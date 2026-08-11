@@ -52,7 +52,11 @@ option(
     ON
 )
 option(TRACY_SUPPORT "Enable support for tracy profiler" OFF)
-option(ENABLE_ENB_EXTENDER "Enable ENBExtender reimplementation (weather blending, time-of-day, technique bindings)" ON)
+option(
+    ENABLE_ENB_EXTENDER
+    "Enable ENBExtender reimplementation (weather blending, time-of-day, technique bindings)"
+    ON
+)
 message("\tAuto plugin deployment: ${AUTO_PLUGIN_DEPLOYMENT}")
 message("\tZip to dist: ${ZIP_TO_DIST}")
 message("\tAIO Zip to dist: ${AIO_ZIP_TO_DIST}")
@@ -290,7 +294,11 @@ foreach(FEATURE_PATH ${FEATURE_CONFIG_FILES})
     # Detect the Unreleased flag, which gates UI visibility independently of the
     # release stage above. Same line anchoring and CMAKE_MATCH_2 guard.
     set(_STAGE_UNRELEASED "")
-    string(REGEX MATCH "(^|[\r\n])[ \t]*[Uu]nreleased[ \t]*=[ \t]*([A-Za-z0-9]+)" _STAGE_UNRELEASED_MATCH "${CONFIG_VALUE}")
+    string(
+        REGEX MATCH "(^|[\r\n])[ \t]*[Uu]nreleased[ \t]*=[ \t]*([A-Za-z0-9]+)"
+        _STAGE_UNRELEASED_MATCH
+        "${CONFIG_VALUE}"
+    )
     if(_STAGE_UNRELEASED_MATCH)
         string(TOLOWER "${CMAKE_MATCH_2}" _STAGE_UNRELEASED)
     endif()
@@ -669,7 +677,9 @@ if(AUTO_PLUGIN_DEPLOYMENT OR AIO_ZIP_TO_DIST)
     list(FILTER _package_shaders EXCLUDE REGEX "/Tests/")
     set(_shader_copy_cmds)
 
-    set(_feature_shader_paths_file "${CMAKE_CURRENT_BINARY_DIR}/feature_shader_paths.txt")
+    set(_feature_shader_paths_file
+        "${CMAKE_CURRENT_BINARY_DIR}/feature_shader_paths.txt"
+    )
     file(WRITE "${_feature_shader_paths_file}" "")
     foreach(_fpath IN LISTS FEATURE_PATHS)
         if(EXISTS "${_fpath}/Shaders")
@@ -930,7 +940,9 @@ if(NOT DEFINED ENV{CommunityShadersOutputDir})
     )
 endif()
 
-find_program(SEVENZ_EXECUTABLE NAMES 7z 7za
+find_program(
+    SEVENZ_EXECUTABLE
+    NAMES 7z 7za
     PATHS "C:/Program Files/7-Zip" "C:/Program Files (x86)/7-Zip"
     DOC "7-Zip archiver for compressed packages"
 )
@@ -1036,9 +1048,11 @@ if(AIO_ZIP_TO_DIST)
     if(SEVENZ_EXECUTABLE)
         add_custom_command(
             OUTPUT ${AIO_ZIP_STAMP}
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/dist"
+            COMMAND
+                ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/dist"
             COMMAND ${CMAKE_COMMAND} -E rm -f "${AIO_ARCHIVE}"
-            COMMAND "${SEVENZ_EXECUTABLE}" a -t7z -mx1 -mmt=on "${AIO_ARCHIVE}" *
+            COMMAND
+                "${SEVENZ_EXECUTABLE}" a -t7z -mx1 -mmt=on "${AIO_ARCHIVE}" *
             COMMAND ${CMAKE_COMMAND} -E touch ${AIO_ZIP_STAMP}
             WORKING_DIRECTORY ${AIO_DIR}
             DEPENDS PREPARE_AIO ${CMAKE_CURRENT_BINARY_DIR}/copy_shaders.stamp
@@ -1048,7 +1062,8 @@ if(AIO_ZIP_TO_DIST)
         message(WARNING "7z not found; AIO archive will use uncompressed zip")
         add_custom_command(
             OUTPUT ${AIO_ZIP_STAMP}
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/dist"
+            COMMAND
+                ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/dist"
             COMMAND ${CMAKE_COMMAND} -E tar cf ${AIO_ARCHIVE} --format=zip -- .
             COMMAND ${CMAKE_COMMAND} -E touch ${AIO_ZIP_STAMP}
             WORKING_DIRECTORY ${AIO_DIR}
@@ -1170,7 +1185,8 @@ if(TARGET PREPARE_AIO)
             OUTPUT ${AIO_PACKAGE}
             COMMAND ${CMAKE_COMMAND} -E make_directory "${DIST_PATH}"
             COMMAND ${CMAKE_COMMAND} -E rm -f "${AIO_PACKAGE}"
-            COMMAND "${SEVENZ_EXECUTABLE}" a -t7z -mx1 -mmt=on "${AIO_PACKAGE}" *
+            COMMAND
+                "${SEVENZ_EXECUTABLE}" a -t7z -mx1 -mmt=on "${AIO_PACKAGE}" *
             WORKING_DIRECTORY ${AIO_DIR}
             DEPENDS
                 ${CMAKE_CURRENT_BINARY_DIR}/prepare_aio.stamp
