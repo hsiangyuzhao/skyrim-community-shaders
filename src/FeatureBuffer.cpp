@@ -2,6 +2,7 @@
 
 #include "Features/CloudShadows.h"
 #include "Features/DynamicCubemaps.h"
+#include "Features/Effects11.h"
 #include "Features/ExponentialHeightFog.h"
 #include "Features/ExtendedMaterials.h"
 #include "Features/ExtendedTranslucency.h"
@@ -59,8 +60,9 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::ibl.GetCommonBufferData(),
 		globals::features::extendedTranslucency.GetCommonBufferData(),
 		globals::features::linearLighting.GetCommonBufferData(),
+		globals::features::effects11.GetCommonBufferData(),
 		globals::features::terrainBlending.settings,
-		globals::features::exponentialHeightFog.settings,
+		globals::features::exponentialHeightFog.GetCommonBufferData(),
 		globals::features::truePBR.settings,
 		globals::features::screenSpaceGI.GetCommonBufferData(),
 		globals::features::screenSpaceReflections.GetCommonBufferData(),

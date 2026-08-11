@@ -3,6 +3,7 @@
 #include "IconsFontAwesome5.h"
 #include "imgui_stdlib.h"
 
+#include "Menu.h"
 #include "JiayeStatement.h"
 #include "State.h"
 #include "Util.h"
@@ -58,9 +59,30 @@ void PostProcessing::DrawSettings()
 	ImGui::EndGroup();
 
 	ImGui::Separator();
-	ImGui::Checkbox(T("feature.post_processing.bypass", "Bypass"), &bypass);
+
+	// Effects11 replaces the whole tonemap pass, so these toggles would have no effect while
+	// it owns the frame. Disable them rather than let them silently do nothing.
+	const bool tonemapTakenByEffects11 = IsTonemapOwnedByEffects11();
+
+	ImGui::BeginDisabled(tonemapTakenByEffects11);
+
+	// A disabled checkbox never reports a click, so bypass keeps its stored value while forced on.
+	bool bypassDisplay = bypass || tonemapTakenByEffects11;
+	if (ImGui::Checkbox(T("feature.post_processing.bypass", "Bypass"), &bypassDisplay))
+		bypass = bypassDisplay;
+
 	ImGui::SameLine();
 	ImGui::Checkbox(T("feature.post_processing.disable_vanilla_tonemapping", "Disable Vanilla Tonemapping"), (bool*)&settings.DisableVanillaTonemapping);
+	ImGui::EndDisabled();
+
+	if (tonemapTakenByEffects11) {
+		ImGui::PushStyleColor(ImGuiCol_Text, Menu::GetSingleton()->GetTheme().StatusPalette.Warning);
+		ImGui::TextWrapped("%s", T("feature.post_processing.tonemap_owned_by_effects11",
+									 "Tonemapping is currently handled by Effects 11. Post Processing effects that run "
+									 "before tonemapping still apply. To use Post Processing tonemapping instead, either "
+									 "disable Effects 11 or enable its \"UseOriginalPostProcessing\" setting."));
+		ImGui::PopStyleColor();
+	}
 
 	ImGui::Separator();
 
@@ -474,6 +496,11 @@ void PostProcessing::SetupResources()
 
 void PostProcessing::Reset()
 {
+	// Cleared per frame rather than only at the end of PreProcess: when Effects11 owns the
+	// tonemap (or the pipeline is bypassed) PreProcess never runs, and a stale flag would
+	// make the next frame we do run read from the wrong buffer.
+	isrefraction = false;
+
 	for (auto& pipe : pipeline) {
 		if (pipe)
 			pipe->Reset();
@@ -486,6 +513,11 @@ void PostProcessing::CopyToRenderTarget(
 	ID3D11Texture2D* srcTex,
 	ID3D11ShaderResourceView* srcSRV)
 {
+	// D3D11 rejects a copy whose source and destination are the same resource, which happens
+	// whenever the pipeline left the image in the buffer we are writing back to.
+	if (targetRT.texture == srcTex)
+		return;
+
 	auto context = globals::d3d::context;
 
 	D3D11_TEXTURE2D_DESC srcDesc;
@@ -532,7 +564,7 @@ void PostProcessing::DrawFeature(PostProcessFeature& feature, PostProcessFeature
 
 void PostProcessing::DrawBeforeUpscaling()
 {
-	if (bypass)
+	if (bypass || IsTonemapOwnedByEffects11())
 		return;
 
 	auto& upscaling = globals::features::upscaling;
@@ -542,7 +574,7 @@ void PostProcessing::DrawBeforeUpscaling()
 	auto renderer = globals::game::renderer;
 	auto state = globals::state;
 
-	bool inMainLoadingMenu = globals::game::ui && (globals::game::ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || globals::game::ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
+	bool inMainLoadingMenu = state->IsMainOrLoadingMenuOpen();
 	auto gameTexMain = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 	PostProcessFeature::TextureInfo lastTexColor = { gameTexMain.texture, gameTexMain.SRV };
 
@@ -566,36 +598,29 @@ void PostProcessing::DrawBeforeUpscaling()
 	state->EndPerfEvent();
 }
 
-void PostProcessing::PreProcess()
+void PostProcessing::PreProcess(RE::RENDER_TARGET a_input)
 {
 	if (bypass)
 		return;
 
 	auto renderer = globals::game::renderer;
-	auto context = globals::d3d::context;
 
 	auto& upscaling = globals::features::upscaling;
 
-	bool inMainLoadingMenu = globals::game::ui && (globals::game::ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || globals::game::ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
+	// This runs before the HDR chain, so ISRefraction still has kMAIN_COPY bound as a render
+	// target. D3D11 silently nulls any SRV of a resource that is also an output, which would
+	// make the pipeline sample black instead of the scene.
+	globals::d3d::context->OMSetRenderTargets(0, nullptr, nullptr);
+	globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
+
+	bool inMainLoadingMenu = globals::state->IsMainOrLoadingMenuOpen();
 
 	auto& gameTexMainRT = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 	auto& gameTexMainCopyRT = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN_COPY];
 
-	bool useMainCopy = isrefraction;
-	ID3D11RenderTargetView* currentRTV = nullptr;
-	ID3D11DepthStencilView* currentDSV = nullptr;
-	context->OMGetRenderTargets(1, &currentRTV, &currentDSV);
-	if (currentRTV) {
-		if (currentRTV == gameTexMainCopyRT.RTV) {
-			useMainCopy = true;
-		} else if (currentRTV == gameTexMainRT.RTV) {
-			useMainCopy = false;
-		}
-	}
-	if (currentRTV)
-		currentRTV->Release();
-	if (currentDSV)
-		currentDSV->Release();
+	// The tonemap hook hands us the pass input directly, so no need to probe the bound RTV.
+	// Refraction still routes through kMAIN_COPY without that being reflected in a_input.
+	bool useMainCopy = isrefraction || a_input == RE::RENDER_TARGETS::kMAIN_COPY;
 
 	auto gameTexMain = useMainCopy ? gameTexMainCopyRT : gameTexMainRT;
 	PostProcessFeature::TextureInfo lastTexColor = { gameTexMain.texture, gameTexMain.SRV };
@@ -631,7 +656,9 @@ void PostProcessing::PreProcess()
 
 void PostProcessing::ClearBorderMotionVectorsForFrameGen()
 {
-	if (bypass)
+	// Effects11 owns the image, so no letterbox is drawn and zeroing its motion vectors
+	// would hand frame generation a band of static pixels over live scene content.
+	if (bypass || IsTonemapOwnedByEffects11())
 		return;
 
 	auto borderIdx = static_cast<size_t>(FeaturePipelineIndex::Border);
@@ -640,6 +667,29 @@ void PostProcessing::ClearBorderMotionVectorsForFrameGen()
 		auto* border = static_cast<Border*>(pipe.get());
 		border->ClearMotionVectorsForFrameGen();
 	}
+}
+
+bool PostProcessing::WantsTonemapOwnership() const
+{
+	return !bypass && settings.DisableVanillaTonemapping != 0;
+}
+
+bool PostProcessing::IsTonemapOwnedByEffects11() const
+{
+	return globals::state->GetTonemapOwner() == State::TonemapOwner::kEffects11;
+}
+
+PostProcessing::Settings PostProcessing::GetCommonBufferData()
+{
+	Settings data = settings;
+
+	// Effects11 outputs gamma-space SDR from its own tonemapper. Leaving this flag set would
+	// make ISHDR take its passthrough branch and HDROutputCS treat the scene as linear and
+	// already display-mapped, skipping AutoHDR and the BT.2020 conversion.
+	if (globals::state->GetTonemapOwner() != State::TonemapOwner::kPostProcessing)
+		data.DisableVanillaTonemapping = 0;
+
+	return data;
 }
 
 void PostProcessing::Prepass()
@@ -665,6 +715,4 @@ void PostProcessing::PostPostLoad()
 {
 	logger::info("Hooking preprocess passes");
 	stl::write_vfunc<0x2, BSImagespaceShaderRefraction_SetupTechnique>(RE::VTABLE_BSImagespaceShaderRefraction[0]);
-	stl::write_vfunc<0x2, BSImagespaceShaderHDRTonemapBlendCinematic_SetupTechnique>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematic[0]);
-	stl::write_vfunc<0x2, BSImagespaceShaderHDRTonemapBlendCinematicFade_SetupTechnique>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematicFade[0]);
 }
