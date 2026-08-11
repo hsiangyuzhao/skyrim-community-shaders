@@ -10,9 +10,9 @@
 #define EFFECT
 
 #if defined(SOFT) && defined(NORMALS) && defined(TEXTURE) && defined(FALLOFF) && defined(VC) && \
-    !defined(LIGHTING) && !defined(PARTICLES) && !defined(STRIP_PARTICLES) &&                    \
-    !defined(BLOOD) && !defined(MEMBRANE) && !defined(ADDBLEND) && !defined(MULTBLEND) &&        \
-    !defined(MULTBLEND_DECAL) && !defined(ALPHA_TEST) && !defined(DEFERRED) && !defined(SKINNED)
+	!defined(LIGHTING) && !defined(PARTICLES) && !defined(STRIP_PARTICLES) &&                   \
+	!defined(BLOOD) && !defined(MEMBRANE) && !defined(ADDBLEND) && !defined(MULTBLEND) &&       \
+	!defined(MULTBLEND_DECAL) && !defined(ALPHA_TEST) && !defined(DEFERRED) && !defined(SKINNED)
 #	define IS_VOLUMETRIC_FOG
 #endif
 
@@ -689,7 +689,7 @@ PS_OUTPUT main(PS_INPUT input)
 	bool isFire = false;
 #		if defined(ADDBLEND)
 #			if defined(SOFT)
-    if (Permutation::PixelShaderDescriptor & Permutation::EffectFlags::GrayscaleToColor && Permutation::PixelShaderDescriptor & Permutation::EffectFlags::GrayscaleToAlpha)
+	if (Permutation::PixelShaderDescriptor & Permutation::EffectFlags::GrayscaleToColor && Permutation::PixelShaderDescriptor & Permutation::EffectFlags::GrayscaleToAlpha)
 		isFire = true;
 #			elif defined(PARTICLES) && defined(TEXCOORD_INDEX) && defined(INDEXED_TEXTURE)
 	isFire = true;
@@ -827,7 +827,7 @@ PS_OUTPUT main(PS_INPUT input)
 		float3 ambientLevel = 0;
 		if (SharedData::iblSettings.DALCMode >= 2) {
 			// Mode 2: keep vanilla DALC, add sky IBL overlay
-			ambientLevel = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 0, 1.0))));
+			ambientLevel = Color::Ambient(max(0, SharedData::GetAmbient(0.f)));
 			ambientLevel += ImageBasedLighting::GetSkyIBLColor(float3(0, 0, 0));
 		} else {
 			// Mode 0/1: replace with envIBL + skyIBL
@@ -903,20 +903,20 @@ PS_OUTPUT main(PS_INPUT input)
 		}
 	}
 #		endif
-#        if defined(ADDBLEND)
-#            if defined(EXP_HEIGHT_FOG)
-    float3 blendedColor = lightColor * (1 - vanillaFogFactor) * (1 - expFogFactor);
-#            else
-    float3 blendedColor = lightColor * (1 - fogFactor);
-#            endif
-#	if defined(EFFECTS11)
+#		if defined(ADDBLEND)
+#			if defined(EXP_HEIGHT_FOG)
+	float3 blendedColor = lightColor * (1 - vanillaFogFactor) * (1 - expFogFactor);
+#			else
+	float3 blendedColor = lightColor * (1 - fogFactor);
+#			endif
+#			if defined(EFFECTS11)
 	if (SharedData::enbSettings.Enable) {
 		if (isFire)
 			blendedColor = pow(abs(blendedColor), SharedData::enbSettings.FireCurve) * SharedData::enbSettings.FireIntensity;
 		else
 			blendedColor *= SharedData::enbSettings.LightSpriteIntensity;
 	}
-#	endif
+#			endif
 #		elif defined(MULTBLEND) || defined(MULTBLEND_DECAL)
 #			if defined(EXP_HEIGHT_FOG)
 	float3 blendedColor = lerp(lightColor, 1.0.xxx, saturate(1.5 * vanillaFogFactor).xxx);
