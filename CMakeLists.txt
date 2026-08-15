@@ -707,6 +707,7 @@ if(AUTO_PLUGIN_DEPLOYMENT OR AIO_ZIP_TO_DIST)
             file(
                 GLOB_RECURSE _feat_shaders
                 LIST_DIRECTORIES FALSE
+                CONFIGURE_DEPENDS
                 "${_fpath}/Shaders/*"
             )
             list(FILTER _feat_shaders EXCLUDE REGEX "/Tests/")
