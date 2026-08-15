@@ -136,7 +136,7 @@ public:
 		uint Enabled;
 		uint EnableIL;
 		uint DebugMode;
-		uint pad0;
+		float AOPower;
 	};
 
 	SharedData GetCommonBufferData();
