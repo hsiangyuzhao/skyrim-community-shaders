@@ -40,6 +40,7 @@ void ScreenSpaceGI::RestoreDefaultSettings()
 	settings = {};
 	recompileFlag = true;
 	resetReblurHistory = true;
+	outputReady = false;
 	hasMultiBounceHistory = false;
 	hasFullResolutionMultiBounceHistory = false;
 	multiBounceHistoryUsesNRDOutput = false;
@@ -110,9 +111,12 @@ void ScreenSpaceGI::DrawSettings()
 			resolutionChanged |= ImGui::RadioButton(T(TKEY("full_resolution"), "Full Resolution"), &resolutionMode, 0);
 
 			ImGui::TableNextColumn();
-			resolutionChanged |= ImGui::RadioButton(T(TKEY("half_resolution"), "1/2 Resolution"), &resolutionMode, 1);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("%s", T(TKEY("half_resolution_checkerboard_tooltip"), "Trace half the columns in a checkerboard pattern. NRD reconstructs the missing pixels."));
+			{
+				auto halfResGuard = Util::DisableGuard(!settings.EnableREBLUR);
+				resolutionChanged |= ImGui::RadioButton(T(TKEY("half_resolution"), "1/2 Resolution"), &resolutionMode, 1);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("%s", T(TKEY("half_resolution_checkerboard_tooltip"), "Trace half the columns in a checkerboard pattern. NRD reconstructs the missing pixels."));
+				}
 			}
 
 			ImGui::TableNextColumn();
@@ -197,7 +201,10 @@ void ScreenSpaceGI::DrawSettings()
 		auto denoiseGuard = Util::DisableGuard(!settings.Enabled);
 
 		if (ImGui::Checkbox(T(TKEY("enable_reblur"), "Enable REBLUR"), &settings.EnableREBLUR)) {
-			if (!settings.EnableREBLUR && settings.QuarterRes) {
+			// Reduced-resolution traces are checkerboard/phase packed and are only
+			// full-resolution consumer inputs after REBLUR reconstruction.
+			if (!settings.EnableREBLUR && (settings.HalfRes || settings.QuarterRes)) {
+				settings.HalfRes = false;
 				settings.QuarterRes = false;
 				recompileFlag = true;
 			}
@@ -237,10 +244,13 @@ void ScreenSpaceGI::LoadSettings(json& o_json)
 	settings = o_json;
 	if (settings.QuarterRes)
 		settings.HalfRes = false;
-	if (!settings.EnableREBLUR)
+	if (!settings.EnableREBLUR) {
+		settings.HalfRes = false;
 		settings.QuarterRes = false;
+	}
 	recompileFlag = true;
 	resetReblurHistory = true;
+	outputReady = false;
 	hasMultiBounceHistory = false;
 	hasFullResolutionMultiBounceHistory = false;
 	multiBounceHistoryUsesNRDOutput = false;
@@ -283,6 +293,7 @@ void ScreenSpaceGI::SetupResources()
 	auto renderer = globals::game::renderer;
 	auto device = globals::d3d::device;
 	resetReblurHistory = true;
+	outputReady = false;
 	hasMultiBounceHistory = false;
 	hasFullResolutionMultiBounceHistory = false;
 	multiBounceHistoryUsesNRDOutput = false;
@@ -436,6 +447,7 @@ void ScreenSpaceGI::SetupResources()
 
 void ScreenSpaceGI::SetupNRDResources()
 {
+	outputReady = false;
 	resetReblurHistory = true;
 	hasMultiBounceHistory = false;
 	hasFullResolutionMultiBounceHistory = false;
@@ -514,6 +526,7 @@ void ScreenSpaceGI::SetupNRDResources()
 
 void ScreenSpaceGI::ClearShaderCache()
 {
+	outputReady = false;
 	static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
 		&prefilterDepthsCompute, &prefilterRadianceCompute, &prefilterNormalCompute, &giCompute, &compositeCompute
 	};
@@ -579,7 +592,10 @@ void ScreenSpaceGI::CompileComputeShaders()
 
 bool ScreenSpaceGI::ShadersOK()
 {
-	return texNoise && prefilterDepthsCompute && prefilterRadianceCompute && prefilterNormalCompute && giCompute;
+	const bool useSH = settings.EnableGI && settings.EnableSH;
+	return texNoise && texWorkingDepth && texRadiance && texNormal && texNRDInput &&
+	       prefilterDepthsCompute && prefilterRadianceCompute && prefilterNormalCompute && giCompute &&
+	       (!settings.EnableGI || compositeCompute) && (!useSH || texNRDInputSH1);
 }
 
 void ScreenSpaceGI::UpdateSB()
@@ -621,6 +637,8 @@ void ScreenSpaceGI::UpdateSB()
 
 void ScreenSpaceGI::DrawSSGI()
 {
+	outputReady = false;
+
 	auto context = globals::d3d::context;
 
 	auto imageSpaceManager = globals::game::imageSpaceManager;
@@ -628,6 +646,17 @@ void ScreenSpaceGI::DrawSSGI()
 
 	static bool* enableSSAO = reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(BSImagespaceShaderISSAOBlurH.get()) + 0x50LL);
 	*enableSSAO = settings.EnableVanillaSSAO;
+
+	const bool useSH = settings.EnableGI && settings.EnableSH;
+	const bool trackMultiBounce = settings.EnableGI && settings.EnableMultiBounce;
+	if (nrdReblurUsesSH != useSH)
+		SetupNRDResources();
+
+	// Compile first: enabling GI may require creating the composite shader, so
+	// checking the old shader set before recompilation can otherwise deadlock the
+	// feature in an unavailable state.
+	if (recompileFlag)
+		ClearShaderCache();
 
 	if (!(settings.Enabled && ShadersOK())) {
 		return;
@@ -646,14 +675,6 @@ void ScreenSpaceGI::DrawSSGI()
 	}
 
 	//////////////////////////////////////////////////////
-
-	const bool useSH = settings.EnableGI && settings.EnableSH;
-	const bool trackMultiBounce = settings.EnableGI && settings.EnableMultiBounce;
-	if (nrdReblurUsesSH != useSH)
-		SetupNRDResources();
-
-	if (recompileFlag)
-		ClearShaderCache();
 
 	UpdateSB();
 
@@ -870,11 +891,13 @@ void ScreenSpaceGI::DrawSSGI()
 	context->CSSetConstantBuffers(1, 1, &cb);
 	context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
 	context->CSSetShader(nullptr, nullptr, 0);
+
+	outputReady = true;
 }
 
 void ScreenSpaceGI::Composite()
 {
-	if (!(settings.Enabled && settings.EnableGI && compositeCompute))
+	if (!(outputReady && settings.Enabled && settings.EnableGI && compositeCompute))
 		return;
 
 	ZoneScoped;
@@ -917,6 +940,8 @@ void ScreenSpaceGI::Composite()
 
 ID3D11ShaderResourceView* ScreenSpaceGI::GetDiffuseOutputTexture()
 {
+	if (!outputReady)
+		return nullptr;
 	if (loaded && settings.Enabled && settings.EnableREBLUR && nrdReblur.IsValid() &&
 		globals::features::nrd.loaded && globals::features::nrd.AreGuidesReady())
 		return texNRDOutput->srv.get();
@@ -927,7 +952,7 @@ ID3D11ShaderResourceView* ScreenSpaceGI::GetDiffuseOutputTexture()
 
 ID3D11ShaderResourceView* ScreenSpaceGI::GetDiffuseSH1Texture()
 {
-	if (!loaded || !settings.Enabled || !settings.EnableSH)
+	if (!outputReady || !loaded || !settings.Enabled || !settings.EnableGI || !settings.EnableSH)
 		return nullptr;
 	if (settings.EnableREBLUR && nrdReblur.IsValid() && globals::features::nrd.loaded && globals::features::nrd.AreGuidesReady() && texNRDOutputSH1)
 		return texNRDOutputSH1->srv.get();
@@ -939,7 +964,7 @@ ID3D11ShaderResourceView* ScreenSpaceGI::GetDiffuseSH1Texture()
 ScreenSpaceGI::SharedData ScreenSpaceGI::GetCommonBufferData()
 {
 	SharedData data{};
-	const bool enabled = loaded && settings.Enabled;
+	const bool enabled = loaded && settings.Enabled && !recompileFlag && ShadersOK();
 	data.Enabled = enabled ? 1u : 0u;
 	data.EnableIL = (enabled && settings.EnableGI) ? 1u : 0u;
 	data.DebugMode = 0;

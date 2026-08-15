@@ -3,6 +3,7 @@
 #include <DDSTextureLoader.h>
 #include <DirectXTex.h>
 
+#include "Deferred.h"
 #include "I18n/I18n.h"
 #include "PhysicalSky.h"
 #include "ShaderCache.h"
@@ -288,7 +289,7 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 	auto context = globals::d3d::context;
 
 	auto& depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
-	auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+	auto& main = renderer->GetRuntimeData().renderTargets[globals::deferred->forwardRenderTargets[0]];
 
 	ID3D11ShaderResourceView* srvs[2] = { depth.depthSRV, main.SRV };
 	context->CSSetShaderResources(0, 2, srvs);
