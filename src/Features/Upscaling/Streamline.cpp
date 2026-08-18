@@ -10,6 +10,71 @@
 #include "../Upscaling.h"
 #include "DX12SwapChain.h"
 
+#include <limits>
+
+namespace
+{
+using DLSSModelPreset = Upscaling::DLSSModelPreset;
+
+constexpr uint kDLSSModelPresetCount = static_cast<uint>(DLSSModelPreset::kCount);
+constexpr uint kUnreportedPreset = std::numeric_limits<uint>::max();
+
+const char* GetDLSSModelPresetName(DLSSModelPreset a_preset)
+{
+	switch (a_preset) {
+	case DLSSModelPreset::kF:
+		return "F";
+	case DLSSModelPreset::kJ:
+		return "J";
+	case DLSSModelPreset::kK:
+		return "K";
+	case DLSSModelPreset::kL:
+		return "L";
+	case DLSSModelPreset::kM:
+		return "M";
+	case DLSSModelPreset::kSDKDocumentedMapping:
+		return "Streamline 2.12 documented mapping (K/K/K/M/L)";
+	default:
+		return "K (safe fallback)";
+	}
+}
+
+void SetAllDLSSPresets(sl::DLSSOptions& a_options, sl::DLSSPreset a_preset)
+{
+	a_options.dlaaPreset = a_preset;
+	a_options.qualityPreset = a_preset;
+	a_options.balancedPreset = a_preset;
+	a_options.performancePreset = a_preset;
+	a_options.ultraPerformancePreset = a_preset;
+}
+
+void SetSDKDocumentedDLSSPresets(sl::DLSSOptions& a_options)
+{
+	a_options.dlaaPreset = sl::DLSSPreset::ePresetK;
+	a_options.qualityPreset = sl::DLSSPreset::ePresetK;
+	a_options.balancedPreset = sl::DLSSPreset::ePresetK;
+	a_options.performancePreset = sl::DLSSPreset::ePresetM;
+	a_options.ultraPerformancePreset = sl::DLSSPreset::ePresetL;
+}
+
+sl::DLSSPreset GetForcedDLSSPreset(DLSSModelPreset a_preset)
+{
+	switch (a_preset) {
+	case DLSSModelPreset::kF:
+		return sl::DLSSPreset::ePresetF;
+	case DLSSModelPreset::kJ:
+		return sl::DLSSPreset::ePresetJ;
+	case DLSSModelPreset::kL:
+		return sl::DLSSPreset::ePresetL;
+	case DLSSModelPreset::kM:
+		return sl::DLSSPreset::ePresetM;
+	case DLSSModelPreset::kK:
+	default:
+		return sl::DLSSPreset::ePresetK;
+	}
+}
+}
+
 void LoggingCallback(sl::LogType type, const char* msg)
 {
 	// Remove trailing newlines from the raw message
@@ -324,29 +389,58 @@ void Streamline::SetDLSSOptions()
 	dlssOptions.preExposure = 1.0f;
 	dlssOptions.sharpness = 0.0f;
 
-	// Set DLSS preset based on VR mode
-	sl::DLSSPreset preset = sl::DLSSPreset::ePresetK;  // Default
-	switch (globals::features::upscaling.settings.DLSSPreset) {
-	case 0:
-		preset = sl::DLSSPreset::ePresetF;
-		break;
-	case 1:
-		preset = sl::DLSSPreset::ePresetJ;
-		break;
-	case 2:
-	default:
-		preset = sl::DLSSPreset::ePresetK;
-		break;
+	auto& settings = globals::features::upscaling.settings;
+	auto requestedPresetValue = settings.DLSSPreset;
+	if (requestedPresetValue >= kDLSSModelPresetCount) {
+		logger::warn("[Streamline] Invalid DLSS model preset {}, falling back to K", requestedPresetValue);
+		requestedPresetValue = static_cast<uint>(DLSSModelPreset::kK);
+		settings.DLSSPreset = requestedPresetValue;
 	}
 
-	dlssOptions.dlaaPreset = preset;
-	dlssOptions.qualityPreset = preset;
-	dlssOptions.balancedPreset = preset;
-	dlssOptions.performancePreset = preset;
-	dlssOptions.ultraPerformancePreset = preset;
+	const auto requestedPreset = static_cast<DLSSModelPreset>(requestedPresetValue);
+	static uint lastLoggedPreset = kUnreportedPreset;
+	static uint lastRequestedPreset = kUnreportedPreset;
+	static uint sessionFallbackPreset = kUnreportedPreset;
+	static uint lastFallbackFailurePreset = kUnreportedPreset;
+	if (lastRequestedPreset != requestedPresetValue) {
+		lastRequestedPreset = requestedPresetValue;
+		sessionFallbackPreset = kUnreportedPreset;
+		lastFallbackFailurePreset = kUnreportedPreset;
+	}
 
-	if (SL_FAILED(result, slDLSSSetOptions(viewport, dlssOptions))) {
-		logger::critical("[Streamline] Could not enable DLSS");
+	if (sessionFallbackPreset == requestedPresetValue) {
+		SetAllDLSSPresets(dlssOptions, sl::DLSSPreset::ePresetK);
+		const auto fallbackResult = slDLSSSetOptions(viewport, dlssOptions);
+		if (fallbackResult != sl::Result::eOk && lastFallbackFailurePreset != requestedPresetValue) {
+			logger::critical("[Streamline] DLSS SR K fallback failed ({})", magic_enum::enum_name(fallbackResult));
+			lastFallbackFailurePreset = requestedPresetValue;
+		}
+		return;
+	}
+
+	if (requestedPreset == DLSSModelPreset::kSDKDocumentedMapping)
+		SetSDKDocumentedDLSSPresets(dlssOptions);
+	else
+		SetAllDLSSPresets(dlssOptions, GetForcedDLSSPreset(requestedPreset));
+
+	const auto result = slDLSSSetOptions(viewport, dlssOptions);
+	if (result == sl::Result::eOk) {
+		if (lastLoggedPreset != requestedPresetValue) {
+			logger::info("[Streamline] Requested DLSS SR model preset: {}", GetDLSSModelPresetName(requestedPreset));
+			lastLoggedPreset = requestedPresetValue;
+		}
+		return;
+	}
+
+	logger::error("[Streamline] slDLSSSetOptions failed for requested DLSS SR model preset {} ({}); using K fallback for this selection", GetDLSSModelPresetName(requestedPreset), magic_enum::enum_name(result));
+	sessionFallbackPreset = requestedPresetValue;
+	SetAllDLSSPresets(dlssOptions, sl::DLSSPreset::ePresetK);
+	const auto fallbackResult = slDLSSSetOptions(viewport, dlssOptions);
+	if (fallbackResult == sl::Result::eOk) {
+		logger::warn("[Streamline] DLSS SR is using K fallback after the requested {} preset failed", GetDLSSModelPresetName(requestedPreset));
+	} else {
+		logger::critical("[Streamline] DLSS SR K fallback failed ({})", magic_enum::enum_name(fallbackResult));
+		lastFallbackFailurePreset = requestedPresetValue;
 	}
 }
 

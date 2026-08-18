@@ -228,16 +228,36 @@ void Upscaling::DrawSettings()
 		} else if (upscaleMethod == UpscaleMethod::kDLSS) {
 			ImGui::SliderFloat("Sharpness", &settings.sharpnessDLSS, 0.0f, 1.0f, "%.1f");
 
-			// VR DLSS preset selection
-			if (globals::game::isVR) {
-				const char* presets[] = { "F (Fast)", "J (Quality)", "K (Ultra)" };
-				ImGui::SliderInt("DLSS Preset", (int*)&settings.DLSSPreset, 0, 2, presets[settings.DLSSPreset]);
+			const bool rayReconstructionActive = settings.enableDLSSRR && streamline.featureDLSS_RR;
+			if (rayReconstructionActive)
+				ImGui::BeginDisabled();
+
+			const char* presets[] = {
+				"F (Legacy forced override)",
+				"J (Forced override)",
+				"K (Forced override)",
+				"L (Forced override)",
+				"M (Forced override)",
+				"Streamline 2.12 documented mapping (K/K/K/M/L)"
+			};
+			int presetIndex = static_cast<int>(settings.DLSSPreset);
+			if (ImGui::Combo("DLSS SR Model Preset", &presetIndex, presets, IM_ARRAYSIZE(presets)))
+				settings.DLSSPreset = static_cast<uint>(presetIndex);
+
+			if (rayReconstructionActive)
+				ImGui::EndDisabled();
+
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("F through M force one DLSS model for the five exposed modes (DLAA/Quality/Balanced/Performance/Ultra Performance).");
+				ImGui::TextUnformatted("The Streamline 2.12 documented mapping uses K for DLAA/Quality/Balanced, M for Performance, and L for Ultra Performance.");
 			}
 		}
 	}
 
 	if (upscaleMethod == UpscaleMethod::kDLSS && streamline.featureDLSS_RR) {
 		ImGui::Checkbox("Enable DLSS Ray Reconstruction", &settings.enableDLSSRR);
+		if (settings.enableDLSSRR)
+			ImGui::TextDisabled("DLSS SR model presets do not apply while Ray Reconstruction is enabled.");
 	}
 
 	if (!globals::game::isVR) {
@@ -386,6 +406,12 @@ void Upscaling::LoadSettings(json& o_json)
 	if (settings.upscaleMethodNoDLSS >= static_cast<uint>(enumCount)) {
 		logger::warn("[Upscaling] Loaded upscaleMethodNoDLSS {} out of range, clamping to {}", settings.upscaleMethodNoDLSS, enumCount ? enumCount - 1 : 0);
 		settings.upscaleMethodNoDLSS = enumCount ? enumCount - 1 : 0;
+	}
+	constexpr auto dlssPresetCount = static_cast<uint>(DLSSModelPreset::kCount);
+	if (settings.DLSSPreset >= dlssPresetCount) {
+		const auto fallback = static_cast<uint>(DLSSModelPreset::kK);
+		logger::warn("[Upscaling] Loaded DLSSPreset {} out of range, falling back to K ({})", settings.DLSSPreset, fallback);
+		settings.DLSSPreset = fallback;
 	}
 	auto iniSettingCollection = globals::game::iniPrefSettingCollection;
 	if (iniSettingCollection) {

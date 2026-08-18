@@ -45,6 +45,18 @@ public:
 		kDLSS
 	};
 
+	// Stored in SettingsUser.json. Keep existing values stable and append new ones.
+	enum class DLSSModelPreset : uint
+	{
+		kF = 0,
+		kJ = 1,
+		kK = 2,
+		kL = 3,
+		kM = 4,
+		kSDKDocumentedMapping = 5,
+		kCount
+	};
+
 	struct Settings
 	{
 		uint upscaleMethod = (uint)UpscaleMethod::kDLSS;
@@ -56,7 +68,7 @@ public:
 		uint streamlineLogLevel = 0;  // 0=Off, 1=Default, 2=Verbose
 		float sharpnessFSR = 1.0f;
 		float sharpnessDLSS = 0.1f;
-		uint DLSSPreset = 2;  // VR-specific DLSS preset: 0=F, 1=J, 2=K
+		uint DLSSPreset = static_cast<uint>(DLSSModelPreset::kK);
 		bool enableDLSSRR = false;
 	};
 
