@@ -1005,7 +1005,7 @@ void Upscaling::CopySharedD3D12Resources()
 			static_cast<uint32_t>(std::lround(screenSize.y * resolutionScale.y)),
 			1u,
 			maxInputHeight);
-		dx12SwapChain.SetDLSSGInputExtent(inputWidth, inputHeight);
+		dx12SwapChain.SetDLSSGInputExtent(inputWidth, inputHeight, streamline.GetLatchedFrameTokenIndex());
 	}
 
 	auto& motionVector = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];

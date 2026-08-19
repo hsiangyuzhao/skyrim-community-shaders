@@ -643,11 +643,14 @@ bool Streamline::SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff)
 		return false;
 
 	const auto& swapChain = globals::features::upscaling.dx12SwapChain;
+	if (a_enable && !swapChain.HasValidDLSSGInputExtent())
+		return false;
+
 	const auto inputWidth = swapChain.GetDLSSGInputWidth();
 	const auto inputHeight = swapChain.GetDLSSGInputHeight();
 	const bool inputExtentUnchanged = dlssGConfiguredInputWidth == inputWidth && dlssGConfiguredInputHeight == inputHeight;
 	const bool outputExtentUnchanged = dlssGConfiguredOutputWidth == swapChain.swapChainDesc.Width &&
-		dlssGConfiguredOutputHeight == swapChain.swapChainDesc.Height;
+	                                   dlssGConfiguredOutputHeight == swapChain.swapChainDesc.Height;
 	const bool retentionUnchanged = dlssGRetainResourcesWhenOff == a_retainResourcesWhenOff;
 	if (dlssGOptionsInitialized && dlssGActive == a_enable && retentionUnchanged && (!a_enable || (inputExtentUnchanged && outputExtentUnchanged)))
 		return true;
@@ -757,6 +760,18 @@ bool Streamline::TagDLSSGResources(const DLSSGFrameResources& a_resources, ID3D1
 	if (result != sl::Result::eOk) {
 		FallbackDLSSG("could not tag its frame resources", result, sl::DLSSGStatus::eOk);
 		return false;
+	}
+
+	if (dlssGTaggedInputWidth != a_resources.depthExtent.width ||
+		dlssGTaggedInputHeight != a_resources.depthExtent.height) {
+		dlssGTaggedInputWidth = a_resources.depthExtent.width;
+		dlssGTaggedInputHeight = a_resources.depthExtent.height;
+		logger::info("[Streamline] DLSS-G owns global Present tags at token {}: depth/mvec={}x{}, HUD-less={}x{}, lifecycle=valid-until-present",
+			frameTokenIndex,
+			a_resources.depthExtent.width,
+			a_resources.depthExtent.height,
+			a_resources.hudlessExtent.width,
+			a_resources.hudlessExtent.height);
 	}
 
 	return true;
@@ -960,46 +975,73 @@ void Streamline::Upscale(ID3D12Resource* a_inputColorTexture,
 {
 	CheckFrameConstants();
 	SetDLSSOptions();
-
-	auto state = globals::state;
-
-	{
-		auto screenSize = state->screenSize;
-		auto renderSize = Util::ConvertToDynamic(screenSize);
-
-		sl::Extent lowResExtent{ 0, 0, (uint)renderSize.x, (uint)renderSize.y };
-		sl::Extent fullExtent{ 0, 0, (uint)screenSize.x, (uint)screenSize.y };
-
-		sl::Resource colorIn = { sl::ResourceType::eTex2d, a_inputColorTexture, 0 };
-		sl::Resource colorOut = { sl::ResourceType::eTex2d, a_outputTexture, 0 };
-		sl::Resource depth = { sl::ResourceType::eTex2d, a_depthTexture, 0 };
-		sl::Resource mvec = { sl::ResourceType::eTex2d, a_motionVectorTexture, 0 };
-
-		sl::ResourceTag colorInTag = sl::ResourceTag{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent };
-		sl::ResourceTag colorOutTag = sl::ResourceTag{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &fullExtent };
-		sl::ResourceTag depthTag = sl::ResourceTag{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
-		sl::ResourceTag mvecTag = sl::ResourceTag{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
-
-		sl::Resource reactiveMask = { sl::ResourceType::eTex2d, a_reactiveMask, 0 };
-		sl::ResourceTag reactiveMaskTag = sl::ResourceTag{ &reactiveMask, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
-
-		sl::Resource transparencyCompositionMask = { sl::ResourceType::eTex2d, a_transparencyCompositionMask, 0 };
-		sl::ResourceTag transparencyCompositionMaskTag = sl::ResourceTag{ &transparencyCompositionMask, sl::kBufferTypeTransparencyHint, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
-
-		sl::ResourceTag resourceTags[] = { colorInTag, colorOutTag, depthTag, mvecTag, reactiveMaskTag, transparencyCompositionMaskTag };
-
-		if (SL_FAILED(result, SetTagsForCurrentFrame(resourceTags, _countof(resourceTags), a_commandList))) {
-			logger::error("[Streamline] Failed to set DLSS SR resource tags ({})", magic_enum::enum_name(result));
-			return;
-		}
+	if (!frameConstantsValid || frameToken == nullptr) {
+		logger::error("[Streamline] Cannot evaluate DLSS SR without constants and a frame token");
+		return;
 	}
 
+	auto state = globals::state;
+	auto screenSize = state->screenSize;
+	auto renderSize = Util::ConvertToDynamic(screenSize);
+
+	sl::Extent lowResExtent{ 0, 0, (uint)renderSize.x, (uint)renderSize.y };
+	sl::Extent fullExtent{ 0, 0, (uint)screenSize.x, (uint)screenSize.y };
+
+	sl::Resource colorIn = { sl::ResourceType::eTex2d, a_inputColorTexture, 0 };
+	sl::Resource colorOut = { sl::ResourceType::eTex2d, a_outputTexture, 0 };
+	sl::Resource depth = { sl::ResourceType::eTex2d, a_depthTexture, 0 };
+	sl::Resource mvec = { sl::ResourceType::eTex2d, a_motionVectorTexture, 0 };
+	sl::Resource reactiveMask = { sl::ResourceType::eTex2d, a_reactiveMask, 0 };
+	sl::Resource transparencyCompositionMask = { sl::ResourceType::eTex2d, a_transparencyCompositionMask, 0 };
+
+	sl::ResourceTag colorInTag = sl::ResourceTag{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent };
+	sl::ResourceTag colorOutTag = sl::ResourceTag{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &fullExtent };
+	sl::ResourceTag depthTag = sl::ResourceTag{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
+	sl::ResourceTag mvecTag = sl::ResourceTag{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
+	sl::ResourceTag reactiveMaskTag = sl::ResourceTag{ &reactiveMask, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
+	sl::ResourceTag transparencyCompositionMaskTag = sl::ResourceTag{ &transparencyCompositionMask, sl::kBufferTypeTransparencyHint, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
 	sl::ViewportHandle view(viewport);
+	if (dlssGBackendSelectedAtBoot) {
+		// DLSS-G owns the global Present tag namespace. Supplying every DLSS SR
+		// input locally prevents SR depth/MV tags from leaking into that namespace.
+		const sl::BaseStructure* inputs[] = {
+			&view,
+			&colorInTag,
+			&colorOutTag,
+			&depthTag,
+			&mvecTag,
+			&reactiveMaskTag,
+			&transparencyCompositionMaskTag
+		};
+		const auto result = slEvaluateFeature(sl::kFeatureDLSS, *frameToken, inputs, _countof(inputs), a_commandList);
+		if (result != sl::Result::eOk) {
+			logger::error("[Streamline] DLSS SR local-tag evaluation failed ({})", magic_enum::enum_name(result));
+			return;
+		}
+		if (!dlssSRLocalTagsLogged) {
+			logger::info("[Streamline] DLSS SR uses evaluate-local tags at token {}: input={}x{}, output={}x{}; global tags remain reserved for DLSS-G",
+				frameTokenIndex,
+				lowResExtent.width,
+				lowResExtent.height,
+				fullExtent.width,
+				fullExtent.height);
+			dlssSRLocalTagsLogged = true;
+		}
+		return;
+	}
+
+	sl::ResourceTag resourceTags[] = { colorInTag, colorOutTag, depthTag, mvecTag, reactiveMaskTag, transparencyCompositionMaskTag };
+	if (SL_FAILED(result, SetTagsForCurrentFrame(resourceTags, _countof(resourceTags), a_commandList))) {
+		logger::error("[Streamline] Failed to set DLSS SR resource tags ({})", magic_enum::enum_name(result));
+		return;
+	}
 	const sl::BaseStructure* inputs[] = { &view };
-	slEvaluateFeature(sl::kFeatureDLSS, *frameToken, inputs, _countof(inputs), a_commandList);
+	if (SL_FAILED(result, slEvaluateFeature(sl::kFeatureDLSS, *frameToken, inputs, _countof(inputs), a_commandList)))
+		logger::error("[Streamline] DLSS SR evaluation failed ({})", magic_enum::enum_name(result));
 }
 
-void Streamline::SetDLSSRROptions() {
+void Streamline::SetDLSSRROptions()
+{
 	sl::DLSSDOptions dlssdOptions{};
 
 	// Map quality mode to DLSS mode
@@ -1051,7 +1093,7 @@ void Streamline::SetDLSSRROptions() {
 	dlssdOptions.performancePreset = sl::DLSSDPreset::ePresetD;
 	dlssdOptions.ultraPerformancePreset = sl::DLSSDPreset::ePresetD;
 
-	if(SL_FAILED(result, slDLSSDSetOptions(viewport, dlssdOptions))) {
+	if (SL_FAILED(result, slDLSSDSetOptions(viewport, dlssdOptions))) {
 		logger::critical("[DLSS RR] Could not set DLSS RR options");
 		return;
 	}
@@ -1076,58 +1118,86 @@ void Streamline::RayReconstruction(ID3D12Resource* a_inputColorTexture,
 
 	CheckFrameConstants();
 	logger::debug("[DLSS RR] Frame constants set");
+	if (!frameConstantsValid || frameToken == nullptr) {
+		logger::error("[DLSS RR] Cannot evaluate without constants and a frame token");
+		return;
+	}
 	SetDLSSRROptions();
 	logger::debug("[DLSS RR] DLSS RR options set");
 
 	auto state = globals::state;
 
-	{
-		auto screenSize = state->screenSize;
-		auto renderSize = Util::ConvertToDynamic(screenSize);
+	auto screenSize = state->screenSize;
+	auto renderSize = Util::ConvertToDynamic(screenSize);
 
-		sl::Extent inputExtent{ 0, 0, (uint)renderSize.x, (uint)renderSize.y };
-		sl::Extent outputExtent{ 0, 0, (uint)screenSize.x, (uint)screenSize.y };
+	sl::Extent inputExtent{ 0, 0, (uint)renderSize.x, (uint)renderSize.y };
+	sl::Extent outputExtent{ 0, 0, (uint)screenSize.x, (uint)screenSize.y };
 
-		sl::Resource colorIn = { sl::ResourceType::eTex2d, a_inputColorTexture, 0 };
-		sl::Resource colorOut = { sl::ResourceType::eTex2d, a_outputTexture, 0 };
-		sl::Resource depth = { sl::ResourceType::eTex2d, a_depthTexture, 0 };
-		sl::Resource mvec = { sl::ResourceType::eTex2d, a_motionVectorTexture, 0 };
-		sl::Resource diffuseAlbedo = { sl::ResourceType::eTex2d, a_albedoTexture, 0 };
-		sl::Resource specularAlbedo = { sl::ResourceType::eTex2d, a_reflectanceTexture, 0 };
-		sl::Resource normalRoughness = { sl::ResourceType::eTex2d, a_normalRoughness, 0 };
-		sl::Resource specHitDistance = { sl::ResourceType::eTex2d, a_specularHitDistance, 0 };
-		sl::Resource colorBeforeTransparency = { sl::ResourceType::eTex2d, a_colorBeforeTransparency, 0 };
-		sl::Resource sssGuide = { sl::ResourceType::eTex2d, a_sssGuide, 0 };
+	sl::Resource colorIn = { sl::ResourceType::eTex2d, a_inputColorTexture, 0 };
+	sl::Resource colorOut = { sl::ResourceType::eTex2d, a_outputTexture, 0 };
+	sl::Resource depth = { sl::ResourceType::eTex2d, a_depthTexture, 0 };
+	sl::Resource mvec = { sl::ResourceType::eTex2d, a_motionVectorTexture, 0 };
+	sl::Resource diffuseAlbedo = { sl::ResourceType::eTex2d, a_albedoTexture, 0 };
+	sl::Resource specularAlbedo = { sl::ResourceType::eTex2d, a_reflectanceTexture, 0 };
+	sl::Resource normalRoughness = { sl::ResourceType::eTex2d, a_normalRoughness, 0 };
+	sl::Resource specHitDistance = { sl::ResourceType::eTex2d, a_specularHitDistance, 0 };
+	sl::Resource colorBeforeTransparency = { sl::ResourceType::eTex2d, a_colorBeforeTransparency, 0 };
+	sl::Resource sssGuide = { sl::ResourceType::eTex2d, a_sssGuide, 0 };
 
-		sl::ResourceTag colorInTag = sl::ResourceTag{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &inputExtent };
-		sl::ResourceTag colorOutTag = sl::ResourceTag{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &outputExtent };
-		sl::ResourceTag depthTag = sl::ResourceTag{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
-		sl::ResourceTag mvecTag = sl::ResourceTag{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
-		sl::ResourceTag diffuseAlbedoTag = sl::ResourceTag{ &diffuseAlbedo, sl::kBufferTypeAlbedo, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
-		sl::ResourceTag specularAlbedoTag = sl::ResourceTag{ &specularAlbedo, sl::kBufferTypeSpecularAlbedo, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
-		sl::ResourceTag normalRoughnessTag = sl::ResourceTag{ &normalRoughness, sl::kBufferTypeNormalRoughness, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
-		sl::ResourceTag specHitDistanceTag = sl::ResourceTag{ &specHitDistance, sl::kBufferTypeSpecularHitDistance, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
-		sl::ResourceTag colorBeforeTransparencyTag = sl::ResourceTag{ &colorBeforeTransparency, sl::kBufferTypeColorBeforeTransparency, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
-		sl::ResourceTag sssGuideTag = sl::ResourceTag{ &sssGuide, sl::kBufferTypeScreenSpaceSubsurfaceScatteringGuide, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
-
-		sl::ResourceTag resourceTags[] = { colorInTag, colorOutTag, depthTag, mvecTag, diffuseAlbedoTag, specularAlbedoTag, normalRoughnessTag, specHitDistanceTag, colorBeforeTransparencyTag, sssGuideTag };
-		if (SL_FAILED(result, SetTagsForCurrentFrame(resourceTags, _countof(resourceTags), a_commandList))) {
-			logger::error("[DLSS RR] Failed to set DLSS RR tags, error code: {}", (int)result);
-			return;
-		}
-	}
-
-	logger::debug("[DLSS RR] DLSS RR resources set");
+	sl::ResourceTag colorInTag = sl::ResourceTag{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &inputExtent };
+	sl::ResourceTag colorOutTag = sl::ResourceTag{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &outputExtent };
+	sl::ResourceTag depthTag = sl::ResourceTag{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
+	sl::ResourceTag mvecTag = sl::ResourceTag{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
+	sl::ResourceTag diffuseAlbedoTag = sl::ResourceTag{ &diffuseAlbedo, sl::kBufferTypeAlbedo, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
+	sl::ResourceTag specularAlbedoTag = sl::ResourceTag{ &specularAlbedo, sl::kBufferTypeSpecularAlbedo, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
+	sl::ResourceTag normalRoughnessTag = sl::ResourceTag{ &normalRoughness, sl::kBufferTypeNormalRoughness, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
+	sl::ResourceTag specHitDistanceTag = sl::ResourceTag{ &specHitDistance, sl::kBufferTypeSpecularHitDistance, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
+	sl::ResourceTag colorBeforeTransparencyTag = sl::ResourceTag{ &colorBeforeTransparency, sl::kBufferTypeColorBeforeTransparency, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
+	sl::ResourceTag sssGuideTag = sl::ResourceTag{ &sssGuide, sl::kBufferTypeScreenSpaceSubsurfaceScatteringGuide, sl::ResourceLifecycle::eValidUntilPresent, &inputExtent };
 
 	sl::ViewportHandle view(viewport);
-	const sl::BaseStructure* inputs[] = { &view };
+	if (dlssGBackendSelectedAtBoot) {
+		const sl::BaseStructure* inputs[] = {
+			&view,
+			&colorInTag,
+			&colorOutTag,
+			&depthTag,
+			&mvecTag,
+			&diffuseAlbedoTag,
+			&specularAlbedoTag,
+			&normalRoughnessTag,
+			&specHitDistanceTag,
+			&colorBeforeTransparencyTag,
+			&sssGuideTag
+		};
+		const auto result = slEvaluateFeature(sl::kFeatureDLSS_RR, *frameToken, inputs, _countof(inputs), a_commandList);
+		if (result != sl::Result::eOk) {
+			logger::error("[DLSS RR] Local-tag evaluation failed ({})", magic_enum::enum_name(result));
+			return;
+		}
+		if (!dlssRRLocalTagsLogged) {
+			logger::info("[DLSS RR] Uses evaluate-local tags at token {}: input={}x{}, output={}x{}; global tags remain reserved for DLSS-G",
+				frameTokenIndex,
+				inputExtent.width,
+				inputExtent.height,
+				outputExtent.width,
+				outputExtent.height);
+			dlssRRLocalTagsLogged = true;
+		}
+		return;
+	}
 
+	sl::ResourceTag resourceTags[] = { colorInTag, colorOutTag, depthTag, mvecTag, diffuseAlbedoTag, specularAlbedoTag, normalRoughnessTag, specHitDistanceTag, colorBeforeTransparencyTag, sssGuideTag };
+	if (SL_FAILED(result, SetTagsForCurrentFrame(resourceTags, _countof(resourceTags), a_commandList))) {
+		logger::error("[DLSS RR] Failed to set DLSS RR tags, error code: {}", (int)result);
+		return;
+	}
+	const sl::BaseStructure* inputs[] = { &view };
 	if (SL_FAILED(result, slEvaluateFeature(sl::kFeatureDLSS_RR, *frameToken, inputs, _countof(inputs), a_commandList))) {
 		logger::error("[DLSS RR] Failed to evaluate DLSS RR feature, error code: {}", (int)result);
 		return;
-	} else {
-		logger::debug("[DLSS RR] slEvaluateFeature executed successfully, output texture updated");
 	}
+	logger::debug("[DLSS RR] slEvaluateFeature executed successfully, output texture updated");
 	logger::debug("[DLSS RR] slEvaluateFeature completed");
 }
 
@@ -1164,21 +1234,13 @@ float2 Streamline::GetInputResolutionScale(uint32_t outputWidth, uint32_t output
 		return { 1.0f, 1.0f };
 	}
 
-	float scaleX;
-	float scaleY;
-
-	if (globals::game::ui->GameIsPaused()) {
-		// Calculate scale as ratio of minimum render resolution to output resolution
-		scaleX = (float)optimalSettings.renderWidthMin / (float)outputWidth;
-		scaleY = (float)optimalSettings.renderHeightMin / (float)outputHeight;
-	} else {
-		// Calculate scale as ratio of optimal render resolution to output resolution
-		scaleX = (float)optimalSettings.optimalRenderWidth / (float)outputWidth;
-		scaleY = (float)optimalSettings.optimalRenderHeight / (float)outputHeight;
-	}
-
-	// Return separate X and Y scales for more precision
-	return { scaleX, scaleY };
+	// Keep a fixed quality-mode ratio across pause and camera domains. Changing
+	// to renderWidthMin while paused was an undeclared dynamic-resolution event
+	// for DLSS-G and invalidated the retained Present history.
+	return {
+		(float)optimalSettings.optimalRenderWidth / (float)outputWidth,
+		(float)optimalSettings.optimalRenderHeight / (float)outputHeight
+	};
 }
 
 float2 Streamline::GetInputResolutionScaleRR(uint32_t outputWidth, uint32_t outputHeight, uint32_t qualityMode)
@@ -1215,21 +1277,10 @@ float2 Streamline::GetInputResolutionScaleRR(uint32_t outputWidth, uint32_t outp
 		return { 1.0f, 1.0f };
 	}
 
-	float scaleX;
-	float scaleY;
-
-	if (globals::game::ui->GameIsPaused()) {
-		// Calculate scale as ratio of minimum render resolution to output resolution
-		scaleX = (float)optimalSettings.renderWidthMin / (float)outputWidth;
-		scaleY = (float)optimalSettings.renderHeightMin / (float)outputHeight;
-	} else {
-		// Calculate scale as ratio of optimal render resolution to output resolution
-		scaleX = (float)optimalSettings.optimalRenderWidth / (float)outputWidth;
-		scaleY = (float)optimalSettings.optimalRenderHeight / (float)outputHeight;
-	}
-
-	// Return separate X and Y scales for more precision
-	return { scaleX, scaleY };
+	return {
+		(float)optimalSettings.optimalRenderWidth / (float)outputWidth,
+		(float)optimalSettings.optimalRenderHeight / (float)outputHeight
+	};
 }
 
 /**

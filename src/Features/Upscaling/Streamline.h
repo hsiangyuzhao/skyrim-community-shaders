@@ -61,6 +61,10 @@ public:
 	uint32_t dlssGConfiguredInputHeight = 0;
 	uint32_t dlssGConfiguredOutputWidth = 0;
 	uint32_t dlssGConfiguredOutputHeight = 0;
+	uint32_t dlssGTaggedInputWidth = 0;
+	uint32_t dlssGTaggedInputHeight = 0;
+	bool dlssSRLocalTagsLogged = false;
+	bool dlssRRLocalTagsLogged = false;
 
 	sl::ViewportHandle viewport{ 0 };
 

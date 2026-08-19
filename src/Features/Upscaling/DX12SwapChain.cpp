@@ -591,13 +591,33 @@ bool DX12SwapChain::ShouldUseNativeMapWarmup() const
 bool DX12SwapChain::DLSSGResourcesReadyForFrame(uint32_t a_frameIndex) const
 {
 	return a_frameIndex != UINT32_MAX &&
-		dlssGSceneResourcesFrameIndex == a_frameIndex &&
-		dlssGHUDLessFrameIndex == a_frameIndex;
+	       dlssGInputExtentFrameIndex == a_frameIndex &&
+	       dlssGSceneResourcesFrameIndex == a_frameIndex &&
+	       dlssGHUDLessFrameIndex == a_frameIndex;
 }
 
 bool DX12SwapChain::UpdateDLSSGPresentationState(bool a_frameGenerationRequested, bool a_mapMenuOpen, bool a_mapRenderingContext)
 {
 	auto& streamline = globals::features::upscaling.streamline;
+	auto resourcesReadyForFrame = [&](uint32_t a_frameIndex) {
+		if (DLSSGResourcesReadyForFrame(a_frameIndex)) {
+			if (dlssGWaitingForResources) {
+				logger::info("[DLSS-G] Token {} has aligned extent, scene, and HUD-less resources; frame generation may resume", a_frameIndex);
+				dlssGWaitingForResources = false;
+			}
+			return true;
+		}
+
+		if (!dlssGWaitingForResources) {
+			logger::info("[DLSS-G] Holding frame generation at token {} until extent={}, scene={}, and HUD-less={} resources align",
+				a_frameIndex,
+				dlssGInputExtentFrameIndex,
+				dlssGSceneResourcesFrameIndex,
+				dlssGHUDLessFrameIndex);
+			dlssGWaitingForResources = true;
+		}
+		return false;
+	};
 
 	if (a_mapMenuOpen && a_mapRenderingContext) {
 		if (dlssGPresentationState != DLSSGPresentationState::kMapWarmup &&
@@ -613,7 +633,7 @@ bool DX12SwapChain::UpdateDLSSGPresentationState(bool a_frameGenerationRequested
 			return false;
 
 		const uint32_t tokenFrameIndex = streamline.GetLatchedFrameTokenIndex();
-		if (!DLSSGResourcesReadyForFrame(tokenFrameIndex))
+		if (!resourcesReadyForFrame(tokenFrameIndex))
 			return false;
 
 		if (dlssGPresentationState == DLSSGPresentationState::kMapWarmup) {
@@ -647,14 +667,16 @@ bool DX12SwapChain::UpdateDLSSGPresentationState(bool a_frameGenerationRequested
 		logger::info("[DLSS-G] MapMenu closed; waiting for aligned world-frame resources before resuming");
 	}
 
-	if (!a_frameGenerationRequested)
+	if (!a_frameGenerationRequested) {
+		dlssGWaitingForResources = false;
+		return false;
+	}
+
+	const uint32_t tokenFrameIndex = streamline.GetLatchedFrameTokenIndex();
+	if (!resourcesReadyForFrame(tokenFrameIndex))
 		return false;
 
 	if (dlssGPresentationState == DLSSGPresentationState::kResumePending) {
-		const uint32_t tokenFrameIndex = streamline.GetLatchedFrameTokenIndex();
-		if (!DLSSGResourcesReadyForFrame(tokenFrameIndex))
-			return false;
-
 		if (dlssGResumeWarmupFrameIndex == UINT32_MAX) {
 			dlssGResumeWarmupFrameIndex = tokenFrameIndex;
 			logger::info("[DLSS-G] Captured warm-up world frame {}; keeping generation disabled for this Present", tokenFrameIndex);
@@ -672,10 +694,21 @@ bool DX12SwapChain::UpdateDLSSGPresentationState(bool a_frameGenerationRequested
 	return true;
 }
 
-void DX12SwapChain::SetDLSSGInputExtent(uint32_t a_width, uint32_t a_height)
+void DX12SwapChain::SetDLSSGInputExtent(uint32_t a_width, uint32_t a_height, uint32_t a_frameIndex)
 {
-	dlssGInputWidth = std::max(1u, a_width);
-	dlssGInputHeight = std::max(1u, a_height);
+	const auto inputWidth = std::max(1u, a_width);
+	const auto inputHeight = std::max(1u, a_height);
+	if (dlssGInputWidth != inputWidth || dlssGInputHeight != inputHeight) {
+		logger::info("[DLSS-G] Input extent changed from {}x{} to {}x{} at token {}",
+			dlssGInputWidth,
+			dlssGInputHeight,
+			inputWidth,
+			inputHeight,
+			a_frameIndex);
+	}
+	dlssGInputWidth = inputWidth;
+	dlssGInputHeight = inputHeight;
+	dlssGInputExtentFrameIndex = a_frameIndex;
 }
 
 uint32_t DX12SwapChain::GetDLSSGInputWidth() const
@@ -688,8 +721,20 @@ uint32_t DX12SwapChain::GetDLSSGInputHeight() const
 	return dlssGInputHeight != 0 ? dlssGInputHeight : swapChainDesc.Height;
 }
 
+bool DX12SwapChain::HasValidDLSSGInputExtent() const
+{
+	return dlssGInputWidth != 0 && dlssGInputHeight != 0 && dlssGInputExtentFrameIndex != UINT32_MAX;
+}
+
 void DX12SwapChain::CreateSharedResources()
 {
+	dlssGInputWidth = 0;
+	dlssGInputHeight = 0;
+	dlssGInputExtentFrameIndex = UINT32_MAX;
+	dlssGSceneResourcesFrameIndex = UINT32_MAX;
+	dlssGHUDLessFrameIndex = UINT32_MAX;
+	dlssGWaitingForResources = false;
+
 	auto renderer = globals::game::renderer;
 
 	// Create depth buffer

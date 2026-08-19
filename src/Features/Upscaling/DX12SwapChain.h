@@ -127,6 +127,7 @@ public:
 	// populated at the current fixed upscaling ratio.
 	uint32_t dlssGInputWidth = 0;
 	uint32_t dlssGInputHeight = 0;
+	uint32_t dlssGInputExtentFrameIndex = UINT32_MAX;
 
 	LARGE_INTEGER qpf;
 
@@ -155,9 +156,10 @@ public:
 	void SetUIBuffer();
 	void MarkDLSSGSceneResourcesReady(uint32_t a_frameIndex);
 	bool ShouldUseNativeMapWarmup() const;
-	void SetDLSSGInputExtent(uint32_t a_width, uint32_t a_height);
+	void SetDLSSGInputExtent(uint32_t a_width, uint32_t a_height, uint32_t a_frameIndex);
 	uint32_t GetDLSSGInputWidth() const;
 	uint32_t GetDLSSGInputHeight() const;
+	bool HasValidDLSSGInputExtent() const;
 
 	// D3D12 interop resource management
 	void CreateSharedResources();
@@ -180,4 +182,5 @@ private:
 	uint32_t dlssGHUDLessFrameIndex = UINT32_MAX;
 	uint32_t dlssGResumeWarmupFrameIndex = UINT32_MAX;
 	bool dlssGMapUnexpectedGeneratedFramesLogged = false;
+	bool dlssGWaitingForResources = false;
 };
