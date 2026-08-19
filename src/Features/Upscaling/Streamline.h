@@ -118,6 +118,7 @@ public:
 	sl::FrameToken* frameToken = nullptr;
 	uint32_t frameTokenIndex = UINT32_MAX;
 	bool frameConstantsValid = false;
+	bool temporalResetRequested = false;
 
 	/**
 	 * @brief Native D3D12 resources consumed by DLSS-G at Present time.
@@ -178,6 +179,7 @@ public:
 	bool BeginFrameToken();
 	void CheckFrameConstants();
 	void CheckFrameConstantsForLatchedFrame();
+	void RequestTemporalReset();
 	void SubmitFrameConstants();
 	const sl::FrameToken* GetFrameToken() const { return frameConstantsValid ? frameToken : nullptr; }
 	bool HasLatchedFrameToken() const { return frameConstantsValid && frameToken != nullptr; }

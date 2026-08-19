@@ -154,6 +154,7 @@ public:
 
 	void SetUIBuffer();
 	void MarkDLSSGSceneResourcesReady(uint32_t a_frameIndex);
+	bool ShouldUseNativeMapWarmup() const;
 	void SetDLSSGInputExtent(uint32_t a_width, uint32_t a_height);
 	uint32_t GetDLSSGInputWidth() const;
 	uint32_t GetDLSSGInputHeight() const;
@@ -165,11 +166,13 @@ private:
 	enum class DLSSGPresentationState
 	{
 		kGameplay,
+		kMapWarmup,
+		kMapGenerating,
 		kMapSuspended,
 		kResumePending
 	};
 
-	bool UpdateDLSSGPresentationState(bool a_frameGenerationRequested, bool a_mapMenuOpen);
+	bool UpdateDLSSGPresentationState(bool a_frameGenerationRequested, bool a_mapMenuOpen, bool a_mapRenderingContext);
 	bool DLSSGResourcesReadyForFrame(uint32_t a_frameIndex) const;
 
 	DLSSGPresentationState dlssGPresentationState = DLSSGPresentationState::kGameplay;

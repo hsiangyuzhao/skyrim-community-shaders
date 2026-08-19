@@ -207,6 +207,8 @@ public:
 	bool IsFrameGenerationEnabled() const;
 	bool IsDLSSGBackend() const;
 	bool IsDLSSGAvailable() const;
+	bool IsDLSSGMapRenderingContext();
+	bool ShouldUseNativeMapRendering();
 	void PresentFrameGeneration(bool a_useFrameGeneration, bool a_retainDLSSGResourcesWhenOff = true);
 	void CheckFrameConstants();
 	void SetUIBuffer();
@@ -231,6 +233,8 @@ public:
 	IDXGISwapChain* GetProxySwapChain();
 
 private:
+	bool dlssGMapRenderingContextActive = false;
+
 	struct Main_UpdateJitter
 	{
 		static void thunk(RE::BSGraphics::State* a_state);

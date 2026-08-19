@@ -189,16 +189,24 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
 	auto& upscaling = globals::features::upscaling;
 	auto* ui = globals::game::ui;
-	const bool frameGenerationRequested = upscaling.IsFrameGenerationEnabled() && !ui->GameIsPaused();
 	const bool mapMenuOpen = ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
+	const bool mapRenderingContext = upscaling.IsDLSSGMapRenderingContext();
+	// MapMenu normally pauses the game. Staged map recovery makes it safe to
+	// request DLSS-G after native and DLSS-SR-only warm-up frames.
+	const bool frameGenerationRequested = upscaling.IsFrameGenerationEnabled() &&
+		(!ui->GameIsPaused() || mapRenderingContext);
 	bool useFrameGeneration = frameGenerationRequested;
 
 	if (upscaling.IsDLSSGBackend() && upscaling.IsDLSSGAvailable()) {
 		// DLSS-G intercepts Present asynchronously. Apply a menu/off transition
 		// before selecting or writing the next native back buffer; doing it after
 		// the copy allows one more buffer to enter the old presentation mode.
-		useFrameGeneration = UpdateDLSSGPresentationState(frameGenerationRequested, mapMenuOpen);
-		upscaling.PresentFrameGeneration(useFrameGeneration);
+		useFrameGeneration = UpdateDLSSGPresentationState(frameGenerationRequested, mapMenuOpen, mapRenderingContext);
+		// Do not retain DLSS-G allocations while the map's native and SR reset
+		// frames are being presented. This prevents the disabled FG plugin from
+		// observing the DLSS SR tags which caused the original map corruption.
+		const bool retainResourcesWhenOff = !(mapRenderingContext && !useFrameGeneration);
+		upscaling.PresentFrameGeneration(useFrameGeneration, retainResourcesWhenOff);
 
 		// The interposer can advance the native swap-chain index when its mode
 		// changes. Re-query it after SetOptions instead of carrying the index from
@@ -542,8 +550,12 @@ void DX12SwapChain::SetUIBuffer()
 
 	if (upscaling.IsDLSSGBackend()) {
 		dlssGHUDLessFrameIndex = UINT32_MAX;
-		if (!globals::game::ui->GameIsPaused() &&
-			!globals::game::ui->IsMenuOpen(RE::MapMenu::MENU_NAME) &&
+		auto* ui = globals::game::ui;
+		const bool mapMenuOpen = ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
+		const bool mapRenderingContext = upscaling.IsDLSSGMapRenderingContext();
+		const bool sceneSupportsFrameGeneration = mapRenderingContext ||
+			(!ui->GameIsPaused() && !mapMenuOpen);
+		if (sceneSupportsFrameGeneration &&
 			upscaling.IsFrameGenerationEnabled() &&
 			upscaling.IsDLSSGAvailable()) {
 			// Capture the scene immediately before UI rendering. Keep the game
@@ -564,7 +576,16 @@ void DX12SwapChain::SetUIBuffer()
 
 void DX12SwapChain::MarkDLSSGSceneResourcesReady(uint32_t a_frameIndex)
 {
-	dlssGSceneResourcesFrameIndex = globals::game::ui->IsMenuOpen(RE::MapMenu::MENU_NAME) ? UINT32_MAX : a_frameIndex;
+	auto& upscaling = globals::features::upscaling;
+	const bool unsupportedMapFrame = globals::game::ui->IsMenuOpen(RE::MapMenu::MENU_NAME) &&
+		!upscaling.IsDLSSGMapRenderingContext();
+	dlssGSceneResourcesFrameIndex = unsupportedMapFrame ? UINT32_MAX : a_frameIndex;
+}
+
+bool DX12SwapChain::ShouldUseNativeMapWarmup() const
+{
+	return dlssGPresentationState != DLSSGPresentationState::kMapWarmup &&
+		dlssGPresentationState != DLSSGPresentationState::kMapGenerating;
 }
 
 bool DX12SwapChain::DLSSGResourcesReadyForFrame(uint32_t a_frameIndex) const
@@ -574,9 +595,39 @@ bool DX12SwapChain::DLSSGResourcesReadyForFrame(uint32_t a_frameIndex) const
 		dlssGHUDLessFrameIndex == a_frameIndex;
 }
 
-bool DX12SwapChain::UpdateDLSSGPresentationState(bool a_frameGenerationRequested, bool a_mapMenuOpen)
+bool DX12SwapChain::UpdateDLSSGPresentationState(bool a_frameGenerationRequested, bool a_mapMenuOpen, bool a_mapRenderingContext)
 {
 	auto& streamline = globals::features::upscaling.streamline;
+
+	if (a_mapMenuOpen && a_mapRenderingContext) {
+		if (dlssGPresentationState != DLSSGPresentationState::kMapWarmup &&
+			dlssGPresentationState != DLSSGPresentationState::kMapGenerating) {
+			dlssGPresentationState = DLSSGPresentationState::kMapWarmup;
+			dlssGResumeWarmupFrameIndex = streamline.GetLatchedFrameTokenIndex();
+			streamline.RequestTemporalReset();
+			logger::info("[DLSS-G] Captured native MapMenu frame {}; next frame will restart DLSS SR with reset while generation remains disabled", dlssGResumeWarmupFrameIndex);
+			return false;
+		}
+
+		if (!a_frameGenerationRequested)
+			return false;
+
+		const uint32_t tokenFrameIndex = streamline.GetLatchedFrameTokenIndex();
+		if (!DLSSGResourcesReadyForFrame(tokenFrameIndex))
+			return false;
+
+		if (dlssGPresentationState == DLSSGPresentationState::kMapWarmup) {
+			if (tokenFrameIndex == dlssGResumeWarmupFrameIndex)
+				return false;
+
+			dlssGPresentationState = DLSSGPresentationState::kMapGenerating;
+			dlssGResumeWarmupFrameIndex = UINT32_MAX;
+			logger::info("[DLSS-G] Completed MapMenu DLSS SR reset frame {}; generation remains disabled for this Present", tokenFrameIndex);
+			return false;
+		}
+
+		return true;
+	}
 
 	if (a_mapMenuOpen) {
 		if (dlssGPresentationState != DLSSGPresentationState::kMapSuspended) {
@@ -588,7 +639,9 @@ bool DX12SwapChain::UpdateDLSSGPresentationState(bool a_frameGenerationRequested
 		return false;
 	}
 
-	if (dlssGPresentationState == DLSSGPresentationState::kMapSuspended) {
+	if (dlssGPresentationState == DLSSGPresentationState::kMapSuspended ||
+		dlssGPresentationState == DLSSGPresentationState::kMapWarmup ||
+		dlssGPresentationState == DLSSGPresentationState::kMapGenerating) {
 		dlssGPresentationState = DLSSGPresentationState::kResumePending;
 		dlssGResumeWarmupFrameIndex = UINT32_MAX;
 		logger::info("[DLSS-G] MapMenu closed; waiting for aligned world-frame resources before resuming");

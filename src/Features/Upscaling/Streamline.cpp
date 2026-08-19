@@ -517,6 +517,11 @@ void Streamline::CheckFrameConstantsForLatchedFrame()
 	SubmitFrameConstants();
 }
 
+void Streamline::RequestTemporalReset()
+{
+	temporalResetRequested = true;
+}
+
 void Streamline::SubmitFrameConstants()
 {
 	if (frameConstantsValid)
@@ -557,7 +562,7 @@ void Streamline::SubmitFrameConstants()
 	auto jitter = upscaling.jitter;
 	slConstants.jitterOffset = { -jitter.x, -jitter.y };
 
-	slConstants.reset = sl::Boolean::eFalse;
+	slConstants.reset = temporalResetRequested ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 
 	slConstants.mvecScale = { (globals::game::isVR ? 0.5f : 1.0f), 1 };
 	slConstants.motionVectors3D = sl::Boolean::eFalse;
@@ -575,6 +580,10 @@ void Streamline::SubmitFrameConstants()
 		return;
 	}
 
+	if (temporalResetRequested) {
+		logger::info("[Streamline] Submitted requested temporal reset for frame {}", currentFrame);
+		temporalResetRequested = false;
+	}
 	frameConstantsValid = true;
 }
 
