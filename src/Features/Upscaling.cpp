@@ -1010,6 +1010,11 @@ void Upscaling::CopySharedD3D12Resources()
 
 	auto& motionVector = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
 	context->CopyResource(dx12SwapChain.motionVectorBufferShared12->resource11, motionVector.texture);
+	if (dx12SwapChain.motionVectorFrameGenerationShared12) {
+		// Preserve the engine's original MV field for DLSS-G before the DLSS SR
+		// encode pass overwrites its own interop buffer with depth-aware dilation.
+		context->CopyResource(dx12SwapChain.motionVectorFrameGenerationShared12->resource11, motionVector.texture);
+	}
 	auto& albedo = renderer->GetRuntimeData().renderTargets[ALBEDO];
 	context->CopyResource(dx12SwapChain.albedoShared12->resource11, albedo.texture);
 	auto& reflectance = renderer->GetRuntimeData().renderTargets[REFLECTANCE];

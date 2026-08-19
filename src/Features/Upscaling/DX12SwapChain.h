@@ -90,6 +90,10 @@ public:
 
 	// D3D12 interop resources for frame generation
 	WrappedResource* depthBufferShared12 = nullptr;
+	// DLSS SR keeps its existing depth-aware MV buffer below. DLSS-G consumes
+	// this separate untouched engine MV copy so the two features cannot change
+	// each other's motion-vector interpretation.
+	WrappedResource* motionVectorFrameGenerationShared12 = nullptr;
 	WrappedResource* motionVectorBufferShared12 = nullptr;
 
 	// for sr/rr

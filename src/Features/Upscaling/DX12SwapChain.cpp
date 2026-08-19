@@ -259,7 +259,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		// hooking state explicit without routing FSR resources through SL.
 		Streamline::DLSSGFrameResources frameResources{};
 		frameResources.depth = depthBufferShared12->resource.get();
-		frameResources.motionVectors = motionVectorBufferShared12->resource.get();
+		frameResources.motionVectors = motionVectorFrameGenerationShared12 ? motionVectorFrameGenerationShared12->resource.get() : nullptr;
 		// FinalColor remains scene plus UI. This snapshot is only the HUD-less
 		// input consumed by DLSS-G's normal gameplay path.
 		frameResources.hudless = uiBufferWrapped->resource.get();
@@ -760,4 +760,8 @@ void DX12SwapChain::CreateSharedResources()
 	auto& motionVector = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
 	motionVector.texture->GetDesc(&texDesc);
 	motionVectorBufferShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
+	if (globals::features::upscaling.IsDLSSGBackend()) {
+		motionVectorFrameGenerationShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
+		logger::info("[DLSS-G] Created an isolated original motion-vector buffer; DLSS SR keeps its existing depth-aware motion-vector path");
+	}
 }

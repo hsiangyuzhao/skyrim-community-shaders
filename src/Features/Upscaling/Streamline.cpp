@@ -673,8 +673,8 @@ bool Streamline::SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff)
 	options.colorWidth = swapChain.swapChainDesc.Width;
 	options.colorHeight = swapChain.swapChainDesc.Height;
 	options.colorBufferFormat = static_cast<uint32_t>(swapChain.swapChainDesc.Format);
-	if (swapChain.motionVectorBufferShared12)
-		options.mvecBufferFormat = static_cast<uint32_t>(swapChain.motionVectorBufferShared12->resource->GetDesc().Format);
+	if (swapChain.motionVectorFrameGenerationShared12)
+		options.mvecBufferFormat = static_cast<uint32_t>(swapChain.motionVectorFrameGenerationShared12->resource->GetDesc().Format);
 	if (swapChain.depthBufferShared12)
 		options.depthBufferFormat = static_cast<uint32_t>(swapChain.depthBufferShared12->resource->GetDesc().Format);
 	if (swapChain.uiBufferWrapped)
