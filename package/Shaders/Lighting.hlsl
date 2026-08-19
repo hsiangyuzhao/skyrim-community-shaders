@@ -2146,9 +2146,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			if (SharedData::skinData.skinParams2.y > 1.0f) {
 				wetNormal = lerp(wetNormal, tangentNormal, saturate(SharedData::skinData.skinParams2.y - 1.0f));
 			}
-			float3 combinedWetNormal = skinWetMask ? wetNormal : combinedTangentNormal;
+			// Texture sampling already supplies filtered mask coverage. Applying a
+			// second screen-space fwidth here made the artist mask vary with distance;
+			// procedural wet/dry coverage is filtered at its threshold instead.
+			const float wetMaskCoverage = saturate(skinWetMask);
+			const float wetNormalWeight = Skin::GetWetnessResponse(skinWetness * wetMaskCoverage);
+			float3 combinedWetNormal = normalize(lerp(combinedTangentNormal, wetNormal, wetNormalWeight));
 			wetWorldNormal = normalize(mul(tbn, combinedWetNormal));
-			wetWorldNormal = lerp(worldNormal.xyz, wetWorldNormal, skinWetness > 0 ? 1 : 0);
 			worldNormal.xyz = wetWorldNormal;
 		}
 	}
@@ -2531,7 +2535,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	skinSurfaceProperties.FuzzRoughness = SharedData::skinData.fuzzParams.y;
 	skinSurfaceProperties.FuzzColor = SharedData::skinData.fuzzParams.zzz;
 
-	skinSurfaceProperties.Wetness = skinWetness;
+	const float skinWetMaskCoverage = saturate(skinWetMask);
+	skinSurfaceProperties.Wetness = saturate(skinWetness * skinWetMaskCoverage);
+	skinSurfaceProperties.WetnessFilmStrength = max(SharedData::skinData.physicalParams.w, 0.0f);
 
 	if (skinRoughnessSet) {
 		skinSurfaceProperties.F0 = 0.08f * skinSpecular * SharedData::skinData.physicalParams.z;
@@ -2544,7 +2550,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float averageRoughness = lerp(skinSurfaceProperties.RoughnessPrimary, skinSurfaceProperties.RoughnessSecondary, skinSurfaceProperties.SecondarySpecIntensity);
 
 	float pbrWeight = 1;
-	float pbrGlossiness = skinSurfaceProperties.Wetness == 0.0 ? (1 - averageRoughness) : (1 - WATER_ROUGHNESS);
+	float pbrGlossiness = lerp(1 - averageRoughness, 1 - WATER_ROUGHNESS, saturate(Skin::GetWetnessOpticalResponse(skinSurfaceProperties.Wetness) * skinSurfaceProperties.WetnessFilmStrength));
 #	endif  // CS_SKIN
 
 	float porosity = 1.0;

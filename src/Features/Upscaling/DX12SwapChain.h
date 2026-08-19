@@ -62,6 +62,11 @@ class DX12SwapChain
 {
 public:
 	winrt::com_ptr<ID3D12Device> d3d12Device;
+	// Native device remains the owner for host resources and is the device
+	// passed to slSetD3DDevice. DLSS-G uses this upgraded interface only for
+	// intercepted command-queue creation.
+	winrt::com_ptr<ID3D12Device> d3d12DeviceProxy;
+	winrt::com_ptr<ID3D12CommandQueue> commandQueueProxy;
 	winrt::com_ptr<ID3D12CommandQueue> commandQueue;
 	winrt::com_ptr<ID3D12CommandAllocator> commandAllocators[2];
 	winrt::com_ptr<ID3D12GraphicsCommandList4> commandLists[2];
@@ -72,7 +77,11 @@ public:
 	winrt::com_ptr<ID3D12CommandAllocator> nisSharpenerCommandAllocator[2];
 	winrt::com_ptr<ID3D12GraphicsCommandList4> nisSharpenerCommandList[2];
 
-	IDXGISwapChain4* swapChain;
+	IDXGISwapChain4* swapChain = nullptr;
+	// slGetNativeInterface returns an AddRef'd pointer. Keep it owned for
+	// non-intercepted DXGI calls while Present/GetBuffer/back-buffer-index use
+	// the Streamline proxy stored above.
+	winrt::com_ptr<IDXGISwapChain4> nativeSwapChain;
 
 	DXGI_SWAP_CHAIN_DESC1 swapChainDesc;
 
@@ -113,6 +122,12 @@ public:
 
 	UINT64 upscalingFenceValue = 0;
 
+	// Active depth/motion-vector region for the rendered frame. The backing
+	// resources can be output-sized, but DLSS-G must only consume the region
+	// populated at the current fixed upscaling ratio.
+	uint32_t dlssGInputWidth = 0;
+	uint32_t dlssGInputHeight = 0;
+
 	LARGE_INTEGER qpf;
 
 	double refreshRate = 0;
@@ -135,9 +150,31 @@ public:
 	HRESULT Present(UINT SyncInterval, UINT Flags);
 	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
 	HANDLE GetFrameLatencyWaitableObject();
+	IDXGISwapChain4* GetNativeSwapChain() const;
 
 	void SetUIBuffer();
+	void MarkDLSSGSceneResourcesReady(uint32_t a_frameIndex);
+	void SetDLSSGInputExtent(uint32_t a_width, uint32_t a_height);
+	uint32_t GetDLSSGInputWidth() const;
+	uint32_t GetDLSSGInputHeight() const;
 
 	// D3D12 interop resource management
 	void CreateSharedResources();
+
+private:
+	enum class DLSSGPresentationState
+	{
+		kGameplay,
+		kMapSuspended,
+		kResumePending
+	};
+
+	bool UpdateDLSSGPresentationState(bool a_frameGenerationRequested, bool a_mapMenuOpen);
+	bool DLSSGResourcesReadyForFrame(uint32_t a_frameIndex) const;
+
+	DLSSGPresentationState dlssGPresentationState = DLSSGPresentationState::kGameplay;
+	uint32_t dlssGSceneResourcesFrameIndex = UINT32_MAX;
+	uint32_t dlssGHUDLessFrameIndex = UINT32_MAX;
+	uint32_t dlssGResumeWarmupFrameIndex = UINT32_MAX;
+	bool dlssGMapUnexpectedGeneratedFramesLogged = false;
 };

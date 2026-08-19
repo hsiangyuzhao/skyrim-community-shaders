@@ -32,6 +32,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	StartSweat,
 	FullSweat,
 	WetParams,
+	WetnessFilmStrength,
 	Translucency,
 	sssWidth,
 	UseSSS,
@@ -144,6 +145,10 @@ void Skin::DrawSettings()
 	ImGui::SliderFloat("Wetness Perlin Noise Lacunarity", &settings.WetParams.y, 0.0f, 2.0f, "%.1f");
 	ImGui::SliderFloat("Wetness Perlin Noise Persistence", &settings.WetParams.z, 0.0f, 20.0f, "%.2f");
 	ImGui::SliderFloat("Wetness Normal Scale", &settings.WetParams.w, 0.0f, 20.0f, "%.1f");
+	ImGui::SliderFloat("Wetness Film Strength", &settings.WetnessFilmStrength, 0.0f, 3.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Controls the optical strength of the water film without changing its Perlin pattern or normal scale");
+	}
 
 	ImGui::Spacing();
 
@@ -284,7 +289,7 @@ Skin::SkinData Skin::GetCommonBufferData()
 	data.skinDetailParams = float4(settings.SkinDetailTiling, settings.BodyTilingMultiplier, settings.SkinDetailStrength, float(settings.EnableSkinDetail && settings.EnableSkin));
 	data.sssParams = float4(settings.Translucency, settings.sssWidth, 0.0f, float(settings.UseSSS));
 	data.fuzzParams = float4(settings.FuzzStrength, settings.FuzzRoughness, settings.FuzzF0, settings.ExtraEdgeRoughness);
-	data.physicalParams = float4(settings.PhysicalMainRoughnessMultiplier, settings.PhysicalSecondRoughnessMultiplier, settings.PhysicalSpecularStrength, 0.0f);
+	data.physicalParams = float4(settings.PhysicalMainRoughnessMultiplier, settings.PhysicalSecondRoughnessMultiplier, settings.PhysicalSpecularStrength, settings.WetnessFilmStrength);
 	data.wetParams = settings.WetParams;
 	return data;
 }

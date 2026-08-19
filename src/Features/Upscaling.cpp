@@ -24,6 +24,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	qualityMode,
 	frameLimitMode,
 	frameGenerationMode,
+	frameGenerationBackend,
 	frameGenerationForceEnable,
 	streamlineLogLevel,
 	sharpnessFSR,
@@ -96,7 +97,11 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 
 	const D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_1;
 
-	if (shouldProxy && upscaling.isWindowed) {
+	const bool dlssGStartupUnavailable = upscaling.IsDLSSGBackend() && !upscaling.HasFrameGenModule();
+	if (dlssGStartupUnavailable)
+		logger::error("[Upscaling] DLSS-G was selected at startup but its required Streamline features are unavailable; using the native D3D11 path for this session");
+
+	if (shouldProxy && upscaling.isWindowed && !dlssGStartupUnavailable) {
 		logger::info("[Upscaling] Using D3D12 proxy");
 
 		if (upscaling.HasFrameGenModule() || upscaling.streamline.featureDLSS) {
@@ -121,19 +126,28 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 
 			upscaling.d3d12SwapChainActive = true;
 
-			auto d3d12Device = upscaling.dx12SwapChain.d3d12Device.get();
-
 			if (upscaling.IsBackendInitialized()) {
-				upscaling.UpgradeBackendInterface((void**)&d3d12Device);
-				upscaling.UpgradeBackendInterface((void**)&(*ppSwapChain));
-				upscaling.SetBackendD3DDevice((void*)d3d12Device);
-				upscaling.PostBackendDevice();
+				if (upscaling.IsDLSSGBackend() && upscaling.streamline.featureDLSS_G && upscaling.streamline.featureReflex && upscaling.streamline.featurePCL) {
+					// DLSS-G registered the native D3D12 device and loaded its
+					// feature functions before command queue/swap-chain creation.
+				} else {
+					// Preserve the existing FSR/DLSS Streamline setup. FFX owns
+					// the swap chain in this branch, so do not change its creation
+					// ordering here.
+					auto d3d12Device = upscaling.dx12SwapChain.d3d12Device.get();
+					upscaling.UpgradeBackendInterface((void**)&d3d12Device);
+					upscaling.UpgradeBackendInterface((void**)&(*ppSwapChain));
+					upscaling.SetBackendD3DDevice((void*)d3d12Device);
+				}
+				if (!upscaling.IsDLSSGBackend())
+					upscaling.PostBackendDevice();
 			}
 
 			return S_OK;
 		} else {
 			logger::warn("[Upscaling] Skipping proxy");
-			upscaling.fidelityFXMissing = true;
+			if (upscaling.GetFrameGenerationBackend() == Upscaling::FrameGenerationBackend::kFSR3FG)
+				upscaling.fidelityFXMissing = true;
 		}
 	}
 
@@ -240,9 +254,9 @@ void Upscaling::DrawSettings()
 				"M (Forced override)",
 				"Streamline 2.12 documented mapping (K/K/K/M/L)"
 			};
-			int presetIndex = static_cast<int>(settings.DLSSPreset);
-			if (ImGui::Combo("DLSS SR Model Preset", &presetIndex, presets, IM_ARRAYSIZE(presets)))
-				settings.DLSSPreset = static_cast<uint>(presetIndex);
+			int dlssPresetIndex = static_cast<int>(settings.DLSSPreset);
+			if (ImGui::Combo("DLSS SR Model Preset", &dlssPresetIndex, presets, IM_ARRAYSIZE(presets)))
+				settings.DLSSPreset = static_cast<uint>(dlssPresetIndex);
 
 			if (rayReconstructionActive)
 				ImGui::EndDisabled();
@@ -263,47 +277,54 @@ void Upscaling::DrawSettings()
 	if (!globals::game::isVR) {
 		if (ImGui::TreeNodeEx("Frame Generation", ImGuiTreeNodeFlags_DefaultOpen)) {
 			ImGui::Text("Frame Generation interpolates real frames with generated ones for a smoother experience");
-			ImGui::Text("Uses AMD FSR Frame Generation technology");
-			if (fidelityFX.featureFSR3FG)
-				ImGui::Text("AMD FSR Frame Generation is available.");
-			ImGui::Text("Requires a D3D11 to D3D12 proxy which can create compatibility issues");
-			ImGui::Text("Toggling this setting requires a restart to work correctly");
 
-			bool onlyRequiresRestart = true;
+			const char* frameGenerationBackends[] = { "AMD FSR 3.1", "NVIDIA DLSS-G" };
+			const auto configuredBackend = GetConfiguredFrameGenerationBackend();
+			int backendIndex = static_cast<int>(configuredBackend);
+			if (ImGui::Combo("Frame Generation Backend", &backendIndex, frameGenerationBackends, IM_ARRAYSIZE(frameGenerationBackends)))
+				settings.frameGenerationBackend = static_cast<uint>(backendIndex);
+
+			const auto activeBackend = GetFrameGenerationBackend();
+			if (configuredBackend != activeBackend) {
+				ImGui::TextDisabled("Backend availability will be checked after restart.");
+			} else if (configuredBackend == FrameGenerationBackend::kFSR3FG) {
+				if (fidelityFX.featureFSR3FG)
+					ImGui::Text("AMD FSR 3.1 Frame Generation is available.");
+			} else if (IsDLSSGAvailable()) {
+				ImGui::Text("NVIDIA DLSS-G Frame Generation is available.");
+			} else {
+				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+				ImGui::Text("Warning: NVIDIA DLSS-G is not available through Streamline");
+				ImGui::PopStyleColor();
+			}
+
+			ImGui::Text("Requires a D3D11 to D3D12 proxy which can create compatibility issues");
+			ImGui::Text("Backend and enable state are selected at game startup");
+			ImGui::Text("Changing either setting requires restarting the game");
 
 			if (!isWindowed) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 				ImGui::Text("Warning: Requires windowed mode");
 				ImGui::PopStyleColor();
-
-				onlyRequiresRestart = false;
 			}
 
 			if (lowRefreshRate && !settings.frameGenerationForceEnable) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 				ImGui::Text("Warning: Requires a high refresh rate monitor or Force Enable Frame Generation");
 				ImGui::PopStyleColor();
-
-				onlyRequiresRestart = false;
 			}
 
-			if (fidelityFXMissing) {
+			if (fidelityFXMissing && activeBackend == FrameGenerationBackend::kFSR3FG) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 				ImGui::Text("Warning: FidelityFX DLLs are not loaded");
 				ImGui::PopStyleColor();
-
-				onlyRequiresRestart = false;
 			}
 
-			if (onlyRequiresRestart && settings.frameGenerationMode && !d3d12SwapChainActive) {
+			const bool backendPendingRestart = frameGenerationBackendLatched && configuredBackend != frameGenerationBackendAtStartup;
+			const bool enabledPendingRestart = frameGenerationBackendLatched && (settings.frameGenerationMode != (frameGenerationEnabledAtStartup ? 1u : 0u));
+			if (backendPendingRestart || enabledPendingRestart) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Warning: Requires restart");
-				ImGui::PopStyleColor();
-			}
-
-			if (!settings.frameGenerationMode && d3d12SwapChainActive) {
-				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Warning: Requires restart");
+				ImGui::Text("Warning: Restart the game to apply frame-generation changes");
 				ImGui::PopStyleColor();
 			}
 
@@ -406,6 +427,15 @@ void Upscaling::LoadSettings(json& o_json)
 	if (settings.upscaleMethodNoDLSS >= static_cast<uint>(enumCount)) {
 		logger::warn("[Upscaling] Loaded upscaleMethodNoDLSS {} out of range, clamping to {}", settings.upscaleMethodNoDLSS, enumCount ? enumCount - 1 : 0);
 		settings.upscaleMethodNoDLSS = enumCount ? enumCount - 1 : 0;
+	}
+	if (settings.frameGenerationMode > 1) {
+		logger::warn("[Upscaling] Loaded frameGenerationMode {} out of range, clamping to enabled", settings.frameGenerationMode);
+		settings.frameGenerationMode = 1;
+	}
+	constexpr auto frameGenerationBackendCount = static_cast<uint>(FrameGenerationBackend::kCount);
+	if (settings.frameGenerationBackend >= frameGenerationBackendCount) {
+		logger::warn("[Upscaling] Loaded frameGenerationBackend {} out of range, falling back to FSR 3.1", settings.frameGenerationBackend);
+		settings.frameGenerationBackend = static_cast<uint>(FrameGenerationBackend::kFSR3FG);
 	}
 	constexpr auto dlssPresetCount = static_cast<uint>(DLSSModelPreset::kCount);
 	if (settings.DLSSPreset >= dlssPresetCount) {
@@ -586,7 +616,7 @@ void Upscaling::CheckResources(UpscaleMethod a_upscalemethod)
 	static bool previousFrameGenMode = false;
 	static bool previousRR = false;
 
-	bool frameGenModeCurrent = (settings.frameGenerationMode && d3d12SwapChainActive);
+	bool frameGenModeCurrent = (IsFrameGenerationEnabled() && d3d12SwapChainActive);
 	bool frameGenModeChanged = frameGenModeCurrent != previousFrameGenMode;
 	bool upscaleModeChanged = (previousUpscaleMode != a_upscalemethod);
 	bool rrChanged = (settings.enableDLSSRR != previousRR);
@@ -629,7 +659,7 @@ void Upscaling::CheckResources(UpscaleMethod a_upscalemethod)
 
 		// Update tracking for next call
 		previousUpscaleMode = a_upscalemethod;
-		previousFrameGenMode = (settings.frameGenerationMode && d3d12SwapChainActive);
+		previousFrameGenMode = (IsFrameGenerationEnabled() && d3d12SwapChainActive);
 		previousRR = settings.enableDLSSRR;
 		previousUpscalingWasActive = IsUpscalingActive();
 	}
@@ -942,6 +972,26 @@ void Upscaling::CopySharedD3D12Resources()
 	auto renderer = globals::game::renderer;
 	auto context = globals::d3d::context;
 
+	if (IsDLSSGBackend()) {
+		// Capture this while the rendering scale for the current frame is still
+		// active. PostDisplay restores the game's viewport ratios before Present,
+		// so deriving the extent there would incorrectly produce output size.
+		const auto screenSize = globals::state->screenSize;
+		const auto depthDesc = dx12SwapChain.depthBufferShared12->resource->GetDesc();
+		const auto motionVectorDesc = dx12SwapChain.motionVectorBufferShared12->resource->GetDesc();
+		const auto maxInputWidth = static_cast<uint32_t>(std::min(depthDesc.Width, motionVectorDesc.Width));
+		const auto maxInputHeight = std::min(depthDesc.Height, motionVectorDesc.Height);
+		const auto inputWidth = std::clamp(
+			static_cast<uint32_t>(std::lround(screenSize.x * resolutionScale.x)),
+			1u,
+			maxInputWidth);
+		const auto inputHeight = std::clamp(
+			static_cast<uint32_t>(std::lround(screenSize.y * resolutionScale.y)),
+			1u,
+			maxInputHeight);
+		dx12SwapChain.SetDLSSGInputExtent(inputWidth, inputHeight);
+	}
+
 	auto& motionVector = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
 	context->CopyResource(dx12SwapChain.motionVectorBufferShared12->resource11, motionVector.texture);
 	auto& albedo = renderer->GetRuntimeData().renderTargets[ALBEDO];
@@ -1014,6 +1064,9 @@ void Upscaling::CopySharedD3D12Resources()
 	context->PSSetShader(nullptr, nullptr, 0);
 	context->VSSetShader(nullptr, nullptr, 0);
 
+	if (IsDLSSGBackend())
+		dx12SwapChain.MarkDLSSGSceneResourcesReady(streamline.GetLatchedFrameTokenIndex());
+
 	globals::state->EndPerfEvent();
 }
 
@@ -1068,7 +1121,7 @@ void Upscaling::FrameLimiter()
 		if (settings.frameLimitMode) {
 			// Fall back to the original timing method
 			// Use integer arithmetic for more precise timing
-			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate * (settings.frameGenerationMode && !globals::game::ui->GameIsPaused() ? 0.5 : 1.0)));
+			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate * (IsFrameGenerationEnabled() && !globals::game::ui->GameIsPaused() ? 0.5 : 1.0)));
 			int64_t targetFrameTicks = (targetFrameTimeNS * qpf.QuadPart) / 1000000000LL;
 
 			static LARGE_INTEGER lastFrame = {};
@@ -1145,7 +1198,8 @@ double Upscaling::GetRefreshRate(HWND a_window)
 
 bool Upscaling::IsFrameGenerationActive() const
 {
-	return d3d12SwapChainActive && settings.frameGenerationMode && fidelityFX.isFrameGenActive && !globals::game::isVR;
+	const bool backendActive = IsDLSSGBackend() ? streamline.IsDLSSGActive() : fidelityFX.isFrameGenActive;
+	return d3d12SwapChainActive && IsFrameGenerationEnabled() && backendActive && !globals::game::isVR;
 }
 
 bool Upscaling::IsUpscalingActive()
@@ -1190,8 +1244,74 @@ void Upscaling::LoadUpscalingSDKs()
 {
 	// Initialize upscaling SDK components during plugin startup
 	// This ensures all SDKs are available before any D3D device creation
+	LatchFrameGenerationBackend();
+	streamline.SelectDLSSGBackendAtBoot(IsDLSSGBackend());
 	streamline.LoadInterposer();
-	fidelityFX.LoadFFX();  // Only for frame generation now
+	if (!IsDLSSGBackend())
+		fidelityFX.LoadFFX();  // Only the cold-selected FSR3 frame-generation path owns these DLLs.
+	else
+		logger::info("[Upscaling] Skipping FidelityFX frame-generation runtime because DLSS-G is selected for this session");
+}
+
+void Upscaling::LatchFrameGenerationBackend()
+{
+	if (frameGenerationBackendLatched)
+		return;
+
+	frameGenerationBackendAtStartup = GetConfiguredFrameGenerationBackend();
+	frameGenerationEnabledAtStartup = settings.frameGenerationMode != 0;
+	frameGenerationBackendLatched = true;
+
+	logger::info("[Upscaling] Frame generation backend latched at startup: {} (enabled={})",
+		magic_enum::enum_name(frameGenerationBackendAtStartup),
+		frameGenerationEnabledAtStartup);
+}
+
+Upscaling::FrameGenerationBackend Upscaling::GetConfiguredFrameGenerationBackend() const
+{
+	const auto backend = static_cast<FrameGenerationBackend>(settings.frameGenerationBackend);
+	if (backend >= FrameGenerationBackend::kCount)
+		return FrameGenerationBackend::kFSR3FG;
+	return backend;
+}
+
+Upscaling::FrameGenerationBackend Upscaling::GetFrameGenerationBackend() const
+{
+	return frameGenerationBackendLatched ? frameGenerationBackendAtStartup : GetConfiguredFrameGenerationBackend();
+}
+
+bool Upscaling::IsFrameGenerationEnabled() const
+{
+	return frameGenerationBackendLatched ? frameGenerationEnabledAtStartup : settings.frameGenerationMode != 0;
+}
+
+bool Upscaling::IsDLSSGBackend() const
+{
+	return GetFrameGenerationBackend() == FrameGenerationBackend::kDLSSG;
+}
+
+bool Upscaling::IsDLSSGAvailable() const
+{
+	return streamline.IsDLSSGReady();
+}
+
+void Upscaling::PresentFrameGeneration(bool a_useFrameGeneration, bool a_retainDLSSGResourcesWhenOff)
+{
+	if (!IsDLSSGBackend()) {
+		fidelityFX.Present(a_useFrameGeneration);
+		return;
+	}
+
+	if (!IsDLSSGAvailable()) {
+		static bool unavailableLogged = false;
+		if (a_useFrameGeneration && !unavailableLogged) {
+			logger::warn("[Upscaling] DLSS-G is selected but its Streamline interface is unavailable");
+			unavailableLogged = true;
+		}
+		return;
+	}
+
+	streamline.SetDLSSGMode(a_useFrameGeneration, a_retainDLSSGResourcesWhenOff);
 }
 
 void Upscaling::CheckFrameConstants()
@@ -1227,12 +1347,14 @@ void Upscaling::CheckBackendFeatures(IDXGIAdapter* adapter)
 
 void Upscaling::UpgradeBackendInterface(void** ppInterface)
 {
-	streamline.slUpgradeInterface(ppInterface);
+	if (const auto result = streamline.UpgradeInterface(ppInterface); result != sl::Result::eOk)
+		logger::warn("[Streamline] Failed to upgrade a D3D12 interface ({})", magic_enum::enum_name(result));
 }
 
 void Upscaling::SetBackendD3DDevice(void* device)
 {
-	streamline.slSetD3DDevice(device);
+	if (const auto result = streamline.SetD3DDevice(device); result != sl::Result::eOk)
+		logger::warn("[Streamline] Failed to register the D3D12 device ({})", magic_enum::enum_name(result));
 }
 
 void Upscaling::PostBackendDevice()
@@ -1243,6 +1365,11 @@ void Upscaling::PostBackendDevice()
 // Module availability methods
 bool Upscaling::HasFrameGenModule() const
 {
+	if (IsDLSSGBackend())
+		// This query is used before PostDevice() to decide whether the proxy
+		// swap chain must be created. Function pointers are not ready yet, so
+		// use the feature support result latched by CheckFeatures().
+		return streamline.featureDLSS_G && streamline.featureReflex && streamline.featurePCL;
 	return fidelityFX.featureFSR3FG;
 }
 
@@ -1639,7 +1766,7 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 	auto& upscaling = globals::features::upscaling;
 	auto upscaleMethod = upscaling.GetUpscaleMethod();
 
-	if (upscaling.d3d12SwapChainActive && (upscaling.settings.frameGenerationMode || upscaleMethod == UpscaleMethod::kDLSS))
+	if (upscaling.d3d12SwapChainActive && (upscaling.IsFrameGenerationEnabled() || upscaleMethod == UpscaleMethod::kDLSS))
 		upscaling.CopySharedD3D12Resources();
 
 	if (upscaling.d3d12SwapChainActive) {

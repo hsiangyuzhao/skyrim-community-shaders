@@ -45,6 +45,17 @@ public:
 		kDLSS
 	};
 
+	// Stored in SettingsUser.json. Keep existing values stable and append new
+	// backends. The old frameGenerationMode setting remains the enable/disable
+	// switch; a missing frameGenerationBackend therefore preserves the legacy
+	// FSR 3 frame-generation behavior.
+	enum class FrameGenerationBackend : uint
+	{
+		kFSR3FG = 0,
+		kDLSSG = 1,
+		kCount
+	};
+
 	// Stored in SettingsUser.json. Keep existing values stable and append new ones.
 	enum class DLSSModelPreset : uint
 	{
@@ -64,6 +75,7 @@ public:
 		uint qualityMode = 1;  // Default to Quality (1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance, 0=Native AA)
 		uint frameLimitMode = 1;
 		uint frameGenerationMode = 1;
+		uint frameGenerationBackend = static_cast<uint>(FrameGenerationBackend::kFSR3FG);
 		uint frameGenerationForceEnable = 0;
 		uint streamlineLogLevel = 0;  // 0=Off, 1=Default, 2=Verbose
 		float sharpnessFSR = 1.0f;
@@ -94,6 +106,9 @@ public:
 	bool lowRefreshRate = false;
 	bool fidelityFXMissing = false;
 	bool d3d12SwapChainActive = false;
+	bool frameGenerationBackendLatched = false;
+	bool frameGenerationEnabledAtStartup = false;
+	FrameGenerationBackend frameGenerationBackendAtStartup = FrameGenerationBackend::kFSR3FG;
 
 	// Timing and scaling
 	double refreshRate = 0.0f;
@@ -186,6 +201,13 @@ public:
 
 	// Unified interface methods - external code should use these instead of direct access
 	void LoadUpscalingSDKs();  // Loads all SDKs at once
+	void LatchFrameGenerationBackend();
+	FrameGenerationBackend GetFrameGenerationBackend() const;
+	FrameGenerationBackend GetConfiguredFrameGenerationBackend() const;
+	bool IsFrameGenerationEnabled() const;
+	bool IsDLSSGBackend() const;
+	bool IsDLSSGAvailable() const;
+	void PresentFrameGeneration(bool a_useFrameGeneration, bool a_retainDLSSGResourcesWhenOff = true);
 	void CheckFrameConstants();
 	void SetUIBuffer();
 	HANDLE GetFrameLatencyWaitableObject() const;

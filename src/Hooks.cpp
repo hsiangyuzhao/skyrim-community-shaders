@@ -713,17 +713,30 @@ namespace Hooks
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
 
-#ifdef TRACY_ENABLE
 	struct Main_Update
 	{
 		static void thunk(RE::Main* a_this, float a2)
 		{
+			auto& upscaling = globals::features::upscaling;
+			auto& streamline = upscaling.streamline;
+			const bool useStreamlineFrameTiming = upscaling.IsDLSSGBackend() && streamline.reflexFunctionsReady && streamline.pclFunctionsReady;
+			const bool frameTimingStarted = useStreamlineFrameTiming && streamline.BeginFrameToken();
+			if (frameTimingStarted) {
+				streamline.ReflexSleep();
+				streamline.SetPCLMarker(sl::PCLMarker::eSimulationStart);
+			}
+
 			func(a_this, a2);
+
+			if (frameTimingStarted) {
+				streamline.SetPCLMarker(sl::PCLMarker::eSimulationEnd);
+			}
+#ifdef TRACY_ENABLE
 			FrameMark;
+#endif
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
-#endif
 
 	namespace CSShadersSupport
 	{
@@ -895,9 +908,7 @@ namespace Hooks
 		stl::write_thunk_call<CreateCubemapRenderTarget_Reflections>(REL::RelocationID(100458, 107175).address() + REL::Relocate(0xA25, 0xA25, 0xCD2));
 		stl::write_thunk_call<CreateDepthStencil_Reflections>(REL::RelocationID(100458, 107175).address() + REL::Relocate(0xA59, 0xA59, 0xD13));
 
-#ifdef TRACY_ENABLE
 		stl::write_thunk_call<Main_Update>(REL::RelocationID(35551, 36544).address() + REL::Relocate(0x11F, 0x160));
-#endif
 
 		logger::info("Hooking BSImagespaceShader");
 		stl::detour_thunk<CSShadersSupport::BSImagespaceShader_DispatchComputeShader>(REL::RelocationID(100952, 107734));

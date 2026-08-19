@@ -40,6 +40,7 @@ namespace Skin
 		float3 FuzzColor;
 		float FuzzWeight;
 		float Wetness;
+		float WetnessFilmStrength;
 	};
 
 	SkinSurfaceProperties InitSkinSurfaceProperties()
@@ -58,7 +59,25 @@ namespace Skin
 		skin.FuzzColor = float3(0.045, 0.045, 0.045);
 		skin.FuzzWeight = 0.0;
 		skin.Wetness = 0.0;
+		skin.WetnessFilmStrength = 1.0;
 		return skin;
+	}
+
+	// A thin water film becomes visually apparent well before geometric
+	// coverage reaches one. Keep the response continuous for anti-aliasing,
+	// while retaining the strong wet appearance of the original binary path.
+	float GetWetnessResponse(float wetness)
+	{
+		return sqrt(sqrt(saturate(wetness)));
+	}
+
+	// Specular reflection and the loss of dry-surface transmission become
+	// visible faster than the normal perturbation of a thin film.  Boost only
+	// that optical response so anti-aliased mask coverage stays stable without
+	// making low and medium wetness look nearly dry.
+	float GetWetnessOpticalResponse(float wetness)
+	{
+		return saturate(GetWetnessResponse(wetness) * 1.6f);
 	}
 
 	// [Jorge Jimenez, Diego Gutierrez 2015, "Separable Subsurface Scattering"]
@@ -170,6 +189,8 @@ namespace Skin
 		}
 
 		if (skin.Wetness > 0.0) {
+			const float wetnessAmount = GetWetnessOpticalResponse(skin.Wetness);
+			const float wetnessEnergy = wetnessAmount * max(skin.WetnessFilmStrength, 0.0f);
 			float3 wetnessF;
 			float WNdotL = clamp(dot(WN, L), 1e-5, 1.0);
 			float WNdotV = saturate(abs(dot(WN, V)) + 1e-5);
@@ -178,9 +199,9 @@ namespace Skin
 			float3 wetSpecular = PBR::GetSpecularDirectLightMultiplierMicrofacet(WATER_ROUGHNESS, WATER_F0, WNdotL, WNdotV, WNdotH, oVdotH, wetnessF) * light.LightColor * WNdotL;
 			float2 wetSpecularBRDF = BRDF::EnvBRDFApproxLazarov(WATER_ROUGHNESS, WNdotV);
 			wetSpecular *= 1 + WATER_F0 * (1 / (wetSpecularBRDF.x + wetSpecularBRDF.y) - 1);
-			const float waterTransmission = 1 - wetnessF.x;
+			const float waterTransmission = lerp(1.0, 1.0 - wetnessF.x, saturate(wetnessEnergy));
 			specular *= waterTransmission;
-			specular += wetSpecular;
+			specular += wetSpecular * wetnessEnergy;
 			diffuse *= waterTransmission;
 		}
 	}
@@ -204,11 +225,14 @@ namespace Skin
 		float3 wetSpecular = 0.f;
 
 		if (skin.Wetness > 0.0) {
+			const float wetnessAmount = GetWetnessOpticalResponse(skin.Wetness);
+			const float wetnessEnergy = wetnessAmount * max(skin.WetnessFilmStrength, 0.0f);
 			float WNdotV = saturate(dot(WN, V));
 			float2 wetSpecularBRDF = BRDF::EnvBRDF(WATER_ROUGHNESS, WNdotV);
 			wetSpecular += WATER_F0 * wetSpecularBRDF.x + wetSpecularBRDF.y;
 			wetSpecular *= 1 + WATER_F0 * (1 / (wetSpecularBRDF.x + wetSpecularBRDF.y) - 1);
-			waterTransmission = 1 - (WATER_F0 * wetSpecularBRDF.x + wetSpecularBRDF.y);
+			wetSpecular *= wetnessEnergy;
+			waterTransmission = lerp(1.0, 1.0 - (WATER_F0 * wetSpecularBRDF.x + wetSpecularBRDF.y), saturate(wetnessEnergy));
 		}
 
 		diffuseWeight = skin.Albedo * (1.0 - specularWeight.x - specularWeight.y) * waterTransmission;
@@ -291,9 +315,18 @@ namespace Skin
 		float frequency = base_scale;
 		float amplitude = 1.0;
 		float max_amplitude = 0.0;
+		const float uv_pixel_footprint = max(length(ddx(uv)), length(ddy(uv)));
 		for (int i = 0; i < octaves; i++)
 		{
-			total += amplitude * (Random::perlinNoise(float3(uv * frequency, (float)i * z_offset_multiplier)) + 1.0) * 0.5;
+			const float2 octave_uv = uv * frequency;
+			const float pixel_footprint = uv_pixel_footprint * abs(frequency);
+			// Fade only this octave as its grid approaches the pixel Nyquist
+			// limit. An unresolved Perlin octave contributes its expected mean
+			// instead of a temporally unstable point sample. Scale, lacunarity and
+			// persistence still control the same frequency/amplitude progression.
+			const float octave_filter = 1.0f - smoothstep(0.25f, 0.5f, pixel_footprint);
+			const float octave_noise = (Random::perlinNoise(float3(octave_uv, (float)i * z_offset_multiplier)) + 1.0f) * 0.5f;
+			total += amplitude * lerp(0.5f, octave_noise, octave_filter);
 			
 			max_amplitude += amplitude;
 			amplitude *= persistence;
@@ -321,15 +354,30 @@ namespace Skin
 		float noise_value = FBM(uv, scale, octaves, lacunarity, persistence, z_offset_multiplier);
 
 		float dynamic_threshold = 1.0f - strength;
+		// Band-limiting the FBM octaves is not sufficient on its own: the wet/dry
+		// threshold below creates a new high-frequency edge, and the final 0.1
+		// power strongly magnifies tiny samples around that edge. Analytically
+		// box-filter the positive ramp over one pixel, preserving the exact old
+		// response outside the transition footprint.
+		const float threshold_distance = noise_value - dynamic_threshold;
+		const float threshold_half_width = max(fwidth(noise_value) * 0.5f, 1e-5f);
+		float filtered_positive;
+		if (threshold_distance <= -threshold_half_width) {
+			filtered_positive = 0.0f;
+		} else if (threshold_distance >= threshold_half_width) {
+			filtered_positive = threshold_distance;
+		} else {
+			const float covered_ramp = threshold_distance + threshold_half_width;
+			filtered_positive = covered_ramp * covered_ramp / (4.0f * threshold_half_width);
+		}
 
-		float sweat_intensity = saturate((noise_value - dynamic_threshold) / strength);
-
+		float sweat_intensity = saturate(filtered_positive / strength);
 		sweat_intensity = pow(sweat_intensity, 1.5f);
 
-		if (strength > 0.8f)
-		{
+		if (strength > 0.8f) {
 			sweat_intensity = sweat_intensity * saturate(0.99f - (strength - 0.8f) * 5.0f) + (strength - 0.8f) * 5.0f;
 		}
+
 		return pow(sweat_intensity, 0.1f);
 	}
 #endif
