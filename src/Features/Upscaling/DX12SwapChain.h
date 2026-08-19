@@ -155,7 +155,6 @@ public:
 
 	void SetUIBuffer();
 	void MarkDLSSGSceneResourcesReady(uint32_t a_frameIndex);
-	bool ShouldUseNativeMapWarmup() const;
 	void SetDLSSGInputExtent(uint32_t a_width, uint32_t a_height, uint32_t a_frameIndex);
 	uint32_t GetDLSSGInputWidth() const;
 	uint32_t GetDLSSGInputHeight() const;

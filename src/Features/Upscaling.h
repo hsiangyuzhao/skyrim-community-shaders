@@ -208,7 +208,6 @@ public:
 	bool IsDLSSGBackend() const;
 	bool IsDLSSGAvailable() const;
 	bool IsDLSSGMapRenderingContext();
-	bool ShouldUseNativeMapRendering();
 	void PresentFrameGeneration(bool a_useFrameGeneration, bool a_retainDLSSGResourcesWhenOff = true);
 	void CheckFrameConstants();
 	void SetUIBuffer();

@@ -202,11 +202,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		// before selecting or writing the next native back buffer; doing it after
 		// the copy allows one more buffer to enter the old presentation mode.
 		useFrameGeneration = UpdateDLSSGPresentationState(frameGenerationRequested, mapMenuOpen, mapRenderingContext);
-		// Do not retain DLSS-G allocations while the map's native and SR reset
-		// frames are being presented. This prevents the disabled FG plugin from
-		// observing the DLSS SR tags which caused the original map corruption.
-		const bool retainResourcesWhenOff = !(mapRenderingContext && !useFrameGeneration);
-		upscaling.PresentFrameGeneration(useFrameGeneration, retainResourcesWhenOff);
+		// SR inputs are evaluate-local now, so a short FG suspension can retain
+		// resources without exposing DLSS-G to SR's depth/MV tags.
+		upscaling.PresentFrameGeneration(useFrameGeneration, true);
 
 		// The interposer can advance the native swap-chain index when its mode
 		// changes. Re-query it after SetOptions instead of carrying the index from
@@ -582,12 +580,6 @@ void DX12SwapChain::MarkDLSSGSceneResourcesReady(uint32_t a_frameIndex)
 	dlssGSceneResourcesFrameIndex = unsupportedMapFrame ? UINT32_MAX : a_frameIndex;
 }
 
-bool DX12SwapChain::ShouldUseNativeMapWarmup() const
-{
-	return dlssGPresentationState != DLSSGPresentationState::kMapWarmup &&
-		dlssGPresentationState != DLSSGPresentationState::kMapGenerating;
-}
-
 bool DX12SwapChain::DLSSGResourcesReadyForFrame(uint32_t a_frameIndex) const
 {
 	return a_frameIndex != UINT32_MAX &&
@@ -624,8 +616,7 @@ bool DX12SwapChain::UpdateDLSSGPresentationState(bool a_frameGenerationRequested
 			dlssGPresentationState != DLSSGPresentationState::kMapGenerating) {
 			dlssGPresentationState = DLSSGPresentationState::kMapWarmup;
 			dlssGResumeWarmupFrameIndex = streamline.GetLatchedFrameTokenIndex();
-			streamline.RequestTemporalReset();
-			logger::info("[DLSS-G] Captured native MapMenu frame {}; next frame will restart DLSS SR with reset while generation remains disabled", dlssGResumeWarmupFrameIndex);
+			logger::info("[DLSS-G] MapMenu DLSS SR reset frame {} captured; retaining resources while generation remains off for this Present", dlssGResumeWarmupFrameIndex);
 			return false;
 		}
 
@@ -642,8 +633,8 @@ bool DX12SwapChain::UpdateDLSSGPresentationState(bool a_frameGenerationRequested
 
 			dlssGPresentationState = DLSSGPresentationState::kMapGenerating;
 			dlssGResumeWarmupFrameIndex = UINT32_MAX;
-			logger::info("[DLSS-G] Completed MapMenu DLSS SR reset frame {}; generation remains disabled for this Present", tokenFrameIndex);
-			return false;
+			logger::info("[DLSS-G] Resuming MapMenu frame generation at aligned token {}", tokenFrameIndex);
+			return true;
 		}
 
 		return true;

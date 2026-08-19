@@ -758,17 +758,16 @@ void GetJitterOffset(float* outX, float* outY, int32_t index, int32_t phaseCount
 void Upscaling::ConfigureTAA()
 {
 	auto upscaleMethod = GetUpscaleMethod();
-	const bool nativeMapRendering = ShouldUseNativeMapRendering();
 
 	auto imageSpaceManager = RE::ImageSpaceManager::GetSingleton();
 	GET_INSTANCE_MEMBER(BSImagespaceShaderISTemporalAA, imageSpaceManager);
 
 	// Disable water TAA when upscaling is enabled
 	bool* enableWaterTAA = reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(BSImagespaceShaderISTemporalAA) + 0x38LL);
-	*enableWaterTAA = nativeMapRendering || upscaleMethod == UpscaleMethod::kNONE || upscaleMethod == UpscaleMethod::kTAA;
+	*enableWaterTAA = upscaleMethod == UpscaleMethod::kNONE || upscaleMethod == UpscaleMethod::kTAA;
 
 	// Force enable TAA if needed
-	BSImagespaceShaderISTemporalAA->taaEnabled = !nativeMapRendering && upscaleMethod != UpscaleMethod::kNONE;
+	BSImagespaceShaderISTemporalAA->taaEnabled = upscaleMethod != UpscaleMethod::kNONE;
 }
 
 void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
@@ -777,7 +776,10 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 	const bool mapRenderingContext = IsDLSSGMapRenderingContext();
 	if (mapRenderingContext != dlssGMapRenderingContextActive) {
 		if (mapRenderingContext) {
-			logger::info("[Upscaling] MapMenu entered staged DLSS recovery; rendering one native frame before restarting DLSS SR");
+			// The map uses a different camera domain. Reset SR on its first frame,
+			// while the Present state machine keeps FG off for that token only.
+			streamline.RequestTemporalReset();
+			logger::info("[Upscaling] MapMenu opened; resetting DLSS SR while frame generation remains off for one token");
 		} else {
 			// ConfigureUpscaling runs before the deferred constants and DLSS SR
 			// dispatch for this world frame, so the reset reaches SR before it can
@@ -787,8 +789,6 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 		}
 		dlssGMapRenderingContextActive = mapRenderingContext;
 	}
-
-	const bool nativeMapRendering = ShouldUseNativeMapRendering();
 
 	// Delete or create resources as necessary
 	CheckResources(upscaleMethod);
@@ -808,7 +808,7 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 	auto screenWidth = static_cast<int>(screenSize.x);
 	auto screenHeight = static_cast<int>(screenSize.y);
 
-	if (!nativeMapRendering && upscaleMethod != UpscaleMethod::kNONE && upscaleMethod != UpscaleMethod::kTAA) {
+	if (upscaleMethod != UpscaleMethod::kNONE && upscaleMethod != UpscaleMethod::kTAA) {
 		float2 resolutionScaleBase = { 1.0f, 1.0f };
 
 		if (upscaleMethod == UpscaleMethod::kDLSS && !settings.enableDLSSRR) {
@@ -1323,11 +1323,6 @@ bool Upscaling::IsDLSSGMapRenderingContext()
 		ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
 }
 
-bool Upscaling::ShouldUseNativeMapRendering()
-{
-	return IsDLSSGMapRenderingContext() && dx12SwapChain.ShouldUseNativeMapWarmup();
-}
-
 void Upscaling::PresentFrameGeneration(bool a_useFrameGeneration, bool a_retainDLSSGResourcesWhenOff)
 {
 	if (!IsDLSSGBackend()) {
@@ -1798,11 +1793,8 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 
 	auto& upscaling = globals::features::upscaling;
 	auto upscaleMethod = upscaling.GetUpscaleMethod();
-	const bool nativeMapRendering = upscaling.ShouldUseNativeMapRendering();
 
-	// Native MapMenu isolation bypasses DLSS SR, but DLSS-G still needs the
-	// current map camera's depth and motion vectors after its warm-up frame.
-	if (upscaling.d3d12SwapChainActive && (upscaling.IsFrameGenerationEnabled() || (!nativeMapRendering && upscaleMethod == UpscaleMethod::kDLSS)))
+	if (upscaling.d3d12SwapChainActive && (upscaling.IsFrameGenerationEnabled() || upscaleMethod == UpscaleMethod::kDLSS))
 		upscaling.CopySharedD3D12Resources();
 
 	if (upscaling.d3d12SwapChainActive) {
@@ -1812,7 +1804,7 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 		DX::ThrowIfFailed(dx12SwapChain.commandQueue->Wait(dx12SwapChain.upscalingFence.get(), dx12SwapChain.upscalingFenceValue));
 	}
 
-	if (!nativeMapRendering && upscaleMethod != UpscaleMethod::kNONE && upscaleMethod != UpscaleMethod::kTAA)
+	if (upscaleMethod != UpscaleMethod::kNONE && upscaleMethod != UpscaleMethod::kTAA)
 		upscaling.PerformUpscaling();
 
 	auto imageSpaceManager = RE::ImageSpaceManager::GetSingleton();
@@ -1829,7 +1821,7 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 		DX::ThrowIfFailed(dx12SwapChain.commandQueue->Wait(dx12SwapChain.upscalingFence.get(), dx12SwapChain.upscalingFenceValue));
 	}
 
-	if (!nativeMapRendering && upscaleMethod == UpscaleMethod::kDLSS)
+	if (upscaleMethod == UpscaleMethod::kDLSS)
 		upscaling.ApplyNISSharpening();
 
 	if (upscaling.d3d12SwapChainActive) {
