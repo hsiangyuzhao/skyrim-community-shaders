@@ -1,17 +1,28 @@
 #include "ScreenSpaceRayTracing/ssrt_common.hlsli"
 
 Texture2D<float4> HistoryTexture : register(t0);
+// (spec A1) Moments texture written by ssrt_temporal.hlsl: .xy = luminance moments,
+// .z = accumulated frame count. t1 used to receive the motion-vector target, which this
+// shader never declared or read, so the slot was free.
+Texture2D<float4> MomentsTexture : register(t1);
 Texture2D<float4> SSRColorTexture : register(t3);
 Texture2D<float> DepthTexture : register(t4);
 
 RWTexture2D<float4> FilteredOutput : register(u0);
 
+// Mirrors ScreenSpaceRayTracing::DenoiserCB, which is the source of truth for the
+// layout. ssrt_temporal.hlsl and ssrt_variance.hlsl declare only the leading four
+// scalars they use; a shader may declare a prefix of a larger constant buffer.
 cbuffer DenoiserCB : register(b2)
 {
     float invMaxAccumulatedFrames;
     uint atrousIterations;
     float colorPhi;
     float normalPhi;
+    uint adaptiveFiltering;
+    float adaptiveHistoryThreshold;
+    float adaptiveVarianceEps;
+    uint denoiserPad0;
 };
 
 float GaussianBlur(uint2 id)
@@ -49,12 +60,30 @@ static const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
 
 #define VAR_EPSILON 0.00001f
 
+// (spec A1) Group-wide convergence vote.
+//
+// This pipeline compiles as cs_5_0 through fxc, which has no wave intrinsics, so the
+// "is every lane of this tile converged?" question cannot be answered with
+// WaveActiveAllTrue. It is answered with a groupshared counter instead: every one of the
+// 64 lanes of the 8x8 group contributes 1 when it considers itself converged, and only a
+// count of exactly 64 authorises the whole group to take the early path.
+//
+// Whole-group granularity is deliberate, not a fallback. A partial early-out inside a
+// group would save nothing: the surviving lanes still execute the 25-tap kernel and the
+// converged ones just idle through it, so the group's cost is unchanged. Only skipping a
+// group in its entirety removes work.
+//
+// Both barriers below are executed unconditionally by every lane. That is what forces
+// the restructuring of the two early-outs further down (they now happen *after* the
+// reduction): a `return` before a GroupMemoryBarrierWithGroupSync() would make the
+// barrier non-uniform across the group, which is undefined behaviour.
+groupshared uint g_ssrtConvergedLanes;
+
 // Spatiotemporal Variance-Guided Filter
-[numthreads(8, 8, 1)] void main(uint3 DTid : SV_DispatchThreadID)
+[numthreads(8, 8, 1)] void main(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID)
 {
     uint2 screen_size = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy;
-    if (DTid.x >= screen_size.x || DTid.y >= screen_size.y)
-        return;
+    const bool inBounds = DTid.x < screen_size.x && DTid.y < screen_size.y;
 
     float2 uv = float2(DTid.xy + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
 
@@ -63,15 +92,57 @@ static const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
     // sky pixel pays the full 25-tap a-trous kernel. Write 0 rather than just
     // returning: this shader ping-pongs between two textures, so skipping the write
     // would leave the previous iteration's (or previous frame's) content behind.
-    float depthCenter = DepthTexture[DTid.xy];
-    if (SSRT_IS_FAR_PLANE(depthCenter)) {
+    float depthCenter = inBounds ? DepthTexture[DTid.xy] : 1.0f;
+    const bool isFarPlane = SSRT_IS_FAR_PLANE(depthCenter);
+
+    float4 ssrColor = inBounds ? SSRColorTexture[DTid.xy] : 0.0f;
+
+    // ---- (spec A1) convergence reduction; no lane may leave before it completes ----
+    if (all(GTid.xy == 0))
+        g_ssrtConvergedLanes = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    // An out-of-bounds or sky lane has nothing left to filter, so it must not veto the
+    // early path for the rest of the tile: it counts as converged. Its own output is
+    // still produced by the dedicated branches below.
+    bool laneConverged = !inBounds || isFarPlane;
+    if (!laneConverged) {
+        // .z is the accumulated frame count maintained by ssrt_temporal.hlsl. Once it
+        // reaches MaxAccumulatedFrames the temporal blend weight has bottomed out at
+        // invMaxAccumulatedFrames, i.e. the pixel is in steady state -- which is exactly
+        // why the default threshold equals the default MaxAccumulatedFrames.
+        const float accumFrames = MomentsTexture[DTid.xy].z;
+        // .w is the per-pixel variance the ping-pong carries (audit #11 made it real);
+        // it shrinks with every a-trous iteration, so a tile that is not quiet enough to
+        // skip iteration 0 may still skip iteration 1 or 2.
+        laneConverged = accumFrames >= adaptiveHistoryThreshold && ssrColor.w < adaptiveVarianceEps;
+    }
+    if (laneConverged)
+        InterlockedAdd(g_ssrtConvergedLanes, 1u);
+    GroupMemoryBarrierWithGroupSync();
+
+    const bool groupConverged = g_ssrtConvergedLanes == 64u;
+    // ---- reduction complete; early returns are safe from here on ----
+
+    if (!inBounds)
+        return;
+
+    if (isFarPlane) {
         FilteredOutput[DTid.xy] = 0.0;
         return;
     }
 
+    if (adaptiveFiltering != 0 && groupConverged) {
+        // Copy input to output verbatim, .w included. The a-trous chain ping-pongs
+        // between two textures and the next iteration reads both the colour and the
+        // variance back, so the early path must *copy* rather than skip the write --
+        // otherwise the following iteration would consume the content of two iterations
+        // ago (or of the previous frame).
+        FilteredOutput[DTid.xy] = ssrColor;
+        return;
+    }
+
     float3 blendedColor = 0;
-    float4 historyColor = HistoryTexture[DTid.xy];
-    float4 ssrColor = SSRColorTexture[DTid.xy];
 
     float3 normalVS;
     float roughness;

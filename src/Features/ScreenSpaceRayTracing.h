@@ -68,6 +68,23 @@ struct ScreenSpaceRayTracing : Feature
         uint AtrousIterations = 3;
         float ColorPhi = 0.5f;
         float NormalPhi = 512.0f;
+        /// @brief (spec A1) Let a fully converged 8x8 tile skip an a-trous iteration.
+        bool AdaptiveFiltering = true;
+        /// @brief (spec A1) Accumulated frames a pixel needs before it may count as
+        /// converged. The default matches MaxAccumulatedFrames: at that point the
+        /// temporal blend weight has reached its floor, so the pixel is in steady state.
+        uint AdaptiveHistoryThreshold = 16;
+        /// @brief (spec A1) Variance below which a pixel counts as converged.
+        ///
+        /// The quantity in the .w channel of the denoiser ping-pong is a variance of
+        /// scene luminance (ssrt_temporal.hlsl: moment.y - moment.x^2 over
+        /// Color::RGBToLuminance of the linear radiance), so it has units of luminance
+        /// squared and is resolution independent. 1e-4 is a standard deviation of 0.01,
+        /// i.e. 1% of a mid-grey surface -- below the point where the a-trous kernel's
+        /// own luminance term (phiLuminance = ColorPhi * sqrt(variance)) can still
+        /// distinguish signal from noise. Deliberately conservative: raising it trades
+        /// residual noise for more skipped tiles.
+        float AdaptiveVarianceEps = 1e-4f;
 #ifdef ENABLE_SHARC
         bool EnableSharc = false;
 #endif
@@ -93,12 +110,22 @@ struct ScreenSpaceRayTracing : Feature
         float CubemapNormalization;
     };
 
+    /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Two float4
+    /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
+    /// reproduce this layout verbatim. ssrt_temporal.hlsl and ssrt_variance.hlsl declare
+    /// only the first row, which is legal -- a shader may declare a prefix of a larger
+    /// constant buffer.
     struct alignas(16) DenoiserCB
     {
         float invMaxAccumulatedFrames;
         uint atrousIterations;
         float colorPhi;
         float normalPhi;
+        // --- row 1 ---
+        uint adaptiveFiltering;
+        float adaptiveHistoryThreshold;
+        float adaptiveVarianceEps;
+        uint pad0;
     };
 
     eastl::unique_ptr<ConstantBuffer> ssrtCB;
@@ -123,6 +150,11 @@ struct ScreenSpaceRayTracing : Feature
     virtual void Prepass() override;
 
     SharedData GetCommonBufferData();
+
+    /// @brief Builds the denoiser constant buffer from the current settings. Shared by
+    /// DrawSSRTSpecular and DrawSSRTDiffuse so the two cannot drift apart as fields are
+    /// added; `atrousIterations` is overwritten per a-trous iteration by both callers.
+    DenoiserCB GetDenoiserCBData() const;
 
     eastl::unique_ptr<Texture2D> texDepth = nullptr;
     eastl::unique_ptr<Texture2D> texColor = nullptr;

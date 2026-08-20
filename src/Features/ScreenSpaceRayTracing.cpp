@@ -35,6 +35,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AtrousIterations,
     ColorPhi,
     NormalPhi,
+    AdaptiveFiltering,
+    AdaptiveHistoryThreshold,
+    AdaptiveVarianceEps,
     EnableSharc
 )
 #else
@@ -59,7 +62,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     MaxAccumulatedFrames,
     AtrousIterations,
     ColorPhi,
-    NormalPhi
+    NormalPhi,
+    AdaptiveFiltering,
+    AdaptiveHistoryThreshold,
+    AdaptiveVarianceEps
 )
 #endif
 
@@ -119,6 +125,21 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::SliderFloat("Normal Phi", &settings.NormalPhi, 1.0f, 1024.0f, "%.2f");
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text("Controls sensitivity to normal differences in the À Trous filter. Higher values preserve more detail but may retain noise.");
+
+        ImGui::Checkbox("Adaptive Filtering", &settings.AdaptiveFiltering);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Lets an 8x8 tile whose pixels have all converged skip an À Trous iteration, "
+                "spending the filter only where the temporal accumulation is still noisy "
+                "(motion, disocclusion). Turn off for a bit-exact classic SVGF.");
+        if (settings.AdaptiveFiltering) {
+            ImGui::SliderInt("Adaptive History Threshold", (int*)&settings.AdaptiveHistoryThreshold, 4, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text("Accumulated frames a pixel needs before it may count as converged. Matching Max Accumulated Frames is a good default.");
+            ImGui::SliderFloat("Adaptive Variance Threshold", &settings.AdaptiveVarianceEps, 1e-6f, 1e-2f, "%.6f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text("Luminance variance below which a pixel counts as converged. Higher values skip more tiles at the cost of residual noise.");
+        }
     }
 #ifdef ENABLE_SHARC
     ImGui::Checkbox("(Broken) Enable SHARC", &settings.EnableSharc);
@@ -665,13 +686,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     resetViews();
 
     if (settings.EnableSVGF) {
-        DenoiserCB denoiserCBData;
-        {
-            denoiserCBData.invMaxAccumulatedFrames = 1.0f / (settings.MaxAccumulatedFrames + 1.0f);
-            denoiserCBData.atrousIterations = settings.AtrousIterations;
-            denoiserCBData.colorPhi = settings.ColorPhi;
-            denoiserCBData.normalPhi = settings.NormalPhi;
-        }
+        DenoiserCB denoiserCBData = GetDenoiserCBData();
         denoiserCB->Update(denoiserCBData);
         auto denoiserBuffer = denoiserCB->CB();
         context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
@@ -720,7 +735,10 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
             context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
             uavs.at(0) = (i % 2 == 0) ? texSSRColor->uav.get() : texVariance->uav.get();
             srvs.at(0) = texHistory->srv.get();
-            srvs.at(1) = motion.SRV;
+            // (spec A1) t1 carries the moments texture, whose .z is the accumulated frame
+            // count the adaptive early-out votes on. It used to receive the motion-vector
+            // target, which ssrt_spatial.hlsl never declared.
+            srvs.at(1) = texMoments->srv.get();
             srvs.at(2) = normal.SRV;
             srvs.at(3) = (i % 2 == 0) ? texVariance->srv.get() : texSSRColor->srv.get();
             srvs.at(4) = depth.depthSRV;
@@ -892,13 +910,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 #endif
 
     if (settings.EnableSVGF) {
-        DenoiserCB denoiserCBData;
-        {
-            denoiserCBData.invMaxAccumulatedFrames = 1.0f / (settings.MaxAccumulatedFrames + 1.0f);
-            denoiserCBData.atrousIterations = settings.AtrousIterations;
-            denoiserCBData.colorPhi = settings.ColorPhi;
-            denoiserCBData.normalPhi = settings.NormalPhi;
-        }
+        DenoiserCB denoiserCBData = GetDenoiserCBData();
         denoiserCB->Update(denoiserCBData);
         auto denoiserBuffer = denoiserCB->CB();
         context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
@@ -946,7 +958,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
             context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
             uavs.at(0) = (i % 2 == 0) ? texSSRTDiffuseColor->uav.get() : texVariance->uav.get();
             srvs.at(0) = texHistoryDiffuse->srv.get();
-            srvs.at(1) = motion.SRV;
+            // (spec A1) t1 = moments; see the matching binding in DrawSSRTSpecular.
+            srvs.at(1) = texMoments->srv.get();
             srvs.at(2) = normal.SRV;
             srvs.at(3) = (i % 2 == 0) ? texVariance->srv.get() : texSSRTDiffuseColor->srv.get();
             srvs.at(4) = depth.depthSRV;
@@ -990,6 +1003,20 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     state->EndPerfEvent();
 
     context->CSSetShader(nullptr, nullptr, 0);
+}
+
+ScreenSpaceRayTracing::DenoiserCB ScreenSpaceRayTracing::GetDenoiserCBData() const
+{
+    DenoiserCB data;
+    data.invMaxAccumulatedFrames = 1.0f / (settings.MaxAccumulatedFrames + 1.0f);
+    data.atrousIterations = settings.AtrousIterations;
+    data.colorPhi = settings.ColorPhi;
+    data.normalPhi = settings.NormalPhi;
+    data.adaptiveFiltering = settings.AdaptiveFiltering ? 1u : 0u;
+    data.adaptiveHistoryThreshold = (float)settings.AdaptiveHistoryThreshold;
+    data.adaptiveVarianceEps = settings.AdaptiveVarianceEps;
+    data.pad0 = 0;
+    return data;
 }
 
 ScreenSpaceRayTracing::SharedData ScreenSpaceRayTracing::GetCommonBufferData()
