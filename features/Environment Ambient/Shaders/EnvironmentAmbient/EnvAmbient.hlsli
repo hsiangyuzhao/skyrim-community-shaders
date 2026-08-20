@@ -3,6 +3,7 @@
 
 #include "Common/Color.hlsli"
 #include "Common/Math.hlsli"
+#include "Common/Random.hlsli"
 #include "Common/SharedData.hlsli"
 #include "Common/Spherical Harmonics/SphericalHarmonics.hlsli"
 
@@ -29,6 +30,29 @@
 
 namespace EnvironmentAmbient
 {
+	// Branchless orthonormal basis around a unit vector.
+	// [Duff et al. 2017, "Building an Orthonormal Basis, Revisited"]
+	void GetOrthonormalBasis(float3 a_n, out float3 o_tangent, out float3 o_bitangent)
+	{
+		float s = a_n.z >= 0.0 ? 1.0 : -1.0;
+		float a = -1.0 / (s + a_n.z);
+		float b = a_n.x * a_n.y * a;
+		o_tangent = float3(1.0 + s * a_n.x * a_n.x * a, s * b, -s * a_n.x);
+		o_bitangent = float3(b, s + a_n.y * a_n.y * a, -a_n.y);
+	}
+
+	// One prefiltered cubemap tap. The sky increment is kept separate so only it can be attenuated
+	// by sky visibility, and the max() is taken per direction so a direction where the sky map is
+	// darker than the no-sky map cannot borrow brightness from its neighbours.
+	void AccumulateDirection(float3 a_dir, float a_mip, inout float3 io_envNoSky, inout float3 io_skyOnly)
+	{
+		float3 noSky = EnvTexture.SampleLevel(LinearSampler, a_dir, a_mip);
+		io_envNoSky += noSky;
+#if !defined(INTERIOR)
+		io_skyOnly += max(EnvReflectionsTexture.SampleLevel(LinearSampler, a_dir, a_mip) - noSky, 0.0);
+#endif
+	}
+
 	// Sky visibility along a_normalWS, evaluated once per pixel. The SSRT fallback evaluates this
 	// per ray with the ray direction; using the surface normal is the once-per-pixel equivalent.
 	float GetSkyVisibility(float3 a_normalWS, float3 a_positionMS, uint2 a_pixCoord)
@@ -64,15 +88,45 @@ namespace EnvironmentAmbient
 	{
 		const float mip = SharedData::envAmbientSettings.EnvMip;
 
-		float3 envNoSky = EnvTexture.SampleLevel(LinearSampler, a_normalWS, mip);
+		// A single tap of one prefiltered mip cannot express a cosine lobe: the SSRT fallback got
+		// its angular width from cosine-hemisphere ray directions plus SVGF filtering. Averaging a
+		// rotating triple widens the effective kernel and breaks up cubemap face seams. The taps
+		// come from mips small enough to sit in cache (mip 4 is 8x8x6), so the cost is negligible.
+		float3 envNoSky = 0.0;
+		float3 skyOnly = 0.0;
+		float sampleWeight = 1.0;
+
+		AccumulateDirection(a_normalWS, mip, envNoSky, skyOnly);
+
+		[branch] if (SharedData::envAmbientSettings.JitteredSampling != 0)
+		{
+			float3 tangent, bitangent;
+			GetOrthonormalBasis(a_normalWS, tangent, bitangent);
+
+			// Per-pixel, per-frame rotation; TAA resolves the residual noise.
+			float phase = Random::InterleavedGradientNoise(float2(a_pixCoord), SharedData::FrameCount) * Math::TAU;
+
+			float sinTheta, cosTheta;
+			sincos(SharedData::envAmbientSettings.JitterAngle, sinTheta, cosTheta);
+
+			// Perpendicular to a_normalWS with length sinTheta, so cosTheta * N +- tilt is already
+			// unit length and needs no renormalisation.
+			float3 tilt = sinTheta * (cos(phase) * tangent + sin(phase) * bitangent);
+
+			AccumulateDirection(cosTheta * a_normalWS + tilt, mip, envNoSky, skyOnly);
+			AccumulateDirection(cosTheta * a_normalWS - tilt, mip, envNoSky, skyOnly);
+
+			sampleWeight = 3.0;
+		}
+
+		envNoSky /= sampleWeight;
+		skyOnly /= sampleWeight;
 
 		// Only the sky increment is attenuated by sky visibility, as in the SSRT fallback
 		// (ssrt_raymarch.hlsl:619-622); attenuating the whole colour would fade the non-sky
 		// environment away as well.
-		float3 skyOnly = 0.0;
 		float visibility = 1.0;
 #if !defined(INTERIOR)
-		skyOnly = max(EnvReflectionsTexture.SampleLevel(LinearSampler, a_normalWS, mip) - envNoSky, 0.0);
 		visibility = GetSkyVisibility(a_normalWS, a_positionMS, a_pixCoord);
 #endif
 

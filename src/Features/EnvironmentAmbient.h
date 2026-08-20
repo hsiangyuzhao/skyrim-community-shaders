@@ -56,17 +56,18 @@ struct EnvironmentAmbient : Feature
 	 */
 	struct alignas(16) Settings
 	{
-		uint Enabled = 1;               // 0
-		float Blend = 1.0f;             // 4
-		float Intensity = 1.0f;         // 8
-		float Normalization = 0.0f;     // 12
-		float EnvMip = 4.0f;            // 16
-		float Saturation = 1.0f;        // 20
-		float AOPower = 1.5f;           // 24
-		uint ApplyAO = 1;               // 28
-		uint EnableInterior = 0;        // 32
-		uint NormalizationMode = 1;     // 36
-		float pad0[2] = { 0.0f, 0.0f }; // 40
+		uint Enabled = 1;            // 0
+		float Blend = 1.0f;          // 4
+		float Intensity = 1.0f;      // 8
+		float Normalization = 0.0f;  // 12
+		float EnvMip = 4.0f;         // 16
+		float Saturation = 1.0f;     // 20
+		float AOPower = 1.5f;        // 24
+		uint ApplyAO = 1;            // 28
+		uint EnableInterior = 0;     // 32
+		uint NormalizationMode = 1;  // 36
+		uint JitteredSampling = 1;   // 40
+		float JitterAngle = 0.35f;   // 44 radians
 	} settings;
 	static_assert(sizeof(Settings) == 48, "EnvironmentAmbient::Settings must stay 48 bytes (3 constant buffer rows).");
 };

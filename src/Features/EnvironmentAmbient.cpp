@@ -16,7 +16,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	AOPower,
 	ApplyAO,
 	EnableInterior,
-	NormalizationMode)
+	NormalizationMode,
+	JitteredSampling,
+	JitterAngle)
 
 void EnvironmentAmbient::RestoreDefaultSettings()
 {
@@ -107,6 +109,27 @@ void EnvironmentAmbient::DrawSettings()
 		ImGui::SliderFloat("Saturation", &settings.Saturation, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Saturation of the environment light, applied before albedo.");
+		}
+
+		ImGui::Checkbox("Jittered Sampling", (bool*)&settings.JitteredSampling);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"Average three cubemap directions instead of one: the surface normal plus a\n"
+				"rotating pair tilted away from it. Widens the effective filter kernel towards a\n"
+				"cosine lobe, which a single mip cannot express, and hides cubemap face seams.\n"
+				"Costs four extra cubemap samples from mips that fit entirely in cache.\n"
+				"Turn off to isolate single-direction behaviour while debugging.");
+		}
+
+		{
+			auto jitterGuard = Util::DisableGuard(!settings.JitteredSampling);
+			ImGui::SliderAngle("Jitter Angle", &settings.JitterAngle, 0.0f, 90.0f, "%.0f deg", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text(
+					"Angular offset of the two extra directions from the surface normal. Larger\n"
+					"widens the lobe, which can be traded against a lower Cubemap Mip to keep more\n"
+					"directional detail.");
+			}
 		}
 
 		if (!skylighting.loaded) {

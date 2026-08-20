@@ -374,7 +374,8 @@ namespace SharedData
 
 		uint EnableInterior;
 		uint NormalizationMode;
-		float2 pad0;
+		uint JitteredSampling;
+		float JitterAngle;
 	};
 
 	cbuffer FeatureData : register(b6)
