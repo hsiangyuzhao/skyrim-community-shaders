@@ -104,28 +104,37 @@ cbuffer SSRTCB : register(b1)
 #   define SAMPLES_PER_PIXEL DIFFUSE_SPP
 #endif
 
-// (audit #7s) Two coherent conventions exist for the Hi-Z traversal, and the code used
-// to mix them:
+// (audit #7 / #17) `screen_size` is the *render* extent, on both permutations.
 //
-//  * legacy (diffuse): `screen_size` is the *full* buffer extent, so cell boundaries are
-//    computed on a 1/fullDim grid, and every depth fetch rescales the coordinate by
+// Two conventions used to coexist here, gated on SSRT_SPECULAR through a
+// SSRT_DEPTH_COORD_SCALE macro:
+//
+//  * legacy (diffuse): `screen_size` was the full buffer extent, so cell boundaries were
+//    computed on a 1/fullDim grid while every depth fetch rescaled its coordinate by
 //    DynamicResolutionParams1.xy to land inside the pyramid's dynamic-resolution
 //    sub-rect. Under DRS with ratio s < 1 (DLSS Quality s ~= 0.667) a cell is s times
-//    smaller than a texel: the ray re-tests the same texel 1/s times, the effective
-//    reach of MaxSteps shrinks by s, and the tile/mip decisions no longer line up with
-//    texel boundaries.
+//    smaller than a texel: the ray re-tests the same texel 1/s times, the effective reach
+//    of MaxSteps shrinks by s, and the tile/mip decisions stop lining up with texel
+//    boundaries -- so the mip pyramid, whose whole purpose is to skip empty space a tile
+//    at a time, is stepping through fractions of single texels.
 //
-//  * render resolution (specular): `screen_size` is the render extent, the grid matches
-//    the pyramid's valid area exactly, and no rescale is needed anywhere.
+//  * render resolution (specular, from freewins): `screen_size` is the render extent, so
+//    the traversal grid coincides with the pyramid's valid area at every mip
+//    (valid extent of mip m == renderDim >> m) and no rescale is needed anywhere.
 //
-// The second is correct. It is applied to the specular permutation only: the traversal
-// grid determines hit rates, and changing it on the diffuse path would move the
-// diffuse+fallback look the user currently depends on.
-#if defined(SSRT_SPECULAR)
-#   define SSRT_DEPTH_COORD_SCALE float2(1.0, 1.0)
-#else
-#   define SSRT_DEPTH_COORD_SCALE FrameBuffer::DynamicResolutionParams1.xy
-#endif
+// Only the second is coherent, and it is now the only one. The macro and its gate are
+// gone, and diffuse and specular walk the same cell grid.
+//
+// It also settles audit #17, which flags two lengths in SSRT_ValidateHit as
+// resolution-dependent. Only one of them is:
+//
+//  * the self-intersection radius `2 / screen_size` is a texel count in the same [0,1]
+//    render-normalised uv space as `hit.xy`, so on the full extent it measured 2s ~= 1.33
+//    render texels rather than 2. Unifying the convention makes it mean what it says.
+//  * the border vignette's `fov = 0.01 * float2(screen_size.y / screen_size.x, 1)` is
+//    *not* affected: DRS scales both extents by the same ratio, so the quotient -- and
+//    with it the vignette band in uv -- is identical under either convention. Nothing to
+//    fix, and nothing changes.
 
 float3 ProjectPosition(float3 origin, float4x4 mat)
 {
@@ -286,7 +295,10 @@ float3 SSRT_HierarchicalRaymarch(float3 origin, float3 direction, bool is_mirror
 #endif
 
         float2 current_mip_position = current_mip_resolution * position.xy;
-        float  surface_z            = SSRT_LoadDepth(current_mip_position * SSRT_DEPTH_COORD_SCALE, current_mip);  // (audit #7s)
+        // (audit #7) No rescale: `screen_size` is the render extent, so a texel coordinate
+        // on this mip's traversal grid is already a texel coordinate inside the pyramid's
+        // valid area at this mip.
+        float  surface_z            = SSRT_LoadDepth(current_mip_position, current_mip);
         bool skipped_tile =
             SSRT_AdvanceRay(origin, direction, inv_direction, current_mip_position, current_mip_resolution_inv, current_mip, floor_offset, uv_offset, surface_z, position, current_t);
         bool nextMipIsOutOfRange = skipped_tile && (current_mip >= SSRT_DEPTH_HIERARCHY_MAX_MIP);
@@ -330,7 +342,7 @@ float SSRT_ValidateHit(float3 hit, float2 uv, float3 world_space_ray_direction, 
     }
 
     // Don't lookup radiance from the background.
-    int2  texel_coords = int2(screen_size * hit.xy * SSRT_DEPTH_COORD_SCALE);
+    int2  texel_coords = int2(screen_size * hit.xy);  // (audit #7) render extent, no rescale
     // (audit #3) Validate against mip 0 -- the same level the traversal descends to
     // (HIZ_MIN_MIP == 0), and the true per-pixel depth.
     //
@@ -558,13 +570,11 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
                                                 uint3 groupThreadID : SV_GroupThreadID,
                                                 uint3 DTid : SV_DispatchThreadID)
 {
-    // (audit #7s) See SSRT_DEPTH_COORD_SCALE: specular traverses a render-resolution
-    // cell grid, diffuse keeps the legacy full-resolution grid plus per-fetch rescale.
-#if defined(SSRT_SPECULAR)
-    uint2 screen_size = uint2(SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy);
-#else
-    uint2 screen_size = SharedData::BufferDim.xy;
-#endif
+    // (audit #7) The render extent, on every permutation -- the traversal grid, the
+    // pyramid's valid area and the dispatch all agree on it. Matches the renderDim in
+    // ssrt_preprocess_depth.hlsl and Util::ConvertToDynamic on the C++ side, so the
+    // truncation lands on the same texel.
+    const uint2 screen_size = uint2(SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy);
     uint2 coords = DTid.xy;
 #if defined(SSRT_SPECULAR)
     uint sample_id = 0;
@@ -610,7 +620,7 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     bool is_mirror = IsMirrorReflection(roughness);
     int most_detailed_mip = HIZ_MIN_MIP;
     float2 mip_resolution = SSRT_GetMipResolution(screen_size, most_detailed_mip);
-    float z = SSRT_LoadDepth(uv * mip_resolution * SSRT_DEPTH_COORD_SCALE, most_detailed_mip);  // (audit #7s)
+    float z = SSRT_LoadDepth(uv * mip_resolution, most_detailed_mip);  // (audit #7) no rescale
     float3 screen_uv_space_ray_origin = float3(uv, z);
     float3 view_space_ray = ScreenSpaceToViewSpace(screen_uv_space_ray_origin, FrameBuffer::CameraProjInverse[eyeIndex]);
     float3 world_space_normal = normalize(mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0)).xyz);
@@ -661,9 +671,11 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     float3 world_space_reflected_direction = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(view_space_reflected_direction, 0)).xyz;
     float3 world_space_origin = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(view_space_ray, 1)).xyz;
     float world_ray_length = 0.0;
-    // (audit #7s) screen_size * SSRT_DEPTH_COORD_SCALE is the render-resolution extent
-    // under both conventions: fullDim * ratio for diffuse, renderDim * 1 for specular.
-    bool valid_ray = all(coords < int2(screen_size * SSRT_DEPTH_COORD_SCALE)) && all(coords >= int2(0, 0)) && !is_far_plane;  // (audit P1)
+    // (audit #7) `screen_size` is already the render extent, i.e. the dispatch's own
+    // bound, so the rescale is gone. The `coords >= int2(0, 0)` half is gone with it:
+    // `coords` is uint2, so it was vacuously true, and comparing it against an int2 was
+    // two of the file's signed/unsigned warnings (X3203).
+    bool valid_ray = all(coords < screen_size) && !is_far_plane;  // (audit P1)
 #if SHARC_UPDATE
     valid_ray = valid_ray && ShouldProcessPixel(coords.xy, SharedData::FrameCount);
 #endif
