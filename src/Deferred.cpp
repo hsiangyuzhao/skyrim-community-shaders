@@ -7,7 +7,6 @@
 #include "TruePBR.h"
 
 #include "Features/DynamicCubemaps.h"
-#include "Features/EnvironmentAmbient.h"
 #include "Features/IBL.h"
 #include "Features/PhysicalSky.h"
 #include "Features/ScreenSpaceGI.h"
@@ -657,11 +656,6 @@ ID3D11ComputeShader* Deferred::GetComputeMainComposite()
 		if (globals::features::physicalSky.loaded)
 			defines.push_back({ "PHYSICAL_SKY", nullptr });
 
-		// Gated on `loaded`, not on settings.Enabled: the runtime toggle lives in the cbuffer so
-		// flipping it never forces a composite recompile.
-		if (globals::features::environmentAmbient.loaded)
-			defines.push_back({ "ENV_AMBIENT", nullptr });
-
 		if (REL::Module::IsVR())
 			defines.push_back({ "FRAMEBUFFER", nullptr });
 
@@ -689,9 +683,6 @@ ID3D11ComputeShader* Deferred::GetComputeMainCompositeInterior()
 
 		if (globals::features::screenSpaceRayTracing.loaded)
 			defines.push_back({ "SSRT", nullptr });
-
-		if (globals::features::environmentAmbient.loaded)
-			defines.push_back({ "ENV_AMBIENT", nullptr });
 
 		if (REL::Module::IsVR())
 			defines.push_back({ "FRAMEBUFFER", nullptr });
