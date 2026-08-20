@@ -23,7 +23,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	HueFalloff,
 	EnableContactOcclusion,
 	ContactRadius,
-	ContactStrength)
+	ContactStrength,
+	AOExponent)
 
 void EnvironmentAmbient::RestoreDefaultSettings()
 {
@@ -182,6 +183,21 @@ void EnvironmentAmbient::DrawSettings()
 			}
 		}
 
+		ImGui::SliderFloat("AO Exponent", &settings.AOExponent, 1.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"Total power of the composite's multi-bounce AO factor on the environment term.\n"
+				"\n"
+				"1.5 is the SSRT diffuse path: its cubemap ambient is added to MAIN before the\n"
+				"deferred composite runs, so it pays that factor once itself and once more at half\n"
+				"power inside the composite. This term is added after the composite has already\n"
+				"applied its half power, so without the extra exponent it pays it only once and\n"
+				"reads about 25 percent brighter in creases than the SSRT reference.\n"
+				"\n"
+				"1.0 is the behaviour before this control existed. Raise towards 2.0 for deeper\n"
+				"creases.");
+		}
+
 		if (!screenSpaceGI.loaded || !screenSpaceGI.settings.Enabled) {
 			ImGui::TextColored({ 1, 0.65f, 0, 1 }, "Screen Space GI is off: only Skylighting occlusion is applied.");
 		}
@@ -219,7 +235,7 @@ void EnvironmentAmbient::DrawSettings()
 		ImGui::Checkbox("Enable Contact Occlusion", (bool*)&settings.EnableContactOcclusion);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text(
-				"Near-field ambient occlusion from the full-resolution depth buffer, six taps per\n"
+				"Near-field ambient occlusion from the full-resolution depth buffer, ten taps per\n"
 				"pixel.\n"
 				"\n"
 				"This covers the last scale the other occlusion sources cannot reach. Skylighting\n"
@@ -244,9 +260,9 @@ void EnvironmentAmbient::DrawSettings()
 					"World-space radius of the search, in centimetres. 15 cm (default) is contact\n"
 					"scale: strand-to-skin, cloth-to-skin, frame-to-wall. Raising it starts to\n"
 					"overlap Screen Space GI's job and costs temporal stability, because the same\n"
-					"six taps then have to cover a larger area.\n"
+					"ten taps then have to cover a larger area.\n"
 					"\n"
-					"The pixel radius is derived from this per pixel and clamped to 2-32 pixels, so\n"
+					"The pixel radius is derived from this per pixel and clamped to 2-64 pixels, so\n"
 					"distant geometry keeps distinct taps and a near-field surface cannot turn this\n"
 					"into a full-screen pass.");
 			}
@@ -254,9 +270,12 @@ void EnvironmentAmbient::DrawSettings()
 			ImGui::SliderFloat("Contact Strength", &settings.ContactStrength, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text(
-					"Scales the occlusion. At 1.0 a 90-degree corner lands near 0.2 occlusion and a\n"
-					"tight contact such as hair against skin near 0.5. 0.0 disables the effect\n"
-					"without removing its cost - use the checkbox for that.");
+					"Scales the occlusion. At 1.0 a 90-degree corner lands near 0.4 occlusion and a\n"
+					"tight contact such as hair against skin reaches full absorption, matching the\n"
+					"SSRT fallback this reproduces. The upper half of the slider is headroom rather\n"
+					"than the working range; use 0.5 for the levels this had before that\n"
+					"recalibration. 0.0 disables the effect without removing its cost - use the\n"
+					"checkbox for that.");
 			}
 		}
 
@@ -266,9 +285,17 @@ void EnvironmentAmbient::DrawSettings()
 		ImGui::Checkbox("Enable in Interiors", (bool*)&settings.EnableInterior);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text(
-				"Interiors use a separate composite permutation without Skylighting, so the sky\n"
-				"visibility term is unavailable and only the no-sky cubemap is used. Off by\n"
-				"default, which leaves interiors on the vanilla ambient path.");
+				"Interiors use a separate composite permutation without Skylighting, so only the\n"
+				"no-sky cubemap is used - which is the whole of the environment light indoors\n"
+				"anyway, and is exactly what Skylighting would report there: its probe volume\n"
+				"returns full visibility inside, so the sky visibility and enclosure terms would\n"
+				"both be constant 1.\n"
+				"\n"
+				"On by default. Interiors are most of the play time, and leaving them on the\n"
+				"vanilla ambient path meant the directional environment light simply did not\n"
+				"exist in dungeons, caves and houses. Contact occlusion and the enclosure hue\n"
+				"fallback still work there; they run off contact and Screen Space GI, not off\n"
+				"Skylighting.");
 		}
 
 		ImGui::SliderFloat("Normalization", &settings.Normalization, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);

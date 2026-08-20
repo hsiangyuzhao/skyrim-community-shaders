@@ -25,6 +25,35 @@
 //   * linear-space composite        ssrt_diffuse_composite.hlsl:20
 // Anything "more correct" than the fallback sits behind a non-default option or is gone.
 //
+// CHECKED AGAINST THE UPSTREAM REWRITE'S OWN FALLBACK (build-0816
+// diffuseGI.cs.hlsl:188-243 SampleDiffuseFallbackCubemap), which absorbed this same term into
+// SSGI. Everything it does that is representable here has been adopted; the rest is recorded so
+// the next reader does not have to re-derive it:
+//
+//   * DALC reference scaled by DALCAmount (:212) - ADOPTED below, see the Normalization block.
+//   * skylightingBoost = 1 + saturate(n.z) * (1 - MinDiffuseVisibility) (:198) - already present,
+//     computed once per pixel by the caller (DeferredCompositeCS.hlsl:196). Upstream applies the
+//     boost *after* MixDiffuse; this lineage applies it before, which is what its own forward
+//     path and SSRT fallback do (ssrt_raymarch.hlsl:730-732). Deliberately NOT reordered: the
+//     caller uses the same value for the ambient estimate it subtracts out of MAIN, so changing
+//     the order would break that parity for a difference that only shows at the
+//     MinDiffuseVisibility floor (upstream boosts the floor, this lineage does not).
+//   * Env / sky split - this lineage's is strictly better and stays: upstream adds the full
+//     with-sky cubemap on top of the no-sky cubemap (:221-228), double counting the non-sky
+//     environment, whereas AccumulateDirection below takes max(withSky - noSky, 0) per direction.
+//   * Sky term attenuated by skylightingDiffuse (:224) - already the behaviour here
+//     (`skyOnly * a_skyVisibility`).
+//   * DALCMode (:206-218, ratio vs DALC-normalised), SkylightingAffectsEnv (:225-226),
+//     EnvIBLScale / SkyIBLScale / EnvIBLSaturation / SkyIBLSaturation - NOT ported: this
+//     lineage's IBL settings block (SharedData::IBLSettings) has none of these fields, and
+//     inventing settings to mirror them is out of scope. Fixed behaviour instead:
+//     DALCMode = luminance ratio (the Normalization control), SkylightingAffectsEnv = 0 (only
+//     the sky increment is attenuated, as the ported fallback does), and the scale/saturation
+//     pairs collapse onto this feature's own Intensity and Saturation.
+//   * Cubemap mip 3 (SSGI_FALLBACK_MIP) vs EnvMip 2 here - not changed: upstream takes one tap
+//     per open sector and needs the wider filter, while this feature averages SampleCount
+//     cosine-hemisphere directions, which is already a wider and better-shaped filter.
+//
 // This header is included by package/Shaders/DeferredCompositeCS.hlsl after its resource
 // declarations and deliberately reads those globals directly:
 //   EnvTexture (t6)              no-sky prefiltered cubemap    [DYNAMIC_CUBEMAPS]
@@ -118,9 +147,15 @@ namespace EnvironmentAmbient
 	// SSGI already applied at their own scales.
 	////////////////////////////////////////////////////////////////////////////////////////////////
 
-	static const uint ContactSamples = 6;    // <= 8 depth Loads, unrolled
+	// The pixel-radius ceiling was the binding constraint, not the world radius: at 1080p the
+	// 15 cm default only fits inside 32 px beyond about 4.5 m, so at the 1-3 m range where a
+	// strand actually meets a cheek the search was clamped down to an effective 5-10 cm and the
+	// term under-read exactly where it matters most. 64 px moves the clamp out to roughly 9 m,
+	// and the tap count goes up with it so the larger disk is still covered densely enough to
+	// stay temporally stable.
+	static const uint ContactSamples = 10;
 	static const float MinContactPixels = 2.0;
-	static const float MaxContactPixels = 32.0;
+	static const float MaxContactPixels = 64.0;
 	static const float ContactBias = 0.1;
 
 	// Same reconstruction the caller uses for its own pixel (DeferredCompositeCS.hlsl:115-131), so
@@ -205,9 +240,14 @@ namespace EnvironmentAmbient
 			occlusion += saturate(cosine - ContactBias) * falloff * valid;
 		}
 
-		// 2/N normalises a roughly half-occluded neighbourhood towards full occlusion at strength 1,
-		// which puts a 90-degree corner near 0.2 and tight contact such as hair on skin near 0.5.
-		occlusion *= SharedData::envAmbientSettings.ContactStrength * (2.0 / float(ContactSamples));
+		// The old 2/N put a 90-degree corner near 0.2 occlusion and a tight contact such as hair on
+		// skin near 0.5 at strength 1, so the term topped out around half visibility where the
+		// SSRT fallback it stands in for went to zero - strength was the only way to reach full
+		// absorption, and 2.0 was barely enough. 4/N makes strength 1 land on full occlusion at
+		// tight contact and near 0.4 at a right-angle corner, which leaves the slider's upper half
+		// as genuine headroom rather than as the working range. Halve ContactStrength to recover
+		// the previous levels exactly.
+		occlusion *= SharedData::envAmbientSettings.ContactStrength * (4.0 / float(ContactSamples));
 
 		return saturate(1.0 - occlusion);
 	}
@@ -281,6 +321,23 @@ namespace EnvironmentAmbient
 			// omits it), ReflectionNormalisationScale included, mip 15 clamps to the 1x1x6 average.
 			float envLuminance = Color::RGBToLuminance(EnvTexture.SampleLevel(LinearSampler, a_normalWS, 15));
 			float directionalAmbientLuminance = Color::RGBToLuminance(max(0.0, mul(SharedData::DirectionalAmbient, float4(a_normalWS, 1.0)))) * Color::ReflectionNormalisationScale;
+
+#if defined(IBL)
+			// Upstream's DALC-normalised fallback mode scales the DALC reference by DALCAmount
+			// (build-0816 diffuseGI.cs.hlsl:212). The fallback this feature ports predates that
+			// and uses raw DALC, which overshoots whenever diffuse IBL is on: the forward ambient
+			// this term replaces is DALC * DALCAmount plus an IBL probe (Lighting.hlsl:3224 and
+			// :3245-3252), and the composite's estimate subtracts it in that same split
+			// (DeferredCompositeCS.hlsl:219-241). Normalising to full DALC therefore aims at a
+			// reference roughly 1/DALCAmount too bright - 3x at the 0.33 default.
+			//
+			// Gated exactly as the composite's DALC half is, so the two stay consistent.
+			// Identity at the shipped default (Normalization = 0 skips this block entirely), so
+			// this only matters once the user turns normalisation on.
+			[branch] if (SharedData::iblSettings.EnableDiffuseIBL != 0 &&
+				(!SharedData::InInterior || SharedData::iblSettings.EnableInterior != 0))
+				directionalAmbientLuminance *= SharedData::iblSettings.DALCAmount;
+#endif
 
 			env = lerp(env, env * (directionalAmbientLuminance / max(envLuminance, 1e-4)), SharedData::envAmbientSettings.Normalization);
 		}
