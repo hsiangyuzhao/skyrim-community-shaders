@@ -43,6 +43,22 @@ struct ScreenSpaceRayTracing : Feature
 	void EnsureSharcResources();
 #endif
 
+	/// @brief (spec C1) Reconciles the half-resolution texture set with the current
+	/// DiffuseHalfRes setting, and resets the diffuse history whenever the path changes.
+	/// Called at the top of DrawSSRTDiffuse, before any dispatch, so the resolution a
+	/// frame runs at is fixed before its first binding.
+	void UpdateHalfResResources();
+	/// @brief Allocates and clears the six half-resolution diffuse textures. Idempotent.
+	void CreateHalfResResources();
+	/// @brief Drops the half-resolution textures. The D3D11 runtime keeps the underlying
+	/// resources alive until the command buffers referencing them retire, so this is safe
+	/// to call between frames.
+	void ReleaseHalfResResources();
+	/// @brief Zeroes the diffuse history and its moments on both resolution paths. A zero
+	/// accumulated-frame count makes ssrt_temporal.hlsl blend with alpha 1, i.e. snap to
+	/// the current frame, which is what a resolution switch requires.
+	void ResetDiffuseHistory();
+
     bool HasShaderDefine(RE::BSShader::Type) override { return true; };
     virtual bool SupportsVR() override { return true; };
 
@@ -88,6 +104,11 @@ struct ScreenSpaceRayTracing : Feature
         /// distinguish signal from noise. Deliberately conservative: raising it trades
         /// residual noise for more skipped tiles.
         float AdaptiveVarianceEps = 1e-4f;
+        /// @brief (spec C1) Run the diffuse raymarch and its whole SVGF chain at half
+        /// resolution, then upsample to full resolution with a depth/normal-aware
+        /// bilateral filter. Specular and the composite are untouched. Off by default:
+        /// the current look stays the default look.
+        bool DiffuseHalfRes = false;
 #ifdef ENABLE_SHARC
         bool EnableSharc = false;
 #endif
@@ -177,6 +198,20 @@ struct ScreenSpaceRayTracing : Feature
     // (audit P6 / #20) texHitPDF (was u1) and texOutput (a redundant full-screen copy
     // of texSSRColor) had no consumer anywhere and are gone.
 
+    // (spec C1) Half-resolution mirror of the diffuse chain, allocated only while
+    // DiffuseHalfRes is on. Dimensions are exactly mip 1 of texDepth, which is the depth
+    // source the half-resolution passes read, so the two line up texel for texel.
+    eastl::unique_ptr<Texture2D> texSSRTDiffuseColorHalf = nullptr;
+    eastl::unique_ptr<Texture2D> texHistoryDiffuseHalf = nullptr;
+    eastl::unique_ptr<Texture2D> texTemporalHalf = nullptr;
+    eastl::unique_ptr<Texture2D> texVarianceHalf = nullptr;
+    eastl::unique_ptr<Texture2D> texMomentsHalf = nullptr;
+    eastl::unique_ptr<Texture2D> texHistoryMomentsDiffuseHalf = nullptr;
+
+    /// @brief Whether the half-resolution set is currently allocated and in use. Compared
+    /// against the effective setting each frame to detect a toggle.
+    bool halfResActive = false;
+
 #ifdef ENABLE_SHARC
     eastl::unique_ptr<Buffer> sharcHashEntries = nullptr;
     eastl::unique_ptr<Buffer> sharcHashCopyOffsets = nullptr;
@@ -208,6 +243,13 @@ struct ScreenSpaceRayTracing : Feature
     winrt::com_ptr<ID3D11ComputeShader> varianceCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialSpecularCS = nullptr;
+    // (spec C1) SSRT_HALF_RES permutations of the diffuse chain, plus the upsample. Always
+    // compiled, so toggling DiffuseHalfRes never triggers a recompile.
+    winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseHalfResCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> temporalHalfResCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> varianceHalfResCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> spatialHalfResCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> diffuseUpsampleCS = nullptr;
 #ifdef ENABLE_SHARC
     winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseSharcCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> sharcUpdateRaymarchCS = nullptr;

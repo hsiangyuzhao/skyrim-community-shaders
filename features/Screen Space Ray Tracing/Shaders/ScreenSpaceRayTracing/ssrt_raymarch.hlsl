@@ -93,7 +93,17 @@ cbuffer SSRTCB : register(b1)
 #define SSRT_OPTION_INVERTED_DEPTH 0
 
 #define HIZ_MAX_ITERATIONS MaxSteps
-#define HIZ_MIN_MIP 0
+// (spec C1) The traversal's finest level *is* the resolution the pass runs at. At half
+// resolution that is mip 1 of the Hi-Z pyramid, which is natively half sized: with the
+// diffuse convention (`screen_size` = full buffer extent) SSRT_GetMipResolution(_, 1)
+// gives exactly the half-resolution cell grid, so the cell boundaries keep lining up with
+// texel boundaries and MaxSteps keeps its reach in screen terms. Starting at mip 0 instead
+// would make the ray re-test every texel twice.
+#if defined(SSRT_HALF_RES)
+#   define HIZ_MIN_MIP 1
+#else
+#   define HIZ_MIN_MIP 0
+#endif
 #define SSRT_FLOAT_MAX 3.402823466e+38
 #define SSRT_DEPTH_HIERARCHY_MAX_MIP MaxMips
 #if defined(SSRT_SPECULAR)
@@ -384,8 +394,16 @@ float SSRT_ValidateHit(float3 hit, float2 uv, float3 world_space_ray_direction, 
     }
 
     // Reject the hit if we didnt advance the ray significantly to avoid immediate self reflection
+    // (spec C1) The threshold is "two texels of the traversal grid", expressed in
+    // full-resolution texels because `screen_size` is a full-resolution extent under the
+    // diffuse convention. At half resolution one grid texel is two full-resolution texels.
+#if defined(SSRT_HALF_RES)
+    static const float SSRT_SELF_HIT_TEXELS = 4.f;
+#else
+    static const float SSRT_SELF_HIT_TEXELS = 2.f;
+#endif
     float2 manhattan_dist = abs(hit.xy - uv);
-    if ((manhattan_dist.x < (2.f / screen_size.x)) && (manhattan_dist.y < (2.f / screen_size.y)))
+    if ((manhattan_dist.x < (SSRT_SELF_HIT_TEXELS / screen_size.x)) && (manhattan_dist.y < (SSRT_SELF_HIT_TEXELS / screen_size.y)))
     {
         occlusion = 1 - confidence;
         return 0;
@@ -538,6 +556,11 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
 #else
     uint2 screen_size = SharedData::BufferDim.xy;
 #endif
+    // (spec C1) In the half-resolution permutation `coords` is a *half-resolution* pixel:
+    // it addresses the output UAV and seeds the sampling sequences (SampleRandomVector2DBaked
+    // and the skylighting STBN lookup), which is what the spec asks for -- the blue-noise
+    // pattern must be decorrelated across the pixels actually being traced. Everything that
+    // addresses a full-resolution G-buffer uses `gbufferCoords` below instead.
     uint2 coords = DTid.xy;
 #if defined(SSRT_SPECULAR)
     uint sample_id = 0;
@@ -548,7 +571,43 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
 
     float4 outColor = float4(0, 0, 0, 0);
 
-    float2 uv = float2(coords.xy + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
+#if defined(SSRT_HALF_RES)
+    // (spec C1) A half-resolution pixel must stand for one *real* surface point, not for
+    // an average of its 2x2 full-resolution block.
+    //
+    // The traversal's finest level is mip 1, whose value is the min over the block, so the
+    // ray origin depth is the nearest of the four subpixels -- there is no choice about
+    // that. Pairing that depth with a different subpixel's uv would place the origin off
+    // the surface; pairing it with a *farther* subpixel's depth would put the origin
+    // behind mip 1's surface, and SSRT_AdvanceRay reads `surface_z > position.z` as
+    // "below the surface", i.e. an instant hit at the origin that SSRT_ValidateHit then
+    // throws away as a self-hit. On any block straddling a depth discontinuity that would
+    // turn into a wholesale false-miss.
+    //
+    // So resolve the argmin explicitly and take uv, depth, normal and albedo from that one
+    // full-resolution pixel. Ties resolve to the lowest subpixel index, which keeps the
+    // choice deterministic frame to frame. mip 0 of the pyramid is safe to read out of
+    // bounds: it holds the far plane there (audit #8).
+    const int2 blockBase = int2(coords.xy) * 2;
+    const float4 blockDepths = float4(
+        SSRT_LoadDepth(blockBase, 0),
+        SSRT_LoadDepth(blockBase + int2(1, 0), 0),
+        SSRT_LoadDepth(blockBase + int2(0, 1), 0),
+        SSRT_LoadDepth(blockBase + int2(1, 1), 0));
+    const float blockDepthMin = min(min(blockDepths.x, blockDepths.y), min(blockDepths.z, blockDepths.w));
+    int2 repOffset = int2(1, 1);
+    if (blockDepths.z == blockDepthMin)
+        repOffset = int2(0, 1);
+    if (blockDepths.y == blockDepthMin)
+        repOffset = int2(1, 0);
+    if (blockDepths.x == blockDepthMin)
+        repOffset = int2(0, 0);
+    const uint2 gbufferCoords = uint2(blockBase + repOffset);
+#else
+    const uint2 gbufferCoords = coords.xy;
+#endif
+
+    float2 uv = float2(gbufferCoords + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
     uint eyeIndex = Stereo::GetEyeIndexFromTexCoord(uv);
 
     // (audit P1) Sky / far-plane early-out.
@@ -568,16 +627,22 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     // GroupMemoryBarrierWithGroupSync(); bailing out of a subset of the group's
     // (x, y) lanes would make that barrier non-uniform. Writing 0 (instead of leaving
     // the target untouched) also keeps the ping-pong denoiser textures deterministic.
+#if defined(SSRT_HALF_RES)
+    // Identical to DepthTexture[gbufferCoords] inside the render sub-rect, and correctly
+    // the far plane outside it, so it doubles as the sky test for a fully-offscreen block.
+    float depth = blockDepthMin;
+#else
     float depth = DepthTexture[coords.xy].x;
+#endif
     const bool is_far_plane = SSRT_IS_FAR_PLANE(depth);
 
     float3 normalVS;
     float roughness;
-    GetNormalRoughness(coords.xy, normalVS, roughness);
+    GetNormalRoughness(gbufferCoords, normalVS, roughness);
     roughness = clamp(roughness, 0.02f, 1.0f);
 
 #if !defined(SSRT_SPECULAR)
-    float3 albedo = AlbedoTexture[coords.xy].xyz;
+    float3 albedo = AlbedoTexture[gbufferCoords].xyz;
 #endif
 
     bool is_mirror = IsMirrorReflection(roughness);
@@ -599,7 +664,14 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     float world_ray_length = 0.0;
     // (audit #7s) screen_size * SSRT_DEPTH_COORD_SCALE is the render-resolution extent
     // under both conventions: fullDim * ratio for diffuse, renderDim * 1 for specular.
-    bool valid_ray = all(coords < int2(screen_size * SSRT_DEPTH_COORD_SCALE)) && all(coords >= int2(0, 0)) && !is_far_plane;  // (audit P1)
+    // (spec C1) At half resolution the dispatch covers floor(renderExtent / 2) instead --
+    // the same floor rule SSRT_GetFilterExtent and mip 1 of the pyramid both use.
+#if defined(SSRT_HALF_RES)
+    const int2 raymarch_extent = int2(max(uint2(1, 1), uint2(screen_size * SSRT_DEPTH_COORD_SCALE) >> 1));
+#else
+    const int2 raymarch_extent = int2(screen_size * SSRT_DEPTH_COORD_SCALE);
+#endif
+    bool valid_ray = all(coords < raymarch_extent) && all(coords >= int2(0, 0)) && !is_far_plane;  // (audit P1)
 #if SHARC_UPDATE
     valid_ray = valid_ray && ShouldProcessPixel(coords.xy, SharedData::FrameCount);
 #endif
@@ -750,7 +822,9 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
             envColor = Color::IrradianceToLinear(envColor);
             float ao = lerp(1.0, occlusion, OcclusionStrength);
 #   if defined(SSGI)
-            ao *= 1 - saturate(SsgiAoTexture[coords.xy].x);
+            // (spec C1) SSGI's AO target is full resolution; sample it at the
+            // representative subpixel, like the normal and albedo G-buffers.
+            ao *= 1 - saturate(SsgiAoTexture[gbufferCoords].x);
 #   endif
 #   if defined(SSRT_SPECULAR)
             ao = GetSpecularOcclusionFromAmbientOcclusion(NdotV, ao, roughness);

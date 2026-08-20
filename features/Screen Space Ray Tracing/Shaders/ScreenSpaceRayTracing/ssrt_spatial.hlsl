@@ -43,7 +43,11 @@ cbuffer DenoiserCB : register(b2)
 #endif
 
 #if SSRT_SVGF_GAUSSIAN
-float GaussianBlur(uint2 id)
+// (spec C1) `extent` is the extent of the grid this pass runs on, passed in rather than
+// recomputed so the half-resolution permutation clamps against the half-resolution bound.
+// It stays a float2 because the comparisons below are float comparisons -- promoting them
+// to unsigned would only add signed/unsigned warnings.
+float GaussianBlur(uint2 id, float2 extent)
 {
     float sum = 0.f;
     float kernelSum = 0.f;
@@ -60,7 +64,7 @@ float GaussianBlur(uint2 id)
         for (int x = -radius; x <= radius; x++)
         {
             const int2 p = id + int2(x, y);
-            const bool inside = (p.x >= 0 && p.y >= 0) && (p.x < SharedData::BufferDim.x * FrameBuffer::DynamicResolutionParams1.x && p.y < SharedData::BufferDim.y * FrameBuffer::DynamicResolutionParams1.y);
+            const bool inside = (p.x >= 0 && p.y >= 0) && (p.x < extent.x && p.y < extent.y);
 
             if (inside)
             {
@@ -131,7 +135,7 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
     } else {
         float3 sampleNormalVS;
         float sampleRoughness;
-        GetNormalRoughness(uint2(samplePos), sampleNormalVS, sampleRoughness);
+        GetNormalRoughness(uint2(SSRT_GBUFFER_COORD(samplePos)), sampleNormalVS, sampleRoughness);
         guide = float4(sampleNormalVS, DepthTexture[samplePos]);
     }
     return guide;
@@ -140,7 +144,7 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
 // Spatiotemporal Variance-Guided Filter
 [numthreads(8, 8, 1)] void main(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
 {
-    uint2 screen_size = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy;
+    uint2 screen_size = SSRT_GetFilterExtent();  // (spec C1) half of the render extent in the half-res permutation
     const bool inBounds = DTid.x < screen_size.x && DTid.y < screen_size.y;
 
     float2 uv = float2(DTid.xy + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
@@ -204,7 +208,7 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
                 float tileDepth = 0.0f;
                 if (valid) {
                     float tileRoughness;
-                    GetNormalRoughness(uint2(p), tileNormal, tileRoughness);
+                    GetNormalRoughness(uint2(SSRT_GBUFFER_COORD(p)), tileNormal, tileRoughness);
                     tileDepth = DepthTexture[p];
                 }
                 g_ssrtSpatialTile[ty * SSRT_SPATIAL_TILE + tx] = float4(tileNormal, tileDepth);
@@ -236,12 +240,21 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
 
     float3 normalVS;
     float roughness;
-    GetNormalRoughness(DTid.xy, normalVS, roughness);
+    GetNormalRoughness(SSRT_GBUFFER_COORD(DTid.xy), normalVS, roughness);
     roughness = clamp(roughness, 0.001f, 1.0f);
 
     float luminanceCenter = Color::RGBToLuminance(ssrColor.rgb);
 #if SSRT_SVGF_GAUSSIAN
-    float variance = GaussianBlur(DTid.xy);
+#   if defined(SSRT_HALF_RES)
+    const float2 gaussianExtent = float2(screen_size);
+#   else
+    // Bit-for-bit the *unrounded* expression GaussianBlur used inline. It matters: at a
+    // fractional dynamic-resolution extent (e.g. 2560 * 0.667 = 1706.6) the truncated
+    // bound would exclude column 1706, which the float comparison admitted -- a one-column
+    // difference from the pre-optimisation shader, and the fallback path has to be exact.
+    const float2 gaussianExtent = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy;
+#   endif
+    float variance = GaussianBlur(DTid.xy, gaussianExtent);
 #else
     // (spec A5) The carried variance, unsmoothed. Post-#11 this channel is already the
     // squared-weight filtered variance the SVGF paper prescribes.

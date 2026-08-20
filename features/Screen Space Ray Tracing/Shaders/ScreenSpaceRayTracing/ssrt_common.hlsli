@@ -24,6 +24,47 @@ Texture2D<unorm float3> NormalRoughnessTexture : register(t2);
 
 SamplerState LinearSampler : register(s0);
 
+#if defined(SSRT_HALF_RES) && defined(SSRT_SPECULAR)
+#   error "SSRT_HALF_RES is a diffuse-only permutation; reflection sharpness rules out half-res specular."
+#endif
+
+// (spec C1) Extent of the render sub-rect, in full-resolution texels.
+uint2 SSRT_GetRenderExtent()
+{
+    return uint2(SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy);
+}
+
+// (spec C1) Extent of the grid the *current pass* runs on.
+//
+// The half-resolution diffuse chain runs on floor(renderExtent / 2), which is exactly the
+// extent ssrt_depth_downsample.hlsl writes into mip 1 of the Hi-Z pyramid (its dispatch is
+// sized `max(1, size >> 1)`). Choosing floor rather than ceil is what makes the two agree
+// texel for texel: with ceil, an odd render width would leave the last half-res column
+// backed by a mip 1 texel nobody ever wrote, which by the audit #8 convention reads as the
+// far plane -- a column of pixels that would silently classify as sky.
+uint2 SSRT_GetFilterExtent()
+{
+#if defined(SSRT_HALF_RES)
+    return max(uint2(1, 1), SSRT_GetRenderExtent() >> 1);
+#else
+    return SSRT_GetRenderExtent();
+#endif
+}
+
+// (spec C1) Maps a pixel of the current pass's grid to the full-resolution G-buffer.
+//
+// At half resolution this is the top-left texel of the 2x2 block. The normal G-buffer is
+// only ever consulted as an edge-stopping *guide* by the denoisers and the upsample, and
+// what matters there is that all four of them agree on one rule -- not that the rule picks
+// the same texel the raymarch chose as its ray origin (which is the block's nearest
+// subpixel; see ssrt_raymarch.hlsl). Resolving the nearest subpixel per tap is not an
+// option: the a-trous kernel would need four extra depth loads for each of its 25 taps.
+#if defined(SSRT_HALF_RES)
+#   define SSRT_GBUFFER_COORD(px) ((px) * 2)
+#else
+#   define SSRT_GBUFFER_COORD(px) (px)
+#endif
+
 // Brian Karis, Epic Games "Real Shading in Unreal Engine 4"
 float4 ImportanceSampleGGX(float2 E, float a2)
 {
