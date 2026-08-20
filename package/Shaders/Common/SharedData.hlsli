@@ -369,13 +369,13 @@ namespace SharedData
 
 		float EnvMip;
 		float Saturation;
-		float AOPower;
-		uint ApplyAO;
+		float Spread;
+		float OcclusionStrength;
 
+		uint SampleCount;
+		uint ApplyAO;
 		uint EnableInterior;
-		uint NormalizationMode;
-		uint JitteredSampling;
-		float JitterAngle;
+		uint LinearComposite;
 	};
 
 	cbuffer FeatureData : register(b6)

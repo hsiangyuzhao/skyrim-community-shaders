@@ -56,18 +56,18 @@ struct EnvironmentAmbient : Feature
 	 */
 	struct alignas(16) Settings
 	{
-		uint Enabled = 1;            // 0
-		float Blend = 1.0f;          // 4
-		float Intensity = 1.0f;      // 8
-		float Normalization = 0.0f;  // 12
-		float EnvMip = 4.0f;         // 16
-		float Saturation = 1.0f;     // 20
-		float AOPower = 1.5f;        // 24
-		uint ApplyAO = 1;            // 28
-		uint EnableInterior = 0;     // 32
-		uint NormalizationMode = 1;  // 36
-		uint JitteredSampling = 1;   // 40
-		float JitterAngle = 0.35f;   // 44 radians
+		uint Enabled = 1;                // 0
+		float Blend = 1.0f;              // 4
+		float Intensity = 1.0f;          // 8
+		float Normalization = 0.0f;      // 12  ssrt CubemapNormalization default
+		float EnvMip = 2.0f;             // 16  ssrt_raymarch.hlsl:593 sampleMip
+		float Saturation = 1.0f;         // 20
+		float Spread = 1.0f;             // 24  1 = full cosine hemisphere (fallback distribution)
+		float OcclusionStrength = 1.0f;  // 28  ssrt OcclusionStrength default
+		uint SampleCount = 3;            // 32
+		uint ApplyAO = 1;                // 36
+		uint EnableInterior = 0;         // 40
+		uint LinearComposite = 1;        // 44
 	} settings;
 	static_assert(sizeof(Settings) == 48, "EnvironmentAmbient::Settings must stay 48 bytes (3 constant buffer rows).");
 };

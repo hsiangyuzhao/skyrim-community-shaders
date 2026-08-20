@@ -10,9 +10,19 @@
 // Environment Ambient ("L1")
 //
 // Directional ambient light from the prefiltered dynamic cubemaps, modulated by Skylighting sky
-// visibility. This is a once-per-pixel restatement of the Screen Space Ray Tracing dynamic-cubemap
-// diffuse fallback (features/Screen Space Ray Tracing/Shaders/ScreenSpaceRayTracing/
-// ssrt_raymarch.hlsl:588-644), which runs once per ray (DiffuseSPP=2 by default).
+// visibility. This is a per-pixel port of the Screen Space Ray Tracing dynamic-cubemap diffuse
+// fallback (features/Screen Space Ray Tracing/Shaders/ScreenSpaceRayTracing/
+// ssrt_raymarch.hlsl:587-645), which runs once per ray (DiffuseSPP=2 by default).
+//
+// PARITY IS THE GOAL, INCLUDING THE FALLBACK'S QUIRKS. Every default here reproduces a specific
+// line of that block:
+//   * EnvMip 2.0                    ssrt_raymarch.hlsl:593  `const uint sampleMip = 2`
+//   * cosine-hemisphere directions  ssrt_raymarch.hlsl:378  CosineSampleHemisphereConcentric
+//   * no Color::Ambient() wrap      ssrt_raymarch.hlsl:595  the fallback omits it
+//   * Normalization 0.0             ScreenSpaceRayTracing.h:59 CubemapNormalization = 0.0f
+//   * MultiBounceAO on gamma albedo ssrt_raymarch.hlsl:640  `MultiBounceAO(albedo, ao)`
+//   * linear-space composite        ssrt_diffuse_composite.hlsl:20
+// Anything "more correct" than the fallback sits behind a non-default option or is gone.
 //
 // This header is included by package/Shaders/DeferredCompositeCS.hlsl after its resource
 // declarations and deliberately reads those globals directly:
@@ -23,13 +33,16 @@
 // It declares no resources of its own and needs no new register.
 //
 // Colour space: the cubemaps hold "irradiance-gamma" values (SpecularIrradianceCS.hlsl writes
-// Color::IrradianceToGamma), which is exactly the space the composite's ambient term lives in, so
-// the result can be blended against ambDalc directly and the caller's single
-// IrradianceToLinear/MultiBounceAO/IrradianceToGamma round trip stays correct under Linear
-// Lighting and without it.
+// Color::IrradianceToGamma), which is the space the composite's ambient term lives in, so the
+// result can be blended against the vanilla ambient directly. Because IrradianceToLinear is a pure
+// power function, IrradianceToLinear(env * albedo) == IrradianceToLinear(env) *
+// IrradianceToLinear(albedo), i.e. multiplying albedo in gamma space here is bit-equivalent to the
+// fallback multiplying it in linear space in ssrt_diffuse_composite.hlsl:20.
 
 namespace EnvironmentAmbient
 {
+	static const uint MaxSamples = 8;
+
 	// Branchless orthonormal basis around a unit vector.
 	// [Duff et al. 2017, "Building an Orthonormal Basis, Revisited"]
 	void GetOrthonormalBasis(float3 a_n, out float3 o_tangent, out float3 o_bitangent)
@@ -41,9 +54,42 @@ namespace EnvironmentAmbient
 		o_bitangent = float3(b, s + a_n.y * a_n.y * a, -a_n.y);
 	}
 
+	// Verbatim port of ssrt_common.hlsli:89-105 so the ray distribution is the fallback's.
+	float3 ConcentricDiskSamplingHelper(float2 a_e)
+	{
+		float2 p = 2.0 * a_e - 0.99999994;
+		float2 a = abs(p);
+		float lo = min(a.x, a.y);
+		float hi = max(a.x, a.y);
+		const float epsilon = 5.42101086243e-20;  // 2^-64, avoids 0/0
+		float phi = (Math::PI / 4.0) * (lo / (hi + epsilon) + 2.0 * float(a.y >= a.x));
+		const uint signMask = 0x80000000;
+		float2 disk = asfloat((asuint(float2(cos(phi), sin(phi))) & ~signMask) | (asuint(p) & signMask));
+		return float3(disk, hi);
+	}
+
+	// Verbatim port of ssrt_common.hlsli:123-129 (the PDF is not needed: the cubemap tap is already
+	// the cosine-weighted estimate, so the cosine-weighted mean is a plain average).
+	float3 CosineSampleHemisphereConcentric(float2 a_e)
+	{
+		float3 result = ConcentricDiskSamplingHelper(a_e);
+		float sinTheta = result.z;
+		float cosTheta = sqrt(max(0.0, 1.0 - sinTheta * sinTheta));
+		return float3(result.xy * sinTheta, cosTheta);
+	}
+
+	// Verbatim port of ssrt_common.hlsli:168-173.
+	float2 Hammersley16(uint a_index, uint a_numSamples, uint2 a_random)
+	{
+		float e1 = frac((float)a_index / (float)a_numSamples + float(a_random.x) * (1.0 / 65536.0));
+		float e2 = float((reversebits(a_index) >> 16) ^ a_random.y) * (1.0 / 65536.0);
+		return float2(e1, e2);
+	}
+
 	// One prefiltered cubemap tap. The sky increment is kept separate so only it can be attenuated
 	// by sky visibility, and the max() is taken per direction so a direction where the sky map is
-	// darker than the no-sky map cannot borrow brightness from its neighbours.
+	// darker than the no-sky map cannot borrow brightness from its neighbours
+	// (ssrt_raymarch.hlsl:617-619).
 	void AccumulateDirection(float3 a_dir, float a_mip, inout float3 io_envNoSky, inout float3 io_skyOnly)
 	{
 		float3 noSky = EnvTexture.SampleLevel(LinearSampler, a_dir, a_mip);
@@ -53,21 +99,39 @@ namespace EnvironmentAmbient
 #endif
 	}
 
-	// Sky visibility along a_normalWS, evaluated once per pixel. The SSRT fallback evaluates this
-	// per ray with the ray direction; using the surface normal is the once-per-pixel equivalent.
-	float GetSkyVisibility(float3 a_normalWS, float3 a_positionMS, uint2 a_pixCoord)
+	// Sky visibility along a_normalWS. The fallback re-evaluates this per ray, but its cosine-lobe
+	// integrand always uses the folded *surface* normal (ssrt_raymarch.hlsl:605-606); the ray
+	// direction reaches Skylighting::sample only as the receiver normal bias that offsets the probe
+	// fetch by one cell (Skylighting.hlsli:65), so per-ray it buys a little extra spatial dither and
+	// no directional gradient. Once per pixel is the faithful reduction.
+	//
+	// Two values come out of the same integral because they play different roles:
+	//   o_skyVisibility  the fallback's `skylightingDiffuse` verbatim (ssrt_raymarch.hlsl:602-612),
+	//                    including the upward-normal boost that can push it above 1 and the
+	//                    MinDiffuseVisibility floor. Only the sky increment may use this.
+	//   return value     raw sky openness: the same integral with neither hack applied. This is
+	//                    what stands in for the fallback's screen-space occlusion factor. Using the
+	//                    boosted value there would be wrong in exactly the place S2 named: the
+	//                    boost is 1 + (1 - MinDiffuseVisibility) at n.z = 1, which saturates the
+	//                    proxy to 1 and removes all darkening from upward-facing surfaces, i.e.
+	//                    from the ground at a wall-to-ground junction.
+	float GetSkyVisibility(float3 a_normalWS, float3 a_positionMS, uint2 a_pixCoord, out float o_skyVisibility)
 	{
+		o_skyVisibility = 1.0;
 #if defined(SKYLIGHTING) && !defined(INTERIOR)
 		sh2 skylighting = Skylighting::sample(SharedData::skylightingSettings, SkylightingProbeArray, stbn_vec3_2Dx1D_128x128x64, a_pixCoord, a_positionMS, a_normalWS);
 
-		// Fold the lower hemisphere up, as the SSRT fallback does (ssrt_raymarch.hlsl:605).
+		// Fold the lower hemisphere up, as the fallback does (ssrt_raymarch.hlsl:605).
 		float3 visibilityNormal = normalize(float3(a_normalWS.xy, max(0, a_normalWS.z)));
 
 		float visibility = SphericalHarmonics::FuncProductIntegral(skylighting, SphericalHarmonics::EvaluateCosineLobe(visibilityNormal)) / Math::PI;
 		visibility = saturate(visibility);
 		visibility = lerp(1.0, visibility, Skylighting::getFadeOutFactor(a_positionMS));
-		visibility *= 1.0 + saturate(a_normalWS.z) * (1.0 - SharedData::skylightingSettings.MinDiffuseVisibility);
-		return Skylighting::mixDiffuse(SharedData::skylightingSettings, visibility);
+
+		o_skyVisibility = visibility * (1.0 + saturate(a_normalWS.z) * (1.0 - SharedData::skylightingSettings.MinDiffuseVisibility));
+		o_skyVisibility = Skylighting::mixDiffuse(SharedData::skylightingSettings, o_skyVisibility);
+
+		return visibility;
 #else
 		return 1.0;
 #endif
@@ -76,90 +140,90 @@ namespace EnvironmentAmbient
 	/**
 	 * @brief Evaluates the environment ambient term for one pixel.
 	 *
-	 * @param a_normalWS   Geometric world-space normal.
-	 * @param a_positionMS Model-space position (already VR eye-adjusted by the caller).
-	 * @param a_albedo     G-buffer albedo, applied with the same convention as the DALC path.
-	 * @param a_ambDalc    Ambient term separated out of MAIN: vanilla DALC chroma with the forward
-	 *                     ground-truth luminance from Masks.z. Used as the normalization target.
-	 * @param a_pixCoord   Dispatch pixel coordinate (Skylighting blue-noise seed).
-	 * @return Environment ambient in the same space and scale as a_ambDalc (albedo included).
+	 * @param a_normalWS    Geometric world-space normal.
+	 * @param a_positionMS  Model-space position (already VR eye-adjusted by the caller).
+	 * @param a_albedo      G-buffer albedo, gamma space, applied last as the fallback does.
+	 * @param a_pixCoord    Dispatch pixel coordinate (sample scramble + Skylighting blue-noise seed).
+	 * @param o_occlusion   Proxy for the fallback's per-ray screen-space occlusion factor
+	 *                      (ssrt_raymarch.hlsl:632). The caller folds it into MultiBounceAO.
+	 * @return Environment ambient in the same space and scale as the vanilla ambient term
+	 *         (albedo included, occlusion NOT included).
 	 */
-	float3 Evaluate(float3 a_normalWS, float3 a_positionMS, float3 a_albedo, float3 a_ambDalc, uint2 a_pixCoord)
+	float3 Evaluate(float3 a_normalWS, float3 a_positionMS, float3 a_albedo, uint2 a_pixCoord, out float o_occlusion)
 	{
 		const float mip = SharedData::envAmbientSettings.EnvMip;
+		const uint numSamples = clamp(SharedData::envAmbientSettings.SampleCount, 1u, MaxSamples);
+		const float spread = saturate(SharedData::envAmbientSettings.Spread);
 
-		// A single tap of one prefiltered mip cannot express a cosine lobe: the SSRT fallback got
-		// its angular width from cosine-hemisphere ray directions plus SVGF filtering. Averaging a
-		// rotating triple widens the effective kernel and breaks up cubemap face seams. The taps
-		// come from mips small enough to sit in cache (mip 4 is 8x8x6), so the cost is negligible.
+		// The fallback's angular width came from the cosine-hemisphere ray distribution, not from
+		// the mip: mip 2 is GGX roughness 2/7 (DynamicCubemaps.cpp:444), far sharper than a cosine
+		// lobe. Sampling K cosine-hemisphere directions and averaging is the per-pixel equivalent;
+		// a narrow cone around the normal is not, because it keeps almost no sky for vertical
+		// normals and almost nothing but the zenith for horizontal ones.
+		float3 tangent, bitangent;
+		GetOrthonormalBasis(a_normalWS, tangent, bitangent);
+
+		// Per-pixel, per-frame scramble of the Hammersley set, as in
+		// SampleRandomVector2DBaked (ssrt_raymarch.hlsl:350-363). TAA resolves the residual noise.
+		uint3 seed = uint3(a_pixCoord, Random::pcg3d(uint3(a_pixCoord, SharedData::FrameCount)).x);
+		uint2 scramble = Random::pcg3d(seed).xy / 0x10000;
+
 		float3 envNoSky = 0.0;
 		float3 skyOnly = 0.0;
-		float sampleWeight = 1.0;
 
-		AccumulateDirection(a_normalWS, mip, envNoSky, skyOnly);
-
-		[branch] if (SharedData::envAmbientSettings.JitteredSampling != 0)
+		[loop] for (uint i = 0; i < numSamples; ++i)
 		{
-			float3 tangent, bitangent;
-			GetOrthonormalBasis(a_normalWS, tangent, bitangent);
+			float3 local = CosineSampleHemisphereConcentric(Hammersley16(i, numSamples, scramble));
+			float3 dir = local.x * tangent + local.y * bitangent + local.z * a_normalWS;
 
-			// Per-pixel, per-frame rotation; TAA resolves the residual noise.
-			float phase = Random::InterleavedGradientNoise(float2(a_pixCoord), SharedData::FrameCount) * Math::TAU;
+			// spread = 1 is the fallback's distribution; lower values collapse the hemisphere back
+			// towards the surface normal for debugging or for a sharper look.
+			dir = normalize(lerp(a_normalWS, dir, spread));
 
-			float sinTheta, cosTheta;
-			sincos(SharedData::envAmbientSettings.JitterAngle, sinTheta, cosTheta);
-
-			// Perpendicular to a_normalWS with length sinTheta, so cosTheta * N +- tilt is already
-			// unit length and needs no renormalisation.
-			float3 tilt = sinTheta * (cos(phase) * tangent + sin(phase) * bitangent);
-
-			AccumulateDirection(cosTheta * a_normalWS + tilt, mip, envNoSky, skyOnly);
-			AccumulateDirection(cosTheta * a_normalWS - tilt, mip, envNoSky, skyOnly);
-
-			sampleWeight = 3.0;
+			AccumulateDirection(dir, mip, envNoSky, skyOnly);
 		}
 
-		envNoSky /= sampleWeight;
-		skyOnly /= sampleWeight;
+		float rcpSamples = rcp((float)numSamples);
+		envNoSky *= rcpSamples;
+		skyOnly *= rcpSamples;
 
-		// Only the sky increment is attenuated by sky visibility, as in the SSRT fallback
-		// (ssrt_raymarch.hlsl:619-622); attenuating the whole colour would fade the non-sky
-		// environment away as well.
-		float visibility = 1.0;
+		// skyVisibility attenuates the sky increment (the fallback's skylightingDiffuse); openness is
+		// the unhacked integral used as the occlusion proxy. See GetSkyVisibility.
+		float skyVisibility = 1.0;
+		float openness = 1.0;
 #if !defined(INTERIOR)
-		visibility = GetSkyVisibility(a_normalWS, a_positionMS, a_pixCoord);
+		openness = GetSkyVisibility(a_normalWS, a_positionMS, a_pixCoord, skyVisibility);
 #endif
 
 		float3 env = envNoSky;
 
 		[branch] if (SharedData::envAmbientSettings.Normalization > 0.0)
 		{
-			// mip 15 clamps to the last mip (1x1x6), i.e. the average cubemap colour.
+			// ssrt_raymarch.hlsl:595 + 620-621, verbatim: no Color::Ambient() wrap (the fallback
+			// omits it), ReflectionNormalisationScale included, mip 15 clamps to the 1x1x6 average.
 			float envLuminance = Color::RGBToLuminance(EnvTexture.SampleLevel(LinearSampler, a_normalWS, 15));
+			float directionalAmbientLuminance = Color::RGBToLuminance(max(0.0, mul(SharedData::DirectionalAmbient, float4(a_normalWS, 1.0)))) * Color::ReflectionNormalisationScale;
 
-			float scale;
-			if (SharedData::envAmbientSettings.NormalizationMode == 0) {
-				// Mode A: the SSRT fallback target (ssrt_raymarch.hlsl:595). Wrapped in
-				// Color::Ambient, which that line omits, so the target sits in the same space as
-				// the rest of the ambient pipeline when Linear Lighting is on.
-				float targetLuminance = Color::RGBToLuminance(Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(a_normalWS, 1.0))))) * Color::ReflectionNormalisationScale;
-				scale = targetLuminance / max(envLuminance, 1e-4);
-			} else {
-				// Mode B: target the forward ground truth in Masks.z. a_ambDalc already includes
-				// albedo, so divide the albedo luminance back out to compare pre-albedo scales.
-				// Needs no ReflectionNormalisationScale fudge and is identical with and without
-				// Linear Lighting.
-				float targetLuminance = Color::RGBToLuminance(a_ambDalc);
-				scale = targetLuminance / max(envLuminance * Color::RGBToLuminance(a_albedo), 1e-4);
-			}
-
-			env = lerp(env, env * scale, SharedData::envAmbientSettings.Normalization);
+			env = lerp(env, env * (directionalAmbientLuminance / max(envLuminance, 1e-4)), SharedData::envAmbientSettings.Normalization);
 		}
 
-		env += skyOnly * visibility;
+		// Only the sky increment is attenuated by sky visibility (ssrt_raymarch.hlsl:622);
+		// attenuating the whole colour would fade the non-sky environment away as well.
+		env += skyOnly * skyVisibility;
 
-		// Saturation and intensity act on the light itself, before albedo, matching the Diffuse IBL
-		// convention (IBL.hlsli / Lighting.hlsl:3241-3255).
+		// The fallback's second, independent darkening factor: `lerp(1, occlusion, OcclusionStrength)`
+		// where occlusion = 1 - hitConfidence from SSRT_ValidateHit (ssrt_raymarch.hlsl:299/307,
+		// :632). It fires on self-intersecting and back-facing rays, which is exactly what happens
+		// under an eave or at a wall-to-ground junction, and it multiplies the *whole* env colour -
+		// not just the sky part. Nothing screen-space is available per pixel in the composite, so
+		// raw sky openness, which drops in the same places, stands in for it. The sky increment
+		// consequently carries openness twice while the no-sky part carries it once; the fallback
+		// carries two genuinely different signals. OcclusionStrength brackets the difference.
+		o_occlusion = 1.0;
+		[branch] if (SharedData::envAmbientSettings.ApplyAO != 0)
+			o_occlusion = lerp(1.0, openness, saturate(SharedData::envAmbientSettings.OcclusionStrength));
+
+		// Non-parity extras: both are identity at their defaults.
 		env = Color::Saturation(env, SharedData::envAmbientSettings.Saturation);
 		env *= SharedData::envAmbientSettings.Intensity;
 

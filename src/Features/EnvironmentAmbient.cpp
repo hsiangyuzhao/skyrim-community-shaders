@@ -13,12 +13,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Normalization,
 	EnvMip,
 	Saturation,
-	AOPower,
+	Spread,
+	OcclusionStrength,
+	SampleCount,
 	ApplyAO,
 	EnableInterior,
-	NormalizationMode,
-	JitteredSampling,
-	JitterAngle)
+	LinearComposite)
 
 void EnvironmentAmbient::RestoreDefaultSettings()
 {
@@ -101,65 +101,80 @@ void EnvironmentAmbient::DrawSettings()
 		ImGui::SliderFloat("Cubemap Mip", &settings.EnvMip, 0.0f, 7.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text(
-				"Prefiltered cubemap mip used for the diffuse hemisphere. Higher is blurrier and\n"
-				"closer to a true cosine lobe; lower keeps more directional detail but can show\n"
-				"blotches. Mip 7 is a single averaged colour with no directionality left.");
+				"Prefiltered cubemap mip used for each hemisphere sample. 2.0 (default) is what the\n"
+				"SSRT dynamic-cubemap fallback used; the angular width of the lobe comes from the\n"
+				"cosine-hemisphere sample directions, not from the mip. Raising it blurs sky and\n"
+				"ground into each other, which desaturates the light and darkens upward-facing\n"
+				"surfaces. Mip 7 is a single averaged colour with no directionality left.");
 		}
 
 		ImGui::SliderFloat("Saturation", &settings.Saturation, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Saturation of the environment light, applied before albedo.");
-		}
-
-		ImGui::Checkbox("Jittered Sampling", (bool*)&settings.JitteredSampling);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text(
-				"Average three cubemap directions instead of one: the surface normal plus a\n"
-				"rotating pair tilted away from it. Widens the effective filter kernel towards a\n"
-				"cosine lobe, which a single mip cannot express, and hides cubemap face seams.\n"
-				"Costs four extra cubemap samples from mips that fit entirely in cache.\n"
-				"Turn off to isolate single-direction behaviour while debugging.");
+			ImGui::Text("Saturation of the environment light, applied before albedo. 1.0 is off.");
 		}
 
 		{
-			auto jitterGuard = Util::DisableGuard(!settings.JitteredSampling);
-			ImGui::SliderAngle("Jitter Angle", &settings.JitterAngle, 0.0f, 90.0f, "%.0f deg", ImGuiSliderFlags_AlwaysClamp);
+			int sampleCount = std::clamp((int)settings.SampleCount, 1, 8);
+			if (ImGui::SliderInt("Hemisphere Samples", &sampleCount, 1, 8, "%d", ImGuiSliderFlags_AlwaysClamp))
+				settings.SampleCount = (uint)sampleCount;
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text(
-					"Angular offset of the two extra directions from the surface normal. Larger\n"
-					"widens the lobe, which can be traded against a lower Cubemap Mip to keep more\n"
-					"directional detail.");
+					"Number of cosine-weighted hemisphere directions averaged per pixel, using the\n"
+					"same concentric Hammersley set the SSRT fallback traced its rays with. 1 samples\n"
+					"the surface normal only, which biases every surface towards whatever sits\n"
+					"straight above it (a blue zenith outdoors) and is the main reason a single tap\n"
+					"reads cool and desaturated. Each extra sample costs two cubemap taps from mips\n"
+					"that fit in cache.");
 			}
 		}
 
+		ImGui::SliderFloat("Hemisphere Spread", &settings.Spread, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"1.0 (default) is the full cosine-weighted hemisphere, matching the SSRT fallback's\n"
+				"ray distribution. Lower values pull the samples back towards the surface normal,\n"
+				"narrowing the lobe: useful to isolate sampling effects while debugging, but it\n"
+				"starves vertical surfaces of sky light.");
+		}
+
 		if (!skylighting.loaded) {
-			ImGui::TextColored({ 1, 0.65f, 0, 1 }, "Skylighting is not loaded: sky visibility is not applied.");
+			ImGui::TextColored({ 1, 0.65f, 0, 1 }, "Skylighting is not loaded: sky visibility and ambient occlusion are not applied.");
 		}
 
 		///////////////////////////////
 		ImGui::SeparatorText("Occlusion");
 
-		if (!screenSpaceGI.loaded || !screenSpaceGI.settings.Enabled) {
-			ImGui::TextColored({ 1, 0.65f, 0, 1 }, "Screen Space GI is off: no contact occlusion is applied.");
-		}
-
 		ImGui::Checkbox("Apply Occlusion", (bool*)&settings.ApplyAO);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text(
-				"Apply the Screen Space GI occlusion exponent to the environment light. Turn off\n"
-				"to isolate the environment light from the occlusion contribution while tuning.");
+				"Darken the environment light where the sky is occluded, in addition to attenuating\n"
+				"the sky part of the cubemap. The SSRT fallback multiplied its whole environment\n"
+				"colour by a second, independent screen-space occlusion factor, which is what gave\n"
+				"backlit walls their gradient under eaves and at ground junctions. Turn off to see\n"
+				"the unoccluded environment light on its own.");
 		}
 
 		{
 			auto aoGuard = Util::DisableGuard(!settings.ApplyAO);
-			ImGui::SliderFloat("Occlusion Power", &settings.AOPower, 0.5f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			ImGui::SliderFloat("Occlusion Strength", &settings.OcclusionStrength, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text(
-					"Exponent on the Screen Space GI occlusion for the ambient term only. Direct\n"
-					"light keeps the unmodified occlusion. Raise it to darken contact regions such\n"
-					"as hair over a face or the base of plants, which the SSRT fallback darkened\n"
-					"with an extra self-intersection factor that is not available here.");
+					"How much of the raw Skylighting sky openness is reused as an ambient occlusion\n"
+					"factor on the whole environment term. 1.0 matches the SSRT fallback's\n"
+					"Occlusion Strength default. Screen Space GI occlusion, when it is loaded, is\n"
+					"always multiplied in on top of this, exactly as the fallback did.\n"
+					"\n"
+					"Raw openness means before Skylighting's upward-normal brightness boost and its\n"
+					"Minimum Diffuse Visibility floor, so upward-facing surfaces darken too - the\n"
+					"ground at a wall junction, not just the wall. The sky part of the cubemap is\n"
+					"already attenuated by the boosted visibility, so it ends up carrying openness\n"
+					"twice where the fallback had two independent signals. If eaves and junctions\n"
+					"now read darker than the SSRT reference, lower this towards 0.5.");
 			}
+		}
+
+		if (!screenSpaceGI.loaded || !screenSpaceGI.settings.Enabled) {
+			ImGui::TextColored({ 1, 0.65f, 0, 1 }, "Screen Space GI is off: only Skylighting occlusion is applied.");
 		}
 
 		///////////////////////////////
@@ -176,25 +191,27 @@ void EnvironmentAmbient::DrawSettings()
 		ImGui::SliderFloat("Normalization", &settings.Normalization, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text(
-				"Rescales the cubemap brightness towards the vanilla ambient brightness.\n"
-				"0.0 (default) takes the brightness straight from the cubemap capture, matching\n"
-				"the SSRT fallback default. 1.0 makes the Blend slider energy neutral.");
+				"Rescales the cubemap brightness towards the vanilla directional ambient\n"
+				"brightness, using the SSRT fallback's formula verbatim. 0.0 (default) takes the\n"
+				"brightness straight from the cubemap capture, matching the fallback's own\n"
+				"Cubemap Normalization default. 1.0 makes the Blend slider energy neutral.");
 		}
 
-		{
-			auto normGuard = Util::DisableGuard(settings.Normalization <= 0.0f);
-			const char* modes[] = { "Directional ambient luminance", "G-buffer ambient luminance" };
-			int mode = settings.NormalizationMode > 1u ? 1 : (int)settings.NormalizationMode;
-			if (ImGui::Combo("Normalization Target", &mode, modes, IM_ARRAYSIZE(modes)))
-				settings.NormalizationMode = (uint)mode;
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text(
-					"Which brightness the cubemap is normalised against.\n"
-					"Directional ambient luminance reproduces the SSRT fallback formula.\n"
-					"G-buffer ambient luminance uses the forward ambient value carried in the\n"
-					"G-buffer, which already includes IBL and Skylighting and behaves identically\n"
-					"with and without Linear Lighting.");
-			}
+		ImGui::Checkbox("Linear Composite", (bool*)&settings.LinearComposite);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"Add the environment light to the direct light in linear space, as the SSRT\n"
+				"diffuse composite does, and fade the vanilla ambient out with Blend instead of\n"
+				"cross-fading against it. Blend 0 stays bit-identical to vanilla either way.\n"
+				"\n"
+				"Off routes the environment light through the vanilla deferred composite, which\n"
+				"converts both terms to gamma, adds them, and converts back. Without Linear\n"
+				"Lighting that soft-add is pow(a^(1/1.6) + b^(1/1.6), 1.6): it brightens the sum\n"
+				"by up to 30% and pulls every channel towards the ambient hue, so the image reads\n"
+				"brighter, flatter and less saturated. That was the main colour error against the\n"
+				"SSRT reference, so this is On by default. It makes no difference when Linear\n"
+				"Lighting is enabled, where both conversions are identities.");
 		}
+
 	}
 }
