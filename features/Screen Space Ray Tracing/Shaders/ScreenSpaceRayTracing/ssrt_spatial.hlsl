@@ -25,6 +25,24 @@ cbuffer DenoiserCB : register(b2)
     uint denoiserPad0;
 };
 
+// (spec A5) The 3x3 Gaussian pre-blur of the variance channel, and the switch to A/B it.
+//
+// Worth stating plainly, because it is easy to mistake for a leftover of the era when
+// variance guidance was broken (audit #11): this pre-blur is prescribed by SVGF itself.
+// Schied et al. 2017 smooth the variance estimate with a small Gaussian before it drives
+// the luminance edge-stopping function, because a variance estimated from a handful of
+// samples is itself noisy, and feeding that straight into phiLuminance makes the filter
+// strength fluctuate pixel to pixel -- which shows up as blotches, not as noise.
+//
+// What #11 changed is only that the input is now meaningful. It costs 9 loads and ~34
+// instruction slots per pixel, so it is a real fraction of the pass, hence the switch;
+// but the default stays on and the report recommends keeping it. Set
+// SSRT_SVGF_GAUSSIAN=0 to measure the alternative.
+#ifndef SSRT_SVGF_GAUSSIAN
+#   define SSRT_SVGF_GAUSSIAN 1
+#endif
+
+#if SSRT_SVGF_GAUSSIAN
 float GaussianBlur(uint2 id)
 {
     float sum = 0.f;
@@ -55,6 +73,7 @@ float GaussianBlur(uint2 id)
 
     return sum / kernelSum;
 }
+#endif
 
 static const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
 
@@ -221,7 +240,13 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
     roughness = clamp(roughness, 0.001f, 1.0f);
 
     float luminanceCenter = Color::RGBToLuminance(ssrColor.rgb);
+#if SSRT_SVGF_GAUSSIAN
     float variance = GaussianBlur(DTid.xy);
+#else
+    // (spec A5) The carried variance, unsmoothed. Post-#11 this channel is already the
+    // squared-weight filtered variance the SVGF paper prescribes.
+    float variance = ssrColor.w;
+#endif
 
     // (audit #11) Variance travels in .w through the ping-pong, and it is what drives
     // phiLuminance above. The output used to hard-code .w = 1.0, so from the second
