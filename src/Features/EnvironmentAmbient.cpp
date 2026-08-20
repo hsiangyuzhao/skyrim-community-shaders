@@ -20,7 +20,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	EnableInterior,
 	LinearComposite,
 	EnclosureFallback,
-	HueFalloff)
+	HueFalloff,
+	EnableContactOcclusion,
+	ContactRadius,
+	ContactStrength)
 
 void EnvironmentAmbient::RestoreDefaultSettings()
 {
@@ -207,6 +210,53 @@ void EnvironmentAmbient::DrawSettings()
 					"Exponent on the openness signal that drives the fallback. Above 1.0 the\n"
 					"fallback reaches further out of enclosed areas (more aggressive de-blueing);\n"
 					"below 1.0 it stays confined to the most enclosed spots. 1.0 is linear.");
+			}
+		}
+
+		///////////////////////////////
+		ImGui::SeparatorText("Contact Occlusion");
+
+		ImGui::Checkbox("Enable Contact Occlusion", (bool*)&settings.EnableContactOcclusion);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"Near-field ambient occlusion from the full-resolution depth buffer, six taps per\n"
+				"pixel.\n"
+				"\n"
+				"This covers the last scale the other occlusion sources cannot reach. Skylighting\n"
+				"works on a metre-scale probe grid and Screen Space GI is half-resolution with a\n"
+				"large radius, while the SSRT fallback this feature reproduces occluded its rays\n"
+				"at full resolution and centimetre scale. That difference is what shows up as\n"
+				"missing absorption where hair meets a face, where cloth meets skin, and around\n"
+				"a window frame behind a character.\n"
+				"\n"
+				"Applies both as a multiplier on the environment light and as part of the\n"
+				"enclosure signal, so contacts shift towards the local ambient colour rather than\n"
+				"just darkening. Independent of Screen Space GI: they act at different scales and\n"
+				"compose, so leaving both on is correct.");
+		}
+
+		{
+			auto contactGuard = Util::DisableGuard(!settings.EnableContactOcclusion);
+
+			ImGui::SliderFloat("Contact Radius", &settings.ContactRadius, 2.0f, 60.0f, "%.1f cm", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text(
+					"World-space radius of the search, in centimetres. 15 cm (default) is contact\n"
+					"scale: strand-to-skin, cloth-to-skin, frame-to-wall. Raising it starts to\n"
+					"overlap Screen Space GI's job and costs temporal stability, because the same\n"
+					"six taps then have to cover a larger area.\n"
+					"\n"
+					"The pixel radius is derived from this per pixel and clamped to 2-32 pixels, so\n"
+					"distant geometry keeps distinct taps and a near-field surface cannot turn this\n"
+					"into a full-screen pass.");
+			}
+
+			ImGui::SliderFloat("Contact Strength", &settings.ContactStrength, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text(
+					"Scales the occlusion. At 1.0 a 90-degree corner lands near 0.2 occlusion and a\n"
+					"tight contact such as hair against skin near 0.5. 0.0 disables the effect\n"
+					"without removing its cost - use the checkbox for that.");
 			}
 		}
 
