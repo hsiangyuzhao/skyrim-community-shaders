@@ -401,32 +401,34 @@ float3 ScreenSpaceToViewSpace(float3 screen_uv_coord, float4x4 invProj)
     return InvProjectPosition(screen_uv_coord, invProj);
 }
 
-groupshared float4 samples[64][SAMPLES_PER_PIXEL];
-groupshared float4 weights[64][SAMPLES_PER_PIXEL];
-
-bool IsInGroup(int2 groupThreadID)
-{
-    return groupThreadID.x < 8 && groupThreadID.y < 8 && groupThreadID.x >= 0 && groupThreadID.y >= 0;
-}
-
-static const int2 offset[4] = {
-    int2(-1, 0), int2(1, 0), int2(0, 1), int2(0, -1)
-};
-
-float LocalBRDF(float3 V, float3 L, float3 N, float roughness) {
-#if defined(SSRT_SPECULAR)  // D_GGX only
-    float3 H = normalize(V + L);
-    float NdotL = saturate(dot(N, L));
-    float NdotV = saturate(dot(N, V));
-    float NdotH = saturate(dot(N, H));
-    float D = BRDF::D_GGX(roughness, NdotH);
-    float G = BRDF::Vis_SmithJointApprox(roughness, NdotV, NdotL);
-    return D * G;
-#else  // Lambert
-    float NdotL = saturate(dot(N, L));
-    return NdotL * BRDF::Diffuse_Lambert();
+// (audit P4) `samples` only ever needs to be shared when several rays per pixel are
+// spread across the thread group's z slices and thread z == 0 sums them up. The
+// specular permutation and the SHARC update pass both run one sample per pixel, so
+// there the whole LDS round trip -- and the group-wide barrier that goes with it --
+// is pure overhead; they use a plain local instead.
+#if defined(SSRT_SPECULAR) || SHARC_UPDATE
+#   define SSRT_USE_SAMPLE_LDS 0
+#else
+#   define SSRT_USE_SAMPLE_LDS 1
 #endif
-}
+
+#if SSRT_USE_SAMPLE_LDS
+// (audit P4) Index as y * 8 + x, not x * 8 + y. LDS is banked on consecutive dwords,
+// so with x * 8 + y the eight threads of a row (fixed y, x = 0..7) land 8 * sizeof(float4)
+// = 32 dwords apart and collide on the same bank, serialising the access eight ways.
+// y * 8 + x makes a row contiguous. This is a pure bijective remap of the slots --
+// every thread still owns exactly one slot and the z == 0 reduction reads the same
+// slots it did before -- so it is bit-for-bit output preserving.
+groupshared float4 samples[64][SAMPLES_PER_PIXEL];
+#   define SSRT_SAMPLE_SLOT (groupThreadID.y * 8 + groupThreadID.x)
+#endif
+
+// (audit P4 / #10) `groupshared float4 weights[64][SAMPLES_PER_PIXEL]` and the
+// LocalBRDF() that fed it are gone: nothing ever read the array back, so the specular
+// path never actually applied any BRDF/pdf weighting, and the write cost half of the
+// group's LDS budget (hurting occupancy) for nothing. Deleting it also retires the
+// swapped L/N arguments at the single call site (audit #10) permanently. Reintroducing
+// BRDF weighting is a separate, look-changing piece of work.
 
 #if SHARC_UPDATE
 uint Hash(uint2 pos, uint seed)
@@ -521,9 +523,11 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
 	positionWS = mul(FrameBuffer::CameraViewProjInverse[eyeIndex], positionWS);
 	positionWS.xyz = positionWS.xyz / positionWS.w;
 
-    samples[groupThreadID.x * 8 + groupThreadID.y][sample_id] = 0.f;
-    float localWeight = pdf == 0 ? 0 : LocalBRDF(-view_space_ray_direction, view_space_surface_normal, view_space_reflected_direction, roughness) / max(pdf, 1e-4);
-    weights[groupThreadID.x * 8 + groupThreadID.y][sample_id] = float4(view_space_surface_normal, localWeight);
+#if SSRT_USE_SAMPLE_LDS
+    samples[SSRT_SAMPLE_SLOT][sample_id] = 0.f;
+#else
+    float4 localSample = 0.f;  // (audit P4) single sample per pixel, no LDS needed
+#endif
     float hit_distance = 65536;
 
 #if SHARC_RENDER
@@ -551,7 +555,7 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
 
     if (valid_ray && SharcGetCachedRadiance(sharcParameters, hitData, sharcColor, true))
     {
-        samples[groupThreadID.x * 8 + groupThreadID.y][sample_id] = float4(sharcColor, 1);
+        samples[SSRT_SAMPLE_SLOT][sample_id] = float4(sharcColor, 1);
     }
     else
 #endif
@@ -663,7 +667,11 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
             confidence = 1;
         }
 #endif
-        samples[groupThreadID.x * 8 + groupThreadID.y][sample_id] = float4(sampleColor, confidence);
+#if SSRT_USE_SAMPLE_LDS
+        samples[SSRT_SAMPLE_SLOT][sample_id] = float4(sampleColor, confidence);
+#else
+        localSample = float4(sampleColor, confidence);
+#endif
 
 #if SHARC_UPDATE
         if (confidence > 0.99f)
@@ -700,13 +708,16 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
         }
 #endif
     }
-#if !SHARC_UPDATE
+#if SSRT_USE_SAMPLE_LDS
+    // Publish this z slice's sample to the other slices of the same pixel before the
+    // z == 0 lane sums them. Only reachable when SAMPLES_PER_PIXEL > 1 actually needs
+    // cross-slice sharing; the specular and SHARC-update permutations skip both the
+    // LDS round trip and this barrier (audit P4).
     GroupMemoryBarrierWithGroupSync();
 #endif
 
 #if defined(SSRT_SPECULAR)
-    outColor.xyz = samples[groupThreadID.x * 8 + groupThreadID.y][0].xyz;
-    outColor.w = samples[groupThreadID.x * 8 + groupThreadID.y][0].w;
+    outColor = localSample;
     SSRColorOutput[coords.xy] = outColor;
     SSRPDFOutput[coords.xy] = outPDF;
     SSRTHitDistanceOutput[coords.xy] = hit_distance;
@@ -716,8 +727,8 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     if (sample_id == 0) {
         outColor = 0.f;
         for (int i = 0; i < SAMPLES_PER_PIXEL; ++i) {
-            outColor.xyz += samples[groupThreadID.x * 8 + groupThreadID.y][i].xyz;
-            outColor.w += samples[groupThreadID.x * 8 + groupThreadID.y][i].w;
+            outColor.xyz += samples[SSRT_SAMPLE_SLOT][i].xyz;
+            outColor.w += samples[SSRT_SAMPLE_SLOT][i].w;
         }
         outColor.xyz /= SAMPLES_PER_PIXEL;
         outColor.w = saturate(outColor.w / SAMPLES_PER_PIXEL);
