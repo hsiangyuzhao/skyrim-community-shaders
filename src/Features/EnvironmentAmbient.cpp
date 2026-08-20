@@ -159,10 +159,17 @@ void EnvironmentAmbient::DrawSettings()
 			ImGui::SliderFloat("Occlusion Strength", &settings.OcclusionStrength, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text(
-					"How much of the Skylighting sky visibility is reused as an ambient occlusion\n"
+					"How much of the raw Skylighting sky openness is reused as an ambient occlusion\n"
 					"factor on the whole environment term. 1.0 matches the SSRT fallback's\n"
 					"Occlusion Strength default. Screen Space GI occlusion, when it is loaded, is\n"
-					"always multiplied in on top of this, exactly as the fallback did.");
+					"always multiplied in on top of this, exactly as the fallback did.\n"
+					"\n"
+					"Raw openness means before Skylighting's upward-normal brightness boost and its\n"
+					"Minimum Diffuse Visibility floor, so upward-facing surfaces darken too - the\n"
+					"ground at a wall junction, not just the wall. The sky part of the cubemap is\n"
+					"already attenuated by the boosted visibility, so it ends up carrying openness\n"
+					"twice where the fallback had two independent signals. If eaves and junctions\n"
+					"now read darker than the SSRT reference, lower this towards 0.5.");
 			}
 		}
 
