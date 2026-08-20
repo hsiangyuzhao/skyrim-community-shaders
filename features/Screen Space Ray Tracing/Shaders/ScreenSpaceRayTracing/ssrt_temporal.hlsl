@@ -203,6 +203,14 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
     // (spec S1) Everything downstream -- the moments, the temporal blend, and the
     // no-history fallback write at the bottom -- consumes the clamped radiance, so the
     // outlier never enters the accumulation in the first place.
+    //
+    // (BUG-1) The ordering is unchanged and remains the correct one, but it now *matters*
+    // where it used to be nearly inert: the clamped sample is what feeds curMoment, so the
+    // variance the a-trous chain is steered by is the variance of the post-clamp
+    // distribution. That is the honest quantity -- the filter should be told about the
+    // signal it is actually being handed -- but it does mean the clamp's aggressiveness and
+    // the filter's strength are now coupled, whereas before the fix the moments were too
+    // degenerate for the clamp to move them measurably.
     if (clampFireflies)
         ssrColor.rgb = SSRTClampFirefly(ssrColor.rgb, GTid.xy, fireflyClampSigma);
 
@@ -211,7 +219,22 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
     GetNormalRoughness(DTid.xy, normalVS, roughness);
 
     float luminance = Color::RGBToLuminance(ssrColor.rgb);
-    float2 curMoment = float2(luminance, luminance * luminance) * 0.5;
+    // (BUG-1a) The raw first and second luminance moments of *this frame's* sample, with
+    // no scale factor. The `* 0.5` that used to sit here had no derivation behind it and
+    // it is not in reference SVGF (Schied et al. 2017 accumulate mu1 = l and mu2 = l*l;
+    // Falcor's SVGFReprojection does the same). Halving only mu2 would have been a pure
+    // 2x variance underestimate; halving *both* is worse than that, because the estimator
+    // y - x^2 is not homogeneous: scaling the pair by c gives
+    //     c*E[l^2] - c^2*E[l]^2 = c*sigma^2 + c*(1 - c)*mean^2,
+    // so at c = 0.5 the estimate becomes 0.5*sigma^2 + 0.25*mean^2 -- half the real noise
+    // plus a term that depends only on how *bright* the pixel is. A converged, perfectly
+    // noise-free surface at luminance 0.5 therefore reported variance 0.0625 while a noisy
+    // dark one reported almost nothing, which is the exact inverse of what the edge-stop
+    // and the A1 convergence vote need. The same pair is re-read by ssrt_variance.hlsl's
+    // 7x7 spatial estimator (history <= 2), which averaged the scaled pairs and inherited
+    // the identical 0.5*sigma^2 + 0.25*mean^2 error, so removing the factor here fixes
+    // that path too -- there is nothing to compensate for on either side.
+    float2 curMoment = float2(luminance, luminance * luminance);
 
     // Reproject UVs using motion vectors
     float2 prevUV = uv;
@@ -313,17 +336,53 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
         float alpha = max(1.0f / (prevAccumFrames + 1.0f), invMaxAccumulatedFrames);
         blendedColor = lerp(prevColor.rgb, ssrColor.rgb, alpha);
 
-        float prevLuminance = Color::RGBToLuminance(prevColor.rgb);
-        float2 prevMoment = float2(prevLuminance, prevLuminance * prevLuminance);
-
+        // (BUG-1b) Continue the *accumulated* moment chain. `prevMoments` is the EMA that
+        // every history path above has just resolved out of HistoryMomentsTexture.xy --
+        // directly for a valid reprojection, or as the mean over the surviving neighbours
+        // in the two fallbacks -- and until now it was read and then thrown away. What the
+        // lerp consumed instead was a pair rebuilt from `prevColor`, the already *filtered*
+        // history colour:
+        //     prevMoment = (P, P*P)   with P = luminance(prevColor)
+        // whose own variance y - x^2 is identically zero by construction. Feeding that in
+        // as the running estimate resets the second moment to the square of the first every
+        // single frame, so the recursion never accumulates: only the newest sample's
+        // contribution survives, and the steady-state estimate collapses to
+        //     alpha * (1 - alpha/2)*mean^2 ... i.e. O(alpha) * sigma^2
+        // instead of sigma^2. At the default MaxAccumulatedFrames 16 (alpha = 1/17) that is
+        // a ~34x underestimate of the real per-frame noise -- enough that the a-trous
+        // luminance edge-stop annihilated every non-centre tap and the whole spatial chain
+        // degenerated into a copy.
+        //
+        // Both halves of BUG-1 have to be fixed together. Dropping the 0.5 alone still
+        // leaves the reset-every-frame recursion (alpha*sigma^2, 17x low); switching to
+        // prevMoments alone still leaves the 0.25*mean^2 brightness bias.
+        //
+        // Note that `prevMoments` is a moment of the *unfiltered per-frame* luminance, which
+        // is exactly the quantity SVGF prescribes: the estimate must describe the noise in
+        // the samples being integrated, not the noise left in the integrated result.
         float momentAlpha = max(1.0f / (prevAccumFrames + 1.0f), invMaxAccumulatedFrames);
-        float2 moment = lerp(prevMoment, curMoment, momentAlpha);
+        float2 moment = lerp(prevMoments, curMoment, momentAlpha);
         float variance = moment.y - (moment.x * moment.x);
         variance = max(variance, 0.f);
         FilteredOutput[DTid.xy] = float4(blendedColor, variance);
         MomentsOutput[DTid.xy] = float4(moment, prevAccumFrames + 1.0f, 0.f);
         return;
     }
+    // (BUG-1) No usable history: seed the chain with this frame's raw moments and a count
+    // of 1. One sample carries no variance information, so `curMoment.y - curMoment.x^2`
+    // is now *exactly* zero -- both operands are the identical `luminance * luminance`
+    // expression -- where the old scaled pair made it 0.25 * luminance^2, a value that was
+    // never anything but the brightness bias described above. The `abs()` that used to
+    // wrap it existed only to hide the sign of that garbage; write the zero plainly.
+    //
+    // Zero here is correct and not a gap: this pixel writes accumFrames = 1, and
+    // ssrt_variance.hlsl (which runs immediately after, reading texMoments and texTemporal)
+    // refines every lane with `history <= 2` using a 7x7 luminance-moment neighbourhood and
+    // *overwrites* the .w channel with 2 * spatial sigma^2 before the first a-trous
+    // iteration ever sees it. So the first two frames of a disocclusion are covered by the
+    // spatial estimator and frame 3 onwards by the temporal one -- and with the 0.5 gone
+    // that spatial estimator is finally on the same scale as the temporal one, which is
+    // what makes the handover at history = 3 continuous instead of a 34x step.
     MomentsOutput[DTid.xy] = float4(curMoment, 1.0f, 0.f);
-    FilteredOutput[DTid.xy] = float4(ssrColor.rgb, abs(curMoment.y - (curMoment.x * curMoment.x)));
+    FilteredOutput[DTid.xy] = float4(ssrColor.rgb, 0.0f);
 }
