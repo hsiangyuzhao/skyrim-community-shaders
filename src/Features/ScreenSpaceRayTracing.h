@@ -112,6 +112,10 @@ struct ScreenSpaceRayTracing : Feature
 
     void DrawSSRTSpecular();
     void DrawSSRTDiffuse();
+    /// @brief Snapshots the normal-roughness G-buffer into texHistoryNormals for next
+    /// frame's SVGF temporal validation. Called exactly once per frame, by whichever of
+    /// the two draw passes runs last (audit #13).
+    void CopyHistoryNormals();
     virtual void Prepass() override;
 
     SharedData GetCommonBufferData();

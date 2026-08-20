@@ -728,12 +728,29 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // was the deferred composite's SRV; that now binds texSSRColor->srv directly
     // (Deferred.cpp), saving a full-screen R16G16B16A16 CopyResource per frame plus the
     // texture itself.
-    context->CopyResource(texHistoryNormals->resource.get(), normal.texture);
+    // (audit #13) Specular runs after diffuse, so it owns the once-per-frame snapshot.
+    CopyHistoryNormals();
     context->CopyResource(texHistory->resource.get(), texSSRColor->resource.get());
 
     context->CSSetShader(nullptr, nullptr, 0);
 
     state->EndPerfEvent();
+}
+
+// (audit #13) texHistoryNormals is the previous frame's normal-roughness buffer that
+// ssrt_temporal.hlsl validates its reprojected history against. The copy used to live
+// only at the end of DrawSSRTSpecular, so with EnableSpecular off and EnableSVGF on the
+// texture stayed at its cleared contents forever, IsValidHistory() rejected every
+// candidate and the diffuse temporal filter never accumulated -- exactly the
+// configuration the diffuse+fallback setup runs in.
+//
+// It must happen after every temporal pass of the frame has read it, and exactly once.
+// Deferred::DeferredPasses calls DrawSSRTDiffuse then DrawSSRTSpecular, so specular
+// takes it when enabled and diffuse takes it otherwise.
+void ScreenSpaceRayTracing::CopyHistoryNormals()
+{
+    auto normal = globals::game::renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
+    globals::d3d::context->CopyResource(texHistoryNormals->resource.get(), normal.texture);
 }
 
 void ScreenSpaceRayTracing::DrawSSRTDiffuse()
@@ -948,6 +965,11 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 
         resetViews();
     }
+
+    // (audit #13) Only when specular will not run afterwards, so the snapshot still
+    // happens exactly once per frame and after every temporal pass has read it.
+    if (!settings.EnableSpecular)
+        CopyHistoryNormals();
 
     state->EndPerfEvent();
 

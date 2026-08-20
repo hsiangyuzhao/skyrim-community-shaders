@@ -20,11 +20,14 @@ cbuffer DenoiserCB : register(b2)
 
 bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
 {
-    uint2 screen_size = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy;
+    // (audit #16) Every caller passes a pixel in the *history* textures, whose valid
+    // sub-rectangle is the previous frame's dynamic-resolution extent -- hence
+    // DynamicResolutionParams1.zw (previous width/height ratio) rather than .xy.
+    uint2 prev_screen_size = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw;
     if (uv.x < 0 || uv.x > 1 || uv.y < 0 || uv.y > 1)
         return false;
 
-    if (pixel.x >= screen_size.x || pixel.y >= screen_size.y)
+    if (pixel.x >= prev_screen_size.x || pixel.y >= prev_screen_size.y)
         return false;
 
     float3 prevNormalVS;
@@ -74,7 +77,11 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
     float4 prevColor = 0.f;
     float prevAccumFrames = 0.f;
     float2 prevMoments = float2(0.f, 0.f);
-    uint2 prevPixel = uint2(prevUV * screen_size);
+    // (audit #16) prevUV is normalised to the *previous* frame's render sub-rect, so it
+    // must be scaled by the previous frame's DRS ratio (DynamicResolutionParams1.zw),
+    // not the current one. With DLSS/DRS the two differ whenever the ratio moves, which
+    // shifted the whole history lookup and silently invalidated reprojection.
+    uint2 prevPixel = uint2(prevUV * SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw);
     bool valid = false;
 
     if (IsValidHistory(prevPixel, prevUV, normalVS))
