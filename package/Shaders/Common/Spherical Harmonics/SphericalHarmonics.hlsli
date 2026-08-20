@@ -227,10 +227,15 @@ namespace SphericalHarmonics
 	// http://torust.me/ZH3.pdf
 	float SHHallucinateZH3Irradiance(sh2 inSH, float3 direction)
 	{
-		float3 zonalAxis = normalize(float3(inSH.w, inSH.y, inSH.z));
-		float ratio = 0.0;
-		ratio = abs(dot(float3(-inSH.w, -inSH.y, inSH.z), zonalAxis));
-		ratio /= inSH.x;
+		// Evaluate() stores L=1 as (M=-1, M=0, M=+1) = (-k*dir.y, k*dir.z, -k*dir.x), so the
+		// direction the L1 band points at is (-inSH.w, -inSH.y, inSH.z). Using (w, y, z) mirrored
+		// the axis through the z plane, which put the contrast lobe in the wrong hemisphere.
+		float3 zonalAxis = normalize(float3(-inSH.w, -inSH.y, inSH.z));
+		// Section 3.4.3 wants |L1| / |L0|, the directionality of the signal. The previous
+		// abs(dot(mirroredL1, zonalAxis)) evaluated to |z*z - w*w - y*y| / |L1|, which collapses to
+		// ~0 whenever the L1 band is roughly diagonal and could go negative once divided by a
+		// signed L0, cancelling the contrast term for most pixels.
+		float ratio = length(float3(inSH.w, inSH.y, inSH.z)) / max(abs(inSH.x), 1e-5);
 		float zonalL2Coeff = inSH.x * (0.08f * ratio + 0.6f * ratio * ratio);  // Curve-fit; Section 3.4.3
 		float fZ = dot(zonalAxis, direction);
 		float zhDir = sqrt(5.0f / (16.0f * Math::PI)) * (3.0f * fZ * fZ - 1.0f);
