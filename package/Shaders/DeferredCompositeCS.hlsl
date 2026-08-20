@@ -87,6 +87,14 @@ void SampleSSGISpecular(uint2 pixCoord, sh2 lobe, out float ao, out float3 il, i
 #	endif
 #endif
 
+#if defined(ENV_AMBIENT)
+#	if !defined(DYNAMIC_CUBEMAPS)
+#		undef ENV_AMBIENT
+#	else
+#		include "EnvironmentAmbient/EnvAmbient.hlsli"
+#	endif
+#endif
+
 #if defined(SSRT)
 Texture2D<float4> SSRTexture : register(t16);
 #endif
@@ -130,11 +138,17 @@ Texture2D<float4> SSRTexture : register(t16);
 	float3 linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
 	float3 normalWS = normalize(mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0)).xyz);
 
-#if defined(SSGI)
+#if defined(SSGI) || defined(ENV_AMBIENT)
 
+#	if defined(SSGI)
 	float ssgiAo;
 	float3 ssgiIl;
 	SampleSSGI(dispatchID.xy, normalWS, ssgiAo, ssgiIl);
+#	else
+	// No Screen Space GI: MultiBounceAO(albedo, 1) is the identity, so the ambient separation below
+	// is a round trip and the block only exists to let Environment Ambient replace the term.
+	float ssgiAo = 1.0;
+#	endif
 
 	float3 directionalAmbientColor = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(normalWS, 1.0))));
 	directionalAmbientColor *= albedo;
@@ -159,6 +173,7 @@ Texture2D<float4> SSRTexture : register(t16);
 
 	float3 linAlbedo = Color::IrradianceToLinear(albedo / Color::PBRLightingScale);
 
+#	if defined(SSGI)
 	// Indirect lighting albedo must keep the upstream (2ea3b3adc) calibration, which divided
 	// albedo by the then-unconditional PBRLightingScale of 0.65 to compensate for lowering the
 	// default GIStrength from 1.5 to 1.0. PBRLightingScale is now 1.0 under Linear Lighting, so
@@ -166,6 +181,45 @@ Texture2D<float4> SSRTexture : register(t16);
 	// Use the literal 0.65 so IL magnitude is identical with and without Linear Lighting.
 	// The AO path above intentionally keeps Color::PBRLightingScale (behaviour unchanged).
 	float3 linAlbedoIl = Color::IrradianceToLinear(albedo / 0.65);
+#	endif
+
+#	if defined(ENV_AMBIENT)
+	// Environment Ambient replaces the ambient term that was just separated out of MAIN, so it can
+	// never double-light: the vanilla contribution is subtracted whether or not L1 is active.
+	float3 ambientColor = directionalAmbientColor;
+	float ambientAo = ssgiAo;
+
+	bool envAmbientActive = SharedData::envAmbientSettings.Enabled != 0 && depth < 1.0;
+#		if defined(SSRT)
+	// SSRT diffuse drives the forward directional ambient to zero via AmbientMult (so Masks.z and
+	// therefore directionalAmbientColor collapse to ~0) and adds its own cubemap ambient in
+	// ssrt_diffuse_composite.hlsl. Running both would double-light, so SSRT wins. Read from the
+	// cbuffer at runtime (DiffuseMult is already gated on EnableDiffuse in
+	// ScreenSpaceRayTracing::GetCommonBufferData) so toggling SSRT needs no composite recompile.
+	envAmbientActive = envAmbientActive && !(SharedData::ssrtSettings.DiffuseMult > 0.0);
+#		endif
+#		if defined(INTERIOR)
+	envAmbientActive = envAmbientActive && SharedData::envAmbientSettings.EnableInterior != 0;
+#		endif
+
+	[branch] if (envAmbientActive)
+	{
+#		if defined(VR)
+		float3 envAmbientPositionMS = positionWS.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+#		else
+		float3 envAmbientPositionMS = positionWS.xyz;
+#		endif
+
+		float3 envAmbient = EnvironmentAmbient::Evaluate(normalWS, envAmbientPositionMS, albedo, directionalAmbientColor, dispatchID.xy);
+		ambientColor = lerp(directionalAmbientColor, envAmbient, SharedData::envAmbientSettings.Blend);
+
+		// Compensates for the extra self-intersection occlusion factor the SSRT fallback had
+		// (ssrt_raymarch.hlsl:632) and that is not available here. Direct light below keeps the
+		// unmodified occlusion.
+		if (SharedData::envAmbientSettings.ApplyAO != 0)
+			ambientAo = pow(saturate(ssgiAo), SharedData::envAmbientSettings.AOPower);
+	}
+#	endif
 
 	float3 multiBounceAO = Color::MultiBounceAO(linAlbedo, ssgiAo);
 
@@ -173,11 +227,17 @@ Texture2D<float4> SSRTexture : register(t16);
 
 	diffuseColor = Color::IrradianceToGamma(linDiffuseColor);
 
+#	if defined(ENV_AMBIENT)
+	diffuseColor += Color::IrradianceToGamma(Color::IrradianceToLinear(ambientColor) * Color::MultiBounceAO(linAlbedo, ambientAo));
+#	else
 	diffuseColor += Color::IrradianceToGamma(Color::IrradianceToLinear(directionalAmbientColor) * multiBounceAO);
+#	endif
 
 	linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
 
+#	if defined(SSGI)
 	linDiffuseColor += ssgiIl * linAlbedoIl;
+#	endif
 #endif
 
 	float3 color = linDiffuseColor + specularColor;
