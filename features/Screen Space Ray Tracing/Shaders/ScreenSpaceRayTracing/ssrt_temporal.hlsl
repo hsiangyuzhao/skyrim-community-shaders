@@ -23,13 +23,7 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
     // (audit #16) Every caller passes a pixel in the *history* textures, whose valid
     // sub-rectangle is the previous frame's dynamic-resolution extent -- hence
     // DynamicResolutionParams1.zw (previous width/height ratio) rather than .xy.
-    // (spec C1) At half resolution the history textures are half sized, so the bound is
-    // halved with the same floor rule SSRT_GetFilterExtent uses. texHistoryNormals stays
-    // full resolution and is indexed accordingly.
     uint2 prev_screen_size = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw;
-#if defined(SSRT_HALF_RES)
-    prev_screen_size = max(uint2(1, 1), prev_screen_size >> 1);
-#endif
     if (uv.x < 0 || uv.x > 1 || uv.y < 0 || uv.y > 1)
         return false;
 
@@ -38,7 +32,7 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
 
     float3 prevNormalVS;
     float roughness;
-    GetNormalRoughness(HistoryNormalsTexture, SSRT_GBUFFER_COORD(pixel), prevNormalVS, roughness);
+    GetNormalRoughness(HistoryNormalsTexture, pixel, prevNormalVS, roughness);
     float normalDiff = dot(currNormalVS, prevNormalVS);
     if (normalDiff < 0.866f) // cos 30
         return false;
@@ -48,18 +42,11 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
 
 [numthreads(8, 8, 1)] void main(uint3 DTid : SV_DispatchThreadID)
 {
-    uint2 screen_size = SSRT_GetFilterExtent();
+    uint2 screen_size = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy;
     if (DTid.x >= screen_size.x || DTid.y >= screen_size.y)
         return;
 
-#if defined(SSRT_HALF_RES)
-    // (spec C1) Reprojection needs the *geometric centre* of the 2x2 full-resolution
-    // block, not the centre of one of its texels: this uv only feeds the motion-vector
-    // lookup and the eye-index test, both of which want the block's centroid.
-    float2 uv = float2(DTid.xy * 2 + 1.0) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
-#else
     float2 uv = float2(DTid.xy + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
-#endif
     uint eyeIndex = Stereo::GetEyeIndexFromTexCoord(uv);
 
     // (audit P1) Sky / far-plane early-out -- skips reprojection plus up to 13 history
@@ -78,7 +65,7 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
 
     float3 normalVS;
     float roughness;
-    GetNormalRoughness(SSRT_GBUFFER_COORD(DTid.xy), normalVS, roughness);
+    GetNormalRoughness(DTid.xy, normalVS, roughness);
 
     float luminance = Color::RGBToLuminance(ssrColor.rgb);
     float2 curMoment = float2(luminance, luminance * luminance) * 0.5;
@@ -95,12 +82,6 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
     // not the current one. With DLSS/DRS the two differ whenever the ratio moves, which
     // shifted the whole history lookup and silently invalidated reprojection.
     uint2 prevPixel = uint2(prevUV * SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw);
-#if defined(SSRT_HALF_RES)
-    // (spec C1) prevUV is a full-resolution normalised coordinate either way; the shift
-    // converts the full-resolution texel it lands in to the half-resolution texel that
-    // contains it, matching the floor rule the history textures were written under.
-    prevPixel >>= 1;
-#endif
     bool valid = false;
 
     if (IsValidHistory(prevPixel, prevUV, normalVS))

@@ -41,7 +41,7 @@ groupshared float4 g_ssrtVarianceTile[SSRT_VARIANCE_TILE * SSRT_VARIANCE_TILE];
 
 [numthreads(8, 8, 1)] void main(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
 {
-    uint2 screen_size = SSRT_GetFilterExtent();  // (spec C1) half of the render extent in the half-res permutation
+    uint2 screen_size = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy;
     const bool inBounds = DTid.x < screen_size.x && DTid.y < screen_size.y;
 
     float2 uv = float2(DTid.xy + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
@@ -86,7 +86,7 @@ groupshared float4 g_ssrtVarianceTile[SSRT_VARIANCE_TILE * SSRT_VARIANCE_TILE];
                 float tileDepth = 1.0f;
                 if (valid) {
                     float tileRoughness;
-                    GetNormalRoughness(uint2(SSRT_GBUFFER_COORD(p)), tileNormal, tileRoughness);
+                    GetNormalRoughness(uint2(p), tileNormal, tileRoughness);
                     tileDepth = DepthTexture[p];
                 }
                 g_ssrtVarianceTile[ty * SSRT_VARIANCE_TILE + tx] = float4(tileNormal, tileDepth);
