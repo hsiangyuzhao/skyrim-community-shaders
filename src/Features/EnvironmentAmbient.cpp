@@ -82,14 +82,18 @@ void EnvironmentAmbient::DrawSettings()
 	{
 		auto settingsGuard = Util::DisableGuard(!settings.Enabled);
 
-		// Logarithmic so the 0.0-0.3 range - where mixing a small amount of environment light
-		// into a low directional-ambient setup lives - stays comfortably adjustable.
-		ImGui::SliderFloat("Blend", &settings.Blend, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
+		// Linear scale: the working range in practice is the high end, around 0.8-0.9, where a
+		// logarithmic slider has almost no resolution.
+		ImGui::SliderFloat("Blend", &settings.Blend, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text(
 				"0.0 = vanilla directional ambient only (identical to this feature being off).\n"
 				"1.0 = environment light only.\n"
-				"The slider is logarithmic so the low end is easy to dial in.");
+				"\n"
+				"This is the same dial SSRT diffuse spells as Ambient Multiplier, inverted:\n"
+				"Blend = 1 - Ambient Multiplier. To port an SSRT setup that kept some vanilla\n"
+				"ambient, use Blend = 1 - AmbientMult with Intensity = 1 / (1 - AmbientMult), so\n"
+				"the environment light keeps its full capture brightness.");
 		}
 
 		ImGui::SliderFloat("Intensity", &settings.Intensity, 0.0f, 3.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
