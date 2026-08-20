@@ -249,15 +249,14 @@ void CalculateGI(
 	const float rcpNumSlices = rcp((float)NumSlices);
 	const float rcpNumSteps = rcp((float)NumSteps);
 
-	// if the offset is under approx pixel size (pixelTooCloseThreshold), push it out to the minimum distance
-	const float pixelTooCloseThreshold = 1.3;
 	// approx viewspace pixel size at pixCoord; approximation of NDCToViewspace( uv.xy + ViewportSize.xy, pixCenterPos.z ).xy - pixCenterPos.xy;
 	const float2 pixelDirRBViewspaceSizeAtCenterZ = viewspaceZ.xx * (eyeIndex == 0 ? NDCToViewMul.xy : NDCToViewMul.zw) * RCP_OUT_FRAME_DIM;
 
 	float screenspaceRadius = EffectRadius / pixelDirRBViewspaceSizeAtCenterZ.x;
 	screenspaceRadius = max(MinScreenRadius, screenspaceRadius);
-	// this is the min distance to start sampling from to avoid sampling from the center pixel (no useful data obtained from sampling center pixel)
-	const float minS = pixelTooCloseThreshold / screenspaceRadius;
+	// `s` is a fraction of EffectRadius, so a pixel-space floor has to be expressed in those
+	// units; this converts the one into the other.
+	const float rcpScreenspaceRadius = rcp(screenspaceRadius);
 
 	//////////////////////////////////////////////////////////////////
 
@@ -344,8 +343,15 @@ void CalculateGI(
 			[loop] for (uint step = 0; step < NumSteps; step++)
 			{
 				float s = (step + stepNoise) * rcpNumSteps;
-				s *= s;     // default 2 is fine
-				s += minS;  // avoid sampling center pixel
+				s *= s;  // default 2 is fine
+				// Near-field step sequence (build-0816 diffuseGI.cs.hlsl:313). The quadratic ramp puts
+				// almost nothing inside the first few pixels: with the previous `s += 1.3 /
+				// screenspaceRadius` floor, steps 0 and 1 landed at roughly 1.3 and 8 px and step 2
+				// already past 23 px, so contact-scale occlusion in between was structurally
+				// unreachable. Flooring each step at (1 + step) pixels instead guarantees a dense
+				// 1, 2, 3, ... px sequence per side while leaving the far field untouched, and it
+				// subsumes the old floor's other job of never sampling the centre pixel.
+				s = max(s, (1.0 + step) * rcpScreenspaceRadius);
 
 				float2 sampleOffset = s * omega;
 
@@ -354,24 +360,20 @@ void CalculateGI(
 				float2 sampleScreenPos = Stereo::ConvertFromStereoUV(sampleUV, eyeIndex);
 				[branch] if (any(sampleScreenPos > 1.0) || any(sampleScreenPos < 0.0)) break;
 
-				float sampleOffsetLength = length(sampleOffset);
-				float mipLevel = clamp(log2(sampleOffsetLength) - 3.3, 0, 5);
-				// The radiance mip floor is one level below the depth/AO mip floor: the radiance
-				// pyramid is already built at the GI working resolution, so an extra forced level
-				// made half-res radiance effectively 1/8 x 1/8 of full res. Combined with blur,
-				// temporal accumulation and upsampling that flattened indirect light into a
-				// spatially uniform haze with no colour locality. Depth sampling (mipLevel) keeps
-				// its original floors.
-				float mipLevelRadiance = mipLevel;
-#if defined(HALF_RES)
-				mipLevel = max(mipLevel, 1);
-				mipLevelRadiance = max(mipLevelRadiance, 1);
-#elif defined(QUARTER_RES)
-				mipLevel = max(mipLevel, 2);
-				mipLevelRadiance = max(mipLevelRadiance, 2);
-#else
-				mipLevelRadiance = max(mipLevelRadiance, 1);
-#endif
+				// Unified mip chain (build-0816 diffuseGI.cs.hlsl:321): one level per two steps, capped at
+				// the coarsest level either pyramid has. Tying the level to the step index instead of to
+				// log2(offset) is what lets step 0 read a 1:1 texel, which the previous
+				// `clamp(log2(len) - 3.3, ...)` plus a hard resolution floor could not do.
+				//
+				// Adaptation for this lineage's resolution scheme, which upstream does not have: the
+				// radiance pyramid is built at the GI *working* resolution while the depth pyramid is
+				// full resolution, so the level that means "1:1" differs between them by exactly RES_MIP.
+				// Adding RES_MIP to the depth level, rather than flooring both, is the correct way to keep
+				// the two footprints aligned - and it is what removes the old radiance floor that made
+				// half-res radiance effectively 1/8 x 1/8 of full resolution (H2), without pretending the
+				// depth pyramid has levels finer than the working resolution.
+				const float mipLevelRadiance = (float)min((step + 1u) / 2u, 4u);
+				const float mipLevel = min(mipLevelRadiance + RES_MIP, 4.0);
 
 				float SZ = srcWorkingDepth.SampleLevel(samplerPointClamp, sampleUV * frameScale, mipLevel);
 
