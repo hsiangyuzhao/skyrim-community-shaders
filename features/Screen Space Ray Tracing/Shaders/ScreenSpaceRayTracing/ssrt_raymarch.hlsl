@@ -265,7 +265,22 @@ float3 SSRT_HierarchicalRaymarch(float3 origin, float3 direction, bool is_mirror
         ++_num_iters;
     }
 
-    valid_hit = (_num_iters <= max_traversal_intersections);
+    // (audit #9) `_num_iters <= max_traversal_intersections` was tautologically true --
+    // the loop condition is `<`, so the counter can never exceed the limit -- which made
+    // every ray report a hit. Rays that ran out of iterations mid-flight, left the
+    // screen, or reached the far plane were then handed to SSRT_ValidateHit(), where a
+    // far-plane stop in particular yields distance ~= 0 against the equally-far surface
+    // depth and therefore confidence ~= 1, i.e. sky colour sampled as if it were a real
+    // hit.
+    //
+    // The traversal descends below `most_detailed_mip` only via the
+    // `current_mip += skipped_tile ? 1 : -1` step taken when a tile is *not* skipped at
+    // the finest level, which is precisely the definition of an intersection. Every
+    // other exit -- the two `break`s and iteration exhaustion -- leaves
+    // current_mip >= most_detailed_mip because the loop condition still held. So the
+    // final mip alone is an exact hit/miss discriminator, and unlike an iteration-count
+    // test it does not reject a genuine hit found on the very last iteration.
+    valid_hit = (current_mip < most_detailed_mip);
 
     return position;
 }
@@ -592,7 +607,14 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
         world_space_hit  = ScreenSpaceToWorldSpace(hit, FrameBuffer::CameraViewProjInverse[eyeIndex]);
         world_space_ray  = world_space_hit - world_space_origin.xyz;
         world_ray_length = length(world_space_ray);
-        float occlusion;
+        // (audit #9) MUST be initialised. `occlusion` is an out parameter of
+        // SSRT_ValidateHit, which is only reached on the true side of the ternary below;
+        // it used to be dead code that valid_hit was always true so the variable was
+        // always assigned. Now that misses genuinely skip the call, an uninitialised
+        // read would feed garbage into `ao = lerp(1.0, occlusion, OcclusionStrength)`.
+        // 1.0 = "no occlusion", matching what SSRT_ValidateHit returns for a hit
+        // rejected outside the view frustum, so a miss falls back cleanly.
+        float occlusion = 1.f;
         confidence       = valid_hit ? SSRT_ValidateHit(hit,
                                                       uv,
                                                       world_space_ray,
