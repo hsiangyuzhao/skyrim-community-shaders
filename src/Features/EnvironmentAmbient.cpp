@@ -23,7 +23,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	HueFalloff,
 	EnableContactOcclusion,
 	ContactRadius,
-	ContactStrength)
+	ContactStrength,
+	AOExponent)
 
 void EnvironmentAmbient::RestoreDefaultSettings()
 {
@@ -180,6 +181,21 @@ void EnvironmentAmbient::DrawSettings()
 					"twice where the fallback had two independent signals. If eaves and junctions\n"
 					"now read darker than the SSRT reference, lower this towards 0.5.");
 			}
+		}
+
+		ImGui::SliderFloat("AO Exponent", &settings.AOExponent, 1.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"Total power of the composite's multi-bounce AO factor on the environment term.\n"
+				"\n"
+				"1.5 is the SSRT diffuse path: its cubemap ambient is added to MAIN before the\n"
+				"deferred composite runs, so it pays that factor once itself and once more at half\n"
+				"power inside the composite. This term is added after the composite has already\n"
+				"applied its half power, so without the extra exponent it pays it only once and\n"
+				"reads about 25 percent brighter in creases than the SSRT reference.\n"
+				"\n"
+				"1.0 is the behaviour before this control existed. Raise towards 2.0 for deeper\n"
+				"creases.");
 		}
 
 		if (!screenSpaceGI.loaded || !screenSpaceGI.settings.Enabled) {

@@ -75,7 +75,11 @@ struct EnvironmentAmbient : Feature
 		float ContactRadius = 15.0f;        // 60  centimetres
 
 		float ContactStrength = 1.0f;       // 64
-		float pad0 = 0.0f;                  // 68
+		// Total power of the composite's MultiBounceAO factor on the environment term. 1.5
+		// reproduces the SSRT diffuse path, which pays it once in its own MultiBounceAO and once
+		// more at half power because it lands in MAIN before the composite's
+		// `linDiffuseColor *= sqrt(multiBounceAO)`. 1.0 is the behaviour before this was added.
+		float AOExponent = 1.5f;            // 68
 		float pad1 = 0.0f;                  // 72
 		float pad2 = 0.0f;                  // 76
 	} settings;

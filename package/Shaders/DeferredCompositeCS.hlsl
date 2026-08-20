@@ -347,6 +347,20 @@ Texture2D<float4> SSRTexture : register(t16);
 		float envAo = saturate(envAmbientOcclusion * ssgiAo * envContactOcclusion);
 		float3 envIrradiance = Color::IrradianceToLinear(envAmbient) * Color::MultiBounceAO(albedo, envAo);
 
+		// The environment term is added at the end of this block, past
+		// `linDiffuseColor *= sqrt(multiBounceAO)` above, so it escapes that factor entirely. The
+		// SSRT diffuse path does not: its cubemap ambient lands in MAIN before the composite
+		// runs, so it pays MultiBounceAO once itself and again at half power here - a total of
+		// about 1.5 - and reads correspondingly deeper in creases. That difference is
+		// systematic, not a tuning matter, so it is reproduced rather than left to Occlusion
+		// Strength.
+		//
+		// Applied before the enclosure fallback below on purpose: at full enclosure that lerp is
+		// meant to land exactly on the vanilla ambient term, which carries the factor at power 1,
+		// and the extra power belongs to the cubemap end of the lerp.
+		[branch] if (SharedData::envAmbientSettings.AOExponent > 1.0)
+			envIrradiance *= pow(max(multiBounceAO, 0.0), SharedData::envAmbientSettings.AOExponent - 1.0);
+
 		// Enclosure-driven hue fallback. The fallback this feature ports does not merely dim the
 		// cubemap where the sky is blocked: rays that hit nearby geometry take that geometry's
 		// screen radiance instead of the cubemap (ssrt_raymarch.hlsl:642), so an enclosed hemisphere

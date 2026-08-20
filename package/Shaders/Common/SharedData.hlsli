@@ -383,7 +383,7 @@ namespace SharedData
 		float ContactRadius;
 
 		float ContactStrength;
-		float pad0;
+		float AOExponent;
 		float pad1;
 		float pad2;
 	};
