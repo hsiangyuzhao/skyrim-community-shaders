@@ -393,10 +393,28 @@ float SSRT_ValidateHit(float3 hit, float2 uv, float3 world_space_ray_direction, 
     }
 
     // Reject the hit if we didnt advance the ray significantly to avoid immediate self reflection
+    //
+    // (audit #5) This branch used to write `occlusion = 1 - confidence`, and a
+    // self-intersection lands on the origin's own surface, so distance ~= 0, confidence
+    // ~= 1, occlusion ~= 0 -- full occlusion. Downstream that is
+    // `ao = lerp(1.0, occlusion, OcclusionStrength)` with OcclusionStrength defaulting to
+    // 1.0, then `envColor *= MultiBounceAO(albedo, ao)`: the cubemap fallback gets
+    // multiplied to black as well, so a failed ray does not merely miss, it darkens the
+    // pixel. At DiffuseSPP = 2 half the samples self-intersecting halves the ambient.
+    //
+    // A ray that never left its own texel is a *failure to trace*, not evidence of an
+    // occluder, so it must leave occlusion at the 1.0 the function entry establishes and
+    // let the pixel fall through to the fallback unattenuated. Back-face hits above
+    // remain the only occlusion source, which is the one case where the ray really did
+    // run into geometry.
+    //
+    // This is also where the contact darkening the user currently likes came from: with
+    // #4 fixed the branch fires far less often, and the hair/foliage darkening is
+    // expected to come back through the legitimate path instead -- rays that now advance
+    // properly, hit the hair, and return its dark screen radiance.
     float2 manhattan_dist = abs(hit.xy - uv);
     if ((manhattan_dist.x < (2.f / screen_size.x)) && (manhattan_dist.y < (2.f / screen_size.y)))
     {
-        occlusion = 1 - confidence;
         return 0;
     }
 
