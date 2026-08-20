@@ -85,6 +85,158 @@ float GetVisibilityFunctionSmithJointApprox(float roughness, float NdotV, float 
 	return vis > 0 ? (0.5 / vis) : 0;
 }
 
+#ifdef GI
+
+///////////////////////////////////////////////////////////////////////////////
+// Analytic bit-field integration
+//
+// Ported from the upstream rewrite (build-0816 diffuseGI.cs.hlsl:95-185) and adapted to this
+// lineage's SH transport. It replaces the `giBoost = 4 * PI * (...)` heuristic and the
+// `countbits(...) * 0.03125` bit average with a closed-form quadrature over the covered angular
+// bins, so a constant-radiance white furnace integrates to exactly 1.
+//
+// DERIVATION (why the numbers below are what they are)
+//
+// A slice is the great circle spanned by `directionVec` and `viewVec`. Writing the hemisphere
+// integral in that parametrisation,
+//
+//     E = INT_0^PI dphi INT_slice L * dot(dir, N) * |sin(theta_view)| dtheta
+//
+// where phi is the azimuth about the view axis (a slice covers phi and phi+PI, i.e. the whole
+// great circle, so phi only needs to run over PI) and |sin(theta_view)| is the spherical
+// Jacobian. Sampling phi uniformly with NumSlices slices turns the outer integral into
+// (PI / NumSlices) * sum, and Lambert's 1/PI then cancels the PI exactly - which is why every
+// accumulator below is scaled by nothing but `rcpNumSlices` and still lands on E/PI, i.e. on the
+// value that wants exactly one albedo multiplication at composite time.
+//
+// Inside a slice, bit b covers relative angle theta_b = (b + 0.5)/32 * PI - PI/2 measured from
+// the projected receiver normal, and
+//
+//     sum_b cos(theta_b) * |sin(theta_b)| = 1 / sin(PI/32)   (exact, closed form)
+//
+// so multiplying each bin by `normalizedBitMeasure = sin(PI/32)` is the analytic finite-bin
+// normalisation: full coverage of a unit-radiance hemisphere returns exactly 1.
+//
+// TWO MEASURES, BECAUSE THIS LINEAGE TRANSPORTS LUMINANCE THROUGH SH (the H3 re-derivation)
+//
+// `radianceY` is an SH2 *radiance* projection and the consumer (DeferredCompositeCS.hlsl:44-50)
+// integrates it against EvaluateCosineLobe(n), i.e. the receiver cosine is applied by the
+// consumer. Chroma has no directional representation and is consumed as a bare value. So the two
+// need different measures, and that - not a constant - is what makes them agree:
+//
+//   solidAngle*: |sin(theta_view)| * sin(PI/32) per bit, with the matching first moment
+//                sum(dir * w). This is the plain solid-angle measure; folded into
+//                Evaluate(dirWS) it is the SH radiance projection, and the consumer's cosine
+//                lobe supplies the receiver cosine. Verified: for a fully covered hemisphere
+//                sum(w) = 2 and the moment's normal component = 1, giving
+//                L0 = 0.28209*2, L1 = 0.48860*1, and
+//                FuncProductIntegral(sh, EvaluateCosineLobe(n)) = 0.5 + 0.5 = 1.
+//   cosineWeight: dot(dir, N) * |sin(theta_view)| * sin(PI/32) per bit, i.e. the upstream
+//                weight, which already contains the receiver cosine. Sums to 1 over a fully
+//                covered hemisphere. This is the chroma measure.
+//
+// Note dot(dir, N) == projectedNormalLength * cos(theta_b) identically, because `dir` lies in the
+// slice plane and the out-of-plane part of N is orthogonal to it - that is the upstream weight.
+//
+// The previous code applied the receiver cosine twice (once through the smoothstep-warped bit
+// density, once through the SH cosine lobe) and the source cosine once too often, and used
+// `CoCg *= 0.5` to bring the two channels back into rough agreement. Both cosines and the
+// constant are now gone; the ratio is exact instead of averaged.
+///////////////////////////////////////////////////////////////////////////////
+
+static const uint SSGI_MAX_RAY = 32;
+
+// sin/cos of the positive bit-centre offsets from the projected receiver normal. The negative
+// half is mirrored, which halves the table and avoids a per-bit sincos.
+// Verbatim from build-0816 diffuseGI.cs.hlsl:95-112.
+static const float2 SSGI_BIT_SIN_COS[SSGI_MAX_RAY / 2] = {
+	float2(0.9987954562, 0.0490676743),
+	float2(0.9891765100, 0.1467304745),
+	float2(0.9700312532, 0.2429801799),
+	float2(0.9415440652, 0.3368898534),
+	float2(0.9039892931, 0.4275550934),
+	float2(0.8577286100, 0.5141027442),
+	float2(0.8032075315, 0.5956993045),
+	float2(0.7409511254, 0.6715589548),
+	float2(0.6715589548, 0.7409511254),
+	float2(0.5956993045, 0.8032075315),
+	float2(0.5141027442, 0.8577286100),
+	float2(0.4275550934, 0.9039892931),
+	float2(0.3368898534, 0.9415440652),
+	float2(0.2429801799, 0.9700312532),
+	float2(0.1467304745, 0.9891765100),
+	float2(0.0490676743, 0.9987954562)
+};
+
+// Bits this sample newly covers, folded into the running occlusion field.
+// Verbatim from build-0816 diffuseGI.cs.hlsl:123-138. Unlike the open-coded
+// `((1 << count) - 1) << start` it also handles a full 32-bit span, where that shift is
+// undefined.
+uint ComputeOccludedBitfield(float minHorizon, float maxHorizon, inout uint globalOccludedBitfield)
+{
+	uint startHorizonInt = min((uint)(saturate(minHorizon) * SSGI_MAX_RAY), SSGI_MAX_RAY);
+	uint angleHorizonInt = min((uint)ceil(saturate(maxHorizon - minHorizon) * SSGI_MAX_RAY), SSGI_MAX_RAY - startHorizonInt);
+
+	if (angleHorizonInt == 0)
+		return 0;
+
+	uint angleHorizonBitfield = 0xFFFFFFFFu;
+	if (angleHorizonInt < SSGI_MAX_RAY)
+		angleHorizonBitfield = (1u << angleHorizonInt) - 1u;
+	uint currentOccludedBitfield = angleHorizonBitfield << startHorizonInt;
+	currentOccludedBitfield &= ~globalOccludedBitfield;
+	globalOccludedBitfield |= currentOccludedBitfield;
+	return currentOccludedBitfield;
+}
+
+// Integrates the newly covered angular bins of one sample. All outputs are view space; the
+// caller aggregates them and converts the direction moment to world space once per pixel.
+void IntegrateBitfield(
+	uint bitfield,
+	float3 projectedNormal, float3 projectedNormalTangent,
+	float projectedNormalLength, float projectedNormalSin, float projectedNormalCos,
+	float3 sourceNormal, bool requireSourceFacing,
+	out float o_solidAngleWeight, out float3 o_solidAngleMoment, out float o_cosineWeight)
+{
+	o_solidAngleWeight = 0;
+	o_solidAngleMoment = 0;
+	o_cosineWeight = 0;
+
+	const float bitAngle = Math::PI / float(SSGI_MAX_RAY);
+	// Midpoint integration of cos(theta) * |sin(theta)| over all bins yields
+	// bitAngle / sin(bitAngle); sin(bitAngle) is therefore the analytic finite-bin
+	// normalisation that makes a constant-radiance white furnace return 1.
+	const float normalizedBitMeasure = sin(bitAngle);
+	// Newly covered hit bits never overlap, so sparse iteration caps all hit integration work
+	// across the whole ray march at 32 iterations per slice.
+	[loop] while (bitfield != 0)
+	{
+		uint bit = (uint)firstbitlow(bitfield);
+		bitfield &= bitfield - 1u;
+
+		uint mirroredBit = bit < SSGI_MAX_RAY / 2 ? bit : SSGI_MAX_RAY - 1 - bit;
+		float2 bitSinCos = SSGI_BIT_SIN_COS[mirroredBit];
+		float bitSin = bit < SSGI_MAX_RAY / 2 ? bitSinCos.x : -bitSinCos.x;
+		float bitCos = bitSinCos.y;
+
+		float3 direction = projectedNormal * bitCos + projectedNormalTangent * bitSin;
+		// Outgoing Lambertian radiance is angle-independent over the source's front hemisphere.
+		// Gate the back hemisphere, but do not multiply by a second source cosine
+		// (build-0816 diffuseGI.cs.hlsl:173-177).
+		if (requireSourceFacing && dot(sourceNormal, -direction) <= 0.0)
+			continue;
+
+		float sineFromView = bitSin * projectedNormalCos + bitCos * projectedNormalSin;
+		float solidAngle = abs(sineFromView) * normalizedBitMeasure;
+
+		o_solidAngleWeight += solidAngle;
+		o_solidAngleMoment += direction * solidAngle;
+		o_cosineWeight += projectedNormalLength * bitCos * solidAngle;
+	}
+}
+
+#endif  // GI
+
 void CalculateGI(
 	uint2 dtid, float2 uv, float viewspaceZ, float3 viewspaceNormal,
 	out float o_ao, out sh2 o_currY, out float2 o_currCoCg, out float4 o_currGIAOSpecular)
@@ -127,7 +279,12 @@ void CalculateGI(
 
 	float visibility = 0;
 	float visibilitySpecular = 0;
-	float4 radianceY = 0;
+	// Luminance is transported as an SH2 radiance projection. Because SphericalHarmonics::Evaluate
+	// is affine in the direction, the whole march can be accumulated as a scalar mass plus a
+	// view-space first moment and assembled into the SH once, which also means a single
+	// view-to-world transform per pixel instead of one per sample.
+	float radianceYScalar = 0;
+	float3 radianceYMoment = 0;
 	float2 radianceCoCg = 0;
 	float3 radianceSpecular = 0;
 
@@ -152,6 +309,21 @@ void CalculateGI(
 		float cosNorm = saturate(dot(projectedNormalVec, viewVec) / projectedNormalVecLength);
 
 		float n = signNorm * FastMath::ACos(cosNorm);
+
+#ifdef GI
+		// Slice-plane frame for the analytic bit integration (build-0816 diffuseGI.cs.hlsl:290-297).
+		// `projectedNormalTangent` completes an orthonormal pair with the projected normal inside
+		// the slice plane. `sinNorm` is derived from the existing cosNorm and signNorm rather than
+		// from a second dot product, which guarantees (cosNorm, sinNorm) is exactly the projected
+		// normal expressed in the orthonormal (viewVec, orthoDirectionVec) basis and needs no extra
+		// normalize. Upstream's `planeNormal`/`tangent` are this lineage's `axisVec` and
+		// normalize(orthoDirectionVec): cross(directionVec, viewVec) == cross(orthoDirectionVec,
+		// viewVec) and cross(viewVec, axisVec) == normalize(orthoDirectionVec), so the two frames
+		// and therefore the angle-to-bit mapping are identical.
+		const float3 projectedNormalNorm = projectedNormalVec / max(projectedNormalVecLength, 1e-6);
+		const float3 projectedNormalTangent = cross(projectedNormalNorm, axisVec);
+		const float sinNorm = signNorm * sqrt(saturate(1.0 - cosNorm * cosNorm));
+#endif
 
 		uint bitmask = 0;
 #ifdef GI
@@ -234,60 +406,82 @@ void CalculateGI(
 				uint maskedBitsGISpecular = s < GIRadius ? ((1 << bitsRangeGISpecular.y) - 1) << bitsRangeGISpecular.x : 0;
 #	endif
 
-				// The math: https://www.desmos.com/calculator/je4y5ved2j
-				// Using smoothstep for cos: https://discord.com/channels/586242553746030596/586245736413528082/1102228968247144570
-				angleRangeGI = smoothstep(0, 1, (angleRangeGI + n) * RCP_PI + .5);
+				// Linear angle-to-bit mapping. The AO field above keeps the smoothstep warp - there the
+				// bit *density* is the cosine weight, which is what makes a plain countbits() a
+				// cosine-weighted visibility - but the analytic integration below evaluates cos/sin at
+				// each bin centre and therefore needs bins that are uniform in angle (build-0816
+				// diffuseGI.cs.hlsl:336).
+				float2 angleRangeGINorm = saturate((angleRangeGI + n) * RCP_PI + .5);
 
-				uint2 bitsRangeGI = uint2(round(angleRangeGI.x * 32u), round((angleRangeGI.y - angleRangeGI.x) * 32u));
-				uint maskedBitsGI = s < GIRadius ? ((1 << bitsRangeGI.y) - 1) << bitsRangeGI.x : 0;
+				uint validBits = 0;
+				[branch] if (s < GIRadius)
+					validBits = ComputeOccludedBitfield(angleRangeGINorm.x, angleRangeGINorm.y, bitmaskGI);
 
-				uint validBits = maskedBitsGI & ~bitmaskGI;
-				bool checkGI = validBits;
+				bool checkGI = validBits != 0;
 
 #	ifdef GI_SPECULAR
-				uint overlappedBitsSpecular = maskedBitsGISpecular & ~bitmaskGISpecular;
+				uint overlappedBitsSpecular = maskedBitsGISpecular & 	bitmaskGISpecular;
 				checkGI = checkGI || overlappedBitsSpecular;
 #	endif
 
 				if (checkGI) {
-					float giBoost = 4.0 * Math::PI * (1 + GIDistanceCompensation * smoothstep(0, GICompensationMaxDist, s * EffectRadius));
+					// Artistic distance ramp, unchanged in meaning: 0 is neutral. It is now a plain
+					// multiplier on an already-normalised weight instead of a scale on the 4*PI
+					// heuristic that used to stand in for the normalisation.
+					float distanceCompensation = 1 + GIDistanceCompensation * smoothstep(0, GICompensationMaxDist, s * EffectRadius);
 
 					// IL
 					float3 normalSample = GBuffer::DecodeNormal(srcNormalRoughness.SampleLevel(samplerPointClamp, sampleUV * frameScale, 0).xy);
 					if (dot(samplePos, normalSample) > 0)
 						normalSample = -normalSample;
-					float frontBackMult = -dot(normalSample, sampleHorizonVec);
-					frontBackMult = frontBackMult < 0 ? 0.0 : frontBackMult;  // backface
 
-					if (frontBackMult > 0.f) {
-						float3 sampleHorizonVecWS = normalize(mul(FrameBuffer::CameraViewInverse[eyeIndex], half4(sampleHorizonVec, 0)).xyz);
+					float3 sampleRadiance = max(0, srcRadiance.SampleLevel(samplerPointClamp, sampleUV * OUT_FRAME_SCALE, mipLevelRadiance).rgb);
+					float3 sampleRadianceYCoCg = Color::RGBToYCoCg(sampleRadiance);
 
-						float3 sampleRadiance = srcRadiance.SampleLevel(samplerPointClamp, sampleUV * OUT_FRAME_SCALE, mipLevelRadiance).rgb * frontBackMult * giBoost * countbits(validBits) * 0.03125;
-						sampleRadiance = max(sampleRadiance, 0);
-						float3 sampleRadianceYCoCg = Color::RGBToYCoCg(sampleRadiance);
+					[branch] if (validBits) {
+						float solidAngleWeight, cosineWeight;
+						float3 solidAngleMoment;
+						IntegrateBitfield(
+							validBits,
+							projectedNormalNorm, projectedNormalTangent,
+							projectedNormalVecLength, sinNorm, cosNorm,
+							normalSample, true,
+							solidAngleWeight, solidAngleMoment, cosineWeight);
 
-						radianceY += sampleRadianceYCoCg.r * SphericalHarmonics::Evaluate(sampleHorizonVecWS);
-						radianceCoCg += sampleRadianceYCoCg.gb;
+						radianceYScalar += sampleRadianceYCoCg.r * solidAngleWeight * distanceCompensation;
+						radianceYMoment += sampleRadianceYCoCg.r * solidAngleMoment * distanceCompensation;
+						radianceCoCg += sampleRadianceYCoCg.gb * cosineWeight * distanceCompensation;
+					}
 
 #	ifdef GI_SPECULAR
+					// HQ specular IL deliberately keeps its original, hand-tuned normalisation: the
+					// measure derived above is a diffuse-irradiance measure (receiver cosine times
+					// spherical Jacobian) and does not carry over to the GGX cone estimator below, and
+					// re-deriving that estimator is outside the scope of this port. The one change is the
+					// source-side cosine, which this commit removes as a spurious second cosine; it is
+					// replaced by its analytic mean over the front hemisphere (1/2) so the specular level
+					// is preserved instead of doubled. The back-hemisphere gate stays per sample here,
+					// unlike the per-bit gate the diffuse path now uses.
+					[branch] if (overlappedBitsSpecular && dot(normalSample, -sampleHorizonVec) > 0.0)
+					{
+						const float sourceCosineMean = 0.5;
+						float giBoostSpecular = 4.0 * Math::PI * distanceCompensation * sourceCosineMean;
+
 						// thank u Olivier!
 						float NoH = clamp(dot(viewspaceNormal, normalize(viewVec + sampleHorizonVec)), 1e-2, 1);
 						float NoL = clamp(dot(viewspaceNormal, sampleHorizonVec), 1e-2, 1);
 
-						float3 specularRadiance = sampleRadiance * countbits(overlappedBitsSpecular) * 0.03125;
+						float3 specularRadiance = sampleRadiance * giBoostSpecular * countbits(validBits) * 0.03125 * countbits(overlappedBitsSpecular) * 0.03125;
 						specularRadiance *= GetNormalDistributionFunctionGGX(roughness, NoH) * GetVisibilityFunctionSmithJointApprox(roughness, NoV, NoL);
 						specularRadiance = max(0, specularRadiance);
 
 						radianceSpecular += specularRadiance;
-#	endif
 					}
+#	endif
 				}
 #endif  // GI
 
 				bitmask |= maskedBits;
-#ifdef GI
-				bitmaskGI |= maskedBitsGI;
-#endif
 			}
 		}
 
@@ -305,22 +499,31 @@ void CalculateGI(
 	visibility = 1 - pow(abs(1 - visibility), AOPower);
 
 #ifdef GI
-	radianceY *= rcpNumSlices;
+	// Assemble the SH2 radiance projection from the accumulated mass and first moment. This is
+	// identical to summing Y * Evaluate(dirWS) per bit, because Evaluate is affine in the
+	// direction: its L0 coefficient is constant and its L1 band is linear. Doing it here also
+	// keeps the view-to-world transform (per eye, VR-correct) to one per pixel.
+	//
+	// rcpNumSlices is the *whole* normalisation: the azimuthal Monte Carlo factor PI/NumSlices
+	// and Lambert's 1/PI cancel, so the consumer's
+	// FuncProductIntegral(radianceY, EvaluateCosineLobe(n)) lands on E/PI - exactly the value
+	// that wants one albedo multiplication in DeferredCompositeCS.
+	radianceYScalar *= rcpNumSlices;
+	radianceYMoment *= rcpNumSlices;
+	float3 radianceYMomentWS = ViewToWorldVector(radianceYMoment, FrameBuffer::CameraViewInverse[eyeIndex]);
+	sh2 radianceYBasis = SphericalHarmonics::Evaluate(radianceYMomentWS);
+	sh2 radianceY = sh2(radianceYBasis.x * radianceYScalar, radianceYBasis.yzw);
 	radianceY = lerp(radianceY, 0, depthFade);
 
-	// Chroma has to be scaled to match the effective weight luminance picks up from the SH
-	// round trip, otherwise YCoCgToRGB overshoots and max(0, ...) clips whole channels.
-	// Luminance:  radianceY accumulates Y * Evaluate(h) and the consumer integrates it against
-	//             EvaluateCosineLobe(n), giving 0.28209*0.88623 + 0.48860*1.02333*(h.n)
-	//             = 0.25 + 0.5*(h.n) per sample; mean(h.n) over the hemisphere is 0.5, so the
-	//             mean luminance weight is 0.5.
-	// Chroma:     radianceCoCg is a bare sum, i.e. weight 1.0 per sample.
-	// So chroma was roughly 2x too saturated relative to luminance -> scale it by 0.5.
-	// This also lines the specular consumer up: it integrates Y against FauxSpecularLobe for a
-	// mean weight of 0.159 (cosine part) to 0.199 (directional part), against a chroma weight of
-	// 1.0/PI = 0.318; after the 0.5 here chroma lands on 0.159. That inconsistency is what the
-	// hand-tuned "* 0.8" cheese removed in 2ea3b3adc was papering over.
-	radianceCoCg *= rcpNumSlices * GISaturation * 0.5;
+	// Chroma carries the cosine-weighted measure (see IntegrateBitfield): the receiver cosine is
+	// in the weight here, whereas for luminance the consumer's cosine lobe supplies it. Both
+	// measures integrate a fully covered unit-radiance hemisphere to 1, so the two channels are
+	// on the same scale by construction and the old hand-derived "* 0.5" is gone.
+	// The depth fade is applied to chroma as well now; fading luminance alone left a pure
+	// chroma vector at the far end of the fade, which YCoCgToRGB turns into a coloured residue
+	// that max(0, ...) then clips per channel.
+	radianceCoCg *= rcpNumSlices * GISaturation;
+	radianceCoCg = lerp(radianceCoCg, 0, depthFade);
 
 #	ifdef GI_SPECULAR
 	radianceSpecular *= rcpNumSlices;
@@ -329,6 +532,8 @@ void CalculateGI(
 	visibilitySpecular *= rcpNumSlices;
 	visibilitySpecular = lerp(saturate(visibilitySpecular), 0, depthFade);
 #	endif
+#else
+	sh2 radianceY = 0;
 #endif
 
 	o_ao = visibility;
