@@ -65,7 +65,10 @@ struct ScreenSpaceRayTracing : Feature
         float CubemapNormalization = 0.0f;
         bool EnableSVGF = false;
         uint MaxAccumulatedFrames = 16;
-        uint AtrousIterations = 3;
+        /// @brief (spec A2) 2, not 3: with variance guidance repaired (audit #11) and the
+        /// depth weight actually discriminating (audit #12), two guided iterations resolve
+        /// more than three unguided ones did. The UI range is unchanged.
+        uint AtrousIterations = 2;
         float ColorPhi = 0.5f;
         float NormalPhi = 512.0f;
         /// @brief (spec A1) Let a fully converged 8x8 tile skip an a-trous iteration.
