@@ -595,6 +595,13 @@ void CalculateGI(
 #ifdef TEMPORAL_DENOISER
 		float lerpFactor = rcp(srcAccumFrames[pxCoord] * 255);
 
+		// AO was the one channel left out of the temporal filter, even though the whole path for it
+		// already existed: radianceDisocc.cs.hlsl:147 writes the reprojected previous AO into the
+		// texture this pass binds as srcPrevAo, and nothing read it. That is why AO was the channel
+		// that visibly flickered while indirect light sat still - it was the only single-frame
+		// estimate in the output. It shares accum_frames with the other channels, so the same
+		// disocclusion test resets it and the same MaxAccumFrames bounds it.
+		currAo = lerp(srcPrevAo[pxCoord], currAo, lerpFactor);
 		currY = lerp(srcPrevY[pxCoord], currY, lerpFactor);
 		currCoCg = lerp(srcPrevCoCg[pxCoord], currCoCg, lerpFactor);
 #	ifdef GI_SPECULAR
