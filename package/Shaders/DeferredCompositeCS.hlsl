@@ -249,6 +249,18 @@ Texture2D<float4> SSRTexture : register(t16);
 	directionalAmbientColor = Color::YCoCgToRGB(directionalAmbientColor);
 	directionalAmbientColor = max(0, directionalAmbientColor);
 
+#	if defined(SSRT)
+	// SSRT diffuse drives the forward directional ambient to zero through AmbientMult, so Masks.z
+	// arrives at ~0 and there is nothing left to separate. Overwriting Y with 0 does NOT make the
+	// term zero, though: YCoCgToRGB(0, Co, Cg) is (Co - Cg, Cg, -Co - Cg), a pure chroma vector
+	// built from A_est's chroma, and max(0, ...) keeps whichever channels came out positive. The
+	// subtraction below then takes that residue out of MAIN, which desaturates the SSRT path for
+	// no reason. Skip the separation instead. Read from the cbuffer at runtime, as the
+	// Environment Ambient gate below does, so toggling SSRT needs no recompile.
+	[branch] if (SharedData::ssrtSettings.DiffuseMult > 0.0)
+		directionalAmbientColor = 0;
+#	endif
+
 	float maxScale = 1.0;
 	if (directionalAmbientColor.x > 0.0)
 		maxScale = min(maxScale, diffuseColor.x / directionalAmbientColor.x);
