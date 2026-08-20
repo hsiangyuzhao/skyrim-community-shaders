@@ -302,14 +302,41 @@ float2 filterInf(float2 v) { return float2(filterInf(v.x), filterInf(v.y)); }
 float3 filterInf(float3 v) { return float3(filterInf(v.x), filterInf(v.y), filterInf(v.z)); }
 float4 filterInf(float4 v) { return float4(filterInf(v.x), filterInf(v.y), filterInf(v.z), filterInf(v.w)); }
 
+// (audit #12) Tolerated *relative* linear-depth change per texel of tap distance.
+//
+// Derivation: for a surface at view depth z the per-pixel depth gradient is
+//   dz/dpixel = z * pixelAngularSize * |slope|,
+// so the relative change per texel, (dz/dpixel)/z, is pixelAngularSize * |slope| and is
+// independent of distance. At 1920 px across a ~90 deg horizontal FOV
+// pixelAngularSize ~= 1e-3 rad, so a face-on surface gives ~1e-3 per texel and an
+// extremely grazing one (~84 deg, slope ~10) about 1e-2 per texel. A real depth
+// discontinuity is orders of magnitude larger (0.3 .. 1e2 relative). 0.05 therefore
+// leaves same-surface taps at exp(-0.02/0.05 * |k|) ~= 0.67 in the worst grazing case
+// and >= 0.96 for typical geometry, while a 1.5x depth step is cut to ~1e-4.
+//
+// Callers pass phiD = tap distance in texels, which cancels the linear growth of the
+// expected same-surface delta with tap distance -- so weightDepth ends up
+// approximately (relative gradient per texel) / SSRT_DEPTH_WEIGHT_SCALE, i.e. a pure
+// measure of surface slope that no longer changes with the a-trous stride.
+#define SSRT_DEPTH_WEIGHT_SCALE 0.05f
+
 float CalculateWeight(float depthCenter, float depthP, float phiD, float3 normalCenter, float3 normalP, float phiN,
 					  float luminanceCenter, float luminanceP, float phiL)
 {
 	float epsilon = 0.0000001;
 
-	// Depth weight
-	float difference = abs(depthCenter - depthP);
-	float weightDepth = (phiD == 0) ? 0.f : difference / max(phiD, epsilon);
+	// Depth weight.
+	// (audit #12) This used to take the difference of *raw NDC* depths and divide it by
+	// phiD >= 1. Post-projection depth differences between neighbouring pixels are on
+	// the order of 1e-5, and even a terrain-versus-sky step is only ~1e-2, so
+	// exp(-weightDepth) was indistinguishable from 1 everywhere: depth edge-stopping
+	// did not exist and the filter blurred straight across depth discontinuities.
+	// Compare linearised view depths as a relative difference instead, which is
+	// scale-free, and rescale phiD by SSRT_DEPTH_WEIGHT_SCALE accordingly.
+	float linearCenter = SharedData::GetScreenDepth(depthCenter);
+	float linearP = SharedData::GetScreenDepth(depthP);
+	float difference = abs(linearCenter - linearP) / max(linearCenter, 1e-5f);
+	float weightDepth = (phiD == 0) ? 0.f : difference / max(phiD * SSRT_DEPTH_WEIGHT_SCALE, epsilon);
 
 	// Normal weight
 	float weightNormal = pow(max(0.f, dot(normalCenter, normalP)), phiN);

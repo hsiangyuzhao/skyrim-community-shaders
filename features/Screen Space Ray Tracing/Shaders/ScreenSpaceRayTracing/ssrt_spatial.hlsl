@@ -81,6 +81,13 @@ static const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
     float luminanceCenter = Color::RGBToLuminance(ssrColor.rgb);
     float variance = GaussianBlur(DTid.xy);
 
+    // (audit #11) Variance travels in .w through the ping-pong, and it is what drives
+    // phiLuminance above. The output used to hard-code .w = 1.0, so from the second
+    // a-trous iteration on GaussianBlur() read back a constant 1 and the filter stopped
+    // being variance-guided. Filter the variance alongside the colour with the squared
+    // weights, as SVGF prescribes, and carry the result.
+    float filteredVariance = ssrColor.w;
+
     if (depthCenter > 0)
     {
         float phiLuminance = max(colorPhi * sqrt(abs(variance) + VAR_EPSILON), VAR_EPSILON);
@@ -92,6 +99,7 @@ static const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
 #endif
         float phiDepth = (atrousIterations + 1);
         float weightSum = 0.f;
+        float varianceSum = 0.f;
 
         for (int ky = -2; ky <= 2; ky++)
         {
@@ -114,6 +122,8 @@ static const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
                         float weight = CalculateWeight(depthCenter, sampleDepth, phiDepth, normalVS, sampleNormalVS, phiNormal, luminanceCenter, luminanceP, phiLuminance) * kernelWeights[abs(kx)] * kernelWeights[abs(ky)];
 
                         blendedColor += sampleSSRColor.rgb * weight;
+                        // Variance of a weighted mean scales with the squared weights.
+                        varianceSum += sampleSSRColor.w * weight * weight;
                         weightSum += weight;
                     }
                 }
@@ -122,12 +132,14 @@ static const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
         if (weightSum > 0.f)
         {
             blendedColor /= weightSum;
+            filteredVariance = varianceSum / (weightSum * weightSum);
         }
         else
         {
             blendedColor = ssrColor.rgb;
+            filteredVariance = ssrColor.w;
         }
     }
 
-    FilteredOutput[DTid.xy] = float4(blendedColor, 1.0);
+    FilteredOutput[DTid.xy] = float4(blendedColor, filteredVariance);
 }

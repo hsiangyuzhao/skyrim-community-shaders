@@ -81,7 +81,14 @@ cbuffer DenoiserCB : register(b2)
         momentsSum /= weightedColor;
 
         float variance = momentsSum.y - (momentsSum.x * momentsSum.x);
-        variance *= 2 / history;
+        // (audit #14) `history` comes from the moments texture and is 0 on the first
+        // frame a pixel is seen (and on any frame the temporal pass found no valid
+        // history), which made 2 / history evaluate to +inf and write inf into the
+        // variance channel. That inf then reaches phiLuminance in the spatial pass and
+        // NaNs the filter. Clamp the divisor to 1, i.e. treat "no accumulation yet" as
+        // one frame of accumulation -- the maximum variance boost, which is the
+        // conservative choice for a pixel we know nothing about.
+        variance *= 2.0 / max(history, 1.0);
         VarianceOutput[DTid.xy] = float4(blendedColor, variance);
     }
 }
