@@ -88,6 +88,24 @@ struct ScreenSpaceRayTracing : Feature
         /// distinguish signal from noise. Deliberately conservative: raising it trades
         /// residual noise for more skipped tiles.
         float AdaptiveVarianceEps = 1e-4f;
+        /// @brief (spec S1) Clamp outlier radiance against its 3x3 neighbourhood before
+        /// the temporal accumulation consumes it. On by default: it is what makes the
+        /// A2 iteration default safe, because a spike that survives into the a-trous
+        /// chain gets spread rather than removed.
+        bool FireflyClamp = true;
+        /// @brief (spec S1) How many neighbourhood standard deviations a pixel may exceed
+        /// the neighbourhood mean before it counts as a firefly.
+        ///
+        /// The reference set is the 8 neighbours, centre excluded. For n = 8 the largest
+        /// deviation any *member* of that set can have is sigma * sqrt(n - 1) = 2.646
+        /// sigma, so any value at or above that makes the test reachable only by the
+        /// centre pixel -- exactly the intent. 3.0 clears that bound with margin for the
+        /// ~26% relative error of an 8-sample sigma estimate, which puts the limit at
+        /// roughly 4x the neighbourhood mean under 1-spp GI noise: invisible on genuine
+        /// bright features, ~25x on a two-orders-of-magnitude spike. Lower it to clamp
+        /// harder; the shader floors the limit at the brightest neighbour so even K = 1
+        /// cannot cut into a feature two pixels wide.
+        float FireflyClampSigma = 3.0f;
 #ifdef ENABLE_SHARC
         bool EnableSharc = false;
 #endif
@@ -113,11 +131,11 @@ struct ScreenSpaceRayTracing : Feature
         float CubemapNormalization;
     };
 
-    /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Two float4
+    /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
-    /// reproduce this layout verbatim. ssrt_temporal.hlsl and ssrt_variance.hlsl declare
-    /// only the first row, which is legal -- a shader may declare a prefix of a larger
-    /// constant buffer.
+    /// reproduce this layout verbatim. ssrt_temporal.hlsl declares the first two rows and
+    /// ssrt_variance.hlsl only the first, which is legal -- a shader may declare a prefix
+    /// of a larger constant buffer.
     struct alignas(16) DenoiserCB
     {
         float invMaxAccumulatedFrames;
@@ -128,7 +146,10 @@ struct ScreenSpaceRayTracing : Feature
         uint adaptiveFiltering;
         float adaptiveHistoryThreshold;
         float adaptiveVarianceEps;
-        uint pad0;
+        /// @brief (spec S1) Firefly clamp width in neighbourhood standard deviations;
+        /// 0 switches the clamp and its LDS prefetch off. Took over the A-layer's pad
+        /// slot, so the buffer did not grow.
+        float fireflyClampSigma;
     };
 
     eastl::unique_ptr<ConstantBuffer> ssrtCB;

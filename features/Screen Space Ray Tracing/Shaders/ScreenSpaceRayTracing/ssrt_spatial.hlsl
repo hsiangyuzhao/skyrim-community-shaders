@@ -22,7 +22,9 @@ cbuffer DenoiserCB : register(b2)
     uint adaptiveFiltering;
     float adaptiveHistoryThreshold;
     float adaptiveVarianceEps;
-    uint denoiserPad0;
+    // (spec S1) Read by ssrt_temporal.hlsl only; declared here so the two views of the
+    // buffer keep matching offsets.
+    float fireflyClampSigma;
 };
 
 // (spec A5) The 3x3 Gaussian pre-blur of the variance channel, and the switch to A/B it.
