@@ -92,7 +92,17 @@ void ScreenSpaceRayTracing::DrawSettings()
 
     ImGui::Separator();
 
-    ImGui::SliderFloat("Thickness", &settings.Thickness, 0.0f, 50.0f, "%.2f");
+    // (spec F1 / audit #3) Range recalibrated to the parameter's actual unit -- game
+    // units of depth-buffer thickness, not the 0-50 window that only ever made sense
+    // against the old mip-1 validation. Logarithmic so the useful 10-60 region is still
+    // draggable at a 500-unit top end.
+    ImGui::SliderFloat("Thickness", &settings.Thickness, 0.0f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "How far behind the validated surface, in game units (1 unit ~ 1.4 cm), a hit "
+            "still counts. Too low and grazing ground loses all confidence and falls back "
+            "to the cubemap; too high and light leaks through thin geometry and specular "
+            "reflections stretch behind silhouettes. The shader adds roughness * 10.");
     ImGui::SliderFloat("Normal Bias", &settings.NormalBias, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("To avoid false hits from nearby geometry, increase this value to push the ray origin along the normal.");

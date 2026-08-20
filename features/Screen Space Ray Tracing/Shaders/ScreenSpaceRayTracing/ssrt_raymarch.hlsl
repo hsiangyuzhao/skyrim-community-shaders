@@ -331,26 +331,35 @@ float SSRT_ValidateHit(float3 hit, float2 uv, float3 world_space_ray_direction, 
 
     // Don't lookup radiance from the background.
     int2  texel_coords = int2(screen_size * hit.xy * SSRT_DEPTH_COORD_SCALE);
-#if defined(SSRT_SPECULAR)
-    // (audit #3s, specular only) mip 0 is the true per-pixel depth. Reading the 2x2 min
-    // of mip 1 measures the surface's own depth gradient rather than the ray/surface
-    // separation, and on a grazing surface that error alone (~9 game units at 1920 px,
-    // z = 1000, 80 deg incidence) exceeds the default 5-15 unit thickness and drives
-    // confidence to ~0.1 or below. The diffuse permutation deliberately keeps the mip 1
-    // read: correcting it there would change hit rates over the whole ground plane and
-    // with them the look the user currently relies on.
+    // (audit #3) Validate against mip 0 -- the same level the traversal descends to
+    // (HIZ_MIN_MIP == 0), and the true per-pixel depth.
+    //
+    // The 2x2 min of mip 1 that used to be read here measures the surface's *own* depth
+    // gradient rather than the ray/surface separation the thickness test is about. A
+    // clean intersection leaves the ray exactly on the depth plane of the texel it
+    // stopped in, so against mip 0 it scores distance ~= 0 and confidence ~= 1; against
+    // the 2x2 min of the neighbourhood it scores the gradient across that
+    // neighbourhood, which on a grazing surface is ~9 game units at 1920 px / z = 1000 /
+    // 80 deg incidence and rises with z and with the incidence angle -- more than the
+    // former 5-15 unit thickness, i.e. confidence <= 0.1 over exactly the grazing ground
+    // and terrain that fills most of a Skyrim frame.
+    //
+    // (The FidelityFX source this was ported from reads `texel_coords / 2, 1` because
+    // there the traversal grid is half the depth hierarchy's resolution; here it is mip 0
+    // itself.)
+    //
+    // Now unconditional: freewins applied it to the specular permutation only, because at
+    // the time the diffuse look depended on the fallback path this starves. Unfreezing it
+    // is the point of this change -- see F5 in the spec for the expected visual shift.
     float surface_z = SSRT_LoadDepth(texel_coords, 0);
-#else
-    float surface_z = SSRT_LoadDepth(texel_coords / 2, 1);
-#endif
 
     // (audit #6) Restored from the author's own fix in e59b35a75. Without it a ray that
     // stops on a background texel is validated against an equally-far surface depth,
     // yielding distance ~= 0 and confidence ~= 1 -- so sky/background colour is sampled
     // as a real hit, while GetNormalRoughness() below reads the cleared normal G-buffer
     // and turns the back-face test into a coin flip. The visible result is flickering
-    // sky-coloured light leaks. The threshold is 1e-4 rather than an equality test
-    // because the diffuse path reads the 2x2 min of mip 1.
+    // sky-coloured light leaks. The threshold stays a margin rather than an equality test
+    // so a ray that stops one texel short of a sky silhouette is rejected too.
     static const float SKY_DEPTH_THRESHOLD = 1e-4;
 #if SSRT_OPTION_INVERTED_DEPTH
     if (surface_z < SKY_DEPTH_THRESHOLD)

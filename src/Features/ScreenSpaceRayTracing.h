@@ -51,7 +51,37 @@ struct ScreenSpaceRayTracing : Feature
         bool EnableSpecular = true;
         uint MaxSteps = 128;
         uint MaxMips = 6;
-        float Thickness = 5.f;
+        /// @brief (spec F1 / audit #3) Depth-buffer thickness, in *game units*, used by
+        /// SSRT_ValidateHit as the range over which a hit's distance behind the validated
+        /// surface fades confidence to zero (the shader adds roughness * 10 on top).
+        ///
+        /// 5 was never a defensible figure. It predates the mip-0 validation fix, so it
+        /// was being compared against the surface's own 2x2 depth gradient rather than
+        /// against a real ray/surface separation, and 5-15 game units is 7-21 cm: smaller
+        /// than that gradient over most of a grazing ground plane, so confidence
+        /// collapsed there. With validation on mip 0 a clean intersection scores
+        /// distance ~= 0, and thickness now only gates the cases it should: a ray that
+        /// was already behind the surface when the traversal descended to mip 0, and the
+        /// single-texel straddle at the hit.
+        ///
+        /// 30 is derived from the residual, not guessed. confidence >= 0.5 requires
+        /// distance <= 0.35 * thickness (confidence = (1 - smoothstep(0, t, d))^2), and
+        /// diffuse roughness on ground/terrain is ~0.9, so the effective thickness is
+        /// ~39 units and the tolerance ~13.6 units. The per-texel view-space depth
+        /// gradient is z * (2 tan(fov/2) / width) * tan(incidence): at 2560 px render
+        /// width that is ~3.4 units at z = 1000 / 80 deg and ~6.8 at 85 deg, scaling
+        /// linearly with z -- so 30 covers the grazing band out to roughly z = 2000-4000
+        /// game units, which is the whole visible ground. The other side of the trade is
+        /// leak-through: 39 units is 56 cm, well under any Skyrim wall or floor slab, and
+        /// the geometry thinner than that (foliage, hair) is exactly where accepting the
+        /// near surface is the desired contact behaviour.
+        ///
+        /// Shared with the specular path, whose effective thickness goes from ~6 to ~31
+        /// (43 cm). That direction is right for the same reason -- specular validates on
+        /// mip 0 too and has the same residual -- at the cost of the usual SSR trade,
+        /// reflections elongating behind silhouettes by up to that distance. The slider
+        /// (0-500) is there if it reads as smearing.
+        float Thickness = 30.f;
         float NormalBias = 0.1f;
         float BRDFBias = 0.25f;
         bool UseDynamicCubemapsAsFallback = true;
