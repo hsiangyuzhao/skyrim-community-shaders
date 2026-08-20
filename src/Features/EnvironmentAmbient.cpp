@@ -190,5 +190,21 @@ void EnvironmentAmbient::DrawSettings()
 				"Cubemap Normalization default. 1.0 makes the Blend slider energy neutral.");
 		}
 
+		ImGui::Checkbox("Linear Composite", (bool*)&settings.LinearComposite);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"Add the environment light to the direct light in linear space, as the SSRT\n"
+				"diffuse composite does, and fade the vanilla ambient out with Blend instead of\n"
+				"cross-fading against it. Blend 0 stays bit-identical to vanilla either way.\n"
+				"\n"
+				"Off routes the environment light through the vanilla deferred composite, which\n"
+				"converts both terms to gamma, adds them, and converts back. Without Linear\n"
+				"Lighting that soft-add is pow(a^(1/1.6) + b^(1/1.6), 1.6): it brightens the sum\n"
+				"by up to 30% and pulls every channel towards the ambient hue, so the image reads\n"
+				"brighter, flatter and less saturated. That was the main colour error against the\n"
+				"SSRT reference, so this is On by default. It makes no difference when Linear\n"
+				"Lighting is enabled, where both conversions are identities.");
+		}
+
 	}
 }

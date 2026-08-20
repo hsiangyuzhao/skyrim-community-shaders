@@ -187,11 +187,20 @@ Texture2D<float4> SSRTexture : register(t16);
 	// Environment Ambient replaces the ambient term that was just separated out of MAIN, so it can
 	// never double-light: the vanilla contribution is subtracted whether or not L1 is active.
 	//
-	// On the separation above (:153-170): replacing Y in YCoCg while keeping Co/Cg is algebraically
-	// `A_est + (Masks.z - Y(A_est)) * (1,1,1)`, i.e. the DALC-ambient-times-albedo colour plus an
-	// achromatic correction to the forward ground-truth luminance. It does NOT carry the blended
-	// pixel chroma, and it is computed identically with and without ENV_AMBIENT, so what is added
-	// back below cannot tint the direct-light residual. The residual is the same in both branches.
+	// On the separation above (:153-170): with Color::YCoCgToRGB, replacing Y while keeping Co/Cg
+	// adds the same delta to all three channels (R = Y - Cg + Co, G = Y + Cg, B = Y - Cg - Co), so
+	// the subtracted term is exactly `A_est + (Masks.z - Y(A_est)) * (1,1,1)` where
+	// A_est = Color::Ambient(DALC . N) * albedo. Its chroma is A_est's, NOT the blended pixel's -
+	// the pixel only enters through the maxScale clamp at :161-168. The subtraction therefore
+	// cannot hue-shift the direct-light residual by scaling pixel chroma, and it is computed
+	// identically with and without ENV_AMBIENT.
+	//
+	// What it does leave is a bounded chroma error: Masks.z is the YCoCg Y of the *real* forward
+	// ambient (Lighting.hlsl:3892, after Skylighting's MultiBounceAO albedo tint and any IBL), so
+	// the luminance is exact but `chroma(real) - chroma(A_est)` survives as an additive term. The
+	// SSGI path cancels it by re-adding the same subtracted value; L1 cannot, because it adds
+	// cubemap chroma instead. This is inherent to the mechanism - the composite has no channel
+	// carrying the real ambient's chroma - and is small next to the composition-space error below.
 	float3 envAmbient = 0.0;
 	float envAmbientOcclusion = 1.0;
 
@@ -228,19 +237,43 @@ Texture2D<float4> SSRTexture : register(t16);
 	// Vanilla ambient contribution, in linear space, bit-identical to the #else branch below.
 	float3 ambientIrradiance = Color::IrradianceToLinear(directionalAmbientColor) * multiBounceAO;
 
+	// The environment term is added *linearly* (below), so it is kept out of ambientIrradiance and
+	// the vanilla term is faded out by the same Blend instead of being lerped against it. Blend = 0
+	// therefore still reproduces vanilla exactly, and Blend = 1 reproduces the reference exactly.
+	float3 envIrradianceAdd = 0.0;
+
 	[branch] if (envAmbientActive) {
+		float blend = saturate(SharedData::envAmbientSettings.Blend);
+
 		// ssrt_raymarch.hlsl:632-641: ao = occlusion * ssgiVisibility, then the whole env colour is
 		// multiplied by MultiBounceAO taken on the *gamma* g-buffer albedo (ssrt_raymarch.hlsl:470
 		// reads AlbedoTexture raw). Kept in that space on purpose: parity includes the quirks.
 		float envAo = saturate(envAmbientOcclusion * ssgiAo);
 		float3 envIrradiance = Color::IrradianceToLinear(envAmbient) * Color::MultiBounceAO(albedo, envAo);
 
-		ambientIrradiance = lerp(ambientIrradiance, envIrradiance, SharedData::envAmbientSettings.Blend);
+		[branch] if (SharedData::envAmbientSettings.LinearComposite != 0) {
+			// PARITY PATH. ssrt_diffuse_composite.hlsl:20 adds the cubemap ambient to MAIN inside
+			// linear space. The gamma path below instead converts both sides to gamma, adds, and
+			// converts back; without Linear Lighting that is pow(a^(1/1.6) + b^(1/1.6), 1.6), a
+			// soft-add which both lifts the sum (up to 2^0.375 = 1.30x where the two terms are
+			// equal) and pulls each channel towards the ambient's hue. Worked example, direct
+			// (1.0, 0.2, 0.1) plus ambient (0.2, 0.2, 0.3): linear gives (1.047, 0.307, 0.323),
+			// R/G = 3.41; gamma gives (1.2, 0.4, 0.4), R/G = 3.00 at 1.23x the luminance. That is
+			// symptom S1 exactly - brighter, less saturated, tinted towards the ambient - and it is
+			// why L1 read washed out against the reference. (Identity when Linear Lighting is on,
+			// where IrradianceToGamma/Linear are no-ops.)
+			ambientIrradiance *= 1.0 - blend;
+			envIrradianceAdd = envIrradiance * blend;
+		} else {
+			// Legacy/diagnostic: fold the environment term into the vanilla gamma soft-add.
+			ambientIrradiance = lerp(ambientIrradiance, envIrradiance, blend);
+		}
 	}
 
 	diffuseColor = Color::IrradianceToGamma(linDiffuseColor);
 	diffuseColor += Color::IrradianceToGamma(ambientIrradiance);
 	linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
+	linDiffuseColor += envIrradianceAdd;
 #	else
 	diffuseColor = Color::IrradianceToGamma(linDiffuseColor);
 	diffuseColor += Color::IrradianceToGamma(Color::IrradianceToLinear(directionalAmbientColor) * multiBounceAO);
