@@ -186,8 +186,14 @@ Texture2D<float4> SSRTexture : register(t16);
 #	if defined(ENV_AMBIENT)
 	// Environment Ambient replaces the ambient term that was just separated out of MAIN, so it can
 	// never double-light: the vanilla contribution is subtracted whether or not L1 is active.
-	float3 ambientColor = directionalAmbientColor;
-	float ambientAo = ssgiAo;
+	//
+	// On the separation above (:153-170): replacing Y in YCoCg while keeping Co/Cg is algebraically
+	// `A_est + (Masks.z - Y(A_est)) * (1,1,1)`, i.e. the DALC-ambient-times-albedo colour plus an
+	// achromatic correction to the forward ground-truth luminance. It does NOT carry the blended
+	// pixel chroma, and it is computed identically with and without ENV_AMBIENT, so what is added
+	// back below cannot tint the direct-light residual. The residual is the same in both branches.
+	float3 envAmbient = 0.0;
+	float envAmbientOcclusion = 1.0;
 
 	bool envAmbientActive = SharedData::envAmbientSettings.Enabled != 0 && depth < 1.0;
 #		if defined(SSRT)
@@ -210,14 +216,7 @@ Texture2D<float4> SSRTexture : register(t16);
 		float3 envAmbientPositionMS = positionWS.xyz;
 #		endif
 
-		float3 envAmbient = EnvironmentAmbient::Evaluate(normalWS, envAmbientPositionMS, albedo, directionalAmbientColor, dispatchID.xy);
-		ambientColor = lerp(directionalAmbientColor, envAmbient, SharedData::envAmbientSettings.Blend);
-
-		// Compensates for the extra self-intersection occlusion factor the SSRT fallback had
-		// (ssrt_raymarch.hlsl:632) and that is not available here. Direct light below keeps the
-		// unmodified occlusion.
-		if (SharedData::envAmbientSettings.ApplyAO != 0)
-			ambientAo = pow(saturate(ssgiAo), SharedData::envAmbientSettings.AOPower);
+		envAmbient = EnvironmentAmbient::Evaluate(normalWS, envAmbientPositionMS, albedo, dispatchID.xy, envAmbientOcclusion);
 	}
 #	endif
 
@@ -225,15 +224,28 @@ Texture2D<float4> SSRTexture : register(t16);
 
 	linDiffuseColor *= sqrt(multiBounceAO);
 
-	diffuseColor = Color::IrradianceToGamma(linDiffuseColor);
-
 #	if defined(ENV_AMBIENT)
-	diffuseColor += Color::IrradianceToGamma(Color::IrradianceToLinear(ambientColor) * Color::MultiBounceAO(linAlbedo, ambientAo));
-#	else
-	diffuseColor += Color::IrradianceToGamma(Color::IrradianceToLinear(directionalAmbientColor) * multiBounceAO);
-#	endif
+	// Vanilla ambient contribution, in linear space, bit-identical to the #else branch below.
+	float3 ambientIrradiance = Color::IrradianceToLinear(directionalAmbientColor) * multiBounceAO;
 
+	[branch] if (envAmbientActive) {
+		// ssrt_raymarch.hlsl:632-641: ao = occlusion * ssgiVisibility, then the whole env colour is
+		// multiplied by MultiBounceAO taken on the *gamma* g-buffer albedo (ssrt_raymarch.hlsl:470
+		// reads AlbedoTexture raw). Kept in that space on purpose: parity includes the quirks.
+		float envAo = saturate(envAmbientOcclusion * ssgiAo);
+		float3 envIrradiance = Color::IrradianceToLinear(envAmbient) * Color::MultiBounceAO(albedo, envAo);
+
+		ambientIrradiance = lerp(ambientIrradiance, envIrradiance, SharedData::envAmbientSettings.Blend);
+	}
+
+	diffuseColor = Color::IrradianceToGamma(linDiffuseColor);
+	diffuseColor += Color::IrradianceToGamma(ambientIrradiance);
 	linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
+#	else
+	diffuseColor = Color::IrradianceToGamma(linDiffuseColor);
+	diffuseColor += Color::IrradianceToGamma(Color::IrradianceToLinear(directionalAmbientColor) * multiBounceAO);
+	linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
+#	endif
 
 #	if defined(SSGI)
 	linDiffuseColor += ssgiIl * linAlbedoIl;
