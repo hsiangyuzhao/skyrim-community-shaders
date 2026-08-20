@@ -145,6 +145,39 @@ struct ScreenSpaceRayTracing : Feature
         /// distinguish signal from noise. Deliberately conservative: raising it trades
         /// residual noise for more skipped tiles.
         float AdaptiveVarianceEps = 1e-4f;
+        /// @brief (spec S1) Clamp outlier radiance against its 3x3 neighbourhood before
+        /// the temporal accumulation consumes it. On by default: it is what makes the
+        /// A2 iteration default safe, because a spike that survives into the a-trous
+        /// chain gets spread rather than removed.
+        bool FireflyClamp = true;
+        /// @brief (spec S1) How many neighbourhood standard deviations a pixel may exceed
+        /// the neighbourhood mean before it counts as a firefly.
+        ///
+        /// The reference set is the 8 neighbours, centre excluded. For n = 8 the largest
+        /// deviation any *member* of that set can have is sigma * sqrt(n - 1) = 2.646
+        /// sigma, so any value at or above that makes the test reachable only by the
+        /// centre pixel -- exactly the intent. 3.0 clears that bound with margin for the
+        /// ~26% relative error of an 8-sample sigma estimate, which puts the limit at
+        /// roughly 4x the neighbourhood mean under 1-spp GI noise: invisible on genuine
+        /// bright features, ~25x on a two-orders-of-magnitude spike. Lower it to clamp
+        /// harder; the shader floors the limit at the brightest neighbour so even K = 1
+        /// cannot cut into a feature two pixels wide.
+        float FireflyClampSigma = 3.0f;
+        /// @brief (spec S3) Roughness at or below which a specular pixel counts as
+        /// mirror-like, letting a whole 8x8 tile of them skip the a-trous kernel. 0
+        /// disables the mechanism.
+        ///
+        /// This is not a quality trade: the specular path already scales its
+        /// edge-stopping functions by roughness (phiLuminance *= r, phiNormal /= r), and
+        /// at r = 0.05 with the default ColorPhi 0.5 / NormalPhi 512 that leaves
+        /// phiNormal = 10240 -- a tap must match the centre normal to within 0.81 degrees
+        /// to keep 1/e of its weight -- and phiLuminance = 0.025 * sigma, so a tap must
+        /// also match the centre luminance to within 2.5% of a standard deviation. Under
+        /// both conditions every non-centre tap is annihilated and the kernel returns the
+        /// centre pixel it was handed. 0.05 is where that becomes true with margin;
+        /// raising it starts skipping genuinely glossy surfaces that the filter would
+        /// still have something to say about.
+        float SpecularDenoiseRoughnessCutoff = 0.05f;
 #ifdef ENABLE_SHARC
         bool EnableSharc = false;
 #endif
@@ -170,11 +203,11 @@ struct ScreenSpaceRayTracing : Feature
         float CubemapNormalization;
     };
 
-    /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Two float4
+    /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
-    /// reproduce this layout verbatim. ssrt_temporal.hlsl and ssrt_variance.hlsl declare
-    /// only the first row, which is legal -- a shader may declare a prefix of a larger
-    /// constant buffer.
+    /// reproduce this layout verbatim. ssrt_temporal.hlsl declares the first two rows and
+    /// ssrt_variance.hlsl only the first, which is legal -- a shader may declare a prefix
+    /// of a larger constant buffer.
     struct alignas(16) DenoiserCB
     {
         float invMaxAccumulatedFrames;
@@ -185,7 +218,15 @@ struct ScreenSpaceRayTracing : Feature
         uint adaptiveFiltering;
         float adaptiveHistoryThreshold;
         float adaptiveVarianceEps;
-        uint pad0;
+        /// @brief (spec S1) Firefly clamp width in neighbourhood standard deviations;
+        /// 0 switches the clamp and its LDS prefetch off. Took over the A-layer's pad
+        /// slot, so the buffer did not grow.
+        float fireflyClampSigma;
+        // --- row 2 ---
+        /// @brief (spec S3) Roughness cutoff for the specular mirror skip; 0 = off. Read
+        /// only by the SSRT_SPECULAR permutation of ssrt_spatial.hlsl.
+        float specularRoughnessCutoff;
+        float pad1[3];
     };
 
     eastl::unique_ptr<ConstantBuffer> ssrtCB;

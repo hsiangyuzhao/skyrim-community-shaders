@@ -38,6 +38,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AdaptiveFiltering,
     AdaptiveHistoryThreshold,
     AdaptiveVarianceEps,
+    FireflyClamp,
+    FireflyClampSigma,
+    SpecularDenoiseRoughnessCutoff,
     EnableSharc
 )
 #else
@@ -65,7 +68,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     NormalPhi,
     AdaptiveFiltering,
     AdaptiveHistoryThreshold,
-    AdaptiveVarianceEps
+    AdaptiveVarianceEps,
+    FireflyClamp,
+    FireflyClampSigma,
+    SpecularDenoiseRoughnessCutoff
 )
 #endif
 
@@ -145,6 +151,24 @@ void ScreenSpaceRayTracing::DrawSettings()
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text("Controls sensitivity to normal differences in the À Trous filter. Higher values preserve more detail but may retain noise.");
 
+        ImGui::Checkbox("Firefly Clamp", &settings.FireflyClamp);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Clamps single-pixel radiance outliers against their 3x3 neighbourhood "
+                "before the temporal accumulation sees them. Fireflies are the one artefact "
+                "the A Trous filter makes worse rather than better -- it spreads them into "
+                "slowly fading blobs -- so this is what keeps a low iteration count safe. "
+                "Turn off for a bit-exact classic SVGF temporal pass.");
+        if (settings.FireflyClamp) {
+            ImGui::SliderFloat("Firefly Clamp Sigma", &settings.FireflyClampSigma, 1.0f, 8.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text(
+                    "Standard deviations above the neighbourhood mean a pixel may reach before "
+                    "it counts as a firefly. Below 2.65 the clamp starts reaching values a "
+                    "neighbour also produced, i.e. real signal; higher values only catch the "
+                    "most extreme spikes.");
+        }
+
         ImGui::Checkbox("Adaptive Filtering", &settings.AdaptiveFiltering);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
@@ -158,6 +182,17 @@ void ScreenSpaceRayTracing::DrawSettings()
             ImGui::SliderFloat("Adaptive Variance Threshold", &settings.AdaptiveVarianceEps, 1e-6f, 1e-2f, "%.6f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
                 ImGui::Text("Luminance variance below which a pixel counts as converged. Higher values skip more tiles at the cost of residual noise.");
+        }
+
+        if (settings.EnableSpecular) {
+            ImGui::SliderFloat("Specular Mirror Cutoff", &settings.SpecularDenoiseRoughnessCutoff, 0.0f, 0.25f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text(
+                    "Roughness at or below which an 8x8 tile of specular pixels skips the A Trous "
+                    "kernel entirely. On a near-mirror the filter already discards every neighbour "
+                    "-- that is what the roughness scaling of Color Phi and Normal Phi is for -- so "
+                    "it computes the pixel it was handed. Skipping it removes the cost of water, "
+                    "glass and polished metal without changing what they look like. 0 disables.");
         }
     }
 #ifdef ENABLE_SHARC
@@ -1034,7 +1069,14 @@ ScreenSpaceRayTracing::DenoiserCB ScreenSpaceRayTracing::GetDenoiserCBData() con
     data.adaptiveFiltering = settings.AdaptiveFiltering ? 1u : 0u;
     data.adaptiveHistoryThreshold = (float)settings.AdaptiveHistoryThreshold;
     data.adaptiveVarianceEps = settings.AdaptiveVarianceEps;
-    data.pad0 = 0;
+    // (spec S1) The bool collapses into the strength: 0 sigmas is the off state the
+    // shader tests, so ssrt_temporal.hlsl needs a single group-uniform predicate rather
+    // than two.
+    data.fireflyClampSigma = settings.FireflyClamp ? settings.FireflyClampSigma : 0.0f;
+    // (spec S3) Only the SSRT_SPECULAR permutation reads this, so DrawSSRTDiffuse simply
+    // passes a value nothing looks at.
+    data.specularRoughnessCutoff = settings.SpecularDenoiseRoughnessCutoff;
+    data.pad1[0] = data.pad1[1] = data.pad1[2] = 0.0f;
     return data;
 }
 
