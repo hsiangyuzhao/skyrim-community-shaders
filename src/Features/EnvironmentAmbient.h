@@ -66,7 +66,7 @@ struct EnvironmentAmbient : Feature
 		float OcclusionStrength = 1.0f;  // 28  ssrt OcclusionStrength default
 		uint SampleCount = 3;            // 32
 		uint ApplyAO = 1;                // 36
-		uint EnableInterior = 0;         // 40
+		uint EnableInterior = 1;         // 40
 		uint LinearComposite = 1;        // 44
 
 		uint EnclosureFallback = 1;         // 48

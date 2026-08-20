@@ -282,9 +282,17 @@ void EnvironmentAmbient::DrawSettings()
 		ImGui::Checkbox("Enable in Interiors", (bool*)&settings.EnableInterior);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text(
-				"Interiors use a separate composite permutation without Skylighting, so the sky\n"
-				"visibility term is unavailable and only the no-sky cubemap is used. Off by\n"
-				"default, which leaves interiors on the vanilla ambient path.");
+				"Interiors use a separate composite permutation without Skylighting, so only the\n"
+				"no-sky cubemap is used - which is the whole of the environment light indoors\n"
+				"anyway, and is exactly what Skylighting would report there: its probe volume\n"
+				"returns full visibility inside, so the sky visibility and enclosure terms would\n"
+				"both be constant 1.\n"
+				"\n"
+				"On by default. Interiors are most of the play time, and leaving them on the\n"
+				"vanilla ambient path meant the directional environment light simply did not\n"
+				"exist in dungeons, caves and houses. Contact occlusion and the enclosure hue\n"
+				"fallback still work there; they run off contact and Screen Space GI, not off\n"
+				"Skylighting.");
 		}
 
 		ImGui::SliderFloat("Normalization", &settings.Normalization, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);

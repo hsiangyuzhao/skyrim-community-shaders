@@ -52,7 +52,10 @@ namespace ImageBasedLighting
 			color = GetDiffuseIBL(rayDir);
 		}
 		else
-#if defined(SKYLIGHTING)
+// Must match the signature guard above exactly: with SKYLIGHTING and INTERIOR both defined the
+// overload without the `skylighting` parameter is the one declared, so this branch would
+// reference an undeclared identifier and fail to compile.
+#if defined(SKYLIGHTING) && !defined(INTERIOR)
 		{
 			color = lerp(GetDiffuseIBL(rayDir), GetSkyDiffuseIBL(rayDir), skylighting);
 		}
