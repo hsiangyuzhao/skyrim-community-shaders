@@ -40,6 +40,20 @@ cbuffer DenoiserCB : register(b2)
 // instruction slots per pixel, so it is a real fraction of the pass, hence the switch;
 // but the default stays on and the report recommends keeping it. Set
 // SSRT_SVGF_GAUSSIAN=0 to measure the alternative.
+//
+// (spec S2) Re-checked against the 3x3 a-trous kernel. The prescription itself is
+// unaffected: Schied's pre-blur is a fixed 3x3 on the variance channel at every a-trous
+// level, independent of the level's kernel or stride, so nothing about it needs to change.
+// What changes is its share of the pass. The pre-blur's 9 loads used to sit next to 25 tap
+// loads (~26% of the texture traffic); next to 9 they are ~50%, and the fxc delta below is
+// unchanged in absolute terms while the pass around it got cheaper. So the switch matters
+// more than it did, and the recommendation to leave it on is unchanged: what it buys is the
+// removal of an artefact class (variance-driven blotching), not smoothing.
+//
+// Also worth noting for a future round: at stride 1 the pre-blur's +-1 footprint coincides
+// exactly with the 3x3 kernel's taps, so iteration 0 loads the same nine texels twice. It
+// cannot simply be folded in, because phiLuminance has to be known before the tap loop
+// starts -- it would take a second LDS tile for the .w channel.
 #ifndef SSRT_SVGF_GAUSSIAN
 #   define SSRT_SVGF_GAUSSIAN 1
 #endif
@@ -77,7 +91,59 @@ float GaussianBlur(uint2 id)
 }
 #endif
 
-static const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
+// (spec S2) 3x3 dilated a-trous, with the original 5x5 kept behind a switch.
+//
+// The pass used to run the 5-tap-per-axis B3 spline [1,4,6,4,1]/16 -- 25 taps per pixel
+// per iteration -- at a stride that grows one texel per iteration (atrousStride =
+// atrousIterations + 1, where the constant carries the *loop index*, so the schedule is
+// 1, 2, 3, ...). The textbook a-trous formulation for a wavelet chain is the 3-tap
+// binomial [1,2,1]/4 instead: 9 taps per iteration, and the dilation is what recovers the
+// reach.
+//
+// The two things worth checking before making that swap are coverage and bandwidth.
+//
+// Coverage. A 3-tap kernel at stride s reaches +-s, so consecutive iterations at strides
+// 1 and 2 have supports {-1,0,1} and {-2,0,2}, whose convolution is {-3..3} -- every
+// integer offset, no holes. That is the property that makes a 3-tap chain legitimate and
+// it survives this codebase's linear stride schedule (1, 2, 3, ...) as well as it does the
+// classic 2^i one. The *hard* radius after N iterations is sum(i = 1..N) i = N(N+1)/2
+// against the 5-tap kernel's N(N+1), i.e. exactly half. So 3 iterations of 3x3 have the
+// same 6-texel support radius as 2 iterations of 5x5, for 27 taps instead of 50.
+//
+// Bandwidth. Per axis the discrete second moment is sum(k^2 * h_k): 1.0 for [1,4,6,4,1]/16
+// and 0.5 for [1,2,1]/4, both at stride 1, scaling with s^2. Summing over the chain (the
+// iterations are independent, so variances add):
+//   5x5, 2 iters: 1*(1+4)     = 5.0   -> sigma 2.24 px   (50 taps/px)
+//   5x5, 3 iters: 1*(1+4+9)   = 14.0  -> sigma 3.74 px   (75 taps/px)
+//   3x3, 2 iters: 0.5*(1+4)   = 2.5   -> sigma 1.58 px   (18 taps/px)
+//   3x3, 3 iters: 0.5*(1+4+9) = 7.0   -> sigma 2.65 px   (27 taps/px)
+// So the 3x3 kernel at the current AtrousIterations default of 2 is a 0.71x narrower
+// filter for 36% of the taps, and at 3 iterations it is a 1.18x *wider* one for 54% of the
+// taps. The report recommends 3 for parity; the default is left at 2 per the user
+// directive that existing defaults do not move.
+//
+// One incidental gain: CalculateWeight's phiDepth is set to atrousStride, i.e. to the
+// distance of a |k| = 1 tap. Under the 5x5 kernel the |k| = 2 taps were therefore judged
+// with a phiD half their true distance -- twice as strict as intended, an inconsistency
+// audit #12 did not reach. A 3-tap kernel has no |k| = 2 taps, so phiDepth is exactly
+// right for every tap it takes.
+//
+// Set SSRT_SVGF_KERNEL_5X5=1 to restore the 25-tap kernel bit-for-bit, including its LDS
+// tile geometry.
+#ifndef SSRT_SVGF_KERNEL_5X5
+#   define SSRT_SVGF_KERNEL_5X5 0
+#endif
+
+#if SSRT_SVGF_KERNEL_5X5
+#   define SSRT_SPATIAL_KERNEL_RADIUS 2
+// B3 spline [1,4,6,4,1]/16, normalised to a unit centre tap.
+static const float kernelWeights[SSRT_SPATIAL_KERNEL_RADIUS + 1] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
+#else
+#   define SSRT_SPATIAL_KERNEL_RADIUS 1
+// Binomial [1,2,1]/4, normalised to a unit centre tap. The separable 3x3 it forms is
+// 1 : 1/2 : 1/4 for centre : edge : corner.
+static const float kernelWeights[SSRT_SPATIAL_KERNEL_RADIUS + 1] = { 1.0, 1.0 / 2.0 };
+#endif
 
 #define VAR_EPSILON 0.00001f
 
@@ -90,9 +156,20 @@ static const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
 // count of exactly 64 authorises the whole group to take the early path.
 //
 // Whole-group granularity is deliberate, not a fallback. A partial early-out inside a
-// group would save nothing: the surviving lanes still execute the 25-tap kernel and the
-// converged ones just idle through it, so the group's cost is unchanged. Only skipping a
-// group in its entirety removes work.
+// group would save nothing: the surviving lanes still execute the kernel and the converged
+// ones just idle through it, so the group's cost is unchanged. Only skipping a group in
+// its entirety removes work.
+//
+// (spec S2) The semantics are unchanged by the move to a 3x3 kernel -- the vote is about
+// the *input*, not about the kernel, and the early path still copies colour and variance
+// verbatim. Two consequences are worth recording, neither of which needs code:
+//   * The prize shrinks. A skipped group now avoids 9 taps per lane instead of 25, so the
+//     vote's own cost (two barriers and an atomic) is amortised over less saved work. It
+//     still pays -- the reduction is a handful of instructions against nine guided taps
+//     plus their weight evaluation -- but the A-layer's measured win scales down with it.
+//   * Slightly fewer tiles qualify at iterations >= 1. The carried variance shrinks by
+//     roughly sum(w^2)/sum(w)^2 per iteration, which is larger for 9 taps than for 25, so
+//     .w falls towards adaptiveVarianceEps more slowly down the chain.
 //
 // Both barriers below are executed unconditionally by every lane. That is what forces
 // the restructuring of the two early-outs further down (they now happen *after* the
@@ -100,21 +177,40 @@ static const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
 // barrier non-uniform across the group, which is undefined behaviour.
 groupshared uint g_ssrtConvergedLanes;
 
-// (spec A4) Groupshared depth/normal tile for the a-trous taps.
+// (spec A4, re-derived for spec S2) Groupshared depth/normal tile for the a-trous taps.
 //
-// The 25 taps of an 8x8 group overlap heavily, so their depth and normal fetches want to
-// be shared. The footprint is *stride dependent*, though: a tap sits at
-// DTid + k * stride with k in [-2, 2] and stride = atrousIterations + 1, so the group
-// needs a (8 + 4 * stride) square, not the fixed 8 + 2 * 2 an unstrided 5x5 kernel would
-// need. Reuse falls off accordingly -- 1600 tap fetches over 144 texels at stride 1,
-// over 256 at stride 2, over 784 at stride 5.
+// The taps of an 8x8 group overlap heavily, so their depth and normal fetches want to be
+// shared. The footprint is *stride dependent*: a tap sits at DTid + k * stride with
+// |k| <= R and stride = atrousIterations + 1, so the group needs a
+// (8 + 2 * R * stride) square, not the fixed 8 + 2 * R an unstrided kernel would need.
 //
-// The tile is therefore sized for stride 2, which covers both iterations of the new
-// AtrousIterations default (strides 1 and 2) at 4 KB of LDS and 11x / 6x fewer global
-// loads. Beyond that the reuse no longer pays for the LDS pressure and the pass falls
-// back to the original per-tap loads.
-#define SSRT_SPATIAL_LDS_MAX_STRIDE 2
-#define SSRT_SPATIAL_TILE (8 + 4 * SSRT_SPATIAL_LDS_MAX_STRIDE)  // 16
+// S2 halves R from 2 to 1, which changes both terms of the trade:
+//
+//   * The halo shrinks from 2 * stride to stride per side, so the tile goes from
+//     8 + 4 * stride to 8 + 2 * stride texels a side -- 100 / 144 / 196 / 256 / 324 entries
+//     at strides 1..5 where the 5x5 kernel needed 144 / 256 / 400 / 576 / 784.
+//   * The demand halves too: 64 lanes x 9 taps = 576 tap fetches per group instead of
+//     1600. Global loads per lane (two per tap or per tile texel) therefore go 18 -> 3.1
+//     at stride 1, -> 4.5 at stride 2, -> 6.1 at stride 3, -> 8.0 at stride 4,
+//     -> 10.1 at stride 5. Break-even is (8 + 2s)^2 = 576, i.e. stride 8, so LDS is still
+//     a win across the whole legal AtrousIterations range of 1..5 -- but with diminishing
+//     returns, and the LDS pressure is what caps it.
+//
+// The cap moves from stride 2 to stride 3: 14 x 14 float4 = 3136 bytes, *less* LDS than
+// A4's 16 x 16 = 4096 while covering one stride more. That reaches AtrousIterations 3,
+// which is both the current default of 2 and the value the S2 report recommends should
+// the shorter 3x3 reach need compensating. Strides 4 and 5 fall back to per-tap loads
+// exactly as before.
+//
+// Under SSRT_SVGF_KERNEL_5X5 the original geometry is restored verbatim (cap 2, 16 x 16),
+// so the fallback path is bit-identical.
+#if SSRT_SVGF_KERNEL_5X5
+#   define SSRT_SPATIAL_LDS_MAX_STRIDE 2
+#else
+#   define SSRT_SPATIAL_LDS_MAX_STRIDE 3
+#endif
+// 16 with the 5x5 kernel, 14 with the 3x3 one.
+#define SSRT_SPATIAL_TILE (8 + 2 * SSRT_SPATIAL_KERNEL_RADIUS * SSRT_SPATIAL_LDS_MAX_STRIDE)
 
 // View-space normal in .xyz, raw depth in .w. Only the tap loop reads it; the centre
 // pixel keeps its direct fetch because it also needs roughness, which is not stored.
@@ -191,8 +287,8 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
     // useLDS from a constant buffer -- so no lane fills the tile for nothing. They guard
     // LDS *writes* only; the barrier that publishes them stays unconditional.
     if (!skipFilter && useLDS) {
-        const uint tileDim = 8 + 4 * atrousStride;
-        const int2 tileOrigin = int2(Gid.xy) * 8 - int(2 * atrousStride);
+        const uint tileDim = 8 + 2 * SSRT_SPATIAL_KERNEL_RADIUS * atrousStride;
+        const int2 tileOrigin = int2(Gid.xy) * 8 - int(SSRT_SPATIAL_KERNEL_RADIUS * atrousStride);
         for (uint ty = GTid.y; ty < tileDim; ty += 8) {
             for (uint tx = GTid.x; tx < tileDim; tx += 8) {
                 const int2 p = tileOrigin + int2(tx, ty);
@@ -270,9 +366,9 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
         float weightSum = 0.f;
         float varianceSum = 0.f;
 
-        for (int ky = -2; ky <= 2; ky++)
+        for (int ky = -SSRT_SPATIAL_KERNEL_RADIUS; ky <= SSRT_SPATIAL_KERNEL_RADIUS; ky++)
         {
-            for (int kx = -2; kx <= 2; kx++)
+            for (int kx = -SSRT_SPATIAL_KERNEL_RADIUS; kx <= SSRT_SPATIAL_KERNEL_RADIUS; kx++)
             {
                 // A-Trous sampling
                 int2 samplePos = int2(DTid.xy) + int2(kx, ky) * int(atrousStride);
@@ -281,8 +377,8 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
                 {
                     float4 sampleSSRColor = SSRColorTexture[samplePos];
                     // (spec A4) Tile coordinate of this tap; the tile origin sits
-                    // 2 * stride texels before the group, so the offset cancels out.
-                    const int2 tileCoord = int2(GTid.xy) + int2(kx, ky) * int(atrousStride) + int(2 * atrousStride);
+                    // radius * stride texels before the group, so the offset cancels out.
+                    const int2 tileCoord = int2(GTid.xy) + int2(kx, ky) * int(atrousStride) + int(SSRT_SPATIAL_KERNEL_RADIUS * atrousStride);
                     const float4 guide = SSRTSpatialFetchGuide(samplePos, tileCoord, useLDS);
                     float sampleDepth = guide.w;
                     if (sampleDepth > 0)
