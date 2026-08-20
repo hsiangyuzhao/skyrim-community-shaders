@@ -300,7 +300,12 @@ PS_OUTPUT main(PS_INPUT input)
 	psout.Normal.zw = 0;
 
 	psout.Albedo = float4(baseColor.xyz, 1);
-	psout.Masks = float4(0, 0, 1, 0);
+	// Masks.z carries the ambient luminance that the deferred composite subtracts back out of
+	// MAIN (see DeferredCompositeCS.hlsl). It must match the ambient contribution actually
+	// written into psout.Diffuse, i.e. directionalAmbientColor * baseColor, in the same YCoCg
+	// convention Lighting.hlsl / RunGrass.hlsl use. Hardwiring 1.0 made the composite treat the
+	// entire distant-tree diffuse as ambient.
+	psout.Masks = float4(0, 0, Color::RGBToYCoCg(directionalAmbientColor * baseColor.xyz).x, 0);
 #		else
 	float dirShadow = ShadowSampling::GetWorldShadow(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, eyeIndex);
 
