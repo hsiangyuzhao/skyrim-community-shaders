@@ -379,8 +379,13 @@ namespace SharedData
 
 		uint EnclosureFallback;
 		float HueFalloff;
+		uint EnableContactOcclusion;
+		float ContactRadius;
+
+		float ContactStrength;
 		float pad0;
 		float pad1;
+		float pad2;
 	};
 
 	cbuffer FeatureData : register(b6)

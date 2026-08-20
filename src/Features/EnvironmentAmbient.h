@@ -69,10 +69,15 @@ struct EnvironmentAmbient : Feature
 		uint EnableInterior = 0;         // 40
 		uint LinearComposite = 1;        // 44
 
-		uint EnclosureFallback = 1;      // 48
-		float HueFalloff = 1.0f;         // 52
-		float pad0 = 0.0f;               // 56
-		float pad1 = 0.0f;               // 60
+		uint EnclosureFallback = 1;         // 48
+		float HueFalloff = 1.0f;            // 52
+		uint EnableContactOcclusion = 1;    // 56
+		float ContactRadius = 15.0f;        // 60  centimetres
+
+		float ContactStrength = 1.0f;       // 64
+		float pad0 = 0.0f;                  // 68
+		float pad1 = 0.0f;                  // 72
+		float pad2 = 0.0f;                  // 76
 	} settings;
-	static_assert(sizeof(Settings) == 64, "EnvironmentAmbient::Settings must stay 64 bytes (4 constant buffer rows).");
+	static_assert(sizeof(Settings) == 80, "EnvironmentAmbient::Settings must stay 80 bytes (5 constant buffer rows).");
 };

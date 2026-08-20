@@ -292,6 +292,7 @@ Texture2D<float4> SSRTexture : register(t16);
 	// here.
 	float3 envAmbient = 0.0;
 	float envAmbientOcclusion = 1.0;
+	float envContactOcclusion = 1.0;
 
 	bool envAmbientActive = SharedData::envAmbientSettings.Enabled != 0 && depth < 1.0;
 #		if defined(SSRT)
@@ -307,7 +308,15 @@ Texture2D<float4> SSRTexture : register(t16);
 #		endif
 
 	[branch] if (envAmbientActive)
+	{
+		// Centimetre-scale self-occlusion, the one part of the fallback that Skylighting's
+		// metre-scale probes and half-resolution SSGI both miss. Only evaluated when the feature is
+		// actually doing something.
+		[branch] if (SharedData::envAmbientSettings.EnableContactOcclusion != 0)
+			envContactOcclusion = EnvironmentAmbient::EvaluateContactOcclusion(dispatchID.xy, positionWS.xyz, normalWS, depth, eyeIndex);
+
 		envAmbient = EnvironmentAmbient::Evaluate(normalWS, albedo, dispatchID.xy, ambientSkyVisibility, ambientEnclosure, envAmbientOcclusion);
+	}
 #	endif
 
 	float3 multiBounceAO = Color::MultiBounceAO(linAlbedo, ssgiAo);
@@ -329,7 +338,10 @@ Texture2D<float4> SSRTexture : register(t16);
 		// ssrt_raymarch.hlsl:632-641: ao = occlusion * ssgiVisibility, then the whole env colour is
 		// multiplied by MultiBounceAO taken on the *gamma* g-buffer albedo (ssrt_raymarch.hlsl:470
 		// reads AlbedoTexture raw). Kept in that space on purpose: parity includes the quirks.
-		float envAo = saturate(envAmbientOcclusion * ssgiAo);
+		// The three occlusion terms act at different scales - Skylighting's metres, SSGI's large
+		// screen-space radius, contact occlusion's centimetres - so multiplying them is composition,
+		// not double-counting.
+		float envAo = saturate(envAmbientOcclusion * ssgiAo * envContactOcclusion);
 		float3 envIrradiance = Color::IrradianceToLinear(envAmbient) * Color::MultiBounceAO(albedo, envAo);
 
 		// Enclosure-driven hue fallback. The fallback this feature ports does not merely dim the
@@ -347,7 +359,11 @@ Texture2D<float4> SSRTexture : register(t16);
 		// the vanilla ambient. Because the occluded cubemap term is lerped away at the enclosed end,
 		// Occlusion Strength no longer compounds with this and can stay at the fallback's 1.0.
 		[branch] if (SharedData::envAmbientSettings.EnclosureFallback != 0) {
-			float enclosure = ambientEnclosure;
+			// Contact occlusion joins the enclosure signal as well as the multiplier above, so a
+			// tight contact gets the hue fallback too: the light reaching the gap between hair and
+			// cheek is bounced skin and hair, not sky, so it should shift towards the local ambient
+			// colour and not just dim.
+			float enclosure = ambientEnclosure * envContactOcclusion;
 #	if defined(SSGI)
 			// Screen Space GI resolves contact and creases far finer than the Skylighting probe
 			// grid, and it is the same signal the fallback multiplied in (ssrt_raymarch.hlsl:634).
