@@ -159,6 +159,14 @@ Texture2D<float4> SSRTexture : register(t16);
 
 	float3 linAlbedo = Color::IrradianceToLinear(albedo / Color::PBRLightingScale);
 
+	// Indirect lighting albedo must keep the upstream (2ea3b3adc) calibration, which divided
+	// albedo by the then-unconditional PBRLightingScale of 0.65 to compensate for lowering the
+	// default GIStrength from 1.5 to 1.0. PBRLightingScale is now 1.0 under Linear Lighting, so
+	// reusing it here silently darkened SSGI IL by 1/0.65 (~1.54x) in every LL configuration.
+	// Use the literal 0.65 so IL magnitude is identical with and without Linear Lighting.
+	// The AO path above intentionally keeps Color::PBRLightingScale (behaviour unchanged).
+	float3 linAlbedoIl = Color::IrradianceToLinear(albedo / 0.65);
+
 	float3 multiBounceAO = Color::MultiBounceAO(linAlbedo, ssgiAo);
 
 	linDiffuseColor *= sqrt(multiBounceAO);
@@ -169,7 +177,7 @@ Texture2D<float4> SSRTexture : register(t16);
 
 	linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
 
-	linDiffuseColor += ssgiIl * linAlbedo;
+	linDiffuseColor += ssgiIl * linAlbedoIl;
 #endif
 
 	float3 color = linDiffuseColor + specularColor;

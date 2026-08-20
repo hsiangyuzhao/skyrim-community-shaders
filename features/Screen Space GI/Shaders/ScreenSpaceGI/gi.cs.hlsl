@@ -184,13 +184,19 @@ void CalculateGI(
 
 				float sampleOffsetLength = length(sampleOffset);
 				float mipLevel = clamp(log2(sampleOffsetLength) - 3.3, 0, 5);
+				// The radiance mip floor is one level below the depth/AO mip floor: the radiance
+				// pyramid is already built at the GI working resolution, so an extra forced level
+				// made half-res radiance effectively 1/8 x 1/8 of full res. Combined with blur,
+				// temporal accumulation and upsampling that flattened indirect light into a
+				// spatially uniform haze with no colour locality. Depth sampling (mipLevel) keeps
+				// its original floors.
 				float mipLevelRadiance = mipLevel;
 #if defined(HALF_RES)
 				mipLevel = max(mipLevel, 1);
-				mipLevelRadiance = max(mipLevelRadiance, 2);
+				mipLevelRadiance = max(mipLevelRadiance, 1);
 #elif defined(QUARTER_RES)
 				mipLevel = max(mipLevel, 2);
-				mipLevelRadiance = max(mipLevelRadiance, 3);
+				mipLevelRadiance = max(mipLevelRadiance, 2);
 #else
 				mipLevelRadiance = max(mipLevelRadiance, 1);
 #endif
@@ -302,14 +308,26 @@ void CalculateGI(
 	radianceY *= rcpNumSlices;
 	radianceY = lerp(radianceY, 0, depthFade);
 
-	radianceCoCg *= rcpNumSlices * GISaturation;
+	// Chroma has to be scaled to match the effective weight luminance picks up from the SH
+	// round trip, otherwise YCoCgToRGB overshoots and max(0, ...) clips whole channels.
+	// Luminance:  radianceY accumulates Y * Evaluate(h) and the consumer integrates it against
+	//             EvaluateCosineLobe(n), giving 0.28209*0.88623 + 0.48860*1.02333*(h.n)
+	//             = 0.25 + 0.5*(h.n) per sample; mean(h.n) over the hemisphere is 0.5, so the
+	//             mean luminance weight is 0.5.
+	// Chroma:     radianceCoCg is a bare sum, i.e. weight 1.0 per sample.
+	// So chroma was roughly 2x too saturated relative to luminance -> scale it by 0.5.
+	// This also lines the specular consumer up: it integrates Y against FauxSpecularLobe for a
+	// mean weight of 0.159 (cosine part) to 0.199 (directional part), against a chroma weight of
+	// 1.0/PI = 0.318; after the 0.5 here chroma lands on 0.159. That inconsistency is what the
+	// hand-tuned "* 0.8" cheese removed in 2ea3b3adc was papering over.
+	radianceCoCg *= rcpNumSlices * GISaturation * 0.5;
 
 #	ifdef GI_SPECULAR
 	radianceSpecular *= rcpNumSlices;
 	radianceSpecular = lerp(radianceSpecular, 0, depthFade);
 
 	visibilitySpecular *= rcpNumSlices;
-	visibilitySpecular = lerp(saturate(visibility), 0, depthFade);
+	visibilitySpecular = lerp(saturate(visibilitySpecular), 0, depthFade);
 #	endif
 #endif
 
