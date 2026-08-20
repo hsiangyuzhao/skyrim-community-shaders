@@ -69,7 +69,11 @@ void ScreenSpaceRayTracing::DrawSettings()
     ImGui::SameLine();
     ImGui::Checkbox("Enable Diffuse", &settings.EnableDiffuse);
     ImGui::SliderInt("Max Steps", (int*)&settings.MaxSteps, 1, 256);
-    ImGui::SliderInt("Max Mip Level", (int*)&settings.MaxMips, 1, maxMips, "%d", ImGuiSliderFlags_AlwaysClamp);
+    // (audit P3) The traversal can load exactly mip SSRTCB::MaxMips, so the highest
+    // legal setting is maxMips - 1; the old bound of maxMips let the ray sample a mip
+    // that does not exist, and an out-of-range Load returns 0 == near plane, i.e. an
+    // instant false hit.
+    ImGui::SliderInt("Max Mip Level", (int*)&settings.MaxMips, 1, maxMips - 1, "%d", ImGuiSliderFlags_AlwaysClamp);
     recompileFlag |= ImGui::SliderInt("Diffuse SPP", (int*)&settings.DiffuseSPP, 1, 16, "%d", ImGuiSliderFlags_AlwaysClamp);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Samples per pixel for diffuse component. Higher values reduce noise but impact performance.");
@@ -481,7 +485,15 @@ void ScreenSpaceRayTracing::Prepass()
             context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
             context->CSSetShader(depthDownsampleCS.get(), nullptr, 0);
 
-            context->Dispatch((uint)dispatchCount.x >> i, (uint)dispatchCount.y >> i, 1);
+            // (audit P3) One thread per *destination* pixel, i.e. per pixel of mip i+1.
+            // The old `dispatchCount >> i` sized the dispatch for mip i and launched 4x
+            // the threads actually needed at every level. Note this cannot be written
+            // as `dispatchCount >> (i + 1)`: that is floor(ceil(size/8) / 2^(i+1)) and
+            // under-covers whenever the group count is odd (e.g. 1080 -> 135 groups ->
+            // 67 instead of the 68 needed for mip 1, leaving the bottom rows unwritten).
+            const uint mipWidth = std::max(1u, (uint)size.x >> (i + 1));
+            const uint mipHeight = std::max(1u, (uint)size.y >> (i + 1));
+            context->Dispatch((mipWidth + 7) / 8, (mipHeight + 7) / 8, 1);
             resetViews();
         }
         state->EndPerfEvent();
@@ -520,7 +532,10 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     SSRTCB ssrCBData;
     {
         ssrCBData.MaxSteps = settings.MaxSteps;
-        ssrCBData.MaxMips = settings.MaxMips;
+        // (audit P3) Clamp against the allocated mip count: a config saved by an older
+        // build may hold a value above maxMips - 1, and loading a mip that does not
+        // exist returns 0 == near plane, i.e. an immediate false hit.
+        ssrCBData.MaxMips = std::min(settings.MaxMips, maxMips - 1);
         ssrCBData.Thickness = settings.Thickness;
         ssrCBData.NormalBias = settings.NormalBias;
         ssrCBData.BRDFBias = settings.BRDFBias;
@@ -718,7 +733,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     SSRTCB ssrCBData;
     {
         ssrCBData.MaxSteps = settings.MaxSteps;
-        ssrCBData.MaxMips = settings.MaxMips;
+        // (audit P3) See DrawSSRTSpecular: clamp to the allocated mip count.
+        ssrCBData.MaxMips = std::min(settings.MaxMips, maxMips - 1);
         ssrCBData.Thickness = settings.Thickness;
         ssrCBData.NormalBias = settings.NormalBias;
         ssrCBData.BRDFBias = settings.BRDFBias;

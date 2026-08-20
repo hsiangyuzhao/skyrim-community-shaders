@@ -131,7 +131,11 @@ struct ScreenSpaceRayTracing : Feature
 
     winrt::com_ptr<ID3D11ShaderResourceView> noiseSRV = nullptr;
 
-    static const uint maxMips = 9;
+    // (audit P3) Mip levels 0..maxMips-1 exist in texDepth. The Hi-Z traversal never
+    // reads above SSRTCB::MaxMips, whose slider is clamped to maxMips - 1, so 7 levels
+    // (mip 0..6) cover the whole usable range; the old 9 allocated two mips and ran two
+    // downsample dispatches that no ray could ever sample.
+    static const uint maxMips = 7;
     static const uint sharcNumEntries = 0x100000;
 
     std::array<winrt::com_ptr<ID3D11ShaderResourceView>, maxMips> depthSRVs = { nullptr };
