@@ -84,6 +84,14 @@ cbuffer SSRTCB : register(b1)
     float CubemapNormalization;
 };
 
+// (audit #21) Never defined by ScreenSpaceRayTracing::CompileComputeShaders, so this is
+// always 0 in every shipped permutation: the engine depth buffer is not inverted (see
+// SSRT_IS_FAR_PLANE in ssrt_common.hlsli). The guarded branches are kept only so the
+// option remains available, and are unified on this single spelling -- one of them used
+// to be `#ifdef SSRT_INVERTED_DEPTH_RANGE`, which never matched and therefore hid
+// non-compiling code.
+#define SSRT_OPTION_INVERTED_DEPTH 0
+
 #define HIZ_MAX_ITERATIONS MaxSteps
 #define HIZ_MIN_MIP 0
 #define SSRT_FLOAT_MAX 3.402823466e+38
@@ -94,6 +102,29 @@ cbuffer SSRTCB : register(b1)
 #   define SAMPLES_PER_PIXEL 1
 #else
 #   define SAMPLES_PER_PIXEL DIFFUSE_SPP
+#endif
+
+// (audit #7s) Two coherent conventions exist for the Hi-Z traversal, and the code used
+// to mix them:
+//
+//  * legacy (diffuse): `screen_size` is the *full* buffer extent, so cell boundaries are
+//    computed on a 1/fullDim grid, and every depth fetch rescales the coordinate by
+//    DynamicResolutionParams1.xy to land inside the pyramid's dynamic-resolution
+//    sub-rect. Under DRS with ratio s < 1 (DLSS Quality s ~= 0.667) a cell is s times
+//    smaller than a texel: the ray re-tests the same texel 1/s times, the effective
+//    reach of MaxSteps shrinks by s, and the tile/mip decisions no longer line up with
+//    texel boundaries.
+//
+//  * render resolution (specular): `screen_size` is the render extent, the grid matches
+//    the pyramid's valid area exactly, and no rescale is needed anywhere.
+//
+// The second is correct. It is applied to the specular permutation only: the traversal
+// grid determines hit rates, and changing it on the diffuse path would move the
+// diffuse+fallback look the user currently depends on.
+#if defined(SSRT_SPECULAR)
+#   define SSRT_DEPTH_COORD_SCALE float2(1.0, 1.0)
+#else
+#   define SSRT_DEPTH_COORD_SCALE FrameBuffer::DynamicResolutionParams1.xy
 #endif
 
 float3 ProjectPosition(float3 origin, float4x4 mat)
@@ -234,8 +265,6 @@ float3 SSRT_HierarchicalRaymarch(float3 origin, float3 direction, bool is_mirror
     // Offset applied depending on current mip resolution to move the boundary to the left/right upper/lower border depending on ray direction.
     float2 floor_offset = direction.xy < 0 ? 0 : 1;
 
-    // valid_hit = false;
-    // if (direction.z < f32(1.0e-6)) return f32x3(0.0, 0.0, 0.0);
 
     // Initially advance ray to avoid immediate self intersections.
     float  current_t;
@@ -245,14 +274,19 @@ float3 SSRT_HierarchicalRaymarch(float3 origin, float3 direction, bool is_mirror
     _num_iters                     = uint(0);
     while (_num_iters < max_traversal_intersections && current_mip >= most_detailed_mip) {
         if (any(position.xy > float2(1.0, 1.0)) || any(position.xy < float2(0.0, 0.0))) break;
-#ifdef SSRT_INVERTED_DEPTH_RANGE
-        if (position.z < f32(1.0e-6)) break;
+        // (audit #21) Was `#ifdef SSRT_INVERTED_DEPTH_RANGE` -- a third spelling of the
+        // macro the rest of the file calls SSRT_OPTION_INVERTED_DEPTH -- guarding
+        // `f32(1.0e-6)`, which is not HLSL (it is a leftover from the FidelityFX source
+        // this was ported from). Never compiled because the name never matched; unified
+        // and made legal so enabling the option is not an instant build break.
+#if SSRT_OPTION_INVERTED_DEPTH
+        if (position.z < float(1.0e-6)) break;
 #else
         if (position.z > float(1.0) - float(1.0e-6)) break;
 #endif
 
         float2 current_mip_position = current_mip_resolution * position.xy;
-        float  surface_z            = SSRT_LoadDepth(current_mip_position * FrameBuffer::DynamicResolutionParams1.xy, current_mip);
+        float  surface_z            = SSRT_LoadDepth(current_mip_position * SSRT_DEPTH_COORD_SCALE, current_mip);  // (audit #7s)
         bool skipped_tile =
             SSRT_AdvanceRay(origin, direction, inv_direction, current_mip_position, current_mip_resolution_inv, current_mip, floor_offset, uv_offset, surface_z, position, current_t);
         bool nextMipIsOutOfRange = skipped_tile && (current_mip >= SSRT_DEPTH_HIERARCHY_MAX_MIP);
@@ -296,17 +330,38 @@ float SSRT_ValidateHit(float3 hit, float2 uv, float3 world_space_ray_direction, 
     }
 
     // Don't lookup radiance from the background.
-    int2  texel_coords = int2(screen_size * hit.xy * FrameBuffer::DynamicResolutionParams1.xy);
-    float surface_z    = SSRT_LoadDepth(texel_coords / 2, 1);
-// #if SSRT_OPTION_INVERTED_DEPTH
-//     if (surface_z == 0.0)
-//     {
-// #else
-//     if (surface_z == 1.0)
-//     {
-// #endif
-//         return 0;
-//     }
+    int2  texel_coords = int2(screen_size * hit.xy * SSRT_DEPTH_COORD_SCALE);
+#if defined(SSRT_SPECULAR)
+    // (audit #3s, specular only) mip 0 is the true per-pixel depth. Reading the 2x2 min
+    // of mip 1 measures the surface's own depth gradient rather than the ray/surface
+    // separation, and on a grazing surface that error alone (~9 game units at 1920 px,
+    // z = 1000, 80 deg incidence) exceeds the default 5-15 unit thickness and drives
+    // confidence to ~0.1 or below. The diffuse permutation deliberately keeps the mip 1
+    // read: correcting it there would change hit rates over the whole ground plane and
+    // with them the look the user currently relies on.
+    float surface_z = SSRT_LoadDepth(texel_coords, 0);
+#else
+    float surface_z = SSRT_LoadDepth(texel_coords / 2, 1);
+#endif
+
+    // (audit #6) Restored from the author's own fix in e59b35a75. Without it a ray that
+    // stops on a background texel is validated against an equally-far surface depth,
+    // yielding distance ~= 0 and confidence ~= 1 -- so sky/background colour is sampled
+    // as a real hit, while GetNormalRoughness() below reads the cleared normal G-buffer
+    // and turns the back-face test into a coin flip. The visible result is flickering
+    // sky-coloured light leaks. The threshold is 1e-4 rather than an equality test
+    // because the diffuse path reads the 2x2 min of mip 1.
+    static const float SKY_DEPTH_THRESHOLD = 1e-4;
+#if SSRT_OPTION_INVERTED_DEPTH
+    if (surface_z < SKY_DEPTH_THRESHOLD)
+#else
+    if (surface_z > (1.0 - SKY_DEPTH_THRESHOLD))
+#endif
+    {
+        // Leaves occlusion at 1 (no occlusion), so the ray falls through to the cubemap
+        // fallback unattenuated rather than being darkened.
+        return 0;
+    }
 
     float3 view_space_surface = SSRT_ScreenSpaceToViewSpace(float3(hit.xy, surface_z), eyeIndex);
     float3 view_space_hit     = SSRT_ScreenSpaceToViewSpace(hit, eyeIndex);
@@ -476,7 +531,13 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
                                                 uint3 groupThreadID : SV_GroupThreadID,
                                                 uint3 DTid : SV_DispatchThreadID)
 {
+    // (audit #7s) See SSRT_DEPTH_COORD_SCALE: specular traverses a render-resolution
+    // cell grid, diffuse keeps the legacy full-resolution grid plus per-fetch rescale.
+#if defined(SSRT_SPECULAR)
+    uint2 screen_size = uint2(SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy);
+#else
     uint2 screen_size = SharedData::BufferDim.xy;
+#endif
     uint2 coords = DTid.xy;
 #if defined(SSRT_SPECULAR)
     uint sample_id = 0;
@@ -522,7 +583,7 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     bool is_mirror = IsMirrorReflection(roughness);
     int most_detailed_mip = HIZ_MIN_MIP;
     float2 mip_resolution = SSRT_GetMipResolution(screen_size, most_detailed_mip);
-    float z = SSRT_LoadDepth(uv * mip_resolution * FrameBuffer::DynamicResolutionParams1.xy, most_detailed_mip);
+    float z = SSRT_LoadDepth(uv * mip_resolution * SSRT_DEPTH_COORD_SCALE, most_detailed_mip);  // (audit #7s)
     float3 screen_uv_space_ray_origin = float3(uv, z);
     float3 view_space_ray = ScreenSpaceToViewSpace(screen_uv_space_ray_origin, FrameBuffer::CameraProjInverse[eyeIndex]);
     float3 world_space_normal = normalize(mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0)).xyz);
@@ -536,7 +597,9 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     float3 world_space_reflected_direction = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(view_space_reflected_direction, 0)).xyz;
     float3 world_space_origin = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(view_space_ray, 1)).xyz;
     float world_ray_length = 0.0;
-    bool valid_ray = all(coords < int2(screen_size * FrameBuffer::DynamicResolutionParams1.xy)) && all(coords >= int2(0, 0)) && !is_far_plane;  // (audit P1)
+    // (audit #7s) screen_size * SSRT_DEPTH_COORD_SCALE is the render-resolution extent
+    // under both conventions: fullDim * ratio for diffuse, renderDim * 1 for specular.
+    bool valid_ray = all(coords < int2(screen_size * SSRT_DEPTH_COORD_SCALE)) && all(coords >= int2(0, 0)) && !is_far_plane;  // (audit P1)
 #if SHARC_UPDATE
     valid_ray = valid_ray && ShouldProcessPixel(coords.xy, SharedData::FrameCount);
 #endif
