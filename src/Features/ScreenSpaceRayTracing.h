@@ -106,6 +106,21 @@ struct ScreenSpaceRayTracing : Feature
         /// harder; the shader floors the limit at the brightest neighbour so even K = 1
         /// cannot cut into a feature two pixels wide.
         float FireflyClampSigma = 3.0f;
+        /// @brief (spec S3) Roughness at or below which a specular pixel counts as
+        /// mirror-like, letting a whole 8x8 tile of them skip the a-trous kernel. 0
+        /// disables the mechanism.
+        ///
+        /// This is not a quality trade: the specular path already scales its
+        /// edge-stopping functions by roughness (phiLuminance *= r, phiNormal /= r), and
+        /// at r = 0.05 with the default ColorPhi 0.5 / NormalPhi 512 that leaves
+        /// phiNormal = 10240 -- a tap must match the centre normal to within 0.81 degrees
+        /// to keep 1/e of its weight -- and phiLuminance = 0.025 * sigma, so a tap must
+        /// also match the centre luminance to within 2.5% of a standard deviation. Under
+        /// both conditions every non-centre tap is annihilated and the kernel returns the
+        /// centre pixel it was handed. 0.05 is where that becomes true with margin;
+        /// raising it starts skipping genuinely glossy surfaces that the filter would
+        /// still have something to say about.
+        float SpecularDenoiseRoughnessCutoff = 0.05f;
 #ifdef ENABLE_SHARC
         bool EnableSharc = false;
 #endif
@@ -150,6 +165,11 @@ struct ScreenSpaceRayTracing : Feature
         /// 0 switches the clamp and its LDS prefetch off. Took over the A-layer's pad
         /// slot, so the buffer did not grow.
         float fireflyClampSigma;
+        // --- row 2 ---
+        /// @brief (spec S3) Roughness cutoff for the specular mirror skip; 0 = off. Read
+        /// only by the SSRT_SPECULAR permutation of ssrt_spatial.hlsl.
+        float specularRoughnessCutoff;
+        float pad1[3];
     };
 
     eastl::unique_ptr<ConstantBuffer> ssrtCB;

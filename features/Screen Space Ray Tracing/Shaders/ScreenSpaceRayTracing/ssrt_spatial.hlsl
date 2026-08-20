@@ -25,6 +25,11 @@ cbuffer DenoiserCB : register(b2)
     // (spec S1) Read by ssrt_temporal.hlsl only; declared here so the two views of the
     // buffer keep matching offsets.
     float fireflyClampSigma;
+    // --- row 2 ---
+    // (spec S3) Roughness at or below which a specular pixel counts as mirror-like;
+    // 0 disables the mechanism.
+    float specularRoughnessCutoff;
+    float3 denoiserPad1;
 };
 
 // (spec A5) The 3x3 Gaussian pre-blur of the variance channel, and the switch to A/B it.
@@ -177,6 +182,37 @@ static const float kernelWeights[SSRT_SPATIAL_KERNEL_RADIUS + 1] = { 1.0, 1.0 / 
 // barrier non-uniform across the group, which is undefined behaviour.
 groupshared uint g_ssrtConvergedLanes;
 
+#if defined(SSRT_SPECULAR)
+// (spec S3) Group-wide "is this whole tile mirror-like?" vote.
+//
+// The specular path already scales its edge-stopping functions by roughness, and the two
+// scalings both diverge as roughness goes to zero:
+//     phiLuminance *= roughness;   phiNormal /= roughness;
+// A tap's weight is exp(-weightDepth - |dL| / phiLuminance) * dot(n, nP)^phiNormal, so at
+// the default ColorPhi 0.5 and NormalPhi 512:
+//   * at roughness 0.05, phiNormal = 10240, and a tap needs its normal within 0.81 deg of
+//     the centre's to keep even 1/e of its weight;
+//   * phiLuminance = 0.5 * 0.05 * sqrt(variance) = 0.025 * sigma, so a tap needs its
+//     luminance within 2.5% of one standard deviation to survive the luminance term.
+// Both conditions together mean the kernel already returns very nearly the centre pixel:
+// the centre tap has weight 1 by construction, every other tap is annihilated by one term
+// or the other, and weightSum ends up ~1 with blendedColor ~ ssrColor.rgb. Running 9 (or
+// 25) guided taps to compute a value the shader already holds is pure waste, and on a
+// mirror it is the *only* thing those taps could do that is not harmful -- the whole point
+// of the roughness scaling is that a near-delta reflection lobe must not be blurred.
+//
+// So this is not a quality/performance trade in the usual sense: it removes work whose
+// output is already, by construction, indistinguishable from the input. What it buys is
+// the water surfaces, polished metal, glass and ice of a Skyrim scene skipping the a-trous
+// chain outright.
+//
+// Same construction as A1: no wave intrinsics under cs_5_0, so a groupshared counter, and
+// only a unanimous 64 authorises the skip. Out-of-bounds and far-plane lanes count as
+// mirror-like so they cannot veto a tile they take no part in -- exactly as they count as
+// converged for A1 -- and they still take their own dedicated branches afterwards.
+groupshared uint g_ssrtMirrorLanes;
+#endif
+
 // (spec A4, re-derived for spec S2) Groupshared depth/normal tile for the a-trous taps.
 //
 // The taps of an 8x8 group overlap heavily, so their depth and normal fetches want to be
@@ -245,7 +281,7 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
 
     // (audit P1) Sky / far-plane early-out. The existing `depthCenter > 0` gate below
     // does *not* cover the far plane (sky depth is 1.0, which is > 0), so today every
-    // sky pixel pays the full 25-tap a-trous kernel. Write 0 rather than just
+    // sky pixel pays the full a-trous kernel. Write 0 rather than just
     // returning: this shader ping-pongs between two textures, so skipping the write
     // would leave the previous iteration's (or previous frame's) content behind.
     float depthCenter = inBounds ? DepthTexture[DTid.xy] : 1.0f;
@@ -253,9 +289,31 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
 
     float4 ssrColor = inBounds ? SSRColorTexture[DTid.xy] : 0.0f;
 
+#if defined(SSRT_SPECULAR)
+    // (spec S3) The centre pixel's guide, hoisted above the reduction because the mirror
+    // vote needs the roughness. Same fetch, same clamp, same values as when it sat below
+    // the early-outs -- only earlier -- so the filtered output is unaffected. Guarded on
+    // inBounds so an out-of-range lane does not issue a pointless load; the initialiser is
+    // what it would have read anyway (DecodeNormal of a zero G-buffer texel is 0, and
+    // 1 - 0 = 1 before the clamp), and such a lane returns before using either.
+    //
+    // The hoist is deliberately confined to this permutation: the diffuse one has no
+    // roughness term in its kernel and no vote to feed, so it keeps the original site and
+    // stays byte-identical.
+    float3 normalVS = 0.0f;
+    float roughness = 1.0f;
+    if (inBounds)
+        GetNormalRoughness(DTid.xy, normalVS, roughness);
+    roughness = clamp(roughness, 0.001f, 1.0f);
+#endif
+
     // ---- (spec A1) convergence reduction; no lane may leave before it completes ----
-    if (all(GTid.xy == 0))
+    if (all(GTid.xy == 0)) {
         g_ssrtConvergedLanes = 0;
+#if defined(SSRT_SPECULAR)
+        g_ssrtMirrorLanes = 0;  // (spec S3)
+#endif
+    }
     GroupMemoryBarrierWithGroupSync();
 
     // An out-of-bounds or sky lane has nothing left to filter, so it must not veto the
@@ -275,10 +333,26 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
     }
     if (laneConverged)
         InterlockedAdd(g_ssrtConvergedLanes, 1u);
+
+#if defined(SSRT_SPECULAR)
+    // (spec S3) The mirror vote rides on the same two barriers as A1's, so it costs one
+    // atomic and no extra synchronisation. The *clamped* roughness is compared, so a
+    // perfectly smooth G-buffer texel reads as 0.001 rather than 0 -- which is what the
+    // kernel itself sees, and therefore the right quantity to threshold.
+    const bool laneMirror = !inBounds || isFarPlane || roughness <= specularRoughnessCutoff;
+    if (laneMirror)
+        InterlockedAdd(g_ssrtMirrorLanes, 1u);
+#endif
     GroupMemoryBarrierWithGroupSync();
 
     const bool groupConverged = g_ssrtConvergedLanes == 64u;
-    const bool skipFilter = adaptiveFiltering != 0 && groupConverged;
+    bool skipFilter = adaptiveFiltering != 0 && groupConverged;
+#if defined(SSRT_SPECULAR)
+    // (spec S3) Folded into A1's skip so the two mechanisms share the copy path *and* the
+    // suppression of the A4 prefetch below -- a skipped group reads nothing at all.
+    // specularRoughnessCutoff == 0 leaves the whole thing inert.
+    skipFilter = skipFilter || (specularRoughnessCutoff > 0.0f && g_ssrtMirrorLanes == 64u);
+#endif
 
     // ---- (spec A4) tap guide prefetch ----
     const uint atrousStride = atrousIterations + 1;
@@ -332,10 +406,14 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
 
     float3 blendedColor = 0;
 
+#if !defined(SSRT_SPECULAR)
     float3 normalVS;
     float roughness;
     GetNormalRoughness(DTid.xy, normalVS, roughness);
     roughness = clamp(roughness, 0.001f, 1.0f);
+#endif
+    // (spec S3) The specular permutation fetched normalVS / roughness above the reduction,
+    // because its mirror vote needs the roughness before any lane may leave.
 
     float luminanceCenter = Color::RGBToLuminance(ssrColor.rgb);
 #if SSRT_SVGF_GAUSSIAN

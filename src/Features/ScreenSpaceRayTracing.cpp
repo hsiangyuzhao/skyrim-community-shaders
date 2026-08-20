@@ -40,6 +40,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AdaptiveVarianceEps,
     FireflyClamp,
     FireflyClampSigma,
+    SpecularDenoiseRoughnessCutoff,
     EnableSharc
 )
 #else
@@ -69,7 +70,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AdaptiveHistoryThreshold,
     AdaptiveVarianceEps,
     FireflyClamp,
-    FireflyClampSigma
+    FireflyClampSigma,
+    SpecularDenoiseRoughnessCutoff
 )
 #endif
 
@@ -161,6 +163,17 @@ void ScreenSpaceRayTracing::DrawSettings()
             ImGui::SliderFloat("Adaptive Variance Threshold", &settings.AdaptiveVarianceEps, 1e-6f, 1e-2f, "%.6f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
                 ImGui::Text("Luminance variance below which a pixel counts as converged. Higher values skip more tiles at the cost of residual noise.");
+        }
+
+        if (settings.EnableSpecular) {
+            ImGui::SliderFloat("Specular Mirror Cutoff", &settings.SpecularDenoiseRoughnessCutoff, 0.0f, 0.25f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text(
+                    "Roughness at or below which an 8x8 tile of specular pixels skips the A Trous "
+                    "kernel entirely. On a near-mirror the filter already discards every neighbour "
+                    "-- that is what the roughness scaling of Color Phi and Normal Phi is for -- so "
+                    "it computes the pixel it was handed. Skipping it removes the cost of water, "
+                    "glass and polished metal without changing what they look like. 0 disables.");
         }
     }
 #ifdef ENABLE_SHARC
@@ -1041,6 +1054,10 @@ ScreenSpaceRayTracing::DenoiserCB ScreenSpaceRayTracing::GetDenoiserCBData() con
     // shader tests, so ssrt_temporal.hlsl needs a single group-uniform predicate rather
     // than two.
     data.fireflyClampSigma = settings.FireflyClamp ? settings.FireflyClampSigma : 0.0f;
+    // (spec S3) Only the SSRT_SPECULAR permutation reads this, so DrawSSRTDiffuse simply
+    // passes a value nothing looks at.
+    data.specularRoughnessCutoff = settings.SpecularDenoiseRoughnessCutoff;
+    data.pad1[0] = data.pad1[1] = data.pad1[2] = 0.0f;
     return data;
 }
 
