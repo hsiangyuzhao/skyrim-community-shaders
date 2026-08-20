@@ -147,9 +147,15 @@ namespace EnvironmentAmbient
 	// SSGI already applied at their own scales.
 	////////////////////////////////////////////////////////////////////////////////////////////////
 
-	static const uint ContactSamples = 6;    // <= 8 depth Loads, unrolled
+	// The pixel-radius ceiling was the binding constraint, not the world radius: at 1080p the
+	// 15 cm default only fits inside 32 px beyond about 4.5 m, so at the 1-3 m range where a
+	// strand actually meets a cheek the search was clamped down to an effective 5-10 cm and the
+	// term under-read exactly where it matters most. 64 px moves the clamp out to roughly 9 m,
+	// and the tap count goes up with it so the larger disk is still covered densely enough to
+	// stay temporally stable.
+	static const uint ContactSamples = 10;
 	static const float MinContactPixels = 2.0;
-	static const float MaxContactPixels = 32.0;
+	static const float MaxContactPixels = 64.0;
 	static const float ContactBias = 0.1;
 
 	// Same reconstruction the caller uses for its own pixel (DeferredCompositeCS.hlsl:115-131), so
@@ -234,9 +240,14 @@ namespace EnvironmentAmbient
 			occlusion += saturate(cosine - ContactBias) * falloff * valid;
 		}
 
-		// 2/N normalises a roughly half-occluded neighbourhood towards full occlusion at strength 1,
-		// which puts a 90-degree corner near 0.2 and tight contact such as hair on skin near 0.5.
-		occlusion *= SharedData::envAmbientSettings.ContactStrength * (2.0 / float(ContactSamples));
+		// The old 2/N put a 90-degree corner near 0.2 occlusion and a tight contact such as hair on
+		// skin near 0.5 at strength 1, so the term topped out around half visibility where the
+		// SSRT fallback it stands in for went to zero - strength was the only way to reach full
+		// absorption, and 2.0 was barely enough. 4/N makes strength 1 land on full occlusion at
+		// tight contact and near 0.4 at a right-angle corner, which leaves the slider's upper half
+		// as genuine headroom rather than as the working range. Halve ContactStrength to recover
+		// the previous levels exactly.
+		occlusion *= SharedData::envAmbientSettings.ContactStrength * (4.0 / float(ContactSamples));
 
 		return saturate(1.0 - occlusion);
 	}
