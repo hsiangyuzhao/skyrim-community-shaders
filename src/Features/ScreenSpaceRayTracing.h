@@ -174,17 +174,44 @@ struct ScreenSpaceRayTracing : Feature
         /// converged. The default matches MaxAccumulatedFrames: at that point the
         /// temporal blend weight has reached its floor, so the pixel is in steady state.
         uint AdaptiveHistoryThreshold = 16;
-        /// @brief (spec A1) Variance below which a pixel counts as converged.
+        /// @brief (spec A1, re-derived for BUG-2) Relative variance below which a pixel
+        /// counts as converged -- a squared coefficient of variation, not an absolute
+        /// luminance-squared threshold.
         ///
-        /// The quantity in the .w channel of the denoiser ping-pong is a variance of
-        /// scene luminance (ssrt_temporal.hlsl: moment.y - moment.x^2 over
-        /// Color::RGBToLuminance of the linear radiance), so it has units of luminance
-        /// squared and is resolution independent. 1e-4 is a standard deviation of 0.01,
-        /// i.e. 1% of a mid-grey surface -- below the point where the a-trous kernel's
-        /// own luminance term (phiLuminance = ColorPhi * sqrt(variance)) can still
-        /// distinguish signal from noise. Deliberately conservative: raising it trades
-        /// residual noise for more skipped tiles.
-        float AdaptiveVarianceEps = 1e-4f;
+        /// ssrt_spatial.hlsl compares `.w < AdaptiveVarianceEps * L^2`, where L is the
+        /// local mean luminance (floored at SSRT_ADAPTIVE_LUM_FLOOR for near-black).
+        ///
+        /// Why relative. Monte-Carlo radiance noise is multiplicative: for a fixed sample
+        /// count sigma scales with the mean, so an absolute threshold selects on how
+        /// *bright* a pixel is and not on how *noisy* it is. The old absolute 1e-4 was
+        /// therefore a darkness gate. Before BUG-1 the .w channel held roughly
+        /// 0.0285 * mean^2 + 0.0294 * sigma^2, and at the 2-spp diffuse default (sigma
+        /// about 1.4 * mean) that is 0.0861 * mean^2, so `< 1e-4` reduced to
+        /// `mean < 0.034`. Fixing BUG-1 does not rescue the absolute form -- with a true
+        /// sigma^2 it becomes `mean < 0.0071`, stricter still -- so the criterion needed
+        /// re-deriving rather than re-defaulting.
+        ///
+        /// Where 1.3e-2 comes from. Post-BUG-1 the .w channel at a-trous iteration 0 is
+        /// the variance of the *per-frame samples* entering the accumulation, sigma_s^2,
+        /// which is what SVGF prescribes for the edge-stop. The noise a player actually
+        /// sees is the residual in the accumulated output, and for an EMA with weight
+        /// alpha = 1 / (MaxAccumulatedFrames + 1) that is sigma_s^2 * alpha / (2 - alpha).
+        /// At the default 16, alpha = 1/17 and the factor is 0.0303, i.e.
+        /// sigma_out = 0.174 * sigma_s. Taking a 2% residual coefficient of variation as
+        /// the visibility line (at or below the Weber limit for a noise pattern, and the
+        /// SSRT term is further attenuated by albedo in the composite) gives
+        /// sigma_s / L <= 0.02 / 0.174 = 0.115, hence a squared CoV of 1.3e-2.
+        ///
+        /// The derivation is alpha dependent and deliberately not coupled to
+        /// MaxAccumulatedFrames: a longer accumulation window makes this default
+        /// conservative (it would tolerate more per-frame variance for the same output
+        /// noise), a shorter one makes it slightly optimistic.
+        ///
+        /// Migration note: a saved value from the old absolute band (1e-6..1e-2) reads as
+        /// a very tight relative threshold, so A1 simply fires less often. That is a
+        /// performance regression, never a visual one -- the failure direction is "filters
+        /// more than it needs to".
+        float AdaptiveVarianceEps = 1.3e-2f;
         /// @brief (spec S1) Clamp outlier radiance against its 3x3 neighbourhood before
         /// the temporal accumulation consumes it. On by default: it is what makes the
         /// A2 iteration default safe, because a spike that survives into the a-trous

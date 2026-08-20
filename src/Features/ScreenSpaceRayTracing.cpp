@@ -187,9 +187,17 @@ void ScreenSpaceRayTracing::DrawSettings()
             ImGui::SliderInt("Adaptive History Threshold", (int*)&settings.AdaptiveHistoryThreshold, 4, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
                 ImGui::Text("Accumulated frames a pixel needs before it may count as converged. Matching Max Accumulated Frames is a good default.");
-            ImGui::SliderFloat("Adaptive Variance Threshold", &settings.AdaptiveVarianceEps, 1e-6f, 1e-2f, "%.6f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SliderFloat("Adaptive Variance Threshold (relative)", &settings.AdaptiveVarianceEps, 1e-4f, 1.0f, "%.5f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
-                ImGui::Text("Luminance variance below which a pixel counts as converged. Higher values skip more tiles at the cost of residual noise.");
+                ImGui::Text(
+                    "Relative luminance variance below which a pixel counts as converged, "
+                    "measured against the pixel's own brightness (a squared coefficient of "
+                    "variation). The default 0.013 is a per-frame noise level of about 11%% "
+                    "of local brightness, which the temporal accumulation reduces to about "
+                    "2%% in the image -- the point where it stops being visible. Higher "
+                    "values skip more tiles at the cost of residual noise. Measuring this "
+                    "relative to brightness rather than absolutely is what keeps it a "
+                    "convergence test instead of a \"is this pixel dark\" test.");
         }
 
         if (settings.EnableSpecular) {

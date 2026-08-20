@@ -152,6 +152,18 @@ static const float kernelWeights[SSRT_SPATIAL_KERNEL_RADIUS + 1] = { 1.0, 1.0 / 
 
 #define VAR_EPSILON 0.00001f
 
+// (BUG-2) Reference-luminance floor for A1's *relative* convergence test below.
+//
+// A pure relative test asks for sigma^2 < eps * L^2, which demands sigma^2 -> 0 as the
+// pixel goes black and would therefore make near-black tiles never skip -- the exact
+// inverse of the darkness gate it replaces. Floor the reference luminance instead: below
+// 1% of a mid-grey linear radiance the SSRT term contributes less than 1% of a surface's
+// indirect light, and its noise is invisible at any relative level. At the default
+// AdaptiveVarianceEps this puts an effective absolute floor of 1.3e-2 * 1e-4 = 1.3e-6 on
+// the threshold (sigma 1.1e-3) -- 75x *below* the old absolute 1e-4, so it acts as a floor
+// and not as a gate.
+#define SSRT_ADAPTIVE_LUM_FLOOR 0.01f
+
 // (spec A1) Group-wide convergence vote.
 //
 // This pipeline compiles as cs_5_0 through fxc, which has no wave intrinsics, so the
@@ -292,6 +304,13 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
 
     float4 ssrColor = inBounds ? SSRColorTexture[DTid.xy] : 0.0f;
 
+    // (BUG-2) Hoisted above the A1 reduction, which needs it as the reference for the
+    // relative convergence test. It used to be computed just before the tap loop; the
+    // value is identical (same texel, same function), so for a filtering lane this is a
+    // pure move and a skipping lane pays one extra dot product. An out-of-bounds lane sees
+    // ssrColor 0 and hence luminance 0, which the floor below covers.
+    float luminanceCenter = Color::RGBToLuminance(ssrColor.rgb);
+
 #if defined(SSRT_SPECULAR)
     // (spec S3) The centre pixel's guide, hoisted above the reduction because the mirror
     // vote needs the roughness. Same fetch, same clamp, same values as when it sat below
@@ -329,10 +348,32 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
         // invMaxAccumulatedFrames, i.e. the pixel is in steady state -- which is exactly
         // why the default threshold equals the default MaxAccumulatedFrames.
         const float accumFrames = MomentsTexture[DTid.xy].z;
-        // .w is the per-pixel variance the ping-pong carries (audit #11 made it real);
-        // it shrinks with every a-trous iteration, so a tile that is not quiet enough to
-        // skip iteration 0 may still skip iteration 1 or 2.
-        laneConverged = accumFrames >= adaptiveHistoryThreshold && ssrColor.w < adaptiveVarianceEps;
+        // .w is the per-pixel variance the ping-pong carries (audit #11 made it real,
+        // BUG-1 made it correctly *scaled*); it shrinks with every a-trous iteration, so a
+        // tile that is not quiet enough to skip iteration 0 may still skip iteration 1 or 2.
+        //
+        // (BUG-2) The test is now RELATIVE: adaptiveVarianceEps is a squared coefficient of
+        // variation, compared against the local mean luminance squared, rather than an
+        // absolute luminance-squared threshold.
+        //
+        // The old absolute form was a darkness gate rather than a convergence test.
+        // Monte-Carlo radiance noise is multiplicative -- sigma scales with the mean for a
+        // given sample count -- so an absolute threshold selects on brightness, not on how
+        // noisy a pixel is. Concretely, before BUG-1 the channel held roughly
+        // 0.0285 * mean^2 + 0.0294 * sigma^2, and at the 2-spp diffuse default (sigma about
+        // 1.4 * mean) that is 0.0861 * mean^2, so `< 1e-4` reduced to `mean < 0.034`: A1
+        // fired on dark pixels and only on dark pixels, regardless of their noise. Fixing
+        // BUG-1 does not rescue the absolute form -- it makes it stricter still
+        // (sigma^2 < 1e-4 with sigma = 1.4 * mean is mean < 0.0071) -- so the criterion had
+        // to be re-derived, not just re-defaulted.
+        //
+        // The relative form costs one multiply and one max on top of a luminance that the
+        // shader already needed, so it is the cheap option as well as the correct one. It
+        // preserves both halves of A1's contract: a converged *and* quiet tile skips, and a
+        // tile whose relative noise is still above the line keeps filtering at every
+        // iteration until the chain has brought .w down.
+        const float lumRef = max(luminanceCenter, SSRT_ADAPTIVE_LUM_FLOOR);
+        laneConverged = accumFrames >= adaptiveHistoryThreshold && ssrColor.w < adaptiveVarianceEps * lumRef * lumRef;
     }
     if (laneConverged)
         InterlockedAdd(g_ssrtConvergedLanes, 1u);
@@ -418,7 +459,7 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
     // (spec S3) The specular permutation fetched normalVS / roughness above the reduction,
     // because its mirror vote needs the roughness before any lane may leave.
 
-    float luminanceCenter = Color::RGBToLuminance(ssrColor.rgb);
+    // (BUG-2) luminanceCenter is computed above the A1 reduction, which needs it.
 #if SSRT_SVGF_GAUSSIAN
     float variance = GaussianBlur(DTid.xy);
 #else
