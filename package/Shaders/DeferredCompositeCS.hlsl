@@ -41,12 +41,12 @@ Texture2D<float4> SsgiSpecularTexture : register(t13);
 
 void SampleSSGI(uint2 pixCoord, float3 normalWS, out float ao, out float3 il)
 {
-	ao = 1 - SsgiAoTexture[pixCoord];
+	ao = 1 - SsgiAoTexture[pixCoord].x;
 	float4 ssgiIlYSh = SsgiYTexture[pixCoord];
 	// without ZH hallucination
 	// float ssgiIlY = SphericalHarmonics::FuncProductIntegral(ssgiIlYSh, SphericalHarmonics::EvaluateCosineLobe(normalWS));
 	float ssgiIlY = SphericalHarmonics::SHHallucinateZH3Irradiance(ssgiIlYSh, normalWS);
-	float2 ssgiIlCoCg = SsgiCoCgTexture[pixCoord];
+	float2 ssgiIlCoCg = SsgiCoCgTexture[pixCoord].xy;
 	il = max(0, Color::YCoCgToRGB(float3(ssgiIlY, ssgiIlCoCg)));
 }
 
@@ -264,15 +264,6 @@ Texture2D<float4> SSRTexture : register(t16);
 
 	float3 linAlbedo = Color::IrradianceToLinear(albedo / Color::PBRLightingScale);
 
-#	if defined(SSGI)
-	// Indirect lighting albedo must keep the upstream (2ea3b3adc) calibration, which divided
-	// albedo by the then-unconditional PBRLightingScale of 0.65 to compensate for lowering the
-	// default GIStrength from 1.5 to 1.0. PBRLightingScale is now 1.0 under Linear Lighting, so
-	// reusing it here silently darkened SSGI IL by 1/0.65 (~1.54x) in every LL configuration.
-	// Use the literal 0.65 so IL magnitude is identical with and without Linear Lighting.
-	// The AO path above intentionally keeps Color::PBRLightingScale (behaviour unchanged).
-	float3 linAlbedoIl = Color::IrradianceToLinear(albedo / 0.65);
-#	endif
 
 #	if defined(ENV_AMBIENT)
 	// Environment Ambient replaces the ambient term that was just separated out of MAIN, so it can
@@ -403,7 +394,15 @@ Texture2D<float4> SSRTexture : register(t16);
 #	endif
 
 #	if defined(SSGI)
-	linDiffuseColor += ssgiIl * linAlbedoIl;
+	// ssgiIl is now analytically normalised diffuse illumination divided by PI (see
+	// ScreenSpaceGI/gi.cs.hlsl), so the term it wants is exactly one true reflectance. `linAlbedo`
+	// is that: the G-buffer stores TRUE_PBR albedo pre-multiplied by PBRLightingScale
+	// (Lighting.hlsl:3601, `indirectDiffuseLobeWeight *= Color::PBRLightingScale`, then :3612
+	// writes it out), so dividing by PBRLightingScale is the correct de-scale and is the same
+	// term the AO path uses. The separate 1/0.65 that used to sit here was never an albedo
+	// de-scale - it was upstream's (2ea3b3adc) energy fudge for lowering the default GIStrength
+	// from 1.5 to 1.0, and with the integrator normalised it has nothing left to compensate for.
+	linDiffuseColor += ssgiIl * linAlbedo;
 #	endif
 #endif
 
