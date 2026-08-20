@@ -376,6 +376,11 @@ namespace SharedData
 		uint ApplyAO;
 		uint EnableInterior;
 		uint LinearComposite;
+
+		uint EnclosureFallback;
+		float HueFalloff;
+		float pad0;
+		float pad1;
 	};
 
 	cbuffer FeatureData : register(b6)

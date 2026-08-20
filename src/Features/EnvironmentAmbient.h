@@ -68,6 +68,11 @@ struct EnvironmentAmbient : Feature
 		uint ApplyAO = 1;                // 36
 		uint EnableInterior = 0;         // 40
 		uint LinearComposite = 1;        // 44
+
+		uint EnclosureFallback = 1;      // 48
+		float HueFalloff = 1.0f;         // 52
+		float pad0 = 0.0f;               // 56
+		float pad1 = 0.0f;               // 60
 	} settings;
-	static_assert(sizeof(Settings) == 48, "EnvironmentAmbient::Settings must stay 48 bytes (3 constant buffer rows).");
+	static_assert(sizeof(Settings) == 64, "EnvironmentAmbient::Settings must stay 64 bytes (4 constant buffer rows).");
 };
