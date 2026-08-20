@@ -184,13 +184,19 @@ void CalculateGI(
 
 				float sampleOffsetLength = length(sampleOffset);
 				float mipLevel = clamp(log2(sampleOffsetLength) - 3.3, 0, 5);
+				// The radiance mip floor is one level below the depth/AO mip floor: the radiance
+				// pyramid is already built at the GI working resolution, so an extra forced level
+				// made half-res radiance effectively 1/8 x 1/8 of full res. Combined with blur,
+				// temporal accumulation and upsampling that flattened indirect light into a
+				// spatially uniform haze with no colour locality. Depth sampling (mipLevel) keeps
+				// its original floors.
 				float mipLevelRadiance = mipLevel;
 #if defined(HALF_RES)
 				mipLevel = max(mipLevel, 1);
-				mipLevelRadiance = max(mipLevelRadiance, 2);
+				mipLevelRadiance = max(mipLevelRadiance, 1);
 #elif defined(QUARTER_RES)
 				mipLevel = max(mipLevel, 2);
-				mipLevelRadiance = max(mipLevelRadiance, 3);
+				mipLevelRadiance = max(mipLevelRadiance, 2);
 #else
 				mipLevelRadiance = max(mipLevelRadiance, 1);
 #endif
