@@ -461,6 +461,26 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     float2 uv = float2(coords.xy + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
     uint eyeIndex = Stereo::GetEyeIndexFromTexCoord(uv);
 
+    // (audit P1) Sky / far-plane early-out.
+    // Nothing computed for a far-plane pixel can reach the frame: the diffuse
+    // composite multiplies the SSRT result by the albedo G-buffer, which is cleared
+    // to 0 wherever no deferred geometry was rasterised (Sky.hlsl writes colour /
+    // motion vectors / normals only), and the specular path is consumed through the
+    // same albedo-gated deferred composite. Today those pixels still run the full
+    // 128-step Hi-Z traversal plus the cubemap + skylighting fallback on a garbage
+    // normal, and (because `occlusion` defaults to 1 whenever the ray leaves the
+    // screen) frequently emit *full* cubemap radiance with confidence 1 -- which the
+    // SVGF spatial filter then bleeds onto the geometry along sky silhouettes.
+    // Folding this into `valid_ray` skips the traversal and the fallback and writes a
+    // plain 0 instead.
+    // NOTE: deliberately *not* an early `return`. The diffuse permutation
+    // synchronises `samples[]` across the SAMPLES_PER_PIXEL thread-group z-slices with
+    // GroupMemoryBarrierWithGroupSync(); bailing out of a subset of the group's
+    // (x, y) lanes would make that barrier non-uniform. Writing 0 (instead of leaving
+    // the target untouched) also keeps the ping-pong denoiser textures deterministic.
+    float depth = DepthTexture[coords.xy].x;
+    const bool is_far_plane = SSRT_IS_FAR_PLANE(depth);
+
     float3 normalVS;
     float roughness;
     GetNormalRoughness(coords.xy, normalVS, roughness);
@@ -487,7 +507,7 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     float3 world_space_reflected_direction = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(view_space_reflected_direction, 0)).xyz;
     float3 world_space_origin = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(view_space_ray, 1)).xyz;
     float world_ray_length = 0.0;
-    bool valid_ray = all(coords < int2(screen_size * FrameBuffer::DynamicResolutionParams1.xy)) && all(coords >= int2(0, 0));
+    bool valid_ray = all(coords < int2(screen_size * FrameBuffer::DynamicResolutionParams1.xy)) && all(coords >= int2(0, 0)) && !is_far_plane;  // (audit P1)
 #if SHARC_UPDATE
     valid_ray = valid_ray && ShouldProcessPixel(coords.xy, SharedData::FrameCount);
 #endif
@@ -497,7 +517,6 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     float3 world_space_hit = float3(0.0, 0.0, 0.0);
     float3 world_space_ray = float3(0.0, 0.0, 0.0);
 
-    float depth = DepthTexture[coords.xy].x;
     float4 positionWS = float4(2 * float2(uv.x, -uv.y + 1) - 1, depth, 1);
 	positionWS = mul(FrameBuffer::CameraViewProjInverse[eyeIndex], positionWS);
 	positionWS.xyz = positionWS.xyz / positionWS.w;

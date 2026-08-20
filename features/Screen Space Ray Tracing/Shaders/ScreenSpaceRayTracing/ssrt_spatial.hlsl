@@ -58,10 +58,20 @@ static const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
 
     float2 uv = float2(DTid.xy + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
 
+    // (audit P1) Sky / far-plane early-out. The existing `depthCenter > 0` gate below
+    // does *not* cover the far plane (sky depth is 1.0, which is > 0), so today every
+    // sky pixel pays the full 25-tap a-trous kernel. Write 0 rather than just
+    // returning: this shader ping-pongs between two textures, so skipping the write
+    // would leave the previous iteration's (or previous frame's) content behind.
+    float depthCenter = DepthTexture[DTid.xy];
+    if (SSRT_IS_FAR_PLANE(depthCenter)) {
+        FilteredOutput[DTid.xy] = 0.0;
+        return;
+    }
+
     float3 blendedColor = 0;
     float4 historyColor = HistoryTexture[DTid.xy];
     float4 ssrColor = SSRColorTexture[DTid.xy];
-    float depthCenter = DepthTexture[DTid.xy];
 
     float3 normalVS;
     float roughness;

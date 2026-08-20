@@ -23,9 +23,16 @@ cbuffer DenoiserCB : register(b2)
 
     float2 uv = float2(DTid.xy + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
 
+    // (audit P1) Sky / far-plane early-out -- the 49-tap refinement below is pure waste
+    // on background pixels, whose SSRT result can never reach the frame.
+    float depthCenter = DepthTexture[DTid.xy];
+    if (SSRT_IS_FAR_PLANE(depthCenter)) {
+        VarianceOutput[DTid.xy] = 0.0;
+        return;
+    }
+
     float4 ssrColor = SSRColorTexture[DTid.xy];
     float3 blendedColor = ssrColor.xyz;
-    float depthCenter = DepthTexture[DTid.xy];
     VarianceOutput[DTid.xy] = ssrColor;
 
     float history = MomentsTexture[DTid.xy].z;

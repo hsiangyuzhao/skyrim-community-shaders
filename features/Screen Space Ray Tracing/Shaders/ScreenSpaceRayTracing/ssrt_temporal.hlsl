@@ -46,9 +46,19 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
     float2 uv = float2(DTid.xy + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
     uint eyeIndex = Stereo::GetEyeIndexFromTexCoord(uv);
 
+    // (audit P1) Sky / far-plane early-out -- skips reprojection plus up to 13 history
+    // probes. Both targets are written (rather than left alone) so the history and
+    // moments textures stay deterministic on background pixels; a zero frame count
+    // also means a pixel that later becomes geometry restarts accumulation cleanly.
+    float depthCenter = DepthTexture[DTid.xy];
+    if (SSRT_IS_FAR_PLANE(depthCenter)) {
+        FilteredOutput[DTid.xy] = 0.0;
+        MomentsOutput[DTid.xy] = 0.0;
+        return;
+    }
+
     float3 blendedColor = 0;
     float4 ssrColor = SSRColorTexture[DTid.xy];
-    float depthCenter = DepthTexture[DTid.xy];
 
     float3 normalVS;
     float roughness;

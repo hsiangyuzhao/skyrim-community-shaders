@@ -10,6 +10,16 @@
 #define Pow2(x) ((x) * (x))
 #define SSRT_FLOAT_MAX	3.402823466e+38
 
+// The engine depth buffer is *not* inverted: 0 = near plane, 1 = far plane.
+// (Confirmed by SharedData::GetScreenDepth, SharedData.hlsli:403 --
+// `CameraData.w / (-depth * CameraData.z + CameraData.x)` grows with depth.)
+// Anything at (very nearly) 1.0 is sky / background: no deferred geometry was
+// rasterised there, so the normal-roughness and albedo G-buffers hold cleared
+// garbage and nothing we compute for those pixels can reach the frame.
+// Threshold matches the existing far-plane guard inside the Hi-Z traversal.
+#define SSRT_FAR_PLANE_EPSILON 1.0e-6f
+#define SSRT_IS_FAR_PLANE(z) ((z) >= 1.0f - SSRT_FAR_PLANE_EPSILON)
+
 Texture2D<unorm float3> NormalRoughnessTexture : register(t2);
 
 SamplerState LinearSampler : register(s0);
