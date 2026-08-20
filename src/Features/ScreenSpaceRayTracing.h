@@ -49,7 +49,16 @@ struct ScreenSpaceRayTracing : Feature
     struct Settings
     {
         bool EnableSpecular = true;
+        /// @brief (spec F5) Reviewed against the repaired traversal, left at 128.
+        /// The render-resolution grid unification means a step is now a whole render
+        /// texel instead of s ~= 0.667 of one, so the same 128 steps reach ~1.5x further
+        /// under DLSS Quality than they did -- the budget was previously being spent
+        /// re-testing texels, not travelling. Lowering it is a performance question and
+        /// belongs to the performance work, not here.
         uint MaxSteps = 128;
+        /// @brief (spec F5) Reviewed, left at 6. Independent of the grid convention: it
+        /// indexes pyramid levels, and freewins already clamped the slider to
+        /// maxMips - 1 so the traversal cannot request a level that does not exist.
         uint MaxMips = 6;
         /// @brief (spec F1 / audit #3) Depth-buffer thickness, in *game units*, used by
         /// SSRT_ValidateHit as the range over which a hit's distance behind the validated
@@ -82,6 +91,17 @@ struct ScreenSpaceRayTracing : Feature
         /// reflections elongating behind silhouettes by up to that distance. The slider
         /// (0-500) is there if it reads as smearing.
         float Thickness = 30.f;
+        /// @brief (spec F5) Reviewed against the repaired offset, left at 0.1.
+        ///
+        /// The F2 change is deliberately a no-op at near-normal incidence -- the bias
+        /// direction normalize(N - D) equals N there and the 1 / max(|N.D|, 0.1) factor is
+        /// 1 -- so 0.1 still means what it meant, ~1.4 game units at z = 1000. Only
+        /// grazing incidence sees more (up to 10x), which is the fix.
+        ///
+        /// Keeping it small matters for the contact regions: the offset also pushes the
+        /// origin off its own surface, so an over-large bias is what makes a ray *miss*
+        /// nearby hair or foliage. Anyone who finds contact darkening weaker than before
+        /// should reach for this slider downwards, not upwards.
         float NormalBias = 0.1f;
         float BRDFBias = 0.25f;
         bool UseDynamicCubemapsAsFallback = true;
@@ -91,6 +111,13 @@ struct ScreenSpaceRayTracing : Feature
         float SpecularMult = 1.0f;
         float DiffuseMult = 1.0f;
         float AmbientMult = 0.0f;
+        /// @brief (spec F5) Reviewed against the corrected occlusion semantics, left at
+        /// 1.0. It now scales occlusion that comes only from back-face hits -- the one
+        /// case where the ray demonstrably entered geometry -- instead of also scaling
+        /// the self-intersection failures that used to multiply the cubemap fallback to
+        /// black (audit #5). Full strength on a source that is now meaningful is the
+        /// right default, and it keeps as much of the contact darkening as the corrected
+        /// mechanism can supply.
         float OcclusionStrength = 1.0f;
         float CubemapNormalization = 0.0f;
         bool EnableSVGF = false;

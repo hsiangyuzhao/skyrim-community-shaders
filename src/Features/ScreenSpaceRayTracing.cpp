@@ -86,6 +86,11 @@ void ScreenSpaceRayTracing::DrawSettings()
     ImGui::SliderFloat("Specular Multiplier", &settings.SpecularMult, 0.0f, 5.0f, "%.2f");
     ImGui::SliderFloat("Diffuse Multiplier", &settings.DiffuseMult, 0.01f, 5.0f, "%.2f");
     ImGui::SliderFloat("Occlusion Strength", &settings.OcclusionStrength, 0.0f, 1.0f, "%.2f");
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "How strongly a ray that ran into the back of geometry darkens the fallback "
+            "ambient for that pixel. Rays that simply failed to trace no longer count "
+            "towards this.");
     ImGui::SliderFloat("Ambient Multiplier", &settings.AmbientMult, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Mix diffuse with vanilla ambient color. Not suggested if using dynamic cubemaps as fallback.");
@@ -105,7 +110,11 @@ void ScreenSpaceRayTracing::DrawSettings()
             "reflections stretch behind silhouettes. The shader adds roughness * 10.");
     ImGui::SliderFloat("Normal Bias", &settings.NormalBias, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text("To avoid false hits from nearby geometry, increase this value to push the ray origin along the normal.");
+        ImGui::Text(
+            "Pushes the ray origin off its own surface to avoid false self-hits, scaled "
+            "with distance and with the grazing angle. Raising it also makes rays miss "
+            "genuinely nearby geometry, so contact shading around hair and foliage gets "
+            "weaker as this goes up.");
     ImGui::SliderFloat("BRDF Bias", &settings.BRDFBias, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Specular only. Higher BRDF bias reduces noise but makes reflections more glossy.");
