@@ -70,7 +70,10 @@ public:
 		float MinScreenRadius = 0.01f;
 		float AORadius = 256.f;
 		float GIRadius = 256.f;
-		float Thickness = 32.f;
+		// Fraction of view depth, not world units: gi.cs.hlsl scales it by viewspaceZ so the
+		// occluder thickness is a constant angular size. 0.1 matches upstream's default and is
+		// the old 32-unit default at ~320 units of depth.
+		float Thickness = 0.1f;
 		float2 DepthFadeRange = { 4e4, 5e4 };
 		// gi
 		float GISaturation = 0.8f;

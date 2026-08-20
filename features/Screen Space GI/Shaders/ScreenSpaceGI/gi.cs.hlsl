@@ -381,28 +381,45 @@ void CalculateGI(
 				float3 sampleDelta = samplePos - pixCenterPos;
 				float3 sampleHorizonVec = normalize(sampleDelta);
 
-				float3 sampleBackPos = samplePos - viewVec * Thickness;
+				// Occluder thickness scales with view depth (build-0816 diffuseGI.cs.hlsl:331). An
+				// absolute world thickness is the wrong unit for a screen-space trace: the same setting
+				// covers a whole wall up close and less than a texel at range, so the back horizon - and
+				// with it how many bits a sample claims - drifted with distance. Scaling by viewspaceZ
+				// makes it a constant angular thickness instead. Thickness is now a ratio, not units.
+				float3 sampleBackPos = samplePos - viewVec * Thickness * viewspaceZ;
 				float3 sampleBackHorizonVec = normalize(sampleBackPos - pixCenterPos);
 
 				float angleFront = FastMath::ACos(dot(sampleHorizonVec, viewVec));  // either clamp or use float version for whatever reason
 				float angleBack = FastMath::ACos(dot(sampleBackHorizonVec, viewVec));
 				float2 angleRange = -sideSign * (sideSign == -1 ? float2(angleFront, angleBack) : float2(angleBack, angleFront));
 				// The math: https://www.desmos.com/calculator/je4y5ved2j
-				// Using smoothstep for cos: https://discord.com/channels/586242553746030596/586245736413528082/1102228968247144570
-				angleRange = smoothstep(0, 1, (angleRange + n) * RCP_PI + .5);
+				float2 angleRangeNorm = (angleRange + n) * RCP_PI + .5;
 
-				uint2 bitsRange = uint2(round(angleRange.x * 32u), round((angleRange.y - angleRange.x) * 32u));
+				// Using smoothstep for cos: https://discord.com/channels/586242553746030596/586245736413528082/1102228968247144570
+				float2 angleRangeAO = smoothstep(0, 1, angleRangeNorm);
+
+				uint2 bitsRange = uint2(round(angleRangeAO.x * 32u), round((angleRangeAO.y - angleRangeAO.x) * 32u));
 				uint maskedBits = s < AORadius ? ((1 << bitsRange.y) - 1) << bitsRange.x : 0;
 
 #ifdef GI
-				float3 sampleBackPosGI = samplePos - viewVec * 300;
-				float3 sampleBackHorizonVecGI = normalize(sampleBackPosGI - pixCenterPos);
-				float angleBackGI = FastMath::ACos(dot(sampleBackHorizonVecGI, viewVec));
-				float2 angleRangeGI = -sideSign * (sideSign == -1 ? float2(angleFront, angleBackGI) : float2(angleBackGI, angleFront));
-
+				// IL shares the AO thickness now; the separate 300-unit GI thickness is gone.
+				//
+				// That constant existed to let one sample's back horizon reach far behind the surface, so
+				// the hemisphere would fill up even from sparse hits. Once the covered bits became the
+				// radiance's solid-angle weight (the analytic normalisation), that stopped being free: an
+				// artificially wide bit span smears a single sample's colour across most of a slice,
+				// which is exactly why indirect light used to appear only where AO appeared instead of
+				// reading as bounced light. Upstream carries one thickness for both, and with a
+				// viewZ-relative unit one value is meaningful at every distance, so they are unified.
+				// The trade is real and deliberate: hemisphere coverage drops, so unfilled directions
+				// simply contribute nothing (this lineage has no off-screen fallback), which GIStrength
+				// accounts for.
+				//
+				// This also removes a normalize and an acos per sample, and lets the specular cone reuse
+				// the same raw angle pair.
 #	ifdef GI_SPECULAR
 				float coneHalfAngles = max(5e-2, specularLobeHalfAngle(roughness));  // not too small
-				float2 angleRangeSpecular = clamp((angleRangeGI + nDom) * 0.5 / coneHalfAngles, -1, 1) * 0.5 + 0.5;
+				float2 angleRangeSpecular = clamp((angleRange + nDom) * 0.5 / coneHalfAngles, -1, 1) * 0.5 + 0.5;
 
 				uint2 bitsRangeGISpecular = uint2(round(angleRangeSpecular.x * 32u), round((angleRangeSpecular.y - angleRangeSpecular.x) * 32u));
 				uint maskedBitsGISpecular = s < GIRadius ? ((1 << bitsRangeGISpecular.y) - 1) << bitsRangeGISpecular.x : 0;
@@ -413,7 +430,7 @@ void CalculateGI(
 				// cosine-weighted visibility - but the analytic integration below evaluates cos/sin at
 				// each bin centre and therefore needs bins that are uniform in angle (build-0816
 				// diffuseGI.cs.hlsl:336).
-				float2 angleRangeGINorm = saturate((angleRangeGI + n) * RCP_PI + .5);
+				float2 angleRangeGINorm = saturate(angleRangeNorm);
 
 				uint validBits = 0;
 				[branch] if (s < GIRadius)

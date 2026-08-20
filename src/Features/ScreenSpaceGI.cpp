@@ -179,6 +179,18 @@ void ScreenSpaceGI::DrawSettings()
 		{
 			auto ilGuard = Util::DisableGuard(!settings.EnableGI);
 			ImGui::SliderFloat("IL Source Brightness", &settings.GIStrength, 0.f, 6.f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				std::vector<std::string> tooltipLines = {
+					"1.0 is one energy-correct screen-space bounce: the integrator is",
+					"analytically normalised, so a surface fully enclosed by unit radiance",
+					"receives exactly its own albedo.",
+					"Because the vanilla/Environment Ambient term is still present and already",
+					"contains indirect light, the visually balanced value is usually below 1.",
+					"Settings carried over from before the normalisation need roughly 5x their",
+					"old value to look the same."
+				};
+				Util::DrawMultiLineTooltip(tooltipLines);
+			}
 		}
 
 		ImGui::Separator();
@@ -225,11 +237,13 @@ void ScreenSpaceGI::DrawSettings()
 		if (showAdvanced) {
 			ImGui::Separator();
 
-			ImGui::SliderFloat("Thickness", &settings.Thickness, 0.f, 128.0f, "%.1f units");
+			ImGui::SliderFloat("Thickness", &settings.Thickness, 0.f, 0.5f, "%.3f");
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				std::vector<std::string> tooltipLines = {
-					"How thick the occluders are. Only affects AO.",
-					Util::Units::FormatDistance(settings.Thickness)
+					"How thick the occluders are, as a fraction of view depth.",
+					"Relative rather than absolute, so one value holds at every distance;",
+					"the old 32-unit default corresponds to 0.1 at around 320 units of depth.",
+					"Affects both AO and indirect light."
 				};
 				Util::DrawMultiLineTooltip(tooltipLines);
 			}
