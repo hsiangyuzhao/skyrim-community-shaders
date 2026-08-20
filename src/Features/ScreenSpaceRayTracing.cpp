@@ -146,7 +146,15 @@ void ScreenSpaceRayTracing::DrawSettings()
             ImGui::Text("Number of À Trous wavelet filter iterations. More iterations yield smoother results but may blur details and have a higher computational cost.");
         ImGui::SliderFloat("Color Phi", &settings.ColorPhi, 0.01f, 32.0f, "%.2f");
         if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text("Controls sensitivity to color differences in the À Trous filter. Lower values preserve more detail but may retain noise.");
+            ImGui::Text(
+                "How many standard deviations of luminance difference a neighbouring pixel "
+                "may have before the A Trous filter rejects it. A tap about 1 sigma away "
+                "differs by noise and should be averaged in; one 4 sigma away is a real "
+                "edge and should be rejected. At the default 2.0 those keep 61%% and 13%% of "
+                "their weight. Lower preserves more detail but retains noise -- below about "
+                "1.0 the filter starts treating its own noise as detail and stops averaging "
+                "at all. The SVGF paper uses 4.0, which is too loose for this pipeline's "
+                "shorter kernel chain.");
         ImGui::SliderFloat("Normal Phi", &settings.NormalPhi, 1.0f, 1024.0f, "%.2f");
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text("Controls sensitivity to normal differences in the À Trous filter. Higher values preserve more detail but may retain noise.");

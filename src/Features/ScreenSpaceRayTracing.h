@@ -126,7 +126,47 @@ struct ScreenSpaceRayTracing : Feature
         /// depth weight actually discriminating (audit #12), two guided iterations resolve
         /// more than three unguided ones did. The UI range is unchanged.
         uint AtrousIterations = 2;
-        float ColorPhi = 0.5f;
+        /// @brief sigma_l for the a-trous luminance edge-stopping function:
+        /// phiLuminance = ColorPhi * sqrt(variance).
+        ///
+        /// Re-tuned from 0.5 to 2.0 as part of the BUG-1 fix. 0.5 was chosen while the
+        /// variance channel carried roughly alpha * sigma^2 -- a ~34x underestimate -- so
+        /// it was compensating for a broken input, and against a true sigma^2 it
+        /// annihilates the kernel. With .w now equal to the real per-frame variance the
+        /// luminance term reduces to weight = exp(-k / ColorPhi) for a tap k standard
+        /// deviations from the centre, which makes the trade explicit. Writing N_eff for
+        /// the effective sample count of the 3x3 binomial kernel under a uniform
+        /// neighbour weight w -- (1 + 3w)^2 / (1 + 1.25 w^2), ceiling 7.11 at w = 1:
+        ///
+        ///   ColorPhi   w(1 sigma)   w(4 sigma)   noise:edge   N_eff
+        ///     0.5        0.135        3.4e-4        403        1.93
+        ///     1.0        0.368        0.018          20        3.79
+        ///     2.0        0.607        0.135         4.5        5.45
+        ///     4.0        0.779        0.368         2.1        6.33
+        ///
+        /// A tap that differs from the centre by ~1 sigma differs by *noise* and must be
+        /// averaged in; one that differs by >=4 sigma is a real luminance edge and must be
+        /// rejected. At 0.5 the filter treats its own noise as an edge (N_eff 1.93 of a
+        /// possible 7.11, i.e. it barely averages at all); at the SVGF paper's sigma_l =
+        /// 4.0 it barely discriminates at all (a real 4-sigma edge keeps 37% of its
+        /// weight).
+        ///
+        /// 2.0 rather than the paper's 4.0 for two reasons specific to this pipeline:
+        ///   * Reach. Schied et al. run five iterations of the 5x5 B3 spline at 2^i
+        ///     strides -- second-moment sigma ~18 px. Spec S2 measured this fork's chain
+        ///     (two iterations of 3x3 at strides 1, 2) at sigma 1.58 px. With an order of
+        ///     magnitude less reach there are no later, wider levels to repair an edge that
+        ///     level 0 crossed, so per-tap discrimination has to be real.
+        ///   * The other two edge-stops are already stronger here than in the paper
+        ///     (NormalPhi 512 against its 128, and audit #12 gave the depth term actual
+        ///     discriminating power). That is what licenses loosening sigma_l from 0.5 at
+        ///     all -- luminance need not carry edge preservation alone -- but 4.0 loosens
+        ///     it past the point of being an edge-stop.
+        ///
+        /// The same constant feeds ssrt_variance.hlsl's 7x7 moment estimator, where a
+        /// wider phiLuminance is likewise wanted: that path runs only on history <= 2
+        /// pixels, and a moment estimate built from more taps is a less noisy seed.
+        float ColorPhi = 2.0f;
         float NormalPhi = 512.0f;
         /// @brief (spec A1) Let a fully converged 8x8 tile skip an a-trous iteration.
         bool AdaptiveFiltering = true;
@@ -169,10 +209,11 @@ struct ScreenSpaceRayTracing : Feature
         ///
         /// This is not a quality trade: the specular path already scales its
         /// edge-stopping functions by roughness (phiLuminance *= r, phiNormal /= r), and
-        /// at r = 0.05 with the default ColorPhi 0.5 / NormalPhi 512 that leaves
+        /// at r = 0.05 with the default ColorPhi 2.0 / NormalPhi 512 that leaves
         /// phiNormal = 10240 -- a tap must match the centre normal to within 0.81 degrees
-        /// to keep 1/e of its weight -- and phiLuminance = 0.025 * sigma, so a tap must
-        /// also match the centre luminance to within 2.5% of a standard deviation. Under
+        /// to keep 1/e of its weight -- and phiLuminance = 0.1 * sigma, so a tap must
+        /// also match the centre luminance to within 10% of a standard deviation (a tap a
+        /// full sigma away keeps exp(-10) = 4.5e-5). Under
         /// both conditions every non-centre tap is annihilated and the kernel returns the
         /// centre pixel it was handed. 0.05 is where that becomes true with margin;
         /// raising it starts skipping genuinely glossy surfaces that the filter would

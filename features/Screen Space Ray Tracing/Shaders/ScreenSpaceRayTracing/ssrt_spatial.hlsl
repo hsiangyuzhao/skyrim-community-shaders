@@ -189,11 +189,14 @@ groupshared uint g_ssrtConvergedLanes;
 // scalings both diverge as roughness goes to zero:
 //     phiLuminance *= roughness;   phiNormal /= roughness;
 // A tap's weight is exp(-weightDepth - |dL| / phiLuminance) * dot(n, nP)^phiNormal, so at
-// the default ColorPhi 0.5 and NormalPhi 512:
+// the default ColorPhi 2.0 and NormalPhi 512:
 //   * at roughness 0.05, phiNormal = 10240, and a tap needs its normal within 0.81 deg of
 //     the centre's to keep even 1/e of its weight;
-//   * phiLuminance = 0.5 * 0.05 * sqrt(variance) = 0.025 * sigma, so a tap needs its
-//     luminance within 2.5% of one standard deviation to survive the luminance term.
+//   * phiLuminance = 2.0 * 0.05 * sqrt(variance) = 0.1 * sigma, so a tap a single standard
+//     deviation from the centre keeps exp(-10) = 4.5e-5 of its weight. (The conclusion is
+//     unchanged by the BUG-1 ColorPhi re-tune from 0.5: the roughness factor is what
+//     dominates here, and 0.1 * sigma is still a 10x-tighter gate than the diffuse path's
+//     2.0 * sigma.)
 // Both conditions together mean the kernel already returns very nearly the centre pixel:
 // the centre tap has weight 1 by construction, every other tap is annihilated by one term
 // or the other, and weightSum ends up ~1 with blendedColor ~ ssrColor.rgb. Running 9 (or
