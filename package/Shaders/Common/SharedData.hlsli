@@ -359,6 +359,24 @@ namespace SharedData
 		float3 pad;
 	};
 
+	// Mirrors EnvironmentAmbient::Settings in src/Features/EnvironmentAmbient.h byte for byte.
+	struct EnvAmbientSettings
+	{
+		uint Enabled;
+		float Blend;
+		float Intensity;
+		float Normalization;
+
+		float EnvMip;
+		float Saturation;
+		float AOPower;
+		uint ApplyAO;
+
+		uint EnableInterior;
+		uint NormalizationMode;
+		float2 pad0;
+	};
+
 	cbuffer FeatureData : register(b6)
 	{
 		GrassLightingSettings grassLightingSettings;
@@ -382,6 +400,7 @@ namespace SharedData
 		PhysSkyData physSkyData;
 		SSRTSettings ssrtSettings;
 		ExponentialHeightFogSettings exponentialHeightFogSettings;
+		EnvAmbientSettings envAmbientSettings;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);
