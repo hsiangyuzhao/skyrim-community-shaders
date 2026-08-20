@@ -104,7 +104,11 @@ float2x2 getRotationMatrix(float noise)
 
 	float depth = READ_DEPTH(srcDepth, dtid);
 	float3 pos = ScreenToViewPosition(screenPos, depth, eyeIndex);
-	float3 normal = GBuffer::DecodeNormal(FULLRES_LOAD(srcNormalRoughness, dtid, uv, samplerLinearClamp).xy);
+	// uv needs frameScale to map from frame space into the full-res texture, same as the sample
+	// loop below and gi.cs.hlsl. Without it the centre normal is read from the wrong texel
+	// whenever render resolution differs from texture dimensions (dynamic resolution, DLSS),
+	// so every normal weight below collapsed onto the 0.01 floor and IL leaked across surfaces.
+	float3 normal = GBuffer::DecodeNormal(FULLRES_LOAD(srcNormalRoughness, dtid, uv * frameScale, samplerLinearClamp).xy);
 
 	const float2 pixelDirRBViewspaceSizeAtCenterZ = depth.xx * (eyeIndex == 0 ? NDCToViewMul.xy : NDCToViewMul.zw) * RCP_OUT_FRAME_DIM;
 	const float worldRadius = radius * pixelDirRBViewspaceSizeAtCenterZ.x;
