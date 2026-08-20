@@ -110,6 +110,10 @@ struct ScreenSpaceRayTracing : Feature
     /// of repeating the player-cell lookup twice (audit P9).
     bool inInterior = true;
 
+    /// @brief Dynamic-resolution extent the depth pyramid was last cleared for; a change
+    /// retriggers the far-plane clear of every mip (audit #8).
+    float2 lastDepthExtent = { 0.0f, 0.0f };
+
     void DrawSSRTSpecular();
     void DrawSSRTDiffuse();
     /// @brief Snapshots the normal-roughness G-buffer into texHistoryNormals for next

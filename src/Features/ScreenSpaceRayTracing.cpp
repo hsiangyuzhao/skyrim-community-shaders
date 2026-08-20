@@ -492,6 +492,22 @@ void ScreenSpaceRayTracing::Prepass()
 
     state->BeginPerfEvent("SSRT Prepass");
 
+    // (audit #8) texDepth is allocated at full resolution but only the dynamic-resolution
+    // sub-rect is ever written, and it was never cleared. The region beyond the dispatch
+    // therefore held undefined data that the downsample's min() drags into the coarse
+    // mips; a value near 0 (= near plane) makes any ray landing in such a tile report an
+    // instant hit. Clearing every mip to the far plane makes the pyramid well defined:
+    // combined with the out-of-sub-rect writes in ssrt_preprocess_depth.hlsl, min() with
+    // 1.0 is a no-op so each level inherits "1.0 outside the valid area" by induction.
+    // Only needed when the extent changes -- with dynamic resolution off that is once,
+    // and even with it on it is one clear per resolution change, not per frame.
+    if (size.x != lastDepthExtent.x || size.y != lastDepthExtent.y) {
+        lastDepthExtent = size;
+        const float farPlane[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        for (uint i = 0; i < maxMips; ++i)
+            context->ClearUnorderedAccessViewFloat(depthUAVs[i].get(), farPlane);
+    }
+
     // preprocess depth
     {
         uavs.at(0) = texDepth->uav.get();
