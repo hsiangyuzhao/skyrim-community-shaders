@@ -8,9 +8,10 @@ RWTexture2D<float4> ColorTextureRW : register(u0);
 
 [numthreads(8, 8, 1)] void main(uint3 dispatchID : SV_DispatchThreadID)
 {
-    uint width, height;
-    ColorTextureRW.GetDimensions(width, height);
-    if (dispatchID.x >= width || dispatchID.y >= height)
+    // (audit P9) SharedData::BufferDim.xy is the same full-resolution extent
+    // ColorTextureRW.GetDimensions() returned (this UAV is the kMAIN render target), so
+    // this is output-identical while dropping a per-thread resource query.
+    if (any(dispatchID.xy >= uint2(SharedData::BufferDim.xy)))
         return;
 
     float4 ssrtDiffuse = SSRTDiffuseTexture[dispatchID.xy];

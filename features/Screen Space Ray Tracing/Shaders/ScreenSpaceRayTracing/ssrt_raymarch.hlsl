@@ -123,11 +123,10 @@ float3 InvProjectPosition(float3 coord, float4x4 mat)
 
 float2 SSRT_GetMipResolution(float2 screen_dimensions, int mip_level)
 {
-    return screen_dimensions * pow(0.5, mip_level);
-    // uint2 dimensions;
-    // uint levels;
-    // DepthTextureMips.GetDimensions(mip_level, dimensions.x, dimensions.y, levels);
-    // return float2(dimensions.x, dimensions.y);
+    // (audit P9) exp2(-mip) instead of pow(0.5, mip): identical result (fxc lowers
+    // pow(0.5, x) to exp2(x * log2(0.5)) anyway) but says what is meant and drops the
+    // multiply.
+    return screen_dimensions * exp2(-float(mip_level));
 }
 
 float SSRT_LoadDepth(int2 pixel_coordinate, int mip)
@@ -171,7 +170,7 @@ bool SSRT_AdvanceRay(float3       origin,
                          float2       floor_offset,
                          float2       uv_offset,
                          float        surface_z,
-                         float        thickness,
+                         // (audit P9) `thickness` used to be passed here and never read
                          inout float3 position,
                          inout float  current_t)
 {
@@ -255,7 +254,7 @@ float3 SSRT_HierarchicalRaymarch(float3 origin, float3 direction, bool is_mirror
         float2 current_mip_position = current_mip_resolution * position.xy;
         float  surface_z            = SSRT_LoadDepth(current_mip_position * FrameBuffer::DynamicResolutionParams1.xy, current_mip);
         bool skipped_tile =
-            SSRT_AdvanceRay(origin, direction, inv_direction, current_mip_position, current_mip_resolution_inv, current_mip, floor_offset, uv_offset, surface_z, thickness, position, current_t);
+            SSRT_AdvanceRay(origin, direction, inv_direction, current_mip_position, current_mip_resolution_inv, current_mip, floor_offset, uv_offset, surface_z, position, current_t);
         bool nextMipIsOutOfRange = skipped_tile && (current_mip >= SSRT_DEPTH_HIERARCHY_MAX_MIP);
         if (!nextMipIsOutOfRange)
         {

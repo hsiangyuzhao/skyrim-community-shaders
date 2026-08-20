@@ -106,6 +106,10 @@ struct ScreenSpaceRayTracing : Feature
 
     bool recompileFlag = false;
 
+    /// @brief Cached once per frame in Prepass() and read by both draw passes, instead
+    /// of repeating the player-cell lookup twice (audit P9).
+    bool inInterior = true;
+
     void DrawSSRTSpecular();
     void DrawSSRTDiffuse();
     virtual void Prepass() override;

@@ -180,9 +180,18 @@ void ScreenSpaceRayTracing::SetupResources()
         auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
         D3D11_TEXTURE2D_DESC texDesc = {};
         mainTex.texture->GetDesc(&texDesc);
-        texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        // (audit P9) None of these textures is ever bound as a render target or passed
+        // to GenerateMips -- the only GenerateMips call in this feature is commented out
+        // in Prepass, and no RTV is ever created. D3D11_RESOURCE_MISC_GENERATE_MIPS also
+        // *requires* BIND_RENDER_TARGET, so the two go together; dropping both lets the
+        // driver pick a layout without RT compression metadata for ~14 full-screen
+        // surfaces (plus the whole depth pyramid).
+        texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        // Explicitly 0 rather than leaving whatever kMAIN carried: MiscFlags used to be
+        // OR-ed into, and any inherited GENERATE_MIPS would now fail creation because it
+        // requires BIND_RENDER_TARGET.
+        texDesc.MiscFlags = 0;
         texDesc.MipLevels = 1;
-        texDesc.MiscFlags |= D3D11_RESOURCE_MISC_GENERATE_MIPS;
         texDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
         D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
@@ -441,6 +450,23 @@ void ScreenSpaceRayTracing::Prepass()
         CompileComputeShaders();
     }
 
+    // (audit P8) The Hi-Z pyramid this pass builds is only ever read by the two SSRT
+    // raymarch passes, so with both switched off it was 1 copy + 8 downsample
+    // dispatches of pure waste every frame.
+    if (!settings.EnableDiffuse && !settings.EnableSpecular)
+        return;
+
+    // (audit P9) Cache the interior test once per frame instead of repeating the cell
+    // lookup in DrawSSRTSpecular and DrawSSRTDiffuse. Safe because Prepass runs from
+    // StartDeferred before either draw, and the gate above only fires when neither of
+    // them will run at all.
+    inInterior = true;
+    if (auto player = RE::PlayerCharacter::GetSingleton()) {
+        if (auto parentCell = player->GetParentCell()) {
+            inInterior = parentCell->IsInteriorCell();
+        }
+    }
+
     auto renderer = globals::game::renderer;
     auto context = globals::d3d::context;
     auto state = globals::state;
@@ -591,14 +617,6 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 	const auto envReflectionsTexture = dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr;
 
     auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec] = ssgi.GetOutputTextures();
-
-    bool inInterior = true;
-
-    if (auto player = RE::PlayerCharacter::GetSingleton()) {
-        if (auto parentCell = player->GetParentCell()) {
-            inInterior = parentCell->IsInteriorCell();
-        }
-    }
 
     // raymarch
     state->BeginPerfEvent("Raymarch");
@@ -783,14 +801,6 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 	const auto envReflectionsTexture = dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr;
 
     auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec] = ssgi.GetOutputTextures();
-
-    bool inInterior = true;
-
-    if (auto player = RE::PlayerCharacter::GetSingleton()) {
-        if (auto parentCell = player->GetParentCell()) {
-            inInterior = parentCell->IsInteriorCell();
-        }
-    }
 
     uavs.at(0) = texSSRTDiffuseColor->uav.get();
 #ifdef ENABLE_SHARC
