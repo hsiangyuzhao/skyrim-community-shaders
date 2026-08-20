@@ -18,7 +18,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SampleCount,
 	ApplyAO,
 	EnableInterior,
-	LinearComposite)
+	LinearComposite,
+	EnclosureFallback,
+	HueFalloff)
 
 void EnvironmentAmbient::RestoreDefaultSettings()
 {
@@ -175,6 +177,33 @@ void EnvironmentAmbient::DrawSettings()
 
 		if (!screenSpaceGI.loaded || !screenSpaceGI.settings.Enabled) {
 			ImGui::TextColored({ 1, 0.65f, 0, 1 }, "Screen Space GI is off: only Skylighting occlusion is applied.");
+		}
+
+		ImGui::Checkbox("Enclosed Hue Fallback", (bool*)&settings.EnclosureFallback);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"In closed-off places, fade the environment light back to the vanilla ambient\n"
+				"colour instead of only dimming the cubemap.\n"
+				"\n"
+				"The SSRT fallback does not dim the cubemap where the sky is blocked: rays that hit\n"
+				"nearby geometry take that geometry's on-screen colour instead, so an enclosed spot\n"
+				"is lit by bounced local light. Dimming a sky-blue cubemap without changing its hue\n"
+				"leaves interiors of arches, eaves and alcoves dark but still visibly blue. The\n"
+				"vanilla ambient term is the right stand-in: it already carries the true ambient\n"
+				"brightness from the G-buffer and has no sky blue in it.\n"
+				"\n"
+				"Open areas are unaffected. Turn off to see the blue wash this removes.");
+		}
+
+		{
+			auto hueGuard = Util::DisableGuard(!settings.EnclosureFallback);
+			ImGui::SliderFloat("Hue Falloff", &settings.HueFalloff, 0.25f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text(
+					"Exponent on the openness signal that drives the fallback. Above 1.0 the\n"
+					"fallback reaches further out of enclosed areas (more aggressive de-blueing);\n"
+					"below 1.0 it stays confined to the most enclosed spots. 1.0 is linear.");
+			}
 		}
 
 		///////////////////////////////

@@ -99,57 +99,30 @@ namespace EnvironmentAmbient
 #endif
 	}
 
-	// Sky visibility along a_normalWS. The fallback re-evaluates this per ray, but its cosine-lobe
-	// integrand always uses the folded *surface* normal (ssrt_raymarch.hlsl:605-606); the ray
-	// direction reaches Skylighting::sample only as the receiver normal bias that offsets the probe
-	// fetch by one cell (Skylighting.hlsli:65), so per-ray it buys a little extra spatial dither and
-	// no directional gradient. Once per pixel is the faithful reduction.
-	//
-	// Two values come out of the same integral because they play different roles:
-	//   o_skyVisibility  the fallback's `skylightingDiffuse` verbatim (ssrt_raymarch.hlsl:602-612),
-	//                    including the upward-normal boost that can push it above 1 and the
-	//                    MinDiffuseVisibility floor. Only the sky increment may use this.
-	//   return value     raw sky openness: the same integral with neither hack applied. This is
-	//                    what stands in for the fallback's screen-space occlusion factor. Using the
-	//                    boosted value there would be wrong in exactly the place S2 named: the
-	//                    boost is 1 + (1 - MinDiffuseVisibility) at n.z = 1, which saturates the
-	//                    proxy to 1 and removes all darkening from upward-facing surfaces, i.e.
-	//                    from the ground at a wall-to-ground junction.
-	float GetSkyVisibility(float3 a_normalWS, float3 a_positionMS, uint2 a_pixCoord, out float o_skyVisibility)
-	{
-		o_skyVisibility = 1.0;
-#if defined(SKYLIGHTING) && !defined(INTERIOR)
-		sh2 skylighting = Skylighting::sample(SharedData::skylightingSettings, SkylightingProbeArray, stbn_vec3_2Dx1D_128x128x64, a_pixCoord, a_positionMS, a_normalWS);
-
-		// Fold the lower hemisphere up, as the fallback does (ssrt_raymarch.hlsl:605).
-		float3 visibilityNormal = normalize(float3(a_normalWS.xy, max(0, a_normalWS.z)));
-
-		float visibility = SphericalHarmonics::FuncProductIntegral(skylighting, SphericalHarmonics::EvaluateCosineLobe(visibilityNormal)) / Math::PI;
-		visibility = saturate(visibility);
-		visibility = lerp(1.0, visibility, Skylighting::getFadeOutFactor(a_positionMS));
-
-		o_skyVisibility = visibility * (1.0 + saturate(a_normalWS.z) * (1.0 - SharedData::skylightingSettings.MinDiffuseVisibility));
-		o_skyVisibility = Skylighting::mixDiffuse(SharedData::skylightingSettings, o_skyVisibility);
-
-		return visibility;
-#else
-		return 1.0;
-#endif
-	}
+	// Sky visibility is sampled once per pixel by the caller (DeferredCompositeCS.hlsl), which needs
+	// the same probe fetch for the IBL half of its ambient estimate. The fallback re-evaluates it
+	// per ray, but its cosine-lobe integrand always uses the folded *surface* normal
+	// (ssrt_raymarch.hlsl:605-606); the ray direction reaches Skylighting::sample only as the
+	// receiver normal bias that offsets the probe fetch by one cell (Skylighting.hlsli:65), so per
+	// ray it buys a little extra spatial dither and no directional gradient. Once per pixel is the
+	// faithful reduction, and sharing the fetch with the caller costs nothing.
 
 	/**
 	 * @brief Evaluates the environment ambient term for one pixel.
 	 *
-	 * @param a_normalWS    Geometric world-space normal.
-	 * @param a_positionMS  Model-space position (already VR eye-adjusted by the caller).
-	 * @param a_albedo      G-buffer albedo, gamma space, applied last as the fallback does.
-	 * @param a_pixCoord    Dispatch pixel coordinate (sample scramble + Skylighting blue-noise seed).
-	 * @param o_occlusion   Proxy for the fallback's per-ray screen-space occlusion factor
-	 *                      (ssrt_raymarch.hlsl:632). The caller folds it into MultiBounceAO.
+	 * @param a_normalWS       Geometric world-space normal.
+	 * @param a_albedo         G-buffer albedo, gamma space, applied last as the fallback does.
+	 * @param a_pixCoord       Dispatch pixel coordinate (sample scramble seed).
+	 * @param a_skyVisibility  The fallback's `skylightingDiffuse` (ssrt_raymarch.hlsl:602-612),
+	 *                         computed by the caller. Attenuates the sky increment only.
+	 * @param a_enclosure      Orientation-normalised sky openness, ~1 in the open. Stands in for the
+	 *                         fallback's screen-space occlusion factor.
+	 * @param o_occlusion      Proxy for the fallback's per-ray screen-space occlusion factor
+	 *                         (ssrt_raymarch.hlsl:632). The caller folds it into MultiBounceAO.
 	 * @return Environment ambient in the same space and scale as the vanilla ambient term
 	 *         (albedo included, occlusion NOT included).
 	 */
-	float3 Evaluate(float3 a_normalWS, float3 a_positionMS, float3 a_albedo, uint2 a_pixCoord, out float o_occlusion)
+	float3 Evaluate(float3 a_normalWS, float3 a_albedo, uint2 a_pixCoord, float a_skyVisibility, float a_enclosure, out float o_occlusion)
 	{
 		const float mip = SharedData::envAmbientSettings.EnvMip;
 		const uint numSamples = clamp(SharedData::envAmbientSettings.SampleCount, 1u, MaxSamples);
@@ -187,14 +160,6 @@ namespace EnvironmentAmbient
 		envNoSky *= rcpSamples;
 		skyOnly *= rcpSamples;
 
-		// skyVisibility attenuates the sky increment (the fallback's skylightingDiffuse); openness is
-		// the unhacked integral used as the occlusion proxy. See GetSkyVisibility.
-		float skyVisibility = 1.0;
-		float openness = 1.0;
-#if !defined(INTERIOR)
-		openness = GetSkyVisibility(a_normalWS, a_positionMS, a_pixCoord, skyVisibility);
-#endif
-
 		float3 env = envNoSky;
 
 		[branch] if (SharedData::envAmbientSettings.Normalization > 0.0)
@@ -209,19 +174,20 @@ namespace EnvironmentAmbient
 
 		// Only the sky increment is attenuated by sky visibility (ssrt_raymarch.hlsl:622);
 		// attenuating the whole colour would fade the non-sky environment away as well.
-		env += skyOnly * skyVisibility;
+		env += skyOnly * a_skyVisibility;
 
 		// The fallback's second, independent darkening factor: `lerp(1, occlusion, OcclusionStrength)`
 		// where occlusion = 1 - hitConfidence from SSRT_ValidateHit (ssrt_raymarch.hlsl:299/307,
-		// :632). It fires on self-intersecting and back-facing rays, which is exactly what happens
-		// under an eave or at a wall-to-ground junction, and it multiplies the *whole* env colour -
-		// not just the sky part. Nothing screen-space is available per pixel in the composite, so
-		// raw sky openness, which drops in the same places, stands in for it. The sky increment
-		// consequently carries openness twice while the no-sky part carries it once; the fallback
+		// :632). It fires on self-intersecting and back-facing rays, and it multiplies the *whole*
+		// env colour, not just the sky part. Nothing screen-space is available per pixel in the
+		// composite, so the orientation-normalised sky openness stands in for it - normalised
+		// because the factor it replaces is ray-hit driven and therefore ~1 in the open whatever way
+		// the surface faces, which the raw hemisphere fraction is not. The sky increment does
+		// consequently carry openness twice while the no-sky part carries it once; the fallback
 		// carries two genuinely different signals. OcclusionStrength brackets the difference.
 		o_occlusion = 1.0;
 		[branch] if (SharedData::envAmbientSettings.ApplyAO != 0)
-			o_occlusion = lerp(1.0, openness, saturate(SharedData::envAmbientSettings.OcclusionStrength));
+			o_occlusion = lerp(1.0, a_enclosure, saturate(SharedData::envAmbientSettings.OcclusionStrength));
 
 		// Non-parity extras: both are identity at their defaults.
 		env = Color::Saturation(env, SharedData::envAmbientSettings.Saturation);

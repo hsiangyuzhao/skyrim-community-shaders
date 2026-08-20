@@ -99,6 +99,15 @@ void SampleSSGISpecular(uint2 pixCoord, sh2 lobe, out float ao, out float3 il, i
 Texture2D<float4> SSRTexture : register(t16);
 #endif
 
+// Skylighting's diffuse visibility is needed by the ambient estimate's IBL term and by Environment
+// Ambient. Computed once per pixel where either is compiled in - a plain SSGI build with neither
+// must not pay for a probe fetch nothing reads. IBL is #undef'd above without DYNAMIC_CUBEMAPS, so
+// inside an IBL build this condition is exactly IBL.hlsli's own `SKYLIGHTING && !INTERIOR` and the
+// GetIBLColor overload always lines up.
+#if defined(SKYLIGHTING) && defined(DYNAMIC_CUBEMAPS) && !defined(INTERIOR) && (defined(IBL) || defined(ENV_AMBIENT))
+#	define COMPOSITE_AMBIENT_SKY
+#endif
+
 #if defined(PHYSICAL_SKY)
 #	define PS_DEFERRED_RSRCS
 #	define PS_DEFERRED_SAMPLERS
@@ -150,8 +159,90 @@ Texture2D<float4> SSRTexture : register(t16);
 	float ssgiAo = 1.0;
 #	endif
 
+	// Skylighting diffuse visibility, shared by every consumer below.
+	//
+	// ambientSkyVisibility: what the forward path (Lighting.hlsl:3230-3236) and the SSRT fallback
+	//     (ssrt_raymarch.hlsl:602-612) attenuate with - upward-normal boost and MinDiffuseVisibility
+	//     floor applied, so it can exceed 1. Reproduced verbatim; parity includes the quirks.
+	// ambientEnclosure: how closed-off the point is, ~1 in the open for every orientation. The raw
+	//     integral answers "what fraction of my hemisphere is sky", which on open flat ground is
+	//     only about 0.5 * (1 + n.z) - a vertical wall in the middle of a field reads 0.5. Dividing
+	//     that reference out turns the signal from orientation into enclosure, which is what both
+	//     the occlusion proxy and the hue fallback actually want.
+	//
+	// Declared only where a consumer exists, so a build with neither IBL nor Environment Ambient
+	// compiles to the same instructions it did before this block was introduced.
+#	if defined(IBL) || defined(ENV_AMBIENT)
+	float ambientSkyVisibility = 1.0;
+	float ambientEnclosure = 1.0;
+#	endif
+#	ifdef COMPOSITE_AMBIENT_SKY
+	{
+#		if defined(VR)
+		float3 ambientPositionMS = positionWS.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+#		else
+		float3 ambientPositionMS = positionWS.xyz;
+#		endif
+
+		sh2 ambientSkylightingSH = Skylighting::sample(SharedData::skylightingSettings, SkylightingProbeArray, stbn_vec3_2Dx1D_128x128x64, dispatchID.xy, ambientPositionMS, normalWS);
+
+		// Fold the lower hemisphere up, as the forward path and the fallback both do.
+		float3 ambientFoldedNormal = normalize(float3(normalWS.xy, max(0, normalWS.z)));
+
+		float rawVisibility = SphericalHarmonics::FuncProductIntegral(ambientSkylightingSH, SphericalHarmonics::EvaluateCosineLobe(ambientFoldedNormal)) / Math::PI;
+		rawVisibility = saturate(rawVisibility);
+		rawVisibility = lerp(1.0, rawVisibility, Skylighting::getFadeOutFactor(ambientPositionMS));
+
+		ambientSkyVisibility = rawVisibility * (1.0 + saturate(normalWS.z) * (1.0 - SharedData::skylightingSettings.MinDiffuseVisibility));
+		ambientSkyVisibility = Skylighting::mixDiffuse(SharedData::skylightingSettings, ambientSkyVisibility);
+
+		// The open-sky reference is taken from normalWS.z rather than the folded normal, which is
+		// NaN for a straight-down normal (normalize of a zero vector).
+		ambientEnclosure = saturate(rawVisibility / max(0.5 * (1.0 + saturate(normalWS.z)), 1e-3));
+	}
+#	endif
+
+	// A_est: this block's estimate of the ambient light MAIN already contains, subtracted back out
+	// below. Only its LUMINANCE is corrected from the G-buffer (Masks.z), so its chroma has to be
+	// built the way the forward path built it (Lighting.hlsl:3217-3252) or the difference survives
+	// as an additive tint - see the ENV_AMBIENT note further down.
 	float3 directionalAmbientColor = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(normalWS, 1.0))));
+
+#	if defined(IBL)
+	// With Image Based Lighting loaded the forward ambient is not DALC at all: DALC is scaled by
+	// DALCAmount (0.33 by default, Lighting.hlsl:3224) and an SH probe term is added on top
+	// (:3245-3252). Estimating it as 100% DALC and no probe therefore got the chroma badly wrong -
+	// about three times too much DALC, none of the probe - which is why the residual tint tracked
+	// the IBL toggle. The UseStaticIBL branch at :3220 is gated on !inWorld, so it cannot apply to
+	// the deferred world G-buffer and is deliberately not reproduced.
+	[branch] if (SharedData::iblSettings.EnableDiffuseIBL != 0 &&
+		(!SharedData::InInterior || SharedData::iblSettings.EnableInterior != 0)) {
+		directionalAmbientColor *= SharedData::iblSettings.DALCAmount;
+
+#		ifdef COMPOSITE_AMBIENT_SKY
+		float3 iblColor = ImageBasedLighting::GetIBLColor(-normalWS, ambientSkyVisibility);
+#		else
+		float3 iblColor = ImageBasedLighting::GetIBLColor(-normalWS);
+#		endif
+		iblColor = Color::IrradianceToGamma(Color::Saturation(iblColor, SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale);
+
+		// The forward path shapes only the DALC half with Skylighting's albedo-tinted MultiBounceAO
+		// (Skylighting.hlsli:53, reached from Lighting.hlsl:3639 after :3633 has taken the probe
+		// term back out) and re-adds the probe term unshaped at :3643. Mirroring that split is what
+		// sets the DALC-to-probe ratio in the enclosed places where the tint was worst.
+		float3 dalcPart = directionalAmbientColor * albedo;
+#		ifdef COMPOSITE_AMBIENT_SKY
+		dalcPart = Color::IrradianceToGamma(Color::IrradianceToLinear(dalcPart) *
+			Color::MultiBounceAO(Color::IrradianceToLinear(albedo / Color::PBRLightingScale), ambientSkyVisibility));
+#		endif
+
+		directionalAmbientColor = dalcPart + iblColor * albedo;
+	} else {
+		directionalAmbientColor *= albedo;
+	}
+#	else
 	directionalAmbientColor *= albedo;
+#	endif
 
 	directionalAmbientColor = Color::RGBToYCoCg(directionalAmbientColor);
 	directionalAmbientColor.x = MasksTexture[dispatchID.xy].z;
@@ -187,20 +278,18 @@ Texture2D<float4> SSRTexture : register(t16);
 	// Environment Ambient replaces the ambient term that was just separated out of MAIN, so it can
 	// never double-light: the vanilla contribution is subtracted whether or not L1 is active.
 	//
-	// On the separation above (:153-170): with Color::YCoCgToRGB, replacing Y while keeping Co/Cg
-	// adds the same delta to all three channels (R = Y - Cg + Co, G = Y + Cg, B = Y - Cg - Co), so
-	// the subtracted term is exactly `A_est + (Masks.z - Y(A_est)) * (1,1,1)` where
-	// A_est = Color::Ambient(DALC . N) * albedo. Its chroma is A_est's, NOT the blended pixel's -
-	// the pixel only enters through the maxScale clamp at :161-168. The subtraction therefore
-	// cannot hue-shift the direct-light residual by scaling pixel chroma, and it is computed
-	// identically with and without ENV_AMBIENT.
+	// On the separation above: with Color::YCoCgToRGB, replacing Y while keeping Co/Cg adds the same
+	// delta to all three channels (R = Y - Cg + Co, G = Y + Cg, B = Y - Cg - Co), so the subtracted
+	// term is exactly `A_est + (Masks.z - Y(A_est)) * (1,1,1)`. Its chroma is A_est's, NOT the
+	// blended pixel's - the pixel only enters through the maxScale clamp. The subtraction therefore
+	// cannot hue-shift the direct-light residual by scaling pixel chroma.
 	//
-	// What it does leave is a bounded chroma error: Masks.z is the YCoCg Y of the *real* forward
-	// ambient (Lighting.hlsl:3892, after Skylighting's MultiBounceAO albedo tint and any IBL), so
-	// the luminance is exact but `chroma(real) - chroma(A_est)` survives as an additive term. The
-	// SSGI path cancels it by re-adding the same subtracted value; L1 cannot, because it adds
-	// cubemap chroma instead. This is inherent to the mechanism - the composite has no channel
-	// carrying the real ambient's chroma - and is small next to the composition-space error below.
+	// It does leave `chroma(real forward ambient) - chroma(A_est)` as an additive term, because only
+	// the luminance is corrected. That residual is why the observed tint tracked the IBL toggle, and
+	// building A_est the way the forward path builds it is what removes the bulk of it. What stays
+	// is second order: the forward pass evaluates DALC along its own ambientNormal (hair and skin
+	// override it) and applies maxScale before the shaping, neither of which is reconstructible
+	// here.
 	float3 envAmbient = 0.0;
 	float envAmbientOcclusion = 1.0;
 
@@ -218,15 +307,7 @@ Texture2D<float4> SSRTexture : register(t16);
 #		endif
 
 	[branch] if (envAmbientActive)
-	{
-#		if defined(VR)
-		float3 envAmbientPositionMS = positionWS.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
-#		else
-		float3 envAmbientPositionMS = positionWS.xyz;
-#		endif
-
-		envAmbient = EnvironmentAmbient::Evaluate(normalWS, envAmbientPositionMS, albedo, dispatchID.xy, envAmbientOcclusion);
-	}
+		envAmbient = EnvironmentAmbient::Evaluate(normalWS, albedo, dispatchID.xy, ambientSkyVisibility, ambientEnclosure, envAmbientOcclusion);
 #	endif
 
 	float3 multiBounceAO = Color::MultiBounceAO(linAlbedo, ssgiAo);
@@ -250,6 +331,31 @@ Texture2D<float4> SSRTexture : register(t16);
 		// reads AlbedoTexture raw). Kept in that space on purpose: parity includes the quirks.
 		float envAo = saturate(envAmbientOcclusion * ssgiAo);
 		float3 envIrradiance = Color::IrradianceToLinear(envAmbient) * Color::MultiBounceAO(albedo, envAo);
+
+		// Enclosure-driven hue fallback. The fallback this feature ports does not merely dim the
+		// cubemap where the sky is blocked: rays that hit nearby geometry take that geometry's
+		// screen radiance instead of the cubemap (ssrt_raymarch.hlsl:642), so an enclosed hemisphere
+		// is lit by bounced local colour rather than by a darkened sky. Attenuating a sky-blue
+		// cubemap achromatically produces exactly what the A/B reported - dark, but still blue.
+		//
+		// Falling back to the vanilla ambient term fixes hue and level in one step: it carries the
+		// true forward ambient luminance (via Masks.z, so it is already dark in closed-off places)
+		// and DALC-plus-probe chroma with no sky-blue in it. It is also the term L1 is replacing, so
+		// at full enclosure L1 degrades to vanilla rather than to something invented.
+		//
+		// Endpoints: openWeight 1 leaves open areas on pure cubemap env, unchanged; openWeight 0 is
+		// the vanilla ambient. Because the occluded cubemap term is lerped away at the enclosed end,
+		// Occlusion Strength no longer compounds with this and can stay at the fallback's 1.0.
+		[branch] if (SharedData::envAmbientSettings.EnclosureFallback != 0) {
+			float enclosure = ambientEnclosure;
+#	if defined(SSGI)
+			// Screen Space GI resolves contact and creases far finer than the Skylighting probe
+			// grid, and it is the same signal the fallback multiplied in (ssrt_raymarch.hlsl:634).
+			enclosure *= ssgiAo;
+#	endif
+			float openWeight = pow(saturate(enclosure), max(SharedData::envAmbientSettings.HueFalloff, 1e-3));
+			envIrradiance = lerp(ambientIrradiance, envIrradiance, openWeight);
+		}
 
 		[branch] if (SharedData::envAmbientSettings.LinearComposite != 0) {
 			// PARITY PATH. ssrt_diffuse_composite.hlsl:20 adds the cubemap ambient to MAIN inside
