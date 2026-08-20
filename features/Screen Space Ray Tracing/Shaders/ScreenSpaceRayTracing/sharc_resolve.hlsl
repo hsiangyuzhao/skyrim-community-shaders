@@ -17,10 +17,14 @@
 
 #define LINEAR_BLOCK_SIZE 256
 
-RWStructuredBuffer<uint2> u_SharcHashEntriesBuffer : register(u2);
-RWStructuredBuffer<uint> u_HashCopyOffsetBuffer : register(u3);
-RWStructuredBuffer<uint4> u_SharcVoxelDataBuffer : register(u4);
-RWStructuredBuffer<uint4> u_SharcVoxelDataBufferPrev : register(u5);
+// (audit P6) u1..u4, matching ssrt_raymarch.hlsl and the `uavs` array in
+// ScreenSpaceRayTracing::DrawSSRTDiffuse -- this pass is dispatched with the same
+// bindings as the SHARC update/render raymarch. Was u2..u5, above the now-deleted
+// SSRPDFOutput (u1) and SSRTHitDistanceOutput (u2).
+RWStructuredBuffer<uint2> u_SharcHashEntriesBuffer : register(u1);
+RWStructuredBuffer<uint> u_HashCopyOffsetBuffer : register(u2);
+RWStructuredBuffer<uint4> u_SharcVoxelDataBuffer : register(u3);
+RWStructuredBuffer<uint4> u_SharcVoxelDataBufferPrev : register(u4);
 
 [numthreads(LINEAR_BLOCK_SIZE, 1, 1)]
 void main(in uint2 did : SV_DispatchThreadID)

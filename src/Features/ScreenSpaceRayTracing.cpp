@@ -137,13 +137,11 @@ void ScreenSpaceRayTracing::DrawSettings()
         BUFFER_VIEWER_NODE(texSSRTDiffuseColor, debugRescale)
         BUFFER_VIEWER_NODE(texHistory, debugRescale)
         BUFFER_VIEWER_NODE(texHistoryDiffuse, debugRescale)
-        BUFFER_VIEWER_NODE(texHitPDF, debugRescale)
         BUFFER_VIEWER_NODE(texTemporal, debugRescale)
         BUFFER_VIEWER_NODE(texMoments, debugRescale)
         BUFFER_VIEWER_NODE(texHistoryMoments, debugRescale)
         BUFFER_VIEWER_NODE(texHistoryMomentsDiffuse, debugRescale)
         BUFFER_VIEWER_NODE(texVariance, debugRescale)
-        BUFFER_VIEWER_NODE(texOutput, debugRescale)
 
 		ImGui::TreePop();
 	}
@@ -209,9 +207,6 @@ void ScreenSpaceRayTracing::SetupResources()
         texSSRTDiffuseColor = eastl::make_unique<Texture2D>(texDesc);
         texSSRTDiffuseColor->CreateSRV(srvDesc);
         texSSRTDiffuseColor->CreateUAV(uavDesc);
-        texHitPDF = eastl::make_unique<Texture2D>(texDesc);
-        texHitPDF->CreateSRV(srvDesc);
-        texHitPDF->CreateUAV(uavDesc);
         texHistory = eastl::make_unique<Texture2D>(texDesc);
         texHistory->CreateSRV(srvDesc);
         texHistory->CreateUAV(uavDesc);
@@ -224,9 +219,6 @@ void ScreenSpaceRayTracing::SetupResources()
         texVariance = eastl::make_unique<Texture2D>(texDesc);
         texVariance->CreateSRV(srvDesc);
         texVariance->CreateUAV(uavDesc);
-        texOutput = eastl::make_unique<Texture2D>(texDesc);
-        texOutput->CreateSRV(srvDesc);
-        texOutput->CreateUAV(uavDesc);
 
         texDesc.Format = srvDesc.Format = uavDesc.Format =  DXGI_FORMAT_R11G11B10_FLOAT;
 
@@ -246,7 +238,11 @@ void ScreenSpaceRayTracing::SetupResources()
         texHistoryNormals->CreateUAV(uavDesc);
 
         texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
-        texHitDistance = new Texture2D(texDesc);
+
+        // (audit #20) Was a bare `new Texture2D` and therefore leaked. It is *not*
+        // dead: Upscaling.cpp copies it into specHitDistanceShared12 as the DLSS-RR
+        // specular hit-distance guide whenever Ray Reconstruction is enabled.
+        texHitDistance = eastl::make_unique<Texture2D>(texDesc);
         texHitDistance->CreateSRV(srvDesc);
         texHitDistance->CreateUAV(uavDesc);
 
@@ -273,8 +269,42 @@ void ScreenSpaceRayTracing::SetupResources()
 		}
     }
 
+    logger::debug("Creating samplers...");
+	{
+		D3D11_SAMPLER_DESC samplerDesc = {
+			.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+			.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP,
+			.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP,
+			.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP,
+			.MaxAnisotropy = 1,
+			.MinLOD = 0,
+			.MaxLOD = D3D11_FLOAT32_MAX
+		};
+		DX::ThrowIfFailed(device->CreateSamplerState(&samplerDesc, linearSampler.put()));
+	}
+
+    logger::debug("Loading noise texture...");
+    {
+        DirectX::CreateDDSTextureFromFile(device, globals::d3d::context, L"Data\\Shaders\\ScreenSpaceRayTracing\\noise.dds",
+            nullptr, noiseSRV.put());
+    }
+
+	CompileComputeShaders();
+}
+
 #ifdef ENABLE_SHARC
-    logger::debug("Creating buffers...");
+// (audit P6) The four SHARC buffers are 44 MB that used to be allocated at feature
+// setup even though SHARC is experimental, marked "(Broken)" in the UI and off by
+// default. Create them the first time SHARC is actually switched on instead. Called
+// from DrawSSRTDiffuse before the first dispatch that binds them, so a runtime enable
+// never dispatches against null UAVs; disabling again binds nullptr rather than
+// releasing, so there is nothing to dangle.
+void ScreenSpaceRayTracing::EnsureSharcResources()
+{
+    if (sharcHashEntries && sharcHashCopyOffsets && sharcVoxelData && sharcVoxelDataPrev)
+        return;
+
+    logger::debug("Creating SHARC buffers...");
 	{
 		D3D11_BUFFER_DESC sbDesc{};
 		sbDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -325,30 +355,8 @@ void ScreenSpaceRayTracing::SetupResources()
         sharcVoxelDataPrev->CreateSRV(srvDesc);
         sharcVoxelDataPrev->CreateUAV(uavDesc);
 	}
-#endif
-
-    logger::debug("Creating samplers...");
-	{
-		D3D11_SAMPLER_DESC samplerDesc = {
-			.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-			.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP,
-			.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP,
-			.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP,
-			.MaxAnisotropy = 1,
-			.MinLOD = 0,
-			.MaxLOD = D3D11_FLOAT32_MAX
-		};
-		DX::ThrowIfFailed(device->CreateSamplerState(&samplerDesc, linearSampler.put()));
-	}
-
-    logger::debug("Loading noise texture...");
-    {
-        DirectX::CreateDDSTextureFromFile(device, globals::d3d::context, L"Data\\Shaders\\ScreenSpaceRayTracing\\noise.dds",
-            nullptr, noiseSRV.put());
-    }
-
-	CompileComputeShaders();
 }
+#endif
 
 void ScreenSpaceRayTracing::ClearShaderCache()
 {
@@ -547,8 +555,11 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     auto buffer = ssrtCB->CB();
     context->CSSetConstantBuffers(1, 1, &buffer);
 
+    // (audit P6) Specular raymarch UAV slots: u0 radiance/confidence,
+	// u1 hit distance (was u2; u1 came free when texHitPDF was dropped). The SVGF
+	// temporal pass below reuses u0/u1 for its own two outputs.
     std::array<ID3D11ShaderResourceView*, 12> srvs = { nullptr };
-	std::array<ID3D11UnorderedAccessView*, 3> uavs = { nullptr };
+	std::array<ID3D11UnorderedAccessView*, 2> uavs = { nullptr };
 
     auto resetViews = [&]() {
 		srvs.fill(nullptr);
@@ -593,8 +604,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     state->BeginPerfEvent("Raymarch");
     
     uavs.at(0) = texSSRColor->uav.get();
-    uavs.at(1) = texHitPDF->uav.get();
-    uavs.at(2) = texHitDistance->uav.get();
+    uavs.at(1) = texHitDistance->uav.get();  // (audit P6) was u2; u1 freed by dropping texHitPDF
 
     srvs.at(0) = texHistory->srv.get();
     srvs.at(1) = motion.SRV;
@@ -696,8 +706,11 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     }
 
     // output
+    // (audit P6) texOutput was a byte-identical copy of texSSRColor whose only reader
+    // was the deferred composite's SRV; that now binds texSSRColor->srv directly
+    // (Deferred.cpp), saving a full-screen R16G16B16A16 CopyResource per frame plus the
+    // texture itself.
     context->CopyResource(texHistoryNormals->resource.get(), normal.texture);
-    context->CopyResource(texOutput->resource.get(), texSSRColor->resource.get());
     context->CopyResource(texHistory->resource.get(), texSSRColor->resource.get());
 
     context->CSSetShader(nullptr, nullptr, 0);
@@ -746,8 +759,13 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     auto buffer = ssrtCB->CB();
     context->CSSetConstantBuffers(1, 1, &buffer);
 
+    // (audit P6) Raymarch UAV slots: u0 radiance/confidence, u1..u4 SHARC (bound only
+	// while SHARC is enabled, and only declared by the SHARC shader permutations). Keep
+	// this in lockstep with the register map at the top of ssrt_raymarch.hlsl and
+	// sharc_resolve.hlsl. The SVGF temporal pass below reuses slots u0/u1 for its own
+	// two outputs, so the array is never smaller than 2.
     std::array<ID3D11ShaderResourceView*, 13> srvs = { nullptr };
-	std::array<ID3D11UnorderedAccessView*, 6> uavs = { nullptr };
+	std::array<ID3D11UnorderedAccessView*, 5> uavs = { nullptr };
 
     auto resetViews = [&]() {
 		srvs.fill(nullptr);
@@ -775,12 +793,14 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     }
 
     uavs.at(0) = texSSRTDiffuseColor->uav.get();
-    uavs.at(1) = texHitPDF->uav.get();
 #ifdef ENABLE_SHARC
-    uavs.at(2) = sharcHashEntries->uav.get();
-    uavs.at(3) = sharcHashCopyOffsets->uav.get();
-    uavs.at(4) = sharcVoxelData->uav.get();
-    uavs.at(5) = sharcVoxelDataPrev->uav.get();
+    if (settings.EnableSharc) {
+        EnsureSharcResources();  // (audit P6) allocate on first enable, before any dispatch binds them
+        uavs.at(1) = sharcHashEntries->uav.get();
+        uavs.at(2) = sharcHashCopyOffsets->uav.get();
+        uavs.at(3) = sharcVoxelData->uav.get();
+        uavs.at(4) = sharcVoxelDataPrev->uav.get();
+    }
 #endif
 
     srvs.at(0) = texHistoryDiffuse->srv.get();

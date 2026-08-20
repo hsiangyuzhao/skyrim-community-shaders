@@ -47,16 +47,30 @@ Texture2DArray<float3> stbn_vec3_2Dx1D_128x128x64 : register(t11);
 #endif
 Texture2D<float3> AlbedoTexture : register(t12);
 
+// UAV register map (audit P6 / #20). Must stay in lockstep with the `uavs` arrays in
+// ScreenSpaceRayTracing::DrawSSRTDiffuse / DrawSSRTSpecular:
+//   u0                       radiance + confidence output       (all permutations)
+//   u1     SSRT_SPECULAR     specular hit distance -> texHitDistance, consumed by
+//                            Upscaling.cpp as the DLSS-RR specular guide
+//   u1..u4 SHARC_*           hash entries / copy offsets / voxel data / voxel prev
+// SSRT_SPECULAR and the SHARC permutations are mutually exclusive (SHARC only exists on
+// the diffuse path), so both may claim u1.
+// The former u1, SSRPDFOutput -> texHitPDF, had no consumer anywhere in the pipeline
+// and is gone. That also resolves the old u2 double declaration in the specular
+// permutation (SSRTHitDistanceOutput plus u_SharcHashEntriesBuffer), which only
+// compiled because fxc strips the unused one.
 RWTexture2D<float4> SSRColorOutput : register(u0);
-RWTexture2D<float4> SSRPDFOutput : register(u1);
+
 #if defined(SSRT_SPECULAR)
-RWTexture2D<float> SSRTHitDistanceOutput : register(u2);
+RWTexture2D<float> SSRTHitDistanceOutput : register(u1);
 #endif
 
-RWStructuredBuffer<uint2> u_SharcHashEntriesBuffer : register(u2);
-RWStructuredBuffer<uint> u_HashCopyOffsetBuffer : register(u3);
-RWStructuredBuffer<uint4> u_SharcVoxelDataBuffer : register(u4);
-RWStructuredBuffer<uint4> u_SharcVoxelDataBufferPrev : register(u5);
+#if SHARC_UPDATE || SHARC_RENDER
+RWStructuredBuffer<uint2> u_SharcHashEntriesBuffer : register(u1);
+RWStructuredBuffer<uint> u_HashCopyOffsetBuffer : register(u2);
+RWStructuredBuffer<uint4> u_SharcVoxelDataBuffer : register(u3);
+RWStructuredBuffer<uint4> u_SharcVoxelDataBufferPrev : register(u4);
+#endif
 
 cbuffer SSRTCB : register(b1)
 {
@@ -458,7 +472,6 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     float3 debug;
 
     float4 outColor = float4(0, 0, 0, 0);
-    float4 outPDF = float4(0, 0, 0, 0);
 
     float2 uv = float2(coords.xy + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
     uint eyeIndex = Stereo::GetEyeIndexFromTexCoord(uv);
@@ -528,7 +541,9 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
 #else
     float4 localSample = 0.f;  // (audit P4) single sample per pixel, no LDS needed
 #endif
-    float hit_distance = 65536;
+#if defined(SSRT_SPECULAR)
+    float hit_distance = 65536;  // "no hit"; fed to DLSS-RR as the specular hit distance
+#endif
 
 #if SHARC_RENDER
     SharcParameters sharcParameters;
@@ -600,11 +615,8 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
             sampleColor *= SharedData::ssrtSettings.DiffuseMult;
 #else
             sampleColor *= SharedData::ssrtSettings.SpecularMult;
-#endif
-
-            outPDF.xyz += hit * confidence;
-            outPDF.w += pdf * confidence;
             hit_distance = world_ray_length;
+#endif
         }
         const float NdotV = saturate(dot(normalize(view_space_ray), view_space_surface_normal));
 #if defined(DYNAMIC_CUBEMAPS) && !SHARC_UPDATE
@@ -719,7 +731,6 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
 #if defined(SSRT_SPECULAR)
     outColor = localSample;
     SSRColorOutput[coords.xy] = outColor;
-    SSRPDFOutput[coords.xy] = outPDF;
     SSRTHitDistanceOutput[coords.xy] = hit_distance;
 #elif SHARC_UPDATE
 #else
@@ -733,7 +744,6 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
         outColor.xyz /= SAMPLES_PER_PIXEL;
         outColor.w = saturate(outColor.w / SAMPLES_PER_PIXEL);
         SSRColorOutput[coords.xy] = outColor;
-        SSRPDFOutput[coords.xy] = outPDF;
     }
 #endif
 }

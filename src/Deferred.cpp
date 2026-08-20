@@ -448,7 +448,9 @@ void Deferred::DeferredPasses()
 			ssgi_hq_spec ? ssgi_gi_spec : nullptr,
 			ibl.loaded ? ibl.diffuseIBLTexture->srv.get() : nullptr,
 			ibl.loaded ? ibl.diffuseSkyIBLTexture->srv.get() : nullptr,
-			(ssrt.loaded && ssrt.settings.EnableSpecular) ? ssrt.texOutput->srv.get() : nullptr,
+			// (audit P6) Bind the specular result directly; texOutput was a redundant
+			// full-screen copy of it made at the end of DrawSSRTSpecular.
+			(ssrt.loaded && ssrt.settings.EnableSpecular) ? ssrt.texSSRColor->srv.get() : nullptr,
 			physSky.loaded ? physSky.texApLut->srv.get() : nullptr,
 			physSky.loaded ? physSky.texApShadow->srv.get() : nullptr,
 		};

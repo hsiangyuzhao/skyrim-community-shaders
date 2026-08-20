@@ -36,6 +36,12 @@ struct ScreenSpaceRayTracing : Feature
 	virtual void SetupResources() override;
 	virtual void ClearShaderCache() override;
 	void CompileComputeShaders();
+#ifdef ENABLE_SHARC
+	/// @brief Allocates the four SHARC structured buffers on first use (audit P6).
+	/// Called from DrawSSRTDiffuse before any dispatch that binds them, so enabling
+	/// SHARC at runtime cannot dispatch against null UAVs.
+	void EnsureSharcResources();
+#endif
 
     bool HasShaderDefine(RE::BSShader::Type) override { return true; };
     virtual bool SupportsVR() override { return true; };
@@ -110,7 +116,6 @@ struct ScreenSpaceRayTracing : Feature
     eastl::unique_ptr<Texture2D> texColor = nullptr;
     eastl::unique_ptr<Texture2D> texSSRColor = nullptr;
     eastl::unique_ptr<Texture2D> texSSRTDiffuseColor = nullptr;
-    eastl::unique_ptr<Texture2D> texHitPDF = nullptr;
     eastl::unique_ptr<Texture2D> texHistory = nullptr;
     eastl::unique_ptr<Texture2D> texHistoryDiffuse = nullptr;
     eastl::unique_ptr<Texture2D> texTemporal = nullptr;
@@ -119,8 +124,11 @@ struct ScreenSpaceRayTracing : Feature
     eastl::unique_ptr<Texture2D> texHistoryMomentsDiffuse = nullptr;
     eastl::unique_ptr<Texture2D> texHistoryNormals = nullptr;
     eastl::unique_ptr<Texture2D> texVariance = nullptr;
-    eastl::unique_ptr<Texture2D> texOutput = nullptr;
-    Texture2D* texHitDistance = nullptr;
+    /// @brief Specular hit distance; consumed by Upscaling.cpp as the DLSS-RR guide.
+    /// Was a raw `Texture2D*` from a bare `new` and leaked (audit #20).
+    eastl::unique_ptr<Texture2D> texHitDistance = nullptr;
+    // (audit P6 / #20) texHitPDF (was u1) and texOutput (a redundant full-screen copy
+    // of texSSRColor) had no consumer anywhere and are gone.
 
 #ifdef ENABLE_SHARC
     eastl::unique_ptr<Buffer> sharcHashEntries = nullptr;
