@@ -598,7 +598,44 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     float3 world_space_normal = normalize(mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0)).xyz);
     float3 view_space_surface_normal = normalVS;
     float3 view_space_ray_direction = normalize(view_space_ray);
-    view_space_ray += view_space_surface_normal * NormalBias * view_space_ray.z * GAME_UNIT_TO_M;
+    // (audit #4) Offsetting purely along the surface normal produces almost no *depth*
+    // offset on a grazing surface, which is precisely where one is needed.
+    //
+    // View space here is right-handed with +z forward and the depth buffer is not
+    // inverted (see SSRT_IS_FAR_PLANE). The old `N * NormalBias * z * GAME_UNIT_TO_M`
+    // moves the origin by 0.001428 * z * N, whose NDC depth component is
+    // ~ n * 0.001428 * N.z / z: at n = 15, z = 1000 that is 2.1e-5 * N.z. On a grazing
+    // surface |N.z| -> 0 and the offset vanishes, while the same surface's per-pixel NDC
+    // depth gradient reaches ~1e-4. The very first `above_surface = surface_z >
+    // position.z` test then fails, current_t never advances, the mip walks down to -1 and
+    // the traversal returns position ~= origin -- a self-intersection reported as a hit
+    // one texel from the origin. That is the mechanism behind the "grazing ground is
+    // black and noisy" symptom, and (via #5) behind the accidental contact darkening.
+    //
+    // Two corrections, both scoped to grazing angles so the near-normal behaviour the
+    // contact regions depend on is untouched:
+    //
+    //  * tilt the offset direction from N towards the camera by mixing in
+    //    -view_space_ray_direction. Motion towards the camera reduces view z directly,
+    //    independent of the incidence angle. At near-normal incidence N ~= -D already, so
+    //    normalize(N - D) ~= N and nothing changes; at grazing it becomes a 45-degree
+    //    blend with a full-strength depth component. Normalising is a deliberate
+    //    departure from the audit's reference expression, which leaves the raw difference
+    //    (length 2 at normal incidence, 1.41 at grazing) and would silently double the
+    //    bias everywhere -- weakening exactly the short-range contact hits that carry
+    //    the hair/foliage look.
+    //
+    //  * scale by 1 / max(|N.D|, 0.1). The depth gradient the bias has to clear grows as
+    //    tan(incidence) ~ 1 / |N.D|, so this tracks it instead of fighting it, capped at
+    //    10x. At z = 1000 the offset goes from 1.4 game units of which almost none is
+    //    depth, to ~14 units almost all of which is -- about three texels of grazing
+    //    gradient, enough for the first advance to clear the surface.
+    const float view_space_normal_dot_ray = dot(view_space_surface_normal, view_space_ray_direction);
+    float3 view_space_bias_direction = view_space_surface_normal - view_space_ray_direction;
+    // Degenerate only for N == D, i.e. a normal facing exactly away from the camera; the
+    // rsqrt form keeps it finite without a branch.
+    view_space_bias_direction *= rsqrt(max(dot(view_space_bias_direction, view_space_bias_direction), 1e-8));
+    view_space_ray += view_space_bias_direction * NormalBias * view_space_ray.z * GAME_UNIT_TO_M / max(abs(view_space_normal_dot_ray), 0.1);
     float pdf;
     float3 view_space_reflected_direction = SampleReflectionVector(view_space_ray_direction, view_space_surface_normal, roughness, coords, sample_id, SAMPLES_PER_PIXEL, pdf);
     screen_uv_space_ray_origin = ProjectPosition(view_space_ray, FrameBuffer::CameraProj[eyeIndex]);
