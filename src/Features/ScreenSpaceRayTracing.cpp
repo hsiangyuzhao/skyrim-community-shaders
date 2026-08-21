@@ -393,12 +393,16 @@ void ScreenSpaceRayTracing::DrawSettings()
             "time. Well understood, mild when it misbehaves.\n\n"
             "On is the mathematically correct version, which corrects for that camera turn. It "
             "should be strictly better -- but only if an assumption about the game's own camera "
-            "matrices holds, and that cannot be checked outside the game. If the assumption is "
-            "wrong, this version throws away the entire screen and the denoiser stops working "
-            "altogether.\n\n"
-            "So it is off by default and this switch is how it gets proven. Turn it on: if the "
-            "picture keeps accumulating just as well, the correct version is safe to adopt. If "
-            "accumulation collapses, the assumption is wrong and off is the right default.");
+            "matrices holds, and that cannot be checked outside the game.\n\n"
+            "That assumption is now checked at runtime, every frame, per pixel: the correction has "
+            "to leave a surface direction the same length it started, which nothing but a genuine "
+            "camera rotation does. Where the check fails the uncorrected version runs instead and "
+            "History Debug View paints the pixel magenta, so this switch can no longer take the "
+            "screen down with it -- the worst it can do now is quietly do nothing.\n\n"
+            "So it is off by default and this switch is how it gets proven. Turn it on with "
+            "History Debug View also on: no magenta means the correction is sound and safe to "
+            "adopt as the default; magenta everywhere means the assumption is wrong and off is "
+            "right.");
 
     ImGui::Checkbox("History Debug View", &settings.HistoryDebugView);
     if (auto _tt = Util::HoverTooltipWrapper())
@@ -413,6 +417,14 @@ void ScreenSpaceRayTracing::DrawSettings()
             "  Red -- history thrown away by the depth/plane check.\n"
             "  Green -- history thrown away by the 30 degree facing check.\n"
             "  Blue -- history thrown away for being off screen, corrupt, or empty.\n"
+            "  Yellow or orange -- the plane check could not be set up for that pixel, so it was "
+            "skipped and the history was judged on facing and bounds alone. Any yellow means "
+            "\"test not run\", not \"history rejected\". The four shades say why: pale yellow -- "
+            "the point has no place in last frame's view at all; orange -- last frame's camera "
+            "cannot see it; dark orange -- the surface is exactly edge-on; lemon -- the tolerance "
+            "came out nonsense.\n"
+            "  Magenta -- only possible with Rotated Normal Gate on: the camera-turn correction "
+            "failed its own sanity check, so the uncorrected facing check ran instead.\n"
             "  Black -- sky, or nothing to shade.\n\n"
             "A few coloured pixels along edges and around moving things is normal and correct. "
             "One flat colour covering the whole screen is the fault: it means that one check is "
@@ -1708,11 +1720,16 @@ ScreenSpaceRayTracing::SharedData ScreenSpaceRayTracing::GetCommonBufferData()
     // Every condition under which the term does not reach the frame has to clear this, or the ray
     // march suppresses its own near-field darkening and nothing replaces it -- which would be
     // strictly worse than the flicker the suppression exists to remove. So: the package present,
-    // the feature on, its contact pass on, *and* its shaders actually compiled -- ShadersOK() is
-    // the same test DrawSSGI uses before it decides to clear the AO output instead of writing it.
+    // the feature on, its contact pass actually dispatching, *and* its shaders compiled --
+    // ShadersOK() is the same test DrawSSGI uses before it decides to clear the AO output instead
+    // of writing it.
+    //
+    // (P2.4 follow-up) contactAoActive rather than settings.EnableContactAo, because the setting
+    // is the request and this is what the pass is doing. It is the same predicate DrawSSGI
+    // dispatches on, so this flag and the texture's contents cannot disagree.
     auto& ssgi = globals::features::screenSpaceGI;
     const bool ssgiContactLive =
-        ssgi.loaded && ssgi.settings.Enabled && ssgi.settings.EnableContactAo && ssgi.ShadersOK();
+        ssgi.loaded && ssgi.settings.Enabled && ssgi.contactAoActive && ssgi.ShadersOK();
     data.SsgiContactAoActive = ssgiContactLive ? 1u : 0u;
     data.SsgiContactRadius = ssgi.settings.ContactRadius;
     return data;

@@ -398,33 +398,73 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 //     walking towards the camera. That is the only thing this test should reject, and it is
 //     precisely the ghost source the depth test was added for.
 //
-// It is also cheaper per tap than the form it replaces. Write v = (ndc.x, ndc.y, rawDepth, 1)
-// for the tap and Pinv for the projection inverse; the tap's previous-view-space position is
-// P = (Pinv * v).xyz / (Pinv * v).w, so
-//     dot(N, P) - dot(N, C) = dot(A - dot(N, C) * W, v) / dot(W, v),
-// with A = N.x * Pinv[0] + N.y * Pinv[1] + N.z * Pinv[2] and W = Pinv[3] -- both foldable once
-// per lane. Multiplying the comparison through by |dot(W, v)| removes the division as well, so
-// a tap costs two dot4s and a compare, against the two linearising divides the depth form
-// needed. It also cannot manufacture a non-finite value from finite inputs, which is what
-// lets the degenerate case (a tap on the previous camera plane, w -> 0) reject by arithmetic
-// rather than by a guard: the right-hand side goes to zero with it.
+// ---------------------------------------------------------------------------------------------
+// (P2.4 follow-up) HOW THE PLANE IS BUILT, AND WHY IT NO LONGER COMPOSES TWO MATRICES
 //
-// The NDC pair is folded into those two rows as well, so a tap never builds one. A tap's NDC
-// is affine in its integer index -- ndc = s * pixel + o with s = float2(2, -2) / prevRenderSize
-// and o = 0.5 * s + float2(-1, 1) for texel centres at index + 0.5 -- so for any row R,
-//     dot(R, v) = dot(float4(R.x * s.x, R.y * s.y, R.z, R.x * o.x + R.y * o.y + R.w),
-//                     float4(pixel.x, pixel.y, rawDepth, 1)).
-// Both stored rows are already in that folded form, which is why they are documented against
-// the *pixel index* rather than against NDC.
+// The first implementation of this test reached the previous frame's view space by composing the
+// published forward previous view-projection with the *current* projection inverse
+// (projInv * CameraPreviousViewProjUnjittered), reconstructed every tap there, and compared
+// against a plane expressed in that space. The algebra is correct on paper and it was measured
+// dead in game: the diagnostic view came back uniformly blue on every pixel, and forcing history
+// acceptance came back uniformly white -- which pins the failure on the plane *construction*
+// (every other gate passed and the whole denoising chain downstream was healthy). A composition
+// of two engine matrices depends on assumptions about their contents -- storage transpose,
+// multiplication order, and the two frames sharing a projection -- that no amount of offline
+// derivation can settle, so the composition is gone rather than debugged.
 //
-// One approximation is worth naming. Only the *forward* previous view-projection is published
-// (CameraPreviousViewProjUnjittered), so the previous frame's view space is reached by
-// composing it with the *current* projection inverse. That composition is exactly the previous
-// view transform whenever the two frames share a projection matrix, which is every frame
-// except those where the FOV is animating (a bow zoom, a killcam). During such a frame both
-// sides of the subtraction are warped by the same map, so a small difference vector survives
-// up to a mild local scaling -- the tolerance absorbs it, and the alternative would be
-// inverting a 4x4 per lane.
+// The replacement uses only operations that some *other* shader in this build already depends on
+// in game, and only in the forward direction:
+//   * uv + raw depth -> current view space, via CameraProjUnjitteredInverse. Same call
+//     ReprojectHit makes for every pixel of this pass (ssrt_common.hlsli), and the same
+//     operation ssrt_raymarch's InvProjectPosition performs for every ray it traces.
+//   * current view space -> world, via CameraViewInverse. ReprojectHit again, plus
+//     ssrt_raymarch's world_space_origin, which every SHARC lookup is addressed by.
+//   * world rebase, + CameraPosAdjust - CameraPreviousPosAdjust. The engine moves its world
+//     origin as the player walks and the previous view-projection is defined against the
+//     previous origin. Exactly the correction ScreenSpaceGI's radianceDisocc applies (its own
+//     disocclusion test works in game) and that DynamicCubemaps' UpdateCubemapCS applies.
+//   * world -> previous clip, via mul(CameraPreviousViewProjUnjittered, float4(world, 1)).
+//     The forward direction only. This is MotionBlur::GetSSMotionVector's second line, which
+//     DeferredCompositeCS uses to publish the sky's motion vectors -- consumed by TAA/DLSS every
+//     frame, so a wrong result there would be visible as smeared sky rather than as silence.
+//   * SharedData::GetScreenDepth, to linearise depth. Used by this feature's own bilateral
+//     weights (ssrt_common.hlsli) and by ScreenSpaceGI.
+// No inverse of any *previous*-frame matrix appears, and no two matrices are multiplied
+// together.
+//
+// The trick that makes that sufficient is to stop reconstructing taps at all and to describe the
+// plane in the space the taps already live in: previous-frame pixel index plus previous-frame
+// depth. A perspective projection sends planes to planes, so the current pixel's tangent plane
+// has an exact description there. Concretely, with px, py the previous-frame pixel index and
+// z the previous-frame *linear* view depth, screen position is proportional to x/z and y/z, so
+// writing a view-space point as (z*u(px), z*v(py), z) turns the plane equation dot(N, X) = k
+// into
+//     N.x * u(px) + N.y * v(py) + N.z = k / z,
+// whose left side is affine in (px, py). So 1/z restricted to the plane is an affine function of
+// the pixel index:
+//     invZ_plane(px, py) = A * px + B * py + C.
+// Three points determine (A, B, C), and three points are what the forward chain above can
+// produce: the shaded surface point itself and two neighbours a short step along the surface.
+// Because the map is exact, the step length affects only conditioning, not the answer.
+//
+// A tap then costs a dot2, an add, a reciprocal and one GetScreenDepth: predicted linear depth
+// of the plane at the tap's own pixel, against the tap's own linear depth. That is the same
+// quantity the folded-row form measured -- distance from the plane along the view ray -- so
+// SSRT_HISTORY_PLANE_TILT and the tolerance below keep their meaning and their tuning.
+//
+// Failure is now attributable instead of silent. Each of the four ways the construction can give
+// up sets its own code on the returned struct, the diagnostic view paints each in its own shade
+// of yellow, and a pixel whose plane could not be built *bypasses* the plane test rather than
+// failing it -- see the bypass at IsValidHistory. There is no longer any path by which a broken
+// plane rejects the whole screen without saying so.
+//
+// The pixel-index-to-NDC map is the same one this pass has always used -- ndc = s * pixel + o
+// with s = float2(2, -2) / prevRenderSize and o = 0.5 * s + float2(-1, 1) for texel centres at
+// index + 0.5 -- applied in the forward direction here, i.e. pixel = (ndc - o) / s. It spans the
+// whole buffer rather than one eye's half, which under VR is the same approximation the folded
+// rows made and is carried over deliberately: correcting it is a separate, VR-testable change,
+// and changing it blind would trade a known state for an unknown one.
+// ---------------------------------------------------------------------------------------------
 
 // (defect D3, replaced) The plane-distance budget, as a multiple of the view-space size of one
 // texel at this pixel's depth.
@@ -470,133 +510,178 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // occluder that could ghost.
 #define SSRT_HISTORY_PLANE_MIN_NOV 0.1f
 
+// (P2.4 follow-up) How far the two tangent probes step along the surface, in texels of
+// perpendicular view-space extent at this pixel's depth.
+//
+// The projection sends planes to planes exactly, so this length cannot change the plane that
+// comes out -- only how well conditioned the 2x2 solve for it is. Wanting it large fights
+// wanting the three probes to stay near the shaded pixel where fp32 cancellation in the
+// previous-clip divide is smallest. 16 texels leaves the probes' screen separation two orders of
+// magnitude above the float epsilon of a 4096-wide buffer even at a 10x grazing foreshortening,
+// while the probe triangle stays inside a 16-texel neighbourhood of the pixel.
+#define SSRT_HISTORY_PLANE_PROBE_TEXELS 16.0f
+
+// (P2.4 follow-up) Conditioning floor for the plane solve: the sine of the angle between the two
+// probe edges in previous screen space, below which the three probes are treated as collinear and
+// no plane is published. Scale free, so it means the same thing at every depth and resolution.
+// Reached only when the tangent basis projects to a line, i.e. an exactly edge-on surface.
+#define SSRT_HISTORY_PLANE_MIN_SIN 1e-4f
+
+// (P2.4 follow-up) Self-check band for the inter-frame rotation that rotatedNormalGate needs.
+//
+// A rotation preserves length, so a unit normal must come back out with unit length. The old
+// code only tested the result against 1e-12, which passes for *any* garbage the composition
+// might produce; that is exactly the "nonsense normal rejects every candidate on screen" failure
+// the comment below warns about, left undetected. 0.25 is loose enough that no plausible
+// projection-scale residual trips it and tight enough that a wrong multiplication order or a
+// transposed matrix cannot slip through.
+#define SSRT_HISTORY_ROTATION_TOLERANCE 0.25f
+
+// (P2.4 follow-up) Why the plane could not be built. Zero means it was. Painted by the
+// diagnostic view as four distinguishable yellows; see SSRT_DebugPlaneFailColour.
+#define SSRT_PLANE_OK 0u
+// The shaded point does not land inside the previous frame's depth range, so no history texel
+// anywhere stands for anything this plane could be compared with.
+#define SSRT_PLANE_FAIL_PREV_RANGE 1u
+// A probe's previous-clip position is non-finite, or sits on/behind the previous camera plane.
+#define SSRT_PLANE_FAIL_PROJECT 2u
+// The three probes are collinear in previous screen space: the solve has no unique answer.
+#define SSRT_PLANE_FAIL_DEGENERATE 3u
+// The tolerance came out non-finite or non-positive, which would reject every tap forever.
+#define SSRT_PLANE_FAIL_TOLERANCE 4u
+
 struct SSRTHistoryPlane
 {
-    // dot(offsetRow, q) = (signed plane distance of the tap) * dot(wRow, q), for
-    // q = float4(tap pixel index xy, tap raw depth, 1). See the derivation above, including
-    // why the index rather than NDC.
-    float4 offsetRow;
-    // The w row of the unprojection, in the same folded form: the homogeneous divisor the
-    // comparison is multiplied through by instead of dividing by.
-    float4 wRow;
-    // The current normal expressed in the *previous* frame's view space. The plane rows below
-    // are built from this and *must* be: the taps are reconstructed in previous view space, so
-    // the plane they are tested against has to live there too. Falls back to the un-rotated
-    // current normal if the rotation cannot be built at all.
-    // Also read by the caller, which picks between it and the un-rotated normal to form the
-    // normal the 30 degree gate compares; see rotatedNormalGate and SSRT_SelectNormalGate.
-    // That selection deliberately lives outside this struct -- adding an eighth field for it
-    // makes fxc lose track of the struct's initialisation and warn X4000 on the early returns
-    // below, even though every field is assigned before any of them.
+    // (P2.4 follow-up) invZ_plane(px, py) = dot(depthRow.xy, float2(px, py)) + depthRow.z, the
+    // reciprocal of the previous-frame linear view depth at which this pixel's tangent plane
+    // crosses previous-frame pixel (px, py). See the derivation above for why 1/z rather than z
+    // is the affine one. .w is unused; the field is a float4 because a float3 costs the same
+    // register and reads worse next to the two-component dot.
+    float4 depthRow;
+    // The current normal expressed in the *previous* frame's view space, for rotatedNormalGate
+    // and nothing else -- the plane above no longer needs it, which is the point of the rebuild.
+    // Falls back to the un-rotated current normal whenever the rotation fails its self-check, so
+    // the gate can never be handed a nonsense direction and reject the whole screen.
+    // Read by the caller, which picks between it and the un-rotated normal; see
+    // rotatedNormalGate and SSRT_SelectNormalGate. That selection deliberately lives outside
+    // this struct -- adding an eighth field for it makes fxc lose track of the struct's
+    // initialisation and warn X4000 on the early returns below, even though every field is
+    // assigned before any of them.
     float3 normalPrev;
     // Absolute plane-distance budget per texel of tangential slop; each call site scales it by
     // (its own worst tap offset + SSRT_HISTORY_PLANE_MV_TEXELS).
     float tolerancePerTexel;
     bool usable;
     bool normalUsable;
+    // (P2.4 follow-up) SSRT_PLANE_OK, or which of the four constructions above gave up. Carried
+    // for the diagnostic view only: nothing in the acceptance path reads it.
+    uint failCode;
 };
+
+// (P2.4 follow-up) One current-view-space point through the forward chain to the previous
+// frame's (pixel index xy, reciprocal linear depth z, raw NDC depth w). Returns false if the
+// point has no finite image there, which is the only thing that can go wrong in it.
+//
+// Every step is an operation some shader in this build already runs in game; see the block
+// comment above for which one vouches for each. Nothing here composes two matrices, and no
+// previous-frame matrix is inverted.
+//
+// .z is the coordinate the plane is affine in and .w is only carried so the caller can apply the
+// previous frame's depth *range* test to the centre probe. They are related by an affine map
+// (1 / GetScreenDepth(d) = (CameraData.x - d * CameraData.z) / CameraData.w), which is exactly why
+// the fit below stays exact for probes that land outside the previous frustum: reciprocal view
+// depth is affine in the pixel index on a plane, and this .z is an affine function of that.
+bool SSRTProbeToPrevScreen(float3 viewPos, float2 prevRenderSize, uint eyeIndex, out float4 outPrev)
+{
+    outPrev = 0.0f;
+
+    float4 world = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(viewPos, 1.0f));
+    if (!isFiniteSafe(world) || world.w == 0.0f)
+        return false;
+    // Rebased onto the previous frame's world origin, which is what
+    // CameraPreviousViewProjUnjittered is defined against.
+    const float3 prevWorld = world.xyz / world.w +
+                             FrameBuffer::CameraPosAdjust[eyeIndex].xyz -
+                             FrameBuffer::CameraPreviousPosAdjust[eyeIndex].xyz;
+
+    const float4 prevClip = mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(prevWorld, 1.0f));
+    // A point on the previous camera plane has w = 0 and no image at all. The bit test rather
+    // than isfinite() for the usual reason (see isFiniteSafe): fxc may assume its inputs finite
+    // without /Gis, so the guard has to look at the bits.
+    if (!isFiniteSafe(prevClip) || abs(prevClip.w) < 1e-9f)
+        return false;
+
+    const float3 prevNDC = prevClip.xyz / prevClip.w;
+    if (!isFiniteSafe(prevNDC))
+        return false;
+
+    // The inverse of the pixel-index-to-NDC map this pass has always used; see the block comment.
+    const float2 prevPixel = float2((prevNDC.x + 1.0f) * 0.5f * prevRenderSize.x - 0.5f,
+                                    (1.0f - prevNDC.y) * 0.5f * prevRenderSize.y - 0.5f);
+    // Linear view depth, from the same helper this feature's bilateral weights use. Reciprocal,
+    // because that is the coordinate in which a plane stays a plane.
+    const float prevLinear = SharedData::GetScreenDepth(prevNDC.z);
+    if (!isFiniteSafe(prevLinear) || abs(prevLinear) < 1e-6f)
+        return false;
+
+    outPrev = float4(prevPixel, 1.0f / prevLinear, prevNDC.z);
+    return isFiniteSafe(outPrev);
+}
 
 SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalVS, float2 prevRenderSize, uint eyeIndex)
 {
     SSRTHistoryPlane plane;
-    plane.offsetRow = 0.0f;
-    plane.wRow = 0.0f;
-    // Seeded with the un-rotated normal, so a rotation that cannot be built leaves both the
-    // plane rows and the gate selection on the shipped pre-D3 value rather than on an
-    // undefined one.
+    plane.depthRow = 0.0f;
+    // Seeded with the un-rotated normal, so a rotation that cannot be built leaves the gate
+    // selection on the shipped pre-D3 value rather than on an undefined one.
     plane.normalPrev = normalVS;
     plane.tolerancePerTexel = 0.0f;
     plane.usable = false;
     plane.normalUsable = false;
+    plane.failCode = SSRT_PLANE_FAIL_PROJECT;
 
     const float4x4 projInv = FrameBuffer::CameraProjUnjitteredInverse[eyeIndex];
 
-    // --- the current surface point, in current view space and then in current world space ---
+    // --- the current surface point, in current view space ---
     const float2 thisScreen = (uv - 0.5f) * float2(2.0f, -2.0f);
     float4 thisView = mul(projInv, float4(thisScreen, rawDepth, 1.0f));
     thisView.xyz = thisView.xyz / thisView.w;
-    float4 thisWorld = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(thisView.xyz, 1.0f));
-    thisWorld.xyz = thisWorld.xyz / thisWorld.w;
 
-    // --- the current normal, in previous view space ---
+    // --- the current normal, in previous view space (rotatedNormalGate only) ---
     // CameraViewInverse is rigid, so its linear part transforms a direction directly. The trip
-    // out through the previous view-projection and back in through the projection inverse
-    // leaves exactly the inter-frame camera rotation (the two projections cancel; see the note
-    // on the FOV-animating case above), and normalize() absorbs any residual scale. A direction
-    // carries w = 0, so no division is involved and there is nothing to guard.
+    // out through the previous view-projection and back in through the projection inverse is
+    // *meant* to leave exactly the inter-frame camera rotation, the two projections cancelling.
     //
-    // (diagnostic H) It was *also* meant to repair the other half of the acceptance test. The
-    // 30 degree agreement compares against HistoryNormalsTexture, which holds the previous
-    // frame's view-space normals, so feeding it an un-rotated current normal biases the dot
-    // product by the whole inter-frame camera rotation -- over-rejecting during exactly the
-    // fast turns where a rebuilt accumulation is most expensive.
+    // (diagnostic H) It was meant to repair the other half of the acceptance test. The 30 degree
+    // agreement compares against HistoryNormalsTexture, which holds the previous frame's
+    // view-space normals, so feeding it an un-rotated current normal biases the dot product by
+    // the whole inter-frame camera rotation -- over-rejecting during exactly the fast turns
+    // where a rebuilt accumulation is most expensive.
     //
-    // That reasoning is correct and the algebra checks out, but it is not what the gate does
-    // by default any more, and the reason is worth stating plainly: the whole construction
-    // depends on the composition below really being the inter-frame camera rotation for this
-    // engine's actual matrices, and that is an assumption about matrix *contents* which no
-    // amount of offline review can settle. If it does not hold, this normal is nonsense and
-    // the 30 degree test rejects every candidate on screen -- the exact failure the plane
-    // repair was made to fix, reintroduced one line away from it. The un-rotated comparison
-    // has a known, measured, benign failure mode by contrast, so it keeps the default and
-    // this form is reached only through rotatedNormalGate. See that flag's declaration.
+    // (P2.4 follow-up) That reasoning is correct on paper, and this composition is the last
+    // survivor of the class of construction that was measured dead: two engine matrices
+    // multiplied together, correct algebra, garbage in practice. It is kept only because
+    // rotatedNormalGate is a switch the user can ask for, it is no longer load-bearing for the
+    // plane, and it now has to pass a self-check before anything is allowed to use it.
     //
-    // The rotation is built unconditionally regardless, because the plane rows genuinely
-    // require it -- only the *comparison* is switchable.
+    // The self-check is the one property a rotation cannot fake: it preserves length. A unit
+    // normal in must come back out with unit length, within
+    // SSRT_HISTORY_ROTATION_TOLERANCE. A transposed matrix, a reversed multiplication order or a
+    // mismatched projection all break that, and on failure normalPrev keeps the un-rotated
+    // normal, normalUsable stays false, and the diagnostic view paints the pixel magenta. There
+    // is no path on which a bad composition quietly rejects the screen.
     const float3 normalWS = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0.0f)).xyz;
     const float3 normalPrevRaw = mul(projInv, mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(normalWS, 0.0f))).xyz;
     const float normalPrevLenSq = dot(normalPrevRaw, normalPrevRaw);
-    if (isFiniteSafe(normalPrevLenSq) && normalPrevLenSq > 1e-12f)
+    const float rotLo = (1.0f - SSRT_HISTORY_ROTATION_TOLERANCE) * (1.0f - SSRT_HISTORY_ROTATION_TOLERANCE);
+    const float rotHi = (1.0f + SSRT_HISTORY_ROTATION_TOLERANCE) * (1.0f + SSRT_HISTORY_ROTATION_TOLERANCE);
+    if (isFiniteSafe(normalPrevLenSq) && normalPrevLenSq > rotLo && normalPrevLenSq < rotHi)
     {
         plane.normalPrev = normalPrevRaw * rsqrt(normalPrevLenSq);
         plane.normalUsable = true;
     }
 
-    // --- the same point in previous world space, then in previous view space ---
-    // The game shifts its world origin as the player moves and CameraPreviousViewProjUnjittered
-    // is defined against the *previous* adjust point, so the rebasing is mandatory: without it
-    // every frame the game re-bases would reject the whole screen. (Same correction
-    // MotionBlur::GetSSMotionVector relies on its caller having done, and that
-    // ScreenSpaceGI's radianceDisocc does explicitly.)
-    const float3 prevWorld = thisWorld.xyz +
-                             FrameBuffer::CameraPosAdjust[eyeIndex].xyz -
-                             FrameBuffer::CameraPreviousPosAdjust[eyeIndex].xyz;
-    const float4 prevClip = mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(prevWorld, 1.0f));
-    const float prevNDC = prevClip.z / prevClip.w;
-
-    // Retained from the depth form, and for the same reason: a point outside the previous
-    // frame's depth range -- behind that near plane, or past its far plane -- had no history at
-    // all, so there is nothing for any tap to match and the plane would be meaningless. The bit
-    // test is what makes the range test a guard: an ordered comparison against a NaN is false,
-    // but fxc may assume its inputs finite without /Gis (see isFiniteSafe), and a point on the
-    // previous camera plane makes prevClip.w vanish and this ratio blow up.
-    if (!isFiniteSafe(prevNDC) || prevNDC <= 0.0f || prevNDC >= 1.0f)
-        return plane;
-
-    const float4 originH = mul(projInv, prevClip);
-    const float3 origin = originH.xyz / originH.w;
-    if (!isFiniteSafe(origin) || !plane.normalUsable)
-        return plane;
-
-    // --- fold the normal, the plane offset and the NDC mapping into two rows ---
-    // dot(N, (projInv * v).xyz) = dot(N.x * projInv[0] + N.y * projInv[1] + N.z * projInv[2], v),
-    // and subtracting dot(N, origin) * projInv[3] folds the plane's own offset in as well, so a
-    // tap's numerator is one dot4. The pixel-index-to-NDC map is folded in on top of that; see
-    // the derivation above for the two coefficient vectors.
-    const float4 rowA = plane.normalPrev.x * projInv[0] +
-                        plane.normalPrev.y * projInv[1] +
-                        plane.normalPrev.z * projInv[2];
-    const float4 rowW = projInv[3];
-    const float4 rowB = rowA - dot(plane.normalPrev, origin) * rowW;
-
-    const float2 ndcScale = float2(2.0f, -2.0f) / prevRenderSize;
-    const float2 ndcBias = 0.5f * ndcScale + float2(-1.0f, 1.0f);
-    plane.offsetRow = float4(rowB.x * ndcScale.x, rowB.y * ndcScale.y, rowB.z,
-                             rowB.x * ndcBias.x + rowB.y * ndcBias.y + rowB.w);
-    plane.wRow = float4(rowW.x * ndcScale.x, rowW.y * ndcScale.y, rowW.z,
-                        rowW.x * ndcBias.x + rowW.y * ndcBias.y + rowW.w);
-
-    // --- the tolerance ---
+    // --- the tolerance, and with it the probe step ---
     // View-space extent of one texel per unit of depth, i.e. 2 / (P00 * renderWidth): the same
     // quantity ScreenSpaceGI builds as NDCToViewMul / OUT_FRAME_DIM. Taking it from the
     // projection matrix and the render extent is what keeps the criterion dynamic-resolution
@@ -611,17 +696,85 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     // abs() so the sign convention of the view axis cannot matter. thisView.xyz is non-zero for
     // any rasterised pixel, the near plane being in front of the camera.
     const float NoV = abs(dot(normalVS, normalize(thisView.xyz)));
-    const float tolerance = SharedData::GetScreenDepth(rawDepth) * texelPerDepth * SSRT_HISTORY_PLANE_TILT /
+    const float linearCenter = SharedData::GetScreenDepth(rawDepth);
+    const float tolerance = linearCenter * texelPerDepth * SSRT_HISTORY_PLANE_TILT /
                             max(NoV, SSRT_HISTORY_PLANE_MIN_NOV);
 
     // Bit-test rather than isfinite() for the usual reason (see isFiniteSafe). A zero or
     // negative tolerance would reject every tap forever, which is the failure being repaired,
-    // so it is treated as "no usable plane" and the bypass switch remains the way out.
-    if (!(isFiniteSafe(plane.offsetRow) && isFiniteSafe(plane.wRow) && isFiniteSafe(tolerance)) || tolerance <= 0.0f)
+    // so it is reported as its own construction failure and the pixel bypasses the plane test.
+    if (!isFiniteSafe(tolerance) || tolerance <= 0.0f)
+    {
+        plane.failCode = SSRT_PLANE_FAIL_TOLERANCE;
         return plane;
-
+    }
     plane.tolerancePerTexel = tolerance;
+
+    // --- the three probes, and the plane they determine ---
+    // (P2.4 follow-up) One tangent basis of the shading plane in *current* view space, then the
+    // shaded point and two neighbours a fixed step along it, each pushed through the forward
+    // chain to the previous frame's (pixel index, 1 / linear depth). See the block comment above
+    // for why that triple determines the plane exactly and for what vouches for each step.
+    //
+    // The basis only has to span the plane; which two directions it picks is irrelevant to the
+    // answer. The float3(0, 0, 1) / float3(1, 0, 0) switch is the standard guard against
+    // crossing a vector with itself.
+    const float3 axis = abs(normalVS.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+    const float3 tangent0 = normalize(cross(normalVS, axis));
+    const float3 tangent1 = cross(normalVS, tangent0);
+    const float probeStep = SSRT_HISTORY_PLANE_PROBE_TEXELS * texelPerDepth * abs(linearCenter);
+
+    float4 p0, p1, p2;
+    const bool projected = SSRTProbeToPrevScreen(thisView.xyz, prevRenderSize, eyeIndex, p0) &&
+                           SSRTProbeToPrevScreen(thisView.xyz + tangent0 * probeStep, prevRenderSize, eyeIndex, p1) &&
+                           SSRTProbeToPrevScreen(thisView.xyz + tangent1 * probeStep, prevRenderSize, eyeIndex, p2);
+    if (!projected)
+    {
+        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        return plane;
+    }
+
+    // Retained from the folded-row form, unchanged in meaning and in bounds: a shaded point whose
+    // image falls outside the previous frame's depth range -- behind that near plane, or past its
+    // far plane -- had no history at all, so there is nothing for any tap to match. Applied to the
+    // centre probe only; the two tangent probes are allowed anywhere, since the plane they help
+    // define extends well past the frustum and the fit does not care (see SSRTProbeToPrevScreen).
+    if (p0.w <= 0.0f || p0.w >= 1.0f)
+    {
+        plane.failCode = SSRT_PLANE_FAIL_PREV_RANGE;
+        return plane;
+    }
+
+    // invZ = A * px + B * py + C through three points: a 2x2 solve on the two edges.
+    const float3 e0 = p1.xyz - p0.xyz;
+    const float3 e1 = p2.xyz - p0.xyz;
+    const float det = e0.x * e1.y - e0.y * e1.x;
+    // Scale-free conditioning test: |det| is the area of the parallelogram the two edges span in
+    // previous screen space, so dividing by their lengths turns it into the sine of the angle
+    // between them. Below the floor the probes are collinear and there is no unique plane.
+    const float e0Len = length(e0.xy);
+    const float e1Len = length(e1.xy);
+    if (!isFiniteSafe(det) || abs(det) <= SSRT_HISTORY_PLANE_MIN_SIN * e0Len * e1Len)
+    {
+        plane.failCode = SSRT_PLANE_FAIL_DEGENERATE;
+        return plane;
+    }
+
+    const float rcpDet = 1.0f / det;
+    const float A = (e0.z * e1.y - e1.z * e0.y) * rcpDet;
+    const float B = (e1.z * e0.x - e0.z * e1.x) * rcpDet;
+    const float C = p0.z - A * p0.x - B * p0.y;
+
+    const float4 depthRow = float4(A, B, C, 0.0f);
+    if (!isFiniteSafe(depthRow))
+    {
+        plane.failCode = SSRT_PLANE_FAIL_DEGENERATE;
+        return plane;
+    }
+
+    plane.depthRow = depthRow;
     plane.usable = true;
+    plane.failCode = SSRT_PLANE_OK;
     return plane;
 }
 
@@ -695,34 +848,42 @@ uint IsValidHistory(uint2 pixel, float2 uv, SSRTHistoryPlane plane, float3 norma
     // are unaffected; verified against the disassembly, which must declare t0 through t7.
     uint reason = SSRT_HISTORY_OK;
 
-    if (disableHistoryDepthTest == 0 && forceAcceptHistory == 0)
+    // (P2.4 follow-up) `plane.usable` joins the two bypass flags in the condition rather than
+    // rejecting inside the block, which is the single most important behavioural change here.
+    //
+    // It used to raise SSRT_HISTORY_REJ_DATA, so a construction that failed for every pixel on
+    // screen turned into a rejection of every pixel on screen -- silently, and reported in the
+    // same blue as a genuine out-of-bounds tap. That is exactly what was measured. A plane that
+    // could not be built is not evidence *against* a tap, it is the absence of evidence, so the
+    // honest response is to abstain: the bounds tests above, the 30 degree normal agreement
+    // below and guard G4 all stay in force, which is precisely the pre-D3 predicate. The
+    // diagnostic view paints these pixels yellow (see SSRT_DebugPlaneFailColour) so an abstention
+    // is loud rather than invisible -- and a full yellow screen now means "ghosting, plane test
+    // off" instead of "no history anywhere".
+    if (disableHistoryDepthTest == 0 && forceAcceptHistory == 0 && plane.usable)
     {
-        // Classified as data rather than as a plane rejection on purpose: the plane could not
-        // be built at all, so the test never ran and reporting it as a plane disagreement
-        // would point the reader at the wrong thing.
-        if (!plane.usable)
+        // The row already carries the pixel-index-to-NDC map, so the tap supplies only its own
+        // index and its own depth. A cleared history depth is the far plane (see
+        // ClearDenoiserHistory) and so is a previous-frame sky texel; both linearise to a
+        // distance enormously far from any plane through a shaded surface, so both reject without
+        // needing a case of their own.
+        const float tapLinear = SharedData::GetScreenDepth(HistoryDepthTexture[pixel]);
+        // The plane's own linear depth at this tap's pixel, from the affine reciprocal form.
+        const float invZPlane = dot(plane.depthRow.xy, float2(pixel)) + plane.depthRow.z;
+        // Data, not plane: the row was bit-tested finite when the plane was built and the tap
+        // depth is the only fresh input, so a non-finite value here means the history depth texel
+        // itself is corrupt.
+        if (!(isFiniteSafe(tapLinear) && isFiniteSafe(invZPlane)))
             reason = SSRT_HISTORY_REJ_DATA;
-        else
-        {
-            // Both rows already carry the pixel-index-to-NDC map, so the tap only supplies its
-            // own index and depth. A cleared history depth is the far plane (see
-            // ClearDenoiserHistory) and so is a previous-frame sky texel; both reconstruct to a
-            // point on the far plane whose plane distance is enormous, so both reject without
-            // needing a case of their own.
-            const float4 q = float4(float2(pixel), HistoryDepthTexture[pixel], 1.0f);
-            const float distTimesW = dot(plane.offsetRow, q);
-            const float homogeneousW = dot(plane.wRow, q);
-            // Data, not plane: both rows were bit-tested finite when the plane was built and
-            // the tap depth is the only fresh input, so a non-finite dot4 here means the
-            // history depth texel itself is corrupt.
-            if (!(isFiniteSafe(distTimesW) && isFiniteSafe(homogeneousW)))
-                reason = SSRT_HISTORY_REJ_DATA;
-            // Both sides carry the factor |w|, which is what removes the division. A tap on
-            // the previous camera plane has w = 0 and no finite position at all; the right-hand
-            // side goes to zero with it, so it rejects by arithmetic.
-            else if (abs(distTimesW) > plane.tolerancePerTexel * tapTexels * abs(homogeneousW))
-                reason = SSRT_HISTORY_REJ_PLANE;
-        }
+        // A non-positive reciprocal depth means the plane passes behind the previous camera at
+        // this pixel, so no surface lying in it could have been visible there. A plane
+        // disagreement, and one that cannot produce a non-finite value on the way to saying so.
+        else if (invZPlane <= 0.0f)
+            reason = SSRT_HISTORY_REJ_PLANE;
+        // The comparison itself, in linear view depth along the view ray -- the same quantity the
+        // folded-row form measured, so SSRT_HISTORY_PLANE_TILT keeps its meaning.
+        else if (abs(tapLinear - 1.0f / invZPlane) > plane.tolerancePerTexel * tapTexels)
+            reason = SSRT_HISTORY_REJ_PLANE;
     }
 
     // (diagnostic H) The counterpart bypass. Both flags are group-uniform, so with the
@@ -796,6 +957,34 @@ float3 SSRT_DebugRejectColour(uint3 tally)
     if (tally.y >= tally.z)
         return float3(1.0f, 0.0f, 0.0f);
     return float3(0.0f, 1.0f, 0.0f);
+}
+
+// (P2.4 follow-up) The colour a pixel whose plane could not be built gets, naming which of the
+// four constructions gave up. Split out of blue, which is what made the first measurement
+// ambiguous: "the plane was never built" and "the taps were out of bounds" arrived in the same
+// colour, so a uniform blue screen had two readings and the more alarming one had to be
+// established by a second trip into the game with Force Accept History on.
+//
+// All four are yellows so the *class* reads at a glance -- any yellow means the plane test did
+// not run on that pixel and the history was judged by bounds plus normal agreement alone -- while
+// the four shades stay apart on a real monitor:
+//   pale yellow  the shaded point has no image inside the previous frame's depth range;
+//   amber        a probe has no finite image at all (non-finite, or on the previous camera plane);
+//   dark amber   the three probes are collinear in previous screen space, i.e. an edge-on surface;
+//   bright lemon the tolerance came out non-finite or non-positive.
+// Anything else is a coding error and comes back white-ish, which is not a colour any other
+// branch of this view produces.
+float3 SSRT_DebugPlaneFailColour(uint failCode)
+{
+    if (failCode == SSRT_PLANE_FAIL_PREV_RANGE)
+        return float3(1.0f, 0.85f, 0.40f);
+    if (failCode == SSRT_PLANE_FAIL_PROJECT)
+        return float3(1.0f, 0.70f, 0.00f);
+    if (failCode == SSRT_PLANE_FAIL_DEGENERATE)
+        return float3(0.70f, 0.45f, 0.00f);
+    if (failCode == SSRT_PLANE_FAIL_TOLERANCE)
+        return float3(1.0f, 1.0f, 0.35f);
+    return float3(0.9f, 0.9f, 0.8f);
 }
 
 // (diagnostic H) Fold one evaluated tap into the running tally, accepted or not.
@@ -1246,8 +1435,26 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
     // cannot disagree.
     if (writeDebug)
     {
-        const float3 debugColour = valid ? SSRT_DebugAcceptColour(prevAccumFrames + 1.0f)
-                                         : SSRT_DebugRejectColour(debugTally);
+        float3 debugColour = valid ? SSRT_DebugAcceptColour(prevAccumFrames + 1.0f)
+                                   : SSRT_DebugRejectColour(debugTally);
+
+        // (P2.4 follow-up) Two per-pixel facts about the *construction* outrank the per-tap
+        // tally, because they say the test the tally reports on did not actually run.
+        //
+        // Order matters: the plane failure is checked last so it wins, since it is the one that
+        // changes what the acceptance means. Both are suppressed when the corresponding gate is
+        // switched off, so a diagnostic pass taken with Force Accept History or Disable History
+        // Depth Test on still reads as the plain accept/reject picture it did before -- the four
+        // switches keep their exact semantics and their exact pictures.
+        //
+        // The rotation warning is only reachable with Rotated Normal Gate on: with it off the
+        // un-rotated normal is what the gate compares anyway, so a failed self-check has changed
+        // nothing and there is nothing to report.
+        if (rotatedNormalGate != 0 && !historyPlane.normalUsable && disableHistoryNormalTest == 0 && forceAcceptHistory == 0)
+            debugColour = float3(1.0f, 0.0f, 1.0f);
+        if (!historyPlane.usable && disableHistoryDepthTest == 0 && forceAcceptHistory == 0)
+            debugColour = SSRT_DebugPlaneFailColour(historyPlane.failCode);
+
         DebugHistoryOutput[DTid.xy] = float4(debugColour, 1.0f);
     }
 
