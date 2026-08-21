@@ -462,32 +462,112 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
     // must be scaled by the previous frame's DRS ratio (DynamicResolutionParams1.zw),
     // not the current one. With DLSS/DRS the two differ whenever the ratio moves, which
     // shifted the whole history lookup and silently invalidated reprojection.
-    uint2 prevPixel = uint2(prevUV * SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw);
+    const float2 prevCoord = prevUV * SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw;
+    // The texel the reprojection lands *in*. No longer the primary lookup (see D2 below),
+    // but still the origin the two disocclusion searches further down are defined against.
+    uint2 prevPixel = uint2(prevCoord);
     bool valid = false;
 
-    // (guard G4) A non-finite history sample is not history; leaving prevColor / prevMoments
-    // / prevAccumFrames at their zero initialisation makes this fall through to the 4-tap
-    // search exactly as a geometrically invalid reprojection does.
-    float4 histColor;
-    float2 histMoments;
-    float histAccumFrames;
-    if (IsValidHistory(prevPixel, prevUV, normalVS) &&
-        SSRT_LoadHistory(prevPixel, histColor, histMoments, histAccumFrames))
+    // (defect D2) 2x2 bilinear gather with per-tap validity, replacing a point fetch of the
+    // single texel containing prevCoord.
+    //
+    // What the point fetch cost. A motion vector lands at an arbitrary sub-texel position, so
+    // rounding it to one texel throws away up to half a texel of registration in each axis
+    // and, worse, does it *inconsistently between frames*: as the reprojection drifts across
+    // a texel boundary the history source jumps by a whole pixel. Under camera motion that
+    // makes the accumulation resample its own output along the motion direction every few
+    // frames, which is a directional low-pass filter -- i.e. it manufactures exactly the
+    // smear the reprojection was supposed to prevent, and it does so at a rate proportional
+    // to screen-space velocity. It also throws away the *sharpening* half of correct
+    // reprojection: sub-texel-accurate history is what lets an accumulated image hold detail
+    // finer than the per-frame sample can resolve.
+    //
+    // Why per-tap validity rather than a single bilinear sample through LinearSampler. The
+    // hardware filter would be one fetch instead of four, but it cannot be told to skip a
+    // tap: a 2x2 quad straddling a silhouette would bleed the background's history into the
+    // foreground with a weight the shader cannot see, which is the ghost source this whole
+    // series is about. Each tap is therefore validated on its own (bounds, normal agreement,
+    // G4 finiteness) and the surviving bilinear weights are renormalised -- the same
+    // construction ScreenSpaceGI's radianceDisocc.cs.hlsl uses for its history.
+    //
+    // Cost: the primary path goes from 3 texture loads to 12. It buys back some of that
+    // statistically -- a partially valid quad now resolves here instead of falling through
+    // to the 4-tap and 8-tap searches, which are 12 and 24 loads -- but on a
+    // fully-reprojectable screen it is a real +9 loads per lane.
+    //
+    // A tap is additionally required to carry accumFrames > 0, which the point fetch did not
+    // demand. That was harmless when a single texel answered the query -- a zero count drives
+    // alpha to 1, so the history was ignored anyway -- but it is not harmless in a weighted
+    // sum: the far-plane branch writes colour 0 and count 0, so an unguarded sky texel inside
+    // the quad would drag a fraction of black into the blend with a non-zero weight. The
+    // guard also matches what both fallback searches already require, so all three paths
+    // agree on what counts as history.
     {
-        prevColor = histColor;
-        prevAccumFrames = histAccumFrames;
-        prevMoments = histMoments;
-        valid = true;
-    }
+        // Texel centres sit at integer + 0.5, so the quad's top-left index is
+        // floor(coord - 0.5) and the interpolants are the remainder.
+        const float2 bilinCoord = prevCoord - 0.5f;
+        const float2 bilinBase = floor(bilinCoord);
+        const float2 f = bilinCoord - bilinBase;
+        const int2 bilinOffset[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+        const float bilinWeight[4] = {
+            (1.0f - f.x) * (1.0f - f.y),
+            f.x * (1.0f - f.y),
+            (1.0f - f.x) * f.y,
+            f.x * f.y
+        };
 
-    if (!valid)
-    {
-        int2 bilinOffset[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
         float weightSum = 0.f;
         [unroll(4)]
         for (int i = 0; i < 4; i++)
         {
-            int2 neighborPixel = int2(prevPixel) + bilinOffset[i];
+            const uint2 tapPixel = uint2(int2(bilinBase) + bilinOffset[i]);
+            // (guard G4) Per-tap rejection, identical in kind to the two searches below: a
+            // non-finite tap contributes to neither the sums nor weightSum, so one poisoned
+            // texel cannot be filtered into its neighbours.
+            float4 tapColor;
+            float2 tapMoments;
+            float tapAccumFrames;
+            if (IsValidHistory(tapPixel, prevUV, normalVS) &&
+                SSRT_LoadHistory(tapPixel, tapColor, tapMoments, tapAccumFrames) &&
+                tapAccumFrames > 0.f)
+            {
+                const float w = bilinWeight[i];
+                prevColor += tapColor * w;
+                prevMoments += tapMoments * w;
+                prevAccumFrames += tapAccumFrames * w;
+                weightSum += w;
+            }
+        }
+
+        // An exactly-aligned reprojection gives two or three taps a weight of 0, so the
+        // threshold is an epsilon rather than 0: a quad whose only survivor carries no weight
+        // has told us nothing and must fall through to the searches, not divide by ~0.
+        if (weightSum > 1e-5f)
+        {
+            const float invWeightSum = 1.0f / weightSum;
+            prevColor *= invWeightSum;
+            prevMoments *= invWeightSum;
+            prevAccumFrames *= invWeightSum;
+            valid = true;
+        }
+        else
+        {
+            // Discard whatever sub-epsilon dust accumulated; the searches below add into
+            // these same accumulators and expect them zeroed.
+            prevColor = 0.f;
+            prevMoments = float2(0.f, 0.f);
+            prevAccumFrames = 0.f;
+        }
+    }
+
+    if (!valid)
+    {
+        int2 crossOffset[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+        float weightSum = 0.f;
+        [unroll(4)]
+        for (int i = 0; i < 4; i++)
+        {
+            int2 neighborPixel = int2(prevPixel) + crossOffset[i];
             // (guard G4) A non-finite tap is excluded from the average and from weightSum,
             // which is what stops a single poisoned texel from being spread into the
             // disoccluded pixels around it every time the camera moves.
