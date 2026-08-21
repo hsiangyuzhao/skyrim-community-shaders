@@ -262,7 +262,14 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "shorter kernel chain.");
         ImGui::SliderFloat("Normal Phi", &settings.NormalPhi, 1.0f, 1024.0f, "%.2f");
         if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text("Controls sensitivity to normal differences in the À Trous filter. Higher values preserve more detail but may retain noise.");
+            ImGui::Text(
+                "How closely a neighbouring pixel's normal must match before the A Trous "
+                "filter will average it in. The weight is dot(n, nP) raised to this power, "
+                "so it is an angle: at the default 128 a tap keeps 1/e of its weight at "
+                "7.2 degrees and 2%% at 14. Raising it preserves detail the indirect light "
+                "does not actually carry, and above about 256 the filter stops averaging on "
+                "any normal-mapped surface -- which is most of Skyrim -- so extra iterations "
+                "buy nothing.");
 
         ImGui::Checkbox("Firefly Clamp", &settings.FireflyClamp);
         if (auto _tt = Util::HoverTooltipWrapper())

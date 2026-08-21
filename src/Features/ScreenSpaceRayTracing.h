@@ -261,7 +261,38 @@ struct ScreenSpaceRayTracing : Feature
         /// wider phiLuminance is likewise wanted: that path runs only on history <= 2
         /// pixels, and a moment estimate built from more taps is a less noisy seed.
         float ColorPhi = 2.0f;
-        float NormalPhi = 512.0f;
+        /// @brief (defect D7) sigma_n for the a-trous normal edge-stopping function:
+        /// weight *= pow(max(0, dot(n, nP)), NormalPhi). Re-tuned from 512 to the SVGF
+        /// paper's 128.
+        ///
+        /// The exponent is an angular gate: pow(cos t, p) = exp(-p t^2 / 2) for small t, so
+        /// the half-power angle is sqrt(2 ln 2 / p) and the 1/e angle is sqrt(2/p). At 512
+        /// that is 2.1 and 3.6 degrees; a tap 7 degrees off the centre normal keeps
+        /// exp(-7.8) = 4e-4 of its weight and one 10 degrees off keeps 4e-7.
+        ///
+        /// Why that is wrong here specifically. The quantity being compared is the *shading*
+        /// normal out of the deferred normal-roughness buffer, i.e. the geometric normal with
+        /// the material's normal map applied. Skyrim's rock, gravel, dirt, bark and foliage
+        /// normal maps swing tens of degrees between adjacent texels, so at 512 the kernel
+        /// collapses to its centre tap over most of an outdoor scene -- and it does so
+        /// *unevenly*, because smooth man-made surfaces keep their taps. That is both halves
+        /// of the reported symptom at once: extra a-trous iterations change nothing (the taps
+        /// they add are annihilated), and the filtering that does happen is patchy at the
+        /// scale of the material rather than of the noise, which is what turns per-pixel
+        /// noise into region-sized blotches.
+        ///
+        /// Reference SVGF uses 128 on primary-hit *geometric* normals, which are smoother than
+        /// these -- so 128 here is if anything still on the tight side. It puts the 1/e angle
+        /// at 7.2 degrees and leaves 2% of weight at 14, which is the right order for a signal
+        /// whose dependence on the normal is a cosine-weighted hemisphere integral: indirect
+        /// irradiance varies slowly with orientation, so averaging across a normal-map wiggle
+        /// on one continuous surface loses nothing that was ever there.
+        ///
+        /// Coupling worth recording: the ColorPhi 2.0 derivation above cites "NormalPhi 512
+        /// against the paper's 128" as part of what licenses loosening sigma_l from 0.5. That
+        /// argument weakens by exactly this change, and 2.0 is still half the paper's 4.0 --
+        /// the depth term (audit #12) remains the third, and now the strongest, edge-stop.
+        float NormalPhi = 128.0f;
         /// @brief (spec A1) Let a fully converged 8x8 tile skip an a-trous iteration.
         bool AdaptiveFiltering = true;
         /// @brief (spec A1) Accumulated frames a pixel needs before it may count as
