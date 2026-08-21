@@ -534,6 +534,75 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
     }
 }
 
+// (guard G8) The SVGF history is the only state in this feature that outlives a frame, and
+// nothing ever reset it. texHistoryDiffuse / texHistoryMomentsDiffuse (and the specular
+// pair) are read by ssrt_temporal.hlsl and rewritten from its own output, so their contents
+// survive a save load, a cell transition and a resolution change; before G4 a single
+// non-finite texel therefore survived until the process exited.
+//
+// Note on Feature::Reset(): it is *not* the hook for this, despite the name. State::Reset()
+// calls it from IDXGISwapChain_Present (Hooks.cpp) on **every frame** -- the same function
+// increments frameCount and advances the timer -- so clearing the history there would wipe
+// it 60 times a second and silently reduce SVGF to a passthrough. Hence the pending-flag
+// design below, latched at the earliest point in the frame that still precedes every reader.
+void ScreenSpaceRayTracing::ClearDenoiserHistory()
+{
+    auto context = globals::d3d::context;
+    if (!context || !texHistoryDiffuse || !texHistoryMomentsDiffuse || !texHistory || !texHistoryMoments)
+        return;
+
+    // Zero, not "some safe colour": ssrt_temporal.hlsl derives its blend weight from the
+    // accumulated frame count in the moments texture's .z, and
+    // alpha = max(1 / (0 + 1), invMaxAccumulatedFrames) = 1 means the pixel takes this
+    // frame's sample whole. A zeroed history is therefore indistinguishable from a
+    // disocclusion, which is a path the temporal and variance passes already handle.
+    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    context->ClearUnorderedAccessViewFloat(texHistoryDiffuse->uav.get(), zero);
+    context->ClearUnorderedAccessViewFloat(texHistoryMomentsDiffuse->uav.get(), zero);
+    // The specular pair has the identical failure mode and the identical fix; clearing all
+    // four costs four ClearUAV calls on an event that happens once per load or transition.
+    context->ClearUnorderedAccessViewFloat(texHistory->uav.get(), zero);
+    context->ClearUnorderedAccessViewFloat(texHistoryMoments->uav.get(), zero);
+
+    // texHistoryNormals is deliberately not in the list: CopyHistoryNormals overwrites it
+    // in full every frame from the live G-buffer, so it is never stale, and its
+    // R10G10B10A2_UNORM storage cannot represent a NaN in the first place.
+}
+
+void ScreenSpaceRayTracing::UpdateHistoryValidity()
+{
+    // A false -> true transition on any of these means the previous frame did not produce
+    // the history this frame is about to read. EnableSVGF is the case the audit called out
+    // (flipping it on made the first filtered frame consume whatever was left in the
+    // textures from the last time it was on, minutes or hours earlier); the two pass toggles
+    // are the same hazard by the same mechanism.
+    if ((settings.EnableSVGF && !lastEnableSVGF) ||
+        (settings.EnableDiffuse && !lastEnableDiffuse) ||
+        (settings.EnableSpecular && !lastEnableSpecular))
+        historyClearPending = true;
+
+    lastEnableSVGF = settings.EnableSVGF;
+    lastEnableDiffuse = settings.EnableDiffuse;
+    lastEnableSpecular = settings.EnableSpecular;
+
+    // Cell identity, compared by pointer exactly as SkySync::Update does. Covers the cases
+    // the audit named as the ones that let a poisoned history outlive its cause: loading a
+    // save, changing cell, fast travel. The history is screen-space, so none of it means
+    // anything once the view is somewhere else.
+    if (auto player = RE::PlayerCharacter::GetSingleton()) {
+        auto cell = player->GetParentCell();
+        if (cell != lastCell) {
+            lastCell = cell;
+            historyClearPending = true;
+        }
+        // (audit P9) Same lookup, so the interior test rides along instead of repeating it:
+        // both draw passes read this member and neither may pay for the cell walk again.
+        inInterior = cell ? cell->IsInteriorCell() : true;
+    } else {
+        inInterior = true;
+    }
+}
+
 void ScreenSpaceRayTracing::Prepass()
 {
     if (recompileFlag) {
@@ -541,22 +610,22 @@ void ScreenSpaceRayTracing::Prepass()
         CompileComputeShaders();
     }
 
+    // (guard G8) Before the enable gate below, so a transition is never missed just because
+    // both passes happened to be off on the frame it occurred; the flag latches until a
+    // frame that actually renders services it. PrepassPasses runs before DeferredPasses, so
+    // this is the earliest point in the frame and precedes every reader of the history.
+    UpdateHistoryValidity();
+
     // (audit P8) The Hi-Z pyramid this pass builds is only ever read by the two SSRT
     // raymarch passes, so with both switched off it was 1 copy + 8 downsample
     // dispatches of pure waste every frame.
     if (!settings.EnableDiffuse && !settings.EnableSpecular)
         return;
 
-    // (audit P9) Cache the interior test once per frame instead of repeating the cell
-    // lookup in DrawSSRTSpecular and DrawSSRTDiffuse. Safe because Prepass runs from
-    // StartDeferred before either draw, and the gate above only fires when neither of
-    // them will run at all.
-    inInterior = true;
-    if (auto player = RE::PlayerCharacter::GetSingleton()) {
-        if (auto parentCell = player->GetParentCell()) {
-            inInterior = parentCell->IsInteriorCell();
-        }
-    }
+    // (audit P9) inInterior is cached once per frame by UpdateHistoryValidity above, which
+    // already has to walk to the player's cell for the G8 discontinuity test. It runs
+    // before the gate, so the value is fresh whether or not either pass is enabled, and
+    // Prepass still precedes both draws.
 
     auto renderer = globals::game::renderer;
     auto context = globals::d3d::context;
@@ -597,6 +666,16 @@ void ScreenSpaceRayTracing::Prepass()
         const float farPlane[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
         for (uint i = 0; i < maxMips; ++i)
             context->ClearUnorderedAccessViewFloat(depthUAVs[i].get(), farPlane);
+        // (guard G8) The denoiser history is addressed by pixel and validated against the
+        // *previous* frame's dynamic-resolution sub-rect, so a change of extent leaves every
+        // texel outside the new one holding data for a pixel that no longer exists -- and
+        // the region beyond the sub-rect was never written at all, i.e. still undefined.
+        historyClearPending = true;
+    }
+
+    if (historyClearPending) {
+        historyClearPending = false;
+        ClearDenoiserHistory();
     }
 
     // preprocess depth
