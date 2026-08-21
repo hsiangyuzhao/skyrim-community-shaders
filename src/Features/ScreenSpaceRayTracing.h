@@ -178,33 +178,6 @@ struct ScreenSpaceRayTracing : Feature
         /// *found*, not how well its radiance is known, so a scene whose on-screen surfaces are
         /// unrepresentative of the whole environment is better served slightly under 1.
         float AmbientReinjectionStrength = 1.0f;
-        /// @brief (reinjection contact occlusion) Shape the ambient the reinjection keeps with
-        /// Environment Ambient's centimetre-scale contact-occlusion kernel.
-        ///
-        /// Default on, because it restores a term the reinjection path lost rather than adding a
-        /// new one. The legacy model's cubemap fallback multiplied its ambient by
-        /// MultiBounceAO(albedo, occlusion * ssgiAo) inside the ray march, and that `occlusion` was
-        /// per-ray, full-resolution self-intersection: a contact-scale signal. Reinjection replaces
-        /// the fallback with the vanilla ambient, which is shaped by SSGI's half-resolution AO and
-        /// nothing finer, and selects it with a confidence that has been through a 7x7 spatial mean
-        /// -- so the near-field contrast in the unlit parts of the frame simply is not there any
-        /// more. This puts it back, on the term that is the fallback's structural counterpart.
-        ///
-        /// Requires the Environment Ambient feature to be *installed*, not enabled: the kernel
-        /// lives in that feature's shader folder, so DeferredCompositeCS gates the whole term on
-        /// ENV_AMBIENT and an SSRT-only install keeps the previous behaviour. It does not read that
-        /// feature's Enabled flag, and the radius/strength it does read are plain struct defaults
-        /// that stay valid while the feature is off.
-        bool EnableReinjectionContactOcclusion = true;
-        /// @brief (reinjection contact occlusion) How much of the kernel's occlusion to apply.
-        ///
-        /// 1 applies it exactly as Environment Ambient's own Contact Radius / Contact Strength
-        /// sliders define it, which is what makes the two consumers of the shared kernel agree; 0
-        /// is off; above 1 deepens it past what the kernel reports (`1 - (1 - ao) * s`, clamped).
-        /// A separate dial from the L1-side strength on purpose -- the reinjected frame has a
-        /// different amount of ambient left to darken than the L1 frame does, so the useful level
-        /// is not necessarily the same.
-        float ReinjectionContactStrength = 1.0f;
         /// @brief (spec F5) Reviewed against the corrected occlusion semantics, left at
         /// 1.0. It now scales occlusion that comes only from back-face hits -- the one
         /// case where the ray demonstrably entered geometry -- instead of also scaling
@@ -213,19 +186,6 @@ struct ScreenSpaceRayTracing : Feature
         /// right default, and it keeps as much of the contact darkening as the corrected
         /// mechanism can supply.
         float OcclusionStrength = 1.0f;
-        /// @brief (contact noise) How much of the deterministic contact-occlusion kernel shapes the
-        /// diffuse cubemap fallback's ambient. The fallback counterpart of
-        /// ReinjectionContactStrength, and the A/B switch for the near-field noise fix.
-        ///
-        /// At 0 the ray march also stops suppressing the near-field per-ray occlusion vote, so the
-        /// whole change reverts to P2.1 behaviour with one slider and no recompile. At 1 the kernel
-        /// applies exactly as Environment Ambient's Contact Radius / Contact Strength define it,
-        /// which is what makes the fallback and reinjection paths darken contact at the same rate.
-        ///
-        /// Same install requirement as EnableReinjectionContactOcclusion: the kernel lives in
-        /// Environment Ambient's shader folder, so ssrt_raymarch.hlsl gates the term -- and the vote
-        /// suppression with it -- on that folder being present. An SSRT-only install is unchanged.
-        float FallbackContactStrength = 1.0f;
         float CubemapNormalization = 0.0f;
         bool EnableSVGF = false;
         uint MaxAccumulatedFrames = 16;
@@ -528,7 +488,7 @@ struct ScreenSpaceRayTracing : Feature
     /// @brief Mirrored by the `SSRTSettings` struct in Common/SharedData.hlsli, which lives
     /// inside the shared FeatureData constant buffer with ExponentialHeightFogSettings behind
     /// it -- so sizeof is load bearing and must stay a multiple of 16. AmbientReinjection and
-    /// its strength opened a second float4 row; the contact-occlusion pair took the two slots
+    /// its strength opened a second float4 row; the SSGI contact pair below took the two slots
     /// that row had left, so the buffer did not grow and the HLSL side no longer needs the
     /// explicit `float2 ssrtPad0` it used to declare in their place.
     struct alignas(16) SharedData
@@ -540,10 +500,21 @@ struct ScreenSpaceRayTracing : Feature
         // --- row 1 ---
         uint AmbientReinjection;
         float AmbientReinjectionStrength;
-        /// @brief (reinjection contact occlusion) Already ANDed with AmbientReinjection by
-        /// GetCommonBufferData, so the shader's own gate is belt and braces.
-        uint ReinjectionContactOcclusion;
-        float ReinjectionContactStrength;
+        /// @brief (contact AO) Non-zero iff Screen Space GI is loaded and enabled with its
+        /// contact-occlusion pass on. Read by ssrt_raymarch.hlsl for one purpose only: deciding
+        /// whether the near-field occlusion vote may be suppressed, which is only safe while a
+        /// deterministic term is standing in for it.
+        ///
+        /// This is Screen Space GI's setting living in SSRT's block, which is deliberate: SSGI
+        /// publishes no FeatureData block of its own, and adding one to carry two scalars would
+        /// shift every offset behind it. Filled from ScreenSpaceGI::settings in
+        /// GetCommonBufferData. These two slots previously held the retired reinjection contact
+        /// pair, so the layout is unchanged.
+        uint SsgiContactAoActive;
+        /// @brief (contact AO) That pass's search radius in centimetres, i.e. the range the vote
+        /// suppression hands over. Same value the kernel measures itself in, so the handover
+        /// cannot drift out of alignment with the kernel's own falloff.
+        float SsgiContactRadius;
     };
     static_assert(sizeof(SharedData) == 32,
         "ScreenSpaceRayTracing::SharedData must stay 32 bytes (two constant buffer rows); "
@@ -553,9 +524,9 @@ struct ScreenSpaceRayTracing : Feature
     /// shader that binds b1 in this feature.
     ///
     /// The first two float4 rows were full, so FreezeNoisePhase opens a third; sizeof is 48,
-    /// still a multiple of 16 as D3D11 requires. The shader declares only the ten scalars
+    /// still a multiple of 16 as D3D11 requires. The shader declares only the nine scalars
     /// and not the padding -- a shader may declare a prefix of a larger constant buffer, and
-    /// a trailing `float pad0[2]` would *not* mirror this layout in HLSL, where each array
+    /// a trailing `float pad0[3]` would *not* mirror this layout in HLSL, where each array
     /// element is padded to its own 16-byte row.
     struct alignas(16) SSRTCB
     {
@@ -572,10 +543,7 @@ struct ScreenSpaceRayTracing : Feature
         /// @brief (diagnostic T2) Non-zero replaces SharedData::FrameCount with 0 in the
         /// ray-direction noise seed. See Settings::FreezeNoisePhase.
         uint FreezeNoisePhase;
-        /// @brief (contact noise) See Settings::FallbackContactStrength. Zeroed on the specular
-        /// pass, which shares this buffer but has no diffuse fallback contact term.
-        float FallbackContactStrength;
-        float pad0[2];
+        float pad0[3];
     };
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4

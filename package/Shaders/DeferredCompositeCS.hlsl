@@ -289,21 +289,6 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 	// and folds the multiply below away.
 	float ambientKeep = 1.0;
 
-#	if defined(SSRT) && defined(ENV_AMBIENT)
-	// (reinjection contact occlusion) Whether the kept ambient below should be shaped by
-	// Environment Ambient's contact-occlusion kernel. See the long note at the application site.
-	//
-	// Gated on ENV_AMBIENT because that is the define that says the kernel's source file is
-	// present: `features/Environment Ambient/` is a non-CORE feature folder, so "SSRT installed,
-	// Environment Ambient not" is a shipping configuration in which EnvAmbient.hlsli does not
-	// exist to be included. Copying the kernel here instead was rejected - two copies of a
-	// ten-tap spiral with a shared radius convention drift the moment either is touched - and
-	// hoisting it into package/Shaders/Common/ would mean editing the L1 file for a build
-	// configuration the AIO package never ships. An SSRT-only install therefore silently loses
-	// this enhancement and keeps the P2 behaviour exactly.
-	bool reinjectContactActive = false;
-#	endif
-
 #	if defined(SSRT)
 	// Two mutually exclusive energy models, selected at runtime so toggling either one needs
 	// no composite recompile (DiffuseMult is already gated on EnableDiffuse in
@@ -341,14 +326,6 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 		[branch] if (SharedData::ssrtSettings.AmbientReinjection != 0) {
 			float ssrtConfidence = SSRTConfidenceTexture[dispatchID.xy];
 			ambientKeep = saturate(1.0 - ssrtConfidence * SharedData::ssrtSettings.AmbientReinjectionStrength);
-#		if defined(ENV_AMBIENT)
-			// Only where there is kept ambient left to shape: at keep == 0 the rays resolved the
-			// whole hemisphere, the term the kernel would multiply is already zero, and the ten
-			// depth loads would buy nothing. `depth < 1.0` excludes the sky for the same reason
-			// L1's own gate does - every tap there is a far-plane tap, so the kernel returns 1.
-			reinjectContactActive = SharedData::ssrtSettings.ReinjectionContactOcclusion != 0 &&
-				ambientKeep > 0.0 && depth < 1.0;
-#		endif
 		} else {
 			directionalAmbientColor = 0;
 		}
@@ -390,7 +367,6 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 	// here.
 	float3 envAmbient = 0.0;
 	float envAmbientOcclusion = 1.0;
-	float envContactOcclusion = 1.0;
 
 	bool envAmbientActive = SharedData::envAmbientSettings.Enabled != 0 && depth < 1.0;
 #		if defined(SSRT)
@@ -421,12 +397,13 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 
 	[branch] if (envAmbientActive)
 	{
-		// Centimetre-scale self-occlusion, the one part of the fallback that Skylighting's
-		// metre-scale probes and half-resolution SSGI both miss. Only evaluated when the feature is
-		// actually doing something.
-		[branch] if (SharedData::envAmbientSettings.EnableContactOcclusion != 0)
-			envContactOcclusion = EnvironmentAmbient::EvaluateContactOcclusion(dispatchID.xy, positionWS.xyz, normalWS, depth, eyeIndex);
-
+		// Centimetre-scale self-occlusion used to be evaluated right here, from this feature's own
+		// ten-tap depth kernel. It now arrives inside `ssgiAo`: Screen Space GI runs one
+		// full-resolution contact pass with its own temporal accumulator and folds the result into
+		// the AO channel it publishes (ScreenSpaceGI/contactAo.cs.hlsl), so every consumer of that
+		// channel - this file's multiBounceAO, the envAo below, and the SSRT ray march - gets it
+		// with no code of its own. The consequence to know about: with Screen Space GI switched
+		// off there is no contact term anywhere, because that is where it lives now.
 		envAmbient = EnvironmentAmbient::Evaluate(normalWS, albedo, dispatchID.xy, ambientSkyVisibility, ambientEnclosure, envAmbientOcclusion);
 	}
 #	endif
@@ -444,68 +421,20 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 #	endif
 
 #	if defined(ENV_AMBIENT)
-	// Shaping applied to the vanilla ambient. Identical to `multiBounceAO` everywhere except on the
-	// SSRT ambient reinjection path, where the ambient that survives the reinjection additionally
-	// carries Environment Ambient's contact occlusion.
-	float3 ambientShaping = multiBounceAO;
+	// (contact occlusion) This is where the SSRT ambient-reinjection path used to re-evaluate
+	// Environment Ambient's contact kernel and fold it into a separate `ambientShaping` factor. Both
+	// are gone. The near-field term now arrives inside `ssgiAo`, so `multiBounceAO` above already is
+	// MultiBounceAO(linAlbedo, ssgiAo * contact) - the same expression this branch built by hand, at
+	// the same power, on the same albedo, folded into the same non-separable argument. One evaluation
+	// of the kernel per pixel per frame, one accumulator, and no way for the two energy models to
+	// disagree about how dark a contact is.
+	//
+	// See ScreenSpaceGI/contactAo.cs.hlsl for where it went. What is lost with Screen Space GI
+	// switched off is the contact term itself, on every path - the deliberate consequence of giving
+	// it exactly one home.
 
-#		if defined(SSRT)
-	// (reinjection contact occlusion) The near-field term the reinjection path was missing.
-	//
-	// What it restores. The SSRT diffuse *fallback* this path replaced multiplied its cubemap
-	// ambient by MultiBounceAO(albedo, occlusion * ssgiAo) inside the ray march, where `occlusion`
-	// was per-ray, full-resolution self-intersection - a centimetre-scale signal that darkened hair
-	// against a face and cloth where it meets skin. Reinjection dropped that: the term that now
-	// fills the unresolved directions is the *vanilla* ambient, which is shaped by SSGI's
-	// half-resolution AO and nothing finer, and the confidence that selects it has been through a
-	// 7x7 spatial mean that erases contact-scale detail by construction. The result reads exactly as
-	// reported - correct overall level, no near-field contrast in the unlit parts of the frame.
-	//
-	// Why it belongs here and not on the traced radiance. The kept ambient is the structural
-	// counterpart of the old cubemap fallback: both stand in for the directions the rays did not
-	// resolve, and both are the term the fallback's occlusion factor multiplied. The traced radiance
-	// already carries its own occlusion implicitly - a direction that hit nearby geometry returns
-	// that geometry's radiance, not the environment's - so darkening it too would double-count.
-	//
-	// Why the AO is folded into the MultiBounceAO argument rather than multiplied on the outside.
-	// MultiBounceAO is not separable: MB(a, x*y) < MB(a, x) * MB(a, y) at any albedo above ~0.1, so
-	// applying it as an outside factor would land measurably lighter than the fallback did (at
-	// albedo 0.8 and two AO terms of 0.5 each, 0.66 against 0.54). Folding it in is also exactly what
-	// L1 does with the same kernel in the branch below (`envAo = ... * envContactOcclusion`, then one
-	// MultiBounceAO), so the two consumers of this kernel stay in the same colour and shaping space.
-	// The albedo is `linAlbedo`, matching the composite's own MultiBounceAO on the vanilla ambient
-	// rather than L1's deliberately gamma-space parity quirk, because the term being shaped is the
-	// composite's, not the cubemap's.
-	//
-	// Power 1, no exponent. The old fallback paid MultiBounceAO(albedo, occlusion * ssgiAo) once in
-	// the ray march; the composite's later `sqrt(multiBounceAO)` is a separate factor built from
-	// ssgiAo alone, so it raised the SSGI half to 1.5 and left the contact half at 1. The kept
-	// ambient here is added past that sqrt and so carries the whole shaping at power 1, which is
-	// the same total the contact term had before. The strength slider is the dial, not an exponent.
-	//
-	// Double counting is impossible by the same construction that makes `ambientKeep` an identity
-	// on every L1 path: reinjectContactActive requires DiffuseMult > 0, envAmbientActive requires
-	// DiffuseMult == 0. L1's own `envContactOcclusion` above and this branch are therefore mutually
-	// exclusive, and the kernel is evaluated at most once per pixel - never twice, and never with
-	// L1's copy of the result compounding this one.
-	[branch] if (reinjectContactActive) {
-		float contactOcclusion = EnvironmentAmbient::EvaluateContactOcclusion(dispatchID.xy, positionWS.xyz, normalWS, depth, eyeIndex);
-
-		// Composition, not override: 1 applies the kernel as Environment Ambient's own radius and
-		// strength sliders define it (they stay valid while that feature is *disabled* - its
-		// Settings block is a plain struct with in-class defaults that FeatureBuffer packs
-		// unconditionally), 0 is off, and above 1 deepens it. The kernel's EnableContactOcclusion
-		// toggle is read by L1's caller, not by the kernel, so this path has its own gate and is
-		// unaffected by the L1-side switch.
-		contactOcclusion = saturate(1.0 - (1.0 - contactOcclusion) * SharedData::ssrtSettings.ReinjectionContactStrength);
-
-		ambientShaping = Color::MultiBounceAO(linAlbedo, saturate(ssgiAo * contactOcclusion));
-	}
-#		endif
-
-	// Vanilla ambient contribution, in linear space, bit-identical to the #else branch below
-	// wherever the reinjection contact term is inactive.
-	float3 ambientIrradiance = Color::IrradianceToLinear(directionalAmbientColor) * ambientShaping;
+	// Vanilla ambient contribution, in linear space. Bit-identical to the #else branch below.
+	float3 ambientIrradiance = Color::IrradianceToLinear(directionalAmbientColor) * multiBounceAO;
 
 	// The environment term is added *linearly* (below), so it is kept out of ambientIrradiance and
 	// the vanilla term is faded out by the same Blend instead of being lerped against it. Blend = 0
@@ -518,10 +447,11 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 		// ssrt_raymarch.hlsl:632-641: ao = occlusion * ssgiVisibility, then the whole env colour is
 		// multiplied by MultiBounceAO taken on the *gamma* g-buffer albedo (ssrt_raymarch.hlsl:470
 		// reads AlbedoTexture raw). Kept in that space on purpose: parity includes the quirks.
-		// The three occlusion terms act at different scales - Skylighting's metres, SSGI's large
-		// screen-space radius, contact occlusion's centimetres - so multiplying them is composition,
-		// not double-counting.
-		float envAo = saturate(envAmbientOcclusion * ssgiAo * envContactOcclusion);
+		// The occlusion terms act at different scales - Skylighting's metres, then SSGI's, which
+		// now carries both its own large screen-space radius and the centimetre-scale contact term
+		// (ScreenSpaceGI/contactAo.cs.hlsl) - so multiplying them is composition, not
+		// double-counting.
+		float envAo = saturate(envAmbientOcclusion * ssgiAo);
 		float3 envIrradiance = Color::IrradianceToLinear(envAmbient) * Color::MultiBounceAO(albedo, envAo);
 
 		// The environment term is added at the end of this block, past
@@ -553,14 +483,15 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 		// the vanilla ambient. Because the occluded cubemap term is lerped away at the enclosed end,
 		// Occlusion Strength no longer compounds with this and can stay at the fallback's 1.0.
 		[branch] if (SharedData::envAmbientSettings.EnclosureFallback != 0) {
-			// Contact occlusion joins the enclosure signal as well as the multiplier above, so a
-			// tight contact gets the hue fallback too: the light reaching the gap between hair and
-			// cheek is bounced skin and hair, not sky, so it should shift towards the local ambient
-			// colour and not just dim.
-			float enclosure = ambientEnclosure * envContactOcclusion;
+			float enclosure = ambientEnclosure;
 #	if defined(SSGI)
 			// Screen Space GI resolves contact and creases far finer than the Skylighting probe
 			// grid, and it is the same signal the fallback multiplied in (ssrt_raymarch.hlsl:634).
+			//
+			// Its contact term rides along, which is what the separate `envContactOcclusion` factor
+			// here used to provide: a tight contact gets the hue fallback and not just a dimming,
+			// because the light reaching the gap between hair and cheek is bounced skin and hair,
+			// not sky, so it should shift towards the local ambient colour.
 			enclosure *= ssgiAo;
 #	endif
 			float openWeight = pow(saturate(enclosure), max(SharedData::envAmbientSettings.HueFalloff, 1e-3));
@@ -613,10 +544,9 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 	linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
 	linDiffuseColor += envIrradianceAdd;
 #	else
-	// No Environment Ambient in this build, which also means no contact-occlusion kernel to shape
-	// the kept ambient with: this branch and the `#if defined(ENV_AMBIENT)` one above are
-	// complementary, so the reinjection contact term has exactly one application site and it is not
-	// this one. An SSRT-without-Environment-Ambient install keeps the P2 reinjection behaviour.
+	// No Environment Ambient in this build. The two branches differ only in whether there is an
+	// environment term to add, not in how the vanilla ambient is shaped: both multiply it by
+	// `multiBounceAO`, which is where the SSGI AO channel (contact term included) enters.
 	diffuseColor = Color::IrradianceToGamma(linDiffuseColor);
 	// `ambientKeep` multiplies in gamma space, i.e. on the same side of the transfer function
 	// the forward path added the term on (Lighting.hlsl `diffuseColor += directionalAmbientColor`

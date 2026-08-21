@@ -2,7 +2,6 @@
 #define __ENV_AMBIENT_HLSLI__
 
 #include "Common/Color.hlsli"
-#include "Common/Game.hlsli"
 #include "Common/Math.hlsli"
 #include "Common/Random.hlsli"
 #include "Common/SharedData.hlsli"
@@ -59,7 +58,6 @@
 //   EnvTexture (t6)              no-sky prefiltered cubemap    [DYNAMIC_CUBEMAPS]
 //   EnvReflectionsTexture (t7)   with-sky prefiltered cubemap  [DYNAMIC_CUBEMAPS]
 //   LinearSampler (s0)                                         [DYNAMIC_CUBEMAPS]
-//   DepthTexture (t4)            full-resolution depth, for the contact occlusion below
 // It declares no resources of its own and needs no new register. Skylighting is sampled by the
 // caller, which needs the same probe fetch for its own ambient estimate.
 //
@@ -131,172 +129,19 @@ namespace EnvironmentAmbient
 	}
 
 	////////////////////////////////////////////////////////////////////////////////////////////////
-	// Contact occlusion
+	// Contact occlusion used to live here, and does not any more.
 	//
-	// The last piece of the fallback with no counterpart here was its near-field self-occlusion:
-	// full-resolution, per-ray, and effective at centimetre scale, which is what darkens hair
-	// against a face, cloth where it meets skin, and a window frame behind a character. Skylighting
-	// works on a metre-scale probe grid and Screen Space GI is half-resolution with a large radius;
-	// neither can reach that scale. This is a deliberately tiny depth-buffer AO that can.
+	// It was a ten-tap centimetre-scale depth AO -- the last piece of the SSRT fallback with no
+	// counterpart in this feature -- and it ended up with three consumers evaluating it
+	// independently and none of them filtering it. It now belongs to Screen Space GI, which runs it
+	// once per frame at full resolution with its own temporal accumulator and folds the result into
+	// the AO channel this feature already multiplies in (see
+	// features/Screen Space GI/Shaders/ScreenSpaceGI/contactAo.cs.hlsl). Nothing in this header
+	// needs to change to receive it: `ssgiAo` in DeferredCompositeCS carries it.
 	//
-	// The estimator is the Alchemy/HBAO cosine form: each tap contributes
-	// saturate(dot(N, dir) - bias) * falloff(distance). The cosine factor is the grazing-surface
-	// guard - a neighbour lying in this pixel's own tangent plane has dot ~ 0 and contributes
-	// nothing, so flat surfaces seen at a glancing angle do not self-darken - and the quadratic
-	// range falloff keeps the term strictly local, so it cannot double-count what Skylighting or
-	// SSGI already applied at their own scales.
+	// Consequence worth knowing: with Screen Space GI switched off there is no contact term for this
+	// feature either. That is the price of having exactly one of it.
 	////////////////////////////////////////////////////////////////////////////////////////////////
-
-	// The pixel-radius ceiling was the binding constraint, not the world radius: at 1080p the
-	// 15 cm default only fits inside 32 px beyond about 4.5 m, so at the 1-3 m range where a
-	// strand actually meets a cheek the search was clamped down to an effective 5-10 cm and the
-	// term under-read exactly where it matters most. 64 px moves the clamp out to roughly 9 m,
-	// and the tap count goes up with it so the larger disk is still covered densely enough to
-	// stay temporally stable.
-	static const uint ContactSamples = 10;
-	static const float MinContactPixels = 2.0;
-	static const float MaxContactPixels = 64.0;
-	static const float ContactBias = 0.1;
-
-	// Same reconstruction the caller uses for its own pixel (DeferredCompositeCS.hlsl:115-131), so
-	// centre and neighbours land in one consistent camera-relative world space. Only differences of
-	// these positions are used, so the camera-relative origin cancels.
-	float3 ReconstructPositionWS(int2 a_coord, float a_depth, uint a_eyeIndex)
-	{
-		float2 uv = (float2(a_coord) + 0.5) * SharedData::BufferDim.zw;
-		uv *= FrameBuffer::DynamicResolutionParams2.xy;
-		uv = Stereo::ConvertFromStereoUV(uv, a_eyeIndex);
-
-		float4 positionCS = float4(2.0 * float2(uv.x, -uv.y + 1.0) - 1.0, a_depth, 1.0);
-		float4 positionWS = mul(FrameBuffer::CameraViewProjInverse[a_eyeIndex], positionCS);
-		return positionWS.xyz / positionWS.w;
-	}
-
-	/**
-	 * @brief Near-field ambient occlusion from the full-resolution depth buffer.
-	 *
-	 * @param a_pixCoord   Dispatch pixel coordinate, also the depth texel and the jitter seed.
-	 * @param a_positionWS This pixel's camera-relative world position.
-	 * @param a_normalWS   Geometric world-space normal.
-	 * @param a_depth      This pixel's raw depth, used to measure the local pixel-to-world scale.
-	 * @param a_eyeIndex   VR eye.
-	 * @param a_extent     Valid texel extent of the depth buffer for this consumer, in texels. The
-	 *                     composite dispatches at the full buffer extent and passes BufferDim; the
-	 *                     SSRT ray march dispatches at the *render* extent, whose sub-rect is the
-	 *                     only part of the depth buffer holding this frame's values, so a 64-pixel
-	 *                     tap radius near the sub-rect edge must clamp there and not at BufferDim.
-	 * @param a_phase      Spiral rotation, radians. Whether it advances with the frame is the
-	 *                     caller's decision, not the kernel's -- see the two wrappers below.
-	 * @return Visibility in [0, 1]; 1 is unoccluded.
-	 */
-	float EvaluateContactOcclusionEx(uint2 a_pixCoord, float3 a_positionWS, float3 a_normalWS, float a_depth, uint a_eyeIndex, float2 a_extent, float a_phase)
-	{
-		const float radius = max(SharedData::envAmbientSettings.ContactRadius, 0.1) / GAME_UNIT_TO_CM;
-
-		// World units per pixel at this depth, measured by reconstructing the next texel across at
-		// the *same* depth. This needs no knowledge of the projection convention and is
-		// automatically right under dynamic resolution and in VR.
-		float3 positionRight = ReconstructPositionWS(int2(a_pixCoord) + int2(1, 0), a_depth, a_eyeIndex);
-		float unitsPerPixel = length(positionRight - a_positionWS);
-
-		// Clamped at both ends: the floor keeps a distant pixel's taps on distinct texels, and the
-		// ceiling stops a near-field pixel from turning this into a full-screen AO pass.
-		float pixelRadius = clamp(radius / max(unitsPerPixel, 1e-4), MinContactPixels, MaxContactPixels);
-
-		int2 lo = int2(0, 0);
-		int2 hi = int2(a_extent) - 1;
-#if defined(VR)
-		// Keep every tap inside this eye's half of the side-by-side buffer. The extent is float, so
-		// halve it before the cast rather than emitting an integer divide.
-		int eyeWidth = (int)(a_extent.x * 0.5);
-		lo.x = (int)a_eyeIndex * eyeWidth;
-		hi.x = lo.x + eyeWidth - 1;
-#endif
-
-		float phase = a_phase;
-		float radiusSq = radius * radius;
-
-		float occlusion = 0.0;
-		[unroll] for (uint i = 0; i < ContactSamples; ++i) {
-			// Golden-angle spiral: near-uniform disk coverage from very few taps. The sqrt spaces
-			// the radii by equal area instead of piling taps up at the centre.
-			float t = (float(i) + 0.5) / float(ContactSamples);
-			float angle = phase + float(i) * 2.39996323;
-
-			float2 dir;
-			sincos(angle, dir.y, dir.x);
-			int2 coord = clamp(int2(a_pixCoord) + int2(round(dir * (sqrt(t) * pixelRadius))), lo, hi);
-
-			float sampleDepth = DepthTexture[coord];
-
-			float3 v = ReconstructPositionWS(coord, sampleDepth, a_eyeIndex) - a_positionWS;
-			float distSq = dot(v, v);
-
-			// Grazing-surface guard, and the bias also absorbs depth quantisation on flat surfaces.
-			// A tap that rounds onto this very pixel gives v = 0 and cosine 0, so it drops out.
-			float cosine = dot(a_normalWS, v * rsqrt(max(distSq, 1e-8)));
-
-			// Strictly local: zero at and beyond the radius.
-			float falloff = saturate(1.0 - distSq / radiusSq);
-
-			// Sky and far-plane neighbours occlude nothing.
-			float valid = sampleDepth < 1.0 ? 1.0 : 0.0;
-
-			occlusion += saturate(cosine - ContactBias) * falloff * valid;
-		}
-
-		// The old 2/N put a 90-degree corner near 0.2 occlusion and a tight contact such as hair on
-		// skin near 0.5 at strength 1, so the term topped out around half visibility where the
-		// SSRT fallback it stands in for went to zero - strength was the only way to reach full
-		// absorption, and 2.0 was barely enough. 4/N makes strength 1 land on full occlusion at
-		// tight contact and near 0.4 at a right-angle corner, which leaves the slider's upper half
-		// as genuine headroom rather than as the working range. Halve ContactStrength to recover
-		// the previous levels exactly.
-		occlusion *= SharedData::envAmbientSettings.ContactStrength * (4.0 / float(ContactSamples));
-
-		return saturate(1.0 - occlusion);
-	}
-
-	/**
-	 * @brief Contact occlusion for a full-buffer consumer that has temporal anti-aliasing behind it.
-	 *
-	 * Bit-identical to what this function did before it was split: the full buffer extent as the tap
-	 * clamp, and a per-pixel, per-frame spiral rotation. InterleavedGradientNoise cycles the frame
-	 * term with period 16, so the sequence is finite and TAA converges instead of chasing it.
-	 *
-	 * Used by DeferredCompositeCS for Environment Ambient's own term and for the SSRT ambient
-	 * reinjection path.
-	 */
-	float EvaluateContactOcclusion(uint2 a_pixCoord, float3 a_positionWS, float3 a_normalWS, float a_depth, uint a_eyeIndex)
-	{
-		return EvaluateContactOcclusionEx(a_pixCoord, a_positionWS, a_normalWS, a_depth, a_eyeIndex,
-			SharedData::BufferDim.xy,
-			Random::InterleavedGradientNoise(float2(a_pixCoord), SharedData::FrameCount) * Math::TAU);
-	}
-
-	/**
-	 * @brief Contact occlusion with a frame-static spiral, for a consumer that must not depend on
-	 *        temporal accumulation.
-	 *
-	 * The SSRT diffuse *fallback* is such a consumer. The term it shapes is applied inside the ray
-	 * march and reaches the frame through the SVGF chain, whose edge-stopping weights collapse at
-	 * exactly the depth and normal discontinuities a contact region is made of, and the user may be
-	 * running no anti-aliasing at all. Rotating the spiral with the frame counter there would
-	 * replace one temporal instability with a smaller one instead of removing it.
-	 *
-	 * Dropping the frame term costs nothing and buys exact temporal stability for a static camera:
-	 * InterleavedGradientNoise is a fine-grained spatial dither, so a fixed phase leaves a
-	 * high-frequency, motionless grain on the occlusion field rather than the blotchy low-frequency
-	 * pattern a constant phase would produce, and the ten taps average most of it away already.
-	 *
-	 * @param a_extent Render extent of the dispatch; see EvaluateContactOcclusionEx.
-	 */
-	float EvaluateContactOcclusionStatic(uint2 a_pixCoord, float3 a_positionWS, float3 a_normalWS, float a_depth, uint a_eyeIndex, float2 a_extent)
-	{
-		return EvaluateContactOcclusionEx(a_pixCoord, a_positionWS, a_normalWS, a_depth, a_eyeIndex,
-			a_extent,
-			Random::InterleavedGradientNoise(float2(a_pixCoord)) * Math::TAU);
-	}
 
 	// Sky visibility is sampled once per pixel by the caller (DeferredCompositeCS.hlsl), which needs
 	// the same probe fetch for the IBL half of its ambient estimate. The fallback re-evaluates it

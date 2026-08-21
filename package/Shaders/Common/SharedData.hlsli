@@ -338,9 +338,8 @@ namespace SharedData
 
 	// Mirrors ScreenSpaceRayTracing::SharedData. This struct sits inside FeatureData with
 	// ExponentialHeightFogSettings behind it, so its size is load bearing: two whole float4
-	// rows on both sides, or everything after it shifts. Row 1 is now full - the two fields
-	// that used to be declared as `float2 ssrtPad0` are the contact-occlusion pair below -
-	// so the row still needs no explicit padding member.
+	// rows on both sides, or everything after it shifts. Row 1 is full - its last two slots hold
+	// the SSGI contact pair below - so the row still needs no explicit padding member.
 	struct SSRTSettings
     {
         uint EnableSpecular;
@@ -352,13 +351,24 @@ namespace SharedData
 		/// wholesale" to "SSRT displaces it in proportion to hit confidence".
 		uint AmbientReinjection;
 		float AmbientReinjectionStrength;
-		/// Non-zero shapes the ambient the reinjection *keeps* with Environment Ambient's
-		/// centimetre-scale contact occlusion kernel. Already ANDed with AmbientReinjection on
-		/// the C++ side, and only read by builds that have the kernel (ENV_AMBIENT).
-		uint ReinjectionContactOcclusion;
-		/// How much of that kernel's occlusion to apply here; 1 applies it as the kernel
-		/// reports it. The kernel's own radius and strength come from envAmbientSettings.
-		float ReinjectionContactStrength;
+		/// (contact AO) Screen Space GI's contact-occlusion pass, described from SSRT's point of
+		/// view. These two are the *only* thing the ray march needs to know about that pass -- its
+		/// output reaches the march through the SSGI AO texture like any other occlusion -- but the
+		/// near-field vote suppression in ssrt_raymarch.hlsl has to know whether a deterministic
+		/// term is standing in for the votes it drops, and over what range.
+		///
+		/// They live in this block rather than in one of SSGI's own because SSGI publishes no
+		/// FeatureData block at all, and adding one to carry two scalars would move every offset
+		/// behind it. Filled by ScreenSpaceRayTracing::GetCommonBufferData from
+		/// ScreenSpaceGI::settings; they occupy the two slots the retired reinjection contact pair
+		/// used, so the buffer layout is unchanged.
+		///
+		/// Non-zero iff SSGI is loaded, enabled, and its contact pass is on.
+		uint SsgiContactAoActive;
+		/// Contact search radius in centimetres, i.e. the range the suppression hands over. Same
+		/// value the kernel measures itself in, so the handover cannot drift out of alignment with
+		/// the kernel's own falloff.
+		float SsgiContactRadius;
     };
 
 	struct ExponentialHeightFogSettings
@@ -396,13 +406,12 @@ namespace SharedData
 
 		uint EnclosureFallback;
 		float HueFalloff;
-		uint EnableContactOcclusion;
-		float ContactRadius;
-
-		float ContactStrength;
+		// (contact AO) EnableContactOcclusion / ContactRadius / ContactStrength used to close this
+		// row and open a fifth. The kernel they configured now lives in Screen Space GI, which owns
+		// its own copies, so the block is four rows and the two trailing pads are gone with them.
+		// Safe to shrink because this struct is last in FeatureData -- nothing sits behind it to
+		// shift.
 		float AOExponent;
-		float pad1;
-		float pad2;
 	};
 
 	cbuffer FeatureData : register(b6)

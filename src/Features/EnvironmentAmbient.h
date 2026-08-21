@@ -69,19 +69,17 @@ struct EnvironmentAmbient : Feature
 		uint EnableInterior = 1;         // 40
 		uint LinearComposite = 1;        // 44
 
-		uint EnclosureFallback = 1;         // 48
-		float HueFalloff = 1.0f;            // 52
-		uint EnableContactOcclusion = 1;    // 56
-		float ContactRadius = 15.0f;        // 60  centimetres
-
-		float ContactStrength = 1.0f;       // 64
+		uint EnclosureFallback = 1;  // 48
+		float HueFalloff = 1.0f;     // 52
 		// Total power of the composite's MultiBounceAO factor on the environment term. 1.5
 		// reproduces the SSRT diffuse path, which pays it once in its own MultiBounceAO and once
 		// more at half power because it lands in MAIN before the composite's
 		// `linDiffuseColor *= sqrt(multiBounceAO)`. 1.0 is the behaviour before this was added.
-		float AOExponent = 1.5f;            // 68
-		float pad1 = 0.0f;                  // 72
-		float pad2 = 0.0f;                  // 76
+		float AOExponent = 1.5f;  // 56
+		// EnableContactOcclusion / ContactRadius / ContactStrength used to sit at 56/60/64 with two
+		// pads behind them. The kernel they configured moved to Screen Space GI, which owns its own
+		// radius and strength, so the block dropped from five rows to four. Safe because this is the
+		// last struct in FeatureData (see FeatureBuffer.cpp) -- nothing behind it shifts.
 	} settings;
-	static_assert(sizeof(Settings) == 80, "EnvironmentAmbient::Settings must stay 80 bytes (5 constant buffer rows).");
+	static_assert(sizeof(Settings) == 64, "EnvironmentAmbient::Settings must stay 64 bytes (4 constant buffer rows).");
 };

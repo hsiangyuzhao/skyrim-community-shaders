@@ -50,7 +50,10 @@ cbuffer SSGICB : register(b1)
 	float GISaturation;
 	float GIDistanceCompensation;
 	float GICompensationMaxDist;
-	float pad1;
+	// (contact AO) World-space search radius of the contact kernel, in centimetres. Read by
+	// contactAo.cs.hlsl only; it took one of this buffer's two spare slots so the layout is
+	// unchanged.
+	float ContactRadius;
 
 	float AOPower;
 	float GIStrength;
@@ -62,7 +65,9 @@ cbuffer SSGICB : register(b1)
 	uint MaxAccumFramesAO;
 	float BlurRadius;
 	float DistanceNormalisation;
-	float pad;
+	// (contact AO) Scales the contact kernel's occlusion. Read by contactAo.cs.hlsl only; took
+	// this buffer's other spare slot.
+	float ContactStrength;
 };
 
 SamplerState samplerPointClamp : register(s0);

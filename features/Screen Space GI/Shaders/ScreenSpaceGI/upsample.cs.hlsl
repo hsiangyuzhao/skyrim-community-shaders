@@ -8,6 +8,13 @@ Texture2D<half> srcAo : register(t1);           // half-res
 Texture2D<half4> srcIlY : register(t2);         // half-res
 Texture2D<half2> srcIlCoCg : register(t3);      // half-res
 Texture2D<half4> srcGiSpecular : register(t4);  // half-res
+#ifdef CONTACT_AO
+// (contact AO) Full-res contact visibility from contactAo.cs.hlsl, folded into the AO channel here
+// because this pass is already reading and rewriting that channel at the render extent. Full
+// resolution has no upsample pass, so there the contact pass composites the term itself; see
+// CONTACT_COMPOSE in contactAo.cs.hlsl.
+Texture2D<unorm float> srcContact : register(t5);
+#endif
 
 RWTexture2D<half> outAo : register(u0);
 RWTexture2D<half4> outIlY : register(u1);
@@ -73,6 +80,14 @@ RWTexture2D<half4> outGiSpecular : register(u3);
 		coCg = srcIlCoCg.SampleLevel(samplerLinearClamp, uv, 0);
 		giSpecular = srcGiSpecular.SampleLevel(samplerLinearClamp, uv, 0);
 	}
+
+#ifdef CONTACT_AO
+	// The channel stores occlusion, so the two visibilities multiply: 1 - (1 - occ) * contact.
+	// Applied after the upsample, not before it: the contact term is a full-resolution signal and
+	// running it through a depth-weighted blend of four half-res taps would throw away the only
+	// thing it contributes.
+	ao = saturate(1.0 - (1.0 - ao) * srcContact[dtid]);
+#endif
 
 	outAo[dtid] = ao;
 	outIlY[dtid] = y;
