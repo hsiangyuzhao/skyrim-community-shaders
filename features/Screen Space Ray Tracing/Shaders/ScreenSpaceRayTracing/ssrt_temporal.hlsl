@@ -161,6 +161,43 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
     return true;
 }
 
+// (guard G4) The self-healing half of the NaN guard set, and the only one that repairs
+// damage rather than preventing it.
+//
+// texHistoryDiffuse / texHistoryMomentsDiffuse are read here and rewritten from this pass's
+// own output every frame, which makes them a closed feedback loop: once a texel holds a NaN
+// or an Inf, `lerp(prevColor, ssrColor, alpha)` reproduces it for every alpha < 1, so the
+// pixel is dead for the rest of the process -- across cell changes, save loads and
+// resolution changes -- no matter how clean the incoming radiance is. The 4-tap and 8-tap
+// disocclusion fallbacks below then *spread* it, averaging a poisoned neighbour into a
+// pixel that had nothing wrong with it, which is why the damage grows with camera motion.
+//
+// Treating a non-finite history sample as *absent* rather than as data breaks the loop.
+// Every reader below already has a well-tested path for "no usable history": the direct
+// reprojection falls through to the 4-tap search, the taps drop out of the average, and a
+// pixel that finds nothing at all seeds a fresh chain from this frame's sample with
+// accumFrames = 1 (the disocclusion path, which ssrt_variance.hlsl covers with its 7x7
+// spatial estimator). So a poisoned pixel costs exactly one frame of accumulation and then
+// rebuilds, instead of persisting forever.
+//
+// The out parameters are written unconditionally -- the caller must ignore them when the
+// return value is false -- so that healthy data takes no extra copy.
+//
+// Also collapses the two separate HistoryMomentsTexture loads the call sites used to issue
+// (one for .z, one for .xy) into one; same texel, same values, one fewer fetch.
+bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out float accumFrames)
+{
+    color = HistoryTexture[pixel];
+    const float3 m = HistoryMomentsTexture[pixel].xyz;
+    moments = m.xy;
+    accumFrames = m.z;
+    // Colour *and* moments, because the two textures poison independently: a NaN colour
+    // ruins the output directly, while an Inf second moment ruins every a-trous weight the
+    // variance channel steers (see G5). .w of the history colour is the variance the
+    // previous frame published, so it belongs to the same test.
+    return isFiniteSafe(color) && isFiniteSafe(m);
+}
+
 [numthreads(8, 8, 1)] void main(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
 {
     uint2 screen_size = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy;
@@ -284,11 +321,18 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
     uint2 prevPixel = uint2(prevUV * SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw);
     bool valid = false;
 
-    if (IsValidHistory(prevPixel, prevUV, normalVS))
+    // (guard G4) A non-finite history sample is not history; leaving prevColor / prevMoments
+    // / prevAccumFrames at their zero initialisation makes this fall through to the 4-tap
+    // search exactly as a geometrically invalid reprojection does.
+    float4 histColor;
+    float2 histMoments;
+    float histAccumFrames;
+    if (IsValidHistory(prevPixel, prevUV, normalVS) &&
+        SSRT_LoadHistory(prevPixel, histColor, histMoments, histAccumFrames))
     {
-        prevColor = HistoryTexture[prevPixel];
-        prevAccumFrames = HistoryMomentsTexture[prevPixel].z;
-        prevMoments = HistoryMomentsTexture[prevPixel].xy;
+        prevColor = histColor;
+        prevAccumFrames = histAccumFrames;
+        prevMoments = histMoments;
         valid = true;
     }
 
@@ -300,17 +344,20 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
         for (int i = 0; i < 4; i++)
         {
             int2 neighborPixel = int2(prevPixel) + bilinOffset[i];
-            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS))
+            // (guard G4) A non-finite tap is excluded from the average and from weightSum,
+            // which is what stops a single poisoned texel from being spread into the
+            // disoccluded pixels around it every time the camera moves.
+            float4 neighborColor;
+            float2 neighborMoments;
+            float neighborAccumFrames;
+            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS) &&
+                SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
+                neighborAccumFrames > 0.f)
             {
-                float4 neighborColor = HistoryTexture[uint2(neighborPixel)];
-                float neighborAccumFrames = HistoryMomentsTexture[uint2(neighborPixel)].z;
-                if (neighborAccumFrames > 0.f)
-                {
-                    prevColor += neighborColor;
-                    prevAccumFrames += neighborAccumFrames;
-                    prevMoments += HistoryMomentsTexture[uint2(neighborPixel)].xy;
-                    weightSum += 1.f;
-                }
+                prevColor += neighborColor;
+                prevAccumFrames += neighborAccumFrames;
+                prevMoments += neighborMoments;
+                weightSum += 1.f;
             }
         }
 
@@ -343,17 +390,18 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
         for (int i = 0; i < 8; i++)
         {
             int2 neighborPixel = int2(prevPixel) + offsets[i];
-            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS))
+            // (guard G4) Same per-tap rejection as the 4-tap search above.
+            float4 neighborColor;
+            float2 neighborMoments;
+            float neighborAccumFrames;
+            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS) &&
+                SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
+                neighborAccumFrames > 0.f)
             {
-                float4 neighborColor = HistoryTexture[uint2(neighborPixel)];
-                float neighborAccumFrames = HistoryMomentsTexture[uint2(neighborPixel)].z;
-                if (neighborAccumFrames > 0.f)
-                {
-                    prevColor += neighborColor;
-                    prevAccumFrames += neighborAccumFrames;
-                    prevMoments += HistoryMomentsTexture[uint2(neighborPixel)].xy;
-                    weightSum += 1.f;
-                }
+                prevColor += neighborColor;
+                prevAccumFrames += neighborAccumFrames;
+                prevMoments += neighborMoments;
+                weightSum += 1.f;
             }
         }
         if (weightSum > 0.f)
