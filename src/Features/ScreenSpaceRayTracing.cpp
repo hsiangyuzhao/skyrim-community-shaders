@@ -41,6 +41,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     FireflyClamp,
     FireflyClampSigma,
     SpecularDenoiseRoughnessCutoff,
+    HistoryClampSigma,
     FreezeNoisePhase,
     EnableSharc
 )
@@ -73,6 +74,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     FireflyClamp,
     FireflyClampSigma,
     SpecularDenoiseRoughnessCutoff,
+    HistoryClampSigma,
     FreezeNoisePhase
 )
 #endif
@@ -178,6 +180,22 @@ void ScreenSpaceRayTracing::DrawSettings()
                     "neighbour also produced, i.e. real signal; higher values only catch the "
                     "most extreme spikes.");
         }
+
+        ImGui::SliderFloat("History Clamp Sigma", &settings.HistoryClampSigma, 0.0f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "How far, in standard deviations, the reprojected history may sit outside "
+                "what this frame's 3x3 neighbourhood says the radiance can be. This is what "
+                "stops a moving object dragging stale lighting behind it: without it the "
+                "accumulation happily blends in history that is geometrically plausible but "
+                "radiometrically wrong, and the streak then takes Max Accumulated Frames to "
+                "fade.\n\n"
+                "At the default 1.0 a converged still image is untouched -- the clamp engages "
+                "on well under 1%% of pixels per frame -- while a ghost, whose error is of the "
+                "order of the local brightness itself, is cut on its first frame. Lower "
+                "shortens trails further but starts pulling the history back towards a "
+                "nine-sample mean and feeding that mean's noise into it, so below about 0.75 "
+                "you are trading convergence for motion. 0 disables the clamp.");
 
         ImGui::Checkbox("Adaptive Filtering", &settings.AdaptiveFiltering);
         if (auto _tt = Util::HoverTooltipWrapper())
@@ -1203,7 +1221,13 @@ ScreenSpaceRayTracing::DenoiserCB ScreenSpaceRayTracing::GetDenoiserCBData() con
     // (spec S3) Only the SSRT_SPECULAR permutation reads this, so DrawSSRTDiffuse simply
     // passes a value nothing looks at.
     data.specularRoughnessCutoff = settings.SpecularDenoiseRoughnessCutoff;
-    data.pad1[0] = data.pad1[1] = data.pad1[2] = 0.0f;
+    // (defect D1) Shared by both chains: ssrt_temporal.hlsl is a single permutation, so the
+    // diffuse and specular temporal passes necessarily see the same width. That is the right
+    // default -- the box is built from each pass's own input, so it self-scales, and on a
+    // near-mirror the neighbourhood's spatial sigma is large enough that the clamp is
+    // effectively inert without needing to be switched off.
+    data.historyClampSigma = settings.HistoryClampSigma;
+    data.pad1[0] = data.pad1[1] = 0.0f;
     return data;
 }
 

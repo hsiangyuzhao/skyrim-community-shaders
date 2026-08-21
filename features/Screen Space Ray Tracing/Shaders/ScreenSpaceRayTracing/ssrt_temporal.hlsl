@@ -10,10 +10,11 @@ Texture2D<float4> HistoryNormalsTexture : register(t6);
 RWTexture2D<float4> FilteredOutput : register(u0);
 RWTexture2D<float4> MomentsOutput : register(u1);
 
-// Mirrors ScreenSpaceRayTracing::DenoiserCB. Two float4 rows are declared here, one
-// more than before spec S1: fireflyClampSigma sits in the slot the A-layer left as
-// padding. A shader may declare a prefix of a larger constant buffer, so the third row
-// that ssrt_spatial.hlsl reads is simply left out.
+// Mirrors ScreenSpaceRayTracing::DenoiserCB. All three float4 rows are declared here now:
+// fireflyClampSigma sits in the slot the A-layer left as padding (spec S1), and defect D1's
+// historyClampSigma took the first of the three pad slots row 2 still had spare after spec
+// S3 claimed its .x. specularRoughnessCutoff itself is read only by the SSRT_SPECULAR
+// permutation of ssrt_spatial.hlsl and is declared here purely to keep the offsets aligned.
 cbuffer DenoiserCB : register(b2)
 {
     float invMaxAccumulatedFrames;
@@ -25,6 +26,10 @@ cbuffer DenoiserCB : register(b2)
     float adaptiveHistoryThreshold;
     float adaptiveVarianceEps;
     float fireflyClampSigma;
+    // --- row 2 ---
+    float specularRoughnessCutoff;
+    float historyClampSigma;
+    float2 denoiserPad2;
 };
 
 // (spec S1) Firefly clamp on the radiance entering the temporal accumulation.
@@ -69,39 +74,47 @@ cbuffer DenoiserCB : register(b2)
 // format rather than against the signal -- see the derivation at its use site.
 #define SSRT_MOMENT_LUMINANCE_MAX 250.0f
 
-#define SSRT_FIREFLY_RADIUS 1
-#define SSRT_FIREFLY_TILE (8 + 2 * SSRT_FIREFLY_RADIUS)  // 10
+#define SSRT_NEIGHBOUR_RADIUS 1
+#define SSRT_NEIGHBOUR_TILE (8 + 2 * SSRT_NEIGHBOUR_RADIUS)  // 10
 
-// (spec S1) The 3x3 neighbourhoods of an 8x8 group overlap almost completely -- 64 lanes
-// want 512 neighbour taps out of 100 distinct texels -- so the luminances are prefetched
-// into LDS once instead of being loaded up to 9 times each. 400 bytes of LDS turns 8 extra
-// global loads per lane into 100/64 = 1.6, and only the luminance is kept: that is all the
-// clamp needs, and it is what makes the tile a quarter the size of A4's.
+// (spec S1, extended for defect D1) The 3x3 neighbourhoods of an 8x8 group overlap almost
+// completely -- 64 lanes want 512 neighbour taps out of 100 distinct texels -- so the
+// neighbourhood is prefetched into LDS once instead of being loaded up to 9 times each.
+// 1600 bytes of LDS turns 8 extra global loads per lane into 100/64 = 1.6.
+//
+// Two mechanisms now share the tile, which is why it carries four floats per texel rather
+// than S1's single luminance:
+//   * .xyz = YCoCg of this frame's radiance, the space defect D1's history clamp builds its
+//     bounding box in (see SSRTClampHistory).
+//   * .w   = Rec.709 luminance, which is what the firefly clamp's statistics are defined
+//     over. It is kept as its own channel deliberately: YCoCg's Y is (r + 2g + b) / 4, a
+//     *different* weighting, and re-deriving luminance from YCoCg would silently change the
+//     P0-hardened firefly behaviour for the sake of four bytes per texel.
 //
 // The vote mirrors ssrt_variance.hlsl (spec A3): a fully-sky or out-of-bounds group has
 // nobody to clamp, so it must not pay for the fill. cs_5_0/fxc has no wave intrinsics,
 // hence a groupshared counter rather than WaveActiveAnyTrue. All three barriers are
 // executed by every lane unconditionally, which is why the bounds and far-plane
 // early-outs had to move below them.
-groupshared uint g_ssrtFireflyLanes;
-groupshared float g_ssrtFireflyTile[SSRT_FIREFLY_TILE * SSRT_FIREFLY_TILE];
+groupshared uint g_ssrtNeighbourLanes;
+groupshared float4 g_ssrtNeighbourTile[SSRT_NEIGHBOUR_TILE * SSRT_NEIGHBOUR_TILE];
 
 float3 SSRTClampFirefly(float3 radiance, uint2 gtid, float sigmas)
 {
-    const int2 c = int2(gtid) + SSRT_FIREFLY_RADIUS;
+    const int2 c = int2(gtid) + SSRT_NEIGHBOUR_RADIUS;
 
     float sum = 0.0f;
     float sumSq = 0.0f;
     float maxNeighbour = 0.0f;
 
-    [unroll] for (int y = -SSRT_FIREFLY_RADIUS; y <= SSRT_FIREFLY_RADIUS; y++)
+    [unroll] for (int y = -SSRT_NEIGHBOUR_RADIUS; y <= SSRT_NEIGHBOUR_RADIUS; y++)
     {
-        [unroll] for (int x = -SSRT_FIREFLY_RADIUS; x <= SSRT_FIREFLY_RADIUS; x++)
+        [unroll] for (int x = -SSRT_NEIGHBOUR_RADIUS; x <= SSRT_NEIGHBOUR_RADIUS; x++)
         {
             if (x == 0 && y == 0)
                 continue;  // the centre is not part of its own reference distribution
 
-            const float l = g_ssrtFireflyTile[(c.y + y) * SSRT_FIREFLY_TILE + (c.x + x)];
+            const float l = g_ssrtNeighbourTile[(c.y + y) * SSRT_NEIGHBOUR_TILE + (c.x + x)].w;
             sum += l;
             sumSq += l * l;
             maxNeighbour = max(maxNeighbour, l);
@@ -137,6 +150,131 @@ float3 SSRTClampFirefly(float3 radiance, uint2 gtid, float sigmas)
     // luminance, so the predicate reduces to the original lum > limit and the returned
     // expression is unchanged.
     return (isFiniteSafe(lum) && lum > limit) ? radiance * (limit / lum) : radiance;
+}
+
+// (defect D1) Neighbourhood colour clamp on the reprojected history -- the missing
+// mechanism that lets a moving object drag stale radiance behind it for
+// MaxAccumulatedFrames frames.
+//
+// Why the accumulation needs one at all. The temporal pass validates *where* it reads the
+// history (motion vector, screen bounds, normal agreement) but never checks *what* it read.
+// Every one of those tests passes for a texel that is geometrically plausible and
+// radiometrically wrong: a character's arm sweeping across a lit wall reprojects onto wall
+// texels whose normals match to well within the 30 degree gate, so the arm's indirect
+// lighting is blended in at alpha = 1/17 and takes ~16 frames to decay. That is the
+// accumulator the T3 experiment identified (streak length growing with
+// sqrt(MaxAccumulatedFrames)), and no amount of extra spatial filtering removes it, because
+// the error is in the history, not in the sample.
+//
+// The clamp is the standard answer -- bound the history by what *this* frame's neighbourhood
+// says the radiance can be -- but the textbook formulation cannot be lifted straight in,
+// because it was designed for a converged shaded image and this is a 2-spp Monte-Carlo one.
+// The three design decisions, in order of how much they matter:
+//
+// 1. mean +- K * sigma, not min/max. The classic TAA box (clamp against the 3x3 min and
+//    max) is *both* too loose and too fragile here. Too loose: at 2 spp the per-sample
+//    relative standard deviation is ~0.7, so the min/max of nine heavy-tailed samples spans
+//    roughly the mean +- 1.5..2 sigma, i.e. +- 1.1..1.4x the mean -- wide enough that most
+//    ghosts sit comfortably inside it and are not clamped at all. Too fragile: SSRT hit
+//    rates are low (audit symptom 3), so a 3x3 patch in which all 18 rays missed is common,
+//    and there the min/max box collapses to the single point 0 and *replaces* the
+//    accumulated dim GI with black. A mean/sigma box has a tunable width and, with the
+//    floor below, cannot collapse.
+//
+// 2. The width is floored by the *temporally accumulated* sample sigma, not only by the
+//    spatial one. sigmaSpatial is estimated from nine samples, so it has ~25% relative error
+//    and, worse, is exactly 0 in the all-miss patch above. prevMoments carries the EMA of
+//    the per-frame luminance moments, i.e. an estimate of the same sigma built from up to
+//    MaxAccumulatedFrames frames, which is both far less noisy and non-zero wherever the
+//    signal is genuinely bursty. Taking max(sigmaSpatial, sigmaTemporal) means:
+//      * small-sample luck can never collapse the box (the failure mode of (1));
+//      * genuine spatial detail -- a texture edge, a geometric crease -- still widens it,
+//        because there sigmaSpatial exceeds the temporal noise, and widening is the
+//        fail-safe direction (do not clamp across an edge).
+//    It is also what *decouples K from MaxAccumulatedFrames*: sigmaTemporal is the per-frame
+//    sample sigma, not the residual noise left in the accumulated output, so the box does
+//    not shrink as the accumulation window lengthens. A K tuned at 16 frames stays valid
+//    at 64.
+//
+// 3. YCoCg, not RGB. The sample cloud of a tinted GI signal is elongated along the
+//    achromatic axis, so an axis-aligned box in RGB is a loose fit to it and rejects less
+//    for the same K. It is also the difference between clamping that changes brightness
+//    (Y) or saturation (Co/Cg) and clamping that changes *hue*, which is what a per-channel
+//    RGB clamp does when it bites one channel and not the others.
+//
+// Why K = 1 is safe on a healthy static image. Write sigma for the per-frame sample sigma.
+// The box half-width is K * sigma. The history's own residual noise for an EMA with
+// alpha = 1/(N+1) is sigma * sqrt(alpha / (2 - alpha)) = 0.174 * sigma at N = 16, and the
+// box centre m1 is a nine-sample mean whose standard error is sigma / 3. So the distance
+// between the history and the box centre has standard deviation
+// sqrt(0.174^2 + 0.333^2) = 0.376 * sigma, and at K = 1 the clamp only engages beyond
+// 2.66 of those -- under 1% of frames, and when it does engage it moves the value only as
+// far as the box edge. The mechanism is a no-op on converged static content by construction,
+// not by luck. Lowering K to 0.5 puts the same event at 1.33 sigma (~18% of frames), which
+// starts feeding the neighbourhood's own noise back into the history -- the failure the
+// naive formulations are notorious for -- which is why the default does not go there.
+//
+// What it does to a ghost. The box tracks the current frame, so it re-applies every frame
+// with no lag: an error larger than K * sigma ~= 0.7x the local mean is cut to that bound
+// on its first frame instead of decaying over 16, which is the whole of the visible,
+// high-contrast streaking. An error smaller than that survives the full accumulation -- so
+// the honest claim is that trails get much shorter, not that they disappear, and the
+// residual is bounded at ~0.7x the SSRT term's own magnitude before albedo modulation.
+//
+// The centre tap is the *firefly-clamped* radiance while the eight neighbours are raw. That
+// asymmetry is deliberate: it removes the one outlier we have already identified and paid
+// for, at zero cost, and a firefly left in a *neighbour* only inflates sigma and widens the
+// box, i.e. it makes the clamp temporarily inert rather than wrong.
+float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas, float sigmaTemporal)
+{
+    const int2 c = int2(gtid) + SSRT_NEIGHBOUR_RADIUS;
+
+    float3 m1 = Color::RGBToYCoCg(centre);
+    float3 m2 = m1 * m1;
+
+    [unroll] for (int y = -SSRT_NEIGHBOUR_RADIUS; y <= SSRT_NEIGHBOUR_RADIUS; y++)
+    {
+        [unroll] for (int x = -SSRT_NEIGHBOUR_RADIUS; x <= SSRT_NEIGHBOUR_RADIUS; x++)
+        {
+            if (x == 0 && y == 0)
+                continue;  // supplied by the caller, post firefly clamp
+
+            const float3 n = g_ssrtNeighbourTile[(c.y + y) * SSRT_NEIGHBOUR_TILE + (c.x + x)].xyz;
+            m1 += n;
+            m2 += n * n;
+        }
+    }
+
+    // Population mean and standard deviation over all nine taps. Unlike the firefly clamp
+    // the centre *is* part of the reference distribution here: this statistic is an estimate
+    // of the local radiance, not an outlier test, and the centre is the single most relevant
+    // sample of it.
+    const float invCount = 1.0f / 9.0f;
+    m1 *= invCount;
+    m2 *= invCount;
+    const float3 sigmaSpatial = sqrt(max(m2 - m1 * m1, 0.0f));
+
+    // sigmaTemporal is a *luminance* sigma applied as an absolute floor to all three
+    // channels. Chroma noise is generally the smaller of the two, so this errs wide on
+    // Co/Cg -- the fail-safe direction.
+    const float3 halfWidth = sigmas * max(sigmaSpatial, sigmaTemporal);
+    const float3 lo = m1 - halfWidth;
+    const float3 hi = m1 + halfWidth;
+    const float3 h = Color::RGBToYCoCg(history);
+
+    // (guard G4 discipline) The bounds are derived from SSRColorTexture, which the upstream
+    // guards sanitise but this pass must not *assume* is clean, and a non-finite bound makes
+    // clamp()'s min/max pair implementation-defined. Bit-test finiteness -- not isfinite(),
+    // for the reason spelled out at isFiniteSafe -- and hand the history back untouched if
+    // the box is not usable arithmetic; G4 above has already rejected a non-finite history
+    // itself, so "untouched" here is always a finite value.
+    if (!(isFiniteSafe(lo) && isFiniteSafe(hi) && isFiniteSafe(h)))
+        return history;
+
+    // Clamping Co/Cg independently of Y can put the triple outside the RGB cone, so the
+    // round trip needs a floor: a negative radiance channel would be lerped into the output
+    // and darken the pixel below anything the ray march could have produced.
+    return max(Color::YCoCgToRGB(clamp(h, lo, hi)), 0.0f);
 }
 
 bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
@@ -213,31 +351,37 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
     float depthCenter = inBounds ? DepthTexture[DTid.xy] : 1.0f;
     const bool isFarPlane = SSRT_IS_FAR_PLANE(depthCenter);
 
-    // ---- (spec S1) firefly-clamp vote and prefetch; no lane may leave before they
-    // ---- complete, because every barrier below must stay group uniform ----
+    // ---- (spec S1 / defect D1) neighbourhood vote and prefetch; no lane may leave before
+    // ---- they complete, because every barrier below must stay group uniform ----
     const bool clampFireflies = fireflyClampSigma > 0.0f;
-    const bool laneClamps = clampFireflies && inBounds && !isFarPlane;
+    // (defect D1) The history clamp reads the same 3x3 tile, so it joins the same vote
+    // rather than getting a second one. Either mechanism being on is enough to make the
+    // fill worth paying for; both off leaves the tile unwritten exactly as before.
+    const bool clampHistory = historyClampSigma > 0.0f;
+    const bool laneClamps = (clampFireflies || clampHistory) && inBounds && !isFarPlane;
 
     if (all(GTid.xy == 0))
-        g_ssrtFireflyLanes = 0;
+        g_ssrtNeighbourLanes = 0;
     GroupMemoryBarrierWithGroupSync();
 
     if (laneClamps)
-        InterlockedAdd(g_ssrtFireflyLanes, 1u);
+        InterlockedAdd(g_ssrtNeighbourLanes, 1u);
     GroupMemoryBarrierWithGroupSync();
 
     // Guards LDS *writes* only; the barrier that publishes them stays unconditional.
-    if (g_ssrtFireflyLanes != 0u) {
-        const int2 tileOrigin = int2(Gid.xy) * 8 - SSRT_FIREFLY_RADIUS;
-        for (uint ty = GTid.y; ty < SSRT_FIREFLY_TILE; ty += 8) {
-            for (uint tx = GTid.x; tx < SSRT_FIREFLY_TILE; tx += 8) {
+    if (g_ssrtNeighbourLanes != 0u) {
+        const int2 tileOrigin = int2(Gid.xy) * 8 - SSRT_NEIGHBOUR_RADIUS;
+        for (uint ty = GTid.y; ty < SSRT_NEIGHBOUR_TILE; ty += 8) {
+            for (uint tx = GTid.x; tx < SSRT_NEIGHBOUR_TILE; tx += 8) {
                 // Clamp-to-edge rather than a validity flag: duplicating the border texel
-                // costs nothing here, because the statistic it feeds is an outlier test
-                // and not an energy-preserving average. A halo texel outside the
-                // dynamic-resolution sub-rect would otherwise have to be excluded from
+                // costs nothing here, because the statistics it feeds are an outlier test
+                // and a bounding box, not energy-preserving averages. A halo texel outside
+                // the dynamic-resolution sub-rect would otherwise have to be excluded from
                 // the count, which is 8 extra predicates per lane for a border effect.
                 const int2 p = clamp(tileOrigin + int2(tx, ty), int2(0, 0), int2(screen_size) - 1);
-                g_ssrtFireflyTile[ty * SSRT_FIREFLY_TILE + tx] = Color::RGBToLuminance(SSRColorTexture[p].rgb);
+                const float3 radiance = SSRColorTexture[p].rgb;
+                g_ssrtNeighbourTile[ty * SSRT_NEIGHBOUR_TILE + tx] =
+                    float4(Color::RGBToYCoCg(radiance), Color::RGBToLuminance(radiance));
             }
         }
     }
@@ -415,6 +559,33 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
 
     if (valid)
     {
+        // (defect D1) Bound the resolved history by this frame's neighbourhood before it is
+        // blended in. Placed here, after all three resolution paths have converged on a
+        // single prevColor / prevMoments pair, so the direct reprojection and both
+        // disocclusion searches are covered by one mechanism -- and the searches need it
+        // most, since they average history from texels up to two pixels away by construction.
+        //
+        // The floor for the box width is the sigma the *accumulated* moment pair implies.
+        // prevMoments is the EMA of the per-frame luminance moments, so
+        // sqrt(y - x^2) is an estimate of the per-frame sample sigma built from the whole
+        // accumulation window rather than from nine spatial taps; see the derivation at
+        // SSRTClampHistory for why flooring with it is what keeps the clamp both
+        // collapse-proof and independent of MaxAccumulatedFrames. A freshly seeded pixel
+        // reports 0 here, which is correct and harmless: its alpha is near 1, so the history
+        // it would clamp barely contributes to the output anyway.
+        //
+        // Only the colour is clamped; prevMoments is passed through to the EMA below
+        // untouched. The moments describe the noise in the *samples* being integrated, which
+        // a wrong history colour does not change, and SVGF requires the a-trous chain to be
+        // steered by exactly that quantity (see BUG-1b). Clamping them as well would make the
+        // variance channel describe the filtered result instead, which is the error BUG-1b
+        // removed.
+        if (clampHistory)
+        {
+            const float sigmaTemporal = sqrt(max(prevMoments.y - prevMoments.x * prevMoments.x, 0.0f));
+            prevColor.rgb = SSRTClampHistory(prevColor.rgb, ssrColor.rgb, GTid.xy, historyClampSigma, sigmaTemporal);
+        }
+
         float alpha = max(1.0f / (prevAccumFrames + 1.0f), invMaxAccumulatedFrames);
         blendedColor = lerp(prevColor.rgb, ssrColor.rgb, alpha);
 
