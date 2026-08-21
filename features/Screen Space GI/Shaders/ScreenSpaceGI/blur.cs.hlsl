@@ -126,9 +126,6 @@ float2x2 getRotationMatrix(float noise)
 
 	float4 ySum = ilY;
 	float2 coCgSum = ilCoCg;
-#if defined(TEMPORAL_DENOISER)
-	float fSum = accumFrames;
-#endif
 	float wSum = 1;
 	for (uint i = 0; i < numSamples; i++) {
 		float w = GaussianWeight(g_Poisson8[i].z);
@@ -171,9 +168,6 @@ float2x2 getRotationMatrix(float noise)
 		if (w > 1e-8) {
 			ySum += srcIlY.SampleLevel(samplerPointClamp, uvSample * OUT_FRAME_SCALE, 0) * w;
 			coCgSum += srcIlCoCg.SampleLevel(samplerPointClamp, uvSample * OUT_FRAME_SCALE, 0) * w;
-#if defined(TEMPORAL_DENOISER)
-			fSum += srcAccumFrames.SampleLevel(samplerPointClamp, uvSample * OUT_FRAME_SCALE, 0) * w;
-#endif
 			wSum += w;
 		}
 	}
@@ -181,6 +175,19 @@ float2x2 getRotationMatrix(float noise)
 	outIlY[dtid] = ySum / wSum;
 	outIlCoCg[dtid] = coCgSum / wSum;
 #if defined(TEMPORAL_DENOISER)
-	outAccumFrames[dtid] = fSum / wSum;
+	// (F3) accumFrames is passed through untouched instead of being spatially averaged along with
+	// the radiance. It is not a signal - it is the age of this texel's history, i.e. the
+	// denominator the next temporal step divides by, and averaging it with the neighbours destroys
+	// the one thing it exists to express. radianceDisocc.cs.hlsl resets it to 1 on a
+	// disocclusion; the old fSum/wSum blur pulled that 1 back up to roughly the neighbourhood mean
+	// (~14 at the default MaxAccumFrames=16 and BlurRadius=2) in the very frame it was written, so
+	// the reset never survived to be read and every disoccluded pixel went on blending 1/16 of a
+	// new sample into history that no longer described it. That is the reset being cancelled, not
+	// softened.
+	//
+	// Cheaper as well as more correct: this drops eight gathers per pixel and adds nothing, since
+	// the store was already here. The copy is exact - both textures are R8_UNORM, so reading n/255
+	// and writing it back yields byte n again.
+	outAccumFrames[dtid] = accumFrames;
 #endif
 }
