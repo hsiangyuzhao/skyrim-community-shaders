@@ -450,7 +450,31 @@ struct ScreenSpaceRayTracing : Feature
 
     /// @brief Dynamic-resolution extent the depth pyramid was last cleared for; a change
     /// retriggers the far-plane clear of every mip (audit #8).
-    float2 lastDepthExtent = { 0.0f, 0.0f };
+    ///
+    /// Integer, not float2: the value comes from screenSize * a dynamic-resolution ratio, and
+    /// an exact float comparison on that product turns any ratio wobble -- which is what
+    /// dynamic resolution *is* -- into a spurious change event. The pyramid is addressed by
+    /// whole texels, so whole texels are the quantity that can actually go stale.
+    uint lastDepthExtentX = 0;
+    uint lastDepthExtentY = 0;
+
+    /// @brief (guard G8, repaired) Output extent the denoiser history was last cleared for.
+    ///
+    /// Deliberately the *output* resolution and not the dynamic-resolution sub-rect. The
+    /// history textures are allocated at output resolution and are addressed by pixel, so only
+    /// a change of that extent can leave a texel describing a pixel that no longer exists. A
+    /// change of the DRS ratio alone needs no clear at all: ssrt_temporal.hlsl rejects every
+    /// texel outside the *previous* frame's sub-rect per-tap (audit #16's
+    /// DynamicResolutionParams1.zw bounds test) and the defect D3 depth test rejects whatever
+    /// stale content survives that.
+    ///
+    /// Keying the clear on the sub-rect instead is what made the mechanism dangerous: with a
+    /// live per-frame ratio the latch fires every frame, ClearDenoiserHistory() zeroes all four
+    /// history textures plus texHistoryDepth every frame, and every pixel reseeds with
+    /// accumFrames = 1, i.e. alpha = 1. That reads in-game as SVGF being a passthrough --
+    /// no denoising, and no ghosting either, because nothing is being accumulated to smear.
+    uint lastHistoryExtentX = 0;
+    uint lastHistoryExtentY = 0;
 
     /// @brief (guard G8) A denoiser-history clear is owed before anything reads it.
     ///

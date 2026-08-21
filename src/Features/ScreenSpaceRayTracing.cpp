@@ -682,10 +682,10 @@ void ScreenSpaceRayTracing::ClearDenoiserHistory()
 
     // (defect D3) texHistoryDepth is cleared to the *far plane*, not to zero. It is the
     // observed side of a comparison, not an accumulator: zero is the near plane, which a
-    // genuinely near surface could match, whereas 1.0 either linearises to a depth nothing on
-    // screen can be at or, at the exact far plane, to a non-finite value -- and
-    // ssrt_temporal.hlsl rejects both. So a cleared frame rejects every candidate and every
-    // pixel reseeds, which is the same behaviour the zeroed colour/moment pair produces.
+    // genuinely near surface could match, whereas 1.0 linearises to the far plane itself --
+    // a depth no on-screen surface can be at, so the relative comparison in
+    // ssrt_temporal.hlsl rejects it for every candidate. A cleared frame therefore reseeds
+    // every pixel, which is the same behaviour the zeroed colour/moment pair produces.
     if (texHistoryDepth) {
         const float farPlane[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
         context->ClearUnorderedAccessViewFloat(texHistoryDepth->uav.get(), farPlane);
@@ -799,15 +799,43 @@ void ScreenSpaceRayTracing::Prepass()
     // 1.0 is a no-op so each level inherits "1.0 outside the valid area" by induction.
     // Only needed when the extent changes -- with dynamic resolution off that is once,
     // and even with it on it is one clear per resolution change, not per frame.
-    if (size.x != lastDepthExtent.x || size.y != lastDepthExtent.y) {
-        lastDepthExtent = size;
+    //
+    // Compared as whole texels. `size` is screenSize scaled by a dynamic-resolution ratio, so
+    // an exact float comparison reports a change for any ratio wobble at all, and the pyramid
+    // only cares about which texels exist.
+    const uint depthExtentX = (uint)size.x;
+    const uint depthExtentY = (uint)size.y;
+    if (depthExtentX != lastDepthExtentX || depthExtentY != lastDepthExtentY) {
+        lastDepthExtentX = depthExtentX;
+        lastDepthExtentY = depthExtentY;
         const float farPlane[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
         for (uint i = 0; i < maxMips; ++i)
             context->ClearUnorderedAccessViewFloat(depthUAVs[i].get(), farPlane);
-        // (guard G8) The denoiser history is addressed by pixel and validated against the
-        // *previous* frame's dynamic-resolution sub-rect, so a change of extent leaves every
-        // texel outside the new one holding data for a pixel that no longer exists -- and
-        // the region beyond the sub-rect was never written at all, i.e. still undefined.
+    }
+
+    // (guard G8, repaired) The history clear is latched on the *output* extent, which is the
+    // extent the history textures are allocated at and addressed in, and it is deliberately no
+    // longer chained to the depth-pyramid latch above.
+    //
+    // The pyramid's latch is about which texels of a full-resolution surface hold real depth,
+    // so it must follow the dynamic-resolution sub-rect. The history's is not: a sub-rect
+    // change leaves the history textures exactly as valid as they were, because
+    // ssrt_temporal.hlsl already validates every tap against the *previous* frame's sub-rect
+    // (audit #16) and then against the previous frame's depth (defect D3). Sharing one latch
+    // therefore bought nothing and cost everything: any source of per-frame ratio movement --
+    // the engine's own adaptive dynamic resolution, or the sub-rect being read on a frame where
+    // dynamicResolutionLock happens to be clear -- wiped all four history textures and
+    // texHistoryDepth 60 times a second. Every pixel then reseeds with accumFrames = 1, alpha
+    // is exactly 1, and SVGF becomes a passthrough that also, for the same reason, cannot
+    // ghost.
+    //
+    // This is a P0-era mechanism, which is why no earlier build showed it: before guard G8
+    // nothing ever cleared the history at all, so a wobbling ratio was harmless.
+    const uint historyExtentX = (uint)state->screenSize.x;
+    const uint historyExtentY = (uint)state->screenSize.y;
+    if (historyExtentX != lastHistoryExtentX || historyExtentY != lastHistoryExtentY) {
+        lastHistoryExtentX = historyExtentX;
+        lastHistoryExtentY = historyExtentY;
         historyClearPending = true;
     }
 
