@@ -41,6 +41,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     FireflyClamp,
     FireflyClampSigma,
     SpecularDenoiseRoughnessCutoff,
+    HistoryClampSigma,
     FreezeNoisePhase,
     EnableSharc
 )
@@ -73,6 +74,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     FireflyClamp,
     FireflyClampSigma,
     SpecularDenoiseRoughnessCutoff,
+    HistoryClampSigma,
     FreezeNoisePhase
 )
 #endif
@@ -179,6 +181,22 @@ void ScreenSpaceRayTracing::DrawSettings()
                     "most extreme spikes.");
         }
 
+        ImGui::SliderFloat("History Clamp Sigma", &settings.HistoryClampSigma, 0.0f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "How far, in standard deviations, the reprojected history may sit outside "
+                "what this frame's 3x3 neighbourhood says the radiance can be. This is what "
+                "stops a moving object dragging stale lighting behind it: without it the "
+                "accumulation happily blends in history that is geometrically plausible but "
+                "radiometrically wrong, and the streak then takes Max Accumulated Frames to "
+                "fade.\n\n"
+                "At the default 1.0 a converged still image is untouched -- the clamp engages "
+                "on well under 1%% of pixels per frame -- while a ghost, whose error is of the "
+                "order of the local brightness itself, is cut on its first frame. Lower "
+                "shortens trails further but starts pulling the history back towards a "
+                "nine-sample mean and feeding that mean's noise into it, so below about 0.75 "
+                "you are trading convergence for motion. 0 disables the clamp.");
+
         ImGui::Checkbox("Adaptive Filtering", &settings.AdaptiveFiltering);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
@@ -248,6 +266,7 @@ void ScreenSpaceRayTracing::DrawSettings()
         BUFFER_VIEWER_NODE(texHistoryMoments, debugRescale)
         BUFFER_VIEWER_NODE(texHistoryMomentsDiffuse, debugRescale)
         BUFFER_VIEWER_NODE(texVariance, debugRescale)
+        BUFFER_VIEWER_NODE(texHistoryDepth, debugRescale)
 
 		ImGui::TreePop();
 	}
@@ -360,6 +379,15 @@ void ScreenSpaceRayTracing::SetupResources()
         texHitDistance = eastl::make_unique<Texture2D>(texDesc);
         texHitDistance->CreateSRV(srvDesc);
         texHitDistance->CreateUAV(uavDesc);
+
+        // (defect D3) The previous frame's raw depth, so ssrt_temporal.hlsl can tell a
+        // reprojection that landed on the same surface from one that landed on a different
+        // surface at a different distance. Same format and extent as mip 0 of the Hi-Z
+        // pyramid, which is what CopyHistoryGeometry snapshots it from; the UAV exists only
+        // so ClearDenoiserHistory can reset it to the far plane.
+        texHistoryDepth = eastl::make_unique<Texture2D>(texDesc);
+        texHistoryDepth->CreateSRV(srvDesc);
+        texHistoryDepth->CreateUAV(uavDesc);
 
         texDesc.MipLevels = maxMips;
         srvDesc.Texture2D.MipLevels = texDesc.MipLevels;
@@ -579,7 +607,18 @@ void ScreenSpaceRayTracing::ClearDenoiserHistory()
     context->ClearUnorderedAccessViewFloat(texHistory->uav.get(), zero);
     context->ClearUnorderedAccessViewFloat(texHistoryMoments->uav.get(), zero);
 
-    // texHistoryNormals is deliberately not in the list: CopyHistoryNormals overwrites it
+    // (defect D3) texHistoryDepth is cleared to the *far plane*, not to zero. It is the
+    // observed side of a comparison, not an accumulator: zero is the near plane, which a
+    // genuinely near surface could match, whereas 1.0 either linearises to a depth nothing on
+    // screen can be at or, at the exact far plane, to a non-finite value -- and
+    // ssrt_temporal.hlsl rejects both. So a cleared frame rejects every candidate and every
+    // pixel reseeds, which is the same behaviour the zeroed colour/moment pair produces.
+    if (texHistoryDepth) {
+        const float farPlane[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        context->ClearUnorderedAccessViewFloat(texHistoryDepth->uav.get(), farPlane);
+    }
+
+    // texHistoryNormals is deliberately not in the list: CopyHistoryGeometry overwrites it
     // in full every frame from the live G-buffer, so it is never stale, and its
     // R10G10B10A2_UNORM storage cannot represent a NaN in the first place.
 }
@@ -590,8 +629,9 @@ void ScreenSpaceRayTracing::UpdateHistoryValidity()
     // the history this frame is about to read.
     //
     // EnableSVGF is the case the audit called out, and it is specifically the *moments* that
-    // go stale: texHistoryDiffuse / texHistory are re-copied at the end of every draw pass
-    // whether or not SVGF is on, so the colour is always one frame old, but
+    // go stale: texHistoryDiffuse / texHistory are re-copied by every draw pass whether or
+    // not SVGF is on -- from the first a-trous iteration when it is and from the raw pass
+    // output when it is not (defect D4) -- so the colour is always one frame old, but
     // texHistoryMomentsDiffuse / texHistoryMoments are only written inside the EnableSVGF
     // block. Flipping it back on therefore resumes from the moment pair -- and the
     // accumulated frame count -- left by the last time it was on, which can be an entire
@@ -864,6 +904,42 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 
     resetViews();
 
+    // (defect D4) The temporal history must be fed from the *first* a-trous iteration, not
+    // from the end of the chain.
+    //
+    // What the end-of-chain feed did. texHistory received the output of the whole filter, so
+    // the accumulation read back an image that had already been blurred by every iteration,
+    // filtered it again, and fed that back -- a recursion with no fixed point short of full
+    // spatial convergence. Two things follow, and both are what the audit's symptom-1
+    // measurements show. The blur compounds geometrically: at AtrousIterations 2 the chain's
+    // second-moment sigma is 1.58 px per pass (spec S2), and re-filtering an
+    // already-filtered history makes the effective kernel grow with the accumulation window
+    // rather than staying fixed. And any reprojection error is *spread* before it is
+    // re-accumulated, so a ghost does not merely persist for MaxAccumulatedFrames frames, it
+    // widens across the screen while it does -- which is why the streaks read as directional
+    // smears rather than as crisp displaced copies.
+    //
+    // Feeding the first iteration instead is what SVGF prescribes (Schied et al. 2017 take
+    // the temporal feedback after wavelet iteration one, and Falcor's SVGF pass does the
+    // same). The reason is precise: the accumulation buffer's job is to hold an estimate of
+    // the *radiance*, and one iteration of guided spatial filtering is the largest amount of
+    // neighbourhood support that can be added without the estimate starting to describe its
+    // own output. The later, wider iterations exist to make the current frame presentable and
+    // must not be allowed to become an input.
+    //
+    // The composite is unaffected: it still reads the full chain output. Only what the next
+    // frame accumulates from changes. Note also that at AtrousIterations 1 the two are the
+    // same texture contents, so this is a no-op at that setting and only takes effect from 2
+    // upwards -- the default being 2.
+    //
+    // The specular chain gets the identical treatment because it has the identical defect:
+    // same shader, same ping-pong, same end-of-chain CopyResource. Its near-mirror tiles are
+    // already immune (spec S3 makes them skip the kernel outright, so chain output equals
+    // chain input there), but the glossy band in between is where the recursion was live and
+    // most damaging, since an over-blurred reflection is more visible than an over-blurred
+    // diffuse bounce.
+    bool historyFed = false;
+
     if (settings.EnableSVGF) {
         DenoiserCB denoiserCBData = GetDenoiserCBData();
         denoiserCB->Update(denoiserCBData);
@@ -880,8 +956,9 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         srvs.at(4) = depth.depthSRV;
         srvs.at(5) = texHistoryMoments->srv.get();
         srvs.at(6) = texHistoryNormals->srv.get();
+        srvs.at(7) = texHistoryDepth->srv.get();  // (defect D3)
 
-        context->CSSetShaderResources(0, 7, srvs.data());
+        context->CSSetShaderResources(0, 8, srvs.data());
         context->CSSetUnorderedAccessViews(0, 2, uavs.data(), nullptr);
         context->CSSetShader(temporalCS.get(), nullptr, 0);
 
@@ -929,6 +1006,13 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
             context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
 
             resetViews();
+
+            // (defect D4) i == 0 is the even leg of the ping-pong, so the first iteration's
+            // output sits in texSSRColor and the next iteration is about to overwrite it.
+            if (i == 0) {
+                context->CopyResource(texHistory->resource.get(), texSSRColor->resource.get());
+                historyFed = true;
+            }
         }
 
         if (settings.AtrousIterations % 2 == 0) {
@@ -942,8 +1026,9 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // (Deferred.cpp), saving a full-screen R16G16B16A16 CopyResource per frame plus the
     // texture itself.
     // (audit #13) Specular runs after diffuse, so it owns the once-per-frame snapshot.
-    CopyHistoryNormals();
-    context->CopyResource(texHistory->resource.get(), texSSRColor->resource.get());
+    CopyHistoryGeometry();
+    if (!historyFed)
+        context->CopyResource(texHistory->resource.get(), texSSRColor->resource.get());
 
     context->CSSetShader(nullptr, nullptr, 0);
 
@@ -960,10 +1045,26 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 // It must happen after every temporal pass of the frame has read it, and exactly once.
 // Deferred::DeferredPasses calls DrawSSRTDiffuse then DrawSSRTSpecular, so specular
 // takes it when enabled and diffuse takes it otherwise.
-void ScreenSpaceRayTracing::CopyHistoryNormals()
+//
+// (defect D3) The depth snapshot rides on the same contract for the same reason, which is
+// why it lives here and not in either draw pass: the two temporal dispatches share one
+// history-geometry pair, and the second of them must still see the *previous* frame's
+// values when it runs. Taking it from mip 0 of the Hi-Z pyramid rather than from the
+// depth-stencil is what makes it a plain same-format copy -- the pyramid is already an
+// R32_FLOAT restatement of kPOST_ZPREPASS_COPY, written this frame in Prepass and untouched
+// since, with the far plane outside the dynamic-resolution sub-rect (audit #8) which is
+// exactly the value that must reject there.
+void ScreenSpaceRayTracing::CopyHistoryGeometry()
 {
+    auto context = globals::d3d::context;
     auto normal = globals::game::renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
-    globals::d3d::context->CopyResource(texHistoryNormals->resource.get(), normal.texture);
+    context->CopyResource(texHistoryNormals->resource.get(), normal.texture);
+
+    // Only the denoiser reads it, so an SVGF-off frame must not pay for it. Flipping SVGF
+    // back on latches historyClearPending (guard G8), which resets this to the far plane, so
+    // the stale content left behind while it was off can never be consumed.
+    if (settings.EnableSVGF && texHistoryDepth)
+        context->CopySubresourceRegion(texHistoryDepth->resource.get(), 0, 0, 0, 0, texDepth->resource.get(), 0, nullptr);
 }
 
 void ScreenSpaceRayTracing::DrawSSRTDiffuse()
@@ -1090,6 +1191,12 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     }
 #endif
 
+    // (defect D4) See the derivation at the matching site in DrawSSRTSpecular. False until
+    // the a-trous loop has published its first iteration's output as next frame's history;
+    // if it never runs -- SVGF off, or a config carrying AtrousIterations 0 -- the
+    // unconditional copy at the bottom stands in unchanged.
+    bool historyFed = false;
+
     if (settings.EnableSVGF) {
         DenoiserCB denoiserCBData = GetDenoiserCBData();
         denoiserCB->Update(denoiserCBData);
@@ -1105,8 +1212,9 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         srvs.at(4) = depth.depthSRV;
         srvs.at(5) = texHistoryMomentsDiffuse->srv.get();
         srvs.at(6) = texHistoryNormals->srv.get();
+        srvs.at(7) = texHistoryDepth->srv.get();  // (defect D3)
 
-        context->CSSetShaderResources(0, 7, srvs.data());
+        context->CSSetShaderResources(0, 8, srvs.data());
         context->CSSetUnorderedAccessViews(0, 2, uavs.data(), nullptr);
         context->CSSetShader(temporalCS.get(), nullptr, 0);
 
@@ -1152,6 +1260,15 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
             context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
 
             resetViews();
+
+            // (defect D4) The history is the *first* iteration's output. i == 0 is the even
+            // leg of the ping-pong, so that output is in texSSRTDiffuseColor right now and
+            // the following iteration is about to overwrite it -- this is the only point in
+            // the frame where it can be taken.
+            if (i == 0) {
+                context->CopyResource(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
+                historyFed = true;
+            }
         }
 
         if (settings.AtrousIterations % 2 == 0) {
@@ -1159,7 +1276,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         }
     }
 
-    context->CopyResource(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
+    if (!historyFed)
+        context->CopyResource(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
 
     // composite
     {
@@ -1179,7 +1297,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // (audit #13) Only when specular will not run afterwards, so the snapshot still
     // happens exactly once per frame and after every temporal pass has read it.
     if (!settings.EnableSpecular)
-        CopyHistoryNormals();
+        CopyHistoryGeometry();
 
     state->EndPerfEvent();
 
@@ -1203,7 +1321,13 @@ ScreenSpaceRayTracing::DenoiserCB ScreenSpaceRayTracing::GetDenoiserCBData() con
     // (spec S3) Only the SSRT_SPECULAR permutation reads this, so DrawSSRTDiffuse simply
     // passes a value nothing looks at.
     data.specularRoughnessCutoff = settings.SpecularDenoiseRoughnessCutoff;
-    data.pad1[0] = data.pad1[1] = data.pad1[2] = 0.0f;
+    // (defect D1) Shared by both chains: ssrt_temporal.hlsl is a single permutation, so the
+    // diffuse and specular temporal passes necessarily see the same width. That is the right
+    // default -- the box is built from each pass's own input, so it self-scales, and on a
+    // near-mirror the neighbourhood's spatial sigma is large enough that the clamp is
+    // effectively inert without needing to be switched off.
+    data.historyClampSigma = settings.HistoryClampSigma;
+    data.pad1[0] = data.pad1[1] = 0.0f;
     return data;
 }
 

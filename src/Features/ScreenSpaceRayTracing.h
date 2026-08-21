@@ -246,6 +246,37 @@ struct ScreenSpaceRayTracing : Feature
         /// raising it starts skipping genuinely glossy surfaces that the filter would
         /// still have something to say about.
         float SpecularDenoiseRoughnessCutoff = 0.05f;
+        /// @brief (defect D1) Width, in standard deviations, of the neighbourhood box the
+        /// reprojected temporal history is clamped into. 0 disables the mechanism.
+        ///
+        /// The box is built per pixel in YCoCg from the 3x3 neighbourhood of *this* frame's
+        /// radiance, centred on the neighbourhood mean, with a half-width of
+        /// HistoryClampSigma * max(spatial sigma, accumulated sample sigma). The full
+        /// derivation lives at SSRTClampHistory in ssrt_temporal.hlsl; the parts that matter
+        /// for choosing a value:
+        ///
+        /// Why 1.0. Writing sigma for the per-frame sample sigma, the distance between a
+        /// healthy converged history and the box centre has standard deviation
+        /// sqrt((sigma/3)^2 + (0.174 sigma)^2) = 0.376 sigma -- the first term the standard
+        /// error of a nine-tap mean, the second the residual noise an EMA at
+        /// MaxAccumulatedFrames 16 leaves behind. At 1.0 the clamp therefore only engages
+        /// past 2.66 of those, i.e. on under 1% of frames, and then only moves the value to
+        /// the box edge: it is a no-op on static converged content by construction. Ghosts,
+        /// which are errors of order the local mean itself (a moving limb's indirect light
+        /// against a lit wall), are outside a +-0.7x-mean box immediately and are cut on
+        /// their first frame instead of decaying over MaxAccumulatedFrames.
+        ///
+        /// Going lower trades convergence for shorter trails and does so sharply: 0.5 puts
+        /// the engagement point at 1.33 standard deviations, i.e. ~18% of frames, at which
+        /// rate the clamp is continuously pulling the history back towards a nine-sample
+        /// mean and re-injecting that mean's own noise -- the classic failure of naive
+        /// neighbourhood clamping on a Monte-Carlo signal. Below ~0.75 is not recommended.
+        ///
+        /// Deliberately *not* coupled to MaxAccumulatedFrames. The floor uses the per-frame
+        /// sample sigma rather than the accumulated output's residual, so the box width does
+        /// not shrink as the accumulation window lengthens and a value tuned at 16 frames
+        /// stays valid at 64.
+        float HistoryClampSigma = 1.0f;
         /// @brief (diagnostic T2) Freeze the per-frame phase of the ray-direction noise.
         ///
         /// Feeds SSRTCB::FreezeNoisePhase, which makes ssrt_raymarch.hlsl seed its
@@ -323,7 +354,12 @@ struct ScreenSpaceRayTracing : Feature
         /// @brief (spec S3) Roughness cutoff for the specular mirror skip; 0 = off. Read
         /// only by the SSRT_SPECULAR permutation of ssrt_spatial.hlsl.
         float specularRoughnessCutoff;
-        float pad1[3];
+        /// @brief (defect D1) Neighbourhood history-clamp width in standard deviations;
+        /// 0 switches the clamp off. Read by ssrt_temporal.hlsl, which is why that shader
+        /// now declares all three rows of this buffer instead of two. Took the first of the
+        /// three pad slots row 2 had spare, so the buffer did not grow.
+        float historyClampSigma;
+        float pad1[2];
     };
 
     eastl::unique_ptr<ConstantBuffer> ssrtCB;
@@ -374,10 +410,11 @@ struct ScreenSpaceRayTracing : Feature
 
     void DrawSSRTSpecular();
     void DrawSSRTDiffuse();
-    /// @brief Snapshots the normal-roughness G-buffer into texHistoryNormals for next
-    /// frame's SVGF temporal validation. Called exactly once per frame, by whichever of
-    /// the two draw passes runs last (audit #13).
-    void CopyHistoryNormals();
+    /// @brief Snapshots the normal-roughness G-buffer into texHistoryNormals, and (defect
+    /// D3, when SVGF is on) mip 0 of the Hi-Z pyramid into texHistoryDepth, for next frame's
+    /// SVGF temporal validation. Called exactly once per frame, by whichever of the two draw
+    /// passes runs last (audit #13).
+    void CopyHistoryGeometry();
     virtual void Prepass() override;
 
     SharedData GetCommonBufferData();
@@ -398,6 +435,10 @@ struct ScreenSpaceRayTracing : Feature
     eastl::unique_ptr<Texture2D> texHistoryMoments = nullptr;
     eastl::unique_ptr<Texture2D> texHistoryMomentsDiffuse = nullptr;
     eastl::unique_ptr<Texture2D> texHistoryNormals = nullptr;
+    /// @brief (defect D3) Previous frame's raw depth, snapshotted from mip 0 of the Hi-Z
+    /// pyramid once per frame by CopyHistoryGeometry. Read by ssrt_temporal.hlsl at t7 as
+    /// the observed side of its depth disocclusion test.
+    eastl::unique_ptr<Texture2D> texHistoryDepth = nullptr;
     eastl::unique_ptr<Texture2D> texVariance = nullptr;
     /// @brief Specular hit distance; consumed by Upscaling.cpp as the DLSS-RR guide.
     /// Was a raw `Texture2D*` from a bare `new` and leaked (audit #20).
