@@ -127,14 +127,35 @@ float GaussianBlur(uint2 id)
 // taps. The report recommends 3 for parity; the default is left at 2 per the user
 // directive that existing defaults do not move.
 //
-// One incidental gain: CalculateWeight's phiDepth is set to atrousStride, i.e. to the
-// distance of a |k| = 1 tap. Under the 5x5 kernel the |k| = 2 taps were therefore judged
-// with a phiD half their true distance -- twice as strict as intended, an inconsistency
-// audit #12 did not reach. A 3-tap kernel has no |k| = 2 taps, so phiDepth is exactly
-// right for every tap it takes.
+// One incidental gain: CalculateWeight's phiDepth was set to atrousStride, i.e. to the
+// distance of an axis-aligned |k| = 1 tap. Under the 5x5 kernel the |k| = 2 taps were
+// therefore judged with a phiD half their true distance -- twice as strict as intended, an
+// inconsistency audit #12 did not reach. A 3-tap kernel has no |k| = 2 taps, so phiDepth was
+// nearly right for every tap it took (the diagonals were still judged at 1/sqrt(2) of their
+// distance). (defect D6) Bringing the 5-tap kernel back makes the error load bearing again,
+// so phiDepth is now the tap's actual texel distance -- see its use site.
 //
-// Set SSRT_SVGF_KERNEL_5X5=1 to restore the 25-tap kernel bit-for-bit, including its LDS
-// tile geometry.
+// (defect D6) The diffuse permutation is now compiled with SSRT_SVGF_KERNEL_5X5=1, i.e. the
+// 3x3 kernel above is no longer what the diffuse chain runs. The S2 measurement is not wrong;
+// its premise was.
+//
+// S2 traded reach for taps on the assumption that a 0.71x narrower filter was an acceptable
+// price. At 2 spp it is not. Reference SVGF (Schied et al. 2017) runs five iterations of the
+// 5-tap B3 spline for a second-moment sigma of ~18 px, because that is what a one-to-two
+// sample-per-pixel radiance signal needs; S2 left this chain at sigma 1.58 px, an order of
+// magnitude short, and the acceptance test that cleared it ran on a build whose variance
+// channel was still broken (BUG-1) -- so the kernel that "lost nothing" was being compared
+// against a filter that was already not filtering. It has never been evaluated on a working
+// chain.
+//
+// Restoring the 5-tap kernel at the unchanged AtrousIterations default of 2 gives sigma
+// 2.24 px for 50 taps per pixel, i.e. 1.4x the reach of the 3x3 chain and two thirds of the
+// 75 taps this pass cost before S2. AtrousIterations 3 reaches sigma 3.74 px if that is still
+// not enough. The specular permutation keeps the 3x3 kernel: its edge-stops are scaled by
+// roughness precisely so that a near-delta lobe is *not* blurred, so extra reach there is
+// either annihilated by the weights (spec S3) or actively wrong.
+//
+// Set SSRT_SVGF_KERNEL_5X5=0 to get the 3x3 chain back.
 #ifndef SSRT_SVGF_KERNEL_5X5
 #   define SSRT_SVGF_KERNEL_5X5 0
 #endif
@@ -253,14 +274,20 @@ groupshared uint g_ssrtMirrorLanes;
 // the shorter 3x3 reach need compensating. Strides 4 and 5 fall back to per-tap loads
 // exactly as before.
 //
-// Under SSRT_SVGF_KERNEL_5X5 the original geometry is restored verbatim (cap 2, 16 x 16),
-// so the fallback path is bit-identical.
+// (defect D6) With the 5-tap kernel back as the diffuse default, its LDS cap moves from A4's
+// stride 2 to stride 3, so the whole of the AtrousIterations 3 chain stays on LDS instead of
+// falling back to per-tap global loads on its last iteration. The tile grows to
+// 8 + 2 * 2 * 3 = 20 texels a side, i.e. 400 float4 = 6400 bytes -- more than A4's 4096 but
+// far inside the 32 KB a cs_5_0 group may hold, and it is the only groupshared allocation in
+// this shader. The maximum tile index a tap can produce is 7 + 2 * 3 + 2 * 3 = 19, which is
+// the last row, so the bound is exact rather than generous. Strides 4 and 5
+// (AtrousIterations 4 and 5) still fall back to per-tap loads.
 #if SSRT_SVGF_KERNEL_5X5
-#   define SSRT_SPATIAL_LDS_MAX_STRIDE 2
+#   define SSRT_SPATIAL_LDS_MAX_STRIDE 3
 #else
 #   define SSRT_SPATIAL_LDS_MAX_STRIDE 3
 #endif
-// 16 with the 5x5 kernel, 14 with the 3x3 one.
+// 20 with the 5x5 kernel, 14 with the 3x3 one.
 #define SSRT_SPATIAL_TILE (8 + 2 * SSRT_SPATIAL_KERNEL_RADIUS * SSRT_SPATIAL_LDS_MAX_STRIDE)
 
 // View-space normal in .xyz, raw depth in .w. Only the tap loop reads it; the centre
@@ -484,7 +511,6 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
         phiLuminance *= roughness;
         phiNormal /= roughness;
 #endif
-        float phiDepth = atrousStride;
         float weightSum = 0.f;
         float varianceSum = 0.f;
 
@@ -508,6 +534,19 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
                         float3 sampleNormalVS = guide.xyz;
 
                         float luminanceP = Color::RGBToLuminance(sampleSSRColor.rgb);
+                        // (defect D6) phiD is this tap's distance in texels, which is what
+                        // CalculateWeight's contract asks for: the expected same-surface depth
+                        // delta grows linearly with distance, so dividing by the distance is
+                        // what turns weightDepth into a pure measure of surface slope that no
+                        // longer changes with the tap offset or the a-trous stride. It used to
+                        // be atrousStride for every tap, which is the distance of an
+                        // axis-aligned |k| = 1 tap only -- so a |k| = 2 tap was judged twice as
+                        // strictly as intended and a diagonal by sqrt(2). The error was mild
+                        // while the kernel had no |k| = 2 taps; with the 5-tap kernel back it
+                        // costs a grazing-incidence surface most of its outer ring (weight
+                        // exp(-2.8) = 0.06 where exp(-1.4) = 0.25 was intended), i.e. exactly
+                        // the wide reach the kernel was restored for.
+                        const float phiDepth = length(float2(kx, ky)) * atrousStride;
                         float weight = CalculateWeight(depthCenter, sampleDepth, phiDepth, normalVS, sampleNormalVS, phiNormal, luminanceCenter, luminanceP, phiLuminance) * kernelWeights[abs(kx)] * kernelWeights[abs(ky)];
 
                         blendedColor += sampleSSRColor.rgb * weight;

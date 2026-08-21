@@ -737,6 +737,18 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
     auto definesSpecular = defines;
     definesSpecular.push_back({ "SSRT_SPECULAR", nullptr });
 
+    // (defect D6) The diffuse a-trous permutation runs the 5-tap B3 spline kernel; the
+    // specular one keeps the 3-tap binomial. Deliberately *not* built on `defines`: this
+    // shader has never received DYNAMIC_CUBEMAPS / SSGI / SKYLIGHTING / DIFFUSE_SPP and does
+    // not read any of them, so the list stays a single entry rather than acquiring four
+    // permutation axes that would change nothing. See the derivation at SSRT_SVGF_KERNEL_5X5
+    // in ssrt_spatial.hlsl -- in short, spec S2's 3x3 chain was accepted on a build whose
+    // variance channel was still broken, and its 1.58 px second-moment sigma is an order of
+    // magnitude short of what a 2-spp signal needs.
+    const std::vector<std::pair<const char*, const char*>> definesWideKernel = {
+        { "SSRT_SVGF_KERNEL_5X5", "1" }
+    };
+
     std::vector<ShaderCompileInfo>
         shaderInfos = {
             { &raymarchDiffuseCS, "ssrt_raymarch.hlsl", defines },
@@ -747,7 +759,7 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &diffuseCompositeCS, "ssrt_diffuse_composite.hlsl", {} },
             { &temporalCS, "ssrt_temporal.hlsl", {} },
             { &varianceCS, "ssrt_variance.hlsl", {} },
-            { &spatialCS, "ssrt_spatial.hlsl", {} },
+            { &spatialCS, "ssrt_spatial.hlsl", definesWideKernel },
             { &spatialSpecularCS, "ssrt_spatial.hlsl", definesSpecular },
 #ifdef ENABLE_SHARC
             { &raymarchDiffuseSharcCS, "ssrt_raymarch.hlsl", definesSharc },
