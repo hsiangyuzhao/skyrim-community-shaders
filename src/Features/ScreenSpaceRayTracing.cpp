@@ -629,8 +629,9 @@ void ScreenSpaceRayTracing::UpdateHistoryValidity()
     // the history this frame is about to read.
     //
     // EnableSVGF is the case the audit called out, and it is specifically the *moments* that
-    // go stale: texHistoryDiffuse / texHistory are re-copied at the end of every draw pass
-    // whether or not SVGF is on, so the colour is always one frame old, but
+    // go stale: texHistoryDiffuse / texHistory are re-copied by every draw pass whether or
+    // not SVGF is on -- from the first a-trous iteration when it is and from the raw pass
+    // output when it is not (defect D4) -- so the colour is always one frame old, but
     // texHistoryMomentsDiffuse / texHistoryMoments are only written inside the EnableSVGF
     // block. Flipping it back on therefore resumes from the moment pair -- and the
     // accumulated frame count -- left by the last time it was on, which can be an entire
@@ -903,6 +904,42 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 
     resetViews();
 
+    // (defect D4) The temporal history must be fed from the *first* a-trous iteration, not
+    // from the end of the chain.
+    //
+    // What the end-of-chain feed did. texHistory received the output of the whole filter, so
+    // the accumulation read back an image that had already been blurred by every iteration,
+    // filtered it again, and fed that back -- a recursion with no fixed point short of full
+    // spatial convergence. Two things follow, and both are what the audit's symptom-1
+    // measurements show. The blur compounds geometrically: at AtrousIterations 2 the chain's
+    // second-moment sigma is 1.58 px per pass (spec S2), and re-filtering an
+    // already-filtered history makes the effective kernel grow with the accumulation window
+    // rather than staying fixed. And any reprojection error is *spread* before it is
+    // re-accumulated, so a ghost does not merely persist for MaxAccumulatedFrames frames, it
+    // widens across the screen while it does -- which is why the streaks read as directional
+    // smears rather than as crisp displaced copies.
+    //
+    // Feeding the first iteration instead is what SVGF prescribes (Schied et al. 2017 take
+    // the temporal feedback after wavelet iteration one, and Falcor's SVGF pass does the
+    // same). The reason is precise: the accumulation buffer's job is to hold an estimate of
+    // the *radiance*, and one iteration of guided spatial filtering is the largest amount of
+    // neighbourhood support that can be added without the estimate starting to describe its
+    // own output. The later, wider iterations exist to make the current frame presentable and
+    // must not be allowed to become an input.
+    //
+    // The composite is unaffected: it still reads the full chain output. Only what the next
+    // frame accumulates from changes. Note also that at AtrousIterations 1 the two are the
+    // same texture contents, so this is a no-op at that setting and only takes effect from 2
+    // upwards -- the default being 2.
+    //
+    // The specular chain gets the identical treatment because it has the identical defect:
+    // same shader, same ping-pong, same end-of-chain CopyResource. Its near-mirror tiles are
+    // already immune (spec S3 makes them skip the kernel outright, so chain output equals
+    // chain input there), but the glossy band in between is where the recursion was live and
+    // most damaging, since an over-blurred reflection is more visible than an over-blurred
+    // diffuse bounce.
+    bool historyFed = false;
+
     if (settings.EnableSVGF) {
         DenoiserCB denoiserCBData = GetDenoiserCBData();
         denoiserCB->Update(denoiserCBData);
@@ -969,6 +1006,13 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
             context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
 
             resetViews();
+
+            // (defect D4) i == 0 is the even leg of the ping-pong, so the first iteration's
+            // output sits in texSSRColor and the next iteration is about to overwrite it.
+            if (i == 0) {
+                context->CopyResource(texHistory->resource.get(), texSSRColor->resource.get());
+                historyFed = true;
+            }
         }
 
         if (settings.AtrousIterations % 2 == 0) {
@@ -983,7 +1027,8 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // texture itself.
     // (audit #13) Specular runs after diffuse, so it owns the once-per-frame snapshot.
     CopyHistoryGeometry();
-    context->CopyResource(texHistory->resource.get(), texSSRColor->resource.get());
+    if (!historyFed)
+        context->CopyResource(texHistory->resource.get(), texSSRColor->resource.get());
 
     context->CSSetShader(nullptr, nullptr, 0);
 
@@ -1146,6 +1191,12 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     }
 #endif
 
+    // (defect D4) See the derivation at the matching site in DrawSSRTSpecular. False until
+    // the a-trous loop has published its first iteration's output as next frame's history;
+    // if it never runs -- SVGF off, or a config carrying AtrousIterations 0 -- the
+    // unconditional copy at the bottom stands in unchanged.
+    bool historyFed = false;
+
     if (settings.EnableSVGF) {
         DenoiserCB denoiserCBData = GetDenoiserCBData();
         denoiserCB->Update(denoiserCBData);
@@ -1209,6 +1260,15 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
             context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
 
             resetViews();
+
+            // (defect D4) The history is the *first* iteration's output. i == 0 is the even
+            // leg of the ping-pong, so that output is in texSSRTDiffuseColor right now and
+            // the following iteration is about to overwrite it -- this is the only point in
+            // the frame where it can be taken.
+            if (i == 0) {
+                context->CopyResource(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
+                historyFed = true;
+            }
         }
 
         if (settings.AtrousIterations % 2 == 0) {
@@ -1216,7 +1276,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         }
     }
 
-    context->CopyResource(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
+    if (!historyFed)
+        context->CopyResource(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
 
     // composite
     {
