@@ -338,8 +338,9 @@ namespace SharedData
 
 	// Mirrors ScreenSpaceRayTracing::SharedData. This struct sits inside FeatureData with
 	// ExponentialHeightFogSettings behind it, so its size is load bearing: two whole float4
-	// rows on both sides, with the tail of row 1 declared as explicit padding rather than
-	// left out, or everything after it shifts.
+	// rows on both sides, or everything after it shifts. Row 1 is now full - the two fields
+	// that used to be declared as `float2 ssrtPad0` are the contact-occlusion pair below -
+	// so the row still needs no explicit padding member.
 	struct SSRTSettings
     {
         uint EnableSpecular;
@@ -351,7 +352,13 @@ namespace SharedData
 		/// wholesale" to "SSRT displaces it in proportion to hit confidence".
 		uint AmbientReinjection;
 		float AmbientReinjectionStrength;
-		float2 ssrtPad0;
+		/// Non-zero shapes the ambient the reinjection *keeps* with Environment Ambient's
+		/// centimetre-scale contact occlusion kernel. Already ANDed with AmbientReinjection on
+		/// the C++ side, and only read by builds that have the kernel (ENV_AMBIENT).
+		uint ReinjectionContactOcclusion;
+		/// How much of that kernel's occlusion to apply here; 1 applies it as the kernel
+		/// reports it. The kernel's own radius and strength come from envAmbientSettings.
+		float ReinjectionContactStrength;
     };
 
 	struct ExponentialHeightFogSettings
