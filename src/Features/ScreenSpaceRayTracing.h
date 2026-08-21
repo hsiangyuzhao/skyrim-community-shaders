@@ -768,6 +768,42 @@ struct ScreenSpaceRayTracing : Feature
     /// a-trous passes keep it there. One byte per texel against the ~8 bytes of every other
     /// full-screen surface here, and UNORM storage means every read is a [0,1] value by
     /// construction.
+    ///
+    /// @warning (batch 1, item 3 -- assessed and rejected) This is NOT NRD's `confidence`, and it
+    /// must not be wired to the temporal accumulation window. NRD documents an externally
+    /// supplied confidence as the best available tool against temporal lag, with
+    /// `historyLength *= lerp(conf, 1, 1 / (1 + len))`, and the shared name is the whole trap.
+    /// Four independent reasons, most conclusive first:
+    ///
+    /// 1. It is identically 1.0 over the whole screen in the default configuration. Every sample
+    ///    that takes the dynamic-cubemap fallback ends with `confidence = 1` right after the
+    ///    `lerp(envColor, sampleColor, confidence)` in ssrt_raymarch.hlsl -- the fallback has
+    ///    *supplied* the unresolved directions, so reporting less would double-count when the
+    ///    composite subtracts ambient. And EnableAmbientReinjection forces
+    ///    UseDynamicCubemapsAsFallback off, so this surface means "real hit coverage" in one mode
+    ///    and "1.0 everywhere" in the other. Anything keyed off it would be inert in one
+    ///    configuration and live in the other, which is precisely the cross-setting coupling the
+    ///    project rules forbid.
+    /// 2. Where it does vary, it is anti-correlated with what the NRD formula wants. NRD's
+    ///    confidence answers "is the accumulated history still valid?" -- a lighting-change
+    ///    detector. This answers "what fraction of the hemisphere did screen space resolve?".
+    ///    Low coverage means the light came from the cubemap and the world-space cache, which are
+    ///    the most temporally *stable* inputs in the pipeline: open ground, sky-facing surfaces.
+    ///    Those pixels should accumulate longest, and the formula would shorten their window
+    ///    hardest.
+    /// 3. Used as a change detector rather than as a level, it would need the previous frame's
+    ///    coverage reprojected and validated -- another history surface with its own disocclusion
+    ///    problem -- and at DiffuseSPP 2 the per-frame estimate is a two-sample mean whose own
+    ///    standard deviation is ~0.35 at mid coverage, so the detector would fire on sampling
+    ///    noise unless it were first temporally accumulated itself.
+    /// 4. Both failure modes a coverage jump would indicate are already covered by mechanisms
+    ///    that measure them directly: a radiometric change by the defect D1 neighbourhood clamp,
+    ///    a geometric one by the defect D3 plane test.
+    ///
+    /// What *would* be a legitimate confidence source here is a global illumination-change
+    /// signal -- a per-frame sun-direction or ambient-colour delta, of the kind Sky Sync already
+    /// tracks -- supplied as a scalar rather than as a per-pixel coverage. Different input,
+    /// different work, and not this surface.
     eastl::unique_ptr<Texture2D> texSSRTDiffuseConfidence = nullptr;
     /// @brief (ambient reinjection) The same signal after ssrt_diffuse_composite.hlsl's
     /// depth-aware 7x7 spatial mean; this is what DeferredCompositeCS lerps with. A separate
