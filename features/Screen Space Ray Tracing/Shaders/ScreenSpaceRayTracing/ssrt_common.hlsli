@@ -297,24 +297,35 @@ float2 filterNaN(float2 v) { return float2(filterNaN(v.x), filterNaN(v.y)); }
 float3 filterNaN(float3 v) { return float3(filterNaN(v.x), filterNaN(v.y), filterNaN(v.z)); }
 float4 filterNaN(float4 v) { return float4(filterNaN(v.x), filterNaN(v.y), filterNaN(v.z), filterNaN(v.w)); }
 
-float filterInf(float v) { return isinf(v) ? 0 : v; }
+// (guard G1/G2/G9) Spelled as an explicit exponent test rather than `isinf(v)`, for the same
+// reason ISNAN above is spelled out rather than calling isnan(): fxc is entitled to assume
+// its inputs are finite unless /Gis is passed, and Util::CompileShader passes
+// D3DCOMPILE_ENABLE_STRICTNESS | OPTIMIZATION_LEVEL3 -- not IEEE strictness. Using isinf()
+// here made fxc emit "warning X3577: value cannot be infinity, isinf() may not be
+// necessary. /Gis may force isinf() to be performed" the moment these helpers acquired
+// their first caller, i.e. the compiler was telling us it reserved the right to delete the
+// guard. The bit test is unfoldable and lowers to the same three instructions fxc generated
+// for isinf() anyway (and 0x7fffffff / ieq 0x7f800000 / movc), so this costs nothing and
+// removes the assumption.
+float filterInf(float v) { return ((asuint(v) & 0x7FFFFFFFu) == 0x7F800000u) ? 0 : v; }
 float2 filterInf(float2 v) { return float2(filterInf(v.x), filterInf(v.y)); }
 float3 filterInf(float3 v) { return float3(filterInf(v.x), filterInf(v.y), filterInf(v.z)); }
 float4 filterInf(float4 v) { return float4(filterInf(v.x), filterInf(v.y), filterInf(v.z), filterInf(v.w)); }
 
 // (guard G4) "Is this value usable arithmetic?", i.e. neither NaN nor +-Inf.
 //
-// Deliberately *not* `isfinite()`. fxc is free to fold `isnan()` away under its default
-// (non-/Gis) float model -- which is exactly why the ISNAN macro above exists rather than
-// a plain isnan call -- and `isfinite` is specified as `!isnan(v) && !isinf(v)`, so it
-// inherits that hazard. Building the test out of the same two primitives the filterNaN /
-// filterInf pair already relies on keeps it robust under every optimisation level: the
-// comparison chain in ISNAN cannot be constant-folded without assuming the operand is
-// ordered, and `isinf` lowers to an exponent test.
+// Deliberately *not* `isfinite()`. `isfinite` is specified as `!isnan(v) && !isinf(v)` and
+// therefore inherits both of the assumptions fxc is allowed to make about its inputs
+// without /Gis (see the note on filterInf above), so the compiler is entitled to fold the
+// whole guard away.
 //
-// Cost is 4 scalar ops per component and no memory traffic, so it is affordable inside the
-// temporal pass's 13-tap history search.
-bool isFiniteSafe(float v) { return !ISNAN(v) && !isinf(v); }
+// A single exponent test covers both cases at once and cannot be folded at all: an IEEE-754
+// binary32 value is non-finite exactly when its 8 exponent bits are all set -- mantissa 0
+// gives +-Inf and any other mantissa gives a NaN -- so the sign and mantissa need not be
+// looked at. Two integer ops per component, against the seven the
+// `!ISNAN(v) && exponentTest` spelling costs, which matters because this runs up to 13
+// times per lane in the temporal pass's history search.
+bool isFiniteSafe(float v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
 bool isFiniteSafe(float2 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y); }
 bool isFiniteSafe(float3 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && isFiniteSafe(v.z); }
 bool isFiniteSafe(float4 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && isFiniteSafe(v.z) && isFiniteSafe(v.w); }
