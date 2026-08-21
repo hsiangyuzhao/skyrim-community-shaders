@@ -138,6 +138,11 @@ void readHistory(
 	radiance = Color::RadianceToLinear(FULLRES_LOAD(srcDiffuse, pixCoord, uv * frameScale, samplerLinearClamp).rgb * GIStrength);
 	radiance = filterNaN(radiance);
 	radiance = filterInf(radiance);
+	// (guard N2) filterNaN/filterInf above only reject values that are *already* non-finite;
+	// RadianceToLinear's pow(x, 2.2) (Linear Lighting off) turns a finite but bright source into
+	// a value the R11G11B10 target below cannot represent, which becomes a fresh Inf. See
+	// SSGI_MAX_RADIANCE in common.hlsli for the range argument.
+	radiance = min(radiance, SSGI_MAX_RADIANCE);
 	outRadianceDisocc[pixCoord] = radiance;
 #endif
 

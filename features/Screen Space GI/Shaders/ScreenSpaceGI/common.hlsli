@@ -122,6 +122,29 @@ bool isFiniteSafe(float2 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y); }
 bool isFiniteSafe(float3 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && isFiniteSafe(v.z); }
 bool isFiniteSafe(float4 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && isFiniteSafe(v.z) && isFiniteSafe(v.w); }
 
+// (guard N2) Ceiling on any single radiance channel entering the temporal chain.
+//
+// Purpose is overflow containment, not tone mapping. filterNaN / filterInf only catch values
+// that have *already* become non-finite, and radianceDisocc.cs.hlsl can manufacture a fresh Inf
+// out of perfectly finite inputs: with Linear Lighting disabled, Color::RadianceToLinear is
+// GammaToLinear, i.e. pow(x, 2.2). The source is the forward colour target (R11G11B10, up to
+// ~65024) scaled by IL Source Brightness (UI range 0..6), and the destination texRadiance is
+// also R11G11B10, whose largest representable value is ~65024. So any input above
+// 65024^(1/2.2) ~= 320 exponentiates past the target's range and is stored as +Inf -- reachable
+// on a sun-facing snow specular or an emissive, not just on corrupt data. From there the Inf
+// spreads through the radiance mip prefilter and into the IL history, where it is permanent.
+// Clamping the post-conversion value bounds the whole chain, because the temporal EMA can only
+// ever move *towards* the sample it is handed.
+//
+// Why this cannot touch healthy imagery: after RadianceToLinear these are linear scene radiances
+// in the same units kMAIN carries, where 1.0 is a diffuse white surface under full sunlight. The
+// brightest legitimate IL *source* -- a torch flame, a sunlit snow highlight -- lands in the low
+// tens. 128 is therefore ~10x above the top of the real signal range: a tripwire, and a pixel
+// that hits it was already broken. Same value and same reasoning as SSRT_MAX_RADIANCE in
+// features/Screen Space Ray Tracing/Shaders/ScreenSpaceRayTracing/ssrt_common.hlsli, kept
+// numerically identical so the two features cannot disagree about what "too bright" means.
+#define SSGI_MAX_RADIANCE 128.0f
+
 // screenPos - normalised position in FrameDim, one eye only
 // uv - normalised position in FrameDim, both eye
 // texCoord - texture coordinate
