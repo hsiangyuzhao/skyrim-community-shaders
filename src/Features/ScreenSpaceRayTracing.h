@@ -281,6 +281,21 @@ struct ScreenSpaceRayTracing : Feature
         /// argument weakens by exactly this change, and 2.0 is still half the paper's 4.0 --
         /// the depth term (audit #12) remains the third, and now the strongest, edge-stop.
         float NormalPhi = 128.0f;
+        /// @brief (batch 1, item 2) How hard the diffuse a-trous kernel narrows on a pixel whose
+        /// rays hit something close by. 0 disables the mechanism exactly.
+        ///
+        /// The window multiplied into the per-axis kernel weights is exp(-beta * |k|^2 / R^2)
+        /// with beta = HitRadiusStrength * (1 - f), where f is the ray's correlation length
+        /// clamped to the iteration's own hard radius and R the kernel radius. At 4.0 a contact
+        /// hit takes the chain's second-moment sigma from 2.24 px to 1.31 px while a miss or a
+        /// distant hit keeps the full 2.24 px bit for bit; the inner ring never loses more than
+        /// exp(-1) = 0.37 of its weight, so the filter narrows and never stops. See the
+        /// derivation block in ssrt_spatial.hlsl.
+        ///
+        /// Diffuse only: the specular kernel is already sized by roughness, which is the
+        /// specular equivalent of this mechanism, and its hit distance lives on a different
+        /// surface with different semantics (DLSS-RR consumes it).
+        float HitRadiusStrength = 4.0f;
         /// @brief (spec A1) Let a fully converged 8x8 tile skip an a-trous iteration.
         bool AdaptiveFiltering = true;
         /// @brief (spec A1) Accumulated frames a pixel needs before it may count as
@@ -583,7 +598,9 @@ struct ScreenSpaceRayTracing : Feature
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
     /// reproduce this layout verbatim. ssrt_temporal.hlsl declares all four rows,
     /// ssrt_spatial.hlsl the first two and ssrt_variance.hlsl only the first, which is legal
-    /// -- a shader may declare a prefix of a larger constant buffer.
+    /// -- a shader may declare a prefix of a larger constant buffer. (batch 1, item 2:
+    /// ssrt_spatial.hlsl now declares all four, because hitRadiusStrength sits on the last one;
+    /// ssrt_preblur.hlsl declares the first two.)
     ///
     /// The mirroring was checked against fxc's own reflection rather than by reading, because
     /// a silent mismatch here presents as a diagnostic switch that does nothing -- which is
@@ -636,7 +653,12 @@ struct ScreenSpaceRayTracing : Feature
         /// one debug surface, so the specular pass always passes 0 and leaves the picture the
         /// diffuse pass drew. See Settings::HistoryDebugView.
         uint historyDebugView;
-        float pad3;
+        /// @brief (batch 1, item 2) Strength of the hit-distance kernel narrowing in the diffuse
+        /// a-trous permutation; 0 leaves the kernel bit-identical to the unmodulated one. Took
+        /// row 3's last pad slot, so the buffer did not grow -- but ssrt_spatial.hlsl now has to
+        /// declare all four rows instead of two, since the field it needs is on the last one.
+        /// See Settings::HitRadiusStrength.
+        float hitRadiusStrength;
     };
     static_assert(sizeof(DenoiserCB) == 64,
         "ScreenSpaceRayTracing::DenoiserCB must stay four whole 16-byte constant buffer rows; "
@@ -751,6 +773,21 @@ struct ScreenSpaceRayTracing : Feature
     /// depth-aware 7x7 spatial mean; this is what DeferredCompositeCS lerps with. A separate
     /// surface because a blur cannot run in place.
     eastl::unique_ptr<Texture2D> texSSRTDiffuseConfidenceSmooth = nullptr;
+    /// @brief (batch 1, item 2) Per-pixel diffuse hit distance, R8_UNORM, written by
+    /// ssrt_raymarch.hlsl at u6 and read by the diffuse permutation of ssrt_spatial.hlsl at t5.
+    ///
+    /// Not a distance in game units: the payload is t / (t + SSRT_HITT_REF_TEXELS), where t is
+    /// the light's correlation length expressed in render texels at this pixel's depth. That is
+    /// the quantity the kernel actually needs, it is dimensionless, and it makes the surface
+    /// dynamic-resolution and FOV proof; the reciprocal form is what lets eight bits hold t's
+    /// four-orders-of-magnitude range across an exterior. A miss, a rejected hit and a SHARC
+    /// cache hit all encode exactly 1.0 -- "no screen-space hit at all" -- which the consumer
+    /// maps to the unmodified kernel bit for bit. See the derivation at that constant in
+    /// ssrt_common.hlsli.
+    ///
+    /// One byte per texel, on the same argument as the confidence pair above, and UNORM so no
+    /// consumer needs a finiteness guard.
+    eastl::unique_ptr<Texture2D> texSSRTDiffuseHitDistance = nullptr;
     eastl::unique_ptr<Texture2D> texHistory = nullptr;
     eastl::unique_ptr<Texture2D> texHistoryDiffuse = nullptr;
     eastl::unique_ptr<Texture2D> texTemporal = nullptr;

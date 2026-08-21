@@ -367,6 +367,85 @@ bool isFiniteSafe(float4 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && i
 // range: it is a tripwire, and a pixel that hits it was already broken.
 #define SSRT_MAX_RADIANCE 128.0f
 
+// (batch 1, item 2) The encoding of the per-pixel diffuse hit distance, shared by the writer
+// (ssrt_raymarch.hlsl) and the reader (ssrt_spatial.hlsl) so the pair cannot drift.
+//
+// WHAT THE SURFACE CARRIES, AND WHY IT IS NOT A DISTANCE
+//
+// The quantity the a-trous kernel needs is not "how far did the ray go" in game units, because
+// game units say nothing on their own: twenty units is a contact bounce at arm's length from the
+// camera and a whole room at four thousand. What the kernel needs is the ray length measured
+// against the *screen*: how many render texels of separation does it take before two pixels stop
+// being lit by the same thing.
+//
+// Deriving that takes one step. Diffuse irradiance arriving from a source at distance L varies
+// over a world-space length scale of order L -- move the receiver much less than L and the solid
+// angle the source subtends barely changes; move it much more and the source has gone. Two
+// pixels d texels apart are separated in world space by d * texelWorldSize, so
+//     correlationLengthInTexels = L / texelWorldSize,
+//     texelWorldSize = viewZ * 2 / (P00 * renderWidth).
+// texelWorldSize is taken from the projection matrix and the render extent rather than from an
+// assumed field of view -- the same construction ssrt_temporal.hlsl's plane tolerance uses and
+// ScreenSpaceGI builds as NDCToViewMul / OUT_FRAME_DIM -- so the result is dynamic-resolution
+// proof, FOV independent and per-eye correct under VR.
+//
+// WHY THE STORED VALUE IS A RECIPROCAL AND NOT THAT NUMBER
+//
+// The correlation length in texels spans four orders of magnitude across a Skyrim exterior: a
+// 5-unit contact bounce with the camera 4000 units out is a single texel, and a 500-unit bounce
+// with the camera at 100 is four thousand. An 8-bit *linear* encoding cannot hold that. The
+// first version of this constant tried, with a linear scale of 16 texels, and the CPU harness in
+// the branch's scratchpad showed the consequence immediately: at 1920 px and a 100 degree
+// horizontal FOV one texel is 1.24 units at viewZ 1000, so a 20-unit contact hit is 16 texels
+// and saturated the encoding at 1.0 -- "as distant as the encoding can say" -- i.e. the
+// mechanism was inert over most of the screen and only fired at extreme range. That is the kind
+// of error a plausible derivation hides and a table of numbers does not.
+//
+// The stored value is therefore the bounded, well-conditioned reciprocal
+//     u = t / (t + SSRT_HITT_REF_TEXELS),      t = correlation length in texels,
+// which is exactly the shape REBLUR uses (`hitDist / (hitDist + frustumSize)`), and it has the
+// two endpoint properties the mechanism needs:
+//   * t = 0 gives u = 0, the narrowest kernel;
+//   * "no screen-space hit at all" is written as the literal 1.0, which the consumer maps to
+//     beta = 0 and therefore to the unmodified kernel, bit for bit.
+// SSRT_HITT_REF_TEXELS is the correlation length at which u reads 0.5. 16 texels puts the
+// encoding's most sensitive band across the range where the interesting answers live: at viewZ
+// 1000 in the example above, u is 0.20 for a 5-unit bounce, 0.50 for 20 units, 0.83 for 100 and
+// 0.96 for 500.
+//
+// Being R8_UNORM means one byte per render texel (~8 MB of a 4K allocation, against ~33 MB for
+// each of the eight RGBA16F surfaces this feature already holds) and that a read is a [0, 1]
+// value by construction, so no consumer needs a finiteness guard -- the same argument the
+// confidence surfaces are built on. The 1/255 quantum is a smooth perturbation of a weight
+// rather than a threshold crossing, so it cannot produce a visible boundary; near u = 1 it
+// corresponds to tens of texels of correlation length, which is exactly where the consumer stops
+// caring.
+#define SSRT_HITT_REF_TEXELS 16.0f
+
+// (batch 1, item 2) How many times its own world-space footprint the light's correlation length
+// must exceed before the a-trous kernel is trusted at full width.
+//
+// This is the one free constant in the mechanism, and it is what turns the stored correlation
+// length into a per-iteration confidence. The kernel at iteration i reaches
+// SSRT_SPATIAL_KERNEL_RADIUS * stride texels, i.e. that many texelWorldSize in world space, and
+// the question is how large t has to be relative to that reach before averaging over it is
+// harmless:
+//     f = t / (t + SSRT_HITT_KERNEL_REACH * hardRadius),
+// so f = 0.5 when the correlation length is REACH kernel radii.
+//
+// 8 is an error budget rather than a taste: the irradiance varies by roughly (reach / t) of
+// itself across the filter footprint, so demanding t >= 8 * reach for full confidence is
+// demanding that the filter's outermost tap disagrees with the centre by under about an eighth
+// of the value. At the default AtrousIterations 2 and the diffuse kernel radius 2 that puts
+// f = 0.5 at 16 texels for the stride-1 iteration and at 32 for the stride-2 one -- the wider
+// iteration is judged more strictly, which is the correct direction, since it is the wide
+// iterations that reach across a contact feature.
+//
+// It is deliberately not a user setting. HitRadiusStrength already exposes the useful knob (how
+// hard to act on the answer); a second one controlling where the answer's midpoint sits would
+// make the pair under-determined.
+#define SSRT_HITT_KERNEL_REACH 8.0f
+
 // (audit #12) Tolerated *relative* linear-depth change per texel of tap distance.
 //
 // Derivation: for a surface at view depth z the per-pixel depth gradient is

@@ -7,6 +7,19 @@ Texture2D<float4> HistoryTexture : register(t0);
 Texture2D<float4> MomentsTexture : register(t1);
 Texture2D<float4> SSRColorTexture : register(t3);
 Texture2D<float> DepthTexture : register(t4);
+#if !defined(SSRT_SPECULAR)
+// (batch 1, item 2) The per-pixel diffuse hit distance. What it stores is
+// t / (t + SSRT_HITT_REF_TEXELS), where t is the correlation length of the light in render
+// texels at this pixel's depth; see that constant in ssrt_common.hlsli for the derivation and
+// the use site below for how the confidence is recovered from it.
+//
+// Diffuse only. The specular chain has its own hit distance on a different surface with
+// different semantics -- texHitDistance is R32_FLOAT in game units with a 65536 miss sentinel,
+// and Upscaling.cpp hands it to DLSS-RR as the specular guide -- and its kernel is already
+// sized by roughness, which is the specular equivalent of this mechanism. Wiring it in belongs
+// with the specular pipeline split, not here.
+Texture2D<float> HitDistanceTexture : register(t5);
+#endif
 
 RWTexture2D<float4> FilteredOutput : register(u0);
 
@@ -29,7 +42,20 @@ cbuffer DenoiserCB : register(b2)
     // (spec S3) Roughness at or below which a specular pixel counts as mirror-like;
     // 0 disables the mechanism.
     float specularRoughnessCutoff;
-    float3 denoiserPad1;
+    // (defect D1 / diagnostic D3 / diagnostic H) Read by ssrt_temporal.hlsl only. Declared here
+    // so the two views of the buffer keep matching offsets -- this shader used to close row 2
+    // with a `float3 denoiserPad1`, which it can no longer do now that it needs a field on
+    // row 3.
+    float historyClampSigma;
+    uint disableHistoryDepthTest;
+    uint disableHistoryNormalTest;
+    // --- row 3 ---
+    uint forceAcceptHistory;
+    uint rotatedNormalGate;
+    uint historyDebugView;
+    // (batch 1, item 2) Strength of the hit-distance kernel narrowing; 0 makes the mechanism
+    // exactly inert. Took the last pad slot of row 3, so DenoiserCB did not grow.
+    float hitRadiusStrength;
 };
 
 // (spec A5) The 3x3 Gaussian pre-blur of the variance channel, and the switch to A/B it.
@@ -511,6 +537,127 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
         phiLuminance *= roughness;
         phiNormal /= roughness;
 #endif
+
+        // ---- (batch 1, item 2) the kernel radius as a function of hit distance ----
+        //
+        // WHY THE RADIUS SHOULD DEPEND ON IT AT ALL
+        //
+        // The kernel is asking one question per tap: may pixel P's indirect radiance be averaged
+        // with pixel Q's? The honest answer depends on the *distance the light came from*.
+        // Diffuse irradiance from a source at world distance L varies over a length scale of
+        // order L, so two pixels separated by less than L worth of world space see almost the
+        // same integrand and averaging them is free, while two pixels separated by much more
+        // than L see different ones and averaging them is a blur. That threshold, expressed in
+        // render texels at this pixel's depth, is what HitDistanceTexture carries -- see
+        // SSRT_HITT_REF_TEXELS for the derivation and for why the surface stores a reciprocal of
+        // it rather than the number itself.
+        //
+        // Concretely, at 1920 px and a 100 degree horizontal FOV with the camera 1000 units out
+        // (one texel = 1.24 game units), and at the default AtrousIterations 2 and
+        // HitRadiusStrength 4, the mechanism produces:
+        //     ray length   correlation   beta (stride 1 / 2)   chain sigma
+        //         5 u         4 texels        3.20 / 3.56          1.382 px
+        //        20 u        16 texels        1.99 / 2.66          1.536 px
+        //       100 u        81 texels        0.66 / 1.13          1.873 px
+        //       500 u       403 texels        0.16 / 0.30          2.127 px
+        //       miss          (n/a)           0.00 / 0.00          2.236 px  (unmodified)
+        // i.e. a contact bounce keeps roughly the reach the 3x3 chain defect D6 replaced had
+        // (1.58 px), a mid-range bounce keeps most of the 5-tap chain's, and a ray that missed and
+        // came back with cubemap radiance keeps all of it -- which is where most of the residual
+        // noise lives, and where the widest kernel is not merely safe but wanted. One number, two
+        // opposite prescriptions, and before this the filter applied the same width to both.
+        //
+        // The same table is depth-adaptive in the right direction, which is the property that
+        // makes it a screen-space criterion rather than a world-space guess: with the camera 100
+        // units out a 5-unit bounce is 40 texels of correlation and gets 1.72 px, and at 4000
+        // units the same bounce is one texel and gets 1.33 px. Every figure here is single
+        // precision out of the CPU harness in the branch's scratchpad, including the R8_UNORM
+        // round trip, not derived by hand.
+        //
+        // HOW IT IS APPLIED: A WINDOW, NOT A DIFFERENT KERNEL
+        //
+        // The tap *positions* cannot vary per pixel -- the loop bounds are compile-time
+        // constants, the spec A4 groupshared tile is sized for a group-uniform stride, and the
+        // a-trous chain's hole-free coverage property depends on the stride schedule. What can
+        // vary per pixel is the tap *weights*, so the mechanism is a radial window multiplied
+        // into them:
+        //     g(k) = exp(-beta * |k|^2 / R^2),    beta = HitRadiusStrength * (1 - f),
+        // with R = SSRT_SPATIAL_KERNEL_RADIUS and f in [0, 1] the confidence that this
+        // iteration's reach is inside the light's correlation length,
+        //     f = t / (t + SSRT_HITT_KERNEL_REACH * R * stride),
+        // recovered from the stored reciprocal below. Three properties make this the right shape:
+        //
+        //   * It is separable. exp(-beta*(kx^2+ky^2)/R^2) = g(kx) * g(ky), so it folds into the
+        //     per-axis kernel weight table and the tap loop below is character-for-character
+        //     what it was. Three exp() calls per pixel, not one per tap.
+        //   * f = 1 gives beta = 0 gives g == 1 *exactly* -- exp(0) is 1.0 in IEEE-754, not
+        //     nearly 1.0 -- so a distant or missed hit reproduces the unmodified kernel bit for
+        //     bit. HitRadiusStrength 0 does the same for every pixel. The mechanism can only
+        //     ever narrow the filter, never widen it, and only where the ray was short.
+        //   * It cannot collapse to a copy. beta is bounded by HitRadiusStrength, so the inner
+        //     ring keeps exp(-S/R^2) of its weight however close the hit was: at the default
+        //     S = 4 and R = 2 that is exp(-1) = 0.37, and at the slider's maximum S = 8 it is
+        //     still exp(-2) = 0.135. A contact pixel gets a narrower filter, never no filter --
+        //     which matters, because contact pixels are 2-spp noisy like every other pixel.
+        //
+        // WHAT IT COSTS IN REACH, WITH NUMBERS
+        //
+        // Effective second moment per axis, m2(beta) = sum(k^2 h_k g_k) / sum(h_k g_k), for the
+        // 5-tap B3 spline in this file's unit-centre normalisation h = {1, 2/3, 1/6}:
+        //     beta = 0  (f = 1):        sum h = 2.6667,  sum k^2 h = 2.6667,  m2 = 1.0000
+        //     beta = 1:                        2.1610,             1.5289,   m2 = 0.7075
+        //     beta = 2  (f = 0.5, S=4):        1.8538,             0.9892,   m2 = 0.5336
+        //     beta = 4  (f = 0,   S=4):        1.4966,             0.5149,   m2 = 0.3441
+        //     beta = 8  (f = 0,   S=8):        1.1806,             0.1809,   m2 = 0.1532
+        // Per-iteration variances add along the chain and scale with stride^2, so at the default
+        // AtrousIterations 2 (strides 1 and 2, spec S2's table) the chain's second-moment sigma
+        // goes 2.236 / 1.881 / 1.633 / 1.312 / 0.875 px across those five cases. For reference the
+        // 3x3 chain defect D6 replaced was 1.58 px. Computed in single precision by the CPU
+        // harness in the branch's scratchpad, not by hand.
+        //
+        // Energy: g_k is a positive multiplier on a weight that is renormalised by weightSum
+        // below, so the output stays a convex combination of its taps. The local mean is
+        // preserved exactly, and varianceSum / weightSum^2 remains the variance of a weighted
+        // mean. Nothing about the energy or variance bookkeeping changes.
+        //
+        // The specular permutation does not take part at all -- not "takes part with beta 0".
+        // Handing it a runtime-zero beta made fxc materialise the weight table as an indexable
+        // temp and cost that permutation four instruction slots for a mechanism it does not use,
+        // so the table and its indexing are compiled out and the tap expression aliases the
+        // static kernel directly. Its generated code is then unchanged.
+#if !defined(SSRT_SPECULAR)
+#   define SSRT_TAP_KERNEL tapKernel
+        float tapKernel[SSRT_SPATIAL_KERNEL_RADIUS + 1];
+        {
+            // The stored value is u = t / (t + SSRT_HITT_REF_TEXELS) with t the correlation
+            // length in texels; see the derivation at that constant for why the encoding is a
+            // reciprocal rather than a linear scale. The confidence this iteration wants is
+            //     f = t / (t + REACH * hardRadius),
+            // and substituting t = REF * u / (1 - u) clears both fractions:
+            //     f = REF * u / (REF * u + REACH * hardRadius * (1 - u)).
+            // Written that way there is nothing to guard. The denominator is a sum of two
+            // non-negative terms and cannot be zero: u = 0 makes the second term
+            // REACH * hardRadius > 0, and u = 1 makes the first REF > 0. The two endpoints are
+            // exact -- u = 0 gives f = 0 and u = 1 gives f = REF / REF = 1, hence beta = 0 and
+            // the unmodified kernel, which is what a missed ray is entitled to.
+            //
+            // hardRadius is this iteration's own reach, so the same correlation length is judged
+            // more strictly by the later, wider iterations. That is the correct direction: it is
+            // the wide iterations that reach across a contact feature, and the narrow first one
+            // is doing the work that a 2-spp signal genuinely needs.
+            const float hitEncoded = HitDistanceTexture[DTid.xy];
+            const float hardRadius = max(float(SSRT_SPATIAL_KERNEL_RADIUS * atrousStride), 1.0f);
+            const float hitNumer = SSRT_HITT_REF_TEXELS * hitEncoded;
+            const float hitFactor = hitNumer / (hitNumer + SSRT_HITT_KERNEL_REACH * hardRadius * (1.0f - hitEncoded));
+            const float beta = hitRadiusStrength * (1.0f - hitFactor);
+            const float rcpRadiusSq = 1.0f / float(SSRT_SPATIAL_KERNEL_RADIUS * SSRT_SPATIAL_KERNEL_RADIUS);
+            [unroll] for (int kr = 0; kr <= SSRT_SPATIAL_KERNEL_RADIUS; kr++)
+                tapKernel[kr] = kernelWeights[kr] * exp(-beta * float(kr * kr) * rcpRadiusSq);
+        }
+#else
+#   define SSRT_TAP_KERNEL kernelWeights
+#endif
+
         float weightSum = 0.f;
         float varianceSum = 0.f;
 
@@ -547,7 +694,12 @@ float4 SSRTSpatialFetchGuide(int2 samplePos, int2 tileCoord, bool useLDS)
                         // exp(-2.8) = 0.06 where exp(-1.4) = 0.25 was intended), i.e. exactly
                         // the wide reach the kernel was restored for.
                         const float phiDepth = length(float2(kx, ky)) * atrousStride;
-                        float weight = CalculateWeight(depthCenter, sampleDepth, phiDepth, normalVS, sampleNormalVS, phiNormal, luminanceCenter, luminanceP, phiLuminance) * kernelWeights[abs(kx)] * kernelWeights[abs(ky)];
+                        // (batch 1, item 2) SSRT_TAP_KERNEL is kernelWeights with the per-pixel
+                        // hit-distance window folded in on the diffuse permutation -- and it *is*
+                        // kernelWeights, bit for bit, whenever the window is inert -- and the
+                        // static kernelWeights itself on the specular one. See the derivation
+                        // above.
+                        float weight = CalculateWeight(depthCenter, sampleDepth, phiDepth, normalVS, sampleNormalVS, phiNormal, luminanceCenter, luminanceP, phiLuminance) * SSRT_TAP_KERNEL[abs(kx)] * SSRT_TAP_KERNEL[abs(ky)];
 
                         blendedColor += sampleSSRColor.rgb * weight;
                         // Variance of a weighted mean scales with the squared weights.
