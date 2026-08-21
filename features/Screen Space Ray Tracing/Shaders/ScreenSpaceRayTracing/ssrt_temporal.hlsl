@@ -296,28 +296,91 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
     return max(Color::YCoCgToRGB(clamp(h, lo, hi)), 0.0f);
 }
 
-// (defect D3) Tolerated *relative* difference between the linear depth a history texel
-// actually held and the linear depth the current pixel's surface point should have had in
-// the previous frame.
+// (defect D3, repaired) Floor on the tolerated *relative* difference between the linear
+// depth a history texel actually held and the linear depth the current pixel's surface point
+// should have had in the previous frame.
 //
-// Derivation, same physics as SSRT_DEPTH_WEIGHT_SCALE in ssrt_common.hlsli. The residual a
-// *correct* match still shows comes from three same-surface sources, all of which scale with
-// the per-texel relative depth gradient (pixelAngularSize * |slope|, distance independent):
-// the up-to-one-texel offsets of the 2x2 bilinear taps, the sub-pixel jitter that moves
-// which surface point a texel sampled between frames, and motion-vector quantisation. At
-// 1920 px across ~90 deg that gradient is ~1e-3 per texel face on and ~1e-2 at an extremely
-// grazing ~84 deg, so the worst-case same-surface residual is a couple of times 1e-2.
+// This is only the part of the budget that does *not* scale with the local geometry: the
+// motion vector's own quantisation, the sub-pixel jitter that moves which surface point a
+// texel sampled between frames, and the depth-buffer/linearisation residual. The part that
+// *does* scale with geometry is added per call site by SSRTRelativeDepthSlope below, which is
+// what the original constant got wrong.
 //
-// The other side is what has to be caught. An occluder 20 cm in front of a wall -- a
-// character's arm, the canonical ghost source -- is ~14 game units, which at a viewing
-// distance of 300 units is a 4.7% depth step. So 0.1 (the value ScreenSpaceGI uses for its
-// 3D position-delta form of this test) would let precisely the case that matters through,
-// while anything much below 0.03 starts rejecting grazing ground. 0.05 sits 2.5x above the
-// worst same-surface residual and still catches the thin-occluder step.
+// Why the original single constant could not work. The residual a *correct* match still shows
+// is (per-texel relative depth gradient) x (how many texels the tap sits from the reprojected
+// position). The gradient is pixelAngularSize * |slope| and is distance independent, but
+// |slope| = tan(incidence) is unbounded: the D3 derivation capped it at 10 (~84 deg) and then
+// chose 0.05 as "2.5x the worst same-surface residual". Two of its inputs are wrong.
+//   * |slope| is routinely far above 10. A ground plane seen from eye height h at distance d
+//     has slope ~ d/h, so at h = 120 units every ground texel beyond ~7000 units exceeds the
+//     budget -- and a wall, fence or road seen edge-on exceeds it at any distance.
+//   * The tap offset is not "up to one texel". The 2x2 bilinear quad reaches 1.41 texels, the
+//     4-tap cross 2.4 and the 8-tap search 3.4, all measured from the sub-texel reprojected
+//     position -- and every one of those taps is compared against the *centre's* expected
+//     depth. The offset is known exactly at each call site, so paying for it with a constant
+//     was never necessary.
+// Where both hold at once -- oblique geometry, and the two fallback searches that only run
+// when the primary quad already failed -- all 16 candidates fail together, the pixel takes
+// the accumFrames = 1 restart every frame, and the accumulation degenerates to alpha = 1:
+// no denoising and, because nothing is accumulated, no ghosting either.
 //
-// Over-rejection is the safe direction: it seeds a fresh accumulation chain, which costs one
-// frame of noise that ssrt_variance.hlsl's 7x7 spatial estimator already covers (history <= 2).
-#define SSRT_HISTORY_DEPTH_TOLERANCE 0.05f
+// The other side still has to be caught, and this form catches it *better* than 0.05 did on
+// the surfaces that matter: an occluder 20 cm in front of a wall (~14 game units, a 4.7% step
+// at 300 units) now has to clear 0.02 + gradient * offset rather than a flat 0.05, so on the
+// face-on wall the canonical ghost source sits at 2.3x the threshold instead of 0.94x.
+//
+// Over-rejection is the safe direction only up to a point: it seeds a fresh accumulation
+// chain, which costs one frame of noise that ssrt_variance.hlsl's 7x7 spatial estimator covers
+// (history <= 2) -- but a pixel that reseeds *every* frame never leaves that state, which is
+// exactly the failure above.
+#define SSRT_HISTORY_DEPTH_BASE_TOLERANCE 0.02f
+
+// (defect D3, repaired) Per-texel relative linear-depth gradient at the current pixel, i.e.
+// the same-surface depth change one texel of tap offset is allowed to produce.
+//
+// Measured rather than assumed. The alternative -- deriving it from the view-space normal and
+// a pixel angular size recovered from the projection matrix -- needs the FOV and the render
+// extent to agree with each other and with the DRS ratio, and gets the answer wrong on any
+// surface the G-buffer normal does not describe (normal-mapped, alpha-tested foliage). Four
+// depth loads give the real number for the real texel grid at whatever resolution the pass is
+// running at, which is what makes the criterion DRS-proof: at 0.667 render scale the gradient
+// is simply 1.5x larger and the tolerance follows it.
+//
+// The min of the two one-sided differences per axis is the standard guard: at a silhouette one
+// side crosses the discontinuity and the other stays on the surface, and the surface is the
+// one whose slope we want. A texel with a discontinuity on *both* sides is a one-texel sliver
+// with no reliable history anyway, so the result is clamped rather than special-cased.
+//
+// Clamp-to-edge at the sub-rect border makes one side's difference 0, so the min picks 0 and
+// the border gets the tightest tolerance. That is the conservative direction and the border is
+// one texel wide.
+#define SSRT_HISTORY_DEPTH_MAX_SLOPE 0.5f
+
+float SSRTRelativeDepthSlope(int2 pixel, int2 screenSize, float centreRawDepth)
+{
+    const float zc = SharedData::GetScreenDepth(centreRawDepth);
+    // A non-finite or non-positive centre depth means the tolerance cannot be scaled at all;
+    // fall back to the floor, which is what the pre-repair code always used.
+    if (!isFiniteSafe(zc) || zc <= 0.0f)
+        return 0.0f;
+
+    float gradX = SSRT_FLOAT_MAX;
+    float gradY = SSRT_FLOAT_MAX;
+
+    [unroll] for (int s = -1; s <= 1; s += 2)
+    {
+        const int2 px = int2(clamp(pixel.x + s, 0, screenSize.x - 1), pixel.y);
+        const int2 py = int2(pixel.x, clamp(pixel.y + s, 0, screenSize.y - 1));
+        gradX = min(gradX, abs(SharedData::GetScreenDepth(DepthTexture[px]) - zc));
+        gradY = min(gradY, abs(SharedData::GetScreenDepth(DepthTexture[py]) - zc));
+    }
+
+    const float grad = sqrt(gradX * gradX + gradY * gradY) / zc;
+    // Bit-test finiteness, not isfinite(): a sky neighbour linearises to the far plane and the
+    // sum of squares of two such differences can overflow, and fxc may assume its inputs
+    // finite without /Gis (see isFiniteSafe).
+    return isFiniteSafe(grad) ? min(grad, SSRT_HISTORY_DEPTH_MAX_SLOPE) : SSRT_HISTORY_DEPTH_MAX_SLOPE;
+}
 
 // (defect D3) Linear view depth the current pixel's surface point *should* have had in the
 // previous frame, or -1 if it had none (it was outside the previous frame's depth range, or
@@ -368,7 +431,7 @@ float SSRTExpectedPrevLinearDepth(float2 uv, float rawDepth, uint eyeIndex)
     return SharedData::GetScreenDepth(prevNDC);
 }
 
-bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS, float expectedPrevLinearDepth)
+bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS, float expectedPrevLinearDepth, float depthTolerance)
 {
     // (audit #16) Every caller passes a pixel in the *history* textures, whose valid
     // sub-rectangle is the previous frame's dynamic-resolution extent -- hence
@@ -410,7 +473,10 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS, float expectedP
         if (!isFiniteSafe(prevLinearDepth))
             return false;
 
-        if (abs(prevLinearDepth - expectedPrevLinearDepth) > SSRT_HISTORY_DEPTH_TOLERANCE * expectedPrevLinearDepth)
+        // (defect D3, repaired) depthTolerance is per call site: the floor plus the measured
+        // per-texel depth gradient times this tap's distance from the reprojected position.
+        // See SSRT_HISTORY_DEPTH_BASE_TOLERANCE for why a single constant could not work.
+        if (abs(prevLinearDepth - expectedPrevLinearDepth) > depthTolerance * expectedPrevLinearDepth)
             return false;
     }
 
@@ -584,6 +650,21 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
     // every one of the up to 16 tap validations below.
     const float expectedPrevLinearDepth = SSRTExpectedPrevLinearDepth(uv, depthCenter, eyeIndex);
 
+    // (defect D3, repaired) The geometry-dependent half of the depth budget, measured once per
+    // lane and scaled per call site by that site's worst tap offset from the reprojected
+    // sub-texel position:
+    //   * the 2x2 bilinear quad reaches sqrt(2) = 1.42 texels;
+    //   * the 4-tap cross is centred on floor(prevCoord), so a tap is up to 1 (truncation) + 1
+    //     (offset) = 2 texels away, and diagonally nothing -- the offsets are axis aligned --
+    //     giving 2.0 plus the half-texel the truncation can add back, i.e. 2.5;
+    //   * the 8-tap search adds one more texel of reach on both axes, i.e. 3.5.
+    // These are worst cases, so a tap closer than the bound is judged slightly loosely; that
+    // is the same fail-safe direction the min-of-sides gradient takes.
+    const float depthSlope = SSRTRelativeDepthSlope(int2(DTid.xy), int2(screen_size), depthCenter);
+    const float depthTolBilinear = SSRT_HISTORY_DEPTH_BASE_TOLERANCE + depthSlope * 1.5f;
+    const float depthTolSearch4 = SSRT_HISTORY_DEPTH_BASE_TOLERANCE + depthSlope * 2.5f;
+    const float depthTolSearch8 = SSRT_HISTORY_DEPTH_BASE_TOLERANCE + depthSlope * 3.5f;
+
     float4 prevColor = 0.f;
     float prevAccumFrames = 0.f;
     float2 prevMoments = float2(0.f, 0.f);
@@ -656,7 +737,7 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 tapColor;
             float2 tapMoments;
             float tapAccumFrames;
-            if (IsValidHistory(tapPixel, prevUV, normalVS, expectedPrevLinearDepth) &&
+            if (IsValidHistory(tapPixel, prevUV, normalVS, expectedPrevLinearDepth, depthTolBilinear) &&
                 SSRT_LoadHistory(tapPixel, tapColor, tapMoments, tapAccumFrames) &&
                 tapAccumFrames > 0.f)
             {
@@ -703,7 +784,7 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 neighborColor;
             float2 neighborMoments;
             float neighborAccumFrames;
-            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS, expectedPrevLinearDepth) &&
+            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS, expectedPrevLinearDepth, depthTolSearch4) &&
                 SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
                 neighborAccumFrames > 0.f)
             {
@@ -747,7 +828,7 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 neighborColor;
             float2 neighborMoments;
             float neighborAccumFrames;
-            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS, expectedPrevLinearDepth) &&
+            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS, expectedPrevLinearDepth, depthTolSearch8) &&
                 SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
                 neighborAccumFrames > 0.f)
             {
