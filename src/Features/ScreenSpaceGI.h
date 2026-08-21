@@ -55,6 +55,14 @@ public:
 	//////////////////////////////////////////////////////////////////////////////////
 
 	bool recompileFlag = false;
+	/// @brief (P2.4 follow-up) Whether the contact AO pass is actually running this compile round.
+	///
+	/// settings.EnableContactAo is the request; this is the outcome. They differ only when the
+	/// contact shader failed to compile, and keeping them separate is what stops one optional pass
+	/// from being able to report itself as "SSGI's compute shaders failed to compile" -- see
+	/// CompileComputeShaders and ShadersOK. It is also the flag the *shared* CONTACT_AO define was
+	/// built from, so it, not the setting, is what the dispatch and the upsample binding must test.
+	bool contactAoActive = false;
 	uint outputAoIdx = 0;
 	uint outputIlIdx = 0;
 	/// @brief (contact AO) Index of the specular GI buffer to hand to consumers.

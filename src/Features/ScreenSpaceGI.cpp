@@ -297,6 +297,15 @@ void ScreenSpaceGI::DrawSettings()
 			Util::DrawMultiLineTooltip(tooltipLines);
 		}
 
+		// (P2.4 follow-up) The one place a contact AO problem is allowed to be reported, now that
+		// it can no longer masquerade as a whole-feature compile failure. Deliberately after the
+		// tooltip block rather than straight after the checkbox: HoverTooltipWrapper tests the
+		// *last* submitted item, so a widget between the two would steal the checkbox's tooltip.
+		// recompileFlag also has to be clear, so the line does not flash during the one frame
+		// between ticking the box and the rebuild that answers it.
+		if (settings.EnableContactAo && !contactAoActive && !recompileFlag)
+			ImGui::TextColored({ 1, 0.4f, 0.4f, 1 }, "Contact AO shader failed to compile; the rest of SSGI is running.");
+
 		{
 			auto contactValueGuard = Util::DisableGuard(!settings.EnableContactAo);
 
@@ -661,6 +670,61 @@ void ScreenSpaceGI::CompileComputeShaders()
 		std::vector<std::pair<const char*, const char*>> defines;
 	};
 
+	auto compile = [](std::string_view filename, const std::vector<std::pair<const char*, const char*>>& defines) {
+		auto path = std::filesystem::path("Data\\Shaders\\ScreenSpaceGI") / filename;
+		return reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), defines, "cs_5_0"));
+	};
+
+	// The permutation defines every pass in one compile round shares. Built by one function so
+	// that the round is internally consistent by construction -- in particular on CONTACT_AO,
+	// which upsample.cs.hlsl uses to decide whether to read a texture only contactAo.cs.hlsl
+	// writes. A round that gave the two different answers would bind an unwritten SRV.
+	auto commonDefines = [this](bool contactAo) {
+		std::vector<std::pair<const char*, const char*>> defines;
+		if (REL::Module::IsVR())
+			defines.push_back({ "VR", "" });
+		if (settings.ResolutionMode == 1)
+			defines.push_back({ "HALF_RES", "" });
+		if (settings.ResolutionMode == 2)
+			defines.push_back({ "QUARTER_RES", "" });
+		if (settings.EnableTemporalDenoiser)
+			defines.push_back({ "TEMPORAL_DENOISER", "" });
+		if (settings.EnableGI)
+			defines.push_back({ "GI", "" });
+		if (settings.EnableExperimentalSpecularGI)
+			defines.push_back({ "GI_SPECULAR", "" });
+		// Only upsample.cs.hlsl reads this; contactAo.cs.hlsl derives its own composite gate from
+		// the resolution defines instead. Handed to the whole set rather than to one entry because
+		// an unreferenced macro changes no bytecode, and singling out one shader here has been the
+		// source of more mistakes in this file than it has saved lines.
+		if (contactAo)
+			defines.push_back({ "CONTACT_AO", "" });
+		return defines;
+	};
+
+	// (contact AO) Resolved first, and the answer drives the shared define, so contact AO can
+	// never cost more than itself.
+	//
+	// (P2.4 follow-up) The previous shape put contactAoCompute in ShadersOK() instead, which made
+	// the pass load-bearing for the entire feature and produced a false "Compute shaders failed to
+	// compile!" the moment the setting was switched on: the recompile that would have built the
+	// shader was itself gated behind ShadersOK() in DrawSSGI, so turning the checkbox on left
+	// SSGI permanently dead with nothing in the log, because nothing had ever been compiled. The
+	// availability of one optional pass is now a property this function decides and records,
+	// rather than a verdict on the whole feature.
+	contactAoCompute = nullptr;
+	contactAoActive = false;
+	if (settings.EnableContactAo) {
+		if (auto rawPtr = compile("contactAo.cs.hlsl", commonDefines(true))) {
+			contactAoCompute.attach(rawPtr);
+			contactAoActive = true;
+		} else {
+			logger::error("ScreenSpaceGI: contact AO compute shader failed to compile; running without contact AO. The rest of SSGI is unaffected.");
+		}
+	}
+
+	const auto defines = commonDefines(contactAoActive);
+
 	std::vector<ShaderCompileInfo>
 		shaderInfos = {
 			{ &prefilterDepthsCompute, "prefilterDepths.cs.hlsl", { { "LINEAR_FILTER", "" } } },
@@ -671,41 +735,9 @@ void ScreenSpaceGI::CompileComputeShaders()
 			{ &upsampleCompute, "upsample.cs.hlsl", {} },
 		};
 
-	// (contact AO) Compiled only when the term is on, so that an install which never enables it
-	// pays nothing at startup and -- more importantly -- cannot lose all of SSGI to a compile
-	// failure in a pass it does not use (see ShadersOK). The upsample pass gets its CONTACT_AO
-	// define from the loop below for the same reason the resolution mode is compile-time here:
-	// nothing else in this feature is a runtime branch either, and it is what makes "contact AO
-	// off" emit byte-identical code to the version before this pass existed.
-	if (settings.EnableContactAo)
-		shaderInfos.push_back({ &contactAoCompute, "contactAo.cs.hlsl", {} });
-	else
-		contactAoCompute = nullptr;
-
 	for (auto& info : shaderInfos) {
-		if (REL::Module::IsVR())
-			info.defines.push_back({ "VR", "" });
-		if (settings.ResolutionMode == 1)
-			info.defines.push_back({ "HALF_RES", "" });
-		if (settings.ResolutionMode == 2)
-			info.defines.push_back({ "QUARTER_RES", "" });
-		if (settings.EnableTemporalDenoiser)
-			info.defines.push_back({ "TEMPORAL_DENOISER", "" });
-		if (settings.EnableGI)
-			info.defines.push_back({ "GI", "" });
-		if (settings.EnableExperimentalSpecularGI)
-			info.defines.push_back({ "GI_SPECULAR", "" });
-		// Only upsample.cs.hlsl reads this; contactAo.cs.hlsl derives its own composite gate from
-		// the resolution defines instead. Handed to the whole set rather than to one entry because
-		// an unreferenced macro changes no bytecode, and singling out one shader here has been the
-		// source of more mistakes in this file than it has saved lines.
-		if (settings.EnableContactAo)
-			info.defines.push_back({ "CONTACT_AO", "" });
-	}
-
-	for (auto& info : shaderInfos) {
-		auto path = std::filesystem::path("Data\\Shaders\\ScreenSpaceGI") / info.filename;
-		if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), info.defines, "cs_5_0")))
+		info.defines.insert(info.defines.end(), defines.begin(), defines.end());
+		if (auto rawPtr = compile(info.filename, info.defines))
 			info.programPtr->attach(rawPtr);
 	}
 
@@ -714,8 +746,11 @@ void ScreenSpaceGI::CompileComputeShaders()
 
 bool ScreenSpaceGI::ShadersOK()
 {
-	return texNoise && prefilterDepthsCompute && prefilterRadianceCompute && radianceDisoccCompute && giCompute && blurCompute && upsampleCompute &&
-	       (!settings.EnableContactAo || contactAoCompute);
+	// (P2.4 follow-up) Deliberately no contact AO term. Contact AO is an optional pass that
+	// degrades on its own (see contactAoActive), so a problem confined to it must not read as
+	// "SSGI's compute shaders failed to compile" and must not take indirect lighting and ambient
+	// occlusion down with it.
+	return texNoise && prefilterDepthsCompute && prefilterRadianceCompute && radianceDisoccCompute && giCompute && blurCompute && upsampleCompute;
 }
 
 void ScreenSpaceGI::UpdateSB()
@@ -789,6 +824,20 @@ void ScreenSpaceGI::DrawSSGI()
 	bool* enableSSAO = reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(BSImagespaceShaderISSAOBlurH.get()) + 0x50LL);
 	*enableSSAO = false;
 
+	// (P2.4 follow-up) The pending recompile is consumed *before* anything can gate on
+	// ShadersOK(), and this ordering is load-bearing rather than tidiness.
+	//
+	// recompileFlag is set by the settings that change the shader permutation, and some of those
+	// settings invalidate ShadersOK() by definition -- switching a pass on means the shader for it
+	// does not exist yet. Consuming the flag after the guard below therefore deadlocked: the guard
+	// returned, the recompile never ran, ShadersOK() stayed false, and the feature reported a
+	// compile failure for a permutation it had never attempted. Recovery required a restart or the
+	// global shader-cache button. Nothing about the flag's meaning depends on the feature being
+	// enabled or on the current shaders being good, so it is honoured unconditionally; the flag is
+	// cleared inside the recompile, so a genuine compile failure cannot spin here.
+	if (recompileFlag)
+		ClearShaderCache();
+
 	if (!(settings.Enabled && ShadersOK())) {
 		FLOAT clr[4] = { 0.f, 0.f, 0.f, 0.f };
 		context->ClearUnorderedAccessViewFloat(texAo[outputAoIdx]->uav.get(), clr);
@@ -807,9 +856,6 @@ void ScreenSpaceGI::DrawSSGI()
 	uint inputGITexIdx = lastFrameGITexIdx;
 
 	//////////////////////////////////////////////////////
-
-	if (recompileFlag)
-		ClearShaderCache();
 
 	UpdateSB();
 
@@ -988,7 +1034,11 @@ void ScreenSpaceGI::DrawSSGI()
 	uint contactIdx = lastFrameContactIdx;
 	uint aoOutIdx = inputAoTexIdx;
 
-	if (settings.EnableContactAo) {
+	// (P2.4 follow-up) contactAoActive, not settings.EnableContactAo: the setting says what the
+	// user asked for, this says what the current compile round actually produced, and it is what
+	// upsample.cs.hlsl was given CONTACT_AO for. The two can only differ when the shader failed to
+	// compile, and in that case the pass must be skipped rather than dispatched with a null shader.
+	if (contactAoActive) {
 		TracyD3D11Zone(globals::state->tracyCtx, "SSGI - Contact AO");
 
 		resetViews();
@@ -1022,7 +1072,7 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(2) = texIlY[inputGITexIdx]->srv.get();
 		srvs.at(3) = texIlCoCg[inputGITexIdx]->srv.get();
 		srvs.at(4) = texGiSpecular[inputAoTexIdx]->srv.get();
-		if (settings.EnableContactAo)
+		if (contactAoActive)
 			srvs.at(5) = texContactAo[contactIdx]->srv.get();
 
 		uavs.at(0) = texAo[!inputAoTexIdx]->uav.get();
