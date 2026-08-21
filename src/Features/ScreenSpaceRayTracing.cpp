@@ -41,6 +41,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     FireflyClamp,
     FireflyClampSigma,
     SpecularDenoiseRoughnessCutoff,
+    FreezeNoisePhase,
     EnableSharc
 )
 #else
@@ -71,7 +72,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AdaptiveVarianceEps,
     FireflyClamp,
     FireflyClampSigma,
-    SpecularDenoiseRoughnessCutoff
+    SpecularDenoiseRoughnessCutoff,
+    FreezeNoisePhase
 )
 #endif
 
@@ -217,6 +219,19 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::Text("(Experimental) Enables Spatially Hashed Radiance Cache (SHARC) to improve diffuse quality. This requires more memory and might impact performance.");
 #endif
     ImGui::SeparatorText("Debug");
+
+    ImGui::Checkbox("Freeze Noise Phase", &settings.FreezeNoisePhase);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Diagnostic. Not for normal play.\n\n"
+            "Freezes the per-frame phase of the ray-direction noise, so every frame traces "
+            "the same sample directions instead of a fresh set. Use it to tell two causes of "
+            "directional smearing apart: smearing produced by the upscaler clamping a "
+            "changing stochastic signal along motion disappears when the phase is frozen, "
+            "while smearing produced by the denoiser's own temporal reprojection survives "
+            "unchanged.\n\n"
+            "Leaving this on locks the sampling noise into a fixed screen-space pattern that "
+            "no amount of accumulation can average away.");
 
 	if (ImGui::TreeNode("Buffer Viewer")) {
 		static float debugRescale = .3f;
@@ -762,6 +777,11 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         ssrCBData.UseDynamicCubemapsAsFallback = (uint)settings.UseDynamicCubemapsAsFallbackSpecular && dynamicCubemaps.loaded;
         ssrCBData.OcclusionStrength = settings.OcclusionStrength;
         ssrCBData.CubemapNormalization = settings.CubemapNormalization;
+        // (diagnostic T2) Applies to both passes: the specular and diffuse permutations
+        // share SampleRandomVector2DBaked, so freezing the phase has to freeze both or the
+        // experiment is confounded by whichever one is still animating.
+        ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;
+        ssrCBData.pad0[0] = ssrCBData.pad0[1] = ssrCBData.pad0[2] = 0.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -972,6 +992,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ssrCBData.UseDynamicCubemapsAsFallback = (uint)settings.UseDynamicCubemapsAsFallback && dynamicCubemaps.loaded;
         ssrCBData.OcclusionStrength = settings.OcclusionStrength;
         ssrCBData.CubemapNormalization = settings.CubemapNormalization;
+        ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;  // (diagnostic T2)
+        ssrCBData.pad0[0] = ssrCBData.pad0[1] = ssrCBData.pad0[2] = 0.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();

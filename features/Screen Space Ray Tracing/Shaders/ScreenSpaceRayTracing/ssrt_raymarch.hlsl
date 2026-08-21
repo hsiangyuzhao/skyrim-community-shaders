@@ -82,6 +82,13 @@ cbuffer SSRTCB : register(b1)
     float BRDFBias;
     float OcclusionStrength;
     float CubemapNormalization;
+    // --- row 2 ---
+    // (diagnostic T2) Non-zero freezes the per-frame phase of the ray-direction noise; see
+    // SampleRandomVector2DBaked. ScreenSpaceRayTracing::SSRTCB pads the rest of this row out
+    // to 48 bytes, which is not declared here -- a shader may declare a prefix of a larger
+    // constant buffer, and mirroring a C++ `float pad0[3]` in HLSL would be wrong anyway
+    // (array elements get a 16-byte row each).
+    uint FreezeNoisePhase;
 };
 
 // (audit #21) Never defined by ScreenSpaceRayTracing::CompileComputeShaders, so this is
@@ -476,7 +483,15 @@ float2 SampleRandomVector2DBaked(uint2 pixel, uint index, uint numSamples) {
     // float2 u     = float2(fmod(xi.x + (((int)(pixel.x / 128)) & 0xFFu) * GOLDEN_RATIO, 1.0f), fmod(xi.y + (((int)(pixel.y / 128)) & 0xFFu) * GOLDEN_RATIO, 1.0f));
     // return u;
     int3 seed = int3(pixel.xy, 0);
-    seed.z = Random::pcg3d(int3(seed.xy, SharedData::FrameCount)).x;
+    // (diagnostic T2) The frame counter is the *only* thing that makes this pixel's sample
+    // directions differ from frame to frame, so replacing it with a constant turns the 2-spp
+    // Monte-Carlo estimate into a fixed, screen-space-locked pattern. That is precisely the
+    // discriminator the audit needs: smearing caused by an upscaler clamping a *changing*
+    // stochastic signal along motion must vanish, while smearing caused by the SVGF temporal
+    // pass's own reprojection must be unaffected. Diagnostic only -- frozen noise is noise a
+    // denoiser cannot average away.
+    const uint noisePhase = FreezeNoisePhase != 0 ? 0u : SharedData::FrameCount;
+    seed.z = Random::pcg3d(int3(seed.xy, noisePhase)).x;
     uint2 xi = Random::pcg3d(seed).xy / 0x10000;
     float2 E = Hammersley16(index, numSamples, xi);
 #if defined(SSRT_SPECULAR)
