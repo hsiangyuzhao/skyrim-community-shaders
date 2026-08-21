@@ -266,6 +266,7 @@ void ScreenSpaceRayTracing::DrawSettings()
         BUFFER_VIEWER_NODE(texHistoryMoments, debugRescale)
         BUFFER_VIEWER_NODE(texHistoryMomentsDiffuse, debugRescale)
         BUFFER_VIEWER_NODE(texVariance, debugRescale)
+        BUFFER_VIEWER_NODE(texHistoryDepth, debugRescale)
 
 		ImGui::TreePop();
 	}
@@ -378,6 +379,15 @@ void ScreenSpaceRayTracing::SetupResources()
         texHitDistance = eastl::make_unique<Texture2D>(texDesc);
         texHitDistance->CreateSRV(srvDesc);
         texHitDistance->CreateUAV(uavDesc);
+
+        // (defect D3) The previous frame's raw depth, so ssrt_temporal.hlsl can tell a
+        // reprojection that landed on the same surface from one that landed on a different
+        // surface at a different distance. Same format and extent as mip 0 of the Hi-Z
+        // pyramid, which is what CopyHistoryGeometry snapshots it from; the UAV exists only
+        // so ClearDenoiserHistory can reset it to the far plane.
+        texHistoryDepth = eastl::make_unique<Texture2D>(texDesc);
+        texHistoryDepth->CreateSRV(srvDesc);
+        texHistoryDepth->CreateUAV(uavDesc);
 
         texDesc.MipLevels = maxMips;
         srvDesc.Texture2D.MipLevels = texDesc.MipLevels;
@@ -597,7 +607,18 @@ void ScreenSpaceRayTracing::ClearDenoiserHistory()
     context->ClearUnorderedAccessViewFloat(texHistory->uav.get(), zero);
     context->ClearUnorderedAccessViewFloat(texHistoryMoments->uav.get(), zero);
 
-    // texHistoryNormals is deliberately not in the list: CopyHistoryNormals overwrites it
+    // (defect D3) texHistoryDepth is cleared to the *far plane*, not to zero. It is the
+    // observed side of a comparison, not an accumulator: zero is the near plane, which a
+    // genuinely near surface could match, whereas 1.0 either linearises to a depth nothing on
+    // screen can be at or, at the exact far plane, to a non-finite value -- and
+    // ssrt_temporal.hlsl rejects both. So a cleared frame rejects every candidate and every
+    // pixel reseeds, which is the same behaviour the zeroed colour/moment pair produces.
+    if (texHistoryDepth) {
+        const float farPlane[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        context->ClearUnorderedAccessViewFloat(texHistoryDepth->uav.get(), farPlane);
+    }
+
+    // texHistoryNormals is deliberately not in the list: CopyHistoryGeometry overwrites it
     // in full every frame from the live G-buffer, so it is never stale, and its
     // R10G10B10A2_UNORM storage cannot represent a NaN in the first place.
 }
@@ -898,8 +919,9 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         srvs.at(4) = depth.depthSRV;
         srvs.at(5) = texHistoryMoments->srv.get();
         srvs.at(6) = texHistoryNormals->srv.get();
+        srvs.at(7) = texHistoryDepth->srv.get();  // (defect D3)
 
-        context->CSSetShaderResources(0, 7, srvs.data());
+        context->CSSetShaderResources(0, 8, srvs.data());
         context->CSSetUnorderedAccessViews(0, 2, uavs.data(), nullptr);
         context->CSSetShader(temporalCS.get(), nullptr, 0);
 
@@ -960,7 +982,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // (Deferred.cpp), saving a full-screen R16G16B16A16 CopyResource per frame plus the
     // texture itself.
     // (audit #13) Specular runs after diffuse, so it owns the once-per-frame snapshot.
-    CopyHistoryNormals();
+    CopyHistoryGeometry();
     context->CopyResource(texHistory->resource.get(), texSSRColor->resource.get());
 
     context->CSSetShader(nullptr, nullptr, 0);
@@ -978,10 +1000,26 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 // It must happen after every temporal pass of the frame has read it, and exactly once.
 // Deferred::DeferredPasses calls DrawSSRTDiffuse then DrawSSRTSpecular, so specular
 // takes it when enabled and diffuse takes it otherwise.
-void ScreenSpaceRayTracing::CopyHistoryNormals()
+//
+// (defect D3) The depth snapshot rides on the same contract for the same reason, which is
+// why it lives here and not in either draw pass: the two temporal dispatches share one
+// history-geometry pair, and the second of them must still see the *previous* frame's
+// values when it runs. Taking it from mip 0 of the Hi-Z pyramid rather than from the
+// depth-stencil is what makes it a plain same-format copy -- the pyramid is already an
+// R32_FLOAT restatement of kPOST_ZPREPASS_COPY, written this frame in Prepass and untouched
+// since, with the far plane outside the dynamic-resolution sub-rect (audit #8) which is
+// exactly the value that must reject there.
+void ScreenSpaceRayTracing::CopyHistoryGeometry()
 {
+    auto context = globals::d3d::context;
     auto normal = globals::game::renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
-    globals::d3d::context->CopyResource(texHistoryNormals->resource.get(), normal.texture);
+    context->CopyResource(texHistoryNormals->resource.get(), normal.texture);
+
+    // Only the denoiser reads it, so an SVGF-off frame must not pay for it. Flipping SVGF
+    // back on latches historyClearPending (guard G8), which resets this to the far plane, so
+    // the stale content left behind while it was off can never be consumed.
+    if (settings.EnableSVGF && texHistoryDepth)
+        context->CopySubresourceRegion(texHistoryDepth->resource.get(), 0, 0, 0, 0, texDepth->resource.get(), 0, nullptr);
 }
 
 void ScreenSpaceRayTracing::DrawSSRTDiffuse()
@@ -1123,8 +1161,9 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         srvs.at(4) = depth.depthSRV;
         srvs.at(5) = texHistoryMomentsDiffuse->srv.get();
         srvs.at(6) = texHistoryNormals->srv.get();
+        srvs.at(7) = texHistoryDepth->srv.get();  // (defect D3)
 
-        context->CSSetShaderResources(0, 7, srvs.data());
+        context->CSSetShaderResources(0, 8, srvs.data());
         context->CSSetUnorderedAccessViews(0, 2, uavs.data(), nullptr);
         context->CSSetShader(temporalCS.get(), nullptr, 0);
 
@@ -1197,7 +1236,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // (audit #13) Only when specular will not run afterwards, so the snapshot still
     // happens exactly once per frame and after every temporal pass has read it.
     if (!settings.EnableSpecular)
-        CopyHistoryNormals();
+        CopyHistoryGeometry();
 
     state->EndPerfEvent();
 

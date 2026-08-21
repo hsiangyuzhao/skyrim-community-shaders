@@ -410,10 +410,11 @@ struct ScreenSpaceRayTracing : Feature
 
     void DrawSSRTSpecular();
     void DrawSSRTDiffuse();
-    /// @brief Snapshots the normal-roughness G-buffer into texHistoryNormals for next
-    /// frame's SVGF temporal validation. Called exactly once per frame, by whichever of
-    /// the two draw passes runs last (audit #13).
-    void CopyHistoryNormals();
+    /// @brief Snapshots the normal-roughness G-buffer into texHistoryNormals, and (defect
+    /// D3, when SVGF is on) mip 0 of the Hi-Z pyramid into texHistoryDepth, for next frame's
+    /// SVGF temporal validation. Called exactly once per frame, by whichever of the two draw
+    /// passes runs last (audit #13).
+    void CopyHistoryGeometry();
     virtual void Prepass() override;
 
     SharedData GetCommonBufferData();
@@ -434,6 +435,10 @@ struct ScreenSpaceRayTracing : Feature
     eastl::unique_ptr<Texture2D> texHistoryMoments = nullptr;
     eastl::unique_ptr<Texture2D> texHistoryMomentsDiffuse = nullptr;
     eastl::unique_ptr<Texture2D> texHistoryNormals = nullptr;
+    /// @brief (defect D3) Previous frame's raw depth, snapshotted from mip 0 of the Hi-Z
+    /// pyramid once per frame by CopyHistoryGeometry. Read by ssrt_temporal.hlsl at t7 as
+    /// the observed side of its depth disocclusion test.
+    eastl::unique_ptr<Texture2D> texHistoryDepth = nullptr;
     eastl::unique_ptr<Texture2D> texVariance = nullptr;
     /// @brief Specular hit distance; consumed by Upscaling.cpp as the DLSS-RR guide.
     /// Was a raw `Texture2D*` from a bare `new` and leaked (audit #20).

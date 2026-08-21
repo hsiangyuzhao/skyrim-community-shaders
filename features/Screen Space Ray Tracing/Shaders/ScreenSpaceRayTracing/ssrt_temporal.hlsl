@@ -6,6 +6,10 @@ Texture2D<float4> SSRColorTexture : register(t3);
 Texture2D<float> DepthTexture : register(t4);
 Texture2D<float4> HistoryMomentsTexture : register(t5); // moments in RG, frame count in B
 Texture2D<float4> HistoryNormalsTexture : register(t6);
+// (defect D3) The previous frame's raw depth buffer -- a snapshot of mip 0 of the Hi-Z
+// pyramid, i.e. of exactly the texture bound at t4 one frame earlier, taken once per frame
+// by ScreenSpaceRayTracing::CopyHistoryGeometry alongside the normal snapshot at t6.
+Texture2D<float> HistoryDepthTexture : register(t7);
 
 RWTexture2D<float4> FilteredOutput : register(u0);
 RWTexture2D<float4> MomentsOutput : register(u1);
@@ -277,7 +281,79 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
     return max(Color::YCoCgToRGB(clamp(h, lo, hi)), 0.0f);
 }
 
-bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
+// (defect D3) Tolerated *relative* difference between the linear depth a history texel
+// actually held and the linear depth the current pixel's surface point should have had in
+// the previous frame.
+//
+// Derivation, same physics as SSRT_DEPTH_WEIGHT_SCALE in ssrt_common.hlsli. The residual a
+// *correct* match still shows comes from three same-surface sources, all of which scale with
+// the per-texel relative depth gradient (pixelAngularSize * |slope|, distance independent):
+// the up-to-one-texel offsets of the 2x2 bilinear taps, the sub-pixel jitter that moves
+// which surface point a texel sampled between frames, and motion-vector quantisation. At
+// 1920 px across ~90 deg that gradient is ~1e-3 per texel face on and ~1e-2 at an extremely
+// grazing ~84 deg, so the worst-case same-surface residual is a couple of times 1e-2.
+//
+// The other side is what has to be caught. An occluder 20 cm in front of a wall -- a
+// character's arm, the canonical ghost source -- is ~14 game units, which at a viewing
+// distance of 300 units is a 4.7% depth step. So 0.1 (the value ScreenSpaceGI uses for its
+// 3D position-delta form of this test) would let precisely the case that matters through,
+// while anything much below 0.03 starts rejecting grazing ground. 0.05 sits 2.5x above the
+// worst same-surface residual and still catches the thin-occluder step.
+//
+// Over-rejection is the safe direction: it seeds a fresh accumulation chain, which costs one
+// frame of noise that ssrt_variance.hlsl's 7x7 spatial estimator already covers (history <= 2).
+#define SSRT_HISTORY_DEPTH_TOLERANCE 0.05f
+
+// (defect D3) Linear view depth the current pixel's surface point *should* have had in the
+// previous frame, or -1 if it had none (it was outside the previous frame's depth range, or
+// behind that camera).
+//
+// This is the reference the observed history depth is compared against, and it has to be
+// computed rather than approximated by the current depth: comparing current-frame depth to
+// history depth directly is wrong the moment the camera translates along its view axis. At
+// 60 fps a walking player covers ~6 game units per frame, which is 0.6% relative at 1000
+// units away but 6% at 100 -- so the naive form would reject nearly all history whenever the
+// player walks near a wall, i.e. it would disable the accumulation exactly where indirect
+// light matters most.
+//
+// The unprojection mirrors ReprojectHit's, with one addition ReprojectHit does not need
+// because it discards its matrix result and uses the motion vector instead: the game shifts
+// its world origin as the player moves, and CameraPreviousViewProjUnjittered is defined
+// against the *previous* adjust point (this is the same rebasing MotionBlur::GetSSMotionVector
+// relies on its caller having done, and that ScreenSpaceGI's radianceDisocc does explicitly).
+// Without it the reference depth would be wrong by the whole origin shift on the frames the
+// game re-bases, which is a guaranteed full-screen history rejection.
+//
+// The result is linearised through SharedData::GetScreenDepth, the same function the observed
+// side goes through, so every projection sign and scale convention cancels between the two
+// and only the NDC ratio -- which is convention independent -- has to be right.
+float SSRTExpectedPrevLinearDepth(float2 uv, float rawDepth, uint eyeIndex)
+{
+    const float2 thisScreen = (uv - 0.5f) * float2(2.0f, -2.0f);
+    float4 thisView = mul(FrameBuffer::CameraProjUnjitteredInverse[eyeIndex], float4(thisScreen, rawDepth, 1.0f));
+    thisView.xyz = thisView.xyz / thisView.w;
+    float4 thisWorld = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(thisView.xyz, 1.0f));
+    thisWorld.xyz = thisWorld.xyz / thisWorld.w;
+
+    const float3 prevWorld = thisWorld.xyz +
+                             FrameBuffer::CameraPosAdjust[eyeIndex].xyz -
+                             FrameBuffer::CameraPreviousPosAdjust[eyeIndex].xyz;
+    const float4 prevClip = mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(prevWorld, 1.0f));
+    const float prevNDC = prevClip.z / prevClip.w;
+
+    // A point behind the previous near plane makes prevClip.w vanish and the ratio blow up to
+    // +-Inf or NaN. The bit test is what makes that safe to rely on: an ordered comparison
+    // against a NaN is false, but fxc is entitled to assume its inputs are finite without
+    // /Gis, so the range test alone would not be a guard (see isFiniteSafe). Outside [0, 1]
+    // the point simply was not in the previous frame's depth range, so there is no history
+    // for it and every tap must be rejected.
+    if (!isFiniteSafe(prevNDC) || prevNDC <= 0.0f || prevNDC >= 1.0f)
+        return -1.0f;
+
+    return SharedData::GetScreenDepth(prevNDC);
+}
+
+bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS, float expectedPrevLinearDepth)
 {
     // (audit #16) Every caller passes a pixel in the *history* textures, whose valid
     // sub-rectangle is the previous frame's dynamic-resolution extent -- hence
@@ -287,6 +363,33 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
         return false;
 
     if (pixel.x >= prev_screen_size.x || pixel.y >= prev_screen_size.y)
+        return false;
+
+    // (defect D3) Depth disocclusion. Until now the only geometric test was the normal
+    // agreement below, which passes for every reprojection that lands on a surface facing
+    // the same way -- and the ghosting cases that matter are exactly those: a character in
+    // front of a wall, a fence post against a parallel wall, the two treads of a step. All
+    // three keep their normals well inside the 30 degree gate while sitting at a completely
+    // different depth, so the accumulation was reading a different surface's radiance and
+    // calling it history.
+    //
+    // Deliberately inside IsValidHistory rather than beside it: the bilinear quad and both
+    // disocclusion searches all go through this one predicate, so the test applies uniformly
+    // and a pixel that fails it everywhere lands on the existing accumFrames = 1 restart at
+    // the bottom of main() -- the alpha = 1 path -- instead of on a second, parallel
+    // rejection mechanism. It also means the 4-tap and 8-tap searches can no longer pull
+    // history across a depth layer, which is the widening path guard G4 documents.
+    if (expectedPrevLinearDepth <= 0.0f)
+        return false;
+
+    const float prevLinearDepth = SharedData::GetScreenDepth(HistoryDepthTexture[pixel]);
+    // A cleared history depth is the far plane (see ClearDenoiserHistory), which either
+    // linearises to a value nothing on screen can match or, at the exact far plane, to a
+    // non-finite one. Both must reject, hence the explicit finiteness test.
+    if (!isFiniteSafe(prevLinearDepth))
+        return false;
+
+    if (abs(prevLinearDepth - expectedPrevLinearDepth) > SSRT_HISTORY_DEPTH_TOLERANCE * expectedPrevLinearDepth)
         return false;
 
     float3 prevNormalVS;
@@ -455,6 +558,10 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
     float2 prevUV = uv;
     ReprojectHit(MotionVectorTexture, LinearSampler, float3(uv, depthCenter), eyeIndex, prevUV);
 
+    // (defect D3) Reference depth for the disocclusion test, computed once and handed to
+    // every one of the up to 16 tap validations below.
+    const float expectedPrevLinearDepth = SSRTExpectedPrevLinearDepth(uv, depthCenter, eyeIndex);
+
     float4 prevColor = 0.f;
     float prevAccumFrames = 0.f;
     float2 prevMoments = float2(0.f, 0.f);
@@ -527,7 +634,7 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 tapColor;
             float2 tapMoments;
             float tapAccumFrames;
-            if (IsValidHistory(tapPixel, prevUV, normalVS) &&
+            if (IsValidHistory(tapPixel, prevUV, normalVS, expectedPrevLinearDepth) &&
                 SSRT_LoadHistory(tapPixel, tapColor, tapMoments, tapAccumFrames) &&
                 tapAccumFrames > 0.f)
             {
@@ -574,7 +681,7 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 neighborColor;
             float2 neighborMoments;
             float neighborAccumFrames;
-            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS) &&
+            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS, expectedPrevLinearDepth) &&
                 SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
                 neighborAccumFrames > 0.f)
             {
@@ -618,7 +725,7 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 neighborColor;
             float2 neighborMoments;
             float neighborAccumFrames;
-            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS) &&
+            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS, expectedPrevLinearDepth) &&
                 SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
                 neighborAccumFrames > 0.f)
             {
