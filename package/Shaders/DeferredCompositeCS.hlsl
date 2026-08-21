@@ -91,6 +91,28 @@ void SampleSSGISpecular(uint2 pixCoord, sh2 lobe, out float ao, out float3 il, i
 Texture2D<float4> SSRTexture : register(t16);
 #endif
 
+// The ambient separation further down has two consumers, and only one of them is SSGI:
+//
+//  * SSGI needs the ambient MAIN already contains taken back out so it can shape it with
+//    its own albedo-tinted MultiBounceAO and re-add it (the "F-A" mechanism -- the
+//    estimate, then the subtract/re-add pair);
+//  * SSRT's confidence-guided ambient reinjection needs the same reconstruction so it can
+//    re-add only the fraction its rays did *not* resolve.
+//
+// features/Screen Space GI and features/Screen Space Ray Tracing are both non-CORE feature
+// folders, so "SSRT installed, SSGI not" is a shipping configuration and the reconstruction
+// has to exist there too. Hoisting the shared half out of the SSGI gate is the only way to
+// get that without a second copy of the IBL-aware estimate, and that estimate is the one
+// piece of this file a pure-SSGI user depends on being exactly right.
+//
+// Nothing inside the hoisted region is changed by the hoist. In an SSGI build the
+// `#if defined(SSGI)` islands hold the ssgiAo / ssgiIl / multiBounceAO code verbatim and
+// `ambientKeep` is a compile-time 1.0 without SSRT, so an SSGI permutation emits what it
+// emitted before.
+#if defined(SSGI) || defined(SSRT)
+#	define COMPOSITE_AMBIENT_SEPARATION
+#endif
+
 // Skylighting's diffuse visibility is needed by the ambient estimate's IBL term. Computed once per
 // pixel where that term is compiled in - a plain SSGI build must not pay for a probe fetch nothing
 // reads. IBL is #undef'd above without DYNAMIC_CUBEMAPS, so inside an IBL build this condition is
@@ -143,6 +165,9 @@ Texture2D<float4> SSRTexture : register(t16);
 	float ssgiAo;
 	float3 ssgiIl;
 	SampleSSGI(dispatchID.xy, normalWS, ssgiAo, ssgiIl);
+#endif
+
+#if defined(COMPOSITE_AMBIENT_SEPARATION)
 
 	// Skylighting diffuse visibility, as the ambient estimate's IBL term below wants it: what the
 	// forward path (Lighting.hlsl:3230-3236) and the SSRT fallback (ssrt_raymarch.hlsl:602-612)
@@ -233,6 +258,11 @@ Texture2D<float4> SSRTexture : register(t16);
 	directionalAmbientColor = Color::YCoCgToRGB(directionalAmbientColor);
 	directionalAmbientColor = max(0, directionalAmbientColor);
 
+	// Fraction of the reconstructed ambient that survives into the frame. Always 1 today, and
+	// a compile-time constant that folds the multiply below away; the SSRT ambient reinjection
+	// is what will drive it.
+	const float ambientKeep = 1.0;
+
 #	if defined(SSRT)
 	// SSRT diffuse drives the forward directional ambient to zero through AmbientMult, so Masks.z
 	// arrives at ~0 and there is nothing left to separate. Overwriting Y with 0 does NOT make the
@@ -259,16 +289,29 @@ Texture2D<float4> SSRTexture : register(t16);
 
 	linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
 
+#	if defined(SSGI)
 	float3 linAlbedo = Color::IrradianceToLinear(albedo / Color::PBRLightingScale);
 
 	float3 multiBounceAO = Color::MultiBounceAO(linAlbedo, ssgiAo);
 
 	linDiffuseColor *= sqrt(multiBounceAO);
+#	else
+	// No SSGI occlusion signal in this build, so the shaping the separation exists to apply is
+	// the identity and fxc folds it out. What is left of the subtract/re-add pair is
+	// `diffuseColor - (1 - ambientKeep) * A`, exactly inverting the forward path's gamma-space
+	// `diffuseColor += directionalAmbientColor`.
+	const float3 multiBounceAO = 1.0;
+#	endif
 
 	diffuseColor = Color::IrradianceToGamma(linDiffuseColor);
-	diffuseColor += Color::IrradianceToGamma(Color::IrradianceToLinear(directionalAmbientColor) * multiBounceAO);
+	// `ambientKeep` multiplies in gamma space, i.e. on the same side of the transfer function
+	// the forward path added the term on (Lighting.hlsl `diffuseColor += directionalAmbientColor`
+	// with both operands gamma-encoded). That makes the removal the exact inverse of the
+	// addition; the MultiBounceAO shaping stays in linear space, where it was derived.
+	diffuseColor += Color::IrradianceToGamma(Color::IrradianceToLinear(directionalAmbientColor) * multiBounceAO) * ambientKeep;
 	linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
 
+#	if defined(SSGI)
 	// ssgiIl is now analytically normalised diffuse illumination divided by PI (see
 	// ScreenSpaceGI/gi.cs.hlsl), so the term it wants is exactly one true reflectance. `linAlbedo`
 	// is that: the G-buffer stores TRUE_PBR albedo pre-multiplied by PBRLightingScale
@@ -278,6 +321,7 @@ Texture2D<float4> SSRTexture : register(t16);
 	// de-scale - it was upstream's (2ea3b3adc) energy fudge for lowering the default GIStrength
 	// from 1.5 to 1.0, and with the integrator normalised it has nothing left to compensate for.
 	linDiffuseColor += ssgiIl * linAlbedo;
+#	endif
 #endif
 
 	float3 color = linDiffuseColor + specularColor;
