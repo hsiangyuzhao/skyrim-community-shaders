@@ -13,12 +13,23 @@ Texture2D<float> HistoryDepthTexture : register(t7);
 
 RWTexture2D<float4> FilteredOutput : register(u0);
 RWTexture2D<float4> MomentsOutput : register(u1);
+// (diagnostic H) Per-pixel picture of what the history acceptance test decided this frame.
+// Always bound -- one permutation serves both chains -- but only written when
+// historyDebugView is non-zero, which the C++ side sets on the diffuse dispatch alone. See
+// the encoding at SSRT_DebugAcceptColour / SSRT_DebugRejectColour.
+RWTexture2D<float4> DebugHistoryOutput : register(u2);
 
-// Mirrors ScreenSpaceRayTracing::DenoiserCB. All three float4 rows are declared here now:
+// Mirrors ScreenSpaceRayTracing::DenoiserCB. All four float4 rows are declared here now:
 // fireflyClampSigma sits in the slot the A-layer left as padding (spec S1), and defect D1's
 // historyClampSigma took the first of the three pad slots row 2 still had spare after spec
 // S3 claimed its .x. specularRoughnessCutoff itself is read only by the SSRT_SPECULAR
 // permutation of ssrt_spatial.hlsl and is declared here purely to keep the offsets aligned.
+//
+// (diagnostic H) The four diagnostic flags below are all group-uniform -- they are constants
+// for the whole dispatch -- so every branch they guard is a scalar branch that costs one
+// comparison per group, not per lane. Row 2 had exactly one pad slot spare, which
+// disableHistoryNormalTest took; the other three opened row 3. Both sides carry a sizeof
+// assertion so the pair cannot drift.
 cbuffer DenoiserCB : register(b2)
 {
     float invMaxAccumulatedFrames;
@@ -33,14 +44,56 @@ cbuffer DenoiserCB : register(b2)
     // --- row 2 ---
     float specularRoughnessCutoff;
     float historyClampSigma;
-    // (diagnostic D3) Non-zero bypasses the defect D3 depth-disocclusion test in
+    // (diagnostic D3) Non-zero bypasses the defect D3 plane-distance disocclusion test in
     // IsValidHistory entirely, restoring the pre-D3 predicate (bounds + normal agreement +
     // the G4 finiteness rejection, which is *not* part of the bypass). Group-uniform, so the
-    // branch it guards costs nothing. Exists so the depth test can be isolated in-game
+    // branch it guards costs nothing. Exists so the plane test can be isolated in-game
     // against the D1 history clamp -- which HistoryClampSigma 0 already switches off -- with
     // one variable moving at a time.
     uint disableHistoryDepthTest;
-    float denoiserPad2;
+    // (diagnostic H) Non-zero bypasses the 30 degree normal agreement test and nothing else,
+    // i.e. the exact counterpart of disableHistoryDepthTest for the other hard gate. The two
+    // together are what turn the debug view's colour reading into a confirmation: a screen
+    // that comes back green should start accumulating the moment this is set, and a screen
+    // that comes back red should start accumulating the moment the other one is.
+    uint disableHistoryNormalTest;
+    // --- row 3 ---
+    // (diagnostic H) Non-zero reduces the acceptance predicate to its *upper bound*: the
+    // screen-bounds tests, the guard G4 finiteness rejection and the accumFrames > 0
+    // requirement, and nothing else. Both geometric gates are skipped, so whatever history
+    // the reprojection lands on is taken.
+    //
+    // It exists because the two per-gate bypasses above can only prove a gate *is* the
+    // blocker; they cannot prove that the gates are the only blockers. If the accumulation
+    // still refuses to build with this set, the fault is not in the acceptance test at all --
+    // it is in the bounds arithmetic, in the history contents, or in the alpha path -- and
+    // that is a different repair. Strictly a diagnostic: with it set the accumulation reads
+    // history straight across silhouettes and depth layers, which is maximal ghosting.
+    uint forceAcceptHistory;
+    // (diagnostic H, defect D3 follow-up) Selects which of the two forms of the 30 degree
+    // normal comparison runs.
+    //
+    // 0 (the default) compares the *current* view-space normal against the stored
+    // previous-frame normal, which is what this pass did for its whole shipped life. It
+    // carries a known bias -- the whole inter-frame camera rotation -- but it is a bias whose
+    // behaviour is measured: it over-rejects during fast turns and passes everything else.
+    //
+    // 1 compares the current normal *rotated into the previous frame's view space*, which is
+    // the algebraically correct form and what defect D3's repair introduced. The algebra is
+    // sound on paper but it rests on an assumption that cannot be checked offline -- that
+    // CameraPreviousViewProjUnjittered composed with CameraProjUnjitteredInverse really is
+    // the inter-frame camera rotation for this engine's matrices. If that assumption is
+    // wrong the rotated normal is garbage and this gate rejects the entire screen, which is
+    // indistinguishable in its symptoms from the plane test doing the same thing.
+    //
+    // So the default is the form with the known-benign failure mode and this switch is how
+    // the correct-on-paper form gets validated in-game, rather than the other way round.
+    uint rotatedNormalGate;
+    // (diagnostic H) Non-zero makes this pass write DebugHistoryOutput. Zero leaves the
+    // texture untouched, which is what the specular dispatch always passes -- the two chains
+    // share one shader and one debug surface, and only the diffuse picture is wanted.
+    uint historyDebugView;
+    float denoiserPad3;
 };
 
 // (spec S1) Firefly clamp on the radiance entering the temporal accumulation.
@@ -426,10 +479,15 @@ struct SSRTHistoryPlane
     // The w row of the unprojection, in the same folded form: the homogeneous divisor the
     // comparison is multiplied through by instead of dividing by.
     float4 wRow;
-    // The current normal expressed in the *previous* frame's view space, which is the space
-    // HistoryNormalsTexture is stored in and therefore the space the 30 degree agreement test
-    // has to be taken in. Falls back to the un-rotated current normal if the rotation cannot
-    // be built at all.
+    // The current normal expressed in the *previous* frame's view space. The plane rows below
+    // are built from this and *must* be: the taps are reconstructed in previous view space, so
+    // the plane they are tested against has to live there too. Falls back to the un-rotated
+    // current normal if the rotation cannot be built at all.
+    // Also read by the caller, which picks between it and the un-rotated normal to form the
+    // normal the 30 degree gate compares; see rotatedNormalGate and SSRT_SelectNormalGate.
+    // That selection deliberately lives outside this struct -- adding an eighth field for it
+    // makes fxc lose track of the struct's initialisation and warn X4000 on the early returns
+    // below, even though every field is assigned before any of them.
     float3 normalPrev;
     // Absolute plane-distance budget per texel of tangential slop; each call site scales it by
     // (its own worst tap offset + SSRT_HISTORY_PLANE_MV_TEXELS).
@@ -443,6 +501,9 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     SSRTHistoryPlane plane;
     plane.offsetRow = 0.0f;
     plane.wRow = 0.0f;
+    // Seeded with the un-rotated normal, so a rotation that cannot be built leaves both the
+    // plane rows and the gate selection on the shipped pre-D3 value rather than on an
+    // undefined one.
     plane.normalPrev = normalVS;
     plane.tolerancePerTexel = 0.0f;
     plane.usable = false;
@@ -464,11 +525,24 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     // on the FOV-animating case above), and normalize() absorbs any residual scale. A direction
     // carries w = 0, so no division is involved and there is nothing to guard.
     //
-    // This is also what repairs the *other* half of the acceptance test. The 30 degree
-    // agreement compares against HistoryNormalsTexture, which holds the previous frame's
-    // view-space normals, so feeding it an un-rotated current normal biased the dot product by
-    // the whole inter-frame camera rotation -- over-rejecting during exactly the fast turns
-    // where a rebuilt accumulation is most expensive.
+    // (diagnostic H) It was *also* meant to repair the other half of the acceptance test. The
+    // 30 degree agreement compares against HistoryNormalsTexture, which holds the previous
+    // frame's view-space normals, so feeding it an un-rotated current normal biases the dot
+    // product by the whole inter-frame camera rotation -- over-rejecting during exactly the
+    // fast turns where a rebuilt accumulation is most expensive.
+    //
+    // That reasoning is correct and the algebra checks out, but it is not what the gate does
+    // by default any more, and the reason is worth stating plainly: the whole construction
+    // depends on the composition below really being the inter-frame camera rotation for this
+    // engine's actual matrices, and that is an assumption about matrix *contents* which no
+    // amount of offline review can settle. If it does not hold, this normal is nonsense and
+    // the 30 degree test rejects every candidate on screen -- the exact failure the plane
+    // repair was made to fix, reintroduced one line away from it. The un-rotated comparison
+    // has a known, measured, benign failure mode by contrast, so it keeps the default and
+    // this form is reached only through rotatedNormalGate. See that flag's declaration.
+    //
+    // The rotation is built unconditionally regardless, because the plane rows genuinely
+    // require it -- only the *comparison* is switchable.
     const float3 normalWS = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0.0f)).xyz;
     const float3 normalPrevRaw = mul(projInv, mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(normalWS, 0.0f))).xyz;
     const float normalPrevLenSq = dot(normalPrevRaw, normalPrevRaw);
@@ -551,17 +625,49 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     return plane;
 }
 
-bool IsValidHistory(uint2 pixel, float2 uv, SSRTHistoryPlane plane, uint2 prevRenderSize, float tapTexels)
+// (diagnostic H) The reason codes IsValidHistory returns in place of a bool. They exist so
+// the debug view can say *which* gate rejected a pixel rather than only that something did,
+// which is the difference between one trip into the game and one trip per hypothesis.
+//
+// The refactor is deliberately result-preserving: every `return false` in the predicate became
+// a `return <that branch's code>` with no reordering and no change of condition, every code is
+// non-zero, and every call site tests `== SSRT_HISTORY_OK` where it used to test the bool. So
+// the accept/reject decision for any tap is bit-identical to the bool form, branch by branch,
+// and the codes are pure extra information carried out alongside it.
+#define SSRT_HISTORY_OK 0u
+// Screen bounds, an unusable plane, a non-finite tap depth, a non-finite history sample, or a
+// zero accumulated frame count -- i.e. "there is nothing here to read", as opposed to "what is
+// here disagrees with me". The last three are raised by the call sites rather than by the
+// predicate, since that is where the history load happens.
+#define SSRT_HISTORY_REJ_DATA 1u
+// The plane-distance disocclusion test.
+#define SSRT_HISTORY_REJ_PLANE 2u
+// The 30 degree normal agreement test.
+#define SSRT_HISTORY_REJ_NORMAL 3u
+
+// (diagnostic H, defect D3 follow-up) Which normal the 30 degree agreement test compares.
+//
+// plane.normalPrev already falls back to the un-rotated normal when the rotation could not be
+// built, so the un-rotated argument is only needed for the deliberate rollback case and the
+// select cannot produce anything undefined either way. Computed once per lane in main() and
+// handed down, rather than stored on SSRTHistoryPlane, for the reason recorded at that
+// struct's normalPrev field.
+float3 SSRT_SelectNormalGate(SSRTHistoryPlane plane, float3 normalVS)
+{
+    return (rotatedNormalGate != 0) ? plane.normalPrev : normalVS;
+}
+
+uint IsValidHistory(uint2 pixel, float2 uv, SSRTHistoryPlane plane, float3 normalGate, uint2 prevRenderSize, float tapTexels)
 {
     // (audit #16) Every caller passes a pixel in the *history* textures, whose valid
     // sub-rectangle is the previous frame's dynamic-resolution extent -- hence
     // DynamicResolutionParams1.zw (previous width/height ratio) rather than .xy at the call
     // site, which is also where it is now computed: once per lane instead of 13 times.
     if (uv.x < 0 || uv.x > 1 || uv.y < 0 || uv.y > 1)
-        return false;
+        return SSRT_HISTORY_REJ_DATA;
 
     if (pixel.x >= prevRenderSize.x || pixel.y >= prevRenderSize.y)
-        return false;
+        return SSRT_HISTORY_REJ_DATA;
 
     // (defect D3, replaced) Plane-distance disocclusion; see SSRTBuildHistoryPlane for the
     // derivation and for why the depth comparison this replaces rejected everything.
@@ -575,38 +681,143 @@ bool IsValidHistory(uint2 pixel, float2 uv, SSRTHistoryPlane plane, uint2 prevRe
     // (diagnostic D3) Group-uniform bypass of the plane test and of nothing else: the bounds
     // tests above and the normal agreement plus G4 finiteness rejection below stay in force, so
     // this still reproduces the pre-D3 predicate exactly rather than accepting anything at all.
-    if (disableHistoryDepthTest == 0)
+    // (diagnostic H) forceAcceptHistory drops both geometric gates at once; see its
+    // declaration for why that is a separate question from either gate on its own.
+    //
+    // Both gates below assign to `reason` instead of returning early, and the function has a
+    // single exit. That shape is mandatory, not tidiness: with an early `return` inside the
+    // *second* conditional block, fxc concludes that this function can never return
+    // SSRT_HISTORY_OK at all. It then proves the acceptance branch at every call site dead and
+    // deletes both history loads outright -- t0 and t5 vanish from the compiled shader, the
+    // accumulation silently reads nothing, and the only outward sign is a handful of X4008
+    // warnings on the renormalising divides whose guards have become unreachable. The bounds
+    // tests above keep their early returns because they sit before any conditional block and
+    // are unaffected; verified against the disassembly, which must declare t0 through t7.
+    uint reason = SSRT_HISTORY_OK;
+
+    if (disableHistoryDepthTest == 0 && forceAcceptHistory == 0)
     {
+        // Classified as data rather than as a plane rejection on purpose: the plane could not
+        // be built at all, so the test never ran and reporting it as a plane disagreement
+        // would point the reader at the wrong thing.
         if (!plane.usable)
-            return false;
-
-        // Both rows already carry the pixel-index-to-NDC map, so the tap only supplies its own
-        // index and depth. A cleared history depth is the far plane (see ClearDenoiserHistory)
-        // and so is a previous-frame sky texel; both reconstruct to a point on the far plane
-        // whose plane distance is enormous, so both reject without needing a case of their own.
-        const float4 q = float4(float2(pixel), HistoryDepthTexture[pixel], 1.0f);
-        const float distTimesW = dot(plane.offsetRow, q);
-        const float homogeneousW = dot(plane.wRow, q);
-        if (!(isFiniteSafe(distTimesW) && isFiniteSafe(homogeneousW)))
-            return false;
-
-        // Both sides carry the factor |w|, which is what removes the division. A tap on the
-        // previous camera plane has w = 0 and no finite position at all; the right-hand side
-        // goes to zero with it, so it rejects by arithmetic.
-        if (abs(distTimesW) > plane.tolerancePerTexel * tapTexels * abs(homogeneousW))
-            return false;
+            reason = SSRT_HISTORY_REJ_DATA;
+        else
+        {
+            // Both rows already carry the pixel-index-to-NDC map, so the tap only supplies its
+            // own index and depth. A cleared history depth is the far plane (see
+            // ClearDenoiserHistory) and so is a previous-frame sky texel; both reconstruct to a
+            // point on the far plane whose plane distance is enormous, so both reject without
+            // needing a case of their own.
+            const float4 q = float4(float2(pixel), HistoryDepthTexture[pixel], 1.0f);
+            const float distTimesW = dot(plane.offsetRow, q);
+            const float homogeneousW = dot(plane.wRow, q);
+            // Data, not plane: both rows were bit-tested finite when the plane was built and
+            // the tap depth is the only fresh input, so a non-finite dot4 here means the
+            // history depth texel itself is corrupt.
+            if (!(isFiniteSafe(distTimesW) && isFiniteSafe(homogeneousW)))
+                reason = SSRT_HISTORY_REJ_DATA;
+            // Both sides carry the factor |w|, which is what removes the division. A tap on
+            // the previous camera plane has w = 0 and no finite position at all; the right-hand
+            // side goes to zero with it, so it rejects by arithmetic.
+            else if (abs(distTimesW) > plane.tolerancePerTexel * tapTexels * abs(homogeneousW))
+                reason = SSRT_HISTORY_REJ_PLANE;
+        }
     }
 
-    float3 prevNormalVS;
-    float roughness;
-    GetNormalRoughness(HistoryNormalsTexture, pixel, prevNormalVS, roughness);
-    // Both sides are now in the *previous* frame's view space; see the normal transform in
-    // SSRTBuildHistoryPlane for why comparing an un-rotated current normal was biased.
-    float normalDiff = dot(plane.normalPrev, prevNormalVS);
-    if (normalDiff < 0.866f) // cos 30
-        return false;
+    // (diagnostic H) The counterpart bypass. Both flags are group-uniform, so with the
+    // defaults (both zero) this is a scalar branch that is always taken and the body below is
+    // reached with exactly the operands it had before the flags existed.
+    //
+    // The leading `reason == SSRT_HISTORY_OK` is what preserves the original short-circuit: the
+    // predicate only ever reached the normal comparison when the plane test had passed, so a
+    // tap the plane already turned down must still not pay for the normal fetch. It also fixes
+    // the attribution -- the first gate to object is the one reported, exactly as with the
+    // early returns this replaces.
+    if (reason == SSRT_HISTORY_OK && disableHistoryNormalTest == 0 && forceAcceptHistory == 0)
+    {
+        float3 prevNormalVS;
+        float roughness;
+        GetNormalRoughness(HistoryNormalsTexture, pixel, prevNormalVS, roughness);
+        // normalGate is the un-rotated current normal by default and the previous-view-space
+        // rotation of it when rotatedNormalGate is set; see SSRT_SelectNormalGate, that flag's
+        // declaration, and the rotation in SSRTBuildHistoryPlane.
+        float normalDiff = dot(normalGate, prevNormalVS);
+        if (normalDiff < 0.866f) // cos 30
+            reason = SSRT_HISTORY_REJ_NORMAL;
+    }
 
-    return true;
+    return reason;
+}
+
+// (diagnostic H) Floor on the accepted-history grey, so that "accumulating, one frame in" is
+// visibly different from "sky" on a real monitor rather than only in a pixel probe.
+//
+// Without it the encoding has a hole exactly where the interesting reading is. A pixel that
+// has just started a chain reports accumFrames = 1, and at MaxAccumulatedFrames 16 that is
+// 1/17 = 6% grey; at 64 it is 1.5%. Both are indistinguishable from the pure black the sky and
+// the far plane write, so the single most important negative result -- "history is being
+// accepted but the frame count never climbs" -- would read as a black screen and be mistaken
+// for the accumulation never starting at all. Lifting the ramp onto a 12% pedestal keeps it
+// monotonic in the frame count and keeps full accumulation at pure white, while making any
+// accepted pixel unmistakably not-black.
+#define SSRT_DEBUG_ACCEPT_FLOOR 0.12f
+
+// (diagnostic H) Grey level for an accepted pixel: brightness is how deep the accumulation
+// has got. saturate() rather than a wrap because the frame counter is not bounded above by
+// MaxAccumulatedFrames -- only the blend weight is -- so a long-lived static pixel would
+// otherwise cycle back through black.
+float3 SSRT_DebugAcceptColour(float accumFrames)
+{
+    const float depth = saturate(accumFrames * invMaxAccumulatedFrames);
+    return (SSRT_DEBUG_ACCEPT_FLOOR + (1.0f - SSRT_DEBUG_ACCEPT_FLOOR) * depth).xxx;
+}
+
+// (diagnostic H) Pure primary for a rejected pixel, naming the gate that turned away the most
+// candidates: red = plane distance, green = normal agreement, blue = bounds or data.
+//
+// Why the mode and not the first failure. A pixel evaluates up to sixteen taps across the
+// bilinear quad and the two disocclusion searches, and the taps do not have to agree -- near a
+// silhouette some fail the plane test while others are simply out of bounds. The single number
+// worth reporting is therefore which gate is doing the bulk of the work, which is what makes a
+// *uniform* screen colour meaningful: it says one gate is rejecting everything everywhere,
+// which is the failure being hunted, as opposed to a speckle of colours along edges, which is
+// the healthy picture.
+//
+// Ties break data > plane > normal. A bounds-or-data rejection is the one nobody predicted, so
+// it wins the coin toss and gets looked at; between the two geometric gates the plane test is
+// evaluated first and so is the one that can mask the other. An all-zero tally -- possible
+// only if every evaluated tap passed the predicate and was then discarded for carrying no
+// bilinear weight -- also lands on blue, which is correct: that is a data outcome.
+float3 SSRT_DebugRejectColour(uint3 tally)
+{
+    if (tally.x >= tally.y && tally.x >= tally.z)
+        return float3(0.0f, 0.0f, 1.0f);
+    if (tally.y >= tally.z)
+        return float3(1.0f, 0.0f, 0.0f);
+    return float3(0.0f, 1.0f, 0.0f);
+}
+
+// (diagnostic H) Fold one evaluated tap into the running tally, accepted or not.
+//
+// Branchless, and called *after* the acceptance `if` rather than from an `else` arm attached to
+// it. Both of those are deliberate. An `else` arm changes the shape of the unrolled tap loops
+// enough that fxc starts enumerating the all-taps-rejected path, constant-folds weightSum to
+// zero on it, and then warns X4008 on the renormalising divides further down -- divides that
+// are guarded by `weightSum > 0` and cannot actually see a zero. Selects and a straight-line
+// call keep the loops in exactly the shape they had before the diagnostic existed, so the
+// generated code for the acceptance logic is untouched and no warning appears.
+//
+// `accepted` folds in the two rejections the predicate cannot see: a non-finite history sample
+// (guard G4) and a zero accumulated frame count, both of which are data outcomes and both of
+// which arrive here as reason == OK with accepted == false.
+void SSRT_DebugTally(inout uint3 tally, bool accepted, uint reason)
+{
+    const uint code = accepted ? SSRT_HISTORY_OK :
+                                 ((reason == SSRT_HISTORY_OK) ? SSRT_HISTORY_REJ_DATA : reason);
+    tally.x += (code == SSRT_HISTORY_REJ_DATA) ? 1u : 0u;
+    tally.y += (code == SSRT_HISTORY_REJ_PLANE) ? 1u : 0u;
+    tally.z += (code == SSRT_HISTORY_REJ_NORMAL) ? 1u : 0u;
 }
 
 // (guard G4) The self-healing half of the NaN guard set, and the only one that repairs
@@ -701,9 +912,16 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
     if (!inBounds)
         return;
 
+    // (diagnostic H) Group-uniform, so every branch guarding a debug write below is scalar.
+    const bool writeDebug = historyDebugView != 0;
+
     if (isFarPlane) {
         FilteredOutput[DTid.xy] = 0.0;
         MomentsOutput[DTid.xy] = 0.0;
+        // (diagnostic H) Sky and far plane are black: there is no history question to ask
+        // here, so neither a grey nor a rejection colour would mean anything.
+        if (writeDebug)
+            DebugHistoryOutput[DTid.xy] = float4(0.0f, 0.0f, 0.0f, 1.0f);
         return;
     }
 
@@ -776,6 +994,8 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
     // (defect D3, replaced) The acceptance plane, built once and handed to every one of the up
     // to 16 tap validations below.
     const SSRTHistoryPlane historyPlane = SSRTBuildHistoryPlane(uv, depthCenter, normalVS, prevRenderSize, eyeIndex);
+    // (diagnostic H) The normal the 30 degree gate compares, resolved once for all 16 taps.
+    const float3 historyNormalGate = SSRT_SelectNormalGate(historyPlane, normalVS);
 
     // Tangential slop per call site, in texels: that site's worst tap distance from the
     // reprojected sub-texel position, plus the motion vector's own registration slop.
@@ -802,6 +1022,11 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
     // but still the origin the two disocclusion searches further down are defined against.
     uint2 prevPixel = uint2(prevCoord);
     bool valid = false;
+    // (diagnostic H) Rejected-tap counts, in the order (data, plane, normal). Accumulated
+    // across all three resolution paths so the mode is taken over every candidate the pixel
+    // actually looked at, and touched only on the rejection path -- a fully accepting bilinear
+    // quad never writes it.
+    uint3 debugTally = uint3(0u, 0u, 0u);
 
     // (defect D2) 2x2 bilinear gather with per-tap validity, replacing a point fetch of the
     // single texel containing prevCoord.
@@ -862,16 +1087,30 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 tapColor;
             float2 tapMoments;
             float tapAccumFrames;
-            if (IsValidHistory(tapPixel, prevUV, historyPlane, prevRenderSizeI, planeSlopBilinear) &&
+            // (diagnostic H) The predicate's verdict, kept so the rejection can be attributed.
+            // The `&&` chain below is unchanged in structure and still short-circuits, so
+            // SSRT_LoadHistory is issued on exactly the taps it was issued on before.
+            const uint reason = IsValidHistory(tapPixel, prevUV, historyPlane, historyNormalGate, prevRenderSizeI, planeSlopBilinear);
+            // (diagnostic H) The condition is character-for-character the one this loop always
+            // had, and it stays an if condition rather than becoming a const bool
+            // initialiser. That is not style: as an initialiser fxc stops short-circuiting the
+            // chain, so 	apAccumFrames > 0.f is evaluated before SSRT_LoadHistory has written
+            // it, the undefined read poisons the whole expression, and the optimiser deletes
+            // both history loads outright -- t0 and t5 disappear from the shader and the
+            // accumulation silently reads nothing at all.
+            bool accepted = false;
+            if (reason == SSRT_HISTORY_OK &&
                 SSRT_LoadHistory(tapPixel, tapColor, tapMoments, tapAccumFrames) &&
                 tapAccumFrames > 0.f)
             {
+                accepted = true;
                 const float w = bilinWeight[i];
                 prevColor += tapColor * w;
                 prevMoments += tapMoments * w;
                 prevAccumFrames += tapAccumFrames * w;
                 weightSum += w;
             }
+            SSRT_DebugTally(debugTally, accepted, reason);
         }
 
         // An exactly-aligned reprojection gives two or three taps a weight of 0, so the
@@ -909,15 +1148,23 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 neighborColor;
             float2 neighborMoments;
             float neighborAccumFrames;
-            if (IsValidHistory(uint2(neighborPixel), prevUV, historyPlane, prevRenderSizeI, planeSlopSearch4) &&
+            // (diagnostic H) Same attribution as the bilinear quad above.
+            const uint reason = IsValidHistory(uint2(neighborPixel), prevUV, historyPlane, historyNormalGate, prevRenderSizeI, planeSlopSearch4);
+            // (diagnostic H) Kept as an if condition for the reason recorded at the bilinear
+            // quad above: as an initialiser the short-circuit is lost and both history loads
+            // are optimised away.
+            bool accepted = false;
+            if (reason == SSRT_HISTORY_OK &&
                 SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
                 neighborAccumFrames > 0.f)
             {
+                accepted = true;
                 prevColor += neighborColor;
                 prevAccumFrames += neighborAccumFrames;
                 prevMoments += neighborMoments;
                 weightSum += 1.f;
             }
+            SSRT_DebugTally(debugTally, accepted, reason);
         }
 
         if (weightSum > 0.f)
@@ -953,15 +1200,23 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 neighborColor;
             float2 neighborMoments;
             float neighborAccumFrames;
-            if (IsValidHistory(uint2(neighborPixel), prevUV, historyPlane, prevRenderSizeI, planeSlopSearch8) &&
+            // (diagnostic H) Same attribution as the two paths above.
+            const uint reason = IsValidHistory(uint2(neighborPixel), prevUV, historyPlane, historyNormalGate, prevRenderSizeI, planeSlopSearch8);
+            // (diagnostic H) Kept as an if condition for the reason recorded at the bilinear
+            // quad above: as an initialiser the short-circuit is lost and both history loads
+            // are optimised away.
+            bool accepted = false;
+            if (reason == SSRT_HISTORY_OK &&
                 SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
                 neighborAccumFrames > 0.f)
             {
+                accepted = true;
                 prevColor += neighborColor;
                 prevAccumFrames += neighborAccumFrames;
                 prevMoments += neighborMoments;
                 weightSum += 1.f;
             }
+            SSRT_DebugTally(debugTally, accepted, reason);
         }
         if (weightSum > 0.f)
         {
@@ -970,6 +1225,30 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             prevMoments /= weightSum;
             valid = true;
         }
+    }
+
+    // (diagnostic H) The one and only debug write for a shaded pixel, deliberately placed here
+    // -- after all three resolution paths have settled `valid` and `prevAccumFrames`, and
+    // *before* the accumulation branch below.
+    //
+    // The position is not cosmetic. Splitting this into a write inside `if (valid)` and a
+    // second one after that block's `return` costs four new fxc warnings in this file: with a
+    // store sitting past that return, fxc stops treating it as an exit, merges both tails and
+    // flattens the whole tap-resolution chain into predicated straight-line code. In that form
+    // it enumerates the all-taps-rejected path, sees weightSum constant-folded to zero, and
+    // reports X4008 on the three renormalising divides that `weightSum > 0` already makes
+    // unreachable -- plus an X4000 on the plane struct, phi-merged across the same paths.
+    // Writing once from here leaves both tails exactly as they were, so the acceptance and
+    // blending code generates as it did before this diagnostic existed.
+    //
+    // prevAccumFrames is final at this point, so `prevAccumFrames + 1` is the very value the
+    // valid branch is about to publish as MomentsOutput.z: the picture and the stored count
+    // cannot disagree.
+    if (writeDebug)
+    {
+        const float3 debugColour = valid ? SSRT_DebugAcceptColour(prevAccumFrames + 1.0f)
+                                         : SSRT_DebugRejectColour(debugTally);
+        DebugHistoryOutput[DTid.xy] = float4(debugColour, 1.0f);
     }
 
     if (valid)
@@ -1090,6 +1369,10 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
     // spatial estimator and frame 3 onwards by the temporal one -- and with the 0.5 gone
     // that spatial estimator is finally on the same scale as the temporal one, which is
     // what makes the handover at history = 3 continuous instead of a 34x step.
+    // (diagnostic H) This is the branch the whole diagnostic exists to explain -- reaching it
+    // every frame on every pixel is precisely the "texTemporal never converges" symptom,
+    // because it is the alpha = 1 passthrough. The colour naming the gate responsible was
+    // already written above, before the branch.
     MomentsOutput[DTid.xy] = float4(curMoment, 1.0f, 0.f);
     FilteredOutput[DTid.xy] = float4(ssrColor.rgb, 0.0f);
 }
