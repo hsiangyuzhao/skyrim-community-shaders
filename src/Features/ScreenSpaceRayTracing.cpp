@@ -587,10 +587,20 @@ void ScreenSpaceRayTracing::ClearDenoiserHistory()
 void ScreenSpaceRayTracing::UpdateHistoryValidity()
 {
     // A false -> true transition on any of these means the previous frame did not produce
-    // the history this frame is about to read. EnableSVGF is the case the audit called out
-    // (flipping it on made the first filtered frame consume whatever was left in the
-    // textures from the last time it was on, minutes or hours earlier); the two pass toggles
-    // are the same hazard by the same mechanism.
+    // the history this frame is about to read.
+    //
+    // EnableSVGF is the case the audit called out, and it is specifically the *moments* that
+    // go stale: texHistoryDiffuse / texHistory are re-copied at the end of every draw pass
+    // whether or not SVGF is on, so the colour is always one frame old, but
+    // texHistoryMomentsDiffuse / texHistoryMoments are only written inside the EnableSVGF
+    // block. Flipping it back on therefore resumes from the moment pair -- and the
+    // accumulated frame count -- left by the last time it was on, which can be an entire
+    // session earlier. The count is the damaging half: a stale MaxAccumulatedFrames drives
+    // alpha straight to its floor on a history that no longer describes the scene, and any
+    // Inf that pair had accumulated comes back with it.
+    //
+    // EnableDiffuse / EnableSpecular are the same hazard by the same mechanism: with a pass
+    // switched off, neither its history colour nor its moments are updated at all.
     if ((settings.EnableSVGF && !lastEnableSVGF) ||
         (settings.EnableDiffuse && !lastEnableDiffuse) ||
         (settings.EnableSpecular && !lastEnableSpecular))
