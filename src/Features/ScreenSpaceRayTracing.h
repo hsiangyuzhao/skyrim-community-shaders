@@ -188,6 +188,21 @@ struct ScreenSpaceRayTracing : Feature
         float OcclusionStrength = 1.0f;
         float CubemapNormalization = 0.0f;
         bool EnableSVGF = false;
+        /// @brief (batch 1, item 1) Run ssrt_preblur.hlsl -- anti-firefly plus a 3x3
+        /// geometry-guided spatial filter -- on the diffuse ray-march output *before* the
+        /// temporal accumulation reads it.
+        ///
+        /// Defaults on because its absence is a defect rather than a missing luxury: every
+        /// denoiser in the reference set (REBLUR, RELAX, Q2RTX's A-SVGF) puts its most important
+        /// spatial filter in front of the temporal pass, because the accumulator writes whatever
+        /// variance it is handed into a buffer the next frame reads back. See the block comment
+        /// at the top of ssrt_preblur.hlsl for the pass order, the kernel derivation, and why
+        /// the firefly clamp had to move into that pass rather than stay behind it.
+        ///
+        /// Diffuse only. The specular chain keeps its unmodified path -- a roughness-blind
+        /// pre-blur on a near-delta reflection lobe is the one thing spec S3 exists to prevent --
+        /// and gets its own pre-pass when the specular pipeline is split out.
+        bool EnablePreBlur = true;
         uint MaxAccumulatedFrames = 16;
         /// @brief (spec A2) 2, not 3: with variance guidance repaired (audit #11) and the
         /// depth weight actually discriminating (audit #12), two guided iterations resolve
@@ -790,6 +805,10 @@ struct ScreenSpaceRayTracing : Feature
     winrt::com_ptr<ID3D11ComputeShader> prepareColorCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> depthDownsampleCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> diffuseCompositeCS = nullptr;
+    /// @brief (batch 1, item 1) ssrt_preblur.hlsl. Nullptr if it failed to compile, in which
+    /// case the diffuse chain runs exactly as it did before the pass existed -- including
+    /// handing the temporal pass the real FireflyClampSigma back.
+    winrt::com_ptr<ID3D11ComputeShader> preblurCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> temporalCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> varianceCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialCS = nullptr;

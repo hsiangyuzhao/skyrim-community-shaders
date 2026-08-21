@@ -33,6 +33,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     OcclusionStrength,
     CubemapNormalization,
     EnableSVGF,
+    EnablePreBlur,
     MaxAccumulatedFrames,
     AtrousIterations,
     ColorPhi,
@@ -73,6 +74,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     OcclusionStrength,
     CubemapNormalization,
     EnableSVGF,
+    EnablePreBlur,
     MaxAccumulatedFrames,
     AtrousIterations,
     ColorPhi,
@@ -217,6 +219,28 @@ void ScreenSpaceRayTracing::DrawSettings()
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("SVGF denoiser. This may introduce some blurriness and temporal artifacts but significantly reduces noise.");
     if (settings.EnableSVGF) {
+        ImGui::Checkbox("Pre-Blur", &settings.EnablePreBlur);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Diffuse only. Runs one small, very gentle smoothing step on the raw rays "
+                "*before* the frame-to-frame averaging looks at them, instead of only "
+                "afterwards.\n\n"
+                "Why it matters: the frame-to-frame average writes whatever it is given into a "
+                "buffer that the next frame reads back and averages again. Hand it a noisy "
+                "picture and the noise goes into that buffer, and every later decision -- how "
+                "much of the old frame to trust, how hard to smooth -- has to be made through "
+                "it. Taking the worst of the noise off first makes all of those decisions "
+                "better at once. Every commercial denoiser does this; ours was the odd one "
+                "out.\n\n"
+                "It is deliberately weak -- about a third of the blur one A Trous pass applies "
+                "-- because its job is to cut the extreme pixels, not to make things look "
+                "smooth. Expect a stationary shot to settle faster and cleaner, and moving "
+                "shots to stop dragging noise into the following seconds. Contact shadows and "
+                "creases should not soften; if they do, turn this off and say so.\n\n"
+                "The single-bright-pixel cleanup (Firefly Clamp) moves into this step while it "
+                "is on, so it still happens exactly once. With Firefly Clamp off, this step has "
+                "nothing stopping it from smearing a stray bright pixel across nine, so the two "
+                "are best left on together.");
         ImGui::SliderInt("Max Accumulated Frames", (int*)&settings.MaxAccumulatedFrames, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
         ImGui::SliderInt("À Trous Iterations", (int*)&settings.AtrousIterations, 1, 5, "%d", ImGuiSliderFlags_AlwaysClamp);
         if (auto _tt = Util::HoverTooltipWrapper())
@@ -765,7 +789,7 @@ void ScreenSpaceRayTracing::EnsureSharcResources()
 void ScreenSpaceRayTracing::ClearShaderCache()
 {
     static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
-        &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &temporalCS, &varianceCS, &spatialCS,
+        &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &preblurCS, &temporalCS, &varianceCS, &spatialCS, &spatialSpecularCS,
 #ifdef ENABLE_SHARC
         &raymarchDiffuseSharcCS, &sharcUpdateRaymarchCS, &sharcResolveCS
 #endif
@@ -837,6 +861,7 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &preprocessDepthCS, "ssrt_preprocess_depth.hlsl", {} },
             { &depthDownsampleCS, "ssrt_depth_downsample.hlsl", {} },
             { &diffuseCompositeCS, "ssrt_diffuse_composite.hlsl", {} },
+            { &preblurCS, "ssrt_preblur.hlsl", {} },
             { &temporalCS, "ssrt_temporal.hlsl", {} },
             { &varianceCS, "ssrt_variance.hlsl", {} },
             { &spatialCS, "ssrt_spatial.hlsl", definesWideKernel },
@@ -1279,8 +1304,14 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         srvs.at(5) = texHistoryMoments->srv.get();
         srvs.at(6) = texHistoryNormals->srv.get();
         srvs.at(7) = texHistoryDepth->srv.get();  // (defect D3)
+        // (batch 1, item 1) The specular chain has no pre-blur, so its raw surface *is* its
+        // temporal input and both slots get the same texture. The binding is not optional: the
+        // shader is a single permutation and declares t8 either way, and an unbound SRV reads as
+        // zero -- which would collapse the defect D1 reference box to the single point 0 and
+        // clamp every specular history towards black.
+        srvs.at(8) = texSSRColor->srv.get();
 
-        context->CSSetShaderResources(0, 8, srvs.data());
+        context->CSSetShaderResources(0, 9, srvs.data());
         context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
         context->CSSetShader(temporalCS.get(), nullptr, 0);
 
@@ -1536,8 +1567,55 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 
     if (settings.EnableSVGF) {
         DenoiserCB denoiserCBData = GetDenoiserCBData(true);
-        denoiserCB->Update(denoiserCBData);
+
+        // (batch 1, item 1) The pre-blur, and the one thing about it that needs explaining on
+        // this side: where its output goes.
+        //
+        // It writes texVariance. That surface is not free-floating scratch by accident -- it is
+        // provably dead at this point in the frame. Its only writer inside DrawSSRTDiffuse is
+        // the variance pass three dispatches below, its only readers are that pass's own output
+        // consumers (the a-trous ping-pong), and DrawSSRTSpecular does not run until this whole
+        // function has returned. So the lifetime is: pre-blur writes it, the temporal pass reads
+        // it, the variance pass overwrites it, the a-trous chain ping-pongs it. Reusing it costs
+        // nothing where a dedicated surface would cost a full-screen RGBA16F (~33 MB at a 4K
+        // allocation, against the eight this feature already holds).
+        //
+        // The one thing that would break: inserting a pass between the pre-blur and the variance
+        // pass that reads texVariance expecting last frame's content. Nothing does today, and
+        // this comment is the tripwire if something ever wants to.
+        const bool preBlurActive = settings.EnablePreBlur && preblurCS;
+        ID3D11ShaderResourceView* temporalInput = texSSRTDiffuseColor->srv.get();
+
         auto denoiserBuffer = denoiserCB->CB();
+
+        if (preBlurActive) {
+            // The pre-blur is handed the real FireflyClampSigma; the temporal pass below is
+            // handed 0. See the "why the firefly clamp moved in here" block in
+            // ssrt_preblur.hlsl: the clamp cannot survive an unconditional spatial filter in
+            // front of it, so it moves rather than being defeated, and it must not then run
+            // twice.
+            denoiserCB->Update(denoiserCBData);
+            denoiserBuffer = denoiserCB->CB();
+            context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
+
+            uavs.at(0) = texVariance->uav.get();
+            srvs.at(2) = normal.SRV;
+            srvs.at(3) = texSSRTDiffuseColor->srv.get();
+            srvs.at(4) = depth.depthSRV;
+
+            context->CSSetShaderResources(0, 5, srvs.data());
+            context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
+            context->CSSetShader(preblurCS.get(), nullptr, 0);
+
+            context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+            resetViews();
+
+            temporalInput = texVariance->srv.get();
+            denoiserCBData.fireflyClampSigma = 0.0f;
+        }
+
+        denoiserCB->Update(denoiserCBData);
+        denoiserBuffer = denoiserCB->CB();
         context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
         // temporal filter
         uavs.at(0) = texTemporal->uav.get();
@@ -1547,13 +1625,19 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         srvs.at(0) = texHistoryDiffuse->srv.get();
         srvs.at(1) = motion.SRV;
         srvs.at(2) = normal.SRV;
-        srvs.at(3) = texSSRTDiffuseColor->srv.get();
+        srvs.at(3) = temporalInput;
         srvs.at(4) = depth.depthSRV;
         srvs.at(5) = texHistoryMomentsDiffuse->srv.get();
         srvs.at(6) = texHistoryNormals->srv.get();
         srvs.at(7) = texHistoryDepth->srv.get();  // (defect D3)
+        // (batch 1, item 1) The raw ray-march surface, for the defect D1 history clamp's
+        // reference neighbourhood only. Identical to t3 whenever the pre-blur is off, which is
+        // what makes that configuration bit-identical to the previous build; see the declaration
+        // of RawColorTexture in ssrt_temporal.hlsl for why the box must not be built from the
+        // pre-blurred surface.
+        srvs.at(8) = texSSRTDiffuseColor->srv.get();
 
-        context->CSSetShaderResources(0, 8, srvs.data());
+        context->CSSetShaderResources(0, 9, srvs.data());
         context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
         context->CSSetShader(temporalCS.get(), nullptr, 0);
 
