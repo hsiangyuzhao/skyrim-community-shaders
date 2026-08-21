@@ -80,6 +80,11 @@ struct EnvironmentAmbient : Feature
 		// pads behind them. The kernel they configured moved to Screen Space GI, which owns its own
 		// radius and strength, so the block dropped from five rows to four. Safe because this is the
 		// last struct in FeatureData (see FeatureBuffer.cpp) -- nothing behind it shifts.
+		//
+		// Explicit tail pad: 15 scalars is 60 bytes and alignas(16) rounds the size up to 64
+		// anyway, but the implicit padding trips C4324 (warnings-as-errors). The HLSL mirror pads
+		// its fourth row implicitly, so this byte-for-byte matches it.
+		float pad0 = 0.0f;  // 60
 	} settings;
 	static_assert(sizeof(Settings) == 64, "EnvironmentAmbient::Settings must stay 64 bytes (4 constant buffer rows).");
 };
