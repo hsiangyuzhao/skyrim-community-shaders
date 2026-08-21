@@ -609,9 +609,17 @@ void CalculateGI(
 #	endif
 #endif
 	}
-	currY = filterNaN(currY);
-	currCoCg = filterNaN(currCoCg);
-	currGIAOSpecular = filterNaN(currGIAOSpecular);
+	// (guard N3/N5) These three are the writers of the IL / specular history, so anything
+	// non-finite that leaves here is permanent: the temporal EMA below is lerp(prev, curr, f),
+	// and lerp(Inf, curr, f) is Inf for every finite f, so a single poisoned texel survives
+	// forever and blur.cs.hlsl hands it to eight more neighbours every frame. Only NaN was being
+	// rejected; Inf went straight through. Note the clamp is a magnitude clamp, not a floor at
+	// zero -- currY is a set of SH2 coefficients and currCoCg is chroma, both legitimately
+	// signed. currAo needs none of this: its target is R8_UNORM, which cannot store a non-finite
+	// or out-of-range value.
+	currY = clamp(filterInf(filterNaN(currY)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
+	currCoCg = clamp(filterInf(filterNaN(currCoCg)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
+	currGIAOSpecular = clamp(filterInf(filterNaN(currGIAOSpecular)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
 
 	outAo[pxCoord] = currAo;
 	outY[pxCoord] = currY;

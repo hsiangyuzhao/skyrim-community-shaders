@@ -145,6 +145,29 @@ bool isFiniteSafe(float4 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && i
 // numerically identical so the two features cannot disagree about what "too bright" means.
 #define SSGI_MAX_RADIANCE 128.0f
 
+// (guard N3/N5) Magnitude ceiling on the IL / specular channels leaving gi.cs.hlsl.
+//
+// Every one of those targets is half precision (texIlY and texGiSpecular are
+// R16G16B16A16_FLOAT, texIlCoCg is R16G16_FLOAT; see ScreenSpaceGI::SetupResources), so the
+// largest value they can represent is 65504 and anything above it is stored as +-Inf. Once one
+// lands in the IL history it is permanent -- lerp(Inf, curr, f) is Inf for every finite f -- and
+// blur.cs.hlsl then spreads it to eight more texels per frame.
+//
+// 16384 == 2^14 leaves two binades of headroom under 65504, which is what the *consumers* need:
+// the value is read back as half, then scaled by AO Power / IL Source Brightness and multiplied
+// into the ambient term in DeferredCompositeCS, and any of those products must still be
+// representable. The bound is self-maintaining above this point, because everything downstream
+// of the clamp is a convex combination: the temporal EMA factor rcp(accumFrames) is in (0, 1],
+// and the blur writes ySum/wSum with all weights positive, so neither can exceed the largest
+// input it was given.
+//
+// Why this cannot touch healthy imagery: with radiance capped at SSGI_MAX_RADIANCE the SH2
+// luminance coefficients integrate to the same order of magnitude as their input times an O(1)
+// solid-angle factor, i.e. the low hundreds in the worst case. 16384 is two orders of magnitude
+// above that. AO is exempt: it lives in an R8_UNORM target, which cannot carry a non-finite or
+// out-of-range value in the first place.
+#define SSGI_MAX_OUTPUT 16384.0f
+
 // screenPos - normalised position in FrameDim, one eye only
 // uv - normalised position in FrameDim, both eye
 // texCoord - texture coordinate
