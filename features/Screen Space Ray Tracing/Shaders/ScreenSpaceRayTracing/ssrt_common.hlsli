@@ -302,6 +302,43 @@ float2 filterInf(float2 v) { return float2(filterInf(v.x), filterInf(v.y)); }
 float3 filterInf(float3 v) { return float3(filterInf(v.x), filterInf(v.y), filterInf(v.z)); }
 float4 filterInf(float4 v) { return float4(filterInf(v.x), filterInf(v.y), filterInf(v.z), filterInf(v.w)); }
 
+// (guard G4) "Is this value usable arithmetic?", i.e. neither NaN nor +-Inf.
+//
+// Deliberately *not* `isfinite()`. fxc is free to fold `isnan()` away under its default
+// (non-/Gis) float model -- which is exactly why the ISNAN macro above exists rather than
+// a plain isnan call -- and `isfinite` is specified as `!isnan(v) && !isinf(v)`, so it
+// inherits that hazard. Building the test out of the same two primitives the filterNaN /
+// filterInf pair already relies on keeps it robust under every optimisation level: the
+// comparison chain in ISNAN cannot be constant-folded without assuming the operand is
+// ordered, and `isinf` lowers to an exponent test.
+//
+// Cost is 4 scalar ops per component and no memory traffic, so it is affordable inside the
+// temporal pass's 13-tap history search.
+bool isFiniteSafe(float v) { return !ISNAN(v) && !isinf(v); }
+bool isFiniteSafe(float2 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y); }
+bool isFiniteSafe(float3 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && isFiniteSafe(v.z); }
+bool isFiniteSafe(float4 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && isFiniteSafe(v.z) && isFiniteSafe(v.w); }
+
+// (guards G2 / G9) Ceiling on any single radiance channel leaving the ray march and
+// entering the frame.
+//
+// Purpose is overflow containment, not tone mapping: filterNaN / filterInf only catch
+// values that have *already* become non-finite, and the two places that can manufacture a
+// fresh Inf out of finite inputs are (a) squaring for the luminance second moment (see
+// SSRT_MOMENT_LUMINANCE_MAX in ssrt_temporal.hlsl) and (b) the R11G11B10 moments target,
+// whose largest representable value is ~65024. A radiance of 128 squares to 16384, an
+// order of magnitude of headroom under that, and the temporal EMA can only ever move
+// *towards* the sample it is handed, so bounding the input bounds the whole chain.
+//
+// Why this cannot touch healthy imagery: the values here are linear scene radiance in the
+// same units kMAIN carries, where 1.0 is a diffuse white surface under full sunlight. The
+// brightest legitimate GI *source* in the game -- a torch flame, a sun-facing snow
+// specular -- lands in the low tens after DiffuseMult, and anything above that is either a
+// firefly (which the S1 clamp handles on statistical grounds, two orders of magnitude
+// lower) or a poisoned texel. 128 is therefore ~10x above the top of the real signal
+// range: it is a tripwire, and a pixel that hits it was already broken.
+#define SSRT_MAX_RADIANCE 128.0f
+
 // (audit #12) Tolerated *relative* linear-depth change per texel of tap distance.
 //
 // Derivation: for a surface at view depth z the per-pixel depth gradient is
