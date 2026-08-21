@@ -16,15 +16,15 @@ struct ImVec2;
 class Menu;
 class Feature;
 
-#define BUFFER_VIEWER_NODE(a_value, a_scale)                                                                 \
-	if (ImGui::TreeNode(#a_value)) {                                                                         \
-		ImGui::Image(a_value->srv.get(), { a_value->desc.Width * a_scale, a_value->desc.Height * a_scale }); \
-		ImGui::TreePop();                                                                                    \
+#define BUFFER_VIEWER_NODE(a_value, a_scale)                                                                           \
+	if (ImGui::TreeNode(#a_value)) {                                                                                   \
+		Util::BufferViewerImage(a_value->srv.get(), { a_value->desc.Width * a_scale, a_value->desc.Height * a_scale }); \
+		ImGui::TreePop();                                                                                              \
 	}
 
 #define BUFFER_VIEWER_NODE_BULLET(a_value, a_scale) \
 	ImGui::BulletText(#a_value);                    \
-	ImGui::Image(a_value->srv.get(), { a_value->desc.Width * a_scale, a_value->desc.Height * a_scale });
+	Util::BufferViewerImage(a_value->srv.get(), { a_value->desc.Width * a_scale, a_value->desc.Height * a_scale });
 
 #define ADDRESS_NODE(a_value)                                                                        \
 	if (ImGui::Button(#a_value)) {                                                                   \
@@ -35,6 +35,11 @@ class Feature;
 
 namespace Util
 {
+	/// Draws a debug texture with alpha blending disabled. Debug surfaces repurpose .a as
+	/// data (variance, confidence, frame counts), which the default alpha-blended
+	/// ImGui::Image renders as partial-to-full transparency.
+	void BufferViewerImage(ID3D11ShaderResourceView* a_srv, ImVec2 a_size);
+
 	/**
 	 * Represents a single line and its color for any colored text rendering (tooltips, legends, etc.).
 	 */

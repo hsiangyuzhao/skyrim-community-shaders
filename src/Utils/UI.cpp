@@ -32,6 +32,25 @@
 
 namespace Util
 {
+	// Debug textures repurpose .a as data (variance, confidence, frame counts), so the
+	// default alpha-blended ImGui::Image draw renders them anywhere from faded to fully
+	// invisible. Bracket the image in an opaque blend state so the viewer always shows
+	// .rgb regardless of what .a holds.
+	static void SetOpaqueBlendCallback(const ImDrawList*, const ImDrawCmd*)
+	{
+		const float blendFactor[4] = { 0.f, 0.f, 0.f, 0.f };
+		// nullptr = the default blend state, which has blending disabled.
+		globals::d3d::context->OMSetBlendState(nullptr, blendFactor, 0xffffffff);
+	}
+
+	void BufferViewerImage(ID3D11ShaderResourceView* a_srv, ImVec2 a_size)
+	{
+		auto* drawList = ImGui::GetWindowDrawList();
+		drawList->AddCallback(SetOpaqueBlendCallback, nullptr);
+		ImGui::Image(a_srv, a_size);
+		drawList->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+	}
+
 	HoverTooltipWrapper::HoverTooltipWrapper()
 	{
 		hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal | ImGuiHoveredFlags_AllowWhenDisabled);
