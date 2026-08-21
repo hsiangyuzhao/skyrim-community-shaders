@@ -110,7 +110,74 @@ struct ScreenSpaceRayTracing : Feature
         bool EnableDiffuse = true;
         float SpecularMult = 1.0f;
         float DiffuseMult = 1.0f;
+        /// @brief Forward-side scale on the vanilla directional-ambient + IBL term while SSRT
+        /// diffuse is active (Lighting.hlsl / RunGrass.hlsl / DistantTree.hlsl).
+        ///
+        /// Default deliberately left at 0, which is the legacy energy model: SSRT diffuse
+        /// replaces the forward ambient outright and the cubemap fallback stands in for it.
+        /// EnableAmbientReinjection *overrides* this to 1 rather than changing its default --
+        /// see GetCommonBufferData -- so an existing configuration that saved 0 keeps the
+        /// old look the moment the reinjection toggle comes off, which is what makes the A/B
+        /// comparison exact.
+        ///
+        /// Intermediate values are only meaningful in the legacy model. Under reinjection the
+        /// composite reconstructs the ambient as "A_est's chroma with Masks.z's luminance"
+        /// (DeferredCompositeCS), and Masks.z is the only half of that pair this scale reaches;
+        /// at m = 0.5 the reconstruction is right in luminance and half again too saturated in
+        /// chroma, so the removal would leave a tint behind. Pinning it to 1 is what keeps the
+        /// reconstruction faithful.
         float AmbientMult = 0.0f;
+        /// @brief (direction B) Confidence-guided vanilla ambient reinjection.
+        ///
+        /// The problem it solves. With the legacy model the SSRT diffuse estimate is
+        /// E = sum_i conf_i * albedo(hit_i) * L(hit_i) / N: the only energy in it comes from
+        /// surfaces that are inside the hemisphere, on screen, *and* directly lit. A ray that
+        /// leaves the screen, hits the sky, or lands on an unlit interior wall contributes
+        /// nothing at all, and with the forward ambient zeroed there is nothing underneath it.
+        /// That is a structural energy hole, not a tuning error, and it is why switching the
+        /// cubemap fallback off leaves the frame near black. The same estimate is also the
+        /// baseline cause of the directional smearing: a raw 2-spp stochastic signal reaching
+        /// kMAIN with no motion vectors of its own gives the upscaler nothing to clamp
+        /// against, so it smears the noise along motion.
+        ///
+        /// What it does. The forward ambient is left in place (AmbientMult pinned to 1) and the
+        /// composite removes the fraction of it the rays actually resolved, so the pixel ends up
+        /// at lerp(vanillaAmbient, tracedRadiance, confidence). Where the rays found geometry
+        /// the SSRT result stands, as before; where they did not, the pixel falls back to the
+        /// forward pass's own ambient -- which is exact, free, already in kMAIN, and perfectly
+        /// stable in time. Two consequences follow, and both are the point:
+        ///
+        ///  * the energy hole closes without double counting anything, because the two terms
+        ///    partition the hemisphere by confidence instead of being summed;
+        ///  * the stochastic fraction of the signal entering kMAIN shrinks to conf * radiance,
+        ///    so the low-confidence regions -- open ground, sky-facing surfaces, anything the
+        ///    screen simply does not contain -- stop feeding the upscaler noise at all.
+        ///
+        /// It also makes the radiance source honest: because the forward ambient is no longer
+        /// zeroed, kMAIN carries a hit point's *outgoing* radiance rather than its direct
+        /// lighting alone, so a lit-wall bounce into a shaded corner finally has something to
+        /// carry.
+        ///
+        /// Interaction with the cubemap fallback. The two are alternative answers to the same
+        /// question and must not both run: the fallback's `confidence = 1` makes every pixel
+        /// claim full coverage, which would remove all the vanilla ambient and then add the
+        /// cubemap estimate of the same light back. DrawSSRTDiffuse therefore forces
+        /// UseDynamicCubemapsAsFallback off while this is on (the specular fallback is a
+        /// separate setting and is untouched). The vanilla ambient is the better of the two
+        /// answers anyway -- it is the real DALC + IBL term with Skylighting already applied,
+        /// where the fallback is a cubemap normalised towards it -- and skipping the fallback
+        /// removes a cubemap sample plus a Skylighting probe fetch per sample per pixel.
+        bool EnableAmbientReinjection = true;
+        /// @brief (direction B) How much of the confidence is allowed to displace the ambient.
+        ///
+        /// 1 is the energy-conserving setting: confidence 1 removes all of the vanilla ambient
+        /// and the traced radiance stands alone. 0 keeps the whole ambient and adds the traced
+        /// radiance on top of it, i.e. a purely additive GI that is brighter than the truth but
+        /// never darker than vanilla. The dial exists because the two ends bracket the honest
+        /// answer for a screen-space estimator: confidence measures how much geometry the rays
+        /// *found*, not how well its radiance is known, so a scene whose on-screen surfaces are
+        /// unrepresentative of the whole environment is better served slightly under 1.
+        float AmbientReinjectionStrength = 1.0f;
         /// @brief (spec F5) Reviewed against the corrected occlusion semantics, left at
         /// 1.0. It now scales occlusion that comes only from back-face hits -- the one
         /// case where the ray demonstrably entered geometry -- instead of also scaling
@@ -297,12 +364,22 @@ struct ScreenSpaceRayTracing : Feature
 #endif
     } settings;
 
+    /// @brief Mirrored by the `SSRTSettings` struct in Common/SharedData.hlsli, which lives
+    /// inside the shared FeatureData constant buffer with ExponentialHeightFogSettings behind
+    /// it -- so sizeof is load bearing and must stay a multiple of 16. AmbientReinjection and
+    /// its strength open a second float4 row; the HLSL side declares the remaining 8 bytes as
+    /// an explicit `float2 ssrtPad0` rather than omitting them, because a struct member of a
+    /// cbuffer cannot be truncated the way a trailing cbuffer row can.
     struct alignas(16) SharedData
     {
         uint EnableSpecular;
         float SpecularMult;
         float DiffuseMult;
         float AmbientMult;
+        // --- row 1 ---
+        uint AmbientReinjection;
+        float AmbientReinjectionStrength;
+        float pad0[2];
     };
 
     /// @brief Mirrored by the `SSRTCB` declaration in ssrt_raymarch.hlsl, which is the only
@@ -428,6 +505,19 @@ struct ScreenSpaceRayTracing : Feature
     eastl::unique_ptr<Texture2D> texColor = nullptr;
     eastl::unique_ptr<Texture2D> texSSRColor = nullptr;
     eastl::unique_ptr<Texture2D> texSSRTDiffuseColor = nullptr;
+    /// @brief (ambient reinjection) Raw per-pixel diffuse hit confidence as the ray march
+    /// resolved it, R8_UNORM.
+    ///
+    /// It exists because .w of texSSRTDiffuseColor cannot carry this past the denoiser:
+    /// ssrt_temporal.hlsl overwrites .w with the luminance variance and the variance and
+    /// a-trous passes keep it there. One byte per texel against the ~8 bytes of every other
+    /// full-screen surface here, and UNORM storage means every read is a [0,1] value by
+    /// construction.
+    eastl::unique_ptr<Texture2D> texSSRTDiffuseConfidence = nullptr;
+    /// @brief (ambient reinjection) The same signal after ssrt_diffuse_composite.hlsl's
+    /// depth-aware 7x7 spatial mean; this is what DeferredCompositeCS lerps with. A separate
+    /// surface because a blur cannot run in place.
+    eastl::unique_ptr<Texture2D> texSSRTDiffuseConfidenceSmooth = nullptr;
     eastl::unique_ptr<Texture2D> texHistory = nullptr;
     eastl::unique_ptr<Texture2D> texHistoryDiffuse = nullptr;
     eastl::unique_ptr<Texture2D> texTemporal = nullptr;

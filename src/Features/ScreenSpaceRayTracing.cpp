@@ -28,6 +28,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     SpecularMult,
     DiffuseMult,
     AmbientMult,
+    EnableAmbientReinjection,
+    AmbientReinjectionStrength,
     OcclusionStrength,
     CubemapNormalization,
     EnableSVGF,
@@ -61,6 +63,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     SpecularMult,
     DiffuseMult,
     AmbientMult,
+    EnableAmbientReinjection,
+    AmbientReinjectionStrength,
     OcclusionStrength,
     CubemapNormalization,
     EnableSVGF,
@@ -101,9 +105,52 @@ void ScreenSpaceRayTracing::DrawSettings()
             "How strongly a ray that ran into the back of geometry darkens the fallback "
             "ambient for that pixel. Rays that simply failed to trace no longer count "
             "towards this.");
+    ImGui::BeginDisabled(settings.EnableAmbientReinjection);
     ImGui::SliderFloat("Ambient Multiplier", &settings.AmbientMult, 0.0f, 1.0f, "%.2f");
+    ImGui::EndDisabled();
+    if (auto _tt = Util::HoverTooltipWrapper()) {
+        if (settings.EnableAmbientReinjection)
+            ImGui::Text(
+                "Pinned to 1 while Ambient Reinjection is on: that mode needs the full vanilla "
+                "ambient in the frame so the composite can take back exactly the part the rays "
+                "resolved. Turn Ambient Reinjection off to edit this again.");
+        else
+            ImGui::Text("Mix diffuse with vanilla ambient color. Not suggested if using dynamic cubemaps as fallback.");
+    }
+
+    ImGui::SeparatorText("Ambient Energy");
+
+    ImGui::Checkbox("Ambient Reinjection", &settings.EnableAmbientReinjection);
     if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text("Mix diffuse with vanilla ambient color. Not suggested if using dynamic cubemaps as fallback.");
+        ImGui::Text(
+            "Keeps the vanilla ambient light in the frame and lets the traced result displace "
+            "it in proportion to how much geometry the rays actually found, instead of zeroing "
+            "the ambient and relying on the cubemap fallback to stand in for it. Each pixel "
+            "ends up at a blend of vanilla ambient and traced radiance weighted by hit "
+            "confidence.\n\n"
+            "Why it matters. A screen-space ray can only bring back light from a surface that "
+            "is on screen, inside the hemisphere and lit; sky, off-screen and unlit hits carry "
+            "nothing. With the ambient zeroed there is nothing underneath that, which is why "
+            "the frame collapses when the fallback is switched off. It also removes most of the "
+            "unfiltered sampling noise reaching the upscaler, because the noisy term is now "
+            "scaled by confidence and the low-confidence regions -- open ground, sky-facing "
+            "surfaces -- rest on a perfectly stable ambient instead.\n\n"
+            "Forces the diffuse cubemap fallback off, since the two are competing answers to "
+            "the same question and running both would count the environment twice. The "
+            "specular fallback is unaffected.\n\n"
+            "Turn it off to get the previous behaviour back exactly, for an A/B comparison.");
+
+    if (settings.EnableAmbientReinjection) {
+        ImGui::SliderFloat("Reinjection Strength", &settings.AmbientReinjectionStrength, 0.0f, 1.0f, "%.2f");
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "How much of the hit confidence is allowed to displace the vanilla ambient. 1 "
+                "conserves energy: a fully confident pixel is pure traced radiance. 0 keeps the "
+                "whole ambient and adds the traced light on top, which is brighter than the "
+                "truth but never darker than vanilla. Slightly below 1 is a reasonable hedge in "
+                "scenes whose on-screen surfaces are not representative of the surrounding "
+                "environment.");
+    }
 
     ImGui::Separator();
 
@@ -128,9 +175,19 @@ void ScreenSpaceRayTracing::DrawSettings()
     ImGui::SliderFloat("BRDF Bias", &settings.BRDFBias, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Specular only. Higher BRDF bias reduces noise but makes reflections more glossy.");
+    ImGui::BeginDisabled(settings.EnableAmbientReinjection);
     ImGui::Checkbox("Use Dynamic Cubemaps as Fallback for Diffuse", &settings.UseDynamicCubemapsAsFallback);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text("When ray marching misses, use dynamic cubemaps for reflections.");
+    ImGui::EndDisabled();
+    if (auto _tt = Util::HoverTooltipWrapper()) {
+        if (settings.EnableAmbientReinjection)
+            ImGui::Text(
+                "Forced off while Ambient Reinjection is on: the vanilla ambient is what fills "
+                "the missed directions in that mode, and letting the cubemap fill them as well "
+                "would count the same environment light twice. The saved value is kept and "
+                "comes back when Ambient Reinjection is turned off.");
+        else
+            ImGui::Text("When ray marching misses, use dynamic cubemaps for reflections.");
+    }
     ImGui::Checkbox("Use Dynamic Cubemaps as Fallback for Specular", &settings.UseDynamicCubemapsAsFallbackSpecular);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("When ray marching misses, use dynamic cubemaps for reflections. Recommended for specular.");
@@ -259,6 +316,8 @@ void ScreenSpaceRayTracing::DrawSettings()
         BUFFER_VIEWER_NODE(texColor, debugRescale)
         BUFFER_VIEWER_NODE(texSSRColor, debugRescale)
         BUFFER_VIEWER_NODE(texSSRTDiffuseColor, debugRescale)
+        BUFFER_VIEWER_NODE(texSSRTDiffuseConfidence, debugRescale)
+        BUFFER_VIEWER_NODE(texSSRTDiffuseConfidenceSmooth, debugRescale)
         BUFFER_VIEWER_NODE(texHistory, debugRescale)
         BUFFER_VIEWER_NODE(texHistoryDiffuse, debugRescale)
         BUFFER_VIEWER_NODE(texTemporal, debugRescale)
@@ -370,6 +429,20 @@ void ScreenSpaceRayTracing::SetupResources()
         texHistoryNormals = eastl::make_unique<Texture2D>(texDesc);
         texHistoryNormals->CreateSRV(srvDesc);
         texHistoryNormals->CreateUAV(uavDesc);
+
+        // (ambient reinjection) The confidence pair. R8_UNORM because the quantity is a
+        // coverage fraction in [0,1]: 1/255 quantisation is an order of magnitude below the
+        // ~0.07 residual noise of the 7x7 spatial mean that produces the second surface, and a
+        // UNORM read cannot be non-finite, so no consumer needs its own guard. One byte per
+        // texel is ~8 MB each at a 4K allocation, against ~33 MB for each of the eight
+        // RGBA16F surfaces above.
+        texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R8_UNORM;
+        texSSRTDiffuseConfidence = eastl::make_unique<Texture2D>(texDesc);
+        texSSRTDiffuseConfidence->CreateSRV(srvDesc);
+        texSSRTDiffuseConfidence->CreateUAV(uavDesc);
+        texSSRTDiffuseConfidenceSmooth = eastl::make_unique<Texture2D>(texDesc);
+        texSSRTDiffuseConfidenceSmooth->CreateSRV(srvDesc);
+        texSSRTDiffuseConfidenceSmooth->CreateUAV(uavDesc);
 
         texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
 
@@ -1100,7 +1173,15 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ssrCBData.Thickness = settings.Thickness;
         ssrCBData.NormalBias = settings.NormalBias;
         ssrCBData.BRDFBias = settings.BRDFBias;
-        ssrCBData.UseDynamicCubemapsAsFallback = (uint)settings.UseDynamicCubemapsAsFallback && dynamicCubemaps.loaded;
+        // (ambient reinjection) The vanilla ambient and the cubemap fallback are two answers to
+        // the same question -- what light arrives from the directions the rays could not resolve
+        // -- and running both counts the environment twice. Worse, the fallback path reports
+        // `confidence = 1` for every pixel it touches, so the composite would remove *all* of
+        // the vanilla ambient and then add the cubemap's estimate of the same light back on top.
+        // Force it off rather than trusting the user to keep the two consistent; the saved
+        // setting is untouched and returns the moment reinjection comes off.
+        ssrCBData.UseDynamicCubemapsAsFallback =
+            (uint)(settings.UseDynamicCubemapsAsFallback && !settings.EnableAmbientReinjection) && dynamicCubemaps.loaded;
         ssrCBData.OcclusionStrength = settings.OcclusionStrength;
         ssrCBData.CubemapNormalization = settings.CubemapNormalization;
         ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;  // (diagnostic T2)
@@ -1111,12 +1192,14 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     context->CSSetConstantBuffers(1, 1, &buffer);
 
     // (audit P6) Raymarch UAV slots: u0 radiance/confidence, u1..u4 SHARC (bound only
-	// while SHARC is enabled, and only declared by the SHARC shader permutations). Keep
-	// this in lockstep with the register map at the top of ssrt_raymarch.hlsl and
-	// sharc_resolve.hlsl. The SVGF temporal pass below reuses slots u0/u1 for its own
-	// two outputs, so the array is never smaller than 2.
+	// while SHARC is enabled, and only declared by the SHARC shader permutations),
+	// u5 the raw confidence copy (ambient reinjection). Keep this in lockstep with the
+	// register map at the top of ssrt_raymarch.hlsl and sharc_resolve.hlsl. The SVGF
+	// temporal pass below reuses slots u0/u1 for its own two outputs, and the diffuse
+	// composite reuses u0/u1 for kMAIN and the smoothed confidence, so the array is never
+	// smaller than 2.
     std::array<ID3D11ShaderResourceView*, 13> srvs = { nullptr };
-	std::array<ID3D11UnorderedAccessView*, 5> uavs = { nullptr };
+	std::array<ID3D11UnorderedAccessView*, 6> uavs = { nullptr };
 
     auto resetViews = [&]() {
 		srvs.fill(nullptr);
@@ -1136,6 +1219,11 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec] = ssgi.GetOutputTextures();
 
     uavs.at(0) = texSSRTDiffuseColor->uav.get();
+    // (ambient reinjection) Always bound, not gated on the setting: the shader writes it
+    // unconditionally so that the surface stays deterministic for every texel the dispatch
+    // covers, and an unbound UAV would make that write a silent no-op. The consumer side is
+    // what the setting gates.
+    uavs.at(5) = texSSRTDiffuseConfidence->uav.get();
 #ifdef ENABLE_SHARC
     if (settings.EnableSharc) {
         EnsureSharcResources();  // (audit P6) allocate on first enable, before any dispatch binds them
@@ -1282,11 +1370,19 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // composite
     {
         uavs.at(0) = main.UAV;
+        // (ambient reinjection) The pass doubles as the confidence smoothing filter: it reads
+        // the raw surface at t3 and publishes the depth-aware 7x7 mean at u1 for
+        // DeferredCompositeCS, which Deferred::DeferredPasses dispatches after this one. Folded
+        // in here rather than given its own dispatch because this pass is three texture reads
+        // of otherwise idle ALU, and because it keeps the change out of the pass schedule.
+        uavs.at(1) = texSSRTDiffuseConfidenceSmooth->uav.get();
         srvs.at(0) = texSSRTDiffuseColor->srv.get();
         srvs.at(1) = albedo.SRV;
+        srvs.at(3) = texSSRTDiffuseConfidence->srv.get();
+        srvs.at(4) = depth.depthSRV;
 
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
-        context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
+        context->CSSetUnorderedAccessViews(0, 2, uavs.data(), nullptr);
         context->CSSetShader(diffuseCompositeCS.get(), nullptr, 0);
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
@@ -1337,6 +1433,19 @@ ScreenSpaceRayTracing::SharedData ScreenSpaceRayTracing::GetCommonBufferData()
     data.EnableSpecular = settings.EnableSpecular;
     data.SpecularMult = settings.SpecularMult;
     data.DiffuseMult = settings.EnableDiffuse ? settings.DiffuseMult : 0.0f;
-    data.AmbientMult = settings.AmbientMult;
+    // (ambient reinjection) Gated on EnableDiffuse for the same reason DiffuseMult is: every
+    // consumer keys off `DiffuseMult > 0`, and a reinjection flag left set while the diffuse
+    // pass is not running would have DeferredCompositeCS reading a stale confidence surface.
+    data.AmbientReinjection = (settings.EnableDiffuse && settings.EnableAmbientReinjection) ? 1u : 0u;
+    data.AmbientReinjectionStrength = settings.AmbientReinjectionStrength;
+    // (ambient reinjection) The forward ambient has to be present at full strength for the
+    // composite's reconstruction to be faithful -- it corrects only the LUMINANCE of its
+    // estimate from Masks.z, and AmbientMult scales exactly that half, so any value other than
+    // 1 leaves the chroma over-saturated relative to the luminance and the removal deposits a
+    // tint. Pinned here rather than by changing the default, so an existing configuration that
+    // saved AmbientMult = 0 still reproduces the old look bit for bit the moment the
+    // reinjection toggle comes off.
+    data.AmbientMult = data.AmbientReinjection != 0u ? 1.0f : settings.AmbientMult;
+    data.pad0[0] = data.pad0[1] = 0.0f;
     return data;
 }

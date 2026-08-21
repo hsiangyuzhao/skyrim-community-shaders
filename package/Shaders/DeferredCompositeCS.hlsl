@@ -97,6 +97,39 @@ void SampleSSGISpecular(uint2 pixCoord, sh2 lobe, out float ao, out float3 il, i
 
 #if defined(SSRT)
 Texture2D<float4> SSRTexture : register(t16);
+// (ambient reinjection) Spatially smoothed SSRT diffuse hit confidence, written by
+// ssrt_diffuse_composite.hlsl earlier in the same frame (Deferred::DeferredPasses calls
+// DrawSSRTDiffuse before this dispatch). R8_UNORM, so a read is a [0,1] value by
+// construction and needs no finiteness test of its own; the write side is covered by the
+// G2 sanitisation the ray march already applies to the channel it comes from.
+Texture2D<float> SSRTConfidenceTexture : register(t19);
+#endif
+
+// The ambient separation further down has three consumers, and only one of them is SSGI:
+//
+//  * SSGI needs the ambient MAIN already contains taken back out so it can shape it with
+//    its own albedo-tinted MultiBounceAO and re-add it (the "F-A" mechanism -- the
+//    estimate, then the subtract/re-add pair);
+//  * SSRT's confidence-guided ambient reinjection needs the same reconstruction so it can
+//    re-add only the fraction its rays did *not* resolve;
+//  * Environment Ambient *replaces* the term, which is only possible once it has been taken
+//    out - and it reads `ambientSkyVisibility` / `ambientEnclosure` from the same block.
+//
+// features/Screen Space GI, features/Screen Space Ray Tracing and
+// features/EnvironmentAmbient are all non-CORE feature folders, so "SSRT installed, SSGI
+// not" (and likewise for Environment Ambient) is a shipping configuration and the
+// reconstruction has to exist there too. Hoisting the shared half out of the SSGI gate is
+// the only way to get that without a second copy of the IBL-aware estimate, and that
+// estimate is the one piece of this file a pure-SSGI user depends on being exactly right.
+//
+// Nothing inside the hoisted region is changed by the hoist. In an SSGI build the
+// `#if defined(SSGI)` islands hold the ssgiAo / ssgiIl / multiBounceAO code verbatim and
+// `ambientKeep` is a compile-time 1.0 without SSRT, so an SSGI permutation emits what it
+// emitted before. The `#if defined(SSGI) || defined(ENV_AMBIENT)` islands are the ones that
+// need the *shaped* re-add (Environment Ambient lerps against it and multiplies by it), as
+// opposed to SSRT-only, where MultiBounceAO is the identity.
+#if defined(SSGI) || defined(SSRT) || defined(ENV_AMBIENT)
+#	define COMPOSITE_AMBIENT_SEPARATION
 #endif
 
 // Skylighting's diffuse visibility is needed by the ambient estimate's IBL term and by Environment
@@ -147,15 +180,17 @@ Texture2D<float4> SSRTexture : register(t16);
 	float3 linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
 	float3 normalWS = normalize(mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0)).xyz);
 
-#if defined(SSGI) || defined(ENV_AMBIENT)
+#if defined(COMPOSITE_AMBIENT_SEPARATION)
 
 #	if defined(SSGI)
 	float ssgiAo;
 	float3 ssgiIl;
 	SampleSSGI(dispatchID.xy, normalWS, ssgiAo, ssgiIl);
-#	else
+#	elif defined(ENV_AMBIENT)
 	// No Screen Space GI: MultiBounceAO(albedo, 1) is the identity, so the ambient separation below
 	// is a round trip and the block only exists to let Environment Ambient replace the term.
+	// SSRT-without-SSGI declares nothing here: its only consumer of the shaping is the re-add, and
+	// that takes the constant-1 MultiBounceAO island further down.
 	float ssgiAo = 1.0;
 #	endif
 
@@ -249,16 +284,52 @@ Texture2D<float4> SSRTexture : register(t16);
 	directionalAmbientColor = Color::YCoCgToRGB(directionalAmbientColor);
 	directionalAmbientColor = max(0, directionalAmbientColor);
 
+	// Fraction of the reconstructed ambient that survives into the frame. 1 everywhere the
+	// SSRT ambient reinjection is not running, which is a compile-time constant without SSRT
+	// and folds the multiply below away.
+	float ambientKeep = 1.0;
+
 #	if defined(SSRT)
-	// SSRT diffuse drives the forward directional ambient to zero through AmbientMult, so Masks.z
-	// arrives at ~0 and there is nothing left to separate. Overwriting Y with 0 does NOT make the
-	// term zero, though: YCoCgToRGB(0, Co, Cg) is (Co - Cg, Cg, -Co - Cg), a pure chroma vector
-	// built from A_est's chroma, and max(0, ...) keeps whichever channels came out positive. The
-	// subtraction below then takes that residue out of MAIN, which desaturates the SSRT path for
-	// no reason. Skip the separation instead. Read from the cbuffer at runtime, as the
-	// Environment Ambient gate below does, so toggling SSRT needs no recompile.
-	[branch] if (SharedData::ssrtSettings.DiffuseMult > 0.0)
-		directionalAmbientColor = 0;
+	// Two mutually exclusive energy models, selected at runtime so toggling either one needs
+	// no composite recompile (DiffuseMult is already gated on EnableDiffuse in
+	// ScreenSpaceRayTracing::GetCommonBufferData). The Environment Ambient gate further down
+	// reads the same cbuffer field for the same reason.
+	//
+	// Legacy (AmbientReinjection == 0, and what every configuration did before this change):
+	// SSRT diffuse drives the forward directional ambient to zero through AmbientMult, so
+	// Masks.z arrives at ~0 and there is nothing left to separate. Overwriting Y with 0 does
+	// NOT make the term zero, though: YCoCgToRGB(0, Co, Cg) is (Co - Cg, Cg, -Co - Cg), a pure
+	// chroma vector built from A_est's chroma, and max(0, ...) keeps whichever channels came
+	// out positive. The subtraction below would then take that residue out of MAIN, which
+	// desaturates the SSRT path for no reason. Skip the separation instead.
+	//
+	// Reinjection (AmbientReinjection != 0): the forward ambient is *not* zeroed
+	// (GetCommonBufferData pins AmbientMult to 1), so Masks.z carries a real luminance and the
+	// reconstruction above is the honest vanilla+IBL ambient this pixel already received. The
+	// SSRT diffuse composite has likewise already added its own conf-weighted radiance to MAIN.
+	// Removing conf * A is what turns the two of them into one term instead of two:
+	//
+	//     MAIN = direct + A + sum_i conf_i * L_i / N        (before this pass)
+	//     out  = direct + (1 - conf) * A + conf * Lbar      with conf = sum_i conf_i / N
+	//                                                       and Lbar the conf-weighted mean
+	//          = direct + lerp(A, Lbar, conf)
+	//
+	// i.e. exactly the ambient in the directions the rays could not resolve, plus exactly the
+	// traced radiance in the directions they could. No direction is counted twice and none is
+	// dropped. The ray march is what makes the pairing exact: in this mode it weights its
+	// radiance by the same confidence it reports (ssrt_raymarch.hlsl), rather than emitting
+	// full radiance for any hit that merely passed the validation threshold.
+	//
+	// AmbientReinjectionStrength scales only the removal, so 0 is a deliberately additive
+	// GI mode and 1 is the energy-conserving one.
+	[branch] if (SharedData::ssrtSettings.DiffuseMult > 0.0) {
+		[branch] if (SharedData::ssrtSettings.AmbientReinjection != 0) {
+			float ssrtConfidence = SSRTConfidenceTexture[dispatchID.xy];
+			ambientKeep = saturate(1.0 - ssrtConfidence * SharedData::ssrtSettings.AmbientReinjectionStrength);
+		} else {
+			directionalAmbientColor = 0;
+		}
+	}
 #	endif
 
 	float maxScale = 1.0;
@@ -274,8 +345,9 @@ Texture2D<float4> SSRTexture : register(t16);
 
 	linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
 
+#	if defined(SSGI) || defined(ENV_AMBIENT)
 	float3 linAlbedo = Color::IrradianceToLinear(albedo / Color::PBRLightingScale);
-
+#	endif
 
 #	if defined(ENV_AMBIENT)
 	// Environment Ambient replaces the ambient term that was just separated out of MAIN, so it can
@@ -299,11 +371,25 @@ Texture2D<float4> SSRTexture : register(t16);
 
 	bool envAmbientActive = SharedData::envAmbientSettings.Enabled != 0 && depth < 1.0;
 #		if defined(SSRT)
-	// SSRT diffuse drives the forward directional ambient to zero via AmbientMult (so Masks.z and
-	// therefore directionalAmbientColor collapse to ~0) and adds its own cubemap ambient in
-	// ssrt_diffuse_composite.hlsl. Running both would double-light, so SSRT wins. Read from the
-	// cbuffer at runtime (DiffuseMult is already gated on EnableDiffuse in
+	// SSRT diffuse and Environment Ambient are competing answers to "what arrives from the
+	// environment", so SSRT wins wherever its diffuse pass runs - under either of its energy
+	// models, and for a different reason in each:
+	//
+	//  * legacy (AmbientReinjection == 0): AmbientMult drives the forward directional ambient to
+	//    zero, so Masks.z and therefore directionalAmbientColor collapse to ~0, and SSRT adds its
+	//    own cubemap ambient in ssrt_diffuse_composite.hlsl. L1 would double-light against that.
+	//  * reinjection (AmbientReinjection != 0): AmbientMult is pinned to 1, so the forward ambient
+	//    is still there, but the SSRT composite has already added confidence-weighted traced
+	//    radiance for the directions its rays resolved and `ambientKeep` above removes exactly
+	//    that fraction of the vanilla term. The hemisphere is already fully accounted for; a third
+	//    estimate of the same light on top would double-count.
+	//
+	// Read from the cbuffer at runtime (DiffuseMult is already gated on EnableDiffuse in
 	// ScreenSpaceRayTracing::GetCommonBufferData) so toggling SSRT needs no composite recompile.
+	//
+	// This exclusion is also what makes `ambientKeep` an identity on every path L1 takes: keep can
+	// only leave 1 where DiffuseMult > 0, which is exactly where envAmbientActive is false. The two
+	// are mutually exclusive by construction, not by tuning - see the re-add below.
 	envAmbientActive = envAmbientActive && !(SharedData::ssrtSettings.DiffuseMult > 0.0);
 #		endif
 #		if defined(INTERIOR)
@@ -322,9 +408,17 @@ Texture2D<float4> SSRTexture : register(t16);
 	}
 #	endif
 
+#	if defined(SSGI) || defined(ENV_AMBIENT)
 	float3 multiBounceAO = Color::MultiBounceAO(linAlbedo, ssgiAo);
 
 	linDiffuseColor *= sqrt(multiBounceAO);
+#	else
+	// No SSGI occlusion signal in this build and no Environment Ambient to shape, so the shaping
+	// the separation exists to apply is the identity and fxc folds it out. What is left of the
+	// subtract/re-add pair is `diffuseColor - (1 - ambientKeep) * A`, exactly inverting the forward
+	// path's gamma-space `diffuseColor += directionalAmbientColor`.
+	const float3 multiBounceAO = 1.0;
+#	endif
 
 #	if defined(ENV_AMBIENT)
 	// Vanilla ambient contribution, in linear space, bit-identical to the #else branch below.
@@ -410,12 +504,38 @@ Texture2D<float4> SSRTexture : register(t16);
 	}
 
 	diffuseColor = Color::IrradianceToGamma(linDiffuseColor);
-	diffuseColor += Color::IrradianceToGamma(ambientIrradiance);
+	// `ambientKeep` multiplies here for the same reason it does in the `#else` branch below, and in
+	// the same (gamma) space: the forward path added this term with `diffuseColor +=
+	// directionalAmbientColor`, both operands gamma-encoded, so removing a fraction of it on that
+	// side of the transfer function is the exact inverse of the addition.
+	//
+	// Both branches must carry it, because `keep` and Environment Ambient are mutually exclusive
+	// (the envAmbientActive gate above), not alternatives:
+	//
+	//  * L1 active  => DiffuseMult == 0 => keep == 1, so the factor is the identity and the vanilla
+	//    plus environment composition above is untouched;
+	//  * keep < 1   => DiffuseMult > 0  => L1 inactive => `ambientIrradiance` is the pure vanilla
+	//    term, bit-identical to the `#else` branch's argument, and the factor is the whole point.
+	//
+	// Omitting it would make the ENV_AMBIENT build the one configuration where reinjection silently
+	// does nothing: `diffuseColor` had the full A subtracted at the maxScale clamp above, and
+	// re-adding the full A here cancels that exactly, leaving the traced radiance stacked on top of
+	// an ambient that was supposed to have made room for it.
+	//
+	// `envIrradianceAdd` deliberately does not take the factor. It is only ever non-zero inside
+	// `envAmbientActive`, i.e. only where keep == 1, so multiplying it would be an identity dressed
+	// up as an energy correction - and it is the environment term, not the vanilla ambient the rays
+	// displaced.
+	diffuseColor += Color::IrradianceToGamma(ambientIrradiance) * ambientKeep;
 	linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
 	linDiffuseColor += envIrradianceAdd;
 #	else
 	diffuseColor = Color::IrradianceToGamma(linDiffuseColor);
-	diffuseColor += Color::IrradianceToGamma(Color::IrradianceToLinear(directionalAmbientColor) * multiBounceAO);
+	// `ambientKeep` multiplies in gamma space, i.e. on the same side of the transfer function
+	// the forward path added the term on (Lighting.hlsl `diffuseColor += directionalAmbientColor`
+	// with both operands gamma-encoded). That makes the removal the exact inverse of the
+	// addition; the MultiBounceAO shaping stays in linear space, where it was derived.
+	diffuseColor += Color::IrradianceToGamma(Color::IrradianceToLinear(directionalAmbientColor) * multiBounceAO) * ambientKeep;
 	linDiffuseColor = Color::IrradianceToLinear(diffuseColor);
 #	endif
 
