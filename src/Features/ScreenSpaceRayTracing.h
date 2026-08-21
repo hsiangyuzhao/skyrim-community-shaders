@@ -401,6 +401,15 @@ struct ScreenSpaceRayTracing : Feature
         /// sample sigma rather than the accumulated output's residual, so the box width does
         /// not shrink as the accumulation window lengthens and a value tuned at 16 frames
         /// stays valid at 64.
+        ///
+        /// (defect D8) This value is the *converged* width. ssrt_temporal.hlsl scales it up
+        /// while a pixel is still accumulating, so that the fraction of frames on which the
+        /// clamp engages stays what the derivation above assumes instead of rising to ~7% three
+        /// frames into a chain -- at which rate the clamp keeps pulling the history back onto a
+        /// nine-tap mean of this frame's noise and the pixel never converges at all. The scale
+        /// is >= 1 by construction and reaches exactly 1 at MaxAccumulatedFrames, so this
+        /// setting still means precisely what it says for any pixel that has finished
+        /// accumulating.
         float HistoryClampSigma = 1.0f;
         /// @brief (diagnostic T2) Freeze the per-frame phase of the ray-direction noise.
         ///

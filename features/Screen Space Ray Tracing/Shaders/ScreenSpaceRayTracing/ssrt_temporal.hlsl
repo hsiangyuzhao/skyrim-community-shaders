@@ -221,7 +221,11 @@ float3 SSRTClampFirefly(float3 radiance, uint2 gtid, float sigmas)
 // sqrt(0.174^2 + 0.333^2) = 0.376 * sigma, and at K = 1 the clamp only engages beyond
 // 2.66 of those -- under 1% of frames, and when it does engage it moves the value only as
 // far as the box edge. The mechanism is a no-op on converged static content by construction,
-// not by luck. Lowering K to 0.5 puts the same event at 1.33 sigma (~18% of frames), which
+// not by luck. (defect D8) The word doing the work in that sentence is *converged*: the 0.376
+// is spread(alpha) evaluated at the floor blend weight, and at a larger alpha the same K
+// engages far more often. The caller therefore hands in a K already scaled to hold the
+// engagement rate constant across the accumulation ramp -- see the derivation at the call
+// site. Lowering K to 0.5 puts the same event at 1.33 sigma (~18% of frames), which
 // starts feeding the neighbourhood's own noise back into the history -- the failure the
 // naive formulations are notorious for -- which is why the default does not go there.
 //
@@ -872,13 +876,52 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
         // steered by exactly that quantity (see BUG-1b). Clamping them as well would make the
         // variance channel describe the filtered result instead, which is the error BUG-1b
         // removed.
+        float alpha = max(1.0f / (prevAccumFrames + 1.0f), invMaxAccumulatedFrames);
+
         if (clampHistory)
         {
             const float sigmaTemporal = sqrt(max(prevMoments.y - prevMoments.x * prevMoments.x, 0.0f));
-            prevColor.rgb = SSRTClampHistory(prevColor.rgb, ssrColor.rgb, GTid.xy, historyClampSigma, sigmaTemporal);
+
+            // (defect D8) HistoryClampSigma is calibrated against a *converged* history, and
+            // applying that width to an unconverged one is a self-lock: it is the one way this
+            // mechanism can stop the accumulation ever reaching the state its own derivation
+            // assumes.
+            //
+            // The derivation at SSRTClampHistory fixes K = 1 by asking how far a healthy
+            // history sits from the box centre. In units of the per-frame sample sigma that
+            // distance has standard deviation
+            //     spread(a) = sqrt(1/9 + a/(2 - a)),
+            // where 1/9 is the variance of the nine-tap mean that forms the centre and
+            // a/(2 - a) is the residual an EMA at blend weight a leaves in the history. The
+            // quoted 0.376 is spread(1/17), i.e. the value at the *floor* weight -- a fully
+            // accumulated pixel. A pixel three frames in blends at a = 1/4, where the spread
+            // is 0.564: the same K then engages at 1.8 standard deviations instead of 2.66,
+            // which is a ~7% per-frame hit rate rather than under 1%, and every hit drags the
+            // history back onto a nine-sample mean of *this* frame's 2-spp noise. That
+            // re-injects the noise the accumulation is trying to average out, so the pixel
+            // stays noisy, which keeps the clamp firing. The loop is stable and the pixel never
+            // converges.
+            //
+            // Scaling K by spread(alpha) / spread(floor alpha) holds the false-positive rate
+            // constant instead of holding the width constant. alpha can never be below the
+            // floor, so the ratio is >= 1 always: the clamp can only ever be *more* permissive
+            // than its tuned value, never less, which is what makes this safe by construction
+            // rather than by measurement. It reaches exactly 1 -- i.e. exactly the tuned
+            // behaviour, with no residual widening -- as soon as the pixel hits
+            // MaxAccumulatedFrames, and it self-normalises to whatever that setting is rather
+            // than to a hard-coded 16.
+            //
+            // Magnitudes at MaxAccumulatedFrames 16: 2.80x on the first blended frame, 1.77x at
+            // one accumulated frame, 1.25x at four, 1.00x at sixteen. The early widening costs
+            // nothing in ghosting terms because alpha is near 1 there -- the history it declines
+            // to clamp contributes almost none of the output.
+            const float spreadNow = sqrt(1.0f / 9.0f + alpha / (2.0f - alpha));
+            const float spreadFloor = sqrt(1.0f / 9.0f + invMaxAccumulatedFrames / (2.0f - invMaxAccumulatedFrames));
+            const float sigmasEffective = historyClampSigma * (spreadNow / spreadFloor);
+
+            prevColor.rgb = SSRTClampHistory(prevColor.rgb, ssrColor.rgb, GTid.xy, sigmasEffective, sigmaTemporal);
         }
 
-        float alpha = max(1.0f / (prevAccumFrames + 1.0f), invMaxAccumulatedFrames);
         blendedColor = lerp(prevColor.rgb, ssrColor.rgb, alpha);
 
         // (BUG-1b) Continue the *accumulated* moment chain. `prevMoments` is the EMA that
