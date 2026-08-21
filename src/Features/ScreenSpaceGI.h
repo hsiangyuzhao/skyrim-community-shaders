@@ -87,6 +87,10 @@ public:
 		float DepthDisocclusion = .1f;
 		float NormalDisocclusion = .1f;
 		uint MaxAccumFrames = 16;
+		// Separate, shorter ceiling for the AO channel only. AO is multiplicative and gets no
+		// spatial filtering of its own, so a long temporal window drags a moving object's
+		// occlusion into a dark trail. See the AO lerp in gi.cs.hlsl.
+		uint MaxAccumFramesAO = 4;
 		float BlurRadius = 2.f;
 		float DistanceNormalisation = 2.f;
 	} settings;
@@ -126,10 +130,11 @@ public:
 		float NormalDisocclusion;
 		uint MaxAccumFrames;  //
 
+		uint MaxAccumFramesAO;
 		float BlurRadius;
 		float DistanceNormalisation;
 
-		float2 pad;
+		float pad;
 	};
 	STATIC_ASSERT_ALIGNAS_16(SSGICB);
 	eastl::unique_ptr<ConstantBuffer> ssgiCB;
