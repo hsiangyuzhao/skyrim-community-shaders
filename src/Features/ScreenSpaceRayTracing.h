@@ -457,6 +457,69 @@ struct ScreenSpaceRayTracing : Feature
         /// history across depth discontinuities again, which is the ghost source D3 exists to
         /// remove.
         bool DisableHistoryDepthTest = false;
+        /// @brief (diagnostic H) Bypass the 30 degree normal agreement test.
+        ///
+        /// Feeds DenoiserCB::disableHistoryNormalTest. The counterpart of
+        /// DisableHistoryDepthTest for the other geometric gate, and it exists for the same
+        /// reason: both gates present identically -- the accumulation refuses to build -- so
+        /// only switching them off one at a time says which is responsible.
+        ///
+        /// The pair is what turns History Debug View's colour reading from a hypothesis into a
+        /// confirmation. A screen that comes back green should start accumulating the moment
+        /// this is set; a screen that comes back red should start accumulating the moment the
+        /// depth-test switch is.
+        bool DisableHistoryNormalTest = false;
+        /// @brief (diagnostic H) Accept whatever history the reprojection lands on.
+        ///
+        /// Feeds DenoiserCB::forceAcceptHistory, which reduces the acceptance predicate to its
+        /// upper bound: screen bounds, the guard G4 non-finite rejection and the requirement
+        /// that the candidate carry a non-zero frame count. Both geometric gates are skipped.
+        ///
+        /// The two per-gate bypasses can only show that a gate *is* the blocker; they cannot
+        /// show that the gates are the only blockers. If the accumulation still refuses to
+        /// build with this set, the fault is not in the acceptance test at all -- it is in the
+        /// bounds arithmetic, the history contents, or the alpha path -- and that is a
+        /// different repair. This is the test that separates those.
+        ///
+        /// Strictly diagnostic: with it set the accumulation reads history straight across
+        /// silhouettes and depth layers, i.e. maximal ghosting.
+        bool ForceAcceptHistory = false;
+        /// @brief (diagnostic H) Compare the *rotated* normal in the 30 degree agreement test.
+        ///
+        /// Feeds DenoiserCB::rotatedNormalGate. Off, the gate compares the current view-space
+        /// normal against the stored previous-frame normal, which is what this pass did for its
+        /// whole shipped life: biased by the inter-frame camera rotation, so it over-rejects
+        /// during fast turns and passes everything else. On, it compares the current normal
+        /// rotated into the previous frame's view space, which is the algebraically correct
+        /// form that the defect D3 work introduced.
+        ///
+        /// The correct form is not the default, and deliberately so. Its algebra is sound but
+        /// it depends on CameraPreviousViewProjUnjittered composed with
+        /// CameraProjUnjitteredInverse really being the inter-frame camera rotation for this
+        /// engine's matrices -- an assumption about matrix contents that no amount of review
+        /// settles. If it does not hold, the rotated normal is nonsense and this gate rejects
+        /// the entire screen, which is exactly the failure the plane repair was made to fix.
+        /// So the default is the form whose failure mode is known and mild, and this switch is
+        /// how the other one earns its place.
+        bool RotatedNormalGate = false;
+        /// @brief (diagnostic H) Render the history-acceptance diagnostic into texDebugHistory.
+        ///
+        /// Feeds DenoiserCB::historyDebugView on the *diffuse* dispatch only. Inspect the
+        /// result under Buffer Viewer -> texDebugHistory:
+        ///
+        ///   * grey, brightening over a second or two -- history is being accepted and the
+        ///     accumulation is building. White is fully converged. This is the healthy picture.
+        ///   * red -- rejected by the plane-distance test.
+        ///   * green -- rejected by the 30 degree normal agreement test.
+        ///   * blue -- rejected by screen bounds, a non-finite history sample, or a zero frame
+        ///     count.
+        ///   * black -- sky or far plane, where there is no history question to ask.
+        ///
+        /// A uniform colour over the whole screen is the finding: it means one gate is turning
+        /// away every candidate everywhere, which is what makes the accumulation degenerate to
+        /// alpha = 1 and the denoiser a passthrough. Speckles of colour along silhouettes and
+        /// moving edges are normal and correct.
+        bool HistoryDebugView = false;
 #ifdef ENABLE_SHARC
         bool EnableSharc = false;
 #endif
@@ -517,9 +580,15 @@ struct ScreenSpaceRayTracing : Feature
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
-    /// reproduce this layout verbatim. ssrt_temporal.hlsl declares the first two rows and
-    /// ssrt_variance.hlsl only the first, which is legal -- a shader may declare a prefix
-    /// of a larger constant buffer.
+    /// reproduce this layout verbatim. ssrt_temporal.hlsl declares all four rows,
+    /// ssrt_spatial.hlsl the first two and ssrt_variance.hlsl only the first, which is legal
+    /// -- a shader may declare a prefix of a larger constant buffer.
+    ///
+    /// The mirroring was checked against fxc's own reflection rather than by reading, because
+    /// a silent mismatch here presents as a diagnostic switch that does nothing -- which is
+    /// indistinguishable from the mechanism it toggles being innocent. Every offset agreed.
+    /// The static_assert below is what keeps it that way as fields are added: it fails the
+    /// build if a member is inserted without the HLSL side moving with it.
     struct alignas(16) DenoiserCB
     {
         float invMaxAccumulatedFrames;
@@ -544,12 +613,34 @@ struct ScreenSpaceRayTracing : Feature
         /// three pad slots row 2 had spare, so the buffer did not grow.
         float historyClampSigma;
         /// @brief (diagnostic D3) Non-zero makes ssrt_temporal.hlsl skip the defect D3
-        /// depth-disocclusion test in IsValidHistory. Took the second of row 2's pad slots,
-        /// so the buffer did not grow; ssrt_spatial.hlsl still declares the whole tail as
-        /// `float3 denoiserPad1` and reads none of it.
+        /// plane-distance disocclusion test in IsValidHistory. Took the second of row 2's pad
+        /// slots; ssrt_spatial.hlsl still declares the whole tail as `float3 denoiserPad1` and
+        /// reads none of it.
         uint disableHistoryDepthTest;
-        float pad1;
+        /// @brief (diagnostic H) Non-zero makes ssrt_temporal.hlsl skip the 30 degree normal
+        /// agreement test and nothing else. Took row 2's last pad slot, so the buffer did not
+        /// grow for it. See Settings::DisableHistoryNormalTest.
+        uint disableHistoryNormalTest;
+        // --- row 3 ---
+        /// @brief (diagnostic H) Non-zero reduces the acceptance predicate to bounds plus the
+        /// guard G4 finiteness and accumFrames > 0 requirements -- both geometric gates off.
+        /// See Settings::ForceAcceptHistory.
+        uint forceAcceptHistory;
+        /// @brief (diagnostic H) Non-zero selects the previous-view-space rotation of the
+        /// current normal for the 30 degree comparison; zero, the default, uses the un-rotated
+        /// normal. See Settings::RotatedNormalGate.
+        uint rotatedNormalGate;
+        /// @brief (diagnostic H) Non-zero makes ssrt_temporal.hlsl write texDebugHistory.
+        /// Deliberately set on the diffuse dispatch only -- the two chains share one shader and
+        /// one debug surface, so the specular pass always passes 0 and leaves the picture the
+        /// diffuse pass drew. See Settings::HistoryDebugView.
+        uint historyDebugView;
+        float pad3;
     };
+    static_assert(sizeof(DenoiserCB) == 64,
+        "ScreenSpaceRayTracing::DenoiserCB must stay four whole 16-byte constant buffer rows; "
+        "the DenoiserCB declarations in ssrt_temporal.hlsl (all four rows), ssrt_spatial.hlsl "
+        "(two) and ssrt_variance.hlsl (one) mirror these offsets and must move with it.");
 
     eastl::unique_ptr<ConstantBuffer> ssrtCB;
     eastl::unique_ptr<ConstantBuffer> denoiserCB;
@@ -635,7 +726,12 @@ struct ScreenSpaceRayTracing : Feature
     /// @brief Builds the denoiser constant buffer from the current settings. Shared by
     /// DrawSSRTSpecular and DrawSSRTDiffuse so the two cannot drift apart as fields are
     /// added; `atrousIterations` is overwritten per a-trous iteration by both callers.
-    DenoiserCB GetDenoiserCBData() const;
+    ///
+    /// @param a_isDiffuseChain Only the diffuse chain may write the history debug view. The two
+    /// chains share one shader permutation and one debug surface, and specular runs second, so
+    /// letting both write it would leave the picture showing whichever pass ran last. Passed
+    /// explicitly at both call sites rather than defaulted, so a third caller has to decide.
+    DenoiserCB GetDenoiserCBData(bool a_isDiffuseChain) const;
 
     eastl::unique_ptr<Texture2D> texDepth = nullptr;
     eastl::unique_ptr<Texture2D> texColor = nullptr;
@@ -665,6 +761,15 @@ struct ScreenSpaceRayTracing : Feature
     /// pyramid once per frame by CopyHistoryGeometry. Read by ssrt_temporal.hlsl at t7 as
     /// the observed side of its depth disocclusion test.
     eastl::unique_ptr<Texture2D> texHistoryDepth = nullptr;
+    /// @brief (diagnostic H) Per-pixel picture of what the temporal pass's history acceptance
+    /// test decided, written by ssrt_temporal.hlsl at u2 when Settings::HistoryDebugView is on
+    /// and inspected under Buffer Viewer. See that setting for the colour key.
+    ///
+    /// R8G8B8A8_UNORM: the payload is three display colours plus an ignored alpha, so a byte
+    /// per channel is exactly enough and a UNORM read cannot be non-finite. One quarter the
+    /// footprint of the RGBA16F surfaces around it, and the Buffer Viewer draws with blending
+    /// disabled so the alpha channel does not need to carry anything meaningful.
+    eastl::unique_ptr<Texture2D> texDebugHistory = nullptr;
     eastl::unique_ptr<Texture2D> texVariance = nullptr;
     /// @brief Specular hit distance; consumed by Upscaling.cpp as the DLSS-RR guide.
     /// Was a raw `Texture2D*` from a bare `new` and leaked (audit #20).

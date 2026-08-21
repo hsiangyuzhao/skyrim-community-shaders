@@ -52,6 +52,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     HistoryClampSigma,
     FreezeNoisePhase,
     DisableHistoryDepthTest,
+    DisableHistoryNormalTest,
+    ForceAcceptHistory,
+    RotatedNormalGate,
+    HistoryDebugView,
     EnableSharc
 )
 #else
@@ -90,7 +94,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     SpecularDenoiseRoughnessCutoff,
     HistoryClampSigma,
     FreezeNoisePhase,
-    DisableHistoryDepthTest
+    DisableHistoryDepthTest,
+    DisableHistoryNormalTest,
+    ForceAcceptHistory,
+    RotatedNormalGate,
+    HistoryDebugView
 )
 #endif
 
@@ -427,6 +435,72 @@ void ScreenSpaceRayTracing::DrawSettings()
             "working, turning it off should now change very little: that is the check that the "
             "plane criterion is accepting history instead of rejecting all of it.");
 
+    ImGui::Checkbox("Disable History Normal Test", &settings.DisableHistoryNormalTest);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Diagnostic. Not for normal play. Requires Enable SVGF.\n\n"
+            "Switches off the other geometric check the temporal pass applies to a history "
+            "candidate: that the surface facing this way last frame is still facing roughly "
+            "the same way now, within 30 degrees. Everything else stays on.\n\n"
+            "This is the partner of the switch above. Both checks produce the same complaint "
+            "when they go wrong -- the picture stays noisy and nothing accumulates -- so the "
+            "only way to tell them apart is to turn them off one at a time. Use History Debug "
+            "View to see which one to reach for first.");
+
+    ImGui::Checkbox("Force Accept History", &settings.ForceAcceptHistory);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Diagnostic. Not for normal play. Requires Enable SVGF.\n\n"
+            "Takes whatever the motion vector points at, with no geometric checking at all. "
+            "Only three things can still turn a candidate away: it is off screen, it contains "
+            "a corrupt number, or it has nothing accumulated in it yet.\n\n"
+            "This is the last-resort test. The two switches above can each show that one check "
+            "is the thing blocking accumulation, but neither can show that the checks are the "
+            "*only* thing blocking it. If the picture still refuses to settle down with this "
+            "on, the problem is somewhere else entirely and the checks were never the "
+            "culprit.\n\n"
+            "Expect heavy smearing while it is on -- that is the point. Nothing is stopping the "
+            "filter from dragging lighting off a wall onto whatever walks in front of it.");
+
+    ImGui::Checkbox("Rotated Normal Gate", &settings.RotatedNormalGate);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Diagnostic. Requires Enable SVGF.\n\n"
+            "Changes which version of the 30 degree facing check runs.\n\n"
+            "Off (the default) is the version that has been shipping for months. It compares "
+            "surface directions without correcting for the camera having turned between the two "
+            "frames, so it is slightly too strict during fast turns and fine the rest of the "
+            "time. Well understood, mild when it misbehaves.\n\n"
+            "On is the mathematically correct version, which corrects for that camera turn. It "
+            "should be strictly better -- but only if an assumption about the game's own camera "
+            "matrices holds, and that cannot be checked outside the game. If the assumption is "
+            "wrong, this version throws away the entire screen and the denoiser stops working "
+            "altogether.\n\n"
+            "So it is off by default and this switch is how it gets proven. Turn it on: if the "
+            "picture keeps accumulating just as well, the correct version is safe to adopt. If "
+            "accumulation collapses, the assumption is wrong and off is the right default.");
+
+    ImGui::Checkbox("History Debug View", &settings.HistoryDebugView);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Diagnostic. Requires Enable SVGF and Enable Diffuse.\n\n"
+            "Paints a picture of what the denoiser decided about every pixel's history this "
+            "frame, into texDebugHistory under Buffer Viewer below. It costs nothing while it "
+            "is off and it does not change what you see on screen either way.\n\n"
+            "Reading it:\n"
+            "  Grey, getting brighter over a second or two -- working. Brightness is how many "
+            "frames have been averaged together; white means fully settled.\n"
+            "  Red -- history thrown away by the depth/plane check.\n"
+            "  Green -- history thrown away by the 30 degree facing check.\n"
+            "  Blue -- history thrown away for being off screen, corrupt, or empty.\n"
+            "  Black -- sky, or nothing to shade.\n\n"
+            "A few coloured pixels along edges and around moving things is normal and correct. "
+            "One flat colour covering the whole screen is the fault: it means that one check is "
+            "rejecting everything, everywhere, which leaves the denoiser doing nothing at all. "
+            "The colour tells you which switch above to reach for.\n\n"
+            "Shows the diffuse pass only. Specular shares the same buffer and deliberately "
+            "leaves it alone.");
+
 	if (ImGui::TreeNode("Buffer Viewer")) {
 		static float debugRescale = .3f;
 		ImGui::SliderFloat("View Resize", &debugRescale, 0.f, 1.f);
@@ -445,6 +519,7 @@ void ScreenSpaceRayTracing::DrawSettings()
         BUFFER_VIEWER_NODE(texHistoryMomentsDiffuse, debugRescale)
         BUFFER_VIEWER_NODE(texVariance, debugRescale)
         BUFFER_VIEWER_NODE(texHistoryDepth, debugRescale)
+        BUFFER_VIEWER_NODE(texDebugHistory, debugRescale)
 
 		ImGui::TreePop();
 	}
@@ -610,6 +685,20 @@ void ScreenSpaceRayTracing::SetupResources()
         texSSRTDiffuseConfidenceSmooth = eastl::make_unique<Texture2D>(texDesc);
         texSSRTDiffuseConfidenceSmooth->CreateSRV(srvDesc);
         texSSRTDiffuseConfidenceSmooth->CreateUAV(uavDesc);
+
+        // (diagnostic H) The history-acceptance picture. R8G8B8A8_UNORM: the payload is three
+        // display colours plus an alpha the Buffer Viewer ignores (it draws with blending
+        // disabled), so a byte per channel is exactly enough and, being UNORM, no read of it
+        // can be non-finite. A quarter the footprint of the RGBA16F surfaces above.
+        //
+        // Allocated at the same extent as every other surface here and addressed by pixel, so
+        // the dispatch writes the dynamic-resolution sub-rect and the rest stays at whatever
+        // ClearDenoiserHistory last left it -- which is why that clear covers this texture too
+        // rather than leaving a border of stale colour to be misread.
+        texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texDebugHistory = eastl::make_unique<Texture2D>(texDesc);
+        texDebugHistory->CreateSRV(srvDesc);
+        texDebugHistory->CreateUAV(uavDesc);
 
         texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
 
@@ -879,6 +968,14 @@ void ScreenSpaceRayTracing::ClearDenoiserHistory()
         context->ClearUnorderedAccessViewFloat(texHistoryDepth->uav.get(), farPlane);
     }
 
+    // (diagnostic H) Not history, but it shares the problem: the temporal dispatch only writes
+    // the dynamic-resolution sub-rect, so at any scale below 1.0 the border of this texture
+    // holds whatever was last written at a larger extent. Black is the same value the sky and
+    // far plane write, so a cleared border reads as "no history question here" rather than as a
+    // rejection colour that never updates.
+    if (texDebugHistory)
+        context->ClearUnorderedAccessViewFloat(texDebugHistory->uav.get(), zero);
+
     // texHistoryNormals is deliberately not in the list: CopyHistoryGeometry overwrites it
     // in full every frame from the live G-buffer, so it is never stale, and its
     // R10G10B10A2_UNORM storage cannot represent a NaN in the first place.
@@ -1132,8 +1229,11 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // (audit P6) Specular raymarch UAV slots: u0 radiance/confidence,
 	// u1 hit distance (was u2; u1 came free when texHitPDF was dropped). The SVGF
 	// temporal pass below reuses u0/u1 for its own two outputs.
+    // (diagnostic H) Three slots now, because ssrt_temporal.hlsl declares texDebugHistory at
+    // u2. The specular chain never writes it -- it passes historyDebugView 0 -- but the slot is
+    // bound anyway so that the declared UAV is never left dangling from another pass.
     std::array<ID3D11ShaderResourceView*, 12> srvs = { nullptr };
-	std::array<ID3D11UnorderedAccessView*, 2> uavs = { nullptr };
+	std::array<ID3D11UnorderedAccessView*, 3> uavs = { nullptr };
 
     auto resetViews = [&]() {
 		srvs.fill(nullptr);
@@ -1233,7 +1333,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     bool historyFed = false;
 
     if (settings.EnableSVGF) {
-        DenoiserCB denoiserCBData = GetDenoiserCBData();
+        DenoiserCB denoiserCBData = GetDenoiserCBData(false);
         denoiserCB->Update(denoiserCBData);
         auto denoiserBuffer = denoiserCB->CB();
         context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
@@ -1241,6 +1341,10 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         // temporal filter
         uavs.at(0) = texTemporal->uav.get();
         uavs.at(1) = texMoments->uav.get();
+        // (diagnostic H) Bound but never written by this chain: GetDenoiserCBData is called
+        // with the specular flag below, which forces historyDebugView to 0. The picture belongs
+        // to the diffuse pass, and specular running afterwards must not overwrite it.
+        uavs.at(2) = texDebugHistory->uav.get();
         srvs.at(0) = texHistory->srv.get();
         srvs.at(1) = motion.SRV;
         srvs.at(2) = normal.SRV;
@@ -1251,7 +1355,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         srvs.at(7) = texHistoryDepth->srv.get();  // (defect D3)
 
         context->CSSetShaderResources(0, 8, srvs.data());
-        context->CSSetUnorderedAccessViews(0, 2, uavs.data(), nullptr);
+        context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
         context->CSSetShader(temporalCS.get(), nullptr, 0);
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
@@ -1511,13 +1615,15 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     bool historyFed = false;
 
     if (settings.EnableSVGF) {
-        DenoiserCB denoiserCBData = GetDenoiserCBData();
+        DenoiserCB denoiserCBData = GetDenoiserCBData(true);
         denoiserCB->Update(denoiserCBData);
         auto denoiserBuffer = denoiserCB->CB();
         context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
         // temporal filter
         uavs.at(0) = texTemporal->uav.get();
         uavs.at(1) = texMoments->uav.get();
+        // (diagnostic H) The one dispatch that writes the picture; see GetDenoiserCBData.
+        uavs.at(2) = texDebugHistory->uav.get();
         srvs.at(0) = texHistoryDiffuse->srv.get();
         srvs.at(1) = motion.SRV;
         srvs.at(2) = normal.SRV;
@@ -1528,7 +1634,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         srvs.at(7) = texHistoryDepth->srv.get();  // (defect D3)
 
         context->CSSetShaderResources(0, 8, srvs.data());
-        context->CSSetUnorderedAccessViews(0, 2, uavs.data(), nullptr);
+        context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
         context->CSSetShader(temporalCS.get(), nullptr, 0);
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
@@ -1625,7 +1731,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     context->CSSetShader(nullptr, nullptr, 0);
 }
 
-ScreenSpaceRayTracing::DenoiserCB ScreenSpaceRayTracing::GetDenoiserCBData() const
+ScreenSpaceRayTracing::DenoiserCB ScreenSpaceRayTracing::GetDenoiserCBData(bool a_isDiffuseChain) const
 {
     DenoiserCB data;
     data.invMaxAccumulatedFrames = 1.0f / (settings.MaxAccumulatedFrames + 1.0f);
@@ -1651,7 +1757,19 @@ ScreenSpaceRayTracing::DenoiserCB ScreenSpaceRayTracing::GetDenoiserCBData() con
     // (diagnostic D3) Shared by both chains for the same reason historyClampSigma is: one
     // permutation, one buffer, and isolating the mechanism means isolating it everywhere.
     data.disableHistoryDepthTest = settings.DisableHistoryDepthTest ? 1u : 0u;
-    data.pad1 = 0.0f;
+    // (diagnostic H) The remaining three gate switches are shared by both chains for the same
+    // reason the two above are: one permutation, one buffer, and isolating a mechanism means
+    // isolating it everywhere. Anything else would leave the specular chain accumulating under
+    // a different predicate than the one being measured.
+    data.disableHistoryNormalTest = settings.DisableHistoryNormalTest ? 1u : 0u;
+    data.forceAcceptHistory = settings.ForceAcceptHistory ? 1u : 0u;
+    data.rotatedNormalGate = settings.RotatedNormalGate ? 1u : 0u;
+    // (diagnostic H) The one field that is *not* shared. Both chains run the same shader and
+    // both have texDebugHistory bound, so without this the specular pass -- which runs after
+    // diffuse -- would overwrite the diffuse picture with its own every frame, and the view
+    // would silently show whichever chain happened to be enabled last.
+    data.historyDebugView = (a_isDiffuseChain && settings.HistoryDebugView) ? 1u : 0u;
+    data.pad3 = 0.0f;
     return data;
 }
 
