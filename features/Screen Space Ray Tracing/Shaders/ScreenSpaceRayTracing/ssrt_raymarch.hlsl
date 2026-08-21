@@ -53,6 +53,7 @@ Texture2D<float3> AlbedoTexture : register(t12);
 //   u1     SSRT_SPECULAR     specular hit distance -> texHitDistance, consumed by
 //                            Upscaling.cpp as the DLSS-RR specular guide
 //   u1..u4 SHARC_*           hash entries / copy offsets / voxel data / voxel prev
+//   u5     diffuse           raw hit confidence -> texSSRTDiffuseConfidence
 // SSRT_SPECULAR and the SHARC permutations are mutually exclusive (SHARC only exists on
 // the diffuse path), so both may claim u1.
 // The former u1, SSRPDFOutput -> texHitPDF, had no consumer anywhere in the pipeline
@@ -63,6 +64,25 @@ RWTexture2D<float4> SSRColorOutput : register(u0);
 
 #if defined(SSRT_SPECULAR)
 RWTexture2D<float> SSRTHitDistanceOutput : register(u1);
+#endif
+
+// (ambient reinjection) A second, deliberately denoiser-independent home for the diffuse hit
+// confidence.
+//
+// .w of SSRColorOutput carries the same number, but only until the SVGF chain runs: with
+// EnableSVGF on, ssrt_temporal.hlsl overwrites .w with the luminance variance and the
+// variance / a-trous passes keep it there, because that is the channel the edge-stopping
+// function is steered by. The composite-side ambient reinjection needs the confidence *after*
+// the denoiser has run, so it cannot read .w and cannot be threaded through four ping-ponging
+// passes without colliding with the quantity they exist to compute.
+//
+// A dedicated R8_UNORM surface costs one byte per render texel (~8 MB of a 4K allocation
+// against ~33 MB for each of the eight full-screen RGBA16F surfaces this feature already
+// holds) and its 1/255 quantisation is an order of magnitude below the residual noise of the
+// spatial smoothing this value gets in ssrt_diffuse_composite.hlsl. Being UNORM also means a
+// read is a [0,1] value by construction, so no consumer needs its own finiteness test.
+#if !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+RWTexture2D<float> SSRTConfidenceOutput : register(u5);
 #endif
 
 #if SHARC_UPDATE || SHARC_RENDER
@@ -930,6 +950,44 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             confidence = 1;
         }
 #endif
+
+#if !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+        // (ambient reinjection) Turn this sample into a matched (radiance, coverage) pair, so
+        // that the composite can spend the *rest* of the hemisphere on the vanilla ambient
+        // without counting any direction twice.
+        //
+        // Two things change, and only in this mode:
+        //
+        //  * The radiance is weighted by the confidence that produced it. Without reinjection
+        //    the estimator is deliberately indicator-weighted -- any hit that clears the
+        //    validation threshold contributes its *full* radiance while reporting only its
+        //    partial confidence -- which is harmless when the miss fraction is filled by the
+        //    cubemap fallback (that path does its own `lerp(envColor, sampleColor, confidence)`
+        //    and then reports confidence 1). Here .w is the weight the composite subtracts
+        //    ambient with, so radiance and weight have to be the same weight or a soft hit
+        //    adds more light than the ambient it displaces.
+        //
+        //  * A back-face hit counts towards the coverage. SSRT_ValidateHit returns confidence 0
+        //    for a ray that hit geometry from behind but reports `occlusion = 1 - confidence`,
+        //    i.e. it is the one rejection path that carries positive evidence: the ray did run
+        //    into something, we simply have no screen-space radiance for its far side. Folding
+        //    that evidence back in as coverage with zero radiance is what keeps the contact and
+        //    corner darkening the cubemap fallback used to supply through `MultiBounceAO(albedo,
+        //    ao)` -- without it a blocked direction would fall back to *full* ambient, which is
+        //    the exact opposite of what the geometry says. OcclusionStrength keeps its meaning:
+        //    it is the fraction of that evidence that is allowed to darken the pixel, matching
+        //    the `ao = lerp(1.0, occlusion, OcclusionStrength)` the fallback path applies.
+        //
+        // SSGI's ambient occlusion is deliberately *not* folded in here even though the fallback
+        // path multiplies it in: DeferredCompositeCS already shapes the re-added ambient with
+        // Color::MultiBounceAO of the same SSGI AO, so doing it here as well would apply it
+        // twice.
+        [branch] if (SharedData::ssrtSettings.AmbientReinjection != 0) {
+            sampleColor *= confidence;
+            confidence = saturate(confidence + (1.0 - occlusion) * OcclusionStrength);
+        }
+#endif
+
 #if SSRT_USE_SAMPLE_LDS
         samples[SSRT_SAMPLE_SLOT][sample_id] = float4(sampleColor, confidence);
 #else
@@ -998,6 +1056,13 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // whole sum non-finite, so the useful place to cut is the resolved value.
         outColor = SSRT_SanitiseRadianceOutput(outColor);
         SSRColorOutput[coords.xy] = outColor;
+        // (ambient reinjection) The same value SSRColorOutput.w carries, on a surface the
+        // denoiser does not touch. Written unconditionally -- including the plain 0 a
+        // far-plane or out-of-bounds lane resolves to, so the surface stays deterministic
+        // for every texel the dispatch covers and a sky pixel keeps its full vanilla
+        // ambient. Already saturated above and sanitised by G2, so the UNORM store cannot
+        // see a NaN.
+        SSRTConfidenceOutput[coords.xy] = outColor.w;
     }
 #endif
 }

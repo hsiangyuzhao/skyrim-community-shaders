@@ -453,6 +453,13 @@ void Deferred::DeferredPasses()
 			(ssrt.loaded && ssrt.settings.EnableSpecular) ? ssrt.texSSRColor->srv.get() : nullptr,
 			physSky.loaded ? physSky.texApLut->srv.get() : nullptr,
 			physSky.loaded ? physSky.texApShadow->srv.get() : nullptr,
+			// t19 (ambient reinjection) Smoothed SSRT diffuse hit confidence. Written by
+			// ssrt_diffuse_composite.hlsl inside DrawSSRTDiffuse above, i.e. earlier in this
+			// same frame. Bound only when that pass ran; the shader side is additionally gated
+			// on ssrtSettings.DiffuseMult > 0 and AmbientReinjection != 0, both of which
+			// GetCommonBufferData clears when EnableDiffuse is off, so a null binding here can
+			// never be read.
+			(ssrt.loaded && ssrt.settings.EnableDiffuse) ? ssrt.texSSRTDiffuseConfidenceSmooth->srv.get() : nullptr,
 		};
 
 		ID3D11SamplerState* samplers[]{
@@ -474,7 +481,7 @@ void Deferred::DeferredPasses()
 
 	// Clear
 	{
-		ID3D11ShaderResourceView* views[19]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+		ID3D11ShaderResourceView* views[20]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
 		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
 
 		ID3D11UnorderedAccessView* uavs[3]{ nullptr, nullptr, nullptr };

@@ -89,6 +89,12 @@ void SampleSSGISpecular(uint2 pixCoord, sh2 lobe, out float ao, out float3 il, i
 
 #if defined(SSRT)
 Texture2D<float4> SSRTexture : register(t16);
+// (ambient reinjection) Spatially smoothed SSRT diffuse hit confidence, written by
+// ssrt_diffuse_composite.hlsl earlier in the same frame (Deferred::DeferredPasses calls
+// DrawSSRTDiffuse before this dispatch). R8_UNORM, so a read is a [0,1] value by
+// construction and needs no finiteness test of its own; the write side is covered by the
+// G2 sanitisation the ray march already applies to the channel it comes from.
+Texture2D<float> SSRTConfidenceTexture : register(t19);
 #endif
 
 // The ambient separation further down has two consumers, and only one of them is SSGI:
@@ -258,22 +264,51 @@ Texture2D<float4> SSRTexture : register(t16);
 	directionalAmbientColor = Color::YCoCgToRGB(directionalAmbientColor);
 	directionalAmbientColor = max(0, directionalAmbientColor);
 
-	// Fraction of the reconstructed ambient that survives into the frame. Always 1 today, and
-	// a compile-time constant that folds the multiply below away; the SSRT ambient reinjection
-	// is what will drive it.
-	const float ambientKeep = 1.0;
+	// Fraction of the reconstructed ambient that survives into the frame. 1 everywhere the
+	// SSRT ambient reinjection is not running, which is a compile-time constant without SSRT
+	// and folds the multiply below away.
+	float ambientKeep = 1.0;
 
 #	if defined(SSRT)
-	// SSRT diffuse drives the forward directional ambient to zero through AmbientMult, so Masks.z
-	// arrives at ~0 and there is nothing left to separate. Overwriting Y with 0 does NOT make the
-	// term zero, though: YCoCgToRGB(0, Co, Cg) is (Co - Cg, Cg, -Co - Cg), a pure chroma vector
-	// built from A_est's chroma, and max(0, ...) keeps whichever channels came out positive. The
-	// subtraction below then takes that residue out of MAIN, which desaturates the SSRT path for
-	// no reason. Skip the separation instead. Read from the cbuffer at runtime (DiffuseMult is
-	// already gated on EnableDiffuse in ScreenSpaceRayTracing::GetCommonBufferData) so toggling
-	// SSRT needs no composite recompile.
-	[branch] if (SharedData::ssrtSettings.DiffuseMult > 0.0)
-		directionalAmbientColor = 0;
+	// Two mutually exclusive energy models, selected at runtime so toggling either one needs
+	// no composite recompile (DiffuseMult is already gated on EnableDiffuse in
+	// ScreenSpaceRayTracing::GetCommonBufferData).
+	//
+	// Legacy (AmbientReinjection == 0, and what every configuration did before this change):
+	// SSRT diffuse drives the forward directional ambient to zero through AmbientMult, so
+	// Masks.z arrives at ~0 and there is nothing left to separate. Overwriting Y with 0 does
+	// NOT make the term zero, though: YCoCgToRGB(0, Co, Cg) is (Co - Cg, Cg, -Co - Cg), a pure
+	// chroma vector built from A_est's chroma, and max(0, ...) keeps whichever channels came
+	// out positive. The subtraction below would then take that residue out of MAIN, which
+	// desaturates the SSRT path for no reason. Skip the separation instead.
+	//
+	// Reinjection (AmbientReinjection != 0): the forward ambient is *not* zeroed
+	// (GetCommonBufferData pins AmbientMult to 1), so Masks.z carries a real luminance and the
+	// reconstruction above is the honest vanilla+IBL ambient this pixel already received. The
+	// SSRT diffuse composite has likewise already added its own conf-weighted radiance to MAIN.
+	// Removing conf * A is what turns the two of them into one term instead of two:
+	//
+	//     MAIN = direct + A + sum_i conf_i * L_i / N        (before this pass)
+	//     out  = direct + (1 - conf) * A + conf * Lbar      with conf = sum_i conf_i / N
+	//                                                       and Lbar the conf-weighted mean
+	//          = direct + lerp(A, Lbar, conf)
+	//
+	// i.e. exactly the ambient in the directions the rays could not resolve, plus exactly the
+	// traced radiance in the directions they could. No direction is counted twice and none is
+	// dropped. The ray march is what makes the pairing exact: in this mode it weights its
+	// radiance by the same confidence it reports (ssrt_raymarch.hlsl), rather than emitting
+	// full radiance for any hit that merely passed the validation threshold.
+	//
+	// AmbientReinjectionStrength scales only the removal, so 0 is a deliberately additive
+	// GI mode and 1 is the energy-conserving one.
+	[branch] if (SharedData::ssrtSettings.DiffuseMult > 0.0) {
+		[branch] if (SharedData::ssrtSettings.AmbientReinjection != 0) {
+			float ssrtConfidence = SSRTConfidenceTexture[dispatchID.xy];
+			ambientKeep = saturate(1.0 - ssrtConfidence * SharedData::ssrtSettings.AmbientReinjectionStrength);
+		} else {
+			directionalAmbientColor = 0;
+		}
+	}
 #	endif
 
 	float maxScale = 1.0;

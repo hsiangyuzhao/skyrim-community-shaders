@@ -336,12 +336,22 @@ namespace SharedData
 		float silverLiningSpread;  //
 	};
 
+	// Mirrors ScreenSpaceRayTracing::SharedData. This struct sits inside FeatureData with
+	// ExponentialHeightFogSettings behind it, so its size is load bearing: two whole float4
+	// rows on both sides, with the tail of row 1 declared as explicit padding rather than
+	// left out, or everything after it shifts.
 	struct SSRTSettings
     {
         uint EnableSpecular;
         float SpecularMult;
         float DiffuseMult;
 		float AmbientMult;
+		// --- row 1 ---
+		/// Non-zero switches the diffuse energy model from "SSRT replaces the forward ambient
+		/// wholesale" to "SSRT displaces it in proportion to hit confidence".
+		uint AmbientReinjection;
+		float AmbientReinjectionStrength;
+		float2 ssrtPad0;
     };
 
 	struct ExponentialHeightFogSettings
