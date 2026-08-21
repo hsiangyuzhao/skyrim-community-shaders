@@ -625,16 +625,18 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
     // the identical 0.5*sigma^2 + 0.25*mean^2 error, so removing the factor here fixes
     // that path too -- there is nothing to compensate for on either side.
     //
-    // (guard G5) The pair is stored in MomentsOutput, an R11G11B10_FLOAT target: R and G
-    // carry a 5-bit exponent and a 6-bit mantissa, so the largest representable value is
-    // 65024 and *anything above it is written back as +Inf, permanently*. The second moment
-    // is a square, so the overflow point in luminance is sqrt(65024) = 255.0 -- reachable
+    // (guard G5) The pair is stored in MomentsOutput, whose largest finite value is 65504:
+    // *anything above it is written back as +Inf, permanently*. (defect D5 moved the target
+    // from R11G11B10_FLOAT to R16G16B16A16_FLOAT, which changes the mantissa but not the
+    // 5-bit exponent, so the ceiling moves only from 65024 to 65504 and this guard is
+    // unaffected -- see the derivation at the allocation site.) The second moment is a
+    // square, so the overflow point in luminance is sqrt(65504) = 255.9 -- reachable
     // by a single bright specular sample, no NaN or corruption required. Once .y is Inf the
     // variance is Inf - x^2 = Inf, the a-trous luminance edge-stop divides by sqrt(Inf),
     // every neighbour weight becomes 0 or NaN, and the moments EMA can never recover
     // because lerp(Inf, finite, alpha) stays Inf for every alpha < 1.
     //
-    // 250 leaves 2% of headroom below the overflow point (250^2 = 62500 < 65024) and is
+    // 250 leaves 4% of headroom below the overflow point (250^2 = 62500 < 65504) and is
     // ~30x above the top of the radiance the firefly clamp lets through, so it can only
     // engage on values that were already outside the representable range of their own
     // storage. Both moments use the clamped luminance so the pair stays a consistent

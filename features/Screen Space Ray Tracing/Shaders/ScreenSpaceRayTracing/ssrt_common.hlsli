@@ -336,8 +336,8 @@ bool isFiniteSafe(float4 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && i
 // Purpose is overflow containment, not tone mapping: filterNaN / filterInf only catch
 // values that have *already* become non-finite, and the two places that can manufacture a
 // fresh Inf out of finite inputs are (a) squaring for the luminance second moment (see
-// SSRT_MOMENT_LUMINANCE_MAX in ssrt_temporal.hlsl) and (b) the R11G11B10 moments target,
-// whose largest representable value is ~65024. A radiance of 128 squares to 16384, an
+// SSRT_MOMENT_LUMINANCE_MAX in ssrt_temporal.hlsl) and (b) the half-float moments target,
+// whose largest representable value is 65504. A radiance of 128 squares to 16384, an
 // order of magnitude of headroom under that, and the temporal EMA can only ever move
 // *towards* the sample it is handed, so bounding the input bounds the whole chain.
 //

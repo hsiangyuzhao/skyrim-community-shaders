@@ -478,8 +478,56 @@ void ScreenSpaceRayTracing::SetupResources()
         texVariance->CreateSRV(srvDesc);
         texVariance->CreateUAV(uavDesc);
 
-        texDesc.Format = srvDesc.Format = uavDesc.Format =  DXGI_FORMAT_R11G11B10_FLOAT;
-
+        // (defect D5) The moment pair stays at R16G16B16A16_FLOAT -- i.e. it keeps the format
+        // set above rather than dropping to R11G11B10_FLOAT as it used to.
+        //
+        // This is the storage the whole variance channel is built on, and 11-bit floats cannot
+        // carry it. R11 and G11 have a 6-bit mantissa, so round-to-nearest costs up to
+        // 2^-7 = 0.78% of the value; B10 has a 5-bit one. Three separate failures follow, and
+        // together they are what made MaxAccumulatedFrames inert:
+        //
+        //   * Cancellation. ssrt_temporal.hlsl publishes variance = mu2 - mu1^2, and for a
+        //     pixel whose per-frame relative sigma is s those two operands differ by only
+        //     s^2 / (1 + s^2) of their own magnitude. Quantising mu1 alone already costs
+        //     2 * 0.78% = 1.56% of mean^2 in mu1^2, which *exceeds the entire variance* below
+        //     s = 0.125 and is still 69% of it at s = 0.15. That is not an exotic corner: with
+        //     ambient reinjection off and the cubemap fallback carrying the ray misses, much of
+        //     the screen is a largely deterministic signal with exactly that little per-frame
+        //     spread. The published variance there is quantisation error, not variance -- and
+        //     because the mean is spatially smooth, neighbouring texels round the same way, so
+        //     the error is *region shaped* rather than per-pixel. The a-trous luminance
+        //     edge-stop it steers therefore flips whole patches of the image between "blur" and
+        //     "copy", and the patch boundaries move as the accumulated mean drifts by one
+        //     quantum. That is the low-frequency temporal flicker the denoiser was reported to
+        //     *add* rather than remove.
+        //
+        //   * An EMA dead zone that gets *worse* with a longer window, which is the direct
+        //     mechanism behind "MaxAccumulatedFrames changes nothing". The moment update is
+        //     lerp(prev, cur, alpha) with alpha = 1 / (MaxAccumulatedFrames + 1), so the step
+        //     it asks the storage to take is alpha * |cur - prev|. At s = 0.15 the second
+        //     moment's own frame-to-frame spread is |cur - prev| ~ 2s * mean^2 = 0.3 * mean^2,
+        //     so the step is 0.018 * mean^2 at alpha = 1/17 -- above the 0.0078 * mean^2
+        //     rounding threshold -- and 0.0046 * mean^2 at alpha = 1/65, *below* it. Past
+        //     roughly MaxAccumulatedFrames 32 the write simply rounds back to the value already
+        //     there and the estimate freezes. Raising the slider did not lengthen the
+        //     accumulation; it stopped the moments updating at all.
+        //
+        //   * The frame counter in .z. A 5-bit mantissa represents every integer up to 64 and
+        //     no odd one above it, so accumFrames + 1 rounds back to 64 forever -- the count
+        //     latched at exactly the top of the slider's own range.
+        //
+        // R16G16B16A16_FLOAT costs 8 bytes per texel instead of 4 (three full-screen surfaces,
+        // so ~+24 MB at 1080p and ~+100 MB at a 4K allocation, against the seven RGBA16F
+        // surfaces this feature already holds) and buys a 10-bit mantissa, i.e. a 16x smaller
+        // rounding step: the mu1^2 cancellation error falls to 4.4% of the variance at
+        // s = 0.15 (and only reaches 100% below s = 0.031), the alpha = 1/65 update clears the
+        // rounding threshold by 9x, denormals resolve to 6e-8 instead of 9.5e-7, and the frame
+        // count is exact past 2000. The exponent range is identical -- both formats carry 5
+        // exponent bits -- so nothing about the representable magnitude changes.
+        //
+        // SSRT_MOMENT_LUMINANCE_MAX in ssrt_temporal.hlsl needs no change: fp16's largest
+        // finite value is 65504, so the 250 ceiling (250^2 = 62500) still keeps the second
+        // moment representable, and it was already derived against a very similar bound.
         texMoments = eastl::make_unique<Texture2D>(texDesc);
         texMoments->CreateSRV(srvDesc);
         texMoments->CreateUAV(uavDesc);
