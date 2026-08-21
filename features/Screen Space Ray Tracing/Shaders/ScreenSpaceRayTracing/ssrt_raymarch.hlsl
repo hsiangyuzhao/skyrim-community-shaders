@@ -588,6 +588,30 @@ float4 SSRT_SanitiseRadianceOutput(float4 color)
     return color;
 }
 
+// (guard G7) Upper bound on the CubemapNormalization brightness ratio.
+//
+// The ratio is directionalAmbientLuminance / max(envLuminance, 1e-4) and had no ceiling at
+// all. The denominator floor bounds it at 1e4 * numerator, so a directional-ambient
+// luminance in the hundreds is already enough to produce a factor of 1e6, and a non-finite
+// DirectionalAmbient produces Inf outright -- at which point the surrounding
+// `lerp(envColor, envColor * ratio, CubemapNormalization)` is *worse* than a plain
+// multiply, because at the default CubemapNormalization = 0 the lerp evaluates
+// envColor + 0 * (Inf - envColor) = 0 * Inf = NaN. The feature being switched off does not
+// protect it.
+//
+// 16 as the ceiling: the ratio's job is to pull a cubemap captured under one lighting
+// condition towards the current ambient, and the honest dynamic range between two Skyrim
+// weather/interior ambients is well inside 4x. 16 is two doublings past the top of that,
+// so it can only engage when the two luminances are not comparable quantities any more --
+// which is the definition of the failure it exists to contain. Inert for every real
+// ratio, hence bit-identical output on healthy data.
+#define SSRT_CUBEMAP_NORMALIZATION_MAX_RATIO 16.0f
+
+float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
+{
+    return min(ambientLuminance / max(envLuminance, 1e-4), SSRT_CUBEMAP_NORMALIZATION_MAX_RATIO);
+}
+
 [numthreads(8, 8, SAMPLES_PER_PIXEL)] void main(uint3 groupID : SV_GroupID,
                                                 uint3 groupThreadID : SV_GroupThreadID,
                                                 uint3 DTid : SV_DispatchThreadID)
@@ -835,7 +859,21 @@ float4 SSRT_SanitiseRadianceOutput(float4 color)
                 float3 positionMS = positionWS.xyz;
 
                 sh2 skylighting = Skylighting::sample(SharedData::skylightingSettings, SkylightingProbeArray, stbn_vec3_2Dx1D_128x128x64, coords.xy, positionMS.xyz, world_space_reflected_direction);
-                float3 skylightingNormal = normalize(float3(world_space_normal.xy, max(0, world_space_normal.z)));
+                // (guard G6) max(0, z) makes the argument the zero vector whenever the
+                // surface normal points away from +Z *and* has no xy component -- a
+                // downward-facing horizontal surface, i.e. the underside of any overhang,
+                // plus every pixel whose normal G-buffer texel is cleared or garbage.
+                // normalize(0) is 0/0 = NaN in all three components, and this vector feeds
+                // the skylighting cosine lobe, so the NaN reaches envColor, sampleColor and
+                // the SVGF history.
+                //
+                // 1e-6 instead of 0 is below the resolution of the quantity it feeds: for
+                // any nonzero xy the renormalised z becomes 1e-6 (was exactly 0) and the xy
+                // pair is scaled by 1/sqrt(1 + 1e-12), a relative change of 5e-13 that is
+                // four orders of magnitude under the float32 epsilon and therefore rounds
+                // to the identical bit pattern. SphericalHarmonics::EvaluateCosineLobe is
+                // linear in z, so the SH coefficient moves by ~1e-6 of its own scale.
+                float3 skylightingNormal = normalize(float3(world_space_normal.xy, max(1e-6, world_space_normal.z)));
                 float skylightingDiffuse = SphericalHarmonics::FuncProductIntegral(skylighting, SphericalHarmonics::EvaluateCosineLobe(skylightingNormal)) / Math::PI;
                 skylightingDiffuse = saturate(skylightingDiffuse);
 
@@ -851,15 +889,15 @@ float4 SSRT_SanitiseRadianceOutput(float4 color)
                 float3 envSkyColor = envColor;
                 float3 skyColor = max(envSkyColor - envNoSkyColor, 0);
                 envLuminance = Color::RGBToLuminance(EnvTexture.SampleLevel(LinearSampler, world_space_reflected_direction, 15));
-                envColor = lerp(envNoSkyColor, envNoSkyColor * (directionalAmbientLuminance / max(envLuminance, 1e-4)), CubemapNormalization);
+                envColor = lerp(envNoSkyColor, envNoSkyColor * SSRT_CubemapNormalizationRatio(directionalAmbientLuminance, envLuminance), CubemapNormalization);  // (guard G7)
                 envColor += skyColor * skylightingDiffuse;
             } else {
                 envLuminance = Color::RGBToLuminance(EnvReflectionsTexture.SampleLevel(LinearSampler, world_space_reflected_direction, 15));
-                envColor = lerp(envColor, envColor * (directionalAmbientLuminance / max(envLuminance, 1e-4)), CubemapNormalization);
+                envColor = lerp(envColor, envColor * SSRT_CubemapNormalizationRatio(directionalAmbientLuminance, envLuminance), CubemapNormalization);  // (guard G7)
             }
 #   else
             envLuminance = Color::RGBToLuminance(EnvReflectionsTexture.SampleLevel(LinearSampler, world_space_reflected_direction, 15).xyz);
-            envColor = lerp(envColor, envColor * (directionalAmbientLuminance / max(envLuminance, 1e-4)), CubemapNormalization);
+            envColor = lerp(envColor, envColor * SSRT_CubemapNormalizationRatio(directionalAmbientLuminance, envLuminance), CubemapNormalization);  // (guard G7)
 #   endif
             envColor = Color::IrradianceToLinear(envColor);
             float ao = lerp(1.0, occlusion, OcclusionStrength);
