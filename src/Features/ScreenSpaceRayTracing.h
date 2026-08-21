@@ -359,6 +359,24 @@ struct ScreenSpaceRayTracing : Feature
         /// phase and must survive). Not a quality setting -- with the phase frozen the noise
         /// becomes a fixed, screen-space-locked pattern that no denoiser can average away.
         bool FreezeNoisePhase = false;
+        /// @brief (diagnostic D3) Bypass the defect D3 history depth-disocclusion test.
+        ///
+        /// Feeds DenoiserCB::disableHistoryDepthTest, which makes ssrt_temporal.hlsl's
+        /// IsValidHistory skip the "did this history texel hold the depth the current pixel's
+        /// surface point should have had last frame?" comparison. Nothing else changes: the
+        /// screen-bounds tests, the 30 degree normal agreement and the guard G4 finiteness
+        /// rejection all stay in force, so the predicate becomes exactly what it was before
+        /// D3 landed rather than "accept anything".
+        ///
+        /// It exists because D1 (the neighbourhood history clamp) and D3 (this test) both
+        /// present as "the accumulation is not accumulating", and only isolating them one at a
+        /// time distinguishes them in-game. D1's own bypass is HistoryClampSigma = 0, which
+        /// the shader already tests for -- no separate switch is needed for it.
+        ///
+        /// Diagnostic, not a quality setting: with the test off, the accumulation will read
+        /// history across depth discontinuities again, which is the ghost source D3 exists to
+        /// remove.
+        bool DisableHistoryDepthTest = false;
 #ifdef ENABLE_SHARC
         bool EnableSharc = false;
 #endif
@@ -436,7 +454,12 @@ struct ScreenSpaceRayTracing : Feature
         /// now declares all three rows of this buffer instead of two. Took the first of the
         /// three pad slots row 2 had spare, so the buffer did not grow.
         float historyClampSigma;
-        float pad1[2];
+        /// @brief (diagnostic D3) Non-zero makes ssrt_temporal.hlsl skip the defect D3
+        /// depth-disocclusion test in IsValidHistory. Took the second of row 2's pad slots,
+        /// so the buffer did not grow; ssrt_spatial.hlsl still declares the whole tail as
+        /// `float3 denoiserPad1` and reads none of it.
+        uint disableHistoryDepthTest;
+        float pad1;
     };
 
     eastl::unique_ptr<ConstantBuffer> ssrtCB;

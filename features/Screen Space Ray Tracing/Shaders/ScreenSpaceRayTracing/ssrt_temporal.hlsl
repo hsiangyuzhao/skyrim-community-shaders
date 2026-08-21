@@ -33,7 +33,14 @@ cbuffer DenoiserCB : register(b2)
     // --- row 2 ---
     float specularRoughnessCutoff;
     float historyClampSigma;
-    float2 denoiserPad2;
+    // (diagnostic D3) Non-zero bypasses the defect D3 depth-disocclusion test in
+    // IsValidHistory entirely, restoring the pre-D3 predicate (bounds + normal agreement +
+    // the G4 finiteness rejection, which is *not* part of the bypass). Group-uniform, so the
+    // branch it guards costs nothing. Exists so the depth test can be isolated in-game
+    // against the D1 history clamp -- which HistoryClampSigma 0 already switches off -- with
+    // one variable moving at a time.
+    uint disableHistoryDepthTest;
+    float denoiserPad2;
 };
 
 // (spec S1) Firefly clamp on the radiance entering the temporal accumulation.
@@ -387,18 +394,25 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS, float expectedP
     // the bottom of main() -- the alpha = 1 path -- instead of on a second, parallel
     // rejection mechanism. It also means the 4-tap and 8-tap searches can no longer pull
     // history across a depth layer, which is the widening path guard G4 documents.
-    if (expectedPrevLinearDepth <= 0.0f)
-        return false;
+    // (diagnostic D3) Group-uniform bypass of the whole depth test, and only of the depth
+    // test: the bounds tests above and the normal agreement plus G4 finiteness rejection below
+    // stay in force, so this reproduces the pre-D3 predicate exactly rather than accepting
+    // anything at all.
+    if (disableHistoryDepthTest == 0)
+    {
+        if (expectedPrevLinearDepth <= 0.0f)
+            return false;
 
-    const float prevLinearDepth = SharedData::GetScreenDepth(HistoryDepthTexture[pixel]);
-    // A cleared history depth is the far plane (see ClearDenoiserHistory), which either
-    // linearises to a value nothing on screen can match or, at the exact far plane, to a
-    // non-finite one. Both must reject, hence the explicit finiteness test.
-    if (!isFiniteSafe(prevLinearDepth))
-        return false;
+        const float prevLinearDepth = SharedData::GetScreenDepth(HistoryDepthTexture[pixel]);
+        // A cleared history depth is the far plane (see ClearDenoiserHistory), which
+        // linearises to a value nothing on screen can be at; the finiteness test additionally
+        // covers a CameraData that cannot linearise it at all.
+        if (!isFiniteSafe(prevLinearDepth))
+            return false;
 
-    if (abs(prevLinearDepth - expectedPrevLinearDepth) > SSRT_HISTORY_DEPTH_TOLERANCE * expectedPrevLinearDepth)
-        return false;
+        if (abs(prevLinearDepth - expectedPrevLinearDepth) > SSRT_HISTORY_DEPTH_TOLERANCE * expectedPrevLinearDepth)
+            return false;
+    }
 
     float3 prevNormalVS;
     float roughness;

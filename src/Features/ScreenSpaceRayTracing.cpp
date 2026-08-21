@@ -45,6 +45,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     SpecularDenoiseRoughnessCutoff,
     HistoryClampSigma,
     FreezeNoisePhase,
+    DisableHistoryDepthTest,
     EnableSharc
 )
 #else
@@ -79,7 +80,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     FireflyClampSigma,
     SpecularDenoiseRoughnessCutoff,
     HistoryClampSigma,
-    FreezeNoisePhase
+    FreezeNoisePhase,
+    DisableHistoryDepthTest
 )
 #endif
 
@@ -252,7 +254,11 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "order of the local brightness itself, is cut on its first frame. Lower "
                 "shortens trails further but starts pulling the history back towards a "
                 "nine-sample mean and feeding that mean's noise into it, so below about 0.75 "
-                "you are trading convergence for motion. 0 disables the clamp.");
+                "you are trading convergence for motion. 0 disables the clamp.\n\n"
+                "0 is also the diagnostic bypass for this mechanism: the shader tests the "
+                "value itself, so 0 skips the clamp and its neighbourhood prefetch entirely. "
+                "Pair it with Disable History Depth Test under Debug to isolate the two "
+                "temporal mechanisms one at a time.");
 
         ImGui::Checkbox("Adaptive Filtering", &settings.AdaptiveFiltering);
         if (auto _tt = Util::HoverTooltipWrapper())
@@ -307,6 +313,23 @@ void ScreenSpaceRayTracing::DrawSettings()
             "unchanged.\n\n"
             "Leaving this on locks the sampling noise into a fixed screen-space pattern that "
             "no amount of accumulation can average away.");
+
+    ImGui::Checkbox("Disable History Depth Test", &settings.DisableHistoryDepthTest);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Diagnostic. Not for normal play. Requires Enable SVGF.\n\n"
+            "Switches off the depth disocclusion test the temporal pass applies to every "
+            "history candidate -- the check that the history texel really held the depth this "
+            "pixel's surface point should have had last frame. Everything else stays on: "
+            "screen bounds, the 30 degree normal agreement and the non-finite rejection, so "
+            "the accumulation behaves exactly as it did before that test existed.\n\n"
+            "Use it together with History Clamp Sigma 0 (which is the off switch for the "
+            "neighbourhood history clamp) to isolate the two mechanisms one at a time. Both "
+            "produce the same complaint -- \"the denoiser is not denoising, and there is no "
+            "ghosting either\" -- because both end with the pixel taking this frame's sample "
+            "whole, so only turning them off separately says which one is responsible.\n\n"
+            "With this off the accumulation will read history across depth discontinuities "
+            "again, i.e. the ghosting it was added to remove comes back.");
 
 	if (ImGui::TreeNode("Buffer Viewer")) {
 		static float debugRescale = .3f;
@@ -1451,7 +1474,10 @@ ScreenSpaceRayTracing::DenoiserCB ScreenSpaceRayTracing::GetDenoiserCBData() con
     // near-mirror the neighbourhood's spatial sigma is large enough that the clamp is
     // effectively inert without needing to be switched off.
     data.historyClampSigma = settings.HistoryClampSigma;
-    data.pad1[0] = data.pad1[1] = 0.0f;
+    // (diagnostic D3) Shared by both chains for the same reason historyClampSigma is: one
+    // permutation, one buffer, and isolating the mechanism means isolating it everywhere.
+    data.disableHistoryDepthTest = settings.DisableHistoryDepthTest ? 1u : 0u;
+    data.pad1 = 0.0f;
     return data;
 }
 
