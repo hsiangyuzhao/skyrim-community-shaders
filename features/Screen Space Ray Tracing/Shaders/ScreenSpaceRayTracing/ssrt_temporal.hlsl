@@ -118,7 +118,21 @@ float3 SSRTClampFirefly(float3 radiance, uint2 gtid, float sigmas)
 
     const float lum = Color::RGBToLuminance(radiance);
     // lum > limit >= 0 implies lum > 0, so the division is safe.
-    return (lum > limit) ? radiance * (limit / lum) : radiance;
+    //
+    // (guard G3) ...but only against a *zero* divisor. The clamp was also, and much more
+    // damagingly, an Inf-to-NaN converter: for lum = +Inf the test lum > limit passes,
+    // limit / lum evaluates to exactly 0, and radiance * 0 is Inf * 0 = NaN in every
+    // channel. So the mechanism whose entire job is to remove outliers was upgrading the
+    // one outlier it cannot scale into the one value that poisons the persistent history
+    // forever -- and it is on by default. Requiring lum to be finite before taking the
+    // scaling path leaves the Inf in place for the output sanitisation (G2 upstream, G9
+    // downstream) and the history rejection (G4) to deal with, which are the guards that
+    // can actually dispose of it.
+    //
+    // Healthy data is untouched: isFiniteSafe(lum) is true for every ordered, finite
+    // luminance, so the predicate reduces to the original lum > limit and the returned
+    // expression is unchanged.
+    return (isFiniteSafe(lum) && lum > limit) ? radiance * (limit / lum) : radiance;
 }
 
 bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
