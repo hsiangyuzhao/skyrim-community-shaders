@@ -49,38 +49,26 @@ Texture2D<float3> AlbedoTexture : register(t12);
 
 // (contact noise) Deterministic near-field occlusion for the diffuse cubemap fallback.
 //
-// WHY THIS IS HERE. The fallback's near-field darkening used to come entirely from the per-ray
-// `occlusion` term below, which is a two-sample Monte-Carlo vote on a hard sign test (see the long
-// note at the application site). No reformulation of a 2-spp binary vote can be quiet: estimating a
-// smooth visibility field from two samples carries a +-0.5 quantisation error by construction, and
-// on this path nothing downstream removes it -- the SVGF chain's edge stops collapse at exactly the
-// depth and normal discontinuities a contact region is made of, and the user may have no
-// anti-aliasing at all. The only fix is to stop estimating that field stochastically, so the vote
-// hands the near field to a deterministic ten-tap depth-buffer AO instead.
+// WHY THE VOTE IS SUPPRESSED IN THE NEAR FIELD. The fallback's near-field darkening used to come
+// entirely from the per-ray `occlusion` term below, which is a two-sample Monte-Carlo vote on a hard
+// sign test (see the long note at the application site). No reformulation of a 2-spp binary vote can
+// be quiet: estimating a smooth visibility field from two samples carries a +-0.5 quantisation error
+// by construction, and on this path nothing downstream removes it -- the SVGF chain's edge stops
+// collapse at exactly the depth and normal discontinuities a contact region is made of, and the user
+// may have no anti-aliasing at all. The only fix is to stop estimating that field stochastically, so
+// the vote hands the near field to a deterministic kernel instead.
 //
-// WHY *THIS* KERNEL AND NOT A LOCAL COPY. It is the same kernel the ambient reinjection path
-// already shapes its kept ambient with, so the two energy models darken hair against a face by the
-// same rule and a user switching between them sees one look, not two. Copying a ten-tap spiral and
-// a radius convention into this feature was rejected for the same reason DeferredCompositeCS
-// rejected it: two copies drift the moment either is touched.
+// WHERE THAT KERNEL IS NOW. In Screen Space GI. This file used to include
+// EnvironmentAmbient/EnvAmbient.hlsli and evaluate a ten-tap contact kernel itself, once per pixel,
+// with a frame-static spiral and an LDS broadcast across the z slices -- one of three independent,
+// unfiltered evaluations of the same signal in the pipeline. SSGI now runs it once per frame at full
+// resolution with its own temporal accumulator and folds the result into the AO channel this file
+// already reads (`ao *= 1 - SsgiAoTexture` at the application site), so the darkening arrives here
+// with no code of its own, denoised, and identical to what every other consumer sees.
 //
-// WHY IT IS GATED. `features/Environment Ambient/` is a non-CORE feature folder, so "SSRT installed,
-// Environment Ambient not" is a shipping configuration in which this header does not exist to be
-// included -- the AIO package, which is what the fallback default is tuned against, always ships
-// both. The *whole* change is behind this gate, the near-field vote suppression included, so an
-// SSRT-only install keeps P2.1 behaviour exactly rather than losing the darkening and keeping the
-// noise. Requires DYNAMIC_CUBEMAPS twice over: the header reads EnvTexture / EnvReflectionsTexture
-// unconditionally, and without the cubemaps there is no fallback ambient to shape.
-//
-// Must follow the resource declarations above: the header declares no registers of its own and
-// binds to EnvTexture (t7), EnvReflectionsTexture (t8), LinearSampler (s0, from ssrt_common.hlsli)
-// and DepthTexture (t4) as globals.
-#if defined(DYNAMIC_CUBEMAPS) && defined(ENV_AMBIENT) && !defined(SSRT_SPECULAR) && !SHARC_UPDATE
-#   define SSRT_FALLBACK_CONTACT_AO 1
-#   include "EnvironmentAmbient/EnvAmbient.hlsli"
-#else
-#   define SSRT_FALLBACK_CONTACT_AO 0
-#endif
+// The dependency on eatures/Environment Ambient/ went with it: that folder is non-CORE, so this
+// file used to compile the whole change out on an SSRT-without-L1 install. It now needs only SSGI's
+// own AO texture, which it was reading anyway.
 
 // UAV register map (audit P6 / #20). Must stay in lockstep with the `uavs` arrays in
 // ScreenSpaceRayTracing::DrawSSRTDiffuse / DrawSSRTSpecular:
@@ -140,14 +128,12 @@ cbuffer SSRTCB : register(b1)
     // --- row 2 ---
     // (diagnostic T2) Non-zero freezes the per-frame phase of the ray-direction noise; see
     // SampleRandomVector2DBaked.
+    //
+    // The only member of this row. ScreenSpaceRayTracing::SSRTCB pads the rest of it out to 48
+    // bytes, which is deliberately not declared here -- a shader may declare a prefix of a larger
+    // constant buffer, and mirroring a C++ `float pad0[3]` in HLSL would be wrong anyway (array
+    // elements get a 16-byte row each).
     uint FreezeNoisePhase;
-    // (contact noise) How much of the deterministic contact-occlusion kernel's result is allowed to
-    // darken the fallback ambient. 0 disables the term and restores the pre-fix behaviour of the
-    // near-field occlusion vote as well, so it is a complete A/B switch for this change.
-    // ScreenSpaceRayTracing::SSRTCB pads the rest of this row out to 48 bytes, which is not
-    // declared here -- a shader may declare a prefix of a larger constant buffer, and mirroring a
-    // C++ `float pad0[2]` in HLSL would be wrong anyway (array elements get a 16-byte row each).
-    float FallbackContactStrength;
 };
 
 // (audit #21) Never defined by ScreenSpaceRayTracing::CompileComputeShaders, so this is
@@ -619,20 +605,6 @@ groupshared float4 samples[64][SAMPLES_PER_PIXEL];
 #   define SSRT_SAMPLE_SLOT (groupThreadID.y * 8 + groupThreadID.x)
 #endif
 
-#if SSRT_FALLBACK_CONTACT_AO
-// (contact noise) One contact-occlusion result per *pixel*, not per ray.
-//
-// The kernel's inputs -- pixel coordinate, position, normal, depth -- are identical across the
-// SAMPLES_PER_PIXEL z slices of a pixel, so evaluating it in every slice would buy nothing and cost
-// ten depth loads each. DiffuseSPP goes to 16 in the UI, so that is up to 160 loads per pixel
-// against the 10 this costs. The z == 0 lane evaluates and the rest read the result.
-//
-// 256 bytes of LDS on top of the 64 * SAMPLES_PER_PIXEL float4s `samples` already holds, i.e. 2.5%
-// of the group's budget at the default SPP of 2 and less as it rises, so it cannot be what moves
-// occupancy.
-groupshared float g_contactVisibility[64];
-#endif
-
 // (audit P4 / #10) `groupshared float4 weights[64][SAMPLES_PER_PIXEL]` and the
 // LocalBRDF() that fed it are gone: nothing ever read the array back, so the specular
 // path never actually applied any BRDF/pdf weighting, and the write cost half of the
@@ -823,43 +795,6 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 	positionWS = mul(FrameBuffer::CameraViewProjInverse[eyeIndex], positionWS);
 	positionWS.xyz = positionWS.xyz / positionWS.w;
 
-#if SSRT_FALLBACK_CONTACT_AO
-    // (contact noise) Per-pixel contact visibility, evaluated once and shared across the z slices.
-    //
-    // The write is guarded by `sample_id == 0` but the barrier is not: it sits in flow control that
-    // no thread can skip, which is what a group sync requires and what the P1 note above keeps true
-    // by never taking an early `return`. The work itself is skipped by a ternary rather than by a
-    // branch around the barrier, so the cost when the term is off is a compare, and the whole block
-    // is compiled out when the kernel is unavailable (see SSRT_FALLBACK_CONTACT_AO).
-    //
-    // `!valid_ray` covers the sky and the out-of-bounds tail of the dispatch, where every tap the
-    // kernel would take is a far-plane tap and it returns 1 anyway.
-    if (sample_id == 0) {
-        const bool contactActive = valid_ray && UseDynamicCubemapsAsFallback != 0 && FallbackContactStrength > 0.0;
-        // Strength composition, identical in form to the reinjection path's
-        // (DeferredCompositeCS.hlsl): 1 applies the kernel as Environment Ambient's own Contact
-        // Radius / Contact Strength sliders define it, so both SSRT energy models darken contact at
-        // the same rate; 0 is off; above 1 deepens it.
-        const float contactKernel = contactActive ?
-                                        EnvironmentAmbient::EvaluateContactOcclusionStatic(
-                                            coords.xy,
-                                            // The kernel's own reconstruction, not the positionWS
-                                            // above: its neighbour taps use this function, and in VR
-                                            // the two differ by Stereo::ConvertFromStereoUV. Only
-                                            // differences of these positions are used, so centre and
-                                            // taps have to come from the same one.
-                                            EnvironmentAmbient::ReconstructPositionWS(int2(coords.xy), depth, eyeIndex),
-                                            world_space_normal,
-                                            depth,
-                                            eyeIndex,
-                                            float2(screen_size)) :
-                                        1.0;
-        g_contactVisibility[SSRT_SAMPLE_SLOT] = saturate(1.0 - (1.0 - contactKernel) * FallbackContactStrength);
-    }
-    GroupMemoryBarrierWithGroupSync();
-    const float contactVisibility = g_contactVisibility[SSRT_SAMPLE_SLOT];
-#endif
-
 #if SSRT_USE_SAMPLE_LDS
     samples[SSRT_SAMPLE_SLOT][sample_id] = 0.f;
 #else
@@ -1025,9 +960,9 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             envColor = lerp(envColor, envColor * SSRT_CubemapNormalizationRatio(directionalAmbientLuminance, envLuminance), CubemapNormalization);  // (guard G7)
 #   endif
             envColor = Color::IrradianceToLinear(envColor);
-#   if SSRT_FALLBACK_CONTACT_AO
-            // (contact noise) THE FIX. Near-field hits stop voting, and the deterministic kernel
-            // takes over the range they used to own.
+#   if defined(SSGI) && !defined(SSRT_SPECULAR)
+            // (contact noise) THE FIX. Near-field hits stop voting, and Screen Space GI's
+            // deterministic contact pass takes over the range they used to own.
             //
             // What the vote actually is. SSRT_ValidateHit leaves `occlusion` at 1 on every path but
             // one: a hit taken from behind sets `occlusion = 1 - confidence`, and `confidence` is the
@@ -1051,11 +986,14 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             // removing it, and it removes the contact darkening along with it -- the darkening and
             // the flicker are the same number. The estimator has to stop being stochastic.
             //
-            // What replaces it. Ten depth taps on a frame-static golden-angle spiral, at Environment
-            // Ambient's own contact radius, cosine-weighted with a quadratic range falloff. It is
-            // deterministic frame to frame, it costs the same at every pixel, and it needs neither
-            // the denoiser nor an upscaler to be readable -- which the vote did, and which is why
-            // turning SVGF's own smoothing up cannot fix this.
+            // What replaces it, and where it enters. SSGI's contact AO pass: ten depth taps on a
+            // golden-angle spiral at its Contact Radius, cosine-weighted with a quadratic range
+            // falloff, temporally accumulated over eight frames behind a current-frame neighbourhood
+            // fence. It reaches this expression through `SsgiAoTexture` a few lines below -- the same
+            // multiply that has always applied SSGI's occlusion here -- so there is nothing to
+            // evaluate on this path and no per-ray or per-pixel cost at all. Deterministic frame to
+            // frame, and readable without a denoiser or an upscaler behind it, which the vote was
+            // not, and which is why turning SVGF's own smoothing up cannot fix this.
             //
             // Why the darkening comes out at least as strong, not weaker. The vote only darkened the
             // rays that happened to hit a back face; a ray that missed kept the *full* ambient even
@@ -1070,32 +1008,39 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             //    partition the range rather than overlapping it. Hits beyond the radius keep voting
             //    unchanged -- a ray that went behind a wall two metres away is still evidence, and
             //    it is not what was reported.
-            //  * Against the traced radiance: this multiplies `envColor` only, before the
-            //    `lerp(envColor, sampleColor, confidence)` below. A ray that found nearby geometry
+            //  * Against the traced radiance: the AO built here multiplies `envColor` only, before
+            //    the `lerp(envColor, sampleColor, confidence)` below. A ray that found nearby geometry
             //    already returns that geometry's light instead of the environment's, so darkening it
             //    too would count the occlusion twice.
-            //  * Against SSGI's AO and Environment Ambient's own contact term: SSGI is folded into
-            //    the same MultiBounceAO argument below and acts at its own much larger scale, which
-            //    the composite treats as composition rather than double-counting for the same
-            //    reason. Environment Ambient's L1 term and the reinjection path's copy of this
-            //    kernel are both unreachable while this block runs -- L1 requires DiffuseMult == 0,
-            //    reinjection forces UseDynamicCubemapsAsFallback to 0 in GetCommonBufferData.
+            //  * Against the other consumers of the contact term: there is now exactly one
+            //    evaluation of it in the pipeline and every consumer reads the same texel, so
+            //    `ao *= 1 - SsgiAo` below applies it once here whatever else the frame is doing.
             //
-            // The radius is read from the same setting the kernel measures itself in, so there is
-            // one contact radius in the system and the handover cannot drift out of alignment with
-            // the kernel's falloff. Matches EvaluateContactOcclusionEx's own `radius`, converted to
-            // the game units `world_ray_length` is in.
-            const float contactRange = max(SharedData::envAmbientSettings.ContactRadius, 0.1) / GAME_UNIT_TO_CM;
-            // The suppression is conditioned on the kernel actually running. Handing the near field
-            // to a term the user has dialled to zero would leave that range shaded by nothing at
-            // all, so FallbackContactStrength = 0 has to restore the vote as well -- that is what
-            // makes it a clean A/B against P2.1 rather than a third behaviour.
-            const bool handOverNearField = FallbackContactStrength > 0.0 && world_ray_length < contactRange;
+            // The radius comes from the pass's own setting, so there is one contact radius in the
+            // system and the handover cannot drift out of alignment with the kernel's falloff.
+            // Converted to the game units `world_ray_length` is in.
+            //
+            // The suppression is conditioned on that pass actually running: handing the near field to
+            // a term that does not exist would leave that range shaded by nothing at all, which would
+            // be strictly worse than the flicker. SsgiContactAoActive is 0 whenever Screen Space GI is
+            // absent, disabled, or has its contact pass switched off, and the vote comes straight back
+            // -- an SSRT-only or SSGI-off install therefore keeps P2.1 behaviour exactly rather than
+            // losing the darkening and keeping the noise.
+            //
+            // Gated on `defined(SSGI)` rather than on the cbuffer flag alone because without SSGI
+            // there is no AO texture to carry the replacement in the first place; with SSGI absent
+            // this whole island compiles to the `#else` line, byte for byte what it was before.
+            //
+            // `!defined(SSRT_SPECULAR)` is inherited from the gate this replaced, deliberately. The
+            // specular permutation does pick up the contact term -- its own `ao *= 1 - SsgiAo`
+            // below is the same line -- but its `occlusion` vote is a *one*-sample estimate that
+            // then goes through GetSpecularOcclusionFromAmbientOcclusion, and the handover radius
+            // was never calibrated against that. Suppressing the vote there is a separate,
+            // look-changing decision about the specular path, not part of moving the kernel.
+            const float contactRange = max(SharedData::ssrtSettings.SsgiContactRadius, 0.1) / GAME_UNIT_TO_CM;
+            const bool handOverNearField = SharedData::ssrtSettings.SsgiContactAoActive != 0 && world_ray_length < contactRange;
             const float voteOcclusion = handOverNearField ? 1.0 : occlusion;
-            // Folded into MultiBounceAO's argument rather than multiplied outside it, as the
-            // reinjection path does with the same kernel: MultiBounceAO is not separable, so an
-            // outside factor would land measurably lighter than one factor of the product.
-            float ao = saturate(lerp(1.0, voteOcclusion, OcclusionStrength) * contactVisibility);
+            float ao = lerp(1.0, voteOcclusion, OcclusionStrength);
 #   else
             float ao = lerp(1.0, occlusion, OcclusionStrength);
 #   endif

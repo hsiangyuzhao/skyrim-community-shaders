@@ -30,7 +30,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	MaxAccumFrames,
 	MaxAccumFramesAO,
 	BlurRadius,
-	DistanceNormalisation)
+	DistanceNormalisation,
+	EnableContactAo,
+	ContactRadius,
+	ContactStrength)
 
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -269,6 +272,63 @@ void ScreenSpaceGI::DrawSettings()
 	}
 
 	///////////////////////////////
+	ImGui::SeparatorText("Contact AO");
+
+	{
+		auto contactGuard = Util::DisableGuard(!settings.Enabled);
+
+		recompileFlag |= ImGui::Checkbox("Enable Contact AO", &settings.EnableContactAo);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			std::vector<std::string> tooltipLines = {
+				"Adds the very small-scale shadows the main occlusion above is too coarse to see:",
+				"where hair touches a face, where clothing meets skin, where a window frame meets",
+				"the wall behind it.",
+				"",
+				"It always runs at full resolution, even when the setting above says half or",
+				"quarter, because a few centimetres is smaller than one pixel of a half-resolution",
+				"image. It has its own small smoothing over the last few frames, so it does not",
+				"sparkle and does not need anti-aliasing or upscaling to look right.",
+				"",
+				"The result is mixed into the same occlusion the rest of the game already uses, so",
+				"everything that reacts to occlusion picks it up automatically.",
+				"",
+				"Turning this off is free: nothing is computed and nothing is stored."
+			};
+			Util::DrawMultiLineTooltip(tooltipLines);
+		}
+
+		{
+			auto contactValueGuard = Util::DisableGuard(!settings.EnableContactAo);
+
+			ImGui::SliderFloat("Contact Radius", &settings.ContactRadius, 2.0f, 60.0f, "%.1f cm", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				std::vector<std::string> tooltipLines = {
+					"How far this looks for something touching the surface, in real-world",
+					"centimetres. 15 cm is roughly the scale of a strand of hair against a cheek or",
+					"a fold of cloth against skin.",
+					"",
+					"Raising it starts doing the main occlusion's job with far fewer samples, which",
+					"looks less steady, not better. If you want wider shadows, use AO radius above."
+				};
+				Util::DrawMultiLineTooltip(tooltipLines);
+			}
+
+			ImGui::SliderFloat("Contact Strength", &settings.ContactStrength, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				std::vector<std::string> tooltipLines = {
+					"How dark these small contacts get. At 1.0 a tight contact goes fully dark and",
+					"an ordinary inside corner lands around 40% -- the upper half of the slider is",
+					"headroom, not the working range.",
+					"",
+					"0.0 leaves the shadows out but still pays for them; use the checkbox above to",
+					"turn it off properly."
+				};
+				Util::DrawMultiLineTooltip(tooltipLines);
+			}
+		}
+	}
+
+	///////////////////////////////
 	ImGui::SeparatorText("Denoising");
 
 	{
@@ -348,6 +408,8 @@ void ScreenSpaceGI::DrawSettings()
 		BUFFER_VIEWER_NODE(texIlY[1], debugRescale)
 		BUFFER_VIEWER_NODE(texIlCoCg[0], debugRescale)
 		BUFFER_VIEWER_NODE(texIlCoCg[1], debugRescale)
+		BUFFER_VIEWER_NODE(texContactAo[0], debugRescale)
+		BUFFER_VIEWER_NODE(texContactAo[1], debugRescale)
 
 		ImGui::TreePop();
 	}
@@ -501,6 +563,19 @@ void ScreenSpaceGI::SetupResources()
 			texAccumFrames[1] = eastl::make_unique<Texture2D>(texDesc);
 			texAccumFrames[1]->CreateSRV(srvDesc);
 			texAccumFrames[1]->CreateUAV(uavDesc);
+
+			// (contact AO) Full resolution regardless of ResolutionMode -- these are the only SSGI
+			// buffers whose *used* extent does not follow it. One byte per texel, so the pair costs
+			// about 7 MB at 1440p and 17 MB at 4K. Never cleared: the neighbourhood fence in
+			// contactAo.cs.hlsl drags whatever they contain into the current frame's own range
+			// before it is used, so there is no uninitialised-history state to defend against.
+			texContactAo[0] = eastl::make_unique<Texture2D>(texDesc);
+			texContactAo[0]->CreateSRV(srvDesc);
+			texContactAo[0]->CreateUAV(uavDesc);
+
+			texContactAo[1] = eastl::make_unique<Texture2D>(texDesc);
+			texContactAo[1]->CreateSRV(srvDesc);
+			texContactAo[1]->CreateUAV(uavDesc);
 		}
 
 		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
@@ -568,7 +643,7 @@ void ScreenSpaceGI::SetupResources()
 void ScreenSpaceGI::ClearShaderCache()
 {
 	static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
-		&prefilterDepthsCompute, &prefilterRadianceCompute, &radianceDisoccCompute, &giCompute, &blurCompute, &upsampleCompute
+		&prefilterDepthsCompute, &prefilterRadianceCompute, &radianceDisoccCompute, &giCompute, &blurCompute, &upsampleCompute, &contactAoCompute
 	};
 
 	for (auto shader : shaderPtrs)
@@ -595,6 +670,18 @@ void ScreenSpaceGI::CompileComputeShaders()
 			{ &blurCompute, "blur.cs.hlsl", {} },
 			{ &upsampleCompute, "upsample.cs.hlsl", {} },
 		};
+
+	// (contact AO) Compiled only when the term is on, so that an install which never enables it
+	// pays nothing at startup and -- more importantly -- cannot lose all of SSGI to a compile
+	// failure in a pass it does not use (see ShadersOK). The upsample pass gets its CONTACT_AO
+	// define from the loop below for the same reason the resolution mode is compile-time here:
+	// nothing else in this feature is a runtime branch either, and it is what makes "contact AO
+	// off" emit byte-identical code to the version before this pass existed.
+	if (settings.EnableContactAo)
+		shaderInfos.push_back({ &contactAoCompute, "contactAo.cs.hlsl", {} });
+	else
+		contactAoCompute = nullptr;
+
 	for (auto& info : shaderInfos) {
 		if (REL::Module::IsVR())
 			info.defines.push_back({ "VR", "" });
@@ -608,6 +695,12 @@ void ScreenSpaceGI::CompileComputeShaders()
 			info.defines.push_back({ "GI", "" });
 		if (settings.EnableExperimentalSpecularGI)
 			info.defines.push_back({ "GI_SPECULAR", "" });
+		// Only upsample.cs.hlsl reads this; contactAo.cs.hlsl derives its own composite gate from
+		// the resolution defines instead. Handed to the whole set rather than to one entry because
+		// an unreferenced macro changes no bytecode, and singling out one shader here has been the
+		// source of more mistakes in this file than it has saved lines.
+		if (settings.EnableContactAo)
+			info.defines.push_back({ "CONTACT_AO", "" });
 	}
 
 	for (auto& info : shaderInfos) {
@@ -621,7 +714,8 @@ void ScreenSpaceGI::CompileComputeShaders()
 
 bool ScreenSpaceGI::ShadersOK()
 {
-	return texNoise && prefilterDepthsCompute && prefilterRadianceCompute && radianceDisoccCompute && giCompute && blurCompute && upsampleCompute;
+	return texNoise && prefilterDepthsCompute && prefilterRadianceCompute && radianceDisoccCompute && giCompute && blurCompute && upsampleCompute &&
+	       (!settings.EnableContactAo || contactAoCompute);
 }
 
 void ScreenSpaceGI::UpdateSB()
@@ -676,6 +770,9 @@ void ScreenSpaceGI::UpdateSB()
 		data.MaxAccumFramesAO = settings.MaxAccumFramesAO;
 		data.BlurRadius = settings.BlurRadius;
 		data.DistanceNormalisation = settings.DistanceNormalisation;
+
+		data.ContactRadius = settings.ContactRadius;
+		data.ContactStrength = settings.ContactStrength;
 	}
 
 	ssgiCB->Update(data);
@@ -875,6 +972,48 @@ void ScreenSpaceGI::DrawSSGI()
 		lastFrameAccumTexIdx = !lastFrameAccumTexIdx;
 	}
 
+	// contact AO
+	//
+	// Placed after the GI/blur chain and before the upsample, because in half and quarter res the
+	// upsample is the pass that folds this term into the AO channel and therefore has to be able to
+	// read the result. Runs at the full render extent in every resolution mode.
+	//
+	// Note which AO buffer this must NOT write: texAo[inputAoTexIdx] is the pure GI occlusion the
+	// GI pass just produced, and radianceDisocc.cs.hlsl reads it as *history* next frame
+	// (lastFrameAoTexIdx). Folding contact occlusion into it would feed the term back through
+	// SSGI's own temporal chain and compound it once per frame. Full-resolution mode therefore
+	// composites into the other slot of the pair, which is free at this point in the frame, and
+	// leaves inputAoTexIdx alone.
+	static uint lastFrameContactIdx = 0;
+	uint contactIdx = lastFrameContactIdx;
+	uint aoOutIdx = inputAoTexIdx;
+
+	if (settings.EnableContactAo) {
+		TracyD3D11Zone(globals::state->tracyCtx, "SSGI - Contact AO");
+
+		resetViews();
+		srvs.at(0) = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].depthSRV;
+		srvs.at(1) = rts[NORMALROUGHNESS].SRV;
+		srvs.at(2) = rts[RE::RENDER_TARGET::kMOTION_VECTOR].SRV;
+		srvs.at(3) = texContactAo[contactIdx]->srv.get();
+
+		uavs.at(0) = texContactAo[!contactIdx]->uav.get();
+
+		if (settings.ResolutionMode == 0) {
+			srvs.at(4) = texAo[inputAoTexIdx]->srv.get();
+			uavs.at(1) = texAo[!inputAoTexIdx]->uav.get();
+			aoOutIdx = !inputAoTexIdx;
+		}
+
+		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
+		context->CSSetShader(contactAoCompute.get(), nullptr, 0);
+		context->Dispatch((resolution[0] + 7u) >> 3, (resolution[1] + 7u) >> 3, 1);
+
+		contactIdx = !contactIdx;
+		lastFrameContactIdx = contactIdx;
+	}
+
 	// upsample
 	if (settings.ResolutionMode != 0) {
 		resetViews();
@@ -883,6 +1022,8 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(2) = texIlY[inputGITexIdx]->srv.get();
 		srvs.at(3) = texIlCoCg[inputGITexIdx]->srv.get();
 		srvs.at(4) = texGiSpecular[inputAoTexIdx]->srv.get();
+		if (settings.EnableContactAo)
+			srvs.at(5) = texContactAo[contactIdx]->srv.get();
 
 		uavs.at(0) = texAo[!inputAoTexIdx]->uav.get();
 		uavs.at(1) = texIlY[!inputGITexIdx]->uav.get();
@@ -896,10 +1037,12 @@ void ScreenSpaceGI::DrawSSGI()
 
 		inputAoTexIdx = !inputAoTexIdx;
 		inputGITexIdx = !inputGITexIdx;
+		aoOutIdx = inputAoTexIdx;
 	}
 
-	outputAoIdx = inputAoTexIdx;
+	outputAoIdx = aoOutIdx;
 	outputIlIdx = inputGITexIdx;
+	outputSpecularIdx = inputAoTexIdx;
 
 	// cleanup
 	resetViews();

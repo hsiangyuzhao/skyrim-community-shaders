@@ -21,9 +21,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	LinearComposite,
 	EnclosureFallback,
 	HueFalloff,
-	EnableContactOcclusion,
-	ContactRadius,
-	ContactStrength,
 	AOExponent)
 
 void EnvironmentAmbient::RestoreDefaultSettings()
@@ -200,6 +197,14 @@ void EnvironmentAmbient::DrawSettings()
 
 		if (!screenSpaceGI.loaded || !screenSpaceGI.settings.Enabled) {
 			ImGui::TextColored({ 1, 0.65f, 0, 1 }, "Screen Space GI is off: only Skylighting occlusion is applied.");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text(
+					"That also means no small-scale contact shading. Screen Space GI's Contact AO is\n"
+					"where the centimetre-scale darkening (hair against a face, cloth against skin)\n"
+					"lives now, and it reaches this feature through the same occlusion channel.");
+			}
+		} else if (!screenSpaceGI.settings.EnableContactAo) {
+			ImGui::TextColored({ 1, 0.65f, 0, 1 }, "Screen Space GI's Contact AO is off: no small-scale contact shading.");
 		}
 
 		ImGui::Checkbox("Enclosed Hue Fallback", (bool*)&settings.EnclosureFallback);
@@ -230,56 +235,6 @@ void EnvironmentAmbient::DrawSettings()
 		}
 
 		///////////////////////////////
-		ImGui::SeparatorText("Contact Occlusion");
-
-		ImGui::Checkbox("Enable Contact Occlusion", (bool*)&settings.EnableContactOcclusion);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text(
-				"Near-field ambient occlusion from the full-resolution depth buffer, ten taps per\n"
-				"pixel.\n"
-				"\n"
-				"This covers the last scale the other occlusion sources cannot reach. Skylighting\n"
-				"works on a metre-scale probe grid and Screen Space GI is half-resolution with a\n"
-				"large radius, while the SSRT fallback this feature reproduces occluded its rays\n"
-				"at full resolution and centimetre scale. That difference is what shows up as\n"
-				"missing absorption where hair meets a face, where cloth meets skin, and around\n"
-				"a window frame behind a character.\n"
-				"\n"
-				"Applies both as a multiplier on the environment light and as part of the\n"
-				"enclosure signal, so contacts shift towards the local ambient colour rather than\n"
-				"just darkening. Independent of Screen Space GI: they act at different scales and\n"
-				"compose, so leaving both on is correct.");
-		}
-
-		{
-			auto contactGuard = Util::DisableGuard(!settings.EnableContactOcclusion);
-
-			ImGui::SliderFloat("Contact Radius", &settings.ContactRadius, 2.0f, 60.0f, "%.1f cm", ImGuiSliderFlags_AlwaysClamp);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text(
-					"World-space radius of the search, in centimetres. 15 cm (default) is contact\n"
-					"scale: strand-to-skin, cloth-to-skin, frame-to-wall. Raising it starts to\n"
-					"overlap Screen Space GI's job and costs temporal stability, because the same\n"
-					"ten taps then have to cover a larger area.\n"
-					"\n"
-					"The pixel radius is derived from this per pixel and clamped to 2-64 pixels, so\n"
-					"distant geometry keeps distinct taps and a near-field surface cannot turn this\n"
-					"into a full-screen pass.");
-			}
-
-			ImGui::SliderFloat("Contact Strength", &settings.ContactStrength, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text(
-					"Scales the occlusion. At 1.0 a 90-degree corner lands near 0.4 occlusion and a\n"
-					"tight contact such as hair against skin reaches full absorption, matching the\n"
-					"SSRT fallback this reproduces. The upper half of the slider is headroom rather\n"
-					"than the working range; use 0.5 for the levels this had before that\n"
-					"recalibration. 0.0 disables the effect without removing its cost - use the\n"
-					"checkbox for that.");
-			}
-		}
-
-		///////////////////////////////
 		ImGui::SeparatorText("Advanced");
 
 		ImGui::Checkbox("Enable in Interiors", (bool*)&settings.EnableInterior);
@@ -293,9 +248,8 @@ void EnvironmentAmbient::DrawSettings()
 				"\n"
 				"On by default. Interiors are most of the play time, and leaving them on the\n"
 				"vanilla ambient path meant the directional environment light simply did not\n"
-				"exist in dungeons, caves and houses. Contact occlusion and the enclosure hue\n"
-				"fallback still work there; they run off contact and Screen Space GI, not off\n"
-				"Skylighting.");
+				"exist in dungeons, caves and houses. The enclosure hue fallback still works\n"
+				"there; it runs off Screen Space GI's occlusion, not off Skylighting.");
 		}
 
 		ImGui::SliderFloat("Normalization", &settings.Normalization, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);

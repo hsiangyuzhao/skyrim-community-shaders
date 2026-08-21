@@ -32,6 +32,7 @@ public:
 			std::vector<std::string>{
 				"Realistic indirect lighting",
 				"Enhanced ambient occlusion",
+				"Full-resolution contact shading at centimetre scale",
 				"Improved visual depth and atmosphere",
 				"Temporal denoising for smooth results",
 				"Configurable quality and performance settings" });
@@ -56,6 +57,12 @@ public:
 	bool recompileFlag = false;
 	uint outputAoIdx = 0;
 	uint outputIlIdx = 0;
+	/// @brief (contact AO) Index of the specular GI buffer to hand to consumers.
+	///
+	/// Used to be outputAoIdx as well, which stopped being true once the contact pass acquired its
+	/// own composite step in full-resolution mode: that step ping-pongs the AO channel one more
+	/// time than the specular channel, so the two indices diverge there.
+	uint outputSpecularIdx = 0;
 
 	struct Settings
 	{
@@ -93,6 +100,11 @@ public:
 		uint MaxAccumFramesAO = 4;
 		float BlurRadius = 2.f;
 		float DistanceNormalisation = 2.f;
+		// contact AO -- a separate, full-resolution near-field pass with its own accumulator.
+		// See features/Screen Space GI/Shaders/ScreenSpaceGI/contactAo.cs.hlsl.
+		bool EnableContactAo = true;
+		float ContactRadius = 15.f;  // centimetres
+		float ContactStrength = 1.f;
 	} settings;
 
 	struct alignas(16) SSGICB
@@ -121,7 +133,8 @@ public:
 		float GISaturation;  //
 		float GIDistanceCompensation;
 		float GICompensationMaxDist;
-		float pad1;
+		// (contact AO) Took this buffer's two spare slots, so the layout is unchanged.
+		float ContactRadius;
 
 		float AOPower;  //
 		float GIStrength;
@@ -134,7 +147,7 @@ public:
 		float BlurRadius;
 		float DistanceNormalisation;
 
-		float pad;
+		float ContactStrength;
 	};
 	STATIC_ASSERT_ALIGNAS_16(SSGICB);
 	eastl::unique_ptr<ConstantBuffer> ssgiCB;
@@ -151,6 +164,9 @@ public:
 	eastl::unique_ptr<Texture2D> texIlY[2] = { nullptr };
 	eastl::unique_ptr<Texture2D> texIlCoCg[2] = { nullptr };
 	eastl::unique_ptr<Texture2D> texGiSpecular[2] = { nullptr };
+	// (contact AO) Full-resolution ping-pong for the accumulated contact visibility. R8_UNORM, so
+	// the signal is format-bounded to [0, 1] and nothing downstream needs a finiteness test.
+	eastl::unique_ptr<Texture2D> texContactAo[2] = { nullptr };
 
 	inline auto GetOutputTextures()
 	{
@@ -159,7 +175,7 @@ public:
 					   texAo[outputAoIdx]->srv.get(),
 					   texIlY[outputIlIdx]->srv.get(),
 					   texIlCoCg[outputIlIdx]->srv.get(),
-					   texGiSpecular[outputAoIdx]->srv.get()) :
+					   texGiSpecular[outputSpecularIdx]->srv.get()) :
 		           std::make_tuple(nullptr, nullptr, nullptr, nullptr);
 	}
 
@@ -172,4 +188,5 @@ public:
 	winrt::com_ptr<ID3D11ComputeShader> giCompute = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> blurCompute = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> upsampleCompute = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> contactAoCompute = nullptr;
 };

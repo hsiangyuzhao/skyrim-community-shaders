@@ -9,9 +9,6 @@
 #include "ShaderCache.h"
 
 #include "DynamicCubemaps.h"
-// (contact noise) For globals::features::environmentAmbient.loaded, which decides whether the
-// diffuse fallback's contact-occlusion term can be compiled. Globals.h only forward declares it.
-#include "EnvironmentAmbient.h"
 #include "ScreenSpaceGI.h"
 #include "Skylighting.h"
 
@@ -33,10 +30,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientMult,
     EnableAmbientReinjection,
     AmbientReinjectionStrength,
-    EnableReinjectionContactOcclusion,
-    ReinjectionContactStrength,
     OcclusionStrength,
-    FallbackContactStrength,
     CubemapNormalization,
     EnableSVGF,
     MaxAccumulatedFrames,
@@ -72,10 +66,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientMult,
     EnableAmbientReinjection,
     AmbientReinjectionStrength,
-    EnableReinjectionContactOcclusion,
-    ReinjectionContactStrength,
     OcclusionStrength,
-    FallbackContactStrength,
     CubemapNormalization,
     EnableSVGF,
     MaxAccumulatedFrames,
@@ -116,45 +107,12 @@ void ScreenSpaceRayTracing::DrawSettings()
             "How strongly a ray that ran into the back of geometry darkens the fallback "
             "ambient for that pixel. Rays that simply failed to trace no longer count "
             "towards this.\n\n"
-            "While Contact Shading below is on, this only counts geometry further away than "
-            "that setting's radius. Anything closer is handed to Contact Shading instead, "
+            "While Screen Space GI's Contact AO is on, this only counts geometry further away "
+            "than that setting's radius. Anything closer is handed to Contact AO instead, "
             "because two rays per pixel cannot decide how dark a tight contact is without the "
-            "answer changing every frame. The two never darken the same geometry twice.");
-
-    // Shapes the diffuse cubemap fallback and nothing else, so it is inert in the two
-    // configurations that have no fallback: Ambient Reinjection forces the fallback off (see
-    // GetCommonBufferData), and the fallback checkbox further down turns it off directly. Greyed out
-    // rather than hidden so the saved value stays visible.
-    const bool fallbackContactLive = !settings.EnableAmbientReinjection && settings.UseDynamicCubemapsAsFallback;
-    ImGui::BeginDisabled(!fallbackContactLive);
-    ImGui::SliderFloat("Contact Shading", &settings.FallbackContactStrength, 0.0f, 2.0f, "%.2f");
-    ImGui::EndDisabled();
-    if (auto _tt = Util::HoverTooltipWrapper()) {
-        if (!fallbackContactLive)
-            ImGui::Text(
-                "Inactive: this shapes the diffuse cubemap fallback, and there is no fallback "
-                "running. Ambient Reinjection forces it off, and so does the diffuse fallback "
-                "checkbox below. The saved value is kept.\n\n"
-                "Ambient Reinjection has its own version of this control, under Ambient Energy.\n\n");
-        ImGui::Text(
-            "Darkens the fallback ambient where geometry is touching, at a scale of a few "
-            "centimetres: hair against a face, cloth where it meets skin, leaves pressed "
-            "together.\n\n"
-            "This shading was already there, but it was decided by the two rays this pixel "
-            "traces, and each of those rays could only answer yes or no. Two yes-or-no votes "
-            "cannot say how dark something is, and the rays are aimed somewhere new every "
-            "frame, so the answer kept changing -- which is what the flickering dark speckle "
-            "around hair and foliage was. This measures it from the depth buffer instead, the "
-            "same way every frame, so the shadow stops moving. It does not rely on the "
-            "denoiser or on any anti-aliasing, so it looks the same with TAA, DLSS, FSR or "
-            "nothing at all.\n\n"
-            "1 matches the strength Environment Ambient's own Contact Radius and Contact "
-            "Strength sliders define, so both of SSRT's ambient modes shade contact the same "
-            "way. Above 1 deepens it. 0 turns it off and puts the old flickering behaviour "
-            "back, for an A/B comparison.\n\n"
-            "Environment Ambient must be installed for this to do anything -- the measurement "
-            "lives in that feature's shader folder. It does not need to be switched on.");
-    }
+            "answer changing every frame. The two never darken the same geometry twice.\n\n"
+            "With Screen Space GI or its Contact AO switched off, the rays go back to deciding "
+            "the near field themselves -- flickery, but never missing.");
     ImGui::BeginDisabled(settings.EnableAmbientReinjection);
     ImGui::SliderFloat("Ambient Multiplier", &settings.AmbientMult, 0.0f, 1.0f, "%.2f");
     ImGui::EndDisabled();
@@ -200,44 +158,6 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "truth but never darker than vanilla. Slightly below 1 is a reasonable hedge in "
                 "scenes whose on-screen surfaces are not representative of the surrounding "
                 "environment.");
-
-        ImGui::Checkbox("Contact Occlusion", &settings.EnableReinjectionContactOcclusion);
-        if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Darkens the ambient the reinjection keeps with a centimetre-scale occlusion "
-                "term, restoring the near-field contrast the old cubemap-fallback path had and "
-                "this one does not.\n\n"
-                "Why it is missing without this. The fallback multiplied its ambient by "
-                "MultiBounceAO(albedo, occlusion * SSGI AO) inside the ray march, and that "
-                "occlusion was per-ray at full resolution -- it is what darkened hair against a "
-                "face and cloth where it meets skin. Reinjection fills the unresolved directions "
-                "with the vanilla ambient instead, which is shaped by Screen Space GI's "
-                "half-resolution AO and nothing finer, and the confidence that selects it has "
-                "been through a 7x7 spatial blur that erases contact-scale detail by "
-                "construction. The overall level is right; the fine dark detail in the unlit "
-                "parts of the frame is not there.\n\n"
-                "Where the term comes from. It reuses Environment Ambient's contact-occlusion "
-                "kernel verbatim -- a 15 cm (default) depth-buffer AO in the Alchemy/HBAO cosine "
-                "form, ten depth taps on a golden-angle spiral. Its radius and base "
-                "strength are that feature's own two sliders, and they apply here even while "
-                "Environment Ambient itself is switched off. Environment Ambient must be "
-                "installed for this to do anything: the kernel lives in its shader folder, so an "
-                "SSRT-only install compiles the term out entirely.\n\n"
-                "Applied only to the kept ambient, never to the traced radiance -- a ray that "
-                "found nearby geometry already returns that geometry's light instead of the "
-                "environment's, so darkening it as well would count the occlusion twice. Cheap: "
-                "evaluated only where reinjection actually left ambient behind.");
-
-        if (settings.EnableReinjectionContactOcclusion) {
-            ImGui::SliderFloat("Contact Occlusion Strength", &settings.ReinjectionContactStrength, 0.0f, 2.0f, "%.2f");
-            if (auto _tt = Util::HoverTooltipWrapper())
-                ImGui::Text(
-                    "1 applies the kernel exactly as Environment Ambient's Contact Radius and "
-                    "Contact Strength define it, so the two paths that use it agree. 0 is off. "
-                    "Above 1 deepens the term past what the kernel reports, for scenes where the "
-                    "reinjected ambient leaves more to darken than Environment Ambient's own "
-                    "frame does.");
-        }
     }
 
     ImGui::Separator();
@@ -773,13 +693,10 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
     if (globals::features::skylighting.loaded)
 		defines.push_back({ "SKYLIGHTING", nullptr });
 
-    // (contact noise) Says that EnvAmbient.hlsli exists to be included, which is what the diffuse
-    // fallback's contact-occlusion term needs -- the kernel lives in that feature's non-CORE shader
-    // folder. Gated on `loaded`, not on that feature's Enabled flag, exactly as Deferred.cpp gates
-    // the same define for DeferredCompositeCS: the runtime dial is the cbuffer's
-    // FallbackContactStrength, so turning the term off never forces a recompile.
-    if (globals::features::environmentAmbient.loaded)
-		defines.push_back({ "ENV_AMBIENT", nullptr });
+    // (contact AO) ENV_AMBIENT used to be defined here so that ssrt_raymarch.hlsl could include
+    // EnvAmbient.hlsli for its contact-occlusion kernel. The kernel now lives in Screen Space GI
+    // and reaches the ray march through the SSGI AO texture, so this feature no longer depends on
+    // the Environment Ambient shader folder at all.
 
     const std::string DiffuseSPPStr = std::to_string(settings.DiffuseSPP);
 
@@ -1116,10 +1033,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         // share SampleRandomVector2DBaked, so freezing the phase has to freeze both or the
         // experiment is confounded by whichever one is still animating.
         ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;
-        // (contact noise) Diffuse-only term; the specular permutation never compiles the block that
-        // reads it (SSRT_FALLBACK_CONTACT_AO requires !SSRT_SPECULAR).
-        ssrCBData.FallbackContactStrength = 0.0f;
-        ssrCBData.pad0[0] = ssrCBData.pad0[1] = 0.0f;
+        ssrCBData.pad0[0] = ssrCBData.pad0[1] = ssrCBData.pad0[2] = 0.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -1400,13 +1314,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ssrCBData.OcclusionStrength = settings.OcclusionStrength;
         ssrCBData.CubemapNormalization = settings.CubemapNormalization;
         ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;  // (diagnostic T2)
-        // (contact noise) Zeroed whenever the fallback itself is off, so the ray march never pays
-        // the kernel's ten depth loads for a term with nothing to multiply. The shader's own gate
-        // tests UseDynamicCubemapsAsFallback as well; this keeps the two from disagreeing if either
-        // is edited later.
-        ssrCBData.FallbackContactStrength =
-            ssrCBData.UseDynamicCubemapsAsFallback != 0 ? settings.FallbackContactStrength : 0.0f;
-        ssrCBData.pad0[0] = ssrCBData.pad0[1] = 0.0f;
+        ssrCBData.pad0[0] = ssrCBData.pad0[1] = ssrCBData.pad0[2] = 0.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -1670,11 +1578,20 @@ ScreenSpaceRayTracing::SharedData ScreenSpaceRayTracing::GetCommonBufferData()
     // saved AmbientMult = 0 still reproduces the old look bit for bit the moment the
     // reinjection toggle comes off.
     data.AmbientMult = data.AmbientReinjection != 0u ? 1.0f : settings.AmbientMult;
-    // (reinjection contact occlusion) ANDed with the reinjection flag here as well as gated in
-    // the composite: the term only has a target when there is kept ambient to shape, and the
-    // legacy energy model zeroes the ambient outright.
-    data.ReinjectionContactOcclusion =
-        (data.AmbientReinjection != 0u && settings.EnableReinjectionContactOcclusion) ? 1u : 0u;
-    data.ReinjectionContactStrength = settings.ReinjectionContactStrength;
+    // (contact AO) Screen Space GI's contact pass, described for the ray march's benefit. This is
+    // the only thing SSRT needs to know about it: ssrt_raymarch.hlsl suppresses the near-field
+    // per-ray occlusion vote only while a deterministic term is standing in for it, and the term
+    // reaches the march through the SSGI AO texture, not through this buffer.
+    //
+    // Every condition under which the term does not reach the frame has to clear this, or the ray
+    // march suppresses its own near-field darkening and nothing replaces it -- which would be
+    // strictly worse than the flicker the suppression exists to remove. So: the package present,
+    // the feature on, its contact pass on, *and* its shaders actually compiled -- ShadersOK() is
+    // the same test DrawSSGI uses before it decides to clear the AO output instead of writing it.
+    auto& ssgi = globals::features::screenSpaceGI;
+    const bool ssgiContactLive =
+        ssgi.loaded && ssgi.settings.Enabled && ssgi.settings.EnableContactAo && ssgi.ShadersOK();
+    data.SsgiContactAoActive = ssgiContactLive ? 1u : 0u;
+    data.SsgiContactRadius = ssgi.settings.ContactRadius;
     return data;
 }
