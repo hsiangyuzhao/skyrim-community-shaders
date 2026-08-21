@@ -259,8 +259,16 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
     const float3 sigmaSpatial = sqrt(max(m2 - m1 * m1, 0.0f));
 
     // sigmaTemporal is a *luminance* sigma applied as an absolute floor to all three
-    // channels. Chroma noise is generally the smaller of the two, so this errs wide on
-    // Co/Cg -- the fail-safe direction.
+    // channels. Two approximations, both benign because this is a floor on a box width and
+    // not a tight bound:
+    //   * It is a Rec.709 luminance sigma being compared against a YCoCg-Y one, and
+    //     Y = (r + 2g + b) / 4 differs from the Rec.709 weighting. The two agree exactly on
+    //     neutral grey and diverge to Y/L = 0.70 on saturated green and 1.18 on saturated
+    //     red, i.e. by at most ~30% on fully saturated radiance. Making it exact would mean
+    //     storing YCoCg-Y moments, which would change the quantity the a-trous luminance
+    //     edge-stop is calibrated against (BUG-1) for no measurable gain here.
+    //   * Chroma noise is generally the smaller of the two, so reusing the luma figure errs
+    //     wide on Co/Cg -- the fail-safe direction.
     const float3 halfWidth = sigmas * max(sigmaSpatial, sigmaTemporal);
     const float3 lo = m1 - halfWidth;
     const float3 hi = m1 + halfWidth;
