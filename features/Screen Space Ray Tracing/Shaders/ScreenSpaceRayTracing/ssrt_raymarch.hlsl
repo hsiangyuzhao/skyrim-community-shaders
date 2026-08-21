@@ -566,6 +566,28 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
 }
 #endif
 
+// (guard G2) Last gate before the radiance leaves the ray march and becomes the input of
+// the SVGF chain, whose history textures are persistent and -- until G8 -- never cleared.
+// Every path that can produce a non-finite value converges here: the kMAIN sample (G1
+// covers the read itself, this covers the arithmetic applied after it), the cubemap
+// fallback's normalisation ratio (G7), the skylighting product, and the per-SPP average
+// below. Sanitising once at the write is cheaper than auditing each contributor and is
+// what makes "one bad frame" recoverable instead of permanent.
+//
+// The clamp is on the colour channels only. .w is confidence (diffuse) or confidence
+// (specular) and is a [0,1] quantity; filterNaN/filterInf are the whole guard it needs.
+//
+// No-op on healthy data: filterNaN is the identity on any ordered float, filterInf the
+// identity on any value below infinity, and min(x, 128) the identity for the entire
+// legitimate radiance range (see SSRT_MAX_RADIANCE). Bit-exact, not merely close.
+float4 SSRT_SanitiseRadianceOutput(float4 color)
+{
+    color = filterNaN(color);
+    color = filterInf(color);
+    color.rgb = min(color.rgb, SSRT_MAX_RADIANCE);
+    return color;
+}
+
 [numthreads(8, 8, SAMPLES_PER_PIXEL)] void main(uint3 groupID : SV_GroupID,
                                                 uint3 groupThreadID : SV_GroupThreadID,
                                                 uint3 DTid : SV_DispatchThreadID)
@@ -771,6 +793,22 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
 
             sampleColor = ScreenColorTextureMips.SampleLevel(LinearSampler, hit.xy * FrameBuffer::DynamicResolutionParams1.xy, 0).xyz;
             sampleColor = Color::IrradianceToLinear(sampleColor);
+            // (guard G1) The radiance source is kMAIN, i.e. the accumulated output of every
+            // other feature in the deferred chain. SSRT has no control over what lands
+            // there, and a single non-finite texel produced anywhere upstream is otherwise
+            // read verbatim into the GI signal and from there into the SVGF history, which
+            // has no way of ever getting rid of it. Sanitise on the way in, at the same
+            // point and in the same order as ScreenSpaceGI does for its own radiance
+            // (radianceDisocc.cs.hlsl:139-140).
+            //
+            // Placed *after* IrradianceToLinear rather than before, so it also catches an
+            // Inf manufactured by the gamma/linear transform itself out of a merely huge
+            // finite input. On finite, in-range radiance both calls are the identity:
+            // filterNaN's ISNAN test is false for any ordered value and filterInf's
+            // exponent test is false for any value below the float32 infinity, so every
+            // healthy pixel keeps its exact bit pattern.
+            sampleColor = filterNaN(sampleColor);
+            sampleColor = filterInf(sampleColor);
 #if !defined(SSRT_SPECULAR)
             sampleColor *= SharedData::ssrtSettings.DiffuseMult;
 #else
@@ -889,7 +927,7 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
 #endif
 
 #if defined(SSRT_SPECULAR)
-    outColor = localSample;
+    outColor = SSRT_SanitiseRadianceOutput(localSample);  // (guard G2)
     SSRColorOutput[coords.xy] = outColor;
     SSRTHitDistanceOutput[coords.xy] = hit_distance;
 #elif SHARC_UPDATE
@@ -903,6 +941,9 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
         }
         outColor.xyz /= SAMPLES_PER_PIXEL;
         outColor.w = saturate(outColor.w / SAMPLES_PER_PIXEL);
+        // (guard G2) After the average, not before: a single poisoned SPP slot turns the
+        // whole sum non-finite, so the useful place to cut is the resolved value.
+        outColor = SSRT_SanitiseRadianceOutput(outColor);
         SSRColorOutput[coords.xy] = outColor;
     }
 #endif
