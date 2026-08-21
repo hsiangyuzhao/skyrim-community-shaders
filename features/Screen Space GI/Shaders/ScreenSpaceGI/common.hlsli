@@ -59,9 +59,10 @@ cbuffer SSGICB : register(b1)
 	float NormalDisocclusion;
 	uint MaxAccumFrames;
 
+	uint MaxAccumFramesAO;
 	float BlurRadius;
 	float DistanceNormalisation;
-	float2 pad;
+	float pad;
 };
 
 SamplerState samplerPointClamp : register(s0);
@@ -81,10 +82,92 @@ float2 filterNaN(float2 v) { return float2(filterNaN(v.x), filterNaN(v.y)); }
 float3 filterNaN(float3 v) { return float3(filterNaN(v.x), filterNaN(v.y), filterNaN(v.z)); }
 float4 filterNaN(float4 v) { return float4(filterNaN(v.x), filterNaN(v.y), filterNaN(v.z), filterNaN(v.w)); }
 
-float filterInf(float v) { return isinf(v) ? 0 : v; }
+// (guard N1) Spelled as an explicit exponent test rather than `isinf(v)`, for the same reason
+// ISNAN above is spelled out rather than calling isnan(): fxc is entitled to assume its inputs
+// are finite unless /Gis is passed, and Util::CompileShader passes
+// D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3 (== /Ges /O3) -- not IEEE
+// strictness. On the Screen Space Ray Tracing side, using isinf() made fxc emit "warning X3577:
+// value cannot be infinity, isinf() may not be necessary. /Gis may force isinf() to be
+// performed" the moment the equivalent helpers acquired their first caller, i.e. the compiler
+// was telling us it reserved the right to delete the guard. Every filterInf() below therefore
+// had to be assumed dead. The bit test is unfoldable and lowers to the same three instructions
+// fxc generated for isinf() anyway (and 0x7fffffff / ieq 0x7f800000 / movc), so this costs
+// nothing and removes the assumption.
+//
+// Independent copy of the helper in
+// features/Screen Space Ray Tracing/Shaders/ScreenSpaceRayTracing/ssrt_common.hlsli (guards
+// G1/G2/G9). Duplicated on purpose: features must not #include across feature directories,
+// since each ships as its own package and either may be absent at runtime.
+float filterInf(float v) { return ((asuint(v) & 0x7FFFFFFFu) == 0x7F800000u) ? 0 : v; }
 float2 filterInf(float2 v) { return float2(filterInf(v.x), filterInf(v.y)); }
 float3 filterInf(float3 v) { return float3(filterInf(v.x), filterInf(v.y), filterInf(v.z)); }
 float4 filterInf(float4 v) { return float4(filterInf(v.x), filterInf(v.y), filterInf(v.z), filterInf(v.w)); }
+
+// (guard N4) "Is this value usable arithmetic?", i.e. neither NaN nor +-Inf.
+//
+// Deliberately *not* `isfinite()`. `isfinite` is specified as `!isnan(v) && !isinf(v)` and
+// therefore inherits both of the assumptions fxc is allowed to make about its inputs without
+// /Gis (see the note on filterInf above), so the compiler is entitled to fold the whole guard
+// away.
+//
+// A single exponent test covers both cases at once and cannot be folded at all: an IEEE-754
+// binary32 value is non-finite exactly when its 8 exponent bits are all set -- mantissa 0 gives
+// +-Inf and any other mantissa gives a NaN -- so the sign and mantissa need not be looked at.
+// Two integer ops per component, against the seven the `!ISNAN(v) && exponentTest` spelling
+// costs, which matters because this runs once per history tap in radianceDisocc.cs.hlsl, i.e.
+// four times per lane.
+//
+// Same provenance as filterInf above (ssrt_common.hlsli guard G4), copied rather than shared.
+bool isFiniteSafe(float v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
+bool isFiniteSafe(float2 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y); }
+bool isFiniteSafe(float3 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && isFiniteSafe(v.z); }
+bool isFiniteSafe(float4 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && isFiniteSafe(v.z) && isFiniteSafe(v.w); }
+
+// (guard N2) Ceiling on any single radiance channel entering the temporal chain.
+//
+// Purpose is overflow containment, not tone mapping. filterNaN / filterInf only catch values
+// that have *already* become non-finite, and radianceDisocc.cs.hlsl can manufacture a fresh Inf
+// out of perfectly finite inputs: with Linear Lighting disabled, Color::RadianceToLinear is
+// GammaToLinear, i.e. pow(x, 2.2). The source is the forward colour target (R11G11B10, up to
+// ~65024) scaled by IL Source Brightness (UI range 0..6), and the destination texRadiance is
+// also R11G11B10, whose largest representable value is ~65024. So any input above
+// 65024^(1/2.2) ~= 320 exponentiates past the target's range and is stored as +Inf -- reachable
+// on a sun-facing snow specular or an emissive, not just on corrupt data. From there the Inf
+// spreads through the radiance mip prefilter and into the IL history, where it is permanent.
+// Clamping the post-conversion value bounds the whole chain, because the temporal EMA can only
+// ever move *towards* the sample it is handed.
+//
+// Why this cannot touch healthy imagery: after RadianceToLinear these are linear scene radiances
+// in the same units kMAIN carries, where 1.0 is a diffuse white surface under full sunlight. The
+// brightest legitimate IL *source* -- a torch flame, a sunlit snow highlight -- lands in the low
+// tens. 128 is therefore ~10x above the top of the real signal range: a tripwire, and a pixel
+// that hits it was already broken. Same value and same reasoning as SSRT_MAX_RADIANCE in
+// features/Screen Space Ray Tracing/Shaders/ScreenSpaceRayTracing/ssrt_common.hlsli, kept
+// numerically identical so the two features cannot disagree about what "too bright" means.
+#define SSGI_MAX_RADIANCE 128.0f
+
+// (guard N3/N5) Magnitude ceiling on the IL / specular channels leaving gi.cs.hlsl.
+//
+// Every one of those targets is half precision (texIlY and texGiSpecular are
+// R16G16B16A16_FLOAT, texIlCoCg is R16G16_FLOAT; see ScreenSpaceGI::SetupResources), so the
+// largest value they can represent is 65504 and anything above it is stored as +-Inf. Once one
+// lands in the IL history it is permanent -- lerp(Inf, curr, f) is Inf for every finite f -- and
+// blur.cs.hlsl then spreads it to eight more texels per frame.
+//
+// 16384 == 2^14 leaves two binades of headroom under 65504, which is what the *consumers* need:
+// the value is read back as half, then scaled by AO Power / IL Source Brightness and multiplied
+// into the ambient term in DeferredCompositeCS, and any of those products must still be
+// representable. The bound is self-maintaining above this point, because everything downstream
+// of the clamp is a convex combination: the temporal EMA factor rcp(accumFrames) is in (0, 1],
+// and the blur writes ySum/wSum with all weights positive, so neither can exceed the largest
+// input it was given.
+//
+// Why this cannot touch healthy imagery: with radiance capped at SSGI_MAX_RADIANCE the SH2
+// luminance coefficients integrate to the same order of magnitude as their input times an O(1)
+// solid-angle factor, i.e. the low hundreds in the worst case. 16384 is two orders of magnitude
+// above that. AO is exempt: it lives in an R8_UNORM target, which cannot carry a non-finite or
+// out-of-range value in the first place.
+#define SSGI_MAX_OUTPUT 16384.0f
 
 // screenPos - normalised position in FrameDim, one eye only
 // uv - normalised position in FrameDim, both eye

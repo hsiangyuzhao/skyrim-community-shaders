@@ -593,15 +593,27 @@ void CalculateGI(
 			currAo, currY, currCoCg, currGIAOSpecular);
 
 #ifdef TEMPORAL_DENOISER
-		float lerpFactor = rcp(srcAccumFrames[pxCoord] * 255);
+		const float accumFrames = srcAccumFrames[pxCoord] * 255;
+		const float lerpFactor = rcp(accumFrames);
 
 		// AO was the one channel left out of the temporal filter, even though the whole path for it
-		// already existed: radianceDisocc.cs.hlsl:147 writes the reprojected previous AO into the
+		// already existed: radianceDisocc.cs.hlsl writes the reprojected previous AO into the
 		// texture this pass binds as srcPrevAo, and nothing read it. That is why AO was the channel
 		// that visibly flickered while indirect light sat still - it was the only single-frame
 		// estimate in the output. It shares accum_frames with the other channels, so the same
-		// disocclusion test resets it and the same MaxAccumFrames bounds it.
-		currAo = lerp(srcPrevAo[pxCoord], currAo, lerpFactor);
+		// disocclusion test resets it.
+		//
+		// (F1) It does not share MaxAccumFrames, though. AO is the one output channel that is both
+		// multiplicative (DeferredCompositeCS scales the whole ambient and indirect term by it) and
+		// spatially unfiltered (blur.cs.hlsl only touches IL), so a stale AO sample is not diluted
+		// by anything before it reaches the frame - it lands as a hard dark patch where the
+		// occluder used to be. At MaxAccumFrames=16 the EMA has a ~36-frame tail, long enough to
+		// leave a visible dark trail behind anything that moves. Capping the *effective* frame
+		// count for this channel alone shortens the tail without touching IL, where the long
+		// window is what suppresses the noise. Set MaxAccumFramesAO == MaxAccumFrames to get the
+		// old shared behaviour back.
+		const float lerpFactorAo = rcp(min(accumFrames, (float)MaxAccumFramesAO));
+		currAo = lerp(srcPrevAo[pxCoord], currAo, lerpFactorAo);
 		currY = lerp(srcPrevY[pxCoord], currY, lerpFactor);
 		currCoCg = lerp(srcPrevCoCg[pxCoord], currCoCg, lerpFactor);
 #	ifdef GI_SPECULAR
@@ -609,9 +621,17 @@ void CalculateGI(
 #	endif
 #endif
 	}
-	currY = filterNaN(currY);
-	currCoCg = filterNaN(currCoCg);
-	currGIAOSpecular = filterNaN(currGIAOSpecular);
+	// (guard N3/N5) These three are the writers of the IL / specular history, so anything
+	// non-finite that leaves here is permanent: the temporal EMA below is lerp(prev, curr, f),
+	// and lerp(Inf, curr, f) is Inf for every finite f, so a single poisoned texel survives
+	// forever and blur.cs.hlsl hands it to eight more neighbours every frame. Only NaN was being
+	// rejected; Inf went straight through. Note the clamp is a magnitude clamp, not a floor at
+	// zero -- currY is a set of SH2 coefficients and currCoCg is chroma, both legitimately
+	// signed. currAo needs none of this: its target is R8_UNORM, which cannot store a non-finite
+	// or out-of-range value.
+	currY = clamp(filterInf(filterNaN(currY)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
+	currCoCg = clamp(filterInf(filterNaN(currCoCg)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
+	currGIAOSpecular = clamp(filterInf(filterNaN(currGIAOSpecular)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
 
 	outAo[pxCoord] = currAo;
 	outY[pxCoord] = currY;

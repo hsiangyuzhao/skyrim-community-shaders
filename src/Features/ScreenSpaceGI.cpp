@@ -28,6 +28,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DepthDisocclusion,
 	NormalDisocclusion,
 	MaxAccumFrames,
+	MaxAccumFramesAO,
 	BlurRadius,
 	DistanceNormalisation)
 
@@ -291,6 +292,15 @@ void ScreenSpaceGI::DrawSettings()
 				ImGui::SliderInt("Max Frame Accumulation", (int*)&settings.MaxAccumFrames, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
 				if (auto _tt = Util::HoverTooltipWrapper())
 					ImGui::Text("How many past frames to accumulate results with. Higher values are less noisy but potentially cause ghosting.");
+
+				ImGui::SliderInt("Max Frame Accumulation (AO)", (int*)&settings.MaxAccumFramesAO, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text(
+						"Same as above, but for the ambient occlusion channel only.\n\n"
+						"AO is multiplicative and gets no spatial filtering of its own, so a long "
+						"temporal window drags a moving object's occlusion into a dark trail behind it. "
+						"4 is a compromise between that trailing and the flickering that returns at 1. "
+						"Set this equal to Max Frame Accumulation to restore the previous behaviour.");
 			}
 
 			ImGui::Separator();
@@ -663,6 +673,7 @@ void ScreenSpaceGI::UpdateSB()
 		data.DepthDisocclusion = settings.DepthDisocclusion;
 		data.NormalDisocclusion = settings.NormalDisocclusion;
 		data.MaxAccumFrames = settings.MaxAccumFrames;
+		data.MaxAccumFramesAO = settings.MaxAccumFramesAO;
 		data.BlurRadius = settings.BlurRadius;
 		data.DistanceNormalisation = settings.DistanceNormalisation;
 	}
