@@ -603,28 +603,28 @@ float4 SSRT_SanitiseRadianceOutput(float4 color)
     return color;
 }
 
-// (guard G7) Upper bound on the CubemapNormalization brightness ratio.
+// (guard G7) Non-finite guard on the CubemapNormalization brightness ratio.
 //
-// The ratio is directionalAmbientLuminance / max(envLuminance, 1e-4) and had no ceiling at
-// all. The denominator floor bounds it at 1e4 * numerator, so a directional-ambient
-// luminance in the hundreds is already enough to produce a factor of 1e6, and a non-finite
-// DirectionalAmbient produces Inf outright -- at which point the surrounding
+// The ratio is directionalAmbientLuminance / max(envLuminance, 1e-4); a non-finite
+// DirectionalAmbient produces Inf, at which point the surrounding
 // `lerp(envColor, envColor * ratio, CubemapNormalization)` is *worse* than a plain
 // multiply, because at the default CubemapNormalization = 0 the lerp evaluates
 // envColor + 0 * (Inf - envColor) = 0 * Inf = NaN. The feature being switched off does not
 // protect it.
 //
-// 16 as the ceiling: the ratio's job is to pull a cubemap captured under one lighting
-// condition towards the current ambient, and the honest dynamic range between two Skyrim
-// weather/interior ambients is well inside 4x. 16 is two doublings past the top of that,
-// so it can only engage when the two luminances are not comparable quantities any more --
-// which is the definition of the failure it exists to contain. Inert for every real
-// ratio, hence bit-identical output on healthy data.
-#define SSRT_CUBEMAP_NORMALIZATION_MAX_RATIO 16.0f
-
+// Deliberately NOT a magnitude ceiling. The numerator (DALC luminance scaled by
+// ReflectionNormalisationScale) and the denominator (the cubemap's mip-15 average
+// luminance) are not comparable quantities -- bridging that scale gap is the entire job of
+// CubemapNormalization -- and in regions with no direct light the honest ratio routinely
+// runs far past any small constant. A first version of this guard capped the ratio at 16
+// and measurably darkened the fallback in exactly those regions. Magnitude overflow is
+// already contained downstream by G2's SSRT_MAX_RADIANCE ceiling, so the only thing that
+// must be stopped here is non-finiteness itself; 1.0 as the fallback multiplies envColor
+// by exactly nothing. Identity (bit-exact) for every finite ratio.
 float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 {
-    return min(ambientLuminance / max(envLuminance, 1e-4), SSRT_CUBEMAP_NORMALIZATION_MAX_RATIO);
+    float ratio = ambientLuminance / max(envLuminance, 1e-4);
+    return isFiniteSafe(ratio) ? ratio : 1.0f;
 }
 
 [numthreads(8, 8, SAMPLES_PER_PIXEL)] void main(uint3 groupID : SV_GroupID,
