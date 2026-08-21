@@ -30,6 +30,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientMult,
     EnableAmbientReinjection,
     AmbientReinjectionStrength,
+    EnableReinjectionContactOcclusion,
+    ReinjectionContactStrength,
     OcclusionStrength,
     CubemapNormalization,
     EnableSVGF,
@@ -66,6 +68,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientMult,
     EnableAmbientReinjection,
     AmbientReinjectionStrength,
+    EnableReinjectionContactOcclusion,
+    ReinjectionContactStrength,
     OcclusionStrength,
     CubemapNormalization,
     EnableSVGF,
@@ -152,6 +156,44 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "truth but never darker than vanilla. Slightly below 1 is a reasonable hedge in "
                 "scenes whose on-screen surfaces are not representative of the surrounding "
                 "environment.");
+
+        ImGui::Checkbox("Contact Occlusion", &settings.EnableReinjectionContactOcclusion);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Darkens the ambient the reinjection keeps with a centimetre-scale occlusion "
+                "term, restoring the near-field contrast the old cubemap-fallback path had and "
+                "this one does not.\n\n"
+                "Why it is missing without this. The fallback multiplied its ambient by "
+                "MultiBounceAO(albedo, occlusion * SSGI AO) inside the ray march, and that "
+                "occlusion was per-ray at full resolution -- it is what darkened hair against a "
+                "face and cloth where it meets skin. Reinjection fills the unresolved directions "
+                "with the vanilla ambient instead, which is shaped by Screen Space GI's "
+                "half-resolution AO and nothing finer, and the confidence that selects it has "
+                "been through a 7x7 spatial blur that erases contact-scale detail by "
+                "construction. The overall level is right; the fine dark detail in the unlit "
+                "parts of the frame is not there.\n\n"
+                "Where the term comes from. It reuses Environment Ambient's contact-occlusion "
+                "kernel verbatim -- a 15 cm (default) depth-buffer AO in the Alchemy/HBAO cosine "
+                "form, ten depth taps on a golden-angle spiral. Its radius and base "
+                "strength are that feature's own two sliders, and they apply here even while "
+                "Environment Ambient itself is switched off. Environment Ambient must be "
+                "installed for this to do anything: the kernel lives in its shader folder, so an "
+                "SSRT-only install compiles the term out entirely.\n\n"
+                "Applied only to the kept ambient, never to the traced radiance -- a ray that "
+                "found nearby geometry already returns that geometry's light instead of the "
+                "environment's, so darkening it as well would count the occlusion twice. Cheap: "
+                "evaluated only where reinjection actually left ambient behind.");
+
+        if (settings.EnableReinjectionContactOcclusion) {
+            ImGui::SliderFloat("Contact Occlusion Strength", &settings.ReinjectionContactStrength, 0.0f, 2.0f, "%.2f");
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text(
+                    "1 applies the kernel exactly as Environment Ambient's Contact Radius and "
+                    "Contact Strength define it, so the two paths that use it agree. 0 is off. "
+                    "Above 1 deepens the term past what the kernel reports, for scenes where the "
+                    "reinjected ambient leaves more to darken than Environment Ambient's own "
+                    "frame does.");
+        }
     }
 
     ImGui::Separator();
@@ -1500,6 +1542,11 @@ ScreenSpaceRayTracing::SharedData ScreenSpaceRayTracing::GetCommonBufferData()
     // saved AmbientMult = 0 still reproduces the old look bit for bit the moment the
     // reinjection toggle comes off.
     data.AmbientMult = data.AmbientReinjection != 0u ? 1.0f : settings.AmbientMult;
-    data.pad0[0] = data.pad0[1] = 0.0f;
+    // (reinjection contact occlusion) ANDed with the reinjection flag here as well as gated in
+    // the composite: the term only has a target when there is kept ambient to shape, and the
+    // legacy energy model zeroes the ambient outright.
+    data.ReinjectionContactOcclusion =
+        (data.AmbientReinjection != 0u && settings.EnableReinjectionContactOcclusion) ? 1u : 0u;
+    data.ReinjectionContactStrength = settings.ReinjectionContactStrength;
     return data;
 }
