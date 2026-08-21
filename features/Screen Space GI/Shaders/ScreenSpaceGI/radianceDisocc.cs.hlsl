@@ -48,18 +48,45 @@ void readHistory(
 
 	bool depth_pass = dot(delta_pos, delta_pos) < movement_thres * movement_thres;
 	// bool normal_pass = normal_prod * normal_prod > NormalDisocclusion;
-	if (depth_pass) {
+	if (!depth_pass)
+		return;
+
 #ifdef TEMPORAL_DENOISER
-		prev_ao += srcPrevAo[pixCoord] * bilinear_weight;
-		prev_y += srcPrevIlY[pixCoord] * bilinear_weight;
-		prev_co_cg += srcPrevIlCoCg[pixCoord] * bilinear_weight;
-		accum_frames += srcAccumFrames[pixCoord] * bilinear_weight;
+	const float4 hist_y = srcPrevIlY[pixCoord];
+	const float2 hist_co_cg = srcPrevIlCoCg[pixCoord];
+	bool hist_finite = isFiniteSafe(hist_y) && isFiniteSafe(hist_co_cg);
 #	ifdef GI_SPECULAR
-		prev_gi_specular += srcPrevGISpecular[pixCoord] * bilinear_weight;
+	const float4 hist_gi_specular = srcPrevGISpecular[pixCoord];
+	hist_finite = hist_finite && isFiniteSafe(hist_gi_specular);
+#	endif
+
+	// (guard N4) The only self-healing guard in the chain. Everything else here bounds what may
+	// *enter* the history; this is what lets the history get out of a bad state once it is in
+	// one. A non-finite tap is treated exactly like a failed depth test -- dropped from both the
+	// weighted sum and wsum -- so if all four taps are poisoned wsum stays 0, the caller's
+	// `wsum > 1e-2` test fails, accum_frames resets to 1 and the pixel takes the existing
+	// disocclusion path. No new mechanism, no new failure mode: the worst case is one frame of
+	// single-sample GI on that texel, which is what a genuine disocclusion already produces.
+	// Matches SSRT_LoadHistory's semantics in ssrt_temporal.hlsl.
+	//
+	// The whole tap is rejected, not just the offending channel: all channels share one
+	// accum_frames, so accepting AO from a tap whose IL was thrown away would leave the surviving
+	// channel weighted as if it had been accumulating for N frames when it had not.
+	//
+	// prev_ao and accum_frames are not tested. Their sources are R8_UNORM, which has no encoding
+	// for a non-finite value, so a test on them could never fire.
+	if (!hist_finite)
+		return;
+
+	prev_ao += srcPrevAo[pixCoord] * bilinear_weight;
+	prev_y += hist_y * bilinear_weight;
+	prev_co_cg += hist_co_cg * bilinear_weight;
+	accum_frames += srcAccumFrames[pixCoord] * bilinear_weight;
+#	ifdef GI_SPECULAR
+	prev_gi_specular += hist_gi_specular * bilinear_weight;
 #	endif
 #endif
-		wsum += bilinear_weight;
-	}
+	wsum += bilinear_weight;
 };
 
 [numthreads(8, 8, 1)] void main(const uint2 pixCoord
