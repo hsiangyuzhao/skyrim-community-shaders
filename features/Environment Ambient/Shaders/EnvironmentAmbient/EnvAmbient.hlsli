@@ -180,9 +180,16 @@ namespace EnvironmentAmbient
 	 * @param a_normalWS   Geometric world-space normal.
 	 * @param a_depth      This pixel's raw depth, used to measure the local pixel-to-world scale.
 	 * @param a_eyeIndex   VR eye.
+	 * @param a_extent     Valid texel extent of the depth buffer for this consumer, in texels. The
+	 *                     composite dispatches at the full buffer extent and passes BufferDim; the
+	 *                     SSRT ray march dispatches at the *render* extent, whose sub-rect is the
+	 *                     only part of the depth buffer holding this frame's values, so a 64-pixel
+	 *                     tap radius near the sub-rect edge must clamp there and not at BufferDim.
+	 * @param a_phase      Spiral rotation, radians. Whether it advances with the frame is the
+	 *                     caller's decision, not the kernel's -- see the two wrappers below.
 	 * @return Visibility in [0, 1]; 1 is unoccluded.
 	 */
-	float EvaluateContactOcclusion(uint2 a_pixCoord, float3 a_positionWS, float3 a_normalWS, float a_depth, uint a_eyeIndex)
+	float EvaluateContactOcclusionEx(uint2 a_pixCoord, float3 a_positionWS, float3 a_normalWS, float a_depth, uint a_eyeIndex, float2 a_extent, float a_phase)
 	{
 		const float radius = max(SharedData::envAmbientSettings.ContactRadius, 0.1) / GAME_UNIT_TO_CM;
 
@@ -197,18 +204,16 @@ namespace EnvironmentAmbient
 		float pixelRadius = clamp(radius / max(unitsPerPixel, 1e-4), MinContactPixels, MaxContactPixels);
 
 		int2 lo = int2(0, 0);
-		int2 hi = int2(SharedData::BufferDim.xy) - 1;
+		int2 hi = int2(a_extent) - 1;
 #if defined(VR)
-		// Keep every tap inside this eye's half of the side-by-side buffer. BufferDim is float, so
+		// Keep every tap inside this eye's half of the side-by-side buffer. The extent is float, so
 		// halve it before the cast rather than emitting an integer divide.
-		int eyeWidth = (int)(SharedData::BufferDim.x * 0.5);
+		int eyeWidth = (int)(a_extent.x * 0.5);
 		lo.x = (int)a_eyeIndex * eyeWidth;
 		hi.x = lo.x + eyeWidth - 1;
 #endif
 
-		// Per-pixel, per-frame spiral rotation. InterleavedGradientNoise cycles the frame term with
-		// period 16, so the sequence is finite and TAA converges instead of chasing it.
-		float phase = Random::InterleavedGradientNoise(float2(a_pixCoord), SharedData::FrameCount) * Math::TAU;
+		float phase = a_phase;
 		float radiusSq = radius * radius;
 
 		float occlusion = 0.0;
@@ -250,6 +255,47 @@ namespace EnvironmentAmbient
 		occlusion *= SharedData::envAmbientSettings.ContactStrength * (4.0 / float(ContactSamples));
 
 		return saturate(1.0 - occlusion);
+	}
+
+	/**
+	 * @brief Contact occlusion for a full-buffer consumer that has temporal anti-aliasing behind it.
+	 *
+	 * Bit-identical to what this function did before it was split: the full buffer extent as the tap
+	 * clamp, and a per-pixel, per-frame spiral rotation. InterleavedGradientNoise cycles the frame
+	 * term with period 16, so the sequence is finite and TAA converges instead of chasing it.
+	 *
+	 * Used by DeferredCompositeCS for Environment Ambient's own term and for the SSRT ambient
+	 * reinjection path.
+	 */
+	float EvaluateContactOcclusion(uint2 a_pixCoord, float3 a_positionWS, float3 a_normalWS, float a_depth, uint a_eyeIndex)
+	{
+		return EvaluateContactOcclusionEx(a_pixCoord, a_positionWS, a_normalWS, a_depth, a_eyeIndex,
+			SharedData::BufferDim.xy,
+			Random::InterleavedGradientNoise(float2(a_pixCoord), SharedData::FrameCount) * Math::TAU);
+	}
+
+	/**
+	 * @brief Contact occlusion with a frame-static spiral, for a consumer that must not depend on
+	 *        temporal accumulation.
+	 *
+	 * The SSRT diffuse *fallback* is such a consumer. The term it shapes is applied inside the ray
+	 * march and reaches the frame through the SVGF chain, whose edge-stopping weights collapse at
+	 * exactly the depth and normal discontinuities a contact region is made of, and the user may be
+	 * running no anti-aliasing at all. Rotating the spiral with the frame counter there would
+	 * replace one temporal instability with a smaller one instead of removing it.
+	 *
+	 * Dropping the frame term costs nothing and buys exact temporal stability for a static camera:
+	 * InterleavedGradientNoise is a fine-grained spatial dither, so a fixed phase leaves a
+	 * high-frequency, motionless grain on the occlusion field rather than the blotchy low-frequency
+	 * pattern a constant phase would produce, and the ten taps average most of it away already.
+	 *
+	 * @param a_extent Render extent of the dispatch; see EvaluateContactOcclusionEx.
+	 */
+	float EvaluateContactOcclusionStatic(uint2 a_pixCoord, float3 a_positionWS, float3 a_normalWS, float a_depth, uint a_eyeIndex, float2 a_extent)
+	{
+		return EvaluateContactOcclusionEx(a_pixCoord, a_positionWS, a_normalWS, a_depth, a_eyeIndex,
+			a_extent,
+			Random::InterleavedGradientNoise(float2(a_pixCoord)) * Math::TAU);
 	}
 
 	// Sky visibility is sampled once per pixel by the caller (DeferredCompositeCS.hlsl), which needs

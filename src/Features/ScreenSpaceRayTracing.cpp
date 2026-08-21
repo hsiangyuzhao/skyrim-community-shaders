@@ -9,6 +9,9 @@
 #include "ShaderCache.h"
 
 #include "DynamicCubemaps.h"
+// (contact noise) For globals::features::environmentAmbient.loaded, which decides whether the
+// diffuse fallback's contact-occlusion term can be compiled. Globals.h only forward declares it.
+#include "EnvironmentAmbient.h"
 #include "ScreenSpaceGI.h"
 #include "Skylighting.h"
 
@@ -33,6 +36,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     EnableReinjectionContactOcclusion,
     ReinjectionContactStrength,
     OcclusionStrength,
+    FallbackContactStrength,
     CubemapNormalization,
     EnableSVGF,
     MaxAccumulatedFrames,
@@ -71,6 +75,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     EnableReinjectionContactOcclusion,
     ReinjectionContactStrength,
     OcclusionStrength,
+    FallbackContactStrength,
     CubemapNormalization,
     EnableSVGF,
     MaxAccumulatedFrames,
@@ -110,7 +115,46 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::Text(
             "How strongly a ray that ran into the back of geometry darkens the fallback "
             "ambient for that pixel. Rays that simply failed to trace no longer count "
-            "towards this.");
+            "towards this.\n\n"
+            "While Contact Shading below is on, this only counts geometry further away than "
+            "that setting's radius. Anything closer is handed to Contact Shading instead, "
+            "because two rays per pixel cannot decide how dark a tight contact is without the "
+            "answer changing every frame. The two never darken the same geometry twice.");
+
+    // Shapes the diffuse cubemap fallback and nothing else, so it is inert in the two
+    // configurations that have no fallback: Ambient Reinjection forces the fallback off (see
+    // GetCommonBufferData), and the fallback checkbox further down turns it off directly. Greyed out
+    // rather than hidden so the saved value stays visible.
+    const bool fallbackContactLive = !settings.EnableAmbientReinjection && settings.UseDynamicCubemapsAsFallback;
+    ImGui::BeginDisabled(!fallbackContactLive);
+    ImGui::SliderFloat("Contact Shading", &settings.FallbackContactStrength, 0.0f, 2.0f, "%.2f");
+    ImGui::EndDisabled();
+    if (auto _tt = Util::HoverTooltipWrapper()) {
+        if (!fallbackContactLive)
+            ImGui::Text(
+                "Inactive: this shapes the diffuse cubemap fallback, and there is no fallback "
+                "running. Ambient Reinjection forces it off, and so does the diffuse fallback "
+                "checkbox below. The saved value is kept.\n\n"
+                "Ambient Reinjection has its own version of this control, under Ambient Energy.\n\n");
+        ImGui::Text(
+            "Darkens the fallback ambient where geometry is touching, at a scale of a few "
+            "centimetres: hair against a face, cloth where it meets skin, leaves pressed "
+            "together.\n\n"
+            "This shading was already there, but it was decided by the two rays this pixel "
+            "traces, and each of those rays could only answer yes or no. Two yes-or-no votes "
+            "cannot say how dark something is, and the rays are aimed somewhere new every "
+            "frame, so the answer kept changing -- which is what the flickering dark speckle "
+            "around hair and foliage was. This measures it from the depth buffer instead, the "
+            "same way every frame, so the shadow stops moving. It does not rely on the "
+            "denoiser or on any anti-aliasing, so it looks the same with TAA, DLSS, FSR or "
+            "nothing at all.\n\n"
+            "1 matches the strength Environment Ambient's own Contact Radius and Contact "
+            "Strength sliders define, so both of SSRT's ambient modes shade contact the same "
+            "way. Above 1 deepens it. 0 turns it off and puts the old flickering behaviour "
+            "back, for an A/B comparison.\n\n"
+            "Environment Ambient must be installed for this to do anything -- the measurement "
+            "lives in that feature's shader folder. It does not need to be switched on.");
+    }
     ImGui::BeginDisabled(settings.EnableAmbientReinjection);
     ImGui::SliderFloat("Ambient Multiplier", &settings.AmbientMult, 0.0f, 1.0f, "%.2f");
     ImGui::EndDisabled();
@@ -729,6 +773,14 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
     if (globals::features::skylighting.loaded)
 		defines.push_back({ "SKYLIGHTING", nullptr });
 
+    // (contact noise) Says that EnvAmbient.hlsli exists to be included, which is what the diffuse
+    // fallback's contact-occlusion term needs -- the kernel lives in that feature's non-CORE shader
+    // folder. Gated on `loaded`, not on that feature's Enabled flag, exactly as Deferred.cpp gates
+    // the same define for DeferredCompositeCS: the runtime dial is the cbuffer's
+    // FallbackContactStrength, so turning the term off never forces a recompile.
+    if (globals::features::environmentAmbient.loaded)
+		defines.push_back({ "ENV_AMBIENT", nullptr });
+
     const std::string DiffuseSPPStr = std::to_string(settings.DiffuseSPP);
 
     defines.push_back({ "DIFFUSE_SPP", DiffuseSPPStr.c_str() });
@@ -1064,7 +1116,10 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         // share SampleRandomVector2DBaked, so freezing the phase has to freeze both or the
         // experiment is confounded by whichever one is still animating.
         ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;
-        ssrCBData.pad0[0] = ssrCBData.pad0[1] = ssrCBData.pad0[2] = 0.0f;
+        // (contact noise) Diffuse-only term; the specular permutation never compiles the block that
+        // reads it (SSRT_FALLBACK_CONTACT_AO requires !SSRT_SPECULAR).
+        ssrCBData.FallbackContactStrength = 0.0f;
+        ssrCBData.pad0[0] = ssrCBData.pad0[1] = 0.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -1345,7 +1400,13 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ssrCBData.OcclusionStrength = settings.OcclusionStrength;
         ssrCBData.CubemapNormalization = settings.CubemapNormalization;
         ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;  // (diagnostic T2)
-        ssrCBData.pad0[0] = ssrCBData.pad0[1] = ssrCBData.pad0[2] = 0.0f;
+        // (contact noise) Zeroed whenever the fallback itself is off, so the ray march never pays
+        // the kernel's ten depth loads for a term with nothing to multiply. The shader's own gate
+        // tests UseDynamicCubemapsAsFallback as well; this keeps the two from disagreeing if either
+        // is edited later.
+        ssrCBData.FallbackContactStrength =
+            ssrCBData.UseDynamicCubemapsAsFallback != 0 ? settings.FallbackContactStrength : 0.0f;
+        ssrCBData.pad0[0] = ssrCBData.pad0[1] = 0.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();

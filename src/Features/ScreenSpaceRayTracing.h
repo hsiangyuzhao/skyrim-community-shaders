@@ -213,6 +213,19 @@ struct ScreenSpaceRayTracing : Feature
         /// right default, and it keeps as much of the contact darkening as the corrected
         /// mechanism can supply.
         float OcclusionStrength = 1.0f;
+        /// @brief (contact noise) How much of the deterministic contact-occlusion kernel shapes the
+        /// diffuse cubemap fallback's ambient. The fallback counterpart of
+        /// ReinjectionContactStrength, and the A/B switch for the near-field noise fix.
+        ///
+        /// At 0 the ray march also stops suppressing the near-field per-ray occlusion vote, so the
+        /// whole change reverts to P2.1 behaviour with one slider and no recompile. At 1 the kernel
+        /// applies exactly as Environment Ambient's Contact Radius / Contact Strength define it,
+        /// which is what makes the fallback and reinjection paths darken contact at the same rate.
+        ///
+        /// Same install requirement as EnableReinjectionContactOcclusion: the kernel lives in
+        /// Environment Ambient's shader folder, so ssrt_raymarch.hlsl gates the term -- and the vote
+        /// suppression with it -- on that folder being present. An SSRT-only install is unchanged.
+        float FallbackContactStrength = 1.0f;
         float CubemapNormalization = 0.0f;
         bool EnableSVGF = false;
         uint MaxAccumulatedFrames = 16;
@@ -477,9 +490,9 @@ struct ScreenSpaceRayTracing : Feature
     /// shader that binds b1 in this feature.
     ///
     /// The first two float4 rows were full, so FreezeNoisePhase opens a third; sizeof is 48,
-    /// still a multiple of 16 as D3D11 requires. The shader declares only the nine scalars
+    /// still a multiple of 16 as D3D11 requires. The shader declares only the ten scalars
     /// and not the padding -- a shader may declare a prefix of a larger constant buffer, and
-    /// a trailing `float pad0[3]` would *not* mirror this layout in HLSL, where each array
+    /// a trailing `float pad0[2]` would *not* mirror this layout in HLSL, where each array
     /// element is padded to its own 16-byte row.
     struct alignas(16) SSRTCB
     {
@@ -496,7 +509,10 @@ struct ScreenSpaceRayTracing : Feature
         /// @brief (diagnostic T2) Non-zero replaces SharedData::FrameCount with 0 in the
         /// ray-direction noise seed. See Settings::FreezeNoisePhase.
         uint FreezeNoisePhase;
-        float pad0[3];
+        /// @brief (contact noise) See Settings::FallbackContactStrength. Zeroed on the specular
+        /// pass, which shares this buffer but has no diffuse fallback contact term.
+        float FallbackContactStrength;
+        float pad0[2];
     };
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
