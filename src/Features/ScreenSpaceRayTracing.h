@@ -453,14 +453,15 @@ struct ScreenSpaceRayTracing : Feature
         /// rotated into the previous frame's view space, which is the algebraically correct
         /// form that the defect D3 work introduced.
         ///
-        /// The correct form is not the default, and deliberately so. Its algebra is sound but
-        /// it depends on CameraPreviousViewProjUnjittered composed with
-        /// CameraProjUnjitteredInverse really being the inter-frame camera rotation for this
-        /// engine's matrices -- an assumption about matrix contents that no amount of review
-        /// settles. If it does not hold, the rotated normal is nonsense and this gate rejects
-        /// the entire screen, which is exactly the failure the plane repair was made to fix.
-        /// So the default is the form whose failure mode is known and mild, and this switch is
-        /// how the other one earns its place.
+        /// (defect P3) The rotation no longer composes two matrices or inverts one: it reads the
+        /// previous view-space components out of a single forward multiply by
+        /// CameraPreviousViewProjUnjittered and undoes only the projection's own first two rows,
+        /// whose four entries come off CameraProjUnjittered. The one remaining assumption -- that
+        /// the two frames share a field of view -- is tested per pixel by the rotation's
+        /// unit-length self-check, which falls back to the un-rotated normal and paints the pixel
+        /// magenta in the diagnostic view when it fails. So this can no longer reject the screen
+        /// silently. The default stays off only because the un-rotated form is the one with
+        /// measured in-game behaviour behind it; changing the default is a separate decision.
         bool RotatedNormalGate = false;
         /// @brief (diagnostic H) Render the history-acceptance diagnostic into texDebugHistory.
         ///
@@ -474,6 +475,23 @@ struct ScreenSpaceRayTracing : Feature
         ///   * blue -- rejected by screen bounds, a non-finite history sample, or a zero frame
         ///     count.
         ///   * black -- sky or far plane, where there is no history question to ask.
+        ///   * any yellow -- the acceptance plane could not be built, so the plane test did not
+        ///     run on that pixel and the history was judged by bounds plus normal agreement
+        ///     alone. Four shades name which construction gave up: pale yellow, the shaded point
+        ///     has no image inside the previous frame's depth range; amber, it has no usable
+        ///     reconstruction at all -- non-finite, on the previous camera plane, or failing the
+        ///     closed-loop depth self-check; dark amber, the plane passes through the previous
+        ///     camera; bright lemon, the tolerance came out non-positive.
+        ///   * magenta -- the rotated normal gate is on and its rotation failed its self-check.
+        ///     Only visible with Disable History Depth Test on; otherwise the amber above says
+        ///     the same thing more strongly, since the plane row is built from that rotation.
+        ///
+        /// (defect P3) A full pale-yellow screen with a stationary camera was the finding that
+        /// identified the last arithmetic error in the plane construction: at rest the projection
+        /// chain must return the depth it started from, so a screen-wide range failure could only
+        /// be a matrix that was not the transform its name claimed. The construction now proves
+        /// its own reconstruction against the depth buffer every frame, so that class of failure
+        /// reports itself in amber instead of silently costing the test its effect.
         ///
         /// A uniform colour over the whole screen is the finding: it means one gate is turning
         /// away every candidate everywhere, which is what makes the accumulation degenerate to

@@ -79,15 +79,16 @@ cbuffer DenoiserCB : register(b2)
     // behaviour is measured: it over-rejects during fast turns and passes everything else.
     //
     // 1 compares the current normal *rotated into the previous frame's view space*, which is
-    // the algebraically correct form and what defect D3's repair introduced. The algebra is
-    // sound on paper but it rests on an assumption that cannot be checked offline -- that
-    // CameraPreviousViewProjUnjittered composed with CameraProjUnjitteredInverse really is
-    // the inter-frame camera rotation for this engine's matrices. If that assumption is
-    // wrong the rotated normal is garbage and this gate rejects the entire screen, which is
-    // indistinguishable in its symptoms from the plane test doing the same thing.
+    // the algebraically correct form and what defect D3's repair introduced.
     //
-    // So the default is the form with the known-benign failure mode and this switch is how
-    // the correct-on-paper form gets validated in-game, rather than the other way round.
+    // (defect P3) The rotation no longer composes or inverts anything: it reads the previous
+    // view-space components straight out of one forward multiply by
+    // CameraPreviousViewProjUnjittered, undoing only the projection's own first two rows. The
+    // remaining assumption is that the two frames share a field of view, which the unit-length
+    // self-check at the construction site tests directly; on failure the gate falls back to the
+    // un-rotated normal and the diagnostic view paints the pixel magenta. So this can no longer
+    // reject the screen silently -- but the default stays 0, because the un-rotated form is the
+    // one with years of measured behaviour behind it and switching defaults is a separate change.
     uint rotatedNormalGate;
     // (diagnostic H) Non-zero makes this pass write DebugHistoryOutput. Zero leaves the
     // texture untouched, which is what the specular dispatch always passes -- the two chains
@@ -414,11 +415,9 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 //
 // The replacement uses only operations that some *other* shader in this build already depends on
 // in game, and only in the forward direction:
-//   * uv + raw depth -> current view space, via CameraProjUnjitteredInverse. Same call
-//     ReprojectHit makes for every pixel of this pass (ssrt_common.hlsli), and the same
-//     operation ssrt_raymarch's InvProjectPosition performs for every ray it traces.
-//   * current view space -> world, via CameraViewInverse. ReprojectHit again, plus
-//     ssrt_raymarch's world_space_origin, which every SHARC lookup is addressed by.
+//   * uv + raw depth -> camera-relative world, via CameraViewProjInverse. Exactly what
+//     DeferredCompositeCS builds `positionWS` with for every pixel of every frame, and what
+//     ssrt_raymarch addresses every SHARC hit with (`ScreenSpaceToWorldSpace`).
 //   * world rebase, + CameraPosAdjust - CameraPreviousPosAdjust. The engine moves its world
 //     origin as the player walks and the previous view-projection is defined against the
 //     previous origin. Exactly the correction ScreenSpaceGI's radianceDisocc applies (its own
@@ -427,10 +426,72 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 //     The forward direction only. This is MotionBlur::GetSSMotionVector's second line, which
 //     DeferredCompositeCS uses to publish the sky's motion vectors -- consumed by TAA/DLSS every
 //     frame, so a wrong result there would be visible as smeared sky rather than as silence.
+//   * the current normal -> camera-relative world, via mul(CameraViewInverse, float4(n, 0)).
+//     DeferredCompositeCS's `normalWS`, i.e. the direction every cubemap and skylighting lookup
+//     in the build is already addressed by.
 //   * SharedData::GetScreenDepth, to linearise depth. Used by this feature's own bilateral
 //     weights (ssrt_common.hlsli) and by ScreenSpaceGI.
 // No inverse of any *previous*-frame matrix appears, and no two matrices are multiplied
 // together.
+//
+// ---------------------------------------------------------------------------------------------
+// (defect P3) THE ARITHMETIC ERROR THAT WAS STILL IN HERE, AND THE SELF-CHECK THAT ENDS THE CLASS
+//
+// The P2.4-follow-up form above reached camera-relative world in two steps -- NDC -> current view
+// space through CameraProjUnjitteredInverse, then view -> world through CameraViewInverse -- and
+// was measured dead in game a second time: texDebugHistory came back *uniformly pale yellow*,
+// i.e. SSRT_PLANE_FAIL_PREV_RANGE on every non-sky pixel, with a stationary camera.
+//
+// That reading is decisive on its own. With the camera at rest CameraPosAdjust equals
+// CameraPreviousPosAdjust and the previous view-projection equals the current one, so the chain
+// collapses to P * V * V^-1 * P^-1 applied to (ndc, rawDepth, 1) -- the identity. The recovered
+// previous NDC depth is then *rawDepth itself*, which is in (0, 1) for every rasterised pixel by
+// construction. A whole screen failing the (0, 1) range gate at rest cannot be a tuning problem,
+// a resolution convention, a y flip or a VR sub-rect question: every one of those cancels in a
+// round trip. It can only be that one of the four matrices is not the transform its name claims,
+// in the multiplication convention this file uses.
+//
+// Three of the four are load-bearing elsewhere in the build and so cannot be:
+// CameraViewProjUnjittered and CameraPreviousViewProjUnjittered publish the sky motion vectors
+// TAA/DLSS consume; CameraViewInverse orients every cubemap fetch; CameraViewProjInverse
+// reconstructs DeferredCompositeCS's world position. CameraProjUnjitteredInverse is the odd one
+// out: `grep` finds exactly two readers in the whole tree, and *both* are this test. The third
+// apparent reader -- the chain at the top of ssrt_common.hlsli's ReprojectHit, which the P2.4
+// comment cited as vouching for it -- computes `prevScreen` from it and then unconditionally
+// overwrites `prevScreen` with the motion-vector result four lines later. It has been dead code
+// since the commit that introduced it (`ray reuse`, before the feature was even renamed), so no
+// frame this build has ever drawn depended on that field's contents.
+//
+// Two corruptions of that field are consistent with the picture, and both produce a *negative*
+// reconstructed view-space z for every pixel at every depth, which is precisely "the shaded point
+// is behind the previous camera" and hence prevNDC.z > 1 everywhere:
+//   * the field holding the transpose of the inverse -- what you get by inverting the matrix as
+//     the engine stores it for mul(M, v) and writing the result back without transposing;
+//   * the field holding the projection itself, un-inverted.
+// With P = perspective(near, far), a = far/(far-near), b = -near*far/(far-near):
+// mul(P^-T, (x, y, d, 1)) / w gives view z = (1/b)/(d - a/b) < 0 for every d >= 0, and
+// mul(P, (x, y, d, 1)) / w gives view z = a + b/d < 0 for every d <= 1. The CPU closed-loop
+// harness in the branch's scratchpad reproduces both at 100% of samples and reproduces 0% with
+// the true inverse, which is what pins the mechanism to that field rather than to the algebra.
+//
+// The repair is therefore not an algebra change: it drops the two-step reconstruction for the
+// one-step CameraViewProjInverse form DeferredCompositeCS ships, and CameraProjUnjitteredInverse
+// no longer appears in this file at all. CameraViewProjInverse is the *jittered* view-projection's
+// inverse while the forward leg is unjittered, and that mismatch is deliberate and harmless: TAA
+// jitter is a translation of clip xy by j * w, so it touches only rows 0 and 1 of the projection
+// and leaves the reconstructed view z bit-identical. The residual is a sub-texel xy offset, an
+// order of magnitude inside the texel of registration slop SSRT_HISTORY_PLANE_MV_TEXELS already
+// budgets, and it is the same mixed pairing DeferredCompositeCS's sky motion vectors use.
+//
+// And because "correct on paper, dead in game" has now happened twice on this test, the
+// reconstruction no longer gets to be trusted on paper. Before the plane is built the shaded
+// point is pushed *back* through CameraViewProjUnjittered and the linear depth that comes out is
+// compared with the linear depth the depth buffer gave: a per-pixel, per-frame closed loop over
+// the exact matrices the GPU holds, with no assumption about storage convention, FOV, dynamic
+// resolution, stereo layout or where the world origin sits. A reconstruction that fails it
+// reports SSRT_PLANE_FAIL_PROJECT and the pixel abstains from the plane test, so a third
+// mislabelled matrix could only ever cost the test its effect -- never turn it into a screen-wide
+// rejection -- and the diagnostic view would say so in amber on the first frame.
 //
 // The trick that makes that sufficient is to stop reconstructing taps at all and to describe the
 // plane in the space the taps already live in: previous-frame pixel index plus previous-frame
@@ -443,9 +504,23 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // whose left side is affine in (px, py). So 1/z restricted to the plane is an affine function of
 // the pixel index:
 //     invZ_plane(px, py) = A * px + B * py + C.
-// Three points determine (A, B, C), and three points are what the forward chain above can
-// produce: the shaded surface point itself and two neighbours a short step along the surface.
-// Because the map is exact, the step length affects only conditioning, not the answer.
+//
+// (defect P3) A and B are then written down rather than fitted. u and v are affine in the pixel
+// index with gradients the projection hands over directly -- du/dpx = sx / P00, dv/dpy = sy / P11,
+// where sx and sy are the NDC extents of one texel -- so
+//     A = N.x * sx / (P00 * k),   B = N.y * sy / (P11 * k),
+// and the row is anchored at the shaded point's own previous image, where invZ is 1 / prevZ
+// exactly, which removes C. N here is the current normal in *previous view space* and k is the
+// plane's offset there; the shader already builds both, for the normal gate and from the same
+// forward multiply, so the row costs three multiplies on top of what was already computed.
+//
+// The three-probe fit this replaces was correct algebra and measurably inaccurate: an arbitrary
+// in-plane basis projects to two nearly parallel screen edges on an oblique surface, the 2x2 solve
+// is then decided by differences of order a tenth of a texel between pixel coordinates of order
+// 1e3, and fp32 has only three digits left there. Up to 4% of relative depth error on a
+// same-surface tap 1.5 texels away, against a tolerance of about 1% -- i.e. the fit alone could
+// reject matching history on exactly the grazing ground planes this test exists to keep. The
+// closed form has no basis, no solve, no conditioning floor, and two fewer matrix multiplies.
 //
 // A tap then costs a dot2, an add, a reciprocal and one GetScreenDepth: predicted linear depth
 // of the plane at the tap's own pixel, against the tap's own linear depth. That is the same
@@ -460,10 +535,15 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 //
 // The pixel-index-to-NDC map is the same one this pass has always used -- ndc = s * pixel + o
 // with s = float2(2, -2) / prevRenderSize and o = 0.5 * s + float2(-1, 1) for texel centres at
-// index + 0.5 -- applied in the forward direction here, i.e. pixel = (ndc - o) / s. It spans the
-// whole buffer rather than one eye's half, which under VR is the same approximation the folded
-// rows made and is carried over deliberately: correcting it is a separate, VR-testable change,
-// and changing it blind would trade a known state for an unknown one.
+// index + 0.5 -- applied in the forward direction here, i.e. pixel = (ndc - o) / s.
+//
+// (defect P3) It now goes through the eye's own half of the buffer under VR rather than treating
+// the whole buffer as one frustum, because the projection matrices it is paired with are per-eye
+// and the previous approximation made the two disagree by half the screen on the right eye. The
+// conversion is spelled out inline rather than calling Stereo::ConvertToStereoUV, for one
+// non-negotiable reason: that helper saturates uv.x, and a clamp is not affine. sx above is the
+// gradient of that map, so a clamped map would publish a gradient the map does not have. Both
+// directions are the identity outside VR, so the flat build's arithmetic is unchanged to the bit.
 // ---------------------------------------------------------------------------------------------
 
 // (defect D3, replaced) The plane-distance budget, as a multiple of the view-space size of one
@@ -510,24 +590,15 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // occluder that could ghost.
 #define SSRT_HISTORY_PLANE_MIN_NOV 0.1f
 
-// (P2.4 follow-up) How far the two tangent probes step along the surface, in texels of
-// perpendicular view-space extent at this pixel's depth.
-//
-// The projection sends planes to planes exactly, so this length cannot change the plane that
-// comes out -- only how well conditioned the 2x2 solve for it is. Wanting it large fights
-// wanting the three probes to stay near the shaded pixel where fp32 cancellation in the
-// previous-clip divide is smallest. 16 texels leaves the probes' screen separation two orders of
-// magnitude above the float epsilon of a 4096-wide buffer even at a 10x grazing foreshortening,
-// while the probe triangle stays inside a 16-texel neighbourhood of the pixel.
-#define SSRT_HISTORY_PLANE_PROBE_TEXELS 16.0f
+// (defect P3) SSRT_HISTORY_PLANE_PROBE_TEXELS and SSRT_HISTORY_PLANE_MIN_SIN used to live here.
+// They were the step length and the conditioning floor for the three-probe fit of the plane row,
+// and both are gone with it: the row now has a closed form (see the derivation at
+// SSRTBuildHistoryPlane) so there is no basis to choose and no 2x2 solve to condition. The
+// conditioning was not a hypothetical -- a nearly-parallel projected basis on an oblique surface
+// was measured costing up to 4% of relative depth error on same-surface taps.
 
-// (P2.4 follow-up) Conditioning floor for the plane solve: the sine of the angle between the two
-// probe edges in previous screen space, below which the three probes are treated as collinear and
-// no plane is published. Scale free, so it means the same thing at every depth and resolution.
-// Reached only when the tangent basis projects to a line, i.e. an exactly edge-on surface.
-#define SSRT_HISTORY_PLANE_MIN_SIN 1e-4f
-
-// (P2.4 follow-up) Self-check band for the inter-frame rotation that rotatedNormalGate needs.
+// (P2.4 follow-up) Self-check band for the inter-frame rotation that the row and the normal gate
+// are both built on.
 //
 // A rotation preserves length, so a unit normal must come back out with unit length. The old
 // code only tested the result against 1e-12, which passes for *any* garbage the composition
@@ -537,6 +608,20 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // transposed matrix cannot slip through.
 #define SSRT_HISTORY_ROTATION_TOLERANCE 0.25f
 
+// (defect P3) Relative band for the reconstruction's closed-loop self-check: the shaded point is
+// pushed back through CameraViewProjUnjittered and the linear depth that returns must agree with
+// the linear depth the depth buffer gave to within this fraction of it.
+//
+// The exact residual is the TAA jitter's, and it is zero: jitter translates clip xy by j * w and
+// so cannot move clip z or w at all, which makes the round trip exact in depth even though the
+// outbound leg is the jittered inverse and the return leg is the unjittered forward. What the
+// band actually absorbs is fp32 cancellation in two 4x4 products and two divides at Skyrim's
+// far-to-near ratio of ~1e4, where a single-precision mantissa leaves about 1e-4 relative. 1%
+// is two orders of magnitude above that and three below the smallest failure worth catching --
+// the corruptions this check exists for invert the *sign* of the reconstructed depth, so they
+// miss by more than 100%.
+#define SSRT_HISTORY_PLANE_ROUNDTRIP_TOLERANCE 0.01f
+
 // (P2.4 follow-up) Why the plane could not be built. Zero means it was. Painted by the
 // diagnostic view as four distinguishable yellows; see SSRT_DebugPlaneFailColour.
 #define SSRT_PLANE_OK 0u
@@ -544,27 +629,43 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // anywhere stands for anything this plane could be compared with.
 #define SSRT_PLANE_FAIL_PREV_RANGE 1u
 // A probe's previous-clip position is non-finite, or sits on/behind the previous camera plane.
+// (defect P3) Also raised when the shaded point's reconstruction fails its closed-loop
+// self-check, i.e. when pushing it back through CameraViewProjUnjittered does not return the
+// depth the depth buffer gave. Deliberately the same code and the same amber: both mean "this
+// pixel has no position the previous frame can be interrogated with", and the diagnostic colour
+// table is not being extended for a case that resolves to the identical abstention.
 #define SSRT_PLANE_FAIL_PROJECT 2u
-// The three probes are collinear in previous screen space: the solve has no unique answer.
+// (defect P3) The plane passes through the previous camera itself, so the reciprocal depth it
+// implies is unbounded and no row describes it. Same meaning as the collinear-probes case this
+// replaces -- "there is no unique answer" -- and the same dark amber, but now it is a single
+// scale-free test on one number instead of a conditioning check on a 2x2 solve.
 #define SSRT_PLANE_FAIL_DEGENERATE 3u
 // The tolerance came out non-finite or non-positive, which would reject every tap forever.
 #define SSRT_PLANE_FAIL_TOLERANCE 4u
 
 struct SSRTHistoryPlane
 {
-    // (P2.4 follow-up) invZ_plane(px, py) = dot(depthRow.xy, float2(px, py)) + depthRow.z, the
-    // reciprocal of the previous-frame linear view depth at which this pixel's tangent plane
+    // (P2.4 follow-up, defect P3)
+    //     invZ_plane(px, py) = dot(depthRow.xy, float2(px, py) - centrePixel) + depthRow.z,
+    // the reciprocal of the previous-frame linear view depth at which this pixel's tangent plane
     // crosses previous-frame pixel (px, py). See the derivation above for why 1/z rather than z
     // is the affine one. .w is unused; the field is a float4 because a float3 costs the same
     // register and reads worse next to the two-component dot.
     float4 depthRow;
-    // The current normal expressed in the *previous* frame's view space, for rotatedNormalGate
-    // and nothing else -- the plane above no longer needs it, which is the point of the rebuild.
-    // Falls back to the un-rotated current normal whenever the rotation fails its self-check, so
-    // the gate can never be handed a nonsense direction and reject the whole screen.
+    // (defect P3) The row's origin: this pixel's own image in the previous frame, where .z above
+    // is the exact reciprocal depth. Anchoring here rather than at pixel (0, 0) is not cosmetic.
+    // The unanchored constant term is invZ0 - A*px0 - B*py0, and on an oblique surface those two
+    // products are tens of times larger than invZ0 itself, so evaluating A*px + B*py + C rebuilds
+    // a small number out of the difference of large ones. Measured on the CPU harness at 2e-4 of
+    // relative depth error for a tap 1.5 texels away, with A and B algebraically exact -- five
+    // times the fp32 depth quantum, for nothing. Anchored, every tap's correction is a small
+    // offset from a number that is already right.
+    float2 centrePixel;
+    // The current normal expressed in the *previous* frame's view space. The plane row is built
+    // from it (see below), and rotatedNormalGate compares against it.
     // Read by the caller, which picks between it and the un-rotated normal; see
     // rotatedNormalGate and SSRT_SelectNormalGate. That selection deliberately lives outside
-    // this struct -- adding an eighth field for it makes fxc lose track of the struct's
+    // this struct -- adding a further field for it makes fxc lose track of the struct's
     // initialisation and warn X4000 on the early returns below, even though every field is
     // assigned before any of them.
     float3 normalPrev;
@@ -578,60 +679,11 @@ struct SSRTHistoryPlane
     uint failCode;
 };
 
-// (P2.4 follow-up) One current-view-space point through the forward chain to the previous
-// frame's (pixel index xy, reciprocal linear depth z, raw NDC depth w). Returns false if the
-// point has no finite image there, which is the only thing that can go wrong in it.
-//
-// Every step is an operation some shader in this build already runs in game; see the block
-// comment above for which one vouches for each. Nothing here composes two matrices, and no
-// previous-frame matrix is inverted.
-//
-// .z is the coordinate the plane is affine in and .w is only carried so the caller can apply the
-// previous frame's depth *range* test to the centre probe. They are related by an affine map
-// (1 / GetScreenDepth(d) = (CameraData.x - d * CameraData.z) / CameraData.w), which is exactly why
-// the fit below stays exact for probes that land outside the previous frustum: reciprocal view
-// depth is affine in the pixel index on a plane, and this .z is an affine function of that.
-bool SSRTProbeToPrevScreen(float3 viewPos, float2 prevRenderSize, uint eyeIndex, out float4 outPrev)
-{
-    outPrev = 0.0f;
-
-    float4 world = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(viewPos, 1.0f));
-    if (!isFiniteSafe(world) || world.w == 0.0f)
-        return false;
-    // Rebased onto the previous frame's world origin, which is what
-    // CameraPreviousViewProjUnjittered is defined against.
-    const float3 prevWorld = world.xyz / world.w +
-                             FrameBuffer::CameraPosAdjust[eyeIndex].xyz -
-                             FrameBuffer::CameraPreviousPosAdjust[eyeIndex].xyz;
-
-    const float4 prevClip = mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(prevWorld, 1.0f));
-    // A point on the previous camera plane has w = 0 and no image at all. The bit test rather
-    // than isfinite() for the usual reason (see isFiniteSafe): fxc may assume its inputs finite
-    // without /Gis, so the guard has to look at the bits.
-    if (!isFiniteSafe(prevClip) || abs(prevClip.w) < 1e-9f)
-        return false;
-
-    const float3 prevNDC = prevClip.xyz / prevClip.w;
-    if (!isFiniteSafe(prevNDC))
-        return false;
-
-    // The inverse of the pixel-index-to-NDC map this pass has always used; see the block comment.
-    const float2 prevPixel = float2((prevNDC.x + 1.0f) * 0.5f * prevRenderSize.x - 0.5f,
-                                    (1.0f - prevNDC.y) * 0.5f * prevRenderSize.y - 0.5f);
-    // Linear view depth, from the same helper this feature's bilateral weights use. Reciprocal,
-    // because that is the coordinate in which a plane stays a plane.
-    const float prevLinear = SharedData::GetScreenDepth(prevNDC.z);
-    if (!isFiniteSafe(prevLinear) || abs(prevLinear) < 1e-6f)
-        return false;
-
-    outPrev = float4(prevPixel, 1.0f / prevLinear, prevNDC.z);
-    return isFiniteSafe(outPrev);
-}
-
 SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalVS, float2 prevRenderSize, uint eyeIndex)
 {
     SSRTHistoryPlane plane;
     plane.depthRow = 0.0f;
+    plane.centrePixel = 0.0f;
     // Seeded with the un-rotated normal, so a rotation that cannot be built leaves the gate
     // selection on the shipped pre-D3 value rather than on an undefined one.
     plane.normalPrev = normalVS;
@@ -640,48 +692,117 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     plane.normalUsable = false;
     plane.failCode = SSRT_PLANE_FAIL_PROJECT;
 
-    const float4x4 projInv = FrameBuffer::CameraProjUnjitteredInverse[eyeIndex];
+    const float4x4 projUnj = FrameBuffer::CameraProjUnjittered[eyeIndex];
+    const float linearCenter = SharedData::GetScreenDepth(rawDepth);
 
-    // --- the current surface point, in current view space ---
-    const float2 thisScreen = (uv - 0.5f) * float2(2.0f, -2.0f);
-    float4 thisView = mul(projInv, float4(thisScreen, rawDepth, 1.0f));
-    thisView.xyz = thisView.xyz / thisView.w;
+    // --- the current surface point, in camera-relative world space ---
+    // (defect P3) One matrix, the one DeferredCompositeCS reconstructs positionWS with. The eye's
+    // own uv first, so the NDC matches the per-eye projection under VR; the identity outside it.
+    const float2 eyeUV = Stereo::ConvertFromStereoUV(uv, eyeIndex);
+    const float2 thisNDC = (eyeUV - 0.5f) * float2(2.0f, -2.0f);
+    float4 posRW4 = mul(FrameBuffer::CameraViewProjInverse[eyeIndex], float4(thisNDC, rawDepth, 1.0f));
+    if (!isFiniteSafe(posRW4) || abs(posRW4.w) < 1e-9f)
+    {
+        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        return plane;
+    }
+    const float3 posRW = posRW4.xyz / posRW4.w;
+    const float distSq = dot(posRW, posRW);
+    if (!isFiniteSafe(posRW) || !(distSq > 1e-12f))
+    {
+        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        return plane;
+    }
 
-    // --- the current normal, in previous view space (rotatedNormalGate only) ---
-    // CameraViewInverse is rigid, so its linear part transforms a direction directly. The trip
-    // out through the previous view-projection and back in through the projection inverse is
-    // *meant* to leave exactly the inter-frame camera rotation, the two projections cancelling.
+    // --- the closed loop: does that point reproduce the depth it was built from? ---
+    // (defect P3) The whole reason this test has been dead twice. See the block comment: the
+    // reconstruction is pushed back through the *forward* unjittered view-projection -- a field
+    // whose correctness TAA and DLSS depend on every frame -- and the linear depth that returns
+    // is compared with the linear depth the depth buffer gave. Any mislabelled matrix, any
+    // storage-convention surprise and any resolution or stereo convention that breaks the pairing
+    // shows up here, on the first frame, in amber, instead of silently rejecting the screen.
+    const float4 checkClip = mul(FrameBuffer::CameraViewProjUnjittered[eyeIndex], float4(posRW, 1.0f));
+    if (!isFiniteSafe(checkClip) || abs(checkClip.w) < 1e-9f)
+    {
+        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        return plane;
+    }
+    const float checkLinear = SharedData::GetScreenDepth(checkClip.z / checkClip.w);
+    if (!isFiniteSafe(checkLinear) ||
+        abs(checkLinear - linearCenter) > SSRT_HISTORY_PLANE_ROUNDTRIP_TOLERANCE * abs(linearCenter))
+    {
+        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        return plane;
+    }
+
+    // --- the current normal, in camera-relative world space ---
+    // CameraViewInverse is rigid, so its linear part transforms a direction directly. This is
+    // DeferredCompositeCS's normalWS, i.e. the direction every cubemap fetch in the build already
+    // depends on. It is the one step between the reconstructed point and the previous view space
+    // the plane row and the normal gate are both expressed in.
+    const float3 normalRWRaw = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0.0f)).xyz;
+    const float normalRWLenSq = dot(normalRWRaw, normalRWRaw);
+    if (!isFiniteSafe(normalRWLenSq) || !(normalRWLenSq > 1e-12f))
+    {
+        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        return plane;
+    }
+    const float3 normalRW = normalRWRaw * rsqrt(normalRWLenSq);
+
+    // --- the current normal, in previous view space ---
+    // Two things need it: the plane row below, in closed form, and the 30 degree normal agreement
+    // when rotatedNormalGate is on.
     //
-    // (diagnostic H) It was meant to repair the other half of the acceptance test. The 30 degree
-    // agreement compares against HistoryNormalsTexture, which holds the previous frame's
-    // view-space normals, so feeding it an un-rotated current normal biases the dot product by
-    // the whole inter-frame camera rotation -- over-rejecting during exactly the fast turns
-    // where a rebuilt accumulation is most expensive.
+    // (diagnostic H) For the gate it repairs the other half of the acceptance test. The agreement
+    // compares against HistoryNormalsTexture, which holds the previous frame's view-space normals,
+    // so feeding it an un-rotated current normal biases the dot product by the whole inter-frame
+    // camera rotation -- over-rejecting during exactly the fast turns where a rebuilt accumulation
+    // is most expensive.
     //
-    // (P2.4 follow-up) That reasoning is correct on paper, and this composition is the last
-    // survivor of the class of construction that was measured dead: two engine matrices
-    // multiplied together, correct algebra, garbage in practice. It is kept only because
-    // rotatedNormalGate is a switch the user can ask for, it is no longer load-bearing for the
-    // plane, and it now has to pass a self-check before anything is allowed to use it.
+    // (defect P3) No matrix composition and no inverse any more, which is what killed the previous
+    // two attempts. A *direction* has w = 0, so pushing it through the previous view-projection
+    // gives clip = P * (V_prev * n) with the projection's translation column contributing nothing:
+    // clip.w is the previous view-space z outright, and clip.xy back out the other two components
+    // through the projection's own first two rows,
+    //     clip.x = P00 * vx + P02 * vz,   clip.y = P11 * vy + P12 * vz.
+    // Those four entries are read straight off CameraProjUnjittered, the field FidelityFX is
+    // handed as cameraViewToClip, so the extraction is exact for any perspective projection --
+    // off-centre VR frusta included -- and needs only that the two frames share a field of view.
     //
-    // The self-check is the one property a rotation cannot fake: it preserves length. A unit
-    // normal in must come back out with unit length, within
-    // SSRT_HISTORY_ROTATION_TOLERANCE. A transposed matrix, a reversed multiplication order or a
-    // mismatched projection all break that, and on failure normalPrev keeps the un-rotated
-    // normal, normalUsable stays false, and the diagnostic view paints the pixel magenta. There
-    // is no path on which a bad composition quietly rejects the screen.
-    const float3 normalWS = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0.0f)).xyz;
-    const float3 normalPrevRaw = mul(projInv, mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(normalWS, 0.0f))).xyz;
+    // The self-check is kept and is the one property a rotation cannot fake: it preserves length.
+    // A unit normal in must come back out with unit length, within
+    // SSRT_HISTORY_ROTATION_TOLERANCE, which a changed FOV or any convention surprise breaks. It is
+    // load-bearing for the plane now rather than for the gate alone, so failing it abstains from the
+    // plane test (amber) rather than only falling back on the gate -- either way, no rejection.
+    if (!(abs(projUnj[0][0]) > 1e-9f) || !(abs(projUnj[1][1]) > 1e-9f))
+    {
+        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        return plane;
+    }
+    const float rcpP00 = 1.0f / projUnj[0][0];
+    const float rcpP11 = 1.0f / projUnj[1][1];
+    const float4 normalPrevClip = mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(normalRW, 0.0f));
+    if (!isFiniteSafe(normalPrevClip))
+    {
+        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        return plane;
+    }
+    const float3 normalPrevRaw = float3((normalPrevClip.x - projUnj[0][2] * normalPrevClip.w) * rcpP00,
+                                        (normalPrevClip.y - projUnj[1][2] * normalPrevClip.w) * rcpP11,
+                                        normalPrevClip.w);
     const float normalPrevLenSq = dot(normalPrevRaw, normalPrevRaw);
     const float rotLo = (1.0f - SSRT_HISTORY_ROTATION_TOLERANCE) * (1.0f - SSRT_HISTORY_ROTATION_TOLERANCE);
     const float rotHi = (1.0f + SSRT_HISTORY_ROTATION_TOLERANCE) * (1.0f + SSRT_HISTORY_ROTATION_TOLERANCE);
-    if (isFiniteSafe(normalPrevLenSq) && normalPrevLenSq > rotLo && normalPrevLenSq < rotHi)
+    if (!isFiniteSafe(normalPrevLenSq) || !(normalPrevLenSq > rotLo) || !(normalPrevLenSq < rotHi))
     {
-        plane.normalPrev = normalPrevRaw * rsqrt(normalPrevLenSq);
-        plane.normalUsable = true;
+        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        return plane;
     }
+    const float3 normalPrevVS = normalPrevRaw * rsqrt(normalPrevLenSq);
+    plane.normalPrev = normalPrevVS;
+    plane.normalUsable = true;
 
-    // --- the tolerance, and with it the probe step ---
+    // --- the tolerance ---
     // View-space extent of one texel per unit of depth, i.e. 2 / (P00 * renderWidth): the same
     // quantity ScreenSpaceGI builds as NDCToViewMul / OUT_FRAME_DIM. Taking it from the
     // projection matrix and the render extent is what keeps the criterion dynamic-resolution
@@ -692,11 +813,15 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
 #else
     const float widthPerEye = prevRenderSize.x;
 #endif
-    const float texelPerDepth = 2.0f / max(abs(FrameBuffer::CameraProjUnjittered[eyeIndex][0][0]) * widthPerEye, 1e-6f);
-    // abs() so the sign convention of the view axis cannot matter. thisView.xyz is non-zero for
-    // any rasterised pixel, the near plane being in front of the camera.
-    const float NoV = abs(dot(normalVS, normalize(thisView.xyz)));
-    const float linearCenter = SharedData::GetScreenDepth(rawDepth);
+    const float texelPerDepth = 2.0f / max(abs(projUnj[0][0]) * widthPerEye, 1e-6f);
+    // (defect P3) In camera-relative world space, where the camera sits at the origin -- the
+    // engine's own reading of CameraPosAdjust, which Util::GetEyePosition returns verbatim as the
+    // eye position and which every SHARC grid lookup in ssrt_raymarch is anchored on. So the view
+    // ray at this pixel is just posRW, and NoV needs no matrix of its own. abs() so the sign
+    // convention of the axis cannot matter; distSq > 0 was established above, so the normalize is
+    // safe. NoV only widens a tolerance and is floored by SSRT_HISTORY_PLANE_MIN_NOV, so this is
+    // the one quantity here whose error budget is a tuning question rather than a correctness one.
+    const float NoV = abs(dot(normalRW, posRW * rsqrt(distSq)));
     const float tolerance = linearCenter * texelPerDepth * SSRT_HISTORY_PLANE_TILT /
                             max(NoV, SSRT_HISTORY_PLANE_MIN_NOV);
 
@@ -710,25 +835,24 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     }
     plane.tolerancePerTexel = tolerance;
 
-    // --- the three probes, and the plane they determine ---
-    // (P2.4 follow-up) One tangent basis of the shading plane in *current* view space, then the
-    // shaded point and two neighbours a fixed step along it, each pushed through the forward
-    // chain to the previous frame's (pixel index, 1 / linear depth). See the block comment above
-    // for why that triple determines the plane exactly and for what vouches for each step.
-    //
-    // The basis only has to span the plane; which two directions it picks is irrelevant to the
-    // answer. The float3(0, 0, 1) / float3(1, 0, 0) switch is the standard guard against
-    // crossing a vector with itself.
-    const float3 axis = abs(normalVS.z) < 0.9f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
-    const float3 tangent0 = normalize(cross(normalVS, axis));
-    const float3 tangent1 = cross(normalVS, tangent0);
-    const float probeStep = SSRT_HISTORY_PLANE_PROBE_TEXELS * texelPerDepth * abs(linearCenter);
-
-    float4 p0, p1, p2;
-    const bool projected = SSRTProbeToPrevScreen(thisView.xyz, prevRenderSize, eyeIndex, p0) &&
-                           SSRTProbeToPrevScreen(thisView.xyz + tangent0 * probeStep, prevRenderSize, eyeIndex, p1) &&
-                           SSRTProbeToPrevScreen(thisView.xyz + tangent1 * probeStep, prevRenderSize, eyeIndex, p2);
-    if (!projected)
+    // --- this pixel's image in the previous frame ---
+    // (defect P3) Rebased onto the previous frame's world origin, which is what
+    // CameraPreviousViewProjUnjittered is defined against, then forward through it. No matrix is
+    // composed and none is inverted; see the block comment for what vouches for each step.
+    const float3 prevWorld = posRW +
+                             FrameBuffer::CameraPosAdjust[eyeIndex].xyz -
+                             FrameBuffer::CameraPreviousPosAdjust[eyeIndex].xyz;
+    const float4 prevClip = mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(prevWorld, 1.0f));
+    // A point on the previous camera plane has w = 0 and no image at all. The bit test rather than
+    // isfinite() for the usual reason (see isFiniteSafe): fxc may assume its inputs finite without
+    // /Gis, so the guard has to look at the bits.
+    if (!isFiniteSafe(prevClip) || abs(prevClip.w) < 1e-9f)
+    {
+        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        return plane;
+    }
+    const float3 prevNDC = prevClip.xyz / prevClip.w;
+    if (!isFiniteSafe(prevNDC))
     {
         plane.failCode = SSRT_PLANE_FAIL_PROJECT;
         return plane;
@@ -736,36 +860,75 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
 
     // Retained from the folded-row form, unchanged in meaning and in bounds: a shaded point whose
     // image falls outside the previous frame's depth range -- behind that near plane, or past its
-    // far plane -- had no history at all, so there is nothing for any tap to match. Applied to the
-    // centre probe only; the two tangent probes are allowed anywhere, since the plane they help
-    // define extends well past the frustum and the fit does not care (see SSRTProbeToPrevScreen).
-    if (p0.w <= 0.0f || p0.w >= 1.0f)
+    // far plane -- had no history at all, so there is nothing for any tap to match. The *row* is
+    // still valid well outside the frustum, which is what lets every tap be judged; only this one
+    // point has to have been visible.
+    if (prevNDC.z <= 0.0f || prevNDC.z >= 1.0f)
     {
         plane.failCode = SSRT_PLANE_FAIL_PREV_RANGE;
         return plane;
     }
 
-    // invZ = A * px + B * py + C through three points: a 2x2 solve on the two edges.
-    const float3 e0 = p1.xyz - p0.xyz;
-    const float3 e1 = p2.xyz - p0.xyz;
-    const float det = e0.x * e1.y - e0.y * e1.x;
-    // Scale-free conditioning test: |det| is the area of the parallelogram the two edges span in
-    // previous screen space, so dividing by their lengths turns it into the sine of the angle
-    // between them. Below the floor the probes are collinear and there is no unique plane.
-    const float e0Len = length(e0.xy);
-    const float e1Len = length(e1.xy);
-    if (!isFiniteSafe(det) || abs(det) <= SSRT_HISTORY_PLANE_MIN_SIN * e0Len * e1Len)
+    // Linear view depth, from the same helper the tap side linearises with, so both ends of the
+    // comparison are the same quantity by construction.
+    const float prevZ = SharedData::GetScreenDepth(prevNDC.z);
+    if (!isFiniteSafe(prevZ) || !(prevZ > 1e-6f))
+    {
+        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        return plane;
+    }
+
+    // NDC -> this eye's own uv, then -> whole-buffer uv, then -> whole-buffer pixel index. The
+    // inverse of the pixel-index-to-NDC map this pass has always used, now with the VR half-buffer
+    // step made explicit; see the block comment for why the stereo step is open-coded rather than
+    // calling the saturating helper.
+    float2 prevUV = prevNDC.xy * float2(0.5f, -0.5f) + 0.5f;
+#if defined(VR)
+    prevUV.x = (prevUV.x + (float)eyeIndex) * 0.5f;
+#endif
+    const float2 prevPixel = prevUV * prevRenderSize - 0.5f;
+
+    // --- the row, in closed form ---
+    // (defect P3) This replaces the three-probe fit, which was measured on the CPU harness giving
+    // up to 4% of relative depth error on a grazing surface for a tap 1.5 texels away -- not from
+    // floating point in the solve (a double-precision solve on the same three probes agrees to six
+    // digits) but from the probes themselves: an arbitrary in-plane basis projects to two nearly
+    // parallel screen edges on an oblique surface, the 2x2 solve is then determined by
+    // sub-tenth-of-a-texel differences between pixel coordinates of order 1e3, and fp32 leaves
+    // those three digits. Choosing a better-conditioned basis is possible but there is no need,
+    // because the row has a closed form.
+    //
+    // With Nv the normal in previous view space and k = dot(Nv, V) the plane's offset there, the
+    // derivation at the top of this file reads
+    //     1 / Vz = (Nv.x * u + Nv.y * v + Nv.z) / k,     u = Vx/Vz, v = Vy/Vz,
+    // and the projection gives u, v affinely from the pixel index:
+    //     u = (ndc.x - P02) / P00,   ndc.x = sx * px + ...
+    //     v = (ndc.y - P12) / P11,   ndc.y = sy * py + ...
+    // so the two gradients are exact one-liners. sx is the NDC width of a texel -- 2 over the
+    // eye's own render width, which is why widthPerEye is the right denominator under VR too --
+    // and sy is negative because the pixel index runs down while NDC y runs up. The constant term
+    // is not needed at all: the row is anchored at prevPixel, where the reciprocal depth is
+    // 1 / prevZ exactly (see SSRTHistoryPlane::centrePixel for why anchoring matters).
+    //
+    // Everything on the right comes from quantities this function has already computed and
+    // already self-checked. There is no third matrix, no solve, and no conditioning question.
+    const float k = dot(normalPrevVS, float3(prevZ * (prevNDC.x - projUnj[0][2]) * rcpP00,
+                                             prevZ * (prevNDC.y - projUnj[1][2]) * rcpP11,
+                                             prevZ));
+    // The plane passing through the previous camera makes 1 / Vz unbounded on it, so no row
+    // describes it. Scale free: k is a length and prevZ is the length it is compared against.
+    if (!isFiniteSafe(k) || !(abs(k) > 1e-4f * prevZ))
     {
         plane.failCode = SSRT_PLANE_FAIL_DEGENERATE;
         return plane;
     }
-
-    const float rcpDet = 1.0f / det;
-    const float A = (e0.z * e1.y - e1.z * e0.y) * rcpDet;
-    const float B = (e1.z * e0.x - e0.z * e1.x) * rcpDet;
-    const float C = p0.z - A * p0.x - B * p0.y;
-
-    const float4 depthRow = float4(A, B, C, 0.0f);
+    const float rcpK = 1.0f / k;
+    const float sx = 2.0f / widthPerEye;
+    const float sy = -2.0f / prevRenderSize.y;
+    const float4 depthRow = float4(normalPrevVS.x * sx * rcpP00 * rcpK,
+                                   normalPrevVS.y * sy * rcpP11 * rcpK,
+                                   1.0f / prevZ,
+                                   0.0f);
     if (!isFiniteSafe(depthRow))
     {
         plane.failCode = SSRT_PLANE_FAIL_DEGENERATE;
@@ -773,6 +936,7 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     }
 
     plane.depthRow = depthRow;
+    plane.centrePixel = prevPixel;
     plane.usable = true;
     plane.failCode = SSRT_PLANE_OK;
     return plane;
@@ -868,8 +1032,9 @@ uint IsValidHistory(uint2 pixel, float2 uv, SSRTHistoryPlane plane, float3 norma
         // distance enormously far from any plane through a shaded surface, so both reject without
         // needing a case of their own.
         const float tapLinear = SharedData::GetScreenDepth(HistoryDepthTexture[pixel]);
-        // The plane's own linear depth at this tap's pixel, from the affine reciprocal form.
-        const float invZPlane = dot(plane.depthRow.xy, float2(pixel)) + plane.depthRow.z;
+        // The plane's own linear depth at this tap's pixel, from the affine reciprocal form,
+        // measured from the row's own origin (see SSRTHistoryPlane::centrePixel).
+        const float invZPlane = dot(plane.depthRow.xy, float2(pixel) - plane.centrePixel) + plane.depthRow.z;
         // Data, not plane: the row was bit-tested finite when the plane was built and the tap
         // depth is the only fresh input, so a non-finite value here means the history depth texel
         // itself is corrupt.
@@ -1450,6 +1615,14 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
         // The rotation warning is only reachable with Rotated Normal Gate on: with it off the
         // un-rotated normal is what the gate compares anyway, so a failed self-check has changed
         // nothing and there is nothing to report.
+        //
+        // (defect P3) With Disable History Depth Test off -- the default -- the magenta is now
+        // subsumed by the amber below, because the plane row is built from the same rotation and
+        // so a failed self-check also stops the plane being published. That is the honest
+        // ordering: the stronger statement is "the plane test did not run", not "one gate lost
+        // its preferred normal". The branch is kept rather than deleted because it is still the
+        // only report available with the depth test switched off, where the rotation matters and
+        // the plane does not.
         if (rotatedNormalGate != 0 && !historyPlane.normalUsable && disableHistoryNormalTest == 0 && forceAcceptHistory == 0)
             debugColour = float3(1.0f, 0.0f, 1.0f);
         if (!historyPlane.usable && disableHistoryDepthTest == 0 && forceAcceptHistory == 0)
