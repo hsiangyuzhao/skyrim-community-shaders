@@ -65,6 +65,10 @@ cbuffer DenoiserCB : register(b2)
 //     genuine bright feature loses nothing while a two-orders-of-magnitude spike is cut
 //     by ~25x.
 // K = 0 disables the mechanism entirely (FireflyClamp off), and the prefetch below with it.
+// (guard G5) Ceiling on the luminance entering the moment pair, chosen against the storage
+// format rather than against the signal -- see the derivation at its use site.
+#define SSRT_MOMENT_LUMINANCE_MAX 250.0f
+
 #define SSRT_FIREFLY_RADIUS 1
 #define SSRT_FIREFLY_TILE (8 + 2 * SSRT_FIREFLY_RADIUS)  // 10
 
@@ -248,7 +252,23 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
     // 7x7 spatial estimator (history <= 2), which averaged the scaled pairs and inherited
     // the identical 0.5*sigma^2 + 0.25*mean^2 error, so removing the factor here fixes
     // that path too -- there is nothing to compensate for on either side.
-    float2 curMoment = float2(luminance, luminance * luminance);
+    //
+    // (guard G5) The pair is stored in MomentsOutput, an R11G11B10_FLOAT target: R and G
+    // carry a 5-bit exponent and a 6-bit mantissa, so the largest representable value is
+    // 65024 and *anything above it is written back as +Inf, permanently*. The second moment
+    // is a square, so the overflow point in luminance is sqrt(65024) = 255.0 -- reachable
+    // by a single bright specular sample, no NaN or corruption required. Once .y is Inf the
+    // variance is Inf - x^2 = Inf, the a-trous luminance edge-stop divides by sqrt(Inf),
+    // every neighbour weight becomes 0 or NaN, and the moments EMA can never recover
+    // because lerp(Inf, finite, alpha) stays Inf for every alpha < 1.
+    //
+    // 250 leaves 2% of headroom below the overflow point (250^2 = 62500 < 65024) and is
+    // ~30x above the top of the radiance the firefly clamp lets through, so it can only
+    // engage on values that were already outside the representable range of their own
+    // storage. Both moments use the clamped luminance so the pair stays a consistent
+    // (mu1, mu2) and the variance estimate y - x^2 keeps its sign.
+    const float momentLuminance = min(luminance, SSRT_MOMENT_LUMINANCE_MAX);
+    float2 curMoment = float2(momentLuminance, momentLuminance * momentLuminance);
 
     // Reproject UVs using motion vectors
     float2 prevUV = uv;
