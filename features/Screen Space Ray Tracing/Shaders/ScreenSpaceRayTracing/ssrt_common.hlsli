@@ -262,7 +262,7 @@ float3 SampleGGXVNDF(float3 Ve, float alpha_x, float alpha_y, float U1, float U2
     return Ne;
 }
 
-void ReprojectHit(Texture2D MotionTexture, SamplerState s, float3 hitUVz, uint eyeIndex, out float2 outPrevUV)
+void ReprojectHit(Texture2D MotionTexture, float3 hitUVz, uint eyeIndex, out float2 outPrevUV)
 {
 	// Camera motion for pixel (in ScreenPos space).
 	float2 thisScreen = (hitUVz.xy - 0.5f) * float2(2.0f, -2.0f);
@@ -274,7 +274,24 @@ void ReprojectHit(Texture2D MotionTexture, SamplerState s, float3 hitUVz, uint e
 	float4 prevClip = mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(thisWorld.xyz, 1.0f));
 	float2 prevScreen = prevClip.xy / prevClip.w;
 
-	float2 velocity = MotionTexture.SampleLevel(s, hitUVz.xy * FrameBuffer::DynamicResolutionParams1.xy, 0).xy;
+	// (defect D3) Point load, not a filtered sample. A bilinear tap on the motion-vector
+	// target averages the motion of two different surfaces wherever its 2x2 footprint
+	// straddles a silhouette, and the average points at neither of them: the history lookup
+	// lands *between* the two surfaces, which is the one place no acceptance test can match,
+	// so the pixel is rejected however permissive the criterion is. Skyrim exteriors are
+	// almost entirely silhouette -- alpha-tested grass and leaf cards put an edge within a
+	// texel or two of nearly every pixel -- so this was never an edge case, and the same
+	// defect is on record in ScreenSpaceGI as F5.
+	//
+	// The integer coordinate is exact rather than an approximation of the sample position: the
+	// caller's uv is (DTid + 0.5) * BufferDim.zw * DynamicResolutionParams2.xy, and
+	// DynamicResolutionParams2.xy is the reciprocal of DynamicResolutionParams1.xy, so the
+	// product below is DTid + 0.5 and truncates to DTid. The clamp is the dynamic-resolution
+	// sub-rect, matching the clamp SampleLevel's addressing used to provide.
+	const int2 motionMax = int2(SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy) - 1;
+	const int2 motionPixel = clamp(int2(hitUVz.xy * FrameBuffer::DynamicResolutionParams1.xy * SharedData::BufferDim.xy),
+								   int2(0, 0), motionMax);
+	float2 velocity = MotionTexture[motionPixel].xy;
 
 	prevScreen = thisClip.xy + velocity * float2(2.f, -2.f);
 

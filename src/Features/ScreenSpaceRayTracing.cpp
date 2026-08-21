@@ -411,18 +411,21 @@ void ScreenSpaceRayTracing::DrawSettings()
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
             "Diagnostic. Not for normal play. Requires Enable SVGF.\n\n"
-            "Switches off the depth disocclusion test the temporal pass applies to every "
-            "history candidate -- the check that the history texel really held the depth this "
-            "pixel's surface point should have had last frame. Everything else stays on: "
-            "screen bounds, the 30 degree normal agreement and the non-finite rejection, so "
-            "the accumulation behaves exactly as it did before that test existed.\n\n"
+            "Switches off the geometric disocclusion test the temporal pass applies to every "
+            "history candidate -- the check that the surface point which occupied that history "
+            "texel last frame still lies in the plane of the surface being shaded now. "
+            "Everything else stays on: screen bounds, the 30 degree normal agreement and the "
+            "non-finite rejection, so the accumulation behaves exactly as it did before that "
+            "test existed.\n\n"
             "Use it together with History Clamp Sigma 0 (which is the off switch for the "
             "neighbourhood history clamp) to isolate the two mechanisms one at a time. Both "
             "produce the same complaint -- \"the denoiser is not denoising, and there is no "
             "ghosting either\" -- because both end with the pixel taking this frame's sample "
             "whole, so only turning them off separately says which one is responsible.\n\n"
             "With this off the accumulation will read history across depth discontinuities "
-            "again, i.e. the ghosting it was added to remove comes back.");
+            "again, i.e. the ghosting it was added to remove comes back. With the test on and "
+            "working, turning it off should now change very little: that is the check that the "
+            "plane criterion is accepting history instead of rejecting all of it.");
 
 	if (ImGui::TreeNode("Buffer Viewer")) {
 		static float debugRescale = .3f;
@@ -866,10 +869,11 @@ void ScreenSpaceRayTracing::ClearDenoiserHistory()
 
     // (defect D3) texHistoryDepth is cleared to the *far plane*, not to zero. It is the
     // observed side of a comparison, not an accumulator: zero is the near plane, which a
-    // genuinely near surface could match, whereas 1.0 linearises to the far plane itself --
-    // a depth no on-screen surface can be at, so the relative comparison in
-    // ssrt_temporal.hlsl rejects it for every candidate. A cleared frame therefore reseeds
-    // every pixel, which is the same behaviour the zeroed colour/moment pair produces.
+    // genuinely near surface could match, whereas 1.0 unprojects to a point on the far plane
+    // itself -- somewhere no on-screen surface can be, so ssrt_temporal.hlsl's plane-distance
+    // test measures an enormous distance to it and rejects it for every candidate. A cleared
+    // frame therefore reseeds every pixel, which is the same behaviour the zeroed
+    // colour/moment pair produces.
     if (texHistoryDepth) {
         const float farPlane[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
         context->ClearUnorderedAccessViewFloat(texHistoryDepth->uav.get(), farPlane);

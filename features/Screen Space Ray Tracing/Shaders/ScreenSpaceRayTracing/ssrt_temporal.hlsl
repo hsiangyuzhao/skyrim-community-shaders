@@ -300,194 +300,309 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
     return max(Color::YCoCgToRGB(clamp(h, lo, hi)), 0.0f);
 }
 
-// (defect D3, repaired) Floor on the tolerated *relative* difference between the linear
-// depth a history texel actually held and the linear depth the current pixel's surface point
-// should have had in the previous frame.
+// (defect D3, replaced) History acceptance by *plane distance* -- the criterion NRD/ReBLUR
+// use -- in place of the linear-depth comparison this pass shipped with.
 //
-// This is only the part of the budget that does *not* scale with the local geometry: the
-// motion vector's own quantisation, the sub-pixel jitter that moves which surface point a
-// texel sampled between frames, and the depth-buffer/linearisation residual. The part that
-// *does* scale with geometry is added per call site by SSRTRelativeDepthSlope below, which is
-// what the original constant got wrong.
+// What the depth form was actually testing. It built the depth the current pixel's surface
+// point *should* have had last frame from the camera matrices alone -- i.e. treating the
+// surface as static -- and compared that against the depth a history texel really held, at a
+// texel the *engine motion vector* pointed at. The two sides therefore do not describe the
+// same thing on anything that moves or is oblique:
+//   * the expected side is a static reprojection while the sampled side follows object
+//     motion, so every animated surface -- swaying grass and trees, cloth, NPCs, i.e. most of
+//     a Skyrim exterior -- is asked for the depth it would have had if it had not moved;
+//   * the expected depth is the *centre's* while the taps sit up to 3.5 texels away, so a
+//     same-surface tap legitimately differs by (per-texel relative depth gradient) x (tap
+//     offset), and that gradient is pixelAngularSize * tan(incidence) -- unbounded. A ground
+//     plane seen from eye height, a road, a wall or fence edge-on all exceed any fixed budget,
+//     which is why the previous repair had to clamp its *measured* slope at 0.5 and still
+//     rejected everything there.
+// With both terms live the 16 candidates fail together every frame, the pixel takes the
+// accumFrames = 1 restart, and the accumulation degenerates to alpha = 1: no denoising and,
+// because nothing accumulates, no ghosting either. That is exactly what the in-game A/B
+// against this test's own bypass switch measured -- texTemporal starts converging the moment
+// the test is switched off -- and it is why every other repair in this series
+// (MaxAccumulatedFrames, the D1 history clamp, the moment-format fix) read as zero-gain: all
+// of them live inside `if (valid)`.
 //
-// Why the original single constant could not work. The residual a *correct* match still shows
-// is (per-texel relative depth gradient) x (how many texels the tap sits from the reprojected
-// position). The gradient is pixelAngularSize * |slope| and is distance independent, but
-// |slope| = tan(incidence) is unbounded: the D3 derivation capped it at 10 (~84 deg) and then
-// chose 0.05 as "2.5x the worst same-surface residual". Two of its inputs are wrong.
-//   * |slope| is routinely far above 10. A ground plane seen from eye height h at distance d
-//     has slope ~ d/h, so at h = 120 units every ground texel beyond ~7000 units exceeds the
-//     budget -- and a wall, fence or road seen edge-on exceeds it at any distance.
-//   * The tap offset is not "up to one texel". The 2x2 bilinear quad reaches 1.41 texels, the
-//     4-tap cross 2.4 and the 8-tap search 3.4, all measured from the sub-texel reprojected
-//     position -- and every one of those taps is compared against the *centre's* expected
-//     depth. The offset is known exactly at each call site, so paying for it with a constant
-//     was never necessary.
-// Where both hold at once -- oblique geometry, and the two fallback searches that only run
-// when the primary quad already failed -- all 16 candidates fail together, the pixel takes
-// the accumFrames = 1 restart every frame, and the accumulation degenerates to alpha = 1:
-// no denoising and, because nothing is accumulated, no ghosting either.
+// The replacement asks one question instead. Take the depth the history texel actually held,
+// rebuild the position it stood for using the *previous* frame's camera, and test:
 //
-// The other side still has to be caught, and this form catches it *better* than 0.05 did on
-// the surfaces that matter: an occluder 20 cm in front of a wall (~14 game units, a 4.7% step
-// at 300 units) now has to clear 0.02 + gradient * offset rather than a flat 0.05, so on the
-// face-on wall the canonical ghost source sits at 2.3x the threshold instead of 0.94x.
+//     |dot(N_now, P_then - C_now)| <= tolerance
 //
-// Over-rejection is the safe direction only up to a point: it seeds a fresh accumulation
-// chain, which costs one frame of noise that ssrt_variance.hlsl's 7x7 spatial estimator covers
-// (history <= 2) -- but a pixel that reseeds *every* frame never leaves that state, which is
-// exactly the failure above.
-#define SSRT_HISTORY_DEPTH_BASE_TOLERANCE 0.02f
+// "is the surface point that occupied that texel last frame lying in the plane I am shading
+// now?" Three properties follow, in order of how much they matter here:
+//   * A same-surface tap contributes *zero*, however oblique the surface is and however far
+//     the tap sits from the reprojected position, because both points are in the plane. The
+//     entire slope-times-offset budget the depth form needed disappears -- and with it the
+//     four extra depth loads per lane its measurement cost.
+//   * Motion *within* the surface's own plane is free: grass and foliage sliding, a limb
+//     sweeping across a locally flat patch, cloth rippling laterally, and every
+//     camera-only reprojection residual. This is the bulk of the animation in an exterior and
+//     it is what the depth form was rejecting wholesale.
+//   * Motion or geometry that changes the front-to-back relationship *does* leave the plane
+//     and is rejected: an occluder in front of a wall, the two treads of a step, an NPC
+//     walking towards the camera. That is the only thing this test should reject, and it is
+//     precisely the ghost source the depth test was added for.
+//
+// It is also cheaper per tap than the form it replaces. Write v = (ndc.x, ndc.y, rawDepth, 1)
+// for the tap and Pinv for the projection inverse; the tap's previous-view-space position is
+// P = (Pinv * v).xyz / (Pinv * v).w, so
+//     dot(N, P) - dot(N, C) = dot(A - dot(N, C) * W, v) / dot(W, v),
+// with A = N.x * Pinv[0] + N.y * Pinv[1] + N.z * Pinv[2] and W = Pinv[3] -- both foldable once
+// per lane. Multiplying the comparison through by |dot(W, v)| removes the division as well, so
+// a tap costs two dot4s and a compare, against the two linearising divides the depth form
+// needed. It also cannot manufacture a non-finite value from finite inputs, which is what
+// lets the degenerate case (a tap on the previous camera plane, w -> 0) reject by arithmetic
+// rather than by a guard: the right-hand side goes to zero with it.
+//
+// The NDC pair is folded into those two rows as well, so a tap never builds one. A tap's NDC
+// is affine in its integer index -- ndc = s * pixel + o with s = float2(2, -2) / prevRenderSize
+// and o = 0.5 * s + float2(-1, 1) for texel centres at index + 0.5 -- so for any row R,
+//     dot(R, v) = dot(float4(R.x * s.x, R.y * s.y, R.z, R.x * o.x + R.y * o.y + R.w),
+//                     float4(pixel.x, pixel.y, rawDepth, 1)).
+// Both stored rows are already in that folded form, which is why they are documented against
+// the *pixel index* rather than against NDC.
+//
+// One approximation is worth naming. Only the *forward* previous view-projection is published
+// (CameraPreviousViewProjUnjittered), so the previous frame's view space is reached by
+// composing it with the *current* projection inverse. That composition is exactly the previous
+// view transform whenever the two frames share a projection matrix, which is every frame
+// except those where the FOV is animating (a bow zoom, a killcam). During such a frame both
+// sides of the subtraction are warped by the same map, so a small difference vector survives
+// up to a mild local scaling -- the tolerance absorbs it, and the alternative would be
+// inverting a 4x4 per lane.
 
-// (defect D3, repaired) Per-texel relative linear-depth gradient at the current pixel, i.e.
-// the same-surface depth change one texel of tap offset is allowed to produce.
+// (defect D3, replaced) The plane-distance budget, as a multiple of the view-space size of one
+// texel at this pixel's depth.
 //
-// Measured rather than assumed. The alternative -- deriving it from the view-space normal and
-// a pixel angular size recovered from the projection matrix -- needs the FOV and the render
-// extent to agree with each other and with the DRS ratio, and gets the answer wrong on any
-// surface the G-buffer normal does not describe (normal-mapped, alpha-tested foliage). Four
-// depth loads give the real number for the real texel grid at whatever resolution the pass is
-// running at, which is what makes the criterion DRS-proof: at 0.667 render scale the gradient
-// is simply 1.5x larger and the tolerance follows it.
+// A correct match is not exactly in the plane, for three reasons, and only the first is
+// significant:
+//   1. N is the G-buffer *shading* normal, not the geometric one. Normal mapping tilts it by
+//      up to ~30 degrees on the surfaces Skyrim actually ships, and a tilt of theta turns a
+//      purely tangential offset s into a spurious plane distance s * sin(theta) <= 0.5 * s.
+//   2. The tangential offset s itself: this tap's distance from the reprojected sub-texel
+//      position (1.5 / 2.5 / 3.5 texels by call site) plus about a texel of motion-vector
+//      registration slop. One texel of *screen* offset is one texel of perpendicular
+//      view-space extent divided by NoV, which is where the grazing term below comes from.
+//   3. Depth-buffer quantisation. Non-inverted R32_FLOAT depth against a ~15 unit near plane
+//      keeps the relative linear-depth error below 1e-5 out to 1e4 units, three orders of
+//      magnitude under (1); it is in the noise and is not budgeted separately.
+// So the modelled worst case is 0.5 * (tap offset + 1) texels of perpendicular extent, and
+// this constant is that 0.5 with a 4x safety factor on top.
 //
-// The min of the two one-sided differences per axis is the standard guard: at a silhouette one
-// side crosses the discontinuity and the other stays on the surface, and the surface is the
-// one whose slope we want. A texel with a discontinuity on *both* sides is a one-texel sliver
-// with no reliable history anyway, so the result is clamped rather than special-cased.
-//
-// Clamp-to-edge at the sub-rect border makes one side's difference 0, so the min picks 0 and
-// the border gets the tightest tolerance. That is the conservative direction and the border is
-// one texel wide.
-#define SSRT_HISTORY_DEPTH_MAX_SLOPE 0.5f
+// Why a safety factor rather than a tight bound: the two failure directions are not
+// symmetric. Too tight and the accumulation dies outright -- the failure this change exists to
+// remove, and one that nothing downstream can compensate for. Too loose and a ghost survives
+// an extra frame or two before the D1 neighbourhood colour clamp bounds it -- and that clamp
+// has never run in practice, because it sits inside `if (valid)`. Accepting history is what
+// switches D1 on, so the loose direction now has a second line of defence that the tight
+// direction does not.
+#define SSRT_HISTORY_PLANE_TILT 2.0f
 
-float SSRTRelativeDepthSlope(int2 pixel, int2 screenSize, float centreRawDepth)
+// (defect D3, replaced) Motion-vector registration slop, in texels, added to every call site's
+// tap offset. The motion vector is quantised and describes a texel centre rather than this
+// pixel's exact sub-texel surface point, so even the nearest tap of a perfect reprojection
+// sits about a texel from where the surface point really went.
+#define SSRT_HISTORY_PLANE_MV_TEXELS 1.0f
+
+// (defect D3, replaced) Floor on NoV in the grazing widening, i.e. a 10x cap on it.
+//
+// The widening is not a fudge factor: the view-space extent of one texel measured *along the
+// surface* is its perpendicular extent divided by NoV, so term (2) above genuinely grows as
+// 1/NoV, and NRD applies the identical division. The floor exists because 1/NoV is unbounded
+// at a silhouette, which is also where the shading normal is least trustworthy. At 0.1 the
+// widest tolerance is 10 texels of perpendicular extent -- 3.6 game units at 1000 units of
+// depth and a 70 degree FOV over 1920 texels -- still well under the depth step of any
+// occluder that could ghost.
+#define SSRT_HISTORY_PLANE_MIN_NOV 0.1f
+
+struct SSRTHistoryPlane
 {
-    const float zc = SharedData::GetScreenDepth(centreRawDepth);
-    // A non-finite or non-positive centre depth means the tolerance cannot be scaled at all;
-    // fall back to the floor, which is what the pre-repair code always used.
-    if (!isFiniteSafe(zc) || zc <= 0.0f)
-        return 0.0f;
+    // dot(offsetRow, q) = (signed plane distance of the tap) * dot(wRow, q), for
+    // q = float4(tap pixel index xy, tap raw depth, 1). See the derivation above, including
+    // why the index rather than NDC.
+    float4 offsetRow;
+    // The w row of the unprojection, in the same folded form: the homogeneous divisor the
+    // comparison is multiplied through by instead of dividing by.
+    float4 wRow;
+    // The current normal expressed in the *previous* frame's view space, which is the space
+    // HistoryNormalsTexture is stored in and therefore the space the 30 degree agreement test
+    // has to be taken in. Falls back to the un-rotated current normal if the rotation cannot
+    // be built at all.
+    float3 normalPrev;
+    // Absolute plane-distance budget per texel of tangential slop; each call site scales it by
+    // (its own worst tap offset + SSRT_HISTORY_PLANE_MV_TEXELS).
+    float tolerancePerTexel;
+    bool usable;
+    bool normalUsable;
+};
 
-    float gradX = SSRT_FLOAT_MAX;
-    float gradY = SSRT_FLOAT_MAX;
-
-    [unroll] for (int s = -1; s <= 1; s += 2)
-    {
-        const int2 px = int2(clamp(pixel.x + s, 0, screenSize.x - 1), pixel.y);
-        const int2 py = int2(pixel.x, clamp(pixel.y + s, 0, screenSize.y - 1));
-        gradX = min(gradX, abs(SharedData::GetScreenDepth(DepthTexture[px]) - zc));
-        gradY = min(gradY, abs(SharedData::GetScreenDepth(DepthTexture[py]) - zc));
-    }
-
-    const float grad = sqrt(gradX * gradX + gradY * gradY) / zc;
-    // Bit-test finiteness, not isfinite(): a sky neighbour linearises to the far plane and the
-    // sum of squares of two such differences can overflow, and fxc may assume its inputs
-    // finite without /Gis (see isFiniteSafe).
-    return isFiniteSafe(grad) ? min(grad, SSRT_HISTORY_DEPTH_MAX_SLOPE) : SSRT_HISTORY_DEPTH_MAX_SLOPE;
-}
-
-// (defect D3) Linear view depth the current pixel's surface point *should* have had in the
-// previous frame, or -1 if it had none (it was outside the previous frame's depth range, or
-// behind that camera).
-//
-// This is the reference the observed history depth is compared against, and it has to be
-// computed rather than approximated by the current depth: comparing current-frame depth to
-// history depth directly is wrong the moment the camera translates along its view axis. At
-// 60 fps a walking player covers ~6 game units per frame, which is 0.6% relative at 1000
-// units away but 6% at 100 -- so the naive form would reject nearly all history whenever the
-// player walks near a wall, i.e. it would disable the accumulation exactly where indirect
-// light matters most.
-//
-// The unprojection mirrors ReprojectHit's, with one addition ReprojectHit does not need
-// because it discards its matrix result and uses the motion vector instead: the game shifts
-// its world origin as the player moves, and CameraPreviousViewProjUnjittered is defined
-// against the *previous* adjust point (this is the same rebasing MotionBlur::GetSSMotionVector
-// relies on its caller having done, and that ScreenSpaceGI's radianceDisocc does explicitly).
-// Without it the reference depth would be wrong by the whole origin shift on the frames the
-// game re-bases, which is a guaranteed full-screen history rejection.
-//
-// The result is linearised through SharedData::GetScreenDepth, the same function the observed
-// side goes through, so every projection sign and scale convention cancels between the two
-// and only the NDC ratio -- which is convention independent -- has to be right.
-float SSRTExpectedPrevLinearDepth(float2 uv, float rawDepth, uint eyeIndex)
+SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalVS, float2 prevRenderSize, uint eyeIndex)
 {
+    SSRTHistoryPlane plane;
+    plane.offsetRow = 0.0f;
+    plane.wRow = 0.0f;
+    plane.normalPrev = normalVS;
+    plane.tolerancePerTexel = 0.0f;
+    plane.usable = false;
+    plane.normalUsable = false;
+
+    const float4x4 projInv = FrameBuffer::CameraProjUnjitteredInverse[eyeIndex];
+
+    // --- the current surface point, in current view space and then in current world space ---
     const float2 thisScreen = (uv - 0.5f) * float2(2.0f, -2.0f);
-    float4 thisView = mul(FrameBuffer::CameraProjUnjitteredInverse[eyeIndex], float4(thisScreen, rawDepth, 1.0f));
+    float4 thisView = mul(projInv, float4(thisScreen, rawDepth, 1.0f));
     thisView.xyz = thisView.xyz / thisView.w;
     float4 thisWorld = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(thisView.xyz, 1.0f));
     thisWorld.xyz = thisWorld.xyz / thisWorld.w;
 
+    // --- the current normal, in previous view space ---
+    // CameraViewInverse is rigid, so its linear part transforms a direction directly. The trip
+    // out through the previous view-projection and back in through the projection inverse
+    // leaves exactly the inter-frame camera rotation (the two projections cancel; see the note
+    // on the FOV-animating case above), and normalize() absorbs any residual scale. A direction
+    // carries w = 0, so no division is involved and there is nothing to guard.
+    //
+    // This is also what repairs the *other* half of the acceptance test. The 30 degree
+    // agreement compares against HistoryNormalsTexture, which holds the previous frame's
+    // view-space normals, so feeding it an un-rotated current normal biased the dot product by
+    // the whole inter-frame camera rotation -- over-rejecting during exactly the fast turns
+    // where a rebuilt accumulation is most expensive.
+    const float3 normalWS = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0.0f)).xyz;
+    const float3 normalPrevRaw = mul(projInv, mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(normalWS, 0.0f))).xyz;
+    const float normalPrevLenSq = dot(normalPrevRaw, normalPrevRaw);
+    if (isFiniteSafe(normalPrevLenSq) && normalPrevLenSq > 1e-12f)
+    {
+        plane.normalPrev = normalPrevRaw * rsqrt(normalPrevLenSq);
+        plane.normalUsable = true;
+    }
+
+    // --- the same point in previous world space, then in previous view space ---
+    // The game shifts its world origin as the player moves and CameraPreviousViewProjUnjittered
+    // is defined against the *previous* adjust point, so the rebasing is mandatory: without it
+    // every frame the game re-bases would reject the whole screen. (Same correction
+    // MotionBlur::GetSSMotionVector relies on its caller having done, and that
+    // ScreenSpaceGI's radianceDisocc does explicitly.)
     const float3 prevWorld = thisWorld.xyz +
                              FrameBuffer::CameraPosAdjust[eyeIndex].xyz -
                              FrameBuffer::CameraPreviousPosAdjust[eyeIndex].xyz;
     const float4 prevClip = mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(prevWorld, 1.0f));
     const float prevNDC = prevClip.z / prevClip.w;
 
-    // A point behind the previous near plane makes prevClip.w vanish and the ratio blow up to
-    // +-Inf or NaN. The bit test is what makes that safe to rely on: an ordered comparison
-    // against a NaN is false, but fxc is entitled to assume its inputs are finite without
-    // /Gis, so the range test alone would not be a guard (see isFiniteSafe). Outside [0, 1]
-    // the point simply was not in the previous frame's depth range, so there is no history
-    // for it and every tap must be rejected.
+    // Retained from the depth form, and for the same reason: a point outside the previous
+    // frame's depth range -- behind that near plane, or past its far plane -- had no history at
+    // all, so there is nothing for any tap to match and the plane would be meaningless. The bit
+    // test is what makes the range test a guard: an ordered comparison against a NaN is false,
+    // but fxc may assume its inputs finite without /Gis (see isFiniteSafe), and a point on the
+    // previous camera plane makes prevClip.w vanish and this ratio blow up.
     if (!isFiniteSafe(prevNDC) || prevNDC <= 0.0f || prevNDC >= 1.0f)
-        return -1.0f;
+        return plane;
 
-    return SharedData::GetScreenDepth(prevNDC);
+    const float4 originH = mul(projInv, prevClip);
+    const float3 origin = originH.xyz / originH.w;
+    if (!isFiniteSafe(origin) || !plane.normalUsable)
+        return plane;
+
+    // --- fold the normal, the plane offset and the NDC mapping into two rows ---
+    // dot(N, (projInv * v).xyz) = dot(N.x * projInv[0] + N.y * projInv[1] + N.z * projInv[2], v),
+    // and subtracting dot(N, origin) * projInv[3] folds the plane's own offset in as well, so a
+    // tap's numerator is one dot4. The pixel-index-to-NDC map is folded in on top of that; see
+    // the derivation above for the two coefficient vectors.
+    const float4 rowA = plane.normalPrev.x * projInv[0] +
+                        plane.normalPrev.y * projInv[1] +
+                        plane.normalPrev.z * projInv[2];
+    const float4 rowW = projInv[3];
+    const float4 rowB = rowA - dot(plane.normalPrev, origin) * rowW;
+
+    const float2 ndcScale = float2(2.0f, -2.0f) / prevRenderSize;
+    const float2 ndcBias = 0.5f * ndcScale + float2(-1.0f, 1.0f);
+    plane.offsetRow = float4(rowB.x * ndcScale.x, rowB.y * ndcScale.y, rowB.z,
+                             rowB.x * ndcBias.x + rowB.y * ndcBias.y + rowB.w);
+    plane.wRow = float4(rowW.x * ndcScale.x, rowW.y * ndcScale.y, rowW.z,
+                        rowW.x * ndcBias.x + rowW.y * ndcBias.y + rowW.w);
+
+    // --- the tolerance ---
+    // View-space extent of one texel per unit of depth, i.e. 2 / (P00 * renderWidth): the same
+    // quantity ScreenSpaceGI builds as NDCToViewMul / OUT_FRAME_DIM. Taking it from the
+    // projection matrix and the render extent is what keeps the criterion dynamic-resolution
+    // proof -- at 0.667 render scale the texel is 1.5x wider and the tolerance follows -- with
+    // no assumed FOV.
+#if defined(VR)
+    const float widthPerEye = prevRenderSize.x * 0.5f;  // each eye owns half the buffer
+#else
+    const float widthPerEye = prevRenderSize.x;
+#endif
+    const float texelPerDepth = 2.0f / max(abs(FrameBuffer::CameraProjUnjittered[eyeIndex][0][0]) * widthPerEye, 1e-6f);
+    // abs() so the sign convention of the view axis cannot matter. thisView.xyz is non-zero for
+    // any rasterised pixel, the near plane being in front of the camera.
+    const float NoV = abs(dot(normalVS, normalize(thisView.xyz)));
+    const float tolerance = SharedData::GetScreenDepth(rawDepth) * texelPerDepth * SSRT_HISTORY_PLANE_TILT /
+                            max(NoV, SSRT_HISTORY_PLANE_MIN_NOV);
+
+    // Bit-test rather than isfinite() for the usual reason (see isFiniteSafe). A zero or
+    // negative tolerance would reject every tap forever, which is the failure being repaired,
+    // so it is treated as "no usable plane" and the bypass switch remains the way out.
+    if (!(isFiniteSafe(plane.offsetRow) && isFiniteSafe(plane.wRow) && isFiniteSafe(tolerance)) || tolerance <= 0.0f)
+        return plane;
+
+    plane.tolerancePerTexel = tolerance;
+    plane.usable = true;
+    return plane;
 }
 
-bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS, float expectedPrevLinearDepth, float depthTolerance)
+bool IsValidHistory(uint2 pixel, float2 uv, SSRTHistoryPlane plane, uint2 prevRenderSize, float tapTexels)
 {
     // (audit #16) Every caller passes a pixel in the *history* textures, whose valid
     // sub-rectangle is the previous frame's dynamic-resolution extent -- hence
-    // DynamicResolutionParams1.zw (previous width/height ratio) rather than .xy.
-    uint2 prev_screen_size = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw;
+    // DynamicResolutionParams1.zw (previous width/height ratio) rather than .xy at the call
+    // site, which is also where it is now computed: once per lane instead of 13 times.
     if (uv.x < 0 || uv.x > 1 || uv.y < 0 || uv.y > 1)
         return false;
 
-    if (pixel.x >= prev_screen_size.x || pixel.y >= prev_screen_size.y)
+    if (pixel.x >= prevRenderSize.x || pixel.y >= prevRenderSize.y)
         return false;
 
-    // (defect D3) Depth disocclusion. Until now the only geometric test was the normal
-    // agreement below, which passes for every reprojection that lands on a surface facing
-    // the same way -- and the ghosting cases that matter are exactly those: a character in
-    // front of a wall, a fence post against a parallel wall, the two treads of a step. All
-    // three keep their normals well inside the 30 degree gate while sitting at a completely
-    // different depth, so the accumulation was reading a different surface's radiance and
-    // calling it history.
+    // (defect D3, replaced) Plane-distance disocclusion; see SSRTBuildHistoryPlane for the
+    // derivation and for why the depth comparison this replaces rejected everything.
     //
     // Deliberately inside IsValidHistory rather than beside it: the bilinear quad and both
-    // disocclusion searches all go through this one predicate, so the test applies uniformly
-    // and a pixel that fails it everywhere lands on the existing accumFrames = 1 restart at
-    // the bottom of main() -- the alpha = 1 path -- instead of on a second, parallel
-    // rejection mechanism. It also means the 4-tap and 8-tap searches can no longer pull
-    // history across a depth layer, which is the widening path guard G4 documents.
-    // (diagnostic D3) Group-uniform bypass of the whole depth test, and only of the depth
-    // test: the bounds tests above and the normal agreement plus G4 finiteness rejection below
-    // stay in force, so this reproduces the pre-D3 predicate exactly rather than accepting
-    // anything at all.
+    // disocclusion searches go through this one predicate, so the test applies uniformly, a
+    // pixel that fails it everywhere lands on the existing accumFrames = 1 restart at the
+    // bottom of main() instead of on a second parallel rejection mechanism, and neither
+    // fallback search can pull history across a depth layer (the widening path guard G4
+    // documents).
+    // (diagnostic D3) Group-uniform bypass of the plane test and of nothing else: the bounds
+    // tests above and the normal agreement plus G4 finiteness rejection below stay in force, so
+    // this still reproduces the pre-D3 predicate exactly rather than accepting anything at all.
     if (disableHistoryDepthTest == 0)
     {
-        if (expectedPrevLinearDepth <= 0.0f)
+        if (!plane.usable)
             return false;
 
-        const float prevLinearDepth = SharedData::GetScreenDepth(HistoryDepthTexture[pixel]);
-        // A cleared history depth is the far plane (see ClearDenoiserHistory), which
-        // linearises to a value nothing on screen can be at; the finiteness test additionally
-        // covers a CameraData that cannot linearise it at all.
-        if (!isFiniteSafe(prevLinearDepth))
+        // Both rows already carry the pixel-index-to-NDC map, so the tap only supplies its own
+        // index and depth. A cleared history depth is the far plane (see ClearDenoiserHistory)
+        // and so is a previous-frame sky texel; both reconstruct to a point on the far plane
+        // whose plane distance is enormous, so both reject without needing a case of their own.
+        const float4 q = float4(float2(pixel), HistoryDepthTexture[pixel], 1.0f);
+        const float distTimesW = dot(plane.offsetRow, q);
+        const float homogeneousW = dot(plane.wRow, q);
+        if (!(isFiniteSafe(distTimesW) && isFiniteSafe(homogeneousW)))
             return false;
 
-        // (defect D3, repaired) depthTolerance is per call site: the floor plus the measured
-        // per-texel depth gradient times this tap's distance from the reprojected position.
-        // See SSRT_HISTORY_DEPTH_BASE_TOLERANCE for why a single constant could not work.
-        if (abs(prevLinearDepth - expectedPrevLinearDepth) > depthTolerance * expectedPrevLinearDepth)
+        // Both sides carry the factor |w|, which is what removes the division. A tap on the
+        // previous camera plane has w = 0 and no finite position at all; the right-hand side
+        // goes to zero with it, so it rejects by arithmetic.
+        if (abs(distTimesW) > plane.tolerancePerTexel * tapTexels * abs(homogeneousW))
             return false;
     }
 
     float3 prevNormalVS;
     float roughness;
     GetNormalRoughness(HistoryNormalsTexture, pixel, prevNormalVS, roughness);
-    float normalDiff = dot(currNormalVS, prevNormalVS);
+    // Both sides are now in the *previous* frame's view space; see the normal transform in
+    // SSRTBuildHistoryPlane for why comparing an un-rotated current normal was biased.
+    float normalDiff = dot(plane.normalPrev, prevNormalVS);
     if (normalDiff < 0.866f) // cos 30
         return false;
 
@@ -650,26 +765,30 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
 
     // Reproject UVs using motion vectors
     float2 prevUV = uv;
-    ReprojectHit(MotionVectorTexture, LinearSampler, float3(uv, depthCenter), eyeIndex, prevUV);
+    ReprojectHit(MotionVectorTexture, float3(uv, depthCenter), eyeIndex, prevUV);
 
-    // (defect D3) Reference depth for the disocclusion test, computed once and handed to
-    // every one of the up to 16 tap validations below.
-    const float expectedPrevLinearDepth = SSRTExpectedPrevLinearDepth(uv, depthCenter, eyeIndex);
+    // (audit #16) The previous frame's dynamic-resolution extent. It is both the grid the
+    // history textures are valid on and the grid every tap's NDC is derived from, so it is
+    // computed once here and handed down rather than rebuilt inside each validation.
+    const float2 prevRenderSize = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw;
+    const uint2 prevRenderSizeI = uint2(prevRenderSize);
 
-    // (defect D3, repaired) The geometry-dependent half of the depth budget, measured once per
-    // lane and scaled per call site by that site's worst tap offset from the reprojected
-    // sub-texel position:
+    // (defect D3, replaced) The acceptance plane, built once and handed to every one of the up
+    // to 16 tap validations below.
+    const SSRTHistoryPlane historyPlane = SSRTBuildHistoryPlane(uv, depthCenter, normalVS, prevRenderSize, eyeIndex);
+
+    // Tangential slop per call site, in texels: that site's worst tap distance from the
+    // reprojected sub-texel position, plus the motion vector's own registration slop.
     //   * the 2x2 bilinear quad reaches sqrt(2) = 1.42 texels;
     //   * the 4-tap cross is centred on floor(prevCoord), so a tap is up to 1 (truncation) + 1
     //     (offset) = 2 texels away, and diagonally nothing -- the offsets are axis aligned --
     //     giving 2.0 plus the half-texel the truncation can add back, i.e. 2.5;
     //   * the 8-tap search adds one more texel of reach on both axes, i.e. 3.5.
-    // These are worst cases, so a tap closer than the bound is judged slightly loosely; that
-    // is the same fail-safe direction the min-of-sides gradient takes.
-    const float depthSlope = SSRTRelativeDepthSlope(int2(DTid.xy), int2(screen_size), depthCenter);
-    const float depthTolBilinear = SSRT_HISTORY_DEPTH_BASE_TOLERANCE + depthSlope * 1.5f;
-    const float depthTolSearch4 = SSRT_HISTORY_DEPTH_BASE_TOLERANCE + depthSlope * 2.5f;
-    const float depthTolSearch8 = SSRT_HISTORY_DEPTH_BASE_TOLERANCE + depthSlope * 3.5f;
+    // These are worst cases, so a tap closer than the bound is judged slightly loosely -- the
+    // fail-safe direction, for the reason given at SSRT_HISTORY_PLANE_TILT.
+    const float planeSlopBilinear = 1.5f + SSRT_HISTORY_PLANE_MV_TEXELS;
+    const float planeSlopSearch4 = 2.5f + SSRT_HISTORY_PLANE_MV_TEXELS;
+    const float planeSlopSearch8 = 3.5f + SSRT_HISTORY_PLANE_MV_TEXELS;
 
     float4 prevColor = 0.f;
     float prevAccumFrames = 0.f;
@@ -678,7 +797,7 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
     // must be scaled by the previous frame's DRS ratio (DynamicResolutionParams1.zw),
     // not the current one. With DLSS/DRS the two differ whenever the ratio moves, which
     // shifted the whole history lookup and silently invalidated reprojection.
-    const float2 prevCoord = prevUV * SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw;
+    const float2 prevCoord = prevUV * prevRenderSize;
     // The texel the reprojection lands *in*. No longer the primary lookup (see D2 below),
     // but still the origin the two disocclusion searches further down are defined against.
     uint2 prevPixel = uint2(prevCoord);
@@ -743,7 +862,7 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 tapColor;
             float2 tapMoments;
             float tapAccumFrames;
-            if (IsValidHistory(tapPixel, prevUV, normalVS, expectedPrevLinearDepth, depthTolBilinear) &&
+            if (IsValidHistory(tapPixel, prevUV, historyPlane, prevRenderSizeI, planeSlopBilinear) &&
                 SSRT_LoadHistory(tapPixel, tapColor, tapMoments, tapAccumFrames) &&
                 tapAccumFrames > 0.f)
             {
@@ -790,7 +909,7 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 neighborColor;
             float2 neighborMoments;
             float neighborAccumFrames;
-            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS, expectedPrevLinearDepth, depthTolSearch4) &&
+            if (IsValidHistory(uint2(neighborPixel), prevUV, historyPlane, prevRenderSizeI, planeSlopSearch4) &&
                 SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
                 neighborAccumFrames > 0.f)
             {
@@ -834,7 +953,7 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             float4 neighborColor;
             float2 neighborMoments;
             float neighborAccumFrames;
-            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS, expectedPrevLinearDepth, depthTolSearch8) &&
+            if (IsValidHistory(uint2(neighborPixel), prevUV, historyPlane, prevRenderSizeI, planeSlopSearch8) &&
                 SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
                 neighborAccumFrames > 0.f)
             {

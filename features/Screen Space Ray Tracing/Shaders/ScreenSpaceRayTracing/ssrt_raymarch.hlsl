@@ -938,7 +938,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         if (confidence > 0.0f)
         {
             // float2 projUV;
-            // ReprojectHit(MotionVectorTexture, LinearSampler, hit, eyeIndex, projUV);
+            // ReprojectHit(MotionVectorTexture, hit, eyeIndex, projUV);
 
             sampleColor = ScreenColorTextureMips.SampleLevel(LinearSampler, hit.xy * FrameBuffer::DynamicResolutionParams1.xy, 0).xyz;
             sampleColor = Color::IrradianceToLinear(sampleColor);
