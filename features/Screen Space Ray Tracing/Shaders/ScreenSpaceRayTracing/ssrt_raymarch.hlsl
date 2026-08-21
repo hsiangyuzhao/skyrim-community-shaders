@@ -82,6 +82,13 @@ cbuffer SSRTCB : register(b1)
     float BRDFBias;
     float OcclusionStrength;
     float CubemapNormalization;
+    // --- row 2 ---
+    // (diagnostic T2) Non-zero freezes the per-frame phase of the ray-direction noise; see
+    // SampleRandomVector2DBaked. ScreenSpaceRayTracing::SSRTCB pads the rest of this row out
+    // to 48 bytes, which is not declared here -- a shader may declare a prefix of a larger
+    // constant buffer, and mirroring a C++ `float pad0[3]` in HLSL would be wrong anyway
+    // (array elements get a 16-byte row each).
+    uint FreezeNoisePhase;
 };
 
 // (audit #21) Never defined by ScreenSpaceRayTracing::CompileComputeShaders, so this is
@@ -476,7 +483,15 @@ float2 SampleRandomVector2DBaked(uint2 pixel, uint index, uint numSamples) {
     // float2 u     = float2(fmod(xi.x + (((int)(pixel.x / 128)) & 0xFFu) * GOLDEN_RATIO, 1.0f), fmod(xi.y + (((int)(pixel.y / 128)) & 0xFFu) * GOLDEN_RATIO, 1.0f));
     // return u;
     int3 seed = int3(pixel.xy, 0);
-    seed.z = Random::pcg3d(int3(seed.xy, SharedData::FrameCount)).x;
+    // (diagnostic T2) The frame counter is the *only* thing that makes this pixel's sample
+    // directions differ from frame to frame, so replacing it with a constant turns the 2-spp
+    // Monte-Carlo estimate into a fixed, screen-space-locked pattern. That is precisely the
+    // discriminator the audit needs: smearing caused by an upscaler clamping a *changing*
+    // stochastic signal along motion must vanish, while smearing caused by the SVGF temporal
+    // pass's own reprojection must be unaffected. Diagnostic only -- frozen noise is noise a
+    // denoiser cannot average away.
+    const uint noisePhase = FreezeNoisePhase != 0 ? 0u : SharedData::FrameCount;
+    seed.z = Random::pcg3d(int3(seed.xy, noisePhase)).x;
     uint2 xi = Random::pcg3d(seed).xy / 0x10000;
     float2 E = Hammersley16(index, numSamples, xi);
 #if defined(SSRT_SPECULAR)
@@ -565,6 +580,52 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
     return (hash % 4) == 0;
 }
 #endif
+
+// (guard G2) Last gate before the radiance leaves the ray march and becomes the input of
+// the SVGF chain, whose history textures are persistent and -- until G8 -- never cleared.
+// Every path that can produce a non-finite value converges here: the kMAIN sample (G1
+// covers the read itself, this covers the arithmetic applied after it), the cubemap
+// fallback's normalisation ratio (G7), the skylighting product, and the per-SPP average
+// below. Sanitising once at the write is cheaper than auditing each contributor and is
+// what makes "one bad frame" recoverable instead of permanent.
+//
+// The clamp is on the colour channels only. .w is confidence (diffuse) or confidence
+// (specular) and is a [0,1] quantity; filterNaN/filterInf are the whole guard it needs.
+//
+// No-op on healthy data: filterNaN is the identity on any ordered float, filterInf the
+// identity on any value below infinity, and min(x, 128) the identity for the entire
+// legitimate radiance range (see SSRT_MAX_RADIANCE). Bit-exact, not merely close.
+float4 SSRT_SanitiseRadianceOutput(float4 color)
+{
+    color = filterNaN(color);
+    color = filterInf(color);
+    color.rgb = min(color.rgb, SSRT_MAX_RADIANCE);
+    return color;
+}
+
+// (guard G7) Upper bound on the CubemapNormalization brightness ratio.
+//
+// The ratio is directionalAmbientLuminance / max(envLuminance, 1e-4) and had no ceiling at
+// all. The denominator floor bounds it at 1e4 * numerator, so a directional-ambient
+// luminance in the hundreds is already enough to produce a factor of 1e6, and a non-finite
+// DirectionalAmbient produces Inf outright -- at which point the surrounding
+// `lerp(envColor, envColor * ratio, CubemapNormalization)` is *worse* than a plain
+// multiply, because at the default CubemapNormalization = 0 the lerp evaluates
+// envColor + 0 * (Inf - envColor) = 0 * Inf = NaN. The feature being switched off does not
+// protect it.
+//
+// 16 as the ceiling: the ratio's job is to pull a cubemap captured under one lighting
+// condition towards the current ambient, and the honest dynamic range between two Skyrim
+// weather/interior ambients is well inside 4x. 16 is two doublings past the top of that,
+// so it can only engage when the two luminances are not comparable quantities any more --
+// which is the definition of the failure it exists to contain. Inert for every real
+// ratio, hence bit-identical output on healthy data.
+#define SSRT_CUBEMAP_NORMALIZATION_MAX_RATIO 16.0f
+
+float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
+{
+    return min(ambientLuminance / max(envLuminance, 1e-4), SSRT_CUBEMAP_NORMALIZATION_MAX_RATIO);
+}
 
 [numthreads(8, 8, SAMPLES_PER_PIXEL)] void main(uint3 groupID : SV_GroupID,
                                                 uint3 groupThreadID : SV_GroupThreadID,
@@ -771,6 +832,22 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
 
             sampleColor = ScreenColorTextureMips.SampleLevel(LinearSampler, hit.xy * FrameBuffer::DynamicResolutionParams1.xy, 0).xyz;
             sampleColor = Color::IrradianceToLinear(sampleColor);
+            // (guard G1) The radiance source is kMAIN, i.e. the accumulated output of every
+            // other feature in the deferred chain. SSRT has no control over what lands
+            // there, and a single non-finite texel produced anywhere upstream is otherwise
+            // read verbatim into the GI signal and from there into the SVGF history, which
+            // has no way of ever getting rid of it. Sanitise on the way in, at the same
+            // point and in the same order as ScreenSpaceGI does for its own radiance
+            // (radianceDisocc.cs.hlsl:139-140).
+            //
+            // Placed *after* IrradianceToLinear rather than before, so it also catches an
+            // Inf manufactured by the gamma/linear transform itself out of a merely huge
+            // finite input. On finite, in-range radiance both calls are the identity:
+            // filterNaN's ISNAN test is false for any ordered value and filterInf's
+            // exponent test is false for any value below the float32 infinity, so every
+            // healthy pixel keeps its exact bit pattern.
+            sampleColor = filterNaN(sampleColor);
+            sampleColor = filterInf(sampleColor);
 #if !defined(SSRT_SPECULAR)
             sampleColor *= SharedData::ssrtSettings.DiffuseMult;
 #else
@@ -797,7 +874,21 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
                 float3 positionMS = positionWS.xyz;
 
                 sh2 skylighting = Skylighting::sample(SharedData::skylightingSettings, SkylightingProbeArray, stbn_vec3_2Dx1D_128x128x64, coords.xy, positionMS.xyz, world_space_reflected_direction);
-                float3 skylightingNormal = normalize(float3(world_space_normal.xy, max(0, world_space_normal.z)));
+                // (guard G6) max(0, z) makes the argument the zero vector whenever the
+                // surface normal points away from +Z *and* has no xy component -- a
+                // downward-facing horizontal surface, i.e. the underside of any overhang,
+                // plus every pixel whose normal G-buffer texel is cleared or garbage.
+                // normalize(0) is 0/0 = NaN in all three components, and this vector feeds
+                // the skylighting cosine lobe, so the NaN reaches envColor, sampleColor and
+                // the SVGF history.
+                //
+                // 1e-6 instead of 0 is below the resolution of the quantity it feeds: for
+                // any nonzero xy the renormalised z becomes 1e-6 (was exactly 0) and the xy
+                // pair is scaled by 1/sqrt(1 + 1e-12), a relative change of 5e-13 that is
+                // four orders of magnitude under the float32 epsilon and therefore rounds
+                // to the identical bit pattern. SphericalHarmonics::EvaluateCosineLobe is
+                // linear in z, so the SH coefficient moves by ~1e-6 of its own scale.
+                float3 skylightingNormal = normalize(float3(world_space_normal.xy, max(1e-6, world_space_normal.z)));
                 float skylightingDiffuse = SphericalHarmonics::FuncProductIntegral(skylighting, SphericalHarmonics::EvaluateCosineLobe(skylightingNormal)) / Math::PI;
                 skylightingDiffuse = saturate(skylightingDiffuse);
 
@@ -813,15 +904,15 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
                 float3 envSkyColor = envColor;
                 float3 skyColor = max(envSkyColor - envNoSkyColor, 0);
                 envLuminance = Color::RGBToLuminance(EnvTexture.SampleLevel(LinearSampler, world_space_reflected_direction, 15));
-                envColor = lerp(envNoSkyColor, envNoSkyColor * (directionalAmbientLuminance / max(envLuminance, 1e-4)), CubemapNormalization);
+                envColor = lerp(envNoSkyColor, envNoSkyColor * SSRT_CubemapNormalizationRatio(directionalAmbientLuminance, envLuminance), CubemapNormalization);  // (guard G7)
                 envColor += skyColor * skylightingDiffuse;
             } else {
                 envLuminance = Color::RGBToLuminance(EnvReflectionsTexture.SampleLevel(LinearSampler, world_space_reflected_direction, 15));
-                envColor = lerp(envColor, envColor * (directionalAmbientLuminance / max(envLuminance, 1e-4)), CubemapNormalization);
+                envColor = lerp(envColor, envColor * SSRT_CubemapNormalizationRatio(directionalAmbientLuminance, envLuminance), CubemapNormalization);  // (guard G7)
             }
 #   else
             envLuminance = Color::RGBToLuminance(EnvReflectionsTexture.SampleLevel(LinearSampler, world_space_reflected_direction, 15).xyz);
-            envColor = lerp(envColor, envColor * (directionalAmbientLuminance / max(envLuminance, 1e-4)), CubemapNormalization);
+            envColor = lerp(envColor, envColor * SSRT_CubemapNormalizationRatio(directionalAmbientLuminance, envLuminance), CubemapNormalization);  // (guard G7)
 #   endif
             envColor = Color::IrradianceToLinear(envColor);
             float ao = lerp(1.0, occlusion, OcclusionStrength);
@@ -889,7 +980,7 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
 #endif
 
 #if defined(SSRT_SPECULAR)
-    outColor = localSample;
+    outColor = SSRT_SanitiseRadianceOutput(localSample);  // (guard G2)
     SSRColorOutput[coords.xy] = outColor;
     SSRTHitDistanceOutput[coords.xy] = hit_distance;
 #elif SHARC_UPDATE
@@ -903,6 +994,9 @@ bool ShouldProcessPixel(uint2 GroupThreadID, uint FrameCount)
         }
         outColor.xyz /= SAMPLES_PER_PIXEL;
         outColor.w = saturate(outColor.w / SAMPLES_PER_PIXEL);
+        // (guard G2) After the average, not before: a single poisoned SPP slot turns the
+        // whole sum non-finite, so the useful place to cut is the resolved value.
+        outColor = SSRT_SanitiseRadianceOutput(outColor);
         SSRColorOutput[coords.xy] = outColor;
     }
 #endif

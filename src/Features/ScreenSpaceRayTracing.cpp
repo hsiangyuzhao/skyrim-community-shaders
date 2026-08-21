@@ -41,6 +41,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     FireflyClamp,
     FireflyClampSigma,
     SpecularDenoiseRoughnessCutoff,
+    FreezeNoisePhase,
     EnableSharc
 )
 #else
@@ -71,7 +72,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AdaptiveVarianceEps,
     FireflyClamp,
     FireflyClampSigma,
-    SpecularDenoiseRoughnessCutoff
+    SpecularDenoiseRoughnessCutoff,
+    FreezeNoisePhase
 )
 #endif
 
@@ -217,6 +219,19 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::Text("(Experimental) Enables Spatially Hashed Radiance Cache (SHARC) to improve diffuse quality. This requires more memory and might impact performance.");
 #endif
     ImGui::SeparatorText("Debug");
+
+    ImGui::Checkbox("Freeze Noise Phase", &settings.FreezeNoisePhase);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Diagnostic. Not for normal play.\n\n"
+            "Freezes the per-frame phase of the ray-direction noise, so every frame traces "
+            "the same sample directions instead of a fresh set. Use it to tell two causes of "
+            "directional smearing apart: smearing produced by the upscaler clamping a "
+            "changing stochastic signal along motion disappears when the phase is frozen, "
+            "while smearing produced by the denoiser's own temporal reprojection survives "
+            "unchanged.\n\n"
+            "Leaving this on locks the sampling noise into a fixed screen-space pattern that "
+            "no amount of accumulation can average away.");
 
 	if (ImGui::TreeNode("Buffer Viewer")) {
 		static float debugRescale = .3f;
@@ -534,6 +549,85 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
     }
 }
 
+// (guard G8) The SVGF history is the only state in this feature that outlives a frame, and
+// nothing ever reset it. texHistoryDiffuse / texHistoryMomentsDiffuse (and the specular
+// pair) are read by ssrt_temporal.hlsl and rewritten from its own output, so their contents
+// survive a save load, a cell transition and a resolution change; before G4 a single
+// non-finite texel therefore survived until the process exited.
+//
+// Note on Feature::Reset(): it is *not* the hook for this, despite the name. State::Reset()
+// calls it from IDXGISwapChain_Present (Hooks.cpp) on **every frame** -- the same function
+// increments frameCount and advances the timer -- so clearing the history there would wipe
+// it 60 times a second and silently reduce SVGF to a passthrough. Hence the pending-flag
+// design below, latched at the earliest point in the frame that still precedes every reader.
+void ScreenSpaceRayTracing::ClearDenoiserHistory()
+{
+    auto context = globals::d3d::context;
+    if (!context || !texHistoryDiffuse || !texHistoryMomentsDiffuse || !texHistory || !texHistoryMoments)
+        return;
+
+    // Zero, not "some safe colour": ssrt_temporal.hlsl derives its blend weight from the
+    // accumulated frame count in the moments texture's .z, and
+    // alpha = max(1 / (0 + 1), invMaxAccumulatedFrames) = 1 means the pixel takes this
+    // frame's sample whole. A zeroed history is therefore indistinguishable from a
+    // disocclusion, which is a path the temporal and variance passes already handle.
+    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    context->ClearUnorderedAccessViewFloat(texHistoryDiffuse->uav.get(), zero);
+    context->ClearUnorderedAccessViewFloat(texHistoryMomentsDiffuse->uav.get(), zero);
+    // The specular pair has the identical failure mode and the identical fix; clearing all
+    // four costs four ClearUAV calls on an event that happens once per load or transition.
+    context->ClearUnorderedAccessViewFloat(texHistory->uav.get(), zero);
+    context->ClearUnorderedAccessViewFloat(texHistoryMoments->uav.get(), zero);
+
+    // texHistoryNormals is deliberately not in the list: CopyHistoryNormals overwrites it
+    // in full every frame from the live G-buffer, so it is never stale, and its
+    // R10G10B10A2_UNORM storage cannot represent a NaN in the first place.
+}
+
+void ScreenSpaceRayTracing::UpdateHistoryValidity()
+{
+    // A false -> true transition on any of these means the previous frame did not produce
+    // the history this frame is about to read.
+    //
+    // EnableSVGF is the case the audit called out, and it is specifically the *moments* that
+    // go stale: texHistoryDiffuse / texHistory are re-copied at the end of every draw pass
+    // whether or not SVGF is on, so the colour is always one frame old, but
+    // texHistoryMomentsDiffuse / texHistoryMoments are only written inside the EnableSVGF
+    // block. Flipping it back on therefore resumes from the moment pair -- and the
+    // accumulated frame count -- left by the last time it was on, which can be an entire
+    // session earlier. The count is the damaging half: a stale MaxAccumulatedFrames drives
+    // alpha straight to its floor on a history that no longer describes the scene, and any
+    // Inf that pair had accumulated comes back with it.
+    //
+    // EnableDiffuse / EnableSpecular are the same hazard by the same mechanism: with a pass
+    // switched off, neither its history colour nor its moments are updated at all.
+    if ((settings.EnableSVGF && !lastEnableSVGF) ||
+        (settings.EnableDiffuse && !lastEnableDiffuse) ||
+        (settings.EnableSpecular && !lastEnableSpecular))
+        historyClearPending = true;
+
+    lastEnableSVGF = settings.EnableSVGF;
+    lastEnableDiffuse = settings.EnableDiffuse;
+    lastEnableSpecular = settings.EnableSpecular;
+
+    // Cell identity, compared by pointer exactly as SkySync::Update does. Covers the cases
+    // the audit named as the ones that let a poisoned history outlive its cause: loading a
+    // save, changing cell, fast travel. The history is screen-space, so none of it means
+    // anything once the view is somewhere else.
+    if (auto player = RE::PlayerCharacter::GetSingleton()) {
+        auto cell = player->GetParentCell();
+        if (cell != lastCell) {
+            lastCell = cell;
+            historyClearPending = true;
+        }
+        // (audit P9) Same lookup, so the interior test rides along instead of repeating it:
+        // both draw passes read this member and neither may pay for the cell walk again.
+        inInterior = cell ? cell->IsInteriorCell() : true;
+    } else {
+        inInterior = true;
+    }
+}
+
 void ScreenSpaceRayTracing::Prepass()
 {
     if (recompileFlag) {
@@ -541,22 +635,22 @@ void ScreenSpaceRayTracing::Prepass()
         CompileComputeShaders();
     }
 
+    // (guard G8) Before the enable gate below, so a transition is never missed just because
+    // both passes happened to be off on the frame it occurred; the flag latches until a
+    // frame that actually renders services it. PrepassPasses runs before DeferredPasses, so
+    // this is the earliest point in the frame and precedes every reader of the history.
+    UpdateHistoryValidity();
+
     // (audit P8) The Hi-Z pyramid this pass builds is only ever read by the two SSRT
     // raymarch passes, so with both switched off it was 1 copy + 8 downsample
     // dispatches of pure waste every frame.
     if (!settings.EnableDiffuse && !settings.EnableSpecular)
         return;
 
-    // (audit P9) Cache the interior test once per frame instead of repeating the cell
-    // lookup in DrawSSRTSpecular and DrawSSRTDiffuse. Safe because Prepass runs from
-    // StartDeferred before either draw, and the gate above only fires when neither of
-    // them will run at all.
-    inInterior = true;
-    if (auto player = RE::PlayerCharacter::GetSingleton()) {
-        if (auto parentCell = player->GetParentCell()) {
-            inInterior = parentCell->IsInteriorCell();
-        }
-    }
+    // (audit P9) inInterior is cached once per frame by UpdateHistoryValidity above, which
+    // already has to walk to the player's cell for the G8 discontinuity test. It runs
+    // before the gate, so the value is fresh whether or not either pass is enabled, and
+    // Prepass still precedes both draws.
 
     auto renderer = globals::game::renderer;
     auto context = globals::d3d::context;
@@ -597,6 +691,16 @@ void ScreenSpaceRayTracing::Prepass()
         const float farPlane[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
         for (uint i = 0; i < maxMips; ++i)
             context->ClearUnorderedAccessViewFloat(depthUAVs[i].get(), farPlane);
+        // (guard G8) The denoiser history is addressed by pixel and validated against the
+        // *previous* frame's dynamic-resolution sub-rect, so a change of extent leaves every
+        // texel outside the new one holding data for a pixel that no longer exists -- and
+        // the region beyond the sub-rect was never written at all, i.e. still undefined.
+        historyClearPending = true;
+    }
+
+    if (historyClearPending) {
+        historyClearPending = false;
+        ClearDenoiserHistory();
     }
 
     // preprocess depth
@@ -683,6 +787,11 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         ssrCBData.UseDynamicCubemapsAsFallback = (uint)settings.UseDynamicCubemapsAsFallbackSpecular && dynamicCubemaps.loaded;
         ssrCBData.OcclusionStrength = settings.OcclusionStrength;
         ssrCBData.CubemapNormalization = settings.CubemapNormalization;
+        // (diagnostic T2) Applies to both passes: the specular and diffuse permutations
+        // share SampleRandomVector2DBaked, so freezing the phase has to freeze both or the
+        // experiment is confounded by whichever one is still animating.
+        ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;
+        ssrCBData.pad0[0] = ssrCBData.pad0[1] = ssrCBData.pad0[2] = 0.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -893,6 +1002,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ssrCBData.UseDynamicCubemapsAsFallback = (uint)settings.UseDynamicCubemapsAsFallback && dynamicCubemaps.loaded;
         ssrCBData.OcclusionStrength = settings.OcclusionStrength;
         ssrCBData.CubemapNormalization = settings.CubemapNormalization;
+        ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;  // (diagnostic T2)
+        ssrCBData.pad0[0] = ssrCBData.pad0[1] = ssrCBData.pad0[2] = 0.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();

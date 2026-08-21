@@ -297,10 +297,58 @@ float2 filterNaN(float2 v) { return float2(filterNaN(v.x), filterNaN(v.y)); }
 float3 filterNaN(float3 v) { return float3(filterNaN(v.x), filterNaN(v.y), filterNaN(v.z)); }
 float4 filterNaN(float4 v) { return float4(filterNaN(v.x), filterNaN(v.y), filterNaN(v.z), filterNaN(v.w)); }
 
-float filterInf(float v) { return isinf(v) ? 0 : v; }
+// (guard G1/G2/G9) Spelled as an explicit exponent test rather than `isinf(v)`, for the same
+// reason ISNAN above is spelled out rather than calling isnan(): fxc is entitled to assume
+// its inputs are finite unless /Gis is passed, and Util::CompileShader passes
+// D3DCOMPILE_ENABLE_STRICTNESS | OPTIMIZATION_LEVEL3 -- not IEEE strictness. Using isinf()
+// here made fxc emit "warning X3577: value cannot be infinity, isinf() may not be
+// necessary. /Gis may force isinf() to be performed" the moment these helpers acquired
+// their first caller, i.e. the compiler was telling us it reserved the right to delete the
+// guard. The bit test is unfoldable and lowers to the same three instructions fxc generated
+// for isinf() anyway (and 0x7fffffff / ieq 0x7f800000 / movc), so this costs nothing and
+// removes the assumption.
+float filterInf(float v) { return ((asuint(v) & 0x7FFFFFFFu) == 0x7F800000u) ? 0 : v; }
 float2 filterInf(float2 v) { return float2(filterInf(v.x), filterInf(v.y)); }
 float3 filterInf(float3 v) { return float3(filterInf(v.x), filterInf(v.y), filterInf(v.z)); }
 float4 filterInf(float4 v) { return float4(filterInf(v.x), filterInf(v.y), filterInf(v.z), filterInf(v.w)); }
+
+// (guard G4) "Is this value usable arithmetic?", i.e. neither NaN nor +-Inf.
+//
+// Deliberately *not* `isfinite()`. `isfinite` is specified as `!isnan(v) && !isinf(v)` and
+// therefore inherits both of the assumptions fxc is allowed to make about its inputs
+// without /Gis (see the note on filterInf above), so the compiler is entitled to fold the
+// whole guard away.
+//
+// A single exponent test covers both cases at once and cannot be folded at all: an IEEE-754
+// binary32 value is non-finite exactly when its 8 exponent bits are all set -- mantissa 0
+// gives +-Inf and any other mantissa gives a NaN -- so the sign and mantissa need not be
+// looked at. Two integer ops per component, against the seven the
+// `!ISNAN(v) && exponentTest` spelling costs, which matters because this runs up to 13
+// times per lane in the temporal pass's history search.
+bool isFiniteSafe(float v) { return (asuint(v) & 0x7F800000u) != 0x7F800000u; }
+bool isFiniteSafe(float2 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y); }
+bool isFiniteSafe(float3 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && isFiniteSafe(v.z); }
+bool isFiniteSafe(float4 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && isFiniteSafe(v.z) && isFiniteSafe(v.w); }
+
+// (guards G2 / G9) Ceiling on any single radiance channel leaving the ray march and
+// entering the frame.
+//
+// Purpose is overflow containment, not tone mapping: filterNaN / filterInf only catch
+// values that have *already* become non-finite, and the two places that can manufacture a
+// fresh Inf out of finite inputs are (a) squaring for the luminance second moment (see
+// SSRT_MOMENT_LUMINANCE_MAX in ssrt_temporal.hlsl) and (b) the R11G11B10 moments target,
+// whose largest representable value is ~65024. A radiance of 128 squares to 16384, an
+// order of magnitude of headroom under that, and the temporal EMA can only ever move
+// *towards* the sample it is handed, so bounding the input bounds the whole chain.
+//
+// Why this cannot touch healthy imagery: the values here are linear scene radiance in the
+// same units kMAIN carries, where 1.0 is a diffuse white surface under full sunlight. The
+// brightest legitimate GI *source* in the game -- a torch flame, a sun-facing snow
+// specular -- lands in the low tens after DiffuseMult, and anything above that is either a
+// firefly (which the S1 clamp handles on statistical grounds, two orders of magnitude
+// lower) or a poisoned texel. 128 is therefore ~10x above the top of the real signal
+// range: it is a tripwire, and a pixel that hits it was already broken.
+#define SSRT_MAX_RADIANCE 128.0f
 
 // (audit #12) Tolerated *relative* linear-depth change per texel of tap distance.
 //

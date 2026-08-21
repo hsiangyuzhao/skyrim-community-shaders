@@ -246,6 +246,21 @@ struct ScreenSpaceRayTracing : Feature
         /// raising it starts skipping genuinely glossy surfaces that the filter would
         /// still have something to say about.
         float SpecularDenoiseRoughnessCutoff = 0.05f;
+        /// @brief (diagnostic T2) Freeze the per-frame phase of the ray-direction noise.
+        ///
+        /// Feeds SSRTCB::FreezeNoisePhase, which makes ssrt_raymarch.hlsl seed its
+        /// Hammersley jitter from 0 instead of SharedData::FrameCount. Every frame then
+        /// traces the *same* ray directions, so the 2-spp Monte-Carlo signal stops changing
+        /// from frame to frame.
+        ///
+        /// This exists to separate the two candidate causes of directional smearing that
+        /// the audit could not separate observationally: an unfiltered stochastic signal
+        /// being smeared by the upscaler's history clamp (which needs a *changing* noise
+        /// pattern and must therefore disappear when the phase is frozen) versus the SVGF
+        /// temporal pass's own reprojection defects (which are independent of the noise
+        /// phase and must survive). Not a quality setting -- with the phase frozen the noise
+        /// becomes a fixed, screen-space-locked pattern that no denoiser can average away.
+        bool FreezeNoisePhase = false;
 #ifdef ENABLE_SHARC
         bool EnableSharc = false;
 #endif
@@ -259,16 +274,30 @@ struct ScreenSpaceRayTracing : Feature
         float AmbientMult;
     };
 
+    /// @brief Mirrored by the `SSRTCB` declaration in ssrt_raymarch.hlsl, which is the only
+    /// shader that binds b1 in this feature.
+    ///
+    /// The first two float4 rows were full, so FreezeNoisePhase opens a third; sizeof is 48,
+    /// still a multiple of 16 as D3D11 requires. The shader declares only the nine scalars
+    /// and not the padding -- a shader may declare a prefix of a larger constant buffer, and
+    /// a trailing `float pad0[3]` would *not* mirror this layout in HLSL, where each array
+    /// element is padded to its own 16-byte row.
     struct alignas(16) SSRTCB
     {
         uint MaxSteps;
         uint MaxMips;
         uint UseDynamicCubemapsAsFallback;
         float Thickness;
+        // --- row 1 ---
         float NormalBias;
         float BRDFBias;
         float OcclusionStrength;
         float CubemapNormalization;
+        // --- row 2 ---
+        /// @brief (diagnostic T2) Non-zero replaces SharedData::FrameCount with 0 in the
+        /// ray-direction noise seed. See Settings::FreezeNoisePhase.
+        uint FreezeNoisePhase;
+        float pad0[3];
     };
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
@@ -309,6 +338,39 @@ struct ScreenSpaceRayTracing : Feature
     /// @brief Dynamic-resolution extent the depth pyramid was last cleared for; a change
     /// retriggers the far-plane clear of every mip (audit #8).
     float2 lastDepthExtent = { 0.0f, 0.0f };
+
+    /// @brief (guard G8) A denoiser-history clear is owed before anything reads it.
+    ///
+    /// Starts true: the history textures are created without initial data, so their contents
+    /// are undefined until something writes them, and "undefined R16G16B16A16_FLOAT" includes
+    /// every NaN and Inf bit pattern.
+    bool historyClearPending = true;
+
+    /// @brief (guard G8) Previous frame's values of the three settings that decide whether
+    /// last frame wrote a history worth reading. Initialised to false so the first frame of
+    /// any enabled configuration counts as a transition.
+    bool lastEnableSVGF = false;
+    bool lastEnableDiffuse = false;
+    bool lastEnableSpecular = false;
+
+    /// @brief (guard G8) Player cell the history belongs to. A different pointer means a
+    /// load, a fast travel, a coc or a door transition -- i.e. the whole screen changed
+    /// while the history textures did not.
+    RE::TESObjectCELL* lastCell = nullptr;
+
+    /// @brief (guard G8) Zeroes the four textures that survive across frames --
+    /// texHistoryDiffuse / texHistoryMomentsDiffuse and their specular counterparts.
+    ///
+    /// Zero is the neutral state rather than merely a blank one: a zero accumulated frame
+    /// count makes the temporal pass's alpha exactly 1, so a cleared pixel takes this
+    /// frame's sample whole and seeds a fresh chain, which is the same behaviour a
+    /// disocclusion already produces.
+    void ClearDenoiserHistory();
+
+    /// @brief (guard G8) Latches historyClearPending whenever the accumulated history has
+    /// stopped describing what is on screen. Cheap: one player-cell pointer read plus three
+    /// bool comparisons, and it must run before anything consumes the history.
+    void UpdateHistoryValidity();
 
     void DrawSSRTSpecular();
     void DrawSSRTDiffuse();

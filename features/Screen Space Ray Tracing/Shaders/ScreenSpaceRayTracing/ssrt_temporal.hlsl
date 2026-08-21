@@ -65,6 +65,10 @@ cbuffer DenoiserCB : register(b2)
 //     genuine bright feature loses nothing while a two-orders-of-magnitude spike is cut
 //     by ~25x.
 // K = 0 disables the mechanism entirely (FireflyClamp off), and the prefetch below with it.
+// (guard G5) Ceiling on the luminance entering the moment pair, chosen against the storage
+// format rather than against the signal -- see the derivation at its use site.
+#define SSRT_MOMENT_LUMINANCE_MAX 250.0f
+
 #define SSRT_FIREFLY_RADIUS 1
 #define SSRT_FIREFLY_TILE (8 + 2 * SSRT_FIREFLY_RADIUS)  // 10
 
@@ -118,7 +122,21 @@ float3 SSRTClampFirefly(float3 radiance, uint2 gtid, float sigmas)
 
     const float lum = Color::RGBToLuminance(radiance);
     // lum > limit >= 0 implies lum > 0, so the division is safe.
-    return (lum > limit) ? radiance * (limit / lum) : radiance;
+    //
+    // (guard G3) ...but only against a *zero* divisor. The clamp was also, and much more
+    // damagingly, an Inf-to-NaN converter: for lum = +Inf the test lum > limit passes,
+    // limit / lum evaluates to exactly 0, and radiance * 0 is Inf * 0 = NaN in every
+    // channel. So the mechanism whose entire job is to remove outliers was upgrading the
+    // one outlier it cannot scale into the one value that poisons the persistent history
+    // forever -- and it is on by default. Requiring lum to be finite before taking the
+    // scaling path leaves the Inf in place for the output sanitisation (G2 upstream, G9
+    // downstream) and the history rejection (G4) to deal with, which are the guards that
+    // can actually dispose of it.
+    //
+    // Healthy data is untouched: isFiniteSafe(lum) is true for every ordered, finite
+    // luminance, so the predicate reduces to the original lum > limit and the returned
+    // expression is unchanged.
+    return (isFiniteSafe(lum) && lum > limit) ? radiance * (limit / lum) : radiance;
 }
 
 bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
@@ -141,6 +159,43 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
         return false;
 
     return true;
+}
+
+// (guard G4) The self-healing half of the NaN guard set, and the only one that repairs
+// damage rather than preventing it.
+//
+// texHistoryDiffuse / texHistoryMomentsDiffuse are read here and rewritten from this pass's
+// own output every frame, which makes them a closed feedback loop: once a texel holds a NaN
+// or an Inf, `lerp(prevColor, ssrColor, alpha)` reproduces it for every alpha < 1, so the
+// pixel is dead for the rest of the process -- across cell changes, save loads and
+// resolution changes -- no matter how clean the incoming radiance is. The 4-tap and 8-tap
+// disocclusion fallbacks below then *spread* it, averaging a poisoned neighbour into a
+// pixel that had nothing wrong with it, which is why the damage grows with camera motion.
+//
+// Treating a non-finite history sample as *absent* rather than as data breaks the loop.
+// Every reader below already has a well-tested path for "no usable history": the direct
+// reprojection falls through to the 4-tap search, the taps drop out of the average, and a
+// pixel that finds nothing at all seeds a fresh chain from this frame's sample with
+// accumFrames = 1 (the disocclusion path, which ssrt_variance.hlsl covers with its 7x7
+// spatial estimator). So a poisoned pixel costs exactly one frame of accumulation and then
+// rebuilds, instead of persisting forever.
+//
+// The out parameters are written unconditionally -- the caller must ignore them when the
+// return value is false -- so that healthy data takes no extra copy.
+//
+// Also collapses the two separate HistoryMomentsTexture loads the call sites used to issue
+// (one for .z, one for .xy) into one; same texel, same values, one fewer fetch.
+bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out float accumFrames)
+{
+    color = HistoryTexture[pixel];
+    const float3 m = HistoryMomentsTexture[pixel].xyz;
+    moments = m.xy;
+    accumFrames = m.z;
+    // Colour *and* moments, because the two textures poison independently: a NaN colour
+    // ruins the output directly, while an Inf second moment ruins every a-trous weight the
+    // variance channel steers (see G5). .w of the history colour is the variance the
+    // previous frame published, so it belongs to the same test.
+    return isFiniteSafe(color) && isFiniteSafe(m);
 }
 
 [numthreads(8, 8, 1)] void main(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
@@ -234,7 +289,23 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
     // 7x7 spatial estimator (history <= 2), which averaged the scaled pairs and inherited
     // the identical 0.5*sigma^2 + 0.25*mean^2 error, so removing the factor here fixes
     // that path too -- there is nothing to compensate for on either side.
-    float2 curMoment = float2(luminance, luminance * luminance);
+    //
+    // (guard G5) The pair is stored in MomentsOutput, an R11G11B10_FLOAT target: R and G
+    // carry a 5-bit exponent and a 6-bit mantissa, so the largest representable value is
+    // 65024 and *anything above it is written back as +Inf, permanently*. The second moment
+    // is a square, so the overflow point in luminance is sqrt(65024) = 255.0 -- reachable
+    // by a single bright specular sample, no NaN or corruption required. Once .y is Inf the
+    // variance is Inf - x^2 = Inf, the a-trous luminance edge-stop divides by sqrt(Inf),
+    // every neighbour weight becomes 0 or NaN, and the moments EMA can never recover
+    // because lerp(Inf, finite, alpha) stays Inf for every alpha < 1.
+    //
+    // 250 leaves 2% of headroom below the overflow point (250^2 = 62500 < 65024) and is
+    // ~30x above the top of the radiance the firefly clamp lets through, so it can only
+    // engage on values that were already outside the representable range of their own
+    // storage. Both moments use the clamped luminance so the pair stays a consistent
+    // (mu1, mu2) and the variance estimate y - x^2 keeps its sign.
+    const float momentLuminance = min(luminance, SSRT_MOMENT_LUMINANCE_MAX);
+    float2 curMoment = float2(momentLuminance, momentLuminance * momentLuminance);
 
     // Reproject UVs using motion vectors
     float2 prevUV = uv;
@@ -250,11 +321,18 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
     uint2 prevPixel = uint2(prevUV * SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw);
     bool valid = false;
 
-    if (IsValidHistory(prevPixel, prevUV, normalVS))
+    // (guard G4) A non-finite history sample is not history; leaving prevColor / prevMoments
+    // / prevAccumFrames at their zero initialisation makes this fall through to the 4-tap
+    // search exactly as a geometrically invalid reprojection does.
+    float4 histColor;
+    float2 histMoments;
+    float histAccumFrames;
+    if (IsValidHistory(prevPixel, prevUV, normalVS) &&
+        SSRT_LoadHistory(prevPixel, histColor, histMoments, histAccumFrames))
     {
-        prevColor = HistoryTexture[prevPixel];
-        prevAccumFrames = HistoryMomentsTexture[prevPixel].z;
-        prevMoments = HistoryMomentsTexture[prevPixel].xy;
+        prevColor = histColor;
+        prevAccumFrames = histAccumFrames;
+        prevMoments = histMoments;
         valid = true;
     }
 
@@ -266,17 +344,20 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
         for (int i = 0; i < 4; i++)
         {
             int2 neighborPixel = int2(prevPixel) + bilinOffset[i];
-            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS))
+            // (guard G4) A non-finite tap is excluded from the average and from weightSum,
+            // which is what stops a single poisoned texel from being spread into the
+            // disoccluded pixels around it every time the camera moves.
+            float4 neighborColor;
+            float2 neighborMoments;
+            float neighborAccumFrames;
+            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS) &&
+                SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
+                neighborAccumFrames > 0.f)
             {
-                float4 neighborColor = HistoryTexture[uint2(neighborPixel)];
-                float neighborAccumFrames = HistoryMomentsTexture[uint2(neighborPixel)].z;
-                if (neighborAccumFrames > 0.f)
-                {
-                    prevColor += neighborColor;
-                    prevAccumFrames += neighborAccumFrames;
-                    prevMoments += HistoryMomentsTexture[uint2(neighborPixel)].xy;
-                    weightSum += 1.f;
-                }
+                prevColor += neighborColor;
+                prevAccumFrames += neighborAccumFrames;
+                prevMoments += neighborMoments;
+                weightSum += 1.f;
             }
         }
 
@@ -309,17 +390,18 @@ bool IsValidHistory(uint2 pixel, float2 uv, float3 currNormalVS)
         for (int i = 0; i < 8; i++)
         {
             int2 neighborPixel = int2(prevPixel) + offsets[i];
-            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS))
+            // (guard G4) Same per-tap rejection as the 4-tap search above.
+            float4 neighborColor;
+            float2 neighborMoments;
+            float neighborAccumFrames;
+            if (IsValidHistory(uint2(neighborPixel), prevUV, normalVS) &&
+                SSRT_LoadHistory(uint2(neighborPixel), neighborColor, neighborMoments, neighborAccumFrames) &&
+                neighborAccumFrames > 0.f)
             {
-                float4 neighborColor = HistoryTexture[uint2(neighborPixel)];
-                float neighborAccumFrames = HistoryMomentsTexture[uint2(neighborPixel)].z;
-                if (neighborAccumFrames > 0.f)
-                {
-                    prevColor += neighborColor;
-                    prevAccumFrames += neighborAccumFrames;
-                    prevMoments += HistoryMomentsTexture[uint2(neighborPixel)].xy;
-                    weightSum += 1.f;
-                }
+                prevColor += neighborColor;
+                prevAccumFrames += neighborAccumFrames;
+                prevMoments += neighborMoments;
+                weightSum += 1.f;
             }
         }
         if (weightSum > 0.f)
