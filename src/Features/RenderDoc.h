@@ -35,6 +35,11 @@ public:
 
 	// Core RenderDoc functionality
 	bool IsAvailable() const { return renderDocApi != nullptr; }
+	/// The persisted enable setting. Unlike IsAvailable() this is valid as soon as
+	/// State::Load has run, i.e. before any feature's Load() -- which is what makes it the
+	/// right gate for load-order-sensitive decisions like skipping the Streamline
+	/// interposer (Upscaling loads before RenderDoc in the feature list).
+	bool IsCaptureEnabled() const { return enableRenderDocCapture; }
 	void TriggerCapture();
 	void SetCaptureFilePathTemplate(const std::string& a_template);
 	std::string GetCapturesDirectory() const;

@@ -175,7 +175,11 @@ void Streamline::LoadInterposer()
 	// interposer being absent (missing-DLL path below), so upscaling simply reports
 	// unavailable for the session. FidelityFX.cpp documents the same interference at the
 	// FSR dispatch level; this stops it one step earlier, where it is fatal.
-	if (RenderDoc::GetSingleton()->IsAvailable()) {
+	//
+	// Gated on the persisted *setting*, not on IsAvailable(): Upscaling loads before
+	// RenderDoc in the feature list, so at this point the RenderDoc API is never up yet,
+	// while the setting was read by State::Load before any feature's Load() ran.
+	if (RenderDoc::GetSingleton()->IsCaptureEnabled()) {
 		logger::info("[Streamline] RenderDoc capture is active, skipping interposer load for this session");
 		triedInitialization = true;
 		initialized = false;
