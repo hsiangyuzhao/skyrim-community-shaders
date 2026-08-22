@@ -63,7 +63,7 @@ void IBL::RestoreDefaultSettings()
 
 void IBL::EarlyPrepass()
 {
-	if (loaded) {
+	if (loaded && diffuseIBLTexture && diffuseSkyIBLTexture && staticDiffuseIBLTexture && staticSpecularIBLTexture) {
 		auto context = globals::d3d::context;
 
 		// Set PS shader resource
@@ -190,6 +190,7 @@ void IBL::SetupResources()
 			DX::ThrowIfFailed(LoadFromDDSFile(path.c_str(), DirectX::DDS_FLAGS_NONE, nullptr, image));
 		} catch (const DX::com_exception& e) {
 			logger::error("{}", e.what());
+			loaded = false;
 			return;
 		}
 
@@ -200,6 +201,7 @@ void IBL::SetupResources()
 				image.GetMetadata(), &pResource));
 		} catch (const DX::com_exception& e) {
 			logger::error("{}", e.what());
+			loaded = false;
 			return;
 		}
 
@@ -226,6 +228,7 @@ void IBL::SetupResources()
 			DX::ThrowIfFailed(LoadFromDDSFile(path.c_str(), DirectX::DDS_FLAGS_NONE, nullptr, image));
 		} catch (const DX::com_exception& e) {
 			logger::error("{}", e.what());
+			loaded = false;
 			return;
 		}
 
@@ -236,6 +239,7 @@ void IBL::SetupResources()
 				image.GetMetadata(), &pResource));
 		} catch (const DX::com_exception& e) {
 			logger::error("{}", e.what());
+			loaded = false;
 			return;
 		}
 
