@@ -489,7 +489,7 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // compared with the linear depth the depth buffer gave: a per-pixel, per-frame closed loop over
 // the exact matrices the GPU holds, with no assumption about storage convention, FOV, dynamic
 // resolution, stereo layout or where the world origin sits. A reconstruction that fails it
-// reports SSRT_PLANE_FAIL_PROJECT and the pixel abstains from the plane test, so a third
+// reports SSRT_PLANE_FAIL_ROUNDTRIP and the pixel abstains from the plane test, so a third
 // mislabelled matrix could only ever cost the test its effect -- never turn it into a screen-wide
 // rejection -- and the diagnostic view would say so in violet on the first frame.
 //
@@ -510,9 +510,17 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // where sx and sy are the NDC extents of one texel -- so
 //     A = N.x * sx / (P00 * k),   B = N.y * sy / (P11 * k),
 // and the row is anchored at the shaded point's own previous image, where invZ is 1 / prevZ
-// exactly, which removes C. N here is the current normal in *previous view space* and k is the
-// plane's offset there; the shader already builds both, for the normal gate and from the same
-// forward multiply, so the row costs three multiplies on top of what was already computed.
+// exactly, which removes C. N here is the current normal, ideally expressed in *previous view
+// space*, and k is the plane's offset there.
+//
+// (defect P5) N is now the current *view*-space normal, unrotated, and that substitution is the
+// change this revision is about. It tilts the plane by one frame of camera rotation, which costs
+// sin(theta) * off / (TILT * (off + 1) * NoV) of the tolerance band -- 5% of it at 2 degrees per
+// frame over a representative surface set -- and it removes the last dependence of the plane on a
+// direction (w = 0) multiply by a previous-frame matrix, which is the one step in this chain that
+// nothing else in the build exercises and the one whose failure was measured varying with the
+// direction of the normal. The full argument, the bound and the alternative are at `normalPlane`
+// in SSRTBuildHistoryPlane.
 //
 // The three-probe fit this replaces was correct algebra and measurably inaccurate: an arbitrary
 // in-plane basis projects to two nearly parallel screen edges on an oblique surface, the 2x2 solve
@@ -527,11 +535,14 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // quantity the folded-row form measured -- distance from the plane along the view ray -- so
 // SSRT_HISTORY_PLANE_TILT and the tolerance below keep their meaning and their tuning.
 //
-// Failure is now attributable instead of silent. Each of the five ways the construction can give
+// Failure is now attributable instead of silent. Each of the seven ways the construction can give
 // up sets its own code on the returned struct, the diagnostic view paints each in its own
 // distinct colour, and a pixel whose plane could not be built *bypasses* the plane test rather than
 // failing it -- see the bypass at IsValidHistory. There is no longer any path by which a broken
 // plane rejects the whole screen without saying so.
+//
+// (defect P5) The codes are grouped by *segment* of the construction rather than one per guard, so
+// a colour names which matrices to look at; see the definitions and SSRT_DebugPlaneFailColour.
 //
 // The pixel-index-to-NDC map is the same one this pass has always used -- ndc = s * pixel + o
 // with s = float2(2, -2) / prevRenderSize and o = 0.5 * s + float2(-1, 1) for texel centres at
@@ -597,15 +608,23 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // conditioning was not a hypothetical -- a nearly-parallel projected basis on an oblique surface
 // was measured costing up to 4% of relative depth error on same-surface taps.
 
-// (P2.4 follow-up) Self-check band for the inter-frame rotation that the row and the normal gate
-// are both built on.
+// (P2.4 follow-up) Self-check band for the inter-frame rotation.
 //
 // A rotation preserves length, so a unit normal must come back out with unit length. The old
 // code only tested the result against 1e-12, which passes for *any* garbage the composition
 // might produce; that is exactly the "nonsense normal rejects every candidate on screen" failure
-// the comment below warns about, left undetected. 0.25 is loose enough that no plausible
-// projection-scale residual trips it and tight enough that a wrong multiplication order or a
-// transposed matrix cannot slip through.
+// left undetected. 0.25 is loose enough that no plausible projection-scale residual trips it and
+// tight enough that a wrong multiplication order or a transposed matrix cannot slip through.
+//
+// (defect P5) Its remaining scope is rotatedNormalGate, which is off by default: the plane row no
+// longer uses the rotation, so this band can no longer cost any pixel its plane test. Note what
+// that means about the band itself, since it is now the *only* filter on the rotation rather than a
+// backstop behind the plane's own round-trip check: a convention error that scales the extracted
+// x or y component by less than 1.25 passes it, so it bounds gross errors and not small ones. The
+// harness measures exactly this -- the family of corruptions that reproduces the in-game picture
+// includes members that slip through at some normal directions -- which is the second reason the
+// plane was taken off it rather than the band being tightened. Tightening instead would trade a
+// silent wrong gate for a noisy dead gate, and the gate is opt-in either way.
 #define SSRT_HISTORY_ROTATION_TOLERANCE 0.25f
 
 // (defect P3) Relative band for the reconstruction's closed-loop self-check: the shaded point is
@@ -651,30 +670,76 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 #define SSRT_FLT_EPSILON 1.1920929e-7f
 
 // (P2.4 follow-up) Why the plane could not be built. Zero means it was. Painted by the
-// diagnostic view as five mutually distinguishable colours; see SSRT_DebugPlaneFailColour.
+// diagnostic view as seven mutually distinguishable colours; see SSRT_DebugPlaneFailColour.
+//
+// (defect P5) ONE CODE PER *SEGMENT*, NOT ONE CODE PER GUARD AND NOT ONE CODE FOR EVERYTHING
+//
+// SSRT_PLANE_FAIL_PROJECT used to be raised by eight separate guards spread over three unrelated
+// stretches of the construction -- the position reconstruction, the normal's two transforms, and
+// the previous-frame projection -- so a screen full of its azure named a 180-line function and
+// nothing narrower. That cost a trip into the game to establish "somewhere in here".
+//
+// It is now split by *segment*: each contiguous stretch of the construction that rests on one set
+// of matrices gets one code, and the diagnostic view gives each segment its own hue with the
+// second code in a segment as a dark tier of it (see SSRT_DebugPlaneFailColour). Splitting per
+// guard instead was rejected deliberately -- the guards inside a segment share their diagnosis
+// and their repair, so separating them buys nothing and spends colours the palette does not have
+// to spare. What matters is that a reading names which matrices to look at.
 #define SSRT_PLANE_OK 0u
+
+// --- segment: the previous frame's image of this pixel (cyan family) -------------------------
 // The shaded point does not land inside the previous frame's depth range, so no history texel
-// anywhere stands for anything this plane could be compared with.
+// anywhere stands for anything this plane could be compared with. Kept as its own code and its
+// own bright cyan rather than folded into the segment below, because it is the one member of the
+// segment that is a legitimate *geometric* outcome -- the point really was off-screen in depth --
+// rather than an indictment of a matrix.
 #define SSRT_PLANE_FAIL_PREV_RANGE 1u
-// A probe's previous-clip position is non-finite, or sits on/behind the previous camera plane.
-#define SSRT_PLANE_FAIL_PROJECT 2u
+// The shaded point's previous-frame projection produced no usable image: a non-finite clip
+// position, a point on the previous camera plane (w = 0), a non-finite NDC, or a previous linear
+// depth that is non-finite or non-positive. All four say the same thing about the same matrix,
+// CameraPreviousViewProjUnjittered, on its *position* (w = 1) path.
+#define SSRT_PLANE_FAIL_PREV_PROJECT 2u
+
+// --- segment: the closed loop on this pixel's own reconstruction (violet family) -------------
+// (defect P4) The shaded point's reconstruction failed its closed-loop self-check: pushing it
+// back through CameraViewProjUnjittered either produced no finite clip position at all or did not
+// return the depth the depth buffer gave.
+//
+// It used to share a code with the position reconstruction, on the argument that both resolve to
+// the same abstention. They do, but the *diagnosis* they support is not the same at all -- one
+// says a matrix is mislabelled, the other says a numeric band is too tight -- and sharing a
+// colour cost a whole trip into the game: the in-game reading came back "orange-ish", which under
+// the table of the day could have been any of four ambers and so identified nothing.
+#define SSRT_PLANE_FAIL_ROUNDTRIP 3u
+
+// --- segment: this pixel's own current-frame reconstruction (green family) -------------------
+// (defect P5) The one-step unprojection through CameraViewProjInverse produced no usable
+// camera-relative world position: non-finite, w = 0, or landing exactly on the camera. This is
+// the code that separates "the *current* frame's inverse is wrong" from every other azure the old
+// table lumped in with it, and it is the first thing to look at because everything downstream --
+// the round-trip band, the normal, the tolerance, the previous projection -- is built on posRW.
+#define SSRT_PLANE_FAIL_RECONSTRUCT 4u
+// (defect P5) The frame's own basis is unusable: the shading normal has no finite direction in
+// camera-relative world space, or CameraProjUnjittered's diagonal is degenerate so neither the
+// row's gradients nor the tolerance's texel extent can be formed. Both are properties of the
+// frame rather than of the pixel, so this code appearing at all means it appears screen-wide.
+#define SSRT_PLANE_FAIL_BASIS 5u
+
+// --- segment: the plane the reconstruction implies (yellow family) ---------------------------
+// The tolerance came out non-finite or non-positive, which would reject every tap forever.
+#define SSRT_PLANE_FAIL_TOLERANCE 6u
 // (defect P3) The plane passes through the previous camera itself, so the reciprocal depth it
 // implies is unbounded and no row describes it. Same meaning as the collinear-probes case this
 // replaces -- "there is no unique answer" -- but now it is a single scale-free test on one number
-// instead of a conditioning check on a 2x2 solve.
-#define SSRT_PLANE_FAIL_DEGENERATE 3u
-// The tolerance came out non-finite or non-positive, which would reject every tap forever.
-#define SSRT_PLANE_FAIL_TOLERANCE 4u
-// (defect P4) The shaded point's reconstruction failed its closed-loop self-check: pushing it back
-// through CameraViewProjUnjittered did not return the depth the depth buffer gave.
-//
-// It used to share SSRT_PLANE_FAIL_PROJECT and that code's amber, on the argument that both
-// resolve to the same abstention. They do, but the *diagnosis* they support is not the same at
-// all -- one says a matrix is mislabelled, the other says a numeric band is too tight -- and
-// sharing a colour cost a whole trip into the game: the in-game reading came back "orange-ish",
-// which under the old table could have been any of four ambers and so identified nothing. It has
-// its own code and its own violet now, and no reachable branch is painted orange any more.
-#define SSRT_PLANE_FAIL_ROUNDTRIP 5u
+// instead of a conditioning check on a 2x2 solve. Also raised if the finished row is non-finite.
+#define SSRT_PLANE_FAIL_DEGENERATE 7u
+
+// (defect P5) There is deliberately NO code for the inter-frame normal rotation any more, and its
+// absence is itself the measurement. The rotation used to abstain from the plane on a failed
+// self-check; the plane row no longer uses it at all (see SSRTBuildHistoryPlane), so no rotation
+// failure can produce a construction colour. If the in-game picture that motivated this change
+// clears, the rotation was the cause; if a construction colour survives, the rotation was not,
+// and the surviving hue names which of the four segments above to look at instead.
 
 struct SSRTHistoryPlane
 {
@@ -694,20 +759,25 @@ struct SSRTHistoryPlane
     // times the fp32 depth quantum, for nothing. Anchored, every tap's correction is a small
     // offset from a number that is already right.
     float2 centrePixel;
-    // The current normal expressed in the *previous* frame's view space. The plane row is built
-    // from it (see below), and rotatedNormalGate compares against it.
-    // Read by the caller, which picks between it and the un-rotated normal; see
-    // rotatedNormalGate and SSRT_SelectNormalGate. That selection deliberately lives outside
-    // this struct -- adding a further field for it makes fxc lose track of the struct's
-    // initialisation and warn X4000 on the early returns below, even though every field is
-    // assigned before any of them.
+    // (defect P5) The current normal expressed in the *previous* frame's view space, when that
+    // rotation could be built and passed its self-check, and the un-rotated current view-space
+    // normal when it could not. Read by rotatedNormalGate through SSRT_SelectNormalGate and by
+    // nothing else -- in particular the plane row above is no longer built from it. That
+    // selection deliberately lives outside this struct: adding a further field for it makes fxc
+    // lose track of the struct's initialisation and warn X4000 on the early returns below, even
+    // though every field is assigned before any of them.
     float3 normalPrev;
     // Absolute plane-distance budget per texel of tangential slop; each call site scales it by
     // (its own worst tap offset + SSRT_HISTORY_PLANE_MV_TEXELS).
     float tolerancePerTexel;
     bool usable;
-    bool normalUsable;
-    // (P2.4 follow-up) SSRT_PLANE_OK, or which of the five constructions above gave up. Carried
+    // (defect P5) Whether `normalPrev` above holds the *rotated* normal rather than the
+    // un-rotated fallback. Renamed from `normalUsable`, which read as "there is a usable normal"
+    // -- there always is one now, since the fallback is itself usable and the plane row uses it
+    // unconditionally. The only reader is the diagnostic view's magenta, which reports that
+    // rotatedNormalGate asked for a rotation and did not get one.
+    bool rotatedNormalUsable;
+    // (P2.4 follow-up) SSRT_PLANE_OK, or which of the seven constructions above gave up. Carried
     // for the diagnostic view only: nothing in the acceptance path reads it.
     uint failCode;
 };
@@ -722,8 +792,8 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     plane.normalPrev = normalVS;
     plane.tolerancePerTexel = 0.0f;
     plane.usable = false;
-    plane.normalUsable = false;
-    plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+    plane.rotatedNormalUsable = false;
+    plane.failCode = SSRT_PLANE_FAIL_RECONSTRUCT;
 
     const float4x4 projUnj = FrameBuffer::CameraProjUnjittered[eyeIndex];
     const float linearCenter = SharedData::GetScreenDepth(rawDepth);
@@ -736,14 +806,14 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     float4 posRW4 = mul(FrameBuffer::CameraViewProjInverse[eyeIndex], float4(thisNDC, rawDepth, 1.0f));
     if (!isFiniteSafe(posRW4) || abs(posRW4.w) < 1e-9f)
     {
-        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        plane.failCode = SSRT_PLANE_FAIL_RECONSTRUCT;
         return plane;
     }
     const float3 posRW = posRW4.xyz / posRW4.w;
     const float distSq = dot(posRW, posRW);
     if (!isFiniteSafe(posRW) || !(distSq > 1e-12f))
     {
-        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        plane.failCode = SSRT_PLANE_FAIL_RECONSTRUCT;
         return plane;
     }
 
@@ -757,7 +827,12 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     const float4 checkClip = mul(FrameBuffer::CameraViewProjUnjittered[eyeIndex], float4(posRW, 1.0f));
     if (!isFiniteSafe(checkClip) || abs(checkClip.w) < 1e-9f)
     {
-        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        // (defect P5) The same code the band failure below raises, and deliberately so: both say
+        // the closed loop over CameraViewProjUnjittered did not come back, they indict the same
+        // matrix, and the next step is the same. Splitting them would spend a colour to
+        // distinguish "the forward leg produced garbage" from "the forward leg produced the wrong
+        // number", which is not a distinction anyone acts on differently.
+        plane.failCode = SSRT_PLANE_FAIL_ROUNDTRIP;
         return plane;
     }
     const float checkLinear = SharedData::GetScreenDepth(checkClip.z / checkClip.w);
@@ -784,23 +859,92 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     const float normalRWLenSq = dot(normalRWRaw, normalRWRaw);
     if (!isFiniteSafe(normalRWLenSq) || !(normalRWLenSq > 1e-12f))
     {
-        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        plane.failCode = SSRT_PLANE_FAIL_BASIS;
         return plane;
     }
     const float3 normalRW = normalRWRaw * rsqrt(normalRWLenSq);
 
-    // --- the current normal, in previous view space ---
-    // Two things need it: the plane row below, in closed form, and the 30 degree normal agreement
-    // when rotatedNormalGate is on.
+    // The projection's diagonal, needed by the row's gradients and by the tolerance's texel
+    // extent, so a degenerate one is fatal to the construction and not just to the rotation.
+    if (!(abs(projUnj[0][0]) > 1e-9f) || !(abs(projUnj[1][1]) > 1e-9f))
+    {
+        plane.failCode = SSRT_PLANE_FAIL_BASIS;
+        return plane;
+    }
+    const float rcpP00 = 1.0f / projUnj[0][0];
+    const float rcpP11 = 1.0f / projUnj[1][1];
+
+    // --- THE NORMAL THE PLANE ROW IS BUILT FROM: THE UN-ROTATED ONE, ALWAYS ---
     //
-    // (diagnostic H) For the gate it repairs the other half of the acceptance test. The agreement
-    // compares against HistoryNormalsTexture, which holds the previous frame's view-space normals,
-    // so feeding it an un-rotated current normal biases the dot product by the whole inter-frame
-    // camera rotation -- over-rejecting during exactly the fast turns where a rebuilt accumulation
-    // is most expensive.
+    // (defect P5) The row wants the current normal expressed in the *previous* frame's view space
+    // and gets handed the current frame's view-space normal instead, unrotated. That is an
+    // approximation, it is deliberate, and it is the whole repair. The reasoning, in order:
     //
-    // (defect P3) No matrix composition and no inverse any more, which is what killed the previous
-    // two attempts. A *direction* has w = 0, so pushing it through the previous view-projection
+    // WHAT IT COSTS. Current and previous view space differ by one frame of camera rotation, so
+    // substituting one normal for the other tilts the plane by exactly that angle, theta. The
+    // plane still passes *exactly* through the shaded point's own previous image -- the row is
+    // anchored there and depthRow.z is 1 / prevZ regardless of the normal -- so a tilt is all it
+    // is. That is term (1) of the tolerance derivation at SSRT_HISTORY_PLANE_TILT, verbatim, with
+    // the camera's rotation in place of the normal map's tilt, and it enters the same budget.
+    //
+    // In closed form: a tap `off` texels away in screen space sits an along-surface distance
+    // off * extent / NoV from the anchor, where `extent` is one texel's perpendicular view-space
+    // extent at this depth, so the tilt gives it a perpendicular deviation of
+    // sin(theta) * off * extent / NoV. What IsValidHistory compares is a view-*depth* difference,
+    // which is that once more over NoV, and the band it is compared against is
+    // SSRT_HISTORY_PLANE_TILT * (off + SSRT_HISTORY_PLANE_MV_TEXELS) * extent / NoV. Depth, FOV
+    // and resolution cancel; one factor of NoV does not:
+    //     err / band = sin(theta) * off / (TILT * (off + 1) * NoV).
+    // The CPU harness confirms that bounds every tap it evaluates from 0.5 to 30 degrees per frame
+    // -- worst measured/bound 0.83 -- and reports the worst *measured* fraction of the band over
+    // four representative surfaces (face-on wall, 60 degree wall, ground, grazing road) as 1.5% at
+    // half a degree per frame, 5.0% at 2 degrees, 10% at 5, 27% at 30. At 60 fps a brisk turn is
+    // under 2 degrees per frame, so this costs 5% of a band whose modelled worst case already
+    // allows sin(30 degrees) = 0.5 for normal mapping and then multiplies by 4 for safety.
+    //
+    // Two honest caveats. The bound grows as 1/NoV, and NoV in the *tolerance* is floored at
+    // SSRT_HISTORY_PLANE_MIN_NOV while the error is not, so on a silhouette-grazing surface below
+    // that floor the substitution can push a tap out of budget where the exact normal would not:
+    // measured, the worst grazing tap goes from 2.8x to 12.8x budget and the count of
+    // below-floor taps over budget goes from 0.3% to 1.1% of the sample. That regime is one the
+    // budget already declines to cover (see A4J's note in the harness and the floor's own
+    // derivation) and is also where the shading normal is least trustworthy. The direction of the
+    // failure is the safe one either way: over-rejection costs one frame of accumulation, on
+    // geometry that is a silhouette in a rotating frame and so was likely to be re-derived
+    // regardless. It is a strictly better trade than losing the plane test over whole surfaces,
+    // which is what was measured happening.
+    //
+    // WHAT IT BUYS. The rotation is the one step in this construction that is a *direction*
+    // (w = 0) multiply by CameraPreviousViewProjUnjittered, and it is the one step whose
+    // correctness nothing else in the build vouches for. The position (w = 1) path through that
+    // same matrix is vouched for twice over -- it publishes the sky motion vectors TAA and DLSS
+    // consume every frame, and this function's own round-trip self-check passes on it in game --
+    // but the direction path is only ever exercised here. It is also the only quantity in the
+    // whole chain that varies with the *direction of the normal*, and the in-game picture this
+    // change repairs varied with exactly that: smooth surfaces, whose shading normals all point
+    // one way, came out uniform, while surfaces with strong normal maps, whose normals scatter per
+    // texel, came out as blocks of construction failure. The CPU harness reproduces that
+    // signature -- part of the normal sphere passing, part failing -- under a whole family of
+    // convention errors in that multiply, and under no other corruption tried.
+    //
+    // So the choice is between an exact chain that has been measured breaking in game and an
+    // approximation whose error is bounded, tiny, and analytically the same shape as a term the
+    // tolerance already budgets four times over. This picks the approximation. The exact form is
+    // not deleted -- it is computed just below and offered to rotatedNormalGate, where the
+    // rotation genuinely matters (a 30 degree threshold on a dot product against stored
+    // previous-frame normals) and where a bad one costs some over-rejection rather than the whole
+    // plane test.
+    const float3 normalPlane = normalVS;
+
+    // --- the rotated normal, for rotatedNormalGate only ---
+    // (diagnostic H) For the gate the rotation repairs the other half of the acceptance test. The
+    // agreement compares against HistoryNormalsTexture, which holds the previous frame's
+    // view-space normals, so feeding it an un-rotated current normal biases the dot product by the
+    // whole inter-frame camera rotation -- over-rejecting during exactly the fast turns where a
+    // rebuilt accumulation is most expensive.
+    //
+    // (defect P3) No matrix composition and no inverse, which is what killed the two attempts
+    // before this one. A *direction* has w = 0, so pushing it through the previous view-projection
     // gives clip = P * (V_prev * n) with the projection's translation column contributing nothing:
     // clip.w is the previous view-space z outright, and clip.xy back out the other two components
     // through the projection's own first two rows,
@@ -809,38 +953,31 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     // handed as cameraViewToClip, so the extraction is exact for any perspective projection --
     // off-centre VR frusta included -- and needs only that the two frames share a field of view.
     //
-    // The self-check is kept and is the one property a rotation cannot fake: it preserves length.
-    // A unit normal in must come back out with unit length, within
-    // SSRT_HISTORY_ROTATION_TOLERANCE, which a changed FOV or any convention surprise breaks. It is
-    // load-bearing for the plane now rather than for the gate alone, so failing it abstains from the
-    // plane test (azure) rather than only falling back on the gate -- either way, no rejection.
-    if (!(abs(projUnj[0][0]) > 1e-9f) || !(abs(projUnj[1][1]) > 1e-9f))
-    {
-        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
-        return plane;
-    }
-    const float rcpP00 = 1.0f / projUnj[0][0];
-    const float rcpP11 = 1.0f / projUnj[1][1];
+    // (defect P5) None of the three guards below returns any more. A rotation that cannot be built
+    // or that fails its length self-check leaves plane.normalPrev on the un-rotated normal it was
+    // seeded with and rotatedNormalUsable false, and the construction carries on to publish a
+    // plane. That is the difference between this commit and the last: the self-check used to be
+    // load-bearing for the plane, so one bad direction multiply cost the plane test its effect on
+    // every pixel it touched. Now it costs at most the gate's preferred operand, and only when
+    // that gate is switched on at all.
+    //
+    // The self-check is still the one property a rotation cannot fake -- it preserves length, so a
+    // unit normal in must come back out with unit length within SSRT_HISTORY_ROTATION_TOLERANCE --
+    // and it is still worth running: a gate fed a wrong normal over-rejects, and the magenta it
+    // paints is now the *only* report of a failed rotation, in exchange for being an honest one.
     const float4 normalPrevClip = mul(FrameBuffer::CameraPreviousViewProjUnjittered[eyeIndex], float4(normalRW, 0.0f));
-    if (!isFiniteSafe(normalPrevClip))
-    {
-        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
-        return plane;
-    }
     const float3 normalPrevRaw = float3((normalPrevClip.x - projUnj[0][2] * normalPrevClip.w) * rcpP00,
                                         (normalPrevClip.y - projUnj[1][2] * normalPrevClip.w) * rcpP11,
                                         normalPrevClip.w);
     const float normalPrevLenSq = dot(normalPrevRaw, normalPrevRaw);
     const float rotLo = (1.0f - SSRT_HISTORY_ROTATION_TOLERANCE) * (1.0f - SSRT_HISTORY_ROTATION_TOLERANCE);
     const float rotHi = (1.0f + SSRT_HISTORY_ROTATION_TOLERANCE) * (1.0f + SSRT_HISTORY_ROTATION_TOLERANCE);
-    if (!isFiniteSafe(normalPrevLenSq) || !(normalPrevLenSq > rotLo) || !(normalPrevLenSq < rotHi))
+    if (isFiniteSafe(normalPrevClip) && isFiniteSafe(normalPrevLenSq) &&
+        normalPrevLenSq > rotLo && normalPrevLenSq < rotHi)
     {
-        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
-        return plane;
+        plane.normalPrev = normalPrevRaw * rsqrt(normalPrevLenSq);
+        plane.rotatedNormalUsable = true;
     }
-    const float3 normalPrevVS = normalPrevRaw * rsqrt(normalPrevLenSq);
-    plane.normalPrev = normalPrevVS;
-    plane.normalUsable = true;
 
     // --- the tolerance ---
     // View-space extent of one texel per unit of depth, i.e. 2 / (P00 * renderWidth): the same
@@ -888,13 +1025,13 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     // /Gis, so the guard has to look at the bits.
     if (!isFiniteSafe(prevClip) || abs(prevClip.w) < 1e-9f)
     {
-        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        plane.failCode = SSRT_PLANE_FAIL_PREV_PROJECT;
         return plane;
     }
     const float3 prevNDC = prevClip.xyz / prevClip.w;
     if (!isFiniteSafe(prevNDC))
     {
-        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        plane.failCode = SSRT_PLANE_FAIL_PREV_PROJECT;
         return plane;
     }
 
@@ -914,7 +1051,7 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     const float prevZ = SharedData::GetScreenDepth(prevNDC.z);
     if (!isFiniteSafe(prevZ) || !(prevZ > 1e-6f))
     {
-        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        plane.failCode = SSRT_PLANE_FAIL_PREV_PROJECT;
         return plane;
     }
 
@@ -952,9 +1089,15 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     //
     // Everything on the right comes from quantities this function has already computed and
     // already self-checked. There is no third matrix, no solve, and no conditioning question.
-    const float k = dot(normalPrevVS, float3(prevZ * (prevNDC.x - projUnj[0][2]) * rcpP00,
-                                             prevZ * (prevNDC.y - projUnj[1][2]) * rcpP11,
-                                             prevZ));
+    //
+    // (defect P5) Nv is `normalPlane`, i.e. the un-rotated current view-space normal; see the
+    // block at its declaration for why, and for the bound on what that costs. Both k and the two
+    // gradients take it from the same place, so the plane the row describes is exactly "the plane
+    // through this pixel's previous image whose normal is normalPlane" -- a consistent plane,
+    // tilted by one frame of camera rotation, rather than an inconsistent mixture.
+    const float k = dot(normalPlane, float3(prevZ * (prevNDC.x - projUnj[0][2]) * rcpP00,
+                                            prevZ * (prevNDC.y - projUnj[1][2]) * rcpP11,
+                                            prevZ));
     // The plane passing through the previous camera makes 1 / Vz unbounded on it, so no row
     // describes it. Scale free: k is a length and prevZ is the length it is compared against.
     if (!isFiniteSafe(k) || !(abs(k) > 1e-4f * prevZ))
@@ -965,8 +1108,8 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     const float rcpK = 1.0f / k;
     const float sx = 2.0f / widthPerEye;
     const float sy = -2.0f / prevRenderSize.y;
-    const float4 depthRow = float4(normalPrevVS.x * sx * rcpP00 * rcpK,
-                                   normalPrevVS.y * sy * rcpP11 * rcpK,
+    const float4 depthRow = float4(normalPlane.x * sx * rcpP00 * rcpK,
+                                   normalPlane.y * sy * rcpP11 * rcpK,
                                    1.0f / prevZ,
                                    0.0f);
     if (!isFiniteSafe(depthRow))
@@ -1009,6 +1152,11 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
 // select cannot produce anything undefined either way. Computed once per lane in main() and
 // handed down, rather than stored on SSRTHistoryPlane, for the reason recorded at that
 // struct's normalPrev field.
+//
+// (defect P5) This is now the *only* consumer of the inter-frame rotation. The plane row takes the
+// un-rotated normal unconditionally, so with rotatedNormalGate off -- the shipped default -- no
+// part of the acceptance path depends on a direction multiply by
+// CameraPreviousViewProjUnjittered at all.
 float3 SSRT_SelectNormalGate(SSRTHistoryPlane plane, float3 normalVS)
 {
     return (rotatedNormalGate != 0) ? plane.normalPrev : normalVS;
@@ -1166,47 +1314,86 @@ float3 SSRT_DebugRejectColour(uint3 tally)
 }
 
 // (P2.4 follow-up) The colour a pixel whose plane could not be built gets, naming which of the
-// five constructions gave up. Split out of blue, which is what made the first measurement
+// seven constructions gave up. Split out of blue, which is what made the first measurement
 // ambiguous: "the plane was never built" and "the taps were out of bounds" arrived in the same
 // colour, so a uniform blue screen had two readings and the more alarming one had to be
 // established by a second trip into the game with Force Accept History on.
 //
-// (defect P4) The four-yellows scheme this replaces failed in the only way a diagnostic colour
+// (defect P4) The four-yellows scheme two revisions ago failed in the only way a diagnostic colour
 // table can: an in-game reading came back "orange-ish, textured, granular" and that description
 // fit all four of pale yellow, amber, dark amber and bright lemon equally well, so a full trip
-// into the game established nothing except that *some* construction had given up. Worse, the two
-// codes most worth separating -- a mislabelled matrix and a numeric band that is too tight --
-// were deliberately sharing one code and one amber.
+// into the game established nothing except that *some* construction had given up.
 //
-// So the class no longer has a shared hue. Each of the five codes gets a colour chosen to be
-// nameable on sight and far from every other colour this view produces (pure red, pure green,
-// pure blue, the grey accept ramp, black for sky, magenta for the rotation warning):
-//   cyan    the shaded point has no image inside the previous frame's depth range;
-//   azure   a probe has no finite image at all (non-finite, or on the previous camera plane);
-//   violet  the reconstruction failed its closed-loop depth self-check (defect P4);
-//   mint    the plane passes through the previous camera, i.e. an edge-on surface;
-//   lemon   the tolerance came out non-finite or non-positive.
+// (defect P5) HUE NAMES THE SEGMENT, BRIGHTNESS NAMES THE GUARD INSIDE IT
 //
-// No reachable branch is orange or amber any more. That is the point: orange is now reserved for
-// an out-of-range failCode, which is unreachable by construction, so if orange ever appears again
-// it means a genuinely new coding error rather than one of five things.
+// The five-colour table that replaced the yellows was separable but under-resolved in the one
+// place it mattered: a single azure stood for eight guards in three unrelated stretches of the
+// construction, and a screen of it named the whole function. The codes are now per segment (see
+// their definitions) and the table is organised the same way -- one hue per segment, with the
+// second code in a segment as a dark tier of that hue:
+//
+//   bright cyan   (0.00, 0.95, 1.00)  the shaded point has no image inside the previous frame's
+//                                     depth range -- a geometric outcome, not a broken matrix;
+//   dark teal     (0.00, 0.46, 0.52)  ... and everything else about that projection: no finite
+//                                     clip position, w = 0, a non-finite NDC, or a non-positive
+//                                     previous linear depth;
+//   violet        (0.68, 0.24, 1.00)  the closed loop through CameraViewProjUnjittered did not
+//                                     return the depth the depth buffer gave (defect P4);
+//   apple green   (0.40, 0.74, 0.28)  the one-step unprojection through CameraViewProjInverse
+//                                     produced no usable world position;
+//   dark green    (0.16, 0.30, 0.12)  ... or the frame's own basis is unusable: no finite normal
+//                                     direction, or a degenerate projection diagonal;
+//   lemon         (1.00, 0.90, 0.20)  the tolerance came out non-finite or non-positive;
+//   dark amber    (0.52, 0.38, 0.02)  the plane passes through the previous camera, i.e. an
+//                                     edge-on surface, or the finished row is non-finite.
+//
+// Reversing the earlier judgement on brightness tiers needs saying plainly, because the four
+// yellows were rejected for being tiers. The difference is what a misread costs. There, four
+// tiers *were* the whole diagnosis, so confusing two of them left the reader with nothing. Here
+// the hue carries the diagnosis -- which segment, i.e. which matrices to look at -- and the tier
+// only separates two guards that already share a segment, a next step and a repair. A reader who
+// gets the tier wrong still gets the answer right.
+//
+// Every one of the seven, against every other colour this view can write (pure red, pure green,
+// pure blue, the grey accept ramp, black for sky, magenta for the rotation warning, orange for a
+// coding error), is at least 0.10 apart under the luminance-weighted RGB metric the CPU harness
+// asserts on; the closest such pair is lemon against a fully converged white at 0.106. The floor
+// for the *whole* view stays 0.08, for one deliberate pair: SSRT_DEBUG_ACCEPT_FLOOR's 12% grey
+// against black sits at 0.081, and that constant has its own derivation which this table has no
+// business moving. Two pairs are worth naming because they are the ones a reading could plausibly
+// hesitate over:
+//   * apple green vs the pure green of a normal-gate rejection: 0.20 apart, twice the floor, and
+//     the apple is visibly desaturated. If a reading is ever genuinely unsure, Disable History
+//     Depth Test settles it by construction -- every colour in *this* table is suppressed when
+//     that switch is on, so a green that survives is a rejection and a green that vanishes was a
+//     construction failure.
+//   * dark teal vs the pure blue of a bounds-or-data rejection: 0.28 apart, and again the dark
+//     teal disappears under Disable History Depth Test while the blue does not.
+//
+// No reachable branch is orange or amber-adjacent by accident: orange stays reserved for an
+// out-of-range failCode, which is unreachable by construction, so if orange appears it means a
+// genuinely new coding error rather than one of seven things.
 //
 // One reading caveat that no palette can remove: this view writes flat colours, so a *speckle* of
-// two rejection colours averages to a third under any downscale or screenshot compression -- a
-// fine red/green mixture reads as olive, and reads as orange once JPEG has had it. When judging a
-// granular region, zoom to 1:1 before naming its colour.
+// two colours averages to a third under any downscale or screenshot compression -- a fine
+// red/green mixture reads as olive, and reads as orange once JPEG has had it. When judging a
+// granular region, zoom to 1:1 before naming its colour, and prefer a lossless screenshot.
 float3 SSRT_DebugPlaneFailColour(uint failCode)
 {
     if (failCode == SSRT_PLANE_FAIL_PREV_RANGE)
-        return float3(0.00f, 0.90f, 0.95f);
-    if (failCode == SSRT_PLANE_FAIL_PROJECT)
-        return float3(0.15f, 0.40f, 1.00f);
+        return float3(0.00f, 0.95f, 1.00f);
+    if (failCode == SSRT_PLANE_FAIL_PREV_PROJECT)
+        return float3(0.00f, 0.46f, 0.52f);
     if (failCode == SSRT_PLANE_FAIL_ROUNDTRIP)
-        return float3(0.70f, 0.25f, 1.00f);
-    if (failCode == SSRT_PLANE_FAIL_DEGENERATE)
-        return float3(0.55f, 1.00f, 0.80f);
+        return float3(0.68f, 0.24f, 1.00f);
+    if (failCode == SSRT_PLANE_FAIL_RECONSTRUCT)
+        return float3(0.40f, 0.74f, 0.28f);
+    if (failCode == SSRT_PLANE_FAIL_BASIS)
+        return float3(0.16f, 0.30f, 0.12f);
     if (failCode == SSRT_PLANE_FAIL_TOLERANCE)
-        return float3(1.00f, 0.95f, 0.30f);
+        return float3(1.00f, 0.90f, 0.20f);
+    if (failCode == SSRT_PLANE_FAIL_DEGENERATE)
+        return float3(0.52f, 0.38f, 0.02f);
     return float3(1.00f, 0.45f, 0.00f);
 }
 
@@ -1674,14 +1861,20 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
         // un-rotated normal is what the gate compares anyway, so a failed self-check has changed
         // nothing and there is nothing to report.
         //
-        // (defect P3) With Disable History Depth Test off -- the default -- the magenta is now
-        // subsumed by the azure below, because the plane row is built from the same rotation and
-        // so a failed self-check also stops the plane being published. That is the honest
-        // ordering: the stronger statement is "the plane test did not run", not "one gate lost
-        // its preferred normal". The branch is kept rather than deleted because it is still the
-        // only report available with the depth test switched off, where the rotation matters and
-        // the plane does not.
-        if (rotatedNormalGate != 0 && !historyPlane.normalUsable && disableHistoryNormalTest == 0 && forceAcceptHistory == 0)
+        // (defect P5) The magenta is a first-class report again, at every switch setting. The
+        // previous revision noted it was subsumed by the construction palette whenever the depth
+        // test was on, because the plane row was built from the same rotation and so a failed
+        // self-check stopped the plane too. It no longer is: the row takes the un-rotated normal
+        // unconditionally, so a failed rotation and an unbuildable plane are now independent
+        // facts about a pixel and each has its own colour.
+        //
+        // Order still puts the plane failure last, so it wins when both are true. That is the
+        // right precedence for the same reason as before -- "the plane test did not run" changes
+        // what the whole picture means, while "one gate is comparing the un-rotated normal" only
+        // changes how strict that one gate is -- and the two are now rare enough together that the
+        // masking costs nothing: with Rotated Normal Gate off, its default, the magenta cannot
+        // appear at all.
+        if (rotatedNormalGate != 0 && !historyPlane.rotatedNormalUsable && disableHistoryNormalTest == 0 && forceAcceptHistory == 0)
             debugColour = float3(1.0f, 0.0f, 1.0f);
         if (!historyPlane.usable && disableHistoryDepthTest == 0 && forceAcceptHistory == 0)
             debugColour = SSRT_DebugPlaneFailColour(historyPlane.failCode);
