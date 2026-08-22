@@ -55,11 +55,14 @@ void SampleSSGISpecular(uint2 pixCoord, sh2 lobe, out float ao, out float3 il, i
 	ao = 1 - SsgiAoTexture[pixCoord].x;
 	float NdotV = dot(normal, view);
 	ao = Color::SpecularAOLagarde(saturate(NdotV), ao, roughness);
+	// Write the out parameter unconditionally at entry: in the SSRT permutation with
+	// EnableSpecular off, no branch below ever assigned it, so the caller consumed an
+	// uninitialised value. Single assignment, single exit - no early return that fxc's
+	// dead-code elimination could fold away.
+	il = 0;
 #	if defined(SSRT)
-	if (SharedData::ssrtSettings.EnableSpecular) {
-		il = 0;
-		return;
-	}
+	// SSRT owns the specular path in this permutation; the SSGI specular IL below is not
+	// compiled in, so il stays 0 whether EnableSpecular is on or off.
 #	else
 	float4 ssgiIlYSh = SsgiYTexture[pixCoord];
 	float ssgiIlY = SphericalHarmonics::FuncProductIntegral(ssgiIlYSh, lobe);
