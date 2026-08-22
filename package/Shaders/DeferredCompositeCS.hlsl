@@ -565,7 +565,21 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 	// term the AO path uses. The separate 1/0.65 that used to sit here was never an albedo
 	// de-scale - it was upstream's (2ea3b3adc) energy fudge for lowering the default GIStrength
 	// from 1.5 to 1.0, and with the integrator normalised it has nothing left to compensate for.
+#		if defined(SSRT)
+	// Same exclusion as `envAmbientActive` above: SSGI IL and SSRT diffuse are competing
+	// answers to "what arrives from the environment", and ssrt_diffuse_composite.hlsl has
+	// already added confidence-weighted traced radiance for this pixel wherever DiffuseMult
+	// is non-zero. Adding the SSGI estimate of the same hemisphere on top double-counts.
+	// Runtime check, not compile-time: the SSGI and SSRT defines are independent (both
+	// features can be loaded at once - Deferred.cpp composite define lists), and DiffuseMult
+	// is already gated on EnableDiffuse in ScreenSpaceRayTracing::GetCommonBufferData, so
+	// toggling SSRT diffuse needs no composite recompile. Only IL is gated - the SSGI AO
+	// channel (contact term included) enters through multiBounceAO above and stays active.
+	if (!(SharedData::ssrtSettings.DiffuseMult > 0.0))
+		linDiffuseColor += ssgiIl * linAlbedo;
+#		else
 	linDiffuseColor += ssgiIl * linAlbedo;
+#		endif
 #	endif
 #endif
 
