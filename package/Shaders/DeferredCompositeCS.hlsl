@@ -55,11 +55,14 @@ void SampleSSGISpecular(uint2 pixCoord, sh2 lobe, out float ao, out float3 il, i
 	ao = 1 - SsgiAoTexture[pixCoord].x;
 	float NdotV = dot(normal, view);
 	ao = Color::SpecularAOLagarde(saturate(NdotV), ao, roughness);
+	// Write the out parameter unconditionally at entry: in the SSRT permutation with
+	// EnableSpecular off, no branch below ever assigned it, so the caller consumed an
+	// uninitialised value. Single assignment, single exit - no early return that fxc's
+	// dead-code elimination could fold away.
+	il = 0;
 #	if defined(SSRT)
-	if (SharedData::ssrtSettings.EnableSpecular) {
-		il = 0;
-		return;
-	}
+	// SSRT owns the specular path in this permutation; the SSGI specular IL below is not
+	// compiled in, so il stays 0 whether EnableSpecular is on or off.
 #	else
 	float4 ssgiIlYSh = SsgiYTexture[pixCoord];
 	float ssgiIlY = SphericalHarmonics::FuncProductIntegral(ssgiIlYSh, lobe);
@@ -565,7 +568,21 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 	// term the AO path uses. The separate 1/0.65 that used to sit here was never an albedo
 	// de-scale - it was upstream's (2ea3b3adc) energy fudge for lowering the default GIStrength
 	// from 1.5 to 1.0, and with the integrator normalised it has nothing left to compensate for.
+#		if defined(SSRT)
+	// Same exclusion as `envAmbientActive` above: SSGI IL and SSRT diffuse are competing
+	// answers to "what arrives from the environment", and ssrt_diffuse_composite.hlsl has
+	// already added confidence-weighted traced radiance for this pixel wherever DiffuseMult
+	// is non-zero. Adding the SSGI estimate of the same hemisphere on top double-counts.
+	// Runtime check, not compile-time: the SSGI and SSRT defines are independent (both
+	// features can be loaded at once - Deferred.cpp composite define lists), and DiffuseMult
+	// is already gated on EnableDiffuse in ScreenSpaceRayTracing::GetCommonBufferData, so
+	// toggling SSRT diffuse needs no composite recompile. Only IL is gated - the SSGI AO
+	// channel (contact term included) enters through multiBounceAO above and stays active.
+	if (!(SharedData::ssrtSettings.DiffuseMult > 0.0))
+		linDiffuseColor += ssgiIl * linAlbedo;
+#		else
 	linDiffuseColor += ssgiIl * linAlbedo;
+#		endif
 #	endif
 #endif
 
@@ -703,13 +720,6 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 #endif
 
 	color = Color::IrradianceToGamma(color);
-
-#if defined(PHYSICAL_SKY)
-	if (SharedData::physSkyData.enabled && depth < 1 - 1e-6) {
-		const float4 apSample = PhysSky::SampleAp(normalize(positionWS.xyz), dispatchID.xy, length(positionWS.xyz), PhysSky::SampSv);
-		color.xyz = color.xyz * apSample.w + apSample.xyz;
-	}
-#endif
 
 #if defined(PHYSICAL_SKY)
 	if (SharedData::physSkyData.enabled && depth < 1 - 1e-6) {
