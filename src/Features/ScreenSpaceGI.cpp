@@ -188,7 +188,7 @@ void ScreenSpaceGI::DrawSettings()
 					"1.0 is one energy-correct screen-space bounce: the integrator is",
 					"analytically normalised, so a surface fully enclosed by unit radiance",
 					"receives exactly its own albedo.",
-					"Because the vanilla/Environment Ambient term is still present and already",
+					"Because the vanilla ambient term is still present and already",
 					"contains indirect light, the visually balanced value is usually below 1.",
 					"Settings carried over from before the normalisation need roughly 5x their",
 					"old value to look the same."

@@ -2,7 +2,6 @@
 
 struct CloudShadows;
 struct DynamicCubemaps;
-struct EnvironmentAmbient;
 struct ExtendedMaterials;
 struct GrassCollision;
 struct GrassLighting;
@@ -97,7 +96,6 @@ namespace globals
 		extern PostProcessing postProcessing;
 		extern Skin skin;
 		extern ExponentialHeightFog exponentialHeightFog;
-		extern EnvironmentAmbient environmentAmbient;
 
 		namespace llf
 		{

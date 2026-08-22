@@ -10,8 +10,9 @@
 // the SSRT diffuse fallback inside ssrt_raymarch.hlsl -- each of them a raw ten-tap estimate with no
 // filtering of any kind. Three copies of one signal, three chances to drift, and no control over its
 // precision. There is now one evaluation per frame per pixel, one accumulator, and one output: the
-// SSGI AO texture. DeferredCompositeCS's multiBounceAO, ssrt_raymarch's `ao *= 1 - SsgiAo` and
-// Environment Ambient's envAo all read it exactly as they did before.
+// SSGI AO texture. DeferredCompositeCS's multiBounceAO and ssrt_raymarch's `ao *= 1 - SsgiAo`
+// both read it exactly as they did before. (Environment Ambient, the third historical consumer,
+// has since been retired.)
 //
 // WHY IT IS FULL RESOLUTION EVEN WHEN SSGI IS NOT. The whole point of the term is the scale SSGI
 // cannot reach: 15 cm is a fraction of a pixel's worth of screen space at half resolution, so

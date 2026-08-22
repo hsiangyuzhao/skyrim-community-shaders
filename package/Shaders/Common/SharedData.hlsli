@@ -386,34 +386,6 @@ namespace SharedData
 		float3 pad;
 	};
 
-	// Mirrors EnvironmentAmbient::Settings in src/Features/EnvironmentAmbient.h byte for byte.
-	struct EnvAmbientSettings
-	{
-		uint Enabled;
-		float Blend;
-		float Intensity;
-		float Normalization;
-
-		float EnvMip;
-		float Saturation;
-		float Spread;
-		float OcclusionStrength;
-
-		uint SampleCount;
-		uint ApplyAO;
-		uint EnableInterior;
-		uint LinearComposite;
-
-		uint EnclosureFallback;
-		float HueFalloff;
-		// (contact AO) EnableContactOcclusion / ContactRadius / ContactStrength used to close this
-		// row and open a fifth. The kernel they configured now lives in Screen Space GI, which owns
-		// its own copies, so the block is four rows and the two trailing pads are gone with them.
-		// Safe to shrink because this struct is last in FeatureData -- nothing sits behind it to
-		// shift.
-		float AOExponent;
-	};
-
 	cbuffer FeatureData : register(b6)
 	{
 		GrassLightingSettings grassLightingSettings;
@@ -437,7 +409,6 @@ namespace SharedData
 		PhysSkyData physSkyData;
 		SSRTSettings ssrtSettings;
 		ExponentialHeightFogSettings exponentialHeightFogSettings;
-		EnvAmbientSettings envAmbientSettings;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);

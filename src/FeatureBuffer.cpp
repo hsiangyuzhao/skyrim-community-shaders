@@ -2,7 +2,6 @@
 
 #include "Features/CloudShadows.h"
 #include "Features/DynamicCubemaps.h"
-#include "Features/EnvironmentAmbient.h"
 #include "Features/ExponentialHeightFog.h"
 #include "Features/ExtendedMaterials.h"
 #include "Features/ExtendedTranslucency.h"
@@ -64,7 +63,5 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::vanillaFresnel.settings,
 		globals::features::physicalSky.cbData,
 		globals::features::screenSpaceRayTracing.GetCommonBufferData(),
-		globals::features::exponentialHeightFog.settings,
-		// Appended at the end so existing member offsets in FeatureData (b6) are untouched.
-		globals::features::environmentAmbient.settings);
+		globals::features::exponentialHeightFog.settings);
 }

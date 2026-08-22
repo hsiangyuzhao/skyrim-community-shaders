@@ -3,7 +3,6 @@
 #include "Deferred.h"
 #include "Features/CloudShadows.h"
 #include "Features/DynamicCubemaps.h"
-#include "Features/EnvironmentAmbient.h"
 #include "Features/ExponentialHeightFog.h"
 #include "Features/ExtendedMaterials.h"
 #include "Features/ExtendedTranslucency.h"
@@ -93,7 +92,6 @@ namespace globals
 		PostProcessing postProcessing{};
 		Skin skin{};
 		ExponentialHeightFog exponentialHeightFog{};
-		EnvironmentAmbient environmentAmbient{};
 
 		namespace llf
 		{
