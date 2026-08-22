@@ -475,23 +475,37 @@ struct ScreenSpaceRayTracing : Feature
         ///   * blue -- rejected by screen bounds, a non-finite history sample, or a zero frame
         ///     count.
         ///   * black -- sky or far plane, where there is no history question to ask.
-        ///   * any yellow -- the acceptance plane could not be built, so the plane test did not
-        ///     run on that pixel and the history was judged by bounds plus normal agreement
-        ///     alone. Four shades name which construction gave up: pale yellow, the shaded point
-        ///     has no image inside the previous frame's depth range; amber, it has no usable
-        ///     reconstruction at all -- non-finite, on the previous camera plane, or failing the
-        ///     closed-loop depth self-check; dark amber, the plane passes through the previous
-        ///     camera; bright lemon, the tolerance came out non-positive.
+        ///   * (defect P4) cyan, azure, violet, mint or lemon -- the acceptance plane could not be
+        ///     built, so the plane test did not run on that pixel and the history was judged by
+        ///     bounds plus normal agreement alone. Each names one construction: cyan, the shaded
+        ///     point has no image inside the previous frame's depth range; azure, a probe has no
+        ///     finite image at all (non-finite, or on the previous camera plane); violet, the
+        ///     reconstruction failed its closed-loop depth self-check; mint, the plane passes
+        ///     through the previous camera (an edge-on surface); lemon, the tolerance came out
+        ///     non-positive.
         ///   * magenta -- the rotated normal gate is on and its rotation failed its self-check.
-        ///     Only visible with Disable History Depth Test on; otherwise the amber above says
+        ///     Only visible with Disable History Depth Test on; otherwise the azure above says
         ///     the same thing more strongly, since the plane row is built from that rotation.
+        ///   * orange -- unreachable by construction. It means the failCode was out of range,
+        ///     i.e. a genuinely new coding error, and nothing else in this view is orange.
+        ///
+        /// (defect P4) The five construction colours used to be four shades of yellow, on the
+        /// theory that the shared hue made the *class* read at a glance. It did, and that was the
+        /// problem: an in-game reading came back "orange-ish, textured, granular", which fitted
+        /// all four shades equally and so identified nothing. They are now mutually
+        /// distinguishable and no reachable branch is orange.
+        ///
+        /// One reading caveat the palette cannot remove: this view writes flat colours, so a
+        /// *speckle* of two colours averages to a third under any downscale or screenshot
+        /// compression -- a fine red/green mixture reads as olive, and as orange once JPEG has
+        /// had it. Zoom to 1:1 before naming the colour of a granular region.
         ///
         /// (defect P3) A full pale-yellow screen with a stationary camera was the finding that
         /// identified the last arithmetic error in the plane construction: at rest the projection
         /// chain must return the depth it started from, so a screen-wide range failure could only
         /// be a matrix that was not the transform its name claimed. The construction now proves
         /// its own reconstruction against the depth buffer every frame, so that class of failure
-        /// reports itself in amber instead of silently costing the test its effect.
+        /// reports itself in violet instead of silently costing the test its effect.
         ///
         /// A uniform colour over the whole screen is the finding: it means one gate is turning
         /// away every candidate everywhere, which is what makes the accumulation degenerate to

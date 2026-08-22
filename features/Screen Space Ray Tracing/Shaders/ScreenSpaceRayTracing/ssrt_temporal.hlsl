@@ -491,7 +491,7 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // resolution, stereo layout or where the world origin sits. A reconstruction that fails it
 // reports SSRT_PLANE_FAIL_PROJECT and the pixel abstains from the plane test, so a third
 // mislabelled matrix could only ever cost the test its effect -- never turn it into a screen-wide
-// rejection -- and the diagnostic view would say so in amber on the first frame.
+// rejection -- and the diagnostic view would say so in violet on the first frame.
 //
 // The trick that makes that sufficient is to stop reconstructing taps at all and to describe the
 // plane in the space the taps already live in: previous-frame pixel index plus previous-frame
@@ -527,9 +527,9 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // quantity the folded-row form measured -- distance from the plane along the view ray -- so
 // SSRT_HISTORY_PLANE_TILT and the tolerance below keep their meaning and their tuning.
 //
-// Failure is now attributable instead of silent. Each of the four ways the construction can give
-// up sets its own code on the returned struct, the diagnostic view paints each in its own shade
-// of yellow, and a pixel whose plane could not be built *bypasses* the plane test rather than
+// Failure is now attributable instead of silent. Each of the five ways the construction can give
+// up sets its own code on the returned struct, the diagnostic view paints each in its own
+// distinct colour, and a pixel whose plane could not be built *bypasses* the plane test rather than
 // failing it -- see the bypass at IsValidHistory. There is no longer any path by which a broken
 // plane rejects the whole screen without saying so.
 //
@@ -612,36 +612,69 @@ float3 SSRTClampHistory(float3 history, float3 centre, uint2 gtid, float sigmas,
 // pushed back through CameraViewProjUnjittered and the linear depth that returns must agree with
 // the linear depth the depth buffer gave to within this fraction of it.
 //
-// The exact residual is the TAA jitter's, and it is zero: jitter translates clip xy by j * w and
-// so cannot move clip z or w at all, which makes the round trip exact in depth even though the
-// outbound leg is the jittered inverse and the return leg is the unjittered forward. What the
-// band actually absorbs is fp32 cancellation in two 4x4 products and two divides at Skyrim's
-// far-to-near ratio of ~1e4, where a single-precision mantissa leaves about 1e-4 relative. 1%
-// is two orders of magnitude above that and three below the smallest failure worth catching --
-// the corruptions this check exists for invert the *sign* of the reconstructed depth, so they
-// miss by more than 100%.
-#define SSRT_HISTORY_PLANE_ROUNDTRIP_TOLERANCE 0.01f
+// THE JITTER CONTRIBUTES NOTHING, AND THAT IS PROVEN RATHER THAN ASSUMED
+//
+// A jittered projection is T(j) * P, where T(j) translates clip xy by j * w. In this convention
+// that is P[0][2] += jx and P[1][2] += jy: it edits *rows 0 and 1 only*, and leaves rows 2 and 3
+// -- the ones that produce clip z and clip w -- bit-identical between CameraViewProj and
+// CameraViewProjUnjittered. So for any point X whatsoever,
+//     (VP_unjittered * X).zw == (VP_jittered * X).zw,
+// and since CameraViewProjInverse inverts VP_jittered exactly, the depth this check compares is
+// an algebraic identity in the jitter. Pairing the jittered inverse with the unjittered forward
+// is therefore not an approximation to be budgeted for, and the phase relationship between the
+// current and previous frames' jitter cannot enter it at all. Measured across 24 consecutive
+// Halton phases at every depth: the residual does not move with the phase.
+//
+// (defect P4) WHAT THE BAND ACTUALLY HAS TO ABSORB, AND WHY A FLAT 1% WAS THE WRONG SHAPE
+//
+// The residual is pure fp32 rounding in two 4x4 products and two divides, and it enters as an
+// error in the *NDC* depth that returns. Linearising amplifies it, because
+//     z(raw) = w / (x - raw * z_c)   with CameraData = (far, near, far - near, far * near),
+//     dz/draw = z_c * z^2 / w   =>   (dz / z) / draw = z_c * z / w   ~   z / near.
+// So the relative residual is A * eps_raw with A = CameraData.z * linear / CameraData.w, and A
+// runs from ~1 next to the near plane to far/near -- of order 1e4 -- at the far plane. Measured
+// on the CPU harness across five near/far/DRS configurations and the whole depth range, eps_raw
+// is flat at 3.1e-7, i.e. 2.6 ulp of binary32, exactly as that derivation predicts; the relative
+// residual it produces runs from 3.8e-7 up to 7.5e-3.
+//
+// A flat 1% is therefore ~26000x looser than needed near the camera and only 1.3x clear of the
+// measurement at the far end -- the wrong shape, and thin exactly where the amplification is
+// worst. The band below is the derivation instead: 24 ulp (9x the measured 2.6) times A. The
+// `max` against the old flat 1% is deliberate and makes this change strictly one-directional --
+// no pixel that passes today can start failing -- while opening the band where the fp32 model
+// says it must open. Both terms stay three orders of magnitude below the smallest failure worth
+// catching, because the corruptions this check exists for invert the *sign* of the reconstructed
+// depth and so miss by more than 100%: at Skyrim's largest plausible A the band reaches 14%.
+#define SSRT_HISTORY_PLANE_ROUNDTRIP_ULPS 24.0f
+#define SSRT_HISTORY_PLANE_ROUNDTRIP_FLOOR 0.01f
+// binary32 machine epsilon, spelled out rather than named so no header has to be assumed.
+#define SSRT_FLT_EPSILON 1.1920929e-7f
 
 // (P2.4 follow-up) Why the plane could not be built. Zero means it was. Painted by the
-// diagnostic view as four distinguishable yellows; see SSRT_DebugPlaneFailColour.
+// diagnostic view as five mutually distinguishable colours; see SSRT_DebugPlaneFailColour.
 #define SSRT_PLANE_OK 0u
 // The shaded point does not land inside the previous frame's depth range, so no history texel
 // anywhere stands for anything this plane could be compared with.
 #define SSRT_PLANE_FAIL_PREV_RANGE 1u
 // A probe's previous-clip position is non-finite, or sits on/behind the previous camera plane.
-// (defect P3) Also raised when the shaded point's reconstruction fails its closed-loop
-// self-check, i.e. when pushing it back through CameraViewProjUnjittered does not return the
-// depth the depth buffer gave. Deliberately the same code and the same amber: both mean "this
-// pixel has no position the previous frame can be interrogated with", and the diagnostic colour
-// table is not being extended for a case that resolves to the identical abstention.
 #define SSRT_PLANE_FAIL_PROJECT 2u
 // (defect P3) The plane passes through the previous camera itself, so the reciprocal depth it
 // implies is unbounded and no row describes it. Same meaning as the collinear-probes case this
-// replaces -- "there is no unique answer" -- and the same dark amber, but now it is a single
-// scale-free test on one number instead of a conditioning check on a 2x2 solve.
+// replaces -- "there is no unique answer" -- but now it is a single scale-free test on one number
+// instead of a conditioning check on a 2x2 solve.
 #define SSRT_PLANE_FAIL_DEGENERATE 3u
 // The tolerance came out non-finite or non-positive, which would reject every tap forever.
 #define SSRT_PLANE_FAIL_TOLERANCE 4u
+// (defect P4) The shaded point's reconstruction failed its closed-loop self-check: pushing it back
+// through CameraViewProjUnjittered did not return the depth the depth buffer gave.
+//
+// It used to share SSRT_PLANE_FAIL_PROJECT and that code's amber, on the argument that both
+// resolve to the same abstention. They do, but the *diagnosis* they support is not the same at
+// all -- one says a matrix is mislabelled, the other says a numeric band is too tight -- and
+// sharing a colour cost a whole trip into the game: the in-game reading came back "orange-ish",
+// which under the old table could have been any of four ambers and so identified nothing. It has
+// its own code and its own violet now, and no reachable branch is painted orange any more.
+#define SSRT_PLANE_FAIL_ROUNDTRIP 5u
 
 struct SSRTHistoryPlane
 {
@@ -674,7 +707,7 @@ struct SSRTHistoryPlane
     float tolerancePerTexel;
     bool usable;
     bool normalUsable;
-    // (P2.4 follow-up) SSRT_PLANE_OK, or which of the four constructions above gave up. Carried
+    // (P2.4 follow-up) SSRT_PLANE_OK, or which of the five constructions above gave up. Carried
     // for the diagnostic view only: nothing in the acceptance path reads it.
     uint failCode;
 };
@@ -720,7 +753,7 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     // whose correctness TAA and DLSS depend on every frame -- and the linear depth that returns
     // is compared with the linear depth the depth buffer gave. Any mislabelled matrix, any
     // storage-convention surprise and any resolution or stereo convention that breaks the pairing
-    // shows up here, on the first frame, in amber, instead of silently rejecting the screen.
+    // shows up here, on the first frame, in violet, instead of silently rejecting the screen.
     const float4 checkClip = mul(FrameBuffer::CameraViewProjUnjittered[eyeIndex], float4(posRW, 1.0f));
     if (!isFiniteSafe(checkClip) || abs(checkClip.w) < 1e-9f)
     {
@@ -728,10 +761,17 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
         return plane;
     }
     const float checkLinear = SharedData::GetScreenDepth(checkClip.z / checkClip.w);
-    if (!isFiniteSafe(checkLinear) ||
-        abs(checkLinear - linearCenter) > SSRT_HISTORY_PLANE_ROUNDTRIP_TOLERANCE * abs(linearCenter))
+    // (defect P4) The band is the derivation at SSRT_HISTORY_PLANE_ROUNDTRIP_ULPS, not a flat
+    // fraction: the NDC-to-linear amplification A is read straight off the same CameraData the
+    // linearisation itself uses, so the band tracks the near plane and the far plane with no
+    // assumed depth range. max() against the old flat floor keeps the change one-directional.
+    const float roundTripAmplify = SharedData::CameraData.z * abs(linearCenter) / SharedData::CameraData.w;
+    const float roundTripBand = max(SSRT_HISTORY_PLANE_ROUNDTRIP_FLOOR,
+        SSRT_HISTORY_PLANE_ROUNDTRIP_ULPS * SSRT_FLT_EPSILON * roundTripAmplify);
+    if (!isFiniteSafe(checkLinear) || !isFiniteSafe(roundTripBand) ||
+        abs(checkLinear - linearCenter) > roundTripBand * abs(linearCenter))
     {
-        plane.failCode = SSRT_PLANE_FAIL_PROJECT;
+        plane.failCode = SSRT_PLANE_FAIL_ROUNDTRIP;
         return plane;
     }
 
@@ -773,7 +813,7 @@ SSRTHistoryPlane SSRTBuildHistoryPlane(float2 uv, float rawDepth, float3 normalV
     // A unit normal in must come back out with unit length, within
     // SSRT_HISTORY_ROTATION_TOLERANCE, which a changed FOV or any convention surprise breaks. It is
     // load-bearing for the plane now rather than for the gate alone, so failing it abstains from the
-    // plane test (amber) rather than only falling back on the gate -- either way, no rejection.
+    // plane test (azure) rather than only falling back on the gate -- either way, no rejection.
     if (!(abs(projUnj[0][0]) > 1e-9f) || !(abs(projUnj[1][1]) > 1e-9f))
     {
         plane.failCode = SSRT_PLANE_FAIL_PROJECT;
@@ -1021,9 +1061,10 @@ uint IsValidHistory(uint2 pixel, float2 uv, SSRTHistoryPlane plane, float3 norma
     // could not be built is not evidence *against* a tap, it is the absence of evidence, so the
     // honest response is to abstain: the bounds tests above, the 30 degree normal agreement
     // below and guard G4 all stay in force, which is precisely the pre-D3 predicate. The
-    // diagnostic view paints these pixels yellow (see SSRT_DebugPlaneFailColour) so an abstention
-    // is loud rather than invisible -- and a full yellow screen now means "ghosting, plane test
-    // off" instead of "no history anywhere".
+    // diagnostic view paints these pixels in the construction-failure palette (see
+    // SSRT_DebugPlaneFailColour) so an abstention is loud rather than invisible -- and a screen
+    // full of any one of those colours now means "ghosting, plane test off" instead of "no
+    // history anywhere".
     if (disableHistoryDepthTest == 0 && forceAcceptHistory == 0 && plane.usable)
     {
         // The row already carries the pixel-index-to-NDC map, so the tap supplies only its own
@@ -1125,31 +1166,48 @@ float3 SSRT_DebugRejectColour(uint3 tally)
 }
 
 // (P2.4 follow-up) The colour a pixel whose plane could not be built gets, naming which of the
-// four constructions gave up. Split out of blue, which is what made the first measurement
+// five constructions gave up. Split out of blue, which is what made the first measurement
 // ambiguous: "the plane was never built" and "the taps were out of bounds" arrived in the same
 // colour, so a uniform blue screen had two readings and the more alarming one had to be
 // established by a second trip into the game with Force Accept History on.
 //
-// All four are yellows so the *class* reads at a glance -- any yellow means the plane test did
-// not run on that pixel and the history was judged by bounds plus normal agreement alone -- while
-// the four shades stay apart on a real monitor:
-//   pale yellow  the shaded point has no image inside the previous frame's depth range;
-//   amber        a probe has no finite image at all (non-finite, or on the previous camera plane);
-//   dark amber   the three probes are collinear in previous screen space, i.e. an edge-on surface;
-//   bright lemon the tolerance came out non-finite or non-positive.
-// Anything else is a coding error and comes back white-ish, which is not a colour any other
-// branch of this view produces.
+// (defect P4) The four-yellows scheme this replaces failed in the only way a diagnostic colour
+// table can: an in-game reading came back "orange-ish, textured, granular" and that description
+// fit all four of pale yellow, amber, dark amber and bright lemon equally well, so a full trip
+// into the game established nothing except that *some* construction had given up. Worse, the two
+// codes most worth separating -- a mislabelled matrix and a numeric band that is too tight --
+// were deliberately sharing one code and one amber.
+//
+// So the class no longer has a shared hue. Each of the five codes gets a colour chosen to be
+// nameable on sight and far from every other colour this view produces (pure red, pure green,
+// pure blue, the grey accept ramp, black for sky, magenta for the rotation warning):
+//   cyan    the shaded point has no image inside the previous frame's depth range;
+//   azure   a probe has no finite image at all (non-finite, or on the previous camera plane);
+//   violet  the reconstruction failed its closed-loop depth self-check (defect P4);
+//   mint    the plane passes through the previous camera, i.e. an edge-on surface;
+//   lemon   the tolerance came out non-finite or non-positive.
+//
+// No reachable branch is orange or amber any more. That is the point: orange is now reserved for
+// an out-of-range failCode, which is unreachable by construction, so if orange ever appears again
+// it means a genuinely new coding error rather than one of five things.
+//
+// One reading caveat that no palette can remove: this view writes flat colours, so a *speckle* of
+// two rejection colours averages to a third under any downscale or screenshot compression -- a
+// fine red/green mixture reads as olive, and reads as orange once JPEG has had it. When judging a
+// granular region, zoom to 1:1 before naming its colour.
 float3 SSRT_DebugPlaneFailColour(uint failCode)
 {
     if (failCode == SSRT_PLANE_FAIL_PREV_RANGE)
-        return float3(1.0f, 0.85f, 0.40f);
+        return float3(0.00f, 0.90f, 0.95f);
     if (failCode == SSRT_PLANE_FAIL_PROJECT)
-        return float3(1.0f, 0.70f, 0.00f);
+        return float3(0.15f, 0.40f, 1.00f);
+    if (failCode == SSRT_PLANE_FAIL_ROUNDTRIP)
+        return float3(0.70f, 0.25f, 1.00f);
     if (failCode == SSRT_PLANE_FAIL_DEGENERATE)
-        return float3(0.70f, 0.45f, 0.00f);
+        return float3(0.55f, 1.00f, 0.80f);
     if (failCode == SSRT_PLANE_FAIL_TOLERANCE)
-        return float3(1.0f, 1.0f, 0.35f);
-    return float3(0.9f, 0.9f, 0.8f);
+        return float3(1.00f, 0.95f, 0.30f);
+    return float3(1.00f, 0.45f, 0.00f);
 }
 
 // (diagnostic H) Fold one evaluated tap into the running tally, accepted or not.
@@ -1617,7 +1675,7 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
         // nothing and there is nothing to report.
         //
         // (defect P3) With Disable History Depth Test off -- the default -- the magenta is now
-        // subsumed by the amber below, because the plane row is built from the same rotation and
+        // subsumed by the azure below, because the plane row is built from the same rotation and
         // so a failed self-check also stops the plane being published. That is the honest
         // ordering: the stronger statement is "the plane test did not run", not "one gate lost
         // its preferred normal". The branch is kept rather than deleted because it is still the
