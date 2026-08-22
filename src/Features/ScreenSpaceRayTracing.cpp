@@ -1377,7 +1377,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
 
-        context->CopyResource(texHistoryMoments->resource.get(), texMoments->resource.get());
+        CopyDynamicRegion(texHistoryMoments->resource.get(), texMoments->resource.get());
 
         // variance filter
         uavs.at(0) = texVariance->uav.get();
@@ -1422,13 +1422,13 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
             // (defect D4) i == 0 is the even leg of the ping-pong, so the first iteration's
             // output sits in texSSRColor and the next iteration is about to overwrite it.
             if (i == 0) {
-                context->CopyResource(texHistory->resource.get(), texSSRColor->resource.get());
+                CopyDynamicRegion(texHistory->resource.get(), texSSRColor->resource.get());
                 historyFed = true;
             }
         }
 
         if (settings.AtrousIterations % 2 == 0) {
-            context->CopyResource(texSSRColor->resource.get(), texVariance->resource.get());
+            CopyDynamicRegion(texSSRColor->resource.get(), texVariance->resource.get());
         }
     }
 
@@ -1440,7 +1440,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // (audit #13) Specular runs after diffuse, so it owns the once-per-frame snapshot.
     CopyHistoryGeometry();
     if (!historyFed)
-        context->CopyResource(texHistory->resource.get(), texSSRColor->resource.get());
+        CopyDynamicRegion(texHistory->resource.get(), texSSRColor->resource.get());
 
     context->CSSetShader(nullptr, nullptr, 0);
 
@@ -1466,17 +1466,39 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 // R32_FLOAT restatement of kPOST_ZPREPASS_COPY, written this frame in Prepass and untouched
 // since, with the far plane outside the dynamic-resolution sub-rect (audit #8) which is
 // exactly the value that must reject there.
-void ScreenSpaceRayTracing::CopyHistoryGeometry()
+// (perf 3) The dynamic-resolution sub-rectangle, as a copy box. See the contract at the
+// declaration for why every reader in this feature is insensitive to what lies outside it.
+void ScreenSpaceRayTracing::CopyDynamicRegion(ID3D11Resource* a_dst, ID3D11Resource* a_src) const
 {
     auto context = globals::d3d::context;
+    const float2 size = Util::ConvertToDynamic(globals::state->screenSize);
+    const auto full = globals::state->screenSize;
+
+    // One texel of margin against a float-rounding disagreement with the shader's own
+    // `BufferDim.xy * DynamicResolutionParams1.xy`, then clamped to the allocation. A dynamic
+    // ratio of 1.0 therefore degenerates to the whole surface, i.e. to what CopyResource did.
+    const UINT w = std::min((UINT)std::max(full.x, 1.0f), (UINT)std::max(size.x, 1.0f) + 1u);
+    const UINT h = std::min((UINT)std::max(full.y, 1.0f), (UINT)std::max(size.y, 1.0f) + 1u);
+
+    const D3D11_BOX box{ 0, 0, 0, w, h, 1 };
+    context->CopySubresourceRegion(a_dst, 0, 0, 0, 0, a_src, 0, &box);
+}
+
+void ScreenSpaceRayTracing::CopyHistoryGeometry()
+{
     auto normal = globals::game::renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
-    context->CopyResource(texHistoryNormals->resource.get(), normal.texture);
+    CopyDynamicRegion(texHistoryNormals->resource.get(), normal.texture);
 
     // Only the denoiser reads it, so an SVGF-off frame must not pay for it. Flipping SVGF
     // back on latches historyClearPending (guard G8), which resets this to the far plane, so
     // the stale content left behind while it was off can never be consumed.
+    //
+    // (perf 3) Restricted to the dynamic-resolution sub-rect, which is where the copy's whole
+    // purpose lies. The region outside it now keeps the far plane ClearDenoiserHistory wrote
+    // instead of inheriting texDepth's own untouched content -- the same value, arrived at more
+    // directly, and the one audit #8's convention asks for there.
     if (settings.EnableSVGF && texHistoryDepth)
-        context->CopySubresourceRegion(texHistoryDepth->resource.get(), 0, 0, 0, 0, texDepth->resource.get(), 0, nullptr);
+        CopyDynamicRegion(texHistoryDepth->resource.get(), texDepth->resource.get());
 }
 
 void ScreenSpaceRayTracing::DrawSSRTDiffuse()
@@ -1714,7 +1736,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
 
-        context->CopyResource(texHistoryMomentsDiffuse->resource.get(), texMoments->resource.get());
+        CopyDynamicRegion(texHistoryMomentsDiffuse->resource.get(), texMoments->resource.get());
 
         // variance filter
         uavs.at(0) = texVariance->uav.get();
@@ -1765,18 +1787,18 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
             // the following iteration is about to overwrite it -- this is the only point in
             // the frame where it can be taken.
             if (i == 0) {
-                context->CopyResource(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
+                CopyDynamicRegion(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
                 historyFed = true;
             }
         }
 
         if (settings.AtrousIterations % 2 == 0) {
-            context->CopyResource(texSSRTDiffuseColor->resource.get(), texVariance->resource.get());
+            CopyDynamicRegion(texSSRTDiffuseColor->resource.get(), texVariance->resource.get());
         }
     }
 
     if (!historyFed)
-        context->CopyResource(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
+        CopyDynamicRegion(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
 
     // composite
     {

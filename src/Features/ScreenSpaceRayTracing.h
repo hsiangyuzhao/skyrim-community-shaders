@@ -789,6 +789,38 @@ struct ScreenSpaceRayTracing : Feature
     void CopyHistoryGeometry();
     virtual void Prepass() override;
 
+    /// @brief (perf 3) Copies one full-screen surface into another over the dynamic-resolution
+    /// sub-rectangle only, instead of over the whole allocation.
+    ///
+    /// Every texture in this feature is allocated at the full output resolution while every
+    /// dispatch covers `Util::ConvertToDynamic(screenSize)`, so at DLSS Quality (0.667 linear)
+    /// 56% of every CopyResource in the chain moved texels that no pass had written and no pass
+    /// would read. The region outside the sub-rect is not merely redundant, it is *stale on both
+    /// sides*: the source's copy of it was never written by any dispatch either, so restricting
+    /// the copy replaces one surface's untouched content with another's.
+    ///
+    /// Safe for every consumer in the chain, and that is a property of the readers rather than a
+    /// hope:
+    ///   * texHistoryDiffuse / texHistoryMomentsDiffuse (and their specular twins) are read only
+    ///     by ssrt_temporal.hlsl, and only through IsValidHistory, which rejects any tap outside
+    ///     `prevRenderSize` -- the previous frame's sub-rect, i.e. exactly the region the
+    ///     previous frame's copy filled. The t0 declarations in ssrt_raymarch / ssrt_variance /
+    ///     ssrt_spatial are vestigial: none of the three reads the texture.
+    ///   * texSSRTDiffuseColor / texSSRColor are read at SV_DispatchThreadID by the composite and
+    ///     the temporal pass, through the clamp-to-edge tile fills (clamped to screen_size - 1),
+    ///     and at bounds-checked positions by the a-trous taps. All inside the sub-rect.
+    ///   * texHistoryDepth's outside region is *better* off: it keeps the far plane that
+    ///     ClearDenoiserHistory wrote, which is the value defect D3 wants there, instead of
+    ///     inheriting texDepth's own untouched content.
+    ///
+    /// One texel of margin is added on each axis and the result clamped to the allocation, so a
+    /// float-rounding disagreement between this and the shader's
+    /// `BufferDim.xy * DynamicResolutionParams1.xy` cannot leave a seam.
+    ///
+    /// @param a_dst Destination resource; the sub-rect lands at (0, 0), as CopyResource put it.
+    /// @param a_src Source resource, which must have the destination's format and dimensions.
+    void CopyDynamicRegion(ID3D11Resource* a_dst, ID3D11Resource* a_src) const;
+
     SharedData GetCommonBufferData();
 
     /// @brief Builds the denoiser constant buffer from the current settings. Shared by
