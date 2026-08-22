@@ -1001,7 +1001,14 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             hit_distance = world_ray_length;
 #endif
         }
-        const float NdotV = saturate(dot(normalize(view_space_ray), view_space_surface_normal));
+        // NdotV is the cosine between the surface normal and the direction *towards the
+        // camera*. view_space_ray is the view-space surface position, i.e. camera->surface
+        // (see :758), so its normalized form points away from the camera and the previous
+        // dot(normalize(view_space_ray), N) was <= 0 for every visible surface - saturate
+        // pinned it to 0 and GetSpecularOcclusionFromAmbientOcclusion below always saw a
+        // fully grazing view. Negate the pre-bias ray direction (:787) to get the
+        // surface->camera vector; the result now lands in (0, 1] as intended.
+        const float NdotV = saturate(dot(-view_space_ray_direction, view_space_surface_normal));
 #if defined(DYNAMIC_CUBEMAPS) && !SHARC_UPDATE
         if (UseDynamicCubemapsAsFallback != 0 && (confidence < 0.999f))
         {
