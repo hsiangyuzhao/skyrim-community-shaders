@@ -611,7 +611,7 @@ struct ScreenSpaceRayTracing : Feature
     };
     static_assert(sizeof(SharedData) == 32,
         "ScreenSpaceRayTracing::SharedData must stay 32 bytes (two constant buffer rows); "
-        "ExponentialHeightFogSettings and EnvAmbientSettings sit behind it in FeatureData.");
+        "ExponentialHeightFogSettings sits behind it in FeatureData.");
 
     /// @brief Mirrored by the `SSRTCB` declaration in ssrt_raymarch.hlsl, which is the only
     /// shader that binds b1 in this feature.

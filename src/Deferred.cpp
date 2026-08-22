@@ -7,7 +7,6 @@
 #include "TruePBR.h"
 
 #include "Features/DynamicCubemaps.h"
-#include "Features/EnvironmentAmbient.h"
 #include "Features/IBL.h"
 #include "Features/PhysicalSky.h"
 #include "Features/ScreenSpaceGI.h"
@@ -402,7 +401,7 @@ void Deferred::DeferredPasses()
 	auto& ssgi = globals::features::screenSpaceGI;
 	if (ssgi.loaded)
 		ssgi.DrawSSGI();
-	auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec] = ssgi.GetOutputTextures();
+	auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec, ssgi_bent_normal] = ssgi.GetOutputTextures();
 	bool ssgi_hq_spec = ssgi.settings.EnableExperimentalSpecularGI;
 
 	auto& ssrt = globals::features::screenSpaceRayTracing;
@@ -461,6 +460,11 @@ void Deferred::DeferredPasses()
 			// GetCommonBufferData clears when EnableDiffuse is off, so a null binding here can
 			// never be read.
 			(ssrt.loaded && ssrt.settings.EnableDiffuse) ? ssrt.texSSRTDiffuseConfidenceSmooth->srv.get() : nullptr,
+			// t20 (directional env) SSGI's bent normal + aperture at output resolution. The
+			// shader-side consumer is gated on ssgiSettings.EnableDirectionalEnv, which
+			// ScreenSpaceGI::GetCommonBufferData zeroes whenever the feature is not actually
+			// running, so a null binding here can never be read.
+			ssgi_bent_normal,
 		};
 
 		ID3D11SamplerState* samplers[]{
@@ -482,7 +486,7 @@ void Deferred::DeferredPasses()
 
 	// Clear
 	{
-		ID3D11ShaderResourceView* views[20]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+		ID3D11ShaderResourceView* views[21]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
 		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
 
 		ID3D11UnorderedAccessView* uavs[3]{ nullptr, nullptr, nullptr };
@@ -664,11 +668,6 @@ ID3D11ComputeShader* Deferred::GetComputeMainComposite()
 		if (globals::features::physicalSky.loaded)
 			defines.push_back({ "PHYSICAL_SKY", nullptr });
 
-		// Gated on `loaded`, not on settings.Enabled: the runtime toggle lives in the cbuffer so
-		// flipping it never forces a composite recompile.
-		if (globals::features::environmentAmbient.loaded)
-			defines.push_back({ "ENV_AMBIENT", nullptr });
-
 		if (REL::Module::IsVR())
 			defines.push_back({ "FRAMEBUFFER", nullptr });
 
@@ -696,9 +695,6 @@ ID3D11ComputeShader* Deferred::GetComputeMainCompositeInterior()
 
 		if (globals::features::screenSpaceRayTracing.loaded)
 			defines.push_back({ "SSRT", nullptr });
-
-		if (globals::features::environmentAmbient.loaded)
-			defines.push_back({ "ENV_AMBIENT", nullptr });
 
 		if (REL::Module::IsVR())
 			defines.push_back({ "FRAMEBUFFER", nullptr });

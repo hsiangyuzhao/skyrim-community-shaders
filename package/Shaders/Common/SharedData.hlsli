@@ -371,6 +371,20 @@ namespace SharedData
 		float SsgiContactRadius;
     };
 
+	// (directional env) Screen Space GI's composite-side knobs. SSGI's own passes read their
+	// parameters from its private SSGICB (b1); these two exist solely for
+	// DeferredCompositeCS.hlsl's directional environment channel, which cannot see that buffer.
+	// Deliberately the LAST member of FeatureData: SSGI never had a block here (see the note in
+	// SSRTSettings), and appending - unlike inserting - moves no existing offset.
+	// EnableDirectionalEnv is pre-gated on the C++ side (feature loaded AND enabled AND the
+	// setting on), so a zero here also covers every "SSGI is not actually running" state.
+	struct SSGISettings
+	{
+		uint EnableDirectionalEnv;
+		float EnvLevel;
+		float2 pad;
+	};
+
 	struct ExponentialHeightFogSettings
 	{
 		uint enabled;
@@ -384,34 +398,6 @@ namespace SharedData
 		float4 inscatteringTint;
 		float cubemapMipLevel;
 		float3 pad;
-	};
-
-	// Mirrors EnvironmentAmbient::Settings in src/Features/EnvironmentAmbient.h byte for byte.
-	struct EnvAmbientSettings
-	{
-		uint Enabled;
-		float Blend;
-		float Intensity;
-		float Normalization;
-
-		float EnvMip;
-		float Saturation;
-		float Spread;
-		float OcclusionStrength;
-
-		uint SampleCount;
-		uint ApplyAO;
-		uint EnableInterior;
-		uint LinearComposite;
-
-		uint EnclosureFallback;
-		float HueFalloff;
-		// (contact AO) EnableContactOcclusion / ContactRadius / ContactStrength used to close this
-		// row and open a fifth. The kernel they configured now lives in Screen Space GI, which owns
-		// its own copies, so the block is four rows and the two trailing pads are gone with them.
-		// Safe to shrink because this struct is last in FeatureData -- nothing sits behind it to
-		// shift.
-		float AOExponent;
 	};
 
 	cbuffer FeatureData : register(b6)
@@ -437,7 +423,7 @@ namespace SharedData
 		PhysSkyData physSkyData;
 		SSRTSettings ssrtSettings;
 		ExponentialHeightFogSettings exponentialHeightFogSettings;
-		EnvAmbientSettings envAmbientSettings;
+		SSGISettings ssgiSettings;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);

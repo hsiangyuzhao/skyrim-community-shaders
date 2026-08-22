@@ -2,7 +2,6 @@
 
 #include "Features/CloudShadows.h"
 #include "Features/DynamicCubemaps.h"
-#include "Features/EnvironmentAmbient.h"
 #include "Features/ExponentialHeightFog.h"
 #include "Features/ExtendedMaterials.h"
 #include "Features/ExtendedTranslucency.h"
@@ -16,6 +15,7 @@
 #include "Features/PostProcessing.h"
 #include "Features/Skin.h"
 #include "Features/ScreenSpacePointLightShadows.h"
+#include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpaceRayTracing.h"
 #include "Features/Skylighting.h"
 #include "Features/TerrainShadows.h"
@@ -65,6 +65,7 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::physicalSky.cbData,
 		globals::features::screenSpaceRayTracing.GetCommonBufferData(),
 		globals::features::exponentialHeightFog.settings,
-		// Appended at the end so existing member offsets in FeatureData (b6) are untouched.
-		globals::features::environmentAmbient.settings);
+		// (directional env) Appended LAST, matching SSGISettings' position at the end of the
+		// FeatureData cbuffer in Common/SharedData.hlsli -- appending moves no existing offset.
+		globals::features::screenSpaceGI.GetCommonBufferData());
 }
