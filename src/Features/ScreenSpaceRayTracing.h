@@ -460,8 +460,19 @@ struct ScreenSpaceRayTracing : Feature
         /// the two frames share a field of view -- is tested per pixel by the rotation's
         /// unit-length self-check, which falls back to the un-rotated normal and paints the pixel
         /// magenta in the diagnostic view when it fails. So this can no longer reject the screen
-        /// silently. The default stays off only because the un-rotated form is the one with
-        /// measured in-game behaviour behind it; changing the default is a separate decision.
+        /// silently.
+        ///
+        /// (defect P5) This flag is now the *only* consumer of that rotation. The acceptance
+        /// plane's row used to be built from it as well, and that is what let one bad direction
+        /// multiply cost the plane test its effect over whole surfaces; the row takes the
+        /// un-rotated normal unconditionally now (see the derivation in ssrt_temporal.hlsl), which
+        /// costs a plane tilt of one frame of camera rotation -- about 5% of the tolerance band at
+        /// 2 degrees per frame -- and removes the dependence entirely. With this flag off, its
+        /// default, nothing
+        /// in the history acceptance path multiplies a direction by a previous-frame matrix at all.
+        /// The default stays off for that reason as much as for the earlier one: the rotation is
+        /// the step whose in-game correctness is least vouched for, and the un-rotated form is the
+        /// one with measured in-game behaviour behind it.
         bool RotatedNormalGate = false;
         /// @brief (diagnostic H) Render the history-acceptance diagnostic into texDebugHistory.
         ///
@@ -475,30 +486,50 @@ struct ScreenSpaceRayTracing : Feature
         ///   * blue -- rejected by screen bounds, a non-finite history sample, or a zero frame
         ///     count.
         ///   * black -- sky or far plane, where there is no history question to ask.
-        ///   * (defect P4) cyan, azure, violet, mint or lemon -- the acceptance plane could not be
+        ///   * (defect P5) one of seven construction colours -- the acceptance plane could not be
         ///     built, so the plane test did not run on that pixel and the history was judged by
-        ///     bounds plus normal agreement alone. Each names one construction: cyan, the shaded
-        ///     point has no image inside the previous frame's depth range; azure, a probe has no
-        ///     finite image at all (non-finite, or on the previous camera plane); violet, the
-        ///     reconstruction failed its closed-loop depth self-check; mint, the plane passes
-        ///     through the previous camera (an edge-on surface); lemon, the tolerance came out
-        ///     non-positive.
+        ///     bounds plus normal agreement alone. The hue names which *segment* of the
+        ///     construction gave up, i.e. which matrices to look at, and where a segment has two
+        ///     codes the darker tier is the second of them:
+        ///       - bright cyan / dark teal -- the previous frame's image of this pixel. Cyan: the
+        ///         point has no image inside the previous depth range, a legitimate geometric
+        ///         outcome. Teal: that projection produced nothing usable at all.
+        ///       - violet -- the closed loop through CameraViewProjUnjittered did not return the
+        ///         depth the depth buffer gave.
+        ///       - apple green / dark green -- this frame's own reconstruction. Apple: the
+        ///         unprojection through CameraViewProjInverse produced no usable world position.
+        ///         Dark: no finite normal direction, or a degenerate projection diagonal.
+        ///       - lemon / dark amber -- the plane that reconstruction implies. Lemon: the
+        ///         tolerance came out non-positive. Amber: the plane passes through the previous
+        ///         camera (an edge-on surface), or the finished row is non-finite.
         ///   * magenta -- the rotated normal gate is on and its rotation failed its self-check.
-        ///     Only visible with Disable History Depth Test on; otherwise the azure above says
-        ///     the same thing more strongly, since the plane row is built from that rotation.
+        ///     (defect P5) Visible at every switch setting now, and a fact independent of the
+        ///     construction colours: the plane row no longer uses that rotation, so a failed
+        ///     rotation costs the gate its preferred operand and nothing else.
         ///   * orange -- unreachable by construction. It means the failCode was out of range,
         ///     i.e. a genuinely new coding error, and nothing else in this view is orange.
         ///
-        /// (defect P4) The five construction colours used to be four shades of yellow, on the
-        /// theory that the shared hue made the *class* read at a glance. It did, and that was the
+        /// (defect P4) The construction colours used to be four shades of yellow, on the theory
+        /// that the shared hue made the *class* read at a glance. It did, and that was the
         /// problem: an in-game reading came back "orange-ish, textured, granular", which fitted
-        /// all four shades equally and so identified nothing. They are now mutually
-        /// distinguishable and no reachable branch is orange.
+        /// all four shades equally and so identified nothing. (defect P5) The tiers above are not
+        /// a return to that: there the tier *was* the diagnosis, so a misread left nothing behind,
+        /// while here the hue carries it and the tier only separates two guards that already share
+        /// a segment and a repair.
+        ///
+        /// Two pairs are worth knowing about in advance, and one switch settles both. Apple green
+        /// sits 0.20 from the pure green of a normal-gate rejection on the luminance-weighted
+        /// metric the CPU harness asserts on, and dark teal sits 0.28 from the pure blue of a
+        /// bounds-or-data rejection -- comfortable margins, but if a reading is ever unsure, turn
+        /// Disable History Depth Test on: every construction colour is suppressed by it, so a
+        /// green or blue that survives is a rejection and one that vanishes was a construction
+        /// failure.
         ///
         /// One reading caveat the palette cannot remove: this view writes flat colours, so a
         /// *speckle* of two colours averages to a third under any downscale or screenshot
         /// compression -- a fine red/green mixture reads as olive, and as orange once JPEG has
-        /// had it. Zoom to 1:1 before naming the colour of a granular region.
+        /// had it. Zoom to 1:1 before naming the colour of a granular region, and prefer a
+        /// lossless screenshot.
         ///
         /// (defect P3) A full pale-yellow screen with a stationary camera was the finding that
         /// identified the last arithmetic error in the plane construction: at rest the projection
