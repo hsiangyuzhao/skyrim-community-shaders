@@ -33,10 +33,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     OcclusionStrength,
     CubemapNormalization,
     EnableSVGF,
+    EnablePreBlur,
     MaxAccumulatedFrames,
     AtrousIterations,
     ColorPhi,
     NormalPhi,
+    HitRadiusStrength,
     AdaptiveFiltering,
     AdaptiveHistoryThreshold,
     AdaptiveVarianceEps,
@@ -73,10 +75,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     OcclusionStrength,
     CubemapNormalization,
     EnableSVGF,
+    EnablePreBlur,
     MaxAccumulatedFrames,
     AtrousIterations,
     ColorPhi,
     NormalPhi,
+    HitRadiusStrength,
     AdaptiveFiltering,
     AdaptiveHistoryThreshold,
     AdaptiveVarianceEps,
@@ -217,6 +221,28 @@ void ScreenSpaceRayTracing::DrawSettings()
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("SVGF denoiser. This may introduce some blurriness and temporal artifacts but significantly reduces noise.");
     if (settings.EnableSVGF) {
+        ImGui::Checkbox("Pre-Blur", &settings.EnablePreBlur);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Diffuse only. Runs one small, very gentle smoothing step on the raw rays "
+                "*before* the frame-to-frame averaging looks at them, instead of only "
+                "afterwards.\n\n"
+                "Why it matters: the frame-to-frame average writes whatever it is given into a "
+                "buffer that the next frame reads back and averages again. Hand it a noisy "
+                "picture and the noise goes into that buffer, and every later decision -- how "
+                "much of the old frame to trust, how hard to smooth -- has to be made through "
+                "it. Taking the worst of the noise off first makes all of those decisions "
+                "better at once. Every commercial denoiser does this; ours was the odd one "
+                "out.\n\n"
+                "It is deliberately weak -- about a third of the blur one A Trous pass applies "
+                "-- because its job is to cut the extreme pixels, not to make things look "
+                "smooth. Expect a stationary shot to settle faster and cleaner, and moving "
+                "shots to stop dragging noise into the following seconds. Contact shadows and "
+                "creases should not soften; if they do, turn this off and say so.\n\n"
+                "The single-bright-pixel cleanup (Firefly Clamp) moves into this step while it "
+                "is on, so it still happens exactly once. With Firefly Clamp off, this step has "
+                "nothing stopping it from smearing a stray bright pixel across nine, so the two "
+                "are best left on together.");
         ImGui::SliderInt("Max Accumulated Frames", (int*)&settings.MaxAccumulatedFrames, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
         ImGui::SliderInt("À Trous Iterations", (int*)&settings.AtrousIterations, 1, 5, "%d", ImGuiSliderFlags_AlwaysClamp);
         if (auto _tt = Util::HoverTooltipWrapper())
@@ -242,6 +268,26 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "does not actually carry, and above about 256 the filter stops averaging on "
                 "any normal-mapped surface -- which is most of Skyrim -- so extra iterations "
                 "buy nothing.");
+
+        ImGui::SliderFloat("Hit Distance Kernel Strength", &settings.HitRadiusStrength, 0.0f, 8.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Diffuse only. Makes the A Trous filter smooth less where the rays hit "
+                "something close by, and keep smoothing at full width where they went far or "
+                "missed entirely.\n\n"
+                "Why: light bouncing off a wall a foot away changes over a foot. Two pixels "
+                "further apart than that are lit by different things, so averaging them is a "
+                "blur, not a denoise -- that is contact shading and corner darkening getting "
+                "washed out. Light that came from the sky or from far away changes over "
+                "hundreds of feet, so there the widest possible average is both safe and "
+                "exactly where the leftover noise is. Until now the filter used the same width "
+                "for both.\n\n"
+                "At the default 4 a contact pixel gets about 60%% of the filter width and a "
+                "distant or missed one gets 100%% of it, unchanged to the last bit. It can only "
+                "ever narrow, never widen, and it never narrows to nothing -- the nearest ring "
+                "of neighbours always keeps at least a third of its weight, because contact "
+                "pixels are just as noisy as everything else. Raise it if contact shading still "
+                "looks washed out; 0 turns the whole thing off.");
 
         ImGui::Checkbox("Firefly Clamp", &settings.FireflyClamp);
         if (auto _tt = Util::HoverTooltipWrapper())
@@ -443,6 +489,11 @@ void ScreenSpaceRayTracing::DrawSettings()
         BUFFER_VIEWER_NODE(texSSRTDiffuseColor, debugRescale)
         BUFFER_VIEWER_NODE(texSSRTDiffuseConfidence, debugRescale)
         BUFFER_VIEWER_NODE(texSSRTDiffuseConfidenceSmooth, debugRescale)
+        // (batch 1, item 2) Black = the rays hit something within a texel or two, so the kernel
+        // collapses towards the centre and contact detail survives. White = they went further
+        // than the kernel reaches, or missed, so the kernel runs at full width. A healthy
+        // exterior reads mostly white with dark outlines around contacts, creases and foliage.
+        BUFFER_VIEWER_NODE(texSSRTDiffuseHitDistance, debugRescale)
         BUFFER_VIEWER_NODE(texHistory, debugRescale)
         BUFFER_VIEWER_NODE(texHistoryDiffuse, debugRescale)
         BUFFER_VIEWER_NODE(texTemporal, debugRescale)
@@ -618,6 +669,20 @@ void ScreenSpaceRayTracing::SetupResources()
         texSSRTDiffuseConfidenceSmooth->CreateSRV(srvDesc);
         texSSRTDiffuseConfidenceSmooth->CreateUAV(uavDesc);
 
+        // (batch 1, item 2) The diffuse hit-distance surface. Same R8_UNORM as the confidence
+        // pair above and for the same three reasons: the payload is a [0,1] fraction, 1/255 is
+        // an order of magnitude below the granularity of what it steers (a smooth per-pixel
+        // weight over one-texel tap offsets), and a UNORM read cannot be non-finite so no
+        // consumer needs a guard of its own. ~8 MB of a 4K allocation, against ~33 MB for each
+        // of the eight RGBA16F surfaces this feature already holds.
+        //
+        // No entry in ClearDenoiserHistory: this surface is rewritten in full by every diffuse
+        // ray-march dispatch before anything reads it, so it carries no state across frames and
+        // has nothing to reset.
+        texSSRTDiffuseHitDistance = eastl::make_unique<Texture2D>(texDesc);
+        texSSRTDiffuseHitDistance->CreateSRV(srvDesc);
+        texSSRTDiffuseHitDistance->CreateUAV(uavDesc);
+
         // (diagnostic H) The history-acceptance picture. R8G8B8A8_UNORM: the payload is three
         // display colours plus an alpha the Buffer Viewer ignores (it draws with blending
         // disabled), so a byte per channel is exactly enough and, being UNORM, no read of it
@@ -765,7 +830,7 @@ void ScreenSpaceRayTracing::EnsureSharcResources()
 void ScreenSpaceRayTracing::ClearShaderCache()
 {
     static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
-        &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &temporalCS, &varianceCS, &spatialCS,
+        &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &preblurCS, &temporalCS, &varianceCS, &spatialCS, &spatialSpecularCS,
 #ifdef ENABLE_SHARC
         &raymarchDiffuseSharcCS, &sharcUpdateRaymarchCS, &sharcResolveCS
 #endif
@@ -837,6 +902,7 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &preprocessDepthCS, "ssrt_preprocess_depth.hlsl", {} },
             { &depthDownsampleCS, "ssrt_depth_downsample.hlsl", {} },
             { &diffuseCompositeCS, "ssrt_diffuse_composite.hlsl", {} },
+            { &preblurCS, "ssrt_preblur.hlsl", {} },
             { &temporalCS, "ssrt_temporal.hlsl", {} },
             { &varianceCS, "ssrt_variance.hlsl", {} },
             { &spatialCS, "ssrt_spatial.hlsl", definesWideKernel },
@@ -1279,8 +1345,14 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         srvs.at(5) = texHistoryMoments->srv.get();
         srvs.at(6) = texHistoryNormals->srv.get();
         srvs.at(7) = texHistoryDepth->srv.get();  // (defect D3)
+        // (batch 1, item 1) The specular chain has no pre-blur, so its raw surface *is* its
+        // temporal input and both slots get the same texture. The binding is not optional: the
+        // shader is a single permutation and declares t8 either way, and an unbound SRV reads as
+        // zero -- which would collapse the defect D1 reference box to the single point 0 and
+        // clamp every specular history towards black.
+        srvs.at(8) = texSSRColor->srv.get();
 
-        context->CSSetShaderResources(0, 8, srvs.data());
+        context->CSSetShaderResources(0, 9, srvs.data());
         context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
         context->CSSetShader(temporalCS.get(), nullptr, 0);
 
@@ -1442,13 +1514,14 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 
     // (audit P6) Raymarch UAV slots: u0 radiance/confidence, u1..u4 SHARC (bound only
 	// while SHARC is enabled, and only declared by the SHARC shader permutations),
-	// u5 the raw confidence copy (ambient reinjection). Keep this in lockstep with the
-	// register map at the top of ssrt_raymarch.hlsl and sharc_resolve.hlsl. The SVGF
-	// temporal pass below reuses slots u0/u1 for its own two outputs, and the diffuse
-	// composite reuses u0/u1 for kMAIN and the smoothed confidence, so the array is never
-	// smaller than 2.
+	// u5 the raw confidence copy (ambient reinjection), u6 the hit-distance surface
+	// (batch 1, item 2). Keep this in lockstep with the register map at the top of
+	// ssrt_raymarch.hlsl and sharc_resolve.hlsl. The SVGF temporal pass below reuses slots
+	// u0/u1 for its own two outputs, and the diffuse composite reuses u0/u1 for kMAIN and the
+	// smoothed confidence, so the array is never smaller than 2. Seven entries against the
+	// eight UAVs a cs_5_0 dispatch may bind.
     std::array<ID3D11ShaderResourceView*, 13> srvs = { nullptr };
-	std::array<ID3D11UnorderedAccessView*, 6> uavs = { nullptr };
+	std::array<ID3D11UnorderedAccessView*, 7> uavs = { nullptr };
 
     auto resetViews = [&]() {
 		srvs.fill(nullptr);
@@ -1473,6 +1546,13 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // covers, and an unbound UAV would make that write a silent no-op. The consumer side is
     // what the setting gates.
     uavs.at(5) = texSSRTDiffuseConfidence->uav.get();
+    // (batch 1, item 2) Always bound, for the same reason the confidence surface is: the shader
+    // writes it unconditionally so the surface stays deterministic for every texel the dispatch
+    // covers -- including the 1.0 "as distant as the encoding can say" a far-plane lane resolves
+    // to -- and an unbound UAV would turn that write into a silent no-op, leaving the a-trous
+    // pass reading a stale or cleared surface. HitRadiusStrength 0 is what makes the mechanism
+    // inert, on the consumer side.
+    uavs.at(6) = texSSRTDiffuseHitDistance->uav.get();
 #ifdef ENABLE_SHARC
     if (settings.EnableSharc) {
         EnsureSharcResources();  // (audit P6) allocate on first enable, before any dispatch binds them
@@ -1536,8 +1616,55 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 
     if (settings.EnableSVGF) {
         DenoiserCB denoiserCBData = GetDenoiserCBData(true);
-        denoiserCB->Update(denoiserCBData);
+
+        // (batch 1, item 1) The pre-blur, and the one thing about it that needs explaining on
+        // this side: where its output goes.
+        //
+        // It writes texVariance. That surface is not free-floating scratch by accident -- it is
+        // provably dead at this point in the frame. Its only writer inside DrawSSRTDiffuse is
+        // the variance pass three dispatches below, its only readers are that pass's own output
+        // consumers (the a-trous ping-pong), and DrawSSRTSpecular does not run until this whole
+        // function has returned. So the lifetime is: pre-blur writes it, the temporal pass reads
+        // it, the variance pass overwrites it, the a-trous chain ping-pongs it. Reusing it costs
+        // nothing where a dedicated surface would cost a full-screen RGBA16F (~33 MB at a 4K
+        // allocation, against the eight this feature already holds).
+        //
+        // The one thing that would break: inserting a pass between the pre-blur and the variance
+        // pass that reads texVariance expecting last frame's content. Nothing does today, and
+        // this comment is the tripwire if something ever wants to.
+        const bool preBlurActive = settings.EnablePreBlur && preblurCS;
+        ID3D11ShaderResourceView* temporalInput = texSSRTDiffuseColor->srv.get();
+
         auto denoiserBuffer = denoiserCB->CB();
+
+        if (preBlurActive) {
+            // The pre-blur is handed the real FireflyClampSigma; the temporal pass below is
+            // handed 0. See the "why the firefly clamp moved in here" block in
+            // ssrt_preblur.hlsl: the clamp cannot survive an unconditional spatial filter in
+            // front of it, so it moves rather than being defeated, and it must not then run
+            // twice.
+            denoiserCB->Update(denoiserCBData);
+            denoiserBuffer = denoiserCB->CB();
+            context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
+
+            uavs.at(0) = texVariance->uav.get();
+            srvs.at(2) = normal.SRV;
+            srvs.at(3) = texSSRTDiffuseColor->srv.get();
+            srvs.at(4) = depth.depthSRV;
+
+            context->CSSetShaderResources(0, 5, srvs.data());
+            context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
+            context->CSSetShader(preblurCS.get(), nullptr, 0);
+
+            context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+            resetViews();
+
+            temporalInput = texVariance->srv.get();
+            denoiserCBData.fireflyClampSigma = 0.0f;
+        }
+
+        denoiserCB->Update(denoiserCBData);
+        denoiserBuffer = denoiserCB->CB();
         context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
         // temporal filter
         uavs.at(0) = texTemporal->uav.get();
@@ -1547,13 +1674,19 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         srvs.at(0) = texHistoryDiffuse->srv.get();
         srvs.at(1) = motion.SRV;
         srvs.at(2) = normal.SRV;
-        srvs.at(3) = texSSRTDiffuseColor->srv.get();
+        srvs.at(3) = temporalInput;
         srvs.at(4) = depth.depthSRV;
         srvs.at(5) = texHistoryMomentsDiffuse->srv.get();
         srvs.at(6) = texHistoryNormals->srv.get();
         srvs.at(7) = texHistoryDepth->srv.get();  // (defect D3)
+        // (batch 1, item 1) The raw ray-march surface, for the defect D1 history clamp's
+        // reference neighbourhood only. Identical to t3 whenever the pre-blur is off, which is
+        // what makes that configuration bit-identical to the previous build; see the declaration
+        // of RawColorTexture in ssrt_temporal.hlsl for why the box must not be built from the
+        // pre-blurred surface.
+        srvs.at(8) = texSSRTDiffuseColor->srv.get();
 
-        context->CSSetShaderResources(0, 8, srvs.data());
+        context->CSSetShaderResources(0, 9, srvs.data());
         context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
         context->CSSetShader(temporalCS.get(), nullptr, 0);
 
@@ -1591,8 +1724,14 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
             srvs.at(2) = normal.SRV;
             srvs.at(3) = (i % 2 == 0) ? texVariance->srv.get() : texSSRTDiffuseColor->srv.get();
             srvs.at(4) = depth.depthSRV;
+            // (batch 1, item 2) The hit-distance surface, which the diffuse permutation declares
+            // at t5 and the specular one does not declare at all. It is the ray march's own
+            // output and is not part of the ping-pong, so the same binding serves every
+            // iteration -- what changes per iteration is the hard radius it is judged against,
+            // which comes from atrousIterations in the constant buffer.
+            srvs.at(5) = texSSRTDiffuseHitDistance->srv.get();
 
-            context->CSSetShaderResources(0, 5, srvs.data());
+            context->CSSetShaderResources(0, 6, srvs.data());
             context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
             context->CSSetShader(spatialCS.get(), nullptr, 0);
 
@@ -1689,7 +1828,11 @@ ScreenSpaceRayTracing::DenoiserCB ScreenSpaceRayTracing::GetDenoiserCBData(bool 
     // diffuse -- would overwrite the diffuse picture with its own every frame, and the view
     // would silently show whichever chain happened to be enabled last.
     data.historyDebugView = (a_isDiffuseChain && settings.HistoryDebugView) ? 1u : 0u;
-    data.pad3 = 0.0f;
+    // (batch 1, item 2) Read only by the diffuse permutation of ssrt_spatial.hlsl -- the
+    // specular one does not declare the field's surface and compiles the window away -- so the
+    // value is passed unconditionally and the specular chain simply ignores it, exactly as it
+    // does with specularRoughnessCutoff in reverse.
+    data.hitRadiusStrength = settings.HitRadiusStrength;
     return data;
 }
 

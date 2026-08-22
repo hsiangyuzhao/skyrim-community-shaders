@@ -10,6 +10,41 @@ Texture2D<float4> HistoryNormalsTexture : register(t6);
 // pyramid, i.e. of exactly the texture bound at t4 one frame earlier, taken once per frame
 // by ScreenSpaceRayTracing::CopyHistoryGeometry alongside the normal snapshot at t6.
 Texture2D<float> HistoryDepthTexture : register(t7);
+// (batch 1, item 1) The *un-pre-blurred* ray-march radiance, i.e. what t3 held before
+// ssrt_preblur.hlsl was inserted in front of this pass. When the pre-blur is off the C++ side
+// binds the same texture to both slots, so every read below is bit-identical to what it was.
+//
+// Two consumers, and only two:
+//
+//   * the g_ssrtNeighbourTile fill, which feeds the defect D1 history clamp's reference box and
+//     the spec S1 firefly statistics;
+//   * the box's own centre tap, at the D1 call site.
+//
+// Everything else -- the sample that enters the EMA, the moment pair, the no-history fallback
+// write -- consumes t3, i.e. the pre-blurred radiance. That split is the point of this slot and
+// it is a calibration argument, not a preference:
+//
+// D1's width is K * max(sigmaSpatial, sigmaTemporal) and defect D8 fixes K by asking how far a
+// *healthy* history sits from the box centre, in units of the per-frame sample sigma:
+//     spread(a) = sqrt(1/9 + a/(2 - a)),
+// where 1/9 is the variance of the nine-tap mean forming the centre and a/(2 - a) is the residual
+// an EMA at blend weight a leaves. The 1/9 assumes the nine taps are *independent* samples. A
+// 3x3 pre-blur destroys that assumption: adjacent pre-blurred texels share six of their nine
+// inputs, so with the pre-blur's own weights (centre 1, edge 1/2, corner 1/4) the tap-to-tap
+// correlation is 1.5 / 2.25 = 0.67 at distance 1, and summing the correlation matrix over the
+// nine taps gives Var(mean) = 0.44 * sigma^2 instead of sigma^2 / 9. spread at the floor blend
+// weight then goes from 0.376 to 0.688, so the tuned K = 1 would engage at 1.45 standard
+// deviations instead of 2.66 -- a per-frame hit rate of ~15% against under 1% -- and every
+// engagement drags the history back onto a mean of this frame's own noise. That is exactly the
+// self-lock D8 exists to prevent, arrived at from the other direction.
+//
+// Feeding the box from the raw surface restores the derivation verbatim: nine independent
+// samples, standard error sigma/3, and a box width set by the raw sigma while the history it
+// judges is an EMA of the *quieter* pre-blurred samples. The clamp therefore engages less often
+// than its tuned rate rather than more, which is the fail-safe direction D1 already prefers on
+// its own terms ("do not clamp across an edge"), and it costs nothing: the tile fill reads the
+// same number of texels, just from a different surface.
+Texture2D<float4> RawColorTexture : register(t8);
 
 RWTexture2D<float4> FilteredOutput : register(u0);
 RWTexture2D<float4> MomentsOutput : register(u1);
@@ -151,6 +186,10 @@ cbuffer DenoiserCB : register(b2)
 // than S1's single luminance:
 //   * .xyz = YCoCg of this frame's radiance, the space defect D1's history clamp builds its
 //     bounding box in (see SSRTClampHistory).
+// (batch 1, item 1) "This frame's radiance" now means specifically the *raw* ray-march output,
+// read from RawColorTexture rather than from t3, because t3 may be the pre-blurred surface and
+// the D1 box's calibration depends on its nine taps being independent samples. Identical
+// texture whenever the pre-blur is off; see the declaration of RawColorTexture.
 //   * .w   = Rec.709 luminance, which is what the firefly clamp's statistics are defined
 //     over. It is kept as its own channel deliberately: YCoCg's Y is (r + 2g + b) / 4, a
 //     *different* weighting, and re-deriving luminance from YCoCg would silently change the
@@ -1499,7 +1538,10 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
                 // the dynamic-resolution sub-rect would otherwise have to be excluded from
                 // the count, which is 8 extra predicates per lane for a border effect.
                 const int2 p = clamp(tileOrigin + int2(tx, ty), int2(0, 0), int2(screen_size) - 1);
-                const float3 radiance = SSRColorTexture[p].rgb;
+                // (batch 1, item 1) The raw ray-march surface, not t3. Same texel count, same
+                // addressing, same everything -- and the same texture whenever the pre-blur is
+                // off. See the declaration of RawColorTexture for the calibration argument.
+                const float3 radiance = RawColorTexture[p].rgb;
                 g_ssrtNeighbourTile[ty * SSRT_NEIGHBOUR_TILE + tx] =
                     float4(Color::RGBToYCoCg(radiance), Color::RGBToLuminance(radiance));
             }
@@ -1948,7 +1990,22 @@ bool SSRT_LoadHistory(uint2 pixel, out float4 color, out float2 moments, out flo
             const float spreadFloor = sqrt(1.0f / 9.0f + invMaxAccumulatedFrames / (2.0f - invMaxAccumulatedFrames));
             const float sigmasEffective = historyClampSigma * (spreadNow / spreadFloor);
 
-            prevColor.rgb = SSRTClampHistory(prevColor.rgb, ssrColor.rgb, GTid.xy, sigmasEffective, sigmaTemporal);
+            // (batch 1, item 1) The box's centre tap has to come from the same surface as its
+            // eight neighbours, or the nine-sample statistic is mixing two different noise
+            // levels. The eight come from the tile, which is filled from RawColorTexture.
+            //
+            // With the firefly clamp live -- which is every configuration where the pre-blur is
+            // *not* running, since the C++ side hands this pass 0 whenever it is -- ssrColor.rgb
+            // is already the raw centre with S1 applied, so this reproduces the previous
+            // behaviour exactly. With the clamp off and the pre-blur off, RawColorTexture is
+            // SSRColorTexture, so the loaded value is ssrColor.rgb: again bit-identical. The load
+            // is only ever a *new* fetch in the pre-blur-on case, and it is inside `clampHistory`
+            // so a configuration with the clamp switched off never pays for it.
+            float3 historyBoxCentre = ssrColor.rgb;
+            if (!clampFireflies)
+                historyBoxCentre = RawColorTexture[DTid.xy].rgb;
+
+            prevColor.rgb = SSRTClampHistory(prevColor.rgb, historyBoxCentre, GTid.xy, sigmasEffective, sigmaTemporal);
         }
 
         blendedColor = lerp(prevColor.rgb, ssrColor.rgb, alpha);

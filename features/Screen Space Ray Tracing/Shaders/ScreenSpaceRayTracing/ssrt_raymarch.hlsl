@@ -106,6 +106,24 @@ RWTexture2D<float> SSRTHitDistanceOutput : register(u1);
 // read is a [0,1] value by construction, so no consumer needs its own finiteness test.
 #if !defined(SSRT_SPECULAR) && !SHARC_UPDATE
 RWTexture2D<float> SSRTConfidenceOutput : register(u5);
+
+// (batch 1, item 2) The diffuse per-pixel hit distance, encoded as a correlation length in
+// texels, reciprocally encoded as t / (t + SSRT_HITT_REF_TEXELS) -- see that constant in
+// ssrt_common.hlsli.
+// Read by the diffuse permutation of ssrt_spatial.hlsl to size its kernel per pixel.
+//
+// A slot of its own rather than a channel of an existing surface, for the reasons the audit
+// already established for the confidence pair:
+//   * .w of SSRColorOutput carries the confidence until the SVGF chain runs, and from
+//     ssrt_temporal.hlsl onwards it carries the luminance variance -- the one channel the whole
+//     a-trous edge-stop is steered by. There is no third meaning available there.
+//   * texSSRTDiffuseConfidence is R8_UNORM and full. Widening it to R8G8 would cost the same
+//     two bytes per texel as a second R8 surface while entangling the denoiser's kernel sizing
+//     with the ambient-reinjection path that DeferredCompositeCS reads, so the surfaces stay
+//     separate.
+// u6, because u1..u4 belong to the SHARC buffers on the permutation that has them and u5 to the
+// confidence. Seven UAVs, against the eight a cs_5_0 dispatch may bind.
+RWTexture2D<float> SSRTDiffuseHitDistanceOutput : register(u6);
 #endif
 
 #if SHARC_UPDATE || SHARC_RENDER
@@ -603,6 +621,15 @@ float3 ScreenSpaceToViewSpace(float3 screen_uv_coord, float4x4 invProj)
 // slots it did before -- so it is bit-for-bit output preserving.
 groupshared float4 samples[64][SAMPLES_PER_PIXEL];
 #   define SSRT_SAMPLE_SLOT (groupThreadID.y * 8 + groupThreadID.x)
+// (batch 1, item 2) The per-sample encoded hit distance, resolved by the same z == 0 lane and
+// across the same barrier as `samples`. Same y * 8 + x slot mapping for the same LDS banking
+// reason; at one dword per slot the eight threads of a row are contiguous.
+//
+// A parallel array rather than a fifth channel because `samples` is a float4 with all four
+// channels spoken for (rgb radiance plus the confidence the resolve also has to average).
+// 4 bytes per lane per sample: 512 bytes at the default DiffuseSPP 2, 4096 at the slider's
+// maximum of 16, on top of the 2048 / 16384 `samples` already costs.
+groupshared float hitNorms[64][SAMPLES_PER_PIXEL];
 #endif
 
 // (audit P4 / #10) `groupshared float4 weights[64][SAMPLES_PER_PIXEL]` and the
@@ -729,6 +756,32 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     float z = SSRT_LoadDepth(uv * mip_resolution, most_detailed_mip);  // (audit #7) no rescale
     float3 screen_uv_space_ray_origin = float3(uv, z);
     float3 view_space_ray = ScreenSpaceToViewSpace(screen_uv_space_ray_origin, FrameBuffer::CameraProjInverse[eyeIndex]);
+#if !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+    // (batch 1, item 2) The world-space length the encoding's half-way point stands for, i.e.
+    // SSRT_HITT_REF_TEXELS texels measured in game units at this pixel's depth. The per-sample
+    // encode below is then one mad and one divide: u = L / (L + hitDistRefWorld).
+    //
+    // texelWorldSize = viewZ * 2 / (P00 * renderWidth): the world width of one render texel at
+    // this pixel's depth, taken from the projection and the render extent rather than from an
+    // assumed FOV. That is the same construction ssrt_temporal.hlsl's plane tolerance uses, and
+    // CameraProj is the field ProjectPosition / ProjectDirection below already depend on every
+    // frame, so nothing new is being trusted. Computed here, before the grazing-angle origin
+    // bias moves view_space_ray: the bias is 1.4 game units at z = 1000 and at most ~14 at
+    // grazing, i.e. under 2% of a reference length that only has to be right to a texel.
+    //
+    // abs() on both terms so neither axis-sign convention can matter, and the max() floor keeps
+    // the reference length positive for a degenerate projection or a point on the near plane. A
+    // pixel there encodes u ~ 1, i.e. "treat this as a distant hit", which is the direction that
+    // leaves the kernel at its unmodified width.
+#   if defined(VR)
+    const float hitDistWidthPerEye = float(screen_size.x) * 0.5f;  // each eye owns half the buffer
+#   else
+    const float hitDistWidthPerEye = float(screen_size.x);
+#   endif
+    const float hitDistTexelWorld = abs(view_space_ray.z) * 2.0f /
+                                    max(abs(FrameBuffer::CameraProj[eyeIndex][0][0]) * hitDistWidthPerEye, 1e-6f);
+    const float hitDistRefWorld = max(hitDistTexelWorld * SSRT_HITT_REF_TEXELS, 1e-6f);
+#endif
     float3 world_space_normal = normalize(mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0)).xyz);
     float3 view_space_surface_normal = normalVS;
     float3 view_space_ray_direction = normalize(view_space_ray);
@@ -795,8 +848,30 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 	positionWS = mul(FrameBuffer::CameraViewProjInverse[eyeIndex], positionWS);
 	positionWS.xyz = positionWS.xyz / positionWS.w;
 
+#if !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+    // (batch 1, item 2) "As distant as the encoding can say", i.e. the full kernel, and it is
+    // the value every path that does not produce a screen-space hit ends on:
+    //
+    //   * a ray that missed. Its radiance came from the cubemap / skylighting fallback, i.e.
+    //     from the environment at effectively infinite distance, whose irradiance field varies
+    //     over the scale of the sky rather than of local geometry. Wide averaging there is both
+    //     safe and wanted -- it is the "远命中/miss = 大核敢抹" half of the mechanism.
+    //   * a ray whose hit was rejected by SSRT_ValidateHit (confidence 0), including the
+    //     back-face case. There is no screen-space radiance for that direction either, so the
+    //     value that reaches the frame is again the fallback's.
+    //   * the SHARC cache hit below, which answers from the world-space radiance cache and never
+    //     runs a screen-space march at all.
+    //   * a far-plane or out-of-bounds lane, whose pixel the whole denoiser chain early-outs on.
+    //
+    // Writing 0 for these instead would be the exact inverse of the intent: it would pin the
+    // narrowest kernel onto precisely the fallback-dominated, lowest-variance, most
+    // spatially-smooth regions of the screen, and leave the full kernel only where the signal
+    // has real geometric structure.
+    float hit_norm = 1.0f;
+#endif
 #if SSRT_USE_SAMPLE_LDS
     samples[SSRT_SAMPLE_SLOT][sample_id] = 0.f;
+    hitNorms[SSRT_SAMPLE_SLOT][sample_id] = 1.0f;
 #else
     float4 localSample = 0.f;  // (audit P4) single sample per pixel, no LDS needed
 #endif
@@ -869,6 +944,32 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
                                                       occlusion
                                                       )
                                      : 0;
+#if !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+        // (batch 1, item 2) Encode this sample's hit distance, here and not later: `confidence`
+        // is overwritten twice further down -- the cubemap fallback sets it to 1 and the ambient
+        // reinjection folds the back-face occlusion into it -- and what this test needs is the
+        // raw "did the march stop on real screen-space geometry" answer.
+        //
+        // A positive validated confidence means there *is* geometry at world_ray_length, so the
+        // correlation length of the light this sample carries is that distance. Zero means the
+        // radiance is the fallback's and the default 1.0 stands; see its declaration.
+        //
+        // u = L / (L + refWorld) rather than a linear scale, for the reason recorded at
+        // SSRT_HITT_REF_TEXELS: the correlation length spans four orders of magnitude across an
+        // exterior and an 8-bit linear encoding saturates over most of the screen. The divisor
+        // is >= refWorld > 0 for any non-negative L, so the divide needs no guard, and the
+        // result is in [0, 1) for every finite L -- strictly below the 1.0 a genuine miss
+        // writes, which is what keeps "no hit" distinguishable from "a very long hit".
+        //
+        // (guard, same discipline as G2/G4) The finiteness test is a bit test rather than
+        // isfinite() for the reason recorded at isFiniteSafe, and it is not decoration:
+        // world_ray_length comes out of a projection divide, and Inf / Inf is NaN, which a UNORM
+        // store would resolve to an implementation-defined value -- most likely 0, i.e. the
+        // *narrowest* kernel on a pixel we know nothing about. Falling back to the 1.0 default
+        // keeps a broken reconstruction on the "leave the kernel alone" side.
+        if (confidence > 0.0f && isFiniteSafe(world_ray_length))
+            hit_norm = world_ray_length / (world_ray_length + hitDistRefWorld);
+#endif
         float3 sampleColor = 0;
         if (confidence > 0.0f)
         {
@@ -1098,6 +1199,9 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 
 #if SSRT_USE_SAMPLE_LDS
         samples[SSRT_SAMPLE_SLOT][sample_id] = float4(sampleColor, confidence);
+#   if !SHARC_UPDATE
+        hitNorms[SSRT_SAMPLE_SLOT][sample_id] = hit_norm;  // (batch 1, item 2)
+#   endif
 #else
         localSample = float4(sampleColor, confidence);
 #endif
@@ -1154,9 +1258,23 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 
     if (sample_id == 0) {
         outColor = 0.f;
+        // (batch 1, item 2) Averaged alongside the radiance and the confidence, in the same
+        // loop and across the same barrier.
+        //
+        // The *encoded* value is what gets averaged, not the raw distance, and that ordering is
+        // the whole reason the encoding exists. Its consumer is linear in this number -- the
+        // a-trous window's exponent is beta = strength * (1 - value) -- so averaging the encoded
+        // samples computes E[f(L)], which is the mean kernel width the pixel's own rays call
+        // for. Averaging raw distances first and encoding afterwards would compute f(E[L]), and
+        // those are not the same thing at all where it matters: one ray hitting a wall 20 units
+        // away while the other misses gives (0.06 + 1.00) / 2 = 0.53, "half the light is
+        // contact, half is sky, so use half the kernel", where the raw mean of 20 and the miss
+        // sentinel is dominated by the sentinel and reports the full kernel.
+        float hitNormSum = 0.f;
         for (int i = 0; i < SAMPLES_PER_PIXEL; ++i) {
             outColor.xyz += samples[SSRT_SAMPLE_SLOT][i].xyz;
             outColor.w += samples[SSRT_SAMPLE_SLOT][i].w;
+            hitNormSum += hitNorms[SSRT_SAMPLE_SLOT][i];
         }
         outColor.xyz /= SAMPLES_PER_PIXEL;
         outColor.w = saturate(outColor.w / SAMPLES_PER_PIXEL);
@@ -1171,6 +1289,12 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // ambient. Already saturated above and sanitised by G2, so the UNORM store cannot
         // see a NaN.
         SSRTConfidenceOutput[coords.xy] = outColor.w;
+        // (batch 1, item 2) Written unconditionally, sky and out-of-bounds lanes included, so
+        // the surface is deterministic for every texel the dispatch covers -- those lanes
+        // resolve to the 1.0 default, which the denoiser never reads because it early-outs on
+        // the far plane. The value is already in [0, 1] by construction (every contributing
+        // sample was saturated), so the UNORM store cannot clip and cannot see a NaN.
+        SSRTDiffuseHitDistanceOutput[coords.xy] = saturate(hitNormSum / SAMPLES_PER_PIXEL);
     }
 #endif
 }

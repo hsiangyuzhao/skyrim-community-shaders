@@ -188,6 +188,21 @@ struct ScreenSpaceRayTracing : Feature
         float OcclusionStrength = 1.0f;
         float CubemapNormalization = 0.0f;
         bool EnableSVGF = false;
+        /// @brief (batch 1, item 1) Run ssrt_preblur.hlsl -- anti-firefly plus a 3x3
+        /// geometry-guided spatial filter -- on the diffuse ray-march output *before* the
+        /// temporal accumulation reads it.
+        ///
+        /// Defaults on because its absence is a defect rather than a missing luxury: every
+        /// denoiser in the reference set (REBLUR, RELAX, Q2RTX's A-SVGF) puts its most important
+        /// spatial filter in front of the temporal pass, because the accumulator writes whatever
+        /// variance it is handed into a buffer the next frame reads back. See the block comment
+        /// at the top of ssrt_preblur.hlsl for the pass order, the kernel derivation, and why
+        /// the firefly clamp had to move into that pass rather than stay behind it.
+        ///
+        /// Diffuse only. The specular chain keeps its unmodified path -- a roughness-blind
+        /// pre-blur on a near-delta reflection lobe is the one thing spec S3 exists to prevent --
+        /// and gets its own pre-pass when the specular pipeline is split out.
+        bool EnablePreBlur = true;
         uint MaxAccumulatedFrames = 16;
         /// @brief (spec A2) 2, not 3: with variance guidance repaired (audit #11) and the
         /// depth weight actually discriminating (audit #12), two guided iterations resolve
@@ -266,6 +281,21 @@ struct ScreenSpaceRayTracing : Feature
         /// argument weakens by exactly this change, and 2.0 is still half the paper's 4.0 --
         /// the depth term (audit #12) remains the third, and now the strongest, edge-stop.
         float NormalPhi = 128.0f;
+        /// @brief (batch 1, item 2) How hard the diffuse a-trous kernel narrows on a pixel whose
+        /// rays hit something close by. 0 disables the mechanism exactly.
+        ///
+        /// The window multiplied into the per-axis kernel weights is exp(-beta * |k|^2 / R^2)
+        /// with beta = HitRadiusStrength * (1 - f), where f is the ray's correlation length
+        /// clamped to the iteration's own hard radius and R the kernel radius. At 4.0 a contact
+        /// hit takes the chain's second-moment sigma from 2.24 px to 1.31 px while a miss or a
+        /// distant hit keeps the full 2.24 px bit for bit; the inner ring never loses more than
+        /// exp(-1) = 0.37 of its weight, so the filter narrows and never stops. See the
+        /// derivation block in ssrt_spatial.hlsl.
+        ///
+        /// Diffuse only: the specular kernel is already sized by roughness, which is the
+        /// specular equivalent of this mechanism, and its hit distance lives on a different
+        /// surface with different semantics (DLSS-RR consumes it).
+        float HitRadiusStrength = 4.0f;
         /// @brief (spec A1) Let a fully converged 8x8 tile skip an a-trous iteration.
         bool AdaptiveFiltering = true;
         /// @brief (spec A1) Accumulated frames a pixel needs before it may count as
@@ -613,7 +643,9 @@ struct ScreenSpaceRayTracing : Feature
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
     /// reproduce this layout verbatim. ssrt_temporal.hlsl declares all four rows,
     /// ssrt_spatial.hlsl the first two and ssrt_variance.hlsl only the first, which is legal
-    /// -- a shader may declare a prefix of a larger constant buffer.
+    /// -- a shader may declare a prefix of a larger constant buffer. (batch 1, item 2:
+    /// ssrt_spatial.hlsl now declares all four, because hitRadiusStrength sits on the last one;
+    /// ssrt_preblur.hlsl declares the first two.)
     ///
     /// The mirroring was checked against fxc's own reflection rather than by reading, because
     /// a silent mismatch here presents as a diagnostic switch that does nothing -- which is
@@ -666,7 +698,12 @@ struct ScreenSpaceRayTracing : Feature
         /// one debug surface, so the specular pass always passes 0 and leaves the picture the
         /// diffuse pass drew. See Settings::HistoryDebugView.
         uint historyDebugView;
-        float pad3;
+        /// @brief (batch 1, item 2) Strength of the hit-distance kernel narrowing in the diffuse
+        /// a-trous permutation; 0 leaves the kernel bit-identical to the unmodulated one. Took
+        /// row 3's last pad slot, so the buffer did not grow -- but ssrt_spatial.hlsl now has to
+        /// declare all four rows instead of two, since the field it needs is on the last one.
+        /// See Settings::HitRadiusStrength.
+        float hitRadiusStrength;
     };
     static_assert(sizeof(DenoiserCB) == 64,
         "ScreenSpaceRayTracing::DenoiserCB must stay four whole 16-byte constant buffer rows; "
@@ -776,11 +813,62 @@ struct ScreenSpaceRayTracing : Feature
     /// a-trous passes keep it there. One byte per texel against the ~8 bytes of every other
     /// full-screen surface here, and UNORM storage means every read is a [0,1] value by
     /// construction.
+    ///
+    /// @warning (batch 1, item 3 -- assessed and rejected) This is NOT NRD's `confidence`, and it
+    /// must not be wired to the temporal accumulation window. NRD documents an externally
+    /// supplied confidence as the best available tool against temporal lag, with
+    /// `historyLength *= lerp(conf, 1, 1 / (1 + len))`, and the shared name is the whole trap.
+    /// Four independent reasons, most conclusive first:
+    ///
+    /// 1. It is identically 1.0 over the whole screen in the default configuration. Every sample
+    ///    that takes the dynamic-cubemap fallback ends with `confidence = 1` right after the
+    ///    `lerp(envColor, sampleColor, confidence)` in ssrt_raymarch.hlsl -- the fallback has
+    ///    *supplied* the unresolved directions, so reporting less would double-count when the
+    ///    composite subtracts ambient. And EnableAmbientReinjection forces
+    ///    UseDynamicCubemapsAsFallback off, so this surface means "real hit coverage" in one mode
+    ///    and "1.0 everywhere" in the other. Anything keyed off it would be inert in one
+    ///    configuration and live in the other, which is precisely the cross-setting coupling the
+    ///    project rules forbid.
+    /// 2. Where it does vary, it is anti-correlated with what the NRD formula wants. NRD's
+    ///    confidence answers "is the accumulated history still valid?" -- a lighting-change
+    ///    detector. This answers "what fraction of the hemisphere did screen space resolve?".
+    ///    Low coverage means the light came from the cubemap and the world-space cache, which are
+    ///    the most temporally *stable* inputs in the pipeline: open ground, sky-facing surfaces.
+    ///    Those pixels should accumulate longest, and the formula would shorten their window
+    ///    hardest.
+    /// 3. Used as a change detector rather than as a level, it would need the previous frame's
+    ///    coverage reprojected and validated -- another history surface with its own disocclusion
+    ///    problem -- and at DiffuseSPP 2 the per-frame estimate is a two-sample mean whose own
+    ///    standard deviation is ~0.35 at mid coverage, so the detector would fire on sampling
+    ///    noise unless it were first temporally accumulated itself.
+    /// 4. Both failure modes a coverage jump would indicate are already covered by mechanisms
+    ///    that measure them directly: a radiometric change by the defect D1 neighbourhood clamp,
+    ///    a geometric one by the defect D3 plane test.
+    ///
+    /// What *would* be a legitimate confidence source here is a global illumination-change
+    /// signal -- a per-frame sun-direction or ambient-colour delta, of the kind Sky Sync already
+    /// tracks -- supplied as a scalar rather than as a per-pixel coverage. Different input,
+    /// different work, and not this surface.
     eastl::unique_ptr<Texture2D> texSSRTDiffuseConfidence = nullptr;
     /// @brief (ambient reinjection) The same signal after ssrt_diffuse_composite.hlsl's
     /// depth-aware 7x7 spatial mean; this is what DeferredCompositeCS lerps with. A separate
     /// surface because a blur cannot run in place.
     eastl::unique_ptr<Texture2D> texSSRTDiffuseConfidenceSmooth = nullptr;
+    /// @brief (batch 1, item 2) Per-pixel diffuse hit distance, R8_UNORM, written by
+    /// ssrt_raymarch.hlsl at u6 and read by the diffuse permutation of ssrt_spatial.hlsl at t5.
+    ///
+    /// Not a distance in game units: the payload is t / (t + SSRT_HITT_REF_TEXELS), where t is
+    /// the light's correlation length expressed in render texels at this pixel's depth. That is
+    /// the quantity the kernel actually needs, it is dimensionless, and it makes the surface
+    /// dynamic-resolution and FOV proof; the reciprocal form is what lets eight bits hold t's
+    /// four-orders-of-magnitude range across an exterior. A miss, a rejected hit and a SHARC
+    /// cache hit all encode exactly 1.0 -- "no screen-space hit at all" -- which the consumer
+    /// maps to the unmodified kernel bit for bit. See the derivation at that constant in
+    /// ssrt_common.hlsli.
+    ///
+    /// One byte per texel, on the same argument as the confidence pair above, and UNORM so no
+    /// consumer needs a finiteness guard.
+    eastl::unique_ptr<Texture2D> texSSRTDiffuseHitDistance = nullptr;
     eastl::unique_ptr<Texture2D> texHistory = nullptr;
     eastl::unique_ptr<Texture2D> texHistoryDiffuse = nullptr;
     eastl::unique_ptr<Texture2D> texTemporal = nullptr;
@@ -835,6 +923,10 @@ struct ScreenSpaceRayTracing : Feature
     winrt::com_ptr<ID3D11ComputeShader> prepareColorCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> depthDownsampleCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> diffuseCompositeCS = nullptr;
+    /// @brief (batch 1, item 1) ssrt_preblur.hlsl. Nullptr if it failed to compile, in which
+    /// case the diffuse chain runs exactly as it did before the pass existed -- including
+    /// handing the temporal pass the real FireflyClampSigma back.
+    winrt::com_ptr<ID3D11ComputeShader> preblurCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> temporalCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> varianceCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialCS = nullptr;
