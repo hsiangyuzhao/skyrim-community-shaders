@@ -1316,15 +1316,46 @@ uint IsValidHistory(uint2 pixel, float2 uv, SSRTHistoryPlane plane, float3 norma
         // The plane's own linear depth at this tap's pixel, from the affine reciprocal form,
         // measured from the row's own origin (see SSRTHistoryPlane::centrePixel).
         const float invZPlane = dot(plane.depthRow.xy, float2(pixel) - plane.centrePixel) + plane.depthRow.z;
-        // Data, not plane: the row was bit-tested finite when the plane was built and the tap
-        // depth is the only fresh input, so a non-finite value here means the history depth texel
-        // itself is corrupt.
-        if (!(isFiniteSafe(tapLinear) && isFiniteSafe(invZPlane)))
-            reason = SSRT_HISTORY_REJ_DATA;
+        // (perf 4) THE TWO PER-TAP FINITENESS TESTS THAT USED TO GUARD THIS ARE GONE
+        //
+        // They were `isFiniteSafe(tapLinear) && isFiniteSafe(invZPlane)`, raising
+        // SSRT_HISTORY_REJ_DATA, on every one of the up-to-sixteen taps. Neither can fire, and
+        // both are provably unreachable from the *writers* rather than from an argument about the
+        // arithmetic:
+        //
+        //   tapLinear. texHistoryDepth has exactly two writers: CopyDynamicRegion from mip 0 of
+        //   the Hi-Z pyramid, which is an R32_FLOAT restatement of a rasterised depth buffer and
+        //   so holds values in [0, 1]; and ClearDenoiserHistory, which writes 1.0. GetScreenDepth
+        //   is w / (x - raw * z) with CameraData = (far, near, far - near, far * near), and for
+        //   raw in [0, 1] the denominator runs from far down to near > 0 -- bounded away from
+        //   zero at both ends, so the result is finite and positive for every value either writer
+        //   can leave behind. The far-plane clear gives exactly `far`, which is finite and rejects
+        //   on distance, which is what it is there for.
+        //
+        //   invZPlane. depthRow was bit-tested finite at the end of SSRTBuildHistoryPlane and
+        //   centrePixel comes from a prevNDC that was bit-tested finite before it; `pixel` is a
+        //   uint2. So the only way the dot could leave the finite range is overflow, and the row's
+        //   gradients are bounded by the |k| > 1e-4 * prevZ guard at |A| <= sx * rcpP00 * 1e4 /
+        //   prevZ against a pixel index under 2^14 -- twenty orders of magnitude inside binary32.
+        //
+        // The cost was not the comparisons. isFiniteSafe forces its operand to stay live across
+        // the test, so on an unrolled sixteen-tap chain it is register pressure, which is the
+        // quantity that decides how many groups an SM can host -- and NRD's shipping hot loops
+        // carry no isfinite at all for exactly this reason. The two guards this feature genuinely
+        // needs are kept, and they are the two NRD would not have: one at the irradiance entry
+        // (guard G2 upstream, plus G3 in the firefly clamp) and one where the *persistent*
+        // history is read, since a poisoned texel there is a closed feedback loop -- that is
+        // SSRT_LoadHistory's G4, below, and it is untouched.
+        //
+        // What a corrupt R32 texel would now do, if one could exist: the comparison against a
+        // NaN is false, so the tap is accepted instead of rejected, and the colour it carries is
+        // still refused by G4. The bounded worst case is one stale tap in a weighted mean, not a
+        // poisoned history -- so even the unreachable branch fails safe.
+        //
         // A non-positive reciprocal depth means the plane passes behind the previous camera at
         // this pixel, so no surface lying in it could have been visible there. A plane
         // disagreement, and one that cannot produce a non-finite value on the way to saying so.
-        else if (invZPlane <= 0.0f)
+        if (invZPlane <= 0.0f)
             reason = SSRT_HISTORY_REJ_PLANE;
         // The comparison itself, in linear view depth along the view ray -- the same quantity the
         // folded-row form measured, so SSRT_HISTORY_PLANE_TILT keeps its meaning.
