@@ -300,20 +300,53 @@ groupshared uint g_ssrtMirrorLanes;
 // the shorter 3x3 reach need compensating. Strides 4 and 5 fall back to per-tap loads
 // exactly as before.
 //
-// (defect D6) With the 5-tap kernel back as the diffuse default, its LDS cap moves from A4's
-// stride 2 to stride 3, so the whole of the AtrousIterations 3 chain stays on LDS instead of
-// falling back to per-tap global loads on its last iteration. The tile grows to
-// 8 + 2 * 2 * 3 = 20 texels a side, i.e. 400 float4 = 6400 bytes -- more than A4's 4096 but
-// far inside the 32 KB a cs_5_0 group may hold, and it is the only groupshared allocation in
-// this shader. The maximum tile index a tap can produce is 7 + 2 * 3 + 2 * 3 = 19, which is
-// the last row, so the bound is exact rather than generous. Strides 4 and 5
-// (AtrousIterations 4 and 5) still fall back to per-tap loads.
+// (defect D6) With the 5-tap kernel back as the diffuse default, its LDS cap moved from A4's
+// stride 2 to stride 3, so the whole of the AtrousIterations 3 chain stayed on LDS instead of
+// falling back to per-tap global loads on its last iteration. The tile grew to
+// 8 + 2 * 2 * 3 = 20 texels a side, i.e. 400 float4 = 6400 bytes.
+//
+// (perf 2) THAT COVERAGE WAS BOUGHT WITH OCCUPANCY, WHICH IS THE WRONG CURRENCY HERE
+//
+// "Far inside the 32 KB a cs_5_0 group may hold" was the wrong budget to check it against. The
+// binding limit is not what one group may hold, it is how many groups an SM can host at once,
+// and a groupshared allocation is charged for the whole dispatch whether or not this particular
+// iteration's stride uses it. The tile is sized for the *worst* stride the shader can be
+// dispatched with, because `atrousIterations` is a constant-buffer field and a groupshared array
+// is not; so at the default AtrousIterations 2 -- strides 1 and 2, which need 12 x 12 and
+// 16 x 16 -- every group was still reserving the 20 x 20 that only stride 3 asks for.
+//
+// An 8x8 group is two warps, and the resident-warp cap and the shared-memory carveout bound the
+// group count together. Taking a 64 KB carveout (and a 100 KB one, since the driver picks):
+//
+//   tile side   bytes   groups/SM @64K   warps   groups/SM @100K   warps
+//      20        6404         10          20/48        15          30/48
+//      16        4100         15          30/48        24 (cap)    48/48
+//
+// i.e. cutting the cap to stride 2 takes the diffuse a-trous pass from 42% to 62% of peak
+// occupancy on a 64 KB carveout, and from 62% to 100% on a 100 KB one -- on a pass that runs
+// twice per frame and whose 25 taps per lane are exactly the kind of work that needs resident
+// warps to hide.
+//
+// What it costs: AtrousIterations 3 and above now take the per-tap global path on their stride-3
+// iteration, 50 loads per lane instead of 12.5 tile texels, at full occupancy. That is a genuine
+// trade rather than a strict win, and it is taken in the direction of the default (2), where
+// there is no trade at all -- both iterations keep the tile *and* gain the occupancy. The
+// specular permutation moves 14 -> 12 a side by the same arithmetic and its stride-3 fallback is
+// 18 loads per lane rather than 50, since its kernel has 9 taps.
+//
+// The output does not move either way: SSRTSpatialFetchGuide's two paths return the same
+// float4 for the same texel, and the tap loop's own `inside` test means a tap outside the render
+// sub-rect -- the only place the tile's fill convention and the G-buffer disagree -- is never
+// fetched through either path.
+//
+// The maximum tile index a tap can produce is 7 + 2 * 2 + 2 * 2 = 15 at the 5x5 kernel's stride
+// 2, which is the last row, so the bound stays exact rather than generous.
 #if SSRT_SVGF_KERNEL_5X5
-#   define SSRT_SPATIAL_LDS_MAX_STRIDE 3
+#   define SSRT_SPATIAL_LDS_MAX_STRIDE 2
 #else
-#   define SSRT_SPATIAL_LDS_MAX_STRIDE 3
+#   define SSRT_SPATIAL_LDS_MAX_STRIDE 2
 #endif
-// 20 with the 5x5 kernel, 14 with the 3x3 one.
+// 16 with the 5x5 kernel, 12 with the 3x3 one.
 #define SSRT_SPATIAL_TILE (8 + 2 * SSRT_SPATIAL_KERNEL_RADIUS * SSRT_SPATIAL_LDS_MAX_STRIDE)
 
 // View-space normal in .xyz, raw depth in .w. Only the tap loop reads it; the centre
