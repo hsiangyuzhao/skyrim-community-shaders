@@ -1271,7 +1271,8 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     const auto envTexture = dynamicCubemaps.loaded ? dynamicCubemaps.envTexture->srv.get() : nullptr;
 	const auto envReflectionsTexture = dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr;
 
-    auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec] = ssgi.GetOutputTextures();
+    auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec, ssgi_bent_normal_unused] = ssgi.GetOutputTextures();
+    (void)ssgi_bent_normal_unused;  // (directional env) composite-only consumer
 
     // raymarch
     state->BeginPerfEvent("Raymarch");
@@ -1578,7 +1579,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     const auto envTexture = dynamicCubemaps.loaded ? dynamicCubemaps.envTexture->srv.get() : nullptr;
 	const auto envReflectionsTexture = dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr;
 
-    auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec] = ssgi.GetOutputTextures();
+    auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec, ssgi_bent_normal_unused] = ssgi.GetOutputTextures();
+    (void)ssgi_bent_normal_unused;  // (directional env) composite-only consumer
 
     uavs.at(0) = texSSRTDiffuseColor->uav.get();
     // (ambient reinjection) Always bound, not gated on the setting: the shader writes it

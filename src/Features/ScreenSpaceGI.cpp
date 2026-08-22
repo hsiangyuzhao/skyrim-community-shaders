@@ -33,7 +33,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DistanceNormalisation,
 	EnableContactAo,
 	ContactRadius,
-	ContactStrength)
+	ContactStrength,
+	EnableDirectionalEnv,
+	EnvLevel)
 
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -338,6 +340,44 @@ void ScreenSpaceGI::DrawSettings()
 	}
 
 	///////////////////////////////
+	ImGui::SeparatorText("Directional Environment");
+
+	{
+		auto dirEnvGuard = Util::DisableGuard(!settings.Enabled);
+
+		ImGui::Checkbox("Enable Directional Environment", &settings.EnableDirectionalEnv);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			std::vector<std::string> tooltipLines = {
+				"Colours the ambient light by what is actually out there in the open direction:",
+				"instead of one flat tint for the whole scene, each surface looks towards the sky,",
+				"doorway or room it can see and takes its colour from the live environment map.",
+				"",
+				"Needs Screen Space GI enabled (this section rides on its occlusion scan) and",
+				"Dynamic Cubemaps installed. If Screen Space Ray Tracing's diffuse mode is active,",
+				"that takes over the same job and this channel steps aside automatically.",
+				"",
+				"Only the colour source changes; ambient occlusion and overall brightness keep",
+				"working exactly as before."
+			};
+			Util::DrawMultiLineTooltip(tooltipLines);
+		}
+
+		{
+			auto levelGuard = Util::DisableGuard(!settings.EnableDirectionalEnv);
+
+			ImGui::SliderFloat("Environment Level", &settings.EnvLevel, 0.0f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				std::vector<std::string> tooltipLines = {
+					"Brightness of the environment-coloured ambient. 1.0 matches the level the old",
+					"flat ambient had, so nothing else needs re-tuning; raising it brightens the",
+					"ambient linearly without shifting its colour."
+				};
+				Util::DrawMultiLineTooltip(tooltipLines);
+			}
+		}
+	}
+
+	///////////////////////////////
 	ImGui::SeparatorText("Denoising");
 
 	{
@@ -419,6 +459,8 @@ void ScreenSpaceGI::DrawSettings()
 		BUFFER_VIEWER_NODE(texIlCoCg[1], debugRescale)
 		BUFFER_VIEWER_NODE(texContactAo[0], debugRescale)
 		BUFFER_VIEWER_NODE(texContactAo[1], debugRescale)
+		BUFFER_VIEWER_NODE(texBentNormal[0], debugRescale)
+		BUFFER_VIEWER_NODE(texBentNormal[1], debugRescale)
 
 		ImGui::TreePop();
 	}
@@ -434,6 +476,18 @@ void ScreenSpaceGI::LoadSettings(json& o_json)
 void ScreenSpaceGI::SaveSettings(json& o_json)
 {
 	o_json = settings;
+}
+
+ScreenSpaceGI::SSGISharedData ScreenSpaceGI::GetCommonBufferData()
+{
+	// (directional env) The whole runtime state is folded into the one flag the shader tests:
+	// feature loaded, feature enabled, channel enabled. DeferredCompositeCS therefore needs no
+	// knowledge of SSGI's lifecycle, and a null bent-normal SRV can never be read -- the same
+	// pattern ScreenSpaceRayTracing::GetCommonBufferData uses for DiffuseMult.
+	SSGISharedData data{};
+	data.EnableDirectionalEnv = (loaded && settings.Enabled && settings.EnableDirectionalEnv) ? 1u : 0u;
+	data.EnvLevel = settings.EnvLevel;
+	return data;
 }
 
 void ScreenSpaceGI::SetupResources()
@@ -585,6 +639,21 @@ void ScreenSpaceGI::SetupResources()
 			texContactAo[1] = eastl::make_unique<Texture2D>(texDesc);
 			texContactAo[1]->CreateSRV(srvDesc);
 			texContactAo[1]->CreateUAV(uavDesc);
+		}
+
+		// (directional env) Bent normal + aperture pair. R8G8B8A8_UNORM: the octahedral codec
+		// needs two [0, 1] channels, the aperture one more, and unorm storage format-bounds
+		// every channel so nothing downstream needs a finiteness test. 8-bit octahedral is
+		// ~0.5 degrees worst-case -- far below what a cubemap mip lookup can resolve.
+		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		{
+			texBentNormal[0] = eastl::make_unique<Texture2D>(texDesc);
+			texBentNormal[0]->CreateSRV(srvDesc);
+			texBentNormal[0]->CreateUAV(uavDesc);
+
+			texBentNormal[1] = eastl::make_unique<Texture2D>(texDesc);
+			texBentNormal[1]->CreateSRV(srvDesc);
+			texBentNormal[1]->CreateUAV(uavDesc);
 		}
 
 		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
@@ -843,6 +912,10 @@ void ScreenSpaceGI::DrawSSGI()
 		context->ClearUnorderedAccessViewFloat(texAo[outputAoIdx]->uav.get(), clr);
 		context->ClearUnorderedAccessViewFloat(texIlY[outputIlIdx]->uav.get(), clr);
 		context->ClearUnorderedAccessViewFloat(texIlCoCg[outputIlIdx]->uav.get(), clr);
+		// (directional env) Hygiene only: GetCommonBufferData zeroes EnableDirectionalEnv while
+		// the feature is off, so the composite never reads this -- but a cleared texture decodes
+		// to a well-defined direction either way.
+		context->ClearUnorderedAccessViewFloat(texBentNormal[outputIlIdx]->uav.get(), clr);
 		return;
 	}
 
@@ -873,7 +946,7 @@ void ScreenSpaceGI::DrawSSGI()
 	auto internalRes = resChoices[settings.ResolutionMode];
 
 	std::array<ID3D11ShaderResourceView*, 11> srvs = { nullptr };
-	std::array<ID3D11UnorderedAccessView*, 6> uavs = { nullptr };
+	std::array<ID3D11UnorderedAccessView*, 7> uavs = { nullptr };
 	std::array<ID3D11SamplerState*, 2> samplers = { pointClampSampler.get(), linearClampSampler.get() };
 	auto cb = ssgiCB->CB();
 
@@ -919,7 +992,9 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(7) = texIlY[inputGITexIdx]->srv.get();
 		srvs.at(8) = texIlCoCg[inputGITexIdx]->srv.get();
 		srvs.at(9) = texGiSpecular[inputAoTexIdx]->srv.get();
-		srvs.at(10) = nullptr;
+		// (directional env) Last frame's bent-normal output; rides the IL chain's index, so its
+		// history lives wherever texIlY's does.
+		srvs.at(10) = texBentNormal[inputGITexIdx]->srv.get();
 
 		uavs.at(0) = texRadiance->uav.get();
 		uavs.at(1) = texAccumFrames[!lastFrameAccumTexIdx]->uav.get();
@@ -927,6 +1002,7 @@ void ScreenSpaceGI::DrawSSGI()
 		uavs.at(3) = texIlY[!inputGITexIdx]->uav.get();
 		uavs.at(4) = texIlCoCg[!inputGITexIdx]->uav.get();
 		uavs.at(5) = texGiSpecular[!inputAoTexIdx]->uav.get();
+		uavs.at(6) = texBentNormal[!inputGITexIdx]->uav.get();
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
@@ -975,12 +1051,15 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(6) = texIlY[inputGITexIdx]->srv.get();
 		srvs.at(7) = texIlCoCg[inputGITexIdx]->srv.get();
 		srvs.at(8) = texGiSpecular[inputAoTexIdx]->srv.get();
+		// (directional env) The reprojected bent history radianceDisocc just wrote.
+		srvs.at(9) = texBentNormal[inputGITexIdx]->srv.get();
 
 		uavs.at(0) = texAo[!inputAoTexIdx]->uav.get();
 		uavs.at(1) = texIlY[!inputGITexIdx]->uav.get();
 		uavs.at(2) = texIlCoCg[!inputGITexIdx]->uav.get();
 		uavs.at(3) = texGiSpecular[!inputAoTexIdx]->uav.get();
 		uavs.at(4) = texPrevGeo->uav.get();
+		uavs.at(5) = texBentNormal[!inputGITexIdx]->uav.get();
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
@@ -1003,10 +1082,15 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(2) = texAccumFrames[lastFrameAccumTexIdx]->srv.get();
 		srvs.at(3) = texIlY[inputGITexIdx]->srv.get();
 		srvs.at(4) = texIlCoCg[inputGITexIdx]->srv.get();
+		// (directional env) The bent pair ping-pongs with the IL pair, so the blur must carry it
+		// (filtered, in the decoded vector domain -- see blur.cs.hlsl) or the chain would read a
+		// stale slot after the flip below.
+		srvs.at(5) = texBentNormal[inputGITexIdx]->srv.get();
 
 		uavs.at(0) = texAccumFrames[!lastFrameAccumTexIdx]->uav.get();
 		uavs.at(1) = texIlY[!inputGITexIdx]->uav.get();
 		uavs.at(2) = texIlCoCg[!inputGITexIdx]->uav.get();
+		uavs.at(3) = texBentNormal[!inputGITexIdx]->uav.get();
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
@@ -1074,11 +1158,13 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(4) = texGiSpecular[inputAoTexIdx]->srv.get();
 		if (contactAoActive)
 			srvs.at(5) = texContactAo[contactIdx]->srv.get();
+		srvs.at(6) = texBentNormal[inputGITexIdx]->srv.get();
 
 		uavs.at(0) = texAo[!inputAoTexIdx]->uav.get();
 		uavs.at(1) = texIlY[!inputGITexIdx]->uav.get();
 		uavs.at(2) = texIlCoCg[!inputGITexIdx]->uav.get();
 		uavs.at(3) = texGiSpecular[!inputAoTexIdx]->uav.get();
+		uavs.at(4) = texBentNormal[!inputGITexIdx]->uav.get();
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);

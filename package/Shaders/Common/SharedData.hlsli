@@ -371,6 +371,20 @@ namespace SharedData
 		float SsgiContactRadius;
     };
 
+	// (directional env) Screen Space GI's composite-side knobs. SSGI's own passes read their
+	// parameters from its private SSGICB (b1); these two exist solely for
+	// DeferredCompositeCS.hlsl's directional environment channel, which cannot see that buffer.
+	// Deliberately the LAST member of FeatureData: SSGI never had a block here (see the note in
+	// SSRTSettings), and appending - unlike inserting - moves no existing offset.
+	// EnableDirectionalEnv is pre-gated on the C++ side (feature loaded AND enabled AND the
+	// setting on), so a zero here also covers every "SSGI is not actually running" state.
+	struct SSGISettings
+	{
+		uint EnableDirectionalEnv;
+		float EnvLevel;
+		float2 pad;
+	};
+
 	struct ExponentialHeightFogSettings
 	{
 		uint enabled;
@@ -409,6 +423,7 @@ namespace SharedData
 		PhysSkyData physSkyData;
 		SSRTSettings ssrtSettings;
 		ExponentialHeightFogSettings exponentialHeightFogSettings;
+		SSGISettings ssgiSettings;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);

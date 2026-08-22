@@ -45,12 +45,16 @@ Texture2D<float> srcPrevAo : register(t5);             // maybe half-res
 Texture2D<float4> srcPrevY : register(t6);             // maybe half-res
 Texture2D<float2> srcPrevCoCg : register(t7);          // maybe half-res
 Texture2D<float4> srcPrevGISpecular : register(t8);    // maybe half-res
+// (directional env) Reprojected bent-normal history, written by radianceDisocc.cs.hlsl the same
+// way srcPrevAo is. Encoding: see SSGI_EncodeBentNormal in common.hlsli.
+Texture2D<unorm float4> srcPrevBentNormal : register(t9);  // maybe half-res
 
 RWTexture2D<unorm float> outAo : register(u0);
 RWTexture2D<float4> outY : register(u1);
 RWTexture2D<float2> outCoCg : register(u2);
 RWTexture2D<float4> outGISpecular : register(u3);
 RWTexture2D<half3> outPrevGeo : register(u4);
+RWTexture2D<unorm float4> outBentNormal : register(u5);
 
 float GetDepthFade(float depth)
 {
@@ -85,7 +89,10 @@ float GetVisibilityFunctionSmithJointApprox(float roughness, float NdotV, float 
 	return vis > 0 ? (0.5 / vis) : 0;
 }
 
-#ifdef GI
+// (directional env) The bit-field machinery below used to live behind `#ifdef GI`. The bent-normal
+// output integrates the *unoccluded* bits with the same table and the same quadrature in every
+// permutation, AO-only included, so the table and the two functions are now unconditional. The GI
+// radiance accumulation that consumes them stays behind the define.
 
 ///////////////////////////////////////////////////////////////////////////////
 // Analytic bit-field integration
@@ -235,11 +242,10 @@ void IntegrateBitfield(
 	}
 }
 
-#endif  // GI
-
 void CalculateGI(
 	uint2 dtid, float2 uv, float viewspaceZ, float3 viewspaceNormal,
-	out float o_ao, out sh2 o_currY, out float2 o_currCoCg, out float4 o_currGIAOSpecular)
+	out float o_ao, out sh2 o_currY, out float2 o_currCoCg, out float4 o_currGIAOSpecular,
+	out float3 o_bentNormalWS, out float o_bentAperture)
 {
 	const float2 frameScale = FrameDim * RcpTexDim;
 
@@ -278,6 +284,13 @@ void CalculateGI(
 
 	float visibility = 0;
 	float visibilitySpecular = 0;
+	// (directional env) Solid-angle mass and first moment of the UNOCCLUDED directions, i.e. the
+	// complement of the per-slice linear-angle bitmask. Same measure the radiance integration
+	// uses (|sin(theta_view)| * sin(PI/32) per bin), so a fully open hemisphere sums to exactly
+	// 2 * NumSlices in mass and NumSlices in the moment's normal component - the baselines the
+	// aperture mapping below is calibrated against (their ratio, 0.5, is the fully-open case).
+	float bentWeightSum = 0;
+	float3 bentMomentVS = 0;
 	// Luminance is transported as an SH2 radiance projection. Because SphericalHarmonics::Evaluate
 	// is affine in the direction, the whole march can be accumulated as a scalar mass plus a
 	// view-space first moment and assembled into the SH once, which also means a single
@@ -309,7 +322,6 @@ void CalculateGI(
 
 		float n = signNorm * FastMath::ACos(cosNorm);
 
-#ifdef GI
 		// Slice-plane frame for the analytic bit integration (build-0816 diffuseGI.cs.hlsl:290-297).
 		// `projectedNormalTangent` completes an orthonormal pair with the projected normal inside
 		// the slice plane. `sinNorm` is derived from the existing cosNorm and signNorm rather than
@@ -319,12 +331,20 @@ void CalculateGI(
 		// normalize(orthoDirectionVec): cross(directionVec, viewVec) == cross(orthoDirectionVec,
 		// viewVec) and cross(viewVec, axisVec) == normalize(orthoDirectionVec), so the two frames
 		// and therefore the angle-to-bit mapping are identical.
+		//
+		// (directional env) No longer GI-only: the bent-normal integration below uses the same
+		// frame in every permutation.
 		const float3 projectedNormalNorm = projectedNormalVec / max(projectedNormalVecLength, 1e-6);
 		const float3 projectedNormalTangent = cross(projectedNormalNorm, axisVec);
 		const float sinNorm = signNorm * sqrt(saturate(1.0 - cosNorm * cosNorm));
-#endif
 
 		uint bitmask = 0;
+		// (directional env) Linear-angle occlusion field for the bent normal. Kept separate from
+		// the AO `bitmask` above, whose smoothstep warp makes bit DENSITY the cosine weight -- the
+		// per-bin quadrature in IntegrateBitfield needs bins uniform in angle, exactly like the GI
+		// field. Gated on AORadius: the bent normal answers "which directions does the *occlusion*
+		// see as open", so it uses the AO range, not the IL range.
+		uint bitmaskBent = 0;
 #ifdef GI
 		uint bitmaskGI = 0;
 #	ifdef GI_SPECULAR
@@ -401,6 +421,22 @@ void CalculateGI(
 				uint2 bitsRange = uint2(round(angleRangeAO.x * 32u), round((angleRangeAO.y - angleRangeAO.x) * 32u));
 				uint maskedBits = s < AORadius ? ((1 << bitsRange.y) - 1) << bitsRange.x : 0;
 
+				// Linear angle-to-bit mapping. The AO field above keeps the smoothstep warp - there the
+				// bit *density* is the cosine weight, which is what makes a plain countbits() a
+				// cosine-weighted visibility - but the analytic integration (IntegrateBitfield)
+				// evaluates cos/sin at each bin centre and therefore needs bins that are uniform in
+				// angle (build-0816 diffuseGI.cs.hlsl:336). Shared by the bent-normal field below and,
+				// under GI, by the radiance field.
+				float2 angleRangeLinNorm = saturate(angleRangeNorm);
+
+				// (directional env) Bent-normal occlusion field. Gated on AORadius - the bent normal
+				// answers "which directions does the *occlusion* see as open", so it uses the AO
+				// range, not the IL range. ComputeOccludedBitfield rather than the open-coded shift
+				// because a sample can legitimately claim the full 32-bit span, where the shift is
+				// undefined; the returned newly-covered bits are not needed here, only the union.
+				[branch] if (s < AORadius)
+					ComputeOccludedBitfield(angleRangeLinNorm.x, angleRangeLinNorm.y, bitmaskBent);
+
 #ifdef GI
 				// IL shares the AO thickness now; the separate 300-unit GI thickness is gone.
 				//
@@ -425,16 +461,9 @@ void CalculateGI(
 				uint maskedBitsGISpecular = s < GIRadius ? ((1 << bitsRangeGISpecular.y) - 1) << bitsRangeGISpecular.x : 0;
 #	endif
 
-				// Linear angle-to-bit mapping. The AO field above keeps the smoothstep warp - there the
-				// bit *density* is the cosine weight, which is what makes a plain countbits() a
-				// cosine-weighted visibility - but the analytic integration below evaluates cos/sin at
-				// each bin centre and therefore needs bins that are uniform in angle (build-0816
-				// diffuseGI.cs.hlsl:336).
-				float2 angleRangeGINorm = saturate(angleRangeNorm);
-
 				uint validBits = 0;
 				[branch] if (s < GIRadius)
-					validBits = ComputeOccludedBitfield(angleRangeGINorm.x, angleRangeGINorm.y, bitmaskGI);
+					validBits = ComputeOccludedBitfield(angleRangeLinNorm.x, angleRangeLinNorm.y, bitmaskGI);
 
 				bool checkGI = validBits != 0;
 
@@ -504,6 +533,26 @@ void CalculateGI(
 			}
 		}
 
+		// (directional env) Fold this slice's UNOCCLUDED directions into the bent accumulators.
+		// ~bitmaskBent is the complement of the linear-angle occlusion field: exactly the bins the
+		// AO-range march never covered. Integrated with the same solid-angle measure as the GI
+		// radiance (|sin(theta_view)| * sin(PI/32) per bin), so a fully open slice contributes 2
+		// to the mass and 1 to the moment's normal component. requireSourceFacing is false: there
+		// is no source surface here, the "sample" is the open environment beyond the horizon, so
+		// every unoccluded bin counts. The unused cosine-measure output is dead and folded away.
+		{
+			float bentWeight, bentCosineUnused;
+			float3 bentMoment;
+			IntegrateBitfield(
+				~bitmaskBent,
+				projectedNormalNorm, projectedNormalTangent,
+				projectedNormalVecLength, sinNorm, cosNorm,
+				viewspaceNormal, false,
+				bentWeight, bentMoment, bentCosineUnused);
+			bentWeightSum += bentWeight;
+			bentMomentVS += bentMoment;
+		}
+
 		visibility += countbits(bitmask) * 0.03125;
 
 #if defined(GI) && defined(GI_SPECULAR)
@@ -516,6 +565,35 @@ void CalculateGI(
 	visibility *= rcpNumSlices;
 	visibility = lerp(saturate(visibility), 0, depthFade);
 	visibility = 1 - pow(abs(1 - visibility), AOPower);
+
+	// (directional env) Bent normal and aperture from the accumulated mass and first moment.
+	//
+	// Direction: the normalised moment, i.e. the mean unoccluded direction.
+	// Aperture: the moment-length / mass ratio. Against the fully-open baselines (mass
+	// 2 * NumSlices, moment NumSlices along the normal) the ratio is 0.5 for a completely open
+	// hemisphere and rises towards 1 as the opening narrows to a single direction, so
+	// 2 * (1 - ratio) maps it onto [0 = pinhole, 1 = open hemisphere]. Scale-invariant in
+	// NumSlices by construction, so slice count changes quality, not meaning.
+	float3 bentNormalVS = viewspaceNormal;
+	float bentAperture = 0.0;
+	{
+		float bentMomentLen = length(bentMomentVS);
+		[flatten] if (bentMomentLen > 1e-4 && bentWeightSum > 1e-4) {
+			bentNormalVS = bentMomentVS / bentMomentLen;
+			bentAperture = saturate(2.0 * (1.0 - bentMomentLen / bentWeightSum));
+		}
+	}
+	// Far-field behaviour mirrors the other channels' depthFade, but towards the OPEN prior
+	// rather than towards zero: at range the march sees too few pixels to measure occlusion,
+	// and "surface normal, fully open" is what makes the composite's environment lookup degrade
+	// to the isotropic ambient it replaces, instead of to a black or arbitrary direction.
+	// normalize is safe: both inputs are unit and the bent normal cannot oppose the surface
+	// normal (every bin lies in the surface's upper half-space).
+	bentNormalVS = normalize(lerp(bentNormalVS, viewspaceNormal, depthFade));
+	bentAperture = lerp(bentAperture, 1.0, depthFade);
+
+	o_bentNormalWS = ViewToWorldVector(bentNormalVS, FrameBuffer::CameraViewInverse[eyeIndex]);
+	o_bentAperture = bentAperture;
 
 #ifdef GI
 	// Assemble the SH2 radiance projection from the accumulated mass and first moment. This is
@@ -575,7 +653,8 @@ void CalculateGI(
 	float2 normalSample = FULLRES_LOAD(srcNormalRoughness, pxCoord, uv * frameScale, samplerLinearClamp).xy;
 	float3 viewspaceNormal = GBuffer::DecodeNormal(normalSample);
 
-	half2 encodedWorldNormal = GBuffer::EncodeNormal(ViewToWorldVector(viewspaceNormal, FrameBuffer::CameraViewInverse[eyeIndex]));
+	float3 worldNormal = ViewToWorldVector(viewspaceNormal, FrameBuffer::CameraViewInverse[eyeIndex]);
+	half2 encodedWorldNormal = GBuffer::EncodeNormal(worldNormal);
 	outPrevGeo[pxCoord] = half3(viewspaceZ, encodedWorldNormal);
 
 	// Move center pixel slightly towards camera to avoid imprecision artifacts due to depth buffer imprecision; offset depends on depth texture format used
@@ -585,12 +664,19 @@ void CalculateGI(
 	float4 currY = 0;
 	float2 currCoCg = 0;
 	float4 currGIAOSpecular = float4(0, 0, 0, 0);
+	// (directional env) Open-hemisphere prior for pixels the march never measures (sky,
+	// first-person geometry, beyond the fade range): surface normal, aperture 1, so the
+	// composite's environment lookup degrades to a wide-cone sample along the normal - the
+	// closest thing to the isotropic ambient it replaces.
+	float3 bentNormalWS = worldNormal;
+	float bentAperture = 1.0;
 
 	bool needGI = viewspaceZ > FP_Z && viewspaceZ < DepthFadeRange.y;
 	if (needGI) {
 		CalculateGI(
 			pxCoord, uv, viewspaceZ, viewspaceNormal,
-			currAo, currY, currCoCg, currGIAOSpecular);
+			currAo, currY, currCoCg, currGIAOSpecular,
+			bentNormalWS, bentAperture);
 
 #ifdef TEMPORAL_DENOISER
 		const float accumFrames = srcAccumFrames[pxCoord] * 255;
@@ -616,6 +702,22 @@ void CalculateGI(
 		currAo = lerp(srcPrevAo[pxCoord], currAo, lerpFactorAo);
 		currY = lerp(srcPrevY[pxCoord], currY, lerpFactor);
 		currCoCg = lerp(srcPrevCoCg[pxCoord], currCoCg, lerpFactor);
+
+		// (directional env) Bent-normal history EMA, in the decoded VECTOR domain - lerping the
+		// octahedral encoding across its fold lines fabricates directions (see the codec note in
+		// common.hlsli). Shares the AO channel's shortened window (MaxAccumFramesAO): like AO,
+		// the bent normal is consumed multiplicatively (it steers the ambient chroma), so a
+		// stale direction lags as a visible colour trail under the full IL window. On a
+		// disocclusion accumFrames is 1, lerpFactorAo is 1, and the history term - whatever a
+		// cleared or unwritten texel decodes to - vanishes entirely.
+		float3 prevBentDir;
+		float prevBentAperture;
+		SSGI_DecodeBentNormal(srcPrevBentNormal[pxCoord], prevBentDir, prevBentAperture);
+		float3 bentBlend = lerp(prevBentDir, bentNormalWS, lerpFactorAo);
+		float bentBlendLen = length(bentBlend);
+		[flatten] if (bentBlendLen > 1e-4)
+			bentNormalWS = bentBlend / bentBlendLen;
+		bentAperture = lerp(prevBentAperture, bentAperture, lerpFactorAo);
 #	ifdef GI_SPECULAR
 		currGIAOSpecular = lerp(srcPrevGISpecular[pxCoord], currGIAOSpecular, lerpFactor);
 #	endif
@@ -636,6 +738,11 @@ void CalculateGI(
 	outAo[pxCoord] = currAo;
 	outY[pxCoord] = currY;
 	outCoCg[pxCoord] = currCoCg;
+	// (directional env) No finiteness guard needed: the target is R8G8B8A8_UNORM, which cannot
+	// store a non-finite or out-of-range value (same argument as currAo above), and a NaN lane
+	// self-heals - the next frame's history tap decodes to a valid unit vector regardless of
+	// what the poisoned write clamped to.
+	outBentNormal[pxCoord] = SSGI_EncodeBentNormal(bentNormalWS, bentAperture);
 #ifdef GI_SPECULAR
 	outGISpecular[pxCoord] = currGIAOSpecular;
 #endif
