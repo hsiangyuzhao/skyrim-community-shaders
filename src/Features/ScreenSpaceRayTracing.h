@@ -801,6 +801,36 @@ struct ScreenSpaceRayTracing : Feature
     /// explicitly at both call sites rather than defaulted, so a third caller has to decide.
     DenoiserCB GetDenoiserCBData(bool a_isDiffuseChain) const;
 
+    /// @brief (perf 1) Whether any of the five temporal-pass diagnostic switches is set.
+    ///
+    /// The production permutation of ssrt_temporal.hlsl has those five gates folded to literal
+    /// zero, so it cannot honour any of them; this is the predicate that decides whether a
+    /// dispatch has to use temporalDiagCS instead. Both chains ask it, and it deliberately
+    /// includes HistoryDebugView even though only the diffuse dispatch writes the debug surface:
+    /// the specular pass shares the shader, and picking the two permutations independently per
+    /// chain would buy one dispatch's worth of instructions in exchange for a second PSO switch
+    /// per frame.
+    ///
+    /// @return true while the user is diagnosing, false in every shipping configuration.
+    [[nodiscard]] bool AnyDenoiserDiagnostic() const
+    {
+        return settings.DisableHistoryDepthTest || settings.DisableHistoryNormalTest ||
+               settings.ForceAcceptHistory || settings.RotatedNormalGate || settings.HistoryDebugView;
+    }
+
+    /// @brief (perf 1) The temporal-pass shader this frame's configuration requires.
+    ///
+    /// Falls back to the production permutation when the diagnostic one is unavailable (a failed
+    /// compile), which degrades a diagnostic switch to "reads as off" rather than dropping the
+    /// denoiser. Returns nullptr only if the production permutation itself is missing, which the
+    /// callers already have to handle.
+    [[nodiscard]] ID3D11ComputeShader* SelectTemporalShader() const
+    {
+        if (AnyDenoiserDiagnostic() && temporalDiagCS)
+            return temporalDiagCS.get();
+        return temporalCS.get();
+    }
+
     eastl::unique_ptr<Texture2D> texDepth = nullptr;
     eastl::unique_ptr<Texture2D> texColor = nullptr;
     eastl::unique_ptr<Texture2D> texSSRColor = nullptr;
@@ -928,6 +958,18 @@ struct ScreenSpaceRayTracing : Feature
     /// handing the temporal pass the real FireflyClampSigma back.
     winrt::com_ptr<ID3D11ComputeShader> preblurCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> temporalCS = nullptr;
+    /// @brief (perf 1) ssrt_temporal.hlsl compiled with SSRT_DENOISER_DIAG, i.e. with the five
+    /// diagnostic gates wired to their constant-buffer fields instead of folded to zero.
+    ///
+    /// The production permutation above cannot honour any of the five switches -- fxc has removed
+    /// the branches -- so AnyDenoiserDiagnostic() decides which one is dispatched, and the answer
+    /// is this one only while a switch is actually set. See the derivation block above the macro
+    /// definitions in ssrt_temporal.hlsl: the generated code of this permutation is byte-identical
+    /// to the single shader that preceded the split, so no switch changes behaviour.
+    ///
+    /// Nullptr if it failed to compile, in which case the switches silently read as off rather
+    /// than the whole denoiser failing -- the production permutation is the one gameplay uses.
+    winrt::com_ptr<ID3D11ComputeShader> temporalDiagCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> varianceCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialSpecularCS = nullptr;

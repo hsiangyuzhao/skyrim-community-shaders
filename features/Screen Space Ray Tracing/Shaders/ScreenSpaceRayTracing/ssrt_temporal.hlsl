@@ -85,13 +85,13 @@ cbuffer DenoiserCB : register(b2)
     // branch it guards costs nothing. Exists so the plane test can be isolated in-game
     // against the D1 history clamp -- which HistoryClampSigma 0 already switches off -- with
     // one variable moving at a time.
-    uint disableHistoryDepthTest;
+    uint d_disableHistoryDepthTest;
     // (diagnostic H) Non-zero bypasses the 30 degree normal agreement test and nothing else,
     // i.e. the exact counterpart of disableHistoryDepthTest for the other hard gate. The two
     // together are what turn the debug view's colour reading into a confirmation: a screen
     // that comes back green should start accumulating the moment this is set, and a screen
     // that comes back red should start accumulating the moment the other one is.
-    uint disableHistoryNormalTest;
+    uint d_disableHistoryNormalTest;
     // --- row 3 ---
     // (diagnostic H) Non-zero reduces the acceptance predicate to its *upper bound*: the
     // screen-bounds tests, the guard G4 finiteness rejection and the accumFrames > 0
@@ -104,7 +104,7 @@ cbuffer DenoiserCB : register(b2)
     // it is in the bounds arithmetic, in the history contents, or in the alpha path -- and
     // that is a different repair. Strictly a diagnostic: with it set the accumulation reads
     // history straight across silhouettes and depth layers, which is maximal ghosting.
-    uint forceAcceptHistory;
+    uint d_forceAcceptHistory;
     // (diagnostic H, defect D3 follow-up) Selects which of the two forms of the 30 degree
     // normal comparison runs.
     //
@@ -124,13 +124,66 @@ cbuffer DenoiserCB : register(b2)
     // un-rotated normal and the diagnostic view paints the pixel magenta. So this can no longer
     // reject the screen silently -- but the default stays 0, because the un-rotated form is the
     // one with years of measured behaviour behind it and switching defaults is a separate change.
-    uint rotatedNormalGate;
+    uint d_rotatedNormalGate;
     // (diagnostic H) Non-zero makes this pass write DebugHistoryOutput. Zero leaves the
     // texture untouched, which is what the specular dispatch always passes -- the two chains
     // share one shader and one debug surface, and only the diffuse picture is wanted.
-    uint historyDebugView;
+    uint d_historyDebugView;
     float denoiserPad3;
 };
+
+// ---------------------------------------------------------------------------------------------
+// (perf 1) THE FIVE DIAGNOSTIC GATES, AND WHY THEY ARE NOW A COMPILE-TIME PERMUTATION
+//
+// Every one of the five is group-uniform -- constant for the whole dispatch -- so the branches
+// they guard have always been scalar branches rather than per-lane ones. That was the whole
+// argument for their being free, and it was measurably wrong, because a scalar branch is not the
+// only cost a constant-buffer flag imposes:
+//
+//   * A flag fxc cannot see the value of is a flag whose *dead side* has to be emitted. The
+//     rotation chain below (a 4x4 direction multiply by CameraPreviousViewProjUnjittered, a
+//     two-row extraction, a dot3, two bit-tested finiteness predicates and an rsqrt) has had
+//     exactly two consumers since defect P5 took the plane row off it, and both are gated on
+//     rotatedNormalGate. With the shipped default it was computed for every pixel of every frame
+//     and then discarded.
+//   * SSRT_DebugTally is called on all sixteen taps *unconditionally*, outside the debug write's
+//     own branch -- deliberately, because an `else` arm reshapes the unrolled tap loops enough to
+//     produce spurious X4008 warnings (see the note at that function). Sixteen calls of three
+//     compares, three conditional adds and a select is the single largest block of default-config
+//     dead work in this shader.
+//   * `reason` being a three-valued code rather than a bool keeps the two rejection causes
+//     distinguishable all the way out of IsValidHistory, which costs a live register and blocks
+//     the boolean simplifications fxc would otherwise apply to the acceptance chain.
+//
+// Measured with fxc /Ges /O3 at the shipped compile settings: 2048 instruction slots with the
+// flags as constant-buffer fields against 1764 with them folded to their defaults, i.e. 284 slots
+// -- 14% of the shader -- that the default configuration cannot use. u2 (DebugHistoryOutput) also
+// stops being declared, and dcl_temps drops from 20 to 18.
+//
+// So the flags are read through macros, and the C++ side compiles this file twice: the production
+// permutation with the macros folded to literal zero, and SSRT_DENOISER_DIAG with them wired to
+// the constant-buffer fields above. The dispatch picks the diagnostic permutation whenever any of
+// the five switches is set, so every switch keeps its exact semantics and its exact picture, and
+// the default path keeps none of the cost.
+//
+// The cbuffer fields keep their slots and their order under both permutations -- they are renamed
+// with a d_ prefix, not removed -- so DenoiserCB's layout and its sizeof assertion are untouched.
+// Nothing below this block changes: the body of the shader refers to the same five names it
+// always did.
+// ---------------------------------------------------------------------------------------------
+#if defined(SSRT_DENOISER_DIAG)
+#   define disableHistoryDepthTest   d_disableHistoryDepthTest
+#   define disableHistoryNormalTest  d_disableHistoryNormalTest
+#   define forceAcceptHistory        d_forceAcceptHistory
+#   define rotatedNormalGate         d_rotatedNormalGate
+#   define historyDebugView          d_historyDebugView
+#else
+#   define disableHistoryDepthTest   0u
+#   define disableHistoryNormalTest  0u
+#   define forceAcceptHistory        0u
+#   define rotatedNormalGate         0u
+#   define historyDebugView          0u
+#endif
 
 // (spec S1) Firefly clamp on the radiance entering the temporal accumulation.
 //

@@ -830,7 +830,7 @@ void ScreenSpaceRayTracing::EnsureSharcResources()
 void ScreenSpaceRayTracing::ClearShaderCache()
 {
     static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
-        &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &preblurCS, &temporalCS, &varianceCS, &spatialCS, &spatialSpecularCS,
+        &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &preblurCS, &temporalCS, &temporalDiagCS, &varianceCS, &spatialCS, &spatialSpecularCS,
 #ifdef ENABLE_SHARC
         &raymarchDiffuseSharcCS, &sharcUpdateRaymarchCS, &sharcResolveCS
 #endif
@@ -894,6 +894,20 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
         { "SSRT_SVGF_KERNEL_5X5", "1" }
     };
 
+    // (perf 1) The temporal pass ships as two permutations. The production one folds the five
+    // diagnostic gates to literal zero; this one wires them to their constant-buffer fields.
+    //
+    // fxc /Ges /O3 puts the pair at 1764 and 2048 instruction slots and at dcl_temps 18 and 20,
+    // and the diagnostic permutation's generated code is byte-identical to the single shader that
+    // preceded the split -- so the split costs a diagnostic dispatch nothing and saves a shipping
+    // one 284 slots, two temporaries and the u2 declaration. Like definesWideKernel this list is
+    // deliberately not built on `defines`: none of DYNAMIC_CUBEMAPS / SSGI / SKYLIGHTING /
+    // DIFFUSE_SPP is read by this file, so the production permutation above passes {} and this one
+    // has to match it entry for entry or the two would stop being the same shader.
+    const std::vector<std::pair<const char*, const char*>> definesDenoiserDiag = {
+        { "SSRT_DENOISER_DIAG", "1" }
+    };
+
     std::vector<ShaderCompileInfo>
         shaderInfos = {
             { &raymarchDiffuseCS, "ssrt_raymarch.hlsl", defines },
@@ -904,6 +918,7 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &diffuseCompositeCS, "ssrt_diffuse_composite.hlsl", {} },
             { &preblurCS, "ssrt_preblur.hlsl", {} },
             { &temporalCS, "ssrt_temporal.hlsl", {} },
+            { &temporalDiagCS, "ssrt_temporal.hlsl", definesDenoiserDiag },
             { &varianceCS, "ssrt_variance.hlsl", {} },
             { &spatialCS, "ssrt_spatial.hlsl", definesWideKernel },
             { &spatialSpecularCS, "ssrt_spatial.hlsl", definesSpecular },
@@ -1354,7 +1369,10 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 
         context->CSSetShaderResources(0, 9, srvs.data());
         context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
-        context->CSSetShader(temporalCS.get(), nullptr, 0);
+        // (perf 1) The production permutation unless a diagnostic switch is set; see
+        // SelectTemporalShader. u2 stays bound either way -- the production permutation does not
+        // declare it, and binding a UAV a shader does not use is free.
+        context->CSSetShader(SelectTemporalShader(), nullptr, 0);
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
@@ -1688,7 +1706,10 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 
         context->CSSetShaderResources(0, 9, srvs.data());
         context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
-        context->CSSetShader(temporalCS.get(), nullptr, 0);
+        // (perf 1) The production permutation unless a diagnostic switch is set; see
+        // SelectTemporalShader. u2 stays bound either way -- the production permutation does not
+        // declare it, and binding a UAV a shader does not use is free.
+        context->CSSetShader(SelectTemporalShader(), nullptr, 0);
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
