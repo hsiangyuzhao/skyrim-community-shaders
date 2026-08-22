@@ -242,9 +242,13 @@ namespace SphericalHarmonics
 		// Convolve inSH with the normalized cosine kernel (multiply the L1 band by the zonal scale 2/3), then dot with
 		// inSH(direction) for linear inSH (Equation 5).
 		float result = SphericalHarmonics::FuncProductIntegral(inSH, SphericalHarmonics::EvaluateCosineLobe(direction));
-		// Add irradiance from the ZH3 term. zonalL2Coeff is the ZH3 coefficient for a radiance signal, so we need to
-		// multiply by 1/4 (the L2 zonal scale for a normalized clamped cosine kernel) to evaluate irradiance.
-		result += 0.25f * zonalL2Coeff * zhDir;
+		// Add irradiance from the ZH3 term. zonalL2Coeff is the ZH3 coefficient for a radiance signal.
+		// The L1/L0 part of this function goes through EvaluateCosineLobe, which carries the
+		// *unnormalized* cosine-kernel weights A^ = (pi, 2pi/3) rather than the normalized
+		// (1, 2/3). The matching L2 weight on that convention is A^_2 = pi/4, not 1/4 - with the
+		// bare 1/4 the hallucinated band was ~3.14x too weak relative to the L0/L1 irradiance it
+		// is supposed to reshape.
+		result += 0.25f * Math::PI * zonalL2Coeff * zhDir;
 		return max(0, result);
 	}
 }
