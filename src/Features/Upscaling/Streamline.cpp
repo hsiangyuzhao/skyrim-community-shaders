@@ -7,6 +7,7 @@
 #include "../../Hooks.h"
 #include "../../State.h"
 #include "../../Util.h"
+#include "../RenderDoc.h"
 #include "../Upscaling.h"
 #include "DX12SwapChain.h"
 
@@ -167,6 +168,19 @@ void Streamline::LoadInterposer()
 {
 	if (triedInitialization)
 		return;
+
+	// RenderDoc and sl.interposer both hook device creation; loading both crashes the game
+	// at startup before anything can log. When a RenderDoc capture session is active, leave
+	// Streamline unloaded entirely -- every downstream feature flag already handles the
+	// interposer being absent (missing-DLL path below), so upscaling simply reports
+	// unavailable for the session. FidelityFX.cpp documents the same interference at the
+	// FSR dispatch level; this stops it one step earlier, where it is fatal.
+	if (RenderDoc::GetSingleton()->IsAvailable()) {
+		logger::info("[Streamline] RenderDoc capture is active, skipping interposer load for this session");
+		triedInitialization = true;
+		initialized = false;
+		return;
+	}
 
 	triedInitialization = true;
 	initialized = false;
