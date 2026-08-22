@@ -135,10 +135,34 @@ cbuffer DenoiserCB : register(b2)
 // blur consumes .rgb only -- and rewriting it would be a second LDS store per texel for a value
 // with no consumer.
 groupshared float4 g_ssrtPreBlurColor[SSRT_PREBLUR_TILE * SSRT_PREBLUR_TILE];
-// .xyz = view-space normal, .w = raw depth. Same construction and the same
-// "depth 0 means outside the render sub-rect, and the tap loop's `> 0` test rejects it"
-// convention as ssrt_spatial.hlsl's spec A4 tile and ssrt_variance.hlsl's spec A3 one.
-groupshared float4 g_ssrtPreBlurGuide[SSRT_PREBLUR_TILE * SSRT_PREBLUR_TILE];
+
+// (perf 5) THE GUIDE TILE IS 10x10, NOT 12x12, AND THAT ASYMMETRY IS THE POINT
+//
+// The two tiles have different readers, so they have different footprints, and sizing the guide
+// to match the colour tile was reserving a ring nothing reads.
+//
+//   * The *colour* tile genuinely needs the full 12 x 12. The outlier stage tests each of the 100
+//     interior texels against its own 3 x 3, so it reaches one texel beyond the 10 x 10 the blur
+//     will read -- that outer ring is the entire cost of doing the anti-firefly step correctly
+//     rather than approximately, and it stays.
+//   * The *guide* tile is read by the blur and by nothing else: the centre lane's own entry, and
+//     the nine taps at centreTile +- 1 with centreTile in [2, 9]. That is tile indices 1..10 on
+//     each axis. The outer ring was filled every frame and never read.
+//
+// LDS goes 4608 -> 3904 bytes a group, which at a 64 KB shared carveout is 14 -> 16 groups per SM
+// (28 -> 32 of 48 warps) and at 100 KB is 21 -> 24, the resident-group cap. The indices shift by
+// one against the colour tile's, which is why the mapping gets its own macro rather than an
+// open-coded `- 1` at each of the three sites.
+//
+// Same construction and the same "depth 0 means outside the render sub-rect, and the tap loop's
+// `> 0` test rejects it" convention as ssrt_spatial.hlsl's spec A4 tile and ssrt_variance.hlsl's
+// spec A3 one; the values stored and read are unchanged texel for texel.
+#define SSRT_PREBLUR_GUIDE_DIM (8 + 2 * SSRT_PREBLUR_RADIUS)  // 10
+// Maps a colour-tile coordinate (0..11) to a guide-tile index. Only defined for the 1..10
+// interior, which is the whole of what the blur touches.
+#define SSRT_PREBLUR_GUIDE_INDEX(c) (((c).y - 1u) * SSRT_PREBLUR_GUIDE_DIM + ((c).x - 1u))
+// .xyz = view-space normal, .w = raw depth.
+groupshared float4 g_ssrtPreBlurGuide[SSRT_PREBLUR_GUIDE_DIM * SSRT_PREBLUR_GUIDE_DIM];
 
 // Binomial [1, 2, 1] / 4, normalised to a unit centre tap -- the same kernel, in the same
 // normalisation, that ssrt_spatial.hlsl runs when SSRT_SVGF_KERNEL_5X5 is off.
@@ -233,17 +257,24 @@ float3 SSRTPreBlurClampFirefly(uint2 tileCoord, float sigmas)
         const float3 radiance = SSRColorTexture[pc].rgb;
         g_ssrtPreBlurColor[t] = float4(radiance, Color::RGBToLuminance(radiance));
 
-        // Depth 0 for a texel outside the render sub-rect. The tap loop's `> 0` test then
-        // rejects it, and the zero normal is a second line of defence: it drives
-        // weightNormal = pow(max(0, dot(n, 0)), phiNormal) to exactly 0.
-        float3 tileNormal = 0.0f;
-        float tileDepth = 0.0f;
-        if (valid) {
-            float tileRoughness;
-            GetNormalRoughness(uint2(p), tileNormal, tileRoughness);
-            tileDepth = DepthTexture[p];
+        // (perf 5) The guide is only wanted over the 10 x 10 the blur reads, so the outer ring of
+        // the colour tile's footprint neither loads nor stores one. The predicate is on `local`,
+        // the tile coordinate, so it costs the fill loop two comparisons per iteration and saves
+        // the 44 border texels their normal decode and their depth load as well as their slot.
+        const bool guideWanted = all(local >= 1) && all(local <= int2(SSRT_PREBLUR_GUIDE_DIM, SSRT_PREBLUR_GUIDE_DIM));
+        if (guideWanted) {
+            // Depth 0 for a texel outside the render sub-rect. The tap loop's `> 0` test then
+            // rejects it, and the zero normal is a second line of defence: it drives
+            // weightNormal = pow(max(0, dot(n, 0)), phiNormal) to exactly 0.
+            float3 tileNormal = 0.0f;
+            float tileDepth = 0.0f;
+            if (valid) {
+                float tileRoughness;
+                GetNormalRoughness(uint2(p), tileNormal, tileRoughness);
+                tileDepth = DepthTexture[p];
+            }
+            g_ssrtPreBlurGuide[SSRT_PREBLUR_GUIDE_INDEX(uint2(local))] = float4(tileNormal, tileDepth);
         }
-        g_ssrtPreBlurGuide[t] = float4(tileNormal, tileDepth);
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -278,7 +309,7 @@ float3 SSRTPreBlurClampFirefly(uint2 tileCoord, float sigmas)
 
     const uint2 centreTile = uint2(GTid.xy) + (SSRT_PREBLUR_RADIUS + 1);
     const float4 centreColor = g_ssrtPreBlurColor[centreTile.y * SSRT_PREBLUR_TILE + centreTile.x];
-    const float3 centreNormalVS = g_ssrtPreBlurGuide[centreTile.y * SSRT_PREBLUR_TILE + centreTile.x].xyz;
+    const float3 centreNormalVS = g_ssrtPreBlurGuide[SSRT_PREBLUR_GUIDE_INDEX(centreTile)].xyz;
 
     float3 blended = 0.0f;
     float weightSum = 0.0f;
@@ -289,7 +320,7 @@ float3 SSRTPreBlurClampFirefly(uint2 tileCoord, float sigmas)
         {
             const uint2 tap = uint2(int2(centreTile) + int2(kx, ky));
             const uint ti = tap.y * SSRT_PREBLUR_TILE + tap.x;
-            const float4 guide = g_ssrtPreBlurGuide[ti];
+            const float4 guide = g_ssrtPreBlurGuide[SSRT_PREBLUR_GUIDE_INDEX(tap)];
             const float sampleDepth = guide.w;
             if (sampleDepth > 0.0f)
             {
