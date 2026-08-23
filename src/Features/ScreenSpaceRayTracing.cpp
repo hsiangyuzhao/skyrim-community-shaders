@@ -12,6 +12,8 @@
 #include "ScreenSpaceGI.h"
 #include "Skylighting.h"
 
+#include "Utils/GpuTimers.h"
+
 #ifdef ENABLE_SHARC
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ScreenSpaceRayTracing::Settings,
@@ -1293,6 +1295,7 @@ void ScreenSpaceRayTracing::Prepass()
     context->CSSetSamplers(0, 1, samplers.data());
 
     state->BeginPerfEvent("SSRT Prepass");
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTrace);
 
     // (audit #8) texDepth is allocated at full resolution but only the dynamic-resolution
     // sub-rect is ever written, and it was never cleared. The region beyond the dispatch
@@ -1389,6 +1392,7 @@ void ScreenSpaceRayTracing::Prepass()
         state->EndPerfEvent();
     }
 
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTrace);
     state->EndPerfEvent();
 
     auto view = texDepth->srv.get();
@@ -1405,6 +1409,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     auto state = globals::state;
 
     state->BeginPerfEvent("SSRT Compute");
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTrace);
 
     auto main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
     auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
@@ -1511,6 +1516,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
 
     state->EndPerfEvent();
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTrace);
 
     resetViews();
 
@@ -1556,6 +1562,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         EnsureNRDResources();
 
     if (SVGFActive()) {
+        Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTSvgf);
         DenoiserCB denoiserCBData = GetDenoiserCBData(false);
         denoiserCB->Update(denoiserCBData);
         auto denoiserBuffer = denoiserCB->CB();
@@ -1646,6 +1653,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         if (settings.AtrousIterations % 2 == 0) {
             CopyDynamicRegion(texSSRColor->resource.get(), texVariance->resource.get());
         }
+        Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTSvgf);
     } else if (ReblurSelected() && ReblurReady(true)) {
         // (batch C1) REBLUR_SPECULAR: pack texSSRColor + the world-space hit distance
         // into NRD's front-end layout, dispatch the instance, unpack the result back
@@ -1747,6 +1755,7 @@ void ScreenSpaceRayTracing::RunReblur(bool a_specular)
     const float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
 
     state->BeginPerfEvent(a_specular ? "SSRT REBLUR Specular" : "SSRT REBLUR Diffuse");
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTReblur);
 
     auto& integration = a_specular ? nrdReblurSpecular : nrdReblurDiffuse;
     auto& reblurUI = a_specular ? settings.ReblurSpecular : settings.ReblurDiffuse;
@@ -1865,6 +1874,7 @@ void ScreenSpaceRayTracing::RunReblur(bool a_specular)
         context->CSSetConstantBuffers(1, 1, &ssrtBuffer);
     }
 
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTReblur);
     state->EndPerfEvent();
 }
 
@@ -1878,6 +1888,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     auto state = globals::state;
 
     state->BeginPerfEvent("SSRT Diffuse Compute");
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTrace);
 
     auto main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
     auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
@@ -2011,6 +2022,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
     resetViews();
 
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTrace);
+
 #ifdef ENABLE_SHARC
     if (settings.EnableSharc) {
         std::swap(sharcVoxelData, sharcVoxelDataPrev);
@@ -2028,6 +2041,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         EnsureNRDResources();
 
     if (SVGFActive()) {
+        Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTSvgf);
         DenoiserCB denoiserCBData = GetDenoiserCBData(true);
 
         // (batch 1, item 1) The pre-blur, and the one thing about it that needs explaining on
@@ -2168,6 +2182,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         if (settings.AtrousIterations % 2 == 0) {
             CopyDynamicRegion(texSSRTDiffuseColor->resource.get(), texVariance->resource.get());
         }
+        Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTSvgf);
     } else if (ReblurSelected() && ReblurReady(false)) {
         // (batch C1) REBLUR_DIFFUSE: pack the raw 2-spp radiance plus the decoded
         // hit distance into NRD's front-end layout, dispatch the instance (with the
@@ -2182,6 +2197,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         CopyDynamicRegion(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
 
     // composite
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTrace);
     {
         uavs.at(0) = main.UAV;
         // (ambient reinjection) The pass doubles as the confidence smoothing filter: it reads
@@ -2203,6 +2219,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 
         resetViews();
     }
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTrace);
 
     // (audit #13) Only when specular will not run afterwards, so the snapshot still
     // happens exactly once per frame and after every temporal pass has read it.

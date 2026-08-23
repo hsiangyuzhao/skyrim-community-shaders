@@ -401,9 +401,17 @@ namespace Util
 			tableSize.y = ImGui::GetTextLineHeightWithSpacing() * (static_cast<float>((totalRows < 15) ? totalRows : 15) + 1.2f);
 		}
 		if (ImGui::BeginTable(table_id, static_cast<int>(headers.size()), flags, tableSize)) {
-			// Set up columns with content-based sizing
+			// Set up columns with content-based sizing. Mark the requested default sort
+			// column so it takes effect before the user clicks any header (without this,
+			// ImGui always starts with column 0 ascending and the sortColumn/ascending
+			// parameters were only honoured for column 0).
 			for (size_t i = 0; i < headers.size(); ++i) {
-				ImGui::TableSetupColumn(headers[i].c_str());
+				ImGuiTableColumnFlags columnFlags = ImGuiTableColumnFlags_None;
+				if (i == sortColumn) {
+					columnFlags |= ImGuiTableColumnFlags_DefaultSort |
+					               (ascending ? ImGuiTableColumnFlags_PreferSortAscending : ImGuiTableColumnFlags_PreferSortDescending);
+				}
+				ImGui::TableSetupColumn(headers[i].c_str(), columnFlags);
 			}
 			ImGui::TableHeadersRow();
 
