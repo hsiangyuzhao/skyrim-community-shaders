@@ -28,6 +28,7 @@
 #include "Utils/FileSystem.h"
 #include "Utils/Format.h"
 #include "Utils/Game.h"
+#include "Utils/GpuTimers.h"
 #include "Utils/UI.h"
 #include <nlohmann/json.hpp>
 
@@ -92,6 +93,10 @@ auto MakeMetricColumn(const auto& theme, auto valueGetter, auto colorGetter, aut
 static std::tuple<float, float, float> CalculateSummaryData(float smoothedFrameTime, float measuredSum)
 {
 	float totalSmoothedDrawCalls = globals::state->GetTotalSmoothedDrawCalls();
+	// GPU-timed feature buckets (SSRT, denoisers, SSGI, Contact AO) explain frame time the
+	// per-shader CPU attribution cannot see; count them as measured so "Other" shrinks by
+	// exactly what those rows display.
+	measuredSum += Util::GpuPassTimers::GetSingleton()->GetActiveBucketsTotalMs();
 	float otherFrameTime = Util::CalculateOtherFrameTime(smoothedFrameTime, measuredSum);
 	float otherPercent = Util::CalculatePercentage(otherFrameTime, smoothedFrameTime);
 	float totalCostPerCall = Util::CalculateCostPerCall(smoothedFrameTime, totalSmoothedDrawCalls);
@@ -250,6 +255,7 @@ void PerformanceOverlay::RestoreDefaultSettings()
 	this->state.maxFrameTime = 0.0f;
 	this->state.smoothedMinFrameTime = 0.0f;
 	this->state.smoothedMaxFrameTime = 50.0f;
+	this->state.statsWindow.Resize(PerformanceOverlay::Settings::kStatsWindowFrames);
 }
 
 void PerformanceOverlay::DataLoaded()
@@ -405,24 +411,69 @@ void PerformanceOverlay::DrawOverlay()
 void PerformanceOverlay::DrawFPS()
 {
 	if (ImGui::BeginTable("FrametimeTargets", 2, ImGuiTableFlags_SizingStretchProp)) {
-		ImGui::TableSetupColumn("##prop", ImGuiTableColumnFlags_WidthFixed, ImGui::GetTextLineHeight() * 5);
+		ImGui::TableSetupColumn("##prop", ImGuiTableColumnFlags_WidthFixed, ImGui::GetTextLineHeight() * 6);
 		ImGui::TableSetupColumn("##value");
 
 		ImGui::TableNextColumn();
 		ImGui::Text(this->state.isFrameGenerationActive ? "Raw FPS:" : "FPS:");
 		ImGui::TableNextColumn();
+		ImGui::Text("%.1f (%.2f ms)", this->state.smoothFps, this->state.smoothFrameTimeMs);
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Instantaneous frame rate, sampled at the configured Update Interval.");
+			}
+		}
 
-		// Check if buffer is full for the avg
-		auto frameData = this->state.frameTimeHistory.GetData();
-		size_t validFrameCount = std::count_if(frameData.begin(), frameData.end(), [](float ft) { return ft > 0.0f; });
-		bool bufferIsFull = validFrameCount == frameData.size();
+		// Rolling statistics over the last kStatsWindowFrames frames: average and 1% Low,
+		// shown alongside the instantaneous value so short stutters remain visible in the
+		// numbers even when the instant readout looks fine.
+		{
+			auto windowData = this->state.statsWindow.GetData();
+			std::vector<float> validFrames;
+			validFrames.reserve(windowData.size());
+			for (float ft : windowData) {
+				if (ft > 0.0f)
+					validFrames.push_back(ft);
+			}
 
-		if (bufferIsFull) {
-			float avgFrameTime = std::accumulate(frameData.begin(), frameData.end(), 0.0f) / frameData.size();
-			float avgFps = (avgFrameTime > 0.001f) ? 1000.0f / avgFrameTime : 0.0f;
-			ImGui::Text("%.1f (%.2f ms) | Avg: %.1f", this->state.smoothFps, this->state.smoothFrameTimeMs, avgFps);
-		} else {
-			ImGui::Text("%.1f (%.2f ms)", this->state.smoothFps, this->state.smoothFrameTimeMs);
+			ImGui::TableNextColumn();
+			ImGui::Text("Avg (%d):", Settings::kStatsWindowFrames);
+			ImGui::TableNextColumn();
+			if (validFrames.size() >= static_cast<size_t>(Settings::kStatsWindowFrames)) {
+				float avgFrameTime = std::accumulate(validFrames.begin(), validFrames.end(), 0.0f) / validFrames.size();
+				float avgFps = Util::CalcFPS(avgFrameTime);
+				ImGui::Text("%.1f (%.2f ms)", avgFps, avgFrameTime);
+				if (ImGui::IsItemHovered()) {
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("Average frame time over the last %d frames.", Settings::kStatsWindowFrames);
+					}
+				}
+
+				// 99th percentile frame time == "1% Low": 99% of recent frames were faster.
+				size_t p99Index = (validFrames.size() * 99) / 100;
+				if (p99Index >= validFrames.size())
+					p99Index = validFrames.size() - 1;
+				std::nth_element(validFrames.begin(), validFrames.begin() + p99Index, validFrames.end());
+				float p99FrameTime = validFrames[p99Index];
+				float lowFps = Util::CalcFPS(p99FrameTime);
+
+				ImGui::TableNextColumn();
+				ImGui::Text("1%% Low:");
+				ImGui::TableNextColumn();
+				ImGui::Text("%.1f (%.2f ms)", lowFps, p99FrameTime);
+				if (ImGui::IsItemHovered()) {
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("99th percentile frame time over the last %d frames:\n99%% of frames were faster than this. Captures stutter\nthat averages hide.", Settings::kStatsWindowFrames);
+					}
+				}
+			} else {
+				ImGui::TextDisabled("collecting...");
+
+				ImGui::TableNextColumn();
+				ImGui::Text("1%% Low:");
+				ImGui::TableNextColumn();
+				ImGui::TextDisabled("collecting...");
+			}
 		}
 
 		if (this->state.isFrameGenerationActive) {
@@ -1327,13 +1378,14 @@ void PerformanceOverlay::DrawDrawCallsTable(const std::vector<DrawCallRow>& main
 	// Create table row handler
 	auto rowHandler = overlay.CreateTableRowHandler(columns);
 
-	// Render the table
+	// Render the table. Default sort: Frame Time descending, so the most expensive
+	// buckets are at the top; the Other/Total summary rows stay pinned at the bottom.
 	Util::ShowSortedStringTableCustom<DrawCallRow>(
 		"DrawCallOverlayTable",
 		[&columns]() { std::vector<std::string> h; for (const auto& c : columns) h.push_back(c.header); return h; }(),
 		mainRowsCopy,
-		0,     // Default sort column (Shader Type)
-		true,  // Default ascending
+		2,      // Default sort column (Frame Time %)
+		false,  // Default descending (most expensive first)
 		sorters,
 		rowHandler,
 		summaryRowsCopy);
@@ -1546,6 +1598,24 @@ std::pair<std::vector<DrawCallRow>, std::vector<DrawCallRow>> PerformanceOverlay
 		mainRows.push_back({ label, typeIndex, static_cast<int>(drawCalls), frameTime, percent, costPerCall, tooltip, enabled, testFrameTime, testCostPerCall });
 		measuredSum += frameTime;
 	});
+
+	// GPU-timed feature buckets (D3D11 timestamp queries around our own compute passes).
+	// These rows are what makes an SVGF vs REBLUR comparison directly readable: each
+	// denoiser has its own bucket, so switching the SSRT Denoiser dropdown swaps which row
+	// is shown and the milliseconds can be compared 1:1. Their sum is folded into "Other"
+	// inside CalculateSummaryData, so it must NOT be added to measuredSum here.
+	Util::GpuPassTimers::GetSingleton()->ForEachActiveBucket(
+		[&mainRows, smoothedFrameTime, this](const char* label, int rowId, float ms, const char* tooltip) {
+			float percent = Util::CalculatePercentage(ms, smoothedFrameTime);
+			std::optional<float> testFrameTime, testCostPerCall;
+			auto it = this->testData.find(rowId);
+			if (it != this->testData.end()) {
+				testFrameTime = it->second.frameTime;
+				testCostPerCall = it->second.costPerCall;
+			}
+			mainRows.push_back({ std::string(label) + ":", rowId, kDrawCallsNotApplicable, ms, percent,
+				0.0f, tooltip, true, testFrameTime, testCostPerCall });
+		});
 
 	auto [otherFrameTime, otherPercent, totalCostPerCall] = CalculateSummaryData(smoothedFrameTime, measuredSum);
 	if (std::abs(otherFrameTime) < 1e-4f)
@@ -1923,6 +1993,10 @@ void PerformanceOverlay::UpdateGraphValues()
 	// Insert latest frame time into circular buffer
 	float oldFrameTime = state.frameTimeHistory.GetData()[state.frameTimeHistory.GetHeadIdx()];  // what is the point of oldFrameTime?
 	state.frameTimeHistory.Push(state.frameTimeMs);
+
+	// Feed the fixed rolling window behind the Avg / 1% Low readouts
+	state.statsWindow.Resize(Settings::kStatsWindowFrames);
+	state.statsWindow.Push(state.frameTimeMs);
 
 	// Maintain instantaneous min/max tracking
 	if (state.frameTimeMs > state.maxFrameTime) {

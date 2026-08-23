@@ -5,6 +5,7 @@
 #include "Deferred.h"
 #include "State.h"
 #include "Util.h"
+#include "Utils/GpuTimers.h"
 
 // (directional env v2) For the cubemap / skylighting SRVs the GI pass now binds and the
 // `loaded` tests the compile round keys its defines on. Globals.h only forward-declares these.
@@ -1011,6 +1012,8 @@ void ScreenSpaceGI::DrawSSGI()
 	context->CSSetConstantBuffers(1, 1, &cb);
 	context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
 
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSGI);
+
 	// prefilter depths
 	{
 		TracyD3D11Zone(globals::state->tracyCtx, "SSGI - Prefilter Depths");
@@ -1178,6 +1181,8 @@ void ScreenSpaceGI::DrawSSGI()
 		lastFrameAccumTexIdx = !lastFrameAccumTexIdx;
 	}
 
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSGI);
+
 	// contact AO
 	//
 	// Placed after the GI/blur chain and before the upsample, because in half and quarter res the
@@ -1200,6 +1205,7 @@ void ScreenSpaceGI::DrawSSGI()
 	// compile, and in that case the pass must be skipped rather than dispatched with a null shader.
 	if (contactAoActive) {
 		TracyD3D11Zone(globals::state->tracyCtx, "SSGI - Contact AO");
+		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSGIContactAO);
 
 		resetViews();
 		srvs.at(0) = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].depthSRV;
@@ -1222,10 +1228,13 @@ void ScreenSpaceGI::DrawSSGI()
 
 		contactIdx = !contactIdx;
 		lastFrameContactIdx = contactIdx;
+
+		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSGIContactAO);
 	}
 
 	// upsample
 	if (settings.ResolutionMode != 0) {
+		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSGI);
 		resetViews();
 		srvs.at(0) = texWorkingDepth->srv.get();
 		srvs.at(1) = texAo[inputAoTexIdx]->srv.get();
@@ -1255,6 +1264,8 @@ void ScreenSpaceGI::DrawSSGI()
 		inputAoTexIdx = !inputAoTexIdx;
 		inputGITexIdx = !inputGITexIdx;
 		aoOutIdx = inputAoTexIdx;
+
+		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSGI);
 	}
 
 	outputAoIdx = aoOutIdx;

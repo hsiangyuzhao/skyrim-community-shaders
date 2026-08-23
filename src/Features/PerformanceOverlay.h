@@ -205,6 +205,10 @@ struct PerformanceOverlay : OverlayFeature
 		CircularBuffer<float> frameTimeHistory;
 		CircularBuffer<float> postFGFrameTimeHistory;
 
+		// Fixed rolling window feeding the Avg / 1% Low readouts (independent of the
+		// user-sized graph history so the statistics window never changes meaning).
+		CircularBuffer<float> statsWindow;
+
 		// State flags
 		bool isFrameGenerationActive = false;
 
@@ -264,6 +268,7 @@ struct PerformanceOverlay : OverlayFeature
 		static constexpr float kDefaultFrameTimeMs = 16.67f;         // ms - Default frame time (60 FPS)
 		static constexpr int kMinFrameHistorySize = 120;             // 2s @ 60fps, 0.5s @ 240fps
 		static constexpr int kMaxFrameHistorySize = 1800;            // 30s @ 60fps, 7.5s @ 240fps
+		static constexpr int kStatsWindowFrames = 120;               // rolling window for Avg / 1% Low
 
 		bool ShowInOverlay = true;  // was: Enabled
 		bool ShowDrawCalls = true;
