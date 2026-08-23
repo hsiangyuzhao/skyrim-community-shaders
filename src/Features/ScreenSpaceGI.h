@@ -201,6 +201,12 @@ public:
 	// holds working-res history in one slot and, in half/quarter modes, the full-res upsample in
 	// the other.
 	eastl::unique_ptr<Texture2D> texBentNormal[2] = { nullptr };
+	// (directional env v2) Hemisphere environment irradiance ping-pong, R16G16B16A16_FLOAT:
+	// RGB = linear irradiance integrated over the unoccluded bins (premultiplied), A = the
+	// march's coverage/confidence. Radiance data, so it rides the IL chain's index exactly like
+	// texIlCoCg -- reprojection, blur and upsample all filter it with the IL weights, never in
+	// a vector domain.
+	eastl::unique_ptr<Texture2D> texEnvIrradiance[2] = { nullptr };
 
 	inline auto GetOutputTextures()
 	{
@@ -210,11 +216,12 @@ public:
 					   texIlY[outputIlIdx]->srv.get(),
 					   texIlCoCg[outputIlIdx]->srv.get(),
 					   texGiSpecular[outputSpecularIdx]->srv.get(),
-					   texBentNormal[outputIlIdx]->srv.get()) :
+					   texBentNormal[outputIlIdx]->srv.get(),
+					   texEnvIrradiance[outputIlIdx]->srv.get()) :
 		           std::make_tuple(
 					   (ID3D11ShaderResourceView*)nullptr, (ID3D11ShaderResourceView*)nullptr,
 					   (ID3D11ShaderResourceView*)nullptr, (ID3D11ShaderResourceView*)nullptr,
-					   (ID3D11ShaderResourceView*)nullptr);
+					   (ID3D11ShaderResourceView*)nullptr, (ID3D11ShaderResourceView*)nullptr);
 	}
 
 	winrt::com_ptr<ID3D11SamplerState> linearClampSampler = nullptr;

@@ -401,7 +401,7 @@ void Deferred::DeferredPasses()
 	auto& ssgi = globals::features::screenSpaceGI;
 	if (ssgi.loaded)
 		ssgi.DrawSSGI();
-	auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec, ssgi_bent_normal] = ssgi.GetOutputTextures();
+	auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec, ssgi_bent_normal, ssgi_env_irradiance] = ssgi.GetOutputTextures();
 	bool ssgi_hq_spec = ssgi.settings.EnableExperimentalSpecularGI;
 
 	auto& ssrt = globals::features::screenSpaceRayTracing;
@@ -460,11 +460,16 @@ void Deferred::DeferredPasses()
 			// GetCommonBufferData clears when EnableDiffuse is off, so a null binding here can
 			// never be read.
 			(ssrt.loaded && ssrt.settings.EnableDiffuse) ? ssrt.texSSRTDiffuseConfidenceSmooth->srv.get() : nullptr,
-			// t20 (directional env) SSGI's bent normal + aperture at output resolution. The
-			// shader-side consumer is gated on ssgiSettings.EnableDirectionalEnv, which
-			// ScreenSpaceGI::GetCommonBufferData zeroes whenever the feature is not actually
-			// running, so a null binding here can never be read.
+			// t20 (directional env) SSGI's bent normal + aperture at output resolution. Not
+			// read by the composite since v2 (the consumer moved to the irradiance surface
+			// below); still produced and bound, reserved for the specular-occlusion consumer.
 			ssgi_bent_normal,
+			// t21 (directional env v2) SSGI's hemisphere environment irradiance at output
+			// resolution (premultiplied RGB + confidence A). The shader-side consumer is gated
+			// on ssgiSettings.EnableDirectionalEnv, which ScreenSpaceGI::GetCommonBufferData
+			// zeroes whenever the feature is not actually running, so a null binding here can
+			// never be read.
+			ssgi_env_irradiance,
 		};
 
 		ID3D11SamplerState* samplers[]{
@@ -486,7 +491,7 @@ void Deferred::DeferredPasses()
 
 	// Clear
 	{
-		ID3D11ShaderResourceView* views[21]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+		ID3D11ShaderResourceView* views[22]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
 		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
 
 		ID3D11UnorderedAccessView* uavs[3]{ nullptr, nullptr, nullptr };

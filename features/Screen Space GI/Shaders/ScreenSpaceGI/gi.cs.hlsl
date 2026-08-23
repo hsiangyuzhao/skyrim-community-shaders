@@ -34,6 +34,15 @@
 #include "Common/VR.hlsli"
 #include "ScreenSpaceGI/common.hlsli"
 
+// (directional env v2) Cross-feature include, same pattern and same justification as
+// ssrt_raymarch.hlsl: the include only exists when the C++ side confirmed the Skylighting
+// feature is installed (the SKYLIGHTING define is derived from `loaded`), and at runtime all
+// installed features share one merged Data/Shaders tree, so the path resolves whenever the
+// define is set.
+#if defined(DYNAMIC_CUBEMAPS) && defined(SKYLIGHTING)
+#	include "Skylighting/Skylighting.hlsli"
+#endif
+
 #define RCP_PI (0.31830988618)
 
 Texture2D<float> srcWorkingDepth : register(t0);
@@ -48,6 +57,22 @@ Texture2D<float4> srcPrevGISpecular : register(t8);    // maybe half-res
 // (directional env) Reprojected bent-normal history, written by radianceDisocc.cs.hlsl the same
 // way srcPrevAo is. Encoding: see SSGI_EncodeBentNormal in common.hlsli.
 Texture2D<unorm float4> srcPrevBentNormal : register(t9);  // maybe half-res
+#if defined(DYNAMIC_CUBEMAPS)
+// (directional env v2) Reprojected environment-irradiance history, written by
+// radianceDisocc.cs.hlsl the same way srcPrevIlY is. RGB = linear hemisphere irradiance
+// premultiplied by the confidence in A (see the write in main()); it is RADIANCE data and is
+// filtered exactly like the IL channels, never like the bent-normal vector.
+Texture2D<float4> srcPrevEnvIrradiance : register(t10);  // maybe half-res
+// The live dynamic-cubemap pair, bound only while the DynamicCubemaps feature is loaded (the
+// define is derived from `loaded` on the C++ side). Same semantics as in the SSRT ray march:
+// EnvTexture is the sky-free capture, EnvReflectionsTexture includes the sky.
+TextureCube<float3> EnvTexture : register(t11);
+TextureCube<float3> EnvReflectionsTexture : register(t12);
+#	if defined(SKYLIGHTING)
+Texture3D<sh2> SkylightingProbeArray : register(t13);
+Texture2DArray<float3> stbn_vec3_2Dx1D_128x128x64 : register(t14);
+#	endif
+#endif
 
 RWTexture2D<unorm float> outAo : register(u0);
 RWTexture2D<float4> outY : register(u1);
@@ -55,6 +80,9 @@ RWTexture2D<float2> outCoCg : register(u2);
 RWTexture2D<float4> outGISpecular : register(u3);
 RWTexture2D<half3> outPrevGeo : register(u4);
 RWTexture2D<unorm float4> outBentNormal : register(u5);
+#if defined(DYNAMIC_CUBEMAPS)
+RWTexture2D<float4> outEnvIrradiance : register(u6);
+#endif
 
 float GetDepthFade(float depth)
 {
@@ -242,10 +270,85 @@ void IntegrateBitfield(
 	}
 }
 
+#if defined(DYNAMIC_CUBEMAPS)
+///////////////////////////////////////////////////////////////////////////////
+// (directional env v2) Per-direction environment radiance, replicated from the SSRT diffuse
+// fallback (ssrt_raymarch.hlsl:1012-1070) -- the reference integrand this channel exists to
+// reproduce inside the bitmask sweep. Line-by-line correspondence:
+//
+//   * mip: the diffuse fallback samples the cubemap at mip 2 (ssrt_raymarch.hlsl:1018), fine
+//     enough that sky and wall stay separate texels (32x32 per face on the 128^2 capture,
+//     ~2.8 degrees per texel). v1's aperture-driven coarse mip (up to the 2x2 level) is exactly
+//     what averaged the whole scene into one tint; reference-identical mip 2 is the fix.
+//   * normalisation: the same DALC-luminance / cubemap-mip-15-luminance ratio the fallback
+//     applies with CubemapNormalization = 1 (:1020 numerator, :1060/:1064 application), with
+//     two deliberate, documented deviations for THIS consumption chain:
+//       - no ReflectionNormalisationScale. In SSRT that 0.65 cancels against the consumer's
+//         1/PBRLightingScale (same 0.65 constant) when the radiance meets
+//         `linAlbedo = IrradianceToLinear(albedo / PBRLightingScale)`. This channel's re-add is
+//         multiplied by the raw gamma-space albedo in DeferredCompositeCS, so carrying the 0.65
+//         here would darken the whole ambient by a third with nothing to cancel it.
+//       - Color::Ambient() wraps the DALC sample. Identity without Linear Lighting; with LL it
+//         is the ambient-gamma shaping the composite's own A_est applies to the very term this
+//         replaces (DeferredCompositeCS directionalAmbientColor), so parity survives LL.
+//   * skylighting: applied to the SKY part only, exactly like :1058-1061. The visibility comes
+//     in per DIRECTION from the caller (see the segment loop) instead of once per ray.
+//   * Color::IrradianceToLinear at the end (:1070): the integral accumulates in linear space,
+//     which is also the space the IL chain filters in.
+///////////////////////////////////////////////////////////////////////////////
+
+// Verbatim duplicate of SSRT_CubemapNormalizationRatio (ssrt_raymarch.hlsl:696, guard G7),
+// including the non-finiteness fallback to 1.0. Duplicated rather than included: features must
+// not #include across feature directories that may be absent at runtime.
+float DirEnvNormalizationRatio(float ambientLuminance, float envLuminance)
+{
+	float ratio = ambientLuminance / max(envLuminance, 1e-4);
+	return isFiniteSafe(ratio) ? ratio : 1.0;
+}
+
+static const float DIR_ENV_SAMPLE_MIP = 2.0;
+
+float3 DirEnvSampleEnvironment(float3 dirWS, float skyVisibility)
+{
+	float directionalAmbientLuminance = Color::RGBToLuminance(Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(dirWS, 1.0)))));
+	float3 envColor;
+	float envLuminance;
+#	if defined(SKYLIGHTING)
+	[branch] if (!SharedData::InInterior) {
+		float3 envNoSkyColor = EnvTexture.SampleLevel(samplerLinearClamp, dirWS, DIR_ENV_SAMPLE_MIP);
+		float3 envSkyColor = EnvReflectionsTexture.SampleLevel(samplerLinearClamp, dirWS, DIR_ENV_SAMPLE_MIP);
+		float3 skyColor = max(envSkyColor - envNoSkyColor, 0);
+		// Level 15 clamps to the top of the chain -- the same "mean luminance" fetch the
+		// reference uses (:1059).
+		envLuminance = Color::RGBToLuminance(EnvTexture.SampleLevel(samplerLinearClamp, dirWS, 15));
+		envColor = envNoSkyColor * DirEnvNormalizationRatio(directionalAmbientLuminance, envLuminance);
+		envColor += skyColor * skyVisibility;
+	} else {
+		envColor = EnvReflectionsTexture.SampleLevel(samplerLinearClamp, dirWS, DIR_ENV_SAMPLE_MIP);
+		envLuminance = Color::RGBToLuminance(EnvReflectionsTexture.SampleLevel(samplerLinearClamp, dirWS, 15));
+		envColor *= DirEnvNormalizationRatio(directionalAmbientLuminance, envLuminance);
+	}
+#	else
+	envColor = EnvReflectionsTexture.SampleLevel(samplerLinearClamp, dirWS, DIR_ENV_SAMPLE_MIP);
+	envLuminance = Color::RGBToLuminance(EnvReflectionsTexture.SampleLevel(samplerLinearClamp, dirWS, 15));
+	envColor *= DirEnvNormalizationRatio(directionalAmbientLuminance, envLuminance);
+#	endif
+	return Color::IrradianceToLinear(envColor);
+}
+
+// Segment width of the run-length sweep over the unoccluded bits, in bins. Per-bin sampling
+// (up to 128 environment lookups per pixel) exceeds any sane budget, so contiguous unoccluded
+// runs are cut into segments of at most this many bins and each segment takes ONE environment
+// lookup at its mean direction, weighted by the segment's analytic cosine measure. 4 bins =
+// 22.5 degrees of arc, which is finer than the sky/wall structures the mip-2 sample resolves
+// matters for -- the horizon line lands within one segment of its true elevation.
+static const uint SSGI_ENV_SEG_BITS = 4;
+#endif
+
 void CalculateGI(
 	uint2 dtid, float2 uv, float viewspaceZ, float3 viewspaceNormal,
 	out float o_ao, out sh2 o_currY, out float2 o_currCoCg, out float4 o_currGIAOSpecular,
-	out float3 o_bentNormalWS, out float o_bentAperture)
+	out float3 o_bentNormalWS, out float o_bentAperture, out float4 o_envIrradiance)
 {
 	const float2 frameScale = FrameDim * RcpTexDim;
 
@@ -281,6 +384,43 @@ void CalculateGI(
 	// flip foliage normal
 	if (dot(viewVec, pixCenterPos) > 0)
 		viewspaceNormal = -viewspaceNormal;
+
+#ifdef DYNAMIC_CUBEMAPS
+	// (directional env v2) Whether the environment integration runs at all. Both gates are
+	// runtime cbuffer reads, so toggling either feature needs no SSGI recompile:
+	//  * EnableDirectionalEnv is pre-multiplied on the C++ side with "SSGI loaded and enabled";
+	//  * with SSRT diffuse active this channel steps aside (the composite would ignore the
+	//    surface anyway -- same A/B gate it uses), so the integration cost is not paid twice.
+	const bool envActive = SharedData::ssgiSettings.EnableDirectionalEnv != 0 && !(SharedData::ssrtSettings.DiffuseMult > 0.0);
+	float3 envIrradiance = 0;
+#	ifdef SKYLIGHTING
+	// Per-pixel skylighting state for the per-direction sky visibility, mirroring the SSRT
+	// diffuse fallback's recipe (ssrt_raymarch.hlsl:1029-1052) with one deliberate change,
+	// forced by budget and reported as a deviation: the reference re-samples the probe SH per
+	// ray (8 taps of the 3D array each time) and collapses it to one scalar through the
+	// surface-normal cosine lobe; at up to 32 environment segments per pixel that is untenable,
+	// and a cosine-lobe scalar is not "per direction" anyway. Instead the probe SH is fetched
+	// ONCE per pixel, biased along the receiver normal exactly like the forward diffuse path
+	// (DeferredCompositeCS ambientSkylightingSH), and each segment reconstructs the visibility
+	// in its own direction via SphericalHarmonics::Unproject -- the same SH, evaluated where the
+	// segment actually points, which is the quantity the reference's per-ray scalar
+	// approximates. The fade / upward-boost / MinDiffuseVisibility shaping is reproduced
+	// verbatim; boost and fade are direction-independent and hoisted here.
+	sh2 envSkySH = float4(sqrt(4.0 * Math::PI), 0, 0, 0);  // "fully open" prior, matches Skylighting's own unitSH
+	float envSkyFade = 0.0;
+	float envSkyBoost = 1.0;
+	[branch] if (envActive && !SharedData::InInterior) {
+		float3 envPositionMS = ViewToWorldPosition(pixCenterPos, FrameBuffer::CameraViewInverse[eyeIndex]);
+#		ifdef VR
+		envPositionMS += FrameBuffer::CameraPosAdjust[eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+#		endif
+		float3 receiverNormalWS = ViewToWorldVector(viewspaceNormal, FrameBuffer::CameraViewInverse[eyeIndex]);
+		envSkySH = Skylighting::sample(SharedData::skylightingSettings, SkylightingProbeArray, stbn_vec3_2Dx1D_128x128x64, dtid, envPositionMS, receiverNormalWS);
+		envSkyFade = Skylighting::getFadeOutFactor(envPositionMS);
+		envSkyBoost = 1.0 + saturate(receiverNormalWS.z) * (1.0 - SharedData::skylightingSettings.MinDiffuseVisibility);
+	}
+#	endif
+#endif
 
 	float visibility = 0;
 	float visibilitySpecular = 0;
@@ -553,6 +693,67 @@ void CalculateGI(
 			bentMomentVS += bentMoment;
 		}
 
+#ifdef DYNAMIC_CUBEMAPS
+		// (directional env v2) Environment radiance over the same unoccluded bins, run-length
+		// swept in segments of at most SSGI_ENV_SEG_BITS. Each segment takes one reference-grade
+		// environment lookup (see DirEnvSampleEnvironment) at the segment's mean direction and
+		// enters the sum with the segment's analytic COSINE measure -- the exact weight the IL
+		// chroma uses (wc_b = |projN| * cos(theta_b) * |sin(theta_view)| * sin(PI/32), summed by
+		// IntegrateBitfield over the segment's bins). Occluded bins carry the screen-space IL,
+		// unoccluded bins carry this; the two halves therefore tile one hemisphere under one
+		// normalisation, which is what makes the result an irradiance rather than a tint.
+		//
+		// Loop bounds: every segment consumes at least one bit of `openBits`, so the sweep is
+		// hard-bounded at 32 iterations; a typical horizon-shaped mask yields 1-2 runs and a
+		// fully open slice exactly 32 / SSGI_ENV_SEG_BITS = 8 segments.
+		[branch] if (envActive) {
+			uint openBits = ~bitmaskBent;
+			[loop] while (openBits != 0) {
+				uint segStart = (uint)firstbitlow(openBits);
+				uint shifted = openBits >> segStart;
+				uint inverted = ~shifted;
+				// `shifted` has its run starting at bit 0; the first zero above it ends the run.
+				// A fully open field is the one case with no zero at all (segStart 0, shifted
+				// all-ones), where firstbitlow's input would be 0 and its result undefined.
+				uint runLength = inverted != 0 ? (uint)firstbitlow(inverted) : SSGI_MAX_RAY;
+				uint segLength = min(runLength, SSGI_ENV_SEG_BITS);
+				uint segMask = ((1u << segLength) - 1u) << segStart;  // segLength <= 4, shift well-defined
+				openBits &= ~segMask;
+
+				float segWeight, segCosineWeight;
+				float3 segMoment;
+				IntegrateBitfield(
+					segMask,
+					projectedNormalNorm, projectedNormalTangent,
+					projectedNormalVecLength, sinNorm, cosNorm,
+					viewspaceNormal, false,
+					segWeight, segMoment, segCosineWeight);
+
+				// The solid-angle moment IS the segment's mean direction (up to length): the
+				// same quadrature that weights the segment also points it, so direction and
+				// weight cannot disagree. Never degenerate for a contiguous <= 22.5-degree
+				// segment, but guarded anyway -- a zero-weight or zero-moment segment simply
+				// contributes nothing, same as an occluded bin.
+				float segMomentLen = length(segMoment);
+				[branch] if (segCosineWeight > 1e-6 && segMomentLen > 1e-6) {
+					float3 segDirWS = ViewToWorldVector(segMoment / segMomentLen, FrameBuffer::CameraViewInverse[eyeIndex]);
+					float skyVisibility = 1.0;
+#	ifdef SKYLIGHTING
+					// Per-direction sky visibility: reconstruct the per-pixel probe SH in the
+					// segment direction, then apply the reference's shaping chain in its
+					// original order (fade towards 1 outside the probe volume, upward boost,
+					// MinDiffuseVisibility floor -- ssrt_raymarch.hlsl:1046-1052).
+					float visRaw = saturate(SphericalHarmonics::Unproject(envSkySH, segDirWS));
+					skyVisibility = lerp(1.0, visRaw, envSkyFade);
+					skyVisibility *= envSkyBoost;
+					skyVisibility = Skylighting::mixDiffuse(SharedData::skylightingSettings, skyVisibility);
+#	endif
+					envIrradiance += DirEnvSampleEnvironment(segDirWS, skyVisibility) * segCosineWeight;
+				}
+			}
+		}
+#endif
+
 		visibility += countbits(bitmask) * 0.03125;
 
 #if defined(GI) && defined(GI_SPECULAR)
@@ -594,6 +795,26 @@ void CalculateGI(
 
 	o_bentNormalWS = ViewToWorldVector(bentNormalVS, FrameBuffer::CameraViewInverse[eyeIndex]);
 	o_bentAperture = bentAperture;
+
+	// (directional env v2) Hemisphere environment irradiance, PREMULTIPLIED by the confidence
+	// stored in A. rcpNumSlices is the whole normalisation, for the same reason as radianceY:
+	// the azimuthal PI/NumSlices and Lambert's 1/PI cancel, and the per-slice cosine measure
+	// already integrates a fully covered hemisphere to 1 -- so a constant-radiance environment
+	// comes out at exactly that radiance.
+	//
+	// The confidence fades with depthFade like every other channel, but the composite CONSUMES
+	// it differently: it lerps between this surface and the flat vanilla ambient by A, so at
+	// range the channel hands back to the isotropic ambient instead of fading the light itself
+	// to black. Premultiplied storage is what keeps that blend correct through every downstream
+	// filter -- reprojection taps, blur and upsample all blend RGB and A with the same weights,
+	// which is only meaningful when RGB already carries its own coverage.
+	o_envIrradiance = 0;
+#ifdef DYNAMIC_CUBEMAPS
+	{
+		float envConfidence = envActive ? (1.0 - depthFade) : 0.0;
+		o_envIrradiance = float4(envIrradiance * rcpNumSlices * envConfidence, envConfidence);
+	}
+#endif
 
 #ifdef GI
 	// Assemble the SH2 radiance projection from the accumulated mass and first moment. This is
@@ -670,13 +891,19 @@ void CalculateGI(
 	// closest thing to the isotropic ambient it replaces.
 	float3 bentNormalWS = worldNormal;
 	float bentAperture = 1.0;
+	// (directional env v2) Default is "no data": zero irradiance, zero confidence. The
+	// composite lerps by the confidence, so sky, first-person geometry and everything beyond
+	// the fade range fall back to the flat vanilla ambient rather than to black -- the same
+	// degrade target the v1 open-prior aimed for, reached through the weight instead of
+	// through a fabricated direction.
+	float4 currEnvIrradiance = 0;
 
 	bool needGI = viewspaceZ > FP_Z && viewspaceZ < DepthFadeRange.y;
 	if (needGI) {
 		CalculateGI(
 			pxCoord, uv, viewspaceZ, viewspaceNormal,
 			currAo, currY, currCoCg, currGIAOSpecular,
-			bentNormalWS, bentAperture);
+			bentNormalWS, bentAperture, currEnvIrradiance);
 
 #ifdef TEMPORAL_DENOISER
 		const float accumFrames = srcAccumFrames[pxCoord] * 255;
@@ -702,6 +929,14 @@ void CalculateGI(
 		currAo = lerp(srcPrevAo[pxCoord], currAo, lerpFactorAo);
 		currY = lerp(srcPrevY[pxCoord], currY, lerpFactor);
 		currCoCg = lerp(srcPrevCoCg[pxCoord], currCoCg, lerpFactor);
+#	ifdef DYNAMIC_CUBEMAPS
+		// (directional env v2) Radiance data on the IL chain, so it shares the IL channels'
+		// FULL temporal window (lerpFactor), not the AO/bent-normal shortened one: like Y/CoCg
+		// it is spatially filtered afterwards and additively consumed, so the long window
+		// suppresses the segment-sampling noise the way it suppresses IL noise. Componentwise
+		// lerp is correct for premultiplied data -- RGB and A age together.
+		currEnvIrradiance = lerp(srcPrevEnvIrradiance[pxCoord], currEnvIrradiance, lerpFactor);
+#	endif
 
 		// (directional env) Bent-normal history EMA, in the decoded VECTOR domain - lerping the
 		// octahedral encoding across its fold lines fabricates directions (see the codec note in
@@ -734,6 +969,13 @@ void CalculateGI(
 	currY = clamp(filterInf(filterNaN(currY)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
 	currCoCg = clamp(filterInf(filterNaN(currCoCg)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
 	currGIAOSpecular = clamp(filterInf(filterNaN(currGIAOSpecular)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
+#ifdef DYNAMIC_CUBEMAPS
+	// (guard, same discipline as N3/N5) This is a writer of the env-irradiance history, and its
+	// target is a float format that CAN store a non-finite value, so the same containment
+	// applies. The floor is 0 rather than -SSGI_MAX_OUTPUT: premultiplied radiance and its
+	// confidence are both non-negative by construction, and clamping says so.
+	currEnvIrradiance = clamp(filterInf(filterNaN(currEnvIrradiance)), 0, SSGI_MAX_OUTPUT);
+#endif
 
 	outAo[pxCoord] = currAo;
 	outY[pxCoord] = currY;
@@ -743,6 +985,9 @@ void CalculateGI(
 	// self-heals - the next frame's history tap decodes to a valid unit vector regardless of
 	// what the poisoned write clamped to.
 	outBentNormal[pxCoord] = SSGI_EncodeBentNormal(bentNormalWS, bentAperture);
+#ifdef DYNAMIC_CUBEMAPS
+	outEnvIrradiance[pxCoord] = currEnvIrradiance;
+#endif
 #ifdef GI_SPECULAR
 	outGISpecular[pxCoord] = currGIAOSpecular;
 #endif

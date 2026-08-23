@@ -42,7 +42,18 @@ Texture2D<float4> SsgiSpecularTexture : register(t13);
 // RG = octahedral world-space bent normal, B = aperture (0 = pinhole, 1 = open hemisphere),
 // A = spare. t20 is the composite's first free SRV slot (t14/t15 IBL, t16/t19 SSRT, t17/t18
 // Physical Sky, t17 also SharedData's DepthTexture).
+//
+// (directional env v2) No longer read here -- the v2 channel consumes the pre-integrated
+// irradiance below instead of sampling the cubemap along one direction. The surface, its
+// binding and its decoder stay: the whole vector-domain pipeline still produces it every
+// frame, reserved for the planned specular-occlusion consumer.
 Texture2D<unorm float4> SsgiBentNormalTexture : register(t20);
+// (directional env v2) Full-resolution hemisphere environment irradiance from Screen Space
+// GI's bitmask sweep: RGB = linear irradiance integrated over the UNOCCLUDED directions (each
+// direction cubemap-sampled at the SSRT-fallback mip, DALC-ratio normalised, skylighting
+// visibility applied), PREMULTIPLIED by A = confidence (march coverage; 0 = no data). t21 is
+// the next free slot after t20 -- see the map above.
+Texture2D<float4> SsgiEnvIrradianceTexture : register(t21);
 
 // Decoder duplicated from features/Screen Space GI/Shaders/ScreenSpaceGI/common.hlsli
 // (SSGI_DecodeBentNormal) on purpose: package shaders must not #include across a feature
@@ -159,35 +170,13 @@ bool DirEnvIsFinite(float v)
 	return (asuint(v) & 0x7F800000u) != 0x7F800000u;
 }
 
-// (directional env) Anchor luminance for the directional environment channel: the brightness
-// the game's own ambient would have along the bent direction, i.e. DALC luminance plus - when
-// Image Based Lighting drives the ambient - the IBL probe luminance, mirroring exactly how the
-// diffuse ambient estimate in main() splits the two (DALCAmount scale, probe added on top).
-// Used ONLY by the new channel; E1's specular normalisation and SSRT's internal fallbacks keep
-// their own established copies untouched.
-float DirectionalEnvAnchorLuma(float3 bentNormalWS
-#	if defined(COMPOSITE_AMBIENT_SKY)
-	,
-	float skyVisibility
-#	endif
-)
-{
-	float luma = Color::RGBToLuminance(Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(bentNormalWS, 1.0)))));
-#	if defined(IBL)
-	[branch] if (SharedData::iblSettings.EnableDiffuseIBL != 0 &&
-		(!SharedData::InInterior || SharedData::iblSettings.EnableInterior != 0)) {
-		luma *= SharedData::iblSettings.DALCAmount;
-#		if defined(COMPOSITE_AMBIENT_SKY)
-		float3 iblColor = ImageBasedLighting::GetIBLColor(-bentNormalWS, skyVisibility);
-#		else
-		float3 iblColor = ImageBasedLighting::GetIBLColor(-bentNormalWS);
-#		endif
-		iblColor = Color::IrradianceToGamma(Color::Saturation(iblColor, SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale);
-		luma += Color::RGBToLuminance(iblColor);
-	}
-#	endif
-	return luma;
-}
+// (directional env v2) v1's DirectionalEnvAnchorLuma helper (DALC + IBL-probe luminance along
+// the bent direction) is gone: the luminance anchor now rides INSIDE the integral -- gi.cs.hlsl
+// normalises every sampled direction by its own DALC-luminance / cubemap-mean-luminance ratio,
+// the same construction the SSRT diffuse fallback uses with CubemapNormalization = 1
+// (ssrt_raymarch.hlsl:1020/:1060). That is what "EnvLevel = 1 matches the level of the ambient
+// this replaces" now rests on, and it is per-direction, so shadowed openings keep their own
+// (dimmer, cooler) level instead of being re-lit to the anchor.
 #endif
 
 #if defined(PHYSICAL_SKY)
@@ -380,62 +369,47 @@ float DirectionalEnvAnchorLuma(float3 bentNormalWS
 	float3 ambientReAddColor = directionalAmbientColor;
 
 #	if defined(SSGI) && defined(DYNAMIC_CUBEMAPS)
-	// (directional env) B2: replace the CHROMA SOURCE of the re-added ambient. Instead of the
-	// flat DALC/IBL tint, sample the dynamic cubemap along SSGI's bent normal - the mean
-	// unoccluded direction - so a doorway wall facing the warm outside and one facing the cool
-	// interior pick up different tints from the actual scene. The luminance scale comes from
-	// anchoring the cubemap sample (normalised by its own coarsest-mip mean luminance, the same
-	// trick the specular env path uses) to the DALC+IBL luminance along that direction, so at
-	// EnvLevel = 1 the overall level matches the ambient this replaces.
+	// (directional env v2) Swap the re-added ambient for SSGI's pre-integrated hemisphere
+	// environment irradiance. v1 sampled the cubemap along ONE direction (the bent normal) at
+	// an aperture-picked coarse mip, which made the chroma the cubemap's scene-average tint and
+	// pushed it over the whole frame; the integral replaces that with "what this pixel's OPEN
+	// directions actually see", each direction normalised against the game's own ambient level
+	// and attenuated by the sky's visibility -- so shadowed openings go dimmer and sky-toned,
+	// exactly like the SSRT diffuse fallback this integral is copied from.
 	//
-	// Runtime gates, no recompile needed for any of them:
+	// Runtime gates, no recompile needed for any of them (unchanged from v1):
 	//  * EnableDirectionalEnv is pre-multiplied on the C++ side with "SSGI loaded and enabled".
 	//  * With SSRT diffuse active (DiffuseMult > 0) this channel steps aside, exactly like the
-	//    SSGI IL gate further down: SSRT's traced radiance already answers "what arrives from
-	//    the environment", and this is the A/B switch between the two approaches.
-	//
-	// The APERTURE is used for mip selection only, NOT as an occlusion factor: ssgiAo already
-	// darkens this very term through multiBounceAO below, and Skylighting/contact occlusion
-	// enter through their own established points, so letting the aperture attenuate as well
-	// would count the same occlusion twice. Trade-off accepted for this version: a sealed pixel
-	// gets a sharp but heavily AO-darkened sample instead of a second darkening.
+	//    SSGI IL gate further down - the A/B switch between the two approaches.
 	[branch] if (SharedData::ssgiSettings.EnableDirectionalEnv != 0
 #		if defined(SSRT)
 				 && !(SharedData::ssrtSettings.DiffuseMult > 0.0)
 #		endif
 	) {
-		float3 bentNormalWS;
-		float bentAperture;
-		SSGI_DecodeBentNormal(SsgiBentNormalTexture[dispatchID.xy], bentNormalWS, bentAperture);
+		float4 envIrradiance = SsgiEnvIrradianceTexture[dispatchID.xy];
+		// A is the march's coverage: RGB is premultiplied by it, so un-premultiply before use
+		// and let A itself blend the channel against the flat ambient below. That one blend
+		// covers every "no data" state at once - sky, first person, beyond the depth fade, the
+		// feature warming up after a toggle - all of which degrade to the vanilla ambient
+		// rather than to black or to a fabricated direction.
+		float envWeight = saturate(envIrradiance.w);
+		// EnvLevel scales the LINEAR irradiance, so the slider brightens the visible result
+		// linearly without touching its chroma; the gamma conversion puts the value in the same
+		// units as the gamma-space re-add slot it fills (the forward path added its ambient in
+		// gamma - see the note at the re-add below).
+		float3 envColor = Color::IrradianceToGamma(envIrradiance.rgb / max(envIrradiance.w, 1e-3) * SharedData::ssgiSettings.EnvLevel);
 
-		// Aperture to mip: wide opening -> coarse mip (wide prefiltered cone), narrow opening ->
-		// finer mip. The cubemap carries 8 mips (DynamicCubemaps MIPLEVELS); 6 is the 2x2 level,
-		// deliberately never the 1x1 mean so the direction always matters, and 2 (32x32) is
-		// blurred enough for what is still a diffuse gather through a narrow opening.
-		float envMip = lerp(2.0, 6.0, bentAperture);
-		float3 envSample = EnvTexture.SampleLevel(LinearSampler, bentNormalWS, envMip);
-		// Mean luminance via the coarsest mip, same fetch the E1-style specular normalisation
-		// uses (level 15 clamps to the top of the chain).
-		float cubemapMeanLuma = Color::RGBToLuminance(EnvTexture.SampleLevel(LinearSampler, bentNormalWS, 15));
-
-#		if defined(COMPOSITE_AMBIENT_SKY)
-		float anchorLuma = DirectionalEnvAnchorLuma(bentNormalWS, ambientSkyVisibility);
-#		else
-		float anchorLuma = DirectionalEnvAnchorLuma(bentNormalWS);
-#		endif
-
-		// Numeric defence: the mean-luma division is only meaningful for a finite, positive
-		// denominator, and the product must come out finite (bit test - fxc cannot fold it).
-		// Anything else bypasses the whole channel and falls back to the existing ambient
-		// chroma, so a black or poisoned cubemap face can never turn into a black screen or a
-		// NaN in MAIN.
-		float3 envColor = envSample * (anchorLuma * SharedData::ssgiSettings.EnvLevel / max(cubemapMeanLuma, 1e-4));
-		bool envValid = DirEnvIsFinite(cubemapMeanLuma) && cubemapMeanLuma > 1e-4;
+		// Numeric defence, same shape as v1: everything consumed must be finite (bit test -
+		// fxc cannot fold it), or the whole pixel bypasses the channel and keeps the existing
+		// ambient chroma. The upstream chain clamps its writes, but this is the last line
+		// before MAIN and it stays.
+		bool envValid = DirEnvIsFinite(envIrradiance.x) && DirEnvIsFinite(envIrradiance.y) &&
+		                DirEnvIsFinite(envIrradiance.z) && DirEnvIsFinite(envIrradiance.w);
 		envValid = envValid && DirEnvIsFinite(envColor.x) && DirEnvIsFinite(envColor.y) && DirEnvIsFinite(envColor.z);
 		// albedo and maxScale mirror the estimate's own construction, so the re-add stays on
 		// the same footing as the term it replaces.
-		[flatten] if (envValid)
-			ambientReAddColor = max(0, envColor) * albedo * maxScale;
+		[flatten] if (envValid && envWeight > 1e-3)
+			ambientReAddColor = lerp(directionalAmbientColor, max(0, envColor) * albedo * maxScale, envWeight);
 	}
 #	endif
 
