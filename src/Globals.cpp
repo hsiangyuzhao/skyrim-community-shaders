@@ -15,6 +15,7 @@
 #include "Features/LODBlending.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LinearLighting.h"
+#include "Features/NRD.h"
 #include "Features/PerformanceOverlay.h"
 #include "Features/PhysicalSky.h"
 #include "Features/PostProcessing.h"
@@ -67,6 +68,7 @@ namespace globals
 		HairSpecular hairSpecular{};
 		InteriorSun interiorSun{};
 		InverseSquareLighting inverseSquareLighting{};
+		NRD nrd{};
 		PhysicalSky physicalSky{};
 		ScreenSpaceGI screenSpaceGI{};
 		ScreenSpacePointLightShadows screenSpacePointLightShadows{};
