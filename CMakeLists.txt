@@ -323,6 +323,12 @@ install(
     COMPONENT Shaders
 )
 install(CODE "file(REMOVE \${CMAKE_INSTALL_PREFIX}/Core)" COMPONENT Shaders)
+install(
+    FILES ${CMAKE_SOURCE_DIR}/extern/NRD/LICENSE.txt
+    DESTINATION Shaders/NRD
+    RENAME nrd.license.txt
+    COMPONENT Shaders
+)
 
 # #######################################################################################################################
 # # Automatic AIO preparation (incremental copy system)
