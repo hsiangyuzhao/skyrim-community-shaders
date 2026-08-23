@@ -17,11 +17,20 @@ Texture2D<float2> srcIlCoCg : register(t4);            // maybe half-res
 // (directional env) Bent normal + aperture from gi.cs.hlsl. Rides this pass's ping-pong, so it
 // must be filtered (or at least copied) here every dispatch or the chain reads a stale slot.
 Texture2D<unorm float4> srcBentNormal : register(t5);  // maybe half-res
+#if defined(DYNAMIC_CUBEMAPS)
+// (directional env v2) Environment irradiance from gi.cs.hlsl. Radiance data (premultiplied
+// RGB + confidence A), so unlike the bent normal it goes through the SAME scalar blend as the
+// IL channels - no vector-domain detour.
+Texture2D<float4> srcEnvIrradiance : register(t6);  // maybe half-res
+#endif
 
 RWTexture2D<unorm float> outAccumFrames : register(u0);
 RWTexture2D<float4> outIlY : register(u1);
 RWTexture2D<float2> outIlCoCg : register(u2);
 RWTexture2D<unorm float4> outBentNormal : register(u3);
+#if defined(DYNAMIC_CUBEMAPS)
+RWTexture2D<float4> outEnvIrradiance : register(u4);
+#endif
 
 // samples = 8, min distance = 0.5, average samples on radius = 2
 static const float3 g_Poisson8[8] = {
@@ -140,6 +149,9 @@ float2x2 getRotationMatrix(float noise)
 
 	float4 ySum = ilY;
 	float2 coCgSum = ilCoCg;
+#if defined(DYNAMIC_CUBEMAPS)
+	float4 envIrrSum = srcEnvIrradiance[dtid];
+#endif
 	float wSum = 1;
 	for (uint i = 0; i < numSamples; i++) {
 		float w = GaussianWeight(g_Poisson8[i].z);
@@ -182,6 +194,9 @@ float2x2 getRotationMatrix(float noise)
 		if (w > 1e-8) {
 			ySum += srcIlY.SampleLevel(samplerPointClamp, uvSample * OUT_FRAME_SCALE, 0) * w;
 			coCgSum += srcIlCoCg.SampleLevel(samplerPointClamp, uvSample * OUT_FRAME_SCALE, 0) * w;
+#if defined(DYNAMIC_CUBEMAPS)
+			envIrrSum += srcEnvIrradiance.SampleLevel(samplerPointClamp, uvSample * OUT_FRAME_SCALE, 0) * w;
+#endif
 
 			float3 bentDirSample;
 			float bentApertureSample;
@@ -195,6 +210,9 @@ float2x2 getRotationMatrix(float noise)
 
 	outIlY[dtid] = ySum / wSum;
 	outIlCoCg[dtid] = coCgSum / wSum;
+#if defined(DYNAMIC_CUBEMAPS)
+	outEnvIrradiance[dtid] = envIrrSum / wSum;
+#endif
 	// (directional env) Renormalise the direction sum; wSum cancels in the normalisation, only
 	// the aperture needs the explicit division. A degenerate sum (opposing taps cancelling)
 	// falls back to the centre direction, which decode guarantees is unit length.
