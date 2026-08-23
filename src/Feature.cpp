@@ -16,6 +16,7 @@
 #include "Features/LODBlending.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LinearLighting.h"
+#include "Features/NRD.h"
 #include "Features/PerformanceOverlay.h"
 #include "Features/PhysicalSky.h"
 #include "Features/PostProcessing.h"
@@ -221,6 +222,11 @@ const std::vector<Feature*>& Feature::GetFeatureList()
 		&globals::features::performanceOverlay,
 		&globals::features::subsurfaceScattering,
 		&globals::features::terrainShadows,
+		// (batch C1) NRD guide service. Deliberately listed before its consumers so
+		// generic per-feature passes see the service initialized first; the actual
+		// per-frame ordering is explicit in Deferred::DeferredPasses (PrepareGuides
+		// runs before any consumer dispatch).
+		&globals::features::nrd,
 		&globals::features::screenSpaceGI,
 		&globals::features::screenSpacePointLightShadows,
 		&globals::features::screenSpaceRayTracing,

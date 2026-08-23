@@ -32,7 +32,14 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientReinjectionStrength,
     OcclusionStrength,
     CubemapNormalization,
-    EnableSVGF,
+    DenoiserMethod,
+    ReblurDiffuse,
+    ReblurSpecular,
+    ReblurHitDistA,
+    ReblurHitDistB,
+    ReblurHitDistC,
+    SpecularPrepassBlurRadius,
+    UsePrepassOnlyForSpecularMotionEstimation,
     EnablePreBlur,
     MaxAccumulatedFrames,
     AtrousIterations,
@@ -74,7 +81,14 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientReinjectionStrength,
     OcclusionStrength,
     CubemapNormalization,
-    EnableSVGF,
+    DenoiserMethod,
+    ReblurDiffuse,
+    ReblurSpecular,
+    ReblurHitDistA,
+    ReblurHitDistB,
+    ReblurHitDistC,
+    SpecularPrepassBlurRadius,
+    UsePrepassOnlyForSpecularMotionEstimation,
     EnablePreBlur,
     MaxAccumulatedFrames,
     AtrousIterations,
@@ -215,12 +229,73 @@ void ScreenSpaceRayTracing::DrawSettings()
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Matches cubemap luminance with ambient color.");
 
-    ImGui::Separator();
+    ImGui::SeparatorText("Denoiser");
 
-    ImGui::Checkbox("Enable Spatiotemporal Variance-Guided Filtering", &settings.EnableSVGF);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text("SVGF denoiser. This may introduce some blurriness and temporal artifacts but significantly reduces noise.");
-    if (settings.EnableSVGF) {
+    // (batch C1) The A/B switch. Both chains stay resident and hot-switch; the one
+    // not selected dispatches nothing at all.
+    {
+        static const char* denoiserModes[] = { "Off", "SVGF", "REBLUR (NRD)" };
+        int dm = (int)std::min(settings.DenoiserMethod, (uint)kDenoiserREBLUR);
+        if (ImGui::Combo("Denoiser", &dm, denoiserModes, 3)) {
+            settings.DenoiserMethod = (uint)dm;
+            // Both transitions latch their own reset through UpdateHistoryValidity
+            // next frame; nothing else to do here.
+        }
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Which denoiser processes the ray-traced light.\n\n"
+                "REBLUR (NVIDIA NRD) is the default: temporally stable, reconstructs "
+                "reflection motion correctly, slightly softer output.\n"
+                "SVGF is the previous in-house chain, kept for A/B comparison: sharper "
+                "in places but with longer trails behind moving objects.\n"
+                "Off shows the raw ray-traced signal — the performance baseline.\n\n"
+                "Switching takes about a second to settle (temporal history rebuilds). "
+                "If anything looks wrong on REBLUR, switching back to SVGF is the "
+                "immediate rollback.");
+    }
+
+    if (ReblurSelected()) {
+        auto& nrdSvc = globals::features::nrd;
+        if (!nrdSvc.loaded)
+            ImGui::TextWrapped(
+                "NRD feature is not installed/loaded - REBLUR cannot run and the signal "
+                "stays undenoised. Install the NRD core feature or select SVGF.");
+        else if (!nrdSvc.settings.Enabled)
+            ImGui::TextWrapped(
+                "NRD is disabled in its own feature page - REBLUR cannot run and the "
+                "signal stays undenoised.");
+        if (REL::Module::IsVR())
+            ImGui::TextWrapped("REBLUR is not available in VR; the signal stays undenoised.");
+
+        bool reblurChanged = false;
+        if (ImGui::TreeNode("REBLUR Hit Distance Normalization")) {
+            reblurChanged |= ImGui::SliderFloat("Hit Dist A (game units)", &settings.ReblurHitDistA, 1.0f, 1000.0f, "%.0f");
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text(
+                    "Constant term of REBLUR's hit-distance normalization, in game units "
+                    "(NRD default 3 m = 210 units). Together with B it sets the distance "
+                    "scale the denoiser considers 'far'.");
+            reblurChanged |= ImGui::SliderFloat("Hit Dist B (per unit viewZ)", &settings.ReblurHitDistB, 0.0f, 1.0f, "%.3f");
+            reblurChanged |= ImGui::SliderFloat("Hit Dist C (roughness scale)", &settings.ReblurHitDistC, 1.0f, 40.0f, "%.1f");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("REBLUR Diffuse (advanced)")) {
+            reblurChanged |= nrdSvc.DrawReblurSettings(settings.ReblurDiffuse, true, "ssrt_reblur_diffuse");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("REBLUR Specular (advanced)")) {
+            reblurChanged |= nrdSvc.DrawReblurSettings(settings.ReblurSpecular, true, "ssrt_reblur_specular");
+            reblurChanged |= ImGui::SliderFloat("Specular Pre-pass Radius", &settings.SpecularPrepassBlurRadius, 0.0f, 75.0f, "%.1f px");
+            reblurChanged |= ImGui::Checkbox("Use Pre-pass Only for Motion Estimation", &settings.UsePrepassOnlyForSpecularMotionEstimation);
+            ImGui::TreePop();
+        }
+        if (reblurChanged) {
+            resetReblurDiffuse = true;
+            resetReblurSpecular = true;
+        }
+    }
+
+    if (SVGFActive()) {
         ImGui::Checkbox("Pre-Blur", &settings.EnablePreBlur);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
@@ -504,6 +579,28 @@ void ScreenSpaceRayTracing::DrawSettings()
         BUFFER_VIEWER_NODE(texHistoryDepth, debugRescale)
         BUFFER_VIEWER_NODE(texDebugHistory, debugRescale)
 
+        // (batch C1) REBLUR-path surfaces; null until REBLUR is first selected.
+        if (texNRDDiffuseInput)
+            BUFFER_VIEWER_NODE(texNRDDiffuseInput, debugRescale)
+        if (texNRDDiffuseOutput)
+            BUFFER_VIEWER_NODE(texNRDDiffuseOutput, debugRescale)
+        if (texNRDSpecInput)
+            BUFFER_VIEWER_NODE(texNRDSpecInput, debugRescale)
+        if (texNRDSpecOutput)
+            BUFFER_VIEWER_NODE(texNRDSpecOutput, debugRescale)
+        if (auto validation = settings.ReblurDiffuse.EnableValidation ? nrdReblurDiffuse.GetValidationSRV() : nullptr) {
+            if (ImGui::TreeNode("NRD Validation (Diffuse)")) {
+                ImGui::Image(validation, { nrdReblurDiffuse.GetWidth() * debugRescale, nrdReblurDiffuse.GetHeight() * debugRescale });
+                ImGui::TreePop();
+            }
+        }
+        if (auto validation = settings.ReblurSpecular.EnableValidation ? nrdReblurSpecular.GetValidationSRV() : nullptr) {
+            if (ImGui::TreeNode("NRD Validation (Specular)")) {
+                ImGui::Image(validation, { nrdReblurSpecular.GetWidth() * debugRescale, nrdReblurSpecular.GetHeight() * debugRescale });
+                ImGui::TreePop();
+            }
+        }
+
 		ImGui::TreePop();
 	}
 
@@ -518,6 +615,9 @@ void ScreenSpaceRayTracing::RestoreDefaultSettings()
 void ScreenSpaceRayTracing::LoadSettings(json& o_json)
 {
     settings = o_json;
+    // (batch C1) An out-of-range value from a hand-edited or future config must not
+    // fall through the dispatch gates as "neither SVGF nor REBLUR but not Off either".
+    settings.DenoiserMethod = std::min(settings.DenoiserMethod, (uint)kDenoiserREBLUR);
 }
 
 void ScreenSpaceRayTracing::SaveSettings(json& o_json)
@@ -534,6 +634,7 @@ void ScreenSpaceRayTracing::SetupResources()
 	{
         ssrtCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<SSRTCB>());
         denoiserCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<DenoiserCB>());
+        nrdPackCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<NRDPackCB>());  // (batch C1)
     }
 
     logger::debug("Creating textures...");
@@ -827,10 +928,94 @@ void ScreenSpaceRayTracing::EnsureSharcResources()
 }
 #endif
 
+// (batch C1) REBLUR-path resources, allocated on first selection rather than at boot,
+// on the same argument EnsureSharcResources makes: a user who stays on SVGF (or Off)
+// never pays for the four RGBA16F packed surfaces or the two instances' permanent and
+// transient pools. Switching REBLUR off afterwards keeps them resident, which is what
+// makes the A/B toggle instant in both directions.
+void ScreenSpaceRayTracing::EnsureNRDResources()
+{
+    if (texNRDDiffuseInput && texNRDSpecInput && nrdReblurDiffuse.IsValid() && nrdReblurSpecular.IsValid())
+        return;
+
+    logger::debug("Creating SSRT NRD resources...");
+
+    auto renderer = globals::game::renderer;
+    auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    D3D11_TEXTURE2D_DESC mainDesc;
+    mainTex.texture->GetDesc(&mainDesc);
+
+    D3D11_TEXTURE2D_DESC texDesc{
+        .Width = mainDesc.Width,
+        .Height = mainDesc.Height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
+        .SampleDesc = { 1, 0 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+    };
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+    };
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipSlice = 0 }
+    };
+
+    auto makeTex = [&](eastl::unique_ptr<Texture2D>& tex, const char* name) {
+        if (!tex) {
+            tex = eastl::make_unique<Texture2D>(texDesc);
+            tex->CreateSRV(srvDesc);
+            tex->CreateUAV(uavDesc);
+            Util::SetResourceName(tex->resource.get(), name);
+        }
+    };
+    makeTex(texNRDDiffuseInput, "SSRT::NRDDiffuseInput");
+    makeTex(texNRDDiffuseOutput, "SSRT::NRDDiffuseOutput");
+    makeTex(texNRDSpecInput, "SSRT::NRDSpecInput");
+    makeTex(texNRDSpecOutput, "SSRT::NRDSpecOutput");
+
+    // Instances are sized at the *output* resolution, like every history surface in
+    // this feature; the per-frame dynamic-resolution sub-rect travels through
+    // nrd::CommonSettings::rectSize, which the NRD service fills.
+    if (!nrdReblurDiffuse.IsValid())
+        nrdReblurDiffuse.Init(mainDesc.Width, mainDesc.Height, nrd::Denoiser::REBLUR_DIFFUSE, 0);
+    if (!nrdReblurSpecular.IsValid())
+        nrdReblurSpecular.Init(mainDesc.Width, mainDesc.Height, nrd::Denoiser::REBLUR_SPECULAR, 1);
+
+    resetReblurDiffuse = true;
+    resetReblurSpecular = true;
+}
+
+bool ScreenSpaceRayTracing::ReblurReady(bool a_specular) const
+{
+    // Mono guide surfaces; the NRD feature does not load in VR, but developer mode
+    // can force-load it there, so the gate is explicit.
+    if (REL::Module::IsVR())
+        return false;
+
+    auto& nrdSvc = globals::features::nrd;
+    if (!nrdSvc.loaded || !nrdSvc.AreGuidesReady())
+        return false;
+
+    if (!nrdUnpackCS || !nrdPackCB)
+        return false;
+
+    if (a_specular) {
+        return nrdPackSpecularCS && texNRDSpecInput && texNRDSpecOutput && nrdReblurSpecular.IsValid();
+    }
+    return nrdPackDiffuseCS && texNRDDiffuseInput && texNRDDiffuseOutput && nrdReblurDiffuse.IsValid();
+}
+
 void ScreenSpaceRayTracing::ClearShaderCache()
 {
     static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
         &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &preblurCS, &temporalCS, &temporalDiagCS, &varianceCS, &spatialCS, &spatialSpecularCS,
+        &nrdPackDiffuseCS, &nrdPackSpecularCS, &nrdUnpackCS,
 #ifdef ENABLE_SHARC
         &raymarchDiffuseSharcCS, &sharcUpdateRaymarchCS, &sharcResolveCS
 #endif
@@ -922,6 +1107,12 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &varianceCS, "ssrt_variance.hlsl", {} },
             { &spatialCS, "ssrt_spatial.hlsl", definesWideKernel },
             { &spatialSpecularCS, "ssrt_spatial.hlsl", definesSpecular },
+            // (batch C1) REBLUR front-end pack / back-end unpack. Deliberately not
+            // built on `defines`: neither file reads DYNAMIC_CUBEMAPS / SSGI /
+            // SKYLIGHTING / DIFFUSE_SPP, so the only permutation axis is the chain.
+            { &nrdPackDiffuseCS, "ssrt_nrd_pack.hlsl", {} },
+            { &nrdPackSpecularCS, "ssrt_nrd_pack.hlsl", { { "SSRT_SPECULAR", nullptr } } },
+            { &nrdUnpackCS, "ssrt_nrd_unpack.hlsl", {} },
 #ifdef ENABLE_SHARC
             { &raymarchDiffuseSharcCS, "ssrt_raymarch.hlsl", definesSharc },
             { &sharcUpdateRaymarchCS, "ssrt_raymarch.hlsl", definesSharcUpdate },
@@ -1009,12 +1200,26 @@ void ScreenSpaceRayTracing::UpdateHistoryValidity()
     //
     // EnableDiffuse / EnableSpecular are the same hazard by the same mechanism: with a pass
     // switched off, neither its history colour nor its moments are updated at all.
-    if ((settings.EnableSVGF && !lastEnableSVGF) ||
-        (settings.EnableDiffuse && !lastEnableDiffuse) ||
-        (settings.EnableSpecular && !lastEnableSpecular))
+    // (batch C1) The SVGF history clear latches on a transition *into* SVGF, exactly
+    // as it used to latch on EnableSVGF flipping on; the two REBLUR instances have the
+    // same class of hazard (their permanent pools survive while another denoiser is
+    // selected) and latch their own reset flags on a transition into REBLUR. Both
+    // resets also ride the pass-enable transitions below, because with a pass off
+    // neither denoiser's history is updated at all.
+    const bool svgfWas = lastDenoiserMethod == kDenoiserSVGF;
+    const bool reblurWas = lastDenoiserMethod == kDenoiserREBLUR;
+    const bool diffuseRising = settings.EnableDiffuse && !lastEnableDiffuse;
+    const bool specularRising = settings.EnableSpecular && !lastEnableSpecular;
+
+    if ((SVGFActive() && !svgfWas) || diffuseRising || specularRising)
         historyClearPending = true;
 
-    lastEnableSVGF = settings.EnableSVGF;
+    if ((ReblurSelected() && !reblurWas) || diffuseRising || specularRising) {
+        resetReblurDiffuse = true;
+        resetReblurSpecular = true;
+    }
+
+    lastDenoiserMethod = settings.DenoiserMethod;
     lastEnableDiffuse = settings.EnableDiffuse;
     lastEnableSpecular = settings.EnableSpecular;
 
@@ -1027,6 +1232,10 @@ void ScreenSpaceRayTracing::UpdateHistoryValidity()
         if (cell != lastCell) {
             lastCell = cell;
             historyClearPending = true;
+            // (batch C1) REBLUR's accumulated history is just as screen-space as
+            // SVGF's; a load, fast travel or door transition invalidates both.
+            resetReblurDiffuse = true;
+            resetReblurSpecular = true;
         }
         // (audit P9) Same lookup, so the interior test rides along instead of repeating it:
         // both draw passes read this member and neither may pay for the cell walk again.
@@ -1341,7 +1550,12 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // diffuse bounce.
     bool historyFed = false;
 
-    if (settings.EnableSVGF) {
+    // (batch C1) Lazy REBLUR bring-up, mirroring EnsureSharcResources: the pools and
+    // the four packed surfaces only exist once REBLUR has actually been selected.
+    if (ReblurSelected())
+        EnsureNRDResources();
+
+    if (SVGFActive()) {
         DenoiserCB denoiserCBData = GetDenoiserCBData(false);
         denoiserCB->Update(denoiserCBData);
         auto denoiserBuffer = denoiserCB->CB();
@@ -1432,6 +1646,15 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         if (settings.AtrousIterations % 2 == 0) {
             CopyDynamicRegion(texSSRColor->resource.get(), texVariance->resource.get());
         }
+    } else if (ReblurSelected() && ReblurReady(true)) {
+        // (batch C1) REBLUR_SPECULAR: pack texSSRColor + the world-space hit distance
+        // into NRD's front-end layout, dispatch the instance, unpack the result back
+        // into texSSRColor for the deferred composite. From here the specular signal
+        // no longer shares the diffuse chain's surface-motion temporal reprojection —
+        // REBLUR's virtual-position mechanism owns the reflected content's motion.
+        // historyFed stays false, so the unconditional copy below publishes the
+        // denoised result as next frame's raymarch history, same as the SVGF-off path.
+        RunReblur(true);
     }
 
     // output
@@ -1499,8 +1722,150 @@ void ScreenSpaceRayTracing::CopyHistoryGeometry()
     // purpose lies. The region outside it now keeps the far plane ClearDenoiserHistory wrote
     // instead of inheriting texDepth's own untouched content -- the same value, arrived at more
     // directly, and the one audit #8's convention asks for there.
-    if (settings.EnableSVGF && texHistoryDepth)
+    if (SVGFActive() && texHistoryDepth)
         CopyDynamicRegion(texHistoryDepth->resource.get(), texDepth->resource.get());
+}
+
+// (batch C1) One REBLUR leg, shared by both chains. The ray-march outputs are read,
+// never written: the pack pass adapts them into NRD's front-end layout, the NRD
+// instance runs its own pipeline against the guide surfaces the NRD feature published
+// this frame, and the unpack pass writes the denoised radiance back over the chain's
+// own surface — which is exactly where the SVGF chain would have left its result, so
+// everything downstream (composites, history feeds, DLSS-RR's hit-distance guide) is
+// untouched by the choice of denoiser.
+void ScreenSpaceRayTracing::RunReblur(bool a_specular)
+{
+    auto renderer = globals::game::renderer;
+    auto context = globals::d3d::context;
+    auto state = globals::state;
+    auto& nrdSvc = globals::features::nrd;
+
+    auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+    auto normal = renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
+
+    const float2 size = Util::ConvertToDynamic(state->screenSize);
+    const float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
+
+    state->BeginPerfEvent(a_specular ? "SSRT REBLUR Specular" : "SSRT REBLUR Diffuse");
+
+    auto& integration = a_specular ? nrdReblurSpecular : nrdReblurDiffuse;
+    auto& reblurUI = a_specular ? settings.ReblurSpecular : settings.ReblurDiffuse;
+    auto& reblurNative = a_specular ? reblurSpecularSettings : reblurDiffuseSettings;
+    bool& resetFlag = a_specular ? resetReblurSpecular : resetReblurDiffuse;
+    auto& texInput = a_specular ? texNRDSpecInput : texNRDDiffuseInput;
+    auto& texOutput = a_specular ? texNRDSpecOutput : texNRDDiffuseOutput;
+    auto& texRadiance = a_specular ? texSSRColor : texSSRTDiffuseColor;
+
+    std::array<ID3D11ShaderResourceView*, 4> srvs = { nullptr };
+    std::array<ID3D11UnorderedAccessView*, 1> uavs = { nullptr };
+    auto resetViews = [&]() {
+        srvs.fill(nullptr);
+        uavs.fill(nullptr);
+        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+        context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
+    };
+
+    // ---- front-end pack ----
+    {
+        NRDPackCB packData{
+            .hitDistA = settings.ReblurHitDistA,
+            .hitDistB = settings.ReblurHitDistB,
+            .hitDistC = settings.ReblurHitDistC,
+            .pad0 = 0.0f
+        };
+        nrdPackCB->Update(packData);
+        auto packBuffer = nrdPackCB->CB();
+        context->CSSetConstantBuffers(1, 1, &packBuffer);
+
+        srvs.at(0) = texRadiance->srv.get();
+        srvs.at(1) = a_specular ? texHitDistance->srv.get() : texSSRTDiffuseHitDistance->srv.get();
+        srvs.at(2) = depth.depthSRV;
+        srvs.at(3) = a_specular ? normal.SRV : nullptr;
+        uavs.at(0) = texInput->uav.get();
+
+        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+        context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
+        context->CSSetShader(a_specular ? nrdPackSpecularCS.get() : nrdPackDiffuseCS.get(), nullptr, 0);
+        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        resetViews();
+    }
+
+    // ---- REBLUR dispatch ----
+    {
+        auto commonSettings = nrdSvc.GetCommonSettings();
+        commonSettings.splitScreen = reblurUI.SplitScreen;
+        commonSettings.enableValidation = reblurUI.EnableValidation;
+        if (!a_specular) {
+            // (batch C1, per spec) The ray march's R8 per-pixel hit coverage feeds
+            // IN_DIFF_CONFIDENCE. Recorded caveat: this surface answers "how much of
+            // the hemisphere did screen space resolve", not NRD's "is the history
+            // still lit the same way" — and in the legacy cubemap-fallback mode it is
+            // identically 1.0 (the fallback claims full coverage), so the input is
+            // only live under ambient reinjection. If REBLUR's accumulation behaves
+            // oddly only in that mode, this wiring is the first suspect for a later
+            // batch; the texSSRTDiffuseConfidence declaration carries the full
+            // analysis.
+            commonSettings.isHistoryConfidenceAvailable = true;
+        }
+        if (resetFlag)
+            commonSettings.accumulationMode = nrd::AccumulationMode::CLEAR_AND_RESTART;
+        integration.SetCommonSettings(commonSettings);
+
+        // Antilag stays off and checkerboard stays OFF for the whole first
+        // integration (NRD bring-up guidance); ApplyReblurSettings enforces the
+        // former for every consumer.
+        nrdSvc.ApplyReblurSettings(reblurNative, reblurUI, nrd::CheckerboardMode::OFF);
+        reblurNative.hitDistanceParameters.A = settings.ReblurHitDistA;
+        reblurNative.hitDistanceParameters.B = settings.ReblurHitDistB;
+        reblurNative.hitDistanceParameters.C = settings.ReblurHitDistC;
+        if (a_specular) {
+            reblurNative.specularPrepassBlurRadius = std::max(settings.SpecularPrepassBlurRadius, 0.0f);
+            reblurNative.usePrepassOnlyForSpecularMotionEstimation = settings.UsePrepassOnlyForSpecularMotionEstimation;
+        }
+        integration.SetDenoiserSettings(&reblurNative);
+
+        integration.SetNamedSRV(nrd::ResourceType::IN_MV, nrdSvc.GetMotionVectorSRV());
+        integration.SetNamedUAV(nrd::ResourceType::IN_MV, nrdSvc.GetMotionVectorUAV());
+        integration.SetNamedSRV(nrd::ResourceType::IN_NORMAL_ROUGHNESS, nrdSvc.GetNormalRoughnessSRV());
+        integration.SetNamedSRV(nrd::ResourceType::IN_VIEWZ, nrdSvc.GetViewZSRV());
+        if (a_specular) {
+            integration.SetNamedSRV(nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, texInput->srv.get());
+            integration.SetNamedSRV(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, texOutput->srv.get());
+            integration.SetNamedUAV(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, texOutput->uav.get());
+        } else {
+            integration.SetNamedSRV(nrd::ResourceType::IN_DIFF_CONFIDENCE, texSSRTDiffuseConfidence->srv.get());
+            integration.SetNamedSRV(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, texInput->srv.get());
+            integration.SetNamedSRV(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, texOutput->srv.get());
+            integration.SetNamedUAV(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, texOutput->uav.get());
+        }
+
+        integration.Dispatch();
+        resetFlag = false;
+    }
+
+    // ---- back-end unpack ----
+    {
+        srvs.at(0) = texOutput->srv.get();
+        uavs.at(0) = texRadiance->uav.get();
+
+        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+        context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
+        context->CSSetShader(nrdUnpackCS.get(), nullptr, 0);
+        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        resetViews();
+    }
+
+    // The NRD dispatch owns s0/s1 and b1 while it runs; restore what the surrounding
+    // draw pass set up so anything dispatched after this (the diffuse composite, or a
+    // caller-side pass added later) sees the bindings it expects.
+    {
+        std::array<ID3D11SamplerState*, 1> samplers = { linearSampler.get() };
+        context->CSSetSamplers(0, 1, samplers.data());
+        auto ssrtBuffer = ssrtCB->CB();
+        context->CSSetConstantBuffers(1, 1, &ssrtBuffer);
+    }
+
+    state->EndPerfEvent();
 }
 
 void ScreenSpaceRayTracing::DrawSSRTDiffuse()
@@ -1658,7 +2023,11 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // unconditional copy at the bottom stands in unchanged.
     bool historyFed = false;
 
-    if (settings.EnableSVGF) {
+    // (batch C1) Lazy REBLUR bring-up; see the matching site in DrawSSRTSpecular.
+    if (ReblurSelected())
+        EnsureNRDResources();
+
+    if (SVGFActive()) {
         DenoiserCB denoiserCBData = GetDenoiserCBData(true);
 
         // (batch 1, item 1) The pre-blur, and the one thing about it that needs explaining on
@@ -1799,6 +2168,14 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         if (settings.AtrousIterations % 2 == 0) {
             CopyDynamicRegion(texSSRTDiffuseColor->resource.get(), texVariance->resource.get());
         }
+    } else if (ReblurSelected() && ReblurReady(false)) {
+        // (batch C1) REBLUR_DIFFUSE: pack the raw 2-spp radiance plus the decoded
+        // hit distance into NRD's front-end layout, dispatch the instance (with the
+        // R8 hit-coverage surface wired to IN_DIFF_CONFIDENCE, per the batch spec),
+        // unpack back into texSSRTDiffuseColor for the diffuse composite below.
+        // historyFed stays false, so the unconditional copy right after publishes
+        // the denoised radiance as next frame's raymarch history.
+        RunReblur(false);
     }
 
     if (!historyFed)

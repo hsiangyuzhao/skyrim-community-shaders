@@ -8,6 +8,7 @@
 
 #include "Features/DynamicCubemaps.h"
 #include "Features/IBL.h"
+#include "Features/NRD.h"
 #include "Features/PhysicalSky.h"
 #include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpaceRayTracing.h"
@@ -397,6 +398,14 @@ void Deferred::DeferredPasses()
 	bool interior = Util::IsInterior();
 
 	auto& skylighting = globals::features::skylighting;
+
+	// (batch C1) NRD guide service: publish this frame's viewZ / normal+roughness /
+	// motion-vector guides before any consumer dispatches. Must run before
+	// DrawSSRTDiffuse / DrawSSRTSpecular so their REBLUR instances see guides that
+	// describe this frame.
+	auto& nrdService = globals::features::nrd;
+	if (nrdService.loaded)
+		nrdService.PrepareGuides();
 
 	auto& ssgi = globals::features::screenSpaceGI;
 	if (ssgi.loaded)
