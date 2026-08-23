@@ -1,6 +1,8 @@
 #pragma once
 #define ENABLE_SHARC
 
+#include "NRD.h"
+
 struct ScreenSpaceRayTracing : Feature
 {
     static ScreenSpaceRayTracing* GetSingleton()
@@ -22,7 +24,7 @@ struct ScreenSpaceRayTracing : Feature
                 "Importance sampling for advanced reflections based on roughness",
                 "Efficient ray marching with Hi-Z buffer",
                 "Uses dynamic cubemaps as fallback for missing information",
-                "Spatiotemporal Variance-Guided Filtering (SVGF) denoiser"
+                "Denoising via NVIDIA NRD REBLUR (default) or the in-house SVGF chain"
             }
 		};
 	}
@@ -45,6 +47,17 @@ struct ScreenSpaceRayTracing : Feature
 
     bool HasShaderDefine(RE::BSShader::Type) override { return true; };
     virtual bool SupportsVR() override { return true; };
+
+    /// @brief (batch C1) Values of Settings::DenoiserMethod. An enum rather than a
+    /// bool pair so the UI combo, the settings file and the dispatch gates all agree
+    /// on one value, and so "denoising off" is a first-class state (the performance
+    /// baseline the A/B guide measures against).
+    enum DenoiserMethodValue : uint
+    {
+        kDenoiserOff = 0,
+        kDenoiserSVGF = 1,
+        kDenoiserREBLUR = 2,
+    };
 
     struct Settings
     {
@@ -187,7 +200,49 @@ struct ScreenSpaceRayTracing : Feature
         /// mechanism can supply.
         float OcclusionStrength = 1.0f;
         float CubemapNormalization = 0.0f;
-        bool EnableSVGF = false;
+        /// @brief (batch C1) Which denoiser processes the two SSRT radiance signals.
+        /// 0 = none, 1 = the in-house SVGF chain, 2 = NVIDIA NRD REBLUR (one
+        /// REBLUR_DIFFUSE and one REBLUR_SPECULAR instance).
+        ///
+        /// Replaces the old EnableSVGF bool; an old config that saved EnableSVGF is
+        /// simply ignored by the serializer and the new default (REBLUR) applies. The
+        /// two chains coexist and hot-switch — that is the A/B mechanism — and under
+        /// REBLUR none of the SVGF passes (preblur / temporal / variance / a-trous)
+        /// is dispatched, so the unselected chain costs nothing.
+        ///
+        /// REBLUR takes over the whole temporal problem for both signals. In
+        /// particular the specular chain stops sharing surface-motion reprojection
+        /// with diffuse: REBLUR's virtual-position mechanism reprojects reflected
+        /// content by its own motion, which is the root fix for the "surface MV is
+        /// wrong for what a mirror shows" defect the SVGF chain carries.
+        uint DenoiserMethod = kDenoiserREBLUR;
+        /// @brief (batch C1) REBLUR tuning for the diffuse instance. NRD defaults.
+        NRD::REBLURSettings ReblurDiffuse;
+        /// @brief (batch C1) REBLUR tuning for the specular instance. Defaults taken
+        /// from the upstream reference SSR integration: short history (20/1/0) and a
+        /// tight fast-history clamp, which is what a glossy signal wants.
+        NRD::REBLURSettings ReblurSpecular = {
+            .MaxAccumulatedFrameNum = 20,
+            .MaxFastAccumulatedFrameNum = 1,
+            .MaxStabilizedFrameNum = 0,
+            .FastHistoryClampingSigmaScale = 1.5f,
+        };
+        /// @brief (batch C1) REBLUR hit-distance normalization constants, the (A, B, C)
+        /// of hitDist / ((A + B * |viewZ|) * lerp(C, 1, specMagicCurve(roughness))).
+        /// NRD's defaults are (3, 0.1, 20) with A in meters; 1 game unit ~ 1.4 cm, so
+        /// A starts at 3 m * 70 = 210 game units — the same scaling the upstream SSR
+        /// integration ships. B is per-unit-viewZ and C is unitless, so both keep the
+        /// NRD defaults verbatim. Consumed identically by the pack shader (front end)
+        /// and by nrd::ReblurSettings::hitDistanceParameters (back end); the two must
+        /// never diverge or REBLUR denormalizes with the wrong curve.
+        float ReblurHitDistA = 210.0f;
+        float ReblurHitDistB = 0.1f;
+        float ReblurHitDistC = 20.0f;
+        /// @brief (batch C1) REBLUR specular pre-pass, mirrored from the upstream SSR
+        /// integration: a small radius search used only to improve the virtual-motion
+        /// estimation, not to blur the signal (the second flag).
+        float SpecularPrepassBlurRadius = 50.0f;
+        bool UsePrepassOnlyForSpecularMotionEstimation = true;
         /// @brief (batch 1, item 1) Run ssrt_preblur.hlsl -- anti-firefly plus a 3x3
         /// geometry-guided spatial filter -- on the diffuse ray-march output *before* the
         /// temporal accumulation reads it.
@@ -710,8 +765,20 @@ struct ScreenSpaceRayTracing : Feature
         "the DenoiserCB declarations in ssrt_temporal.hlsl (all four rows), ssrt_spatial.hlsl "
         "(two) and ssrt_variance.hlsl (one) mirror these offsets and must move with it.");
 
+    /// @brief (batch C1) Mirrored by the `NRDPackCB` declaration in ssrt_nrd_pack.hlsl.
+    /// One row: the REBLUR hit-distance normalization constants. The unpack shader
+    /// declares no constant buffer at all.
+    struct alignas(16) NRDPackCB
+    {
+        float hitDistA;
+        float hitDistB;
+        float hitDistC;
+        float pad0;
+    };
+
     eastl::unique_ptr<ConstantBuffer> ssrtCB;
     eastl::unique_ptr<ConstantBuffer> denoiserCB;
+    eastl::unique_ptr<ConstantBuffer> nrdPackCB;
 
     bool recompileFlag = false;
 
@@ -754,12 +821,36 @@ struct ScreenSpaceRayTracing : Feature
     /// every NaN and Inf bit pattern.
     bool historyClearPending = true;
 
-    /// @brief (guard G8) Previous frame's values of the three settings that decide whether
-    /// last frame wrote a history worth reading. Initialised to false so the first frame of
-    /// any enabled configuration counts as a transition.
-    bool lastEnableSVGF = false;
+    /// @brief (guard G8) Previous frame's values of the settings that decide whether
+    /// last frame wrote a history worth reading. lastDenoiserMethod starts at Off so
+    /// the first frame of any enabled configuration counts as a transition — for the
+    /// SVGF history clear and for the REBLUR reset alike.
+    uint lastDenoiserMethod = kDenoiserOff;
     bool lastEnableDiffuse = false;
     bool lastEnableSpecular = false;
+
+    /// @brief (batch C1) Convenience predicates over Settings::DenoiserMethod.
+    [[nodiscard]] bool SVGFActive() const { return settings.DenoiserMethod == kDenoiserSVGF; }
+    [[nodiscard]] bool ReblurSelected() const { return settings.DenoiserMethod == kDenoiserREBLUR; }
+
+    /// @brief (batch C1) Whether the REBLUR path can actually run this frame: the NRD
+    /// guide service is loaded, enabled and has published this frame's guides, we are
+    /// not in VR (the guide surfaces are mono), and the per-chain integration instance
+    /// asked about is initialized. When REBLUR is selected but this comes back false,
+    /// the chain runs undenoised for the frame — the same graceful degradation the
+    /// upstream integrations use — rather than silently switching to SVGF.
+    [[nodiscard]] bool ReblurReady(bool a_specular) const;
+
+    /// @brief (batch C1) Allocates the NRD input/output surfaces and initializes the
+    /// two REBLUR instances on first use, exactly like EnsureSharcResources: a user
+    /// who stays on SVGF never pays for REBLUR's permanent/transient pools.
+    void EnsureNRDResources();
+
+    /// @brief (batch C1) One flag per REBLUR instance rather than one shared, because
+    /// diffuse dispatches earlier in the frame than specular and each instance must
+    /// clear its own flag only after it has actually consumed the reset.
+    bool resetReblurDiffuse = true;
+    bool resetReblurSpecular = true;
 
     /// @brief (guard G8) Player cell the history belongs to. A different pointer means a
     /// load, a fast travel, a coc or a door transition -- i.e. the whole screen changed
@@ -782,6 +873,13 @@ struct ScreenSpaceRayTracing : Feature
 
     void DrawSSRTSpecular();
     void DrawSSRTDiffuse();
+
+    /// @brief (batch C1) The whole REBLUR leg for one chain: front-end pack of the
+    /// ray-march outputs, the NRD instance dispatch, back-end unpack into the surface
+    /// the rest of the pipeline reads. Callers gate on ReblurReady(a_specular).
+    /// Restores the sampler and b1 bindings the surrounding draw set up before it
+    /// returns, since the NRD dispatch owns those slots while it runs.
+    void RunReblur(bool a_specular);
     /// @brief Snapshots the normal-roughness G-buffer into texHistoryNormals, and (defect
     /// D3, when SVGF is on) mip 0 of the Hi-Z pyramid into texHistoryDepth, for next frame's
     /// SVGF temporal validation. Called exactly once per frame, by whichever of the two draw
@@ -958,6 +1056,22 @@ struct ScreenSpaceRayTracing : Feature
     // (audit P6 / #20) texHitPDF (was u1) and texOutput (a redundant full-screen copy
     // of texSSRColor) had no consumer anywhere and are gone.
 
+    /// @brief (batch C1) REBLUR-path surfaces and instances, allocated lazily by
+    /// EnsureNRDResources. The input pair carries the front-end packed signal
+    /// (YCoCg radiance + normalized hit distance, RGBA16F); the output pair is what
+    /// REBLUR writes and the unpack pass reads back into the chain's own surfaces.
+    /// SSRT's ray-march outputs are untouched — the pack/unpack passes adapt around
+    /// them, which is what keeps the tracing side byte-identical between denoisers.
+    eastl::unique_ptr<Texture2D> texNRDDiffuseInput = nullptr;
+    eastl::unique_ptr<Texture2D> texNRDDiffuseOutput = nullptr;
+    eastl::unique_ptr<Texture2D> texNRDSpecInput = nullptr;
+    eastl::unique_ptr<Texture2D> texNRDSpecOutput = nullptr;
+
+    NRDReblurIntegration nrdReblurDiffuse;
+    NRDReblurIntegration nrdReblurSpecular;
+    nrd::ReblurSettings reblurDiffuseSettings{};
+    nrd::ReblurSettings reblurSpecularSettings{};
+
 #ifdef ENABLE_SHARC
     eastl::unique_ptr<Buffer> sharcHashEntries = nullptr;
     eastl::unique_ptr<Buffer> sharcHashCopyOffsets = nullptr;
@@ -1005,6 +1119,14 @@ struct ScreenSpaceRayTracing : Feature
     winrt::com_ptr<ID3D11ComputeShader> varianceCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialSpecularCS = nullptr;
+    /// @brief (batch C1) REBLUR front-end pack (per-chain permutation: the diffuse one
+    /// decodes the R8 reciprocal hit-distance surface, the specular one reads the R32
+    /// world-space one plus G-buffer roughness) and the shared back-end unpack.
+    /// Any of them failing to compile makes ReblurReady() false for its chain, so the
+    /// failure degrades to "no denoising" rather than to a bad dispatch.
+    winrt::com_ptr<ID3D11ComputeShader> nrdPackDiffuseCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> nrdPackSpecularCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> nrdUnpackCS = nullptr;
 #ifdef ENABLE_SHARC
     winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseSharcCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> sharcUpdateRaymarchCS = nullptr;
