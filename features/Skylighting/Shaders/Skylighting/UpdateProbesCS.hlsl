@@ -24,8 +24,7 @@ SamplerComparisonState comparisonSampler : register(s0);
 	float2 occlusionUV = cellCentreOS.xy * 0.5 + 0.5;
 
 	if (all(occlusionUV > 0) && all(occlusionUV < 1)) {
-		uint accumFrames = isValid ? (outAccumFramesArray[dtid] + 1) : 1;
-		float occlusionDepth = srcOcclusionDepth.SampleCmpLevelZero(comparisonSampler, occlusionUV, 0);
+		uint accumFrames = isValid ? min(outAccumFramesArray[dtid] + 1, 255u) : 1;
 		float visibility = srcOcclusionDepth.SampleCmpLevelZero(comparisonSampler, occlusionUV, cellCentreOS.z);
 
 		sh2 occlusionSH = SphericalHarmonics::Scale(SphericalHarmonics::Evaluate(settings.OcclusionDir.xyz), visibility * 4.0 * Math::PI);  // 4 pi from monte carlo
