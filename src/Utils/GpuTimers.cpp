@@ -88,7 +88,9 @@ namespace Util
 		bool TableIsOnScreen()
 		{
 			auto& overlay = globals::features::performanceOverlay;
-			return globals::menu && globals::menu->overlayVisible &&
+			// globals::state is required because the frame counter both timers key their
+			// per-frame bookkeeping on lives there.
+			return globals::state && globals::menu && globals::menu->overlayVisible &&
 			       overlay.loaded && overlay.IsOverlayVisible() &&
 			       overlay.settings.ShowDrawCalls;
 		}

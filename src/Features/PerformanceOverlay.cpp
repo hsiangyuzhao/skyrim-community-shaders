@@ -824,7 +824,11 @@ void PerformanceOverlay::ConvertABTestResultsToRows(const std::vector<Aggregated
 					row.tooltip = "Total frame time.";
 					break;
 				case SpecialShaderType::Other:
-					row.tooltip = "Frame time not attributed to any measured shader type. This includes UI, post-processing, engine work, and any GPU activity not directly measured by the overlay.";
+					row.tooltip = "Frame time left after the shader types, Community Shaders' own CPU cost and the Present wait: the engine's own work (culling, animation, scripts, physics, audio, vanilla UI), driver overhead and other SKSE plugins. Not attributable from inside a plugin.";
+					break;
+				default:
+					// OurCpu / PresentWait are live-only rows; the A/B aggregator records
+					// Total and Other, so nothing else reaches here.
 					break;
 				}
 			}
