@@ -25,9 +25,20 @@ namespace Skylighting
 		return saturate(edgeDist * 20);
 	}
 
+	// `visibility` is saturated here rather than at the call sites because three callers
+	// deliberately apply an upward-facing gain before calling in -- DeferredCompositeCS.hlsl:257,
+	// ssrt_raymarch.hlsl:1109 and gi.cs.hlsl:748 all multiply by
+	// `1 + saturate(normalWS.z) * (1 - MinDiffuseVisibility)`, which peaks at 1.9 for a
+	// straight-up normal. Without the clamp, `lerp(min, 1, 1.9)` returns up to 1.81, and the
+	// worst consumer is DeferredCompositeCS.hlsl:280, where the result is a lerp WEIGHT:
+	// `lerp(env, sky, 1.81)` extrapolates to `1.81*sky - 0.81*env`, subtracting most of the
+	// environment probe from every up-facing surface (and going negative where env > sky).
+	// The gain is meant to let grazing-visibility up-facing surfaces reach full sky, i.e. it is a
+	// gain-then-clamp curve; the clamp was just missing. The other five callers already pass
+	// [0,1], so this is a no-op for them.
 	float mixDiffuse(SharedData::SkylightingSettings params, float visibility)
 	{
-		return lerp(params.MinDiffuseVisibility, 1.0, visibility);
+		return lerp(params.MinDiffuseVisibility, 1.0, saturate(visibility));
 	}
 
 	float mixSpecular(SharedData::SkylightingSettings params, float visibility)
