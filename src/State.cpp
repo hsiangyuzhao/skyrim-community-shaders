@@ -74,6 +74,32 @@ void State::Debug()
 			smoothDrawCalls[i] = smoothDrawCalls[i] * static_cast<float>(0.95) + drawCalls[i] * static_cast<float>(0.05);
 			smoothFrameTimePerType[i] = smoothFrameTimePerType[i] * static_cast<float>(0.95) + frameTimePerType[i] * static_cast<float>(0.05);
 		}
+
+		// Wall-clock frame time on the SAME clock, the SAME coefficients and the SAME
+		// cadence as the buckets just smoothed above. One new-frame detection per frame
+		// means the gap between two of them is exactly one frame period, so this is a
+		// real frame time and not a derived quantity - see State.h for why the overlay's
+		// own smoothFrameTimeMs cannot be used as the attribution denominator.
+		if (frameTimingFrequency.QuadPart == 0)
+			QueryPerformanceFrequency(&frameTimingFrequency);
+		if (frameTimingFrequency.QuadPart != 0) {
+			LARGE_INTEGER markNow;
+			QueryPerformanceCounter(&markNow);
+			if (wallFrameTimePrimed) {
+				const float wallMs = (markNow.QuadPart - lastFrameMarkTime.QuadPart) * 1000.0f /
+				                     static_cast<float>(frameTimingFrequency.QuadPart);
+				// Discard loading screens / alt-tabs / gaps where Debug() did not run.
+				if (wallMs > 0.0f && wallMs <= kMaxWallFrameSampleMs) {
+					if (smoothWallFrameTimeMs <= 0.0f)
+						smoothWallFrameTimeMs = wallMs;  // seed, so the first frames are not a ramp from zero
+					else
+						smoothWallFrameTimeMs = smoothWallFrameTimeMs * 0.95f + wallMs * 0.05f;
+				}
+			}
+			lastFrameMarkTime = markNow;
+			wallFrameTimePrimed = true;
+		}
+
 		// Reset counters for next frame
 		for (auto& c : drawCalls)
 			c = 0;
@@ -565,6 +591,8 @@ void State::SetupResources()
 		sft = 0.0f;
 
 	frameTimingActive = false;
+	smoothWallFrameTimeMs = 0.0f;
+	wallFrameTimePrimed = false;
 
 	auto renderer = globals::game::renderer;
 
@@ -836,6 +864,16 @@ std::unordered_map<std::string, bool>& State::GetDisabledFeatures()
 float State::GetTotalSmoothedDrawCalls() const
 {
 	return static_cast<float>(smoothDrawCalls[magic_enum::enum_integer(RE::BSShader::Type::Total)]);
+}
+
+float State::GetAttributionFrameTimeMs() const
+{
+	if (smoothWallFrameTimeMs > 0.0f)
+		return smoothWallFrameTimeMs;
+	// Not primed yet (the overlay was only just shown, so Debug() has run at most once).
+	// Fall back to the overlay's sampled frame time so the table shows something sane for
+	// the first frames; it converges to the EMA within a few frames.
+	return static_cast<float>(globals::features::performanceOverlay.state.smoothFrameTimeMs);
 }
 
 void State::LoadTheme()

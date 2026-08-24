@@ -85,22 +85,31 @@ auto MakeMetricColumn(const auto& theme, auto valueGetter, auto colorGetter, aut
 
 // --- Helper Functions ---
 /**
-  * @brief Calculates summary data (Other frame time, percentages, cost per call) from measured sum
+  * @brief Calculates summary data (residual frame time, percentages, cost per call).
+  *
+  * `smoothedFrameTime` must be State::GetAttributionFrameTimeMs() - the wall clock,
+  * smoothed with the same coefficients and on the same cadence as the per-type buckets.
+  * Passing the overlay's own `smoothFrameTimeMs` here (an instantaneous Present-to-Present
+  * sample re-snapped every 0.5 s) mixed two estimators: the buckets could exceed it and
+  * the residual went negative.
   *
   * `measuredSum` must contain CPU attribution only. GPU timestamp buckets are shown in
   * their own table and are deliberately NOT subtracted here: they are sampled on the GPU
   * clock, read back several frames later, and overlap both each other and the CPU
-  * timeline, so subtracting them from a CPU frame-time sample is not a residual - it just
-  * drove "Other" negative.
+  * timeline, so subtracting them from a CPU frame-time sample is not a residual.
   *
-  * @param smoothedFrameTime The total smoothed frame time
+  * @param smoothedFrameTime Wall-clock frame time on the attribution clock
   * @param measuredSum The sum of measured per-shader CPU frame times
   * @return Tuple of (otherFrameTime, otherPercent, totalCostPerCall)
   */
 static std::tuple<float, float, float> CalculateSummaryData(float smoothedFrameTime, float measuredSum)
 {
 	float totalSmoothedDrawCalls = globals::state->GetTotalSmoothedDrawCalls();
-	float otherFrameTime = Util::CalculateOtherFrameTime(smoothedFrameTime, measuredSum);
+	// Same clock, same smoother, and the buckets only ever cover first-draw..last-draw of
+	// the frame, so this cannot legitimately go negative any more. The clamp is a belt-and
+	// -braces guard for the transient right after the overlay is unhidden, where the
+	// bucket EMAs have been frozen for a while and the wall-clock EMA has not.
+	float otherFrameTime = std::max(0.0f, Util::CalculateOtherFrameTime(smoothedFrameTime, measuredSum));
 	float otherPercent = Util::CalculatePercentage(otherFrameTime, smoothedFrameTime);
 	float totalCostPerCall = Util::CalculateCostPerCall(smoothedFrameTime, totalSmoothedDrawCalls);
 	return { otherFrameTime, otherPercent, totalCostPerCall };
@@ -1468,7 +1477,7 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 	float bucketSum = 0.0f;
 	for (const auto& row : gpuRows)
 		bucketSum += row.frameTime;
-	const float smoothedFrameTime = static_cast<float>(this->state.smoothFrameTimeMs);
+	const float smoothedFrameTime = globals::state->GetAttributionFrameTimeMs();
 
 	std::vector<DrawCallRow> gpuSummaryRows;
 	gpuSummaryRows.push_back(DrawCallRow{
@@ -1674,7 +1683,7 @@ PerformanceOverlay::DrawCallRowSets PerformanceOverlay::BuildDrawCallRows() cons
 {
 	std::vector<DrawCallRow> mainRows;
 	std::vector<DrawCallRow> gpuRows;
-	float smoothedFrameTime = static_cast<float>(this->state.smoothFrameTimeMs);
+	float smoothedFrameTime = globals::state->GetAttributionFrameTimeMs();
 	float measuredSum = 0.0f;
 
 	globals::state->ForEachShaderTypeWithMetrics([&mainRows, &measuredSum, smoothedFrameTime, this](auto type, int typeIndex, float drawCalls, float frameTime, float percent, float costPerCall) {
@@ -1834,7 +1843,7 @@ void PerformanceOverlay::HandleShaderToggle(const DrawCallRow& row, bool wasEnab
 	float prevCostPerCall = row.costPerCall;
 
 	// Capture live data for Total and Other before toggling
-	float smoothedFrameTime = static_cast<float>(this->state.smoothFrameTimeMs);
+	float smoothedFrameTime = globals::state->GetAttributionFrameTimeMs();
 	float measuredSum = 0.0f;
 	globals::state->ForEachShaderTypeWithMetrics([&measuredSum]([[maybe_unused]] auto type, [[maybe_unused]] int typeIndex, [[maybe_unused]] float drawCalls, float frameTime, [[maybe_unused]] float percent, [[maybe_unused]] float costPerCall) {
 		measuredSum += frameTime;
@@ -1881,7 +1890,7 @@ void PerformanceOverlay::HandleTotalRowToggle()
 		this->UpdateAllShaderTestData();
 	} else {
 		// Manual toggle: update test data and timestamp
-		float smoothedFrameTime = static_cast<float>(this->state.smoothFrameTimeMs);
+		float smoothedFrameTime = globals::state->GetAttributionFrameTimeMs();
 		float measuredSum = 0.0f;
 		globals::state->ForEachShaderTypeWithMetrics([&measuredSum]([[maybe_unused]] auto type, [[maybe_unused]] int typeIndex, [[maybe_unused]] float drawCalls, float frameTime, [[maybe_unused]] float percent, [[maybe_unused]] float costPerCall) {
 			measuredSum += frameTime;
@@ -1917,7 +1926,7 @@ void PerformanceOverlay::UpdateShaderTestData(int shaderType, float frameTime, f
 {
 	UpdateShaderTestDataEntry(shaderType, frameTime, costPerCall);
 
-	float smoothedFrameTime = static_cast<float>(this->state.smoothFrameTimeMs);
+	float smoothedFrameTime = globals::state->GetAttributionFrameTimeMs();
 	float measuredSum = 0.0f;
 	for (const auto& [type, data] : testData) {
 		if (type >= 0)
@@ -1965,7 +1974,7 @@ void PerformanceOverlay::UpdateAllShaderTestData()
 		return;
 	}
 
-	float smoothedFrameTime = static_cast<float>(this->state.smoothFrameTimeMs);
+	float smoothedFrameTime = globals::state->GetAttributionFrameTimeMs();
 	float measuredSum = 0.0f;
 
 	globals::state->ForEachShaderTypeWithMetrics([&measuredSum, smoothedFrameTime, this]([[maybe_unused]] auto type, int typeIndex, [[maybe_unused]] float drawCalls, float frameTime, float percent, float costPerCall) {
@@ -2010,7 +2019,7 @@ void PerformanceOverlay::CaptureTestData()
 			anyShaderDisabled = true;
 		}
 	});
-	float smoothedFrameTime = static_cast<float>(this->state.smoothFrameTimeMs);
+	float smoothedFrameTime = globals::state->GetAttributionFrameTimeMs();
 	float measuredSum = 0.0f;
 	if (abTestActive) {
 		measuredSum = 0.0f;

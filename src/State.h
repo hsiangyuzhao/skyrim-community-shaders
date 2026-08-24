@@ -65,6 +65,43 @@ public:
 	LARGE_INTEGER frameStartTime;
 	bool frameTimingActive = false;
 
+	// --- Wall-clock frame time on the attribution clock -------------------------------
+	//
+	// Everything the overlay's CPU attribution table shows must come from ONE clock and
+	// ONE smoother, otherwise the numbers do not add up:
+	//
+	//   * the per-type rows are EMA-smoothed (0.95/0.05) and stepped once per frame here
+	//     in Debug(), and they only ever cover first-draw..last-draw of the frame;
+	//   * the overlay's own `smoothFrameTimeMs` is an *instantaneous* Present-to-Present
+	//     sample re-snapped every UpdateInterval (0.5 s), i.e. a completely different
+	//     estimator.
+	//
+	// Mixing the two produced both reported bugs: percentages were divided by the sum of
+	// the smoothed buckets (a much smaller number, so Utility read 57.9% instead of ~28%)
+	// while the residual was computed against the instantaneous wall clock, and the
+	// residual could go negative whenever the smoothed buckets happened to exceed the
+	// instantaneous sample.
+	//
+	// This is the same wall clock, sampled between consecutive new-frame detections and
+	// smoothed with the same coefficients on the same cadence as the buckets, so
+	// sum(buckets) <= smoothWallFrameTimeMs holds by construction.
+	float smoothWallFrameTimeMs = 0.0f;
+	LARGE_INTEGER lastFrameMarkTime{};
+	bool wallFrameTimePrimed = false;
+	// Longer than this (< 2 FPS) is a loading screen, an alt-tab or a period where the
+	// overlay was hidden and Debug() did not run; folding it in would poison the average
+	// for seconds. Matches PerformanceOverlay::Settings::kStatsMaxSampleMs.
+	static constexpr float kMaxWallFrameSampleMs = 500.0f;
+
+	/**
+	 * @brief The denominator every CPU attribution number in the overlay must use.
+	 *
+	 * Wall-clock frame time on the same clock and the same smoother as the per-type
+	 * buckets. Falls back to the overlay's own sampled frame time until the EMA has been
+	 * primed (first frames after the overlay is shown), so the table is never blank.
+	 */
+	float GetAttributionFrameTimeMs() const;
+
 	enum ConfigMode
 	{
 		DEFAULT,
@@ -262,9 +299,15 @@ public:
 		ForEachValidShaderType([&](auto type, int typeIndex, [[maybe_unused]] int classIndex) {
 			float drawCalls = static_cast<float>(GetSingleton()->smoothDrawCalls[typeIndex]);
 			float frameTime = static_cast<float>(GetSingleton()->smoothFrameTimePerType[typeIndex]);
-			float percent = (frameTime > 0.0f && GetSingleton()->smoothFrameTimePerType[magic_enum::enum_integer(RE::BSShader::Type::Total)] > 0.0f) ?
-			                    (frameTime / GetSingleton()->smoothFrameTimePerType[magic_enum::enum_integer(RE::BSShader::Type::Total)] * 100.0f) :
-			                    0.0f;
+			// Share of the WALL-CLOCK frame, not of the attributed sum. Dividing by
+			// smoothFrameTimePerType[Total] (the sum of the buckets) made every row's
+			// percentage relative to a ~20 ms denominator while the Other/Total rows used
+			// the ~42 ms real frame time, so the column silently mixed two scales and the
+			// rows added up to 100% of something the user never saw.
+			// smoothFrameTimePerType[Total] is still maintained - it is the "attributed
+			// sum" and is what Other is subtracted from - it just is not a percentage base.
+			const float denominator = GetSingleton()->GetAttributionFrameTimeMs();
+			float percent = (frameTime > 0.0f && denominator > 0.0f) ? (frameTime / denominator * 100.0f) : 0.0f;
 			float costPerCall = (drawCalls > 0.0f) ? (frameTime / drawCalls) : 0.0f;
 			callback(type, typeIndex, drawCalls, frameTime, percent, costPerCall);
 		});
