@@ -37,7 +37,17 @@ public:
 	uint32_t GetHeight() const { return m_height; }
 
 	// Execute all compute dispatches for this denoiser.
-	void Dispatch();
+	//
+	// (S1.2) Returns false if the denoiser did not run to completion — no instance, NRD
+	// declined to produce a dispatch list, a pipeline is missing, or a dispatch's storage
+	// binding resolved to null. A false return means the OUT_* surfaces do not hold this
+	// frame's result: the caller must keep its undenoised input, must not consume those
+	// surfaces, and must keep any pending accumulation reset pending, because NRD's own
+	// history is now in an unknown state.
+	//
+	// A dispatch with an empty grid is skipped and is *not* a failure: NRD emits those on
+	// purpose (e.g. a pass whose work is fully split-screened away).
+	[[nodiscard]] bool Dispatch();
 
 	bool IsValid() const { return m_instance != nullptr; }
 

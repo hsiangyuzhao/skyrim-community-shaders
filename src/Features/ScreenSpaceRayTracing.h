@@ -216,6 +216,31 @@ struct ScreenSpaceRayTracing : Feature
         /// content by its own motion, which is the root fix for the "surface MV is
         /// wrong for what a mirror shows" defect the SVGF chain carries.
         uint DenoiserMethod = kDenoiserREBLUR;
+        /// @brief (S1.1) Feed texSSRTDiffuseConfidence to REBLUR's IN_DIFF_CONFIDENCE.
+        ///
+        /// **Default off, and off is the honest setting.** Batch C1 wired this input up on the
+        /// strength of a shared word. NRD documents IN_DIFF_CONFIDENCE as "user-provided history
+        /// confidence in range 0-1, i.e. antilag ... must be computed for the previous frame in
+        /// the current frame" (NRDDescs.h) -- it answers *is the accumulated history still valid
+        /// for this pixel*, and REBLUR shortens the accumulation window where it is low. What this
+        /// surface carries is this frame's ray hit coverage: *what fraction of the hemisphere
+        /// screen space managed to resolve*. The two are not merely different, they are
+        /// anti-correlated in exactly the places that matter -- a newly disoccluded pixel or a
+        /// lighting change can have full coverage (history invalid, confidence reported high),
+        /// while open ground and sky-facing surfaces have low coverage and the most temporally
+        /// stable light in the frame (history perfectly valid, confidence reported low, window
+        /// shortened hardest).
+        ///
+        /// This fork has already ruled on the same question once, on the SVGF side: batch 1 item 3
+        /// rejected wiring this surface to the temporal accumulation window, and the four reasons
+        /// recorded at the texSSRTDiffuseConfidence declaration apply verbatim here. The first of
+        /// them is on its own decisive: with the cubemap fallback active the surface is identically
+        /// 1.0 over the whole screen, so the input is inert in one configuration and live in the
+        /// other.
+        ///
+        /// Kept as a switch rather than deleted so the A/B can still be run in-game (see the
+        /// closeout guide), not because the semantics are in doubt.
+        bool ReblurFeedHitCoverageConfidence = false;
         /// @brief (batch C1) REBLUR tuning for the diffuse instance. NRD defaults.
         NRD::REBLURSettings ReblurDiffuse;
         /// @brief (batch C1) REBLUR tuning for the specular instance. Defaults taken
@@ -822,24 +847,108 @@ struct ScreenSpaceRayTracing : Feature
     bool historyClearPending = true;
 
     /// @brief (guard G8) Previous frame's values of the settings that decide whether
-    /// last frame wrote a history worth reading. lastDenoiserMethod starts at Off so
-    /// the first frame of any enabled configuration counts as a transition — for the
-    /// SVGF history clear and for the REBLUR reset alike.
-    uint lastDenoiserMethod = kDenoiserOff;
+    /// last frame wrote a history worth reading. These start at "nothing ran" so the
+    /// first frame of any enabled configuration counts as a transition — for the SVGF
+    /// history clear and for the REBLUR reset alike.
+    ///
+    /// (S1.3) These track the *effective* denoiser per chain, not Settings::DenoiserMethod.
+    /// A fallback from REBLUR to SVGF is exactly the transition the SVGF history clear
+    /// exists for, and keying the latch on the requested method would have missed it.
+    uint lastEffectiveDenoiserDiffuse = kDenoiserOff;
+    uint lastEffectiveDenoiserSpecular = kDenoiserOff;
     bool lastEnableDiffuse = false;
     bool lastEnableSpecular = false;
 
-    /// @brief (batch C1) Convenience predicates over Settings::DenoiserMethod.
-    [[nodiscard]] bool SVGFActive() const { return settings.DenoiserMethod == kDenoiserSVGF; }
+    /// @brief (batch C1) Convenience predicates over Settings::DenoiserMethod — what the
+    /// *user asked for*. The UI reads these; the dispatch gates read EffectiveDenoiser().
+    [[nodiscard]] bool SVGFSelected() const { return settings.DenoiserMethod == kDenoiserSVGF; }
     [[nodiscard]] bool ReblurSelected() const { return settings.DenoiserMethod == kDenoiserREBLUR; }
 
-    /// @brief (batch C1) Whether the REBLUR path can actually run this frame: the NRD
-    /// guide service is loaded, enabled and has published this frame's guides, we are
-    /// not in VR (the guide surfaces are mono), and the per-chain integration instance
-    /// asked about is initialized. When REBLUR is selected but this comes back false,
-    /// the chain runs undenoised for the frame — the same graceful degradation the
-    /// upstream integrations use — rather than silently switching to SVGF.
+    /// @brief (S1.3) The denoiser that will actually process a chain this frame, resolved
+    /// once per frame by ResolveDenoisers() before anything allocates or dispatches.
+    ///
+    /// Never returns REBLUR unless the whole REBLUR chain for that signal is ready, and
+    /// never returns Off just because REBLUR is unavailable: an unavailable REBLUR falls
+    /// back to SVGF, because "any reasonable combination of settings must work on its own"
+    /// is a hard rule of this project and raw 2-spp noise is not a working configuration.
+    /// Off is reached only when the user asked for it, or when *both* chains failed to
+    /// compile — in which case there is nothing left to fall back to.
+    [[nodiscard]] uint EffectiveDenoiser(bool a_specular) const
+    {
+        return a_specular ? effectiveDenoiserSpecular : effectiveDenoiserDiffuse;
+    }
+    [[nodiscard]] bool AnyChainSVGF() const
+    {
+        return effectiveDenoiserDiffuse == kDenoiserSVGF || effectiveDenoiserSpecular == kDenoiserSVGF;
+    }
+
+    /// @brief (S1.3) Resolved effective denoiser per chain; written only by ResolveDenoisers().
+    uint effectiveDenoiserDiffuse = kDenoiserOff;
+    uint effectiveDenoiserSpecular = kDenoiserOff;
+
+    /// @brief (S1.3) Why the effective denoiser differs from the requested one, for the UI.
+    /// Points at a string literal or is null; never owns storage.
+    const char* denoiserFallbackReason = nullptr;
+
+    /// @brief (S1.4) DiffuseSPP as it stood the last time CompileComputeShaders ran.
+    ///
+    /// DIFFUSE_SPP is a compile-time macro, so a change of the setting is only real once the
+    /// ray-march permutations have been rebuilt. The UI used to be the only path that set
+    /// recompileFlag, which left LoadSettings free to install a value the compiled shader
+    /// does not implement — silently tracing the previous session's sample count. Comparing
+    /// against this instead makes the recompile unconditional on *any* path that can change
+    /// the setting, at the cost of one uint.
+    uint compiledDiffuseSPP = 0;
+
+    /// @brief (S1.4) Clamp every setting into the range its consumer can actually honour.
+    ///
+    /// The UI sliders carry ImGuiSliderFlags_AlwaysClamp, so they are not the hazard; a
+    /// hand-edited or future-version json is. DiffuseSPP is the sharpest case — 0 makes the
+    /// ray march's sample loop degenerate and >16 overruns the Hammersley table's assumption
+    /// — but a negative ColorPhi or an AtrousIterations of 400 are dispatch-count and
+    /// numerical hazards of the same family.
+    void SanitizeSettings();
+
+    /// @brief (S1.3) Whether the SVGF chain for one signal has every shader it needs.
+    ///
+    /// Atomic on purpose: a chain missing one pass must not run the others and must not
+    /// leave a consumer reading a surface the missing pass was supposed to write. The
+    /// pre-blur is deliberately absent — it degrades on its own (the temporal pass simply
+    /// reads the raw surface and keeps the firefly clamp), which is a documented path.
+    [[nodiscard]] bool SvgfChainReady(bool a_specular) const;
+
+    /// @brief (S1.3) Whether the REBLUR path *may be brought up* for one signal, judged
+    /// without touching any REBLUR allocation.
+    ///
+    /// Split from ReblurReady so the decision can be made before EnsureNRDResources runs:
+    /// the old order asked "is the instance valid" before anything had created one, which
+    /// is why a REBLUR selection could reach the dispatch gates and find nothing there.
+    /// Everything here is a fact about this frame's configuration, not about SSRT's own
+    /// allocations.
+    [[nodiscard]] bool ReblurStaticallyAvailable(bool a_specular) const;
+
+    /// @brief (batch C1) Whether the REBLUR path can actually run this frame: everything
+    /// ReblurStaticallyAvailable checks, plus this frame's guides being published and the
+    /// per-chain integration instance and surfaces existing.
     [[nodiscard]] bool ReblurReady(bool a_specular) const;
+
+    /// @brief (S1.3) Resolve EffectiveDenoiser for both chains and bring up whatever the
+    /// answer needs. Called once per frame from Prepass, before UpdateHistoryValidity so the
+    /// history latches see the effective values, and before any dispatch.
+    void ResolveDenoisers();
+
+    /// @brief (S4.15) Put every piece of cross-frame state back to "nothing has run yet".
+    ///
+    /// SetupResources is not only the boot path: BSShaderRenderTargets_Create re-runs
+    /// State::Setup() whenever the game recreates its render targets, i.e. on a resolution
+    /// change. That rebuilt every texture in this feature and left the state machine that
+    /// describes them untouched — the extent latches still held the old extents (so the
+    /// far-plane clear of a same-extent rebuild never fired), historyClearPending was
+    /// false (so freshly allocated, undefined history was consumed as if valid), and the
+    /// lazily allocated NRD surfaces and instances kept the *previous* resolution's
+    /// dimensions forever. Extents, history validity and the REBLUR bring-up are one
+    /// state machine and are now reset as one.
+    void ResetFrameState();
 
     /// @brief (batch C1) Allocates the NRD input/output surfaces and initializes the
     /// two REBLUR instances on first use, exactly like EnsureSharcResources: a user
@@ -879,7 +988,14 @@ struct ScreenSpaceRayTracing : Feature
     /// the rest of the pipeline reads. Callers gate on ReblurReady(a_specular).
     /// Restores the sampler and b1 bindings the surrounding draw set up before it
     /// returns, since the NRD dispatch owns those slots while it runs.
-    void RunReblur(bool a_specular);
+    ///
+    /// @return true iff the NRD dispatch actually ran to completion and the denoised
+    /// result was unpacked over the chain's radiance surface. On false the radiance
+    /// surface is left exactly as the ray march wrote it — undenoised, but this frame's
+    /// — and the chain's REBLUR reset stays pending. (S1.2: the old void signature let a
+    /// skipped dispatch clear the reset flag and unpack whatever the output surface
+    /// happened to hold, which on the first frame is uninitialised RGBA16F.)
+    [[nodiscard]] bool RunReblur(bool a_specular);
     /// @brief Snapshots the normal-roughness G-buffer into texHistoryNormals, and (defect
     /// D3, when SVGF is on) mip 0 of the Hi-Z pyramid into texHistoryDepth, for next frame's
     /// SVGF temporal validation. Called exactly once per frame, by whichever of the two draw

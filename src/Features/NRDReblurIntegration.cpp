@@ -174,18 +174,32 @@ ID3D11View* NRDReblurIntegration::ResolveResource(const nrd::ResourceDesc& res)
 	return nullptr;
 }
 
-void NRDReblurIntegration::Dispatch()
+bool NRDReblurIntegration::Dispatch()
 {
 	if (!m_instance)
-		return;
+		return false;
 
 	auto context = globals::d3d::context;
 	const auto& instanceDesc = *nrd::GetInstanceDesc(*m_instance);
 
 	const nrd::DispatchDesc* dispatchDescs = nullptr;
 	uint32_t dispatchNum = 0;
-	nrd::GetComputeDispatches(*m_instance, &m_identifier, 1, dispatchDescs, dispatchNum);
+	if (nrd::GetComputeDispatches(*m_instance, &m_identifier, 1, dispatchDescs, dispatchNum) != nrd::Result::SUCCESS ||
+		!dispatchDescs || dispatchNum == 0) {
+		// (S1.2) NRD refused to schedule. Nothing has been written, so the caller must not
+		// treat the OUT_* surfaces as this frame's result.
+		logger::warn("NRDReblurIntegration: GetComputeDispatches produced no work for identifier {}", m_identifier);
+		memset(m_namedSRV, 0, sizeof(m_namedSRV));
+		memset(m_namedUAV, 0, sizeof(m_namedUAV));
+		return false;
+	}
 
+	// (S1.2) Any skipped dispatch makes the whole denoiser's output meaningless, not merely
+	// incomplete: REBLUR's passes feed one another and its permanent pool is written in
+	// place, so a hole in the chain corrupts the history as well as the frame. The loop
+	// therefore aborts on the first missing pipeline or unresolved storage binding rather
+	// than pressing on with `continue`.
+	bool ok = true;
 	static bool s_debugLogged = false;
 
 	for (uint32_t di = 0; di < dispatchNum; di++) {
@@ -214,8 +228,38 @@ void NRDReblurIntegration::Dispatch()
 			continue;
 
 		// Set compute shader
-		if (dispatch.pipelineIndex >= static_cast<uint32_t>(m_pipelines.size()) || !m_pipelines[dispatch.pipelineIndex])
-			continue;
+		if (dispatch.pipelineIndex >= static_cast<uint32_t>(m_pipelines.size()) || !m_pipelines[dispatch.pipelineIndex]) {
+			logger::error("NRDReblurIntegration: dispatch '{}' wants pipeline {} which does not exist; aborting denoiser {}",
+				dispatch.name ? dispatch.name : "?", dispatch.pipelineIndex, m_identifier);
+			ok = false;
+			break;
+		}
+
+		// (S1.2) Validate before binding anything. A null storage binding means the pass
+		// would write nowhere, so the passes after it would read undefined data and the
+		// permanent pool would end the frame inconsistent with its own history length.
+		{
+			const auto& validatePipeline = instanceDesc.pipelines[dispatch.pipelineIndex];
+			uint32_t validateIdx = 0;
+			bool missing = false;
+			for (uint32_t ri = 0; ri < validatePipeline.resourceRangesNum && !missing; ri++) {
+				const auto& range = validatePipeline.resourceRanges[ri];
+				for (uint32_t k = 0; k < range.descriptorsNum; k++, validateIdx++) {
+					if (range.descriptorType == nrd::DescriptorType::STORAGE_TEXTURE &&
+						!ResolveResource(dispatch.resources[validateIdx])) {
+						missing = true;
+						break;
+					}
+				}
+			}
+			if (missing) {
+				logger::error("NRDReblurIntegration: dispatch '{}' has an unbound storage resource; aborting denoiser {}",
+					dispatch.name ? dispatch.name : "?", m_identifier);
+				ok = false;
+				break;
+			}
+		}
+
 		context->CSSetShader(m_pipelines[dispatch.pipelineIndex].get(), nullptr, 0);
 
 		// Update constant buffer
@@ -288,6 +332,7 @@ void NRDReblurIntegration::Dispatch()
 	}
 
 	context->CSSetShader(nullptr, nullptr, 0);
+	return ok;
 }
 
 void NRDReblurIntegration::CreatePoolTextures(uint32_t w, uint32_t h)

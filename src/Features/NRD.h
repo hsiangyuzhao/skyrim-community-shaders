@@ -60,6 +60,18 @@ struct NRD : Feature
 	// loaded, shader failed to compile).
 	bool AreGuidesReady() const { return guidesReadyThisFrame; }
 
+	// (S1.3) Whether PrepareGuides *would* succeed if it were called now — exactly the
+	// precondition set PrepareGuides itself tests, minus anything per-frame.
+	//
+	// Consumers need this because the frame's pass order puts every feature's Prepass()
+	// ahead of PrepareGuides(): a consumer deciding at Prepass time whether to bring its
+	// REBLUR path up cannot ask AreGuidesReady() without reading last frame's answer.
+	// This is the question that has a stable answer at that point.
+	bool CanPrepareGuides() const
+	{
+		return settings.Enabled && prepareNRDGuidesCompute && texNRDViewZ && texNRDNormalRoughness && texNRDMV;
+	}
+
 	// Build a CommonSettings block shared by every denoiser instance this
 	// frame. Centralizing this guarantees frameIndex and prev-frame matrices
 	// stay in lockstep across consumers.
