@@ -125,16 +125,18 @@ bool SSRTConfAccept(float a_centreDepth, float3 a_centreNormal, float a_tapDepth
 /// to the other surface, and an unguarded difference would then predict a slope steep enough
 /// to accept that surface's taps outright -- the exact bleed the predicates exist to prevent.
 /// A rejected gradient is zero, which reduces the prediction to the flat test.
+/// The two neighbours are the taps at -1 and +1 *along the blur axis of this frame's image*.
+/// Nothing in this file has a temporal dimension; "minus" and "plus" are spatial offsets.
 float SSRTConfPlaneGradient(
 	float a_centreDepth, float3 a_centreNormal,
-	float a_prevDepth, float3 a_prevNormal,
-	float a_nextDepth, float3 a_nextNormal)
+	float a_minusDepth, float3 a_minusNormal,
+	float a_plusDepth, float3 a_plusNormal)
 {
 	const bool usable =
-		SSRTConfAccept(a_centreDepth, a_centreNormal, a_prevDepth, a_prevNormal, SSRT_CONF_LO_GRAD_TOL) &&
-		SSRTConfAccept(a_centreDepth, a_centreNormal, a_nextDepth, a_nextNormal, SSRT_CONF_LO_GRAD_TOL);
+		SSRTConfAccept(a_centreDepth, a_centreNormal, a_minusDepth, a_minusNormal, SSRT_CONF_LO_GRAD_TOL) &&
+		SSRTConfAccept(a_centreDepth, a_centreNormal, a_plusDepth, a_plusNormal, SSRT_CONF_LO_GRAD_TOL);
 
-	const float gradient = 0.5f * (rcp(max(a_nextDepth, SSRT_CONF_MIN_DEPTH)) - rcp(max(a_prevDepth, SSRT_CONF_MIN_DEPTH)));
+	const float gradient = 0.5f * (rcp(max(a_plusDepth, SSRT_CONF_MIN_DEPTH)) - rcp(max(a_minusDepth, SSRT_CONF_MIN_DEPTH)));
 
 	// Finiteness by bit test rather than isfinite(): fxc may assume its inputs finite without
 	// /Gis, so the guard has to look at the bits. Both operands are reciprocals of a clamped
@@ -143,7 +145,7 @@ float SSRTConfPlaneGradient(
 	return (usable && isFiniteSafe(gradient)) ? gradient : 0.0f;
 }
 
-/// @brief Normalises an accumulated normal, falling back to the reference on cancellation.
+/// @brief Normalises a summed normal, falling back to the reference on cancellation.
 ///
 /// The taps folded in are all within SSRT_CONF_LO_NORMAL_COS of the reference, so the sum
 /// cannot actually cancel; this exists so that a non-finite G-buffer texel cannot publish a
