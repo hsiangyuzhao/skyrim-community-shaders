@@ -708,7 +708,14 @@ void PhysicalSky::AccumShadow()
 		context->CSSetShaderResources(0, (int)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 		context->CSSetShader(csShadowAccum.get(), nullptr, 0);
-		context->Dispatch((resolution[0] + 7u) >> 3, (resolution[1] + 7u) >> 3, 1);
+		// texApShadow is half resolution (see Draw()/SetupResources: Width/Height /= 2) and
+		// ShadowAccum.cs.hlsl addresses it as such -- SV_DispatchThreadID is a half-res texel,
+		// scaled back to a full-res UV by `* rcpFrameDim * 2`. Consumers read TexApShadow[px / 2].
+		// So the dispatch domain is ceil(renderExtent / 2), not the full render extent: the group
+		// count is ceil(ceil(res / 2) / 8) == ceil(res / 16). Dispatching the full extent launched
+		// 4x the required threads, and the surplus ran all 30 shadow steps before having its
+		// out-of-bounds UAV write discarded.
+		context->Dispatch((resolution[0] + 15u) >> 4, (resolution[1] + 15u) >> 4, 1);
 
 		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::PhysicalSkyShadowAccum);
 
