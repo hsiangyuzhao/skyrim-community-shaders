@@ -18,6 +18,37 @@
 #include "Features/Upscaling.h"
 
 #include "Hooks.h"
+#include "Utils/GpuTimers.h"
+
+// CPU-side timing of our own work. Purely observational: every one of these is a
+// QueryPerformanceCounter bracket around an existing call, and each is a no-op unless the
+// Performance Overlay's draw-call table is on screen. No orchestration is changed.
+//
+// Why it has to happen here: the overlay's CPU attribution charges the gap between two
+// engine draw calls to whichever BSShader type is drawing, so all of the work below used
+// to be billed to an unrelated shader type. State::Debug() now subtracts these brackets
+// from the interval it charges, which both fixes those rows and gives our features their
+// own honest rows.
+namespace
+{
+	/**
+	 * @brief Stable timing key for a Feature, cached per instance.
+	 *
+	 * Util::CpuPassScope holds a string_view, so the key has to outlive the scope, and
+	 * GetShortName() returns by value. Building a std::string per feature per frame would
+	 * be a cost paid even with the overlay off, so cache one string per Feature; the
+	 * feature list is fixed after load and unordered_map never moves its nodes, so the
+	 * returned reference stays valid for the process lifetime.
+	 */
+	const std::string& CpuTimerKey(Feature* a_feature)
+	{
+		static std::unordered_map<const Feature*, std::string> cache;
+		auto it = cache.find(a_feature);
+		if (it == cache.end())
+			it = cache.emplace(a_feature, a_feature->GetShortName()).first;
+		return it->second;
+	}
+}
 
 struct DepthStates
 {
@@ -237,7 +268,10 @@ void Deferred::ReflectionsPrepasses()
 	auto state = globals::state;
 
 	state->activeReflections = true;
-	state->UpdateSharedData(false, false);
+	{
+		Util::CpuPassScope timer("Shared Data");
+		state->UpdateSharedData(false, false);
+	}
 
 	ZoneScoped;
 	TracyD3D11Zone(globals::game::graphicsState->tracyCtx, "Early Prepass");
@@ -249,6 +283,7 @@ void Deferred::ReflectionsPrepasses()
 
 	for (auto* feature : Feature::GetFeatureList()) {
 		if (feature->loaded) {
+			Util::CpuPassScope timer(CpuTimerKey(feature));
 			feature->ReflectionsPrepass();
 		}
 	}
@@ -261,7 +296,10 @@ void Deferred::EarlyPrepasses()
 	if (!shaderCache->IsEnabled())
 		return;
 
-	globals::state->UpdateSharedData(false, true);
+	{
+		Util::CpuPassScope timer("Shared Data");
+		globals::state->UpdateSharedData(false, true);
+	}
 
 	ZoneScoped;
 	TracyD3D11Zone(globals::game::graphicsState->tracyCtx, "Early Prepass");
@@ -273,6 +311,7 @@ void Deferred::EarlyPrepasses()
 
 	for (auto* feature : Feature::GetFeatureList()) {
 		if (feature->loaded) {
+			Util::CpuPassScope timer(CpuTimerKey(feature));
 			feature->EarlyPrepass();
 		}
 	}
@@ -291,9 +330,13 @@ void Deferred::PrepassPasses()
 	auto context = globals::d3d::context;
 	context->OMSetRenderTargets(0, nullptr, nullptr);  // Unbind all bound render targets
 
-	globals::truePBR->PrePass();
+	{
+		Util::CpuPassScope timer("TruePBR");
+		globals::truePBR->PrePass();
+	}
 	for (auto* feature : Feature::GetFeatureList()) {
 		if (feature->loaded) {
+			Util::CpuPassScope timer(CpuTimerKey(feature));
 			feature->Prepass();
 		}
 	}
@@ -301,7 +344,10 @@ void Deferred::PrepassPasses()
 
 void Deferred::StartDeferred()
 {
-	globals::state->UpdateSharedData(true, false);
+	{
+		Util::CpuPassScope timer("Shared Data");
+		globals::state->UpdateSharedData(true, false);
+	}
 
 	auto shadowState = globals::game::shadowState;
 	GET_INSTANCE_MEMBER(renderTargets, shadowState)
@@ -359,7 +405,10 @@ void Deferred::StartDeferred()
 
 void Deferred::DeferredPasses()
 {
-	globals::features::upscaling.CheckFrameConstants();
+	{
+		Util::CpuPassScope timer("Upscaling");
+		globals::features::upscaling.CheckFrameConstants();
+	}
 
 	ZoneScoped;
 	TracyD3D11Zone(globals::state->tracyCtx, "Deferred");
@@ -404,28 +453,38 @@ void Deferred::DeferredPasses()
 	// DrawSSRTDiffuse / DrawSSRTSpecular so their REBLUR instances see guides that
 	// describe this frame.
 	auto& nrdService = globals::features::nrd;
-	if (nrdService.loaded)
+	if (nrdService.loaded) {
+		Util::CpuPassScope timer("NRD");
 		nrdService.PrepareGuides();
+	}
 
 	auto& ssgi = globals::features::screenSpaceGI;
-	if (ssgi.loaded)
+	if (ssgi.loaded) {
+		Util::CpuPassScope timer("ScreenSpaceGI");
 		ssgi.DrawSSGI();
+	}
 	auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec, ssgi_bent_normal, ssgi_env_irradiance] = ssgi.GetOutputTextures();
 	bool ssgi_hq_spec = ssgi.settings.EnableExperimentalSpecularGI;
 
 	auto& ssrt = globals::features::screenSpaceRayTracing;
-	if (ssrt.loaded && ssrt.settings.EnableDiffuse)
+	if (ssrt.loaded && ssrt.settings.EnableDiffuse) {
+		Util::CpuPassScope timer("ScreenSpaceRayTracing");
 		ssrt.DrawSSRTDiffuse();
+	}
 
 	auto dispatchCount = Util::GetScreenDispatchCount(true);
 
 	auto& sss = globals::features::subsurfaceScattering;
-	if (sss.loaded)
+	if (sss.loaded) {
+		Util::CpuPassScope timer("SubsurfaceScattering");
 		sss.DrawSSS();
+	}
 
 	auto& dynamicCubemaps = globals::features::dynamicCubemaps;
-	if (dynamicCubemaps.loaded)
+	if (dynamicCubemaps.loaded) {
+		Util::CpuPassScope timer("DynamicCubemaps");
 		dynamicCubemaps.UpdateCubemap();
+	}
 
 	auto& terrainBlending = globals::features::terrainBlending;
 
@@ -433,12 +492,15 @@ void Deferred::DeferredPasses()
 
 	auto& physSky = globals::features::physicalSky;
 
-	if (ssrt.loaded && ssrt.settings.EnableSpecular)
+	if (ssrt.loaded && ssrt.settings.EnableSpecular) {
+		Util::CpuPassScope timer("ScreenSpaceRayTracing");
 		ssrt.DrawSSRTSpecular();
+	}
 
 	// Deferred Composite
 	{
 		TracyD3D11Zone(globals::state->tracyCtx, "Deferred Composite");
+		Util::CpuPassScope timer("Deferred Composite");
 
 		ID3D11ShaderResourceView* srvs[]{
 			specular.SRV,
@@ -515,11 +577,14 @@ void Deferred::DeferredPasses()
 		context->CSSetShader(nullptr, nullptr, 0);
 	}
 
-	if (dynamicCubemaps.loaded)
+	if (dynamicCubemaps.loaded) {
+		Util::CpuPassScope timer("DynamicCubemaps");
 		dynamicCubemaps.PostDeferred();
+	}
 
 	auto& upscaling = globals::features::upscaling;
 	if (upscaling.loaded && upscaling.settings.enableDLSSRR) {
+		Util::CpuPassScope timer("Upscaling");
 		upscaling.SnapshotBeforeTransparency();
 	}
 }

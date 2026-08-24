@@ -257,7 +257,14 @@ struct IDXGISwapChain_Present
 		state->Reset();
 		menu->DrawOverlay();
 
+		// Time the CPU spends blocked inside Present: waiting on the GPU, on vsync or on a
+		// frame-rate limiter. This is the single biggest thing the overlay's "Other" row
+		// used to hide, and it is the only place it can be measured - the call below is the
+		// real Present. Purely observational, and a no-op unless the overlay's draw-call
+		// table is on screen.
+		Util::CpuPassTimers::GetSingleton()->BeginPresentWait();
 		HRESULT retval = func(This, SyncInterval, Flags);
+		Util::CpuPassTimers::GetSingleton()->EndPresentWait();
 
 		TracyD3D11Collect(state->tracyCtx);
 

@@ -105,11 +105,18 @@ auto MakeMetricColumn(const auto& theme, auto valueGetter, auto colorGetter, aut
 static std::tuple<float, float, float> CalculateSummaryData(float smoothedFrameTime, float measuredSum)
 {
 	float totalSmoothedDrawCalls = globals::state->GetTotalSmoothedDrawCalls();
+	// Community Shaders' own CPU cost and the Present wait are measured on the same clock
+	// with the same smoothing and are disjoint from the shader-type buckets (State::Debug()
+	// subtracts them from the intervals it charges), so they belong in the accounted sum.
+	// Every caller gets this for free, which keeps the residual consistent between the live
+	// table, the A/B aggregation and the manual-toggle capture.
+	auto* cpuTimers = Util::CpuPassTimers::GetSingleton();
+	const float accountedSum = measuredSum + cpuTimers->GetFeatureTotalMs() + cpuTimers->GetPresentWaitMs();
 	// Same clock, same smoother, and the buckets only ever cover first-draw..last-draw of
 	// the frame, so this cannot legitimately go negative any more. The clamp is a belt-and
 	// -braces guard for the transient right after the overlay is unhidden, where the
 	// bucket EMAs have been frozen for a while and the wall-clock EMA has not.
-	float otherFrameTime = std::max(0.0f, Util::CalculateOtherFrameTime(smoothedFrameTime, measuredSum));
+	float otherFrameTime = std::max(0.0f, Util::CalculateOtherFrameTime(smoothedFrameTime, accountedSum));
 	float otherPercent = Util::CalculatePercentage(otherFrameTime, smoothedFrameTime);
 	float totalCostPerCall = Util::CalculateCostPerCall(smoothedFrameTime, totalSmoothedDrawCalls);
 	return { otherFrameTime, otherPercent, totalCostPerCall };
@@ -312,6 +319,7 @@ void PerformanceOverlay::DrawOverlay()
 	// Build draw call rows ONCE per frame and reuse
 	auto rowSets = this->BuildDrawCallRows();
 	std::vector<DrawCallRow> allRows = rowSets.cpuRows;
+	allRows.insert(allRows.end(), rowSets.ourCpuRows.begin(), rowSets.ourCpuRows.end());
 	allRows.insert(allRows.end(), rowSets.gpuRows.begin(), rowSets.gpuRows.end());
 	allRows.insert(allRows.end(), rowSets.summaryRows.begin(), rowSets.summaryRows.end());
 
@@ -409,7 +417,9 @@ void PerformanceOverlay::DrawOverlay()
 
 	// Show Draw Calls if enabled
 	if (this->settings.ShowDrawCalls) {
+		DrawBottleneckSummary();
 		DrawDrawCallsTable(rowSets.cpuRows, rowSets.summaryRows);
+		DrawOurCpuPassTable(rowSets.ourCpuRows);
 		DrawGpuPassTable(rowSets.gpuRows);
 	}
 
@@ -1514,6 +1524,181 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 		gpuSummaryRows);
 }
 
+/**
+ * @brief Renders Community Shaders' own CPU submit cost, per feature.
+ *
+ * These rows sum exactly to the "CS features (CPU)" line in the table above, and they are
+ * disjoint from the shader-type rows there (State::Debug() removes this time from the
+ * intervals it charges). A feature whose cost rounds to nothing gets no row at all rather
+ * than a row of zeros.
+ */
+void PerformanceOverlay::DrawOurCpuPassTable(const std::vector<DrawCallRow>& ourCpuRows)
+{
+	if (ourCpuRows.empty())
+		return;
+
+	auto& overlay = globals::features::performanceOverlay;
+	auto* menu = Menu::GetSingleton();
+	const auto& theme = menu->GetTheme();
+
+	ImGui::Spacing();
+	ImGui::TextUnformatted("Community Shaders (CPU submit)");
+	if (ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted(
+				"What Community Shaders costs the CPU: building constant buffers, binding\n"
+				"resources and issuing dispatches. Wall clock, same smoothing as the table above.\n"
+				"  - these rows sum to the \"CS features (CPU)\" line above, exactly\n"
+				"  - they are NOT inside the shader-type rows; that time is subtracted there\n"
+				"  - so the table above still adds up to the frame time\n"
+				"Same feature names as the GPU table, so submit cost and execution cost can be\n"
+				"read side by side. A feature with no measurable cost gets no row.\n\n"
+				"Coverage: everything reachable from the deferred renderer's own orchestration.\n"
+				"Passes driven straight from engine hooks (the post-processing draw legs, the\n"
+				"upscale itself) are not in here; their GPU cost still is.");
+		}
+	}
+
+	bool anyTestData = !overlay.testData.empty();
+	auto legends = overlay.BuildDrawCallLegends(theme, anyTestData);
+	auto columns = overlay.BuildPassTableColumns(theme, legends, false, "CPU Time (%)",
+		"Calls: how many times this bucket was entered in the last frame. A feature with\n"
+		"several instrumented entry points (a prepass plus a deferred pass) counts more\n"
+		"than one. Draw Calls and Cost/Call are not shown: these are compute submissions,\n"
+		"not draws, so both would be meaningless.");
+
+	std::vector<std::function<bool(const DrawCallRow&, const DrawCallRow&, bool)>> sorters;
+	for (const auto& col : columns)
+		sorters.push_back(col.sortFunc);
+
+	std::vector<DrawCallRow> rowsCopy = ourCpuRows;
+
+	std::function<void(int, int, const DrawCallRow&)> rowHandler =
+		[&columns](int, int colIdx, const DrawCallRow& row) { columns[colIdx].cellRender(row, colIdx); };
+
+	Util::ShowSortedStringTableCustom<DrawCallRow>(
+		"OurCpuPassOverlayTable",
+		[&columns]() { std::vector<std::string> h; for (const auto& c : columns) h.push_back(c.header); return h; }(),
+		rowsCopy,
+		2,      // Default sort column (CPU Time %)
+		false,  // Default descending (most expensive first)
+		sorters,
+		rowHandler);
+}
+
+/**
+ * @brief CPU-bound / GPU-bound readout.
+ *
+ * The verdict comes from how long the CPU spends blocked in Present, which is the only
+ * reliable signal available from inside a D3D11 plugin:
+ *
+ *   - a frame-spanning timestamp pair does NOT measure GPU busy time. GPU timestamps are
+ *     elapsed GPU clock, and that clock runs while the GPU is idle, so such a span just
+ *     reproduces wall-clock frame time.
+ *   - the sum of our GPU buckets is a genuine measurement but only of OUR passes, so it is
+ *     a lower bound on GPU busy time and is labelled as one.
+ *   - Present blocking, on the other hand, is exactly "the CPU had nothing to do but wait".
+ *
+ * The one thing it cannot distinguish is a GPU wait from a vsync or frame-limiter wait,
+ * which the tooltip says outright.
+ */
+void PerformanceOverlay::DrawBottleneckSummary()
+{
+	auto* menu = Menu::GetSingleton();
+	const auto& theme = menu->GetTheme();
+
+	auto* cpuTimers = Util::CpuPassTimers::GetSingleton();
+	const float frameMs = globals::state->GetAttributionFrameTimeMs();
+	const float waitMs = cpuTimers->GetPresentWaitMs();
+	const float busyMs = std::max(0.0f, frameMs - waitMs);
+
+	float gpuMeasuredMs = 0.0f;
+	Util::GpuPassTimers::GetSingleton()->ForEachActiveBucket(
+		[&gpuMeasuredMs](const Util::GpuPassTimers::BucketReport& report) { gpuMeasuredMs += report.smoothedMs; });
+
+	const float waitShare = (frameMs > 0.0f) ? (waitMs / frameMs) : 0.0f;
+
+	// Thresholds are deliberately coarse and the middle band is named rather than forced
+	// into one of the two answers.
+	const char* verdict = "collecting...";
+	ImVec4 verdictColor = theme.StatusPalette.Disable;
+	if (frameMs > 0.0f) {
+		if (waitShare >= 0.25f) {
+			verdict = "GPU-bound (or frame-limited)";
+			verdictColor = theme.StatusPalette.Warning;
+		} else if (waitShare <= 0.10f) {
+			verdict = "CPU-bound";
+			verdictColor = theme.StatusPalette.Error;
+		} else {
+			verdict = "balanced";
+			verdictColor = theme.StatusPalette.SuccessColor;
+		}
+	}
+
+	if (ImGui::BeginTable("BottleneckSummary", 2, ImGuiTableFlags_SizingStretchProp)) {
+		ImGui::TableSetupColumn("##prop", ImGuiTableColumnFlags_WidthFixed, ImGui::GetTextLineHeight() * 6);
+		ImGui::TableSetupColumn("##value");
+
+		ImGui::TableNextColumn();
+		ImGui::TextUnformatted("Bottleneck:");
+		ImGui::TableNextColumn();
+		ImGui::TextColored(verdictColor, "%s", verdict);
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted(
+					"How this is decided: the share of the frame the CPU spends blocked inside\n"
+					"Present. Over 25% means the CPU is waiting and the frame is limited by\n"
+					"something downstream of it; under 10% means the CPU never gets to idle.\n"
+					"\n"
+					"Error sources, honestly:\n"
+					"  - a Present wait can be the GPU, vsync, or a frame-rate limiter. Uncap the\n"
+					"    frame rate to tell them apart.\n"
+					"  - \"GPU (measured)\" is only OUR passes, so it is a LOWER BOUND on GPU busy\n"
+					"    time. The engine's own draws are not instrumented.\n"
+					"  - there is no honest way to measure whole-frame GPU busy time from here: a\n"
+					"    frame-spanning timestamp pair measures elapsed GPU clock, which keeps\n"
+					"    running while the GPU is idle, so it would just restate frame time.\n"
+					"  - GPU numbers are read back a few frames late and passes overlap, so they\n"
+					"    do not line up frame-for-frame with the CPU numbers.\n"
+					"  - everything here is smoothed over roughly 20 frames.");
+			}
+		}
+
+		ImGui::TableNextColumn();
+		ImGui::TextUnformatted("CPU busy:");
+		ImGui::TableNextColumn();
+		ImGui::Text("%.2f ms of %.2f ms (%.0f%%)", busyMs, frameMs,
+			(frameMs > 0.0f) ? (busyMs / frameMs * 100.0f) : 0.0f);
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Frame time minus the time blocked in Present. Wall clock, smoothed.");
+			}
+		}
+
+		ImGui::TableNextColumn();
+		ImGui::TextUnformatted("Present wait:");
+		ImGui::TableNextColumn();
+		ImGui::Text("%.2f ms (%.0f%%)", waitMs, waitShare * 100.0f);
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Measured with QueryPerformanceCounter around the real Present call.\nGPU wait, vsync wait and frame-limiter wait all land here.");
+			}
+		}
+
+		ImGui::TableNextColumn();
+		ImGui::TextUnformatted("GPU (measured):");
+		ImGui::TableNextColumn();
+		ImGui::Text(">= %.2f ms", gpuMeasuredMs);
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Sum of the GPU pass buckets: Community Shaders' own passes only, so a\nlower bound on how busy the GPU was. Not comparable 1:1 with the CPU\nnumbers - different clock, read back a few frames late, and the passes\noverlap each other.");
+			}
+		}
+
+		ImGui::EndTable();
+	}
+}
+
 DrawCallLegends PerformanceOverlay::BuildDrawCallLegends(const Menu::ThemeSettings& theme, bool anyTestData) const
 {
 	(void)anyTestData;
@@ -1823,6 +2008,24 @@ PerformanceOverlay::DrawCallRowSets PerformanceOverlay::BuildDrawCallRows() cons
 				report.smoothedMs, percent, 0.0f, report.tooltip, true, testFrameTime, testCostPerCall });
 		});
 
+	// Community Shaders' own CPU submit cost. These milliseconds are NOT part of any
+	// shader-type row: State::Debug() subtracts them from the interval it charges, so the
+	// per-feature rows here and the shader-type rows above are disjoint and both are part
+	// of the same additive breakdown of the frame.
+	auto* cpuTimers = Util::CpuPassTimers::GetSingleton();
+	std::vector<DrawCallRow> ourCpuRows;
+	float ourCpuSum = 0.0f;
+	cpuTimers->ForEachActiveBucket([&ourCpuRows, &ourCpuSum, smoothedFrameTime](const Util::CpuPassTimers::Report& report) {
+		ourCpuRows.push_back({ std::string(report.label) + ":", report.rowId, report.callsPerFrame,
+			report.smoothedMs, Util::CalculatePercentage(report.smoothedMs, smoothedFrameTime),
+			0.0f, report.tooltip, true, std::nullopt, std::nullopt });
+		ourCpuSum += report.smoothedMs;
+	});
+	// GetFeatureTotalMs() includes buckets too small to earn a row, so the aggregate line
+	// is the honest total rather than the sum of what happens to be displayed.
+	const float ourCpuTotal = std::max(ourCpuSum, cpuTimers->GetFeatureTotalMs());
+	const float presentWaitMs = cpuTimers->GetPresentWaitMs();
+
 	auto [otherFrameTime, otherPercent, totalCostPerCall] = CalculateSummaryData(smoothedFrameTime, measuredSum);
 	if (std::abs(otherFrameTime) < 1e-4f)
 		otherFrameTime = 0.0f;
@@ -1837,14 +2040,46 @@ PerformanceOverlay::DrawCallRowSets PerformanceOverlay::BuildDrawCallRows() cons
 		totalTestFrameTime = itTotal->second.frameTime;
 		totalTestCostPerCall = itTotal->second.costPerCall;
 	}
+	DrawCallRow ourCpuRow = {
+		"CS features (CPU):", magic_enum::enum_integer(SpecialShaderType::OurCpu), kDrawCallsNotApplicable,
+		ourCpuTotal, Util::CalculatePercentage(ourCpuTotal, smoothedFrameTime), 0.0f,
+		std::string("CPU time Community Shaders itself spends preparing and submitting work: "
+					"constant buffers, resource binds and dispatch calls.\n\n"
+					"Broken down per feature in the \"Community Shaders (CPU submit)\" table below, "
+					"which sums exactly to this line. It is NOT part of the shader-type rows above - "
+					"those intervals have this time removed - so the whole table adds up."),
+		true, std::nullopt, std::nullopt
+	};
+
+	DrawCallRow presentWaitRow = {
+		"Present / GPU wait:", magic_enum::enum_integer(SpecialShaderType::PresentWait), kDrawCallsNotApplicable,
+		presentWaitMs, Util::CalculatePercentage(presentWaitMs, smoothedFrameTime), 0.0f,
+		std::string("CPU time blocked inside Present, measured around the real Present call.\n\n"
+					"Large means the CPU is waiting - for the GPU to finish, for vsync, or for a "
+					"frame-rate limiter. Small means the CPU never got a chance to idle, i.e. the "
+					"CPU is the limit. This is the main input to the CPU-bound / GPU-bound verdict "
+					"above the table.\n\n"
+					"It cannot tell a GPU wait apart from a vsync or frame-cap wait: uncap the frame "
+					"rate if you need to know which."),
+		true, std::nullopt, std::nullopt
+	};
+
 	DrawCallRow otherRow = {
-		"Other:", magic_enum::enum_integer(SpecialShaderType::Other), kDrawCallsNotApplicable, otherFrameTime, otherPercent,
+		"Engine (untracked):", magic_enum::enum_integer(SpecialShaderType::Other), kDrawCallsNotApplicable, otherFrameTime, otherPercent,
 		0.0f,
-		std::string("CPU frame time not attributed to any measured shader type: UI, post-processing, "
-					"engine work and anything else the per-shader timers do not see.\n\n"
-					"This is a CPU-only residual. The GPU Passes table below is measured on the GPU "
-					"clock and is NOT subtracted from this value, so the two tables can legitimately "
-					"overlap - GPU work runs while the CPU is doing something else."),
+		std::string("What is left of the frame after the shader-type rows, Community Shaders' own "
+					"CPU cost and the Present wait. It is not a Community Shaders cost and we "
+					"cannot break it down from inside a plugin.\n\n"
+					"What lives here: the engine's own per-frame work - visibility culling, "
+					"animation and skinning, Papyrus scripts, physics, navmesh and AI, audio, the "
+					"vanilla UI - plus D3D11 driver overhead and any other SKSE plugins in the "
+					"load order.\n\n"
+					"Why we cannot split it: attribution comes from hooking Community Shaders' own "
+					"call sites and the engine's draw submissions. Everything in this row happens "
+					"between draw submissions in engine code we do not hook, so there is no marker "
+					"to charge it against. Splitting it needs an external profiler.\n\n"
+					"A big number here is normal in Skyrim and usually means the game is CPU-bound "
+					"on engine work, not on rendering."),
 		true, otherTestFrameTime, otherTestCostPerCall
 	};
 	// Always use the actual total frame time for live data
@@ -1854,13 +2089,18 @@ PerformanceOverlay::DrawCallRowSets PerformanceOverlay::BuildDrawCallRows() cons
 	DrawCallRow totalRow = {
 		"Total:", magic_enum::enum_integer(SpecialShaderType::Total), static_cast<int>(globals::state->GetTotalSmoothedDrawCalls()), totalFrameTime, totalPercent,
 		totalCostPerCall,
-		std::string("Total frame time."),
+		std::string("Wall-clock frame time, smoothed the same way as every row above, so the rows "
+					"add up to it. The FPS readout at the top of the panel is an instantaneous "
+					"sample re-taken every Update Interval, so it can differ by a millisecond or "
+					"two - that is the difference between the two estimators, not an error."),
 		true, totalTestFrameTime, totalTestCostPerCall
 	};
 	std::vector<DrawCallRow> summaryRows;
+	summaryRows.push_back(ourCpuRow);
+	summaryRows.push_back(presentWaitRow);
 	summaryRows.push_back(otherRow);
 	summaryRows.push_back(totalRow);
-	return { std::move(mainRows), std::move(summaryRows), std::move(gpuRows) };
+	return { std::move(mainRows), std::move(summaryRows), std::move(gpuRows), std::move(ourCpuRows) };
 }
 
 /**
@@ -1878,9 +2118,14 @@ std::function<void(int, int, const DrawCallRow&)> PerformanceOverlay::CreateTabl
 {
 	return [&columns, this](int rowIdx, int colIdx, const DrawCallRow& row) {
 		(void)rowIdx;
-		// Special handling for summary rows
-		if ((row.label == "Total:" || row.label == "Other:") && colIdx == 0) {
-			if (row.label == "Total:") {
+		// Summary rows are identified by their negative pseudo shader type, not by their
+		// label text: there are four of them now and matching on strings meant renaming a
+		// row silently turned it back into a clickable shader row.
+		const bool isSummary = row.shaderType < 0;
+		const bool isTotal = row.shaderType == magic_enum::enum_integer(SpecialShaderType::Total);
+
+		if (isSummary && colIdx == 0) {
+			if (isTotal) {
 				if (ImGui::Selectable(row.label.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
 					HandleTotalRowToggle();
 				}
@@ -1891,7 +2136,7 @@ std::function<void(int, int, const DrawCallRow&)> PerformanceOverlay::CreateTabl
 						ImGui::Text("FPS: %.2f", _fps);
 					}
 				}
-			} else if (row.label == "Other:") {
+			} else {
 				ImGui::TextUnformatted(row.label.c_str());
 				if (!row.tooltip.empty() && ImGui::IsItemHovered()) {
 					if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -1899,11 +2144,9 @@ std::function<void(int, int, const DrawCallRow&)> PerformanceOverlay::CreateTabl
 					}
 				}
 			}
-		} else if (row.label == "Total:" || row.label == "Other:") {
-			// No tooltip for summary rows in non-label columns
-			columns[colIdx].cellRender(row, colIdx);
 		} else {
-			// Normal row: ensure tooltips never modify cell content
+			// Normal row (and summary rows in non-label columns): tooltips never modify
+			// cell content.
 			columns[colIdx].cellRender(row, colIdx);
 		}
 	};

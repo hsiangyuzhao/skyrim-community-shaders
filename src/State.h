@@ -88,6 +88,10 @@ public:
 	float smoothWallFrameTimeMs = 0.0f;
 	LARGE_INTEGER lastFrameMarkTime{};
 	bool wallFrameTimePrimed = false;
+	// Running total from Util::CpuPassTimers at the previous draw call. Its delta is our
+	// own CPU work inside the interval about to be charged to a shader type, and is
+	// removed from it - see Debug().
+	float accountedCpuSnapshotMs = 0.0f;
 	// Longer than this (< 2 FPS) is a loading screen, an alt-tab or a period where the
 	// overlay was hidden and Debug() did not run; folding it in would poison the average
 	// for seconds. Matches PerformanceOverlay::Settings::kStatsMaxSampleMs.

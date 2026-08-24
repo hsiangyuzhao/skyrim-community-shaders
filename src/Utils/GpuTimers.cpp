@@ -82,6 +82,18 @@ namespace Util
 			"kBucketInfo must have one entry per GpuBucket");
 	}
 
+	namespace
+	{
+		/// Shared gate for both timers: instrumentation is free unless the table is on screen.
+		bool TableIsOnScreen()
+		{
+			auto& overlay = globals::features::performanceOverlay;
+			return globals::menu && globals::menu->overlayVisible &&
+			       overlay.loaded && overlay.IsOverlayVisible() &&
+			       overlay.settings.ShowDrawCalls;
+		}
+	}
+
 	GpuPassTimers* GpuPassTimers::GetSingleton()
 	{
 		static GpuPassTimers singleton;
@@ -90,11 +102,7 @@ namespace Util
 
 	bool GpuPassTimers::OverlayWantsTimings() const
 	{
-		auto& overlay = globals::features::performanceOverlay;
-		return globals::d3d::device && globals::d3d::context &&
-		       globals::menu && globals::menu->overlayVisible &&
-		       overlay.loaded && overlay.IsOverlayVisible() &&
-		       overlay.settings.ShowDrawCalls;
+		return globals::d3d::device && globals::d3d::context && TableIsOnScreen();
 	}
 
 	bool GpuPassTimers::EnsureQueries(Interval& a_interval) const
@@ -340,6 +348,318 @@ namespace Util
 			a_callback(BucketReport{ kBucketInfo[i].label, kRowIdBase + i, bucket.smoothedMs,
 				bucket.lastSampleIntervals, kBucketInfo[i].tooltip });
 		}
+	}
+
+	// ========================================================================
+	// CpuPassTimers
+	// ========================================================================
+
+	namespace
+	{
+		struct CpuBucketDoc
+		{
+			const char* key;      // Feature short name, or an orchestration key from Deferred.cpp
+			const char* label;    // Overlay row name; kept aligned with the GPU bucket labels
+			const char* tooltip;
+		};
+
+		// Labels match the GPU pass table on purpose: the same feature appears under the
+		// same name in both tables, so its CPU submit cost and its GPU execution cost can
+		// be read side by side. Keys not listed here still work - the row is then labelled
+		// with the raw key.
+		constexpr CpuBucketDoc kCpuBucketDocs[] = {
+			{ "ScreenSpaceRayTracing", "SSRT",
+				"CPU time spent issuing SSRT work: constant-buffer updates, resource binds and\n"
+				"dispatch calls for the prepasses, the diffuse and specular chains and the\n"
+				"denoiser. This is submission cost only - the GPU execution cost is the SSRT\n"
+				"rows in the GPU table." },
+			{ "ScreenSpaceGI", "SSGI",
+				"CPU time spent issuing the Screen Space GI chain. Submission cost only; see\n"
+				"the SSGI row in the GPU table for execution cost." },
+			{ "Skylighting", "Skylighting",
+				"CPU time spent on Skylighting: probe update dispatch plus the height-map pass\n"
+				"setup, which includes the engine-side precipitation-mask plumbing it reuses." },
+			{ "PhysicalSky", "PhysicalSky",
+				"CPU time spent issuing Physical Sky's LUT generation and shadow accumulation." },
+			{ "DynamicCubemaps", "Dynamic Cubemaps",
+				"CPU time spent issuing the dynamic cubemap update (capture / inferrence /\n"
+				"irradiance convolution round-robin) and the post-deferred leg." },
+			{ "LightLimitFix", "Light Limit Fix",
+				"CPU time spent building the light list and issuing cluster building and light\n"
+				"culling. The per-light CPU loop lives here, so this row can be much larger than\n"
+				"the GPU row of the same name." },
+			{ "PostProcessing", "Post Processing",
+				"CPU time spent on the post-processing chain's prepass leg. The main draw legs\n"
+				"are driven from an engine hook rather than from Deferred.cpp and are NOT\n"
+				"included; their GPU cost is in the GPU table." },
+			{ "TerrainBlending", "Terrain Blending",
+				"CPU time spent on Terrain Blending's prepass leg." },
+			{ "VolumetricLighting", "Volumetric Lighting",
+				"CPU time spent issuing volumetric lighting: generate, raymarch and both blurs." },
+			{ "SubsurfaceScattering", "Subsurface Scattering",
+				"CPU time spent issuing the skin subsurface scattering chain and its composite." },
+			{ "ScreenSpacePointLightShadows", "SSPLS",
+				"CPU time spent issuing the Screen Space Point Light Shadows PrepareDepth chain." },
+			{ "ScreenSpaceShadows", "Screen Space Shadows",
+				"CPU time spent issuing the screen space shadow passes." },
+			{ "TerrainShadows", "Terrain Shadows",
+				"CPU time spent issuing the terrain shadow height-map passes." },
+			{ "NRD", "NRD Guides",
+				"CPU time spent publishing this frame's NRD guide buffers (viewZ, normal +\n"
+				"roughness, motion vectors) for the REBLUR denoiser instances." },
+			{ "Upscaling", "Upscaling",
+				"CPU time spent in the upscaler's per-frame bookkeeping reached from the deferred\n"
+				"path. The upscale itself runs from an engine hook and is not included here." },
+			{ "Deferred Composite", "Deferred Composite",
+				"CPU time spent binding the ~22 SRVs and issuing the deferred composite dispatch\n"
+				"that consumes every feature's output." },
+			{ "Shared Data", "Shared Data",
+				"CPU time spent gathering and uploading the per-frame shared constant buffer that\n"
+				"every Community Shaders shader reads. Runs up to three times per frame." },
+			{ "TruePBR", "TruePBR",
+				"CPU time spent in the TruePBR prepass." },
+		};
+
+		const CpuBucketDoc* FindCpuDoc(std::string_view a_key)
+		{
+			for (const auto& doc : kCpuBucketDocs) {
+				if (a_key == doc.key)
+					return &doc;
+			}
+			return nullptr;
+		}
+
+		constexpr const char* kCpuGenericTooltip =
+			"CPU time Community Shaders spends preparing and submitting this feature's work.\n"
+			"Submission cost only - what the GPU then does with it is a separate measurement.";
+	}
+
+	CpuPassTimers* CpuPassTimers::GetSingleton()
+	{
+		static CpuPassTimers singleton;
+		return &singleton;
+	}
+
+	bool CpuPassTimers::WantsTimings() const
+	{
+		return TableIsOnScreen();
+	}
+
+	int64_t CpuPassTimers::Now() const
+	{
+		LARGE_INTEGER now;
+		QueryPerformanceCounter(&now);
+		return now.QuadPart;
+	}
+
+	void CpuPassTimers::AdvanceFrameIfNew()
+	{
+		if (frequency == 0) {
+			LARGE_INTEGER freq;
+			QueryPerformanceFrequency(&freq);
+			frequency = freq.QuadPart;
+		}
+
+		if (!frameChecker.IsNewFrame())
+			return;
+
+		++frameIndex;
+
+		// An interval left open across a frame boundary would otherwise measure a whole
+		// frame. Discard it rather than record a lie.
+		openBucket = -1;
+		openDepth = 0;
+
+		for (auto& bucket : buckets) {
+			if (!bucket.inUse)
+				continue;
+			if (bucket.frameCalls > 0) {
+				bucket.lastActiveFrame = frameIndex;
+				bucket.everActive = true;
+			}
+			bucket.smoothedMs = bucket.smoothedMs * kSmoothingOld +
+			                    static_cast<float>(bucket.frameMs) * kSmoothingNew;
+			bucket.lastFrameCalls = bucket.frameCalls;
+			bucket.frameMs = 0.0;
+			bucket.frameCalls = 0;
+		}
+
+		presentWaitSmoothedMs = presentWaitSmoothedMs * kSmoothingOld +
+		                        static_cast<float>(presentWaitFrameMs) * kSmoothingNew;
+		presentWaitFrameMs = 0.0;
+		frameAccountedMs = 0.0;
+	}
+
+	int CpuPassTimers::Acquire(std::string_view a_key)
+	{
+		int freeSlot = -1;
+		for (int i = 0; i < kMaxBuckets; ++i) {
+			if (buckets[i].inUse) {
+				if (buckets[i].key == a_key)
+					return i;
+			} else if (freeSlot < 0) {
+				freeSlot = i;
+			}
+		}
+		if (freeSlot < 0)
+			return -1;  // table full: drop the sample rather than mis-attribute it
+
+		auto& bucket = buckets[freeSlot];
+		bucket.key.assign(a_key);
+		if (const auto* doc = FindCpuDoc(a_key)) {
+			bucket.label = doc->label;
+			bucket.tooltip = doc->tooltip;
+		} else {
+			// key is stored in the bucket's own std::string, which lives as long as the
+			// singleton and is never reassigned while in use, so c_str() is stable.
+			bucket.label = bucket.key.c_str();
+			bucket.tooltip = kCpuGenericTooltip;
+		}
+		bucket.inUse = true;
+		return freeSlot;
+	}
+
+	void CpuPassTimers::Begin(std::string_view a_key)
+	{
+		if (!WantsTimings())
+			return;
+
+		AdvanceFrameIfNew();
+		if (frequency == 0)
+			return;
+
+		if (openBucket >= 0) {
+			// Nested. The outer bucket already covers this time; counting it again would
+			// break the "buckets sum to frame time" identity.
+			++openDepth;
+			return;
+		}
+
+		const int index = Acquire(a_key);
+		if (index < 0)
+			return;
+
+		openBucket = index;
+		openDepth = 0;
+		openStart = Now();
+	}
+
+	void CpuPassTimers::End(std::string_view a_key)
+	{
+		if (openBucket < 0)
+			return;
+
+		if (buckets[openBucket].key != a_key) {
+			// Close of an absorbed nested interval (or an unbalanced call). Either way the
+			// outer interval must stay open.
+			if (openDepth > 0)
+				--openDepth;
+			return;
+		}
+		if (openDepth > 0) {
+			--openDepth;
+			return;
+		}
+
+		const double ms = static_cast<double>(Now() - openStart) * 1000.0 / static_cast<double>(frequency);
+		auto& bucket = buckets[openBucket];
+		if (ms > 0.0) {
+			bucket.frameMs += ms;
+			frameAccountedMs += ms;
+		}
+		++bucket.frameCalls;
+		openBucket = -1;
+	}
+
+	void CpuPassTimers::BeginPresentWait()
+	{
+		if (!WantsTimings())
+			return;
+		AdvanceFrameIfNew();
+		if (frequency == 0)
+			return;
+		presentWaitStart = Now();
+	}
+
+	void CpuPassTimers::EndPresentWait()
+	{
+		if (presentWaitStart == 0 || frequency == 0)
+			return;
+		const double ms = static_cast<double>(Now() - presentWaitStart) * 1000.0 / static_cast<double>(frequency);
+		presentWaitStart = 0;
+		if (ms > 0.0) {
+			presentWaitFrameMs += ms;
+			frameAccountedMs += ms;
+		}
+	}
+
+	float CpuPassTimers::GetFrameAccountedMs()
+	{
+		if (!WantsTimings())
+			return 0.0f;
+		AdvanceFrameIfNew();
+		return static_cast<float>(frameAccountedMs);
+	}
+
+	float CpuPassTimers::GetPresentWaitMs()
+	{
+		return presentWaitSmoothedMs;
+	}
+
+	float CpuPassTimers::GetFeatureTotalMs()
+	{
+		float total = 0.0f;
+		for (const auto& bucket : buckets) {
+			if (bucket.inUse)
+				total += bucket.smoothedMs;
+		}
+		return total;
+	}
+
+	void CpuPassTimers::ForEachActiveBucket(const std::function<void(const Report&)>& a_callback)
+	{
+		// Also drives the per-frame fold when nothing is instrumented any more, so stale
+		// rows decay and time out instead of freezing at their last value.
+		if (WantsTimings())
+			AdvanceFrameIfNew();
+
+		for (int i = 0; i < kMaxBuckets; ++i) {
+			auto& bucket = buckets[i];
+			if (!bucket.inUse || !bucket.everActive)
+				continue;
+			if (frameIndex - bucket.lastActiveFrame > static_cast<uint64_t>(kActiveTimeoutFrames))
+				continue;
+			// A bucket whose cost rounds to nothing gets no row at all. Showing "0 ms" for
+			// a feature that is switched off (or whose prepass is an early return) is worse
+			// than showing nothing: it reads as a broken measurement.
+			if (bucket.smoothedMs < kVisibleThresholdMs)
+				continue;
+			a_callback(Report{ bucket.label, kRowIdBase + i, bucket.smoothedMs,
+				bucket.lastFrameCalls, bucket.tooltip });
+		}
+	}
+
+	void CpuPassTimers::Reset()
+	{
+		for (auto& bucket : buckets) {
+			bucket.key.clear();
+			bucket.label = nullptr;
+			bucket.tooltip = nullptr;
+			bucket.frameMs = 0.0;
+			bucket.frameCalls = 0;
+			bucket.smoothedMs = 0.0f;
+			bucket.lastFrameCalls = 0;
+			bucket.lastActiveFrame = 0;
+			bucket.inUse = false;
+			bucket.everActive = false;
+		}
+		frameIndex = 0;
+		frameAccountedMs = 0.0;
+		presentWaitFrameMs = 0.0;
+		presentWaitSmoothedMs = 0.0f;
+		presentWaitStart = 0;
+		openBucket = -1;
+		openDepth = 0;
 	}
 
 }

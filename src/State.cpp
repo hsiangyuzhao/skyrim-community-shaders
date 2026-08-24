@@ -17,6 +17,7 @@
 #include "ShaderCache.h"
 #include "TruePBR.h"
 #include "Utils/FileSystem.h"
+#include "Utils/GpuTimers.h"
 
 void State::Draw()
 {
@@ -115,6 +116,11 @@ void State::Debug()
 		}
 		QueryPerformanceCounter(&frameStartTime);
 		frameTimingActive = true;
+
+		// Anything our own timers already accounted for before the first draw of the frame
+		// (Present/wait, the early prepasses) sits outside the draw intervals entirely, so
+		// the baseline starts at whatever has accrued so far rather than at zero.
+		accountedCpuSnapshotMs = Util::CpuPassTimers::GetSingleton()->GetFrameAccountedMs();
 	}
 
 	// Track time for current shader type if timing is active
@@ -124,6 +130,17 @@ void State::Debug()
 
 		// Calculate elapsed time in milliseconds
 		float elapsed = (currentTime.QuadPart - frameStartTime.QuadPart) * 1000.0f / frameTimingFrequency.QuadPart;
+
+		// Remove Community Shaders' own CPU work from this interval before charging it to
+		// a shader type. The interval covers everything that happened since the previous
+		// draw call, which includes our prepasses and deferred dispatch submission - so a
+		// feature's CPU cost used to be billed to whichever BSShader type happened to draw
+		// next, not to "Other". Subtracting it here is what lets those features have their
+		// own honest rows without double counting.
+		const float accounted = Util::CpuPassTimers::GetSingleton()->GetFrameAccountedMs();
+		const float ourWork = std::max(0.0f, accounted - accountedCpuSnapshotMs);
+		accountedCpuSnapshotMs = accounted;
+		elapsed = std::max(0.0f, elapsed - ourWork);
 
 		// Add elapsed time to the current shader type
 		frameTimePerType[magic_enum::enum_integer(currentShader->shaderType.get())] += elapsed;

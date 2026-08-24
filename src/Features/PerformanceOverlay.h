@@ -19,7 +19,12 @@ struct DrawCallRow;
 enum class SpecialShaderType
 {
 	Total = -1,
-	Other = -2
+	Other = -2,  // the residual; labelled "Engine (untracked)" in the UI
+	// Aggregate of Community Shaders' own CPU submit cost. Broken down per feature in its
+	// own table; here it is one line so the CPU frame table stays additive.
+	OurCpu = -3,
+	// CPU time blocked inside Present (GPU wait / vsync / frame limiter).
+	PresentWait = -4
 };
 
 // Constants for special draw call values
@@ -264,10 +269,17 @@ struct PerformanceOverlay : OverlayFeature
 		std::vector<DrawCallRow> cpuRows;
 		std::vector<DrawCallRow> summaryRows;
 		std::vector<DrawCallRow> gpuRows;
+		/// Community Shaders' own CPU submit cost, per feature. Sums exactly to the
+		/// "CS features (CPU)" summary row, and is disjoint from the shader-type rows
+		/// because State::Debug() removes it from the intervals it charges.
+		std::vector<DrawCallRow> ourCpuRows;
 	};
 
 	void DrawDrawCallsTable(const std::vector<DrawCallRow>& mainRows, const std::vector<DrawCallRow>& summaryRows);
 	void DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRows);
+	void DrawOurCpuPassTable(const std::vector<DrawCallRow>& ourCpuRows);
+	/// @brief CPU / GPU bottleneck readout drawn above the tables.
+	void DrawBottleneckSummary();
 	DrawCallLegends BuildDrawCallLegends(const Menu::ThemeSettings& theme, bool anyTestData) const;
 	std::vector<ColumnConfig> BuildDrawCallTableColumns(const Menu::ThemeSettings& theme, const DrawCallLegends& legends, bool anyTestData);
 

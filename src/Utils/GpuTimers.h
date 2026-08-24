@@ -2,6 +2,8 @@
 
 #include <d3d11.h>
 #include <functional>
+#include <string>
+#include <string_view>
 #include <winrt/base.h>
 
 #include "Utils/Game.h"
@@ -171,5 +173,155 @@ namespace Util
 		// exists so a future call site in an unexpected place degrades into a missing
 		// sample instead of a debug-layer error and garbage timings.
 		int openBucket = -1;
+	};
+
+	/**
+	 * @brief Wall-clock (QueryPerformanceCounter) timing of Community Shaders' own CPU work.
+	 *
+	 * The overlay's CPU table attributes frame time by BSShader type, and it does so by
+	 * charging the interval between two consecutive engine draw calls to whichever shader
+	 * type is drawing. That means our own CPU cost - building constant buffers, binding
+	 * resources, issuing dispatches - was never in the "Other" residual at all: it was
+	 * silently folded into whichever shader type happened to draw next.
+	 *
+	 * This timer measures those stretches explicitly, and State::Debug() subtracts them
+	 * from the interval it is about to charge to a shader type. The result is an additive
+	 * breakdown:
+	 *
+	 *     sum(shader types) + our CPU buckets + Present/wait + Engine (untracked)
+	 *         == wall-clock frame time
+	 *
+	 * Same clock and same 0.95/0.05 smoothing as the shader-type buckets, stepped once per
+	 * frame on the same frame counter, so the identity survives smoothing.
+	 *
+	 * Render-thread only (every call site is on the thread owning the immediate context).
+	 * Every entry point is a no-op while the overlay's draw-call table is hidden, so normal
+	 * gameplay pays nothing.
+	 */
+	class CpuPassTimers
+	{
+	public:
+		static CpuPassTimers* GetSingleton();
+
+		/**
+		 * @brief Opens an interval attributed to a named bucket.
+		 *
+		 * @param a_key Stable identifier; a Feature's short name, or one of the
+		 *              orchestration keys used in Deferred.cpp. The overlay label and
+		 *              tooltip are looked up from it (see kCpuBucketDocs), falling back to
+		 *              the key itself so a new call site never needs a table edit to work.
+		 *
+		 * Nested intervals are absorbed into the outermost one rather than double counted,
+		 * so wrapping a call that internally wraps another is safe.
+		 */
+		void Begin(std::string_view a_key);
+
+		/// @brief Closes the interval opened by the matching Begin. Unbalanced calls are ignored.
+		void End(std::string_view a_key);
+
+		/// @brief Brackets the real Present call, i.e. the time the CPU spends blocked
+		///        waiting on the GPU, on vsync, or on a frame-rate limiter.
+		void BeginPresentWait();
+		void EndPresentWait();
+
+		struct Report
+		{
+			const char* label;
+			int rowId;
+			float smoothedMs;
+			int callsPerFrame;  ///< intervals this bucket recorded in the last completed frame
+			const char* tooltip;
+		};
+
+		/// @brief Iterates feature buckets with a non-trivial cost. Present/wait is excluded
+		///        (it gets its own summary row) and so is anything under kVisibleThresholdMs,
+		///        so a feature that is switched off leaves no row behind instead of showing 0.
+		void ForEachActiveBucket(const std::function<void(const Report&)>& a_callback);
+
+		/**
+		 * @brief Milliseconds accumulated in instrumented buckets since this frame started.
+		 *
+		 * State::Debug() takes the delta of this between two draw calls and removes it from
+		 * the interval it charges to a shader type; that is what keeps our CPU cost out of
+		 * the shader rows so it can be reported on its own.
+		 */
+		float GetFrameAccountedMs();
+
+		/// @brief Smoothed CPU time blocked in Present (GPU wait / vsync / frame limiter).
+		float GetPresentWaitMs();
+
+		/// @brief Smoothed sum of all feature buckets, including ones too small to get a row.
+		float GetFeatureTotalMs();
+
+		void Reset();
+
+		// Overlay row ids for CPU buckets. Above the GPU bucket range (100..115) and far
+		// outside RE::BSShader::Type, so magic_enum::enum_cast rejects them and no toggle
+		// handling can ever fire on one.
+		static constexpr int kRowIdBase = 200;
+
+	private:
+		static constexpr int kMaxBuckets = 48;
+		static constexpr int kActiveTimeoutFrames = 60;
+		static constexpr float kSmoothingOld = 0.95f;  // matches State::Debug() smoothing
+		static constexpr float kSmoothingNew = 0.05f;
+		// Below this a row is noise, not information: it is the cost of a few binds that
+		// rounds to nothing, or a feature whose Prepass is an early return. Hiding it is
+		// what makes "this row is 0 ms" impossible - a bucket either has a real number or
+		// no row at all.
+		static constexpr float kVisibleThresholdMs = 0.005f;
+
+		struct Bucket
+		{
+			std::string key;
+			const char* label = nullptr;
+			const char* tooltip = nullptr;
+			double frameMs = 0.0;
+			int frameCalls = 0;
+			float smoothedMs = 0.0f;
+			int lastFrameCalls = 0;
+			uint64_t lastActiveFrame = 0;
+			bool inUse = false;
+			bool everActive = false;
+		};
+
+		bool WantsTimings() const;
+		void AdvanceFrameIfNew();
+		int Acquire(std::string_view a_key);
+		int64_t Now() const;
+
+		Bucket buckets[kMaxBuckets];
+		Util::FrameChecker frameChecker;
+		uint64_t frameIndex = 0;
+		int64_t frequency = 0;
+
+		double frameAccountedMs = 0.0;
+
+		// Present/wait is kept out of the bucket array: it is not a feature, it is the
+		// opposite of one (time the CPU is doing nothing), and it needs its own row.
+		double presentWaitFrameMs = 0.0;
+		float presentWaitSmoothedMs = 0.0f;
+		int64_t presentWaitStart = 0;
+
+		int openBucket = -1;
+		int openDepth = 0;
+		int64_t openStart = 0;
+	};
+
+	/// @brief RAII wrapper for CpuPassTimers. The key must outlive the scope.
+	struct CpuPassScope
+	{
+		explicit CpuPassScope(std::string_view a_key) :
+			key(a_key)
+		{
+			CpuPassTimers::GetSingleton()->Begin(key);
+		}
+		~CpuPassScope() { CpuPassTimers::GetSingleton()->End(key); }
+
+		CpuPassScope(const CpuPassScope&) = delete;
+		CpuPassScope& operator=(const CpuPassScope&) = delete;
+
+	private:
+		std::string_view key;
 	};
 }
