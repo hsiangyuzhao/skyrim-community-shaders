@@ -912,9 +912,20 @@ void ScreenSpaceGI::UpdateSB()
 
 		data.ContactRadius = settings.ContactRadius;
 		data.ContactStrength = settings.ContactStrength;
+
+		// (S4.13) The render extent the history textures were written at. prevFrameDim starts
+		// at zero, so the first frame after a load publishes 0 -- which the consumers treat as
+		// "no usable history extent" and fall back to this frame's, exactly the behaviour they
+		// had before. Every subsequent frame carries the real value.
+		data.PrevFrameDim = (prevFrameDim.x > 0.0f && prevFrameDim.y > 0.0f) ? prevFrameDim : dynres;
+		data.ssgiPad0 = { 0.0f, 0.0f };
 	}
 
 	ssgiCB->Update(data);
+
+	// (S4.13) Recorded after the buffer is published, so it describes the frame whose passes
+	// are about to run -- i.e. the frame whose output the *next* frame will read as history.
+	prevFrameDim = dynres;
 }
 
 void ScreenSpaceGI::DrawSSGI()

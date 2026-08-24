@@ -292,7 +292,16 @@ float EvaluateContact(uint2 a_px, float3 a_posVS, float3 a_normalVS, float a_vie
 	const bool histValid = !(any(prevScreenPos < 0) || any(prevScreenPos > 1));
 	[branch] if (histValid)
 	{
-		const float2 prevTexCoord = Stereo::ConvertToStereoUV(prevScreenPos, eyeIndex) * (FrameDim * RcpTexDim);
+		// (S4.13) PrevFrameDim, not FrameDim. srcPrevContact was written by last frame's
+		// dispatch, which covered last frame's render extent at the texture's origin, so the
+		// normalised previous-frame position has to be scaled by *that* extent to address the
+		// texel it wrote. Using this frame's extent is exact only while the dynamic-resolution
+		// ratio holds still; when it moves, every history fetch lands off by the ratio change
+		// times the position -- up to several texels at the far edge of the screen on a large
+		// step, which for a 15 cm kernel is a large fraction of its whole radius. The failure
+		// is worst exactly when it matters most: the ratio moves because the frame time moved,
+		// i.e. during the motion this accumulator exists to stabilise.
+		const float2 prevTexCoord = Stereo::ConvertToStereoUV(prevScreenPos, eyeIndex) * (PrevFrameDim * RcpTexDim);
 		// R8_UNORM, so the fetch is a [0, 1] value by construction and no finiteness test on it
 		// could ever fire -- the format has no encoding for NaN, Inf, or an out-of-range value.
 		// The same is true of everything this pass writes, which is why the whole guard family in

@@ -68,6 +68,12 @@ cbuffer SSGICB : register(b1)
 	// (contact AO) Scales the contact kernel's occlusion. Read by contactAo.cs.hlsl only; took
 	// this buffer's other spare slot.
 	float ContactStrength;
+
+	// (S4.13) FrameDim as of the frame that wrote the history textures. A previous-frame screen
+	// position has to be scaled by the render extent that was in force when the history was
+	// written, not by this frame's; the two differ exactly when the dynamic-resolution ratio
+	// moves. Opens a new row, and the C++ side declares the row's padding explicitly to match.
+	float2 PrevFrameDim;
 };
 
 SamplerState samplerPointClamp : register(s0);

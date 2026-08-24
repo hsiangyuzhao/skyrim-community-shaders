@@ -176,9 +176,32 @@ public:
 		float DistanceNormalisation;
 
 		float ContactStrength;
+
+		// --- new row ---
+		/// @brief (S4.13) FrameDim as of the frame that wrote the history textures.
+		///
+		/// Every reprojection in this feature reads a history texture that is TexDim-sized with
+		/// the render extent at its origin, so a previous-frame screen position has to be scaled
+		/// by the *previous* frame's render extent to land on the texel that was written. The
+		/// passes were using FrameDim -- this frame's extent -- which is exact only while the
+		/// dynamic-resolution ratio holds still. When it moves, every history fetch lands a
+		/// fraction of the sub-rect away from where it should, in proportion to the ratio change.
+		///
+		/// Recorded here rather than derived, because a ratio is not recoverable after the fact.
+		/// Filled at the end of UpdateSB from the value that call published, so it describes the
+		/// frame whose output the history now holds.
+		float2 PrevFrameDim;
+		/// @brief Explicit, because a bare float2 tail would leave sizeof at 296 -- and HLSL
+		/// would pad the row anyway, so the padding may as well be visible on both sides.
+		float2 ssgiPad0;
 	};
 	STATIC_ASSERT_ALIGNAS_16(SSGICB);
 	eastl::unique_ptr<ConstantBuffer> ssgiCB;
+
+	/// @brief (S4.13) The dynamic-resolution render extent UpdateSB published last frame, i.e.
+	/// the extent the history textures were written at. Zero until the first UpdateSB, which
+	/// the consumers read as "no usable previous extent" and fall back on this frame's.
+	float2 prevFrameDim{};
 
 	eastl::unique_ptr<Texture2D> texNoise = nullptr;
 	eastl::unique_ptr<Texture2D> texWorkingDepth = nullptr;
