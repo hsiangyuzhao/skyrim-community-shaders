@@ -1776,8 +1776,32 @@ void ScreenSpaceRayTracing::Prepass()
             // as `dispatchCount >> (i + 1)`: that is floor(ceil(size/8) / 2^(i+1)) and
             // under-covers whenever the group count is odd (e.g. 1080 -> 135 groups ->
             // 67 instead of the 68 needed for mip 1, leaving the bottom rows unwritten).
-            const uint mipWidth = std::max(1u, (uint)size.x >> (i + 1));
-            const uint mipHeight = std::max(1u, (uint)size.y >> (i + 1));
+            //
+            // (S4.12) VERIFIED AND FIXED: the shift was still a floor, and the covering
+            // count is a ceiling.
+            //
+            // Destination texel j of mip k reads source texels 2j and 2j+1 of mip k-1, so
+            // the active region of mip k is every j with 2j < activeWidth(k-1), i.e.
+            // ceil(activeWidth(k-1) / 2) texels. Iterated from mip 0, the active width at
+            // level L is ceil(size.x / 2^L) -- not floor. At a dynamic-resolution width of
+            // 1921 that is 961 columns at mip 1 while `1921 >> 1` dispatches 960: column
+            // 960, whose source pair is texels 1920 and 1921, is never written. It keeps
+            // whatever the far-plane clear left there, and because every coarser level takes
+            // a min() over its children, that far-plane value propagates all the way up the
+            // pyramid -- one column of the traversal reporting "nothing here" at every mip
+            // above 0. Odd extents are the normal case under dynamic resolution, so this was
+            // live whenever DRS moved off an even width.
+            //
+            // Clamped to the mip's own allocated dimension as well, because D3D11 mip sizes
+            // *are* floors of the allocation: at an odd *output* width the ceiling can ask
+            // for a texel the resource does not have, and that write would be discarded
+            // silently.
+            const uint level = (uint)(i + 1);
+            const uint allocW = std::max(1u, (uint)texDepth->desc.Width >> level);
+            const uint allocH = std::max(1u, (uint)texDepth->desc.Height >> level);
+            const uint roundUp = 1u << level;
+            const uint mipWidth = std::min(allocW, std::max(1u, ((uint)size.x + roundUp - 1u) >> level));
+            const uint mipHeight = std::min(allocH, std::max(1u, ((uint)size.y + roundUp - 1u) >> level));
             context->Dispatch((mipWidth + 7) / 8, (mipHeight + 7) / 8, 1);
             resetViews();
         }
