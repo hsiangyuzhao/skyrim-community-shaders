@@ -146,12 +146,15 @@ cbuffer SSRTCB : register(b1)
     // --- row 2 ---
     // (diagnostic T2) Non-zero freezes the per-frame phase of the ray-direction noise; see
     // SampleRandomVector2DBaked.
-    //
-    // The only member of this row. ScreenSpaceRayTracing::SSRTCB pads the rest of it out to 48
-    // bytes, which is deliberately not declared here -- a shader may declare a prefix of a larger
-    // constant buffer, and mirroring a C++ `float pad0[3]` in HLSL would be wrong anyway (array
-    // elements get a 16-byte row each).
     uint FreezeNoisePhase;
+    // (S3.10) Non-zero takes the sample scramble from the baked blue-noise array at t6; zero
+    // takes it from a pcg3d hash, which is what shipped before. See SampleRandomVector2DBaked.
+    //
+    // The last declared member. ScreenSpaceRayTracing::SSRTCB pads the rest of the row out to
+    // 48 bytes, which is deliberately not declared here -- a shader may declare a prefix of a
+    // larger constant buffer, and mirroring a C++ `float pad0[2]` in HLSL would be wrong anyway
+    // (array elements get a 16-byte row each).
+    uint UseBlueNoise;
 };
 
 // (audit #21) Never defined by ScreenSpaceRayTracing::CompileComputeShaders, so this is
@@ -540,12 +543,26 @@ float3x3 CreateTBN(float3 N) {
 
 #define GOLDEN_RATIO 1.61803398875f
 
+// (S3.10) NUMBER OF ARRAY SLICES IN noise.dds. Read out of the file's own DX10 header, not
+// assumed: dxgiFormat 80 (BC4_UNORM), 128x128, 8 mips, arraySize 64. That figure matters
+// because the blue-noise path this constant serves was previously written -- and commented out
+// -- as `NoiseTexture[uint3(coord, 0)]` paired with `NoiseTexture[uint3(coord, 64)]`, and slice
+// 64 does not exist in a 64-slice array. An out-of-range Load returns 0, so the y coordinate of
+// every sample would have been a constant and the second dimension of the hemisphere sample a
+// pure spatial ramp. That is almost certainly why the path was abandoned rather than debugged.
+#define SSRT_NOISE_SLICE_MASK 63u
+
+// (S3.10) Second tap offset for the y coordinate.
+//
+// noise.dds is a *scalar* blue-noise array, so a 2D sample needs two values. Taking them from
+// two positions within the same slice is the standard construction: a blue-noise field's
+// autocorrelation is negligible beyond a few texels, so two taps this far apart are effectively
+// independent while each remains blue-noise distributed *across the screen*, which is the
+// property that buys the perceptual win. Coprime with 128 in both axes so the pairing does not
+// degenerate on any lattice the tiling can produce.
+#define SSRT_NOISE_TAP2_OFFSET uint2(61, 37)
+
 float2 SampleRandomVector2DBaked(uint2 pixel, uint index, uint numSamples) {
-    // int2   coord = int2(pixel.x & 127u, pixel.y & 127u);
-    // float2 xi    = float2(NoiseTexture[uint3(coord, 0)].x, NoiseTexture[uint3(coord, 64)].x);
-    // float2 u     = float2(fmod(xi.x + (((int)(pixel.x / 128)) & 0xFFu) * GOLDEN_RATIO, 1.0f), fmod(xi.y + (((int)(pixel.y / 128)) & 0xFFu) * GOLDEN_RATIO, 1.0f));
-    // return u;
-    int3 seed = int3(pixel.xy, 0);
     // (diagnostic T2) The frame counter is the *only* thing that makes this pixel's sample
     // directions differ from frame to frame, so replacing it with a constant turns the 2-spp
     // Monte-Carlo estimate into a fixed, screen-space-locked pattern. That is precisely the
@@ -554,8 +571,50 @@ float2 SampleRandomVector2DBaked(uint2 pixel, uint index, uint numSamples) {
     // pass's own reprojection must be unaffected. Diagnostic only -- frozen noise is noise a
     // denoiser cannot average away.
     const uint noisePhase = FreezeNoisePhase != 0 ? 0u : SharedData::FrameCount;
-    seed.z = Random::pcg3d(int3(seed.xy, noisePhase)).x;
-    uint2 xi = Random::pcg3d(seed).xy / 0x10000;
+
+    // (S3.10) The scramble Hammersley16 is given: blue noise by default, hash white noise as
+    // the A/B alternative.
+    //
+    // WHY THIS IS THE RIGHT SEAM. Hammersley16 uses its argument as a per-pixel Cranley-Patterson
+    // shift on the first coordinate and an XOR scramble on the second, so the argument decides
+    // *where in the sequence* each pixel starts while the sequence itself keeps the intra-pixel
+    // stratification of the N samples. Replacing the whole function with a raw texture fetch --
+    // which is what the commented-out code did -- would have thrown that stratification away and
+    // handed every one of a pixel's N samples the same direction. Only the scramble changes here.
+    //
+    // WHAT IT BUYS. The error of a 2-spp estimate does not get smaller; it gets *rearranged*.
+    // A hash gives neighbouring pixels independent scrambles, so the error field is white --
+    // energy spread evenly across all spatial frequencies, including the low ones that read as
+    // blotching and that no small denoiser kernel and no upscaler can remove. A blue-noise
+    // scramble pushes that energy into the high frequencies, where every subsequent stage --
+    // the a-trous kernel, REBLUR's spatial pass, the upscaler, and the eye's own contrast
+    // sensitivity falloff -- attenuates it. Same samples, same cost (one or two texture taps
+    // against two pcg3d hashes, which is a wash), materially quieter picture.
+    //
+    // WHY THE PHASE STILL ADVANCES PER FRAME. The third axis of this array is the temporal one,
+    // so the slice index carries the per-frame phase. Freezing it would give a fixed screen-space
+    // pattern -- which is exactly what the T2 diagnostic is for and exactly what REBLUR's
+    // temporal accumulation must not be handed, because it averages over frames and can only
+    // average away something that changes.
+    uint2 xi;
+    if (UseBlueNoise != 0) {
+        const uint2 coord = uint2(pixel.x & 127u, pixel.y & 127u);
+        const uint2 coord2 = (coord + SSRT_NOISE_TAP2_OFFSET) & 127u;
+        // One slice per (frame, sample) pair, so the N samples of a frame are decorrelated from
+        // each other as well as from the previous frame's.
+        const uint slice = (noisePhase * numSamples + index) & SSRT_NOISE_SLICE_MASK;
+        // BC4 carries 8 bits, so the fetch quantises to 1/255 and is shifted into the high byte
+        // of the 16-bit scramble Hammersley16 expects. The low byte being zero costs nothing
+        // that matters: it makes the per-pixel shift a multiple of 1/256, an order of magnitude
+        // finer than the angular resolution a 2-spp hemisphere estimate can resolve.
+        const uint nx = (uint)(NoiseTexture[uint3(coord, slice)] * 255.0f + 0.5f);
+        const uint ny = (uint)(NoiseTexture[uint3(coord2, slice)] * 255.0f + 0.5f);
+        xi = uint2(nx, ny) << 8u;
+    } else {
+        int3 seed = int3(pixel.xy, 0);
+        seed.z = Random::pcg3d(int3(seed.xy, noisePhase)).x;
+        xi = Random::pcg3d(seed).xy / 0x10000;
+    }
     float2 E = Hammersley16(index, numSamples, xi);
 #if defined(SSRT_SPECULAR)
     E.y = lerp(E.y, 0, BRDFBias);

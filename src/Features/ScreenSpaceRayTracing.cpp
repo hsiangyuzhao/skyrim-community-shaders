@@ -56,6 +56,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     FireflyClampSigma,
     SpecularDenoiseRoughnessCutoff,
     HistoryClampSigma,
+    UseBlueNoise,
     FreezeNoisePhase,
     DisableHistoryDepthTest,
     DisableHistoryNormalTest,
@@ -106,6 +107,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     FireflyClampSigma,
     SpecularDenoiseRoughnessCutoff,
     HistoryClampSigma,
+    UseBlueNoise,
     FreezeNoisePhase,
     DisableHistoryDepthTest,
     DisableHistoryNormalTest,
@@ -474,6 +476,27 @@ void ScreenSpaceRayTracing::DrawSettings()
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("(Experimental) Enables Spatially Hashed Radiance Cache (SHARC) to improve diffuse quality. This requires more memory and might impact performance.");
 #endif
+    ImGui::SeparatorText("Sampling");
+
+    // (S3.10) Default on. Free, and it is the noise the rest of the pipeline is built to remove.
+    ImGui::Checkbox("Blue Noise Sampling", &settings.UseBlueNoise);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Chooses how the ray directions are scrambled from pixel to pixel. On is the "
+            "default and costs nothing either way.\n\n"
+            "It does not reduce the amount of noise -- it moves it. Off, each pixel picks its "
+            "directions independently of its neighbours, so the leftover error comes out as "
+            "coarse patchy clumping: large soft blotches that drift about. Those are the one "
+            "kind of noise nothing downstream can remove, because the denoiser's kernel, the "
+            "upscaler and your own eye all work by averaging neighbours, and blotches are "
+            "already an average.\n\n"
+            "On, neighbouring pixels are made to disagree on purpose, so the same error comes "
+            "out as a fine even stipple instead -- which every one of those stages removes "
+            "almost completely.\n\n"
+            "Expect a visibly cleaner picture in motion and on first appearance, most obviously "
+            "on large dim surfaces. Turn it off to see the difference: watch the *shape* of the "
+            "grain, not its amount.");
+
     ImGui::SeparatorText("Debug");
 
     ImGui::Checkbox("Freeze Noise Phase", &settings.FreezeNoisePhase);
@@ -1810,7 +1833,8 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         // share SampleRandomVector2DBaked, so freezing the phase has to freeze both or the
         // experiment is confounded by whichever one is still animating.
         ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;
-        ssrCBData.pad0[0] = ssrCBData.pad0[1] = ssrCBData.pad0[2] = 0.0f;
+        ssrCBData.UseBlueNoise = (settings.UseBlueNoise && noiseSRV) ? 1u : 0u;  // (S3.10)
+        ssrCBData.pad0[0] = ssrCBData.pad0[1] = 0.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -2361,7 +2385,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ssrCBData.OcclusionStrength = settings.OcclusionStrength;
         ssrCBData.CubemapNormalization = settings.CubemapNormalization;
         ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;  // (diagnostic T2)
-        ssrCBData.pad0[0] = ssrCBData.pad0[1] = ssrCBData.pad0[2] = 0.0f;
+        ssrCBData.UseBlueNoise = (settings.UseBlueNoise && noiseSRV) ? 1u : 0u;  // (S3.10)
+        ssrCBData.pad0[0] = ssrCBData.pad0[1] = 0.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();

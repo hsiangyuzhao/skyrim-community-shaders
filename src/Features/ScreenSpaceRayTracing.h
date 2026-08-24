@@ -532,6 +532,27 @@ struct ScreenSpaceRayTracing : Feature
         /// temporal pass's own reprojection defects (which are independent of the noise
         /// phase and must survive). Not a quality setting -- with the phase frozen the noise
         /// becomes a fixed, screen-space-locked pattern that no denoiser can average away.
+        /// @brief (S3.10) Take the ray-direction sample scramble from the baked blue-noise
+        /// array (noise.dds, t6) rather than from a pcg3d hash. Default on.
+        ///
+        /// The scramble is what decides where in the Hammersley sequence each pixel starts, so
+        /// its *spatial* distribution is the spatial distribution of the 2-spp estimate's error.
+        /// A hash makes neighbouring pixels independent, i.e. white error: energy spread evenly
+        /// over all spatial frequencies including the low ones, which read as blotching and
+        /// which neither a small a-trous kernel nor REBLUR's spatial pass nor an upscaler can
+        /// remove. Blue noise pushes that same energy into the high frequencies, where every
+        /// one of those stages -- and the eye's own contrast sensitivity -- attenuates it. The
+        /// samples, the sample count and the cost are unchanged; only where the error sits is.
+        ///
+        /// The baked path existed but was commented out, and reading noise.dds' own DX10 header
+        /// says why it was abandoned rather than fixed: the array has 64 slices and the code
+        /// indexed slice 64 for its second coordinate, which returns 0 out of range. This
+        /// revival uses the third axis as what it is -- 64 frames of temporal blue noise -- and
+        /// takes the second coordinate from a second tap within the slice.
+        ///
+        /// A switch rather than a silent change, so the A/B can be run: turn it off and the
+        /// noise grain goes from a fine even stipple to coarser, patchier clumping.
+        bool UseBlueNoise = true;
         bool FreezeNoisePhase = false;
         /// @brief (diagnostic D3) Bypass the defect D3 history depth-disocclusion test.
         ///
@@ -740,8 +761,15 @@ struct ScreenSpaceRayTracing : Feature
         /// @brief (diagnostic T2) Non-zero replaces SharedData::FrameCount with 0 in the
         /// ray-direction noise seed. See Settings::FreezeNoisePhase.
         uint FreezeNoisePhase;
-        float pad0[3];
+        /// @brief (S3.10) Non-zero takes the sample scramble from the baked blue-noise array;
+        /// zero takes it from a pcg3d hash. See Settings::UseBlueNoise.
+        uint UseBlueNoise;
+        float pad0[2];
     };
+    static_assert(sizeof(SSRTCB) == 48,
+        "ScreenSpaceRayTracing::SSRTCB must stay three whole 16-byte constant buffer rows; "
+        "the SSRTCB declaration in ssrt_raymarch.hlsl mirrors these offsets up to UseBlueNoise "
+        "and must move with them.");
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
