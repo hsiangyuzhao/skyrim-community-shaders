@@ -181,6 +181,15 @@ const static float DepthOffsets[16] = {
 #		include "IBL/IBL.hlsli"
 #	endif
 
+// (F10) This file used to pass a literal 1.0 as GetIBLColor's skylighting weight, i.e. every
+// distant tree in the game claimed unobstructed sky whatever it stood under. Sampling the probe
+// needs the array, so the include is new here; t50/t51 are bound once per frame by
+// Skylighting::Prepass, which Deferred::Prepasses runs before any object pass, so this shader
+// reads the same live binding Lighting.hlsl and RunGrass.hlsl already do.
+#	if defined(SKYLIGHTING)
+#		include "Skylighting/Skylighting.hlsli"
+#	endif
+
 #	if defined(PHYSICAL_SKY)
 #		include "PhysicalSky/Common.hlsli"
 #	endif
@@ -263,13 +272,34 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 normal = -normalize(cross(ddx, ddy));
 
 	float3 directionalAmbientColor = max(0, Color::Ambient(mul(SharedData::DirectionalAmbient, float4(normal, 1.0))));
+#			if defined(SKYLIGHTING)
+	// (F10) The real probe visibility, replacing the literal 1.0 this call used to pass. Same
+	// chain and same order as Lighting.hlsl:3233-3237 -- cosine-lobe product integral, saturate,
+	// fade towards 1 outside the probe volume, then the MinDiffuseVisibility floor. sampleNoBias
+	// rather than sample: the normal here is a ddx/ddy plane normal for a billboard rather than a
+	// real surface normal, so a receiver bias along it would push the lookup off the tree, and
+	// this shader has no blue-noise texture bound to jitter with.
+	float treeSkylighting = SharedData::skylightingSettings.MinDiffuseVisibility;
+	{
+#				if defined(VR)
+		float3 positionMSSkylight = input.WorldPosition.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+#				else
+		float3 positionMSSkylight = input.WorldPosition.xyz;
+#				endif
+		sh2 skylightingSH = Skylighting::sampleNoBias(SharedData::skylightingSettings, Skylighting::SkylightingProbeArray, positionMSSkylight);
+		float skylightingDiffuse = SphericalHarmonics::FuncProductIntegral(skylightingSH, SphericalHarmonics::EvaluateCosineLobe(normal)) / Math::PI;
+		skylightingDiffuse = saturate(skylightingDiffuse);
+		skylightingDiffuse = lerp(1.0, skylightingDiffuse, Skylighting::getFadeOutFactor(input.WorldPosition.xyz));
+		treeSkylighting = Skylighting::mixDiffuse(SharedData::skylightingSettings, skylightingDiffuse);
+	}
+#			endif
 #			if defined(IBL)
 	float3 iblColor = 0;
 	if (SharedData::iblSettings.EnableDiffuseIBL) {
 		directionalAmbientColor = Color::IrradianceToLinear(directionalAmbientColor);
 		directionalAmbientColor *= SharedData::iblSettings.DALCAmount;
 #					if defined(SKYLIGHTING)
-		iblColor += Color::Saturation(ImageBasedLighting::GetIBLColor(-normal, 1.0), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
+		iblColor += Color::Saturation(ImageBasedLighting::GetIBLColor(-normal, treeSkylighting), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
 #					else
 		iblColor += Color::Saturation(ImageBasedLighting::GetIBLColor(-normal), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
 #					endif
@@ -332,13 +362,29 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 normal = normalize(cross(ddx, ddy));
 
 	float3 directionalAmbientColor = Color::Ambient(mul(SharedData::DirectionalAmbient, float4(normal, 1.0)));
+#			if defined(SKYLIGHTING)
+	// (F10) Same fix as the branch above, which this block mirrors apart from the normal's sign.
+	float treeSkylighting = SharedData::skylightingSettings.MinDiffuseVisibility;
+	{
+#				if defined(VR)
+		float3 positionMSSkylight = input.WorldPosition.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+#				else
+		float3 positionMSSkylight = input.WorldPosition.xyz;
+#				endif
+		sh2 skylightingSH = Skylighting::sampleNoBias(SharedData::skylightingSettings, Skylighting::SkylightingProbeArray, positionMSSkylight);
+		float skylightingDiffuse = SphericalHarmonics::FuncProductIntegral(skylightingSH, SphericalHarmonics::EvaluateCosineLobe(normal)) / Math::PI;
+		skylightingDiffuse = saturate(skylightingDiffuse);
+		skylightingDiffuse = lerp(1.0, skylightingDiffuse, Skylighting::getFadeOutFactor(input.WorldPosition.xyz));
+		treeSkylighting = Skylighting::mixDiffuse(SharedData::skylightingSettings, skylightingDiffuse);
+	}
+#			endif
 #			if defined(IBL)
 	float3 iblColor = 0;
 	if (SharedData::iblSettings.EnableDiffuseIBL) {
 		directionalAmbientColor = Color::IrradianceToLinear(directionalAmbientColor);
 		directionalAmbientColor *= SharedData::iblSettings.DALCAmount;
 #					if defined(SKYLIGHTING)
-		iblColor += Color::Saturation(ImageBasedLighting::GetIBLColor(-normal, 1.0), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
+		iblColor += Color::Saturation(ImageBasedLighting::GetIBLColor(-normal, treeSkylighting), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
 #					else
 		iblColor += Color::Saturation(ImageBasedLighting::GetIBLColor(-normal), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
 #					endif

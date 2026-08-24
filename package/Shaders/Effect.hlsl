@@ -856,7 +856,24 @@ PS_OUTPUT main(PS_INPUT input)
             max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 0, 1.0)))
         );
 #		if defined(SKYLIGHTING)
-		float3 iblColor = ImageBasedLighting::GetIBLColor(float3(0, 0, 0), 1);
+		// (F10) The real probe visibility, replacing the literal 1 this call used to pass, which
+		// normalised every effect against unobstructed sky wherever it was standing. Same chain
+		// and same order as GetLightingColor above (:587-591), which is this file's own idiom for
+		// it, so the two agree; sampleNoBias for the same reason it does.
+		float effectSkylighting;
+		{
+#			if defined(VR)
+			float3 positionMSSkylight = input.WorldPosition.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+#			else
+			float3 positionMSSkylight = input.WorldPosition.xyz;
+#			endif
+			sh2 skylightingSH = Skylighting::sampleNoBias(SharedData::skylightingSettings, Skylighting::SkylightingProbeArray, positionMSSkylight);
+			float skylightingDiffuse = SphericalHarmonics::FuncProductIntegral(skylightingSH, SphericalHarmonics::EvaluateCosineLobe(float3(0, 0, 1))) / Math::PI;
+			skylightingDiffuse = saturate(skylightingDiffuse);
+			skylightingDiffuse = lerp(1.0, skylightingDiffuse, Skylighting::getFadeOutFactor(input.WorldPosition.xyz));
+			effectSkylighting = Skylighting::mixDiffuse(SharedData::skylightingSettings, skylightingDiffuse);
+		}
+		float3 iblColor = ImageBasedLighting::GetIBLColor(float3(0, 0, 0), effectSkylighting);
 #		else
 		float3 iblColor = ImageBasedLighting::GetIBLColor(float3(0, 0, 0));
 #		endif
