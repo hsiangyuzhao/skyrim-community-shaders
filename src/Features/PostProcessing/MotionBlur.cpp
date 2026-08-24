@@ -491,9 +491,12 @@ void MotionBlur::ExecuteVerticalPass()
 	ID3D11Buffer* reductionCB = reductionPassConstantBufferObj->CB();
 	SetupComputePass(verticalPassShader.get(), &horizontalSRV, 1, verticalPassTexture->uav.get(), reductionCB);
 
-	// Dispatch vertical pass
-	uint32_t dispatchX = (lastWidth + 7) / 8;
-	uint32_t dispatchY = (lastHeight + 7) / 8;
+	// Dispatch vertical pass. verticalPassTexture is FixedGridSize x FixedGridSize and the
+	// shader early-outs above GRID_SIZE in both axes, so the dispatch domain is the grid, not
+	// the screen. Sizing it off lastWidth/lastHeight launched a full-screen grid of groups
+	// (~131k at 4K) of which only these few did any work.
+	uint32_t dispatchX = (FixedGridSize + 7) / 8;
+	uint32_t dispatchY = (FixedGridSize + 7) / 8;
 	context->Dispatch(dispatchX, dispatchY, 1);
 
 	ClearComputeResources(1);
@@ -548,8 +551,10 @@ void MotionBlur::ExecuteHorizontalPass()
 	ID3D11Buffer* reductionCB = reductionPassConstantBufferObj->CB();
 	SetupComputePass(horizontalPassShader.get(), &velocitySRV, 1, horizontalPassTexture->uav.get(), reductionCB);
 
-	// Dispatch horizontal pass (width/8 × height/8)
-	uint32_t dispatchX = (lastWidth + 7) / 8;
+	// Dispatch horizontal pass. It reduces [width x height] down to
+	// [FixedGridSize x height], so only the height axis spans the screen -- the shader
+	// early-outs above the output width. X was previously sized off the screen width.
+	uint32_t dispatchX = (FixedGridSize + 7) / 8;
 	uint32_t dispatchY = (lastHeight + 7) / 8;
 	context->Dispatch(dispatchX, dispatchY, 1);
 
@@ -590,11 +595,10 @@ void MotionBlur::ExecuteNeighborMaxPass()
 	ID3D11Buffer* reductionCB = reductionPassConstantBufferObj->CB();
 	SetupComputePass(neighborMaxPassShader.get(), &verticalPassSRV, 1, neighborMaxTexture->uav.get(), reductionCB);
 
-	// Dispatch neighbor pass
-	uint32_t width = lastWidth;
-	uint32_t height = lastHeight;
-	uint32_t dispatchX = (width + 7) / 8;
-	uint32_t dispatchY = (height + 7) / 8;
+	// Dispatch neighbor pass. Reads and writes FixedGridSize x FixedGridSize textures and the
+	// shader early-outs above GRID_SIZE, so the dispatch domain is the grid, not the screen.
+	uint32_t dispatchX = (FixedGridSize + 7) / 8;
+	uint32_t dispatchY = (FixedGridSize + 7) / 8;
 	context->Dispatch(dispatchX, dispatchY, 1);
 
 	ClearComputeResources(1);
