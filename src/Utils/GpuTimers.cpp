@@ -23,6 +23,14 @@ namespace Util
 				"GPU time for the hand-written SVGF denoiser: temporal, variance and a-trous passes,\ndiffuse and specular chains combined. Only shown while the SSRT Denoiser is set to SVGF." },
 			{ "SSRT REBLUR",
 				"GPU time for the NRD REBLUR denoiser: front-end pack, all REBLUR dispatches and the\nback-end unpack, diffuse and specular combined. Only shown while the SSRT Denoiser is set to REBLUR." },
+			{ "SSRT Confidence Filter",
+				"GPU time for the ambient-reinjection confidence filter: the quarter-resolution\n"
+				"depth-aware downsample, the two separable joint-bilateral blur passes and the\n"
+				"joint-bilateral upsample back to full resolution. Purely spatial - it reads no\n"
+				"history and no previous frame. Only shown while Ambient Reinjection and the\n"
+				"Low-Resolution Confidence Filter are both on; with the filter off the same work\n"
+				"is a 7x7 full-resolution window folded into the diffuse composite, which is\n"
+				"charged to the SSRT Trace row instead." },
 			{ "SSGI",
 				"GPU time for the Screen Space GI compute chain (prefilter, radiance, GI, blur, upsample),\nexcluding the Contact AO pass which has its own row." },
 			{ "SSGI Contact AO",

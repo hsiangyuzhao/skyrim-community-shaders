@@ -23,6 +23,7 @@ namespace Util
 		SSRTTrace = 0,           // depth pyramid, prepare color, ray march, SHARC, diffuse composite
 		SSRTSvgf,                // hand-written SVGF: temporal + variance + a-trous (diffuse and specular)
 		SSRTReblur,              // NRD REBLUR: pack + REBLUR dispatches + unpack (diffuse and specular)
+		SSRTConfidenceFilter,    // reinjection confidence: quarter-res downsample + separable blur + upsample
 		SSGI,                    // Screen Space GI compute chain (excluding Contact AO)
 		SSGIContactAO,           // SSGI Contact AO pass
 		PhysicalSkyShadowAccum,  // Physical Sky aerial-perspective shadow accumulation
