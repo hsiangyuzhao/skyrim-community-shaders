@@ -616,8 +616,15 @@ void PostProcessing::PreProcess()
 	if (desc.Format == texCopy->desc.Format) {
 		// either MAIN_COPY or MAIN is used as input for HDR pass
 		// so we copy to both so whatever the game wants we're not failing it
-		context->CopySubresourceRegion(gameTexMain.texture, 0, 0, 0, 0, lastTexColor.tex, 0, nullptr);
-		context->CopySubresourceRegion(gameTexMainAlt.texture, 0, 0, 0, 0, lastTexColor.tex, 0, nullptr);
+		//
+		// The self-copy guards are not cosmetic: whenever the pipeline leaves the image in the
+		// buffer we are writing back to (no effect advanced lastTexColor, or one wrote straight
+		// into it) this was a same-resource, same-subresource CopySubresourceRegion, which D3D11
+		// leaves undefined. Skipping it is exactly the intended result, only defined.
+		if (lastTexColor.tex != gameTexMain.texture)
+			context->CopySubresourceRegion(gameTexMain.texture, 0, 0, 0, 0, lastTexColor.tex, 0, nullptr);
+		if (lastTexColor.tex != gameTexMainAlt.texture)
+			context->CopySubresourceRegion(gameTexMainAlt.texture, 0, 0, 0, 0, lastTexColor.tex, 0, nullptr);
 	} else {
 		ID3D11ShaderResourceView* srv = lastTexColor.srv;
 		ID3D11UnorderedAccessView* uav = texCopy->uav.get();
