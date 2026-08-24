@@ -320,10 +320,11 @@ struct PerformanceOverlay : OverlayFeature
 		// False until the first Present has established a baseline for the QPC delta.
 		bool frameClockPrimed = false;
 
-		// Performance counters
-		int64_t frequency;
-		int64_t lastFrameCounter;
-		int64_t currentFrameCounter;
+		// Performance counters. Zero-initialised so AdvanceFrameClock() can tell "not yet
+		// primed" from a real sample even if it runs before DataLoaded().
+		int64_t frequency = 0;
+		int64_t lastFrameCounter = 0;
+		int64_t currentFrameCounter = 0;
 
 		// Current frame metrics
 		float frameTimeMs = 0.0f;
