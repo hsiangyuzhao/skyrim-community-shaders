@@ -2,9 +2,38 @@
 
 #include "Deferred.h"
 #include "Menu.h"
+#include "ScreenSpaceRayTracing.h"
 #include "State.h"
 #include "Upscaling.h"
 #include "Utils/D3D.h"
+
+namespace
+{
+	// (S2.6) Whether anything is going to read this frame's guides.
+	//
+	// PrepareGuides is one compute dispatch writing viewZ and packed normal+roughness plus a
+	// full-resource copy of the motion-vector target: ~16 bytes per pixel of read+write
+	// traffic, ~190 MB/frame at a 4K allocation. It ran on every frame the NRD feature was
+	// loaded and enabled, whether or not any consumer had selected REBLUR -- which, with SVGF
+	// or Off selected, is nobody.
+	//
+	// Screen Space Ray Tracing's two chains are the entire consumer set in this fork. The
+	// question asked is the *effective* denoiser, not the requested one, and it is safe to ask
+	// here because SSRT resolves it in Prepass and every feature's Prepass runs ahead of the
+	// deferred passes that call PrepareGuides.
+	bool AnyConsumerNeedsGuides()
+	{
+		auto& ssrt = globals::features::screenSpaceRayTracing;
+		if (!ssrt.loaded)
+			return false;
+
+		const bool diffuse = ssrt.settings.EnableDiffuse &&
+		                     ssrt.EffectiveDenoiser(false) == ScreenSpaceRayTracing::kDenoiserREBLUR;
+		const bool specular = ssrt.settings.EnableSpecular &&
+		                      ssrt.EffectiveDenoiser(true) == ScreenSpaceRayTracing::kDenoiserREBLUR;
+		return diffuse || specular;
+	}
+}
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	NRD::Settings,
@@ -134,6 +163,13 @@ void NRD::PrepareGuides()
 	guidesReadyThisFrame = false;
 
 	if (!settings.Enabled || !prepareNRDGuidesCompute || !texNRDViewZ || !texNRDNormalRoughness || !texNRDMV)
+		return;
+
+	// (S2.6) No REBLUR consumer this frame means no reader for any of the three guides.
+	// Leaving guidesReadyThisFrame false is exactly right: a consumer that changes its mind
+	// mid-frame finds the guides absent and keeps its own fallback, which is the same answer
+	// it would get from a genuine failure.
+	if (!AnyConsumerNeedsGuides())
 		return;
 
 	auto context = globals::d3d::context;
