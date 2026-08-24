@@ -269,10 +269,16 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 		uint32_t dispatchX = ((texAdapt->desc.Width - 1) >> 5) + 1;
 		uint32_t dispatchY = ((texAdapt->desc.Height - 1) >> 5) + 1;
 
-		// Further reduce dispatches based on our sampling pattern
-		// Since we're sampling at 8x spacing, we can reduce dispatches by 8x
-		dispatchX = (dispatchX + 7) / 8;
-		dispatchY = (dispatchY + 7) / 8;
+		// Further reduce dispatches based on our sampling pattern.
+		// CS_Histogram samples pixel `tid * (2 * SAMPLE_SPACING)` with SAMPLE_SPACING == 8,
+		// i.e. a stride of 16 pixels per thread, so the thread grid is the image divided by 16
+		// -- not by 8. Dividing by 8 launched twice the threads per axis (4x in total) and the
+		// surplus clamped onto the last row/column in the shader. With Focus Area at 1.0 those
+		// clamped taps still pass the box test, so each edge pixel was counted many times over
+		// and skewed the exposure average toward the screen border; sizing the dispatch to the
+		// real stride removes both the wasted threads and the skew.
+		dispatchX = (dispatchX + 15) / 16;
+		dispatchY = (dispatchY + 15) / 16;
 
 		context->Dispatch(dispatchX, dispatchY, 1);
 
