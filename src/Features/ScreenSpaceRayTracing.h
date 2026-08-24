@@ -62,13 +62,37 @@ struct ScreenSpaceRayTracing : Feature
     struct Settings
     {
         bool EnableSpecular = true;
-        /// @brief (spec F5) Reviewed against the repaired traversal, left at 128.
-        /// The render-resolution grid unification means a step is now a whole render
-        /// texel instead of s ~= 0.667 of one, so the same 128 steps reach ~1.5x further
-        /// under DLSS Quality than they did -- the budget was previously being spent
-        /// re-testing texels, not travelling. Lowering it is a performance question and
-        /// belongs to the performance work, not here.
-        uint MaxSteps = 128;
+        /// @brief (S3.9) Default 64, down from 128. The slider is unchanged (1-256), so this
+        /// is a default and nothing else -- anyone who wants the old reach types it back.
+        ///
+        /// What M actually buys, and what it does not. The intuition that a lower step count
+        /// makes the traversal *miss* things does not hold for a Hi-Z traversal: the descent is
+        /// conservative, so a ray either finds the first intersection along its path or runs
+        /// out of budget before reaching it. Small objects are not skipped -- they are either
+        /// inside the range the budget bought or beyond it. So M is a ray *range* parameter,
+        /// not a quality-of-detection one, and the question is only how far indirect light has
+        /// to travel before something else can stand in for it.
+        ///
+        /// The range at 64. A step is one render texel at the coarsest mip the ray reaches, so
+        /// the distance covered is scene dependent. Two brackets, from the analysis in
+        /// reviews/analysis-ssrt-tracing-reshape.md:
+        ///   * open, uncluttered geometry -- the traversal climbs to the high mips almost
+        ///     immediately and 64 steps still cross the whole screen. No change at all.
+        ///   * cluttered geometry (dense forest, interiors full of clutter) -- the ray is
+        ///     forced back down the pyramid repeatedly and the reach falls from roughly 3.5 m
+        ///     to 1.7 m.
+        /// 1.7 m is still well past the scale at which screen-space diffuse GI carries most of
+        /// its signal, and past that distance Skylighting's own occlusion is what the pixel
+        /// falls back on -- which is a better estimate of a 3 m bounce than a screen-space ray
+        /// that has to guess at everything off screen anyway.
+        ///
+        /// Expected saving 10-35% of the ray-march pass depending on scene clutter; the open
+        /// end of that range is where the budget was never being spent in the first place.
+        ///
+        /// The visual A/B to run is remote light leaking through dense forest: at 64 a distant
+        /// bright surface seen through a lot of intervening geometry may stop contributing.
+        /// That is the only failure direction this change has.
+        uint MaxSteps = 64;
         /// @brief (spec F5) Reviewed, left at 6. Independent of the grid convention: it
         /// indexes pyramid levels, and freewins already clamped the slider to
         /// maxMips - 1 so the traversal cannot request a level that does not exist.
