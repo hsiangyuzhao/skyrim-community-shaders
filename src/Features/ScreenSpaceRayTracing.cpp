@@ -26,6 +26,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     UseDynamicCubemapsAsFallback,
     UseDynamicCubemapsAsFallbackSpecular,
     DiffuseSPP,
+    DiffuseSamplingMode,
     EnableDiffuse,
     SpecularMult,
     DiffuseMult,
@@ -81,6 +82,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     UseDynamicCubemapsAsFallback,
     UseDynamicCubemapsAsFallbackSpecular,
     DiffuseSPP,
+    DiffuseSamplingMode,
     EnableDiffuse,
     SpecularMult,
     DiffuseMult,
@@ -139,6 +141,53 @@ void ScreenSpaceRayTracing::DrawSettings()
     recompileFlag |= ImGui::SliderInt("Diffuse SPP", (int*)&settings.DiffuseSPP, 1, 16, "%d", ImGuiSliderFlags_AlwaysClamp);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Samples per pixel for diffuse component. Higher values reduce noise but impact performance.");
+
+    // (batch 12) Sparse sampling. Placed directly under Diffuse SPP because the two are the same
+    // axis read from opposite ends: SPP is rays per pixel, this is pixels per ray. Not gated on the
+    // denoiser -- it covers the ray march, so it applies with the denoiser off as well -- and not a
+    // recompile, because all three permutations are built at startup.
+    {
+        static const char* samplingModes[] = { "Full", "Half Resolution", "Checkerboard" };
+        int sm = (int)std::min(settings.DiffuseSamplingMode, (uint)kSamplingCheckerboard);
+        if (ImGui::Combo("Diffuse Sampling", &sm, samplingModes, 3))
+            settings.DiffuseSamplingMode = (uint)sm;
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "How many pixels share one diffuse ray. Both sparse modes trace half as many rays "
+                "as Full, so both save about the same amount in the SSRT Trace Diffuse row -- and "
+                "neither of them changes anything about the denoiser, which still runs at full "
+                "resolution on a full-resolution input.\n\n"
+                "Full: one ray per pixel. The default and the reference image; identical to the "
+                "previous build.\n\n"
+                "Half Resolution: one ray per 2x2 block, traced from whichever of the four pixels "
+                "is nearest the camera, then expanded back with a depth- and normal-aware filter. "
+                "The cheapest of the three, because the rays also step through the depth pyramid "
+                "one level coarser. Cost: indirect light detail softens, most visibly in tight "
+                "contact shadows and on thin geometry, and a one-pixel feature can lose its bounce "
+                "light entirely.\n\n"
+                "Checkerboard: one ray per horizontal pair of pixels, swapping which half is "
+                "traced every frame. Half the frame is untouched full-resolution data at any "
+                "moment and every pixel gets a real ray every other frame, so the pixel grid and "
+                "thin geometry survive much better than at half resolution. It saves a little less "
+                "than Half Resolution -- its rays walk the fine depth pyramid, like Full's do -- "
+                "and the pixels it skips are filled from their vertical neighbours, which can "
+                "shimmer slightly on fast camera motion.\n\n"
+                "Specular reflections are unaffected by all three."
+#ifdef ENABLE_SHARC
+                "\n\nIgnored while SHARC is enabled."
+#endif
+                "\n\nWatch the 'SSRT Sparse Resolve' row in the Performance Overlay against 'SSRT "
+                "Trace Diffuse': the sparse modes are only worth it while the second falls by more "
+                "than the first adds.");
+#ifdef ENABLE_SHARC
+        if (settings.DiffuseSamplingMode != kSamplingFull && settings.EnableSharc)
+            ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "Sparse diffuse sampling is inactive: SHARC is enabled.");
+        else
+#endif
+            if (settings.DiffuseSamplingMode != kSamplingFull && activeSamplingMode == kSamplingFull && settings.EnableDiffuse)
+            ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "Sparse diffuse sampling is inactive: check the log for a shader or allocation failure.");
+    }
+
     ImGui::SliderFloat("Specular Multiplier", &settings.SpecularMult, 0.0f, 5.0f, "%.2f");
     ImGui::SliderFloat("Diffuse Multiplier", &settings.DiffuseMult, 0.01f, 5.0f, "%.2f");
     ImGui::SliderFloat("Occlusion Strength", &settings.OcclusionStrength, 0.0f, 1.0f, "%.2f");
@@ -629,114 +678,161 @@ void ScreenSpaceRayTracing::DrawSettings()
             "Leaving this on locks the sampling noise into a fixed screen-space pattern that "
             "no amount of accumulation can average away.");
 
-    ImGui::Checkbox("Disable History Depth Test", &settings.DisableHistoryDepthTest);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "Diagnostic. Not for normal play. Requires Enable SVGF.\n\n"
-            "Switches off the geometric disocclusion test the temporal pass applies to every "
-            "history candidate -- the check that the surface point which occupied that history "
-            "texel last frame still lies in the plane of the surface being shaded now. "
-            "Everything else stays on: screen bounds, the 30 degree normal agreement and the "
-            "non-finite rejection, so the accumulation behaves exactly as it did before that "
-            "test existed.\n\n"
-            "Use it together with History Clamp Sigma 0 (which is the off switch for the "
-            "neighbourhood history clamp) to isolate the two mechanisms one at a time. Both "
-            "produce the same complaint -- \"the denoiser is not denoising, and there is no "
-            "ghosting either\" -- because both end with the pixel taking this frame's sample "
-            "whole, so only turning them off separately says which one is responsible.\n\n"
-            "With this off the accumulation will read history across depth discontinuities "
-            "again, i.e. the ghosting it was added to remove comes back. With the test on and "
-            "working, turning it off should now change very little: that is the check that the "
-            "plane criterion is accepting history instead of rejecting all of it.");
+    // (batch 11, item C3) The five temporal-history diagnostics, moved behind a collapsed node
+    // and shown only while SVGF is the denoiser that reads them.
+    //
+    // They cost nothing to leave switched on -- the production permutation of ssrt_temporal.hlsl
+    // has every one of them `#define`d to the literal 0u, so fxc folds the branches away and
+    // there is no GPU price to reclaim here. What there is to reclaim is the confusion: under
+    // REBLUR, which is the default, ssrt_temporal.hlsl is not dispatched at all, so all five
+    // switches do nothing whatsoever while sitting in the top level of the page. Their tooltips
+    // still said "Requires Enable SVGF", which was a checkbox before the denoiser became a
+    // dropdown, so the one hint they gave named a control that no longer exists.
+    //
+    // AnyChainSVGF() rather than the diffuse chain alone: the first four steer ssrt_temporal.hlsl,
+    // which both chains dispatch, so a specular-only SVGF configuration must still reach them.
+    // History Debug View is diffuse-only for a different reason (the two chains share one debug
+    // surface and the specular pass deliberately passes 0), which its own tooltip states.
+    //
+    // Freeze Noise Phase stays outside: it seeds the ray-direction noise in ssrt_raymarch.hlsl
+    // and is denoiser-independent, so it is as useful under REBLUR as under SVGF.
+    if (!AnyChainSVGF()) {
+        ImGui::TextDisabled("SVGF history diagnostics: select the SVGF denoiser to reach them.");
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Five switches that steer the hand-written SVGF temporal pass, plus its history "
+                "debug view. That pass is not dispatched under REBLUR or Off, so none of them "
+                "would have any effect.\n\n"
+                "They cost no GPU time either way -- the shipped shader permutation compiles every "
+                "one of them out to a constant -- so this is about not offering controls that "
+                "silently do nothing.");
+    } else if (ImGui::TreeNode("SVGF History Diagnostics")) {
+        ImGui::Checkbox("Disable History Depth Test", &settings.DisableHistoryDepthTest);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Diagnostic. Not for normal play. Steers the SVGF temporal pass.\n\n"
+                "Switches off the geometric disocclusion test the temporal pass applies to every "
+                "history candidate -- the check that the surface point which occupied that history "
+                "texel last frame still lies in the plane of the surface being shaded now. "
+                "Everything else stays on: screen bounds, the 30 degree normal agreement and the "
+                "non-finite rejection, so the accumulation behaves exactly as it did before that "
+                "test existed.\n\n"
+                "Use it together with History Clamp Sigma 0 (which is the off switch for the "
+                "neighbourhood history clamp) to isolate the two mechanisms one at a time. Both "
+                "produce the same complaint -- \"the denoiser is not denoising, and there is no "
+                "ghosting either\" -- because both end with the pixel taking this frame's sample "
+                "whole, so only turning them off separately says which one is responsible.\n\n"
+                "With this off the accumulation will read history across depth discontinuities "
+                "again, i.e. the ghosting it was added to remove comes back. With the test on and "
+                "working, turning it off should now change very little: that is the check that the "
+                "plane criterion is accepting history instead of rejecting all of it.");
 
-    ImGui::Checkbox("Disable History Normal Test", &settings.DisableHistoryNormalTest);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "Diagnostic. Not for normal play. Requires Enable SVGF.\n\n"
-            "Switches off the other geometric check the temporal pass applies to a history "
-            "candidate: that the surface facing this way last frame is still facing roughly "
-            "the same way now, within 30 degrees. Everything else stays on.\n\n"
-            "This is the partner of the switch above. Both checks produce the same complaint "
-            "when they go wrong -- the picture stays noisy and nothing accumulates -- so the "
-            "only way to tell them apart is to turn them off one at a time. Use History Debug "
-            "View to see which one to reach for first.");
+        ImGui::Checkbox("Disable History Normal Test", &settings.DisableHistoryNormalTest);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Diagnostic. Not for normal play. Steers the SVGF temporal pass.\n\n"
+                "Switches off the other geometric check the temporal pass applies to a history "
+                "candidate: that the surface facing this way last frame is still facing roughly "
+                "the same way now, within 30 degrees. Everything else stays on.\n\n"
+                "This is the partner of the switch above. Both checks produce the same complaint "
+                "when they go wrong -- the picture stays noisy and nothing accumulates -- so the "
+                "only way to tell them apart is to turn them off one at a time. Use History Debug "
+                "View to see which one to reach for first.");
 
-    ImGui::Checkbox("Force Accept History", &settings.ForceAcceptHistory);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "Diagnostic. Not for normal play. Requires Enable SVGF.\n\n"
-            "Takes whatever the motion vector points at, with no geometric checking at all. "
-            "Only three things can still turn a candidate away: it is off screen, it contains "
-            "a corrupt number, or it has nothing accumulated in it yet.\n\n"
-            "This is the last-resort test. The two switches above can each show that one check "
-            "is the thing blocking accumulation, but neither can show that the checks are the "
-            "*only* thing blocking it. If the picture still refuses to settle down with this "
-            "on, the problem is somewhere else entirely and the checks were never the "
-            "culprit.\n\n"
-            "Expect heavy smearing while it is on -- that is the point. Nothing is stopping the "
-            "filter from dragging lighting off a wall onto whatever walks in front of it.");
+        ImGui::Checkbox("Force Accept History", &settings.ForceAcceptHistory);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Diagnostic. Not for normal play. Steers the SVGF temporal pass.\n\n"
+                "Takes whatever the motion vector points at, with no geometric checking at all. "
+                "Only three things can still turn a candidate away: it is off screen, it contains "
+                "a corrupt number, or it has nothing accumulated in it yet.\n\n"
+                "This is the last-resort test. The two switches above can each show that one check "
+                "is the thing blocking accumulation, but neither can show that the checks are the "
+                "*only* thing blocking it. If the picture still refuses to settle down with this "
+                "on, the problem is somewhere else entirely and the checks were never the "
+                "culprit.\n\n"
+                "Expect heavy smearing while it is on -- that is the point. Nothing is stopping the "
+                "filter from dragging lighting off a wall onto whatever walks in front of it.");
 
-    ImGui::Checkbox("Rotated Normal Gate", &settings.RotatedNormalGate);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "Diagnostic. Requires Enable SVGF.\n\n"
-            "Changes which version of the 30 degree facing check runs.\n\n"
-            "Off (the default) is the version that has been shipping for months. It compares "
-            "surface directions without correcting for the camera having turned between the two "
-            "frames, so it is slightly too strict during fast turns and fine the rest of the "
-            "time. Well understood, mild when it misbehaves.\n\n"
-            "On is the mathematically correct version, which corrects for that camera turn. It "
-            "should be strictly better -- but only if an assumption about the game's own camera "
-            "matrices holds, and that cannot be checked outside the game.\n\n"
-            "That assumption is now checked at runtime, every frame, per pixel: the correction has "
-            "to leave a surface direction the same length it started, which nothing but a genuine "
-            "camera rotation does. Where the check fails the uncorrected version runs instead and "
-            "History Debug View paints the pixel magenta, so this switch can no longer take the "
-            "screen down with it -- the worst it can do now is quietly do nothing.\n\n"
-            "So it is off by default and this switch is how it gets proven. Turn it on with "
-            "History Debug View also on: no magenta means the correction is sound and safe to "
-            "adopt as the default; magenta everywhere means the assumption is wrong and off is "
-            "right.");
+        ImGui::Checkbox("Rotated Normal Gate", &settings.RotatedNormalGate);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Diagnostic. Steers the SVGF temporal pass.\n\n"
+                "Changes which version of the 30 degree facing check runs.\n\n"
+                "Off (the default) is the version that has been shipping for months. It compares "
+                "surface directions without correcting for the camera having turned between the two "
+                "frames, so it is slightly too strict during fast turns and fine the rest of the "
+                "time. Well understood, mild when it misbehaves.\n\n"
+                "On is the mathematically correct version, which corrects for that camera turn. It "
+                "should be strictly better -- but only if an assumption about the game's own camera "
+                "matrices holds, and that cannot be checked outside the game.\n\n"
+                "That assumption is now checked at runtime, every frame, per pixel: the correction has "
+                "to leave a surface direction the same length it started, which nothing but a genuine "
+                "camera rotation does. Where the check fails the uncorrected version runs instead and "
+                "History Debug View paints the pixel magenta, so this switch can no longer take the "
+                "screen down with it -- the worst it can do now is quietly do nothing.\n\n"
+                "So it is off by default and this switch is how it gets proven. Turn it on with "
+                "History Debug View also on: no magenta means the correction is sound and safe to "
+                "adopt as the default; magenta everywhere means the assumption is wrong and off is "
+                "right.");
 
-    ImGui::Checkbox("History Debug View", &settings.HistoryDebugView);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "Diagnostic. Requires Enable SVGF and Enable Diffuse.\n\n"
-            "Paints a picture of what the denoiser decided about every pixel's history this "
-            "frame, into texDebugHistory under Buffer Viewer below. It costs nothing while it "
-            "is off and it does not change what you see on screen either way.\n\n"
-            "Reading it:\n"
-            "  Grey, getting brighter over a second or two -- working. Brightness is how many "
-            "frames have been averaged together; white means fully settled.\n"
-            "  Red -- history thrown away by the depth/plane check.\n"
-            "  Green -- history thrown away by the 30 degree facing check.\n"
-            "  Blue -- history thrown away for being off screen, corrupt, or empty.\n"
-            "  Yellow or orange -- the plane check could not be set up for that pixel, so it was "
-            "skipped and the history was judged on facing and bounds alone. Any yellow means "
-            "\"test not run\", not \"history rejected\". The four shades say why: pale yellow -- "
-            "the point has no place in last frame's view at all; orange -- last frame's camera "
-            "cannot see it; dark orange -- the surface is exactly edge-on; lemon -- the tolerance "
-            "came out nonsense.\n"
-            "  Magenta -- only possible with Rotated Normal Gate on: the camera-turn correction "
-            "failed its own sanity check, so the uncorrected facing check ran instead.\n"
-            "  Black -- sky, or nothing to shade.\n\n"
-            "A few coloured pixels along edges and around moving things is normal and correct. "
-            "One flat colour covering the whole screen is the fault: it means that one check is "
-            "rejecting everything, everywhere, which leaves the denoiser doing nothing at all. "
-            "The colour tells you which switch above to reach for.\n\n"
-            "Shows the diffuse pass only. Specular shares the same buffer and deliberately "
-            "leaves it alone.");
+        ImGui::Checkbox("History Debug View", &settings.HistoryDebugView);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Diagnostic. Needs the SVGF denoiser and Enable Diffuse.\n\n"
+                "Paints a picture of what the denoiser decided about every pixel's history this "
+                "frame, into texDebugHistory under Buffer Viewer below. It costs nothing while it "
+                "is off and it does not change what you see on screen either way.\n\n"
+                "Reading it:\n"
+                "  Grey, getting brighter over a second or two -- working. Brightness is how many "
+                "frames have been averaged together; white means fully settled.\n"
+                "  Red -- history thrown away by the depth/plane check.\n"
+                "  Green -- history thrown away by the 30 degree facing check.\n"
+                "  Blue -- history thrown away for being off screen, corrupt, or empty.\n"
+                "  Yellow or orange -- the plane check could not be set up for that pixel, so it was "
+                "skipped and the history was judged on facing and bounds alone. Any yellow means "
+                "\"test not run\", not \"history rejected\". The four shades say why: pale yellow -- "
+                "the point has no place in last frame's view at all; orange -- last frame's camera "
+                "cannot see it; dark orange -- the surface is exactly edge-on; lemon -- the tolerance "
+                "came out nonsense.\n"
+                "  Magenta -- only possible with Rotated Normal Gate on: the camera-turn correction "
+                "failed its own sanity check, so the uncorrected facing check ran instead.\n"
+                "  Black -- sky, or nothing to shade.\n\n"
+                "A few coloured pixels along edges and around moving things is normal and correct. "
+                "One flat colour covering the whole screen is the fault: it means that one check is "
+                "rejecting everything, everywhere, which leaves the denoiser doing nothing at all. "
+                "The colour tells you which switch above to reach for.\n\n"
+                "Shows the diffuse pass only. Specular shares the same buffer and deliberately "
+                "leaves it alone.");
+
+        ImGui::TreePop();
+    }
 
 	if (ImGui::TreeNode("Buffer Viewer")) {
 		static float debugRescale = .3f;
 		ImGui::SliderFloat("View Resize", &debugRescale, 0.f, 1.f);
 
-        // (S2.5) The Buffer Viewer is a first-class consumer of the SVGF history surfaces, so
-        // having it open both allocates them and keeps them maintained -- otherwise selecting
-        // the default denoiser would silently freeze half of this panel. Consumed and cleared
-        // by Prepass, which runs before the menu draws, so this stays raised for as long as
-        // the tree is expanded and decays one frame after it is not.
-        bufferViewerOpen = true;
+        // (batch 11, item C1) This tree no longer pulls the SVGF history surfaces into existence.
+        //
+        // It used to raise a flag that SvgfHistoryNeeded() and the allocation gate in
+        // ResolveDenoisers both read, on the argument that "a debug view that silently freezes
+        // the moment the default denoiser is selected would be worse than the waste". Three
+        // things were wrong with that trade:
+        //
+        //   * The waste was not small. The nine surfaces are 68 bytes per output pixel -- ~140 MB
+        //     at 1080p and ~560 MB at a 4K allocation -- and ResetFrameState is the only thing
+        //     that releases them, which runs on a resolution change. Expanding the tree once
+        //     therefore held that memory for the rest of the session, with the tree closed and
+        //     the menu shut.
+        //   * The maintenance was not small either: three full-screen copies per frame while the
+        //     tree was open, ~330 MB/frame at a 4K allocation.
+        //   * And the freeze it was buying off happened anyway. Six of the ten panels are written
+        //     only inside the SVGF dispatch blocks, which do not run under REBLUR whatever this
+        //     flag says -- so under the default denoiser the flag bought nine allocations and
+        //     three copies per frame in order to display six cleared black rectangles.
+        //
+        // The honest presentation is the one below: show the panels when the denoiser that fills
+        // them is running, and say so plainly when it is not.
 
 		BUFFER_VIEWER_NODE(texDepth, debugRescale)
         BUFFER_VIEWER_NODE(texColor, debugRescale)
@@ -812,22 +908,31 @@ void ScreenSpaceRayTracing::DrawSettings()
         // than the kernel reaches, or missed, so the kernel runs at full width. A healthy
         // exterior reads mostly white with dark outlines around contacts, creases and foliage.
         BUFFER_VIEWER_NODE(texSSRTDiffuseHitDistance, debugRescale)
-        // (S2.5) Null until the frame after this tree is first opened, because they are
-        // allocated lazily now. One frame of absence, then they populate.
-        if (texHistory)
-            BUFFER_VIEWER_NODE(texHistory, debugRescale)
-        if (texHistoryDiffuse)
-            BUFFER_VIEWER_NODE(texHistoryDiffuse, debugRescale)
-        if (texTemporal)
-            BUFFER_VIEWER_NODE(texTemporal, debugRescale)
-        // (S2.8) The three moment surfaces rotate through each other every frame now -- the
-        // temporal pass writes the scratch one and it then *becomes* the history rather than
-        // being copied into it -- so the variable names no longer say which part a physical
-        // texture is playing. These labels do: the two "current" entries are what the temporal
-        // pass wrote this frame (and what the next frame will read as history), and "scratch"
-        // is the buffer waiting to be overwritten. Menu draw happens after the frame's
-        // dispatches, so this is the ownership as of end of frame.
-        {
+
+        // (batch 11, item C1) The nine SVGF-only surfaces, shown only while SVGF is the denoiser
+        // that writes them. AnyChainSVGF() rather than a per-chain test because these are one
+        // allocation group: EnsureSvgfResources brings all nine up together the moment either
+        // chain resolves to SVGF, and none of them is written by any other code path.
+        //
+        // Every entry keeps its own null guard as well. The predicate says "SVGF is running", not
+        // "the allocation succeeded", and a failed EnsureSvgfResources is exactly the case where
+        // an unguarded BUFFER_VIEWER_NODE would dereference null on expand (batch 10: the macro
+        // touches ->srv and ->desc inside the expanded branch, so the crash only shows up when
+        // someone clicks the label).
+        if (AnyChainSVGF()) {
+            if (texHistory)
+                BUFFER_VIEWER_NODE(texHistory, debugRescale)
+            if (texHistoryDiffuse)
+                BUFFER_VIEWER_NODE(texHistoryDiffuse, debugRescale)
+            if (texTemporal)
+                BUFFER_VIEWER_NODE(texTemporal, debugRescale)
+            // (S2.8) The three moment surfaces rotate through each other every frame now -- the
+            // temporal pass writes the scratch one and it then *becomes* the history rather than
+            // being copied into it -- so the variable names no longer say which part a physical
+            // texture is playing. These labels do: the two "current" entries are what the temporal
+            // pass wrote this frame (and what the next frame will read as history), and "scratch"
+            // is the buffer waiting to be overwritten. Menu draw happens after the frame's
+            // dispatches, so this is the ownership as of end of frame.
             auto momentNode = [&](const char* label, const eastl::unique_ptr<Texture2D>& tex) {
                 if (!tex)
                     return;
@@ -840,17 +945,40 @@ void ScreenSpaceRayTracing::DrawSettings()
             momentNode("moments (diffuse, current)", texHistoryMomentsDiffuse);
             momentNode("moments (specular, current)", texHistoryMoments);
             momentNode("moments (scratch)", texMoments);
+
+            if (texVariance)
+                BUFFER_VIEWER_NODE(texVariance, debugRescale)
+            if (texHistoryDepth)
+                BUFFER_VIEWER_NODE(texHistoryDepth, debugRescale)
+            if (texDebugHistory)
+                BUFFER_VIEWER_NODE(texDebugHistory, debugRescale)
+        } else {
+            ImGui::TextDisabled("SVGF history buffers: select the SVGF denoiser to see them.");
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text(
+                    "Nine surfaces -- the two colour histories, the three moment buffers, the "
+                    "temporal and variance scratch, the depth history snapshot and the history "
+                    "debug view -- are written only by the hand-written SVGF chain, which is not "
+                    "running.\n\n"
+                    "They are also not allocated. That is deliberate: they cost 68 bytes per "
+                    "output pixel between them (~140 MB at 1080p, ~560 MB at 4K) and are only "
+                    "released on a resolution change, so bringing them up just to show this "
+                    "panel would hold that memory for the rest of the session -- and six of the "
+                    "nine would show nothing but their cleared contents anyway.");
         }
-        if (texVariance)
-            BUFFER_VIEWER_NODE(texVariance, debugRescale)
-        if (texHistoryDepth)
-            BUFFER_VIEWER_NODE(texHistoryDepth, debugRescale)
-        if (texDebugHistory)
-            BUFFER_VIEWER_NODE(texDebugHistory, debugRescale)
 
         // (batch C1) REBLUR-path scratch; null until REBLUR is first selected.
         // (S2.7) One shared pair, so what these hold is whichever chain ran last in the
         // frame -- specular when it is enabled, diffuse otherwise.
+        // (batch 12) The compact sparse set; null unless a sparse Diffuse Sampling mode is active.
+        // Guarded because BUFFER_VIEWER_NODE dereferences unconditionally.
+        if (texSparseColor)
+            BUFFER_VIEWER_NODE(texSparseColor, debugRescale)
+        if (texSparseConfidence)
+            BUFFER_VIEWER_NODE(texSparseConfidence, debugRescale)
+        if (texSparseHitDistance)
+            BUFFER_VIEWER_NODE(texSparseHitDistance, debugRescale)
+
         if (texNRDPackInput)
             BUFFER_VIEWER_NODE(texNRDPackInput, debugRescale)
         if (texNRDPackOutput)
@@ -901,6 +1029,10 @@ void ScreenSpaceRayTracing::SanitizeSettings()
     // DIFFUSE_SPP is a compile-time macro and the ray march's sample loop divides by it.
     // 0 is a divide by zero in the estimator; the 16 ceiling is the Hammersley table's.
     settings.DiffuseSPP = std::clamp(settings.DiffuseSPP, 1u, 16u);
+    // (batch 12) An out-of-range value must not fall through ResolveSamplingMode's switch as
+    // "sparse, but neither of the two sparse modes", which would leave the compact set allocated
+    // and no shader selected to write it.
+    settings.DiffuseSamplingMode = std::min(settings.DiffuseSamplingMode, (uint)kSamplingCheckerboard);
     // (audit P3) The traversal can load exactly mip MaxMips, and mip maxMips-1 is the last
     // one allocated; an out-of-range Load returns 0 == near plane, i.e. an instant false hit.
     settings.MaxMips = std::clamp(settings.MaxMips, 1u, maxMips - 1u);
@@ -975,7 +1107,8 @@ void ScreenSpaceRayTracing::SetupResources()
 	{
         ssrtCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<SSRTCB>());
         denoiserCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<DenoiserCB>());
-        nrdPackCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<NRDPackCB>());  // (batch C1)
+        // (batch 11, item A) nrdPackCB is gone with ssrt_nrd_pack.hlsl: its three constants ride
+        // on row 3 of SSRTCB, which the ray march already binds.
     }
 
     logger::debug("Creating textures...");
@@ -1263,8 +1396,9 @@ void ScreenSpaceRayTracing::EnsureSharcResources()
 // never reference them, so fxc strips the bindings and those passes do not count as readers.
 //
 // Called from ResolveDenoisers on every path that has concluded SVGF will run -- including
-// the REBLUR-unavailable fallback and the Buffer Viewer being open -- so no consumer can
-// reach a null surface. Switching away afterwards keeps them resident, which is what makes
+// the REBLUR-unavailable fallback -- so no consumer can reach a null surface. (batch 11, item
+// C1: the Buffer Viewer used to be a third path into here and no longer is.)
+// Switching away afterwards keeps them resident, which is what makes
 // the A/B toggle instant in both directions; only a resolution change releases them.
 void ScreenSpaceRayTracing::EnsureSvgfResources()
 {
@@ -1488,6 +1622,128 @@ bool ScreenSpaceRayTracing::EnsureConfidenceFilterResources()
     return texSSRTConfidenceLo && texSSRTConfidenceLoBlur && texSSRTConfidenceLoDepth && texSSRTConfidenceLoNormal;
 }
 
+bool ScreenSpaceRayTracing::EnsureSparseResources()
+{
+    if (texSparseColor && texSparseConfidence && texSparseHitDistance)
+        return true;
+
+    logger::debug("Creating SSRT sparse sampling resources...");
+
+    auto renderer = globals::game::renderer;
+    auto context = globals::d3d::context;
+    if (!renderer || !context)
+        return false;
+
+    auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return false;
+
+    D3D11_TEXTURE2D_DESC texDesc{};
+    mainTex.texture->GetDesc(&texDesc);
+    // Same reasoning as every other surface in this feature (audit P9): no RTV is created for any
+    // of these and none is passed to GenerateMips, so the render-target bind flag and its
+    // compression metadata are pure cost. MiscFlags set rather than OR-ed, because an inherited
+    // GENERATE_MIPS would fail creation once BIND_RENDER_TARGET is gone.
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    texDesc.MiscFlags = 0;
+    texDesc.MipLevels = 1;
+    // Half the width, full height. That is the checkerboard grid exactly -- one compact texel per
+    // horizontal pair of render pixels, every row -- and a superset of the half-resolution grid,
+    // which uses the top-left quadrant. Rounded *up* rather than floor, deliberately and in the
+    // opposite direction from SSRT_GetSparseExtent's floor: the extent every shader clamps against
+    // is derived from the render sub-rect, and this is the allocation that has to contain it for
+    // every dynamic-resolution ratio the sub-rect can take, including 1.0 with an odd full width.
+    texDesc.Width = std::max(1u, (texDesc.Width + 1u) / 2u);
+
+    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    auto makeTex = [&](eastl::unique_ptr<Texture2D>& tex, DXGI_FORMAT format, const char* name) {
+        if (tex)
+            return;
+        texDesc.Format = format;
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+            .Format = format,
+            .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+            .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+        };
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+            .Format = format,
+            .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+            .Texture2D = { .MipSlice = 0 }
+        };
+        tex = eastl::make_unique<Texture2D>(texDesc);
+        tex->CreateSRV(srvDesc);
+        tex->CreateUAV(uavDesc);
+        Util::SetResourceName(tex->resource.get(), name);
+        // Cleared, unlike the confidence filter's set. Those surfaces are each rewritten in full
+        // by their own dispatch before anything reads them; these are written over the *compact*
+        // sub-rect only, so the region between it and the allocation is never written -- and the
+        // resolve's tap clamp keeps it out of reach, but a fresh texture's undefined contents are
+        // not something to leave sitting behind a clamp on the strength of an argument.
+        context->ClearUnorderedAccessViewFloat(tex->uav.get(), zero);
+    };
+
+    // Formats mirror the three full-resolution surfaces these stand in for, exactly. That is what
+    // lets ssrt_raymarch.hlsl's output block stay untouched: the stores are the same stores to the
+    // same register slots with the same types, and only the bound resource differs.
+    makeTex(texSparseColor, DXGI_FORMAT_R16G16B16A16_FLOAT, "SSRT::SparseColor");
+    makeTex(texSparseConfidence, DXGI_FORMAT_R8_UNORM, "SSRT::SparseConfidence");
+    makeTex(texSparseHitDistance, DXGI_FORMAT_R8_UNORM, "SSRT::SparseHitDistance");
+
+    return texSparseColor && texSparseConfidence && texSparseHitDistance;
+}
+
+void ScreenSpaceRayTracing::ReleaseSparseResources()
+{
+    if (!texSparseColor && !texSparseConfidence && !texSparseHitDistance)
+        return;
+
+    logger::debug("Releasing SSRT sparse sampling resources...");
+
+    // The D3D11 runtime holds its own reference to a resource for as long as a submitted command
+    // list can still reference it, so dropping ours here does not free anything the GPU is
+    // reading. Nothing this frame has been bound yet either: the only caller is
+    // ResolveSamplingMode, which runs at the top of DrawSSRTDiffuse before the first binding.
+    texSparseColor = nullptr;
+    texSparseConfidence = nullptr;
+    texSparseHitDistance = nullptr;
+}
+
+uint ScreenSpaceRayTracing::ResolveSamplingMode()
+{
+    uint mode = std::min(settings.DiffuseSamplingMode, (uint)kSamplingCheckerboard);
+
+    // Nothing to sample sparsely if the diffuse chain is not running at all, and this is the path
+    // that gives the compact set back instead of stranding ~41 MB of a 4K allocation.
+    if (!settings.EnableDiffuse)
+        mode = kSamplingFull;
+
+#ifdef ENABLE_SHARC
+    // SHARC traces into a world-space hash grid whose update pass is tuned for a full-resolution
+    // dispatch, and it is experimental and marked "(Broken)" in the UI; rather than add two more
+    // ray-march permutations for it, sparse sampling yields. The UI says so when both are set.
+    if (settings.EnableSharc)
+        mode = kSamplingFull;
+#endif
+
+    // A failed compile falls back to full density rather than to a null CSSetShader, which in
+    // D3D11 is a silent no-op: the ray march would write nothing, the resolve would read an
+    // unwritten compact surface, and the frame would look plausible and be wrong. Same argument as
+    // the whole-chain readiness guard at the top of DrawSSRTDiffuse.
+    if (mode == kSamplingHalfRes && (!raymarchDiffuseHalfResCS || !sparseResolveHalfResCS))
+        mode = kSamplingFull;
+    if (mode == kSamplingCheckerboard && (!raymarchDiffuseCheckerCS || !sparseResolveCheckerCS))
+        mode = kSamplingFull;
+
+    if (mode != kSamplingFull && !EnsureSparseResources())
+        mode = kSamplingFull;
+
+    if (mode == kSamplingFull)
+        ReleaseSparseResources();
+
+    activeSamplingMode = mode;
+    return mode;
+}
+
 // (batch C1) REBLUR-path resources, allocated on first selection rather than at boot,
 // on the same argument EnsureSharcResources makes: a user who stays on SVGF (or Off)
 // never pays for the packed scratch surfaces or the two instances' permanent and
@@ -1558,8 +1814,10 @@ void ScreenSpaceRayTracing::EnsureNRDResources()
 // (S1.3) The static half of the REBLUR readiness question: everything that is knowable
 // before SSRT has allocated anything of its own. Deliberately does *not* consult
 // AreGuidesReady(), because every feature's Prepass() runs ahead of NRD::PrepareGuides()
-// and the answer there would be last frame's. CanPrepareGuides() is the same precondition
-// set PrepareGuides tests, so it is the question with a stable answer at that point.
+// and the answer there would be last frame's. CanPrepareGuides() asks only about
+// configuration -- NRD switched on and its guide shader compiled -- which is the question with
+// a stable answer at that point. (batch 11, item C2: it also no longer asks whether the guide
+// textures exist, because those are allocated on the strength of this very answer.)
 bool ScreenSpaceRayTracing::ReblurStaticallyAvailable(bool a_specular) const
 {
     // Mono guide surfaces; the NRD feature does not load in VR, but developer mode
@@ -1571,10 +1829,12 @@ bool ScreenSpaceRayTracing::ReblurStaticallyAvailable(bool a_specular) const
     if (!nrdSvc.loaded || !nrdSvc.CanPrepareGuides())
         return false;
 
-    if (!nrdUnpackCS || !nrdPackCB)
-        return false;
-
-    return a_specular ? (bool)nrdPackSpecularCS : (bool)nrdPackDiffuseCS;
+    // (batch 11, item A) The front-end pack shaders are gone -- the ray march produces that
+    // layout itself, and its own availability is already a precondition of the draw pass that
+    // can reach this path at all -- so the back-end unpack is the whole shader requirement now.
+    // It is chain-independent, hence no a_specular branch.
+    (void)a_specular;
+    return (bool)nrdUnpackCS;
 }
 
 // (S1.3) Everything except this frame's guides. This is the predicate ResolveDenoisers uses,
@@ -1643,9 +1903,14 @@ void ScreenSpaceRayTracing::ResolveDenoisers()
 
     // (S2.5) Bring the SVGF surfaces up only when this frame is actually going to need them:
     // the user selected SVGF, or REBLUR was selected and cannot run for one of the chains (the
-    // fallback), or the Buffer Viewer is open and would otherwise show ten black rectangles.
-    // The REBLUR-working case -- the default -- allocates none of them.
-    if (SVGFSelected() || bufferViewerActive ||
+    // fallback). The REBLUR-working case -- the default -- allocates none of them.
+    //
+    // (batch 11, item C1) The `|| bufferViewerActive` term is gone. Having the Buffer Viewer tree
+    // expanded once was enough to allocate all nine surfaces -- 68 B/px, ~560 MB at a 4K
+    // allocation -- and nothing but a resolution change ever released them again, so the memory
+    // stayed committed for the rest of the session with the tree closed and the menu shut. See
+    // SvgfHistoryNeeded for why the debug view it was protecting was not actually being served.
+    if (SVGFSelected() ||
         (ReblurSelected() && (!ReblurResourcesReady(false) || !ReblurResourcesReady(true))))
         EnsureSvgfResources();
 
@@ -1730,13 +1995,23 @@ void ScreenSpaceRayTracing::ResetFrameState()
     texHistoryNormals = nullptr;
     texHistoryDepth = nullptr;
     texDebugHistory = nullptr;
+
+    // (batch 12) And the compact sparse set, for exactly the same reason: its extent is derived
+    // from kMAIN's, so a set left resident across a resolution change would be addressed with a
+    // compact grid the surfaces do not have -- which unlike a subtly wrong sample is a write
+    // outside the texture. ResolveSamplingMode rebuilds it at the new size on the next frame that
+    // asks for a sparse mode.
+    ReleaseSparseResources();
+    activeSamplingMode = kSamplingFull;
 }
 
 void ScreenSpaceRayTracing::ClearShaderCache()
 {
     static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
         &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &preblurCS, &temporalCS, &temporalDiagCS, &varianceCS, &spatialCS, &spatialSpecularCS,
-        &nrdPackDiffuseCS, &nrdPackSpecularCS, &nrdUnpackCS,
+        &nrdUnpackCS,
+        // (batch 12) sparse sampling: the two ray-march permutations and their two resolve passes
+        &raymarchDiffuseHalfResCS, &raymarchDiffuseCheckerCS, &sparseResolveHalfResCS, &sparseResolveCheckerCS,
 #ifdef ENABLE_SHARC
         &raymarchDiffuseSharcCS, &sharcUpdateRaymarchCS, &sharcResolveCS
 #endif
@@ -1787,6 +2062,25 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
 
     auto definesSpecular = defines;
     definesSpecular.push_back({ "SSRT_SPECULAR", nullptr });
+
+    // (batch 12) The two sparse ray-march permutations. Built on `defines` -- unlike the
+    // denoiser-side lists below -- because they are the *same shader* as the full-density diffuse
+    // permutation and therefore read every one of its axes: DYNAMIC_CUBEMAPS, SSGI, SKYLIGHTING
+    // and DIFFUSE_SPP all still apply.
+    auto definesSparseHalfRes = defines;
+    definesSparseHalfRes.push_back({ "SSRT_SPARSE_HALFRES", "1" });
+    auto definesSparseChecker = defines;
+    definesSparseChecker.push_back({ "SSRT_SPARSE_CHECKERBOARD", "1" });
+    // The resolve pass, whose only axis is which sparse layout it reconstructs from. Deliberately
+    // not built on `defines`, like definesWideKernel below: ssrt_sparse_resolve.hlsl reads none of
+    // DYNAMIC_CUBEMAPS / SSGI / SKYLIGHTING / DIFFUSE_SPP, and giving it four permutation axes
+    // that change nothing would only multiply the compile time.
+    const std::vector<std::pair<const char*, const char*>> definesResolveHalfRes = {
+        { "SSRT_SPARSE_HALFRES", "1" }
+    };
+    const std::vector<std::pair<const char*, const char*>> definesResolveChecker = {
+        { "SSRT_SPARSE_CHECKERBOARD", "1" }
+    };
 
     // (defect D6) The diffuse a-trous permutation runs the 5-tap B3 spline kernel; the
     // specular one keeps the 3-tap binomial. Deliberately *not* built on `defines`: this
@@ -1841,12 +2135,18 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &varianceCS, "ssrt_variance.hlsl", {} },
             { &spatialCS, "ssrt_spatial.hlsl", definesWideKernel },
             { &spatialSpecularCS, "ssrt_spatial.hlsl", definesSpecular },
-            // (batch C1) REBLUR front-end pack / back-end unpack. Deliberately not
-            // built on `defines`: neither file reads DYNAMIC_CUBEMAPS / SSGI /
-            // SKYLIGHTING / DIFFUSE_SPP, so the only permutation axis is the chain.
-            { &nrdPackDiffuseCS, "ssrt_nrd_pack.hlsl", {} },
-            { &nrdPackSpecularCS, "ssrt_nrd_pack.hlsl", { { "SSRT_SPECULAR", nullptr } } },
+            // (batch C1) REBLUR back-end unpack. Deliberately not built on `defines`: the file
+            // reads none of DYNAMIC_CUBEMAPS / SSGI / SKYLIGHTING / DIFFUSE_SPP, and both chains
+            // share it, so it has no permutation axis at all.
+            // (batch 11, item A) The two front-end pack permutations that used to sit here are
+            // gone; ssrt_raymarch.hlsl produces that layout itself.
             { &nrdUnpackCS, "ssrt_nrd_unpack.hlsl", {} },
+            // (batch 12) Sparse sampling. Both variants of both passes are always compiled, so
+            // Settings::DiffuseSamplingMode is a hot switch and never a recompile.
+            { &raymarchDiffuseHalfResCS, "ssrt_raymarch.hlsl", definesSparseHalfRes },
+            { &raymarchDiffuseCheckerCS, "ssrt_raymarch.hlsl", definesSparseChecker },
+            { &sparseResolveHalfResCS, "ssrt_sparse_resolve.hlsl", definesResolveHalfRes },
+            { &sparseResolveCheckerCS, "ssrt_sparse_resolve.hlsl", definesResolveChecker },
 #ifdef ENABLE_SHARC
             { &raymarchDiffuseSharcCS, "ssrt_raymarch.hlsl", definesSharc },
             { &sharcUpdateRaymarchCS, "ssrt_raymarch.hlsl", definesSharcUpdate },
@@ -2024,12 +2324,8 @@ void ScreenSpaceRayTracing::Prepass()
         CompileComputeShaders();
     }
 
-    // (S2.5) Latch the debug view's claim on the SVGF surfaces before anything asks about it.
-    // DrawSettings runs at present time, i.e. after this, so the raise it makes is consumed
-    // here on the following frame and cleared -- an expanded tree keeps it set continuously and
-    // a collapsed one lets it decay after a single frame.
-    bufferViewerActive = bufferViewerOpen;
-    bufferViewerOpen = false;
+    // (batch 11, item C1) The debug view's claim on the SVGF surfaces was latched here. It is
+    // gone: the Buffer Viewer no longer makes one. See SvgfHistoryNeeded.
 
     // (S1.3) Before UpdateHistoryValidity, because the history latches key on the effective
     // denoiser and a fallback is one of the transitions they have to catch; before the
@@ -2079,7 +2375,7 @@ void ScreenSpaceRayTracing::Prepass()
     context->CSSetSamplers(0, 1, samplers.data());
 
     state->BeginPerfEvent("SSRT Prepass");
-    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTrace);
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTDepthPyramid);
 
     // (audit #8) texDepth is allocated at full resolution but only the dynamic-resolution
     // sub-rect is ever written, and it was never cleared. The region beyond the dispatch
@@ -2215,7 +2511,7 @@ void ScreenSpaceRayTracing::Prepass()
         state->EndPerfEvent();
     }
 
-    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTrace);
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTDepthPyramid);
     state->EndPerfEvent();
 
     auto view = texDepth->srv.get();
@@ -2251,7 +2547,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     auto state = globals::state;
 
     state->BeginPerfEvent("SSRT Compute");
-    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTrace);
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTraceSpecular);
 
     auto main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
     auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
@@ -2265,7 +2561,28 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 
     float2 size = Util::ConvertToDynamic(state->screenSize);
     float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
-    
+
+    // (batch 11, item A) This frame's denoiser, resolved *before* the ray march instead of after
+    // it. It has to move up because the ray march now decides its own output layout on the
+    // answer, and it can move up safely because nothing in the answer depends on the ray march:
+    // EffectiveDenoiser was resolved in Prepass, and ReblurReady / SvgfChainReady ask only about
+    // this frame's guides and this feature's own allocations.
+    //
+    // (S1.3) The one thing still worth re-testing at this point is whether this frame's guides
+    // arrived, since Prepass runs ahead of NRD::PrepareGuides.
+    uint denoiser = EffectiveDenoiser(true);
+    if (denoiser == kDenoiserREBLUR && !ReblurReady(true)) {
+        denoiser = SvgfChainReady(true) ? kDenoiserSVGF : kDenoiserOff;
+        // The SVGF history was not maintained while REBLUR owned the signal, so reseed it
+        // next frame rather than accumulate onto whatever it last held.
+        historyClearPending = true;
+    }
+    // (batch 11, item A) Whether the ray march writes REBLUR's front-end layout into
+    // texNRDPackInput at u0 instead of its own linear layout into texSSRColor. Derived from the
+    // same `denoiser` the RunReblur call below is gated on, so the two cannot disagree; and
+    // denoiser == kDenoiserREBLUR implies ReblurReady, which implies texNRDPackInput exists.
+    const bool nrdFrontEndPack = (denoiser == kDenoiserREBLUR);
+
     SSRTCB ssrCBData;
     {
         ssrCBData.MaxSteps = settings.MaxSteps;
@@ -2299,6 +2616,15 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         // fields above are: the buffer is shared and every field has to be written, but nothing
         // in this dispatch reads it.
         ssrCBData.CubemapFillBlend = 0.0f;
+        // (batch 11, item A) REBLUR's front-end packing, folded in from the retired pack pass.
+        // The three constants must be the same values RunReblur hands
+        // nrd::ReblurSettings::hitDistanceParameters -- see the derivation at
+        // Settings::ReblurHitDistA -- and they are written unconditionally so the buffer is fully
+        // defined on both paths; the flag is what decides whether the shader reads them.
+        ssrCBData.NRDHitDistA = settings.ReblurHitDistA;
+        ssrCBData.NRDHitDistB = settings.ReblurHitDistB;
+        ssrCBData.NRDHitDistC = settings.ReblurHitDistC;
+        ssrCBData.NRDFrontEndPack = nrdFrontEndPack ? 1u : 0u;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -2349,7 +2675,14 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // raymarch
     state->BeginPerfEvent("Raymarch");
     
-    uavs.at(0) = texSSRColor->uav.get();
+    // (batch 11, item A) u0 is the packed NRD front-end surface under REBLUR and the chain's own
+    // radiance surface otherwise. Same slot, same format (both RGBA16F), same dispatch: only the
+    // meaning of the four channels changes, and SSRTCB::NRDFrontEndPack is what tells the shader
+    // which meaning to write. Under REBLUR the back-end unpack is what fills texSSRColor, which
+    // is where the deferred composite reads it from either way.
+    uavs.at(0) = nrdFrontEndPack ? texNRDPackInput->uav.get() : texSSRColor->uav.get();
+    // Unchanged on both paths: this R32_FLOAT surface is Upscaling.cpp's DLSS-RR specular
+    // hit-distance guide, not private pack-pass input, so it cannot be traded away.
     uavs.at(1) = texHitDistance->uav.get();  // (audit P6) was u2; u1 freed by dropping texHitPDF
 
     // (S2.5) t0 stays unbound. ssrt_raymarch.hlsl declares HistoryTexture at t0 and never
@@ -2376,7 +2709,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
 
     state->EndPerfEvent();
-    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTrace);
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceSpecular);
 
     resetViews();
 
@@ -2416,16 +2749,8 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // diffuse bounce.
     bool historyFed = false;
 
-    // (S1.3) Resolved in Prepass, before anything allocated; the REBLUR bring-up that used
-    // to sit here has moved there with it. The one thing still worth re-testing is whether
-    // this frame's guides arrived, since Prepass runs ahead of NRD::PrepareGuides.
-    uint denoiser = EffectiveDenoiser(true);
-    if (denoiser == kDenoiserREBLUR && !ReblurReady(true)) {
-        denoiser = SvgfChainReady(true) ? kDenoiserSVGF : kDenoiserOff;
-        // The SVGF history was not maintained while REBLUR owned the signal, so reseed it
-        // next frame rather than accumulate onto whatever it last held.
-        historyClearPending = true;
-    }
+    // (batch 11, item A) `denoiser` is resolved above the ray march now, because the ray march's
+    // own output layout depends on it. Nothing else about the sequence changed.
 
     if (denoiser == kDenoiserSVGF) {
         Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTSvgf);
@@ -2644,22 +2969,21 @@ void ScreenSpaceRayTracing::CopyHistoryGeometry()
         CopyDynamicRegion(texHistoryDepth->resource.get(), texDepth->resource.get());
 }
 
-// (batch C1) One REBLUR leg, shared by both chains. The ray-march outputs are read,
-// never written: the pack pass adapts them into NRD's front-end layout, the NRD
-// instance runs its own pipeline against the guide surfaces the NRD feature published
-// this frame, and the unpack pass writes the denoised radiance back over the chain's
-// own surface — which is exactly where the SVGF chain would have left its result, so
-// everything downstream (composites, history feeds, DLSS-RR's hit-distance guide) is
-// untouched by the choice of denoiser.
+// (batch C1) One REBLUR leg, shared by both chains. The NRD instance runs its own pipeline
+// against the guide surfaces the NRD feature published this frame, and the unpack pass writes
+// the denoised radiance back over the chain's own surface — which is exactly where the SVGF
+// chain would have left its result, so everything downstream (composites, history feeds,
+// DLSS-RR's hit-distance guide) is untouched by the choice of denoiser.
+//
+// (batch 11, item A) Two dispatches, not three. The front-end pack that used to open this
+// function is now part of the ray march: texNRDPackInput arrives already carrying this frame's
+// radiance in NRD's IN_*_RADIANCE_HITDIST layout, because the caller bound it at u0 and set
+// SSRTCB::NRDFrontEndPack on the same condition that calls this function.
 bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
 {
-    auto renderer = globals::game::renderer;
     auto context = globals::d3d::context;
     auto state = globals::state;
     auto& nrdSvc = globals::features::nrd;
-
-    auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
-    auto normal = renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
 
     const float2 size = Util::ConvertToDynamic(state->screenSize);
     const float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
@@ -2687,30 +3011,15 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
     // (S1.2) Set by the NRD dispatch below; gates the unpack and the reset-flag clear.
     bool dispatched = false;
 
-    // ---- front-end pack ----
-    {
-        NRDPackCB packData{
-            .hitDistA = settings.ReblurHitDistA,
-            .hitDistB = settings.ReblurHitDistB,
-            .hitDistC = settings.ReblurHitDistC,
-            .pad0 = 0.0f
-        };
-        nrdPackCB->Update(packData);
-        auto packBuffer = nrdPackCB->CB();
-        context->CSSetConstantBuffers(1, 1, &packBuffer);
-
-        srvs.at(0) = texRadiance->srv.get();
-        srvs.at(1) = a_specular ? texHitDistance->srv.get() : texSSRTDiffuseHitDistance->srv.get();
-        srvs.at(2) = depth.depthSRV;
-        srvs.at(3) = a_specular ? normal.SRV : nullptr;
-        uavs.at(0) = texInput->uav.get();
-
-        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
-        context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-        context->CSSetShader(a_specular ? nrdPackSpecularCS.get() : nrdPackDiffuseCS.get(), nullptr, 0);
-        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
-        resetViews();
-    }
+    // (batch 11, item A) The front-end pack pass that used to stand here is gone. texInput
+    // already holds this frame's radiance in REBLUR's IN_*_RADIANCE_HITDIST layout, written
+    // straight out of the ray march: DrawSSRT{Diffuse,Specular} bound it at u0 and set
+    // SSRTCB::NRDFrontEndPack, on exactly the condition that leads here. Nothing between that
+    // dispatch and this one touches the surface.
+    //
+    // (depth and normal are still read below for the SVGF sibling's sake in the *caller*; this
+    // function itself no longer needs either, which is why the two locals are only used by the
+    // recovery path at the bottom.)
 
     // ---- REBLUR dispatch ----
     {
@@ -2769,12 +3078,25 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
     }
 
     // ---- back-end unpack ----
-    // (S1.2) Skipped when the dispatch did not complete: texOutput would hold either the
-    // previous frame's denoised result or, on the first frame, uninitialised RGBA16F --
-    // which includes every NaN and Inf bit pattern. Leaving texRadiance as the ray march
-    // wrote it is strictly better: undenoised, but this frame's and finite.
-    if (dispatched) {
-        srvs.at(0) = texOutput->srv.get();
+    // (S1.2) The source depends on whether the dispatch completed. texOutput would otherwise hold
+    // either the previous frame's denoised result or, on the first frame, uninitialised RGBA16F --
+    // which includes every NaN and Inf bit pattern.
+    //
+    // (batch 11, item A) The unpack now runs on *both* paths, and that is what preserves S1.2's
+    // guarantee. Before this batch the failure path could simply skip the pass, because
+    // texRadiance still held the raw ray march; now the ray march wrote texInput instead, so
+    // skipping would hand the composites last frame's contents. Unpacking texInput is the honest
+    // recovery: it is this frame's own radiance, undenoised, and the YCoCg transform is its own
+    // exact inverse (Y = .25r+.5g+.25b, Co = .5(r-b), Cg = .5g-.25(r+b) reconstructs r, g, b
+    // algebraically), so what lands in texRadiance is the ray march's output to within fp
+    // rounding. .w carries the normalized hit distance rather than the confidence -- which is
+    // already true on the success path, and no consumer reads .w of either surface.
+    if (!dispatched)
+        logger::warn("SSRT: REBLUR {} dispatch did not complete; publishing this frame's undenoised radiance",
+            a_specular ? "specular" : "diffuse");
+
+    {
+        srvs.at(0) = (dispatched ? texOutput : texInput)->srv.get();
         uavs.at(0) = texRadiance->uav.get();
 
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
@@ -2782,9 +3104,6 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
         context->CSSetShader(nrdUnpackCS.get(), nullptr, 0);
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
-    } else {
-        logger::warn("SSRT: REBLUR {} dispatch did not complete; keeping the undenoised radiance for this frame",
-            a_specular ? "specular" : "diffuse");
     }
 
     // The NRD dispatch owns s0/s1 and b1 while it runs; restore what the surrounding
@@ -2805,6 +3124,13 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
 
 void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 {
+    // (batch 12) Above the early-out on purpose, so switching the diffuse component off hands the
+    // compact sparse set back instead of stranding it; and above every binding in this function,
+    // so the resolution this frame traces at is fixed before the first one. The frame reads this
+    // local and never the setting again -- see ResolveSamplingMode.
+    const uint samplingMode = ResolveSamplingMode();
+    const bool sparseSampling = samplingMode != kSamplingFull;
+
     if (!settings.EnableDiffuse)
         return;
 
@@ -2845,7 +3171,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     auto state = globals::state;
 
     state->BeginPerfEvent("SSRT Diffuse Compute");
-    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTrace);
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTraceDiffuse);
 
     auto main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
     auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
@@ -2860,7 +3186,22 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 
     float2 size = Util::ConvertToDynamic(state->screenSize);
     float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
-    
+
+    // (batch 12) The extent the ray march itself covers, which is the compact grid under a sparse
+    // mode and the render sub-rect otherwise. Every other dispatch in this function keeps
+    // dispatchCount: the resolve pass restores full resolution before any of them runs.
+    //
+    // Integer halving with *floor*, matching SSRT_GetSparseExtent and -- for half resolution --
+    // mip 1 of the Hi-Z pyramid, whose downsample dispatch is sized `max(1, size >> 1)`. Ceil
+    // would leave the last compact column of an odd render extent backed by a mip 1 texel nobody
+    // wrote, which by the audit #8 convention reads as sky. The full-resolution column that floor
+    // leaves without a compact sample of its own is reconstructed by the resolve pass from its
+    // clamped neighbour, so nothing is left stale at the edge.
+    const uint traceExtentX = sparseSampling ? std::max(1u, (uint)size.x / 2u) : (uint)size.x;
+    const uint traceExtentY = samplingMode == kSamplingHalfRes ? std::max(1u, (uint)size.y / 2u) : (uint)size.y;
+    const uint traceDispatchX = (traceExtentX + 7u) / 8u;
+    const uint traceDispatchY = (traceExtentY + 7u) / 8u;
+
     // (reinjection noise) Whether the confidence accumulator runs this frame. Decided once, in
     // the constant-buffer block below, and read again by the composite dispatch so the CPU-side
     // bindings and the shader-side branch cannot disagree.
@@ -2876,6 +3217,19 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         settings.EnableAmbientReinjection && settings.LowResConfidenceFilter &&
         confDownsampleCS && confBlurHorizontalCS && confBlurVerticalCS && confUpsampleCS &&
         diffuseCompositeExternalConfCS && EnsureConfidenceFilterResources();
+
+    // (batch 11, item A) This frame's denoiser, resolved before the ray march rather than after
+    // it: the ray march now chooses its own output layout on the answer. See the matching site
+    // and derivation in DrawSSRTSpecular.
+    //
+    // (S1.3) Resolved in Prepass; re-tested here only for this frame's guides, and it falls back
+    // to SVGF rather than to raw noise.
+    uint denoiser = EffectiveDenoiser(false);
+    if (denoiser == kDenoiserREBLUR && !ReblurReady(false)) {
+        denoiser = SvgfChainReady(false) ? kDenoiserSVGF : kDenoiserOff;
+        historyClearPending = true;
+    }
+    const bool nrdFrontEndPack = (denoiser == kDenoiserREBLUR);
 
     SSRTCB ssrCBData;
     {
@@ -2932,6 +3286,12 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
                              !confidenceFilter && EnsureAmbientConfidenceResources();
         ssrCBData.TemporalAmbientConfidence = confidenceTemporal ? 1u : 0u;
         ssrCBData.AmbientConfidenceInvMaxFrames = 1.0f / (settings.AmbientConfidenceMaxFrames + 1.0f);
+        // (batch 11, item A) See the matching block in DrawSSRTSpecular. Written unconditionally
+        // so the buffer is fully defined on both paths; the flag decides whether they are read.
+        ssrCBData.NRDHitDistA = settings.ReblurHitDistA;
+        ssrCBData.NRDHitDistB = settings.ReblurHitDistB;
+        ssrCBData.NRDHitDistC = settings.ReblurHitDistC;
+        ssrCBData.NRDFrontEndPack = nrdFrontEndPack ? 1u : 0u;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -2967,19 +3327,30 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     (void)ssgi_bent_normal_unused;      // (directional env) composite-only consumer
     (void)ssgi_env_irradiance_unused;   // (directional env v2) composite-only consumer
 
-    uavs.at(0) = texSSRTDiffuseColor->uav.get();
+    // (batch 11, item A) u0 is the packed NRD front-end surface under REBLUR and the chain's own
+    // radiance surface otherwise -- same slot, same RGBA16F format, only the meaning of the four
+    // channels changes. Under REBLUR the back-end unpack is what fills texSSRTDiffuseColor, which
+    // is where the diffuse composite reads it from either way. See DrawSSRTSpecular.
+    //
+    // (batch 12) ...and it is the *compact* surface under a sparse mode, whatever the layout. The
+    // ray march's stores are unchanged either way -- it writes u0/u5/u6 at its own dispatch
+    // coordinate, which the sparse permutations know is a compact grid coordinate -- so the choice
+    // of surface is made here and nowhere else. The resolve pass a few dispatches below is what
+    // puts the result back on the full-resolution grid the whole rest of this function reads.
+    uavs.at(0) = sparseSampling ? texSparseColor->uav.get() :
+                                  (nrdFrontEndPack ? texNRDPackInput->uav.get() : texSSRTDiffuseColor->uav.get());
     // (ambient reinjection) Always bound, not gated on the setting: the shader writes it
     // unconditionally so that the surface stays deterministic for every texel the dispatch
     // covers, and an unbound UAV would make that write a silent no-op. The consumer side is
     // what the setting gates.
-    uavs.at(5) = texSSRTDiffuseConfidence->uav.get();
+    uavs.at(5) = sparseSampling ? texSparseConfidence->uav.get() : texSSRTDiffuseConfidence->uav.get();
     // (batch 1, item 2) Always bound, for the same reason the confidence surface is: the shader
     // writes it unconditionally so the surface stays deterministic for every texel the dispatch
     // covers -- including the 1.0 "as distant as the encoding can say" a far-plane lane resolves
     // to -- and an unbound UAV would turn that write into a silent no-op, leaving the a-trous
     // pass reading a stale or cleared surface. HitRadiusStrength 0 is what makes the mechanism
     // inert, on the consumer side.
-    uavs.at(6) = texSSRTDiffuseHitDistance->uav.get();
+    uavs.at(6) = sparseSampling ? texSparseHitDistance->uav.get() : texSSRTDiffuseHitDistance->uav.get();
 #ifdef ENABLE_SHARC
     if (settings.EnableSharc) {
         EnsureSharcResources();  // (audit P6) allocate on first enable, before any dispatch binds them
@@ -3023,14 +3394,59 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         state->EndPerfEvent();
     }
 
-    context->CSSetShader(settings.EnableSharc ? raymarchDiffuseSharcCS.get() : raymarchDiffuseCS.get(), nullptr, 0);
+    // (batch 12) samplingMode is kSamplingFull whenever SHARC is on -- ResolveSamplingMode forces
+    // it -- so the two selectors below cannot both fire.
+    context->CSSetShader(settings.EnableSharc ? raymarchDiffuseSharcCS.get() : SelectDiffuseRaymarchShader(samplingMode), nullptr, 0);
 #else
-    context->CSSetShader(raymarchDiffuseCS.get(), nullptr, 0);
+    context->CSSetShader(SelectDiffuseRaymarchShader(samplingMode), nullptr, 0);
 #endif
-    context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+    context->Dispatch(traceDispatchX, traceDispatchY, 1);
     resetViews();
 
-    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTrace);
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceDiffuse);
+
+    // (batch 12) THE SPARSE RESOLVE. Half a ray per render pixel goes in, three full-resolution
+    // surfaces come out, and everything after this point is the code that ran before this batch --
+    // the denoiser (either one), the confidence filter, the composite -- reading the same three
+    // surfaces at the same extent with the same meanings.
+    //
+    // Placed here rather than folded into the denoiser: it has to precede *both* denoiser paths
+    // and the no-denoiser path, and it has to precede the confidence filter, whose input is the
+    // raw ray-march confidence. Its own timing bucket rather than the trace bucket, so the user can
+    // confirm that what the sparse trace saves is not being handed straight back -- which is the
+    // whole question this batch exists to answer.
+    if (sparseSampling) {
+        state->BeginPerfEvent("SSRT Sparse Resolve");
+        Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTSparseResolve);
+
+        // u0 is the destination the ray march would have written at full density, in whichever
+        // layout SSRTCB::NRDFrontEndPack selected -- the resolve is channel-agnostic, so the same
+        // shader carries REBLUR's packed layout and the chain's linear one.
+        uavs.at(0) = nrdFrontEndPack ? texNRDPackInput->uav.get() : texSSRTDiffuseColor->uav.get();
+        uavs.at(1) = texSSRTDiffuseConfidence->uav.get();
+        uavs.at(2) = texSSRTDiffuseHitDistance->uav.get();
+
+        srvs.at(0) = texSparseColor->srv.get();
+        srvs.at(1) = texSparseConfidence->srv.get();
+        srvs.at(2) = normal.SRV;
+        srvs.at(3) = texSparseHitDistance->srv.get();
+        srvs.at(4) = depth.depthSRV;
+        // t5 is mip 1 of the Hi-Z pyramid, i.e. the 2x2 minimum, which is exactly the depth of the
+        // subpixel each half-resolution ray was traced from. Declared only by the half-resolution
+        // permutation: the checkerboard one reads full-resolution depth at t4 for its taps,
+        // because every one of its compact texels corresponds to a real full-resolution pixel.
+        srvs.at(5) = samplingMode == kSamplingHalfRes ? depthSRVs[1].get() : nullptr;
+
+        context->CSSetShaderResources(0, 6, srvs.data());
+        context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
+        context->CSSetShader(samplingMode == kSamplingHalfRes ? sparseResolveHalfResCS.get() : sparseResolveCheckerCS.get(), nullptr, 0);
+
+        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        resetViews();
+
+        Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTSparseResolve);
+        state->EndPerfEvent();
+    }
 
 #ifdef ENABLE_SHARC
     if (settings.EnableSharc) {
@@ -3044,13 +3460,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // unconditional copy at the bottom stands in unchanged.
     bool historyFed = false;
 
-    // (S1.3) See the matching site in DrawSSRTSpecular: resolved in Prepass, re-tested here
-    // only for this frame's guides, and it falls back to SVGF rather than to raw noise.
-    uint denoiser = EffectiveDenoiser(false);
-    if (denoiser == kDenoiserREBLUR && !ReblurReady(false)) {
-        denoiser = SvgfChainReady(false) ? kDenoiserSVGF : kDenoiserOff;
-        historyClearPending = true;
-    }
+    // (batch 11, item A) `denoiser` is resolved above the ray march now, because the ray march's
+    // own output layout depends on it. Nothing else about the sequence changed.
 
     if (denoiser == kDenoiserSVGF) {
         Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTSvgf);
@@ -3353,7 +3764,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     }
 
     // composite
-    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTrace);
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTComposite);
     {
         uavs.at(0) = main.UAV;
         srvs.at(0) = texSSRTDiffuseColor->srv.get();
@@ -3406,7 +3817,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         if (confidenceTemporal)
             std::swap(texSSRTConfidenceHistory, texSSRTConfidenceHistoryPrev);
     }
-    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTrace);
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTComposite);
 
     // (audit #13) Only when specular will not run afterwards, so the snapshot still
     // happens exactly once per frame and after every temporal pass has read it.

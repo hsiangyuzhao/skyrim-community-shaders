@@ -59,6 +59,28 @@ struct ScreenSpaceRayTracing : Feature
         kDenoiserREBLUR = 2,
     };
 
+    /// @brief (batch 12) Values of Settings::DiffuseSamplingMode: how densely the diffuse ray
+    /// march samples the screen. An enum for the same reasons DenoiserMethodValue is one -- the
+    /// UI combo, the settings file and the dispatch gates all agree on one value, and "full
+    /// density" is a first-class state, namely the performance and image-quality baseline
+    /// everything else is measured against.
+    ///
+    /// Both sparse modes trace exactly half a ray per render pixel, and both resolve back to full
+    /// resolution inside DrawSSRTDiffuse before anything else runs, so nothing downstream --
+    /// REBLUR, SVGF, the confidence filter, the composite -- knows which one is active.
+    enum SamplingModeValue : uint
+    {
+        /// @brief One ray per render pixel. Bit-identical to the pre-batch-12 build.
+        kSamplingFull = 0,
+        /// @brief One ray per 2x2 block of render pixels, traced from the block's nearest
+        /// subpixel, with the traversal starting at mip 1 of the Hi-Z pyramid.
+        kSamplingHalfRes = 1,
+        /// @brief One ray per horizontal pair of render pixels, alternating halves every frame.
+        /// The traced sample is always a real full-resolution pixel and the traversal stays at
+        /// mip 0.
+        kSamplingCheckerboard = 2,
+    };
+
     struct Settings
     {
         bool EnableSpecular = true;
@@ -144,6 +166,18 @@ struct ScreenSpaceRayTracing : Feature
         bool UseDynamicCubemapsAsFallback = true;
         bool UseDynamicCubemapsAsFallbackSpecular = true;
         uint DiffuseSPP = 2;
+        /// @brief (batch 12) How densely the diffuse ray march samples the screen; one of
+        /// SamplingModeValue. Defaults to kSamplingFull, so the current look stays the default
+        /// look and an existing configuration reproduces the previous build exactly.
+        ///
+        /// Not a compile-time setting from the C++ side's point of view even though it selects a
+        /// shader permutation: all three ray-march variants and both resolve variants are
+        /// compiled at startup, so switching this never triggers a recompile and never drops a
+        /// frame. It also does *not* invalidate any denoiser history -- both sparse modes hand
+        /// the denoiser a full-resolution surface of the same extent it always got, so there is
+        /// no extent mismatch to reset and blending through the transition is quieter than
+        /// restarting the accumulation would be.
+        uint DiffuseSamplingMode = kSamplingFull;
         bool EnableDiffuse = true;
         float SpecularMult = 1.0f;
         float DiffuseMult = 1.0f;
@@ -412,9 +446,10 @@ struct ScreenSpaceRayTracing : Feature
         /// NRD's defaults are (3, 0.1, 20) with A in meters; 1 game unit ~ 1.4 cm, so
         /// A starts at 3 m * 70 = 210 game units — the same scaling the upstream SSR
         /// integration ships. B is per-unit-viewZ and C is unitless, so both keep the
-        /// NRD defaults verbatim. Consumed identically by the pack shader (front end)
-        /// and by nrd::ReblurSettings::hitDistanceParameters (back end); the two must
-        /// never diverge or REBLUR denormalizes with the wrong curve.
+        /// NRD defaults verbatim. Consumed identically by ssrt_raymarch.hlsl's front-end
+        /// packing (batch 11, item A: through SSRTCB::NRDHitDistA/B/C) and by
+        /// nrd::ReblurSettings::hitDistanceParameters (back end); the two must never diverge
+        /// or REBLUR denormalizes with the wrong curve.
         float ReblurHitDistA = 210.0f;
         float ReblurHitDistB = 0.1f;
         float ReblurHitDistC = 20.0f;
@@ -924,18 +959,41 @@ struct ScreenSpaceRayTracing : Feature
         /// one, so every offset ssrt_raymarch.hlsl and ssrt_diffuse_composite.hlsl already mirror
         /// keeps its value, and the composite continues to declare a legal prefix.
         float CubemapFillBlend;
-        /// @brief Explicit tail padding for row 3. Not decoration: `alignas(16)` would otherwise
+        /// @brief (batch 11, item A) REBLUR's hit-distance normalization constants (A, B, C),
+        /// which the ray march now needs because it produces the front-end layout itself.
+        ///
+        /// These are the same three values RunReblur hands
+        /// nrd::ReblurSettings::hitDistanceParameters, and they must stay that way: REBLUR
+        /// denormalizes with them internally, so producer and denoiser have to agree. They used
+        /// to travel in a constant buffer of their own (NRDPackCB at b1, read by the retired
+        /// ssrt_nrd_pack.hlsl); moving them here took row 3's three spare slots exactly, so the
+        /// buffer did not grow for them and no existing offset moved.
+        float NRDHitDistA;
+        float NRDHitDistB;
+        float NRDHitDistC;
+        // --- row 4 ---
+        /// @brief (batch 11, item A) Non-zero makes ssrt_raymarch.hlsl write u0 in REBLUR's
+        /// front-end layout (YCoCg radiance + normalized hit distance) instead of the chain's own
+        /// linear radiance layout — and both draw passes bind texNRDPackInput at u0 in exactly
+        /// that case. Zero is the pre-existing behaviour bit for bit: every expression the flag
+        /// gates is skipped.
+        ///
+        /// Set only where the draw pass has already resolved this frame's effective denoiser to
+        /// REBLUR, which is the same condition that calls RunReblur, so the binding and the
+        /// shader's choice of layout cannot disagree.
+        uint NRDFrontEndPack;
+        /// @brief Explicit tail padding for row 4. Not decoration: `alignas(16)` would otherwise
         /// pad the struct implicitly and MSVC's C4324 is an error in this build. Deliberately not
         /// mirrored in either HLSL declaration -- a shader may declare a prefix of a larger
         /// constant buffer, and a `float pad[3]` in HLSL would not describe this layout anyway,
         /// since HLSL gives every array element a 16-byte row of its own.
         /// Zero-initialised in place so neither of the two writers has to remember it and so the
         /// bytes that reach the GPU are deterministic rather than whatever was on the stack.
-        float ssrtPad3[3] = {};
+        float ssrtPad4[3] = {};
     };
-    static_assert(sizeof(SSRTCB) == 64,
+    static_assert(sizeof(SSRTCB) == 80,
         "ScreenSpaceRayTracing::SSRTCB must stay whole 16-byte constant buffer rows; "
-        "ssrt_raymarch.hlsl mirrors these offsets up to CubemapFillBlend and must move with "
+        "ssrt_raymarch.hlsl mirrors these offsets up to NRDFrontEndPack and must move with "
         "them; ssrt_diffuse_composite.hlsl mirrors the first three rows.");
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
@@ -1009,20 +1067,12 @@ struct ScreenSpaceRayTracing : Feature
         "the DenoiserCB declarations in ssrt_temporal.hlsl (all four rows), ssrt_spatial.hlsl "
         "(two) and ssrt_variance.hlsl (one) mirror these offsets and must move with it.");
 
-    /// @brief (batch C1) Mirrored by the `NRDPackCB` declaration in ssrt_nrd_pack.hlsl.
-    /// One row: the REBLUR hit-distance normalization constants. The unpack shader
-    /// declares no constant buffer at all.
-    struct alignas(16) NRDPackCB
-    {
-        float hitDistA;
-        float hitDistB;
-        float hitDistC;
-        float pad0;
-    };
+    // (batch 11, item A) NRDPackCB is gone with ssrt_nrd_pack.hlsl. Its three constants live on
+    // row 3 of SSRTCB now, which the ray march already binds, so the REBLUR path needs no
+    // constant buffer of its own. The unpack shader never declared one.
 
     eastl::unique_ptr<ConstantBuffer> ssrtCB;
     eastl::unique_ptr<ConstantBuffer> denoiserCB;
-    eastl::unique_ptr<ConstantBuffer> nrdPackCB;
 
     bool recompileFlag = false;
 
@@ -1174,8 +1224,12 @@ struct ScreenSpaceRayTracing : Feature
     /// Off. They were nevertheless allocated at boot for every user of the feature.
     ///
     /// Called from ResolveDenoisers, and only on the path that has already established SVGF
-    /// is what this frame will use -- which includes the REBLUR-unavailable fallback and the
-    /// Buffer Viewer being open, so neither can find a null surface.
+    /// is what this frame will use -- which includes the REBLUR-unavailable fallback, so that
+    /// cannot find a null surface either.
+    ///
+    /// (batch 11, item C1) An expanded Buffer Viewer tree used to be a third way in. It is not
+    /// any more: it allocated the whole set for the rest of the session (nothing but a
+    /// resolution change releases them) to populate panels that were mostly frozen regardless.
     void EnsureSvgfResources();
 
     /// @brief (reinjection noise) Allocate the confidence accumulator's ping-pong pair on first
@@ -1198,6 +1252,42 @@ struct ScreenSpaceRayTracing : Feature
     /// i.e. to the behaviour the toggle's off position selects, not to skipping the smoothing.
     bool EnsureConfidenceFilterResources();
 
+    /// @brief (batch 12) Decide, once per frame and before this frame's first binding, which
+    /// sampling mode the diffuse chain will actually run at, and reconcile the compact texture set
+    /// with the answer.
+    ///
+    /// Called from the very top of DrawSSRTDiffuse -- above the EnableDiffuse early-out, so
+    /// switching the diffuse component off releases the compact set rather than stranding it, and
+    /// above every binding, so an on-off-on cycle can never leave a dispatch pointing at a
+    /// released texture. The frame then reads the returned value into a local and never consults
+    /// the setting again, which is what makes the ray march's output surface, the resolve's input
+    /// surface and the choice of shader unable to disagree.
+    ///
+    /// Falls back to kSamplingFull -- never to a broken dispatch -- if SHARC is enabled (its
+    /// ray-march permutations have no sparse variants and its hash-grid update is tuned for a
+    /// full-resolution dispatch), if either shader of the selected mode failed to compile, or if
+    /// the compact textures could not be allocated.
+    ///
+    /// @return the effective SamplingModeValue for this frame.
+    uint ResolveSamplingMode();
+    /// @brief (batch 12) Allocate the three compact surfaces the sparse ray march writes, on
+    /// first need rather than at boot, on the same argument EnsureConfidenceFilterResources
+    /// makes: a session that stays on full density never pays for them.
+    ///
+    /// One allocation serves both modes. The extent is ceil(fullWidth / 2) x fullHeight, which is
+    /// the checkerboard grid exactly and a superset of the half-resolution grid -- half resolution
+    /// simply uses the top-left sub-rect. A second, smaller texture set would have bought ~17 MB
+    /// at a 4K allocation in exchange for a second lifecycle to get wrong on a mode switch.
+    ///
+    /// @return false if allocation was not attempted or did not complete, which
+    /// ResolveSamplingMode treats as "run at full density this frame".
+    bool EnsureSparseResources();
+    /// @brief (batch 12) Drop the compact surfaces. The D3D11 runtime keeps the underlying
+    /// resources alive until the command buffers referencing them retire, and nothing this frame
+    /// has been bound yet, so this is safe wherever ResolveSamplingMode may call it. Also called
+    /// from SetupResources, so a resolution change cannot leave a mismatched extent resident.
+    void ReleaseSparseResources();
+
     /// @brief (S2.5) Whether the SVGF history for one signal has to be maintained this frame.
     ///
     /// The history *maintenance* -- two full-screen RGBA16F colour copies plus the
@@ -1207,23 +1297,22 @@ struct ScreenSpaceRayTracing : Feature
     /// declarations in ssrt_raymarch / ssrt_variance / ssrt_spatial are vestigial (declared,
     /// never referenced, so fxc strips them).
     ///
-    /// The Buffer Viewer counts as a consumer. It is the only other thing that looks at these
-    /// surfaces, and a debug view that silently freezes the moment the default denoiser is
-    /// selected would be worse than the waste.
+    /// (batch 11, item C1) The Buffer Viewer used to count as a consumer here, via an
+    /// `|| bufferViewerActive` term that DrawSettings raised while its tree was expanded. It no
+    /// longer does, and the argument that put it there does not survive inspection: it was
+    /// bought to stop the panel freezing under the default denoiser, but six of the ten SVGF
+    /// panels are written only inside the SVGF dispatch blocks, which do not run under REBLUR
+    /// whatever this predicate says. So the term paid nine allocations (68 B/px, ~560 MB at a 4K
+    /// allocation, released only on a resolution change) and three full-screen copies per frame
+    /// in order to display six cleared black rectangles. The Buffer Viewer now hides those
+    /// entries and says why instead.
+    ///
+    /// SVGF is therefore the whole consumer set of the three history surfaces, which is what
+    /// this predicate has said all along.
     [[nodiscard]] bool SvgfHistoryNeeded(bool a_specular) const
     {
-        return EffectiveDenoiser(a_specular) == kDenoiserSVGF || bufferViewerActive;
+        return EffectiveDenoiser(a_specular) == kDenoiserSVGF;
     }
-
-    /// @brief (S2.5) Latched once per frame in Prepass from bufferViewerOpen, which
-    /// DrawSettings raises while its Buffer Viewer tree is expanded.
-    ///
-    /// Two variables rather than one because the menu draws at present time, i.e. after
-    /// Prepass: the raise is consumed by the *following* frame and then cleared, so an open
-    /// tree keeps it set for as long as the menu is up and it decays one frame after the menu
-    /// closes. A single variable would either never clear or clear before it was read.
-    bool bufferViewerOpen = false;
-    bool bufferViewerActive = false;
 
     /// @brief (S4.15) Put every piece of cross-frame state back to "nothing has run yet".
     ///
@@ -1365,6 +1454,22 @@ struct ScreenSpaceRayTracing : Feature
         return temporalCS.get();
     }
 
+    /// @brief (batch 12) The diffuse ray-march permutation for a resolved SamplingModeValue.
+    ///
+    /// Takes the mode as an argument rather than reading the setting, so it cannot answer a
+    /// different question than the one ResolveSamplingMode answered at the top of the frame. The
+    /// modes are only ever reached with their shader present -- ResolveSamplingMode falls back to
+    /// kSamplingFull otherwise -- so the default arm is unreachable in practice and is the safe
+    /// answer anyway.
+    [[nodiscard]] ID3D11ComputeShader* SelectDiffuseRaymarchShader(uint a_samplingMode) const
+    {
+        if (a_samplingMode == kSamplingHalfRes && raymarchDiffuseHalfResCS)
+            return raymarchDiffuseHalfResCS.get();
+        if (a_samplingMode == kSamplingCheckerboard && raymarchDiffuseCheckerCS)
+            return raymarchDiffuseCheckerCS.get();
+        return raymarchDiffuseCS.get();
+    }
+
     eastl::unique_ptr<Texture2D> texDepth = nullptr;
     eastl::unique_ptr<Texture2D> texColor = nullptr;
     eastl::unique_ptr<Texture2D> texSSRColor = nullptr;
@@ -1449,6 +1554,36 @@ struct ScreenSpaceRayTracing : Feature
     ///
     /// Allocated by EnsureConfidenceFilterResources on first need rather than at boot, and
     /// released by SetupResources so a resolution change cannot leave a mismatched extent behind.
+    /// @brief (batch 12) The compact working set of the sparse diffuse ray march: the three
+    /// surfaces the ray march writes when Settings::DiffuseSamplingMode is not kSamplingFull,
+    /// sized ceil(fullWidth / 2) x fullHeight.
+    ///
+    /// They are the sparse counterparts of the three full-resolution surfaces the ray march
+    /// writes at full density, in the same formats and carrying the same quantities, so no shader
+    /// register map and no store in ssrt_raymarch.hlsl's output block changes: the compact grid
+    /// coordinate the sparse permutations address their UAVs with is simply `coords`, exactly as
+    /// before, and the C++ side binds different textures.
+    ///
+    ///   texSparseColor       R16G16B16A16_FLOAT  radiance, in REBLUR's packed front-end layout
+    ///                                            or the chain's own linear layout -- whichever
+    ///                                            SSRTCB::NRDFrontEndPack selected, unchanged
+    ///   texSparseConfidence  R8_UNORM            the raw hit confidence ambient reinjection reads
+    ///   texSparseHitDistance R8_UNORM            the reciprocally encoded hit distance
+    ///                                            ssrt_spatial.hlsl sizes its kernel from
+    ///
+    /// ~41 MB together at a 4K allocation (33 + 4 + 4), against the eight full-screen RGBA16F
+    /// surfaces this feature already holds at ~33 MB each; ~10 MB at 1080p. Allocated by
+    /// EnsureSparseResources on first need and released by ReleaseSparseResources both on a mode
+    /// switch back to full density and by SetupResources on a resolution change.
+    eastl::unique_ptr<Texture2D> texSparseColor = nullptr;
+    eastl::unique_ptr<Texture2D> texSparseConfidence = nullptr;
+    eastl::unique_ptr<Texture2D> texSparseHitDistance = nullptr;
+
+    /// @brief (batch 12) The sampling mode the current frame's diffuse chain is running at, i.e.
+    /// what ResolveSamplingMode returned. Written once per frame, before any binding, and read by
+    /// the Buffer Viewer and the UI's status line; the draw pass itself uses the returned local.
+    uint activeSamplingMode = kSamplingFull;
+
     eastl::unique_ptr<Texture2D> texSSRTConfidenceLo = nullptr;
     eastl::unique_ptr<Texture2D> texSSRTConfidenceLoBlur = nullptr;
     eastl::unique_ptr<Texture2D> texSSRTConfidenceLoDepth = nullptr;
@@ -1621,14 +1756,27 @@ struct ScreenSpaceRayTracing : Feature
     winrt::com_ptr<ID3D11ComputeShader> varianceCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialSpecularCS = nullptr;
-    /// @brief (batch C1) REBLUR front-end pack (per-chain permutation: the diffuse one
-    /// decodes the R8 reciprocal hit-distance surface, the specular one reads the R32
-    /// world-space one plus G-buffer roughness) and the shared back-end unpack.
-    /// Any of them failing to compile makes ReblurReady() false for its chain, so the
-    /// failure degrades to "no denoising" rather than to a bad dispatch.
-    winrt::com_ptr<ID3D11ComputeShader> nrdPackDiffuseCS = nullptr;
-    winrt::com_ptr<ID3D11ComputeShader> nrdPackSpecularCS = nullptr;
+    /// @brief (batch C1) The shared REBLUR back-end unpack. Failing to compile makes
+    /// ReblurReady() false for both chains, so the failure degrades to "no denoising" rather
+    /// than to a bad dispatch.
+    ///
+    /// (batch 11, item A) The two front-end pack permutations are gone: ssrt_raymarch.hlsl
+    /// writes the front-end layout itself when SSRTCB::NRDFrontEndPack is set, which removes a
+    /// full-screen pass per chain. See SSRTCB::NRDFrontEndPack and RunReblur.
     winrt::com_ptr<ID3D11ComputeShader> nrdUnpackCS = nullptr;
+    /// @brief (batch 12) The two sparse ray-march permutations and their two resolve passes.
+    ///
+    /// Permutations rather than runtime branches because sampling density changes the traversal's
+    /// finest Hi-Z level, the extent the dispatch clamps against, and how the G-buffer is
+    /// addressed. All four are compiled at startup alongside the full-density variant, so
+    /// switching Settings::DiffuseSamplingMode never triggers a recompile -- and if any of them
+    /// fails to compile, ResolveSamplingMode reports full density for that mode rather than
+    /// dispatching a null shader (a silent no-op in D3D11, which is what would leave the resolve
+    /// reading an unwritten compact surface).
+    winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseHalfResCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseCheckerCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> sparseResolveHalfResCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> sparseResolveCheckerCS = nullptr;
 #ifdef ENABLE_SHARC
     winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseSharcCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> sharcUpdateRaymarchCS = nullptr;

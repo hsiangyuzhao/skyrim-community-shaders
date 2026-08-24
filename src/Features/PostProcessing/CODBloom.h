@@ -43,6 +43,12 @@ struct CODBloom : public PostProcessFeature
 	winrt::com_ptr<ID3D11ComputeShader> upsampleCS = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> compositeCS = nullptr;
 
+	/// @brief (batch 11, item B3) The coarsest mip the last Draw actually built, i.e. the top of
+	/// the pyramid after the zero-weight levels have been peeled off. Only the Debug view reads
+	/// it, to keep its mip slider from offering a level nothing wrote this frame; the derivation
+	/// of the peeling rule is at the computation site in Draw.
+	int lastTopMip = (int)s_BloomMips - 1;
+
 	virtual void SetupResources() override;
 	virtual void ClearShaderCache() override;
 	void CompileComputeShaders();

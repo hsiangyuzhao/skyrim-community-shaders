@@ -286,7 +286,17 @@ namespace SharedData
 		float MinF0;
 		float CubemapToF0Multiplier;
 		float ComplexMaterialF0Multiplier;
-		float pad;
+		// (batch 10b) Mirrors VanillaFresnel::Settings. Sixteen 4-byte slots = 64 bytes; the
+		// three pads are spelled out because FeatureData is a naked concatenation of every
+		// feature's struct (src/FeatureBuffer.cpp), so this side has to state the same size
+		// the C++ side gets from alignas(16). Growing this struct by 16 bytes shifts
+		// physSkyData, ssrtSettings, exponentialHeightFogSettings and ssgiSettings by 16 --
+		// consistently on both sides, which is what makes it safe.
+		float EyeRoughness;
+		float EnvMaskStrength;
+		float pad0;
+		float pad1;
+		float pad2;
 	};
 
 	struct PhysSkyData

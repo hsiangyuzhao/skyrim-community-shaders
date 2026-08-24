@@ -6,6 +6,7 @@
 #include "State.h"
 #include "Upscaling.h"
 #include "Utils/D3D.h"
+#include "Utils/GpuTimers.h"
 
 namespace
 {
@@ -66,12 +67,19 @@ void NRD::DrawSettings()
 		static float debugRescale = .3f;
 		ImGui::SliderFloat("View Resize", &debugRescale, 0.f, 1.f);
 
+		// (batch 11, item C2) The three entries appear once the guides exist, i.e. once a consumer
+		// has selected REBLUR. Before that they are genuinely absent rather than showing
+		// uninitialised video memory, which is what they used to do: the textures were allocated
+		// unconditionally in SetupResources and nothing ever cleared them, so with SVGF or Off
+		// selected these panels displayed whatever the driver handed out.
 		if (texNRDViewZ)
 			BUFFER_VIEWER_NODE(texNRDViewZ, debugRescale)
 		if (texNRDNormalRoughness)
 			BUFFER_VIEWER_NODE(texNRDNormalRoughness, debugRescale)
 		if (texNRDMV)
 			BUFFER_VIEWER_NODE(texNRDMV, debugRescale)
+		if (!texNRDViewZ && !texNRDNormalRoughness && !texNRDMV)
+			ImGui::TextDisabled("The guides are allocated on first use; select the REBLUR denoiser in Screen Space Ray Tracing.");
 
 		ImGui::TreePop();
 	}
@@ -95,6 +103,48 @@ void NRD::SetupResources()
 	lastCommonGameFrame = 0;
 	prevResourceSize[0] = prevResourceSize[1] = 0;
 	prevRectSize[0] = prevRectSize[1] = 0;
+
+	// (batch 11, item C2) The three guide textures are allocated on first need, not here.
+	//
+	// SetupResources also runs on a resolution change (BSShaderRenderTargets_Create re-runs
+	// State::Setup), and these are sized from kMAIN, so anything left resident would keep the old
+	// extent forever. Dropping them is what makes the next frame that needs guides rebuild them
+	// at the current size -- the same pattern ScreenSpaceRayTracing uses for its own lazily built
+	// REBLUR surfaces.
+	texNRDViewZ = nullptr;
+	texNRDNormalRoughness = nullptr;
+	texNRDMV = nullptr;
+
+	CompileComputeShaders();
+}
+
+// (batch 11, item C2) Bring the three guides up on the first frame that is actually going to
+// write them.
+//
+// They used to be created unconditionally in SetupResources: 12 bytes per output pixel between
+// them -- R32 viewZ, R10G10B10A2 normal+roughness, R16G16 motion vectors -- i.e. ~25 MB at 1080p
+// and ~100 MB at a 4K allocation, held for the whole session by every user with the NRD feature
+// installed. That included users on SVGF or Off, for whom nothing reads any of the three, and
+// users with `Enabled` unticked on this very page.
+//
+// This is the only allocation in this batch that a user who never opens the menu still gets back,
+// which is why it is worth doing even though the dispatch itself was already correctly gated by
+// AnyConsumerNeedsGuides.
+//
+// SetupResources' clear-on-allocate problem goes away with it. Nothing zeroed these three, so
+// with SVGF or Off selected the Buffer Viewer entries below showed uninitialised video memory
+// rather than an honest "not in use". Now the entries are simply absent -- they are guarded by
+// `if (tex)` and the pointers are null -- which is the accurate presentation.
+//
+// Returns false if allocation was not attempted or did not produce all three, which PrepareGuides
+// treats exactly like a failed shader compile: guidesReadyThisFrame stays false and every consumer
+// falls back to its own denoiser, which is a path that already exists and is already tested.
+bool NRD::EnsureGuides()
+{
+	if (texNRDViewZ && texNRDNormalRoughness && texNRDMV)
+		return true;
+
+	logger::debug("Creating NRD guide textures...");
 
 	auto renderer = globals::game::renderer;
 	auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
@@ -122,24 +172,30 @@ void NRD::SetupResources()
 		.Texture2D = { .MipSlice = 0 }
 	};
 
-	texNRDMV = eastl::make_unique<Texture2D>(texDesc);
-	texNRDMV->CreateSRV(srvDesc);
-	texNRDMV->CreateUAV(uavDesc);
-	Util::SetResourceName(texNRDMV->resource.get(), "NRD::MV");
+	if (!texNRDMV) {
+		texNRDMV = eastl::make_unique<Texture2D>(texDesc);
+		texNRDMV->CreateSRV(srvDesc);
+		texNRDMV->CreateUAV(uavDesc);
+		Util::SetResourceName(texNRDMV->resource.get(), "NRD::MV");
+	}
 
 	srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R32_FLOAT;
-	texNRDViewZ = eastl::make_unique<Texture2D>(texDesc);
-	texNRDViewZ->CreateSRV(srvDesc);
-	texNRDViewZ->CreateUAV(uavDesc);
-	Util::SetResourceName(texNRDViewZ->resource.get(), "NRD::ViewZ");
+	if (!texNRDViewZ) {
+		texNRDViewZ = eastl::make_unique<Texture2D>(texDesc);
+		texNRDViewZ->CreateSRV(srvDesc);
+		texNRDViewZ->CreateUAV(uavDesc);
+		Util::SetResourceName(texNRDViewZ->resource.get(), "NRD::ViewZ");
+	}
 
 	srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-	texNRDNormalRoughness = eastl::make_unique<Texture2D>(texDesc);
-	texNRDNormalRoughness->CreateSRV(srvDesc);
-	texNRDNormalRoughness->CreateUAV(uavDesc);
-	Util::SetResourceName(texNRDNormalRoughness->resource.get(), "NRD::NormalRoughness");
+	if (!texNRDNormalRoughness) {
+		texNRDNormalRoughness = eastl::make_unique<Texture2D>(texDesc);
+		texNRDNormalRoughness->CreateSRV(srvDesc);
+		texNRDNormalRoughness->CreateUAV(uavDesc);
+		Util::SetResourceName(texNRDNormalRoughness->resource.get(), "NRD::NormalRoughness");
+	}
 
-	CompileComputeShaders();
+	return texNRDViewZ && texNRDNormalRoughness && texNRDMV;
 }
 
 void NRD::ClearShaderCache()
@@ -162,7 +218,7 @@ void NRD::PrepareGuides()
 	commonSettingsValidThisFrame = false;
 	guidesReadyThisFrame = false;
 
-	if (!settings.Enabled || !prepareNRDGuidesCompute || !texNRDViewZ || !texNRDNormalRoughness || !texNRDMV)
+	if (!settings.Enabled || !prepareNRDGuidesCompute)
 		return;
 
 	// (S2.6) No REBLUR consumer this frame means no reader for any of the three guides.
@@ -172,12 +228,26 @@ void NRD::PrepareGuides()
 	if (!AnyConsumerNeedsGuides())
 		return;
 
+	// (batch 11, item C2) ...and this is where the guides come into existence, on the far side of
+	// that gate. The ordering is the whole point: with the surfaces allocated in SetupResources,
+	// a user on SVGF or Off -- or with this feature's own Enabled unticked -- still paid ~100 MB
+	// of a 4K allocation for three textures nothing read. A failure here is treated exactly like
+	// a failed shader compile above: guidesReadyThisFrame stays false and every consumer keeps
+	// its own fallback denoiser.
+	if (!EnsureGuides())
+		return;
+
 	auto context = globals::d3d::context;
 	auto renderer = globals::game::renderer;
 	auto rts = renderer->GetRuntimeData().renderTargets;
 	auto state = globals::state;
 
 	state->BeginPerfEvent("NRD - Prepare Guides");
+	// (batch 11, item B1) This pass had a PIX marker but no GPU timing row, which made it the one
+	// stretch of the REBLUR path the overlay could not price: one full-screen dispatch writing
+	// viewZ and packed normal+roughness, plus a full-resource copy of the motion-vector target.
+	// Purely instrumentation -- it changes no dispatch and no binding.
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::NRDGuides);
 
 	auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 	auto normal = rts[NORMALROUGHNESS];
@@ -213,6 +283,7 @@ void NRD::PrepareGuides()
 	// MV target so we can rebind it through NRD's UAV slot without aliasing.
 	context->CopyResource(texNRDMV->resource.get(), motion.texture);
 
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::NRDGuides);
 	state->EndPerfEvent();
 
 	guidesReadyThisFrame = true;

@@ -1483,8 +1483,8 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 	auto legends = overlay.BuildDrawCallLegends(theme, anyTestData);
 	auto columns = overlay.BuildPassTableColumns(theme, legends, anyTestData, "GPU Time (%)",
 		"Intervals: how many separate timestamp intervals this frame's sample is the sum of.\n"
-		"A bucket can measure several disjoint stretches of one frame - SSRT Trace has four\n"
-		"(prepass, diffuse chain, specular chain, composite). This replaces Draw Calls and\n"
+		"A bucket can measure several disjoint stretches of one frame - Volumetric Lighting\n"
+		"has four (generate, raymarch, both blurs). This replaces Draw Calls and\n"
 		"Cost/Call, which are not defined for a compute pass: a GPU bucket has no draw calls,\n"
 		"so Cost/Call was a hard zero on every row.");
 

@@ -20,10 +20,19 @@ namespace Util
 	 */
 	enum class GpuBucket : int
 	{
-		SSRTTrace = 0,           // depth pyramid, prepare color, ray march, SHARC, diffuse composite
+		// (batch 11, item B2) The former single SSRTTrace row, split four ways. It was one bucket
+		// accumulating four disjoint stretches of the frame, which made "SSRT costs N ms" the only
+		// answer it could give -- and the question people actually have is how that N divides
+		// between the diffuse and the specular chain, because those have independent toggles.
+		SSRTDepthPyramid = 0,    // SSRT prepass: depth linearise + Hi-Z pyramid build
+		SSRTTraceDiffuse,        // diffuse ray march (and the SHARC update/resolve when built in)
+		SSRTSparseResolve,       // (batch 12) sparse sampling: half-res / checkerboard resolve back to full resolution
+		SSRTTraceSpecular,       // specular prepare-color + specular ray march
+		SSRTComposite,           // diffuse composite, including the full-res 7x7 confidence window
 		SSRTSvgf,                // hand-written SVGF: temporal + variance + a-trous (diffuse and specular)
-		SSRTReblur,              // NRD REBLUR: pack + REBLUR dispatches + unpack (diffuse and specular)
+		SSRTReblur,              // NRD REBLUR dispatches + back-end unpack (diffuse and specular)
 		SSRTConfidenceFilter,    // reinjection confidence: quarter-res downsample + separable blur + upsample
+		NRDGuides,               // (batch 11, item B1) NRD::PrepareGuides: viewZ + normal/roughness + MV copy
 		SSGI,                    // Screen Space GI compute chain (excluding Contact AO)
 		SSGIContactAO,           // SSGI Contact AO pass
 		PhysicalSkyShadowAccum,  // Physical Sky aerial-perspective shadow accumulation
@@ -113,9 +122,10 @@ namespace Util
 
 	private:
 		static constexpr int kFramesInFlight = 5;  // readback latency budget in frames
-		// Begin/End pairs one bucket may accumulate per frame. The busiest buckets need 4
-		// (SSRT Trace: prepass + diffuse/specular chains + composite) and 4 (Volumetric
-		// Lighting: generate + raymarch + both blurs). VR does NOT double these: the eyes
+		// Begin/End pairs one bucket may accumulate per frame. The busiest bucket needs 4
+		// (Volumetric Lighting: generate + raymarch + both blurs). SSRT used to need 4 as well;
+		// batch 11 item B2 split that bucket into the four stretches it was summing, so each of
+		// those now opens exactly one interval. VR does NOT double these: the eyes
 		// are packed double-wide or into an array and handled by the same host dispatch,
 		// so it is the dispatch extent that grows, not the number of intervals. 12 leaves
 		// headroom instead of silently dropping intervals; each unused slot is a null

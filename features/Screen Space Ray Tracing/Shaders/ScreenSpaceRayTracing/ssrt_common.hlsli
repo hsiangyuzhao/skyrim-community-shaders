@@ -491,3 +491,97 @@ float CalculateWeight(float depthCenter, float depthP, float phiD, float3 normal
 	float weight = exp(-weightDepth - weightLuminance) * weightNormal;
 	return weight;
 }
+// ============================================================================================
+// (batch 12) SPARSE SAMPLING -- the geometry shared by the sparse ray march and its resolve.
+//
+// Two sparse modes, each a compile-time permutation of ssrt_raymarch.hlsl and of
+// ssrt_sparse_resolve.hlsl, and both of them halve the number of diffuse rays the frame traces:
+//
+//   SSRT_SPARSE_HALFRES       one ray per 2x2 block of render pixels. The compact grid is
+//                             floor(renderExtent / 2), which is exactly the extent
+//                             ssrt_depth_downsample.hlsl writes into mip 1 of the Hi-Z pyramid,
+//                             so the traversal can start at mip 1 and its cell grid still
+//                             coincides with a texel grid.
+//   SSRT_SPARSE_CHECKERBOARD  one ray per horizontal pair of render pixels, alternating which
+//                             half of the pair every frame. The compact grid is
+//                             (renderExtent.x >> 1) x renderExtent.y, and every sample is a
+//                             *real* full-resolution pixel -- so the traversal stays at mip 0
+//                             and no G-buffer value is ever approximated.
+//
+// Resolution is a permutation and not a runtime branch because it changes the traversal's
+// finest Hi-Z level, the extent the dispatch clamps against, and how the G-buffer is addressed.
+// All variants are always compiled, so switching modes never triggers a recompile.
+//
+// What is deliberately *not* affected: the denoisers. Both modes resolve back to full
+// resolution before anything else in the chain runs, so REBLUR, SVGF, the confidence filter and
+// the composite are untouched -- see the derivation at the head of ssrt_sparse_resolve.hlsl.
+#if defined(SSRT_SPARSE_HALFRES) && defined(SSRT_SPARSE_CHECKERBOARD)
+#	error "SSRT_SPARSE_HALFRES and SSRT_SPARSE_CHECKERBOARD are alternatives, not a pair."
+#endif
+#if (defined(SSRT_SPARSE_HALFRES) || defined(SSRT_SPARSE_CHECKERBOARD)) && defined(SSRT_SPECULAR)
+#	error "Sparse sampling is a diffuse-only permutation; reflection sharpness rules out sparse specular."
+#endif
+
+#if defined(SSRT_SPARSE_HALFRES) || defined(SSRT_SPARSE_CHECKERBOARD)
+#	define SSRT_SPARSE 1
+#endif
+
+// Extent of the render sub-rect, in full-resolution texels. Same truncation
+// Util::ConvertToDynamic performs on the CPU side and the same expression the ray march and
+// every denoiser pass already compute inline, so the three land on the same texel.
+uint2 SSRT_GetRenderExtent()
+{
+	return uint2(SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy);
+}
+
+// Extent of the compact grid the current permutation's ray march runs on.
+//
+// The half-resolution grid is floor(renderExtent / 2) rather than ceil, because floor is exactly
+// what ssrt_depth_downsample.hlsl writes into mip 1 of the pyramid (its dispatch is sized
+// `max(1, size >> 1)`). With ceil, an odd render width would leave the last compact column
+// backed by a mip 1 texel nobody ever wrote, which by the audit #8 convention reads as the far
+// plane -- a column of rays that would silently classify as sky. The resolve pass covers the
+// full render extent regardless of the compact extent, so an odd render extent's last
+// full-resolution column is reconstructed from its clamped neighbour rather than left stale.
+uint2 SSRT_GetSparseExtent(uint2 renderExtent)
+{
+#if defined(SSRT_SPARSE_HALFRES)
+	return max(uint2(1, 1), renderExtent >> 1);
+#elif defined(SSRT_SPARSE_CHECKERBOARD)
+	return uint2(max(1u, renderExtent.x >> 1), renderExtent.y);
+#else
+	return renderExtent;
+#endif
+}
+
+// (batch 12) Which half of each horizontal pair the checkerboard traces this frame.
+//
+// Taken from SharedData::FrameCount rather than from a constant-buffer field, deliberately: the
+// ray march and the resolve are two dispatches of the same frame reading the same shared
+// constant buffer, which is uploaded once per frame, so they cannot disagree -- and adding a
+// field to SSRTCB would have changed the reflection chunk of *every* permutation of
+// ssrt_raymarch.hlsl, including the ones that must stay bit-identical.
+//
+// It has to alternate. With a fixed phase, half the pixels are never traced and the frame is
+// permanently half-resolution in x; alternating means every pixel is traced every other frame
+// and the denoiser's temporal accumulation carries the other one. NRD's own checkerboard
+// support has the same requirement, for the same reason.
+uint SSRT_SparseCheckerPhase()
+{
+	return SharedData::FrameCount & 1u;
+}
+
+// The full-resolution column that compact texel `compact` traced. The phase flips with y, so
+// the traced set is a checkerboard rather than a set of columns.
+uint SSRT_SparseCheckerColumn(uint2 compact)
+{
+	return (compact.x << 1) | ((compact.y + SSRT_SparseCheckerPhase()) & 1u);
+}
+
+// Whether full-resolution pixel `pixel` is the one its own 2x1 pair traced this frame. The
+// exact inverse of SSRT_SparseCheckerColumn: pixel is traced iff the column that pair traced
+// equals pixel.x.
+bool SSRT_SparseCheckerIsTraced(uint2 pixel)
+{
+	return (pixel.x & 1u) == ((pixel.y + SSRT_SparseCheckerPhase()) & 1u);
+}

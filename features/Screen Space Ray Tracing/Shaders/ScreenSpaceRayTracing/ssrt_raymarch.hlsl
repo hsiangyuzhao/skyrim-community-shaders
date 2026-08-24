@@ -22,6 +22,13 @@
 
 #include "ScreenSpaceRayTracing/ssrt_common.hlsli"
 
+// (batch 11, item A) REBLUR's front-end packing helpers, so that the ray march can write u0
+// straight into the IN_*_RADIANCE_HITDIST layout NRD expects instead of handing a second
+// full-screen pass the job of converting it. Header only -- it declares no registers and every
+// symbol in it is prefixed _NRD_ / NRD_ / REBLUR_, so it cannot collide with anything
+// ssrt_common.hlsli brings in.
+#include "NRD/NRDReblurSH.hlsli"
+
 #if SHARC_UPDATE || SHARC_RENDER
 #   define SHARC_ENABLE_64_BIT_ATOMICS 1
 #   include "ScreenSpaceRayTracing/sharc/SharcCommon.h"
@@ -176,6 +183,23 @@ cbuffer SSRTCB : register(b1)
     // DrawSSRTSpecular passes 0 unconditionally. So neither the fallback path nor the specular
     // permutation needs a guard of its own.
     float CubemapFillBlend;
+    // (batch 11, item A) REBLUR's hit-distance normalization constants. The same three values
+    // the C++ side hands nrd::ReblurSettings::hitDistanceParameters -- REBLUR denormalizes with
+    // them internally, so the producer and the denoiser must agree. They used to live in a
+    // constant buffer of their own (NRDPackCB, read by ssrt_nrd_pack.hlsl); that shader is gone
+    // and these took the three pad slots row 3 already had, so the buffer did not grow for them.
+    float NRDHitDistA;
+    float NRDHitDistB;
+    float NRDHitDistC;
+    // --- row 4 ---
+    // (batch 11, item A) Non-zero makes the output block below write u0 in REBLUR's front-end
+    // layout (YCoCg radiance + normalized hit distance) instead of the chain's own linear
+    // radiance layout -- and the C++ side binds texNRDPackInput at u0 in exactly that case. Zero
+    // is the pre-existing behaviour, bit for bit: every expression the flag gates is skipped.
+    //
+    // Set only when DrawSSRT{Diffuse,Specular} has already resolved this frame's effective
+    // denoiser to REBLUR, which is the same condition that calls RunReblur.
+    uint NRDFrontEndPack;
 };
 
 // (audit #21) Never defined by ScreenSpaceRayTracing::CompileComputeShaders, so this is
@@ -187,7 +211,33 @@ cbuffer SSRTCB : register(b1)
 #define SSRT_OPTION_INVERTED_DEPTH 0
 
 #define HIZ_MAX_ITERATIONS MaxSteps
-#define HIZ_MIN_MIP 0
+// (batch 12) The traversal's finest level *is* the resolution the pass traces at.
+//
+// Under SSRT_SPARSE_HALFRES that is mip 1 of the Hi-Z pyramid, which is natively half sized:
+// with `screen_size` the render extent, SSRT_GetMipResolution(screen_size, 1) is exactly the
+// compact grid, so cell boundaries keep lining up with texel boundaries and MaxSteps keeps its
+// reach in screen terms. Starting at mip 0 there would make the ray re-test every texel twice.
+//
+// Under SSRT_SPARSE_CHECKERBOARD it stays 0, and that is not an oversight: a checkerboard
+// sample *is* a full-resolution pixel, so its ray is the same ray the full-resolution pass
+// would trace for that pixel and it must walk the same cell grid. The consequence is that
+// checkerboard rays are individually more expensive than half-resolution ones even though both
+// modes trace the same number of them.
+#if defined(SSRT_SPARSE_HALFRES)
+#   define HIZ_MIN_MIP 1
+#else
+#   define HIZ_MIN_MIP 0
+#endif
+// (batch 12) The self-intersection radius in SSRT_ValidateHit, in full-resolution texels --
+// `screen_size` is a full-resolution extent, so the number has to be expressed in those. It is
+// "two texels of the traversal grid", and under SSRT_SPARSE_HALFRES one grid texel is two
+// full-resolution texels. Spelled as a macro rather than a static const so the default path is
+// textually the literal it always was.
+#if defined(SSRT_SPARSE_HALFRES)
+#   define SSRT_SELF_HIT_TEXELS 4.f
+#else
+#   define SSRT_SELF_HIT_TEXELS 2.f
+#endif
 #define SSRT_FLOAT_MAX 3.402823466e+38
 #define SSRT_DEPTH_HIERARCHY_MAX_MIP MaxMips
 #if defined(SSRT_SPECULAR)
@@ -519,7 +569,7 @@ float SSRT_ValidateHit(float3 hit, float2 uv, float3 world_space_ray_direction, 
     // expected to come back through the legitimate path instead -- rays that now advance
     // properly, hit the hair, and return its dark screen radiance.
     float2 manhattan_dist = abs(hit.xy - uv);
-    if ((manhattan_dist.x < (2.f / screen_size.x)) && (manhattan_dist.y < (2.f / screen_size.y)))
+    if ((manhattan_dist.x < (SSRT_SELF_HIT_TEXELS / screen_size.x)) && (manhattan_dist.y < (SSRT_SELF_HIT_TEXELS / screen_size.y)))
     {
         return 0;
     }
@@ -755,6 +805,49 @@ float4 SSRT_SanitiseRadianceOutput(float4 color)
     return color;
 }
 
+// ============================================================================================
+// (batch 11, item A) REBLUR front-end packing, folded in from the retired ssrt_nrd_pack.hlsl.
+//
+// WHY THE STORAGE ROUND TRIPS ARE REPRODUCED EXPLICITLY. The pack pass read its inputs back
+// out of textures the ray march had just written: the radiance out of an R16G16B16A16_FLOAT
+// surface, the diffuse hit-distance encoding out of an R8_UNORM one. Computing the same
+// quantities from the full-precision locals instead would produce a *different* (in fact
+// slightly better) number, and "slightly better" is not what this change is for -- the point is
+// to delete two full-screen passes at no visual cost whatsoever. So the two conversions are
+// applied by hand, which makes the arithmetic below bit-identical to what the pack pass
+// computed and keeps the burden of proof on arithmetic rather than on perception.
+//
+// Both conversions are exactly specified, which is what makes this work at all:
+//   * FLOAT -> FLOAT16 is IEEE half with round-to-nearest-even, and the f32tof16 / f16tof32
+//     intrinsic pair is that same conversion.
+//   * FLOAT -> UNORM8 is round-to-nearest-even of clamp(x, 0, 1) * 255, and HLSL's round()
+//     compiles to DXBC round_ne -- nearest *even*, not C's ties-away-from-zero.
+float3 SSRT_Fp16RoundTrip3(float3 v)
+{
+    return float3(f16tof32(f32tof16(v.x)), f16tof32(f32tof16(v.y)), f16tof32(f32tof16(v.z)));
+}
+
+float SSRT_Unorm8RoundTrip(float v)
+{
+    return round(saturate(v) * 255.0f) / 255.0f;
+}
+
+// Verbatim from ssrt_nrd_pack.hlsl's ScreenToViewDepth, including the sentinel: sky and far
+// plane resolve to a viewZ far outside NRD's denoisingRange, so REBLUR treats the pixel as "no
+// surface". Deliberately *not* expressed through view_space_ray.z, which is a different
+// construction (Hi-Z mip 0 through CameraProjInverse) and would not reproduce the same bits.
+float SSRT_NRDViewZ(float screenDepth)
+{
+    if (screenDepth >= 1.0 - 1e-6 || screenDepth <= 0.0)
+        return 3.402823466e+38;
+    return (SharedData::CameraData.w / (-screenDepth * SharedData::CameraData.z + SharedData::CameraData.x));
+}
+
+float3 SSRT_NRDHitDistParams()
+{
+    return float3(NRDHitDistA, NRDHitDistB, NRDHitDistC);
+}
+
 // (guard G7) Non-finite guard on the CubemapNormalization brightness ratio.
 //
 // The ratio is directionalAmbientLuminance / max(envLuminance, 1e-4); a non-finite
@@ -798,7 +891,83 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 
     float4 outColor = float4(0, 0, 0, 0);
 
-    float2 uv = float2(coords.xy + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
+    // (batch 12) THE THREE COORDINATES A SPARSE LANE HAS, AND WHY THEY ARE NOT THE SAME NUMBER.
+    //
+    // `coords` is the *compact* grid coordinate. It addresses the three output UAVs and nothing
+    // else, so on the sparse paths every store below writes the compact surfaces unchanged --
+    // the output block at the bottom of this file needs no edit at all.
+    //
+    // `gbufferCoords` is the full-resolution pixel this lane stands for. Everything that reads a
+    // full-resolution G-buffer -- depth, normal/roughness, albedo, SSGI's AO -- and the `uv` the
+    // ray origin is built from must use it, or the lane would trace a ray for one pixel out of
+    // another pixel's surface data.
+    //
+    // `SSRT_NOISE_COORDS` seeds the sampling sequences (SampleRandomVector2DBaked and the
+    // skylighting STBN lookup). Under checkerboard it is the full-resolution pixel, because a
+    // checkerboard sample really is one and the blue-noise pattern was authored for that grid --
+    // which also makes each traced ray identical to the one the full-resolution pass would have
+    // traced. Under half resolution there is no full-resolution pixel to be had: the
+    // representative subpixel jitters between the four as the geometry moves, so seeding from it
+    // would sample the noise texture at an irregular subset and destroy both its spectrum and its
+    // frame-to-frame stability. The compact grid is contiguous, which is what blue noise wants.
+    //
+    // Spelled as macros rather than as `const uint2` locals, and that is load bearing rather than
+    // stylistic: on the default path both expand textually to `coords.xy`, so the token stream
+    // fxc sees for every non-sparse permutation -- the diffuse one, the specular one and the
+    // SHARC ones -- is exactly the one it saw before this batch, and the generated code is
+    // bit-identical rather than merely equivalent. Introducing the aliases as locals instead
+    // produced identical *values* but let O3 reassociate an unrelated saturate in the specular
+    // permutation, which is precisely the kind of "equivalent but not identical" the Full-mode
+    // proof is not allowed to contain.
+#if defined(SSRT_SPARSE_HALFRES)
+    // A half-resolution lane must stand for one *real* surface point, not for an average of its
+    // 2x2 block, and which point is forced rather than chosen.
+    //
+    // The traversal's finest level is mip 1, whose value is the *minimum* over the block, so the
+    // ray origin's depth is the nearest of the four subpixels; there is nothing to decide about
+    // that. What is decidable is which subpixel supplies the uv, the normal and the albedo, and
+    // pairing the minimum depth with a farther subpixel is a defect and not a nuance: the origin
+    // would land *behind* the surface mip 1 records, SSRT_AdvanceRay reads `surface_z >
+    // position.z` as "below the surface" (i.e. an instant hit at the origin), and
+    // SSRT_ValidateHit then throws that hit away as a self-hit. Every block straddling a depth
+    // discontinuity would come back as a miss -- a wholesale false-miss along every silhouette
+    // in the frame.
+    //
+    // So resolve the argmin explicitly and take uv, depth, normal and albedo from that one
+    // full-resolution pixel. Then mip 1's value *is* that pixel's own depth, the grazing-angle
+    // origin bias below pushes the origin off the surface by exactly the margin the
+    // full-resolution path enjoys, and the first advance behaves identically.
+    //
+    // Ties resolve to the lowest subpixel index, which keeps the choice deterministic frame to
+    // frame. Reading mip 0 out of bounds is safe: the pyramid holds the far plane there
+    // (audit #8), so an out-of-range subpixel simply never wins the argmin.
+    const int2 blockBase = int2(coords.xy) * 2;
+    const float4 blockDepths = float4(
+        SSRT_LoadDepth(blockBase, 0),
+        SSRT_LoadDepth(blockBase + int2(1, 0), 0),
+        SSRT_LoadDepth(blockBase + int2(0, 1), 0),
+        SSRT_LoadDepth(blockBase + int2(1, 1), 0));
+    const float blockDepthMin = min(min(blockDepths.x, blockDepths.y), min(blockDepths.z, blockDepths.w));
+    int2 repOffset = int2(1, 1);
+    if (blockDepths.z == blockDepthMin)
+        repOffset = int2(0, 1);
+    if (blockDepths.y == blockDepthMin)
+        repOffset = int2(1, 0);
+    if (blockDepths.x == blockDepthMin)
+        repOffset = int2(0, 0);
+    const uint2 gbufferCoords = uint2(blockBase + repOffset);
+#   define SSRT_GBUFFER_COORDS gbufferCoords
+#   define SSRT_NOISE_COORDS coords.xy
+#elif defined(SSRT_SPARSE_CHECKERBOARD)
+    const uint2 gbufferCoords = uint2(SSRT_SparseCheckerColumn(coords.xy), coords.y);
+#   define SSRT_GBUFFER_COORDS gbufferCoords
+#   define SSRT_NOISE_COORDS gbufferCoords
+#else
+#   define SSRT_GBUFFER_COORDS coords.xy
+#   define SSRT_NOISE_COORDS coords.xy
+#endif
+
+    float2 uv = float2(SSRT_GBUFFER_COORDS + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
     uint eyeIndex = Stereo::GetEyeIndexFromTexCoord(uv);
 
     // (audit P1) Sky / far-plane early-out.
@@ -818,16 +987,30 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // GroupMemoryBarrierWithGroupSync(); bailing out of a subset of the group's
     // (x, y) lanes would make that barrier non-uniform. Writing 0 (instead of leaving
     // the target untouched) also keeps the ping-pong denoiser textures deterministic.
-    float depth = DepthTexture[coords.xy].x;
+#if defined(SSRT_SPARSE_HALFRES)
+    // Identical to DepthTexture[gbufferCoords] inside the render sub-rect -- the argmin subpixel
+    // is by construction the one holding the block minimum -- and correctly the far plane
+    // outside it, so it doubles as the sky test for a fully off-screen block.
+    float depth = blockDepthMin;
+#else
+    float depth = DepthTexture[SSRT_GBUFFER_COORDS].x;
+#endif
     const bool is_far_plane = SSRT_IS_FAR_PLANE(depth);
 
     float3 normalVS;
     float roughness;
-    GetNormalRoughness(coords.xy, normalVS, roughness);
+    GetNormalRoughness(SSRT_GBUFFER_COORDS, normalVS, roughness);
+    // (batch 11, item A) The un-clamped roughness, which is what the retired pack pass fed
+    // REBLUR_FrontEnd_GetNormHitDist: it read the G-buffer itself and computed
+    // saturate(1 - glossiness), where the clamp below would have lifted a mirror-smooth pixel to
+    // 0.02 and moved _NRD_GetSpecMagicCurve with it. GetNormalRoughness returns exactly
+    // 1 - glossiness and glossiness comes out of a UNORM texture, so the value here is in [0, 1]
+    // by construction and the pack's saturate() was a no-op -- i.e. this is the same number.
+    const float nrdFrontEndRoughness = roughness;
     roughness = clamp(roughness, 0.02f, 1.0f);
 
 #if !defined(SSRT_SPECULAR)
-    float3 albedo = AlbedoTexture[coords.xy].xyz;
+    float3 albedo = AlbedoTexture[SSRT_GBUFFER_COORDS].xyz;
 #endif
 
     bool is_mirror = IsMirrorReflection(roughness);
@@ -904,7 +1087,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     view_space_bias_direction *= rsqrt(max(dot(view_space_bias_direction, view_space_bias_direction), 1e-8));
     view_space_ray += view_space_bias_direction * NormalBias * view_space_ray.z * GAME_UNIT_TO_M / max(abs(view_space_normal_dot_ray), 0.1);
     float pdf;
-    float3 view_space_reflected_direction = SampleReflectionVector(view_space_ray_direction, view_space_surface_normal, roughness, coords, sample_id, SAMPLES_PER_PIXEL, pdf);
+    float3 view_space_reflected_direction = SampleReflectionVector(view_space_ray_direction, view_space_surface_normal, roughness, SSRT_NOISE_COORDS, sample_id, SAMPLES_PER_PIXEL, pdf);
     screen_uv_space_ray_origin = ProjectPosition(view_space_ray, FrameBuffer::CameraProj[eyeIndex]);
     float3 screen_space_ray_direction = ProjectDirection(view_space_ray, view_space_reflected_direction, screen_uv_space_ray_origin, FrameBuffer::CameraProj[eyeIndex]);
     float3 world_space_reflected_direction = mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(view_space_reflected_direction, 0)).xyz;
@@ -914,7 +1097,17 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // bound, so the rescale is gone. The `coords >= int2(0, 0)` half is gone with it:
     // `coords` is uint2, so it was vacuously true, and comparing it against an int2 was
     // two of the file's signed/unsigned warnings (X3203).
-    bool valid_ray = all(coords < screen_size) && !is_far_plane;  // (audit P1)
+    // (batch 12) The dispatch's own bound is the compact extent on the sparse paths, and
+    // SSRT_GetSparseExtent applies the same floor rule mip 1 of the pyramid was built under. A
+    // macro for the same reason SSRT_GBUFFER_COORDS is one: on the default path the test below is
+    // textually `all(coords < screen_size)`, the expression that was always there.
+#if defined(SSRT_SPARSE)
+    const uint2 raymarch_extent = SSRT_GetSparseExtent(screen_size);
+#   define SSRT_RAYMARCH_EXTENT raymarch_extent
+#else
+#   define SSRT_RAYMARCH_EXTENT screen_size
+#endif
+    bool valid_ray = all(coords < SSRT_RAYMARCH_EXTENT) && !is_far_plane;  // (audit P1)
 #if SHARC_UPDATE
     valid_ray = valid_ray && ShouldProcessPixel(coords.xy, SharedData::FrameCount);
 #endif
@@ -1120,7 +1313,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             {
                 float3 positionMS = positionWS.xyz;
 
-                sh2 skylighting = Skylighting::sample(SharedData::skylightingSettings, SkylightingProbeArray, stbn_vec3_2Dx1D_128x128x64, coords.xy, positionMS.xyz, world_space_reflected_direction);
+                sh2 skylighting = Skylighting::sample(SharedData::skylightingSettings, SkylightingProbeArray, stbn_vec3_2Dx1D_128x128x64, SSRT_NOISE_COORDS, positionMS.xyz, world_space_reflected_direction);
                 // (guard G6) max(0, z) makes the argument the zero vector whenever the
                 // surface normal points away from +Z *and* has no xy component -- a
                 // downward-facing horizontal surface, i.e. the underside of any overhang,
@@ -1247,7 +1440,9 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             float ao = lerp(1.0, occlusion, OcclusionStrength);
 #   endif
 #   if defined(SSGI)
-            ao *= 1 - saturate(SsgiAoTexture[coords.xy].x);
+            // (batch 12) SSGI's AO target is full resolution; sampled at the representative
+            // subpixel, like the normal and albedo G-buffers.
+            ao *= 1 - saturate(SsgiAoTexture[SSRT_GBUFFER_COORDS].x);
 #   endif
 #   if defined(SSRT_SPECULAR)
             ao = GetSpecularOcclusionFromAmbientOcclusion(NdotV, ao, roughness);
@@ -1279,7 +1474,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             [branch] if (CubemapFillBlend > 0.0) {
                 float fillAo = 1.0;
 #       if defined(SSGI)
-                fillAo = 1 - saturate(SsgiAoTexture[coords.xy].x);
+                fillAo = 1 - saturate(SsgiAoTexture[SSRT_GBUFFER_COORDS].x);
 #       endif
                 ambientFillColor = envColor * Color::MultiBounceAO(albedo, fillAo);
                 ambientFillBlend = CubemapFillBlend;
@@ -1427,8 +1622,22 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 
 #if defined(SSRT_SPECULAR)
     outColor = SSRT_SanitiseRadianceOutput(localSample);  // (guard G2)
-    SSRColorOutput[coords.xy] = outColor;
+    // (batch 11, item A) Written on both paths and unchanged: this is the R32_FLOAT surface
+    // Upscaling.cpp hands DLSS-RR as its specular hit-distance guide, so it is not the pack
+    // pass's private input and cannot be traded away for the packed layout.
     SSRTHitDistanceOutput[coords.xy] = hit_distance;
+    if (NRDFrontEndPack != 0) {
+        // The retired pack pass read hit_distance back out of the R32_FLOAT surface above --
+        // an exact round trip, so no re-quantisation is owed here, unlike the diffuse case.
+        // 65536 is the ray march's "no hit" sentinel, which GetNormHitDist saturates to 1.
+        const float nrdViewZ = SSRT_NRDViewZ(depth);
+        const float normHitDist = REBLUR_FrontEnd_GetNormHitDist(
+            hit_distance, nrdViewZ, SSRT_NRDHitDistParams(), nrdFrontEndRoughness);
+        SSRColorOutput[coords.xy] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(
+            SSRT_Fp16RoundTrip3(outColor.rgb), normHitDist, true);
+    } else {
+        SSRColorOutput[coords.xy] = outColor;
+    }
 #elif SHARC_UPDATE
 #else
 
@@ -1457,7 +1666,34 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // (guard G2) After the average, not before: a single poisoned SPP slot turns the
         // whole sum non-finite, so the useful place to cut is the resolved value.
         outColor = SSRT_SanitiseRadianceOutput(outColor);
-        SSRColorOutput[coords.xy] = outColor;
+        // (batch 11, item A) The encoded hit distance, hoisted out of the store below because
+        // the packed path needs the same number.
+        const float hitNormMean = saturate(hitNormSum / SAMPLES_PER_PIXEL);
+        if (NRDFrontEndPack != 0) {
+            // Every line here is the retired ssrt_nrd_pack.hlsl, moved. The reciprocal
+            // texel-space encoding is decoded back to world units through the *pack's* own
+            // texel-footprint construction, not through hitDistTexelWorld above: the two are
+            // different expressions (this one takes viewZ from the depth buffer and the render
+            // width un-truncated, where the encode side used view_space_ray.z and the truncated
+            // screen_size), and reproducing the consumer's arithmetic rather than the producer's
+            // is what keeps the result bit-identical to what REBLUR was fed before.
+            const float u = SSRT_Unorm8RoundTrip(hitNormMean);
+            const float tTexels = SSRT_HITT_REF_TEXELS * u / max(1.0 - u, 1e-4);
+            const float nrdViewZ = SSRT_NRDViewZ(depth);
+            const float nrdRenderWidth = SharedData::BufferDim.x * FrameBuffer::DynamicResolutionParams1.x;
+            // viewZ is clamped before the footprint multiply: a sky pixel carries the 3.4e38
+            // sentinel, and 2 * 3.4e38 overflows to +inf, which a u = 0 texel would then turn
+            // into 0 * inf = NaN. 1e7 game units is far beyond the denoising range, so the clamp
+            // changes nothing for any pixel REBLUR actually reads.
+            const float nrdTexelWorld = min(abs(nrdViewZ), 1e7) * 2.0 /
+                                        max(abs(FrameBuffer::CameraProj[0][0][0]) * nrdRenderWidth, 1e-6);
+            const float normHitDist = REBLUR_FrontEnd_GetNormHitDist(
+                tTexels * nrdTexelWorld, nrdViewZ, SSRT_NRDHitDistParams(), 1.0);
+            SSRColorOutput[coords.xy] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(
+                SSRT_Fp16RoundTrip3(outColor.xyz), normHitDist, true);
+        } else {
+            SSRColorOutput[coords.xy] = outColor;
+        }
         // (ambient reinjection) The same value SSRColorOutput.w carries, on a surface the
         // denoiser does not touch. Written unconditionally -- including the plain 0 a
         // far-plane or out-of-bounds lane resolves to, so the surface stays deterministic
@@ -1470,7 +1706,11 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // resolve to the 1.0 default, which the denoiser never reads because it early-outs on
         // the far plane. The value is already in [0, 1] by construction (every contributing
         // sample was saturated), so the UNORM store cannot clip and cannot see a NaN.
-        SSRTDiffuseHitDistanceOutput[coords.xy] = saturate(hitNormSum / SAMPLES_PER_PIXEL);
+        // (batch 11, item A) Still written on the packed path, and deliberately so. It costs one
+        // byte per texel, it is what the Buffer Viewer shows for this surface, and it is the one
+        // thing that keeps the entry honest rather than displaying whatever the last SVGF frame
+        // left there. hitNormMean is the value the store always carried, hoisted above.
+        SSRTDiffuseHitDistanceOutput[coords.xy] = hitNormMean;
     }
 #endif
 }

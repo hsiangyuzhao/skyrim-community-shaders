@@ -16,7 +16,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     BaseF0Multiplier,
     MinF0,
     CubemapToF0Multiplier,
-    ComplexMaterialF0Multiplier)
+    ComplexMaterialF0Multiplier,
+    EyeRoughness,
+    EnvMaskStrength)
 
 namespace
 {
@@ -152,7 +154,7 @@ void VanillaFresnel::DrawSettings()
     ImGui::Checkbox("Enable Eye Special Handling", reinterpret_cast<bool*>(&settings.EnableEyeSpecialHandling));
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
-            "Forces eye materials to a fixed near-mirror reflectance (F0 0.027, roughness 0.1) "
+            "Forces eye materials to a fixed reflectance (F0 0.027) plus the Eye Roughness set below, "
             "instead of whatever the generic environment-map path works out.\n\n"
             "Eyes are now recognised per draw at runtime -- by shader technique, by material "
             "feature, or by \"eye\" appearing in the mesh name -- rather than by a compile-time "
@@ -181,4 +183,36 @@ void VanillaFresnel::DrawSettings()
     ImGui::SliderFloat("Min F0", &settings.MinF0, 0.0f, 0.04f, "%.3f");
     ImGui::SliderFloat("Cubemap to F0 Multiplier", &settings.CubemapToF0Multiplier, 0.0f, 10.0f, "%.2f");
     ImGui::SliderFloat("Complex Material Env F0 Multiplier", &settings.ComplexMaterialF0Multiplier, 0.0f, 10.0f, "%.2f");
+
+    ImGui::SliderFloat("Eye Roughness", &settings.EyeRoughness, 0.04f, 1.0f, "%.2f");
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "How blurred the reflection in an eye is. Only applies while Enable Eye Special "
+            "Handling is on.\n\n"
+            "This used to be fixed at 0.10, which is the physically correct value for a cornea "
+            "-- a real eye is a mirror. It was calibrated against the vanilla eye cubemap, "
+            "which is 32x32 and almost black, so a mirror-sharp eye had nothing to reflect. "
+            "With Auto Cubemaps Conversion the reflection source becomes the full-resolution "
+            "real-time environment and the same value turns eyes into chrome beads.\n\n"
+            "0.10 is the old behaviour. 1.00 samples the coarsest cubemap level, which is the "
+            "whole environment averaged to one colour, and looks about like switching Auto "
+            "Cubemaps Conversion off.\n\n"
+            "This is an absolute value: Roughness Multiplier does not scale it. If you raised "
+            "that multiplier to fix eyes, set it back to 1.00 or every metal surface stays "
+            "flat.");
+
+    ImGui::SliderFloat("Environment Mask Strength", &settings.EnvMaskStrength, 0.0f, 1.0f, "%.2f");
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "How much of a material's own environment mask is honoured on materials that ship "
+            "one. Materials without an authored mask are unaffected either way.\n\n"
+            "An authored mask says where a surface reflects and how strongly. Vanilla's masks "
+            "are dark: across all 270 of them the median average value is 0.14 and nearly half "
+            "of all texels are close to black, so applying them in full drops metal armour and "
+            "weapon reflections to roughly a tenth of what they were.\n\n"
+            "Eyes are the exception, and the reason this path exists: the vanilla eye mask is "
+            "mostly black with a bright iris ring, so honouring it is what stops an eye "
+            "reflecting the room over its whole surface.\n\n"
+            "0 ignores authored masks. 1 applies them in full. Anything between fades "
+            "smoothly.");
 }

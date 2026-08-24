@@ -55,6 +55,13 @@ struct NRD : Feature
 	// pass so every consumer sees consistent guides for this frame.
 	void PrepareGuides();
 
+	// (batch 11, item C2) Allocate the three guide textures on first need. Called from
+	// PrepareGuides, and only after AnyConsumerNeedsGuides() has passed, so a session that never
+	// selects REBLUR never pays for them (~25 MB at 1080p, ~100 MB at a 4K allocation). Returns
+	// false if the set is not complete afterwards, which PrepareGuides treats as a failure like
+	// any other. Idempotent; the early-out makes the steady-state call free.
+	bool EnsureGuides();
+
 	// True when PrepareGuides has run successfully for this frame. Consumers
 	// should skip their dispatches if guides aren't ready (e.g. world not
 	// loaded, shader failed to compile).
@@ -67,9 +74,18 @@ struct NRD : Feature
 	// ahead of PrepareGuides(): a consumer deciding at Prepass time whether to bring its
 	// REBLUR path up cannot ask AreGuidesReady() without reading last frame's answer.
 	// This is the question that has a stable answer at that point.
+	//
+	// (batch 11, item C2) It deliberately does *not* ask whether the guide textures exist any
+	// more, and that omission is load-bearing in exactly the way ReblurResourcesReady's is.
+	// The guides are allocated by EnsureGuides on the far side of AnyConsumerNeedsGuides(),
+	// which asks whether a consumer resolved to REBLUR — and this predicate is one of the
+	// inputs to that resolution. Asking about the allocation here would close the loop: no
+	// consumer would select REBLUR because no guides existed, and no guides would be allocated
+	// because no consumer had selected REBLUR. What is left is a fact about configuration, which
+	// is the only kind of fact this question can safely be built on.
 	bool CanPrepareGuides() const
 	{
-		return settings.Enabled && prepareNRDGuidesCompute && texNRDViewZ && texNRDNormalRoughness && texNRDMV;
+		return settings.Enabled && prepareNRDGuidesCompute;
 	}
 
 	// Build a CommonSettings block shared by every denoiser instance this
@@ -141,7 +157,9 @@ struct NRD : Feature
 	uint16_t prevResourceSize[2] = {};
 	uint16_t prevRectSize[2] = {};
 
-	// Shared guide textures owned by NRD.
+	// Shared guide textures owned by NRD. (batch 11, item C2) Null until EnsureGuides runs, i.e.
+	// until a consumer has actually resolved to REBLUR; dropped again by SetupResources so a
+	// resolution change cannot leave them at the old extent.
 	eastl::unique_ptr<Texture2D> texNRDViewZ = nullptr;
 	eastl::unique_ptr<Texture2D> texNRDNormalRoughness = nullptr;
 	eastl::unique_ptr<Texture2D> texNRDMV = nullptr;

@@ -17,12 +17,41 @@ namespace Util
 
 		// Indexed by GpuBucket. Labels are the overlay row names (the overlay appends ':').
 		constexpr BucketInfo kBucketInfo[static_cast<int>(GpuBucket::Count)] = {
-			{ "SSRT Trace",
-				"GPU time for SSRT ray tracing: depth pyramid, prepare color, specular/diffuse ray march,\nSHARC update/resolve and the diffuse composite. Measured with D3D11 timestamp queries." },
+			{ "SSRT Depth Pyramid",
+				"GPU time for the SSRT prepass: the depth linearisation and the Hi-Z pyramid\n"
+				"downsample chain the ray march traverses. Runs once per frame and is shared by\n"
+				"both chains, so it is charged here rather than to either of them. Measured with\n"
+				"D3D11 timestamp queries." },
+			{ "SSRT Trace Diffuse",
+				"GPU time for the diffuse ray march (and the SHARC update/resolve dispatches where\n"
+				"that path is built in). Split out from the old combined SSRT Trace row so the\n"
+				"diffuse and specular chains, which have independent toggles, can be priced\n"
+				"separately." },
+			{ "SSRT Sparse Resolve",
+				"GPU time for the diffuse sparse-sampling resolve: the pass that turns a\n"
+				"half-resolution or checkerboard ray march back into the three full-resolution\n"
+				"surfaces the denoiser, the confidence filter and the composite read. Only runs\n"
+				"while Diffuse Sampling is not Full. This is the row to read against SSRT Trace\n"
+				"Diffuse: the sparse modes are worth having only while the drop in that row is\n"
+				"larger than the figure here, and everything after this pass costs exactly what\n"
+				"it cost at full density." },
+			{ "SSRT Trace Specular",
+				"GPU time for the specular leg's prepare-color pass and specular ray march. Split\n"
+				"out from the old combined SSRT Trace row; compare against SSRT Trace Diffuse to\n"
+				"see how the ray-marching cost divides between the two chains." },
+			{ "SSRT Composite",
+				"GPU time for the diffuse composite: the ambient-reinjection application and, when\n"
+				"the Low-Resolution Confidence Filter is off, the full-resolution 7x7 confidence\n"
+				"window folded into the same dispatch. The specular signal has no composite of its\n"
+				"own - the deferred composite adds it, which is not instrumented here." },
 			{ "SSRT SVGF",
 				"GPU time for the hand-written SVGF denoiser: temporal, variance and a-trous passes,\ndiffuse and specular chains combined. Only shown while the SSRT Denoiser is set to SVGF." },
 			{ "SSRT REBLUR",
-				"GPU time for the NRD REBLUR denoiser: front-end pack, all REBLUR dispatches and the\nback-end unpack, diffuse and specular combined. Only shown while the SSRT Denoiser is set to REBLUR." },
+				"GPU time for the NRD REBLUR denoiser: all REBLUR dispatches plus the back-end\n"
+				"unpack, diffuse and specular combined. The front-end pack that used to be counted\n"
+				"here no longer exists - the ray march writes REBLUR's input layout directly, so\n"
+				"that cost is now inside the SSRT Trace rows and is smaller than it was. Only shown\n"
+				"while the SSRT Denoiser is set to REBLUR." },
 			{ "SSRT Confidence Filter",
 				"GPU time for the ambient-reinjection confidence filter: the quarter-resolution\n"
 				"depth-aware downsample, the two separable joint-bilateral blur passes and the\n"
@@ -30,7 +59,13 @@ namespace Util
 				"history and no previous frame. Only shown while Ambient Reinjection and the\n"
 				"Low-Resolution Confidence Filter are both on; with the filter off the same work\n"
 				"is a 7x7 full-resolution window folded into the diffuse composite, which is\n"
-				"charged to the SSRT Trace row instead." },
+				"charged to the SSRT Composite row instead." },
+			{ "NRD Guides",
+				"GPU time for NRD::PrepareGuides: the viewZ and packed normal+roughness dispatch\n"
+				"plus the full-resource copy of the game's motion-vector target that REBLUR needs\n"
+				"as both an SRV and a UAV. Runs once per frame, and only when a chain has actually\n"
+				"resolved to REBLUR - with SVGF or Off selected it does not run at all. It used to\n"
+				"be the one stretch of the denoising path with no timing row of its own." },
 			{ "SSGI",
 				"GPU time for the Screen Space GI compute chain (prefilter, radiance, GI, blur, upsample),\nexcluding the Contact AO pass which has its own row." },
 			{ "SSGI Contact AO",

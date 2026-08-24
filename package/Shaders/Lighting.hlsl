@@ -2406,7 +2406,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif
 	if (enableVanillaFresnel && applyEyeHandling) {
 		F0 = 0.027;
-		roughness = 0.1;
+		// (batch 10b) An absolute roughness now, and deliberately not scaled by
+		// RoughnessMultiplier -- see the twin of this at the end of the env-map block for why.
+		// F0 stays hardcoded at 0.027: that is the cornea's real reflectance and it was never
+		// the problem. The old 0.1 lives on as the setting's "previous behaviour" value.
+		roughness = clamp(SharedData::vanillaFresnelSettings.EyeRoughness, 0.04, 1.0);
 	}
 	F0 = max((enableVanillaFresnel ? SharedData::vanillaFresnelSettings.MinF0 : 0.0), F0 * SharedData::vanillaFresnelSettings.BaseF0Multiplier);
 	float3 baseF0 = F0;
@@ -2522,11 +2526,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			// back to 0.027 after the conversion branch above has handed it a cubemap-derived
 			// F0; before, it did not compile into the permutations the mis-identified eye
 			// materials actually use, which is why those eyes came out chrome.
+			//
+			// (batch 10b) The eye roughness is an absolute value and skips RoughnessMultiplier on
+			// purpose. Otherwise the two knobs fight: the only way to unfocus an eye used to be to
+			// raise the global multiplier (5x-10x, measured), and that multiplies every ordinary
+			// material's roughness by the same factor and flattens all of them at once. Both
+			// branches still land in [0.04, 1.0].
 			if (applyEyeHandling) {
 				F0 = 0.027;
-				roughness = 0.1;
+				roughness = clamp(SharedData::vanillaFresnelSettings.EyeRoughness, 0.04, 1.0);
+			} else {
+				roughness = clamp(roughness * SharedData::vanillaFresnelSettings.RoughnessMultiplier, 0.04, 1.0);
 			}
-			roughness = clamp(roughness * SharedData::vanillaFresnelSettings.RoughnessMultiplier, 0.04, 1.0);
 		}
 #		endif
 
@@ -3333,15 +3344,33 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		// (batch 10) Deliberate divergence from upstream, which skips this multiply for every
 		// material once VanillaFresnel is on. VanillaFresnel exists to invent reflections for
 		// vanilla materials that never had any; those have no author env mask (EnvmapData.y == 0,
-		// see :563 and :2422) and `envMask` is only `glossiness` there, so skipping is right.
+		// see :563 and :2426) and `envMask` is only `glossiness` there, so skipping is right.
 		// A material that ships its own env mask already had reflections in vanilla and the
 		// author said where and how strong they are, so honour the mask instead of overriding it.
-		// This is what unflattens eyes whose cubemap is near-black: the conversion at :2467
-		// forces `dynamicCubemap`, so :2533 never samples that near-black cubemap, and without
+		// This is what unflattens eyes whose cubemap is near-black: the conversion at :2471
+		// forces `dynamicCubemap`, so :2544 never samples that near-black cubemap, and without
 		// this multiply the substituted real-time reflection also escaped the author's mask.
-		if (!enableVanillaFresnel || EnvmapData.y)
-#			endif
+		//
+		// (batch 10b) `EnvMaskStrength` fades that mask back out, because honouring it in full
+		// is expensive elsewhere: across all 270 shipping `_m.dds` masks the median per-texture
+		// mean is 0.14, the median texel is 0.06, 47.7% of texels are near black and only 0.8%
+		// reach 0.8, so full strength cuts metal armour reflections to roughly a tenth. Eyes are
+		// the exception that made batch 10 work at all -- the vanilla eye mask is 73% near black
+		// but 12.4% of its texels are >= 0.8 (p90 = 1.0), a bright iris ring on a black field.
+		// Linear, not thresholded: a "only when the mask is dark" rule would band on gradients.
+		//
+		// The strength only applies while VanillaFresnel is actually on. With the feature
+		// compiled in but switched off at runtime this line is still reachable (the guard above
+		// admits `dynamicCubemap` on its own), and a disabled feature must not move the mask, so
+		// that case keeps the plain multiply. Which pixels get any multiply at all is unchanged
+		// from batch 10: `!enableVanillaFresnel || EnvmapData.y`, just spelled as two branches.
+		if (!enableVanillaFresnel)
+			reflectance *= envMask;
+		else if (EnvmapData.y)
+			reflectance *= lerp(1.0, envMask, SharedData::vanillaFresnelSettings.EnvMaskStrength);
+#			else
 		reflectance *= envMask;
+#			endif
 #		endif
 	}
 #	endif

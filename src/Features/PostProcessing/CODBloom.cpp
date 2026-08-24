@@ -33,7 +33,12 @@ void CODBloom::DrawSettings()
 
 	if (ImGui::CollapsingHeader("Debug")) {
 		static int mip = 0;
-		ImGui::SliderInt("Debug Mip Level", &mip, 0, (int)s_BloomMips - 1, "%d", ImGuiSliderFlags_NoInput | ImGuiSliderFlags_AlwaysClamp);
+		// (batch 11, item B3) Bounded by the pyramid the last frame actually built rather than by
+		// the allocation. The zero-weight levels above it are no longer dispatched, so offering
+		// them here would display whatever was last left in those mips -- or, on a fresh
+		// allocation, uninitialised memory.
+		ImGui::SliderInt("Debug Mip Level", &mip, 0, lastTopMip, "%d", ImGuiSliderFlags_NoInput | ImGuiSliderFlags_AlwaysClamp);
+		mip = std::clamp(mip, 0, lastTopMip);
 
 		ImGui::BulletText("texBloom");
 		ImGui::Image(texBloomMipSRVs[mip].get(), { texBloom->desc.Width * .2f, texBloom->desc.Height * .2f });
@@ -190,6 +195,39 @@ void CODBloom::Draw(TextureInfo& inout_tex)
 
 	//////////////////////////////////////////////////////////////////////////////
 
+	// (batch 11, item B3) How deep the pyramid actually has to go this frame.
+	//
+	// The chain is nine mips and the blend-factor array has eight entries, but Settings only
+	// supplies six initialisers -- `{ 1, 1, 1, 1, 1, 1 }` into a std::array<float, 8> leaves
+	// MipBlendFactor[6] and [7] value-initialised to 0. Every shipped configuration therefore
+	// paid for three dispatches whose result is multiplied by zero: the two coarsest downsamples
+	// (mips 7 and 8) and the upsample iteration that writes mip 7, which under those weights
+	// writes literal zeros and exists only so the iteration below it adds nothing.
+	//
+	// WHY DROPPING A LEVEL IS EXACT, not merely close. The upsample recurrence is
+	//     mip[i] = mip[i]_ds * MBF[i-1] + Upsample(mip[i+1]) * (i == top ? MBF[i] : 1)
+	// so removing the top level deletes the term `Upsample(mip[top+1]) * MBF[top]` and promotes
+	// the iteration below it to `top`, which changes its own upsample multiplier from 1 to
+	// MBF[top]. Those two changes cancel: UpsampleCOD is a fixed-weight linear filter, so
+	// Upsample(x * k) == Upsample(x) * k for a scalar k, which means "scale the coarser mip then
+	// filter it" and "filter it then scale" are the same value. What is left over is exactly the
+	// deleted term, and it vanishes precisely when MBF[top] == 0.
+	//
+	// So the rule is: peel levels off the top for as long as the weight that would multiply them
+	// is zero. At the defaults that peels two and stops at mip 6, whose weight is 1. It is not a
+	// hard-coded "drop two" because MipBlendFactor[6] and [7] are reachable from the Mip Level
+	// slider and are serialised: a configuration that gives either of them a non-zero value gets
+	// the level back, and gets it back with the same arithmetic as before.
+	// The floor is 2, not 1: the i == 1 upsample iteration is the only place MipBlendFactor[0]
+	// is ever applied, so peeling down past a two-level pyramid would silently drop that factor
+	// instead of preserving it. Reaching the floor needs every entry from [1] up to be zero,
+	// which no shipped configuration is, but the algebra above only holds while an upsample
+	// iteration survives to carry the promoted multiplier.
+	int topMip = (int)s_BloomMips - 1;
+	while (topMip > 2 && settings.MipBlendFactor[topMip - 1] == 0.f)
+		--topMip;
+	lastTopMip = topMip;
+
 	std::array<ID3D11ShaderResourceView*, 2> srvs = { nullptr };
 	std::array<ID3D11UnorderedAccessView*, 1> uavs = { nullptr };
 	std::array<ID3D11SamplerState*, 1> samplers = { colorSampler.get() };
@@ -219,7 +257,7 @@ void CODBloom::Draw(TextureInfo& inout_tex)
 
 	// Downsample
 	context->CSSetShader(downsampleFirstMipCS.get(), nullptr, 0);
-	for (int i = 0; i < s_BloomMips - 1; i++) {
+	for (int i = 0; i < topMip; i++) {
 		resetViews();
 
 		srvs.at(1) = texBloomMipSRVs[i].get();
@@ -238,11 +276,11 @@ void CODBloom::Draw(TextureInfo& inout_tex)
 
 	// upsample
 	context->CSSetShader(upsampleCS.get(), nullptr, 0);
-	for (int i = s_BloomMips - 2; i >= 1; i--) {
+	for (int i = topMip - 1; i >= 1; i--) {
 		resetViews();
 
 		cbData.UpsampleMult = 1.f;
-		if (i == s_BloomMips - 2)
+		if (i == topMip - 1)
 			cbData.UpsampleMult = settings.MipBlendFactor[i];
 		cbData.CurrentMipMult = settings.MipBlendFactor[i - 1];
 		bloomCB->Update(cbData);
