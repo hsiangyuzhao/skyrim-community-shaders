@@ -223,6 +223,7 @@ namespace Util
 				case SlotStatus::Ready:
 					bucket.smoothedMs = bucket.smoothedMs * kSmoothingOld + sampleMs * kSmoothingNew;
 					bucket.lastSampleIntervals = slot.used;
+					bucket.hasSample = true;
 					slot.pending = false;
 					slot.used = 0;
 					break;
@@ -260,6 +261,7 @@ namespace Util
 			bucket.openInterval = -1;
 			bucket.lastSampleIntervals = 0;
 			bucket.everActive = false;
+			bucket.hasSample = false;
 		}
 		writeSlot = 0;
 		frameIndex = 0;
@@ -341,7 +343,7 @@ namespace Util
 
 		for (int i = 0; i < static_cast<int>(GpuBucket::Count); ++i) {
 			auto& bucket = buckets[i];
-			if (!bucket.everActive)
+			if (!bucket.everActive || !bucket.hasSample)
 				continue;
 			if (frameIndex - bucket.lastActiveFrame > static_cast<uint64_t>(kActiveTimeoutFrames))
 				continue;

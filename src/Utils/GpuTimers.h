@@ -146,6 +146,12 @@ namespace Util
 			int openInterval = -1;      // interval index while between Begin and End, else -1
 			int lastSampleIntervals = 0;  // intervals in the most recently collected sample
 			bool everActive = false;
+			// True once at least one frame's queries actually came back. Without this a
+			// bucket whose queries never resolve (disjoint every frame, a driver that
+			// refuses the query, a Begin/End pair around no GPU work at all) sat in the
+			// table showing a permanent 0 ms, which reads as a broken measurement. No
+			// sample means no row.
+			bool hasSample = false;
 		};
 
 		enum class SlotStatus

@@ -1466,9 +1466,12 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 				"  - GPU clock, not the CPU QueryPerformanceCounter clock\n"
 				"  - read back a few frames late, so give it a second to settle\n"
 				"  - passes overlap each other and the CPU, so these do NOT sum to frame time\n"
-				"  - never subtracted from \"Other\" above\n"
+				"  - never subtracted from the CPU table above\n"
 				"A row disappears about a second after its feature stops running, so the table\n"
-				"shows exactly what the current settings are actually executing.");
+				"shows exactly what the current settings are actually executing. A feature that\n"
+				"is switched off has no row here rather than a row of zeros, and so does one\n"
+				"whose queries never came back. \"< 0.01 ms\" means measured but below the GPU\n"
+				"timer's resolution - real, just too small to put a number on.");
 		}
 	}
 
@@ -1808,7 +1811,12 @@ std::vector<ColumnConfig> PerformanceOverlay::BuildPassTableColumns(const Menu::
 
 	columns.push_back(ColumnConfig{
 		timeHeader,
-		MakeMetricColumn(theme, [](const DrawCallRow& row) { return row.frameTime; }, [](const auto& theme, float value, const DrawCallRow&) { return Util::GetThresholdColor(value, PerformanceOverlay::Settings::kFrameTimeGoodThreshold, PerformanceOverlay::Settings::kFrameTimeWarningThreshold, theme.StatusPalette.SuccessColor, theme.StatusPalette.Warning, theme.StatusPalette.Error); }, [](float /*value*/, const DrawCallRow& row) { return Util::FormatMilliseconds(row.frameTime) + " (" + Util::FormatPercent(row.percent) + ")"; }, legends.frameTime.tooltip),
+		// A pass row is only in the table because its work ran, so a rendered "0 ms" would
+		// mean "below the timer's resolution", not "free" - and it reads as a broken
+		// measurement. Say what is actually known instead.
+		MakeMetricColumn(theme, [](const DrawCallRow& row) { return row.frameTime; }, [](const auto& theme, float value, const DrawCallRow&) { return Util::GetThresholdColor(value, PerformanceOverlay::Settings::kFrameTimeGoodThreshold, PerformanceOverlay::Settings::kFrameTimeWarningThreshold, theme.StatusPalette.SuccessColor, theme.StatusPalette.Warning, theme.StatusPalette.Error); }, [](float /*value*/, const DrawCallRow& row) {
+				const std::string time = (row.frameTime < 0.01f) ? std::string("< 0.01 ms") : Util::FormatMilliseconds(row.frameTime);
+				return time + " (" + Util::FormatPercent(row.percent) + ")"; }, legends.frameTime.tooltip),
 		[](const DrawCallRow& a, const DrawCallRow& b, bool asc) { return asc ? (a.frameTime < b.frameTime) : (a.frameTime > b.frameTime); },
 		[legends]() {
 			if (ImGui::IsItemHovered()) {
