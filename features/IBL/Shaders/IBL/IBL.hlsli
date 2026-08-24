@@ -57,7 +57,30 @@ namespace ImageBasedLighting
 // reference an undeclared identifier and fail to compile.
 #if defined(SKYLIGHTING) && !defined(INTERIOR)
 		{
-			color = lerp(GetDiffuseIBL(rayDir), GetSkyDiffuseIBL(rayDir), skylighting);
+			// Subtract-and-add, not lerp. The `skylighting` weight that arrives here is not a raw
+			// visibility: every caller scales it by up to 1.9 (DeferredCompositeCS.hlsl:257,
+			// ssrt_raymarch.hlsl:1109) before Skylighting::mixDiffuse, so any raw visibility past
+			// ~0.53 already saturates it to 1. Under a lerp that multiplied the environment probe
+			// by zero on essentially every upward-facing outdoor surface: no bounce colour from
+			// the surroundings at all, and shadows tinted pure sky blue. Splitting the two probes
+			// keeps the geometry bounce at full strength unconditionally and attenuates only the
+			// sky part - the same form ssrt_raymarch.hlsl:1115-1120 already applies to this very
+			// cubemap pair (DiffuseIBLTexture <- envTexture, whose sky is rejected by
+			// UpdateCubemapCS.hlsl:85's `depth != 1.0`; DiffuseSkyIBLTexture <-
+			// envReflectionsTexture, which keeps the sky).
+			//
+			// The subtraction is done on the evaluated RGB rather than on the sh2 coefficients.
+			// Coefficient-domain subtraction is exact only for a linear evaluator, and
+			// SphericalHarmonics::SHHallucinateZH3Irradiance is not linear: it normalizes the L1
+			// band into a zonal axis and squares the L1/L0 ratio (SphericalHarmonics.hlsli:233-239),
+			// so eval(shSky - shEnv) != eval(shSky) - eval(shEnv). Subtracting coefficients would
+			// therefore also break the skylighting == 1 endpoint, which must still reproduce the
+			// sky probe exactly as the old lerp did. RGB is additionally the domain where the
+			// max(..., 0) clamp actually means something: a negative SH coefficient is a perfectly
+			// legal signal, a negative irradiance is not.
+			float3 envOnly = GetDiffuseIBL(rayDir);
+			float3 skyOnly = max(GetSkyDiffuseIBL(rayDir) - envOnly, 0);
+			color = envOnly + skyOnly * skylighting;
 		}
 #else
 		{
