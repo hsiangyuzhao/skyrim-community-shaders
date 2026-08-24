@@ -1820,6 +1820,25 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     if (!settings.EnableSpecular)
         return;
 
+    // (S1.4) See the matching guard in DrawSSRTDiffuse. Neutral here is a zeroed texSSRColor
+    // and a zeroed hit distance: the deferred composite binds texSSRColor directly and adds
+    // it, so zero is "no reflection contribution", and Upscaling's DLSS-RR guide reads the
+    // hit distance, which must not be a stale or uninitialised depth.
+    if (!prepareColorCS || !raymarchSpecularCS || !texColor || !texSSRColor || !texHitDistance) {
+        auto ctx = globals::d3d::context;
+        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        if (texSSRColor)
+            ctx->ClearUnorderedAccessViewFloat(texSSRColor->uav.get(), zero);
+        if (texHitDistance)
+            ctx->ClearUnorderedAccessViewFloat(texHitDistance->uav.get(), zero);
+        // The once-per-frame history snapshot is specular's responsibility when it runs; with
+        // the chain down, diffuse's own `if (!settings.EnableSpecular)` branch will not have
+        // taken it either, so take it here rather than leaving the SVGF history geometry a
+        // frame stale.
+        CopyHistoryGeometry();
+        return;
+    }
+
     auto renderer = globals::game::renderer;
     auto context = globals::d3d::context;
     auto state = globals::state;
@@ -2367,6 +2386,38 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 {
     if (!settings.EnableDiffuse)
         return;
+
+    // (S1.4) Whole-chain readiness before the first dispatch, and a neutral surface if it
+    // fails. Without this, a failed compile of any tracing pass left a null CSSetShader --
+    // a silent no-op in D3D11 -- and every pass after it consumed whatever the surface last
+    // held: at best the previous frame's radiance, at worst uninitialised RGBA16F. The
+    // denoiser then filtered it, the history accumulated it, and the composite added it, so
+    // one missing shader produced a plausible-looking wrong image instead of a visible
+    // failure.
+    //
+    // Neutral is confidence 0 with zero radiance, not merely zero radiance. Confidence 0 says
+    // "the rays resolved nothing", which is exactly what happened, and under ambient
+    // reinjection DeferredCompositeCS then keeps the whole vanilla ambient -- the frame looks
+    // like SSRT diffuse is switched off, which is the honest presentation of a chain that
+    // cannot run.
+    if (!prepareColorCS || !diffuseCompositeCS || !texSSRTDiffuseColor ||
+        !texSSRTDiffuseConfidence || !texSSRTDiffuseConfidenceSmooth || !texSSRTDiffuseHitDistance ||
+#ifdef ENABLE_SHARC
+        (settings.EnableSharc ? (!raymarchDiffuseSharcCS || !sharcUpdateRaymarchCS || !sharcResolveCS) : !raymarchDiffuseCS)
+#else
+        !raymarchDiffuseCS
+#endif
+    ) {
+        auto ctx = globals::d3d::context;
+        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        if (texSSRTDiffuseColor)
+            ctx->ClearUnorderedAccessViewFloat(texSSRTDiffuseColor->uav.get(), zero);
+        if (texSSRTDiffuseConfidence)
+            ctx->ClearUnorderedAccessViewFloat(texSSRTDiffuseConfidence->uav.get(), zero);
+        if (texSSRTDiffuseConfidenceSmooth)
+            ctx->ClearUnorderedAccessViewFloat(texSSRTDiffuseConfidenceSmooth->uav.get(), zero);
+        return;
+    }
 
     auto renderer = globals::game::renderer;
     auto context = globals::d3d::context;
