@@ -523,6 +523,9 @@ void ColorGrading::SetupResources()
 		texLUT = std::make_unique<Texture3D>(lutTexDesc);
 		texLUT->CreateSRV(lutSrvDesc);
 		texLUT->CreateUAV(lutUavDesc);
+
+		// A brand new texture holds undefined contents, so the next Draw must bake.
+		lutValid = false;
 	}
 
 	logger::debug("Creating samplers...");
@@ -554,6 +557,9 @@ void ColorGrading::ClearShaderCache()
 			(*shader)->Release();
 			shader->detach();
 		}
+
+	// A fresh lutgenCS may bake differently from the one that filled texLUT, so force a rebake.
+	lutValid = false;
 
 	CompileComputeShaders();
 }
@@ -688,15 +694,26 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
     context->CSSetSamplers(0, 1, samplers.data());
 	ID3D11UnorderedAccessView* uav = nullptr;
 
-	// LUT Gen
-	uav = texLUT->uav.get();
-	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-	context->CSSetShader(lutgenCS.get(), nullptr, 0);
-	context->Dispatch(LUTDim >> 3, LUTDim >> 3, LUTDim >> 3);
+	// LUT Gen. CSLUTGen is a pure function of ColorCB -- no textures, no frame counter -- so
+	// while the settings and the game's imagespace data hold still (the common case: weather
+	// and time-of-day move slowly, and both are already smoothed into ColorCB), the bake would
+	// produce a bit-identical LUT. Skipping it removes a 64^3 dispatch and, more importantly,
+	// the hard dependency between it and the full-screen apply below that samples texLUT.
+	// ColorCB is float4s plus a four-uint tail, so it has no padding and memcmp is exact; a
+	// false "changed" would only cost a redundant bake, never a stale LUT.
+	if (!lutValid || std::memcmp(&bakedColorCBData, &colorCBData, sizeof(ColorCB)) != 0) {
+		uav = texLUT->uav.get();
+		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		context->CSSetShader(lutgenCS.get(), nullptr, 0);
+		context->Dispatch(LUTDim >> 3, LUTDim >> 3, LUTDim >> 3);
 
-	uav = nullptr;
-	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-	context->CSSetShader(nullptr, nullptr, 0);
+		uav = nullptr;
+		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		context->CSSetShader(nullptr, nullptr, 0);
+
+		bakedColorCBData = colorCBData;
+		lutValid = true;
+	}
 
 	// Apply LUT
 	std::array<ID3D11ShaderResourceView*, 2> srvs = { inout_tex.srv, texLUT->srv.get() };

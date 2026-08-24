@@ -107,6 +107,16 @@ struct ColorGrading : public PostProcessFeature
     };
 	std::unique_ptr<ConstantBuffer> colorCB = nullptr;
 
+    /// @brief The ColorCB contents texLUT was last baked from. CSLUTGen reads nothing but
+    /// ColorCB, so an identical buffer bakes an identical LUT and the 64^3 dispatch (plus the
+    /// pass boundary between it and the full-screen apply that samples it) can be skipped.
+    /// Valid only while lutValid is true.
+    ColorCB bakedColorCBData{};
+
+    /// @brief False whenever texLUT's contents cannot be trusted -- before the first bake, and
+    /// after the texture or the LUT-gen shader is recreated.
+    bool lutValid = false;
+
 	std::unique_ptr<Texture2D> texColor = nullptr;
     std::unique_ptr<Texture3D> texLUT = nullptr;
 
