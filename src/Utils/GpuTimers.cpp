@@ -214,6 +214,7 @@ namespace Util
 				switch (TryCollectSlot(slot, sampleMs)) {
 				case SlotStatus::Ready:
 					bucket.smoothedMs = bucket.smoothedMs * kSmoothingOld + sampleMs * kSmoothingNew;
+					bucket.lastSampleIntervals = slot.used;
 					slot.pending = false;
 					slot.used = 0;
 					break;
@@ -249,6 +250,7 @@ namespace Util
 			bucket.smoothedMs = 0.0f;
 			bucket.lastActiveFrame = 0;
 			bucket.openInterval = -1;
+			bucket.lastSampleIntervals = 0;
 			bucket.everActive = false;
 		}
 		writeSlot = 0;
@@ -315,7 +317,7 @@ namespace Util
 			openBucket = -1;
 	}
 
-	void GpuPassTimers::ForEachActiveBucket(const std::function<void(const char*, int, float, const char*)>& a_callback)
+	void GpuPassTimers::ForEachActiveBucket(const std::function<void(const BucketReport&)>& a_callback)
 	{
 		// Same device-identity guard as Begin(), for the case where the overlay is drawn
 		// after a device rebuild but before any instrumented pass has run again.
@@ -335,7 +337,8 @@ namespace Util
 				continue;
 			if (frameIndex - bucket.lastActiveFrame > static_cast<uint64_t>(kActiveTimeoutFrames))
 				continue;
-			a_callback(kBucketInfo[i].label, kRowIdBase + i, bucket.smoothedMs, kBucketInfo[i].tooltip);
+			a_callback(BucketReport{ kBucketInfo[i].label, kRowIdBase + i, bucket.smoothedMs,
+				bucket.lastSampleIntervals, kBucketInfo[i].tooltip });
 		}
 	}
 

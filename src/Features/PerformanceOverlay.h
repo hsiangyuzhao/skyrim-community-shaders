@@ -270,6 +270,17 @@ struct PerformanceOverlay : OverlayFeature
 	void DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRows);
 	DrawCallLegends BuildDrawCallLegends(const Menu::ThemeSettings& theme, bool anyTestData) const;
 	std::vector<ColumnConfig> BuildDrawCallTableColumns(const Menu::ThemeSettings& theme, const DrawCallLegends& legends, bool anyTestData);
+
+	/**
+	 * @brief Columns for the pass tables (GPU buckets, and our own CPU submit buckets).
+	 *
+	 * Deliberately NOT the draw-call column set. A GPU bucket has no draw calls, so the
+	 * old shared columns showed "-" for Draw Calls and a hard 0 ms for Cost/Call
+	 * (cost = time / drawCalls, and drawCalls is zero) on every single row. The count
+	 * that is meaningful for a pass row is how many timing intervals the row is the sum
+	 * of, so that is what this column set shows instead.
+	 */
+	std::vector<ColumnConfig> BuildPassTableColumns(const Menu::ThemeSettings& theme, const DrawCallLegends& legends, bool anyTestData, const char* timeHeader, const char* intervalTooltip);
 	DrawCallRowSets BuildDrawCallRows() const;
 	std::function<void(int, int, const DrawCallRow&)> CreateTableRowHandler(const std::vector<ColumnConfig>& columns);
 

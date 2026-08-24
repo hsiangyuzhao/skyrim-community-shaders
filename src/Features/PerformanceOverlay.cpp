@@ -1464,7 +1464,12 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 
 	bool anyTestData = !overlay.testData.empty();
 	auto legends = overlay.BuildDrawCallLegends(theme, anyTestData);
-	auto columns = overlay.BuildDrawCallTableColumns(theme, legends, anyTestData);
+	auto columns = overlay.BuildPassTableColumns(theme, legends, anyTestData, "GPU Time (%)",
+		"Intervals: how many separate timestamp intervals this frame's sample is the sum of.\n"
+		"A bucket can measure several disjoint stretches of one frame - SSRT Trace has four\n"
+		"(prepass, diffuse chain, specular chain, composite). This replaces Draw Calls and\n"
+		"Cost/Call, which are not defined for a compute pass: a GPU bucket has no draw calls,\n"
+		"so Cost/Call was a hard zero on every row.");
 
 	std::vector<std::function<bool(const DrawCallRow&, const DrawCallRow&, bool)>> sorters;
 	for (const auto& col : columns)
@@ -1475,20 +1480,28 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 	// Sum of the buckets. Not a residual and not a share of frame time; just "how much
 	// GPU time the instrumented passes accounted for".
 	float bucketSum = 0.0f;
-	for (const auto& row : gpuRows)
+	int intervalSum = 0;
+	for (const auto& row : gpuRows) {
 		bucketSum += row.frameTime;
+		if (row.drawCalls != kDrawCallsNotApplicable)
+			intervalSum += row.drawCalls;
+	}
 	const float smoothedFrameTime = globals::state->GetAttributionFrameTimeMs();
 
 	std::vector<DrawCallRow> gpuSummaryRows;
 	gpuSummaryRows.push_back(DrawCallRow{
-		"Measured GPU:", kGpuTotalRowId, kDrawCallsNotApplicable, bucketSum,
+		"Measured GPU:", kGpuTotalRowId, intervalSum, bucketSum,
 		Util::CalculatePercentage(bucketSum, smoothedFrameTime), 0.0f,
 		std::string("Sum of the GPU buckets above. Because these passes can overlap each other "
 					"and the rest of the frame, this is not a share of frame time and not a "
-					"residual - it is the total GPU time the instrumented passes reported."),
+					"residual - it is the total GPU time the instrumented passes reported, and "
+					"a LOWER BOUND on how busy the GPU actually was (the engine's own draws are "
+					"not instrumented)."),
 		true, std::nullopt, std::nullopt });
 
-	auto rowHandler = overlay.CreateTableRowHandler(columns);
+	// Plain handler: pass rows have no toggle and no summary-row special cases.
+	std::function<void(int, int, const DrawCallRow&)> rowHandler =
+		[&columns](int, int colIdx, const DrawCallRow& row) { columns[colIdx].cellRender(row, colIdx); };
 
 	Util::ShowSortedStringTableCustom<DrawCallRow>(
 		"GpuPassOverlayTable",
@@ -1558,6 +1571,90 @@ DrawCallLegends PerformanceOverlay::BuildDrawCallLegends(const Menu::ThemeSettin
 	};
 
 	return legends;
+}
+
+std::vector<ColumnConfig> PerformanceOverlay::BuildPassTableColumns(const Menu::ThemeSettings& theme, const DrawCallLegends& legends, bool anyTestData, const char* timeHeader, const char* intervalTooltip)
+{
+	const std::string intervalTip = intervalTooltip;
+
+	std::vector<ColumnConfig> columns;
+
+	// Pass name. Not clickable: unlike a shader type there is nothing to toggle from here.
+	columns.push_back(ColumnConfig{
+		"Pass",
+		[](const DrawCallRow& row, int) {
+			ImGui::TextUnformatted(row.label.c_str());
+			if (!row.tooltip.empty() && ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted(row.tooltip.c_str());
+				}
+			}
+		},
+		[](const DrawCallRow& a, const DrawCallRow& b, bool asc) { return asc ? (a.label < b.label) : (a.label > b.label); },
+		[]() {
+			if (ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted("The instrumented pass group. Hover a name for what it covers.");
+				}
+			}
+		} });
+
+	columns.push_back(ColumnConfig{
+		"Intervals",
+		[intervalTip](const DrawCallRow& row, int) {
+			if (row.drawCalls == kDrawCallsNotApplicable)
+				ImGui::TextDisabled("-");
+			else
+				ImGui::Text("%d", row.drawCalls);
+			if (ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted(intervalTip.c_str());
+				}
+			}
+		},
+		[](const DrawCallRow& a, const DrawCallRow& b, bool asc) { return asc ? (a.drawCalls < b.drawCalls) : (a.drawCalls > b.drawCalls); },
+		[intervalTip]() {
+			if (ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted(intervalTip.c_str());
+				}
+			}
+		} });
+
+	columns.push_back(ColumnConfig{
+		timeHeader,
+		MakeMetricColumn(theme, [](const DrawCallRow& row) { return row.frameTime; }, [](const auto& theme, float value, const DrawCallRow&) { return Util::GetThresholdColor(value, PerformanceOverlay::Settings::kFrameTimeGoodThreshold, PerformanceOverlay::Settings::kFrameTimeWarningThreshold, theme.StatusPalette.SuccessColor, theme.StatusPalette.Warning, theme.StatusPalette.Error); }, [](float /*value*/, const DrawCallRow& row) { return Util::FormatMilliseconds(row.frameTime) + " (" + Util::FormatPercent(row.percent) + ")"; }, legends.frameTime.tooltip),
+		[](const DrawCallRow& a, const DrawCallRow& b, bool asc) { return asc ? (a.frameTime < b.frameTime) : (a.frameTime > b.frameTime); },
+		[legends]() {
+			if (ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					Util::DrawColoredMultiLineTooltip(legends.frameTime.tooltip);
+				}
+			}
+		} });
+
+	if (anyTestData) {
+		columns.push_back(ColumnConfig{
+			legends.testFrameTime.header,
+			MakeMetricColumn(theme, [](const DrawCallRow& row) { return row.testFrameTime; }, [](const auto& theme, float value, const DrawCallRow& row) {
+					 if (value < row.frameTime)
+						 return theme.StatusPalette.SuccessColor;
+					 if (value > row.frameTime)
+						 return theme.StatusPalette.Error;
+					 return theme.Palette.Text; }, [](float value, const DrawCallRow&) { return Util::FormatMilliseconds(value); }, legends.testFrameTime.tooltip),
+			[](const DrawCallRow& a, const DrawCallRow& b, bool asc) {
+				 float aVal = a.testFrameTime.value_or(FLT_MAX);
+				 float bVal = b.testFrameTime.value_or(FLT_MAX);
+				 return asc ? (aVal < bVal) : (aVal > bVal); },
+			[legends]() {
+				 if (ImGui::IsItemHovered()) {
+					 if (auto _tt = Util::HoverTooltipWrapper()) {
+						 Util::DrawColoredMultiLineTooltip(legends.testFrameTime.tooltip);
+					 }
+				 } } });
+	}
+
+	return columns;
 }
 
 std::vector<ColumnConfig> PerformanceOverlay::BuildDrawCallTableColumns(const Menu::ThemeSettings& theme, const DrawCallLegends& legends, bool anyTestData)
@@ -1714,16 +1811,16 @@ PerformanceOverlay::DrawCallRowSets PerformanceOverlay::BuildDrawCallRows() cons
 	// timeline. They are therefore also deliberately absent from measuredSum - the old
 	// code subtracted them from the CPU residual, which could drive "Other" negative.
 	Util::GpuPassTimers::GetSingleton()->ForEachActiveBucket(
-		[&gpuRows, smoothedFrameTime, this](const char* label, int rowId, float ms, const char* tooltip) {
-			float percent = Util::CalculatePercentage(ms, smoothedFrameTime);
+		[&gpuRows, smoothedFrameTime, this](const Util::GpuPassTimers::BucketReport& report) {
+			float percent = Util::CalculatePercentage(report.smoothedMs, smoothedFrameTime);
 			std::optional<float> testFrameTime, testCostPerCall;
-			auto it = this->testData.find(rowId);
+			auto it = this->testData.find(report.rowId);
 			if (it != this->testData.end()) {
 				testFrameTime = it->second.frameTime;
 				testCostPerCall = it->second.costPerCall;
 			}
-			gpuRows.push_back({ std::string(label) + ":", rowId, kDrawCallsNotApplicable, ms, percent,
-				0.0f, tooltip, true, testFrameTime, testCostPerCall });
+			gpuRows.push_back({ std::string(report.label) + ":", report.rowId, report.intervalsPerFrame,
+				report.smoothedMs, percent, 0.0f, report.tooltip, true, testFrameTime, testCostPerCall });
 		});
 
 	auto [otherFrameTime, otherPercent, totalCostPerCall] = CalculateSummaryData(smoothedFrameTime, measuredSum);

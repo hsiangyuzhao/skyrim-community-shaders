@@ -73,11 +73,24 @@ namespace Util
 		 */
 		void End(GpuBucket a_bucket);
 
+		/// @brief One row's worth of bucket state, as handed to ForEachActiveBucket.
+		struct BucketReport
+		{
+			const char* label;
+			int rowId;
+			float smoothedMs;
+			/// Timing intervals folded into the most recently collected frame sample. This
+			/// is what replaces the meaningless "Draw Calls" / "Cost/Call" columns for GPU
+			/// rows: a bucket can measure several disjoint stretches of one frame (SSRT
+			/// Trace has four, Volumetric Lighting four), and the row is their sum.
+			int intervalsPerFrame;
+			const char* tooltip;
+		};
+
 		/**
 		 * @brief Iterates buckets that reported GPU work within the activity timeout.
-		 * @param a_callback (label, overlay row id, smoothed milliseconds, tooltip)
 		 */
-		void ForEachActiveBucket(const std::function<void(const char*, int, float, const char*)>& a_callback);
+		void ForEachActiveBucket(const std::function<void(const BucketReport&)>& a_callback);
 
 		/**
 		 * @brief Releases every query and clears all smoothing/pending state.
@@ -128,7 +141,8 @@ namespace Util
 			FrameSlot slots[kFramesInFlight];
 			float smoothedMs = 0.0f;
 			uint64_t lastActiveFrame = 0;
-			int openInterval = -1;  // interval index while between Begin and End, else -1
+			int openInterval = -1;      // interval index while between Begin and End, else -1
+			int lastSampleIntervals = 0;  // intervals in the most recently collected sample
 			bool everActive = false;
 		};
 
