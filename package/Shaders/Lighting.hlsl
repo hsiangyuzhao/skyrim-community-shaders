@@ -3330,7 +3330,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #		if (defined(ENVMAP) || defined(MULTI_LAYER_PARALLAX) || defined(EYE))
 #			if defined(VANILLA_FRESNEL)
-		if (!enableVanillaFresnel)
+		// (batch 10) Deliberate divergence from upstream, which skips this multiply for every
+		// material once VanillaFresnel is on. VanillaFresnel exists to invent reflections for
+		// vanilla materials that never had any; those have no author env mask (EnvmapData.y == 0,
+		// see :563 and :2422) and `envMask` is only `glossiness` there, so skipping is right.
+		// A material that ships its own env mask already had reflections in vanilla and the
+		// author said where and how strong they are, so honour the mask instead of overriding it.
+		// This is what unflattens eyes whose cubemap is near-black: the conversion at :2467
+		// forces `dynamicCubemap`, so :2533 never samples that near-black cubemap, and without
+		// this multiply the substituted real-time reflection also escaped the author's mask.
+		if (!enableVanillaFresnel || EnvmapData.y)
 #			endif
 		reflectance *= envMask;
 #		endif

@@ -763,7 +763,18 @@ void ScreenSpaceRayTracing::DrawSettings()
         // which is the direct read on the disocclusion test: it should ramp to the window length
         // over open ground and drop back to 1 in a thin band along the trailing edge of anything
         // moving, not over whole regions.
-        BUFFER_VIEWER_NODE(texSSRTConfidenceHistoryPrev, debugRescale)
+        //
+        // (batch 10) Guarded, like every other on-demand entry in this tree. The pair is
+        // allocated only by EnsureAmbientConfidenceResources (:1345), reached from the one
+        // call site at :2932 under `EnableAmbientReinjection && TemporalAmbientConfidence &&
+        // !confidenceFilter`, and SetupResources drops both at :1102-1103. With the shipped
+        // defaults -- TemporalAmbientConfidence false and LowResConfidenceFilter true
+        // (ScreenSpaceRayTracing.h) -- that condition never holds, so this is null out of the
+        // box and expanding the node dereferenced it inside BUFFER_VIEWER_NODE
+        // (src/Utils/UI.h:19 touches ->srv and ->desc). The guard outside the macro also
+        // hides the label entirely rather than offering an empty node.
+        if (texSSRTConfidenceHistoryPrev)
+            BUFFER_VIEWER_NODE(texSSRTConfidenceHistoryPrev, debugRescale)
         // (batch 9) The two G-buffer channels that decide whether the ambient re-add can reach a
         // pixel at all. These are RenderTargetData, not our own Texture2D -- they have .SRV and
         // no desc -- so BUFFER_VIEWER_NODE cannot take them and the size comes from the screen.
