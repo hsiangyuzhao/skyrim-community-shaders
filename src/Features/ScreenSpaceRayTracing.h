@@ -238,7 +238,19 @@ struct ScreenSpaceRayTracing : Feature
         /// written the temporal pass has gained a real plane test, and the accumulator added here
         /// carries its own reference depth so it can reject a stale sample without depending on
         /// the SVGF-only history-geometry surfaces (which do not exist under REBLUR).
-        bool TemporalAmbientConfidence = true;
+        ///
+        /// DEFAULT OFF as of this change, after play testing. Everything above is still true about
+        /// the *noise*, and it is still worth keeping around to compare against, but the reasoning
+        /// left out what the signal is. Confidence is a geometric quantity: the moment anything in
+        /// the scene moves, its correct value changes immediately, and a 30-frame window makes it
+        /// lag behind by construction. Because it then multiplies the ambient term, that lag shows
+        /// up as structured low-frequency brightness trails behind every moving object - a far
+        /// worse artefact than the per-frame flicker it was trading away. No window length or
+        /// rejection criterion fixes this, because the defect is the accumulation itself, not its
+        /// tuning: a lagging estimator of a quantity that changes discontinuously cannot be made
+        /// to track it. The zero-lag replacement is to compute the confidence at reduced resolution
+        /// and joint-bilateral upsample it, which is out of scope here.
+        bool TemporalAmbientConfidence = false;
         /// @brief (reinjection noise) Accumulation window for the confidence, in frames.
         ///
         /// Noise falls as 1/sqrt(N), so 30 frames is ~5.5x on top of the spatial mean, taking the
