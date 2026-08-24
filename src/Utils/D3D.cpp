@@ -177,20 +177,44 @@ namespace Util
 		// Compiler setup
 		uint32_t flags = !globals::state->IsDeveloperMode() ? (D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3) : D3DCOMPILE_DEBUG;
 
-		ID3DBlob* shaderBlob;
-		ID3DBlob* shaderErrors;
+		// (S4.14) RAII, and not merely as tidiness: these were raw ID3DBlob* with no Release
+		// on any path. The success path leaked the bytecode blob -- for a shader of a few
+		// kilobytes, once per compile, and ClearShaderCache recompiles every shader of every
+		// feature on a settings change that sets a recompile flag, so the leak is unbounded
+		// over a session rather than a one-off. The failure path leaked the *error* blob:
+		// `shaderErrors` was read for the log message and then abandoned, and an error blob
+		// carries the full diagnostic text, which is the largest of the two.
+		//
+		// Both were also *uninitialised* raw pointers. D3DCompileFromFile does not write
+		// ppErrorMsgs when there is nothing to report, so on a clean compile `shaderErrors`
+		// kept whatever was on the stack and `if (shaderErrors)` then dereferenced it. That
+		// it never crashed is luck about stack contents, not correctness.
+		//
+		// com_ptr's destructor covers every exit -- the two early returns, all six of the
+		// per-profile returns below, the trailing return, and a throw out of
+		// DX::ThrowIfFailed on the compute paths.
+		winrt::com_ptr<ID3DBlob> shaderBlob;
+		winrt::com_ptr<ID3DBlob> shaderErrors;
 
 		if (!std::filesystem::exists(FilePath)) {
 			logger::error("Failed to compile shader; {} does not exist", str);
 			return nullptr;
 		}
 		logger::debug("Compiling {} with {}", str, DefinesToString(macros));
-		if (FAILED(D3DCompileFromFile(FilePath, macros.data(), &include, Program, ProgramType, flags, 0, &shaderBlob, &shaderErrors))) {
+		if (FAILED(D3DCompileFromFile(FilePath, macros.data(), &include, Program, ProgramType, flags, 0, shaderBlob.put(), shaderErrors.put()))) {
 			logger::warn("Shader compilation failed:\n\n{}", shaderErrors ? static_cast<char*>(shaderErrors->GetBufferPointer()) : "Unknown error");
 			return nullptr;
 		}
+		// A successful compile can still have produced warnings, and can equally have produced
+		// no blob at all -- hence the test rather than an unconditional read.
 		if (shaderErrors)
 			logger::debug("Shader logs:\n{}", static_cast<char*>(shaderErrors->GetBufferPointer()));
+		// Defensive: a SUCCEEDED return with no bytecode would make every GetBufferPointer
+		// below a null dereference. Not observed, but it is one branch against a hard crash.
+		if (!shaderBlob) {
+			logger::error("Shader compilation reported success but produced no bytecode for {}", str);
+			return nullptr;
+		}
 		if (!_stricmp(ProgramType, "ps_5_0")) {
 			ID3D11PixelShader* regShader;
 			device->CreatePixelShader(shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(), nullptr, &regShader);
