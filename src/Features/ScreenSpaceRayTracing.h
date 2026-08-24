@@ -215,6 +215,38 @@ struct ScreenSpaceRayTracing : Feature
         /// *found*, not how well its radiance is known, so a scene whose on-screen surfaces are
         /// unrepresentative of the whole environment is better served slightly under 1.
         float AmbientReinjectionStrength = 1.0f;
+        /// @brief (reinjection noise) Temporally accumulate the reinjection confidence, in
+        /// addition to the depth-aware 7x7 spatial mean that has always run.
+        ///
+        /// Why this is a defect fix rather than a luxury. Confidence is an n = DiffuseSPP
+        /// binomial-ish coverage estimate -- two samples by default -- so its raw per-pixel
+        /// standard deviation is ~0.35 at mid coverage. The 49-tap spatial mean brings that to
+        /// ~0.07, and there the chain used to stop. But DeferredCompositeCS consumes it as
+        /// `ambientKeep = 1 - conf * strength` and the composite runs *after* SVGF/REBLUR, so
+        /// that residual is a multiplicative noise source sitting downstream of the entire
+        /// denoiser: no denoiser can reach it, which is exactly why turning reinjection on was
+        /// reported as louder than leaving it off with both denoisers unable to help. The rays
+        /// are redrawn every frame, so the residual reshuffles per frame and reads as flicker.
+        ///
+        /// A temporal mean over the same window the radiance uses closes that gap -- and it also
+        /// makes the two frequency-matched, which the spatial-only chain never was: a noisy
+        /// confidence modulating an already-denoised radiance is a mismatch on its own.
+        ///
+        /// This deliberately reverses the "not temporal" note that used to sit in
+        /// ssrt_diffuse_composite.hlsl. That note's premise was that a reprojected EMA would
+        /// have to import nearest-neighbour reprojection with no disocclusion test; since it was
+        /// written the temporal pass has gained a real plane test, and the accumulator added here
+        /// carries its own reference depth so it can reject a stale sample without depending on
+        /// the SVGF-only history-geometry surfaces (which do not exist under REBLUR).
+        bool TemporalAmbientConfidence = true;
+        /// @brief (reinjection noise) Accumulation window for the confidence, in frames.
+        ///
+        /// Noise falls as 1/sqrt(N), so 30 frames is ~5.5x on top of the spatial mean, taking the
+        /// residual from ~0.07 to ~0.013 -- below the 1/255 quantisation of the R8_UNORM surface
+        /// it is published through, i.e. as far as this storage can carry. Longer buys little and
+        /// lengthens the settle after a disocclusion; the counter-driven alpha means a fresh pixel
+        /// still converges as 1/n from its first frame rather than crawling in at a fixed rate.
+        uint AmbientConfidenceMaxFrames = 30;
         /// @brief (spec F5) Reviewed against the corrected occlusion semantics, left at
         /// 1.0. It now scales occlusion that comes only from back-face hits -- the one
         /// case where the ray demonstrably entered geometry -- instead of also scaling
@@ -764,12 +796,22 @@ struct ScreenSpaceRayTracing : Feature
         /// @brief (S3.10) Non-zero takes the sample scramble from the baked blue-noise array;
         /// zero takes it from a pcg3d hash. See Settings::UseBlueNoise.
         uint UseBlueNoise;
-        float pad0[2];
+        /// @brief (reinjection noise) Non-zero makes ssrt_diffuse_composite.hlsl temporally
+        /// accumulate the smoothed confidence instead of publishing the spatial mean directly.
+        /// Took the first of the two pad slots row 2 had spare, so the buffer did not grow.
+        /// ssrt_raymarch.hlsl still declares only the prefix up to UseBlueNoise and reads
+        /// neither of these two.
+        uint TemporalAmbientConfidence;
+        /// @brief (reinjection noise) 1 / (AmbientConfidenceMaxFrames + 1), i.e. the floor on the
+        /// accumulator's blend weight. Precomputed on the CPU for the same reason
+        /// DenoiserCB::invMaxAccumulatedFrames is: it turns a per-pixel divide into a max().
+        /// Took row 2's last pad slot.
+        float AmbientConfidenceInvMaxFrames;
     };
     static_assert(sizeof(SSRTCB) == 48,
         "ScreenSpaceRayTracing::SSRTCB must stay three whole 16-byte constant buffer rows; "
         "the SSRTCB declaration in ssrt_raymarch.hlsl mirrors these offsets up to UseBlueNoise "
-        "and must move with them.");
+        "and must move with them; ssrt_diffuse_composite.hlsl mirrors the whole three rows.");
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
@@ -1011,6 +1053,17 @@ struct ScreenSpaceRayTracing : Feature
     /// Buffer Viewer being open, so neither can find a null surface.
     void EnsureSvgfResources();
 
+    /// @brief (reinjection noise) Allocate the confidence accumulator's ping-pong pair on first
+    /// need, the same argument EnsureSvgfResources makes: ~66 MB of a 4K allocation between them,
+    /// and nothing reads either surface unless ambient reinjection and TemporalAmbientConfidence
+    /// are both on.
+    ///
+    /// Called from DrawSSRTDiffuse on the one path that is about to bind them, so the dispatch
+    /// cannot find a null surface. Returns false if allocation was not attempted or failed, which
+    /// is the composite pass's signal to publish the spatial mean alone -- the pre-existing
+    /// behaviour -- rather than to skip the pass.
+    bool EnsureAmbientConfidenceResources();
+
     /// @brief (S2.5) Whether the SVGF history for one signal has to be maintained this frame.
     ///
     /// The history *maintenance* -- two full-screen RGBA16F colour copies plus the
@@ -1228,9 +1281,40 @@ struct ScreenSpaceRayTracing : Feature
     /// different work, and not this surface.
     eastl::unique_ptr<Texture2D> texSSRTDiffuseConfidence = nullptr;
     /// @brief (ambient reinjection) The same signal after ssrt_diffuse_composite.hlsl's
-    /// depth-aware 7x7 spatial mean; this is what DeferredCompositeCS lerps with. A separate
-    /// surface because a blur cannot run in place.
+    /// depth-aware 7x7 spatial mean -- and, when Settings::TemporalAmbientConfidence is on, after
+    /// the temporal accumulation that follows it. This is what DeferredCompositeCS lerps with. A
+    /// separate surface because a blur cannot run in place.
+    ///
+    /// Stays R8_UNORM either way: the accumulated residual is ~0.013, still above the 1/255
+    /// quantisation, so the storage is not what limits the result and DeferredCompositeCS's t19
+    /// declaration needs no change.
     eastl::unique_ptr<Texture2D> texSSRTDiffuseConfidenceSmooth = nullptr;
+    /// @brief (reinjection noise) The confidence accumulator's ping-pong pair. `Prev` is read at
+    /// the reprojected pixel, the other is written at this pixel; a compute pass cannot do both
+    /// ends in one surface without racing, so there are two.
+    ///
+    /// R16G16B16A16_FLOAT, matching the rest of this feature's history surfaces, with
+    ///   .x  accumulated confidence, [0,1]
+    ///   .y  the linear view depth this texel was written at, scaled by
+    ///       1 / SSRT_CONF_DEPTH_STORE_SCALE so a far-LOD depth cannot overflow fp16's 65504
+    ///       ceiling (the scale does not affect precision -- floating point relative error is
+    ///       scale invariant -- it only moves the overflow point)
+    ///   .z  accumulated frame count, exact in fp16 past 2000 (see the defect D5 derivation at
+    ///       the moment pair: this is the same counter-in-a-float-channel problem, and the same
+    ///       format is what makes it exact rather than latching)
+    ///   .w  unused, written 0
+    ///
+    /// The reference depth in .y is why this accumulator does not need texHistoryDepth or
+    /// texHistoryNormals: those are EnsureSvgfResources allocations that are neither created nor
+    /// updated under REBLUR, which is the default, whereas the confidence smoothing and its
+    /// composite consumption run on *every* denoiser path. Carrying its own reference makes the
+    /// disocclusion test self-contained and identical under SVGF, REBLUR and Off.
+    ///
+    /// Allocated by EnsureAmbientConfidenceResources on first need, not at boot: ~33 MB each at a
+    /// 4K allocation, and nothing reads them unless ambient reinjection and this accumulator are
+    /// both on.
+    eastl::unique_ptr<Texture2D> texSSRTConfidenceHistory = nullptr;
+    eastl::unique_ptr<Texture2D> texSSRTConfidenceHistoryPrev = nullptr;
     /// @brief (batch 1, item 2) Per-pixel diffuse hit distance, R8_UNORM, written by
     /// ssrt_raymarch.hlsl at u6 and read by the diffuse permutation of ssrt_spatial.hlsl at t5.
     ///

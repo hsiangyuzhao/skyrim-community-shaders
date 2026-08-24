@@ -32,6 +32,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientMult,
     EnableAmbientReinjection,
     AmbientReinjectionStrength,
+    TemporalAmbientConfidence,
+    AmbientConfidenceMaxFrames,
     OcclusionStrength,
     CubemapNormalization,
     DenoiserMethod,
@@ -83,6 +85,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientMult,
     EnableAmbientReinjection,
     AmbientReinjectionStrength,
+    TemporalAmbientConfidence,
+    AmbientConfidenceMaxFrames,
     OcclusionStrength,
     CubemapNormalization,
     DenoiserMethod,
@@ -190,6 +194,32 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "truth but never darker than vanilla. Slightly below 1 is a reasonable hedge in "
                 "scenes whose on-screen surfaces are not representative of the surrounding "
                 "environment.");
+
+        ImGui::Checkbox("Accumulate Confidence Over Time", &settings.TemporalAmbientConfidence);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Averages the hit-confidence signal over several frames instead of relying on "
+                "the spatial blur alone. This is the fix for reinjection looking noisier than "
+                "leaving it off.\n\n"
+                "Why the denoisers could not help. Confidence is measured from only a couple of "
+                "rays per pixel, so it is grainy, and the frame's ambient light gets multiplied "
+                "by it in a pass that runs AFTER the denoiser. The graininess therefore lands in "
+                "the final image untouched, no matter which denoiser is selected or how hard it "
+                "is turned up. Averaging over time is the only place left to remove it.\n\n"
+                "Expect a clear drop in shimmer on open ground and around foliage. The average "
+                "is reset wherever the surface moves out from behind something, so it does not "
+                "smear a trail behind moving objects.\n\n"
+                "Turn it off for the previous spatial-only behaviour, for an A/B comparison.");
+
+        if (settings.TemporalAmbientConfidence) {
+            ImGui::SliderInt("Confidence Frames", (int*)&settings.AmbientConfidenceMaxFrames, 1, 60, "%d", ImGuiSliderFlags_AlwaysClamp);
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text(
+                    "How many frames the confidence average covers. Noise falls with the square "
+                    "root of this, so 30 frames is about five and a half times cleaner than one "
+                    "frame; past that the returns are small and the signal takes longer to settle "
+                    "after the camera reveals new ground. 30 is a good default.");
+        }
     }
 
     ImGui::Separator();
@@ -627,6 +657,13 @@ void ScreenSpaceRayTracing::DrawSettings()
         BUFFER_VIEWER_NODE(texSSRTDiffuseColor, debugRescale)
         BUFFER_VIEWER_NODE(texSSRTDiffuseConfidence, debugRescale)
         BUFFER_VIEWER_NODE(texSSRTDiffuseConfidenceSmooth, debugRescale)
+        // (reinjection noise) The accumulator's history. .x is the accumulated coverage -- compare
+        // it against texSSRTDiffuseConfidenceSmooth above with the toggle off to see how much
+        // per-frame grain the temporal window is removing -- and .z is the per-pixel frame count,
+        // which is the direct read on the disocclusion test: it should ramp to the window length
+        // over open ground and drop back to 1 in a thin band along the trailing edge of anything
+        // moving, not over whole regions.
+        BUFFER_VIEWER_NODE(texSSRTConfidenceHistoryPrev, debugRescale)
         // (batch 1, item 2) Black = the rays hit something within a texel or two, so the kernel
         // collapses towards the centre and contact detail survives. White = they went further
         // than the kernel reaches, or missed, so the kernel runs at full width. A healthy
@@ -737,6 +774,10 @@ void ScreenSpaceRayTracing::SanitizeSettings()
     settings.DiffuseMult = std::clamp(settings.DiffuseMult, 0.01f, 5.0f);
     settings.AmbientMult = std::clamp(settings.AmbientMult, 0.0f, 1.0f);
     settings.AmbientReinjectionStrength = std::clamp(settings.AmbientReinjectionStrength, 0.0f, 1.0f);
+    // (reinjection noise) 1 is "no accumulation", i.e. alpha == 1 and the spatial mean straight
+    // through, so the low end is inert rather than degenerate; the 60 ceiling matches the slider
+    // and keeps the fp16 frame counter in .z far inside its exact range.
+    settings.AmbientConfidenceMaxFrames = std::clamp(settings.AmbientConfidenceMaxFrames, 1u, 60u);
     settings.OcclusionStrength = std::clamp(settings.OcclusionStrength, 0.0f, 1.0f);
     settings.CubemapNormalization = std::clamp(settings.CubemapNormalization, 0.0f, 1.0f);
 
@@ -903,6 +944,15 @@ void ScreenSpaceRayTracing::SetupResources()
         texSSRTDiffuseConfidenceSmooth = eastl::make_unique<Texture2D>(texDesc);
         texSSRTDiffuseConfidenceSmooth->CreateSRV(srvDesc);
         texSSRTDiffuseConfidenceSmooth->CreateUAV(uavDesc);
+
+        // (reinjection noise) Release the confidence accumulator rather than allocating it here.
+        // It is created on demand by EnsureAmbientConfidenceResources, but this function runs
+        // again on a resolution change and every surface around it is rebuilt at the new extent --
+        // so a pair left resident would keep the *old* extent, and the accumulator would sample
+        // its history through a mismatched reprojection. Dropping them makes the next frame that
+        // needs them allocate at the current size.
+        texSSRTConfidenceHistory.reset();
+        texSSRTConfidenceHistoryPrev.reset();
 
         // (batch 1, item 2) The diffuse hit-distance surface. Same R8_UNORM as the confidence
         // pair above and for the same three reasons: the payload is a [0,1] fraction, 1/255 is
@@ -1126,6 +1176,77 @@ void ScreenSpaceRayTracing::EnsureSvgfResources()
     // Freshly allocated, so their contents are undefined -- which for RGBA16F includes every
     // NaN and Inf bit pattern. Guard G8's flag is the mechanism that makes that safe.
     historyClearPending = true;
+}
+
+// (reinjection noise) The confidence accumulator's ping-pong pair, allocated on first need on
+// the same argument EnsureSvgfResources makes: ~66 MB of a 4K allocation between them, and
+// nothing reads either surface unless ambient reinjection and TemporalAmbientConfidence are
+// both on. Unlike the SVGF set these are *not* released when the toggle goes off, so the A/B is
+// instant in both directions; only a resolution change releases them.
+bool ScreenSpaceRayTracing::EnsureAmbientConfidenceResources()
+{
+    if (texSSRTConfidenceHistory && texSSRTConfidenceHistoryPrev)
+        return true;
+
+    logger::debug("Creating SSRT ambient confidence accumulator...");
+
+    auto renderer = globals::game::renderer;
+    if (!renderer)
+        return false;
+
+    auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return false;
+
+    D3D11_TEXTURE2D_DESC texDesc{};
+    mainTex.texture->GetDesc(&texDesc);
+    // Same reasoning as every other surface in this feature: no RTV is created for either and
+    // neither is passed to GenerateMips, so the render-target bind flag and its compression
+    // metadata are pure cost. MiscFlags set rather than OR-ed, because an inherited
+    // GENERATE_MIPS would fail creation once BIND_RENDER_TARGET is gone.
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    texDesc.MiscFlags = 0;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+    };
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipSlice = 0 }
+    };
+
+    auto makeTex = [&](eastl::unique_ptr<Texture2D>& tex, const char* name) {
+        if (!tex) {
+            tex = eastl::make_unique<Texture2D>(texDesc);
+            tex->CreateSRV(srvDesc);
+            tex->CreateUAV(uavDesc);
+            Util::SetResourceName(tex->resource.get(), name);
+        }
+    };
+
+    makeTex(texSSRTConfidenceHistory, "SSRT::ConfidenceHistory");
+    makeTex(texSSRTConfidenceHistoryPrev, "SSRT::ConfidenceHistoryPrev");
+
+    if (!texSSRTConfidenceHistory || !texSSRTConfidenceHistoryPrev)
+        return false;
+
+    // Freshly allocated contents are undefined, and for RGBA16F that includes every NaN and Inf
+    // bit pattern. The accumulator's own finiteness test rejects those, but a NaN that survived
+    // into .z would read as "history exists" under a naive comparison, so the surfaces are zeroed
+    // here as well: accumFrames 0 is the same "no history" state a disocclusion produces, which
+    // the pass already handles.
+    if (auto context = globals::d3d::context) {
+        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        context->ClearUnorderedAccessViewFloat(texSSRTConfidenceHistory->uav.get(), zero);
+        context->ClearUnorderedAccessViewFloat(texSSRTConfidenceHistoryPrev->uav.get(), zero);
+    }
+
+    return true;
 }
 
 // (batch C1) REBLUR-path resources, allocated on first selection rather than at boot,
@@ -1507,7 +1628,26 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
 void ScreenSpaceRayTracing::ClearDenoiserHistory()
 {
     auto context = globals::d3d::context;
-    if (!context || !texHistoryDiffuse || !texHistoryMomentsDiffuse || !texHistory || !texHistoryMoments)
+    if (!context)
+        return;
+
+    // (reinjection noise) The confidence accumulator, cleared ahead of the SVGF guard below
+    // because it is not an SVGF surface: it is allocated on demand and its pass runs under
+    // REBLUR and Off as well, so gating it on the SVGF set being resident would skip it on the
+    // default denoiser -- which is where the reinjection noise was reported.
+    //
+    // Zero for the same reason the colour and moment pairs are: accumFrames 0 in .z makes
+    // alpha = max(1 / (0 + 1), invMax) = 1, so every pixel takes this frame's spatial mean whole,
+    // indistinguishable from a disocclusion. A cell reload is exactly when the stored reference
+    // depths stop describing the world in front of the camera, so leaving them would let a frame
+    // of wrong coverage survive the transition.
+    const float zeroConfidence[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    if (texSSRTConfidenceHistory)
+        context->ClearUnorderedAccessViewFloat(texSSRTConfidenceHistory->uav.get(), zeroConfidence);
+    if (texSSRTConfidenceHistoryPrev)
+        context->ClearUnorderedAccessViewFloat(texSSRTConfidenceHistoryPrev->uav.get(), zeroConfidence);
+
+    if (!texHistoryDiffuse || !texHistoryMomentsDiffuse || !texHistory || !texHistoryMoments)
         return;
 
     // Zero, not "some safe colour": ssrt_temporal.hlsl derives its blend weight from the
@@ -1897,7 +2037,11 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         // experiment is confounded by whichever one is still animating.
         ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;
         ssrCBData.UseBlueNoise = (settings.UseBlueNoise && noiseSRV) ? 1u : 0u;  // (S3.10)
-        ssrCBData.pad0[0] = ssrCBData.pad0[1] = 0.0f;
+        // (reinjection noise) Diffuse-only mechanism, and the specular chain has no composite
+        // pass that reads it. Zeroed rather than left uninitialised so the buffer is fully
+        // written on both paths.
+        ssrCBData.TemporalAmbientConfidence = 0u;
+        ssrCBData.AmbientConfidenceInvMaxFrames = 1.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -2460,6 +2604,11 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     float2 size = Util::ConvertToDynamic(state->screenSize);
     float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
     
+    // (reinjection noise) Whether the confidence accumulator runs this frame. Decided once, in
+    // the constant-buffer block below, and read again by the composite dispatch so the CPU-side
+    // bindings and the shader-side branch cannot disagree.
+    bool confidenceTemporal = false;
+
     SSRTCB ssrCBData;
     {
         ssrCBData.MaxSteps = settings.MaxSteps;
@@ -2482,7 +2631,15 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ssrCBData.CubemapNormalization = settings.CubemapNormalization;
         ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;  // (diagnostic T2)
         ssrCBData.UseBlueNoise = (settings.UseBlueNoise && noiseSRV) ? 1u : 0u;  // (S3.10)
-        ssrCBData.pad0[0] = ssrCBData.pad0[1] = 0.0f;
+        // (reinjection noise) Gated on reinjection as well as on its own switch: with reinjection
+        // off nothing reads the confidence surface, so accumulating it would be pure cost. The
+        // allocation is attempted here, before any dispatch binds it, and a failure clears the
+        // flag -- the composite pass then publishes the spatial mean alone, which is exactly the
+        // pre-existing behaviour.
+        confidenceTemporal = settings.EnableAmbientReinjection && settings.TemporalAmbientConfidence &&
+                             EnsureAmbientConfidenceResources();
+        ssrCBData.TemporalAmbientConfidence = confidenceTemporal ? 1u : 0u;
+        ssrCBData.AmbientConfidenceInvMaxFrames = 1.0f / (settings.AmbientConfidenceMaxFrames + 1.0f);
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -2847,13 +3004,34 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         srvs.at(3) = texSSRTDiffuseConfidence->srv.get();
         srvs.at(4) = depth.depthSRV;
 
+        // (reinjection noise) The confidence accumulator's extra ends. Bound only when it runs,
+        // so with it off the compiled binding table is reached exactly as it was before: the
+        // shader's branch is a constant-buffer test, and an unbound SRV reads zero while an
+        // unbound UAV write is a no-op, neither of which the spatial-only path performs.
+        uint uavCount = 2;
+        if (confidenceTemporal) {
+            srvs.at(5) = texSSRTConfidenceHistoryPrev->srv.get();
+            srvs.at(6) = motion.SRV;
+            uavs.at(2) = texSSRTConfidenceHistory->uav.get();
+            uavCount = 3;
+        }
+
+        // b1 is set at the top of this function and only b2 is written after it, so this rebind
+        // is belt and braces rather than a fix -- but the accumulator now reads b1 from a pass
+        // that never used to, and a future pass inserted between the two would break silently.
+        context->CSSetConstantBuffers(1, 1, &buffer);
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
-        context->CSSetUnorderedAccessViews(0, 2, uavs.data(), nullptr);
+        context->CSSetUnorderedAccessViews(0, uavCount, uavs.data(), nullptr);
         context->CSSetShader(diffuseCompositeCS.get(), nullptr, 0);
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
 
         resetViews();
+
+        // (reinjection noise) This frame's accumulator becomes next frame's history. A pointer
+        // swap, matching the moment pair at the end of the SVGF block, so no copy is issued.
+        if (confidenceTemporal)
+            std::swap(texSSRTConfidenceHistory, texSSRTConfidenceHistoryPrev);
     }
     Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTrace);
 
