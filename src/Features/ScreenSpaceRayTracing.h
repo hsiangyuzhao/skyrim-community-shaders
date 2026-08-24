@@ -927,6 +927,14 @@ struct ScreenSpaceRayTracing : Feature
     /// allocations.
     [[nodiscard]] bool ReblurStaticallyAvailable(bool a_specular) const;
 
+    /// @brief (S1.3) ReblurStaticallyAvailable plus this chain's own surfaces and instance.
+    ///
+    /// Deliberately does *not* ask whether this frame's guides have been published, and that
+    /// omission is load-bearing: NRD::PrepareGuides is gated on a consumer having resolved to
+    /// REBLUR (S2.6), so a predicate that consulted AreGuidesReady() would make the two
+    /// decisions mutually dependent and both would answer "no" forever from the first frame.
+    [[nodiscard]] bool ReblurResourcesReady(bool a_specular) const;
+
     /// @brief (batch C1) Whether the REBLUR path can actually run this frame: everything
     /// ReblurStaticallyAvailable checks, plus this frame's guides being published and the
     /// per-chain integration instance and surfaces existing.
@@ -936,6 +944,47 @@ struct ScreenSpaceRayTracing : Feature
     /// answer needs. Called once per frame from Prepass, before UpdateHistoryValidity so the
     /// history latches see the effective values, and before any dispatch.
     void ResolveDenoisers();
+
+    /// @brief (S2.5) Allocate the SVGF-only surfaces on first need.
+    ///
+    /// Ten textures -- the two colour histories, the two moment histories, the temporal and
+    /// variance scratch, the moments surface, the normal and depth history snapshots and the
+    /// debug view -- 68 bytes per output pixel between them, i.e. ~140 MB at 1080p and
+    /// ~560 MB at a 4K allocation. Every one of them is read by exactly one shader,
+    /// ssrt_temporal.hlsl and the passes around it, and none of those runs under REBLUR or
+    /// Off. They were nevertheless allocated at boot for every user of the feature.
+    ///
+    /// Called from ResolveDenoisers, and only on the path that has already established SVGF
+    /// is what this frame will use -- which includes the REBLUR-unavailable fallback and the
+    /// Buffer Viewer being open, so neither can find a null surface.
+    void EnsureSvgfResources();
+
+    /// @brief (S2.5) Whether the SVGF history for one signal has to be maintained this frame.
+    ///
+    /// The history *maintenance* -- two full-screen RGBA16F colour copies plus the
+    /// normal-roughness snapshot, ~40 bytes per pixel of read+write traffic, ~330 MB/frame at
+    /// a 4K allocation -- ran unconditionally, including under REBLUR and Off where nothing
+    /// reads any of it. ssrt_temporal.hlsl is the sole reader of all three surfaces; the t0
+    /// declarations in ssrt_raymarch / ssrt_variance / ssrt_spatial are vestigial (declared,
+    /// never referenced, so fxc strips them).
+    ///
+    /// The Buffer Viewer counts as a consumer. It is the only other thing that looks at these
+    /// surfaces, and a debug view that silently freezes the moment the default denoiser is
+    /// selected would be worse than the waste.
+    [[nodiscard]] bool SvgfHistoryNeeded(bool a_specular) const
+    {
+        return EffectiveDenoiser(a_specular) == kDenoiserSVGF || bufferViewerActive;
+    }
+
+    /// @brief (S2.5) Latched once per frame in Prepass from bufferViewerOpen, which
+    /// DrawSettings raises while its Buffer Viewer tree is expanded.
+    ///
+    /// Two variables rather than one because the menu draws at present time, i.e. after
+    /// Prepass: the raise is consumed by the *following* frame and then cleared, so an open
+    /// tree keeps it set for as long as the menu is up and it decays one frame after the menu
+    /// closes. A single variable would either never clear or clear before it was read.
+    bool bufferViewerOpen = false;
+    bool bufferViewerActive = false;
 
     /// @brief (S4.15) Put every piece of cross-frame state back to "nothing has run yet".
     ///
@@ -1172,16 +1221,27 @@ struct ScreenSpaceRayTracing : Feature
     // (audit P6 / #20) texHitPDF (was u1) and texOutput (a redundant full-screen copy
     // of texSSRColor) had no consumer anywhere and are gone.
 
-    /// @brief (batch C1) REBLUR-path surfaces and instances, allocated lazily by
-    /// EnsureNRDResources. The input pair carries the front-end packed signal
-    /// (YCoCg radiance + normalized hit distance, RGBA16F); the output pair is what
-    /// REBLUR writes and the unpack pass reads back into the chain's own surfaces.
-    /// SSRT's ray-march outputs are untouched — the pack/unpack passes adapt around
-    /// them, which is what keeps the tracing side byte-identical between denoisers.
-    eastl::unique_ptr<Texture2D> texNRDDiffuseInput = nullptr;
-    eastl::unique_ptr<Texture2D> texNRDDiffuseOutput = nullptr;
-    eastl::unique_ptr<Texture2D> texNRDSpecInput = nullptr;
-    eastl::unique_ptr<Texture2D> texNRDSpecOutput = nullptr;
+    /// @brief (batch C1) REBLUR-path scratch, allocated lazily by EnsureNRDResources.
+    /// texNRDPackInput carries the front-end packed signal (YCoCg radiance + normalized hit
+    /// distance, RGBA16F); texNRDPackOutput is what REBLUR writes and the unpack pass reads
+    /// back into the chain's own surface. SSRT's ray-march outputs are untouched — the
+    /// pack/unpack passes adapt around them, which is what keeps the tracing side
+    /// byte-identical between denoisers.
+    ///
+    /// (S2.7) **One pair, shared by both chains.** Batch C1 gave diffuse and specular a pair
+    /// each: four full-screen RGBA16F surfaces, 32 bytes per output pixel, ~265 MB at a 4K
+    /// allocation. The two are pure scratch with a lifetime entirely inside RunReblur — pack
+    /// writes the input, the NRD instance reads it and writes the output, the unpack reads the
+    /// output — and the two chains execute strictly serially, DrawSSRTDiffuse before
+    /// DrawSSRTSpecular within one Deferred::DeferredPasses. Nothing in either surface has to
+    /// survive the call, so nothing has to be duplicated: 127 MiB back at 4K.
+    ///
+    /// What is emphatically **not** shared is anything NRD keeps: each chain owns its own
+    /// nrd::Instance below, and with it its own permanent pool — the accumulated radiance,
+    /// history length and fast history that make REBLUR a denoiser rather than a blur. Those
+    /// are per-signal by construction and sharing them would be nonsense, not an optimisation.
+    eastl::unique_ptr<Texture2D> texNRDPackInput = nullptr;
+    eastl::unique_ptr<Texture2D> texNRDPackOutput = nullptr;
 
     NRDReblurIntegration nrdReblurDiffuse;
     NRDReblurIntegration nrdReblurSpecular;

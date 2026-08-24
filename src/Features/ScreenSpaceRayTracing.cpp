@@ -591,6 +591,13 @@ void ScreenSpaceRayTracing::DrawSettings()
 		static float debugRescale = .3f;
 		ImGui::SliderFloat("View Resize", &debugRescale, 0.f, 1.f);
 
+        // (S2.5) The Buffer Viewer is a first-class consumer of the SVGF history surfaces, so
+        // having it open both allocates them and keeps them maintained -- otherwise selecting
+        // the default denoiser would silently freeze half of this panel. Consumed and cleared
+        // by Prepass, which runs before the menu draws, so this stays raised for as long as
+        // the tree is expanded and decays one frame after it is not.
+        bufferViewerOpen = true;
+
 		BUFFER_VIEWER_NODE(texDepth, debugRescale)
         BUFFER_VIEWER_NODE(texColor, debugRescale)
         BUFFER_VIEWER_NODE(texSSRColor, debugRescale)
@@ -602,25 +609,49 @@ void ScreenSpaceRayTracing::DrawSettings()
         // than the kernel reaches, or missed, so the kernel runs at full width. A healthy
         // exterior reads mostly white with dark outlines around contacts, creases and foliage.
         BUFFER_VIEWER_NODE(texSSRTDiffuseHitDistance, debugRescale)
-        BUFFER_VIEWER_NODE(texHistory, debugRescale)
-        BUFFER_VIEWER_NODE(texHistoryDiffuse, debugRescale)
-        BUFFER_VIEWER_NODE(texTemporal, debugRescale)
-        BUFFER_VIEWER_NODE(texMoments, debugRescale)
-        BUFFER_VIEWER_NODE(texHistoryMoments, debugRescale)
-        BUFFER_VIEWER_NODE(texHistoryMomentsDiffuse, debugRescale)
-        BUFFER_VIEWER_NODE(texVariance, debugRescale)
-        BUFFER_VIEWER_NODE(texHistoryDepth, debugRescale)
-        BUFFER_VIEWER_NODE(texDebugHistory, debugRescale)
+        // (S2.5) Null until the frame after this tree is first opened, because they are
+        // allocated lazily now. One frame of absence, then they populate.
+        if (texHistory)
+            BUFFER_VIEWER_NODE(texHistory, debugRescale)
+        if (texHistoryDiffuse)
+            BUFFER_VIEWER_NODE(texHistoryDiffuse, debugRescale)
+        if (texTemporal)
+            BUFFER_VIEWER_NODE(texTemporal, debugRescale)
+        // (S2.8) The three moment surfaces rotate through each other every frame now -- the
+        // temporal pass writes the scratch one and it then *becomes* the history rather than
+        // being copied into it -- so the variable names no longer say which part a physical
+        // texture is playing. These labels do: the two "current" entries are what the temporal
+        // pass wrote this frame (and what the next frame will read as history), and "scratch"
+        // is the buffer waiting to be overwritten. Menu draw happens after the frame's
+        // dispatches, so this is the ownership as of end of frame.
+        {
+            auto momentNode = [&](const char* label, const eastl::unique_ptr<Texture2D>& tex) {
+                if (!tex)
+                    return;
+                if (ImGui::TreeNode(label)) {
+                    Util::BufferViewerImage(tex->srv.get(),
+                        { tex->desc.Width * debugRescale, tex->desc.Height * debugRescale });
+                    ImGui::TreePop();
+                }
+            };
+            momentNode("moments (diffuse, current)", texHistoryMomentsDiffuse);
+            momentNode("moments (specular, current)", texHistoryMoments);
+            momentNode("moments (scratch)", texMoments);
+        }
+        if (texVariance)
+            BUFFER_VIEWER_NODE(texVariance, debugRescale)
+        if (texHistoryDepth)
+            BUFFER_VIEWER_NODE(texHistoryDepth, debugRescale)
+        if (texDebugHistory)
+            BUFFER_VIEWER_NODE(texDebugHistory, debugRescale)
 
-        // (batch C1) REBLUR-path surfaces; null until REBLUR is first selected.
-        if (texNRDDiffuseInput)
-            BUFFER_VIEWER_NODE(texNRDDiffuseInput, debugRescale)
-        if (texNRDDiffuseOutput)
-            BUFFER_VIEWER_NODE(texNRDDiffuseOutput, debugRescale)
-        if (texNRDSpecInput)
-            BUFFER_VIEWER_NODE(texNRDSpecInput, debugRescale)
-        if (texNRDSpecOutput)
-            BUFFER_VIEWER_NODE(texNRDSpecOutput, debugRescale)
+        // (batch C1) REBLUR-path scratch; null until REBLUR is first selected.
+        // (S2.7) One shared pair, so what these hold is whichever chain ran last in the
+        // frame -- specular when it is enabled, diffuse otherwise.
+        if (texNRDPackInput)
+            BUFFER_VIEWER_NODE(texNRDPackInput, debugRescale)
+        if (texNRDPackOutput)
+            BUFFER_VIEWER_NODE(texNRDPackOutput, debugRescale)
         if (auto validation = settings.ReblurDiffuse.EnableValidation ? nrdReblurDiffuse.GetValidationSRV() : nullptr) {
             if (ImGui::TreeNode("NRD Validation (Diffuse)")) {
                 ImGui::Image(validation, { nrdReblurDiffuse.GetWidth() * debugRescale, nrdReblurDiffuse.GetHeight() * debugRescale });
@@ -776,18 +807,12 @@ void ScreenSpaceRayTracing::SetupResources()
         texSSRTDiffuseColor = eastl::make_unique<Texture2D>(texDesc);
         texSSRTDiffuseColor->CreateSRV(srvDesc);
         texSSRTDiffuseColor->CreateUAV(uavDesc);
-        texHistory = eastl::make_unique<Texture2D>(texDesc);
-        texHistory->CreateSRV(srvDesc);
-        texHistory->CreateUAV(uavDesc);
-        texHistoryDiffuse = eastl::make_unique<Texture2D>(texDesc);
-        texHistoryDiffuse->CreateSRV(srvDesc);
-        texHistoryDiffuse->CreateUAV(uavDesc);
-        texTemporal = eastl::make_unique<Texture2D>(texDesc);
-        texTemporal->CreateSRV(srvDesc);
-        texTemporal->CreateUAV(uavDesc);
-        texVariance = eastl::make_unique<Texture2D>(texDesc);
-        texVariance->CreateSRV(srvDesc);
-        texVariance->CreateUAV(uavDesc);
+
+        // (S2.5) texHistory / texHistoryDiffuse / texTemporal / texVariance, the moment trio,
+        // texHistoryNormals, texHistoryDepth and texDebugHistory have moved to
+        // EnsureSvgfResources: they are read by ssrt_temporal.hlsl and the passes around it and
+        // by nothing else, so under REBLUR or Off they were 68 bytes per output pixel of
+        // allocation that no dispatch touched.
 
         // (defect D5) The moment pair stays at R16G16B16A16_FLOAT -- i.e. it keeps the format
         // set above rather than dropping to R11G11B10_FLOAT as it used to.
@@ -839,20 +864,8 @@ void ScreenSpaceRayTracing::SetupResources()
         // SSRT_MOMENT_LUMINANCE_MAX in ssrt_temporal.hlsl needs no change: fp16's largest
         // finite value is 65504, so the 250 ceiling (250^2 = 62500) still keeps the second
         // moment representable, and it was already derived against a very similar bound.
-        texMoments = eastl::make_unique<Texture2D>(texDesc);
-        texMoments->CreateSRV(srvDesc);
-        texMoments->CreateUAV(uavDesc);
-        texHistoryMoments = eastl::make_unique<Texture2D>(texDesc);
-        texHistoryMoments->CreateSRV(srvDesc);
-        texHistoryMoments->CreateUAV(uavDesc);
-        texHistoryMomentsDiffuse = eastl::make_unique<Texture2D>(texDesc);
-        texHistoryMomentsDiffuse->CreateSRV(srvDesc);
-        texHistoryMomentsDiffuse->CreateUAV(uavDesc);
-
-        texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-        texHistoryNormals = eastl::make_unique<Texture2D>(texDesc);
-        texHistoryNormals->CreateSRV(srvDesc);
-        texHistoryNormals->CreateUAV(uavDesc);
+        // (S2.5) The moment trio and texHistoryNormals live in EnsureSvgfResources now; the
+        // derivation above still governs their format, which that function repeats verbatim.
 
         // (ambient reinjection) The confidence pair. R8_UNORM because the quantity is a
         // coverage fraction in [0,1]: 1/255 quantisation is an order of magnitude below the
@@ -882,19 +895,7 @@ void ScreenSpaceRayTracing::SetupResources()
         texSSRTDiffuseHitDistance->CreateSRV(srvDesc);
         texSSRTDiffuseHitDistance->CreateUAV(uavDesc);
 
-        // (diagnostic H) The history-acceptance picture. R8G8B8A8_UNORM: the payload is three
-        // display colours plus an alpha the Buffer Viewer ignores (it draws with blending
-        // disabled), so a byte per channel is exactly enough and, being UNORM, no read of it
-        // can be non-finite. A quarter the footprint of the RGBA16F surfaces above.
-        //
-        // Allocated at the same extent as every other surface here and addressed by pixel, so
-        // the dispatch writes the dynamic-resolution sub-rect and the rest stays at whatever
-        // ClearDenoiserHistory last left it -- which is why that clear covers this texture too
-        // rather than leaving a border of stale colour to be misread.
-        texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        texDebugHistory = eastl::make_unique<Texture2D>(texDesc);
-        texDebugHistory->CreateSRV(srvDesc);
-        texDebugHistory->CreateUAV(uavDesc);
+        // (S2.5) texDebugHistory moved to EnsureSvgfResources.
 
         texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
 
@@ -905,14 +906,7 @@ void ScreenSpaceRayTracing::SetupResources()
         texHitDistance->CreateSRV(srvDesc);
         texHitDistance->CreateUAV(uavDesc);
 
-        // (defect D3) The previous frame's raw depth, so ssrt_temporal.hlsl can tell a
-        // reprojection that landed on the same surface from one that landed on a different
-        // surface at a different distance. Same format and extent as mip 0 of the Hi-Z
-        // pyramid, which is what CopyHistoryGeometry snapshots it from; the UAV exists only
-        // so ClearDenoiserHistory can reset it to the far plane.
-        texHistoryDepth = eastl::make_unique<Texture2D>(texDesc);
-        texHistoryDepth->CreateSRV(srvDesc);
-        texHistoryDepth->CreateUAV(uavDesc);
+        // (S2.5) texHistoryDepth moved to EnsureSvgfResources.
 
         texDesc.MipLevels = maxMips;
         srvDesc.Texture2D.MipLevels = texDesc.MipLevels;
@@ -1026,14 +1020,105 @@ void ScreenSpaceRayTracing::EnsureSharcResources()
 }
 #endif
 
+// (S2.5) The SVGF-only surfaces, allocated on first need rather than at boot -- the same
+// argument EnsureSharcResources and EnsureNRDResources make, applied to the chain that is no
+// longer the default.
+//
+// Ten textures, 68 bytes per output pixel between them: ~140 MB at 1080p, ~560 MB at a 4K
+// allocation. ssrt_temporal.hlsl and the three passes around it are their only readers (plus
+// the Buffer Viewer), and none of those is dispatched under REBLUR or Off. The t0
+// declarations in ssrt_raymarch / ssrt_variance / ssrt_spatial name the colour histories but
+// never reference them, so fxc strips the bindings and those passes do not count as readers.
+//
+// Called from ResolveDenoisers on every path that has concluded SVGF will run -- including
+// the REBLUR-unavailable fallback and the Buffer Viewer being open -- so no consumer can
+// reach a null surface. Switching away afterwards keeps them resident, which is what makes
+// the A/B toggle instant in both directions; only a resolution change releases them.
+void ScreenSpaceRayTracing::EnsureSvgfResources()
+{
+    if (texHistoryDiffuse && texHistory && texTemporal && texVariance && texMoments &&
+        texHistoryMoments && texHistoryMomentsDiffuse && texHistoryNormals && texHistoryDepth &&
+        texDebugHistory)
+        return;
+
+    logger::debug("Creating SSRT SVGF resources...");
+
+    auto renderer = globals::game::renderer;
+    auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    D3D11_TEXTURE2D_DESC texDesc{};
+    mainTex.texture->GetDesc(&texDesc);
+    // (audit P9) No RTV is ever created for any of these and none is passed to GenerateMips,
+    // so the render-target bind flag and its compression metadata are pure cost. MiscFlags is
+    // set rather than OR-ed because GENERATE_MIPS requires BIND_RENDER_TARGET.
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    texDesc.MiscFlags = 0;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+    };
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipSlice = 0 }
+    };
+
+    auto makeTex = [&](eastl::unique_ptr<Texture2D>& tex, const char* name) {
+        if (!tex) {
+            tex = eastl::make_unique<Texture2D>(texDesc);
+            tex->CreateSRV(srvDesc);
+            tex->CreateUAV(uavDesc);
+            Util::SetResourceName(tex->resource.get(), name);
+        }
+    };
+
+    makeTex(texHistory, "SSRT::HistorySpecular");
+    makeTex(texHistoryDiffuse, "SSRT::HistoryDiffuse");
+    makeTex(texTemporal, "SSRT::Temporal");
+    makeTex(texVariance, "SSRT::Variance");
+    // (defect D5) The moment trio stays R16G16B16A16_FLOAT. See the derivation in
+    // SetupResources: at R11G11B10 the mu2 - mu1^2 cancellation, the EMA dead zone and the
+    // integer frame counter in .z all fail, which is what made MaxAccumulatedFrames inert.
+    makeTex(texMoments, "SSRT::Moments");
+    makeTex(texHistoryMoments, "SSRT::HistoryMomentsSpecular");
+    makeTex(texHistoryMomentsDiffuse, "SSRT::HistoryMomentsDiffuse");
+
+    texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    makeTex(texHistoryNormals, "SSRT::HistoryNormals");
+
+    // (diagnostic H) Three display colours plus an alpha the Buffer Viewer ignores, so a byte
+    // per channel is exactly enough; being UNORM, no read of it can be non-finite.
+    texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    makeTex(texDebugHistory, "SSRT::DebugHistory");
+
+    // (defect D3) Previous frame's raw depth, same format and extent as mip 0 of the Hi-Z
+    // pyramid that CopyHistoryGeometry snapshots it from. The UAV exists only so
+    // ClearDenoiserHistory can reset it to the far plane.
+    texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    makeTex(texHistoryDepth, "SSRT::HistoryDepth");
+
+    // Freshly allocated, so their contents are undefined -- which for RGBA16F includes every
+    // NaN and Inf bit pattern. Guard G8's flag is the mechanism that makes that safe.
+    historyClearPending = true;
+}
+
 // (batch C1) REBLUR-path resources, allocated on first selection rather than at boot,
 // on the same argument EnsureSharcResources makes: a user who stays on SVGF (or Off)
-// never pays for the four RGBA16F packed surfaces or the two instances' permanent and
+// never pays for the packed scratch surfaces or the two instances' permanent and
 // transient pools. Switching REBLUR off afterwards keeps them resident, which is what
 // makes the A/B toggle instant in both directions.
+//
+// (S2.7) One shared scratch pair instead of one per chain. The two chains run strictly
+// serially inside Deferred::DeferredPasses and neither surface carries anything across the
+// RunReblur call, so the duplication bought nothing and cost 16 bytes per output pixel
+// (~127 MiB at a 4K allocation). The two nrd::Instances stay separate: their permanent pools
+// *are* the per-signal history and are not scratch.
 void ScreenSpaceRayTracing::EnsureNRDResources()
 {
-    if (texNRDDiffuseInput && texNRDSpecInput && nrdReblurDiffuse.IsValid() && nrdReblurSpecular.IsValid())
+    if (texNRDPackInput && texNRDPackOutput && nrdReblurDiffuse.IsValid() && nrdReblurSpecular.IsValid())
         return;
 
     logger::debug("Creating SSRT NRD resources...");
@@ -1072,10 +1157,8 @@ void ScreenSpaceRayTracing::EnsureNRDResources()
             Util::SetResourceName(tex->resource.get(), name);
         }
     };
-    makeTex(texNRDDiffuseInput, "SSRT::NRDDiffuseInput");
-    makeTex(texNRDDiffuseOutput, "SSRT::NRDDiffuseOutput");
-    makeTex(texNRDSpecInput, "SSRT::NRDSpecInput");
-    makeTex(texNRDSpecOutput, "SSRT::NRDSpecOutput");
+    makeTex(texNRDPackInput, "SSRT::NRDPackInput");
+    makeTex(texNRDPackOutput, "SSRT::NRDPackOutput");
 
     // Instances are sized at the *output* resolution, like every history surface in
     // this feature; the per-frame dynamic-resolution sub-rect travels through
@@ -1111,17 +1194,26 @@ bool ScreenSpaceRayTracing::ReblurStaticallyAvailable(bool a_specular) const
     return a_specular ? (bool)nrdPackSpecularCS : (bool)nrdPackDiffuseCS;
 }
 
-bool ScreenSpaceRayTracing::ReblurReady(bool a_specular) const
+// (S1.3) Everything except this frame's guides. This is the predicate ResolveDenoisers uses,
+// and it must not ask about the guides: NRD::PrepareGuides is gated on a consumer having
+// selected REBLUR (S2.6), and the answer to *that* is what this function decides. Asking
+// AreGuidesReady() here would read last frame's value, and on the first frame both sides would
+// answer "no" forever — REBLUR would never start because no guides had been published, and no
+// guides would be published because REBLUR had not started.
+bool ScreenSpaceRayTracing::ReblurResourcesReady(bool a_specular) const
 {
     if (!ReblurStaticallyAvailable(a_specular))
         return false;
 
-    if (!globals::features::nrd.AreGuidesReady())
-        return false;
-
     if (a_specular)
-        return texNRDSpecInput && texNRDSpecOutput && nrdReblurSpecular.IsValid();
-    return texNRDDiffuseInput && texNRDDiffuseOutput && nrdReblurDiffuse.IsValid();
+        return texNRDPackInput && texNRDPackOutput && nrdReblurSpecular.IsValid();
+    return texNRDPackInput && texNRDPackOutput && nrdReblurDiffuse.IsValid();
+}
+
+bool ScreenSpaceRayTracing::ReblurReady(bool a_specular) const
+{
+    // The per-frame half, asked at dispatch time when PrepareGuides has already run.
+    return ReblurResourcesReady(a_specular) && globals::features::nrd.AreGuidesReady();
 }
 
 // (S1.3 / S1.4) Whole-chain readiness for SVGF, one signal at a time.
@@ -1166,6 +1258,14 @@ void ScreenSpaceRayTracing::ResolveDenoisers()
     if (ReblurSelected() && (ReblurStaticallyAvailable(false) || ReblurStaticallyAvailable(true)))
         EnsureNRDResources();
 
+    // (S2.5) Bring the SVGF surfaces up only when this frame is actually going to need them:
+    // the user selected SVGF, or REBLUR was selected and cannot run for one of the chains (the
+    // fallback), or the Buffer Viewer is open and would otherwise show ten black rectangles.
+    // The REBLUR-working case -- the default -- allocates none of them.
+    if (SVGFSelected() || bufferViewerActive ||
+        (ReblurSelected() && (!ReblurResourcesReady(false) || !ReblurResourcesReady(true))))
+        EnsureSvgfResources();
+
     const bool svgfDiffuse = SvgfChainReady(false);
     const bool svgfSpecular = SvgfChainReady(true);
 
@@ -1180,7 +1280,7 @@ void ScreenSpaceRayTracing::ResolveDenoisers()
             return kDenoiserOff;
         case kDenoiserREBLUR:
         default:
-            if (ReblurReady(a_specular))
+            if (ReblurResourcesReady(a_specular))
                 return kDenoiserREBLUR;
             if (a_svgfOk) {
                 if (!denoiserFallbackReason) {
@@ -1229,12 +1329,24 @@ void ScreenSpaceRayTracing::ResetFrameState()
     // lazily, so a rebuild at a *different* resolution left them at the old dimensions
     // indefinitely — EnsureNRDResources' early-out only asks whether they exist. Drop them
     // and let the next selection rebuild them against the new extent.
-    texNRDDiffuseInput = nullptr;
-    texNRDDiffuseOutput = nullptr;
-    texNRDSpecInput = nullptr;
-    texNRDSpecOutput = nullptr;
+    texNRDPackInput = nullptr;
+    texNRDPackOutput = nullptr;
     nrdReblurDiffuse.Shutdown();
     nrdReblurSpecular.Shutdown();
+
+    // (S2.5) Same argument for the SVGF surfaces, which are lazily allocated for the same
+    // reason. SetupResources reallocates everything else at the new extent; these would
+    // otherwise keep the old one until the process exited.
+    texHistory = nullptr;
+    texHistoryDiffuse = nullptr;
+    texTemporal = nullptr;
+    texVariance = nullptr;
+    texMoments = nullptr;
+    texHistoryMoments = nullptr;
+    texHistoryMomentsDiffuse = nullptr;
+    texHistoryNormals = nullptr;
+    texHistoryDepth = nullptr;
+    texDebugHistory = nullptr;
 }
 
 void ScreenSpaceRayTracing::ClearShaderCache()
@@ -1497,6 +1609,13 @@ void ScreenSpaceRayTracing::Prepass()
         CompileComputeShaders();
     }
 
+    // (S2.5) Latch the debug view's claim on the SVGF surfaces before anything asks about it.
+    // DrawSettings runs at present time, i.e. after this, so the raise it makes is consumed
+    // here on the following frame and cleared -- an expanded tree keeps it set continuously and
+    // a collapsed one lets it decay after a single frame.
+    bufferViewerActive = bufferViewerOpen;
+    bufferViewerOpen = false;
+
     // (S1.3) Before UpdateHistoryValidity, because the history latches key on the effective
     // denoiser and a fallback is one of the transitions they have to catch; before the
     // enable gate below, because a frame in which neither pass renders must still record
@@ -1745,7 +1864,10 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     uavs.at(0) = texSSRColor->uav.get();
     uavs.at(1) = texHitDistance->uav.get();  // (audit P6) was u2; u1 freed by dropping texHitPDF
 
-    srvs.at(0) = texHistory->srv.get();
+    // (S2.5) t0 stays unbound. ssrt_raymarch.hlsl declares HistoryTexture at t0 and never
+    // references it, so fxc strips the binding entirely -- and texHistory is allocated lazily
+    // now, so dereferencing it here would be a null read on the default denoiser.
+    srvs.at(0) = nullptr;
     srvs.at(1) = motion.SRV;
     srvs.at(2) = normal.SRV;
     srvs.at(3) = texColor->srv.get();
@@ -1856,11 +1978,17 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
 
-        CopyDynamicRegion(texHistoryMoments->resource.get(), texMoments->resource.get());
+        // (S2.8) The moments copy is gone: the two surfaces swap owners instead. See the
+        // derivation at the matching site in DrawSSRTDiffuse; the swap happens once this
+        // frame's readers -- the variance pass and the a-trous loop, both of which read
+        // texMoments -- are done with it.
 
         // variance filter
         uavs.at(0) = texVariance->uav.get();
-        srvs.at(0) = texHistory->srv.get();
+        // (S2.8) t0 stays unbound. ssrt_variance.hlsl declares HistoryTexture there and never
+        // references it, so fxc strips the binding; leaving it bound would additionally alias
+        // the surface the a-trous loop is about to write.
+        srvs.at(0) = nullptr;
         srvs.at(1) = texMoments->srv.get();
         srvs.at(2) = normal.SRV;
         srvs.at(3) = texTemporal->srv.get();
@@ -1873,21 +2001,34 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
 
+        // (S2.8) A-trous routing by ownership. See the block comment at the diffuse twin.
+        const int atrousN = (int)settings.AtrousIterations;
+        ID3D11ShaderResourceView* atrousSrc = texVariance->srv.get();
+
         // spatial filter
-        for (int i = 0; i < (int)settings.AtrousIterations; ++i)
+        for (int i = 0; i < atrousN; ++i)
         {
             denoiserCBData.atrousIterations = i;
             denoiserCB->Update(denoiserCBData);
             denoiserBuffer = denoiserCB->CB();
             context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
-            uavs.at(0) = (i % 2 == 0) ? texSSRColor->uav.get() : texVariance->uav.get();
-            srvs.at(0) = texHistory->srv.get();
+
+            Texture2D* dst = nullptr;
+            if (i == 0)
+                dst = (atrousN == 1) ? texSSRColor.get() : texHistory.get();
+            else
+                dst = (((atrousN - 1 - i) % 2) == 0) ? texSSRColor.get() : texVariance.get();
+
+            uavs.at(0) = dst->uav.get();
+            // (S2.8) t0 stays unbound: ssrt_spatial.hlsl declares HistoryTexture there and
+            // never references it, and at i == 0 that surface *is* the destination.
+            srvs.at(0) = nullptr;
             // (spec A1) t1 carries the moments texture, whose .z is the accumulated frame
             // count the adaptive early-out votes on. It used to receive the motion-vector
             // target, which ssrt_spatial.hlsl never declared.
             srvs.at(1) = texMoments->srv.get();
             srvs.at(2) = normal.SRV;
-            srvs.at(3) = (i % 2 == 0) ? texVariance->srv.get() : texSSRColor->srv.get();
+            srvs.at(3) = atrousSrc;
             srvs.at(4) = depth.depthSRV;
 
             context->CSSetShaderResources(0, 5, srvs.data());
@@ -1898,17 +2039,26 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 
             resetViews();
 
-            // (defect D4) i == 0 is the even leg of the ping-pong, so the first iteration's
-            // output sits in texSSRColor and the next iteration is about to overwrite it.
-            if (i == 0) {
-                CopyDynamicRegion(texHistory->resource.get(), texSSRColor->resource.get());
+            atrousSrc = dst->srv.get();
+
+            // (defect D4) The history is the first iteration's output, and at atrousN >= 2 it
+            // was written straight into texHistory, so there is nothing to copy.
+            if (i == 0 && atrousN >= 2)
                 historyFed = true;
-            }
         }
 
-        if (settings.AtrousIterations % 2 == 0) {
-            CopyDynamicRegion(texSSRColor->resource.get(), texVariance->resource.get());
+        // (S2.8) At atrousN == 1 the single iteration wrote texSSRColor, which is both the
+        // final result and the first-iteration output, so one copy is still owed.
+        if (atrousN == 1 && SvgfHistoryNeeded(true) && texHistory) {
+            CopyDynamicRegion(texHistory->resource.get(), texSSRColor->resource.get());
+            historyFed = true;
         }
+
+        // (S2.8) Moment ownership swap in place of the copy above. texHistoryMoments must end
+        // the frame holding what the temporal pass just wrote; swapping the two pointers says
+        // exactly that and moves no bytes.
+        std::swap(texMoments, texHistoryMoments);
+
         Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTSvgf);
     } else if (denoiser == kDenoiserREBLUR) {
         // (batch C1) REBLUR_SPECULAR: pack texSSRColor + the world-space hit distance
@@ -1932,7 +2082,12 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // texture itself.
     // (audit #13) Specular runs after diffuse, so it owns the once-per-frame snapshot.
     CopyHistoryGeometry();
-    if (!historyFed)
+    // (S2.5) ssrt_temporal.hlsl at t0 is the only reader of texHistory (plus the Buffer
+    // Viewer). The specular ray march declares HistoryTexture at t0 and never references it,
+    // so fxc strips the binding; ssrt_variance and ssrt_spatial do the same. Under REBLUR or
+    // Off this copy was therefore a full-screen RGBA16F move -- 16 bytes per pixel of
+    // read+write -- with no consumer at all.
+    if (!historyFed && SvgfHistoryNeeded(true) && texHistory)
         CopyDynamicRegion(texHistory->resource.get(), texSSRColor->resource.get());
 
     context->CSSetShader(nullptr, nullptr, 0);
@@ -1979,6 +2134,13 @@ void ScreenSpaceRayTracing::CopyDynamicRegion(ID3D11Resource* a_dst, ID3D11Resou
 
 void ScreenSpaceRayTracing::CopyHistoryGeometry()
 {
+    // (S2.5) ssrt_temporal.hlsl at t6 is the only reader of texHistoryNormals, so under
+    // REBLUR or Off this was a full-screen R10G10B10A2 copy -- 8 bytes per pixel of read+write
+    // traffic, ~66 MB/frame at a 4K allocation -- feeding nothing. It is not in the Buffer
+    // Viewer either, so SVGF is its whole consumer set.
+    if (!(SvgfHistoryNeeded(false) || SvgfHistoryNeeded(true)) || !texHistoryNormals)
+        return;
+
     auto normal = globals::game::renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
     CopyDynamicRegion(texHistoryNormals->resource.get(), normal.texture);
 
@@ -1990,7 +2152,7 @@ void ScreenSpaceRayTracing::CopyHistoryGeometry()
     // purpose lies. The region outside it now keeps the far plane ClearDenoiserHistory wrote
     // instead of inheriting texDepth's own untouched content -- the same value, arrived at more
     // directly, and the one audit #8's convention asks for there.
-    if (AnyChainSVGF() && texHistoryDepth)
+    if (texHistoryDepth)
         CopyDynamicRegion(texHistoryDepth->resource.get(), texDepth->resource.get());
 }
 
@@ -2021,8 +2183,8 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
     auto& reblurUI = a_specular ? settings.ReblurSpecular : settings.ReblurDiffuse;
     auto& reblurNative = a_specular ? reblurSpecularSettings : reblurDiffuseSettings;
     bool& resetFlag = a_specular ? resetReblurSpecular : resetReblurDiffuse;
-    auto& texInput = a_specular ? texNRDSpecInput : texNRDDiffuseInput;
-    auto& texOutput = a_specular ? texNRDSpecOutput : texNRDDiffuseOutput;
+    auto& texInput = texNRDPackInput;
+    auto& texOutput = texNRDPackOutput;
     auto& texRadiance = a_specular ? texSSRColor : texSSRTDiffuseColor;
 
     std::array<ID3D11ShaderResourceView*, 4> srvs = { nullptr };
@@ -2258,7 +2420,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     }
 #endif
 
-    srvs.at(0) = texHistoryDiffuse->srv.get();
+    // (S2.5) t0 stays unbound; see the matching site in DrawSSRTSpecular.
+    srvs.at(0) = nullptr;
     srvs.at(1) = motion.SRV;
     srvs.at(2) = normal.SRV;
     srvs.at(3) = main.SRV;
@@ -2402,11 +2565,62 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
 
-        CopyDynamicRegion(texHistoryMomentsDiffuse->resource.get(), texMoments->resource.get());
+        // (S2.8) THE COPY CHAIN, AND WHY SIX OF ITS EIGHT COPIES WERE UNNECESSARY.
+        //
+        // What was here. Per chain, three full-screen RGBA16F CopySubresourceRegions: the
+        // moments into the moment history, the first a-trous iteration's output into the
+        // colour history, and -- at an even iteration count -- the ping-pong's final leg back
+        // into the surface the rest of the pipeline reads. Two chains, so six; with the normal
+        // and depth snapshots that is the eight the audit counted. 16 bytes per pixel of
+        // read+write each, 96 bytes per pixel in total, ~800 MB/frame at a 4K allocation.
+        //
+        // Why none of the three is needed. Every one of them exists to put a surface's
+        // *contents* where a name expects them, and in each case the name could simply have
+        // been pointed at the surface instead:
+        //
+        //   * The moment history. The temporal pass reads the history and writes the current
+        //     moments; the copy then makes the current moments the history. Swapping the two
+        //     pointers once this frame's readers of the current moments are done says the same
+        //     thing and moves nothing. (The three moment surfaces -- one scratch, two
+        //     histories -- rotate through each other over a frame; they are the same format
+        //     and extent, so which physical texture plays which part is immaterial.)
+        //
+        //   * The colour history. Defect D4 requires the history to be the *first* a-trous
+        //     iteration's output, and the copy took it because iteration 0's output was in the
+        //     surface iteration 1 was about to overwrite. Writing iteration 0 straight into the
+        //     history surface is the same bytes, one dispatch earlier, with no copy at all --
+        //     and the surface is free at that moment, because the temporal pass read it two
+        //     dispatches ago and nothing else reads it this frame.
+        //
+        //   * The final relocation. The ping-pong alternated between the result surface and the
+        //     variance scratch starting from the result surface, so at an even iteration count
+        //     it finished in the scratch. Choosing the destinations by *parity from the end*
+        //     instead of from the start lands the last iteration in the result surface for any
+        //     count, which is what the relocation was for.
+        //
+        // The routing, for N iterations (N >= 2), with V = variance scratch, H = colour
+        // history, R = the result surface the composite reads:
+        //     variance pass -> V
+        //     iteration 0   : V -> H          (H is now defect D4's first-iteration history)
+        //     iteration i>=1: previous -> ((N-1-i) even ? R : V)
+        // so the last iteration always writes R and each reads what the one before wrote:
+        // N=2 gives V->H->R, N=3 V->H->V->R, N=4 V->H->R->V->R. At N=1 the single iteration is
+        // both the final result and the first-iteration output, so it writes R and one copy to
+        // H is still owed -- that is the one case the old code already handled minimally.
+        //
+        // This changes no shader source and no shader arithmetic: it is entirely a question of
+        // which resource view is bound to which slot. The fxc output is expected to be
+        // byte-identical, and the closeout notes record the baseline diff that proves it.
+        //
+        // One binding has to go with it. ssrt_spatial.hlsl and ssrt_variance.hlsl both declare
+        // HistoryTexture at t0 and neither references it, so fxc strips it -- but at iteration
+        // 0 that surface is now the dispatch's own destination, and binding a resource as SRV
+        // and UAV in one dispatch is a state conflict D3D11 resolves by silently dropping one.
+        // t0 is left unbound in both passes instead, which is what the shaders already assume.
 
         // variance filter
         uavs.at(0) = texVariance->uav.get();
-        srvs.at(0) = texHistoryDiffuse->srv.get();
+        srvs.at(0) = nullptr;  // (S2.8) declared at t0, never referenced
         srvs.at(1) = texMoments->srv.get();
         srvs.at(2) = normal.SRV;
         srvs.at(3) = texTemporal->srv.get();
@@ -2419,19 +2633,29 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
 
+        const int atrousN = (int)settings.AtrousIterations;
+        ID3D11ShaderResourceView* atrousSrc = texVariance->srv.get();
+
         // spatial filter
-        for (int i = 0; i < (int)settings.AtrousIterations; ++i)
+        for (int i = 0; i < atrousN; ++i)
         {
             denoiserCBData.atrousIterations = i;
             denoiserCB->Update(denoiserCBData);
             denoiserBuffer = denoiserCB->CB();
             context->CSSetConstantBuffers(2, 1, &denoiserBuffer);
-            uavs.at(0) = (i % 2 == 0) ? texSSRTDiffuseColor->uav.get() : texVariance->uav.get();
-            srvs.at(0) = texHistoryDiffuse->srv.get();
+
+            Texture2D* dst = nullptr;
+            if (i == 0)
+                dst = (atrousN == 1) ? texSSRTDiffuseColor.get() : texHistoryDiffuse.get();
+            else
+                dst = (((atrousN - 1 - i) % 2) == 0) ? texSSRTDiffuseColor.get() : texVariance.get();
+
+            uavs.at(0) = dst->uav.get();
+            srvs.at(0) = nullptr;  // (S2.8) declared at t0, never referenced; and at i == 0 it is dst
             // (spec A1) t1 = moments; see the matching binding in DrawSSRTSpecular.
             srvs.at(1) = texMoments->srv.get();
             srvs.at(2) = normal.SRV;
-            srvs.at(3) = (i % 2 == 0) ? texVariance->srv.get() : texSSRTDiffuseColor->srv.get();
+            srvs.at(3) = atrousSrc;
             srvs.at(4) = depth.depthSRV;
             // (batch 1, item 2) The hit-distance surface, which the diffuse permutation declares
             // at t5 and the specular one does not declare at all. It is the ray march's own
@@ -2448,19 +2672,26 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 
             resetViews();
 
-            // (defect D4) The history is the *first* iteration's output. i == 0 is the even
-            // leg of the ping-pong, so that output is in texSSRTDiffuseColor right now and
-            // the following iteration is about to overwrite it -- this is the only point in
-            // the frame where it can be taken.
-            if (i == 0) {
-                CopyDynamicRegion(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
+            atrousSrc = dst->srv.get();
+
+            // (defect D4) The history is the *first* iteration's output, written straight into
+            // texHistoryDiffuse at atrousN >= 2, so there is nothing left to copy.
+            if (i == 0 && atrousN >= 2)
                 historyFed = true;
-            }
         }
 
-        if (settings.AtrousIterations % 2 == 0) {
-            CopyDynamicRegion(texSSRTDiffuseColor->resource.get(), texVariance->resource.get());
+        // (S2.8) atrousN == 1 is the one case where the first iteration's output and the final
+        // result are the same surface, so one copy is still owed.
+        if (atrousN == 1 && SvgfHistoryNeeded(false) && texHistoryDiffuse) {
+            CopyDynamicRegion(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
+            historyFed = true;
         }
+
+        // (S2.8) Moment ownership swap in place of the copy the temporal pass used to need.
+        // Safe here and not earlier: the variance pass and every a-trous iteration read
+        // texMoments, and all of them have now run.
+        std::swap(texMoments, texHistoryMomentsDiffuse);
+
         Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTSvgf);
     } else if (denoiser == kDenoiserREBLUR) {
         // (batch C1) REBLUR_DIFFUSE: pack the raw 2-spp radiance plus the decoded
@@ -2475,7 +2706,9 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         (void)RunReblur(false);
     }
 
-    if (!historyFed)
+    // (S2.5) Same as the specular twin: ssrt_temporal.hlsl at t0 plus the Buffer Viewer are
+    // the whole consumer set for texHistoryDiffuse.
+    if (!historyFed && SvgfHistoryNeeded(false) && texHistoryDiffuse)
         CopyDynamicRegion(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
 
     // composite
