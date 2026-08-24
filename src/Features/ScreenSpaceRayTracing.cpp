@@ -32,6 +32,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientMult,
     EnableAmbientReinjection,
     AmbientReinjectionStrength,
+    LowResConfidenceFilter,
     TemporalAmbientConfidence,
     AmbientConfidenceMaxFrames,
     OcclusionStrength,
@@ -85,6 +86,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientMult,
     EnableAmbientReinjection,
     AmbientReinjectionStrength,
+    LowResConfidenceFilter,
     TemporalAmbientConfidence,
     AmbientConfidenceMaxFrames,
     OcclusionStrength,
@@ -195,23 +197,54 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "scenes whose on-screen surfaces are not representative of the surrounding "
                 "environment.");
 
-        ImGui::Checkbox("Accumulate Confidence Over Time", &settings.TemporalAmbientConfidence);
+        // (batch 6) The zero-lag noise fix, and the default. Placed above the temporal
+        // accumulator because it supersedes it.
+        ImGui::Checkbox("Low-Resolution Confidence Filter", &settings.LowResConfidenceFilter);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Averages the hit-confidence signal over several frames instead of relying on "
-                "the spatial blur alone. This is the fix for reinjection looking noisier than "
-                "leaving it off.\n\n"
-                "Why the denoisers could not help. Confidence is measured from only a couple of "
-                "rays per pixel, so it is grainy, and the frame's ambient light gets multiplied "
-                "by it in a pass that runs AFTER the denoiser. The graininess therefore lands in "
-                "the final image untouched, no matter which denoiser is selected or how hard it "
-                "is turned up. Averaging over time is the only place left to remove it.\n\n"
-                "Expect a clear drop in shimmer on open ground and around foliage. The average "
-                "is reset wherever the surface moves out from behind something, so it does not "
-                "smear a trail behind moving objects.\n\n"
-                "Turn it off for the previous spatial-only behaviour, for an A/B comparison.");
+                "Smooths the hit-confidence signal on a half-width, half-height grid with a wide "
+                "edge-aware blur, then upsamples it back, instead of running a small 7x7 blur at "
+                "full resolution. This is the fix for reinjection looking noisier than leaving it "
+                "off.\n\n"
+                "Why it works. Confidence is measured from only a couple of rays per pixel, and "
+                "the frame's ambient light gets multiplied by it in a pass that runs AFTER the "
+                "denoiser -- so the graininess lands in the final image untouched no matter which "
+                "denoiser is selected. Averaging 2x2 pixels together is four times the rays for "
+                "free, and on the smaller grid a much wider blur costs LESS than the old narrow "
+                "one did. Together that is about thirteen times the samples, i.e. roughly three "
+                "and a half times less flicker, for a little over half the GPU work.\n\n"
+                "It cannot smear. Nothing in this chain looks at the previous frame -- no history, "
+                "no motion vectors, no averaging over time -- so there is no trailing behind "
+                "moving objects at all. If you ever see a trail, that is a bug; please report it.\n\n"
+                "The cost is a slightly softer boundary between traced light and vanilla ambient. "
+                "It stays put instead of moving, and it is held off real edges by depth and normal "
+                "tests.\n\n"
+                "Turn it off to get the old full-resolution 7x7 path back exactly, for an A/B "
+                "comparison. Watch the 'SSRT Confidence Filter' row in the Performance Overlay to "
+                "confirm the new path is not costing more.");
 
-        if (settings.TemporalAmbientConfidence) {
+        // (batch 6) Forced off while the spatial filter runs: the two are competing answers to
+        // one question, and the accumulator is the one with lag. Disabled rather than hidden so
+        // the A/B is still discoverable.
+        ImGui::BeginDisabled(settings.LowResConfidenceFilter);
+        ImGui::Checkbox("Accumulate Confidence Over Time", &settings.TemporalAmbientConfidence);
+        ImGui::EndDisabled();
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Averages the hit-confidence signal over several frames as well as over space. "
+                "Kept only as a comparison, and off by default.\n\n"
+                "It removes the graininess, but it trails. Confidence describes the geometry "
+                "around a pixel, so the moment anything moves its correct value changes at once, "
+                "and an average over frames necessarily lags behind. Because the ambient light is "
+                "then multiplied by it, that lag shows up as bands of wrong brightness following "
+                "moving objects -- worse than the flicker it removes. No window length fixes that; "
+                "the averaging itself is the problem.\n\n"
+                "Use the Low-Resolution Confidence Filter above instead. It buys more samples "
+                "without looking at previous frames at all, so it does not trail.\n\n"
+                "Disabled while that filter is on, because the two are competing answers to the "
+                "same question. Turn the filter off if you want to try this one.");
+
+        if (settings.TemporalAmbientConfidence && !settings.LowResConfidenceFilter) {
             ImGui::SliderInt("Confidence Frames", (int*)&settings.AmbientConfidenceMaxFrames, 1, 60, "%d", ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
                 ImGui::Text(
@@ -657,6 +690,19 @@ void ScreenSpaceRayTracing::DrawSettings()
         BUFFER_VIEWER_NODE(texSSRTDiffuseColor, debugRescale)
         BUFFER_VIEWER_NODE(texSSRTDiffuseConfidence, debugRescale)
         BUFFER_VIEWER_NODE(texSSRTDiffuseConfidenceSmooth, debugRescale)
+        // (batch 6) The spatial filter's quarter-resolution working set, null until the frame
+        // after the filter first runs. texSSRTConfidenceLo is the finished low-resolution field
+        // (compare it against the raw surface two nodes up to see what the chain removes);
+        // texSSRTConfidenceLoBlur is the horizontal pass only, so a difference between the two
+        // is the vertical pass's contribution. The depth and normal guides should look like
+        // smaller copies of the G-buffer with no blur across silhouettes -- if a guide is smeared
+        // the geometric tests in the chain are being fed the wrong thing.
+        if (texSSRTConfidenceLo)
+            BUFFER_VIEWER_NODE(texSSRTConfidenceLo, debugRescale)
+        if (texSSRTConfidenceLoBlur)
+            BUFFER_VIEWER_NODE(texSSRTConfidenceLoBlur, debugRescale)
+        if (texSSRTConfidenceLoNormal)
+            BUFFER_VIEWER_NODE(texSSRTConfidenceLoNormal, debugRescale)
         // (reinjection noise) The accumulator's history. .x is the accumulated coverage -- compare
         // it against texSSRTDiffuseConfidenceSmooth above with the toggle off to see how much
         // per-frame grain the temporal window is removing -- and .z is the per-pixel frame count,
@@ -954,6 +1000,17 @@ void ScreenSpaceRayTracing::SetupResources()
         texSSRTConfidenceHistory.reset();
         texSSRTConfidenceHistoryPrev.reset();
 
+        // (batch 6) The spatial filter's quarter-resolution set, released for exactly the reason
+        // above: their extent is derived from this function's texDesc, so a set left resident
+        // across a resolution change would be addressed with a low-resolution grid the surfaces do
+        // not have -- and unlike the accumulator that is not a subtly wrong sample, it is a write
+        // outside the texture. EnsureConfidenceFilterResources rebuilds them at the new size on
+        // the next frame that needs them.
+        texSSRTConfidenceLo.reset();
+        texSSRTConfidenceLoBlur.reset();
+        texSSRTConfidenceLoDepth.reset();
+        texSSRTConfidenceLoNormal.reset();
+
         // (batch 1, item 2) The diffuse hit-distance surface. Same R8_UNORM as the confidence
         // pair above and for the same three reasons: the payload is a [0,1] fraction, 1/255 is
         // an order of magnitude below the granularity of what it steers (a smooth per-pixel
@@ -1247,6 +1304,86 @@ bool ScreenSpaceRayTracing::EnsureAmbientConfidenceResources()
     }
 
     return true;
+}
+
+// (batch 6) The spatial confidence filter's quarter-resolution working set, allocated on first
+// need on the same argument EnsureAmbientConfidenceResources makes -- and released only by a
+// resolution change, so the A/B toggle is instant in both directions.
+//
+// Half width, half height, rounded up, so that an odd render extent still has a low-resolution
+// texel covering its last column and row. Derived from the kMAIN allocation rather than from the
+// current dynamic-resolution sub-rect, because the sub-rect changes per frame while the
+// allocation does not; every pass computes the *used* extent itself from BufferDim and
+// DynamicResolutionParams1, exactly as the rest of this feature does.
+bool ScreenSpaceRayTracing::EnsureConfidenceFilterResources()
+{
+    if (texSSRTConfidenceLo && texSSRTConfidenceLoBlur && texSSRTConfidenceLoDepth && texSSRTConfidenceLoNormal)
+        return true;
+
+    logger::debug("Creating SSRT confidence filter resources...");
+
+    auto renderer = globals::game::renderer;
+    if (!renderer)
+        return false;
+
+    auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return false;
+
+    D3D11_TEXTURE2D_DESC texDesc{};
+    mainTex.texture->GetDesc(&texDesc);
+    // Same reasoning as every other surface in this feature: no RTV is created for any of these
+    // and none is passed to GenerateMips, so the render-target bind flag and its compression
+    // metadata are pure cost. MiscFlags set rather than OR-ed, because an inherited GENERATE_MIPS
+    // would fail creation once BIND_RENDER_TARGET is gone.
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    texDesc.MiscFlags = 0;
+    texDesc.MipLevels = 1;
+    texDesc.Width = std::max(1u, (texDesc.Width + 1u) / 2u);
+    texDesc.Height = std::max(1u, (texDesc.Height + 1u) / 2u);
+
+    auto makeTex = [&](eastl::unique_ptr<Texture2D>& tex, DXGI_FORMAT format, const char* name) {
+        if (tex)
+            return;
+        texDesc.Format = format;
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+            .Format = format,
+            .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+            .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+        };
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+            .Format = format,
+            .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+            .Texture2D = { .MipSlice = 0 }
+        };
+        tex = eastl::make_unique<Texture2D>(texDesc);
+        tex->CreateSRV(srvDesc);
+        tex->CreateUAV(uavDesc);
+        Util::SetResourceName(tex->resource.get(), name);
+    };
+
+    // R8_UNORM for the two confidence surfaces, for the reason the full-resolution pair carries
+    // it: the payload is a coverage fraction in [0,1] and 1/255 sits well below the residual noise
+    // of even the finished field, so the storage is not what limits the result. A UNORM read also
+    // cannot be non-finite, so no consumer needs a guard.
+    makeTex(texSSRTConfidenceLo, DXGI_FORMAT_R8_UNORM, "SSRT::ConfidenceLo");
+    makeTex(texSSRTConfidenceLoBlur, DXGI_FORMAT_R8_UNORM, "SSRT::ConfidenceLoBlur");
+    // R32_FLOAT for the depth guide, and this one is load bearing rather than conservative: the
+    // blur's plane test differences two near-equal reciprocals of it to recover the surface slope,
+    // and fp16's 11-bit mantissa would put ~1e-3 of relative noise straight into a gradient whose
+    // legitimate magnitude is 2e-3 face-on. Distant LOD terrain also runs past fp16's 65504
+    // ceiling outright.
+    makeTex(texSSRTConfidenceLoDepth, DXGI_FORMAT_R32_FLOAT, "SSRT::ConfidenceLoDepth");
+    // R8G8B8A8_SNORM for the normal guide: the components are a unit view-space vector, so a
+    // signed normalised format is the exact shape of the data, and 8 bits per axis is ~0.4 degrees
+    // of angular error against the 45 degree gate that reads it -- two orders of magnitude of
+    // headroom. The unused .w is written 0.
+    makeTex(texSSRTConfidenceLoNormal, DXGI_FORMAT_R8G8B8A8_SNORM, "SSRT::ConfidenceLoNormal");
+
+    // No clear here, unlike the accumulator: every one of these surfaces is fully rewritten by its
+    // own dispatch before anything reads it, within the same frame and before the composite, so
+    // none of them carries state and none can present undefined memory to a consumer.
+    return texSSRTConfidenceLo && texSSRTConfidenceLoBlur && texSSRTConfidenceLoDepth && texSSRTConfidenceLoNormal;
 }
 
 // (batch C1) REBLUR-path resources, allocated on first selection rather than at boot,
@@ -1583,6 +1720,19 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &preprocessDepthCS, "ssrt_preprocess_depth.hlsl", {} },
             { &depthDownsampleCS, "ssrt_depth_downsample.hlsl", {} },
             { &diffuseCompositeCS, "ssrt_diffuse_composite.hlsl", {} },
+            // (batch 6) The composite's second permutation, with the confidence smoothing
+            // compiled out because the three passes below publish that surface instead. Like
+            // definesWideKernel this define list is deliberately not built on `defines`: this file
+            // reads none of DYNAMIC_CUBEMAPS / SSGI / SKYLIGHTING / DIFFUSE_SPP, so the entry
+            // above passes {} and this one has to match it entry for entry or the two would stop
+            // being the same shader.
+            { &diffuseCompositeExternalConfCS, "ssrt_diffuse_composite.hlsl", { { "SSRT_CONF_EXTERNAL_FILTER", "1" } } },
+            // (batch 6) The spatial confidence filter. None of the three files reads any of the
+            // permutation axes above either; the blur's only axis is which way it runs.
+            { &confDownsampleCS, "ssrt_conf_downsample.hlsl", {} },
+            { &confBlurHorizontalCS, "ssrt_conf_blur.hlsl", {} },
+            { &confBlurVerticalCS, "ssrt_conf_blur.hlsl", { { "SSRT_CONF_BLUR_VERTICAL", "1" } } },
+            { &confUpsampleCS, "ssrt_conf_upsample.hlsl", {} },
             { &preblurCS, "ssrt_preblur.hlsl", {} },
             { &temporalCS, "ssrt_temporal.hlsl", {} },
             { &temporalDiagCS, "ssrt_temporal.hlsl", definesDenoiserDiag },
@@ -2609,6 +2759,17 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // bindings and the shader-side branch cannot disagree.
     bool confidenceTemporal = false;
 
+    // (batch 6) Whether the three-pass spatial confidence filter runs this frame. Decided once,
+    // here, because three separate sites depend on the same answer -- the accumulator gate below,
+    // the chain's own dispatches, and which permutation of the composite is bound -- and any
+    // disagreement between them would leave texSSRTDiffuseConfidenceSmooth written twice or not at
+    // all. The allocation is attempted as part of the predicate, before any dispatch binds it, so a
+    // failure simply selects the full-resolution 7x7 path, which is the toggle's off behaviour.
+    const bool confidenceFilter =
+        settings.EnableAmbientReinjection && settings.LowResConfidenceFilter &&
+        confDownsampleCS && confBlurHorizontalCS && confBlurVerticalCS && confUpsampleCS &&
+        diffuseCompositeExternalConfCS && EnsureConfidenceFilterResources();
+
     SSRTCB ssrCBData;
     {
         ssrCBData.MaxSteps = settings.MaxSteps;
@@ -2636,8 +2797,15 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // allocation is attempted here, before any dispatch binds it, and a failure clears the
         // flag -- the composite pass then publishes the spatial mean alone, which is exactly the
         // pre-existing behaviour.
+        //
+        // (batch 6) And gated on the spatial filter being off. The two are competing answers to
+        // one question and the accumulator is the one that lags, so the spatial filter wins --
+        // exactly as ambient reinjection wins over the diffuse cubemap fallback above. It is also
+        // a hard requirement rather than a preference: with the filter on, the composite runs the
+        // permutation that has the whole confidence block compiled out, so there is no spatial
+        // mean there for an accumulator to blend with.
         confidenceTemporal = settings.EnableAmbientReinjection && settings.TemporalAmbientConfidence &&
-                             EnsureAmbientConfidenceResources();
+                             !confidenceFilter && EnsureAmbientConfidenceResources();
         ssrCBData.TemporalAmbientConfidence = confidenceTemporal ? 1u : 0u;
         ssrCBData.AmbientConfidenceInvMaxFrames = 1.0f / (settings.AmbientConfidenceMaxFrames + 1.0f);
     }
@@ -2989,31 +3157,112 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     if (!historyFed && SvgfHistoryNeeded(false) && texHistoryDiffuse)
         CopyDynamicRegion(texHistoryDiffuse->resource.get(), texSSRTDiffuseColor->resource.get());
 
+    // (batch 6) The spatial confidence filter, in its own timing bucket so the user can confirm
+    // that the wider kernel is genuinely cheaper than the 7x7 window it replaces rather than
+    // taking that on trust. Placed here, after the denoiser and before the composite, for one
+    // reason: its input is the raw ray-march confidence (which the denoiser never touches) and its
+    // output is read by DeferredCompositeCS, which Deferred::DeferredPasses dispatches after this
+    // whole function. Nothing between those two points reads a previous frame.
+    if (confidenceFilter) {
+        state->BeginPerfEvent("SSRT Confidence Filter");
+        Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTConfidenceFilter);
+
+        // The quarter-resolution grid, rounded up exactly as every shader in the chain rounds it,
+        // and the dispatch that covers it.
+        const uint loWidth = std::max(1u, ((uint)size.x + 1u) / 2u);
+        const uint loHeight = std::max(1u, ((uint)size.y + 1u) / 2u);
+        const uint loDispatchX = (loWidth + 7u) / 8u;
+        const uint loDispatchY = (loHeight + 7u) / 8u;
+
+        // Stage 1: 2x2 depth- and normal-aware average of the raw confidence, publishing the
+        // low-resolution depth and normal guides the two stages after it are steered by.
+        srvs.at(0) = texSSRTDiffuseConfidence->srv.get();
+        srvs.at(1) = depth.depthSRV;
+        srvs.at(2) = normal.SRV;
+        uavs.at(0) = texSSRTConfidenceLo->uav.get();
+        uavs.at(1) = texSSRTConfidenceLoDepth->uav.get();
+        uavs.at(2) = texSSRTConfidenceLoNormal->uav.get();
+        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+        context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
+        context->CSSetShader(confDownsampleCS.get(), nullptr, 0);
+        context->Dispatch(loDispatchX, loDispatchY, 1);
+        resetViews();
+
+        // Stage 2: the separable pair. Horizontal reads the downsample's output and writes the
+        // scratch surface; vertical reads that back and returns to the first, so the finished field
+        // ends up in texSSRTConfidenceLo whichever way round the pair is inspected. A separable
+        // pass cannot run in place, which is the only reason there are two surfaces.
+        const auto blurPass = [&](ID3D11ComputeShader* a_shader, Texture2D* a_source, Texture2D* a_target) {
+            srvs.at(0) = a_source->srv.get();
+            srvs.at(1) = texSSRTConfidenceLoDepth->srv.get();
+            srvs.at(3) = texSSRTConfidenceLoNormal->srv.get();
+            uavs.at(0) = a_target->uav.get();
+            context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+            context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
+            context->CSSetShader(a_shader, nullptr, 0);
+            context->Dispatch(loDispatchX, loDispatchY, 1);
+            resetViews();
+        };
+        blurPass(confBlurHorizontalCS.get(), texSSRTConfidenceLo.get(), texSSRTConfidenceLoBlur.get());
+        blurPass(confBlurVerticalCS.get(), texSSRTConfidenceLoBlur.get(), texSSRTConfidenceLo.get());
+
+        // Stage 3: joint bilateral upsample onto texSSRTDiffuseConfidenceSmooth -- the same surface
+        // the 7x7 window used to write, with the same semantics and the same written region, so
+        // DeferredCompositeCS needs no change. The raw confidence at t0 is the fallback a pixel
+        // with no geometrically valid low-resolution neighbour publishes; see the degeneracy rule
+        // in ssrt_conf_upsample.hlsl.
+        srvs.at(0) = texSSRTDiffuseConfidence->srv.get();
+        srvs.at(1) = depth.depthSRV;
+        srvs.at(2) = normal.SRV;
+        srvs.at(3) = texSSRTConfidenceLo->srv.get();
+        srvs.at(4) = texSSRTConfidenceLoDepth->srv.get();
+        srvs.at(5) = texSSRTConfidenceLoNormal->srv.get();
+        uavs.at(0) = texSSRTDiffuseConfidenceSmooth->uav.get();
+        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+        context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
+        context->CSSetShader(confUpsampleCS.get(), nullptr, 0);
+        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        resetViews();
+
+        Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTConfidenceFilter);
+        state->EndPerfEvent();
+    }
+
     // composite
     Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTrace);
     {
         uavs.at(0) = main.UAV;
-        // (ambient reinjection) The pass doubles as the confidence smoothing filter: it reads
-        // the raw surface at t3 and publishes the depth-aware 7x7 mean at u1 for
-        // DeferredCompositeCS, which Deferred::DeferredPasses dispatches after this one. Folded
-        // in here rather than given its own dispatch because this pass is three texture reads
-        // of otherwise idle ALU, and because it keeps the change out of the pass schedule.
-        uavs.at(1) = texSSRTDiffuseConfidenceSmooth->uav.get();
         srvs.at(0) = texSSRTDiffuseColor->srv.get();
         srvs.at(1) = albedo.SRV;
-        srvs.at(3) = texSSRTDiffuseConfidence->srv.get();
-        srvs.at(4) = depth.depthSRV;
 
-        // (reinjection noise) The confidence accumulator's extra ends. Bound only when it runs,
-        // so with it off the compiled binding table is reached exactly as it was before: the
-        // shader's branch is a constant-buffer test, and an unbound SRV reads zero while an
-        // unbound UAV write is a no-op, neither of which the spatial-only path performs.
-        uint uavCount = 2;
-        if (confidenceTemporal) {
-            srvs.at(5) = texSSRTConfidenceHistoryPrev->srv.get();
-            srvs.at(6) = motion.SRV;
-            uavs.at(2) = texSSRTConfidenceHistory->uav.get();
-            uavCount = 3;
+        uint uavCount = 1;
+        if (!confidenceFilter) {
+            // (ambient reinjection) The pass doubles as the confidence smoothing filter: it reads
+            // the raw surface at t3 and publishes the depth-aware 7x7 mean at u1 for
+            // DeferredCompositeCS, which Deferred::DeferredPasses dispatches after this one. Folded
+            // in here rather than given its own dispatch because this pass is three texture reads
+            // of otherwise idle ALU, and because it keeps the change out of the pass schedule.
+            //
+            // (batch 6) ...and none of that is true any more once the filter above runs, which is
+            // why this whole half is now conditional. The SSRT_CONF_EXTERNAL_FILTER permutation has
+            // the block, its LDS tile and its barrier compiled out, so these bindings would have no
+            // reader; leaving u1 bound in particular would be actively misleading, since the
+            // surface it points at was written moments ago by stage 3.
+            uavs.at(1) = texSSRTDiffuseConfidenceSmooth->uav.get();
+            srvs.at(3) = texSSRTDiffuseConfidence->srv.get();
+            srvs.at(4) = depth.depthSRV;
+            uavCount = 2;
+
+            // (reinjection noise) The confidence accumulator's extra ends. Bound only when it runs,
+            // so with it off the compiled binding table is reached exactly as it was before: the
+            // shader's branch is a constant-buffer test, and an unbound SRV reads zero while an
+            // unbound UAV write is a no-op, neither of which the spatial-only path performs.
+            if (confidenceTemporal) {
+                srvs.at(5) = texSSRTConfidenceHistoryPrev->srv.get();
+                srvs.at(6) = motion.SRV;
+                uavs.at(2) = texSSRTConfidenceHistory->uav.get();
+                uavCount = 3;
+            }
         }
 
         // b1 is set at the top of this function and only b2 is written after it, so this rebind
@@ -3022,7 +3271,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         context->CSSetConstantBuffers(1, 1, &buffer);
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, uavCount, uavs.data(), nullptr);
-        context->CSSetShader(diffuseCompositeCS.get(), nullptr, 0);
+        context->CSSetShader(confidenceFilter ? diffuseCompositeExternalConfCS.get() : diffuseCompositeCS.get(), nullptr, 0);
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
 

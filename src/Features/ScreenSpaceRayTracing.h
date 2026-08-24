@@ -215,6 +215,52 @@ struct ScreenSpaceRayTracing : Feature
         /// *found*, not how well its radiance is known, so a scene whose on-screen surfaces are
         /// unrepresentative of the whole environment is better served slightly under 1.
         float AmbientReinjectionStrength = 1.0f;
+        /// @brief (batch 6) Filter the reinjection confidence at quarter resolution with a wide
+        /// separable joint-bilateral kernel and joint-bilateral upsample the result, instead of
+        /// running the depth-aware 7x7 window at full resolution inside the diffuse composite.
+        ///
+        /// **Default on.** This is the zero-lag answer to the reinjection noise that
+        /// TemporalAmbientConfidence was the wrong answer to.
+        ///
+        /// The arithmetic. Confidence is a coverage fraction estimated from DiffuseSPP directions
+        /// per pixel, 2 by default, and DeferredCompositeCS consumes it as
+        /// `ambientKeep = 1 - conf * strength` in a pass that runs *after* SVGF/REBLUR -- so its
+        /// residual noise is multiplicative, structurally downstream of the entire denoiser, and
+        /// unreachable by any denoiser setting. The only lever is how many ray samples the
+        /// estimator averages, and noise falls as 1/sqrt(N):
+        ///
+        ///   off:  49 full-resolution taps x 2 rays                 =   98 samples
+        ///   on:  159 quarter-resolution taps x 4 pixels x 2 rays   = 1274 samples
+        ///
+        /// i.e. 3.6x less noise. And it is *cheaper*, not dearer: two separable 15-tap passes over
+        /// a quarter of the texels come to about 7.5 full-resolution taps of work against the 49
+        /// the 7x7 window spent, so the wider kernel is paid for by the resolution drop. The
+        /// downsample and the upsample add one 4-tap pass each. Measured on fxc /Ges /O3 the whole
+        /// chain is 306 instruction slots per full-resolution pixel against the old composite's
+        /// 587, and it reads 8 bytes per quarter-resolution texel where the old window read 5 bytes
+        /// per full-resolution one.
+        ///
+        /// The 159 is the *effective* tap count of the separable Gaussian pair,
+        /// ((sum w)^2 / sum w^2)^2, not the 225 a 15x15 box would nominally give -- the taper is
+        /// deliberate, because every rejected tap in a box leaves a step in the filtered field and
+        /// a step in `ambientKeep` is a visible seam in the ambient.
+        ///
+        /// Why it does not lag. Every stage reads this frame only. There is no history surface, no
+        /// motion vector, no reprojection and no accumulator anywhere in the chain -- which is the
+        /// entire difference from TemporalAmbientConfidence, whose defect was not its tuning but
+        /// the accumulation itself: confidence is a geometric quantity whose correct value changes
+        /// the instant anything moves, so any temporal estimator of it trails moving objects with
+        /// bands of wrong ambient. Trading spatial reach for sample count costs a slightly softer
+        /// ambient/GI boundary instead, which is stationary and which the geometric edge stops keep
+        /// off actual silhouettes.
+        ///
+        /// Mutually exclusive with TemporalAmbientConfidence, and it wins: the accumulator is
+        /// forced off while this is on, for the same reason ambient reinjection forces the diffuse
+        /// cubemap fallback off -- they are two answers to one question and running both would
+        /// reintroduce exactly the lag this exists to avoid.
+        ///
+        /// Turn it off to get the full-resolution 7x7 path back bit for bit, for an A/B comparison.
+        bool LowResConfidenceFilter = true;
         /// @brief (reinjection noise) Temporally accumulate the reinjection confidence, in
         /// addition to the depth-aware 7x7 spatial mean that has always run.
         ///
@@ -1076,6 +1122,15 @@ struct ScreenSpaceRayTracing : Feature
     /// behaviour -- rather than to skip the pass.
     bool EnsureAmbientConfidenceResources();
 
+    /// @brief (batch 6) Allocate the quarter-resolution working set of the spatial confidence
+    /// filter on first need, on the same argument EnsureAmbientConfidenceResources makes.
+    ///
+    /// Called from DrawSSRTDiffuse on the one path that is about to bind them, so no dispatch can
+    /// find a null surface. Returns false if allocation was not attempted or failed, which is the
+    /// signal to fall back to the full-resolution 7x7 window folded into the diffuse composite --
+    /// i.e. to the behaviour the toggle's off position selects, not to skipping the smoothing.
+    bool EnsureConfidenceFilterResources();
+
     /// @brief (S2.5) Whether the SVGF history for one signal has to be maintained this frame.
     ///
     /// The history *maintenance* -- two full-screen RGBA16F colour copies plus the
@@ -1301,6 +1356,36 @@ struct ScreenSpaceRayTracing : Feature
     /// quantisation, so the storage is not what limits the result and DeferredCompositeCS's t19
     /// declaration needs no change.
     eastl::unique_ptr<Texture2D> texSSRTDiffuseConfidenceSmooth = nullptr;
+    /// @brief (batch 6) The quarter-resolution working set of the spatial confidence filter:
+    /// half width, half height, i.e. one texel per 2x2 block of render pixels.
+    ///
+    /// Why quarter resolution is the mechanism and not a shortcut. Confidence is a coverage
+    /// fraction estimated from DiffuseSPP ray directions per pixel -- two by default -- so a 2x2
+    /// average is four times the rays, exactly, with no approximation involved. Filtering on that
+    /// grid then makes a *wider* kernel *cheaper*: two separable 15-tap passes over a quarter of
+    /// the texels cost about 7.5 full-resolution taps against the 49 the 7x7 window took, while
+    /// reaching 14 full-resolution pixels instead of 3. The two together take the effective sample
+    /// count from 98 to 1274, i.e. 3.6x less noise for less GPU time -- and with zero lag,
+    /// because every stage reads only this frame.
+    ///
+    /// Four surfaces, 8 bytes per quarter-resolution texel between them (2 bytes per
+    /// full-resolution pixel, ~17 MB at a 4K allocation):
+    ///   texSSRTConfidenceLo      R8_UNORM   the downsample's output, and the vertical blur's
+    ///   texSSRTConfidenceLoBlur  R8_UNORM   the horizontal blur's output (a separable pass
+    ///                                       cannot run in place, so the pair ping-pongs)
+    ///   texSSRTConfidenceLoDepth R32_FLOAT  linear view depth. R32 rather than fp16 because the
+    ///                                       blur's plane test differences two near-equal
+    ///                                       reciprocals of it, and because distant LOD terrain
+    ///                                       runs past fp16's 65504 ceiling outright
+    ///   texSSRTConfidenceLoNormal R8G8B8A8_SNORM view-space normal, ~0.4 degrees of angular
+    ///                                       precision against the 45 degree gate that reads it
+    ///
+    /// Allocated by EnsureConfidenceFilterResources on first need rather than at boot, and
+    /// released by SetupResources so a resolution change cannot leave a mismatched extent behind.
+    eastl::unique_ptr<Texture2D> texSSRTConfidenceLo = nullptr;
+    eastl::unique_ptr<Texture2D> texSSRTConfidenceLoBlur = nullptr;
+    eastl::unique_ptr<Texture2D> texSSRTConfidenceLoDepth = nullptr;
+    eastl::unique_ptr<Texture2D> texSSRTConfidenceLoNormal = nullptr;
     /// @brief (reinjection noise) The confidence accumulator's ping-pong pair. `Prev` is read at
     /// the reprojected pixel, the other is written at this pixel; a compute pass cannot do both
     /// ends in one surface without racing, so there are two.
@@ -1438,6 +1523,17 @@ struct ScreenSpaceRayTracing : Feature
     winrt::com_ptr<ID3D11ComputeShader> prepareColorCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> depthDownsampleCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> diffuseCompositeCS = nullptr;
+    /// @brief (batch 6) The SSRT_CONF_EXTERNAL_FILTER permutation of ssrt_diffuse_composite.hlsl:
+    /// the colour composite with the confidence smoothing, its LDS tile and its barrier compiled
+    /// away, for use when the three-pass filter below publishes that surface instead.
+    winrt::com_ptr<ID3D11ComputeShader> diffuseCompositeExternalConfCS = nullptr;
+    /// @brief (batch 6) The spatial confidence filter: 2x2 depth- and normal-aware downsample,
+    /// two 15-tap separable joint-bilateral blurs at quarter resolution, joint-bilateral upsample.
+    /// The two blur entries are the horizontal and vertical permutations of one file.
+    winrt::com_ptr<ID3D11ComputeShader> confDownsampleCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> confBlurHorizontalCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> confBlurVerticalCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> confUpsampleCS = nullptr;
     /// @brief (batch 1, item 1) ssrt_preblur.hlsl. Nullptr if it failed to compile, in which
     /// case the diffuse chain runs exactly as it did before the pass existed -- including
     /// handing the temporal pass the real FireflyClampSigma back.

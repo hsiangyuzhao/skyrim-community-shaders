@@ -7,6 +7,21 @@
 
 Texture2D<float4> SSRTDiffuseTexture : register(t0);
 Texture2D<float4> AlbedoTexture : register(t1);
+
+RWTexture2D<float4> ColorTextureRW : register(u0);
+
+// (batch 6) SSRT_CONF_EXTERNAL_FILTER strips this pass back to the colour composite alone.
+// The confidence smoothing has moved out into its own three-pass chain -- quarter-resolution
+// downsample, wide separable joint bilateral blur, joint bilateral upsample -- which publishes
+// the same surface with the same semantics from about 16x the ray samples for less GPU time.
+// See ssrt_conf_filter.hlsli.
+//
+// A permutation rather than a constant-buffer branch, for two reasons: the stripped version
+// pays nothing at all (no LDS, no tile prefetch, no barrier, no 49 taps, three fewer SRVs and
+// two fewer UAVs), and the unstripped version stays byte-identical to the shader that shipped
+// before this change, which is what makes the user-facing toggle a real A/B rather than an
+// approximation of one.
+#ifndef SSRT_CONF_EXTERNAL_FILTER
 // (ambient reinjection) Raw per-pixel hit confidence straight from the ray march, and the
 // depth buffer the smoothing below uses as its edge stop.
 Texture2D<float> SSRTConfidenceTexture : register(t3);
@@ -17,7 +32,6 @@ Texture2D<float> DepthTexture : register(t4);
 Texture2D<float4> ConfidenceHistoryTexture : register(t5);
 Texture2D<float4> MotionVectorTexture : register(t6);
 
-RWTexture2D<float4> ColorTextureRW : register(u0);
 // (ambient reinjection) Smoothed confidence, consumed by DeferredCompositeCS (which
 // Deferred::DeferredPasses dispatches after DrawSSRTDiffuse, so it always reads this frame's
 // values). Spatial mean alone, or the temporal accumulation of it -- see below.
@@ -25,7 +39,9 @@ RWTexture2D<float> SSRTConfidenceSmoothRW : register(u1);
 // (reinjection noise) This frame's accumulator state, which the C++ side swaps into
 // ConfidenceHistoryTexture for the next frame.
 RWTexture2D<float4> ConfidenceHistoryRW : register(u2);
+#endif
 
+#ifndef SSRT_CONF_EXTERNAL_FILTER
 // (reinjection noise) Mirrors ScreenSpaceRayTracing::SSRTCB. Only the last two members are read
 // here; the eight before them are declared because a constant buffer cannot be entered at an
 // offset. ssrt_raymarch.hlsl declares the same buffer up to UseBlueNoise and is the other
@@ -48,7 +64,9 @@ cbuffer SSRTCB : register(b1)
     // 1 / (AmbientConfidenceMaxFrames + 1): the floor on the accumulator's blend weight.
     float AmbientConfidenceInvMaxFrames;
 }
+#endif
 
+#ifndef SSRT_CONF_EXTERNAL_FILTER
 // (ambient reinjection) Why the confidence has to be smoothed before anything lerps with it.
 //
 // Confidence is a *coverage* quantity: the cosine-weighted fraction of the hemisphere in
@@ -143,9 +161,11 @@ cbuffer SSRTCB : register(b1)
 
 groupshared float g_ssrtConfTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
 groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
+#endif
 
 [numthreads(8, 8, 1)] void main(uint3 dispatchID : SV_DispatchThreadID, uint3 groupThreadID : SV_GroupThreadID, uint3 groupID : SV_GroupID)
 {
+#ifndef SSRT_CONF_EXTERNAL_FILTER
     // (audit #7) The render extent, matching every other pass in this feature: the dispatch,
     // the ray march's traversal grid and the pyramid's valid area all agree on it, and it is
     // what the tile fill has to clamp against.
@@ -172,6 +192,7 @@ groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
     }
     GroupMemoryBarrierWithGroupSync();
     // ---- prefetch complete; early returns are safe from here on ----
+#endif
 
     // (audit P9) SharedData::BufferDim.xy is the same full-resolution extent
     // ColorTextureRW.GetDimensions() returned (this UAV is the kMAIN render target), so
@@ -179,6 +200,7 @@ groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
     if (any(dispatchID.xy >= uint2(SharedData::BufferDim.xy)))
         return;
 
+#ifndef SSRT_CONF_EXTERNAL_FILTER
     {
         const int2 c = int2(groupThreadID.xy) + SSRT_CONF_BLUR_RADIUS;
         const uint centreSlot = c.y * SSRT_CONF_TILE + c.x;
@@ -306,6 +328,7 @@ groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
 
         SSRTConfidenceSmoothRW[dispatchID.xy] = publishedConf;
     }
+#endif
 
     float4 ssrtDiffuse = SSRTDiffuseTexture[dispatchID.xy];
     // (guard G9) The last gate in the chain, and the one that decides whether an SSRT
