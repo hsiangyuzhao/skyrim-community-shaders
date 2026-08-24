@@ -8,6 +8,7 @@
 
 #include "State.h"
 #include "Util.h"
+#include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PhysicalSky::Settings,
@@ -623,6 +624,8 @@ void PhysicalSky::GenerateLuts()
 		std::array<ID3D11ShaderResourceView*, 2> srvs = {};
 		ID3D11UnorderedAccessView* uav = nullptr;
 
+		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::PhysicalSkyLuts);
+
 		/* ---- DISPATCH ---- */
 		context->CSSetSamplers(0, (int)samplers.size(), samplers.data());
 
@@ -653,6 +656,8 @@ void PhysicalSky::GenerateLuts()
 		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 		context->CSSetShader(csApLutGen.get(), nullptr, 0);
 		context->Dispatch((kApLutW + 7) >> 3, (kApLutH + 7) >> 3, 1);
+
+		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::PhysicalSkyLuts);
 
 		/* ---- RESTORE ---- */
 		samplers.fill(nullptr);
@@ -696,12 +701,16 @@ void PhysicalSky::AccumShadow()
 		};
 		auto uav = texApShadow->uav.get();
 
+		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::PhysicalSkyShadowAccum);
+
 		/* ---- DISPATCH ---- */
 		context->CSSetSamplers(0, 1, &sampler);
 		context->CSSetShaderResources(0, (int)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 		context->CSSetShader(csShadowAccum.get(), nullptr, 0);
 		context->Dispatch((resolution[0] + 7u) >> 3, (resolution[1] + 7u) >> 3, 1);
+
+		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::PhysicalSkyShadowAccum);
 
 		/* ---- RESTORE ---- */
 		sampler = nullptr;

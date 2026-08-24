@@ -4,6 +4,7 @@
 #include "Features/TerrainBlending.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SubsurfaceScattering::DiffusionProfile,
 	BlurRadius, Thickness, Strength, Falloff)
@@ -205,6 +206,8 @@ void SubsurfaceScattering::DrawSSS()
 
 	validMaterials = false;
 
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SubsurfaceScattering);
+
 	auto dispatchCount = Util::GetScreenDispatchCount();
 
 	{
@@ -318,6 +321,8 @@ void SubsurfaceScattering::DrawSSS()
 			context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
 		}
 	}
+
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SubsurfaceScattering);
 
 	ID3D11Buffer* buffer = nullptr;
 	context->CSSetConstantBuffers(1, 1, &buffer);

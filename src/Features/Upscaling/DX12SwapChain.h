@@ -142,6 +142,20 @@ public:
 	// Returns the current frame time (in seconds) for accurate FPS calculation when frame generation is active
 	float GetFrameTime() const;
 
+	/**
+	 * @brief Measured presentation multiplier reported by DLSS-G, smoothed.
+	 *
+	 * DLSS-G's `numFramesActuallyPresented` counts the frames the swap chain put on
+	 * screen since the previous state query, i.e. presented frames per rendered frame.
+	 * Present() already performs exactly one state query per rendered frame, so this
+	 * is the real presentation cadence rather than an assumed 2x.
+	 *
+	 * @return >0 once DLSS-G has reported a cadence; 0 when no measurement exists
+	 *         (frame generation off, FSR 3 frame generation, or DLSS-G not reporting).
+	 *         Callers must fall back to an estimate and label it as such.
+	 */
+	float GetMeasuredPresentMultiplier() const { return measuredPresentMultiplier; }
+
 	void CreateD3D12Device(IDXGIAdapter* a_adapter);
 	void CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
 
@@ -186,4 +200,8 @@ private:
 	uint32_t dlssGResumeWarmupFrameIndex = UINT32_MAX;
 	bool dlssGMapUnexpectedGeneratedFramesLogged = false;
 	bool dlssGWaitingForResources = false;
+
+	// Smoothed presented-frames-per-rendered-frame, fed from the DLSS-G state query
+	// already issued once per Present. 0 means "never measured".
+	float measuredPresentMultiplier = 0.0f;
 };

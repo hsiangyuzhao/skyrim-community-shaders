@@ -3,6 +3,7 @@
 #include "Deferred.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/GpuTimers.h"
 
 ID3D11VertexShader* TerrainBlending::GetTerrainVertexShader()
 {
@@ -133,7 +134,9 @@ void TerrainBlending::ResetDepth()
 	auto context = globals::d3d::context;
 
 	auto dsv = terrainDepth.views[0];
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::TerrainBlending);
 	context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0u);
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::TerrainBlending);
 }
 
 void TerrainBlending::ResetTerrainDepth()
@@ -150,6 +153,10 @@ void TerrainBlending::ResetTerrainDepth()
 void TerrainBlending::BlendPrepassDepths()
 {
 	auto context = globals::d3d::context;
+	// Second of the three Terrain Blending intervals (clear / blend+copy / blended
+	// passes). They accumulate into one bucket because the vanilla depth prepass runs
+	// between them and must not be counted.
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::TerrainBlending);
 	context->OMSetRenderTargets(0, nullptr, nullptr);
 
 	auto dispatchCount = Util::GetScreenDispatchCount();
@@ -182,6 +189,8 @@ void TerrainBlending::BlendPrepassDepths()
 	auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 
 	context->CopyResource(terrainDepth.texture, mainDepth.texture);
+
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::TerrainBlending);
 }
 
 void TerrainBlending::ClearShaderCache()
@@ -294,6 +303,7 @@ void TerrainBlending::RenderTerrainBlendingPasses()
 	context->PSSetShaderResources(55, 1, &view);
 
 	if (!terrainRenderPasses.empty() || !renderPasses.empty()) {
+		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::TerrainBlending);
 		GET_INSTANCE_MEMBER(alphaBlendMode, shadowState)
 		GET_INSTANCE_MEMBER(alphaBlendWriteMode, shadowState)
 		GET_INSTANCE_MEMBER(depthStencilDepthMode, shadowState)
@@ -322,6 +332,7 @@ void TerrainBlending::RenderTerrainBlendingPasses()
 
 		terrainRenderPasses.clear();
 		renderPasses.clear();
+		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::TerrainBlending);
 	}
 
 	auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];

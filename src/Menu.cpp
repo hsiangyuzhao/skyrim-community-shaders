@@ -590,6 +590,11 @@ void Menu::DrawFooter()
  */
 void Menu::DrawOverlay()
 {
+	// Sample the frame clock before anything can bail out. The Performance Overlay must
+	// see every Present, otherwise hiding it freezes the clock and the first frame after
+	// unhiding is recorded as one enormous sample inside the statistics window.
+	globals::features::performanceOverlay.AdvanceFrameClock();
+
 	// Process deferred font reload BEFORE any ImGui operations
 	// This is the safest place to do font atlas modifications
 	if (pendingFontReload) {

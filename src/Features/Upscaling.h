@@ -118,6 +118,8 @@ public:
 	// FG FPS Measurement for Overlay
 	bool IsFrameGenerationActive() const;
 	float GetFrameGenerationFrameTime() const;
+	/// @brief Measured presented-frames-per-rendered-frame, or 0 when unavailable (see DX12SwapChain).
+	float GetFrameGenerationPresentMultiplier() const;
 	bool IsUpscalingActive();
 
 	// Feature interface overrides

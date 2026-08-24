@@ -99,8 +99,14 @@ namespace Util
 	/**
 	 * Calculates the "other" frame time (total frame time minus measured sum).
 	 *
+	 * Both arguments must come from the SAME clock and the same frame. In practice that
+	 * means CPU QueryPerformanceCounter attribution only: GPU timestamp measurements are
+	 * a different clock, are read back several frames late, and can overlap each other
+	 * and the CPU timeline, so subtracting them here yields a meaningless (frequently
+	 * negative) result rather than a residual.
+	 *
 	 * @param totalFrameTime The total frame time
-	 * @param measuredSum The sum of all measured frame times
+	 * @param measuredSum The sum of all measured frame times, same clock domain
 	 * @return The remaining frame time not accounted for by measured components
 	 */
 	float CalculateOtherFrameTime(float totalFrameTime, float measuredSum);

@@ -6,6 +6,7 @@
 #include "JiayeStatement.h"
 #include "State.h"
 #include "Util.h"
+#include "Utils/GpuTimers.h"
 
 #include "Features/Upscaling.h"
 
@@ -523,6 +524,9 @@ void PostProcessing::DrawBeforeUpscaling()
 	PostProcessFeature::TextureInfo lastTexColor = { gameTexMain.texture, gameTexMain.SRV };
 
 	state->BeginPerfEvent("[Post Processing] Pre-Upscale");
+	// First of the two post-processing legs. Both accumulate into one bucket so the row
+	// reads as the cost of the whole chain.
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::PostProcessing);
 
 	// go through each fx
 	for (auto& pipe : pipeline) {
@@ -554,6 +558,7 @@ void PostProcessing::DrawBeforeUpscaling()
 		context->CopySubresourceRegion(gameTexMain.texture, 0, 0, 0, 0, texCopy->resource.get(), 0, nullptr);
 	}
 
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::PostProcessing);
 	state->EndPerfEvent();
 }
 
@@ -572,6 +577,9 @@ void PostProcessing::PreProcess()
 	auto gameTexMain = isrefraction ? renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN_COPY] : renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 	PostProcessFeature::TextureInfo lastTexColor = { gameTexMain.texture, gameTexMain.SRV };
 	auto gameTexMainAlt = isrefraction ? renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN] : renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN_COPY];
+
+	// Second post-processing leg; accumulates into the same bucket as the pre-upscale leg.
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::PostProcessing);
 
 	// go through each fx
 	for (auto& pipe : pipeline) {
@@ -612,6 +620,8 @@ void PostProcessing::PreProcess()
 		context->CopySubresourceRegion(gameTexMain.texture, 0, 0, 0, 0, texCopy->resource.get(), 0, nullptr);
 		context->CopySubresourceRegion(gameTexMainAlt.texture, 0, 0, 0, 0, texCopy->resource.get(), 0, nullptr);
 	}
+
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::PostProcessing);
 
 	isrefraction = false;
 }

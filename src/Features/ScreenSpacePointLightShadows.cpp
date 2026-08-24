@@ -4,6 +4,7 @@
 #include "LightLimitFix.h"
 #include "State.h"
 #include "Util.h"
+#include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ScreenSpacePointLightShadows::Settings,
@@ -196,6 +197,7 @@ void ScreenSpacePointLightShadows::PrepareDepth()
 	auto renderer = globals::game::renderer;
 
 	state->BeginPerfEvent("ScreenSpacePointLightShadows::PrepareDepth");
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSPLS);
 
 	auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 	context->CSSetShaderResources(0, 1, &depth.depthSRV);
@@ -272,6 +274,7 @@ void ScreenSpacePointLightShadows::PrepareDepth()
 	cb = nullptr;
 	context->CSSetConstantBuffers(1, 1, &cb);
 
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSPLS);
 	state->EndPerfEvent();
 }
 

@@ -5,6 +5,7 @@
 
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/GpuTimers.h"
 
 constexpr auto MIPLEVELS = 8;
 
@@ -314,6 +315,11 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 	auto renderer = globals::game::renderer;
 	auto context = globals::d3d::context;
 
+	// One of capture / inferrence / irradiance runs per frame in a round-robin, and all
+	// three report into the same bucket, so the smoothed row reads as the amortised
+	// per-frame cost of keeping the cubemap up to date.
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::DynamicCubemaps);
+
 	auto& depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 	auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 
@@ -379,12 +385,16 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 
 	ID3D11SamplerState* nullSampler = { nullptr };
 	context->CSSetSamplers(0, 1, &nullSampler);
+
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::DynamicCubemaps);
 }
 
 void DynamicCubemaps::Inferrence(bool a_reflections)
 {
 	auto renderer = globals::game::renderer;
 	auto context = globals::d3d::context;
+
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::DynamicCubemaps);
 
 	// Infer local reflection information
 	ID3D11UnorderedAccessView* uav = envInferredTexture->uav.get();
@@ -417,11 +427,15 @@ void DynamicCubemaps::Inferrence(bool a_reflections)
 
 	ID3D11SamplerState* sampler = nullptr;
 	context->CSSetSamplers(0, 1, &sampler);
+
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::DynamicCubemaps);
 }
 
 void DynamicCubemaps::Irradiance(bool a_reflections)
 {
 	auto context = globals::d3d::context;
+
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::DynamicCubemaps);
 
 	// Copy cubemap to other resources
 	for (uint face = 0; face < 6; face++) {
@@ -468,6 +482,8 @@ void DynamicCubemaps::Irradiance(bool a_reflections)
 	context->CSSetShader(nullptr, 0, 0);
 	context->CSSetConstantBuffers(0, 1, &nullBuffer);
 	context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::DynamicCubemaps);
 }
 
 void DynamicCubemaps::UpdateCubemap()

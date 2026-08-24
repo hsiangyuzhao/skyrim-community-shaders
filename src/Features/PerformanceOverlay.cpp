@@ -86,17 +86,20 @@ auto MakeMetricColumn(const auto& theme, auto valueGetter, auto colorGetter, aut
 // --- Helper Functions ---
 /**
   * @brief Calculates summary data (Other frame time, percentages, cost per call) from measured sum
+  *
+  * `measuredSum` must contain CPU attribution only. GPU timestamp buckets are shown in
+  * their own table and are deliberately NOT subtracted here: they are sampled on the GPU
+  * clock, read back several frames later, and overlap both each other and the CPU
+  * timeline, so subtracting them from a CPU frame-time sample is not a residual - it just
+  * drove "Other" negative.
+  *
   * @param smoothedFrameTime The total smoothed frame time
-  * @param measuredSum The sum of measured frame times
+  * @param measuredSum The sum of measured per-shader CPU frame times
   * @return Tuple of (otherFrameTime, otherPercent, totalCostPerCall)
   */
 static std::tuple<float, float, float> CalculateSummaryData(float smoothedFrameTime, float measuredSum)
 {
 	float totalSmoothedDrawCalls = globals::state->GetTotalSmoothedDrawCalls();
-	// GPU-timed feature buckets (SSRT, denoisers, SSGI, Contact AO) explain frame time the
-	// per-shader CPU attribution cannot see; count them as measured so "Other" shrinks by
-	// exactly what those rows display.
-	measuredSum += Util::GpuPassTimers::GetSingleton()->GetActiveBucketsTotalMs();
 	float otherFrameTime = Util::CalculateOtherFrameTime(smoothedFrameTime, measuredSum);
 	float otherPercent = Util::CalculatePercentage(otherFrameTime, smoothedFrameTime);
 	float totalCostPerCall = Util::CalculateCostPerCall(smoothedFrameTime, totalSmoothedDrawCalls);
@@ -255,7 +258,15 @@ void PerformanceOverlay::RestoreDefaultSettings()
 	this->state.maxFrameTime = 0.0f;
 	this->state.smoothedMinFrameTime = 0.0f;
 	this->state.smoothedMaxFrameTime = 50.0f;
-	this->state.statsWindow.Resize(PerformanceOverlay::Settings::kStatsWindowFrames);
+	// Statistics must actually restart, not merely keep their capacity: leaving old
+	// samples in place made Avg / 1% Low keep reporting the pre-restore state for
+	// seconds afterwards.
+	this->state.statsWindow.Resize(PerformanceOverlay::Settings::kStatsWindowMaxFrames);
+	this->state.statsWindow.Clear();
+	this->state.frameTimeHistory.Clear();
+	this->state.postFGFrameTimeHistory.Clear();
+	this->state.postFGIsMeasured = false;
+	this->state.postFGMultiplier = 0.0f;
 }
 
 void PerformanceOverlay::DataLoaded()
@@ -263,8 +274,10 @@ void PerformanceOverlay::DataLoaded()
 	// Initialize performance overlay state
 	REX::W32::QueryPerformanceFrequency(&this->state.frequency);
 	REX::W32::QueryPerformanceCounter(&this->state.lastFrameCounter);
+	this->state.frameClockPrimed = true;
 	this->state.frameTimeHistory.Resize(this->settings.FrameHistorySize);
 	this->state.postFGFrameTimeHistory.Resize(this->settings.FrameHistorySize);
+	this->state.statsWindow.Resize(PerformanceOverlay::Settings::kStatsWindowMaxFrames);
 }
 
 void PerformanceOverlay::DrawOverlay()
@@ -288,9 +301,10 @@ void PerformanceOverlay::DrawOverlay()
 	}
 
 	// Build draw call rows ONCE per frame and reuse
-	auto [mainRows, summaryRows] = this->BuildDrawCallRows();
-	std::vector<DrawCallRow> allRows = mainRows;
-	allRows.insert(allRows.end(), summaryRows.begin(), summaryRows.end());
+	auto rowSets = this->BuildDrawCallRows();
+	std::vector<DrawCallRow> allRows = rowSets.cpuRows;
+	allRows.insert(allRows.end(), rowSets.gpuRows.begin(), rowSets.gpuRows.end());
+	allRows.insert(allRows.end(), rowSets.summaryRows.begin(), rowSets.summaryRows.end());
 
 	// Set window flags - no decoration and only movable when ShowBorder is true
 	ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize;
@@ -376,8 +390,8 @@ void PerformanceOverlay::DrawOverlay()
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 1.0f));  // Tighter spacing
 	ImGui::SetWindowFontScale(this->settings.TextSize);
 
-	// Update graph values
-	this->UpdateGraphValues();
+	// Frame sampling deliberately does NOT happen here - it runs on every Present via
+	// AdvanceFrameClock() so hiding the overlay cannot inject a bogus sample.
 
 	// Show FPS counter if enabled
 	if (this->settings.ShowFPS) {
@@ -386,7 +400,8 @@ void PerformanceOverlay::DrawOverlay()
 
 	// Show Draw Calls if enabled
 	if (this->settings.ShowDrawCalls) {
-		DrawDrawCallsTable(mainRows, summaryRows);
+		DrawDrawCallsTable(rowSets.cpuRows, rowSets.summaryRows);
+		DrawGpuPassTable(rowSets.gpuRows);
 	}
 
 	// VRAM & GPU Usage
@@ -424,46 +439,32 @@ void PerformanceOverlay::DrawFPS()
 			}
 		}
 
-		// Rolling statistics over the last kStatsWindowFrames frames: average and 1% Low,
-		// shown alongside the instantaneous value so short stutters remain visible in the
-		// numbers even when the instant readout looks fine.
+		// Rolling statistics over the trailing kStatsWindowSeconds of frames: average and
+		// 1% Low, shown alongside the instantaneous value so short stutters stay visible
+		// in the numbers even when the instant readout looks fine.
 		{
-			auto windowData = this->state.statsWindow.GetData();
-			std::vector<float> validFrames;
-			validFrames.reserve(windowData.size());
-			for (float ft : windowData) {
-				if (ft > 0.0f)
-					validFrames.push_back(ft);
-			}
+			const FrameStats stats = ComputeFrameStats();
 
 			ImGui::TableNextColumn();
-			ImGui::Text("Avg (%d):", Settings::kStatsWindowFrames);
+			ImGui::Text("Avg (%.0fs):", Settings::kStatsWindowSeconds);
 			ImGui::TableNextColumn();
-			if (validFrames.size() >= static_cast<size_t>(Settings::kStatsWindowFrames)) {
-				float avgFrameTime = std::accumulate(validFrames.begin(), validFrames.end(), 0.0f) / validFrames.size();
-				float avgFps = Util::CalcFPS(avgFrameTime);
-				ImGui::Text("%.1f (%.2f ms)", avgFps, avgFrameTime);
+			if (stats.valid) {
+				ImGui::Text("%.1f (%.2f ms)", Util::CalcFPS(stats.averageMs), stats.averageMs);
 				if (ImGui::IsItemHovered()) {
 					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("Average frame time over the last %d frames.", Settings::kStatsWindowFrames);
+						ImGui::Text("Mean frame time over the last %.1f s (%d frames).\nSampled every Present, so hiding the overlay does not\nbreak the window. Frames slower than %.0f ms (loading\nscreens, alt-tab) are excluded.",
+							stats.seconds, stats.frames, Settings::kStatsMaxSampleMs);
 					}
 				}
-
-				// 99th percentile frame time == "1% Low": 99% of recent frames were faster.
-				size_t p99Index = (validFrames.size() * 99) / 100;
-				if (p99Index >= validFrames.size())
-					p99Index = validFrames.size() - 1;
-				std::nth_element(validFrames.begin(), validFrames.begin() + p99Index, validFrames.end());
-				float p99FrameTime = validFrames[p99Index];
-				float lowFps = Util::CalcFPS(p99FrameTime);
 
 				ImGui::TableNextColumn();
 				ImGui::Text("1%% Low:");
 				ImGui::TableNextColumn();
-				ImGui::Text("%.1f (%.2f ms)", lowFps, p99FrameTime);
+				ImGui::Text("%.1f (%.2f ms)", Util::CalcFPS(stats.percentile99Ms), stats.percentile99Ms);
 				if (ImGui::IsItemHovered()) {
 					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("99th percentile frame time over the last %d frames:\n99%% of frames were faster than this. Captures stutter\nthat averages hide.", Settings::kStatsWindowFrames);
+						ImGui::Text("Exact definition: 99th-percentile frame time over the\nsame %.1f s / %d frame window, i.e. the (0.99 x N)-th\nslowest frame. 99%% of frames were faster than this.\nWith %d frames in the window it sits on roughly the\n%d-th slowest frame, so it reflects repeated stutter\nrather than one outlier.",
+							stats.seconds, stats.frames, stats.frames, std::max(1, stats.frames / 100));
 					}
 				}
 			} else {
@@ -480,7 +481,23 @@ void PerformanceOverlay::DrawFPS()
 			ImGui::TableNextColumn();
 			ImGui::Text("Post-FG FPS:");
 			ImGui::TableNextColumn();
-			ImGui::Text("%.1f (%.2f ms)", this->state.postFGSmoothFps, this->state.postFGSmoothFrameTimeMs);
+			if (this->state.postFGIsMeasured) {
+				ImGui::Text("%.1f (%.2f ms)", this->state.postFGSmoothFps, this->state.postFGSmoothFrameTimeMs);
+				if (ImGui::IsItemHovered()) {
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("Measured: the frame-generation backend reported %.2f\npresented frames per rendered frame.", this->state.postFGMultiplier);
+					}
+				}
+			} else {
+				ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "%.1f (%.2f ms) est.",
+					this->state.postFGSmoothFps, this->state.postFGSmoothFrameTimeMs);
+				if (ImGui::IsItemHovered()) {
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("Estimate, not a measurement: the backend reports no\npresentation cadence, so a fixed %.0fx multiplier is\nassumed. Raw FPS, Avg and 1%% Low above are always\nmeasured pre-frame-generation values.",
+							Settings::kFrameGenerationMultiplier);
+					}
+				}
+			}
 		}
 
 		ImGui::EndTable();
@@ -527,18 +544,21 @@ void PerformanceOverlay::DrawFPS()
 
 	// Show Post-FG frametime graph if enabled
 	if (this->settings.ShowPostFGFrameTimeGraph && this->state.isFrameGenerationActive) {
-		// Check if FSR frame generation is active (FSR doesn't provide timing data)
-		bool isFrameGenActive = globals::features::upscaling.IsFrameGenerationActive();
-
-		if (isFrameGenActive) {
-			// Show note that FSR uses calculated data
-			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Post-FG: Calculated timing (2x Pre-FG)");
+		// State the provenance of the post-FG curve explicitly. Only DLSS-G reports a
+		// presented-frame count; FSR 3 frame generation does not, so its curve is the
+		// pre-FG curve scaled by a fixed multiplier and must be labelled as an estimate.
+		if (this->state.postFGIsMeasured) {
+			ImGui::Text("Post-FG: measured (%.2fx presented frames)", this->state.postFGMultiplier);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("AMD FSR Frame Generation uses calculated timing data (2x Pre-FG).\nNVIDIA DLSS Frame Generation provides measured timing data.");
+				ImGui::TextUnformatted("Presented-frame count reported by the frame-generation backend,\nsampled once per rendered frame.");
+			}
+		} else {
+			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Post-FG: estimated (%.0fx Pre-FG)", Settings::kFrameGenerationMultiplier);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("The active frame-generation backend reports no presentation\ncadence, so this curve is the Pre-FG curve divided by a fixed\nmultiplier. Treat it as an estimate.");
 			}
 		}
 
-		// Show post-FG graph for both DLSS and FSR (FSR uses calculated data)
 		this->DrawPostFGFrameTimeGraph();
 	}
 }
@@ -1397,6 +1417,81 @@ void PerformanceOverlay::DrawDrawCallsTable(const std::vector<DrawCallRow>& main
 	}
 }
 
+/**
+ * @brief Renders the GPU timestamp buckets as their own table.
+ *
+ * Kept separate from the draw-call table on purpose. These numbers come from D3D11
+ * timestamp queries on the GPU clock, are read back a few frames late, and can overlap
+ * each other and the CPU timeline. Mixing them into the CPU attribution and subtracting
+ * them from "Other" was the bug that produced negative residuals; here they are simply
+ * reported, and the summary row is an honest sum of the buckets rather than a residual.
+ *
+ * @param gpuRows Bucket rows built by BuildDrawCallRows(); empty when no bucket is active.
+ */
+void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRows)
+{
+	if (gpuRows.empty())
+		return;
+
+	auto& overlay = globals::features::performanceOverlay;
+	auto* menu = Menu::GetSingleton();
+	const auto& theme = menu->GetTheme();
+
+	ImGui::Spacing();
+	ImGui::TextUnformatted("GPU Passes (timestamp queries)");
+	if (ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted(
+				"GPU time for Community Shaders' own passes, measured with D3D11 timestamp\n"
+				"queries and smoothed. Separate from the table above:\n"
+				"  - GPU clock, not the CPU QueryPerformanceCounter clock\n"
+				"  - read back a few frames late, so give it a second to settle\n"
+				"  - passes overlap each other and the CPU, so these do NOT sum to frame time\n"
+				"  - never subtracted from \"Other\" above\n"
+				"A row disappears about a second after its feature stops running, so the table\n"
+				"shows exactly what the current settings are actually executing.");
+		}
+	}
+
+	bool anyTestData = !overlay.testData.empty();
+	auto legends = overlay.BuildDrawCallLegends(theme, anyTestData);
+	auto columns = overlay.BuildDrawCallTableColumns(theme, legends, anyTestData);
+
+	std::vector<std::function<bool(const DrawCallRow&, const DrawCallRow&, bool)>> sorters;
+	for (const auto& col : columns)
+		sorters.push_back(col.sortFunc);
+
+	std::vector<DrawCallRow> gpuRowsCopy = gpuRows;
+
+	// Sum of the buckets. Not a residual and not a share of frame time; just "how much
+	// GPU time the instrumented passes accounted for".
+	float bucketSum = 0.0f;
+	for (const auto& row : gpuRows)
+		bucketSum += row.frameTime;
+	const float smoothedFrameTime = static_cast<float>(this->state.smoothFrameTimeMs);
+
+	std::vector<DrawCallRow> gpuSummaryRows;
+	gpuSummaryRows.push_back(DrawCallRow{
+		"Measured GPU:", kGpuTotalRowId, kDrawCallsNotApplicable, bucketSum,
+		Util::CalculatePercentage(bucketSum, smoothedFrameTime), 0.0f,
+		std::string("Sum of the GPU buckets above. Because these passes can overlap each other "
+					"and the rest of the frame, this is not a share of frame time and not a "
+					"residual - it is the total GPU time the instrumented passes reported."),
+		true, std::nullopt, std::nullopt });
+
+	auto rowHandler = overlay.CreateTableRowHandler(columns);
+
+	Util::ShowSortedStringTableCustom<DrawCallRow>(
+		"GpuPassOverlayTable",
+		[&columns]() { std::vector<std::string> h; for (const auto& c : columns) h.push_back(c.header); return h; }(),
+		gpuRowsCopy,
+		2,      // Default sort column (GPU Time %)
+		false,  // Default descending (most expensive first)
+		sorters,
+		rowHandler,
+		gpuSummaryRows);
+}
+
 DrawCallLegends PerformanceOverlay::BuildDrawCallLegends(const Menu::ThemeSettings& theme, bool anyTestData) const
 {
 	(void)anyTestData;
@@ -1575,9 +1670,10 @@ std::vector<ColumnConfig> PerformanceOverlay::BuildDrawCallTableColumns(const Me
 	return columns;
 }
 
-std::pair<std::vector<DrawCallRow>, std::vector<DrawCallRow>> PerformanceOverlay::BuildDrawCallRows() const
+PerformanceOverlay::DrawCallRowSets PerformanceOverlay::BuildDrawCallRows() const
 {
 	std::vector<DrawCallRow> mainRows;
+	std::vector<DrawCallRow> gpuRows;
 	float smoothedFrameTime = static_cast<float>(this->state.smoothFrameTimeMs);
 	float measuredSum = 0.0f;
 
@@ -1599,13 +1695,17 @@ std::pair<std::vector<DrawCallRow>, std::vector<DrawCallRow>> PerformanceOverlay
 		measuredSum += frameTime;
 	});
 
-	// GPU-timed feature buckets (D3D11 timestamp queries around our own compute passes).
-	// These rows are what makes an SVGF vs REBLUR comparison directly readable: each
-	// denoiser has its own bucket, so switching the SSRT Denoiser dropdown swaps which row
-	// is shown and the milliseconds can be compared 1:1. Their sum is folded into "Other"
-	// inside CalculateSummaryData, so it must NOT be added to measuredSum here.
+	// GPU-timed feature buckets (D3D11 timestamp queries around our own passes). These
+	// rows are what makes an SVGF vs REBLUR comparison directly readable: each denoiser
+	// has its own bucket, so switching the SSRT Denoiser dropdown swaps which row is
+	// shown and the milliseconds can be compared 1:1.
+	//
+	// They go into their own row set, not into the CPU table: GPU timestamps are a
+	// different clock, arrive several frames late, and overlap each other and the CPU
+	// timeline. They are therefore also deliberately absent from measuredSum - the old
+	// code subtracted them from the CPU residual, which could drive "Other" negative.
 	Util::GpuPassTimers::GetSingleton()->ForEachActiveBucket(
-		[&mainRows, smoothedFrameTime, this](const char* label, int rowId, float ms, const char* tooltip) {
+		[&gpuRows, smoothedFrameTime, this](const char* label, int rowId, float ms, const char* tooltip) {
 			float percent = Util::CalculatePercentage(ms, smoothedFrameTime);
 			std::optional<float> testFrameTime, testCostPerCall;
 			auto it = this->testData.find(rowId);
@@ -1613,7 +1713,7 @@ std::pair<std::vector<DrawCallRow>, std::vector<DrawCallRow>> PerformanceOverlay
 				testFrameTime = it->second.frameTime;
 				testCostPerCall = it->second.costPerCall;
 			}
-			mainRows.push_back({ std::string(label) + ":", rowId, kDrawCallsNotApplicable, ms, percent,
+			gpuRows.push_back({ std::string(label) + ":", rowId, kDrawCallsNotApplicable, ms, percent,
 				0.0f, tooltip, true, testFrameTime, testCostPerCall });
 		});
 
@@ -1634,7 +1734,11 @@ std::pair<std::vector<DrawCallRow>, std::vector<DrawCallRow>> PerformanceOverlay
 	DrawCallRow otherRow = {
 		"Other:", magic_enum::enum_integer(SpecialShaderType::Other), kDrawCallsNotApplicable, otherFrameTime, otherPercent,
 		0.0f,
-		std::string("Frame time not attributed to any measured shader type. This includes UI, post-processing, engine work, and any GPU activity not directly measured by the overlay."),
+		std::string("CPU frame time not attributed to any measured shader type: UI, post-processing, "
+					"engine work and anything else the per-shader timers do not see.\n\n"
+					"This is a CPU-only residual. The GPU Passes table below is measured on the GPU "
+					"clock and is NOT subtracted from this value, so the two tables can legitimately "
+					"overlap - GPU work runs while the CPU is doing something else."),
 		true, otherTestFrameTime, otherTestCostPerCall
 	};
 	// Always use the actual total frame time for live data
@@ -1650,7 +1754,7 @@ std::pair<std::vector<DrawCallRow>, std::vector<DrawCallRow>> PerformanceOverlay
 	std::vector<DrawCallRow> summaryRows;
 	summaryRows.push_back(otherRow);
 	summaryRows.push_back(totalRow);
-	return { mainRows, summaryRows };
+	return { std::move(mainRows), std::move(summaryRows), std::move(gpuRows) };
 }
 
 /**
@@ -1955,6 +2059,58 @@ void PerformanceOverlay::UpdateSummaryTestData(float smoothedFrameTime, float ot
 // PERFORMANCE OVERLAY STATE MANAGEMENT
 // ============================================================================
 
+void PerformanceOverlay::AdvanceFrameClock()
+{
+	// Runs on every Present, including frames where the overlay is not drawn. Without
+	// this the frame clock froze while hidden and the first delta after unhiding covered
+	// the whole hidden period, which then sat inside the Avg / 1% Low window.
+	if (!loaded)
+		return;
+	UpdateGraphValues();
+}
+
+PerformanceOverlay::FrameStats PerformanceOverlay::ComputeFrameStats() const
+{
+	FrameStats stats;
+
+	const size_t available = state.statsWindow.GetValidCount();
+	if (available == 0)
+		return stats;
+
+	// Walk backwards from the newest sample, accumulating frame times until the window
+	// duration is covered. The sum of frame times *is* the elapsed wall time, so the
+	// window stays exactly kStatsWindowSeconds long at any frame rate.
+	const float windowMs = Settings::kStatsWindowSeconds * 1000.0f;
+	std::vector<float> samples;
+	samples.reserve(std::min<size_t>(available, Settings::kStatsWindowMaxFrames));
+
+	float coveredMs = 0.0f;
+	for (size_t age = 0; age < available && coveredMs < windowMs; ++age) {
+		const float sampleMs = state.statsWindow.GetNewest(age);
+		if (sampleMs <= 0.0f)
+			break;  // never-written slot: nothing older is valid either
+		samples.push_back(sampleMs);
+		coveredMs += sampleMs;
+	}
+
+	if (samples.empty() || coveredMs < Settings::kStatsWindowMinSeconds * 1000.0f)
+		return stats;
+
+	stats.valid = true;
+	stats.frames = static_cast<int>(samples.size());
+	stats.seconds = coveredMs / 1000.0f;
+	stats.averageMs = coveredMs / static_cast<float>(samples.size());
+
+	// "1% Low" == 99th-percentile frame time: the (0.99 * N)-th slowest frame.
+	size_t p99Index = (samples.size() * 99) / 100;
+	if (p99Index >= samples.size())
+		p99Index = samples.size() - 1;
+	std::nth_element(samples.begin(), samples.begin() + p99Index, samples.end());
+	stats.percentile99Ms = samples[p99Index];
+
+	return stats;
+}
+
 void PerformanceOverlay::UpdateGraphValues()
 {
 	// Check if Frame Generation is active
@@ -1968,10 +2124,22 @@ void PerformanceOverlay::UpdateGraphValues()
 	state.frameTimeHistory.Resize(settings.FrameHistorySize);
 	state.postFGFrameTimeHistory.Resize(settings.FrameHistorySize);
 
-	// Calculate counter deltas
+	// Calculate counter deltas. The counter is always primed by DataLoaded(); the guard
+	// covers the case where this runs before it (frequency 0 would divide by zero) and
+	// discards that one sample instead of reporting an absurd frame time.
+	if (state.frequency == 0) {
+		REX::W32::QueryPerformanceFrequency(&state.frequency);
+		REX::W32::QueryPerformanceCounter(&state.lastFrameCounter);
+		state.frameClockPrimed = state.frequency != 0;
+		return;
+	}
 	REX::W32::QueryPerformanceCounter(&state.currentFrameCounter);
 	int64_t elapsedCounter = state.currentFrameCounter - state.lastFrameCounter;
 	state.lastFrameCounter = state.currentFrameCounter;
+	if (!state.frameClockPrimed) {
+		state.frameClockPrimed = true;
+		return;
+	}
 
 	// Calculate frametime and fps
 	state.frameTimeMs = Util::CalcFrameTime(elapsedCounter, state.frequency);
@@ -1990,13 +2158,18 @@ void PerformanceOverlay::UpdateGraphValues()
 	                  static_cast<float>(state.overlayTimingFrequency.QuadPart);
 	state.lastUpdateTime = now;
 
-	// Insert latest frame time into circular buffer
-	float oldFrameTime = state.frameTimeHistory.GetData()[state.frameTimeHistory.GetHeadIdx()];  // what is the point of oldFrameTime?
+	// Insert latest frame time into circular buffer. oldFrameTime is the sample about to
+	// be overwritten; it lets the min/max tracking below skip a full rescan unless the
+	// value that just left the window was the current extreme.
+	float oldFrameTime = state.frameTimeHistory.GetData()[state.frameTimeHistory.GetHeadIdx()];
 	state.frameTimeHistory.Push(state.frameTimeMs);
 
-	// Feed the fixed rolling window behind the Avg / 1% Low readouts
-	state.statsWindow.Resize(Settings::kStatsWindowFrames);
-	state.statsWindow.Push(state.frameTimeMs);
+	// Feed the rolling window behind the Avg / 1% Low readouts. Ridiculous samples
+	// (loading screens, alt-tab, a debugger break) are kept out so a single multi-second
+	// frame cannot dominate the window for the next ten seconds.
+	state.statsWindow.Resize(Settings::kStatsWindowMaxFrames);
+	if (state.frameTimeMs > 0.0f && state.frameTimeMs <= Settings::kStatsMaxSampleMs)
+		state.statsWindow.Push(state.frameTimeMs);
 
 	// Maintain instantaneous min/max tracking
 	if (state.frameTimeMs > state.maxFrameTime) {
@@ -2038,16 +2211,24 @@ void PerformanceOverlay::UpdateGraphValues()
 	state.smoothedMaxFrameTime = state.smoothedMaxFrameTime + Settings::kSmoothingFactor * (graphMax - state.smoothedMaxFrameTime);
 
 	if (state.isFrameGenerationActive) {
-		// Get frametime directly from the Frame Generation system
-		float fgDeltaTime = globals::features::upscaling.GetFrameGenerationFrameTime();
-
-		// Check if FSR frame generation is active (FSR doesn't provide timing data)
-		bool isFrameGenActive = globals::features::upscaling.IsFrameGenerationActive();
-		if (fgDeltaTime > 0.0f && !isFrameGenActive) {
-			state.postFGFrameTimeMs = fgDeltaTime * 1000.0f;
-			state.postFGFps = 1000.0f / state.postFGFrameTimeMs;
+		// Presented frames per rendered frame, as reported by the backend. DLSS-G reports
+		// this; FSR 3 frame generation does not and returns 0.
+		//
+		// The previous code asked for a measured value and then required frame generation
+		// to be INACTIVE to use it - inside a branch that already required it to be
+		// ACTIVE. The measured path was therefore unreachable and the fixed 2x estimate
+		// was always used, silently, with no indication in the UI.
+		const float measuredMultiplier = globals::features::upscaling.GetFrameGenerationPresentMultiplier();
+		if (measuredMultiplier > 1.01f) {
+			state.postFGIsMeasured = true;
+			state.postFGMultiplier = measuredMultiplier;
+			state.postFGFrameTimeMs = state.frameTimeMs / measuredMultiplier;
+			state.postFGFps = state.fps * measuredMultiplier;
 		} else {
-			// Fallback if FG time is not available
+			// No cadence reported: fall back to the fixed estimate. The UI labels every
+			// number derived from this as an estimate.
+			state.postFGIsMeasured = false;
+			state.postFGMultiplier = Settings::kFrameGenerationMultiplier;
 			state.postFGFrameTimeMs = state.frameTimeMs / Settings::kFrameGenerationMultiplier;
 			state.postFGFps = state.fps * Settings::kFrameGenerationMultiplier;
 		}

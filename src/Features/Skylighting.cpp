@@ -4,6 +4,7 @@
 
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Skylighting::Settings,
@@ -229,11 +230,13 @@ void Skylighting::Prepass()
 
 		// Update probe array
 		{
+			Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SkylightingProbes);
 			context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
 			context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 			context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
 			context->CSSetShader(probeUpdateCompute.get(), nullptr, 0);
 			context->Dispatch((probeArrayDims[0] + 7u) >> 3, (probeArrayDims[1] + 7u) >> 3, probeArrayDims[2]);
+			Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SkylightingProbes);
 		}
 
 		// Reset
@@ -585,7 +588,9 @@ void Skylighting::RenderOcclusion()
 				BSParticleShaderRainEmitter* rain = new BSParticleShaderRainEmitter;
 				{
 					TracyD3D11Zone(state->tracyCtx, "Skylighting - Render Height Map");
+					Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SkylightingHeightMap);
 					precip->RenderMask((RE::BSParticleShaderRainEmitter*)rain);
+					Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SkylightingHeightMap);
 				}
 				inOcclusion = false;
 

@@ -5,9 +5,12 @@
 #include "PerformanceOverlay/ABTesting/ABTestAggregator.h"
 #include "Utils/PerfUtils.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <optional>
+#include <span>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 // Forward declarations
 struct DrawCallRow;
@@ -79,28 +82,57 @@ struct ColumnConfig
 	std::function<void()> headerTooltip;
 };
 
+/**
+ * @brief Fixed-capacity ring buffer of samples in write order.
+ *
+ * `GetHeadIdx()` is the next write position, which is also the index of the oldest
+ * sample once the buffer has wrapped (the convention ImGui::PlotLines expects as its
+ * `values_offset`).
+ */
 template <typename T>
 class CircularBuffer
 {
 	std::vector<T> data = {};
-	size_t headIdx = 0;
+	size_t headIdx = 0;     // next write position == oldest sample once wrapped
+	size_t validCount = 0;  // samples actually written, capped at capacity
 
 public:
-	CircularBuffer(size_t size)
+	explicit CircularBuffer(size_t size)
 	{
-		size = std::max((size_t)1, size);
-		data.resize(size);
+		data.resize(std::max<size_t>(1, size));
 	}
 	CircularBuffer() :
 		CircularBuffer(1) {}
 
+	/**
+	 * @brief Changes capacity while keeping the newest samples in chronological order.
+	 *
+	 * Resizing the underlying vector directly would splice the buffer at the wrap
+	 * point: samples would silently change position in time and stale slots would be
+	 * indistinguishable from real ones. Rebuild instead, oldest kept sample first.
+	 */
 	void Resize(size_t newSize)
 	{
+		newSize = std::max<size_t>(1, newSize);
 		if (data.size() == newSize)
 			return;
-		data.resize(newSize);
-		if (headIdx >= newSize)
-			headIdx = 0;
+
+		const size_t keep = std::min(validCount, newSize);
+		std::vector<T> rebuilt(newSize, T{});
+		for (size_t i = 0; i < keep; ++i)
+			rebuilt[i] = data[(headIdx + data.size() - keep + i) % data.size()];
+
+		data = std::move(rebuilt);
+		validCount = keep;
+		headIdx = (keep >= newSize) ? 0 : keep;
+	}
+
+	/// @brief Drops every sample. Used when a settings change makes old samples meaningless.
+	void Clear()
+	{
+		std::fill(data.begin(), data.end(), T{});
+		headIdx = 0;
+		validCount = 0;
 	}
 
 	void Push(const T& val)
@@ -108,10 +140,24 @@ public:
 		data[headIdx++] = val;
 		if (headIdx >= data.size())
 			headIdx = 0;
+		if (validCount < data.size())
+			++validCount;
 	}
 
 	std::span<const T> GetData() const { return { data }; }
 	size_t GetHeadIdx() const { return headIdx; }
+
+	/// @brief Number of real samples written so far (never counts never-written slots).
+	size_t GetValidCount() const { return validCount; }
+
+	/**
+	 * @brief Reads the i-th newest sample (0 == newest).
+	 * @pre a_age < GetValidCount()
+	 */
+	const T& GetNewest(size_t a_age) const
+	{
+		return data[(headIdx + data.size() - 1 - a_age) % data.size()];
+	}
 };
 
 struct PerformanceOverlay : OverlayFeature
@@ -156,6 +202,34 @@ struct PerformanceOverlay : OverlayFeature
 	* No parameters; uses settings from the singleton.
 	*/
 	void UpdateGraphValues();
+
+	/**
+	 * @brief Advances the frame clock and samples one frame. Must run on every Present.
+	 *
+	 * Sampling used to happen inside DrawOverlay(), so the clock froze whenever the
+	 * overlay was hidden and the first delta after unhiding covered the entire hidden
+	 * period - a single bogus multi-second sample inside the statistics window. Driving
+	 * it from Present keeps the window continuous and honest regardless of visibility.
+	 */
+	void AdvanceFrameClock();
+
+	/**
+	 * @brief Rolling statistics over the trailing kStatsWindowSeconds of frames.
+	 *
+	 * The window is defined in time, not in frames, so its meaning does not change with
+	 * frame rate. It is measured by walking the ring buffer backwards and accumulating
+	 * frame times until the requested duration is covered.
+	 */
+	struct FrameStats
+	{
+		bool valid = false;
+		int frames = 0;              ///< frames the window actually covered
+		float seconds = 0.0f;        ///< wall time the window actually covered
+		float averageMs = 0.0f;      ///< mean frame time over the window
+		float percentile99Ms = 0.0f;  ///< 99th-percentile frame time ("1% Low")
+	};
+	FrameStats ComputeFrameStats() const;
+
 	void DrawFPS();
 	void DrawVRAM();
 	void DrawPostFGFrameTimeGraph();
@@ -174,11 +248,34 @@ struct PerformanceOverlay : OverlayFeature
 	// ============================================================================
 	// TABLE BUILDING AND RENDERING FUNCTIONS
 	// ============================================================================
+	/**
+	 * @brief Row sets for the overlay tables, kept apart because they are not the same
+	 *        kind of measurement.
+	 *
+	 * `cpuRows` + `summaryRows` are CPU QueryPerformanceCounter attribution per shader
+	 * type, where "Other" is a meaningful residual of the CPU frame time.
+	 * `gpuRows` are D3D11 timestamp intervals around our own passes. They live in a
+	 * different clock domain, are read back several frames late, and overlap each other
+	 * and the CPU timeline, so they must never be subtracted from the CPU residual -
+	 * doing that produced negative "Other" values.
+	 */
+	struct DrawCallRowSets
+	{
+		std::vector<DrawCallRow> cpuRows;
+		std::vector<DrawCallRow> summaryRows;
+		std::vector<DrawCallRow> gpuRows;
+	};
+
 	void DrawDrawCallsTable(const std::vector<DrawCallRow>& mainRows, const std::vector<DrawCallRow>& summaryRows);
+	void DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRows);
 	DrawCallLegends BuildDrawCallLegends(const Menu::ThemeSettings& theme, bool anyTestData) const;
 	std::vector<ColumnConfig> BuildDrawCallTableColumns(const Menu::ThemeSettings& theme, const DrawCallLegends& legends, bool anyTestData);
-	std::pair<std::vector<DrawCallRow>, std::vector<DrawCallRow>> BuildDrawCallRows() const;
+	DrawCallRowSets BuildDrawCallRows() const;
 	std::function<void(int, int, const DrawCallRow&)> CreateTableRowHandler(const std::vector<ColumnConfig>& columns);
+
+	// Row id for the "GPU Passes Total" summary row. Above the GPU bucket ids and far
+	// outside the RE::BSShader::Type range, so it can never be mistaken for a toggle.
+	static constexpr int kGpuTotalRowId = 999;
 
 	// ============================================================================
 	// EVENT HANDLING FUNCTIONS
@@ -205,12 +302,23 @@ struct PerformanceOverlay : OverlayFeature
 		CircularBuffer<float> frameTimeHistory;
 		CircularBuffer<float> postFGFrameTimeHistory;
 
-		// Fixed rolling window feeding the Avg / 1% Low readouts (independent of the
-		// user-sized graph history so the statistics window never changes meaning).
+		// Rolling window feeding the Avg / 1% Low readouts (independent of the user-sized
+		// graph history so the statistics window never changes meaning). Sized for the
+		// worst-case frame rate; the readouts trim it to a fixed duration.
 		CircularBuffer<float> statsWindow;
 
 		// State flags
 		bool isFrameGenerationActive = false;
+
+		// True when Post-FG numbers come from the backend's reported presentation cadence,
+		// false when they are the fixed-multiplier estimate. Surfaced in the UI so an
+		// estimate is never mistaken for a measurement.
+		bool postFGIsMeasured = false;
+		// Presented frames per rendered frame actually used for the Post-FG numbers.
+		float postFGMultiplier = 0.0f;
+
+		// False until the first Present has established a baseline for the QPC delta.
+		bool frameClockPrimed = false;
 
 		// Performance counters
 		int64_t frequency;
@@ -258,7 +366,11 @@ struct PerformanceOverlay : OverlayFeature
 		static constexpr float kGraphSpreadMultiplier = 2.0f;        // Standard deviation multiplier for graph range
 		static constexpr float kGraphMinSpread = 2.0f;               // ms - Minimum graph spread
 		static constexpr float kGraphMaxSpread = 20.0f;              // ms - Maximum graph spread
-		static constexpr float kFrameGenerationMultiplier = 2.0f;    // Frame generation doubles frame rate
+		// Fallback presentation multiplier used only when the frame-generation backend
+		// reports no cadence of its own (FSR 3 frame generation never does). Anything
+		// derived from it is labelled as an estimate in the UI; DLSS-G reports a real
+		// presented-frame count, which is used instead when available.
+		static constexpr float kFrameGenerationMultiplier = 2.0f;
 		static constexpr float kMaxUpdateInterval = 2.0f;            // seconds - Maximum update interval
 		static constexpr float kDefaultWindowPadding = 10.0f;        // pixels - Default window padding
 		static constexpr float kLabelPadding = 100.0f;               // pixels - Padding for labels
@@ -268,7 +380,18 @@ struct PerformanceOverlay : OverlayFeature
 		static constexpr float kDefaultFrameTimeMs = 16.67f;         // ms - Default frame time (60 FPS)
 		static constexpr int kMinFrameHistorySize = 120;             // 2s @ 60fps, 0.5s @ 240fps
 		static constexpr int kMaxFrameHistorySize = 1800;            // 30s @ 60fps, 7.5s @ 240fps
-		static constexpr int kStatsWindowFrames = 120;               // rolling window for Avg / 1% Low
+		// Avg / 1% Low window. Defined in seconds so its meaning is frame-rate
+		// independent: a 120-frame window held only ~1.2 samples in its top 1%, making
+		// the "1% Low" readout little more than the single worst frame. Ten seconds is
+		// ~600 frames at 60 FPS, so the 99th percentile sits on the ~6th worst frame.
+		static constexpr float kStatsWindowSeconds = 10.0f;
+		// Ring capacity: 10 s at 300 FPS. Excess capacity costs 12 KB and is harmless.
+		static constexpr int kStatsWindowMaxFrames = 3000;
+		// Minimum coverage before Avg / 1% Low are shown at all.
+		static constexpr float kStatsWindowMinSeconds = 2.0f;
+		// Frames slower than this (< 2 FPS) are loading screens, alt-tabs or breakpoints,
+		// not gameplay stutter. They are still plotted but kept out of the statistics.
+		static constexpr float kStatsMaxSampleMs = 500.0f;
 
 		bool ShowInOverlay = true;  // was: Enabled
 		bool ShowDrawCalls = true;

@@ -4,6 +4,7 @@
 
 #include "Shadercache.h"
 #include "State.h"
+#include "Utils/GpuTimers.h"
 
 static constexpr uint CLUSTER_MAX_LIGHTS = 128;
 static constexpr uint MAX_LIGHTS = 1024;
@@ -489,6 +490,8 @@ void LightLimitFix::UpdateStructure()
 	clusterSize[1] = ((uint)renderSize.y + 63) / 64;
 	clusterSize[2] = 32;
 
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::LightLimitFix);
+
 	{
 		LightBuildingCB updateData{};
 		updateData.LightsNear = lightsNear;
@@ -532,6 +535,8 @@ void LightLimitFix::UpdateStructure()
 		context->CSSetShader(clusterCullingCS, nullptr, 0);
 		context->Dispatch((clusterSize[0] + 15) / 16, (clusterSize[1] + 15) / 16, (clusterSize[2] + 3) / 4);
 	}
+
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::LightLimitFix);
 
 	context->CSSetShader(nullptr, nullptr, 0);
 

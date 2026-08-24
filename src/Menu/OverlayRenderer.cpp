@@ -203,9 +203,10 @@ void OverlayRenderer::HandleABTesting()
 
 		// Add A/B test aggregator data collection here
 		auto& overlay = globals::features::performanceOverlay;
-		auto [mainRows, summaryRows] = overlay.BuildDrawCallRows();
-		std::vector<DrawCallRow> allRows = mainRows;
-		allRows.insert(allRows.end(), summaryRows.begin(), summaryRows.end());
+		auto rowSets = overlay.BuildDrawCallRows();
+		std::vector<DrawCallRow> allRows = rowSets.cpuRows;
+		allRows.insert(allRows.end(), rowSets.gpuRows.begin(), rowSets.gpuRows.end());
+		allRows.insert(allRows.end(), rowSets.summaryRows.begin(), rowSets.summaryRows.end());
 
 		// Update the A/B test aggregator with current frame data
 		abTestingManager->GetAggregator().OnFrame(allRows);

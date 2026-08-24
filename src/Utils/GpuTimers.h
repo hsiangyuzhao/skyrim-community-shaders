@@ -18,11 +18,22 @@ namespace Util
 	 */
 	enum class GpuBucket : int
 	{
-		SSRTTrace = 0,   // depth pyramid, prepare color, ray march, SHARC, diffuse composite
-		SSRTSvgf,        // hand-written SVGF: temporal + variance + a-trous (diffuse and specular)
-		SSRTReblur,      // NRD REBLUR: pack + REBLUR dispatches + unpack (diffuse and specular)
-		SSGI,            // Screen Space GI compute chain (excluding Contact AO)
-		SSGIContactAO,   // SSGI Contact AO pass
+		SSRTTrace = 0,           // depth pyramid, prepare color, ray march, SHARC, diffuse composite
+		SSRTSvgf,                // hand-written SVGF: temporal + variance + a-trous (diffuse and specular)
+		SSRTReblur,              // NRD REBLUR: pack + REBLUR dispatches + unpack (diffuse and specular)
+		SSGI,                    // Screen Space GI compute chain (excluding Contact AO)
+		SSGIContactAO,           // SSGI Contact AO pass
+		PhysicalSkyShadowAccum,  // Physical Sky aerial-perspective shadow accumulation
+		PhysicalSkyLuts,         // Physical Sky transmittance / multiscatter / sky-view / aerial LUTs
+		SkylightingHeightMap,    // Skylighting height-map geometry depth pass
+		SkylightingProbes,       // Skylighting probe volume update
+		TerrainBlending,         // Terrain Blending clear + blend CS + depth copy + blended passes
+		SSPLS,                   // Screen Space Point Light Shadows PrepareDepth chain
+		PostProcessing,          // whole post-processing chain (pre-upscale and pre-tonemap legs)
+		SubsurfaceScattering,    // Separable / Burley SSS blur chain and composite
+		LightLimitFix,           // cluster building + light culling
+		VolumetricLighting,      // generate + raymarch + both blur passes
+		DynamicCubemaps,         // capture / inferrence / irradiance convolution round-robin
 		Count
 	};
 
@@ -69,11 +80,15 @@ namespace Util
 		void ForEachActiveBucket(const std::function<void(const char*, int, float, const char*)>& a_callback);
 
 		/**
-		 * @brief Sum of smoothed milliseconds over recently active buckets.
+		 * @brief Releases every query and clears all smoothing/pending state.
 		 *
-		 * Used by the overlay to shrink the "Other" residual by what the buckets explain.
+		 * Timestamp queries belong to the D3D11 device that created them; using them on a
+		 * new device is a debug-layer error at best. Begin() detects a device change and
+		 * calls this automatically, so no external wiring is required, but it is public so
+		 * a device-lost or render-target rebuild path can also call it explicitly.
+		 * Render-thread only, like everything else here.
 		 */
-		float GetActiveBucketsTotalMs();
+		void Reset();
 
 		// Overlay row ids for GPU buckets: kRowIdBase + bucket index. Chosen well above the
 		// RE::BSShader::Type range so they can never collide with the per-shader rows and so
@@ -81,8 +96,15 @@ namespace Util
 		static constexpr int kRowIdBase = 100;
 
 	private:
-		static constexpr int kFramesInFlight = 5;      // readback latency budget in frames
-		static constexpr int kMaxIntervalsPerFrame = 8;  // prepass + 2 chains + composite, x2 for VR
+		static constexpr int kFramesInFlight = 5;  // readback latency budget in frames
+		// Begin/End pairs one bucket may accumulate per frame. The busiest buckets need 4
+		// (SSRT Trace: prepass + diffuse/specular chains + composite) and 4 (Volumetric
+		// Lighting: generate + raymarch + both blurs). VR does NOT double these: the eyes
+		// are packed double-wide or into an array and handled by the same host dispatch,
+		// so it is the dispatch extent that grows, not the number of intervals. 12 leaves
+		// headroom instead of silently dropping intervals; each unused slot is a null
+		// pointer, so the spare capacity costs nothing at runtime.
+		static constexpr int kMaxIntervalsPerFrame = 12;
 		static constexpr int kActiveTimeoutFrames = 60;  // hide a bucket ~1s after its passes stop
 		static constexpr float kSmoothingOld = 0.95f;    // matches State::Debug() smoothing
 		static constexpr float kSmoothingNew = 0.05f;
@@ -126,5 +148,14 @@ namespace Util
 		Util::FrameChecker frameChecker;
 		uint64_t frameIndex = 0;
 		int writeSlot = 0;
+		// Device that created the currently held queries. A query may only be used with the
+		// device that created it, so a device swap must release everything.
+		ID3D11Device* queryDevice = nullptr;
+		// Bucket currently between Begin and End, or -1. D3D11 queries must not be nested,
+		// so while one interval is open no other bucket may open one. Buckets are placed
+		// around disjoint stretches of the frame, so this never actually rejects work; it
+		// exists so a future call site in an unexpected place degrades into a missing
+		// sample instead of a debug-layer error and garbage timings.
+		int openBucket = -1;
 	};
 }

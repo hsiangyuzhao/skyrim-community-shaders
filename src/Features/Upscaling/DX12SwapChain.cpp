@@ -293,12 +293,24 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		if (SUCCEEDED(presentResult) && upscaling.IsDLSSGAvailable() &&
 			(useFrameGeneration || dlssGPresentationState == DLSSGPresentationState::kMapSuspended)) {
 			sl::DLSSGState dlssGState{};
-			if (upscaling.streamline.GetDLSSGState(dlssGState) &&
-				dlssGPresentationState == DLSSGPresentationState::kMapSuspended &&
-				dlssGState.numFramesActuallyPresented > 1 &&
-				!dlssGMapUnexpectedGeneratedFramesLogged) {
-				logger::warn("[DLSS-G] Streamline presented {} frames while MapMenu generation was disabled", dlssGState.numFramesActuallyPresented);
-				dlssGMapUnexpectedGeneratedFramesLogged = true;
+			const bool dlssGStateValid = upscaling.streamline.GetDLSSGState(dlssGState);
+			if (dlssGStateValid) {
+				// Presented frames since the previous query == presented frames for this
+				// rendered frame, because this is the only per-Present query. Feed the
+				// Performance Overlay a smoothed cadence so it can report a measured
+				// post-FG frame time instead of assuming a fixed 2x multiplier.
+				if (dlssGState.numFramesActuallyPresented > 0) {
+					const float sample = static_cast<float>(dlssGState.numFramesActuallyPresented);
+					measuredPresentMultiplier = measuredPresentMultiplier > 0.0f ?
+					                                measuredPresentMultiplier * 0.95f + sample * 0.05f :
+					                                sample;
+				}
+				if (dlssGPresentationState == DLSSGPresentationState::kMapSuspended &&
+					dlssGState.numFramesActuallyPresented > 1 &&
+					!dlssGMapUnexpectedGeneratedFramesLogged) {
+					logger::warn("[DLSS-G] Streamline presented {} frames while MapMenu generation was disabled", dlssGState.numFramesActuallyPresented);
+					dlssGMapUnexpectedGeneratedFramesLogged = true;
+				}
 			}
 		}
 	}

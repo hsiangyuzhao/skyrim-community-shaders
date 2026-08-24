@@ -1260,6 +1260,20 @@ float Upscaling::GetFrameGenerationFrameTime() const
 	return 0.0f;
 }
 
+/**
+ * @brief Measured DLSS-G presentation cadence for the Performance Overlay.
+ *
+ * @return presented frames per rendered frame (>1 while multi-frame generation runs),
+ *         or 0 when frame generation is inactive or the backend reports no cadence
+ *         (FSR 3 frame generation never does).
+ */
+float Upscaling::GetFrameGenerationPresentMultiplier() const
+{
+	if (!IsFrameGenerationActive() || !IsDLSSGBackend())
+		return 0.0f;
+	return dx12SwapChain.GetMeasuredPresentMultiplier();
+}
+
 // Unified interface methods
 void Upscaling::LoadUpscalingSDKs()
 {

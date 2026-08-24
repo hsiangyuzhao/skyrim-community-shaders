@@ -9,6 +9,7 @@
 #include "State.h"
 #include "TruePBR.h"
 #include "Util.h"
+#include "Utils/GpuTimers.h"
 
 #include "Features/InteriorSun.h"
 #include "Features/LightLimitFix.h"
@@ -776,6 +777,11 @@ namespace Hooks
 				auto shaderCache = globals::shaderCache;
 				auto& vl = globals::features::volumetricLighting;
 
+				// Volumetric lighting has no C++ dispatch site of its own - the engine
+				// issues its four passes through this thunk. Time them here so the overlay
+				// can show one accumulated Volumetric Lighting row.
+				bool timeVolumetricLighting = false;
+
 				if (state->enabledClasses[RE::BSShader::Type::ImageSpace]) {
 					RE::BSImagespaceShader* isShader = CurrentlyDispatchedShader;
 					uint32_t techniqueId = CurrentComputeShaderTechniqueId;
@@ -784,19 +790,23 @@ namespace Hooks
 							techniqueId = 0;
 							if (CurrentlyDispatchedComputeShader->name == "ISVolumetricLightingGenerateCS"sv) {
 								isShader = vl.GetOrCreateGenerateCS(CurrentlyDispatchedComputeShader);
+								timeVolumetricLighting = true;
 							} else if (CurrentlyDispatchedComputeShader->name == "ISVolumetricLightingRaymarchCS"sv) {
 								isShader = vl.GetOrCreateRaymarchCS(CurrentlyDispatchedComputeShader);
+								timeVolumetricLighting = true;
 							}
 						} else if (CurrentlyDispatchedComputeShader->name == "ISVolumetricLightingBlurHCS"sv) {
 							techniqueId = 0;
 							isShader = vl.GetOrCreateBlurHCS(CurrentlyDispatchedComputeShader);
 							vl.SetDimensionsCB();
 							vl.SetGroupCountsHCS(threadGroupCountX);
+							timeVolumetricLighting = true;
 						} else if (CurrentlyDispatchedComputeShader->name == "ISVolumetricLightingBlurVCS"sv) {
 							techniqueId = 0;
 							isShader = vl.GetOrCreateBlurVCS(CurrentlyDispatchedComputeShader);
 							vl.SetDimensionsCB();
 							vl.SetGroupCountsVCS(threadGroupCountY);
+							timeVolumetricLighting = true;
 						}
 					}
 					if (isShader != nullptr) {
@@ -805,7 +815,11 @@ namespace Hooks
 						}
 					}
 				}
+				if (timeVolumetricLighting)
+					Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::VolumetricLighting);
 				func(renderer, shader, threadGroupCountX, threadGroupCountY, threadGroupCountZ);
+				if (timeVolumetricLighting)
+					Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::VolumetricLighting);
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
 		};

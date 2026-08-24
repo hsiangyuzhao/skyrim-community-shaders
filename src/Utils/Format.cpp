@@ -237,6 +237,8 @@ namespace Util
 
 	float CalculateOtherFrameTime(float totalFrameTime, float measuredSum)
 	{
+		// Same-clock, same-frame contract - see the header. Mixing GPU timestamp buckets
+		// into measuredSum is what used to make this go negative.
 		return totalFrameTime - measuredSum;
 	}
 }  // namespace Util
