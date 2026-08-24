@@ -60,7 +60,6 @@ struct DoF : public PostProcessFeature
 	eastl::unique_ptr<Texture2D> texFarBlurred = nullptr;
 	eastl::unique_ptr<Texture2D> texNearBlurred = nullptr;
 	eastl::unique_ptr<Texture2D> texBlurredFiltered = nullptr;
-	eastl::unique_ptr<Texture2D> texBlurredFull = nullptr;
 	eastl::unique_ptr<Texture2D> texPostSmooth = nullptr;
 	eastl::unique_ptr<Texture2D> texPostSmooth2 = nullptr;
 	eastl::unique_ptr<Texture2D> texFocus = nullptr;

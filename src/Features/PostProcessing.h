@@ -115,7 +115,6 @@ struct PostProcessing : Feature
 	// std::vector<std::unique_ptr<PostProcessFeature>> colorTransformsFeats = {};
 
 	eastl::unique_ptr<Texture2D> texCopy = nullptr;
-	eastl::unique_ptr<Texture2D> texAfterTAA = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> copyCS = nullptr;
 
 	/////////////////////////////////////////////////////////////////////////////////

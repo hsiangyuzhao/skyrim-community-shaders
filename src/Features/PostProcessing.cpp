@@ -377,14 +377,6 @@ void PostProcessing::SetupResources()
 
 		texCopy = eastl::make_unique<Texture2D>(texDesc);
 		texCopy->CreateUAV(uavDesc);
-
-		texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		srvDesc.Format = texDesc.Format;
-		uavDesc.Format = texDesc.Format;
-
-		texAfterTAA = eastl::make_unique<Texture2D>(texDesc);
-		texAfterTAA->CreateSRV(srvDesc);
-		texAfterTAA->CreateUAV(uavDesc);
 	}
 
 	if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\PostProcessing\\copy.cs.hlsl", {}, "cs_5_0")))

@@ -134,10 +134,6 @@ void DoF::SetupResources()
 		texOutput->CreateSRV(srvDesc);
 		texOutput->CreateUAV(uavDesc);
 
-		texBlurredFull = eastl::make_unique<Texture2D>(texDesc);
-		texBlurredFull->CreateSRV(srvDesc);
-		texBlurredFull->CreateUAV(uavDesc);
-
 		texPostSmooth = eastl::make_unique<Texture2D>(texDesc);
 		texPostSmooth->CreateSRV(srvDesc);
 		texPostSmooth->CreateUAV(uavDesc);
