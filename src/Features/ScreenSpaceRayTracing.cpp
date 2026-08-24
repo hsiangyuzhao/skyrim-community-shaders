@@ -32,6 +32,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientMult,
     EnableAmbientReinjection,
     AmbientReinjectionStrength,
+    CubemapFillBlend,
     LowResConfidenceFilter,
     TemporalAmbientConfidence,
     AmbientConfidenceMaxFrames,
@@ -86,6 +87,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AmbientMult,
     EnableAmbientReinjection,
     AmbientReinjectionStrength,
+    CubemapFillBlend,
     LowResConfidenceFilter,
     TemporalAmbientConfidence,
     AmbientConfidenceMaxFrames,
@@ -183,7 +185,10 @@ void ScreenSpaceRayTracing::DrawSettings()
             "surfaces -- rest on a perfectly stable ambient instead.\n\n"
             "Forces the diffuse cubemap fallback off, since the two are competing answers to "
             "the same question and running both would count the environment twice. The "
-            "specular fallback is unaffected.\n\n"
+            "specular fallback is unaffected. If you want some of the cubemap back, use the "
+            "\"Cubemap Fill Blend\" slider below instead of the fallback checkbox -- that route "
+            "shares the missed directions between the two sources rather than letting both claim "
+            "all of them.\n\n"
             "Turn it off to get the previous behaviour back exactly, for an A/B comparison.");
 
     if (settings.EnableAmbientReinjection) {
@@ -196,6 +201,47 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "truth but never darker than vanilla. Slightly below 1 is a reasonable hedge in "
                 "scenes whose on-screen surfaces are not representative of the surrounding "
                 "environment.");
+
+        // (batch 8) beta. Disabled without the diffuse cubemap fallback switched on, because that
+        // switch is what decides whether the cubemap estimate is built at all -- with it off there
+        // is nothing for this slider to blend towards.
+        ImGui::BeginDisabled(!settings.UseDynamicCubemapsAsFallback);
+        ImGui::SliderFloat("Cubemap Fill Blend", &settings.CubemapFillBlend, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::EndDisabled();
+        if (auto _tt = Util::HoverTooltipWrapper()) {
+            if (!settings.UseDynamicCubemapsAsFallback)
+                ImGui::Text(
+                    "Needs \"Use Dynamic Cubemaps as Fallback for Diffuse\" (under Tracing) turned "
+                    "on. That switch is what builds the cubemap estimate this slider blends "
+                    "towards, so with it off there is nothing to fill from and this does nothing.");
+            else
+                ImGui::Text(
+                    "What fills the directions the rays could not answer. At 0 they are filled by "
+                    "the vanilla ambient plus IBL, which is what Ambient Reinjection has always "
+                    "done. At 1 they are filled by the dynamic cubemap instead, which is what the "
+                    "old cubemap fallback did. In between the two are mixed.\n\n"
+                    "This is a continuous version of what used to be an either/or. It does not "
+                    "change how much light a pixel gets, only where the unresolved part of it "
+                    "comes from: the rays keep the share they resolved, and the rest is split "
+                    "between the two sources by this slider. Total energy is the same at every "
+                    "setting.\n\n"
+                    "Where you will see it. Shadowed recesses that face the camera -- Whiterun's "
+                    "gate tunnel, under eaves, the underside of arches. Those are where the rays "
+                    "miss most often, so almost the whole ambient there is coming from whichever "
+                    "source this picks. Open ground facing away from you barely changes.\n\n"
+                    "At 1 this is arithmetically the old fallback but not numerically identical to "
+                    "it: the light gets added in the forward pass and taken back out later, and "
+                    "the take-back reads the ambient brightness out of a packed G-buffer channel, "
+                    "so it loses a little precision. It is also a shade darker where rays hit the "
+                    "back of geometry, because that evidence is counted once here instead of "
+                    "twice.\n\n"
+                    "One side effect worth knowing: this raises the confidence value the denoiser "
+                    "sees on the pixels it raises the most, and the cheap experimental REBLUR "
+                    "\"Feed Hit Coverage as History Confidence\" switch is the one thing that "
+                    "reads it. The a-trous blur width is NOT affected -- that runs off a separate "
+                    "hit-distance channel measured before any of this.\n\n"
+                    "0 is the default and leaves the frame exactly as it was.");
+        }
 
         // (batch 6) The zero-lag noise fix, and the default. Placed above the temporal
         // accumulator because it supersedes it.
@@ -278,16 +324,24 @@ void ScreenSpaceRayTracing::DrawSettings()
     ImGui::SliderFloat("BRDF Bias", &settings.BRDFBias, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Specular only. Higher BRDF bias reduces noise but makes reflections more glossy.");
-    ImGui::BeginDisabled(settings.EnableAmbientReinjection);
+    // (batch 8) No longer disabled under Ambient Reinjection. It used to be, because in that mode
+    // the flag could only have done harm; it now selects whether the Cubemap Fill Blend slider has
+    // a source at all, so leaving it locked would make beta unreachable for anyone whose saved
+    // value happens to be off -- that slider is itself disabled while this is off, so the pair
+    // would deadlock. At beta = 0 this checkbox still changes nothing in the frame: DrawSSRTDiffuse
+    // only lets it through when beta is non-zero.
     ImGui::Checkbox("Use Dynamic Cubemaps as Fallback for Diffuse", &settings.UseDynamicCubemapsAsFallback);
-    ImGui::EndDisabled();
     if (auto _tt = Util::HoverTooltipWrapper()) {
         if (settings.EnableAmbientReinjection)
             ImGui::Text(
-                "Forced off while Ambient Reinjection is on: the vanilla ambient is what fills "
-                "the missed directions in that mode, and letting the cubemap fill them as well "
-                "would count the same environment light twice. The saved value is kept and "
-                "comes back when Ambient Reinjection is turned off.");
+                "With Ambient Reinjection on, this no longer fills the missed directions by "
+                "itself -- the vanilla ambient does that. What it does instead is decide whether "
+                "the cubemap estimate gets built at all, which is what the \"Cubemap Fill Blend\" "
+                "slider under Ambient Energy needs in order to blend towards it.\n\n"
+                "So: off, or Cubemap Fill Blend at 0, and the frame is pure reinjection and this "
+                "costs nothing. On, with Cubemap Fill Blend above 0, and the missed directions "
+                "are filled from a mix of the two -- which costs one cubemap sample and one "
+                "Skylighting probe fetch per ray.");
         else
             ImGui::Text("When ray marching misses, use dynamic cubemaps for reflections.");
     }
@@ -710,6 +764,38 @@ void ScreenSpaceRayTracing::DrawSettings()
         // over open ground and drop back to 1 in a thin band along the trailing edge of anything
         // moving, not over whole regions.
         BUFFER_VIEWER_NODE(texSSRTConfidenceHistoryPrev, debugRescale)
+        // (batch 9) The two G-buffer channels that decide whether the ambient re-add can reach a
+        // pixel at all. These are RenderTargetData, not our own Texture2D -- they have .SRV and
+        // no desc -- so BUFFER_VIEWER_NODE cannot take them and the size comes from the screen.
+        //
+        // Reading them together, on eyes and hair:
+        //   Albedo black + NormalRoughness showing a normal sphere/strands => the albedo was
+        //     crushed by Lighting.hlsl's `outputAlbedo *= 1 - reflectance`, so the one channel
+        //     that puts ambient light back (ssrtDiffuse * albedo) has nothing to multiply. This
+        //     also implies Masks.z is 0, since Masks.z is computed after that multiply.
+        //   Both black => the geometry is not in the deferred window at all, and no amount of
+        //     albedo work will help.
+        // Both cases look identical on Albedo alone -- src/Deferred.cpp:375 clears the G-buffer
+        // every frame -- which is exactly why both have to be on screen at once.
+        //
+        // Prediction worth checking after the batch 9 eye fix: eyes should stop being black
+        // holes here. The old chrome-eye F0 (~1 from the cubemap average) drove reflectance to
+        // near 1, so `1 - reflectance` zeroed the albedo; pinning eye F0 back to 0.027 leaves
+        // most of the albedo intact.
+        {
+            auto gbufferNode = [&](const char* label, const RE::BSGraphics::RenderTargetData& rt) {
+                if (!rt.SRV)
+                    return;
+                if (ImGui::TreeNode(label)) {
+                    Util::BufferViewerImage(rt.SRV,
+                        { globals::state->screenSize.x * debugRescale, globals::state->screenSize.y * debugRescale });
+                    ImGui::TreePop();
+                }
+            };
+            auto& renderTargets = globals::game::renderer->GetRuntimeData().renderTargets;
+            gbufferNode("G-Buffer Albedo", renderTargets[ALBEDO]);
+            gbufferNode("G-Buffer NormalRoughness", renderTargets[NORMALROUGHNESS]);
+        }
         // (batch 1, item 2) Black = the rays hit something within a texel or two, so the kernel
         // collapses towards the centre and contact detail survives. White = they went further
         // than the kernel reaches, or missed, so the kernel runs at full width. A healthy
@@ -820,6 +906,11 @@ void ScreenSpaceRayTracing::SanitizeSettings()
     settings.DiffuseMult = std::clamp(settings.DiffuseMult, 0.01f, 5.0f);
     settings.AmbientMult = std::clamp(settings.AmbientMult, 0.0f, 1.0f);
     settings.AmbientReinjectionStrength = std::clamp(settings.AmbientReinjectionStrength, 0.0f, 1.0f);
+    // (batch 8) beta is a blend fraction. Above 1 it would report a confidence over 1 -- which the
+    // shader's saturate() would eat, leaving the fill radiance over-weighted relative to the
+    // ambient the composite then removes, i.e. net energy gain. Below 0 it would subtract cubemap
+    // light from the frame.
+    settings.CubemapFillBlend = std::clamp(settings.CubemapFillBlend, 0.0f, 1.0f);
     // (reinjection noise) 1 is "no accumulation", i.e. alpha == 1 and the spatial mean straight
     // through, so the low end is inert rather than degenerate; the 60 ceiling matches the slider
     // and keeps the fp16 frame counter in .z far inside its exact range.
@@ -2192,6 +2283,11 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         // written on both paths.
         ssrCBData.TemporalAmbientConfidence = 0u;
         ssrCBData.AmbientConfidenceInvMaxFrames = 1.0f;
+        // (batch 8) The specular permutation compiles the beta fill out entirely -- ambient
+        // reinjection is a diffuse-only energy model -- so this is 0 for the same reason the two
+        // fields above are: the buffer is shared and every field has to be written, but nothing
+        // in this dispatch reads it.
+        ssrCBData.CubemapFillBlend = 0.0f;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -2786,8 +2882,25 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // the vanilla ambient and then add the cubemap's estimate of the same light back on top.
         // Force it off rather than trusting the user to keep the two consistent; the saved
         // setting is untouched and returns the moment reinjection comes off.
-        ssrCBData.UseDynamicCubemapsAsFallback =
-            (uint)(settings.UseDynamicCubemapsAsFallback && !settings.EnableAmbientReinjection) && dynamicCubemaps.loaded;
+        //
+        // (batch 8) ...unless beta asks for it. Cubemap Fill Blend turns the either/or above into
+        // a dial, and the block this flag gates is where the cubemap estimate is built, so a
+        // non-zero beta has to let it run. What stops the double-count the comment above warns
+        // about is not this gate any more -- it is that the block no longer reports
+        // `confidence = 1` in this mode. It hands the estimate to the reinjection block as a
+        // weighted (radiance, coverage) contribution instead, and the weights still sum to the
+        // unresolved fraction. See ssrt_raymarch.hlsl.
+        //
+        // beta is gated on reinjection here rather than in the shader, so the fallback path can
+        // never see a non-zero value however the settings file was hand-edited, and so the shader
+        // needs one comparison instead of two.
+        const bool cubemapFill =
+            settings.EnableAmbientReinjection && settings.UseDynamicCubemapsAsFallback &&
+            settings.CubemapFillBlend > 0.0f && dynamicCubemaps.loaded;
+        const bool legacyFallback =
+            settings.UseDynamicCubemapsAsFallback && !settings.EnableAmbientReinjection && dynamicCubemaps.loaded;
+        ssrCBData.UseDynamicCubemapsAsFallback = (legacyFallback || cubemapFill) ? 1u : 0u;
+        ssrCBData.CubemapFillBlend = cubemapFill ? settings.CubemapFillBlend : 0.0f;
         ssrCBData.OcclusionStrength = settings.OcclusionStrength;
         ssrCBData.CubemapNormalization = settings.CubemapNormalization;
         ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;  // (diagnostic T2)

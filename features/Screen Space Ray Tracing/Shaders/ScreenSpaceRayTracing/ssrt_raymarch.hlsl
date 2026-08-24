@@ -149,12 +149,33 @@ cbuffer SSRTCB : register(b1)
     uint FreezeNoisePhase;
     // (S3.10) Non-zero takes the sample scramble from the baked blue-noise array at t6; zero
     // takes it from a pcg3d hash, which is what shipped before. See SampleRandomVector2DBaked.
-    //
-    // The last declared member. ScreenSpaceRayTracing::SSRTCB pads the rest of the row out to
-    // 48 bytes, which is deliberately not declared here -- a shader may declare a prefix of a
-    // larger constant buffer, and mirroring a C++ `float pad0[2]` in HLSL would be wrong anyway
-    // (array elements get a 16-byte row each).
     uint UseBlueNoise;
+    // (batch 8) Declared only so that CubemapFillBlend lands on its real offset. Row 2 of
+    // ScreenSpaceRayTracing::SSRTCB is full, HLSL has no syntax for skipping a constant-buffer
+    // slot, and this file reads neither of these two -- ssrt_diffuse_composite.hlsl is their
+    // consumer. Naming them rather than declaring a `uint2` pad keeps the mirror readable and
+    // greppable; fxc strips unreferenced cbuffer members from the binding either way.
+    uint TemporalAmbientConfidence;
+    float AmbientConfidenceInvMaxFrames;
+    // --- row 3 ---
+    // (batch 8) beta: the fraction of the hemisphere the rays could *not* resolve that is filled
+    // from the dynamic cubemap instead of from the vanilla ambient DeferredCompositeCS re-adds.
+    //
+    // The composite needs no knowledge of this at all. It computes
+    // `ambientKeep = 1 - conf * strength` from the confidence this file reports, so folding the
+    // fill into the reported (radiance, confidence) pair makes the composite's own subtraction
+    // balance the books automatically -- see the derivation at the application site.
+    //
+    // 0 is the pure ambient-reinjection behaviour and every expression this value appears in
+    // folds away at that value, which is what makes the default bit-identical. 1 fills the whole
+    // unresolved fraction from the cubemap, i.e. arithmetically the legacy fallback, but reached
+    // through the composite's subtraction rather than by zeroing the forward ambient.
+    //
+    // Only ever non-zero while SharedData::ssrtSettings.AmbientReinjection is set and the diffuse
+    // cubemap fallback has a cubemap to sample: DrawSSRTDiffuse zeroes it in every other case, and
+    // DrawSSRTSpecular passes 0 unconditionally. So neither the fallback path nor the specular
+    // permutation needs a guard of its own.
+    float CubemapFillBlend;
 };
 
 // (audit #21) Never defined by ScreenSpaceRayTracing::CompileComputeShaders, so this is
@@ -1068,6 +1089,20 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // fully grazing view. Negate the pre-bias ray direction (:787) to get the
         // surface->camera vector; the result now lands in (0, 1] as intended.
         const float NdotV = saturate(dot(-view_space_ray_direction, view_space_surface_normal));
+#if defined(DYNAMIC_CUBEMAPS) && !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+        // (batch 8, cubemap fill) The (radiance, weight) pair the beta fill contributes. It has to
+        // live out here because the two halves of it are produced and spent in different blocks:
+        // the cubemap estimate is only built inside the fallback block below, and the weight can
+        // only be applied after the ambient-reinjection block further down has finished deciding
+        // what the reported confidence is.
+        //
+        // Both stay at zero unless the fallback block actually ran *and* beta is non-zero, and
+        // that coupling is the point rather than tidiness: the block is skipped for any ray that
+        // already reports confidence >= 0.999, and a weight applied without a colour to go with it
+        // would take vanilla ambient away and put nothing in its place.
+        float3 ambientFillColor = 0.0;
+        float ambientFillBlend = 0.0;
+#endif
 #if defined(DYNAMIC_CUBEMAPS) && !SHARC_UPDATE
         if (UseDynamicCubemapsAsFallback != 0 && (confidence < 0.999f))
         {
@@ -1217,12 +1252,44 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 #   if defined(SSRT_SPECULAR)
             ao = GetSpecularOcclusionFromAmbientOcclusion(NdotV, ao, roughness);
             envColor *= ao;
-#   else
-            float3 multiBounceAO = Color::MultiBounceAO(albedo, ao);
-            envColor *= multiBounceAO;
-#   endif
             sampleColor.xyz = lerp(envColor, sampleColor.xyz, confidence);
             confidence = 1;
+#   else
+            // (batch 8, cubemap fill) The fork between the legacy fallback and the beta fill.
+            //
+            // Gated on beta rather than on AmbientReinjection so that the *literal* zero used by
+            // the bit-identity harness collapses the whole `if` to its else side: at
+            // CubemapFillBlend == 0 what fxc sees is textually the sequence this block always
+            // was. C++ only ever sends a non-zero beta while reinjection is on, so gating on the
+            // one value covers both conditions (see the cbuffer declaration).
+            //
+            // WHY THE FILL'S OCCLUSION IS NOT THE FALLBACK'S `ao`. The fallback multiplies the
+            // per-ray back-face vote into the environment colour, because in that mode the vote
+            // is the *only* way the geometry can darken the pixel. Under reinjection the vote is
+            // already spent as coverage a few lines below -- `confidence += (1 - occlusion) *
+            // OcclusionStrength` -- with zero radiance attached to it, which is the same
+            // darkening expressed as a weight instead of a multiplier. Multiplying it in here as
+            // well would count one piece of evidence twice, and quadratically: at
+            // OcclusionStrength 1 a back-face ray would contribute weight (1 - 1) = 0 *and* a
+            // colour multiplied by MultiBounceAO(albedo, 0). So the fill carries SSGI's occlusion
+            // only, and the vote reaches the frame exactly once, as coverage.
+            //
+            // The re-read of SsgiAoTexture is the same texel `ao` already sampled; fxc common-
+            // subexpressions the two loads, and at beta == 0 this side does not exist at all.
+            [branch] if (CubemapFillBlend > 0.0) {
+                float fillAo = 1.0;
+#       if defined(SSGI)
+                fillAo = 1 - saturate(SsgiAoTexture[coords.xy].x);
+#       endif
+                ambientFillColor = envColor * Color::MultiBounceAO(albedo, fillAo);
+                ambientFillBlend = CubemapFillBlend;
+            } else {
+                float3 multiBounceAO = Color::MultiBounceAO(albedo, ao);
+                envColor *= multiBounceAO;
+                sampleColor.xyz = lerp(envColor, sampleColor.xyz, confidence);
+                confidence = 1;
+            }
+#   endif
         }
 #endif
 
@@ -1260,6 +1327,49 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         [branch] if (SharedData::ssrtSettings.AmbientReinjection != 0) {
             sampleColor *= confidence;
             confidence = saturate(confidence + (1.0 - occlusion) * OcclusionStrength);
+#   if defined(DYNAMIC_CUBEMAPS)
+            // (batch 8, cubemap fill) Spend the beta fill, and spend it *here* -- after the line
+            // above has settled what fraction of the hemisphere this sample claims to have
+            // answered, because the fill is defined on the fraction it did not.
+            //
+            // THE ALGEBRA, and why the composite needs no change. Write c for the validated
+            // confidence, o for the occlusion out-parameter, S for OcclusionStrength, L for the
+            // traced radiance and F for `ambientFillColor`. The two lines above report
+            //
+            //     radiance   = c * L
+            //     confidence = c_rep = saturate(c + (1 - o) * S)
+            //
+            // and DeferredCompositeCS turns that into `out = direct + (1 - c_rep) * A + c * L`
+            // with A the vanilla ambient. So (1 - c_rep) is exactly the weight A is carrying, and
+            // it is that weight -- not (1 - c) -- that beta has to split. Reporting
+            //
+            //     radiance   = c * L + w * F,   w = (1 - c_rep) * beta
+            //     confidence = c_rep + w
+            //
+            // makes the composite's own subtraction produce
+            //
+            //     out = direct + (1 - c_rep - w) * A + c * L + w * F
+            //         = direct + c * L + (1 - c_rep) * ((1 - beta) * A + beta * F)
+            //         = direct + c * L + (1 - c_rep) * lerp(A, F, beta)
+            //
+            // i.e. the target formula, with the fill weights still summing to exactly the
+            // unresolved fraction. That is what keeps this from reintroducing the asymmetry the
+            // ambient-coupling audit is about: the removal and every one of its replacements are
+            // still one partition of one hemisphere, per pixel, from one estimator.
+            //
+            // Splitting (1 - c_rep) rather than (1 - c) is forced, not chosen. Beta applied to
+            // (1 - c) would leave A weighted by (1 - c_rep - beta * (1 - c)), which goes negative
+            // wherever the back-face vote fired, and a negative ambient weight is not a slightly
+            // wrong look -- it is light created out of nothing (or clamped, and then the weights
+            // no longer sum to one). The visible consequence is that beta = 1 is a shade darker
+            // than the legacy fallback on back-face-heavy geometry, which is the correct
+            // direction: that evidence is being honoured once instead of not at all.
+            [branch] if (ambientFillBlend > 0.0) {
+                const float fillWeight = (1.0 - confidence) * ambientFillBlend;
+                sampleColor += ambientFillColor * fillWeight;
+                confidence = saturate(confidence + fillWeight);
+            }
+#   endif
         }
 #endif
 

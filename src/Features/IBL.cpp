@@ -21,13 +21,47 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	FogAmount,
 	EffectNormalization,
 	EffectNormalizationMult,
-	MinEffectMult)
+	MinEffectMult,
+	EnvIBLScale,
+	SkyIBLScale,
+	EnvIBLSaturation,
+	SkyIBLSaturation)
 
 void IBL::DrawSettings()
 {
 	ImGui::Checkbox("Enable Diffuse IBL", (bool*)&settings.EnableDiffuseIBL);
 	ImGui::SliderFloat("Diffuse IBL Scale", &settings.DiffuseIBLScale, 0.0f, 10.0f, "%.2f");
 	ImGui::SliderFloat("Diffuse IBL Saturation", &settings.IBLSaturation, 0.0f, 2.0f, "%.2f");
+
+	// (B7) The two halves the ambient probe is split into, trimmable independently. The pair
+	// above stays the master gate on the combined result; these four sit underneath it.
+	ImGui::SliderFloat("Env IBL Scale", &settings.EnvIBLScale, 0.0f, 10.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"Intensity of the environment half of the ambient probe - the bounce light from the "
+			"surrounding geometry, with the sky excluded.\n\n"
+			"This half is not attenuated by skylighting, so it is what fills shadowed pockets that "
+			"face the camera: gateway arches, undersides of eaves, alley corners. Turn it down if "
+			"those read as too bright or too strongly tinted by nearby walls.");
+	}
+	ImGui::SliderFloat("Sky IBL Scale", &settings.SkyIBLScale, 0.0f, 10.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"Intensity of the sky half of the ambient probe - what the sky adds on top of the "
+			"environment bounce.\n\n"
+			"This half is scaled by skylighting visibility, so it is strongest on open ground and "
+			"upward-facing surfaces and fades to nothing under cover. Turn it down if open "
+			"exteriors are too blue.");
+	}
+	ImGui::SliderFloat("Env IBL Saturation", &settings.EnvIBLSaturation, 0.0f, 2.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Colour saturation of the environment half only. 0 makes the bounce light grey; 1 leaves it untouched.");
+	}
+	ImGui::SliderFloat("Sky IBL Saturation", &settings.SkyIBLSaturation, 0.0f, 2.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Colour saturation of the sky half only. 0 makes the sky contribution grey; 1 leaves it untouched.");
+	}
+
 	ImGui::SliderFloat("DALC Amount", &settings.DALCAmount, 0.0f, 1.0f, "%.2f");
 	ImGui::Checkbox("Enable Interior", (bool*)&settings.EnableInterior);
 	ImGui::Checkbox("Use Static IBL For Out-of-World Objects", (bool*)&settings.UseStaticIBL);

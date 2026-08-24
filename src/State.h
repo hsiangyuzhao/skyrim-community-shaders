@@ -191,7 +191,11 @@ public:
 		IsBeastRace = 1 << 2,
 		EffectShadows = 1 << 3,
 		IsTree = 1 << 4,
-		GrassSphereNormal = 1 << 5
+		GrassSphereNormal = 1 << 5,
+		// (batch 9) Set per draw by VanillaFresnel's BSLightingShader::SetupGeometry hook.
+		// Bit 6 is the only free slot: bits 3/4/5 mean different things here than they do
+		// upstream, so only this one bit can be taken over, not the block.
+		IsEye = 1 << 6
 	};
 
 	enum class ExtraFeatureDescriptors : uint32_t

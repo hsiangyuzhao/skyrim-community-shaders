@@ -54,6 +54,15 @@ public:
 		uint EffectNormalization = 0;
 		float EffectNormalizationMult = 5.0f;
 		float MinEffectMult = 1.0f;
+		// (B7) Per-source trim on the two probes GetIBLColor splits the ambient into. All four
+		// default to 1.0 and each is an exact no-op at that value, so a default install renders
+		// bit-for-bit what it rendered before they existed; see IBL.hlsli's GetIBLColor.
+		// DiffuseIBLScale / IBLSaturation above stay where they are - they remain the master
+		// gate applied by the callers on the combined result, these four sit underneath it.
+		float EnvIBLScale = 1.0f;
+		float SkyIBLScale = 1.0f;
+		float EnvIBLSaturation = 1.0f;
+		float SkyIBLSaturation = 1.0f;
 		float pad;
 	} settings;
 	STATIC_ASSERT_ALIGNAS_16(Settings);

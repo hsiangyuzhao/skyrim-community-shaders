@@ -191,6 +191,12 @@ namespace SharedData
 		uint EffectNormalization;
 		float EffectNormalizationMult;
 		float MinEffectMult;
+		// (B7) Mirrors IBL.h's Settings tail exactly. Per-source trim for the environment and
+		// sky halves of the ambient probe; all four default to 1.0 and are exact no-ops there.
+		float EnvIBLScale;
+		float SkyIBLScale;
+		float EnvIBLSaturation;
+		float SkyIBLSaturation;
 		float pad;
 	};
 
@@ -273,12 +279,14 @@ namespace SharedData
 		uint EnableGGX;
 		uint EnableGGXOnGrass;
 		uint EnableDynamicCubemapsConversion;
+		uint EnableEyeSpecialHandling;
 		float RoughnessMultiplier;
+		float SpecularRoughnessBlend;
 		float BaseF0Multiplier;
 		float MinF0;
 		float CubemapToF0Multiplier;
 		float ComplexMaterialF0Multiplier;
-		float3 pad;
+		float pad;
 	};
 
 	struct PhysSkyData

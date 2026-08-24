@@ -2372,17 +2372,42 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float roughness = 1.0;
 
 #	if defined(VANILLA_FRESNEL)
+	// (batch 9) Eyes are identified per draw now, not per permutation. A compile-time EYE
+	// macro misses the eye meshes that ship as ordinary kEnvironmentMap materials -- those
+	// used to fall through to the generic ENVMAP branch below and take the cubemap's average
+	// colour as F0, which the x pi at the conversion site saturates to ~1 on any bright
+	// cubemap: a mirror-metal eyeball. The compile-time macro stays as an OR term, since a
+	// permutation that carries it is an eye by definition and needs no runtime confirmation.
+	const bool isEyeMaterial =
+#		if defined(EYE)
+		true;
+#		else
+		(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsEye) != 0;
+#		endif
+	const bool applyEyeHandling = isEyeMaterial && SharedData::vanillaFresnelSettings.EnableEyeSpecialHandling;
+
+	// (batch 9) This used to be `#if SPECULAR ... #elif EYE`, which meant the SPECULAR+EYE
+	// permutations -- and they exist: Lighting:Pixel:10000201/10000211/10100201/10100211 all
+	// appear in the shipping permutation set -- could never reach the eye branch at all. The
+	// specular branch now excludes eyes and the eye handling is its own statement.
 #		if defined(SPECULAR) && !defined(TRUE_PBR)
-	if (enableVanillaFresnel) {
+	if (enableVanillaFresnel && !isEyeMaterial) {
 		F0 = saturate(glossiness * SpecularColor.xyz / Math::PI);
-		roughness = pow(2.0 / (shininess + 2.0), 0.25);
+		// (batch 9) Two derivations of roughness from the vanilla specular inputs, mixed by
+		// how un-glossy the pixel is. Blend 0 reduces to the old specular-power-only form.
+		// roughness selects the cubemap mip, i.e. how sharp the reflection is, so this is
+		// the knob behind metals reading flat. abs() is what the old form was missing --
+		// it silenced a standing X3571 on this line.
+		float roughnessFromSpecular = (1.0 - glossiness) * (1.0 - glossiness);
+		float roughnessFromShininess = pow(abs(2.0 / (shininess + 2.0)), 0.25);
+		roughness = lerp(roughnessFromShininess, roughnessFromSpecular,
+			SharedData::vanillaFresnelSettings.SpecularRoughnessBlend * (1.0 - glossiness));
 	}
-#		elif defined(EYE)
-	if (enableVanillaFresnel) {
+#		endif
+	if (enableVanillaFresnel && applyEyeHandling) {
 		F0 = 0.027;
 		roughness = 0.1;
 	}
-#		endif
 	F0 = max((enableVanillaFresnel ? SharedData::vanillaFresnelSettings.MinF0 : 0.0), F0 * SharedData::vanillaFresnelSettings.BaseF0Multiplier);
 	float3 baseF0 = F0;
 #	endif
@@ -2493,10 +2518,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #		if defined(VANILLA_FRESNEL)
 		if (enableVanillaFresnel) {
-#			if defined(EYE)
-			F0 = 0.027;
-			roughness = 0.1;
-#			endif
+			// (batch 9) Runtime, not `#if defined(EYE)`. This is the override that puts an eye
+			// back to 0.027 after the conversion branch above has handed it a cubemap-derived
+			// F0; before, it did not compile into the permutations the mis-identified eye
+			// materials actually use, which is why those eyes came out chrome.
+			if (applyEyeHandling) {
+				F0 = 0.027;
+				roughness = 0.1;
+			}
 			roughness = clamp(roughness * SharedData::vanillaFresnelSettings.RoughnessMultiplier, 0.04, 1.0);
 		}
 #		endif

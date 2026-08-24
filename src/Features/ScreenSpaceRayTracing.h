@@ -200,7 +200,15 @@ struct ScreenSpaceRayTracing : Feature
         /// claim full coverage, which would remove all the vanilla ambient and then add the
         /// cubemap estimate of the same light back. DrawSSRTDiffuse therefore forces
         /// UseDynamicCubemapsAsFallback off while this is on (the specular fallback is a
-        /// separate setting and is untouched). The vanilla ambient is the better of the two
+        /// separate setting and is untouched).
+        ///
+        /// (batch 8) ...unless Settings::CubemapFillBlend is non-zero, which is the controlled
+        /// version of running both. What made the combination illegal was the fallback's
+        /// `confidence = 1`, not the cubemap sample itself; with beta on, the ray march reports a
+        /// weighted contribution instead and the two sources partition the unresolved fraction
+        /// rather than both claiming all of it.
+        ///
+        /// The vanilla ambient is the better of the two
         /// answers anyway -- it is the real DALC + IBL term with Skylighting already applied,
         /// where the fallback is a cubemap normalised towards it -- and skipping the fallback
         /// removes a cubemap sample plus a Skylighting probe fetch per sample per pixel.
@@ -215,6 +223,39 @@ struct ScreenSpaceRayTracing : Feature
         /// *found*, not how well its radiance is known, so a scene whose on-screen surfaces are
         /// unrepresentative of the whole environment is better served slightly under 1.
         float AmbientReinjectionStrength = 1.0f;
+        /// @brief (batch 8) beta: of the hemisphere the rays could not resolve, how much is filled
+        /// from the dynamic cubemap instead of from the vanilla ambient the composite re-adds.
+        ///
+        /// This is the continuous dial between the feature's two historical ambient models, which
+        /// were previously a hard either/or:
+        ///
+        ///   | EnableAmbientReinjection | beta | behaviour                                       |
+        ///   |--------------------------|------|-------------------------------------------------|
+        ///   | false                    | n/a  | legacy fallback. Untouched code path, bit-identical |
+        ///   | true                     | 0    | pure reinjection. Bit-identical to before        |
+        ///   | true                     | 1    | arithmetically the fallback, via the composite   |
+        ///   | true                     | 0..1 | the new blend                                    |
+        ///
+        /// Deliberately NOT modelled as a third value of EnableAmbientReinjection. That would need
+        /// a json migration (the saved key is a bool in every existing configuration), a rework of
+        /// the two BeginDisabled gates that key off it, and a change to the AmbientMult pin in
+        /// GetCommonBufferData. A bool plus a scalar reaches all four rows above with none of that.
+        ///
+        /// How it is implemented, and why the composite needed no change at all. The ray march
+        /// folds beta into the (radiance, confidence) pair it reports, so the composite's existing
+        /// `ambientKeep = 1 - conf * strength` balances the books on its own -- the full derivation
+        /// is at the application site in ssrt_raymarch.hlsl. The weights still partition one
+        /// hemisphere and still sum to one, so this does not reintroduce the "removal is global,
+        /// re-add is per-pixel" asymmetry that ambient reinjection exists to fix.
+        ///
+        /// Only meaningful while EnableAmbientReinjection is on, and only while
+        /// UseDynamicCubemapsAsFallback is on -- that is the switch that decides whether the
+        /// cubemap estimate is built at all, and beta has nothing to fill from without it.
+        /// DrawSSRTDiffuse sends 0 in every other case, so the fallback path and the specular
+        /// permutation never see a non-zero value.
+        ///
+        /// Default 0: the frame is unchanged until the slider is moved.
+        float CubemapFillBlend = 0.0f;
         /// @brief (batch 6) Filter the reinjection confidence at quarter resolution with a wide
         /// separable joint-bilateral kernel and joint-bilateral upsample the result, instead of
         /// running the depth-aware 7x7 window at full resolution inside the diffuse composite.
@@ -836,6 +877,14 @@ struct ScreenSpaceRayTracing : Feature
     /// and not the padding -- a shader may declare a prefix of a larger constant buffer, and
     /// a trailing `float pad0[3]` would *not* mirror this layout in HLSL, where each array
     /// element is padded to its own 16-byte row.
+    ///
+    /// (batch 8) Row 2 was full, so CubemapFillBlend opens a fourth row and sizeof goes 48 -> 64.
+    /// This buffer is deliberately where that value lives rather than SSRTSettings in
+    /// FeatureData: appending to the *end* of a standalone constant buffer moves no existing
+    /// offset, where SSRTSettings sits mid-struct in FeatureData with
+    /// ExponentialHeightFogSettings and SSGISettings behind it and a third row there would shift
+    /// every one of their offsets in every shader that reads them. Only ssrt_raymarch.hlsl reads
+    /// beta, and it already binds this buffer.
     struct alignas(16) SSRTCB
     {
         uint MaxSteps;
@@ -865,11 +914,29 @@ struct ScreenSpaceRayTracing : Feature
         /// DenoiserCB::invMaxAccumulatedFrames is: it turns a per-pixel divide into a max().
         /// Took row 2's last pad slot.
         float AmbientConfidenceInvMaxFrames;
+        // --- row 3 ---
+        /// @brief (batch 8) beta. See Settings::CubemapFillBlend for what it means and
+        /// ssrt_raymarch.hlsl for the algebra. Zeroed by DrawSSRTDiffuse whenever ambient
+        /// reinjection is off, the diffuse cubemap fallback is off, or no cubemap is loaded, and
+        /// passed as 0 unconditionally by DrawSSRTSpecular -- so the shader needs no second gate.
+        ///
+        /// Opens row 3. Appending here shifts nothing: this buffer is not nested inside another
+        /// one, so every offset ssrt_raymarch.hlsl and ssrt_diffuse_composite.hlsl already mirror
+        /// keeps its value, and the composite continues to declare a legal prefix.
+        float CubemapFillBlend;
+        /// @brief Explicit tail padding for row 3. Not decoration: `alignas(16)` would otherwise
+        /// pad the struct implicitly and MSVC's C4324 is an error in this build. Deliberately not
+        /// mirrored in either HLSL declaration -- a shader may declare a prefix of a larger
+        /// constant buffer, and a `float pad[3]` in HLSL would not describe this layout anyway,
+        /// since HLSL gives every array element a 16-byte row of its own.
+        /// Zero-initialised in place so neither of the two writers has to remember it and so the
+        /// bytes that reach the GPU are deterministic rather than whatever was on the stack.
+        float ssrtPad3[3] = {};
     };
-    static_assert(sizeof(SSRTCB) == 48,
-        "ScreenSpaceRayTracing::SSRTCB must stay three whole 16-byte constant buffer rows; "
-        "the SSRTCB declaration in ssrt_raymarch.hlsl mirrors these offsets up to UseBlueNoise "
-        "and must move with them; ssrt_diffuse_composite.hlsl mirrors the whole three rows.");
+    static_assert(sizeof(SSRTCB) == 64,
+        "ScreenSpaceRayTracing::SSRTCB must stay whole 16-byte constant buffer rows; "
+        "ssrt_raymarch.hlsl mirrors these offsets up to CubemapFillBlend and must move with "
+        "them; ssrt_diffuse_composite.hlsl mirrors the first three rows.");
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules

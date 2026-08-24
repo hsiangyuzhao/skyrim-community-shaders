@@ -25,6 +25,7 @@ struct VanillaFresnel : public Feature
 	virtual bool inline SupportsVR() override { return true; }
 	virtual inline std::string_view GetShaderDefineName() override { return "VANILLA_FRESNEL"; }
 	virtual inline bool HasShaderDefine(RE::BSShader::Type) override { return true; };
+	virtual void PostPostLoad() override;
 
 	// Settings & UI
 	virtual void RestoreDefaultSettings() override;
@@ -35,14 +36,21 @@ struct VanillaFresnel : public Feature
 	struct alignas(16) Settings
 	{
 		uint Enable = true;
-        uint EnableGGX = false;
+        // (batch 9) GGX and the cubemap conversion now default on together. Conversion sets
+        // F0/roughness into the shape the split-sum GGX lobe consumes, and with GGX off the
+        // vanilla phong specular still runs and gets that F0 mixed into its SpecularColor --
+        // two lighting models in one pixel. Upstream forbids the pairing outright; we default
+        // to the half that is self-consistent instead. See DrawSettings/LoadSettings.
+        uint EnableGGX = true;
         uint EnableGGXOnGrass = false;
-        uint EnableDynamicCubemapsConversion = false;
+        uint EnableDynamicCubemapsConversion = true;
+        uint EnableEyeSpecialHandling = true;
         float RoughnessMultiplier = 1.0f;
+        float SpecularRoughnessBlend = 1.0f;
         float BaseF0Multiplier = 0.32f;
         float MinF0 = 0.02f;
         float CubemapToF0Multiplier = 1.0f;
         float ComplexMaterialF0Multiplier = 1.0f;
-        float pad[3];
+        float pad;
 	} settings;
 };

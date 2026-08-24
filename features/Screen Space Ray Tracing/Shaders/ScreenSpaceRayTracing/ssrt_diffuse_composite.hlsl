@@ -44,8 +44,11 @@ RWTexture2D<float4> ConfidenceHistoryRW : register(u2);
 #ifndef SSRT_CONF_EXTERNAL_FILTER
 // (reinjection noise) Mirrors ScreenSpaceRayTracing::SSRTCB. Only the last two members are read
 // here; the eight before them are declared because a constant buffer cannot be entered at an
-// offset. ssrt_raymarch.hlsl declares the same buffer up to UseBlueNoise and is the other
-// consumer, so the two declarations must stay in lockstep with the C++ struct.
+// offset. ssrt_raymarch.hlsl declares the same buffer and is the other consumer, so the two
+// declarations must stay in lockstep with the C++ struct.
+// (batch 8) That struct now carries a fourth row, CubemapFillBlend, which only the ray march
+// reads. Declaring the first three rows here stays legal -- a shader may declare a prefix of a
+// larger constant buffer -- and none of the offsets above moved.
 cbuffer SSRTCB : register(b1)
 {
     uint MaxSteps;
