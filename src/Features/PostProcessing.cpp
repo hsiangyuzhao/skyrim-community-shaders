@@ -523,6 +523,20 @@ void PostProcessing::DrawBeforeUpscaling()
 	auto gameTexMain = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 	PostProcessFeature::TextureInfo lastTexColor = { gameTexMain.texture, gameTexMain.SRV };
 
+	auto drawsHere = [&](const std::unique_ptr<PostProcessFeature>& a_pipe) {
+		return a_pipe && a_pipe->enabled && !a_pipe->DrawAfterColorGrading() &&
+		       !(inMainLoadingMenu && a_pipe->DisableInMainLoadingMenu()) && a_pipe->DrawBeforeUpscaling();
+	};
+
+	// Nothing opts into the pre-upscale leg today: PostProcessFeature::DrawBeforeUpscaling()
+	// defaults to false and the only override (HistogramAutoExposure) is commented out. With
+	// no qualifying effect the loop below cannot advance lastTexColor past gameTexMain, so the
+	// write-back degenerated into a same-resource, same-subresource CopySubresourceRegion --
+	// undefined behaviour in D3D11 -- on a full-screen target, every frame. Bail out before
+	// touching the context so the leg costs nothing instead of a wasted full-screen copy.
+	if (std::ranges::none_of(pipeline, drawsHere))
+		return;
+
 	state->BeginPerfEvent("[Post Processing] Pre-Upscale");
 	// First of the two post-processing legs. Both accumulate into one bucket so the row
 	// reads as the cost of the whole chain.
@@ -530,7 +544,7 @@ void PostProcessing::DrawBeforeUpscaling()
 
 	// go through each fx
 	for (auto& pipe : pipeline) {
-		if (pipe && pipe->enabled && !pipe->DrawAfterColorGrading() && !(inMainLoadingMenu && pipe->DisableInMainLoadingMenu()) && pipe->DrawBeforeUpscaling()) {
+		if (drawsHere(pipe)) {
 			pipe->Draw(lastTexColor);
 		}
 	}
@@ -538,7 +552,10 @@ void PostProcessing::DrawBeforeUpscaling()
 	D3D11_TEXTURE2D_DESC desc;
 	lastTexColor.tex->GetDesc(&desc);
 	if (desc.Format == texCopy->desc.Format) {
-		context->CopySubresourceRegion(gameTexMain.texture, 0, 0, 0, 0, lastTexColor.tex, 0, nullptr);
+		// Only a real hand-off needs the copy; an effect that wrote straight back into MAIN
+		// would otherwise trigger the same self-copy UB described above.
+		if (lastTexColor.tex != gameTexMain.texture)
+			context->CopySubresourceRegion(gameTexMain.texture, 0, 0, 0, 0, lastTexColor.tex, 0, nullptr);
 	} else {
 		ID3D11ShaderResourceView* srv = lastTexColor.srv;
 		ID3D11UnorderedAccessView* uav = texCopy->uav.get();
