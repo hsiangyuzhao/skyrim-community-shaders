@@ -305,7 +305,8 @@ void LensFlare::Draw(TextureInfo& inout_tex)
 			resetViews();
 		}
 		context->CopyResource(texFlare->resource.get(), texFlareD->resource.get());
-		context->Flush();
+		// No Flush here: D3D11 already orders the copy against everything that follows on this
+		// context, so flushing only drained the command queue mid-frame for no correctness gain.
 	}
 
 	context->CopyResource(texFlareU->resource.get(), texFlareD->resource.get());
@@ -330,7 +331,7 @@ void LensFlare::Draw(TextureInfo& inout_tex)
 			resetViews();
 		}
 		context->CopyResource(texFlare->resource.get(), texFlareU->resource.get());
-		context->Flush();
+		// See above: the mid-frame Flush bought nothing but a command-queue drain.
 	}
 
 	// Final composite
