@@ -1762,7 +1762,21 @@ void ScreenSpaceRayTracing::Prepass()
     // downsample depth
     {
         state->BeginPerfEvent("Downsample Depth - HiZ Buffer");
-        for (int i = 0; i < maxMips - 1; ++i) {
+        // Build only the levels the traversal can reach. ssrt_raymarch.hlsl blocks the climb at
+        // `current_mip >= SSRT_DEPTH_HIERARCHY_MAX_MIP` (= SSRTCB::MaxMips) *after* loading the
+        // level it is on, so the coarsest level ever read is exactly MaxMips -- levels 0..MaxMips
+        // must be valid and nothing above them is ever sampled. The loop used to run a fixed
+        // maxMips - 1 times, so at the default MaxMips of 6 it was already exact but at any lower
+        // setting it downsampled levels no ray could reach: at MaxMips 4 that is two dispatches
+        // and two pass boundaries per frame spent filling mips 5 and 6 for nobody.
+        //
+        // texDepth keeps all maxMips levels allocated, because MaxMips is a live slider; only the
+        // downsample work is skipped. The bound below is read fresh every frame from the same
+        // clamped setting the traversal uses, so raising the slider refills the newly reachable
+        // levels on this very pass -- and hiZTopMipBuilt then clamps SSRTCB::MaxMips so the
+        // traversal cannot outrun the builder even for one frame.
+        const uint hiZTopMip = std::min(settings.MaxMips, maxMips - 1u);
+        for (uint i = 0; i < hiZTopMip; ++i) {
             uavs.at(0) = depthUAVs[i + 1].get();
             srvs.at(0) = depthSRVs[i].get();
 
@@ -1805,6 +1819,7 @@ void ScreenSpaceRayTracing::Prepass()
             context->Dispatch((mipWidth + 7) / 8, (mipHeight + 7) / 8, 1);
             resetViews();
         }
+        hiZTopMipBuilt = hiZTopMip;
         state->EndPerfEvent();
     }
 
@@ -1865,7 +1880,12 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         // (audit P3) Clamp against the allocated mip count: a config saved by an older
         // build may hold a value above maxMips - 1, and loading a mip that does not
         // exist returns 0 == near plane, i.e. an immediate false hit.
-        ssrCBData.MaxMips = std::min(settings.MaxMips, maxMips - 1);
+        //
+        // Also clamped to hiZTopMipBuilt, the coarsest level Prepass actually downsampled.
+        // Prepass builds up to this same setting, so the two agree; the clamp only matters if
+        // the setting were raised between Prepass and here, where an unbuilt level would read
+        // the far-plane clear -- "nothing here" at every tile, i.e. a leak, not a crash.
+        ssrCBData.MaxMips = std::min({ settings.MaxMips, maxMips - 1u, hiZTopMipBuilt });
         ssrCBData.Thickness = settings.Thickness;
         ssrCBData.NormalBias = settings.NormalBias;
         ssrCBData.BRDFBias = settings.BRDFBias;
@@ -2443,8 +2463,9 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     SSRTCB ssrCBData;
     {
         ssrCBData.MaxSteps = settings.MaxSteps;
-        // (audit P3) See DrawSSRTSpecular: clamp to the allocated mip count.
-        ssrCBData.MaxMips = std::min(settings.MaxMips, maxMips - 1);
+        // (audit P3) See DrawSSRTSpecular: clamp to the allocated mip count, and to the level
+        // count the pyramid build actually reached this frame.
+        ssrCBData.MaxMips = std::min({ settings.MaxMips, maxMips - 1u, hiZTopMipBuilt });
         ssrCBData.Thickness = settings.Thickness;
         ssrCBData.NormalBias = settings.NormalBias;
         ssrCBData.BRDFBias = settings.BRDFBias;

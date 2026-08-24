@@ -1314,6 +1314,21 @@ struct ScreenSpaceRayTracing : Feature
     // (mip 0..6) cover the whole usable range; the old 9 allocated two mips and ran two
     // downsample dispatches that no ray could ever sample.
     static const uint maxMips = 7;
+
+    /// @brief The coarsest pyramid level Prepass actually filled on the most recent frame that
+    /// built it, i.e. levels 0..hiZTopMipBuilt hold this frame's depth.
+    ///
+    /// texDepth is always *allocated* with all maxMips levels, because MaxMips is a runtime
+    /// slider, but only levels up to the traversal's ceiling are downsampled -- at the default
+    /// of 6 that is every level, at 4 it saves two dispatches and two pass boundaries. The
+    /// builder reads the same clamped setting the traversal does, so raising the slider refills
+    /// the new levels on the very next Prepass, before any ray can reach them. This member is
+    /// the belt to that braces: SSRTCB::MaxMips is clamped to it, so no traversal can climb into
+    /// a level that has not been written even if the setting were to move between Prepass and a
+    /// draw. Zero until the first pyramid build, which makes the traversal mip-0-only rather
+    /// than letting it read the far-plane clear.
+    uint hiZTopMipBuilt = 0;
+
     static const uint sharcNumEntries = 0x100000;
 
     std::array<winrt::com_ptr<ID3D11ShaderResourceView>, maxMips> depthSRVs = { nullptr };
