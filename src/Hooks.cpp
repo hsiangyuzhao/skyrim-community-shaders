@@ -262,9 +262,18 @@ struct IDXGISwapChain_Present
 		// used to hide, and it is the only place it can be measured - the call below is the
 		// real Present. Purely observational, and a no-op unless the overlay's draw-call
 		// table is on screen.
+		// Frame-spanning GPU timestamps, on the GPU timeline rather than the CPU's. The two
+		// markers bracket the real Present, which is what splits the frame into "everything
+		// the engine, we and DLSS super resolution submitted" and "the flip, the frame
+		// pacing and DLSS-G frame generation". Present is the only per-frame call site that
+		// is guaranteed to run exactly once for every presented frame, menus included, and
+		// no GpuPassTimers interval is open here, so the marker's disjoint window cannot be
+		// nested. Also a no-op unless the overlay's pass table is on screen.
+		Util::GpuFrameTimer::GetSingleton()->MarkPresentBegin();
 		Util::CpuPassTimers::GetSingleton()->BeginPresentWait();
 		HRESULT retval = func(This, SyncInterval, Flags);
 		Util::CpuPassTimers::GetSingleton()->EndPresentWait();
+		Util::GpuFrameTimer::GetSingleton()->MarkPresentEnd();
 
 		TracyD3D11Collect(state->tracyCtx);
 

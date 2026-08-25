@@ -115,6 +115,17 @@ namespace Util
 		 */
 		void Reset();
 
+		/**
+		 * @brief True while a pass interval (and therefore a disjoint query) is open.
+		 *
+		 * D3D11 forbids nesting queries, so GpuFrameTimer asks before opening its own
+		 * disjoint window. Through the public API this can only be false at Present -
+		 * every Begin is matched by an End earlier in the frame - but "cannot happen"
+		 * is not a guarantee, and the failure mode without the check is a debug-layer
+		 * error plus garbage timings rather than one missing sample.
+		 */
+		bool HasOpenInterval() const { return openBucket >= 0; }
+
 		// Overlay row ids for GPU buckets: kRowIdBase + bucket index. Chosen well above the
 		// RE::BSShader::Type range so they can never collide with the per-shader rows and so
 		// magic_enum::enum_cast<RE::BSShader::Type> rejects them (no toggle handling).
@@ -190,6 +201,156 @@ namespace Util
 		// exists so a future call site in an unexpected place degrades into a missing
 		// sample instead of a debug-layer error and garbage timings.
 		int openBucket = -1;
+	};
+
+	/**
+	 * @brief Whole-frame GPU timeline instrumentation: the frame-spanning timestamp pair.
+	 *
+	 * GpuPassTimers only ever sees Community Shaders' own passes, so the overlay could only
+	 * ever say "GPU >= sum of our buckets". Everything else on the GPU - the engine's own
+	 * draws, DLSS super resolution and DLSS-G frame generation (both inside Streamline /
+	 * driver code we do not hook) - had no row anywhere. This class supplies the missing
+	 * denominator by putting two timestamps per frame on the GPU timeline, both issued from
+	 * the one place that is guaranteed to run exactly once per presented frame: the
+	 * IDXGISwapChain::Present hook.
+	 *
+	 *     MarkPresentBegin()  -> ts_begin, issued immediately before the real Present
+	 *     MarkPresentEnd()    -> ts_end,   issued immediately after the real Present returns
+	 *
+	 * From ts_begin(n), ts_end(n) and the previous frame's pair, three quantities follow,
+	 * and they are additive by construction (see Report):
+	 *
+	 *     frameElapsedMs  = ts_begin(n)   - ts_begin(n-1)
+	 *     presentSpanMs   = ts_end(n-1)   - ts_begin(n-1)
+	 *     workSpanMs      = ts_begin(n)   - ts_end(n-1)
+	 *
+	 * What these are NOT: GPU busy time. A GPU timestamp is a reading of the GPU's clock,
+	 * and that clock keeps running while the GPU has nothing to do, so a frame-spanning
+	 * pair measures *elapsed* GPU time and in steady state simply reproduces wall-clock
+	 * frame time. That is exactly why the pair is only useful together with the split: it
+	 * is the split point (the Present call) that carries the information, because
+	 * everything the frame submitted lands on one side of it and the flip, the frame-rate
+	 * pacing and any other-queue work land on the other.
+	 *
+	 * Design constraints honoured here:
+	 * - No disjoint query is ever nested. D3D11 forbids nesting queries, and GpuPassTimers
+	 *   opens a disjoint query around each of our passes; a disjoint query spanning the
+	 *   whole frame would contain those. Instead each marker gets its own degenerate
+	 *   disjoint window (Begin, End(timestamp), End) at a point in the frame where no pass
+	 *   interval is open. Timestamp queries themselves are not restricted this way, which
+	 *   is what makes the frame-spanning pair possible at all.
+	 * - Because a degenerate disjoint window cannot report a clock change that happens
+	 *   later in the frame, validity is established by requiring the reported Frequency to
+	 *   be identical at both markers and across the two frames a sample spans, plus a
+	 *   sanity band on the result. A frequency change is precisely the event the Disjoint
+	 *   flag exists to catch, so this is the same check applied across the real interval
+	 *   rather than across a zero-length one.
+	 * - Results are read back with non-blocking GetData (D3D11_ASYNC_GETDATA_DONOTFLUSH)
+	 *   out of a kFramesInFlight ring, so there is never a synchronous wait, and a slot
+	 *   whose result did not arrive within the budget is dropped rather than stalled on.
+	 * - Both entry points return immediately while the overlay's pass table is hidden, so
+	 *   normal gameplay pays a single boolean check and creates no queries at all.
+	 *
+	 * Render-thread only, like GpuPassTimers.
+	 */
+	class GpuFrameTimer
+	{
+	public:
+		static GpuFrameTimer* GetSingleton();
+
+		/// @brief Issues this frame's first marker. Call immediately before the real Present.
+		void MarkPresentBegin();
+
+		/// @brief Issues this frame's second marker. Call immediately after the real Present
+		///        returns. A no-op if MarkPresentBegin was suppressed, so a gate flip in
+		///        between cannot leave a marker unpaired.
+		void MarkPresentEnd();
+
+		/**
+		 * @brief The three spans, smoothed. All three are elapsed GPU clock, not busy time.
+		 *
+		 * By construction frameElapsedMs == workSpanMs + presentSpanMs for every raw
+		 * sample, and the same smoothing is applied to all three, so the identity survives
+		 * smoothing and the overlay can present them as an additive breakdown.
+		 */
+		struct Report
+		{
+			/// False until at least one sample has been collected; the overlay then shows
+			/// no rows at all rather than a row of zeros.
+			bool hasSample = false;
+			/// Present-to-present elapsed GPU clock. Tracks wall-clock frame time.
+			float frameElapsedMs = 0.0f;
+			/// Elapsed GPU clock from the end of the previous Present to the start of this
+			/// one: everything the engine, Community Shaders and DLSS super resolution
+			/// submitted for the frame, plus any GPU idle inside the frame.
+			float workSpanMs = 0.0f;
+			/// Elapsed GPU clock across the Present call itself: the flip, vsync or
+			/// frame-limiter pacing, DLSS-G frame generation on its own queue, and GPU
+			/// idle while the CPU is blocked.
+			float presentSpanMs = 0.0f;
+		};
+
+		Report Get() const;
+
+		/// @brief Releases every query and clears all state. Called automatically on a
+		///        device change, like GpuPassTimers::Reset().
+		void Reset();
+
+	private:
+		static constexpr int kFramesInFlight = 5;
+		static constexpr float kSmoothingOld = 0.95f;  // matches State::Debug() smoothing
+		static constexpr float kSmoothingNew = 0.05f;
+		// Sanity band on a raw sample, in milliseconds. Anything outside it is a clock
+		// artefact, a wrapped counter or a paused/alt-tabbed frame, not a measurement: a
+		// GPU frame under 0.05 ms means a 20000 fps frame and over 2000 ms means the game
+		// was not rendering. Dropping those keeps a single bad frame out of the average.
+		static constexpr double kMinPlausibleMs = 0.05;
+		static constexpr double kMaxPlausibleMs = 2000.0;
+
+		struct Slot
+		{
+			winrt::com_ptr<ID3D11Query> disjointBegin;
+			winrt::com_ptr<ID3D11Query> disjointEnd;
+			winrt::com_ptr<ID3D11Query> timestampBegin;
+			winrt::com_ptr<ID3D11Query> timestampEnd;
+			uint64_t frameIndex = 0;
+			bool pending = false;  // both markers issued, result not yet folded in
+		};
+
+		enum class SlotStatus
+		{
+			NotReady,
+			Ready,
+			Invalid
+		};
+
+		/// One collected frame's raw readings, kept so the next frame's sample can span the
+		/// Present boundary.
+		struct Previous
+		{
+			bool valid = false;
+			uint64_t frameIndex = 0;
+			UINT64 beginTicks = 0;
+			UINT64 endTicks = 0;
+			UINT64 frequency = 0;
+		};
+
+		bool OverlayWantsTimings() const;
+		bool EnsureQueries(Slot& a_slot) const;
+		void Collect();
+		SlotStatus TryReadSlot(Slot& a_slot, UINT64& a_outBegin, UINT64& a_outEnd, UINT64& a_outFrequency) const;
+
+		Slot slots[kFramesInFlight];
+		Previous previous;
+		uint64_t frameIndex = 0;
+		int writeSlot = 0;
+		int openSlot = -1;  // slot whose begin marker is issued but whose end marker is not
+		ID3D11Device* queryDevice = nullptr;
+
+		float smoothedFrameElapsedMs = 0.0f;
+		float smoothedWorkSpanMs = 0.0f;
+		float smoothedPresentSpanMs = 0.0f;
+		bool hasSample = false;
 	};
 
 	/**

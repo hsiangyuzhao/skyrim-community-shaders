@@ -300,6 +300,13 @@ struct PerformanceOverlay : OverlayFeature
 	// outside the RE::BSShader::Type range, so it can never be mistaken for a toggle.
 	static constexpr int kGpuTotalRowId = 999;
 
+	// Row ids for the whole-frame GPU timeline rows fed by Util::GpuFrameTimer. Same
+	// reasoning as kGpuTotalRowId: above every bucket id and far outside
+	// RE::BSShader::Type, so magic_enum::enum_cast rejects them and no toggle can fire.
+	static constexpr int kGpuUntrackedRowId = 1000;
+	static constexpr int kGpuGapRowId = 1001;
+	static constexpr int kGpuFrameElapsedRowId = 1002;
+
 	// ============================================================================
 	// EVENT HANDLING FUNCTIONS
 	// ============================================================================

@@ -398,6 +398,256 @@ namespace Util
 	}
 
 	// ========================================================================
+	// GpuFrameTimer
+	// ========================================================================
+
+	GpuFrameTimer* GpuFrameTimer::GetSingleton()
+	{
+		static GpuFrameTimer singleton;
+		return &singleton;
+	}
+
+	bool GpuFrameTimer::OverlayWantsTimings() const
+	{
+		return globals::d3d::device && globals::d3d::context && TableIsOnScreen();
+	}
+
+	bool GpuFrameTimer::EnsureQueries(Slot& a_slot) const
+	{
+		if (a_slot.disjointBegin && a_slot.disjointEnd && a_slot.timestampBegin && a_slot.timestampEnd)
+			return true;
+
+		auto device = globals::d3d::device;
+		if (!device)
+			return false;
+
+		D3D11_QUERY_DESC disjointDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+		D3D11_QUERY_DESC timestampDesc{ D3D11_QUERY_TIMESTAMP, 0 };
+
+		if (!a_slot.disjointBegin && FAILED(device->CreateQuery(&disjointDesc, a_slot.disjointBegin.put())))
+			return false;
+		if (!a_slot.disjointEnd && FAILED(device->CreateQuery(&disjointDesc, a_slot.disjointEnd.put())))
+			return false;
+		if (!a_slot.timestampBegin && FAILED(device->CreateQuery(&timestampDesc, a_slot.timestampBegin.put())))
+			return false;
+		if (!a_slot.timestampEnd && FAILED(device->CreateQuery(&timestampDesc, a_slot.timestampEnd.put())))
+			return false;
+		return true;
+	}
+
+	GpuFrameTimer::SlotStatus GpuFrameTimer::TryReadSlot(Slot& a_slot, UINT64& a_outBegin, UINT64& a_outEnd, UINT64& a_outFrequency) const
+	{
+		auto context = globals::d3d::context;
+		if (!context)
+			return SlotStatus::Invalid;
+
+		// Same three-way handling as GpuPassTimers::TryCollectSlot: S_OK is a result,
+		// S_FALSE means ask again next frame, and a real failure means the query is
+		// unusable and the sample must be discarded rather than retried forever.
+		const auto poll = [context](ID3D11Query* a_query, void* a_out, UINT a_size) {
+			return context->GetData(a_query, a_out, a_size, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+		};
+
+		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointBeginData{};
+		HRESULT hr = poll(a_slot.disjointBegin.get(), &disjointBeginData, sizeof(disjointBeginData));
+		if (hr == S_FALSE)
+			return SlotStatus::NotReady;
+		if (FAILED(hr))
+			return SlotStatus::Invalid;
+
+		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointEndData{};
+		hr = poll(a_slot.disjointEnd.get(), &disjointEndData, sizeof(disjointEndData));
+		if (hr == S_FALSE)
+			return SlotStatus::NotReady;
+		if (FAILED(hr))
+			return SlotStatus::Invalid;
+
+		UINT64 beginTicks = 0, endTicks = 0;
+		hr = poll(a_slot.timestampBegin.get(), &beginTicks, sizeof(beginTicks));
+		if (hr == S_FALSE)
+			return SlotStatus::NotReady;
+		if (FAILED(hr))
+			return SlotStatus::Invalid;
+		hr = poll(a_slot.timestampEnd.get(), &endTicks, sizeof(endTicks));
+		if (hr == S_FALSE)
+			return SlotStatus::NotReady;
+		if (FAILED(hr))
+			return SlotStatus::Invalid;
+
+		// The two disjoint windows are degenerate (opened and closed around a single
+		// timestamp), so their Disjoint flag can only report a clock change happening at
+		// that exact instant. It is still respected - a set flag means the reading is
+		// worthless - but the check that actually covers the frame-spanning interval is
+		// the frequency comparison below and in Collect().
+		if (disjointBeginData.Disjoint || disjointEndData.Disjoint)
+			return SlotStatus::Invalid;
+		if (disjointBeginData.Frequency == 0 || disjointBeginData.Frequency != disjointEndData.Frequency)
+			return SlotStatus::Invalid;
+
+		a_outBegin = beginTicks;
+		a_outEnd = endTicks;
+		a_outFrequency = disjointBeginData.Frequency;
+		return SlotStatus::Ready;
+	}
+
+	void GpuFrameTimer::Collect()
+	{
+		// Oldest first: results complete in submission order, and a sample is built from
+		// two consecutive frames, so they must be folded in chronologically.
+		for (int age = 0; age < kFramesInFlight; ++age) {
+			auto& slot = slots[(writeSlot + age) % kFramesInFlight];
+			if (!slot.pending)
+				continue;
+
+			UINT64 beginTicks = 0, endTicks = 0, frequency = 0;
+			const SlotStatus status = TryReadSlot(slot, beginTicks, endTicks, frequency);
+			if (status == SlotStatus::NotReady)
+				continue;
+
+			slot.pending = false;
+			if (status == SlotStatus::Invalid) {
+				// The chain is broken: the next slot must not treat a discarded frame as
+				// its predecessor.
+				previous.valid = false;
+				continue;
+			}
+
+			// A sample needs the immediately preceding frame. Anything else (a dropped
+			// slot, a frame whose queries were never issued because the overlay was
+			// hidden, a clock frequency change) means there is no interval to measure.
+			const bool chained = previous.valid &&
+			                     slot.frameIndex == previous.frameIndex + 1 &&
+			                     previous.frequency == frequency;
+			if (chained && beginTicks >= previous.endTicks && previous.endTicks >= previous.beginTicks) {
+				const double toMs = 1000.0 / static_cast<double>(frequency);
+				const double elapsedMs = static_cast<double>(beginTicks - previous.beginTicks) * toMs;
+				const double presentMs = static_cast<double>(previous.endTicks - previous.beginTicks) * toMs;
+				const double workMs = static_cast<double>(beginTicks - previous.endTicks) * toMs;
+
+				if (elapsedMs >= kMinPlausibleMs && elapsedMs <= kMaxPlausibleMs) {
+					smoothedFrameElapsedMs = smoothedFrameElapsedMs * kSmoothingOld + static_cast<float>(elapsedMs) * kSmoothingNew;
+					smoothedPresentSpanMs = smoothedPresentSpanMs * kSmoothingOld + static_cast<float>(presentMs) * kSmoothingNew;
+					smoothedWorkSpanMs = smoothedWorkSpanMs * kSmoothingOld + static_cast<float>(workMs) * kSmoothingNew;
+					hasSample = true;
+				}
+			}
+
+			previous.valid = true;
+			previous.frameIndex = slot.frameIndex;
+			previous.beginTicks = beginTicks;
+			previous.endTicks = endTicks;
+			previous.frequency = frequency;
+		}
+	}
+
+	void GpuFrameTimer::Reset()
+	{
+		for (auto& slot : slots) {
+			slot.disjointBegin = nullptr;
+			slot.disjointEnd = nullptr;
+			slot.timestampBegin = nullptr;
+			slot.timestampEnd = nullptr;
+			slot.frameIndex = 0;
+			slot.pending = false;
+		}
+		previous = {};
+		frameIndex = 0;
+		writeSlot = 0;
+		openSlot = -1;
+		queryDevice = nullptr;
+		smoothedFrameElapsedMs = 0.0f;
+		smoothedWorkSpanMs = 0.0f;
+		smoothedPresentSpanMs = 0.0f;
+		hasSample = false;
+	}
+
+	void GpuFrameTimer::MarkPresentBegin()
+	{
+		if (!OverlayWantsTimings())
+			return;
+
+		// A query belongs to the device that created it; a device rebuild invalidates
+		// everything, including the smoothed values.
+		if (queryDevice != globals::d3d::device) {
+			Reset();
+			queryDevice = globals::d3d::device;
+		}
+
+		// Every path below that abandons a frame relies on the same mechanism rather than
+		// on invalidating the history directly: an abandoned frame never becomes a
+		// collected slot, so the "frameIndex == previous.frameIndex + 1" test in Collect()
+		// refuses to build a sample across the hole on its own. Clearing previous.valid
+		// here instead would additionally throw away the still-unread samples in the ring,
+		// which are perfectly good.
+
+		// A slot left open by a missing MarkPresentEnd (the overlay was hidden between the
+		// two calls) has an unpaired timestamp. Its result would never arrive, so it is
+		// discarded here instead of being allowed to pin the ring.
+		if (openSlot >= 0) {
+			slots[openSlot].pending = false;
+			openSlot = -1;
+		}
+
+		Collect();
+
+		++frameIndex;
+		auto& slot = slots[writeSlot];
+		// The slot about to be reused must be free. If its result never arrived within the
+		// latency budget, drop that sample rather than stalling on it.
+		slot.pending = false;
+
+		// Belt and braces against query nesting: if a pass interval is somehow still open
+		// at Present, its disjoint query is open too and ours would nest inside it. Skip
+		// the frame instead - one missing sample, no debug-layer error.
+		if (GpuPassTimers::GetSingleton()->HasOpenInterval())
+			return;
+
+		if (!EnsureQueries(slot))
+			return;
+
+		auto context = globals::d3d::context;
+		// Degenerate disjoint window: opened and closed around the single timestamp, so no
+		// GpuPassTimers pass interval can ever be nested inside it. Nothing of ours is
+		// mid-interval at this point in the frame either, so this Begin is never itself
+		// nested. Timestamp queries are issued with End() only.
+		context->Begin(slot.disjointBegin.get());
+		context->End(slot.timestampBegin.get());
+		context->End(slot.disjointBegin.get());
+
+		slot.frameIndex = frameIndex;
+		openSlot = writeSlot;
+	}
+
+	void GpuFrameTimer::MarkPresentEnd()
+	{
+		if (openSlot < 0)
+			return;  // begin marker was suppressed; nothing to pair with
+
+		auto& slot = slots[openSlot];
+		if (auto context = globals::d3d::context) {
+			context->Begin(slot.disjointEnd.get());
+			context->End(slot.timestampEnd.get());
+			context->End(slot.disjointEnd.get());
+			// Only a complete pair may be collected, so pending is set here and not in
+			// MarkPresentBegin.
+			slot.pending = true;
+		}
+
+		openSlot = -1;
+		writeSlot = (writeSlot + 1) % kFramesInFlight;
+	}
+
+	GpuFrameTimer::Report GpuFrameTimer::Get() const
+	{
+		Report report;
+		report.hasSample = hasSample;
+		report.frameElapsedMs = smoothedFrameElapsedMs;
+		report.workSpanMs = smoothedWorkSpanMs;
+		report.presentSpanMs = smoothedPresentSpanMs;
+		return report;
+	}
+
+	// ========================================================================
 	// CpuPassTimers
 	// ========================================================================
 

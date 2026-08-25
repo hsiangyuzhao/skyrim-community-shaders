@@ -1475,7 +1475,13 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 				"shows exactly what the current settings are actually executing. A feature that\n"
 				"is switched off has no row here rather than a row of zeros, and so does one\n"
 				"whose queries never came back. \"< 0.01 ms\" means measured but below the GPU\n"
-				"timer's resolution - real, just too small to put a number on.");
+				"timer's resolution - real, just too small to put a number on.\n"
+				"\n"
+				"The four summary rows at the bottom DO add up, and they account for the whole\n"
+				"GPU frame:\n"
+				"  Measured GPU + Untracked GPU + Gap = GPU frame (elapsed)\n"
+				"They come from a second, frame-spanning timestamp pair around Present. Hover\n"
+				"each one: \"elapsed\" is not \"busy\", and the gap row is not pure idle.");
 		}
 	}
 
@@ -1509,12 +1515,71 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 	gpuSummaryRows.push_back(DrawCallRow{
 		"Measured GPU:", kGpuTotalRowId, intervalSum, bucketSum,
 		Util::CalculatePercentage(bucketSum, smoothedFrameTime), 0.0f,
-		std::string("Sum of the GPU buckets above. Because these passes can overlap each other "
-					"and the rest of the frame, this is not a share of frame time and not a "
-					"residual - it is the total GPU time the instrumented passes reported, and "
-					"a LOWER BOUND on how busy the GPU actually was (the engine's own draws are "
-					"not instrumented)."),
+		std::string("Sum of the GPU buckets above: Community Shaders' own passes and nothing "
+					"else, so a LOWER BOUND on how busy the GPU actually was.\n\n"
+					"What is missing from it now has its own row: see \"Untracked GPU\" below "
+					"for the engine's own rendering plus DLSS super resolution, and \"Gap\" for "
+					"the Present window where DLSS-G frame generation runs."),
 		true, std::nullopt, std::nullopt });
+
+	// Whole-frame GPU timeline (batch 14). The bucket rows above only ever cover our own
+	// passes, which left the engine's own rendering, DLSS super resolution and DLSS-G frame
+	// generation with no row anywhere - the reason "GPU (ours)" could only ever be a
+	// ">=". Util::GpuFrameTimer supplies the frame-spanning pair that closes the gap, and
+	// the three rows below are additive: untracked + gap + measured == frame (elapsed).
+	const auto frameGpu = Util::GpuFrameTimer::GetSingleton()->Get();
+	if (frameGpu.hasSample) {
+		// Clamped at zero on purpose. The bucket sum and the frame span are collected from
+		// different frames and smoothed independently, so on a settings change the
+		// difference can dip slightly negative for a few frames; a negative millisecond
+		// count would read as a broken measurement rather than as transient skew.
+		const float untrackedMs = std::max(0.0f, frameGpu.workSpanMs - bucketSum);
+
+		gpuSummaryRows.push_back(DrawCallRow{
+			"Untracked GPU (engine + DLSS):", kGpuUntrackedRowId, kDrawCallsNotApplicable, untrackedMs,
+			Util::CalculatePercentage(untrackedMs, smoothedFrameTime), 0.0f,
+			std::string("GPU work in this frame that is NOT one of our passes. This is the row that "
+						"used to be missing entirely.\n\n"
+						"Computed as the GPU-timeline stretch between the end of the previous Present "
+						"and the start of this one, minus \"Measured GPU\" above.\n\n"
+						"What lives here: the game engine's own rendering (shadow maps, the opaque and "
+						"alpha passes, water, the vanilla post chain), DLSS/FSR super resolution, and "
+						"any gaps inside the frame where the GPU had nothing submitted to it. DLSS-G "
+						"frame generation is NOT here - it runs while Present is executing and lands "
+						"in the gap row below.\n\n"
+						"Large here and small in \"Measured GPU\" means Community Shaders is not what "
+						"is costing you the frame. The reverse means it is."),
+			true, std::nullopt, std::nullopt });
+
+		gpuSummaryRows.push_back(DrawCallRow{
+			"Gap: idle / flip / frame-gen:", kGpuGapRowId, kDrawCallsNotApplicable, frameGpu.presentSpanMs,
+			Util::CalculatePercentage(frameGpu.presentSpanMs, smoothedFrameTime), 0.0f,
+			std::string("Elapsed GPU clock across the Present call itself, i.e. the part of the frame "
+						"in which nothing of the frame's own rendering is running.\n\n"
+						"It is a MIXTURE, not pure idle: the flip, vsync or frame-limiter pacing, "
+						"DLSS-G frame generation (which executes on its own queue during Present and "
+						"is therefore invisible to our timestamps), and genuine GPU idle while the CPU "
+						"is blocked. Treat it as an UPPER BOUND on how idle the GPU was.\n\n"
+						"With frame generation on, a large number here is expected and does not mean "
+						"there is headroom: half of it is the generated frame being produced."),
+			true, std::nullopt, std::nullopt });
+
+		gpuSummaryRows.push_back(DrawCallRow{
+			"GPU frame (elapsed):", kGpuFrameElapsedRowId, kDrawCallsNotApplicable, frameGpu.frameElapsedMs,
+			Util::CalculatePercentage(frameGpu.frameElapsedMs, smoothedFrameTime), 0.0f,
+			std::string("Present-to-present distance measured on the GPU's own clock.\n\n"
+						"ELAPSED, NOT BUSY. A GPU timestamp reads a clock that keeps ticking while the "
+						"GPU has nothing to do, so this number includes every idle microsecond and in "
+						"steady state simply tracks wall-clock frame time. It is here as the "
+						"denominator for the two rows above and as a sanity check: if it does not "
+						"match \"Total\" in the table further up, the two clocks disagree and none of "
+						"the GPU numbers should be trusted.\n\n"
+						"There is no way to measure whole-frame GPU BUSY time from inside a D3D11 "
+						"plugin. What can be done is what the rows above do: bound it from below with "
+						"our own passes, size the rest of the frame's rendering, and bound the idle "
+						"from above."),
+			true, std::nullopt, std::nullopt });
+	}
 
 	// Plain handler: pass rows have no toggle and no summary-row special cases.
 	std::function<void(int, int, const DrawCallRow&)> rowHandler =
@@ -1596,18 +1661,25 @@ void PerformanceOverlay::DrawOurCpuPassTable(const std::vector<DrawCallRow>& our
 /**
  * @brief CPU-bound / GPU-bound readout.
  *
- * The verdict comes from how long the CPU spends blocked in Present, which is the only
- * reliable signal available from inside a D3D11 plugin:
+ * The verdict still comes from how long the CPU spends blocked in Present, because that is
+ * the only signal that is cheap, always available, and unambiguous about the CPU: it is
+ * exactly "the CPU had nothing to do but wait". What it is NOT is a GPU-bound test - it
+ * cannot tell a GPU wait from a vsync wait, a frame-limiter wait, or (the case that made
+ * this misleading in practice) Streamline's proxy Present pacing a frame-generated
+ * presentation queue. All of those park the CPU in Present with the GPU largely idle.
  *
- *   - a frame-spanning timestamp pair does NOT measure GPU busy time. GPU timestamps are
- *     elapsed GPU clock, and that clock runs while the GPU is idle, so such a span just
- *     reproduces wall-clock frame time.
- *   - the sum of our GPU buckets is a genuine measurement but only of OUR passes, so it is
- *     a lower bound on GPU busy time and is labelled as one.
- *   - Present blocking, on the other hand, is exactly "the CPU had nothing to do but wait".
+ * Batch 14 therefore stops treating the Present wait as the whole story and adds the
+ * frame-spanning GPU timestamps of Util::GpuFrameTimer:
  *
- * The one thing it cannot distinguish is a GPU wait from a vsync or frame-limiter wait,
- * which the tooltip says outright.
+ *   - a frame-spanning pair still does NOT measure GPU busy time. GPU timestamps read a
+ *     clock that runs while the GPU is idle, so the span itself just reproduces wall-clock
+ *     frame time - it is reported as "elapsed" and never as "busy".
+ *   - what carries information is where the pair is SPLIT. Both markers bracket the real
+ *     Present, so the frame's own rendering lands on one side and the flip, the pacing and
+ *     DLSS-G frame generation land on the other.
+ *   - the sum of our GPU buckets is a genuine measurement but only of OUR passes, so it
+ *     stays a lower bound; the difference against the rendering side of the split is the
+ *     engine plus DLSS super resolution, which is the "Untracked GPU" line.
  */
 void PerformanceOverlay::DrawBottleneckSummary()
 {
@@ -1654,17 +1726,27 @@ void PerformanceOverlay::DrawBottleneckSummary()
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted(
 					"How this is decided: the share of the frame the CPU spends blocked inside\n"
-					"Present. Over 25% means the CPU is waiting and the frame is limited by\n"
-					"something downstream of it; under 10% means the CPU never gets to idle.\n"
+					"Present. Over 25% means the CPU is waiting on something downstream of it;\n"
+					"under 10% means the CPU never gets to idle.\n"
+					"\n"
+					"IMPORTANT: this is a CPU test, not a GPU test. A big Present wait does NOT\n"
+					"mean the GPU is busy. Vsync, a frame-rate cap, and Streamline pacing a\n"
+					"frame-generated presentation queue all park the CPU in Present with the GPU\n"
+					"mostly idle. \"GPU-bound (or frame-limited)\" really does mean \"or\".\n"
+					"\n"
+					"To find out where the GPU time goes, read the GPU Passes table instead:\n"
+					"\"Untracked GPU\" is the engine's own rendering plus DLSS super resolution,\n"
+					"and \"Gap\" is the Present window (flip, pacing, frame generation, idle).\n"
 					"\n"
 					"Error sources, honestly:\n"
 					"  - a Present wait can be the GPU, vsync, or a frame-rate limiter. Uncap the\n"
-					"    frame rate to tell them apart.\n"
-					"  - \"GPU (measured)\" is only OUR passes, so it is a LOWER BOUND on GPU busy\n"
+					"    frame rate and switch frame generation off to tell them apart.\n"
+					"  - \"GPU (ours)\" is only OUR passes, so it is a LOWER BOUND on GPU busy\n"
 					"    time. The engine's own draws are not instrumented.\n"
-					"  - there is no honest way to measure whole-frame GPU busy time from here: a\n"
-					"    frame-spanning timestamp pair measures elapsed GPU clock, which keeps\n"
-					"    running while the GPU is idle, so it would just restate frame time.\n"
+					"  - whole-frame GPU BUSY time still cannot be measured from inside a D3D11\n"
+					"    plugin. The frame-spanning timestamps are elapsed GPU clock, which keeps\n"
+					"    running while the GPU is idle; they are only useful because they are\n"
+					"    split at Present, which separates rendering from flip and frame-gen.\n"
 					"  - GPU numbers are read back a few frames late and passes overlap, so they\n"
 					"    do not line up frame-for-frame with the CPU numbers.\n"
 					"  - everything here is smoothed over roughly 20 frames.");
@@ -1688,17 +1770,63 @@ void PerformanceOverlay::DrawBottleneckSummary()
 		ImGui::Text("%.2f ms (%.0f%%)", waitMs, waitShare * 100.0f);
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Measured with QueryPerformanceCounter around the real Present call.\nGPU wait, vsync wait and frame-limiter wait all land here.");
+				ImGui::TextUnformatted(
+					"Measured with QueryPerformanceCounter around the real Present call: CPU time,\n"
+					"not GPU time.\n"
+					"\n"
+					"A GPU wait, a vsync wait, a frame-limiter wait and Streamline's frame-\n"
+					"generation pacing all land here and cannot be told apart. So this being large\n"
+					"does NOT mean the GPU was busy - and it does not mean the GPU was idle either.\n"
+					"For that, read \"Untracked GPU\" and \"Gap\" in the GPU Passes table.");
 			}
 		}
 
 		ImGui::TableNextColumn();
-		ImGui::TextUnformatted("GPU (measured):");
+		ImGui::TextUnformatted("GPU (ours):");
 		ImGui::TableNextColumn();
-		ImGui::Text(">= %.2f ms", gpuMeasuredMs);
+		ImGui::Text("%.2f ms", gpuMeasuredMs);
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Sum of the GPU pass buckets: Community Shaders' own passes only, so a\nlower bound on how busy the GPU was. Not comparable 1:1 with the CPU\nnumbers - different clock, read back a few frames late, and the passes\noverlap each other.");
+				ImGui::TextUnformatted(
+					"Sum of the GPU pass buckets: Community Shaders' own passes and nothing else.\n"
+					"An exact figure for OUR cost, and a lower bound on total GPU busy time.\n"
+					"\n"
+					"It used to be shown as \">= x ms\" because everything else on the GPU was\n"
+					"unmeasured. The line below now measures that remainder, so this one no longer\n"
+					"has to stand in for the whole GPU.\n"
+					"\n"
+					"Not comparable 1:1 with the CPU numbers - different clock, read back a few\n"
+					"frames late, and the passes overlap each other.");
+			}
+		}
+
+		// The batch 14 addition: the engine's own rendering plus DLSS super resolution,
+		// which is what the 65% of unattributed frame time mostly was.
+		const auto frameGpu = Util::GpuFrameTimer::GetSingleton()->Get();
+		ImGui::TableNextColumn();
+		ImGui::TextUnformatted("GPU (other):");
+		ImGui::TableNextColumn();
+		if (frameGpu.hasSample) {
+			const float untrackedMs = std::max(0.0f, frameGpu.workSpanMs - gpuMeasuredMs);
+			ImGui::Text("%.2f ms rendering + %.2f ms gap", untrackedMs, frameGpu.presentSpanMs);
+		} else {
+			ImGui::TextUnformatted("collecting...");
+		}
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted(
+					"From the frame-spanning timestamp pair around Present, split into the two\n"
+					"halves of the frame:\n"
+					"\n"
+					"  rendering - GPU time in the frame that is not one of our passes: the\n"
+					"              engine's own draws and DLSS/FSR super resolution.\n"
+					"  gap       - GPU time while Present is executing: the flip, vsync or\n"
+					"              frame-limiter pacing, DLSS-G frame generation on its own\n"
+					"              queue, and genuine idle. A mixture, so an upper bound on\n"
+					"              idle rather than a measurement of it.\n"
+					"\n"
+					"\"GPU (ours)\" + rendering + gap is the whole GPU frame. The GPU Passes table\n"
+					"shows the same three numbers as rows, with the total.");
 			}
 		}
 
@@ -2064,15 +2192,24 @@ PerformanceOverlay::DrawCallRowSets PerformanceOverlay::BuildDrawCallRows() cons
 	};
 
 	DrawCallRow presentWaitRow = {
-		"Present / GPU wait:", magic_enum::enum_integer(SpecialShaderType::PresentWait), kDrawCallsNotApplicable,
+		// Deliberately no longer called "Present / GPU wait": the label itself was the source
+		// of the "the GPU was idle 70% of the frame" misreading. It is CPU blocked time.
+		"Present wait (CPU blocked):", magic_enum::enum_integer(SpecialShaderType::PresentWait), kDrawCallsNotApplicable,
 		presentWaitMs, Util::CalculatePercentage(presentWaitMs, smoothedFrameTime), 0.0f,
-		std::string("CPU time blocked inside Present, measured around the real Present call.\n\n"
-					"Large means the CPU is waiting - for the GPU to finish, for vsync, or for a "
-					"frame-rate limiter. Small means the CPU never got a chance to idle, i.e. the "
-					"CPU is the limit. This is the main input to the CPU-bound / GPU-bound verdict "
-					"above the table.\n\n"
-					"It cannot tell a GPU wait apart from a vsync or frame-cap wait: uncap the frame "
-					"rate if you need to know which."),
+		std::string("CPU time blocked inside Present, measured around the real Present call. This "
+					"is a CPU measurement. It says nothing about whether the GPU was busy.\n\n"
+					"A large number here means only one thing: the CPU had nothing left to do. The "
+					"wait can be the GPU finishing, vsync, a frame-rate limiter, or - on D3D11 with "
+					"Streamline in the chain - the proxy Present pacing out a frame-generated "
+					"presentation queue. With DLSS-G on, most of this row is usually pacing, and "
+					"reading it as \"the GPU was busy 70% of the frame\" is the specific mistake it "
+					"invites.\n\n"
+					"For where the GPU time actually went, read the GPU Passes table: "
+					"\"Untracked GPU\" is the engine's own rendering plus super resolution, "
+					"\"Gap\" is the Present window itself (flip, pacing, frame generation, idle), "
+					"and \"GPU frame (elapsed)\" is the total they add up to.\n\n"
+					"To separate a real GPU wait from pacing: uncap the frame rate and switch frame "
+					"generation off, then watch whether this row stays large."),
 		true, std::nullopt, std::nullopt
 	};
 
