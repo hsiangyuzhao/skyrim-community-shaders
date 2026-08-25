@@ -2635,6 +2635,35 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	const bool eyeUseVanillaDirectLobe = false;
 #	endif
 
+	// (batch 17) Two knobs on the vanilla soft-lighting / rim / back-lighting fill terms.
+	// Both are spelled as preprocessor macros rather than local variables, for the same
+	// reason batch 15's flags are spelled out verbatim at their original sites: hoisting a
+	// predicate into a named variable makes fxc materialise it somewhere else and cascades
+	// register allocation through the whole light loop. Batch 12 (const locals) and batch 15
+	// (a hoisted `Enable && EnableGGX`) each lost bit-identical non-eye codegen that way. A
+	// macro is pure text, so the original expression is still the original expression with one
+	// factor appended.
+	//
+	// EYE_SOFT_LIGHTING_SCALE -- item 1, the eye fix. Scales only the soft-lighting fill on
+	// eye materials; the Lambert diffuse and every specular term are untouched. Substitute the
+	// literal 1.0 for this macro and the multiply folds away entirely, which is how "non-eye
+	// materials are bit-identical" is proved: a non-eye pixel multiplies by exactly 1.0 and no
+	// other instruction in the shader changes. On permutations compiled without
+	// VANILLA_FRESNEL there is no eye handling at all, so the macro *is* the literal.
+	//
+	// SUN_SOFT_SHADOW -- item 2, the consistency fix, off by default. dirDetailShadow has
+	// already absorbed parallaxShadow by the time these terms run (`dirDetailShadow *=
+	// parallaxShadow` a few lines above each use site), so this single factor supplies both
+	// occluders. Folded to a compile-time false the ternary becomes 1.0 and the multiply
+	// disappears, so the default is a zero-instruction no-op rather than a value that happens
+	// to be one.
+#	if defined(VANILLA_FRESNEL)
+#		define EYE_SOFT_LIGHTING_SCALE ((enableVanillaFresnel && applyEyeHandling) ? SharedData::vanillaFresnelSettings.EyeSoftLightingScale : 1.0)
+#	else
+#		define EYE_SOFT_LIGHTING_SCALE 1.0
+#	endif
+#	define SUN_SOFT_SHADOW (SharedData::vanillaFresnelSettings.ShadowSoftLighting ? dirDetailShadow : 1.0)
+
 #	if defined(SKIN) && defined(CS_SKIN)
 	Skin::SkinSurfaceProperties skinSurfaceProperties = Skin::InitSkinSurfaceProperties();
 
@@ -2955,15 +2984,15 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 dirDiffuseColor = dirLightColor * saturate(dirLightAngle) * dirDetailShadow * Color::VanillaDiffuseMult();
 
 #		if defined(SOFT_LIGHTING)
-	lightsDiffuseColor += dirLightColor * GetSoftLightMultiplier(dirLightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult();
+	lightsDiffuseColor += dirLightColor * GetSoftLightMultiplier(dirLightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_SOFT_LIGHTING_SCALE * SUN_SOFT_SHADOW;
 #		endif
 
 #		if defined(RIM_LIGHTING)
-	lightsDiffuseColor += dirLightColor * GetRimLightMultiplier(DirLightDirection, viewDirection, worldNormal.xyz) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult();
+	lightsDiffuseColor += dirLightColor * GetRimLightMultiplier(DirLightDirection, viewDirection, worldNormal.xyz) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * SUN_SOFT_SHADOW;
 #		endif
 
 #		if defined(BACK_LIGHTING)
-	lightsDiffuseColor += dirLightColor * saturate(-dirLightAngle) * backLightColor.xyz * Color::VanillaDiffuseMult();
+	lightsDiffuseColor += dirLightColor * saturate(-dirLightAngle) * backLightColor.xyz * Color::VanillaDiffuseMult() * SUN_SOFT_SHADOW;
 #		endif
 
 	if (useSnowSpecular && useSnowDecalSpecular) {
@@ -3068,7 +3097,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float3 lightDiffuseColor = lightColor * saturate(lightAngle.xxx) * Color::VanillaDiffuseMult();
 
 #				if defined(SOFT_LIGHTING)
-		lightDiffuseColor += lightColor * GetSoftLightMultiplier(lightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult();
+		lightDiffuseColor += lightColor * GetSoftLightMultiplier(lightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_SOFT_LIGHTING_SCALE;
 #				endif  // SOFT_LIGHTING
 
 #				if defined(RIM_LIGHTING)
@@ -3262,7 +3291,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float lightBacklighting = 1.0 + saturate(dot(normalizedLightDirection.xyz, viewDirection));
 
 #				if defined(SOFT_LIGHTING)
-		lightDiffuseColor += lightBacklighting * lightColor * GetSoftLightMultiplier(lightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult();
+		lightDiffuseColor += lightBacklighting * lightColor * GetSoftLightMultiplier(lightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_SOFT_LIGHTING_SCALE;
 #				endif
 
 #				if defined(RIM_LIGHTING)

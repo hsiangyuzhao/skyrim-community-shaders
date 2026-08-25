@@ -107,8 +107,54 @@ struct VanillaFresnel : public Feature
         // Default 0 reproduces the December-2025 baseline (bedec8379), which is the only
         // configuration with a known-correct reference.
         uint EyeDirectSpecularMode = 0;
-        // Explicit tail padding. 15 slots is 60 bytes and alignas(16) rounds the struct to
-        // 80; the five spare slots are named so the HLSL mirror in Common/SharedData.hlsli
+        // (batch 17) How much of the vanilla *soft lighting* term an eye keeps. This is the
+        // sixth attempt at "eyes glow in side-on sunlight" and the first one that stops
+        // looking at the highlight, because the previous five proved the highlight cannot be
+        // the cause: in the default VanillaPhong mode the eye's direct lobe is HdotN^479
+        // against the face's ^30, a pinprick that physically cannot wash out an eyeball.
+        //
+        // Soft lighting is a fill term Skyrim adds on top of the Lambert diffuse. Its
+        // multiplier (Lighting.hlsl's GetSoftLightMultiplier) is zero facing the light, zero
+        // fully backlit, and peaks *side-on* -- which is exactly the light dependence that
+        // was reported, and no hypothesis about the highlight has that shape. On the sun it
+        // is also the one term in the file that never gets multiplied by the screen-space
+        // shadow, so the light it adds is completely unoccluded by brow, socket or hair.
+        // Vanilla sets the strength behind it (Lighting Effect 1) to 1.0 on male and 1.5 on
+        // female human eyes against 0.4 on a head, and pairs it with a soft-lighting map
+        // (EyeBrown_sk.dds) whose median is 0.87 -- roughly half a full sunlight's worth of
+        // unshadowed fill, measured offline from the vanilla NIFs and DDS.
+        //
+        // Default 0 because that is what the *face* already gets: Lighting.hlsl `#undef`s
+        // SOFT_LIGHTING outright whenever Subsurface Scattering is installed, so on any setup
+        // with SSS the face has no soft lighting at all. Zeroing it on eyes makes them
+        // consistent with the face rather than picking a number. The slider exists because
+        // eyes can read a little dead at 0 and putting some back is a legitimate taste
+        // choice.
+        //
+        // This is a pre-existing defect, not one of ours: the term is byte-identical to the
+        // December-2025 baseline (bedec8379). What changed is that batch 9 gave eyes a
+        // real-time environment reflection they did not have, which lifted the whole eye and
+        // pushed the fill over the threshold where it gets noticed.
+        float EyeSoftLightingScale = 0.0f;
+        // (batch 17) Multiply the *sun's* soft-lighting, rim-lighting and back-lighting terms
+        // by the screen-space + parallax shadow, the way the point-light versions of the same
+        // three terms in Lighting.hlsl already are. Those three sun terms take dirLightColor
+        // before dirDetailShadow is applied; the point-light twins take a lightColor that has
+        // already been multiplied by the light's shadow. That is an inconsistency, not a
+        // design decision -- but fixing it changes every material carrying those flags, not
+        // just eyes (foliage, cloth, leather all lose 40-70% of the term inside their own
+        // shadow), so it ships as an off-by-default switch rather than a silent change.
+        //
+        // Hosted in this struct only because that is where the eye work lives; it is not
+        // eye-specific and is read on every permutation, including ones compiled without the
+        // VANILLA_FRESNEL define (FeatureData is populated whether or not the feature is on).
+        //
+        // Deliberately does *not* add saturate(N dot L) to those terms. Reaching around onto
+        // the unlit side is the entire point of soft lighting; clamping it would switch the
+        // feature off rather than shadow it. Occlusion only.
+        uint ShadowSoftLighting = false;
+        // Explicit tail padding. 17 slots is 68 bytes and alignas(16) rounds the struct to
+        // 80; the three spare slots are named so the HLSL mirror in Common/SharedData.hlsli
         // can spell out the same 20 slots. That cbuffer is a naked concatenation of every
         // feature's settings (src/FeatureBuffer.cpp), so the two sides must agree on the
         // struct's size, not only on its fields.
@@ -120,11 +166,14 @@ struct VanillaFresnel : public Feature
         // 64 -> 80 and physSkyData, ssrtSettings, exponentialHeightFogSettings and
         // ssgiSettings each shift 16 bytes later -- on both sides at once, which is what
         // makes it safe. Same shift batch 7 and batch 10b performed.
+        //
+        // (batch 17) EyeSoftLightingScale and ShadowSoftLighting took pad3 and pad4, so
+        // sizeof stays 80 and nothing downstream in FeatureData moves. The six offsetof
+        // assertions batch 15 left in src/FeatureBuffer.cpp are what proves that rather than
+        // assumes it: if this struct had grown past 80 they would fail to compile.
         float pad0 = 0.0f;
         float pad1 = 0.0f;
         float pad2 = 0.0f;
-        float pad3 = 0.0f;
-        float pad4 = 0.0f;
 	} settings;
 
 	// (batch 10b) FeatureData is a naked concatenation of every feature's settings struct
@@ -140,6 +189,10 @@ struct VanillaFresnel : public Feature
 	// (batch 15) Now 80. EyeDirectSpecularMode took the 15th slot and alignas(16) rounded up,
 	// so the four structs after this one in FeatureData move 16 bytes later. Verified against
 	// fxc's reflection listing for Lighting.hlsl before and after; see the batch 15 report.
+	//
+	// (batch 17) Still 80. EyeSoftLightingScale and ShadowSoftLighting went into pad3/pad4,
+	// so no downstream offset moved; fxc still reports vanillaFresnelSettings at 1008 size 80
+	// and physSkyData at 1088.
 	static_assert(sizeof(Settings) == 80,
 		"VanillaFresnel::Settings must stay 20 x 4 bytes to match VanillaFresnelSettings in "
 		"package/Shaders/Common/SharedData.hlsli.");

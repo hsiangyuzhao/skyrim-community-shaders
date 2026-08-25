@@ -20,7 +20,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     EyeRoughness,
     EnvMaskStrength,
     EyeDirectRoughness,
-    EyeDirectSpecularMode)
+    EyeDirectSpecularMode,
+    EyeSoftLightingScale,
+    ShadowSoftLighting)
 
 namespace
 {
@@ -143,6 +145,11 @@ void VanillaFresnel::LoadSettings(json& o_json)
             settings.EyeDirectSpecularMode);
         settings.EyeDirectSpecularMode = static_cast<uint>(EyeDirectSpecular::VanillaPhong);
     }
+
+    // (batch 17) Same reasoning as the clamp above: this one is multiplied straight into a
+    // light term, so a hand-edited 50 would not fail, it would just make eyes glow far worse
+    // than the defect this setting exists to fix. The UI range is 0..1.
+    settings.EyeSoftLightingScale = std::clamp(settings.EyeSoftLightingScale, 0.0f, 1.0f);
 }
 
 void VanillaFresnel::SaveSettings(json& o_json)
@@ -284,6 +291,53 @@ void VanillaFresnel::DrawSettings()
             "It also turned out not to be the fix. Both GGX modes spread a fixed amount of "
             "energy over a wider or narrower patch -- lowering this concentrates the same total "
             "brightness into a smaller spot rather than removing any of it.");
+
+    // (batch 17) The one that actually matches the reported symptom. See the long note on
+    // Settings::EyeSoftLightingScale for why five previous attempts at the eye all looked at
+    // the highlight and none of them could have worked.
+    ImGui::SliderFloat("Eye Soft Lighting Scale", &settings.EyeSoftLightingScale, 0.0f, 1.0f, "%.2f");
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "How much of Skyrim's \"soft lighting\" fill an eye keeps. 0 removes it, 1 is the "
+            "vanilla amount. Only applies while Enable Eye Special Handling is on, and only to "
+            "eyes.\n\n"
+            "Soft lighting is extra light Skyrim adds on top of normal diffuse lighting to fake "
+            "light bleeding through a thin surface. It is at its strongest when the light is "
+            "hitting the surface side-on, and fades to nothing both facing the light and fully "
+            "behind it -- so it does nothing at night and nothing in full backlight.\n\n"
+            "On eyes it is the reason for \"my character's eyes glow in side-on sunlight\". Two "
+            "things stack up: vanilla sets this fill two to four times stronger on eyes than on "
+            "a face and pairs it with an almost-white texture, and on the sun this one term "
+            "never gets multiplied by the shadow, so brow, eye socket and hair do not block any "
+            "of it. Together that is roughly half a full sunbeam landing on the eye with "
+            "nothing in the way.\n\n"
+            "0 is the default because that is what the face already gets: whenever Subsurface "
+            "Scattering is installed, soft lighting on skin is switched off completely in the "
+            "shader. Setting eyes to 0 makes them match the face instead of picking an "
+            "arbitrary number. Turn it up if the eyes look too dead for you -- that is a taste "
+            "call and there is no wrong answer.\n\n"
+            "This is an old defect, not a new one: it has been in the shader since at least "
+            "December 2025. What changed is that eyes gained a real-time environment "
+            "reflection, which brightened them enough for the fill to become obvious.");
+
+    ImGui::Checkbox("Shadow Soft/Rim/Back Lighting (Sun)", reinterpret_cast<bool*>(&settings.ShadowSoftLighting));
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Makes the sun's soft-lighting, rim-lighting and back-lighting fill obey shadows. "
+            "Off by default, and off means exactly today's picture -- nothing changes until you "
+            "tick it.\n\n"
+            "These three fill terms have a gap: the versions driven by torches and other point "
+            "lights are multiplied by that light's shadow, but the versions driven by the sun "
+            "are not. The sun's fill therefore passes straight through anything casting a "
+            "shadow -- a brow over an eye, a leaf over the leaf behind it, a fold in cloth.\n\n"
+            "Ticking this multiplies the sun's three terms by the same screen-space and "
+            "parallax shadow the rest of the sunlight already uses, matching what the point "
+            "lights do.\n\n"
+            "It is off by default because it is not an eyes-only change. Every material that "
+            "uses these flags is affected -- foliage, cloth, leather, skin -- and inside their "
+            "own shadow the term drops by roughly 40 to 70 percent. That is more correct, but "
+            "it is a broad change to how the game looks, so it is your call rather than ours. "
+            "Worth trying with the Eye Soft Lighting Scale slider above put back up.");
 
     ImGui::SliderFloat("Environment Mask Strength", &settings.EnvMaskStrength, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())

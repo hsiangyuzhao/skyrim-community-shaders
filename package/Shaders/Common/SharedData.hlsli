@@ -302,15 +302,18 @@ namespace SharedData
 		// so this struct is now 20 slots = 80 bytes, and physSkyData, ssrtSettings,
 		// exponentialHeightFogSettings and ssgiSettings all sit 16 bytes later than before.
 		// The C++ side grew by exactly the same 16 (VanillaFresnel::Settings' static_assert).
+		//
+		// (batch 17) EyeSoftLightingScale and ShadowSoftLighting took pad3 and pad4, so the
+		// struct is still 20 slots = 80 bytes and nothing after it moved.
 		float EyeRoughness;
 		float EnvMaskStrength;
 		float EyeDirectRoughness;
 		uint EyeDirectSpecularMode;
+		float EyeSoftLightingScale;
+		uint ShadowSoftLighting;
 		float pad0;
 		float pad1;
 		float pad2;
-		float pad3;
-		float pad4;
 	};
 
 	// (batch 15) Values for VanillaFresnelSettings::EyeDirectSpecularMode. Mirrors
