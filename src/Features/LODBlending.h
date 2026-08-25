@@ -36,12 +36,17 @@ struct LODBlending : Feature
 	Settings settings;
 
 	// (batch 19) Grass LOD has no LOD macro, so it is identified per draw in Hooks.cpp instead.
-	// Two independent judgements, because the primary one rests on a naming convention:
+	// Two judgements, because the primary one rests on a naming convention:
 	//   - name: shape name is exactly "grasspassthru" (every grass-LOD vertex in the measured
 	//     object LOD sits under that one name, no variants)
 	//   - fallback: no user data (merged LOD has no TESObjectREFR, placed foliage does) and the
 	//     material is back-lit -- independent of any generator's naming
-	// Both are counted every frame whichever one is armed, so one screenshot says which fired.
+	//
+	// They are not symmetric: a shape named grasspassthru is necessarily merged and back-lit, so
+	// the name set is a subset of the fallback set. In-game draw counts for the two came out
+	// equal, and a subset of equal size is the same set -- so on the measured content the two
+	// agree exactly, which is what rules out the fallback over-reaching into placed back-lit
+	// foliage. That is why the counters they were measured with are gone again.
 	enum class GrassDetection : uint
 	{
 		Name = 0,
@@ -50,12 +55,6 @@ struct LODBlending : Feature
 	};
 
 	GrassDetection grassDetection = GrassDetection::Name;
-
-	uint32_t grassNameHits = 0;
-	uint32_t grassFallbackHits = 0;
-	uint32_t grassNameHitsLastFrame = 0;
-	uint32_t grassFallbackHitsLastFrame = 0;
-	uint32_t grassDiagFrame = 0;
 
 	virtual void DrawSettings() override;
 

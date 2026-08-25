@@ -236,28 +236,13 @@ namespace LightingExtensions
 
 			state->permutationData.ExtraShaderDescriptor &= ~static_cast<uint32_t>(State::ExtraShaderDescriptors::IsLODGrass);
 
-			auto& lodBlending = globals::features::lodBlending;
-
-			if (lodBlending.grassDiagFrame != state->frameCount) {
-				lodBlending.grassDiagFrame = state->frameCount;
-				lodBlending.grassNameHitsLastFrame = lodBlending.grassNameHits;
-				lodBlending.grassFallbackHitsLastFrame = lodBlending.grassFallbackHits;
-				lodBlending.grassNameHits = 0;
-				lodBlending.grassFallbackHits = 0;
-			}
-
-			// Both judgements run every draw whichever one is armed, so the readout in the UI
-			// says which of them would have fired. Without that, a slider with no visible
-			// effect is indistinguishable from a detection that never matched anything.
-			const bool byName = IsGrassLODName(pass->geometry->name.c_str());
-			const bool byFallback = IsGrassLODNoUserDataAndBackLit(pass);
-
-			lodBlending.grassNameHits += byName;
-			lodBlending.grassFallbackHits += byFallback;
-
-			const bool isGrassLOD = lodBlending.grassDetection == LODBlending::GrassDetection::Name ?
-			                            byName :
-			                            byFallback;
+			// Only the armed judgement is evaluated. Both ran while their per-frame draw counts
+			// were being compared in the UI; those counts came out equal, and since the name set
+			// is a subset of the fallback set by construction, equal size means the same set.
+			const bool isGrassLOD =
+				globals::features::lodBlending.grassDetection == LODBlending::GrassDetection::Name ?
+					IsGrassLODName(pass->geometry->name.c_str()) :
+					IsGrassLODNoUserDataAndBackLit(pass);
 			if (isGrassLOD)
 				state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsLODGrass);
 		}

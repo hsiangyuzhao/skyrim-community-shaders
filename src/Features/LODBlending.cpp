@@ -62,23 +62,12 @@ void LODBlending::DrawSettings()
 	}
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
-			"How a draw is recognised as grass LOD. Both judgements are counted every frame "
-			"regardless of which one is selected, so the readout below tells you whether the "
-			"other one would have worked.\n\n"
+			"How a draw is recognised as grass LOD. The two were measured to select exactly the "
+			"same draws, so switching between them should not change the image.\n\n"
 			"The default rests on a naming convention, which is why the alternative exists: it "
 			"keys off merged LOD having no object reference behind it and the material being "
-			"back-lit, and so does not care what the LOD generator names its shapes.");
-	}
-
-	ImGui::Text("Detected this frame -- name: %u draws, fallback: %u draws",
-		grassNameHitsLastFrame, grassFallbackHitsLastFrame);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text(
-			"Both counts are taken every frame, whichever mode is selected.\n\n"
-			"If the selected mode reads 0 while the other reads more than 0, switch modes. "
-			"If both read 0 in an exterior with grass LOD in view, the draws are not reaching "
-			"this hook at all and the gamma slider cannot work -- that is a different bug from "
-			"the slider having no visible effect.");
+			"back-lit, and so does not care what the LOD generator names its shapes. Switch to "
+			"it if LOD from a different generator stops responding to the slider above.");
 	}
 }
 
