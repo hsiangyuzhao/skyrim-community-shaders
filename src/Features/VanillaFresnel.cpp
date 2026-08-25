@@ -19,7 +19,19 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ComplexMaterialF0Multiplier,
     EyeRoughness,
     EnvMaskStrength,
-    EyeDirectRoughness)
+    EyeDirectRoughness,
+    EyeDirectSpecularMode)
+
+namespace
+{
+	// (batch 15) Labels for VanillaFresnel::EyeDirectSpecular, in enum order.
+	constexpr std::array EyeDirectSpecularModeNames{
+		"Vanilla Phong (matches Dec-2025)",
+		"GGX, gated by gloss + mask",
+		"GGX, raw (current)"
+	};
+	static_assert(EyeDirectSpecularModeNames.size() == static_cast<std::size_t>(VanillaFresnel::EyeDirectSpecular::Total));
+}
 
 namespace
 {
@@ -121,6 +133,16 @@ void VanillaFresnel::LoadSettings(json& o_json)
                      "enabling Phong to GGX. Conversion prepares GGX-shaped F0/roughness, which vanilla "
                      "phong specular cannot consume correctly.");
     }
+
+    // (batch 15) A hand-edited or older json can hold anything here; an out-of-range value
+    // would index past the label array in DrawSettings and would fall through every branch in
+    // Lighting.hlsl, silently landing on GGXRaw. Clamp to the safe default instead.
+    if (settings.EyeDirectSpecularMode >= static_cast<uint>(EyeDirectSpecular::Total)) {
+        logger::warn("[VanillaFresnel] Eye Direct Specular Mode was {}, which is not a valid mode; "
+                     "resetting to Vanilla Phong.",
+            settings.EyeDirectSpecularMode);
+        settings.EyeDirectSpecularMode = static_cast<uint>(EyeDirectSpecular::VanillaPhong);
+    }
 }
 
 void VanillaFresnel::SaveSettings(json& o_json)
@@ -205,7 +227,45 @@ void VanillaFresnel::DrawSettings()
             "Raising this is a workaround, not a fix. The real problem is that the environment "
             "reflection arrives too bright, and blurring it only spreads the excess out.");
 
+    // (batch 15) The switch, not another number. See the long note on
+    // Settings::EyeDirectSpecularMode for why four previous attempts at the glowing eye all
+    // moved a roughness and none of them helped.
+    {
+        int mode = static_cast<int>(settings.EyeDirectSpecularMode);
+        if (ImGui::Combo("Eye Direct Specular Mode", &mode, EyeDirectSpecularModeNames.data(),
+                static_cast<int>(EyeDirectSpecularModeNames.size()))) {
+            settings.EyeDirectSpecularMode = static_cast<uint>(std::clamp(mode, 0,
+                static_cast<int>(EyeDirectSpecularModeNames.size()) - 1));
+        }
+    }
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Which lighting model draws the highlight an actual light source -- the sun, a "
+            "torch -- leaves on an eye. Only applies while Enable Eye Special Handling is on, "
+            "and only to direct light: the environment reflection in an eye is controlled by "
+            "Eye Roughness above and is the same in all three modes.\n\n"
+            "Eyes need their own setting because they are the only surface in the game whose "
+            "GGX reflectance and roughness are fixed numbers instead of being read from the "
+            "material's own textures. Every other surface feeds its gloss map and specular "
+            "colour into the GGX highlight, so those values keep it in check. An eye has "
+            "nothing doing that job, and the GGX highlight is roughly three thousand times "
+            "more concentrated than the old one at the same settings.\n\n"
+            "Vanilla Phong (matches Dec-2025): the eye's direct highlight uses the original "
+            "Skyrim highlight, multiplied by the gloss map and the environment mask the way it "
+            "always was, even with Enable Phong to GGX switched on. This is the December 2025 "
+            "behaviour and it is the only one of the three we have a known-good reference for, "
+            "which is why it is the default.\n\n"
+            "GGX, gated by gloss + mask: keeps the newer GGX highlight but puts the gloss map "
+            "and the environment mask back in front of it. In principle the better answer -- "
+            "it is the modern lighting model *and* it respects what the eye texture says. "
+            "Untested, so it is not the default.\n\n"
+            "GGX, raw (current): what the mod has been doing since the Phong-to-GGX default "
+            "was switched on. Kept so you can flip between them and see the difference for "
+            "yourself.");
+
+    ImGui::BeginDisabled(settings.EyeDirectSpecularMode == static_cast<uint>(EyeDirectSpecular::VanillaPhong));
     ImGui::SliderFloat("Eye Direct Light Roughness", &settings.EyeDirectRoughness, 0.04f, 1.0f, "%.2f");
+    ImGui::EndDisabled();
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
             "How wide the highlight from an actual light source -- the sun, a torch, a candle -- "
@@ -217,7 +277,13 @@ void VanillaFresnel::DrawSettings()
             "The two needs are not the same. The environment reflection is being blurred to "
             "compensate for arriving too bright; a direct highlight has no such problem and "
             "wants the physically correct cornea value. 0.10 is that value and is the default. "
-            "Raise it only if you want a deliberately soft, matte highlight.");
+            "Raise it only if you want a deliberately soft, matte highlight.\n\n"
+            "Greyed out in Vanilla Phong mode: the original Skyrim highlight has no roughness, "
+            "it takes its width from the material's own specular power, so this slider does "
+            "nothing there.\n\n"
+            "It also turned out not to be the fix. Both GGX modes spread a fixed amount of "
+            "energy over a wider or narrower patch -- lowering this concentrates the same total "
+            "brightness into a smaller spot rather than removing any of it.");
 
     ImGui::SliderFloat("Environment Mask Strength", &settings.EnvMaskStrength, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())

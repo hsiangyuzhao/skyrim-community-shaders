@@ -293,16 +293,35 @@ namespace SharedData
 		// physSkyData, ssrtSettings, exponentialHeightFogSettings and ssgiSettings by 16 --
 		// consistently on both sides, which is what makes it safe.
 		//
-		// (batch 13) EyeDirectRoughness was appended into what used to be pad0, so this stays
+		// (batch 13) EyeDirectRoughness was appended into what used to be pad0, so this stayed
 		// at 64 bytes and nothing after it moved. EyeRoughness now drives only the environment
 		// reflection and the G-buffer glossiness; EyeDirectRoughness drives the direct-light
 		// GGX lobe (see the split at Lighting.hlsl's directSpecularRoughness).
+		//
+		// (batch 15) EyeDirectSpecularMode is the 15th slot and there was no pad left to take,
+		// so this struct is now 20 slots = 80 bytes, and physSkyData, ssrtSettings,
+		// exponentialHeightFogSettings and ssgiSettings all sit 16 bytes later than before.
+		// The C++ side grew by exactly the same 16 (VanillaFresnel::Settings' static_assert).
 		float EyeRoughness;
 		float EnvMaskStrength;
 		float EyeDirectRoughness;
+		uint EyeDirectSpecularMode;
 		float pad0;
 		float pad1;
+		float pad2;
+		float pad3;
+		float pad4;
 	};
+
+	// (batch 15) Values for VanillaFresnelSettings::EyeDirectSpecularMode. Mirrors
+	// VanillaFresnel::EyeDirectSpecular in src/Features/VanillaFresnel.h.
+	//
+	// Only the *direct* highlight on eye materials is affected. The environment reflection
+	// path (EyeRoughness, DynamicCubemaps::GetDynamicCubemap, psout.NormalGlossiness) is
+	// untouched by all three -- batch 13 separated the two and they stay separated.
+	static const uint EyeDirectSpecularModeVanillaPhong = 0;  // vanilla phong lobe + both gates
+	static const uint EyeDirectSpecularModeGGXGated = 1;      // GGX lobe + both gates restored
+	static const uint EyeDirectSpecularModeGGXRaw = 2;        // GGX lobe, no gates (batch 9-14)
 
 	struct PhysSkyData
 	{

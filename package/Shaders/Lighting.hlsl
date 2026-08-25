@@ -671,7 +671,13 @@ float ProcessSparkleColor(float color)
 }
 #	endif
 
-float3 GetLightSpecularInput(PS_INPUT input, float3 L, float3 V, float3 N, float3 lightColor, float3 F0, float roughness, float shininess, float2 uv)
+// (batch 15) a_forceVanillaLobe is an extra veto on the GGX branch below, false for every
+// material except an eye in EyeDirectSpecularMode = VanillaPhong. The GGX test itself is
+// untouched, so when the caller's flag is a compile-time false the whole term folds away and
+// the codegen is exactly what it was before this batch. See the flag block near
+// `directSpecularRoughness` in the pixel shader body. With VANILLA_FRESNEL undefined the
+// parameter is unused and fxc drops it.
+float3 GetLightSpecularInput(PS_INPUT input, float3 L, float3 V, float3 N, float3 lightColor, float3 F0, float roughness, float shininess, float2 uv, bool a_forceVanillaLobe)
 {
 	float3 H = normalize(V + L);
 	float HdotN = 1.0;
@@ -693,7 +699,7 @@ float3 GetLightSpecularInput(PS_INPUT input, float3 L, float3 V, float3 N, float
 #	endif
 
 #	if defined(VANILLA_FRESNEL)
-	if (SharedData::vanillaFresnelSettings.Enable && SharedData::vanillaFresnelSettings.EnableGGX) {
+	if (SharedData::vanillaFresnelSettings.Enable && SharedData::vanillaFresnelSettings.EnableGGX && !a_forceVanillaLobe) {
 		float NdotV = saturate(dot(N, V));
 		float NdotL = saturate(dot(N, L));
 		float NdotH = saturate(dot(N, H));
@@ -2568,10 +2574,65 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// Non-eye pixels take the `roughness` value unchanged, so nothing outside eye materials
 	// changes; with VANILLA_FRESNEL off this is a plain copy that fxc folds away.
 	float directSpecularRoughness = roughness;
+
+	// (batch 15) Which lighting model the direct lobes use, and whether the vanilla per-pixel
+	// specular gates in the SPECULAR block near the end of this shader still run.
+	//
+	// Batches 10b and 13 both tried to fix the glowing eye by moving a roughness, and both
+	// failed for the same reason: the GGX lobe in GetLightSpecularInput is energy-normalised,
+	// so roughness only decides how wide the same total energy spreads. What actually changed
+	// in batch 9 was EnableGGX's *default*, false -> true, and that did two things at once:
+	//
+	//   1. It turned on the GGX block at :701, which for eyes runs on a hardcoded F0 (0.027)
+	//      and a hardcoded roughness -- the only surface in the shader whose GGX inputs are
+	//      not read from the material.
+	//   2. It made the assignment in the SPECULAR block skip itself, and that assignment is
+	//      where the two per-pixel gates lived: `specularColor * glossiness` (glossiness is
+	//      normal.w, the gloss map, set at :1969/:1972) times either `SpecularColor.xyz` or
+	//      `lerp(SpecularColor.xyz, F0, envMask)` -- the environment mask. `MaterialData.yyy`
+	//      is a separate statement and was never skipped.
+	//
+	// Every other material feeds its own gloss/specular numbers into GGX, so for them (2) is
+	// a deliberate model swap. Eyes had nothing else holding the lobe down, so for eyes it is
+	// just a missing brake -- D_GGX peaks at 3183 at roughness 0.1 against phong's 1.
+	//
+	// All three flags below are *additional* terms that start at false and are only ever
+	// raised inside `applyEyeHandling`. They are deliberately not folded into the existing
+	// conditions they modify: the original expressions stay spelled out verbatim at their
+	// original sites and gain one `&& !flag` / `|| flag`. That is what keeps non-eye output
+	// bit-identical -- fold the eye test to a compile-time false and fxc constant-propagates
+	// each flag to false, the extra term disappears, and the conditions revert to the exact
+	// text they had before this batch. An earlier draft hoisted `Enable && EnableGGX` into a
+	// variable instead, which is semantically the same but made fxc materialise the predicate
+	// once outside the light loop rather than at each inlined call site -- one extra ine/and
+	// pair and a register-allocation cascade through every SPECULAR permutation.
 #	if defined(VANILLA_FRESNEL)
+	bool eyeUseVanillaDirectLobe = false;    // VanillaPhong: phong lobe instead of the GGX one
+	bool eyeForceVanillaGates = false;       // VanillaPhong + GGXGated: run the two gates
+	bool eyeSuppressConvertedF0 = false;     // VanillaPhong: gate on plain SpecularColor.xyz
 	if (enableVanillaFresnel && applyEyeHandling) {
 		directSpecularRoughness = clamp(SharedData::vanillaFresnelSettings.EyeDirectRoughness, 0.04, 1.0);
+
+		const uint eyeDirectSpecularMode = SharedData::vanillaFresnelSettings.EyeDirectSpecularMode;
+		if (eyeDirectSpecularMode == SharedData::EyeDirectSpecularModeVanillaPhong) {
+			// Phong lobe plus both gates, and the gate uses plain SpecularColor.xyz with no
+			// converted-cubemap F0 mixed in. That is exactly what bedec8379 compiled to for an
+			// eye, because EnableGGX and EnableDynamicCubemapsConversion both defaulted off
+			// there. The one branch with a known-correct reference.
+			eyeUseVanillaDirectLobe = true;
+			eyeForceVanillaGates = true;
+			eyeSuppressConvertedF0 = true;
+		} else if (eyeDirectSpecularMode == SharedData::EyeDirectSpecularModeGGXGated) {
+			// GGX lobe, but put the two gates back. Theoretically the better answer --
+			// energy-conserving lobe, and the author's gloss map and env mask respected --
+			// and unverified, which is why it is not the default.
+			eyeForceVanillaGates = true;
+		}
+		// EyeDirectSpecularModeGGXRaw leaves all three false: GGX lobe, gates skipped, i.e.
+		// the batch 9 - batch 14 behaviour, kept for A/B.
 	}
+#	else
+	const bool eyeUseVanillaDirectLobe = false;
 #	endif
 
 #	if defined(SKIN) && defined(CS_SKIN)
@@ -2877,7 +2938,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float3 dirDiffuseColor = dirLightColor * saturate(dirLightAngle) * dirDetailShadow * Color::VanillaDiffuseMult();
 
 #		if defined(SPECULAR) || defined(SPARKLE)
-		lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
+		lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, directSpecularRoughness, shininess, uv, eyeUseVanillaDirectLobe) * Color::VanillaSpecularMult();
 #		endif
 
 		lightsDiffuseColor += dirDiffuseColor;
@@ -2919,11 +2980,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 		else {
 #			if defined(SPECULAR)
-			lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
+			lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, directSpecularRoughness, shininess, uv, eyeUseVanillaDirectLobe) * Color::VanillaSpecularMult();
 #			endif
 		}
 #		elif defined(SPECULAR) || defined(SPARKLE)
-		lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
+		lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, directSpecularRoughness, shininess, uv, eyeUseVanillaDirectLobe) * Color::VanillaSpecularMult();
 #		endif
 	}
 
@@ -2996,7 +3057,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float3 lightDiffuseColor = lightColor * saturate(lightAngle.xxx) * Color::VanillaDiffuseMult();
 
 #				if defined(SPECULAR) || (defined(SPARKLE) && !defined(SNOW))
-			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
+			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv, eyeUseVanillaDirectLobe) * Color::VanillaSpecularMult();
 #				endif  // defined (SPECULAR) || (defined (SPARKLE) && !defined(SNOW))
 
 			lightsDiffuseColor += lightDiffuseColor;
@@ -3027,11 +3088,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			transmissionColor += lightTransmissionColor;
 		} else {
 #					if defined(SPECULAR)
-			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
+			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv, eyeUseVanillaDirectLobe) * Color::VanillaSpecularMult();
 #					endif
 		}
 #				elif defined(SPECULAR) || (defined(SPARKLE) && !defined(SNOW))
-		lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
+		lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv, eyeUseVanillaDirectLobe) * Color::VanillaSpecularMult();
 #				endif  // defined (SPECULAR) || (defined (SPARKLE) && !defined(SNOW))
 
 		lightsDiffuseColor += lightDiffuseColor;
@@ -3189,7 +3250,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float3 lightDiffuseColor = lightColor * parallaxShadow * saturate(lightAngle.xxx) * Color::VanillaDiffuseMult();
 
 #				if defined(SPECULAR) || (defined(SPARKLE) && !defined(SNOW))
-			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
+			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv, eyeUseVanillaDirectLobe) * Color::VanillaSpecularMult();
 #				endif
 
 			lightsDiffuseColor += lightDiffuseColor;
@@ -3222,11 +3283,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			transmissionColor += lightTransmissionColor;
 		} else {
 #					if defined(SPECULAR)
-			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
+			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv, eyeUseVanillaDirectLobe) * Color::VanillaSpecularMult();
 #					endif
 		}
 #				elif defined(SPECULAR) || (defined(SPARKLE) && !defined(SNOW))
-		lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
+		lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv, eyeUseVanillaDirectLobe) * Color::VanillaSpecularMult();
 #				endif
 
 		lightsDiffuseColor += lightDiffuseColor;
@@ -3628,11 +3689,26 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		elif defined(SKIN) && defined(CS_SKIN)
 	if (!skinEnabled)
 #		endif
+		// (batch 15) This assignment is the *only* place the two per-pixel gates on the direct
+		// specular live: `specularColor * glossiness` (glossiness is normal.w, the gloss map,
+		// set at :1969/:1972) and the environment mask inside the ternary. Turning EnableGGX on
+		// makes the whole statement skip itself, which is a deliberate model swap for materials
+		// that feed their own gloss/specular numbers into GGX -- and a missing brake for eyes,
+		// whose GGX F0 and roughness are hardcoded and have nothing else restraining them.
+		// `specularColor *= MaterialData.yyy` below is a separate statement and was never part
+		// of the skip.
+		//
+		// The two original conditions are unchanged; each gained one extra term that is false
+		// for everything except an eye in the matching EyeDirectSpecularMode.
+		// eyeForceVanillaGates runs the gates in VanillaPhong and GGXGated;
+		// eyeSuppressConvertedF0 drops the converted-cubemap F0 mix in VanillaPhong so the gate
+		// is plain SpecularColor.xyz, which is the shape bedec8379 had (conversion defaulted
+		// off there).
 #		if defined(VANILLA_FRESNEL)
-	if (!(enableVanillaFresnel && SharedData::vanillaFresnelSettings.EnableGGX))
+	if (!(enableVanillaFresnel && SharedData::vanillaFresnelSettings.EnableGGX) || eyeForceVanillaGates)
 #		endif
 #		if defined(VANILLA_FRESNEL) && (defined(ENVMAP) || defined(MULTI_LAYER_PARALLAX) || defined(EYE))
-		specularColor = (specularColor * glossiness) * ((enableVanillaFresnel && SharedData::vanillaFresnelSettings.EnableDynamicCubemapsConversion) ? lerp(SpecularColor.xyz, F0, envMask) : SpecularColor.xyz);
+		specularColor = (specularColor * glossiness) * ((enableVanillaFresnel && SharedData::vanillaFresnelSettings.EnableDynamicCubemapsConversion && !eyeSuppressConvertedF0) ? lerp(SpecularColor.xyz, F0, envMask) : SpecularColor.xyz);
 #		else
 		specularColor = (specularColor * glossiness) * SpecularColor.xyz;
 #		endif

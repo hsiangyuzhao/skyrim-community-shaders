@@ -69,3 +69,58 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		// FeatureData cbuffer in Common/SharedData.hlsli -- appending moves no existing offset.
 		globals::features::screenSpaceGI.GetCommonBufferData());
 }
+
+namespace
+{
+	// (batch 15) FeatureData in package/Shaders/Common/SharedData.hlsli is nothing but the
+	// concatenation above, in that order, so every struct's offset is the sum of the sizes of
+	// the ones before it. Grow any one of them and everything after it moves -- silently, with
+	// a clean build, and only visible in-game as a feature reading another feature's numbers.
+	//
+	// Mirroring the concatenation as a real struct lets offsetof() pin the C++ side against the
+	// offsets fxc reports for the HLSL side. The numbers below were read out of fxc's reflection
+	// listing for Lighting.hlsl (fxc -Fc, `cbuffer SharedData::FeatureData`), not calculated.
+	// Batch 15 grew VanillaFresnel::Settings from 64 to 80 bytes, which is why the last four
+	// entries sit 16 bytes later than they did at ea8459bd0.
+	template <class T>
+	using SettingsOf = std::decay_t<T>;
+
+	struct FeatureDataLayoutMirror
+	{
+		SettingsOf<decltype(globals::features::grassLighting.settings)> grassLighting;
+		SettingsOf<decltype(globals::features::extendedMaterials.settings)> extendedMaterials;
+		SettingsOf<decltype(globals::features::dynamicCubemaps.settings)> dynamicCubemaps;
+		SettingsOf<decltype(globals::features::terrainShadows.GetCommonBufferData())> terrainShadows;
+		SettingsOf<decltype(globals::features::lightLimitFix.GetCommonBufferData())> lightLimitFix;
+		SettingsOf<decltype(globals::features::wetnessEffects.GetCommonBufferData())> wetnessEffects;
+		SettingsOf<decltype(globals::features::skylighting.GetCommonBufferData(true))> skylighting;
+		SettingsOf<decltype(globals::features::cloudShadows.settings)> cloudShadows;
+		SettingsOf<decltype(globals::features::lodBlending.settings)> lodBlending;
+		SettingsOf<decltype(globals::features::hairSpecular.settings)> hairSpecular;
+		SettingsOf<decltype(globals::features::terrainVariation.settings)> terrainVariation;
+		SettingsOf<decltype(globals::features::ibl.settings)> ibl;
+		SettingsOf<decltype(globals::features::extendedTranslucency.GetCommonBufferData())> extendedTranslucency;
+		SettingsOf<decltype(globals::features::linearLighting.GetCommonBufferData())> linearLighting;
+		SettingsOf<decltype(globals::features::postProcessing.settings)> postProcessing;
+		SettingsOf<decltype(globals::features::skin.GetCommonBufferData())> skin;
+		SettingsOf<decltype(globals::features::screenSpacePointLightShadows.GetCommonBufferData())> screenSpacePointLightShadows;
+		SettingsOf<decltype(globals::features::vanillaFresnel.settings)> vanillaFresnel;
+		SettingsOf<decltype(globals::features::physicalSky.cbData)> physicalSky;
+		SettingsOf<decltype(globals::features::screenSpaceRayTracing.GetCommonBufferData())> screenSpaceRayTracing;
+		SettingsOf<decltype(globals::features::exponentialHeightFog.settings)> exponentialHeightFog;
+		SettingsOf<decltype(globals::features::screenSpaceGI.GetCommonBufferData())> screenSpaceGI;
+	};
+
+	static_assert(offsetof(FeatureDataLayoutMirror, vanillaFresnel) == 1008,
+		"SharedData::vanillaFresnelSettings moved; update the HLSL mirror and this offset together.");
+	static_assert(offsetof(FeatureDataLayoutMirror, physicalSky) == 1088,
+		"SharedData::physSkyData moved; update the HLSL mirror and this offset together.");
+	static_assert(offsetof(FeatureDataLayoutMirror, screenSpaceRayTracing) == 1344,
+		"SharedData::ssrtSettings moved; update the HLSL mirror and this offset together.");
+	static_assert(offsetof(FeatureDataLayoutMirror, exponentialHeightFog) == 1376,
+		"SharedData::exponentialHeightFogSettings moved; update the HLSL mirror and this offset together.");
+	static_assert(offsetof(FeatureDataLayoutMirror, screenSpaceGI) == 1440,
+		"SharedData::ssgiSettings moved; update the HLSL mirror and this offset together.");
+	static_assert(sizeof(FeatureDataLayoutMirror) == 1456,
+		"FeatureData's total size changed; check every offset above against fxc's reflection listing.");
+}
