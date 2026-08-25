@@ -2549,6 +2549,31 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #	endif  // defined (ENVMAP) || defined (MULTI_LAYER_PARALLAX) || defined(EYE)
 
+	// (batch 13) The roughness handed to the *direct* light lobes, split off from the one that
+	// drives the environment reflection.
+	//
+	// GetLightSpecularInput feeds its roughness straight into BRDF::D_GGX (:701), and every
+	// direct light in this shader calls it -- the sun at :2880/:2922/:2926 and each point light
+	// below. Both eye overrides above (:2413 and :2537) run before any of those calls, so
+	// EyeRoughness went into the sun's GGX lobe as well as into the cubemap fetch. At 0.7 that
+	// lobe is wide enough that side-on sunlight stops reading as a glint on the cornea and
+	// becomes a white sheet across the whole eyeball. 0.7 exists to blur an environment
+	// reflection that is too *bright*; the direct lobe never needed that compensation.
+	//
+	// Everything else keeps using `roughness`, deliberately: GetDynamicCubemap (:3362) is the
+	// environment reflection, and psout.NormalGlossiness writes 1 - roughness, which
+	// DeferredCompositeCS.hlsl turns back into `roughness * 7` to pick a cubemap mip
+	// (:485-486) -- also the environment. Only the direct lobes move.
+	//
+	// Non-eye pixels take the `roughness` value unchanged, so nothing outside eye materials
+	// changes; with VANILLA_FRESNEL off this is a plain copy that fxc folds away.
+	float directSpecularRoughness = roughness;
+#	if defined(VANILLA_FRESNEL)
+	if (enableVanillaFresnel && applyEyeHandling) {
+		directSpecularRoughness = clamp(SharedData::vanillaFresnelSettings.EyeDirectRoughness, 0.04, 1.0);
+	}
+#	endif
+
 #	if defined(SKIN) && defined(CS_SKIN)
 	Skin::SkinSurfaceProperties skinSurfaceProperties = Skin::InitSkinSurfaceProperties();
 
@@ -2852,7 +2877,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float3 dirDiffuseColor = dirLightColor * saturate(dirLightAngle) * dirDetailShadow * Color::VanillaDiffuseMult();
 
 #		if defined(SPECULAR) || defined(SPARKLE)
-		lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, roughness, shininess, uv) * Color::VanillaSpecularMult();
+		lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
 #		endif
 
 		lightsDiffuseColor += dirDiffuseColor;
@@ -2894,11 +2919,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 		else {
 #			if defined(SPECULAR)
-			lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, roughness, shininess, uv) * Color::VanillaSpecularMult();
+			lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
 #			endif
 		}
 #		elif defined(SPECULAR) || defined(SPARKLE)
-		lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, roughness, shininess, uv) * Color::VanillaSpecularMult();
+		lightsSpecularColor = GetLightSpecularInput(input, DirLightDirection, viewDirection, worldNormal.xyz, dirLightColor.xyz * dirDetailShadow, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
 #		endif
 	}
 
@@ -2971,7 +2996,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float3 lightDiffuseColor = lightColor * saturate(lightAngle.xxx) * Color::VanillaDiffuseMult();
 
 #				if defined(SPECULAR) || (defined(SPARKLE) && !defined(SNOW))
-			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, roughness, shininess, uv) * Color::VanillaSpecularMult();
+			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
 #				endif  // defined (SPECULAR) || (defined (SPARKLE) && !defined(SNOW))
 
 			lightsDiffuseColor += lightDiffuseColor;
@@ -3002,11 +3027,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			transmissionColor += lightTransmissionColor;
 		} else {
 #					if defined(SPECULAR)
-			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, roughness, shininess, uv) * Color::VanillaSpecularMult();
+			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
 #					endif
 		}
 #				elif defined(SPECULAR) || (defined(SPARKLE) && !defined(SNOW))
-		lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, roughness, shininess, uv) * Color::VanillaSpecularMult();
+		lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
 #				endif  // defined (SPECULAR) || (defined (SPARKLE) && !defined(SNOW))
 
 		lightsDiffuseColor += lightDiffuseColor;
@@ -3164,7 +3189,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float3 lightDiffuseColor = lightColor * parallaxShadow * saturate(lightAngle.xxx) * Color::VanillaDiffuseMult();
 
 #				if defined(SPECULAR) || (defined(SPARKLE) && !defined(SNOW))
-			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, roughness, shininess, uv) * Color::VanillaSpecularMult();
+			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
 #				endif
 
 			lightsDiffuseColor += lightDiffuseColor;
@@ -3197,11 +3222,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			transmissionColor += lightTransmissionColor;
 		} else {
 #					if defined(SPECULAR)
-			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, roughness, shininess, uv) * Color::VanillaSpecularMult();
+			lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
 #					endif
 		}
 #				elif defined(SPECULAR) || (defined(SPARKLE) && !defined(SNOW))
-		lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, roughness, shininess, uv) * Color::VanillaSpecularMult();
+		lightsSpecularColor += GetLightSpecularInput(input, normalizedLightDirection, viewDirection, worldNormal.xyz, lightColor, F0, directSpecularRoughness, shininess, uv) * Color::VanillaSpecularMult();
 #				endif
 
 		lightsDiffuseColor += lightDiffuseColor;

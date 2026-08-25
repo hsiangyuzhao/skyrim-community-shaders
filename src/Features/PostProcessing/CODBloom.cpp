@@ -22,7 +22,17 @@ void CODBloom::DrawSettings()
 	ImGui::Separator();
 
 	static int mipLevel = 1;
-	ImGui::SliderInt("Mip Level", &mipLevel, 1, (int)settings.MipBlendFactor.size() + 1, "%d", ImGuiSliderFlags_AlwaysClamp);
+	// (batch 13) Upper bound is size(), not size() + 1. The Intensity slider below indexes
+	// MipBlendFactor[mipLevel - 1] and ImGui::SliderFloat writes through that address, so the
+	// old bound of 9 against an 8-element array let a user drag Mip Level to the top and then
+	// have any Intensity edit write one float past the end of Settings -- straight into
+	// whatever the allocator put next. Levels 1..8 already cover every entry: the deepest
+	// pyramid is s_BloomMips - 1 == 8 and Draw reads its weight as MipBlendFactor[topMip - 1],
+	// i.e. index 7. Nothing reachable was lost. Independent of the Debug slider's lastTopMip
+	// bound, which limits which mip may be *displayed*, not which weight may be edited --
+	// clamping this one to lastTopMip too would make the zero-weight levels uneditable and so
+	// unrecoverable, since zeroing them is exactly what peels them off.
+	ImGui::SliderInt("Mip Level", &mipLevel, 1, (int)settings.MipBlendFactor.size(), "%d", ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("The greater the level, the blurrier the part it controls");
 	ImGui::Indent();

@@ -287,16 +287,21 @@ namespace SharedData
 		float CubemapToF0Multiplier;
 		float ComplexMaterialF0Multiplier;
 		// (batch 10b) Mirrors VanillaFresnel::Settings. Sixteen 4-byte slots = 64 bytes; the
-		// three pads are spelled out because FeatureData is a naked concatenation of every
+		// pads are spelled out because FeatureData is a naked concatenation of every
 		// feature's struct (src/FeatureBuffer.cpp), so this side has to state the same size
 		// the C++ side gets from alignas(16). Growing this struct by 16 bytes shifts
 		// physSkyData, ssrtSettings, exponentialHeightFogSettings and ssgiSettings by 16 --
 		// consistently on both sides, which is what makes it safe.
+		//
+		// (batch 13) EyeDirectRoughness was appended into what used to be pad0, so this stays
+		// at 64 bytes and nothing after it moved. EyeRoughness now drives only the environment
+		// reflection and the G-buffer glossiness; EyeDirectRoughness drives the direct-light
+		// GGX lobe (see the split at Lighting.hlsl's directSpecularRoughness).
 		float EyeRoughness;
 		float EnvMaskStrength;
+		float EyeDirectRoughness;
 		float pad0;
 		float pad1;
-		float pad2;
 	};
 
 	struct PhysSkyData

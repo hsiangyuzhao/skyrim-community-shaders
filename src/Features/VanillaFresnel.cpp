@@ -18,7 +18,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     CubemapToF0Multiplier,
     ComplexMaterialF0Multiplier,
     EyeRoughness,
-    EnvMaskStrength)
+    EnvMaskStrength,
+    EyeDirectRoughness)
 
 namespace
 {
@@ -187,8 +188,9 @@ void VanillaFresnel::DrawSettings()
     ImGui::SliderFloat("Eye Roughness", &settings.EyeRoughness, 0.04f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
-            "How blurred the reflection in an eye is. Only applies while Enable Eye Special "
-            "Handling is on.\n\n"
+            "How blurred the *environment reflection* in an eye is -- the room, the sky, the "
+            "cubemap. Since batch 13 it no longer touches direct light; that has its own slider "
+            "below. Only applies while Enable Eye Special Handling is on.\n\n"
             "This used to be fixed at 0.10, which is the physically correct value for a cornea "
             "-- a real eye is a mirror. It was calibrated against the vanilla eye cubemap, "
             "which is 32x32 and almost black, so a mirror-sharp eye had nothing to reflect. "
@@ -199,7 +201,23 @@ void VanillaFresnel::DrawSettings()
             "Cubemaps Conversion off.\n\n"
             "This is an absolute value: Roughness Multiplier does not scale it. If you raised "
             "that multiplier to fix eyes, set it back to 1.00 or every metal surface stays "
-            "flat.");
+            "flat.\n\n"
+            "Raising this is a workaround, not a fix. The real problem is that the environment "
+            "reflection arrives too bright, and blurring it only spreads the excess out.");
+
+    ImGui::SliderFloat("Eye Direct Light Roughness", &settings.EyeDirectRoughness, 0.04f, 1.0f, "%.2f");
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "How wide the highlight from an actual light source -- the sun, a torch, a candle -- "
+            "is on an eye. Only applies while Enable Eye Special Handling is on.\n\n"
+            "This used to share one value with Eye Roughness above, and that was the bug: "
+            "Eye Roughness had been raised to 0.70 to blur the environment reflection, and the "
+            "same 0.70 widened the sun's highlight until it stopped being a glint and covered "
+            "the whole eyeball. In side-on sunlight the eyes read as glowing white.\n\n"
+            "The two needs are not the same. The environment reflection is being blurred to "
+            "compensate for arriving too bright; a direct highlight has no such problem and "
+            "wants the physically correct cornea value. 0.10 is that value and is the default. "
+            "Raise it only if you want a deliberately soft, matte highlight.");
 
     ImGui::SliderFloat("Environment Mask Strength", &settings.EnvMaskStrength, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
