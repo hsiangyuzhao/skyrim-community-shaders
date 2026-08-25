@@ -57,7 +57,20 @@ struct VanillaFresnel : public Feature
         uint EnableDynamicCubemapsConversion = true;
         uint EnableEyeSpecialHandling = true;
         float RoughnessMultiplier = 1.0f;
-        float SpecularRoughnessBlend = 1.0f;
+        // (batch 9) How much of the (1-glossiness)^2 roughness derivation is mixed into the
+        // specular-power one, scaled again by (1-glossiness) at the use site
+        // (Lighting.hlsl:2408). Introduced to stop metals reading flat.
+        //
+        // (batch 18) Default back to 0. This was never part of the eye investigation -- it
+        // fires on SPECULAR, non-eye pixels only -- but it moved the picture for every
+        // vanilla specular material in the game, and six rounds of eye work made it
+        // impossible to tell which visible change came from where. 0 makes the lerp at
+        // :2409 collapse to its first argument, so the roughness is literally
+        // `roughnessFromShininess` again: the pre-batch-9 formula, character for character.
+        // The slider stays -- the flat-metal complaint was real and 1.0 is still the fix for
+        // it, it just should not have been the default while something else was being
+        // diagnosed.
+        float SpecularRoughnessBlend = 0.0f;
         float BaseF0Multiplier = 0.32f;
         float MinF0 = 0.02f;
         float CubemapToF0Multiplier = 1.0f;
@@ -71,7 +84,17 @@ struct VanillaFresnel : public Feature
         float EyeRoughness = 0.7f;
         // (batch 10b) How much of an authored environment mask batch 10 honours. 0 restores
         // the pre-batch-10 behaviour (mask ignored), 1 applies the full mask.
-        float EnvMaskStrength = 1.0f;
+        //
+        // (batch 18) Default back to 0. Batch 10 honoured the mask in order to hold eyes down,
+        // and that turned out to be doomed on its own terms: the vanilla eye mask is a black
+        // field with a *bright* iris ring (73% of texels near black but 12.4% at >= 0.8,
+        // p90 = 1.0), so the mask is ~1 exactly on the part of the eye that was complained
+        // about and multiplying by it does nothing there. What it did do is cost every other
+        // material: across the 270 shipping `_m.dds` masks the median per-texture mean is
+        // 0.14, so metal armour lost roughly nine tenths of its reflection to fix an eye it
+        // could never have fixed. 0 makes the lerp at Lighting.hlsl:3485 evaluate to 1.0 and
+        // the multiply becomes the identity, which is exactly the batch-9 path. Slider kept.
+        float EnvMaskStrength = 0.0f;
         // (batch 13) Roughness for eye materials in the *direct* light lobe only -- the sun and
         // every point light. EyeRoughness above now applies solely to the environment/cubemap
         // reflection and to the glossiness written into the G-buffer.
@@ -124,18 +147,29 @@ struct VanillaFresnel : public Feature
         // (EyeBrown_sk.dds) whose median is 0.87 -- roughly half a full sunlight's worth of
         // unshadowed fill, measured offline from the vanilla NIFs and DDS.
         //
-        // Default 0 because that is what the *face* already gets: Lighting.hlsl `#undef`s
-        // SOFT_LIGHTING outright whenever Subsurface Scattering is installed, so on any setup
-        // with SSS the face has no soft lighting at all. Zeroing it on eyes makes them
-        // consistent with the face rather than picking a number. The slider exists because
-        // eyes can read a little dead at 0 and putting some back is a legitimate taste
-        // choice.
+        // Batch 17 shipped this at 0, reasoning that 0 is what the *face* already gets:
+        // Lighting.hlsl `#undef`s SOFT_LIGHTING outright whenever Subsurface Scattering is
+        // installed, so on any setup with SSS the face has no soft lighting at all, and
+        // zeroing it on eyes makes them consistent with the face rather than picking a
+        // number. That argument still stands on paper.
+        //
+        // (batch 18) Default moved to 1 anyway, for a reason that has nothing to do with the
+        // argument: batch 17 never actually ran. ValidateDiskCache (src/ShaderCache.cpp:2186)
+        // only compares SHADER_CACHE_VERSION and each feature ini's Version -- it never looks
+        // at a .hlsl -- and batch 17 bumped neither, so every machine kept serving batch-15
+        // bytecode from Data/ShaderCache and this term was never once evaluated. Batch 18
+        // bumps the ini, which means this code compiles for the first time. Shipping a
+        // never-executed change in its *active* state at the same moment it first becomes
+        // reachable would put two untested variables in one package; 1.0 makes the macro at
+        // Lighting.hlsl:2661 evaluate to 1.0 on both ternary branches, so the term multiplies
+        // by exactly one and the eye keeps the full vanilla fill. The slider is the whole
+        // feature now -- the hypothesis is still worth testing, just not by default.
         //
         // This is a pre-existing defect, not one of ours: the term is byte-identical to the
         // December-2025 baseline (bedec8379). What changed is that batch 9 gave eyes a
         // real-time environment reflection they did not have, which lifted the whole eye and
         // pushed the fill over the threshold where it gets noticed.
-        float EyeSoftLightingScale = 0.0f;
+        float EyeSoftLightingScale = 1.0f;
         // (batch 17) Multiply the *sun's* soft-lighting, rim-lighting and back-lighting terms
         // by the screen-space + parallax shadow, the way the point-light versions of the same
         // three terms in Lighting.hlsl already are. Those three sun terms take dirLightColor
