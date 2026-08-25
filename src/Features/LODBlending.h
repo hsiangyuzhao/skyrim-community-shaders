@@ -28,10 +28,34 @@ struct LODBlending : Feature
 		float LODTerrainGamma = 1;
 		float LODObjectGamma = 1;
 		float LODObjectSnowGamma = 1;
-		float pad;
+		// (batch 19) Claims the struct's spare float, so the shared feature buffer layout is
+		// byte-for-byte unchanged and the pinned offsets in FeatureBuffer.cpp still hold.
+		float LODGrassGamma = 1;
 	};
 
 	Settings settings;
+
+	// (batch 19) Grass LOD has no LOD macro, so it is identified per draw in Hooks.cpp instead.
+	// Two independent judgements, because the primary one rests on a naming convention:
+	//   - name: shape name is exactly "grasspassthru" (every grass-LOD vertex in the measured
+	//     object LOD sits under that one name, no variants)
+	//   - fallback: no user data (merged LOD has no TESObjectREFR, placed foliage does) and the
+	//     material is back-lit -- independent of any generator's naming
+	// Both are counted every frame whichever one is armed, so one screenshot says which fired.
+	enum class GrassDetection : uint
+	{
+		Name = 0,
+		NoUserDataAndBackLit,
+		Total
+	};
+
+	GrassDetection grassDetection = GrassDetection::Name;
+
+	uint32_t grassNameHits = 0;
+	uint32_t grassFallbackHits = 0;
+	uint32_t grassNameHitsLastFrame = 0;
+	uint32_t grassFallbackHitsLastFrame = 0;
+	uint32_t grassDiagFrame = 0;
 
 	virtual void DrawSettings() override;
 

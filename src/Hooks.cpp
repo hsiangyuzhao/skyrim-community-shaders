@@ -13,6 +13,7 @@
 
 #include "Features/InteriorSun.h"
 #include "Features/LightLimitFix.h"
+#include "Features/LODBlending.h"
 #include "Features/Skin.h"
 #include "Features/TerrainHelper.h"
 #include "Features/Upscaling.h"
@@ -188,6 +189,36 @@ namespace EffectExtensions
 
 namespace LightingExtensions
 {
+	// (batch 19) Grass LOD carries none of the engine's LOD property flags, so the vanilla
+	// technique decoder never emits LODOBJECTS/LODOBJECTSHD/LODLANDSCAPE for it and the LOD
+	// brightness code in Lighting.hlsl is not compiled into its permutations at all. The class
+	// therefore has to be recognised per draw. See State::ExtraShaderDescriptors::IsLODGrass.
+	bool IsGrassLODName(std::string_view a_name)
+	{
+		constexpr std::string_view grasspassthru = "grasspassthru";
+		return a_name.size() == grasspassthru.size() &&
+		       std::equal(a_name.begin(), a_name.end(), grasspassthru.begin(),
+				   [](char a_lhs, char a_rhs) {
+					   return static_cast<char>(std::tolower(static_cast<unsigned char>(a_lhs))) == a_rhs;
+				   });
+	}
+
+	// Independent of any LOD generator's naming: merged LOD geometry has no object reference
+	// behind it, where foliage actually placed in the world does, and grass LOD billboards are
+	// back-lit. Near-field back-lit plants share the exact same shader permutation as grass LOD
+	// -- that is why the shader-side flags cannot be used to tell them apart, and why the user
+	// data is the part that carries the distinction.
+	bool IsGrassLODNoUserDataAndBackLit(const RE::BSRenderPass* a_pass)
+	{
+		if (a_pass->geometry->GetUserData())
+			return false;
+
+		const auto* shaderProperty = static_cast<RE::BSShaderProperty*>(
+			a_pass->geometry->GetGeometryRuntimeData().properties[1].get());
+		return shaderProperty &&
+		       shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kBackLighting);
+	}
+
 	struct BSLightingShader_SetupGeometry
 	{
 		static void thunk(RE::BSShader* shader, RE::BSRenderPass* pass, uint32_t renderFlags)
@@ -202,6 +233,33 @@ namespace LightingExtensions
 				if (auto baseObject = userData->GetBaseObject())
 					if (baseObject->As<RE::TESObjectTREE>())
 						state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsTree);
+
+			state->permutationData.ExtraShaderDescriptor &= ~static_cast<uint32_t>(State::ExtraShaderDescriptors::IsLODGrass);
+
+			auto& lodBlending = globals::features::lodBlending;
+
+			if (lodBlending.grassDiagFrame != state->frameCount) {
+				lodBlending.grassDiagFrame = state->frameCount;
+				lodBlending.grassNameHitsLastFrame = lodBlending.grassNameHits;
+				lodBlending.grassFallbackHitsLastFrame = lodBlending.grassFallbackHits;
+				lodBlending.grassNameHits = 0;
+				lodBlending.grassFallbackHits = 0;
+			}
+
+			// Both judgements run every draw whichever one is armed, so the readout in the UI
+			// says which of them would have fired. Without that, a slider with no visible
+			// effect is indistinguishable from a detection that never matched anything.
+			const bool byName = IsGrassLODName(pass->geometry->name.c_str());
+			const bool byFallback = IsGrassLODNoUserDataAndBackLit(pass);
+
+			lodBlending.grassNameHits += byName;
+			lodBlending.grassFallbackHits += byFallback;
+
+			const bool isGrassLOD = lodBlending.grassDetection == LODBlending::GrassDetection::Name ?
+			                            byName :
+			                            byFallback;
+			if (isGrassLOD)
+				state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsLODGrass);
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
 	};

@@ -1905,6 +1905,23 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 #			endif
 	baseColor.xyz = pow(abs(baseColor.xyz), SharedData::lodBlendingSettings.LODTerrainGamma) * SharedData::lodBlendingSettings.LODTerrainBrightness;
+#		elif defined(BACK_LIGHTING)
+	// Grass LOD. It reaches none of the branches above: the engine hands out the LOD defines
+	// from the geometry's own LOD property flags and merged grass LOD carries none of them, so
+	// the class has to be identified per draw instead (Hooks.cpp, IsLODGrass).
+	//
+	// Gated on BACK_LIGHTING to keep this out of the permutations that cannot be grass LOD.
+	// Grass LOD billboards are back-lit, and of the 553 Lighting permutations observed in a
+	// real playthrough only 88 carry that flag -- the other 465 stay byte-identical.
+	//
+	// Gamma with no brightness multiplier, unlike the two branches above, because this value
+	// also lands in the deferred albedo (outputAlbedo = baseColor * vertexColor further down),
+	// which screen-space GI reads back as a reflectance. pow() cannot lift a value above 1, so
+	// no setting of this slider can push albedo past the point where indirect light would be
+	// gaining energy on every bounce.
+	if (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsLODGrass) {
+		baseColor.xyz = pow(abs(baseColor.xyz), SharedData::lodBlendingSettings.LODGrassGamma);
+	}
 #		endif
 #	endif  // LOD_BLENDING
 

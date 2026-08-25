@@ -63,6 +63,7 @@ namespace Permutation
 		static const uint IsTree = (1 << 4);
 		static const uint GrassSphereNormal = (1 << 5);
 		static const uint IsEye = (1 << 6);
+		static const uint IsLODGrass = (1 << 7);
 	}
 
 	namespace ExtraFeatureFlags

@@ -195,7 +195,15 @@ public:
 		// (batch 9) Set per draw by VanillaFresnel's BSLightingShader::SetupGeometry hook.
 		// Bit 6 is the only free slot: bits 3/4/5 mean different things here than they do
 		// upstream, so only this one bit can be taken over, not the block.
-		IsEye = 1 << 6
+		IsEye = 1 << 6,
+		// (batch 19) Set per draw by the BSLightingShader::SetupGeometry hook in Hooks.cpp.
+		// Grass LOD is the one distant class no compile-time macro can reach: the LOD defines
+		// come from GetLightingShaderDefines, which forwards straight to the vanilla engine
+		// decoder, and that hands out LODOBJECTS/LODOBJECTSHD/LODLANDSCAPE from the geometry's
+		// own LOD property flags. Merged grass LOD carries none of them (measured flags2
+		// 0x08000021 = ZBufWrite|VertexColors|BackLighting), so this bit is the only way to
+		// tell the shader "this draw is grass LOD".
+		IsLODGrass = 1 << 7
 	};
 
 	enum class ExtraFeatureDescriptors : uint32_t
