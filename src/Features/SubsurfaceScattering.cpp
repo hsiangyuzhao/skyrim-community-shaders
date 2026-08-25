@@ -340,7 +340,7 @@ void SubsurfaceScattering::DrawSSS()
 void SubsurfaceScattering::SetupResources()
 {
 	{
-		blurCB = new ConstantBuffer(ConstantBufferDesc<BlurCB>());
+		blurCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<BlurCB>());
 	}
 
 	auto renderer = globals::game::renderer;
@@ -359,18 +359,18 @@ void SubsurfaceScattering::SetupResources()
 		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
 		main.UAV->GetDesc(&uavDesc);
 
-		blurHorizontalTemp = new Texture2D(texDesc);
+		blurHorizontalTemp = std::make_unique<Texture2D>(texDesc);
 		blurHorizontalTemp->CreateSRV(srvDesc);
 		blurHorizontalTemp->CreateUAV(uavDesc);
 
-		sssResult = new Texture2D(texDesc);
+		sssResult = std::make_unique<Texture2D>(texDesc);
 		sssResult->CreateSRV(srvDesc);
 		sssResult->CreateUAV(uavDesc);
 
 		texDesc.Format = DXGI_FORMAT_R16_FLOAT;
 		srvDesc.Format = DXGI_FORMAT_R16_FLOAT;
 		uavDesc.Format = DXGI_FORMAT_R16_FLOAT;
-		sssGuide = new Texture2D(texDesc);
+		sssGuide = std::make_unique<Texture2D>(texDesc);
 		sssGuide->CreateSRV(srvDesc);
 		sssGuide->CreateUAV(uavDesc);
 	}

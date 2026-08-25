@@ -40,6 +40,25 @@ void TerrainBlending::SetupResources()
 	{
 		auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 
+		// (batch 16, item 3) SetupResources re-runs whenever the game recreates its render
+		// targets, and these three raw pointers used to be overwritten without a Release:
+		// 31.6 MiB of depth buffer plus its two views, orphaned per resolution change. They
+		// are ours -- we created them here and nothing else owns them -- so dropping our one
+		// reference is exactly right. Anything currently bound to the pipeline holds its own
+		// reference, so this cannot pull a surface out from under the context.
+		if (terrainDepth.views[0]) {
+			terrainDepth.views[0]->Release();
+			terrainDepth.views[0] = nullptr;
+		}
+		if (terrainDepth.depthSRV) {
+			terrainDepth.depthSRV->Release();
+			terrainDepth.depthSRV = nullptr;
+		}
+		if (terrainDepth.texture) {
+			terrainDepth.texture->Release();
+			terrainDepth.texture = nullptr;
+		}
+
 		D3D11_TEXTURE2D_DESC texDesc;
 		mainDepth.texture->GetDesc(&texDesc);
 		DX::ThrowIfFailed(device->CreateTexture2D(&texDesc, NULL, &terrainDepth.texture));
@@ -61,7 +80,7 @@ void TerrainBlending::SetupResources()
 		texDesc.Format = DXGI_FORMAT_R32_FLOAT;
 		texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 
-		blendedDepthTexture = new Texture2D(texDesc);
+		blendedDepthTexture = std::make_unique<Texture2D>(texDesc);
 
 		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
 		main.SRV->GetDesc(&srvDesc);
@@ -77,7 +96,7 @@ void TerrainBlending::SetupResources()
 		srvDesc.Format = texDesc.Format;
 		uavDesc.Format = texDesc.Format;
 
-		blendedDepthTexture16 = new Texture2D(texDesc);
+		blendedDepthTexture16 = std::make_unique<Texture2D>(texDesc);
 		blendedDepthTexture16->CreateSRV(srvDesc);
 		blendedDepthTexture16->CreateUAV(uavDesc);
 
@@ -94,6 +113,11 @@ void TerrainBlending::SetupResources()
 		depthStencilDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
 		depthStencilDesc.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
 		depthStencilDesc.StencilEnable = false;
+		// Same story, three bytes of consequence instead of 31.6 MiB, but the same shape.
+		if (terrainDepthStencilState) {
+			terrainDepthStencilState->Release();
+			terrainDepthStencilState = nullptr;
+		}
 		DX::ThrowIfFailed(device->CreateDepthStencilState(&depthStencilDesc, &terrainDepthStencilState));
 	}
 }

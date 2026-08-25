@@ -98,8 +98,8 @@ public:
 		float2 pad0;
 	};
 
-	ConstantBuffer* jitterCB = nullptr;
-	ConstantBuffer* upscalingDataCB = nullptr;
+	std::unique_ptr<ConstantBuffer> jitterCB;
+	std::unique_ptr<ConstantBuffer> upscalingDataCB;
 
 	// Runtime state
 	bool isWindowed = false;
@@ -165,9 +165,9 @@ public:
 	void Upscale();
 
 	// D3D11 textures
-	Texture2D* reactiveMaskTexture = nullptr;
-	Texture2D* transparencyCompositionMaskTexture = nullptr;
-	Texture2D* motionVectorCopyTexture = nullptr;
+	std::unique_ptr<Texture2D> reactiveMaskTexture;
+	std::unique_ptr<Texture2D> transparencyCompositionMaskTexture;
+	std::unique_ptr<Texture2D> motionVectorCopyTexture;
 
 	virtual void ClearShaderCache() override;
 

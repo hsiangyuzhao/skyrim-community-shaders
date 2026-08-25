@@ -66,6 +66,39 @@ struct BlendStates
 	}
 };
 
+namespace
+{
+	/// @brief One replacement G-buffer target that we own.
+	struct HijackedTarget
+	{
+		winrt::com_ptr<ID3D11Texture2D> texture;
+		winrt::com_ptr<ID3D11ShaderResourceView> srv;
+		winrt::com_ptr<ID3D11RenderTargetView> rtv;
+		winrt::com_ptr<ID3D11UnorderedAccessView> uav;
+	};
+
+	/// @brief Owning references to the replacement targets, keyed by RE::RENDER_TARGET.
+	///
+	/// (batch 16, item 3) The five slots we hijack live in the *game's* render-target array as
+	/// bare ID3D11* pointers, and Deferred::SetupResources re-runs every time the game
+	/// recreates its render targets. The old code overwrote those pointers with no Release on
+	/// any path, so each re-entry orphaned five full-screen targets and their views -- 158 MiB
+	/// at 4K, gone for the rest of the process.
+	///
+	/// Holding our own reference is what lets that be fixed without guessing. On re-entry the
+	/// new pointers go into the game's slot first, and only then is the previous entry here
+	/// destroyed -- so whichever of the two references was the last one standing, ours or the
+	/// slot's, the texture is actually freed.
+	///
+	/// What is deliberately NOT done: releasing whatever the slot contained on entry. On the
+	/// first call that is a texture the *game* created, and nothing in the code establishes
+	/// that the slot is its sole owner. Being wrong about that is a use-after-free on every
+	/// boot for every user, which is a far worse trade than one 158 MiB one-off. A map rather
+	/// than an array because RENDER_TARGET::kTOTAL differs between VR and flat and this file
+	/// is compiled once for both.
+	std::unordered_map<int, HijackedTarget> hijackedTargets;
+}
+
 void SetupRenderTarget(RE::RENDER_TARGET target, D3D11_TEXTURE2D_DESC texDesc, D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc, D3D11_RENDER_TARGET_VIEW_DESC rtvDesc, D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc, DXGI_FORMAT format, uint bindFlags)
 {
 	auto renderer = globals::game::renderer;
@@ -77,17 +110,33 @@ void SetupRenderTarget(RE::RENDER_TARGET target, D3D11_TEXTURE2D_DESC texDesc, D
 	rtvDesc.Format = format;
 	uavDesc.Format = format;
 
-	auto& data = renderer->GetRuntimeData().renderTargets[target];
-	DX::ThrowIfFailed(device->CreateTexture2D(&texDesc, nullptr, &data.texture));
+	HijackedTarget fresh;
+	DX::ThrowIfFailed(device->CreateTexture2D(&texDesc, nullptr, fresh.texture.put()));
 
 	if (texDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
-		DX::ThrowIfFailed(device->CreateShaderResourceView(data.texture, &srvDesc, &data.SRV));
+		DX::ThrowIfFailed(device->CreateShaderResourceView(fresh.texture.get(), &srvDesc, fresh.srv.put()));
 
 	if (texDesc.BindFlags & D3D11_BIND_RENDER_TARGET)
-		DX::ThrowIfFailed(device->CreateRenderTargetView(data.texture, &rtvDesc, &data.RTV));
+		DX::ThrowIfFailed(device->CreateRenderTargetView(fresh.texture.get(), &rtvDesc, fresh.rtv.put()));
 
 	if (texDesc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
-		DX::ThrowIfFailed(device->CreateUnorderedAccessView(data.texture, &uavDesc, &data.UAV));
+		DX::ThrowIfFailed(device->CreateUnorderedAccessView(fresh.texture.get(), &uavDesc, fresh.uav.put()));
+
+	// Publish into the game's slot. Only the fields we actually built are written, exactly as
+	// before: none of the five callers asks for a UAV, and overwriting data.UAV with null would
+	// be a behaviour change, not a fix.
+	auto& data = renderer->GetRuntimeData().renderTargets[target];
+	data.texture = fresh.texture.get();
+	if (fresh.srv)
+		data.SRV = fresh.srv.get();
+	if (fresh.rtv)
+		data.RTV = fresh.rtv.get();
+	if (fresh.uav)
+		data.UAV = fresh.uav.get();
+
+	// Last: drop the previous generation. The game's slot no longer points at it, so if the
+	// game had not already released it, the reference we are dropping here is the final one.
+	hijackedTargets[static_cast<int>(target)] = std::move(fresh);
 }
 
 void Deferred::SetupResources()
@@ -154,10 +203,12 @@ void Deferred::SetupResources()
 		samplerDesc.MaxAnisotropy = 1;
 		samplerDesc.MinLOD = 0;
 		samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
-		DX::ThrowIfFailed(device->CreateSamplerState(&samplerDesc, &linearSampler));
+		linearSampler = nullptr;
+		DX::ThrowIfFailed(device->CreateSamplerState(&samplerDesc, linearSampler.put()));
 
 		samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-		DX::ThrowIfFailed(device->CreateSamplerState(&samplerDesc, &pointSampler));
+		pointSampler = nullptr;
+		DX::ThrowIfFailed(device->CreateSamplerState(&samplerDesc, pointSampler.put()));
 	}
 
 	{
@@ -182,13 +233,14 @@ void Deferred::SetupResources()
 
 		sbDesc.StructureByteStride = sizeof(PerGeometry);
 		sbDesc.ByteWidth = sizeof(PerGeometry) * numElements;
-		perShadow = new Buffer(sbDesc);
+		perShadow = std::make_unique<Buffer>(sbDesc);
 		srvDesc.Buffer.NumElements = numElements;
 		perShadow->CreateSRV(srvDesc);
 		uavDesc.Buffer.NumElements = numElements;
 		perShadow->CreateUAV(uavDesc);
 
-		copyShadowCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\CopyShadowDataCS.hlsl", {}, "cs_5_0"));
+		copyShadowCS = nullptr;
+		copyShadowCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\CopyShadowDataCS.hlsl", {}, "cs_5_0")));
 	}
 
 	{
@@ -230,7 +282,7 @@ void Deferred::CopyShadowData()
 
 	context->CSSetConstantBuffers(0, 3, buffers);
 
-	context->CSSetShader(copyShadowCS, nullptr, 0);
+	context->CSSetShader(copyShadowCS.get(), nullptr, 0);
 
 	context->Dispatch(1, 1, 1);
 
@@ -544,7 +596,7 @@ void Deferred::DeferredPasses()
 		};
 
 		ID3D11SamplerState* samplers[]{
-			dynamicCubemaps.loaded ? linearSampler : nullptr,
+			dynamicCubemaps.loaded ? linearSampler.get() : nullptr,
 			physSky.loaded ? physSky.sampSv.get() : nullptr,
 		};
 		context->CSSetSamplers(0, ARRAYSIZE(samplers), samplers);

@@ -155,13 +155,13 @@ void DX12SwapChain::CreateInterop()
 	texDesc11.SampleDesc.Quality = 0;
 	texDesc11.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
-	swapChainBufferWrapped = new WrappedResource(texDesc11, d3d11Device.get(), d3d12Device.get());
+	swapChainBufferWrapped = std::make_unique<WrappedResource>(texDesc11, d3d11Device.get(), d3d12Device.get());
 
 	// FSR uses this as a premultiplied UI target. DLSS-G uses it as a
 	// HUD-less snapshot, so CopyResource requires the final-color format.
 	if (!globals::features::upscaling.IsDLSSGBackend())
 		texDesc11.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	uiBufferWrapped = new WrappedResource(texDesc11, d3d11Device.get(), d3d12Device.get());
+	uiBufferWrapped = std::make_unique<WrappedResource>(texDesc11, d3d11Device.get(), d3d12Device.get());
 }
 
 DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
@@ -744,36 +744,43 @@ void DX12SwapChain::CreateSharedResources()
 	auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 	D3D11_TEXTURE2D_DESC texDesc{};
 	main.texture->GetDesc(&texDesc);
-	inputColorBufferShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
-	outputColorBufferShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
-	packedNormalShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
-	nisSharpenerInputShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
-	nisSharpenerOutputShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
-	colorBeforeTransparencySnapshot = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
+	inputColorBufferShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	outputColorBufferShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	packedNormalShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	nisSharpenerInputShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	nisSharpenerOutputShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	colorBeforeTransparencySnapshot = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
 	texDesc.Format = DXGI_FORMAT_R32_FLOAT;
-	depthBufferShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
-	specHitDistanceShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
+	depthBufferShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	specHitDistanceShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
 	texDesc.Format = DXGI_FORMAT_R16_FLOAT;
-	sssGuide = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
+	sssGuide = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
 	texDesc.Format = DXGI_FORMAT_R8_UNORM;
-	reactiveMaskShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
-	transparencyCompositionMaskShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
+	reactiveMaskShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	transparencyCompositionMaskShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
 	texDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-	albedoShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
+	albedoShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
 	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	reflectanceShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
+	reflectanceShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
 	// Create motion vector buffer
 	auto& motionVector = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
 	motionVector.texture->GetDesc(&texDesc);
-	motionVectorBufferShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
+	motionVectorBufferShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 	if (globals::features::upscaling.IsDLSSGBackend()) {
-		motionVectorFrameGenerationShared12 = new WrappedResource(texDesc, d3d11Device.get(), d3d12Device.get());
+		motionVectorFrameGenerationShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 		logger::info("[DLSS-G] Created an isolated original motion-vector buffer; DLSS SR keeps its existing depth-aware motion-vector path");
+	} else {
+		// (batch 16, item 3) Explicit, because this is the one resource here that is
+		// conditional: without the reset, switching off the DLSS-G backend and re-entering
+		// this function would leave the previous frame-generation motion-vector buffer
+		// resident with nothing left that reads it. Every other member above is unconditional
+		// and so is freed by its own reassignment.
+		motionVectorFrameGenerationShared12.reset();
 	}
 }

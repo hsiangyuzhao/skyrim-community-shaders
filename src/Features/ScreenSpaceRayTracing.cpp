@@ -819,16 +819,16 @@ void ScreenSpaceRayTracing::DrawSettings()
         // the moment the default denoiser is selected would be worse than the waste". Three
         // things were wrong with that trade:
         //
-        //   * The waste was not small. The nine surfaces are 68 bytes per output pixel -- ~140 MB
-        //     at 1080p and ~560 MB at a 4K allocation -- and ResetFrameState is the only thing
-        //     that releases them, which runs on a resolution change. Expanding the tree once
+        //   * The waste was not small. The ten surfaces are 68 bytes per output pixel -- 134.5
+        //     MiB at 1080p and 537.9 MiB at a 4K allocation -- and ResetFrameState is the only
+        //     thing that releases them, which runs on a resolution change. Expanding the tree once
         //     therefore held that memory for the rest of the session, with the tree closed and
         //     the menu shut.
         //   * The maintenance was not small either: three full-screen copies per frame while the
         //     tree was open, ~330 MB/frame at a 4K allocation.
         //   * And the freeze it was buying off happened anyway. Six of the ten panels are written
         //     only inside the SVGF dispatch blocks, which do not run under REBLUR whatever this
-        //     flag says -- so under the default denoiser the flag bought nine allocations and
+        //     flag says -- so under the default denoiser the flag bought ten allocations and
         //     three copies per frame in order to display six cleared black rectangles.
         //
         // The honest presentation is the one below: show the panels when the denoiser that fills
@@ -909,10 +909,17 @@ void ScreenSpaceRayTracing::DrawSettings()
         // exterior reads mostly white with dark outlines around contacts, creases and foliage.
         BUFFER_VIEWER_NODE(texSSRTDiffuseHitDistance, debugRescale)
 
-        // (batch 11, item C1) The nine SVGF-only surfaces, shown only while SVGF is the denoiser
+        // (batch 11, item C1) The SVGF-only surfaces, shown only while SVGF is the denoiser
         // that writes them. AnyChainSVGF() rather than a per-chain test because these are one
-        // allocation group: EnsureSvgfResources brings all nine up together the moment either
+        // allocation group: EnsureSvgfResources brings all ten up together the moment either
         // chain resolves to SVGF, and none of them is written by any other code path.
+        //
+        // (batch 16, item 5) Ten allocated, nine shown. The allocation group is texHistory,
+        // texHistoryDiffuse, texTemporal, texVariance, texMoments, texHistoryMoments,
+        // texHistoryMomentsDiffuse (7 x RGBA16F), texHistoryNormals (R10G10B10A2),
+        // texDebugHistory (RGBA8) and texHistoryDepth (R32) -- 68 bytes per output pixel, which
+        // is the number the 537.9 MiB figure comes from. texHistoryNormals has no viewer entry,
+        // which is where the old "nine" came from.
         //
         // Every entry keeps its own null guard as well. The predicate says "SVGF is running", not
         // "the allocation succeeded", and a failed EnsureSvgfResources is exactly the case where
@@ -956,15 +963,15 @@ void ScreenSpaceRayTracing::DrawSettings()
             ImGui::TextDisabled("SVGF history buffers: select the SVGF denoiser to see them.");
             if (auto _tt = Util::HoverTooltipWrapper())
                 ImGui::Text(
-                    "Nine surfaces -- the two colour histories, the three moment buffers, the "
-                    "temporal and variance scratch, the depth history snapshot and the history "
-                    "debug view -- are written only by the hand-written SVGF chain, which is not "
-                    "running.\n\n"
+                    "Ten surfaces -- the two colour histories, the three moment buffers, the "
+                    "temporal and variance scratch, the normal and depth history snapshots and "
+                    "the history debug view -- are written only by the hand-written SVGF chain, "
+                    "which is not running. Nine of the ten have a viewer entry above.\n\n"
                     "They are also not allocated. That is deliberate: they cost 68 bytes per "
-                    "output pixel between them (~140 MB at 1080p, ~560 MB at 4K) and are only "
-                    "released on a resolution change, so bringing them up just to show this "
-                    "panel would hold that memory for the rest of the session -- and six of the "
-                    "nine would show nothing but their cleared contents anyway.");
+                    "output pixel between them (134.5 MiB at 1080p, 537.9 MiB at 4K) and are "
+                    "only released on a resolution change, so bringing them up just to show "
+                    "this panel would hold that memory for the rest of the session -- and six "
+                    "of them would show nothing but their cleared contents anyway.");
         }
 
         // (batch C1) REBLUR-path scratch; null until REBLUR is first selected.
@@ -1216,8 +1223,13 @@ void ScreenSpaceRayTracing::SetupResources()
         // coverage fraction in [0,1]: 1/255 quantisation is an order of magnitude below the
         // ~0.07 residual noise of the 7x7 spatial mean that produces the second surface, and a
         // UNORM read cannot be non-finite, so no consumer needs its own guard. One byte per
-        // texel is ~8 MB each at a 4K allocation, against ~33 MB for each of the eight
-        // RGBA16F surfaces above.
+        // texel is 7.9 MiB each at a 4K allocation, against 63.3 MiB for each of the three
+        // unconditional RGBA16F surfaces above (texColor, texSSRColor, texSSRTDiffuseColor).
+        //
+        // (batch 16, item 5) Both numbers in that sentence used to be wrong: "~33 MB each" was
+        // half the real figure -- R16G16B16A16_FLOAT is 8 bytes per pixel, so a full-screen
+        // surface is 8 * 3840 * 2160 = 63.3 MiB, not 33 -- and "eight" was a miscount of the
+        // three allocated above this line.
         texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R8_UNORM;
         texSSRTDiffuseConfidence = eastl::make_unique<Texture2D>(texDesc);
         texSSRTDiffuseConfidence->CreateSRV(srvDesc);
@@ -1250,8 +1262,9 @@ void ScreenSpaceRayTracing::SetupResources()
         // pair above and for the same three reasons: the payload is a [0,1] fraction, 1/255 is
         // an order of magnitude below the granularity of what it steers (a smooth per-pixel
         // weight over one-texel tap offsets), and a UNORM read cannot be non-finite so no
-        // consumer needs a guard of its own. ~8 MB of a 4K allocation, against ~33 MB for each
-        // of the eight RGBA16F surfaces this feature already holds.
+        // consumer needs a guard of its own. 7.9 MiB of a 4K allocation, against 63.3 MiB for
+        // each of the three unconditional RGBA16F surfaces this feature already holds.
+        // (batch 16, item 5) Corrected: see the note on texSSRTDiffuseConfidence above.
         //
         // No entry in ClearDenoiserHistory: this surface is rewritten in full by every diffuse
         // ray-march dispatch before anything reads it, so it carries no state across frames and
@@ -1389,7 +1402,7 @@ void ScreenSpaceRayTracing::EnsureSharcResources()
 // argument EnsureSharcResources and EnsureNRDResources make, applied to the chain that is no
 // longer the default.
 //
-// Ten textures, 68 bytes per output pixel between them: ~140 MB at 1080p, ~560 MB at a 4K
+// Ten textures, 68 bytes per output pixel between them: 134.5 MiB at 1080p, 537.9 MiB at a 4K
 // allocation. ssrt_temporal.hlsl and the three passes around it are their only readers (plus
 // the Buffer Viewer), and none of those is dispatched under REBLUR or Off. The t0
 // declarations in ssrt_raymarch / ssrt_variance / ssrt_spatial name the colour histories but
@@ -1472,7 +1485,9 @@ void ScreenSpaceRayTracing::EnsureSvgfResources()
 }
 
 // (reinjection noise) The confidence accumulator's ping-pong pair, allocated on first need on
-// the same argument EnsureSvgfResources makes: ~66 MB of a 4K allocation between them, and
+// the same argument EnsureSvgfResources makes: 63.3 MiB each, 126.6 MiB for the pair, at a 4K
+// allocation (R16G16B16A16_FLOAT, 8 bytes per pixel). (batch 16, item 5) This line used to say
+// "~66 MB between them", which is the figure for one surface, not two. And
 // nothing reads either surface unless ambient reinjection and TemporalAmbientConfidence are
 // both on. Unlike the SVGF set these are *not* released when the toggle goes off, so the A/B is
 // instant in both directions; only a resolution change releases them.
@@ -1906,7 +1921,7 @@ void ScreenSpaceRayTracing::ResolveDenoisers()
     // fallback). The REBLUR-working case -- the default -- allocates none of them.
     //
     // (batch 11, item C1) The `|| bufferViewerActive` term is gone. Having the Buffer Viewer tree
-    // expanded once was enough to allocate all nine surfaces -- 68 B/px, ~560 MB at a 4K
+    // expanded once was enough to allocate all ten surfaces -- 68 B/px, 537.9 MiB at a 4K
     // allocation -- and nothing but a resolution change ever released them again, so the memory
     // stayed committed for the rest of the session with the tree closed and the menu shut. See
     // SvgfHistoryNeeded for why the debug view it was protecting was not actually being served.
@@ -3476,8 +3491,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // consumers (the a-trous ping-pong), and DrawSSRTSpecular does not run until this whole
         // function has returned. So the lifetime is: pre-blur writes it, the temporal pass reads
         // it, the variance pass overwrites it, the a-trous chain ping-pongs it. Reusing it costs
-        // nothing where a dedicated surface would cost a full-screen RGBA16F (~33 MB at a 4K
-        // allocation, against the eight this feature already holds).
+        // nothing where a dedicated surface would cost a full-screen RGBA16F (63.3 MiB at a 4K
+        // allocation, against the three unconditional ones this feature already holds).
         //
         // The one thing that would break: inserting a pass between the pre-blur and the variance
         // pass that reads texVariance expecting last frame's content. Nothing does today, and

@@ -92,7 +92,7 @@ struct Skin : Feature
 		float4 skinPerGeometry;
 	};
 
-	ConstantBuffer* PerGeometryCB = nullptr;
+	std::unique_ptr<ConstantBuffer> PerGeometryCB;
 	float4 currentWetness = { 0.0f, 0.0f, 0.0f, 0.0f };
 	float playerStamina = 0.0f;
 	float playerStaminaMax = 0.0f;
@@ -105,7 +105,35 @@ struct Skin : Feature
 		std::string wetnessTexturePath;
 		bool hasExtraTexture = false;
 		bool hasWetnessTexture = false;
+		/// @brief steady_clock tick of the last draw that read this entry.
+		///
+		/// (batch 16, item 4) Recency signal for the bound below. Written on the render thread
+		/// from BSLightingShader_SetupMaterial, which is the only reader of the map.
+		std::int64_t lastUsed = 0;
 	};
+
+	/// @brief Upper bound on how many facegen skin materials keep their extra textures resident.
+	///
+	/// (batch 16, item 4) skinExtraTextures pins two RE::NiSourceTexturePtr per distinct facegen
+	/// material -- the RFAOS map and the wetness map -- and nothing ever removed an entry, so on
+	/// an NPC-heavy load order it grew for the whole session and the textures it pinned could
+	/// never be unloaded by the game.
+	///
+	/// Evicting here is safe in a way that it would not be for a general texture cache, and the
+	/// reason is worth stating: BSLightingShader_SetupMaterial already treats a miss as "build
+	/// it now" (it calls SetupExtraTexture and falls back to the default black texture if that
+	/// fails). So the map is a cache with a working repopulate path, and the only cost of an
+	/// eviction is that the next draw of that material pays the path-derivation and texture load
+	/// again. Nothing can be left dangling and nothing can be left visually wrong.
+	///
+	/// 512 is chosen to be well above the number of distinct facegen materials on screen at once
+	/// -- eviction should only ever reach NPCs that are long gone -- while still bounding the
+	/// session. Two textures per entry at 512 entries is the ceiling, not the typical case,
+	/// because NiSourceTexture deduplicates by path.
+	static constexpr size_t maxSkinExtraTextures = 512;
+
+	/// @brief Drop the least recently drawn entries if the map is over maxSkinExtraTextures.
+	void PruneSkinExtraTextures();
 
 	eastl::unique_ptr<Texture2D> texSkinDetail = nullptr;
 	std::unordered_map<uint32_t, ExtraTextures> skinExtraTextures;

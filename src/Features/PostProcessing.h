@@ -90,6 +90,18 @@ struct PostProcessing : Feature
 	virtual void SetupResources() override;
 	virtual void Reset() override;
 
+	/// @brief Allocate a sub-feature's resources if they are not already up.
+	/// @param a_pipe The sub-feature. Must not be null.
+	///
+	/// (batch 16, item P14) Called from the draw loops, immediately before Draw, so that an
+	/// effect can never be drawn against released memory.
+	void EnsureResources(PostProcessFeature* a_pipe);
+
+	/// @brief Hand back the resources of sub-features that have been disabled for a while.
+	///
+	/// (batch 16, item P14) Called from Prepass. Never allocates.
+	void ReleaseIdleResources();
+
 	virtual void PostPostLoad() override;
 	virtual void Prepass() override;
 

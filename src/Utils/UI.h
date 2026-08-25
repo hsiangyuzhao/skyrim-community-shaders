@@ -16,15 +16,30 @@ struct ImVec2;
 class Menu;
 class Feature;
 
-#define BUFFER_VIEWER_NODE(a_value, a_scale)                                                                           \
-	if (ImGui::TreeNode(#a_value)) {                                                                                   \
-		Util::BufferViewerImage(a_value->srv.get(), { a_value->desc.Width * a_scale, a_value->desc.Height * a_scale }); \
-		ImGui::TreePop();                                                                                              \
+// (batch 16, item P14) Both macros are null-guarded.
+//
+// Resources are no longer all allocated at boot -- post-processing sub-features build theirs
+// on the first frame they draw, and hand them back after being switched off for a while. So a
+// debug tree can be opened in a frame where its texture legitimately does not exist yet, and
+// the unguarded `a_value->srv` was a null dereference on the render thread. The guard costs a
+// branch in a panel that only draws when a tree node is open.
+#define BUFFER_VIEWER_NODE(a_value, a_scale)                                                                               \
+	if (ImGui::TreeNode(#a_value)) {                                                                                       \
+		if (a_value) {                                                                                                     \
+			Util::BufferViewerImage(a_value->srv.get(), { a_value->desc.Width * a_scale, a_value->desc.Height * a_scale }); \
+		} else {                                                                                                           \
+			ImGui::TextDisabled("(not allocated)");                                                                        \
+		}                                                                                                                  \
+		ImGui::TreePop();                                                                                                  \
 	}
 
-#define BUFFER_VIEWER_NODE_BULLET(a_value, a_scale) \
-	ImGui::BulletText(#a_value);                    \
-	Util::BufferViewerImage(a_value->srv.get(), { a_value->desc.Width * a_scale, a_value->desc.Height * a_scale });
+#define BUFFER_VIEWER_NODE_BULLET(a_value, a_scale)                                                                    \
+	ImGui::BulletText(#a_value);                                                                                       \
+	if (a_value) {                                                                                                     \
+		Util::BufferViewerImage(a_value->srv.get(), { a_value->desc.Width * a_scale, a_value->desc.Height * a_scale }); \
+	} else {                                                                                                           \
+		ImGui::TextDisabled("(not allocated)");                                                                        \
+	}
 
 #define ADDRESS_NODE(a_value)                                                                        \
 	if (ImGui::Button(#a_value)) {                                                                   \

@@ -45,8 +45,11 @@ public:
 
 	bool deferredPass = false;
 
-	ID3D11SamplerState* linearSampler = nullptr;
-	ID3D11SamplerState* pointSampler = nullptr;
+	// (batch 16, item 3) com_ptr, not raw: SetupResources re-runs on every render-target
+	// recreation and used to overwrite these without a Release. A sampler state is a handful
+	// of bytes, but it was the same shape as the leaks that mattered.
+	winrt::com_ptr<ID3D11SamplerState> linearSampler;
+	winrt::com_ptr<ID3D11SamplerState> pointSampler;
 
 	struct alignas(16) PerGeometry
 	{
@@ -66,8 +69,9 @@ public:
 	};
 	STATIC_ASSERT_ALIGNAS_16(PerGeometry);
 
-	ID3D11ComputeShader* copyShadowCS = nullptr;
-	Buffer* perShadow = nullptr;
+	// (batch 16, item 3) com_ptr, not raw: same re-entry, same missing Release.
+	winrt::com_ptr<ID3D11ComputeShader> copyShadowCS;
+	std::unique_ptr<Buffer> perShadow;
 	ID3D11ShaderResourceView* shadowView = nullptr;
 
 	struct Hooks

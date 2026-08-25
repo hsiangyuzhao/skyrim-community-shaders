@@ -68,11 +68,11 @@ public:
 
 	ID3D11SamplerState* pointBorderSampler = nullptr;
 
-	ConstantBuffer* raymarchCB = nullptr;
+	std::unique_ptr<ConstantBuffer> raymarchCB;
 	ID3D11ComputeShader* raymarchCS = nullptr;
 	ID3D11ComputeShader* raymarchRightCS = nullptr;
 
-	Texture2D* screenSpaceShadowsTexture = nullptr;
+	std::unique_ptr<Texture2D> screenSpaceShadowsTexture;
 
 	virtual void SetupResources() override;
 

@@ -465,7 +465,7 @@ void DynamicCubemaps::Irradiance(bool a_reflections)
 			const SpecularMapFilterSettingsCB spmapConstants = { level * delta_roughness };
 			spmapCB->Update(spmapConstants);
 
-			auto uav = a_reflections ? uavReflectionsArray[level - 1] : uavArray[level - 1];
+			auto* uav = a_reflections ? uavReflectionsArray[level - 1].get() : uavArray[level - 1].get();
 
 			context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 			context->Dispatch(numGroups, numGroups, 6);
@@ -589,27 +589,27 @@ void DynamicCubemaps::SetupResources()
 		uavDesc.Texture2DArray.FirstArraySlice = 0;
 		uavDesc.Texture2DArray.ArraySize = texDesc.ArraySize;
 
-		envCaptureTexture = new Texture2D(texDesc);
+		envCaptureTexture = std::make_unique<Texture2D>(texDesc);
 		envCaptureTexture->CreateSRV(srvDesc);
 		envCaptureTexture->CreateUAV(uavDesc);
 
-		envCaptureRawTexture = new Texture2D(texDesc);
+		envCaptureRawTexture = std::make_unique<Texture2D>(texDesc);
 		envCaptureRawTexture->CreateSRV(srvDesc);
 		envCaptureRawTexture->CreateUAV(uavDesc);
 
-		envCapturePositionTexture = new Texture2D(texDesc);
+		envCapturePositionTexture = std::make_unique<Texture2D>(texDesc);
 		envCapturePositionTexture->CreateSRV(srvDesc);
 		envCapturePositionTexture->CreateUAV(uavDesc);
 
-		envCaptureReflectionsTexture = new Texture2D(texDesc);
+		envCaptureReflectionsTexture = std::make_unique<Texture2D>(texDesc);
 		envCaptureReflectionsTexture->CreateSRV(srvDesc);
 		envCaptureReflectionsTexture->CreateUAV(uavDesc);
 
-		envCaptureRawReflectionsTexture = new Texture2D(texDesc);
+		envCaptureRawReflectionsTexture = std::make_unique<Texture2D>(texDesc);
 		envCaptureRawReflectionsTexture->CreateSRV(srvDesc);
 		envCaptureRawReflectionsTexture->CreateUAV(uavDesc);
 
-		envCapturePositionReflectionsTexture = new Texture2D(texDesc);
+		envCapturePositionReflectionsTexture = std::make_unique<Texture2D>(texDesc);
 		envCapturePositionReflectionsTexture->CreateSRV(srvDesc);
 		envCapturePositionReflectionsTexture->CreateUAV(uavDesc);
 
@@ -617,23 +617,23 @@ void DynamicCubemaps::SetupResources()
 		srvDesc.Format = texDesc.Format;
 		uavDesc.Format = texDesc.Format;
 
-		envTexture = new Texture2D(texDesc);
+		envTexture = std::make_unique<Texture2D>(texDesc);
 		envTexture->CreateSRV(srvDesc);
 		envTexture->CreateUAV(uavDesc);
 
-		envReflectionsTexture = new Texture2D(texDesc);
+		envReflectionsTexture = std::make_unique<Texture2D>(texDesc);
 		envReflectionsTexture->CreateSRV(srvDesc);
 		envReflectionsTexture->CreateUAV(uavDesc);
 
-		envInferredTexture = new Texture2D(texDesc);
+		envInferredTexture = std::make_unique<Texture2D>(texDesc);
 		envInferredTexture->CreateSRV(srvDesc);
 		envInferredTexture->CreateUAV(uavDesc);
 
-		updateCubemapCB = new ConstantBuffer(ConstantBufferDesc<UpdateCubemapCB>());
+		updateCubemapCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<UpdateCubemapCB>());
 	}
 
 	{
-		spmapCB = new ConstantBuffer(ConstantBufferDesc<SpecularMapFilterSettingsCB>());
+		spmapCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<SpecularMapFilterSettingsCB>());
 	}
 
 	{
@@ -646,12 +646,14 @@ void DynamicCubemaps::SetupResources()
 
 		for (std::uint32_t level = 1; level < MIPLEVELS; ++level) {
 			uavDesc.Texture2DArray.MipSlice = level;
-			DX::ThrowIfFailed(device->CreateUnorderedAccessView(envTexture->resource.get(), &uavDesc, &uavArray[level - 1]));
+			uavArray[level - 1] = nullptr;
+			DX::ThrowIfFailed(device->CreateUnorderedAccessView(envTexture->resource.get(), &uavDesc, uavArray[level - 1].put()));
 		}
 
 		for (std::uint32_t level = 1; level < MIPLEVELS; ++level) {
 			uavDesc.Texture2DArray.MipSlice = level;
-			DX::ThrowIfFailed(device->CreateUnorderedAccessView(envReflectionsTexture->resource.get(), &uavDesc, &uavReflectionsArray[level - 1]));
+			uavReflectionsArray[level - 1] = nullptr;
+			DX::ThrowIfFailed(device->CreateUnorderedAccessView(envReflectionsTexture->resource.get(), &uavDesc, uavReflectionsArray[level - 1].put()));
 		}
 	}
 

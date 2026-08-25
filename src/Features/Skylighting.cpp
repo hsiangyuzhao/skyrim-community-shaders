@@ -70,7 +70,7 @@ void Skylighting::SetupResources()
 		precipitationOcclusion.depthSRV->GetDesc(&srvDesc);
 		precipitationOcclusion.views[0]->GetDesc(&dsvDesc);
 
-		texOcclusion = new Texture2D(texDesc);
+		texOcclusion = std::make_unique<Texture2D>(texDesc);
 		texOcclusion->CreateSRV(srvDesc);
 		texOcclusion->CreateDSV(dsvDesc);
 	}
@@ -103,13 +103,13 @@ void Skylighting::SetupResources()
 				.WSize = texDesc.Depth }
 		};
 
-		texProbeArray = new Texture3D(texDesc);
+		texProbeArray = std::make_unique<Texture3D>(texDesc);
 		texProbeArray->CreateSRV(srvDesc);
 		texProbeArray->CreateUAV(uavDesc);
 
 		texDesc.Format = srvDesc.Format = uavDesc.Format = DXGI_FORMAT_R8_UINT;
 
-		texAccumFramesArray = new Texture3D(texDesc);
+		texAccumFramesArray = std::make_unique<Texture3D>(texDesc);
 		texAccumFramesArray->CreateSRV(srvDesc);
 		texAccumFramesArray->CreateUAV(uavDesc);
 	}

@@ -2,6 +2,8 @@
 
 #include "Feature.h"
 
+#include <chrono>
+
 struct PostProcessFeatureConstructor;
 
 struct PostProcessFeature
@@ -18,7 +20,44 @@ struct PostProcessFeature
 	virtual bool DrawAfterColorGrading() const { return false; }
 	virtual bool DisableInMainLoadingMenu() const { return false; }
 
+	/// @brief Allocate this effect's GPU memory (textures, buffers, samplers).
+	///
+	/// (batch 16, item P14) This is no longer called for every sub-feature at boot. It runs
+	/// the first time an *enabled* effect is about to draw, and again after a settings load
+	/// or a resolution change. Shader compilation deliberately does NOT live here any more
+	/// -- see SetupShaders().
 	virtual inline void SetupResources() = 0;
+
+	/// @brief Compile this effect's shaders. Called once per sub-feature at boot, for every
+	/// sub-feature, on or off.
+	///
+	/// Shaders are a few kilobytes each; the reason to keep them unconditional is the other
+	/// direction. Util::CompileShader is a live D3DCompileFromFile with no cache, so folding
+	/// it into SetupResources would put a multi-hundred-millisecond stall on the exact frame
+	/// where the user ticks a checkbox, every time they tick it.
+	virtual void SetupShaders() {}
+
+	/// @brief Release everything SetupResources() allocated, and nothing else.
+	///
+	/// The contract is literal: every texture/buffer member that SetupResources() assigns has
+	/// to be nulled here. If one is missed, turning the effect off silently keeps its memory,
+	/// which is the bug this whole mechanism exists to fix. Shaders and sampler states are
+	/// intentionally left alone -- they are tiny and keeping them is what makes a re-enable
+	/// cheap.
+	virtual void ReleaseResources() {}
+
+	/// @brief True iff SetupResources() has run and ReleaseResources() has not run since.
+	///
+	/// Owned by PostProcessing, not by the effect itself. Effects must not read it.
+	bool resourcesResident = false;
+
+	/// @brief When this effect was first seen disabled while still holding resources.
+	///
+	/// Default-constructed means "not currently counting down". PostProcessing uses it to
+	/// hold the memory for a grace period rather than freeing on the frame the checkbox
+	/// flips, so toggling in the menu does not thrash a few hundred MiB.
+	std::chrono::steady_clock::time_point disabledSince{};
+
 	virtual void ClearShaderCache() = 0;
 	virtual void RestoreDefaultSettings() = 0;
 

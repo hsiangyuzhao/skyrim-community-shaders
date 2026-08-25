@@ -252,7 +252,44 @@ void DoF::SetupResources()
 		DX::ThrowIfFailed(device->CreateSamplerState(&samplerDesc, linearSampler.put()));
 	}
 
+}
+
+// (batch 16, item P14) Shader compilation is no longer part of SetupResources, so that the
+// memory SetupResources allocates can be handed back while the effect is off without paying
+// a D3DCompileFromFile on every re-enable.
+void DoF::SetupShaders()
+{
 	CompileComputeShaders();
+}
+
+// (batch 16, item P14) Mirror of SetupResources: every texture/buffer it assigns is nulled
+// here. Shaders and sampler states are deliberately kept -- they are tiny, and keeping them
+// is what makes turning the effect back on cheap.
+//
+// This is the second largest single release in the pipeline: 34 bytes per output pixel,
+// 268.9 MiB at 4K, and DoF ships off.
+void DoF::ReleaseResources()
+{
+	dofCB = nullptr;
+	texOutput = nullptr;
+	texPreBlurred = nullptr;
+	texFarBlurred = nullptr;
+	texNearBlurred = nullptr;
+	texBlurredFiltered = nullptr;
+	texPostSmooth = nullptr;
+	texPostSmooth2 = nullptr;
+	texFocus = nullptr;
+	texPreFocus = nullptr;
+	texCoC = nullptr;
+	texCoCTileTmp = nullptr;
+	texCoCTileTmp2 = nullptr;
+	texCoCTileNeighbor = nullptr;
+	texCoCBlur1 = nullptr;
+	texCoCBlur2 = nullptr;
+	// Loaded from DDS on disk, so a re-enable pays the file read again. That is the price of
+	// not keeping six bokeh kernels resident for an effect that is off.
+	for (auto& shape : texBokehShapes)
+		shape = nullptr;
 }
 
 void DoF::ClearShaderCache()

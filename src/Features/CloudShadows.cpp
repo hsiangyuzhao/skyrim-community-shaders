@@ -151,7 +151,7 @@ void CloudShadows::SetupResources()
 
 		texDesc.Format = srvDesc.Format = DXGI_FORMAT_R8_UNORM;
 
-		texCubemapCloudOcc = new Texture2D(texDesc);
+		texCubemapCloudOcc = std::make_unique<Texture2D>(texDesc);
 		texCubemapCloudOcc->CreateSRV(srvDesc);
 
 		for (int i = 0; i < 6; ++i) {
@@ -160,7 +160,7 @@ void CloudShadows::SetupResources()
 			DX::ThrowIfFailed(device->CreateRenderTargetView(texCubemapCloudOcc->resource.get(), &rtvDesc, cubemapCloudOccRTVs + i));
 		}
 
-		texCubemapCloudOccCopy = new Texture2D(texDesc);
+		texCubemapCloudOccCopy = std::make_unique<Texture2D>(texDesc);
 		texCubemapCloudOccCopy->CreateSRV(srvDesc);
 
 		for (int i = 0; i < 6; ++i) {

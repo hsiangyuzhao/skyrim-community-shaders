@@ -85,31 +85,31 @@ public:
 
 	DXGI_SWAP_CHAIN_DESC1 swapChainDesc;
 
-	WrappedResource* swapChainBufferWrapped;
-	WrappedResource* uiBufferWrapped;
+	std::unique_ptr<WrappedResource> swapChainBufferWrapped;
+	std::unique_ptr<WrappedResource> uiBufferWrapped;
 
 	// D3D12 interop resources for frame generation
-	WrappedResource* depthBufferShared12 = nullptr;
+	std::unique_ptr<WrappedResource> depthBufferShared12;
 	// DLSS SR keeps its existing depth-aware MV buffer below. DLSS-G consumes
 	// this separate untouched engine MV copy so the two features cannot change
 	// each other's motion-vector interpretation.
-	WrappedResource* motionVectorFrameGenerationShared12 = nullptr;
-	WrappedResource* motionVectorBufferShared12 = nullptr;
+	std::unique_ptr<WrappedResource> motionVectorFrameGenerationShared12;
+	std::unique_ptr<WrappedResource> motionVectorBufferShared12;
 
 	// for sr/rr
-	WrappedResource* reactiveMaskShared12 = nullptr;
-	WrappedResource* transparencyCompositionMaskShared12 = nullptr;
-	WrappedResource* inputColorBufferShared12 = nullptr;
-	WrappedResource* outputColorBufferShared12 = nullptr;
-	WrappedResource* albedoShared12 = nullptr;
-	WrappedResource* reflectanceShared12 = nullptr;
-	WrappedResource* packedNormalShared12 = nullptr;
-	WrappedResource* specHitDistanceShared12 = nullptr;
-	WrappedResource* colorBeforeTransparencySnapshot = nullptr;
-	WrappedResource* sssGuide = nullptr;
+	std::unique_ptr<WrappedResource> reactiveMaskShared12;
+	std::unique_ptr<WrappedResource> transparencyCompositionMaskShared12;
+	std::unique_ptr<WrappedResource> inputColorBufferShared12;
+	std::unique_ptr<WrappedResource> outputColorBufferShared12;
+	std::unique_ptr<WrappedResource> albedoShared12;
+	std::unique_ptr<WrappedResource> reflectanceShared12;
+	std::unique_ptr<WrappedResource> packedNormalShared12;
+	std::unique_ptr<WrappedResource> specHitDistanceShared12;
+	std::unique_ptr<WrappedResource> colorBeforeTransparencySnapshot;
+	std::unique_ptr<WrappedResource> sssGuide;
 
-	WrappedResource* nisSharpenerInputShared12 = nullptr;
-	WrappedResource* nisSharpenerOutputShared12 = nullptr;
+	std::unique_ptr<WrappedResource> nisSharpenerInputShared12;
+	std::unique_ptr<WrappedResource> nisSharpenerOutputShared12;
 
 	winrt::com_ptr<ID3D11Device5> d3d11Device;
 	winrt::com_ptr<ID3D11DeviceContext4> d3d11Context;

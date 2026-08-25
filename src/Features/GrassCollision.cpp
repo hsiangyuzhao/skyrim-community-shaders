@@ -234,7 +234,7 @@ void GrassCollision::PostPostLoad()
 
 void GrassCollision::SetupResources()
 {
-	perFrame = new ConstantBuffer(ConstantBufferDesc<PerFrame>());
+	perFrame = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PerFrame>());
 
 	{
 		D3D11_TEXTURE2D_DESC texDesc = {
@@ -262,7 +262,7 @@ void GrassCollision::SetupResources()
 			.Texture2D = { .MipSlice = 0 }
 		};
 
-		collisionTexture = new Texture2D(texDesc);
+		collisionTexture = std::make_unique<Texture2D>(texDesc);
 		collisionTexture->CreateSRV(srvDesc);
 		collisionTexture->CreateUAV(uavDesc);
 	}

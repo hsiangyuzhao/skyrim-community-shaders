@@ -219,8 +219,19 @@ void PostProcessing::ProcessSettings(json& o_json)
 			feat->enabled = o_json.value(feat->GetType(), json::object()).value("enabled", true);
 			json featSettings = o_json.value(feat->GetType(), json::object()).value("settings", json::object());
 			feat->LoadSettings(featSettings);
-			if (loaded)
-				feat->SetupResources();
+			// (batch 16, item P14) This used to be an unconditional feat->SetupResources(),
+			// which meant loading a preset reallocated all ten sub-features' textures whether
+			// they were on or not -- and at boot it ran a second time on top of the loop in
+			// SetupResources, so the whole 945.7 MiB was built twice.
+			//
+			// Settings really can change what the resources look like (which LUT file, which
+			// tile sizes), so they still have to be dropped. They just get rebuilt lazily,
+			// and only for effects that are actually on.
+			if (loaded) {
+				feat->ReleaseResources();
+				feat->resourcesResident = false;
+				feat->disabledSince = {};
+			}
 		}
 	}
 
@@ -345,8 +356,16 @@ void PostProcessing::RestoreDefaultSettings()
 void PostProcessing::ClearShaderCache()
 {
 	for (auto& pipe : pipeline) {
-		if (pipe)
+		if (pipe) {
 			pipe->ClearShaderCache();
+			// (batch 16, item P14) Some sub-features drop more than shaders here --
+			// MotionBlur::ClearShaderCache nulls its constant buffers and grid textures too.
+			// Nothing used to put those back, so motion blur was quietly broken after any
+			// shader-cache clear. Invalidating the residency flag makes the next draw rebuild
+			// them, which fixes that as a side effect of keeping our bookkeeping honest.
+			pipe->resourcesResident = false;
+			pipe->disabledSince = {};
+		}
 	}
 }
 
@@ -406,14 +425,108 @@ void PostProcessing::SetupResources()
 		pipeline[static_cast<size_t>(FeaturePipelineIndex::Border)].get()->enabled = false;
 	}
 
+	// Shaders for every sub-feature, on or off. See PostProcessFeature::SetupShaders for why
+	// this half stays unconditional.
 	for (auto& pipe : pipeline) {
 		if (pipe) {
-			pipe->SetupResources();
+			pipe->SetupShaders();
+		}
+	}
+
+	// (batch 16, item P14) This loop used to call pipe->SetupResources() unconditionally, for
+	// every sub-feature, ignoring pipe->enabled entirely: 119.5 bytes per output pixel, 945.7
+	// MiB at 4K, of which 743.4 MiB belonged to effects that ship switched off (LensFlare
+	// 379.7, DoF 268.9, LUT / Camera / Border 31.6 each).
+	//
+	// Nothing is allocated here now. Two things replace it:
+	//   * EnsureResources(), called immediately before an effect's Draw, brings its memory up
+	//     on the first frame it is actually used. "Immediately before use" is the whole point:
+	//     an effect can never be drawn with released resources, whatever order the engine
+	//     happens to call our hooks in on a given frame.
+	//   * ReleaseIdleResources(), called from Prepass, hands memory back after an effect has
+	//     been off for a grace period.
+	//
+	// SetupResources also re-runs on a resolution change (BSShaderRenderTargets_Create
+	// re-enters State::Setup), and everything a sub-feature allocates is sized from
+	// kMAIN_COPY, so nothing may survive that re-entry describing the old extent.
+	//
+	// In practice the make_unique calls above already handle it: they replace the whole
+	// pipeline, and the old objects' unique_ptr members free the old-size textures on
+	// destruction. This loop is the belt to that braces -- it makes the residency flags true
+	// by construction rather than by relying on the objects being new, so the invariant still
+	// holds if someone later makes the pipeline persist across a re-entry.
+	for (auto& pipe : pipeline) {
+		if (pipe) {
+			pipe->ReleaseResources();
+			pipe->resourcesResident = false;
+			pipe->disabledSince = {};
 		}
 	}
 
 	ProcessSettings(pendingSettings);
 	pendingSettings = {};
+}
+
+// (batch 16, item P14) Bring one sub-feature's resources up if they are not already up.
+//
+// Called from the draw loops rather than from a per-frame reconcile so that allocation is
+// ordered against *use* and not against some other hook. The failure mode this avoids is
+// specific: Prepass and PreProcess are separate hooks, and there is no guarantee every frame
+// runs both, so a reconcile in Prepass could be skipped on the frame PreProcess draws.
+void PostProcessing::EnsureResources(PostProcessFeature* a_pipe)
+{
+	if (a_pipe->resourcesResident)
+		return;
+
+	// Marked resident before the call, not after: if SetupResources throws we do not want to
+	// retry it every single frame for the rest of the session. One log line and the effect
+	// draws with whatever it managed to build, which is the same behaviour a failure in the
+	// old boot-time loop produced.
+	a_pipe->resourcesResident = true;
+	a_pipe->disabledSince = {};
+
+	try {
+		a_pipe->SetupResources();
+	} catch (const std::exception& e) {
+		logger::error("[Post Processing] {} failed to allocate its resources: {}", a_pipe->GetType(), e.what());
+	}
+}
+
+// (batch 16, item P14) Give back the memory of effects that have been off for a while.
+//
+// The grace period is the part that matters. Freeing on the frame the checkbox flips would
+// mean a user clicking LensFlare on and off in the menu allocates and frees 379.7 MiB per
+// click, which is worse for the driver than never freeing at all. Ten seconds of wall clock
+// (not frames -- menu framerates vary by an order of magnitude) is long enough that ordinary
+// menu fiddling costs nothing, and short enough that the memory is back before the user has
+// walked anywhere.
+void PostProcessing::ReleaseIdleResources()
+{
+	static constexpr auto graceperiod = std::chrono::seconds(10);
+	const auto now = std::chrono::steady_clock::now();
+
+	for (auto& pipe : pipeline) {
+		if (!pipe || !pipe->resourcesResident)
+			continue;
+
+		if (pipe->enabled) {
+			pipe->disabledSince = {};
+			continue;
+		}
+
+		if (pipe->disabledSince == std::chrono::steady_clock::time_point{}) {
+			pipe->disabledSince = now;
+			continue;
+		}
+
+		if (now - pipe->disabledSince < graceperiod)
+			continue;
+
+		logger::debug("[Post Processing] Releasing {} resources after {} s disabled", pipe->GetType(), std::chrono::duration_cast<std::chrono::seconds>(now - pipe->disabledSince).count());
+		pipe->ReleaseResources();
+		pipe->resourcesResident = false;
+		pipe->disabledSince = {};
+	}
 }
 
 void PostProcessing::Reset()
@@ -537,6 +650,7 @@ void PostProcessing::DrawBeforeUpscaling()
 	// go through each fx
 	for (auto& pipe : pipeline) {
 		if (drawsHere(pipe)) {
+			EnsureResources(pipe.get());
 			pipe->Draw(lastTexColor);
 		}
 	}
@@ -593,12 +707,14 @@ void PostProcessing::PreProcess()
 	// go through each fx
 	for (auto& pipe : pipeline) {
 		if (pipe && pipe->enabled && !pipe->DrawAfterColorGrading() && !(inMainLoadingMenu && pipe->DisableInMainLoadingMenu()) && (!pipe->DrawBeforeUpscaling() || !upscaling.loaded)) {
+			EnsureResources(pipe.get());
 			pipe->Draw(lastTexColor);
 		}
 	}
 
 	for (auto& pipe : pipeline) {
 		if (pipe && pipe->enabled && pipe->DrawAfterColorGrading() && !(inMainLoadingMenu && pipe->DisableInMainLoadingMenu()) && (!pipe->DrawBeforeUpscaling() || !upscaling.loaded)) {
+			EnsureResources(pipe.get());
 			pipe->Draw(lastTexColor);
 		}
 	}
@@ -644,6 +760,10 @@ void PostProcessing::PreProcess()
 
 void PostProcessing::Prepass()
 {
+	// (batch 16, item P14) Release-only pass. It never allocates, so a frame that skips
+	// Prepass can only ever delay a release, never leave an enabled effect without memory.
+	ReleaseIdleResources();
+
 	if (!pendingSettings.empty()) {
 		logger::info("Processing pending post processing settings...");
 		ProcessSettings(pendingSettings);

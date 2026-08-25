@@ -60,6 +60,8 @@ struct HistogramAutoExposure : public PostProcessFeature
 	std::unique_ptr<Texture2D> texAdapt = nullptr;
 
 	virtual void SetupResources() override;
+	virtual void SetupShaders() override;
+	virtual void ReleaseResources() override;
 	virtual void ClearShaderCache() override;
 	void CompileComputeShaders();
 

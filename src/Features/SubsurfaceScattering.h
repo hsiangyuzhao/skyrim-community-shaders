@@ -54,16 +54,16 @@ public:
 	};
 	STATIC_ASSERT_ALIGNAS_16(BlurCB);
 
-	ConstantBuffer* blurCB = nullptr;
+	std::unique_ptr<ConstantBuffer> blurCB;
 	BlurCB blurCBData{};
 
 	bool validMaterial = true;
 	bool updateKernels = true;
 	bool validMaterials = false;
 
-	Texture2D* blurHorizontalTemp = nullptr;
-	Texture2D* sssResult = nullptr;
-	Texture2D* sssGuide = nullptr;
+	std::unique_ptr<Texture2D> blurHorizontalTemp;
+	std::unique_ptr<Texture2D> sssResult;
+	std::unique_ptr<Texture2D> sssGuide;
 
 	ID3D11ComputeShader* horizontalSSBlur = nullptr;
 	ID3D11ComputeShader* verticalSSBlur = nullptr;

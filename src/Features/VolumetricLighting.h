@@ -138,7 +138,7 @@ private:
 		int32_t screenYMin1;
 	};
 	VLData vlData = VLData();
-	ConstantBuffer* vlDataCB = nullptr;
+	std::unique_ptr<ConstantBuffer> vlDataCB;
 
 	static constexpr int32_t BlurThreadGroupSizeX = 256;
 	static constexpr int32_t BlurThreadGroupSizeY = 256;

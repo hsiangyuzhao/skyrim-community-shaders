@@ -30,9 +30,6 @@ void MotionBlur::SetupResources()
 	samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
 	device->CreateSamplerState(&samplerDesc, pointSampler.put());
 
-	// Compile shaders
-	CompileComputeShaders();
-
 	// Initialize constant buffer structs
 	motionBlurCB = {
 		.VelocityScale = GetScaleValueFromPreset(settings.ScalePreset),
@@ -61,6 +58,31 @@ void MotionBlur::SetupResources()
 	}
 
 	logger::info("Motion blur resources initialized");
+}
+
+// (batch 16, item P14) Shader compilation is no longer part of SetupResources, so that the
+// memory SetupResources allocates can be handed back while the effect is off without paying
+// a D3DCompileFromFile on every re-enable.
+void MotionBlur::SetupShaders()
+{
+	CompileComputeShaders();
+}
+
+// (batch 16, item P14) Mirror of SetupResources plus CheckAndResizeResources: motion blur is
+// the one sub-feature that was already allocating its grid textures lazily, so the release
+// side has to cover both. Zeroing lastWidth/lastHeight is what makes CheckAndResizeResources
+// rebuild them from scratch on the next draw.
+void MotionBlur::ReleaseResources()
+{
+	blurConstantBufferObj = nullptr;
+	reductionPassConstantBufferObj = nullptr;
+
+	horizontalPassTexture = nullptr;
+	verticalPassTexture = nullptr;
+	neighborMaxTexture = nullptr;
+	blurOutputTexture = nullptr;
+
+	lastWidth = lastHeight = 0;
 }
 
 void MotionBlur::CompileComputeShaders()

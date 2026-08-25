@@ -132,11 +132,11 @@ void IBL::Prepass()
 	state->BeginPerfEvent("IBL");
 	std::array<ID3D11ShaderResourceView*, 1> srvs = { (dynamicCubemaps.loaded && envTexture) ? envTexture->srv.get() : nullptr };
 	std::array<ID3D11UnorderedAccessView*, 1> uavs = { diffuseIBLTexture->uav.get() };
-	std::array<ID3D11SamplerState*, 1> samplers = { Deferred::GetSingleton()->linearSampler };
+	std::array<ID3D11SamplerState*, 1> samplers = { Deferred::GetSingleton()->linearSampler.get() };
 
 	// IBL
 	{
-		samplers[0] = Deferred::GetSingleton()->linearSampler;
+		samplers[0] = Deferred::GetSingleton()->linearSampler.get();
 
 		context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
@@ -205,10 +205,10 @@ void IBL::SetupResources()
 			.Texture2D = { .MipSlice = 0 }
 		};
 
-		diffuseIBLTexture = new Texture2D(texDesc);
+		diffuseIBLTexture = std::make_unique<Texture2D>(texDesc);
 		diffuseIBLTexture->CreateSRV(srvDesc);
 		diffuseIBLTexture->CreateUAV(uavDesc);
-		diffuseSkyIBLTexture = new Texture2D(texDesc);
+		diffuseSkyIBLTexture = std::make_unique<Texture2D>(texDesc);
 		diffuseSkyIBLTexture->CreateSRV(srvDesc);
 		diffuseSkyIBLTexture->CreateUAV(uavDesc);
 	}

@@ -70,9 +70,9 @@ public:
 
 	winrt::com_ptr<ID3D11SamplerState> comparisonSampler = nullptr;
 
-	Texture2D* texOcclusion = nullptr;
-	Texture3D* texProbeArray = nullptr;
-	Texture3D* texAccumFramesArray = nullptr;
+	std::unique_ptr<Texture2D> texOcclusion;
+	std::unique_ptr<Texture3D> texProbeArray;
+	std::unique_ptr<Texture3D> texAccumFramesArray;
 
 	winrt::com_ptr<ID3D11ComputeShader> probeUpdateCompute = nullptr;
 	winrt::com_ptr<ID3D11ShaderResourceView> stbn_vec3_2Dx1D_128x128x64;

@@ -119,7 +119,26 @@ void LUT::SetupResources()
 		texOutput->CreateUAV(uavDesc);
 	}
 
+}
+
+// (batch 16, item P14) Shader compilation is no longer part of SetupResources, so that
+// the memory SetupResources allocates can be handed back while the effect is off
+// without paying a D3DCompileFromFile on every re-enable.
+void LUT::SetupShaders()
+{
 	CompileComputeShaders();
+}
+
+// (batch 16, item P14) Mirror of SetupResources: every texture/buffer it assigns is
+// nulled here. Shaders and sampler states are deliberately kept -- they are a few
+// hundred bytes and keeping them is what makes turning the effect back on cheap.
+void LUT::ReleaseResources()
+{
+	// texLUT2D / texLUT3D are NOT touched: they are loaded by ReadTexture from whichever
+	// LUT file the user picked, not by SetupResources, and they are small. Releasing them
+	// here would leave Draw dereferencing a null SRV after a re-enable.
+	lutCB = nullptr;
+	texOutput = nullptr;
 }
 
 void LUT::ReadTexture(std::filesystem::path path)

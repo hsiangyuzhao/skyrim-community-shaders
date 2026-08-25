@@ -46,6 +46,8 @@ struct Camera : public PostProcessFeature
 	winrt::com_ptr<ID3D11SamplerState> colorSampler = nullptr;
 
 	virtual void SetupResources() override;
+	virtual void SetupShaders() override;
+	virtual void ReleaseResources() override;
 	virtual void ClearShaderCache() override;
 	void CompileComputeShaders();
 

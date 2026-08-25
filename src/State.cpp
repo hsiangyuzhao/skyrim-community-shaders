@@ -613,11 +613,11 @@ void State::SetupResources()
 
 	auto renderer = globals::game::renderer;
 
-	permutationCB = new ConstantBuffer(ConstantBufferDesc<PermutationCB>());
-	sharedDataCB = new ConstantBuffer(ConstantBufferDesc<SharedDataCB>());
+	permutationCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PermutationCB>());
+	sharedDataCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<SharedDataCB>());
 
 	auto [data, size] = GetFeatureBufferData(false);
-	featureDataCB = new ConstantBuffer(ConstantBufferDesc((uint32_t)size));
+	featureDataCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc((uint32_t)size));
 	delete[] data;
 
 	// Grab main texture to get resolution

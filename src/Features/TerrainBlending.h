@@ -56,10 +56,18 @@ public:
 	void ResetTerrainDepth();
 	void BlendPrepassDepths();
 
-	Texture2D* blendedDepthTexture = nullptr;
-	Texture2D* blendedDepthTexture16 = nullptr;
+	std::unique_ptr<Texture2D> blendedDepthTexture;
+	std::unique_ptr<Texture2D> blendedDepthTexture16;
 
-	RE::BSGraphics::DepthStencilData terrainDepth;
+	/// @brief Our own private copy of the main depth buffer, not one of the game's slots.
+	///
+	/// (batch 16, item 3) The `= {}` is load-bearing. RE::BSGraphics::DepthStencilData is a
+	/// plain aggregate of raw pointers, so as a bare member it was default-initialised, i.e.
+	/// indeterminate. Only the three fields SetupResources fills were ever read, so nothing
+	/// broke -- but SetupResources now releases the previous contents before overwriting them,
+	/// and releasing an indeterminate pointer is a crash. Zero-initialising makes the release
+	/// path safe on the first call.
+	RE::BSGraphics::DepthStencilData terrainDepth = {};
 
 	ID3D11DepthStencilState* terrainDepthStencilState = nullptr;
 

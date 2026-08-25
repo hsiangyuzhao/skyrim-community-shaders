@@ -104,7 +104,7 @@ struct LinearLighting : Feature
 		float pad0[3];
 	};
 
-	ConstantBuffer* PerGeometryCB = nullptr;
+	std::unique_ptr<ConstantBuffer> PerGeometryCB;
 
 	uint isDirLightLinear = false;
 	float dirLightMult = 1.0f;

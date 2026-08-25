@@ -78,8 +78,8 @@ void LightLimitFix::SetupResources()
 		clusterBuildingCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterBuildingCS.hlsl", {}, "cs_5_0");
 		clusterCullingCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterCullingCS.hlsl", {}, "cs_5_0");
 
-		lightBuildingCB = new ConstantBuffer(ConstantBufferDesc<LightBuildingCB>());
-		lightCullingCB = new ConstantBuffer(ConstantBufferDesc<LightCullingCB>());
+		lightBuildingCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<LightBuildingCB>());
+		lightCullingCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<LightCullingCB>());
 	}
 
 	{
@@ -157,7 +157,7 @@ void LightLimitFix::SetupResources()
 	}
 
 	{
-		strictLightDataCB = new ConstantBuffer(ConstantBufferDesc<StrictLightDataCB>());
+		strictLightDataCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<StrictLightDataCB>());
 	}
 }
 

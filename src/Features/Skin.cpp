@@ -220,7 +220,7 @@ void Skin::SetupResources()
 	}
 
 	{
-		PerGeometryCB = new ConstantBuffer(ConstantBufferDesc<PerGeometryData>());
+		PerGeometryCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PerGeometryData>());
 	}
 
 	// Check for Dynamic Wetness availability
@@ -573,6 +573,37 @@ void Skin::SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, R
 	} else {
 		logger::debug("[Advanced Skin] SetupExtraTexture : Failed to set extra texture for material: {}", hashKey);
 	}
+
+	// (batch 16, item 4) Bound the map here rather than on a timer: this is the only insertion
+	// point, so it is the only place the size can grow, and pruning here means the check costs
+	// nothing on the hot path (BSLightingShader_SetupMaterial, per draw call).
+	PruneSkinExtraTextures();
+}
+
+// (batch 16, item 4) See Skin::maxSkinExtraTextures for why eviction is safe here.
+void Skin::PruneSkinExtraTextures()
+{
+	if (skinExtraTextures.size() <= maxSkinExtraTextures)
+		return;
+
+	// Drop down to three quarters of the cap rather than to exactly the cap. Trimming to the
+	// cap would make every subsequent insertion trigger another prune, i.e. an O(n) pass per
+	// new facegen material for the rest of the session.
+	const size_t target = maxSkinExtraTextures - (maxSkinExtraTextures / 4);
+
+	std::vector<std::pair<std::int64_t, uint32_t>> byAge;
+	byAge.reserve(skinExtraTextures.size());
+	for (const auto& [key, entry] : skinExtraTextures)
+		byAge.emplace_back(entry.lastUsed, key);
+
+	const size_t toDrop = skinExtraTextures.size() - target;
+	std::nth_element(byAge.begin(), byAge.begin() + toDrop, byAge.end(),
+		[](const auto& a, const auto& b) { return a.first < b.first; });
+
+	for (size_t i = 0; i < toDrop; ++i)
+		skinExtraTextures.erase(byAge[i].second);
+
+	logger::debug("[Advanced Skin] Pruned {} least recently drawn skin material entries, {} remain", toDrop, skinExtraTextures.size());
 }
 
 void Skin::BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialBase const* material)
@@ -598,7 +629,15 @@ void Skin::BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialBase const
 	}
 
 	auto graphicsState = globals::game::graphicsState;
-	auto workingExtraPtr = skinExtraTextures[hashKey];
+	// (batch 16, item 4) Reference, not a copy. This runs once per facegen draw call and the
+	// copy it replaced duplicated two NiPointer refcount round-trips and two std::string heap
+	// allocations every time. Taking it after SetupExtraTexture (and therefore after any
+	// rehash or prune the insertion above may have caused) is what makes the reference safe;
+	// nothing below mutates the map.
+	auto& workingExtraPtr = skinExtraTextures[hashKey];
+	// Recency stamp for PruneSkinExtraTextures: an entry drawn this frame is the last thing
+	// that should be evicted.
+	workingExtraPtr.lastUsed = std::chrono::steady_clock::now().time_since_epoch().count();
 
 	if (workingExtraPtr.hasExtraTexture || workingExtraPtr.hasWetnessTexture) {
 		skinExtendedRendererState.SetExtraSkinPSTexture(workingExtraPtr.rfaosTexture->rendererTexture, workingExtraPtr.wetnessTexture->rendererTexture);

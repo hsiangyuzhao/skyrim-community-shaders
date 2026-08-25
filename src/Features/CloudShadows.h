@@ -37,8 +37,8 @@ public:
 	bool overrideSky = false;
 	void SkyShaderHacks();
 
-	Texture2D* texCubemapCloudOcc = nullptr;
-	Texture2D* texCubemapCloudOccCopy = nullptr;
+	std::unique_ptr<Texture2D> texCubemapCloudOcc;
+	std::unique_ptr<Texture2D> texCubemapCloudOccCopy;
 
 	ID3D11RenderTargetView* cubemapCloudOccRTVs[6] = { nullptr };
 	ID3D11RenderTargetView* cubemapCloudOccCopyRTVs[6] = { nullptr };

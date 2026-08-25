@@ -115,10 +115,24 @@ void Camera::SetupResources()
 		DX::ThrowIfFailed(device->CreateSamplerState(&samplerDesc, colorSampler.put()));
 	}
 
+}
+
+// (batch 16, item P14) Shader compilation is no longer part of SetupResources, so that the
+// memory SetupResources allocates can be handed back while the effect is off without paying
+// a D3DCompileFromFile on every re-enable.
+void Camera::SetupShaders()
+{
 	logger::debug("Creating compute shaders...");
-	{
-		CompileComputeShaders();
-	}
+	CompileComputeShaders();
+}
+
+// (batch 16, item P14) Mirror of SetupResources: every texture/buffer it assigns is nulled
+// here. Shaders and sampler states are deliberately kept -- they are tiny, and keeping them
+// is what makes turning the effect back on cheap.
+void Camera::ReleaseResources()
+{
+	cameraCB = nullptr;
+	texOutput = nullptr;
 }
 
 void Camera::ClearShaderCache()

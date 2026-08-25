@@ -50,6 +50,8 @@ struct CODBloom : public PostProcessFeature
 	int lastTopMip = (int)s_BloomMips - 1;
 
 	virtual void SetupResources() override;
+	virtual void SetupShaders() override;
+	virtual void ReleaseResources() override;
 	virtual void ClearShaderCache() override;
 	void CompileComputeShaders();
 

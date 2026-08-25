@@ -18,12 +18,67 @@ void TerrainHelper::DataLoaded()
 	}
 }
 
+// (batch 16, item 4) See the doc comment on the declaration for the full argument. Runs from
+// TESObjectLAND_SetupMaterial rather than from a per-frame hook: that is the only place the map
+// grows, and it is called continuously as land streams in, so a worldspace change is always
+// followed by more calls here within a second or two.
+void TerrainHelper::PruneStaleExtendedSlots()
+{
+	// How long after a worldspace change we wait before evicting, so that anything still being
+	// rendered has had many frames to stamp lastUsed.
+	static constexpr auto pruneGrace = std::chrono::seconds(10);
+
+	auto tes = RE::TES::GetSingleton();
+	auto worldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+	if (!worldspace)
+		return;  // interior, or no worldspace yet: never a safe moment to evict anything
+
+	const std::uint32_t current = worldspace->formID;
+	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+
+	{
+		const std::unique_lock lock(extendedSlotsMutex);
+
+		if (current != trackedWorldspace) {
+			// Arm, do not fire. The entries for the *new* worldspace mostly do not exist yet,
+			// and the ones for the old one need a grace period in which to prove they are not
+			// still being drawn.
+			trackedWorldspace = current;
+			worldspaceChangedAt = now;
+			return;
+		}
+
+		if (worldspaceChangedAt == 0)
+			return;  // nothing pending
+
+		if (now - worldspaceChangedAt < std::chrono::duration_cast<std::chrono::steady_clock::duration>(pruneGrace).count())
+			return;  // still inside the grace period
+
+		const size_t before = extendedSlots.size();
+		for (auto it = extendedSlots.begin(); it != extendedSlots.end();) {
+			const bool foreign = it->second.worldspace != 0 && it->second.worldspace != trackedWorldspace;
+			const bool unusedSinceChange = it->second.lastUsed.load(std::memory_order_relaxed) < worldspaceChangedAt;
+			it = (foreign && unusedSinceChange) ? extendedSlots.erase(it) : std::next(it);
+		}
+		worldspaceChangedAt = 0;
+
+		if (before != extendedSlots.size())
+			logger::info("[Terrain Helper] Released {} terrain material entries left behind by a worldspace change, {} remain", before - extendedSlots.size(), extendedSlots.size());
+	}
+}
+
 bool TerrainHelper::TESObjectLAND_SetupMaterial(RE::TESObjectLAND* land)
 {
 	if (!enabled) {
 		// terrain helper is not enabled
 		return false;
 	}
+
+	PruneStaleExtendedSlots();
+
+	auto tes = RE::TES::GetSingleton();
+	auto currentWorldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+	const std::uint32_t currentWorldspaceID = currentWorldspace ? currentWorldspace->formID : 0u;
 
 	if (land == nullptr || land->loadedData == nullptr || land->loadedData->mesh[0] == nullptr) {
 		// this is not terrain or vanilla material failed
@@ -81,6 +136,11 @@ bool TerrainHelper::TESObjectLAND_SetupMaterial(RE::TESObjectLAND* land)
 		{
 			const std::unique_lock lock(extendedSlotsMutex);
 			auto& slot = extendedSlots.try_emplace(hashKey).first->second;
+			// Tag with the worldspace this land belongs to; PruneStaleExtendedSlots uses it.
+			// Re-stamped rather than set-once so that an entry re-registered under a new
+			// worldspace is not left carrying the old tag.
+			slot.worldspace = currentWorldspaceID;
+			slot.lastUsed.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 
 			for (uint32_t textureI = 0; textureI < 6; ++textureI) {
 				if (textureSets[textureI] == nullptr) {
@@ -163,15 +223,24 @@ void TerrainHelper::BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialB
 		return;
 	}
 
-	ExtendedSlots materialBase;
+	// (batch 16, item 4) Only the parallax array is copied out, not the whole entry -- the entry
+	// now also carries an atomic recency stamp, and copying it under a shared_lock would be both
+	// wrong and pointless. The copy itself stays: it is what lets the lock be released before the
+	// rest of this function runs, and it is what makes the pointers safe against a concurrent
+	// prune.
+	std::array<RE::NiSourceTexturePtr, 6> materialParallax;
 	{
 		const std::shared_lock lock(extendedSlotsMutex);
 
-		if (!extendedSlots.contains(material->hashKey)) {
+		auto it = extendedSlots.find(material->hashKey);
+		if (it == extendedSlots.end()) {
 			// hash does not exists
 			return;
 		}
-		materialBase = extendedSlots[material->hashKey];
+		// Recency stamp. Relaxed is enough: the prune only compares it against a timestamp it
+		// took before the grace period, so a stale-by-microseconds read cannot flip the result.
+		it->second.lastUsed.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+		materialParallax = it->second.parallax;
 	}
 
 	const auto state = globals::state;
@@ -182,8 +251,8 @@ void TerrainHelper::BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialB
 	// Populate extended slots
 	// Bits 0-5 track individual texture displacement; THLandHasDisplacement (bit 9) tracks if any texture has displacement
 	for (uint32_t textureI = 0; textureI < 6; ++textureI) {
-		if (materialBase.parallax[textureI] != nullptr && materialBase.parallax[textureI] != stateData.defaultTextureNormalMap) {
-			thExtendedRendererState.SetPSTexture(textureI, materialBase.parallax[textureI]->rendererTexture);
+		if (materialParallax[textureI] != nullptr && materialParallax[textureI] != stateData.defaultTextureNormalMap) {
+			thExtendedRendererState.SetPSTexture(textureI, materialParallax[textureI]->rendererTexture);
 			state->permutationData.ExtraFeatureDescriptor |= 1 << textureI;
 			state->permutationData.ExtraFeatureDescriptor |= uint(State::ExtraFeatureDescriptors::THLandHasDisplacement);
 		} else {

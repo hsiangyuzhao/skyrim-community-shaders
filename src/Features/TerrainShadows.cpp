@@ -236,7 +236,10 @@ void TerrainShadows::LoadHeightmap()
 			return;
 		}
 
-		texHeightMap.release();
+		// reset(), not release(): unique_ptr::release() hands off ownership WITHOUT
+		// destroying, so every worldspace change orphaned the previous heightmap
+		// (Tamriel 21.8 MiB, Solstheim 72 MiB) for the rest of the process.
+		texHeightMap.reset();
 		texHeightMap = std::make_unique<Texture2D>(reinterpret_cast<ID3D11Texture2D*>(pResource));
 
 		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
@@ -270,7 +273,9 @@ void TerrainShadows::Precompute()
 			context->CSSetShaderResources(60, (uint)srvs.size(), srvs.data());
 		}
 
-		texShadowHeight.release();
+		// reset(), not release(): see LoadHeightmap(). Freeing here rather than
+		// letting operator= do it also keeps the peak at one texture, not two.
+		texShadowHeight.reset();
 
 		D3D11_TEXTURE2D_DESC texDesc = {
 			.Width = texHeightMap->desc.Width,

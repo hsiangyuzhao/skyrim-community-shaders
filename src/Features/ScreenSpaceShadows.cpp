@@ -274,7 +274,7 @@ bool ScreenSpaceShadows::HasShaderDefine(RE::BSShader::Type)
 
 void ScreenSpaceShadows::SetupResources()
 {
-	raymarchCB = new ConstantBuffer(ConstantBufferDesc<RaymarchCB>());
+	raymarchCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<RaymarchCB>());
 
 	{
 		auto device = globals::d3d::device;
@@ -314,7 +314,7 @@ void ScreenSpaceShadows::SetupResources()
 			.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
 			.Texture2D = { .MipSlice = 0 }
 		};
-		screenSpaceShadowsTexture = new Texture2D(texDesc);
+		screenSpaceShadowsTexture = std::make_unique<Texture2D>(texDesc);
 		screenSpaceShadowsTexture->CreateSRV(srvDesc);
 		screenSpaceShadowsTexture->CreateUAV(uavDesc);
 	}

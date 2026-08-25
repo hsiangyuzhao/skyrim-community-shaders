@@ -1218,8 +1218,8 @@ struct ScreenSpaceRayTracing : Feature
     ///
     /// Ten textures -- the two colour histories, the two moment histories, the temporal and
     /// variance scratch, the moments surface, the normal and depth history snapshots and the
-    /// debug view -- 68 bytes per output pixel between them, i.e. ~140 MB at 1080p and
-    /// ~560 MB at a 4K allocation. Every one of them is read by exactly one shader,
+    /// debug view -- 68 bytes per output pixel between them, i.e. 134.5 MiB at 1080p and
+    /// 537.9 MiB at a 4K allocation. Every one of them is read by exactly one shader,
     /// ssrt_temporal.hlsl and the passes around it, and none of those runs under REBLUR or
     /// Off. They were nevertheless allocated at boot for every user of the feature.
     ///
@@ -1233,9 +1233,12 @@ struct ScreenSpaceRayTracing : Feature
     void EnsureSvgfResources();
 
     /// @brief (reinjection noise) Allocate the confidence accumulator's ping-pong pair on first
-    /// need, the same argument EnsureSvgfResources makes: ~66 MB of a 4K allocation between them,
-    /// and nothing reads either surface unless ambient reinjection and TemporalAmbientConfidence
-    /// are both on.
+    /// need, the same argument EnsureSvgfResources makes: 63.3 MiB each and 126.6 MiB for the
+    /// pair at a 4K allocation, and nothing reads either surface unless ambient reinjection and
+    /// TemporalAmbientConfidence are both on.
+    ///
+    /// (batch 16, item 5) This used to read "~66 MB between them", which is the figure for one
+    /// of the two. R16G16B16A16_FLOAT is 8 bytes per pixel: 8 * 3840 * 2160 = 63.3 MiB each.
     ///
     /// Called from DrawSSRTDiffuse on the one path that is about to bind them, so the dispatch
     /// cannot find a null surface. Returns false if allocation was not attempted or failed, which
@@ -1302,7 +1305,7 @@ struct ScreenSpaceRayTracing : Feature
     /// longer does, and the argument that put it there does not survive inspection: it was
     /// bought to stop the panel freezing under the default denoiser, but six of the ten SVGF
     /// panels are written only inside the SVGF dispatch blocks, which do not run under REBLUR
-    /// whatever this predicate says. So the term paid nine allocations (68 B/px, ~560 MB at a 4K
+    /// whatever this predicate says. So the term paid ten allocations (68 B/px, 537.9 MiB at a 4K
     /// allocation, released only on a resolution change) and three full-screen copies per frame
     /// in order to display six cleared black rectangles. The Buffer Viewer now hides those
     /// entries and says why instead.
@@ -1571,8 +1574,11 @@ struct ScreenSpaceRayTracing : Feature
     ///   texSparseHitDistance R8_UNORM            the reciprocally encoded hit distance
     ///                                            ssrt_spatial.hlsl sizes its kernel from
     ///
-    /// ~41 MB together at a 4K allocation (33 + 4 + 4), against the eight full-screen RGBA16F
-    /// surfaces this feature already holds at ~33 MB each; ~10 MB at 1080p. Allocated by
+    /// 39.6 MiB together at a 4K allocation (31.6 + 4 + 4 -- these are half-width, so the
+    /// RGBA16F one is half of a full-screen surface), against the three unconditional
+    /// full-screen RGBA16F surfaces this feature already holds at 63.3 MiB each; 9.9 MiB at
+    /// 1080p. (batch 16, item 5) The "~33 MB each" this line used to quote for the full-screen
+    /// surfaces was half their real size. Allocated by
     /// EnsureSparseResources on first need and released by ReleaseSparseResources both on a mode
     /// switch back to full density and by SetupResources on a resolution change.
     eastl::unique_ptr<Texture2D> texSparseColor = nullptr;
@@ -1609,9 +1615,9 @@ struct ScreenSpaceRayTracing : Feature
     /// composite consumption run on *every* denoiser path. Carrying its own reference makes the
     /// disocclusion test self-contained and identical under SVGF, REBLUR and Off.
     ///
-    /// Allocated by EnsureAmbientConfidenceResources on first need, not at boot: ~33 MB each at a
-    /// 4K allocation, and nothing reads them unless ambient reinjection and this accumulator are
-    /// both on.
+    /// Allocated by EnsureAmbientConfidenceResources on first need, not at boot: 63.3 MiB each
+    /// at a 4K allocation (126.6 MiB for the pair), and nothing reads them unless ambient
+    /// reinjection and this accumulator are both on.
     eastl::unique_ptr<Texture2D> texSSRTConfidenceHistory = nullptr;
     eastl::unique_ptr<Texture2D> texSSRTConfidenceHistoryPrev = nullptr;
     /// @brief (batch 1, item 2) Per-pixel diffuse hit distance, R8_UNORM, written by

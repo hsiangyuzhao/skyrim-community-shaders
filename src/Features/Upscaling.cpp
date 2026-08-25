@@ -540,13 +540,13 @@ void Upscaling::CreateUpscalingTextureResources(UpscaleMethod a_upscalemethod, b
 		uavDesc.Format = texDesc.Format;
 
 		if (!reactiveMaskTexture) {
-			reactiveMaskTexture = new Texture2D(texDesc);
+			reactiveMaskTexture = std::make_unique<Texture2D>(texDesc);
 			reactiveMaskTexture->CreateSRV(srvDesc);
 			reactiveMaskTexture->CreateUAV(uavDesc);
 		}
 
 		if (!transparencyCompositionMaskTexture) {
-			transparencyCompositionMaskTexture = new Texture2D(texDesc);
+			transparencyCompositionMaskTexture = std::make_unique<Texture2D>(texDesc);
 			transparencyCompositionMaskTexture->CreateSRV(srvDesc);
 			transparencyCompositionMaskTexture->CreateUAV(uavDesc);
 		}
@@ -564,7 +564,7 @@ void Upscaling::CreateUpscalingTextureResources(UpscaleMethod a_upscalemethod, b
 			srvDesc.Format = texDesc.Format;
 			uavDesc.Format = texDesc.Format;
 
-			motionVectorCopyTexture = new Texture2D(motionTexDesc);
+			motionVectorCopyTexture = std::make_unique<Texture2D>(motionTexDesc);
 			motionVectorCopyTexture->CreateSRV(srvDesc);
 			motionVectorCopyTexture->CreateUAV(uavDesc);
 		}
@@ -577,36 +577,18 @@ void Upscaling::DestroyUpscalingTextureResources(UpscaleMethod a_upscalemethod)
 
 	// Clean up D3D11 textures that are no longer needed
 	// Only destroy textures when switching away from methods that use them
+	// (batch 16, item 3) These three were the one place in the repo that already released
+	// correctly, but by hand: null the three views, then `delete`. As unique_ptrs a single
+	// reset() does the same thing, and the members can no longer be leaked by a future edit
+	// that forgets the delete.
 	if (a_upscalemethod != UpscaleMethod::kDLSS && a_upscalemethod != UpscaleMethod::kFSR) {
-		if (reactiveMaskTexture) {
-			reactiveMaskTexture->srv = nullptr;
-			reactiveMaskTexture->uav = nullptr;
-			reactiveMaskTexture->resource = nullptr;
-
-			delete reactiveMaskTexture;
-			reactiveMaskTexture = nullptr;
-		}
-
-		if (transparencyCompositionMaskTexture) {
-			transparencyCompositionMaskTexture->srv = nullptr;
-			transparencyCompositionMaskTexture->uav = nullptr;
-			transparencyCompositionMaskTexture->resource = nullptr;
-
-			delete transparencyCompositionMaskTexture;
-			transparencyCompositionMaskTexture = nullptr;
-		}
+		reactiveMaskTexture.reset();
+		transparencyCompositionMaskTexture.reset();
 	}
 
 	// Motion vector copy texture is only needed for DLSS - destroy when switching away from DLSS
 	if (a_upscalemethod != UpscaleMethod::kDLSS) {
-		if (motionVectorCopyTexture) {
-			motionVectorCopyTexture->srv = nullptr;
-			motionVectorCopyTexture->uav = nullptr;
-			motionVectorCopyTexture->resource = nullptr;
-
-			delete motionVectorCopyTexture;
-			motionVectorCopyTexture = nullptr;
-		}
+		motionVectorCopyTexture.reset();
 	}
 }
 
@@ -935,10 +917,10 @@ void Upscaling::SetupResources()
 	DX::ThrowIfFailed(globals::d3d::device->CreateDepthStencilState(&depthStencilDesc, upscaleDepthStencilState.put()));
 
 	// Create jitter offset constant buffer for depth upscaling
-	jitterCB = new ConstantBuffer(ConstantBufferDesc<JitterCB>());
+	jitterCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<JitterCB>());
 
 	// Create upscaling data constant buffer for encode textures compute shader
-	upscalingDataCB = new ConstantBuffer(ConstantBufferDesc<UpscalingDataCB>());
+	upscalingDataCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<UpscalingDataCB>());
 
 	// Create blend state for depth upscaling
 	D3D11_BLEND_DESC blendDesc = {};
@@ -1646,7 +1628,7 @@ void Upscaling::UpscaleDepth()
 		// Set up pixel shader resources
 		auto deferred = globals::deferred;
 
-		ID3D11SamplerState* samplers[] = { deferred->linearSampler };
+		ID3D11SamplerState* samplers[] = { deferred->linearSampler.get() };
 		context->PSSetSamplers(0, ARRAYSIZE(samplers), samplers);
 
 		// Set up jitter constant buffer for upscaling

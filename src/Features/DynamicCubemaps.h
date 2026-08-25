@@ -26,11 +26,19 @@ public:
 	STATIC_ASSERT_ALIGNAS_16(SpecularMapFilterSettingsCB);
 
 	ID3D11ComputeShader* specularIrradianceCS = nullptr;
-	ConstantBuffer* spmapCB = nullptr;
-	Texture2D* envTexture = nullptr;
-	Texture2D* envReflectionsTexture = nullptr;
-	ID3D11UnorderedAccessView* uavArray[7];
-	ID3D11UnorderedAccessView* uavReflectionsArray[7];
+	std::unique_ptr<ConstantBuffer> spmapCB;
+	std::unique_ptr<Texture2D> envTexture;
+	std::unique_ptr<Texture2D> envReflectionsTexture;
+	/// @brief Per-mip UAVs onto envTexture / envReflectionsTexture.
+	///
+	/// (batch 16, item 3) These were bare `ID3D11UnorderedAccessView*[7]`: uninitialised, and
+	/// overwritten without a Release whenever SetupResources re-ran. The twelve descriptors
+	/// themselves are negligible, but each one holds a COM reference on the cubemap it views,
+	/// so they were what kept the *previous* set of cubemaps alive after the unique_ptrs above
+	/// let go of them. com_ptr's assignment releases the old view, which is what actually lets
+	/// the old cubemaps die.
+	std::array<winrt::com_ptr<ID3D11UnorderedAccessView>, 7> uavArray = {};
+	std::array<winrt::com_ptr<ID3D11UnorderedAccessView>, 7> uavReflectionsArray = {};
 
 	// Reflection capture
 
@@ -45,21 +53,21 @@ public:
 	ID3D11ComputeShader* updateCubemapReflectionsCS = nullptr;
 	ID3D11ComputeShader* updateCubemapFakeReflectionsCS = nullptr;
 
-	ConstantBuffer* updateCubemapCB = nullptr;
+	std::unique_ptr<ConstantBuffer> updateCubemapCB;
 
 	ID3D11ComputeShader* inferCubemapCS = nullptr;
 	ID3D11ComputeShader* inferCubemapReflectionsCS = nullptr;
 	ID3D11ComputeShader* inferCubemapFakeReflectionsCS = nullptr;
 
-	Texture2D* envCaptureTexture = nullptr;
-	Texture2D* envCaptureRawTexture = nullptr;
-	Texture2D* envCapturePositionTexture = nullptr;
+	std::unique_ptr<Texture2D> envCaptureTexture;
+	std::unique_ptr<Texture2D> envCaptureRawTexture;
+	std::unique_ptr<Texture2D> envCapturePositionTexture;
 
-	Texture2D* envCaptureReflectionsTexture = nullptr;
-	Texture2D* envCaptureRawReflectionsTexture = nullptr;
-	Texture2D* envCapturePositionReflectionsTexture = nullptr;
+	std::unique_ptr<Texture2D> envCaptureReflectionsTexture;
+	std::unique_ptr<Texture2D> envCaptureRawReflectionsTexture;
+	std::unique_ptr<Texture2D> envCapturePositionReflectionsTexture;
 
-	Texture2D* envInferredTexture = nullptr;
+	std::unique_ptr<Texture2D> envInferredTexture;
 
 	ID3D11ShaderResourceView* defaultCubemap = nullptr;
 
