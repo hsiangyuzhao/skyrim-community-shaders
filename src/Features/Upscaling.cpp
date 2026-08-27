@@ -30,7 +30,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sharpnessFSR,
 	sharpnessDLSS,
 	DLSSPreset,
-	enableDLSSRR);
+	enableDLSSRR,
+	DLSSDPreset);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
 
@@ -270,8 +271,25 @@ void Upscaling::DrawSettings()
 
 	if (upscaleMethod == UpscaleMethod::kDLSS && streamline.featureDLSS_RR) {
 		ImGui::Checkbox("Enable DLSS Ray Reconstruction", &settings.enableDLSSRR);
-		if (settings.enableDLSSRR)
+		if (settings.enableDLSSRR) {
 			ImGui::TextDisabled("DLSS SR model presets do not apply while Ray Reconstruction is enabled.");
+
+			const char* dlssdPresets[] = {
+				"Default (whatever the DLL picks)",
+				"D (transformer, previous default)",
+				"E (transformer, DoF-guide model)",
+				"F (DLSS 4.5 model)"
+			};
+			int dlssdPresetIndex = static_cast<int>(settings.DLSSDPreset);
+			if (ImGui::Combo("DLSS RR Model Preset", &dlssdPresetIndex, dlssdPresets, IM_ARRAYSIZE(dlssdPresets)))
+				settings.DLSSDPreset = static_cast<uint>(dlssdPresetIndex);
+
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Selects the Ray Reconstruction model for all five quality modes. Takes effect on the next frame, so two models can be compared back to back.");
+				ImGui::TextUnformatted("The model weights live in nvngx_dlssd.dll, not in Streamline. Preset F is the DLSS 4.5 model and needs nvngx_dlssd.dll 310.7.12 or newer; older DLLs have no weights for it and fall back to their own default without saying so.");
+				ImGui::TextUnformatted("To check which model was actually requested, read the '[DLSS RR] Requested model preset' line in CommunityShaders.log alongside the 'nvngx_dlssd.dll version' line logged at startup.");
+			}
+		}
 	}
 
 	if (!globals::game::isVR) {
@@ -442,6 +460,12 @@ void Upscaling::LoadSettings(json& o_json)
 		const auto fallback = static_cast<uint>(DLSSModelPreset::kK);
 		logger::warn("[Upscaling] Loaded DLSSPreset {} out of range, falling back to K ({})", settings.DLSSPreset, fallback);
 		settings.DLSSPreset = fallback;
+	}
+	constexpr auto dlssdPresetCount = static_cast<uint>(DLSSDModelPreset::kCount);
+	if (settings.DLSSDPreset >= dlssdPresetCount) {
+		const auto fallback = static_cast<uint>(DLSSDModelPreset::kD);
+		logger::warn("[Upscaling] Loaded DLSSDPreset {} out of range, falling back to D ({})", settings.DLSSDPreset, fallback);
+		settings.DLSSDPreset = fallback;
 	}
 	auto iniSettingCollection = globals::game::iniPrefSettingCollection;
 	if (iniSettingCollection) {

@@ -17,6 +17,7 @@
 namespace
 {
 using DLSSModelPreset = Upscaling::DLSSModelPreset;
+using DLSSDModelPreset = Upscaling::DLSSDModelPreset;
 
 constexpr uint kDLSSModelPresetCount = static_cast<uint>(DLSSModelPreset::kCount);
 constexpr uint kUnreportedPreset = std::numeric_limits<uint>::max();
@@ -74,6 +75,45 @@ sl::DLSSPreset GetForcedDLSSPreset(DLSSModelPreset a_preset)
 	default:
 		return sl::DLSSPreset::ePresetK;
 	}
+}
+
+const char* GetDLSSDModelPresetName(DLSSDModelPreset a_preset)
+{
+	switch (a_preset) {
+	case DLSSDModelPreset::kDefault:
+		return "Default (whatever the DLL picks)";
+	case DLSSDModelPreset::kE:
+		return "E (transformer, DoF-guide model)";
+	case DLSSDModelPreset::kF:
+		return "F (DLSS 4.5 model)";
+	case DLSSDModelPreset::kD:
+	default:
+		return "D (transformer, previous default)";
+	}
+}
+
+sl::DLSSDPreset GetForcedDLSSDPreset(DLSSDModelPreset a_preset)
+{
+	switch (a_preset) {
+	case DLSSDModelPreset::kDefault:
+		return sl::DLSSDPreset::eDefault;
+	case DLSSDModelPreset::kE:
+		return sl::DLSSDPreset::ePresetE;
+	case DLSSDModelPreset::kF:
+		return sl::DLSSDPreset::ePresetF;
+	case DLSSDModelPreset::kD:
+	default:
+		return sl::DLSSDPreset::ePresetD;
+	}
+}
+
+void SetAllDLSSDPresets(sl::DLSSDOptions& a_options, sl::DLSSDPreset a_preset)
+{
+	a_options.dlaaPreset = a_preset;
+	a_options.qualityPreset = a_preset;
+	a_options.balancedPreset = a_preset;
+	a_options.performancePreset = a_preset;
+	a_options.ultraPerformancePreset = a_preset;
 }
 
 template <class T>
@@ -1105,11 +1145,22 @@ void Streamline::SetDLSSRROptions()
 		sl::float4{ cameraViewToWorld._31, cameraViewToWorld._32, cameraViewToWorld._33, cameraViewToWorld._34 },
 		sl::float4{ cameraViewToWorld._41, cameraViewToWorld._42, cameraViewToWorld._43, cameraViewToWorld._44 }
 	};
-	dlssdOptions.dlaaPreset = sl::DLSSDPreset::ePresetD;
-	dlssdOptions.qualityPreset = sl::DLSSDPreset::ePresetD;
-	dlssdOptions.balancedPreset = sl::DLSSDPreset::ePresetD;
-	dlssdOptions.performancePreset = sl::DLSSDPreset::ePresetD;
-	dlssdOptions.ultraPerformancePreset = sl::DLSSDPreset::ePresetD;
+	const auto selectedPreset = static_cast<DLSSDModelPreset>(globals::features::upscaling.settings.DLSSDPreset);
+	const auto rrPreset = GetForcedDLSSDPreset(selectedPreset);
+	SetAllDLSSDPresets(dlssdOptions, rrPreset);
+
+	// This runs every frame, so log only on change. It is the only place the requested model is
+	// observable: the weights live in nvngx_dlssd.dll, and asking for a preset that DLL has no
+	// weights for falls back to its default without reporting anything. Read this line together
+	// with the "nvngx_dlssd.dll version" line Streamline logs at startup -- Preset F needs
+	// 310.7.12 or newer, and the shipped 310.7.0 predates it.
+	static uint loggedPreset = static_cast<uint>(DLSSDModelPreset::kCount);
+	if (loggedPreset != globals::features::upscaling.settings.DLSSDPreset) {
+		loggedPreset = globals::features::upscaling.settings.DLSSDPreset;
+		logger::info("[DLSS RR] Requested model preset {} = sl::DLSSDPreset({}) for all five quality modes",
+			GetDLSSDModelPresetName(selectedPreset),
+			static_cast<uint>(rrPreset));
+	}
 
 	if (SL_FAILED(result, slDLSSDSetOptions(viewport, dlssdOptions))) {
 		logger::critical("[DLSS RR] Could not set DLSS RR options");

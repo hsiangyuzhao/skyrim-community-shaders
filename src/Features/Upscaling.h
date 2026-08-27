@@ -68,6 +68,25 @@ public:
 		kCount
 	};
 
+	// Stored in SettingsUser.json. Keep existing values stable and append new ones.
+	//
+	// Ray Reconstruction carries its own model presets, a separate enum from the super
+	// resolution ones above (sl::DLSSDPreset, not sl::DLSSPreset). Skyrim is not an official
+	// DLSS title, so it has no driver profile and the NVIDIA App's DLSS Override cannot reach
+	// it -- selecting the model here is the only way to pick one.
+	//
+	// The model weights live in nvngx_dlssd.dll, not in Streamline. Requesting a preset the
+	// shipped DLL has no weights for falls back to that DLL's default silently, and nothing in
+	// the API reports it, which is why SetDLSSRROptions logs the requested value.
+	enum class DLSSDModelPreset : uint
+	{
+		kDefault = 0,
+		kD = 1,
+		kE = 2,
+		kF = 3,
+		kCount
+	};
+
 	struct Settings
 	{
 		uint upscaleMethod = (uint)UpscaleMethod::kDLSS;
@@ -82,6 +101,9 @@ public:
 		float sharpnessDLSS = 0.1f;
 		uint DLSSPreset = static_cast<uint>(DLSSModelPreset::kK);
 		bool enableDLSSRR = false;
+		// kD reproduces what was hardcoded before this setting existed, so an existing profile
+		// keeps its exact behaviour.
+		uint DLSSDPreset = static_cast<uint>(DLSSDModelPreset::kD);
 	};
 
 	Settings settings;
