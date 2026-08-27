@@ -276,9 +276,9 @@ void Upscaling::DrawSettings()
 
 			const char* dlssdPresets[] = {
 				"Default (whatever the DLL picks)",
-				"D (transformer, previous default)",
-				"E (transformer, DoF-guide model)",
-				"F (DLSS 4.5 model)"
+				"D (previous default)",
+				"E (latest model in this SDK)",
+				"F (no model in this SDK; falls back to default)"
 			};
 			int dlssdPresetIndex = static_cast<int>(settings.DLSSDPreset);
 			if (ImGui::Combo("DLSS RR Model Preset", &dlssdPresetIndex, dlssdPresets, IM_ARRAYSIZE(dlssdPresets)))
@@ -286,7 +286,8 @@ void Upscaling::DrawSettings()
 
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("Selects the Ray Reconstruction model for all five quality modes. Takes effect on the next frame, so two models can be compared back to back.");
-				ImGui::TextUnformatted("The model weights live in nvngx_dlssd.dll, not in Streamline. Preset F is the DLSS 4.5 model and needs nvngx_dlssd.dll 310.7.12 or newer; older DLLs have no weights for it and fall back to their own default without saying so.");
+				ImGui::TextUnformatted("Only D and E are real models here. Streamline documents ePresetD as the default transformer model and ePresetE as the latest one, with F through O all reverting to default and A through C removed outright. E is therefore the upgrade worth comparing against D, and it needs no new files.");
+				ImGui::TextUnformatted("F is exposed because third-party reporting has it carrying the DLSS 4.5 model in nvngx_dlssd.dll 310.7.12 and newer. That DLL is in no NVIDIA developer channel: the newest official DLSS SDK is 310.7.0 and the newest Streamline is 2.12.0, both shipped here, and the 4.5 model currently reaches users through the NVIDIA App instead. Until such a DLL is in place, F behaves as Default.");
 				ImGui::TextUnformatted("To check which model was actually requested, read the '[DLSS RR] Requested model preset' line in CommunityShaders.log alongside the 'nvngx_dlssd.dll version' line logged at startup.");
 			}
 		}

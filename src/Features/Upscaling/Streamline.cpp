@@ -83,12 +83,12 @@ const char* GetDLSSDModelPresetName(DLSSDModelPreset a_preset)
 	case DLSSDModelPreset::kDefault:
 		return "Default (whatever the DLL picks)";
 	case DLSSDModelPreset::kE:
-		return "E (transformer, DoF-guide model)";
+		return "E (latest model in this SDK)";
 	case DLSSDModelPreset::kF:
-		return "F (DLSS 4.5 model)";
+		return "F (no model in this SDK; falls back to default)";
 	case DLSSDModelPreset::kD:
 	default:
-		return "D (transformer, previous default)";
+		return "D (previous default)";
 	}
 }
 

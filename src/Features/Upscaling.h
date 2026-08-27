@@ -75,9 +75,22 @@ public:
 	// DLSS title, so it has no driver profile and the NVIDIA App's DLSS Override cannot reach
 	// it -- selecting the model here is the only way to pick one.
 	//
-	// The model weights live in nvngx_dlssd.dll, not in Streamline. Requesting a preset the
-	// shipped DLL has no weights for falls back to that DLL's default silently, and nothing in
-	// the API reports it, which is why SetDLSSRROptions logs the requested value.
+	// Only two Ray Reconstruction models actually exist in the current SDK. Verified against
+	// Streamline main, not just our local 2.12 copy -- the enum and its comments are identical
+	// in both:
+	//   ePresetD = 4   "Default model (transformer)"
+	//   ePresetE = 5   "Latest transformer model (must use if DoF guide is needed)"
+	//   ePresetF = 6 through ePresetO = 15   all "Reverts to default"
+	// and the programming guide states ePresetA through ePresetC are no longer available.
+	//
+	// So E, not F, is the newest model reachable with the shipped DLL. F is exposed anyway
+	// because third-party reporting has it carrying the DLSS 4.5 model in nvngx_dlssd.dll
+	// 310.7.12 and newer -- but 310.7.12 is not in any NVIDIA developer channel: the newest
+	// official DLSS SDK is 310.7.0 and the newest Streamline is 2.12.0, both of which we
+	// already ship, and the 4.5 model currently reaches users through the NVIDIA App / driver
+	// instead. The weights live in that DLL, not in Streamline, and requesting a preset the DLL
+	// has no weights for falls back to its default silently with nothing in the API reporting
+	// it, which is why SetDLSSRROptions logs the requested value.
 	enum class DLSSDModelPreset : uint
 	{
 		kDefault = 0,
