@@ -83,14 +83,21 @@ public:
 	//   ePresetF = 6 through ePresetO = 15   all "Reverts to default"
 	// and the programming guide states ePresetA through ePresetC are no longer available.
 	//
-	// So E, not F, is the newest model reachable with the shipped DLL. F is exposed anyway
-	// because third-party reporting has it carrying the DLSS 4.5 model in nvngx_dlssd.dll
-	// 310.7.12 and newer -- but 310.7.12 is not in any NVIDIA developer channel: the newest
-	// official DLSS SDK is 310.7.0 and the newest Streamline is 2.12.0, both of which we
-	// already ship, and the 4.5 model currently reaches users through the NVIDIA App / driver
-	// instead. The weights live in that DLL, not in Streamline, and requesting a preset the DLL
-	// has no weights for falls back to its default silently with nothing in the API reporting
-	// it, which is why SetDLSSRROptions logs the requested value.
+	// Only kD and kF are offered in the UI. The NVIDIA App's Ray Reconstruction dropdown exposes
+	// nothing but Recommended and Preset F, which is the only signal available from outside
+	// NVIDIA about which models are worth running -- E in particular is exposed nowhere, and
+	// the header calling it "latest" says nothing about its cost. kDefault and kE keep their
+	// values so a saved profile is never silently remapped onto a different model; LoadSettings
+	// coerces them to kD.
+	//
+	// F is the DLSS 4.5 model, and it needs nvngx_dlssd.dll 310.7.12 or newer, which no NVIDIA
+	// developer channel carries: the newest DLSS SDK release is v310.7.0 and the newest
+	// Streamline release is v2.12.0, both dated 2026-06-23 and both already shipped here, and
+	// the Unreal plugin package is older still at NGX 310.6.0. Downloading the DLL from
+	// NVIDIA's own repo returns a file byte-identical to ours. The weights live in that DLL,
+	// not in Streamline, and requesting a preset the DLL has no weights for falls back to its
+	// default silently with nothing in the API reporting it, which is why SetDLSSRROptions logs
+	// the requested value.
 	enum class DLSSDModelPreset : uint
 	{
 		kDefault = 0,

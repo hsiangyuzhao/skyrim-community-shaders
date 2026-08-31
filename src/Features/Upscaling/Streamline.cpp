@@ -79,13 +79,10 @@ sl::DLSSPreset GetForcedDLSSPreset(DLSSModelPreset a_preset)
 
 const char* GetDLSSDModelPresetName(DLSSDModelPreset a_preset)
 {
+	// Only kD and kF survive LoadSettings, so everything else lands on the D arm.
 	switch (a_preset) {
-	case DLSSDModelPreset::kDefault:
-		return "Default (whatever the DLL picks)";
-	case DLSSDModelPreset::kE:
-		return "E (latest model in this SDK)";
 	case DLSSDModelPreset::kF:
-		return "F (no model in this SDK; falls back to default)";
+		return "F (DLSS 4.5; inert without a 310.7.12+ DLL)";
 	case DLSSDModelPreset::kD:
 	default:
 		return "D (previous default)";

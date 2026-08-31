@@ -274,20 +274,20 @@ void Upscaling::DrawSettings()
 		if (settings.enableDLSSRR) {
 			ImGui::TextDisabled("DLSS SR model presets do not apply while Ray Reconstruction is enabled.");
 
+			// Only D and F are offered. The NVIDIA App's Ray Reconstruction dropdown exposes
+			// nothing but Recommended and Preset F, which is the only signal available from
+			// outside NVIDIA about which models are worth running at all.
 			const char* dlssdPresets[] = {
-				"Default (whatever the DLL picks)",
 				"D (previous default)",
-				"E (latest model in this SDK)",
-				"F (no model in this SDK; falls back to default)"
+				"F (DLSS 4.5; needs a newer nvngx_dlssd.dll)"
 			};
-			int dlssdPresetIndex = static_cast<int>(settings.DLSSDPreset);
+			int dlssdPresetIndex = settings.DLSSDPreset == static_cast<uint>(DLSSDModelPreset::kF) ? 1 : 0;
 			if (ImGui::Combo("DLSS RR Model Preset", &dlssdPresetIndex, dlssdPresets, IM_ARRAYSIZE(dlssdPresets)))
-				settings.DLSSDPreset = static_cast<uint>(dlssdPresetIndex);
+				settings.DLSSDPreset = static_cast<uint>(dlssdPresetIndex == 1 ? DLSSDModelPreset::kF : DLSSDModelPreset::kD);
 
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Selects the Ray Reconstruction model for all five quality modes. Takes effect on the next frame, so two models can be compared back to back.");
-				ImGui::TextUnformatted("Only D and E are real models here. Streamline documents ePresetD as the default transformer model and ePresetE as the latest one, with F through O all reverting to default and A through C removed outright. E is therefore the upgrade worth comparing against D, and it needs no new files.");
-				ImGui::TextUnformatted("F is exposed because third-party reporting has it carrying the DLSS 4.5 model in nvngx_dlssd.dll 310.7.12 and newer. That DLL is in no NVIDIA developer channel: the newest official DLSS SDK is 310.7.0 and the newest Streamline is 2.12.0, both shipped here, and the 4.5 model currently reaches users through the NVIDIA App instead. Until such a DLL is in place, F behaves as Default.");
+				ImGui::TextUnformatted("Selects the Ray Reconstruction model for all five quality modes. Takes effect on the next frame, so the two can be compared back to back.");
+				ImGui::TextUnformatted("F is the DLSS 4.5 second-generation transformer model. The weights live in nvngx_dlssd.dll rather than in Streamline, and no NVIDIA developer channel carries a DLL that has them: the newest DLSS SDK is 310.7.0, the newest Streamline is 2.12.0, the Unreal plugin package is older still at NGX 310.6.0, and Streamline's own header documents ePresetF as reverting to default. Until a 310.7.12 or newer DLL is in place, picking F changes nothing.");
 				ImGui::TextUnformatted("To check which model was actually requested, read the '[DLSS RR] Requested model preset' line in CommunityShaders.log alongside the 'nvngx_dlssd.dll version' line logged at startup.");
 			}
 		}
@@ -462,10 +462,14 @@ void Upscaling::LoadSettings(json& o_json)
 		logger::warn("[Upscaling] Loaded DLSSPreset {} out of range, falling back to K ({})", settings.DLSSPreset, fallback);
 		settings.DLSSPreset = fallback;
 	}
-	constexpr auto dlssdPresetCount = static_cast<uint>(DLSSDModelPreset::kCount);
-	if (settings.DLSSDPreset >= dlssdPresetCount) {
+	// D and F are the only selectable Ray Reconstruction models. The enum keeps its original
+	// values so a saved profile is never silently remapped onto a different model; anything
+	// that is no longer offered is coerced to D, which is what the RR path ran hardcoded
+	// before the setting existed.
+	if (settings.DLSSDPreset != static_cast<uint>(DLSSDModelPreset::kD) &&
+		settings.DLSSDPreset != static_cast<uint>(DLSSDModelPreset::kF)) {
 		const auto fallback = static_cast<uint>(DLSSDModelPreset::kD);
-		logger::warn("[Upscaling] Loaded DLSSDPreset {} out of range, falling back to D ({})", settings.DLSSDPreset, fallback);
+		logger::warn("[Upscaling] Loaded DLSSDPreset {} is not a selectable model, falling back to D ({})", settings.DLSSDPreset, fallback);
 		settings.DLSSDPreset = fallback;
 	}
 	auto iniSettingCollection = globals::game::iniPrefSettingCollection;
