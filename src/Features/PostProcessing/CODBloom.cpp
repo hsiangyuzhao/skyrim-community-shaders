@@ -179,7 +179,7 @@ void CODBloom::ReleaseResources()
 void CODBloom::ClearShaderCache()
 {
 	auto const shaderPtrs = std::array{
-		&thresholdCS, &downsampleCS, &downsampleFirstMipCS, &upsampleCS, &compositeCS
+		&downsampleCS, &downsampleFirstMipCS, &upsampleCS, &compositeCS
 	};
 
 	for (auto shader : shaderPtrs)
@@ -203,7 +203,6 @@ void CODBloom::CompileComputeShaders()
 
 	std::vector<ShaderCompileInfo>
 		shaderInfos = {
-			{ &thresholdCS, "bloom.cs.hlsl", {}, "CS_Threshold" },
 			{ &downsampleCS, "bloom.cs.hlsl", {}, "CS_Downsample" },
 			{ &downsampleFirstMipCS, "bloom.cs.hlsl", { { "FIRST_MIP", "" } }, "CS_Downsample" },
 			{ &upsampleCS, "bloom.cs.hlsl", {}, "CS_Upsample" },
@@ -284,23 +283,22 @@ void CODBloom::Draw(TextureInfo& inout_tex)
 	context->CSSetConstantBuffers(1, 1, &cb);
 	context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
 
-	// Threshold
-	{
-		srvs.at(0) = inout_tex.srv;
-		uavs.at(0) = texBloomMipUAVs[0].get();
-
-		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
-		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-		context->CSSetShader(thresholdCS.get(), nullptr, 0);
-		context->Dispatch(((texBloom->desc.Width - 1) >> 5) + 1, ((texBloom->desc.Height - 1) >> 5) + 1, 1);
-	}
-
 	// Downsample
+	//
+	// (batch 23) The separate threshold pass is gone. It read the whole frame and wrote a whole
+	// full-resolution mip 0 that nothing but the first downsample ever read, so it cost a
+	// full-resolution read plus a full-resolution write plus a dispatch to hand this loop
+	// something it can now produce itself: the FIRST_MIP permutation reads inout_tex directly
+	// and thresholds each of its thirteen fetches. Mip 0 is written exactly once now, by the
+	// composite at the end.
 	context->CSSetShader(downsampleFirstMipCS.get(), nullptr, 0);
 	for (int i = 0; i < topMip; i++) {
 		resetViews();
 
-		srvs.at(1) = texBloomMipSRVs[i].get();
+		if (i == 0)
+			srvs.at(0) = inout_tex.srv;  // TexColor: the frame itself, thresholded per fetch
+		else
+			srvs.at(1) = texBloomMipSRVs[i].get();
 		uavs.at(0) = texBloomMipUAVs[i + 1].get();
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
@@ -311,7 +309,7 @@ void CODBloom::Draw(TextureInfo& inout_tex)
 
 		uint mipWidth = texBloom->desc.Width >> (i + 1);
 		uint mipHeight = texBloom->desc.Height >> (i + 1);
-		context->Dispatch(((mipWidth - 1) >> 5) + 1, ((mipHeight - 1) >> 5) + 1, 1);
+		context->Dispatch(((mipWidth - 1) >> 3) + 1, ((mipHeight - 1) >> 3) + 1, 1);
 	}
 
 	// upsample
@@ -333,7 +331,7 @@ void CODBloom::Draw(TextureInfo& inout_tex)
 
 		uint mipWidth = texBloom->desc.Width >> i;
 		uint mipHeight = texBloom->desc.Height >> i;
-		context->Dispatch(((mipWidth - 1) >> 5) + 1, ((mipHeight - 1) >> 5) + 1, 1);
+		context->Dispatch(((mipWidth - 1) >> 3) + 1, ((mipHeight - 1) >> 3) + 1, 1);
 	}
 
 	// composite
@@ -350,7 +348,7 @@ void CODBloom::Draw(TextureInfo& inout_tex)
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-		context->Dispatch(((texBloom->desc.Width - 1) >> 5) + 1, ((texBloom->desc.Height - 1) >> 5) + 1, 1);
+		context->Dispatch(((texBloom->desc.Width - 1) >> 3) + 1, ((texBloom->desc.Height - 1) >> 3) + 1, 1);
 	}
 
 	// cleanup

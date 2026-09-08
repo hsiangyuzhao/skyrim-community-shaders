@@ -37,7 +37,6 @@ struct CODBloom : public PostProcessFeature
 	std::array<winrt::com_ptr<ID3D11ShaderResourceView>, s_BloomMips> texBloomMipSRVs = { nullptr };
 	std::array<winrt::com_ptr<ID3D11UnorderedAccessView>, s_BloomMips> texBloomMipUAVs = { nullptr };
 
-	winrt::com_ptr<ID3D11ComputeShader> thresholdCS = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> downsampleCS = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> downsampleFirstMipCS = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> upsampleCS = nullptr;
