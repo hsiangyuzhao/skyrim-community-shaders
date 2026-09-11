@@ -90,14 +90,13 @@ public:
 	// values so a saved profile is never silently remapped onto a different model; LoadSettings
 	// coerces them to kD.
 	//
-	// F is the DLSS 4.5 model, and it needs nvngx_dlssd.dll 310.7.12 or newer, which no NVIDIA
-	// developer channel carries: the newest DLSS SDK release is v310.7.0 and the newest
-	// Streamline release is v2.12.0, both dated 2026-06-23 and both already shipped here, and
-	// the Unreal plugin package is older still at NGX 310.6.0. Downloading the DLL from
-	// NVIDIA's own repo returns a file byte-identical to ours. The weights live in that DLL,
-	// not in Streamline, and requesting a preset the DLL has no weights for falls back to its
-	// default silently with nothing in the API reporting it, which is why SetDLSSRROptions logs
-	// the requested value.
+	// F is the DLSS 4.5 model. It is official as of the DLSS 310.9.1 / Streamline 2.14.1 SDKs
+	// shipped here: their sl_dlss_d.h calls ePresetF "Latest and default transformer model",
+	// where 2.12's still called it "Reverts to default", and lists A through C as superseded by
+	// "D, E or F". The weights live in nvngx_dlssd.dll rather than in Streamline, and requesting
+	// a preset the shipped DLL has no weights for falls back to its default silently with
+	// nothing in the API reporting it -- which is why SetDLSSRROptions logs the requested value,
+	// and why that log line stays useful even now that the runtime is first-party.
 	enum class DLSSDModelPreset : uint
 	{
 		kDefault = 0,
