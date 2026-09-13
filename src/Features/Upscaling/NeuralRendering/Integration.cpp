@@ -8,6 +8,9 @@
 
 #include <d3d11.h>
 
+#include <format>
+#include <utility>
+
 namespace NeuralRendering
 {
 	namespace
@@ -17,7 +20,20 @@ namespace NeuralRendering
 		// the log at frame rate.
 		bool g_loggedFrameGenerationBlock = false;
 		bool g_loggedUpscalerBlock = false;
-		bool g_loggedRuntimeBlock = false;
+		bool g_loggedResourceBlock = false;
+
+		// Always returns false, so a blocked path reads as `return LogBlockOnce(...)` and cannot
+		// accidentally fall through to the pass. One line per session per reason: this runs at
+		// frame rate, and a reason that repeats is not more informative the thousandth time.
+		template <class... Args>
+		bool LogBlockOnce(std::format_string<Args...> format, Args&&... args)
+		{
+			if (!g_loggedResourceBlock) {
+				logger::warn("[DLSSNR] Blocked: {}", std::format(format, std::forward<Args>(args)...));
+				g_loggedResourceBlock = true;
+			}
+			return false;
+		}
 
 		Tuning MakeTuning(const Upscaling::NeuralRenderingSettings& settings)
 		{
@@ -76,27 +92,29 @@ namespace NeuralRendering
 			return false;
 		}
 
+		// Every path out of here used to be a bare return, which is how a blocked frame ends up
+		// indistinguishable from a working one that simply did nothing -- the exact failure this
+		// feature's diagnostics exist to avoid. Each now names itself once.
 		auto* renderer = globals::game::renderer;
 		auto* context = globals::d3d::context;
 		auto* device = globals::d3d::device;
 		if (!renderer || !context || !device || !upscaling.motionVectorCopyTexture)
-			return false;
+			return LogBlockOnce("prerequisites missing: renderer={} context={} device={} motionVectorCopy={}",
+				renderer != nullptr, context != nullptr, device != nullptr,
+				upscaling.motionVectorCopyTexture != nullptr);
 
 		// kFRAMEBUFFER is where the engine's post chain leaves the finished tonemapped scene.
 		auto& framebuffer = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kFRAMEBUFFER];
 		auto& depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 		auto* motionVectors = upscaling.motionVectorCopyTexture->resource.get();
 		if (!framebuffer.texture || !depth.texture || !depth.depthSRV || !motionVectors)
-			return false;
+			return LogBlockOnce("render targets missing: framebuffer={} depth={} depthSRV={} motionVectors={}",
+				framebuffer.texture != nullptr, depth.texture != nullptr,
+				depth.depthSRV != nullptr, motionVectors != nullptr);
 
 		D3D11_TEXTURE2D_DESC colorDesc{}, motionDesc{};
 		if (!GetTextureDesc(framebuffer.texture, colorDesc) || !GetTextureDesc(motionVectors, motionDesc))
-			return false;
-
-		if (Runtime::Instance().Status() == RuntimeStatus::NotFound && !g_loggedRuntimeBlock) {
-			logger::warn("[DLSSNR] Blocked: {}", Runtime::Instance().Detail());
-			g_loggedRuntimeBlock = true;
-		}
+			return LogBlockOnce("could not read a texture description for the framebuffer or the motion vectors");
 
 		// The guides run at the motion vector extent and the colour at the framebuffer extent --
 		// the two differ whenever DLSS is upscaling, which is the normal case. Motion vector
@@ -115,6 +133,6 @@ namespace NeuralRendering
 		Renderer::Instance().Reset();
 		g_loggedFrameGenerationBlock = false;
 		g_loggedUpscalerBlock = false;
-		g_loggedRuntimeBlock = false;
+		g_loggedResourceBlock = false;
 	}
 }

@@ -6,6 +6,7 @@
 #include "Upscaling/DX12SwapChain.h"
 #include "Upscaling/FidelityFX.h"
 #include "Upscaling/NeuralRendering/Integration.h"
+#include "Upscaling/NeuralRendering/Renderer.h"
 #include "Upscaling/NeuralRendering/Runtime.h"
 #include "Upscaling/Streamline.h"
 #include "VR.h"
@@ -327,8 +328,26 @@ void Upscaling::DrawSettings()
 					ImGui::TextUnformatted("Both backends route the frame through the D3D11-to-D3D12 proxy swapchain. This pass owns a separate D3D12 device whose work cannot be sequenced against a swapchain it does not control, so FSR 3.1 conflicts exactly as DLSS-G does.");
 			}
 
+			// Probe as soon as the feature is switched on, rather than waiting for the frame path
+			// to reach it. The runtime is otherwise only probed from inside Renderer::Apply, and
+			// that happens *after* the D3D12 interop is brought up -- so an interop failure used
+			// to leave this panel reading "not probed", which says nothing about the one thing
+			// the user can actually act on: whether the DLL is there. Probe() resets on entry, so
+			// this is only safe while nothing has been initialised, which NotProbed guarantees.
+			// A failed probe moves the status off NotProbed, so this does not retry every frame.
+			if (NeuralRendering::Runtime::Instance().Status() == NeuralRendering::RuntimeStatus::NotProbed)
+				NeuralRendering::Runtime::Instance().Probe();
+
 			const auto status = NeuralRendering::Runtime::Instance().Status();
 			const auto& detail = NeuralRendering::Runtime::Instance().Detail();
+
+			if (NeuralRendering::Renderer::Instance().IsFailureLatched()) {
+				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+				ImGui::Text("A pass failed and the feature latched off. See the [DLSSNR] lines in the log.");
+				ImGui::PopStyleColor();
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::TextUnformatted("The latch exists so a failing pass cannot retry every frame. The D3D12 interop is brought up before the runtime is probed, so an interop failure latches here while the runtime status above still reads as never probed -- the log line names which of the two failed. Reset Neural Rendering clears the latch.");
+			}
 			if (status == NeuralRendering::RuntimeStatus::Initialized) {
 				ImGui::Text("Runtime %s, %llu frames evaluated",
 					NeuralRendering::Runtime::Instance().Version().c_str(),
