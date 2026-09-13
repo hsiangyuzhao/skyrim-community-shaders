@@ -5,6 +5,8 @@
 #include "State.h"
 #include "Upscaling/DX12SwapChain.h"
 #include "Upscaling/FidelityFX.h"
+#include "Upscaling/NeuralRendering/Integration.h"
+#include "Upscaling/NeuralRendering/Runtime.h"
 #include "Upscaling/Streamline.h"
 #include "VR.h"
 #include <Windows.h>
@@ -16,6 +18,17 @@
 
 #include "Features/ScreenSpaceRayTracing.h"
 #include "Features/SubsurfaceScattering.h"
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+	Upscaling::NeuralRenderingSettings,
+	enabled,
+	intensity,
+	localToneStrength,
+	localStructureStrength,
+	skinStructureStrength,
+	style,
+	useAutoMask,
+	uiCorrection)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Upscaling::Settings,
@@ -31,7 +44,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sharpnessDLSS,
 	DLSSPreset,
 	enableDLSSRR,
-	DLSSDPreset);
+	DLSSDPreset,
+	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
 
@@ -290,6 +304,62 @@ void Upscaling::DrawSettings()
 				ImGui::TextUnformatted("F is the DLSS 4.5 second-generation transformer model, and as of the DLSS 310.9.1 / Streamline 2.14.1 SDKs shipped here it is both official and NVIDIA's own default -- their header calls ePresetF the latest and default transformer model, where the previous SDK still listed it as reverting to default. D is kept as the comparison baseline: it is what this feature ran hardcoded before the selector existed.");
 				ImGui::TextUnformatted("To check which model was actually requested, read the '[DLSS RR] Requested model preset' line in CommunityShaders.log alongside the 'nvngx_dlssd.dll version' line logged at startup.");
 			}
+		}
+	}
+
+	if (upscaleMethod == UpscaleMethod::kDLSS && !globals::game::isVR) {
+		ImGui::SeparatorText("Neural Rendering (experimental)");
+
+		auto& nr = settings.neuralRendering;
+		ImGui::Checkbox("Enable Neural Rendering", &nr.enabled);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("DLSS 5's neural renderer, run on the finished tonemapped frame just before the interface is drawn. It re-lights the image rather than reconstructing it, so unlike every other feature here it reads no G-buffer and feeds nothing back into lighting.");
+			ImGui::TextUnformatted("Expect a large cost: roughly 37% of frame time measured on an RTX 5090, and about 39% on an RTX 4090 with the community Ada build.");
+		}
+
+		if (nr.enabled) {
+			// Everything that can stop the pass, stated rather than left to a silent no-op.
+			if (d3d12SwapChainActive && IsFrameGenerationEnabled()) {
+				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+				ImGui::Text("Blocked: Frame Generation is active. Disable it and restart.");
+				ImGui::PopStyleColor();
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::TextUnformatted("Both backends route the frame through the D3D11-to-D3D12 proxy swapchain. This pass owns a separate D3D12 device whose work cannot be sequenced against a swapchain it does not control, so FSR 3.1 conflicts exactly as DLSS-G does.");
+			}
+
+			const auto status = NeuralRendering::Runtime::Instance().Status();
+			const auto& detail = NeuralRendering::Runtime::Instance().Detail();
+			if (status == NeuralRendering::RuntimeStatus::Initialized) {
+				ImGui::Text("Runtime %s, %llu frames evaluated",
+					NeuralRendering::Runtime::Instance().Version().c_str(),
+					NeuralRendering::Runtime::Instance().SuccessfulFrames());
+			} else {
+				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+				ImGui::Text("Runtime %s%s%s", NeuralRendering::ToString(status),
+					detail.empty() ? "" : ": ", detail.c_str());
+				ImGui::PopStyleColor();
+			}
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("nvngx_dlssnr.dll is not shipped with this mod and has to be placed in Data/Shaders/Upscaling/Streamline yourself. NVIDIA's own build runs on GeForce RTX 50 only; anything older needs a community-recompiled DLL, and neither is ours to redistribute.");
+				ImGui::TextUnformatted("A version of 310.8.x is required -- that check is what stops an unrelated DLL of the same name from being handed to NGX.");
+			}
+
+			ImGui::SliderFloat("Intensity", &nr.intensity, 0.f, 1.f, "%.2f");
+			ImGui::SliderFloat("Local Tone Strength", &nr.localToneStrength, 0.f, 1.f, "%.2f");
+			ImGui::SliderFloat("Local Structure Strength", &nr.localStructureStrength, 0.f, 1.f, "%.2f");
+			ImGui::SliderFloat("Skin Structure Strength", &nr.skinStructureStrength, 0.f, 1.f, "%.2f");
+
+			int style = static_cast<int>(nr.style);
+			if (ImGui::SliderInt("Style", &style, 0, 3, "%d", ImGuiSliderFlags_AlwaysClamp))
+				nr.style = static_cast<uint>(std::clamp(style, 0, 3));
+
+			ImGui::Checkbox("Auto Mask", &nr.useAutoMask);
+			ImGui::Checkbox("UI Correction", &nr.uiCorrection);
+
+			if (ImGui::Button("Reset Neural Rendering", { -1, 0 }))
+				NeuralRendering::Reset();
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Drops the runtime, its D3D12 device and every shared texture, then lets the next frame rebuild them. Use it after replacing the DLL.");
 		}
 	}
 
@@ -1811,6 +1881,14 @@ void Upscaling::Main_UpdateJitter::thunk(RE::BSGraphics::State* a_state)
 void Upscaling::MenuManagerDrawInterfaceStartHook::thunk(int64_t a1)
 {
 	globals::features::upscaling.PostDisplay();
+
+	// (batch 25) The one moment in the frame where kFRAMEBUFFER holds the finished tonemapped
+	// scene and nothing has drawn over it. ApplyLdr returns without touching a render target
+	// whenever the feature is off or a precondition is unmet, so this call costs a predicate
+	// on every frame that is not using it.
+	if (!globals::game::isVR)
+		NeuralRendering::ApplyLdr();
+
 	func(a1);
 }
 

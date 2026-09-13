@@ -106,6 +106,25 @@ public:
 		kCount
 	};
 
+	// DLSS Neural Rendering (NGX feature 18). A post-tonemap, pre-UI pass that re-lights the
+	// finished LDR frame; it reads no G-buffer and feeds nothing back, so it neither conflicts
+	// with nor cooperates with the lighting features -- it sits on top of the result.
+	//
+	// Off by default and inert without a runtime: the model lives in nvngx_dlssnr.dll, which is
+	// deliberately not shipped here. NVIDIA's own builds are Blackwell-only; running on anything
+	// older needs a community-recompiled DLL, and neither is ours to redistribute.
+	struct NeuralRenderingSettings
+	{
+		bool enabled = false;
+		float intensity = 0.8f;
+		float localToneStrength = 0.75f;
+		float localStructureStrength = 0.9f;
+		float skinStructureStrength = 0.9f;
+		uint style = 3;
+		bool useAutoMask = true;
+		bool uiCorrection = false;
+	};
+
 	struct Settings
 	{
 		uint upscaleMethod = (uint)UpscaleMethod::kDLSS;
@@ -123,6 +142,7 @@ public:
 		// kD reproduces what was hardcoded before this setting existed, so an existing profile
 		// keeps its exact behaviour.
 		uint DLSSDPreset = static_cast<uint>(DLSSDModelPreset::kD);
+		NeuralRenderingSettings neuralRendering;
 	};
 
 	Settings settings;

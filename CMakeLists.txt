@@ -120,6 +120,10 @@ target_include_directories(
         "${CMAKE_SOURCE_DIR}/package/Shaders"
         ${DETOURS_INCLUDE_DIRS}
         "${CMAKE_SOURCE_DIR}/extern/NRD/Include"
+        # NGX headers, for the Neural Rendering feature. They ride along inside the Streamline
+        # submodule rather than being a package of their own, and Streamline only exports its
+        # own include directory, so this one has to be named explicitly.
+        "${CMAKE_SOURCE_DIR}/extern/Streamline-DX12/external/ngx-sdk/include"
 )
 
 target_link_libraries(
