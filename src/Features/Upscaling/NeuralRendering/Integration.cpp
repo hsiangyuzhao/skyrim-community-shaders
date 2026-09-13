@@ -21,6 +21,7 @@ namespace NeuralRendering
 		bool g_loggedFrameGenerationBlock = false;
 		bool g_loggedUpscalerBlock = false;
 		bool g_loggedResourceBlock = false;
+		Counters g_counters;
 
 		// Always returns false, so a blocked path reads as `return LogBlockOnce(...)` and cannot
 		// accidentally fall through to the pass. One line per session per reason: this runs at
@@ -61,11 +62,17 @@ namespace NeuralRendering
 		}
 	}
 
+	Counters GetCounters() { return g_counters; }
+
 	bool ApplyLdr()
 	{
 		auto& upscaling = globals::features::upscaling;
 		if (!upscaling.loaded || !upscaling.settings.neuralRendering.enabled)
 			return false;
+
+		// Counted after the enabled check and before every gate, so it answers exactly one
+		// question: is this function being reached at all while the feature is on.
+		++g_counters.attempts;
 
 		// The upscaler must be DLSS. Neural Rendering is an NGX feature and shares that
 		// machinery; the reference integration gates on the same thing. It is also the only
@@ -120,12 +127,14 @@ namespace NeuralRendering
 		// the two differ whenever DLSS is upscaling, which is the normal case. Motion vector
 		// scale is the guide extent because the engine stores its vectors in normalised screen
 		// units and the model wants pixels.
-		return Renderer::Instance().Apply(device, context, 0,
+		const bool applied = Renderer::Instance().Apply(device, context, 0,
 			framebuffer.texture, depth.texture, depth.depthSRV, motionVectors,
 			motionDesc.Width, motionDesc.Height,
 			colorDesc.Width, colorDesc.Height,
 			static_cast<float>(motionDesc.Width), static_cast<float>(motionDesc.Height),
 			MakeTuning(upscaling.settings.neuralRendering));
+		g_counters.applications += applied ? 1 : 0;
+		return applied;
 	}
 
 	void Reset()
@@ -134,5 +143,6 @@ namespace NeuralRendering
 		g_loggedFrameGenerationBlock = false;
 		g_loggedUpscalerBlock = false;
 		g_loggedResourceBlock = false;
+		g_counters = {};
 	}
 }

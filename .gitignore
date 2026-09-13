@@ -10,3 +10,8 @@ shadertoolsconfig.json
 # Folder view configuration files
 **/.DS_Store
 .claude/settings.local.json
+
+# The DLSS Neural Rendering runtime. Copied into local test packages so it does not have to be
+# added by hand every time, but never committed: it is a community recompile of a binary NVIDIA
+# has not published, it carries no valid NVIDIA signature, and it is not ours to redistribute.
+features/Upscaling/Shaders/Upscaling/Streamline/nvngx_dlssnr.dll

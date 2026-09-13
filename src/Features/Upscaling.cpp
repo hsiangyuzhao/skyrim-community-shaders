@@ -341,6 +341,19 @@ void Upscaling::DrawSettings()
 			const auto status = NeuralRendering::Runtime::Instance().Status();
 			const auto& detail = NeuralRendering::Runtime::Instance().Detail();
 
+			const auto counters = NeuralRendering::GetCounters();
+			if (counters.attempts == 0) {
+				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+				ImGui::Text("The pass has never been reached. Load a save and look again.");
+				ImGui::PopStyleColor();
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::TextUnformatted("This counts entries into the pass, before any of its own checks. Zero means the call site in the post-processing chain is not running -- which is a different problem from the pass running and rejecting the frame. It stays zero in the main menu, where that chain does not run.");
+			} else {
+				ImGui::Text("Reached %llu frames, applied %llu", counters.attempts, counters.applications);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::TextUnformatted("Both climbing: the pass is running. Only the first climbing: a check inside is rejecting every frame, and the log line below names it.");
+			}
+
 			if (NeuralRendering::Renderer::Instance().IsFailureLatched()) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 				ImGui::Text("A pass failed and the feature latched off. See the [DLSSNR] lines in the log.");
@@ -1900,14 +1913,6 @@ void Upscaling::Main_UpdateJitter::thunk(RE::BSGraphics::State* a_state)
 void Upscaling::MenuManagerDrawInterfaceStartHook::thunk(int64_t a1)
 {
 	globals::features::upscaling.PostDisplay();
-
-	// (batch 25) The one moment in the frame where kFRAMEBUFFER holds the finished tonemapped
-	// scene and nothing has drawn over it. ApplyLdr returns without touching a render target
-	// whenever the feature is off or a precondition is unmet, so this call costs a predicate
-	// on every frame that is not using it.
-	if (!globals::game::isVR)
-		NeuralRendering::ApplyLdr();
-
 	func(a1);
 }
 
@@ -1957,6 +1962,16 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 		DX::ThrowIfFailed(dx12SwapChain.commandQueue->Signal(dx12SwapChain.upscalingFence.get(), dx12SwapChain.upscalingFenceValue));
 		DX::ThrowIfFailed(dx12SwapChain.commandQueue->Wait(dx12SwapChain.upscalingFence.get(), dx12SwapChain.upscalingFenceValue));
 	}
+
+	// (batch 25b) Neural Rendering goes here, not in the interface hook where it was first put.
+	// This is where the engine's post chain has returned and kFRAMEBUFFER holds the finished
+	// tonemapped scene, with the sharpening pass above it already applied; by the time the
+	// interface hook runs the engine may have rebound its targets, so a write into kFRAMEBUFFER
+	// there is not guaranteed to reach the screen -- which is consistent with the feature
+	// showing no effect and no cost at all from that placement. This is also where the
+	// reference integration puts it.
+	if (!globals::game::isVR)
+		NeuralRendering::ApplyLdr();
 
 	// Disable TAA in some menus
 	BSImagespaceShaderISTemporalAA->taaEnabled = false;
