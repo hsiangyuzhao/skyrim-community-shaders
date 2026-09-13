@@ -1953,6 +1953,14 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 		DX::ThrowIfFailed(dx12SwapChain.commandQueue->Wait(dx12SwapChain.upscalingFence.get(), dx12SwapChain.upscalingFenceValue));
 	}
 
+	// (batch 26b) Neural Rendering runs before the sharpener, not after. Both take the scene
+	// from the currently bound render target, and ApplyNISSharpening leaves targets unbound --
+	// so after it there is nothing to read. It also early-returns when sharpening is off, which
+	// would have made the binding's presence depend on an unrelated setting. Running the network
+	// on the unsharpened image and sharpening its output is the right order anyway.
+	if (!globals::game::isVR)
+		NeuralRendering::ApplyLdr();
+
 	if (upscaleMethod == UpscaleMethod::kDLSS)
 		upscaling.ApplyNISSharpening();
 
@@ -1962,16 +1970,6 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 		DX::ThrowIfFailed(dx12SwapChain.commandQueue->Signal(dx12SwapChain.upscalingFence.get(), dx12SwapChain.upscalingFenceValue));
 		DX::ThrowIfFailed(dx12SwapChain.commandQueue->Wait(dx12SwapChain.upscalingFence.get(), dx12SwapChain.upscalingFenceValue));
 	}
-
-	// (batch 25b) Neural Rendering goes here, not in the interface hook where it was first put.
-	// This is where the engine's post chain has returned and kFRAMEBUFFER holds the finished
-	// tonemapped scene, with the sharpening pass above it already applied; by the time the
-	// interface hook runs the engine may have rebound its targets, so a write into kFRAMEBUFFER
-	// there is not guaranteed to reach the screen -- which is consistent with the feature
-	// showing no effect and no cost at all from that placement. This is also where the
-	// reference integration puts it.
-	if (!globals::game::isVR)
-		NeuralRendering::ApplyLdr();
 
 	// Disable TAA in some menus
 	BSImagespaceShaderISTemporalAA->taaEnabled = false;

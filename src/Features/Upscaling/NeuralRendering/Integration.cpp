@@ -110,29 +110,58 @@ namespace NeuralRendering
 				renderer != nullptr, context != nullptr, device != nullptr,
 				upscaling.motionVectorCopyTexture != nullptr);
 
-		// kFRAMEBUFFER is where the engine's post chain leaves the finished tonemapped scene.
-		auto& framebuffer = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kFRAMEBUFFER];
 		auto& depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 		auto* motionVectors = upscaling.motionVectorCopyTexture->resource.get();
-		if (!framebuffer.texture || !depth.texture || !depth.depthSRV || !motionVectors)
-			return LogBlockOnce("render targets missing: framebuffer={} depth={} depthSRV={} motionVectors={}",
-				framebuffer.texture != nullptr, depth.texture != nullptr,
-				depth.depthSRV != nullptr, motionVectors != nullptr);
+		if (!depth.texture || !depth.depthSRV || !motionVectors)
+			return LogBlockOnce("guides missing: depth={} depthSRV={} motionVectors={}",
+				depth.texture != nullptr, depth.depthSRV != nullptr, motionVectors != nullptr);
+
+		// The scene is taken from whatever render target is bound right now, not from a named
+		// slot. The first attempt read RENDER_TARGETS::kFRAMEBUFFER on the strength of the
+		// reference integration's comment, and it is empty here -- nothing else in this tree
+		// touches that slot. ApplyNISSharpening, a few lines below the call site, has always
+		// done it this way, and it is the only method that does not depend on guessing which
+		// slot the engine happens to be using at this point in its own chain.
+		ID3D11RenderTargetView* renderTargetView = nullptr;
+		context->OMGetRenderTargets(1, &renderTargetView, nullptr);
+		if (!renderTargetView)
+			return LogBlockOnce("no render target is bound at the call site");
+
+		ID3D11Resource* color = nullptr;
+		renderTargetView->GetResource(&color);
 
 		D3D11_TEXTURE2D_DESC colorDesc{}, motionDesc{};
-		if (!GetTextureDesc(framebuffer.texture, colorDesc) || !GetTextureDesc(motionVectors, motionDesc))
-			return LogBlockOnce("could not read a texture description for the framebuffer or the motion vectors");
+		const bool descsRead = GetTextureDesc(color, colorDesc) && GetTextureDesc(motionVectors, motionDesc);
 
-		// The guides run at the motion vector extent and the colour at the framebuffer extent --
-		// the two differ whenever DLSS is upscaling, which is the normal case. Motion vector
-		// scale is the guide extent because the engine stores its vectors in normalised screen
-		// units and the model wants pixels.
-		const bool applied = Renderer::Instance().Apply(device, context, 0,
-			framebuffer.texture, depth.texture, depth.depthSRV, motionVectors,
-			motionDesc.Width, motionDesc.Height,
-			colorDesc.Width, colorDesc.Height,
-			static_cast<float>(motionDesc.Width), static_cast<float>(motionDesc.Height),
-			MakeTuning(upscaling.settings.neuralRendering));
+		bool applied = false;
+		if (descsRead) {
+			// Unbind first: Renderer copies into and back out of this resource, which D3D11 will
+			// not do while it is bound as a render target. Same reason ApplyNISSharpening unbinds.
+			context->OMSetRenderTargets(0, nullptr, nullptr);
+
+			// The guides run at the motion vector extent and the colour at the scene extent --
+			// the two differ whenever DLSS is upscaling, which is the normal case. Motion vector
+			// scale is the guide extent because the engine stores its vectors in normalised
+			// screen units and the model wants pixels.
+			applied = Renderer::Instance().Apply(device, context, 0,
+				color, depth.texture, depth.depthSRV, motionVectors,
+				motionDesc.Width, motionDesc.Height,
+				colorDesc.Width, colorDesc.Height,
+				static_cast<float>(motionDesc.Width), static_cast<float>(motionDesc.Height),
+				MakeTuning(upscaling.settings.neuralRendering));
+
+			// Tell the engine its binding is stale so it rebinds before its next draw, exactly
+			// as the sharpening pass does after unbinding.
+			globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
+		}
+
+		if (color)
+			color->Release();
+		renderTargetView->Release();
+
+		if (!descsRead)
+			return LogBlockOnce("could not read a texture description for the scene or the motion vectors");
+
 		g_counters.applications += applied ? 1 : 0;
 		return applied;
 	}
