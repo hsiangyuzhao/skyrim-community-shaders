@@ -122,16 +122,40 @@ namespace NeuralRendering
 		// touches that slot. ApplyNISSharpening, a few lines below the call site, has always
 		// done it this way, and it is the only method that does not depend on guessing which
 		// slot the engine happens to be using at this point in its own chain.
+		//
+		// The depth-stencil view comes along only so the binding can be put back exactly as it
+		// was found. ApplyNISSharpening runs immediately after this and reads the bound target
+		// without checking it for null, so leaving the pipeline unbound here is an access
+		// violation in that function -- which is exactly what the first attempt did.
 		ID3D11RenderTargetView* renderTargetView = nullptr;
-		context->OMGetRenderTargets(1, &renderTargetView, nullptr);
-		if (!renderTargetView)
+		ID3D11DepthStencilView* depthStencilView = nullptr;
+		context->OMGetRenderTargets(1, &renderTargetView, &depthStencilView);
+		if (!renderTargetView) {
+			if (depthStencilView)
+				depthStencilView->Release();
 			return LogBlockOnce("no render target is bound at the call site");
+		}
 
 		ID3D11Resource* color = nullptr;
 		renderTargetView->GetResource(&color);
 
 		D3D11_TEXTURE2D_DESC colorDesc{}, motionDesc{};
 		const bool descsRead = GetTextureDesc(color, colorDesc) && GetTextureDesc(motionVectors, motionDesc);
+
+		// The two extents are worth stating once, because they are not what the model's contract
+		// expects and that is the first thing to suspect if the image looks wrong: it wants the
+		// guides at the lower render extent and the scene at the higher output extent, i.e. a
+		// scale at or above one. Here the scene is whatever D3D11 still holds at this point in
+		// the frame, which is render-resolution, while the motion vector copy is output-sized --
+		// so the ratio comes out inverted. It is left alone for now rather than guessed at,
+		// because the crash that hid this was in this file, not in the model.
+		static bool loggedExtents = false;
+		if (descsRead && !loggedExtents) {
+			logger::info("[DLSSNR] extents: scene={}x{} guides={}x{} scale={:.3f}",
+				colorDesc.Width, colorDesc.Height, motionDesc.Width, motionDesc.Height,
+				motionDesc.Width ? static_cast<float>(colorDesc.Width) / motionDesc.Width : 0.f);
+			loggedExtents = true;
+		}
 
 		bool applied = false;
 		if (descsRead) {
@@ -150,13 +174,17 @@ namespace NeuralRendering
 				static_cast<float>(motionDesc.Width), static_cast<float>(motionDesc.Height),
 				MakeTuning(upscaling.settings.neuralRendering));
 
-			// Tell the engine its binding is stale so it rebinds before its next draw, exactly
-			// as the sharpening pass does after unbinding.
-			globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
+			// Put the binding back rather than leaving it to the engine's dirty flag. The
+			// sharpening pass gets away with not restoring because nothing else reads the
+			// binding before the engine's next draw; this pass is not last, so it has to leave
+			// the pipeline as it found it.
+			context->OMSetRenderTargets(1, &renderTargetView, depthStencilView);
 		}
 
 		if (color)
 			color->Release();
+		if (depthStencilView)
+			depthStencilView->Release();
 		renderTargetView->Release();
 
 		if (!descsRead)
