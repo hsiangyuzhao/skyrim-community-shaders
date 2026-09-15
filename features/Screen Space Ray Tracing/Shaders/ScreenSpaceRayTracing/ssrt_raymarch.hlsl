@@ -200,6 +200,10 @@ cbuffer SSRTCB : register(b1)
     // Set only when DrawSSRT{Diffuse,Specular} has already resolved this frame's effective
     // denoiser to REBLUR, which is the same condition that calls RunReblur.
     uint NRDFrontEndPack;
+    // (batch 28) Roughness above which the specular march is skipped entirely. Takes one of the
+    // three spare floats row 4 already had, so SSRTCB does not grow. Read only under
+    // SSRT_SPECULAR; the diffuse permutation declares it to keep one shared layout.
+    float SpecularMaxRoughness;
 };
 
 // (audit #21) Never defined by ScreenSpaceRayTracing::CompileComputeShaders, so this is
@@ -1108,6 +1112,20 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 #   define SSRT_RAYMARCH_EXTENT screen_size
 #endif
     bool valid_ray = all(coords < SSRT_RAYMARCH_EXTENT) && !is_far_plane;  // (audit P1)
+#if defined(SSRT_SPECULAR)
+    // (batch 28) Skip the march where the GGX lobe is wide enough that the prefiltered cubemap
+    // is already the same answer. Joining valid_ray rather than returning early is deliberate:
+    // this is the one gate every non-hit path already funnels through, so a skipped pixel ends
+    // on confidence 0 and the composite falls back exactly as it does for a ray that left the
+    // screen -- no new path, no new state.
+    //
+    // Correct by construction in a way the diffuse side never was: vanilla specular already
+    // comes from the cubemap, along the same reflection vector and in the same units, so this
+    // picks the cheaper estimator of one quantity rather than deleting one estimator and hoping
+    // another covers it. The cubemap has no parallax, though, which is why the gate belongs at
+    // high roughness only -- a polished floor at roughness 0.05 would show the difference at once.
+    valid_ray = valid_ray && roughness <= SpecularMaxRoughness;
+#endif
 #if SHARC_UPDATE
     valid_ray = valid_ray && ShouldProcessPixel(coords.xy, SharedData::FrameCount);
 #endif

@@ -60,6 +60,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     FireflyClamp,
     FireflyClampSigma,
     SpecularDenoiseRoughnessCutoff,
+    SpecularMaxRoughness,
     HistoryClampSigma,
     UseBlueNoise,
     FreezeNoisePhase,
@@ -116,6 +117,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     FireflyClamp,
     FireflyClampSigma,
     SpecularDenoiseRoughnessCutoff,
+    SpecularMaxRoughness,
     HistoryClampSigma,
     UseBlueNoise,
     FreezeNoisePhase,
@@ -627,6 +629,22 @@ void ScreenSpaceRayTracing::DrawSettings()
         }
 
         if (settings.EnableSpecular) {
+            ImGui::SliderFloat("Specular Max Roughness", &settings.SpecularMaxRoughness, 0.05f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text(
+                    "Above this roughness the specular ray march does not run and the pixel keeps "
+                    "the cubemap reflection it would otherwise have had.\n\n"
+                    "1.00 traces everything, which is what this feature did before the setting "
+                    "existed. Lowering it is close to free in image terms over most of a Skyrim "
+                    "frame: a wide GGX lobe averages so much of the environment that the "
+                    "prefiltered cubemap is already the same answer, and vanilla specular comes "
+                    "from that cubemap anyway -- so this picks the cheaper estimator of one "
+                    "quantity rather than removing anything.\n\n"
+                    "What it cannot do is stand in for a sharp reflection. The cubemap has no "
+                    "parallax, so on water, polished floors and metal the traced result is "
+                    "visibly different. Watch those surfaces as you lower it, and read the SSRT "
+                    "Trace Specular row for what it buys.");
+
             ImGui::SliderFloat("Specular Mirror Cutoff", &settings.SpecularDenoiseRoughnessCutoff, 0.0f, 0.25f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
                 ImGui::Text(
@@ -1077,6 +1095,7 @@ void ScreenSpaceRayTracing::SanitizeSettings()
     settings.HistoryClampSigma = std::clamp(settings.HistoryClampSigma, 0.0f, 4.0f);
     settings.AdaptiveVarianceEps = std::clamp(settings.AdaptiveVarianceEps, 1e-4f, 1.0f);
     settings.SpecularDenoiseRoughnessCutoff = std::clamp(settings.SpecularDenoiseRoughnessCutoff, 0.0f, 0.25f);
+    settings.SpecularMaxRoughness = std::clamp(settings.SpecularMaxRoughness, 0.05f, 1.0f);
 
     settings.ReblurHitDistA = std::clamp(settings.ReblurHitDistA, 1.0f, 1000.0f);
     settings.ReblurHitDistB = std::clamp(settings.ReblurHitDistB, 0.0f, 1.0f);
@@ -2640,6 +2659,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         ssrCBData.NRDHitDistB = settings.ReblurHitDistB;
         ssrCBData.NRDHitDistC = settings.ReblurHitDistC;
         ssrCBData.NRDFrontEndPack = nrdFrontEndPack ? 1u : 0u;
+        ssrCBData.SpecularMaxRoughness = settings.SpecularMaxRoughness;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -3307,6 +3327,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ssrCBData.NRDHitDistB = settings.ReblurHitDistB;
         ssrCBData.NRDHitDistC = settings.ReblurHitDistC;
         ssrCBData.NRDFrontEndPack = nrdFrontEndPack ? 1u : 0u;
+        ssrCBData.SpecularMaxRoughness = settings.SpecularMaxRoughness;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();

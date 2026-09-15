@@ -644,6 +644,10 @@ struct ScreenSpaceRayTracing : Feature
         /// raising it starts skipping genuinely glossy surfaces that the filter would
         /// still have something to say about.
         float SpecularDenoiseRoughnessCutoff = 0.05f;
+        /// @brief (batch 28) Roughness above which the specular march is skipped and the pixel
+        /// keeps the cubemap fallback. Defaults to 1.0, which traces everything -- exactly what
+        /// the feature did before this setting existed.
+        float SpecularMaxRoughness = 1.0f;
         /// @brief (defect D1) Width, in standard deviations, of the neighbourhood box the
         /// reprojected temporal history is clamped into. 0 disables the mechanism.
         ///
@@ -989,7 +993,11 @@ struct ScreenSpaceRayTracing : Feature
         /// since HLSL gives every array element a 16-byte row of its own.
         /// Zero-initialised in place so neither of the two writers has to remember it and so the
         /// bytes that reach the GPU are deterministic rather than whatever was on the stack.
-        float ssrtPad4[3] = {};
+        /// @brief (batch 28) Above this roughness the specular ray march does not run at all and
+        /// the pixel keeps whatever the cubemap fallback gives it. Claims one of row 4's three
+        /// spare floats, so the struct does not grow and the size assertion below still holds.
+        float SpecularMaxRoughness = 1.0f;
+        float ssrtPad4[2] = {};
     };
     static_assert(sizeof(SSRTCB) == 80,
         "ScreenSpaceRayTracing::SSRTCB must stay whole 16-byte constant buffer rows; "
