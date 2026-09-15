@@ -144,6 +144,28 @@ void ScreenSpaceRayTracing::DrawSettings()
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Samples per pixel for diffuse component. Higher values reduce noise but impact performance.");
 
+    // (batch 28b) Belongs with the ray march, not with a denoiser. It first went in beside
+    // Specular Mirror Cutoff on the strength of the name, and that one lives under
+    // SVGFSelected() -- so on REBLUR the slider was simply not drawn. This gate stops the march
+    // itself and applies whatever the denoiser is, including none.
+    if (settings.EnableSpecular) {
+        ImGui::SliderFloat("Specular Max Roughness", &settings.SpecularMaxRoughness, 0.05f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Above this roughness the specular ray march does not run and the pixel keeps "
+                "the cubemap reflection it would otherwise have had.\n\n"
+                "1.00 traces everything, which is what this feature did before the setting "
+                "existed. Lowering it is close to free in image terms over most of a Skyrim "
+                "frame: a wide GGX lobe averages so much of the environment that the "
+                "prefiltered cubemap is already the same answer, and vanilla specular comes "
+                "from that cubemap anyway -- so this picks the cheaper estimator of one "
+                "quantity rather than removing anything.\n\n"
+                "What it cannot do is stand in for a sharp reflection. The cubemap has no "
+                "parallax, so on water, polished floors and metal the traced result is "
+                "visibly different. Watch those surfaces as you lower it, and read the SSRT "
+                "Trace Specular row for what it buys.");
+    }
+
     // (batch 12) Sparse sampling. Placed directly under Diffuse SPP because the two are the same
     // axis read from opposite ends: SPP is rays per pixel, this is pixels per ray. Not gated on the
     // denoiser -- it covers the ray march, so it applies with the denoiser off as well -- and not a
@@ -629,22 +651,6 @@ void ScreenSpaceRayTracing::DrawSettings()
         }
 
         if (settings.EnableSpecular) {
-            ImGui::SliderFloat("Specular Max Roughness", &settings.SpecularMaxRoughness, 0.05f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-            if (auto _tt = Util::HoverTooltipWrapper())
-                ImGui::Text(
-                    "Above this roughness the specular ray march does not run and the pixel keeps "
-                    "the cubemap reflection it would otherwise have had.\n\n"
-                    "1.00 traces everything, which is what this feature did before the setting "
-                    "existed. Lowering it is close to free in image terms over most of a Skyrim "
-                    "frame: a wide GGX lobe averages so much of the environment that the "
-                    "prefiltered cubemap is already the same answer, and vanilla specular comes "
-                    "from that cubemap anyway -- so this picks the cheaper estimator of one "
-                    "quantity rather than removing anything.\n\n"
-                    "What it cannot do is stand in for a sharp reflection. The cubemap has no "
-                    "parallax, so on water, polished floors and metal the traced result is "
-                    "visibly different. Watch those surfaces as you lower it, and read the SSRT "
-                    "Trace Specular row for what it buys.");
-
             ImGui::SliderFloat("Specular Mirror Cutoff", &settings.SpecularDenoiseRoughnessCutoff, 0.0f, 0.25f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
                 ImGui::Text(
