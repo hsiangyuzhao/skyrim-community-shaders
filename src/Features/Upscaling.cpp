@@ -320,12 +320,12 @@ void Upscaling::DrawSettings()
 
 		if (nr.enabled) {
 			// Everything that can stop the pass, stated rather than left to a silent no-op.
-			if (d3d12SwapChainActive && IsFrameGenerationEnabled()) {
+			if (d3d12SwapChainActive && IsFrameGenerationRequestedNow()) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Blocked: Frame Generation is active. Disable it and restart.");
+				ImGui::Text("Blocked: Frame Generation is running. Switch it off -- no restart needed.");
 				ImGui::PopStyleColor();
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("Both backends route the frame through the D3D11-to-D3D12 proxy swapchain. This pass owns a separate D3D12 device whose work cannot be sequenced against a swapchain it does not control, so FSR 3.1 conflicts exactly as DLSS-G does.");
+					ImGui::TextUnformatted("DLSS-G intercepts Present asynchronously, and this pass writes into the scene through a D3D12 device of its own, so the two cannot both be working on the same image. Switching Frame Generation off releases it immediately: the proxy swapchain stays, idle, which is exactly what lets the two share a session. Switching it back on is the direction that still needs a restart, and only if the session booted with it off.");
 			}
 
 			// Probe as soon as the feature is switched on, rather than waiting for the frame path
@@ -420,8 +420,14 @@ void Upscaling::DrawSettings()
 			}
 
 			ImGui::Text("Requires a D3D11 to D3D12 proxy which can create compatibility issues");
-			ImGui::Text("Backend and enable state are selected at game startup");
-			ImGui::Text("Changing either setting requires restarting the game");
+			ImGui::Text("Backend is selected at game startup; changing it requires a restart");
+			if (frameGenerationEnabledAtStartup) {
+				ImGui::Text("This session booted with it on, so it can be switched off and back on freely");
+			} else {
+				ImGui::Text("This session booted with it off, so switching it on requires a restart");
+			}
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Turning generation off needs nothing new -- it already happens every time a menu opens, with resources retained so it can resume cheaply. Turning it on needs the D3D11-to-D3D12 proxy swapchain, and that is created once, at device creation, from the state this session started in: with no proxy there is nothing to present generated frames through.");
 
 			if (!isWindowed) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
@@ -1255,7 +1261,7 @@ void Upscaling::FrameLimiter()
 		if (settings.frameLimitMode) {
 			// Fall back to the original timing method
 			// Use integer arithmetic for more precise timing
-			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate * (IsFrameGenerationEnabled() && !globals::game::ui->GameIsPaused() ? 0.5 : 1.0)));
+			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate * (IsFrameGenerationRequestedNow() && !globals::game::ui->GameIsPaused() ? 0.5 : 1.0)));
 			int64_t targetFrameTicks = (targetFrameTimeNS * qpf.QuadPart) / 1000000000LL;
 
 			static LARGE_INTEGER lastFrame = {};
@@ -1333,7 +1339,7 @@ double Upscaling::GetRefreshRate(HWND a_window)
 bool Upscaling::IsFrameGenerationActive() const
 {
 	const bool backendActive = IsDLSSGBackend() ? streamline.IsDLSSGActive() : fidelityFX.isFrameGenActive;
-	return d3d12SwapChainActive && IsFrameGenerationEnabled() && backendActive && !globals::game::isVR;
+	return d3d12SwapChainActive && IsFrameGenerationRequestedNow() && backendActive && !globals::game::isVR;
 }
 
 bool Upscaling::IsUpscalingActive()
@@ -1431,6 +1437,25 @@ Upscaling::FrameGenerationBackend Upscaling::GetFrameGenerationBackend() const
 bool Upscaling::IsFrameGenerationEnabled() const
 {
 	return frameGenerationBackendLatched ? frameGenerationEnabledAtStartup : settings.frameGenerationMode != 0;
+}
+
+// (batch 29) What the frame actually wants, as opposed to what the session was configured for.
+//
+// The two have to stay separate. IsFrameGenerationEnabled decides whether frame-generation
+// resources exist at all, and CreateUpscalingTextureResources rebuilds its whole working set
+// whenever that answer changes -- so letting the live setting reach it would tear down and
+// recreate textures in the middle of a frame every time the checkbox moved. This one carries the
+// live setting and is read only by paths that decide something for the current frame.
+//
+// Asymmetric on purpose, and the asymmetry is physical rather than cautious. Turning frame
+// generation off needs nothing new: DLSS-G already goes to eOff every time a menu opens, with
+// eRetainResourcesWhenOff so it can come back cheaply. Turning it on needs the D3D11-to-D3D12
+// proxy swapchain, and that is created once, at device creation, from the latched state -- with
+// no proxy there is nothing to present generated frames through. So the boot state still gates
+// the on direction, and the live setting only ever subtracts.
+bool Upscaling::IsFrameGenerationRequestedNow() const
+{
+	return IsFrameGenerationEnabled() && settings.frameGenerationMode != 0;
 }
 
 bool Upscaling::IsDLSSGBackend() const

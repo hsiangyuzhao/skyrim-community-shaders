@@ -193,7 +193,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	const bool mapRenderingContext = upscaling.IsDLSSGMapRenderingContext();
 	// MapMenu normally pauses the game. Staged map recovery makes it safe to
 	// request DLSS-G after native and DLSS-SR-only warm-up frames.
-	const bool frameGenerationRequested = upscaling.IsFrameGenerationEnabled() &&
+	const bool frameGenerationRequested = upscaling.IsFrameGenerationRequestedNow() &&
 		(!ui->GameIsPaused() || mapRenderingContext);
 	bool useFrameGeneration = frameGenerationRequested;
 
@@ -566,7 +566,7 @@ void DX12SwapChain::SetUIBuffer()
 		const bool sceneSupportsFrameGeneration = mapRenderingContext ||
 			(!ui->GameIsPaused() && !mapMenuOpen);
 		if (sceneSupportsFrameGeneration &&
-			upscaling.IsFrameGenerationEnabled() &&
+			upscaling.IsFrameGenerationRequestedNow() &&
 			upscaling.IsDLSSGAvailable()) {
 			// Capture the scene immediately before UI rendering. Keep the game
 			// framebuffer bound so FinalColor remains scene plus UI.

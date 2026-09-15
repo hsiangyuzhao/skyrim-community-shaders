@@ -86,14 +86,15 @@ namespace NeuralRendering
 			return false;
 		}
 
-		// Frame generation, either backend. Both route the frame through the D3D11-to-D3D12
-		// proxy swapchain, and this pass owns a separate D3D12 device whose shared resources
-		// cannot be sequenced against a swapchain it does not control. The gate is on the proxy
-		// being active rather than on which backend was chosen, because the proxy is the thing
-		// that conflicts -- FSR 3.1 hits it exactly as DLSS-G does.
-		if (upscaling.d3d12SwapChainActive && upscaling.IsFrameGenerationEnabled()) {
+		// Frame generation, either backend, and asked of the frame rather than of the session:
+		// DLSS-G intercepts Present asynchronously, and this pass writes into the scene through
+		// its own D3D12 device, so the two cannot both be operating on the same image. What
+		// matters is whether generation is running right now, not whether it was configured at
+		// boot -- the proxy swapchain can sit idle without conflicting, which is what lets the
+		// two features share a session.
+		if (upscaling.d3d12SwapChainActive && upscaling.IsFrameGenerationRequestedNow()) {
 			if (!g_loggedFrameGenerationBlock) {
-				logger::warn("[DLSSNR] Blocked: disable Frame Generation and restart the game");
+				logger::warn("[DLSSNR] Blocked: Frame Generation is running. Switching it off takes effect immediately -- no restart.");
 				g_loggedFrameGenerationBlock = true;
 			}
 			return false;

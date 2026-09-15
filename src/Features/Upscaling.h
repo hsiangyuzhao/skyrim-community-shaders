@@ -268,6 +268,10 @@ public:
 	FrameGenerationBackend GetFrameGenerationBackend() const;
 	FrameGenerationBackend GetConfiguredFrameGenerationBackend() const;
 	bool IsFrameGenerationEnabled() const;
+	/// @brief Whether this frame should generate, as opposed to whether the session is configured
+	/// for it. Carries the live setting; only ever subtracts from IsFrameGenerationEnabled, because
+	/// the proxy swapchain the on direction needs is created once at device creation.
+	bool IsFrameGenerationRequestedNow() const;
 	bool IsDLSSGBackend() const;
 	bool IsDLSSGAvailable() const;
 	bool IsDLSSGMapRenderingContext();
