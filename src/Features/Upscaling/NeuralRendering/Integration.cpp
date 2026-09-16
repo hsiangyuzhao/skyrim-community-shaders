@@ -21,7 +21,6 @@ namespace NeuralRendering
 		bool g_loggedFrameGenerationBlock = false;
 		bool g_loggedUpscalerBlock = false;
 		bool g_loggedResourceBlock = false;
-		Counters g_counters;
 
 		// Always returns false, so a blocked path reads as `return LogBlockOnce(...)` and cannot
 		// accidentally fall through to the pass. One line per session per reason: this runs at
@@ -62,17 +61,11 @@ namespace NeuralRendering
 		}
 	}
 
-	Counters GetCounters() { return g_counters; }
-
 	bool ApplyLdr()
 	{
 		auto& upscaling = globals::features::upscaling;
 		if (!upscaling.loaded || !upscaling.settings.neuralRendering.enabled)
 			return false;
-
-		// Counted after the enabled check and before every gate, so it answers exactly one
-		// question: is this function being reached at all while the feature is on.
-		++g_counters.attempts;
 
 		// The upscaler must be DLSS. Neural Rendering is an NGX feature and shares that
 		// machinery; the reference integration gates on the same thing. It is also the only
@@ -191,7 +184,6 @@ namespace NeuralRendering
 		if (!descsRead)
 			return LogBlockOnce("could not read a texture description for the scene or the motion vectors");
 
-		g_counters.applications += applied ? 1 : 0;
 		return applied;
 	}
 
@@ -201,6 +193,5 @@ namespace NeuralRendering
 		g_loggedFrameGenerationBlock = false;
 		g_loggedUpscalerBlock = false;
 		g_loggedResourceBlock = false;
-		g_counters = {};
 	}
 }

@@ -779,9 +779,16 @@ namespace Hooks
 		{
 			auto& upscaling = globals::features::upscaling;
 			auto& streamline = upscaling.streamline;
-			const bool useStreamlineFrameTiming = upscaling.IsDLSSGBackend() && streamline.reflexFunctionsReady && streamline.pclFunctionsReady;
+			// No longer gated on the frame-generation backend. Reflex is loaded for every
+			// non-VR session now, and its sleep is where latency is actually removed -- it is
+			// the point the frame is paced from, before input is sampled, which is also the
+			// only place a frame cap can be imposed without adding queue latency behind it.
+			const bool useStreamlineFrameTiming = streamline.reflexFunctionsReady && streamline.pclFunctionsReady;
 			const bool frameTimingStarted = useStreamlineFrameTiming && streamline.BeginFrameToken();
 			if (frameTimingStarted) {
+				// Before the sleep, so a mode or cap changed in the menu takes effect on the
+				// very frame it is paced by rather than one frame late.
+				upscaling.ApplyReflexSettings();
 				streamline.ReflexSleep();
 				streamline.SetPCLMarker(sl::PCLMarker::eSimulationStart);
 			}

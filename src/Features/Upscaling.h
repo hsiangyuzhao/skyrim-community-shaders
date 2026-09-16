@@ -142,6 +142,16 @@ public:
 		// kD reproduces what was hardcoded before this setting existed, so an existing profile
 		// keeps its exact behaviour.
 		uint DLSSDPreset = static_cast<uint>(DLSSDModelPreset::kD);
+
+		// NVIDIA Reflex. 0 = Off, 1 = On, 2 = On + Boost, matching sl::ReflexMode. The
+		// default reproduces what was hardcoded at initialization before this was exposed.
+		uint reflexMode = 1;
+		// Rendered frames per second, 0 to leave uncapped. This is Reflex's own limiter, not
+		// the spin below Present: it is applied before input is sampled and the driver is
+		// aware of it, which is what makes it the correct cap to pair with a variable refresh
+		// rate. Under frame generation the *presented* rate is roughly twice this.
+		uint reflexFrameLimit = 0;
+
 		NeuralRenderingSettings neuralRendering;
 	};
 
@@ -170,6 +180,12 @@ public:
 	bool frameGenerationBackendLatched = false;
 	bool frameGenerationEnabledAtStartup = false;
 	FrameGenerationBackend frameGenerationBackendAtStartup = FrameGenerationBackend::kFSR3FG;
+
+	// Last values Streamline accepted, so ApplyReflexSettings can run per frame without
+	// calling into the plugin on frames where nothing moved. UINT_MAX is a value neither
+	// setting can hold, which makes "nothing applied yet" distinguishable from "applied 0".
+	uint reflexModeApplied = UINT_MAX;
+	uint reflexFrameLimitApplied = UINT_MAX;
 
 	// Timing and scaling
 	double refreshRate = 0.0f;
@@ -259,6 +275,16 @@ public:
 	static void TimerSleepQPC(int64_t targetQPC);
 
 	void FrameLimiter();
+
+	/// @brief Pushes settings.reflexMode and settings.reflexFrameLimit to Streamline.
+	///
+	/// Cheap to call every frame: it compares against what was last accepted and only crosses
+	/// into Streamline when one of them has actually changed. Pass a_force at initialization,
+	/// where the cache is empty but the call still has to happen so a failure can invalidate
+	/// the feature.
+	///
+	/// @return false only when Streamline rejected the options, or Reflex is unavailable.
+	bool ApplyReflexSettings(bool a_force = false);
 
 	static double GetRefreshRate(HWND a_window);
 

@@ -271,16 +271,25 @@ void Streamline::LoadInterposer()
 	sl::Preferences pref;
 	const bool isVR = REL::Module::IsVR();
 	std::vector<sl::Feature> featuresToLoad = { sl::kFeatureDLSS, sl::kFeatureDLSS_RR, sl::kFeatureNIS };
+	if (!isVR) {
+		// Reflex and PCL are not DLSS-G's; they were only ever loaded alongside it. They
+		// reduce latency on their own, and Reflex's frame limiter in particular is the only
+		// one in this tree the driver knows about, which is what makes it the right one to
+		// use under a variable refresh rate. The markers placed around simulation and
+		// present cost nothing extra to feed. Loading them for every non-VR session is what
+		// lets the latency panel work on the FSR backend and with frame generation off.
+		featuresToLoad.push_back(sl::kFeatureReflex);
+		featuresToLoad.push_back(sl::kFeaturePCL);
+	}
 	if (!isVR && dlssGBackendSelectedAtBoot) {
 		// DLSS-G owns the presentation path.  Do not request it when the
 		// startup-selected backend is FSR3, otherwise both backends can claim
 		// the same swap chain.
 		featuresToLoad.push_back(sl::kFeatureDLSS_G);
-		featuresToLoad.push_back(sl::kFeatureReflex);
-		featuresToLoad.push_back(sl::kFeaturePCL);
 		logger::info("[Streamline] Startup backend: DLSS-G (2x) + Reflex/PCL");
 	} else {
-		logger::info("[Streamline] Startup backend: {}", isVR ? "VR/no DLSS-G" : "FSR3/no DLSS-G");
+		logger::info("[Streamline] Startup backend: {}{}",
+			isVR ? "VR/no DLSS-G" : "FSR3/no DLSS-G", isVR ? "" : " + Reflex/PCL");
 	}
 
 	pref.featuresToLoad = featuresToLoad.data();
@@ -439,10 +448,13 @@ void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
 	checkFeature(sl::kFeatureDLSS_RR, "DLSS RR", true, featureDLSS_RR);
 	checkFeature(sl::kFeatureNIS, "NIS", true, featureNIS);
 
-	const bool requestDLSSG = !REL::Module::IsVR() && dlssGBackendSelectedAtBoot;
+	const bool isVR = REL::Module::IsVR();
+	const bool requestDLSSG = !isVR && dlssGBackendSelectedAtBoot;
 	checkFeature(sl::kFeatureDLSS_G, "DLSS-G", requestDLSSG, featureDLSS_G);
-	checkFeature(sl::kFeatureReflex, "Reflex", requestDLSSG, featureReflex);
-	checkFeature(sl::kFeaturePCL, "PCL", requestDLSSG, featurePCL);
+	// Requested for every non-VR session, matching what Initialize now loads: these two
+	// stand on their own and are no longer tied to the frame-generation backend.
+	checkFeature(sl::kFeatureReflex, "Reflex", !isVR, featureReflex);
+	checkFeature(sl::kFeaturePCL, "PCL", !isVR, featurePCL);
 
 	logger::info("[Streamline] DLSS {} available", featureDLSS ? "is" : "is not");
 	logger::info("[Streamline] DLSS RR {} available", featureDLSS_RR ? "is" : "is not");
@@ -509,7 +521,9 @@ void Streamline::PostDevice()
 		pclFunctionsReady = stateReady && markerReady && optionsReady;
 	}
 
-	if (reflexFunctionsReady && !SetReflexOptions(sl::ReflexMode::eLowLatency))
+	// Driven by the saved settings rather than hardcoded to eLowLatency, and forced here so a
+	// failure at this point still invalidates the feature the way the old fixed call did.
+	if (reflexFunctionsReady && !globals::features::upscaling.ApplyReflexSettings(true))
 		reflexFunctionsReady = false;
 	if (pclFunctionsReady) {
 		sl::PCLOptions options{};

@@ -46,6 +46,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DLSSPreset,
 	enableDLSSRR,
 	DLSSDPreset,
+	reflexMode,
+	reflexFrameLimit,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -284,7 +286,7 @@ void Upscaling::DrawSettings()
 		}
 	}
 
-	if (upscaleMethod == UpscaleMethod::kDLSS && streamline.featureDLSS_RR) {
+	if (upscaleMethod == UpscaleMethod::kDLSS && streamline.featureDLSS_RR && ImGui::TreeNodeEx("Ray Reconstruction")) {
 		ImGui::Checkbox("Enable DLSS Ray Reconstruction", &settings.enableDLSSRR);
 		if (settings.enableDLSSRR) {
 			ImGui::TextDisabled("DLSS SR model presets do not apply while Ray Reconstruction is enabled.");
@@ -306,11 +308,10 @@ void Upscaling::DrawSettings()
 				ImGui::TextUnformatted("To check which model was actually requested, read the '[DLSS RR] Requested model preset' line in CommunityShaders.log alongside the 'nvngx_dlssd.dll version' line logged at startup.");
 			}
 		}
+		ImGui::TreePop();
 	}
 
-	if (upscaleMethod == UpscaleMethod::kDLSS && !globals::game::isVR) {
-		ImGui::SeparatorText("Neural Rendering (experimental)");
-
+	if (upscaleMethod == UpscaleMethod::kDLSS && !globals::game::isVR && ImGui::TreeNodeEx("Neural Rendering (DLSS 5, experimental)")) {
 		auto& nr = settings.neuralRendering;
 		ImGui::Checkbox("Enable Neural Rendering", &nr.enabled);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -341,19 +342,6 @@ void Upscaling::DrawSettings()
 			const auto status = NeuralRendering::Runtime::Instance().Status();
 			const auto& detail = NeuralRendering::Runtime::Instance().Detail();
 
-			const auto counters = NeuralRendering::GetCounters();
-			if (counters.attempts == 0) {
-				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("The pass has never been reached. Load a save and look again.");
-				ImGui::PopStyleColor();
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("This counts entries into the pass, before any of its own checks. Zero means the call site in the post-processing chain is not running -- which is a different problem from the pass running and rejecting the frame. It stays zero in the main menu, where that chain does not run.");
-			} else {
-				ImGui::Text("Reached %llu frames, applied %llu", counters.attempts, counters.applications);
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("Both climbing: the pass is running. Only the first climbing: a check inside is rejecting every frame, and the log line below names it.");
-			}
-
 			if (NeuralRendering::Renderer::Instance().IsFailureLatched()) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 				ImGui::Text("A pass failed and the feature latched off. See the [DLSSNR] lines in the log.");
@@ -362,9 +350,7 @@ void Upscaling::DrawSettings()
 					ImGui::TextUnformatted("The latch exists so a failing pass cannot retry every frame. The D3D12 interop is brought up before the runtime is probed, so an interop failure latches here while the runtime status above still reads as never probed -- the log line names which of the two failed. Reset Neural Rendering clears the latch.");
 			}
 			if (status == NeuralRendering::RuntimeStatus::Initialized) {
-				ImGui::Text("Runtime %s, %llu frames evaluated",
-					NeuralRendering::Runtime::Instance().Version().c_str(),
-					NeuralRendering::Runtime::Instance().SuccessfulFrames());
+				ImGui::Text("Runtime %s", NeuralRendering::Runtime::Instance().Version().c_str());
 			} else {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 				ImGui::Text("Runtime %s%s%s", NeuralRendering::ToString(status),
@@ -421,13 +407,17 @@ void Upscaling::DrawSettings()
 
 			ImGui::Text("Requires a D3D11 to D3D12 proxy which can create compatibility issues");
 			ImGui::Text("Backend is selected at game startup; changing it requires a restart");
-			if (frameGenerationEnabledAtStartup) {
+			if (activeBackend == FrameGenerationBackend::kDLSSG) {
+				ImGui::Text("On this backend it can be switched off and back on freely, in either direction");
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::TextUnformatted("A DLSS-G session stands generation up whether or not this setting starts on, so the toggle below is live. Turning it off already happened every time a menu opened, with resources retained so it can resume cheaply; what used to need a restart was turning it back on, because the session only prepared the proxy path when it booted with the setting enabled. It now always does, which is what makes switching generation off to use Neural Rendering a decision you can reverse without leaving the game.");
+			} else if (frameGenerationEnabledAtStartup) {
 				ImGui::Text("This session booted with it on, so it can be switched off and back on freely");
 			} else {
 				ImGui::Text("This session booted with it off, so switching it on requires a restart");
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::TextUnformatted("FSR frame generation owns its own FidelityFX swapchain and has no equivalent of DLSS-G's per-frame suspend, so its enable state is still read once, at startup. The DLSS-G backend does not have this restriction.");
 			}
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("Turning generation off needs nothing new -- it already happens every time a menu opens, with resources retained so it can resume cheaply. Turning it on needs the D3D11-to-D3D12 proxy swapchain, and that is created once, at device creation, from the state this session started in: with no proxy there is nothing to present generated frames through.");
 
 			if (!isWindowed) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
@@ -448,7 +438,11 @@ void Upscaling::DrawSettings()
 			}
 
 			const bool backendPendingRestart = frameGenerationBackendLatched && configuredBackend != frameGenerationBackendAtStartup;
-			const bool enabledPendingRestart = frameGenerationBackendLatched && (settings.frameGenerationMode != (frameGenerationEnabledAtStartup ? 1u : 0u));
+			// Only the FSR path still reads its enable state once. On DLSS-G the toggle is live
+			// in both directions, so warning about a restart there would be wrong.
+			const bool enabledPendingRestart = frameGenerationBackendLatched &&
+			                                   activeBackend != FrameGenerationBackend::kDLSSG &&
+			                                   (settings.frameGenerationMode != (frameGenerationEnabledAtStartup ? 1u : 0u));
 			if (backendPendingRestart || enabledPendingRestart) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 				ImGui::Text("Warning: Restart the game to apply frame-generation changes");
@@ -464,7 +458,11 @@ void Upscaling::DrawSettings()
 			if (!d3d12SwapChainActive)
 				ImGui::BeginDisabled();
 
-			ImGui::SliderInt("Frame Limit (Variable Refresh Rate)", (int*)&settings.frameLimitMode, 0, 1, std::format("{}", toggleModes[settings.frameLimitMode]).c_str());
+			ImGui::SliderInt("Frame Limit (VSync off only)", (int*)&settings.frameLimitMode, 0, 1, std::format("{}", toggleModes[settings.frameLimitMode]).c_str());
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Paces presentation to the refresh rate, or half of it while generating. It runs only when the game presents with a sync interval of zero, so anything that turns VSync on -- including SSE Display Tweaks, which owns that setting for most setups -- leaves it inert.");
+				ImGui::TextUnformatted("It also spins after Present, which is the wrong side of the frame for a cap: it holds the CPU once the work is already submitted. Under a variable refresh rate prefer the Reflex frame limit below, which is applied before input is sampled and which the driver is aware of.");
+			}
 
 			if (!d3d12SwapChainActive)
 				ImGui::EndDisabled();
@@ -479,6 +477,73 @@ void Upscaling::DrawSettings()
 			ImGui::Text("Frame Generation is not available on your system.\nThis requires either NVIDIA DLSS-G or AMD FSR 3.1 Frame Generation support and D3D12 interop.");
 			ImGui::TreePop();
 		}
+	}
+
+	if (!globals::game::isVR && ImGui::TreeNodeEx("Latency (NVIDIA Reflex)")) {
+		if (!streamline.featureReflex) {
+			ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+			ImGui::Text("Reflex is not available through Streamline on this system.");
+			ImGui::PopStyleColor();
+		} else {
+			const char* reflexModes[] = { "Off", "On", "On + Boost" };
+			int reflexModeIndex = static_cast<int>(std::min(settings.reflexMode, 2u));
+			if (ImGui::Combo("Reflex Low Latency", &reflexModeIndex, reflexModes, IM_ARRAYSIZE(reflexModes)))
+				settings.reflexMode = static_cast<uint>(reflexModeIndex);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Holds the render queue so the CPU does not run further ahead of the GPU than the frame needs. This is where latency is actually removed, and it happens in the game's own update, before input is sampled.");
+				ImGui::TextUnformatted("Boost additionally keeps GPU clocks up when the frame is CPU-bound. It costs power for a small further latency reduction and is worth little unless the GPU is idling.");
+			}
+
+			if (IsFrameGenerationRequestedNow() && settings.reflexMode == 0) {
+				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+				ImGui::Text("Held at On: Frame Generation requires Reflex.");
+				ImGui::PopStyleColor();
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::TextUnformatted("NVIDIA requires Reflex whenever DLSS-G is generating, and effectively no shipping game exposes the other combination. DLSS-G paces its own presentation, so without Reflex holding the render queue the game runs ahead of a cadence it no longer controls -- the case where generation adds the most latency. The setting above is left as you chose it and takes effect again once generation is off.");
+			}
+
+			int reflexFrameLimit = static_cast<int>(settings.reflexFrameLimit);
+			if (ImGui::SliderInt("Reflex Frame Limit", &reflexFrameLimit, 0, 240,
+					reflexFrameLimit > 0 ? "%d rendered fps" : "Off", ImGuiSliderFlags_AlwaysClamp))
+				settings.reflexFrameLimit = static_cast<uint>(std::max(reflexFrameLimit, 0));
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Caps rendered frames, not presented ones: while generating, the presented rate is roughly twice this. Zero leaves it uncapped.");
+				ImGui::TextUnformatted("This is the cap to use with a variable refresh rate. It is imposed inside Reflex's own sleep, before input is sampled, and the driver knows about it -- unlike a limiter that spins after Present, which adds the time it waits to the latency of the frame it just submitted.");
+				ImGui::TextUnformatted("Interpolation assumes evenly spaced frames, so a cap low enough to hold steady in the worst case is usually worth more than the headroom it gives up. Keep it below the display's maximum refresh so presentation stays inside the variable-refresh window.");
+			}
+
+			ImGui::Text("Display reports %.0f Hz", refreshRate);
+			if (settings.reflexFrameLimit > 0) {
+				const double presented = settings.reflexFrameLimit * (IsFrameGenerationRequestedNow() ? 2.0 : 1.0);
+				ImGui::Text("Capped at about %.0f presented fps", presented);
+				if (presented > refreshRate) {
+					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+					ImGui::Text("Above the refresh rate: presentation leaves the variable-refresh window.");
+					ImGui::PopStyleColor();
+				}
+			}
+
+			sl::ReflexState reflexState{};
+			if (streamline.GetReflexState(reflexState) && reflexState.latencyReportAvailable) {
+				// The report is a 64-entry ring whose fill order is Streamline's business, so
+				// pick the newest complete frame by frameID rather than assuming an end.
+				const sl::ReflexReport* newest = nullptr;
+				for (const auto& report : reflexState.frameReport) {
+					if (report.gpuRenderEndTime > report.simStartTime && report.simStartTime != 0 &&
+						(newest == nullptr || report.frameID > newest->frameID))
+						newest = &report;
+				}
+				if (newest) {
+					// Simulation start to GPU render end: the span Reflex itself acts on, and
+					// the only one assembled entirely from markers this tree places.
+					ImGui::Text("Reported latency %.1f ms",
+						static_cast<double>(newest->gpuRenderEndTime - newest->simStartTime) / 1000.0);
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::TextUnformatted("Simulation start to GPU render end for the newest completed frame, as the driver measured it. It excludes the display's own pipeline, so treat it as a number to compare against itself rather than as end-to-end click-to-photon.");
+				}
+			}
+		}
+		ImGui::TreePop();
 	}
 
 	if (ImGui::TreeNodeEx("Backend Diagnostics")) {
@@ -1241,6 +1306,45 @@ void Upscaling::PostDisplay()
 	globals::state->UpdateSharedData(false, false);
 }
 
+bool Upscaling::ApplyReflexSettings(bool a_force)
+{
+	if (!streamline.featureReflex)
+		return false;
+
+	uint mode = std::min(settings.reflexMode, static_cast<uint>(sl::ReflexMode::eLowLatencyWithBoost));
+
+	// NVIDIA requires Reflex to be at least on whenever DLSS-G is generating, and effectively
+	// no shipping game exposes the combination of frame generation on with Reflex off. The
+	// reason is structural rather than a recommendation: DLSS-G paces its own presentation, and
+	// without Reflex holding the render queue the game runs ahead of a display cadence it no
+	// longer controls, which is the case where generation adds the most latency. Held here
+	// rather than by rewriting the setting, so the user's own choice survives switching
+	// generation back off.
+	if (IsFrameGenerationRequestedNow() && mode == static_cast<uint>(sl::ReflexMode::eOff))
+		mode = static_cast<uint>(sl::ReflexMode::eLowLatency);
+
+	const uint frameLimit = settings.reflexFrameLimit;
+	if (!a_force && mode == reflexModeApplied && frameLimit == reflexFrameLimitApplied)
+		return true;
+
+	// Reflex takes a frame *period*, not a rate. Zero stays zero, which is how it is told the
+	// limiter is off; anything else rounds down to whole microseconds, so the cap is at or
+	// fractionally below the requested rate rather than above it.
+	const uint32_t frameLimitUs = frameLimit > 0 ? static_cast<uint32_t>(1000000u / frameLimit) : 0u;
+
+	if (!streamline.SetReflexOptions(static_cast<sl::ReflexMode>(mode), frameLimitUs))
+		return false;
+
+	// Only cached on success, so a rejected call is retried on the next frame instead of being
+	// silently remembered as applied.
+	reflexModeApplied = mode;
+	reflexFrameLimitApplied = frameLimit;
+	logger::info("[Streamline] Reflex mode {}, frame limit {}",
+		magic_enum::enum_name(static_cast<sl::ReflexMode>(mode)),
+		frameLimit > 0 ? std::format("{} fps ({} us)", frameLimit, frameLimitUs) : std::string("off"));
+	return true;
+}
+
 void Upscaling::TimerSleepQPC(int64_t targetQPC)
 {
 	LARGE_INTEGER currentQPC;
@@ -1436,7 +1540,25 @@ Upscaling::FrameGenerationBackend Upscaling::GetFrameGenerationBackend() const
 
 bool Upscaling::IsFrameGenerationEnabled() const
 {
-	return frameGenerationBackendLatched ? frameGenerationEnabledAtStartup : settings.frameGenerationMode != 0;
+	if (!frameGenerationBackendLatched)
+		return settings.frameGenerationMode != 0;
+
+	// A DLSS-G session always stands frame generation up, whether or not the setting is on.
+	//
+	// It costs nothing to do so: the proxy swap chain is created for any windowed DLSS-G
+	// session already, and CreateProxyInterop allocates the frame-generation motion-vector
+	// buffer on IsDLSSGBackend() alone -- so the resources this query appeared to gate were
+	// never actually keyed to the setting. What it did gate was the ability to turn generation
+	// back on, which produced the case this removes: switching generation off to use Neural
+	// Rendering, then needing two more launches to get it back -- one to set the toggle, one to
+	// boot with it set.
+	//
+	// The FSR path keeps the startup latch. Its swap chain is FidelityFX's own and it has no
+	// equivalent of SetDLSSGMode to suspend and resume generation within a session.
+	if (IsDLSSGBackend() && HasFrameGenModule())
+		return true;
+
+	return frameGenerationEnabledAtStartup;
 }
 
 // (batch 29) What the frame actually wants, as opposed to what the session was configured for.

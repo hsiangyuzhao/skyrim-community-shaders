@@ -275,21 +275,28 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 	DX::ThrowIfFailed(commandLists[frameIndex]->Close());
 
-	if (upscaling.IsDLSSGBackend())
+	// Marker placement follows PCL rather than the frame-generation backend. The simulation
+	// markers in Main_Update are no longer backend-gated either, and half a marker set is worse
+	// than none: Reflex pairs submit and present against simulation to derive the latency it
+	// then paces from. PCL is pure measurement, so this costs nothing on the FSR path.
+	const bool markLatency = upscaling.streamline.pclFunctionsReady;
+
+	if (markLatency)
 		upscaling.streamline.SetPCLMarker(sl::PCLMarker::eRenderSubmitStart);
 
 	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };
 	commandQueue->ExecuteCommandLists(1, commandListsToExecute);
 
-	if (upscaling.IsDLSSGBackend())
+	if (markLatency)
 		upscaling.streamline.SetPCLMarker(sl::PCLMarker::eRenderSubmitEnd);
 
 	// Present the frame
-	if (upscaling.IsDLSSGBackend())
+	if (markLatency)
 		upscaling.streamline.SetPCLMarker(sl::PCLMarker::ePresentStart);
 	const auto presentResult = swapChain->Present(SyncInterval, Flags);
-	if (upscaling.IsDLSSGBackend()) {
+	if (markLatency)
 		upscaling.streamline.SetPCLMarker(sl::PCLMarker::ePresentEnd);
+	if (upscaling.IsDLSSGBackend()) {
 		if (SUCCEEDED(presentResult) && upscaling.IsDLSSGAvailable() &&
 			(useFrameGeneration || dlssGPresentationState == DLSSGPresentationState::kMapSuspended)) {
 			sl::DLSSGState dlssGState{};
