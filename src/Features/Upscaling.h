@@ -149,10 +149,15 @@ public:
 		// NVIDIA Reflex. 0 = Off, 1 = On, 2 = On + Boost, matching sl::ReflexMode. The
 		// default reproduces what was hardcoded at initialization before this was exposed.
 		uint reflexMode = 1;
-		// Rendered frames per second, 0 to leave uncapped. This is Reflex's own limiter, not
-		// the spin below Present: it is applied before input is sampled and the driver is
-		// aware of it, which is what makes it the correct cap to pair with a variable refresh
-		// rate. Under frame generation the *presented* rate is roughly twice this.
+		// Frames per second as they reach the display, 0 to leave uncapped. This is Reflex's
+		// own limiter, not the spin below Present: it is applied before input is sampled and
+		// the driver is aware of it, which is what makes it the correct cap to pair with a
+		// variable refresh rate.
+		//
+		// It caps the *presented* rate, not the rendered one. The driver knows the generation
+		// multiplier, so with DLSS-G running a cap of 60 renders 30 and presents 60, and the
+		// same cap in a paused menu with generation off renders and presents 60. Measured in
+		// game, against an earlier assumption here that it capped rendered frames.
 		uint reflexFrameLimit = 0;
 
 		NeuralRenderingSettings neuralRendering;
@@ -301,6 +306,13 @@ public:
 	/// for it. Carries the live setting; only ever subtracts from IsFrameGenerationEnabled, because
 	/// the proxy swapchain the on direction needs is created once at device creation.
 	bool IsFrameGenerationRequestedNow() const;
+	/// @brief Whether a paused frame should still generate, per Frame Generation in Menus.
+	///
+	/// Two places decide independently whether a paused frame is eligible -- the Present gate
+	/// and the HUD-less capture that gate depends on -- and the first version of this setting
+	/// changed only the former, so generation stayed held waiting for a snapshot that was never
+	/// taken. They share this now.
+	bool IsFrameGenerationAllowedWhilePaused() const;
 	bool IsDLSSGBackend() const;
 	bool IsDLSSGAvailable() const;
 	bool IsDLSSGMapRenderingContext();

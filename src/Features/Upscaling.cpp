@@ -512,19 +512,20 @@ void Upscaling::DrawSettings()
 
 			int reflexFrameLimit = static_cast<int>(settings.reflexFrameLimit);
 			if (ImGui::SliderInt("Reflex Frame Limit", &reflexFrameLimit, 0, 240,
-					reflexFrameLimit > 0 ? "%d rendered fps" : "Off", ImGuiSliderFlags_AlwaysClamp))
+					reflexFrameLimit > 0 ? "%d presented fps" : "Off", ImGuiSliderFlags_AlwaysClamp))
 				settings.reflexFrameLimit = static_cast<uint>(std::max(reflexFrameLimit, 0));
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Caps rendered frames, not presented ones: while generating, the presented rate is roughly twice this. Zero leaves it uncapped.");
+				ImGui::TextUnformatted("Caps frames as they reach the display, not as they are rendered. The driver knows the generation multiplier, so with generation running a cap of 60 renders 30 and presents 60; the same cap where generation is off renders and presents 60. Zero leaves it uncapped.");
 				ImGui::TextUnformatted("This is the cap to use with a variable refresh rate. It is imposed inside Reflex's own sleep, before input is sampled, and the driver knows about it -- unlike a limiter that spins after Present, which adds the time it waits to the latency of the frame it just submitted.");
 				ImGui::TextUnformatted("Interpolation assumes evenly spaced frames, so a cap low enough to hold steady in the worst case is usually worth more than the headroom it gives up. Keep it below the display's maximum refresh so presentation stays inside the variable-refresh window.");
 			}
 
 			ImGui::Text("Display reports %.0f Hz", refreshRate);
 			if (settings.reflexFrameLimit > 0) {
-				const double presented = settings.reflexFrameLimit * (IsFrameGenerationRequestedNow() ? 2.0 : 1.0);
-				ImGui::Text("Capped at about %.0f presented fps", presented);
-				if (presented > refreshRate) {
+				if (IsFrameGenerationRequestedNow())
+					ImGui::Text("About %u presented, from %u rendered while generating",
+						settings.reflexFrameLimit, settings.reflexFrameLimit / 2);
+				if (settings.reflexFrameLimit > refreshRate) {
 					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 					ImGui::Text("Above the refresh rate: presentation leaves the variable-refresh window.");
 					ImGui::PopStyleColor();
@@ -1383,7 +1384,9 @@ void Upscaling::FrameLimiter()
 		if (settings.frameLimitMode) {
 			// Fall back to the original timing method
 			// Use integer arithmetic for more precise timing
-			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate * (IsFrameGenerationRequestedNow() && !globals::game::ui->GameIsPaused() ? 0.5 : 1.0)));
+			const bool generatingNow = IsFrameGenerationRequestedNow() &&
+			                           (!globals::game::ui->GameIsPaused() || IsFrameGenerationAllowedWhilePaused());
+			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate * (generatingNow ? 0.5 : 1.0)));
 			int64_t targetFrameTicks = (targetFrameTimeNS * qpf.QuadPart) / 1000000000LL;
 
 			static LARGE_INTEGER lastFrame = {};
@@ -1606,6 +1609,21 @@ bool Upscaling::IsDLSSGBackend() const
 bool Upscaling::IsDLSSGAvailable() const
 {
 	return streamline.IsDLSSGReady();
+}
+
+bool Upscaling::IsFrameGenerationAllowedWhilePaused() const
+{
+	if (!settings.frameGenerationAllowInMenus)
+		return false;
+
+	// The main menu and loading screens are never eligible: there is no world scene behind
+	// them, so generation would be interpolating between two images of a menu. Everything
+	// else that pauses -- inventory, the journal, the system menu -- is a real rendered frame
+	// with the world still behind it, which is what the setting opens up.
+	auto* ui = globals::game::ui;
+	return ui != nullptr &&
+	       !ui->IsMenuOpen(RE::MainMenu::MENU_NAME) &&
+	       !ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME);
 }
 
 bool Upscaling::IsDLSSGMapRenderingContext()

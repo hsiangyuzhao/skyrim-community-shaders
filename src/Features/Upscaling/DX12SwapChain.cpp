@@ -201,19 +201,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	auto* ui = globals::game::ui;
 	const bool mapMenuOpen = ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
 	const bool mapRenderingContext = upscaling.IsDLSSGMapRenderingContext();
-
-	// The main menu and loading screens are never eligible: there is no world scene behind
-	// them, so generation would be interpolating between two images of a menu. Everything
-	// else that pauses -- inventory, the journal, the system menu -- is a real rendered frame
-	// with the world still behind it, which is what the setting opens up.
-	const bool worldBehindMenu = !ui->IsMenuOpen(RE::MainMenu::MENU_NAME) &&
-	                             !ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME);
-	const bool allowInMenus = upscaling.settings.frameGenerationAllowInMenus && worldBehindMenu;
-
 	// MapMenu normally pauses the game. Staged map recovery makes it safe to
 	// request DLSS-G after native and DLSS-SR-only warm-up frames.
 	const bool frameGenerationRequested = upscaling.IsFrameGenerationRequestedNow() &&
-		(!ui->GameIsPaused() || mapRenderingContext || allowInMenus);
+		(!ui->GameIsPaused() || mapRenderingContext || upscaling.IsFrameGenerationAllowedWhilePaused());
 	bool useFrameGeneration = frameGenerationRequested;
 
 	if (upscaling.IsDLSSGBackend() && upscaling.IsDLSSGAvailable()) {
@@ -600,8 +591,12 @@ void DX12SwapChain::SetUIBuffer()
 		auto* ui = globals::game::ui;
 		const bool mapMenuOpen = ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
 		const bool mapRenderingContext = upscaling.IsDLSSGMapRenderingContext();
+		// This is the gate that actually decides whether a paused frame can generate. Without
+		// the HUD-less snapshot below, dlssGHUDLessFrameIndex stays at UINT32_MAX and
+		// UpdateDLSSGPresentationState holds generation waiting for a resource that is never
+		// produced -- which is why relaxing only the Present gate changed nothing.
 		const bool sceneSupportsFrameGeneration = mapRenderingContext ||
-			(!ui->GameIsPaused() && !mapMenuOpen);
+			((!ui->GameIsPaused() || upscaling.IsFrameGenerationAllowedWhilePaused()) && !mapMenuOpen);
 		if (sceneSupportsFrameGeneration &&
 			upscaling.IsFrameGenerationRequestedNow() &&
 			upscaling.IsDLSSGAvailable()) {
