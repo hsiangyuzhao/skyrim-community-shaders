@@ -129,6 +129,16 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 
 	frameIndex = swapChain->GetCurrentBackBufferIndex();
 
+	// Everything a variable refresh rate depends on, in one line, because none of it is
+	// decided here: the swap effect is forced by the device-creation hook, and the flags are
+	// whatever the game's own swap-chain description carried in -- which is where SSE Display
+	// Tweaks puts ALLOW_TEARING. Without that flag DXGI will not present outside a vertical
+	// blank, and G-Sync has nothing to follow no matter what the driver is set to.
+	logger::info("[Upscaling] Proxy swap chain: {}x{} format={} buffers={} swapEffect={} flags=0x{:X} allowTearing={}",
+		swapChainDesc.Width, swapChainDesc.Height, static_cast<uint32_t>(swapChainDesc.Format),
+		swapChainDesc.BufferCount, static_cast<uint32_t>(swapChainDesc.SwapEffect), swapChainDesc.Flags,
+		(swapChainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0);
+
 	if (!useDLSSG)
 		upscaling.fidelityFX.SetupFrameGeneration();
 }
@@ -191,10 +201,19 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	auto* ui = globals::game::ui;
 	const bool mapMenuOpen = ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
 	const bool mapRenderingContext = upscaling.IsDLSSGMapRenderingContext();
+
+	// The main menu and loading screens are never eligible: there is no world scene behind
+	// them, so generation would be interpolating between two images of a menu. Everything
+	// else that pauses -- inventory, the journal, the system menu -- is a real rendered frame
+	// with the world still behind it, which is what the setting opens up.
+	const bool worldBehindMenu = !ui->IsMenuOpen(RE::MainMenu::MENU_NAME) &&
+	                             !ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME);
+	const bool allowInMenus = upscaling.settings.frameGenerationAllowInMenus && worldBehindMenu;
+
 	// MapMenu normally pauses the game. Staged map recovery makes it safe to
 	// request DLSS-G after native and DLSS-SR-only warm-up frames.
 	const bool frameGenerationRequested = upscaling.IsFrameGenerationRequestedNow() &&
-		(!ui->GameIsPaused() || mapRenderingContext);
+		(!ui->GameIsPaused() || mapRenderingContext || allowInMenus);
 	bool useFrameGeneration = frameGenerationRequested;
 
 	if (upscaling.IsDLSSGBackend() && upscaling.IsDLSSGAvailable()) {
@@ -293,6 +312,17 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// Present the frame
 	if (markLatency)
 		upscaling.streamline.SetPCLMarker(sl::PCLMarker::ePresentStart);
+	// The other half of the variable-refresh question, and the half that cannot be read from
+	// the swap-chain description: what the game actually asks for each Present. A sync interval
+	// of anything but zero means every present waits for a vertical blank regardless of the
+	// flags above, which is what an in-game VSync setting produces. Logged once.
+	static bool loggedPresentParameters = false;
+	if (!loggedPresentParameters) {
+		logger::info("[Upscaling] First Present: syncInterval={} flags=0x{:X} allowTearing={}",
+			SyncInterval, Flags, (Flags & DXGI_PRESENT_ALLOW_TEARING) != 0);
+		loggedPresentParameters = true;
+	}
+
 	const auto presentResult = swapChain->Present(SyncInterval, Flags);
 	if (markLatency)
 		upscaling.streamline.SetPCLMarker(sl::PCLMarker::ePresentEnd);

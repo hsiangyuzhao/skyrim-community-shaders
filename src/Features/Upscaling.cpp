@@ -40,6 +40,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	frameGenerationMode,
 	frameGenerationBackend,
 	frameGenerationForceEnable,
+	frameGenerationAllowInMenus,
 	streamlineLogLevel,
 	sharpnessFSR,
 	sharpnessDLSS,
@@ -469,6 +470,13 @@ void Upscaling::DrawSettings()
 
 			ImGui::Text("Allows frame generation to function on low refresh rate monitors");
 			ImGui::SliderInt("Force Enable Frame Generation", (int*)&settings.frameGenerationForceEnable, 0, 1, std::format("{}", toggleModes[settings.frameGenerationForceEnable]).c_str());
+
+			ImGui::Checkbox("Frame Generation in Menus", &settings.frameGenerationAllowInMenus);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Keeps generation running while a paused menu is open -- inventory, the journal, the system menu. Without it, generation stops the moment the game pauses, which is why the frame rate drops as soon as a menu appears.");
+				ImGui::TextUnformatted("The main menu and loading screens stay excluded: there is no world scene behind them, so there would be nothing to interpolate but the menu itself. The map keeps its own staged recovery either way.");
+				ImGui::TextUnformatted("Menus are where the latency generation adds is easiest to notice and the extra smoothness worth least, which is why this is off by default.");
+			}
 
 			ImGui::TreePop();
 		}
@@ -1335,13 +1343,23 @@ bool Upscaling::ApplyReflexSettings(bool a_force)
 	if (!streamline.SetReflexOptions(static_cast<sl::ReflexMode>(mode), frameLimitUs))
 		return false;
 
+	// Only logged when the mode moves. Dragging the frame-limit slider applies on every step,
+	// and logging each one buried the rest of the session in a hundred near-identical lines.
+	// The cap is carried on the mode line and shown live in the panel, which is where it is
+	// actually read; the per-step value goes to debug.
+	const bool modeChanged = mode != reflexModeApplied;
+
 	// Only cached on success, so a rejected call is retried on the next frame instead of being
 	// silently remembered as applied.
 	reflexModeApplied = mode;
 	reflexFrameLimitApplied = frameLimit;
-	logger::info("[Streamline] Reflex mode {}, frame limit {}",
-		magic_enum::enum_name(static_cast<sl::ReflexMode>(mode)),
-		frameLimit > 0 ? std::format("{} fps ({} us)", frameLimit, frameLimitUs) : std::string("off"));
+
+	const auto limitText = frameLimit > 0 ? std::format("{} fps ({} us)", frameLimit, frameLimitUs) : std::string("off");
+	if (modeChanged)
+		logger::info("[Streamline] Reflex mode {}, frame limit {}",
+			magic_enum::enum_name(static_cast<sl::ReflexMode>(mode)), limitText);
+	else
+		logger::debug("[Streamline] Reflex frame limit {}", limitText);
 	return true;
 }
 

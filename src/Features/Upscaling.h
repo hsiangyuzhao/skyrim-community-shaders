@@ -134,6 +134,9 @@ public:
 		uint frameGenerationMode = 1;
 		uint frameGenerationBackend = static_cast<uint>(FrameGenerationBackend::kFSR3FG);
 		uint frameGenerationForceEnable = 0;
+		// Keeps generation running while a paused menu is open. Off by default because a menu
+		// is where the added input latency is most noticeable and the smoothness least useful.
+		bool frameGenerationAllowInMenus = false;
 		uint streamlineLogLevel = 0;  // 0=Off, 1=Default, 2=Verbose
 		float sharpnessFSR = 1.0f;
 		float sharpnessDLSS = 0.1f;
