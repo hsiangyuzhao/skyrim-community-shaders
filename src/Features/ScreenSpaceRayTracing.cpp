@@ -138,14 +138,22 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 void ScreenSpaceRayTracing::DrawSettings()
 {
     ImGui::Checkbox("Enable Specular", &settings.EnableSpecular);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text("Traced reflections that show what is actually on screen, instead of only the cubemap reflection.");
     ImGui::SameLine();
     ImGui::Checkbox("Enable Diffuse", &settings.EnableDiffuse);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text("Traced bounce light: light and color reflected from nearby surfaces onto others.");
     ImGui::SliderInt("Max Steps", (int*)&settings.MaxSteps, 1, 256);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text("How far each ray can search for something to hit. Higher = finds more distant objects, but costs more GPU time.");
     // (audit P3) The traversal can load exactly mip SSRTCB::MaxMips, so the highest
     // legal setting is maxMips - 1; the old bound of maxMips let the ray sample a mip
     // that does not exist, and an out-of-range Load returns 0 == near plane, i.e. an
     // instant false hit.
     ImGui::SliderInt("Max Mip Level", (int*)&settings.MaxMips, 1, maxMips - 1, "%d", ImGuiSliderFlags_AlwaysClamp);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text("How big a jump each ray step can take. Higher = rays reach farther for the same cost, but may skip over thin objects.");
     recompileFlag |= ImGui::SliderInt("Diffuse SPP", (int*)&settings.DiffuseSPP, 1, 16, "%d", ImGuiSliderFlags_AlwaysClamp);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Samples per pixel for diffuse component. Higher values reduce noise but impact performance.");
@@ -158,18 +166,8 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::SliderFloat("Specular Max Roughness", &settings.SpecularMaxRoughness, 0.05f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Above this roughness the specular ray march does not run and the pixel keeps "
-                "the cubemap reflection it would otherwise have had.\n\n"
-                "1.00 traces everything, which is what this feature did before the setting "
-                "existed. Lowering it is close to free in image terms over most of a Skyrim "
-                "frame: a wide GGX lobe averages so much of the environment that the "
-                "prefiltered cubemap is already the same answer, and vanilla specular comes "
-                "from that cubemap anyway -- so this picks the cheaper estimator of one "
-                "quantity rather than removing anything.\n\n"
-                "What it cannot do is stand in for a sharp reflection. The cubemap has no "
-                "parallax, so on water, polished floors and metal the traced result is "
-                "visibly different. Watch those surfaces as you lower it, and read the SSRT "
-                "Trace Specular row for what it buys.");
+                "Surfaces rougher than this skip traced reflections and keep the cheaper cubemap reflection. "
+                "Lower = more FPS with little change on rough surfaces, but watch shiny floors, metal and water as you go lower; 1.00 = trace everything.");
     }
 
     // (batch 12) Sparse sampling. Placed directly under Diffuse SPP because the two are the same
@@ -183,64 +181,39 @@ void ScreenSpaceRayTracing::DrawSettings()
             settings.DiffuseSamplingMode = (uint)sm;
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "How many pixels share one diffuse ray. Both sparse modes trace half as many rays "
-                "as Full, so both save about the same amount in the SSRT Trace Diffuse row -- and "
-                "neither of them changes anything about the denoiser, which still runs at full "
-                "resolution on a full-resolution input.\n\n"
-                "Full: one ray per pixel. The default and the reference image; identical to the "
-                "previous build.\n\n"
-                "Half Resolution: one ray per 2x2 block, traced from whichever of the four pixels "
-                "is nearest the camera, then expanded back with a depth- and normal-aware filter. "
-                "The cheapest of the three, because the rays also step through the depth pyramid "
-                "one level coarser. Cost: indirect light detail softens, most visibly in tight "
-                "contact shadows and on thin geometry, and a one-pixel feature can lose its bounce "
-                "light entirely.\n\n"
-                "Checkerboard: one ray per horizontal pair of pixels, swapping which half is "
-                "traced every frame. Half the frame is untouched full-resolution data at any "
-                "moment and every pixel gets a real ray every other frame, so the pixel grid and "
-                "thin geometry survive much better than at half resolution. It saves a little less "
-                "than Half Resolution -- its rays walk the fine depth pyramid, like Full's do -- "
-                "and the pixels it skips are filled from their vertical neighbours, which can "
-                "shimmer slightly on fast camera motion.\n\n"
-                "Specular reflections are unaffected by all three."
+                "How many pixels share one bounce-light ray. Full = best quality; Half Resolution = cheapest, but bounce light gets softer "
+                "and very thin objects can lose it; Checkerboard = almost as cheap and keeps detail better, but may shimmer slightly in fast motion. "
+                "Reflections are not affected."
 #ifdef ENABLE_SHARC
-                "\n\nIgnored while SHARC is enabled."
+                " Ignored while SHARC is enabled."
 #endif
-                "\n\nWatch the 'SSRT Sparse Resolve' row in the Performance Overlay against 'SSRT "
-                "Trace Diffuse': the sparse modes are only worth it while the second falls by more "
-                "than the first adds.");
+            );
 #ifdef ENABLE_SHARC
         if (settings.DiffuseSamplingMode != kSamplingFull && settings.EnableSharc)
             ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "Sparse diffuse sampling is inactive: SHARC is enabled.");
         else
 #endif
             if (settings.DiffuseSamplingMode != kSamplingFull && activeSamplingMode == kSamplingFull && settings.EnableDiffuse)
-            ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "Sparse diffuse sampling is inactive: check the log for a shader or allocation failure.");
+            ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "Sparse diffuse sampling failed to start, so Full is running. See the log.");
     }
 
     ImGui::SliderFloat("Specular Multiplier", &settings.SpecularMult, 0.0f, 5.0f, "%.2f");
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text("Brightness of the traced reflections. 1 = neutral.");
     ImGui::SliderFloat("Diffuse Multiplier", &settings.DiffuseMult, 0.01f, 5.0f, "%.2f");
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text("Brightness of the traced bounce light. 1 = neutral.");
     ImGui::SliderFloat("Occlusion Strength", &settings.OcclusionStrength, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
-            "How strongly a ray that ran into the back of geometry darkens the fallback "
-            "ambient for that pixel. Rays that simply failed to trace no longer count "
-            "towards this.\n\n"
-            "While Screen Space GI's Contact AO is on, this only counts geometry further away "
-            "than that setting's radius. Anything closer is handed to Contact AO instead, "
-            "because two rays per pixel cannot decide how dark a tight contact is without the "
-            "answer changing every frame. The two never darken the same geometry twice.\n\n"
-            "With Screen Space GI or its Contact AO switched off, the rays go back to deciding "
-            "the near field themselves -- flickery, but never missing.");
+            "How much the rays darken ambient light in corners and behind objects. "
+            "With Screen Space GI's Contact AO on, very close contacts are left to Contact AO, so nothing gets darkened twice.");
     ImGui::BeginDisabled(settings.EnableAmbientReinjection);
     ImGui::SliderFloat("Ambient Multiplier", &settings.AmbientMult, 0.0f, 1.0f, "%.2f");
     ImGui::EndDisabled();
     if (auto _tt = Util::HoverTooltipWrapper()) {
         if (settings.EnableAmbientReinjection)
-            ImGui::Text(
-                "Pinned to 1 while Ambient Reinjection is on: that mode needs the full vanilla "
-                "ambient in the frame so the composite can take back exactly the part the rays "
-                "resolved. Turn Ambient Reinjection off to edit this again.");
+            ImGui::Text("Locked to 1 while Ambient Reinjection is on. Turn Ambient Reinjection off to change it.");
         else
             ImGui::Text("Mix diffuse with vanilla ambient color. Not suggested if using dynamic cubemaps as fallback.");
     }
@@ -250,36 +223,15 @@ void ScreenSpaceRayTracing::DrawSettings()
     ImGui::Checkbox("Ambient Reinjection", &settings.EnableAmbientReinjection);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
-            "Keeps the vanilla ambient light in the frame and lets the traced result displace "
-            "it in proportion to how much geometry the rays actually found, instead of zeroing "
-            "the ambient and relying on the cubemap fallback to stand in for it. Each pixel "
-            "ends up at a blend of vanilla ambient and traced radiance weighted by hit "
-            "confidence.\n\n"
-            "Why it matters. A screen-space ray can only bring back light from a surface that "
-            "is on screen, inside the hemisphere and lit; sky, off-screen and unlit hits carry "
-            "nothing. With the ambient zeroed there is nothing underneath that, which is why "
-            "the frame collapses when the fallback is switched off. It also removes most of the "
-            "unfiltered sampling noise reaching the upscaler, because the noisy term is now "
-            "scaled by confidence and the low-confidence regions -- open ground, sky-facing "
-            "surfaces -- rest on a perfectly stable ambient instead.\n\n"
-            "Forces the diffuse cubemap fallback off, since the two are competing answers to "
-            "the same question and running both would count the environment twice. The "
-            "specular fallback is unaffected. If you want some of the cubemap back, use the "
-            "\"Cubemap Fill Blend\" slider below instead of the fallback checkbox -- that route "
-            "shares the missed directions between the two sources rather than letting both claim "
-            "all of them.\n\n"
-            "Turn it off to get the previous behaviour back exactly, for an A/B comparison.");
+            "Keeps the game's normal ambient light and replaces it with traced bounce light only where the rays actually found something. "
+            "Steadier, less noisy lighting in open areas; while on, the diffuse cubemap fallback only works through Cubemap Fill Blend below.");
 
     if (settings.EnableAmbientReinjection) {
         ImGui::SliderFloat("Reinjection Strength", &settings.AmbientReinjectionStrength, 0.0f, 1.0f, "%.2f");
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "How much of the hit confidence is allowed to displace the vanilla ambient. 1 "
-                "conserves energy: a fully confident pixel is pure traced radiance. 0 keeps the "
-                "whole ambient and adds the traced light on top, which is brighter than the "
-                "truth but never darker than vanilla. Slightly below 1 is a reasonable hedge in "
-                "scenes whose on-screen surfaces are not representative of the surrounding "
-                "environment.");
+                "How much the traced light replaces the normal ambient light. 1 = full replacement (most accurate); "
+                "lower keeps more of the normal ambient and adds traced light on top, so brighter but never darker than vanilla.");
 
         // (batch 8) beta. Disabled without the diffuse cubemap fallback switched on, because that
         // switch is what decides whether the cubemap estimate is built at all -- with it off there
@@ -290,36 +242,12 @@ void ScreenSpaceRayTracing::DrawSettings()
         if (auto _tt = Util::HoverTooltipWrapper()) {
             if (!settings.UseDynamicCubemapsAsFallback)
                 ImGui::Text(
-                    "Needs \"Use Dynamic Cubemaps as Fallback for Diffuse\" (under Tracing) turned "
-                    "on. That switch is what builds the cubemap estimate this slider blends "
-                    "towards, so with it off there is nothing to fill from and this does nothing.");
+                    "Needs \"Use Dynamic Cubemaps as Fallback for Diffuse\" (further down) turned on; "
+                    "without it this slider does nothing.");
             else
                 ImGui::Text(
-                    "What fills the directions the rays could not answer. At 0 they are filled by "
-                    "the vanilla ambient plus IBL, which is what Ambient Reinjection has always "
-                    "done. At 1 they are filled by the dynamic cubemap instead, which is what the "
-                    "old cubemap fallback did. In between the two are mixed.\n\n"
-                    "This is a continuous version of what used to be an either/or. It does not "
-                    "change how much light a pixel gets, only where the unresolved part of it "
-                    "comes from: the rays keep the share they resolved, and the rest is split "
-                    "between the two sources by this slider. Total energy is the same at every "
-                    "setting.\n\n"
-                    "Where you will see it. Shadowed recesses that face the camera -- Whiterun's "
-                    "gate tunnel, under eaves, the underside of arches. Those are where the rays "
-                    "miss most often, so almost the whole ambient there is coming from whichever "
-                    "source this picks. Open ground facing away from you barely changes.\n\n"
-                    "At 1 this is arithmetically the old fallback but not numerically identical to "
-                    "it: the light gets added in the forward pass and taken back out later, and "
-                    "the take-back reads the ambient brightness out of a packed G-buffer channel, "
-                    "so it loses a little precision. It is also a shade darker where rays hit the "
-                    "back of geometry, because that evidence is counted once here instead of "
-                    "twice.\n\n"
-                    "One side effect worth knowing: this raises the confidence value the denoiser "
-                    "sees on the pixels it raises the most, and the cheap experimental REBLUR "
-                    "\"Feed Hit Coverage as History Confidence\" switch is the one thing that "
-                    "reads it. The a-trous blur width is NOT affected -- that runs off a separate "
-                    "hit-distance channel measured before any of this.\n\n"
-                    "0 is the default and leaves the frame exactly as it was.");
+                    "Where the light comes from in spots the rays could not reach: 0 = normal ambient light, 1 = dynamic cubemap, in between = a mix. "
+                    "Overall brightness stays about the same; most visible in shadowed nooks facing you, such as under eaves and arches.");
         }
 
         // (batch 6) The zero-lag noise fix, and the default. Placed above the temporal
@@ -327,26 +255,8 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::Checkbox("Low-Resolution Confidence Filter", &settings.LowResConfidenceFilter);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Smooths the hit-confidence signal on a half-width, half-height grid with a wide "
-                "edge-aware blur, then upsamples it back, instead of running a small 7x7 blur at "
-                "full resolution. This is the fix for reinjection looking noisier than leaving it "
-                "off.\n\n"
-                "Why it works. Confidence is measured from only a couple of rays per pixel, and "
-                "the frame's ambient light gets multiplied by it in a pass that runs AFTER the "
-                "denoiser -- so the graininess lands in the final image untouched no matter which "
-                "denoiser is selected. Averaging 2x2 pixels together is four times the rays for "
-                "free, and on the smaller grid a much wider blur costs LESS than the old narrow "
-                "one did. Together that is about thirteen times the samples, i.e. roughly three "
-                "and a half times less flicker, for a little over half the GPU work.\n\n"
-                "It cannot smear. Nothing in this chain looks at the previous frame -- no history, "
-                "no motion vectors, no averaging over time -- so there is no trailing behind "
-                "moving objects at all. If you ever see a trail, that is a bug; please report it.\n\n"
-                "The cost is a slightly softer boundary between traced light and vanilla ambient. "
-                "It stays put instead of moving, and it is held off real edges by depth and normal "
-                "tests.\n\n"
-                "Turn it off to get the old full-resolution 7x7 path back exactly, for an A/B "
-                "comparison. Watch the 'SSRT Confidence Filter' row in the Performance Overlay to "
-                "confirm the new path is not costing more.");
+                "Removes most of the grain Ambient Reinjection can add, using a wide blur at lower resolution. "
+                "Cheap and never smears in motion; the edge between traced light and normal ambient gets slightly softer. Off = sharper but grainier.");
 
         // (batch 6) Forced off while the spatial filter runs: the two are competing answers to
         // one question, and the accumulator is the one with lag. Disabled rather than hidden so
@@ -356,27 +266,13 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::EndDisabled();
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Averages the hit-confidence signal over several frames as well as over space. "
-                "Kept only as a comparison, and off by default.\n\n"
-                "It removes the graininess, but it trails. Confidence describes the geometry "
-                "around a pixel, so the moment anything moves its correct value changes at once, "
-                "and an average over frames necessarily lags behind. Because the ambient light is "
-                "then multiplied by it, that lag shows up as bands of wrong brightness following "
-                "moving objects -- worse than the flicker it removes. No window length fixes that; "
-                "the averaging itself is the problem.\n\n"
-                "Use the Low-Resolution Confidence Filter above instead. It buys more samples "
-                "without looking at previous frames at all, so it does not trail.\n\n"
-                "Disabled while that filter is on, because the two are competing answers to the "
-                "same question. Turn the filter off if you want to try this one.");
+                "Alternative to the filter above that averages over several frames: removes grain, but leaves bands of wrong brightness trailing moving objects. "
+                "Off by default; only available with the Low-Resolution Confidence Filter turned off.");
 
         if (settings.TemporalAmbientConfidence && !settings.LowResConfidenceFilter) {
             ImGui::SliderInt("Confidence Frames", (int*)&settings.AmbientConfidenceMaxFrames, 1, 60, "%d", ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
-                ImGui::Text(
-                    "How many frames the confidence average covers. Noise falls with the square "
-                    "root of this, so 30 frames is about five and a half times cleaner than one "
-                    "frame; past that the returns are small and the signal takes longer to settle "
-                    "after the camera reveals new ground. 30 is a good default.");
+                ImGui::Text("How many frames are averaged. Higher = less grain but slower to catch up when the view changes; 30 is a good default.");
         }
     }
 
@@ -389,17 +285,13 @@ void ScreenSpaceRayTracing::DrawSettings()
     ImGui::SliderFloat("Thickness", &settings.Thickness, 0.0f, 500.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
-            "How far behind the validated surface, in game units (1 unit ~ 1.4 cm), a hit "
-            "still counts. Too low and grazing ground loses all confidence and falls back "
-            "to the cubemap; too high and light leaks through thin geometry and specular "
-            "reflections stretch behind silhouettes. The shader adds roughness * 10.");
+            "How thick objects are assumed to be when a ray passes behind them (game units, 1 unit ~ 1.4 cm). "
+            "Too low = traced light goes missing on ground and slopes; too high = light leaks through thin objects and reflections smear behind edges.");
     ImGui::SliderFloat("Normal Bias", &settings.NormalBias, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
-            "Pushes the ray origin off its own surface to avoid false self-hits, scaled "
-            "with distance and with the grazing angle. Raising it also makes rays miss "
-            "genuinely nearby geometry, so contact shading around hair and foliage gets "
-            "weaker as this goes up.");
+            "Starts each ray slightly off its surface so it does not hit itself. "
+            "Higher = fewer false dark speckles, but weaker contact shading around hair and foliage.");
     ImGui::SliderFloat("BRDF Bias", &settings.BRDFBias, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Specular only. Higher BRDF bias reduces noise but makes reflections more glossy.");
@@ -413,14 +305,8 @@ void ScreenSpaceRayTracing::DrawSettings()
     if (auto _tt = Util::HoverTooltipWrapper()) {
         if (settings.EnableAmbientReinjection)
             ImGui::Text(
-                "With Ambient Reinjection on, this no longer fills the missed directions by "
-                "itself -- the vanilla ambient does that. What it does instead is decide whether "
-                "the cubemap estimate gets built at all, which is what the \"Cubemap Fill Blend\" "
-                "slider under Ambient Energy needs in order to blend towards it.\n\n"
-                "So: off, or Cubemap Fill Blend at 0, and the frame is pure reinjection and this "
-                "costs nothing. On, with Cubemap Fill Blend above 0, and the missed directions "
-                "are filled from a mix of the two -- which costs one cubemap sample and one "
-                "Skylighting probe fetch per ray.");
+                "With Ambient Reinjection on, this only supplies the cubemap that \"Cubemap Fill Blend\" (under Ambient Energy) mixes in. "
+                "Off, or Fill Blend at 0, costs nothing.");
         else
             ImGui::Text("When ray marching misses, use dynamic cubemaps for reflections.");
     }
@@ -445,15 +331,9 @@ void ScreenSpaceRayTracing::DrawSettings()
         }
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Which denoiser processes the ray-traced light.\n\n"
-                "REBLUR (NVIDIA NRD) is the default: temporally stable, reconstructs "
-                "reflection motion correctly, slightly softer output.\n"
-                "SVGF is the previous in-house chain, kept for A/B comparison: sharper "
-                "in places but with longer trails behind moving objects.\n"
-                "Off shows the raw ray-traced signal — the performance baseline.\n\n"
-                "Switching takes about a second to settle (temporal history rebuilds). "
-                "If anything looks wrong on REBLUR, switching back to SVGF is the "
-                "immediate rollback.");
+                "What cleans up the grainy traced light. REBLUR (NVIDIA) = default, stable with clean reflections, slightly softer; "
+                "SVGF = the older built-in one, sharper in places but longer trails behind moving objects; Off = raw, noisy result.\n"
+                "Takes about a second to settle after switching.");
     }
 
     // (S1.3) One line of truth about what is actually running, whatever was asked for.
@@ -470,13 +350,12 @@ void ScreenSpaceRayTracing::DrawSettings()
         auto& nrdSvc = globals::features::nrd;
         if (!nrdSvc.loaded)
             ImGui::TextWrapped(
-                "NRD feature is not installed/loaded - install the NRD core feature to use "
-                "REBLUR. SVGF is running in its place.");
+                "The NRD feature is not installed or failed to load, so SVGF is running instead of REBLUR.");
         else if (!nrdSvc.settings.Enabled)
             ImGui::TextWrapped(
-                "NRD is disabled in its own feature page - SVGF is running in REBLUR's place.");
+                "NRD is turned off on its own feature page, so SVGF is running instead of REBLUR.");
         if (REL::Module::IsVR())
-            ImGui::TextWrapped("REBLUR is not available in VR (its guide surfaces are mono); SVGF runs instead.");
+            ImGui::TextWrapped("REBLUR is not available in VR; SVGF runs instead.");
 
         bool reblurChanged = false;
 
@@ -485,20 +364,8 @@ void ScreenSpaceRayTracing::DrawSettings()
             reblurChanged = true;
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Experimental, and the semantics are doubtful. Default off.\n\n"
-                "REBLUR's confidence input asks \"is the light I accumulated for this pixel still "
-                "the right light?\" and shortens its frame-to-frame averaging where the answer is "
-                "no. What we can hand it is a different measurement: what fraction of the "
-                "surrounding directions the screen-space rays actually managed to find geometry "
-                "in.\n\n"
-                "Those two disagree in the places that matter. Open ground and anything facing the "
-                "sky resolve very little geometry but have the steadiest light in the scene, so "
-                "this would shorten their averaging hardest -- exactly backwards. And with the "
-                "diffuse cubemap fallback on, the value is 1 everywhere, so the switch does "
-                "nothing at all in that configuration.\n\n"
-                "It is here so the difference can be seen rather than argued about: turn it on and "
-                "watch trailing behind moving objects (should shorten) against noise and blotching "
-                "on open ground (should get worse). Off is the shipping setting.");
+                "Experimental, off by default. Makes REBLUR average fewer frames where the rays found little nearby geometry: "
+                "trails behind moving objects may get shorter, but open ground gets noisier and blotchier. Does nothing while the diffuse cubemap fallback is on.");
         // (batch 36) The three REBLUR cost switches. All hot, all default on, and each one off is
         // the batch 34 behaviour for that piece.
         ImGui::SeparatorText("REBLUR Cost");
@@ -508,43 +375,25 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::Checkbox("Half-Resolution Diffuse Denoising (changes picture)", &settings.ReblurDiffuseHalfRes);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Changes the picture - compare it in game.\n\n"
-                "Denoises the ray-traced bounce light at half resolution (a quarter of the pixels) "
-                "and scales the result back up guided by depth. The rays are still traced at full "
-                "resolution and every 2x2 block is averaged first, so the denoiser starts from four "
-                "times the samples per pixel. Saves most of the diffuse half of REBLUR's cost.\n\n"
-                "What to look for: the bounce light on very thin things (grass blades, fences, "
-                "hair-thin branches) may pick up a little of their neighbours' light, and very "
-                "small contact details in the bounce light get softer. Textures, direct light, "
-                "reflections and AO are not affected.\n\n"
-                "Switching resets the diffuse denoiser's history (about a second to settle).");
+                "Cleans up the bounce light at half resolution to save GPU time. Changes the picture: bounce light on thin things "
+                "(grass, fences, branches) and small contact details gets slightly softer.\n"
+                "Off by default and will be removed in a later version.");
         {
             const bool halfRunning = diffuseHalfResActive && EffectiveDenoiser(false) == kDenoiserREBLUR;
             if (settings.ReblurDiffuseHalfRes && !halfRunning && EffectiveDenoiser(false) == kDenoiserREBLUR)
-                ImGui::TextDisabled("Not active this frame (shader or allocation failure - full resolution is running).");
+                ImGui::TextDisabled("Not running (failed to start, see the log); full resolution is used instead.");
         }
         ImGui::Checkbox("Fold Diffuse Unpack Into Composite", &settings.ReblurFoldDiffuseUnpack);
         if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Performance only - the picture should not change.\n\n"
-                "Skips one full-screen conversion pass after the diffuse denoiser: the final "
-                "diffuse composite reads the denoiser's output as it is and converts it itself. "
-                "Only matters at full resolution (the half-resolution path does the conversion "
-                "inside its upscale anyway).");
+            ImGui::Text("Saves GPU time by skipping one full-screen step after the bounce-light denoiser. The picture should not change.");
         ImGui::Checkbox("Direct Motion Vectors", &settings.ReblurDirectMotionVectors);
         if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Performance only - the picture should not change.\n\n"
-                "Lets the denoiser read the game's motion vectors directly instead of copying the "
-                "whole motion-vector screen every frame (and frees the copy's memory).");
+            ImGui::Text("Saves GPU time and some VRAM by skipping a full-screen copy every frame. The picture should not change.");
 
         if (ImGui::TreeNode("REBLUR Hit Distance Normalization")) {
             reblurChanged |= ImGui::SliderFloat("Hit Dist A (game units)", &settings.ReblurHitDistA, 1.0f, 1000.0f, "%.0f");
             if (auto _tt = Util::HoverTooltipWrapper())
-                ImGui::Text(
-                    "Constant term of REBLUR's hit-distance normalization, in game units "
-                    "(NRD default 3 m = 210 units). Together with B it sets the distance "
-                    "scale the denoiser considers 'far'.");
+                ImGui::Text("Advanced. The distance REBLUR treats as 'far' when judging traced light, in game units (NVIDIA's default 210 = 3 m). Works together with B.");
             reblurChanged |= ImGui::SliderFloat("Hit Dist B (per unit viewZ)", &settings.ReblurHitDistB, 0.0f, 1.0f, "%.3f");
             reblurChanged |= ImGui::SliderFloat("Hit Dist C (roughness scale)", &settings.ReblurHitDistC, 1.0f, 40.0f, "%.1f");
             ImGui::TreePop();
@@ -556,6 +405,8 @@ void ScreenSpaceRayTracing::DrawSettings()
         if (ImGui::TreeNode("REBLUR Specular (advanced)")) {
             reblurChanged |= nrdSvc.DrawReblurSettings(settings.ReblurSpecular, true, "ssrt_reblur_specular");
             reblurChanged |= ImGui::SliderFloat("Specular Pre-pass Radius", &settings.SpecularPrepassBlurRadius, 0.0f, 75.0f, "%.1f px");
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text("Blur applied to reflections before REBLUR's frame averaging. Higher = less noisy but blurrier reflections; 0 = off.");
             reblurChanged |= ImGui::Checkbox("Use Pre-pass Only for Motion Estimation", &settings.UsePrepassOnlyForSpecularMotionEstimation);
             ImGui::TreePop();
         }
@@ -570,141 +421,66 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::Checkbox("Pre-Blur", &settings.EnablePreBlur);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Diffuse only. Runs one small, very gentle smoothing step on the raw rays "
-                "*before* the frame-to-frame averaging looks at them, instead of only "
-                "afterwards.\n\n"
-                "Why it matters: the frame-to-frame average writes whatever it is given into a "
-                "buffer that the next frame reads back and averages again. Hand it a noisy "
-                "picture and the noise goes into that buffer, and every later decision -- how "
-                "much of the old frame to trust, how hard to smooth -- has to be made through "
-                "it. Taking the worst of the noise off first makes all of those decisions "
-                "better at once. Every commercial denoiser does this; ours was the odd one "
-                "out.\n\n"
-                "It is deliberately weak -- about a third of the blur one A Trous pass applies "
-                "-- because its job is to cut the extreme pixels, not to make things look "
-                "smooth. Expect a stationary shot to settle faster and cleaner, and moving "
-                "shots to stop dragging noise into the following seconds. Contact shadows and "
-                "creases should not soften; if they do, turn this off and say so.\n\n"
-                "The single-bright-pixel cleanup (Firefly Clamp) moves into this step while it "
-                "is on, so it still happens exactly once. With Firefly Clamp off, this step has "
-                "nothing stopping it from smearing a stray bright pixel across nine, so the two "
-                "are best left on together.");
+                "Bounce light only. A light blur on the raw rays before frames are averaged, so the image settles faster and motion drags less noise. "
+                "Best kept on together with Firefly Clamp.");
         ImGui::SliderInt("Max Accumulated Frames", (int*)&settings.MaxAccumulatedFrames, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text("How many past frames are averaged together. Higher = smoother and less noisy, but longer trails behind moving objects.");
         ImGui::SliderInt("À Trous Iterations", (int*)&settings.AtrousIterations, 1, 5, "%d", ImGuiSliderFlags_AlwaysClamp);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text("Number of À Trous wavelet filter iterations. More iterations yield smoother results but may blur details and have a higher computational cost.");
         ImGui::SliderFloat("Color Phi", &settings.ColorPhi, 0.01f, 32.0f, "%.2f");
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "How many standard deviations of luminance difference a neighbouring pixel "
-                "may have before the A Trous filter rejects it. A tap about 1 sigma away "
-                "differs by noise and should be averaged in; one 4 sigma away is a real "
-                "edge and should be rejected. At the default 2.0 those keep 61%% and 13%% of "
-                "their weight. Lower preserves more detail but retains noise -- below about "
-                "1.0 the filter starts treating its own noise as detail and stops averaging "
-                "at all. The SVGF paper uses 4.0, which is too loose for this pipeline's "
-                "shorter kernel chain.");
+                "How different in brightness neighbouring pixels can be and still be blurred together. "
+                "Lower = keeps more detail but leaves more noise (below about 1 it barely denoises); higher = smoother but blurrier.");
         ImGui::SliderFloat("Normal Phi", &settings.NormalPhi, 1.0f, 1024.0f, "%.2f");
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "How closely a neighbouring pixel's normal must match before the A Trous "
-                "filter will average it in. The weight is dot(n, nP) raised to this power, "
-                "so it is an angle: at the default 128 a tap keeps 1/e of its weight at "
-                "7.2 degrees and 2%% at 14. Raising it preserves detail the indirect light "
-                "does not actually carry, and above about 256 the filter stops averaging on "
-                "any normal-mapped surface -- which is most of Skyrim -- so extra iterations "
-                "buy nothing.");
+                "How closely surface directions must match for neighbouring pixels to be blurred together. "
+                "Higher = keeps more surface detail but denoises less (above about 256 it barely denoises bumpy surfaces).");
 
         ImGui::SliderFloat("Hit Distance Kernel Strength", &settings.HitRadiusStrength, 0.0f, 8.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Diffuse only. Makes the A Trous filter smooth less where the rays hit "
-                "something close by, and keep smoothing at full width where they went far or "
-                "missed entirely.\n\n"
-                "Why: light bouncing off a wall a foot away changes over a foot. Two pixels "
-                "further apart than that are lit by different things, so averaging them is a "
-                "blur, not a denoise -- that is contact shading and corner darkening getting "
-                "washed out. Light that came from the sky or from far away changes over "
-                "hundreds of feet, so there the widest possible average is both safe and "
-                "exactly where the leftover noise is. Until now the filter used the same width "
-                "for both.\n\n"
-                "At the default 4 a contact pixel gets about 60%% of the filter width and a "
-                "distant or missed one gets 100%% of it, unchanged to the last bit. It can only "
-                "ever narrow, never widen, and it never narrows to nothing -- the nearest ring "
-                "of neighbours always keeps at least a third of its weight, because contact "
-                "pixels are just as noisy as everything else. Raise it if contact shading still "
-                "looks washed out; 0 turns the whole thing off.");
+                "Bounce light only. Blurs less where the light came from something close, so contact shadows and dark corners stay crisp. "
+                "Higher = crisper contact shading; 0 = off.");
 
         ImGui::Checkbox("Firefly Clamp", &settings.FireflyClamp);
         if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Clamps single-pixel radiance outliers against their 3x3 neighbourhood "
-                "before the temporal accumulation sees them. Fireflies are the one artefact "
-                "the A Trous filter makes worse rather than better -- it spreads them into "
-                "slowly fading blobs -- so this is what keeps a low iteration count safe. "
-                "Turn off for a bit-exact classic SVGF temporal pass.");
+            ImGui::Text("Removes single overly bright pixels (fireflies) before they get smeared into slowly fading blobs. Recommended on.");
         if (settings.FireflyClamp) {
             ImGui::SliderFloat("Firefly Clamp Sigma", &settings.FireflyClampSigma, 1.0f, 8.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
                 ImGui::Text(
-                    "Standard deviations above the neighbourhood mean a pixel may reach before "
-                    "it counts as a firefly. Below 2.65 the clamp starts reaching values a "
-                    "neighbour also produced, i.e. real signal; higher values only catch the "
-                    "most extreme spikes.");
+                    "How much brighter than its neighbours a pixel must be to count as a firefly. "
+                    "Lower = removes more, but below about 2.65 it starts removing real highlights.");
         }
 
         ImGui::SliderFloat("History Clamp Sigma", &settings.HistoryClampSigma, 0.0f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "How far, in standard deviations, the reprojected history may sit outside "
-                "what this frame's 3x3 neighbourhood says the radiance can be. This is what "
-                "stops a moving object dragging stale lighting behind it: without it the "
-                "accumulation happily blends in history that is geometrically plausible but "
-                "radiometrically wrong, and the streak then takes Max Accumulated Frames to "
-                "fade.\n\n"
-                "At the default 1.0 a converged still image is untouched -- the clamp engages "
-                "on well under 1%% of pixels per frame -- while a ghost, whose error is of the "
-                "order of the local brightness itself, is cut on its first frame. Lower "
-                "shortens trails further but starts pulling the history back towards a "
-                "nine-sample mean and feeding that mean's noise into it, so below about 0.75 "
-                "you are trading convergence for motion. 0 disables the clamp.\n\n"
-                "0 is also the diagnostic bypass for this mechanism: the shader tests the "
-                "value itself, so 0 skips the clamp and its neighbourhood prefetch entirely. "
-                "Pair it with Disable History Depth Test under Debug to isolate the two "
-                "temporal mechanisms one at a time.");
+                "Stops old frames from leaving trails of stale lighting behind moving objects. "
+                "Lower = shorter trails but more noise (noticeable below about 0.75); 0 = off.");
 
         ImGui::Checkbox("Adaptive Filtering", &settings.AdaptiveFiltering);
         if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Lets an 8x8 tile whose pixels have all converged skip an À Trous iteration, "
-                "spending the filter only where the temporal accumulation is still noisy "
-                "(motion, disocclusion). Turn off for a bit-exact classic SVGF.");
+            ImGui::Text("Skips some blur work in areas that are already clean, for more FPS. Off = the classic SVGF behaviour.");
         if (settings.AdaptiveFiltering) {
             ImGui::SliderInt("Adaptive History Threshold", (int*)&settings.AdaptiveHistoryThreshold, 4, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
-                ImGui::Text("Accumulated frames a pixel needs before it may count as converged. Matching Max Accumulated Frames is a good default.");
+                ImGui::Text("How many frames a pixel must have been averaged before it can count as clean. Matching Max Accumulated Frames is a good default.");
             ImGui::SliderFloat("Adaptive Variance Threshold (relative)", &settings.AdaptiveVarianceEps, 1e-4f, 1.0f, "%.5f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
-                ImGui::Text(
-                    "Relative luminance variance below which a pixel counts as converged, "
-                    "measured against the pixel's own brightness (a squared coefficient of "
-                    "variation). The default 0.013 is a per-frame noise level of about 11%% "
-                    "of local brightness, which the temporal accumulation reduces to about "
-                    "2%% in the image -- the point where it stops being visible. Higher "
-                    "values skip more tiles at the cost of residual noise. Measuring this "
-                    "relative to brightness rather than absolutely is what keeps it a "
-                    "convergence test instead of a \"is this pixel dark\" test.");
+                ImGui::Text("How little noise a pixel may have to count as clean. Higher = skips more work for more FPS, but may leave visible noise.");
         }
 
         if (settings.EnableSpecular) {
             ImGui::SliderFloat("Specular Mirror Cutoff", &settings.SpecularDenoiseRoughnessCutoff, 0.0f, 0.25f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
                 ImGui::Text(
-                    "Roughness at or below which an 8x8 tile of specular pixels skips the A Trous "
-                    "kernel entirely. On a near-mirror the filter already discards every neighbour "
-                    "-- that is what the roughness scaling of Color Phi and Normal Phi is for -- so "
-                    "it computes the pixel it was handed. Skipping it removes the cost of water, "
-                    "glass and polished metal without changing what they look like. 0 disables.");
+                    "Mirror-like surfaces smoother than this (water, glass, polished metal) skip the denoiser blur, "
+                    "saving GPU time with no visible change. 0 = off.");
         }
     }
 #ifdef ENABLE_SHARC
@@ -718,35 +494,16 @@ void ScreenSpaceRayTracing::DrawSettings()
     ImGui::Checkbox("Blue Noise Sampling", &settings.UseBlueNoise);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
-            "Chooses how the ray directions are scrambled from pixel to pixel. On is the "
-            "default and costs nothing either way.\n\n"
-            "It does not reduce the amount of noise -- it moves it. Off, each pixel picks its "
-            "directions independently of its neighbours, so the leftover error comes out as "
-            "coarse patchy clumping: large soft blotches that drift about. Those are the one "
-            "kind of noise nothing downstream can remove, because the denoiser's kernel, the "
-            "upscaler and your own eye all work by averaging neighbours, and blotches are "
-            "already an average.\n\n"
-            "On, neighbouring pixels are made to disagree on purpose, so the same error comes "
-            "out as a fine even stipple instead -- which every one of those stages removes "
-            "almost completely.\n\n"
-            "Expect a visibly cleaner picture in motion and on first appearance, most obviously "
-            "on large dim surfaces. Turn it off to see the difference: watch the *shape* of the "
-            "grain, not its amount.");
+            "Turns leftover grain into a fine, even pattern instead of drifting blotches, which the denoiser and upscaler clean up much better. "
+            "Free; keep it on.");
 
     ImGui::SeparatorText("Debug");
 
     ImGui::Checkbox("Freeze Noise Phase", &settings.FreezeNoisePhase);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
-            "Diagnostic. Not for normal play.\n\n"
-            "Freezes the per-frame phase of the ray-direction noise, so every frame traces "
-            "the same sample directions instead of a fresh set. Use it to tell two causes of "
-            "directional smearing apart: smearing produced by the upscaler clamping a "
-            "changing stochastic signal along motion disappears when the phase is frozen, "
-            "while smearing produced by the denoiser's own temporal reprojection survives "
-            "unchanged.\n\n"
-            "Leaving this on locks the sampling noise into a fixed screen-space pattern that "
-            "no amount of accumulation can average away.");
+            "Diagnostic, not for normal play. Uses the same ray directions every frame, to tell whether smearing comes from the upscaler (goes away) "
+            "or the denoiser (stays). Leaving it on locks a fixed noise pattern onto the screen.");
 
     // (batch 11, item C3) The five temporal-history diagnostics, moved behind a collapsed node
     // and shown only while SVGF is the denoiser that reads them.
@@ -769,111 +526,40 @@ void ScreenSpaceRayTracing::DrawSettings()
     if (!AnyChainSVGF()) {
         ImGui::TextDisabled("SVGF history diagnostics: select the SVGF denoiser to reach them.");
         if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Five switches that steer the hand-written SVGF temporal pass, plus its history "
-                "debug view. That pass is not dispatched under REBLUR or Off, so none of them "
-                "would have any effect.\n\n"
-                "They cost no GPU time either way -- the shipped shader permutation compiles every "
-                "one of them out to a constant -- so this is about not offering controls that "
-                "silently do nothing.");
+            ImGui::Text("These switches only affect the SVGF denoiser, which is not running now.");
     } else if (ImGui::TreeNode("SVGF History Diagnostics")) {
         ImGui::Checkbox("Disable History Depth Test", &settings.DisableHistoryDepthTest);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Diagnostic. Not for normal play. Steers the SVGF temporal pass.\n\n"
-                "Switches off the geometric disocclusion test the temporal pass applies to every "
-                "history candidate -- the check that the surface point which occupied that history "
-                "texel last frame still lies in the plane of the surface being shaded now. "
-                "Everything else stays on: screen bounds, the 30 degree normal agreement and the "
-                "non-finite rejection, so the accumulation behaves exactly as it did before that "
-                "test existed.\n\n"
-                "Use it together with History Clamp Sigma 0 (which is the off switch for the "
-                "neighbourhood history clamp) to isolate the two mechanisms one at a time. Both "
-                "produce the same complaint -- \"the denoiser is not denoising, and there is no "
-                "ghosting either\" -- because both end with the pixel taking this frame's sample "
-                "whole, so only turning them off separately says which one is responsible.\n\n"
-                "With this off the accumulation will read history across depth discontinuities "
-                "again, i.e. the ghosting it was added to remove comes back. With the test on and "
-                "working, turning it off should now change very little: that is the check that the "
-                "plane criterion is accepting history instead of rejecting all of it.");
+                "Diagnostic, not for normal play. Turns off the depth check that stops SVGF reusing old frames across object edges (trails come back). "
+                "Try it and History Clamp Sigma 0 one at a time to find which one stops the image from settling.");
 
         ImGui::Checkbox("Disable History Normal Test", &settings.DisableHistoryNormalTest);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Diagnostic. Not for normal play. Steers the SVGF temporal pass.\n\n"
-                "Switches off the other geometric check the temporal pass applies to a history "
-                "candidate: that the surface facing this way last frame is still facing roughly "
-                "the same way now, within 30 degrees. Everything else stays on.\n\n"
-                "This is the partner of the switch above. Both checks produce the same complaint "
-                "when they go wrong -- the picture stays noisy and nothing accumulates -- so the "
-                "only way to tell them apart is to turn them off one at a time. Use History Debug "
-                "View to see which one to reach for first.");
+                "Diagnostic, not for normal play. Turns off the check that a surface still faces the same way as last frame. "
+                "History Debug View shows which check to try first.");
 
         ImGui::Checkbox("Force Accept History", &settings.ForceAcceptHistory);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Diagnostic. Not for normal play. Steers the SVGF temporal pass.\n\n"
-                "Takes whatever the motion vector points at, with no geometric checking at all. "
-                "Only three things can still turn a candidate away: it is off screen, it contains "
-                "a corrupt number, or it has nothing accumulated in it yet.\n\n"
-                "This is the last-resort test. The two switches above can each show that one check "
-                "is the thing blocking accumulation, but neither can show that the checks are the "
-                "*only* thing blocking it. If the picture still refuses to settle down with this "
-                "on, the problem is somewhere else entirely and the checks were never the "
-                "culprit.\n\n"
-                "Expect heavy smearing while it is on -- that is the point. Nothing is stopping the "
-                "filter from dragging lighting off a wall onto whatever walks in front of it.");
+                "Diagnostic, not for normal play. Reuses old frames with no checks at all, so expect heavy smearing. "
+                "If the image still will not settle with this on, the checks are not the problem.");
 
         ImGui::Checkbox("Rotated Normal Gate", &settings.RotatedNormalGate);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Diagnostic. Steers the SVGF temporal pass.\n\n"
-                "Changes which version of the 30 degree facing check runs.\n\n"
-                "Off (the default) is the version that has been shipping for months. It compares "
-                "surface directions without correcting for the camera having turned between the two "
-                "frames, so it is slightly too strict during fast turns and fine the rest of the "
-                "time. Well understood, mild when it misbehaves.\n\n"
-                "On is the mathematically correct version, which corrects for that camera turn. It "
-                "should be strictly better -- but only if an assumption about the game's own camera "
-                "matrices holds, and that cannot be checked outside the game.\n\n"
-                "That assumption is now checked at runtime, every frame, per pixel: the correction has "
-                "to leave a surface direction the same length it started, which nothing but a genuine "
-                "camera rotation does. Where the check fails the uncorrected version runs instead and "
-                "History Debug View paints the pixel magenta, so this switch can no longer take the "
-                "screen down with it -- the worst it can do now is quietly do nothing.\n\n"
-                "So it is off by default and this switch is how it gets proven. Turn it on with "
-                "History Debug View also on: no magenta means the correction is sound and safe to "
-                "adopt as the default; magenta everywhere means the assumption is wrong and off is "
-                "right.");
+                "Diagnostic. A more accurate facing check that allows for the camera turning, so fast turns keep more history. "
+                "Off by default; turn it on with History Debug View, and no magenta pixels means it works.");
 
         ImGui::Checkbox("History Debug View", &settings.HistoryDebugView);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
-                "Diagnostic. Needs the SVGF denoiser and Enable Diffuse.\n\n"
-                "Paints a picture of what the denoiser decided about every pixel's history this "
-                "frame, into texDebugHistory under Buffer Viewer below. It costs nothing while it "
-                "is off and it does not change what you see on screen either way.\n\n"
-                "Reading it:\n"
-                "  Grey, getting brighter over a second or two -- working. Brightness is how many "
-                "frames have been averaged together; white means fully settled.\n"
-                "  Red -- history thrown away by the depth/plane check.\n"
-                "  Green -- history thrown away by the 30 degree facing check.\n"
-                "  Blue -- history thrown away for being off screen, corrupt, or empty.\n"
-                "  Yellow or orange -- the plane check could not be set up for that pixel, so it was "
-                "skipped and the history was judged on facing and bounds alone. Any yellow means "
-                "\"test not run\", not \"history rejected\". The four shades say why: pale yellow -- "
-                "the point has no place in last frame's view at all; orange -- last frame's camera "
-                "cannot see it; dark orange -- the surface is exactly edge-on; lemon -- the tolerance "
-                "came out nonsense.\n"
-                "  Magenta -- only possible with Rotated Normal Gate on: the camera-turn correction "
-                "failed its own sanity check, so the uncorrected facing check ran instead.\n"
-                "  Black -- sky, or nothing to shade.\n\n"
-                "A few coloured pixels along edges and around moving things is normal and correct. "
-                "One flat colour covering the whole screen is the fault: it means that one check is "
-                "rejecting everything, everywhere, which leaves the denoiser doing nothing at all. "
-                "The colour tells you which switch above to reach for.\n\n"
-                "Shows the diffuse pass only. Specular shares the same buffer and deliberately "
-                "leaves it alone.");
+                "Diagnostic; needs the SVGF denoiser and Enable Diffuse. Shows what SVGF decided about each pixel's history in "
+                "texDebugHistory under Buffer Viewer; the game picture is not changed.\n"
+                "Grey = working (brighter = more settled). Red = rejected by the depth check, green = by the facing check, blue = off screen or empty. "
+                "Yellow/orange = depth check skipped. Magenta = Rotated Normal Gate correction failed. Black = sky.\n"
+                "A few colored pixels at edges is normal; one color over the whole screen means that check is the problem.");
 
         ImGui::TreePop();
     }
@@ -1032,16 +718,7 @@ void ScreenSpaceRayTracing::DrawSettings()
         } else {
             ImGui::TextDisabled("SVGF history buffers: select the SVGF denoiser to see them.");
             if (auto _tt = Util::HoverTooltipWrapper())
-                ImGui::Text(
-                    "Ten surfaces -- the two colour histories, the three moment buffers, the "
-                    "temporal and variance scratch, the normal and depth history snapshots and "
-                    "the history debug view -- are written only by the hand-written SVGF chain, "
-                    "which is not running. Nine of the ten have a viewer entry above.\n\n"
-                    "They are also not allocated. That is deliberate: they cost 68 bytes per "
-                    "output pixel between them (134.5 MiB at 1080p, 537.9 MiB at 4K) and are "
-                    "only released on a resolution change, so bringing them up just to show "
-                    "this panel would hold that memory for the rest of the session -- and six "
-                    "of them would show nothing but their cleared contents anyway.");
+                ImGui::Text("These buffers only exist while SVGF is running, to save VRAM (about 540 MB at 4K).");
         }
 
         // (batch C1) REBLUR-path scratch; null until REBLUR is first selected.
@@ -2120,7 +1797,7 @@ void ScreenSpaceRayTracing::ResolveDenoisers()
         case kDenoiserSVGF:
             if (a_svgfOk)
                 return kDenoiserSVGF;
-            denoiserFallbackReason = "the SVGF compute shaders are not available (check the log for a shader compile failure).";
+            denoiserFallbackReason = "SVGF failed to load (see the log).";
             return kDenoiserOff;
         case kDenoiserREBLUR:
         default:
@@ -2129,17 +1806,17 @@ void ScreenSpaceRayTracing::ResolveDenoisers()
             if (a_svgfOk) {
                 if (!denoiserFallbackReason) {
                     if (REL::Module::IsVR())
-                        denoiserFallbackReason = "REBLUR needs mono guide surfaces and this is VR.";
+                        denoiserFallbackReason = "REBLUR is not available in VR.";
                     else if (!globals::features::nrd.loaded)
                         denoiserFallbackReason = "the NRD feature is not loaded.";
                     else if (!globals::features::nrd.settings.Enabled)
                         denoiserFallbackReason = "NRD is switched off on its own feature page.";
                     else
-                        denoiserFallbackReason = "REBLUR could not be brought up (check the log for an NRD or shader failure).";
+                        denoiserFallbackReason = "REBLUR failed to start (see the log).";
                 }
                 return kDenoiserSVGF;
             }
-            denoiserFallbackReason = "neither REBLUR nor SVGF is available (check the log for shader compile failures).";
+            denoiserFallbackReason = "neither REBLUR nor SVGF could be loaded (see the log).";
             return kDenoiserOff;
         }
     };

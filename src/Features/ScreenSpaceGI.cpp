@@ -78,6 +78,8 @@ void ScreenSpaceGI::DrawSettings()
 		{
 			auto ilToggleGuard = Util::DisableGuard(!settings.Enabled);
 			recompileFlag |= ImGui::Checkbox("Indirect Lighting (IL)", &settings.EnableGI);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Light bouncing off nearby surfaces, e.g. a red wall tinting the floor red. Off = ambient occlusion only, which is cheaper.");
 		}
 		ImGui::TableNextColumn();
 		if (showAdvanced) {
@@ -175,10 +177,16 @@ void ScreenSpaceGI::DrawSettings()
 		if (ImGui::BeginTable("Less Work", 3)) {
 			ImGui::TableNextColumn();
 			recompileFlag |= ImGui::RadioButton("Full Res", &settings.ResolutionMode, 0);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Calculated at full resolution: sharpest and most stable, but the slowest.");
 			ImGui::TableNextColumn();
 			recompileFlag |= ImGui::RadioButton("Half Res", &settings.ResolutionMode, 1);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Calculated at half resolution: much faster, slightly softer.");
 			ImGui::TableNextColumn();
 			recompileFlag |= ImGui::RadioButton("Quarter Res", &settings.ResolutionMode, 2);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Calculated at quarter resolution: fastest, but blurrier and less stable.");
 
 			ImGui::EndTable();
 		}
@@ -191,19 +199,15 @@ void ScreenSpaceGI::DrawSettings()
 		auto visualGuard = Util::DisableGuard(!settings.Enabled);
 
 		ImGui::SliderFloat("AO Power", &settings.AOPower, 0.f, 6.f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("How dark the ambient occlusion (shadowing in corners and creases) is. Higher = darker, 0 = none.");
 
 		{
 			auto ilGuard = Util::DisableGuard(!settings.EnableGI);
 			ImGui::SliderFloat("IL Source Brightness", &settings.GIStrength, 0.f, 6.f, "%.2f");
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				std::vector<std::string> tooltipLines = {
-					"1.0 is one energy-correct screen-space bounce: the integrator is",
-					"analytically normalised, so a surface fully enclosed by unit radiance",
-					"receives exactly its own albedo.",
-					"Because the vanilla ambient term is still present and already",
-					"contains indirect light, the visually balanced value is usually below 1.",
-					"Settings carried over from before the normalisation need roughly 5x their",
-					"old value to look the same."
+					"How bright the bounced light is. 1.0 is physically correct, but the game's own ambient light already includes some bounce, so values below 1 usually look more balanced."
 				};
 				Util::DrawMultiLineTooltip(tooltipLines);
 			}
@@ -256,9 +260,7 @@ void ScreenSpaceGI::DrawSettings()
 			ImGui::SliderFloat("Thickness", &settings.Thickness, 0.f, 0.5f, "%.3f");
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				std::vector<std::string> tooltipLines = {
-					"How thick the occluders are, as a fraction of view depth.",
-					"Relative rather than absolute, so one value holds at every distance;",
-					"the old 32-unit default corresponds to 0.1 at around 320 units of depth.",
+					"How thick objects are assumed to be when they block light (scales with distance). Higher = fuller, darker shadowing; lower = light slips behind objects more easily.",
 					"Affects both AO and indirect light."
 				};
 				Util::DrawMultiLineTooltip(tooltipLines);
@@ -281,6 +283,8 @@ void ScreenSpaceGI::DrawSettings()
 		}
 
 		Util::PercentageSlider("IL Saturation", &settings.GISaturation);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Colour strength of the bounced light. Lower = less colour tinting from nearby surfaces.");
 	}
 
 	///////////////////////////////
@@ -292,19 +296,8 @@ void ScreenSpaceGI::DrawSettings()
 		recompileFlag |= ImGui::Checkbox("Enable Contact AO", &settings.EnableContactAo);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			std::vector<std::string> tooltipLines = {
-				"Adds the very small-scale shadows the main occlusion above is too coarse to see:",
-				"where hair touches a face, where clothing meets skin, where a window frame meets",
-				"the wall behind it.",
-				"",
-				"It always runs at full resolution, even when the setting above says half or",
-				"quarter, because a few centimetres is smaller than one pixel of a half-resolution",
-				"image. It has its own small smoothing over the last few frames, so it does not",
-				"sparkle and does not need anti-aliasing or upscaling to look right.",
-				"",
-				"The result is mixed into the same occlusion the rest of the game already uses, so",
-				"everything that reacts to occlusion picks it up automatically.",
-				"",
-				"Turning this off is free: nothing is computed and nothing is stored."
+				"Adds tiny contact shadows that the main AO is too coarse to catch: hair against a face, clothing against skin, a window frame against the wall.",
+				"Always runs at full resolution, even when SSGI is set to half or quarter. Small cost; off costs nothing."
 			};
 			Util::DrawMultiLineTooltip(tooltipLines);
 		}
@@ -324,12 +317,8 @@ void ScreenSpaceGI::DrawSettings()
 			ImGui::SliderFloat("Contact Radius", &settings.ContactRadius, 2.0f, 60.0f, "%.1f cm", ImGuiSliderFlags_AlwaysClamp);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				std::vector<std::string> tooltipLines = {
-					"How far this looks for something touching the surface, in real-world",
-					"centimetres. 15 cm is roughly the scale of a strand of hair against a cheek or",
-					"a fold of cloth against skin.",
-					"",
-					"Raising it starts doing the main occlusion's job with far fewer samples, which",
-					"looks less steady, not better. If you want wider shadows, use AO radius above."
+					"How far contact shadows reach, in centimetres. 15 cm suits hair and cloth.",
+					"Raising it makes them noisier, not better; for wider shadows raise AO radius instead."
 				};
 				Util::DrawMultiLineTooltip(tooltipLines);
 			}
@@ -337,12 +326,8 @@ void ScreenSpaceGI::DrawSettings()
 			ImGui::SliderFloat("Contact Strength", &settings.ContactStrength, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				std::vector<std::string> tooltipLines = {
-					"How dark these small contacts get. At 1.0 a tight contact goes fully dark and",
-					"an ordinary inside corner lands around 40% -- the upper half of the slider is",
-					"headroom, not the working range.",
-					"",
-					"0.0 leaves the shadows out but still pays for them; use the checkbox above to",
-					"turn it off properly."
+					"How dark contact shadows get. 1.0 is already strong; higher is rarely needed.",
+					"0 hides them but still costs performance; use the checkbox above to turn them off."
 				};
 				Util::DrawMultiLineTooltip(tooltipLines);
 			}
@@ -358,18 +343,8 @@ void ScreenSpaceGI::DrawSettings()
 		ImGui::Checkbox("Enable Directional Environment", &settings.EnableDirectionalEnv);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			std::vector<std::string> tooltipLines = {
-				"Rebuilds the ambient light from what each surface can actually see: every open",
-				"direction found by the occlusion scan samples the live environment map (sky",
-				"visibility included), and the results are averaged over the whole hemisphere.",
-				"Walls facing a doorway pick up the outside's colour and brightness, walls facing",
-				"away keep the room's, and shaded spots go dimmer and sky-toned on their own.",
-				"",
-				"Needs Screen Space GI enabled (this section rides on its occlusion scan) and",
-				"Dynamic Cubemaps installed. If Screen Space Ray Tracing's diffuse mode is active,",
-				"that takes over the same job and this channel steps aside automatically.",
-				"",
-				"Each direction is levelled against the game's own ambient, so at Level 1.0 the",
-				"overall brightness matches the flat ambient it replaces."
+				"Makes ambient light directional: each surface takes the colour and brightness of what it can see (sky, a bright doorway) instead of one flat ambient colour.",
+				"Needs Dynamic Cubemaps installed. Steps aside automatically while Screen Space Ray Tracing's diffuse light is on."
 			};
 			Util::DrawMultiLineTooltip(tooltipLines);
 		}
@@ -380,9 +355,7 @@ void ScreenSpaceGI::DrawSettings()
 			ImGui::SliderFloat("Environment Level", &settings.EnvLevel, 0.0f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				std::vector<std::string> tooltipLines = {
-					"Brightness of the environment-coloured ambient. 1.0 matches the level the old",
-					"flat ambient had, so nothing else needs re-tuning; raising it brightens the",
-					"ambient linearly without shifting its colour."
+					"Brightness of the directional ambient. 1.0 matches the game's normal ambient level; higher = brighter, same colour."
 				};
 				Util::DrawMultiLineTooltip(tooltipLines);
 			}
@@ -398,9 +371,13 @@ void ScreenSpaceGI::DrawSettings()
 		if (ImGui::BeginTable("denoisers", 2)) {
 			ImGui::TableNextColumn();
 			recompileFlag |= ImGui::Checkbox("Temporal Denoiser", &settings.EnableTemporalDenoiser);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Blends the result over several frames to remove grain and flicker. Off = noisy, but no trailing behind moving objects.");
 
 			ImGui::TableNextColumn();
 			ImGui::Checkbox("Blur", &settings.EnableBlur);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Smooths leftover grain in the bounced light (not the AO). Off = sharper but grainier.");
 
 			ImGui::EndTable();
 		}
@@ -411,14 +388,9 @@ void ScreenSpaceGI::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(
 				"Performance only - the picture should not change.\n\n"
-				"While Screen Space Ray Tracing's diffuse light is on, the final composite throws "
-				"this feature's indirect light away and keeps only its ambient occlusion. With this "
-				"on, the indirect light is not computed in the first place: only the AO (and the "
-				"contact AO) is worked out and denoised, so the two features stop paying for two "
-				"separate indirect-light denoisers.\n\n"
-				"If SSRT diffuse is switched off or cannot run, the full indirect light comes back "
-				"by itself.\n\n"
-				"Off is the previous behaviour, for comparison.");
+				"While Screen Space Ray Tracing's diffuse light is on, SSGI's bounced light is not used, "
+				"so this skips calculating it and keeps only the AO, for more FPS. "
+				"Does nothing while SSRT diffuse is off.");
 		{
 			const bool skipping = ShouldSkipIL();
 			ImGui::TextDisabled("%s", skipping ? "Now: AO only (SSRT diffuse supplies the indirect light)" :
@@ -437,11 +409,8 @@ void ScreenSpaceGI::DrawSettings()
 				ImGui::SliderInt("Max Frame Accumulation (AO)", (int*)&settings.MaxAccumFramesAO, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
 				if (auto _tt = Util::HoverTooltipWrapper())
 					ImGui::Text(
-						"Same as above, but for the ambient occlusion channel only.\n\n"
-						"AO is multiplicative and gets no spatial filtering of its own, so a long "
-						"temporal window drags a moving object's occlusion into a dark trail behind it. "
-						"4 is a compromise between that trailing and the flickering that returns at 1. "
-						"Set this equal to Max Frame Accumulation to restore the previous behaviour.");
+						"Same as above, but for ambient occlusion only. "
+						"Higher = less flicker, but moving objects leave a dark trail behind them.");
 			}
 
 			ImGui::Separator();
@@ -461,6 +430,8 @@ void ScreenSpaceGI::DrawSettings()
 			{
 				auto blurGuard = Util::DisableGuard(!settings.EnableBlur);
 				ImGui::SliderFloat("Blur Radius", &settings.BlurRadius, 0.f, 30.f, "%.1f px");
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("How wide the blur is. Higher = smoother bounced light, but small details get washed out.");
 
 				if (showAdvanced) {
 					ImGui::SliderFloat("Geometry Weight", &settings.DistanceNormalisation, 0.f, 5.f, "%.2f");

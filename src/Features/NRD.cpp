@@ -50,17 +50,15 @@ void NRD::RestoreDefaultSettings()
 void NRD::DrawSettings()
 {
 	ImGui::TextWrapped(
-		"NRD provides shared denoising infrastructure for screen-space "
-		"radiance signals. It is consumed by Screen Space Ray Tracing's "
-		"REBLUR denoiser path; select the denoiser there to control "
-		"whether denoising actually runs.");
+		"NVIDIA's REBLUR denoiser for Screen Space Ray Tracing. Whether it runs "
+		"is chosen there, with the Denoiser setting; its tuning options are there too.");
 
 	ImGui::Separator();
 	ImGui::Checkbox("Enabled", &settings.Enabled);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
-			"When disabled, NRD skips the guide preparation pass and consumer "
-			"features that depend on denoising will fall back to undenoised input.");
+			"Off = REBLUR is unavailable, and Screen Space Ray Tracing switches "
+			"to its other denoiser (SVGF) instead.");
 	}
 
 	if (ImGui::TreeNode("Buffer Viewer")) {
@@ -79,7 +77,7 @@ void NRD::DrawSettings()
 		if (texNRDMV)
 			BUFFER_VIEWER_NODE(texNRDMV, debugRescale)
 		if (!texNRDViewZ && !texNRDNormalRoughness && !texNRDMV)
-			ImGui::TextDisabled("The guides are allocated on first use; select the REBLUR denoiser in Screen Space Ray Tracing.");
+			ImGui::TextDisabled("Nothing to show until REBLUR is selected as the denoiser in Screen Space Ray Tracing.");
 
 		ImGui::TreePop();
 	}
@@ -439,50 +437,76 @@ bool NRD::DrawReblurSettings(REBLURSettings& s, bool showAdvanced, const char* t
 				s.MaxAccumulatedFrameNum = (uint32_t)v;
 				changed = true;
 			}
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("How many past frames are averaged together. Higher = cleaner and steadier, but lighting reacts more slowly and moving things can smear.");
 
 			v = (int)s.MaxFastAccumulatedFrameNum;
 			if (ImGui::SliderInt("Max Fast Accumulated Frames", &v, 1, (int)s.MaxAccumulatedFrameNum)) {
 				s.MaxFastAccumulatedFrameNum = (uint32_t)v;
 				changed = true;
 			}
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("A short backup history that catches quick lighting changes. Lower = reacts faster but noisier; setting it equal to the slider above turns it off.");
 
 			v = (int)s.MaxStabilizedFrameNum;
 			if (ImGui::SliderInt("Max Stabilized Frames", &v, 0, (int)s.MaxAccumulatedFrameNum)) {
 				s.MaxStabilizedFrameNum = (uint32_t)v;
 				changed = true;
 			}
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Extra smoothing over time on the final result to reduce shimmer. Higher = steadier but laggier; 0 = off.");
 		}
 
 		ImGui::SeparatorText("Spatial Filter");
 		{
 			changed |= ImGui::SliderFloat("Min Blur Radius", &s.MinBlurRadius, 0.0f, 10.0f, "%.1f px");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Blur size once the image has settled. Higher = smoother but softer.");
 			changed |= ImGui::SliderFloat("Max Blur Radius", &s.MaxBlurRadius, 0.0f, 60.0f, "%.1f px");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Blur size right after a change; it shrinks as the image settles. Higher = less grain in newly revealed areas, but blurrier.");
 			changed |= ImGui::SliderFloat("Lobe Angle Fraction", &s.LobeAngleFraction, 0.0f, 1.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("How freely the blur mixes surfaces facing different directions. Higher = smoother; lower = bumps and surface detail stay crisper, but noisier.");
 			changed |= ImGui::SliderFloat("Roughness Fraction", &s.RoughnessFraction, 0.0f, 1.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("How freely the blur mixes shiny and rough surfaces. Higher = smoother; lower = sharper material edges. Mainly matters for reflections.");
 			changed |= ImGui::SliderFloat("Plane Distance Sensitivity", &s.PlaneDistanceSensitivity, 0.0f, 0.1f, "%.4f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("How strictly the blur stops at depth edges between objects. Lower = sharper edges; higher = smoother, but can bleed across edges.");
 		}
 
 		ImGui::SeparatorText("Quality");
 		{
 			changed |= ImGui::SliderFloat("Fast History Clamping Sigma", &s.FastHistoryClampingSigmaScale, 1.0f, 3.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("How far old frames may drift from the current lighting before being pulled back. Lower = less ghosting and lag; higher = smoother.");
 			changed |= ImGui::SliderFloat("Min Hit Distance Weight", &s.MinHitDistanceWeight, 0.0001f, 0.2f, "%.4f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Higher = smoother, but small contact shadows and creases get blurred away. Lower keeps them, but noisier.");
 
 			int v = (int)s.HistoryFixFrameNum;
 			if (ImGui::SliderInt("History Fix Frame Num", &v, 0, 4)) {
 				s.HistoryFixFrameNum = (uint32_t)v;
 				changed = true;
 			}
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("For how many frames newly revealed areas (e.g. behind a moving object) get extra cleanup. Higher = less grain there, but softer.");
 
 			v = (int)s.HistoryFixBasePixelStride;
 			if (ImGui::SliderInt("History Fix Pixel Stride", &v, 1, 20)) {
 				s.HistoryFixBasePixelStride = (uint32_t)v;
 				changed = true;
 			}
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("How wide that extra cleanup reaches. Higher = smoother newly revealed areas, but blurrier.");
 		}
 
 		ImGui::SeparatorText("Debug");
 		{
 			changed |= ImGui::SliderFloat("Split Screen", &s.SplitScreen, 0.0f, 1.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Shows the raw, un-denoised image on the left part of the screen for comparison. 0 = off.");
 			changed |= ImGui::Checkbox("NRD Validation Overlay", &s.EnableValidation);
 			changed |= ImGui::Checkbox("Output History Length", &s.ReturnHistoryLength);
 

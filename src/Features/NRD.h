@@ -32,14 +32,13 @@ struct NRD : Feature
 	{
 		return std::make_pair(
 			std::string(
-				"NVIDIA Real-Time Denoisers (NRD) integration. Provides the shared "
-				"viewZ / normal+roughness / motion-vector guide textures and the "
-				"REBLUR denoiser plumbing used by features that produce noisy "
-				"radiance signals (Screen Space Ray Tracing)."),
+				"NVIDIA's REBLUR denoiser, which cleans up the grainy lighting and "
+				"reflections from Screen Space Ray Tracing. To use it, pick REBLUR as the "
+				"denoiser in Screen Space Ray Tracing; its tuning options are there too."),
 			std::vector<std::string>{
-				"Shared NRD guide textures",
-				"REBLUR denoiser infrastructure",
-				"Common camera/jitter/frame-index state" });
+				"Cleans up noisy ray-traced lighting and reflections",
+				"Used by Screen Space Ray Tracing (REBLUR denoiser)",
+				"Not available in VR" });
 	}
 
 	virtual void RestoreDefaultSettings() override;
