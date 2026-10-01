@@ -44,6 +44,8 @@ void DynamicCubemaps::DrawSettings()
 	if (ImGui::TreeNodeEx("Dynamic Cubemap Creator", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Text("You must enable creator mode by adding the shader define CREATOR");
 		ImGui::Checkbox("Enable Creator", reinterpret_cast<bool*>(&settings.EnabledCreator));
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Tool for mod authors: make a plain colour/roughness cubemap and export it. Not needed for normal play.");
 		if (settings.EnabledCreator) {
 			ImGui::ColorEdit3("Color", reinterpret_cast<float*>(&settings.CubemapColor));
 			ImGui::SliderFloat("Roughness", &settings.CubemapColor.w, 0.0f, 1.0f, "%.2f");

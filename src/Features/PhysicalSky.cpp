@@ -148,15 +148,25 @@ void PhysicalSky::SettingsGeneral()
 	ImGui::SeparatorText("Post Processing");
 	{
 		ImGui::InputFloat("Day Exposure", &settings.dayExposure);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Brightness of the sky and sun/moon light by day. Higher = brighter.");
 		settings.dayExposure = std::max(1e-10f, settings.dayExposure);
 		ImGui::InputFloat("Night Exposure", &settings.nightExposure);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Same, but at night. Higher = brighter nights.");
 		settings.nightExposure = std::max(1e-10f, settings.nightExposure);
 		ImGui::SliderAngle("Adaptation Start", &settings.adaptationStart, -90.f, 0.f);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Sun angle below the horizon where the switch from Day to Night Exposure begins.");
 		ImGui::SliderAngle("Adaptation End", &settings.adaptationEnd, -90.f, 0.f);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Sun angle below the horizon where Night Exposure is fully reached.");
 
 		if (ImGui::BeginTable("tonemap", 4, ImGuiTableFlags_SizingStretchSame, { -1, 0 })) {
 			ImGui::TableNextColumn();
 			ImGui::Text("Tonemapper");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How bright sky values are squeezed into display range. Ignored (always Linear) while Linear Lighting is on.");
 			ImGui::TableNextColumn();
 			ImGui::RadioButton("Linear", &settings.tonemapper, 0);
 			ImGui::TableNextColumn();
@@ -193,6 +203,8 @@ void PhysicalSky::SettingsCelestials()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(lightColorHint);
 		ImGui::Checkbox("Procedural Sun", &settings.proceduralSun);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Draws a physically-sized sun disk (size set below).");
 		ImGui::SliderAngle("Sun Disk Angular Radius", &settings.sunDiskRad, 0.f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Real world sun disk angular radius is about 0.27 degrees.");
@@ -289,8 +301,14 @@ void PhysicalSky::SettingsClouds()
 	InfoBox("Clouds.");
 
 	ImGui::SliderFloat("Vanilla Mix", &settings.cloudOriginalMix, 0.f, 2.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("How much of the clouds' original colour is kept.");
 	ImGui::SliderFloat("Relight Mix", &settings.cloudRelightMix, 0.f, 2.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("How much light from the physical sun/moons is added to the clouds.");
 	ImGui::SliderFloat("Silver Lining Accent", &settings.silverLiningMix, 0.f, 1.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Brightens clouds when looking toward the sun (bright cloud edges).");
 	ImGui::SliderFloat("Silver Lining Spread", &settings.silverLiningSpread, -0.99f, 0.99f, "%.2f");
 }
 
