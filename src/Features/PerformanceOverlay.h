@@ -179,6 +179,8 @@ struct PerformanceOverlay : OverlayFeature
 	virtual std::pair<std::string, std::vector<std::string>> GetFeatureSummary() override;
 	virtual void DrawSettings() override;
 	virtual void DataLoaded() override;
+	/// @brief (batch 36) Installs the engine hooks behind the "Engine passes (GPU)" table.
+	virtual void PostPostLoad() override;
 	void DrawOverlay() override;
 	// Settings persistence and defaults
 	void SaveSettings(json& j) override;
@@ -278,6 +280,8 @@ struct PerformanceOverlay : OverlayFeature
 	void DrawDrawCallsTable(const std::vector<DrawCallRow>& mainRows, const std::vector<DrawCallRow>& summaryRows);
 	void DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRows);
 	void DrawOurCpuPassTable(const std::vector<DrawCallRow>& ourCpuRows);
+	/// @brief (batch 36) The whole GPU frame split into engine stages (Util::GpuPhaseTimeline).
+	void DrawEngineGpuTable();
 	/// @brief CPU / GPU bottleneck readout drawn above the tables.
 	void DrawBottleneckSummary();
 	DrawCallLegends BuildDrawCallLegends(const Menu::ThemeSettings& theme, bool anyTestData) const;

@@ -19,6 +19,7 @@
 
 #include "Features/ScreenSpaceRayTracing.h"
 #include "Features/SubsurfaceScattering.h"
+#include "Utils/GpuPhaseTimeline.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Upscaling::NeuralRenderingSettings,
@@ -2176,12 +2177,21 @@ void Upscaling::Main_UpdateJitter::thunk(RE::BSGraphics::State* a_state)
 
 void Upscaling::MenuManagerDrawInterfaceStartHook::thunk(int64_t a1)
 {
-	globals::features::upscaling.PostDisplay();
+	{
+		Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsUpscaling);  // (batch 36) timeline row
+		globals::features::upscaling.PostDisplay();
+	}
 	func(a1);
 }
 
 void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32_t a3, RE::RENDER_TARGET a_target, void* a_4, bool a_5)
 {
+	// (batch 36) Everything of ours in here (upscaling, sharpening, the copies and syncs around
+	// them) is one row of the overlay's GPU frame timeline; the vanilla post chain in func()
+	// is left to the engine's imagespace row.
+	auto* gpuTimeline = Util::GpuPhaseTimeline::GetSingleton();
+	gpuTimeline->Push(Util::GpuScope::CsUpscaling);
+
 	auto& postProcessing = globals::features::postProcessing;
 	if (postProcessing.loaded) {
 		postProcessing.DrawBeforeUpscaling();
@@ -2208,7 +2218,9 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 
 	BSImagespaceShaderISTemporalAA->taaEnabled = upscaleMethod == UpscaleMethod::kTAA;
 
+	gpuTimeline->Pop(Util::GpuScope::CsUpscaling);
 	func(a_this, a3, a_target, a_4, a_5);
+	gpuTimeline->Push(Util::GpuScope::CsUpscaling);
 
 	if (upscaling.d3d12SwapChainActive) {
 		dx12SwapChain.upscalingFenceValue++;
@@ -2237,6 +2249,8 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 
 	// Disable TAA in some menus
 	BSImagespaceShaderISTemporalAA->taaEnabled = false;
+
+	gpuTimeline->Pop(Util::GpuScope::CsUpscaling);
 }
 
 void Upscaling::SetScissorRect::thunk(RE::BSGraphics::Renderer* This, int a_left, int a_top, int a_right, int a_bottom)
