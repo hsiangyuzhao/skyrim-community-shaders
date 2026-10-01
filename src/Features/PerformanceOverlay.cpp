@@ -422,6 +422,7 @@ void PerformanceOverlay::DrawOverlay()
 		DrawDrawCallsTable(rowSets.cpuRows, rowSets.summaryRows);
 		DrawOurCpuPassTable(rowSets.ourCpuRows);
 		DrawGpuPassTable(rowSets.gpuRows);
+		DrawEngineGpuSpans();
 		if (globals::features::grassOptimizations.loaded)
 			globals::features::grassOptimizations.DrawOverlayStats();
 	}
@@ -1621,6 +1622,58 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 		sorters,
 		rowHandler,
 		gpuSummaryRows);
+}
+
+/**
+ * @brief (batch 35, M1) The engine's own passes in which the Lighting shader runs.
+ *
+ * Kept out of the GPU Passes table on purpose: those rows sum to "Measured GPU", and these
+ * spans enclose some of them (Terrain Blending, the Grass Optimizations culls), so mixing
+ * them in would double count. They are a breakdown of what used to be "Untracked GPU".
+ */
+void PerformanceOverlay::DrawEngineGpuSpans()
+{
+	std::vector<Util::GpuSpanTimers::SpanReport> spans;
+	Util::GpuSpanTimers::GetSingleton()->ForEachActiveSpan(
+		[&spans](const Util::GpuSpanTimers::SpanReport& report) { spans.push_back(report); });
+	if (spans.empty())
+		return;
+
+	const float frameMs = globals::state->GetAttributionFrameTimeMs();
+
+	ImGui::Spacing();
+	ImGui::TextUnformatted("Engine passes (GPU)");
+	if (ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted(
+				"GPU time of the two engine passes the Lighting shader runs in, measured with a\n"
+				"timestamp pair around each. Not part of the GPU Passes sums above: the opaque\n"
+				"pass contains a few of our own rows, so adding it in would count them twice.\n"
+				"Measure with the frame rate uncapped and frame generation off, and compare the\n"
+				"same camera position with a setting on and off.");
+		}
+	}
+
+	if (ImGui::BeginTable("EngineGpuSpans", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
+		ImGui::TableSetupColumn("Pass");
+		ImGui::TableSetupColumn("GPU Time");
+		ImGui::TableSetupColumn("% of frame");
+		ImGui::TableHeadersRow();
+		for (const auto& span : spans) {
+			ImGui::TableNextColumn();
+			ImGui::TextUnformatted(span.label);
+			if (ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted(span.tooltip);
+				}
+			}
+			ImGui::TableNextColumn();
+			ImGui::Text("%.2f ms", span.smoothedMs);
+			ImGui::TableNextColumn();
+			ImGui::Text("%.1f%%", frameMs > 0.0f ? span.smoothedMs / frameMs * 100.0f : 0.0f);
+		}
+		ImGui::EndTable();
+	}
 }
 
 /**

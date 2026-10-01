@@ -355,6 +355,104 @@ namespace Util
 	};
 
 	/**
+	 * @brief (batch 35, M1) The engine's own GPU passes that contain our Lighting draws.
+	 *
+	 * GpuPassTimers only covers our compute passes; the opaque geometry pass and the shadow
+	 * map pass - the two places the Lighting shader actually runs - had no GPU row at all,
+	 * so a shader-side optimisation could only ever be judged by FPS. These two spans fix
+	 * that.
+	 */
+	enum class GpuSpan : int
+	{
+		GeometryOpaque = 0,  // Deferred::StartDeferred (after our prepasses) -> Deferred::EndDeferred
+		ShadowMaps,          // the engine's Main_RenderShadowMaps call
+		Count
+	};
+
+	/**
+	 * @brief Timestamp pairs around engine passes that may CONTAIN our own pass intervals.
+	 *
+	 * Same construction as GpuFrameTimer and for the same reason: GpuPassTimers opens a
+	 * disjoint query around each of our passes, and D3D11 forbids nesting queries, so a
+	 * span that encloses one of those passes (Terrain Blending and the Grass Optimizations
+	 * culls both run inside the opaque pass) must not hold a disjoint query open across
+	 * its length. Each marker therefore gets its own degenerate disjoint window, validity
+	 * comes from both windows reporting the same non-zero frequency, and a span is skipped
+	 * outright if a pass interval happens to be open at either marker.
+	 *
+	 * The result is ELAPSED GPU clock between the two markers, which for a pass the GPU is
+	 * busy with from end to end is its cost. Nested passes of ours are included and keep
+	 * their own rows. Render-thread only; free while the overlay table is hidden.
+	 */
+	class GpuSpanTimers
+	{
+	public:
+		static GpuSpanTimers* GetSingleton();
+
+		/// @brief Issues the begin marker. One interval per span per frame; extra calls are ignored.
+		void Begin(GpuSpan a_span);
+
+		/// @brief Issues the end marker. A no-op if the matching Begin was suppressed.
+		void End(GpuSpan a_span);
+
+		struct SpanReport
+		{
+			const char* label;
+			const char* tooltip;
+			float smoothedMs;
+		};
+
+		/// @brief Iterates spans that produced a sample recently, in enum order.
+		void ForEachActiveSpan(const std::function<void(const SpanReport&)>& a_callback);
+
+		void Reset();
+
+	private:
+		static constexpr int kFramesInFlight = 5;
+		static constexpr int kActiveTimeoutFrames = 60;
+		static constexpr float kSmoothingOld = 0.95f;
+		static constexpr float kSmoothingNew = 0.05f;
+		static constexpr double kMaxPlausibleMs = 2000.0;
+
+		struct Slot
+		{
+			winrt::com_ptr<ID3D11Query> disjointBegin;
+			winrt::com_ptr<ID3D11Query> disjointEnd;
+			winrt::com_ptr<ID3D11Query> timestampBegin;
+			winrt::com_ptr<ID3D11Query> timestampEnd;
+			bool pending = false;  // both markers issued, result not yet folded in
+			bool used = false;     // a Begin was issued into this slot this frame
+		};
+
+		struct Span
+		{
+			Slot slots[kFramesInFlight];
+			int openSlot = -1;
+			float smoothedMs = 0.0f;
+			uint64_t lastActiveFrame = 0;
+			bool hasSample = false;
+		};
+
+		enum class SlotStatus
+		{
+			NotReady,
+			Ready,
+			Invalid
+		};
+
+		bool OverlayWantsTimings() const;
+		bool EnsureQueries(Slot& a_slot) const;
+		void AdvanceFrameIfNew();
+		SlotStatus TryReadSlot(Slot& a_slot, float& a_outMs) const;
+
+		Span spans[static_cast<int>(GpuSpan::Count)];
+		Util::FrameChecker frameChecker;
+		uint64_t frameIndex = 0;
+		int writeSlot = 0;
+		ID3D11Device* queryDevice = nullptr;
+	};
+
+	/**
 	 * @brief Wall-clock (QueryPerformanceCounter) timing of Community Shaders' own CPU work.
 	 *
 	 * The overlay's CPU table attributes frame time by BSShader type, and it does so by

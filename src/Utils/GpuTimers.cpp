@@ -653,6 +653,258 @@ namespace Util
 	}
 
 	// ========================================================================
+	// GpuSpanTimers (batch 35, M1)
+	// ========================================================================
+
+	namespace
+	{
+		constexpr BucketInfo kSpanInfo[static_cast<int>(GpuSpan::Count)] = {
+			{ "Geometry (opaque)",
+				"GPU time of the engine's opaque geometry pass: from the moment our prepasses\n"
+				"finish to the start of the deferred composite. This is where almost every\n"
+				"Lighting draw runs, so it is the row to watch when toggling the batch 35\n"
+				"Lighting optimisations. Also contains the blended decals and the Terrain\n"
+				"Blending and Grass Optimizations work of ours that runs inside the pass (those\n"
+				"keep their own rows above).\n\n"
+				"Elapsed GPU clock between two timestamps, so read it with the frame rate\n"
+				"uncapped and frame generation off: a GPU waiting on the CPU inside the pass\n"
+				"would be counted too." },
+			{ "Shadow maps",
+				"GPU time of the engine's shadow map pass (sun cascades and shadow-casting point\n"
+				"lights). Lighting draws here run the depth-only path, so the alpha test is most\n"
+				"of what they do. Elapsed GPU clock between two timestamps, same caveats as the\n"
+				"geometry row." },
+		};
+	}
+
+	GpuSpanTimers* GpuSpanTimers::GetSingleton()
+	{
+		static GpuSpanTimers singleton;
+		return &singleton;
+	}
+
+	bool GpuSpanTimers::OverlayWantsTimings() const
+	{
+		return globals::d3d::device && globals::d3d::context && TableIsOnScreen();
+	}
+
+	bool GpuSpanTimers::EnsureQueries(Slot& a_slot) const
+	{
+		if (a_slot.disjointBegin && a_slot.disjointEnd && a_slot.timestampBegin && a_slot.timestampEnd)
+			return true;
+
+		auto device = globals::d3d::device;
+		if (!device)
+			return false;
+
+		D3D11_QUERY_DESC disjointDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+		D3D11_QUERY_DESC timestampDesc{ D3D11_QUERY_TIMESTAMP, 0 };
+
+		if (!a_slot.disjointBegin && FAILED(device->CreateQuery(&disjointDesc, a_slot.disjointBegin.put())))
+			return false;
+		if (!a_slot.disjointEnd && FAILED(device->CreateQuery(&disjointDesc, a_slot.disjointEnd.put())))
+			return false;
+		if (!a_slot.timestampBegin && FAILED(device->CreateQuery(&timestampDesc, a_slot.timestampBegin.put())))
+			return false;
+		if (!a_slot.timestampEnd && FAILED(device->CreateQuery(&timestampDesc, a_slot.timestampEnd.put())))
+			return false;
+		return true;
+	}
+
+	GpuSpanTimers::SlotStatus GpuSpanTimers::TryReadSlot(Slot& a_slot, float& a_outMs) const
+	{
+		auto context = globals::d3d::context;
+		if (!context)
+			return SlotStatus::Invalid;
+
+		const auto poll = [context](ID3D11Query* a_query, void* a_out, UINT a_size) {
+			return context->GetData(a_query, a_out, a_size, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+		};
+
+		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT beginData{}, endData{};
+		UINT64 beginTicks = 0, endTicks = 0;
+		HRESULT hr = poll(a_slot.disjointBegin.get(), &beginData, sizeof(beginData));
+		if (hr == S_FALSE)
+			return SlotStatus::NotReady;
+		if (FAILED(hr))
+			return SlotStatus::Invalid;
+		hr = poll(a_slot.disjointEnd.get(), &endData, sizeof(endData));
+		if (hr == S_FALSE)
+			return SlotStatus::NotReady;
+		if (FAILED(hr))
+			return SlotStatus::Invalid;
+		hr = poll(a_slot.timestampBegin.get(), &beginTicks, sizeof(beginTicks));
+		if (hr == S_FALSE)
+			return SlotStatus::NotReady;
+		if (FAILED(hr))
+			return SlotStatus::Invalid;
+		hr = poll(a_slot.timestampEnd.get(), &endTicks, sizeof(endTicks));
+		if (hr == S_FALSE)
+			return SlotStatus::NotReady;
+		if (FAILED(hr))
+			return SlotStatus::Invalid;
+
+		// Degenerate windows, as in GpuFrameTimer: the flag is respected, and the check that
+		// covers the span itself is the frequency matching at both ends.
+		if (beginData.Disjoint || endData.Disjoint)
+			return SlotStatus::Invalid;
+		if (beginData.Frequency == 0 || beginData.Frequency != endData.Frequency || endTicks < beginTicks)
+			return SlotStatus::Invalid;
+
+		const double ms = static_cast<double>(endTicks - beginTicks) * 1000.0 / static_cast<double>(beginData.Frequency);
+		if (ms > kMaxPlausibleMs)
+			return SlotStatus::Invalid;
+		a_outMs = static_cast<float>(ms);
+		return SlotStatus::Ready;
+	}
+
+	void GpuSpanTimers::AdvanceFrameIfNew()
+	{
+		if (!frameChecker.IsNewFrame())
+			return;
+
+		++frameIndex;
+		writeSlot = (writeSlot + 1) % kFramesInFlight;
+
+		for (auto& span : spans) {
+			// A Begin whose End never came (overlay hidden in between, an early return on
+			// the engine side) has an unpaired timestamp whose result would never be usable.
+			if (span.openSlot >= 0) {
+				span.slots[span.openSlot].pending = false;
+				span.slots[span.openSlot].used = false;
+				span.openSlot = -1;
+			}
+
+			for (int age = 0; age < kFramesInFlight; ++age) {
+				auto& slot = span.slots[(writeSlot + age) % kFramesInFlight];
+				if (!slot.pending)
+					continue;
+				float sampleMs = 0.0f;
+				switch (TryReadSlot(slot, sampleMs)) {
+				case SlotStatus::Ready:
+					span.smoothedMs = span.hasSample ? span.smoothedMs * kSmoothingOld + sampleMs * kSmoothingNew : sampleMs;
+					span.hasSample = true;
+					span.lastActiveFrame = frameIndex;
+					slot.pending = false;
+					slot.used = false;
+					break;
+				case SlotStatus::Invalid:
+					slot.pending = false;
+					slot.used = false;
+					break;
+				case SlotStatus::NotReady:
+					break;
+				}
+			}
+
+			// The slot about to be written must be free; a result that never arrived within
+			// the latency budget is dropped rather than waited for.
+			auto& reused = span.slots[writeSlot];
+			reused.pending = false;
+			reused.used = false;
+		}
+	}
+
+	void GpuSpanTimers::Reset()
+	{
+		for (auto& span : spans) {
+			for (auto& slot : span.slots) {
+				slot.disjointBegin = nullptr;
+				slot.disjointEnd = nullptr;
+				slot.timestampBegin = nullptr;
+				slot.timestampEnd = nullptr;
+				slot.pending = false;
+				slot.used = false;
+			}
+			span.openSlot = -1;
+			span.smoothedMs = 0.0f;
+			span.lastActiveFrame = 0;
+			span.hasSample = false;
+		}
+		frameIndex = 0;
+		writeSlot = 0;
+		queryDevice = nullptr;
+	}
+
+	void GpuSpanTimers::Begin(GpuSpan a_span)
+	{
+		if (!OverlayWantsTimings())
+			return;
+
+		if (queryDevice != globals::d3d::device) {
+			Reset();
+			queryDevice = globals::d3d::device;
+		}
+
+		AdvanceFrameIfNew();
+
+		auto& span = spans[static_cast<int>(a_span)];
+		if (span.openSlot >= 0)
+			return;
+
+		auto& slot = span.slots[writeSlot];
+		if (slot.used || slot.pending)
+			return;  // one interval per span per frame
+
+		// A disjoint query of ours must never open inside one of GpuPassTimers'.
+		if (GpuPassTimers::GetSingleton()->HasOpenInterval())
+			return;
+
+		if (!EnsureQueries(slot))
+			return;
+
+		auto context = globals::d3d::context;
+		context->Begin(slot.disjointBegin.get());
+		context->End(slot.timestampBegin.get());
+		context->End(slot.disjointBegin.get());
+
+		slot.used = true;
+		span.openSlot = writeSlot;
+	}
+
+	void GpuSpanTimers::End(GpuSpan a_span)
+	{
+		auto& span = spans[static_cast<int>(a_span)];
+		if (span.openSlot < 0)
+			return;
+
+		auto& slot = span.slots[span.openSlot];
+		span.openSlot = -1;
+
+		auto context = globals::d3d::context;
+		if (!context || GpuPassTimers::GetSingleton()->HasOpenInterval()) {
+			slot.used = false;
+			return;
+		}
+
+		context->Begin(slot.disjointEnd.get());
+		context->End(slot.timestampEnd.get());
+		context->End(slot.disjointEnd.get());
+		slot.pending = true;
+	}
+
+	void GpuSpanTimers::ForEachActiveSpan(const std::function<void(const SpanReport&)>& a_callback)
+	{
+		if (queryDevice && queryDevice != globals::d3d::device) {
+			Reset();
+			return;
+		}
+
+		// Also drives readback while no span is being issued any more, so a row times out.
+		if (OverlayWantsTimings())
+			AdvanceFrameIfNew();
+
+		for (int i = 0; i < static_cast<int>(GpuSpan::Count); ++i) {
+			const auto& span = spans[i];
+			if (!span.hasSample)
+				continue;
+			if (frameIndex - span.lastActiveFrame > static_cast<uint64_t>(kActiveTimeoutFrames))
+				continue;
+			a_callback(SpanReport{ kSpanInfo[i].label, kSpanInfo[i].tooltip, span.smoothedMs });
+		}
+	}
+
+	// ========================================================================
 	// CpuPassTimers
 	// ========================================================================
 
