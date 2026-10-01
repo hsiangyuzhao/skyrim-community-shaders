@@ -1714,6 +1714,7 @@ bool ScreenSpaceRayTracing::WantEfficiencyMode() const
         return false;
     return raymarchDiffuseCheckerCS && raymarchSpecularCheckerCS && nrdUnpackSpecEfficiencyCS &&
            diffuseCompositeB36BCS[2] && diffuseCompositeB36BCS[3] && prepareColorCS &&
+           DiffuseChainReady() && texColor && texSSRColor && texHitDistance &&
            ReblurStaticallyAvailable(false) && ReblurStaticallyAvailable(true);
 }
 
