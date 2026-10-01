@@ -32,6 +32,10 @@ struct StochasticOffsets
 	float2 offset2;
 	float2 offset3;
 	float3 weights;
+	// (batch 35, B3b) pow(saturate(weights), contrast) for StochasticEffect, computed once in
+	// ComputeStochasticOffsets instead of once per texture per layer. Only filled, and only
+	// read, while the switch is on.
+	float3 blendWeights;
 };
 
 // --------------------- FUNCTION DECLARATIONS --------------------- //
@@ -91,6 +95,12 @@ inline StochasticOffsets ComputeStochasticOffsets(float2 landscapeUV)
     offsets.offset3 = hash2D2D(BW_vx[2].xy);
     offsets.weights = BW_vx[3];
 
+    // (batch 35, B3b) The exact expression StochasticEffect used to evaluate for every texture
+    // of every layer; the inputs are per-pixel constants, so once is enough.
+    offsets.blendWeights = 0;
+    [branch] if (Batch35::IsOn(Batch35::HoistTerrainVariationPow))
+        offsets.blendWeights = pow(saturate(offsets.weights), HEIGHT_BLEND_CONTRAST * (1.0 - HEIGHT_INFLUENCE));
+
     return offsets;
 }
 
@@ -112,6 +122,7 @@ inline StochasticOffsets ComputeStochasticOffsetsLOD(float2 landscapeUV)
 
 	// Simplified weights since we only use 2 samples now
 	offsetsLOD.weights = float3(0.65, 0.35, 0.0);
+	offsetsLOD.blendWeights = 0;  // (batch 35) unused by the LOD sampler
 
 	return offsetsLOD;
 }
@@ -151,7 +162,11 @@ inline float4 StochasticEffect(Texture2D tex, SamplerState samp, float2 uv, Stoc
 
 	// Full height-based blending for terrain
 	float contrastFactor = HEIGHT_BLEND_CONTRAST * (1.0 - HEIGHT_INFLUENCE);
-	float3 blendWeights = pow(saturate(offsets.weights), contrastFactor);
+	float3 blendWeights;
+	[branch] if (Batch35::IsOn(Batch35::HoistTerrainVariationPow))
+		blendWeights = offsets.blendWeights;  // (batch 35, B3b) same expression, evaluated once
+	else
+		blendWeights = pow(saturate(offsets.weights), contrastFactor);
 
 	// Height calculation - use luminance for RGB data, alpha when available
 	float3 luminanceHeights = float3(

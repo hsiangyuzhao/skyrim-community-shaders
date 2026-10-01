@@ -1359,6 +1359,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			sharedOffset.offset2 = float2(0, 0);
 			sharedOffset.offset3 = float2(0, 0);
 			sharedOffset.weights = float3(0, 0, 0);
+			sharedOffset.blendWeights = float3(0, 0, 0);
 			[branch] if (useTerrainVariation)
 			{
 				dx = ddx(input.TexCoord0.zw);
@@ -1413,7 +1414,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		if (SharedData::extendedMaterialSettings.EnableShadows && (parallaxShadowQuality > 0.0f || SharedData::extendedMaterialSettings.ExtendShadows)) {
 #			if defined(TERRAIN_VARIATION)
 			sh0 = ExtendedMaterials::GetTerrainHeight(screenNoise, input, uv, mipLevels, displacementParams, parallaxShadowQuality, input.LandBlendWeights1, input.LandBlendWeights2.xy, sharedOffset, dx, dy, weights);
-			float shadowMultiplier = ExtendedMaterials::GetParallaxSoftShadowMultiplierTerrain(input, uv, mipLevels, DirLightDirection, sh0, parallaxShadowQuality, screenNoise, displacementParams, sharedOffset, dx, dy);
 #			else
 			sh0 = ExtendedMaterials::GetTerrainHeight(screenNoise, input, uv, mipLevels, displacementParams, parallaxShadowQuality, input.LandBlendWeights1, input.LandBlendWeights2.xy, weights);
 #			endif
@@ -3028,6 +3028,20 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (SharedData::extendedMaterialSettings.EnableTerrainParallax || (SharedData::extendedMaterialSettings.EnableParallax && Permutation::ExtraFeatureDescriptor & Permutation::ExtraFeatureFlags::THLandHasDisplacement)){
 #			endif
 #			if defined(TERRAIN_VARIATION)
+			// (batch 35, B3a) The GetTerrainHeight call below repeats the one that filled the
+			// outer sh0 next to GetParallaxCoords, argument for argument: same uv, mipLevels,
+			// displacementParams, parallaxShadowQuality, LandBlendWeights, sharedOffset, dx, dy,
+			// none of which change in between, and `weights` is out-only. The outer call is
+			// skipped only when parallaxShadowQuality == 0 without ExtendShadows, and then
+			// GetParallaxSoftShadowMultiplierTerrain returns 1 without reading sh0. So with the
+			// switch on the outer value is reused (the non-TERRAIN_VARIATION path below always
+			// did exactly that).
+			[branch] if (Batch35::IsOn(Batch35::ReuseTerrainHeight))
+			{
+				parallaxShadow = ExtendedMaterials::GetParallaxSoftShadowMultiplierTerrain(input, uv, mipLevels, dirLightDirectionTS, sh0, parallaxShadowQuality, screenNoise, displacementParams, sharedOffset, dx, dy);
+			}
+			else
+			{
 			float weights[6];
 			// Initialize weights array
 			weights[0] = weights[1] = weights[2] = weights[3] = weights[4] = weights[5] = 0.0;
@@ -3035,6 +3049,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float sh0 = ExtendedMaterials::GetTerrainHeight(screenNoise, input, uv, mipLevels, displacementParams, parallaxShadowQuality, input.LandBlendWeights1, input.LandBlendWeights2.xy, sharedOffset, dx, dy, weights);
 
 			parallaxShadow = ExtendedMaterials::GetParallaxSoftShadowMultiplierTerrain(input, uv, mipLevels, dirLightDirectionTS, sh0, parallaxShadowQuality, screenNoise, displacementParams, sharedOffset, dx, dy);
+			}
 #			else
 			// Standard terrain parallax shadow without stochastic sampling
 			parallaxShadow = ExtendedMaterials::GetParallaxSoftShadowMultiplierTerrain(input, uv, mipLevels, dirLightDirectionTS, sh0, parallaxShadowQuality, screenNoise, displacementParams);
