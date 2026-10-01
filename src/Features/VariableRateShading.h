@@ -14,8 +14,9 @@
  *   StartDeferred  -> BeginOpaquePass(): build this frame's rate image from last frame's
  *                     tile statistics (reprojected by motion), bind it.
  *   every draw     -> OnDraw(): per draw, pick the rate table (off / full / alpha-tested)
- *                     from the shader class, so only opaque Lighting / Grass / DistantTree
- *                     G-buffer draws are ever coarse-shaded.
+ *                     from the shader class, so only opaque, unblended Lighting / Grass /
+ *                     DistantTree G-buffer draws are ever coarse-shaded. Landscape (the
+ *                     multi-texture ground) is always full rate, see ClassifyDraw.
  *   EndDeferred    -> EndOpaquePass(): VRS off and unbound before any of our compute work.
  *                  -> AnalyzeFrame(): after the deferred composite, measure this frame's lit
  *                     scene per tile for the next frame; optional debug tint.
@@ -39,7 +40,7 @@ struct VariableRateShading : Feature
 			"Needs an NVIDIA RTX 20-series or newer GPU; not available in VR.",
 			{ "Adapts to the picture: lowers detail only where the last frame looked flat",
 				"Optional mode that lowers detail towards the screen edges",
-				"Only solid scene geometry is affected; shadows, UI and post-processing never are",
+				"Only solid objects are affected; the ground, shadows, UI and post-processing never are",
 				"Debug overlay showing where detail is lowered" }
 		};
 	}
@@ -66,6 +67,16 @@ struct VariableRateShading : Feature
 	};
 
 	Settings settings;
+
+	/// Runtime-only A/B switches for in-game diagnosis. Never saved, so a session always starts
+	/// with the fixed behaviour.
+	struct Diagnostics
+	{
+		bool CoarseTerrain = false;       // let landscape draws be coarse-shaded again (the 36a behaviour)
+		bool FullRateEverywhere = false;  // keep the whole VRS pipeline running but shade every draw at 1x1
+	};
+
+	Diagnostics diagnostics;
 
 	/// Mirrors RateCB in VariableRateShading/Common.hlsli.
 	struct alignas(16) RateCB
@@ -127,6 +138,7 @@ private:
 	bool IsActive() const;
 	void UpdateDrawState();
 	Table ClassifyDraw() const;
+	static bool IsAlphaBlendedDraw();
 	void ApplyTable(Table a_table);
 	void DisableForSession(std::string a_reason);
 	void ReadBackRateCounts();
