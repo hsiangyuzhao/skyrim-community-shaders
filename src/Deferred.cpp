@@ -18,6 +18,7 @@
 #include "Features/Upscaling.h"
 
 #include "Hooks.h"
+#include "Utils/Batch35.h"
 #include "Utils/GpuTimers.h"
 
 // CPU-side timing of our own work. Purely observational: every one of these is a
@@ -924,6 +925,8 @@ void Deferred::Hooks::Main_RenderFirstPersonView::thunk(bool a1, bool a2)
 void Deferred::Hooks::Renderer_ResetState::thunk(void* This)
 {
 	func(This);
+
+	++Batch35::rendererResetGeneration;
 
 	auto* const state = globals::state;
 	auto* const context = globals::d3d::context;

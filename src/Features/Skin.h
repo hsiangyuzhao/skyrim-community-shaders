@@ -94,6 +94,11 @@ struct Skin : Feature
 
 	std::unique_ptr<ConstantBuffer> PerGeometryCB;
 	float4 currentWetness = { 0.0f, 0.0f, 0.0f, 0.0f };
+	// (batch 35, C4) What PS b7 was last bound to, and when. PerGeometryCB is the only thing
+	// ever bound to PS b7, so one bind per frame (and after an engine state reset) suffices.
+	ID3D11Buffer* boundPerGeometryCB = nullptr;
+	uint32_t boundResetGeneration = 0;
+	Util::FrameChecker perGeometryBindFrame;
 	float playerStamina = 0.0f;
 	float playerStaminaMax = 0.0f;
 

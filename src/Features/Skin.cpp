@@ -7,6 +7,7 @@
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/Batch35.h"
 
 #include "DynamicWetness_PublicAPI.h"
 
@@ -663,7 +664,17 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 		}
 
 		ID3D11Buffer* buffer = { PerGeometryCB->CB() };
-		context->PSSetConstantBuffers(7, 1, &buffer);
+		// (batch 35, C4) The buffer object never changes (Update maps it in place), and no
+		// other code binds PS b7, so re-binding it before every skin draw was redundant. Bind
+		// on the first draw of a frame, after an engine state reset, or if the buffer itself
+		// was recreated. The frame check runs every draw so it stays in step either way.
+		const bool newFrame = perGeometryBindFrame.IsNewFrame();
+		if (!Batch35::IsOn(Batch35::CpuItem::SkinBindOncePerFrame) || newFrame ||
+			boundPerGeometryCB != buffer || boundResetGeneration != Batch35::rendererResetGeneration) {
+			context->PSSetConstantBuffers(7, 1, &buffer);
+			boundPerGeometryCB = buffer;
+			boundResetGeneration = Batch35::rendererResetGeneration;
+		}
 	}
 }
 

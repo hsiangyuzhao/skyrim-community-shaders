@@ -105,6 +105,10 @@ namespace Batch35
 
 	inline Settings settings{};
 
+	/// Bumped by Deferred's Renderer_ResetState hook. A binding that is made once and then
+	/// trusted for the rest of the frame (C4) is redone after an engine state reset as well.
+	inline uint32_t rendererResetGeneration = 0;
+
 	/// @brief The value uploaded as SharedData::Batch35Flags this frame.
 	inline uint32_t GetGpuFlags()
 	{
