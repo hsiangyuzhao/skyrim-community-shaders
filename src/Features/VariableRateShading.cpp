@@ -4,6 +4,7 @@
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/Batch36.h"
 #include "Utils/GpuTimers.h"
 
 // NVAPI is only used for its types; every entry point is resolved at runtime through the
@@ -194,7 +195,8 @@ void VariableRateShading::RestoreDefaultSettings()
 
 bool VariableRateShading::IsActive() const
 {
-	return loaded && settings.Enabled && hardwareSupported && !shaderFailed && rateCB;
+	// The Batch 36 master switch can only force VRS off, never on.
+	return loaded && settings.Enabled && Batch36::IsOn() && hardwareSupported && !shaderFailed && rateCB;
 }
 
 void VariableRateShading::SetupResources()
@@ -465,23 +467,51 @@ VariableRateShading::Table VariableRateShading::ClassifyDraw() const
 	if (state->permutationData.ExtraShaderDescriptor & static_cast<uint32_t>(State::ExtraShaderDescriptors::IsReflections))
 		return Table::Off;
 
+	if (diagnostics.FullRateEverywhere)
+		return Table::Off;
+
+	using Technique = SIE::ShaderCache::LightingShaderTechniques;
 	const uint32_t pixelDescriptor = state->currentPixelDescriptor;
 	switch (shader->shaderType.get()) {
 	case RE::BSShader::Type::Lighting:
 		{
+			const auto technique = static_cast<Technique>((pixelDescriptor >> 24) & 0x3F);
+
+			// Landscape (the multi-texture ground of the loaded cells) is never coarse-shaded.
+			// Terrain Blending draws it last, alpha-blended, with an alpha computed per pixel
+			// from SV_Position.z against the prepass depth read at SV_Position.xy. Under a coarse
+			// rate both describe the coarse-pixel centre, not the pixel: the exact-equality test
+			// distant terrain relies on fails, the alpha drops to 0 for the whole block and the
+			// ground turns see-through, leaving only the fog / aerial-perspective colour of its
+			// depth (pale, sky-coloured blocks on distant ground, clipped to whatever stands in
+			// front). One alpha per block cannot represent a per-pixel depth comparison.
+			// The landscape shader is also the most sensitive to attribute extrapolation (blend
+			// weights renormalised, vertex colour divided by its own maximum); Lighting.hlsl
+			// reads those centroid-interpolated, which covers the other coarse-shaded draws.
+			if (technique == Technique::MTLand || technique == Technique::MTLandLODBlend)
+				return diagnostics.CoarseTerrain ? Table::Full : Table::Off;
+
+			// Anything blended writes a per-pixel alpha; one coarse alpha per block would
+			// cut or fade whole blocks (blended decals and the like).
+			if (IsAlphaBlendedDraw())
+				return Table::Off;
+
 			// AdditionalAlphaMask is the 4x4 screen-door dither of a fading object; a coarse
 			// pixel would turn it into visible 2x2 blocks, so it counts as alpha-tested too.
+			// MultiIndexSparkle can discard (projected sparkle), so it is a cut-out as well.
 			constexpr uint32_t cutOut = static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::DoAlphaTest) |
 			                            static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::AdditionalAlphaMask);
-			if (pixelDescriptor & cutOut)
+			if ((pixelDescriptor & cutOut) || technique == Technique::MultiIndexSparkle)
 				return settings.IncludeAlphaTested ? Table::AlphaTested : Table::Off;
 			return Table::Full;
 		}
 	case RE::BSShader::Type::Grass:
-		if (!settings.IncludeGrass)
+		if (!settings.IncludeGrass || IsAlphaBlendedDraw())
 			return Table::Off;
 		return (pixelDescriptor & static_cast<uint32_t>(SIE::ShaderCache::GrassShaderFlags::AlphaTest)) ? Table::AlphaTested : Table::Full;
 	case RE::BSShader::Type::DistantTree:
+		if (IsAlphaBlendedDraw())
+			return Table::Off;
 		if (pixelDescriptor & static_cast<uint32_t>(SIE::ShaderCache::DistantTreeShaderFlags::AlphaTest))
 			return settings.IncludeAlphaTested ? Table::AlphaTested : Table::Off;
 		return Table::Full;
@@ -489,6 +519,15 @@ VariableRateShading::Table VariableRateShading::ClassifyDraw() const
 		// Sky, water, effects, particles, utility (shadow / depth), image space, ...
 		return Table::Off;
 	}
+}
+
+bool VariableRateShading::IsAlphaBlendedDraw()
+{
+	// The engine's requested blend mode for this draw; State::Draw runs right after
+	// BSGraphics::SetDirtyStates applied it, so it describes the draw about to be issued.
+	auto shadowState = globals::game::shadowState;
+	GET_INSTANCE_MEMBER(alphaBlendMode, shadowState)
+	return alphaBlendMode != 0;
 }
 
 void VariableRateShading::UpdateDrawState()
@@ -647,8 +686,11 @@ void VariableRateShading::DrawSettings()
 
 	ImGui::Checkbox("Enable", &settings.Enabled);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Draws flat, low-detail parts of the scene with fewer pixel-shader runs to save GPU time; off by default because it changes the image.");
+		ImGui::Text("Lowers shading detail on flat, low-detail parts of the scene to save GPU time. Off by default because it can make parts of the image softer; needs an NVIDIA RTX 20-series or newer card.");
 	}
+
+	if (settings.Enabled && !Batch36::IsOn())
+		ImGui::TextColored(palette.Warning, "Forced off: the Batch 36 master switch is off (Advanced > Batch 36).");
 
 	ImGui::BeginDisabled(!settings.Enabled);
 
@@ -670,19 +712,19 @@ void VariableRateShading::DrawSettings()
 
 		ImGui::SliderFloat("Motion Boost", &settings.MotionPixels, 0.0f, 32.0f, settings.MotionPixels > 0.0f ? "%.0f px/frame" : "Off");
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Fast-moving parts of the screen may drop more detail; this is the speed at which the allowance doubles, 0 turns it off.");
+			ImGui::Text("Lets fast-moving parts of the screen drop more detail, since motion hides it. Lower values = stronger effect, more savings; 0 turns it off.");
 		}
 
 		ImGui::Checkbox("Protect Normal Detail", &settings.ProtectNormals);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Keeps bumpy surfaces at full detail so screen-space lighting (SSGI, SSRT) still sees crisp normals; turning it off saves a bit more.");
+			ImGui::Text("Keeps bumpy surfaces at full detail so screen-space lighting (SSGI, SSRT) still sees their fine surface shape. Turning it off saves a bit more.");
 		}
 	}
 
 	if (settings.RateMode != static_cast<uint32_t>(Mode::Adaptive)) {
 		ImGui::SliderFloat("Full-Detail Centre Size", &settings.PeripheryRadius, 0.1f, 2.0f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Radius of the screen centre that always stays at full detail, in half screen heights (1.0 touches the top and bottom).");
+			ImGui::Text("Size of the circle in the middle of the screen that always stays at full detail. 1.0 reaches the top and bottom edges.");
 		}
 	}
 
@@ -691,7 +733,7 @@ void VariableRateShading::DrawSettings()
 	if (ImGui::Combo("Coarsest Rate", &coarsest, rates, IM_ARRAYSIZE(rates)))
 		settings.CoarsestRate = static_cast<uint32_t>(coarsest);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("The biggest pixel block one shading result may cover; 4x4 saves more but can look blocky.");
+		ImGui::Text("The largest block of pixels that may share one shading result. 4x4 saves more but can look blocky.");
 	}
 
 	ImGui::SeparatorText("What to include");
@@ -706,7 +748,7 @@ void VariableRateShading::DrawSettings()
 		ImGui::Text("Also lowers detail on leaves, hair, fences and distant trees, whose cut-out edges can look blocky (capped at 2x2).");
 	}
 
-	ImGui::TextDisabled("Never affected: shadows, depth prepass, sky, water, transparent effects, UI, post-processing.");
+	ImGui::TextDisabled("Never affected: the ground, blended decals, shadows, sky, water, transparent effects, UI, post-processing.");
 
 	ImGui::SeparatorText("Debug");
 
@@ -740,9 +782,21 @@ void VariableRateShading::DrawSettings()
 			}
 			ImGui::Text("Opaque pixel-shader work: about %.0f%% of full rate", 100.0f * work / total);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Upper bound for the included objects; excluded draws (grass, cut-outs when off) still shade every pixel.");
+				ImGui::Text("Counts screen tiles, not objects. Anything excluded (the ground, and grass or cut-outs when off) still runs at full detail, so the real saving is smaller.");
 			}
 		}
+	}
+
+	ImGui::SeparatorText("Diagnostics (not saved)");
+
+	ImGui::Checkbox("Diagnostic: Coarse Ground (old)", &diagnostics.CoarseTerrain);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Lets the ground drop detail again, like the previous build. Only for checking whether the pale blocks on distant ground come back; leave off for normal play.");
+	}
+
+	ImGui::Checkbox("Diagnostic: Full Detail Everywhere", &diagnostics.FullRateEverywhere);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Keeps all of VRS running but shades everything at full detail. If a problem stays with this on, VRS lowering detail is not what causes it.");
 	}
 
 	ImGui::EndDisabled();
