@@ -63,6 +63,20 @@ public:
 	uint32_t dlssGConfiguredOutputHeight = 0;
 	uint32_t dlssGTaggedInputWidth = 0;
 	uint32_t dlssGTaggedInputHeight = 0;
+
+	// Multi-frame generation. All counts here are Streamline's numFramesToGenerate, i.e. the
+	// presentation multiplier minus one (1 = 2x, 2 = 3x, 3 = 4x).
+	//
+	// The ceiling is whatever slDLSSGGetState last reported in numFramesToGenerateMax; 0 means
+	// no report has arrived yet, and until one does only 2x is requested. The applied count is
+	// the value slDLSSGSetOptions last accepted, which is what the overlay reports as the
+	// running mode. A rejected count is one that either SetOptions refused or that put DLSS-G
+	// into an invalid runtime state; it is held at 2x until the user picks a multiplier again
+	// or the reported ceiling changes, so a failing request is not retried every frame.
+	uint32_t dlssGFramesToGenerateMax = 0;
+	uint32_t dlssGAppliedFramesToGenerate = 1;
+	uint32_t dlssGRejectedFramesToGenerate = 0;
+	uint32_t dlssGCapabilityQueryCooldown = 0;
 	bool dlssSRLocalTagsLogged = false;
 	bool dlssRRLocalTagsLogged = false;
 
@@ -192,12 +206,36 @@ public:
 	/**
 	 * @brief Enables or disables non-VR DLSS-G in the current viewport.
 	 *
-	 * DLSS-G is deliberately fixed to 2x (one generated frame per rendered
-	 * frame).  Turning it off retains plugin resources to avoid a pause/menu
-	 * stutter; long-term shutdown can call DestroyDLSSGResources().
+	 * @param a_framesToGenerate Requested generated frames per rendered frame
+	 *        (multiplier - 1). Clamped to the reported ceiling; a rejected
+	 *        multi-frame request is retried once at 2x before the session-wide
+	 *        fallback is considered. Ignored when disabling: eOff keeps the
+	 *        count last accepted, so a menu suspend/resume changes only the mode.
+	 *
+	 * Must be called on the presenting thread. Changing the multiplier is a
+	 * plain slDLSSGSetOptions update; no resources or swap chain are rebuilt.
+	 * Turning it off retains plugin resources to avoid a pause/menu stutter;
+	 * long-term shutdown can call DestroyDLSSGResources().
 	 */
-	bool SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff = true);
+	bool SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff = true, uint32_t a_framesToGenerate = 1);
 	bool GetDLSSGState(sl::DLSSGState& a_state);
+
+	/// @brief Queries numFramesToGenerateMax without judging the runtime status.
+	///
+	/// Unlike GetDLSSGState this never triggers the session fallback, so it is safe before the
+	/// first generated Present. It does consume the numFramesActuallyPresented counter, so it is
+	/// only called while generation is not running (the per-Present query covers that case).
+	bool RefreshDLSSGCapabilities();
+	/// @brief Highest numFramesToGenerate DLSS-G reported, or 0 before any report.
+	uint32_t GetDLSSGFramesToGenerateMax() const { return dlssGFramesToGenerateMax; }
+	/// @brief numFramesToGenerate last accepted by slDLSSGSetOptions (1 = 2x).
+	uint32_t GetDLSSGAppliedFramesToGenerate() const { return dlssGAppliedFramesToGenerate; }
+	/// @brief numFramesToGenerate that was rejected and degraded to 2x, or 0.
+	uint32_t GetDLSSGRejectedFramesToGenerate() const { return dlssGRejectedFramesToGenerate; }
+	/// @brief Lets a previously rejected multiplier be tried again (called when the user re-selects).
+	void ClearDLSSGMultiFrameRejection() { dlssGRejectedFramesToGenerate = 0; }
+	/// @brief The count SetDLSSGMode would request for a_requested right now.
+	uint32_t ResolveDLSSGFramesToGenerate(uint32_t a_requested) const;
 	bool TagDLSSGResources(const DLSSGFrameResources& a_resources, ID3D12GraphicsCommandList* a_commandList);
 	void DestroyDLSSGResources(bool a_modeSwitch = true);
 
@@ -242,6 +280,7 @@ public:
 
 private:
 	void FallbackDLSSG(const char* a_reason, sl::Result a_result, sl::DLSSGStatus a_status);
+	void UpdateDLSSGFramesToGenerateMax(uint32_t a_reportedMax);
 	sl::Result SetTagsForCurrentFrame(const sl::ResourceTag* a_tags, uint32_t a_numTags, ID3D12GraphicsCommandList* a_commandList);
 	sl::Result SetTagsForLatchedFrame(const sl::ResourceTag* a_tags, uint32_t a_numTags, ID3D12GraphicsCommandList* a_commandList);
 };

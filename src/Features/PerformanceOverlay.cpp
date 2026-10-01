@@ -203,7 +203,7 @@ void PerformanceOverlay::DrawSettings()
 			ImGui::Checkbox("Show Post-FG Frametime Graph", &this->settings.ShowPostFGFrameTimeGraph);
 			if (ImGui::IsItemHovered()) {
 				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("FSR Frame Generation uses calculated timing data (2x Pre-FG).\nDLSS Frame Generation provides measured timing data.");
+					ImGui::Text("FSR Frame Generation uses calculated timing data (2x Pre-FG).\nDLSS Frame Generation provides measured timing data at whatever\nmultiplier it is running.");
 				}
 			}
 		} else if (this->settings.ShowFPS) {
@@ -515,9 +515,32 @@ void PerformanceOverlay::DrawFPS()
 					this->state.postFGSmoothFps, this->state.postFGSmoothFrameTimeMs);
 				if (ImGui::IsItemHovered()) {
 					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("Estimate, not a measurement: the backend reports no\npresentation cadence, so a fixed %.0fx multiplier is\nassumed. Raw FPS, Avg and 1%% Low above are always\nmeasured pre-frame-generation values.",
-							Settings::kFrameGenerationMultiplier);
+						ImGui::Text("Estimate, not a measurement: the backend reports no\npresentation cadence, so its configured %.0fx multiplier is\nassumed. Raw FPS, Avg and 1%% Low above are always\nmeasured pre-frame-generation values.",
+							this->state.postFGMultiplier);
 					}
+				}
+			}
+
+			// The mode the backend accepted, beside what it measurably presents. This is the
+			// line that answers "is my multiplier actually running": the setting can ask for 4x
+			// while DLSS-G only reports 2x (or refused more), and then this reads 2x.
+			ImGui::TableNextColumn();
+			ImGui::Text("FG Mode:");
+			ImGui::TableNextColumn();
+			if (this->state.postFGIsMeasured)
+				ImGui::Text("%ux (measured %.2fx)", this->state.appliedFGMultiplier, this->state.postFGMultiplier);
+			else
+				ImGui::Text("%ux", this->state.appliedFGMultiplier);
+			if (this->state.rejectedFGMultiplier > 0) {
+				ImGui::SameLine();
+				ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "(%ux refused)", this->state.rejectedFGMultiplier);
+			}
+			if (ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					if (this->state.frameGenerationIsDLSSG)
+						ImGui::TextUnformatted("Left: the multiplier DLSS-G accepted (generated frames per\nrendered frame, plus one), read back from Streamline rather\nthan from the menu setting. Right: presented frames per\nrendered frame as DLSS-G counted them, smoothed. The\nmeasured value sits slightly below the mode when DLSS-G\ndrops a generated frame to keep pacing.");
+					else
+						ImGui::TextUnformatted("FSR 3.1 frame generation is single-frame only (2x).");
 				}
 			}
 		}
@@ -575,7 +598,7 @@ void PerformanceOverlay::DrawFPS()
 				ImGui::TextUnformatted("Presented-frame count reported by the frame-generation backend,\nsampled once per rendered frame.");
 			}
 		} else {
-			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Post-FG: estimated (%.0fx Pre-FG)", Settings::kFrameGenerationMultiplier);
+			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Post-FG: estimated (%.0fx Pre-FG)", this->state.postFGMultiplier);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("The active frame-generation backend reports no presentation\ncadence, so this curve is the Pre-FG curve divided by a fixed\nmultiplier. Treat it as an estimate.");
 			}
@@ -1564,7 +1587,8 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 						"is therefore invisible to our timestamps), and genuine GPU idle while the CPU "
 						"is blocked. Treat it as an UPPER BOUND on how idle the GPU was.\n\n"
 						"With frame generation on, a large number here is expected and does not mean "
-						"there is headroom: half of it is the generated frame being produced."),
+						"there is headroom: much of it is the generated frames being produced, and more of "
+						"it the higher the multiplier."),
 			true, std::nullopt, std::nullopt });
 
 		gpuSummaryRows.push_back(DrawCallRow{
@@ -2712,6 +2736,12 @@ void PerformanceOverlay::UpdateGraphValues()
 	state.smoothedMaxFrameTime = state.smoothedMaxFrameTime + Settings::kSmoothingFactor * (graphMax - state.smoothedMaxFrameTime);
 
 	if (state.isFrameGenerationActive) {
+		auto& upscaling = globals::features::upscaling;
+		state.frameGenerationIsDLSSG = upscaling.IsDLSSGBackend();
+		state.appliedFGMultiplier = upscaling.GetFrameGenerationAppliedMultiplier();
+		const uint32_t rejectedFrames = state.frameGenerationIsDLSSG ? upscaling.streamline.GetDLSSGRejectedFramesToGenerate() : 0u;
+		state.rejectedFGMultiplier = rejectedFrames > 0 ? rejectedFrames + 1u : 0u;
+
 		// Presented frames per rendered frame, as reported by the backend. DLSS-G reports
 		// this; FSR 3 frame generation does not and returns 0.
 		//
@@ -2726,12 +2756,16 @@ void PerformanceOverlay::UpdateGraphValues()
 			state.postFGFrameTimeMs = state.frameTimeMs / measuredMultiplier;
 			state.postFGFps = state.fps * measuredMultiplier;
 		} else {
-			// No cadence reported: fall back to the fixed estimate. The UI labels every
-			// number derived from this as an estimate.
+			// No cadence reported: fall back to an estimate. The UI labels every number
+			// derived from this as an estimate. DLSS-G is estimated from the multiplier it
+			// accepted (it reports none for the first frames after a switch); FSR is fixed 2x.
+			const float estimatedMultiplier = state.frameGenerationIsDLSSG ?
+			                                      static_cast<float>(state.appliedFGMultiplier) :
+			                                      Settings::kFrameGenerationMultiplier;
 			state.postFGIsMeasured = false;
-			state.postFGMultiplier = Settings::kFrameGenerationMultiplier;
-			state.postFGFrameTimeMs = state.frameTimeMs / Settings::kFrameGenerationMultiplier;
-			state.postFGFps = state.fps * Settings::kFrameGenerationMultiplier;
+			state.postFGMultiplier = estimatedMultiplier;
+			state.postFGFrameTimeMs = state.frameTimeMs / estimatedMultiplier;
+			state.postFGFps = state.fps * estimatedMultiplier;
 		}
 
 		// Update post-FG smooth values when timer elapses

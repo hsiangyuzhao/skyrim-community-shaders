@@ -327,6 +327,15 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 				// rendered frame, because this is the only per-Present query. Feed the
 				// Performance Overlay a smoothed cadence so it can report a measured
 				// post-FG frame time instead of assuming a fixed 2x multiplier.
+				//
+				// The smoothing restarts whenever the applied multiplier moves, so after a
+				// hot switch from 2x to 4x it is seeded from the first sample at the new
+				// mode instead of drifting up over a second of frames from the old value.
+				const uint32_t appliedFrames = upscaling.streamline.GetDLSSGAppliedFramesToGenerate();
+				if (appliedFrames != measuredPresentMultiplierFrames) {
+					measuredPresentMultiplier = 0.0f;
+					measuredPresentMultiplierFrames = appliedFrames;
+				}
 				if (dlssGState.numFramesActuallyPresented > 0) {
 					const float sample = static_cast<float>(dlssGState.numFramesActuallyPresented);
 					measuredPresentMultiplier = measuredPresentMultiplier > 0.0f ?
@@ -340,6 +349,13 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 					dlssGMapUnexpectedGeneratedFramesLogged = true;
 				}
 			}
+		} else if (SUCCEEDED(presentResult) && upscaling.IsDLSSGAvailable() &&
+				   upscaling.streamline.GetDLSSGFramesToGenerateMax() == 0) {
+			// Not generating and the multi-frame ceiling is still unknown (loading screens,
+			// main menu, generation switched off): ask for it here, on the presenting thread and
+			// after a real Present, so the multiplier list is complete before gameplay starts.
+			// While generating, the query above already carries the ceiling.
+			upscaling.streamline.RefreshDLSSGCapabilities();
 		}
 	}
 	DX::ThrowIfFailed(presentResult);

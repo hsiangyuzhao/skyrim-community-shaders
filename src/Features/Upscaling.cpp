@@ -40,6 +40,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	frameGenerationMode,
 	frameGenerationBackend,
 	frameGenerationForceEnable,
+	frameGenerationMultiplier,
 	frameGenerationAllowInMenus,
 	streamlineLogLevel,
 	sharpnessFSR,
@@ -456,12 +457,61 @@ void Upscaling::DrawSettings()
 
 			ImGui::SliderInt("Frame Generation", (int*)&settings.frameGenerationMode, 0, 1, toggleModesFG[settings.frameGenerationMode]);
 
+			if (activeBackend == FrameGenerationBackend::kDLSSG) {
+				// Only what DLSS-G reported for this session is offered. The saved preference is
+				// left alone when it is above that, so it comes back in a session that allows it.
+				const uint32_t reportedFramesMax = streamline.GetDLSSGFramesToGenerateMax();
+				const uint availableMultiplierMax = reportedFramesMax > 0 ?
+				                                        std::clamp(static_cast<uint>(reportedFramesMax) + 1u, kMinFrameGenerationMultiplier, kMaxFrameGenerationMultiplier) :
+				                                        kMinFrameGenerationMultiplier;
+				const uint shownMultiplier = std::clamp(settings.frameGenerationMultiplier, kMinFrameGenerationMultiplier, availableMultiplierMax);
+				const auto previewLabel = std::format("{}x", shownMultiplier);
+				if (ImGui::BeginCombo("Frame Generation Multiplier", previewLabel.c_str())) {
+					for (uint multiplier = kMinFrameGenerationMultiplier; multiplier <= availableMultiplierMax; ++multiplier) {
+						const bool isSelected = multiplier == shownMultiplier;
+						const auto itemLabel = std::format("{}x", multiplier);
+						if (ImGui::Selectable(itemLabel.c_str(), isSelected)) {
+							settings.frameGenerationMultiplier = multiplier;
+							// Picking a multiplier -- even the one that was refused -- is the
+							// explicit request to try it again.
+							streamline.ClearDLSSGMultiFrameRejection();
+						}
+						if (isSelected)
+							ImGui::SetItemDefaultFocus();
+					}
+					ImGui::EndCombo();
+				}
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted("Frames shown per frame rendered: 2x adds one generated frame between each pair of real ones, 3x adds two, 4x adds three. Takes effect immediately, no restart.");
+					ImGui::TextUnformatted("Only the multipliers DLSS-G reports for this system are listed. RTX 50 cards report up to 4x; RTX 40 cards report 2x unless an external unlock is loaded with the game. Community Shaders itself does not modify any NVIDIA file.");
+					ImGui::TextUnformatted("Under the same Reflex frame limit a higher multiplier renders fewer real frames, so input latency rises with it.");
+				}
+
+				if (reportedFramesMax == 0) {
+					ImGui::TextDisabled("Multipliers above 2x are listed once DLSS-G reports this system's limit.");
+				} else if (reportedFramesMax == 1) {
+					ImGui::TextDisabled("DLSS-G reports 2x as this system's limit.");
+				}
+				if (reportedFramesMax > 0 && settings.frameGenerationMultiplier > availableMultiplierMax) {
+					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+					ImGui::Text("Saved choice %ux is above this session's limit; using %ux.", settings.frameGenerationMultiplier, availableMultiplierMax);
+					ImGui::PopStyleColor();
+				}
+				if (const uint32_t rejectedFrames = streamline.GetDLSSGRejectedFramesToGenerate(); rejectedFrames > 0) {
+					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+					ImGui::Text("DLSS-G refused %ux and fell back to 2x. Select it again to retry.", rejectedFrames + 1);
+					ImGui::PopStyleColor();
+				}
+				if (IsFrameGenerationActive())
+					ImGui::Text("Running: %ux (as accepted by DLSS-G)", GetFrameGenerationAppliedMultiplier());
+			}
+
 			if (!d3d12SwapChainActive)
 				ImGui::BeginDisabled();
 
 			ImGui::SliderInt("Frame Limit (VSync off only)", (int*)&settings.frameLimitMode, 0, 1, std::format("{}", toggleModes[settings.frameLimitMode]).c_str());
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Paces presentation to the refresh rate, or half of it while generating. It runs only when the game presents with a sync interval of zero, so anything that turns VSync on -- including SSE Display Tweaks, which owns that setting for most setups -- leaves it inert.");
+				ImGui::TextUnformatted("Paces presentation to the refresh rate, or the refresh rate divided by the generation multiplier while generating. It runs only when the game presents with a sync interval of zero, so anything that turns VSync on -- including SSE Display Tweaks, which owns that setting for most setups -- leaves it inert.");
 				ImGui::TextUnformatted("It also spins after Present, which is the wrong side of the frame for a cap: it holds the CPU once the work is already submitted. Under a variable refresh rate prefer the Reflex frame limit below, which is applied before input is sampled and which the driver is aware of.");
 			}
 
@@ -515,16 +565,18 @@ void Upscaling::DrawSettings()
 					reflexFrameLimit > 0 ? "%d presented fps" : "Off", ImGuiSliderFlags_AlwaysClamp))
 				settings.reflexFrameLimit = static_cast<uint>(std::max(reflexFrameLimit, 0));
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Caps frames as they reach the display, not as they are rendered. The driver knows the generation multiplier, so with generation running a cap of 60 renders 30 and presents 60; the same cap where generation is off renders and presents 60. Zero leaves it uncapped.");
+				ImGui::TextUnformatted("Caps frames as they reach the display, not as they are rendered. The driver knows the generation multiplier, so with generation running a cap of 120 presents 120 and renders 120 divided by the multiplier (60 at 2x, 40 at 3x, 30 at 4x); the same cap where generation is off renders and presents 120. Zero leaves it uncapped.");
 				ImGui::TextUnformatted("This is the cap to use with a variable refresh rate. It is imposed inside Reflex's own sleep, before input is sampled, and the driver knows about it -- unlike a limiter that spins after Present, which adds the time it waits to the latency of the frame it just submitted.");
 				ImGui::TextUnformatted("Interpolation assumes evenly spaced frames, so a cap low enough to hold steady in the worst case is usually worth more than the headroom it gives up. Keep it below the display's maximum refresh so presentation stays inside the variable-refresh window.");
 			}
 
 			ImGui::Text("Display reports %.0f Hz", refreshRate);
 			if (settings.reflexFrameLimit > 0) {
-				if (IsFrameGenerationRequestedNow())
-					ImGui::Text("About %u presented, from %u rendered while generating",
-						settings.reflexFrameLimit, settings.reflexFrameLimit / 2);
+				if (IsFrameGenerationRequestedNow()) {
+					const uint multiplier = GetFrameGenerationAppliedMultiplier();
+					ImGui::Text("About %u presented, from %u rendered while generating at %ux",
+						settings.reflexFrameLimit, settings.reflexFrameLimit / multiplier, multiplier);
+				}
 				if (settings.reflexFrameLimit > refreshRate) {
 					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 					ImGui::Text("Above the refresh rate: presentation leaves the variable-refresh window.");
@@ -632,6 +684,12 @@ void Upscaling::LoadSettings(json& o_json)
 	if (settings.frameGenerationMode > 1) {
 		logger::warn("[Upscaling] Loaded frameGenerationMode {} out of range, clamping to enabled", settings.frameGenerationMode);
 		settings.frameGenerationMode = 1;
+	}
+	if (settings.frameGenerationMultiplier < kMinFrameGenerationMultiplier ||
+		settings.frameGenerationMultiplier > kMaxFrameGenerationMultiplier) {
+		logger::warn("[Upscaling] Loaded frameGenerationMultiplier {} out of range, falling back to {}x",
+			settings.frameGenerationMultiplier, kMinFrameGenerationMultiplier);
+		settings.frameGenerationMultiplier = kMinFrameGenerationMultiplier;
 	}
 	constexpr auto frameGenerationBackendCount = static_cast<uint>(FrameGenerationBackend::kCount);
 	if (settings.frameGenerationBackend >= frameGenerationBackendCount) {
@@ -1375,18 +1433,29 @@ void Upscaling::TimerSleepQPC(int64_t targetQPC)
 void Upscaling::FrameLimiter()
 {
 	if (d3d12SwapChainActive) {
-		// Use frame latency waitable object if available for better frame pacing
-		HANDLE waitableObject = GetFrameLatencyWaitableObject();
-
-		// Wait for the next frame presentation slot
-		WaitForSingleObject(waitableObject, INFINITE);
+		// The waitable belongs to whoever owns pacing. On the DLSS-G backend, unless the swap
+		// chain was created with FRAME_LATENCY_WAITABLE_OBJECT (its flags are the game's own),
+		// that is the SL pacer, and the DLSS-G guide (section 12.1) states the application must
+		// then not wait on it: the handle is the one the pacer consumes, and the two would
+		// compete for its signals -- more of them per rendered frame the higher the multiplier.
+		// Reflex's sleep is the frame-start pacing there. FSR keeps the original wait. The
+		// proxy test mirrors the one DX12SwapChain::CreateSwapChain uses to pick Streamline.
+		const bool streamlineProxySwapChain = IsDLSSGBackend() && streamline.featureDLSS_G && streamline.featureReflex && streamline.featurePCL;
+		const bool appOwnsWaitable = (dx12SwapChain.swapChainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
+		if (!streamlineProxySwapChain || appOwnsWaitable) {
+			HANDLE waitableObject = GetFrameLatencyWaitableObject();
+			WaitForSingleObject(waitableObject, INFINITE);
+		}
 
 		if (settings.frameLimitMode) {
 			// Fall back to the original timing method
 			// Use integer arithmetic for more precise timing
 			const bool generatingNow = IsFrameGenerationRequestedNow() &&
 			                           (!globals::game::ui->GameIsPaused() || IsFrameGenerationAllowedWhilePaused());
-			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate * (generatingNow ? 0.5 : 1.0)));
+			// Rendered frames are paced to the refresh rate divided by the multiplier the backend
+			// is running (no longer a fixed half), so presented frames still land at the refresh rate.
+			const double presentMultiplier = generatingNow ? static_cast<double>(GetFrameGenerationAppliedMultiplier()) : 1.0;
+			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate / presentMultiplier));
 			int64_t targetFrameTicks = (targetFrameTimeNS * qpf.QuadPart) / 1000000000LL;
 
 			static LARGE_INTEGER lastFrame = {};
@@ -1516,6 +1585,18 @@ float Upscaling::GetFrameGenerationPresentMultiplier() const
 	if (!IsFrameGenerationActive() || !IsDLSSGBackend())
 		return 0.0f;
 	return dx12SwapChain.GetMeasuredPresentMultiplier();
+}
+
+uint Upscaling::GetFrameGenerationAppliedMultiplier() const
+{
+	if (IsDLSSGBackend())
+		return std::max(streamline.GetDLSSGAppliedFramesToGenerate(), 1u) + 1u;
+	return 2u;  // FSR 3.1 frame generation is single-frame only.
+}
+
+uint32_t Upscaling::GetRequestedDLSSGFramesToGenerate() const
+{
+	return std::clamp(settings.frameGenerationMultiplier, kMinFrameGenerationMultiplier, kMaxFrameGenerationMultiplier) - 1u;
 }
 
 // Unified interface methods
@@ -1654,7 +1735,7 @@ void Upscaling::PresentFrameGeneration(bool a_useFrameGeneration, bool a_retainD
 		return;
 	}
 
-	streamline.SetDLSSGMode(a_useFrameGeneration, a_retainDLSSGResourcesWhenOff);
+	streamline.SetDLSSGMode(a_useFrameGeneration, a_retainDLSSGResourcesWhenOff, GetRequestedDLSSGFramesToGenerate());
 }
 
 void Upscaling::CheckFrameConstants()
