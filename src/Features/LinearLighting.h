@@ -105,6 +105,11 @@ struct LinearLighting : Feature
 	};
 
 	std::unique_ptr<ConstantBuffer> PerGeometryCB;
+	// (batch 35, C1) Bit pattern of the emissiveMult last written into PerGeometryCB, so a
+	// draw with the same value can skip the Map. Tracked whether or not the switch is on, so
+	// flipping it mid-session never trusts a stale value.
+	uint32_t uploadedEmissiveMultBits = 0;
+	bool hasUploadedEmissiveMult = false;
 
 	uint isDirLightLinear = false;
 	float dirLightMult = 1.0f;

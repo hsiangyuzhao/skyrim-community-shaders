@@ -1,6 +1,7 @@
 #include "LinearLighting.h"
 
 #include "JiayeStatement.h"
+#include "Utils/Batch35.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	LinearLighting::Settings,
@@ -95,6 +96,7 @@ void LinearLighting::RestoreDefaultSettings()
 void LinearLighting::SetupResources()
 {
 	PerGeometryCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PerGeometryData>());
+	hasUploadedEmissiveMult = false;
 }
 
 void LinearLighting::Prepass()
@@ -192,9 +194,17 @@ void LinearLighting::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 		float emissiveMult = 1.0f;
 		if (settings.enableLinearLighting) {
 			emissiveMult = lightProperty->emissiveMult;
-			PerGeometryData perGeometryData{};
-			perGeometryData.emissiveMult = emissiveMult;
-			PerGeometryCB->Update(perGeometryData);
+			// (batch 35, C1) The buffer holds nothing but this float, and a dynamic buffer
+			// keeps its contents until the next Map, so a draw whose value is bit-identical to
+			// the last upload can skip the Map. Most draws have emissiveMult == 1.
+			const uint32_t emissiveMultBits = std::bit_cast<uint32_t>(emissiveMult);
+			if (!Batch35::IsOn(Batch35::CpuItem::LinearLightingUploadDedup) || !hasUploadedEmissiveMult || emissiveMultBits != uploadedEmissiveMultBits) {
+				PerGeometryData perGeometryData{};
+				perGeometryData.emissiveMult = emissiveMult;
+				PerGeometryCB->Update(perGeometryData);
+				uploadedEmissiveMultBits = emissiveMultBits;
+				hasUploadedEmissiveMult = true;
+			}
 
 			ID3D11Buffer* buffer = { PerGeometryCB->CB() };
 			auto context = globals::d3d::context;
