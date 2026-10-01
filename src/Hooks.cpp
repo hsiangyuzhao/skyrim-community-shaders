@@ -9,6 +9,7 @@
 #include "State.h"
 #include "TruePBR.h"
 #include "Util.h"
+#include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 
 #include "Features/GrassOptimizations.h"
@@ -303,7 +304,15 @@ struct IDXGISwapChain_Present
 		auto state = globals::state;
 		auto menu = globals::menu;
 		state->Reset();
-		menu->DrawOverlay();
+		{
+			// (batch 36) ImGui (this overlay, the CS menu) gets its own row in the frame timeline.
+			Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOverlay);
+			menu->DrawOverlay();
+		}
+		// Close the GPU frame timeline right before the real Present and open the next one
+		// right after it, so its chain spans exactly the frame's own rendering.
+		auto* gpuTimeline = Util::GpuPhaseTimeline::GetSingleton();
+		gpuTimeline->EndFrame();
 
 		// Time the CPU spends blocked inside Present: waiting on the GPU, on vsync or on a
 		// frame-rate limiter. This is the single biggest thing the overlay's "Other" row
@@ -322,6 +331,7 @@ struct IDXGISwapChain_Present
 		HRESULT retval = func(This, SyncInterval, Flags);
 		Util::CpuPassTimers::GetSingleton()->EndPresentWait();
 		Util::GpuFrameTimer::GetSingleton()->MarkPresentEnd();
+		gpuTimeline->BeginFrame();
 
 		TracyD3D11Collect(state->tracyCtx);
 

@@ -17,10 +17,15 @@
 #include "ShaderCache.h"
 #include "TruePBR.h"
 #include "Utils/FileSystem.h"
+#include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 
 void State::Draw()
 {
+	// (batch 36) Per-draw stage switch for the overlay's GPU frame timeline. One branch while
+	// the overlay table is closed.
+	Util::GpuPhaseTimeline::GetSingleton()->OnDraw(currentShader, currentVertexDescriptor, currentPixelDescriptor);
+
 	auto shaderCache = globals::shaderCache;
 	auto deferred = globals::deferred;
 	auto& terrainBlending = globals::features::terrainBlending;

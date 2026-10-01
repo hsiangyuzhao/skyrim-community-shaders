@@ -18,6 +18,7 @@
 #include "Features/Upscaling.h"
 
 #include "Hooks.h"
+#include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 
 // CPU-side timing of our own work. Purely observational: every one of these is a
@@ -396,6 +397,10 @@ void Deferred::PrepassPasses()
 
 void Deferred::StartDeferred()
 {
+	// (batch 36) Our setup and prepasses before the opaque pass; the passes among them that
+	// have a GPU Passes row take their own time out of this.
+	Util::GpuPhaseTimeline::GetSingleton()->Push(Util::GpuScope::CsOther);
+
 	{
 		Util::CpuPassScope timer("Shared Data");
 		globals::state->UpdateSharedData(true, false);
@@ -454,9 +459,11 @@ void Deferred::StartDeferred()
 
 	OverrideBlendStates();
 
-	// (batch 35, M1) Everything the GPU does from here until EndDeferred is the engine's
-	// opaque pass, i.e. the Lighting draws, plus the few passes of ours nested inside it.
-	Util::GpuSpanTimers::GetSingleton()->Begin(Util::GpuSpan::GeometryOpaque);
+	// (batch 36) Everything the GPU does from here until EndDeferred is the engine's opaque
+	// pass, split per draw into terrain / objects / characters / trees / grass / LOD.
+	auto* timeline = Util::GpuPhaseTimeline::GetSingleton();
+	timeline->Pop(Util::GpuScope::CsOther);
+	timeline->Push(Util::GpuScope::Opaque);
 }
 
 void Deferred::DeferredPasses()
@@ -647,9 +654,8 @@ void Deferred::DeferredPasses()
 
 void Deferred::EndDeferred()
 {
-	// (batch 35, M1) Closed before the early returns so the span opened in StartDeferred
-	// always gets its end marker; a no-op if that Begin was suppressed.
-	Util::GpuSpanTimers::GetSingleton()->End(Util::GpuSpan::GeometryOpaque);
+	// (batch 36) Closed before the early returns; a no-op if StartDeferred never opened it.
+	Util::GpuPhaseTimeline::GetSingleton()->Pop(Util::GpuScope::Opaque);
 
 	if (!globals::state->inWorld)
 		return;
@@ -675,7 +681,10 @@ void Deferred::EndDeferred()
 	auto context = globals::d3d::context;
 	context->OMSetRenderTargets(0, nullptr, nullptr);  // Unbind all bound render targets
 
-	DeferredPasses();  // Perform deferred passes and composite forward buffers
+	{
+		Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOther);
+		DeferredPasses();  // Perform deferred passes and composite forward buffers
+	}
 
 	stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);  // Run OMSetRenderTargets again
 
@@ -845,11 +854,12 @@ ID3D11ComputeShader* Deferred::GetComputeMainCompositeInterior()
 
 void Deferred::Hooks::Main_RenderShadowMaps::thunk()
 {
-	// (batch 35, M1) The engine's shadow map pass, timed on the GPU.
-	auto* spanTimers = Util::GpuSpanTimers::GetSingleton();
-	spanTimers->Begin(Util::GpuSpan::ShadowMaps);
-	func();
-	spanTimers->End(Util::GpuSpan::ShadowMaps);
+	// (batch 36) The engine's shadow map pass; the per-light hooks split it further.
+	{
+		Util::GpuPhaseScope gpuPhase(Util::GpuScope::ShadowMaps);
+		func();
+	}
+	Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOther);
 	globals::deferred->EarlyPrepasses();
 };
 
@@ -858,7 +868,11 @@ void Deferred::Hooks::Main_RenderWorld::thunk(bool a1)
 	auto* const state = globals::state;
 	state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::InWorld);
 	state->inWorld = true;
-	func(a1);
+	{
+		// (batch 36) Sky, water, transparent and our deferred work are split out from here.
+		Util::GpuPhaseScope gpuPhase(Util::GpuScope::World);
+		func(a1);
+	}
 	state->inWorld = false;
 	state->permutationData.ExtraShaderDescriptor &= ~static_cast<uint32_t>(State::ExtraShaderDescriptors::InWorld);
 };
@@ -907,9 +921,15 @@ void Deferred::Hooks::BSCubeMapCamera_RenderCubemap::thunk(RE::NiAVObject* camer
 	auto deferred = globals::deferred;
 	auto state = globals::state;
 
-	deferred->ReflectionsPrepasses();
+	{
+		Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOther);
+		deferred->ReflectionsPrepasses();
+	}
 	state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsReflections);
-	func(camera, a2, a3, a4, a5);
+	{
+		Util::GpuPhaseScope gpuPhase(Util::GpuScope::Reflections);
+		func(camera, a2, a3, a4, a5);
+	}
 	state->permutationData.ExtraShaderDescriptor &= ~static_cast<uint32_t>(State::ExtraShaderDescriptors::IsReflections);
 }
 
@@ -917,7 +937,10 @@ void Deferred::Hooks::Main_RenderFirstPersonView::thunk(bool a1, bool a2)
 {
 	auto* const state = globals::state;
 	state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::InWorld);
-	func(a1, a2);
+	{
+		Util::GpuPhaseScope gpuPhase(Util::GpuScope::FirstPerson);
+		func(a1, a2);
+	}
 	state->permutationData.ExtraShaderDescriptor &= ~static_cast<uint32_t>(State::ExtraShaderDescriptors::InWorld);
 }
 
