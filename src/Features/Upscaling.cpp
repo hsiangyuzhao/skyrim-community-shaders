@@ -1433,18 +1433,29 @@ void Upscaling::TimerSleepQPC(int64_t targetQPC)
 void Upscaling::FrameLimiter()
 {
 	if (d3d12SwapChainActive) {
-		// Use frame latency waitable object if available for better frame pacing
-		HANDLE waitableObject = GetFrameLatencyWaitableObject();
-
-		// Wait for the next frame presentation slot
-		WaitForSingleObject(waitableObject, INFINITE);
+		// The waitable belongs to whoever owns pacing. On the DLSS-G backend, unless the swap
+		// chain was created with FRAME_LATENCY_WAITABLE_OBJECT (its flags are the game's own),
+		// that is the SL pacer, and the DLSS-G guide (section 12.1) states the application must
+		// then not wait on it: the handle is the one the pacer consumes, and the two would
+		// compete for its signals -- more of them per rendered frame the higher the multiplier.
+		// Reflex's sleep is the frame-start pacing there. FSR keeps the original wait. The
+		// proxy test mirrors the one DX12SwapChain::CreateSwapChain uses to pick Streamline.
+		const bool streamlineProxySwapChain = IsDLSSGBackend() && streamline.featureDLSS_G && streamline.featureReflex && streamline.featurePCL;
+		const bool appOwnsWaitable = (dx12SwapChain.swapChainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
+		if (!streamlineProxySwapChain || appOwnsWaitable) {
+			HANDLE waitableObject = GetFrameLatencyWaitableObject();
+			WaitForSingleObject(waitableObject, INFINITE);
+		}
 
 		if (settings.frameLimitMode) {
 			// Fall back to the original timing method
 			// Use integer arithmetic for more precise timing
 			const bool generatingNow = IsFrameGenerationRequestedNow() &&
 			                           (!globals::game::ui->GameIsPaused() || IsFrameGenerationAllowedWhilePaused());
-			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate * (generatingNow ? 0.5 : 1.0)));
+			// Rendered frames are paced to the refresh rate divided by the multiplier the backend
+			// is running (no longer a fixed half), so presented frames still land at the refresh rate.
+			const double presentMultiplier = generatingNow ? static_cast<double>(GetFrameGenerationAppliedMultiplier()) : 1.0;
+			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate / presentMultiplier));
 			int64_t targetFrameTicks = (targetFrameTimeNS * qpf.QuadPart) / 1000000000LL;
 
 			static LARGE_INTEGER lastFrame = {};
