@@ -16,6 +16,7 @@
 #include "SettingsOverrideManager.h"
 #include "ShaderCache.h"
 #include "TruePBR.h"
+#include "Utils/Batch35.h"
 #include "Utils/FileSystem.h"
 #include "Utils/GpuTimers.h"
 
@@ -332,6 +333,8 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				shaderCache->SetFileWatcher(advanced["Use FileWatcher"]);
 			if (advanced["Frame Annotations"].is_boolean())
 				frameAnnotations = advanced["Frame Annotations"];
+			if (advanced.contains("Batch 35"))
+				Batch35::Load(advanced["Batch 35"]);
 		}
 
 		if (settings["General"].is_object()) {
@@ -474,6 +477,7 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Background Compiler Threads"] = shaderCache->backgroundCompilationThreadCount;
 	advanced["Use FileWatcher"] = shaderCache->UseFileWatcher();
 	advanced["Frame Annotations"] = frameAnnotations;
+	advanced["Batch 35"] = Batch35::Save();
 	settings["Advanced"] = advanced;
 
 	json general;
@@ -827,6 +831,8 @@ void State::UpdateSharedData([[maybe_unused]] bool a_inWorld, [[maybe_unused]] b
 		} else {
 			data.MipBias = 0;
 		}
+
+		data.Batch35Flags = Batch35::GetGpuFlags();
 
 		sharedDataCB->Update(data);
 	}

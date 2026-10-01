@@ -23,6 +23,7 @@ namespace SharedData
 		bool InMapMenu;   // If the world/local map is open (note that the renderer is still deferred here)
 		bool HideSky;     // HideSky flag in WorldSpace, e.g. Blackreach
 		float MipBias;    // Offset to mip level for TAA sharpness#
+		uint Batch35Flags;  // (batch 35) runtime A/B switches, read through Batch35::IsOn() below
 	};
 
 	struct GrassLightingSettings
@@ -528,4 +529,35 @@ namespace SharedData
 
 #endif  // PSHADER
 }
+
+#if defined(PSHADER) || defined(CSHADER) || defined(COMPUTESHADER)
+// (batch 35) Runtime A/B switches for the Lighting-path optimisations. Bits mirror
+// Batch35::GpuFlag in src/Utils/Batch35.h; the C++ side uploads 0 when the master switch
+// is off. Every call site branches on these uniformly (the value is the same for the
+// whole draw), so the old and the new code path both live in the permutation and the
+// switch picks one at run time.
+//
+// B35_FORCE_FLAGS is for offline verification only: compiling with it set to a constant
+// folds every switch away, so the "all off" build can be compared against the pre-batch-35
+// bytecode and the "all on" build against it for instruction and sample counts.
+namespace Batch35
+{
+	static const uint EarlyAlphaTest = 1u << 0;            // B1
+	static const uint WetnessSpecularBranch = 1u << 1;     // B5a
+	static const uint ExclusiveSpecularLobe = 1u << 2;     // B5b
+	static const uint SkipOccludedSunShadows = 1u << 3;    // B2
+	static const uint ReuseTerrainHeight = 1u << 4;        // B3a
+	static const uint HoistTerrainVariationPow = 1u << 5;  // B3b
+
+	bool IsOn(uint a_flag)
+	{
+#	if defined(B35_FORCE_FLAGS)
+		return (uint(B35_FORCE_FLAGS) & a_flag) != 0;
+#	else
+		return (SharedData::Batch35Flags & a_flag) != 0;
+#	endif
+	}
+}
+#endif  // PSHADER
+
 #endif  // __SHARED_DATA_DEPENDENCY_HLSL__

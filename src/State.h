@@ -256,7 +256,7 @@ public:
 		uint InMapMenu;
 		uint HideSky;
 		float MipBias;
-		float pad0;
+		uint Batch35Flags;  // (batch 35) Batch35::GetGpuFlags(); was padding, so the layout is unchanged
 	};
 	STATIC_ASSERT_ALIGNAS_16(SharedDataCB);
 

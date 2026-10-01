@@ -15,6 +15,7 @@
 #include "State.h"
 #include "TruePBR.h"
 #include "Util.h"
+#include "Utils/Batch35.h"
 #include "Utils/Format.h"
 #include "Utils/UI.h"
 
@@ -24,6 +25,15 @@ void AdvancedSettingsRenderer::RenderAdvancedSettings(
 {
 	// Use TabBar system - tabs sorted alphabetically
 	if (ImGui::BeginTabBar("##AdvancedSettingsTabs", ImGuiTabBarFlags_None)) {
+		// Batch 35 Tab (first, so the A/B switches are one click from the Advanced page)
+		if (MenuFonts::BeginTabItemWithFont("Batch 35", Menu::FontRole::Subheading)) {
+			if (ImGui::BeginChild("##Batch35Content", ImVec2(0, 0), false)) {
+				RenderBatch35Section();
+			}
+			ImGui::EndChild();
+			ImGui::EndTabItem();
+		}
+
 		// Developer Tab
 		if (MenuFonts::BeginTabItemWithFont("Developer", Menu::FontRole::Subheading)) {
 			if (ImGui::BeginChild("##DeveloperContent", ImVec2(0, 0), false)) {
@@ -71,6 +81,47 @@ void AdvancedSettingsRenderer::RenderAdvancedSettings(
 
 		ImGui::EndTabBar();
 	}
+}
+
+void AdvancedSettingsRenderer::RenderBatch35Section()
+{
+	auto& settings = Batch35::settings;
+
+	ImGui::Checkbox("Batch 35 optimizations (all)", &settings.master);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"Master switch for every batch 35 Lighting optimisation below. Off = the exact\n"
+			"batch 34 code paths, whatever the individual switches say. Takes effect on the\n"
+			"next frame: no restart, no cache clear.\n\n"
+			"None of these may change the picture. Compare the GPU time in the Performance\n"
+			"Overlay's \"Engine passes (GPU)\" table (Geometry (opaque), Shadow maps) with\n"
+			"this on and off at the same camera position, frame rate uncapped and frame\n"
+			"generation off.");
+	}
+
+	ImGui::Spacing();
+	ImGui::BeginDisabled(!settings.master);
+
+	Util::DrawSectionHeader("GPU (Lighting shader)", false, false);
+	for (size_t i = 0; i < Batch35::kGpuItems.size(); ++i) {
+		const auto& info = Batch35::kGpuItems[i].second;
+		ImGui::Checkbox(info.label, &settings.gpu[i]);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("%s", info.tooltip);
+		}
+	}
+
+	ImGui::Spacing();
+	Util::DrawSectionHeader("CPU (per-draw overhead)", false, false);
+	for (size_t i = 0; i < Batch35::kCpuItems.size(); ++i) {
+		const auto& info = Batch35::kCpuItems[i];
+		ImGui::Checkbox(info.label, &settings.cpu[i]);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("%s", info.tooltip);
+		}
+	}
+
+	ImGui::EndDisabled();
 }
 
 void AdvancedSettingsRenderer::RenderLoggingSection()
