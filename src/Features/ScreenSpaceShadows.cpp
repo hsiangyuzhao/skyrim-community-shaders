@@ -21,10 +21,20 @@ void ScreenSpaceShadows::DrawSettings()
 {
 	if (ImGui::TreeNodeEx("General", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Enable", (bool*)&bendSettings.Enable);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Adds small, sharp sun shadows (contact shadows) that normal shadow maps miss, e.g. under feet and in crevices.");
 		ImGui::SliderInt("Sample Count Multiplier", (int*)&bendSettings.SampleCount, 1, 4);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("How far each pixel searches for a shadow caster. Higher = longer contact shadows but slower.");
 		ImGui::SliderFloat("Surface Thickness", &bendSettings.SurfaceThickness, 0.005f, 0.05f);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("How thick objects are assumed to be when casting these shadows. Higher = fuller shadows, but thin objects may cast too much.");
 		ImGui::SliderFloat("Bilinear Threshold", &bendSettings.BilinearThreshold, 0.02f, 1.0f);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("How big a depth jump counts as an object edge, where depth is not smoothed. Tweak if shadow edges look jagged or leak.");
 		ImGui::SliderFloat("Shadow Contrast", &bendSettings.ShadowContrast, 0.0f, 4.0f);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Sharpens the fade into and out of shadow. Higher = harder, darker contact shadows.");
 
 		ImGui::Spacing();
 		ImGui::Spacing();
