@@ -124,6 +124,10 @@ namespace Util
 				"grass cells, the Hi-Z occlusion pyramid and the per-instance culling dispatches.\n"
 				"With the optimized path off only the cell uploads remain, so it should read ~0.\n"
 				"The grass draws themselves are engine work and are not part of this row." },
+			{ "Variable Rate Shading",
+				"GPU overhead of Variable Rate Shading itself: building the shading-rate image\n"
+				"before the opaque pass and analysing the lit scene after it (plus the debug\n"
+				"tint when shown). The savings appear in the engine's own geometry time." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

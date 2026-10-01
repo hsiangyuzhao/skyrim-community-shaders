@@ -47,6 +47,7 @@ namespace Util
 		VolumetricLighting,      // generate + raymarch + both blur passes
 		DynamicCubemaps,         // capture / inferrence / irradiance convolution round-robin
 		GrassOptimizations,      // grass cell uploads + Hi-Z pyramid + per-instance cull dispatches
+		VariableRateShading,     // shading-rate image build + per-tile scene analysis (+ debug tint)
 		Count
 	};
 
