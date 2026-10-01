@@ -141,7 +141,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PositionSet)
 
 static const std::unordered_map<RE::BSShader::Type, std::string> kShaderTypeTooltips = {
-	{ RE::BSShader::Type::Grass, "Draw calls using the Grass shader. Typically many, but each is usually cheap.\nWith Grass Optimizations on, each grass type is one instanced indirect draw per pass, counted once here; see its block below the GPU table for instance counts." },
+	{ RE::BSShader::Type::Grass, "Draw calls using the Grass shader. Typically many, but each is usually cheap.\nWith Grass Optimizations on, each grass type is drawn in one call, so this count is much lower; its section below the GPU tables shows the real grass counts." },
 	{ RE::BSShader::Type::Sky, "Draw calls for the sky dome, clouds, and related effects." },
 	{ RE::BSShader::Type::Water, "Draw calls for water surfaces and effects." },
 	{ RE::BSShader::Type::Lighting, "Draw calls for dynamic and static lighting passes." },
@@ -195,6 +195,9 @@ void PerformanceOverlay::DrawSettings()
 
 		ImGui::Checkbox("Show FPS Counter", &this->settings.ShowFPS);
 		ImGui::Checkbox("Show Draw Calls", &this->settings.ShowDrawCalls);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Shows the detailed performance tables: bottleneck summary, CPU time per shader type and per Community Shaders feature, and GPU time per effect and per engine stage.");
+		}
 		ImGui::Checkbox("Show VRAM Usage", &this->settings.ShowVRAM);
 
 		bool isFrameGenerationActive = globals::features::upscaling.IsFrameGenerationActive();
@@ -222,8 +225,14 @@ void PerformanceOverlay::DrawSettings()
 		ImGui::SliderFloat("Background Opacity", &this->settings.BackgroundOpacity, 0.0f, 1.0f, "%.2f");
 		ImGui::Checkbox("Show Border", &this->settings.ShowBorder);
 		ImGui::SliderFloat("Update Interval", &this->settings.UpdateInterval, 0.001f, PerformanceOverlay::Settings::kMaxUpdateInterval, "%.2f seconds");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("How often the FPS readout refreshes. Shorter = updates faster, but the number jumps around more.");
+		}
 		ImGui::SliderInt("Frame History Size", &this->settings.FrameHistorySize,
 			this->settings.kMinFrameHistorySize, this->settings.kMaxFrameHistorySize);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("How many recent frames the frametime graph shows.");
+		}
 
 		ImGui::Separator();
 		ImGui::Text("Position:");
@@ -466,7 +475,7 @@ void PerformanceOverlay::DrawFPS()
 		ImGui::Text("%.1f (%.2f ms)", this->state.smoothFps, this->state.smoothFrameTimeMs);
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Instantaneous frame rate, sampled at the configured Update Interval.");
+				ImGui::TextUnformatted("Current frame rate, refreshed every Update Interval.");
 			}
 		}
 
@@ -483,7 +492,7 @@ void PerformanceOverlay::DrawFPS()
 				ImGui::Text("%.1f (%.2f ms)", Util::CalcFPS(stats.averageMs), stats.averageMs);
 				if (ImGui::IsItemHovered()) {
 					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("Mean frame time over the last %.1f s (%d frames).\nSampled every Present, so hiding the overlay does not\nbreak the window. Frames slower than %.0f ms (loading\nscreens, alt-tab) are excluded.",
+						ImGui::Text("Average over the last %.1f s (%d frames). Frames slower than %.0f ms (loading screens, alt-tab) are left out.",
 							stats.seconds, stats.frames, Settings::kStatsMaxSampleMs);
 					}
 				}
@@ -494,7 +503,7 @@ void PerformanceOverlay::DrawFPS()
 				ImGui::Text("%.1f (%.2f ms)", Util::CalcFPS(stats.percentile99Ms), stats.percentile99Ms);
 				if (ImGui::IsItemHovered()) {
 					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("Exact definition: 99th-percentile frame time over the\nsame %.1f s / %d frame window, i.e. the (0.99 x N)-th\nslowest frame. 99%% of frames were faster than this.\nWith %d frames in the window it sits on roughly the\n%d-th slowest frame, so it reflects repeated stutter\nrather than one outlier.",
+						ImGui::Text("The frame rate that 99%% of frames beat over the last %.1f s (%d frames). With %d frames this is about the %d-th slowest frame, so it shows repeated stutter rather than a single hitch.",
 							stats.seconds, stats.frames, stats.frames, std::max(1, stats.frames / 100));
 					}
 				}
@@ -516,7 +525,7 @@ void PerformanceOverlay::DrawFPS()
 				ImGui::Text("%.1f (%.2f ms)", this->state.postFGSmoothFps, this->state.postFGSmoothFrameTimeMs);
 				if (ImGui::IsItemHovered()) {
 					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("Measured: the frame-generation backend reported %.2f\npresented frames per rendered frame.", this->state.postFGMultiplier);
+						ImGui::Text("Measured: %.2f frames shown on screen per frame rendered.", this->state.postFGMultiplier);
 					}
 				}
 			} else {
@@ -524,7 +533,7 @@ void PerformanceOverlay::DrawFPS()
 					this->state.postFGSmoothFps, this->state.postFGSmoothFrameTimeMs);
 				if (ImGui::IsItemHovered()) {
 					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("Estimate, not a measurement: the backend reports no\npresentation cadence, so its configured %.0fx multiplier is\nassumed. Raw FPS, Avg and 1%% Low above are always\nmeasured pre-frame-generation values.",
+						ImGui::Text("Estimate: this frame generation type does not report shown frames, so the %.0fx setting is assumed. Raw FPS, Avg and 1%% Low above are always measured before frame generation.",
 							this->state.postFGMultiplier);
 					}
 				}
@@ -547,9 +556,9 @@ void PerformanceOverlay::DrawFPS()
 			if (ImGui::IsItemHovered()) {
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					if (this->state.frameGenerationIsDLSSG)
-						ImGui::TextUnformatted("Left: the multiplier DLSS-G accepted (generated frames per\nrendered frame, plus one), read back from Streamline rather\nthan from the menu setting. Right: presented frames per\nrendered frame as DLSS-G counted them, smoothed. The\nmeasured value sits slightly below the mode when DLSS-G\ndrops a generated frame to keep pacing.");
+						ImGui::TextUnformatted("Left: the multiplier DLSS-G is actually running, which can differ from the menu setting (\"refused\" = a multiplier it turned down). Right: the measured ratio, a bit lower when DLSS-G skips a generated frame to keep pacing smooth.");
 					else
-						ImGui::TextUnformatted("FSR 3.1 frame generation is single-frame only (2x).");
+						ImGui::TextUnformatted("FSR 3.1 frame generation only supports 2x.");
 				}
 			}
 		}
@@ -604,12 +613,12 @@ void PerformanceOverlay::DrawFPS()
 		if (this->state.postFGIsMeasured) {
 			ImGui::Text("Post-FG: measured (%.2fx presented frames)", this->state.postFGMultiplier);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Presented-frame count reported by the frame-generation backend,\nsampled once per rendered frame.");
+				ImGui::TextUnformatted("Based on the number of shown frames that frame generation reports for each rendered frame.");
 			}
 		} else {
 			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Post-FG: estimated (%.0fx Pre-FG)", this->state.postFGMultiplier);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("The active frame-generation backend reports no presentation\ncadence, so this curve is the Pre-FG curve divided by a fixed\nmultiplier. Treat it as an estimate.");
+				ImGui::TextUnformatted("This frame generation type does not report shown frames, so this curve is just the Pre-FG curve divided by the multiplier. Treat it as an estimate.");
 			}
 		}
 
@@ -859,7 +868,7 @@ void PerformanceOverlay::ConvertABTestResultsToRows(const std::vector<Aggregated
 					row.tooltip = "Total frame time.";
 					break;
 				case SpecialShaderType::Other:
-					row.tooltip = "Frame time left after the shader types, Community Shaders' own CPU cost and the Present wait: the engine's own work (culling, animation, scripts, physics, audio, vanilla UI), driver overhead and other SKSE plugins. Not attributable from inside a plugin.";
+					row.tooltip = "Frame time not covered by the other rows: the game engine's own work (scripts, physics, animation, AI, audio, vanilla UI), driver overhead and other SKSE plugins. Cannot be broken down further.";
 					break;
 				default:
 					// OurCpu / PresentWait are live-only rows; the A/B aggregator records
@@ -1500,34 +1509,19 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 	if (ImGui::IsItemHovered()) {
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::TextUnformatted(
-				"GPU time for Community Shaders' own passes, measured with D3D11 timestamp\n"
-				"queries and smoothed. Separate from the table above:\n"
-				"  - GPU clock, not the CPU QueryPerformanceCounter clock\n"
-				"  - read back a few frames late, so give it a second to settle\n"
-				"  - passes overlap each other and the CPU, so these do NOT sum to frame time\n"
-				"  - never subtracted from the CPU table above\n"
-				"A row disappears about a second after its feature stops running, so the table\n"
-				"shows exactly what the current settings are actually executing. A feature that\n"
-				"is switched off has no row here rather than a row of zeros, and so does one\n"
-				"whose queries never came back. \"< 0.01 ms\" means measured but below the GPU\n"
-				"timer's resolution - real, just too small to put a number on.\n"
-				"\n"
-				"The four summary rows at the bottom DO add up, and they account for the whole\n"
-				"GPU frame:\n"
-				"  Measured GPU + Untracked GPU + Gap = GPU frame (elapsed)\n"
-				"They come from a second, frame-spanning timestamp pair around Present. Hover\n"
-				"each one: \"elapsed\" is not \"busy\", and the gap row is not pure idle.");
+				"GPU time of Community Shaders' own effects. It is separate from the CPU table above, "
+				"takes about a second to settle, and passes overlap, so these rows do not add up to frame time.\n\n"
+				"A row only appears while its effect is running. \"< 0.01 ms\" means it ran but was too small to measure.\n\n"
+				"The four rows at the bottom do add up to the whole GPU frame:\n"
+				"  Measured GPU + Untracked GPU + Gap = GPU frame (elapsed)");
 		}
 	}
 
 	bool anyTestData = !overlay.testData.empty();
 	auto legends = overlay.BuildDrawCallLegends(theme, anyTestData);
 	auto columns = overlay.BuildPassTableColumns(theme, legends, anyTestData, "GPU Time (%)",
-		"Intervals: how many separate timestamp intervals this frame's sample is the sum of.\n"
-		"A bucket can measure several disjoint stretches of one frame - Volumetric Lighting\n"
-		"has four (generate, raymarch, both blurs). This replaces Draw Calls and\n"
-		"Cost/Call, which are not defined for a compute pass: a GPU bucket has no draw calls,\n"
-		"so Cost/Call was a hard zero on every row.");
+		"Intervals: how many separately timed pieces of work this row adds up each frame "
+		"(Volumetric Lighting has four, for example).");
 
 	std::vector<std::function<bool(const DrawCallRow&, const DrawCallRow&, bool)>> sorters;
 	for (const auto& col : columns)
@@ -1550,11 +1544,8 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 	gpuSummaryRows.push_back(DrawCallRow{
 		"Measured GPU:", kGpuTotalRowId, intervalSum, bucketSum,
 		Util::CalculatePercentage(bucketSum, smoothedFrameTime), 0.0f,
-		std::string("Sum of the GPU buckets above: Community Shaders' own passes and nothing "
-					"else, so a LOWER BOUND on how busy the GPU actually was.\n\n"
-					"What is missing from it now has its own row: see \"Untracked GPU\" below "
-					"for the engine's own rendering plus DLSS super resolution, and \"Gap\" for "
-					"the Present window where DLSS-G frame generation runs."),
+		std::string("Sum of the rows above: only Community Shaders' own effects, so the GPU was busy at least this long. "
+					"The game's own rendering is in \"Untracked GPU\" below, and frame generation in \"Gap\"."),
 		true, std::nullopt, std::nullopt });
 
 	// Whole-frame GPU timeline (batch 14). The bucket rows above only ever cover our own
@@ -1573,48 +1564,29 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 		gpuSummaryRows.push_back(DrawCallRow{
 			"Untracked GPU (engine + DLSS):", kGpuUntrackedRowId, kDrawCallsNotApplicable, untrackedMs,
 			Util::CalculatePercentage(untrackedMs, smoothedFrameTime), 0.0f,
-			std::string("GPU work in this frame that is NOT one of our passes. This is the row that "
-						"used to be missing entirely.\n\n"
-						"Computed as the GPU-timeline stretch between the end of the previous Present "
-						"and the start of this one, minus \"Measured GPU\" above.\n\n"
-						"What lives here: the game engine's own rendering (shadow maps, the opaque and "
-						"alpha passes, water, the vanilla post chain), DLSS/FSR super resolution, and "
-						"any gaps inside the frame where the GPU had nothing submitted to it. DLSS-G "
-						"frame generation is NOT here - it runs while Present is executing and lands "
-						"in the gap row below.\n\n"
-						"Large here and small in \"Measured GPU\" means Community Shaders is not what "
-						"is costing you the frame. The reverse means it is.\n\n"
-						"The \"Engine passes (GPU)\" table below splits this up by stage."),
+			std::string("GPU time this frame that is not one of our effects: the game's own rendering "
+						"(shadows, scenery, water, its post-processing) and DLSS/FSR upscaling. "
+						"Frame generation is not here; it is in \"Gap\".\n\n"
+						"Large here and small in \"Measured GPU\" means Community Shaders is not what is "
+						"costing you the frame. The \"Engine passes (GPU)\" table below breaks this down by stage."),
 			true, std::nullopt, std::nullopt });
 
 		gpuSummaryRows.push_back(DrawCallRow{
 			"Gap: idle / flip / frame-gen:", kGpuGapRowId, kDrawCallsNotApplicable, frameGpu.presentSpanMs,
 			Util::CalculatePercentage(frameGpu.presentSpanMs, smoothedFrameTime), 0.0f,
-			std::string("Elapsed GPU clock across the Present call itself, i.e. the part of the frame "
-						"in which nothing of the frame's own rendering is running.\n\n"
-						"It is a MIXTURE, not pure idle: the flip, vsync or frame-limiter pacing, "
-						"DLSS-G frame generation (which executes on its own queue during Present and "
-						"is therefore invisible to our timestamps), and genuine GPU idle while the CPU "
-						"is blocked. Treat it as an UPPER BOUND on how idle the GPU was.\n\n"
-						"With frame generation on, a large number here is expected and does not mean "
-						"there is headroom: much of it is the generated frames being produced, and more of "
-						"it the higher the multiplier."),
+			std::string("GPU time while the finished frame is being shown: the display flip, V-Sync or "
+						"frame-cap waiting, DLSS-G frame generation, and real idle time. Because it is a mix, "
+						"the GPU was idle at most this long.\n\n"
+						"With frame generation on, a large value is normal and does not mean spare GPU power; "
+						"it grows with the multiplier."),
 			true, std::nullopt, std::nullopt });
 
 		gpuSummaryRows.push_back(DrawCallRow{
 			"GPU frame (elapsed):", kGpuFrameElapsedRowId, kDrawCallsNotApplicable, frameGpu.frameElapsedMs,
 			Util::CalculatePercentage(frameGpu.frameElapsedMs, smoothedFrameTime), 0.0f,
-			std::string("Present-to-present distance measured on the GPU's own clock.\n\n"
-						"ELAPSED, NOT BUSY. A GPU timestamp reads a clock that keeps ticking while the "
-						"GPU has nothing to do, so this number includes every idle microsecond and in "
-						"steady state simply tracks wall-clock frame time. It is here as the "
-						"denominator for the two rows above and as a sanity check: if it does not "
-						"match \"Total\" in the table further up, the two clocks disagree and none of "
-						"the GPU numbers should be trusted.\n\n"
-						"There is no way to measure whole-frame GPU BUSY time from inside a D3D11 "
-						"plugin. What can be done is what the rows above do: bound it from below with "
-						"our own passes, size the rest of the frame's rendering, and bound the idle "
-						"from above."),
+			std::string("Time from one frame to the next on the GPU's clock. It includes idle time, so it "
+						"is not how busy the GPU was.\n\n"
+						"It should match \"Total\" in the shader-type table further up; if it does not, do not trust the GPU numbers."),
 			true, std::nullopt, std::nullopt });
 	}
 
@@ -1658,13 +1630,12 @@ namespace
 		static const std::vector<EnginePhaseGroup> layout = {
 			{ nullptr, nullptr,
 				{ { P::WaterPrep, "Water prep",
-					"Engine water work before the main view:\n"
-					"the reflection picture on water and the ripple maps." } } },
+					"Water work done before the main scene: water reflections and ripples." } } },
 			{ "Shadows", "Drawing the shadow maps, and applying them to the screen.",
 				{
 					{ P::ShadowSunCascade1, "Sun cascade 1",
-						"Sun/moon shadow map, cascade 1 - normally the sharp one\n"
-						"closest to the camera. Cascades are numbered in drawing order." },
+						"Sun/moon shadows are drawn in distance bands (cascades). Cascade 1 is "
+						"normally the sharp one closest to the camera." },
 					{ P::ShadowSunCascade2, "Sun cascade 2", "Sun/moon shadow map, cascade 2 (further out than 1)." },
 					{ P::ShadowSunCascade3, "Sun cascade 3", "Sun/moon shadow map, cascade 3." },
 					{ P::ShadowSunCascade4, "Sun cascade 4", "Sun/moon shadow map, cascade 4 (and any beyond)." },
@@ -1691,7 +1662,7 @@ namespace
 					{ P::Transparent, "Transparent & effects",
 						"See-through things drawn after the solid pass:\n"
 						"glass, particles, spell effects, fire, smoke, rain." },
-					{ P::WorldOther, "Other world work", "World-pass work before its first draw could be put in a row." },
+					{ P::WorldOther, "Other world work", "Main scene work that could not be assigned to any row here." },
 					{ P::FirstPerson, "First person", "Your hands and weapon in first person." },
 					{ P::Reflections, "Reflections", "The engine's cubemap reflections." },
 					{ P::Imagespace, "Post-processing (game)",
@@ -1749,12 +1720,9 @@ void PerformanceOverlay::DrawEngineGpuTable()
 	if (ImGui::IsItemHovered()) {
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::TextUnformatted(
-				"Where each frame's GPU time goes, stage by stage.\n"
-				"The GPU writes a timestamp every time the frame moves on to another\n"
-				"stage; each row is its time until the next stage started. Rows never\n"
-				"overlap, so they add up to Total.\n\n"
-				"Read it with the frame rate uncapped: if the GPU has to wait for the\n"
-				"CPU, the wait is billed to whichever stage was running.");
+				"Where each frame's GPU time goes, stage by stage. Rows do not overlap, so they add up to Total.\n\n"
+				"Read it with the frame rate uncapped: otherwise time the GPU spends waiting for the CPU "
+				"is counted in whichever stage was running.");
 		}
 	}
 
@@ -1854,9 +1822,8 @@ void PerformanceOverlay::DrawEngineGpuTable()
 	for (float d : report.draws)
 		totalDraws += d;
 	std::string totalTooltip =
-		"Sum of all rows: the GPU time from the end of the last Present to this\n"
-		"one. Should match \"Measured GPU\" + \"Untracked GPU\" in the table above.\n"
-		"The Present gap (where frame generation runs) is not included.\n\n";
+		"Sum of all rows: the GPU time for one frame, not counting the \"Gap\" where frame generation runs. "
+		"Should match \"Measured GPU\" + \"Untracked GPU\" in the table above.\n\n";
 	totalTooltip += std::format("Timestamps per frame: {:.0f}", report.timestampsPerFrame);
 	if (report.droppedFrames > 0)
 		totalTooltip += std::format("\nFrames skipped (too many stage switches): {}", report.droppedFrames);
@@ -1887,26 +1854,17 @@ void PerformanceOverlay::DrawOurCpuPassTable(const std::vector<DrawCallRow>& our
 	if (ImGui::IsItemHovered()) {
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::TextUnformatted(
-				"What Community Shaders costs the CPU: building constant buffers, binding\n"
-				"resources and issuing dispatches. Wall clock, same smoothing as the table above.\n"
-				"  - these rows sum to the \"CS features (CPU)\" line above, exactly\n"
-				"  - they are NOT inside the shader-type rows; that time is subtracted there\n"
-				"  - so the table above still adds up to the frame time\n"
-				"Same feature names as the GPU table, so submit cost and execution cost can be\n"
-				"read side by side. A feature with no measurable cost gets no row.\n\n"
-				"Coverage: everything reachable from the deferred renderer's own orchestration.\n"
-				"Passes driven straight from engine hooks (the post-processing draw legs, the\n"
-				"upscale itself) are not in here; their GPU cost still is.");
+				"CPU time Community Shaders spends preparing each effect's work and sending it to the GPU. "
+				"These rows add up to the \"CS features (CPU)\" line above, and use the same names as the GPU table.\n\n"
+				"A feature with no measurable cost gets no row. Work started directly by the game "
+				"(most post-processing, the upscaling itself) is not included here.");
 		}
 	}
 
 	bool anyTestData = !overlay.testData.empty();
 	auto legends = overlay.BuildDrawCallLegends(theme, anyTestData);
 	auto columns = overlay.BuildPassTableColumns(theme, legends, false, "CPU Time (%)",
-		"Calls: how many times this bucket was entered in the last frame. A feature with\n"
-		"several instrumented entry points (a prepass plus a deferred pass) counts more\n"
-		"than one. Draw Calls and Cost/Call are not shown: these are compute submissions,\n"
-		"not draws, so both would be meaningless.");
+		"Calls: how many times this feature's CPU work ran in the last frame.");
 
 	std::vector<std::function<bool(const DrawCallRow&, const DrawCallRow&, bool)>> sorters;
 	for (const auto& col : columns)
@@ -1994,31 +1952,11 @@ void PerformanceOverlay::DrawBottleneckSummary()
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted(
-					"How this is decided: the share of the frame the CPU spends blocked inside\n"
-					"Present. Over 25% means the CPU is waiting on something downstream of it;\n"
-					"under 10% means the CPU never gets to idle.\n"
-					"\n"
-					"IMPORTANT: this is a CPU test, not a GPU test. A big Present wait does NOT\n"
-					"mean the GPU is busy. Vsync, a frame-rate cap, and Streamline pacing a\n"
-					"frame-generated presentation queue all park the CPU in Present with the GPU\n"
-					"mostly idle. \"GPU-bound (or frame-limited)\" really does mean \"or\".\n"
-					"\n"
-					"To find out where the GPU time goes, read the GPU Passes table instead:\n"
-					"\"Untracked GPU\" is the engine's own rendering plus DLSS super resolution,\n"
-					"and \"Gap\" is the Present window (flip, pacing, frame generation, idle).\n"
-					"\n"
-					"Error sources, honestly:\n"
-					"  - a Present wait can be the GPU, vsync, or a frame-rate limiter. Uncap the\n"
-					"    frame rate and switch frame generation off to tell them apart.\n"
-					"  - \"GPU (ours)\" is only OUR passes, so it is a LOWER BOUND on GPU busy\n"
-					"    time. The engine's own draws are not instrumented.\n"
-					"  - whole-frame GPU BUSY time still cannot be measured from inside a D3D11\n"
-					"    plugin. The frame-spanning timestamps are elapsed GPU clock, which keeps\n"
-					"    running while the GPU is idle; they are only useful because they are\n"
-					"    split at Present, which separates rendering from flip and frame-gen.\n"
-					"  - GPU numbers are read back a few frames late and passes overlap, so they\n"
-					"    do not line up frame-for-frame with the CPU numbers.\n"
-					"  - everything here is smoothed over roughly 20 frames.");
+					"Based on how much of the frame the CPU spends waiting for it to be shown (Present wait): "
+					"over 25% = GPU-bound, under 10% = CPU-bound, in between = balanced.\n\n"
+					"V-Sync, a frame-rate cap and frame generation also make the CPU wait, so "
+					"\"GPU-bound (or frame-limited)\" really means either. For a clean reading, uncap the "
+					"frame rate and turn frame generation off. Averaged over about 20 frames.");
 			}
 		}
 
@@ -2029,7 +1967,7 @@ void PerformanceOverlay::DrawBottleneckSummary()
 			(frameMs > 0.0f) ? (busyMs / frameMs * 100.0f) : 0.0f);
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Frame time minus the time blocked in Present. Wall clock, smoothed.");
+				ImGui::TextUnformatted("Time the CPU spent working this frame (frame time minus Present wait).");
 			}
 		}
 
@@ -2040,13 +1978,9 @@ void PerformanceOverlay::DrawBottleneckSummary()
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted(
-					"Measured with QueryPerformanceCounter around the real Present call: CPU time,\n"
-					"not GPU time.\n"
-					"\n"
-					"A GPU wait, a vsync wait, a frame-limiter wait and Streamline's frame-\n"
-					"generation pacing all land here and cannot be told apart. So this being large\n"
-					"does NOT mean the GPU was busy - and it does not mean the GPU was idle either.\n"
-					"For that, read \"Untracked GPU\" and \"Gap\" in the GPU Passes table.");
+					"Time the CPU spent waiting for the frame to be shown. Waiting on the GPU, V-Sync, a frame-rate cap "
+					"or frame generation pacing all look the same here, so a large value does not by itself mean the GPU is busy.\n\n"
+					"For the GPU side, see \"Untracked GPU\" and \"Gap\" in the GPU Passes table.");
 			}
 		}
 
@@ -2057,15 +1991,8 @@ void PerformanceOverlay::DrawBottleneckSummary()
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted(
-					"Sum of the GPU pass buckets: Community Shaders' own passes and nothing else.\n"
-					"An exact figure for OUR cost, and a lower bound on total GPU busy time.\n"
-					"\n"
-					"It used to be shown as \">= x ms\" because everything else on the GPU was\n"
-					"unmeasured. The line below now measures that remainder, so this one no longer\n"
-					"has to stand in for the whole GPU.\n"
-					"\n"
-					"Not comparable 1:1 with the CPU numbers - different clock, read back a few\n"
-					"frames late, and the passes overlap each other.");
+					"GPU time of Community Shaders' own effects (the GPU Passes rows added up). "
+					"Not directly comparable with the CPU numbers above.");
 			}
 		}
 
@@ -2084,18 +2011,9 @@ void PerformanceOverlay::DrawBottleneckSummary()
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted(
-					"From the frame-spanning timestamp pair around Present, split into the two\n"
-					"halves of the frame:\n"
-					"\n"
-					"  rendering - GPU time in the frame that is not one of our passes: the\n"
-					"              engine's own draws and DLSS/FSR super resolution.\n"
-					"  gap       - GPU time while Present is executing: the flip, vsync or\n"
-					"              frame-limiter pacing, DLSS-G frame generation on its own\n"
-					"              queue, and genuine idle. A mixture, so an upper bound on\n"
-					"              idle rather than a measurement of it.\n"
-					"\n"
-					"\"GPU (ours)\" + rendering + gap is the whole GPU frame. The GPU Passes table\n"
-					"shows the same three numbers as rows, with the total.");
+					"rendering = the game's own rendering plus DLSS/FSR upscaling.\n"
+					"gap = time while the frame is being shown: flip, V-Sync or frame-cap waiting, frame generation, and idle.\n\n"
+					"\"GPU (ours)\" + rendering + gap = the whole GPU frame (also shown as rows in the GPU Passes table).");
 			}
 		}
 
@@ -2183,7 +2101,7 @@ std::vector<ColumnConfig> PerformanceOverlay::BuildPassTableColumns(const Menu::
 		[]() {
 			if (ImGui::IsItemHovered()) {
 				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted("The instrumented pass group. Hover a name for what it covers.");
+					ImGui::TextUnformatted("Which effect is timed. Hover a name to see what it covers.");
 				}
 			}
 		} });
@@ -2452,11 +2370,9 @@ PerformanceOverlay::DrawCallRowSets PerformanceOverlay::BuildDrawCallRows() cons
 	DrawCallRow ourCpuRow = {
 		"CS features (CPU):", magic_enum::enum_integer(SpecialShaderType::OurCpu), kDrawCallsNotApplicable,
 		ourCpuTotal, Util::CalculatePercentage(ourCpuTotal, smoothedFrameTime), 0.0f,
-		std::string("CPU time Community Shaders itself spends preparing and submitting work: "
-					"constant buffers, resource binds and dispatch calls.\n\n"
-					"Broken down per feature in the \"Community Shaders (CPU submit)\" table below, "
-					"which sums exactly to this line. It is NOT part of the shader-type rows above - "
-					"those intervals have this time removed - so the whole table adds up."),
+		std::string("CPU time Community Shaders itself spends preparing work for the GPU. "
+					"Broken down per feature in the \"Community Shaders (CPU submit)\" table below; "
+					"it is not counted again in the shader rows above, so the table still adds up."),
 		true, std::nullopt, std::nullopt
 	};
 
@@ -2465,39 +2381,21 @@ PerformanceOverlay::DrawCallRowSets PerformanceOverlay::BuildDrawCallRows() cons
 		// of the "the GPU was idle 70% of the frame" misreading. It is CPU blocked time.
 		"Present wait (CPU blocked):", magic_enum::enum_integer(SpecialShaderType::PresentWait), kDrawCallsNotApplicable,
 		presentWaitMs, Util::CalculatePercentage(presentWaitMs, smoothedFrameTime), 0.0f,
-		std::string("CPU time blocked inside Present, measured around the real Present call. This "
-					"is a CPU measurement. It says nothing about whether the GPU was busy.\n\n"
-					"A large number here means only one thing: the CPU had nothing left to do. The "
-					"wait can be the GPU finishing, vsync, a frame-rate limiter, or - on D3D11 with "
-					"Streamline in the chain - the proxy Present pacing out a frame-generated "
-					"presentation queue. With DLSS-G on, most of this row is usually pacing, and "
-					"reading it as \"the GPU was busy 70% of the frame\" is the specific mistake it "
-					"invites.\n\n"
-					"For where the GPU time actually went, read the GPU Passes table: "
-					"\"Untracked GPU\" is the engine's own rendering plus super resolution, "
-					"\"Gap\" is the Present window itself (flip, pacing, frame generation, idle), "
-					"and \"GPU frame (elapsed)\" is the total they add up to.\n\n"
-					"To separate a real GPU wait from pacing: uncap the frame rate and switch frame "
-					"generation off, then watch whether this row stays large."),
+		std::string("Time the CPU spent waiting for the frame to be shown, i.e. it had nothing left to do. "
+					"This is not GPU load: waiting on the GPU, V-Sync, a frame-rate cap or DLSS-G pacing all land here, "
+					"and with DLSS-G on most of it is usually pacing.\n\n"
+					"For where GPU time goes, see the GPU Passes table. To tell a real GPU wait from pacing, "
+					"uncap the frame rate and turn frame generation off."),
 		true, std::nullopt, std::nullopt
 	};
 
 	DrawCallRow otherRow = {
 		"Engine (untracked):", magic_enum::enum_integer(SpecialShaderType::Other), kDrawCallsNotApplicable, otherFrameTime, otherPercent,
 		0.0f,
-		std::string("What is left of the frame after the shader-type rows, Community Shaders' own "
-					"CPU cost and the Present wait. It is not a Community Shaders cost and we "
-					"cannot break it down from inside a plugin.\n\n"
-					"What lives here: the engine's own per-frame work - visibility culling, "
-					"animation and skinning, Papyrus scripts, physics, navmesh and AI, audio, the "
-					"vanilla UI - plus D3D11 driver overhead and any other SKSE plugins in the "
-					"load order.\n\n"
-					"Why we cannot split it: attribution comes from hooking Community Shaders' own "
-					"call sites and the engine's draw submissions. Everything in this row happens "
-					"between draw submissions in engine code we do not hook, so there is no marker "
-					"to charge it against. Splitting it needs an external profiler.\n\n"
-					"A big number here is normal in Skyrim and usually means the game is CPU-bound "
-					"on engine work, not on rendering."),
+		std::string("Frame time not covered by the rows above: the game engine's own work (scripts, physics, "
+					"animation, AI, audio, vanilla UI), driver overhead and other SKSE plugins. Not a Community "
+					"Shaders cost, and it cannot be broken down further.\n\n"
+					"A large value is normal in Skyrim and usually means the game is limited by engine work, not rendering."),
 		true, otherTestFrameTime, otherTestCostPerCall
 	};
 	// Always use the actual total frame time for live data
@@ -2507,10 +2405,9 @@ PerformanceOverlay::DrawCallRowSets PerformanceOverlay::BuildDrawCallRows() cons
 	DrawCallRow totalRow = {
 		"Total:", magic_enum::enum_integer(SpecialShaderType::Total), static_cast<int>(globals::state->GetTotalSmoothedDrawCalls()), totalFrameTime, totalPercent,
 		totalCostPerCall,
-		std::string("Wall-clock frame time, smoothed the same way as every row above, so the rows "
-					"add up to it. The FPS readout at the top of the panel is an instantaneous "
-					"sample re-taken every Update Interval, so it can differ by a millisecond or "
-					"two - that is the difference between the two estimators, not an error."),
+		std::string("Frame time, smoothed the same way as the rows above so they add up to it. "
+					"It can differ by a millisecond or two from the FPS readout at the top, which is refreshed "
+					"every Update Interval; that is normal."),
 		true, totalTestFrameTime, totalTestCostPerCall
 	};
 	std::vector<DrawCallRow> summaryRows;

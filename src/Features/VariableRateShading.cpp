@@ -647,7 +647,7 @@ void VariableRateShading::DrawSettings()
 
 	ImGui::Checkbox("Enable", &settings.Enabled);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Draws flat, low-detail parts of the scene with fewer pixel-shader runs to save GPU time; off by default because it changes the image.");
+		ImGui::Text("Lowers shading detail on flat, low-detail parts of the scene to save GPU time. Off by default because it can make parts of the image softer; needs an NVIDIA RTX 20-series or newer card.");
 	}
 
 	ImGui::BeginDisabled(!settings.Enabled);
@@ -670,19 +670,19 @@ void VariableRateShading::DrawSettings()
 
 		ImGui::SliderFloat("Motion Boost", &settings.MotionPixels, 0.0f, 32.0f, settings.MotionPixels > 0.0f ? "%.0f px/frame" : "Off");
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Fast-moving parts of the screen may drop more detail; this is the speed at which the allowance doubles, 0 turns it off.");
+			ImGui::Text("Lets fast-moving parts of the screen drop more detail, since motion hides it. Lower values = stronger effect, more savings; 0 turns it off.");
 		}
 
 		ImGui::Checkbox("Protect Normal Detail", &settings.ProtectNormals);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Keeps bumpy surfaces at full detail so screen-space lighting (SSGI, SSRT) still sees crisp normals; turning it off saves a bit more.");
+			ImGui::Text("Keeps bumpy surfaces at full detail so screen-space lighting (SSGI, SSRT) still sees their fine surface shape. Turning it off saves a bit more.");
 		}
 	}
 
 	if (settings.RateMode != static_cast<uint32_t>(Mode::Adaptive)) {
 		ImGui::SliderFloat("Full-Detail Centre Size", &settings.PeripheryRadius, 0.1f, 2.0f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Radius of the screen centre that always stays at full detail, in half screen heights (1.0 touches the top and bottom).");
+			ImGui::Text("Size of the circle in the middle of the screen that always stays at full detail. 1.0 reaches the top and bottom edges.");
 		}
 	}
 
@@ -691,7 +691,7 @@ void VariableRateShading::DrawSettings()
 	if (ImGui::Combo("Coarsest Rate", &coarsest, rates, IM_ARRAYSIZE(rates)))
 		settings.CoarsestRate = static_cast<uint32_t>(coarsest);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("The biggest pixel block one shading result may cover; 4x4 saves more but can look blocky.");
+		ImGui::Text("The largest block of pixels that may share one shading result. 4x4 saves more but can look blocky.");
 	}
 
 	ImGui::SeparatorText("What to include");
@@ -740,7 +740,7 @@ void VariableRateShading::DrawSettings()
 			}
 			ImGui::Text("Opaque pixel-shader work: about %.0f%% of full rate", 100.0f * work / total);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Upper bound for the included objects; excluded draws (grass, cut-outs when off) still shade every pixel.");
+				ImGui::Text("Counts only the included objects. Anything excluded (grass or cut-outs when off) still runs at full detail, so the real saving is smaller.");
 			}
 		}
 	}

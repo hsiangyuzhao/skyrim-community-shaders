@@ -19,116 +19,60 @@ namespace Util
 		// Indexed by GpuBucket. Labels are the overlay row names (the overlay appends ':').
 		constexpr BucketInfo kBucketInfo[static_cast<int>(GpuBucket::Count)] = {
 			{ "SSRT Depth Pyramid",
-				"GPU time for the SSRT prepass: the depth linearisation and the Hi-Z pyramid\n"
-				"downsample chain the ray march traverses. Runs once per frame and is shared by\n"
-				"both chains, so it is charged here rather than to either of them. Measured with\n"
-				"D3D11 timestamp queries." },
+				"GPU time for SSRT's depth preparation, shared by its diffuse and specular parts." },
 			{ "SSRT Trace Diffuse",
-				"GPU time for the diffuse ray march (and the SHARC update/resolve dispatches where\n"
-				"that path is built in). Split out from the old combined SSRT Trace row so the\n"
-				"diffuse and specular chains, which have independent toggles, can be priced\n"
-				"separately." },
+				"GPU time for SSRT's diffuse (bounce light) ray tracing." },
 			{ "SSRT Sparse Resolve",
-				"GPU time for the diffuse sparse-sampling resolve: the pass that turns a\n"
-				"half-resolution or checkerboard ray march back into the three full-resolution\n"
-				"surfaces the denoiser, the confidence filter and the composite read. Only runs\n"
-				"while Diffuse Sampling is not Full. This is the row to read against SSRT Trace\n"
-				"Diffuse: the sparse modes are worth having only while the drop in that row is\n"
-				"larger than the figure here, and everything after this pass costs exactly what\n"
-				"it cost at full density." },
+				"GPU time for filling in the full-resolution result when Diffuse Sampling is not Full. "
+				"Sparse sampling only pays off if it lowers SSRT Trace Diffuse by more than this row costs." },
 			{ "SSRT Trace Specular",
-				"GPU time for the specular leg's prepare-color pass and specular ray march. Split\n"
-				"out from the old combined SSRT Trace row; compare against SSRT Trace Diffuse to\n"
-				"see how the ray-marching cost divides between the two chains." },
+				"GPU time for SSRT's specular (reflection) ray tracing." },
 			{ "SSRT Composite",
-				"GPU time for the diffuse composite: the ambient-reinjection application and, when\n"
-				"the Low-Resolution Confidence Filter is off, the full-resolution 7x7 confidence\n"
-				"window folded into the same dispatch. The specular signal has no composite of its\n"
-				"own - the deferred composite adds it, which is not instrumented here." },
+				"GPU time for adding SSRT's diffuse light to the image. With the Low-Resolution "
+				"Confidence Filter off, the confidence filter's cost is counted here too." },
 			{ "SSRT SVGF",
-				"GPU time for the hand-written SVGF denoiser: temporal, variance and a-trous passes,\ndiffuse and specular chains combined. Only shown while the SSRT Denoiser is set to SVGF." },
+				"GPU time for the SVGF denoiser (diffuse and specular). Only shown while the SSRT Denoiser is set to SVGF." },
 			{ "SSRT REBLUR",
-				"GPU time for the NRD REBLUR denoiser: all REBLUR dispatches plus the back-end\n"
-				"unpack, diffuse and specular combined. The front-end pack that used to be counted\n"
-				"here no longer exists - the ray march writes REBLUR's input layout directly, so\n"
-				"that cost is now inside the SSRT Trace rows and is smaller than it was. Only shown\n"
-				"while the SSRT Denoiser is set to REBLUR." },
+				"GPU time for the REBLUR denoiser (diffuse and specular). Only shown while the SSRT Denoiser is set to REBLUR." },
 			{ "SSRT Confidence Filter",
-				"GPU time for the ambient-reinjection confidence filter: the quarter-resolution\n"
-				"depth-aware downsample, the two separable joint-bilateral blur passes and the\n"
-				"joint-bilateral upsample back to full resolution. Purely spatial - it reads no\n"
-				"history and no previous frame. Only shown while Ambient Reinjection and the\n"
-				"Low-Resolution Confidence Filter are both on; with the filter off the same work\n"
-				"is a 7x7 full-resolution window folded into the diffuse composite, which is\n"
-				"charged to the SSRT Composite row instead." },
+				"GPU time for the low-resolution confidence filter. Only shown while Ambient Reinjection and the "
+				"Low-Resolution Confidence Filter are both on; otherwise its cost is in SSRT Composite." },
 			{ "NRD Guides",
-				"GPU time for NRD::PrepareGuides: the viewZ and packed normal+roughness dispatch\n"
-				"plus the full-resource copy of the game's motion-vector target that REBLUR needs\n"
-				"as both an SRV and a UAV. Runs once per frame, and only when a chain has actually\n"
-				"resolved to REBLUR - with SVGF or Off selected it does not run at all. It used to\n"
-				"be the one stretch of the denoising path with no timing row of its own." },
+				"GPU time for preparing the extra inputs the REBLUR denoiser needs. Only runs while REBLUR is in use." },
 			{ "SSGI",
-				"GPU time for the Screen Space GI compute chain (prefilter, radiance, GI, blur, upsample),\nexcluding the Contact AO pass which has its own row." },
+				"GPU time for Screen Space GI, not counting Contact AO (which has its own row)." },
 			{ "SSGI Contact AO",
 				"GPU time for the SSGI Contact AO pass." },
 			{ "PhysicalSky ShadowAccum",
-				"GPU time for the Physical Sky aerial-perspective shadow accumulation pass.\n"
-				"Predicted to be Physical Sky's single largest cost: it is dispatched at full\n"
-				"resolution while writing a half-resolution target, so ~3/4 of its threads do\n"
-				"a full 30-step loop and then throw the result away." },
+				"GPU time for Physical Sky's shadows in the air (aerial perspective). Expected to be Physical Sky's largest cost." },
 			{ "PhysicalSky LUTs",
-				"GPU time for all four Physical Sky lookup tables together: transmittance,\n"
-				"multiscatter, sky-view and aerial perspective. Regenerated every frame even\n"
-				"though only UI changes affect the first two; expected to be small (<0.1 ms),\n"
-				"so this row mainly confirms that it is not worth optimising." },
+				"GPU time for rebuilding Physical Sky's lookup tables each frame. Expected to be very small (under 0.1 ms)." },
 			{ "Skylighting Height Map",
-				"GPU time for the Skylighting height-map geometry depth pass, rendered every\n"
-				"frame with no throttling even when the camera is still and the probes have\n"
-				"converged. Includes the precipitation-mask draw when it rains." },
+				"GPU time for drawing Skylighting's height map of the scene, done every frame. Includes the rain mask when it rains." },
 			{ "Skylighting Probes",
-				"GPU time for the Skylighting probe volume update dispatch. Dispatched over the\n"
-				"whole volume every frame with roughly 3/4 of the threads exiting out of bounds;\n"
-				"the real cost is expected to be the in-bounds read-modify-write bandwidth." },
+				"GPU time for updating Skylighting's light probes, done every frame." },
 			{ "Terrain Blending",
-				"GPU time for Terrain Blending: depth clear, the full-screen blend compute pass,\n"
-				"the full-resolution depth copy and the blended terrain passes. This feature has\n"
-				"no user toggle, and indoors the whole chain is expected to be a no-op that still\n"
-				"costs its full price - compare this row indoors and outdoors." },
+				"GPU time for Terrain Blending. It has no on/off switch and still runs indoors." },
 			{ "SSPLS",
-				"GPU time for the Screen Space Point Light Shadows PrepareDepth chain: depth\n"
-				"linearisation, two GenerateMips calls and four blur dispatches. The outputs of\n"
-				"this chain have no reader anywhere in the project, so whatever this row shows\n"
-				"is the price of work nothing consumes." },
+				"GPU time for Screen Space Point Light Shadows' depth preparation. "
+				"Nothing currently uses its result, so this time is wasted." },
 			{ "Post Processing",
-				"GPU time for the whole post-processing chain, both legs: the pre-upscale pass\n"
-				"and the pre-tonemap pass, including their format-convert and copy tails.\n"
-				"Individual effects are not split out because nesting timestamp queries is not\n"
-				"safe in D3D11; toggle effects one at a time to attribute the cost." },
+				"GPU time for all post-processing effects combined. To see one effect's cost, turn effects off one at a time." },
 			{ "Subsurface Scattering",
-				"GPU time for the skin subsurface scattering chain (Separable or Burley) plus its\n"
-				"composite. Expected to be dominated by full-screen bandwidth serving under 5%\n"
-				"of pixels; only runs on frames that actually draw faces." },
+				"GPU time for skin subsurface scattering. Only runs on frames that draw faces." },
 			{ "Light Limit Fix",
-				"GPU time for Light Limit Fix cluster building and light culling. Cluster building\n"
-				"is dispatched with one thread per group, so most of each GPU wave is idle, and\n"
-				"the cluster grid is rebuilt every frame even though it only depends on the\n"
-				"projection." },
+				"GPU time for Light Limit Fix sorting lights into screen areas." },
 			{ "Volumetric Lighting",
-				"GPU time for volumetric lighting: the generate pass, the raymarch pass and both\n"
-				"blur passes, accumulated into one row." },
+				"GPU time for volumetric lighting (light shafts), all passes combined." },
 			{ "Dynamic Cubemaps",
-				"GPU time for the dynamic cubemap update. The feature runs one of capture,\n"
-				"inferrence or irradiance convolution per frame in a round-robin, so this row is\n"
-				"the smoothed per-frame cost across the cycle rather than one pass." },
+				"GPU time for updating dynamic cubemap reflections. The work is spread over several frames, "
+				"so this is the average per frame." },
 			{ "Grass Optimizations",
-				"GPU time Grass Optimizations adds before grass is drawn: uploads of newly loaded\n"
-				"grass cells, the Hi-Z occlusion pyramid and the per-instance culling dispatches.\n"
-				"With the optimized path off only the cell uploads remain, so it should read ~0.\n"
-				"The grass draws themselves are engine work and are not part of this row." },
+				"GPU time Grass Optimizations adds before grass is drawn (loading new grass, culling hidden grass). "
+				"Drawing the grass itself is not included." },
 			{ "Variable Rate Shading",
-				"GPU overhead of Variable Rate Shading itself: building the shading-rate image\n"
-				"before the opaque pass and analysing the lit scene after it (plus the debug\n"
-				"tint when shown). The savings appear in the engine's own geometry time." },
+				"GPU time Variable Rate Shading itself costs (plus its debug overlay when shown). "
+				"Its savings show up in the engine's opaque geometry time, not here." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
@@ -683,59 +627,47 @@ namespace Util
 		// with the raw key.
 		constexpr CpuBucketDoc kCpuBucketDocs[] = {
 			{ "ScreenSpaceRayTracing", "SSRT",
-				"CPU time spent issuing SSRT work: constant-buffer updates, resource binds and\n"
-				"dispatch calls for the prepasses, the diffuse and specular chains and the\n"
-				"denoiser. This is submission cost only - the GPU execution cost is the SSRT\n"
-				"rows in the GPU table." },
+				"CPU time spent sending SSRT work to the GPU. Its GPU cost is in the SSRT rows of the GPU table." },
 			{ "ScreenSpaceGI", "SSGI",
-				"CPU time spent issuing the Screen Space GI chain. Submission cost only; see\n"
-				"the SSGI row in the GPU table for execution cost." },
+				"CPU time spent sending Screen Space GI work to the GPU. Its GPU cost is in the SSGI row of the GPU table." },
 			{ "Skylighting", "Skylighting",
-				"CPU time spent on Skylighting: probe update dispatch plus the height-map pass\n"
-				"setup, which includes the engine-side precipitation-mask plumbing it reuses." },
+				"CPU time spent on Skylighting's probe update and height-map setup." },
 			{ "PhysicalSky", "PhysicalSky",
-				"CPU time spent issuing Physical Sky's LUT generation and shadow accumulation." },
+				"CPU time spent sending Physical Sky's work to the GPU." },
 			{ "DynamicCubemaps", "Dynamic Cubemaps",
-				"CPU time spent issuing the dynamic cubemap update (capture / inferrence /\n"
-				"irradiance convolution round-robin) and the post-deferred leg." },
+				"CPU time spent on the dynamic cubemap reflection update." },
 			{ "LightLimitFix", "Light Limit Fix",
-				"CPU time spent building the light list and issuing cluster building and light\n"
-				"culling. The per-light CPU loop lives here, so this row can be much larger than\n"
-				"the GPU row of the same name." },
+				"CPU time spent building the light list and sending light sorting work to the GPU. "
+				"Can be much larger than the GPU row of the same name." },
 			{ "PostProcessing", "Post Processing",
-				"CPU time spent on the post-processing chain's prepass leg. The main draw legs\n"
-				"are driven from an engine hook rather than from Deferred.cpp and are NOT\n"
-				"included; their GPU cost is in the GPU table." },
+				"CPU time for a small part of post-processing setup only. Most post-processing CPU work "
+				"is not counted here; its GPU cost is in the GPU table." },
 			{ "TerrainBlending", "Terrain Blending",
-				"CPU time spent on Terrain Blending's prepass leg." },
+				"CPU time spent on Terrain Blending's preparation step." },
 			{ "VolumetricLighting", "Volumetric Lighting",
-				"CPU time spent issuing volumetric lighting: generate, raymarch and both blurs." },
+				"CPU time spent sending volumetric lighting work to the GPU." },
 			{ "SubsurfaceScattering", "Subsurface Scattering",
-				"CPU time spent issuing the skin subsurface scattering chain and its composite." },
+				"CPU time spent sending skin subsurface scattering work to the GPU." },
 			{ "ScreenSpacePointLightShadows", "SSPLS",
-				"CPU time spent issuing the Screen Space Point Light Shadows PrepareDepth chain." },
+				"CPU time spent sending Screen Space Point Light Shadows work to the GPU." },
 			{ "ScreenSpaceShadows", "Screen Space Shadows",
-				"CPU time spent issuing the screen space shadow passes." },
+				"CPU time spent sending screen space shadow work to the GPU." },
 			{ "TerrainShadows", "Terrain Shadows",
-				"CPU time spent issuing the terrain shadow height-map passes." },
+				"CPU time spent sending terrain shadow work to the GPU." },
 			{ "NRD", "NRD Guides",
-				"CPU time spent publishing this frame's NRD guide buffers (viewZ, normal +\n"
-				"roughness, motion vectors) for the REBLUR denoiser instances." },
+				"CPU time spent preparing the extra inputs the REBLUR denoiser needs." },
 			{ "Upscaling", "Upscaling",
-				"CPU time spent in the upscaler's per-frame bookkeeping reached from the deferred\n"
-				"path. The upscale itself runs from an engine hook and is not included here." },
+				"CPU time for the upscaler's per-frame bookkeeping. The upscaling itself is not included." },
 			{ "Deferred Composite", "Deferred Composite",
-				"CPU time spent binding the ~22 SRVs and issuing the deferred composite dispatch\n"
-				"that consumes every feature's output." },
+				"CPU time spent setting up the final lighting pass that combines every feature's output." },
 			{ "Shared Data", "Shared Data",
-				"CPU time spent gathering and uploading the per-frame shared constant buffer that\n"
-				"every Community Shaders shader reads. Runs up to three times per frame." },
+				"CPU time spent gathering the per-frame data every Community Shaders shader reads. "
+				"Runs up to three times per frame." },
 			{ "TruePBR", "TruePBR",
-				"CPU time spent in the TruePBR prepass." },
+				"CPU time spent on TruePBR's per-frame setup." },
 			{ "GrassOptimizations", "Grass Optimizations",
-				"CPU time spent in Grass Optimizations' once-per-frame update: folding newly loaded\n"
-				"grass cells into buckets, the per-bucket CPU slice cull and issuing the culling\n"
-				"dispatches. The indirect grass draws themselves stay in the Grass row above." },
+				"CPU time for Grass Optimizations' per-frame work: sorting newly loaded grass and choosing what to draw. "
+				"Drawing the grass itself stays in the Grass row of the table above." },
 		};
 
 		const CpuBucketDoc* FindCpuDoc(std::string_view a_key)
@@ -748,8 +680,8 @@ namespace Util
 		}
 
 		constexpr const char* kCpuGenericTooltip =
-			"CPU time Community Shaders spends preparing and submitting this feature's work.\n"
-			"Submission cost only - what the GPU then does with it is a separate measurement.";
+			"CPU time Community Shaders spends preparing this feature's work and sending it to the GPU. "
+			"The GPU's own time for it is measured separately.";
 	}
 
 	CpuPassTimers* CpuPassTimers::GetSingleton()

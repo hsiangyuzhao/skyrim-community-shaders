@@ -35,12 +35,12 @@ struct VariableRateShading : Feature
 	virtual std::pair<std::string, std::vector<std::string>> GetFeatureSummary() override
 	{
 		return {
-			"Shades flat, low-detail parts of the scene at a lower rate to cut the pixel-shader cost of the "
-			"engine's opaque geometry pass. Requires an NVIDIA RTX (Turing or newer) GPU.",
-			{ "Content-adaptive 16x16 tile shading rates from the previous frame",
-				"Optional fixed screen-edge mode",
-				"Only the opaque G-buffer pass is affected; shadows, UI and post-processing never are",
-				"Debug view of the per-tile shading rate" }
+			"Lowers shading detail on flat, low-detail parts of the scene to save GPU time, which can make them slightly softer. "
+			"Needs an NVIDIA RTX 20-series or newer GPU; not available in VR.",
+			{ "Adapts to the picture: lowers detail only where the last frame looked flat",
+				"Optional mode that lowers detail towards the screen edges",
+				"Only solid scene geometry is affected; shadows, UI and post-processing never are",
+				"Debug overlay showing where detail is lowered" }
 		};
 	}
 
