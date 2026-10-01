@@ -16,6 +16,7 @@
 #include "Features/SubsurfaceScattering.h"
 #include "Features/TerrainBlending.h"
 #include "Features/Upscaling.h"
+#include "Features/VariableRateShading.h"
 
 #include "Hooks.h"
 #include "Utils/GpuPhaseTimeline.h"
@@ -464,6 +465,10 @@ void Deferred::StartDeferred()
 	auto* timeline = Util::GpuPhaseTimeline::GetSingleton();
 	timeline->Pop(Util::GpuScope::CsOther);
 	timeline->Push(Util::GpuScope::Opaque);
+
+	// Last, so none of the prepass work above can run under a coarse shading rate. Inside the
+	// Opaque scope; its own rate-image dispatch is billed to "our timed passes" by GpuPassTimers.
+	globals::features::variableRateShading.BeginOpaquePass();
 }
 
 void Deferred::DeferredPasses()
@@ -654,6 +659,10 @@ void Deferred::DeferredPasses()
 
 void Deferred::EndDeferred()
 {
+	// Before the early-outs: the opaque pass is over whatever happens next. VRS is switched off
+	// first so the shading-rate window nests inside the timeline's Opaque scope.
+	globals::features::variableRateShading.EndOpaquePass();
+
 	// (batch 36) Closed before the early returns; a no-op if StartDeferred never opened it.
 	Util::GpuPhaseTimeline::GetSingleton()->Pop(Util::GpuScope::Opaque);
 
@@ -684,6 +693,10 @@ void Deferred::EndDeferred()
 	{
 		Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOther);
 		DeferredPasses();  // Perform deferred passes and composite forward buffers
+
+		// Measures the lit opaque scene for next frame's shading rates. Our work, so it stays
+		// in the CsOther scope; its dispatches are billed to "our timed passes" by GpuPassTimers.
+		globals::features::variableRateShading.AnalyzeFrame();
 	}
 
 	stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);  // Run OMSetRenderTargets again

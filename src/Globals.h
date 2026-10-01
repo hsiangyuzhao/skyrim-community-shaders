@@ -38,6 +38,7 @@ struct Upscaling;
 struct PostProcessing;
 struct Skin;
 struct ExponentialHeightFog;
+struct VariableRateShading;
 
 class State;
 class Deferred;
@@ -100,6 +101,7 @@ namespace globals
 		extern PostProcessing postProcessing;
 		extern Skin skin;
 		extern ExponentialHeightFog exponentialHeightFog;
+		extern VariableRateShading variableRateShading;
 
 		namespace llf
 		{
