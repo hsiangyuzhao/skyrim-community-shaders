@@ -12,6 +12,7 @@
 #include "Features/TerrainBlending.h"
 #include "Features/TerrainHelper.h"
 #include "Features/Upscaling.h"
+#include "Features/VariableRateShading.h"
 #include "Menu.h"
 #include "SettingsOverrideManager.h"
 #include "ShaderCache.h"
@@ -29,6 +30,9 @@ void State::Draw()
 	auto& skin = globals::features::skin;
 	auto truePBR = globals::truePBR;
 	auto context = globals::d3d::context;
+
+	// Per-draw shading-rate selection; a single branch unless the opaque pass has VRS bound.
+	globals::features::variableRateShading.OnDraw();
 
 	if (shaderCache->IsEnabled()) {
 		if (terrainBlending.loaded)

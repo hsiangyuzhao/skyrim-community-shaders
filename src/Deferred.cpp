@@ -16,6 +16,7 @@
 #include "Features/SubsurfaceScattering.h"
 #include "Features/TerrainBlending.h"
 #include "Features/Upscaling.h"
+#include "Features/VariableRateShading.h"
 
 #include "Hooks.h"
 #include "Utils/GpuTimers.h"
@@ -453,6 +454,9 @@ void Deferred::StartDeferred()
 	PrepassPasses();
 
 	OverrideBlendStates();
+
+	// Last, so none of the prepass work above can run under a coarse shading rate.
+	globals::features::variableRateShading.BeginOpaquePass();
 }
 
 void Deferred::DeferredPasses()
@@ -643,6 +647,9 @@ void Deferred::DeferredPasses()
 
 void Deferred::EndDeferred()
 {
+	// Before the early-outs: the opaque pass is over whatever happens next.
+	globals::features::variableRateShading.EndOpaquePass();
+
 	if (!globals::state->inWorld)
 		return;
 
@@ -668,6 +675,9 @@ void Deferred::EndDeferred()
 	context->OMSetRenderTargets(0, nullptr, nullptr);  // Unbind all bound render targets
 
 	DeferredPasses();  // Perform deferred passes and composite forward buffers
+
+	// Measures the lit opaque scene for next frame's shading rates.
+	globals::features::variableRateShading.AnalyzeFrame();
 
 	stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);  // Run OMSetRenderTargets again
 

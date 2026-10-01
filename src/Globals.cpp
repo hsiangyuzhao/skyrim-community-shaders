@@ -36,6 +36,7 @@
 #include "Features/Upscaling.h"
 #include "Features/VanillaFresnel.h"
 #include "Features/VR.h"
+#include "Features/VariableRateShading.h"
 #include "Features/VolumetricLighting.h"
 #include "Features/WaterEffects.h"
 #include "Features/WeatherPicker.h"
@@ -96,6 +97,7 @@ namespace globals
 		PostProcessing postProcessing{};
 		Skin skin{};
 		ExponentialHeightFog exponentialHeightFog{};
+		VariableRateShading variableRateShading{};
 
 		namespace llf
 		{

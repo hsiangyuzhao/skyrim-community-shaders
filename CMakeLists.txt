@@ -124,6 +124,9 @@ target_include_directories(
         # submodule rather than being a package of their own, and Streamline only exports its
         # own include directory, so this one has to be named explicitly.
         "${CMAKE_SOURCE_DIR}/extern/Streamline-DX12/external/ngx-sdk/include"
+        # NVAPI headers (MIT), for Variable Rate Shading. Types only: the functions are resolved
+        # at runtime from the driver's nvapi64.dll, so no NVAPI library is linked.
+        "${CMAKE_SOURCE_DIR}/extern/Streamline-DX12/external/nvapi"
 )
 
 target_link_libraries(
