@@ -581,7 +581,9 @@ void Deferred::DeferredPasses()
 			dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr,
 			dynamicCubemaps.loaded && skylighting.loaded ? skylighting.texProbeArray->srv.get() : nullptr,
 			dynamicCubemaps.loaded && skylighting.loaded ? skylighting.stbn_vec3_2Dx1D_128x128x64.get() : nullptr,
-			ssgi_ao,
+			// t10 (batch 36b) Screen Space Ray Tracing's denoiser AO when its AO Source asks for it and it
+			// wrote one this frame (DrawSSRTDiffuse, above); Screen Space GI's AO otherwise.
+			(ssrt.loaded && ssrt.AoOverrideSRV()) ? ssrt.AoOverrideSRV() : ssgi_ao,
 			ssgi_hq_spec ? nullptr : ssgi_y,
 			ssgi_hq_spec ? nullptr : ssgi_cocg,
 			ssgi_hq_spec ? ssgi_gi_spec : nullptr,

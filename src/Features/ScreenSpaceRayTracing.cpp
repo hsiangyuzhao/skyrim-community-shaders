@@ -44,6 +44,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurDirectMotionVectors,
     ReblurFoldDiffuseUnpack,
     ReblurMode,
+    AoSource,
     ReblurDiffuse,
     ReblurSpecular,
     ReblurMerged,
@@ -105,6 +106,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurDirectMotionVectors,
     ReblurFoldDiffuseUnpack,
     ReblurMode,
+    AoSource,
     ReblurDiffuse,
     ReblurSpecular,
     ReblurMerged,
@@ -249,6 +251,37 @@ void ScreenSpaceRayTracing::DrawSettings()
             ImGui::SliderInt("Confidence Frames", (int*)&settings.AmbientConfidenceMaxFrames, 1, 60, "%d", ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
                 ImGui::Text("How many frames are averaged. Higher = less grain but slower to catch up when the view changes; 30 is a good default.");
+        }
+    }
+
+    // (batch 36b) AO source. Only meaningful while SSRT diffuse lights the frame.
+    ImGui::SeparatorText("Ambient Occlusion");
+    {
+        static const char* aoSources[] = { "Screen Space GI", "Denoiser + SSGI Contact AO", "Denoiser Only" };
+        int ao = (int)std::min(settings.AoSource, (uint)kAoDenoiserOnly);
+        if (ImGui::Combo("AO Source", &ao, aoSources, 3))
+            settings.AoSource = (uint)ao;
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Where the darkening in corners and creases comes from while traced bounce light is on.\n"
+                "Screen Space GI = as before. Denoiser + SSGI Contact AO = the bounce-light denoiser's AO plus SSGI's tiny contact shadows; "
+                "saves most of SSGI's cost. Denoiser Only = SSGI is not run at all; cheapest, but small creases (hair, clothing folds) get lighter.\n"
+                "Needs the REBLUR denoiser; otherwise Screen Space GI is used automatically.");
+        if (settings.AoSource != kAoSsgi) {
+            if (denoiserAoActive)
+                ImGui::TextDisabled("Now: denoiser AO%s", settings.AoSource == kAoDenoiserContact ?
+                                                              (globals::features::screenSpaceGI.contactAoActive ? " + SSGI Contact AO" : " (SSGI Contact AO is off)") :
+                                                              "");
+            else {
+                const char* why = !Batch36::IsOn()                                  ? "the Batch 36 master switch is off" :
+                                  !globals::features::screenSpaceGI.loaded           ? "Screen Space GI is not installed" :
+                                  REL::Module::IsVR()                                ? "VR has no REBLUR" :
+                                  !settings.EnableDiffuse                            ? "Enable Diffuse is off" :
+                                  effectiveDenoiserDiffuse != kDenoiserREBLUR        ? "the denoiser is not REBLUR" :
+                                  !lastDiffuseReblurOk                               ? "REBLUR failed last frame (see the log)" :
+                                                                                       "a shader failed to load (see the log)";
+                ImGui::TextDisabled("Now: Screen Space GI, because %s.", why);
+            }
         }
     }
 
@@ -741,6 +774,9 @@ void ScreenSpaceRayTracing::DrawSettings()
             BUFFER_VIEWER_NODE(texNRDSpecOutput, debugRescale)
         if (texCheckerDebug)
             BUFFER_VIEWER_NODE(texCheckerDebug, debugRescale)
+        // (batch 36b) The denoiser AO (AO Source not Screen Space GI); white = occluded.
+        if (texSSRTAo)
+            BUFFER_VIEWER_NODE(texSSRTAo, debugRescale)
         if (auto validation = settings.ReblurMerged.EnableValidation ? nrdReblurMerged.GetValidationSRV() : nullptr) {
             if (ImGui::TreeNode("NRD Validation (Efficiency mode)")) {
                 ImGui::Image(validation, { nrdReblurMerged.GetWidth() * debugRescale, nrdReblurMerged.GetHeight() * debugRescale });
@@ -785,6 +821,7 @@ void ScreenSpaceRayTracing::SanitizeSettings()
     settings.DenoiserMethod = std::min(settings.DenoiserMethod, (uint)kDenoiserREBLUR);
     // (batch 36b) Likewise for the REBLUR layout.
     settings.ReblurMode = std::min(settings.ReblurMode, (uint)kReblurEfficiency);
+    settings.AoSource = std::min(settings.AoSource, (uint)kAoDenoiserOnly);
 
     // DIFFUSE_SPP is a compile-time macro and the ray march's sample loop divides by it.
     // 0 is a divide by zero in the estimator; the 16 ceiling is the Hammersley table's.
@@ -1536,6 +1573,45 @@ bool ScreenSpaceRayTracing::EnsureCheckerDebugTexture()
     return true;
 }
 
+// (batch 36b) The denoiser AO surface (Settings::AoSource). R8_UNORM in SSGI's AO convention, so
+// every consumer reads it exactly as it reads SSGI's. 8 MiB at a 4K allocation; allocated the first
+// time a denoiser tier runs and kept until a resolution change.
+bool ScreenSpaceRayTracing::EnsureAoTexture()
+{
+    if (texSSRTAo)
+        return true;
+    auto mainTex = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return false;
+    D3D11_TEXTURE2D_DESC mainDesc{};
+    mainTex.texture->GetDesc(&mainDesc);
+    D3D11_TEXTURE2D_DESC texDesc{
+        .Width = mainDesc.Width,
+        .Height = mainDesc.Height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R8_UNORM,
+        .SampleDesc = { 1, 0 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+    };
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+    };
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipSlice = 0 }
+    };
+    texSSRTAo = eastl::make_unique<Texture2D>(texDesc);
+    texSSRTAo->CreateSRV(srvDesc);
+    texSSRTAo->CreateUAV(uavDesc);
+    Util::SetResourceName(texSSRTAo->resource.get(), "SSRT::DenoiserAO");
+    return true;
+}
+
 // (batch 36b) The configuration half of the efficiency-mode question. Everything here is a fact
 // about settings and compiled shaders; resources are EnsureNRDResources' business.
 bool ScreenSpaceRayTracing::WantEfficiencyMode() const
@@ -1752,6 +1828,10 @@ void ScreenSpaceRayTracing::ResetFrameState()
     texNRDSpecOutput = nullptr;
     texCheckerDebug = nullptr;
     mergedReblurActive = false;
+    texSSRTAo = nullptr;
+    denoiserAoActive = false;
+    lastDenoiserAoActive = false;
+    denoiserAoWrittenThisFrame = false;
     mergedReblurInitFailed = false;
     efficiencyActive = false;
     efficiencyThisFrame = false;
@@ -2104,6 +2184,37 @@ void ScreenSpaceRayTracing::Prepass()
     ResolveDenoisers();
     // (batch 36b) Set by DrawSSRTDiffuse when it runs the efficiency path; read by DrawSSRTSpecular.
     efficiencyThisFrame = false;
+    denoiserAoWrittenThisFrame = false;
+
+    // (batch 36b) AO source for this frame, decided here because Screen Space GI draws before either
+    // SSRT pass and asks SsgiAoDemand(). The denoiser AO exists only while REBLUR really denoises the
+    // diffuse signal: SVGF, Off, VR, and the frame after a failed REBLUR dispatch all fall back to
+    // Screen Space GI in full -- which restarts its own history on the way back (DrawSSGI). Every AO
+    // consumer is compiled under Screen Space GI's define, so without that feature there is nothing
+    // for a denoiser AO to feed.
+    {
+        bool chainShaders = true;
+        for (const auto& cs : diffuseCompositeB36BCS)
+            chainShaders = chainShaders && cs;
+        const bool wantDenoiserAo =
+            loaded && Batch36::IsOn() && settings.AoSource != kAoSsgi && !REL::Module::IsVR() &&
+            globals::features::screenSpaceGI.loaded && settings.EnableDiffuse && DiffuseChainReady() &&
+            effectiveDenoiserDiffuse == kDenoiserREBLUR && lastDiffuseReblurOk && chainShaders;
+        denoiserAoActive = wantDenoiserAo && EnsureAoTexture();
+        if (denoiserAoActive != lastDenoiserAoActive) {
+            // The ray march reads texSSRTAo reprojected from the previous frame, which on the first
+            // frame of a denoiser tier is not a previous frame's AO at all: start it unoccluded.
+            if (denoiserAoActive) {
+                const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                globals::d3d::context->ClearUnorderedAccessViewFloat(texSSRTAo->uav.get(), zero);
+            }
+            // The diffuse hit-distance channel changes meaning with it (SSRTCB::HitDistIsVisibility)
+            // unless efficiency mode already had it in that meaning, so restart the diffuse history.
+            resetReblurDiffuse = true;
+            resetReblurMerged = true;
+        }
+        lastDenoiserAoActive = denoiserAoActive;
+    }
 
     // (guard G8) Before the enable gate below, so a transition is never missed just because
     // both passes happened to be off on the frame it occurred; the flag latches until a
@@ -2348,6 +2459,9 @@ ScreenSpaceRayTracing::SSRTCB ScreenSpaceRayTracing::BuildSpecularCB(bool a_nrdF
         if (a_checkerboard && settings.CheckerboardDebugView)
             flags |= kRaymarchCheckerDebug;
         ssrCBData.RaymarchFlags = flags;
+        // (batch 36b) Denoiser AO tier: this frame's texSSRTAo if the diffuse composite already wrote
+        // it (quality mode traces specular after it), last frame's reprojected otherwise.
+        ssrCBData.AoFetchReprojected = (denoiserAoActive && !denoiserAoWrittenThisFrame) ? 1u : 0u;
     }
     return ssrCBData;
 }
@@ -2514,7 +2628,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     srvs.at(6) = noiseSRV.get();
     srvs.at(7) = envTexture;
     srvs.at(8) = inInterior ? envTexture : envReflectionsTexture;
-    srvs.at(9) = ssgi_ao;
+    srvs.at(9) = denoiserAoActive ? texSSRTAo->srv.get() : ssgi_ao;  // (batch 36b) AO source
     srvs.at(10) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.texProbeArray->srv.get() : nullptr;
     srvs.at(11) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.stbn_vec3_2Dx1D_128x128x64.get() : nullptr;
 
@@ -3225,7 +3339,11 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // (deviation 3) -- with the radiance weighted to match whenever reinjection consumes it.
         ssrCBData.CheckerboardTrace = efficiency ? 1u : 0u;
         ssrCBData.NRDFrameIndex = efficiency ? globals::features::nrd.GetCommonSettings().frameIndex : 0u;
-        ssrCBData.HitDistIsVisibility = efficiency ? 1u : 0u;
+        // (batch 36b) ...and the denoiser AO tiers read the same channel as their AO.
+        ssrCBData.HitDistIsVisibility = (efficiency || denoiserAoActive) ? 1u : 0u;
+        // (batch 36b) Under a denoiser AO tier t9 is texSSRTAo, which this frame's composite has not
+        // written yet: the fallbacks read last frame's, reprojected.
+        ssrCBData.AoFetchReprojected = denoiserAoActive ? 1u : 0u;
         ssrCBData.ProximityCoverage = (efficiency && settings.EnableAmbientReinjection) ? 1u : 0u;
         ssrCBData.RaymarchFlags = (efficiency && settings.CheckerboardDebugView) ? kRaymarchCheckerDebug : 0u;
     }
@@ -3309,7 +3427,10 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     srvs.at(6) = noiseSRV.get();
     srvs.at(7) = envTexture;
     srvs.at(8) = inInterior ? envTexture : envReflectionsTexture;
-    srvs.at(9) = ssgi_ao;
+    // (batch 36b) The AO the fallbacks occlude with: SSGI's, or under a denoiser tier last frame's
+    // denoiser AO (SSRTCB::AoFetchReprojected tells the shader to read it reprojected).
+    ID3D11ShaderResourceView* const fallbackAo = denoiserAoActive ? texSSRTAo->srv.get() : ssgi_ao;
+    srvs.at(9) = fallbackAo;
     srvs.at(10) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.texProbeArray->srv.get() : nullptr;
     srvs.at(11) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.stbn_vec3_2Dx1D_128x128x64.get() : nullptr;
     srvs.at(12) = albedo.SRV;
@@ -3371,7 +3492,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         srvs.at(6) = noiseSRV.get();
         srvs.at(7) = envTexture;
         srvs.at(8) = inInterior ? envTexture : envReflectionsTexture;
-        srvs.at(9) = ssgi_ao;
+        srvs.at(9) = fallbackAo;
         srvs.at(10) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.texProbeArray->srv.get() : nullptr;
         srvs.at(11) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.stbn_vec3_2Dx1D_128x128x64.get() : nullptr;
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
@@ -3737,6 +3858,22 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         state->EndPerfEvent();
     }
 
+    // (batch 36b) Denoiser AO tier: the composite also publishes texSSRTAo from the denoised
+    // visibility (times Screen Space GI's contact term in the contact tier), and the traced light it
+    // adds is pre-compensated for DeferredCompositeCS's sqrt(AO), so those rays' own AO never lands
+    // on their own indirect light (deviation 4 always holds for this AO). Only when REBLUR really
+    // denoised the signal this frame -- otherwise .w is not a visibility, nothing is written, and
+    // DeferredCompositeCS keeps reading Screen Space GI's texture for this one frame.
+    ID3D11ShaderResourceView* contactVisibility = nullptr;
+    if (denoiserAoActive && nrdFrontEndPack) {
+        compositeFlags |= kCompositeWriteAo | kCompositeTracedSkipsAo;
+        if (settings.AoSource == kAoDenoiserContact) {
+            contactVisibility = ssgi.GetContactVisibilitySRV();
+            if (contactVisibility)
+                compositeFlags |= kCompositeAoContact;
+        }
+    }
+
     // composite
     Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTComposite);
     {
@@ -3745,6 +3882,14 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         srvs.at(1) = albedo.SRV;
 
         uint uavCount = 1;
+        // (batch 36b) The B36B twin's extra inputs: depth (sky test) at t4, Screen Space GI's contact
+        // visibility at t7 and its AO at t8 (the AO DeferredCompositeCS will apply when it is not the
+        // denoiser's), and texSSRTAo at u3.
+        if (compositeFlags != 0) {
+            srvs.at(4) = depth.depthSRV;
+            srvs.at(7) = contactVisibility;
+            srvs.at(8) = ssgi_ao;
+        }
         if (!confidenceFilter) {
             // (ambient reinjection) The pass doubles as the confidence smoothing filter: it reads
             // the raw surface at t3 and publishes the depth-aware 7x7 mean at u1 for
@@ -3780,6 +3925,10 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         //
         // (batch 36b) Re-uploaded rather than only rebound: efficiency mode's specular trace and unpack
         // wrote their own constants into the same buffer, and CompositeFlags is settled only now.
+        if ((compositeFlags & kCompositeWriteAo) != 0) {
+            uavs.at(3) = texSSRTAo->uav.get();
+            uavCount = 4;
+        }
         ssrCBData.CompositeFlags = compositeFlags;
         ssrtCB->Update(ssrCBData);
         buffer = ssrtCB->CB();
@@ -3804,6 +3953,10 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
 
         resetViews();
+
+        // (batch 36b) DeferredCompositeCS and a quality-mode specular trace read it from here on.
+        if ((compositeFlags & kCompositeWriteAo) != 0)
+            denoiserAoWrittenThisFrame = true;
 
         // (reinjection noise) This frame's accumulator becomes next frame's history. A pointer
         // swap, matching the moment pair at the end of the SVGF block, so no copy is issued.
@@ -3923,8 +4076,13 @@ ScreenSpaceRayTracing::SharedData ScreenSpaceRayTracing::GetCommonBufferData()
     // (P2.4 follow-up) contactAoActive rather than settings.EnableContactAo, because the setting
     // is the request and this is what the pass is doing. It is the same predicate DrawSSGI
     // dispatches on, so this flag and the texture's contents cannot disagree.
+    //
+    // (batch 36b) Under a denoiser AO tier the texture the ray march reads is texSSRTAo, which carries
+    // the contact term only in the contact tier (and only if that pass is running). denoiserAoActive
+    // is last frame's here -- this runs ahead of Prepass -- which costs one frame at a switch.
     const bool ssgiContactLive =
-        ssgi.loaded && ssgi.settings.Enabled && ssgi.contactAoActive && ssgi.ShadersOK();
+        ssgi.loaded && ssgi.settings.Enabled && ssgi.contactAoActive && ssgi.ShadersOK() &&
+        (!denoiserAoActive || settings.AoSource == kAoDenoiserContact);
     data.SsgiContactAoActive = ssgiContactLive ? 1u : 0u;
     data.SsgiContactRadius = ssgi.settings.ContactRadius;
     return data;

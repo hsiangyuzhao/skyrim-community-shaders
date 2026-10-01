@@ -69,6 +69,17 @@ struct ScreenSpaceRayTracing : Feature
         kReblurEfficiency = 1,
     };
 
+    /// @brief (batch 36b) Values of Settings::AoSource.
+    enum AoSourceValue : uint
+    {
+        /// @brief Screen Space GI computes the AO (36a: AO only while SSRT diffuse supplies the light).
+        kAoSsgi = 0,
+        /// @brief REBLUR's denoised diffuse hit distance is the AO; SSGI runs only its Contact AO pass.
+        kAoDenoiserContact = 1,
+        /// @brief REBLUR's denoised diffuse hit distance is the AO; SSGI does not run at all.
+        kAoDenoiserOnly = 2,
+    };
+
     /// @brief (batch 36b) RaymarchFlags / CompositeFlags bits, mirrored by ssrt_cb.hlsli.
     static constexpr uint kRaymarchPrevFrameColor = 1u;
     static constexpr uint kRaymarchSpecMissComposite = 2u;
@@ -452,6 +463,18 @@ struct ScreenSpaceRayTracing : Feature
         /// Quality: batch 34's two independent instances at full density (plus 36a's folded unpack
         /// and direct motion vectors). Also what the Batch 36 master switch forces.
         uint ReblurMode = kReblurEfficiency;
+        /// @brief (batch 36b) Where the ambient occlusion comes from while SSRT diffuse is lighting the
+        /// frame; one of AoSourceValue. The AO has four consumers -- DeferredCompositeCS's darkening
+        /// (diffuse and cubemap specular), the specular fallback's occlusion and the diffuse cubemap /
+        /// beta fallback in ssrt_raymarch.hlsl, and the contact shadows folded into that same texture --
+        /// and the denoiser tiers feed all four from texSSRTAo instead of SSGI's AO texture.
+        ///
+        /// The denoiser tiers need REBLUR actually denoising the diffuse signal (its hit-distance
+        /// channel then carries REBLUR's AO convention, see SSRTCB::HitDistIsVisibility). Under SVGF or
+        /// Off, in VR, without Screen Space GI installed, or the frame after a failed REBLUR dispatch,
+        /// there is no denoiser AO and Screen Space GI runs in full again, with its history reset.
+        /// Default SSGI: the 36a picture.
+        uint AoSource = kAoSsgi;
         /// @brief (batch C1) REBLUR tuning for the diffuse instance. NRD defaults.
         NRD::REBLURSettings ReblurDiffuse;
         /// @brief (batch C1) REBLUR tuning for the specular instance. Defaults taken
@@ -1404,6 +1427,21 @@ struct ScreenSpaceRayTracing : Feature
     void DrawSSRTSpecular();
     void DrawSSRTDiffuse();
 
+    /// @brief (batch 36b) What Screen Space GI has left to do this frame under Settings::AoSource:
+    /// 0 = everything (as before), 1 = only its Contact AO pass, 2 = nothing.
+    [[nodiscard]] uint SsgiAoDemand() const
+    {
+        if (!loaded || !denoiserAoActive)
+            return 0u;
+        return settings.AoSource == kAoDenoiserContact ? 1u : 2u;
+    }
+    /// @brief (batch 36b) The AO texture DeferredCompositeCS should read at t10 this frame instead of
+    /// Screen Space GI's, or null to keep SSGI's.
+    [[nodiscard]] ID3D11ShaderResourceView* AoOverrideSRV() const
+    {
+        return (loaded && denoiserAoWrittenThisFrame && texSSRTAo) ? texSSRTAo->srv.get() : nullptr;
+    }
+
     /// @brief (batch 36) DrawSSRTDiffuse's whole-chain guard (S1.4) as a predicate: every shader
     /// and surface the diffuse chain needs exists. Shared with GetCommonBufferData.
     [[nodiscard]] bool DiffuseChainReady() const;
@@ -1719,6 +1757,16 @@ struct ScreenSpaceRayTracing : Feature
     bool efficiencyThisFrame = false;
     /// @brief (batch 36b) Whether the last diffuse REBLUR dispatch (either layout) completed.
     bool lastDiffuseReblurOk = true;
+    /// @brief (batch 36b) Denoiser AO (Settings::AoSource). Resolved once per frame in Prepass, before
+    /// Screen Space GI draws (it asks SsgiAoDemand()). texSSRTAo is R8_UNORM in SSGI's AO convention
+    /// (occlusion, consumers read 1 - value), written by the batch 36b composite each frame and read
+    /// motion-reprojected by the ray-march passes that run before it.
+    bool denoiserAoActive = false;
+    bool lastDenoiserAoActive = false;
+    bool denoiserAoWrittenThisFrame = false;
+    eastl::unique_ptr<Texture2D> texSSRTAo = nullptr;
+    bool EnsureAoTexture();
+
     /// @brief (batch 36b) Settings::CheckerboardDebugView target, R8G8B8A8_UNORM, full size.
     eastl::unique_ptr<Texture2D> texCheckerDebug = nullptr;
 

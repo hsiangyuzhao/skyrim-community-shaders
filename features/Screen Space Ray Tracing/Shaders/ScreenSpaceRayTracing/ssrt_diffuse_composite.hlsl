@@ -68,6 +68,18 @@ RWTexture2D<float4> ConfidenceHistoryRW : register(u2);
 // (batch 36b) CONF_FROM_DENOISER publishes the confidence here; the internal-filter variant
 // already declares this slot above and the two jobs never run together.
 RWTexture2D<float> SSRTConfidenceSmoothRW : register(u1);
+// The internal-filter variant declares the depth buffer at t4 for its 7x7 window; this one needs it
+// for the sky test below.
+Texture2D<float> DepthTexture : register(t4);
+#endif
+#ifdef SSRT_COMPOSITE_B36B
+// (batch 36b) WRITE_AO / AO_CONTACT / TRACED_SKIPS_AO. t7: Screen Space GI's contact visibility (1 =
+// unoccluded) in the contact tier. t8: Screen Space GI's AO texture, i.e. what DeferredCompositeCS
+// applies when the AO is not the denoiser's. u3: the denoiser AO surface, in that same convention
+// (occlusion; consumers read 1 - value), so every consumer reads it exactly as it read SSGI's.
+Texture2D<unorm float> ContactVisibilityTexture : register(t7);
+Texture2D<float4> SsgiAoTexture : register(t8);
+RWTexture2D<unorm float> DenoiserAoRW : register(u3);
 #endif
 
 #ifndef SSRT_CONF_EXTERNAL_FILTER
@@ -382,10 +394,30 @@ groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
     // 1 = every ray of the neighbourhood missed or hit far away, 0 = all of them hit close by.
     // saturate() also maps a NaN (sky texels REBLUR never writes) to 0.
     const float denoisedVisibility = saturate(ssrtDiffuse.w);
+    // Sky and far plane: REBLUR never wrote them, and DeferredCompositeCS multiplies the sky colour
+    // itself by the AO, so they must read as unoccluded and as zero confidence.
+    const bool b36Sky = SSRT_IS_FAR_PLANE(DepthTexture[dispatchID.xy]);
 #   ifdef SSRT_CONF_EXTERNAL_FILTER
     [branch] if ((CompositeFlags & SSRT_COMPOSITE_FLAG_CONF_FROM_DENOISER) != 0)
-        SSRTConfidenceSmoothRW[dispatchID.xy] = 1.0 - denoisedVisibility;
+        SSRTConfidenceSmoothRW[dispatchID.xy] = b36Sky ? 0.0 : 1.0 - denoisedVisibility;
 #   endif
+    // The occlusion DeferredCompositeCS will apply at this pixel, in SSGI's convention.
+    float b36AoOcclusion = 0.0;
+    [branch] if ((CompositeFlags & SSRT_COMPOSITE_FLAG_WRITE_AO) != 0)
+    {
+        // REBLUR's denoised diffuse hit distance *is* an AO (NRD's own convention, which the ray
+        // march packs it in under SSRTCB::HitDistIsVisibility); the contact tier multiplies Screen
+        // Space GI's centimetre-scale contact visibility in, exactly as SSGI folds it into its own.
+        float visibility = denoisedVisibility;
+        [branch] if ((CompositeFlags & SSRT_COMPOSITE_FLAG_AO_CONTACT) != 0)
+            visibility *= ContactVisibilityTexture[dispatchID.xy];
+        b36AoOcclusion = b36Sky ? 0.0 : saturate(1.0 - visibility);
+        DenoiserAoRW[dispatchID.xy] = b36AoOcclusion;
+    }
+    else
+    {
+        b36AoOcclusion = saturate(SsgiAoTexture[dispatchID.xy].x);
+    }
 #endif
     // (guard G9) The last gate in the chain, and the one that decides whether an SSRT
     // failure is a local artefact or a global one. ColorTextureRW is kMAIN: whatever is
@@ -407,6 +439,22 @@ groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
     ssrtDiffuse.rgb = min(filterInf(filterNaN(ssrtDiffuse.rgb)), SSRT_MAX_RADIANCE);
     float4 albedo = AlbedoTexture[dispatchID.xy];
     float4 originalColor = ColorTextureRW[dispatchID.xy];
+#ifdef SSRT_COMPOSITE_B36B
+    // (batch 36b) TRACED_SKIPS_AO (deviation 4, and always under the denoiser AO). DeferredCompositeCS
+    // multiplies everything left in MAIN after the ambient removal by sqrt(MultiBounceAO(albedo, AO))
+    // -- direct light and this traced light alike. AO is a statement about the ambient term; the
+    // traced light already *is* the occluded answer for those directions, so darkening it again is
+    // a double count (and under the denoiser AO it would be the same rays darkening their own light).
+    // Pre-dividing by the very factor the composite will multiply by lands it there unchanged. The
+    // factor is rebuilt from the same albedo, the same AO texel and the same function the composite
+    // uses; the 0.05 floor only matters where MultiBounceAO is under 0.0025, i.e. full occlusion.
+    [branch] if ((CompositeFlags & SSRT_COMPOSITE_FLAG_TRACED_SKIPS_AO) != 0)
+    {
+        const float3 linAlbedoAo = Color::IrradianceToLinear(albedo.xyz / Color::PBRLightingScale);
+        const float3 compositeAo = sqrt(Color::MultiBounceAO(linAlbedoAo, 1.0 - b36AoOcclusion));
+        ssrtDiffuse.rgb /= max(compositeAo, 0.05);
+    }
+#endif
 
     float3 color = Color::IrradianceToGamma(ssrtDiffuse.xyz * Color::IrradianceToLinear(albedo.xyz) + Color::IrradianceToLinear(originalColor.xyz));
     ColorTextureRW[dispatchID.xy] = float4(color, originalColor.w);

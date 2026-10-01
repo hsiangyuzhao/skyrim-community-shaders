@@ -1013,7 +1013,45 @@ void ScreenSpaceGI::DrawSSGI()
 		// (directional env v2) Zero is also the honest value here: confidence 0 means "no
 		// data", which the composite turns into the flat vanilla ambient.
 		context->ClearUnorderedAccessViewFloat(texEnvIrradiance[outputIlIdx]->uav.get(), clr);
+		contactVisibilityThisFrame = nullptr;
 		return;
+	}
+
+	// (batch 36b) Screen Space Ray Tracing's AO Source. When REBLUR's denoised hit distance is the
+	// AO, this feature has nothing left to compute except, in the contact tier, its Contact AO pass;
+	// SSRT folds that into its own AO surface and DeferredCompositeCS reads that surface instead of
+	// texAo. SSRT decided this in its Prepass, i.e. already for this frame.
+	contactVisibilityThisFrame = nullptr;
+	const uint aoDemand = globals::features::screenSpaceRayTracing.SsgiAoDemand();
+	if (aoDemand != 0) {
+		// On the way in: DeferredCompositeCS still binds the IL, specular, bent-normal and
+		// environment slots (and discards them through a runtime branch), so every slot is zeroed
+		// once to keep what it reads a finite zero. The AO slots too, for any frame on which SSRT
+		// does not publish its own (the composite then reads "unoccluded" rather than stale AO).
+		if (lastAoDemand == 0) {
+			FLOAT zero[4] = { 0.f, 0.f, 0.f, 0.f };
+			for (int i = 0; i < 2; ++i) {
+				context->ClearUnorderedAccessViewFloat(texAo[i]->uav.get(), zero);
+				context->ClearUnorderedAccessViewFloat(texIlY[i]->uav.get(), zero);
+				context->ClearUnorderedAccessViewFloat(texIlCoCg[i]->uav.get(), zero);
+				context->ClearUnorderedAccessViewFloat(texGiSpecular[i]->uav.get(), zero);
+				context->ClearUnorderedAccessViewFloat(texBentNormal[i]->uav.get(), zero);
+				context->ClearUnorderedAccessViewFloat(texEnvIrradiance[i]->uav.get(), zero);
+			}
+		}
+		lastAoDemand = aoDemand;
+		if (aoDemand == 1 && contactAoActive)
+			DrawContactAoOnly();
+		return;
+	}
+	// On the way out: AO, IL and the accumulation counters were not maintained while SSRT supplied
+	// the AO, so every pixel restarts -- the same zero-frames state as a disocclusion, exactly as the
+	// skip-IL transition below does it.
+	if (lastAoDemand != 0) {
+		FLOAT zero[4] = { 0.f, 0.f, 0.f, 0.f };
+		context->ClearUnorderedAccessViewFloat(texAccumFrames[0]->uav.get(), zero);
+		context->ClearUnorderedAccessViewFloat(texAccumFrames[1]->uav.get(), zero);
+		lastAoDemand = 0;
 	}
 
 	ZoneScoped;
@@ -1296,8 +1334,7 @@ void ScreenSpaceGI::DrawSSGI()
 	// SSGI's own temporal chain and compound it once per frame. Full-resolution mode therefore
 	// composites into the other slot of the pair, which is free at this point in the frame, and
 	// leaves inputAoTexIdx alone.
-	static uint lastFrameContactIdx = 0;
-	uint contactIdx = lastFrameContactIdx;
+	uint contactIdx = contactHistoryIdx;
 	uint aoOutIdx = inputAoTexIdx;
 
 	// (P2.4 follow-up) contactAoActive, not settings.EnableContactAo: the setting says what the
@@ -1328,7 +1365,7 @@ void ScreenSpaceGI::DrawSSGI()
 		context->Dispatch((resolution[0] + 7u) >> 3, (resolution[1] + 7u) >> 3, 1);
 
 		contactIdx = !contactIdx;
-		lastFrameContactIdx = contactIdx;
+		contactHistoryIdx = contactIdx;
 
 		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSGIContactAO);
 	}
@@ -1381,6 +1418,61 @@ void ScreenSpaceGI::DrawSSGI()
 	samplers.fill(nullptr);
 	cb = nullptr;
 
+	context->CSSetConstantBuffers(1, 1, &cb);
+	context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
+	context->CSSetShader(nullptr, nullptr, 0);
+}
+
+// (batch 36b) Contact AO on its own, for Screen Space Ray Tracing's "Denoiser + SSGI Contact AO"
+// tier. The pass reads only the depth buffer, the normals, the motion vectors and its own history --
+// nothing the rest of SSGI produces -- so it runs alone unchanged. In full-resolution mode its
+// shader also composites into SSGI's AO channel (CONTACT_COMPOSE); that input and output are left
+// unbound here (an unbound SRV reads 0 = unoccluded, an unbound UAV write is dropped), and SSRT
+// folds the visibility into its own AO surface instead.
+void ScreenSpaceGI::DrawContactAoOnly()
+{
+	auto context = globals::d3d::context;
+	auto renderer = globals::game::renderer;
+	auto rts = renderer->GetRuntimeData().renderTargets;
+
+	UpdateSB();
+
+	float2 size = Util::ConvertToDynamic(globals::state->screenSize);
+	const uint width = (uint)size.x;
+	const uint height = (uint)size.y;
+
+	std::array<ID3D11SamplerState*, 2> samplers = { pointClampSampler.get(), linearClampSampler.get() };
+	auto cb = ssgiCB->CB();
+	context->CSSetConstantBuffers(1, 1, &cb);
+	context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
+
+	TracyD3D11Zone(globals::state->tracyCtx, "SSGI - Contact AO (alone)");
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSGIContactAO);
+
+	std::array<ID3D11ShaderResourceView*, 5> srvs = { nullptr };
+	std::array<ID3D11UnorderedAccessView*, 2> uavs = { nullptr };
+	srvs.at(0) = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].depthSRV;
+	srvs.at(1) = rts[NORMALROUGHNESS].SRV;
+	srvs.at(2) = rts[RE::RENDER_TARGET::kMOTION_VECTOR].SRV;
+	srvs.at(3) = texContactAo[contactHistoryIdx]->srv.get();
+	uavs.at(0) = texContactAo[!contactHistoryIdx]->uav.get();
+
+	context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+	context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
+	context->CSSetShader(contactAoCompute.get(), nullptr, 0);
+	context->Dispatch((width + 7u) >> 3, (height + 7u) >> 3, 1);
+
+	contactHistoryIdx = !contactHistoryIdx;
+	contactVisibilityThisFrame = texContactAo[contactHistoryIdx]->srv.get();
+
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSGIContactAO);
+
+	srvs.fill(nullptr);
+	uavs.fill(nullptr);
+	context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+	context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
+	samplers.fill(nullptr);
+	cb = nullptr;
 	context->CSSetConstantBuffers(1, 1, &cb);
 	context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
 	context->CSSetShader(nullptr, nullptr, 0);

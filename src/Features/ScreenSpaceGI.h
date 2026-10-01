@@ -282,4 +282,16 @@ public:
 	[[nodiscard]] bool SkipILSwitchOn() const;
 	/// @brief (batch 36) Last frame's ShouldSkipIL(), for the history reset on the way back.
 	bool lastFrameSkippedIL = false;
+
+	/// @brief (batch 36b) Last frame's ScreenSpaceRayTracing::SsgiAoDemand() (0 = full, 1 = Contact AO
+	/// only, 2 = nothing), for the clears on the way in and the history reset on the way out.
+	uint lastAoDemand = 0;
+	/// @brief Which texContactAo slot holds the latest contact visibility (was a function-static).
+	uint contactHistoryIdx = 0;
+	/// @brief (batch 36b) This frame's contact visibility (R8, 1 = unoccluded) when the Contact AO pass
+	/// ran on its own for SSRT's "Denoiser + SSGI Contact AO" tier; null otherwise.
+	ID3D11ShaderResourceView* contactVisibilityThisFrame = nullptr;
+	[[nodiscard]] ID3D11ShaderResourceView* GetContactVisibilitySRV() const { return contactVisibilityThisFrame; }
+	/// @brief (batch 36b) The Contact AO pass alone, for that tier.
+	void DrawContactAoOnly();
 };

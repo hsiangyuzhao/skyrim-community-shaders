@@ -798,6 +798,26 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     return isFiniteSafe(ratio) ? ratio : 1.0f;
 }
 
+#if defined(DYNAMIC_CUBEMAPS) && defined(SSGI)
+// (batch 36b) The fallbacks' AO, in SSGI's convention (occlusion). t9 is Screen Space GI's AO, read in
+// place as always -- or, under SSRT's denoiser AO tiers, texSSRTAo. That surface is written by the
+// diffuse composite, i.e. after every ray march that runs before it, so those passes read last
+// frame's at this pixel's motion-reprojected position (AoFetchReprojected). Same reprojection as
+// ReprojectHit: uv plus the motion vector, point-loaded, previous frame's dynamic-resolution ratio.
+float SSRT_FallbackAoOcclusion(uint2 px, float2 uv)
+{
+    int2 aoPx = int2(px);
+    [branch] if (AoFetchReprojected != 0)
+    {
+        const int2 motionMax = int2(SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy) - 1;
+        const float2 prevUV = uv + MotionVectorTexture[clamp(int2(px), int2(0, 0), motionMax)].xy;
+        const float2 prevExtent = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw;
+        aoPx = clamp(int2(prevUV * prevExtent), int2(0, 0), int2(prevExtent) - 1);
+    }
+    return saturate(SsgiAoTexture[aoPx].x);
+}
+#endif
+
 [numthreads(8, 8, SAMPLES_PER_PIXEL)] void main(uint3 groupID : SV_GroupID,
                                                 uint3 groupThreadID : SV_GroupThreadID,
                                                 uint3 DTid : SV_DispatchThreadID)
@@ -1357,7 +1377,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             float ao = lerp(1.0, occlusion, OcclusionStrength);
 #   endif
 #   if defined(SSGI)
-            ao *= 1 - saturate(SsgiAoTexture[SSRT_GBUFFER_COORDS].x);
+            ao *= 1 - SSRT_FallbackAoOcclusion(SSRT_GBUFFER_COORDS, uv);  // (batch 36b) SSGI's or the denoiser's
 #   endif
 #   if defined(SSRT_SPECULAR)
             ao = GetSpecularOcclusionFromAmbientOcclusion(NdotV, ao, roughness);
@@ -1389,7 +1409,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             [branch] if (CubemapFillBlend > 0.0) {
                 float fillAo = 1.0;
 #       if defined(SSGI)
-                fillAo = 1 - saturate(SsgiAoTexture[SSRT_GBUFFER_COORDS].x);
+                fillAo = 1 - SSRT_FallbackAoOcclusion(SSRT_GBUFFER_COORDS, uv);
 #       endif
                 ambientFillColor = envColor * Color::MultiBounceAO(albedo, fillAo);
                 ambientFillBlend = CubemapFillBlend;
