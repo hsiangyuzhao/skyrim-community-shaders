@@ -73,23 +73,31 @@ struct VS_OUTPUT
 		float3 InputPosition : TEXCOORD4;
 #endif
 
+	// centroid: under Variable Rate Shading one pixel-shader invocation covers a 2x2 / 4x4 block
+	// and is evaluated at the block centre, which on thin (distant, grazing) triangles lies
+	// well outside the triangle. Plain interpolation then extrapolates these attributes far out
+	// of range (vertex colour / AO below 0 or above 1, normals flipped, blend weights > 1) and
+	// the result blows up. centroid moves the evaluation to a covered position. Without VRS
+	// (no MSAA) every covered pixel's centroid is its centre, so nothing changes. Texture
+	// coordinates and positions stay at the centre: their screen derivatives drive mip
+	// selection and the flat-normal / parallax maths and must stay regular.
 #if defined(SKINNED) || !defined(MODELSPACENORMALS)
-	float3 TBN0 : TEXCOORD1;
-	float3 TBN1 : TEXCOORD2;
-	float3 TBN2 : TEXCOORD3;
+	centroid float3 TBN0 : TEXCOORD1;
+	centroid float3 TBN1 : TEXCOORD2;
+	centroid float3 TBN2 : TEXCOORD3;
 #endif  // defined(SKINNED) || !defined(MODELSPACENORMALS)
 #if defined(EYE)
 	float3 EyeNormal : TEXCOORD6;
 #elif defined(LANDSCAPE)
-	float4 LandBlendWeights1 : TEXCOORD6;
-	float4 LandBlendWeights2 : TEXCOORD7;
+	centroid float4 LandBlendWeights1 : TEXCOORD6;
+	centroid float4 LandBlendWeights2 : TEXCOORD7;
 #elif defined(PROJECTED_UV) && !defined(SKINNED)
 	float3 TexProj : TEXCOORD7;
 #endif  // EYE
 
 	float4 WorldPosition : POSITION1;
 	float4 PreviousWorldPosition : POSITION2;
-	float4 Color : COLOR0;
+	centroid float4 Color : COLOR0;
 	float4 FogParam : COLOR1;
 
 #if defined(VR)

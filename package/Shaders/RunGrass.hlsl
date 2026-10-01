@@ -34,7 +34,9 @@ struct VS_INPUT
 struct VS_OUTPUT
 {
 	float4 HPosition : SV_POSITION0;
-	float4 VertexColor : COLOR0;
+	// centroid: see Lighting.hlsl VS_OUTPUT (VRS). VertexMult stays linear: it shares a register
+	// with TexCoord, and a different mode there would repack the pixel-shader inputs.
+	centroid float4 VertexColor : COLOR0;
 	float VertexMult : COLOR1;
 	float3 TexCoord : TEXCOORD0;
 	float3 ViewSpacePosition :
@@ -53,7 +55,7 @@ struct VS_OUTPUT
 #	endif  // RENDER_DEPTH
 	float4 WorldPosition : POSITION1;
 	float4 PreviousWorldPosition : POSITION2;
-	float4 VertexNormal : POSITION4;
+	centroid float4 VertexNormal : POSITION4;
 #	if defined(GRASS_OPTIMIZATIONS) && !defined(RENDER_DEPTH)
 	// Grass Optimizations: per-instance simple-shading flag and mesh-LOD tier (0 full, 1 middle, 2 far).
 	nointerpolation float IsFar : TEXCOORD9;
@@ -68,10 +70,12 @@ struct VS_OUTPUT
 struct VS_OUTPUT
 {
 	float4 HPosition : SV_POSITION0;
-	float4 VertexColor : COLOR0;
+	// centroid: see Lighting.hlsl VS_OUTPUT (VRS). VertexMult stays linear: it shares a register
+	// with TexCoord, and a different mode there would repack the pixel-shader inputs.
+	centroid float4 VertexColor : COLOR0;
 	float VertexMult : COLOR1;
 	float3 TexCoord : TEXCOORD0;
-	float4 AmbientColor : TEXCOORD1;
+	centroid float4 AmbientColor : TEXCOORD1;
 	float3 ViewSpacePosition : TEXCOORD2;
 #	if defined(RENDER_DEPTH)
 	float2 Depth : TEXCOORD3;
