@@ -238,6 +238,10 @@ void Streamline::LoadInterposer()
 	pclFunctionsReady = false;
 	reflexSleepFailureLogged = false;
 	pclMarkerFailureLogged = false;
+	dlssGFramesToGenerateMax = 0;
+	dlssGAppliedFramesToGenerate = 1;
+	dlssGRejectedFramesToGenerate = 0;
+	dlssGCapabilityQueryCooldown = 0;
 
 	std::wstring interposerPath = std::wstring(Streamline::PluginDir) + L"\\sl.interposer.dll";
 	interposer = LoadLibraryW(interposerPath.c_str());
@@ -286,7 +290,7 @@ void Streamline::LoadInterposer()
 		// startup-selected backend is FSR3, otherwise both backends can claim
 		// the same swap chain.
 		featuresToLoad.push_back(sl::kFeatureDLSS_G);
-		logger::info("[Streamline] Startup backend: DLSS-G (2x) + Reflex/PCL");
+		logger::info("[Streamline] Startup backend: DLSS-G (multiplier chosen at runtime; 2x until the driver reports more) + Reflex/PCL");
 	} else {
 		logger::info("[Streamline] Startup backend: {}{}",
 			isVR ? "VR/no DLSS-G" : "FSR3/no DLSS-G", isVR ? "" : " + Reflex/PCL");
@@ -700,9 +704,60 @@ void Streamline::FallbackDLSSG(const char* a_reason, sl::Result a_result, sl::DL
 		if (disableResult != sl::Result::eOk)
 			logger::critical("[Streamline] DLSS-G failed to enter the safe off state ({})", magic_enum::enum_name(disableResult));
 	}
+	dlssGAppliedFramesToGenerate = 1;
 }
 
-bool Streamline::SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff)
+void Streamline::UpdateDLSSGFramesToGenerateMax(uint32_t a_reportedMax)
+{
+	// 0 is not a valid report (the minimum is 1, single-frame generation); treat it as "no
+	// information" rather than as a ceiling below 2x.
+	if (a_reportedMax == 0 || a_reportedMax == dlssGFramesToGenerateMax)
+		return;
+
+	logger::info("[Streamline] DLSS-G reports up to {} generated frames per rendered frame (up to {}x){}",
+		a_reportedMax, a_reportedMax + 1,
+		dlssGFramesToGenerateMax != 0 ? std::format(", was {}x", dlssGFramesToGenerateMax + 1) : std::string());
+	dlssGFramesToGenerateMax = a_reportedMax;
+	// A different ceiling means the system changed under us; a multiplier rejected under the
+	// old one deserves one more attempt.
+	dlssGRejectedFramesToGenerate = 0;
+}
+
+bool Streamline::RefreshDLSSGCapabilities()
+{
+	if (!IsDLSSGReady() || slDLSSGGetState == nullptr)
+		return false;
+	if (dlssGCapabilityQueryCooldown > 0) {
+		--dlssGCapabilityQueryCooldown;
+		return false;
+	}
+
+	sl::DLSSGState state{};
+	const auto result = slDLSSGGetState(viewport, state, nullptr);
+	if (result != sl::Result::eOk || state.numFramesToGenerateMax == 0) {
+		// Not fatal and not judged: this only asks for the ceiling. Try again in about a second
+		// of frames rather than on every Present.
+		dlssGCapabilityQueryCooldown = 60;
+		return false;
+	}
+
+	UpdateDLSSGFramesToGenerateMax(state.numFramesToGenerateMax);
+	return true;
+}
+
+uint32_t Streamline::ResolveDLSSGFramesToGenerate(uint32_t a_requested) const
+{
+	// Never ask Streamline for more than it said it can do: its documented contract is that
+	// numFramesToGenerate must lie in [1, numFramesToGenerateMax], and an out-of-range request
+	// fails SetOptions. Before the first report the ceiling is unknown and only 2x is safe.
+	uint32_t frames = std::max(a_requested, 1u);
+	frames = std::min(frames, std::max(dlssGFramesToGenerateMax, 1u));
+	if (frames > 1 && frames == dlssGRejectedFramesToGenerate)
+		frames = 1;
+	return frames;
+}
+
+bool Streamline::SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff, uint32_t a_framesToGenerate)
 {
 	if (REL::Module::IsVR() || !dlssGBackendSelectedAtBoot || !featureDLSS_G || slDLSSGSetOptions == nullptr)
 		return false;
@@ -721,12 +776,18 @@ bool Streamline::SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff)
 	const bool outputExtentUnchanged = dlssGConfiguredOutputWidth == swapChain.swapChainDesc.Width &&
 	                                   dlssGConfiguredOutputHeight == swapChain.swapChainDesc.Height;
 	const bool retentionUnchanged = dlssGRetainResourcesWhenOff == a_retainResourcesWhenOff;
-	if (dlssGOptionsInitialized && dlssGActive == a_enable && retentionUnchanged && (!a_enable || (inputExtentUnchanged && outputExtentUnchanged)))
+	// Off keeps the count last accepted rather than dropping to 1, so suspending for a menu and
+	// resuming flips only the mode -- exactly what the fixed-2x path did, where both directions
+	// always carried 1. The count only moves on an enabled call, and a change there is the whole
+	// hot switch: one SetOptions with nothing reallocated on our side.
+	uint32_t framesToGenerate = a_enable ? ResolveDLSSGFramesToGenerate(a_framesToGenerate) : dlssGAppliedFramesToGenerate;
+	const bool framesUnchanged = dlssGAppliedFramesToGenerate == framesToGenerate;
+	if (dlssGOptionsInitialized && dlssGActive == a_enable && retentionUnchanged && (!a_enable || (inputExtentUnchanged && outputExtentUnchanged && framesUnchanged)))
 		return true;
 
 	sl::DLSSGOptions options{};
 	options.mode = a_enable ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
-	options.numFramesToGenerate = 1;  // Fixed 2x: one generated frame per real frame.
+	options.numFramesToGenerate = framesToGenerate;
 	// FinalColor already contains the scene plus UI. UI recomposition stays off
 	// because this path only supplies an exact-format HUD-less snapshot.
 	// This integration uses the fixed input ratio selected by the active
@@ -749,7 +810,31 @@ bool Streamline::SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff)
 	if (swapChain.uiBufferWrapped)
 		options.hudLessBufferFormat = static_cast<uint32_t>(swapChain.uiBufferWrapped->resource->GetDesc().Format);
 
-	const auto result = slDLSSGSetOptions(viewport, options);
+	auto result = slDLSSGSetOptions(viewport, options);
+	if (result != sl::Result::eOk && a_enable && framesToGenerate > 1) {
+		// A refused multi-frame request must not cost the session its frame generation. The
+		// ceiling check above already filters what Streamline documents as invalid, so this is
+		// the case where the driver, the NGX runtime or an external unlock disagrees with the
+		// reported ceiling. Drop to 2x -- the configuration this integration shipped with -- and
+		// hold it there; only if 2x is refused too is the session-wide fallback below taken.
+		logger::warn("[Streamline] DLSS-G rejected {}x frame generation ({}); retrying at 2x",
+			framesToGenerate + 1, magic_enum::enum_name(result));
+		dlssGRejectedFramesToGenerate = framesToGenerate;
+		framesToGenerate = 1;
+		options.numFramesToGenerate = framesToGenerate;
+		result = slDLSSGSetOptions(viewport, options);
+		if (result == sl::Result::eOk)
+			logger::warn("[Streamline] DLSS-G is running at 2x; {}x stays disabled until it is selected again",
+				dlssGRejectedFramesToGenerate + 1);
+	} else if (result != sl::Result::eOk && !a_enable && framesToGenerate > 1) {
+		// Turning generation off must not depend on the multiplier still being acceptable;
+		// carry the 1 the off path always carried before multi-frame generation existed.
+		logger::warn("[Streamline] DLSS-G refused eOff at {}x ({}); retrying with 2x options",
+			framesToGenerate + 1, magic_enum::enum_name(result));
+		framesToGenerate = 1;
+		options.numFramesToGenerate = framesToGenerate;
+		result = slDLSSGSetOptions(viewport, options);
+	}
 	if (result != sl::Result::eOk) {
 		if (a_enable) {
 			FallbackDLSSG("could not apply options", result, sl::DLSSGStatus::eOk);
@@ -762,12 +847,14 @@ bool Streamline::SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff)
 	dlssGActive = a_enable;
 	dlssGOptionsInitialized = true;
 	dlssGRetainResourcesWhenOff = a_retainResourcesWhenOff;
+	dlssGAppliedFramesToGenerate = framesToGenerate;
 	dlssGConfiguredInputWidth = inputWidth;
 	dlssGConfiguredInputHeight = inputHeight;
 	dlssGConfiguredOutputWidth = swapChain.swapChainDesc.Width;
 	dlssGConfiguredOutputHeight = swapChain.swapChainDesc.Height;
-	logger::info("[Streamline] DLSS-G mode {} with input extent {}x{} and output extent {}x{} (retainWhenOff={})",
+	logger::info("[Streamline] DLSS-G mode {} at {}x with input extent {}x{} and output extent {}x{} (retainWhenOff={})",
 		a_enable ? "enabled" : "disabled",
+		framesToGenerate + 1,
 		inputWidth,
 		inputHeight,
 		swapChain.swapChainDesc.Width,
@@ -783,6 +870,16 @@ bool Streamline::GetDLSSGState(sl::DLSSGState& a_state)
 		return false;
 
 	const auto result = slDLSSGGetState(viewport, a_state, nullptr);
+	const bool failed = result != sl::Result::eOk || a_state.status != sl::DLSSGStatus::eOk;
+	if (failed && dlssGActive && dlssGAppliedFramesToGenerate > 1) {
+		// Same rule as a refused SetOptions: a multi-frame configuration that DLSS-G accepted but
+		// then could not run is first taken back to 2x, which the next SetDLSSGMode applies on
+		// the following Present. Only a failure at 2x reaches the session-wide fallback.
+		logger::warn("[Streamline] DLSS-G reported a failure at {}x (result={}, status={}); falling back to 2x",
+			dlssGAppliedFramesToGenerate + 1, magic_enum::enum_name(result), static_cast<uint32_t>(a_state.status));
+		dlssGRejectedFramesToGenerate = dlssGAppliedFramesToGenerate;
+		return false;
+	}
 	if (result != sl::Result::eOk) {
 		FallbackDLSSG("state query failed", result, a_state.status);
 		return false;
@@ -792,6 +889,7 @@ bool Streamline::GetDLSSGState(sl::DLSSGState& a_state)
 		return false;
 	}
 
+	UpdateDLSSGFramesToGenerateMax(a_state.numFramesToGenerateMax);
 	return true;
 }
 
@@ -859,6 +957,7 @@ void Streamline::DestroyDLSSGResources(bool a_modeSwitch)
 
 	dlssGActive = false;
 	dlssGOptionsInitialized = false;
+	dlssGAppliedFramesToGenerate = 1;
 	if (slFreeResources != nullptr && featureDLSS_G) {
 		if (SL_FAILED(result, slFreeResources(sl::kFeatureDLSS_G, viewport)))
 			logger::error("[Streamline] Could not free DLSS-G resources ({})", magic_enum::enum_name(result));
