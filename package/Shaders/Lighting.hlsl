@@ -691,7 +691,16 @@ float3 GetLightSpecularInput(PS_INPUT input, float3 L, float3 V, float3 N, float
 #	endif
 
 #	if defined(SPECULAR)
-	float3 lightColorMultiplier = exp2(shininess * log2(HdotN));
+	float3 lightColorMultiplier;
+#		if defined(VANILLA_FRESNEL)
+	// (batch 35, B5b) When the GGX block below is going to run, it overwrites this Phong
+	// value entirely, so with the switch on the log/exp pair is skipped. The condition is the
+	// GGX block's own condition, verbatim, so "skipped here" implies "overwritten there".
+	[branch] if (Batch35::IsOn(Batch35::ExclusiveSpecularLobe) && SharedData::vanillaFresnelSettings.Enable && SharedData::vanillaFresnelSettings.EnableGGX && !a_forceVanillaLobe)
+		lightColorMultiplier = 0;
+	else
+#		endif
+		lightColorMultiplier = exp2(shininess * log2(HdotN));
 #	elif defined(SPARKLE)
 	float3 lightColorMultiplier = 0;
 #	else
@@ -1091,6 +1100,14 @@ float ApplyMaterialAlphaAndTest(float a_alpha, float2 a_svPosition, float a_vert
 #	if defined(DO_ALPHA_TEST) && !defined(LANDSCAPE) && !defined(LOD_LAND_BLEND)
 #		define B35_EARLY_ALPHA_ELIGIBLE
 #	endif
+
+// (batch 35, B5a) The nine wetness highlights (sun, both light loops, indirect lobe) were
+// written `if (waterRoughnessSpecular < 1.0) x += ...;`, which fxc flattens: the wetness
+// BRDF (a div and an rcp among ~20 instructions) ran for every light on every dry pixel and
+// was then thrown away by a movc. With the switch on, the same statement sits behind a real
+// branch; with it off, the batch 34 statement runs exactly as written. Same result either
+// way - the condition and the statement are textually the same.
+#	define B35_WETNESS_IF(a_condition, a_statement) [branch] if (Batch35::IsOn(Batch35::WetnessSpecularBranch)) { [branch] if (a_condition) a_statement; } else if (a_condition) a_statement
 
 PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 {
@@ -3052,8 +3069,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		lodLandDiffuseColor += dirLightColor / Math::PI * saturate(dirLightAngle) * dirLightColorMultiplier * dirDetailShadow * parallaxShadow;
 #		endif
 #		if defined(WETNESS_EFFECTS)
-		if (waterRoughnessSpecular < 1.0)
-			specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
+		B35_WETNESS_IF(waterRoughnessSpecular < 1.0, specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular);
 #		endif
 	}
 #	elif defined(SKIN) && defined(CS_SKIN)
@@ -3073,8 +3089,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		transmissionColor += min(sssTransmittance * lightProperties.LightColor * skinSurfaceProperties.Albedo, dirLightColor * dirLightColorMultiplier);
 		specularColorPBR += dirSpecularColor * !SharedData::InInterior;
 #		if defined(WETNESS_EFFECTS)
-		if (waterRoughnessSpecular < 1.0)
-			specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
+		B35_WETNESS_IF(waterRoughnessSpecular < 1.0, specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular);
 #		endif
 	} else {
 		dirDetailShadow *= parallaxShadow;
@@ -3088,8 +3103,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		lightsDiffuseColor += dirDiffuseColor;
 
 #		if defined(WETNESS_EFFECTS)
-		if (waterRoughnessSpecular < 1.0)
-			wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, DirLightDirection, viewDirection, dirLightColor * dirDetailShadow, waterRoughnessSpecular);
+		B35_WETNESS_IF(waterRoughnessSpecular < 1.0, wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, DirLightDirection, viewDirection, dirLightColor * dirDetailShadow, waterRoughnessSpecular));
 #		endif
 	}
 #	else
@@ -3135,8 +3149,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	lightsDiffuseColor += dirDiffuseColor;
 
 #		if defined(WETNESS_EFFECTS)
-	if (waterRoughnessSpecular < 1.0)
-		wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, DirLightDirection, viewDirection, dirLightColor * dirDetailShadow, waterRoughnessSpecular);
+	B35_WETNESS_IF(waterRoughnessSpecular < 1.0, wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, DirLightDirection, viewDirection, dirLightColor * dirDetailShadow, waterRoughnessSpecular));
 #		endif
 #	endif
 
@@ -3364,8 +3377,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			transmissionColor += pointTransmissionColor;
 			specularColorPBR += pointSpecularColor;
 #				if defined(WETNESS_EFFECTS)
-			if (waterRoughnessSpecular < 1.0)
-				specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
+			B35_WETNESS_IF(waterRoughnessSpecular < 1.0, specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular);
 #				endif
 		}
 #			elif defined(SKIN) && defined(CS_SKIN)
@@ -3385,8 +3397,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			transmissionColor += min(sssTransmittance * lightProperties.LightColor * skinSurfaceProperties.Albedo, lightProperties.LightColor);
 			specularColorPBR += pointSpecularColor;
 #				if defined(WETNESS_EFFECTS)
-			if (waterRoughnessSpecular < 1.0)
-				specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
+			B35_WETNESS_IF(waterRoughnessSpecular < 1.0, specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular);
 #				endif
 		} else {
 			lightColor *= lightShadow;
@@ -3438,8 +3449,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			endif
 
 #			if defined(WETNESS_EFFECTS)
-		if (waterRoughnessSpecular < 1.0)
-			wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, normalizedLightDirection, viewDirection, lightColor, waterRoughnessSpecular);
+		B35_WETNESS_IF(waterRoughnessSpecular < 1.0, wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, normalizedLightDirection, viewDirection, lightColor, waterRoughnessSpecular));
 #			endif
 	}
 #		endif
@@ -3712,8 +3722,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 indirectDiffuseLobeWeight, indirectSpecularLobeWeight;
 	PBR::GetIndirectLobeWeights(indirectDiffuseLobeWeight, indirectSpecularLobeWeight, worldNormal.xyz, viewDirection, vertexNormal, baseColor.xyz, pbrSurfaceProperties);
 #		if defined(WETNESS_EFFECTS)
-	if (waterRoughnessSpecular < 1.0)
-		indirectSpecularLobeWeight = max(indirectSpecularLobeWeight, PBR::GetWetnessIndirectSpecularLobeWeight(wetnessNormal, viewDirection, vertexNormal, waterRoughnessSpecular));
+	B35_WETNESS_IF(waterRoughnessSpecular < 1.0, indirectSpecularLobeWeight = max(indirectSpecularLobeWeight, PBR::GetWetnessIndirectSpecularLobeWeight(wetnessNormal, viewDirection, vertexNormal, waterRoughnessSpecular)));
 #		endif
 
 	color.xyz += indirectDiffuseLobeWeight * directionalAmbientColor;
@@ -3747,8 +3756,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		Skin::SkinIndirectLobeWeights(indirectDiffuseLobeWeight, indirectSpecularLobeWeight, skinSurfaceProperties, originalWorldNormal, viewDirection, vertexNormal, wetWorldNormal);
 
 #		if defined(WETNESS_EFFECTS)
-		if (waterRoughnessSpecular < 1.0)
-			indirectSpecularLobeWeight += PBR::GetWetnessIndirectSpecularLobeWeight(wetnessNormal, viewDirection, vertexNormal, waterRoughnessSpecular) * wetnessGlossinessSpecular;
+		B35_WETNESS_IF(waterRoughnessSpecular < 1.0, indirectSpecularLobeWeight += PBR::GetWetnessIndirectSpecularLobeWeight(wetnessNormal, viewDirection, vertexNormal, waterRoughnessSpecular) * wetnessGlossinessSpecular);
 #		endif
 
 #		if !(defined(DEFERRED) && defined(SSGI))
