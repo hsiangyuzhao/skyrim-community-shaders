@@ -116,8 +116,6 @@ void AdvancedSettingsRenderer::RenderBatch36Section()
 		const char* where;
 	};
 	const Row rows[] = {
-		{ "Half-Resolution Diffuse Denoising (being retired, default off)", ssrt.loaded, ssrt.settings.ReblurDiffuseHalfRes,
-			"Lighting > Screen Space Ray Tracing > Denoiser > REBLUR Cost (shown when Denoiser = REBLUR)" },
 		{ "Fold Diffuse Unpack Into Composite", ssrt.loaded, ssrt.settings.ReblurFoldDiffuseUnpack,
 			"Lighting > Screen Space Ray Tracing > Denoiser > REBLUR Cost (shown when Denoiser = REBLUR)" },
 		{ "Direct Motion Vectors", ssrt.loaded, ssrt.settings.ReblurDirectMotionVectors,

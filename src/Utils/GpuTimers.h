@@ -26,7 +26,6 @@ namespace Util
 		// between the diffuse and the specular chain, because those have independent toggles.
 		SSRTDepthPyramid = 0,    // SSRT prepass: depth linearise + Hi-Z pyramid build
 		SSRTTraceDiffuse,        // diffuse ray march (and the SHARC update/resolve when built in)
-		SSRTSparseResolve,       // (batch 12) sparse sampling: half-res / checkerboard resolve back to full resolution
 		SSRTTraceSpecular,       // specular prepare-color + specular ray march
 		SSRTComposite,           // diffuse composite, including the full-res 7x7 confidence window
 		SSRTSvgf,                // hand-written SVGF: temporal + variance + a-trous (diffuse and specular)

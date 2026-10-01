@@ -215,33 +215,11 @@ cbuffer SSRTCB : register(b1)
 #define SSRT_OPTION_INVERTED_DEPTH 0
 
 #define HIZ_MAX_ITERATIONS MaxSteps
-// (batch 12) The traversal's finest level *is* the resolution the pass traces at.
-//
-// Under SSRT_SPARSE_HALFRES that is mip 1 of the Hi-Z pyramid, which is natively half sized:
-// with `screen_size` the render extent, SSRT_GetMipResolution(screen_size, 1) is exactly the
-// compact grid, so cell boundaries keep lining up with texel boundaries and MaxSteps keeps its
-// reach in screen terms. Starting at mip 0 there would make the ray re-test every texel twice.
-//
-// Under SSRT_SPARSE_CHECKERBOARD it stays 0, and that is not an oversight: a checkerboard
-// sample *is* a full-resolution pixel, so its ray is the same ray the full-resolution pass
-// would trace for that pixel and it must walk the same cell grid. The consequence is that
-// checkerboard rays are individually more expensive than half-resolution ones even though both
-// modes trace the same number of them.
-#if defined(SSRT_SPARSE_HALFRES)
-#   define HIZ_MIN_MIP 1
-#else
-#   define HIZ_MIN_MIP 0
-#endif
-// (batch 12) The self-intersection radius in SSRT_ValidateHit, in full-resolution texels --
-// `screen_size` is a full-resolution extent, so the number has to be expressed in those. It is
-// "two texels of the traversal grid", and under SSRT_SPARSE_HALFRES one grid texel is two
-// full-resolution texels. Spelled as a macro rather than a static const so the default path is
-// textually the literal it always was.
-#if defined(SSRT_SPARSE_HALFRES)
-#   define SSRT_SELF_HIT_TEXELS 4.f
-#else
-#   define SSRT_SELF_HIT_TEXELS 2.f
-#endif
+// The traversal starts at mip 0: every lane, checkerboard ones included, traces a real
+// full-resolution pixel and walks the same cell grid the full-resolution pass walks.
+#define HIZ_MIN_MIP 0
+// The self-intersection radius in SSRT_ValidateHit, in full-resolution texels.
+#define SSRT_SELF_HIT_TEXELS 2.f
 #define SSRT_FLOAT_MAX 3.402823466e+38
 #define SSRT_DEPTH_HIERARCHY_MAX_MIP MaxMips
 #if defined(SSRT_SPECULAR)
@@ -895,81 +873,11 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 
     float4 outColor = float4(0, 0, 0, 0);
 
-    // (batch 12) THE THREE COORDINATES A SPARSE LANE HAS, AND WHY THEY ARE NOT THE SAME NUMBER.
-    //
-    // `coords` is the *compact* grid coordinate. It addresses the three output UAVs and nothing
-    // else, so on the sparse paths every store below writes the compact surfaces unchanged --
-    // the output block at the bottom of this file needs no edit at all.
-    //
-    // `gbufferCoords` is the full-resolution pixel this lane stands for. Everything that reads a
-    // full-resolution G-buffer -- depth, normal/roughness, albedo, SSGI's AO -- and the `uv` the
-    // ray origin is built from must use it, or the lane would trace a ray for one pixel out of
-    // another pixel's surface data.
-    //
-    // `SSRT_NOISE_COORDS` seeds the sampling sequences (SampleRandomVector2DBaked and the
-    // skylighting STBN lookup). Under checkerboard it is the full-resolution pixel, because a
-    // checkerboard sample really is one and the blue-noise pattern was authored for that grid --
-    // which also makes each traced ray identical to the one the full-resolution pass would have
-    // traced. Under half resolution there is no full-resolution pixel to be had: the
-    // representative subpixel jitters between the four as the geometry moves, so seeding from it
-    // would sample the noise texture at an irregular subset and destroy both its spectrum and its
-    // frame-to-frame stability. The compact grid is contiguous, which is what blue noise wants.
-    //
-    // Spelled as macros rather than as `const uint2` locals, and that is load bearing rather than
-    // stylistic: on the default path both expand textually to `coords.xy`, so the token stream
-    // fxc sees for every non-sparse permutation -- the diffuse one, the specular one and the
-    // SHARC ones -- is exactly the one it saw before this batch, and the generated code is
-    // bit-identical rather than merely equivalent. Introducing the aliases as locals instead
-    // produced identical *values* but let O3 reassociate an unrelated saturate in the specular
-    // permutation, which is precisely the kind of "equivalent but not identical" the Full-mode
-    // proof is not allowed to contain.
-#if defined(SSRT_SPARSE_HALFRES)
-    // A half-resolution lane must stand for one *real* surface point, not for an average of its
-    // 2x2 block, and which point is forced rather than chosen.
-    //
-    // The traversal's finest level is mip 1, whose value is the *minimum* over the block, so the
-    // ray origin's depth is the nearest of the four subpixels; there is nothing to decide about
-    // that. What is decidable is which subpixel supplies the uv, the normal and the albedo, and
-    // pairing the minimum depth with a farther subpixel is a defect and not a nuance: the origin
-    // would land *behind* the surface mip 1 records, SSRT_AdvanceRay reads `surface_z >
-    // position.z` as "below the surface" (i.e. an instant hit at the origin), and
-    // SSRT_ValidateHit then throws that hit away as a self-hit. Every block straddling a depth
-    // discontinuity would come back as a miss -- a wholesale false-miss along every silhouette
-    // in the frame.
-    //
-    // So resolve the argmin explicitly and take uv, depth, normal and albedo from that one
-    // full-resolution pixel. Then mip 1's value *is* that pixel's own depth, the grazing-angle
-    // origin bias below pushes the origin off the surface by exactly the margin the
-    // full-resolution path enjoys, and the first advance behaves identically.
-    //
-    // Ties resolve to the lowest subpixel index, which keeps the choice deterministic frame to
-    // frame. Reading mip 0 out of bounds is safe: the pyramid holds the far plane there
-    // (audit #8), so an out-of-range subpixel simply never wins the argmin.
-    const int2 blockBase = int2(coords.xy) * 2;
-    const float4 blockDepths = float4(
-        SSRT_LoadDepth(blockBase, 0),
-        SSRT_LoadDepth(blockBase + int2(1, 0), 0),
-        SSRT_LoadDepth(blockBase + int2(0, 1), 0),
-        SSRT_LoadDepth(blockBase + int2(1, 1), 0));
-    const float blockDepthMin = min(min(blockDepths.x, blockDepths.y), min(blockDepths.z, blockDepths.w));
-    int2 repOffset = int2(1, 1);
-    if (blockDepths.z == blockDepthMin)
-        repOffset = int2(0, 1);
-    if (blockDepths.y == blockDepthMin)
-        repOffset = int2(1, 0);
-    if (blockDepths.x == blockDepthMin)
-        repOffset = int2(0, 0);
-    const uint2 gbufferCoords = uint2(blockBase + repOffset);
-#   define SSRT_GBUFFER_COORDS gbufferCoords
-#   define SSRT_NOISE_COORDS coords.xy
-#elif defined(SSRT_SPARSE_CHECKERBOARD)
-    const uint2 gbufferCoords = uint2(SSRT_SparseCheckerColumn(coords.xy), coords.y);
-#   define SSRT_GBUFFER_COORDS gbufferCoords
-#   define SSRT_NOISE_COORDS gbufferCoords
-#else
+    // `SSRT_GBUFFER_COORDS` is the full-resolution pixel this lane traces for and `SSRT_NOISE_COORDS`
+    // seeds its sampling sequences. Macros rather than locals so the token stream fxc sees is
+    // `coords.xy` itself on every full-resolution permutation.
 #   define SSRT_GBUFFER_COORDS coords.xy
 #   define SSRT_NOISE_COORDS coords.xy
-#endif
 
     float2 uv = float2(SSRT_GBUFFER_COORDS + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
     uint eyeIndex = Stereo::GetEyeIndexFromTexCoord(uv);
@@ -991,14 +899,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // GroupMemoryBarrierWithGroupSync(); bailing out of a subset of the group's
     // (x, y) lanes would make that barrier non-uniform. Writing 0 (instead of leaving
     // the target untouched) also keeps the ping-pong denoiser textures deterministic.
-#if defined(SSRT_SPARSE_HALFRES)
-    // Identical to DepthTexture[gbufferCoords] inside the render sub-rect -- the argmin subpixel
-    // is by construction the one holding the block minimum -- and correctly the far plane
-    // outside it, so it doubles as the sky test for a fully off-screen block.
-    float depth = blockDepthMin;
-#else
     float depth = DepthTexture[SSRT_GBUFFER_COORDS].x;
-#endif
     const bool is_far_plane = SSRT_IS_FAR_PLANE(depth);
 
     float3 normalVS;
@@ -1101,17 +1002,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // bound, so the rescale is gone. The `coords >= int2(0, 0)` half is gone with it:
     // `coords` is uint2, so it was vacuously true, and comparing it against an int2 was
     // two of the file's signed/unsigned warnings (X3203).
-    // (batch 12) The dispatch's own bound is the compact extent on the sparse paths, and
-    // SSRT_GetSparseExtent applies the same floor rule mip 1 of the pyramid was built under. A
-    // macro for the same reason SSRT_GBUFFER_COORDS is one: on the default path the test below is
-    // textually `all(coords < screen_size)`, the expression that was always there.
-#if defined(SSRT_SPARSE)
-    const uint2 raymarch_extent = SSRT_GetSparseExtent(screen_size);
-#   define SSRT_RAYMARCH_EXTENT raymarch_extent
-#else
-#   define SSRT_RAYMARCH_EXTENT screen_size
-#endif
-    bool valid_ray = all(coords < SSRT_RAYMARCH_EXTENT) && !is_far_plane;  // (audit P1)
+    bool valid_ray = all(coords < screen_size) && !is_far_plane;  // (audit P1)
 #if defined(SSRT_SPECULAR)
     // (batch 28) Skip the march where the GGX lobe is wide enough that the prefiltered cubemap
     // is already the same answer. Joining valid_ray rather than returning early is deliberate:
@@ -1458,8 +1349,6 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             float ao = lerp(1.0, occlusion, OcclusionStrength);
 #   endif
 #   if defined(SSGI)
-            // (batch 12) SSGI's AO target is full resolution; sampled at the representative
-            // subpixel, like the normal and albedo G-buffers.
             ao *= 1 - saturate(SsgiAoTexture[SSRT_GBUFFER_COORDS].x);
 #   endif
 #   if defined(SSRT_SPECULAR)

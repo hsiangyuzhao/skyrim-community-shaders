@@ -22,9 +22,6 @@ namespace Util
 				"GPU time for SSRT's depth preparation, shared by its diffuse and specular parts." },
 			{ "SSRT Trace Diffuse",
 				"GPU time for SSRT's diffuse (bounce light) ray tracing." },
-			{ "SSRT Sparse Resolve",
-				"GPU time for filling in the full-resolution result when Diffuse Sampling is not Full. "
-				"Sparse sampling only pays off if it lowers SSRT Trace Diffuse by more than this row costs." },
 			{ "SSRT Trace Specular",
 				"GPU time for SSRT's specular (reflection) ray tracing." },
 			{ "SSRT Composite",

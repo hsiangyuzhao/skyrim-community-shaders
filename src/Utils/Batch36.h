@@ -8,9 +8,8 @@
  * read every frame: no restart, no recompile, no cache clear.
  *
  * Governed:
- * - Screen Space Ray Tracing: Half-Resolution Diffuse Denoising, Fold Diffuse Unpack Into
- *   Composite, Direct Motion Vectors (Settings::ReblurDiffuseHalfRes / ReblurFoldDiffuseUnpack /
- *   ReblurDirectMotionVectors)
+ * - Screen Space Ray Tracing: Fold Diffuse Unpack Into Composite, Direct Motion Vectors
+ *   (Settings::ReblurFoldDiffuseUnpack / ReblurDirectMotionVectors)
  * - Screen Space GI: Skip IL While SSRT Diffuse Is On (Settings::SkipILUnderSSRTDiffuse)
  * - Variable Rate Shading: can only be forced off here, never on (its own Enable stays the
  *   only way to turn it on).
