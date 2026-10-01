@@ -122,11 +122,12 @@ public:
 		// (batch 36) While Screen Space Ray Tracing's diffuse is actually lighting the frame,
 		// DeferredCompositeCS discards this feature's indirect light (and its directional
 		// environment channel) and keeps only the AO. With this on, the IL is then not computed
-		// either: the GI and radiance-reprojection passes run their AO-only permutations, and the
-		// radiance prefilter (plus its copy) and the IL blur are not dispatched. The AO -- contact
-		// term included -- is produced by the same code as before, so the picture does not change.
-		// The moment SSRT diffuse stops lighting the frame (switched off, or its chain cannot
-		// run) the full path comes back with its temporal history reset. Off = batch 34.
+		// either: radianceDisocc, gi and upsample run their SSGI_AO_ONLY permutations (AO and its
+		// history only), and the radiance prefilter (plus its copy) and the IL blur are not
+		// dispatched. The AO -- contact term included -- is produced by the same code as before,
+		// so the picture does not change. The moment SSRT diffuse stops lighting the frame
+		// (switched off, or its chain cannot run) the full path comes back with its temporal
+		// history reset. Off = batch 34.
 		bool SkipILUnderSSRTDiffuse = true;
 	} settings;
 
@@ -267,12 +268,12 @@ public:
 	winrt::com_ptr<ID3D11ComputeShader> upsampleCompute = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> contactAoCompute = nullptr;
 
-	// (batch 36) AO-only permutations of the two passes whose IL work can be dropped while SSRT
-	// diffuse supplies the indirect light: the same define set as the pair above minus GI and
-	// GI_SPECULAR, i.e. exactly what the "Indirect Lighting (IL)" checkbox off would compile.
-	// Built only while EnableGI is on (with it off the pair above already is this pair).
+	// (batch 36) SSGI_AO_ONLY permutations of the three passes that carry IL while SSRT diffuse
+	// supplies the indirect light: the regular define set minus GI / GI_SPECULAR plus SSGI_AO_ONLY.
+	// Built only while EnableGI is on; the upsample one only in half/quarter resolution.
 	winrt::com_ptr<ID3D11ComputeShader> radianceDisoccAoOnlyCompute = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> giAoOnlyCompute = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> upsampleAoOnlyCompute = nullptr;
 
 	/// @brief (batch 36) Whether this frame runs the AO-only path. See Settings::SkipILUnderSSRTDiffuse.
 	[[nodiscard]] bool ShouldSkipIL() const;

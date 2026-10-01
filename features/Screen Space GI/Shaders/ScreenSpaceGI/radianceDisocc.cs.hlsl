@@ -39,6 +39,17 @@ RWTexture2D<float4> outRemappedEnvIrradiance : register(u7);
 #	define REPROJECTION
 #endif
 
+// (batch 36) SSGI_AO_ONLY: see gi.cs.hlsl. This pass then reprojects only what the AO-only GI
+// pass reads back -- the AO history and the shared accumulation counter -- and neither reads nor
+// writes the IL, bent-normal, environment or specular histories. Without the define the file
+// compiles exactly as before.
+#if defined(SSGI_AO_ONLY) && (defined(GI) || defined(GI_SPECULAR))
+#	error "SSGI_AO_ONLY is the IL-free permutation and cannot be combined with GI or GI_SPECULAR."
+#endif
+#if defined(DYNAMIC_CUBEMAPS) && !defined(SSGI_AO_ONLY)
+#	define SSGI_ENV_IRRADIANCE
+#endif
+
 void readHistory(
 	uint eyeIndex, float curr_depth, float3 curr_pos, int2 pixCoord, float bilinear_weight,
 	inout half prev_ao, inout half4 prev_y, inout half2 prev_co_cg, inout half3 prev_ambient, inout float accum_frames, inout half4 prev_gi_specular,
@@ -66,6 +77,7 @@ void readHistory(
 		return;
 
 #ifdef TEMPORAL_DENOISER
+#	ifndef SSGI_AO_ONLY
 	const float4 hist_y = srcPrevIlY[pixCoord];
 	const float2 hist_co_cg = srcPrevIlCoCg[pixCoord];
 	bool hist_finite = isFiniteSafe(hist_y) && isFiniteSafe(hist_co_cg);
@@ -73,7 +85,7 @@ void readHistory(
 	const float4 hist_gi_specular = srcPrevGISpecular[pixCoord];
 	hist_finite = hist_finite && isFiniteSafe(hist_gi_specular);
 #	endif
-#	ifdef DYNAMIC_CUBEMAPS
+#	ifdef SSGI_ENV_IRRADIANCE
 	// (directional env v2) Same whole-tap rejection as the IL channels and for the same
 	// reason: all channels share one accum_frames, and the source is a float format that can
 	// carry a non-finite value into the history.
@@ -98,8 +110,10 @@ void readHistory(
 	// for a non-finite value, so a test on them could never fire.
 	if (!hist_finite)
 		return;
+#	endif
 
 	prev_ao += srcPrevAo[pixCoord] * bilinear_weight;
+#	ifndef SSGI_AO_ONLY
 	prev_y += hist_y * bilinear_weight;
 	prev_co_cg += hist_co_cg * bilinear_weight;
 	// (directional env) The bent tap is blended in the decoded VECTOR domain - the octahedral
@@ -112,7 +126,8 @@ void readHistory(
 	SSGI_DecodeBentNormal(srcPrevBentNormal[pixCoord], tap_bent_dir, tap_bent_aperture);
 	prev_bent_dir += tap_bent_dir * bilinear_weight;
 	prev_bent_aperture += tap_bent_aperture * bilinear_weight;
-#	ifdef DYNAMIC_CUBEMAPS
+#	endif
+#	ifdef SSGI_ENV_IRRADIANCE
 	// Plain bilinear accumulation: premultiplied radiance + confidence blend linearly.
 	prev_env_irr += hist_env_irr * bilinear_weight;
 #	endif
@@ -152,12 +167,16 @@ void readHistory(
 	const float curr_depth = READ_DEPTH(srcCurrDepth, pixCoord);
 
 	if (curr_depth < FP_Z) {
+#ifdef SSGI_AO_ONLY
+		outAccumFrames[pixCoord] = 1.0 / 255.0;
+#else
 		outRadianceDisocc[pixCoord] = half3(0, 0, 0);
 		outAccumFrames[pixCoord] = 1.0 / 255.0;
 		outRemappedIlY[pixCoord] = half4(0, 0, 0, 0);
 		outRemappedIlCoCg[pixCoord] = half2(0, 0);
 		outRemappedBentNormal[pixCoord] = 0;
-#ifdef DYNAMIC_CUBEMAPS
+#endif
+#ifdef SSGI_ENV_IRRADIANCE
 		outRemappedEnvIrradiance[pixCoord] = 0;
 #endif
 		return;
@@ -191,14 +210,18 @@ void readHistory(
 			float rcpWsum = rcp(wsum + 1e-10);
 #	ifdef TEMPORAL_DENOISER
 			prev_ao *= rcpWsum;
+#		ifndef SSGI_AO_ONLY
 			prev_y *= rcpWsum;
 			prev_co_cg *= rcpWsum;
-#		ifdef DYNAMIC_CUBEMAPS
+#		endif
+#		ifdef SSGI_ENV_IRRADIANCE
 			prev_env_irr *= rcpWsum;
 #		endif
 			// (directional env) Only the aperture needs the weight normalisation - the direction
 			// sum is renormalised to unit length at the write below, which absorbs wsum.
+#		ifndef SSGI_AO_ONLY
 			prev_bent_aperture *= rcpWsum;
+#		endif
 			accum_frames *= rcpWsum;
 #		ifdef GI_SPECULAR
 			prev_gi_specular *= rcpWsum;
@@ -225,10 +248,12 @@ void readHistory(
 	accum_frames = max(1, min(accum_frames * 255 + 1, MaxAccumFrames));
 	outAccumFrames[pixCoord] = accum_frames / 255.0;
 	outRemappedAo[pixCoord] = prev_ao;
+#	ifndef SSGI_AO_ONLY
 	outRemappedIlY[pixCoord] = prev_y;
 	outRemappedIlCoCg[pixCoord] = prev_co_cg;
 	outRemappedPrevGISpecular[pixCoord] = prev_gi_specular;
-#	ifdef DYNAMIC_CUBEMAPS
+#	endif
+#	ifdef SSGI_ENV_IRRADIANCE
 	// (directional env v2) Radiance data: written as-is, like prev_y. When no tap survived the
 	// sum is 0 (zero confidence included), and gi.cs.hlsl never uses it anyway - accum_frames
 	// is 1 there, so its EMA factor is 1.
@@ -237,6 +262,7 @@ void readHistory(
 	// (directional env) Renormalise the vector-domain tap sum and re-encode. When no tap
 	// survived (disocclusion, off-screen) the sum is degenerate and a zero encoding is written;
 	// gi.cs.hlsl never uses it, because accum_frames is 1 there and its EMA factor is 1.
+#	ifndef SSGI_AO_ONLY
 	{
 		float bent_len = length(prev_bent_dir);
 		float4 bent_enc = 0;
@@ -244,5 +270,6 @@ void readHistory(
 			bent_enc = SSGI_EncodeBentNormal(prev_bent_dir / bent_len, prev_bent_aperture);
 		outRemappedBentNormal[pixCoord] = bent_enc;
 	}
+#	endif
 #endif
 }

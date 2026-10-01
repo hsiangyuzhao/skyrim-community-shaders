@@ -771,7 +771,7 @@ void ScreenSpaceGI::ClearShaderCache()
 {
 	static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
 		&prefilterDepthsCompute, &prefilterRadianceCompute, &radianceDisoccCompute, &giCompute, &blurCompute, &upsampleCompute, &contactAoCompute,
-		&radianceDisoccAoOnlyCompute, &giAoOnlyCompute
+		&radianceDisoccAoOnlyCompute, &giAoOnlyCompute, &upsampleAoOnlyCompute
 	};
 
 	for (auto shader : shaderPtrs)
@@ -870,16 +870,18 @@ void ScreenSpaceGI::CompileComputeShaders()
 			info.programPtr->attach(rawPtr);
 	}
 
-	// (batch 36) The AO-only pair for Settings::SkipILUnderSSRTDiffuse. The same round's define
-	// set with GI and GI_SPECULAR taken out -- the exact permutation the IL checkbox off would
-	// build, so nothing new is being compiled here, only an existing configuration alongside the
-	// current one. Every other define (resolution, temporal, contact, cubemap, skylighting, VR)
-	// is kept, which is what makes the AO these produce the same AO the full pair produces: the
-	// AO bitmask, its temporal EMA and the bent normal in gi.cs.hlsl sit outside every #ifdef GI.
-	// Not needed with IL off (the pair above is already AO-only); a failed compile leaves a null
+	// (batch 36) The AO-only set for Settings::SkipILUnderSSRTDiffuse: the same round's define set
+	// with GI and GI_SPECULAR taken out and SSGI_AO_ONLY added. Every other define (resolution,
+	// temporal, contact, cubemap, skylighting, VR) is kept, which is what makes the AO these
+	// produce the AO the full set produces: the AO bitmask, its quadrature and its temporal EMA
+	// sit outside every guard in gi.cs.hlsl. SSGI_AO_ONLY additionally drops what only the IL side
+	// consumes -- the IL / bent-normal / environment / specular history reprojection, EMA and
+	// stores in radianceDisocc and gi, and the same four channels in the upsample.
+	// Not needed with IL off (the regular set is already IL-free); a failed compile leaves a null
 	// pointer, which ShouldSkipIL() treats as "run the full path".
 	radianceDisoccAoOnlyCompute = nullptr;
 	giAoOnlyCompute = nullptr;
+	upsampleAoOnlyCompute = nullptr;
 	if (settings.EnableGI) {
 		std::vector<std::pair<const char*, const char*>> aoOnlyDefines;
 		for (const auto& d : defines) {
@@ -887,10 +889,16 @@ void ScreenSpaceGI::CompileComputeShaders()
 				continue;
 			aoOnlyDefines.push_back(d);
 		}
+		aoOnlyDefines.push_back({ "SSGI_AO_ONLY", "" });
 		if (auto rawPtr = compile("radianceDisocc.cs.hlsl", aoOnlyDefines))
 			radianceDisoccAoOnlyCompute.attach(rawPtr);
 		if (auto rawPtr = compile("gi.cs.hlsl", aoOnlyDefines))
 			giAoOnlyCompute.attach(rawPtr);
+		// Only the half/quarter-resolution modes dispatch the upsample at all.
+		if (settings.ResolutionMode != 0) {
+			if (auto rawPtr = compile("upsample.cs.hlsl", aoOnlyDefines))
+				upsampleAoOnlyCompute.attach(rawPtr);
+		}
 	}
 
 	recompileFlag = false;
@@ -905,6 +913,7 @@ bool ScreenSpaceGI::ShouldSkipIL() const
 {
 	return settings.SkipILUnderSSRTDiffuse && settings.EnableGI &&
 	       giAoOnlyCompute && radianceDisoccAoOnlyCompute &&
+	       (settings.ResolutionMode == 0 || upsampleAoOnlyCompute) &&
 	       globals::features::screenSpaceRayTracing.DiffuseReplacesSsgiIl();
 }
 
@@ -1052,6 +1061,22 @@ void ScreenSpaceGI::DrawSSGI()
 		context->ClearUnorderedAccessViewFloat(texAccumFrames[0]->uav.get(), zero);
 		context->ClearUnorderedAccessViewFloat(texAccumFrames[1]->uav.get(), zero);
 	}
+	// (batch 36) Entering it: the AO-only permutations never write the IL, bent-normal,
+	// environment or specular pairs, but DeferredCompositeCS still *reads* the IL and environment
+	// slots (it discards the values, through a runtime branch) and fxc is free to evaluate them
+	// arithmetically on the discarded side. Zeroing every slot once makes what it reads a finite
+	// zero for as long as the mode lasts, whatever the surfaces held before -- including
+	// never-written allocations when the session starts in this mode. Once per transition.
+	if (skipIL && !lastFrameSkippedIL) {
+		FLOAT zero[4] = { 0.f, 0.f, 0.f, 0.f };
+		for (int i = 0; i < 2; ++i) {
+			context->ClearUnorderedAccessViewFloat(texIlY[i]->uav.get(), zero);
+			context->ClearUnorderedAccessViewFloat(texIlCoCg[i]->uav.get(), zero);
+			context->ClearUnorderedAccessViewFloat(texGiSpecular[i]->uav.get(), zero);
+			context->ClearUnorderedAccessViewFloat(texBentNormal[i]->uav.get(), zero);
+			context->ClearUnorderedAccessViewFloat(texEnvIrradiance[i]->uav.get(), zero);
+		}
+	}
 	lastFrameSkippedIL = skipIL;
 
 	//////////////////////////////////////////////////////
@@ -1151,9 +1176,9 @@ void ScreenSpaceGI::DrawSSGI()
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-		// (batch 36) Same bindings either way: the AO-only permutation skips the radiance fetch
-		// and its store to u0 (the `#ifdef GI` block in the shader), writing u0 only for sky
-		// texels, which nothing reads on this path.
+		// (batch 36) Same bindings either way: the AO-only permutation writes only the AO history
+		// (u2) and the accumulation counter (u1); the radiance, IL, specular, bent and environment
+		// outputs bound here are left untouched.
 		context->CSSetShader(skipIL ? radianceDisoccAoOnlyCompute.get() : radianceDisoccCompute.get(), nullptr, 0);
 		context->Dispatch((internalRes[0] + 7u) >> 3, (internalRes[1] + 7u) >> 3, 1);
 
@@ -1355,7 +1380,9 @@ void ScreenSpaceGI::DrawSSGI()
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-		context->CSSetShader(upsampleCompute.get(), nullptr, 0);
+		// (batch 36) Same bindings and the same index flips either way; the AO-only permutation
+		// writes u0 (AO) only. ShouldSkipIL() already required it to exist in this mode.
+		context->CSSetShader(skipIL ? upsampleAoOnlyCompute.get() : upsampleCompute.get(), nullptr, 0);
 		context->Dispatch((resolution[0] + 7u) >> 3, (resolution[1] + 7u) >> 3, 1);
 
 		inputAoTexIdx = !inputAoTexIdx;
