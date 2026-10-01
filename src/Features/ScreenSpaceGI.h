@@ -277,6 +277,9 @@ public:
 
 	/// @brief (batch 36) Whether this frame runs the AO-only path. See Settings::SkipILUnderSSRTDiffuse.
 	[[nodiscard]] bool ShouldSkipIL() const;
+	/// @brief Settings::SkipILUnderSSRTDiffuse as it applies this frame: off while the Batch 36
+	/// master switch (Advanced > Batch 36) is off.
+	[[nodiscard]] bool SkipILSwitchOn() const;
 	/// @brief (batch 36) Last frame's ShouldSkipIL(), for the history reset on the way back.
 	bool lastFrameSkippedIL = false;
 };

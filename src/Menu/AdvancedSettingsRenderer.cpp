@@ -8,6 +8,9 @@
 
 #include "FeatureIssues.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
+#include "Features/ScreenSpaceGI.h"
+#include "Features/ScreenSpaceRayTracing.h"
+#include "Features/VariableRateShading.h"
 #include "Fonts.h"
 #include "Globals.h"
 #include "Menu.h"
@@ -15,6 +18,7 @@
 #include "State.h"
 #include "TruePBR.h"
 #include "Util.h"
+#include "Utils/Batch36.h"
 #include "Utils/Format.h"
 #include "Utils/UI.h"
 
@@ -24,6 +28,15 @@ void AdvancedSettingsRenderer::RenderAdvancedSettings(
 {
 	// Use TabBar system - tabs sorted alphabetically
 	if (ImGui::BeginTabBar("##AdvancedSettingsTabs", ImGuiTabBarFlags_None)) {
+		// Batch 36 Tab (first, so the A/B master switch is one click from the Advanced page)
+		if (MenuFonts::BeginTabItemWithFont("Batch 36", Menu::FontRole::Subheading)) {
+			if (ImGui::BeginChild("##Batch36Content", ImVec2(0, 0), false)) {
+				RenderBatch36Section();
+			}
+			ImGui::EndChild();
+			ImGui::EndTabItem();
+		}
+
 		// Developer Tab
 		if (MenuFonts::BeginTabItemWithFont("Developer", Menu::FontRole::Subheading)) {
 			if (ImGui::BeginChild("##DeveloperContent", ImVec2(0, 0), false)) {
@@ -71,6 +84,82 @@ void AdvancedSettingsRenderer::RenderAdvancedSettings(
 
 		ImGui::EndTabBar();
 	}
+}
+
+void AdvancedSettingsRenderer::RenderBatch36Section()
+{
+	auto& master = Batch36::settings.master;
+
+	ImGui::Checkbox("Batch 36 optimizations (all)", &master);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"Off = everything listed below runs exactly as in batch 34, whatever its own switch says.\n"
+			"Takes effect on the next frame: no restart, no cache clear.");
+	}
+
+	ImGui::Spacing();
+	ImGui::TextWrapped(
+		"Each item keeps its own switch in its feature's menu. \"Now\" is what runs this frame: "
+		"the item's own switch, unless the master switch above is off.");
+	ImGui::Spacing();
+
+	const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
+	const auto& ssrt = globals::features::screenSpaceRayTracing;
+	const auto& ssgi = globals::features::screenSpaceGI;
+	const auto& vrs = globals::features::variableRateShading;
+
+	struct Row
+	{
+		const char* name;
+		bool installed;
+		bool own;
+		const char* where;
+	};
+	const Row rows[] = {
+		{ "Half-Resolution Diffuse Denoising (being retired, default off)", ssrt.loaded, ssrt.settings.ReblurDiffuseHalfRes,
+			"Lighting > Screen Space Ray Tracing > Denoiser > REBLUR Cost (shown when Denoiser = REBLUR)" },
+		{ "Fold Diffuse Unpack Into Composite", ssrt.loaded, ssrt.settings.ReblurFoldDiffuseUnpack,
+			"Lighting > Screen Space Ray Tracing > Denoiser > REBLUR Cost (shown when Denoiser = REBLUR)" },
+		{ "Direct Motion Vectors", ssrt.loaded, ssrt.settings.ReblurDirectMotionVectors,
+			"Lighting > Screen Space Ray Tracing > Denoiser > REBLUR Cost (shown when Denoiser = REBLUR)" },
+		{ "Skip IL While SSRT Diffuse Is On", ssgi.loaded, ssgi.settings.SkipILUnderSSRTDiffuse,
+			"Lighting > Screen Space GI > Denoising" },
+		{ "Variable Rate Shading (default off; master can only force it off)", vrs.loaded, vrs.settings.Enabled,
+			"Display > Variable Rate Shading > Enable" },
+	};
+
+	if (ImGui::BeginTable("##Batch36Items", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+		ImGui::TableSetupColumn("Item");
+		ImGui::TableSetupColumn("Own switch");
+		ImGui::TableSetupColumn("Now");
+		ImGui::TableSetupColumn("Where", ImGuiTableColumnFlags_WidthStretch);
+		ImGui::TableHeadersRow();
+
+		for (const auto& row : rows) {
+			ImGui::TableNextRow();
+			ImGui::TableNextColumn();
+			ImGui::TextUnformatted(row.name);
+			ImGui::TableNextColumn();
+			if (!row.installed)
+				ImGui::TextDisabled("not installed");
+			else
+				ImGui::TextUnformatted(row.own ? "On" : "Off");
+			ImGui::TableNextColumn();
+			const bool now = row.installed && row.own && master;
+			if (!row.installed)
+				ImGui::TextDisabled("-");
+			else if (row.own && !master)
+				ImGui::TextColored(palette.Warning, "Off (master)");
+			else
+				ImGui::TextColored(now ? palette.SuccessColor : palette.Disable, "%s", now ? "On" : "Off");
+			ImGui::TableNextColumn();
+			ImGui::TextWrapped("%s", row.where);
+		}
+		ImGui::EndTable();
+	}
+
+	ImGui::Spacing();
+	ImGui::TextDisabled("Not affected by this switch: the overlay's engine-pass timers and the menu text.");
 }
 
 void AdvancedSettingsRenderer::RenderLoggingSection()

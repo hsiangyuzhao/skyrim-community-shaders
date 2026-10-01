@@ -12,6 +12,7 @@
 #include "ScreenSpaceGI.h"
 #include "Skylighting.h"
 
+#include "Utils/Batch36.h"
 #include "Utils/GpuTimers.h"
 
 #ifdef ENABLE_SHARC
@@ -380,7 +381,7 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "Off by default and will be removed in a later version.");
         {
             const bool halfRunning = diffuseHalfResActive && EffectiveDenoiser(false) == kDenoiserREBLUR;
-            if (settings.ReblurDiffuseHalfRes && !halfRunning && EffectiveDenoiser(false) == kDenoiserREBLUR)
+            if (settings.ReblurDiffuseHalfRes && Batch36::IsOn() && !halfRunning && EffectiveDenoiser(false) == kDenoiserREBLUR)
                 ImGui::TextDisabled("Not running (failed to start, see the log); full resolution is used instead.");
         }
         ImGui::Checkbox("Fold Diffuse Unpack Into Composite", &settings.ReblurFoldDiffuseUnpack);
@@ -389,6 +390,8 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::Checkbox("Direct Motion Vectors", &settings.ReblurDirectMotionVectors);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text("Saves GPU time and some VRAM by skipping a full-screen copy every frame. The picture should not change.");
+        if (!Batch36::IsOn())
+            ImGui::TextDisabled("Overridden: the Batch 36 master switch is off (Advanced > Batch 36), so all three run as in batch 34.");
 
         if (ImGui::TreeNode("REBLUR Hit Distance Normalization")) {
             reblurChanged |= ImGui::SliderFloat("Hit Dist A (game units)", &settings.ReblurHitDistA, 1.0f, 1000.0f, "%.0f");
@@ -1535,8 +1538,9 @@ void ScreenSpaceRayTracing::EnsureNRDResources()
 {
     // (batch 36) Which diffuse instance this frame wants. Settings::ReblurDiffuseHalfRes plus the
     // two shaders the half-resolution leg cannot run without; anything missing keeps the
-    // full-resolution instance, which is the batch 34 path.
-    const bool wantHalf = settings.ReblurDiffuseHalfRes && nrdHalfDownsampleCS && nrdHalfUpsampleCS;
+    // full-resolution instance, which is the batch 34 path. The Batch 36 master switch off forces
+    // that path too, read every frame like the setting itself.
+    const bool wantHalf = settings.ReblurDiffuseHalfRes && Batch36::IsOn() && nrdHalfDownsampleCS && nrdHalfUpsampleCS;
 
     const bool diffuseInPlace = wantHalf ?
                                     (diffuseHalfResActive && nrdReblurDiffuseHalf.IsValid() && texNRDHalfInput && texNRDHalfOutput &&
@@ -3754,7 +3758,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
             (void)RunReblurDiffuseHalf();
         } else {
             ID3D11ComputeShader* packedTwin = confidenceFilter ? diffuseCompositeExternalConfPackedCS.get() : diffuseCompositePackedCS.get();
-            const bool foldUnpack = settings.ReblurFoldDiffuseUnpack && packedTwin != nullptr;
+            const bool foldUnpack = settings.ReblurFoldDiffuseUnpack && Batch36::IsOn() && packedTwin != nullptr;
             const bool dispatched = RunReblur(false, foldUnpack);
             if (foldUnpack) {
                 compositePackedShader = packedTwin;
@@ -3976,7 +3980,7 @@ ScreenSpaceRayTracing::SharedData ScreenSpaceRayTracing::GetCommonBufferData()
     // it. With the SSGI switch off this term is skipped and the value is batch 34's exactly.
     const bool diffuseLive =
         settings.EnableDiffuse &&
-        (!ssgi.settings.SkipILUnderSSRTDiffuse || (loaded && DiffuseChainReady()));
+        (!ssgi.SkipILSwitchOn() || (loaded && DiffuseChainReady()));
 
     data.DiffuseMult = diffuseLive ? settings.DiffuseMult : 0.0f;
     // (ambient reinjection) Gated on EnableDiffuse for the same reason DiffuseMult is: every

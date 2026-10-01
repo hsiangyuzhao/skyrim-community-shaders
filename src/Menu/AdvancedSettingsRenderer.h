@@ -14,6 +14,7 @@ public:
 		const std::function<void()>& drawDisableAtBootSettings);
 
 private:
+	static void RenderBatch36Section();
 	static void RenderLoggingSection();
 	static void RenderShaderDebugSection();
 	static void RenderPBRSection(const std::function<void()>& drawTruePBRSettings);

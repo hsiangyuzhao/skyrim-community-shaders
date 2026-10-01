@@ -5,6 +5,7 @@
 #include "Deferred.h"
 #include "State.h"
 #include "Util.h"
+#include "Utils/Batch36.h"
 #include "Utils/GpuTimers.h"
 
 // (directional env v2) For the cubemap / skylighting SRVs the GI pass now binds and the
@@ -395,6 +396,8 @@ void ScreenSpaceGI::DrawSettings()
 			const bool skipping = ShouldSkipIL();
 			ImGui::TextDisabled("%s", skipping ? "Now: AO only (SSRT diffuse supplies the indirect light)" :
 			                                     "Now: full IL + AO");
+			if (settings.SkipILUnderSSRTDiffuse && !Batch36::IsOn())
+				ImGui::TextDisabled("Overridden: the Batch 36 master switch is off (Advanced > Batch 36).");
 		}
 
 		if (showAdvanced) {
@@ -875,6 +878,11 @@ void ScreenSpaceGI::CompileComputeShaders()
 	recompileFlag = false;
 }
 
+bool ScreenSpaceGI::SkipILSwitchOn() const
+{
+	return settings.SkipILUnderSSRTDiffuse && Batch36::IsOn();
+}
+
 // (batch 36) The AO-only path runs when, and only when, the composite is going to discard the IL
 // anyway (SSRT loaded and publishing a positive DiffuseMult this frame -- see
 // ScreenSpaceRayTracing::GetCommonBufferData, which also folds in whether the SSRT diffuse chain
@@ -882,7 +890,7 @@ void ScreenSpaceGI::CompileComputeShaders()
 // the regular pair already is the AO-only pair and there is nothing to switch.
 bool ScreenSpaceGI::ShouldSkipIL() const
 {
-	return settings.SkipILUnderSSRTDiffuse && settings.EnableGI &&
+	return SkipILSwitchOn() && settings.EnableGI &&
 	       giAoOnlyCompute && radianceDisoccAoOnlyCompute &&
 	       (settings.ResolutionMode == 0 || upsampleAoOnlyCompute) &&
 	       globals::features::screenSpaceRayTracing.DiffuseReplacesSsgiIl();

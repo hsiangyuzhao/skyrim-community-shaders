@@ -5,6 +5,7 @@
 #include "ScreenSpaceRayTracing.h"
 #include "State.h"
 #include "Upscaling.h"
+#include "Utils/Batch36.h"
 #include "Utils/D3D.h"
 #include "Utils/GpuTimers.h"
 
@@ -254,7 +255,7 @@ void NRD::PrepareGuides()
 	{
 		const auto& motionRT = rts[RE::RENDER_TARGETS::kMOTION_VECTOR];
 		directMotionVectorsThisFrame =
-			globals::features::screenSpaceRayTracing.settings.ReblurDirectMotionVectors &&
+			globals::features::screenSpaceRayTracing.settings.ReblurDirectMotionVectors && Batch36::IsOn() &&
 			motionRT.SRV && motionRT.UAV;
 		if (directMotionVectorsThisFrame) {
 			directMotionVectorSRV = motionRT.SRV;

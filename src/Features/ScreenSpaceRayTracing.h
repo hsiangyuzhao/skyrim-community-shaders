@@ -464,7 +464,8 @@ struct ScreenSpaceRayTracing : Feature
         /// sub-2-pixel detail in the *bounce light* itself (thin geometry such as grass blades and
         /// railings can pick up their neighbours' indirect light); the albedo, the direct light
         /// and the confidence/occlusion surfaces stay at full resolution. Off = batch 34.
-        bool ReblurDiffuseHalfRes = true;
+        /// Default off since 36a: being retired in favour of checkerboard sampling.
+        bool ReblurDiffuseHalfRes = false;
         /// @brief (batch C1) REBLUR tuning for the diffuse instance. NRD defaults.
         NRD::REBLURSettings ReblurDiffuse;
         /// @brief (batch C1) REBLUR tuning for the specular instance. Defaults taken

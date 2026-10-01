@@ -4,6 +4,7 @@
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/Batch36.h"
 #include "Utils/GpuTimers.h"
 
 // NVAPI is only used for its types; every entry point is resolved at runtime through the
@@ -194,7 +195,8 @@ void VariableRateShading::RestoreDefaultSettings()
 
 bool VariableRateShading::IsActive() const
 {
-	return loaded && settings.Enabled && hardwareSupported && !shaderFailed && rateCB;
+	// The Batch 36 master switch can only force VRS off, never on.
+	return loaded && settings.Enabled && Batch36::IsOn() && hardwareSupported && !shaderFailed && rateCB;
 }
 
 void VariableRateShading::SetupResources()
@@ -649,6 +651,9 @@ void VariableRateShading::DrawSettings()
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Lowers shading detail on flat, low-detail parts of the scene to save GPU time. Off by default because it can make parts of the image softer; needs an NVIDIA RTX 20-series or newer card.");
 	}
+
+	if (settings.Enabled && !Batch36::IsOn())
+		ImGui::TextColored(palette.Warning, "Forced off: the Batch 36 master switch is off (Advanced > Batch 36).");
 
 	ImGui::BeginDisabled(!settings.Enabled);
 
