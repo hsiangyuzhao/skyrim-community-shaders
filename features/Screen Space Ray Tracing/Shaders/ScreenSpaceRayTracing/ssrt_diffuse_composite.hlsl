@@ -15,6 +15,19 @@
 #	include "NRD/NRDReblurSH.hlsli"
 #endif
 
+// (batch 36b) SSRT_COMPOSITE_B36B: the same composite plus the batch 36b jobs, each behind a bit of
+// SSRTCB::CompositeFlags so one permutation per (filter, input) pair covers every combination:
+//   * CONF_FROM_DENOISER (efficiency mode, deviation 3): the reinjection confidence is not filtered
+//     on its own any more. The merged REBLUR instance denoises it together with the radiance, in
+//     the hit-distance channel (ssrt_raymarch.hlsl, HitDistIsVisibility), and this pass publishes
+//     1 - visibility as the confidence DeferredCompositeCS reads.
+//   * CHECKER_INPUT: the merged dispatch failed, t0 is the compact checkerboard input, and each
+//     pixel takes the traced sample of its own horizontal pair.
+// Without the define this file compiles to exactly what it did before.
+#ifdef SSRT_COMPOSITE_B36B
+#	include "ScreenSpaceRayTracing/ssrt_cb.hlsli"
+#endif
+
 Texture2D<float4> SSRTDiffuseTexture : register(t0);
 Texture2D<float4> AlbedoTexture : register(t1);
 
@@ -51,6 +64,12 @@ RWTexture2D<float> SSRTConfidenceSmoothRW : register(u1);
 RWTexture2D<float4> ConfidenceHistoryRW : register(u2);
 #endif
 
+#if defined(SSRT_COMPOSITE_B36B) && defined(SSRT_CONF_EXTERNAL_FILTER)
+// (batch 36b) CONF_FROM_DENOISER publishes the confidence here; the internal-filter variant
+// already declares this slot above and the two jobs never run together.
+RWTexture2D<float> SSRTConfidenceSmoothRW : register(u1);
+#endif
+
 #ifndef SSRT_CONF_EXTERNAL_FILTER
 // (reinjection noise) Mirrors ScreenSpaceRayTracing::SSRTCB. Only the last two members are read
 // here; the eight before them are declared because a constant buffer cannot be entered at an
@@ -59,6 +78,7 @@ RWTexture2D<float4> ConfidenceHistoryRW : register(u2);
 // (batch 8) That struct now carries a fourth row, CubemapFillBlend, which only the ray march
 // reads. Declaring the first three rows here stays legal -- a shader may declare a prefix of a
 // larger constant buffer -- and none of the offsets above moved.
+#	ifndef SSRT_COMPOSITE_B36B
 cbuffer SSRTCB : register(b1)
 {
     uint MaxSteps;
@@ -77,6 +97,7 @@ cbuffer SSRTCB : register(b1)
     // 1 / (AmbientConfidenceMaxFrames + 1): the floor on the accumulator's blend weight.
     float AmbientConfidenceInvMaxFrames;
 }
+#	endif
 #endif
 
 #ifndef SSRT_CONF_EXTERNAL_FILTER
@@ -344,6 +365,10 @@ groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
 #endif
 
     float4 ssrtDiffuse = SSRTDiffuseTexture[dispatchID.xy];
+#ifdef SSRT_COMPOSITE_B36B
+    [branch] if ((CompositeFlags & SSRT_COMPOSITE_FLAG_CHECKER_INPUT) != 0)
+        ssrtDiffuse = SSRTDiffuseTexture[uint2(dispatchID.x >> 1, dispatchID.y)];
+#endif
 #ifdef SSRT_DIFFUSE_PACKED_INPUT
     {
         float3 unpackedRadiance;
@@ -351,6 +376,16 @@ groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
         REBLUR_BackEnd_UnpackRadianceAndNormHitDist(ssrtDiffuse, unpackedRadiance, unpackedNormHitDist);
         ssrtDiffuse = float4(unpackedRadiance, unpackedNormHitDist);
     }
+#endif
+#ifdef SSRT_COMPOSITE_B36B
+    // REBLUR's denoised normalized hit distance, which in the batch 36b modes is a visibility:
+    // 1 = every ray of the neighbourhood missed or hit far away, 0 = all of them hit close by.
+    // saturate() also maps a NaN (sky texels REBLUR never writes) to 0.
+    const float denoisedVisibility = saturate(ssrtDiffuse.w);
+#   ifdef SSRT_CONF_EXTERNAL_FILTER
+    [branch] if ((CompositeFlags & SSRT_COMPOSITE_FLAG_CONF_FROM_DENOISER) != 0)
+        SSRTConfidenceSmoothRW[dispatchID.xy] = 1.0 - denoisedVisibility;
+#   endif
 #endif
     // (guard G9) The last gate in the chain, and the one that decides whether an SSRT
     // failure is a local artefact or a global one. ColorTextureRW is kMAIN: whatever is

@@ -140,71 +140,15 @@ RWStructuredBuffer<uint4> u_SharcVoxelDataBuffer : register(u3);
 RWStructuredBuffer<uint4> u_SharcVoxelDataBufferPrev : register(u4);
 #endif
 
-cbuffer SSRTCB : register(b1)
-{
-    uint MaxSteps;
-    uint MaxMips;
-    uint UseDynamicCubemapsAsFallback;
-    float Thickness;
-    float NormalBias;
-    float BRDFBias;
-    float OcclusionStrength;
-    float CubemapNormalization;
-    // --- row 2 ---
-    // (diagnostic T2) Non-zero freezes the per-frame phase of the ray-direction noise; see
-    // SampleRandomVector2DBaked.
-    uint FreezeNoisePhase;
-    // (S3.10) Non-zero takes the sample scramble from the baked blue-noise array at t6; zero
-    // takes it from a pcg3d hash, which is what shipped before. See SampleRandomVector2DBaked.
-    uint UseBlueNoise;
-    // (batch 8) Declared only so that CubemapFillBlend lands on its real offset. Row 2 of
-    // ScreenSpaceRayTracing::SSRTCB is full, HLSL has no syntax for skipping a constant-buffer
-    // slot, and this file reads neither of these two -- ssrt_diffuse_composite.hlsl is their
-    // consumer. Naming them rather than declaring a `uint2` pad keeps the mirror readable and
-    // greppable; fxc strips unreferenced cbuffer members from the binding either way.
-    uint TemporalAmbientConfidence;
-    float AmbientConfidenceInvMaxFrames;
-    // --- row 3 ---
-    // (batch 8) beta: the fraction of the hemisphere the rays could *not* resolve that is filled
-    // from the dynamic cubemap instead of from the vanilla ambient DeferredCompositeCS re-adds.
-    //
-    // The composite needs no knowledge of this at all. It computes
-    // `ambientKeep = 1 - conf * strength` from the confidence this file reports, so folding the
-    // fill into the reported (radiance, confidence) pair makes the composite's own subtraction
-    // balance the books automatically -- see the derivation at the application site.
-    //
-    // 0 is the pure ambient-reinjection behaviour and every expression this value appears in
-    // folds away at that value, which is what makes the default bit-identical. 1 fills the whole
-    // unresolved fraction from the cubemap, i.e. arithmetically the legacy fallback, but reached
-    // through the composite's subtraction rather than by zeroing the forward ambient.
-    //
-    // Only ever non-zero while SharedData::ssrtSettings.AmbientReinjection is set and the diffuse
-    // cubemap fallback has a cubemap to sample: DrawSSRTDiffuse zeroes it in every other case, and
-    // DrawSSRTSpecular passes 0 unconditionally. So neither the fallback path nor the specular
-    // permutation needs a guard of its own.
-    float CubemapFillBlend;
-    // (batch 11, item A) REBLUR's hit-distance normalization constants. The same three values
-    // the C++ side hands nrd::ReblurSettings::hitDistanceParameters -- REBLUR denormalizes with
-    // them internally, so the producer and the denoiser must agree. They used to live in a
-    // constant buffer of their own (NRDPackCB, read by ssrt_nrd_pack.hlsl); that shader is gone
-    // and these took the three pad slots row 3 already had, so the buffer did not grow for them.
-    float NRDHitDistA;
-    float NRDHitDistB;
-    float NRDHitDistC;
-    // --- row 4 ---
-    // (batch 11, item A) Non-zero makes the output block below write u0 in REBLUR's front-end
-    // layout (YCoCg radiance + normalized hit distance) instead of the chain's own linear
-    // radiance layout -- and the C++ side binds texNRDPackInput at u0 in exactly that case. Zero
-    // is the pre-existing behaviour, bit for bit: every expression the flag gates is skipped.
-    //
-    // Set only when DrawSSRT{Diffuse,Specular} has already resolved this frame's effective
-    // denoiser to REBLUR, which is the same condition that calls RunReblur.
-    uint NRDFrontEndPack;
-    // (batch 28) Roughness above which the specular march is skipped entirely. Takes one of the
-    // three spare floats row 4 already had, so SSRTCB does not grow. Read only under
-    // SSRT_SPECULAR; the diffuse permutation declares it to keep one shared layout.
-    float SpecularMaxRoughness;
-};
+// (batch 36b) The constant buffer moved to ssrt_cb.hlsli, shared with the batch 36b composite and
+// unpack permutations that read its later rows.
+#include "ScreenSpaceRayTracing/ssrt_cb.hlsli"
+
+#if defined(SSRT_CHECKERBOARD)
+// (batch 36b) Checkerboard debug view: red where this frame traced diffuse, green where it traced
+// specular. u7 is free on both checkerboard permutations (no SHARC buffers there).
+RWTexture2D<unorm float4> CheckerDebugOutput : register(u7);
+#endif
 
 // (audit #21) Never defined by ScreenSpaceRayTracing::CompileComputeShaders, so this is
 // always 0 in every shipped permutation: the engine depth buffer is not inverted (see
@@ -876,8 +820,38 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // `SSRT_GBUFFER_COORDS` is the full-resolution pixel this lane traces for and `SSRT_NOISE_COORDS`
     // seeds its sampling sequences. Macros rather than locals so the token stream fxc sees is
     // `coords.xy` itself on every full-resolution permutation.
+#if defined(SSRT_CHECKERBOARD)
+    // (batch 36b) REBLUR checkerboard. `coords` is the compact coordinate: the dispatch is
+    // ceil(width / 2) wide and the packed output is written there, i.e. tightly into the left half of
+    // the full-size NRD input, which is NRD's own layout for checkerboard signals
+    // (NRDSettings.h, CheckerboardMode). The full-resolution pixel this lane traces is the one of the
+    // horizontal pair that REBLUR will read this frame:
+    //
+    //   NRD: checkerboard = (x ^ y ^ frameIndex) & 1  (MathLib Sequence::CheckerBoard)
+    //        diffuse has data where checkerboard == gDiffCheckerboard, specular where
+    //        checkerboard == gSpecCheckerboard, and it reads both at (x >> 1, y)
+    //        (REBLUR_TemporalAccumulation.cs.hlsl, diffHasData / specHasData).
+    //   REBLUR_DIFFUSE_SPECULAR with CheckerboardMode::BLACK: gDiffCheckerboard = 0,
+    //        gSpecCheckerboard = 1 (Reblur.cpp).
+    //   So diffuse owns x with (x & 1) == ((y + frameIndex) & 1) -- the low bit of an XOR is the
+    //   low bit of the sum -- and specular owns the other one. Every pixel gets exactly one of the
+    //   two signals per frame, and the other one the next frame.
+    //
+    // NRDFrameIndex is the very value REBLUR receives as gFrameIndex (CommonSettings::frameIndex).
+#   if defined(SSRT_SPECULAR)
+    const uint checkerParity = ((coords.y + NRDFrameIndex) & 1u) ^ 1u;
+#   else
+    const uint checkerParity = (coords.y + NRDFrameIndex) & 1u;
+#   endif
+    const uint2 gbufferCoords = uint2((coords.x << 1) | checkerParity, coords.y);
+#   define SSRT_GBUFFER_COORDS gbufferCoords
+    // The noise pattern was authored for the full-resolution grid, and a checkerboard lane really is
+    // a full-resolution pixel, so it is seeded exactly as the full-resolution pass would seed it.
+#   define SSRT_NOISE_COORDS gbufferCoords
+#else
 #   define SSRT_GBUFFER_COORDS coords.xy
 #   define SSRT_NOISE_COORDS coords.xy
+#endif
 
     float2 uv = float2(SSRT_GBUFFER_COORDS + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
     uint eyeIndex = Stereo::GetEyeIndexFromTexCoord(uv);
@@ -949,6 +923,8 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     const float hitDistTexelWorld = abs(view_space_ray.z) * 2.0f /
                                     max(abs(FrameBuffer::CameraProj[eyeIndex][0][0]) * hitDistWidthPerEye, 1e-6f);
     const float hitDistRefWorld = max(hitDistTexelWorld * SSRT_HITT_REF_TEXELS, 1e-6f);
+    // (batch 36b) This pixel's REBLUR viewZ, for the per-sample visibility below (HitDistIsVisibility).
+    const float nrdVisViewZ = SSRT_NRDViewZ(depth);
 #endif
     float3 world_space_normal = normalize(mul(FrameBuffer::CameraViewInverse[eyeIndex], float4(normalVS, 0)).xyz);
     float3 view_space_surface_normal = normalVS;
@@ -1002,7 +978,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // bound, so the rescale is gone. The `coords >= int2(0, 0)` half is gone with it:
     // `coords` is uint2, so it was vacuously true, and comparing it against an int2 was
     // two of the file's signed/unsigned warnings (X3203).
-    bool valid_ray = all(coords < screen_size) && !is_far_plane;  // (audit P1)
+    bool valid_ray = all(SSRT_GBUFFER_COORDS < screen_size) && !is_far_plane;  // (audit P1)
 #if defined(SSRT_SPECULAR)
     // (batch 28) Skip the march where the GGX lobe is wide enough that the prefiltered cubemap
     // is already the same answer. Joining valid_ray rather than returning early is deliberate:
@@ -1151,14 +1127,46 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // keeps a broken reconstruction on the "leave the kernel alone" side.
         if (confidence > 0.0f && isFiniteSafe(world_ray_length))
             hit_norm = world_ray_length / (world_ray_length + hitDistRefWorld);
+        // (batch 36b) REBLUR's own AO convention for the hit-distance channel, used whenever
+        // something downstream reads that channel as a visibility (efficiency mode's confidence,
+        // the denoiser AO). Per sample: the coverage this ray claims -- its validated hit plus the
+        // back-face evidence ambient reinjection already counts -- attenuated by how far away the
+        // geometry is on REBLUR's own hit-distance curve, (A + B * viewZ) at roughness 1. The
+        // channel then carries the mean of (1 - visCoverage), which is the "normalized hit distance
+        // averaged over samples" NRD asks for (a miss is 1). The batch 11 texel encoding above stays
+        // for every other configuration, bit for bit.
+        float visCoverage = 0.0f;
+        float proximity = 1.0f;
+        [branch] if (HitDistIsVisibility != 0 && isFiniteSafe(world_ray_length))
+        {
+            proximity = 1.0f - REBLUR_FrontEnd_GetNormHitDist(world_ray_length, nrdVisViewZ, SSRT_NRDHitDistParams(), 1.0f);
+            visCoverage = saturate(confidence + (1.0f - occlusion) * OcclusionStrength) * proximity;
+        }
 #endif
         float3 sampleColor = 0;
+#if defined(SSRT_SPECULAR)
+        // (batch 36b) Efficiency mode traces specular before this frame's merged REBLUR dispatch,
+        // i.e. before this frame's image exists, so the hit takes its colour from last frame's
+        // texColor at the hit's motion-reprojected position. A hit whose previous position fell off
+        // screen has no colour to give and is treated as a miss (the fallback below covers it).
+        float2 hitColorUV = hit.xy * FrameBuffer::DynamicResolutionParams1.xy;
+        [branch] if ((RaymarchFlags & SSRT_RAYMARCH_FLAG_PREV_FRAME_COLOR) != 0 && confidence > 0.0f)
+        {
+            float2 prevHitUV;
+            ReprojectHit(MotionVectorTexture, hit, eyeIndex, prevHitUV);
+            if (any(prevHitUV < 0.0f) || any(prevHitUV > 1.0f))
+                confidence = 0.0f;
+            // .zw: last frame's dynamic-resolution ratio, which is what texColor was written at.
+            hitColorUV = prevHitUV * FrameBuffer::DynamicResolutionParams1.zw;
+        }
+#endif
         if (confidence > 0.0f)
         {
-            // float2 projUV;
-            // ReprojectHit(MotionVectorTexture, hit, eyeIndex, projUV);
-
+#if defined(SSRT_SPECULAR)
+            sampleColor = ScreenColorTextureMips.SampleLevel(LinearSampler, hitColorUV, 0).xyz;
+#else
             sampleColor = ScreenColorTextureMips.SampleLevel(LinearSampler, hit.xy * FrameBuffer::DynamicResolutionParams1.xy, 0).xyz;
+#endif
             sampleColor = Color::IrradianceToLinear(sampleColor);
             // (guard G1) The radiance source is kMAIN, i.e. the accumulated output of every
             // other feature in the deferred chain. SSRT has no control over what lands
@@ -1427,8 +1435,17 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // Color::MultiBounceAO of the same SSGI AO, so doing it here as well would apply it
         // twice.
         [branch] if (SharedData::ssrtSettings.AmbientReinjection != 0) {
-            sampleColor *= confidence;
-            confidence = saturate(confidence + (1.0 - occlusion) * OcclusionStrength);
+            // (batch 36b) ProximityCoverage (efficiency mode, deviation 3): the confidence the
+            // composite subtracts the ambient with is the merged denoiser's visibility, i.e. the
+            // distance-attenuated coverage computed above, so the radiance has to carry the same
+            // weight or a far hit would add its light without displacing the ambient it stands for.
+            [branch] if (ProximityCoverage != 0) {
+                sampleColor *= confidence * proximity;
+                confidence = visCoverage;
+            } else {
+                sampleColor *= confidence;
+                confidence = saturate(confidence + (1.0 - occlusion) * OcclusionStrength);
+            }
 #   if defined(DYNAMIC_CUBEMAPS)
             // (batch 8, cubemap fill) Spend the beta fill, and spend it *here* -- after the line
             // above has settled what fraction of the hemisphere this sample claims to have
@@ -1472,13 +1489,18 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
                 confidence = saturate(confidence + fillWeight);
             }
 #   endif
+            // (batch 36b) The fill partitions the same hemisphere, so under ProximityCoverage it has to
+            // reach the denoised channel too, or the composite would keep the ambient it replaced.
+            if (ProximityCoverage != 0)
+                visCoverage = confidence;
         }
 #endif
 
 #if SSRT_USE_SAMPLE_LDS
         samples[SSRT_SAMPLE_SLOT][sample_id] = float4(sampleColor, confidence);
 #   if !SHARC_UPDATE
-        hitNorms[SSRT_SAMPLE_SLOT][sample_id] = hit_norm;  // (batch 1, item 2)
+        // (batch 1, item 2) The texel encoding, or (batch 36b) the REBLUR visibility of this sample.
+        hitNorms[SSRT_SAMPLE_SLOT][sample_id] = HitDistIsVisibility != 0 ? 1.0f - visCoverage : hit_norm;
 #   endif
 #else
         localSample = float4(sampleColor, confidence);
@@ -1532,7 +1554,15 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // (batch 11, item A) Written on both paths and unchanged: this is the R32_FLOAT surface
     // Upscaling.cpp hands DLSS-RR as its specular hit-distance guide, so it is not the pack
     // pass's private input and cannot be traded away for the packed layout.
+#if defined(SSRT_CHECKERBOARD)
+    // (batch 36b) Not written here: half the pixels have no specular sample this frame, so the
+    // efficiency-mode unpack rebuilds this R32 surface for every pixel from REBLUR's denoised
+    // hit distance (ssrt_nrd_unpack.hlsl, SSRT_UNPACK_SPEC_EFFICIENCY).
+    if ((RaymarchFlags & SSRT_RAYMARCH_FLAG_CHECKER_DEBUG) != 0 && all(SSRT_GBUFFER_COORDS < screen_size))
+        CheckerDebugOutput[SSRT_GBUFFER_COORDS] = float4(0, 1, 0, 1);
+#else
     SSRTHitDistanceOutput[coords.xy] = hit_distance;
+#endif
     if (NRDFrontEndPack != 0) {
         // The retired pack pass read hit_distance back out of the R32_FLOAT surface above --
         // an exact round trip, so no re-quantisation is owed here, unlike the diffuse case.
@@ -1594,8 +1624,12 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             // changes nothing for any pixel REBLUR actually reads.
             const float nrdTexelWorld = min(abs(nrdViewZ), 1e7) * 2.0 /
                                         max(abs(FrameBuffer::CameraProj[0][0][0]) * nrdRenderWidth, 1e-6);
-            const float normHitDist = REBLUR_FrontEnd_GetNormHitDist(
+            float normHitDist = REBLUR_FrontEnd_GetNormHitDist(
                 tTexels * nrdTexelWorld, nrdViewZ, SSRT_NRDHitDistParams(), 1.0);
+            // (batch 36b) The samples already carry REBLUR's normalized visibility, so the mean is
+            // the front-end value as it stands. Floored at NRD_EPS like GetNormHitDist's own result.
+            if (HitDistIsVisibility != 0)
+                normHitDist = max(hitNormMean, NRD_EPS);
             SSRColorOutput[coords.xy] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(
                 SSRT_Fp16RoundTrip3(outColor.xyz), normHitDist, true);
         } else {
@@ -1607,7 +1641,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // for every texel the dispatch covers and a sky pixel keeps its full vanilla
         // ambient. Already saturated above and sanitised by G2, so the UNORM store cannot
         // see a NaN.
-        SSRTConfidenceOutput[coords.xy] = outColor.w;
+        SSRTConfidenceOutput[SSRT_GBUFFER_COORDS] = outColor.w;
         // (batch 1, item 2) Written unconditionally, sky and out-of-bounds lanes included, so
         // the surface is deterministic for every texel the dispatch covers -- those lanes
         // resolve to the 1.0 default, which the denoiser never reads because it early-outs on
@@ -1617,7 +1651,11 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // byte per texel, it is what the Buffer Viewer shows for this surface, and it is the one
         // thing that keeps the entry honest rather than displaying whatever the last SVGF frame
         // left there. hitNormMean is the value the store always carried, hoisted above.
-        SSRTDiffuseHitDistanceOutput[coords.xy] = hitNormMean;
+        SSRTDiffuseHitDistanceOutput[SSRT_GBUFFER_COORDS] = hitNormMean;
+#   if defined(SSRT_CHECKERBOARD)
+        if ((RaymarchFlags & SSRT_RAYMARCH_FLAG_CHECKER_DEBUG) != 0 && all(SSRT_GBUFFER_COORDS < screen_size))
+            CheckerDebugOutput[SSRT_GBUFFER_COORDS] = float4(1, 0, 0, 1);
+#   endif
     }
 #endif
 }

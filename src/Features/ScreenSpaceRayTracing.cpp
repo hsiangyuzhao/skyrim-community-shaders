@@ -43,8 +43,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurFeedHitCoverageConfidence,
     ReblurDirectMotionVectors,
     ReblurFoldDiffuseUnpack,
+    ReblurMode,
     ReblurDiffuse,
     ReblurSpecular,
+    ReblurMerged,
     ReblurHitDistA,
     ReblurHitDistB,
     ReblurHitDistC,
@@ -71,6 +73,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ForceAcceptHistory,
     RotatedNormalGate,
     HistoryDebugView,
+    CheckerboardDebugView,
     EnableSharc
 )
 #else
@@ -101,8 +104,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurFeedHitCoverageConfidence,
     ReblurDirectMotionVectors,
     ReblurFoldDiffuseUnpack,
+    ReblurMode,
     ReblurDiffuse,
     ReblurSpecular,
+    ReblurMerged,
     ReblurHitDistA,
     ReblurHitDistB,
     ReblurHitDistC,
@@ -128,7 +133,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     DisableHistoryNormalTest,
     ForceAcceptHistory,
     RotatedNormalGate,
-    HistoryDebugView
+    HistoryDebugView,
+    CheckerboardDebugView
 )
 #endif
 
@@ -339,14 +345,38 @@ void ScreenSpaceRayTracing::DrawSettings()
         // (batch 36) The REBLUR cost switches. All hot, all default on, and each one off is the
         // batch 34 behaviour for that piece.
         ImGui::SeparatorText("REBLUR Cost");
+        // (batch 36b) The REBLUR layout. No reblurChanged here: the switch swaps instances, and the
+        // one entered is created fresh and restarts on its own (EnsureNRDResources).
+        {
+            static const char* reblurModes[] = { "Quality", "Efficiency" };
+            int rm = (int)std::min(settings.ReblurMode, (uint)kReblurEfficiency);
+            if (ImGui::Combo("REBLUR Mode", &rm, reblurModes, 2))
+                settings.ReblurMode = (uint)rm;
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text(
+                    "Efficiency = each pixel traces either bounce light or reflections, swapping every frame, and one denoiser cleans up both: "
+                    "much cheaper. Reflections are one frame late, and bounce light from far surfaces fades into the normal ambient light.\n"
+                    "Quality = every pixel traces both every frame with two denoisers, the batch 34 picture.\n"
+                    "Switching restarts the denoiser, so the image takes about a second to settle.");
+            if (efficiencyActive)
+                ImGui::TextDisabled("Now: Efficiency");
+            else if (settings.ReblurMode == kReblurEfficiency) {
+                const char* why = !Batch36::IsOn()                                     ? "the Batch 36 master switch is off" :
+                                  (!settings.EnableDiffuse || !settings.EnableSpecular) ? "it needs both Enable Diffuse and Enable Specular" :
+                                  mergedReblurInitFailed                               ? "it failed to start (see the log)" :
+                                  (effectiveDenoiserDiffuse != kDenoiserREBLUR || effectiveDenoiserSpecular != kDenoiserREBLUR) ? "REBLUR is not running" :
+                                                                                         "it is unavailable with the current settings (SHARC on, or a shader failed)";
+                ImGui::TextDisabled("Now: Quality, because %s.", why);
+            }
+        }
         ImGui::Checkbox("Fold Diffuse Unpack Into Composite", &settings.ReblurFoldDiffuseUnpack);
         if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text("Saves GPU time by skipping one full-screen step after the bounce-light denoiser. The picture should not change.");
+            ImGui::Text("Saves GPU time by skipping one full-screen step after the bounce-light denoiser. The picture should not change. Quality mode only; Efficiency always skips it.");
         ImGui::Checkbox("Direct Motion Vectors", &settings.ReblurDirectMotionVectors);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text("Saves GPU time and some VRAM by skipping a full-screen copy every frame. The picture should not change.");
         if (!Batch36::IsOn())
-            ImGui::TextDisabled("Overridden: the Batch 36 master switch is off (Advanced > Batch 36), so all three run as in batch 34.");
+            ImGui::TextDisabled("Overridden: the Batch 36 master switch is off (Advanced > Batch 36), so these run as in batch 34 (Quality mode, no folding, motion-vector copy).");
 
         if (ImGui::TreeNode("REBLUR Hit Distance Normalization")) {
             reblurChanged |= ImGui::SliderFloat("Hit Dist A (game units)", &settings.ReblurHitDistA, 1.0f, 1000.0f, "%.0f");
@@ -368,9 +398,15 @@ void ScreenSpaceRayTracing::DrawSettings()
             reblurChanged |= ImGui::Checkbox("Use Pre-pass Only for Motion Estimation", &settings.UsePrepassOnlyForSpecularMotionEstimation);
             ImGui::TreePop();
         }
+        if (ImGui::TreeNode("REBLUR Efficiency Mode (advanced)")) {
+            ImGui::TextWrapped("One set of values for bounce light and reflections together. The specular pre-pass settings above apply here too.");
+            reblurChanged |= nrdSvc.DrawReblurSettings(settings.ReblurMerged, true, "ssrt_reblur_merged");
+            ImGui::TreePop();
+        }
         if (reblurChanged) {
             resetReblurDiffuse = true;
             resetReblurSpecular = true;
+            resetReblurMerged = true;
         }
     }
 
@@ -455,6 +491,12 @@ void ScreenSpaceRayTracing::DrawSettings()
             "Free; keep it on.");
 
     ImGui::SeparatorText("Debug");
+
+    ImGui::Checkbox("Checkerboard Debug View", &settings.CheckerboardDebugView);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Diagnostic, Efficiency mode only. Paints texCheckerDebug (Buffer Viewer): red where this frame traced bounce light, "
+            "green where it traced reflections. It should be a fine checkerboard whose colours swap every frame; the game picture is not changed.");
 
     ImGui::Checkbox("Freeze Noise Phase", &settings.FreezeNoisePhase);
     if (auto _tt = Util::HoverTooltipWrapper())
@@ -691,6 +733,20 @@ void ScreenSpaceRayTracing::DrawSettings()
                 ImGui::TreePop();
             }
         }
+        // (batch 36b) Efficiency mode: the specular pair (the diffuse one is texNRDPack* above), the
+        // merged instance's validation layer, and the checkerboard debug surface.
+        if (texNRDSpecInput)
+            BUFFER_VIEWER_NODE(texNRDSpecInput, debugRescale)
+        if (texNRDSpecOutput)
+            BUFFER_VIEWER_NODE(texNRDSpecOutput, debugRescale)
+        if (texCheckerDebug)
+            BUFFER_VIEWER_NODE(texCheckerDebug, debugRescale)
+        if (auto validation = settings.ReblurMerged.EnableValidation ? nrdReblurMerged.GetValidationSRV() : nullptr) {
+            if (ImGui::TreeNode("NRD Validation (Efficiency mode)")) {
+                ImGui::Image(validation, { nrdReblurMerged.GetWidth() * debugRescale, nrdReblurMerged.GetHeight() * debugRescale });
+                ImGui::TreePop();
+            }
+        }
         if (auto validation = settings.ReblurSpecular.EnableValidation ? nrdReblurSpecular.GetValidationSRV() : nullptr) {
             if (ImGui::TreeNode("NRD Validation (Specular)")) {
                 ImGui::Image(validation, { nrdReblurSpecular.GetWidth() * debugRescale, nrdReblurSpecular.GetHeight() * debugRescale });
@@ -727,6 +783,8 @@ void ScreenSpaceRayTracing::SanitizeSettings()
     // (batch C1) An out-of-range value must not fall through the dispatch gates as
     // "neither SVGF nor REBLUR but not Off either".
     settings.DenoiserMethod = std::min(settings.DenoiserMethod, (uint)kDenoiserREBLUR);
+    // (batch 36b) Likewise for the REBLUR layout.
+    settings.ReblurMode = std::min(settings.ReblurMode, (uint)kReblurEfficiency);
 
     // DIFFUSE_SPP is a compile-time macro and the ray march's sample loop divides by it.
     // 0 is a divide by zero in the estimator; the 16 ceiling is the Hammersley table's.
@@ -845,6 +903,12 @@ void ScreenSpaceRayTracing::SetupResources()
         texColor = eastl::make_unique<Texture2D>(texDesc);
         texColor->CreateSRV(srvDesc);
         texColor->CreateUAV(uavDesc);
+        // (batch 36b) Efficiency mode reads this as *last* frame's image before this frame writes it,
+        // so a fresh allocation must not hold undefined memory on the first frame.
+        {
+            const float zeroColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            globals::d3d::context->ClearUnorderedAccessViewFloat(texColor->uav.get(), zeroColor);
+        }
         texSSRColor = eastl::make_unique<Texture2D>(texDesc);
         texSSRColor->CreateSRV(srvDesc);
         texSSRColor->CreateUAV(uavDesc);
@@ -1340,10 +1404,15 @@ bool ScreenSpaceRayTracing::EnsureConfidenceFilterResources()
 // RunReblur call, so the duplication bought nothing and cost 16 bytes per output pixel
 // (~127 MiB at a 4K allocation). The two nrd::Instances stay separate: their permanent pools
 // *are* the per-signal history and are not scratch.
-void ScreenSpaceRayTracing::EnsureNRDResources()
+void ScreenSpaceRayTracing::EnsureNRDResources(bool a_merged)
 {
-    if (texNRDPackInput && texNRDPackOutput && nrdReblurDiffuse.IsValid() && nrdReblurSpecular.IsValid())
-        return;
+    // (batch 36b) Steady state is one predicate per frame: the pair, and the layout asked for.
+    if (texNRDPackInput && texNRDPackOutput) {
+        if (a_merged && mergedReblurActive && nrdReblurMerged.IsValid() && texNRDSpecInput && texNRDSpecOutput)
+            return;
+        if (!a_merged && !mergedReblurActive && nrdReblurDiffuse.IsValid() && nrdReblurSpecular.IsValid())
+            return;
+    }
 
     logger::debug("Creating SSRT NRD resources...");
 
@@ -1392,14 +1461,100 @@ void ScreenSpaceRayTracing::EnsureNRDResources()
     // fresh instance's pools are undefined until CLEAR_AND_RESTART has run over them. (Batch 34
     // latched both on any creation, which is the same thing whenever both are created together,
     // the only case that path ever had.)
-    if (!nrdReblurSpecular.IsValid()) {
-        nrdReblurSpecular.Init(mainDesc.Width, mainDesc.Height, nrd::Denoiser::REBLUR_SPECULAR, 1);
-        resetReblurSpecular = true;
+    //
+    // (batch 36b) Exactly one of the two layouts stands at a time, so switching modes swaps one
+    // set of NRD pools for the other instead of holding both. The layout being left is released
+    // before the other is created, which keeps the peak allocation at the larger of the two.
+    bool mergedUp = false;
+    if (a_merged) {
+        nrdReblurSpecular.Shutdown();
+        nrdReblurDiffuse.Shutdown();
+        makeTex(texNRDSpecInput, "SSRT::NRDSpecInput");
+        makeTex(texNRDSpecOutput, "SSRT::NRDSpecOutput");
+        if (!nrdReblurMerged.IsValid()) {
+            if (nrdReblurMerged.Init(mainDesc.Width, mainDesc.Height, nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR, 3)) {
+                resetReblurMerged = true;
+            } else {
+                // Not retried every frame: quality runs until the setting or the resolution changes.
+                mergedReblurInitFailed = true;
+                logger::error("SSRT: the efficiency-mode REBLUR instance failed to start; running quality mode instead.");
+            }
+        }
+        mergedUp = nrdReblurMerged.IsValid() && texNRDSpecInput && texNRDSpecOutput;
     }
-    if (!nrdReblurDiffuse.IsValid()) {
-        nrdReblurDiffuse.Init(mainDesc.Width, mainDesc.Height, nrd::Denoiser::REBLUR_DIFFUSE, 0);
-        resetReblurDiffuse = true;
+    if (!mergedUp) {
+        nrdReblurMerged.Shutdown();
+        texNRDSpecInput = nullptr;
+        texNRDSpecOutput = nullptr;
+        if (!nrdReblurSpecular.IsValid()) {
+            nrdReblurSpecular.Init(mainDesc.Width, mainDesc.Height, nrd::Denoiser::REBLUR_SPECULAR, 1);
+            resetReblurSpecular = true;
+        }
+        if (!nrdReblurDiffuse.IsValid()) {
+            nrdReblurDiffuse.Init(mainDesc.Width, mainDesc.Height, nrd::Denoiser::REBLUR_DIFFUSE, 0);
+            resetReblurDiffuse = true;
+        }
     }
+    mergedReblurActive = mergedUp;
+}
+
+// (batch 36b) The checkerboard debug surface. Only the debug view uses it, so it is allocated the
+// first time that view is switched on and released only with the rest on a resolution change.
+bool ScreenSpaceRayTracing::EnsureCheckerDebugTexture()
+{
+    if (texCheckerDebug)
+        return true;
+    auto mainTex = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return false;
+    D3D11_TEXTURE2D_DESC mainDesc{};
+    mainTex.texture->GetDesc(&mainDesc);
+    D3D11_TEXTURE2D_DESC texDesc{
+        .Width = mainDesc.Width,
+        .Height = mainDesc.Height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+        .SampleDesc = { 1, 0 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+    };
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+    };
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipSlice = 0 }
+    };
+    texCheckerDebug = eastl::make_unique<Texture2D>(texDesc);
+    texCheckerDebug->CreateSRV(srvDesc);
+    texCheckerDebug->CreateUAV(uavDesc);
+    Util::SetResourceName(texCheckerDebug->resource.get(), "SSRT::CheckerDebug");
+    return true;
+}
+
+// (batch 36b) The configuration half of the efficiency-mode question. Everything here is a fact
+// about settings and compiled shaders; resources are EnsureNRDResources' business.
+bool ScreenSpaceRayTracing::WantEfficiencyMode() const
+{
+    if (!Batch36::IsOn() || settings.ReblurMode != kReblurEfficiency || !ReblurSelected())
+        return false;
+    // One instance denoises both signals, so both have to exist to be traced.
+    if (!settings.EnableDiffuse || !settings.EnableSpecular)
+        return false;
+#ifdef ENABLE_SHARC
+    // SHARC's diffuse permutations have no checkerboard variant.
+    if (settings.EnableSharc)
+        return false;
+#endif
+    if (mergedReblurInitFailed)
+        return false;
+    return raymarchDiffuseCheckerCS && raymarchSpecularCheckerCS && nrdUnpackSpecEfficiencyCS &&
+           diffuseCompositeB36BCS[2] && diffuseCompositeB36BCS[3] && prepareColorCS &&
+           ReblurStaticallyAvailable(false) && ReblurStaticallyAvailable(true);
 }
 
 // (S1.3) The static half of the REBLUR readiness question: everything that is knowable
@@ -1439,6 +1594,10 @@ bool ScreenSpaceRayTracing::ReblurResourcesReady(bool a_specular) const
     if (!ReblurStaticallyAvailable(a_specular))
         return false;
 
+    // (batch 36b) Whichever layout EnsureNRDResources left standing. The merged instance serves
+    // both chains, so both ask the same question of it.
+    if (mergedReblurActive)
+        return texNRDPackInput && texNRDPackOutput && texNRDSpecInput && texNRDSpecOutput && nrdReblurMerged.IsValid();
     if (a_specular)
         return texNRDPackInput && texNRDPackOutput && nrdReblurSpecular.IsValid();
     return texNRDPackInput && texNRDPackOutput && nrdReblurDiffuse.IsValid();
@@ -1489,8 +1648,16 @@ void ScreenSpaceRayTracing::ResolveDenoisers()
     // before the readiness question is asked and long before the dispatch gate. The old
     // order asked "is the instance valid?" and only allocated inside the branch that had
     // already been taken on the answer.
+    //
+    // (batch 36b) A change of ReblurMode clears the "merged instance failed" latch, so picking
+    // Efficiency again is a retry; nothing else retries it.
+    if (settings.ReblurMode != lastReblurModeSetting) {
+        lastReblurModeSetting = settings.ReblurMode;
+        mergedReblurInitFailed = false;
+    }
+    const bool wantEfficiency = WantEfficiencyMode();
     if (ReblurSelected() && (ReblurStaticallyAvailable(false) || ReblurStaticallyAvailable(true)))
-        EnsureNRDResources();
+        EnsureNRDResources(wantEfficiency);
 
     // (S2.5) Bring the SVGF surfaces up only when this frame is actually going to need them:
     // the user selected SVGF, or REBLUR was selected and cannot run for one of the chains (the
@@ -1541,6 +1708,12 @@ void ScreenSpaceRayTracing::ResolveDenoisers()
 
     effectiveDenoiserDiffuse = resolve(false, svgfDiffuse);
     effectiveDenoiserSpecular = resolve(true, svgfSpecular);
+
+    // (batch 36b) Efficiency mode needs the merged layout standing and REBLUR resolved for both
+    // chains. If REBLUR fell back for either, the merged instance cannot run and nothing
+    // downstream keys off it; the fallback chain (SVGF) takes the frame as it always has.
+    efficiencyActive = wantEfficiency && mergedReblurActive &&
+                       effectiveDenoiserDiffuse == kDenoiserREBLUR && effectiveDenoiserSpecular == kDenoiserREBLUR;
 }
 
 // (S4.15) Extents, history validity and the lazily built REBLUR path are one state machine.
@@ -1563,6 +1736,7 @@ void ScreenSpaceRayTracing::ResetFrameState()
 
     resetReblurDiffuse = true;
     resetReblurSpecular = true;
+    resetReblurMerged = true;
 
     // The REBLUR surfaces and instances are sized at the output resolution and are allocated
     // lazily, so a rebuild at a *different* resolution left them at the old dimensions
@@ -1572,6 +1746,16 @@ void ScreenSpaceRayTracing::ResetFrameState()
     texNRDPackOutput = nullptr;
     nrdReblurDiffuse.Shutdown();
     nrdReblurSpecular.Shutdown();
+    // (batch 36b) The efficiency-mode layout, for the same reason.
+    nrdReblurMerged.Shutdown();
+    texNRDSpecInput = nullptr;
+    texNRDSpecOutput = nullptr;
+    texCheckerDebug = nullptr;
+    mergedReblurActive = false;
+    mergedReblurInitFailed = false;
+    efficiencyActive = false;
+    efficiencyThisFrame = false;
+    lastDiffuseReblurOk = true;
 
     // (S2.5) Same argument for the SVGF surfaces, which are lazily allocated for the same
     // reason. SetupResources reallocates everything else at the new extent; these would
@@ -1595,6 +1779,9 @@ void ScreenSpaceRayTracing::ClearShaderCache()
         &nrdUnpackCS,
         // (batch 36) the packed-input composite twins
         &diffuseCompositePackedCS, &diffuseCompositeExternalConfPackedCS,
+        // (batch 36b) efficiency mode and the batch 36b composite permutations
+        &raymarchDiffuseCheckerCS, &raymarchSpecularCheckerCS, &nrdUnpackSpecEfficiencyCS,
+        &diffuseCompositeB36BCS[0], &diffuseCompositeB36BCS[1], &diffuseCompositeB36BCS[2], &diffuseCompositeB36BCS[3],
 #ifdef ENABLE_SHARC
         &raymarchDiffuseSharcCS, &sharcUpdateRaymarchCS, &sharcResolveCS
 #endif
@@ -1645,6 +1832,13 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
 
     auto definesSpecular = defines;
     definesSpecular.push_back({ "SSRT_SPECULAR", nullptr });
+
+    // (batch 36b) The efficiency-mode checkerboard ray marches. Built on `defines` because they are
+    // the same shader as the full-resolution permutations and read every one of their axes.
+    auto definesDiffuseChecker = defines;
+    definesDiffuseChecker.push_back({ "SSRT_CHECKERBOARD", "1" });
+    auto definesSpecularChecker = definesSpecular;
+    definesSpecularChecker.push_back({ "SSRT_CHECKERBOARD", "1" });
 
     // (defect D6) The diffuse a-trous permutation runs the 5-tap B3 spline kernel; the
     // specular one keeps the 3-tap binomial. Deliberately *not* built on `defines`: this
@@ -1711,6 +1905,15 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             // DYNAMIC_CUBEMAPS / SSGI / SKYLIGHTING / DIFFUSE_SPP.
             { &diffuseCompositePackedCS, "ssrt_diffuse_composite.hlsl", { { "SSRT_DIFFUSE_PACKED_INPUT", "1" } } },
             { &diffuseCompositeExternalConfPackedCS, "ssrt_diffuse_composite.hlsl", { { "SSRT_CONF_EXTERNAL_FILTER", "1" }, { "SSRT_DIFFUSE_PACKED_INPUT", "1" } } },
+            // (batch 36b) The batch 36b twins of all four composites (CompositeFlags-driven jobs), and
+            // efficiency mode's checkerboard ray marches and specular unpack.
+            { &diffuseCompositeB36BCS[0], "ssrt_diffuse_composite.hlsl", { { "SSRT_COMPOSITE_B36B", "1" } } },
+            { &diffuseCompositeB36BCS[1], "ssrt_diffuse_composite.hlsl", { { "SSRT_COMPOSITE_B36B", "1" }, { "SSRT_DIFFUSE_PACKED_INPUT", "1" } } },
+            { &diffuseCompositeB36BCS[2], "ssrt_diffuse_composite.hlsl", { { "SSRT_COMPOSITE_B36B", "1" }, { "SSRT_CONF_EXTERNAL_FILTER", "1" } } },
+            { &diffuseCompositeB36BCS[3], "ssrt_diffuse_composite.hlsl", { { "SSRT_COMPOSITE_B36B", "1" }, { "SSRT_CONF_EXTERNAL_FILTER", "1" }, { "SSRT_DIFFUSE_PACKED_INPUT", "1" } } },
+            { &raymarchDiffuseCheckerCS, "ssrt_raymarch.hlsl", definesDiffuseChecker },
+            { &raymarchSpecularCheckerCS, "ssrt_raymarch.hlsl", definesSpecularChecker },
+            { &nrdUnpackSpecEfficiencyCS, "ssrt_nrd_unpack.hlsl", { { "SSRT_UNPACK_SPEC_EFFICIENCY", "1" } } },
 #ifdef ENABLE_SHARC
             { &raymarchDiffuseSharcCS, "ssrt_raymarch.hlsl", definesSharc },
             { &sharcUpdateRaymarchCS, "ssrt_raymarch.hlsl", definesSharcUpdate },
@@ -1848,6 +2051,7 @@ void ScreenSpaceRayTracing::UpdateHistoryValidity()
     if (reblurRising || diffuseRising || specularRising) {
         resetReblurDiffuse = true;
         resetReblurSpecular = true;
+        resetReblurMerged = true;
     }
 
     lastEffectiveDenoiserDiffuse = effectiveDenoiserDiffuse;
@@ -1868,6 +2072,7 @@ void ScreenSpaceRayTracing::UpdateHistoryValidity()
             // SVGF's; a load, fast travel or door transition invalidates both.
             resetReblurDiffuse = true;
             resetReblurSpecular = true;
+            resetReblurMerged = true;
         }
         // (audit P9) Same lookup, so the interior test rides along instead of repeating it:
         // both draw passes read this member and neither may pay for the cell walk again.
@@ -1897,6 +2102,8 @@ void ScreenSpaceRayTracing::Prepass()
     // where the state machine got to. This is also where the REBLUR path is brought up, so
     // no dispatch gate is ever the first thing to ask whether its resources exist.
     ResolveDenoisers();
+    // (batch 36b) Set by DrawSSRTDiffuse when it runs the efficiency path; read by DrawSSRTSpecular.
+    efficiencyThisFrame = false;
 
     // (guard G8) Before the enable gate below, so a transition is never missed just because
     // both passes happened to be off on the frame it occurred; the flag latches until a
@@ -2082,6 +2289,69 @@ void ScreenSpaceRayTracing::Prepass()
     context->PSSetShaderResources(99, 1, &view);
 }
 
+// (batch 36b) The specular ray march's constant buffer, moved out of DrawSSRTSpecular so that
+// efficiency mode, which traces specular from DrawSSRTDiffuse, builds exactly the same one.
+ScreenSpaceRayTracing::SSRTCB ScreenSpaceRayTracing::BuildSpecularCB(bool a_nrdFrontEndPack, bool a_checkerboard) const
+{
+    auto& dynamicCubemaps = globals::features::dynamicCubemaps;
+    const bool nrdFrontEndPack = a_nrdFrontEndPack;
+    SSRTCB ssrCBData;
+    {
+        ssrCBData.MaxSteps = settings.MaxSteps;
+        // (audit P3) Clamp against the allocated mip count: a config saved by an older
+        // build may hold a value above maxMips - 1, and loading a mip that does not
+        // exist returns 0 == near plane, i.e. an immediate false hit.
+        //
+        // Also clamped to hiZTopMipBuilt, the coarsest level Prepass actually downsampled.
+        // Prepass builds up to this same setting, so the two agree; the clamp only matters if
+        // the setting were raised between Prepass and here, where an unbuilt level would read
+        // the far-plane clear -- "nothing here" at every tile, i.e. a leak, not a crash.
+        ssrCBData.MaxMips = std::min({ settings.MaxMips, maxMips - 1u, hiZTopMipBuilt });
+        ssrCBData.Thickness = settings.Thickness;
+        ssrCBData.NormalBias = settings.NormalBias;
+        ssrCBData.BRDFBias = settings.BRDFBias;
+        ssrCBData.UseDynamicCubemapsAsFallback = (uint)settings.UseDynamicCubemapsAsFallbackSpecular && dynamicCubemaps.loaded;
+        ssrCBData.OcclusionStrength = settings.OcclusionStrength;
+        ssrCBData.CubemapNormalization = settings.CubemapNormalization;
+        // (diagnostic T2) Applies to both passes: the specular and diffuse permutations
+        // share SampleRandomVector2DBaked, so freezing the phase has to freeze both or the
+        // experiment is confounded by whichever one is still animating.
+        ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;
+        ssrCBData.UseBlueNoise = (settings.UseBlueNoise && noiseSRV) ? 1u : 0u;  // (S3.10)
+        // (reinjection noise) Diffuse-only mechanism, and the specular chain has no composite
+        // pass that reads it. Zeroed rather than left uninitialised so the buffer is fully
+        // written on both paths.
+        ssrCBData.TemporalAmbientConfidence = 0u;
+        ssrCBData.AmbientConfidenceInvMaxFrames = 1.0f;
+        // (batch 8) The specular permutation compiles the beta fill out entirely -- ambient
+        // reinjection is a diffuse-only energy model -- so this is 0 for the same reason the two
+        // fields above are: the buffer is shared and every field has to be written, but nothing
+        // in this dispatch reads it.
+        ssrCBData.CubemapFillBlend = 0.0f;
+        // (batch 11, item A) REBLUR's front-end packing, folded in from the retired pack pass.
+        // The three constants must be the same values RunReblur hands
+        // nrd::ReblurSettings::hitDistanceParameters -- see the derivation at
+        // Settings::ReblurHitDistA -- and they are written unconditionally so the buffer is fully
+        // defined on both paths; the flag is what decides whether the shader reads them.
+        ssrCBData.NRDHitDistA = settings.ReblurHitDistA;
+        ssrCBData.NRDHitDistB = settings.ReblurHitDistB;
+        ssrCBData.NRDHitDistC = settings.ReblurHitDistC;
+        ssrCBData.NRDFrontEndPack = nrdFrontEndPack ? 1u : 0u;
+        ssrCBData.SpecularMaxRoughness = settings.SpecularMaxRoughness;
+        // (batch 36b) Efficiency mode: checkerboard lanes, NRD's own frame index for the phase,
+        // and the hit colour from last frame's image (reprojected per hit).
+        ssrCBData.CheckerboardTrace = a_checkerboard ? 1u : 0u;
+        ssrCBData.NRDFrameIndex = a_checkerboard ? globals::features::nrd.GetCommonSettings().frameIndex : 0u;
+        uint flags = 0;
+        if (a_checkerboard)
+            flags |= kRaymarchPrevFrameColor;
+        if (a_checkerboard && settings.CheckerboardDebugView)
+            flags |= kRaymarchCheckerDebug;
+        ssrCBData.RaymarchFlags = flags;
+    }
+    return ssrCBData;
+}
+
 void ScreenSpaceRayTracing::DrawSSRTSpecular()
 {
     if (!settings.EnableSpecular)
@@ -2126,6 +2396,30 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     float2 size = Util::ConvertToDynamic(state->screenSize);
     float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
 
+    // (batch 36b) Efficiency mode already traced and denoised specular inside DrawSSRTDiffuse,
+    // from last frame's image. What is left here is to capture this frame's image for the next
+    // frame's trace: the same prepare-colour pass quality mode runs, at the same point in the
+    // frame (after the diffuse composite and SSS), so the two modes reflect the same content and
+    // differ only in being one frame apart.
+    if (efficiencyThisFrame) {
+        std::array<ID3D11ShaderResourceView*, 3> prepSrvs = { main.SRV, specular.SRV, normal.SRV };
+        std::array<ID3D11UnorderedAccessView*, 1> prepUavs = { texColor->uav.get() };
+        context->CSSetShaderResources(0, (uint)prepSrvs.size(), prepSrvs.data());
+        context->CSSetUnorderedAccessViews(0, (uint)prepUavs.size(), prepUavs.data(), nullptr);
+        context->CSSetShader(prepareColorCS.get(), nullptr, 0);
+        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        prepSrvs.fill(nullptr);
+        prepUavs.fill(nullptr);
+        context->CSSetShaderResources(0, (uint)prepSrvs.size(), prepSrvs.data());
+        context->CSSetUnorderedAccessViews(0, (uint)prepUavs.size(), prepUavs.data(), nullptr);
+        context->CSSetShader(nullptr, nullptr, 0);
+
+        Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceSpecular);
+        CopyHistoryGeometry();
+        state->EndPerfEvent();
+        return;
+    }
+
     // (batch 11, item A) This frame's denoiser, resolved *before* the ray march instead of after
     // it. It has to move up because the ray march now decides its own output layout on the
     // answer, and it can move up safely because nothing in the answer depends on the ray march:
@@ -2147,50 +2441,8 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // denoiser == kDenoiserREBLUR implies ReblurReady, which implies texNRDPackInput exists.
     const bool nrdFrontEndPack = (denoiser == kDenoiserREBLUR);
 
-    SSRTCB ssrCBData;
-    {
-        ssrCBData.MaxSteps = settings.MaxSteps;
-        // (audit P3) Clamp against the allocated mip count: a config saved by an older
-        // build may hold a value above maxMips - 1, and loading a mip that does not
-        // exist returns 0 == near plane, i.e. an immediate false hit.
-        //
-        // Also clamped to hiZTopMipBuilt, the coarsest level Prepass actually downsampled.
-        // Prepass builds up to this same setting, so the two agree; the clamp only matters if
-        // the setting were raised between Prepass and here, where an unbuilt level would read
-        // the far-plane clear -- "nothing here" at every tile, i.e. a leak, not a crash.
-        ssrCBData.MaxMips = std::min({ settings.MaxMips, maxMips - 1u, hiZTopMipBuilt });
-        ssrCBData.Thickness = settings.Thickness;
-        ssrCBData.NormalBias = settings.NormalBias;
-        ssrCBData.BRDFBias = settings.BRDFBias;
-        ssrCBData.UseDynamicCubemapsAsFallback = (uint)settings.UseDynamicCubemapsAsFallbackSpecular && dynamicCubemaps.loaded;
-        ssrCBData.OcclusionStrength = settings.OcclusionStrength;
-        ssrCBData.CubemapNormalization = settings.CubemapNormalization;
-        // (diagnostic T2) Applies to both passes: the specular and diffuse permutations
-        // share SampleRandomVector2DBaked, so freezing the phase has to freeze both or the
-        // experiment is confounded by whichever one is still animating.
-        ssrCBData.FreezeNoisePhase = settings.FreezeNoisePhase ? 1u : 0u;
-        ssrCBData.UseBlueNoise = (settings.UseBlueNoise && noiseSRV) ? 1u : 0u;  // (S3.10)
-        // (reinjection noise) Diffuse-only mechanism, and the specular chain has no composite
-        // pass that reads it. Zeroed rather than left uninitialised so the buffer is fully
-        // written on both paths.
-        ssrCBData.TemporalAmbientConfidence = 0u;
-        ssrCBData.AmbientConfidenceInvMaxFrames = 1.0f;
-        // (batch 8) The specular permutation compiles the beta fill out entirely -- ambient
-        // reinjection is a diffuse-only energy model -- so this is 0 for the same reason the two
-        // fields above are: the buffer is shared and every field has to be written, but nothing
-        // in this dispatch reads it.
-        ssrCBData.CubemapFillBlend = 0.0f;
-        // (batch 11, item A) REBLUR's front-end packing, folded in from the retired pack pass.
-        // The three constants must be the same values RunReblur hands
-        // nrd::ReblurSettings::hitDistanceParameters -- see the derivation at
-        // Settings::ReblurHitDistA -- and they are written unconditionally so the buffer is fully
-        // defined on both paths; the flag is what decides whether the shader reads them.
-        ssrCBData.NRDHitDistA = settings.ReblurHitDistA;
-        ssrCBData.NRDHitDistB = settings.ReblurHitDistB;
-        ssrCBData.NRDHitDistC = settings.ReblurHitDistC;
-        ssrCBData.NRDFrontEndPack = nrdFrontEndPack ? 1u : 0u;
-        ssrCBData.SpecularMaxRoughness = settings.SpecularMaxRoughness;
-    }
+    // (batch 36b) The constant buffer moved into BuildSpecularCB, shared with efficiency mode.
+    const SSRTCB ssrCBData = BuildSpecularCB(nrdFrontEndPack, false);
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
     context->CSSetConstantBuffers(1, 1, &buffer);
@@ -2690,6 +2942,112 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
     return dispatched;
 }
 
+// (batch 36b) Efficiency mode's denoiser: one REBLUR_DIFFUSE_SPECULAR instance in NRD checkerboard
+// mode. Both inputs arrive compact (the left half of their full-size textures, NRD's layout for a
+// checkerboard signal), diffuse on the BLACK cells and specular on the WHITE ones of this frame's
+// NRDFrameIndex; REBLUR reconstructs the other half of each itself (pre-pass checkerboard resolve,
+// gCheckerboardResolveAccumSpeed in the temporal pass) and writes both outputs at full resolution.
+//
+// Then the specular unpack, which also rebuilds the DLSS-RR hit-distance guide for every pixel. The
+// diffuse output stays packed: the batch 36b composite reads it directly (and publishes the
+// confidence from it), so there is no diffuse unpack in this mode at all.
+bool ScreenSpaceRayTracing::RunReblurMerged()
+{
+    auto context = globals::d3d::context;
+    auto state = globals::state;
+    auto& nrdSvc = globals::features::nrd;
+
+    const float2 size = Util::ConvertToDynamic(state->screenSize);
+    const float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
+
+    state->BeginPerfEvent("SSRT REBLUR Diffuse+Specular");
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTReblur);
+
+    bool dispatched = false;
+    {
+        auto commonSettings = nrdSvc.GetCommonSettings();
+        commonSettings.splitScreen = settings.ReblurMerged.SplitScreen;
+        commonSettings.enableValidation = settings.ReblurMerged.EnableValidation;
+        // The hit-coverage confidence feed (S1.1) is a full-resolution, every-pixel surface; it has
+        // no checkerboard form, and it is off by default anyway.
+        commonSettings.isHistoryConfidenceAvailable = false;
+        if (resetReblurMerged)
+            commonSettings.accumulationMode = nrd::AccumulationMode::CLEAR_AND_RESTART;
+        nrdReblurMerged.SetCommonSettings(commonSettings);
+
+        // BLACK: diffuse has data where (x ^ y ^ frameIndex) & 1 == 0, specular where it is 1. The
+        // ray march derives its lanes from the same rule and the same frameIndex (ssrt_raymarch.hlsl,
+        // SSRT_CHECKERBOARD).
+        nrdSvc.ApplyReblurSettings(reblurMergedSettings, settings.ReblurMerged, nrd::CheckerboardMode::BLACK);
+        reblurMergedSettings.hitDistanceParameters.A = settings.ReblurHitDistA;
+        reblurMergedSettings.hitDistanceParameters.B = settings.ReblurHitDistB;
+        reblurMergedSettings.hitDistanceParameters.C = settings.ReblurHitDistC;
+        reblurMergedSettings.specularPrepassBlurRadius = std::max(settings.SpecularPrepassBlurRadius, 0.0f);
+        reblurMergedSettings.usePrepassOnlyForSpecularMotionEstimation = settings.UsePrepassOnlyForSpecularMotionEstimation;
+        nrdReblurMerged.SetDenoiserSettings(&reblurMergedSettings);
+
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::IN_MV, nrdSvc.GetMotionVectorSRV());
+        nrdReblurMerged.SetNamedUAV(nrd::ResourceType::IN_MV, nrdSvc.GetMotionVectorUAV());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::IN_NORMAL_ROUGHNESS, nrdSvc.GetNormalRoughnessSRV());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::IN_VIEWZ, nrdSvc.GetViewZSRV());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, texNRDPackInput->srv.get());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, texNRDSpecInput->srv.get());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, texNRDPackOutput->srv.get());
+        nrdReblurMerged.SetNamedUAV(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, texNRDPackOutput->uav.get());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, texNRDSpecOutput->srv.get());
+        nrdReblurMerged.SetNamedUAV(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, texNRDSpecOutput->uav.get());
+
+        dispatched = nrdReblurMerged.Dispatch();
+        // (S1.2) The reset is only consumed by a dispatch that actually ran.
+        if (dispatched)
+            resetReblurMerged = false;
+    }
+
+    if (!dispatched)
+        logger::warn("SSRT: REBLUR diffuse+specular dispatch did not complete; publishing this frame's undenoised checkerboard samples");
+
+    // ---- specular unpack + DLSS-RR hit distance ----
+    {
+        SSRTCB unpackCB{};
+        unpackCB.NRDHitDistA = settings.ReblurHitDistA;
+        unpackCB.NRDHitDistB = settings.ReblurHitDistB;
+        unpackCB.NRDHitDistC = settings.ReblurHitDistC;
+        unpackCB.CompositeFlags = dispatched ? 0u : kCompositeCheckerInput;
+        ssrtCB->Update(unpackCB);
+        auto unpackBuffer = ssrtCB->CB();
+        context->CSSetConstantBuffers(1, 1, &unpackBuffer);
+
+        auto renderer = globals::game::renderer;
+        auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+        auto normal = renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
+
+        std::array<ID3D11ShaderResourceView*, 3> srvs = {
+            (dispatched ? texNRDSpecOutput : texNRDSpecInput)->srv.get(), depth.depthSRV, normal.SRV
+        };
+        std::array<ID3D11UnorderedAccessView*, 2> uavs = { texSSRColor->uav.get(), texHitDistance->uav.get() };
+        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+        context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
+        context->CSSetShader(nrdUnpackSpecEfficiencyCS.get(), nullptr, 0);
+        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        srvs.fill(nullptr);
+        uavs.fill(nullptr);
+        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+        context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
+    }
+
+    // Same restore RunReblur performs. b1 is left holding the unpack's buffer; the caller
+    // rebuilds its own before the next dispatch that reads it.
+    {
+        std::array<ID3D11SamplerState*, 1> samplers = { linearSampler.get() };
+        context->CSSetSamplers(0, 1, samplers.data());
+    }
+
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTReblur);
+    state->EndPerfEvent();
+
+    return dispatched;
+}
+
 // (batch 36) The S1.4 whole-chain guard of DrawSSRTDiffuse, lifted out verbatim so that
 // GetCommonBufferData can ask the same question when it decides whether SSRT diffuse is really
 // going to replace Screen Space GI's indirect light this frame.
@@ -2757,23 +3115,6 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     float2 size = Util::ConvertToDynamic(state->screenSize);
     float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
 
-
-    // (reinjection noise) Whether the confidence accumulator runs this frame. Decided once, in
-    // the constant-buffer block below, and read again by the composite dispatch so the CPU-side
-    // bindings and the shader-side branch cannot disagree.
-    bool confidenceTemporal = false;
-
-    // (batch 6) Whether the three-pass spatial confidence filter runs this frame. Decided once,
-    // here, because three separate sites depend on the same answer -- the accumulator gate below,
-    // the chain's own dispatches, and which permutation of the composite is bound -- and any
-    // disagreement between them would leave texSSRTDiffuseConfidenceSmooth written twice or not at
-    // all. The allocation is attempted as part of the predicate, before any dispatch binds it, so a
-    // failure simply selects the full-resolution 7x7 path, which is the toggle's off behaviour.
-    const bool confidenceFilter =
-        settings.EnableAmbientReinjection && settings.LowResConfidenceFilter &&
-        confDownsampleCS && confBlurHorizontalCS && confBlurVerticalCS && confUpsampleCS &&
-        diffuseCompositeExternalConfCS && EnsureConfidenceFilterResources();
-
     // (batch 11, item A) This frame's denoiser, resolved before the ray march rather than after
     // it: the ray march now chooses its own output layout on the answer. See the matching site
     // and derivation in DrawSSRTSpecular.
@@ -2786,6 +3127,36 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         historyClearPending = true;
     }
     const bool nrdFrontEndPack = (denoiser == kDenoiserREBLUR);
+
+    // (batch 36b) Efficiency mode, decided once for the frame. ResolveDenoisers already made sure the
+    // merged instance stands and both chains resolved to REBLUR; this adds this frame's guides (the
+    // same per-frame test both chains make). DrawSSRTSpecular reads efficiencyThisFrame, so a frame
+    // that drops out here traces specular the quality way, through its usual fallbacks.
+    const bool efficiency = efficiencyActive && nrdFrontEndPack && ReblurReady(true) && texNRDSpecInput && texColor;
+    efficiencyThisFrame = efficiency;
+    // Checkerboard dispatch: one lane per horizontal pair, every row.
+    const uint checkerDispatchX = (((uint)size.x + 1u) / 2u + 7u) / 8u;
+    const uint checkerDispatchY = ((uint)size.y + 7u) / 8u;
+
+    // (reinjection noise) Whether the confidence accumulator runs this frame. Decided once, in
+    // the constant-buffer block below, and read again by the composite dispatch so the CPU-side
+    // bindings and the shader-side branch cannot disagree.
+    bool confidenceTemporal = false;
+
+    // (batch 6) Whether the three-pass spatial confidence filter runs this frame. Decided once,
+    // here, because three separate sites depend on the same answer -- the accumulator gate below,
+    // the chain's own dispatches, and which permutation of the composite is bound -- and any
+    // disagreement between them would leave texSSRTDiffuseConfidenceSmooth written twice or not at
+    // all. The allocation is attempted as part of the predicate, before any dispatch binds it, so a
+    // failure simply selects the full-resolution 7x7 path, which is the toggle's off behaviour.
+    //
+    // (batch 36b) Retired in efficiency mode (deviation 3): the merged denoiser supplies the
+    // confidence, so neither this filter nor the accumulator below runs.
+    const bool confidenceFilter =
+        !efficiency &&
+        settings.EnableAmbientReinjection && settings.LowResConfidenceFilter &&
+        confDownsampleCS && confBlurHorizontalCS && confBlurVerticalCS && confUpsampleCS &&
+        diffuseCompositeExternalConfCS && EnsureConfidenceFilterResources();
 
     SSRTCB ssrCBData;
     {
@@ -2838,7 +3209,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // a hard requirement rather than a preference: with the filter on, the composite runs the
         // permutation that has the whole confidence block compiled out, so there is no spatial
         // mean there for an accumulator to blend with.
-        confidenceTemporal = settings.EnableAmbientReinjection && settings.TemporalAmbientConfidence &&
+        confidenceTemporal = !efficiency && settings.EnableAmbientReinjection && settings.TemporalAmbientConfidence &&
                              !confidenceFilter && EnsureAmbientConfidenceResources();
         ssrCBData.TemporalAmbientConfidence = confidenceTemporal ? 1u : 0u;
         ssrCBData.AmbientConfidenceInvMaxFrames = 1.0f / (settings.AmbientConfidenceMaxFrames + 1.0f);
@@ -2849,10 +3220,25 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ssrCBData.NRDHitDistC = settings.ReblurHitDistC;
         ssrCBData.NRDFrontEndPack = nrdFrontEndPack ? 1u : 0u;
         ssrCBData.SpecularMaxRoughness = settings.SpecularMaxRoughness;
+        // (batch 36b) Efficiency mode: checkerboard lanes on NRD's frame index, and the REBLUR-convention
+        // visibility in the hit-distance channel, which is where the confidence now comes from
+        // (deviation 3) -- with the radiance weighted to match whenever reinjection consumes it.
+        ssrCBData.CheckerboardTrace = efficiency ? 1u : 0u;
+        ssrCBData.NRDFrameIndex = efficiency ? globals::features::nrd.GetCommonSettings().frameIndex : 0u;
+        ssrCBData.HitDistIsVisibility = efficiency ? 1u : 0u;
+        ssrCBData.ProximityCoverage = (efficiency && settings.EnableAmbientReinjection) ? 1u : 0u;
+        ssrCBData.RaymarchFlags = (efficiency && settings.CheckerboardDebugView) ? kRaymarchCheckerDebug : 0u;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
     context->CSSetConstantBuffers(1, 1, &buffer);
+
+    // (batch 36b) The checkerboard debug surface: cleared, then marked by both traces.
+    const bool checkerDebug = efficiency && settings.CheckerboardDebugView && EnsureCheckerDebugTexture();
+    if (checkerDebug) {
+        const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        context->ClearUnorderedAccessViewFloat(texCheckerDebug->uav.get(), black);
+    }
 
     // (audit P6) Raymarch UAV slots: u0 radiance/confidence, u1..u4 SHARC (bound only
 	// while SHARC is enabled, and only declared by the SHARC shader permutations),
@@ -2860,10 +3246,10 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 	// (batch 1, item 2). Keep this in lockstep with the register map at the top of
 	// ssrt_raymarch.hlsl and sharc_resolve.hlsl. The SVGF temporal pass below reuses slots
 	// u0/u1 for its own two outputs, and the diffuse composite reuses u0/u1 for kMAIN and the
-	// smoothed confidence, so the array is never smaller than 2. Seven entries against the
-	// eight UAVs a cs_5_0 dispatch may bind.
+	// smoothed confidence, so the array is never smaller than 2. (batch 36b) Eight entries: u7 is
+	// the checkerboard debug surface, the last of the eight UAVs a cs_5_0 dispatch may bind.
     std::array<ID3D11ShaderResourceView*, 13> srvs = { nullptr };
-	std::array<ID3D11UnorderedAccessView*, 7> uavs = { nullptr };
+	std::array<ID3D11UnorderedAccessView*, 8> uavs = { nullptr };
 
     auto resetViews = [&]() {
 		srvs.fill(nullptr);
@@ -2901,6 +3287,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // pass reading a stale or cleared surface. HitRadiusStrength 0 is what makes the mechanism
     // inert, on the consumer side.
     uavs.at(6) = texSSRTDiffuseHitDistance->uav.get();
+    if (checkerDebug)
+        uavs.at(7) = texCheckerDebug->uav.get();
 #ifdef ENABLE_SHARC
     if (settings.EnableSharc) {
         EnsureSharcResources();  // (audit P6) allocate on first enable, before any dispatch binds them
@@ -2944,14 +3332,62 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         state->EndPerfEvent();
     }
 
-    context->CSSetShader(settings.EnableSharc ? raymarchDiffuseSharcCS.get() : raymarchDiffuseCS.get(), nullptr, 0);
+    context->CSSetShader(settings.EnableSharc ? raymarchDiffuseSharcCS.get() : (efficiency ? raymarchDiffuseCheckerCS.get() : raymarchDiffuseCS.get()), nullptr, 0);
 #else
-    context->CSSetShader(raymarchDiffuseCS.get(), nullptr, 0);
+    context->CSSetShader(efficiency ? raymarchDiffuseCheckerCS.get() : raymarchDiffuseCS.get(), nullptr, 0);
 #endif
-    context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+    if (efficiency)
+        context->Dispatch(checkerDispatchX, checkerDispatchY, 1);
+    else
+        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
     resetViews();
 
     Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceDiffuse);
+
+    // (batch 36b) EFFICIENCY MODE'S SPECULAR TRACE. Here rather than in DrawSSRTSpecular because the
+    // merged REBLUR dispatch below denoises both signals at once, so both inputs have to exist
+    // first. The consequence is that this frame's image does not exist yet either: the trace
+    // reads texColor, which still holds last frame's prepared image (DrawSSRTSpecular refreshes it
+    // at the end of the frame), at each hit's motion-reprojected position -- reflections are one
+    // frame late, which the spec accepts. Same shader, bindings and constants as quality mode
+    // apart from the checkerboard lanes, and still in the "SSRT Trace Specular" timing row.
+    if (efficiency) {
+        state->BeginPerfEvent("SSRT Specular Trace (checkerboard)");
+        Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTraceSpecular);
+
+        const SSRTCB specCBData = BuildSpecularCB(true, true);
+        ssrtCB->Update(specCBData);
+        auto specBuffer = ssrtCB->CB();
+        context->CSSetConstantBuffers(1, 1, &specBuffer);
+
+        uavs.at(0) = texNRDSpecInput->uav.get();
+        if (checkerDebug)
+            uavs.at(7) = texCheckerDebug->uav.get();
+        srvs.at(1) = motion.SRV;
+        srvs.at(2) = normal.SRV;
+        srvs.at(3) = texColor->srv.get();
+        srvs.at(4) = depth.depthSRV;
+        srvs.at(5) = texDepth->srv.get();
+        srvs.at(6) = noiseSRV.get();
+        srvs.at(7) = envTexture;
+        srvs.at(8) = inInterior ? envTexture : envReflectionsTexture;
+        srvs.at(9) = ssgi_ao;
+        srvs.at(10) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.texProbeArray->srv.get() : nullptr;
+        srvs.at(11) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.stbn_vec3_2Dx1D_128x128x64.get() : nullptr;
+        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+        context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
+        context->CSSetShader(raymarchSpecularCheckerCS.get(), nullptr, 0);
+        context->Dispatch(checkerDispatchX, checkerDispatchY, 1);
+        resetViews();
+
+        // The diffuse constants back for every pass below that reads b1.
+        ssrtCB->Update(ssrCBData);
+        buffer = ssrtCB->CB();
+        context->CSSetConstantBuffers(1, 1, &buffer);
+
+        Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceSpecular);
+        state->EndPerfEvent();
+    }
 
 #ifdef ENABLE_SHARC
     if (settings.EnableSharc) {
@@ -2972,9 +3408,24 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // defaults are batch 34's -- texSSRTDiffuseColor, linear -- and only the folded-unpack REBLUR
     // path below replaces them (with the packed surface and the packed-input twin).
     ID3D11ShaderResourceView* compositeSource = texSSRTDiffuseColor->srv.get();
-    ID3D11ComputeShader* compositePackedShader = nullptr;
+    bool compositePacked = false;
+    // (batch 36b) SSRTCB::CompositeFlags for this frame. Non-zero selects the SSRT_COMPOSITE_B36B
+    // twin of whichever composite would otherwise run; zero keeps the 36a permutation as it was.
+    uint compositeFlags = 0;
 
-    if (denoiser == kDenoiserSVGF) {
+    if (efficiency) {
+        // (batch 36b) One dispatch denoises both signals; the specular result is unpacked inside
+        // RunReblurMerged, the diffuse one is read packed by the composite, which also publishes
+        // the reinjection confidence from it (deviation 3). On a failed dispatch both fall back to
+        // this frame's raw checkerboard samples, each pixel taking its pair's traced one.
+        const bool dispatched = RunReblurMerged();
+        lastDiffuseReblurOk = dispatched;
+        compositePacked = true;
+        compositeSource = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
+        compositeFlags |= kCompositeConfFromDenoiser;
+        if (!dispatched)
+            compositeFlags |= kCompositeCheckerInput;
+    } else if (denoiser == kDenoiserSVGF) {
         Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTSvgf);
         DenoiserCB denoiserCBData = GetDenoiserCBData(true);
 
@@ -3201,8 +3652,9 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ID3D11ComputeShader* packedTwin = confidenceFilter ? diffuseCompositeExternalConfPackedCS.get() : diffuseCompositePackedCS.get();
         const bool foldUnpack = settings.ReblurFoldDiffuseUnpack && Batch36::IsOn() && packedTwin != nullptr;
         const bool dispatched = RunReblur(false, foldUnpack);
+        lastDiffuseReblurOk = dispatched;
         if (foldUnpack) {
-            compositePackedShader = packedTwin;
+            compositePacked = true;
             // Same S1.2 choice the unpack pass makes: the denoised output only if the
             // dispatch that writes it actually completed, this frame's raw input otherwise.
             compositeSource = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
@@ -3325,14 +3777,29 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // b1 is set at the top of this function and only b2 is written after it, so this rebind
         // is belt and braces rather than a fix -- but the accumulator now reads b1 from a pass
         // that never used to, and a future pass inserted between the two would break silently.
+        //
+        // (batch 36b) Re-uploaded rather than only rebound: efficiency mode's specular trace and unpack
+        // wrote their own constants into the same buffer, and CompositeFlags is settled only now.
+        ssrCBData.CompositeFlags = compositeFlags;
+        ssrtCB->Update(ssrCBData);
+        buffer = ssrtCB->CB();
         context->CSSetConstantBuffers(1, 1, &buffer);
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, uavCount, uavs.data(), nullptr);
-        // (batch 36) compositePackedShader is already the right one of the two packed twins for
-        // this frame's confidenceFilter, chosen where the fold was decided.
-        context->CSSetShader(compositePackedShader ? compositePackedShader :
-                                                     (confidenceFilter ? diffuseCompositeExternalConfCS.get() : diffuseCompositeCS.get()),
-            nullptr, 0);
+        // (batch 36) Which of the four composites: confidence filter external or not, radiance
+        // packed (folded unpack) or not. (batch 36b) Any CompositeFlags bit selects the B36B twin of
+        // the same pair; conf-from-denoiser implies the external one, since the filter is retired.
+        const bool externalConf = confidenceFilter || (compositeFlags & kCompositeConfFromDenoiser) != 0;
+        ID3D11ComputeShader* compositeShader = nullptr;
+        if (compositeFlags != 0)
+            compositeShader = diffuseCompositeB36BCS[(externalConf ? 2 : 0) + (compositePacked ? 1 : 0)].get();
+        if (!compositeShader) {
+            if (compositePacked)
+                compositeShader = confidenceFilter ? diffuseCompositeExternalConfPackedCS.get() : diffuseCompositePackedCS.get();
+            else
+                compositeShader = confidenceFilter ? diffuseCompositeExternalConfCS.get() : diffuseCompositeCS.get();
+        }
+        context->CSSetShader(compositeShader, nullptr, 0);
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
 

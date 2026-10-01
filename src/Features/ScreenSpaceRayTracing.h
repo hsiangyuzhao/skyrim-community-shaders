@@ -59,6 +59,27 @@ struct ScreenSpaceRayTracing : Feature
         kDenoiserREBLUR = 2,
     };
 
+    /// @brief (batch 36b) Values of Settings::ReblurMode.
+    enum ReblurModeValue : uint
+    {
+        /// @brief Batch 34's two REBLUR instances, every pixel traced for both signals every frame.
+        kReblurQuality = 0,
+        /// @brief One REBLUR_DIFFUSE_SPECULAR instance; each pixel traces diffuse or specular,
+        /// alternating every frame (NRD checkerboard), and specular is traced before the denoiser.
+        kReblurEfficiency = 1,
+    };
+
+    /// @brief (batch 36b) RaymarchFlags / CompositeFlags bits, mirrored by ssrt_cb.hlsli.
+    static constexpr uint kRaymarchPrevFrameColor = 1u;
+    static constexpr uint kRaymarchSpecMissComposite = 2u;
+    static constexpr uint kRaymarchCheckerDebug = 4u;
+    static constexpr uint kRaymarchMissBent = 8u;
+    static constexpr uint kCompositeConfFromDenoiser = 1u;
+    static constexpr uint kCompositeWriteAo = 2u;
+    static constexpr uint kCompositeAoContact = 4u;
+    static constexpr uint kCompositeTracedSkipsAo = 8u;
+    static constexpr uint kCompositeCheckerInput = 16u;
+
     struct Settings
     {
         bool EnableSpecular = true;
@@ -417,6 +438,20 @@ struct ScreenSpaceRayTracing : Feature
         /// two steps (it is now *more* precise, by at most one fp16 ulp). Off = batch 34
         /// (separate unpack pass).
         bool ReblurFoldDiffuseUnpack = true;
+        /// @brief (batch 36b) Which REBLUR layout runs; one of ReblurModeValue. Hot: switching swaps the
+        /// instances (the one entered starts with CLEAR_AND_RESTART, the one left is released).
+        ///
+        /// Efficiency: diffuse and specular are traced on opposite halves of an NRD checkerboard
+        /// that flips every frame and denoised by one REBLUR_DIFFUSE_SPECULAR instance, which
+        /// reconstructs the missing half itself. Specular is traced inside DrawSSRTDiffuse, before
+        /// that dispatch, so it reads last frame's image (texColor, reprojected per hit). The
+        /// reinjection confidence comes out of the same denoiser (deviation 3), so the confidence
+        /// filters do not run. Needs REBLUR for both signals, both signals on, and SHARC off;
+        /// otherwise Quality runs.
+        ///
+        /// Quality: batch 34's two independent instances at full density (plus 36a's folded unpack
+        /// and direct motion vectors). Also what the Batch 36 master switch forces.
+        uint ReblurMode = kReblurEfficiency;
         /// @brief (batch C1) REBLUR tuning for the diffuse instance. NRD defaults.
         NRD::REBLURSettings ReblurDiffuse;
         /// @brief (batch C1) REBLUR tuning for the specular instance. Defaults taken
@@ -427,6 +462,27 @@ struct ScreenSpaceRayTracing : Feature
             .MaxFastAccumulatedFrameNum = 1,
             .MaxStabilizedFrameNum = 0,
             .FastHistoryClampingSigmaScale = 1.5f,
+        };
+        /// @brief (batch 36b) Tuning of the efficiency-mode REBLUR_DIFFUSE_SPECULAR instance. One set for
+        /// both signals, which is all NRD offers for a merged instance. Why each value:
+        ///  * MaxAccumulated 30 -- the diffuse value. Each pixel now gets a new diffuse sample every
+        ///    other frame, so diffuse needs the long window more than before, not less. Specular
+        ///    does not inherit it on glossy surfaces: REBLUR caps the specular window itself at
+        ///    MaxAccumulated * f(roughness) (specMagicCurve, REBLUR_TemporalAccumulation), so only the
+        ///    rough reflections -- the noisiest ones -- accumulate longer than quality mode's 20.
+        ///  * MaxFast 3 -- between diffuse's 6 and specular's 1. The fast history is the anti-lag
+        ///    clamp; 1 would be a single checkerboard frame (half the pixels), 6 would let reflections
+        ///    trail by six frames. 3 keeps reflection ghosting to ~3 frames.
+        ///  * MaxStabilized 15 -- strength 15/16 against diffuse's 63/64 and specular's 0. Some
+        ///    stabilization is needed against checkerboard shimmer; REBLUR already scales it down on
+        ///    glossy specular (acceleration >= 0.5 in TemporalStabilization), and 15 keeps the lag on
+        ///    reflections short.
+        ///  * FastHistoryClampingSigmaScale 1.75 -- midway between diffuse 2.0 and specular 1.5.
+        NRD::REBLURSettings ReblurMerged = {
+            .MaxAccumulatedFrameNum = 30,
+            .MaxFastAccumulatedFrameNum = 3,
+            .MaxStabilizedFrameNum = 15,
+            .FastHistoryClampingSigmaScale = 1.75f,
         };
         /// @brief (batch C1) REBLUR hit-distance normalization constants, the (A, B, C)
         /// of hitDist / ((A + B * |viewZ|) * lerp(C, 1, specMagicCurve(roughness))).
@@ -855,6 +911,9 @@ struct ScreenSpaceRayTracing : Feature
         /// alpha = 1 and the denoiser a passthrough. Speckles of colour along silhouettes and
         /// moving edges are normal and correct.
         bool HistoryDebugView = false;
+        /// @brief (batch 36b) Mark, in texCheckerDebug (Buffer Viewer), which pixels traced diffuse
+        /// (red) and which traced specular (green) this frame. Efficiency mode only.
+        bool CheckerboardDebugView = false;
 #ifdef ENABLE_SHARC
         bool EnableSharc = false;
 #endif
@@ -984,12 +1043,34 @@ struct ScreenSpaceRayTracing : Feature
         /// the pixel keeps whatever the cubemap fallback gives it. Claims one of row 4's three
         /// spare floats, so the struct does not grow and the size assertion below still holds.
         float SpecularMaxRoughness = 1.0f;
-        float ssrtPad4[2] = {};
+        /// @brief (batch 36b) Non-zero on the checkerboard ray-march dispatches of efficiency mode.
+        uint CheckerboardTrace = 0;
+        /// @brief (batch 36b) NRD's CommonSettings::frameIndex for this frame -- the value REBLUR
+        /// itself receives as gFrameIndex -- from which the ray march derives the checkerboard phase.
+        /// Never SharedData::FrameCount, which is frameCount * GetTemporal() and therefore 0 with
+        /// temporal effects off, while NRD keeps counting.
+        uint NRDFrameIndex = 0;
+        // --- row 5 ---
+        /// @brief (batch 36b) Non-zero: t9 holds last frame's denoiser AO and is read at the
+        /// motion-reprojected position.
+        uint AoFetchReprojected = 0;
+        /// @brief (batch 36b) Non-zero: the diffuse hit-distance channel carries REBLUR's AO-style
+        /// visibility instead of the batch 11 texel-space encoding.
+        uint HitDistIsVisibility = 0;
+        /// @brief (batch 36b) Non-zero: under ambient reinjection, weight the traced radiance by the
+        /// same distance-attenuated coverage the visibility carries (efficiency mode, deviation 3).
+        uint ProximityCoverage = 0;
+        /// @brief (batch 36b) SSRT_RAYMARCH_FLAG_* bits (ssrt_cb.hlsli).
+        uint RaymarchFlags = 0;
+        // --- row 6 ---
+        /// @brief (batch 36b) SSRT_COMPOSITE_FLAG_* bits (ssrt_cb.hlsli).
+        uint CompositeFlags = 0;
+        float ssrtPad6[3] = {};
     };
-    static_assert(sizeof(SSRTCB) == 80,
+    static_assert(sizeof(SSRTCB) == 112,
         "ScreenSpaceRayTracing::SSRTCB must stay whole 16-byte constant buffer rows; "
-        "ssrt_raymarch.hlsl mirrors these offsets up to NRDFrontEndPack and must move with "
-        "them; ssrt_diffuse_composite.hlsl mirrors the first three rows.");
+        "ssrt_cb.hlsli mirrors all seven rows and must move with them; the original permutations "
+        "of ssrt_diffuse_composite.hlsl mirror the first three.");
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
@@ -1293,7 +1374,7 @@ struct ScreenSpaceRayTracing : Feature
     /// @brief (batch C1) Allocates the NRD input/output surfaces and initializes the
     /// two REBLUR instances on first use, exactly like EnsureSharcResources: a user
     /// who stays on SVGF never pays for REBLUR's permanent/transient pools.
-    void EnsureNRDResources();
+    void EnsureNRDResources(bool a_merged);
 
     /// @brief (batch C1) One flag per REBLUR instance rather than one shared, because
     /// diffuse dispatches earlier in the frame than specular and each instance must
@@ -1614,6 +1695,47 @@ struct ScreenSpaceRayTracing : Feature
     nrd::ReblurSettings reblurDiffuseSettings{};
     nrd::ReblurSettings reblurSpecularSettings{};
 
+    /// @brief (batch 36b) Efficiency mode (Settings::ReblurMode). One REBLUR_DIFFUSE_SPECULAR
+    /// instance in NRD checkerboard mode, plus the second packed input/output pair it needs because
+    /// both signals are now denoised in one dispatch (texNRDPackInput/Output keep carrying diffuse).
+    /// Exactly one layout exists at a time: EnsureNRDResources releases the two quality-mode
+    /// instances on the way in and this instance and pair on the way out, and whichever is created
+    /// restarts with CLEAR_AND_RESTART. One allocation per switch, none per frame.
+    NRDReblurIntegration nrdReblurMerged;
+    nrd::ReblurSettings reblurMergedSettings{};
+    bool resetReblurMerged = true;
+    eastl::unique_ptr<Texture2D> texNRDSpecInput = nullptr;
+    eastl::unique_ptr<Texture2D> texNRDSpecOutput = nullptr;
+    /// @brief (batch 36b) Which layout EnsureNRDResources left standing (true = merged).
+    bool mergedReblurActive = false;
+    /// @brief (batch 36b) The merged instance failed to come up for this ReblurMode value; quality
+    /// runs instead and nothing is retried until the setting changes or the resolution does.
+    bool mergedReblurInitFailed = false;
+    uint lastReblurModeSetting = 0xFFFFFFFFu;
+    /// @brief (batch 36b) Efficiency mode resolved for this frame by ResolveDenoisers (all of its
+    /// preconditions and resources), and whether DrawSSRTDiffuse actually ran it -- which is what
+    /// DrawSSRTSpecular keys off, since the trace it would otherwise do has already happened.
+    bool efficiencyActive = false;
+    bool efficiencyThisFrame = false;
+    /// @brief (batch 36b) Whether the last diffuse REBLUR dispatch (either layout) completed.
+    bool lastDiffuseReblurOk = true;
+    /// @brief (batch 36b) Settings::CheckerboardDebugView target, R8G8B8A8_UNORM, full size.
+    eastl::unique_ptr<Texture2D> texCheckerDebug = nullptr;
+
+    /// @brief (batch 36b) Everything efficiency mode needs that is knowable before allocating:
+    /// master switch, the setting, REBLUR selected, both signals on, SHARC off, shaders present.
+    [[nodiscard]] bool WantEfficiencyMode() const;
+    /// @brief (batch 36b) The merged REBLUR dispatch plus the specular unpack (texSSRColor and the
+    /// DLSS-RR hit-distance guide). Returns whether the NRD dispatch completed; on false the
+    /// unpack has published this frame's undenoised checkerboard samples and the reset stays
+    /// pending, the S1.2 contract of RunReblur.
+    [[nodiscard]] bool RunReblurMerged();
+    /// @brief (batch 36b) The constant buffer of a specular ray-march dispatch, shared by quality
+    /// mode (DrawSSRTSpecular) and efficiency mode (DrawSSRTDiffuse).
+    SSRTCB BuildSpecularCB(bool a_nrdFrontEndPack, bool a_checkerboard) const;
+    /// @brief (batch 36b) Allocate texCheckerDebug on first use of the debug view.
+    bool EnsureCheckerDebugTexture();
+
 #ifdef ENABLE_SHARC
     eastl::unique_ptr<Buffer> sharcHashEntries = nullptr;
     eastl::unique_ptr<Buffer> sharcHashCopyOffsets = nullptr;
@@ -1701,6 +1823,15 @@ struct ScreenSpaceRayTracing : Feature
     /// writes the front-end layout itself when SSRTCB::NRDFrontEndPack is set, which removes a
     /// full-screen pass per chain. See SSRTCB::NRDFrontEndPack and RunReblur.
     winrt::com_ptr<ID3D11ComputeShader> nrdUnpackCS = nullptr;
+    /// @brief (batch 36b) Efficiency mode: the two SSRT_CHECKERBOARD ray-march permutations and the
+    /// specular unpack that also rebuilds the DLSS-RR hit-distance guide. Any of them missing keeps
+    /// quality mode.
+    winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseCheckerCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> raymarchSpecularCheckerCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> nrdUnpackSpecEfficiencyCS = nullptr;
+    /// @brief (batch 36b) SSRT_COMPOSITE_B36B permutations of ssrt_diffuse_composite.hlsl, indexed
+    /// [externalConfidenceFilter * 2 + packedInput].
+    std::array<winrt::com_ptr<ID3D11ComputeShader>, 4> diffuseCompositeB36BCS = {};
 #ifdef ENABLE_SHARC
     winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseSharcCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> sharcUpdateRaymarchCS = nullptr;
