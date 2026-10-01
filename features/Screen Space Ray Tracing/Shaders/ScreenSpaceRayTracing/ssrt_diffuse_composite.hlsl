@@ -5,6 +5,16 @@
 // strips them, so the compiled binding table is unchanged.
 #include "ScreenSpaceRayTracing/ssrt_common.hlsli"
 
+// (batch 36) SSRT_DIFFUSE_PACKED_INPUT: t0 is REBLUR's OUT_DIFF_RADIANCE_HITDIST surface (YCoCg
+// radiance + normalized hit distance) -- or, if the REBLUR dispatch did not complete, its
+// IN_ counterpart in the same layout -- instead of the linear radiance the separate
+// ssrt_nrd_unpack.hlsl pass used to write. The conversion below is that pass's entire body, so
+// folding it here drops one full-screen RGBA16F read+write per frame and changes nothing but the
+// skipped fp16 round trip. Without the define this file compiles to exactly what it did before.
+#ifdef SSRT_DIFFUSE_PACKED_INPUT
+#	include "NRD/NRDReblurSH.hlsli"
+#endif
+
 Texture2D<float4> SSRTDiffuseTexture : register(t0);
 Texture2D<float4> AlbedoTexture : register(t1);
 
@@ -334,6 +344,14 @@ groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
 #endif
 
     float4 ssrtDiffuse = SSRTDiffuseTexture[dispatchID.xy];
+#ifdef SSRT_DIFFUSE_PACKED_INPUT
+    {
+        float3 unpackedRadiance;
+        float unpackedNormHitDist;
+        REBLUR_BackEnd_UnpackRadianceAndNormHitDist(ssrtDiffuse, unpackedRadiance, unpackedNormHitDist);
+        ssrtDiffuse = float4(unpackedRadiance, unpackedNormHitDist);
+    }
+#endif
     // (guard G9) The last gate in the chain, and the one that decides whether an SSRT
     // failure is a local artefact or a global one. ColorTextureRW is kMAIN: whatever is
     // written here is what the upscaler, the bloom chain and the tonemapper consume, and

@@ -12,6 +12,9 @@
 #include "DynamicCubemaps.h"
 #include "Skylighting.h"
 
+// (batch 36) For DiffuseReplacesSsgiIl(), the one question the AO-only path asks.
+#include "ScreenSpaceRayTracing.h"
+
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ScreenSpaceGI::Settings,
 	Enabled,
@@ -41,7 +44,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ContactRadius,
 	ContactStrength,
 	EnableDirectionalEnv,
-	EnvLevel)
+	EnvLevel,
+	SkipILUnderSSRTDiffuse)
 
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -401,6 +405,26 @@ void ScreenSpaceGI::DrawSettings()
 			ImGui::EndTable();
 		}
 
+		// (batch 36) The A/B switch for the AO-only path. Hot: both permutations are compiled
+		// whenever IL is on, so flipping this never recompiles anything.
+		ImGui::Checkbox("Skip IL While SSRT Diffuse Is On", &settings.SkipILUnderSSRTDiffuse);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Performance only - the picture should not change.\n\n"
+				"While Screen Space Ray Tracing's diffuse light is on, the final composite throws "
+				"this feature's indirect light away and keeps only its ambient occlusion. With this "
+				"on, the indirect light is not computed in the first place: only the AO (and the "
+				"contact AO) is worked out and denoised, so the two features stop paying for two "
+				"separate indirect-light denoisers.\n\n"
+				"If SSRT diffuse is switched off or cannot run, the full indirect light comes back "
+				"by itself.\n\n"
+				"Off is the previous behaviour, for comparison.");
+		{
+			const bool skipping = ShouldSkipIL();
+			ImGui::TextDisabled("%s", skipping ? "Now: AO only (SSRT diffuse supplies the indirect light)" :
+			                                     "Now: full IL + AO");
+		}
+
 		if (showAdvanced) {
 			ImGui::Separator();
 
@@ -746,7 +770,8 @@ void ScreenSpaceGI::SetupResources()
 void ScreenSpaceGI::ClearShaderCache()
 {
 	static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
-		&prefilterDepthsCompute, &prefilterRadianceCompute, &radianceDisoccCompute, &giCompute, &blurCompute, &upsampleCompute, &contactAoCompute
+		&prefilterDepthsCompute, &prefilterRadianceCompute, &radianceDisoccCompute, &giCompute, &blurCompute, &upsampleCompute, &contactAoCompute,
+		&radianceDisoccAoOnlyCompute, &giAoOnlyCompute
 	};
 
 	for (auto shader : shaderPtrs)
@@ -845,7 +870,42 @@ void ScreenSpaceGI::CompileComputeShaders()
 			info.programPtr->attach(rawPtr);
 	}
 
+	// (batch 36) The AO-only pair for Settings::SkipILUnderSSRTDiffuse. The same round's define
+	// set with GI and GI_SPECULAR taken out -- the exact permutation the IL checkbox off would
+	// build, so nothing new is being compiled here, only an existing configuration alongside the
+	// current one. Every other define (resolution, temporal, contact, cubemap, skylighting, VR)
+	// is kept, which is what makes the AO these produce the same AO the full pair produces: the
+	// AO bitmask, its temporal EMA and the bent normal in gi.cs.hlsl sit outside every #ifdef GI.
+	// Not needed with IL off (the pair above is already AO-only); a failed compile leaves a null
+	// pointer, which ShouldSkipIL() treats as "run the full path".
+	radianceDisoccAoOnlyCompute = nullptr;
+	giAoOnlyCompute = nullptr;
+	if (settings.EnableGI) {
+		std::vector<std::pair<const char*, const char*>> aoOnlyDefines;
+		for (const auto& d : defines) {
+			if (std::string_view(d.first) == "GI" || std::string_view(d.first) == "GI_SPECULAR")
+				continue;
+			aoOnlyDefines.push_back(d);
+		}
+		if (auto rawPtr = compile("radianceDisocc.cs.hlsl", aoOnlyDefines))
+			radianceDisoccAoOnlyCompute.attach(rawPtr);
+		if (auto rawPtr = compile("gi.cs.hlsl", aoOnlyDefines))
+			giAoOnlyCompute.attach(rawPtr);
+	}
+
 	recompileFlag = false;
+}
+
+// (batch 36) The AO-only path runs when, and only when, the composite is going to discard the IL
+// anyway (SSRT loaded and publishing a positive DiffuseMult this frame -- see
+// ScreenSpaceRayTracing::GetCommonBufferData, which also folds in whether the SSRT diffuse chain
+// can actually run) and both AO-only shaders exist. EnableGI is in the test because with IL off
+// the regular pair already is the AO-only pair and there is nothing to switch.
+bool ScreenSpaceGI::ShouldSkipIL() const
+{
+	return settings.SkipILUnderSSRTDiffuse && settings.EnableGI &&
+	       giAoOnlyCompute && radianceDisoccAoOnlyCompute &&
+	       globals::features::screenSpaceRayTracing.DiffuseReplacesSsgiIl();
 }
 
 bool ScreenSpaceGI::ShadersOK()
@@ -977,6 +1037,23 @@ void ScreenSpaceGI::DrawSSGI()
 	uint inputAoTexIdx = lastFrameAoTexIdx;
 	uint inputGITexIdx = lastFrameGITexIdx;
 
+	// (batch 36) AO-only frame? Decided once, here, and read by every dispatch below so the
+	// shader choice and the skipped passes cannot disagree within a frame.
+	const bool skipIL = ShouldSkipIL();
+
+	// (batch 36) Leaving the AO-only path: the IL history was not maintained while it ran (the
+	// AO-only GI pass leaves IL at zero and its EMA has been decaying the stored IL towards it),
+	// so start every channel over rather than fade the IL back in across MaxAccumFrames frames.
+	// Zero accumulated frames is the existing disocclusion state -- radianceDisocc turns it into
+	// accum_frames = 1, and gi.cs.hlsl then takes this frame's estimate whole -- so this needs no
+	// new mechanism. AO restarts too (it shares the counter), which costs it one frame of history.
+	if (lastFrameSkippedIL && !skipIL) {
+		FLOAT zero[4] = { 0.f, 0.f, 0.f, 0.f };
+		context->ClearUnorderedAccessViewFloat(texAccumFrames[0]->uav.get(), zero);
+		context->ClearUnorderedAccessViewFloat(texAccumFrames[1]->uav.get(), zero);
+	}
+	lastFrameSkippedIL = skipIL;
+
 	//////////////////////////////////////////////////////
 
 	UpdateSB();
@@ -1074,11 +1151,16 @@ void ScreenSpaceGI::DrawSSGI()
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-		context->CSSetShader(radianceDisoccCompute.get(), nullptr, 0);
+		// (batch 36) Same bindings either way: the AO-only permutation skips the radiance fetch
+		// and its store to u0 (the `#ifdef GI` block in the shader), writing u0 only for sky
+		// texels, which nothing reads on this path.
+		context->CSSetShader(skipIL ? radianceDisoccAoOnlyCompute.get() : radianceDisoccCompute.get(), nullptr, 0);
 		context->Dispatch((internalRes[0] + 7u) >> 3, (internalRes[1] + 7u) >> 3, 1);
 
 		// Prefilter radiance texture instead of using GenerateMips for proper dynamic resolution handling
-		{
+		// (batch 36) The radiance pyramid is read only by the GI pass's IL march, so the AO-only
+		// path drops both the mip-0 copy and the prefilter dispatch.
+		if (!skipIL) {
 			TracyD3D11Zone(globals::state->tracyCtx, "SSGI - Prefilter Radiance");
 
 			// First copy mip 0 from radiance to temporary texture to avoid read/write conflict
@@ -1146,7 +1228,9 @@ void ScreenSpaceGI::DrawSSGI()
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-		context->CSSetShader(giCompute.get(), nullptr, 0);
+		// (batch 36) Same bindings either way; the AO-only permutation skips the IL march and
+		// therefore never samples t2 (the radiance pyramid this frame did not build).
+		context->CSSetShader(skipIL ? giAoOnlyCompute.get() : giCompute.get(), nullptr, 0);
 		context->Dispatch((internalRes[0] + 7u) >> 3, (internalRes[1] + 7u) >> 3, 1);
 
 		inputAoTexIdx = !inputAoTexIdx;
@@ -1156,7 +1240,9 @@ void ScreenSpaceGI::DrawSSGI()
 	}
 
 	// blur
-	if (settings.EnableBlur) {
+	// (batch 36) IL-only filter (the AO channel is not blurred, see gi.cs.hlsl's F1 note), so
+	// the AO-only path skips it -- the same index bookkeeping the EnableBlur-off path uses.
+	if (settings.EnableBlur && !skipIL) {
 		TracyD3D11Zone(globals::state->tracyCtx, "SSGI - Diffuse Blur");
 
 		resetViews();
