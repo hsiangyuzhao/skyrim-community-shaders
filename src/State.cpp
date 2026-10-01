@@ -624,6 +624,10 @@ void State::SetupResources()
 	featureDataCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc((uint32_t)size));
 	delete[] data;
 
+	// (batch 35, C7) Fresh buffers hold nothing we uploaded.
+	uploadedSharedData.clear();
+	uploadedFeatureData.clear();
+
 	// Grab main texture to get resolution
 	// VR cannot use viewport->screenWidth/Height as it's the desktop preview window's resolution and not HMD
 	D3D11_TEXTURE2D_DESC texDesc{};
@@ -834,13 +838,28 @@ void State::UpdateSharedData([[maybe_unused]] bool a_inWorld, [[maybe_unused]] b
 
 		data.Batch35Flags = Batch35::GetGpuFlags();
 
-		sharedDataCB->Update(data);
+		// (batch 35, C7) This runs 3-4 times a frame (early prepass, reflections, deferred
+		// start, upscaling) and most calls rebuild byte-identical contents. The buffers are
+		// dynamic and keep their contents until the next Map, so a call whose bytes equal
+		// the last upload has nothing to change on the GPU. The comparison is on the exact
+		// bytes, so any field that did change - water data, MipBias, the frame counter -
+		// still goes up immediately. The last upload is tracked with the switch off too.
+		const bool dedup = Batch35::IsOn(Batch35::CpuItem::SharedDataUploadDedup);
+		const auto* bytes = reinterpret_cast<const uint8_t*>(&data);
+		if (!dedup || uploadedSharedData.size() != sizeof(data) || std::memcmp(uploadedSharedData.data(), bytes, sizeof(data)) != 0) {
+			sharedDataCB->Update(data);
+			uploadedSharedData.assign(bytes, bytes + sizeof(data));
+		}
 	}
 
 	{
 		auto [data, size] = GetFeatureBufferData(a_inWorld);
 
-		featureDataCB->Update(data, size);
+		const bool dedup = Batch35::IsOn(Batch35::CpuItem::SharedDataUploadDedup);
+		if (!dedup || uploadedFeatureData.size() != size || std::memcmp(uploadedFeatureData.data(), data, size) != 0) {
+			featureDataCB->Update(data, size);
+			uploadedFeatureData.assign(data, data + size);
+		}
 
 		delete[] data;
 	}

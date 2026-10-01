@@ -262,6 +262,9 @@ public:
 
 	std::unique_ptr<ConstantBuffer> sharedDataCB;
 	std::unique_ptr<ConstantBuffer> featureDataCB;
+	// (batch 35, C7) Exact bytes last written to the two buffers above.
+	std::vector<uint8_t> uploadedSharedData;
+	std::vector<uint8_t> uploadedFeatureData;
 
 	PermutationCB permutationData{};
 	PermutationCB permutationDataPrevious{};
