@@ -394,8 +394,12 @@ void ScreenSpaceGI::DrawSettings()
 				"Does nothing while SSRT diffuse is off.");
 		{
 			const bool skipping = ShouldSkipIL();
-			ImGui::TextDisabled("%s", skipping ? "Now: AO only (SSRT diffuse supplies the indirect light)" :
-			                                     "Now: full IL + AO");
+			// (batch 36b) SSRT's AO Source can take the AO over as well.
+			const uint aoDemand = globals::features::screenSpaceRayTracing.SsgiAoDemand();
+			ImGui::TextDisabled("%s", aoDemand == 2 ? "Now: not running (SSRT's AO Source supplies the AO)" :
+			                          aoDemand == 1 ? "Now: Contact AO only (SSRT's AO Source supplies the rest)" :
+			                          skipping      ? "Now: AO only (SSRT diffuse supplies the indirect light)" :
+			                                          "Now: full IL + AO");
 			if (settings.SkipILUnderSSRTDiffuse && !Batch36::IsOn())
 				ImGui::TextDisabled("Overridden: the Batch 36 master switch is off (Advanced > Batch 36).");
 		}

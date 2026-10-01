@@ -108,21 +108,54 @@ void AdvancedSettingsRenderer::RenderBatch36Section()
 	const auto& ssgi = globals::features::screenSpaceGI;
 	const auto& vrs = globals::features::variableRateShading;
 
+	// (batch 36b) "Own switch" is the item's own setting as text; "Now" is what this frame actually
+	// runs, which for the batch 36b items also folds in their own preconditions (REBLUR running, both
+	// SSRT parts on, Screen Space GI installed...), the same predicates the feature menus report.
 	struct Row
 	{
 		const char* name;
 		bool installed;
-		bool own;
+		const char* own;
+		bool ownOn;    // the item's own setting asks for the batch 36 behaviour
+		bool nowOn;    // that behaviour runs this frame
+		const char* nowText;
 		const char* where;
 	};
+	static const char* reblurModeNames[] = { "Quality", "Efficiency" };
+	static const char* aoSourceNames[] = { "Screen Space GI", "Denoiser + SSGI Contact AO", "Denoiser Only" };
+	const auto onOff = [](bool a_on) { return a_on ? "On" : "Off"; };
+	const auto& s = ssrt.settings;
+	const bool efficiencyOwn = s.ReblurMode == ScreenSpaceRayTracing::kReblurEfficiency;
+	const bool aoOwn = s.AoSource != ScreenSpaceRayTracing::kAoSsgi;
 	const Row rows[] = {
-		{ "Fold Diffuse Unpack Into Composite", ssrt.loaded, ssrt.settings.ReblurFoldDiffuseUnpack,
+		{ "REBLUR Mode (Efficiency = checkerboard tracing, one merged denoiser, confidence from the denoiser)", ssrt.loaded,
+			reblurModeNames[std::min(s.ReblurMode, 1u)], efficiencyOwn, ssrt.efficiencyActive,
+			ssrt.efficiencyActive ? "Efficiency" : "Quality",
+			"Lighting > Screen Space Ray Tracing > Denoiser > REBLUR Cost > REBLUR Mode (shown when Denoiser = REBLUR)" },
+		{ "AO Source", ssrt.loaded, aoSourceNames[std::min(s.AoSource, 2u)], aoOwn, ssrt.denoiserAoActive,
+			ssrt.denoiserAoActive ? aoSourceNames[std::min(s.AoSource, 2u)] : aoSourceNames[0],
+			"Lighting > Screen Space Ray Tracing > Ambient Occlusion > AO Source" },
+		{ "Direction-Aware Reinjection (optional, default off)", ssrt.loaded, onOff(s.DirectionalReinjection), s.DirectionalReinjection,
+			ssrt.missBentActive, onOff(ssrt.missBentActive),
+			"Lighting > Screen Space Ray Tracing > Ambient Energy (shown when Ambient Reinjection is on)" },
+		{ "Bounce Light Skips AO", ssrt.loaded, onOff(s.TracedLightSkipsAo), s.TracedLightSkipsAo,
+			master && (s.TracedLightSkipsAo || ssrt.denoiserAoActive), onOff(master && (s.TracedLightSkipsAo || ssrt.denoiserAoActive)),
+			"Lighting > Screen Space Ray Tracing > Ambient Occlusion" },
+		{ "Reflection Misses Use Scene Cubemap", ssrt.loaded, onOff(s.SpecularMissUsesCompositeCubemap), s.SpecularMissUsesCompositeCubemap,
+			master && s.SpecularMissUsesCompositeCubemap && s.UseDynamicCubemapsAsFallbackSpecular,
+			onOff(master && s.SpecularMissUsesCompositeCubemap && s.UseDynamicCubemapsAsFallbackSpecular),
+			"Lighting > Screen Space Ray Tracing (below Use Dynamic Cubemaps as Fallback for Specular)" },
+		{ "Fold Diffuse Unpack Into Composite", ssrt.loaded, onOff(s.ReblurFoldDiffuseUnpack), s.ReblurFoldDiffuseUnpack,
+			master && s.ReblurFoldDiffuseUnpack, onOff(master && s.ReblurFoldDiffuseUnpack),
 			"Lighting > Screen Space Ray Tracing > Denoiser > REBLUR Cost (shown when Denoiser = REBLUR)" },
-		{ "Direct Motion Vectors", ssrt.loaded, ssrt.settings.ReblurDirectMotionVectors,
+		{ "Direct Motion Vectors", ssrt.loaded, onOff(s.ReblurDirectMotionVectors), s.ReblurDirectMotionVectors,
+			master && s.ReblurDirectMotionVectors, onOff(master && s.ReblurDirectMotionVectors),
 			"Lighting > Screen Space Ray Tracing > Denoiser > REBLUR Cost (shown when Denoiser = REBLUR)" },
-		{ "Skip IL While SSRT Diffuse Is On", ssgi.loaded, ssgi.settings.SkipILUnderSSRTDiffuse,
+		{ "Skip IL While SSRT Diffuse Is On", ssgi.loaded, onOff(ssgi.settings.SkipILUnderSSRTDiffuse), ssgi.settings.SkipILUnderSSRTDiffuse,
+			master && ssgi.settings.SkipILUnderSSRTDiffuse, onOff(master && ssgi.settings.SkipILUnderSSRTDiffuse),
 			"Lighting > Screen Space GI > Denoising" },
-		{ "Variable Rate Shading (default off; master can only force it off)", vrs.loaded, vrs.settings.Enabled,
+		{ "Variable Rate Shading (default off; master can only force it off)", vrs.loaded, onOff(vrs.settings.Enabled), vrs.settings.Enabled,
+			master && vrs.settings.Enabled, onOff(master && vrs.settings.Enabled),
 			"Display > Variable Rate Shading > Enable" },
 	};
 
@@ -136,20 +169,19 @@ void AdvancedSettingsRenderer::RenderBatch36Section()
 		for (const auto& row : rows) {
 			ImGui::TableNextRow();
 			ImGui::TableNextColumn();
-			ImGui::TextUnformatted(row.name);
+			ImGui::TextWrapped("%s", row.name);
 			ImGui::TableNextColumn();
 			if (!row.installed)
 				ImGui::TextDisabled("not installed");
 			else
-				ImGui::TextUnformatted(row.own ? "On" : "Off");
+				ImGui::TextUnformatted(row.own);
 			ImGui::TableNextColumn();
-			const bool now = row.installed && row.own && master;
 			if (!row.installed)
 				ImGui::TextDisabled("-");
-			else if (row.own && !master)
-				ImGui::TextColored(palette.Warning, "Off (master)");
+			else if (row.ownOn && !master)
+				ImGui::TextColored(palette.Warning, "%s (master off)", row.nowText);
 			else
-				ImGui::TextColored(now ? palette.SuccessColor : palette.Disable, "%s", now ? "On" : "Off");
+				ImGui::TextColored(row.nowOn ? palette.SuccessColor : palette.Disable, "%s", row.nowText);
 			ImGui::TableNextColumn();
 			ImGui::TextWrapped("%s", row.where);
 		}

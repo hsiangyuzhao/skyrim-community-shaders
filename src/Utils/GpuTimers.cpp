@@ -23,14 +23,14 @@ namespace Util
 			{ "SSRT Trace Diffuse",
 				"GPU time for SSRT's diffuse (bounce light) ray tracing." },
 			{ "SSRT Trace Specular",
-				"GPU time for SSRT's specular (reflection) ray tracing." },
+				"GPU time for SSRT's specular (reflection) ray tracing. In REBLUR Efficiency mode this also includes saving the frame for the next frame's reflections." },
 			{ "SSRT Composite",
 				"GPU time for adding SSRT's diffuse light to the image. With the Low-Resolution "
 				"Confidence Filter off, the confidence filter's cost is counted here too." },
 			{ "SSRT SVGF",
 				"GPU time for the SVGF denoiser (diffuse and specular). Only shown while the SSRT Denoiser is set to SVGF." },
 			{ "SSRT REBLUR",
-				"GPU time for the REBLUR denoiser (diffuse and specular). Only shown while the SSRT Denoiser is set to REBLUR." },
+				"GPU time for the REBLUR denoiser (diffuse and specular; one combined pass in Efficiency mode). Only shown while the SSRT Denoiser is set to REBLUR." },
 			{ "SSRT Confidence Filter",
 				"GPU time for the low-resolution confidence filter. Only shown while Ambient Reinjection and the "
 				"Low-Resolution Confidence Filter are both on; otherwise its cost is in SSRT Composite." },
