@@ -36,6 +36,13 @@ ID3D11ShaderResourceView* HiZPyramid::GetSourceDepthSRV()
 
 ID3D11ShaderResourceView* HiZPyramid::GetLiveDepthSRV()
 {
+	// Terrain Blending repoints kMAIN's SRV at its blended R32_FLOAT copy for the whole depth prepass,
+	// which is where grass first draws; that copy still holds the previous frame until the blend pass
+	// runs. Its saved original is the SRV of the live depth buffer itself.
+	auto& tb = globals::features::terrainBlending;
+	if (tb.loaded && tb.depthSRVBackup)
+		return tb.depthSRVBackup;
+
 	auto* renderer = globals::game::renderer;
 	if (!renderer)
 		return nullptr;
