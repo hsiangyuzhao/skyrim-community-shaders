@@ -97,10 +97,8 @@ struct VariableRateShading : Feature
 	};
 	STATIC_ASSERT_ALIGNAS_16(RateCB);
 
-	// Nothing of this feature is compiled into the engine shader permutations the disk cache
-	// holds (its compute shaders are compiled directly at runtime), so installing, removing or
-	// updating it must not throw that cache away and force a full recompile.
-	virtual bool ValidateCache(CSimpleIniA&) override { return true; }
+	// The default disk-cache check applies on purpose: the engine Lighting / Grass shaders carry
+	// VRS-specific interpolation (centroid), so a VRS version bump must rebuild that cache.
 
 	virtual void SetupResources() override;
 	virtual void ClearShaderCache() override;
