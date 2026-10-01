@@ -611,6 +611,9 @@ void Deferred::DeferredPasses()
 			// zeroes whenever the feature is not actually running, so a null binding here can
 			// never be read.
 			ssgi_env_irradiance,
+			// t22 (batch 36b, deviation 2) SSRT's accumulated miss bent normal. Read only under
+			// ssrtSettings.AmbientReinjection bit 1, which GetCommonBufferData sets only while it exists.
+			ssrt.loaded ? ssrt.MissBentSRV() : nullptr,
 		};
 
 		ID3D11SamplerState* samplers[]{
@@ -632,7 +635,7 @@ void Deferred::DeferredPasses()
 
 	// Clear
 	{
-		ID3D11ShaderResourceView* views[22]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+		ID3D11ShaderResourceView* views[23]{};
 		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
 
 		ID3D11UnorderedAccessView* uavs[3]{ nullptr, nullptr, nullptr };

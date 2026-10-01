@@ -90,6 +90,7 @@ struct ScreenSpaceRayTracing : Feature
     static constexpr uint kCompositeAoContact = 4u;
     static constexpr uint kCompositeTracedSkipsAo = 8u;
     static constexpr uint kCompositeCheckerInput = 16u;
+    static constexpr uint kCompositeMissBent = 32u;
 
     struct Settings
     {
@@ -475,6 +476,27 @@ struct ScreenSpaceRayTracing : Feature
         /// there is no denoiser AO and Screen Space GI runs in full again, with its history reset.
         /// Default SSGI: the 36a picture.
         uint AoSource = kAoSsgi;
+        /// @brief (batch 36b, deviation 2) Direction-aware reinjection. The ambient kept for the unresolved
+        /// part of the hemisphere is the forward ambient evaluated along the surface normal; with
+        /// this on, the ray march also records the mean direction of the rays that missed (the "miss
+        /// bent normal", accumulated over ~8 frames) and DeferredCompositeCS rescales the re-added
+        /// ambient by DALC(bent) / DALC(normal) -- e.g. a ledge whose open directions face the sky
+        /// keeps more sky light than one whose misses run along the ground. Optional, default off.
+        bool DirectionalReinjection = false;
+        /// @brief (batch 36b, deviation 4) The traced bounce light is not darkened by Screen Space GI's AO a
+        /// second time: AO applies to the ambient part only. DeferredCompositeCS multiplies all of
+        /// MAIN except the re-added ambient by sqrt(MultiBounceAO), and the traced light was already
+        /// in MAIN, so the diffuse composite pre-divides it by that same factor. Always in force under
+        /// a denoiser AO source, whatever this says. Default on.
+        bool TracedLightSkipsAo = true;
+        /// @brief (batch 36b, deviation 5) A specular ray that misses falls back to the deferred composite's
+        /// own cubemap reflection -- DALC-normalised, with Image Based Lighting and Skylighting's
+        /// specular visibility, exactly what the frame shows with traced reflections off -- instead
+        /// of the ray march's own raw mip-0 cubemap sample. Following the upstream SSR, which hands
+        /// misses to the composite; here the composite's evaluation is reproduced in the ray march so
+        /// the blend with partial hits happens before denoising (no dark seams at hit/miss borders).
+        /// Default on.
+        bool SpecularMissUsesCompositeCubemap = true;
         /// @brief (batch C1) REBLUR tuning for the diffuse instance. NRD defaults.
         NRD::REBLURSettings ReblurDiffuse;
         /// @brief (batch C1) REBLUR tuning for the specular instance. Defaults taken
@@ -1767,6 +1789,22 @@ struct ScreenSpaceRayTracing : Feature
     eastl::unique_ptr<Texture2D> texSSRTAo = nullptr;
     bool EnsureAoTexture();
 
+    /// @brief (batch 36b, deviation 2) The miss bent normal: the ray march's per-frame mean miss direction
+    /// (texMissDirRaw) and its temporal accumulation (texMissBent ping-pong, written by the diffuse
+    /// composite, read by DeferredCompositeCS at t22). R8G8B8A8_SNORM; allocated while the switch is
+    /// on, released when it goes off.
+    bool missBentActive = false;
+    uint missBentIdx = 0;
+    eastl::unique_ptr<Texture2D> texMissDirRaw = nullptr;
+    eastl::unique_ptr<Texture2D> texMissBent[2] = { nullptr, nullptr };
+    bool EnsureMissBentResources();
+    void ReleaseMissBentResources();
+    /// @brief The accumulated miss bent normal DeferredCompositeCS should read this frame, or null.
+    [[nodiscard]] ID3D11ShaderResourceView* MissBentSRV() const
+    {
+        return (loaded && missBentActive && texMissBent[missBentIdx]) ? texMissBent[missBentIdx]->srv.get() : nullptr;
+    }
+
     /// @brief (batch 36b) Settings::CheckerboardDebugView target, R8G8B8A8_UNORM, full size.
     eastl::unique_ptr<Texture2D> texCheckerDebug = nullptr;
 
@@ -1876,6 +1914,9 @@ struct ScreenSpaceRayTracing : Feature
     /// quality mode.
     winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseCheckerCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> raymarchSpecularCheckerCS = nullptr;
+    /// @brief (batch 36b, deviation 2) SSRT_MISS_BENT twins of the two diffuse ray marches.
+    winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseBentCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseCheckerBentCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> nrdUnpackSpecEfficiencyCS = nullptr;
     /// @brief (batch 36b) SSRT_COMPOSITE_B36B permutations of ssrt_diffuse_composite.hlsl, indexed
     /// [externalConfidenceFilter * 2 + packedInput].

@@ -127,6 +127,10 @@ Texture2D<float4> SSRTexture : register(t16);
 // construction and needs no finiteness test of its own; the write side is covered by the
 // G2 sanitisation the ray march already applies to the channel it comes from.
 Texture2D<float> SSRTConfidenceTexture : register(t19);
+// (batch 36b, deviation 2) The accumulated miss bent normal: the mean direction the rays that resolved
+// nothing escaped through, weighted by how much they missed (R8G8B8A8_SNORM, xyz world space). Read
+// only when ssrtSettings.AmbientReinjection has bit 1 set.
+Texture2D<float4> SSRTMissBentTexture : register(t22);
 #endif
 
 // The ambient separation further down has two consumers, and only one of them is SSGI:
@@ -344,7 +348,8 @@ bool DirEnvIsFinite(float v)
 	// AmbientReinjectionStrength scales only the removal, so 0 is a deliberately additive
 	// GI mode and 1 is the energy-conserving one.
 	[branch] if (SharedData::ssrtSettings.DiffuseMult > 0.0) {
-		[branch] if (SharedData::ssrtSettings.AmbientReinjection != 0) {
+		// (batch 36b) AmbientReinjection is a bit field now: bit 0 = reinjection, bit 1 = deviation 2.
+		[branch] if ((SharedData::ssrtSettings.AmbientReinjection & 1u) != 0) {
 			float ssrtConfidence = SSRTConfidenceTexture[dispatchID.xy];
 			ambientKeep = saturate(1.0 - ssrtConfidence * SharedData::ssrtSettings.AmbientReinjectionStrength);
 		} else {
@@ -367,6 +372,27 @@ bool DirEnvIsFinite(float v)
 	// it would unbalance the separation - so the directional environment channel swaps only
 	// this, the re-add.
 	float3 ambientReAddColor = directionalAmbientColor;
+
+#	if defined(SSRT)
+	// (batch 36b, deviation 2) Direction-aware reinjection. What is re-added is the forward ambient for the
+	// part of the hemisphere the SSRT rays did not resolve, but evaluated along the surface normal -- as
+	// if the unresolved directions were spread around it evenly. The ray march knows which directions
+	// actually escaped; their accumulated mean (the miss bent normal) re-aims the DALC lookup, and the
+	// re-add is scaled by DALC(bent) / DALC(normal) in luminance, so its chroma and its balance with
+	// the removal above are untouched. Clamped to [0.5, 2] and faded in over short bent vectors
+	// (pixels whose rays almost all hit something), so it corrects the direction and never decides
+	// the amount -- that stays ambientKeep's job.
+	[branch] if ((SharedData::ssrtSettings.AmbientReinjection & 2u) != 0 && SharedData::ssrtSettings.DiffuseMult > 0.0) {
+		const float3 bent = SSRTMissBentTexture[dispatchID.xy].xyz;
+		const float bentLength = length(bent);
+		const float3 bentDir = bent / max(bentLength, 1e-4);
+		const float lumNormal = Color::RGBToLuminance(Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(normalWS, 1.0)))));
+		const float lumBent = Color::RGBToLuminance(Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(bentDir, 1.0)))));
+		const float scale = lerp(1.0, clamp(lumBent / max(lumNormal, 1e-4), 0.5, 2.0), smoothstep(0.02, 0.1, bentLength));
+		if ((asuint(scale) & 0x7F800000u) != 0x7F800000u)
+			ambientReAddColor *= scale;
+	}
+#	endif
 
 #	if defined(SSGI) && defined(DYNAMIC_CUBEMAPS)
 	// (directional env v2) Swap the re-added ambient for SSGI's pre-integrated hemisphere

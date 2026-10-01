@@ -9,6 +9,7 @@
 #include "ShaderCache.h"
 
 #include "DynamicCubemaps.h"
+#include "IBL.h"
 #include "ScreenSpaceGI.h"
 #include "Skylighting.h"
 
@@ -45,6 +46,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurFoldDiffuseUnpack,
     ReblurMode,
     AoSource,
+    DirectionalReinjection,
+    TracedLightSkipsAo,
+    SpecularMissUsesCompositeCubemap,
     ReblurDiffuse,
     ReblurSpecular,
     ReblurMerged,
@@ -107,6 +111,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurFoldDiffuseUnpack,
     ReblurMode,
     AoSource,
+    DirectionalReinjection,
+    TracedLightSkipsAo,
+    SpecularMissUsesCompositeCubemap,
     ReblurDiffuse,
     ReblurSpecular,
     ReblurMerged,
@@ -247,6 +254,13 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "Alternative to the filter above that averages over several frames: removes grain, but leaves bands of wrong brightness trailing moving objects. "
                 "Off by default; only available with the Low-Resolution Confidence Filter turned off.");
 
+        // (batch 36b, deviation 2) Optional, default off.
+        ImGui::Checkbox("Direction-Aware Reinjection", &settings.DirectionalReinjection);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Optional. The normal ambient light kept where the rays found nothing is aimed at the directions they actually escaped through. "
+                "Spots that only see the sky get a little more sky light, spots that look along the ground a little less; most visible right next to walls.");
+
         if (settings.TemporalAmbientConfidence && !settings.LowResConfidenceFilter) {
             ImGui::SliderInt("Confidence Frames", (int*)&settings.AmbientConfidenceMaxFrames, 1, 60, "%d", ImGuiSliderFlags_AlwaysClamp);
             if (auto _tt = Util::HoverTooltipWrapper())
@@ -283,6 +297,12 @@ void ScreenSpaceRayTracing::DrawSettings()
                 ImGui::TextDisabled("Now: Screen Space GI, because %s.", why);
             }
         }
+        // (batch 36b, deviation 4)
+        ImGui::Checkbox("Bounce Light Skips AO", &settings.TracedLightSkipsAo);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "The traced bounce light is not darkened by the AO again; AO only darkens the normal ambient light. "
+                "Corners and crevices that receive bounce light get slightly brighter. Always on with a Denoiser AO source.");
     }
 
     ImGui::Separator();
@@ -322,6 +342,14 @@ void ScreenSpaceRayTracing::DrawSettings()
     ImGui::Checkbox("Use Dynamic Cubemaps as Fallback for Specular", &settings.UseDynamicCubemapsAsFallbackSpecular);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("When ray marching misses, use dynamic cubemaps for reflections. Recommended for specular.");
+    // (batch 36b, deviation 5)
+    ImGui::BeginDisabled(!settings.UseDynamicCubemapsAsFallbackSpecular);
+    ImGui::Checkbox("Reflection Misses Use Scene Cubemap", &settings.SpecularMissUsesCompositeCubemap);
+    ImGui::EndDisabled();
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Where a reflection ray finds nothing, use the same cubemap reflection the game shows with traced reflections off "
+            "(brightness-matched, with Image Based Lighting). Fewer too-bright or too-dark patches where traced and cubemap reflections meet.");
     ImGui::SliderFloat("Cubemap Normalization", &settings.CubemapNormalization, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Matches cubemap luminance with ambient color.");
@@ -1612,6 +1640,62 @@ bool ScreenSpaceRayTracing::EnsureAoTexture()
     return true;
 }
 
+// (batch 36b, deviation 2) The miss bent normal set: the ray march's raw per-frame value and the
+// accumulated ping-pong pair. R8G8B8A8_SNORM -- a direction weighted by a miss fraction, both
+// within [-1, 1] -- 4 bytes per pixel each, ~33 MiB per surface at 4K. Cleared on allocation so the
+// first frames read "no data" (zero length), which DeferredCompositeCS treats as "no correction".
+bool ScreenSpaceRayTracing::EnsureMissBentResources()
+{
+    if (texMissDirRaw && texMissBent[0] && texMissBent[1])
+        return true;
+    auto mainTex = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return false;
+    D3D11_TEXTURE2D_DESC mainDesc{};
+    mainTex.texture->GetDesc(&mainDesc);
+    D3D11_TEXTURE2D_DESC texDesc{
+        .Width = mainDesc.Width,
+        .Height = mainDesc.Height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R8G8B8A8_SNORM,
+        .SampleDesc = { 1, 0 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+    };
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+    };
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipSlice = 0 }
+    };
+    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    auto makeTex = [&](eastl::unique_ptr<Texture2D>& tex, const char* name) {
+        if (tex)
+            return;
+        tex = eastl::make_unique<Texture2D>(texDesc);
+        tex->CreateSRV(srvDesc);
+        tex->CreateUAV(uavDesc);
+        Util::SetResourceName(tex->resource.get(), name);
+        globals::d3d::context->ClearUnorderedAccessViewFloat(tex->uav.get(), zero);
+    };
+    makeTex(texMissDirRaw, "SSRT::MissDirRaw");
+    makeTex(texMissBent[0], "SSRT::MissBent0");
+    makeTex(texMissBent[1], "SSRT::MissBent1");
+    return texMissDirRaw && texMissBent[0] && texMissBent[1];
+}
+
+void ScreenSpaceRayTracing::ReleaseMissBentResources()
+{
+    texMissDirRaw = nullptr;
+    texMissBent[0] = nullptr;
+    texMissBent[1] = nullptr;
+}
+
 // (batch 36b) The configuration half of the efficiency-mode question. Everything here is a fact
 // about settings and compiled shaders; resources are EnsureNRDResources' business.
 bool ScreenSpaceRayTracing::WantEfficiencyMode() const
@@ -1830,6 +1914,9 @@ void ScreenSpaceRayTracing::ResetFrameState()
     mergedReblurActive = false;
     texSSRTAo = nullptr;
     denoiserAoActive = false;
+    ReleaseMissBentResources();
+    missBentActive = false;
+    missBentIdx = 0;
     lastDenoiserAoActive = false;
     denoiserAoWrittenThisFrame = false;
     mergedReblurInitFailed = false;
@@ -1861,6 +1948,7 @@ void ScreenSpaceRayTracing::ClearShaderCache()
         &diffuseCompositePackedCS, &diffuseCompositeExternalConfPackedCS,
         // (batch 36b) efficiency mode and the batch 36b composite permutations
         &raymarchDiffuseCheckerCS, &raymarchSpecularCheckerCS, &nrdUnpackSpecEfficiencyCS,
+        &raymarchDiffuseBentCS, &raymarchDiffuseCheckerBentCS,
         &diffuseCompositeB36BCS[0], &diffuseCompositeB36BCS[1], &diffuseCompositeB36BCS[2], &diffuseCompositeB36BCS[3],
 #ifdef ENABLE_SHARC
         &raymarchDiffuseSharcCS, &sharcUpdateRaymarchCS, &sharcResolveCS
@@ -1912,11 +2000,21 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
 
     auto definesSpecular = defines;
     definesSpecular.push_back({ "SSRT_SPECULAR", nullptr });
+    // (batch 36b, deviation 5) The specular miss fallback reproduces DeferredCompositeCS's cubemap
+    // reflection, which includes Image Based Lighting when that feature is installed. Specular only:
+    // no diffuse permutation reads it, and the define would only multiply their compile time.
+    if (globals::features::ibl.loaded)
+        definesSpecular.push_back({ "IBL", nullptr });
 
     // (batch 36b) The efficiency-mode checkerboard ray marches. Built on `defines` because they are
     // the same shader as the full-resolution permutations and read every one of their axes.
     auto definesDiffuseChecker = defines;
     definesDiffuseChecker.push_back({ "SSRT_CHECKERBOARD", "1" });
+    // (batch 36b, deviation 2) The two diffuse ray marches again, publishing the miss direction.
+    auto definesDiffuseBent = defines;
+    definesDiffuseBent.push_back({ "SSRT_MISS_BENT", "1" });
+    auto definesDiffuseCheckerBent = definesDiffuseChecker;
+    definesDiffuseCheckerBent.push_back({ "SSRT_MISS_BENT", "1" });
     auto definesSpecularChecker = definesSpecular;
     definesSpecularChecker.push_back({ "SSRT_CHECKERBOARD", "1" });
 
@@ -1993,6 +2091,8 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &diffuseCompositeB36BCS[3], "ssrt_diffuse_composite.hlsl", { { "SSRT_COMPOSITE_B36B", "1" }, { "SSRT_CONF_EXTERNAL_FILTER", "1" }, { "SSRT_DIFFUSE_PACKED_INPUT", "1" } } },
             { &raymarchDiffuseCheckerCS, "ssrt_raymarch.hlsl", definesDiffuseChecker },
             { &raymarchSpecularCheckerCS, "ssrt_raymarch.hlsl", definesSpecularChecker },
+            { &raymarchDiffuseBentCS, "ssrt_raymarch.hlsl", definesDiffuseBent },
+            { &raymarchDiffuseCheckerBentCS, "ssrt_raymarch.hlsl", definesDiffuseCheckerBent },
             { &nrdUnpackSpecEfficiencyCS, "ssrt_nrd_unpack.hlsl", { { "SSRT_UNPACK_SPEC_EFFICIENCY", "1" } } },
 #ifdef ENABLE_SHARC
             { &raymarchDiffuseSharcCS, "ssrt_raymarch.hlsl", definesSharc },
@@ -2214,6 +2314,23 @@ void ScreenSpaceRayTracing::Prepass()
             resetReblurMerged = true;
         }
         lastDenoiserAoActive = denoiserAoActive;
+    }
+
+    // (batch 36b, deviation 2) Direction-aware reinjection: only meaningful while reinjection runs, and
+    // only on the non-SHARC diffuse ray march (the permutations that carry the miss direction).
+    {
+        bool chainShaders = true;
+        for (const auto& cs : diffuseCompositeB36BCS)
+            chainShaders = chainShaders && cs;
+        bool wantBent = loaded && Batch36::IsOn() && settings.DirectionalReinjection && settings.EnableDiffuse &&
+                        settings.EnableAmbientReinjection && DiffuseChainReady() && chainShaders &&
+                        raymarchDiffuseBentCS && raymarchDiffuseCheckerBentCS;
+#ifdef ENABLE_SHARC
+        wantBent = wantBent && !settings.EnableSharc;
+#endif
+        missBentActive = wantBent && EnsureMissBentResources();
+        if (!wantBent && texMissDirRaw)
+            ReleaseMissBentResources();
     }
 
     // (guard G8) Before the enable gate below, so a transition is never missed just because
@@ -2458,6 +2575,11 @@ ScreenSpaceRayTracing::SSRTCB ScreenSpaceRayTracing::BuildSpecularCB(bool a_nrdF
             flags |= kRaymarchPrevFrameColor;
         if (a_checkerboard && settings.CheckerboardDebugView)
             flags |= kRaymarchCheckerDebug;
+        // (batch 36b, deviation 5) Misses take DeferredCompositeCS's own cubemap reflection. Not in VR,
+        // where the composite reconstructs its position through the stereo UV transform this pass
+        // does not reproduce.
+        if (Batch36::IsOn() && settings.SpecularMissUsesCompositeCubemap && dynamicCubemaps.loaded && !REL::Module::IsVR())
+            flags |= kRaymarchSpecMissComposite;
         ssrCBData.RaymarchFlags = flags;
         // (batch 36b) Denoiser AO tier: this frame's texSSRTAo if the diffuse composite already wrote
         // it (quality mode traces specular after it), last frame's reprojected otherwise.
@@ -2567,7 +2689,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // (diagnostic H) Three slots now, because ssrt_temporal.hlsl declares texDebugHistory at
     // u2. The specular chain never writes it -- it passes historyDebugView 0 -- but the slot is
     // bound anyway so that the declared UAV is never left dangling from another pass.
-    std::array<ID3D11ShaderResourceView*, 12> srvs = { nullptr };
+    std::array<ID3D11ShaderResourceView*, 16> srvs = { nullptr };  // (batch 36b) t14/t15: IBL, deviation 5
 	std::array<ID3D11UnorderedAccessView*, 3> uavs = { nullptr };
 
     auto resetViews = [&]() {
@@ -2631,6 +2753,9 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     srvs.at(9) = denoiserAoActive ? texSSRTAo->srv.get() : ssgi_ao;  // (batch 36b) AO source
     srvs.at(10) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.texProbeArray->srv.get() : nullptr;
     srvs.at(11) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.stbn_vec3_2Dx1D_128x128x64.get() : nullptr;
+    // (batch 36b, deviation 5) The SH probes DeferredCompositeCS's cubemap reflection reads.
+    srvs.at(14) = globals::features::ibl.loaded ? globals::features::ibl.diffuseIBLTexture->srv.get() : nullptr;
+    srvs.at(15) = globals::features::ibl.loaded ? globals::features::ibl.diffuseSkyIBLTexture->srv.get() : nullptr;
 
     context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
     context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
@@ -3366,7 +3491,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 	// u0/u1 for its own two outputs, and the diffuse composite reuses u0/u1 for kMAIN and the
 	// smoothed confidence, so the array is never smaller than 2. (batch 36b) Eight entries: u7 is
 	// the checkerboard debug surface, the last of the eight UAVs a cs_5_0 dispatch may bind.
-    std::array<ID3D11ShaderResourceView*, 13> srvs = { nullptr };
+    std::array<ID3D11ShaderResourceView*, 16> srvs = { nullptr };  // (batch 36b) t14/t15: IBL, deviation 5
 	std::array<ID3D11UnorderedAccessView*, 8> uavs = { nullptr };
 
     auto resetViews = [&]() {
@@ -3405,6 +3530,13 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // pass reading a stale or cleared surface. HitRadiusStrength 0 is what makes the mechanism
     // inert, on the consumer side.
     uavs.at(6) = texSSRTDiffuseHitDistance->uav.get();
+    // (batch 36b, deviation 2) The SSRT_MISS_BENT twins also write the per-frame miss direction at u2
+    // (free on every non-SHARC permutation).
+    if (missBentActive)
+        uavs.at(2) = texMissDirRaw->uav.get();
+    ID3D11ComputeShader* const diffuseRaymarchShader =
+        efficiency ? (missBentActive ? raymarchDiffuseCheckerBentCS.get() : raymarchDiffuseCheckerCS.get()) :
+                     (missBentActive ? raymarchDiffuseBentCS.get() : raymarchDiffuseCS.get());
     if (checkerDebug)
         uavs.at(7) = texCheckerDebug->uav.get();
 #ifdef ENABLE_SHARC
@@ -3453,9 +3585,9 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         state->EndPerfEvent();
     }
 
-    context->CSSetShader(settings.EnableSharc ? raymarchDiffuseSharcCS.get() : (efficiency ? raymarchDiffuseCheckerCS.get() : raymarchDiffuseCS.get()), nullptr, 0);
+    context->CSSetShader(settings.EnableSharc ? raymarchDiffuseSharcCS.get() : diffuseRaymarchShader, nullptr, 0);
 #else
-    context->CSSetShader(efficiency ? raymarchDiffuseCheckerCS.get() : raymarchDiffuseCS.get(), nullptr, 0);
+    context->CSSetShader(diffuseRaymarchShader, nullptr, 0);
 #endif
     if (efficiency)
         context->Dispatch(checkerDispatchX, checkerDispatchY, 1);
@@ -3494,6 +3626,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         srvs.at(8) = inInterior ? envTexture : envReflectionsTexture;
         srvs.at(9) = fallbackAo;
         srvs.at(10) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.texProbeArray->srv.get() : nullptr;
+        srvs.at(14) = globals::features::ibl.loaded ? globals::features::ibl.diffuseIBLTexture->srv.get() : nullptr;  // (deviation 5)
+        srvs.at(15) = globals::features::ibl.loaded ? globals::features::ibl.diffuseSkyIBLTexture->srv.get() : nullptr;
         srvs.at(11) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.stbn_vec3_2Dx1D_128x128x64.get() : nullptr;
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
@@ -3873,6 +4007,13 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
                 compositeFlags |= kCompositeAoContact;
         }
     }
+    // (batch 36b, deviation 4) The same exemption against Screen Space GI's AO. Only where that AO is
+    // applied at all: DeferredCompositeCS compiles its AO under SSGI's define.
+    if (Batch36::IsOn() && settings.TracedLightSkipsAo && ssgi.loaded)
+        compositeFlags |= kCompositeTracedSkipsAo;
+    // (batch 36b, deviation 2) Accumulate the miss bent normal.
+    if (missBentActive)
+        compositeFlags |= kCompositeMissBent;
 
     // composite
     Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTComposite);
@@ -3929,6 +4070,15 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
             uavs.at(3) = texSSRTAo->uav.get();
             uavCount = 4;
         }
+        // (batch 36b, deviation 2) Raw miss direction at t9, last frame's accumulation at t10 (read at
+        // the motion-reprojected position, motion at t6), this frame's accumulation at u4.
+        if ((compositeFlags & kCompositeMissBent) != 0) {
+            srvs.at(6) = motion.SRV;
+            srvs.at(9) = texMissDirRaw->srv.get();
+            srvs.at(10) = texMissBent[missBentIdx]->srv.get();
+            uavs.at(4) = texMissBent[!missBentIdx]->uav.get();
+            uavCount = 5;
+        }
         ssrCBData.CompositeFlags = compositeFlags;
         ssrtCB->Update(ssrCBData);
         buffer = ssrtCB->CB();
@@ -3957,6 +4107,10 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // (batch 36b) DeferredCompositeCS and a quality-mode specular trace read it from here on.
         if ((compositeFlags & kCompositeWriteAo) != 0)
             denoiserAoWrittenThisFrame = true;
+        // (batch 36b, deviation 2) The accumulation just written becomes the one MissBentSRV() hands
+        // DeferredCompositeCS, and next frame's history.
+        if ((compositeFlags & kCompositeMissBent) != 0)
+            missBentIdx = !missBentIdx;
 
         // (reinjection noise) This frame's accumulator becomes next frame's history. A pointer
         // swap, matching the moment pair at the end of the SVGF block, so no copy is issued.
@@ -4047,6 +4201,12 @@ ScreenSpaceRayTracing::SharedData ScreenSpaceRayTracing::GetCommonBufferData()
     // consumer keys off `DiffuseMult > 0`, and a reinjection flag left set while the diffuse
     // pass is not running would have DeferredCompositeCS reading a stale confidence surface.
     data.AmbientReinjection = (diffuseLive && settings.EnableAmbientReinjection) ? 1u : 0u;
+    // (batch 36b, deviation 2) Bit 1: DeferredCompositeCS rescales the re-added ambient along the
+    // accumulated miss bent normal at t22. Bit 0 keeps its meaning; both readers (the composite and
+    // the ray march) test bits rather than != 0. missBentActive is last frame's here, which only
+    // matters on the frame of a switch, and t22 is bound only while the surface exists.
+    if (data.AmbientReinjection != 0u && missBentActive)
+        data.AmbientReinjection |= 2u;
 
     // (batch 36) What Screen Space GI asks before skipping its IL. `loaded` is part of it because
     // DeferredCompositeCS only drops SSGI's IL in its SSRT permutation, i.e. when this feature is

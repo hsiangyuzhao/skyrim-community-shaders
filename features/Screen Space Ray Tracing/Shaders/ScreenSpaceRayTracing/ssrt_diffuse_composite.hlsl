@@ -80,6 +80,15 @@ Texture2D<float> DepthTexture : register(t4);
 Texture2D<unorm float> ContactVisibilityTexture : register(t7);
 Texture2D<float4> SsgiAoTexture : register(t8);
 RWTexture2D<unorm float> DenoiserAoRW : register(u3);
+// (batch 36b, deviation 2) MISS_BENT: the ray march's per-frame miss direction (t9), last frame's
+// accumulation (t10, read at the motion-reprojected position) and this frame's (u4).
+Texture2D<float4> MissDirRawTexture : register(t9);
+Texture2D<float4> MissBentHistoryTexture : register(t10);
+RWTexture2D<snorm float4> MissBentRW : register(u4);
+#   ifdef SSRT_CONF_EXTERNAL_FILTER
+// The internal-filter variant declares the motion vectors at t6 for its confidence accumulator.
+Texture2D<float4> MotionVectorTexture : register(t6);
+#   endif
 #endif
 
 #ifndef SSRT_CONF_EXTERNAL_FILTER
@@ -417,6 +426,25 @@ groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
     else
     {
         b36AoOcclusion = saturate(SsgiAoTexture[dispatchID.xy].x);
+    }
+    // (batch 36b, deviation 2) Accumulate the miss bent normal over ~8 frames. It is a slowly varying
+    // geometric quantity sampled by two random rays a frame, so a plain exponential average at the
+    // motion-reprojected position is enough; a pixel without history takes this frame's value. In
+    // efficiency mode only the pixels that traced diffuse this frame have a new sample (the same
+    // checkerboard rule as the ray march); the others carry their history forward.
+    [branch] if ((CompositeFlags & SSRT_COMPOSITE_FLAG_MISS_BENT) != 0)
+    {
+        const int2 renderMax = int2(SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy) - 1;
+        const float2 bentUV = (float2(dispatchID.xy) + 0.5) * SharedData::BufferDim.zw * FrameBuffer::DynamicResolutionParams2.xy;
+        const float2 prevUV = bentUV + MotionVectorTexture[clamp(int2(dispatchID.xy), int2(0, 0), renderMax)].xy;
+        const float2 prevExtent = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.zw;
+        const bool historyOk = all(prevUV >= 0.0) && all(prevUV <= 1.0);
+        const float3 history = MissBentHistoryTexture[clamp(int2(prevUV * prevExtent), int2(0, 0), int2(prevExtent) - 1)].xyz;
+        const bool traced = CheckerboardTrace == 0 || ((dispatchID.x & 1u) == ((dispatchID.y + NRDFrameIndex) & 1u));
+        const float3 current = MissDirRawTexture[dispatchID.xy].xyz;
+        float3 bent = historyOk ? (traced ? lerp(history, current, 0.125) : history) : current;
+        bent = (b36Sky || !isFiniteSafe(bent)) ? 0.0.xxx : bent;
+        MissBentRW[dispatchID.xy] = float4(bent, 0.0);
     }
 #endif
     // (guard G9) The last gate in the chain, and the one that decides whether an SSRT

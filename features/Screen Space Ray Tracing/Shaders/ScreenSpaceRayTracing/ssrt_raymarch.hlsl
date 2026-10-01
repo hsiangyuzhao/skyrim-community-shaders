@@ -54,6 +54,15 @@ Texture2DArray<float3> stbn_vec3_2Dx1D_128x128x64 : register(t11);
 #endif
 Texture2D<float3> AlbedoTexture : register(t12);
 
+// (batch 36b, deviation 5) Image Based Lighting's SH probes at t14/t15, the slots DeferredCompositeCS
+// binds them at (IBL_DEFERRED), for the specular miss fallback that reproduces its cubemap reflection.
+// Same guard as the composite: IBL without dynamic cubemaps has nothing to scale.
+#if defined(SSRT_SPECULAR) && defined(DYNAMIC_CUBEMAPS) && defined(IBL)
+#   define SSRT_IBL 1
+#   define IBL_DEFERRED
+#   include "IBL/IBL.hlsli"
+#endif
+
 // (contact noise) Deterministic near-field occlusion for the diffuse cubemap fallback.
 //
 // WHY THE VOTE IS SUPPRESSED IN THE NEAR FIELD. The fallback's near-field darkening used to come
@@ -131,6 +140,12 @@ RWTexture2D<float> SSRTConfidenceOutput : register(u5);
 // u6, because u1..u4 belong to the SHARC buffers on the permutation that has them and u5 to the
 // confidence. Seven UAVs, against the eight a cs_5_0 dispatch may bind.
 RWTexture2D<float> SSRTDiffuseHitDistanceOutput : register(u6);
+#   if defined(SSRT_MISS_BENT)
+// (batch 36b, deviation 2) The per-frame miss bent normal: mean over this pixel's samples of
+// (1 - coverage) * ray direction, world space. u2 is free on every non-SHARC permutation. The diffuse
+// composite accumulates it over frames; DeferredCompositeCS aims the re-added ambient with it.
+RWTexture2D<snorm float4> MissDirOutput : register(u2);
+#   endif
 #endif
 
 #if SHARC_UPDATE || SHARC_RENDER
@@ -686,6 +701,10 @@ groupshared float4 samples[64][SAMPLES_PER_PIXEL];
 // 4 bytes per lane per sample: 512 bytes at the default DiffuseSPP 2, 4096 at the slider's
 // maximum of 16, on top of the 2048 / 16384 `samples` already costs.
 groupshared float hitNorms[64][SAMPLES_PER_PIXEL];
+#   if defined(SSRT_MISS_BENT)
+// (batch 36b, deviation 2) Per-sample miss direction, reduced by the same lane across the same barrier.
+groupshared float3 missDirs[64][SAMPLES_PER_PIXEL];
+#   endif
 #endif
 
 // (audit P4 / #10) `groupshared float4 weights[64][SAMPLES_PER_PIXEL]` and the
@@ -815,6 +834,99 @@ float SSRT_FallbackAoOcclusion(uint2 px, float2 uv)
         aoPx = clamp(int2(prevUV * prevExtent), int2(0, 0), int2(prevExtent) - 1);
     }
     return saturate(SsgiAoTexture[aoPx].x);
+}
+#endif
+
+#if defined(SSRT_SPECULAR) && defined(DYNAMIC_CUBEMAPS)
+// (batch 36b, deviation 5) DeferredCompositeCS's own specular cubemap reflection for this pixel --
+// what the frame shows where no traced reflection replaces it -- reproduced line for line from its
+// INTERIOR / SKYLIGHTING / plain branches (the composite picks the first by permutation, this pass by
+// SharedData::InInterior, which is the same predicate) and including its Screen Space GI specular
+// occlusion. A specular miss falls back to this instead of the ray march's raw mip-0 sample along
+// the sampled ray, so a reflection that misses looks exactly like traced reflections switched off:
+// DALC-normalised brightness, Image Based Lighting, Skylighting's specular visibility. Evaluated per
+// pixel along the mirror direction at the composite's roughness mip, i.e. already prefiltered, so it
+// adds no noise of its own. Following the upstream SSR, which hands misses to the composite; doing it
+// here instead keeps the blend with partial hits ahead of the denoiser.
+float3 SSRT_CompositeSpecularCubemap(uint2 px, float2 uv, float3 positionWS, float3 normalWS, float roughness)
+{
+    const float3 V = normalize(positionWS);
+    const float3 R = reflect(V, normalWS);
+    const float level = roughness * 7.0;
+    float directionalAmbientColorSpecular = Color::RGBToLuminance(max(0, mul(SharedData::DirectionalAmbient, float4(R, 1.0)))) * Color::ReflectionNormalisationScale;
+    float3 finalIrradiance = 0;
+    [branch] if (SharedData::InInterior)
+    {
+        float3 specularIrradiance = EnvTexture.SampleLevel(LinearSampler, R, level);
+        const float specularIrradianceLuminance = Color::RGBToLuminance(EnvTexture.SampleLevel(LinearSampler, R, 15));
+#   if defined(SSRT_IBL)
+        if (SharedData::iblSettings.EnableDiffuseIBL && SharedData::iblSettings.EnableInterior) {
+            directionalAmbientColorSpecular *= SharedData::iblSettings.DALCAmount;
+#       if defined(SKYLIGHTING)
+            const float3 iblColor = Color::Saturation(ImageBasedLighting::GetIBLColor(-R, 1.0), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
+#       else
+            const float3 iblColor = Color::Saturation(ImageBasedLighting::GetIBLColor(-R), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
+#       endif
+            directionalAmbientColorSpecular += Color::RGBToLuminance(Color::IrradianceToGamma(iblColor));
+        }
+#   endif
+        specularIrradiance = (specularIrradiance / max(specularIrradianceLuminance, 0.001)) * directionalAmbientColorSpecular;
+        finalIrradiance = Color::IrradianceToLinear(specularIrradiance);
+    }
+    else
+    {
+#   if defined(SKYLIGHTING)
+        const float3 positionMS = positionWS;
+        const sh2 specularLobe = SphericalHarmonics::FauxSpecularLobe(normalWS, -V, roughness);
+        const sh2 skylighting = Skylighting::sample(SharedData::skylightingSettings, SkylightingProbeArray, stbn_vec3_2Dx1D_128x128x64, px, positionMS, R);
+        float skylightingSpecular = saturate(SphericalHarmonics::FuncProductIntegral(skylighting, specularLobe));
+        skylightingSpecular = Skylighting::mixSpecular(SharedData::skylightingSettings, skylightingSpecular);
+#       if defined(SSRT_IBL)
+        if (SharedData::iblSettings.EnableDiffuseIBL) {
+            directionalAmbientColorSpecular *= SharedData::iblSettings.DALCAmount;
+            const float3 iblColor = Color::Saturation(ImageBasedLighting::GetIBLColor(-R, skylightingSpecular), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
+            directionalAmbientColorSpecular += Color::RGBToLuminance(Color::IrradianceToGamma(iblColor));
+        }
+#       endif
+        float3 specularIrradianceReflections = 0.0;
+        if (skylightingSpecular > 0.0) {
+            specularIrradianceReflections = EnvReflectionsTexture.SampleLevel(LinearSampler, R, level);
+            const float specularIrradianceLuminance = Color::RGBToLuminance(EnvReflectionsTexture.SampleLevel(LinearSampler, R, 15));
+            specularIrradianceReflections = (specularIrradianceReflections / max(specularIrradianceLuminance, 0.001)) * directionalAmbientColorSpecular;
+            specularIrradianceReflections = Color::IrradianceToLinear(specularIrradianceReflections);
+        }
+        float3 specularIrradiance = 0.0;
+        if (skylightingSpecular < 1.0) {
+            specularIrradiance = EnvTexture.SampleLevel(LinearSampler, R, level);
+            const float specularIrradianceLuminance = Color::RGBToLuminance(EnvTexture.SampleLevel(LinearSampler, R, 15));
+            float dalcSky = Color::IrradianceToLinear(directionalAmbientColorSpecular);
+            dalcSky *= skylightingSpecular;
+            dalcSky = Color::IrradianceToGamma(dalcSky);
+            specularIrradiance = (specularIrradiance / max(specularIrradianceLuminance, 0.001)) * dalcSky;
+            specularIrradiance = Color::IrradianceToLinear(specularIrradiance);
+        }
+        finalIrradiance = lerp(specularIrradiance, specularIrradianceReflections, skylightingSpecular);
+#   else
+#       if defined(SSRT_IBL)
+        if (SharedData::iblSettings.EnableDiffuseIBL) {
+            directionalAmbientColorSpecular *= SharedData::iblSettings.DALCAmount;
+            const float3 iblColor = Color::Saturation(ImageBasedLighting::GetIBLColor(-R), SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale;
+            directionalAmbientColorSpecular += Color::RGBToLuminance(Color::IrradianceToGamma(iblColor));
+        }
+#       endif
+        float3 specularIrradianceReflections = EnvReflectionsTexture.SampleLevel(LinearSampler, R, level);
+        const float specularIrradianceReflectionsLuminance = Color::RGBToLuminance(EnvReflectionsTexture.SampleLevel(LinearSampler, R, 15));
+        specularIrradianceReflections = (specularIrradianceReflections / max(specularIrradianceReflectionsLuminance, 0.001)) * directionalAmbientColorSpecular;
+        finalIrradiance = Color::IrradianceToLinear(specularIrradianceReflections);
+#   endif
+    }
+#   if defined(SSGI)
+    // The composite's SampleSSGISpecular: AO = 1 - texel, then Lagarde's specular occlusion with its
+    // NdotV taken against the camera-to-pixel direction, exactly as it is written there.
+    const float specAo = Color::SpecularAOLagarde(saturate(dot(normalWS, V)), 1.0 - SSRT_FallbackAoOcclusion(px, uv), roughness);
+    finalIrradiance *= specAo;
+#   endif
+    return finalIrradiance;
 }
 #endif
 
@@ -1050,6 +1162,9 @@ float SSRT_FallbackAoOcclusion(uint2 px, float2 uv)
 #if SSRT_USE_SAMPLE_LDS
     samples[SSRT_SAMPLE_SLOT][sample_id] = 0.f;
     hitNorms[SSRT_SAMPLE_SLOT][sample_id] = 1.0f;
+#   if defined(SSRT_MISS_BENT)
+    missDirs[SSRT_SAMPLE_SLOT][sample_id] = 0.0f;
+#   endif
 #else
     float4 localSample = 0.f;  // (audit P4) single sample per pixel, no LDS needed
 #endif
@@ -1162,6 +1277,13 @@ float SSRT_FallbackAoOcclusion(uint2 px, float2 uv)
             proximity = 1.0f - REBLUR_FrontEnd_GetNormHitDist(world_ray_length, nrdVisViewZ, SSRT_NRDHitDistParams(), 1.0f);
             visCoverage = saturate(confidence + (1.0f - occlusion) * OcclusionStrength) * proximity;
         }
+#   if defined(SSRT_MISS_BENT) && SSRT_USE_SAMPLE_LDS
+        // (batch 36b, deviation 2) This ray's share of the unresolved hemisphere, along its direction. The
+        // plain coverage (validated hit plus back-face evidence), i.e. what reinjection's ambientKeep is
+        // made of, before any fallback below rewrites `confidence`.
+        missDirs[SSRT_SAMPLE_SLOT][sample_id] =
+            world_space_reflected_direction * (1.0f - saturate(confidence + (1.0f - occlusion) * OcclusionStrength));
+#   endif
 #endif
         float3 sampleColor = 0;
 #if defined(SSRT_SPECULAR)
@@ -1234,6 +1356,19 @@ float SSRT_FallbackAoOcclusion(uint2 px, float2 uv)
         float ambientFillBlend = 0.0;
 #endif
 #if defined(DYNAMIC_CUBEMAPS) && !SHARC_UPDATE
+#   if defined(SSRT_SPECULAR)
+        // (batch 36b, deviation 5) The miss share takes DeferredCompositeCS's own cubemap reflection (see
+        // SSRT_CompositeSpecularCubemap) times this ray's back-face vote -- the one occlusion the
+        // composite cannot know about -- and reports confidence 1, so the regular fallback below is
+        // skipped. Same blend as that fallback; only the environment estimate changes.
+        [branch] if (UseDynamicCubemapsAsFallback != 0 && (RaymarchFlags & SSRT_RAYMARCH_FLAG_SPEC_MISS_COMPOSITE) != 0 && confidence < 0.999f)
+        {
+            const float voteAo = GetSpecularOcclusionFromAmbientOcclusion(NdotV, lerp(1.0, occlusion, OcclusionStrength), roughness);
+            const float3 compositeEnv = SSRT_CompositeSpecularCubemap(SSRT_GBUFFER_COORDS, uv, positionWS.xyz, world_space_normal, nrdFrontEndRoughness);
+            sampleColor.xyz = lerp(compositeEnv * voteAo, sampleColor.xyz, confidence);
+            confidence = 1;
+        }
+#   endif
         if (UseDynamicCubemapsAsFallback != 0 && (confidence < 0.999f))
         {
 #   if defined(SSRT_SPECULAR)            
@@ -1454,7 +1589,7 @@ float SSRT_FallbackAoOcclusion(uint2 px, float2 uv)
         // path multiplies it in: DeferredCompositeCS already shapes the re-added ambient with
         // Color::MultiBounceAO of the same SSGI AO, so doing it here as well would apply it
         // twice.
-        [branch] if (SharedData::ssrtSettings.AmbientReinjection != 0) {
+        [branch] if ((SharedData::ssrtSettings.AmbientReinjection & 1u) != 0) {  // (batch 36b) bit 0; bit 1 is deviation 2
             // (batch 36b) ProximityCoverage (efficiency mode, deviation 3): the confidence the
             // composite subtracts the ambient with is the merged denoiser's visibility, i.e. the
             // distance-attenuated coverage computed above, so the radiance has to carry the same
@@ -1672,6 +1807,15 @@ float SSRT_FallbackAoOcclusion(uint2 px, float2 uv)
         // thing that keeps the entry honest rather than displaying whatever the last SVGF frame
         // left there. hitNormMean is the value the store always carried, hoisted above.
         SSRTDiffuseHitDistanceOutput[SSRT_GBUFFER_COORDS] = hitNormMean;
+#   if defined(SSRT_MISS_BENT)
+        {
+            float3 missDirSum = 0.0f;
+            for (int m = 0; m < SAMPLES_PER_PIXEL; ++m)
+                missDirSum += missDirs[SSRT_SAMPLE_SLOT][m];
+            const float3 missDirMean = missDirSum / SAMPLES_PER_PIXEL;
+            MissDirOutput[SSRT_GBUFFER_COORDS] = float4(isFiniteSafe(missDirMean) ? missDirMean : 0.0f.xxx, 0.0f);
+        }
+#   endif
 #   if defined(SSRT_CHECKERBOARD)
         if ((RaymarchFlags & SSRT_RAYMARCH_FLAG_CHECKER_DEBUG) != 0 && all(SSRT_GBUFFER_COORDS < screen_size))
             CheckerDebugOutput[SSRT_GBUFFER_COORDS] = float4(1, 0, 0, 1);
