@@ -1022,6 +1022,76 @@ float GetSnowParameterY(float texProjTmp, float alpha)
 #		include "ExponentialHeightFog/ExponentialHeightFog.hlsli"
 #	endif
 
+#	if !(defined(LANDSCAPE) && !defined(LOD_LAND_BLEND))
+// (batch 35, B1) A line-for-line copy of the material alpha and alpha test at the end of
+// main(), so it can also run right after the base colour is sampled. a_alpha is the base
+// colour alpha, or the EMAT parallax re-sample of it; a_svPosition and a_vertexAlpha are
+// input.Position.xy and input.Color.w. The original at the end of main() is deliberately
+// left in place and unmodified.
+float ApplyMaterialAlphaAndTest(float a_alpha, float2 a_svPosition, float a_vertexAlpha)
+{
+	float alpha = a_alpha;
+#		if defined(DO_ALPHA_TEST)
+	[branch] if ((Permutation::PixelShaderDescriptor & Permutation::LightingFlags::AdditionalAlphaMask) != 0)
+	{
+		uint2 alphaMask = a_svPosition;
+		alphaMask.x = ((alphaMask.x << 2) & 12);
+		alphaMask.x = (alphaMask.y & 3) | (alphaMask.x & ~3);
+		const float maskValues[16] = {
+			0.003922,
+			0.533333,
+			0.133333,
+			0.666667,
+			0.800000,
+			0.266667,
+			0.933333,
+			0.400000,
+			0.200000,
+			0.733333,
+			0.066667,
+			0.600000,
+			0.996078,
+			0.466667,
+			0.866667,
+			0.333333,
+		};
+
+		if (MaterialData.z - maskValues[alphaMask.x] < 0) {
+			discard;
+		}
+	}
+	else
+#		endif  // defined(DO_ALPHA_TEST)
+	{
+		alpha *= MaterialData.z;
+	}
+#		if !(defined(TREE_ANIM) || defined(LODOBJECTSHD) || defined(LODOBJECTS))
+	alpha *= a_vertexAlpha;
+#		endif  // !(defined(TREE_ANIM) || defined(LODOBJECTSHD) || defined(LODOBJECTS))
+#		if defined(DO_ALPHA_TEST)
+#			if defined(DEPTH_WRITE_DECALS)
+	if (alpha - 0.0156862754 < 0) {
+		discard;
+	}
+	alpha = saturate(1.05 * alpha);
+#			endif  // DEPTH_WRITE_DECALS
+	if (alpha - AlphaTestRefRS < 0) {
+		discard;
+	}
+#		endif  // DO_ALPHA_TEST
+	return alpha;
+}
+#	endif
+
+// (batch 35, B1) Permutations that can run the alpha test early. Everything the alpha
+// depends on - baseColor.w, uvOriginal, PBRParallax, MaterialData.z, input.Color.w,
+// input.Position, AlphaTestRefRS - is final by the time the base colour has been sampled,
+// with one exception: LOD_LAND_BLEND rewrites baseColor.w afterwards, so it keeps the old
+// order. Landscape without LOD_LAND_BLEND has no alpha at all.
+#	if defined(DO_ALPHA_TEST) && !defined(LANDSCAPE) && !defined(LOD_LAND_BLEND)
+#		define B35_EARLY_ALPHA_ELIGIBLE
+#	endif
+
 PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 {
 	PS_OUTPUT psout;
@@ -1885,6 +1955,34 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				glintParameters = MultiLayerParallaxData;
 			}
 #		endif
+#	endif
+
+#	if defined(B35_EARLY_ALPHA_ELIGIBLE)
+	// (batch 35, B1) Alpha test right after the base colour is read. In batch 34 it ran at
+	// the very end of main(), so a cut-out leaf or hair pixel paid for shadows, skylighting,
+	// IBL and the whole light loop before being discarded. Every input of the alpha is final
+	// here (see B35_EARLY_ALPHA_ELIGIBLE), so this discards exactly the pixels the end of
+	// main() would. The batch 34 test there is left untouched and still runs; for a pixel
+	// that survived this one it computes the same value and passes, and it is what the
+	// output alpha comes from, so nothing downstream sees a different number. Discarded
+	// pixels keep running as helper lanes, so derivatives further down are unaffected.
+	const bool b35EarlyAlphaTest = Batch35::IsOn(Batch35::EarlyAlphaTest);
+	float b35EarlyAlpha = 0;
+	[branch] if (b35EarlyAlphaTest)
+	{
+		b35EarlyAlpha = baseColor.w;
+#		if defined(EMAT) && !defined(LANDSCAPE)
+#			if defined(PARALLAX)
+		b35EarlyAlpha = TexColorSampler.SampleBias(SampColorSampler, uvOriginal, SharedData::MipBias).w;
+#			elif defined(TRUE_PBR)
+		[branch] if (PBRParallax)
+		{
+			b35EarlyAlpha = TexColorSampler.SampleBias(SampColorSampler, uvOriginal, SharedData::MipBias).w;
+		}
+#			endif
+#		endif
+		b35EarlyAlpha = ApplyMaterialAlphaAndTest(b35EarlyAlpha, input.Position.xy, input.Color.w);
+	}
 #	endif
 
 
