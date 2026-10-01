@@ -4,6 +4,7 @@
 
 #include "Shadercache.h"
 #include "State.h"
+#include "Utils/Batch35.h"
 #include "Utils/GpuTimers.h"
 
 static constexpr uint CLUSTER_MAX_LIGHTS = 128;
@@ -193,6 +194,38 @@ RE::NiNode* GetParentRoomNode(RE::NiAVObject* object)
 	return GetParentRoomNode(object->parent);
 }
 
+RE::NiNode* LightLimitFix::GetParentRoomNodeCached(RE::NiAVObject* a_object)
+{
+	if (a_object == nullptr) {
+		return nullptr;
+	}
+
+	if (parentRoomNodeCacheFrame.IsNewFrame()) {
+		parentRoomNodeCache.clear();
+	}
+
+	// Same first step as GetParentRoomNode: the object itself may be the room or portal.
+	static const auto* roomRtti = REL::Relocation<const RE::NiRTTI*>{ RE::NiRTTI_BSMultiBoundRoom }.get();
+	static const auto* portalRtti = REL::Relocation<const RE::NiRTTI*>{ RE::NiRTTI_BSPortalSharedNode }.get();
+	const auto* rtti = a_object->GetRTTI();
+	if (rtti == roomRtti || rtti == portalRtti) {
+		return static_cast<RE::NiNode*>(a_object);
+	}
+
+	RE::NiNode* parent = a_object->parent;
+	if (parent == nullptr) {
+		return nullptr;
+	}
+
+	if (auto it = parentRoomNodeCache.find(parent); it != parentRoomNodeCache.end()) {
+		return it->second;
+	}
+
+	RE::NiNode* roomNode = GetParentRoomNode(parent);
+	parentRoomNodeCache.emplace(parent, roomNode);
+	return roomNode;
+}
+
 void LightLimitFix::BSLightingShader_SetupGeometry_Before(RE::BSRenderPass* a_pass)
 {
 	auto shaderCache = globals::shaderCache;
@@ -205,7 +238,10 @@ void LightLimitFix::BSLightingShader_SetupGeometry_Before(RE::BSRenderPass* a_pa
 
 	strictLightDataTemp.RoomIndex = -1;
 	if (!roomNodes.empty()) {
-		if (RE::NiNode* roomNode = GetParentRoomNode(a_pass->geometry)) {
+		RE::NiNode* roomNode = Batch35::IsOn(Batch35::CpuItem::LightLimitFixRoomCache) ?
+		                           GetParentRoomNodeCached(a_pass->geometry) :
+		                           GetParentRoomNode(a_pass->geometry);
+		if (roomNode) {
 			if (auto it = roomNodes.find(roomNode); it != roomNodes.cend()) {
 				strictLightDataTemp.RoomIndex = it->second;
 			}

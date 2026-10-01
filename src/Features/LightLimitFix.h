@@ -190,6 +190,13 @@ public:
 
 	eastl::hash_map<RE::NiNode*, uint8_t> roomNodes;
 
+	// (batch 35, C3) Room/portal node found above each geometry parent, remembered for the
+	// rest of the frame. Keyed on the geometry's immediate parent: every draw under the same
+	// parent walks the identical chain, and the scene graph is not re-parented mid-frame.
+	std::unordered_map<RE::NiNode*, RE::NiNode*> parentRoomNodeCache;
+	Util::FrameChecker parentRoomNodeCacheFrame;
+	RE::NiNode* GetParentRoomNodeCached(RE::NiAVObject* a_object);
+
 	struct Hooks
 	{
 		struct BSLightingShader_SetupGeometry
