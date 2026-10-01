@@ -204,4 +204,6 @@ private:
 	// Smoothed presented-frames-per-rendered-frame, fed from the DLSS-G state query
 	// already issued once per Present. 0 means "never measured".
 	float measuredPresentMultiplier = 0.0f;
+	// numFramesToGenerate the smoothed value above was accumulated under.
+	uint32_t measuredPresentMultiplierFrames = 0;
 };

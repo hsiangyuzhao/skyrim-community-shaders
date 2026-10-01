@@ -346,6 +346,14 @@ struct PerformanceOverlay : OverlayFeature
 		bool postFGIsMeasured = false;
 		// Presented frames per rendered frame actually used for the Post-FG numbers.
 		float postFGMultiplier = 0.0f;
+		// The multiplier the frame-generation backend is configured to run, as it reported it
+		// (DLSS-G: the numFramesToGenerate Streamline accepted, plus one; FSR: 2). Shown next to
+		// the measured cadence so a request that did not take -- e.g. an external unlock not
+		// loaded -- is visible as "running 2x" rather than inferred from frame rates.
+		uint appliedFGMultiplier = 0;
+		// Multiplier DLSS-G refused this session and degraded to 2x, or 0.
+		uint rejectedFGMultiplier = 0;
+		bool frameGenerationIsDLSSG = false;
 
 		// False until the first Present has established a baseline for the QPC delta.
 		bool frameClockPrimed = false;

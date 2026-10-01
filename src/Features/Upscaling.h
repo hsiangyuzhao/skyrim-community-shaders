@@ -134,6 +134,11 @@ public:
 		uint frameGenerationMode = 1;
 		uint frameGenerationBackend = static_cast<uint>(FrameGenerationBackend::kFSR3FG);
 		uint frameGenerationForceEnable = 0;
+		// DLSS-G presentation multiplier: presented frames per rendered frame (2 = one generated
+		// frame, the only mode before multi-frame generation). The saved value is a preference;
+		// what actually runs is clamped to what DLSS-G reports this session, without rewriting
+		// this, so a session that reports less does not erase the choice for the next one.
+		uint frameGenerationMultiplier = 2;
 		// Keeps generation running while a paused menu is open. Off by default because a menu
 		// is where the added input latency is most noticeable and the smoothness least useful.
 		bool frameGenerationAllowInMenus = false;
@@ -158,12 +163,25 @@ public:
 		// multiplier, so with DLSS-G running a cap of 60 renders 30 and presents 60, and the
 		// same cap in a paused menu with generation off renders and presents 60. Measured in
 		// game, against an earlier assumption here that it capped rendered frames.
+		//
+		// Multi-frame generation is expected to keep that meaning with nothing changed on this
+		// side: frameLimitUs reaches the driver's sleep mode unscaled (sl.chi setSleepMode), and
+		// the multiplier reaches the driver on a separate channel (sl.chi setReflexSyncFG, the
+		// fgMultiplier of NvAPI_D3D_SetReflexSync), so a cap of 240 at 4x should render 60 and
+		// present 240. The value is therefore never divided by the multiplier here; only the
+		// "rendered" figure shown in the UI is. Measured at 2x only; >2x is still to be confirmed.
 		uint reflexFrameLimit = 0;
 
 		NeuralRenderingSettings neuralRendering;
 	};
 
 	Settings settings;
+
+	// Bounds for Settings::frameGenerationMultiplier. 6x is the highest multiplier the shipped
+	// sl.dlss_g can be asked for (numFramesToGenerateMax is compiled in at 5); the per-session
+	// ceiling comes from Streamline and is usually lower.
+	static constexpr uint kMinFrameGenerationMultiplier = 2;
+	static constexpr uint kMaxFrameGenerationMultiplier = 6;
 
 	struct JitterCB
 	{
@@ -205,6 +223,13 @@ public:
 	float GetFrameGenerationFrameTime() const;
 	/// @brief Measured presented-frames-per-rendered-frame, or 0 when unavailable (see DX12SwapChain).
 	float GetFrameGenerationPresentMultiplier() const;
+	/// @brief The multiplier the backend is configured to run, as it reported it -- not the setting.
+	///
+	/// DLSS-G: the numFramesToGenerate Streamline last accepted, plus one. FSR 3: always 2.
+	/// Used wherever a rate has to be converted between rendered and presented frames.
+	uint GetFrameGenerationAppliedMultiplier() const;
+	/// @brief numFramesToGenerate requested by the saved multiplier (before the session ceiling).
+	uint32_t GetRequestedDLSSGFramesToGenerate() const;
 	bool IsUpscalingActive();
 
 	// Feature interface overrides
