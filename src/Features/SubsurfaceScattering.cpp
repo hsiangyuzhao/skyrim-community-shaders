@@ -29,11 +29,17 @@ void SubsurfaceScattering::DrawSettings()
 		}
 		if (settings.EnableCharacterLighting) {
 			ImGui::SliderFloat("Strength", &settings.CharacterLightingStrength, 0, 5, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Strength of Skyrim's built-in extra light on characters (multiplies the vanilla value).");
 		}
 
 		ImGui::RadioButton("Separable SSS", &settings.SSMode, 0);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Classic skin blur, tuned per colour with the profile settings below.");
 		ImGui::SameLine();
 		ImGui::RadioButton("Burley", &settings.SSMode, 1);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("More physically based skin light scattering, tuned by how far light travels into skin.");
 
 		if (settings.SSMode == 0) {
 			if (ImGui::TreeNodeEx("Base Profile", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -48,7 +54,11 @@ void SubsurfaceScattering::DrawSettings()
 				}
 
 				updateKernels = updateKernels || ImGui::ColorEdit3("Strength", (float*)&settings.BaseProfile.Strength);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("How much each colour (red, green, blue) scatters under the surface.");
 				updateKernels = updateKernels || ImGui::ColorEdit3("Falloff", (float*)&settings.BaseProfile.Falloff);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("How far each colour spreads under the surface. Higher = wider, softer glow of that colour.");
 
 				ImGui::TreePop();
 			}
@@ -65,12 +75,18 @@ void SubsurfaceScattering::DrawSettings()
 				}
 
 				updateKernels = updateKernels || ImGui::ColorEdit3("Strength", (float*)&settings.HumanProfile.Strength);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("How much each colour (red, green, blue) scatters under the surface.");
 				updateKernels = updateKernels || ImGui::ColorEdit3("Falloff", (float*)&settings.HumanProfile.Falloff);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("How far each colour spreads under the surface. Higher = wider, softer glow of that colour.");
 
 				ImGui::TreePop();
 			}
 		} else if (settings.SSMode == 1) {
 			ImGui::SliderInt("Burley Samples", (int*)&settings.BurleySamples, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Samples per pixel. Higher = smoother, less grainy skin but slower.");
 			if (ImGui::TreeNodeEx("Base Profile", ImGuiTreeNodeFlags_DefaultOpen)) {
 				ImGui::ColorEdit3("Mean Free Path Color", (float*)&settings.MeanFreePathBase);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
