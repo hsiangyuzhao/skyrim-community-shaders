@@ -671,6 +671,22 @@ float ProcessSparkleColor(float color)
 }
 #	endif
 
+#	if defined(VANILLA_FRESNEL)
+// (batch 35, B5b) Line-for-line copy of the GGX block in GetLightSpecularInput below, so the
+// switched-on path can put it behind a real branch while the batch 34 block stays as written.
+float3 GetGGXLightColorMultiplier(float3 L, float3 V, float3 N, float3 H, float HdotN, float3 F0, float roughness)
+{
+	float NdotV = saturate(dot(N, V));
+	float NdotL = saturate(dot(N, L));
+	float NdotH = saturate(dot(N, H));
+	float HdotV = saturate(dot(H, V));
+	float D = BRDF::D_GGX(roughness, HdotN);
+	float3 F = BRDF::F_Schlick(F0, HdotV);
+	float G = BRDF::Vis_SmithJointApprox(roughness, NdotV, NdotL);
+	return max(D * G * F * NdotL, 0.0) * Color::PBRLightingCompensation;
+}
+#	endif
+
 // (batch 15) a_forceVanillaLobe is an extra veto on the GGX branch below, false for every
 // material except an eye in EyeDirectSpecularMode = VanillaPhong. The GGX test itself is
 // untouched, so when the caller's flag is a compile-time false the whole term folds away and
@@ -708,7 +724,15 @@ float3 GetLightSpecularInput(PS_INPUT input, float3 L, float3 V, float3 N, float
 #	endif
 
 #	if defined(VANILLA_FRESNEL)
-	if (SharedData::vanillaFresnelSettings.Enable && SharedData::vanillaFresnelSettings.EnableGGX && !a_forceVanillaLobe) {
+	// (batch 35, B5b) The other half of the exclusivity: fxc flattens the batch 34 block
+	// below, so the GGX lobe was also evaluated (and discarded) whenever it was not in use.
+	// With the switch on, a line-for-line copy of it runs behind a real branch instead.
+	[branch] if (Batch35::IsOn(Batch35::ExclusiveSpecularLobe))
+	{
+		[branch] if (SharedData::vanillaFresnelSettings.Enable && SharedData::vanillaFresnelSettings.EnableGGX && !a_forceVanillaLobe)
+			lightColorMultiplier = GetGGXLightColorMultiplier(L, V, N, H, HdotN, F0, roughness);
+	}
+	else if (SharedData::vanillaFresnelSettings.Enable && SharedData::vanillaFresnelSettings.EnableGGX && !a_forceVanillaLobe) {
 		float NdotV = saturate(dot(N, V));
 		float NdotL = saturate(dot(N, L));
 		float NdotH = saturate(dot(N, H));
