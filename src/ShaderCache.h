@@ -533,6 +533,9 @@ namespace SIE
 		enum class GrassShaderFlags
 		{
 			AlphaTest = 0x10000,
+			// Community Shaders only, never set by the engine: selects the GRASS_OPTIMIZATIONS permutation,
+			// which Grass Optimizations binds around its own indirect draws.
+			Optimized = 0x40000000,
 		};
 
 		enum class ParticleShaderTechniques

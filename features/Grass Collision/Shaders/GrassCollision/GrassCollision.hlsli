@@ -166,4 +166,38 @@ namespace GrassCollision
 			previousDisplacement = 0.0;
 		}
 	}
+
+#ifdef GRASS_OPTIMIZATIONS
+	// Grass Optimizations draws instances that already carry their shape origin, so the caller passes
+	// camera-relative positions directly; applying World here as above would add the origin twice.
+	void GetDisplacedPositionCameraRelative(VS_INPUT input, float3 worldPosition, float3 worldPositionCentre, out float3 displacement, out float3 previousDisplacement)
+	{
+		float nearFactor = smoothstep(2048.0, 0.0, length(worldPosition));
+
+		if (input.Color.w > 0.0 && nearFactor > 0.0) {
+			// Limit stretching
+			float3 remappedWorldPosition = lerp(worldPosition, worldPositionCentre, float3(0.95, 0.95, 0.0));
+
+			float distanceFromCenter = length(worldPosition - worldPositionCentre) + 0.01;
+			float maximumDepth = worldPosition.z - worldPositionCentre.z;
+
+			// Return base collision
+			float3 collision, previousCollision;
+			ComputeCollision(remappedWorldPosition, maximumDepth, distanceFromCenter, CELL_SIZE, collision, previousCollision);
+
+			// Do not let collision move upwards
+			collision.z = -abs(collision.z);
+			previousCollision.z = -abs(previousCollision.z);
+
+			// Scale grass by wind amount (detect rocks and bottom of some grass)
+			float alpha = saturate(input.Color.w * 10.0);
+
+			displacement = collision * alpha * nearFactor * 0.75;
+			previousDisplacement = previousCollision * alpha * nearFactor * 0.75;
+		} else {
+			displacement = 0.0;
+			previousDisplacement = 0.0;
+		}
+	}
+#endif  // GRASS_OPTIMIZATIONS
 }

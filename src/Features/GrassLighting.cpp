@@ -1,12 +1,16 @@
 #include "GrassLighting.h"
 
+#include "GrassOptimizations.h"
+
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	GrassLighting::Settings,
 	Glossiness,
 	SpecularStrength,
 	SubsurfaceScatteringAmount,
 	OverrideComplexGrassSettings,
-	BasicGrassBrightness)
+	BasicGrassBrightness,
+	MidLODBrightness,
+	FarLODBrightness)
 
 void GrassLighting::DrawSettings()
 {
@@ -58,6 +62,26 @@ void GrassLighting::DrawSettings()
 		ImGui::SliderFloat("Brightness", &settings.BasicGrassBrightness, 0.0f, 1.0f);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Darkens the grass textures to look better with the new lighting");
+		}
+
+		if (globals::features::grassOptimizations.loaded) {
+			ImGui::Spacing();
+			ImGui::TextWrapped("Middle LOD Grass");
+			ImGui::PushID("midlod");
+			ImGui::SliderFloat("Brightness", &settings.MidLODBrightness, 0.0f, 2.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Raise or lower until middle-distance LOD grass matches the full-detail grass around it. Requires Grass Optimizations with Mesh LOD and Middle LOD enabled.");
+			}
+			ImGui::PopID();
+
+			ImGui::Spacing();
+			ImGui::TextWrapped("Far LOD Grass");
+			ImGui::PushID("farlod");
+			ImGui::SliderFloat("Brightness", &settings.FarLODBrightness, 0.0f, 2.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Raise or lower until the most distant LOD grass matches the middle LOD grass in front of it. Requires Grass Optimizations with Mesh LOD and Far LOD enabled.");
+			}
+			ImGui::PopID();
 		}
 
 		ImGui::TreePop();

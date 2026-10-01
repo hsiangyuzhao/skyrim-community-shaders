@@ -119,6 +119,11 @@ namespace Util
 				"GPU time for the dynamic cubemap update. The feature runs one of capture,\n"
 				"inferrence or irradiance convolution per frame in a round-robin, so this row is\n"
 				"the smoothed per-frame cost across the cycle rather than one pass." },
+			{ "Grass Optimizations",
+				"GPU time Grass Optimizations adds before grass is drawn: uploads of newly loaded\n"
+				"grass cells, the Hi-Z occlusion pyramid and the per-instance culling dispatches.\n"
+				"With the optimized path off only the cell uploads remain, so it should read ~0.\n"
+				"The grass draws themselves are engine work and are not part of this row." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
@@ -715,6 +720,10 @@ namespace Util
 				"every Community Shaders shader reads. Runs up to three times per frame." },
 			{ "TruePBR", "TruePBR",
 				"CPU time spent in the TruePBR prepass." },
+			{ "GrassOptimizations", "Grass Optimizations",
+				"CPU time spent in Grass Optimizations' once-per-frame update: folding newly loaded\n"
+				"grass cells into buckets, the per-bucket CPU slice cull and issuing the culling\n"
+				"dispatches. The indirect grass draws themselves stay in the Grass row above." },
 		};
 
 		const CpuBucketDoc* FindCpuDoc(std::string_view a_key)

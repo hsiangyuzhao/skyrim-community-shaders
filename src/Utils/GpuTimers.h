@@ -46,6 +46,7 @@ namespace Util
 		LightLimitFix,           // cluster building + light culling
 		VolumetricLighting,      // generate + raymarch + both blur passes
 		DynamicCubemaps,         // capture / inferrence / irradiance convolution round-robin
+		GrassOptimizations,      // grass cell uploads + Hi-Z pyramid + per-instance cull dispatches
 		Count
 	};
 

@@ -6,6 +6,7 @@
 #include "State.h"
 
 #include "Features/DynamicCubemaps.h"
+#include "Features/GrassOptimizations.h"
 
 namespace SIE
 {
@@ -227,6 +228,12 @@ namespace SIE
 				if (feature->loaded && feature->HasShaderDefine(RE::BSShader::Type::Grass)) {
 					defines[lastIndex++] = { feature->GetShaderDefineName().data(), nullptr };
 				}
+			}
+
+			// Selected per draw by Grass Optimizations; the engine never sets this bit, so the
+			// regular permutations compile exactly as without the feature.
+			if ((descriptor & static_cast<uint32_t>(ShaderCache::GrassShaderFlags::Optimized)) && globals::features::grassOptimizations.loaded) {
+				defines[lastIndex++] = { globals::features::grassOptimizations.GetShaderDefineName().data(), nullptr };
 			}
 
 			defines[lastIndex] = { nullptr, nullptr };

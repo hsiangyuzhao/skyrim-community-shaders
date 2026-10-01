@@ -35,7 +35,10 @@ public:
 		float SubsurfaceScatteringAmount = 0.5f;
 		uint OverrideComplexGrassSettings = false;
 		float BasicGrassBrightness = 1.0f;
-		uint pad[3];
+		// Only consumed by the GRASS_OPTIMIZATIONS permutation, for grass drawn with an LOD mesh.
+		float MidLODBrightness = 1.0f;
+		float FarLODBrightness = 1.0f;
+		uint pad0 = 0;
 	};
 	STATIC_ASSERT_ALIGNAS_16(Settings);
 

@@ -5,6 +5,7 @@ struct DynamicCubemaps;
 struct ExtendedMaterials;
 struct GrassCollision;
 struct GrassLighting;
+struct GrassOptimizations;
 struct HairSpecular;
 struct IBL;
 struct LightLimitFix;
@@ -65,6 +66,7 @@ namespace globals
 		extern ExtendedMaterials extendedMaterials;
 		extern GrassCollision grassCollision;
 		extern GrassLighting grassLighting;
+		extern GrassOptimizations grassOptimizations;
 		extern HairSpecular hairSpecular;
 		extern IBL ibl;
 		extern LightLimitFix lightLimitFix;
@@ -250,6 +252,7 @@ namespace globals
 		extern REL::Relocation<const RE::NiRTTI*> NiParticleSystemRTTI;
 		extern REL::Relocation<const RE::NiRTTI*> NiBillboardNodeRTTI;
 		extern REL::Relocation<const RE::NiRTTI*> NiAlphaPropertyRTTI;
+		extern REL::Relocation<const RE::NiRTTI*> BSGrassShaderPropertyRTTI;
 	}
 
 	extern State* state;

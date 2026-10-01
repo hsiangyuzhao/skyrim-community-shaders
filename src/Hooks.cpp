@@ -11,6 +11,7 @@
 #include "Util.h"
 #include "Utils/GpuTimers.h"
 
+#include "Features/GrassOptimizations.h"
 #include "Features/InteriorSun.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LODBlending.h"
@@ -95,6 +96,8 @@ struct BSShader_LoadShaders
 				auto pixelShaderDescriptor = entry->id;
 				state->ModifyShaderLookup(*shader, vertexShaderDesriptor, pixelShaderDescriptor);
 				shaderCache->GetVertexShader(*shader, vertexShaderDesriptor);
+				if (shader->shaderType.get() == RE::BSShader::Type::Grass && globals::features::grassOptimizations.loaded)
+					shaderCache->GetVertexShader(*shader, vertexShaderDesriptor | static_cast<uint32_t>(SIE::ShaderCache::GrassShaderFlags::Optimized));
 			}
 			for (const auto& entry : shader->pixelShaders) {
 				if (entry->shader && shaderCache->IsDump()) {
@@ -107,6 +110,8 @@ struct BSShader_LoadShaders
 				shaderCache->GetPixelShader(*shader, pixelShaderDescriptor);
 				state->ModifyShaderLookup(*shader, vertexShaderDesriptor, pixelShaderDescriptor, true);
 				shaderCache->GetPixelShader(*shader, pixelShaderDescriptor);
+				if (shader->shaderType.get() == RE::BSShader::Type::Grass && globals::features::grassOptimizations.loaded)
+					shaderCache->GetPixelShader(*shader, pixelShaderDescriptor | static_cast<uint32_t>(SIE::ShaderCache::GrassShaderFlags::Optimized));
 			}
 		}
 		BSShaderHooks::hk_LoadShaders((REX::BSShader*)shader, stream);

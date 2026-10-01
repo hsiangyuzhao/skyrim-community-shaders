@@ -54,6 +54,11 @@ struct VS_OUTPUT
 	float4 WorldPosition : POSITION1;
 	float4 PreviousWorldPosition : POSITION2;
 	float4 VertexNormal : POSITION4;
+#	if defined(GRASS_OPTIMIZATIONS) && !defined(RENDER_DEPTH)
+	// Grass Optimizations: per-instance simple-shading flag and mesh-LOD tier (0 full, 1 middle, 2 far).
+	nointerpolation float IsFar : TEXCOORD9;
+	nointerpolation float LodTier : TEXCOORD10;
+#	endif
 #	ifdef VR
 	float ClipDistance : SV_ClipDistance0;
 	float CullDistance : SV_CullDistance0;
@@ -73,6 +78,11 @@ struct VS_OUTPUT
 #	endif  // RENDER_DEPTH
 	float4 WorldPosition : POSITION1;
 	float4 PreviousWorldPosition : POSITION2;
+#	if defined(GRASS_OPTIMIZATIONS) && !defined(RENDER_DEPTH)
+	// Grass Optimizations: per-instance simple-shading flag and mesh-LOD tier (0 full, 1 middle, 2 far).
+	nointerpolation float IsFar : TEXCOORD9;
+	nointerpolation float LodTier : TEXCOORD10;
+#	endif
 #	ifdef VR
 	float ClipDistance : SV_ClipDistance0;
 	float CullDistance : SV_CullDistance0;
@@ -140,6 +150,12 @@ cbuffer cb8 : register(b8)
 	float4 cb8[240];
 }
 
+#	ifdef GRASS_OPTIMIZATIONS
+// Written by GrassCullingCS for every surviving instance, two entries each:
+// [0] = shape origin.xyz + unused, [1] = wind now, wind previous frame, fade, packed flags.
+StructuredBuffer<float4> InstanceExtras : register(t2);
+#	endif  // GRASS_OPTIMIZATIONS
+
 // Calculate wind displacement for a grass vertex
 float3 CalculateWindDisplacement(VS_INPUT input, float windTimer)
 {
@@ -183,7 +199,91 @@ float4 GetMSPosition(VS_INPUT input)
 	return msPosition;
 }
 
-#	ifdef GRASS_LIGHTING
+#	if defined(GRASS_OPTIMIZATIONS)
+// Grass Optimizations: one instanced indirect draw covers every surviving instance of a grass type,
+// so the per-shape World matrices and the per-group fade buffer do not apply. Instances are placed
+// with their shape origin from InstanceExtras and projected with the camera directly; the outputs
+// match the regular path below so the pixel shader is shared.
+VS_OUTPUT main(VS_INPUT input, uint instanceID : SV_InstanceID)
+{
+	VS_OUTPUT vsout = (VS_OUTPUT)0;
+
+	const float4 e0 = InstanceExtras[instanceID * 2 + 0];
+	const float4 e1 = InstanceExtras[instanceID * 2 + 1];
+
+	// e1.w packs 4.0 per LOD tier, 2.0 = simple shading and 1.0 = in collision range.
+	const float lodTier = floor(e1.w * 0.25);
+	const float packedFlags = e1.w - 4.0 * lodTier;
+	const float isFarFlag = (packedFlags >= 2.0) ? 1.0 : 0.0;
+	const float collisionFlag = packedFlags - 2.0 * isFarFlag;
+
+#		ifdef GRASS_LIGHTING
+	float3x3 world3x3 = float3x3(input.InstanceData2.xyz, input.InstanceData3.xyz, float3(input.InstanceData4.x, input.InstanceData2.w, input.InstanceData3.w));
+	float4 msPosition = GetMSPosition(input, world3x3);
+#		else
+	float4 msPosition = GetMSPosition(input);
+#		endif
+	msPosition.xyz += e0.xyz;
+
+	float4 previousMsPosition = msPosition;
+
+#		ifdef GRASS_COLLISION
+	[branch] if (collisionFlag > 0.5)
+	{
+		// Instances already carry their shape origin, so World must not be applied a second time.
+		const float3 collisionPos = msPosition.xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+		const float3 collisionCentre = input.InstanceData1.xyz + e0.xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+		float3 displacement, previousDisplacement;
+		GrassCollision::GetDisplacedPositionCameraRelative(input, collisionPos, collisionCentre, displacement, previousDisplacement);
+		msPosition.xyz += displacement;
+		previousMsPosition.xyz += previousDisplacement;
+	}
+#		endif  // GRASS_COLLISION
+
+	// The per-instance wind terms come from the cull pass; only the per-vertex weight is applied here.
+	const float vertexTerm = WindVector.z * (0.5 * (input.Color.w * input.Color.w));
+	msPosition.xyz += float3(WindVector.xy, 0) * (e1.x * vertexTerm);
+	previousMsPosition.xyz += float3(WindVector.xy, 0) * (e1.y * vertexTerm);
+
+	const float3 eyeRelative = msPosition.xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+	const float4 projSpacePosition = mul(FrameBuffer::CameraViewProj[0], float4(eyeRelative, 1.0));
+	vsout.HPosition = projSpacePosition;
+
+#		if defined(RENDER_DEPTH)
+	vsout.Depth = projSpacePosition.zw;
+#		endif  // RENDER_DEPTH
+
+	// Note: input.Color.w is used for wind speed
+	vsout.VertexColor.xyz = input.Color.xyz;
+	vsout.VertexColor.w = e1.z;
+	vsout.VertexMult = input.InstanceData1.w;
+
+	vsout.TexCoord.xy = input.TexCoord.xy;
+	vsout.TexCoord.z = FogNearColor.w;
+
+#		ifndef GRASS_LIGHTING
+	vsout.AmbientColor.xyz = input.InstanceData1.www * (AmbientColor.xyz * input.Color.xyz);
+	vsout.AmbientColor.w = ShadowClampValue;
+#		endif
+
+	vsout.ViewSpacePosition = mul(FrameBuffer::CameraView[0], float4(eyeRelative, 1.0)).xyz;
+	vsout.WorldPosition = float4(eyeRelative, 1.0);
+	vsout.PreviousWorldPosition = float4(previousMsPosition.xyz - FrameBuffer::CameraPreviousPosAdjust[0].xyz, 1.0);
+
+#		ifdef GRASS_LIGHTING
+	// Vertex normal needs to be transformed to world-space for lighting calculations.
+	vsout.VertexNormal.xyz = mul(world3x3, input.Normal.xyz * 2.0 - 1.0);
+	vsout.VertexNormal.w = input.Color.w;
+#		endif
+
+#		if !defined(RENDER_DEPTH)
+	vsout.IsFar = isFarFlag;
+	vsout.LodTier = lodTier;
+#		endif
+
+	return vsout;
+}
+#	elif defined(GRASS_LIGHTING)
 VS_OUTPUT main(VS_INPUT input)
 {
 	VS_OUTPUT vsout;
@@ -510,7 +610,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	psout.PS.w = diffuseAlpha;
 #		else
 #			if !defined(TRUE_PBR)
+#				if defined(GRASS_OPTIMIZATIONS)
+	// Simple shading (Grass Optimizations): small distant instances keep the complex atlas layout
+	// for their colour but skip its normal map and specular half.
+	const bool complexDetail = complex && input.IsFar <= 0.5;
+	float4 specColor = complexDetail ? TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, 0.5 + input.TexCoord.y * 0.5), SharedData::MipBias) : 1;
+#				else
 	float4 specColor = complex ? TexBaseSampler.SampleBias(SampBaseSampler, float2(input.TexCoord.x, 0.5 + input.TexCoord.y * 0.5), SharedData::MipBias) : 1;
+#				endif
 #			else
 	float4 specColor = TexNormalSampler.SampleBias(SampNormalSampler, input.TexCoord.xy, SharedData::MipBias);
 #			endif
@@ -537,7 +644,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3x3 tbn = 0;
 
 #			if !defined(TRUE_PBR)
+#				if defined(GRASS_OPTIMIZATIONS)
+	if (complexDetail)
+#				else
 	if (complex)
+#				endif
 #			endif  // !TRUE_PBR
 	{
 		float3 normalColor = GrassLighting::TransformNormal(specColor.xyz);
@@ -551,6 +662,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (!complex || SharedData::grassLightingSettings.OverrideComplexGrassSettings)
 		baseColor.xyz *= SharedData::grassLightingSettings.BasicGrassBrightness;
 #			endif  // !TRUE_PBR
+
+#			if defined(GRASS_OPTIMIZATIONS)
+	// Mesh LOD (Grass Optimizations): per-band brightness to match LOD meshes to the full-detail grass.
+	const float lodBrightness = input.LodTier > 1.5 ? SharedData::grassLightingSettings.FarLODBrightness : SharedData::grassLightingSettings.MidLODBrightness;
+	baseColor.xyz *= lerp(1.0, lodBrightness, saturate(input.LodTier));
+#			endif
 
 #			if defined(VANILLA_FRESNEL)
 	const bool enableVanillaFresnel = SharedData::vanillaFresnelSettings.Enable;
@@ -605,6 +722,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	if (dirShadow > 0.0 && !SharedData::InInterior) {
 #			if defined(SCREEN_SPACE_SHADOWS)
+#				if defined(GRASS_OPTIMIZATIONS)
+		// Simple shading (Grass Optimizations) skips contact shadows.
+		if (input.IsFar <= 0.5)
+#				endif
 		dirDetailShadow = ScreenSpaceShadows::GetScreenSpaceShadow(input.HPosition.xyz, screenUV, screenNoise, eyeIndex);
 #			endif  // SCREEN_SPACE_SHADOWS
 
@@ -656,7 +777,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 subsurfaceColor = lerp(dot(albedo, 1.0 / 3.0), albedo, 2.0) * saturate(input.VertexNormal.w * 10.0);
 	float3 sss = dirLightColor * saturate(-dirLightAngle) * Color::GrassDiffuseMult();
 
+#				if defined(GRASS_OPTIMIZATIONS)
+	if (complexDetail)
+#				else
 	if (complex)
+#				endif
 		lightsSpecularColor += GrassLighting::GetLightSpecularInput(SharedData::DirLightDirection.xyz, viewDirection, normal, dirLightColor, roughness, F0) * Color::GrassSpecularMult();
 #			endif
 
@@ -721,7 +846,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 				lightsDiffuseColor += lightDiffuseColor * Color::GrassDiffuseMult();
 
+#					if defined(GRASS_OPTIMIZATIONS)
+				if (complexDetail)
+#					else
 				if (complex)
+#					endif
 					lightsSpecularColor += GrassLighting::GetLightSpecularInput(normalizedLightDirection, viewDirection, normal, lightColor, roughness, F0) * Color::GrassSpecularMult();
 #				endif
 			}
@@ -896,6 +1025,12 @@ PS_OUTPUT main(PS_INPUT input)
 	psout.PS.w = diffuseAlpha;
 #		else
 
+#			if defined(GRASS_OPTIMIZATIONS)
+	// Mesh LOD (Grass Optimizations): per-band brightness to match LOD meshes to the full-detail grass.
+	const float lodBrightness = input.LodTier > 1.5 ? SharedData::grassLightingSettings.FarLODBrightness : SharedData::grassLightingSettings.MidLODBrightness;
+	baseColor.xyz *= lerp(1.0, lodBrightness, saturate(input.LodTier));
+#			endif
+
 	uint eyeIndex = Stereo::GetEyeIndexPS(input.HPosition, VPOSOffset);
 
 	float3 viewPosition = mul(FrameBuffer::CameraView[eyeIndex], float4(input.WorldPosition.xyz, 1)).xyz;
@@ -909,6 +1044,10 @@ PS_OUTPUT main(PS_INPUT input)
 
 	if (dirShadow > 0.0 && !SharedData::InInterior) {
 #			if defined(SCREEN_SPACE_SHADOWS)
+#				if defined(GRASS_OPTIMIZATIONS)
+		// Simple shading (Grass Optimizations) skips contact shadows.
+		if (input.IsFar <= 0.5)
+#				endif
 		dirDetailShadow = ScreenSpaceShadows::GetScreenSpaceShadow(input.HPosition.xyz, screenUV, screenNoise, eyeIndex);
 #			endif  // SCREEN_SPACE_SHADOWS
 
