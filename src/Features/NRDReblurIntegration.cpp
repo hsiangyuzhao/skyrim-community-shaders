@@ -3,6 +3,7 @@
 #include "Globals.h"
 #include "Utils/D3D.h"
 
+#include <array>
 #include <d3dcompiler.h>
 
 namespace
@@ -54,6 +55,11 @@ namespace
 		DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
 	};
 	static_assert(ARRAYSIZE(kNRDFormatTable) == static_cast<uint32_t>(nrd::Format::MAX_NUM));
+
+	// (batch 36) Per-range staging capacity for Dispatch's binding loop. 32 covers the widest
+	// REBLUR range with room to spare (the largest, TemporalAccumulation's SRV range, is under
+	// 20) and stays under both D3D11 limits (128 SRV slots, 64 UAV slots on 11.1).
+	constexpr uint32_t kMaxRangeDescriptors = 32;
 }
 
 DXGI_FORMAT NRDReblurIntegration::NRDFormatToDXGI(nrd::Format fmt)
@@ -244,6 +250,12 @@ bool NRDReblurIntegration::Dispatch()
 			bool missing = false;
 			for (uint32_t ri = 0; ri < validatePipeline.resourceRangesNum && !missing; ri++) {
 				const auto& range = validatePipeline.resourceRanges[ri];
+				// (batch 36) The binding loop below stages each range in a fixed-size array; a
+				// range wider than that cannot be represented and is treated like a hole.
+				if (range.descriptorsNum > kMaxRangeDescriptors) {
+					missing = true;
+					break;
+				}
 				for (uint32_t k = 0; k < range.descriptorsNum; k++, validateIdx++) {
 					if (range.descriptorType == nrd::DescriptorType::STORAGE_TEXTURE &&
 						!ResolveResource(dispatch.resources[validateIdx])) {
@@ -287,26 +299,34 @@ bool NRDReblurIntegration::Dispatch()
 		uint32_t srvSlot = instanceDesc.resourcesBaseRegisterIndex;
 		uint32_t uavSlot = instanceDesc.resourcesBaseRegisterIndex;
 
+		// (batch 36) Fixed-size scratch instead of one eastl::vector per range. Every REBLUR
+		// pipeline has exactly two ranges (InstanceImpl.cpp), so the old code made two heap
+		// allocations per dispatch -- 24 a frame with both chains on REBLUR -- for arrays that
+		// never hold more than a couple of dozen pointers. Same views, same slots, same calls:
+		// only where the temporary array lives changed. A range wider than kMaxRangeDescriptors
+		// is rejected by the validation block above, before anything is bound, through the
+		// existing S1.2 failure path rather than by truncating the binding.
+		std::array<ID3D11ShaderResourceView*, kMaxRangeDescriptors> srvScratch;
+		std::array<ID3D11UnorderedAccessView*, kMaxRangeDescriptors> uavScratch;
+
 		for (uint32_t ri = 0; ri < pipeline.resourceRangesNum; ri++) {
 			const auto& range = pipeline.resourceRanges[ri];
 
 			if (range.descriptorType == nrd::DescriptorType::TEXTURE) {
 				// SRVs
-				eastl::vector<ID3D11ShaderResourceView*> srvs(range.descriptorsNum, nullptr);
 				for (uint32_t k = 0; k < range.descriptorsNum; k++, resIdx++) {
 					auto* view = ResolveResource(dispatch.resources[resIdx]);
-					srvs[k] = static_cast<ID3D11ShaderResourceView*>(view);
+					srvScratch[k] = static_cast<ID3D11ShaderResourceView*>(view);
 				}
-				context->CSSetShaderResources(srvSlot, range.descriptorsNum, srvs.data());
+				context->CSSetShaderResources(srvSlot, range.descriptorsNum, srvScratch.data());
 				srvSlot += range.descriptorsNum;
 			} else {
 				// UAVs
-				eastl::vector<ID3D11UnorderedAccessView*> uavs(range.descriptorsNum, nullptr);
 				for (uint32_t k = 0; k < range.descriptorsNum; k++, resIdx++) {
 					auto* view = ResolveResource(dispatch.resources[resIdx]);
-					uavs[k] = static_cast<ID3D11UnorderedAccessView*>(view);
+					uavScratch[k] = static_cast<ID3D11UnorderedAccessView*>(view);
 				}
-				context->CSSetUnorderedAccessViews(uavSlot, range.descriptorsNum, uavs.data(), nullptr);
+				context->CSSetUnorderedAccessViews(uavSlot, range.descriptorsNum, uavScratch.data(), nullptr);
 				uavSlot += range.descriptorsNum;
 			}
 		}
