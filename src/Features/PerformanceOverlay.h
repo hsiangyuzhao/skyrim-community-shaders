@@ -278,6 +278,8 @@ struct PerformanceOverlay : OverlayFeature
 	void DrawDrawCallsTable(const std::vector<DrawCallRow>& mainRows, const std::vector<DrawCallRow>& summaryRows);
 	void DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRows);
 	void DrawOurCpuPassTable(const std::vector<DrawCallRow>& ourCpuRows);
+	/// @brief (batch 35, M1) GPU time of the engine's opaque geometry and shadow map passes.
+	void DrawEngineGpuSpans();
 	/// @brief CPU / GPU bottleneck readout drawn above the tables.
 	void DrawBottleneckSummary();
 	DrawCallLegends BuildDrawCallLegends(const Menu::ThemeSettings& theme, bool anyTestData) const;

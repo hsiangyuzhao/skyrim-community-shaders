@@ -453,6 +453,10 @@ void Deferred::StartDeferred()
 	PrepassPasses();
 
 	OverrideBlendStates();
+
+	// (batch 35, M1) Everything the GPU does from here until EndDeferred is the engine's
+	// opaque pass, i.e. the Lighting draws, plus the few passes of ours nested inside it.
+	Util::GpuSpanTimers::GetSingleton()->Begin(Util::GpuSpan::GeometryOpaque);
 }
 
 void Deferred::DeferredPasses()
@@ -643,6 +647,10 @@ void Deferred::DeferredPasses()
 
 void Deferred::EndDeferred()
 {
+	// (batch 35, M1) Closed before the early returns so the span opened in StartDeferred
+	// always gets its end marker; a no-op if that Begin was suppressed.
+	Util::GpuSpanTimers::GetSingleton()->End(Util::GpuSpan::GeometryOpaque);
+
 	if (!globals::state->inWorld)
 		return;
 
@@ -837,7 +845,11 @@ ID3D11ComputeShader* Deferred::GetComputeMainCompositeInterior()
 
 void Deferred::Hooks::Main_RenderShadowMaps::thunk()
 {
+	// (batch 35, M1) The engine's shadow map pass, timed on the GPU.
+	auto* spanTimers = Util::GpuSpanTimers::GetSingleton();
+	spanTimers->Begin(Util::GpuSpan::ShadowMaps);
 	func();
+	spanTimers->End(Util::GpuSpan::ShadowMaps);
 	globals::deferred->EarlyPrepasses();
 };
 
