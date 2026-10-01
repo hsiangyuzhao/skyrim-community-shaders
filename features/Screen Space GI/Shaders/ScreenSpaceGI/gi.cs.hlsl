@@ -43,6 +43,20 @@
 #	include "Skylighting/Skylighting.hlsli"
 #endif
 
+// (batch 36) SSGI_AO_ONLY: the permutation ScreenSpaceGI runs while Screen Space Ray Tracing's
+// diffuse supplies the indirect light (Settings::SkipILUnderSSRTDiffuse). DeferredCompositeCS
+// then reads only the AO channel of this feature, so everything else this pass produces -- IL,
+// its temporal EMA, the bent normal and the directional-environment irradiance -- is not computed
+// and not written. The AO bitmask, its quadrature, its depth fade and its temporal EMA are
+// outside every guard below, so the AO this permutation writes is the AO the full one writes.
+// Without the define every line of this file compiles exactly as before.
+#if defined(SSGI_AO_ONLY) && (defined(GI) || defined(GI_SPECULAR))
+#	error "SSGI_AO_ONLY is the IL-free permutation and cannot be combined with GI or GI_SPECULAR."
+#endif
+#if defined(DYNAMIC_CUBEMAPS) && !defined(SSGI_AO_ONLY)
+#	define SSGI_ENV_IRRADIANCE
+#endif
+
 #define RCP_PI (0.31830988618)
 
 Texture2D<float> srcWorkingDepth : register(t0);
@@ -385,7 +399,7 @@ void CalculateGI(
 	if (dot(viewVec, pixCenterPos) > 0)
 		viewspaceNormal = -viewspaceNormal;
 
-#ifdef DYNAMIC_CUBEMAPS
+#ifdef SSGI_ENV_IRRADIANCE
 	// (directional env v2) Whether the environment integration runs at all. Both gates are
 	// runtime cbuffer reads, so toggling either feature needs no SSGI recompile:
 	//  * EnableDirectionalEnv is pre-multiplied on the C++ side with "SSGI loaded and enabled";
@@ -574,8 +588,10 @@ void CalculateGI(
 				// range, not the IL range. ComputeOccludedBitfield rather than the open-coded shift
 				// because a sample can legitimately claim the full 32-bit span, where the shift is
 				// undefined; the returned newly-covered bits are not needed here, only the union.
+#ifndef SSGI_AO_ONLY
 				[branch] if (s < AORadius)
 					ComputeOccludedBitfield(angleRangeLinNorm.x, angleRangeLinNorm.y, bitmaskBent);
+#endif
 
 #ifdef GI
 				// IL shares the AO thickness now; the separate 300-unit GI thickness is gone.
@@ -680,6 +696,8 @@ void CalculateGI(
 		// to the mass and 1 to the moment's normal component. requireSourceFacing is false: there
 		// is no source surface here, the "sample" is the open environment beyond the horizon, so
 		// every unoccluded bin counts. The unused cosine-measure output is dead and folded away.
+		// (batch 36) Not in SSGI_AO_ONLY, whose output set has no bent normal.
+#ifndef SSGI_AO_ONLY
 		{
 			float bentWeight, bentCosineUnused;
 			float3 bentMoment;
@@ -692,8 +710,9 @@ void CalculateGI(
 			bentWeightSum += bentWeight;
 			bentMomentVS += bentMoment;
 		}
+#endif
 
-#ifdef DYNAMIC_CUBEMAPS
+#ifdef SSGI_ENV_IRRADIANCE
 		// (directional env v2) Environment radiance over the same unoccluded bins, run-length
 		// swept in segments of at most SSGI_ENV_SEG_BITS. Each segment takes one reference-grade
 		// environment lookup (see DirEnvSampleEnvironment) at the segment's mean direction and
@@ -775,6 +794,11 @@ void CalculateGI(
 	// hemisphere and rises towards 1 as the opening narrows to a single direction, so
 	// 2 * (1 - ratio) maps it onto [0 = pinhole, 1 = open hemisphere]. Scale-invariant in
 	// NumSlices by construction, so slice count changes quality, not meaning.
+#ifdef SSGI_AO_ONLY
+	// (batch 36) No bent normal in this permutation; main() does not write the output either.
+	o_bentNormalWS = ViewToWorldVector(viewspaceNormal, FrameBuffer::CameraViewInverse[eyeIndex]);
+	o_bentAperture = 1.0;
+#else
 	float3 bentNormalVS = viewspaceNormal;
 	float bentAperture = 0.0;
 	{
@@ -795,6 +819,7 @@ void CalculateGI(
 
 	o_bentNormalWS = ViewToWorldVector(bentNormalVS, FrameBuffer::CameraViewInverse[eyeIndex]);
 	o_bentAperture = bentAperture;
+#endif
 
 	// (directional env v2) Hemisphere environment irradiance, PREMULTIPLIED by the confidence
 	// stored in A. rcpNumSlices is the whole normalisation, for the same reason as radianceY:
@@ -809,7 +834,7 @@ void CalculateGI(
 	// filter -- reprojection taps, blur and upsample all blend RGB and A with the same weights,
 	// which is only meaningful when RGB already carries its own coverage.
 	o_envIrradiance = 0;
-#ifdef DYNAMIC_CUBEMAPS
+#ifdef SSGI_ENV_IRRADIANCE
 	{
 		float envConfidence = envActive ? (1.0 - depthFade) : 0.0;
 		o_envIrradiance = float4(envIrradiance * rcpNumSlices * envConfidence, envConfidence);
@@ -927,9 +952,11 @@ void CalculateGI(
 		// old shared behaviour back.
 		const float lerpFactorAo = rcp(min(accumFrames, (float)MaxAccumFramesAO));
 		currAo = lerp(srcPrevAo[pxCoord], currAo, lerpFactorAo);
+#	ifndef SSGI_AO_ONLY
 		currY = lerp(srcPrevY[pxCoord], currY, lerpFactor);
 		currCoCg = lerp(srcPrevCoCg[pxCoord], currCoCg, lerpFactor);
-#	ifdef DYNAMIC_CUBEMAPS
+#	endif
+#	ifdef SSGI_ENV_IRRADIANCE
 		// (directional env v2) Radiance data on the IL chain, so it shares the IL channels'
 		// FULL temporal window (lerpFactor), not the AO/bent-normal shortened one: like Y/CoCg
 		// it is spatially filtered afterwards and additively consumed, so the long window
@@ -945,6 +972,7 @@ void CalculateGI(
 		// stale direction lags as a visible colour trail under the full IL window. On a
 		// disocclusion accumFrames is 1, lerpFactorAo is 1, and the history term - whatever a
 		// cleared or unwritten texel decodes to - vanishes entirely.
+#	ifndef SSGI_AO_ONLY
 		float3 prevBentDir;
 		float prevBentAperture;
 		SSGI_DecodeBentNormal(srcPrevBentNormal[pxCoord], prevBentDir, prevBentAperture);
@@ -953,6 +981,7 @@ void CalculateGI(
 		[flatten] if (bentBlendLen > 1e-4)
 			bentNormalWS = bentBlend / bentBlendLen;
 		bentAperture = lerp(prevBentAperture, bentAperture, lerpFactorAo);
+#	endif
 #	ifdef GI_SPECULAR
 		currGIAOSpecular = lerp(srcPrevGISpecular[pxCoord], currGIAOSpecular, lerpFactor);
 #	endif
@@ -966,10 +995,12 @@ void CalculateGI(
 	// zero -- currY is a set of SH2 coefficients and currCoCg is chroma, both legitimately
 	// signed. currAo needs none of this: its target is R8_UNORM, which cannot store a non-finite
 	// or out-of-range value.
+#ifndef SSGI_AO_ONLY
 	currY = clamp(filterInf(filterNaN(currY)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
 	currCoCg = clamp(filterInf(filterNaN(currCoCg)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
 	currGIAOSpecular = clamp(filterInf(filterNaN(currGIAOSpecular)), -SSGI_MAX_OUTPUT, SSGI_MAX_OUTPUT);
-#ifdef DYNAMIC_CUBEMAPS
+#endif
+#ifdef SSGI_ENV_IRRADIANCE
 	// (guard, same discipline as N3/N5) This is a writer of the env-irradiance history, and its
 	// target is a float format that CAN store a non-finite value, so the same containment
 	// applies. The floor is 0 rather than -SSGI_MAX_OUTPUT: premultiplied radiance and its
@@ -978,6 +1009,11 @@ void CalculateGI(
 #endif
 
 	outAo[pxCoord] = currAo;
+	// (batch 36) SSGI_AO_ONLY writes the AO and the previous-geometry snapshot above, nothing
+	// else. The C++ side zeroes the IL / bent / environment / specular pairs when it enters that
+	// mode, so whatever the composite reads from them while it lasts is a finite zero, and it
+	// restarts their history when it leaves.
+#ifndef SSGI_AO_ONLY
 	outY[pxCoord] = currY;
 	outCoCg[pxCoord] = currCoCg;
 	// (directional env) No finiteness guard needed: the target is R8G8B8A8_UNORM, which cannot
@@ -985,7 +1021,8 @@ void CalculateGI(
 	// self-heals - the next frame's history tap decodes to a valid unit vector regardless of
 	// what the poisoned write clamped to.
 	outBentNormal[pxCoord] = SSGI_EncodeBentNormal(bentNormalWS, bentAperture);
-#ifdef DYNAMIC_CUBEMAPS
+#endif
+#ifdef SSGI_ENV_IRRADIANCE
 	outEnvIrradiance[pxCoord] = currEnvIrradiance;
 #endif
 #ifdef GI_SPECULAR

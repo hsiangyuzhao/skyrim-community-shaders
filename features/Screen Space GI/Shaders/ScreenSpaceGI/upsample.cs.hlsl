@@ -34,6 +34,17 @@ RWTexture2D<unorm float4> outBentNormal : register(u4);
 RWTexture2D<float4> outEnvIrradiance : register(u5);
 #endif
 
+// (batch 36) SSGI_AO_ONLY: see gi.cs.hlsl. Only the AO channel (with the contact term) is
+// upsampled and written; the IL, specular, bent-normal and environment outputs are left alone,
+// which is most of this pass's store traffic (32 of 33 bytes per render pixel with Dynamic
+// Cubemaps loaded: R8 AO against RGBA16F Y, RG16F CoCg, RGBA16F specular, RGBA8 bent normal and
+// RGBA16F environment). Without the define the file compiles exactly as before.
+#ifdef SSGI_AO_ONLY
+#	define SSGI_UPSAMPLE_IL 0
+#else
+#	define SSGI_UPSAMPLE_IL 1
+#endif
+
 #define min4(v) min(min(v.x, v.y), min(v.z, v.w))
 #define max4(v) max(max(v.x, v.y), max(v.z, v.w))
 
@@ -67,11 +78,13 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 	bool d_edge = (diffd / avg) < 0.1;
 
 	float ao;
+#if SSGI_UPSAMPLE_IL
 	float4 y;
 	float2 coCg;
 	float4 giSpecular;
-#ifdef DYNAMIC_CUBEMAPS
+#	ifdef DYNAMIC_CUBEMAPS
 	float4 envIrradiance;
+#	endif
 #endif
 
 	[branch] if (d_edge)
@@ -84,22 +97,26 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 		float sumw = w.x + w.y + w.z + w.w;
 
 		ao = BLEND_WEIGHT(srcAo[px00], srcAo[px01], srcAo[px10], srcAo[px11], w, sumw);
+#if SSGI_UPSAMPLE_IL
 		y = BLEND_WEIGHT(srcIlY[px00], srcIlY[px01], srcIlY[px10], srcIlY[px11], w, sumw);
 		coCg = BLEND_WEIGHT(srcIlCoCg[px00], srcIlCoCg[px01], srcIlCoCg[px10], srcIlCoCg[px11], w, sumw);
 		giSpecular = BLEND_WEIGHT(srcGiSpecular[px00], srcGiSpecular[px01], srcGiSpecular[px10], srcGiSpecular[px11], w, sumw);
-#ifdef DYNAMIC_CUBEMAPS
+#	ifdef DYNAMIC_CUBEMAPS
 		envIrradiance = BLEND_WEIGHT(srcEnvIrradiance[px00], srcEnvIrradiance[px01], srcEnvIrradiance[px10], srcEnvIrradiance[px11], w, sumw);
+#	endif
 #endif
 	}
 	else
 	{
 		float2 uv = (dtid + .5) * RcpFrameDim * OUT_FRAME_DIM * RcpTexDim;
 		ao = srcAo.SampleLevel(samplerLinearClamp, uv, 0);
+#if SSGI_UPSAMPLE_IL
 		y = srcIlY.SampleLevel(samplerLinearClamp, uv, 0);
 		coCg = srcIlCoCg.SampleLevel(samplerLinearClamp, uv, 0);
 		giSpecular = srcGiSpecular.SampleLevel(samplerLinearClamp, uv, 0);
-#ifdef DYNAMIC_CUBEMAPS
+#	ifdef DYNAMIC_CUBEMAPS
 		envIrradiance = srcEnvIrradiance.SampleLevel(samplerLinearClamp, uv, 0);
+#	endif
 #endif
 	}
 
@@ -109,6 +126,7 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 	// upsampled once, in the decoded vector domain, with the same four taps and the same
 	// 1/(|dz|+eps) depth weighting the edge branch uses - on flat depth those weights degrade
 	// towards the plain average the linear branch approximates, so a single path serves both.
+#if SSGI_UPSAMPLE_IL
 	{
 		float bgdepth = srcDepth[dtid];
 		float4 dd = abs(d - bgdepth);
@@ -129,6 +147,7 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 		bentDir = bentLen > 1e-4 ? bentDir / bentLen : dir00;
 		outBentNormal[dtid] = SSGI_EncodeBentNormal(bentDir, bentAperture);
 	}
+#endif
 
 #ifdef CONTACT_AO
 	// The channel stores occlusion, so the two visibilities multiply: 1 - (1 - occ) * contact.
@@ -139,10 +158,12 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 #endif
 
 	outAo[dtid] = ao;
+#if SSGI_UPSAMPLE_IL
 	outIlY[dtid] = y;
 	outIlCoCg[dtid] = coCg;
 	outGiSpecular[dtid] = giSpecular;
-#ifdef DYNAMIC_CUBEMAPS
+#	ifdef DYNAMIC_CUBEMAPS
 	outEnvIrradiance[dtid] = envIrradiance;
+#	endif
 #endif
 }

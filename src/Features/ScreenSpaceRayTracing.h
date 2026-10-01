@@ -430,6 +430,41 @@ struct ScreenSpaceRayTracing : Feature
         /// Kept as a switch rather than deleted so the A/B can still be run in-game (see the
         /// closeout guide), not because the semantics are in doubt.
         bool ReblurFeedHitCoverageConfidence = false;
+        /// @brief (batch 36) Hand REBLUR the game's own motion-vector target (its SRV and the UAV
+        /// CS already adds to it) instead of a per-frame CopyResource snapshot of it.
+        ///
+        /// No picture change: REBLUR only ever *reads* IN_MV -- Temporal Stabilization declares it
+        /// as a storage resource but loads from it and never stores (REBLUR_TemporalStabilization
+        /// in NRD 4.17.3), and nothing writes the target between NRD::PrepareGuides and the last
+        /// REBLUR dispatch of the frame -- so the copy and the original hold the same bytes for
+        /// every reader. The saving is one full-resource R16G16_FLOAT copy (8 B/px of traffic
+        /// over the whole 4K allocation, ~66 MB a frame whatever the DLSS mode), plus the 32 MiB
+        /// snapshot texture, which is then never allocated. Off = batch 34 (copy).
+        bool ReblurDirectMotionVectors = true;
+        /// @brief (batch 36) Skip the full-screen diffuse back-end unpack: the diffuse composite
+        /// reads REBLUR's packed YCoCg output directly and converts it in registers.
+        ///
+        /// The unpack pass read one RGBA16F surface and wrote another (16 B per render pixel) only
+        /// for ssrt_diffuse_composite.hlsl to read the result straight back; folding the three-line
+        /// YCoCg-to-RGB transform into the composite removes the round trip. The only difference
+        /// in the result is that the radiance no longer passes through an fp16 store between the
+        /// two steps (it is now *more* precise, by at most one fp16 ulp). Applies to the
+        /// full-resolution REBLUR path only; the half-resolution path's upsample already writes
+        /// linear RGB. Off = batch 34 (separate unpack pass).
+        bool ReblurFoldDiffuseUnpack = true;
+        /// @brief (batch 36) Denoise the diffuse signal with REBLUR at half resolution (one
+        /// quarter of the pixels) and bring the result back with a depth-guided upsample.
+        ///
+        /// **Changes the picture**, which is why it is its own switch. Diffuse indirect light is
+        /// the lowest-frequency signal in the frame and REBLUR's diffuse instance is about half of
+        /// the denoising bill; at half resolution its five full-screen passes touch a quarter of
+        /// the pixels. The ray march still traces at full density (or whatever Diffuse Sampling
+        /// selects), and every 2x2 block is averaged -- depth-aware -- into one denoiser input, so
+        /// the denoiser starts from four times the samples per input pixel. What can be lost is
+        /// sub-2-pixel detail in the *bounce light* itself (thin geometry such as grass blades and
+        /// railings can pick up their neighbours' indirect light); the albedo, the direct light
+        /// and the confidence/occlusion surfaces stay at full resolution. Off = batch 34.
+        bool ReblurDiffuseHalfRes = true;
         /// @brief (batch C1) REBLUR tuning for the diffuse instance. NRD defaults.
         NRD::REBLURSettings ReblurDiffuse;
         /// @brief (batch C1) REBLUR tuning for the specular instance. Defaults taken
@@ -1371,6 +1406,17 @@ struct ScreenSpaceRayTracing : Feature
     void DrawSSRTSpecular();
     void DrawSSRTDiffuse();
 
+    /// @brief (batch 36) DrawSSRTDiffuse's whole-chain guard (S1.4) as a predicate: every shader
+    /// and surface the diffuse chain needs exists. Shared with GetCommonBufferData.
+    [[nodiscard]] bool DiffuseChainReady() const;
+
+    /// @brief (batch 36) Whether this frame's DeferredCompositeCS will discard Screen Space GI's
+    /// indirect light because SSRT diffuse supplies it -- i.e. this feature is loaded and the
+    /// published `DiffuseMult` is positive. Written by GetCommonBufferData (which runs in
+    /// UpdateSharedData, ahead of every deferred pass of the frame), read by ScreenSpaceGI::DrawSSGI.
+    [[nodiscard]] bool DiffuseReplacesSsgiIl() const { return publishedDiffuseReplacesSsgiIl; }
+    bool publishedDiffuseReplacesSsgiIl = false;
+
     /// @brief (batch C1) The whole REBLUR leg for one chain: front-end pack of the
     /// ray-march outputs, the NRD instance dispatch, back-end unpack into the surface
     /// the rest of the pipeline reads. Callers gate on ReblurReady(a_specular).
@@ -1383,7 +1429,10 @@ struct ScreenSpaceRayTracing : Feature
     /// — and the chain's REBLUR reset stays pending. (S1.2: the old void signature let a
     /// skipped dispatch clear the reset flag and unpack whatever the output surface
     /// happened to hold, which on the first frame is uninitialised RGBA16F.)
-    [[nodiscard]] bool RunReblur(bool a_specular);
+    ///
+    /// (batch 36) a_skipUnpack: leave the result packed (texNRDPackOutput on success,
+    /// texNRDPackInput on failure) for the caller's packed-input composite. Diffuse only.
+    [[nodiscard]] bool RunReblur(bool a_specular, bool a_skipUnpack = false);
     /// @brief Snapshots the normal-roughness G-buffer into texHistoryNormals, and (defect
     /// D3, when SVGF is on) mip 0 of the Hi-Z pyramid into texHistoryDepth, for next frame's
     /// SVGF temporal validation. Called exactly once per frame, by whichever of the two draw
@@ -1697,6 +1746,39 @@ struct ScreenSpaceRayTracing : Feature
     nrd::ReblurSettings reblurDiffuseSettings{};
     nrd::ReblurSettings reblurSpecularSettings{};
 
+    /// @brief (batch 36) Half-resolution diffuse REBLUR (Settings::ReblurDiffuseHalfRes).
+    ///
+    /// Its own instance, its own reset flag and its own guide set, all at ceil(full / 2) of the
+    /// output allocation. Only one of nrdReblurDiffuse / nrdReblurDiffuseHalf exists at a time:
+    /// EnsureNRDResources shuts the other one down on every mode switch, so a session pays for one
+    /// diffuse history, and the instance being entered always starts with CLEAR_AND_RESTART.
+    ///
+    ///   texNRDHalfInput        RGBA16F       2x2 depth-aware mean of texNRDPackInput (packed layout)
+    ///   texNRDHalfOutput       RGBA16F       REBLUR OUT_DIFF_RADIANCE_HITDIST
+    ///   texNRDHalfViewZ        R32F          IN_VIEWZ, the representative texel's value
+    ///   texNRDHalfNormalRough  R10G10B10A2   IN_NORMAL_ROUGHNESS, same texel, NRD packing kept
+    ///   texNRDHalfMV           R16G16F       IN_MV, same texel (UV-space, so no rescale needed)
+    NRDReblurIntegration nrdReblurDiffuseHalf;
+    eastl::unique_ptr<Texture2D> texNRDHalfInput = nullptr;
+    eastl::unique_ptr<Texture2D> texNRDHalfOutput = nullptr;
+    eastl::unique_ptr<Texture2D> texNRDHalfViewZ = nullptr;
+    eastl::unique_ptr<Texture2D> texNRDHalfNormalRough = nullptr;
+    eastl::unique_ptr<Texture2D> texNRDHalfMV = nullptr;
+    bool resetReblurDiffuseHalf = true;
+    /// @brief (batch 36) Which diffuse instance EnsureNRDResources left standing this frame.
+    /// Read by ReblurResourcesReady(false) and RunReblur(false); written only by
+    /// EnsureNRDResources and ResetFrameState.
+    bool diffuseHalfResActive = false;
+    /// @brief (batch 36) Allocate the half-resolution set and instance if missing. Returns
+    /// whether all of it exists afterwards.
+    bool EnsureHalfResDiffuseResources(uint32_t a_fullWidth, uint32_t a_fullHeight);
+    /// @brief (batch 36) Drop the half-resolution set and instance.
+    void ReleaseHalfResDiffuseResources();
+    /// @brief (batch 36) The half-resolution REBLUR leg: reduce, denoise, upsample+unpack into
+    /// texSSRTDiffuseColor. Same contract as RunReblur: false means the dispatch did not
+    /// complete and the caller's fallback (unpacking the full-resolution input) must run.
+    [[nodiscard]] bool RunReblurDiffuseHalf();
+
 #ifdef ENABLE_SHARC
     eastl::unique_ptr<Buffer> sharcHashEntries = nullptr;
     eastl::unique_ptr<Buffer> sharcHashCopyOffsets = nullptr;
@@ -1743,6 +1825,12 @@ struct ScreenSpaceRayTracing : Feature
     /// the colour composite with the confidence smoothing, its LDS tile and its barrier compiled
     /// away, for use when the three-pass filter below publishes that surface instead.
     winrt::com_ptr<ID3D11ComputeShader> diffuseCompositeExternalConfCS = nullptr;
+    /// @brief (batch 36) The SSRT_DIFFUSE_PACKED_INPUT twins of the two composites above: they
+    /// read REBLUR's packed YCoCg surface at t0 and unpack it in registers, which is what lets the
+    /// separate diffuse unpack pass go (Settings::ReblurFoldDiffuseUnpack). A null twin simply
+    /// keeps the unpack pass for that frame.
+    winrt::com_ptr<ID3D11ComputeShader> diffuseCompositePackedCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> diffuseCompositeExternalConfPackedCS = nullptr;
     /// @brief (batch 6) The spatial confidence filter: 2x2 depth- and normal-aware downsample,
     /// two 15-tap separable joint-bilateral blurs at quarter resolution, joint-bilateral upsample.
     /// The two blur entries are the horizontal and vertical permutations of one file.
@@ -1778,6 +1866,12 @@ struct ScreenSpaceRayTracing : Feature
     /// writes the front-end layout itself when SSRTCB::NRDFrontEndPack is set, which removes a
     /// full-screen pass per chain. See SSRTCB::NRDFrontEndPack and RunReblur.
     winrt::com_ptr<ID3D11ComputeShader> nrdUnpackCS = nullptr;
+    /// @brief (batch 36) Half-resolution diffuse REBLUR: the 2x2 depth-aware reduction that
+    /// builds the half-resolution input and guides, and the depth-guided upsample that brings the
+    /// denoised result back (unpacking it on the way). Either one missing keeps the
+    /// full-resolution path.
+    winrt::com_ptr<ID3D11ComputeShader> nrdHalfDownsampleCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> nrdHalfUpsampleCS = nullptr;
     /// @brief (batch 12) The two sparse ray-march permutations and their two resolve passes.
     ///
     /// Permutations rather than runtime branches because sampling density changes the traversal's

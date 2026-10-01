@@ -139,9 +139,15 @@ void NRD::SetupResources()
 // Returns false if allocation was not attempted or did not produce all three, which PrepareGuides
 // treats exactly like a failed shader compile: guidesReadyThisFrame stays false and every consumer
 // falls back to its own denoiser, which is a path that already exists and is already tested.
-bool NRD::EnsureGuides()
+bool NRD::EnsureGuides(bool a_needMotionCopy)
 {
-	if (texNRDViewZ && texNRDNormalRoughness && texNRDMV)
+	// (batch 36) With the direct motion-vector path nothing reads texNRDMV, so it is dropped
+	// rather than held: 4 bytes per pixel of the allocation, 32 MiB at 4K. Switching back
+	// re-creates it on the next frame through the normal path below.
+	if (!a_needMotionCopy)
+		texNRDMV = nullptr;
+
+	if (texNRDViewZ && texNRDNormalRoughness && (texNRDMV || !a_needMotionCopy))
 		return true;
 
 	logger::debug("Creating NRD guide textures...");
@@ -172,7 +178,7 @@ bool NRD::EnsureGuides()
 		.Texture2D = { .MipSlice = 0 }
 	};
 
-	if (!texNRDMV) {
+	if (a_needMotionCopy && !texNRDMV) {
 		texNRDMV = eastl::make_unique<Texture2D>(texDesc);
 		texNRDMV->CreateSRV(srvDesc);
 		texNRDMV->CreateUAV(uavDesc);
@@ -195,7 +201,7 @@ bool NRD::EnsureGuides()
 		Util::SetResourceName(texNRDNormalRoughness->resource.get(), "NRD::NormalRoughness");
 	}
 
-	return texNRDViewZ && texNRDNormalRoughness && texNRDMV;
+	return texNRDViewZ && texNRDNormalRoughness && (texNRDMV || !a_needMotionCopy);
 }
 
 void NRD::ClearShaderCache()
@@ -217,6 +223,9 @@ void NRD::PrepareGuides()
 {
 	commonSettingsValidThisFrame = false;
 	guidesReadyThisFrame = false;
+	directMotionVectorsThisFrame = false;
+	directMotionVectorSRV = nullptr;
+	directMotionVectorUAV = nullptr;
 
 	if (!settings.Enabled || !prepareNRDGuidesCompute)
 		return;
@@ -234,13 +243,33 @@ void NRD::PrepareGuides()
 	// of a 4K allocation for three textures nothing read. A failure here is treated exactly like
 	// a failed shader compile above: guidesReadyThisFrame stays false and every consumer keeps
 	// its own fallback denoiser.
-	if (!EnsureGuides())
-		return;
-
 	auto context = globals::d3d::context;
 	auto renderer = globals::game::renderer;
 	auto rts = renderer->GetRuntimeData().renderTargets;
 	auto state = globals::state;
+
+	// (batch 36) Direct motion vectors: bind the game's target instead of a snapshot of it. Only
+	// when the target actually carries both views -- CS's ModifyRenderTarget hook adds the UAV to
+	// it, and anything that ever stops doing that makes this fall back to the copy rather than
+	// hand REBLUR a null storage binding (which NRDReblurIntegration::Dispatch would abort on).
+	// See Settings::ReblurDirectMotionVectors for why the two are interchangeable.
+	{
+		const auto& motionRT = rts[RE::RENDER_TARGETS::kMOTION_VECTOR];
+		directMotionVectorsThisFrame =
+			globals::features::screenSpaceRayTracing.settings.ReblurDirectMotionVectors &&
+			motionRT.SRV && motionRT.UAV;
+		if (directMotionVectorsThisFrame) {
+			directMotionVectorSRV = motionRT.SRV;
+			directMotionVectorUAV = motionRT.UAV;
+		}
+	}
+
+	if (!EnsureGuides(!directMotionVectorsThisFrame)) {
+		directMotionVectorsThisFrame = false;
+		directMotionVectorSRV = nullptr;
+		directMotionVectorUAV = nullptr;
+		return;
+	}
 
 	state->BeginPerfEvent("NRD - Prepare Guides");
 	// (batch 11, item B1) This pass had a PIX marker but no GPU timing row, which made it the one
@@ -281,7 +310,11 @@ void NRD::PrepareGuides()
 
 	// Motion Vector is used as both SRV and UAV by ReBLUR; snapshot the game's
 	// MV target so we can rebind it through NRD's UAV slot without aliasing.
-	context->CopyResource(texNRDMV->resource.get(), motion.texture);
+	// (batch 36) ...unless the direct path is on, in which case no pass binds the target as SRV
+	// and UAV at once anyway (each REBLUR dispatch binds it one way only), and the snapshot is
+	// skipped. Deferred's own composite already binds this same target's UAV every frame.
+	if (!directMotionVectorsThisFrame)
+		context->CopyResource(texNRDMV->resource.get(), motion.texture);
 
 	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::NRDGuides);
 	state->EndPerfEvent();

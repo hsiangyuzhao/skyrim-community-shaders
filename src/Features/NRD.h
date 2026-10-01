@@ -60,7 +60,9 @@ struct NRD : Feature
 	// selects REBLUR never pays for them (~25 MB at 1080p, ~100 MB at a 4K allocation). Returns
 	// false if the set is not complete afterwards, which PrepareGuides treats as a failure like
 	// any other. Idempotent; the early-out makes the steady-state call free.
-	bool EnsureGuides();
+	// (batch 36) a_needMotionCopy: whether texNRDMV is required this frame. With the direct
+	// motion-vector path it is not, and it is then neither allocated nor kept.
+	bool EnsureGuides(bool a_needMotionCopy);
 
 	// True when PrepareGuides has run successfully for this frame. Consumers
 	// should skip their dispatches if guides aren't ready (e.g. world not
@@ -133,8 +135,21 @@ struct NRD : Feature
 	// Guide accessors. Valid after PrepareGuides() returns guidesReadyThisFrame=true.
 	ID3D11ShaderResourceView* GetViewZSRV() const { return texNRDViewZ ? texNRDViewZ->srv.get() : nullptr; }
 	ID3D11ShaderResourceView* GetNormalRoughnessSRV() const { return texNRDNormalRoughness ? texNRDNormalRoughness->srv.get() : nullptr; }
-	ID3D11ShaderResourceView* GetMotionVectorSRV() const { return texNRDMV ? texNRDMV->srv.get() : nullptr; }
-	ID3D11UnorderedAccessView* GetMotionVectorUAV() const { return texNRDMV ? texNRDMV->uav.get() : nullptr; }
+	// (batch 36) Either the snapshot copy (batch 34 behaviour) or, with Screen Space Ray Tracing's
+	// "Direct Motion Vectors" switch on, the game's own motion-vector target. Decided once per
+	// frame in PrepareGuides, so every REBLUR instance of the frame sees the same answer.
+	ID3D11ShaderResourceView* GetMotionVectorSRV() const
+	{
+		if (directMotionVectorsThisFrame)
+			return directMotionVectorSRV;
+		return texNRDMV ? texNRDMV->srv.get() : nullptr;
+	}
+	ID3D11UnorderedAccessView* GetMotionVectorUAV() const
+	{
+		if (directMotionVectorsThisFrame)
+			return directMotionVectorUAV;
+		return texNRDMV ? texNRDMV->uav.get() : nullptr;
+	}
 
 	//////////////////////////////////////////////////////////////////////////
 
@@ -152,6 +167,12 @@ struct NRD : Feature
 	nrd::CommonSettings commonSettings{};
 	bool commonSettingsValidThisFrame = false;
 	bool guidesReadyThisFrame = false;
+	// (batch 36) Whether this frame's IN_MV is the game's motion-vector target itself rather than
+	// texNRDMV. The two views are non-owning: they belong to the render target, which outlives
+	// the frame they are used in.
+	bool directMotionVectorsThisFrame = false;
+	ID3D11ShaderResourceView* directMotionVectorSRV = nullptr;
+	ID3D11UnorderedAccessView* directMotionVectorUAV = nullptr;
 	bool hasCommonFrameHistory = false;
 	uint32_t lastCommonGameFrame = 0;
 	uint16_t prevResourceSize[2] = {};

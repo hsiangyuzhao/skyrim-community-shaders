@@ -119,6 +119,16 @@ public:
 		// bent normal itself is always produced while SSGI runs.
 		bool EnableDirectionalEnv = true;
 		float EnvLevel = 1.0f;  // 0..4, linear brightness of the new channel; 1 = parity
+		// (batch 36) While Screen Space Ray Tracing's diffuse is actually lighting the frame,
+		// DeferredCompositeCS discards this feature's indirect light (and its directional
+		// environment channel) and keeps only the AO. With this on, the IL is then not computed
+		// either: radianceDisocc, gi and upsample run their SSGI_AO_ONLY permutations (AO and its
+		// history only), and the radiance prefilter (plus its copy) and the IL blur are not
+		// dispatched. The AO -- contact term included -- is produced by the same code as before,
+		// so the picture does not change. The moment SSRT diffuse stops lighting the frame
+		// (switched off, or its chain cannot run) the full path comes back with its temporal
+		// history reset. Off = batch 34.
+		bool SkipILUnderSSRTDiffuse = true;
 	} settings;
 
 	// (directional env) Mirror of SSGISettings in Common/SharedData.hlsli -- appended at the
@@ -257,4 +267,16 @@ public:
 	winrt::com_ptr<ID3D11ComputeShader> blurCompute = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> upsampleCompute = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> contactAoCompute = nullptr;
+
+	// (batch 36) SSGI_AO_ONLY permutations of the three passes that carry IL while SSRT diffuse
+	// supplies the indirect light: the regular define set minus GI / GI_SPECULAR plus SSGI_AO_ONLY.
+	// Built only while EnableGI is on; the upsample one only in half/quarter resolution.
+	winrt::com_ptr<ID3D11ComputeShader> radianceDisoccAoOnlyCompute = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> giAoOnlyCompute = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> upsampleAoOnlyCompute = nullptr;
+
+	/// @brief (batch 36) Whether this frame runs the AO-only path. See Settings::SkipILUnderSSRTDiffuse.
+	[[nodiscard]] bool ShouldSkipIL() const;
+	/// @brief (batch 36) Last frame's ShouldSkipIL(), for the history reset on the way back.
+	bool lastFrameSkippedIL = false;
 };
