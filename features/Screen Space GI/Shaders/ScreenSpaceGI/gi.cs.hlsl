@@ -33,6 +33,9 @@
 #include "Common/Spherical Harmonics/SphericalHarmonics.hlsli"
 #include "Common/VR.hlsli"
 #include "ScreenSpaceGI/common.hlsli"
+#ifdef SSGI_REBLUR
+#	include "NRD/NRDReblurSH.hlsli"
+#endif
 
 // (directional env v2) Cross-feature include, same pattern and same justification as
 // ssrt_raymarch.hlsl: the include only exists when the C++ side confirmed the Skylighting
@@ -82,6 +85,10 @@ RWTexture2D<half3> outPrevGeo : register(u4);
 RWTexture2D<unorm float4> outBentNormal : register(u5);
 #if defined(DYNAMIC_CUBEMAPS)
 RWTexture2D<float4> outEnvIrradiance : register(u6);
+#endif
+#ifdef SSGI_REBLUR
+// Current-frame diffuse signal, independent of the legacy SH2 temporal history.
+RWTexture2D<float4> outNRDDiffuse : register(u7);
 #endif
 
 float GetDepthFade(float depth)
@@ -348,7 +355,8 @@ static const uint SSGI_ENV_SEG_BITS = 4;
 void CalculateGI(
 	uint2 dtid, float2 uv, float viewspaceZ, float3 viewspaceNormal,
 	out float o_ao, out sh2 o_currY, out float2 o_currCoCg, out float4 o_currGIAOSpecular,
-	out float3 o_bentNormalWS, out float o_bentAperture, out float4 o_envIrradiance)
+	out float3 o_bentNormalWS, out float o_bentAperture, out float4 o_envIrradiance,
+	out float o_diffuseHitDistance)
 {
 	const float2 frameScale = FrameDim * RcpTexDim;
 
@@ -439,6 +447,12 @@ void CalculateGI(
 	float3 radianceYMoment = 0;
 	float2 radianceCoCg = 0;
 	float3 radianceSpecular = 0;
+#ifdef SSGI_REBLUR
+	// REBLUR's hit distance is a signal statistic, not the AO/GI search radius. Weight
+	// only samples that contributed newly visible diffuse angular bins.
+	float diffuseHitDistanceSum = 0;
+	float diffuseHitWeightSum = 0;
+#endif
 
 #ifdef GI_SPECULAR
 	const float roughness = max(0.2, saturate(1 - FULLRES_LOAD(srcNormalRoughness, dtid, uv * frameScale, samplerLinearClamp).z));  // can't handle low roughness
@@ -639,6 +653,11 @@ void CalculateGI(
 						radianceYScalar += sampleRadianceYCoCg.r * solidAngleWeight * distanceCompensation;
 						radianceYMoment += sampleRadianceYCoCg.r * solidAngleMoment * distanceCompensation;
 						radianceCoCg += sampleRadianceYCoCg.gb * cosineWeight * distanceCompensation;
+#						ifdef SSGI_REBLUR
+						float hitWeight = max(solidAngleWeight, 0.0);
+						diffuseHitDistanceSum += length(sampleDelta) * hitWeight;
+						diffuseHitWeightSum += hitWeight;
+#						endif
 					}
 
 #	ifdef GI_SPECULAR
@@ -858,6 +877,13 @@ void CalculateGI(
 	o_currY = radianceY;
 	o_currCoCg = radianceCoCg;
 	o_currGIAOSpecular = float4(radianceSpecular, visibilitySpecular);
+#ifdef SSGI_REBLUR
+	// A pixel with no screen-space hit represents a ray miss, i.e. the maximum
+	// normalized hit distance. Zero would claim a receiver-local occluder to NRD.
+	o_diffuseHitDistance = diffuseHitWeightSum > 1e-6 ? diffuseHitDistanceSum / diffuseHitWeightSum : NRD_FP16_MAX;
+#else
+	o_diffuseHitDistance = 0.0;
+#endif
 }
 
 [numthreads(8, 8, 1)] void main(const uint2 dtid
@@ -885,6 +911,7 @@ void CalculateGI(
 	float4 currY = 0;
 	float2 currCoCg = 0;
 	float4 currGIAOSpecular = float4(0, 0, 0, 0);
+	float diffuseHitDistance = 0.0;
 	// (directional env) Open-hemisphere prior for pixels the march never measures (sky,
 	// first-person geometry, beyond the fade range): surface normal, aperture 1, so the
 	// composite's environment lookup degrades to a wide-cone sample along the normal - the
@@ -903,7 +930,21 @@ void CalculateGI(
 		CalculateGI(
 			pxCoord, uv, viewspaceZ, viewspaceNormal,
 			currAo, currY, currCoCg, currGIAOSpecular,
-			bentNormalWS, bentAperture, currEnvIrradiance);
+			bentNormalWS, bentAperture, currEnvIrradiance, diffuseHitDistance);
+
+#ifdef SSGI_REBLUR
+		// Match the diffuse composite's SH2 resolve at this receiver normal, before the
+		// legacy EMA changes the current-frame sample. REBLUR_DIFFUSE consumes RGB radiance;
+		// SH2 cannot be reinterpreted as NRD's spherical-Gaussian SH representation.
+		float diffuseY = SphericalHarmonics::SHHallucinateZH3Irradiance(currY, worldNormal);
+		float3 diffuseRGB = Color::YCoCgToRGB(float3(diffuseY, currCoCg));
+		diffuseRGB = clamp(filterInf(filterNaN(diffuseRGB)), 0.0, SSGI_MAX_OUTPUT);
+		float normHitDistance = REBLUR_FrontEnd_GetNormHitDist(
+			max(0.0, filterInf(filterNaN(diffuseHitDistance))), viewspaceZ,
+			float3(3.0, 0.1, 20.0), 1.0);
+		outNRDDiffuse[pxCoord] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(
+			diffuseRGB, normHitDistance, true);
+#endif
 
 #ifdef TEMPORAL_DENOISER
 		const float accumFrames = srcAccumFrames[pxCoord] * 255;
@@ -958,6 +999,13 @@ void CalculateGI(
 #	endif
 #endif
 	}
+#ifdef SSGI_REBLUR
+	else {
+		// The NRD input is a separate, non-temporal surface and must be defined even on
+		// sky or first-person pixels skipped by the GI march.
+		outNRDDiffuse[pxCoord] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(float3(0.0, 0.0, 0.0), 1.0, true);
+	}
+#endif
 	// (guard N3/N5) These three are the writers of the IL / specular history, so anything
 	// non-finite that leaves here is permanent: the temporal EMA below is lerp(prev, curr, f),
 	// and lerp(Inf, curr, f) is Inf for every finite f, so a single poisoned texel survives

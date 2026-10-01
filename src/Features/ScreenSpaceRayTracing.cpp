@@ -27,6 +27,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     UseDynamicCubemapsAsFallbackSpecular,
     DiffuseSPP,
     DiffuseSamplingMode,
+    SpecularSamplingMode,
     EnableDiffuse,
     SpecularMult,
     DiffuseMult,
@@ -84,6 +85,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     UseDynamicCubemapsAsFallbackSpecular,
     DiffuseSPP,
     DiffuseSamplingMode,
+    SpecularSamplingMode,
     EnableDiffuse,
     SpecularMult,
     DiffuseMult,
@@ -164,6 +166,25 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "parallax, so on water, polished floors and metal the traced result is "
                 "visibly different. Watch those surfaces as you lower it, and read the SSRT "
                 "Trace Specular row for what it buys.");
+    }
+
+    {
+        static const char* specularSamplingModes[] = { "Full", "Checkerboard" };
+        int selected = settings.SpecularSamplingMode == kSamplingCheckerboard ? 1 : 0;
+        if (ImGui::Combo("Specular Sampling", &selected, specularSamplingModes, 2))
+            settings.SpecularSamplingMode = selected ? kSamplingCheckerboard : kSamplingFull;
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Full traces every reflection pixel and is the default A/B reference. "
+                "Checkerboard traces one pixel per horizontal pair and alternates the traced "
+                "half each frame. A depth- and normal-guided resolve fills the missing pixels "
+                "before REBLUR, SVGF, or Off consumes them; the DLSS-RR hit-distance guide "
+                "also remains full resolution. Thin, sharp reflections may shimmer during "
+                "motion. Compare SSRT Trace Specular with SSRT Sparse Resolve in the overlay.");
+        if (settings.EnableSpecular && settings.SpecularSamplingMode == kSamplingCheckerboard &&
+            activeSpecularSamplingMode == kSamplingFull)
+            ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f },
+                "Specular checkerboard is inactive: check the log for a shader or allocation failure.");
     }
 
     // (batch 12) Sparse sampling. Placed directly under Diffuse SPP because the two are the same
@@ -1009,6 +1030,10 @@ void ScreenSpaceRayTracing::DrawSettings()
             BUFFER_VIEWER_NODE(texSparseConfidence, debugRescale)
         if (texSparseHitDistance)
             BUFFER_VIEWER_NODE(texSparseHitDistance, debugRescale)
+        if (texSparseSpecularColor)
+            BUFFER_VIEWER_NODE(texSparseSpecularColor, debugRescale)
+        if (texSparseSpecularHitDistance)
+            BUFFER_VIEWER_NODE(texSparseSpecularHitDistance, debugRescale)
 
         if (texNRDPackInput)
             BUFFER_VIEWER_NODE(texNRDPackInput, debugRescale)
@@ -1064,6 +1089,8 @@ void ScreenSpaceRayTracing::SanitizeSettings()
     // "sparse, but neither of the two sparse modes", which would leave the compact set allocated
     // and no shader selected to write it.
     settings.DiffuseSamplingMode = std::min(settings.DiffuseSamplingMode, (uint)kSamplingCheckerboard);
+    settings.SpecularSamplingMode = settings.SpecularSamplingMode == kSamplingCheckerboard ?
+                                        kSamplingCheckerboard : kSamplingFull;
     // (audit P3) The traversal can load exactly mip MaxMips, and mip maxMips-1 is the last
     // one allocated; an out-of-range Load returns 0 == near plane, i.e. an instant false hit.
     settings.MaxMips = std::clamp(settings.MaxMips, 1u, maxMips - 1u);
@@ -1748,6 +1775,89 @@ void ScreenSpaceRayTracing::ReleaseSparseResources()
     texSparseHitDistance = nullptr;
 }
 
+bool ScreenSpaceRayTracing::EnsureSpecularSparseResources()
+{
+    if (texSparseSpecularColor && texSparseSpecularHitDistance)
+        return true;
+
+    auto renderer = globals::game::renderer;
+    auto context = globals::d3d::context;
+    if (!renderer || !context)
+        return false;
+    auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return false;
+
+    D3D11_TEXTURE2D_DESC texDesc{};
+    mainTex.texture->GetDesc(&texDesc);
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    texDesc.MiscFlags = 0;
+    texDesc.MipLevels = 1;
+    texDesc.Width = std::max(1u, (texDesc.Width + 1u) / 2u);
+
+    auto makeTex = [&](DXGI_FORMAT format, const char* name) {
+        texDesc.Format = format;
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+            .Format = format,
+            .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+            .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+        };
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+            .Format = format,
+            .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+            .Texture2D = { .MipSlice = 0 }
+        };
+        auto tex = eastl::make_unique<Texture2D>(texDesc);
+        tex->CreateSRV(srvDesc);
+        tex->CreateUAV(uavDesc);
+        Util::SetResourceName(tex->resource.get(), name);
+        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        context->ClearUnorderedAccessViewFloat(tex->uav.get(), zero);
+        return tex;
+    };
+
+    try {
+        // At 3840x2160: 1920x2160x(8+4) = 47.46 MiB. Keep the R32 guide
+        // independent of diffuse's normalized R8 distance and REBLUR's packed alpha.
+        texSparseSpecularColor = makeTex(DXGI_FORMAT_R16G16B16A16_FLOAT, "SSRT::SparseSpecularColor");
+        texSparseSpecularHitDistance = makeTex(DXGI_FORMAT_R32_FLOAT, "SSRT::SparseSpecularHitDistance");
+    } catch (...) {
+        // Texture2D/CreateSRV/CreateUAV throw on D3D allocation failure. A failed
+        // optional compact set must select the existing Full shader this frame.
+        ReleaseSpecularSparseResources();
+        specularSparseAllocationFailed = true;
+        logger::warn("SSRT specular checkerboard resources unavailable; using Full sampling");
+        return false;
+    }
+    return true;
+}
+
+void ScreenSpaceRayTracing::ReleaseSpecularSparseResources()
+{
+    texSparseSpecularColor = nullptr;
+    texSparseSpecularHitDistance = nullptr;
+}
+
+uint ScreenSpaceRayTracing::ResolveSpecularSamplingMode()
+{
+    uint mode = settings.EnableSpecular && settings.SpecularSamplingMode == kSamplingCheckerboard ?
+                    kSamplingCheckerboard : kSamplingFull;
+    if (mode == kSamplingCheckerboard &&
+        (!raymarchSpecularCheckerCS || !specularCheckerResolveCS || specularSparseAllocationFailed ||
+         !EnsureSpecularSparseResources()))
+        mode = kSamplingFull;
+
+    if (mode == kSamplingFull) {
+        ReleaseSpecularSparseResources();
+        // A user can retry after choosing Full; SetupResources also clears the latch
+        // so a resolution change can retry with a different allocation extent.
+        if (settings.SpecularSamplingMode == kSamplingFull || !settings.EnableSpecular)
+            specularSparseAllocationFailed = false;
+    }
+    activeSpecularSamplingMode = mode;
+    return mode;
+}
+
 uint ScreenSpaceRayTracing::ResolveSamplingMode()
 {
     uint mode = std::min(settings.DiffuseSamplingMode, (uint)kSamplingCheckerboard);
@@ -2043,12 +2153,16 @@ void ScreenSpaceRayTracing::ResetFrameState()
     // asks for a sparse mode.
     ReleaseSparseResources();
     activeSamplingMode = kSamplingFull;
+    ReleaseSpecularSparseResources();
+    specularSparseAllocationFailed = false;
+    activeSpecularSamplingMode = kSamplingFull;
+    lastSpecularSamplingMode = kSamplingFull;
 }
 
 void ScreenSpaceRayTracing::ClearShaderCache()
 {
     static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
-        &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &preblurCS, &temporalCS, &temporalDiagCS, &varianceCS, &spatialCS, &spatialSpecularCS,
+        &raymarchSpecularCS, &raymarchSpecularCheckerCS, &specularCheckerResolveCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &preblurCS, &temporalCS, &temporalDiagCS, &varianceCS, &spatialCS, &spatialSpecularCS,
         &nrdUnpackCS,
         // (batch 12) sparse sampling: the two ray-march permutations and their two resolve passes
         &raymarchDiffuseHalfResCS, &raymarchDiffuseCheckerCS, &sparseResolveHalfResCS, &sparseResolveCheckerCS,
@@ -2102,6 +2216,8 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
 
     auto definesSpecular = defines;
     definesSpecular.push_back({ "SSRT_SPECULAR", nullptr });
+    auto definesSpecularChecker = definesSpecular;
+    definesSpecularChecker.push_back({ "SSRT_SPARSE_CHECKERBOARD", "1" });
 
     // (batch 12) The two sparse ray-march permutations. Built on `defines` -- unlike the
     // denoiser-side lists below -- because they are the *same shader* as the full-density diffuse
@@ -2152,6 +2268,8 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
         shaderInfos = {
             { &raymarchDiffuseCS, "ssrt_raymarch.hlsl", defines },
             { &raymarchSpecularCS, "ssrt_raymarch.hlsl", definesSpecular },
+            { &raymarchSpecularCheckerCS, "ssrt_raymarch.hlsl", definesSpecularChecker },
+            { &specularCheckerResolveCS, "ssrt_specular_checker_resolve.hlsl", definesSpecularChecker },
             { &prepareColorCS, "ssrt_prepare_color.hlsl", {} },
             { &preprocessDepthCS, "ssrt_preprocess_depth.hlsl", {} },
             { &depthDownsampleCS, "ssrt_depth_downsample.hlsl", {} },
@@ -2198,6 +2316,8 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
         auto path = std::filesystem::path("Data\\Shaders\\ScreenSpaceRayTracing") / info.filename;
         if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), info.defines, "cs_5_0")))
             info.programPtr->attach(rawPtr);
+        else if (info.programPtr == &raymarchSpecularCheckerCS || info.programPtr == &specularCheckerResolveCS)
+            *info.programPtr = nullptr;  // never keep an old optional checker shader after a failed recompile
     }
 
     // (S1.4) Record what DIFFUSE_SPP the permutations above were actually built with, so
@@ -2318,6 +2438,22 @@ void ScreenSpaceRayTracing::UpdateHistoryValidity()
         (effectiveDenoiserDiffuse == kDenoiserREBLUR && lastEffectiveDenoiserDiffuse != kDenoiserREBLUR) ||
         (effectiveDenoiserSpecular == kDenoiserREBLUR && lastEffectiveDenoiserSpecular != kDenoiserREBLUR);
 
+    // A checkerboard/full switch changes the specular sample distribution even
+    // though both paths hand the denoiser a full-resolution surface. Reseed only
+    // the specular histories on the actual transition (including a shader or
+    // allocation fallback), before either denoiser reads a previous estimate.
+    if (activeSpecularSamplingMode != lastSpecularSamplingMode) {
+        if (auto context = globals::d3d::context) {
+            const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            if (texHistory)
+                context->ClearUnorderedAccessViewFloat(texHistory->uav.get(), zero);
+            if (texHistoryMoments)
+                context->ClearUnorderedAccessViewFloat(texHistoryMoments->uav.get(), zero);
+        }
+        resetReblurSpecular = true;
+        lastSpecularSamplingMode = activeSpecularSamplingMode;
+    }
+
     if (svgfRising || diffuseRising || specularRising)
         historyClearPending = true;
 
@@ -2373,6 +2509,7 @@ void ScreenSpaceRayTracing::Prepass()
     // where the state machine got to. This is also where the REBLUR path is brought up, so
     // no dispatch gate is ever the first thing to ask whether its resources exist.
     ResolveDenoisers();
+    ResolveSpecularSamplingMode();
 
     // (guard G8) Before the enable gate below, so a transition is never missed just because
     // both passes happened to be off on the frame it occurred; the flag latches until a
@@ -2560,6 +2697,9 @@ void ScreenSpaceRayTracing::Prepass()
 
 void ScreenSpaceRayTracing::DrawSSRTSpecular()
 {
+    // Prepass resolved and latched the actual mode before history validation.
+    // Reading only this value keeps trace/resolve/resource ownership in sync.
+    const bool checkerboard = activeSpecularSamplingMode == kSamplingCheckerboard;
     if (!settings.EnableSpecular)
         return;
 
@@ -2601,6 +2741,11 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 
     float2 size = Util::ConvertToDynamic(state->screenSize);
     float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
+    // Unlike diffuse half resolution, specular checkerboard stays on mip 0 and
+    // can trace the unpaired last column of an odd DRS render extent. The shader
+    // uses this same ceil(width / 2) compact extent.
+    const uint traceWidth = checkerboard ? std::max(1u, ((uint)size.x + 1u) / 2u) : (uint)size.x;
+    const uint traceDispatchX = (traceWidth + 7u) / 8u;
 
     // (batch 11, item A) This frame's denoiser, resolved *before* the ray march instead of after
     // it. It has to move up because the ray march now decides its own output layout on the
@@ -2721,10 +2866,11 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // meaning of the four channels changes, and SSRTCB::NRDFrontEndPack is what tells the shader
     // which meaning to write. Under REBLUR the back-end unpack is what fills texSSRColor, which
     // is where the deferred composite reads it from either way.
-    uavs.at(0) = nrdFrontEndPack ? texNRDPackInput->uav.get() : texSSRColor->uav.get();
+    uavs.at(0) = checkerboard ? texSparseSpecularColor->uav.get() :
+                                    (nrdFrontEndPack ? texNRDPackInput->uav.get() : texSSRColor->uav.get());
     // Unchanged on both paths: this R32_FLOAT surface is Upscaling.cpp's DLSS-RR specular
     // hit-distance guide, not private pack-pass input, so it cannot be traded away.
-    uavs.at(1) = texHitDistance->uav.get();  // (audit P6) was u2; u1 freed by dropping texHitPDF
+    uavs.at(1) = checkerboard ? texSparseSpecularHitDistance->uav.get() : texHitDistance->uav.get();
 
     // (S2.5) t0 stays unbound. ssrt_raymarch.hlsl declares HistoryTexture at t0 and never
     // references it, so fxc strips the binding entirely -- and texHistory is allocated lazily
@@ -2744,15 +2890,35 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 
     context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
     context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-    context->CSSetShader(raymarchSpecularCS.get(), nullptr, 0);
+    context->CSSetShader(checkerboard ? raymarchSpecularCheckerCS.get() : raymarchSpecularCS.get(), nullptr, 0);
     context->CSSetConstantBuffers(1, 1, &buffer);
 
-    context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+    context->Dispatch(traceDispatchX, (uint)dispatchCount.y, 1);
 
     state->EndPerfEvent();
     Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceSpecular);
 
     resetViews();
+
+    if (checkerboard) {
+        state->BeginPerfEvent("SSRT Specular Checkerboard Resolve");
+        Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTSparseResolve);
+
+        uavs.at(0) = nrdFrontEndPack ? texNRDPackInput->uav.get() : texSSRColor->uav.get();
+        uavs.at(1) = texHitDistance->uav.get();
+        srvs.at(0) = texSparseSpecularColor->srv.get();
+        srvs.at(1) = texSparseSpecularHitDistance->srv.get();
+        srvs.at(2) = normal.SRV;
+        srvs.at(3) = depth.depthSRV;
+        context->CSSetShaderResources(0, 4, srvs.data());
+        context->CSSetUnorderedAccessViews(0, 2, uavs.data(), nullptr);
+        context->CSSetShader(specularCheckerResolveCS.get(), nullptr, 0);
+        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        resetViews();
+
+        Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTSparseResolve);
+        state->EndPerfEvent();
+    }
 
     // (defect D4) The temporal history must be fed from the *first* a-trous iteration, not
     // from the end of the chain.

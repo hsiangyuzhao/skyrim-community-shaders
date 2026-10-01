@@ -51,6 +51,16 @@ public:
 	winrt::com_ptr<ID3D11SamplerState> linearSampler;
 	winrt::com_ptr<ID3D11SamplerState> pointSampler;
 
+	// DeferredCompositeCS reads this after SSGI has drawn for the current frame. FeatureData
+	// is uploaded before feature Prepass, so it cannot carry the effective REBLUR mode here.
+	struct alignas(16) SSGICompositeState
+	{
+		uint32_t ReblurDiffuseActive = 0;
+		uint32_t pad[3]{};
+	};
+	STATIC_ASSERT_ALIGNAS_16(SSGICompositeState);
+	std::unique_ptr<ConstantBuffer> ssgiCompositeStateCB;
+
 	struct alignas(16) PerGeometry
 	{
 		float4 VPOSOffset;

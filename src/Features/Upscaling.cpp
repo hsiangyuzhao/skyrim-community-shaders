@@ -18,7 +18,11 @@
 #include "Features/PostProcessing.h"
 
 #include "Features/ScreenSpaceRayTracing.h"
+#include "Features/ScreenSpaceGI.h"
+#include "Features/PerformanceOverlay.h"
 #include "Features/SubsurfaceScattering.h"
+#include "Menu.h"
+#include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Upscaling::NeuralRenderingSettings,
@@ -39,6 +43,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	frameLimitMode,
 	frameGenerationMode,
 	frameGenerationBackend,
+	dlssGFramesToGenerate,
 	frameGenerationForceEnable,
 	frameGenerationAllowInMenus,
 	streamlineLogLevel,
@@ -50,6 +55,361 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexMode,
 	reflexFrameLimit,
 	neuralRendering);
+
+namespace
+{
+	constexpr const char* kBatch33Experiments[] = {
+		"SSGI: temporal + blur / REBLUR",
+		"SSRT specular: Full / Checkerboard",
+		"Neural Rendering alone: Off / On",
+		"Neural Rendering with DLSS-G 2x: Off / On",
+		"DLSS-G: 2x / 3x (NR off)",
+		"DLSS-G: 2x / 4x (NR off)",
+		"Neural Rendering with DLSS-G 3x: Off / On"
+	};
+	constexpr DWORD kBatch33SettleMs = 12000;  // Longer than the overlay's 10-second statistics window.
+
+	struct Batch33ABState
+	{
+		struct OriginalSettings
+		{
+			bool valid = false;
+			uint fgMode = 0;
+			uint fgFrames = 1;
+			bool nrEnabled = false;
+			bool ssgiEnabled = false;
+			bool ssgiGI = false;
+			uint ssgiDenoiser = 0;
+			bool ssrtDiffuse = false;
+			bool ssrtSpecular = false;
+			uint ssrtSpecularSampling = 0;
+			bool overlayVisible = false;
+			bool overlayEnabled = false;
+			bool overlayDrawCalls = false;
+		} original;
+
+		int experiment = 0;
+		int pending = -1;  // 0 = A, 1 = B; capture after the settings menu closes.
+		ULONGLONG eligibleSince = 0;
+		uint64_t runId = 0;
+		uint64_t nrAttemptsAtArm = 0;
+		uint64_t nrSuccessesAtArm = 0;
+		uint64_t nrFailuresAtArm = 0;
+		uint64_t fgSamplesAtArm = 0;
+		uint64_t fgPresentedAtArm = 0;
+		json a;
+		json b;
+		std::string verdict;
+	};
+
+	Batch33ABState& GetBatch33ABState()
+	{
+		static Batch33ABState state;
+		return state;
+	}
+
+	void SaveBatch33OriginalSettings(Upscaling& upscaling, Batch33ABState& state)
+	{
+		if (state.original.valid)
+			return;
+		auto& original = state.original;
+		const auto& ssgi = globals::features::screenSpaceGI;
+		const auto& ssrt = globals::features::screenSpaceRayTracing;
+		const auto& overlay = globals::features::performanceOverlay;
+		original.valid = true;
+		original.fgMode = upscaling.settings.frameGenerationMode;
+		original.fgFrames = upscaling.settings.dlssGFramesToGenerate;
+		original.nrEnabled = upscaling.settings.neuralRendering.enabled;
+		original.ssgiEnabled = ssgi.settings.Enabled;
+		original.ssgiGI = ssgi.settings.EnableGI;
+		original.ssgiDenoiser = ssgi.settings.DenoiserMethod;
+		original.ssrtDiffuse = ssrt.settings.EnableDiffuse;
+		original.ssrtSpecular = ssrt.settings.EnableSpecular;
+		original.ssrtSpecularSampling = ssrt.settings.SpecularSamplingMode;
+		original.overlayVisible = globals::menu->overlayVisible;
+		original.overlayEnabled = overlay.settings.ShowInOverlay;
+		original.overlayDrawCalls = overlay.settings.ShowDrawCalls;
+	}
+
+	void RestoreBatch33OriginalSettings(Upscaling& upscaling, Batch33ABState& state)
+	{
+		const auto& original = state.original;
+		if (!original.valid)
+			return;
+		auto& ssgi = globals::features::screenSpaceGI;
+		auto& ssrt = globals::features::screenSpaceRayTracing;
+		auto& overlay = globals::features::performanceOverlay;
+		upscaling.settings.frameGenerationMode = original.fgMode;
+		upscaling.settings.dlssGFramesToGenerate = original.fgFrames;
+		upscaling.settings.neuralRendering.enabled = original.nrEnabled;
+		ssgi.settings.Enabled = original.ssgiEnabled;
+		ssgi.settings.EnableGI = original.ssgiGI;
+		ssgi.settings.DenoiserMethod = original.ssgiDenoiser;
+		ssgi.recompileFlag = true;
+		ssrt.settings.EnableDiffuse = original.ssrtDiffuse;
+		ssrt.settings.EnableSpecular = original.ssrtSpecular;
+		ssrt.settings.SpecularSamplingMode = original.ssrtSpecularSampling;
+		globals::menu->overlayVisible = original.overlayVisible;
+		overlay.settings.ShowInOverlay = original.overlayEnabled;
+		overlay.settings.ShowDrawCalls = original.overlayDrawCalls;
+		state = {};
+		logger::info("[B33AB] Original settings restored");
+	}
+
+	void ArmBatch33Run(Upscaling& upscaling, Batch33ABState& state, int arm)
+	{
+		SaveBatch33OriginalSettings(upscaling, state);
+		auto& ssgi = globals::features::screenSpaceGI;
+		auto& ssrt = globals::features::screenSpaceRayTracing;
+		if (arm == 0) {
+			++state.runId;
+			state.a = json();
+			state.b = json();
+			state.verdict.clear();
+		} else {
+			state.b = json();
+		}
+		const bool variant = arm == 1;
+		switch (state.experiment) {
+		case 0:
+			ssgi.settings.Enabled = true;
+			ssgi.settings.EnableGI = true;
+			ssrt.settings.EnableDiffuse = false;  // Otherwise SSRT owns diffuse IL.
+			ssgi.settings.DenoiserMethod = variant ? ScreenSpaceGI::kDenoiserREBLUR : ScreenSpaceGI::kDenoiserLegacy;
+			ssgi.recompileFlag = true;
+			break;
+		case 1:
+			ssrt.settings.EnableSpecular = true;
+			ssrt.settings.SpecularSamplingMode = variant ? ScreenSpaceRayTracing::kSamplingCheckerboard : ScreenSpaceRayTracing::kSamplingFull;
+			break;
+		case 2:
+			upscaling.settings.frameGenerationMode = 0;
+			upscaling.settings.neuralRendering.enabled = variant;
+			break;
+		case 3:
+			upscaling.settings.frameGenerationMode = 1;
+			upscaling.settings.dlssGFramesToGenerate = 1;
+			upscaling.settings.neuralRendering.enabled = variant;
+			break;
+		case 4:
+		case 5:
+			upscaling.settings.frameGenerationMode = 1;
+			upscaling.settings.neuralRendering.enabled = false;
+			upscaling.settings.dlssGFramesToGenerate = variant ? static_cast<uint>(state.experiment == 4 ? 2 : 3) : 1;
+			break;
+		case 6:
+			upscaling.settings.frameGenerationMode = 1;
+			upscaling.settings.dlssGFramesToGenerate = 2;
+			upscaling.settings.neuralRendering.enabled = variant;
+			break;
+		default:
+			return;
+		}
+		// The GPU pass timers intentionally run only while the draw-call table is visible.
+		// Keep that instrumentation on for both samples, including while the menu is closed.
+		globals::menu->overlayVisible = true;
+		auto& overlay = globals::features::performanceOverlay;
+		overlay.settings.ShowInOverlay = true;
+		overlay.settings.ShowDrawCalls = true;
+		Util::GpuPassTimers::GetSingleton()->Reset();
+		state.pending = arm;
+		state.eligibleSince = 0;
+		logger::info("[B33AB] run={} experiment={} arm={} requestedFG={} requestedNR={} requestedMFG={}; close settings menu and play the same scene",
+			state.runId, kBatch33Experiments[state.experiment], variant ? "B" : "A",
+			upscaling.settings.frameGenerationMode, upscaling.settings.neuralRendering.enabled,
+			upscaling.settings.dlssGFramesToGenerate + 1);
+	}
+
+	json CaptureBatch33Snapshot(Upscaling& upscaling, const Batch33ABState& state, int arm)
+	{
+		const auto& ssgi = globals::features::screenSpaceGI;
+		const auto& ssrt = globals::features::screenSpaceRayTracing;
+		const auto& overlay = globals::features::performanceOverlay;
+		const auto nr = NeuralRendering::GetDiagnostics();
+		const auto fg = upscaling.dx12SwapChain.GetDLSSGCadenceTotals();
+		const bool nrCountersReset = nr.attempts < state.nrAttemptsAtArm ||
+			nr.successes < state.nrSuccessesAtArm || nr.failures < state.nrFailuresAtArm;
+		const uint64_t nrAttemptDelta = nrCountersReset ? nr.attempts : nr.attempts - state.nrAttemptsAtArm;
+		const uint64_t nrSuccessDelta = nrCountersReset ? nr.successes : nr.successes - state.nrSuccessesAtArm;
+		const uint64_t nrFailureDelta = nrCountersReset ? nr.failures : nr.failures - state.nrFailuresAtArm;
+		const bool fgCountersReset = fg.samples < state.fgSamplesAtArm || fg.presented < state.fgPresentedAtArm;
+		const uint64_t fgSampleDelta = fgCountersReset ? fg.samples : fg.samples - state.fgSamplesAtArm;
+		const uint64_t fgPresentedDelta = fgCountersReset ? fg.presented : fg.presented - state.fgPresentedAtArm;
+		json snapshot;
+		snapshot["run"] = state.runId;
+		snapshot["experiment"] = kBatch33Experiments[state.experiment];
+		snapshot["arm"] = arm == 0 ? "A" : "B";
+		snapshot["request"] = {
+			{ "upscaler", static_cast<uint>(upscaling.GetUpscaleMethod()) },
+			{ "fgBackend", static_cast<uint>(upscaling.GetFrameGenerationBackend()) },
+			{ "fg", upscaling.settings.frameGenerationMode },
+			{ "fgGeneratedFrames", upscaling.settings.dlssGFramesToGenerate },
+			{ "nr", upscaling.settings.neuralRendering.enabled },
+			{ "ssgi", ssgi.settings.Enabled },
+			{ "ssgiGI", ssgi.settings.EnableGI },
+			{ "ssgiDenoiser", ssgi.settings.DenoiserMethod },
+			{ "ssrtDiffuse", ssrt.settings.EnableDiffuse },
+			{ "ssrtSpecular", ssrt.settings.EnableSpecular },
+			{ "ssrtSpecularSampling", ssrt.settings.SpecularSamplingMode },
+			{ "ssrtDenoiser", ssrt.settings.DenoiserMethod },
+			{ "dlssRR", upscaling.settings.enableDLSSRR }
+		};
+		snapshot["effective"] = {
+			{ "ssgiReblur", ssgi.WantsReblurGuides() },
+			{ "ssgiReblurOutput", ssgi.GetReblurDiffuseOutputSRV() != nullptr },
+			{ "ssrtSpecularSampling", ssrt.activeSpecularSamplingMode },
+			{ "ssrtSpecularDenoiser", ssrt.EffectiveDenoiser(true) },
+			{ "nrApplied", nr.appliedThisFrame },
+			{ "nrStatus", nr.status },
+			{ "nrSizeContract", nr.sizeContractSatisfied },
+			{ "nrFailureLatched", nr.failureLatched },
+			{ "nrAttempts", nr.attempts },
+			{ "nrSuccesses", nr.successes },
+			{ "nrFailures", nr.failures },
+			{ "nrCounterResetDuringArm", nrCountersReset },
+			{ "nrAttemptsDuringArm", nrAttemptDelta },
+			{ "nrSuccessesDuringArm", nrSuccessDelta },
+			{ "nrFailuresDuringArm", nrFailureDelta },
+			{ "nrSceneWidth", nr.sceneWidth },
+			{ "nrSceneHeight", nr.sceneHeight },
+			{ "nrDepthWidth", nr.depthWidth },
+			{ "nrDepthHeight", nr.depthHeight },
+			{ "nrMotionWidth", nr.motionWidth },
+			{ "nrMotionHeight", nr.motionHeight },
+			{ "nrNgxResult", nr.ngxResult },
+			{ "nrSceneResource", nr.sceneResource },
+			{ "nrDepthResource", nr.depthResource },
+			{ "nrMotionResource", nr.motionResource },
+			{ "nrSceneFormat", nr.sceneFormat },
+			{ "nrDepthFormat", nr.depthFormat },
+			{ "nrMotionFormat", nr.motionFormat },
+			{ "fgActive", upscaling.streamline.IsDLSSGActive() },
+			{ "fgAppliedGeneratedFrames", upscaling.streamline.GetDLSSGAppliedFramesToGenerate() },
+			{ "fgMaxGeneratedFrames", upscaling.streamline.GetDLSSGMaxFramesToGenerate() },
+			{ "fgCounterResetDuringArm", fgCountersReset },
+			{ "fgPresentSamplesDuringArm", fgSampleDelta },
+			{ "fgPresentedFramesDuringArm", fgPresentedDelta },
+			{ "fgMeanPresentedPerRenderedFrame", fgSampleDelta ?
+				static_cast<float>(fgPresentedDelta) / static_cast<float>(fgSampleDelta) : 0.0f },
+			{ "fgRuntimeFaulted", upscaling.streamline.dlssGRuntimeFaulted }
+		};
+		const auto frameStats = overlay.ComputeFrameStats();
+		snapshot["metrics"] = {
+			{ "frameStatsValid", frameStats.valid },
+			{ "rawMeanMs", frameStats.averageMs },
+			{ "rawP99Ms", frameStats.percentile99Ms },
+			{ "fgMeasuredMultiplier", upscaling.GetFrameGenerationPresentMultiplier() }
+		};
+		snapshot["gpuMs"] = json::object();
+		Util::GpuPassTimers::GetSingleton()->ForEachActiveBucket([&snapshot](const Util::GpuPassTimers::BucketReport& report) {
+			snapshot["gpuMs"][report.label] = report.smoothedMs;
+		});
+		return snapshot;
+	}
+
+	std::string CompareBatch33Snapshots(const json& a, const json& b)
+	{
+		const auto requestDiff = json::diff(a.at("request"), b.at("request"));
+		const bool singleSettingPair = requestDiff.size() == 1;
+		const bool metricsValid = a.at("metrics").at("frameStatsValid").get<bool>() &&
+			b.at("metrics").at("frameStatsValid").get<bool>();
+		bool effectiveValid = true;
+		json summary = {
+			{ "run", b.at("run") },
+			{ "singleSettingPair", singleSettingPair },
+			{ "metricsValid", metricsValid },
+			{ "requestDiff", requestDiff },
+			{ "rawMeanMsDelta", b.at("metrics").at("rawMeanMs").get<float>() - a.at("metrics").at("rawMeanMs").get<float>() },
+			{ "gpuMsDelta", json::object() }
+		};
+		for (auto it = b.at("gpuMs").begin(); it != b.at("gpuMs").end(); ++it) {
+			if (a.at("gpuMs").contains(it.key()))
+				summary["gpuMsDelta"][it.key()] = it.value().get<float>() - a.at("gpuMs").at(it.key()).get<float>();
+		}
+		std::string verdict = singleSettingPair ? "one requested setting changed" : "confounded: expected exactly one requested setting change";
+		if (!metricsValid)
+			verdict += "; frame timing window is invalid";
+		const auto& effective = b.at("effective");
+		const int experiment = GetBatch33ABState().experiment;
+		if (experiment == 0 && (!effective.at("ssgiReblur").get<bool>() ||
+			!effective.at("ssgiReblurOutput").get<bool>())) {
+			verdict += "; SSGI REBLUR did not publish an output";
+			effectiveValid = false;
+		}
+		if (experiment == 1 && effective.at("ssrtSpecularSampling").get<uint>() != ScreenSpaceRayTracing::kSamplingCheckerboard) {
+			verdict += "; SSRT checkerboard fell back to Full";
+			effectiveValid = false;
+		}
+		if ((experiment == 2 || experiment == 3 || experiment == 6) &&
+			(!effective.at("nrApplied").get<bool>() ||
+			 effective.at("nrSuccessesDuringArm").get<uint64_t>() == 0 ||
+			 effective.at("nrCounterResetDuringArm").get<bool>())) {
+			verdict += "; NR did not run: " + effective.at("nrStatus").get<std::string>();
+			effectiveValid = false;
+		}
+		if ((experiment == 2 || experiment == 3 || experiment == 6) &&
+			effective.at("nrFailuresDuringArm").get<uint64_t>() > 0) {
+			verdict += "; NR had failures during the B sample";
+			effectiveValid = false;
+		}
+		if (experiment >= 3) {
+			for (const auto* sample : { &a, &b }) {
+				const auto& fg = sample->at("effective");
+				const uint requested = sample->at("request").at("fgGeneratedFrames").get<uint>();
+				const auto arm = sample->at("arm").get<std::string>();
+				if (!fg.at("fgActive").get<bool>() || fg.at("fgCounterResetDuringArm").get<bool>() ||
+					fg.at("fgAppliedGeneratedFrames").get<uint>() < requested ||
+					fg.at("fgPresentSamplesDuringArm").get<uint64_t>() < 8 ||
+					fg.at("fgMeanPresentedPerRenderedFrame").get<float>() + 0.25f < static_cast<float>(requested + 1)) {
+					verdict += "; DLSS-G " + arm + " did not demonstrate its requested presentation cadence";
+					effectiveValid = false;
+				}
+			}
+		}
+		summary["effectiveValid"] = effectiveValid;
+		summary["cleanPair"] = singleSettingPair && metricsValid && effectiveValid;
+		summary["verdict"] = verdict;
+		logger::info("[B33AB] compare {}", summary.dump());
+		return verdict;
+	}
+
+	void DrawBatch33ABLab(Upscaling& upscaling)
+	{
+		if (globals::game::isVR || !ImGui::TreeNodeEx("Batch33 A/B Lab"))
+			return;
+		auto& state = GetBatch33ABState();
+		if (ImGui::Combo("Experiment", &state.experiment, kBatch33Experiments, IM_ARRAYSIZE(kBatch33Experiments))) {
+			state.a = json();
+			state.b = json();
+			state.pending = -1;
+			state.verdict.clear();
+		}
+		ImGui::TextWrapped("Run A, close this menu and play the fixed scene for 12 seconds. Reopen it, Run B, then repeat. Capture and comparison are automatic; the log contains every requested and effective state plus GPU timing rows.");
+		if (ImGui::Button("Run A"))
+			ArmBatch33Run(upscaling, state, 0);
+		ImGui::SameLine();
+		if (ImGui::Button("Run B")) {
+			if (state.a.is_object())
+				ArmBatch33Run(upscaling, state, 1);
+			else
+				state.verdict = "Capture A first, then run B in the same scene.";
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Restore original settings"))
+			RestoreBatch33OriginalSettings(upscaling, state);
+		ImGui::Text("A: %s  B: %s", state.a.is_object() ? "captured" : "waiting", state.b.is_object() ? "captured" : "waiting");
+		if (state.pending >= 0)
+			ImGui::TextDisabled("Capture %c armed; close the settings menu and unpause gameplay.", state.pending == 0 ? 'A' : 'B');
+		if (!state.verdict.empty())
+			ImGui::TextWrapped("%s", state.verdict.c_str());
+		if (upscaling.GetUpscaleMethod() != Upscaling::UpscaleMethod::kDLSS && state.experiment >= 2)
+			ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "NR experiments require DLSS upscaling.");
+		if (state.experiment >= 3 && !upscaling.IsDLSSGBackend())
+			ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "DLSS-G must be selected before launching the game; use the package preflight script.");
+		ImGui::TextDisabled("SSRT remains a separate feature in batch33; upstream efficiency candidates have not been ported.");
+		ImGui::TreePop();
+	}
+}
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
 
@@ -321,13 +681,10 @@ void Upscaling::DrawSettings()
 		}
 
 		if (nr.enabled) {
-			// Everything that can stop the pass, stated rather than left to a silent no-op.
-			if (d3d12SwapChainActive && IsFrameGenerationRequestedNow()) {
+			if (d3d12SwapChainActive && IsDLSSGBackend() && IsFrameGenerationRequestedNow()) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Blocked: Frame Generation is running. Switch it off -- no restart needed.");
+				ImGui::TextUnformatted("NR + DLSS-G coexistence test is requested. Check the Batch33 A/B Lab and log for actual execution.");
 				ImGui::PopStyleColor();
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("DLSS-G intercepts Present asynchronously, and this pass writes into the scene through a D3D12 device of its own, so the two cannot both be working on the same image. Switching Frame Generation off releases it immediately: the proxy swapchain stays, idle, which is exactly what lets the two share a session. Switching it back on is the direction that still needs a restart, and only if the session booted with it off.");
 			}
 
 			// Probe as soon as the feature is switched on, rather than waiting for the frame path
@@ -455,13 +812,30 @@ void Upscaling::DrawSettings()
 			const char* toggleModesFG[] = { "Disabled", enabledLabel.c_str() };
 
 			ImGui::SliderInt("Frame Generation", (int*)&settings.frameGenerationMode, 0, 1, toggleModesFG[settings.frameGenerationMode]);
+			if (activeBackend == FrameGenerationBackend::kDLSSG) {
+				int generatedFrames = static_cast<int>(settings.dlssGFramesToGenerate);
+				if (ImGui::SliderInt("DLSS-G generated frames", &generatedFrames, 1, 3,
+						"%d per rendered frame", ImGuiSliderFlags_AlwaysClamp))
+					settings.dlssGFramesToGenerate = static_cast<uint>(std::clamp(generatedFrames, 1, 3));
+				if (streamline.GetDLSSGMaxFramesToGenerate() == 0)
+					ImGui::Text("Requested %ux; applied %ux; hardware maximum pending",
+						settings.dlssGFramesToGenerate + 1,
+						streamline.GetDLSSGAppliedFramesToGenerate() + 1);
+				else
+					ImGui::Text("Requested %ux; applied %ux; hardware maximum %ux",
+						settings.dlssGFramesToGenerate + 1,
+						streamline.GetDLSSGAppliedFramesToGenerate() + 1,
+						streamline.GetDLSSGMaxFramesToGenerate() + 1);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::TextUnformatted("1/2/3 generated frames request 2x/3x/4x. Streamline clamps to the hardware maximum; use the measured post-FG multiplier to confirm actual presentation.");
+			}
 
 			if (!d3d12SwapChainActive)
 				ImGui::BeginDisabled();
 
 			ImGui::SliderInt("Frame Limit (VSync off only)", (int*)&settings.frameLimitMode, 0, 1, std::format("{}", toggleModes[settings.frameLimitMode]).c_str());
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Paces presentation to the refresh rate, or half of it while generating. It runs only when the game presents with a sync interval of zero, so anything that turns VSync on -- including SSE Display Tweaks, which owns that setting for most setups -- leaves it inert.");
+				ImGui::TextUnformatted("Paces presentation to the refresh rate, or the selected generation fraction while generating. It runs only when the game presents with a sync interval of zero, so anything that turns VSync on -- including SSE Display Tweaks, which owns that setting for most setups -- leaves it inert.");
 				ImGui::TextUnformatted("It also spins after Present, which is the wrong side of the frame for a cap: it holds the CPU once the work is already submitted. Under a variable refresh rate prefer the Reflex frame limit below, which is applied before input is sampled and which the driver is aware of.");
 			}
 
@@ -515,16 +889,19 @@ void Upscaling::DrawSettings()
 					reflexFrameLimit > 0 ? "%d presented fps" : "Off", ImGuiSliderFlags_AlwaysClamp))
 				settings.reflexFrameLimit = static_cast<uint>(std::max(reflexFrameLimit, 0));
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Caps frames as they reach the display, not as they are rendered. The driver knows the generation multiplier, so with generation running a cap of 60 renders 30 and presents 60; the same cap where generation is off renders and presents 60. Zero leaves it uncapped.");
+				ImGui::TextUnformatted("Caps frames as they reach the display, not as they are rendered. The driver knows the generation multiplier, so a 60 presented fps cap targets about 30 rendered fps at 2x or 20 at 3x. Zero leaves it uncapped.");
 				ImGui::TextUnformatted("This is the cap to use with a variable refresh rate. It is imposed inside Reflex's own sleep, before input is sampled, and the driver knows about it -- unlike a limiter that spins after Present, which adds the time it waits to the latency of the frame it just submitted.");
 				ImGui::TextUnformatted("Interpolation assumes evenly spaced frames, so a cap low enough to hold steady in the worst case is usually worth more than the headroom it gives up. Keep it below the display's maximum refresh so presentation stays inside the variable-refresh window.");
 			}
 
 			ImGui::Text("Display reports %.0f Hz", refreshRate);
 			if (settings.reflexFrameLimit > 0) {
-				if (IsFrameGenerationRequestedNow())
+				if (IsFrameGenerationRequestedNow()) {
+					const uint multiplier = IsDLSSGBackend() ?
+						std::max(2u, streamline.GetDLSSGAppliedFramesToGenerate() + 1) : 2u;
 					ImGui::Text("About %u presented, from %u rendered while generating",
-						settings.reflexFrameLimit, settings.reflexFrameLimit / 2);
+						settings.reflexFrameLimit, settings.reflexFrameLimit / multiplier);
+				}
 				if (settings.reflexFrameLimit > refreshRate) {
 					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 					ImGui::Text("Above the refresh rate: presentation leaves the variable-refresh window.");
@@ -601,6 +978,44 @@ void Upscaling::DrawSettings()
 			slSorters);
 		ImGui::TreePop();
 	}
+	DrawBatch33ABLab(*this);
+}
+
+void Upscaling::TickBatch33AB()
+{
+	auto& state = GetBatch33ABState();
+	if (state.pending < 0 || !globals::menu || globals::menu->IsEnabled ||
+		!globals::game::ui || globals::game::ui->GameIsPaused()) {
+		state.eligibleSince = 0;
+		return;
+	}
+	const auto now = GetTickCount64();
+	if (state.eligibleSince == 0) {
+		// Begin the counter window only when gameplay is eligible. A pause or
+		// settings-menu interruption restarts both the clock and these baselines.
+		const auto nr = NeuralRendering::GetDiagnostics();
+		state.nrAttemptsAtArm = nr.attempts;
+		state.nrSuccessesAtArm = nr.successes;
+		state.nrFailuresAtArm = nr.failures;
+		const auto fg = dx12SwapChain.GetDLSSGCadenceTotals();
+		state.fgSamplesAtArm = fg.samples;
+		state.fgPresentedAtArm = fg.presented;
+		state.eligibleSince = now;
+		return;
+	}
+	if (now - state.eligibleSince < kBatch33SettleMs)
+		return;
+	const int arm = state.pending;
+	json snapshot = CaptureBatch33Snapshot(*this, state, arm);
+	logger::info("[B33AB] capture {}", snapshot.dump());
+	if (arm == 0)
+		state.a = std::move(snapshot);
+	else
+		state.b = std::move(snapshot);
+	state.pending = -1;
+	state.eligibleSince = 0;
+	if (state.a.is_object() && state.b.is_object())
+		state.verdict = CompareBatch33Snapshots(state.a, state.b);
 }
 
 void Upscaling::SaveSettings(json& o_json)
@@ -637,6 +1052,10 @@ void Upscaling::LoadSettings(json& o_json)
 	if (settings.frameGenerationBackend >= frameGenerationBackendCount) {
 		logger::warn("[Upscaling] Loaded frameGenerationBackend {} out of range, falling back to FSR 3.1", settings.frameGenerationBackend);
 		settings.frameGenerationBackend = static_cast<uint>(FrameGenerationBackend::kFSR3FG);
+	}
+	if (settings.dlssGFramesToGenerate < 1 || settings.dlssGFramesToGenerate > 3) {
+		logger::warn("[Upscaling] Loaded dlssGFramesToGenerate {} out of range, clamping to 1..3", settings.dlssGFramesToGenerate);
+		settings.dlssGFramesToGenerate = std::clamp(settings.dlssGFramesToGenerate, 1u, 3u);
 	}
 	constexpr auto dlssPresetCount = static_cast<uint>(DLSSModelPreset::kCount);
 	if (settings.DLSSPreset >= dlssPresetCount) {
@@ -1384,9 +1803,13 @@ void Upscaling::FrameLimiter()
 		if (settings.frameLimitMode) {
 			// Fall back to the original timing method
 			// Use integer arithmetic for more precise timing
-			const bool generatingNow = IsFrameGenerationRequestedNow() &&
-			                           (!globals::game::ui->GameIsPaused() || IsFrameGenerationAllowedWhilePaused());
-			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate * (generatingNow ? 0.5 : 1.0)));
+			// SetOptions ran earlier in this Present. Pace only when generation really
+			// stayed active; a failed or suspended DLSS-G request must not cap raw FPS.
+			const bool generatingNow = IsFrameGenerationActive();
+			const uint multiplier = generatingNow && IsDLSSGBackend() ?
+				std::max(2u, streamline.GetDLSSGAppliedFramesToGenerate() + 1) : 2u;
+			int64_t targetFrameTimeNS = int64_t(1000000000.0 /
+				(refreshRate * (generatingNow ? 1.0 / multiplier : 1.0)));
 			int64_t targetFrameTicks = (targetFrameTimeNS * qpf.QuadPart) / 1000000000LL;
 
 			static LARGE_INTEGER lastFrame = {};

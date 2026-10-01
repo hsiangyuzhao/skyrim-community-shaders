@@ -34,6 +34,7 @@ namespace Util
 		SSRTConfidenceFilter,    // reinjection confidence: quarter-res downsample + separable blur + upsample
 		NRDGuides,               // (batch 11, item B1) NRD::PrepareGuides: viewZ + normal/roughness + MV copy
 		SSGI,                    // Screen Space GI compute chain (excluding Contact AO)
+		SSGIReblur,              // SSGI's NRD REBLUR diffuse IL dispatches
 		SSGIContactAO,           // SSGI Contact AO pass
 		PhysicalSkyShadowAccum,  // Physical Sky aerial-perspective shadow accumulation
 		PhysicalSkyLuts,         // Physical Sky transmittance / multiscatter / sky-view / aerial LUTs

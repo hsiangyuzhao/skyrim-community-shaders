@@ -24,6 +24,10 @@ Texture2D<unorm float4> srcBentNormal : register(t6);  // half-res
 // channels, hardware bilinear included.
 Texture2D<float4> srcEnvIrradiance : register(t7);  // half-res
 #endif
+#ifdef SSGI_REBLUR
+// Packed YCoCg radiance + normalized hit distance, at the GI working resolution.
+Texture2D<float4> srcNRDDiffuse : register(t8);
+#endif
 
 RWTexture2D<half> outAo : register(u0);
 RWTexture2D<half4> outIlY : register(u1);
@@ -32,6 +36,9 @@ RWTexture2D<half4> outGiSpecular : register(u3);
 RWTexture2D<unorm float4> outBentNormal : register(u4);
 #ifdef DYNAMIC_CUBEMAPS
 RWTexture2D<float4> outEnvIrradiance : register(u5);
+#endif
+#ifdef SSGI_REBLUR
+RWTexture2D<float4> outNRDDiffuse : register(u6);
 #endif
 
 #define min4(v) min(min(v.x, v.y), min(v.z, v.w))
@@ -70,6 +77,9 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 	float4 y;
 	float2 coCg;
 	float4 giSpecular;
+#ifdef SSGI_REBLUR
+	float4 nrdDiffuse;
+#endif
 #ifdef DYNAMIC_CUBEMAPS
 	float4 envIrradiance;
 #endif
@@ -87,6 +97,9 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 		y = BLEND_WEIGHT(srcIlY[px00], srcIlY[px01], srcIlY[px10], srcIlY[px11], w, sumw);
 		coCg = BLEND_WEIGHT(srcIlCoCg[px00], srcIlCoCg[px01], srcIlCoCg[px10], srcIlCoCg[px11], w, sumw);
 		giSpecular = BLEND_WEIGHT(srcGiSpecular[px00], srcGiSpecular[px01], srcGiSpecular[px10], srcGiSpecular[px11], w, sumw);
+#ifdef SSGI_REBLUR
+		nrdDiffuse = BLEND_WEIGHT(srcNRDDiffuse[px00], srcNRDDiffuse[px01], srcNRDDiffuse[px10], srcNRDDiffuse[px11], w, sumw);
+#endif
 #ifdef DYNAMIC_CUBEMAPS
 		envIrradiance = BLEND_WEIGHT(srcEnvIrradiance[px00], srcEnvIrradiance[px01], srcEnvIrradiance[px10], srcEnvIrradiance[px11], w, sumw);
 #endif
@@ -98,6 +111,9 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 		y = srcIlY.SampleLevel(samplerLinearClamp, uv, 0);
 		coCg = srcIlCoCg.SampleLevel(samplerLinearClamp, uv, 0);
 		giSpecular = srcGiSpecular.SampleLevel(samplerLinearClamp, uv, 0);
+#ifdef SSGI_REBLUR
+		nrdDiffuse = srcNRDDiffuse.SampleLevel(samplerLinearClamp, uv, 0);
+#endif
 #ifdef DYNAMIC_CUBEMAPS
 		envIrradiance = srcEnvIrradiance.SampleLevel(samplerLinearClamp, uv, 0);
 #endif
@@ -142,6 +158,9 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 	outIlY[dtid] = y;
 	outIlCoCg[dtid] = coCg;
 	outGiSpecular[dtid] = giSpecular;
+#ifdef SSGI_REBLUR
+	outNRDDiffuse[dtid] = nrdDiffuse;
+#endif
 #ifdef DYNAMIC_CUBEMAPS
 	outEnvIrradiance[dtid] = envIrradiance;
 #endif

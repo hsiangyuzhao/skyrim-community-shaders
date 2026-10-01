@@ -1,0 +1,8 @@
+ID,Lab experiment,Scene,Lab fixed conditions,Run A,Run B,Seconds after each menu close,A capture timestamp,B capture timestamp,cleanPair,Effective A,Effective B,GPU bucket A ms,GPU bucket B ms,rawMeanMs A,rawMeanMs B,Presented FPS A,Presented FPS B,Visual notes,Result
+01,SSGI: temporal + blur / REBLUR,Same saved world view,SSGI and GI enabled; SSRT diffuse off,Legacy,REBLUR,12,,,,,,,,,,,,,
+02,SSRT specular: Full / Checkerboard,Same reflective view,SSRT specular enabled,Full,Checkerboard,12,,,,,,,,,,,,,
+03,Neural Rendering alone: Off / On,Same saved world view,FG off,NR off,NR on,12,,,,,,,,,,,,,
+04,Neural Rendering with DLSS-G 2x: Off / On,Same saved world view,FG on 2x,NR off,NR on,12,,,,,,,,,,,,,
+05,DLSS-G: 2x / 3x (NR off),Same saved world view,FG on; NR off,FG 2x,FG 3x,12,,,,,,,,,,,,,
+06,DLSS-G: 2x / 4x (NR off),Same saved world view,FG on; NR off,FG 2x,FG 4x,12,,,,,,,,,,,,,
+07,Neural Rendering with DLSS-G 3x: Off / On,Same saved world view,FG on 3x,NR off,NR on,12,,,,,,,,,,,,,

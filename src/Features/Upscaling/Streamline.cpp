@@ -688,6 +688,7 @@ void Streamline::FallbackDLSSG(const char* a_reason, sl::Result a_result, sl::DL
 	dlssGStateFallbackApplied = true;
 	dlssGRuntimeFaulted = true;
 	dlssGActive = false;
+	dlssGAppliedFramesToGenerate = 1;
 	dlssGOptionsInitialized = true;
 	logger::error("[Streamline] DLSS-G {} (result={}, status={}); disabling DLSS-G for this session", a_reason, magic_enum::enum_name(a_result), static_cast<uint32_t>(a_status));
 
@@ -717,16 +718,29 @@ bool Streamline::SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff)
 
 	const auto inputWidth = swapChain.GetDLSSGInputWidth();
 	const auto inputHeight = swapChain.GetDLSSGInputHeight();
+	const uint32_t requestedFrames = std::clamp<uint32_t>(
+		globals::features::upscaling.settings.dlssGFramesToGenerate, 1u, 3u);
+	// slDLSSGGetState is already called after each Present. Do not query it here:
+	// doing so would consume numFramesActuallyPresented before the cadence logger
+	// sees it. Until its first report, ask for only the universally supported 2x.
+	const uint32_t supportedFrames = std::max(1u, dlssGMaxFramesToGenerate);
+	const uint32_t appliedFrames = std::min(requestedFrames, supportedFrames);
 	const bool inputExtentUnchanged = dlssGConfiguredInputWidth == inputWidth && dlssGConfiguredInputHeight == inputHeight;
 	const bool outputExtentUnchanged = dlssGConfiguredOutputWidth == swapChain.swapChainDesc.Width &&
 	                                   dlssGConfiguredOutputHeight == swapChain.swapChainDesc.Height;
 	const bool retentionUnchanged = dlssGRetainResourcesWhenOff == a_retainResourcesWhenOff;
-	if (dlssGOptionsInitialized && dlssGActive == a_enable && retentionUnchanged && (!a_enable || (inputExtentUnchanged && outputExtentUnchanged)))
+	if (dlssGOptionsInitialized && dlssGActive == a_enable && retentionUnchanged &&
+		(!a_enable || (inputExtentUnchanged && outputExtentUnchanged &&
+		                 dlssGRequestedFramesToGenerate == requestedFrames &&
+		                 dlssGAppliedFramesToGenerate == appliedFrames)))
 		return true;
 
 	sl::DLSSGOptions options{};
 	options.mode = a_enable ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
-	options.numFramesToGenerate = 1;  // Fixed 2x: one generated frame per real frame.
+	options.numFramesToGenerate = a_enable ? appliedFrames : 1;
+	// D3D12 uses the presenting-queue-blocking mode. It guarantees ordering
+	// between the plugin's read of tagged inputs and our next queue signal.
+	options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
 	// FinalColor already contains the scene plus UI. UI recomposition stays off
 	// because this path only supplies an exact-format HUD-less snapshot.
 	// This integration uses the fixed input ratio selected by the active
@@ -759,24 +773,31 @@ bool Streamline::SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff)
 		return false;
 	}
 
+	globals::features::upscaling.dx12SwapChain.ResetDLSSGCadenceMeasurement();
 	dlssGActive = a_enable;
 	dlssGOptionsInitialized = true;
 	dlssGRetainResourcesWhenOff = a_retainResourcesWhenOff;
+	dlssGRequestedFramesToGenerate = requestedFrames;
+	dlssGAppliedFramesToGenerate = a_enable ? appliedFrames : 1;
 	dlssGConfiguredInputWidth = inputWidth;
 	dlssGConfiguredInputHeight = inputHeight;
 	dlssGConfiguredOutputWidth = swapChain.swapChainDesc.Width;
 	dlssGConfiguredOutputHeight = swapChain.swapChainDesc.Height;
-	logger::info("[Streamline] DLSS-G mode {} with input extent {}x{} and output extent {}x{} (retainWhenOff={})",
+	logger::info("[Streamline] DLSS-G mode {} with input extent {}x{} and output extent {}x{} (retainWhenOff={}, requested={}x, configured={}x, supportedMax={}x{})",
 		a_enable ? "enabled" : "disabled",
 		inputWidth,
 		inputHeight,
 		swapChain.swapChainDesc.Width,
 		swapChain.swapChainDesc.Height,
-		a_retainResourcesWhenOff);
+		a_retainResourcesWhenOff,
+		requestedFrames + 1,
+		(a_enable ? appliedFrames : 1) + 1,
+		supportedFrames + 1,
+		dlssGMaxFramesToGenerate == 0 ? ", capability pending" : "");
 	return true;
 }
 
-bool Streamline::GetDLSSGState(sl::DLSSGState& a_state)
+bool Streamline::GetDLSSGState(sl::DLSSGState& a_state, bool a_requireHealthy)
 {
 	a_state = {};
 	if (!IsDLSSGReady() || slDLSSGGetState == nullptr)
@@ -784,11 +805,18 @@ bool Streamline::GetDLSSGState(sl::DLSSGState& a_state)
 
 	const auto result = slDLSSGGetState(viewport, a_state, nullptr);
 	if (result != sl::Result::eOk) {
-		FallbackDLSSG("state query failed", result, a_state.status);
+		if (a_requireHealthy)
+			FallbackDLSSG("state query failed", result, a_state.status);
 		return false;
 	}
+	if (a_state.numFramesToGenerateMax > 0 && a_state.numFramesToGenerateMax != dlssGMaxFramesToGenerate) {
+		dlssGMaxFramesToGenerate = a_state.numFramesToGenerateMax;
+		logger::info("[DLSS-G] Runtime supports up to {}x frame generation ({} generated per rendered frame)",
+			dlssGMaxFramesToGenerate + 1, dlssGMaxFramesToGenerate);
+	}
 	if (a_state.status != sl::DLSSGStatus::eOk) {
-		FallbackDLSSG("reported an invalid runtime state", sl::Result::eOk, a_state.status);
+		if (a_requireHealthy)
+			FallbackDLSSG("reported an invalid runtime state", sl::Result::eOk, a_state.status);
 		return false;
 	}
 
@@ -859,6 +887,7 @@ void Streamline::DestroyDLSSGResources(bool a_modeSwitch)
 
 	dlssGActive = false;
 	dlssGOptionsInitialized = false;
+	dlssGAppliedFramesToGenerate = 1;
 	if (slFreeResources != nullptr && featureDLSS_G) {
 		if (SL_FAILED(result, slFreeResources(sl::kFeatureDLSS_G, viewport)))
 			logger::error("[Streamline] Could not free DLSS-G resources ({})", magic_enum::enum_name(result));

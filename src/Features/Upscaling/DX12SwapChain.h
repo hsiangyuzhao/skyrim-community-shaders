@@ -8,6 +8,8 @@
 
 #include <d3d11_4.h>
 #include <d3d12.h>
+#include <atomic>
+#include <cstdint>
 
 #include <directx/d3dx12.h>
 
@@ -30,6 +32,8 @@ public:
 	DXGISwapChainProxy(IDXGISwapChain4* a_swapChain);
 
 	IDXGISwapChain4* swapChain;
+	// The game owns proxy references independently of DX12SwapChain's native swap chain.
+	std::atomic<ULONG> refCount{ 1 };
 
 	/****IUnknown****/
 	virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override;
@@ -155,6 +159,13 @@ public:
 	 *         Callers must fall back to an estimate and label it as such.
 	 */
 	float GetMeasuredPresentMultiplier() const { return measuredPresentMultiplier; }
+	struct DLSSGCadenceTotals
+	{
+		uint64_t samples = 0;
+		uint64_t presented = 0;
+	};
+	DLSSGCadenceTotals GetDLSSGCadenceTotals() const { return { dlssGTotalSamples, dlssGTotalPresented }; }
+	void ResetDLSSGCadenceMeasurement();
 
 	void CreateD3D12Device(IDXGIAdapter* a_adapter);
 	void CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC swapChainDesc);
@@ -165,7 +176,7 @@ public:
 	void SetD3D11Device(ID3D11Device* a_d3d11Device);
 	void SetD3D11DeviceContext(ID3D11DeviceContext* a_d3d11Context);
 
-	HRESULT GetBuffer(void** ppSurface);
+	HRESULT GetBuffer(UINT buffer, REFIID riid, void** ppSurface);
 	HRESULT Present(UINT SyncInterval, UINT Flags);
 	HRESULT GetDevice(_In_ REFIID riid, _COM_Outptr_ void** ppDevice);
 	HANDLE GetFrameLatencyWaitableObject();
@@ -182,6 +193,9 @@ public:
 	void CreateSharedResources();
 
 private:
+	void WaitForDLSSGInputsBeforeResourceRecreation(const char* a_reason);
+	void LogDLSSGCadenceWindow();
+
 	enum class DLSSGPresentationState
 	{
 		kGameplay,
@@ -204,4 +218,16 @@ private:
 	// Smoothed presented-frames-per-rendered-frame, fed from the DLSS-G state query
 	// already issued once per Present. 0 means "never measured".
 	float measuredPresentMultiplier = 0.0f;
+	bool dlssGPreviousStateQueryValid = false;
+	bool dlssGInputsFenceObserved = false;
+	bool dlssGInputsFenceMissingLogged = false;
+	uint32_t dlssGCadenceSamples = 0;
+	uint32_t dlssGCadencePresented = 0;
+	uint64_t dlssGTotalSamples = 0;
+	uint64_t dlssGTotalPresented = 0;
+	uint32_t dlssGCadenceBuckets[6]{};  // 0, 1, 2, 3, 4, 5+ presented.
+	uint32_t dlssGCadenceRequested = 1;
+	uint32_t dlssGCadenceApplied = 1;
+	uint32_t dlssGCadenceFirstToken = UINT32_MAX;
+	uint32_t dlssGCadenceLastToken = UINT32_MAX;
 };

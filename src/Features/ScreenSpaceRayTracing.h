@@ -1,6 +1,8 @@
 #pragma once
 #define ENABLE_SHARC
 
+#include <cstddef>
+
 #include "NRD.h"
 
 struct ScreenSpaceRayTracing : Feature
@@ -178,6 +180,11 @@ struct ScreenSpaceRayTracing : Feature
         /// no extent mismatch to reset and blending through the transition is quieter than
         /// restarting the accumulation would be.
         uint DiffuseSamplingMode = kSamplingFull;
+        /// @brief Full-resolution specular tracing or one traced pixel per horizontal pair.
+        /// The checkerboard path resolves radiance and the raw R32 hit-distance guide back to
+        /// full resolution before REBLUR, SVGF, Off, the composite or DLSS-RR reads either.
+        /// Full remains the reference/default image for a direct A/B comparison.
+        uint SpecularSamplingMode = kSamplingFull;
         bool EnableDiffuse = true;
         float SpecularMult = 1.0f;
         float DiffuseMult = 1.0f;
@@ -1003,6 +1010,9 @@ struct ScreenSpaceRayTracing : Feature
         "ScreenSpaceRayTracing::SSRTCB must stay whole 16-byte constant buffer rows; "
         "ssrt_raymarch.hlsl mirrors these offsets up to NRDFrontEndPack and must move with "
         "them; ssrt_diffuse_composite.hlsl mirrors the first three rows.");
+    static_assert(offsetof(SSRTCB, NRDFrontEndPack) == 64 &&
+                  offsetof(SSRTCB, SpecularMaxRoughness) == 68,
+        "The specular checkerboard resolve reads b1 c4.x/y; keep its packoffsets in sync.");
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
@@ -1281,6 +1291,11 @@ struct ScreenSpaceRayTracing : Feature
     ///
     /// @return the effective SamplingModeValue for this frame.
     uint ResolveSamplingMode();
+    /// @brief Select the specular trace density, falling back to Full when its optional
+    /// permutation, resolve shader or compact resources are unavailable.
+    uint ResolveSpecularSamplingMode();
+    bool EnsureSpecularSparseResources();
+    void ReleaseSpecularSparseResources();
     /// @brief (batch 12) Allocate the three compact surfaces the sparse ray march writes, on
     /// first need rather than at boot, on the same argument EnsureConfidenceFilterResources
     /// makes: a session that stays on full density never pays for them.
@@ -1592,6 +1607,13 @@ struct ScreenSpaceRayTracing : Feature
     eastl::unique_ptr<Texture2D> texSparseColor = nullptr;
     eastl::unique_ptr<Texture2D> texSparseConfidence = nullptr;
     eastl::unique_ptr<Texture2D> texSparseHitDistance = nullptr;
+    /// @brief Optional specular checkerboard trace targets. At 3840x2160 the independent
+    /// RGBA16F + R32F pair occupies 47.46 MiB; Full mode releases both surfaces.
+    eastl::unique_ptr<Texture2D> texSparseSpecularColor = nullptr;
+    eastl::unique_ptr<Texture2D> texSparseSpecularHitDistance = nullptr;
+    bool specularSparseAllocationFailed = false;
+    uint activeSpecularSamplingMode = kSamplingFull;
+    uint lastSpecularSamplingMode = kSamplingFull;
 
     /// @brief (batch 12) The sampling mode the current frame's diffuse chain is running at, i.e.
     /// what ResolveSamplingMode returned. Written once per frame, before any binding, and read by
@@ -1735,6 +1757,8 @@ struct ScreenSpaceRayTracing : Feature
 
     winrt::com_ptr<ID3D11ComputeShader> preprocessDepthCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> raymarchSpecularCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> raymarchSpecularCheckerCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> specularCheckerResolveCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> prepareColorCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> depthDownsampleCS = nullptr;

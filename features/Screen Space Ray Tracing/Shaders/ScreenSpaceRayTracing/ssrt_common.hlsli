@@ -503,23 +503,23 @@ float CalculateWeight(float depthCenter, float depthP, float phiD, float3 normal
 //                             so the traversal can start at mip 1 and its cell grid still
 //                             coincides with a texel grid.
 //   SSRT_SPARSE_CHECKERBOARD  one ray per horizontal pair of render pixels, alternating which
-//                             half of the pair every frame. The compact grid is
-//                             (renderExtent.x >> 1) x renderExtent.y, and every sample is a
-//                             *real* full-resolution pixel -- so the traversal stays at mip 0
-//                             and no G-buffer value is ever approximated.
+//                             half of the pair every frame. The diffuse grid has floor(width/2)
+//                             columns; specular has ceil(width/2) so the odd last column gets
+//                             its own sample. Every ray starts at a real full-resolution pixel
+//                             and traverses mip 0 without approximating its G-buffer origin.
 //
 // Resolution is a permutation and not a runtime branch because it changes the traversal's
 // finest Hi-Z level, the extent the dispatch clamps against, and how the G-buffer is addressed.
 // All variants are always compiled, so switching modes never triggers a recompile.
 //
-// What is deliberately *not* affected: the denoisers. Both modes resolve back to full
-// resolution before anything else in the chain runs, so REBLUR, SVGF, the confidence filter and
-// the composite are untouched -- see the derivation at the head of ssrt_sparse_resolve.hlsl.
+// The denoisers remain full resolution. Diffuse resolves with ssrt_sparse_resolve.hlsl;
+// specular checkerboard resolves both its radiance and R32 hit-distance guide with
+// ssrt_specular_checker_resolve.hlsl before REBLUR, SVGF, Off or DLSS-RR reads them.
 #if defined(SSRT_SPARSE_HALFRES) && defined(SSRT_SPARSE_CHECKERBOARD)
 #	error "SSRT_SPARSE_HALFRES and SSRT_SPARSE_CHECKERBOARD are alternatives, not a pair."
 #endif
-#if (defined(SSRT_SPARSE_HALFRES) || defined(SSRT_SPARSE_CHECKERBOARD)) && defined(SSRT_SPECULAR)
-#	error "Sparse sampling is a diffuse-only permutation; reflection sharpness rules out sparse specular."
+#if defined(SSRT_SPARSE_HALFRES) && defined(SSRT_SPECULAR)
+#	error "Half-resolution specular would discard reflection detail; only checkerboard is supported."
 #endif
 
 #if defined(SSRT_SPARSE_HALFRES) || defined(SSRT_SPARSE_CHECKERBOARD)
@@ -548,7 +548,14 @@ uint2 SSRT_GetSparseExtent(uint2 renderExtent)
 #if defined(SSRT_SPARSE_HALFRES)
 	return max(uint2(1, 1), renderExtent >> 1);
 #elif defined(SSRT_SPARSE_CHECKERBOARD)
+#if defined(SSRT_SPECULAR)
+	// Specular has no mip-1 traversal dependency, so include the final unpaired column.
+	// It traces its own full-resolution pixel on both phases instead of borrowing a
+	// neighbouring reflection. This also keeps a one-pixel-wide DRS sub-rect valid.
+	return uint2(max(1u, (renderExtent.x + 1u) >> 1), renderExtent.y);
+#else
 	return uint2(max(1u, renderExtent.x >> 1), renderExtent.y);
+#endif
 #else
 	return renderExtent;
 #endif
@@ -575,7 +582,12 @@ uint SSRT_SparseCheckerPhase()
 // the traced set is a checkerboard rather than a set of columns.
 uint SSRT_SparseCheckerColumn(uint2 compact)
 {
+#if defined(SSRT_SPECULAR)
+	return min((compact.x << 1) | ((compact.y + SSRT_SparseCheckerPhase()) & 1u),
+	           SSRT_GetRenderExtent().x - 1u);
+#else
 	return (compact.x << 1) | ((compact.y + SSRT_SparseCheckerPhase()) & 1u);
+#endif
 }
 
 // Whether full-resolution pixel `pixel` is the one its own 2x1 pair traced this frame. The
@@ -583,5 +595,10 @@ uint SSRT_SparseCheckerColumn(uint2 compact)
 // equals pixel.x.
 bool SSRT_SparseCheckerIsTraced(uint2 pixel)
 {
+#if defined(SSRT_SPECULAR)
+	const uint renderWidth = SSRT_GetRenderExtent().x;
+	if ((renderWidth & 1u) != 0u && pixel.x == renderWidth - 1u)
+		return true;
+#endif
 	return (pixel.x & 1u) == ((pixel.y + SSRT_SparseCheckerPhase()) & 1u);
 }

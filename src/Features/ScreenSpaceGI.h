@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Buffer.h"
+#include "NRD.h"
 
 struct ScreenSpaceGI : Feature
 {
@@ -45,16 +46,24 @@ public:
 	virtual void SaveSettings(json& o_json) override;
 
 	virtual void SetupResources() override;
+	virtual void Prepass() override;
 	virtual void ClearShaderCache() override;
 	void CompileComputeShaders();
 	bool ShadersOK();
 
 	void DrawSSGI();
 	void UpdateSB();
+	bool WantsReblurGuides() const { return effectiveReblurDiffuse; }
+	ID3D11ShaderResourceView* GetReblurDiffuseOutputSRV() const { return loaded && settings.Enabled && effectiveReblurDiffuse ? reblurPublishedSRV : nullptr; }
 
 	//////////////////////////////////////////////////////////////////////////////////
 
 	bool recompileFlag = false;
+	static constexpr uint kDenoiserLegacy = 0;
+	static constexpr uint kDenoiserREBLUR = 1;
+	bool effectiveReblurDiffuse = false;
+	bool resetReblurDiffuse = true;
+	ID3D11ShaderResourceView* reblurPublishedSRV = nullptr;
 	/// @brief (P2.4 follow-up) Whether the contact AO pass is actually running this compile round.
 	///
 	/// settings.EnableContactAo is the request; this is the outcome. They differ only when the
@@ -97,6 +106,8 @@ public:
 		float AOPower = 1.0f;
 		float GIStrength = 1.0f;
 		// denoise
+		uint DenoiserMethod = kDenoiserLegacy;
+		NRD::REBLURSettings ReblurDiffuse;
 		bool EnableTemporalDenoiser = true;
 		bool EnableBlur = true;
 		float DepthDisocclusion = .1f;
@@ -129,7 +140,7 @@ public:
 	{
 		uint EnableDirectionalEnv;
 		float EnvLevel;
-		float pad[2];
+		float2 pad;
 	};
 	STATIC_ASSERT_ALIGNAS_16(SSGISharedData);
 
@@ -230,6 +241,17 @@ public:
 	// texIlCoCg -- reprojection, blur and upsample all filter it with the IL weights, never in
 	// a vector domain.
 	eastl::unique_ptr<Texture2D> texEnvIrradiance[2] = { nullptr };
+	// REBLUR operates at full render resolution so it can consume NRD's shared guides.
+	// The GI pass writes the current-frame signal at its working resolution; the existing
+	// upsample pass expands it when SSGI is in half- or quarter-resolution mode.
+	eastl::unique_ptr<Texture2D> texNRDInputWorking = nullptr;
+	eastl::unique_ptr<Texture2D> texNRDInputFull = nullptr;
+	eastl::unique_ptr<Texture2D> texNRDOutput = nullptr;
+	NRDReblurIntegration nrdReblurDiffuse;
+	nrd::ReblurSettings reblurDiffuseSettings{};
+	void EnsureNRDResources();
+	void ReleaseNRDResources();
+	void RunReblurDiffuse();
 
 	inline auto GetOutputTextures()
 	{
@@ -254,7 +276,9 @@ public:
 	winrt::com_ptr<ID3D11ComputeShader> prefilterRadianceCompute = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> radianceDisoccCompute = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> giCompute = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> giReblurCompute = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> blurCompute = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> upsampleCompute = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> upsampleReblurCompute = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> contactAoCompute = nullptr;
 };

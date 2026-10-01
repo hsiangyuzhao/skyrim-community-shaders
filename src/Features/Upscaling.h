@@ -133,6 +133,9 @@ public:
 		uint frameLimitMode = 1;
 		uint frameGenerationMode = 1;
 		uint frameGenerationBackend = static_cast<uint>(FrameGenerationBackend::kFSR3FG);
+		// DLSS-G only: generated frames per rendered frame. 1/2/3 produce 2x/3x/4x.
+		// The runtime clamps this request to its reported hardware capability.
+		uint dlssGFramesToGenerate = 1;
 		uint frameGenerationForceEnable = 0;
 		// Keeps generation running while a paused menu is open. Off by default because a menu
 		// is where the added input latency is most noticeable and the smoothness least useful.
@@ -209,6 +212,8 @@ public:
 
 	// Feature interface overrides
 	virtual void DrawSettings() override;
+	// Completes an armed Batch33 A/B capture during real gameplay after the menu closes.
+	void TickBatch33AB();
 	virtual void SaveSettings(json& o_json) override;
 	virtual void LoadSettings(json& o_json) override;
 	virtual void RestoreDefaultSettings() override;

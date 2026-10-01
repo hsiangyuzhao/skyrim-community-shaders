@@ -244,22 +244,26 @@ namespace NeuralRendering
 			return true;
 		}
 
-		void Reset()
+		bool Reset()
 		{
-			interop.WaitForIdle();
+			if (!interop.WaitForIdle())
+				return LatchFailure("renderer reset wait for NR queue", interop.LastError());
 			Runtime::Instance().Shutdown();
 			interop.Shutdown();
 			eyes = {};
 			resetPending = { true, true };
 			failureLatched = false;
 			copyDepthGuideCS.Reset();
+			return true;
 		}
 
-		void ResetHistory()
+		bool ResetHistory()
 		{
-			interop.WaitForIdle();
+			if (!interop.WaitForIdle())
+				return LatchFailure("history reset wait for NR queue", interop.LastError());
 			Runtime::Instance().ResetFeatures();
 			resetPending = { true, true };
+			return true;
 		}
 
 		[[nodiscard]] bool IsFailureLatched() const { return failureLatched; }
@@ -378,8 +382,8 @@ namespace NeuralRendering
 			guideWidth, guideHeight, colorWidth, colorHeight, tuning);
 	}
 
-	void Renderer::Reset() { state_->Reset(); }
-	void Renderer::ResetHistory() { state_->ResetHistory(); }
+	bool Renderer::Reset() { return state_->Reset(); }
+	bool Renderer::ResetHistory() { return state_->ResetHistory(); }
 	bool Renderer::IsFailureLatched() const { return state_->IsFailureLatched(); }
 	std::uint32_t Renderer::NgxResult() const { return Runtime::Instance().NgxResult(); }
 	std::uint64_t Renderer::SuccessfulFrames() const { return Runtime::Instance().SuccessfulFrames(); }

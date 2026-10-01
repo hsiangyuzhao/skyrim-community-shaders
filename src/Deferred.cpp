@@ -142,6 +142,7 @@ void SetupRenderTarget(RE::RENDER_TARGET target, D3D11_TEXTURE2D_DESC texDesc, D
 void Deferred::SetupResources()
 {
 	auto renderer = globals::game::renderer;
+	ssgiCompositeStateCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<SSGICompositeState>());
 
 	{
 		auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
@@ -515,6 +516,7 @@ void Deferred::DeferredPasses()
 		Util::CpuPassScope timer("ScreenSpaceGI");
 		ssgi.DrawSSGI();
 	}
+	auto* ssgiReblurDiffuseSRV = ssgi.GetReblurDiffuseOutputSRV();
 	auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec, ssgi_bent_normal, ssgi_env_irradiance] = ssgi.GetOutputTextures();
 	bool ssgi_hq_spec = ssgi.settings.EnableExperimentalSpecularGI;
 
@@ -593,6 +595,9 @@ void Deferred::DeferredPasses()
 			// zeroes whenever the feature is not actually running, so a null binding here can
 			// never be read.
 			ssgi_env_irradiance,
+			// t22 (batch 33) NRD's diffuse IL output, or this frame's raw packed signal
+			// when its dispatch fails. The composite b7 flag gates every read of this slot.
+			ssgiReblurDiffuseSRV,
 		};
 
 		ID3D11SamplerState* samplers[]{
@@ -602,6 +607,11 @@ void Deferred::DeferredPasses()
 		context->CSSetSamplers(0, ARRAYSIZE(samplers), samplers);
 
 		context->CSSetShaderResources(0, ARRAYSIZE(srvs), srvs);
+		SSGICompositeState ssgiCompositeState{};
+		ssgiCompositeState.ReblurDiffuseActive = ssgiReblurDiffuseSRV != nullptr ? 1u : 0u;
+		ssgiCompositeStateCB->Update(ssgiCompositeState);
+		auto* ssgiCompositeBuffer = ssgiCompositeStateCB->CB();
+		context->CSSetConstantBuffers(7, 1, &ssgiCompositeBuffer);
 
 		ID3D11UnorderedAccessView* uavs[3]{ main.UAV, normals.UAV, motionVectors.UAV };
 		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
@@ -614,13 +624,14 @@ void Deferred::DeferredPasses()
 
 	// Clear
 	{
-		ID3D11ShaderResourceView* views[22]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+		ID3D11ShaderResourceView* views[23]{};
 		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
 
 		ID3D11UnorderedAccessView* uavs[3]{ nullptr, nullptr, nullptr };
 		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
 
 		ID3D11Buffer* buffers[1] = { nullptr };
+		context->CSSetConstantBuffers(7, 1, buffers);
 		context->CSSetConstantBuffers(12, 1, buffers);
 
 		ID3D11SamplerState* samplers[2]{ nullptr, nullptr };

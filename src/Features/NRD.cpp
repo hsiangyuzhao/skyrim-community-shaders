@@ -2,6 +2,7 @@
 
 #include "Deferred.h"
 #include "Menu.h"
+#include "ScreenSpaceGI.h"
 #include "ScreenSpaceRayTracing.h"
 #include "State.h"
 #include "Upscaling.h"
@@ -18,21 +19,16 @@ namespace
 	// loaded and enabled, whether or not any consumer had selected REBLUR -- which, with SVGF
 	// or Off selected, is nobody.
 	//
-	// Screen Space Ray Tracing's two chains are the entire consumer set in this fork. The
-	// question asked is the *effective* denoiser, not the requested one, and it is safe to ask
-	// here because SSRT resolves it in Prepass and every feature's Prepass runs ahead of the
-	// deferred passes that call PrepareGuides.
+	// Ask for effective denoisers, resolved in feature Prepass before deferred rendering.
 	bool AnyConsumerNeedsGuides()
 	{
 		auto& ssrt = globals::features::screenSpaceRayTracing;
-		if (!ssrt.loaded)
-			return false;
-
-		const bool diffuse = ssrt.settings.EnableDiffuse &&
+		const bool diffuse = ssrt.loaded && ssrt.settings.EnableDiffuse &&
 		                     ssrt.EffectiveDenoiser(false) == ScreenSpaceRayTracing::kDenoiserREBLUR;
-		const bool specular = ssrt.settings.EnableSpecular &&
+		const bool specular = ssrt.loaded && ssrt.settings.EnableSpecular &&
 		                      ssrt.EffectiveDenoiser(true) == ScreenSpaceRayTracing::kDenoiserREBLUR;
-		return diffuse || specular;
+		const auto& ssgi = globals::features::screenSpaceGI;
+		return diffuse || specular || (ssgi.loaded && ssgi.WantsReblurGuides());
 	}
 }
 
@@ -51,8 +47,8 @@ void NRD::DrawSettings()
 {
 	ImGui::TextWrapped(
 		"NRD provides shared denoising infrastructure for screen-space "
-		"radiance signals. It is consumed by Screen Space Ray Tracing's "
-		"REBLUR denoiser path; select the denoiser there to control "
+		"radiance signals. It is consumed by the REBLUR denoiser paths in "
+		"Screen Space Ray Tracing and Screen Space GI; select either feature's denoiser to control "
 		"whether denoising actually runs.");
 
 	ImGui::Separator();

@@ -512,8 +512,8 @@ void PerformanceOverlay::DrawFPS()
 					this->state.postFGSmoothFps, this->state.postFGSmoothFrameTimeMs);
 				if (ImGui::IsItemHovered()) {
 					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("Estimate, not a measurement: the backend reports no\npresentation cadence, so a fixed %.0fx multiplier is\nassumed. Raw FPS, Avg and 1%% Low above are always\nmeasured pre-frame-generation values.",
-							Settings::kFrameGenerationMultiplier);
+						ImGui::Text("Estimate, not a measurement: the backend reports no\npresentation cadence, so the configured %.0fx multiplier is\nassumed. Raw FPS, Avg and 1%% Low above are always\nmeasured pre-frame-generation values.",
+							this->state.postFGMultiplier);
 					}
 				}
 			}
@@ -572,7 +572,7 @@ void PerformanceOverlay::DrawFPS()
 				ImGui::TextUnformatted("Presented-frame count reported by the frame-generation backend,\nsampled once per rendered frame.");
 			}
 		} else {
-			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Post-FG: estimated (%.0fx Pre-FG)", Settings::kFrameGenerationMultiplier);
+			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Post-FG: estimated (%.0fx Pre-FG)", this->state.postFGMultiplier);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("The active frame-generation backend reports no presentation\ncadence, so this curve is the Pre-FG curve divided by a fixed\nmultiplier. Treat it as an estimate.");
 			}
@@ -2565,6 +2565,7 @@ void PerformanceOverlay::AdvanceFrameClock()
 	if (!loaded)
 		return;
 	UpdateGraphValues();
+	globals::features::upscaling.TickBatch33AB();
 }
 
 PerformanceOverlay::FrameStats PerformanceOverlay::ComputeFrameStats() const
@@ -2723,12 +2724,15 @@ void PerformanceOverlay::UpdateGraphValues()
 			state.postFGFrameTimeMs = state.frameTimeMs / measuredMultiplier;
 			state.postFGFps = state.fps * measuredMultiplier;
 		} else {
-			// No cadence reported: fall back to the fixed estimate. The UI labels every
-			// number derived from this as an estimate.
+			// No cadence reported: use the accepted DLSS-G request, or FSR's fixed 2x.
+			// The UI labels every number derived from this as an estimate.
 			state.postFGIsMeasured = false;
-			state.postFGMultiplier = Settings::kFrameGenerationMultiplier;
-			state.postFGFrameTimeMs = state.frameTimeMs / Settings::kFrameGenerationMultiplier;
-			state.postFGFps = state.fps * Settings::kFrameGenerationMultiplier;
+			const auto& upscaling = globals::features::upscaling;
+			state.postFGMultiplier = upscaling.IsDLSSGBackend() ?
+				static_cast<float>(std::max(2u, upscaling.streamline.GetDLSSGAppliedFramesToGenerate() + 1)) :
+				Settings::kFrameGenerationMultiplier;
+			state.postFGFrameTimeMs = state.frameTimeMs / state.postFGMultiplier;
+			state.postFGFps = state.fps * state.postFGMultiplier;
 		}
 
 		// Update post-FG smooth values when timer elapses

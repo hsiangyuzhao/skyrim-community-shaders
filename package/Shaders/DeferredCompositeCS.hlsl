@@ -34,6 +34,12 @@ Texture2DArray<float3> stbn_vec3_2Dx1D_128x128x64 : register(t9);
 #endif
 
 #if defined(SSGI)
+cbuffer SSGICompositeState : register(b7)
+{
+	uint SSGIReblurDiffuseActive;
+	float3 SSGICompositePad;
+};
+
 Texture2D<float4> SsgiAoTexture : register(t10);
 Texture2D<float4> SsgiYTexture : register(t11);
 Texture2D<float4> SsgiCoCgTexture : register(t12);
@@ -54,6 +60,9 @@ Texture2D<unorm float4> SsgiBentNormalTexture : register(t20);
 // visibility applied), PREMULTIPLIED by A = confidence (march coverage; 0 = no data). t21 is
 // the next free slot after t20 -- see the map above.
 Texture2D<float4> SsgiEnvIrradianceTexture : register(t21);
+// (batch 33) NRD REBLUR_DIFFUSE result, packed as YCoCg + normalized hit distance.
+// Bound only when ScreenSpaceGI reports its effective REBLUR path for this frame.
+Texture2D<float4> SsgiReblurDiffuseTexture : register(t22);
 
 // Decoder duplicated from features/Screen Space GI/Shaders/ScreenSpaceGI/common.hlsli
 // (SSGI_DecodeBentNormal) on purpose: package shaders must not #include across a feature
@@ -71,12 +80,18 @@ void SSGI_DecodeBentNormal(float4 enc, out float3 o_dir, out float o_aperture)
 void SampleSSGI(uint2 pixCoord, float3 normalWS, out float ao, out float3 il)
 {
 	ao = 1 - SsgiAoTexture[pixCoord].x;
-	float4 ssgiIlYSh = SsgiYTexture[pixCoord];
-	// without ZH hallucination
-	// float ssgiIlY = SphericalHarmonics::FuncProductIntegral(ssgiIlYSh, SphericalHarmonics::EvaluateCosineLobe(normalWS));
-	float ssgiIlY = SphericalHarmonics::SHHallucinateZH3Irradiance(ssgiIlYSh, normalWS);
-	float2 ssgiIlCoCg = SsgiCoCgTexture[pixCoord].xy;
-	il = max(0, Color::YCoCgToRGB(float3(ssgiIlY, ssgiIlCoCg)));
+	if (SSGIReblurDiffuseActive != 0) {
+		// NRD's packed diffuse signal is YCoCg. The fourth channel is hit distance,
+		// which only its temporal/spatial passes consume.
+		il = max(0, Color::YCoCgToRGB(SsgiReblurDiffuseTexture[pixCoord].xyz));
+	} else {
+		float4 ssgiIlYSh = SsgiYTexture[pixCoord];
+		// without ZH hallucination
+		// float ssgiIlY = SphericalHarmonics::FuncProductIntegral(ssgiIlYSh, SphericalHarmonics::EvaluateCosineLobe(normalWS));
+		float ssgiIlY = SphericalHarmonics::SHHallucinateZH3Irradiance(ssgiIlYSh, normalWS);
+		float2 ssgiIlCoCg = SsgiCoCgTexture[pixCoord].xy;
+		il = max(0, Color::YCoCgToRGB(float3(ssgiIlY, ssgiIlCoCg)));
+	}
 }
 
 void SampleSSGISpecular(uint2 pixCoord, sh2 lobe, out float ao, out float3 il, in float3 normal, in float3 view, in float roughness)

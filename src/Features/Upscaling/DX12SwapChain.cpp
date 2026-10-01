@@ -8,6 +8,75 @@
 #include "FidelityFX.h"
 #include "Streamline.h"
 
+void DX12SwapChain::WaitForDLSSGInputsBeforeResourceRecreation(const char* a_reason)
+{
+	if (!globals::features::upscaling.IsDLSSGBackend() || !d3d12Fence || fenceValue <= 1)
+		return;
+
+	// The signal after Present is queued after the DLSS-G input-completion wait.
+	// D3D11's GPU wait protects subsequent writes, but releasing a shared input
+	// resource on the CPU during resize also needs this one-time drain.
+	const UINT64 completedPresent = fenceValue - 1;
+	if (d3d12Fence->GetCompletedValue() >= completedPresent)
+		return;
+	if (d3d11Context)
+		d3d11Context->Flush();
+
+	HANDLE completionEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	if (!completionEvent) {
+		const DWORD eventError = GetLastError();
+		DX::ThrowIfFailed(HRESULT_FROM_WIN32(eventError != ERROR_SUCCESS ? eventError : ERROR_GEN_FAILURE));
+	}
+	const HRESULT eventResult = d3d12Fence->SetEventOnCompletion(completedPresent, completionEvent);
+	if (FAILED(eventResult)) {
+		CloseHandle(completionEvent);
+		DX::ThrowIfFailed(eventResult);
+	}
+	const DWORD waitResult = WaitForSingleObject(completionEvent, 5000);
+	const DWORD waitError = waitResult == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT;
+	CloseHandle(completionEvent);
+	if (waitResult != WAIT_OBJECT_0) {
+		logger::error("[DLSS-G] Timed out draining Present fence {} before {} (waitResult={})",
+			completedPresent, a_reason, waitResult);
+		DX::ThrowIfFailed(HRESULT_FROM_WIN32(waitError));
+	}
+	logger::info("[DLSS-G] Drained Present fence {} before {}", completedPresent, a_reason);
+}
+
+void DX12SwapChain::LogDLSSGCadenceWindow()
+{
+	if (dlssGCadenceSamples == 0)
+		return;
+
+	logger::info("[AIO][DLSS-G] tokens {}..{} requested={}x configured={}x samples={} presented={} avg={:.2f} histogram(0/1/2/3/4/5+)={}/{}/{}/{}/{}/{}",
+		dlssGCadenceFirstToken,
+		dlssGCadenceLastToken,
+		dlssGCadenceRequested + 1,
+		dlssGCadenceApplied + 1,
+		dlssGCadenceSamples,
+		dlssGCadencePresented,
+		static_cast<float>(dlssGCadencePresented) / static_cast<float>(dlssGCadenceSamples),
+		dlssGCadenceBuckets[0],
+		dlssGCadenceBuckets[1],
+		dlssGCadenceBuckets[2],
+		dlssGCadenceBuckets[3],
+		dlssGCadenceBuckets[4],
+		dlssGCadenceBuckets[5]);
+	dlssGCadenceSamples = 0;
+	dlssGCadencePresented = 0;
+	for (auto& count : dlssGCadenceBuckets)
+		count = 0;
+	dlssGCadenceFirstToken = UINT32_MAX;
+	dlssGCadenceLastToken = UINT32_MAX;
+}
+
+void DX12SwapChain::ResetDLSSGCadenceMeasurement()
+{
+	LogDLSSGCadenceWindow();
+	measuredPresentMultiplier = 0.0f;
+	dlssGPreviousStateQueryValid = false;
+}
+
 void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
 {
 	DX::ThrowIfFailed(D3D12CreateDevice(a_adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d3d12Device)));
@@ -66,6 +135,7 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
 
 void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC a_swapChainDesc)
 {
+	WaitForDLSSGInputsBeforeResourceRecreation("swap-chain recreation");
 	CreateD3D12Device(adapter);
 
 	IDXGIFactory4* dxgiFactory;
@@ -145,6 +215,7 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 
 void DX12SwapChain::CreateInterop()
 {
+	WaitForDLSSGInputsBeforeResourceRecreation("interop recreation");
 	HANDLE sharedFenceHandle;
 	DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&d3d12Fence)));
 	DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(d3d12Fence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle));
@@ -152,6 +223,11 @@ void DX12SwapChain::CreateInterop()
 	CloseHandle(sharedFenceHandle);
 
 	DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&upscalingFence)));
+	// Both fences above start at zero. Their counters belong to this interop
+	// instance and must not carry an old swap chain's sequence into resize.
+	fenceValue = 0;
+	upscalingFenceValue = 0;
+	ResetDLSSGCadenceMeasurement();
 
 	swapChainProxy = new DXGISwapChainProxy(swapChain);
 
@@ -189,10 +265,14 @@ void DX12SwapChain::SetD3D11DeviceContext(ID3D11DeviceContext* a_d3d11Context)
 	DX::ThrowIfFailed(a_d3d11Context->QueryInterface(IID_PPV_ARGS(&d3d11Context)));
 }
 
-HRESULT DX12SwapChain::GetBuffer(void** ppSurface)
+HRESULT DX12SwapChain::GetBuffer(UINT buffer, REFIID riid, void** ppSurface)
 {
-	*ppSurface = swapChainBufferWrapped->resource11;
-	return S_OK;
+	if (!ppSurface)
+		return E_POINTER;
+	*ppSurface = nullptr;
+	if (buffer != 0 || !swapChainBufferWrapped || !swapChainBufferWrapped->resource11)
+		return DXGI_ERROR_INVALID_CALL;
+	return swapChainBufferWrapped->resource11->QueryInterface(riid, ppSurface);
 }
 
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
@@ -318,16 +398,62 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (markLatency)
 		upscaling.streamline.SetPCLMarker(sl::PCLMarker::ePresentEnd);
 	if (upscaling.IsDLSSGBackend()) {
-		if (SUCCEEDED(presentResult) && upscaling.IsDLSSGAvailable() &&
-			(useFrameGeneration || dlssGPresentationState == DLSSGPresentationState::kMapSuspended)) {
+		const uint32_t requestedFrames = upscaling.streamline.GetDLSSGRequestedFramesToGenerate();
+		const uint32_t appliedFrames = upscaling.streamline.GetDLSSGAppliedFramesToGenerate();
+		if (dlssGCadenceSamples > 0 &&
+			(!useFrameGeneration || dlssGCadenceRequested != requestedFrames || dlssGCadenceApplied != appliedFrames))
+			LogDLSSGCadenceWindow();
+
+		// Query once after every successful Present while the plugin is configured.
+		// numFramesActuallyPresented is a delta since the previous query, so
+		// skipping off/menu frames would corrupt the first resumed A/B sample.
+		bool stateValid = false;
+		if (SUCCEEDED(presentResult) && upscaling.IsDLSSGAvailable() && upscaling.streamline.dlssGOptionsInitialized) {
 			sl::DLSSGState dlssGState{};
-			const bool dlssGStateValid = upscaling.streamline.GetDLSSGState(dlssGState);
-			if (dlssGStateValid) {
-				// Presented frames since the previous query == presented frames for this
-				// rendered frame, because this is the only per-Present query. Feed the
-				// Performance Overlay a smoothed cadence so it can report a measured
-				// post-FG frame time instead of assuming a fixed 2x multiplier.
-				if (dlssGState.numFramesActuallyPresented > 0) {
+			stateValid = upscaling.streamline.GetDLSSGState(dlssGState, useFrameGeneration);
+			if (stateValid) {
+				// Present's asynchronous plugin work can continue after the API call.
+				// Make the existing D3D12 signal -> D3D11 wait chain cover the plugin's
+				// input read before D3D11 writes those same shared textures next frame.
+				if (dlssGState.inputsProcessingCompletionFence != nullptr &&
+					dlssGState.lastPresentInputsProcessingCompletionFenceValue > 0) {
+					auto* inputFence = static_cast<ID3D12Fence*>(dlssGState.inputsProcessingCompletionFence);
+					DX::ThrowIfFailed(commandQueue->Wait(inputFence, dlssGState.lastPresentInputsProcessingCompletionFenceValue));
+					if (useFrameGeneration && !dlssGInputsFenceObserved) {
+						logger::info("[AIO][DLSS-G] Input completion fence is chained to the D3D11 shared-resource wait at token {}",
+							upscaling.streamline.GetLatchedFrameTokenIndex());
+						dlssGInputsFenceObserved = true;
+					}
+				} else if (useFrameGeneration && !dlssGInputsFenceMissingLogged) {
+					logger::warn("[AIO][DLSS-G] No explicit input completion fence was returned; relying on the SDK's D3D12 presenting-queue-blocking mode");
+					dlssGInputsFenceMissingLogged = true;
+				}
+
+				if (useFrameGeneration && dlssGPreviousStateQueryValid) {
+					if (dlssGCadenceSamples == 0) {
+						dlssGCadenceRequested = requestedFrames;
+						dlssGCadenceApplied = appliedFrames;
+						dlssGCadenceFirstToken = upscaling.streamline.GetLatchedFrameTokenIndex();
+					}
+					dlssGCadenceLastToken = upscaling.streamline.GetLatchedFrameTokenIndex();
+					dlssGCadenceSamples++;
+					dlssGCadencePresented += dlssGState.numFramesActuallyPresented;
+					++dlssGTotalSamples;
+					dlssGTotalPresented += dlssGState.numFramesActuallyPresented;
+					dlssGCadenceBuckets[std::min(dlssGState.numFramesActuallyPresented, 5u)]++;
+					if (dlssGCadenceSamples >= 60)
+						LogDLSSGCadenceWindow();
+				} else if (useFrameGeneration) {
+					logger::info("[AIO][DLSS-G] Established Present-count baseline at token {} (requested={}x, configured={}x, supportedMax={}x)",
+						upscaling.streamline.GetLatchedFrameTokenIndex(),
+						requestedFrames + 1,
+						appliedFrames + 1,
+						std::max(1u, upscaling.streamline.GetDLSSGMaxFramesToGenerate()) + 1);
+				}
+
+				// Feed the overlay only when generation was requested; an off-frame
+				// count of one must not dilute its running FG multiplier.
+				if (useFrameGeneration && dlssGPreviousStateQueryValid && dlssGState.numFramesActuallyPresented > 0) {
 					const float sample = static_cast<float>(dlssGState.numFramesActuallyPresented);
 					measuredPresentMultiplier = measuredPresentMultiplier > 0.0f ?
 					                                measuredPresentMultiplier * 0.95f + sample * 0.05f :
@@ -341,6 +467,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 				}
 			}
 		}
+		dlssGPreviousStateQueryValid = stateValid;
 	}
 	DX::ThrowIfFailed(presentResult);
 
@@ -364,9 +491,11 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 HRESULT DX12SwapChain::GetDevice(REFIID uuid, void** ppDevice)
 {
+	if (!ppDevice)
+		return E_POINTER;
+	*ppDevice = nullptr;
 	if (uuid == __uuidof(ID3D11Device) || uuid == __uuidof(ID3D11Device1) || uuid == __uuidof(ID3D11Device2) || uuid == __uuidof(ID3D11Device3) || uuid == __uuidof(ID3D11Device4) || uuid == __uuidof(ID3D11Device5)) {
-		*ppDevice = d3d11Device.get();
-		return S_OK;
+		return d3d11Device ? d3d11Device->QueryInterface(uuid, ppDevice) : DXGI_ERROR_INVALID_CALL;
 	}
 
 	return GetNativeSwapChain()->GetDevice(uuid, ppDevice);
@@ -488,20 +617,42 @@ DXGISwapChainProxy::DXGISwapChainProxy(IDXGISwapChain4* a_swapChain)
 /****IUknown****/
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::QueryInterface(REFIID riid, void** ppvObj)
 {
-	auto ret = swapChain->QueryInterface(riid, ppvObj);
-	if (*ppvObj)
+	if (!ppvObj)
+		return E_POINTER;
+
+	*ppvObj = nullptr;
+	if (riid == __uuidof(IUnknown) || riid == __uuidof(IDXGIObject) ||
+		riid == __uuidof(IDXGIDeviceSubObject) || riid == __uuidof(IDXGISwapChain)) {
 		*ppvObj = this;
-	return ret;
+		AddRef();
+		return S_OK;
+	}
+
+	// This proxy only implements IDXGISwapChain. Returning it for a derived IID
+	// exposes methods outside its vtable; returning the native chain bypasses Present.
+	if (riid == __uuidof(IDXGISwapChain1) || riid == __uuidof(IDXGISwapChain2) ||
+		riid == __uuidof(IDXGISwapChain3) || riid == __uuidof(IDXGISwapChain4))
+		return E_NOINTERFACE;
+
+	return swapChain ? swapChain->QueryInterface(riid, ppvObj) : E_NOINTERFACE;
 }
 
 ULONG STDMETHODCALLTYPE DXGISwapChainProxy::AddRef()
 {
-	return swapChain->AddRef();
+	return refCount.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 ULONG STDMETHODCALLTYPE DXGISwapChainProxy::Release()
 {
-	return swapChain->Release();
+	// DX12SwapChain owns this proxy; releasing the last game reference must not
+	// release its native swap chain or invalidate the pointer used for Present.
+	ULONG previous = refCount.load(std::memory_order_relaxed);
+	while (previous != 0) {
+		if (refCount.compare_exchange_weak(previous, previous - 1, std::memory_order_acq_rel, std::memory_order_relaxed))
+			return previous - 1;
+	}
+
+	return 0;
 }
 
 /****IDXGIObject****/
@@ -537,9 +688,9 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::Present(UINT SyncInterval, UINT Fl
 	return globals::features::upscaling.dx12SwapChain.Present(SyncInterval, Flags);
 }
 
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetBuffer(UINT, _In_ REFIID, _COM_Outptr_ void** ppSurface)
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetBuffer(UINT buffer, _In_ REFIID riid, _COM_Outptr_ void** ppSurface)
 {
-	return globals::features::upscaling.dx12SwapChain.GetBuffer(ppSurface);
+	return globals::features::upscaling.dx12SwapChain.GetBuffer(buffer, riid, ppSurface);
 }
 
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetFullscreenState(BOOL Fullscreen, _In_opt_ IDXGIOutput* pTarget)
@@ -763,6 +914,7 @@ bool DX12SwapChain::HasValidDLSSGInputExtent() const
 
 void DX12SwapChain::CreateSharedResources()
 {
+	WaitForDLSSGInputsBeforeResourceRecreation("shared-input recreation");
 	dlssGInputWidth = 0;
 	dlssGInputHeight = 0;
 	dlssGInputExtentFrameIndex = UINT32_MAX;

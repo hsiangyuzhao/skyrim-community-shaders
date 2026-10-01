@@ -1,0 +1,34 @@
+# batch33 设计备忘录：SSRT 归属与上游性能候选
+
+本文仅覆盖需求 1（SSRT 是否拆入 SSR / SSGI）和需求 4（上游效率设计的移植候选）。分析基线为本地 batch32 提交 `6f1d04a824e21f51b725906d6a73d44e403b6cc0`；正在开发的 batch33 代码可能改变局部行号及降噪数据流。上游仅作只读核查：2026-09-27 的 `pp` 为 `3a2440b64af44526e5f3890a81118665a7a83028`，`compendium-clean` 为 `e5cb550b0cace194174c05dccb568f2bd31b7c23`。这些是分支引用，不等同于附带发行包的冻结提交。
+
+## 1. batch33 暂保留独立 SSRT
+
+上游在 [`f39f8a5d2`](https://github.com/jiayev/skyrim-community-shaders/commit/f39f8a5d25280c1281da3ba1b041b2d4fbd3e351) 将原先 SSGI 内的 specular 追踪迁到独立的 `ScreenSpaceReflections`，并把 NRD 引导纹理提升为共享服务。最新 `compendium-clean` 仍采用这条边界：[Deferred.cpp](https://github.com/jiayev/skyrim-community-shaders/blob/e5cb550b0cace194174c05dccb568f2bd31b7c23/src/Deferred.cpp#L336-L352) 先准备 NRD guides，再运行 SSGI diffuse 和 SSR specular；[SSR](https://github.com/jiayev/skyrim-community-shaders/blob/e5cb550b0cace194174c05dccb568f2bd31b7c23/src/Features/ScreenSpaceReflections.cpp#L377-L386) 独立持有 Hi-Z、specular 追踪与 REBLUR 实例；[SSGI](https://github.com/jiayev/skyrim-community-shaders/blob/e5cb550b0cace194174c05dccb568f2bd31b7c23/src/Features/ScreenSpaceGI.cpp#L907-L959) 独立合成 diffuse IL。`pp` 发布分支并没有这套独立 SSR feature，不能把 `compendium-clean` 的结构称为已发布架构。
+
+本地已有单独的 `ScreenSpaceRayTracing` feature，内部可分别开关 diffuse 与 specular。其 [`Prepass()`](../src/Features/ScreenSpaceRayTracing.cpp) 为两条追踪链共建 Hi-Z；[`DeferredPasses()`](../src/Deferred.cpp) 分别调用 `DrawSSRTDiffuse()`、`DrawSSRTSpecular()`，且在最终 composite 中处理 specular 输出和 diffuse 置信度。diffuse 还包含自身的置信度过滤、环境回退与 ambient reinjection；[DeferredCompositeCS.hlsl](../package/Shaders/DeferredCompositeCS.hlsl) 在 `ssrtSettings.DiffuseMult > 0` 时抑制 SSGI IL，以避免重复计算同一份间接光能量。直接按上游目录拆分，会同时触及 Hi-Z 共享、历史有效性、两条合成路径、SSGI AO 保留、运行时切换和回退策略，而不只是移动 shader 文件。
+
+**决定：batch33 保留本地独立 SSRT，继续让 specular 进入反射合成、diffuse 进入其现有独立合成路径。** 借鉴上游的职责边界：NRD guides 由公共服务提供、diffuse/specular 独立开关及计时、各自维护 denoiser 历史。若后续有明确需求要以 SSGI 的输出契约取代本地 diffuse 路径，再以视觉对等和 GPU 时间为验收条件重新评估拆分；届时必须先定义 AO、IL、SSRT confidence 的唯一生产者与消费者，避免重复 dispatch 或双重合成。
+
+## 2–3. 已落地的实验路径与验收
+
+SSGI 新增可切换的 `REBLUR_DIFFUSE` 模式，默认仍用原有 temporal + blur，以便同场景 A/B。GI pass 把当帧 SH2 在接收面法线处还原为 RGB，再按 NRD 格式编码并送入全分辨率 REBLUR；旧 SH2 链仍负责 AO、方向环境与可选 specular GI。这里没有直接使用 `REBLUR_DIFFUSE_SH`：本地的 SH2 系数与 NRD 的球形高斯表示不同，强行转换会改变方向与负系数语义。SSRT diffuse 接管 IL、NRD 不可用或 VR 时使用旧路径；模式退出会释放新增 NRD 纹理和历史，重新进入清空历史。Deferred composite 通过当帧独立的 `b7` 状态读取 `t22`，避免设置切换时误用上一帧门控。
+
+SSRT specular 新增 `Full`／`Checkerboard` 采样模式，默认 `Full`。棋盘格在每个水平像素对中追踪一个真实全分辨率像素，并逐帧交替；独立的 RGBA16F 色彩和 R32F 命中距离紧凑纹理在 4K 下约占 47.46 MiB，仅选中该模式时分配。resolve 按深度、法线和粗糙度补全色彩，给 REBLUR、SVGF、Off 与 DLSS-RR 的都是全分辨率输入；R32 命中距离保留真实值或精确的 `65536` 未命中哨兵。奇数动态分辨率宽度的末列会被追踪。shader 或资源失败时回退 `Full`，实际模式改变时重置 specular 历史。
+
+2026-09-27 已通过 Release C++ 构建、相关 shader 的 `fxc cs_5_0` 普通／VR 编译、`prepare_shaders` 复制与 `git diff --check`；**尚未进行游戏内画质或 GPU 帧时验证**。实机验收应在相同场景分别对比 SSGI 两种降噪模式及 specular 两种采样模式，检查 1080p／1440p／4K、奇数动态分辨率宽度、运动中的细反射、粗糙度材质边界、模式切换首帧、DLSS-RR 命中距离，并记录 `SSGI REBLUR`、`SSRT Trace Specular` 和 `SSRT Sparse Resolve` 的 GPU 时间与显存峰值。
+
+## 4. 效率候选与优先级
+
+以下「收益」仅是源码层面的预期，**没有实机帧时结论**。优先级综合了每帧重复工作、与本地结构的贴合度及回归风险。
+
+| 优先级 | 候选及上游证据 | 本地证据、前置条件与风险 | 必须实测 |
+| --- | --- | --- | --- |
+| **P0** | **SSRT diffuse 生效时走 AO-only SSGI：本地工作流建议，并非上游现成实现。** | 本地 [`Deferred.cpp`](../src/Deferred.cpp) 先运行完整 `DrawSSGI()`；[`DeferredCompositeCS.hlsl`](../package/Shaders/DeferredCompositeCS.hlsl) 在 `ssrtSettings.DiffuseMult > 0` 时不用 SSGI IL，却仍消费 SSGI AO。SSRT 的 SSGI 输入只取 AO。当前 [`gi.cs.hlsl`](../features/Screen%20Space%20GI/Shaders/ScreenSpaceGI/gi.cs.hlsl) 在同一 dispatch 中计算 AO 与 IL，不能停掉整个 SSGI。可评估跳过 IL 积分、辐射预滤波与旧 IL blur；半/四分辨率时仍需 AO/contact AO 上采样。`radianceDisocc` 会读 IL 历史并与 AO 共用有效性判断，模式切换必须重置或隔离历史；门控要与**实际有效的** SSRT diffuse 输出一致，不能只看 UI 开关。与 batch33 新降噪数据流合并后再定实施边界。 | 固定场景中 SSRT diffuse 开/关各测 SSGI 分 pass 及总 GPU 时间、Deferred Composite 时间；核对 AO 与最终颜色、切换首帧、失败回退和动态分辨率。 |
+| **P1** | `pp` 的 [SSGI radiance copy 消除，`30937337c`](https://github.com/jiayev/skyrim-community-shaders/commit/30937337ce3e9e3233be778355668069ce2a9c31)：[RadianceTemp 直接创建 UAV](https://github.com/jiayev/skyrim-community-shaders/blob/3a2440b64af44526e5f3890a81118665a7a83028/src/Features/ScreenSpaceGI.cpp#L427-L466)，`radianceDisocc` 写 Temp、预滤从 Temp 读。 | 本地 [`ScreenSpaceGI.cpp`](../src/Features/ScreenSpaceGI.cpp) 仍在两 pass 间 `CopySubresourceRegion` 整张 radiance mip 0；结构近似，适合小范围移植。需保留同格式、同 mip 内容及动态分辨率边缘行为。 | GPU capture 中该 copy 从每帧 1 次变 0 次；SSGI 总时间、radiance mip 逐层差异、动态分辨率边界。 |
+| **P1/P2** | `compendium-clean` 的 [SSR Hi-Z mip 0–4 融合，`91a6cf811`](https://github.com/jiayev/skyrim-community-shaders/commit/91a6cf8119e04281c1a66a38e7e76fa649a83e5a)：[16 对齐时单次 dispatch，其他情况回退](https://github.com/jiayev/skyrim-community-shaders/blob/e5cb550b0cace194174c05dccb568f2bd31b7c23/src/Features/ScreenSpaceReflections.cpp#L429-L469)。 | 本地 [`ScreenSpaceRayTracing::Prepass()`](../src/Features/ScreenSpaceRayTracing.cpp) 默认构造 mip 0–6：融合前五层理论上将 7 次降为 3 次 dispatch。上游路径在 1920×1080 等非 16 对齐分辨率不会启用；本地动态分辨率外侧使用远平面 `1.0`，而上游 shader 钳制边缘像素，不能直接照搬，否则可能改变 min-depth 金字塔与命中结果。保留通用回退及 `hiZTopMipBuilt` 限制。 | `SSRTDepthPyramid` GPU 时间及 dispatch 数；2560×1440、4K、1080p、奇数动态分辨率下逐 mip 比较和误命中检查。 |
+| **P2** | `pp` 的 [SSGI 法线 mip 预滤波，`be3726525`](https://github.com/jiayev/skyrim-community-shaders/commit/be3726525a354d613682f0b09335a97788b31604)：[按辐射 mip 取预滤法线](https://github.com/jiayev/skyrim-community-shaders/blob/3a2440b64af44526e5f3890a81118665a7a83028/features/Screen%20Space%20GI/Shaders/ScreenSpaceGI/gi.cs.hlsl#L253-L266)。 | 本地 [`gi.cs.hlsl`](../features/Screen%20Space%20GI/Shaders/ScreenSpaceGI/gi.cs.hlsl) 的远处 IL 样本仍从全分辨率 `srcNormalRoughness` 读法线。新 mip 链和预滤 pass 自身有成本，且会改变几何边缘的法线平均值；净收益不能由提交标题推断。 | SSGI 预滤 pass、GI pass、总 GPU 时间；低/高采样设置及边缘图像对比。 |
+| **P2** | `pp` 的 [动态 cubemap BC6H 采样副本，`ecabfdbf0`](https://github.com/jiayev/skyrim-community-shaders/commit/ecabfdbf023561c21c8da95b233336e6d9f8442c)：[压缩与绑定](https://github.com/jiayev/skyrim-community-shaders/blob/3a2440b64af44526e5f3890a81118665a7a83028/src/Features/DynamicCubemaps.cpp#L488-L540)。 | 本地 [`DynamicCubemaps.cpp`](../src/Features/DynamicCubemaps.cpp) 绑定 R11G11B10；IBL、Deferred、SSGI、SSRT 均有直接 SRV 消费点。压缩可减小**采样表示**的读带宽与缓存压力，但上游仍保留未压缩 UAV 和额外 scratch，不能声称总显存下降。刷新时编码增加 GPU 工作，且可能出现压缩伪影。 | 常态采样 GPU 时间、cubemap 刷新帧峰值、总显存、反射和 IBL 图像差异。 |
+| **P3** | `pp` 的 [FeatureBuffer 复用，`7a0219825`](https://github.com/jiayev/skyrim-community-shaders/commit/7a0219825)：[thread-local 定长缓冲](https://github.com/jiayev/skyrim-community-shaders/blob/3a2440b64af44526e5f3890a81118665a7a83028/src/FeatureBuffer.cpp#L26-L44)。 | 本地 [`FeatureBuffer.cpp`](../src/FeatureBuffer.cpp) 每次调用 `new[]`，`State.cpp` 用后释放；为 CPU 小优化。移植时保留本地 FeatureData 布局断言，并按字节拷贝以避免对齐问题。 | `UpdateSharedData` CPU 时间和每帧分配次数；GPU 时间不应作为该项收益指标。 |
+
+本地 SSRT 已有「diffuse 与 specular 都关闭时跳过 Hi-Z」「按 `MaxMips` 只生成会被追踪读取的层」以及直接绑定 specular 输出、避免另一张全屏复制的措施，不能把这些记为待移植的新收益。任何候选都应先在相同场景、相同分辨率和采样设置下记录 GPU 分 pass 时间与画面差异，再决定是否进入 batch33。

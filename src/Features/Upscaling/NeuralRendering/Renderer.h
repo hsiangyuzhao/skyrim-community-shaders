@@ -46,8 +46,9 @@ namespace NeuralRendering
 			const std::array<StereoEyeInput, 2>& eyes,
 			std::uint32_t guideWidth, std::uint32_t guideHeight,
 			std::uint32_t colorWidth, std::uint32_t colorHeight, const Tuning& tuning);
-		void Reset();
-		void ResetHistory();
+		bool Reset();
+		/** Releases temporal features only after their D3D12 work has completed. */
+		bool ResetHistory();
 
 		[[nodiscard]] bool IsFailureLatched() const;
 		[[nodiscard]] std::uint32_t NgxResult() const;

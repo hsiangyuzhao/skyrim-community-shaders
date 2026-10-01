@@ -10,6 +10,7 @@
 // (directional env v2) For the cubemap / skylighting SRVs the GI pass now binds and the
 // `loaded` tests the compile round keys its defines on. Globals.h only forward-declares these.
 #include "DynamicCubemaps.h"
+#include "ScreenSpaceRayTracing.h"
 #include "Skylighting.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -29,6 +30,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	GIDistanceCompensation,
 	AOPower,
 	GIStrength,
+	DenoiserMethod,
+	ReblurDiffuse,
 	EnableTemporalDenoiser,
 	EnableBlur,
 	DepthDisocclusion,
@@ -393,12 +396,29 @@ void ScreenSpaceGI::DrawSettings()
 
 		if (ImGui::BeginTable("denoisers", 2)) {
 			ImGui::TableNextColumn();
-			recompileFlag |= ImGui::Checkbox("Temporal Denoiser", &settings.EnableTemporalDenoiser);
-
+			int method = (int)settings.DenoiserMethod;
+			if (ImGui::RadioButton("Current temporal + blur", &method, (int)kDenoiserLegacy)) {
+				settings.DenoiserMethod = kDenoiserLegacy;
+				recompileFlag = true;
+			}
 			ImGui::TableNextColumn();
-			ImGui::Checkbox("Blur", &settings.EnableBlur);
+			if (ImGui::RadioButton("NRD REBLUR diffuse IL", &method, (int)kDenoiserREBLUR)) {
+				settings.DenoiserMethod = kDenoiserREBLUR;
+				recompileFlag = true;
+			}
 
 			ImGui::EndTable();
+		}
+		ImGui::TextWrapped("REBLUR replaces the visible diffuse indirect-light result only. AO, directional environment and the optional specular GI keep their existing filters.");
+		if (settings.DenoiserMethod == kDenoiserREBLUR) {
+			if (!effectiveReblurDiffuse)
+				ImGui::TextDisabled("REBLUR is unavailable or SSRT diffuse is providing indirect light; using the current SSGI result.");
+			globals::features::nrd.DrawReblurSettings(settings.ReblurDiffuse, showAdvanced, "SSGI diffuse");
+		}
+		{
+			auto legacyGuard = Util::DisableGuard(settings.DenoiserMethod != kDenoiserLegacy);
+			recompileFlag |= ImGui::Checkbox("Temporal Denoiser", &settings.EnableTemporalDenoiser);
+			ImGui::Checkbox("Blur", &settings.EnableBlur);
 		}
 
 		if (showAdvanced) {
@@ -465,6 +485,12 @@ void ScreenSpaceGI::DrawSettings()
 		BUFFER_VIEWER_NODE(texIlY[1], debugRescale)
 		BUFFER_VIEWER_NODE(texIlCoCg[0], debugRescale)
 		BUFFER_VIEWER_NODE(texIlCoCg[1], debugRescale)
+		if (texNRDInputWorking)
+			BUFFER_VIEWER_NODE(texNRDInputWorking, debugRescale)
+		if (texNRDInputFull)
+			BUFFER_VIEWER_NODE(texNRDInputFull, debugRescale)
+		if (texNRDOutput)
+			BUFFER_VIEWER_NODE(texNRDOutput, debugRescale)
 		BUFFER_VIEWER_NODE(texContactAo[0], debugRescale)
 		BUFFER_VIEWER_NODE(texContactAo[1], debugRescale)
 		BUFFER_VIEWER_NODE(texBentNormal[0], debugRescale)
@@ -502,6 +528,10 @@ ScreenSpaceGI::SSGISharedData ScreenSpaceGI::GetCommonBufferData()
 
 void ScreenSpaceGI::SetupResources()
 {
+	effectiveReblurDiffuse = false;
+	ReleaseNRDResources();
+	prevFrameDim = {};
+
 	auto renderer = globals::game::renderer;
 	auto device = globals::d3d::device;
 
@@ -743,10 +773,119 @@ void ScreenSpaceGI::SetupResources()
 	CompileComputeShaders();
 }
 
+void ScreenSpaceGI::EnsureNRDResources()
+{
+	auto renderer = globals::game::renderer;
+	auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+	D3D11_TEXTURE2D_DESC mainDesc{};
+	mainTex.texture->GetDesc(&mainDesc);
+	const uint32_t divisor = 1u << settings.ResolutionMode;
+	const uint32_t workingWidth = std::max(1u, mainDesc.Width / divisor);
+	const uint32_t workingHeight = std::max(1u, mainDesc.Height / divisor);
+
+	D3D11_TEXTURE2D_DESC desc{
+		.Width = workingWidth,
+		.Height = workingHeight,
+		.MipLevels = 1,
+		.ArraySize = 1,
+		.Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
+		.SampleDesc = { 1, 0 },
+		.Usage = D3D11_USAGE_DEFAULT,
+		.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+	};
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{
+		.Format = desc.Format,
+		.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+		.Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 },
+	};
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{
+		.Format = desc.Format,
+		.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+		.Texture2D = { .MipSlice = 0 },
+	};
+	auto makeTex = [&](eastl::unique_ptr<Texture2D>& tex, const char* name) {
+		if (tex && (tex->desc.Width != desc.Width || tex->desc.Height != desc.Height))
+			tex = nullptr;
+		if (!tex) {
+			tex = eastl::make_unique<Texture2D>(desc);
+			tex->CreateSRV(srvDesc);
+			tex->CreateUAV(uavDesc);
+			Util::SetResourceName(tex->resource.get(), name);
+		}
+	};
+	makeTex(texNRDInputWorking, "SSGI::NRDInputWorking");
+
+	desc.Width = mainDesc.Width;
+	desc.Height = mainDesc.Height;
+	if (settings.ResolutionMode != 0)
+		makeTex(texNRDInputFull, "SSGI::NRDInputFull");
+	else
+		texNRDInputFull = nullptr;
+	makeTex(texNRDOutput, "SSGI::NRDOutput");
+
+	if (nrdReblurDiffuse.IsValid() &&
+		(nrdReblurDiffuse.GetWidth() != mainDesc.Width || nrdReblurDiffuse.GetHeight() != mainDesc.Height)) {
+		nrdReblurDiffuse.Resize(mainDesc.Width, mainDesc.Height);
+		resetReblurDiffuse = true;
+	}
+	if (!nrdReblurDiffuse.IsValid()) {
+		nrdReblurDiffuse.Init(mainDesc.Width, mainDesc.Height, nrd::Denoiser::REBLUR_DIFFUSE, 2);
+		resetReblurDiffuse = true;
+	}
+}
+
+void ScreenSpaceGI::ReleaseNRDResources()
+{
+	reblurPublishedSRV = nullptr;
+	resetReblurDiffuse = true;
+	if (nrdReblurDiffuse.IsValid())
+		nrdReblurDiffuse.Shutdown();
+	texNRDInputWorking = nullptr;
+	texNRDInputFull = nullptr;
+	texNRDOutput = nullptr;
+}
+
+void ScreenSpaceGI::Prepass()
+{
+	if (recompileFlag)
+		ClearShaderCache();
+
+	const bool wasEffective = effectiveReblurDiffuse;
+	effectiveReblurDiffuse = false;
+	reblurPublishedSRV = nullptr;
+	if (settings.DenoiserMethod != kDenoiserREBLUR || !settings.Enabled || !settings.EnableGI ||
+		!ShadersOK() || !giReblurCompute || !upsampleReblurCompute || REL::Module::IsVR()) {
+		ReleaseNRDResources();
+		return;
+	}
+
+	const auto& ssrt = globals::features::screenSpaceRayTracing;
+	if (ssrt.loaded && ssrt.settings.EnableDiffuse && ssrt.settings.DiffuseMult > 0.0f) {
+		ReleaseNRDResources();
+		return;
+	}
+
+	const auto& nrdSvc = globals::features::nrd;
+	if (!nrdSvc.loaded || !nrdSvc.CanPrepareGuides()) {
+		ReleaseNRDResources();
+		return;
+	}
+
+	EnsureNRDResources();
+	effectiveReblurDiffuse = texNRDInputWorking && texNRDOutput &&
+		(settings.ResolutionMode == 0 || texNRDInputFull) && nrdReblurDiffuse.IsValid();
+	if (!effectiveReblurDiffuse) {
+		ReleaseNRDResources();
+	} else if (!wasEffective) {
+		resetReblurDiffuse = true;
+	}
+}
+
 void ScreenSpaceGI::ClearShaderCache()
 {
 	static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
-		&prefilterDepthsCompute, &prefilterRadianceCompute, &radianceDisoccCompute, &giCompute, &blurCompute, &upsampleCompute, &contactAoCompute
+		&prefilterDepthsCompute, &prefilterRadianceCompute, &radianceDisoccCompute, &giCompute,
+		&giReblurCompute, &blurCompute, &upsampleCompute, &upsampleReblurCompute, &contactAoCompute
 	};
 
 	for (auto shader : shaderPtrs)
@@ -843,6 +982,16 @@ void ScreenSpaceGI::CompileComputeShaders()
 		info.defines.insert(info.defines.end(), defines.begin(), defines.end());
 		if (auto rawPtr = compile(info.filename, info.defines))
 			info.programPtr->attach(rawPtr);
+	}
+	// Optional permutations write/upsample this frame's raw diffuse IL for REBLUR. The
+	// original shaders stay available so a missing NRD shader falls back to legacy SSGI.
+	if (settings.DenoiserMethod == kDenoiserREBLUR && settings.EnableGI && !REL::Module::IsVR()) {
+		auto reblurDefines = defines;
+		reblurDefines.push_back({ "SSGI_REBLUR", "" });
+		if (auto rawPtr = compile("gi.cs.hlsl", reblurDefines))
+			giReblurCompute.attach(rawPtr);
+		if (auto rawPtr = compile("upsample.cs.hlsl", reblurDefines))
+			upsampleReblurCompute.attach(rawPtr);
 	}
 
 	recompileFlag = false;
@@ -1128,6 +1277,8 @@ void ScreenSpaceGI::DrawSSGI()
 		uavs.at(3) = texGiSpecular[!inputAoTexIdx]->uav.get();
 		uavs.at(4) = texPrevGeo->uav.get();
 		uavs.at(5) = texBentNormal[!inputGITexIdx]->uav.get();
+		if (effectiveReblurDiffuse)
+			uavs.at(7) = texNRDInputWorking->uav.get();
 
 		// (directional env v2) t10 = the reprojected irradiance history radianceDisocc just
 		// wrote; t11/t12 = the live cubemap pair (last capture round -- DrawSSGI runs before
@@ -1146,7 +1297,7 @@ void ScreenSpaceGI::DrawSSGI()
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-		context->CSSetShader(giCompute.get(), nullptr, 0);
+		context->CSSetShader((effectiveReblurDiffuse ? giReblurCompute : giCompute).get(), nullptr, 0);
 		context->Dispatch((internalRes[0] + 7u) >> 3, (internalRes[1] + 7u) >> 3, 1);
 
 		inputAoTexIdx = !inputAoTexIdx;
@@ -1266,10 +1417,14 @@ void ScreenSpaceGI::DrawSSGI()
 			srvs.at(7) = texEnvIrradiance[inputGITexIdx]->srv.get();
 			uavs.at(5) = texEnvIrradiance[!inputGITexIdx]->uav.get();
 		}
+		if (effectiveReblurDiffuse) {
+			srvs.at(8) = texNRDInputWorking->srv.get();
+			uavs.at(6) = texNRDInputFull->uav.get();
+		}
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-		context->CSSetShader(upsampleCompute.get(), nullptr, 0);
+		context->CSSetShader((effectiveReblurDiffuse ? upsampleReblurCompute : upsampleCompute).get(), nullptr, 0);
 		context->Dispatch((resolution[0] + 7u) >> 3, (resolution[1] + 7u) >> 3, 1);
 
 		inputAoTexIdx = !inputAoTexIdx;
@@ -1292,4 +1447,48 @@ void ScreenSpaceGI::DrawSSGI()
 	context->CSSetConstantBuffers(1, 1, &cb);
 	context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
 	context->CSSetShader(nullptr, nullptr, 0);
+	if (effectiveReblurDiffuse)
+		RunReblurDiffuse();
+}
+
+void ScreenSpaceGI::RunReblurDiffuse()
+{
+	auto& nrdSvc = globals::features::nrd;
+	auto* input = (settings.ResolutionMode == 0 ? texNRDInputWorking : texNRDInputFull).get();
+	// Keep this frame's raw signal as the publication fallback if guides or an NRD
+	// dispatch fail. The composite must never read a stale output/history texture.
+	reblurPublishedSRV = input->srv.get();
+	if (!nrdSvc.AreGuidesReady()) {
+		resetReblurDiffuse = true;
+		return;
+	}
+
+	auto common = nrdSvc.GetCommonSettings();
+	common.splitScreen = settings.ReblurDiffuse.SplitScreen;
+	common.enableValidation = settings.ReblurDiffuse.EnableValidation;
+	if (resetReblurDiffuse)
+		common.accumulationMode = nrd::AccumulationMode::CLEAR_AND_RESTART;
+	nrdReblurDiffuse.SetCommonSettings(common);
+	nrdSvc.ApplyReblurSettings(reblurDiffuseSettings, settings.ReblurDiffuse, nrd::CheckerboardMode::OFF);
+	nrdReblurDiffuse.SetDenoiserSettings(&reblurDiffuseSettings);
+	nrdReblurDiffuse.SetNamedSRV(nrd::ResourceType::IN_MV, nrdSvc.GetMotionVectorSRV());
+	nrdReblurDiffuse.SetNamedUAV(nrd::ResourceType::IN_MV, nrdSvc.GetMotionVectorUAV());
+	nrdReblurDiffuse.SetNamedSRV(nrd::ResourceType::IN_NORMAL_ROUGHNESS, nrdSvc.GetNormalRoughnessSRV());
+	nrdReblurDiffuse.SetNamedSRV(nrd::ResourceType::IN_VIEWZ, nrdSvc.GetViewZSRV());
+	nrdReblurDiffuse.SetNamedSRV(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, input->srv.get());
+	nrdReblurDiffuse.SetNamedSRV(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, texNRDOutput->srv.get());
+	nrdReblurDiffuse.SetNamedUAV(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, texNRDOutput->uav.get());
+
+	globals::state->BeginPerfEvent("SSGI REBLUR Diffuse IL");
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSGIReblur);
+	const bool dispatched = nrdReblurDiffuse.Dispatch();
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSGIReblur);
+	globals::state->EndPerfEvent();
+	if (dispatched) {
+		reblurPublishedSRV = texNRDOutput->srv.get();
+		resetReblurDiffuse = false;
+	} else {
+		resetReblurDiffuse = true;
+		logger::warn("SSGI REBLUR dispatch did not complete; publishing this frame's undenoised diffuse IL");
+	}
 }

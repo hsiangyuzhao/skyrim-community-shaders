@@ -68,6 +68,10 @@ namespace Util
 				"be the one stretch of the denoising path with no timing row of its own." },
 			{ "SSGI",
 				"GPU time for the Screen Space GI compute chain (prefilter, radiance, GI, blur, upsample),\nexcluding the Contact AO pass which has its own row." },
+			{ "SSGI REBLUR",
+				"GPU time for SSGI's NRD REBLUR_DIFFUSE dispatches. The GI front-end pack and\n"
+				"full-resolution upsample are included in the SSGI row; shared guide preparation\n"
+				"is reported in NRD Guides. Shown only while SSGI REBLUR is active." },
 			{ "SSGI Contact AO",
 				"GPU time for the SSGI Contact AO pass." },
 			{ "PhysicalSky ShadowAccum",

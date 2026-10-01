@@ -52,6 +52,11 @@ public:
 	bool dlssGActive = false;
 	bool dlssGOptionsInitialized = false;
 	bool dlssGRetainResourcesWhenOff = true;
+	// Counts generated frames per real frame. Zero maximum means the runtime has
+	// not reported its capability yet; the first enabled Present uses safe 2x.
+	uint32_t dlssGRequestedFramesToGenerate = 1;
+	uint32_t dlssGAppliedFramesToGenerate = 1;
+	uint32_t dlssGMaxFramesToGenerate = 0;
 	bool dlssGFunctionsReady = false;
 	bool reflexFunctionsReady = false;
 	bool pclFunctionsReady = false;
@@ -192,12 +197,15 @@ public:
 	/**
 	 * @brief Enables or disables non-VR DLSS-G in the current viewport.
 	 *
-	 * DLSS-G is deliberately fixed to 2x (one generated frame per rendered
-	 * frame).  Turning it off retains plugin resources to avoid a pause/menu
-	 * stutter; long-term shutdown can call DestroyDLSSGResources().
+	 * The requested generated-frame count is clamped to the maximum reported
+	 * by the runtime. Turning it off retains plugin resources to avoid a
+	 * pause/menu stutter; long-term shutdown can call DestroyDLSSGResources().
 	 */
 	bool SetDLSSGMode(bool a_enable, bool a_retainResourcesWhenOff = true);
-	bool GetDLSSGState(sl::DLSSGState& a_state);
+	bool GetDLSSGState(sl::DLSSGState& a_state, bool a_requireHealthy = true);
+	uint32_t GetDLSSGRequestedFramesToGenerate() const { return dlssGRequestedFramesToGenerate; }
+	uint32_t GetDLSSGAppliedFramesToGenerate() const { return dlssGAppliedFramesToGenerate; }
+	uint32_t GetDLSSGMaxFramesToGenerate() const { return dlssGMaxFramesToGenerate; }
 	bool TagDLSSGResources(const DLSSGFrameResources& a_resources, ID3D12GraphicsCommandList* a_commandList);
 	void DestroyDLSSGResources(bool a_modeSwitch = true);
 
