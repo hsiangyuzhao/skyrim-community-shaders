@@ -1,4 +1,5 @@
 #include "Deferred.h"
+#include "EngineFixes/WndProcPseudoHandleFix.h"
 #include "Features/Upscaling.h"
 #include "FrameAnnotations.h"
 #include "Globals.h"
@@ -171,6 +172,9 @@ bool Load()
 
 	auto log = spdlog::default_logger();
 	log->set_level(state->GetLogLevel());
+
+	// Before the game window exists, so every later GWLP_WNDPROC query is covered.
+	WndProcPseudoHandleFix::Install();
 
 	const std::array incompatibleDLLs = {
 		L"Data/SKSE/Plugins/ShaderTools.dll",
