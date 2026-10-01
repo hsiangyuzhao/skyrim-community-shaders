@@ -20,6 +20,7 @@
 #include "PerformanceOverlay.h"
 #include "Feature.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTestAggregator.h"
+#include "Features/GrassOptimizations.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Features/Upscaling.h"
 #include "Globals.h"
@@ -139,7 +140,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PositionSet)
 
 static const std::unordered_map<RE::BSShader::Type, std::string> kShaderTypeTooltips = {
-	{ RE::BSShader::Type::Grass, "Draw calls using the Grass shader. Typically many, but each is usually cheap." },
+	{ RE::BSShader::Type::Grass, "Draw calls using the Grass shader. Typically many, but each is usually cheap.\nWith Grass Optimizations on, each grass type is one instanced indirect draw per pass, counted once here; see its block below the GPU table for instance counts." },
 	{ RE::BSShader::Type::Sky, "Draw calls for the sky dome, clouds, and related effects." },
 	{ RE::BSShader::Type::Water, "Draw calls for water surfaces and effects." },
 	{ RE::BSShader::Type::Lighting, "Draw calls for dynamic and static lighting passes." },
@@ -421,6 +422,8 @@ void PerformanceOverlay::DrawOverlay()
 		DrawDrawCallsTable(rowSets.cpuRows, rowSets.summaryRows);
 		DrawOurCpuPassTable(rowSets.ourCpuRows);
 		DrawGpuPassTable(rowSets.gpuRows);
+		if (globals::features::grassOptimizations.loaded)
+			globals::features::grassOptimizations.DrawOverlayStats();
 	}
 
 	// VRAM & GPU Usage
