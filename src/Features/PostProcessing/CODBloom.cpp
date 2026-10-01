@@ -13,11 +13,15 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 void CODBloom::DrawSettings()
 {
 	ImGui::SliderFloat("Threshold", &settings.Threshold, -6.f, 21.f, "%+.2f EV");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Only parts of the image brighter than this glow. Higher = fewer, only the brightest things bloom.");
 	ImGui::SliderFloat("Upsampling Radius", &settings.UpsampleRadius, 1.f, 5.f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("A greater radius makes the bloom slightly blurrier.");
 
 	ImGui::SliderFloat("Mix", &settings.BlendFactor, 0.f, 1.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Overall bloom strength added to the image. 0 = no bloom.");
 
 	ImGui::Separator();
 
@@ -38,6 +42,8 @@ void CODBloom::DrawSettings()
 	ImGui::Indent();
 	{
 		ImGui::SliderFloat("Intensity", &settings.MipBlendFactor[mipLevel - 1], 0.f, 1.f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Strength of the glow layer picked by Mip Level. Low levels = tight glow, high levels = wide haze.");
 	}
 	ImGui::Unindent();
 
@@ -48,6 +54,8 @@ void CODBloom::DrawSettings()
 		// them here would display whatever was last left in those mips -- or, on a fresh
 		// allocation, uninitialised memory.
 		ImGui::SliderInt("Debug Mip Level", &mip, 0, lastTopMip, "%d", ImGuiSliderFlags_NoInput | ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Debug only. Shows one bloom layer below.");
 		mip = std::clamp(mip, 0, lastTopMip);
 
 		ImGui::BulletText("texBloom");

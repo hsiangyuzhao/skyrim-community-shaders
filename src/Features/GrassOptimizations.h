@@ -31,13 +31,13 @@ public:
 	/** @brief Returns a description and list of key features for the UI summary. */
 	virtual std::pair<std::string, std::vector<std::string>> GetFeatureSummary() override
 	{
-		return { "Rewrites grass rendering around GPU-driven culling and instancing, consolidating thousands of engine draw calls into a handful of indirect draws and removing hidden grass before it costs anything.",
-			{ "Consolidates per-shape grass draws into one instanced indirect draw per grass type",
-				"GPU compute culling of individual instances by frustum, distance and projected size",
-				"Hi-Z occlusion culling skips grass hidden behind objects before the vertex shader runs",
-				"Configurable render distance beyond the vanilla INI cap with density scaling",
-				"Optional mesh-swap LOD and simplified shading for distant grass",
-				"Can be switched off in-game for same-session A/B comparison" } };
+		return { "Draws grass much faster: the GPU batches it and skips grass that is off-screen, too small or hidden.",
+			{ "One draw per grass type instead of thousands of small draws",
+				"Skips grass that is off-screen, too far or too small to see",
+				"Skips grass hidden behind objects (occlusion culling)",
+				"Grass render distance beyond the vanilla INI cap, thinned with distance",
+				"Optional simpler models (LOD) and simpler shading for distant grass",
+				"Can be switched off in-game for A/B comparison" } };
 	};
 
 	struct Settings

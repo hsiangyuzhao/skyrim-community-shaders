@@ -23,11 +23,23 @@ namespace
 void LODBlending::DrawSettings()
 {
 	ImGui::SliderFloat("LOD Terrain Brightness", &settings.LODTerrainBrightness, 0.01f, 5.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Brightness of distant (LOD) terrain, to match it with nearby terrain. Higher = brighter.");
 	ImGui::SliderFloat("LOD Object Brightness", &settings.LODObjectBrightness, 0.01f, 5.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Brightness of distant (LOD) objects such as buildings, rocks and mountains. Higher = brighter.");
 	ImGui::SliderFloat("LOD Object Snow Brightness", &settings.LODObjectSnowBrightness, 0.01f, 5.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Brightness of snow on distant (LOD) objects. Higher = brighter.");
 	ImGui::SliderFloat("LOD Terrain Gamma", &settings.LODTerrainGamma, 0.1f, 3.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Contrast curve for distant terrain colours. Lower = brighter (mostly the darker tones), higher = darker.");
 	ImGui::SliderFloat("LOD Object Gamma", &settings.LODObjectGamma, 0.1f, 3.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Contrast curve for distant object colours. Lower = brighter (mostly the darker tones), higher = darker.");
 	ImGui::SliderFloat("LOD Object Snow Gamma", &settings.LODObjectSnowGamma, 0.1f, 3.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Contrast curve for snow on distant objects. Lower = brighter (mostly the darker tones), higher = darker.");
 	ImGui::Checkbox("Disable Terrain Vertex Colors", (bool*)&settings.DisableTerrainVertexColors);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
@@ -40,16 +52,8 @@ void LODBlending::DrawSettings()
 	ImGui::SliderFloat("LOD Grass Gamma", &settings.LODGrassGamma, 0.1f, 3.f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
-			"Brightness of distant grass LOD, as a gamma curve on its diffuse texture. "
-			"Lower is brighter: 0.40 lifts a mid-tone by roughly 2x, 0.30 by roughly 2.4x.\n\n"
-			"Distant grass needs a control of its own because the engine never tags it as LOD "
-			"geometry, so LOD Object Brightness and LOD Object Gamma cannot reach it -- their "
-			"shader code is not even compiled into the permutations grass LOD draws with. "
-			"Merged grass LOD is also darkened where it is generated (DynDOLOD's "
-			"ComplexGrassBrightness, default 0.5), which is what this compensates for.\n\n"
-			"Gamma rather than a multiplier on purpose: gamma cannot lift a value above 1, so it "
-			"cannot blow out highlights, and it cannot feed an albedo above 1 into screen-space "
-			"GI, which would be creating light out of nothing.");
+			"Brightness of distant grass LOD (DynDOLOD grass), which the LOD Object sliders don't affect. Lower = brighter:\n"
+			"0.40 roughly doubles mid-tones. Use it to offset DynDOLOD darkening its grass LOD; it can't blow out highlights.");
 	}
 
 	{
@@ -62,12 +66,8 @@ void LODBlending::DrawSettings()
 	}
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
-			"How a draw is recognised as grass LOD. The two were measured to select exactly the "
-			"same draws, so switching between them should not change the image.\n\n"
-			"The default rests on a naming convention, which is why the alternative exists: it "
-			"keys off merged LOD having no object reference behind it and the material being "
-			"back-lit, and so does not care what the LOD generator names its shapes. Switch to "
-			"it if LOD from a different generator stops responding to the slider above.");
+			"How distant grass LOD is recognised for the slider above. Both normally pick the same grass.\n"
+			"Switch to the second one if your LOD generator names things differently and the slider stops working.");
 	}
 }
 

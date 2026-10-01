@@ -224,6 +224,8 @@ void Upscaling::DrawSettings()
 	uint32_t modeLabelIndex = std::min(*currentUpscaleMode, static_cast<uint32_t>(upscaleModes.size() - 1));
 	std::string currentLabel = upscaleModes[modeLabelIndex];
 	ImGui::SliderInt("Method", (int*)currentUpscaleMode, 0, availableModes, currentLabel.c_str());
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted("How edges are smoothed (anti-aliasing). None = off, TAA = the game's own. FSR/DLSS can also render at a lower resolution and upscale it for more FPS (DLSS needs an NVIDIA RTX card).");
 
 	*currentUpscaleMode = std::min(availableModes, *currentUpscaleMode);
 
@@ -256,12 +258,18 @@ void Upscaling::DrawSettings()
 			std::string labelWithScale = std::format("{} ( {:.2f}x )", baseLabel, (resolutionScale.x + resolutionScale.y) * 0.5f);
 
 			ImGui::SliderInt("Upscale Preset", (int*)&settings.qualityMode, 0, 4, labelWithScale.c_str());
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Internal render resolution (the number is the upscale factor). Toward Performance = more FPS but softer image; DLAA/Native AA = full resolution, best quality, slowest.");
 		}
 
 		if (upscaleMethod == UpscaleMethod::kFSR) {
 			ImGui::SliderFloat("Sharpness", &settings.sharpnessFSR, 0.0f, 1.0f, "%.1f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Sharpening applied after upscaling. Higher = crisper, but too high adds halos and shimmer.");
 		} else if (upscaleMethod == UpscaleMethod::kDLSS) {
 			ImGui::SliderFloat("Sharpness", &settings.sharpnessDLSS, 0.0f, 1.0f, "%.1f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Extra sharpening (NVIDIA NIS) after DLSS. 0 = off. Higher = crisper, but too high adds halos and shimmer.");
 
 			const bool rayReconstructionActive = settings.enableDLSSRR && streamline.featureDLSS_RR;
 			if (rayReconstructionActive)
@@ -283,14 +291,15 @@ void Upscaling::DrawSettings()
 				ImGui::EndDisabled();
 
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("F through M force one DLSS model for the five exposed modes (DLAA/Quality/Balanced/Performance/Ultra Performance).");
-				ImGui::TextUnformatted("The Streamline 2.12 documented mapping uses K for DLAA/Quality/Balanced, M for Performance, and L for Ultra Performance.");
+				ImGui::TextUnformatted("Which DLSS AI model to use. F-M force one model for every preset; the last option picks per preset (K for DLAA/Quality/Balanced, M for Performance, L for Ultra Performance).");
 			}
 		}
 	}
 
 	if (upscaleMethod == UpscaleMethod::kDLSS && streamline.featureDLSS_RR && ImGui::TreeNodeEx("Ray Reconstruction")) {
 		ImGui::Checkbox("Enable DLSS Ray Reconstruction", &settings.enableDLSSRR);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Swaps regular DLSS for Ray Reconstruction (RR), which also cleans up noisy reflections and lighting. Costs more GPU time than regular DLSS.");
 		if (settings.enableDLSSRR) {
 			ImGui::TextDisabled("DLSS SR model presets do not apply while Ray Reconstruction is enabled.");
 
@@ -306,9 +315,8 @@ void Upscaling::DrawSettings()
 				settings.DLSSDPreset = static_cast<uint>(dlssdPresetIndex == 1 ? DLSSDModelPreset::kF : DLSSDModelPreset::kD);
 
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Selects the Ray Reconstruction model for all five quality modes. Takes effect on the next frame, so the two can be compared back to back.");
-				ImGui::TextUnformatted("F is the DLSS 4.5 second-generation transformer model, and as of the DLSS 310.9.1 / Streamline 2.14.1 SDKs shipped here it is both official and NVIDIA's own default -- their header calls ePresetF the latest and default transformer model, where the previous SDK still listed it as reverting to default. D is kept as the comparison baseline: it is what this feature ran hardcoded before the selector existed.");
-				ImGui::TextUnformatted("To check which model was actually requested, read the '[DLSS RR] Requested model preset' line in CommunityShaders.log alongside the 'nvngx_dlssd.dll version' line logged at startup.");
+				ImGui::TextUnformatted("Which Ray Reconstruction AI model to use. Switches instantly, so you can compare.");
+				ImGui::TextUnformatted("F = newest model and NVIDIA's default. D = the older model this mod used before.");
 			}
 		}
 		ImGui::TreePop();
@@ -318,8 +326,8 @@ void Upscaling::DrawSettings()
 		auto& nr = settings.neuralRendering;
 		ImGui::Checkbox("Enable Neural Rendering", &nr.enabled);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("DLSS 5's neural renderer, run on the finished tonemapped frame just before the interface is drawn. It re-lights the image rather than reconstructing it, so unlike every other feature here it reads no G-buffer and feeds nothing back into lighting.");
-			ImGui::TextUnformatted("Expect a large cost: roughly 37% of frame time measured on an RTX 5090, and about 39% on an RTX 4090 with the community Ada build.");
+			ImGui::TextUnformatted("NVIDIA's DLSS 5 AI filter that re-lights the finished image (before the HUD is drawn). Experimental.");
+			ImGui::TextUnformatted("Very expensive: roughly 37-39% of frame time on an RTX 5090/4090.");
 		}
 
 		if (nr.enabled) {
@@ -329,7 +337,7 @@ void Upscaling::DrawSettings()
 				ImGui::Text("Blocked: Frame Generation is running. Switch it off -- no restart needed.");
 				ImGui::PopStyleColor();
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("DLSS-G intercepts Present asynchronously, and this pass writes into the scene through a D3D12 device of its own, so the two cannot both be working on the same image. Switching Frame Generation off releases it immediately: the proxy swapchain stays, idle, which is exactly what lets the two share a session. Switching it back on is the direction that still needs a restart, and only if the session booted with it off.");
+					ImGui::TextUnformatted("Neural Rendering and Frame Generation can't work on the same image. Turning Frame Generation off frees it at once (see the Frame Generation section for when turning it back on needs a restart).");
 			}
 
 			// Probe as soon as the feature is switched on, rather than waiting for the frame path
@@ -350,7 +358,7 @@ void Upscaling::DrawSettings()
 				ImGui::Text("A pass failed and the feature latched off. See the [DLSSNR] lines in the log.");
 				ImGui::PopStyleColor();
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("The latch exists so a failing pass cannot retry every frame. The D3D12 interop is brought up before the runtime is probed, so an interop failure latches here while the runtime status above still reads as never probed -- the log line names which of the two failed. Reset Neural Rendering clears the latch.");
+					ImGui::TextUnformatted("After a failure it stays off instead of retrying every frame. The log line says what failed; Reset Neural Rendering tries again.");
 			}
 			if (status == NeuralRendering::RuntimeStatus::Initialized) {
 				ImGui::Text("Runtime %s", NeuralRendering::Runtime::Instance().Version().c_str());
@@ -361,8 +369,8 @@ void Upscaling::DrawSettings()
 				ImGui::PopStyleColor();
 			}
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("nvngx_dlssnr.dll is not shipped with this mod and has to be placed in Data/Shaders/Upscaling/Streamline yourself. NVIDIA's own build runs on GeForce RTX 50 only; anything older needs a community-recompiled DLL, and neither is ours to redistribute.");
-				ImGui::TextUnformatted("A version of 310.8.x is required -- that check is what stops an unrelated DLL of the same name from being handed to NGX.");
+				ImGui::TextUnformatted("Not included: place nvngx_dlssnr.dll (version 310.8.x) in Data/Shaders/Upscaling/Streamline yourself.");
+				ImGui::TextUnformatted("NVIDIA's DLL runs on RTX 50 only; older cards need a community-rebuilt DLL.");
 			}
 
 			ImGui::SliderFloat("Intensity", &nr.intensity, 0.f, 1.f, "%.2f");
@@ -380,7 +388,7 @@ void Upscaling::DrawSettings()
 			if (ImGui::Button("Reset Neural Rendering", { -1, 0 }))
 				NeuralRendering::Reset();
 			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("Drops the runtime, its D3D12 device and every shared texture, then lets the next frame rebuild them. Use it after replacing the DLL.");
+				ImGui::TextUnformatted("Shuts Neural Rendering down and restarts it on the next frame. Use after replacing the DLL or after a failure.");
 		}
 	}
 
@@ -413,13 +421,13 @@ void Upscaling::DrawSettings()
 			if (activeBackend == FrameGenerationBackend::kDLSSG) {
 				ImGui::Text("On this backend it can be switched off and back on freely, in either direction");
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("A DLSS-G session stands generation up whether or not this setting starts on, so the toggle below is live. Turning it off already happened every time a menu opened, with resources retained so it can resume cheaply; what used to need a restart was turning it back on, because the session only prepared the proxy path when it booted with the setting enabled. It now always does, which is what makes switching generation off to use Neural Rendering a decision you can reverse without leaving the game.");
+					ImGui::TextUnformatted("With DLSS-G the Frame Generation switch below works live in both directions, e.g. to turn it off for Neural Rendering and back on later without restarting.");
 			} else if (frameGenerationEnabledAtStartup) {
 				ImGui::Text("This session booted with it on, so it can be switched off and back on freely");
 			} else {
 				ImGui::Text("This session booted with it off, so switching it on requires a restart");
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("FSR frame generation owns its own FidelityFX swapchain and has no equivalent of DLSS-G's per-frame suspend, so its enable state is still read once, at startup. The DLSS-G backend does not have this restriction.");
+					ImGui::TextUnformatted("FSR frame generation is only set up at game start. The DLSS-G backend doesn't have this limit.");
 			}
 
 			if (!isWindowed) {
@@ -483,9 +491,9 @@ void Upscaling::DrawSettings()
 					ImGui::EndCombo();
 				}
 				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted("Frames shown per frame rendered: 2x adds one generated frame between each pair of real ones, 3x adds two, 4x adds three. Takes effect immediately, no restart.");
-					ImGui::TextUnformatted("Only the multipliers DLSS-G reports for this system are listed. RTX 50 cards report up to 4x; RTX 40 cards report 2x unless an external unlock is loaded with the game. Community Shaders itself does not modify any NVIDIA file.");
-					ImGui::TextUnformatted("Under the same Reflex frame limit a higher multiplier renders fewer real frames, so input latency rises with it.");
+					ImGui::TextUnformatted("Generated frames per real frame: 2x adds one, 3x two, 4x three. Applies instantly.");
+					ImGui::TextUnformatted("Only what DLSS-G allows on this system is listed (RTX 40: 2x unless unlocked; RTX 50: up to 4x).");
+					ImGui::TextUnformatted("At the same frame limit, higher = fewer real frames, so more input lag.");
 				}
 
 				if (reportedFramesMax == 0) {
@@ -512,8 +520,8 @@ void Upscaling::DrawSettings()
 
 			ImGui::SliderInt("Frame Limit (VSync off only)", (int*)&settings.frameLimitMode, 0, 1, std::format("{}", toggleModes[settings.frameLimitMode]).c_str());
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Paces presentation to the refresh rate, or the refresh rate divided by the generation multiplier while generating. It runs only when the game presents with a sync interval of zero, so anything that turns VSync on -- including SSE Display Tweaks, which owns that setting for most setups -- leaves it inert.");
-				ImGui::TextUnformatted("It also spins after Present, which is the wrong side of the frame for a cap: it holds the CPU once the work is already submitted. Under a variable refresh rate prefer the Reflex frame limit below, which is applied before input is sampled and which the driver is aware of.");
+				ImGui::TextUnformatted("Caps FPS to the monitor's refresh rate. Does nothing while VSync is on (e.g. set by SSE Display Tweaks).");
+				ImGui::TextUnformatted("Adds more input lag than the Reflex Frame Limit; with a VRR/G-Sync monitor use that one instead.");
 			}
 
 			if (!d3d12SwapChainActive)
@@ -524,9 +532,8 @@ void Upscaling::DrawSettings()
 
 			ImGui::Checkbox("Frame Generation in Menus", &settings.frameGenerationAllowInMenus);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Keeps generation running while a paused menu is open -- inventory, the journal, the system menu. Without it, generation stops the moment the game pauses, which is why the frame rate drops as soon as a menu appears.");
-				ImGui::TextUnformatted("The main menu and loading screens stay excluded: there is no world scene behind them, so there would be nothing to interpolate but the menu itself. The map keeps its own staged recovery either way.");
-				ImGui::TextUnformatted("Menus are where the latency generation adds is easiest to notice and the extra smoothness worth least, which is why this is off by default.");
+				ImGui::TextUnformatted("Keeps frame generation on in pause menus (inventory, journal, system menu), so FPS doesn't drop when one opens.");
+				ImGui::TextUnformatted("Main menu and loading screens are always excluded. Off by default: menus feel laggier with it.");
 			}
 
 			ImGui::TreePop();
@@ -549,8 +556,8 @@ void Upscaling::DrawSettings()
 			if (ImGui::Combo("Reflex Low Latency", &reflexModeIndex, reflexModes, IM_ARRAYSIZE(reflexModes)))
 				settings.reflexMode = static_cast<uint>(reflexModeIndex);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Holds the render queue so the CPU does not run further ahead of the GPU than the frame needs. This is where latency is actually removed, and it happens in the game's own update, before input is sampled.");
-				ImGui::TextUnformatted("Boost additionally keeps GPU clocks up when the frame is CPU-bound. It costs power for a small further latency reduction and is worth little unless the GPU is idling.");
+				ImGui::TextUnformatted("Reduces input lag by stopping the CPU from queuing frames ahead of the GPU.");
+				ImGui::TextUnformatted("Boost also keeps GPU clocks high: slightly less lag for more power use; mostly useful when the GPU isn't fully busy.");
 			}
 
 			if (IsFrameGenerationRequestedNow() && settings.reflexMode == 0) {
@@ -558,7 +565,7 @@ void Upscaling::DrawSettings()
 				ImGui::Text("Held at On: Frame Generation requires Reflex.");
 				ImGui::PopStyleColor();
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("NVIDIA requires Reflex whenever DLSS-G is generating, and effectively no shipping game exposes the other combination. DLSS-G paces its own presentation, so without Reflex holding the render queue the game runs ahead of a cadence it no longer controls -- the case where generation adds the most latency. The setting above is left as you chose it and takes effect again once generation is off.");
+					ImGui::TextUnformatted("DLSS-G needs Reflex, or input lag gets much worse. Your choice is kept and applies again once Frame Generation is off.");
 			}
 
 			int reflexFrameLimit = static_cast<int>(settings.reflexFrameLimit);
@@ -566,9 +573,8 @@ void Upscaling::DrawSettings()
 					reflexFrameLimit > 0 ? "%d presented fps" : "Off", ImGuiSliderFlags_AlwaysClamp))
 				settings.reflexFrameLimit = static_cast<uint>(std::max(reflexFrameLimit, 0));
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Caps frames as they reach the display, not as they are rendered. The driver knows the generation multiplier, so with generation running a cap of 120 presents 120 and renders 120 divided by the multiplier (60 at 2x, 40 at 3x, 30 at 4x); the same cap where generation is off renders and presents 120. Zero leaves it uncapped.");
-				ImGui::TextUnformatted("This is the cap to use with a variable refresh rate. It is imposed inside Reflex's own sleep, before input is sampled, and the driver knows about it -- unlike a limiter that spins after Present, which adds the time it waits to the latency of the frame it just submitted.");
-				ImGui::TextUnformatted("Interpolation assumes evenly spaced frames, so a cap low enough to hold steady in the worst case is usually worth more than the headroom it gives up. Keep it below the display's maximum refresh so presentation stays inside the variable-refresh window.");
+				ImGui::TextUnformatted("FPS cap on frames shown, including generated ones: 120 at 2x renders 60 real frames (40 at 3x, 30 at 4x). 0 = no cap.");
+				ImGui::TextUnformatted("Best cap for VRR/G-Sync, with the least added lag. Keep it below the monitor's max refresh, and low enough to hold steady.");
 			}
 
 			ImGui::Text("Display reports %.0f Hz", refreshRate);
@@ -601,7 +607,7 @@ void Upscaling::DrawSettings()
 					ImGui::Text("Reported latency %.1f ms",
 						static_cast<double>(newest->gpuRenderEndTime - newest->simStartTime) / 1000.0);
 					if (auto _tt = Util::HoverTooltipWrapper())
-						ImGui::TextUnformatted("Simulation start to GPU render end for the newest completed frame, as the driver measured it. It excludes the display's own pipeline, so treat it as a number to compare against itself rather than as end-to-end click-to-photon.");
+						ImGui::TextUnformatted("Driver-measured time from game update to GPU finish for the latest frame. Excludes the monitor, so use it to compare settings, not as total input lag.");
 				}
 			}
 		}

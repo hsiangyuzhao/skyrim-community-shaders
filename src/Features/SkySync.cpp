@@ -13,18 +13,26 @@ void SkySync::DrawSettings()
 	ImGui::Checkbox("Enabled", &settings.Enabled);
 
 	ImGui::Checkbox("Use alternate sun path", &settings.UseAlternateSunPath);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Changes the tilt of the sun's daily path across the sky (picked below) for different shadow angles.");
 
 	if (settings.UseAlternateSunPath) {
 		if (ImGui::SliderInt("Sun path", &settings.SunPath, 0, static_cast<uint8_t>(SunPath::Count) - 1, SunPathNames[settings.SunPath], ImGuiSliderFlags_AlwaysClamp))
 			SetSunAngle();
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Southern/Northern Sky: the sun path tilts 35 degrees to that side for longer, more angled shadows. Vanilla: Skyrim's near-overhead path.");
 
 		if (settings.SunPath == static_cast<int32_t>(SunPath::Custom)) {
 			if (ImGui::SliderFloat("Custom angle", &settings.CustomAngle, -90.0f, 90.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
 				SetSunAngle();
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Tilt of the sun's path in degrees. 0 = straight overhead; -35 matches Southern Sky, +35 Northern Sky.");
 		}
 	}
 
 	ImGui::SliderInt("Moon light source", &settings.MoonLightSource, 0, static_cast<uint8_t>(MoonLightSource::Count) - 1, MoonLightSourceNames[settings.MoonLightSource], ImGuiSliderFlags_AlwaysClamp);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Which moon lights the night. Brightest = whichever moon is brighter.");
 }
 
 void SkySync::LoadSettings(json& o_json)

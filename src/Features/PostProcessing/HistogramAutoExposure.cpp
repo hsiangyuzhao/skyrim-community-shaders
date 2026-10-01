@@ -33,11 +33,23 @@ void HistogramAutoExposure::DrawSettings()
 	if (settings.EnableToD) {
 		if (ImGui::TreeNodeEx("ToD Exposure Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
 			ImGui::SliderFloat("Dawn", &settings.ToDExposure[0], -5.f, 5.f, "%+.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Extra brightness at this time of day, in EV (+1 = twice as bright, -1 = half).");
 			ImGui::SliderFloat("Sunrise", &settings.ToDExposure[1], -5.f, 5.f, "%+.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Extra brightness at this time of day, in EV (+1 = twice as bright, -1 = half).");
 			ImGui::SliderFloat("Day", &settings.ToDExposure[2], -5.f, 5.f, "%+.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Extra brightness at this time of day, in EV (+1 = twice as bright, -1 = half).");
 			ImGui::SliderFloat("Sunset", &settings.ToDExposure[3], -5.f, 5.f, "%+.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Extra brightness at this time of day, in EV (+1 = twice as bright, -1 = half).");
 			ImGui::SliderFloat("Dusk", &settings.ToDExposure[4], -5.f, 5.f, "%+.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Extra brightness at this time of day, in EV (+1 = twice as bright, -1 = half).");
 			ImGui::SliderFloat("Night", &settings.ToDExposure[5], -5.f, 5.f, "%+.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Extra brightness at this time of day, in EV (+1 = twice as bright, -1 = half).");
 			ImGui::TreePop();
 		}
 	} else {
@@ -50,20 +62,36 @@ void HistogramAutoExposure::DrawSettings()
 		ImGui::Text("Applying exposure adjustments separately to interiors.");
 	if (settings.EnableInterior) {
 		ImGui::SliderFloat("Interior", &settings.InteriorExposure, -5.f, 5.f, "%+.2f EV");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Extra brightness indoors, in EV (+1 = twice as bright, -1 = half).");
 	}
 
 	ImGui::SliderFloat("Adaptation Speed", &settings.AdaptSpeed, 0.1f, 5.f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("How fast the eye adjusts when moving between bright and dark areas. Higher = faster.");
 	ImGui::SliderFloat2("Focus Area", &settings.AdaptArea.x, 0.f, 1.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Specifies the proportion of the area [width, height] that auto exposure will adapt to.");
 	if (settings.EnableToD) {
 		if (ImGui::TreeNodeEx("ToD Adaptation Range Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
 			ImGui::SliderFloat2("Dawn Adaptation Range", &settings.ToDAdaptationRange[0].x, -6.f, 21.f, "%.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("[Min, Max] brightness range auto exposure adapts within at this time of day. See Adaptation Range.");
 			ImGui::SliderFloat2("Sunrise Adaptation Range", &settings.ToDAdaptationRange[1].x, -6.f, 21.f, "%.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("[Min, Max] brightness range auto exposure adapts within at this time of day. See Adaptation Range.");
 			ImGui::SliderFloat2("Day Adaptation Range", &settings.ToDAdaptationRange[2].x, -6.f, 21.f, "%.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("[Min, Max] brightness range auto exposure adapts within at this time of day. See Adaptation Range.");
 			ImGui::SliderFloat2("Sunset Adaptation Range", &settings.ToDAdaptationRange[3].x, -6.f, 21.f, "%.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("[Min, Max] brightness range auto exposure adapts within at this time of day. See Adaptation Range.");
 			ImGui::SliderFloat2("Dusk Adaptation Range", &settings.ToDAdaptationRange[4].x, -6.f, 21.f, "%.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("[Min, Max] brightness range auto exposure adapts within at this time of day. See Adaptation Range.");
 			ImGui::SliderFloat2("Night Adaptation Range", &settings.ToDAdaptationRange[5].x, -6.f, 21.f, "%.2f EV");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("[Min, Max] brightness range auto exposure adapts within at this time of day. See Adaptation Range.");
 			ImGui::TreePop();
 		}
 	} else {
