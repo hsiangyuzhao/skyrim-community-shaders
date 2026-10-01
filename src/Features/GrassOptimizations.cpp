@@ -5,6 +5,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/WinApi.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	GrassOptimizations::Settings,
@@ -192,6 +193,15 @@ void GrassOptimizations::DrawSettings()
 
 void GrassOptimizations::PostPostLoad()
 {
+	// Upstream #2716: SexLabUtil.dll before 2.0 makes grass stutter with this feature. Upstream refuses to
+	// load Community Shaders at all; here only this feature stands down, so the rest keeps working.
+	if (auto sexLabUtil = Util::GetDllVersion(L"Data/SKSE/Plugins/SexLabUtil.dll"); sexLabUtil && sexLabUtil->major() < 2) {
+		failedLoadedMessage = "Incompatible version of SexLabUtil.dll detected (causes grass stutter). Use SexLab P+ instead.";
+		logger::error("[GRASS OPTIMIZATIONS] {}", failedLoadedMessage);
+		loaded = false;
+		return;
+	}
+
 	Hooks::Install();
 }
 
