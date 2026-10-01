@@ -4,6 +4,7 @@
 
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/Batch35.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -386,7 +387,12 @@ RE::BSLightingShaderProperty::Data* Skylighting::BSLightingShaderProperty_GetPre
 			}
 
 			if (fadeNode) {
-				if (auto extraData = fadeNode->GetExtraData("BSX")) {
+				// (batch 35, C2) GetExtraData takes a BSFixedString, so the literal used to be
+				// turned into one - a lookup in the engine's global string pool - for every
+				// object this pass looked at. The interned string is the same either way.
+				static const RE::BSFixedString bsxName{ "BSX" };
+				const bool reuseName = Batch35::IsOn(Batch35::CpuItem::SkylightingStaticBSXName);
+				if (auto extraData = reuseName ? fadeNode->GetExtraData(bsxName) : fadeNode->GetExtraData("BSX")) {
 					auto bsxFlags = (RE::BSXFlags*)extraData;
 					auto value = static_cast<int32_t>(bsxFlags->value);
 
