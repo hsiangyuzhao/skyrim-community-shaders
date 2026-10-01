@@ -3001,13 +3001,24 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float dirShadow = 1.0;
 	float parallaxShadow = 1;
 
+	// (batch 35, B2) Both the EMAT parallax self-shadow and the world (terrain + cloud)
+	// shadow reach the sun only as factors multiplied onto dirLightColorMultiplier - through
+	// dirShadow, through dirDetailShadow and SUN_SOFT_SHADOW, or through
+	// PBR::InitLightProperties' LightColor/CoatLightColor products. Where the multiplier is
+	// already exactly zero (the engine's own shadow, caustics, sky transmittance), every one
+	// of those products is zero whatever the two shadows are, as long as they are finite, so
+	// with the switch on they are not computed. Snow specular does not use the sun colour and
+	// is unaffected.
+	const bool b35SkipOccludedSun = Batch35::IsOn(Batch35::SkipOccludedSunShadows);
+	const bool b35SunReachesPixel = !b35SkipOccludedSun || any(dirLightColorMultiplier != 0);
+
 #	if defined(SCREEN_SPACE_SHADOWS) && defined(DEFERRED)
 	if (!SharedData::InInterior)
 		dirDetailShadow = ScreenSpaceShadows::GetScreenSpaceShadow(input.Position.xyz, screenUV, screenNoise, eyeIndex);
 #	endif
 
 #	if defined(EMAT) && (defined(SKINNED) || !defined(MODELSPACENORMALS))
-	[branch] if (inWorld && SharedData::extendedMaterialSettings.EnableShadows)
+	[branch] if (inWorld && SharedData::extendedMaterialSettings.EnableShadows && b35SunReachesPixel)
 	{
 		float3 dirLightDirectionTS = mul(refractedDirLightDirection, tbn).xyz;
 #		if defined(LANDSCAPE)
@@ -3042,7 +3053,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #	endif  // defined(EMAT) && (defined(SKINNED) || !defined(MODELSPACENORMALS))
 
-	if (dirShadow != 0.0 && (inWorld || inReflection))
+	[branch] if (b35SkipOccludedSun)
+	{
+		[branch] if (dirShadow != 0.0 && (inWorld || inReflection) && b35SunReachesPixel)
+			dirShadow *= ShadowSampling::GetWorldShadow(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, eyeIndex);
+	}
+	else if (dirShadow != 0.0 && (inWorld || inReflection))
 		dirShadow *= ShadowSampling::GetWorldShadow(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, eyeIndex);
 
 	dirLightColorMultiplier *= dirShadow;
