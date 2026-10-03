@@ -4,6 +4,7 @@
 #include "Globals.h"
 #include "Menu.h"
 #include "State.h"
+#include "Utils/GpuPhaseTimeline.h"
 
 namespace Util
 {
@@ -349,6 +350,11 @@ namespace Util
 		if (!EnsureQueries(interval))
 			return;
 
+		// (batch 36) The frame timeline bills this stretch to "our timed passes", so the engine
+		// row the pass is nested in (Terrain Blending inside the opaque pass, ...) does not
+		// count it again. Issued before the disjoint Begin; a timestamp needs no window.
+		GpuPhaseTimeline::GetSingleton()->Push(GpuScope::CsPasses);
+
 		auto context = globals::d3d::context;
 		context->Begin(interval.disjoint.get());
 		context->End(interval.start.get());  // timestamp queries are issued with End() only
@@ -375,6 +381,8 @@ namespace Util
 		bucket.openInterval = -1;
 		if (openBucket == static_cast<int>(a_bucket))
 			openBucket = -1;
+
+		GpuPhaseTimeline::GetSingleton()->Pop(GpuScope::CsPasses);
 	}
 
 	void GpuPassTimers::ForEachActiveBucket(const std::function<void(const BucketReport&)>& a_callback)

@@ -29,6 +29,7 @@
 #include "Utils/FileSystem.h"
 #include "Utils/Format.h"
 #include "Utils/Game.h"
+#include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/UI.h"
 #include <nlohmann/json.hpp>
@@ -297,6 +298,13 @@ void PerformanceOverlay::DataLoaded()
 	this->state.statsWindow.Resize(PerformanceOverlay::Settings::kStatsWindowMaxFrames);
 }
 
+void PerformanceOverlay::PostPostLoad()
+{
+	// Hooks that only bracket engine calls with a timeline scope; they cost one branch per
+	// call while the overlay table is closed.
+	Util::GpuPhaseTimeline::InstallHooks();
+}
+
 void PerformanceOverlay::DrawOverlay()
 {
 	auto* menu = Menu::GetSingleton();
@@ -422,6 +430,7 @@ void PerformanceOverlay::DrawOverlay()
 		DrawDrawCallsTable(rowSets.cpuRows, rowSets.summaryRows);
 		DrawOurCpuPassTable(rowSets.ourCpuRows);
 		DrawGpuPassTable(rowSets.gpuRows);
+		DrawEngineGpuTable();
 		if (globals::features::grassOptimizations.loaded)
 			globals::features::grassOptimizations.DrawOverlayStats();
 	}
@@ -1574,7 +1583,8 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 						"frame generation is NOT here - it runs while Present is executing and lands "
 						"in the gap row below.\n\n"
 						"Large here and small in \"Measured GPU\" means Community Shaders is not what "
-						"is costing you the frame. The reverse means it is."),
+						"is costing you the frame. The reverse means it is.\n\n"
+						"The \"Engine passes (GPU)\" table below splits this up by stage."),
 			true, std::nullopt, std::nullopt });
 
 		gpuSummaryRows.push_back(DrawCallRow{
@@ -1621,6 +1631,238 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 		sorters,
 		rowHandler,
 		gpuSummaryRows);
+}
+
+namespace
+{
+	// (batch 36) Layout of the "Engine passes (GPU)" table. A group with a label gets a header
+	// row carrying the sum of its rows; a group without one shows its rows at the top level.
+	struct EnginePhaseRow
+	{
+		Util::GpuPhase phase;
+		const char* label;
+		const char* tooltip;
+	};
+
+	struct EnginePhaseGroup
+	{
+		const char* label;  // nullptr: rows are shown at the top level
+		const char* tooltip;
+		std::vector<EnginePhaseRow> rows;
+		bool countsDraws = true;  // false: our own GPU work, where "draws" mostly means nothing
+	};
+
+	const std::vector<EnginePhaseGroup>& EnginePhaseLayout()
+	{
+		using P = Util::GpuPhase;
+		static const std::vector<EnginePhaseGroup> layout = {
+			{ nullptr, nullptr,
+				{ { P::WaterPrep, "Water prep",
+					"Engine water work before the main view:\n"
+					"the reflection picture on water and the ripple maps." } } },
+			{ "Shadows", "Drawing the shadow maps, and applying them to the screen.",
+				{
+					{ P::ShadowSunCascade1, "Sun cascade 1",
+						"Sun/moon shadow map, cascade 1 - normally the sharp one\n"
+						"closest to the camera. Cascades are numbered in drawing order." },
+					{ P::ShadowSunCascade2, "Sun cascade 2", "Sun/moon shadow map, cascade 2 (further out than 1)." },
+					{ P::ShadowSunCascade3, "Sun cascade 3", "Sun/moon shadow map, cascade 3." },
+					{ P::ShadowSunCascade4, "Sun cascade 4", "Sun/moon shadow map, cascade 4 (and any beyond)." },
+					{ P::ShadowLocalLights, "Lamps & torches", "Shadow maps of shadow-casting lamps, torches and spells." },
+					{ P::ShadowMask, "Shadow mask", "Full-screen passes that work out which pixels are in shadow." },
+					{ P::ShadowOther, "Other shadow work", "Shadow-pass time outside the per-light drawing (setup, clears)." },
+				} },
+			{ nullptr, nullptr,
+				{ { P::DepthPrepass, "Depth prepass", "The engine's depth-only pass over the scene,\nbefore the main geometry is drawn." } } },
+			{ "Opaque geometry", "The main pass that draws all solid geometry.",
+				{
+					{ P::OpaqueTerrain, "Terrain", "Landscape around the player." },
+					{ P::OpaqueObjects, "Objects", "Solid objects: buildings, rocks, clutter, furniture..." },
+					{ P::OpaqueCharacters, "Characters", "People and creatures: bodies, faces, hair, eyes." },
+					{ P::OpaqueTrees, "Trees", "Full-detail trees." },
+					{ P::OpaqueGrass, "Grass", "Grass." },
+					{ P::OpaqueDistant, "Distant LOD", "Far-away terrain, objects and trees (LOD)." },
+					{ P::OpaqueOther, "Other", "Anything else in the solid pass: decals, effect meshes, clears." },
+				} },
+			{ nullptr, nullptr,
+				{
+					{ P::Sky, "Sky", "Sky, clouds, sun, moons and stars." },
+					{ P::Water, "Water", "Water surfaces in the main view." },
+					{ P::Transparent, "Transparent & effects",
+						"See-through things drawn after the solid pass:\n"
+						"glass, particles, spell effects, fire, smoke, rain." },
+					{ P::WorldOther, "Other world work", "World-pass work before its first draw could be put in a row." },
+					{ P::FirstPerson, "First person", "Your hands and weapon in first person." },
+					{ P::Reflections, "Reflections", "The engine's cubemap reflections." },
+					{ P::Imagespace, "Post-processing (game)",
+						"The game's own image effects: bloom, tonemapping, TAA,\n"
+						"depth of field, underwater, and similar." },
+					{ P::UI, "UI", "HUD and menus." },
+				} },
+			{ "Community Shaders", "Our own GPU work, listed so the table adds up to the whole frame.",
+				{
+					{ P::CsPasses, "Timed passes",
+						"Our passes from the GPU Passes table above.\n"
+						"Should be close to its \"Measured GPU\" line." },
+					{ P::CsOther, "Other CS work",
+						"Our work without a GPU Passes row:\n"
+						"the deferred lighting composite, feature prepasses, setup." },
+					{ P::CsUpscaling, "Upscaling",
+						"DLSS / FSR upscaling, sharpening and the copies around them.\n"
+						"With frame generation on, part of DLSS can run on another\n"
+						"GPU queue and then does not show here." },
+					{ P::CsOverlay, "This overlay", "Drawing this overlay and the Community Shaders menu." },
+				},
+				false },
+			{ nullptr, nullptr,
+				{ { P::Untracked, "Untracked",
+					"GPU time inside the frame that no row above covers.\n"
+					"Small is good: the rows above then explain the whole frame." } } },
+		};
+		return layout;
+	}
+
+	// Below this a row is noise from timer resolution, not a stage that ran.
+	constexpr float kEnginePhaseVisibleMs = 0.005f;
+}
+
+/**
+ * @brief (batch 36) Where the whole GPU frame goes, stage by stage.
+ *
+ * Fed by Util::GpuPhaseTimeline: one GPU timestamp per stage switch, every row exclusive,
+ * so the rows add up to Total by construction. Nested work (our passes inside the opaque
+ * pass, a shadow light inside the shadow pass) is billed to the inner row only, which is
+ * what keeps the sum free of double counting.
+ */
+void PerformanceOverlay::DrawEngineGpuTable()
+{
+	const auto& report = Util::GpuPhaseTimeline::GetSingleton()->Get();
+	if (!report.hasSample)
+		return;
+
+	const float totalMs = report.totalMs;
+	const auto msOf = [&report](Util::GpuPhase p) { return report.ms[static_cast<size_t>(p)]; };
+	const auto drawsOf = [&report](Util::GpuPhase p) { return report.draws[static_cast<size_t>(p)]; };
+
+	ImGui::Spacing();
+	ImGui::TextUnformatted("Engine passes (GPU)");
+	if (ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted(
+				"Where each frame's GPU time goes, stage by stage.\n"
+				"The GPU writes a timestamp every time the frame moves on to another\n"
+				"stage; each row is its time until the next stage started. Rows never\n"
+				"overlap, so they add up to Total.\n\n"
+				"Read it with the frame rate uncapped: if the GPU has to wait for the\n"
+				"CPU, the wait is billed to whichever stage was running.");
+		}
+	}
+
+	if (!ImGui::BeginTable("EngineGpuPhases", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg))
+		return;
+
+	ImGui::TableSetupColumn("Stage");
+	ImGui::TableSetupColumn("GPU Time");
+	ImGui::TableSetupColumn("% of GPU frame");
+	ImGui::TableSetupColumn("Draws");
+	ImGui::TableHeadersRow();
+
+	const auto tooltip = [](const char* a_text) {
+		if (a_text && ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted(a_text);
+		}
+	};
+
+	const auto drawRow = [&](const char* a_label, const char* a_tooltip, float a_ms, float a_draws, bool a_showDraws, bool a_indent) {
+		ImGui::TableNextRow();
+		ImGui::TableNextColumn();
+		if (a_indent)
+			ImGui::Indent();
+		ImGui::TextUnformatted(a_label);
+		tooltip(a_tooltip);
+		if (a_indent)
+			ImGui::Unindent();
+
+		ImGui::TableNextColumn();
+		if (a_ms > 0.0f && a_ms < 0.01f)
+			ImGui::TextUnformatted("< 0.01 ms");
+		else
+			ImGui::Text("%.2f ms", a_ms);
+
+		ImGui::TableNextColumn();
+		ImGui::Text("%.1f%%", totalMs > 0.0f ? a_ms / totalMs * 100.0f : 0.0f);
+
+		ImGui::TableNextColumn();
+		if (a_showDraws)
+			ImGui::Text("%d", static_cast<int>(std::lround(a_draws)));
+		else
+			ImGui::TextDisabled("-");
+	};
+
+	const auto rowVisible = [&](const EnginePhaseRow& a_row) {
+		return a_row.phase == Util::GpuPhase::Untracked || msOf(a_row.phase) >= kEnginePhaseVisibleMs || drawsOf(a_row.phase) >= 0.5f;
+	};
+
+	for (const auto& group : EnginePhaseLayout()) {
+		if (!group.label) {
+			for (const auto& row : group.rows) {
+				if (!rowVisible(row))
+					continue;
+				if (row.phase != Util::GpuPhase::Untracked) {
+					drawRow(row.label, row.tooltip, msOf(row.phase), drawsOf(row.phase), group.countsDraws, false);
+					continue;
+				}
+				// Which shader types the untracked draws were: tells where a missing hook is.
+				std::string untrackedTooltip = row.tooltip;
+				std::string byType;
+				for (size_t t = 0; t < report.untrackedDrawsByType.size(); ++t) {
+					const float n = report.untrackedDrawsByType[t];
+					if (n < 0.5f)
+						continue;
+					const auto name = magic_enum::enum_name(static_cast<RE::BSShader::Type>(t));
+					byType += std::format("\n  {}: {}", name.empty() ? std::string_view("?") : name, std::lround(n));
+				}
+				if (!byType.empty())
+					untrackedTooltip += "\n\nDraws in here, by shader:" + byType;
+				drawRow(row.label, untrackedTooltip.c_str(), msOf(row.phase), drawsOf(row.phase), group.countsDraws, false);
+			}
+			continue;
+		}
+
+		float groupMs = 0.0f, groupDraws = 0.0f;
+		bool anyVisible = false;
+		for (const auto& row : group.rows) {
+			groupMs += msOf(row.phase);
+			groupDraws += drawsOf(row.phase);
+			anyVisible |= rowVisible(row);
+		}
+		if (!anyVisible)
+			continue;
+
+		drawRow(group.label, group.tooltip, groupMs, groupDraws, group.countsDraws, false);
+		for (const auto& row : group.rows) {
+			if (!rowVisible(row))
+				continue;
+			// Our rows: show a count only where engine draws really happen inside our work.
+			const bool showDraws = group.countsDraws || drawsOf(row.phase) >= 0.5f;
+			drawRow(row.label, row.tooltip, msOf(row.phase), drawsOf(row.phase), showDraws, true);
+		}
+	}
+
+	float totalDraws = 0.0f;
+	for (float d : report.draws)
+		totalDraws += d;
+	std::string totalTooltip =
+		"Sum of all rows: the GPU time from the end of the last Present to this\n"
+		"one. Should match \"Measured GPU\" + \"Untracked GPU\" in the table above.\n"
+		"The Present gap (where frame generation runs) is not included.\n\n";
+	totalTooltip += std::format("Timestamps per frame: {:.0f}", report.timestampsPerFrame);
+	if (report.droppedFrames > 0)
+		totalTooltip += std::format("\nFrames skipped (too many stage switches): {}", report.droppedFrames);
+	drawRow("Total", totalTooltip.c_str(), totalMs, totalDraws, true, false);
+
+	ImGui::EndTable();
 }
 
 /**
