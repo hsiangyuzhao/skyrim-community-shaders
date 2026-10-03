@@ -2,7 +2,9 @@
 
 #include "Globals.h"
 #include "Utils/D3D.h"
+#include "Utils/DenoiserTimers.h"
 
+#include <d3d11shader.h>
 #include <d3dcompiler.h>
 
 namespace
@@ -311,7 +313,23 @@ bool NRDReblurIntegration::Dispatch()
 			}
 		}
 
-		context->Dispatch(dispatch.gridWidth, dispatch.gridHeight, 1);
+		{
+			// (batch 36e) One row per NRD dispatch in the overlay's "Denoiser breakdown", named
+			// by NRD itself. Two GPU timestamps around the call while that section is open,
+			// nothing at all otherwise.
+			int timingToken = -1;
+			auto* denoiserTimers = Util::DenoiserTimers::GetSingleton();
+			if (denoiserTimers->IsRecording()) {
+				std::string_view passName = dispatch.name ? std::string_view(dispatch.name) : std::string_view("?");
+				if (const auto sep = passName.rfind("::"); sep != std::string_view::npos)
+					passName.remove_prefix(sep + 2);
+				const auto& groupSize = m_pipelineGroupSize[dispatch.pipelineIndex];
+				timingToken = denoiserTimers->Begin(m_timingGroup, passName, dispatch.gridWidth, dispatch.gridHeight,
+					dispatch.gridWidth * groupSize[0], dispatch.gridHeight * groupSize[1]);
+			}
+			context->Dispatch(dispatch.gridWidth, dispatch.gridHeight, 1);
+			denoiserTimers->End(timingToken);
+		}
 
 		// Clear bindings
 		{
@@ -421,18 +439,29 @@ void NRDReblurIntegration::CreatePipelines()
 	const auto& instanceDesc = *nrd::GetInstanceDesc(*m_instance);
 
 	m_pipelines.resize(instanceDesc.pipelinesNum);
+	m_pipelineGroupSize.assign(instanceDesc.pipelinesNum, eastl::array<uint32_t, 2>{ 0u, 0u });
 	for (uint32_t i = 0; i < instanceDesc.pipelinesNum; i++) {
 		const auto& pipeline = instanceDesc.pipelines[i];
 		const auto& dxbc = pipeline.computeShaderDXBC;
 		if (!dxbc.bytecode || !dxbc.size)
 			continue;
 		DX::ThrowIfFailed(device->CreateComputeShader(dxbc.bytecode, static_cast<SIZE_T>(dxbc.size), nullptr, m_pipelines[i].put()));
+
+		// (batch 36e) Group size for the overlay's coverage column. Read once here; a failed
+		// reflection only leaves the column at "groups x ?" and touches nothing else.
+		winrt::com_ptr<ID3D11ShaderReflection> reflection;
+		if (SUCCEEDED(D3DReflect(dxbc.bytecode, static_cast<SIZE_T>(dxbc.size), IID_PPV_ARGS(reflection.put())))) {
+			UINT x = 0, y = 0, z = 0;
+			reflection->GetThreadGroupSize(&x, &y, &z);
+			m_pipelineGroupSize[i] = { x, y };
+		}
 	}
 }
 
 void NRDReblurIntegration::DestroyPipelines()
 {
 	m_pipelines.clear();
+	m_pipelineGroupSize.clear();
 }
 
 void NRDReblurIntegration::CreateConstantBuffer(uint32_t maxSize)

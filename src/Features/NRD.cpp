@@ -6,6 +6,7 @@
 #include "State.h"
 #include "Upscaling.h"
 #include "Utils/D3D.h"
+#include "Utils/DenoiserTimers.h"
 #include "Utils/GpuTimers.h"
 
 namespace
@@ -269,7 +270,13 @@ void NRD::PrepareGuides()
 	context->CSSetShaderResources(0, (uint)guideSRVs.size(), guideSRVs.data());
 	context->CSSetUnorderedAccessViews(0, (uint)guideUAVs.size(), guideUAVs.data(), nullptr);
 	context->CSSetShader(prepareNRDGuidesCompute.get(), nullptr, 0);
-	context->Dispatch(((uint)dynres.x + 7) / 8, ((uint)dynres.y + 7) / 8, 1);
+	{
+		const uint groupsX = ((uint)dynres.x + 7) / 8;
+		const uint groupsY = ((uint)dynres.y + 7) / 8;
+		// (batch 36e) Overlay "Denoiser breakdown" row; timestamps only while that section is open.
+		Util::DenoiserTimerScope timing("Guides", "ViewZ + normal/roughness", groupsX, groupsY, groupsX * 8u, groupsY * 8u);
+		context->Dispatch(groupsX, groupsY, 1);
+	}
 
 	std::array<ID3D11ShaderResourceView*, 2> nullSRVs = { nullptr };
 	std::array<ID3D11UnorderedAccessView*, 2> nullUAVs = { nullptr };
@@ -279,7 +286,11 @@ void NRD::PrepareGuides()
 
 	// Motion Vector is used as both SRV and UAV by ReBLUR; snapshot the game's
 	// MV target so we can rebind it through NRD's UAV slot without aliasing.
-	context->CopyResource(texNRDMV->resource.get(), motion.texture);
+	{
+		// A copy has no thread groups; the coverage column shows the copied extent instead.
+		Util::DenoiserTimerScope timing("Guides", "Motion vector copy", 0, 0, texNRDMV->desc.Width, texNRDMV->desc.Height);
+		context->CopyResource(texNRDMV->resource.get(), motion.texture);
+	}
 
 	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::NRDGuides);
 	state->EndPerfEvent();

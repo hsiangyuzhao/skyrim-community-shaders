@@ -51,6 +51,11 @@ public:
 
 	bool IsValid() const { return m_instance != nullptr; }
 
+	// (batch 36e) Row group under which this instance's dispatches appear in the overlay's
+	// "Denoiser breakdown" (e.g. "NRD diffuse"). Must point at a string that outlives the
+	// instance (a literal). Timing only; nothing about the dispatches changes.
+	void SetTimingGroup(const char* a_group) { m_timingGroup = a_group; }
+
 private:
 	struct PoolTexture
 	{
@@ -83,6 +88,10 @@ private:
 
 	// Per-pipeline DX11 compute shaders (indexed by PipelineDesc order)
 	eastl::vector<winrt::com_ptr<ID3D11ComputeShader>> m_pipelines;
+	// (batch 36e) [numthreads] X/Y of each pipeline, read from the DXBC by reflection, so the
+	// breakdown can show how many pixels a dispatch covers (grid x group size).
+	eastl::vector<eastl::array<uint32_t, 2>> m_pipelineGroupSize;
+	const char* m_timingGroup = "NRD";
 
 	// Single constant buffer, updated per-dispatch
 	winrt::com_ptr<ID3D11Buffer> m_constantBuffer;

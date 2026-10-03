@@ -690,6 +690,8 @@ void Menu::ProcessInputEventQueue()
 					{ &settings.OverlayToggleKey, &settingOverlayToggleKey, [this](uint32_t key) { settings.OverlayToggleKey = key; settingOverlayToggleKey = false; } },
 					{ &settings.ShaderBlockPrevKey, &settingShaderBlockPrevKey, [this](uint32_t key) { settings.ShaderBlockPrevKey = key; settingShaderBlockPrevKey = false; } },
 					{ &settings.ShaderBlockNextKey, &settingShaderBlockNextKey, [this](uint32_t key) { settings.ShaderBlockNextKey = key; settingShaderBlockNextKey = false; } },
+					// (batch 36e) Performance Overlay freeze key, set from its settings page.
+					{ &globals::features::performanceOverlay.settings.FreezeKey, &globals::features::performanceOverlay.capturingFreezeKey, [](uint32_t key) { globals::features::performanceOverlay.settings.FreezeKey = key; globals::features::performanceOverlay.capturingFreezeKey = false; } },
 				};
 				bool handled = false;
 				for (auto& h : hotkeyActions) {
@@ -720,6 +722,12 @@ void Menu::ProcessInputEventQueue()
 						{ settings.ShaderBlockNextKey, [this, shaderCache]() { if (settings.EnableShaderBlocking) shaderCache->IterateShaderBlock(false); } },
 						{ settings.OverlayToggleKey, []() {
 							 Menu::GetSingleton()->overlayVisible = !Menu::GetSingleton()->overlayVisible;
+						 } },
+						// (batch 36e) Freeze / unfreeze every number on the Performance Overlay.
+						{ globals::features::performanceOverlay.settings.FreezeKey, []() {
+							 auto& overlay = globals::features::performanceOverlay;
+							 if (overlay.loaded && overlay.settings.FreezeKey != 0)
+								 overlay.ToggleFreeze();
 						 } },
 					};
 					for (const auto& ka : keyActions) {

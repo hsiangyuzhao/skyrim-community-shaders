@@ -12,6 +12,7 @@
 #include "ScreenSpaceGI.h"
 #include "Skylighting.h"
 
+#include "Utils/DenoiserTimers.h"
 #include "Utils/GpuTimers.h"
 
 #ifdef ENABLE_SHARC
@@ -2802,6 +2803,7 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
             integration.SetNamedUAV(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, texOutput->uav.get());
         }
 
+        integration.SetTimingGroup(a_specular ? "NRD specular" : "NRD diffuse");
         dispatched = integration.Dispatch();
         // (S1.2) The reset is only consumed if the dispatch that was supposed to consume it
         // actually ran. Clearing it on a skipped dispatch is what let a stale or never-written
@@ -2835,7 +2837,11 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
         context->CSSetShader(nrdUnpackCS.get(), nullptr, 0);
-        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        {
+            Util::DenoiserTimerScope timing("SSRT", a_specular ? "Unpack specular" : "Unpack diffuse",
+                (uint)dispatchCount.x, (uint)dispatchCount.y, (uint)dispatchCount.x * 8u, (uint)dispatchCount.y * 8u);
+            context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        }
         resetViews();
     }
 
@@ -3175,7 +3181,11 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
         context->CSSetShader(samplingMode == kSamplingHalfRes ? sparseResolveHalfResCS.get() : sparseResolveCheckerCS.get(), nullptr, 0);
 
-        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        {
+            Util::DenoiserTimerScope timing("SSRT", "Sparse Resolve",
+                (uint)dispatchCount.x, (uint)dispatchCount.y, (uint)dispatchCount.x * 8u, (uint)dispatchCount.y * 8u);
+            context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        }
         resetViews();
 
         Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTSparseResolve);
@@ -3454,14 +3464,17 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
         context->CSSetShader(confDownsampleCS.get(), nullptr, 0);
-        context->Dispatch(loDispatchX, loDispatchY, 1);
+        {
+            Util::DenoiserTimerScope timing("Confidence", "Downsample", loDispatchX, loDispatchY, loDispatchX * 8u, loDispatchY * 8u);
+            context->Dispatch(loDispatchX, loDispatchY, 1);
+        }
         resetViews();
 
         // Stage 2: the separable pair. Horizontal reads the downsample's output and writes the
         // scratch surface; vertical reads that back and returns to the first, so the finished field
         // ends up in texSSRTConfidenceLo whichever way round the pair is inspected. A separable
         // pass cannot run in place, which is the only reason there are two surfaces.
-        const auto blurPass = [&](ID3D11ComputeShader* a_shader, Texture2D* a_source, Texture2D* a_target) {
+        const auto blurPass = [&](ID3D11ComputeShader* a_shader, Texture2D* a_source, Texture2D* a_target, const char* a_timingName) {
             srvs.at(0) = a_source->srv.get();
             srvs.at(1) = texSSRTConfidenceLoDepth->srv.get();
             srvs.at(3) = texSSRTConfidenceLoNormal->srv.get();
@@ -3469,11 +3482,14 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
             context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
             context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
             context->CSSetShader(a_shader, nullptr, 0);
-            context->Dispatch(loDispatchX, loDispatchY, 1);
+            {
+                Util::DenoiserTimerScope timing("Confidence", a_timingName, loDispatchX, loDispatchY, loDispatchX * 8u, loDispatchY * 8u);
+                context->Dispatch(loDispatchX, loDispatchY, 1);
+            }
             resetViews();
         };
-        blurPass(confBlurHorizontalCS.get(), texSSRTConfidenceLo.get(), texSSRTConfidenceLoBlur.get());
-        blurPass(confBlurVerticalCS.get(), texSSRTConfidenceLoBlur.get(), texSSRTConfidenceLo.get());
+        blurPass(confBlurHorizontalCS.get(), texSSRTConfidenceLo.get(), texSSRTConfidenceLoBlur.get(), "Blur horizontal");
+        blurPass(confBlurVerticalCS.get(), texSSRTConfidenceLoBlur.get(), texSSRTConfidenceLo.get(), "Blur vertical");
 
         // Stage 3: joint bilateral upsample onto texSSRTDiffuseConfidenceSmooth -- the same surface
         // the 7x7 window used to write, with the same semantics and the same written region, so
@@ -3490,7 +3506,11 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
         context->CSSetShader(confUpsampleCS.get(), nullptr, 0);
-        context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        {
+            Util::DenoiserTimerScope timing("Confidence", "Upsample",
+                (uint)dispatchCount.x, (uint)dispatchCount.y, (uint)dispatchCount.x * 8u, (uint)dispatchCount.y * 8u);
+            context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        }
         resetViews();
 
         Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTConfidenceFilter);

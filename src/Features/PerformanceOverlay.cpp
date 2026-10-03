@@ -28,6 +28,7 @@
 #include "State.h"
 #include "Utils/FileSystem.h"
 #include "Utils/Format.h"
+#include "Utils/DenoiserTimers.h"
 #include "Utils/Game.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
@@ -39,12 +40,14 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_stdlib.h>
 #include <magic_enum/magic_enum.hpp>
 #include <map>
 #include <numeric>
+#include <string_view>
 
 // --- Constants ---
 constexpr float kDefaultFPS = 60.0f;
@@ -80,6 +83,28 @@ auto MakeMetricColumn(const auto& theme, auto valueGetter, auto colorGetter, aut
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				const Util::ColoredTextLines& useLegend = cellLegend ? *cellLegend : legend;
 				Util::DrawColoredMultiLineTooltip(useLegend);
+			}
+		}
+	};
+}
+
+// (batch 36e) "Peak" column: the highest reading inside the smoothing window.
+static ColumnConfig MakePeakColumn()
+{
+	return ColumnConfig{
+		"Peak",
+		[](const DrawCallRow& row, int) {
+			if (!row.peak) {
+				ImGui::TextDisabled("-");
+				return;
+			}
+			ImGui::Text("%s", Util::FormatMilliseconds(*row.peak).c_str());
+		},
+		nullptr,
+		[]() {
+			if (ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::TextUnformatted("Highest reading inside the smoothing window: catches spikes the average hides.");
 			}
 		}
 	};
@@ -138,7 +163,25 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	BackgroundOpacity,
 	ShowBorder,
 	Position,
-	PositionSet)
+	PositionSet,
+	SortMode,
+	SmoothingMode,
+	SmoothingWindow,
+	ShowLiveValues,
+	ShowPeakColumn,
+	TopN,
+	FreezeKey,
+	DenoiserLogInterval,
+	SectionFrame,
+	SectionBottleneck,
+	SectionShaderTypes,
+	SectionCsCpu,
+	SectionGpuPasses,
+	SectionEngine,
+	SectionDenoiser,
+	SectionGrass,
+	SectionVram,
+	SectionView)
 
 static const std::unordered_map<RE::BSShader::Type, std::string> kShaderTypeTooltips = {
 	{ RE::BSShader::Type::Grass, "Draw calls using the Grass shader. Typically many, but each is usually cheap.\nWith Grass Optimizations on, each grass type is drawn in one call, so this count is much lower; its section below the GPU tables shows the real grass counts." },
@@ -234,6 +277,15 @@ void PerformanceOverlay::DrawSettings()
 			ImGui::TextUnformatted("How many recent frames the frametime graph shows.");
 		}
 
+		ImGui::Spacing();
+		ImGui::Spacing();
+
+		// (batch 36e) How the tables are smoothed, ordered and trimmed. The same controls are
+		// in the overlay's own "View options" section.
+		ImGui::TextUnformatted("Readability");
+		ImGui::Separator();
+		DrawViewOptions();
+
 		ImGui::Separator();
 		ImGui::Text("Position:");
 		if (ImGui::Button("Reset Position")) {
@@ -266,6 +318,12 @@ void PerformanceOverlay::LoadSettings(json& j)
 		// Fallback to defaults if JSON is invalid
 		this->settings = PerformanceOverlay::Settings{};
 	}
+	// (batch 36e) A hand-edited or future config must not index past the option lists.
+	this->settings.SortMode = std::clamp(this->settings.SortMode, 0, 2);
+	this->settings.SmoothingMode = std::clamp(this->settings.SmoothingMode, 0, 2);
+	this->settings.SmoothingWindow = std::clamp(this->settings.SmoothingWindow, 0.1f, 5.0f);
+	this->settings.TopN = std::clamp(this->settings.TopN, 0, 64);
+	this->settings.DenoiserLogInterval = std::clamp(this->settings.DenoiserLogInterval, 0, 600);
 	// Ensure history buffers match loaded size
 	this->state.frameTimeHistory.Resize(this->settings.FrameHistorySize);
 	this->state.postFGFrameTimeHistory.Resize(this->settings.FrameHistorySize);
@@ -294,6 +352,8 @@ void PerformanceOverlay::RestoreDefaultSettings()
 	this->state.postFGFrameTimeHistory.Clear();
 	this->state.postFGIsMeasured = false;
 	this->state.postFGMultiplier = 0.0f;
+	// (batch 36e) Rows and their order restart from scratch too.
+	this->view = ViewState{};
 }
 
 void PerformanceOverlay::DataLoaded()
@@ -428,25 +488,68 @@ void PerformanceOverlay::DrawOverlay()
 	// Frame sampling deliberately does NOT happen here - it runs on every Present via
 	// AdvanceFrameClock() so hiding the overlay cannot inject a bogus sample.
 
+	// (batch 36e) Readability layer: feed this frame into the display state of every table,
+	// unless frozen. Everything drawn below reads from that state, not from the timers.
+	const PerfView::ViewConfig viewCfg = MakeViewConfig();
+	{
+		LARGE_INTEGER freq, counter;
+		QueryPerformanceFrequency(&freq);
+		QueryPerformanceCounter(&counter);
+		const double now = static_cast<double>(counter.QuadPart) / static_cast<double>(freq.QuadPart);
+		if (!view.frozen)
+			UpdateViews(now, rowSets, viewCfg);
+
+		// Periodic denoiser line for the log (option; off by default). Only while the section
+		// is open, which is also the only time its timers run.
+		if (this->settings.ShowDrawCalls && this->settings.SectionDenoiser && this->settings.DenoiserLogInterval > 0 &&
+			now - view.lastDenoiserLog >= static_cast<double>(this->settings.DenoiserLogInterval)) {
+			view.lastDenoiserLog = now;
+			const std::string line = FormatDenoiserLogLine(viewCfg);
+			if (!line.empty())
+				logger::info("{}", line);
+		}
+	}
+
+	// Always on top, never collapsible: the four numbers that answer "how is it going".
+	DrawCompactSummary(viewCfg);
+
+	if (Section("View options", this->settings.SectionView, "Sorting, smoothing, Top N, Peak column and Freeze."))
+		DrawViewOptions();
+
 	// Show FPS counter if enabled
-	if (this->settings.ShowFPS) {
+	if (this->settings.ShowFPS && Section("Frame rate & graphs", this->settings.SectionFrame)) {
 		DrawFPS();
 	}
 
 	// Show Draw Calls if enabled
 	if (this->settings.ShowDrawCalls) {
-		DrawBottleneckSummary();
-		DrawDrawCallsTable(rowSets.cpuRows, rowSets.summaryRows);
-		DrawOurCpuPassTable(rowSets.ourCpuRows);
-		DrawGpuPassTable(rowSets.gpuRows);
-		DrawEngineGpuTable();
-		if (globals::features::grassOptimizations.loaded)
+		if (Section("CPU / GPU split", this->settings.SectionBottleneck))
+			DrawBottleneckSummary();
+		if (Section("Shader types (CPU)", this->settings.SectionShaderTypes))
+			DrawDrawCallsTable(rowSets.cpuRows, rowSets.summaryRows);
+		if (Section("Community Shaders (CPU submit)", this->settings.SectionCsCpu))
+			DrawOurCpuPassTable(rowSets.ourCpuRows);
+		if (Section("GPU passes", this->settings.SectionGpuPasses))
+			DrawGpuPassTable(rowSets.gpuRows);
+		if (Section("Engine passes (GPU)", this->settings.SectionEngine))
+			DrawEngineGpuTable();
+		if (Section("Denoiser breakdown", this->settings.SectionDenoiser,
+				"Every pass of the SSRT denoiser chain, timed on its own. Only measured while this section is open."))
+			DrawDenoiserTable(viewCfg);
+		if (globals::features::grassOptimizations.loaded && Section("Grass Optimizations", this->settings.SectionGrass))
 			globals::features::grassOptimizations.DrawOverlayStats();
 	}
 
 	// VRAM & GPU Usage
-	if (this->settings.ShowVRAM && menu->GetDXGIAdapter3()) {
+	if (this->settings.ShowVRAM && menu->GetDXGIAdapter3() && Section("VRAM", this->settings.SectionVram)) {
 		DrawVRAM();
+	}
+
+	// Freeze (and the "Log snapshot" button) asks for a snapshot; it is written here, after
+	// every table has its display values for this frame.
+	if (view.pendingSnapshot) {
+		view.pendingSnapshot = false;
+		WriteSnapshotToLog(viewCfg);
 	}
 
 	ImGui::PopStyleVar();             // ItemSpacing
@@ -454,6 +557,17 @@ void PerformanceOverlay::DrawOverlay()
 
 	// --- A/B Test Section ---
 	DrawABTestSection(allRows);
+
+	// (batch 36e) With a border the window is not auto-sized (its width used to jump with
+	// the text), so collapsing a section left an empty box behind and expanding one hid rows
+	// below the edge. Fit the height to the content every frame; the width stays the user's.
+	if (this->settings.ShowBorder) {
+		const float contentHeight = ImGui::GetCursorPosY() - ImGui::GetScrollY() + ImGui::GetStyle().WindowPadding.y;
+		const float maxHeight = ImGui::GetIO().DisplaySize.y - ImGui::GetWindowPos().y;
+		const float wantHeight = std::clamp(contentHeight, 50.0f, std::max(50.0f, maxHeight));
+		if (std::abs(wantHeight - ImGui::GetWindowHeight()) > 1.0f)
+			ImGui::SetWindowSize(ImVec2(ImGui::GetWindowWidth(), wantHeight));
+	}
 
 	ImGui::End();
 	ImGui::PopStyleVar();    // WindowBorderSize
@@ -465,14 +579,17 @@ void PerformanceOverlay::DrawOverlay()
 
 void PerformanceOverlay::DrawFPS()
 {
+	// (batch 36e) While frozen, every number and graph here comes from the copy taken at the
+	// moment of freezing.
+	const State& st = (view.frozen && view.frozenState) ? *view.frozenState : state;
 	if (ImGui::BeginTable("FrametimeTargets", 2, ImGuiTableFlags_SizingStretchProp)) {
 		ImGui::TableSetupColumn("##prop", ImGuiTableColumnFlags_WidthFixed, ImGui::GetTextLineHeight() * 6);
 		ImGui::TableSetupColumn("##value");
 
 		ImGui::TableNextColumn();
-		ImGui::Text(this->state.isFrameGenerationActive ? "Raw FPS:" : "FPS:");
+		ImGui::Text(st.isFrameGenerationActive ? "Raw FPS:" : "FPS:");
 		ImGui::TableNextColumn();
-		ImGui::Text("%.1f (%.2f ms)", this->state.smoothFps, this->state.smoothFrameTimeMs);
+		ImGui::Text("%.1f (%.2f ms)", st.smoothFps, st.smoothFrameTimeMs);
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("Current frame rate, refreshed every Update Interval.");
@@ -483,7 +600,7 @@ void PerformanceOverlay::DrawFPS()
 		// 1% Low, shown alongside the instantaneous value so short stutters stay visible
 		// in the numbers even when the instant readout looks fine.
 		{
-			const FrameStats stats = ComputeFrameStats();
+			const FrameStats stats = view.frozen ? view.frozenStats : ComputeFrameStats();
 
 			ImGui::TableNextColumn();
 			ImGui::Text("Avg (%.0fs):", Settings::kStatsWindowSeconds);
@@ -517,24 +634,24 @@ void PerformanceOverlay::DrawFPS()
 			}
 		}
 
-		if (this->state.isFrameGenerationActive) {
+		if (st.isFrameGenerationActive) {
 			ImGui::TableNextColumn();
 			ImGui::Text("Post-FG FPS:");
 			ImGui::TableNextColumn();
-			if (this->state.postFGIsMeasured) {
-				ImGui::Text("%.1f (%.2f ms)", this->state.postFGSmoothFps, this->state.postFGSmoothFrameTimeMs);
+			if (st.postFGIsMeasured) {
+				ImGui::Text("%.1f (%.2f ms)", st.postFGSmoothFps, st.postFGSmoothFrameTimeMs);
 				if (ImGui::IsItemHovered()) {
 					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("Measured: %.2f frames shown on screen per frame rendered.", this->state.postFGMultiplier);
+						ImGui::Text("Measured: %.2f frames shown on screen per frame rendered.", st.postFGMultiplier);
 					}
 				}
 			} else {
 				ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "%.1f (%.2f ms) est.",
-					this->state.postFGSmoothFps, this->state.postFGSmoothFrameTimeMs);
+					st.postFGSmoothFps, st.postFGSmoothFrameTimeMs);
 				if (ImGui::IsItemHovered()) {
 					if (auto _tt = Util::HoverTooltipWrapper()) {
 						ImGui::Text("Estimate: this frame generation type does not report shown frames, so the %.0fx setting is assumed. Raw FPS, Avg and 1%% Low above are always measured before frame generation.",
-							this->state.postFGMultiplier);
+							st.postFGMultiplier);
 					}
 				}
 			}
@@ -545,17 +662,17 @@ void PerformanceOverlay::DrawFPS()
 			ImGui::TableNextColumn();
 			ImGui::Text("FG Mode:");
 			ImGui::TableNextColumn();
-			if (this->state.postFGIsMeasured)
-				ImGui::Text("%ux (measured %.2fx)", this->state.appliedFGMultiplier, this->state.postFGMultiplier);
+			if (st.postFGIsMeasured)
+				ImGui::Text("%ux (measured %.2fx)", st.appliedFGMultiplier, st.postFGMultiplier);
 			else
-				ImGui::Text("%ux", this->state.appliedFGMultiplier);
-			if (this->state.rejectedFGMultiplier > 0) {
+				ImGui::Text("%ux", st.appliedFGMultiplier);
+			if (st.rejectedFGMultiplier > 0) {
 				ImGui::SameLine();
-				ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "(%ux refused)", this->state.rejectedFGMultiplier);
+				ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "(%ux refused)", st.rejectedFGMultiplier);
 			}
 			if (ImGui::IsItemHovered()) {
 				if (auto _tt = Util::HoverTooltipWrapper()) {
-					if (this->state.frameGenerationIsDLSSG)
+					if (st.frameGenerationIsDLSSG)
 						ImGui::TextUnformatted("Left: the multiplier DLSS-G is actually running, which can differ from the menu setting (\"refused\" = a multiplier it turned down). Right: the measured ratio, a bit lower when DLSS-G skips a generated frame to keep pacing smooth.");
 					else
 						ImGui::TextUnformatted("FSR 3.1 frame generation only supports 2x.");
@@ -572,8 +689,8 @@ void PerformanceOverlay::DrawFPS()
 		char overlay_text[128];
 		snprintf(overlay_text, IM_ARRAYSIZE(overlay_text),
 			"%s%.2f ms (%.1f FPS)",
-			this->state.isFrameGenerationActive ? "Pre-FG: " : "",
-			this->state.smoothFrameTimeMs, this->state.smoothFps);
+			st.isFrameGenerationActive ? "Pre-FG: " : "",
+			st.smoothFrameTimeMs, st.smoothFps);
 
 		// Set graph colors
 		ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.0f, 1.0f, 0.0f, 1.0f));  // Green line
@@ -581,11 +698,11 @@ void PerformanceOverlay::DrawFPS()
 		// Draw the graph
 		float graphWidth = ImGui::GetWindowWidth() * 0.9f;
 		ImGui::PlotLines("##frametime",
-			this->state.frameTimeHistory.GetData().data(),
-			this->settings.FrameHistorySize,
-			static_cast<int>(this->state.frameTimeHistory.GetHeadIdx()),
+			st.frameTimeHistory.GetData().data(),
+			static_cast<int>(st.frameTimeHistory.GetData().size()),
+			static_cast<int>(st.frameTimeHistory.GetHeadIdx()),
 			overlay_text,
-			this->state.smoothedMinFrameTime, this->state.smoothedMaxFrameTime,
+			st.smoothedMinFrameTime, st.smoothedMaxFrameTime,
 			ImVec2(graphWidth, 50.0f * this->settings.TextSize));
 
 		ImGui::PopStyleColor();
@@ -606,17 +723,17 @@ void PerformanceOverlay::DrawFPS()
 	}
 
 	// Show Post-FG frametime graph if enabled
-	if (this->settings.ShowPostFGFrameTimeGraph && this->state.isFrameGenerationActive) {
+	if (this->settings.ShowPostFGFrameTimeGraph && st.isFrameGenerationActive) {
 		// State the provenance of the post-FG curve explicitly. Only DLSS-G reports a
 		// presented-frame count; FSR 3 frame generation does not, so its curve is the
 		// pre-FG curve scaled by a fixed multiplier and must be labelled as an estimate.
-		if (this->state.postFGIsMeasured) {
-			ImGui::Text("Post-FG: measured (%.2fx presented frames)", this->state.postFGMultiplier);
+		if (st.postFGIsMeasured) {
+			ImGui::Text("Post-FG: measured (%.2fx presented frames)", st.postFGMultiplier);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("Based on the number of shown frames that frame generation reports for each rendered frame.");
 			}
 		} else {
-			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Post-FG: estimated (%.0fx Pre-FG)", this->state.postFGMultiplier);
+			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Post-FG: estimated (%.0fx Pre-FG)", st.postFGMultiplier);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("This frame generation type does not report shown frames, so this curve is just the Pre-FG curve divided by the multiplier. Treat it as an estimate.");
 			}
@@ -669,11 +786,13 @@ void PerformanceOverlay::DrawVRAM()
 
 void PerformanceOverlay::DrawPostFGFrameTimeGraph()
 {
+	// (batch 36e) While frozen, the graph shows the copy taken at the moment of freezing.
+	const State& st = (view.frozen && view.frozenState) ? *view.frozenState : state;
 	// Prepare overlay text
 	char overlay_text[128];
 	snprintf(overlay_text, IM_ARRAYSIZE(overlay_text),
 		"Post-FG: %.2f ms (%.1f FPS)",
-		state.postFGSmoothFrameTimeMs, state.postFGSmoothFps);
+		st.postFGSmoothFrameTimeMs, st.postFGSmoothFps);
 
 	// Set graph colors - blue for post-FG
 	ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.0f, 0.5f, 1.0f, 1.0f));  // Blue line
@@ -681,11 +800,11 @@ void PerformanceOverlay::DrawPostFGFrameTimeGraph()
 	// Draw the graph
 	float graphWidth = ImGui::GetWindowWidth() * 0.9f;
 	ImGui::PlotLines("##postfgframetime",
-		state.postFGFrameTimeHistory.GetData().data(),
-		settings.FrameHistorySize,
-		static_cast<int>(state.postFGFrameTimeHistory.GetHeadIdx()),
+		st.postFGFrameTimeHistory.GetData().data(),
+		static_cast<int>(st.postFGFrameTimeHistory.GetData().size()),
+		static_cast<int>(st.postFGFrameTimeHistory.GetHeadIdx()),
 		overlay_text,
-		state.smoothedMinFrameTime, state.smoothedMaxFrameTime,
+		st.smoothedMinFrameTime, st.smoothedMaxFrameTime,
 		ImVec2(graphWidth, 50.0f * settings.TextSize));
 
 	ImGui::PopStyleColor();
@@ -1454,28 +1573,22 @@ void PerformanceOverlay::DrawDrawCallsTable(const std::vector<DrawCallRow>& main
 	auto legends = overlay.BuildDrawCallLegends(theme, anyTestData);
 	auto columns = overlay.BuildDrawCallTableColumns(theme, legends, anyTestData);
 
-	// Build sorters
-	std::vector<std::function<bool(const DrawCallRow&, const DrawCallRow&, bool)>> sorters;
-	for (const auto& col : columns) sorters.push_back(col.sortFunc);
-
-	// Create non-const copies for the table function
-	std::vector<DrawCallRow> mainRowsCopy = mainRows;
-	std::vector<DrawCallRow> summaryRowsCopy = summaryRows;
+	// (batch 36e) The live rows only feed the view layer (UpdateViews); what is drawn is the
+	// stable, smoothed row set in its hysteresis order, with the summary rows pinned below.
+	(void)mainRows;
+	(void)summaryRows;
+	const auto cfg = overlay.MakeViewConfig();
+	float totalMs = 0.0f;
+	overlay.view.shaderFooter.DisplayValue(magic_enum::enum_integer(SpecialShaderType::Total), cfg, totalMs);
+	const auto mainView = MaterializeRows(overlay.view.shaderTypes, overlay.view.shaderTypes.DisplayOrder(cfg), cfg, totalMs, true);
+	PerfView::ViewConfig footerCfg = cfg;
+	footerCfg.sort = PerfView::SortMode::Fixed;
+	footerCfg.topN = 0;
+	const auto footerView = MaterializeRows(overlay.view.shaderFooter, overlay.view.shaderFooter.DisplayOrder(footerCfg), cfg, totalMs, true);
 
 	// Create table row handler
 	auto rowHandler = overlay.CreateTableRowHandler(columns);
-
-	// Render the table. Default sort: Frame Time descending, so the most expensive
-	// buckets are at the top; the Other/Total summary rows stay pinned at the bottom.
-	Util::ShowSortedStringTableCustom<DrawCallRow>(
-		"DrawCallOverlayTable",
-		[&columns]() { std::vector<std::string> h; for (const auto& c : columns) h.push_back(c.header); return h; }(),
-		mainRowsCopy,
-		2,      // Default sort column (Frame Time %)
-		false,  // Default descending (most expensive first)
-		sorters,
-		rowHandler,
-		summaryRowsCopy);
+	DrawStableTable("DrawCallOverlayTable", columns, mainView, footerView, rowHandler);
 
 	// Handle clear test data request
 	if (clearTestDataRequested) {
@@ -1497,21 +1610,24 @@ void PerformanceOverlay::DrawDrawCallsTable(const std::vector<DrawCallRow>& main
  */
 void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRows)
 {
-	if (gpuRows.empty())
-		return;
-
+	(void)gpuRows;  // (batch 36e) fed into view.gpuPasses by UpdateViews; drawn from there
 	auto& overlay = globals::features::performanceOverlay;
+	if (overlay.view.gpuPasses.RowCount() == 0 && overlay.view.gpuFooter.RowCount() == 0) {
+		ImGui::TextDisabled("No GPU pass has run yet.");
+		return;
+	}
+
 	auto* menu = Menu::GetSingleton();
 	const auto& theme = menu->GetTheme();
 
-	ImGui::Spacing();
-	ImGui::TextUnformatted("GPU Passes (timestamp queries)");
+	ImGui::TextDisabled("(hover for how to read this)");
 	if (ImGui::IsItemHovered()) {
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::TextUnformatted(
 				"GPU time of Community Shaders' own effects. It is separate from the CPU table above, "
-				"takes about a second to settle, and passes overlap, so these rows do not add up to frame time.\n\n"
-				"A row only appears while its effect is running. \"< 0.01 ms\" means it ran but was too small to measure.\n\n"
+				"and passes overlap, so these rows do not add up to frame time.\n\n"
+				"A row stays in place once it has appeared; \"-\" means its effect did not run recently. "
+				"\"< 0.01 ms\" means it ran but was too small to measure.\n\n"
 				"The four rows at the bottom do add up to the whole GPU frame:\n"
 				"  Measured GPU + Untracked GPU + Gap = GPU frame (elapsed)");
 		}
@@ -1523,86 +1639,21 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 		"Intervals: how many separately timed pieces of work this row adds up each frame "
 		"(Volumetric Lighting has four, for example).");
 
-	std::vector<std::function<bool(const DrawCallRow&, const DrawCallRow&, bool)>> sorters;
-	for (const auto& col : columns)
-		sorters.push_back(col.sortFunc);
+	const auto cfg = overlay.MakeViewConfig();
+	// Percentages stay a share of the CPU frame (the Total row of the shader table), as before.
+	float totalMs = 0.0f;
+	overlay.view.shaderFooter.DisplayValue(magic_enum::enum_integer(SpecialShaderType::Total), cfg, totalMs);
 
-	std::vector<DrawCallRow> gpuRowsCopy = gpuRows;
-
-	// Sum of the buckets. Not a residual and not a share of frame time; just "how much
-	// GPU time the instrumented passes accounted for".
-	float bucketSum = 0.0f;
-	int intervalSum = 0;
-	for (const auto& row : gpuRows) {
-		bucketSum += row.frameTime;
-		if (row.drawCalls != kDrawCallsNotApplicable)
-			intervalSum += row.drawCalls;
-	}
-	const float smoothedFrameTime = globals::state->GetAttributionFrameTimeMs();
-
-	std::vector<DrawCallRow> gpuSummaryRows;
-	gpuSummaryRows.push_back(DrawCallRow{
-		"Measured GPU:", kGpuTotalRowId, intervalSum, bucketSum,
-		Util::CalculatePercentage(bucketSum, smoothedFrameTime), 0.0f,
-		std::string("Sum of the rows above: only Community Shaders' own effects, so the GPU was busy at least this long. "
-					"The game's own rendering is in \"Untracked GPU\" below, and frame generation in \"Gap\"."),
-		true, std::nullopt, std::nullopt });
-
-	// Whole-frame GPU timeline (batch 14). The bucket rows above only ever cover our own
-	// passes, which left the engine's own rendering, DLSS super resolution and DLSS-G frame
-	// generation with no row anywhere - the reason "GPU (ours)" could only ever be a
-	// ">=". Util::GpuFrameTimer supplies the frame-spanning pair that closes the gap, and
-	// the three rows below are additive: untracked + gap + measured == frame (elapsed).
-	const auto frameGpu = Util::GpuFrameTimer::GetSingleton()->Get();
-	if (frameGpu.hasSample) {
-		// Clamped at zero on purpose. The bucket sum and the frame span are collected from
-		// different frames and smoothed independently, so on a settings change the
-		// difference can dip slightly negative for a few frames; a negative millisecond
-		// count would read as a broken measurement rather than as transient skew.
-		const float untrackedMs = std::max(0.0f, frameGpu.workSpanMs - bucketSum);
-
-		gpuSummaryRows.push_back(DrawCallRow{
-			"Untracked GPU (engine + DLSS):", kGpuUntrackedRowId, kDrawCallsNotApplicable, untrackedMs,
-			Util::CalculatePercentage(untrackedMs, smoothedFrameTime), 0.0f,
-			std::string("GPU time this frame that is not one of our effects: the game's own rendering "
-						"(shadows, scenery, water, its post-processing) and DLSS/FSR upscaling. "
-						"Frame generation is not here; it is in \"Gap\".\n\n"
-						"Large here and small in \"Measured GPU\" means Community Shaders is not what is "
-						"costing you the frame. The \"Engine passes (GPU)\" table below breaks this down by stage."),
-			true, std::nullopt, std::nullopt });
-
-		gpuSummaryRows.push_back(DrawCallRow{
-			"Gap: idle / flip / frame-gen:", kGpuGapRowId, kDrawCallsNotApplicable, frameGpu.presentSpanMs,
-			Util::CalculatePercentage(frameGpu.presentSpanMs, smoothedFrameTime), 0.0f,
-			std::string("GPU time while the finished frame is being shown: the display flip, V-Sync or "
-						"frame-cap waiting, DLSS-G frame generation, and real idle time. Because it is a mix, "
-						"the GPU was idle at most this long.\n\n"
-						"With frame generation on, a large value is normal and does not mean spare GPU power; "
-						"it grows with the multiplier."),
-			true, std::nullopt, std::nullopt });
-
-		gpuSummaryRows.push_back(DrawCallRow{
-			"GPU frame (elapsed):", kGpuFrameElapsedRowId, kDrawCallsNotApplicable, frameGpu.frameElapsedMs,
-			Util::CalculatePercentage(frameGpu.frameElapsedMs, smoothedFrameTime), 0.0f,
-			std::string("Time from one frame to the next on the GPU's clock. It includes idle time, so it "
-						"is not how busy the GPU was.\n\n"
-						"It should match \"Total\" in the shader-type table further up; if it does not, do not trust the GPU numbers."),
-			true, std::nullopt, std::nullopt });
-	}
+	const auto mainView = MaterializeRows(overlay.view.gpuPasses, overlay.view.gpuPasses.DisplayOrder(cfg), cfg, totalMs, false);
+	PerfView::ViewConfig footerCfg = cfg;
+	footerCfg.sort = PerfView::SortMode::Fixed;
+	footerCfg.topN = 0;
+	const auto footerView = MaterializeRows(overlay.view.gpuFooter, overlay.view.gpuFooter.DisplayOrder(footerCfg), cfg, totalMs, false);
 
 	// Plain handler: pass rows have no toggle and no summary-row special cases.
 	std::function<void(int, int, const DrawCallRow&)> rowHandler =
 		[&columns](int, int colIdx, const DrawCallRow& row) { columns[colIdx].cellRender(row, colIdx); };
-
-	Util::ShowSortedStringTableCustom<DrawCallRow>(
-		"GpuPassOverlayTable",
-		[&columns]() { std::vector<std::string> h; for (const auto& c : columns) h.push_back(c.header); return h; }(),
-		gpuRowsCopy,
-		2,      // Default sort column (GPU Time %)
-		false,  // Default descending (most expensive first)
-		sorters,
-		rowHandler,
-		gpuSummaryRows);
+	DrawStableTable("GpuPassOverlayTable", columns, mainView, footerView, rowHandler);
 }
 
 namespace
@@ -1695,6 +1746,38 @@ namespace
 
 	// Below this a row is noise from timer resolution, not a stage that ran.
 	constexpr float kEnginePhaseVisibleMs = 0.005f;
+
+	// (batch 36e) Row ids of the engine table's group header rows and its Total row in the
+	// view layer. Far above every Util::GpuPhase value.
+	constexpr int kEngineGroupRowIdBase = 10000;
+	constexpr int kEngineTotalRowId = 20000;
+
+	// (batch 36e) Rows of the view layer's summary table (the compact summary + CPU/GPU split).
+	enum SummaryRowId : int
+	{
+		kSummaryCpuFrame = 0,  // attribution clock frame time (same as the shader table's Total)
+		kSummaryPresentWait,
+		kSummaryGpuOurs,
+		kSummaryGpuUntracked,
+		kSummaryGpuGap,
+		kSummaryFrame,  // the overlay's own Present-to-Present frame time
+		kSummaryPostFgFrame
+	};
+
+	/// CPU-bound / GPU-bound verdict from the share of the frame the CPU spends in Present.
+	/// Thresholds are deliberately coarse and the middle band is named rather than forced
+	/// into one of the two answers.
+	std::pair<const char*, ImVec4> BottleneckVerdict(const Menu::ThemeSettings& a_theme, float a_frameMs, float a_waitMs)
+	{
+		if (a_frameMs <= 0.0f)
+			return { "collecting...", a_theme.StatusPalette.Disable };
+		const float waitShare = a_waitMs / a_frameMs;
+		if (waitShare >= 0.25f)
+			return { "GPU-bound (or frame-limited)", a_theme.StatusPalette.Warning };
+		if (waitShare <= 0.10f)
+			return { "CPU-bound", a_theme.StatusPalette.Error };
+		return { "balanced", a_theme.StatusPalette.SuccessColor };
+	}
 }
 
 /**
@@ -1707,16 +1790,20 @@ namespace
  */
 void PerformanceOverlay::DrawEngineGpuTable()
 {
-	const auto& report = Util::GpuPhaseTimeline::GetSingleton()->Get();
-	if (!report.hasSample)
+	// (batch 36e) Fed by UpdateViews from Util::GpuPhaseTimeline; drawn from view.engine so
+	// the numbers are smoothed and a row, once it has appeared, keeps its place. The layout is
+	// a fixed hierarchy, so the sort options do not apply here.
+	const auto& table = view.engine;
+	if (table.RowCount() == 0) {
+		ImGui::TextDisabled("collecting...");
 		return;
+	}
+	const auto cfg = MakeViewConfig();
 
-	const float totalMs = report.totalMs;
-	const auto msOf = [&report](Util::GpuPhase p) { return report.ms[static_cast<size_t>(p)]; };
-	const auto drawsOf = [&report](Util::GpuPhase p) { return report.draws[static_cast<size_t>(p)]; };
+	float totalMs = 0.0f;
+	table.DisplayValue(kEngineTotalRowId, cfg, totalMs);
 
-	ImGui::Spacing();
-	ImGui::TextUnformatted("Engine passes (GPU)");
+	ImGui::TextDisabled("(hover for how to read this)");
 	if (ImGui::IsItemHovered()) {
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::TextUnformatted(
@@ -1726,108 +1813,85 @@ void PerformanceOverlay::DrawEngineGpuTable()
 		}
 	}
 
-	if (!ImGui::BeginTable("EngineGpuPhases", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg))
+	const bool peakColumn = settings.ShowPeakColumn;
+	if (!ImGui::BeginTable("EngineGpuPhases", peakColumn ? 5 : 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg))
 		return;
 
 	ImGui::TableSetupColumn("Stage");
 	ImGui::TableSetupColumn("GPU Time");
 	ImGui::TableSetupColumn("% of GPU frame");
 	ImGui::TableSetupColumn("Draws");
+	if (peakColumn)
+		ImGui::TableSetupColumn("Peak");
 	ImGui::TableHeadersRow();
 
-	const auto tooltip = [](const char* a_text) {
-		if (a_text && ImGui::IsItemHovered()) {
+	const auto tooltip = [](const std::string& a_text) {
+		if (!a_text.empty() && ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(a_text);
+				ImGui::TextUnformatted(a_text.c_str());
 		}
 	};
 
-	const auto drawRow = [&](const char* a_label, const char* a_tooltip, float a_ms, float a_draws, bool a_showDraws, bool a_indent) {
+	const auto drawRow = [&](int a_id, bool a_showDraws, bool a_indent) {
+		const DrawCallRow* row = table.GetRow(a_id);
+		if (!row)
+			return;
+		float ms = 0.0f;
+		const bool has = table.DisplayValue(a_id, cfg, ms);
+
 		ImGui::TableNextRow();
 		ImGui::TableNextColumn();
 		if (a_indent)
 			ImGui::Indent();
-		ImGui::TextUnformatted(a_label);
-		tooltip(a_tooltip);
+		ImGui::TextUnformatted(row->label.c_str());
+		tooltip(row->tooltip);
 		if (a_indent)
 			ImGui::Unindent();
 
 		ImGui::TableNextColumn();
-		if (a_ms > 0.0f && a_ms < 0.01f)
+		if (!has)
+			ImGui::TextDisabled("-");
+		else if (ms > 0.0f && ms < 0.01f)
 			ImGui::TextUnformatted("< 0.01 ms");
 		else
-			ImGui::Text("%.2f ms", a_ms);
+			ImGui::Text("%.2f ms", ms);
 
 		ImGui::TableNextColumn();
-		ImGui::Text("%.1f%%", totalMs > 0.0f ? a_ms / totalMs * 100.0f : 0.0f);
-
-		ImGui::TableNextColumn();
-		if (a_showDraws)
-			ImGui::Text("%d", static_cast<int>(std::lround(a_draws)));
+		if (has)
+			ImGui::Text("%.1f%%", totalMs > 0.0f ? ms / totalMs * 100.0f : 0.0f);
 		else
 			ImGui::TextDisabled("-");
+
+		ImGui::TableNextColumn();
+		if (a_showDraws && row->drawCalls >= 0)
+			ImGui::Text("%d", row->drawCalls);
+		else
+			ImGui::TextDisabled("-");
+
+		if (peakColumn) {
+			ImGui::TableNextColumn();
+			const auto values = table.GetValues(a_id);
+			if (values.hasData)
+				ImGui::Text("%.2f ms", values.peak);
+			else
+				ImGui::TextDisabled("-");
+		}
 	};
 
-	const auto rowVisible = [&](const EnginePhaseRow& a_row) {
-		return a_row.phase == Util::GpuPhase::Untracked || msOf(a_row.phase) >= kEnginePhaseVisibleMs || drawsOf(a_row.phase) >= 0.5f;
-	};
-
-	for (const auto& group : EnginePhaseLayout()) {
-		if (!group.label) {
-			for (const auto& row : group.rows) {
-				if (!rowVisible(row))
-					continue;
-				if (row.phase != Util::GpuPhase::Untracked) {
-					drawRow(row.label, row.tooltip, msOf(row.phase), drawsOf(row.phase), group.countsDraws, false);
-					continue;
-				}
-				// Which shader types the untracked draws were: tells where a missing hook is.
-				std::string untrackedTooltip = row.tooltip;
-				std::string byType;
-				for (size_t t = 0; t < report.untrackedDrawsByType.size(); ++t) {
-					const float n = report.untrackedDrawsByType[t];
-					if (n < 0.5f)
-						continue;
-					const auto name = magic_enum::enum_name(static_cast<RE::BSShader::Type>(t));
-					byType += std::format("\n  {}: {}", name.empty() ? std::string_view("?") : name, std::lround(n));
-				}
-				if (!byType.empty())
-					untrackedTooltip += "\n\nDraws in here, by shader:" + byType;
-				drawRow(row.label, untrackedTooltip.c_str(), msOf(row.phase), drawsOf(row.phase), group.countsDraws, false);
-			}
-			continue;
-		}
-
-		float groupMs = 0.0f, groupDraws = 0.0f;
-		bool anyVisible = false;
+	const auto& layout = EnginePhaseLayout();
+	for (size_t g = 0; g < layout.size(); ++g) {
+		const auto& group = layout[g];
+		if (group.label)
+			drawRow(kEngineGroupRowIdBase + static_cast<int>(g), group.countsDraws, false);
 		for (const auto& row : group.rows) {
-			groupMs += msOf(row.phase);
-			groupDraws += drawsOf(row.phase);
-			anyVisible |= rowVisible(row);
-		}
-		if (!anyVisible)
-			continue;
-
-		drawRow(group.label, group.tooltip, groupMs, groupDraws, group.countsDraws, false);
-		for (const auto& row : group.rows) {
-			if (!rowVisible(row))
-				continue;
+			const int id = static_cast<int>(row.phase);
+			const DrawCallRow* stored = table.GetRow(id);
 			// Our rows: show a count only where engine draws really happen inside our work.
-			const bool showDraws = group.countsDraws || drawsOf(row.phase) >= 0.5f;
-			drawRow(row.label, row.tooltip, msOf(row.phase), drawsOf(row.phase), showDraws, true);
+			const bool showDraws = group.countsDraws || (stored && stored->drawCalls > 0);
+			drawRow(id, showDraws, group.label != nullptr);
 		}
 	}
-
-	float totalDraws = 0.0f;
-	for (float d : report.draws)
-		totalDraws += d;
-	std::string totalTooltip =
-		"Sum of all rows: the GPU time for one frame, not counting the \"Gap\" where frame generation runs. "
-		"Should match \"Measured GPU\" + \"Untracked GPU\" in the table above.\n\n";
-	totalTooltip += std::format("Timestamps per frame: {:.0f}", report.timestampsPerFrame);
-	if (report.droppedFrames > 0)
-		totalTooltip += std::format("\nFrames skipped (too many stage switches): {}", report.droppedFrames);
-	drawRow("Total", totalTooltip.c_str(), totalMs, totalDraws, true, false);
+	drawRow(kEngineTotalRowId, true, false);
 
 	ImGui::EndTable();
 }
@@ -1842,21 +1906,23 @@ void PerformanceOverlay::DrawEngineGpuTable()
  */
 void PerformanceOverlay::DrawOurCpuPassTable(const std::vector<DrawCallRow>& ourCpuRows)
 {
-	if (ourCpuRows.empty())
-		return;
-
+	(void)ourCpuRows;  // (batch 36e) fed into view.csCpu by UpdateViews; drawn from there
 	auto& overlay = globals::features::performanceOverlay;
+	if (overlay.view.csCpu.RowCount() == 0) {
+		ImGui::TextDisabled("No feature has a measurable CPU cost yet.");
+		return;
+	}
+
 	auto* menu = Menu::GetSingleton();
 	const auto& theme = menu->GetTheme();
 
-	ImGui::Spacing();
-	ImGui::TextUnformatted("Community Shaders (CPU submit)");
+	ImGui::TextDisabled("(hover for how to read this)");
 	if (ImGui::IsItemHovered()) {
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::TextUnformatted(
 				"CPU time Community Shaders spends preparing each effect's work and sending it to the GPU. "
-				"These rows add up to the \"CS features (CPU)\" line above, and use the same names as the GPU table.\n\n"
-				"A feature with no measurable cost gets no row. Work started directly by the game "
+				"These rows add up to the \"CS features (CPU)\" line in the shader table, and use the same names as the GPU table.\n\n"
+				"\"-\" means the feature had no measurable cost recently. Work started directly by the game "
 				"(most post-processing, the upscaling itself) is not included here.");
 		}
 	}
@@ -1866,23 +1932,14 @@ void PerformanceOverlay::DrawOurCpuPassTable(const std::vector<DrawCallRow>& our
 	auto columns = overlay.BuildPassTableColumns(theme, legends, false, "CPU Time (%)",
 		"Calls: how many times this feature's CPU work ran in the last frame.");
 
-	std::vector<std::function<bool(const DrawCallRow&, const DrawCallRow&, bool)>> sorters;
-	for (const auto& col : columns)
-		sorters.push_back(col.sortFunc);
-
-	std::vector<DrawCallRow> rowsCopy = ourCpuRows;
+	const auto cfg = overlay.MakeViewConfig();
+	float totalMs = 0.0f;
+	overlay.view.shaderFooter.DisplayValue(magic_enum::enum_integer(SpecialShaderType::Total), cfg, totalMs);
+	const auto rows = MaterializeRows(overlay.view.csCpu, overlay.view.csCpu.DisplayOrder(cfg), cfg, totalMs, false);
 
 	std::function<void(int, int, const DrawCallRow&)> rowHandler =
 		[&columns](int, int colIdx, const DrawCallRow& row) { columns[colIdx].cellRender(row, colIdx); };
-
-	Util::ShowSortedStringTableCustom<DrawCallRow>(
-		"OurCpuPassOverlayTable",
-		[&columns]() { std::vector<std::string> h; for (const auto& c : columns) h.push_back(c.header); return h; }(),
-		rowsCopy,
-		2,      // Default sort column (CPU Time %)
-		false,  // Default descending (most expensive first)
-		sorters,
-		rowHandler);
+	DrawStableTable("OurCpuPassOverlayTable", columns, rows, {}, rowHandler);
 }
 
 /**
@@ -1913,33 +1970,17 @@ void PerformanceOverlay::DrawBottleneckSummary()
 	auto* menu = Menu::GetSingleton();
 	const auto& theme = menu->GetTheme();
 
-	auto* cpuTimers = Util::CpuPassTimers::GetSingleton();
-	const float frameMs = globals::state->GetAttributionFrameTimeMs();
-	const float waitMs = cpuTimers->GetPresentWaitMs();
+	// (batch 36e) Every number here comes from view.summary (smoothed, frozen with the rest).
+	const auto cfg = MakeViewConfig();
+	const auto value = [this, &cfg](int a_id, float& o_value) { return view.summary.DisplayValue(a_id, cfg, o_value); };
+
+	float frameMs = 0.0f, waitMs = 0.0f, gpuMeasuredMs = 0.0f;
+	value(kSummaryCpuFrame, frameMs);
+	value(kSummaryPresentWait, waitMs);
+	value(kSummaryGpuOurs, gpuMeasuredMs);
 	const float busyMs = std::max(0.0f, frameMs - waitMs);
-
-	float gpuMeasuredMs = 0.0f;
-	Util::GpuPassTimers::GetSingleton()->ForEachActiveBucket(
-		[&gpuMeasuredMs](const Util::GpuPassTimers::BucketReport& report) { gpuMeasuredMs += report.smoothedMs; });
-
 	const float waitShare = (frameMs > 0.0f) ? (waitMs / frameMs) : 0.0f;
-
-	// Thresholds are deliberately coarse and the middle band is named rather than forced
-	// into one of the two answers.
-	const char* verdict = "collecting...";
-	ImVec4 verdictColor = theme.StatusPalette.Disable;
-	if (frameMs > 0.0f) {
-		if (waitShare >= 0.25f) {
-			verdict = "GPU-bound (or frame-limited)";
-			verdictColor = theme.StatusPalette.Warning;
-		} else if (waitShare <= 0.10f) {
-			verdict = "CPU-bound";
-			verdictColor = theme.StatusPalette.Error;
-		} else {
-			verdict = "balanced";
-			verdictColor = theme.StatusPalette.SuccessColor;
-		}
-	}
+	const auto verdict = BottleneckVerdict(theme, frameMs, waitMs);
 
 	if (ImGui::BeginTable("BottleneckSummary", 2, ImGuiTableFlags_SizingStretchProp)) {
 		ImGui::TableSetupColumn("##prop", ImGuiTableColumnFlags_WidthFixed, ImGui::GetTextLineHeight() * 6);
@@ -1948,7 +1989,7 @@ void PerformanceOverlay::DrawBottleneckSummary()
 		ImGui::TableNextColumn();
 		ImGui::TextUnformatted("Bottleneck:");
 		ImGui::TableNextColumn();
-		ImGui::TextColored(verdictColor, "%s", verdict);
+		ImGui::TextColored(verdict.second, "%s", verdict.first);
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted(
@@ -1956,7 +1997,7 @@ void PerformanceOverlay::DrawBottleneckSummary()
 					"over 25% = GPU-bound, under 10% = CPU-bound, in between = balanced.\n\n"
 					"V-Sync, a frame-rate cap and frame generation also make the CPU wait, so "
 					"\"GPU-bound (or frame-limited)\" really means either. For a clean reading, uncap the "
-					"frame rate and turn frame generation off. Averaged over about 20 frames.");
+					"frame rate and turn frame generation off.");
 			}
 		}
 
@@ -1980,7 +2021,7 @@ void PerformanceOverlay::DrawBottleneckSummary()
 				ImGui::TextUnformatted(
 					"Time the CPU spent waiting for the frame to be shown. Waiting on the GPU, V-Sync, a frame-rate cap "
 					"or frame generation pacing all look the same here, so a large value does not by itself mean the GPU is busy.\n\n"
-					"For the GPU side, see \"Untracked GPU\" and \"Gap\" in the GPU Passes table.");
+					"For the GPU side, see \"Untracked GPU\" and \"Gap\" in the GPU passes table.");
 			}
 		}
 
@@ -1991,20 +2032,18 @@ void PerformanceOverlay::DrawBottleneckSummary()
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted(
-					"GPU time of Community Shaders' own effects (the GPU Passes rows added up). "
+					"GPU time of Community Shaders' own effects (the GPU passes rows added up). "
 					"Not directly comparable with the CPU numbers above.");
 			}
 		}
 
-		// The batch 14 addition: the engine's own rendering plus DLSS super resolution,
-		// which is what the 65% of unattributed frame time mostly was.
-		const auto frameGpu = Util::GpuFrameTimer::GetSingleton()->Get();
+		// The engine's own rendering plus DLSS super resolution, and the Present-side gap.
 		ImGui::TableNextColumn();
 		ImGui::TextUnformatted("GPU (other):");
 		ImGui::TableNextColumn();
-		if (frameGpu.hasSample) {
-			const float untrackedMs = std::max(0.0f, frameGpu.workSpanMs - gpuMeasuredMs);
-			ImGui::Text("%.2f ms rendering + %.2f ms gap", untrackedMs, frameGpu.presentSpanMs);
+		float untrackedMs = 0.0f, gapMs = 0.0f;
+		if (value(kSummaryGpuUntracked, untrackedMs) && value(kSummaryGpuGap, gapMs)) {
+			ImGui::Text("%.2f ms rendering + %.2f ms gap", untrackedMs, gapMs);
 		} else {
 			ImGui::TextUnformatted("collecting...");
 		}
@@ -2013,7 +2052,7 @@ void PerformanceOverlay::DrawBottleneckSummary()
 				ImGui::TextUnformatted(
 					"rendering = the game's own rendering plus DLSS/FSR upscaling.\n"
 					"gap = time while the frame is being shown: flip, V-Sync or frame-cap waiting, frame generation, and idle.\n\n"
-					"\"GPU (ours)\" + rendering + gap = the whole GPU frame (also shown as rows in the GPU Passes table).");
+					"\"GPU (ours)\" + rendering + gap = the whole GPU frame (also shown as rows in the GPU passes table).");
 			}
 		}
 
@@ -2133,7 +2172,7 @@ std::vector<ColumnConfig> PerformanceOverlay::BuildPassTableColumns(const Menu::
 		// A pass row is only in the table because its work ran, so a rendered "0 ms" would
 		// mean "below the timer's resolution", not "free" - and it reads as a broken
 		// measurement. Say what is actually known instead.
-		MakeMetricColumn(theme, [](const DrawCallRow& row) { return row.frameTime; }, [](const auto& theme, float value, const DrawCallRow&) { return Util::GetThresholdColor(value, PerformanceOverlay::Settings::kFrameTimeGoodThreshold, PerformanceOverlay::Settings::kFrameTimeWarningThreshold, theme.StatusPalette.SuccessColor, theme.StatusPalette.Warning, theme.StatusPalette.Error); }, [](float /*value*/, const DrawCallRow& row) {
+		MakeMetricColumn(theme, [](const DrawCallRow& row) -> std::optional<float> { return row.hasData ? std::optional<float>(row.frameTime) : std::nullopt; }, [](const auto& theme, float value, const DrawCallRow&) { return Util::GetThresholdColor(value, PerformanceOverlay::Settings::kFrameTimeGoodThreshold, PerformanceOverlay::Settings::kFrameTimeWarningThreshold, theme.StatusPalette.SuccessColor, theme.StatusPalette.Warning, theme.StatusPalette.Error); }, [](float /*value*/, const DrawCallRow& row) {
 				const std::string time = (row.frameTime < 0.01f) ? std::string("< 0.01 ms") : Util::FormatMilliseconds(row.frameTime);
 				return time + " (" + Util::FormatPercent(row.percent) + ")"; }, legends.frameTime.tooltip),
 		[](const DrawCallRow& a, const DrawCallRow& b, bool asc) { return asc ? (a.frameTime < b.frameTime) : (a.frameTime > b.frameTime); },
@@ -2166,6 +2205,9 @@ std::vector<ColumnConfig> PerformanceOverlay::BuildPassTableColumns(const Menu::
 				 } } });
 	}
 
+	// (batch 36e) Highest reading inside the smoothing window, when enabled.
+	if (settings.ShowPeakColumn)
+		columns.push_back(MakePeakColumn());
 	return columns;
 }
 
@@ -2232,7 +2274,7 @@ std::vector<ColumnConfig> PerformanceOverlay::BuildDrawCallTableColumns(const Me
 
 	columns.push_back(ColumnConfig{
 		legends.frameTime.header,
-		MakeMetricColumn(theme, [](const DrawCallRow& row) { return row.frameTime; }, [](const auto& theme, float value, const DrawCallRow&) { return Util::GetThresholdColor(value, PerformanceOverlay::Settings::kFrameTimeGoodThreshold, PerformanceOverlay::Settings::kFrameTimeWarningThreshold, theme.StatusPalette.SuccessColor, theme.StatusPalette.Warning, theme.StatusPalette.Error); }, [](float /*value*/, const DrawCallRow& row) { return Util::FormatMilliseconds(row.frameTime) + " (" + Util::FormatPercent(row.percent) + ")"; }, legends.frameTime.tooltip), [](const DrawCallRow& a, const DrawCallRow& b, bool asc) { return asc ? (a.percent < b.percent) : (a.percent > b.percent); }, [legends]() {
+		MakeMetricColumn(theme, [](const DrawCallRow& row) -> std::optional<float> { return row.hasData ? std::optional<float>(row.frameTime) : std::nullopt; }, [](const auto& theme, float value, const DrawCallRow&) { return Util::GetThresholdColor(value, PerformanceOverlay::Settings::kFrameTimeGoodThreshold, PerformanceOverlay::Settings::kFrameTimeWarningThreshold, theme.StatusPalette.SuccessColor, theme.StatusPalette.Warning, theme.StatusPalette.Error); }, [](float /*value*/, const DrawCallRow& row) { return Util::FormatMilliseconds(row.frameTime) + " (" + Util::FormatPercent(row.percent) + ")"; }, legends.frameTime.tooltip), [](const DrawCallRow& a, const DrawCallRow& b, bool asc) { return asc ? (a.percent < b.percent) : (a.percent > b.percent); }, [legends]() {
 			 if (ImGui::IsItemHovered()) {
 				 if (auto _tt = Util::HoverTooltipWrapper()) {
 					 Util::DrawColoredMultiLineTooltip(legends.frameTime.tooltip);
@@ -2241,7 +2283,7 @@ std::vector<ColumnConfig> PerformanceOverlay::BuildDrawCallTableColumns(const Me
 
 	columns.push_back(ColumnConfig{
 		legends.costPerCall.header,
-		MakeMetricColumn(theme, [](const DrawCallRow& row) { return row.costPerCall; }, [](const auto& theme, float value, const DrawCallRow&) { return Util::GetThresholdColor(value, PerformanceOverlay::Settings::kCostPerCallGoodThreshold, PerformanceOverlay::Settings::kCostPerCallWarningThreshold, theme.StatusPalette.SuccessColor, theme.StatusPalette.Warning, theme.StatusPalette.Error); }, [](float value, const DrawCallRow&) { return (value < PerformanceOverlay::Settings::kMicrosecondThreshold && value > 0.0f) ? Util::FormatMicroseconds(value * 1000.0f) : Util::FormatMilliseconds(value); }, legends.costPerCall.tooltip), [](const DrawCallRow& a, const DrawCallRow& b, bool asc) { return asc ? (a.costPerCall < b.costPerCall) : (a.costPerCall > b.costPerCall); }, [legends]() {
+		MakeMetricColumn(theme, [](const DrawCallRow& row) -> std::optional<float> { return row.hasData ? std::optional<float>(row.costPerCall) : std::nullopt; }, [](const auto& theme, float value, const DrawCallRow&) { return Util::GetThresholdColor(value, PerformanceOverlay::Settings::kCostPerCallGoodThreshold, PerformanceOverlay::Settings::kCostPerCallWarningThreshold, theme.StatusPalette.SuccessColor, theme.StatusPalette.Warning, theme.StatusPalette.Error); }, [](float value, const DrawCallRow&) { return (value < PerformanceOverlay::Settings::kMicrosecondThreshold && value > 0.0f) ? Util::FormatMicroseconds(value * 1000.0f) : Util::FormatMilliseconds(value); }, legends.costPerCall.tooltip), [](const DrawCallRow& a, const DrawCallRow& b, bool asc) { return asc ? (a.costPerCall < b.costPerCall) : (a.costPerCall > b.costPerCall); }, [legends]() {
 			 if (ImGui::IsItemHovered()) {
 				 if (auto _tt = Util::HoverTooltipWrapper()) {
 					 Util::DrawColoredMultiLineTooltip(legends.costPerCall.tooltip);
@@ -2285,6 +2327,9 @@ std::vector<ColumnConfig> PerformanceOverlay::BuildDrawCallTableColumns(const Me
 				 } } });
 	}
 
+	// (batch 36e) Highest reading inside the smoothing window, when enabled.
+	if (settings.ShowPeakColumn)
+		columns.push_back(MakePeakColumn());
 	return columns;
 }
 
@@ -2924,4 +2969,747 @@ void PerformanceOverlay::UpdateGraphValues()
 		state.smoothFrameTimeMs = state.frameTimeMs;
 		state.updateTimer = 0.0f;
 	}
+}
+
+// ============================================================================
+// (batch 36e) READABILITY LAYER
+// ============================================================================
+
+namespace
+{
+	/// Stable row id from a string, for rows that have no natural integer id (denoiser passes).
+	int StableId(std::string_view a_key)
+	{
+		return static_cast<int>(std::hash<std::string_view>{}(a_key) & 0x3FFFFFFF);
+	}
+
+	double NowSeconds()
+	{
+		LARGE_INTEGER freq, counter;
+		QueryPerformanceFrequency(&freq);
+		QueryPerformanceCounter(&counter);
+		return static_cast<double>(counter.QuadPart) / static_cast<double>(freq.QuadPart);
+	}
+
+	const char* DenoiserPassTooltip(const std::string& a_group, const std::string& a_pass)
+	{
+		if (a_group == "Guides") {
+			if (a_pass.starts_with("ViewZ"))
+				return "Our pass that prepares REBLUR's depth and normal/roughness inputs (once per frame, shared by both REBLUR instances).";
+			return "Copy of the game's motion vectors for REBLUR (a plain GPU copy, no shader).";
+		}
+		if (a_group == "SSRT") {
+			if (a_pass == "Sparse Resolve")
+				return "Our pass that fills the pixels the sparse (checkerboard) diffuse trace skipped, before denoising.";
+			return "Our pass that turns REBLUR's output back into the colour SSRT composites. Packing REBLUR's input "
+			       "has no pass of its own: it is done inside the ray march, so its cost is in SSRT Trace.";
+		}
+		if (a_group == "Confidence")
+			return "A stage of the low-resolution confidence filter (how much SSRT light replaces the game's ambient).";
+		return "One of REBLUR's own passes, named by NRD. Groups = thread groups NRD dispatched; Covers = groups x group "
+		       "size, i.e. the pixel area the pass works on. Compare Covers with the render resolution above.";
+	}
+
+	std::string FormatMsForLog(bool a_has, float a_ms)
+	{
+		return a_has ? std::format("{:.3f} ms", a_ms) : std::string("-");
+	}
+
+	constexpr const char* kSortModeNames[] = { "By cost (smoothed)", "Fixed order", "By cost (live, jumps)" };
+	constexpr const char* kSmoothModeNames[] = { "Off", "Window average", "EMA" };
+	constexpr float kWindowChoices[] = { 0.25f, 0.5f, 1.0f, 2.0f };
+	constexpr const char* kWindowNames[] = { "0.25 s", "0.5 s", "1 s", "2 s" };
+	constexpr int kLogChoices[] = { 0, 5, 10, 30, 60 };
+	constexpr const char* kLogNames[] = { "Off", "Every 5 s", "Every 10 s", "Every 30 s", "Every 60 s" };
+}
+
+PerfView::ViewConfig PerformanceOverlay::MakeViewConfig() const
+{
+	PerfView::ViewConfig cfg;
+	cfg.sort = static_cast<PerfView::SortMode>(std::clamp(settings.SortMode, 0, 2));
+	cfg.smooth = static_cast<PerfView::SmoothMode>(std::clamp(settings.SmoothingMode, 0, 2));
+	cfg.windowSeconds = std::clamp(settings.SmoothingWindow, 0.1f, 5.0f);
+	cfg.showLive = settings.ShowLiveValues;
+	cfg.topN = std::max(0, settings.TopN);
+	return cfg;
+}
+
+bool PerformanceOverlay::Section(const char* a_label, bool& a_open, const char* a_tooltip)
+{
+	// The setting is the source of truth: forced every frame, and whatever the click made of
+	// it is written back, so the state is saved with the rest of the settings.
+	ImGui::SetNextItemOpen(a_open, ImGuiCond_Always);
+	a_open = ImGui::CollapsingHeader(a_label);
+	if (a_tooltip && ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(a_tooltip);
+	}
+	return a_open;
+}
+
+void PerformanceOverlay::ToggleFreeze()
+{
+	if (!view.frozen) {
+		view.frozen = true;
+		view.frozenAt = NowSeconds();
+		view.frozenState = state;
+		view.frozenStats = ComputeFrameStats();
+		view.pendingSnapshot = true;  // written on the next overlay frame, once tables are drawn
+	} else {
+		view.frozen = false;
+		view.frozenState.reset();
+	}
+}
+
+void PerformanceOverlay::UpdateViews(double a_now, const DrawCallRowSets& a_rowSets, const PerfView::ViewConfig& a_cfg)
+{
+	using DcIn = PerfView::StableTable<DrawCallRow>::Input;
+
+	// --- CPU shader-type table and its pinned summary rows ---
+	{
+		std::vector<DcIn> in;
+		for (const auto& r : a_rowSets.cpuRows)
+			in.push_back(DcIn{ r.shaderType, r, r.frameTime, r.shaderType });
+		view.shaderTypes.Update(a_now, std::move(in), a_cfg);
+
+		std::vector<DcIn> footer;
+		int order = 0;
+		for (const auto& r : a_rowSets.summaryRows)
+			footer.push_back(DcIn{ r.shaderType, r, r.frameTime, order++ });
+		view.shaderFooter.Update(a_now, std::move(footer), a_cfg);
+	}
+
+	// --- Community Shaders CPU submit ---
+	{
+		std::vector<DcIn> in;
+		for (const auto& r : a_rowSets.ourCpuRows)
+			in.push_back(DcIn{ r.shaderType, r, r.frameTime, 0 });
+		view.csCpu.Update(a_now, std::move(in), a_cfg);
+	}
+
+	// --- GPU passes, and the four whole-frame rows below them ---
+	float bucketSum = 0.0f;
+	const auto frameGpu = Util::GpuFrameTimer::GetSingleton()->Get();
+	{
+		std::vector<DcIn> in;
+		int intervalSum = 0;
+		for (const auto& r : a_rowSets.gpuRows) {
+			in.push_back(DcIn{ r.shaderType, r, r.frameTime, r.shaderType });
+			bucketSum += r.frameTime;
+			if (r.drawCalls != kDrawCallsNotApplicable)
+				intervalSum += r.drawCalls;
+		}
+		view.gpuPasses.Update(a_now, std::move(in), a_cfg);
+
+		std::vector<DcIn> footer;
+		if (!a_rowSets.gpuRows.empty()) {
+			footer.push_back(DcIn{ kGpuTotalRowId,
+				DrawCallRow{ "Measured GPU:", kGpuTotalRowId, intervalSum, bucketSum, 0.0f, 0.0f,
+					std::string("Sum of the rows above: only Community Shaders' own effects, so the GPU was busy at least this long. "
+								"The game's own rendering is in \"Untracked GPU\" below, and frame generation in \"Gap\"."),
+					true, std::nullopt, std::nullopt },
+				bucketSum, 0 });
+		}
+		// Whole-frame GPU timeline (batch 14): untracked + gap + measured == frame (elapsed).
+		if (frameGpu.hasSample) {
+			// Clamped at zero: the bucket sum and the frame span come from different frames,
+			// so right after a settings change the difference can dip below zero for a moment.
+			const float untrackedMs = std::max(0.0f, frameGpu.workSpanMs - bucketSum);
+			footer.push_back(DcIn{ kGpuUntrackedRowId,
+				DrawCallRow{ "Untracked GPU (engine + DLSS):", kGpuUntrackedRowId, kDrawCallsNotApplicable, untrackedMs, 0.0f, 0.0f,
+					std::string("GPU time this frame that is not one of our effects: the game's own rendering "
+								"(shadows, scenery, water, its post-processing) and DLSS/FSR upscaling. "
+								"Frame generation is not here; it is in \"Gap\".\n\n"
+								"Large here and small in \"Measured GPU\" means Community Shaders is not what is "
+								"costing you the frame. The \"Engine passes (GPU)\" section breaks this down by stage."),
+					true, std::nullopt, std::nullopt },
+				untrackedMs, 1 });
+			footer.push_back(DcIn{ kGpuGapRowId,
+				DrawCallRow{ "Gap: idle / flip / frame-gen:", kGpuGapRowId, kDrawCallsNotApplicable, frameGpu.presentSpanMs, 0.0f, 0.0f,
+					std::string("GPU time while the finished frame is being shown: the display flip, V-Sync or "
+								"frame-cap waiting, DLSS-G frame generation, and real idle time. Because it is a mix, "
+								"the GPU was idle at most this long.\n\n"
+								"With frame generation on, a large value is normal and does not mean spare GPU power; "
+								"it grows with the multiplier."),
+					true, std::nullopt, std::nullopt },
+				frameGpu.presentSpanMs, 2 });
+			footer.push_back(DcIn{ kGpuFrameElapsedRowId,
+				DrawCallRow{ "GPU frame (elapsed):", kGpuFrameElapsedRowId, kDrawCallsNotApplicable, frameGpu.frameElapsedMs, 0.0f, 0.0f,
+					std::string("Time from one frame to the next on the GPU's clock. It includes idle time, so it "
+								"is not how busy the GPU was.\n\n"
+								"It should match \"Total\" in the shader-type table; if it does not, do not trust the GPU numbers."),
+					true, std::nullopt, std::nullopt },
+				frameGpu.frameElapsedMs, 3 });
+		}
+		view.gpuFooter.Update(a_now, std::move(footer), a_cfg);
+	}
+
+	// --- Engine passes (GPU) ---
+	{
+		std::vector<DcIn> in;
+		const auto& report = Util::GpuPhaseTimeline::GetSingleton()->Get();
+		if (report.hasSample) {
+			const auto msOf = [&report](Util::GpuPhase p) { return report.ms[static_cast<size_t>(p)]; };
+			const auto drawsOf = [&report](Util::GpuPhase p) { return report.draws[static_cast<size_t>(p)]; };
+			const auto rowVisible = [&](const EnginePhaseRow& a_row) {
+				return a_row.phase == Util::GpuPhase::Untracked || msOf(a_row.phase) >= kEnginePhaseVisibleMs || drawsOf(a_row.phase) >= 0.5f;
+			};
+			const auto makeRow = [](const char* a_label, std::string a_tooltip, int a_id, float a_ms, float a_draws) {
+				return DrawCallRow{ a_label, a_id, static_cast<int>(std::lround(a_draws)), a_ms, 0.0f, 0.0f, std::move(a_tooltip), true, std::nullopt, std::nullopt };
+			};
+
+			const auto& layout = EnginePhaseLayout();
+			for (size_t g = 0; g < layout.size(); ++g) {
+				const auto& group = layout[g];
+				float groupMs = 0.0f, groupDraws = 0.0f;
+				bool anyVisible = false;
+				for (const auto& row : group.rows) {
+					groupMs += msOf(row.phase);
+					groupDraws += drawsOf(row.phase);
+					anyVisible |= rowVisible(row);
+					if (!rowVisible(row))
+						continue;
+					std::string tooltip = row.tooltip ? row.tooltip : "";
+					if (row.phase == Util::GpuPhase::Untracked) {
+						// Which shader types the untracked draws were: tells where a missing hook is.
+						std::string byType;
+						for (size_t t = 0; t < report.untrackedDrawsByType.size(); ++t) {
+							const float n = report.untrackedDrawsByType[t];
+							if (n < 0.5f)
+								continue;
+							const auto name = magic_enum::enum_name(static_cast<RE::BSShader::Type>(t));
+							byType += std::format("\n  {}: {}", name.empty() ? std::string_view("?") : name, std::lround(n));
+						}
+						if (!byType.empty())
+							tooltip += "\n\nDraws in here, by shader:" + byType;
+					}
+					const int id = static_cast<int>(row.phase);
+					in.push_back(DcIn{ id, makeRow(row.label, std::move(tooltip), id, msOf(row.phase), drawsOf(row.phase)), msOf(row.phase), id });
+				}
+				if (group.label && anyVisible) {
+					const int id = kEngineGroupRowIdBase + static_cast<int>(g);
+					in.push_back(DcIn{ id, makeRow(group.label, group.tooltip ? group.tooltip : "", id, groupMs, groupDraws), groupMs, id });
+				}
+			}
+
+			float totalDraws = 0.0f;
+			for (float d : report.draws)
+				totalDraws += d;
+			std::string totalTooltip =
+				"Sum of all rows: the GPU time for one frame, not counting the \"Gap\" where frame generation runs. "
+				"Should match \"Measured GPU\" + \"Untracked GPU\" in the GPU passes table.\n\n";
+			totalTooltip += std::format("Timestamps per frame: {:.0f}", report.timestampsPerFrame);
+			if (report.droppedFrames > 0)
+				totalTooltip += std::format("\nFrames skipped (too many stage switches): {}", report.droppedFrames);
+			in.push_back(DcIn{ kEngineTotalRowId, makeRow("Total", std::move(totalTooltip), kEngineTotalRowId, report.totalMs, totalDraws), report.totalMs, kEngineTotalRowId });
+		}
+		view.engine.Update(a_now, std::move(in), a_cfg);
+	}
+
+	// --- Denoiser breakdown ---
+	{
+		using DnIn = PerfView::StableTable<DenoiserRow>::Input;
+		std::vector<DnIn> in;
+		std::vector<DnIn> footer;
+		auto* timers = Util::DenoiserTimers::GetSingleton();
+		const uint64_t latest = timers->LatestFrame();
+		if (latest > 0) {
+			std::vector<std::pair<std::string, float>> groupSums;
+			float total = 0.0f;
+			for (const auto& r : timers->Rows()) {
+				if (r.lastFrame != latest)
+					continue;
+				DenoiserRow row;
+				row.group = r.group;
+				row.label = r.group + ": " + r.pass;
+				row.tooltip = DenoiserPassTooltip(r.group, r.pass);
+				row.groupsX = r.groupsX;
+				row.groupsY = r.groupsY;
+				row.threadsX = r.threadsX;
+				row.threadsY = r.threadsY;
+				row.calls = r.lastCalls;
+				in.push_back(DnIn{ StableId(row.label), std::move(row), r.lastMs, r.order });
+
+				auto it = std::find_if(groupSums.begin(), groupSums.end(), [&r](const auto& p) { return p.first == r.group; });
+				if (it == groupSums.end())
+					groupSums.emplace_back(r.group, r.lastMs);
+				else
+					it->second += r.lastMs;
+				total += r.lastMs;
+			}
+			int order = 0;
+			for (const auto& [group, ms] : groupSums) {
+				DenoiserRow row;
+				row.group = group;
+				row.label = group + " total";
+				row.tooltip = "Sum of this group's rows above.";
+				row.isFooter = true;
+				footer.push_back(DnIn{ StableId("sum|" + group), std::move(row), ms, order++ });
+			}
+			if (!groupSums.empty()) {
+				DenoiserRow row;
+				row.label = "Denoiser chain total";
+				row.tooltip =
+					"Every row above added up. The two NRD groups together correspond to the \"SSRT REBLUR\" row of the "
+					"GPU passes table minus the unpacks; Guides corresponds to \"NRD Guides\".";
+				row.isFooter = true;
+				footer.push_back(DnIn{ 1, std::move(row), total, 1000 });
+			}
+		}
+		view.denoiser.Update(a_now, std::move(in), a_cfg);
+		view.denoiserFooter.Update(a_now, std::move(footer), a_cfg);
+
+		if (globals::state) {
+			const float2 output = globals::state->screenSize;
+			const float2 render = Util::ConvertToDynamic(output);
+			view.outputWidth = static_cast<uint32_t>(output.x);
+			view.outputHeight = static_cast<uint32_t>(output.y);
+			view.renderWidth = static_cast<uint32_t>(std::floor(render.x));
+			view.renderHeight = static_cast<uint32_t>(std::floor(render.y));
+		}
+	}
+
+	// --- Compact summary ---
+	{
+		using SIn = PerfView::StableTable<int>::Input;
+		std::vector<SIn> in;
+		const float cpuFrameMs = globals::state->GetAttributionFrameTimeMs();
+		if (cpuFrameMs > 0.0f)
+			in.push_back(SIn{ kSummaryCpuFrame, 0, cpuFrameMs, 0 });
+		in.push_back(SIn{ kSummaryPresentWait, 0, Util::CpuPassTimers::GetSingleton()->GetPresentWaitMs(), 0 });
+		in.push_back(SIn{ kSummaryGpuOurs, 0, bucketSum, 0 });
+		if (frameGpu.hasSample) {
+			in.push_back(SIn{ kSummaryGpuUntracked, 0, std::max(0.0f, frameGpu.workSpanMs - bucketSum), 0 });
+			in.push_back(SIn{ kSummaryGpuGap, 0, frameGpu.presentSpanMs, 0 });
+		}
+		if (state.frameTimeMs > 0.0f)
+			in.push_back(SIn{ kSummaryFrame, 0, state.frameTimeMs, 0 });
+		if (state.isFrameGenerationActive && state.postFGFrameTimeMs > 0.0f)
+			in.push_back(SIn{ kSummaryPostFgFrame, 0, state.postFGFrameTimeMs, 0 });
+		view.summary.Update(a_now, std::move(in), a_cfg);
+	}
+}
+
+void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
+{
+	auto* menu = Menu::GetSingleton();
+	const auto& theme = menu->GetTheme();
+	const auto value = [this, &a_cfg](int a_id, float& o_value) { return view.summary.DisplayValue(a_id, a_cfg, o_value); };
+
+	float frameMs = 0.0f;
+	if (value(kSummaryFrame, frameMs) && frameMs > 0.0f)
+		ImGui::Text("%s %.1f (%.2f ms)", state.isFrameGenerationActive ? "Raw FPS" : "FPS", 1000.0f / frameMs, frameMs);
+	else
+		ImGui::TextDisabled("FPS: collecting...");
+	if (ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Frame rate before frame generation, %s.",
+				a_cfg.showLive ? "live" : std::format("averaged over {:.2f} s", a_cfg.windowSeconds).c_str());
+		}
+	}
+	float postFgMs = 0.0f;
+	if (value(kSummaryPostFgFrame, postFgMs) && postFgMs > 0.0f) {
+		ImGui::SameLine(0.0f, 16.0f);
+		ImGui::Text("Post-FG %.1f", 1000.0f / postFgMs);
+	}
+	if (view.frozen) {
+		ImGui::SameLine(0.0f, 16.0f);
+		ImGui::TextColored(theme.StatusPalette.Warning, "FROZEN");
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("All numbers are held. Press %s again (or the Unfreeze button) to resume. A snapshot was written to CommunityShaders.log.",
+					Util::Input::KeyIdToString(settings.FreezeKey));
+		}
+	}
+
+	if (settings.ShowDrawCalls) {
+		float gpuOursMs = 0.0f, cpuFrameMs = 0.0f, waitMs = 0.0f;
+		value(kSummaryGpuOurs, gpuOursMs);
+		value(kSummaryCpuFrame, cpuFrameMs);
+		value(kSummaryPresentWait, waitMs);
+		ImGui::Text("GPU (ours) %.2f ms", gpuOursMs);
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("GPU time of Community Shaders' own effects (the GPU passes rows added up).");
+		}
+		ImGui::SameLine(0.0f, 16.0f);
+		const auto verdict = BottleneckVerdict(theme, cpuFrameMs, waitMs);
+		ImGui::TextUnformatted("Bottleneck:");
+		ImGui::SameLine();
+		ImGui::TextColored(verdict.second, "%s", verdict.first);
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("From how long the CPU waits for each frame to be shown. Details in \"CPU / GPU split\".");
+		}
+	}
+
+	// Only clickable while the CS menu is open (the overlay ignores the mouse otherwise); the
+	// hotkey works any time.
+	if (menu->IsEnabled) {
+		if (ImGui::SmallButton(view.frozen ? "Unfreeze" : "Freeze"))
+			ToggleFreeze();
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Holds every number so it can be read or screenshotted, and writes them all to CommunityShaders.log. Hotkey: %s.",
+					Util::Input::KeyIdToString(settings.FreezeKey));
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Log snapshot"))
+			view.pendingSnapshot = true;
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Writes every table, as shown right now, to CommunityShaders.log without freezing.");
+		}
+	}
+}
+
+void PerformanceOverlay::DrawViewOptions()
+{
+	ImGui::PushID("PerfViewOptions");
+
+	ImGui::Combo("Sort rows", &settings.SortMode, kSortModeNames, IM_ARRAYSIZE(kSortModeNames));
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted(
+			"By cost (smoothed): most expensive first, using the smoothed numbers. Two rows only swap once one has been "
+			"more than 10% more expensive for half a second, so the order does not flicker.\n"
+			"Fixed order: rows never move.\n"
+			"By cost (live, jumps): the old behaviour, re-sorted every frame. For debugging.");
+	}
+
+	ImGui::Combo("Smoothing", &settings.SmoothingMode, kSmoothModeNames, IM_ARRAYSIZE(kSmoothModeNames));
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted(
+			"Window average: the average over the last Window seconds (default).\n"
+			"EMA: a running average that reacts a little faster to changes.\n"
+			"Both are measured in time, not frames, so they behave the same with frame generation on or off.");
+	}
+
+	int windowIdx = 1;
+	for (int i = 0; i < IM_ARRAYSIZE(kWindowChoices); ++i) {
+		if (std::abs(settings.SmoothingWindow - kWindowChoices[i]) < 0.01f)
+			windowIdx = i;
+	}
+	if (ImGui::Combo("Window", &windowIdx, kWindowNames, IM_ARRAYSIZE(kWindowNames)))
+		settings.SmoothingWindow = kWindowChoices[windowIdx];
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted("How much time the smoothing and the Peak column look back over. Longer = steadier numbers, slower to react.");
+
+	int valuesIdx = settings.ShowLiveValues ? 1 : 0;
+	const char* valueNames[] = { "Smoothed", "Live" };
+	if (ImGui::Combo("Numbers shown", &valuesIdx, valueNames, IM_ARRAYSIZE(valueNames)))
+		settings.ShowLiveValues = valuesIdx == 1;
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted("Smoothed is easier to read. Live is the timer's own current reading, as the panel showed before.");
+
+	ImGui::Checkbox("Peak column", &settings.ShowPeakColumn);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted("Adds a column with the highest reading inside the window, to catch spikes the average hides.");
+
+	ImGui::SliderInt("Top N rows", &settings.TopN, 0, 30, settings.TopN == 0 ? "all" : "%d");
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted(
+			"Show only the N most expensive rows of each sortable table (0 = all). The N are picked with the same "
+			"half-second rule as the sorting, so the row count stays constant. Totals are always shown.");
+	}
+
+	int logIdx = 0;
+	for (int i = 0; i < IM_ARRAYSIZE(kLogChoices); ++i) {
+		if (settings.DenoiserLogInterval == kLogChoices[i])
+			logIdx = i;
+	}
+	if (ImGui::Combo("Denoiser log", &logIdx, kLogNames, IM_ARRAYSIZE(kLogNames)))
+		settings.DenoiserLogInterval = kLogChoices[logIdx];
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted(
+			"While the \"Denoiser breakdown\" section is open, also write one line of its smoothed numbers to "
+			"CommunityShaders.log this often. Freeze always writes a full snapshot regardless.");
+	}
+
+	ImGui::TextUnformatted("Freeze key:");
+	ImGui::SameLine();
+	if (capturingFreezeKey) {
+		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.CurrentHotkey, "press a key...");
+	} else {
+		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.CurrentHotkey, "%s", Util::Input::KeyIdToString(settings.FreezeKey));
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Change"))
+			capturingFreezeKey = true;
+	}
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted("Holds every number on the overlay (and writes a snapshot to the log). Works while playing, without the menu open.");
+
+	ImGui::SameLine();
+	if (ImGui::SmallButton(view.frozen ? "Unfreeze" : "Freeze"))
+		ToggleFreeze();
+	ImGui::SameLine();
+	if (ImGui::SmallButton("Forget old rows")) {
+		const bool frozen = view.frozen;
+		auto frozenState = view.frozenState;
+		const auto frozenStats = view.frozenStats;
+		view = ViewState{};
+		view.frozen = frozen;
+		view.frozenState = frozenState;
+		view.frozenStats = frozenStats;
+	}
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted("Rows stay in place once they have appeared. This clears them, e.g. after switching an effect off for good.");
+
+	ImGui::PopID();
+}
+
+void PerformanceOverlay::DrawDenoiserTable(const PerfView::ViewConfig& a_cfg)
+{
+	ImGui::Text("Render %ux%u, output %ux%u", view.renderWidth, view.renderHeight, view.outputWidth, view.outputHeight);
+	if (ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted(
+				"Render = the resolution the game draws at before DLSS/FSR upscales it; output = the screen. "
+				"A pass whose Covers matches Render runs at render resolution.\n\n"
+				"Packing REBLUR's input has no pass of its own (it is done inside the ray march), so it has no row.\n\n"
+				"Each row costs two GPU timestamps while this section is open; nothing when it is closed.");
+		}
+	}
+
+	const auto& table = view.denoiser;
+	const auto& footerTable = view.denoiserFooter;
+	if (table.RowCount() == 0) {
+		ImGui::TextDisabled("Nothing measured yet: needs SSRT with the REBLUR denoiser (or the confidence filter) running.");
+		return;
+	}
+
+	float totalMs = 0.0f;
+	footerTable.DisplayValue(1, a_cfg, totalMs);
+
+	const bool peakColumn = settings.ShowPeakColumn;
+	if (!ImGui::BeginTable("DenoiserBreakdown", peakColumn ? 5 : 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp))
+		return;
+	ImGui::TableSetupColumn("Pass");
+	ImGui::TableSetupColumn("Groups");
+	ImGui::TableSetupColumn("Covers");
+	ImGui::TableSetupColumn("GPU Time (%)");
+	if (peakColumn)
+		ImGui::TableSetupColumn("Peak");
+	ImGui::TableHeadersRow();
+
+	const auto drawRow = [&](const PerfView::StableTable<DenoiserRow>& a_table, int a_id) {
+		const DenoiserRow* row = a_table.GetRow(a_id);
+		if (!row)
+			return;
+		float ms = 0.0f;
+		const bool has = a_table.DisplayValue(a_id, a_cfg, ms);
+
+		ImGui::TableNextRow();
+		ImGui::TableNextColumn();
+		ImGui::TextUnformatted(row->label.c_str());
+		if (!row->tooltip.empty() && ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted(row->tooltip.c_str());
+		}
+
+		ImGui::TableNextColumn();
+		if (!row->isFooter && row->groupsX > 0)
+			ImGui::Text("%ux%u", row->groupsX, row->groupsY);
+		else if (!row->isFooter)
+			ImGui::TextDisabled("copy");
+		else
+			ImGui::TextDisabled("-");
+
+		ImGui::TableNextColumn();
+		if (!row->isFooter && row->threadsX > 0)
+			ImGui::Text("%ux%u", row->threadsX, row->threadsY);
+		else
+			ImGui::TextDisabled("-");
+
+		ImGui::TableNextColumn();
+		if (!has)
+			ImGui::TextDisabled("-");
+		else
+			ImGui::Text("%s (%.1f%%)", ms < 0.01f ? "< 0.01 ms" : std::format("{:.2f} ms", ms).c_str(), totalMs > 0.0f ? ms / totalMs * 100.0f : 0.0f);
+
+		if (peakColumn) {
+			ImGui::TableNextColumn();
+			const auto values = a_table.GetValues(a_id);
+			if (values.hasData)
+				ImGui::Text("%.2f ms", values.peak);
+			else
+				ImGui::TextDisabled("-");
+		}
+	};
+
+	for (int id : table.DisplayOrder(a_cfg))
+		drawRow(table, id);
+
+	PerfView::ViewConfig footerCfg = a_cfg;
+	footerCfg.sort = PerfView::SortMode::Fixed;
+	footerCfg.topN = 0;
+	const auto footerOrder = footerTable.DisplayOrder(footerCfg);
+	if (!footerOrder.empty()) {
+		ImGui::TableNextRow();
+		ImGui::TableSetColumnIndex(0);
+		ImGui::Separator();
+	}
+	for (int id : footerOrder)
+		drawRow(footerTable, id);
+
+	ImGui::EndTable();
+}
+
+std::vector<DrawCallRow> PerformanceOverlay::MaterializeRows(const PerfView::StableTable<DrawCallRow>& a_table, const std::vector<int>& a_order,
+	const PerfView::ViewConfig& a_cfg, float a_percentBase, bool a_recomputeCostPerCall)
+{
+	std::vector<DrawCallRow> rows;
+	rows.reserve(a_order.size());
+	for (int id : a_order) {
+		const DrawCallRow* stored = a_table.GetRow(id);
+		if (!stored)
+			continue;
+		DrawCallRow row = *stored;
+		float value = 0.0f;
+		row.hasData = a_table.DisplayValue(id, a_cfg, value);
+		row.frameTime = row.hasData ? value : 0.0f;
+		row.percent = (row.hasData && a_percentBase > 0.0f) ? (value / a_percentBase * 100.0f) : 0.0f;
+		const auto values = a_table.GetValues(id);
+		row.peak = values.hasData ? std::optional<float>(values.peak) : std::nullopt;
+		if (a_recomputeCostPerCall)
+			row.costPerCall = (row.hasData && row.drawCalls > 0) ? (value / static_cast<float>(row.drawCalls)) : 0.0f;
+		rows.push_back(std::move(row));
+	}
+	return rows;
+}
+
+void PerformanceOverlay::DrawStableTable(const char* a_id, const std::vector<ColumnConfig>& a_columns, const std::vector<DrawCallRow>& a_rows,
+	const std::vector<DrawCallRow>& a_footer, const std::function<void(int, int, const DrawCallRow&)>& a_cellRender)
+{
+	// Deliberately not sortable by header click: the order is the view layer's (see the
+	// "Sort rows" option), and clicking a header used to re-sort by the jumping live value.
+	const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
+	if (!ImGui::BeginTable(a_id, static_cast<int>(a_columns.size()), flags))
+		return;
+	for (const auto& col : a_columns)
+		ImGui::TableSetupColumn(col.header.c_str());
+
+	ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+	for (size_t c = 0; c < a_columns.size(); ++c) {
+		ImGui::TableSetColumnIndex(static_cast<int>(c));
+		ImGui::TableHeader(a_columns[c].header.c_str());
+		if (a_columns[c].headerTooltip)
+			a_columns[c].headerTooltip();
+	}
+
+	int rowIdx = 0;
+	const auto drawRows = [&](const std::vector<DrawCallRow>& a_list) {
+		for (const auto& row : a_list) {
+			ImGui::TableNextRow();
+			for (size_t c = 0; c < a_columns.size(); ++c) {
+				ImGui::TableSetColumnIndex(static_cast<int>(c));
+				ImGui::PushID(rowIdx * 64 + static_cast<int>(c));
+				a_cellRender(rowIdx, static_cast<int>(c), row);
+				ImGui::PopID();
+			}
+			++rowIdx;
+		}
+	};
+	drawRows(a_rows);
+	if (!a_footer.empty() && !a_rows.empty()) {
+		ImGui::TableNextRow();
+		ImGui::TableSetColumnIndex(0);
+		ImGui::Separator();
+	}
+	drawRows(a_footer);
+	ImGui::EndTable();
+}
+
+std::string PerformanceOverlay::FormatDenoiserLogLine(const PerfView::ViewConfig& a_cfg) const
+{
+	PerfView::ViewConfig cfg = a_cfg;
+	cfg.showLive = false;  // the log line is always the smoothed value
+	cfg.sort = PerfView::SortMode::Fixed;
+	cfg.topN = 0;
+
+	float total = 0.0f;
+	if (!view.denoiserFooter.DisplayValue(1, cfg, total))
+		return {};
+
+	std::string line = std::format("[PerfDenoiser] window {:.2f} s | render {}x{} | total {:.3f} ms",
+		cfg.windowSeconds, view.renderWidth, view.renderHeight, total);
+	for (int id : view.denoiser.DisplayOrder(cfg)) {
+		const DenoiserRow* row = view.denoiser.GetRow(id);
+		float ms = 0.0f;
+		if (!row || !view.denoiser.DisplayValue(id, cfg, ms))
+			continue;
+		line += std::format(" | {} {:.3f}", row->label, ms);
+	}
+	return line;
+}
+
+void PerformanceOverlay::WriteSnapshotToLog(const PerfView::ViewConfig& a_cfg)
+{
+	// Everything in the order and with the values the overlay shows, but never trimmed by
+	// Top N: the log is for reading later, the whole table is wanted.
+	PerfView::ViewConfig cfg = a_cfg;
+	cfg.topN = 0;
+	PerfView::ViewConfig fixedCfg = cfg;
+	fixedCfg.sort = PerfView::SortMode::Fixed;
+
+	const char* valueKind = cfg.showLive ? "live" : (cfg.smooth == PerfView::SmoothMode::Off ? "unsmoothed" : "smoothed");
+	logger::info("[PerfSnapshot] ===== begin{} | values {} | smoothing {} {:.2f} s | sort {} =====",
+		view.frozen ? " (frozen)" : "", valueKind, kSmoothModeNames[static_cast<int>(cfg.smooth)], cfg.windowSeconds,
+		kSortModeNames[static_cast<int>(cfg.sort)]);
+
+	const auto summary = [this, &cfg](int a_id) {
+		float v = 0.0f;
+		return view.summary.DisplayValue(a_id, cfg, v) ? v : -1.0f;
+	};
+	const float frameMs = summary(kSummaryFrame);
+	const float cpuFrame = summary(kSummaryCpuFrame);
+	const float wait = summary(kSummaryPresentWait);
+	const float postFg = summary(kSummaryPostFgFrame);
+	logger::info("[PerfSnapshot] Summary | FPS {:.1f} | frame {:.2f} ms{} | CPU frame {:.2f} ms | present wait {:.2f} ms | GPU ours {:.2f} ms | GPU untracked {:.2f} ms | GPU gap {:.2f} ms",
+		frameMs > 0.0f ? 1000.0f / frameMs : 0.0f, std::max(0.0f, frameMs),
+		postFg > 0.0f ? std::format(" | post-FG FPS {:.1f}", 1000.0f / postFg) : std::string(),
+		std::max(0.0f, cpuFrame), std::max(0.0f, wait), std::max(0.0f, summary(kSummaryGpuOurs)),
+		std::max(0.0f, summary(kSummaryGpuUntracked)), std::max(0.0f, summary(kSummaryGpuGap)));
+	logger::info("[PerfSnapshot] Resolution | render {}x{} | output {}x{}", view.renderWidth, view.renderHeight, view.outputWidth, view.outputHeight);
+
+	const auto logTable = [&](const char* a_name, const PerfView::StableTable<DrawCallRow>& a_table, const PerfView::ViewConfig& a_order) {
+		for (int id : a_table.DisplayOrder(a_order)) {
+			const DrawCallRow* row = a_table.GetRow(id);
+			if (!row)
+				continue;
+			float v = 0.0f;
+			const bool has = a_table.DisplayValue(id, cfg, v);
+			const auto values = a_table.GetValues(id);
+			logger::info("[PerfSnapshot] {} | {} | {} | peak {} | count {}", a_name, row->label, FormatMsForLog(has, v),
+				FormatMsForLog(values.hasData, values.peak), row->drawCalls);
+		}
+	};
+	logTable("Shader types (CPU)", view.shaderTypes, cfg);
+	logTable("Shader types (CPU)", view.shaderFooter, fixedCfg);
+	logTable("CS CPU submit", view.csCpu, cfg);
+	logTable("GPU passes", view.gpuPasses, cfg);
+	logTable("GPU passes", view.gpuFooter, fixedCfg);
+	logTable("Engine passes (GPU)", view.engine, fixedCfg);
+
+	const auto logDenoiser = [&](const PerfView::StableTable<DenoiserRow>& a_table, const PerfView::ViewConfig& a_order) {
+		for (int id : a_table.DisplayOrder(a_order)) {
+			const DenoiserRow* row = a_table.GetRow(id);
+			if (!row)
+				continue;
+			float v = 0.0f;
+			const bool has = a_table.DisplayValue(id, cfg, v);
+			const auto values = a_table.GetValues(id);
+			if (row->isFooter) {
+				logger::info("[PerfSnapshot] Denoiser | {} | {} | peak {}", row->label, FormatMsForLog(has, v), FormatMsForLog(values.hasData, values.peak));
+			} else {
+				logger::info("[PerfSnapshot] Denoiser | {} | {} | peak {} | groups {}x{} | covers {}x{}", row->label, FormatMsForLog(has, v),
+					FormatMsForLog(values.hasData, values.peak), row->groupsX, row->groupsY, row->threadsX, row->threadsY);
+			}
+		}
+	};
+	if (view.denoiser.RowCount() == 0)
+		logger::info("[PerfSnapshot] Denoiser | (not measured: open the \"Denoiser breakdown\" section first)");
+	logDenoiser(view.denoiser, cfg);
+	logDenoiser(view.denoiserFooter, fixedCfg);
+
+	logger::info("[PerfSnapshot] ===== end =====");
 }

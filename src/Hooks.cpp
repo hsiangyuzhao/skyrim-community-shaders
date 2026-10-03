@@ -9,6 +9,7 @@
 #include "State.h"
 #include "TruePBR.h"
 #include "Util.h"
+#include "Utils/DenoiserTimers.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 
@@ -313,6 +314,9 @@ struct IDXGISwapChain_Present
 		// right after it, so its chain spans exactly the frame's own rendering.
 		auto* gpuTimeline = Util::GpuPhaseTimeline::GetSingleton();
 		gpuTimeline->EndFrame();
+		// (batch 36e) Same frame bracket for the denoiser breakdown's timestamps.
+		auto* denoiserTimers = Util::DenoiserTimers::GetSingleton();
+		denoiserTimers->EndFrame();
 
 		// Time the CPU spends blocked inside Present: waiting on the GPU, on vsync or on a
 		// frame-rate limiter. This is the single biggest thing the overlay's "Other" row
@@ -332,6 +336,7 @@ struct IDXGISwapChain_Present
 		Util::CpuPassTimers::GetSingleton()->EndPresentWait();
 		Util::GpuFrameTimer::GetSingleton()->MarkPresentEnd();
 		gpuTimeline->BeginFrame();
+		denoiserTimers->BeginFrame();
 
 		TracyD3D11Collect(state->tracyCtx);
 

@@ -3,6 +3,7 @@
 #include "Menu.h"
 #include "OverlayFeature.h"
 #include "PerformanceOverlay/ABTesting/ABTestAggregator.h"
+#include "PerformanceOverlay/StableTable.h"
 #include "Utils/PerfUtils.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -42,6 +43,24 @@ struct DrawCallRow
 	bool enabled;
 	std::optional<float> testFrameTime;
 	std::optional<float> testCostPerCall;
+	// (batch 36e) Display-layer fields, filled from PerfView::StableTable. hasData is false for
+	// a row that is kept in place but has no reading in the smoothing window ("-").
+	std::optional<float> peak = std::nullopt;
+	bool hasData = true;
+};
+
+/// (batch 36e) One row of the "Denoiser breakdown" table.
+struct DenoiserRow
+{
+	std::string label;
+	std::string group;
+	std::string tooltip;
+	uint32_t groupsX = 0;
+	uint32_t groupsY = 0;
+	uint32_t threadsX = 0;
+	uint32_t threadsY = 0;
+	int calls = 0;
+	bool isFooter = false;
 };
 
 struct ShaderRow
@@ -284,6 +303,41 @@ struct PerformanceOverlay : OverlayFeature
 	void DrawEngineGpuTable();
 	/// @brief CPU / GPU bottleneck readout drawn above the tables.
 	void DrawBottleneckSummary();
+
+	// ============================================================================
+	// (batch 36e) READABILITY LAYER
+	// ============================================================================
+	// Everything below only changes what is printed and in which row. The timers, their hook
+	// points and their own smoothing are untouched; see PerfView::StableTable.
+
+	/// @brief The display config the tables use, from the settings.
+	PerfView::ViewConfig MakeViewConfig() const;
+	/// @brief Feeds this frame's readings into every table's display state (skipped while frozen).
+	void UpdateViews(double a_now, const DrawCallRowSets& a_rowSets, const PerfView::ViewConfig& a_cfg);
+	/// @brief Always-visible two-line summary: FPS, frame time, our GPU total, bottleneck.
+	void DrawCompactSummary(const PerfView::ViewConfig& a_cfg);
+	/// @brief Sort / smoothing / Top N / Peak / Freeze controls. Shared by the menu page and the overlay.
+	void DrawViewOptions();
+	/// @brief (batch 36e) Per-dispatch timing of the SSRT denoiser chain (Util::DenoiserTimers).
+	void DrawDenoiserTable(const PerfView::ViewConfig& a_cfg);
+	/// @brief A collapsible section whose open state lives in the settings (so it is saved).
+	static bool Section(const char* a_label, bool& a_open, const char* a_tooltip = nullptr);
+	/// @brief Freeze / unfreeze every number on the overlay. Freezing also writes a snapshot to the log.
+	void ToggleFreeze();
+	bool IsFrozen() const { return view.frozen; }
+	/// @brief Writes every table, as currently displayed, to CommunityShaders.log.
+	void WriteSnapshotToLog(const PerfView::ViewConfig& a_cfg);
+	/// @brief One line of smoothed denoiser timings, for the periodic log option.
+	std::string FormatDenoiserLogLine(const PerfView::ViewConfig& a_cfg) const;
+	/// @brief Rows of a DrawCallRow table, in display order, with the display values filled in.
+	static std::vector<DrawCallRow> MaterializeRows(const PerfView::StableTable<DrawCallRow>& a_table, const std::vector<int>& a_order,
+		const PerfView::ViewConfig& a_cfg, float a_percentBase, bool a_recomputeCostPerCall);
+	/// @brief Renders rows in the given order (no header-click sorting: order comes from the view layer).
+	static void DrawStableTable(const char* a_id, const std::vector<ColumnConfig>& a_columns, const std::vector<DrawCallRow>& a_rows,
+		const std::vector<DrawCallRow>& a_footer, const std::function<void(int, int, const DrawCallRow&)>& a_cellRender);
+
+	/// Set while the menu is waiting for the next key press to become the Freeze key.
+	bool capturingFreezeKey = false;
 	DrawCallLegends BuildDrawCallLegends(const Menu::ThemeSettings& theme, bool anyTestData) const;
 	std::vector<ColumnConfig> BuildDrawCallTableColumns(const Menu::ThemeSettings& theme, const DrawCallLegends& legends, bool anyTestData);
 
@@ -450,8 +504,55 @@ struct PerformanceOverlay : OverlayFeature
 		bool ShowBorder = true;
 		ImVec2 Position = ImVec2(10.f, 10.f);
 		bool PositionSet = false;
+
+		// (batch 36e) Readability. Values are PerfView::SortMode / SmoothMode.
+		int SortMode = 0;               // 0 smoothed (hysteresis), 1 fixed order, 2 live
+		int SmoothingMode = 1;          // 0 off, 1 window average, 2 EMA
+		float SmoothingWindow = 0.5f;   // seconds
+		bool ShowLiveValues = false;    // print the live reading instead of the smoothed one
+		bool ShowPeakColumn = false;    // max of the live reading over the window
+		int TopN = 0;                   // 0 = every row
+		uint32_t FreezeKey = VK_F11;    // freeze / unfreeze every number (also logs a snapshot)
+		int DenoiserLogInterval = 0;    // seconds between denoiser log lines, 0 = off
+
+		// Collapsible sections; open state is part of the saved settings.
+		bool SectionFrame = true;
+		bool SectionBottleneck = false;
+		bool SectionShaderTypes = true;
+		bool SectionCsCpu = false;
+		bool SectionGpuPasses = true;
+		bool SectionEngine = false;
+		bool SectionDenoiser = false;
+		bool SectionGrass = false;
+		bool SectionVram = true;
+		bool SectionView = false;
 	};
 	Settings settings;
+
+	/// (batch 36e) Display state of every table. Not saved.
+	struct ViewState
+	{
+		PerfView::StableTable<DrawCallRow> shaderTypes;
+		PerfView::StableTable<DrawCallRow> shaderFooter;
+		PerfView::StableTable<DrawCallRow> csCpu;
+		PerfView::StableTable<DrawCallRow> gpuPasses;
+		PerfView::StableTable<DrawCallRow> gpuFooter;
+		PerfView::StableTable<DrawCallRow> engine;
+		PerfView::StableTable<DenoiserRow> denoiser;
+		PerfView::StableTable<DenoiserRow> denoiserFooter;
+		PerfView::StableTable<int> summary;
+
+		bool frozen = false;
+		bool pendingSnapshot = false;
+		double frozenAt = 0.0;
+		double lastDenoiserLog = 0.0;
+		// Copies taken at the moment of freezing, so the FPS block and graphs freeze too.
+		std::optional<State> frozenState;
+		FrameStats frozenStats{};
+		// Render / output resolution at the last update, for the denoiser table header.
+		uint32_t renderWidth = 0, renderHeight = 0, outputWidth = 0, outputHeight = 0;
+	};
+	ViewState view;
 
 private:
 	// ============================================================================
