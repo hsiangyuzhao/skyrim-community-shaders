@@ -25,7 +25,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	IncludeGrass,
 	IncludeAlphaTested,
 	PeripheryRadius,
-	DebugOverlay)
+	DebugOverlay,
+	CoarsenFrames)
 
 namespace
 {
@@ -150,6 +151,7 @@ namespace
 	constexpr float kNormalWeight = 0.5f;               // normal chord (~radians) to luminance-error units
 	constexpr float kEnvLuminance = 0.02f;              // keeps near-black tiles from reading as infinitely detailed
 	constexpr float kHysteresis = 0.8f;                 // must beat 80% of the threshold to get coarser than last frame
+	constexpr uint32_t kMaxCoarsenFrames = 30;
 
 	uint32_t DivideRoundUp(uint32_t a_value, uint32_t a_divisor) { return (a_value + a_divisor - 1) / a_divisor; }
 
@@ -163,8 +165,8 @@ namespace
 
 	void UnbindCompute(ID3D11DeviceContext* a_context, UINT a_srvCount, UINT a_uavCount)
 	{
-		ID3D11ShaderResourceView* nullSRVs[3]{};
-		ID3D11UnorderedAccessView* nullUAVs[2]{};
+		ID3D11ShaderResourceView* nullSRVs[4]{};
+		ID3D11UnorderedAccessView* nullUAVs[3]{};
 		ID3D11Buffer* nullCB = nullptr;
 		a_context->CSSetShaderResources(0, a_srvCount, nullSRVs);
 		a_context->CSSetUnorderedAccessViews(0, a_uavCount, nullUAVs, nullptr);
@@ -181,6 +183,7 @@ void VariableRateShading::LoadSettings(json& o_json)
 	settings.Quality = std::clamp(settings.Quality, 0.0f, 1.0f);
 	settings.MotionPixels = std::clamp(settings.MotionPixels, 0.0f, 64.0f);
 	settings.PeripheryRadius = std::clamp(settings.PeripheryRadius, 0.1f, 2.0f);
+	settings.CoarsenFrames = std::min(settings.CoarsenFrames, kMaxCoarsenFrames);
 }
 
 void VariableRateShading::SaveSettings(json& o_json)
@@ -212,6 +215,8 @@ void VariableRateShading::SetupResources()
 	tileStats = nullptr;
 	tileStatsSRV = nullptr;
 	tileStatsUAV = nullptr;
+	tileState = nullptr;
+	tileStateUAV = nullptr;
 	for (uint32_t i = 0; i < 2; i++) {
 		rateImage[i] = nullptr;
 		rateImageSRV[i] = nullptr;
@@ -226,6 +231,7 @@ void VariableRateShading::SetupResources()
 	hasRateCounts = false;
 	lastAnalysisFrame = 0;
 	lastBuildFrame = 0;
+	lastBoundFrame = 0;
 	hardwareSupported = false;
 
 	if (REL::Module::IsVR()) {
@@ -312,6 +318,17 @@ void VariableRateShading::SetupResources()
 		rateImageView[i] = view;
 	}
 
+	// R32_UINT: the build pass reads and writes it through one UAV, and typed UAV loads are
+	// only guaranteed for 32-bit formats.
+	std::vector<uint32_t> zeroState(static_cast<size_t>(imageTiles[0]) * imageTiles[1], 0);
+	D3D11_SUBRESOURCE_DATA initialState{ zeroState.data(), imageTiles[0] * static_cast<UINT>(sizeof(uint32_t)), 0 };
+	texDesc.Format = DXGI_FORMAT_R32_UINT;
+	texDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+	if (HRESULT hr = device->CreateTexture2D(&texDesc, &initialState, tileState.put()); FAILED(hr))
+		return fail("the tile state texture", hr);
+	if (HRESULT hr = device->CreateUnorderedAccessView(tileState.get(), nullptr, tileStateUAV.put()); FAILED(hr))
+		return fail("the tile state UAV", hr);
+
 	D3D11_BUFFER_DESC countsDesc{};
 	countsDesc.ByteWidth = 16 * sizeof(uint32_t);
 	countsDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -384,6 +401,11 @@ VariableRateShading::RateCB VariableRateShading::BuildConstants(bool a_historyVa
 	cb.EnvLuminance = kEnvLuminance;
 	cb.HistoryValid = a_historyValid ? 1u : 0u;
 	cb.Hysteresis = kHysteresis;
+	cb.CoarsenFrames = std::min(settings.CoarsenFrames, kMaxCoarsenFrames);
+	cb.RateAwareAnalysis = diagnostics.RateBlindAnalysis ? 0u : 1u;
+	// What this frame's opaque draws were actually shaded at; Full Detail Everywhere shades
+	// every draw at 1x1 whatever the image says.
+	cb.AppliedRatesValid = (lastBoundFrame == frameIndex && !diagnostics.FullRateEverywhere) ? 1u : 0u;
 	return cb;
 }
 
@@ -396,7 +418,8 @@ void VariableRateShading::BeginOpaquePass()
 	Util::CpuPassScope cpuTimer("VariableRateShading");
 	auto context = globals::d3d::context;
 
-	if (lastBuildFrame != frameIndex) {
+	// Freeze Rates keeps re-binding the last image without rebuilding it.
+	if (lastBuildFrame != frameIndex && !diagnostics.FreezeRates) {
 		auto shader = GetShader(buildCS, L"Data\\Shaders\\VariableRateShading\\BuildRateImageCS.hlsl");
 		if (!shader)
 			return;
@@ -420,14 +443,14 @@ void VariableRateShading::BeginOpaquePass()
 			context->ClearUnorderedAccessViewUint(rateCountsUAV.get(), zero);
 
 			ID3D11ShaderResourceView* srvs[2]{ tileStatsSRV.get(), rateImageSRV[previous].get() };
-			ID3D11UnorderedAccessView* uavs[2]{ rateImageUAV[currentImage].get(), rateCountsUAV.get() };
+			ID3D11UnorderedAccessView* uavs[3]{ rateImageUAV[currentImage].get(), rateCountsUAV.get(), tileStateUAV.get() };
 			ID3D11Buffer* cbs[1]{ rateCB->CB() };
 			context->CSSetShaderResources(0, 2, srvs);
-			context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+			context->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
 			context->CSSetConstantBuffers(0, 1, cbs);
 			context->CSSetShader(shader, nullptr, 0);
 			context->Dispatch(DivideRoundUp(imageTiles[0], 8), DivideRoundUp(imageTiles[1], 8), 1);
-			UnbindCompute(context, 2, 2);
+			UnbindCompute(context, 2, 3);
 		}
 
 		context->CopyResource(rateCountsStaging[readbackWrite].get(), rateCounts.get());
@@ -444,6 +467,7 @@ void VariableRateShading::BeginOpaquePass()
 	}
 	imageBound = true;
 	opaqueWindow = true;
+	lastBoundFrame = frameIndex;
 	// The rate table itself stays off until the first draw that qualifies (see OnDraw).
 }
 
@@ -587,7 +611,7 @@ void VariableRateShading::AnalyzeFrame()
 		return;
 
 	const bool needAnalysis = settings.RateMode != static_cast<uint32_t>(Mode::Periphery);
-	const bool needDebug = settings.DebugOverlay && lastBuildFrame == frameIndex;
+	const bool needDebug = settings.DebugOverlay && lastBoundFrame == frameIndex;
 	if (!needAnalysis && !needDebug)
 		return;
 
@@ -608,18 +632,19 @@ void VariableRateShading::AnalyzeFrame()
 		if (!shader)
 			return;
 
-		ID3D11ShaderResourceView* srvs[3]{
+		ID3D11ShaderResourceView* srvs[4]{
 			main.SRV,
 			targets[RE::RENDER_TARGETS::kMOTION_VECTOR].SRV,
 			targets[NORMALROUGHNESS].SRV,
+			rateImageSRV[currentImage].get(),
 		};
 		ID3D11UnorderedAccessView* uavs[1]{ tileStatsUAV.get() };
-		context->CSSetShaderResources(0, 3, srvs);
+		context->CSSetShaderResources(0, 4, srvs);
 		context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
 		context->CSSetConstantBuffers(0, 1, cbs);
 		context->CSSetShader(shader, nullptr, 0);
 		context->Dispatch(cb.RenderTiles[0], cb.RenderTiles[1], 1);
-		UnbindCompute(context, 3, 1);
+		UnbindCompute(context, 4, 1);
 
 		lastAnalysisFrame = frameIndex;
 		lastAnalysisRenderSize[0] = cb.RenderSize[0];
@@ -719,6 +744,13 @@ void VariableRateShading::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Keeps bumpy surfaces at full detail so screen-space lighting (SSGI, SSRT) still sees their fine surface shape. Turning it off saves a bit more.");
 		}
+
+		int coarsenFrames = static_cast<int>(settings.CoarsenFrames);
+		if (ImGui::SliderInt("Coarsen Delay", &coarsenFrames, 0, static_cast<int>(kMaxCoarsenFrames), coarsenFrames > 0 ? "%d frames" : "Off"))
+			settings.CoarsenFrames = static_cast<uint32_t>(std::clamp(coarsenFrames, 0, static_cast<int>(kMaxCoarsenFrames)));
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("A block must look flat for this many frames in a row before its detail is lowered; raising detail is always immediate. Keeps flickering fire and moving shadows from switching blocks back and forth.");
+		}
 	}
 
 	if (settings.RateMode != static_cast<uint32_t>(Mode::Adaptive)) {
@@ -797,6 +829,16 @@ void VariableRateShading::DrawSettings()
 	ImGui::Checkbox("Diagnostic: Full Detail Everywhere", &diagnostics.FullRateEverywhere);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Keeps all of VRS running but shades everything at full detail. If a problem stays with this on, VRS lowering detail is not what causes it.");
+	}
+
+	ImGui::Checkbox("Diagnostic: Freeze Rates", &diagnostics.FreezeRates);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Stops updating where detail is lowered; the current pattern stays. If flicker stops, it came from blocks switching detail; if it stays, from the lowered detail itself.");
+	}
+
+	ImGui::Checkbox("Diagnostic: Old Rate Analysis", &diagnostics.RateBlindAnalysis);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Measures blocks the way the previous build did, ignoring that some were already shaded coarsely. Only for checking whether the old flicker comes back.");
 	}
 
 	ImGui::EndDisabled();

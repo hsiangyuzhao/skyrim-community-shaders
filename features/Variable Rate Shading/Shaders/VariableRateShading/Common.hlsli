@@ -12,7 +12,15 @@
 // hands to NVAPI: index = log2(width) * 3 + log2(height), so 0 = 1x1, 4 = 2x2, 8 = 4x4.
 // The build pass never emits 2 (1x4) or 6 (4x1); the table maps them to 1x2 / 2x1 anyway.
 
-// Mirrors VariableRateShading::RateCB on the C++ side. 64 bytes.
+// Rate-image index -> log2 of the coarse-pixel size along each axis (exact for every index the
+// build pass emits).
+uint2 RateLog2(uint index)
+{
+	index = min(index, 8u);
+	return uint2(index / 3, index % 3);
+}
+
+// Mirrors VariableRateShading::RateCB on the C++ side. 80 bytes.
 cbuffer RateCB : register(b0)
 {
 	uint2 RenderSize;       // render-resolution extent in pixels (the dynamic-resolution sub-rectangle)
@@ -28,6 +36,10 @@ cbuffer RateCB : register(b0)
 	float EnvLuminance;     // luminance floor added to the tile mean (Weber-law denominator)
 	uint HistoryValid;      // 1 when last frame's tile statistics describe this view
 	float Hysteresis;       // threshold multiplier for getting coarser than last frame (< 1)
+	uint CoarsenFrames;     // consecutive frames a tile must qualify before it gets coarser; 0 = at once
+	uint Pad0;
+	uint RateAwareAnalysis;  // 1 = measure at the spacing this frame was actually shaded at
+	uint AppliedRatesValid;  // 1 = RateImage (AnalyzeCS t3) is what this frame's opaque draws used
 };
 
 #endif  // __VARIABLE_RATE_SHADING_COMMON_HLSLI__

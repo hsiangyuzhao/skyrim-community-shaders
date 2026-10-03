@@ -9,6 +9,15 @@
 // adjacent G-buffer normals is folded in, so tiles whose normals carry detail the screen-space
 // effects (SSGI / SSRT) rely on stay at full rate even when their lit colour is flat.
 //
+// The image measured here was itself shaded at this frame's rates. Inside a coarse pixel every
+// pixel holds the same value, so adjacent-pixel differences are zero inside a block and twice
+// the real step across block edges. On anything that varies over more than a few pixels (a
+// magnified texture or normal-map bumps under a nearby torch) that reads up to ~1.4x higher
+// than the same surface at full rate. A tile near the threshold then measures
+// "too detailed" whenever it is coarse and "flat" whenever it is fine, and flips every frame.
+// So differences are taken at the spacing the tile was shaded at and divided by it: a coarse
+// tile can never measure higher than the same content at full rate, and the loop is stable.
+//
 // The result feeds BuildRateImageCS at the start of the NEXT frame's opaque pass, which
 // reprojects it with the motion stored here.
 
@@ -18,6 +27,7 @@
 Texture2D<float4> ColorTexture : register(t0);            // main scene colour after the deferred composite
 Texture2D<float2> MotionVectorTexture : register(t1);     // prevUV - currUV, render-resolution UV units
 Texture2D<float4> NormalRoughnessTexture : register(t2);  // CS G-buffer: octahedral normal in xy
+Texture2D<uint> RateImage : register(t3);                 // the rates this frame's opaque draws were shaded at
 
 // x: relative error at half rate horizontally, y: vertically, zw: mean motion (pixels, prev - curr)
 RWTexture2D<float4> TileStatsRW : register(u0);
@@ -33,6 +43,13 @@ groupshared float2 gsMotion[VRS_THREADS];     // sum motion (pixels)
 [numthreads(VRS_TILE, VRS_TILE, 1)] void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID, uint groupIndex : SV_GroupIndex) {
 	const uint2 pixel = groupId.xy * VRS_TILE + groupThreadId.xy;
 	const bool valid = all(pixel < RenderSize);
+
+	// Pixel spacing of one shading result in this tile (1, 2 or 4 per axis). Draws the table
+	// keeps finer (ground, blended, cut-outs capped at 2x2) are measured at this spacing too,
+	// which only under-reads them; their own rate does not depend on this tile's.
+	uint2 stride = 1;
+	if (RateAwareAnalysis != 0 && AppliedRatesValid != 0)
+		stride = 1u << RateLog2(RateImage[groupId.xy]);
 
 	float luma = 0.0;
 	float3 normal = 0.0;
@@ -54,17 +71,18 @@ groupshared float2 gsMotion[VRS_THREADS];     // sum motion (pixels)
 	float4 normalSums = 0.0;
 	if (valid) {
 		// Pairs are only formed inside the tile: that is the neighbourhood a coarse pixel
-		// can actually merge, and it keeps the tile independent of its neighbours.
-		if (groupThreadId.x + 1 < VRS_TILE && pixel.x + 1 < RenderSize.x) {
-			const float d = gsLuma[groupThreadId.y][groupThreadId.x + 1] - luma;
-			const float3 dn = gsNormal[groupThreadId.y][groupThreadId.x + 1] - normal;
+		// can actually merge, and it keeps the tile independent of its neighbours. Dividing
+		// by the spacing turns a difference over `stride` pixels into a per-pixel step.
+		if (groupThreadId.x + stride.x < VRS_TILE && pixel.x + stride.x < RenderSize.x) {
+			const float d = (gsLuma[groupThreadId.y][groupThreadId.x + stride.x] - luma) / stride.x;
+			const float3 dn = (gsNormal[groupThreadId.y][groupThreadId.x + stride.x] - normal) / stride.x;
 			colourSums.x = d * d;
 			normalSums.x = dot(dn, dn);
 			normalSums.z = 1.0;
 		}
-		if (groupThreadId.y + 1 < VRS_TILE && pixel.y + 1 < RenderSize.y) {
-			const float d = gsLuma[groupThreadId.y + 1][groupThreadId.x] - luma;
-			const float3 dn = gsNormal[groupThreadId.y + 1][groupThreadId.x] - normal;
+		if (groupThreadId.y + stride.y < VRS_TILE && pixel.y + stride.y < RenderSize.y) {
+			const float d = (gsLuma[groupThreadId.y + stride.y][groupThreadId.x] - luma) / stride.y;
+			const float3 dn = (gsNormal[groupThreadId.y + stride.y][groupThreadId.x] - normal) / stride.y;
 			colourSums.y = d * d;
 			normalSums.y = dot(dn, dn);
 			normalSums.w = 1.0;
@@ -75,12 +93,12 @@ groupshared float2 gsMotion[VRS_THREADS];     // sum motion (pixels)
 	gsMotion[groupIndex] = motion;
 	GroupMemoryBarrierWithGroupSync();
 
-	[unroll] for (uint stride = VRS_THREADS / 2; stride > 0; stride >>= 1)
+	[unroll] for (uint s = VRS_THREADS / 2; s > 0; s >>= 1)
 	{
-		if (groupIndex < stride) {
-			gsColour[groupIndex] += gsColour[groupIndex + stride];
-			gsNormalErr[groupIndex] += gsNormalErr[groupIndex + stride];
-			gsMotion[groupIndex] += gsMotion[groupIndex + stride];
+		if (groupIndex < s) {
+			gsColour[groupIndex] += gsColour[groupIndex + s];
+			gsNormalErr[groupIndex] += gsNormalErr[groupIndex + s];
+			gsMotion[groupIndex] += gsMotion[groupIndex + s];
 		}
 		GroupMemoryBarrierWithGroupSync();
 	}
