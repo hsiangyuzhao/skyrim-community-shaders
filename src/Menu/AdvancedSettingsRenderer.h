@@ -21,4 +21,6 @@ private:
 	static void RenderDeveloperSection();
 	// (batch 36f) Master switch for the batch 36f denoiser savings and its status table.
 	static void RenderBatch36fSection();
+	// (batch 36g) Master switch, experiment switches and status of the batch 36g diagnostic matrix.
+	static void RenderBatch36gSection();
 };

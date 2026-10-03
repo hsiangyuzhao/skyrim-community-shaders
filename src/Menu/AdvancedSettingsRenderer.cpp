@@ -18,6 +18,7 @@
 #include "TruePBR.h"
 #include "Util.h"
 #include "Utils/Batch36f.h"
+#include "Utils/Batch36g.h"
 #include "Utils/Format.h"
 #include "Utils/UI.h"
 
@@ -31,6 +32,15 @@ void AdvancedSettingsRenderer::RenderAdvancedSettings(
 		if (MenuFonts::BeginTabItemWithFont("Batch 36f", Menu::FontRole::Subheading)) {
 			if (ImGui::BeginChild("##Batch36fContent", ImVec2(0, 0), false)) {
 				RenderBatch36fSection();
+			}
+			ImGui::EndChild();
+			ImGui::EndTabItem();
+		}
+
+		// Batch 36g Tab (its own master switch; independent of Batch 36f's)
+		if (MenuFonts::BeginTabItemWithFont("Batch 36g", Menu::FontRole::Subheading)) {
+			if (ImGui::BeginChild("##Batch36gContent", ImVec2(0, 0), false)) {
+				RenderBatch36gSection();
 			}
 			ImGui::EndChild();
 			ImGui::EndTabItem();
@@ -162,6 +172,195 @@ void AdvancedSettingsRenderer::RenderBatch36fSection()
 	ImGui::TextDisabled(
 		"The REBLUR items only do anything while SSRT's Denoiser is REBLUR. The Distance Limit limits bounce light only "
 		"while Ambient Reinjection is on. Not affected by this switch: the Denoiser breakdown panel fixes (display only).");
+}
+
+void AdvancedSettingsRenderer::RenderBatch36gSection()
+{
+	auto& master = Batch36g::settings.master;
+	const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
+	auto& ssrt = globals::features::screenSpaceRayTracing;
+
+	ImGui::Checkbox("Batch 36g experiments (all)", &master);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"Off = the four experiment switches below run at their defaults (the picture is batch 36f's), whatever they are set to.\n"
+			"Separate from Batch 36f: this switch does not touch the 36f items, and the 36f master switch does not touch these.\n"
+			"Takes effect on the next frame: no restart, no cache clear.");
+	}
+	ImGui::TextWrapped(
+		"Diagnostic matrix for the checkerboard stripes and flicker. Every switch defaults to the batch 36f behaviour; "
+		"changing any of them restarts the denoisers' history.");
+
+	if (!ssrt.loaded) {
+		ImGui::TextDisabled("Screen Space Ray Tracing is not installed.");
+		return;
+	}
+	auto& s = ssrt.settings;
+	using SSRT = ScreenSpaceRayTracing;
+
+	ImGui::SeparatorText("Experiment switches");
+	{
+		static const char* patterns[] = {
+			"Full resolution (default)",
+			"A: checkerboard, NRD fills the gaps",
+			"B: probabilistic (diffuse or reflection per pixel)",
+			"C: checkerboard, our own gap filling"
+		};
+		int p = (int)std::min(s.B36gPattern, 3u);
+		if (ImGui::Combo("Tracing pattern", &p, patterns, 4))
+			s.B36gPattern = (uint)p;
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"Which pixels trace bounce light and which trace reflections each frame.\n"
+				"Full: both everywhere (36f).\n"
+				"A: alternate pixels like a chessboard, swapping every frame; NVIDIA's denoiser fills each gap from its left and right neighbours.\n"
+				"B: each pixel picks one of the two by a dither pattern (rough surfaces lean to bounce light); the denoiser fills the rest. NVIDIA's recommended way.\n"
+				"C: the same chessboard as A, but our own passes fill the gaps before the denoiser sees them (reflections re-weighted per pixel).\n"
+				"A and B need REBLUR on both; A, B and C need both bounce light and reflections on.");
+		}
+
+		ImGui::Checkbox("Merge denoisers (one REBLUR instance)", &s.B36gMergedDenoiser);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"One REBLUR denoiser for both bounce light and reflections instead of two. Cheaper, but both then share one set of settings.\n"
+				"Needs REBLUR on both.");
+		if (s.B36gMergedDenoiser) {
+			ImGui::Indent();
+			ImGui::Checkbox("Use batch 36b's shared settings (30 / 3 / 15)", &s.B36gMergedUse36bTuning);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("On = the compromise 36b used. Off = the bounce-light (diffuse) REBLUR settings for both.");
+			const NRD::REBLURSettings shown = s.B36gMergedUse36bTuning ?
+			                                      NRD::REBLURSettings{ .MaxAccumulatedFrameNum = 30, .MaxFastAccumulatedFrameNum = 3, .MaxStabilizedFrameNum = 15, .FastHistoryClampingSigmaScale = 1.75f } :
+			                                      s.ReblurDiffuse;
+			ImGui::TextDisabled("Shared: accumulated %u, fast %u, stabilized %u, fast clamp %.2f, blur %.0f-%.0f px",
+				shown.MaxAccumulatedFrameNum, shown.MaxFastAccumulatedFrameNum, shown.MaxStabilizedFrameNum,
+				shown.FastHistoryClampingSigmaScale, shown.MinBlurRadius, shown.MaxBlurRadius);
+			ImGui::Unindent();
+		}
+
+		static const char* sources[] = {
+			"1: rays, filtered (batch 34, default)",
+			"2: REBLUR hit distance (36b, reproduction only)"
+		};
+		int c = (int)std::min(s.B36gConfidenceSource, 1u);
+		if (ImGui::Combo("Confidence source", &c, sources, 2))
+			s.B36gConfidenceSource = (uint)c;
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Where 'how much of the game's own ambient light to replace' comes from (Ambient Reinjection).\n"
+				"1: this frame's rays, smoothed at quarter resolution (the clean batch 34 way).\n"
+				"2: what 36b did, kept only to check whether 36b's problem comes back. Needs Ambient Reinjection and REBLUR.");
+
+		ImGui::Checkbox("Diffuse pre-blur", &s.B36gDiffusePrepass);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("REBLUR's small blur on bounce light before it averages frames. Pattern B always turns it on.");
+		if (s.B36gDiffusePrepass || s.B36gPattern == SSRT::kB36gB) {
+			ImGui::Indent();
+			ImGui::SliderFloat("Diffuse pre-blur radius", &s.B36gDiffusePrepassRadius, 5.0f, 60.0f, "%.0f px", ImGuiSliderFlags_AlwaysClamp);
+			ImGui::Unindent();
+		}
+		ImGui::TextDisabled(
+			"Reflection pre-blur is batch 36f's \"Skip Reflection Pre-pass\" (Lighting > Screen Space Ray Tracing > Denoiser); "
+			"patterns A and B turn the pre-pass back on while they run.");
+	}
+
+	ImGui::SeparatorText("This frame");
+	{
+		const auto& f = ssrt.b36g;
+		const uint combo = SSRT::B36gCombination(f.drawnPattern, f.mergedDrawn);
+		ImGui::TextColored(palette.InfoColor, "Combination #%u%s%s", combo, f.confSource == 1 ? " + confidence 2" : "", f.diffusePrepass ? " + diffuse pre-blur" : "");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Numbers follow the test table: 1 Full + two denoisers, 2 A + two, 3 A + merged, 4 B + two, 5 B + merged,\n"
+				"6 C + two, 7 C + merged, 8 Full + merged. Freezing the performance overlay (F11) writes this line to the log.");
+
+		const bool on = master;
+		struct Row
+		{
+			const char* name;
+			std::string set;
+			std::string now;
+			bool differs;
+			const char* note;
+		};
+		const auto patternShort = [](uint a_p) -> std::string { return a_p == 1 ? "A" : a_p == 2 ? "B" : a_p == 3 ? "C" : "Full"; };
+		const bool prepassForced = f.specPrepassForced;
+		const std::string specPrepassNow = prepassForced ? "on (forced by pattern " + patternShort(f.drawnPattern) + ")" :
+		                                                   (ssrt.SkipSpecularPrepassActive() ? "skipped (36f)" : "on");
+		std::vector<Row> rows = {
+			{ "Tracing pattern", patternShort(s.B36gPattern), patternShort(f.drawnPattern), (on ? s.B36gPattern : 0u) != f.drawnPattern, f.patternNote },
+			{ "Denoiser", s.B36gMergedDenoiser ? "merged" : "two instances", f.mergedDrawn ? "merged" : "two instances",
+				(on && s.B36gMergedDenoiser) != f.mergedDrawn, f.mergedNote },
+			{ "Confidence source", s.B36gConfidenceSource == 1 ? "2" : "1", f.confSource == 1 ? "2" : "1",
+				(on ? std::min(s.B36gConfidenceSource, 1u) : 0u) != f.confSource, f.confNote },
+			{ "Diffuse pre-blur", s.B36gDiffusePrepass ? "on" : "off", f.diffusePrepass ? std::format("on, {:.0f} px", s.B36gDiffusePrepassRadius) : std::string("off"),
+				(on && s.B36gDiffusePrepass) != f.diffusePrepass, f.prepassNote },
+			{ "Reflection pre-pass (36f item)", s.ReblurSkipSpecularPrepass ? "skip" : "keep", specPrepassNow,
+				prepassForced && ssrt.SkipSpecularPrepassActive(), prepassForced ? "pre-pass forced on by the pattern (overrides 36f's skip)" : nullptr },
+			{ "Low-Res Confidence Filter", s.LowResConfidenceFilter ? "on" : "off", (s.LowResConfidenceFilter || f.lowResFilterForced) ? "on" : "off",
+				f.lowResFilterForced, f.lowResFilterForced ? "forced on by the pattern (the full-resolution window cannot skip untraced pixels)" : nullptr },
+		};
+
+		if (ImGui::BeginTable("##Batch36gItems", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+			ImGui::TableSetupColumn("Item");
+			ImGui::TableSetupColumn("Set");
+			ImGui::TableSetupColumn("Now");
+			ImGui::TableSetupColumn("Why it differs", ImGuiTableColumnFlags_WidthStretch);
+			ImGui::TableHeadersRow();
+			for (const auto& row : rows) {
+				ImGui::TableNextRow();
+				ImGui::TableNextColumn();
+				ImGui::TextUnformatted(row.name);
+				ImGui::TableNextColumn();
+				ImGui::TextUnformatted(row.set.c_str());
+				ImGui::TableNextColumn();
+				if (row.differs)
+					ImGui::TextColored(palette.Warning, "%s", row.now.c_str());
+				else
+					ImGui::TextUnformatted(row.now.c_str());
+				ImGui::TableNextColumn();
+				if (!on && !row.note && row.differs)
+					ImGui::TextWrapped("master switch off");
+				else if (row.note)
+					ImGui::TextWrapped("%s", row.note);
+			}
+			ImGui::EndTable();
+		}
+		if (!on)
+			ImGui::TextColored(palette.Warning, "Batch 36g master switch is off: every experiment switch runs at its default.");
+		if (f.foldNote)
+			ImGui::TextColored(palette.Warning, "Fold Unpack: %s", f.foldNote);
+		else if (ssrt.FoldUnpackActive())
+			ImGui::TextDisabled("Fold Unpack Into Composite (36f) works with every combination (pattern A falls back to a separate unpack only if REBLUR fails to run).");
+		if (f.mergedDrawn)
+			ImGui::TextDisabled(
+				"Merged: reflections are traced before this frame's bounce light is added to the picture, so mirrored surfaces miss "
+				"this frame's SSRT bounce light (slightly darker in reflections).");
+		if (ssrt.DistanceLimitActive() && f.mergedDrawn && !ssrt.settings.EnableAmbientReinjection)
+			ImGui::TextDisabled("Distance Limit with the merged denoiser and Ambient Reinjection off: tracing is limited, REBLUR denoises the full range.");
+	}
+
+	ImGui::SeparatorText("Debug views");
+	{
+		static const char* views[] = { "Off", "Which signal each pixel traced", "Bounce light: denoiser input before / after gap filling", "Reflections: denoiser input before / after gap filling" };
+		int v = (int)std::min(s.B36gDebugView, 3u);
+		if (ImGui::Combo("Debug view", &v, views, 4))
+			s.B36gDebugView = (uint)v;
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Which signal: red = bounce light traced, green = reflection traced, yellow = both, dark blue = sky.\n"
+				"Before / after: left half = only the pixels traced this frame (black = gap); right half = what the denoiser works from after the gaps are filled\n"
+				"(A: an imitation of NVIDIA's left/right fill; B: as NVIDIA receives it, which only rebuilds hit distances; C: our fill). REBLUR only.");
+		if (s.B36gDebugView != 0) {
+			if (auto* srv = ssrt.texB36gDebug ? ssrt.texB36gDebug->srv.get() : nullptr) {
+				const float w = ImGui::GetContentRegionAvail().x;
+				const float aspect = (float)ssrt.texB36gDebug->desc.Height / std::max(1.0f, (float)ssrt.texB36gDebug->desc.Width);
+				Util::BufferViewerImage(srv, { w, w * aspect });
+			} else {
+				ImGui::TextDisabled("Nothing drawn yet (the view needs the matching chain to run with REBLUR).");
+			}
+		}
+	}
 }
 
 void AdvancedSettingsRenderer::RenderLoggingSection()

@@ -22,6 +22,7 @@
 #include "Features/PerformanceOverlay/ABTesting/ABTestAggregator.h"
 #include "Features/GrassOptimizations.h"
 #include "Features/NRD.h"
+#include "Features/ScreenSpaceRayTracing.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Features/Upscaling.h"
 #include "Globals.h"
@@ -3685,6 +3686,9 @@ void PerformanceOverlay::WriteSnapshotToLog(const PerfView::ViewConfig& a_cfg)
 		std::max(0.0f, cpuFrame), std::max(0.0f, wait), std::max(0.0f, summary(kSummaryGpuOurs)),
 		std::max(0.0f, summary(kSummaryGpuUntracked)), std::max(0.0f, summary(kSummaryGpuGap)));
 	logger::info("[PerfSnapshot] Resolution | render {}x{} | output {}x{}", view.renderWidth, view.renderHeight, view.outputWidth, view.outputHeight);
+	// (batch 36g) Which cell of the diagnostic matrix these numbers belong to.
+	if (const auto& ssrt = globals::features::screenSpaceRayTracing; ssrt.loaded)
+		logger::info("[PerfSnapshot] Batch 36g | now {} | set {}", ssrt.DescribeB36g(true), ssrt.DescribeB36g(false));
 
 	const auto logTable = [&](const char* a_name, const PerfView::StableTable<DrawCallRow>& a_table, const PerfView::ViewConfig& a_order) {
 		for (int id : a_table.DisplayOrder(a_order)) {
