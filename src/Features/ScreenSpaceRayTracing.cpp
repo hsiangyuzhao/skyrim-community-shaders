@@ -4386,7 +4386,8 @@ void ScreenSpaceRayTracing::ResolveB36g()
 
     // Spec: switching any item resets the denoiser history. The key starts at the default
     // combination's value, so a session that never leaves it never resets for this reason.
-    const uint key = pattern | (merged ? 4u : 0u) | (conf << 3) | (dpp ? 16u : 0u) | (f.specPrepassForced ? 32u : 0u);
+    const uint key = pattern | (merged ? 4u : 0u) | (conf << 3) | (dpp ? 16u : 0u) | (f.specPrepassForced ? 32u : 0u) |
+                     ((merged && !settings.B36gMergedUse36bTuning) ? 64u : 0u);
     if (key != lastB36gKey) {
         lastB36gKey = key;
         resetReblurDiffuse = true;
