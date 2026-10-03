@@ -2402,9 +2402,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     const auto envTexture = dynamicCubemaps.loaded ? dynamicCubemaps.envTexture->srv.get() : nullptr;
 	const auto envReflectionsTexture = dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr;
 
-    auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec, ssgi_bent_normal_unused, ssgi_env_irradiance_unused] = ssgi.GetOutputTextures();
-    (void)ssgi_bent_normal_unused;      // (directional env) composite-only consumer
-    (void)ssgi_env_irradiance_unused;   // (directional env v2) composite-only consumer
+    auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec] = ssgi.GetOutputTextures();
 
     // raymarch
     state->BeginPerfEvent("Raymarch");
@@ -3063,9 +3061,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     const auto envTexture = dynamicCubemaps.loaded ? dynamicCubemaps.envTexture->srv.get() : nullptr;
 	const auto envReflectionsTexture = dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr;
 
-    auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec, ssgi_bent_normal_unused, ssgi_env_irradiance_unused] = ssgi.GetOutputTextures();
-    (void)ssgi_bent_normal_unused;      // (directional env) composite-only consumer
-    (void)ssgi_env_irradiance_unused;   // (directional env v2) composite-only consumer
+    auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec] = ssgi.GetOutputTextures();
 
     // (batch 11, item A) u0 is the packed NRD front-end surface under REBLUR and the chain's own
     // radiance surface otherwise -- same slot, same RGBA16F format, only the meaning of the four

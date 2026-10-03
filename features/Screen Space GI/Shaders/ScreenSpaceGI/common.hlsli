@@ -180,46 +180,6 @@ bool isFiniteSafe(float4 v) { return isFiniteSafe(v.x) && isFiniteSafe(v.y) && i
 // out-of-range value in the first place.
 #define SSGI_MAX_OUTPUT 16384.0f
 
-// (directional env) Bent-normal + aperture codec for the R8G8B8A8_UNORM bent-normal surface.
-//
-// Layout: RG = octahedral-encoded world-space bent normal mapped to [0, 1], B = aperture
-// (fraction of the hemisphere the occlusion sees as open, 0 = sealed, 1 = fully open),
-// A = spare (written 1, never read).
-//
-// Octahedral rather than the GBuffer codec so this file stays self-contained: the decoder is
-// duplicated in DeferredCompositeCS.hlsl (package side), which must not #include across a
-// feature directory that may be absent at runtime -- same reasoning as filterInf above. Any
-// change here must be mirrored there.
-//
-// The encoding is DIRECTION data: no consumer may interpolate the RG channels directly. Every
-// filter (temporal EMA in gi.cs.hlsl, reprojection taps in radianceDisocc.cs.hlsl, the spatial
-// blur, the upsample) decodes to a vector, blends in the vector domain, renormalises, and
-// re-encodes. Interpolating across the octahedron's fold lines yields directions unrelated to
-// either endpoint.
-float2 SSGI_OctWrap(float2 v)
-{
-	return (1.0 - abs(v.yx)) * (v.xy >= 0.0 ? float2(1, 1) : float2(-1, -1));
-}
-
-float4 SSGI_EncodeBentNormal(float3 dir, float aperture)
-{
-	float3 n = dir / max(abs(dir.x) + abs(dir.y) + abs(dir.z), 1e-6);
-	float2 oct = n.z >= 0.0 ? n.xy : SSGI_OctWrap(n.xy);
-	return float4(oct * 0.5 + 0.5, saturate(aperture), 1.0);
-}
-
-void SSGI_DecodeBentNormal(float4 enc, out float3 o_dir, out float o_aperture)
-{
-	float2 f = enc.xy * 2.0 - 1.0;
-	float3 n = float3(f, 1.0 - abs(f.x) - abs(f.y));
-	float t = saturate(-n.z);
-	n.xy += n.xy >= 0.0 ? float2(-t, -t) : float2(t, t);
-	// normalize is safe: |n| >= 1/sqrt(2) for every representable input, including the all-zero
-	// texel a cleared surface produces (which decodes to (0, 0, -1)).
-	o_dir = normalize(n);
-	o_aperture = enc.z;
-}
-
 // screenPos - normalised position in FrameDim, one eye only
 // uv - normalised position in FrameDim, both eye
 // texCoord - texture coordinate

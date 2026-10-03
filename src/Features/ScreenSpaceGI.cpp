@@ -7,11 +7,6 @@
 #include "Util.h"
 #include "Utils/GpuTimers.h"
 
-// (directional env v2) For the cubemap / skylighting SRVs the GI pass now binds and the
-// `loaded` tests the compile round keys its defines on. Globals.h only forward-declares these.
-#include "DynamicCubemaps.h"
-#include "Skylighting.h"
-
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ScreenSpaceGI::Settings,
 	Enabled,
@@ -39,9 +34,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DistanceNormalisation,
 	EnableContactAo,
 	ContactRadius,
-	ContactStrength,
-	EnableDirectionalEnv,
-	EnvLevel)
+	ContactStrength)
 
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -331,34 +324,6 @@ void ScreenSpaceGI::DrawSettings()
 	}
 
 	///////////////////////////////
-	ImGui::SeparatorText("Directional Environment");
-
-	{
-		auto dirEnvGuard = Util::DisableGuard(!settings.Enabled);
-
-		ImGui::Checkbox("Enable Directional Environment", &settings.EnableDirectionalEnv);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			std::vector<std::string> tooltipLines = {
-				"Makes ambient light directional: each surface takes the colour and brightness of what it can see (sky, a bright doorway) instead of one flat ambient colour.",
-				"Needs Dynamic Cubemaps installed. Steps aside automatically while Screen Space Ray Tracing's diffuse light is on."
-			};
-			Util::DrawMultiLineTooltip(tooltipLines);
-		}
-
-		{
-			auto levelGuard = Util::DisableGuard(!settings.EnableDirectionalEnv);
-
-			ImGui::SliderFloat("Environment Level", &settings.EnvLevel, 0.0f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				std::vector<std::string> tooltipLines = {
-					"Brightness of the directional ambient. 1.0 matches the game's normal ambient level; higher = brighter, same colour."
-				};
-				Util::DrawMultiLineTooltip(tooltipLines);
-			}
-		}
-	}
-
-	///////////////////////////////
 	ImGui::SeparatorText("Denoising");
 
 	{
@@ -443,10 +408,6 @@ void ScreenSpaceGI::DrawSettings()
 		BUFFER_VIEWER_NODE(texIlCoCg[1], debugRescale)
 		BUFFER_VIEWER_NODE(texContactAo[0], debugRescale)
 		BUFFER_VIEWER_NODE(texContactAo[1], debugRescale)
-		BUFFER_VIEWER_NODE(texBentNormal[0], debugRescale)
-		BUFFER_VIEWER_NODE(texBentNormal[1], debugRescale)
-		BUFFER_VIEWER_NODE(texEnvIrradiance[0], debugRescale)
-		BUFFER_VIEWER_NODE(texEnvIrradiance[1], debugRescale)
 
 		ImGui::TreePop();
 	}
@@ -462,18 +423,6 @@ void ScreenSpaceGI::LoadSettings(json& o_json)
 void ScreenSpaceGI::SaveSettings(json& o_json)
 {
 	o_json = settings;
-}
-
-ScreenSpaceGI::SSGISharedData ScreenSpaceGI::GetCommonBufferData()
-{
-	// (directional env) The whole runtime state is folded into the one flag the shader tests:
-	// feature loaded, feature enabled, channel enabled. DeferredCompositeCS therefore needs no
-	// knowledge of SSGI's lifecycle, and a null bent-normal SRV can never be read -- the same
-	// pattern ScreenSpaceRayTracing::GetCommonBufferData uses for DiffuseMult.
-	SSGISharedData data{};
-	data.EnableDirectionalEnv = (loaded && settings.Enabled && settings.EnableDirectionalEnv) ? 1u : 0u;
-	data.EnvLevel = settings.EnvLevel;
-	return data;
 }
 
 void ScreenSpaceGI::SetupResources()
@@ -583,21 +532,6 @@ void ScreenSpaceGI::SetupResources()
 			texGiSpecular[1] = eastl::make_unique<Texture2D>(texDesc);
 			texGiSpecular[1]->CreateSRV(srvDesc);
 			texGiSpecular[1]->CreateUAV(uavDesc);
-
-			// (directional env v2) Environment irradiance pair. R16G16B16A16_FLOAT: RGB is a
-			// linear radiometric quantity (a UNORM format cannot carry it) and A is the
-			// coverage the RGB is premultiplied by; 16-bit float matches texIlY, whose chain
-			// and clamping discipline (SSGI_MAX_OUTPUT vs the 65504 half ceiling) this surface
-			// shares. Created unconditionally -- a few MB -- so a Dynamic Cubemaps hot-plug
-			// cannot meet a missing resource; the passes only touch it when the
-			// DYNAMIC_CUBEMAPS define was handed to the compile round.
-			texEnvIrradiance[0] = eastl::make_unique<Texture2D>(texDesc);
-			texEnvIrradiance[0]->CreateSRV(srvDesc);
-			texEnvIrradiance[0]->CreateUAV(uavDesc);
-
-			texEnvIrradiance[1] = eastl::make_unique<Texture2D>(texDesc);
-			texEnvIrradiance[1]->CreateSRV(srvDesc);
-			texEnvIrradiance[1]->CreateUAV(uavDesc);
 		}
 		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
 		{
@@ -640,21 +574,6 @@ void ScreenSpaceGI::SetupResources()
 			texContactAo[1] = eastl::make_unique<Texture2D>(texDesc);
 			texContactAo[1]->CreateSRV(srvDesc);
 			texContactAo[1]->CreateUAV(uavDesc);
-		}
-
-		// (directional env) Bent normal + aperture pair. R8G8B8A8_UNORM: the octahedral codec
-		// needs two [0, 1] channels, the aperture one more, and unorm storage format-bounds
-		// every channel so nothing downstream needs a finiteness test. 8-bit octahedral is
-		// ~0.5 degrees worst-case -- far below what a cubemap mip lookup can resolve.
-		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		{
-			texBentNormal[0] = eastl::make_unique<Texture2D>(texDesc);
-			texBentNormal[0]->CreateSRV(srvDesc);
-			texBentNormal[0]->CreateUAV(uavDesc);
-
-			texBentNormal[1] = eastl::make_unique<Texture2D>(texDesc);
-			texBentNormal[1]->CreateSRV(srvDesc);
-			texBentNormal[1]->CreateUAV(uavDesc);
 		}
 
 		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
@@ -769,16 +688,6 @@ void ScreenSpaceGI::CompileComputeShaders()
 		// source of more mistakes in this file than it has saved lines.
 		if (contactAo)
 			defines.push_back({ "CONTACT_AO", "" });
-		// (directional env v2) The environment integration in gi.cs.hlsl and the irradiance
-		// surface it feeds through radianceDisocc/blur/upsample exist iff the dynamic cubemap
-		// is there to sample; the skylighting split inside it exists iff the probe array is.
-		// Derived from `loaded`, same as the composite's and SSRT's own define lists, so every
-		// consumer of these surfaces agrees on the permutation by construction. Handed to the
-		// whole set for the same reason as CONTACT_AO above.
-		if (globals::features::dynamicCubemaps.loaded)
-			defines.push_back({ "DYNAMIC_CUBEMAPS", "" });
-		if (globals::features::skylighting.loaded)
-			defines.push_back({ "SKYLIGHTING", "" });
 		return defines;
 	};
 
@@ -934,13 +843,6 @@ void ScreenSpaceGI::DrawSSGI()
 		context->ClearUnorderedAccessViewFloat(texAo[outputAoIdx]->uav.get(), clr);
 		context->ClearUnorderedAccessViewFloat(texIlY[outputIlIdx]->uav.get(), clr);
 		context->ClearUnorderedAccessViewFloat(texIlCoCg[outputIlIdx]->uav.get(), clr);
-		// (directional env) Hygiene only: GetCommonBufferData zeroes EnableDirectionalEnv while
-		// the feature is off, so the composite never reads this -- but a cleared texture decodes
-		// to a well-defined direction either way.
-		context->ClearUnorderedAccessViewFloat(texBentNormal[outputIlIdx]->uav.get(), clr);
-		// (directional env v2) Zero is also the honest value here: confidence 0 means "no
-		// data", which the composite turns into the flat vanilla ambient.
-		context->ClearUnorderedAccessViewFloat(texEnvIrradiance[outputIlIdx]->uav.get(), clr);
 		return;
 	}
 
@@ -970,19 +872,8 @@ void ScreenSpaceGI::DrawSSGI()
 	};
 	auto internalRes = resChoices[settings.ResolutionMode];
 
-	// (directional env v2) 15 SRV slots: the GI pass tops out at t14 (irradiance history t10,
-	// cubemap pair t11/t12, skylighting pair t13/t14). 8 UAV slots: radianceDisocc tops out at
-	// u7 -- exactly the cs_5_0 limit, so any future output needs a repack, not a new slot.
-	std::array<ID3D11ShaderResourceView*, 15> srvs = { nullptr };
-	std::array<ID3D11UnorderedAccessView*, 8> uavs = { nullptr };
-
-	// (directional env v2) Whether the compile round carried DYNAMIC_CUBEMAPS/SKYLIGHTING --
-	// same `loaded` tests commonDefines used, so bindings and shader permutation cannot
-	// disagree. Bind nothing when a define was absent: the shaders then do not declare the
-	// registers at all.
-	auto& dynamicCubemapsFeat = globals::features::dynamicCubemaps;
-	auto& skylightingFeat = globals::features::skylighting;
-	const bool envIrradianceActive = dynamicCubemapsFeat.loaded;
+	std::array<ID3D11ShaderResourceView*, 11> srvs = { nullptr };
+	std::array<ID3D11UnorderedAccessView*, 6> uavs = { nullptr };
 	std::array<ID3D11SamplerState*, 2> samplers = { pointClampSampler.get(), linearClampSampler.get() };
 	auto cb = ssgiCB->CB();
 
@@ -1030,9 +921,7 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(7) = texIlY[inputGITexIdx]->srv.get();
 		srvs.at(8) = texIlCoCg[inputGITexIdx]->srv.get();
 		srvs.at(9) = texGiSpecular[inputAoTexIdx]->srv.get();
-		// (directional env) Last frame's bent-normal output; rides the IL chain's index, so its
-		// history lives wherever texIlY's does.
-		srvs.at(10) = texBentNormal[inputGITexIdx]->srv.get();
+		srvs.at(10) = nullptr;
 
 		uavs.at(0) = texRadiance->uav.get();
 		uavs.at(1) = texAccumFrames[!lastFrameAccumTexIdx]->uav.get();
@@ -1040,13 +929,6 @@ void ScreenSpaceGI::DrawSSGI()
 		uavs.at(3) = texIlY[!inputGITexIdx]->uav.get();
 		uavs.at(4) = texIlCoCg[!inputGITexIdx]->uav.get();
 		uavs.at(5) = texGiSpecular[!inputAoTexIdx]->uav.get();
-		uavs.at(6) = texBentNormal[!inputGITexIdx]->uav.get();
-
-		// (directional env v2) Irradiance history rides the IL index, like the bent pair.
-		if (envIrradianceActive) {
-			srvs.at(11) = texEnvIrradiance[inputGITexIdx]->srv.get();
-			uavs.at(7) = texEnvIrradiance[!inputGITexIdx]->uav.get();
-		}
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
@@ -1095,30 +977,12 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(6) = texIlY[inputGITexIdx]->srv.get();
 		srvs.at(7) = texIlCoCg[inputGITexIdx]->srv.get();
 		srvs.at(8) = texGiSpecular[inputAoTexIdx]->srv.get();
-		// (directional env) The reprojected bent history radianceDisocc just wrote.
-		srvs.at(9) = texBentNormal[inputGITexIdx]->srv.get();
 
 		uavs.at(0) = texAo[!inputAoTexIdx]->uav.get();
 		uavs.at(1) = texIlY[!inputGITexIdx]->uav.get();
 		uavs.at(2) = texIlCoCg[!inputGITexIdx]->uav.get();
 		uavs.at(3) = texGiSpecular[!inputAoTexIdx]->uav.get();
 		uavs.at(4) = texPrevGeo->uav.get();
-		uavs.at(5) = texBentNormal[!inputGITexIdx]->uav.get();
-
-		// (directional env v2) t10 = the reprojected irradiance history radianceDisocc just
-		// wrote; t11/t12 = the live cubemap pair (last capture round -- DrawSSGI runs before
-		// UpdateCubemap in DeferredPasses, the same one-frame latency SSRT's ray-march fallback
-		// accepts); t13/t14 = the skylighting probe array + its blue noise.
-		if (envIrradianceActive) {
-			srvs.at(10) = texEnvIrradiance[inputGITexIdx]->srv.get();
-			srvs.at(11) = dynamicCubemapsFeat.envTexture->srv.get();
-			srvs.at(12) = dynamicCubemapsFeat.envReflectionsTexture->srv.get();
-			if (skylightingFeat.loaded) {
-				srvs.at(13) = skylightingFeat.texProbeArray->srv.get();
-				srvs.at(14) = skylightingFeat.stbn_vec3_2Dx1D_128x128x64.get();
-			}
-			uavs.at(6) = texEnvIrradiance[!inputGITexIdx]->uav.get();
-		}
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
@@ -1141,22 +1005,10 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(2) = texAccumFrames[lastFrameAccumTexIdx]->srv.get();
 		srvs.at(3) = texIlY[inputGITexIdx]->srv.get();
 		srvs.at(4) = texIlCoCg[inputGITexIdx]->srv.get();
-		// (directional env) The bent pair ping-pongs with the IL pair, so the blur must carry it
-		// (filtered, in the decoded vector domain -- see blur.cs.hlsl) or the chain would read a
-		// stale slot after the flip below.
-		srvs.at(5) = texBentNormal[inputGITexIdx]->srv.get();
 
 		uavs.at(0) = texAccumFrames[!lastFrameAccumTexIdx]->uav.get();
 		uavs.at(1) = texIlY[!inputGITexIdx]->uav.get();
 		uavs.at(2) = texIlCoCg[!inputGITexIdx]->uav.get();
-		uavs.at(3) = texBentNormal[!inputGITexIdx]->uav.get();
-
-		// (directional env v2) Same ping-pong obligation as the bent pair: it rides the IL
-		// index, so the blur must carry it or the chain reads a stale slot after the flip.
-		if (envIrradianceActive) {
-			srvs.at(6) = texEnvIrradiance[inputGITexIdx]->srv.get();
-			uavs.at(4) = texEnvIrradiance[!inputGITexIdx]->uav.get();
-		}
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
@@ -1230,18 +1082,11 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(4) = texGiSpecular[inputAoTexIdx]->srv.get();
 		if (contactAoActive)
 			srvs.at(5) = texContactAo[contactIdx]->srv.get();
-		srvs.at(6) = texBentNormal[inputGITexIdx]->srv.get();
 
 		uavs.at(0) = texAo[!inputAoTexIdx]->uav.get();
 		uavs.at(1) = texIlY[!inputGITexIdx]->uav.get();
 		uavs.at(2) = texIlCoCg[!inputGITexIdx]->uav.get();
 		uavs.at(3) = texGiSpecular[!inputAoTexIdx]->uav.get();
-		uavs.at(4) = texBentNormal[!inputGITexIdx]->uav.get();
-
-		if (envIrradianceActive) {
-			srvs.at(7) = texEnvIrradiance[inputGITexIdx]->srv.get();
-			uavs.at(5) = texEnvIrradiance[!inputGITexIdx]->uav.get();
-		}
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
