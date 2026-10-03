@@ -164,7 +164,7 @@ namespace Util
 		writeSlot = (writeSlot + 1) % kFramesInFlight;
 	}
 
-	int DenoiserTimers::Begin(std::string_view a_group, std::string_view a_pass, uint32_t a_groupsX, uint32_t a_groupsY, uint32_t a_threadsX, uint32_t a_threadsY)
+	int DenoiserTimers::Begin(std::string_view a_group, std::string_view a_pass, uint32_t a_groupsX, uint32_t a_groupsY, uint32_t a_threadsX, uint32_t a_threadsY, bool a_merge)
 	{
 		if (!frameActive)
 			return -1;
@@ -177,7 +177,7 @@ namespace Util
 		std::string occKey;
 		occKey.reserve(a_group.size() + a_pass.size() + 1);
 		occKey.append(a_group).append("|").append(a_pass);
-		const int occurrence = occurrences[occKey]++;
+		const int occurrence = a_merge ? 0 : occurrences[occKey]++;
 
 		const int row = FindOrAddRow(a_group, a_pass, occurrence);
 		auto& r = rows[row];

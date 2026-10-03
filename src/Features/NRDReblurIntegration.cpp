@@ -323,9 +323,15 @@ bool NRDReblurIntegration::Dispatch()
 				std::string_view passName = dispatch.name ? std::string_view(dispatch.name) : std::string_view("?");
 				if (const auto sep = passName.rfind("::"); sep != std::string_view::npos)
 					passName.remove_prefix(sep + 2);
+				// (batch 36f) NRD's "Clear (f)" / "Clear (ui)" dispatches run once per history surface,
+				// and only on a reset. Numbered one row per call they took dozens of rows that read "-"
+				// every other frame; one row per instance, with the call count, says the same thing.
+				const bool oneTimeClear = passName.starts_with("Clear");
+				if (oneTimeClear)
+					passName = "One-time clears";
 				const auto& groupSize = m_pipelineGroupSize[dispatch.pipelineIndex];
 				timingToken = denoiserTimers->Begin(m_timingGroup, passName, dispatch.gridWidth, dispatch.gridHeight,
-					dispatch.gridWidth * groupSize[0], dispatch.gridHeight * groupSize[1]);
+					dispatch.gridWidth * groupSize[0], dispatch.gridHeight * groupSize[1], oneTimeClear);
 			}
 			context->Dispatch(dispatch.gridWidth, dispatch.gridHeight, 1);
 			denoiserTimers->End(timingToken);

@@ -21,6 +21,7 @@
 #include "Feature.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTestAggregator.h"
 #include "Features/GrassOptimizations.h"
+#include "Features/NRD.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Features/Upscaling.h"
 #include "Globals.h"
@@ -3223,6 +3224,11 @@ void PerformanceOverlay::UpdateViews(double a_now, const DrawCallRowSets& a_rowS
 				row.group = r.group;
 				row.label = r.group + ": " + r.pass;
 				row.tooltip = DenoiserPassTooltip(r.group, r.pass);
+				if (r.pass == "One-time clears")
+					row.tooltip = std::format(
+						"NRD clearing its history surfaces, all in one row ({} dispatches the last time). Runs only when REBLUR "
+						"restarts (first frame, a settings change, a load), so it normally shows \"-\".",
+						r.lastCalls);
 				row.groupsX = r.groupsX;
 				row.groupsY = r.groupsY;
 				row.threadsX = r.threadsX;
@@ -3261,11 +3267,20 @@ void PerformanceOverlay::UpdateViews(double a_now, const DrawCallRowSets& a_rowS
 
 		if (globals::state) {
 			const float2 output = globals::state->screenSize;
-			const float2 render = Util::ConvertToDynamic(output);
+			// (batch 36f) The overlay is drawn after the upscaler, where the dynamic-resolution lock
+			// is set and ConvertToDynamic returns the output size unchanged -- which is why this used
+			// to read 3840x2160 under DLSS Quality. Prefer the rectangle NRD was actually given this
+			// frame; otherwise ask for the ratio past the lock.
+			const float2 render = Util::ConvertToDynamic(output, true);
 			view.outputWidth = static_cast<uint32_t>(output.x);
 			view.outputHeight = static_cast<uint32_t>(output.y);
 			view.renderWidth = static_cast<uint32_t>(std::floor(render.x));
 			view.renderHeight = static_cast<uint32_t>(std::floor(render.y));
+			const auto& nrd = globals::features::nrd;
+			if (nrd.loaded && nrd.hasCommonFrameHistory && nrd.prevRectSize[0] > 0 && nrd.prevRectSize[1] > 0) {
+				view.renderWidth = nrd.prevRectSize[0];
+				view.renderHeight = nrd.prevRectSize[1];
+			}
 		}
 	}
 

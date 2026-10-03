@@ -51,7 +51,9 @@ namespace Util
 		 * @param a_threadsX Threads covered in X = groups x group size (or the copy's width).
 		 * @param a_threadsY Threads covered in Y.
 		 */
-		int Begin(std::string_view a_group, std::string_view a_pass, uint32_t a_groupsX, uint32_t a_groupsY, uint32_t a_threadsX, uint32_t a_threadsY);
+		/// @param a_merge   (batch 36f) Fold every call with this name in a frame into one row (its
+		///                 call count is Row::lastCalls) instead of numbering repeats "#2", "#3"...
+		int Begin(std::string_view a_group, std::string_view a_pass, uint32_t a_groupsX, uint32_t a_groupsY, uint32_t a_threadsX, uint32_t a_threadsY, bool a_merge = false);
 		void End(int a_token);
 
 		/// @brief True while scopes are being recorded this frame (cheap check for call sites).
