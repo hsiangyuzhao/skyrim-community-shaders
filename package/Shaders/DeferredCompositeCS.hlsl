@@ -98,6 +98,31 @@ Texture2D<float4> SSRTexture : register(t16);
 // construction and needs no finiteness test of its own; the write side is covered by the
 // G2 sanitisation the ray march already applies to the channel it comes from.
 Texture2D<float> SSRTConfidenceTexture : register(t19);
+// (batch 36f) kPOST_ZPREPASS_COPY: the depth the SSRT ray march and NRD's viewZ guide are built
+// from, bound so the distance limit below classifies a pixel exactly as they do. t4 above can be
+// Terrain Blending's 16-bit depth, which is too coarse at distance for that.
+Texture2D<float> SSRTDepthTexture : register(t20);
+#	include "NRD/NRDReblurSH.hlsli"
+
+// (batch 36f) Written by ScreenSpaceRayTracing right before this dispatch, i.e. *after* the
+// specular chain has run -- which is what makes it possible to tell this shader whether t16 holds
+// REBLUR's packed output this frame (fold) or linear radiance (separate unpack pass, SVGF, Off, or
+// a REBLUR fallback). SharedData is uploaded long before the chain runs, so it cannot carry that.
+cbuffer SSRTCompositeCB : register(b1)
+{
+	uint SSRTSpecularPacked;  // t16 is REBLUR's YCoCg layout: unpack it here
+	uint SSRTSpecularCap;     // distance limit active on the specular chain
+	float SSRTCapStart;       // fade start, NRD viewZ units (game units)
+	float SSRTCapEnd;         // limit; at or beyond it the cubemap is used alone
+};
+
+// Same expression as SSRT_NRDViewZ (ssrt_common.hlsli) / prepareNRDGuides.cs.hlsl.
+float SSRTCompositeViewZ(float screenDepth)
+{
+	if (screenDepth >= 1.0 - 1e-6 || screenDepth <= 0.0)
+		return 3.402823466e+38;
+	return (SharedData::CameraData.w / (-screenDepth * SharedData::CameraData.z + SharedData::CameraData.x));
+}
 #endif
 
 // The ambient separation further down has two consumers, and only one of them is SSGI:
@@ -493,8 +518,28 @@ Texture2D<float> SSRTConfidenceTexture : register(t19);
 
 #	if defined(SSRT)
 		if (SharedData::ssrtSettings.EnableSpecular) {
-			float4 ssrIrradiance = SSRTexture[dispatchID.xy];
-			finalIrradiance = any(ssrIrradiance.rgb > 0) ? ssrIrradiance.rgb : finalIrradiance;
+			// (batch 36f) Distance limit: 1 = full SSR, 0 = cubemap only, smooth in between. At or
+			// past the limit t16 is not read at all (nothing was traced there and REBLUR left the
+			// texel unwritten).
+			float ssrWeight = 1.0;
+			[branch] if (SSRTSpecularCap != 0) {
+				const float ssrViewZ = SSRTCompositeViewZ(SSRTDepthTexture[dispatchID.xy]);
+				const float t = saturate((ssrViewZ - SSRTCapStart) / max(SSRTCapEnd - SSRTCapStart, 1e-3));
+				ssrWeight = ssrViewZ >= SSRTCapEnd ? 0.0 : 1.0 - t * t * (3.0 - 2.0 * t);
+			}
+			[branch] if (ssrWeight > 0.0) {
+				float4 ssrIrradiance = SSRTexture[dispatchID.xy];
+				// (batch 36f) Folded unpack: exactly ssrt_nrd_unpack.hlsl plus the RGBA16F
+				// store+load it ended with, so the value is bit-identical to the separate pass.
+				[branch] if (SSRTSpecularPacked != 0) {
+					float3 unpackedRadiance;
+					float unpackedNormHitDist;
+					REBLUR_BackEnd_UnpackRadianceAndNormHitDist(ssrIrradiance, unpackedRadiance, unpackedNormHitDist);
+					ssrIrradiance.rgb = float3(f16tof32(f32tof16(unpackedRadiance.x)), f16tof32(f32tof16(unpackedRadiance.y)), f16tof32(f32tof16(unpackedRadiance.z)));
+				}
+				if (any(ssrIrradiance.rgb > 0))
+					finalIrradiance = ssrWeight < 1.0 ? lerp(finalIrradiance, ssrIrradiance.rgb, ssrWeight) : ssrIrradiance.rgb;
+			}
 		}
 #	endif
 

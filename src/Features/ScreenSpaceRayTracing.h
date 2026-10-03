@@ -2,6 +2,7 @@
 #define ENABLE_SHARC
 
 #include "NRD.h"
+#include "Utils/Batch36f.h"
 
 struct ScreenSpaceRayTracing : Feature
 {
@@ -458,6 +459,30 @@ struct ScreenSpaceRayTracing : Feature
         /// estimation, not to blur the signal (the second flag).
         float SpecularPrepassBlurRadius = 50.0f;
         bool UsePrepassOnlyForSpecularMotionEstimation = true;
+        /// @brief (batch 36f, item 1) Skip REBLUR's specular pre-pass: the specular instance
+        /// gets specularPrepassBlurRadius 0, so NRD drops the PrePass dispatch altogether (its
+        /// skipPrePass test in Reblur.cpp). Off = the two settings above, i.e. batch 34/36e.
+        /// The pre-pass was configured for motion estimation only, and the reflection signal fed
+        /// to it is already low-noise. Governed by the Batch 36f master switch.
+        bool ReblurSkipSpecularPrepass = true;
+        /// @brief (batch 36f, item 4) Leave REBLUR's output packed and let the two composites
+        /// (ssrt_diffuse_composite.hlsl for diffuse, DeferredCompositeCS.hlsl for specular)
+        /// decode it in registers, instead of running ssrt_nrd_unpack.hlsl once per chain. The
+        /// decode includes the RGBA16F round trip the unpack pass's store did, so the picture is
+        /// bit-identical. Governed by the Batch 36f master switch.
+        bool ReblurFoldUnpack = true;
+        /// @brief (batch 36f, item 2) Distance limit: pixels farther than DistanceLimitMeters are
+        /// neither traced nor denoised (NRD denoisingRange), and keep the game's own lighting --
+        /// vanilla ambient for diffuse (confidence 0 under ambient reinjection), the cubemap for
+        /// reflections. The last 20% of the range fades smoothly. Diffuse needs Ambient
+        /// Reinjection on (without it there is no vanilla ambient left to fall back to), so it is
+        /// limited only then; reflections are limited either way. Default off; governed by the
+        /// Batch 36f master switch.
+        bool DistanceLimit = false;
+        /// @brief Default 150 m (~10500 game units): about the radius of the loaded cells at
+        /// uGridsToLoad = 5 (2.5 cells x 4096 units x 1.428 cm). Beyond it is LOD terrain, where
+        /// screen-space rays find little and the vanilla ambient is already the right answer.
+        float DistanceLimitMeters = 150.0f;
         /// @brief (batch 1, item 1) Run ssrt_preblur.hlsl -- anti-firefly plus a 3x3
         /// geometry-guided spatial filter -- on the diffuse ray-march output *before* the
         /// temporal accumulation reads it.
@@ -997,12 +1022,27 @@ struct ScreenSpaceRayTracing : Feature
         /// the pixel keeps whatever the cubemap fallback gives it. Claims one of row 4's three
         /// spare floats, so the struct does not grow and the size assertion below still holds.
         float SpecularMaxRoughness = 1.0f;
-        float ssrtPad4[2] = {};
+        /// @brief (batch 36f) Distance limit in NRD viewZ units (game units): fade start and
+        /// limit. DistanceCapEnd == 0 means off on this chain. Takes row 4's last two spare
+        /// floats, so the struct does not grow.
+        float DistanceCapStart = 0.0f;
+        float DistanceCapEnd = 0.0f;
     };
     static_assert(sizeof(SSRTCB) == 80,
         "ScreenSpaceRayTracing::SSRTCB must stay whole 16-byte constant buffer rows; "
-        "ssrt_raymarch.hlsl mirrors these offsets up to NRDFrontEndPack and must move with "
-        "them; ssrt_diffuse_composite.hlsl mirrors the first three rows.");
+        "ssrt_raymarch.hlsl and ssrt_diffuse_composite.hlsl mirror all five rows.");
+
+    /// @brief (batch 36f) DeferredCompositeCS's `SSRTCompositeCB` at b1. Written by
+    /// BindCompositeConstants right before that dispatch, after the specular chain has run, so it
+    /// can say what t16 actually holds this frame.
+    struct alignas(16) CompositeCB
+    {
+        uint SpecularPacked = 0;
+        uint SpecularCap = 0;
+        float CapStart = 0.0f;
+        float CapEnd = 0.0f;
+    };
+    static_assert(sizeof(CompositeCB) == 16);
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
@@ -1081,6 +1121,10 @@ struct ScreenSpaceRayTracing : Feature
 
     eastl::unique_ptr<ConstantBuffer> ssrtCB;
     eastl::unique_ptr<ConstantBuffer> denoiserCB;
+    // (batch 36f) DeferredCompositeCS b1, and what DrawSSRTSpecular left at t16 this frame.
+    eastl::unique_ptr<ConstantBuffer> compositeCB;
+    ID3D11ShaderResourceView* specularCompositeSRV = nullptr;
+    bool specularCompositePacked = false;
 
     bool recompileFlag = false;
 
@@ -1383,7 +1427,31 @@ struct ScreenSpaceRayTracing : Feature
     /// — and the chain's REBLUR reset stays pending. (S1.2: the old void signature let a
     /// skipped dispatch clear the reset flag and unpack whatever the output surface
     /// happened to hold, which on the first frame is uninitialised RGBA16F.)
-    [[nodiscard]] bool RunReblur(bool a_specular);
+    /// (batch 36f) a_skipUnpack: leave the result packed (texNRDPackOutput on success,
+    /// texNRDPackInput on failure) for the caller's composite to decode; see
+    /// Settings::ReblurFoldUnpack.
+    [[nodiscard]] bool RunReblur(bool a_specular, bool a_skipUnpack = false);
+
+    /// @brief (batch 36f) Effective switches: own setting AND the Batch 36f master switch.
+    [[nodiscard]] bool SkipSpecularPrepassActive() const { return Batch36f::IsOn() && settings.ReblurSkipSpecularPrepass; }
+    [[nodiscard]] bool FoldUnpackActive() const { return Batch36f::IsOn() && settings.ReblurFoldUnpack; }
+    [[nodiscard]] bool DistanceLimitActive() const { return Batch36f::IsOn() && settings.DistanceLimit; }
+    /// @brief (batch 36f) Whether the distance limit applies to this chain this frame. Diffuse
+    /// needs ambient reinjection: without it the forward ambient is gone (AmbientMult) and a
+    /// pixel past the limit would have no ambient at all.
+    [[nodiscard]] bool DistanceLimitOnChain(bool a_specular) const
+    {
+        return DistanceLimitActive() && (a_specular || settings.EnableAmbientReinjection);
+    }
+    /// @brief (batch 36f) The limit in NRD viewZ units (game units).
+    [[nodiscard]] float DistanceLimitUnits() const { return settings.DistanceLimitMeters / Util::Units::GAME_UNIT_TO_M; }
+
+    /// @brief (batch 36f) For Deferred.cpp: what the deferred composite reads at t16 this frame
+    /// (texSSRColor, or REBLUR's packed surface under the folded unpack).
+    [[nodiscard]] ID3D11ShaderResourceView* GetSpecularCompositeSRV() const;
+    /// @brief (batch 36f) Updates and binds DeferredCompositeCS's b1 (CompositeCB). Call
+    /// right before that dispatch; Deferred.cpp unbinds b1 afterwards.
+    void BindCompositeConstants();
     /// @brief Snapshots the normal-roughness G-buffer into texHistoryNormals, and (defect
     /// D3, when SVGF is on) mip 0 of the Hi-Z pyramid into texHistoryDepth, for next frame's
     /// SVGF temporal validation. Called exactly once per frame, by whichever of the two draw
@@ -1743,6 +1811,9 @@ struct ScreenSpaceRayTracing : Feature
     /// the colour composite with the confidence smoothing, its LDS tile and its barrier compiled
     /// away, for use when the three-pass filter below publishes that surface instead.
     winrt::com_ptr<ID3D11ComputeShader> diffuseCompositeExternalConfCS = nullptr;
+    // (batch 36f) SSRT_DIFFUSE_PACKED_INPUT twins of the two composites above (folded unpack).
+    winrt::com_ptr<ID3D11ComputeShader> diffuseCompositePackedCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> diffuseCompositeExternalConfPackedCS = nullptr;
     /// @brief (batch 6) The spatial confidence filter: 2x2 depth- and normal-aware downsample,
     /// two 15-tap separable joint-bilateral blurs at quarter resolution, joint-bilateral upsample.
     /// The two blur entries are the horizontal and vertical permutations of one file.

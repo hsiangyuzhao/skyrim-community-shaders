@@ -286,10 +286,28 @@ void NRD::PrepareGuides()
 
 	// Motion Vector is used as both SRV and UAV by ReBLUR; snapshot the game's
 	// MV target so we can rebind it through NRD's UAV slot without aliasing.
+	//
+	// (batch 36f, item 3) Only the render rectangle is copied. REBLUR reads IN_MV at
+	// WithRectOrigin(pixelPos) for pixels inside rectSize only (TemporalAccumulation returns
+	// before the read for anything outside it), and rectSize is exactly floor(dynres) below, so
+	// nothing outside the box is ever read: the picture cannot change. One texel of margin, as
+	// ScreenSpaceRayTracing::CopyDynamicRegion uses, then clamped to the allocation, so a ratio of
+	// 1.0 is the whole surface. Under DLSS Quality at 4K that is 2561x1441 of 3840x2160 (44%).
+	// With the Batch 36f master switch off: the full-resource copy of 36e.
 	{
+		const UINT fullW = texNRDMV->desc.Width;
+		const UINT fullH = texNRDMV->desc.Height;
+		const bool rectCopy = Batch36f::IsOn();
+		const UINT copyW = rectCopy ? std::min(fullW, (UINT)std::max(dynres.x, 1.0f) + 1u) : fullW;
+		const UINT copyH = rectCopy ? std::min(fullH, (UINT)std::max(dynres.y, 1.0f) + 1u) : fullH;
 		// A copy has no thread groups; the coverage column shows the copied extent instead.
-		Util::DenoiserTimerScope timing("Guides", "Motion vector copy", 0, 0, texNRDMV->desc.Width, texNRDMV->desc.Height);
-		context->CopyResource(texNRDMV->resource.get(), motion.texture);
+		Util::DenoiserTimerScope timing("Guides", "Motion vector copy", 0, 0, copyW, copyH);
+		if (rectCopy) {
+			const D3D11_BOX box{ 0, 0, 0, copyW, copyH, 1 };
+			context->CopySubresourceRegion(texNRDMV->resource.get(), 0, 0, 0, 0, motion.texture, 0, &box);
+		} else {
+			context->CopyResource(texNRDMV->resource.get(), motion.texture);
+		}
 	}
 
 	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::NRDGuides);

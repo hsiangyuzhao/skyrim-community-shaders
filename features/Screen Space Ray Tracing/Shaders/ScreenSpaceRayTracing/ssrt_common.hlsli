@@ -585,3 +585,39 @@ bool SSRT_SparseCheckerIsTraced(uint2 pixel)
 {
 	return (pixel.x & 1u) == ((pixel.y + SSRT_SparseCheckerPhase()) & 1u);
 }
+
+// ============================================================================================
+// (batch 36f) Shared by the ray march and the diffuse composite. The first two moved here
+// unchanged from ssrt_raymarch.hlsl.
+
+// What an R16G16B16A16_FLOAT store followed by a load does to a value. FLOAT -> FLOAT16 is IEEE
+// half with round-to-nearest-even, and the f32tof16 / f16tof32 intrinsic pair is that same
+// conversion. The ray march has relied on this since batch 11 (REBLUR front-end packing); the
+// folded unpack in ssrt_diffuse_composite.hlsl and DeferredCompositeCS.hlsl relies on it to stay
+// bit-identical to the separate unpack pass, which stored its result in an RGBA16F surface.
+float3 SSRT_Fp16RoundTrip3(float3 v)
+{
+	return float3(f16tof32(f32tof16(v.x)), f16tof32(f32tof16(v.y)), f16tof32(f32tof16(v.z)));
+}
+
+// Verbatim from ssrt_nrd_pack.hlsl's ScreenToViewDepth (= prepareNRDGuides.cs.hlsl's), including
+// the sentinel: sky and far plane resolve to a viewZ far outside NRD's denoisingRange, so REBLUR
+// treats the pixel as "no surface". Deliberately *not* expressed through view_space_ray.z, which
+// is a different construction (Hi-Z mip 0 through CameraProjInverse) and would not reproduce the
+// same bits. The distance limit tests this value, so "beyond the limit" here and NRD's own
+// "viewZ > denoisingRange" are the same expression of the same depth texel.
+float SSRT_NRDViewZ(float screenDepth)
+{
+	if (screenDepth >= 1.0 - 1e-6 || screenDepth <= 0.0)
+		return 3.402823466e+38;
+	return (SharedData::CameraData.w / (-screenDepth * SharedData::CameraData.z + SharedData::CameraData.x));
+}
+
+// Distance limit fade weight: 1 up to a_start, 0 from a_end on, smoothstep in between (no hard
+// edge). A sky pixel's 3.4e38 viewZ gives a large finite ratio that saturates to 0 like any other
+// distant pixel.
+float SSRT_DistanceFade(float a_viewZ, float a_start, float a_end)
+{
+	const float t = saturate((a_viewZ - a_start) / max(a_end - a_start, 1e-3f));
+	return 1.0f - t * t * (3.0f - 2.0f * t);
+}

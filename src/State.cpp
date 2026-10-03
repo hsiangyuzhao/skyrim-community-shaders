@@ -17,6 +17,7 @@
 #include "SettingsOverrideManager.h"
 #include "ShaderCache.h"
 #include "TruePBR.h"
+#include "Utils/Batch36f.h"
 #include "Utils/FileSystem.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
@@ -341,6 +342,8 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				shaderCache->SetFileWatcher(advanced["Use FileWatcher"]);
 			if (advanced["Frame Annotations"].is_boolean())
 				frameAnnotations = advanced["Frame Annotations"];
+			if (advanced.contains("Batch 36f"))
+				Batch36f::Load(advanced["Batch 36f"]);
 		}
 
 		if (settings["General"].is_object()) {
@@ -483,6 +486,7 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Background Compiler Threads"] = shaderCache->backgroundCompilationThreadCount;
 	advanced["Use FileWatcher"] = shaderCache->UseFileWatcher();
 	advanced["Frame Annotations"] = frameAnnotations;
+	advanced["Batch 36f"] = Batch36f::Save();
 	settings["Advanced"] = advanced;
 
 	json general;

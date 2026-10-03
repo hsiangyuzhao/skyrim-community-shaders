@@ -589,7 +589,7 @@ void Deferred::DeferredPasses()
 			ibl.loaded ? ibl.diffuseSkyIBLTexture->srv.get() : nullptr,
 			// (audit P6) Bind the specular result directly; texOutput was a redundant
 			// full-screen copy of it made at the end of DrawSSRTSpecular.
-			(ssrt.loaded && ssrt.settings.EnableSpecular) ? ssrt.texSSRColor->srv.get() : nullptr,
+			(ssrt.loaded && ssrt.settings.EnableSpecular) ? ssrt.GetSpecularCompositeSRV() : nullptr,
 			physSky.loaded ? physSky.texApLut->srv.get() : nullptr,
 			physSky.loaded ? physSky.texApShadow->srv.get() : nullptr,
 			// t19 (ambient reinjection) Smoothed SSRT diffuse hit confidence. Written by
@@ -599,6 +599,8 @@ void Deferred::DeferredPasses()
 			// GetCommonBufferData clears when EnableDiffuse is off, so a null binding here can
 			// never be read.
 			(ssrt.loaded && ssrt.settings.EnableDiffuse) ? ssrt.texSSRTDiffuseConfidenceSmooth->srv.get() : nullptr,
+			// t20 (batch 36f) kPOST_ZPREPASS_COPY, the depth SSRT and NRD classify the distance limit by.
+			ssrt.loaded ? renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].depthSRV : nullptr,
 		};
 
 		ID3D11SamplerState* samplers[]{
@@ -612,6 +614,10 @@ void Deferred::DeferredPasses()
 		ID3D11UnorderedAccessView* uavs[3]{ main.UAV, normals.UAV, motionVectors.UAV };
 		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
 
+		// (batch 36f) b1: what t16 holds this frame (folded unpack) and the distance limit.
+		if (ssrt.loaded)
+			ssrt.BindCompositeConstants();
+
 		auto shader = interior ? GetComputeMainCompositeInterior() : GetComputeMainComposite();
 		context->CSSetShader(shader, nullptr, 0);
 
@@ -620,7 +626,7 @@ void Deferred::DeferredPasses()
 
 	// Clear
 	{
-		ID3D11ShaderResourceView* views[20]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+		ID3D11ShaderResourceView* views[21]{};
 		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
 
 		ID3D11UnorderedAccessView* uavs[3]{ nullptr, nullptr, nullptr };
@@ -628,6 +634,7 @@ void Deferred::DeferredPasses()
 
 		ID3D11Buffer* buffers[1] = { nullptr };
 		context->CSSetConstantBuffers(12, 1, buffers);
+		context->CSSetConstantBuffers(1, 1, buffers);  // (batch 36f) SSRT composite constants
 
 		ID3D11SamplerState* samplers[2]{ nullptr, nullptr };
 		context->CSSetSamplers(0, ARRAYSIZE(samplers), samplers);

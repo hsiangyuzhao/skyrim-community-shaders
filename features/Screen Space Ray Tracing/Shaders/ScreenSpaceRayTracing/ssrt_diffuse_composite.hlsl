@@ -5,10 +5,23 @@
 // strips them, so the compiled binding table is unchanged.
 #include "ScreenSpaceRayTracing/ssrt_common.hlsli"
 
+// (batch 36f) SSRT_DIFFUSE_PACKED_INPUT: t0 is REBLUR's OUT_DIFF_RADIANCE_HITDIST surface (YCoCg
+// radiance + normalized hit distance) -- or its IN_ twin if the REBLUR dispatch did not complete --
+// instead of the linear radiance ssrt_nrd_unpack.hlsl used to write into texSSRTDiffuseColor. The
+// decode below is that pass's body plus the RGBA16F store/load it did (SSRT_Fp16RoundTrip3), so
+// the result is bit-identical and one full-screen read+write pass is gone.
+#ifdef SSRT_DIFFUSE_PACKED_INPUT
+#	include "NRD/NRDReblurSH.hlsli"
+#endif
+
 Texture2D<float4> SSRTDiffuseTexture : register(t0);
 Texture2D<float4> AlbedoTexture : register(t1);
 
 RWTexture2D<float4> ColorTextureRW : register(u0);
+
+// Depth (kPOST_ZPREPASS_COPY). The confidence smoothing below uses it as its edge stop, and (batch
+// 36f) the distance limit uses it on every permutation, so it is declared outside the #ifndef.
+Texture2D<float> DepthTexture : register(t4);
 
 // (batch 6) SSRT_CONF_EXTERNAL_FILTER strips this pass back to the colour composite alone.
 // The confidence smoothing has moved out into its own three-pass chain -- quarter-resolution
@@ -25,7 +38,6 @@ RWTexture2D<float4> ColorTextureRW : register(u0);
 // (ambient reinjection) Raw per-pixel hit confidence straight from the ray march, and the
 // depth buffer the smoothing below uses as its edge stop.
 Texture2D<float> SSRTConfidenceTexture : register(t3);
-Texture2D<float> DepthTexture : register(t4);
 // (reinjection noise) The confidence accumulator's read ends. Bound only when
 // TemporalAmbientConfidence is set; an unbound SRV reads zero, which the validity test below
 // rejects as "no history", so a stale binding cannot leak into the result.
@@ -41,14 +53,11 @@ RWTexture2D<float> SSRTConfidenceSmoothRW : register(u1);
 RWTexture2D<float4> ConfidenceHistoryRW : register(u2);
 #endif
 
-#ifndef SSRT_CONF_EXTERNAL_FILTER
-// (reinjection noise) Mirrors ScreenSpaceRayTracing::SSRTCB. Only the last two members are read
-// here; the eight before them are declared because a constant buffer cannot be entered at an
-// offset. ssrt_raymarch.hlsl declares the same buffer and is the other consumer, so the two
-// declarations must stay in lockstep with the C++ struct.
-// (batch 8) That struct now carries a fourth row, CubemapFillBlend, which only the ray march
-// reads. Declaring the first three rows here stays legal -- a shader may declare a prefix of a
-// larger constant buffer -- and none of the offsets above moved.
+// (reinjection noise) Mirrors ScreenSpaceRayTracing::SSRTCB. ssrt_raymarch.hlsl declares the same
+// buffer and is the other consumer, so the two declarations must stay in lockstep with the C++
+// struct; members this file does not read are declared only to reach the ones it does.
+// (batch 36f) Declared on every permutation now, and through row 4, because the distance limit
+// (DistanceCapEnd) is read by the external-filter permutation too.
 cbuffer SSRTCB : register(b1)
 {
     uint MaxSteps;
@@ -66,8 +75,18 @@ cbuffer SSRTCB : register(b1)
     uint TemporalAmbientConfidence;
     // 1 / (AmbientConfidenceMaxFrames + 1): the floor on the accumulator's blend weight.
     float AmbientConfidenceInvMaxFrames;
+    // --- row 3 ---
+    float CubemapFillBlend;
+    float NRDHitDistA;
+    float NRDHitDistB;
+    float NRDHitDistC;
+    // --- row 4 ---
+    uint NRDFrontEndPack;
+    float SpecularMaxRoughness;
+    // (batch 36f) See ssrt_raymarch.hlsl. 0 = distance limit off on this chain.
+    float DistanceCapStart;
+    float DistanceCapEnd;
 }
-#endif
 
 #ifndef SSRT_CONF_EXTERNAL_FILTER
 // (ambient reinjection) Why the confidence has to be smoothed before anything lerps with it.
@@ -334,6 +353,25 @@ groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
 #endif
 
     float4 ssrtDiffuse = SSRTDiffuseTexture[dispatchID.xy];
+#ifdef SSRT_DIFFUSE_PACKED_INPUT
+    {
+        // Exactly ssrt_nrd_unpack.hlsl, then the RGBA16F store+load it ended with.
+        float3 unpackedRadiance;
+        float unpackedNormHitDist;
+        REBLUR_BackEnd_UnpackRadianceAndNormHitDist(ssrtDiffuse, unpackedRadiance, unpackedNormHitDist);
+        ssrtDiffuse = float4(SSRT_Fp16RoundTrip3(unpackedRadiance), unpackedNormHitDist);
+    }
+#endif
+    // (batch 36f) Distance limit. Past DistanceCapEnd nothing was traced and REBLUR (whose
+    // denoisingRange the C++ side sets just above DistanceCapEnd) left its output there untouched,
+    // i.e. stale or uninitialised. Such a pixel adds nothing: its confidence is 0, so
+    // DeferredCompositeCS keeps the full vanilla ambient there. A select, not a multiply, so a NaN
+    // in an unwritten texel cannot leak through. Inside the limit the ray march has already faded
+    // radiance and confidence together, so nothing else is needed here.
+    [branch] if (DistanceCapEnd > 0.0f) {
+        if (SSRT_NRDViewZ(DepthTexture[dispatchID.xy]) >= DistanceCapEnd)
+            ssrtDiffuse = 0.0f;
+    }
     // (guard G9) The last gate in the chain, and the one that decides whether an SSRT
     // failure is a local artefact or a global one. ColorTextureRW is kMAIN: whatever is
     // written here is what the upscaler, the bloom chain and the tonemapper consume, and

@@ -8,6 +8,8 @@
 
 #include "FeatureIssues.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
+#include "Features/NRD.h"
+#include "Features/ScreenSpaceRayTracing.h"
 #include "Fonts.h"
 #include "Globals.h"
 #include "Menu.h"
@@ -15,6 +17,7 @@
 #include "State.h"
 #include "TruePBR.h"
 #include "Util.h"
+#include "Utils/Batch36f.h"
 #include "Utils/Format.h"
 #include "Utils/UI.h"
 
@@ -24,6 +27,15 @@ void AdvancedSettingsRenderer::RenderAdvancedSettings(
 {
 	// Use TabBar system - tabs sorted alphabetically
 	if (ImGui::BeginTabBar("##AdvancedSettingsTabs", ImGuiTabBarFlags_None)) {
+		// Batch 36f Tab (first, so the A/B master switch is one click from the Advanced page)
+		if (MenuFonts::BeginTabItemWithFont("Batch 36f", Menu::FontRole::Subheading)) {
+			if (ImGui::BeginChild("##Batch36fContent", ImVec2(0, 0), false)) {
+				RenderBatch36fSection();
+			}
+			ImGui::EndChild();
+			ImGui::EndTabItem();
+		}
+
 		// Developer Tab
 		if (MenuFonts::BeginTabItemWithFont("Developer", Menu::FontRole::Subheading)) {
 			if (ImGui::BeginChild("##DeveloperContent", ImVec2(0, 0), false)) {
@@ -71,6 +83,85 @@ void AdvancedSettingsRenderer::RenderAdvancedSettings(
 
 		ImGui::EndTabBar();
 	}
+}
+
+void AdvancedSettingsRenderer::RenderBatch36fSection()
+{
+	auto& master = Batch36f::settings.master;
+
+	ImGui::Checkbox("Batch 36f denoiser savings (all)", &master);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"Off = every item below runs exactly as in batch 36e, whatever its own switch says.\n"
+			"Takes effect on the next frame: no restart, no cache clear.");
+	}
+
+	ImGui::Spacing();
+	ImGui::TextWrapped(
+		"Each item keeps its own switch in its feature's menu. \"Now\" is what runs this frame: "
+		"the item's own switch, unless the master switch above is off.");
+	ImGui::Spacing();
+
+	const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
+	const auto& ssrt = globals::features::screenSpaceRayTracing;
+	const auto& nrd = globals::features::nrd;
+
+	struct Row
+	{
+		const char* name;
+		bool installed;
+		bool own;
+		std::string ownText;
+		const char* where;
+	};
+	const Row rows[] = {
+		{ "Skip Reflection Pre-pass", ssrt.loaded, ssrt.settings.ReblurSkipSpecularPrepass,
+			ssrt.settings.ReblurSkipSpecularPrepass ? "On" : "Off",
+			"Lighting > Screen Space Ray Tracing > Denoiser (shown when Denoiser = REBLUR)" },
+		{ "Distance Limit", ssrt.loaded, ssrt.settings.DistanceLimit,
+			ssrt.settings.DistanceLimit ? std::format("On, {:.0f} m", ssrt.settings.DistanceLimitMeters) : std::string("Off"),
+			"Lighting > Screen Space Ray Tracing > Denoiser > Distance Limit" },
+		{ "Motion vectors: copy only the render area", nrd.loaded, true, "(no own switch)",
+			"- (NRD guide preparation)" },
+		{ "Fold Unpack Into Composite", ssrt.loaded, ssrt.settings.ReblurFoldUnpack,
+			ssrt.settings.ReblurFoldUnpack ? "On" : "Off",
+			"Lighting > Screen Space Ray Tracing > Denoiser (shown when Denoiser = REBLUR)" },
+	};
+
+	if (ImGui::BeginTable("##Batch36fItems", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+		ImGui::TableSetupColumn("Item");
+		ImGui::TableSetupColumn("Own switch");
+		ImGui::TableSetupColumn("Now");
+		ImGui::TableSetupColumn("Where", ImGuiTableColumnFlags_WidthStretch);
+		ImGui::TableHeadersRow();
+
+		for (const auto& row : rows) {
+			ImGui::TableNextRow();
+			ImGui::TableNextColumn();
+			ImGui::TextUnformatted(row.name);
+			ImGui::TableNextColumn();
+			if (!row.installed)
+				ImGui::TextDisabled("not installed");
+			else
+				ImGui::TextUnformatted(row.ownText.c_str());
+			ImGui::TableNextColumn();
+			const bool now = row.installed && row.own && master;
+			if (!row.installed)
+				ImGui::TextDisabled("-");
+			else if (row.own && !master)
+				ImGui::TextColored(palette.Warning, "Off (master)");
+			else
+				ImGui::TextColored(now ? palette.SuccessColor : palette.Disable, "%s", now ? "On" : "Off");
+			ImGui::TableNextColumn();
+			ImGui::TextWrapped("%s", row.where);
+		}
+		ImGui::EndTable();
+	}
+
+	ImGui::Spacing();
+	ImGui::TextDisabled(
+		"The REBLUR items only do anything while SSRT's Denoiser is REBLUR. The Distance Limit limits bounce light only "
+		"while Ambient Reinjection is on. Not affected by this switch: the Denoiser breakdown panel fixes (display only).");
 }
 
 void AdvancedSettingsRenderer::RenderLoggingSection()

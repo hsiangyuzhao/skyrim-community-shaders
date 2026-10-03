@@ -49,6 +49,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurHitDistC,
     SpecularPrepassBlurRadius,
     UsePrepassOnlyForSpecularMotionEstimation,
+    ReblurSkipSpecularPrepass,
+    ReblurFoldUnpack,
+    DistanceLimit,
+    DistanceLimitMeters,
     EnablePreBlur,
     MaxAccumulatedFrames,
     AtrousIterations,
@@ -106,6 +110,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurHitDistC,
     SpecularPrepassBlurRadius,
     UsePrepassOnlyForSpecularMotionEstimation,
+    ReblurSkipSpecularPrepass,
+    ReblurFoldUnpack,
+    DistanceLimit,
+    DistanceLimitMeters,
     EnablePreBlur,
     MaxAccumulatedFrames,
     AtrousIterations,
@@ -354,6 +362,21 @@ void ScreenSpaceRayTracing::DrawSettings()
 
         bool reblurChanged = false;
 
+        // (batch 36f) Cost switches. Both are runtime switches; the master switch under
+        // Advanced > Batch 36f overrides them.
+        ImGui::Checkbox("Skip Reflection Pre-pass", &settings.ReblurSkipSpecularPrepass);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Drops REBLUR's reflection pre-pass (~0.3 ms at 1440p). It was only used to track how reflections move, and our reflections are already clean. "
+                "Risk: a little more smearing in reflections during fast camera turns. Off = the 36e behaviour.");
+        ImGui::Checkbox("Fold Unpack Into Composite", &settings.ReblurFoldUnpack);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Converts REBLUR's output inside the final composite instead of in two extra full-screen passes (~0.15 ms). "
+                "The picture is identical either way; Off = the 36e separate passes.");
+        if (!Batch36f::IsOn())
+            ImGui::TextDisabled("Batch 36f master switch is off (Advanced > Batch 36f): both run as in 36e.");
+
         // (S1.1) The confidence input, off by default and labelled for what it is.
         if (ImGui::Checkbox("Feed Hit Coverage as History Confidence (experimental)", &settings.ReblurFeedHitCoverageConfidence))
             reblurChanged = true;
@@ -386,6 +409,25 @@ void ScreenSpaceRayTracing::DrawSettings()
             resetReblurSpecular = true;
         }
     }
+
+    // (batch 36f, item 2) Any denoiser: it limits the tracing as well as REBLUR.
+    ImGui::Checkbox("Distance Limit", &settings.DistanceLimit);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Stops ray tracing and denoising beyond the distance below; far away you get the game's own ambient light and cubemap reflections, "
+            "blended in smoothly over the last 20%%. Saves time in open landscapes, nothing indoors. "
+            "Bounce light is only limited while Ambient Reinjection is on.");
+    if (settings.DistanceLimit) {
+        ImGui::SliderFloat("Distance Limit (m)", &settings.DistanceLimitMeters, 20.0f, 1000.0f, "%.0f m", ImGuiSliderFlags_AlwaysClamp);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Lower = faster, but the hand-over to vanilla lighting comes closer and may become noticeable. "
+                "150 m is about the edge of the fully loaded area around you.");
+        if (!settings.EnableAmbientReinjection)
+            ImGui::TextDisabled("Ambient Reinjection is off: only reflections are limited.");
+    }
+    if (!Batch36f::IsOn())
+        ImGui::TextDisabled("Batch 36f master switch is off (Advanced > Batch 36f): no distance limit.");
 
     if (SVGFSelected()) {
         ImGui::Checkbox("Pre-Blur", &settings.EnablePreBlur);
@@ -800,6 +842,9 @@ void ScreenSpaceRayTracing::SanitizeSettings()
     settings.ReblurHitDistB = std::clamp(settings.ReblurHitDistB, 0.0f, 1.0f);
     settings.ReblurHitDistC = std::clamp(settings.ReblurHitDistC, 1.0f, 40.0f);
     settings.SpecularPrepassBlurRadius = std::clamp(settings.SpecularPrepassBlurRadius, 0.0f, 75.0f);
+    // (batch 36f) Same range as the slider. Far below 20 m the limit would cut SSRT off at
+    // arm's length; the 1000 m ceiling is far past where screen-space rays find anything.
+    settings.DistanceLimitMeters = std::clamp(settings.DistanceLimitMeters, 20.0f, 1000.0f);
 }
 
 void ScreenSpaceRayTracing::LoadSettings(json& o_json)
@@ -832,6 +877,7 @@ void ScreenSpaceRayTracing::SetupResources()
 	{
         ssrtCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<SSRTCB>());
         denoiserCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<DenoiserCB>());
+        compositeCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<CompositeCB>());
         // (batch 11, item A) nrdPackCB is gone with ssrt_nrd_pack.hlsl: its three constants ride
         // on row 3 of SSRTCB, which the ray march already binds.
     }
@@ -1743,6 +1789,8 @@ void ScreenSpaceRayTracing::ClearShaderCache()
     static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
         &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &preblurCS, &temporalCS, &temporalDiagCS, &varianceCS, &spatialCS, &spatialSpecularCS,
         &nrdUnpackCS,
+        // (batch 36f) folded-unpack composite twins
+        &diffuseCompositePackedCS, &diffuseCompositeExternalConfPackedCS,
         // (batch 12) sparse sampling: the two ray-march permutations and their two resolve passes
         &raymarchDiffuseHalfResCS, &raymarchDiffuseCheckerCS, &sparseResolveHalfResCS, &sparseResolveCheckerCS,
 #ifdef ENABLE_SHARC
@@ -1856,6 +1904,10 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             // above passes {} and this one has to match it entry for entry or the two would stop
             // being the same shader.
             { &diffuseCompositeExternalConfCS, "ssrt_diffuse_composite.hlsl", { { "SSRT_CONF_EXTERNAL_FILTER", "1" } } },
+            // (batch 36f) Settings::ReblurFoldUnpack: the same two composites reading REBLUR's packed
+            // output at t0 and decoding it in registers, in place of ssrt_nrd_unpack.hlsl.
+            { &diffuseCompositePackedCS, "ssrt_diffuse_composite.hlsl", { { "SSRT_DIFFUSE_PACKED_INPUT", "1" } } },
+            { &diffuseCompositeExternalConfPackedCS, "ssrt_diffuse_composite.hlsl", { { "SSRT_CONF_EXTERNAL_FILTER", "1" }, { "SSRT_DIFFUSE_PACKED_INPUT", "1" } } },
             // (batch 6) The spatial confidence filter. None of the three files reads any of the
             // permutation axes above either; the blur's only axis is which way it runs.
             { &confDownsampleCS, "ssrt_conf_downsample.hlsl", {} },
@@ -2251,8 +2303,38 @@ void ScreenSpaceRayTracing::Prepass()
     context->PSSetShaderResources(99, 1, &view);
 }
 
+ID3D11ShaderResourceView* ScreenSpaceRayTracing::GetSpecularCompositeSRV() const
+{
+    if (specularCompositeSRV)
+        return specularCompositeSRV;
+    return texSSRColor ? texSSRColor->srv.get() : nullptr;
+}
+
+void ScreenSpaceRayTracing::BindCompositeConstants()
+{
+    if (!compositeCB)
+        return;
+    CompositeCB data;
+    // Only meaningful while the specular chain ran this frame; DeferredCompositeCS reads t16 only
+    // under SharedData's EnableSpecular, which is the same setting.
+    data.SpecularPacked = (settings.EnableSpecular && specularCompositePacked) ? 1u : 0u;
+    if (settings.EnableSpecular && DistanceLimitOnChain(true)) {
+        data.SpecularCap = 1u;
+        data.CapEnd = DistanceLimitUnits();
+        data.CapStart = data.CapEnd * 0.8f;
+    }
+    compositeCB->Update(data);
+    auto buffer = compositeCB->CB();
+    globals::d3d::context->CSSetConstantBuffers(1, 1, &buffer);
+}
+
 void ScreenSpaceRayTracing::DrawSSRTSpecular()
 {
+    // (batch 36f) What DeferredCompositeCS reads at t16 unless the REBLUR block below folds the
+    // unpack: the linear surface, as before. Reset every frame before any early-out.
+    specularCompositeSRV = texSSRColor ? texSSRColor->srv.get() : nullptr;
+    specularCompositePacked = false;
+
     if (!settings.EnableSpecular)
         return;
 
@@ -2359,6 +2441,12 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         ssrCBData.NRDHitDistC = settings.ReblurHitDistC;
         ssrCBData.NRDFrontEndPack = nrdFrontEndPack ? 1u : 0u;
         ssrCBData.SpecularMaxRoughness = settings.SpecularMaxRoughness;
+        // (batch 36f, item 2) Distance limit, specular chain: not traced past the limit; the
+        // fade happens in DeferredCompositeCS (lerp towards the cubemap), not here.
+        if (DistanceLimitOnChain(true)) {
+            ssrCBData.DistanceCapEnd = DistanceLimitUnits();
+            ssrCBData.DistanceCapStart = ssrCBData.DistanceCapEnd * 0.8f;
+        }
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
@@ -2617,7 +2705,13 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         // (S1.2) A false return means the dispatch did not complete: texSSRColor still
         // holds this frame's raw ray march, which is the correct thing to publish and to
         // hand the composite. The reset stays pending inside RunReblur.
-        (void)RunReblur(true);
+        // (batch 36f, item 4) Folded unpack: DeferredCompositeCS decodes the packed surface.
+        const bool foldUnpack = FoldUnpackActive();
+        const bool dispatched = RunReblur(true, foldUnpack);
+        if (foldUnpack) {
+            specularCompositeSRV = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
+            specularCompositePacked = true;
+        }
     }
 
     // output
@@ -2711,7 +2805,7 @@ void ScreenSpaceRayTracing::CopyHistoryGeometry()
 // function is now part of the ray march: texNRDPackInput arrives already carrying this frame's
 // radiance in NRD's IN_*_RADIANCE_HITDIST layout, because the caller bound it at u0 and set
 // SSRTCB::NRDFrontEndPack on the same condition that calls this function.
-bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
+bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
 {
     auto context = globals::d3d::context;
     auto state = globals::state;
@@ -2768,6 +2862,14 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
         const bool feedConfidence =
             !a_specular && settings.ReblurFeedHitCoverageConfidence && texSSRTDiffuseConfidence;
         commonSettings.isHistoryConfidenceAvailable = feedConfidence;
+        // (batch 36f, item 2) Distance limit: NRD skips every pixel whose viewZ is past
+        // denoisingRange (16x16 tiles that are entirely past it are classified as sky and skip
+        // every pass). Set a hair above the shader-side limit, so any pixel the composites treat
+        // as inside the limit is certainly one NRD denoised; the sliver in between was not traced
+        // and carries zero radiance, which NRD handles like any other input. Per instance: the
+        // diffuse chain is limited only under ambient reinjection (DistanceLimitOnChain).
+        if (DistanceLimitOnChain(a_specular))
+            commonSettings.denoisingRange = DistanceLimitUnits() * 1.001f;
         if (resetFlag)
             commonSettings.accumulationMode = nrd::AccumulationMode::CLEAR_AND_RESTART;
         integration.SetCommonSettings(commonSettings);
@@ -2780,8 +2882,16 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
         reblurNative.hitDistanceParameters.B = settings.ReblurHitDistB;
         reblurNative.hitDistanceParameters.C = settings.ReblurHitDistC;
         if (a_specular) {
-            reblurNative.specularPrepassBlurRadius = std::max(settings.SpecularPrepassBlurRadius, 0.0f);
-            reblurNative.usePrepassOnlyForSpecularMotionEstimation = settings.UsePrepassOnlyForSpecularMotionEstimation;
+            // (batch 36f, item 1) Radius 0 makes NRD drop the PrePass dispatch (Reblur.cpp
+            // skipPrePass: diffuse radius is always 0 here and checkerboard is OFF). Off, or with
+            // the Batch 36f master switch off: the batch 34 / 36e values.
+            if (SkipSpecularPrepassActive()) {
+                reblurNative.specularPrepassBlurRadius = 0.0f;
+                reblurNative.usePrepassOnlyForSpecularMotionEstimation = false;
+            } else {
+                reblurNative.specularPrepassBlurRadius = std::max(settings.SpecularPrepassBlurRadius, 0.0f);
+                reblurNative.usePrepassOnlyForSpecularMotionEstimation = settings.UsePrepassOnlyForSpecularMotionEstimation;
+            }
         }
         integration.SetDenoiserSettings(&reblurNative);
 
@@ -2828,7 +2938,9 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
         logger::warn("SSRT: REBLUR {} dispatch did not complete; publishing this frame's undenoised radiance",
             a_specular ? "specular" : "diffuse");
 
-    {
+    // (batch 36f, item 4) Folded unpack: the caller's composite decodes the packed surface itself
+    // (texOutput on success, texInput on failure -- the same choice as below).
+    if (!a_skipUnpack) {
         srvs.at(0) = (dispatched ? texOutput : texInput)->srv.get();
         uavs.at(0) = texRadiance->uav.get();
 
@@ -3030,10 +3142,22 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ssrCBData.NRDHitDistC = settings.ReblurHitDistC;
         ssrCBData.NRDFrontEndPack = nrdFrontEndPack ? 1u : 0u;
         ssrCBData.SpecularMaxRoughness = settings.SpecularMaxRoughness;
+        // (batch 36f, item 2) Distance limit, diffuse chain (only under ambient reinjection):
+        // not traced past the limit, and radiance + confidence fade together over the last 20%.
+        // The composite below reads the same two fields to ignore whatever the denoiser left
+        // past the limit.
+        if (DistanceLimitOnChain(false)) {
+            ssrCBData.DistanceCapEnd = DistanceLimitUnits();
+            ssrCBData.DistanceCapStart = ssrCBData.DistanceCapEnd * 0.8f;
+        }
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
     context->CSSetConstantBuffers(1, 1, &buffer);
+
+    // (batch 36f, item 4) Set by the REBLUR block when the unpack is folded into the composite:
+    // the packed surface to read at t0 instead of texSSRTDiffuseColor.
+    ID3D11ShaderResourceView* compositePackedSRV = nullptr;
 
     // (audit P6) Raymarch UAV slots: u0 radiance/confidence, u1..u4 SHARC (bound only
 	// while SHARC is enabled, and only declared by the SHARC shader permutations),
@@ -3424,7 +3548,12 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // (S1.1) IN_DIFF_CONFIDENCE is no longer wired unconditionally — see
         // Settings::ReblurFeedHitCoverageConfidence.
         // (S1.2) A false return leaves texSSRTDiffuseColor holding the raw ray march.
-        (void)RunReblur(false);
+        // (batch 36f, item 4) Folded unpack: the packed-input composite twin decodes it, and
+        // only if that twin compiled (otherwise the separate unpack pass runs as before).
+        const bool foldUnpack = FoldUnpackActive() && diffuseCompositePackedCS && diffuseCompositeExternalConfPackedCS;
+        const bool dispatched = RunReblur(false, foldUnpack);
+        if (foldUnpack)
+            compositePackedSRV = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
     }
 
     // (S2.5) Same as the specular twin: ssrt_temporal.hlsl at t0 plus the Buffer Viewer are
@@ -3517,8 +3646,11 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTComposite);
     {
         uavs.at(0) = main.UAV;
-        srvs.at(0) = texSSRTDiffuseColor->srv.get();
+        srvs.at(0) = compositePackedSRV ? compositePackedSRV : texSSRTDiffuseColor->srv.get();
         srvs.at(1) = albedo.SRV;
+        // (batch 36f) Depth at t4 on every permutation: the distance limit reads it in the
+        // external-filter one too (the other permutation already had it here for its smoothing).
+        srvs.at(4) = depth.depthSRV;
 
         uint uavCount = 1;
         if (!confidenceFilter) {
@@ -3556,7 +3688,10 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         context->CSSetConstantBuffers(1, 1, &buffer);
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, uavCount, uavs.data(), nullptr);
-        context->CSSetShader(confidenceFilter ? diffuseCompositeExternalConfCS.get() : diffuseCompositeCS.get(), nullptr, 0);
+        ID3D11ComputeShader* compositeShader = confidenceFilter ? diffuseCompositeExternalConfCS.get() : diffuseCompositeCS.get();
+        if (compositePackedSRV)
+            compositeShader = confidenceFilter ? diffuseCompositeExternalConfPackedCS.get() : diffuseCompositePackedCS.get();
+        context->CSSetShader(compositeShader, nullptr, 0);
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
 

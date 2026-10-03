@@ -204,6 +204,14 @@ cbuffer SSRTCB : register(b1)
     // three spare floats row 4 already had, so SSRTCB does not grow. Read only under
     // SSRT_SPECULAR; the diffuse permutation declares it to keep one shared layout.
     float SpecularMaxRoughness;
+    // (batch 36f) Distance limit, in NRD viewZ units (game units). DistanceCapEnd == 0 is "off"
+    // and every expression below that reads these is behind that test. Otherwise a pixel whose
+    // viewZ is at or past DistanceCapEnd is not traced (the same "no ray" path a sky pixel takes:
+    // radiance 0, confidence 0), and on the diffuse chain the result fades to zero between
+    // DistanceCapStart and DistanceCapEnd. The two take row 4's last two spare floats, so the
+    // buffer does not grow.
+    float DistanceCapStart;
+    float DistanceCapEnd;
 };
 
 // (audit #21) Never defined by ScreenSpaceRayTracing::CompileComputeShaders, so this is
@@ -826,25 +834,12 @@ float4 SSRT_SanitiseRadianceOutput(float4 color)
 //     intrinsic pair is that same conversion.
 //   * FLOAT -> UNORM8 is round-to-nearest-even of clamp(x, 0, 1) * 255, and HLSL's round()
 //     compiles to DXBC round_ne -- nearest *even*, not C's ties-away-from-zero.
-float3 SSRT_Fp16RoundTrip3(float3 v)
-{
-    return float3(f16tof32(f32tof16(v.x)), f16tof32(f32tof16(v.y)), f16tof32(f32tof16(v.z)));
-}
-
+//
+// (batch 36f) SSRT_Fp16RoundTrip3 and SSRT_NRDViewZ now live in ssrt_common.hlsli, unchanged, so
+// the diffuse composite can use the same two functions (folded unpack, distance limit).
 float SSRT_Unorm8RoundTrip(float v)
 {
     return round(saturate(v) * 255.0f) / 255.0f;
-}
-
-// Verbatim from ssrt_nrd_pack.hlsl's ScreenToViewDepth, including the sentinel: sky and far
-// plane resolve to a viewZ far outside NRD's denoisingRange, so REBLUR treats the pixel as "no
-// surface". Deliberately *not* expressed through view_space_ray.z, which is a different
-// construction (Hi-Z mip 0 through CameraProjInverse) and would not reproduce the same bits.
-float SSRT_NRDViewZ(float screenDepth)
-{
-    if (screenDepth >= 1.0 - 1e-6 || screenDepth <= 0.0)
-        return 3.402823466e+38;
-    return (SharedData::CameraData.w / (-screenDepth * SharedData::CameraData.z + SharedData::CameraData.x));
 }
 
 float3 SSRT_NRDHitDistParams()
@@ -1125,6 +1120,16 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // another covers it. The cubemap has no parallax, though, which is why the gate belongs at
     // high roughness only -- a polished floor at roughness 0.05 would show the difference at once.
     valid_ray = valid_ray && roughness <= SpecularMaxRoughness;
+#endif
+#if !SHARC_UPDATE
+    // (batch 36f) Distance limit: past DistanceCapEnd the pixel is not traced at all. Joining
+    // valid_ray (not returning) for the reason the sky test above gives: the diffuse permutation's
+    // LDS barrier must stay uniform. The pixel then ends exactly like a sky pixel -- radiance 0,
+    // confidence 0 -- which under ambient reinjection keeps the full vanilla ambient (diffuse) and
+    // makes DeferredCompositeCS use the cubemap (specular). NRD is given the same limit as its
+    // denoisingRange, so it skips these pixels too.
+    [branch] if (DistanceCapEnd > 0.0f)
+        valid_ray = valid_ray && SSRT_NRDViewZ(depth) < DistanceCapEnd;
 #endif
 #if SHARC_UPDATE
     valid_ray = valid_ray && ShouldProcessPixel(coords.xy, SharedData::FrameCount);
@@ -1684,6 +1689,15 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // (guard G2) After the average, not before: a single poisoned SPP slot turns the
         // whole sum non-finite, so the useful place to cut is the resolved value.
         outColor = SSRT_SanitiseRadianceOutput(outColor);
+        // (batch 36f) Distance limit fade. Radiance (.xyz, already confidence-weighted: the C++
+        // side only enables the limit on this chain under ambient reinjection) and confidence
+        // (.w) are scaled by the *same* weight, so the traced light added and the vanilla ambient
+        // removed stay one matched pair all the way to DeferredCompositeCS (hard constraint 5),
+        // and both reach 0 smoothly at the limit. The weight is a function of this pixel's own
+        // depth, so it adds nothing from another frame; the confidence still goes through the
+        // low-resolution filter downstream like any other.
+        [branch] if (DistanceCapEnd > 0.0f)
+            outColor *= SSRT_DistanceFade(SSRT_NRDViewZ(depth), DistanceCapStart, DistanceCapEnd);
         // (batch 11, item A) The encoded hit distance, hoisted out of the store below because
         // the packed path needs the same number.
         const float hitNormMean = saturate(hitNormSum / SAMPLES_PER_PIXEL);
