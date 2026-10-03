@@ -32,7 +32,7 @@ public:
 			std::vector<std::string>{
 				"Realistic indirect lighting",
 				"Enhanced ambient occlusion",
-				"Full-resolution contact shading at centimetre scale",
+				"Fine contact shadows where hair, cloth and small objects touch",
 				"Improved visual depth and atmosphere",
 				"Temporal denoising for smooth results",
 				"Configurable quality and performance settings" });

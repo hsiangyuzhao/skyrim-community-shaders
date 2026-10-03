@@ -24,7 +24,7 @@ struct ScreenSpaceRayTracing : Feature
                 "Importance sampling for advanced reflections based on roughness",
                 "Efficient ray marching with Hi-Z buffer",
                 "Uses dynamic cubemaps as fallback for missing information",
-                "Denoising via NVIDIA NRD REBLUR (default) or the in-house SVGF chain"
+                "Noise cleanup via NVIDIA REBLUR (default) or the built-in SVGF denoiser"
             }
 		};
 	}
