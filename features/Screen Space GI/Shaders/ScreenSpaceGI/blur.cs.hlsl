@@ -14,23 +14,10 @@ Texture2D<half4> srcNormalRoughness : register(t1);
 Texture2D<unorm float> srcAccumFrames : register(t2);  // maybe half-res
 Texture2D<float4> srcIlY : register(t3);               // maybe half-res
 Texture2D<float2> srcIlCoCg : register(t4);            // maybe half-res
-// (directional env) Bent normal + aperture from gi.cs.hlsl. Rides this pass's ping-pong, so it
-// must be filtered (or at least copied) here every dispatch or the chain reads a stale slot.
-Texture2D<unorm float4> srcBentNormal : register(t5);  // maybe half-res
-#if defined(DYNAMIC_CUBEMAPS)
-// (directional env v2) Environment irradiance from gi.cs.hlsl. Radiance data (premultiplied
-// RGB + confidence A), so unlike the bent normal it goes through the SAME scalar blend as the
-// IL channels - no vector-domain detour.
-Texture2D<float4> srcEnvIrradiance : register(t6);  // maybe half-res
-#endif
 
 RWTexture2D<unorm float> outAccumFrames : register(u0);
 RWTexture2D<float4> outIlY : register(u1);
 RWTexture2D<float2> outIlCoCg : register(u2);
-RWTexture2D<unorm float4> outBentNormal : register(u3);
-#if defined(DYNAMIC_CUBEMAPS)
-RWTexture2D<float4> outEnvIrradiance : register(u4);
-#endif
 
 // samples = 8, min distance = 0.5, average samples on radius = 2
 static const float3 g_Poisson8[8] = {
@@ -137,21 +124,8 @@ float2x2 getRotationMatrix(float noise)
 	const float4 ilY = srcIlY[dtid];
 	const float2 ilCoCg = srcIlCoCg[dtid];
 
-	// (directional env) Filtered in the decoded VECTOR domain with the same edge-aware weights
-	// as the IL below - never in the octahedral encoding (see the codec note in common.hlsli).
-	// The taps snap to texel centres and use the point sampler, so no hardware interpolation of
-	// the encoding can occur either.
-	float3 bentDirCentre;
-	float bentApertureCentre;
-	SSGI_DecodeBentNormal(srcBentNormal[dtid], bentDirCentre, bentApertureCentre);
-	float3 bentDirSum = bentDirCentre;
-	float bentApertureSum = bentApertureCentre;
-
 	float4 ySum = ilY;
 	float2 coCgSum = ilCoCg;
-#if defined(DYNAMIC_CUBEMAPS)
-	float4 envIrrSum = srcEnvIrradiance[dtid];
-#endif
 	float wSum = 1;
 	for (uint i = 0; i < numSamples; i++) {
 		float w = GaussianWeight(g_Poisson8[i].z);
@@ -194,33 +168,12 @@ float2x2 getRotationMatrix(float noise)
 		if (w > 1e-8) {
 			ySum += srcIlY.SampleLevel(samplerPointClamp, uvSample * OUT_FRAME_SCALE, 0) * w;
 			coCgSum += srcIlCoCg.SampleLevel(samplerPointClamp, uvSample * OUT_FRAME_SCALE, 0) * w;
-#if defined(DYNAMIC_CUBEMAPS)
-			envIrrSum += srcEnvIrradiance.SampleLevel(samplerPointClamp, uvSample * OUT_FRAME_SCALE, 0) * w;
-#endif
-
-			float3 bentDirSample;
-			float bentApertureSample;
-			SSGI_DecodeBentNormal(srcBentNormal.SampleLevel(samplerPointClamp, uvSample * OUT_FRAME_SCALE, 0), bentDirSample, bentApertureSample);
-			bentDirSum += bentDirSample * w;
-			bentApertureSum += bentApertureSample * w;
-
 			wSum += w;
 		}
 	}
 
 	outIlY[dtid] = ySum / wSum;
 	outIlCoCg[dtid] = coCgSum / wSum;
-#if defined(DYNAMIC_CUBEMAPS)
-	outEnvIrradiance[dtid] = envIrrSum / wSum;
-#endif
-	// (directional env) Renormalise the direction sum; wSum cancels in the normalisation, only
-	// the aperture needs the explicit division. A degenerate sum (opposing taps cancelling)
-	// falls back to the centre direction, which decode guarantees is unit length.
-	{
-		float bentLen = length(bentDirSum);
-		float3 bentDirOut = bentLen > 1e-4 ? bentDirSum / bentLen : bentDirCentre;
-		outBentNormal[dtid] = SSGI_EncodeBentNormal(bentDirOut, bentApertureSum / wSum);
-	}
 #if defined(TEMPORAL_DENOISER)
 	// (F3) accumFrames is passed through untouched instead of being spatially averaged along with
 	// the radiance. It is not a signal - it is the age of this texel's history, i.e. the

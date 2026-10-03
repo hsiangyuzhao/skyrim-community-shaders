@@ -14,15 +14,6 @@ Texture2D<half> srcPrevAo : register(t6);              // maybe half-res
 Texture2D<half4> srcPrevIlY : register(t7);            // maybe half-res
 Texture2D<half2> srcPrevIlCoCg : register(t8);         // maybe half-res
 Texture2D<half4> srcPrevGISpecular : register(t9);    // maybe half-res
-// (directional env) Last frame's bent-normal output (post-blur slot). Encoding: see
-// SSGI_EncodeBentNormal in common.hlsli.
-Texture2D<unorm float4> srcPrevBentNormal : register(t10);  // maybe half-res
-#if defined(DYNAMIC_CUBEMAPS)
-// (directional env v2) Last frame's environment-irradiance output (post-blur slot). Linear
-// premultiplied radiance + confidence -- reprojected exactly like the IL channels, bilinear
-// taps included; nothing here is direction-encoded.
-Texture2D<float4> srcPrevEnvIrradiance : register(t11);  // maybe half-res
-#endif
 
 RWTexture2D<float3> outRadianceDisocc : register(u0);
 RWTexture2D<unorm float> outAccumFrames : register(u1);
@@ -30,10 +21,6 @@ RWTexture2D<float> outRemappedAo : register(u2);
 RWTexture2D<float4> outRemappedIlY : register(u3);
 RWTexture2D<float2> outRemappedIlCoCg : register(u4);
 RWTexture2D<float4> outRemappedPrevGISpecular : register(u5);
-RWTexture2D<unorm float4> outRemappedBentNormal : register(u6);
-#if defined(DYNAMIC_CUBEMAPS)
-RWTexture2D<float4> outRemappedEnvIrradiance : register(u7);
-#endif
 
 #if defined(TEMPORAL_DENOISER) || defined(HALF_RATE)
 #	define REPROJECTION
@@ -41,8 +28,7 @@ RWTexture2D<float4> outRemappedEnvIrradiance : register(u7);
 
 void readHistory(
 	uint eyeIndex, float curr_depth, float3 curr_pos, int2 pixCoord, float bilinear_weight,
-	inout half prev_ao, inout half4 prev_y, inout half2 prev_co_cg, inout half3 prev_ambient, inout float accum_frames, inout half4 prev_gi_specular,
-	inout float3 prev_bent_dir, inout float prev_bent_aperture, inout float4 prev_env_irr, inout float wsum)
+	inout half prev_ao, inout half4 prev_y, inout half2 prev_co_cg, inout half3 prev_ambient, inout float accum_frames, inout half4 prev_gi_specular, inout float wsum)
 {
 	const float2 uv = (pixCoord + .5) * RCP_OUT_FRAME_DIM;
 	const float2 screen_pos = Stereo::ConvertFromStereoUV(uv, eyeIndex);
@@ -73,13 +59,6 @@ void readHistory(
 	const float4 hist_gi_specular = srcPrevGISpecular[pixCoord];
 	hist_finite = hist_finite && isFiniteSafe(hist_gi_specular);
 #	endif
-#	ifdef DYNAMIC_CUBEMAPS
-	// (directional env v2) Same whole-tap rejection as the IL channels and for the same
-	// reason: all channels share one accum_frames, and the source is a float format that can
-	// carry a non-finite value into the history.
-	const float4 hist_env_irr = srcPrevEnvIrradiance[pixCoord];
-	hist_finite = hist_finite && isFiniteSafe(hist_env_irr);
-#	endif
 
 	// (guard N4) The only self-healing guard in the chain. Everything else here bounds what may
 	// *enter* the history; this is what lets the history get out of a bad state once it is in
@@ -102,20 +81,6 @@ void readHistory(
 	prev_ao += srcPrevAo[pixCoord] * bilinear_weight;
 	prev_y += hist_y * bilinear_weight;
 	prev_co_cg += hist_co_cg * bilinear_weight;
-	// (directional env) The bent tap is blended in the decoded VECTOR domain - the octahedral
-	// RG channels must never be interpolated (see the codec note in common.hlsli). The caller
-	// renormalises the summed direction once. No finiteness test needed: the source is
-	// R8G8B8A8_UNORM, which has no encoding for a non-finite value, and the decode of any byte
-	// pattern is a valid unit vector.
-	float3 tap_bent_dir;
-	float tap_bent_aperture;
-	SSGI_DecodeBentNormal(srcPrevBentNormal[pixCoord], tap_bent_dir, tap_bent_aperture);
-	prev_bent_dir += tap_bent_dir * bilinear_weight;
-	prev_bent_aperture += tap_bent_aperture * bilinear_weight;
-#	ifdef DYNAMIC_CUBEMAPS
-	// Plain bilinear accumulation: premultiplied radiance + confidence blend linearly.
-	prev_env_irr += hist_env_irr * bilinear_weight;
-#	endif
 	accum_frames += srcAccumFrames[pixCoord] * bilinear_weight;
 #	ifdef GI_SPECULAR
 	prev_gi_specular += hist_gi_specular * bilinear_weight;
@@ -143,9 +108,6 @@ void readHistory(
 	half4 prev_y = 0;
 	half2 prev_co_cg = 0;
 	half4 prev_gi_specular = 0;
-	float3 prev_bent_dir = 0;
-	float prev_bent_aperture = 0;
-	float4 prev_env_irr = 0;
 	float accum_frames = 0;
 	float wsum = 0;
 
@@ -156,10 +118,6 @@ void readHistory(
 		outAccumFrames[pixCoord] = 1.0 / 255.0;
 		outRemappedIlY[pixCoord] = half4(0, 0, 0, 0);
 		outRemappedIlCoCg[pixCoord] = half2(0, 0);
-		outRemappedBentNormal[pixCoord] = 0;
-#ifdef DYNAMIC_CUBEMAPS
-		outRemappedEnvIrradiance[pixCoord] = 0;
-#endif
 		return;
 	}
 
@@ -176,16 +134,16 @@ void readHistory(
 
 		readHistory(eyeIndex, curr_depth, curr_pos,
 			prev_px_lu, (1 - bilinear_weights.x) * (1 - bilinear_weights.y),
-			prev_ao, prev_y, prev_co_cg, prev_ambient, accum_frames, prev_gi_specular, prev_bent_dir, prev_bent_aperture, prev_env_irr, wsum);
+			prev_ao, prev_y, prev_co_cg, prev_ambient, accum_frames, prev_gi_specular, wsum);
 		readHistory(eyeIndex, curr_depth, curr_pos,
 			prev_px_lu + int2(1, 0), bilinear_weights.x * (1 - bilinear_weights.y),
-			prev_ao, prev_y, prev_co_cg, prev_ambient, accum_frames, prev_gi_specular, prev_bent_dir, prev_bent_aperture, prev_env_irr, wsum);
+			prev_ao, prev_y, prev_co_cg, prev_ambient, accum_frames, prev_gi_specular, wsum);
 		readHistory(eyeIndex, curr_depth, curr_pos,
 			prev_px_lu + int2(0, 1), (1 - bilinear_weights.x) * bilinear_weights.y,
-			prev_ao, prev_y, prev_co_cg, prev_ambient, accum_frames, prev_gi_specular, prev_bent_dir, prev_bent_aperture, prev_env_irr, wsum);
+			prev_ao, prev_y, prev_co_cg, prev_ambient, accum_frames, prev_gi_specular, wsum);
 		readHistory(eyeIndex, curr_depth, curr_pos,
 			prev_px_lu + int2(1, 1), bilinear_weights.x * bilinear_weights.y,
-			prev_ao, prev_y, prev_co_cg, prev_ambient, accum_frames, prev_gi_specular, prev_bent_dir, prev_bent_aperture, prev_env_irr, wsum);
+			prev_ao, prev_y, prev_co_cg, prev_ambient, accum_frames, prev_gi_specular, wsum);
 
 		if (wsum > 1e-2) {
 			float rcpWsum = rcp(wsum + 1e-10);
@@ -193,12 +151,6 @@ void readHistory(
 			prev_ao *= rcpWsum;
 			prev_y *= rcpWsum;
 			prev_co_cg *= rcpWsum;
-#		ifdef DYNAMIC_CUBEMAPS
-			prev_env_irr *= rcpWsum;
-#		endif
-			// (directional env) Only the aperture needs the weight normalisation - the direction
-			// sum is renormalised to unit length at the write below, which absorbs wsum.
-			prev_bent_aperture *= rcpWsum;
 			accum_frames *= rcpWsum;
 #		ifdef GI_SPECULAR
 			prev_gi_specular *= rcpWsum;
@@ -228,21 +180,5 @@ void readHistory(
 	outRemappedIlY[pixCoord] = prev_y;
 	outRemappedIlCoCg[pixCoord] = prev_co_cg;
 	outRemappedPrevGISpecular[pixCoord] = prev_gi_specular;
-#	ifdef DYNAMIC_CUBEMAPS
-	// (directional env v2) Radiance data: written as-is, like prev_y. When no tap survived the
-	// sum is 0 (zero confidence included), and gi.cs.hlsl never uses it anyway - accum_frames
-	// is 1 there, so its EMA factor is 1.
-	outRemappedEnvIrradiance[pixCoord] = prev_env_irr;
-#	endif
-	// (directional env) Renormalise the vector-domain tap sum and re-encode. When no tap
-	// survived (disocclusion, off-screen) the sum is degenerate and a zero encoding is written;
-	// gi.cs.hlsl never uses it, because accum_frames is 1 there and its EMA factor is 1.
-	{
-		float bent_len = length(prev_bent_dir);
-		float4 bent_enc = 0;
-		[flatten] if (bent_len > 1e-4)
-			bent_enc = SSGI_EncodeBentNormal(prev_bent_dir / bent_len, prev_bent_aperture);
-		outRemappedBentNormal[pixCoord] = bent_enc;
-	}
 #endif
 }

@@ -15,24 +15,11 @@ Texture2D<half4> srcGiSpecular : register(t4);  // half-res
 // CONTACT_COMPOSE in contactAo.cs.hlsl.
 Texture2D<unorm float> srcContact : register(t5);
 #endif
-// (directional env) Bent normal + aperture at working resolution. Encoding: see
-// SSGI_EncodeBentNormal in common.hlsli.
-Texture2D<unorm float4> srcBentNormal : register(t6);  // half-res
-#ifdef DYNAMIC_CUBEMAPS
-// (directional env v2) Environment irradiance at working resolution. Radiance data
-// (premultiplied RGB + confidence A): upsampled through the same two scalar paths as the IL
-// channels, hardware bilinear included.
-Texture2D<float4> srcEnvIrradiance : register(t7);  // half-res
-#endif
 
 RWTexture2D<half> outAo : register(u0);
 RWTexture2D<half4> outIlY : register(u1);
 RWTexture2D<half2> outIlCoCg : register(u2);
 RWTexture2D<half4> outGiSpecular : register(u3);
-RWTexture2D<unorm float4> outBentNormal : register(u4);
-#ifdef DYNAMIC_CUBEMAPS
-RWTexture2D<float4> outEnvIrradiance : register(u5);
-#endif
 
 #define min4(v) min(min(v.x, v.y), min(v.z, v.w))
 #define max4(v) max(max(v.x, v.y), max(v.z, v.w))
@@ -70,9 +57,6 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 	float4 y;
 	float2 coCg;
 	float4 giSpecular;
-#ifdef DYNAMIC_CUBEMAPS
-	float4 envIrradiance;
-#endif
 
 	[branch] if (d_edge)
 	{
@@ -87,9 +71,6 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 		y = BLEND_WEIGHT(srcIlY[px00], srcIlY[px01], srcIlY[px10], srcIlY[px11], w, sumw);
 		coCg = BLEND_WEIGHT(srcIlCoCg[px00], srcIlCoCg[px01], srcIlCoCg[px10], srcIlCoCg[px11], w, sumw);
 		giSpecular = BLEND_WEIGHT(srcGiSpecular[px00], srcGiSpecular[px01], srcGiSpecular[px10], srcGiSpecular[px11], w, sumw);
-#ifdef DYNAMIC_CUBEMAPS
-		envIrradiance = BLEND_WEIGHT(srcEnvIrradiance[px00], srcEnvIrradiance[px01], srcEnvIrradiance[px10], srcEnvIrradiance[px11], w, sumw);
-#endif
 	}
 	else
 	{
@@ -98,36 +79,6 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 		y = srcIlY.SampleLevel(samplerLinearClamp, uv, 0);
 		coCg = srcIlCoCg.SampleLevel(samplerLinearClamp, uv, 0);
 		giSpecular = srcGiSpecular.SampleLevel(samplerLinearClamp, uv, 0);
-#ifdef DYNAMIC_CUBEMAPS
-		envIrradiance = srcEnvIrradiance.SampleLevel(samplerLinearClamp, uv, 0);
-#endif
-	}
-
-	// (directional env) The bent normal cannot go through either scalar path above: hardware
-	// bilinear on the octahedral encoding interpolates across fold lines, and BLEND_WEIGHT on
-	// the raw channels is the same thing by hand (see the codec note in common.hlsli). So it is
-	// upsampled once, in the decoded vector domain, with the same four taps and the same
-	// 1/(|dz|+eps) depth weighting the edge branch uses - on flat depth those weights degrade
-	// towards the plain average the linear branch approximates, so a single path serves both.
-	{
-		float bgdepth = srcDepth[dtid];
-		float4 dd = abs(d - bgdepth);
-		float4 wB = 1.0 / (dd + 0.00001);
-		float sumwB = max(wB.x + wB.y + wB.z + wB.w, 1e-5);
-
-		float3 dir00, dir01, dir10, dir11;
-		float ap00, ap01, ap10, ap11;
-		SSGI_DecodeBentNormal(srcBentNormal[px00], dir00, ap00);
-		SSGI_DecodeBentNormal(srcBentNormal[px01], dir01, ap01);
-		SSGI_DecodeBentNormal(srcBentNormal[px10], dir10, ap10);
-		SSGI_DecodeBentNormal(srcBentNormal[px11], dir11, ap11);
-
-		float3 bentDir = dir00 * wB.x + dir01 * wB.y + dir10 * wB.z + dir11 * wB.w;
-		float bentAperture = (ap00 * wB.x + ap01 * wB.y + ap10 * wB.z + ap11 * wB.w) / sumwB;
-
-		float bentLen = length(bentDir);
-		bentDir = bentLen > 1e-4 ? bentDir / bentLen : dir00;
-		outBentNormal[dtid] = SSGI_EncodeBentNormal(bentDir, bentAperture);
 	}
 
 #ifdef CONTACT_AO
@@ -142,7 +93,4 @@ RWTexture2D<float4> outEnvIrradiance : register(u5);
 	outIlY[dtid] = y;
 	outIlCoCg[dtid] = coCg;
 	outGiSpecular[dtid] = giSpecular;
-#ifdef DYNAMIC_CUBEMAPS
-	outEnvIrradiance[dtid] = envIrradiance;
-#endif
 }

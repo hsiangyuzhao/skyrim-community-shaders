@@ -113,27 +113,7 @@ public:
 		bool EnableContactAo = true;
 		float ContactRadius = 15.f;  // centimetres
 		float ContactStrength = 1.f;
-		// (directional env) Composite-side channel: replace the flat ambient chroma with a
-		// dynamic-cubemap sample along the bent normal. Consumed by DeferredCompositeCS via the
-		// shared FeatureData block (see GetCommonBufferData), not by SSGI's own passes -- the
-		// bent normal itself is always produced while SSGI runs.
-		bool EnableDirectionalEnv = true;
-		float EnvLevel = 1.0f;  // 0..4, linear brightness of the new channel; 1 = parity
 	} settings;
-
-	// (directional env) Mirror of SSGISettings in Common/SharedData.hlsli -- appended at the
-	// END of the FeatureData cbuffer, so no existing offset moves. EnableDirectionalEnv is
-	// pre-gated here on loaded && Enabled, so the shader-side test needs no knowledge of the
-	// feature's runtime state.
-	struct alignas(16) SSGISharedData
-	{
-		uint EnableDirectionalEnv;
-		float EnvLevel;
-		float pad[2];
-	};
-	STATIC_ASSERT_ALIGNAS_16(SSGISharedData);
-
-	SSGISharedData GetCommonBufferData();
 
 	struct alignas(16) SSGICB
 	{
@@ -218,18 +198,6 @@ public:
 	// (contact AO) Full-resolution ping-pong for the accumulated contact visibility. R8_UNORM, so
 	// the signal is format-bounded to [0, 1] and nothing downstream needs a finiteness test.
 	eastl::unique_ptr<Texture2D> texContactAo[2] = { nullptr };
-	// (directional env) Bent normal + aperture ping-pong, R8G8B8A8_UNORM (octahedral RG,
-	// aperture B, spare A -- see SSGI_EncodeBentNormal in the feature's common.hlsli). Rides the
-	// IL chain's index through radianceDisocc -> gi -> blur -> upsample, so like texIlY the pair
-	// holds working-res history in one slot and, in half/quarter modes, the full-res upsample in
-	// the other.
-	eastl::unique_ptr<Texture2D> texBentNormal[2] = { nullptr };
-	// (directional env v2) Hemisphere environment irradiance ping-pong, R16G16B16A16_FLOAT:
-	// RGB = linear irradiance integrated over the unoccluded bins (premultiplied), A = the
-	// march's coverage/confidence. Radiance data, so it rides the IL chain's index exactly like
-	// texIlCoCg -- reprojection, blur and upsample all filter it with the IL weights, never in
-	// a vector domain.
-	eastl::unique_ptr<Texture2D> texEnvIrradiance[2] = { nullptr };
 
 	inline auto GetOutputTextures()
 	{
@@ -238,13 +206,8 @@ public:
 					   texAo[outputAoIdx]->srv.get(),
 					   texIlY[outputIlIdx]->srv.get(),
 					   texIlCoCg[outputIlIdx]->srv.get(),
-					   texGiSpecular[outputSpecularIdx]->srv.get(),
-					   texBentNormal[outputIlIdx]->srv.get(),
-					   texEnvIrradiance[outputIlIdx]->srv.get()) :
-		           std::make_tuple(
-					   (ID3D11ShaderResourceView*)nullptr, (ID3D11ShaderResourceView*)nullptr,
-					   (ID3D11ShaderResourceView*)nullptr, (ID3D11ShaderResourceView*)nullptr,
-					   (ID3D11ShaderResourceView*)nullptr, (ID3D11ShaderResourceView*)nullptr);
+					   texGiSpecular[outputSpecularIdx]->srv.get()) :
+		           std::make_tuple(nullptr, nullptr, nullptr, nullptr);
 	}
 
 	winrt::com_ptr<ID3D11SamplerState> linearClampSampler = nullptr;
