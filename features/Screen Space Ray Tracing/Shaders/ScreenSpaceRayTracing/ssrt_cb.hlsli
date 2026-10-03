@@ -78,5 +78,7 @@ cbuffer SSRTCB : register(b1)
 #define SSRT_COMPOSITE_FLAG_TRACED_SKIPS_AO 8u  // pre-compensate the traced light for the composite's sqrt(AO) (deviation 4)
 #define SSRT_COMPOSITE_FLAG_CHECKER_INPUT 16u  // t0 is a compact checkerboard input (REBLUR dispatch failed)
 #define SSRT_COMPOSITE_FLAG_MISS_BENT 32u  // accumulate the miss bent normal (deviation 2)
+#define SSRT_COMPOSITE_FLAG_AO_FROM_FILTER 64u  // (batch 36c) denoiser AO visibility = the filtered ray signal at t11
+#define SSRT_COMPOSITE_FLAG_AO_FILTER_IS_CONF 128u  // (batch 36c) ...which is the filtered confidence: visibility = 1 - t11
 
 #endif  // SSRT_CB_HLSLI

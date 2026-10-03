@@ -141,10 +141,16 @@ RWTexture2D<float> SSRTConfidenceOutput : register(u5);
 // confidence. Seven UAVs, against the eight a cs_5_0 dispatch may bind.
 RWTexture2D<float> SSRTDiffuseHitDistanceOutput : register(u6);
 #   if defined(SSRT_MISS_BENT)
-// (batch 36b, deviation 2) The per-frame miss bent normal: mean over this pixel's samples of
-// (1 - coverage) * ray direction, world space. u2 is free on every non-SHARC permutation. The diffuse
-// composite accumulates it over frames; DeferredCompositeCS aims the re-added ambient with it.
-RWTexture2D<snorm float4> MissDirOutput : register(u2);
+// (batch 36b, deviation 2) Direction-aware reinjection. u2 is free on every non-SHARC permutation.
+// (batch 36c) The per-pixel mean over this pixel's samples of
+//     (1 - confidence_i) * clamp(DALC(ray_i) / DALC(normal), 0, 2) / 2
+// in luminance, i.e. the ambient the unresolved rays would have seen relative to the ambient the
+// composite re-adds (along the normal), weighted by how much of each ray is left to the ambient.
+// confidence_i is the per-sample value this pass reports, so the weights sum to exactly what the
+// confidence filter's input is missing. Filtered by the same quarter-resolution chain as the
+// confidence; DeferredCompositeCS divides the two filtered fields. Replaces 36b's per-pixel miss bent
+// normal, a direction estimated from one or two rays that multiplied the ambient unfiltered.
+RWTexture2D<unorm float> MissAmbientOutput : register(u2);
 #   endif
 #endif
 
@@ -702,8 +708,9 @@ groupshared float4 samples[64][SAMPLES_PER_PIXEL];
 // maximum of 16, on top of the 2048 / 16384 `samples` already costs.
 groupshared float hitNorms[64][SAMPLES_PER_PIXEL];
 #   if defined(SSRT_MISS_BENT)
-// (batch 36b, deviation 2) Per-sample miss direction, reduced by the same lane across the same barrier.
-groupshared float3 missDirs[64][SAMPLES_PER_PIXEL];
+// (batch 36b, deviation 2) Per-sample miss-ambient term (batch 36c: a scalar, see MissAmbientOutput),
+// reduced by the same lane across the same barrier.
+groupshared float missAmbient[64][SAMPLES_PER_PIXEL];
 #   endif
 #endif
 
@@ -925,6 +932,16 @@ float3 SSRT_CompositeSpecularCubemap(uint2 px, float2 uv, float3 positionWS, flo
     // NdotV taken against the camera-to-pixel direction, exactly as it is written there.
     const float specAo = Color::SpecularAOLagarde(saturate(dot(normalWS, V)), 1.0 - SSRT_FallbackAoOcclusion(px, uv), roughness);
     finalIrradiance *= specAo;
+    // (batch 36c) ...and the composite's next two lines, which 36b left out. Under SSRT, Screen Space GI's
+    // specular IL is zero, but the composite still blends its chroma halfway towards the cubemap's and
+    // adds the result: YCoCg(0, CoCg / 2) back to RGB, clamped at 0, i.e. an extra half of the
+    // cubemap's own colour on its dominant channels (+10-20% on a tinted cubemap). Without it every
+    // reflection that missed came out visibly less saturated than the same reflection with traced
+    // reflections off.
+    {
+        const float3 ilSpecularYCoCg = float3(0.0, lerp(0.0.xx, Color::RGBToYCoCg(finalIrradiance).yz, 0.5));
+        finalIrradiance += max(0, Color::YCoCgToRGB(ilSpecularYCoCg));
+    }
 #   endif
     return finalIrradiance;
 }
@@ -1163,7 +1180,9 @@ float3 SSRT_CompositeSpecularCubemap(uint2 px, float2 uv, float3 positionWS, flo
     samples[SSRT_SAMPLE_SLOT][sample_id] = 0.f;
     hitNorms[SSRT_SAMPLE_SLOT][sample_id] = 1.0f;
 #   if defined(SSRT_MISS_BENT)
-    missDirs[SSRT_SAMPLE_SLOT][sample_id] = 0.0f;
+    // (batch 36c) A lane that does not trace (sky, off-screen) reports confidence 0, i.e. a full miss,
+    // so its term is a full miss at the normal's own ambient: weight 1, ratio 1, stored halved.
+    missAmbient[SSRT_SAMPLE_SLOT][sample_id] = 0.5f;
 #   endif
 #else
     float4 localSample = 0.f;  // (audit P4) single sample per pixel, no LDS needed
@@ -1277,13 +1296,6 @@ float3 SSRT_CompositeSpecularCubemap(uint2 px, float2 uv, float3 positionWS, flo
             proximity = 1.0f - REBLUR_FrontEnd_GetNormHitDist(world_ray_length, nrdVisViewZ, SSRT_NRDHitDistParams(), 1.0f);
             visCoverage = saturate(confidence + (1.0f - occlusion) * OcclusionStrength) * proximity;
         }
-#   if defined(SSRT_MISS_BENT) && SSRT_USE_SAMPLE_LDS
-        // (batch 36b, deviation 2) This ray's share of the unresolved hemisphere, along its direction. The
-        // plain coverage (validated hit plus back-face evidence), i.e. what reinjection's ambientKeep is
-        // made of, before any fallback below rewrites `confidence`.
-        missDirs[SSRT_SAMPLE_SLOT][sample_id] =
-            world_space_reflected_direction * (1.0f - saturate(confidence + (1.0f - occlusion) * OcclusionStrength));
-#   endif
 #endif
         float3 sampleColor = 0;
 #if defined(SSRT_SPECULAR)
@@ -1657,6 +1669,17 @@ float3 SSRT_CompositeSpecularCubemap(uint2 px, float2 uv, float3 positionWS, flo
         // (batch 1, item 2) The texel encoding, or (batch 36b) the REBLUR visibility of this sample.
         hitNorms[SSRT_SAMPLE_SLOT][sample_id] = HitDistIsVisibility != 0 ? 1.0f - visCoverage : hit_norm;
 #   endif
+#   if defined(SSRT_MISS_BENT)
+        // (batch 36c, deviation 2) See MissAmbientOutput. `confidence` is final here (reinjection, fill
+        // and ProximityCoverage all applied), so the weight is exactly this sample's ambient share.
+        {
+            const float lumAlongNormal = Color::RGBToLuminance(Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(world_space_normal, 1.0)))));
+            const float lumAlongRay = Color::RGBToLuminance(Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(world_space_reflected_direction, 1.0)))));
+            float ratio = clamp(lumAlongRay / max(lumAlongNormal, 1e-4f), 0.0f, 2.0f);
+            ratio = isFiniteSafe(ratio) ? ratio : 1.0f;
+            missAmbient[SSRT_SAMPLE_SLOT][sample_id] = saturate(1.0f - confidence) * ratio * 0.5f;
+        }
+#   endif
 #else
         localSample = float4(sampleColor, confidence);
 #endif
@@ -1809,11 +1832,11 @@ float3 SSRT_CompositeSpecularCubemap(uint2 px, float2 uv, float3 positionWS, flo
         SSRTDiffuseHitDistanceOutput[SSRT_GBUFFER_COORDS] = hitNormMean;
 #   if defined(SSRT_MISS_BENT)
         {
-            float3 missDirSum = 0.0f;
+            float missAmbientSum = 0.0f;
             for (int m = 0; m < SAMPLES_PER_PIXEL; ++m)
-                missDirSum += missDirs[SSRT_SAMPLE_SLOT][m];
-            const float3 missDirMean = missDirSum / SAMPLES_PER_PIXEL;
-            MissDirOutput[SSRT_GBUFFER_COORDS] = float4(isFiniteSafe(missDirMean) ? missDirMean : 0.0f.xxx, 0.0f);
+                missAmbientSum += missAmbient[SSRT_SAMPLE_SLOT][m];
+            const float missAmbientMean = missAmbientSum / SAMPLES_PER_PIXEL;
+            MissAmbientOutput[SSRT_GBUFFER_COORDS] = isFiniteSafe(missAmbientMean) ? saturate(missAmbientMean) : 0.5f;
         }
 #   endif
 #   if defined(SSRT_CHECKERBOARD)

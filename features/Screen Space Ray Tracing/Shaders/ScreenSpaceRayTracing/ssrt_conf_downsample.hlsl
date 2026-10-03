@@ -9,6 +9,18 @@
 // kernel in stage 2 cheaper than the 7x7 window the chain replaces rather than dearer.
 #include "ScreenSpaceRayTracing/ssrt_conf_filter.hlsli"
 
+// (batch 36c) SSRT_CONF_CHECKERBOARD: REBLUR efficiency mode. The checkerboard ray march traces
+// diffuse on only half of the pixels each frame -- x & 1 == (y + NRDFrameIndex) & 1, its own rule
+// (ssrt_raymarch.hlsl, SSRT_CHECKERBOARD) -- and leaves the other half holding last frame's value.
+// Every 2x2 block holds exactly one traced pixel per row, so this permutation averages those two
+// and nothing older: the filtered signal has no lag at all, at half the rays per block. The guides
+// still use all four pixels. If neither traced pixel agrees with the block's geometry the block
+// falls back to the accepted untraced ones (one frame old) rather than to nothing. Without the
+// define this file compiles exactly as before.
+#ifdef SSRT_CONF_CHECKERBOARD
+#	include "ScreenSpaceRayTracing/ssrt_cb.hlsli"
+#endif
+
 // Raw per-pixel hit confidence straight from the ray march, and the full-resolution depth
 // buffer. NormalRoughnessTexture comes from ssrt_common.hlsli at t2, which is where every
 // other pass in this feature reads it.
@@ -55,6 +67,10 @@ RWTexture2D<float4> NormalLoRW : register(u2);
 	float depthSum = 0.0f;
 	float3 normalSum = 0.0f;
 	float weightSum = 0.0f;
+#ifdef SSRT_CONF_CHECKERBOARD
+	float freshConfidenceSum = 0.0f;
+	float freshWeightSum = 0.0f;
+#endif
 
 	[unroll] for (int tap = 0; tap < 4; tap++)
 	{
@@ -70,7 +86,18 @@ RWTexture2D<float4> NormalLoRW : register(u2);
 		depthSum += tapDepth * weight;
 		normalSum += tapNormal * weight;
 		weightSum += weight;
+#ifdef SSRT_CONF_CHECKERBOARD
+		const float freshWeight = ((uint(pixel.x) & 1u) == ((uint(pixel.y) + NRDFrameIndex) & 1u)) ? weight : 0.0f;
+		freshConfidenceSum += SSRTConfidenceTexture[pixel] * freshWeight;
+		freshWeightSum += freshWeight;
+#endif
 	}
+#ifdef SSRT_CONF_CHECKERBOARD
+	[flatten] if (freshWeightSum > 0.0f)
+	{
+		confidenceSum = freshConfidenceSum * (weightSum / freshWeightSum);
+	}
+#endif
 
 	// tap 0 is the reference itself, so it passes its own test (relative depth 0, cosine 1)
 	// and weightSum is normally at least 1. The fallback is the spec'd degenerate rule made

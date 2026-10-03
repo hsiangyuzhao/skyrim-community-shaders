@@ -127,10 +127,11 @@ Texture2D<float4> SSRTexture : register(t16);
 // construction and needs no finiteness test of its own; the write side is covered by the
 // G2 sanitisation the ray march already applies to the channel it comes from.
 Texture2D<float> SSRTConfidenceTexture : register(t19);
-// (batch 36b, deviation 2) The accumulated miss bent normal: the mean direction the rays that resolved
-// nothing escaped through, weighted by how much they missed (R8G8B8A8_SNORM, xyz world space). Read
-// only when ssrtSettings.AmbientReinjection has bit 1 set.
-Texture2D<float4> SSRTMissBentTexture : register(t22);
+// (batch 36b, deviation 2) Direction-aware reinjection. Read only when ssrtSettings.AmbientReinjection
+// has bit 1 set. (batch 36c) R8_UNORM: the quarter-resolution-filtered mean of
+// (1 - confidence) * DALC(ray) / DALC(normal) / 2 over the SSRT rays (see ssrt_raymarch.hlsl,
+// MissAmbientOutput), filtered by the same chain and over the same rays as t19.
+Texture2D<float> SSRTMissAmbientTexture : register(t22);
 #endif
 
 // The ambient separation further down has two consumers, and only one of them is SSGI:
@@ -382,13 +383,18 @@ bool DirEnvIsFinite(float v)
 	// the removal above are untouched. Clamped to [0.5, 2] and faded in over short bent vectors
 	// (pixels whose rays almost all hit something), so it corrects the direction and never decides
 	// the amount -- that stays ambientKeep's job.
+	//
+	// (batch 36c) The ratio is now measured per ray in the ray march -- DALC along each ray against DALC
+	// along the normal, weighted by the ray's unresolved share -- and both that sum and the miss mass
+	// arrive filtered by the same quarter-resolution chain over the same rays, so their quotient is the
+	// neighbourhood's mean ambient ratio over its escaped directions. The 36b version normalised a
+	// per-pixel mean direction of one or two rays and used it unfiltered: a [0.5, 2] multiplier on the
+	// whole re-added ambient that changed every frame, i.e. ambient-coloured grain wherever ambient
+	// dominates the picture. Fades out where the rays leave almost nothing to the ambient anyway.
 	[branch] if ((SharedData::ssrtSettings.AmbientReinjection & 2u) != 0 && SharedData::ssrtSettings.DiffuseMult > 0.0) {
-		const float3 bent = SSRTMissBentTexture[dispatchID.xy].xyz;
-		const float bentLength = length(bent);
-		const float3 bentDir = bent / max(bentLength, 1e-4);
-		const float lumNormal = Color::RGBToLuminance(Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(normalWS, 1.0)))));
-		const float lumBent = Color::RGBToLuminance(Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(bentDir, 1.0)))));
-		const float scale = lerp(1.0, clamp(lumBent / max(lumNormal, 1e-4), 0.5, 2.0), smoothstep(0.02, 0.1, bentLength));
+		const float missMass = saturate(1.0 - SSRTConfidenceTexture[dispatchID.xy]);
+		const float missAmbient = 2.0 * SSRTMissAmbientTexture[dispatchID.xy];
+		const float scale = lerp(1.0, clamp(missAmbient / max(missMass, 1e-3), 0.5, 2.0), smoothstep(0.02, 0.1, missMass));
 		if ((asuint(scale) & 0x7F800000u) != 0x7F800000u)
 			ambientReAddColor *= scale;
 	}

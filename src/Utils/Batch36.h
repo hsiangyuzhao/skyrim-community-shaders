@@ -13,6 +13,9 @@
  *   (Efficiency, which carries deviation 3), AO Source, Direction-Aware Reinjection (deviation 2),
  *   Bounce Light Skips AO (deviation 4), Reflection Misses Use Scene Cubemap (deviation 5).
  *   Off = Quality mode, Screen Space GI's AO, and the batch 34 composite and fallbacks.
+ *   (batch 36c) Steady Confidence and AO (Settings::FilterSignalsFromRays) and the efficiency-mode
+ *   pre-blur only act inside efficiency mode / the denoiser AO tiers, so the master switch reaches
+ *   them through those; the 36c direction-aware reinjection rework is inside deviation 2.
  * - Screen Space GI: Skip IL While SSRT Diffuse Is On (Settings::SkipILUnderSSRTDiffuse)
  * - Variable Rate Shading: can only be forced off here, never on (its own Enable stays the
  *   only way to turn it on).

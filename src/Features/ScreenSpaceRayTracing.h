@@ -91,6 +91,11 @@ struct ScreenSpaceRayTracing : Feature
     static constexpr uint kCompositeTracedSkipsAo = 8u;
     static constexpr uint kCompositeCheckerInput = 16u;
     static constexpr uint kCompositeMissBent = 32u;
+    /// @brief (batch 36c) The denoiser AO's visibility is the quarter-resolution filtered ray signal at
+    /// t11 rather than REBLUR's denoised hit distance; with the second bit, t11 holds the filtered
+    /// confidence and the visibility is 1 - it. See Settings::FilterSignalsFromRays.
+    static constexpr uint kCompositeAoFromFilter = 64u;
+    static constexpr uint kCompositeAoFilterIsConf = 128u;
 
     struct Settings
     {
@@ -497,6 +502,23 @@ struct ScreenSpaceRayTracing : Feature
         /// the blend with partial hits happens before denoising (no dark seams at hit/miss borders).
         /// Default on.
         bool SpecularMissUsesCompositeCubemap = true;
+        /// @brief (batch 36c) Where the two batch 36b signals that multiply the ambient light come from:
+        /// efficiency mode's reinjection confidence (deviation 3) and the denoiser AO tiers' AO.
+        ///
+        /// On (default): from this frame's rays, through the same quarter-resolution joint-bilateral
+        /// filter quality mode's confidence uses (Settings::LowResConfidenceFilter). Under efficiency
+        /// mode the downsample averages only the pixels that traced diffuse this frame
+        /// (ssrt_conf_downsample.hlsl, SSRT_CONF_CHECKERBOARD), so nothing in the chain is older than
+        /// this frame. Zero lag, ~600-1300 rays per output pixel.
+        ///
+        /// Off: batch 36b -- both come from REBLUR's denoised hit distance. That channel is a
+        /// per-pixel ~15-frame average that REBLUR deliberately barely blurs (its blur radius shrinks
+        /// with hit distance and history length, and its hit-distance weight rejects neighbours that
+        /// disagree), and under the checkerboard each missing pixel is rebuilt from its horizontal
+        /// pair. Applied as a multiplier to the ambient after every denoiser, it shows up as a
+        /// crawling, horizontally streaked grain wherever ambient dominates (night, interiors), and it
+        /// trails moving occluders by ~15-30 frames. Kept as the A/B.
+        bool FilterSignalsFromRays = true;
         /// @brief (batch C1) REBLUR tuning for the diffuse instance. NRD defaults.
         NRD::REBLURSettings ReblurDiffuse;
         /// @brief (batch C1) REBLUR tuning for the specular instance. Defaults taken
@@ -959,6 +981,19 @@ struct ScreenSpaceRayTracing : Feature
         /// @brief (batch 36b) Mark, in texCheckerDebug (Buffer Viewer), which pixels traced diffuse
         /// (red) and which traced specular (green) this frame. Efficiency mode only.
         bool CheckerboardDebugView = false;
+        /// @brief (batch 36c, diagnostic) Efficiency mode without its checkerboard: the same merged
+        /// REBLUR_DIFFUSE_SPECULAR instance, the same prev-frame specular trace and the same
+        /// confidence handling, but every pixel traces both signals every frame (CheckerboardMode::OFF).
+        /// Isolates "checkerboard" from "merged instance / efficiency-mode confidence" in one session.
+        /// Costs more than Quality; not meant to be left on.
+        bool EfficiencyFullDensity = false;
+        /// @brief (batch 36c) REBLUR's diffuse pre-pass radius for the efficiency-mode instance, in
+        /// pixels. Every other instance keeps NRD.cpp's 0. With 0 a checkerboard pixel that has no
+        /// diffuse sample this frame is rebuilt from its two horizontal neighbours only (REBLUR's
+        /// fallback resolve, REBLUR_Common_SpatialFilter "sum == 0"), which leaves the reconstructed
+        /// half correlated along rows; NRD's own default is 30, and its checkerboard guidance relies on
+        /// the pre-pass to do that resolve. 0 = batch 36b.
+        float EfficiencyDiffusePrepassRadius = 30.0f;
 #ifdef ENABLE_SHARC
         bool EnableSharc = false;
 #endif
@@ -1788,21 +1823,35 @@ struct ScreenSpaceRayTracing : Feature
     bool denoiserAoWrittenThisFrame = false;
     eastl::unique_ptr<Texture2D> texSSRTAo = nullptr;
     bool EnsureAoTexture();
+    /// @brief (batch 36c) The filtered ray visibility the denoiser AO is built from when
+    /// Settings::FilterSignalsFromRays is on and no filtered confidence can stand in for it (quality
+    /// mode, or efficiency mode without reinjection). R8_UNORM, full size, written by the confidence
+    /// filter's upsample each frame it is needed; allocated on first need, released with the
+    /// confidence filter's working set on a resolution change.
+    eastl::unique_ptr<Texture2D> texSSRTVisSmooth = nullptr;
+    bool EnsureVisSmoothTexture();
+    /// @brief (batch 36c) What the composite read its denoiser-AO visibility from this frame, for the
+    /// menus: 0 = REBLUR's hit distance, 1 = filtered confidence, 2 = filtered visibility.
+    uint aoSignalSourceThisFrame = 0;
+    /// @brief (batch 36c) Whether efficiency mode's confidence came out of the filter this frame.
+    bool efficiencyConfFilteredThisFrame = false;
 
-    /// @brief (batch 36b, deviation 2) The miss bent normal: the ray march's per-frame mean miss direction
-    /// (texMissDirRaw) and its temporal accumulation (texMissBent ping-pong, written by the diffuse
-    /// composite, read by DeferredCompositeCS at t22). R8G8B8A8_SNORM; allocated while the switch is
-    /// on, released when it goes off.
+    /// @brief (batch 36b, deviation 2) Direction-aware reinjection.
+    /// (batch 36c) texMissDirRaw: the ray march's per-pixel mean of (1 - confidence) * DALC(ray) /
+    /// DALC(normal) / 2 (R8_UNORM). texMissBent[0]: the same through the quarter-resolution confidence
+    /// filter, read by DeferredCompositeCS at t22 together with the filtered confidence (t19). Both
+    /// allocated while the switch is on, released when it goes off. texMissBent[1] is unused (it was
+    /// the 36b temporal ping-pong, which this replaces).
     bool missBentActive = false;
     uint missBentIdx = 0;
     eastl::unique_ptr<Texture2D> texMissDirRaw = nullptr;
     eastl::unique_ptr<Texture2D> texMissBent[2] = { nullptr, nullptr };
     bool EnsureMissBentResources();
     void ReleaseMissBentResources();
-    /// @brief The accumulated miss bent normal DeferredCompositeCS should read this frame, or null.
+    /// @brief The filtered miss-ambient signal DeferredCompositeCS should read this frame, or null.
     [[nodiscard]] ID3D11ShaderResourceView* MissBentSRV() const
     {
-        return (loaded && missBentActive && texMissBent[missBentIdx]) ? texMissBent[missBentIdx]->srv.get() : nullptr;
+        return (loaded && missBentActive && texMissBent[0]) ? texMissBent[0]->srv.get() : nullptr;
     }
 
     /// @brief (batch 36b) Settings::CheckerboardDebugView target, R8G8B8A8_UNORM, full size.
@@ -1815,10 +1864,12 @@ struct ScreenSpaceRayTracing : Feature
     /// DLSS-RR hit-distance guide). Returns whether the NRD dispatch completed; on false the
     /// unpack has published this frame's undenoised checkerboard samples and the reset stays
     /// pending, the S1.2 contract of RunReblur.
-    [[nodiscard]] bool RunReblurMerged();
+    /// (batch 36c) a_checkerboard false = Settings::EfficiencyFullDensity (CheckerboardMode::OFF).
+    [[nodiscard]] bool RunReblurMerged(bool a_checkerboard);
     /// @brief (batch 36b) The constant buffer of a specular ray-march dispatch, shared by quality
-    /// mode (DrawSSRTSpecular) and efficiency mode (DrawSSRTDiffuse).
-    SSRTCB BuildSpecularCB(bool a_nrdFrontEndPack, bool a_checkerboard) const;
+    /// mode (DrawSSRTSpecular) and efficiency mode (DrawSSRTDiffuse). (batch 36c) a_prevFrameColor:
+    /// the hit colour comes from last frame's image (efficiency mode, checkerboard or not).
+    SSRTCB BuildSpecularCB(bool a_nrdFrontEndPack, bool a_checkerboard, bool a_prevFrameColor) const;
     /// @brief (batch 36b) Allocate texCheckerDebug on first use of the debug view.
     bool EnsureCheckerDebugTexture();
 
@@ -1881,6 +1932,9 @@ struct ScreenSpaceRayTracing : Feature
     winrt::com_ptr<ID3D11ComputeShader> confBlurHorizontalCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> confBlurVerticalCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> confUpsampleCS = nullptr;
+    /// @brief (batch 36c) SSRT_CONF_CHECKERBOARD twin of confDownsampleCS: averages only the pixels the
+    /// efficiency-mode checkerboard ray march traced this frame (NRDFrameIndex parity, read from b1).
+    winrt::com_ptr<ID3D11ComputeShader> confDownsampleCheckerCS = nullptr;
     /// @brief (batch 1, item 1) ssrt_preblur.hlsl. Nullptr if it failed to compile, in which
     /// case the diffuse chain runs exactly as it did before the pass existed -- including
     /// handing the temporal pass the real FireflyClampSigma back.

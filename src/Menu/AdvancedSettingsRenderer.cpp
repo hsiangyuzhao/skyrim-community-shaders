@@ -128,10 +128,22 @@ void AdvancedSettingsRenderer::RenderBatch36Section()
 	const bool efficiencyOwn = s.ReblurMode == ScreenSpaceRayTracing::kReblurEfficiency;
 	const bool aoOwn = s.AoSource != ScreenSpaceRayTracing::kAoSsgi;
 	const Row rows[] = {
-		{ "REBLUR Mode (Efficiency = checkerboard tracing, one merged denoiser, confidence from the denoiser)", ssrt.loaded,
+		{ "REBLUR Mode (Efficiency = checkerboard tracing, one merged denoiser)", ssrt.loaded,
 			reblurModeNames[std::min(s.ReblurMode, 1u)], efficiencyOwn, ssrt.efficiencyActive,
 			ssrt.efficiencyActive ? "Efficiency" : "Quality",
 			"Lighting > Screen Space Ray Tracing > Denoiser > REBLUR Cost > REBLUR Mode (shown when Denoiser = REBLUR)" },
+		{ "Steady Confidence and AO (36c: Efficiency-mode confidence and Denoiser AO from filtered rays)", ssrt.loaded,
+			onOff(s.FilterSignalsFromRays), s.FilterSignalsFromRays,
+			ssrt.efficiencyConfFilteredThisFrame || ssrt.aoSignalSourceThisFrame != 0,
+			(ssrt.efficiencyConfFilteredThisFrame || ssrt.aoSignalSourceThisFrame != 0) ? "On" :
+			(ssrt.efficiencyActive || ssrt.denoiserAoActive)                            ? "Off (from the denoiser)" :
+			                                                                               "Not used (Quality, SSGI AO)",
+			"Lighting > Screen Space Ray Tracing > Denoiser > REBLUR Cost (shown when Denoiser = REBLUR)" },
+		{ "Efficiency Bounce Light Pre-Blur (36c)", ssrt.loaded,
+			s.EfficiencyDiffusePrepassRadius > 0.0f ? "On" : "Off (0)", s.EfficiencyDiffusePrepassRadius > 0.0f,
+			ssrt.efficiencyActive && s.EfficiencyDiffusePrepassRadius > 0.0f,
+			ssrt.efficiencyActive ? (s.EfficiencyDiffusePrepassRadius > 0.0f ? "On" : "Off") : "Not used (Quality)",
+			"Lighting > Screen Space Ray Tracing > Denoiser > REBLUR Cost (shown when Denoiser = REBLUR)" },
 		{ "AO Source", ssrt.loaded, aoSourceNames[std::min(s.AoSource, 2u)], aoOwn, ssrt.denoiserAoActive,
 			ssrt.denoiserAoActive ? aoSourceNames[std::min(s.AoSource, 2u)] : aoSourceNames[0],
 			"Lighting > Screen Space Ray Tracing > Ambient Occlusion > AO Source" },

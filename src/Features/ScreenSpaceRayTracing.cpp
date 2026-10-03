@@ -430,6 +430,33 @@ void ScreenSpaceRayTracing::DrawSettings()
                 ImGui::TextDisabled("Now: Quality, because %s.", why);
             }
         }
+        // (batch 36c) The efficiency-mode instance's diffuse pre-pass.
+        ImGui::SliderFloat("Efficiency Bounce Light Pre-Blur", &settings.EfficiencyDiffusePrepassRadius, 0.0f, 60.0f, "%.0f px", ImGuiSliderFlags_AlwaysClamp);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Efficiency mode only. In Efficiency mode each pixel gets new bounce light only every other frame; this small blur before the denoiser "
+                "fills the missing pixels from a whole neighbourhood instead of just the pixels to their left and right, which otherwise leaves "
+                "fine horizontal streaks. 30 = NVIDIA's default; 0 = batch 36b.");
+        // (batch 36c) Where efficiency mode's reinjection confidence and the denoiser AO come from.
+        ImGui::Checkbox("Steady Confidence and AO", &settings.FilterSignalsFromRays);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "On = in Efficiency mode, how much normal ambient light is kept (Ambient Reinjection), and the AO of the two Denoiser AO sources, "
+                "are worked out from this frame's rays with the same wide, low-resolution filter Quality mode uses. Steady, no trails.\n"
+                "Off = batch 36b: both are read from the denoiser, which can leave a crawling, streaky grain wherever ambient light dominates "
+                "(night, interiors) and lets it lag behind moving objects. Only matters in Efficiency mode or with a Denoiser AO source.");
+        if (efficiencyActive || denoiserAoActive) {
+            const char* conf = !efficiencyActive || !settings.EnableAmbientReinjection ? nullptr :
+                               efficiencyConfFilteredThisFrame                      ? "confidence filtered" :
+                                                                                       "confidence from the denoiser";
+            const char* ao = !denoiserAoActive              ? nullptr :
+                             aoSignalSourceThisFrame != 0   ? "AO filtered" :
+                                                              "AO from the denoiser";
+            if (conf && ao)
+                ImGui::TextDisabled("Now: %s, %s", conf, ao);
+            else if (conf || ao)
+                ImGui::TextDisabled("Now: %s", conf ? conf : ao);
+        }
         ImGui::Checkbox("Fold Diffuse Unpack Into Composite", &settings.ReblurFoldDiffuseUnpack);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text("Saves GPU time by skipping one full-screen step after the bounce-light denoiser. The picture should not change. Quality mode only; Efficiency always skips it.");
@@ -558,6 +585,14 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::Text(
             "Diagnostic, Efficiency mode only. Paints texCheckerDebug (Buffer Viewer): red where this frame traced bounce light, "
             "green where it traced reflections. It should be a fine checkerboard whose colours swap every frame; the game picture is not changed.");
+
+    // (batch 36c, diagnostic)
+    ImGui::Checkbox("Efficiency Mode Without Checkerboard", &settings.EfficiencyFullDensity);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Diagnostic, Efficiency mode only, slower than Quality. Every pixel traces both bounce light and reflections every frame, "
+            "but everything else about Efficiency mode stays (one shared denoiser, reflections one frame late). "
+            "If a problem disappears with this on, the checkerboard causes it; if it stays, the shared denoiser does.");
 
     ImGui::Checkbox("Freeze Noise Phase", &settings.FreezeNoisePhase);
     if (auto _tt = Util::HoverTooltipWrapper())
@@ -850,6 +885,10 @@ void ScreenSpaceRayTracing::SanitizeSettings()
     // (batch 36b) Likewise for the REBLUR layout.
     settings.ReblurMode = std::min(settings.ReblurMode, (uint)kReblurEfficiency);
     settings.AoSource = std::min(settings.AoSource, (uint)kAoDenoiserOnly);
+    // (batch 36c) A hand-edited NaN would otherwise survive std::clamp at the use site.
+    if (!std::isfinite(settings.EfficiencyDiffusePrepassRadius))
+        settings.EfficiencyDiffusePrepassRadius = 30.0f;
+    settings.EfficiencyDiffusePrepassRadius = std::clamp(settings.EfficiencyDiffusePrepassRadius, 0.0f, 60.0f);
 
     // DIFFUSE_SPP is a compile-time macro and the ray march's sample loop divides by it.
     // 0 is a divide by zero in the estimator; the 16 ceiling is the Hammersley table's.
@@ -902,6 +941,16 @@ void ScreenSpaceRayTracing::SanitizeSettings()
 void ScreenSpaceRayTracing::LoadSettings(json& o_json)
 {
     settings = o_json;
+    // (batch 36c) Read by hand: NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT takes at most 64 fields
+    // and the list above is at that limit. A missing key keeps the default, as the macro would.
+    if (o_json.is_object()) {
+        if (o_json.contains("FilterSignalsFromRays") && o_json["FilterSignalsFromRays"].is_boolean())
+            settings.FilterSignalsFromRays = o_json["FilterSignalsFromRays"].get<bool>();
+        if (o_json.contains("EfficiencyFullDensity") && o_json["EfficiencyFullDensity"].is_boolean())
+            settings.EfficiencyFullDensity = o_json["EfficiencyFullDensity"].get<bool>();
+        if (o_json.contains("EfficiencyDiffusePrepassRadius") && o_json["EfficiencyDiffusePrepassRadius"].is_number())
+            settings.EfficiencyDiffusePrepassRadius = o_json["EfficiencyDiffusePrepassRadius"].get<float>();
+    }
     SanitizeSettings();
     // (S1.4) DiffuseSPP is a compile-time macro. The UI path set recompileFlag; this one did
     // not, so a loaded value the compiled permutation does not implement was traced silently.
@@ -912,6 +961,10 @@ void ScreenSpaceRayTracing::LoadSettings(json& o_json)
 void ScreenSpaceRayTracing::SaveSettings(json& o_json)
 {
     o_json = settings;
+    // (batch 36c) See LoadSettings.
+    o_json["FilterSignalsFromRays"] = settings.FilterSignalsFromRays;
+    o_json["EfficiencyFullDensity"] = settings.EfficiencyFullDensity;
+    o_json["EfficiencyDiffusePrepassRadius"] = settings.EfficiencyDiffusePrepassRadius;
 }
 
 void ScreenSpaceRayTracing::SetupResources()
@@ -1078,6 +1131,8 @@ void ScreenSpaceRayTracing::SetupResources()
         texSSRTConfidenceLoBlur.reset();
         texSSRTConfidenceLoDepth.reset();
         texSSRTConfidenceLoNormal.reset();
+        // (batch 36c) The filtered-visibility surface is sized like the pair above; same reason.
+        texSSRTVisSmooth.reset();
 
         // (batch 1, item 2) The diffuse hit-distance surface. Same R8_UNORM as the confidence
         // pair above and for the same three reasons: the payload is a [0,1] fraction, 1/255 is
@@ -1640,13 +1695,12 @@ bool ScreenSpaceRayTracing::EnsureAoTexture()
     return true;
 }
 
-// (batch 36b, deviation 2) The miss bent normal set: the ray march's raw per-frame value and the
-// accumulated ping-pong pair. R8G8B8A8_SNORM -- a direction weighted by a miss fraction, both
-// within [-1, 1] -- 4 bytes per pixel each, ~33 MiB per surface at 4K. Cleared on allocation so the
-// first frames read "no data" (zero length), which DeferredCompositeCS treats as "no correction".
-bool ScreenSpaceRayTracing::EnsureMissBentResources()
+// (batch 36c) Full-size R8_UNORM, the same shape as texSSRTDiffuseConfidenceSmooth, which the
+// confidence filter's upsample writes in exactly the same way. No clear: the upsample rewrites every
+// texel of the render extent before the composite reads it, in the same frame.
+bool ScreenSpaceRayTracing::EnsureVisSmoothTexture()
 {
-    if (texMissDirRaw && texMissBent[0] && texMissBent[1])
+    if (texSSRTVisSmooth)
         return true;
     auto mainTex = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
     if (!mainTex.texture)
@@ -1658,7 +1712,7 @@ bool ScreenSpaceRayTracing::EnsureMissBentResources()
         .Height = mainDesc.Height,
         .MipLevels = 1,
         .ArraySize = 1,
-        .Format = DXGI_FORMAT_R8G8B8A8_SNORM,
+        .Format = DXGI_FORMAT_R8_UNORM,
         .SampleDesc = { 1, 0 },
         .Usage = D3D11_USAGE_DEFAULT,
         .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
@@ -1673,7 +1727,52 @@ bool ScreenSpaceRayTracing::EnsureMissBentResources()
         .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
         .Texture2D = { .MipSlice = 0 }
     };
-    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    texSSRTVisSmooth = eastl::make_unique<Texture2D>(texDesc);
+    texSSRTVisSmooth->CreateSRV(srvDesc);
+    texSSRTVisSmooth->CreateUAV(uavDesc);
+    Util::SetResourceName(texSSRTVisSmooth->resource.get(), "SSRT::FilteredVisibility");
+    return true;
+}
+
+// (batch 36b, deviation 2) The direction-aware reinjection pair.
+//
+// (batch 36c) Was an R8G8B8A8_SNORM miss bent normal plus an 8-frame ping-pong accumulation, i.e. an
+// unfiltered per-pixel direction drawn from one or two rays a frame, which DeferredCompositeCS then
+// turned into a [0.5, 2] multiplier on the whole re-added ambient. Now two R8_UNORM surfaces: the ray
+// march's per-pixel mean of (1 - confidence) * DALC(ray) / DALC(normal) / 2, and the same after the
+// quarter-resolution confidence filter. The raw one is cleared to 0.5 (a miss with the normal's own
+// ambient, i.e. "no correction"), which only matters for efficiency mode's untraced half on the
+// very first frame; the filtered one is rewritten in full before every read.
+bool ScreenSpaceRayTracing::EnsureMissBentResources()
+{
+    if (texMissDirRaw && texMissBent[0])
+        return true;
+    auto mainTex = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return false;
+    D3D11_TEXTURE2D_DESC mainDesc{};
+    mainTex.texture->GetDesc(&mainDesc);
+    D3D11_TEXTURE2D_DESC texDesc{
+        .Width = mainDesc.Width,
+        .Height = mainDesc.Height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R8_UNORM,
+        .SampleDesc = { 1, 0 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+    };
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+    };
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipSlice = 0 }
+    };
+    const float neutral[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
     auto makeTex = [&](eastl::unique_ptr<Texture2D>& tex, const char* name) {
         if (tex)
             return;
@@ -1681,19 +1780,17 @@ bool ScreenSpaceRayTracing::EnsureMissBentResources()
         tex->CreateSRV(srvDesc);
         tex->CreateUAV(uavDesc);
         Util::SetResourceName(tex->resource.get(), name);
-        globals::d3d::context->ClearUnorderedAccessViewFloat(tex->uav.get(), zero);
+        globals::d3d::context->ClearUnorderedAccessViewFloat(tex->uav.get(), neutral);
     };
-    makeTex(texMissDirRaw, "SSRT::MissDirRaw");
-    makeTex(texMissBent[0], "SSRT::MissBent0");
-    makeTex(texMissBent[1], "SSRT::MissBent1");
-    return texMissDirRaw && texMissBent[0] && texMissBent[1];
+    makeTex(texMissDirRaw, "SSRT::MissAmbientRaw");
+    makeTex(texMissBent[0], "SSRT::MissAmbientFiltered");
+    return texMissDirRaw && texMissBent[0];
 }
 
 void ScreenSpaceRayTracing::ReleaseMissBentResources()
 {
     texMissDirRaw = nullptr;
     texMissBent[0] = nullptr;
-    texMissBent[1] = nullptr;
 }
 
 // (batch 36b) The configuration half of the efficiency-mode question. Everything here is a fact
@@ -1914,6 +2011,7 @@ void ScreenSpaceRayTracing::ResetFrameState()
     texCheckerDebug = nullptr;
     mergedReblurActive = false;
     texSSRTAo = nullptr;
+    texSSRTVisSmooth = nullptr;
     denoiserAoActive = false;
     ReleaseMissBentResources();
     missBentActive = false;
@@ -1949,7 +2047,7 @@ void ScreenSpaceRayTracing::ClearShaderCache()
         &diffuseCompositePackedCS, &diffuseCompositeExternalConfPackedCS,
         // (batch 36b) efficiency mode and the batch 36b composite permutations
         &raymarchDiffuseCheckerCS, &raymarchSpecularCheckerCS, &nrdUnpackSpecEfficiencyCS,
-        &raymarchDiffuseBentCS, &raymarchDiffuseCheckerBentCS,
+        &raymarchDiffuseBentCS, &raymarchDiffuseCheckerBentCS, &confDownsampleCheckerCS,
         &diffuseCompositeB36BCS[0], &diffuseCompositeB36BCS[1], &diffuseCompositeB36BCS[2], &diffuseCompositeB36BCS[3],
 #ifdef ENABLE_SHARC
         &raymarchDiffuseSharcCS, &sharcUpdateRaymarchCS, &sharcResolveCS
@@ -2066,6 +2164,8 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &confBlurHorizontalCS, "ssrt_conf_blur.hlsl", {} },
             { &confBlurVerticalCS, "ssrt_conf_blur.hlsl", { { "SSRT_CONF_BLUR_VERTICAL", "1" } } },
             { &confUpsampleCS, "ssrt_conf_upsample.hlsl", {} },
+            // (batch 36c) Efficiency mode's downsample: only this frame's traced pixels.
+            { &confDownsampleCheckerCS, "ssrt_conf_downsample.hlsl", { { "SSRT_CONF_CHECKERBOARD", "1" } } },
             { &preblurCS, "ssrt_preblur.hlsl", {} },
             { &temporalCS, "ssrt_temporal.hlsl", {} },
             { &temporalDiagCS, "ssrt_temporal.hlsl", definesDenoiserDiag },
@@ -2286,6 +2386,8 @@ void ScreenSpaceRayTracing::Prepass()
     // (batch 36b) Set by DrawSSRTDiffuse when it runs the efficiency path; read by DrawSSRTSpecular.
     efficiencyThisFrame = false;
     denoiserAoWrittenThisFrame = false;
+    efficiencyConfFilteredThisFrame = false;  // (batch 36c) set by DrawSSRTDiffuse
+    aoSignalSourceThisFrame = 0;
 
     // (batch 36b) AO source for this frame, decided here because Screen Space GI draws before either
     // SSRT pass and asks SsgiAoDemand(). The denoiser AO exists only while REBLUR really denoises the
@@ -2520,7 +2622,7 @@ void ScreenSpaceRayTracing::Prepass()
 
 // (batch 36b) The specular ray march's constant buffer, moved out of DrawSSRTSpecular so that
 // efficiency mode, which traces specular from DrawSSRTDiffuse, builds exactly the same one.
-ScreenSpaceRayTracing::SSRTCB ScreenSpaceRayTracing::BuildSpecularCB(bool a_nrdFrontEndPack, bool a_checkerboard) const
+ScreenSpaceRayTracing::SSRTCB ScreenSpaceRayTracing::BuildSpecularCB(bool a_nrdFrontEndPack, bool a_checkerboard, bool a_prevFrameColor) const
 {
     auto& dynamicCubemaps = globals::features::dynamicCubemaps;
     const bool nrdFrontEndPack = a_nrdFrontEndPack;
@@ -2572,7 +2674,9 @@ ScreenSpaceRayTracing::SSRTCB ScreenSpaceRayTracing::BuildSpecularCB(bool a_nrdF
         ssrCBData.CheckerboardTrace = a_checkerboard ? 1u : 0u;
         ssrCBData.NRDFrameIndex = a_checkerboard ? globals::features::nrd.GetCommonSettings().frameIndex : 0u;
         uint flags = 0;
-        if (a_checkerboard)
+        // (batch 36c) Its own argument: efficiency mode's full-density diagnostic traces without the
+        // checkerboard but still before this frame's image exists.
+        if (a_prevFrameColor)
             flags |= kRaymarchPrevFrameColor;
         if (a_checkerboard && settings.CheckerboardDebugView)
             flags |= kRaymarchCheckerDebug;
@@ -2679,7 +2783,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     const bool nrdFrontEndPack = (denoiser == kDenoiserREBLUR);
 
     // (batch 36b) The constant buffer moved into BuildSpecularCB, shared with efficiency mode.
-    const SSRTCB ssrCBData = BuildSpecularCB(nrdFrontEndPack, false);
+    const SSRTCB ssrCBData = BuildSpecularCB(nrdFrontEndPack, false, false);
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
     context->CSSetConstantBuffers(1, 1, &buffer);
@@ -3191,7 +3295,7 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
 // Then the specular unpack, which also rebuilds the DLSS-RR hit-distance guide for every pixel. The
 // diffuse output stays packed: the batch 36b composite reads it directly (and publishes the
 // confidence from it), so there is no diffuse unpack in this mode at all.
-bool ScreenSpaceRayTracing::RunReblurMerged()
+bool ScreenSpaceRayTracing::RunReblurMerged(bool a_checkerboard)
 {
     auto context = globals::d3d::context;
     auto state = globals::state;
@@ -3218,7 +3322,11 @@ bool ScreenSpaceRayTracing::RunReblurMerged()
         // BLACK: diffuse has data where (x ^ y ^ frameIndex) & 1 == 0, specular where it is 1. The
         // ray march derives its lanes from the same rule and the same frameIndex (ssrt_raymarch.hlsl,
         // SSRT_CHECKERBOARD).
-        nrdSvc.ApplyReblurSettings(reblurMergedSettings, settings.ReblurMerged, nrd::CheckerboardMode::BLACK);
+        nrdSvc.ApplyReblurSettings(reblurMergedSettings, settings.ReblurMerged, a_checkerboard ? nrd::CheckerboardMode::BLACK : nrd::CheckerboardMode::OFF);
+        // (batch 36c) The diffuse pre-pass, for this instance only (Settings::EfficiencyDiffusePrepassRadius):
+        // with a checkerboard it is what resolves the half of the pixels that has no diffuse sample
+        // this frame, from a geometry-weighted disc instead of the two horizontal neighbours.
+        reblurMergedSettings.diffusePrepassBlurRadius = std::clamp(settings.EfficiencyDiffusePrepassRadius, 0.0f, 60.0f);
         reblurMergedSettings.hitDistanceParameters.A = settings.ReblurHitDistA;
         reblurMergedSettings.hitDistanceParameters.B = settings.ReblurHitDistB;
         reblurMergedSettings.hitDistanceParameters.C = settings.ReblurHitDistC;
@@ -3252,7 +3360,7 @@ bool ScreenSpaceRayTracing::RunReblurMerged()
         unpackCB.NRDHitDistA = settings.ReblurHitDistA;
         unpackCB.NRDHitDistB = settings.ReblurHitDistB;
         unpackCB.NRDHitDistC = settings.ReblurHitDistC;
-        unpackCB.CompositeFlags = dispatched ? 0u : kCompositeCheckerInput;
+        unpackCB.CompositeFlags = (dispatched || !a_checkerboard) ? 0u : kCompositeCheckerInput;
         ssrtCB->Update(unpackCB);
         auto unpackBuffer = ssrtCB->CB();
         context->CSSetConstantBuffers(1, 1, &unpackBuffer);
@@ -3377,6 +3485,11 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // Checkerboard dispatch: one lane per horizontal pair, every row.
     const uint checkerDispatchX = (((uint)size.x + 1u) / 2u + 7u) / 8u;
     const uint checkerDispatchY = ((uint)size.y + 7u) / 8u;
+    // (batch 36c, diagnostic) Settings::EfficiencyFullDensity: efficiency mode with every pixel tracing
+    // both signals -- the full-resolution ray marches, CheckerboardMode::OFF, and the plain confidence
+    // downsample. Everything else about efficiency mode (merged instance, prev-frame specular,
+    // proximity coverage, confidence source) is unchanged.
+    const bool checker = efficiency && !settings.EfficiencyFullDensity;
 
     // (reinjection noise) Whether the confidence accumulator runs this frame. Decided once, in
     // the constant-buffer block below, and read again by the composite dispatch so the CPU-side
@@ -3392,11 +3505,23 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     //
     // (batch 36b) Retired in efficiency mode (deviation 3): the merged denoiser supplies the
     // confidence, so neither this filter nor the accumulator below runs.
-    const bool confidenceFilter =
-        !efficiency &&
-        settings.EnableAmbientReinjection && settings.LowResConfidenceFilter &&
+    //
+    // (batch 36c) ...which put REBLUR's hit-distance channel -- a per-pixel ~15-frame average that
+    // REBLUR barely blurs, rebuilt along horizontal pairs under the checkerboard -- straight onto
+    // the ambient as a multiplier, and the grain came back. With Settings::FilterSignalsFromRays on
+    // (default) efficiency mode runs this filter again, on this frame's traced pixels only
+    // (confDownsampleCheckerCS), whatever LowResConfidenceFilter says: that switch is the batch 6
+    // A/B against the 7x7 window, whose input would be half last frame's here. Off = batch 36b.
+    // The accumulator below stays retired in efficiency mode either way.
+    const bool rayFiltered = Batch36::IsOn() && settings.FilterSignalsFromRays;
+    const bool confFilterShaders =
         confDownsampleCS && confBlurHorizontalCS && confBlurVerticalCS && confUpsampleCS &&
-        diffuseCompositeExternalConfCS && EnsureConfidenceFilterResources();
+        diffuseCompositeExternalConfCS && (!checker || confDownsampleCheckerCS);
+    const bool confidenceFilter =
+        settings.EnableAmbientReinjection &&
+        (efficiency ? rayFiltered : settings.LowResConfidenceFilter) &&
+        confFilterShaders && EnsureConfidenceFilterResources();
+    efficiencyConfFilteredThisFrame = efficiency && confidenceFilter;
 
     SSRTCB ssrCBData;
     {
@@ -3463,22 +3588,22 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // (batch 36b) Efficiency mode: checkerboard lanes on NRD's frame index, and the REBLUR-convention
         // visibility in the hit-distance channel, which is where the confidence now comes from
         // (deviation 3) -- with the radiance weighted to match whenever reinjection consumes it.
-        ssrCBData.CheckerboardTrace = efficiency ? 1u : 0u;
-        ssrCBData.NRDFrameIndex = efficiency ? globals::features::nrd.GetCommonSettings().frameIndex : 0u;
+        ssrCBData.CheckerboardTrace = checker ? 1u : 0u;
+        ssrCBData.NRDFrameIndex = checker ? globals::features::nrd.GetCommonSettings().frameIndex : 0u;
         // (batch 36b) ...and the denoiser AO tiers read the same channel as their AO.
         ssrCBData.HitDistIsVisibility = (efficiency || denoiserAoActive) ? 1u : 0u;
         // (batch 36b) Under a denoiser AO tier t9 is texSSRTAo, which this frame's composite has not
         // written yet: the fallbacks read last frame's, reprojected.
         ssrCBData.AoFetchReprojected = denoiserAoActive ? 1u : 0u;
         ssrCBData.ProximityCoverage = (efficiency && settings.EnableAmbientReinjection) ? 1u : 0u;
-        ssrCBData.RaymarchFlags = (efficiency && settings.CheckerboardDebugView) ? kRaymarchCheckerDebug : 0u;
+        ssrCBData.RaymarchFlags = (checker && settings.CheckerboardDebugView) ? kRaymarchCheckerDebug : 0u;
     }
     ssrtCB->Update(ssrCBData);
     auto buffer = ssrtCB->CB();
     context->CSSetConstantBuffers(1, 1, &buffer);
 
     // (batch 36b) The checkerboard debug surface: cleared, then marked by both traces.
-    const bool checkerDebug = efficiency && settings.CheckerboardDebugView && EnsureCheckerDebugTexture();
+    const bool checkerDebug = checker && settings.CheckerboardDebugView && EnsureCheckerDebugTexture();
     if (checkerDebug) {
         const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
         context->ClearUnorderedAccessViewFloat(texCheckerDebug->uav.get(), black);
@@ -3536,7 +3661,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     if (missBentActive)
         uavs.at(2) = texMissDirRaw->uav.get();
     ID3D11ComputeShader* const diffuseRaymarchShader =
-        efficiency ? (missBentActive ? raymarchDiffuseCheckerBentCS.get() : raymarchDiffuseCheckerCS.get()) :
+        checker ? (missBentActive ? raymarchDiffuseCheckerBentCS.get() : raymarchDiffuseCheckerCS.get()) :
                      (missBentActive ? raymarchDiffuseBentCS.get() : raymarchDiffuseCS.get());
     if (checkerDebug)
         uavs.at(7) = texCheckerDebug->uav.get();
@@ -3590,7 +3715,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 #else
     context->CSSetShader(diffuseRaymarchShader, nullptr, 0);
 #endif
-    if (efficiency)
+    if (checker)
         context->Dispatch(checkerDispatchX, checkerDispatchY, 1);
     else
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
@@ -3609,7 +3734,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         state->BeginPerfEvent("SSRT Specular Trace (checkerboard)");
         Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTraceSpecular);
 
-        const SSRTCB specCBData = BuildSpecularCB(true, true);
+        const SSRTCB specCBData = BuildSpecularCB(true, checker, true);
         ssrtCB->Update(specCBData);
         auto specBuffer = ssrtCB->CB();
         context->CSSetConstantBuffers(1, 1, &specBuffer);
@@ -3632,8 +3757,11 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         srvs.at(11) = dynamicCubemaps.loaded && skylighting.loaded ? skylighting.stbn_vec3_2Dx1D_128x128x64.get() : nullptr;
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-        context->CSSetShader(raymarchSpecularCheckerCS.get(), nullptr, 0);
-        context->Dispatch(checkerDispatchX, checkerDispatchY, 1);
+        context->CSSetShader(checker ? raymarchSpecularCheckerCS.get() : raymarchSpecularCS.get(), nullptr, 0);
+        if (checker)
+            context->Dispatch(checkerDispatchX, checkerDispatchY, 1);
+        else
+            context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
 
         // The diffuse constants back for every pass below that reads b1.
@@ -3674,12 +3802,14 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // RunReblurMerged, the diffuse one is read packed by the composite, which also publishes
         // the reinjection confidence from it (deviation 3). On a failed dispatch both fall back to
         // this frame's raw checkerboard samples, each pixel taking its pair's traced one.
-        const bool dispatched = RunReblurMerged();
+        const bool dispatched = RunReblurMerged(checker);
         lastDiffuseReblurOk = dispatched;
         compositePacked = true;
         compositeSource = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
-        compositeFlags |= kCompositeConfFromDenoiser;
-        if (!dispatched)
+        // (batch 36c) Only when the confidence filter is not publishing it from this frame's rays.
+        if (!confidenceFilter)
+            compositeFlags |= kCompositeConfFromDenoiser;
+        if (!dispatched && checker)
             compositeFlags |= kCompositeCheckerInput;
     } else if (denoiser == kDenoiserSVGF) {
         Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTSvgf);
@@ -3928,9 +4058,19 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // reason: its input is the raw ray-march confidence (which the denoiser never touches) and its
     // output is read by DeferredCompositeCS, which Deferred::DeferredPasses dispatches after this
     // whole function. Nothing between those two points reads a previous frame.
-    if (confidenceFilter) {
-        state->BeginPerfEvent("SSRT Confidence Filter");
-        Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTConfidenceFilter);
+    //
+    // (batch 36c) Factored into a lambda so the same three stages can also filter the ray march's raw
+    // visibility for the denoiser AO tiers (below). a_rawInput is the full-resolution raw signal --
+    // read by the downsample and as the upsample's degenerate fallback -- and a_output the
+    // full-resolution result. Under efficiency mode the downsample is the checkerboard twin, which
+    // reads NRDFrameIndex from b1; RunReblurMerged left b1 holding its unpack constants, so this
+    // frame's diffuse constants go back first.
+    const auto runSignalFilter = [&](ID3D11ShaderResourceView* a_rawInput, ID3D11UnorderedAccessView* a_output) {
+        if (efficiency) {
+            ssrtCB->Update(ssrCBData);
+            buffer = ssrtCB->CB();
+            context->CSSetConstantBuffers(1, 1, &buffer);
+        }
 
         // The quarter-resolution grid, rounded up exactly as every shader in the chain rounds it,
         // and the dispatch that covers it.
@@ -3941,7 +4081,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 
         // Stage 1: 2x2 depth- and normal-aware average of the raw confidence, publishing the
         // low-resolution depth and normal guides the two stages after it are steered by.
-        srvs.at(0) = texSSRTDiffuseConfidence->srv.get();
+        srvs.at(0) = a_rawInput;
         srvs.at(1) = depth.depthSRV;
         srvs.at(2) = normal.SRV;
         uavs.at(0) = texSSRTConfidenceLo->uav.get();
@@ -3949,7 +4089,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         uavs.at(2) = texSSRTConfidenceLoNormal->uav.get();
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
-        context->CSSetShader(confDownsampleCS.get(), nullptr, 0);
+        context->CSSetShader(checker ? confDownsampleCheckerCS.get() : confDownsampleCS.get(), nullptr, 0);
         context->Dispatch(loDispatchX, loDispatchY, 1);
         resetViews();
 
@@ -3976,22 +4116,19 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // DeferredCompositeCS needs no change. The raw confidence at t0 is the fallback a pixel
         // with no geometrically valid low-resolution neighbour publishes; see the degeneracy rule
         // in ssrt_conf_upsample.hlsl.
-        srvs.at(0) = texSSRTDiffuseConfidence->srv.get();
+        srvs.at(0) = a_rawInput;
         srvs.at(1) = depth.depthSRV;
         srvs.at(2) = normal.SRV;
         srvs.at(3) = texSSRTConfidenceLo->srv.get();
         srvs.at(4) = texSSRTConfidenceLoDepth->srv.get();
         srvs.at(5) = texSSRTConfidenceLoNormal->srv.get();
-        uavs.at(0) = texSSRTDiffuseConfidenceSmooth->uav.get();
+        uavs.at(0) = a_output;
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
         context->CSSetShader(confUpsampleCS.get(), nullptr, 0);
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
-
-        Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTConfidenceFilter);
-        state->EndPerfEvent();
-    }
+    };
 
     // (batch 36b) Denoiser AO tier: the composite also publishes texSSRTAo from the denoised
     // visibility (times Screen Space GI's contact term in the contact tier), and the traced light it
@@ -3999,22 +4136,67 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // on their own indirect light (deviation 4 always holds for this AO). Only when REBLUR really
     // denoised the signal this frame -- otherwise .w is not a visibility, nothing is written, and
     // DeferredCompositeCS keeps reading Screen Space GI's texture for this one frame.
+    //
+    // (batch 36c) The visibility itself comes, by default, from this frame's rays through the filter
+    // above rather than from REBLUR's hit distance (Settings::FilterSignalsFromRays): the latter is
+    // the same barely-blurred, ~15-frame, checkerboard-reconstructed channel the efficiency-mode
+    // confidence was, multiplying the same ambient. Under efficiency mode with reinjection the ray
+    // march already makes the confidence exactly 1 - visibility per pixel (SSRTCB::ProximityCoverage:
+    // both are the same distance-attenuated coverage, fill included), and every stage of the filter
+    // is linear in its payload with geometry-only weights, so the filtered confidence is reused and
+    // the chain runs once. Otherwise the chain runs a second time on the raw visibility the ray march
+    // writes to texSSRTDiffuseHitDistance (its mean of 1 - coverage under HitDistIsVisibility).
+    const bool aoWanted = denoiserAoActive && nrdFrontEndPack;
+    const bool aoFromConf = aoWanted && rayFiltered && efficiency && confidenceFilter;
+    const bool aoFromVis = aoWanted && rayFiltered && !aoFromConf && confFilterShaders &&
+                           EnsureConfidenceFilterResources() && EnsureVisSmoothTexture();
+
+    // (batch 36c, deviation 2) Direction-aware reinjection's signal goes through the same filter: it is
+    // a per-pixel mean over one or two rays, applied as a multiplier on the re-added ambient, which is
+    // exactly the kind of quantity this chain exists for. DeferredCompositeCS divides it by the
+    // filtered miss mass (1 - the filtered confidence) to get the ambient ratio of the directions the
+    // rays escaped through, averaged over the neighbourhood instead of guessed from one pixel's rays.
+    const bool missFiltered = missBentActive && texMissDirRaw && texMissBent[0] && confFilterShaders && EnsureConfidenceFilterResources();
+
+    if (confidenceFilter || aoFromVis || missFiltered) {
+        state->BeginPerfEvent("SSRT Confidence Filter");
+        Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTConfidenceFilter);
+        if (confidenceFilter)
+            runSignalFilter(texSSRTDiffuseConfidence->srv.get(), texSSRTDiffuseConfidenceSmooth->uav.get());
+        if (aoFromVis)
+            runSignalFilter(texSSRTDiffuseHitDistance->srv.get(), texSSRTVisSmooth->uav.get());
+        if (missFiltered)
+            runSignalFilter(texMissDirRaw->srv.get(), texMissBent[0]->uav.get());
+        Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTConfidenceFilter);
+        state->EndPerfEvent();
+    }
+
     ID3D11ShaderResourceView* contactVisibility = nullptr;
-    if (denoiserAoActive && nrdFrontEndPack) {
+    ID3D11ShaderResourceView* filteredAoSignal = nullptr;
+    aoSignalSourceThisFrame = 0;
+    if (aoWanted) {
         compositeFlags |= kCompositeWriteAo | kCompositeTracedSkipsAo;
         if (settings.AoSource == kAoDenoiserContact) {
             contactVisibility = ssgi.GetContactVisibilitySRV();
             if (contactVisibility)
                 compositeFlags |= kCompositeAoContact;
         }
+        if (aoFromConf) {
+            compositeFlags |= kCompositeAoFromFilter | kCompositeAoFilterIsConf;
+            filteredAoSignal = texSSRTDiffuseConfidenceSmooth->srv.get();
+            aoSignalSourceThisFrame = 1;
+        } else if (aoFromVis) {
+            compositeFlags |= kCompositeAoFromFilter;
+            filteredAoSignal = texSSRTVisSmooth->srv.get();
+            aoSignalSourceThisFrame = 2;
+        }
     }
     // (batch 36b, deviation 4) The same exemption against Screen Space GI's AO. Only where that AO is
     // applied at all: DeferredCompositeCS compiles its AO under SSGI's define.
     if (Batch36::IsOn() && settings.TracedLightSkipsAo && ssgi.loaded)
         compositeFlags |= kCompositeTracedSkipsAo;
-    // (batch 36b, deviation 2) Accumulate the miss bent normal.
-    if (missBentActive)
-        compositeFlags |= kCompositeMissBent;
+    // (batch 36b, deviation 2) The composite used to accumulate the miss bent normal here
+    // (kCompositeMissBent); (batch 36c) the filter above replaces that, so the flag is never set.
 
     // composite
     Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTComposite);
@@ -4031,6 +4213,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
             srvs.at(4) = depth.depthSRV;
             srvs.at(7) = contactVisibility;
             srvs.at(8) = ssgi_ao;
+            // (batch 36c) The filtered ray signal the denoiser AO is built from (kCompositeAoFromFilter).
+            srvs.at(11) = filteredAoSignal;
         }
         if (!confidenceFilter) {
             // (ambient reinjection) The pass doubles as the confidence smoothing filter: it reads
@@ -4071,15 +4255,6 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
             uavs.at(3) = texSSRTAo->uav.get();
             uavCount = 4;
         }
-        // (batch 36b, deviation 2) Raw miss direction at t9, last frame's accumulation at t10 (read at
-        // the motion-reprojected position, motion at t6), this frame's accumulation at u4.
-        if ((compositeFlags & kCompositeMissBent) != 0) {
-            srvs.at(6) = motion.SRV;
-            srvs.at(9) = texMissDirRaw->srv.get();
-            srvs.at(10) = texMissBent[missBentIdx]->srv.get();
-            uavs.at(4) = texMissBent[!missBentIdx]->uav.get();
-            uavCount = 5;
-        }
         ssrCBData.CompositeFlags = compositeFlags;
         ssrtCB->Update(ssrCBData);
         buffer = ssrtCB->CB();
@@ -4108,11 +4283,6 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // (batch 36b) DeferredCompositeCS and a quality-mode specular trace read it from here on.
         if ((compositeFlags & kCompositeWriteAo) != 0)
             denoiserAoWrittenThisFrame = true;
-        // (batch 36b, deviation 2) The accumulation just written becomes the one MissBentSRV() hands
-        // DeferredCompositeCS, and next frame's history.
-        if ((compositeFlags & kCompositeMissBent) != 0)
-            missBentIdx = !missBentIdx;
-
         // (reinjection noise) This frame's accumulator becomes next frame's history. A pointer
         // swap, matching the moment pair at the end of the SVGF block, so no copy is issued.
         if (confidenceTemporal)
