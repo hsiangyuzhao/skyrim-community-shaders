@@ -3,6 +3,7 @@
 
 #include "NRD.h"
 #include "Utils/Batch36f.h"
+#include "Utils/Batch36g.h"
 
 struct ScreenSpaceRayTracing : Feature
 {
@@ -82,8 +83,45 @@ struct ScreenSpaceRayTracing : Feature
         kSamplingCheckerboard = 2,
     };
 
+    /// @brief (batch 36g) Tracing pattern of the checkerboard / merged-denoiser diagnostic matrix
+    /// (specs/spec-batch36g-checkerboard-diagnostic-matrix.md). Mirrored by B36G_PATTERN_* in
+    /// ssrt_b36g.hlsli, which documents each pattern's cell rule.
+    enum B36gPatternValue : uint
+    {
+        kB36gFull = 0,  ///< both signals at every pixel (batch 36f)
+        kB36gA = 1,     ///< strict complementary checkerboard, NRD fills (CheckerboardMode::BLACK)
+        kB36gB = 2,     ///< probabilistic lobe selection, Bayer4x4 + Weyl, p in [1/4, 3/4], AREA_3X3
+        kB36gC = 3,     ///< complementary checkerboard, our own resolves fill
+    };
+
+    /// @brief (batch 36g) Debug views, written into texB36gDebug and shown in Advanced > Batch 36g.
+    enum B36gDebugValue : uint
+    {
+        kB36gDebugOff = 0,
+        kB36gDebugPattern = 1,       ///< red = diffuse traced, green = reflection traced
+        kB36gDebugFillDiffuse = 2,   ///< diffuse denoiser input, before / after hole filling
+        kB36gDebugFillSpecular = 3,  ///< reflection denoiser input, before / after hole filling
+    };
+
     struct Settings
     {
+        /// @brief (batch 36g) Experiment switches. Every default is the batch 36f behaviour, and the
+        /// Batch 36g master switch (Advanced > Batch 36g) forces all of them back to it.
+        uint B36gPattern = kB36gFull;
+        /// @brief (batch 36g) One REBLUR_DIFFUSE_SPECULAR instance instead of the two separate ones.
+        bool B36gMergedDenoiser = false;
+        /// @brief (batch 36g) The merged instance's one set of accumulation settings: batch 36b's
+        /// compromise (30 / 3 / 15, fast clamp 1.75) when true, the diffuse instance's settings when
+        /// false. Shown on the panel either way.
+        bool B36gMergedUse36bTuning = true;
+        /// @brief (batch 36g) 0 = the batch 34 self-filtered confidence (hard constraint 3, default);
+        /// 1 = 1 - REBLUR's denoised visibility (batch 36b), only to reproduce 36b.
+        uint B36gConfidenceSource = 0;
+        /// @brief (batch 36g) REBLUR's diffuse pre-pass blur. Forced on by pattern B.
+        bool B36gDiffusePrepass = false;
+        float B36gDiffusePrepassRadius = 30.0f;
+        uint B36gDebugView = kB36gDebugOff;
+
         bool EnableSpecular = true;
         /// @brief (S3.9) Default 64, down from 128. The slider is unchanged (1-256), so this
         /// is a default and nothing else -- anyone who wants the old reach types it back.
@@ -1044,6 +1082,57 @@ struct ScreenSpaceRayTracing : Feature
     };
     static_assert(sizeof(CompositeCB) == 16);
 
+    /// @brief (batch 36g) `SSRTPatternCB` at b3, declared only by the batch 36g permutations
+    /// (ssrt_b36g.hlsli), so the default permutations neither declare nor read it.
+    struct alignas(16) PatternCB
+    {
+        uint Pattern = 0;          ///< B36gPatternValue of this frame
+        uint DiffuseMapping = 0;   ///< B36G_MAP_* of the diffuse ray march lanes
+        uint FrameIndex = 0;       ///< nrd::CommonSettings::frameIndex (State::frameCount)
+        uint Flags = 0;            ///< bit 0: confidence source 2 (visibility in the hit-distance channel)
+        float WeylShift = 0.0f;    ///< frac(FrameIndex / sqrt(7))
+        uint DebugMode = 0;        ///< B36G_DEBUG_*
+        uint DebugFlags = 0;       ///< B36G_DBGF_*
+        uint SpecularMapping = 0;  ///< B36G_MAP_* of the reflection ray march lanes
+    };
+    static_assert(sizeof(PatternCB) == 32);
+
+    /// @brief (batch 36g) Lane mappings, mirroring B36G_MAP_* in ssrt_b36g.hlsli.
+    enum B36gMapping : uint
+    {
+        kB36gMapIdentity = 0,
+        kB36gMapNrd = 1,
+        kB36gMapBatch12 = 2,
+        kB36gMapProb = 3,
+    };
+
+    /// @brief (batch 36g) What actually runs this frame, resolved once per frame in Prepass by
+    /// ResolveB36g(). Notes point at string literals or are null.
+    struct B36gFrame
+    {
+        uint pattern = kB36gFull;
+        bool merged = false;
+        uint confSource = 0;
+        bool diffusePrepass = false;
+        /// Pattern A or B: REBLUR runs the reflection pre-pass whatever 36f's "Skip Reflection
+        /// Pre-pass" says (NRD forces it in checkerboard mode; probabilistic selection needs it).
+        bool specPrepassForced = false;
+        /// Pattern A or B with the Low-Resolution Confidence Filter off: the filter runs anyway,
+        /// because the full-resolution 7x7 window cannot skip the untraced pixels.
+        bool lowResFilterForced = false;
+        const char* patternNote = nullptr;
+        const char* mergedNote = nullptr;
+        const char* confNote = nullptr;
+        const char* prepassNote = nullptr;
+        /// Set by the draw passes: the folded unpack fell back to the separate pass this frame.
+        const char* foldNote = nullptr;
+        /// Set by the draw passes: the pattern actually traced (A/B drop to Full on a frame whose
+        /// REBLUR guides are missing).
+        uint drawnPattern = kB36gFull;
+        bool mergedDrawn = false;
+    };
+    B36gFrame b36g{};
+
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules
     /// reproduce this layout verbatim. ssrt_temporal.hlsl declares all four rows,
@@ -1125,6 +1214,50 @@ struct ScreenSpaceRayTracing : Feature
     eastl::unique_ptr<ConstantBuffer> compositeCB;
     ID3D11ShaderResourceView* specularCompositeSRV = nullptr;
     bool specularCompositePacked = false;
+    // (batch 36g) b3 of the pattern permutations, and what the merged dispatch (run inside
+    // DrawSSRTDiffuse) left for DrawSSRTSpecular to hand the deferred composite.
+    eastl::unique_ptr<ConstantBuffer> patternCB;
+    ID3D11ShaderResourceView* mergedSpecularCompositeSRV = nullptr;
+    bool mergedSpecularCompositePacked = false;
+    /// @brief (batch 36g) Key of the last frame's effective combination; any change resets every
+    /// denoiser history (spec: "switching any item resets the denoiser history").
+    uint lastB36gKey = 0;
+
+    /// @brief (batch 36g) Resolve b36g for this frame (Prepass, after ResolveDenoisers).
+    void ResolveB36g();
+    /// @brief (batch 36g) Compile the batch 36g permutations on first need (a one-off hitch the
+    /// first time a combination needs them; the default never compiles them).
+    void CompileB36gShaders();
+    bool b36gShadersCompiled = false;
+    /// @brief (batch 36g) Combination number of the spec's test table (1-7, 8 = Full + merged)
+    /// for an effective or requested state.
+    [[nodiscard]] static uint B36gCombination(uint a_pattern, bool a_merged);
+    /// @brief (batch 36g) One line describing this frame's combination, for the panel and the F11
+    /// log snapshot.
+    [[nodiscard]] std::string DescribeB36g(bool a_effective) const;
+    [[nodiscard]] static const char* B36gPatternName(uint a_pattern);
+    /// @brief (batch 36g) b3 contents for this frame's pattern.
+    [[nodiscard]] PatternCB BuildPatternCB(uint a_pattern, uint a_samplingMode) const;
+    void BindPatternCB(const PatternCB& a_data);
+    /// @brief (batch 36g) NRD settings of this frame's combination, applied after
+    /// NRD::ApplyReblurSettings. A no-op on the default combination.
+    void ConfigureReblurB36g(nrd::ReblurSettings& a_settings, bool a_hasDiffuse, bool a_hasSpecular, uint a_pattern) const;
+    /// @brief (batch 36g) Reflection tracing shared by DrawSSRTSpecular and the merged path in
+    /// DrawSSRTDiffuse: SSRTCB, prepare colour, ray march, and under pattern C the resolve.
+    /// a_target receives the full-resolution reflection (packed if a_pack).
+    void TraceSpecular(uint a_pattern, bool a_pack, ID3D11UnorderedAccessView* a_target);
+    /// @brief (batch 36g) The merged REBLUR_DIFFUSE_SPECULAR dispatch. Mirrors RunReblur.
+    [[nodiscard]] bool RunReblurMerged(uint a_pattern, bool a_foldDiffuse, bool a_foldSpecular, bool& a_diffuseUnpacked, bool& a_specularUnpacked);
+    bool EnsureMergedResources();
+    bool mergedInitFailed = false;
+    bool EnsureB36gSpecSparseResources();
+    bool EnsureB36gDebugResources();
+    void DispatchB36gFillDebug(bool a_specular, uint a_pattern, ID3D11ShaderResourceView* a_input, bool a_inputPacked);
+    void DispatchB36gPatternDebug(uint a_pattern, uint a_samplingMode);
+    /// @brief (batch 36g) Unpack of a compact checkerboard (pattern A) input when the REBLUR dispatch
+    /// did not run: each pixel takes its pair's traced sample.
+    void UnpackCompact(ID3D11ShaderResourceView* a_input, ID3D11UnorderedAccessView* a_target);
+    bool b36gMergedRanThisFrame = false;
 
     bool recompileFlag = false;
 
@@ -1430,7 +1563,11 @@ struct ScreenSpaceRayTracing : Feature
     /// (batch 36f) a_skipUnpack: leave the result packed (texNRDPackOutput on success,
     /// texNRDPackInput on failure) for the caller's composite to decode; see
     /// Settings::ReblurFoldUnpack.
-    [[nodiscard]] bool RunReblur(bool a_specular, bool a_skipUnpack = false);
+    /// (batch 36g) a_pattern: this chain's tracing pattern (NRD checkerboard / hit-distance
+    /// reconstruction / pre-pass follow from it). Under pattern A a failed dispatch leaves a compact
+    /// input that no packed reader can decode, so the compact unpack runs even when a_skipUnpack is
+    /// set; a_unpacked (if given) reports whether texRadiance holds the result.
+    [[nodiscard]] bool RunReblur(bool a_specular, bool a_skipUnpack = false, uint a_pattern = kB36gFull, bool* a_unpacked = nullptr);
 
     /// @brief (batch 36f) Effective switches: own setting AND the Batch 36f master switch.
     [[nodiscard]] bool SkipSpecularPrepassActive() const { return Batch36f::IsOn() && settings.ReblurSkipSpecularPrepass; }
@@ -1765,6 +1902,24 @@ struct ScreenSpaceRayTracing : Feature
     nrd::ReblurSettings reblurDiffuseSettings{};
     nrd::ReblurSettings reblurSpecularSettings{};
 
+    /// @brief (batch 36g) Merged denoiser: one REBLUR_DIFFUSE_SPECULAR instance plus the second
+    /// packed pair it needs (both signals are denoised in one dispatch; texNRDPackInput/Output keep
+    /// carrying diffuse). Allocated the first time the merged switch is effective, kept afterwards so
+    /// the A/B is instant, released with everything else on a resolution change.
+    NRDReblurIntegration nrdReblurMerged;
+    nrd::ReblurSettings reblurMergedSettings{};
+    bool resetReblurMerged = true;
+    eastl::unique_ptr<Texture2D> texNRDSpecInput = nullptr;
+    eastl::unique_ptr<Texture2D> texNRDSpecOutput = nullptr;
+    /// @brief (batch 36g, pattern C) Compact reflection outputs of the ray march, read by
+    /// ssrt_spec_resolve.hlsl: linear radiance (RGBA16F), world hit distance (R32F), hit point or
+    /// direction + pdf (RGBA32F). ceil(width / 2) x height, like the batch 12 sparse set.
+    eastl::unique_ptr<Texture2D> texSparseSpecColor = nullptr;
+    eastl::unique_ptr<Texture2D> texSparseSpecHitDist = nullptr;
+    eastl::unique_ptr<Texture2D> texSparseSpecHitInfo = nullptr;
+    /// @brief (batch 36g) Debug view (RGBA8), shown in Advanced > Batch 36g.
+    eastl::unique_ptr<Texture2D> texB36gDebug = nullptr;
+
 #ifdef ENABLE_SHARC
     eastl::unique_ptr<Buffer> sharcHashEntries = nullptr;
     eastl::unique_ptr<Buffer> sharcHashCopyOffsets = nullptr;
@@ -1862,6 +2017,16 @@ struct ScreenSpaceRayTracing : Feature
     winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseCheckerCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> sparseResolveHalfResCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> sparseResolveCheckerCS = nullptr;
+    // (batch 36g) Pattern permutations; compiled by CompileB36gShaders on first need.
+    winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseB36gCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> raymarchSpecularB36gCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> confDownsamplePatternCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> confUpsamplePatternCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> diffuseCompositeNrdConfCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> diffuseCompositeNrdConfPackedCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> nrdUnpackCompactCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> specResolveCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> b36gDebugCS = nullptr;
 #ifdef ENABLE_SHARC
     winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseSharcCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> sharcUpdateRaymarchCS = nullptr;

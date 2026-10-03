@@ -407,6 +407,7 @@ void ScreenSpaceRayTracing::DrawSettings()
         if (reblurChanged) {
             resetReblurDiffuse = true;
             resetReblurSpecular = true;
+            resetReblurMerged = true;
         }
     }
 
@@ -428,6 +429,9 @@ void ScreenSpaceRayTracing::DrawSettings()
     }
     if (!Batch36f::IsOn())
         ImGui::TextDisabled("Batch 36f master switch is off (Advanced > Batch 36f): no distance limit.");
+    // (batch 36g) The diagnostic matrix lives in its own tab; one line here so it can be found.
+    ImGui::TextDisabled("Checkerboard / merged-denoiser experiments: Advanced > Batch 36g (now combination #%u).",
+        B36gCombination(b36g.drawnPattern, b36g.mergedDrawn));
 
     if (SVGFSelected()) {
         ImGui::Checkbox("Pre-Blur", &settings.EnablePreBlur);
@@ -799,6 +803,11 @@ void ScreenSpaceRayTracing::SanitizeSettings()
     // "sparse, but neither of the two sparse modes", which would leave the compact set allocated
     // and no shader selected to write it.
     settings.DiffuseSamplingMode = std::min(settings.DiffuseSamplingMode, (uint)kSamplingCheckerboard);
+    // (batch 36g) Experiment switches.
+    settings.B36gPattern = std::min(settings.B36gPattern, (uint)kB36gC);
+    settings.B36gConfidenceSource = std::min(settings.B36gConfidenceSource, 1u);
+    settings.B36gDebugView = std::min(settings.B36gDebugView, (uint)kB36gDebugFillSpecular);
+    settings.B36gDiffusePrepassRadius = std::isfinite(settings.B36gDiffusePrepassRadius) ? std::clamp(settings.B36gDiffusePrepassRadius, 5.0f, 60.0f) : 30.0f;
     // (audit P3) The traversal can load exactly mip MaxMips, and mip maxMips-1 is the last
     // one allocated; an out-of-range Load returns 0 == near plane, i.e. an instant false hit.
     settings.MaxMips = std::clamp(settings.MaxMips, 1u, maxMips - 1u);
@@ -850,6 +859,20 @@ void ScreenSpaceRayTracing::SanitizeSettings()
 void ScreenSpaceRayTracing::LoadSettings(json& o_json)
 {
     settings = o_json;
+    // (batch 36g) Kept in a sub-object: the serializer macro above is at nlohmann's argument limit.
+    if (o_json.is_object() && o_json.contains("Batch36g") && o_json["Batch36g"].is_object()) {
+        const auto& b = o_json["Batch36g"];
+        const auto getU = [&](const char* k, uint& v) { if (b.contains(k) && b[k].is_number_unsigned()) v = b[k].get<uint>(); };
+        const auto getB = [&](const char* k, bool& v) { if (b.contains(k) && b[k].is_boolean()) v = b[k].get<bool>(); };
+        getU("Pattern", settings.B36gPattern);
+        getB("MergedDenoiser", settings.B36gMergedDenoiser);
+        getB("MergedUse36bTuning", settings.B36gMergedUse36bTuning);
+        getU("ConfidenceSource", settings.B36gConfidenceSource);
+        getB("DiffusePrepass", settings.B36gDiffusePrepass);
+        if (b.contains("DiffusePrepassRadius") && b["DiffusePrepassRadius"].is_number())
+            settings.B36gDiffusePrepassRadius = b["DiffusePrepassRadius"].get<float>();
+        getU("DebugView", settings.B36gDebugView);
+    }
     SanitizeSettings();
     // (S1.4) DiffuseSPP is a compile-time macro. The UI path set recompileFlag; this one did
     // not, so a loaded value the compiled permutation does not implement was traced silently.
@@ -860,6 +883,15 @@ void ScreenSpaceRayTracing::LoadSettings(json& o_json)
 void ScreenSpaceRayTracing::SaveSettings(json& o_json)
 {
     o_json = settings;
+    json b;
+    b["Pattern"] = settings.B36gPattern;
+    b["MergedDenoiser"] = settings.B36gMergedDenoiser;
+    b["MergedUse36bTuning"] = settings.B36gMergedUse36bTuning;
+    b["ConfidenceSource"] = settings.B36gConfidenceSource;
+    b["DiffusePrepass"] = settings.B36gDiffusePrepass;
+    b["DiffusePrepassRadius"] = settings.B36gDiffusePrepassRadius;
+    b["DebugView"] = settings.B36gDebugView;
+    o_json["Batch36g"] = b;
 }
 
 void ScreenSpaceRayTracing::SetupResources()
@@ -878,6 +910,7 @@ void ScreenSpaceRayTracing::SetupResources()
         ssrtCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<SSRTCB>());
         denoiserCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<DenoiserCB>());
         compositeCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<CompositeCB>());
+        patternCB = eastl::make_unique<ConstantBuffer>(ConstantBufferDesc<PatternCB>());  // (batch 36g)
         // (batch 11, item A) nrdPackCB is gone with ssrt_nrd_pack.hlsl: its three constants ride
         // on row 3 of SSRTCB, which the ray march already binds.
     }
@@ -1491,6 +1524,14 @@ uint ScreenSpaceRayTracing::ResolveSamplingMode()
 {
     uint mode = std::min(settings.DiffuseSamplingMode, (uint)kSamplingCheckerboard);
 
+    // (batch 36g) The tracing pattern overrides the sampling mode: C traces diffuse on batch 12's
+    // checkerboard (and its resolve), A and B trace diffuse through their own permutation at full
+    // resolution layout. ResolveB36g has already checked that C's shaders exist.
+    if (b36g.pattern == kB36gC)
+        mode = kSamplingCheckerboard;
+    else if (b36g.pattern == kB36gA || b36g.pattern == kB36gB)
+        mode = kSamplingFull;
+
     // Nothing to sample sparsely if the diffuse chain is not running at all, and this is the path
     // that gives the compact set back instead of stranding ~41 MB of a 4K allocation.
     if (!settings.EnableDiffuse)
@@ -1782,6 +1823,21 @@ void ScreenSpaceRayTracing::ResetFrameState()
     // asks for a sparse mode.
     ReleaseSparseResources();
     activeSamplingMode = kSamplingFull;
+
+    // (batch 36g) The merged instance, its packed pair, pattern C's compact reflection set and the
+    // debug view are sized from kMAIN too; the next frame that needs them rebuilds them.
+    resetReblurMerged = true;
+    nrdReblurMerged.Shutdown();
+    mergedInitFailed = false;
+    texNRDSpecInput = nullptr;
+    texNRDSpecOutput = nullptr;
+    texSparseSpecColor = nullptr;
+    texSparseSpecHitDist = nullptr;
+    texSparseSpecHitInfo = nullptr;
+    texB36gDebug = nullptr;
+    b36gMergedRanThisFrame = false;
+    mergedSpecularCompositeSRV = nullptr;
+    mergedSpecularCompositePacked = false;
 }
 
 void ScreenSpaceRayTracing::ClearShaderCache()
@@ -1949,6 +2005,71 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
     // Prepass can notice a setting change on any path -- UI, config load, RestoreDefaults --
     // rather than only on the one that remembered to raise recompileFlag.
     compiledDiffuseSPP = settings.DiffuseSPP;
+
+    // (batch 36g) The pattern permutations share these axes (DIFFUSE_SPP and the feature defines),
+    // so they are dropped with the rest and rebuilt the next time a combination needs them.
+    raymarchDiffuseB36gCS = nullptr;
+    raymarchSpecularB36gCS = nullptr;
+    confDownsamplePatternCS = nullptr;
+    confUpsamplePatternCS = nullptr;
+    diffuseCompositeNrdConfCS = nullptr;
+    diffuseCompositeNrdConfPackedCS = nullptr;
+    nrdUnpackCompactCS = nullptr;
+    specResolveCS = nullptr;
+    b36gDebugCS = nullptr;
+    b36gShadersCompiled = false;
+}
+
+// (batch 36g) Compiled on first need rather than at startup: the default combination never uses
+// them, so a user who never touches the Batch 36g tab pays nothing, and the first selection of a
+// combination costs a one-off compile hitch (cached on disk by the driver afterwards).
+void ScreenSpaceRayTracing::CompileB36gShaders()
+{
+    if (b36gShadersCompiled)
+        return;
+    b36gShadersCompiled = true;
+
+    std::vector<std::pair<const char*, const char*>> defines;
+    if (globals::features::dynamicCubemaps.loaded)
+        defines.push_back({ "DYNAMIC_CUBEMAPS", nullptr });
+    if (globals::features::screenSpaceGI.loaded)
+        defines.push_back({ "SSGI", nullptr });
+    if (globals::features::skylighting.loaded)
+        defines.push_back({ "SKYLIGHTING", nullptr });
+    const std::string DiffuseSPPStr = std::to_string(settings.DiffuseSPP);
+    defines.push_back({ "DIFFUSE_SPP", DiffuseSPPStr.c_str() });
+
+    auto definesDiffuse = defines;
+    definesDiffuse.push_back({ "SSRT_B36G", "1" });
+    auto definesSpecular = defines;
+    definesSpecular.push_back({ "SSRT_SPECULAR", nullptr });
+    definesSpecular.push_back({ "SSRT_B36G", "1" });
+
+    struct Info
+    {
+        winrt::com_ptr<ID3D11ComputeShader>* program;
+        std::string_view file;
+        std::vector<std::pair<const char*, const char*>> defines;
+    };
+    std::vector<Info> infos = {
+        { &raymarchDiffuseB36gCS, "ssrt_raymarch.hlsl", definesDiffuse },
+        { &raymarchSpecularB36gCS, "ssrt_raymarch.hlsl", definesSpecular },
+        { &confDownsamplePatternCS, "ssrt_conf_downsample.hlsl", { { "SSRT_CONF_PATTERN", "1" } } },
+        { &confUpsamplePatternCS, "ssrt_conf_upsample.hlsl", { { "SSRT_CONF_PATTERN", "1" } } },
+        { &diffuseCompositeNrdConfCS, "ssrt_diffuse_composite.hlsl", { { "SSRT_CONF_EXTERNAL_FILTER", "1" }, { "SSRT_B36G_CONF_NRD", "1" } } },
+        { &diffuseCompositeNrdConfPackedCS, "ssrt_diffuse_composite.hlsl", { { "SSRT_CONF_EXTERNAL_FILTER", "1" }, { "SSRT_B36G_CONF_NRD", "1" }, { "SSRT_DIFFUSE_PACKED_INPUT", "1" } } },
+        { &nrdUnpackCompactCS, "ssrt_nrd_unpack.hlsl", { { "SSRT_B36G_UNPACK_COMPACT", "1" } } },
+        { &specResolveCS, "ssrt_spec_resolve.hlsl", {} },
+        { &b36gDebugCS, "ssrt_b36g_debug.hlsl", {} },
+    };
+    logger::info("SSRT: compiling the batch 36g pattern permutations");
+    for (auto& info : infos) {
+        auto path = std::filesystem::path("Data\\Shaders\\ScreenSpaceRayTracing") / info.file;
+        if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), info.defines, "cs_5_0")))
+            info.program->attach(rawPtr);
+        else
+            logger::warn("SSRT: batch 36g permutation {} failed to compile; the combinations that need it fall back", info.file);
+    }
 }
 
 // (guard G8) The SVGF history is the only state in this feature that outlives a frame, and
@@ -2069,6 +2190,7 @@ void ScreenSpaceRayTracing::UpdateHistoryValidity()
     if (reblurRising || diffuseRising || specularRising) {
         resetReblurDiffuse = true;
         resetReblurSpecular = true;
+        resetReblurMerged = true;
     }
 
     lastEffectiveDenoiserDiffuse = effectiveDenoiserDiffuse;
@@ -2089,6 +2211,7 @@ void ScreenSpaceRayTracing::UpdateHistoryValidity()
             // SVGF's; a load, fast travel or door transition invalidates both.
             resetReblurDiffuse = true;
             resetReblurSpecular = true;
+            resetReblurMerged = true;
         }
         // (audit P9) Same lookup, so the interior test rides along instead of repeating it:
         // both draw passes read this member and neither may pay for the cell walk again.
@@ -2118,6 +2241,11 @@ void ScreenSpaceRayTracing::Prepass()
     // where the state machine got to. This is also where the REBLUR path is brought up, so
     // no dispatch gate is ever the first thing to ask whether its resources exist.
     ResolveDenoisers();
+
+    // (batch 36g) After the denoisers (several combinations need REBLUR on both chains) and before
+    // UpdateHistoryValidity (a change of combination resets the histories it latches).
+    b36gMergedRanThisFrame = false;
+    ResolveB36g();
 
     // (guard G8) Before the enable gate below, so a transition is never missed just because
     // both passes happened to be off on the frame it occurred; the flag latches until a
@@ -2328,41 +2456,17 @@ void ScreenSpaceRayTracing::BindCompositeConstants()
     globals::d3d::context->CSSetConstantBuffers(1, 1, &buffer);
 }
 
-void ScreenSpaceRayTracing::DrawSSRTSpecular()
+// (batch 36g) The reflection trace, moved out of DrawSSRTSpecular unchanged so the merged denoiser
+// can run it from DrawSSRTDiffuse (the one REBLUR_DIFFUSE_SPECULAR dispatch needs both inputs before
+// the diffuse composite). On the default combination this issues exactly the dispatches and bindings
+// DrawSSRTSpecular used to: SSRTCB, prepare colour, ray march. Patterns A, B and C swap in the
+// pattern permutation, and C adds its resolve, which writes a_target and texHitDistance at full
+// resolution from the compact reflection set.
+void ScreenSpaceRayTracing::TraceSpecular(uint a_pattern, bool a_pack, ID3D11UnorderedAccessView* a_target)
 {
-    // (batch 36f) What DeferredCompositeCS reads at t16 unless the REBLUR block below folds the
-    // unpack: the linear surface, as before. Reset every frame before any early-out.
-    specularCompositeSRV = texSSRColor ? texSSRColor->srv.get() : nullptr;
-    specularCompositePacked = false;
-
-    if (!settings.EnableSpecular)
-        return;
-
-    // (S1.4) See the matching guard in DrawSSRTDiffuse. Neutral here is a zeroed texSSRColor
-    // and a zeroed hit distance: the deferred composite binds texSSRColor directly and adds
-    // it, so zero is "no reflection contribution", and Upscaling's DLSS-RR guide reads the
-    // hit distance, which must not be a stale or uninitialised depth.
-    if (!prepareColorCS || !raymarchSpecularCS || !texColor || !texSSRColor || !texHitDistance) {
-        auto ctx = globals::d3d::context;
-        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-        if (texSSRColor)
-            ctx->ClearUnorderedAccessViewFloat(texSSRColor->uav.get(), zero);
-        if (texHitDistance)
-            ctx->ClearUnorderedAccessViewFloat(texHitDistance->uav.get(), zero);
-        // The once-per-frame history snapshot is specular's responsibility when it runs; with
-        // the chain down, diffuse's own `if (!settings.EnableSpecular)` branch will not have
-        // taken it either, so take it here rather than leaving the SVGF history geometry a
-        // frame stale.
-        CopyHistoryGeometry();
-        return;
-    }
-
     auto renderer = globals::game::renderer;
     auto context = globals::d3d::context;
     auto state = globals::state;
-
-    state->BeginPerfEvent("SSRT Compute");
-    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTraceSpecular);
 
     auto main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
     auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
@@ -2376,27 +2480,20 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 
     float2 size = Util::ConvertToDynamic(state->screenSize);
     float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
+    const bool nrdFrontEndPack = a_pack;
 
-    // (batch 11, item A) This frame's denoiser, resolved *before* the ray march instead of after
-    // it. It has to move up because the ray march now decides its own output layout on the
-    // answer, and it can move up safely because nothing in the answer depends on the ray march:
-    // EffectiveDenoiser was resolved in Prepass, and ReblurReady / SvgfChainReady ask only about
-    // this frame's guides and this feature's own allocations.
-    //
-    // (S1.3) The one thing still worth re-testing at this point is whether this frame's guides
-    // arrived, since Prepass runs ahead of NRD::PrepareGuides.
-    uint denoiser = EffectiveDenoiser(true);
-    if (denoiser == kDenoiserREBLUR && !ReblurReady(true)) {
-        denoiser = SvgfChainReady(true) ? kDenoiserSVGF : kDenoiserOff;
-        // The SVGF history was not maintained while REBLUR owned the signal, so reseed it
-        // next frame rather than accumulate onto whatever it last held.
-        historyClearPending = true;
+    // (batch 36g) Pattern permutation and lane mapping. ResolveB36g only lets a pattern through with
+    // its shaders and surfaces present, and DrawSSRTSpecular drops A/B to Full on a non-REBLUR frame.
+    bool b36gTrace = a_pattern != kB36gFull && raymarchSpecularB36gCS;
+    uint b36gMapping = !b36gTrace ? (uint)kB36gMapIdentity :
+                             a_pattern == kB36gA ? (uint)kB36gMapNrd :
+                             a_pattern == kB36gB ? (uint)kB36gMapProb : (uint)kB36gMapBatch12;
+    const bool b36gCompactC = b36gTrace && b36gMapping == kB36gMapBatch12 && specResolveCS &&
+                              texSparseSpecColor && texSparseSpecHitDist && texSparseSpecHitInfo;
+    if (b36gMapping == kB36gMapBatch12 && !b36gCompactC) {
+        b36gTrace = false;  // unreachable: ResolveB36g checked the compact set
+        b36gMapping = kB36gMapIdentity;
     }
-    // (batch 11, item A) Whether the ray march writes REBLUR's front-end layout into
-    // texNRDPackInput at u0 instead of its own linear layout into texSSRColor. Derived from the
-    // same `denoiser` the RunReblur call below is gated on, so the two cannot disagree; and
-    // denoiser == kDenoiserREBLUR implies ReblurReady, which implies texNRDPackInput exists.
-    const bool nrdFrontEndPack = (denoiser == kDenoiserREBLUR);
 
     SSRTCB ssrCBData;
     {
@@ -2452,12 +2549,10 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     auto buffer = ssrtCB->CB();
     context->CSSetConstantBuffers(1, 1, &buffer);
 
-    // (audit P6) Specular raymarch UAV slots: u0 radiance/confidence,
-	// u1 hit distance (was u2; u1 came free when texHitPDF was dropped). The SVGF
-	// temporal pass below reuses u0/u1 for its own two outputs.
-    // (diagnostic H) Three slots now, because ssrt_temporal.hlsl declares texDebugHistory at
-    // u2. The specular chain never writes it -- it passes historyDebugView 0 -- but the slot is
-    // bound anyway so that the declared UAV is never left dangling from another pass.
+    // (batch 36g) b3 for the pattern permutation and the resolve; nothing else declares it.
+    if (b36gTrace)
+        BindPatternCB(BuildPatternCB(a_pattern, kSamplingFull));
+
     std::array<ID3D11ShaderResourceView*, 12> srvs = { nullptr };
 	std::array<ID3D11UnorderedAccessView*, 3> uavs = { nullptr };
 
@@ -2500,10 +2595,13 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
     // meaning of the four channels changes, and SSRTCB::NRDFrontEndPack is what tells the shader
     // which meaning to write. Under REBLUR the back-end unpack is what fills texSSRColor, which
     // is where the deferred composite reads it from either way.
-    uavs.at(0) = nrdFrontEndPack ? texNRDPackInput->uav.get() : texSSRColor->uav.get();
+    uavs.at(0) = b36gCompactC ? texSparseSpecColor->uav.get() : a_target;
     // Unchanged on both paths: this R32_FLOAT surface is Upscaling.cpp's DLSS-RR specular
     // hit-distance guide, not private pack-pass input, so it cannot be traded away.
-    uavs.at(1) = texHitDistance->uav.get();  // (audit P6) was u2; u1 freed by dropping texHitPDF
+    uavs.at(1) = b36gCompactC ? texSparseSpecHitDist->uav.get() : texHitDistance->uav.get();  // (audit P6) was u2; u1 freed by dropping texHitPDF
+    // (batch 36g, pattern C) The compact hit point / direction + pdf the resolve re-weights.
+    if (b36gCompactC)
+        uavs.at(2) = texSparseSpecHitInfo->uav.get();
 
     // (S2.5) t0 stays unbound. ssrt_raymarch.hlsl declares HistoryTexture at t0 and never
     // references it, so fxc strips the binding entirely -- and texHistory is allocated lazily
@@ -2523,15 +2621,154 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 
     context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
     context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-    context->CSSetShader(raymarchSpecularCS.get(), nullptr, 0);
+    context->CSSetShader(b36gTrace ? raymarchSpecularB36gCS.get() : raymarchSpecularCS.get(), nullptr, 0);
     context->CSSetConstantBuffers(1, 1, &buffer);
 
-    context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+    // (batch 36g) A compact mapping traces one lane per horizontal pair.
+    uint traceGroupsX = (uint)dispatchCount.x;
+    if (b36gMapping == kB36gMapNrd)
+        traceGroupsX = ((((uint)size.x + 1u) >> 1) + 7u) / 8u;
+    else if (b36gMapping == kB36gMapBatch12)
+        traceGroupsX = (std::max(1u, (uint)size.x >> 1) + 7u) / 8u;
+    context->Dispatch(traceGroupsX, (uint)dispatchCount.y, 1);
 
     state->EndPerfEvent();
-    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceSpecular);
 
     resetViews();
+
+    // (batch 36g, pattern C) Our own reflection hole filling: full-resolution radiance into a_target
+    // (packed when a_pack, per SSRTCB::NRDFrontEndPack) and the DLSS-RR hit-distance guide.
+    if (b36gCompactC) {
+        state->BeginPerfEvent("SSRT Reflection Resolve");
+        srvs.at(0) = texSparseSpecColor->srv.get();
+        srvs.at(1) = texSparseSpecHitDist->srv.get();
+        srvs.at(2) = normal.SRV;
+        srvs.at(3) = texSparseSpecHitInfo->srv.get();
+        srvs.at(4) = depth.depthSRV;
+        uavs.at(0) = a_target;
+        uavs.at(1) = texHitDistance->uav.get();
+        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+        context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
+        context->CSSetShader(specResolveCS.get(), nullptr, 0);
+        context->CSSetConstantBuffers(1, 1, &buffer);
+        {
+            Util::DenoiserTimerScope timing("SSRT", "Reflection resolve (36g C)",
+                (uint)dispatchCount.x, (uint)dispatchCount.y, (uint)dispatchCount.x * 8u, (uint)dispatchCount.y * 8u);
+            context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
+        }
+        resetViews();
+        state->EndPerfEvent();
+    }
+}
+
+void ScreenSpaceRayTracing::DrawSSRTSpecular()
+{
+    // (batch 36f) What DeferredCompositeCS reads at t16 unless the REBLUR block below folds the
+    // unpack: the linear surface, as before. Reset every frame before any early-out.
+    specularCompositeSRV = texSSRColor ? texSSRColor->srv.get() : nullptr;
+    specularCompositePacked = false;
+
+    if (!settings.EnableSpecular)
+        return;
+
+    // (S1.4) See the matching guard in DrawSSRTDiffuse. Neutral here is a zeroed texSSRColor
+    // and a zeroed hit distance: the deferred composite binds texSSRColor directly and adds
+    // it, so zero is "no reflection contribution", and Upscaling's DLSS-RR guide reads the
+    // hit distance, which must not be a stale or uninitialised depth.
+    if (!prepareColorCS || !raymarchSpecularCS || !texColor || !texSSRColor || !texHitDistance) {
+        auto ctx = globals::d3d::context;
+        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        if (texSSRColor)
+            ctx->ClearUnorderedAccessViewFloat(texSSRColor->uav.get(), zero);
+        if (texHitDistance)
+            ctx->ClearUnorderedAccessViewFloat(texHitDistance->uav.get(), zero);
+        // The once-per-frame history snapshot is specular's responsibility when it runs; with
+        // the chain down, diffuse's own `if (!settings.EnableSpecular)` branch will not have
+        // taken it either, so take it here rather than leaving the SVGF history geometry a
+        // frame stale.
+        CopyHistoryGeometry();
+        return;
+    }
+
+    // (batch 36g) Merged denoiser: DrawSSRTDiffuse already traced the reflections into the merged
+    // instance's second input and ran the one REBLUR_DIFFUSE_SPECULAR dispatch (it has to run before
+    // the diffuse composite, which needs the denoised diffuse). All that is left here is to tell the
+    // deferred composite what t16 holds, and the once-per-frame history snapshot.
+    if (b36gMergedRanThisFrame) {
+        if (mergedSpecularCompositeSRV) {
+            specularCompositeSRV = mergedSpecularCompositeSRV;
+            specularCompositePacked = mergedSpecularCompositePacked;
+        }
+        CopyHistoryGeometry();
+        return;
+    }
+
+    auto renderer = globals::game::renderer;
+    auto context = globals::d3d::context;
+    auto state = globals::state;
+
+    state->BeginPerfEvent("SSRT Compute");
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTraceSpecular);
+
+    auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+    auto normal = renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
+    auto motion = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
+
+    float2 size = Util::ConvertToDynamic(state->screenSize);
+    float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
+
+    // (batch 11, item A) This frame's denoiser, resolved *before* the ray march instead of after
+    // it. It has to move up because the ray march now decides its own output layout on the
+    // answer, and it can move up safely because nothing in the answer depends on the ray march:
+    // EffectiveDenoiser was resolved in Prepass, and ReblurReady / SvgfChainReady ask only about
+    // this frame's guides and this feature's own allocations.
+    //
+    // (S1.3) The one thing still worth re-testing at this point is whether this frame's guides
+    // arrived, since Prepass runs ahead of NRD::PrepareGuides.
+    uint denoiser = EffectiveDenoiser(true);
+    if (denoiser == kDenoiserREBLUR && !ReblurReady(true)) {
+        denoiser = SvgfChainReady(true) ? kDenoiserSVGF : kDenoiserOff;
+        // The SVGF history was not maintained while REBLUR owned the signal, so reseed it
+        // next frame rather than accumulate onto whatever it last held.
+        historyClearPending = true;
+    }
+    // (batch 11, item A) Whether the ray march writes REBLUR's front-end layout into
+    // texNRDPackInput at u0 instead of its own linear layout into texSSRColor. Derived from the
+    // same `denoiser` the RunReblur call below is gated on, so the two cannot disagree; and
+    // denoiser == kDenoiserREBLUR implies ReblurReady, which implies texNRDPackInput exists.
+    const bool nrdFrontEndPack = (denoiser == kDenoiserREBLUR);
+
+    // (batch 36g) This chain's tracing pattern. A and B hand NRD a pattern only REBLUR can fill, so
+    // a frame whose REBLUR path is not ready traces at full resolution instead.
+    uint pattern = b36g.pattern;
+    if ((pattern == kB36gA || pattern == kB36gB) && !nrdFrontEndPack)
+        pattern = kB36gFull;
+
+    // (batch 11, item A) u0 is the packed NRD front-end surface under REBLUR and the chain's own
+    // radiance surface otherwise. Same slot, same format (both RGBA16F), same dispatch: only the
+    // meaning of the four channels changes, and SSRTCB::NRDFrontEndPack is what tells the shader
+    // which meaning to write. Under REBLUR the back-end unpack is what fills texSSRColor, which
+    // is where the deferred composite reads it from either way.
+    TraceSpecular(pattern, nrdFrontEndPack, nrdFrontEndPack ? texNRDPackInput->uav.get() : texSSRColor->uav.get());
+
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceSpecular);
+
+    // (audit P6) Specular raymarch UAV slots: u0 radiance/confidence,
+	// u1 hit distance (was u2; u1 came free when texHitPDF was dropped). The SVGF
+	// temporal pass below reuses u0/u1 for its own two outputs.
+    // (diagnostic H) Three slots now, because ssrt_temporal.hlsl declares texDebugHistory at
+    // u2. The specular chain never writes it -- it passes historyDebugView 0 -- but the slot is
+    // bound anyway so that the declared UAV is never left dangling from another pass.
+    std::array<ID3D11ShaderResourceView*, 12> srvs = { nullptr };
+	std::array<ID3D11UnorderedAccessView*, 3> uavs = { nullptr };
+
+    auto resetViews = [&]() {
+		srvs.fill(nullptr);
+		uavs.fill(nullptr);
+
+		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
+	};
 
     // (defect D4) The temporal history must be fed from the *first* a-trous iteration, not
     // from the end of the chain.
@@ -2706,9 +2943,12 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         // holds this frame's raw ray march, which is the correct thing to publish and to
         // hand the composite. The reset stays pending inside RunReblur.
         // (batch 36f, item 4) Folded unpack: DeferredCompositeCS decodes the packed surface.
+        // (batch 36g) RunReblur unpacks anyway when pattern A's dispatch failed (compact input);
+        // texSSRColor then holds the result and t16 stays linear.
         const bool foldUnpack = FoldUnpackActive();
-        const bool dispatched = RunReblur(true, foldUnpack);
-        if (foldUnpack) {
+        bool unpacked = false;
+        const bool dispatched = RunReblur(true, foldUnpack, pattern, &unpacked);
+        if (foldUnpack && !unpacked) {
             specularCompositeSRV = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
             specularCompositePacked = true;
         }
@@ -2805,8 +3045,10 @@ void ScreenSpaceRayTracing::CopyHistoryGeometry()
 // function is now part of the ray march: texNRDPackInput arrives already carrying this frame's
 // radiance in NRD's IN_*_RADIANCE_HITDIST layout, because the caller bound it at u0 and set
 // SSRTCB::NRDFrontEndPack on the same condition that calls this function.
-bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
+bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack, uint a_pattern, bool* a_unpacked)
 {
+    if (a_unpacked)
+        *a_unpacked = false;
     auto context = globals::d3d::context;
     auto state = globals::state;
     auto& nrdSvc = globals::features::nrd;
@@ -2893,6 +3135,10 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
                 reblurNative.usePrepassOnlyForSpecularMotionEstimation = settings.UsePrepassOnlyForSpecularMotionEstimation;
             }
         }
+        // (batch 36g) Checkerboard mode, hit-distance reconstruction and the pre-passes of this
+        // frame's combination. Applied last, so a pattern that needs the reflection pre-pass wins
+        // over 36f's skip. A no-op on the default combination.
+        ConfigureReblurB36g(reblurNative, !a_specular, a_specular, a_pattern);
         integration.SetDenoiserSettings(&reblurNative);
 
         integration.SetNamedSRV(nrd::ResourceType::IN_MV, nrdSvc.GetMotionVectorSRV());
@@ -2909,6 +3155,14 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
             integration.SetNamedSRV(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, texInput->srv.get());
             integration.SetNamedSRV(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, texOutput->srv.get());
             integration.SetNamedUAV(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, texOutput->uav.get());
+        }
+
+        // (batch 36g) Debug view: this chain's NRD input before / after hole filling, captured now,
+        // before the other chain reuses the shared packed surface.
+        if (settings.B36gDebugView == (a_specular ? kB36gDebugFillSpecular : kB36gDebugFillDiffuse)) {
+            DispatchB36gFillDebug(a_specular, a_pattern, texInput->srv.get(), true);
+            std::array<ID3D11SamplerState*, 1> samplers = { linearSampler.get() };
+            context->CSSetSamplers(0, 1, samplers.data());
         }
 
         integration.SetTimingGroup(a_specular ? "NRD specular" : "NRD diffuse");
@@ -2940,7 +3194,17 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
 
     // (batch 36f, item 4) Folded unpack: the caller's composite decodes the packed surface itself
     // (texOutput on success, texInput on failure -- the same choice as below).
-    if (!a_skipUnpack) {
+    // (batch 36g) Pattern A's input is the compact checkerboard layout, which neither the packed
+    // composites nor the plain unpack can read: a failed dispatch always takes the compact unpack.
+    if (!dispatched && a_pattern == kB36gA && nrdUnpackCompactCS) {
+        UnpackCompact(texInput->srv.get(), texRadiance->uav.get());
+        if (a_unpacked)
+            *a_unpacked = true;
+        if (a_skipUnpack)
+            b36g.foldNote = "pattern A: REBLUR did not run this frame, so the separate (compact) unpack ran instead of the folded one";
+    } else if (!a_skipUnpack) {
+        if (a_unpacked)
+            *a_unpacked = true;
         srvs.at(0) = (dispatched ? texOutput : texInput)->srv.get();
         uavs.at(0) = texRadiance->uav.get();
 
@@ -3048,7 +3312,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // clamped neighbour, so nothing is left stale at the edge.
     const uint traceExtentX = sparseSampling ? std::max(1u, (uint)size.x / 2u) : (uint)size.x;
     const uint traceExtentY = samplingMode == kSamplingHalfRes ? std::max(1u, (uint)size.y / 2u) : (uint)size.y;
-    const uint traceDispatchX = (traceExtentX + 7u) / 8u;
+    uint traceDispatchX = (traceExtentX + 7u) / 8u;  // (batch 36g) pattern A narrows it below
     const uint traceDispatchY = (traceExtentY + 7u) / 8u;
 
     // (reinjection noise) Whether the confidence accumulator runs this frame. Decided once, in
@@ -3062,23 +3326,59 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
     // disagreement between them would leave texSSRTDiffuseConfidenceSmooth written twice or not at
     // all. The allocation is attempted as part of the predicate, before any dispatch binds it, so a
     // failure simply selects the full-resolution 7x7 path, which is the toggle's off behaviour.
-    const bool confidenceFilter =
-        settings.EnableAmbientReinjection && settings.LowResConfidenceFilter &&
-        confDownsampleCS && confBlurHorizontalCS && confBlurVerticalCS && confUpsampleCS &&
-        diffuseCompositeExternalConfCS && EnsureConfidenceFilterResources();
-
+    //
     // (batch 11, item A) This frame's denoiser, resolved before the ray march rather than after
     // it: the ray march now chooses its own output layout on the answer. See the matching site
     // and derivation in DrawSSRTSpecular.
     //
     // (S1.3) Resolved in Prepass; re-tested here only for this frame's guides, and it falls back
     // to SVGF rather than to raw noise.
+    //
+    // (batch 36g) Resolved above the confidence-filter decision now, because the confidence
+    // source and the pattern both depend on it; it binds and dispatches nothing.
     uint denoiser = EffectiveDenoiser(false);
     if (denoiser == kDenoiserREBLUR && !ReblurReady(false)) {
         denoiser = SvgfChainReady(false) ? kDenoiserSVGF : kDenoiserOff;
         historyClearPending = true;
     }
     const bool nrdFrontEndPack = (denoiser == kDenoiserREBLUR);
+
+    // (batch 36g) This frame's combination as the diffuse chain runs it. A and B hand NRD a pattern
+    // only REBLUR can fill, so a frame whose REBLUR path is not ready traces at full resolution. The
+    // merged dispatch needs both chains' REBLUR this frame. Confidence source 2 reads REBLUR's
+    // denoised visibility, so it needs this frame's REBLUR too.
+    uint b36gPattern = b36g.pattern;
+    if ((b36gPattern == kB36gA || b36gPattern == kB36gB) && !nrdFrontEndPack)
+        b36gPattern = kB36gFull;
+    const bool b36gMerged = b36g.merged && nrdFrontEndPack && ReblurReady(true) && settings.EnableSpecular;
+    const bool b36gNrdConfidence = b36g.confSource == 1 && nrdFrontEndPack &&
+                                   diffuseCompositeNrdConfCS && diffuseCompositeNrdConfPackedCS;
+    // The pattern permutation of the diffuse ray march runs for A and B, and for confidence source
+    // 2 (its visibility channel) under any pattern. C with source 1 is batch 12's checkerboard
+    // permutation itself.
+    const bool b36gDiffuseTrace = raymarchDiffuseB36gCS &&
+                                  (b36gPattern == kB36gA || b36gPattern == kB36gB || b36gNrdConfidence) &&
+                                  samplingMode != kSamplingHalfRes;
+    const uint b36gDiffuseMapping = b36gPattern == kB36gA ? (uint)kB36gMapNrd :
+                                    b36gPattern == kB36gB ? (uint)kB36gMapProb :
+                                    sparseSampling        ? (uint)kB36gMapBatch12 : (uint)kB36gMapIdentity;
+    if (b36gDiffuseTrace && b36gDiffuseMapping == kB36gMapNrd)
+        traceDispatchX = ((((uint)size.x + 1u) >> 1) + 7u) / 8u;
+    // Pattern-aware confidence filter for any pattern that leaves pixels without a diffuse sample.
+    const bool b36gPatternConfidence = b36gPattern != kB36gFull && !b36gNrdConfidence &&
+                                       confDownsamplePatternCS && confUpsamplePatternCS;
+    const bool b36gForceConfidenceFilter = (b36gPattern == kB36gA || b36gPattern == kB36gB) && !b36gNrdConfidence;
+    b36g.drawnPattern = b36gPattern;
+    b36g.mergedDrawn = b36gMerged;
+    b36g.foldNote = nullptr;
+
+    // (batch 36g) Confidence source 2 publishes its own confidence from the composite, so the
+    // filter does not run; A and B force it on, because the 7x7 window inside the composite cannot
+    // skip the pixels that did not trace diffuse.
+    const bool confidenceFilter =
+        settings.EnableAmbientReinjection && (settings.LowResConfidenceFilter || b36gForceConfidenceFilter) && !b36gNrdConfidence &&
+        confDownsampleCS && confBlurHorizontalCS && confBlurVerticalCS && confUpsampleCS &&
+        diffuseCompositeExternalConfCS && EnsureConfidenceFilterResources();
 
     SSRTCB ssrCBData;
     {
@@ -3132,7 +3432,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // permutation that has the whole confidence block compiled out, so there is no spatial
         // mean there for an accumulator to blend with.
         confidenceTemporal = settings.EnableAmbientReinjection && settings.TemporalAmbientConfidence &&
-                             !confidenceFilter && EnsureAmbientConfidenceResources();
+                             !confidenceFilter && !b36gNrdConfidence && EnsureAmbientConfidenceResources();
         ssrCBData.TemporalAmbientConfidence = confidenceTemporal ? 1u : 0u;
         ssrCBData.AmbientConfidenceInvMaxFrames = 1.0f / (settings.AmbientConfidenceMaxFrames + 1.0f);
         // (batch 11, item A) See the matching block in DrawSSRTSpecular. Written unconditionally
@@ -3260,6 +3560,15 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 #else
     context->CSSetShader(SelectDiffuseRaymarchShader(samplingMode), nullptr, 0);
 #endif
+    // (batch 36g) The pattern permutation, with its b3. SHARC is excluded by ResolveB36g (it forces
+    // the default combination), so this never replaces a SHARC shader.
+    if (b36gDiffuseTrace) {
+        PatternCB patternData = BuildPatternCB(b36gPattern, samplingMode);
+        patternData.DiffuseMapping = b36gDiffuseMapping;
+        patternData.Flags = b36gNrdConfidence ? 1u : 0u;
+        BindPatternCB(patternData);
+        context->CSSetShader(raymarchDiffuseB36gCS.get(), nullptr, 0);
+    }
     context->Dispatch(traceDispatchX, traceDispatchY, 1);
     resetViews();
 
@@ -3551,9 +3860,49 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // (batch 36f, item 4) Folded unpack: the packed-input composite twin decodes it, and
         // only if that twin compiled (otherwise the separate unpack pass runs as before).
         const bool foldUnpack = FoldUnpackActive() && diffuseCompositePackedCS && diffuseCompositeExternalConfPackedCS;
-        const bool dispatched = RunReblur(false, foldUnpack);
-        if (foldUnpack)
-            compositePackedSRV = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
+        if (b36gMerged) {
+            // (batch 36g) Merged denoiser. Trace the reflections now -- into the merged instance's
+            // second input -- because the one REBLUR_DIFFUSE_SPECULAR dispatch needs both signals and
+            // has to run before the composite below. Known difference from the separate path: the
+            // reflection colours are prepared from kMAIN before this frame's diffuse composite and
+            // subsurface pass (and the cubemap update) have run. DrawSSRTSpecular then only tells
+            // the deferred composite what t16 holds.
+            uint specPattern = b36gPattern;
+            Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTTraceSpecular);
+            state->BeginPerfEvent("SSRT Compute (merged reflections)");
+            TraceSpecular(specPattern, true, texNRDSpecInput->uav.get());
+            state->EndPerfEvent();
+            Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceSpecular);
+            // TraceSpecular left the reflection chain's SSRTCB in the shared buffer; the composite
+            // below reads the diffuse one (distance limit, confidence accumulator).
+            ssrtCB->Update(ssrCBData);
+            context->CSSetConstantBuffers(1, 1, &buffer);
+            {
+                std::array<ID3D11SamplerState*, 1> mergedSamplers = { linearSampler.get() };
+                context->CSSetSamplers(0, 1, mergedSamplers.data());
+            }
+
+            const bool foldSpecular = FoldUnpackActive();
+            bool diffuseUnpacked = false;
+            bool specularUnpacked = false;
+            const bool dispatched = RunReblurMerged(b36gPattern, foldUnpack, foldSpecular, diffuseUnpacked, specularUnpacked);
+            if (foldUnpack && !diffuseUnpacked)
+                compositePackedSRV = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
+            if (foldSpecular && !specularUnpacked) {
+                mergedSpecularCompositeSRV = (dispatched ? texNRDSpecOutput : texNRDSpecInput)->srv.get();
+                mergedSpecularCompositePacked = true;
+            } else {
+                mergedSpecularCompositeSRV = texSSRColor->srv.get();
+                mergedSpecularCompositePacked = false;
+            }
+            b36gMergedRanThisFrame = true;
+        } else {
+            // (batch 36g) RunReblur unpacks anyway when pattern A's dispatch failed (compact input).
+            bool unpacked = false;
+            const bool dispatched = RunReblur(false, foldUnpack, b36gPattern, &unpacked);
+            if (foldUnpack && !unpacked)
+                compositePackedSRV = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
+        }
     }
 
     // (S2.5) Same as the specular twin: ssrt_temporal.hlsl at t0 plus the Buffer Viewer are
@@ -3588,7 +3937,11 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         uavs.at(2) = texSSRTConfidenceLoNormal->uav.get();
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, 3, uavs.data(), nullptr);
-        context->CSSetShader(confDownsampleCS.get(), nullptr, 0);
+        // (batch 36g) Under a pattern, the downsample that averages only the pixels that traced
+        // diffuse this frame (and the upsample whose fallback never reads a skipped pixel).
+        if (b36gPatternConfidence)
+            BindPatternCB(BuildPatternCB(b36gPattern, samplingMode));
+        context->CSSetShader(b36gPatternConfidence ? confDownsamplePatternCS.get() : confDownsampleCS.get(), nullptr, 0);
         {
             Util::DenoiserTimerScope timing("Confidence", "Downsample", loDispatchX, loDispatchY, loDispatchX * 8u, loDispatchY * 8u);
             context->Dispatch(loDispatchX, loDispatchY, 1);
@@ -3630,7 +3983,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         uavs.at(0) = texSSRTDiffuseConfidenceSmooth->uav.get();
         context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
         context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
-        context->CSSetShader(confUpsampleCS.get(), nullptr, 0);
+        context->CSSetShader(b36gPatternConfidence ? confUpsamplePatternCS.get() : confUpsampleCS.get(), nullptr, 0);
         {
             Util::DenoiserTimerScope timing("Confidence", "Upsample",
                 (uint)dispatchCount.x, (uint)dispatchCount.y, (uint)dispatchCount.x * 8u, (uint)dispatchCount.y * 8u);
@@ -3653,7 +4006,12 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         srvs.at(4) = depth.depthSRV;
 
         uint uavCount = 1;
-        if (!confidenceFilter) {
+        // (batch 36g) Confidence source 2: this pass publishes 1 - REBLUR's denoised visibility at u1
+        // itself (SSRT_B36G_CONF_NRD twins); nothing else writes that surface this frame.
+        if (b36gNrdConfidence) {
+            uavs.at(1) = texSSRTDiffuseConfidenceSmooth->uav.get();
+            uavCount = 2;
+        } else if (!confidenceFilter) {
             // (ambient reinjection) The pass doubles as the confidence smoothing filter: it reads
             // the raw surface at t3 and publishes the depth-aware 7x7 mean at u1 for
             // DeferredCompositeCS, which Deferred::DeferredPasses dispatches after this one. Folded
@@ -3691,6 +4049,8 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         ID3D11ComputeShader* compositeShader = confidenceFilter ? diffuseCompositeExternalConfCS.get() : diffuseCompositeCS.get();
         if (compositePackedSRV)
             compositeShader = confidenceFilter ? diffuseCompositeExternalConfPackedCS.get() : diffuseCompositePackedCS.get();
+        if (b36gNrdConfidence)
+            compositeShader = compositePackedSRV ? diffuseCompositeNrdConfPackedCS.get() : diffuseCompositeNrdConfCS.get();
         context->CSSetShader(compositeShader, nullptr, 0);
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
@@ -3703,6 +4063,10 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
             std::swap(texSSRTConfidenceHistory, texSSRTConfidenceHistoryPrev);
     }
     Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTComposite);
+
+    // (batch 36g) Debug view: which signal each pixel traced this frame.
+    if (settings.B36gDebugView == kB36gDebugPattern)
+        DispatchB36gPatternDebug(b36gPattern, samplingMode);
 
     // (audit #13) Only when specular will not run afterwards, so the snapshot still
     // happens exactly once per frame and after every temporal pass has read it.
@@ -3800,4 +4164,602 @@ ScreenSpaceRayTracing::SharedData ScreenSpaceRayTracing::GetCommonBufferData()
     data.SsgiContactAoActive = ssgiContactLive ? 1u : 0u;
     data.SsgiContactRadius = ssgi.settings.ContactRadius;
     return data;
+}
+
+// ============================================================================================
+// (batch 36g) Checkerboard / merged-denoiser diagnostic matrix.
+// specs/spec-batch36g-checkerboard-diagnostic-matrix.md; shader side in ssrt_b36g.hlsli.
+
+namespace
+{
+    /// Batch 36b's merged tuning (30 / 3 / 15, fast clamp 1.75), kept to reproduce 36b.
+    const NRD::REBLURSettings kB36gMerged36bTuning = {
+        .MaxAccumulatedFrameNum = 30,
+        .MaxFastAccumulatedFrameNum = 3,
+        .MaxStabilizedFrameNum = 15,
+        .FastHistoryClampingSigmaScale = 1.75f,
+    };
+}
+
+const char* ScreenSpaceRayTracing::B36gPatternName(uint a_pattern)
+{
+    switch (a_pattern) {
+    case kB36gA:
+        return "A (checkerboard, NRD fills)";
+    case kB36gB:
+        return "B (probabilistic lobe)";
+    case kB36gC:
+        return "C (checkerboard, own fill)";
+    default:
+        return "Full";
+    }
+}
+
+uint ScreenSpaceRayTracing::B36gCombination(uint a_pattern, bool a_merged)
+{
+    // The spec's test table, in order; 8 is the one cell the table leaves out.
+    switch (a_pattern) {
+    case kB36gA:
+        return a_merged ? 3u : 2u;
+    case kB36gB:
+        return a_merged ? 5u : 4u;
+    case kB36gC:
+        return a_merged ? 7u : 6u;
+    default:
+        return a_merged ? 8u : 1u;
+    }
+}
+
+std::string ScreenSpaceRayTracing::DescribeB36g(bool a_effective) const
+{
+    uint pattern = settings.B36gPattern;
+    bool merged = settings.B36gMergedDenoiser;
+    uint conf = settings.B36gConfidenceSource;
+    bool dpp = settings.B36gDiffusePrepass;
+    if (a_effective) {
+        pattern = b36g.drawnPattern;
+        merged = b36g.mergedDrawn;
+        conf = b36g.confSource;
+        dpp = b36g.diffusePrepass;
+    }
+    std::string s = std::format("#{}{}{} | pattern {} | denoiser {} | confidence {} | diffuse pre-blur {}",
+        B36gCombination(pattern, merged), conf == 1 ? "+conf2" : "", dpp ? "+dpp" : "",
+        B36gPatternName(pattern),
+        merged ? (settings.B36gMergedUse36bTuning ? "merged (36b tuning 30/3/15)" : "merged (diffuse settings)") : "two instances",
+        conf == 1 ? "2 (NRD hit distance)" : "1 (self-filtered)",
+        dpp ? std::format("on {:.0f} px", settings.B36gDiffusePrepassRadius) : std::string("off"));
+    if (a_effective)
+        s += std::format(" | reflection pre-pass {}",
+            b36g.specPrepassForced ? "forced on by the pattern" : (SkipSpecularPrepassActive() ? "skipped (36f)" : "on (36e)"));
+    if (!Batch36g::IsOn())
+        s += " | Batch 36g master OFF";
+    return s;
+}
+
+ScreenSpaceRayTracing::PatternCB ScreenSpaceRayTracing::BuildPatternCB(uint a_pattern, uint a_samplingMode) const
+{
+    PatternCB d;
+    d.Pattern = a_pattern;
+    d.DiffuseMapping = a_pattern == kB36gA ? (uint)kB36gMapNrd :
+                       a_pattern == kB36gB ? (uint)kB36gMapProb :
+                       a_pattern == kB36gC ? (uint)kB36gMapBatch12 :
+                                             (a_samplingMode == kSamplingCheckerboard ? (uint)kB36gMapBatch12 : (uint)kB36gMapIdentity);
+    d.SpecularMapping = a_pattern == kB36gA ? (uint)kB36gMapNrd :
+                        a_pattern == kB36gB ? (uint)kB36gMapProb :
+                        a_pattern == kB36gC ? (uint)kB36gMapBatch12 :
+                                              (uint)kB36gMapIdentity;
+    // The value NRD gets as CommonSettings::frameIndex (NRD::GetCommonSettings), so the cells we
+    // trace are the cells REBLUR reads.
+    d.FrameIndex = globals::state->frameCount;
+    d.Flags = b36g.confSource == 1 ? 1u : 0u;
+    // Weyl sequence with step 1/sqrt(7): one global shift per frame, added to Bayer4x4 (NRD's own
+    // recommendation: Bayer alone pokes the same holes every 16 frames).
+    const double weyl = double(d.FrameIndex) * 0.37796447300922722;
+    d.WeylShift = (float)(weyl - std::floor(weyl));
+    return d;
+}
+
+void ScreenSpaceRayTracing::BindPatternCB(const PatternCB& a_data)
+{
+    if (!patternCB)
+        return;
+    patternCB->Update(a_data);
+    auto cb = patternCB->CB();
+    globals::d3d::context->CSSetConstantBuffers(3, 1, &cb);
+}
+
+void ScreenSpaceRayTracing::ConfigureReblurB36g(nrd::ReblurSettings& a_settings, bool a_hasDiffuse, bool a_hasSpecular, uint a_pattern) const
+{
+    // A: NRD's checkerboard, diffuse on the BLACK cells (specular takes the other ones, also on a
+    // specular-only instance: Reblur.cpp maps BLACK to gDiffCheckerboard 0 / gSpecCheckerboard 1).
+    // NRD then runs its pre-pass whatever the radii say.
+    if (a_pattern == kB36gA)
+        a_settings.checkerboardMode = nrd::CheckerboardMode::BLACK;
+    // B: the skipped lobe's hitT is 0, rebuilt from the 3x3 neighbourhood.
+    if (a_pattern == kB36gB)
+        a_settings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
+    if (a_hasDiffuse && b36g.diffusePrepass)
+        a_settings.diffusePrepassBlurRadius = std::max(settings.B36gDiffusePrepassRadius, 1.0f);
+    // A and B need REBLUR's reflection pre-pass, so it is forced on over 36f's skip (the panel says
+    // so): the 36e radius, and under B a real blur rather than the motion-estimation-only pass,
+    // because the probabilistic holes have to be filled spatially.
+    if (a_hasSpecular && (a_pattern == kB36gA || a_pattern == kB36gB)) {
+        a_settings.specularPrepassBlurRadius = settings.SpecularPrepassBlurRadius > 0.0f ? settings.SpecularPrepassBlurRadius : 50.0f;
+        a_settings.usePrepassOnlyForSpecularMotionEstimation = a_pattern == kB36gB ? false : settings.UsePrepassOnlyForSpecularMotionEstimation;
+    }
+}
+
+void ScreenSpaceRayTracing::ResolveB36g()
+{
+    B36gFrame f{};
+    const bool master = Batch36g::IsOn();
+    uint pattern = master ? std::min(settings.B36gPattern, (uint)kB36gC) : (uint)kB36gFull;
+    bool merged = master && settings.B36gMergedDenoiser;
+    uint conf = master ? std::min(settings.B36gConfidenceSource, 1u) : 0u;
+    bool dpp = master && settings.B36gDiffusePrepass;
+
+    const bool bothOn = settings.EnableDiffuse && settings.EnableSpecular;
+    const bool reblurDiffuse = settings.EnableDiffuse && effectiveDenoiserDiffuse == kDenoiserREBLUR;
+    const bool reblurBoth = bothOn && reblurDiffuse && effectiveDenoiserSpecular == kDenoiserREBLUR;
+#ifdef ENABLE_SHARC
+    const bool sharc = settings.EnableSharc;
+#else
+    const bool sharc = false;
+#endif
+
+    if (pattern != kB36gFull || conf == 1)
+        CompileB36gShaders();
+
+    if (pattern != kB36gFull) {
+        const char* why = nullptr;
+        if (!bothOn)
+            why = "needs both bounce light and reflections on";
+        else if (sharc)
+            why = "not available with SHARC";
+        else if ((pattern == kB36gA || pattern == kB36gB) && !reblurBoth)
+            why = "needs REBLUR running on both bounce light and reflections";
+        else if (!raymarchSpecularB36gCS || !confDownsamplePatternCS || !confUpsamplePatternCS ||
+                 ((pattern == kB36gA || pattern == kB36gB) && !raymarchDiffuseB36gCS) ||
+                 (pattern == kB36gA && !nrdUnpackCompactCS))
+            why = "a pattern shader failed to compile (see the log)";
+        else if (pattern == kB36gC && (!raymarchDiffuseCheckerCS || !sparseResolveCheckerCS || !specResolveCS))
+            why = "a pattern shader failed to compile (see the log)";
+        else if (pattern == kB36gC && (!EnsureSparseResources() || !EnsureB36gSpecSparseResources()))
+            why = "its working textures could not be allocated";
+        if (why) {
+            f.patternNote = why;
+            pattern = kB36gFull;
+        }
+    }
+
+    if (merged) {
+        const char* why = nullptr;
+        if (!reblurBoth)
+            why = "needs REBLUR running on both bounce light and reflections";
+        else if (sharc)
+            why = "not available with SHARC";
+        else if (!EnsureMergedResources())
+            why = "the merged REBLUR instance failed to start (see the log)";
+        if (why) {
+            f.mergedNote = why;
+            merged = false;
+        }
+    }
+
+    if (conf == 1) {
+        const char* why = nullptr;
+        if (!settings.EnableDiffuse || !settings.EnableAmbientReinjection)
+            why = "only does anything with Ambient Reinjection on";
+        else if (!reblurDiffuse)
+            why = "needs REBLUR on bounce light";
+        else if (sharc)
+            why = "not available with SHARC";
+        else if (pattern == kB36gFull && settings.DiffuseSamplingMode == kSamplingHalfRes)
+            why = "not available with Half-Res diffuse sampling";
+        else if (!raymarchDiffuseB36gCS || !diffuseCompositeNrdConfCS || !diffuseCompositeNrdConfPackedCS)
+            why = "a shader failed to compile (see the log)";
+        if (why) {
+            f.confNote = why;
+            conf = 0;
+        }
+    }
+
+    if (pattern == kB36gB && !dpp) {
+        dpp = true;
+        f.prepassNote = "forced on by pattern B (NVIDIA: probabilistic sampling needs the pre-pass)";
+    }
+    if (dpp && !reblurDiffuse) {
+        dpp = false;
+        f.prepassNote = "needs REBLUR on bounce light";
+    }
+
+    f.pattern = pattern;
+    f.merged = merged;
+    f.confSource = conf;
+    f.diffusePrepass = dpp;
+    f.specPrepassForced = (pattern == kB36gA || pattern == kB36gB) && effectiveDenoiserSpecular == kDenoiserREBLUR;
+    f.lowResFilterForced = (pattern == kB36gA || pattern == kB36gB) && conf == 0 &&
+                           settings.EnableAmbientReinjection && !settings.LowResConfidenceFilter;
+    f.drawnPattern = pattern;
+    f.mergedDrawn = merged;
+    b36g = f;
+
+    // Spec: switching any item resets the denoiser history. The key starts at the default
+    // combination's value, so a session that never leaves it never resets for this reason.
+    const uint key = pattern | (merged ? 4u : 0u) | (conf << 3) | (dpp ? 16u : 0u) | (f.specPrepassForced ? 32u : 0u);
+    if (key != lastB36gKey) {
+        lastB36gKey = key;
+        resetReblurDiffuse = true;
+        resetReblurSpecular = true;
+        resetReblurMerged = true;
+        historyClearPending = true;
+        logger::info("[Batch36g] combination now {}", DescribeB36g(true));
+    }
+}
+
+bool ScreenSpaceRayTracing::EnsureMergedResources()
+{
+    if (texNRDSpecInput && texNRDSpecOutput && nrdReblurMerged.IsValid())
+        return true;
+    if (mergedInitFailed)
+        return false;
+
+    auto renderer = globals::game::renderer;
+    if (!renderer)
+        return false;
+    auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return false;
+    D3D11_TEXTURE2D_DESC mainDesc;
+    mainTex.texture->GetDesc(&mainDesc);
+
+    logger::debug("Creating SSRT merged REBLUR resources...");
+    D3D11_TEXTURE2D_DESC texDesc{
+        .Width = mainDesc.Width,
+        .Height = mainDesc.Height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
+        .SampleDesc = { 1, 0 },
+        .Usage = D3D11_USAGE_DEFAULT,
+        .BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
+    };
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+    };
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipSlice = 0 }
+    };
+    auto makeTex = [&](eastl::unique_ptr<Texture2D>& tex, const char* name) {
+        if (!tex) {
+            tex = eastl::make_unique<Texture2D>(texDesc);
+            tex->CreateSRV(srvDesc);
+            tex->CreateUAV(uavDesc);
+            Util::SetResourceName(tex->resource.get(), name);
+        }
+    };
+    makeTex(texNRDSpecInput, "SSRT::NRDSpecInput");
+    makeTex(texNRDSpecOutput, "SSRT::NRDSpecOutput");
+
+    if (!nrdReblurMerged.IsValid() &&
+        !nrdReblurMerged.Init(mainDesc.Width, mainDesc.Height, nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR, 2)) {
+        logger::warn("SSRT: the merged REBLUR_DIFFUSE_SPECULAR instance failed to initialise; Batch 36g keeps two instances");
+        mergedInitFailed = true;
+        return false;
+    }
+    resetReblurMerged = true;
+    return texNRDSpecInput && texNRDSpecOutput && nrdReblurMerged.IsValid();
+}
+
+bool ScreenSpaceRayTracing::EnsureB36gSpecSparseResources()
+{
+    if (texSparseSpecColor && texSparseSpecHitDist && texSparseSpecHitInfo)
+        return true;
+
+    auto renderer = globals::game::renderer;
+    auto context = globals::d3d::context;
+    if (!renderer || !context)
+        return false;
+    auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return false;
+
+    logger::debug("Creating SSRT batch 36g compact reflection resources...");
+    D3D11_TEXTURE2D_DESC texDesc{};
+    mainTex.texture->GetDesc(&texDesc);
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    texDesc.MiscFlags = 0;
+    texDesc.MipLevels = 1;
+    // Same compact extent as batch 12's sparse set (EnsureSparseResources).
+    texDesc.Width = std::max(1u, (texDesc.Width + 1u) / 2u);
+
+    const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    auto makeTex = [&](eastl::unique_ptr<Texture2D>& tex, DXGI_FORMAT format, const char* name) {
+        if (tex)
+            return;
+        texDesc.Format = format;
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+            .Format = format,
+            .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+            .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+        };
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+            .Format = format,
+            .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+            .Texture2D = { .MipSlice = 0 }
+        };
+        tex = eastl::make_unique<Texture2D>(texDesc);
+        tex->CreateSRV(srvDesc);
+        tex->CreateUAV(uavDesc);
+        Util::SetResourceName(tex->resource.get(), name);
+        context->ClearUnorderedAccessViewFloat(tex->uav.get(), zero);
+    };
+    makeTex(texSparseSpecColor, DXGI_FORMAT_R16G16B16A16_FLOAT, "SSRT::SparseSpecColor");
+    makeTex(texSparseSpecHitDist, DXGI_FORMAT_R32_FLOAT, "SSRT::SparseSpecHitDist");
+    makeTex(texSparseSpecHitInfo, DXGI_FORMAT_R32G32B32A32_FLOAT, "SSRT::SparseSpecHitInfo");
+    return texSparseSpecColor && texSparseSpecHitDist && texSparseSpecHitInfo;
+}
+
+bool ScreenSpaceRayTracing::EnsureB36gDebugResources()
+{
+    if (texB36gDebug)
+        return true;
+    auto renderer = globals::game::renderer;
+    if (!renderer)
+        return false;
+    auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return false;
+    D3D11_TEXTURE2D_DESC texDesc{};
+    mainTex.texture->GetDesc(&texDesc);
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    texDesc.MiscFlags = 0;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 }
+    };
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+        .Format = texDesc.Format,
+        .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipSlice = 0 }
+    };
+    texB36gDebug = eastl::make_unique<Texture2D>(texDesc);
+    texB36gDebug->CreateSRV(srvDesc);
+    texB36gDebug->CreateUAV(uavDesc);
+    Util::SetResourceName(texB36gDebug->resource.get(), "SSRT::B36gDebug");
+    return true;
+}
+
+void ScreenSpaceRayTracing::UnpackCompact(ID3D11ShaderResourceView* a_input, ID3D11UnorderedAccessView* a_target)
+{
+    auto context = globals::d3d::context;
+    const float2 size = Util::ConvertToDynamic(globals::state->screenSize);
+    const uint groupsX = ((uint)size.x + 7u) / 8u;
+    const uint groupsY = ((uint)size.y + 7u) / 8u;
+    ID3D11ShaderResourceView* srv = a_input;
+    ID3D11UnorderedAccessView* uav = a_target;
+    context->CSSetShaderResources(0, 1, &srv);
+    context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+    context->CSSetShader(nrdUnpackCompactCS.get(), nullptr, 0);
+    {
+        Util::DenoiserTimerScope timing("SSRT", "Unpack (compact, 36g A)", groupsX, groupsY, groupsX * 8u, groupsY * 8u);
+        context->Dispatch(groupsX, groupsY, 1);
+    }
+    srv = nullptr;
+    uav = nullptr;
+    context->CSSetShaderResources(0, 1, &srv);
+    context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+}
+
+void ScreenSpaceRayTracing::DispatchB36gPatternDebug(uint a_pattern, uint a_samplingMode)
+{
+    if (!b36gDebugCS) {
+        CompileB36gShaders();
+        if (!b36gDebugCS)
+            return;
+    }
+    if (!EnsureB36gDebugResources())
+        return;
+    auto context = globals::d3d::context;
+    auto renderer = globals::game::renderer;
+    PatternCB d = BuildPatternCB(a_pattern, a_samplingMode);
+    d.DebugMode = 1u;  // B36G_DEBUG_PATTERN
+    BindPatternCB(d);
+
+    std::array<ID3D11ShaderResourceView*, 5> srvs = { nullptr };
+    srvs.at(2) = renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS].SRV;
+    srvs.at(4) = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].depthSRV;
+    ID3D11UnorderedAccessView* uav = texB36gDebug->uav.get();
+    context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+    context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+    context->CSSetShader(b36gDebugCS.get(), nullptr, 0);
+    const uint gx = ((uint)texB36gDebug->desc.Width + 7u) / 8u;
+    const uint gy = ((uint)texB36gDebug->desc.Height + 7u) / 8u;
+    context->Dispatch(gx, gy, 1);
+    srvs.fill(nullptr);
+    uav = nullptr;
+    context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+    context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+}
+
+void ScreenSpaceRayTracing::DispatchB36gFillDebug(bool a_specular, uint a_pattern, ID3D11ShaderResourceView* a_input, bool a_inputPacked)
+{
+    if (!b36gDebugCS) {
+        CompileB36gShaders();
+        if (!b36gDebugCS)
+            return;
+    }
+    if (!EnsureB36gDebugResources() || !a_input)
+        return;
+    auto context = globals::d3d::context;
+    auto renderer = globals::game::renderer;
+
+    // Flag values mirror B36G_DBGF_* in ssrt_b36g.hlsli.
+    constexpr uint kBeforeNrdCompact = 1u, kBeforeBatch12Compact = 2u, kBeforePacked = 4u, kAfterPacked = 8u,
+                   kEmulateNrdFill = 16u, kSpecular = 32u, kAfterSameAsBefore = 64u;
+    PatternCB d = BuildPatternCB(a_pattern, activeSamplingMode);
+    d.DebugMode = 2u;  // B36G_DEBUG_FILL
+    uint flags = a_specular ? kSpecular : 0u;
+    ID3D11ShaderResourceView* before = a_input;
+    ID3D11ShaderResourceView* after = a_input;
+    switch (a_pattern) {
+    case kB36gA:
+        flags |= kBeforeNrdCompact | (a_inputPacked ? kBeforePacked : 0u) | kEmulateNrdFill;
+        break;
+    case kB36gC:
+        if (a_specular && texSparseSpecColor) {
+            before = texSparseSpecColor->srv.get();  // compact, linear
+            flags |= kBeforeBatch12Compact | (a_inputPacked ? kAfterPacked : 0u);
+        } else if (!a_specular && texSparseColor) {
+            before = texSparseColor->srv.get();  // compact, in the chain's layout (packed under REBLUR)
+            flags |= kBeforeBatch12Compact | (a_inputPacked ? (kBeforePacked | kAfterPacked) : 0u);
+        } else {
+            flags |= (a_inputPacked ? kBeforePacked : 0u) | kAfterSameAsBefore;
+        }
+        break;
+    default:  // Full and B: NRD receives the full-resolution input as it is
+        flags |= (a_inputPacked ? kBeforePacked : 0u) | kAfterSameAsBefore;
+        break;
+    }
+    d.DebugFlags = flags;
+    BindPatternCB(d);
+
+    std::array<ID3D11ShaderResourceView*, 5> srvs = { nullptr };
+    srvs.at(0) = before;
+    srvs.at(1) = after;
+    srvs.at(2) = renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS].SRV;
+    srvs.at(4) = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].depthSRV;
+    ID3D11UnorderedAccessView* uav = texB36gDebug->uav.get();
+    context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+    context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+    context->CSSetShader(b36gDebugCS.get(), nullptr, 0);
+    const uint gx = ((uint)texB36gDebug->desc.Width + 7u) / 8u;
+    const uint gy = ((uint)texB36gDebug->desc.Height + 7u) / 8u;
+    context->Dispatch(gx, gy, 1);
+    srvs.fill(nullptr);
+    uav = nullptr;
+    context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
+    context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+}
+
+bool ScreenSpaceRayTracing::RunReblurMerged(uint a_pattern, bool a_foldDiffuse, bool a_foldSpecular, bool& a_diffuseUnpacked, bool& a_specularUnpacked)
+{
+    a_diffuseUnpacked = false;
+    a_specularUnpacked = false;
+
+    auto context = globals::d3d::context;
+    auto state = globals::state;
+    auto& nrdSvc = globals::features::nrd;
+
+    const float2 size = Util::ConvertToDynamic(state->screenSize);
+    const uint groupsX = ((uint)size.x + 7u) / 8u;
+    const uint groupsY = ((uint)size.y + 7u) / 8u;
+
+    state->BeginPerfEvent("SSRT REBLUR Merged");
+    Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTReblur);
+
+    bool dispatched = false;
+    {
+        const NRD::REBLURSettings& tuning = settings.B36gMergedUse36bTuning ? kB36gMerged36bTuning : settings.ReblurDiffuse;
+        auto commonSettings = nrdSvc.GetCommonSettings();
+        commonSettings.splitScreen = tuning.SplitScreen;
+        commonSettings.enableValidation = tuning.EnableValidation;
+        // The hit-coverage history confidence (S1.1, off by default) is a diffuse-instance option;
+        // the merged instance runs without it.
+        commonSettings.isHistoryConfidenceAvailable = false;
+        // One denoisingRange for both signals: the limit only when it applies to both chains (it
+        // limits diffuse only under ambient reinjection). Otherwise NRD denoises everything; the
+        // tracing is still limited, and DeferredCompositeCS still fades reflections to the cubemap.
+        if (DistanceLimitOnChain(false) && DistanceLimitOnChain(true))
+            commonSettings.denoisingRange = DistanceLimitUnits() * 1.001f;
+        if (resetReblurMerged)
+            commonSettings.accumulationMode = nrd::AccumulationMode::CLEAR_AND_RESTART;
+        nrdReblurMerged.SetCommonSettings(commonSettings);
+
+        nrdSvc.ApplyReblurSettings(reblurMergedSettings, tuning, nrd::CheckerboardMode::OFF);
+        reblurMergedSettings.hitDistanceParameters.A = settings.ReblurHitDistA;
+        reblurMergedSettings.hitDistanceParameters.B = settings.ReblurHitDistB;
+        reblurMergedSettings.hitDistanceParameters.C = settings.ReblurHitDistC;
+        if (SkipSpecularPrepassActive()) {
+            reblurMergedSettings.specularPrepassBlurRadius = 0.0f;
+            reblurMergedSettings.usePrepassOnlyForSpecularMotionEstimation = false;
+        } else {
+            reblurMergedSettings.specularPrepassBlurRadius = std::max(settings.SpecularPrepassBlurRadius, 0.0f);
+            reblurMergedSettings.usePrepassOnlyForSpecularMotionEstimation = settings.UsePrepassOnlyForSpecularMotionEstimation;
+        }
+        ConfigureReblurB36g(reblurMergedSettings, true, true, a_pattern);
+        nrdReblurMerged.SetDenoiserSettings(&reblurMergedSettings);
+
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::IN_MV, nrdSvc.GetMotionVectorSRV());
+        nrdReblurMerged.SetNamedUAV(nrd::ResourceType::IN_MV, nrdSvc.GetMotionVectorUAV());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::IN_NORMAL_ROUGHNESS, nrdSvc.GetNormalRoughnessSRV());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::IN_VIEWZ, nrdSvc.GetViewZSRV());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, texNRDPackInput->srv.get());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, texNRDSpecInput->srv.get());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, texNRDPackOutput->srv.get());
+        nrdReblurMerged.SetNamedUAV(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, texNRDPackOutput->uav.get());
+        nrdReblurMerged.SetNamedSRV(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, texNRDSpecOutput->srv.get());
+        nrdReblurMerged.SetNamedUAV(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, texNRDSpecOutput->uav.get());
+
+        if (settings.B36gDebugView == kB36gDebugFillDiffuse)
+            DispatchB36gFillDebug(false, a_pattern, texNRDPackInput->srv.get(), true);
+        else if (settings.B36gDebugView == kB36gDebugFillSpecular)
+            DispatchB36gFillDebug(true, a_pattern, texNRDSpecInput->srv.get(), true);
+
+        nrdReblurMerged.SetTimingGroup("NRD merged");
+        dispatched = nrdReblurMerged.Dispatch();
+        if (dispatched)
+            resetReblurMerged = false;
+    }
+
+    if (!dispatched)
+        logger::warn("SSRT: merged REBLUR dispatch did not complete; publishing this frame's undenoised radiance");
+
+    // Same recovery rules as RunReblur: unpack unless folded, and under pattern A a failed dispatch
+    // always takes the compact unpack.
+    const auto unpack = [&](Texture2D* a_in, Texture2D* a_out, Texture2D* a_radiance, bool a_fold, bool& a_unpacked, const char* a_name) {
+        if (!dispatched && a_pattern == kB36gA && nrdUnpackCompactCS) {
+            UnpackCompact(a_in->srv.get(), a_radiance->uav.get());
+            a_unpacked = true;
+            if (a_fold)
+                b36g.foldNote = "pattern A: REBLUR did not run this frame, so the separate (compact) unpack ran instead of the folded one";
+            return;
+        }
+        if (a_fold)
+            return;
+        ID3D11ShaderResourceView* srv = (dispatched ? a_out : a_in)->srv.get();
+        ID3D11UnorderedAccessView* uav = a_radiance->uav.get();
+        context->CSSetShaderResources(0, 1, &srv);
+        context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+        context->CSSetShader(nrdUnpackCS.get(), nullptr, 0);
+        {
+            Util::DenoiserTimerScope timing("SSRT", a_name, groupsX, groupsY, groupsX * 8u, groupsY * 8u);
+            context->Dispatch(groupsX, groupsY, 1);
+        }
+        srv = nullptr;
+        uav = nullptr;
+        context->CSSetShaderResources(0, 1, &srv);
+        context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+        a_unpacked = true;
+    };
+    unpack(texNRDPackInput.get(), texNRDPackOutput.get(), texSSRTDiffuseColor.get(), a_foldDiffuse, a_diffuseUnpacked, "Unpack diffuse");
+    unpack(texNRDSpecInput.get(), texNRDSpecOutput.get(), texSSRColor.get(), a_foldSpecular, a_specularUnpacked, "Unpack specular");
+
+    {
+        std::array<ID3D11SamplerState*, 1> samplers = { linearSampler.get() };
+        context->CSSetSamplers(0, 1, samplers.data());
+        auto ssrtBuffer = ssrtCB->CB();
+        context->CSSetConstantBuffers(1, 1, &ssrtBuffer);
+    }
+
+    Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTReblur);
+    state->EndPerfEvent();
+    return dispatched;
 }
