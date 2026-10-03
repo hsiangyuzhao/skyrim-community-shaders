@@ -9,6 +9,15 @@
 // kernel in stage 2 cheaper than the 7x7 window the chain replaces rather than dearer.
 #include "ScreenSpaceRayTracing/ssrt_conf_filter.hlsli"
 
+// (batch 36g) SSRT_CONF_PATTERN: under a checkerboard or probabilistic tracing pattern only the
+// pixels that traced diffuse this frame carry a confidence sample, so only they are averaged (spec
+// 36g, switch 3). Every aligned 2x2 block holds at least one of them under all three patterns
+// (A and C: two; B: see ssrt_b36g.hlsli). The depth and normal guides still average every pixel the
+// geometry test accepts: they are G-buffer facts, not samples.
+#if defined(SSRT_CONF_PATTERN)
+#	include "ScreenSpaceRayTracing/ssrt_b36g.hlsli"
+#endif
+
 // Raw per-pixel hit confidence straight from the ray march, and the full-resolution depth
 // buffer. NormalRoughnessTexture comes from ssrt_common.hlsli at t2, which is where every
 // other pass in this feature reads it.
@@ -81,7 +90,47 @@ RWTexture2D<float4> NormalLoRW : register(u2);
 	const bool degenerate = !(weightSum > 0.0f);
 	const float invWeight = degenerate ? 1.0f : rcp(weightSum);
 
+#if defined(SSRT_CONF_PATTERN)
+	// Confidence over the traced pixels the geometry test accepts; if the test rejected all of
+	// them, over every traced pixel of the block (still this frame, never a skipped pixel's value).
+	float tracedSum = 0.0f;
+	float tracedWeight = 0.0f;
+	float tracedAnySum = 0.0f;
+	float tracedAnyCount = 0.0f;
+	[unroll] for (int ptap = 0; ptap < 4; ptap++)
+	{
+		const int2 pixel = blockOrigin + int2(ptap & 1, ptap >> 1);
+		if (any(pixel > maxCoord) || !B36G_DiffuseTraced(uint2(pixel)))
+			continue;
+		const float tapDepth = SharedData::GetScreenDepth(DepthTexture[pixel]);
+		float3 tapNormal;
+		float tapRoughness;
+		GetNormalRoughness(uint2(pixel), tapNormal, tapRoughness);
+		const float conf = SSRTConfidenceTexture[pixel];
+		const float accepted = SSRTConfAccept(referenceDepth, referenceNormal, tapDepth, tapNormal, SSRT_CONF_DS_DEPTH_TOL) ? 1.0f : 0.0f;
+		tracedSum += conf * accepted;
+		tracedWeight += accepted;
+		tracedAnySum += conf;
+		tracedAnyCount += 1.0f;
+	}
+	// A block clipped by an odd render extent can be a single skipped pixel: then the traced
+	// 4-neighbours of the reference pixel stand in (under A and C all four are traced).
+	if (tracedAnyCount == 0.0f) {
+		[unroll] for (int k = 0; k < 4; k++)
+		{
+			const int2 n = referencePixel + int2(k == 0 ? -1 : (k == 1 ? 1 : 0), k == 2 ? -1 : (k == 3 ? 1 : 0));
+			if (any(n < int2(0, 0)) || any(n > maxCoord) || !B36G_DiffuseTraced(uint2(n)))
+				continue;
+			tracedAnySum += SSRTConfidenceTexture[n];
+			tracedAnyCount += 1.0f;
+		}
+	}
+	const float patternConfidence = tracedWeight > 0.0f ? tracedSum / tracedWeight :
+	                                (tracedAnyCount > 0.0f ? tracedAnySum / tracedAnyCount : 0.0f);
+	ConfidenceLoRW[dispatchID.xy] = saturate(patternConfidence);
+#else
 	ConfidenceLoRW[dispatchID.xy] = degenerate ? saturate(SSRTConfidenceTexture[referencePixel]) : saturate(confidenceSum * invWeight);
+#endif
 	DepthLoRW[dispatchID.xy] = degenerate ? referenceDepth : depthSum * invWeight;
 	NormalLoRW[dispatchID.xy] = float4(degenerate ? referenceNormal : SSRTConfNormaliseGuide(normalSum, referenceNormal), 0.0f);
 }

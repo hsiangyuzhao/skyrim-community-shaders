@@ -7,6 +7,12 @@
 // Nothing here reads a previous frame. See ssrt_conf_filter.hlsli for why that is permanent.
 #include "ScreenSpaceRayTracing/ssrt_conf_filter.hlsli"
 
+// (batch 36g) SSRT_CONF_PATTERN: the degeneracy fallback below must not read a pixel that did not
+// trace diffuse this frame (36b's fallback read last frame's value there). See the end of main.
+#if defined(SSRT_CONF_PATTERN)
+#	include "ScreenSpaceRayTracing/ssrt_b36g.hlsli"
+#endif
+
 // The raw per-pixel confidence is bound for one reason: it is what a pixel with no usable
 // low-resolution neighbour falls back to. See the degeneracy rule at the bottom.
 Texture2D<float> SSRTConfidenceTexture : register(t0);
@@ -79,6 +85,34 @@ RWTexture2D<float> SSRTConfidenceSmoothRW : register(u0);
 	//
 	// weightSum can only reach zero through rejection, never through the weights themselves;
 	// see the note on the fractional position above.
+#if defined(SSRT_CONF_PATTERN)
+	// A pixel that traced diffuse this frame falls back to its own value, as before. One that did
+	// not takes the mean of its geometrically accepted, traced 4-neighbours (under A and C all four
+	// traced); with none of those, 0 -- "nothing resolved", i.e. the vanilla ambient stays.
+	float rawConfidence = 0.0f;
+	if (B36G_DiffuseTraced(uint2(pixel))) {
+		rawConfidence = SSRTConfidenceTexture[pixel];
+	} else {
+		const int2 hiMax = max(hiSize - int2(1, 1), int2(0, 0));
+		float nSum = 0.0f;
+		float nCount = 0.0f;
+		[unroll] for (int k = 0; k < 4; k++)
+		{
+			const int2 n = pixel + int2(k == 0 ? -1 : (k == 1 ? 1 : 0), k == 2 ? -1 : (k == 3 ? 1 : 0));
+			if (any(n < int2(0, 0)) || any(n > hiMax) || !B36G_DiffuseTraced(uint2(n)))
+				continue;
+			float3 nNormal;
+			float nRoughness;
+			GetNormalRoughness(uint2(n), nNormal, nRoughness);
+			if (!SSRTConfAccept(centreDepth, centreNormal, SharedData::GetScreenDepth(DepthTexture[n]), nNormal, SSRT_CONF_US_DEPTH_TOL))
+				continue;
+			nSum += SSRTConfidenceTexture[n];
+			nCount += 1.0f;
+		}
+		rawConfidence = nCount > 0.0f ? nSum / nCount : 0.0f;
+	}
+#else
 	const float rawConfidence = SSRTConfidenceTexture[pixel];
+#endif
 	SSRTConfidenceSmoothRW[dispatchID.xy] = weightSum > 0.0f ? saturate(sum / weightSum) : saturate(rawConfidence);
 }

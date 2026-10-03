@@ -34,6 +34,15 @@ Texture2D<float> DepthTexture : register(t4);
 // two fewer UAVs), and the unstripped version stays byte-identical to the shader that shipped
 // before this change, which is what makes the user-facing toggle a real A/B rather than an
 // approximation of one.
+// (batch 36g) SSRT_B36G_CONF_NRD, always compiled together with SSRT_CONF_EXTERNAL_FILTER:
+// confidence source 2 of the diagnostic matrix, i.e. batch 36b's deviation 3, kept only to
+// reproduce 36b. The ray march wrote REBLUR visibility into the hit-distance channel, and this pass
+// publishes 1 - denoised visibility as the reinjection confidence, with no spatial filter (hard
+// constraint 3 forbids this as a default; it is an experiment switch).
+#ifdef SSRT_B36G_CONF_NRD
+RWTexture2D<float> SSRTConfidenceNrdRW : register(u1);
+#endif
+
 #ifndef SSRT_CONF_EXTERNAL_FILTER
 // (ambient reinjection) Raw per-pixel hit confidence straight from the ray march, and the
 // depth buffer the smoothing below uses as its edge stop.
@@ -368,10 +377,21 @@ groupshared float g_ssrtConfDepthTile[SSRT_CONF_TILE * SSRT_CONF_TILE];
     // DeferredCompositeCS keeps the full vanilla ambient there. A select, not a multiply, so a NaN
     // in an unwritten texel cannot leak through. Inside the limit the ray march has already faded
     // radiance and confidence together, so nothing else is needed here.
+#ifdef SSRT_B36G_CONF_NRD
+    // 1 - denoised visibility; 0 past the distance limit, like the radiance below.
+    float b36gNrdConfidence = saturate(1.0f - ssrtDiffuse.w);
+#endif
     [branch] if (DistanceCapEnd > 0.0f) {
         if (SSRT_NRDViewZ(DepthTexture[dispatchID.xy]) >= DistanceCapEnd)
             ssrtDiffuse = 0.0f;
     }
+#ifdef SSRT_B36G_CONF_NRD
+    [branch] if (DistanceCapEnd > 0.0f) {
+        if (SSRT_NRDViewZ(DepthTexture[dispatchID.xy]) >= DistanceCapEnd)
+            b36gNrdConfidence = 0.0f;
+    }
+    SSRTConfidenceNrdRW[dispatchID.xy] = b36gNrdConfidence;
+#endif
     // (guard G9) The last gate in the chain, and the one that decides whether an SSRT
     // failure is a local artefact or a global one. ColorTextureRW is kMAIN: whatever is
     // written here is what the upscaler, the bloom chain and the tonemapper consume, and

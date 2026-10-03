@@ -29,6 +29,12 @@
 // ssrt_common.hlsli brings in.
 #include "NRD/NRDReblurSH.hlsli"
 
+// (batch 36g) The diagnostic matrix's tracing patterns. Only the SSRT_B36G permutations include it,
+// so b3 is declared nowhere else and the default permutations compile to the same bytecode.
+#if defined(SSRT_B36G)
+#   include "ScreenSpaceRayTracing/ssrt_b36g.hlsli"
+#endif
+
 #if SHARC_UPDATE || SHARC_RENDER
 #   define SHARC_ENABLE_64_BIT_ATOMICS 1
 #   include "ScreenSpaceRayTracing/sharc/SharcCommon.h"
@@ -94,6 +100,12 @@ RWTexture2D<float4> SSRColorOutput : register(u0);
 
 #if defined(SSRT_SPECULAR)
 RWTexture2D<float> SSRTHitDistanceOutput : register(u1);
+#endif
+#if defined(SSRT_SPECULAR) && defined(SSRT_B36G)
+// (batch 36g, pattern C) Per traced reflection lane, compact: .xyz the camera-relative world hit
+// point (w > 0) or the ray direction (w < 0), |w| the solid-angle pdf of the sampled direction.
+// ssrt_spec_resolve.hlsl re-weights a neighbour's ray with this pixel's own BRDF from it.
+RWTexture2D<float4> SSRTSpecHitInfoOutput : register(u2);
 #endif
 
 // (ambient reinjection) A second, deliberately denoiser-independent home for the diffuse hit
@@ -918,7 +930,24 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     // produced identical *values* but let O3 reassociate an unrelated saturate in the specular
     // permutation, which is precisely the kind of "equivalent but not identical" the Full-mode
     // proof is not allowed to contain.
-#if defined(SSRT_SPARSE_HALFRES)
+#if defined(SSRT_B36G)
+    // (batch 36g) One permutation per signal for every pattern of the diagnostic matrix; the lane
+    // mapping is a uniform constant-buffer branch (see ssrt_b36g.hlsli). Compact mappings trace the
+    // pixel of each horizontal pair that the pattern assigns to this signal and write u0 at the
+    // compact coordinate, which is the left-half layout NRD reads in checkerboard mode (A) and the
+    // compact layout batch 12's resolve reads (C).
+#   if defined(SSRT_SPECULAR)
+    const uint b36gMapping = B36G_SpecularMapping;
+    const uint b36gComplement = 1u;
+#   else
+    const uint b36gMapping = B36G_DiffuseMapping;
+    const uint b36gComplement = 0u;
+#   endif
+    const uint2 gbufferCoords = B36G_LaneToPixel(b36gMapping, coords.xy, b36gComplement);
+    const uint2 b36gLaneExtent = B36G_CompactExtent(b36gMapping, screen_size);
+#   define SSRT_GBUFFER_COORDS gbufferCoords
+#   define SSRT_NOISE_COORDS gbufferCoords
+#elif defined(SSRT_SPARSE_HALFRES)
     // A half-resolution lane must stand for one *real* surface point, not for an average of its
     // 2x2 block, and which point is forced rather than chosen.
     //
@@ -1106,7 +1135,23 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 #else
 #   define SSRT_RAYMARCH_EXTENT screen_size
 #endif
+#if defined(SSRT_B36G)
+    // (batch 36g) The lane must be inside its compact extent and stand for a pixel inside the
+    // render extent; under pattern B it must also be the lobe this pixel selected this frame.
+    bool b36gTraced = true;
+    if (b36gMapping == B36G_MAP_PROB) {
+#   if defined(SSRT_SPECULAR)
+        b36gTraced = !B36G_ProbSelectsDiffuse(gbufferCoords, nrdFrontEndRoughness);
+#   else
+        b36gTraced = B36G_ProbSelectsDiffuse(gbufferCoords, nrdFrontEndRoughness);
+#   endif
+    }
+    const bool b36gLaneInExtent = all(coords < b36gLaneExtent) && coords.y < screen_size.y;
+    const bool b36gPixelInRender = b36gLaneInExtent && all(gbufferCoords < screen_size);
+    bool valid_ray = b36gPixelInRender && !is_far_plane && b36gTraced;
+#else
     bool valid_ray = all(coords < SSRT_RAYMARCH_EXTENT) && !is_far_plane;  // (audit P1)
+#endif
 #if defined(SSRT_SPECULAR)
     // (batch 28) Skip the march where the GGX lobe is wide enough that the prefiltered cubemap
     // is already the same answer. Joining valid_ray rather than returning early is deliberate:
@@ -1173,6 +1218,9 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 #endif
 #if defined(SSRT_SPECULAR)
     float hit_distance = 65536;  // "no hit"; fed to DLSS-RR as the specular hit distance
+#endif
+#if defined(SSRT_SPECULAR) && defined(SSRT_B36G)
+    float4 b36gHitInfo = float4(0.0f, 0.0f, 1.0f, -1.0f);  // (batch 36g) no ray: see the resolve
 #endif
 
 #if SHARC_RENDER
@@ -1265,6 +1313,34 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // keeps a broken reconstruction on the "leave the kernel alone" side.
         if (confidence > 0.0f && isFiniteSafe(world_ray_length))
             hit_norm = world_ray_length / (world_ray_length + hitDistRefWorld);
+#   if defined(SSRT_B36G)
+        // (batch 36g, confidence source 2 = batch 36b deviation 3, for the reproduction only) The
+        // hit-distance channel carries REBLUR's AO convention: per sample, the coverage this ray
+        // claims (validated hit plus back-face evidence) attenuated by REBLUR's own hit-distance
+        // curve at roughness 1. The channel then holds the mean of 1 - b36gVisCoverage, and the
+        // composite publishes 1 - denoised visibility as the reinjection confidence.
+        float b36gVisCoverage = 0.0f;
+        float b36gProximity = 1.0f;
+        [branch] if ((B36G_Flags & B36G_FLAG_VISIBILITY) != 0u && isFiniteSafe(world_ray_length))
+        {
+            b36gProximity = 1.0f - REBLUR_FrontEnd_GetNormHitDist(world_ray_length, SSRT_NRDViewZ(depth), SSRT_NRDHitDistParams(), 1.0f);
+            b36gVisCoverage = saturate(confidence + (1.0f - occlusion) * OcclusionStrength) * b36gProximity;
+        }
+#   endif
+#endif
+#if defined(SSRT_SPECULAR) && defined(SSRT_B36G)
+        // (batch 36g, pattern C) What ssrt_spec_resolve.hlsl needs to reuse this ray for a
+        // neighbour: the hit point (or, for a ray that found nothing, its direction) and the
+        // solid-angle pdf of the sampled direction. ImportanceSampleGGX reports the half-vector pdf
+        // D * NoH; the direction pdf is that over 4 VoH.
+        {
+            const float3 b36gV = -view_space_ray_direction;
+            const float3 b36gH = normalize(b36gV + view_space_reflected_direction);
+            const float b36gPdfL = max(pdf / (4.0f * max(dot(b36gV, b36gH), 1e-4f)), 1e-6f);
+            b36gHitInfo = (confidence > 0.0f && isFiniteSafe(world_space_hit)) ?
+                              float4(world_space_hit, b36gPdfL) :
+                              float4(normalize(world_space_reflected_direction), -b36gPdfL);
+        }
 #endif
         float3 sampleColor = 0;
         if (confidence > 0.0f)
@@ -1543,8 +1619,20 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // Color::MultiBounceAO of the same SSGI AO, so doing it here as well would apply it
         // twice.
         [branch] if (SharedData::ssrtSettings.AmbientReinjection != 0) {
+#   if defined(SSRT_B36G)
+            // (batch 36g, confidence source 2) The composite subtracts the ambient with the denoised
+            // visibility, so the radiance carries the same distance-attenuated weight (36b).
+            [branch] if ((B36G_Flags & B36G_FLAG_VISIBILITY) != 0u) {
+                sampleColor *= confidence * b36gProximity;
+                confidence = b36gVisCoverage;
+            } else {
+                sampleColor *= confidence;
+                confidence = saturate(confidence + (1.0 - occlusion) * OcclusionStrength);
+            }
+#   else
             sampleColor *= confidence;
             confidence = saturate(confidence + (1.0 - occlusion) * OcclusionStrength);
+#   endif
 #   if defined(DYNAMIC_CUBEMAPS)
             // (batch 8, cubemap fill) Spend the beta fill, and spend it *here* -- after the line
             // above has settled what fraction of the hemisphere this sample claims to have
@@ -1588,12 +1676,21 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
                 confidence = saturate(confidence + fillWeight);
             }
 #   endif
+#   if defined(SSRT_B36G)
+            // (batch 36g, confidence source 2) The fill partitions the same hemisphere, so it has to
+            // reach the denoised channel too (36b).
+            if ((B36G_Flags & B36G_FLAG_VISIBILITY) != 0u)
+                b36gVisCoverage = confidence;
+#   endif
         }
 #endif
 
 #if SSRT_USE_SAMPLE_LDS
         samples[SSRT_SAMPLE_SLOT][sample_id] = float4(sampleColor, confidence);
-#   if !SHARC_UPDATE
+#   if defined(SSRT_B36G)
+        // (batch 36g) The texel encoding, or (confidence source 2) this sample's REBLUR visibility.
+        hitNorms[SSRT_SAMPLE_SLOT][sample_id] = (B36G_Flags & B36G_FLAG_VISIBILITY) != 0u ? 1.0f - b36gVisCoverage : hit_norm;
+#   elif !SHARC_UPDATE
         hitNorms[SSRT_SAMPLE_SLOT][sample_id] = hit_norm;  // (batch 1, item 2)
 #   endif
 #else
@@ -1643,7 +1740,44 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
     GroupMemoryBarrierWithGroupSync();
 #endif
 
-#if defined(SSRT_SPECULAR)
+#if defined(SSRT_SPECULAR) && defined(SSRT_B36G)
+    // (batch 36g) Reflection output of the pattern permutation.
+    outColor = SSRT_SanitiseRadianceOutput(localSample);  // (guard G2)
+    [branch] if (b36gMapping == B36G_MAP_BATCH12) {
+        // Pattern C: compact and linear, for ssrt_spec_resolve.hlsl, which writes the full-resolution
+        // radiance (packed or linear) and the DLSS-RR hit-distance guide.
+        SSRColorOutput[coords.xy] = outColor;
+        SSRTHitDistanceOutput[coords.xy] = hit_distance;
+        SSRTSpecHitInfoOutput[coords.xy] = b36gHitInfo;
+    } else {
+        float3 b36gRadiance = outColor.rgb;
+        bool b36gInvalidHitT = false;
+        if (b36gMapping == B36G_MAP_PROB) {
+            // Pattern B: the traced lobe carries radiance / probability, the skipped one hitT = 0.
+            if (b36gTraced)
+                b36gRadiance /= 1.0f - B36G_DiffuseProbability(nrdFrontEndRoughness);
+            else
+                b36gInvalidHitT = true;
+        }
+        // The DLSS-RR guide is full resolution: this pixel, and under A also the pair partner the
+        // pattern skipped this frame, so the surface never holds last frame's value.
+        if (b36gLaneInExtent) {
+            if (gbufferCoords.x < screen_size.x)
+                SSRTHitDistanceOutput[gbufferCoords] = hit_distance;
+            if (b36gMapping == B36G_MAP_NRD && (gbufferCoords.x ^ 1u) < screen_size.x)
+                SSRTHitDistanceOutput[uint2(gbufferCoords.x ^ 1u, gbufferCoords.y)] = hit_distance;
+        }
+        if (NRDFrontEndPack != 0) {
+            const float nrdViewZ = SSRT_NRDViewZ(depth);
+            const float normHitDist = b36gInvalidHitT ? 0.0f : REBLUR_FrontEnd_GetNormHitDist(
+                hit_distance, nrdViewZ, SSRT_NRDHitDistParams(), nrdFrontEndRoughness);
+            SSRColorOutput[coords.xy] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(
+                SSRT_Fp16RoundTrip3(b36gRadiance), normHitDist, true);
+        } else {
+            SSRColorOutput[coords.xy] = float4(b36gRadiance, outColor.w);
+        }
+    }
+#elif defined(SSRT_SPECULAR)
     outColor = SSRT_SanitiseRadianceOutput(localSample);  // (guard G2)
     // (batch 11, item A) Written on both paths and unchanged: this is the R32_FLOAT surface
     // Upscaling.cpp hands DLSS-RR as its specular hit-distance guide, so it is not the pack
@@ -1701,6 +1835,73 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // (batch 11, item A) The encoded hit distance, hoisted out of the store below because
         // the packed path needs the same number.
         const float hitNormMean = saturate(hitNormSum / SAMPLES_PER_PIXEL);
+#   if defined(SSRT_B36G)
+        // (batch 36g) Diffuse output of the pattern permutation.
+        float3 b36gRadiance = outColor.xyz;
+        float b36gConfidence = outColor.w;
+        float b36gHitNorm = hitNormMean;
+        bool b36gInvalidHitT = false;
+        if (b36gMapping == B36G_MAP_PROB) {
+            // Pattern B: the traced lobe carries radiance / probability; the skipped one carries
+            // radiance 0 and hitT = 0 (invalid), which REBLUR's AREA_3X3 reconstruction fills from
+            // the 3x3 neighbourhood. Confidence 0 / hit distance "miss" on a skipped pixel are never
+            // read as data: the pattern-aware confidence downsample counts traced pixels only.
+            if (b36gTraced) {
+                b36gRadiance /= B36G_DiffuseProbability(nrdFrontEndRoughness);
+            } else {
+                b36gInvalidHitT = true;
+                b36gConfidence = 0.0f;
+                b36gHitNorm = 1.0f;
+            }
+        }
+        if (NRDFrontEndPack != 0) {
+            float normHitDist;
+            [branch] if ((B36G_Flags & B36G_FLAG_VISIBILITY) != 0u) {
+                // The samples already carry REBLUR's normalized visibility (36b); floored at NRD_EPS
+                // like GetNormHitDist's own result so a traced pixel is never read as invalid.
+                // The distance-limit fade scales coverage like it scaled the radiance above, so the
+                // pair the composite gets stays matched (hard constraint 5).
+                float visibility = hitNormMean;
+                [branch] if (DistanceCapEnd > 0.0f)
+                    visibility = 1.0f - (1.0f - visibility) * SSRT_DistanceFade(SSRT_NRDViewZ(depth), DistanceCapStart, DistanceCapEnd);
+                normHitDist = max(visibility, NRD_EPS);
+            } else {
+                // The batch 11 decode, as in the default permutation below.
+                const float u = SSRT_Unorm8RoundTrip(hitNormMean);
+                const float tTexels = SSRT_HITT_REF_TEXELS * u / max(1.0 - u, 1e-4);
+                const float nrdViewZ = SSRT_NRDViewZ(depth);
+                const float nrdRenderWidth = SharedData::BufferDim.x * FrameBuffer::DynamicResolutionParams1.x;
+                const float nrdTexelWorld = min(abs(nrdViewZ), 1e7) * 2.0 /
+                                            max(abs(FrameBuffer::CameraProj[0][0][0]) * nrdRenderWidth, 1e-6);
+                normHitDist = REBLUR_FrontEnd_GetNormHitDist(
+                    tTexels * nrdTexelWorld, nrdViewZ, SSRT_NRDHitDistParams(), 1.0);
+            }
+            if (b36gInvalidHitT)
+                normHitDist = 0.0f;
+            SSRColorOutput[coords.xy] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(
+                SSRT_Fp16RoundTrip3(b36gRadiance), normHitDist, true);
+        } else {
+            SSRColorOutput[coords.xy] = float4(b36gRadiance, b36gConfidence);
+        }
+        // Confidence and hit distance: on the compact grid for batch 12's resolve (C); at the traced
+        // full-resolution pixel otherwise, and under A also at the pair partner the pattern skipped,
+        // so the raw surfaces hold only this frame's values (the upsample fallback reads them).
+        if (b36gMapping == B36G_MAP_NRD) {
+            if (b36gLaneInExtent) {
+                if (gbufferCoords.x < screen_size.x) {
+                    SSRTConfidenceOutput[gbufferCoords] = b36gConfidence;
+                    SSRTDiffuseHitDistanceOutput[gbufferCoords] = b36gHitNorm;
+                }
+                if ((gbufferCoords.x ^ 1u) < screen_size.x) {
+                    SSRTConfidenceOutput[uint2(gbufferCoords.x ^ 1u, gbufferCoords.y)] = b36gConfidence;
+                    SSRTDiffuseHitDistanceOutput[uint2(gbufferCoords.x ^ 1u, gbufferCoords.y)] = b36gHitNorm;
+                }
+            }
+        } else {
+            SSRTConfidenceOutput[coords.xy] = b36gConfidence;
+            SSRTDiffuseHitDistanceOutput[coords.xy] = b36gHitNorm;
+        }
+#   else
         if (NRDFrontEndPack != 0) {
             // Every line here is the retired ssrt_nrd_pack.hlsl, moved. The reciprocal
             // texel-space encoding is decoded back to world units through the *pack's* own
@@ -1743,6 +1944,7 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // thing that keeps the entry honest rather than displaying whatever the last SVGF frame
         // left there. hitNormMean is the value the store always carried, hoisted above.
         SSRTDiffuseHitDistanceOutput[coords.xy] = hitNormMean;
+#   endif
     }
 #endif
 }
