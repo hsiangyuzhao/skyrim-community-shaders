@@ -44,12 +44,26 @@ void HairSpecular::DrawSettings()
 			"In Marschner mode, it controls the roughness of the hair surface.\n");
 	}
 	ImGui::SliderFloat("Specular Multiplier", &settings.SpecularMult, 0.0f, 10.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Brightness of hair highlights from the sun and lights.");
 	ImGui::SliderFloat("Diffuse Multiplier", &settings.DiffuseMult, 0.0f, 10.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Brightness of hair colour lit by the sun and lights.");
 	ImGui::SliderFloat("Indirect Specular Multiplier", &settings.SpecularIndirectMult, 0.0f, 10.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Brightness of hair highlights from ambient light and reflections.");
 	ImGui::SliderFloat("Indirect Diffuse Multiplier", &settings.DiffuseIndirectMult, 0.0f, 10.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Brightness of hair colour lit by ambient light.");
 	ImGui::SliderFloat("Hair Base Color Multiplier", &settings.BaseColorMult, 0.0f, 10.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Scales the hair texture colour. Higher = lighter hair.");
 	ImGui::SliderFloat("Hair Saturation", &settings.HairSaturation, 0.0f, 5.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Colour strength of the hair texture. 1 = unchanged, 0 = grey.");
 	ImGui::SliderFloat("Transmission", &settings.Transmission, 0.0f, 1.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("How much light shines through hair when lit from behind.");
 	ImGui::Spacing();
 	ImGui::Checkbox("Enable Tangent Shift", (bool*)&settings.EnableTangentShift);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -59,7 +73,11 @@ void HairSpecular::DrawSettings()
 	}
 	if (settings.HairMode == 0) {
 		ImGui::SliderFloat("Primary Specular Tangent Shift", &settings.PrimaryTangentShift, -1.0f, 1.0f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Moves the main highlight band along the strands (up or down the hair).");
 		ImGui::SliderFloat("Secondary Specular Tangent Shift", &settings.SecondaryTangentShift, -1.0f, 1.0f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Moves the second highlight band along the strands.");
 	}
 	ImGui::Spacing();
 	ImGui::Checkbox("Enable Screen-Space Self Shadow", (bool*)&settings.EnableSelfShadow);
@@ -69,8 +87,14 @@ void HairSpecular::DrawSettings()
 			"Marschner hair model might have overly bright transmission without self-shadowing.\n");
 	}
 	ImGui::SliderFloat("Self Shadow Strength", &settings.SelfShadowStrength, 0.0f, 1.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("How dark hair self-shadowing gets. 0 = off.");
 	ImGui::SliderFloat("Self Shadow Exponent", &settings.SelfShadowExponent, 0.0f, 10.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Higher = partly blocked spots stay lighter; only fully blocked spots get full shadow.");
 	ImGui::SliderFloat("Self Shadow Scale", &settings.SelfShadowScale, 0.0f, 10.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("How far toward the light hair checks for blockers. Higher = longer self-shadows.");
 
 	JiayeStatement::GetSingleton()->DrawJSInfo();
 }

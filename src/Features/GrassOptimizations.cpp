@@ -75,9 +75,8 @@ void GrassOptimizations::DrawSettings()
 	ImGui::Checkbox("Enable Optimized Grass Rendering", &settings.Enabled);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
-			"Switches the optimized grass path on and off without restarting, for same-session A/B comparison.\n"
-			"Off, every grass shape is culled and drawn by the game exactly as without this feature.\n"
-			"Compare the Grass row and the Grass Optimizations block of the Performance Overlay in both states.");
+			"Faster grass drawing (GPU culling and batching). Can be toggled live for A/B comparison.\n"
+			"Off = the game draws grass exactly as without this feature. Compare the Grass numbers in the Performance Overlay.");
 	}
 
 	if (settings.Enabled) {
@@ -93,64 +92,64 @@ void GrassOptimizations::DrawSettings()
 
 	ImGui::SliderFloat("Full-Detail Pixel Size", &settings.FullDetailPixelSize, 4.0f, 128.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Instances whose on-screen radius is above this render at full density. Below it, density is increasingly thinned down to Minimum Density at Min Pixel Size. Increasing this setting improves performance by removing closer grass.");
+		ImGui::Text("Grass bigger than this on screen is drawn at full density; smaller grass is gradually thinned. Higher = thinning starts closer to you, more FPS.");
 	}
 
 	ImGui::SliderFloat("Min Pixel Size", &settings.MinPixelSize, 1.0f, 32.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Individual grass instances that visibly take up less space on the screen than this are dropped entirely. Higher values improve performance by removing far-away grass instances sooner.");
+		ImGui::Text("Grass smaller than this on screen is not drawn at all. Higher = distant grass disappears sooner, more FPS.");
 	}
 
 	Util::PercentageSlider("Minimum Density", &settings.MinDensity);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("The percentage of grass that remains at the smallest (Min Pixel Size) LOD level before culling.");
+		ImGui::Text("How much grass is left at the smallest size (Min Pixel Size) after thinning. Lower = sparser distant grass, more FPS.");
 	}
 
 	Util::PercentageSlider("Mesh Cost Bias", &settings.MeshCostBias);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Culls or removes grass meshes based on their complexity (performance impact). At 0, removal is identical between all grass types regardless of complexity. At 1, heavier and more complex meshes are culled 2-6x sooner than simple ones. Only applies beyond the Cost Bias Start Distance, so nearby grass is never thinned.");
+		ImGui::Text("Thins detailed (expensive) grass types sooner than simple ones. 0 = all types treated the same; 1 = heavy meshes thinned 2-6x sooner. Only beyond Cost Bias Start Distance.");
 	}
 
 	ImGui::SliderFloat("Cost Bias Start Distance", &settings.CostBiasStartDistance, 0.0f, 20000.0f, "%.0f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		Util::DrawMultiLineTooltip({ "Distance at which Mesh Cost Bias starts taking effect, ramping to full over the same distance again. Nearer than this, all grass types are treated identically no matter how complex. Zero applies the bias everywhere, including right in front of the player.",
+		Util::DrawMultiLineTooltip({ "Distance where Mesh Cost Bias starts, reaching full effect at twice this distance. 0 = applies everywhere, even right in front of you.",
 			Util::Units::FormatDistance(settings.CostBiasStartDistance) });
 	}
 
 	ImGui::SliderFloat("Grass Render Distance", &settings.RenderDistanceOverride, 0.0f, 100000.0f, "%.0f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Max grass render distance in units. 0 = use the game's INI cap (fGrassStartFadeDistance + fGrassFadeRange). Any grass beyond the vanilla range or this range will be removed.");
+		ImGui::Text("How far grass is drawn, in game units. 0 = use the game's INI setting (fGrassStartFadeDistance + fGrassFadeRange).");
 	}
 
 	Util::PercentageSlider("Edge Fade Start", &settings.EdgeFadeStart);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		Util::DrawMultiLineTooltip({ "Percent of the grass render distance at which grass starts fading out. The default of 85% fades over the last 15%. A lower value results in a longer, smoother fade out, while 100% disables the fade and grass pops out at the render distance.",
+		Util::DrawMultiLineTooltip({ "Where grass starts fading out, as a share of the render distance. Lower = longer, smoother fade; 100% = no fade, grass pops out at the edge.",
 			Util::Units::FormatDistance(maxGrassDistance * settings.EdgeFadeStart) });
 	}
 
 	ImGui::SliderFloat("Invisible Fade Cull", &settings.InvisibleFadeCull, 0.0f, 0.5f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Skip drawing grass whose transparency is below this threshold. Grass with a fade value of zero is completely invisible and thus is removed early for performance reasons.");
+		ImGui::Text("Skips grass that has faded below this opacity. 0 = only skip fully invisible grass.");
 	}
 
 	ImGui::Checkbox("Occlusion Culling", &settings.EnableOcclusionCulling);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Skips grass hidden behind rocks, buildings and NPCs. Depending on how much grass is not visible, this may cost more than its benefits. If you see grass flickering when moving, try disabling this.");
+		ImGui::Text("Skips grass hidden behind rocks, buildings and NPCs. Can cost more than it saves when little grass is hidden; turn off if grass flickers while moving.");
 	}
 
 	ImGui::SliderFloat("Occlusion Bias", &settings.OcclusionBias, 0.0f, 0.05f, "%.4f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("How far behind an occluder grass must sit before Occlusion Culling removes it. Raise this if grass disappears around the edges of rocks and hills, lower it to reclaim more performance. Has no effect unless Occlusion Culling is enabled.");
+		ImGui::Text("How far behind an object grass must be before Occlusion Culling hides it. Raise if grass vanishes around rock and hill edges; lower for more FPS.");
 	}
 
 	ImGui::SliderFloat("Simple Shading Below", &settings.SimpleShadingPixelSize, 0.0f, 32.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Grass instances smaller than this size on screen will skip barely visible detail including contact shadows, specular highlights, and other complex grass visual elements. Zero disables this feature.");
+		ImGui::Text("Grass smaller than this on screen skips fine details (contact shadows, highlights) for speed. 0 = off.");
 	}
 
 	ImGui::SliderFloat("Collision Distance", &settings.CollisionDistance, 0.0f, 8192.0f, "%.0f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		Util::DrawMultiLineTooltip({ "Grass beyond this distance skips any collision detection. Zero disables collision on all grass. Requires the Grass Collision feature.",
+		Util::DrawMultiLineTooltip({ "Grass farther than this doesn't bend when walked through. 0 = no grass collision at all. Needs the Grass Collision feature.",
 			Util::Units::FormatDistance(settings.CollisionDistance) });
 	}
 
@@ -158,34 +157,34 @@ void GrassOptimizations::DrawSettings()
 
 	ImGui::Checkbox("Enable Mesh LOD", &settings.EnableMeshLOD);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Improves performance by swapping distant grass instances for a simpler LOD mesh, in two bands. Requires an LOD .nif per grass type at meshes\\LOD\\Grass\\<source-mesh-name>_LOD0.nif, plus an optional _LOD1.nif for the far band. Grass with no LOD mesh keeps its full mesh.");
+		ImGui::Text("Swaps distant grass for simpler models (LOD) in two distance bands, for more FPS. Needs meshes\\LOD\\Grass\\<mesh-name>_LOD0.nif (optionally _LOD1.nif); grass without them is unchanged.");
 	}
 
 	ImGui::BeginDisabled(!settings.EnableMeshLOD);
 
 	ImGui::Checkbox("Enable Middle LOD", &settings.EnableMidLOD);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Swaps mid-distance grass to the _LOD0.nif mesh. With this off, grass stays on its full mesh until the far band takes over.");
+		ImGui::Text("Uses the _LOD0.nif model for mid-distance grass. Off = full model until the far band.");
 	}
 
 	ImGui::SliderFloat("Middle LOD Pixel Size", &settings.MidLODPixelSize, 1.0f, 64.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Instances whose on-screen radius is below this but above the Far LOD Pixel Size swap to the _LOD0.nif mesh.");
+		ImGui::Text("Grass smaller than this on screen (but above Far LOD Pixel Size) uses the middle LOD model. Higher = swaps closer to you.");
 	}
 
 	ImGui::Checkbox("Enable Far LOD", &settings.EnableFarLOD);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Swaps the most distant grass to the _LOD1.nif mesh. Grass types without that file reuse their _LOD0.nif, so the far band still gets its own brightness.");
+		ImGui::Text("Uses the _LOD1.nif model for the most distant grass (falls back to _LOD0.nif if missing).");
 	}
 
 	ImGui::SliderFloat("Far LOD Pixel Size", &settings.FarLODPixelSize, 1.0f, 64.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Instances whose on-screen radius is below this but above Min Pixel Size swap to the _LOD1.nif mesh. Values above the Middle LOD Pixel Size are clamped to it, since the far band is always the more distant of the two.");
+		ImGui::Text("Grass smaller than this on screen uses the far LOD model. Can't be higher than Middle LOD Pixel Size.");
 	}
 
 	ImGui::SliderFloat("Mesh LOD Transition Band", &settings.MeshLODBandPixels, 0.0f, 16.0f, "%.1f px");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("The range of on-screen sizes over which a random amount of meshes are swapped out before completely transitioning to the next LOD. Applies to both transitions. A wider range results in a smoother transition.");
+		ImGui::Text("Size range over which grass gradually switches between models, so the swap is less visible. Wider = smoother.");
 	}
 
 	ImGui::EndDisabled();
@@ -948,10 +947,8 @@ void GrassOptimizations::DrawOverlayStats()
 	ImGui::TextUnformatted("Grass Optimizations");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::TextUnformatted(
-			"Per-frame grass counters for comparing the optimized path against the game's own.\n"
-			"Grass draw calls in the table above count every submitted draw: with the optimized path each\n"
-			"grass type is one instanced indirect draw (plus one per active mesh-LOD band); off, the game\n"
-			"issues one instanced draw per visible group of every grass shape.");
+			"Per-frame grass counters to compare the optimized path with the game's own.\n"
+			"Optimized: one draw per grass type (plus one per LOD band). Off: one draw per visible grass group.");
 	}
 
 	const char* mode = !settings.Enabled ? "Off (game draws grass)" :

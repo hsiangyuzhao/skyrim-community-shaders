@@ -26,7 +26,11 @@ void VanillaImagespace::DrawSettings()
 	}
 
 	ImGui::Checkbox("Enable Fade", &settings.enableFade);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Applies the game's own screen fades (e.g. fade to black or white).");
 	ImGui::Checkbox("Enable Tint", &settings.enableTint);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Applies the game's own colour tint from weather and effects.");
 
 	ImGui::Checkbox("Enable Interior/Exterior Multiplier", &settings.enableInExMultiplier);
 

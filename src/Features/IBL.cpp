@@ -30,52 +30,64 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 void IBL::DrawSettings()
 {
 	ImGui::Checkbox("Enable Diffuse IBL", (bool*)&settings.EnableDiffuseIBL);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Adds ambient light coloured by the real surroundings and sky (IBL, image-based lighting) alongside Skyrim's flat ambient light (see DALC Amount).");
 	ImGui::SliderFloat("Diffuse IBL Scale", &settings.DiffuseIBLScale, 0.0f, 10.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Overall brightness of the IBL ambient light. Higher = brighter shadows and ambient areas.");
 	ImGui::SliderFloat("Diffuse IBL Saturation", &settings.IBLSaturation, 0.0f, 2.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Colour strength of the IBL ambient light. 0 = grey, 1 = unchanged, above 1 = more colourful.");
 
 	// (B7) The two halves the ambient probe is split into, trimmable independently. The pair
 	// above stays the master gate on the combined result; these four sit underneath it.
 	ImGui::SliderFloat("Env IBL Scale", &settings.EnvIBLScale, 0.0f, 10.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
-			"Intensity of the environment half of the ambient probe - the bounce light from the "
-			"surrounding geometry, with the sky excluded.\n\n"
-			"This half is not attenuated by skylighting, so it is what fills shadowed pockets that "
-			"face the camera: gateway arches, undersides of eaves, alley corners. Turn it down if "
-			"those read as too bright or too strongly tinted by nearby walls.");
+			"Brightness of light bounced from surrounding objects (not the sky). It isn't blocked by cover, so it lights shaded spots\n"
+			"like arches, eaves and alleys. Lower it if those look too bright or too tinted by nearby walls.");
 	}
 	ImGui::SliderFloat("Sky IBL Scale", &settings.SkyIBLScale, 0.0f, 10.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
-			"Intensity of the sky half of the ambient probe - what the sky adds on top of the "
-			"environment bounce.\n\n"
-			"This half is scaled by skylighting visibility, so it is strongest on open ground and "
-			"upward-facing surfaces and fades to nothing under cover. Turn it down if open "
-			"exteriors are too blue.");
+			"Brightness of light from the sky. Strongest in the open and on upward-facing surfaces, fading out under cover.\n"
+			"Lower it if open outdoor areas look too blue.");
 	}
 	ImGui::SliderFloat("Env IBL Saturation", &settings.EnvIBLSaturation, 0.0f, 2.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Colour saturation of the environment half only. 0 makes the bounce light grey; 1 leaves it untouched.");
+		ImGui::Text("Colour strength of the bounced (surroundings) light only. 0 = grey, 1 = unchanged.");
 	}
 	ImGui::SliderFloat("Sky IBL Saturation", &settings.SkyIBLSaturation, 0.0f, 2.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Colour saturation of the sky half only. 0 makes the sky contribution grey; 1 leaves it untouched.");
+		ImGui::Text("Colour strength of the sky light only. 0 = grey, 1 = unchanged.");
 	}
 
 	ImGui::SliderFloat("DALC Amount", &settings.DALCAmount, 0.0f, 1.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("How much of Skyrim's own ambient light (DALC, directional ambient lighting) is kept when IBL is on. 1 = all of it.");
 	ImGui::Checkbox("Enable Interior", (bool*)&settings.EnableInterior);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Also use IBL indoors. Off = interiors keep vanilla ambient light.");
 	ImGui::Checkbox("Use Static IBL For Out-of-World Objects", (bool*)&settings.UseStaticIBL);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Enables the use of static IBL textures for objects that are not in the world (e.g. inventory items).");
 	}
 	ImGui::SliderFloat("Fog Mix", &settings.FogAmount, 0.0f, 1.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("How much fog colour is replaced by the IBL ambient colour. 0 = vanilla fog colour, 1 = fully IBL-coloured.");
 	ImGui::Checkbox("Preserve Fog Luminance", (bool*)&settings.PreserveFogLuminance);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("With Fog Mix, only change the fog's colour and keep its original brightness.");
 	ImGui::Checkbox("Effect Normalization", (bool*)&settings.EffectNormalization);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Normalizes effect shader brightness based on IBL brightness.");
 	}
 	ImGui::SliderFloat("Effect Normalization Multiplier", &settings.EffectNormalizationMult, 0.0f, 100.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("With Effect Normalization: overall brightness of effects (smoke, magic, particles). Higher = brighter.");
 	ImGui::SliderFloat("Minimum Effect Multiplier", &settings.MinEffectMult, 0.0f, 10.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("With Effect Normalization: effects never get darker than this, even in very dark places.");
 
 	JiayeStatement::GetSingleton()->DrawJSInfo();
 }

@@ -325,12 +325,18 @@ void WetnessEffects::DrawSettings()
 		ImGui::SliderFloat("Rain Wetness", &settings.MaxRainWetness, 0.0f, 2.5f);
 		if (ImGui::IsItemDeactivatedAfterEdit())
 			DetectCurrentPreset();
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("How wet surfaces get in rain. Higher = darker, shinier surfaces.");
 
 		ImGui::SliderFloat("Puddle Wetness", &settings.MaxPuddleWetness, 0.0f, 6.0f);
 		if (ImGui::IsItemDeactivatedAfterEdit())
 			DetectCurrentPreset();
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("How much water collects into puddles in rain. Higher = more and bigger puddles.");
 
 		ImGui::SliderFloat("Shore Wetness", &settings.MaxShoreWetness, 0.0f, 1.0f);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("How wet surfaces get near water (shores, rivers). See Shore Range below.");
 		ImGui::TreePop();
 	}
 
@@ -339,6 +345,8 @@ void WetnessEffects::DrawSettings()
 
 	if (ImGui::TreeNodeEx("Raindrop Effects", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Enable Raindrop Effects", (bool*)&settings.EnableRaindropFx);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Adds raindrop splashes and ripples on surfaces while it rains.");
 
 		ImGui::BeginDisabled(!settings.EnableRaindropFx);
 
@@ -398,6 +406,8 @@ void WetnessEffects::DrawSettings()
 
 		if (ImGui::TreeNodeEx("Splashes")) {
 			ImGui::SliderFloat("Strength", &settings.SplashesStrength, 0.f, 2.f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How visible splashes are.");
 			ImGui::SliderFloat("Min Radius", &settings.SplashesMinRadius, 0.f, 1.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("As portion of grid size.");
@@ -405,16 +415,24 @@ void WetnessEffects::DrawSettings()
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("As portion of grid size.");
 			ImGui::SliderFloat("Lifetime", &settings.SplashesLifetime, 0.1f, 20.f, "%.1f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How long splashes stay visible.");
 			ImGui::TreePop();
 		}
 
 		if (ImGui::TreeNodeEx("Ripples")) {
 			ImGui::SliderFloat("Strength", &settings.RippleStrength, 0.f, 2.f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How visible ripples are.");
 			ImGui::SliderFloat("Radius", &settings.RippleRadius, 0.f, 1.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("As portion of grid size.");
 			ImGui::SliderFloat("Breadth", &settings.RippleBreadth, 0.f, 1.f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Width of the ripple rings.");
 			ImGui::SliderFloat("Lifetime", &settings.RippleLifetime, 0.f, settings.RaindropInterval, "%.2f sec", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How long ripples stay visible (up to the raindrop Interval).");
 			ImGui::TreePop();
 		}
 
@@ -490,8 +508,14 @@ void WetnessEffects::DrawSettings()
 
 	if (ImGui::TreeNodeEx("Debug", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Enable Wetness Override", &debugSettings.EnableWetnessOverride);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Debug only. Forces the wetness amount.");
 		ImGui::Checkbox("Enable Puddle Override", &debugSettings.EnablePuddleOverride);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Debug only. Forces the puddle amount.");
 		ImGui::Checkbox("Enable Rain Override", &debugSettings.EnableRainOverride);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Debug only. Forces the rain amount.");
 		ImGui::Checkbox("Enable Interior/Exterior Override", &debugSettings.EnableIntExOverride);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text(

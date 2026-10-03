@@ -196,6 +196,8 @@ void MotionBlur::DrawSettings()
 	if (ImGui::Combo("Motion Length", &preset, presets, IM_ARRAYSIZE(presets))) {
 		settings.ScalePreset = static_cast<MotionScale>(preset);
 	}
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("How long the motion blur streaks are when the camera or objects move.");
 
 	// Samples (each UI sample represents 2 actual samples)
 	ImGui::SliderInt("Samples", &settings.SampleCount, 8, 16, "%d");

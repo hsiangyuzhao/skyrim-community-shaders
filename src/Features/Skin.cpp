@@ -129,6 +129,8 @@ void Skin::DrawSettings()
 	if (isDynamicWetnessAvailable) {
 		ImGui::Text("Dynamic Wetness detected.");
 		ImGui::Checkbox("Use Dynamic Wetness", &settings.UseDynamicWetness);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Let the Dynamic Wetness mod decide how wet skin is, instead of the stamina-based sweat below.");
 	} else {
 		settings.UseDynamicWetness = false;
 	}
@@ -137,8 +139,12 @@ void Skin::DrawSettings()
 	{
 		ImGui::SliderFloat("Stamina Threshold for Sweat", &settings.StartSweat, 0.0f, 1.0f, "%.2f", 
 			ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Characters start to look sweaty when stamina drops below this fraction (0.75 = 75 percent).");
 		ImGui::SliderFloat("Full Sweat Threshold", &settings.FullSweat, 0.0f, 1.0f, "%.2f",
 			ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Stamina fraction at which sweat reaches full strength.");
 	}
 
 	ImGui::SliderFloat("Wetness Perlin Noise Scale", &settings.WetParams.x, 0.0f, 1024.0f, "%1.f");
@@ -147,7 +153,7 @@ void Skin::DrawSettings()
 	ImGui::SliderFloat("Wetness Normal Scale", &settings.WetParams.w, 0.0f, 20.0f, "%.1f");
 	ImGui::SliderFloat("Wetness Film Strength", &settings.WetnessFilmStrength, 0.0f, 3.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Controls the optical strength of the water film without changing its Perlin pattern or normal scale");
+		ImGui::Text("How visible the wet/sweat film on skin is (shine and darkening), without changing its pattern.");
 	}
 
 	ImGui::Spacing();

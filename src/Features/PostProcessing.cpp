@@ -64,8 +64,12 @@ void PostProcessing::DrawSettings()
 
 	ImGui::Separator();
 	ImGui::Checkbox("Bypass", &bypass);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Temporarily skips all post-processing below, for quick before/after comparison. Not saved.");
 	ImGui::SameLine();
 	ImGui::Checkbox("Disable Vanilla Tonemapping", (bool*)&settings.DisableVanillaTonemapping);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Skips Skyrim's own final image pass (tonemapping, vanilla bloom and colour grading), so only the effects below shape the look.");
 
 	ImGui::Separator();
 

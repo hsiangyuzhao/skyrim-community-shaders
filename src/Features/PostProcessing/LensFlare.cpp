@@ -54,8 +54,14 @@ void LensFlare::DrawSettings()
 	ImGui::Separator();
 
 	ImGui::SliderFloat("Halo Strength", &settings.HaloStrength, 0.0f, 1.0f, "%.3f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Brightness of the ring-shaped halo flare around bright lights.");
 	ImGui::SliderFloat("Halo Radius", &settings.HaloRadius, 0.0f, 0.8f, "%.3f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Size of the halo ring.");
 	ImGui::SliderFloat("Halo Width", &settings.HaloWidth, 0.0f, 1.0f, "%.3f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Thickness of the halo ring.");
 
 	// Chromatic Aberration
 	ImGui::Spacing();
@@ -63,6 +69,8 @@ void LensFlare::DrawSettings()
 	ImGui::Separator();
 
 	ImGui::SliderFloat("CA Amount", &settings.LensFlareCA, 0.0f, 2.0f, "%.3f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Colour fringing (chromatic aberration) on the flares. Higher = stronger rainbow edges.");
 
 	ImGui::Spacing();
 	ImGui::Separator();
@@ -70,9 +78,17 @@ void LensFlare::DrawSettings()
 
 	if (ImGui::CollapsingHeader("Debug")) {
 		ImGui::Checkbox("Disable Downsample", &debugsettings.disableDownsample);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Debug only.");
 		ImGui::Checkbox("Disable Upsample", &debugsettings.disableUpsample);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Debug only.");
 		ImGui::SliderInt("Downsample Times", &debugsettings.downsampleTimes, 1, 8);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Debug only.");
 		ImGui::SliderInt("Upsample Times", &debugsettings.upsampleTimes, 1, 8);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Debug only.");
 	}
 }
 

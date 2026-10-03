@@ -31,26 +31,56 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 void DoF::DrawSettings()
 {
 	ImGui::Checkbox("Auto Focus", &settings.AutoFocus);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Focuses automatically on whatever is at the Focus Point. Off = use Manual Focus.");
 
 	if (settings.AutoFocus) {
 		ImGui::SliderFloat2("Focus Point", &settings.FocusCoord.x, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Screen position used for auto focus (0.5, 0.5 = centre of the screen).");
 	}
 	ImGui::SliderFloat("Transition Speed", &settings.TransitionSpeed, 0.1f, 1.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("How quickly focus adjusts to a new distance.");
 	ImGui::SliderFloat("Manual Focus", &settings.ManualFocusPlane, 0.1f, 150.0f, "%.2f m");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Focus distance in metres when Auto Focus is off.");
 	ImGui::SliderFloat("Focal Length", &settings.FocalLength, 1.0f, 300.0f, "%.1f mm");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Simulated camera lens length. Higher = stronger blur away from the focus distance.");
 	ImGui::SliderFloat("F-Number", &settings.FNumber, 1.0f, 22.0f, "f/%.1f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Like a camera aperture: lower = stronger blur, higher = more of the scene in focus.");
 	ImGui::SliderFloat("Far Plane Max Blur", &settings.FarPlaneMaxBlur, 0.0f, 8.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Maximum blur for things behind the focus point.");
 	ImGui::SliderFloat("Near Plane Max Blur", &settings.NearPlaneMaxBlur, 0.0f, 4.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Maximum blur for things in front of the focus point.");
 	ImGui::SliderFloat("Blur Quality", &settings.BlurQuality, 2.0f, 30.0f, "%.1f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Number of blur sample rings. Higher = smoother blur but slower.");
 	ImGui::SliderFloat("Near-Far Plane Distance Compenation", &settings.NearFarDistanceCompensation, 1.0f, 5.0f, "%.2f");
 	ImGui::SliderFloat("Bokeh Busy Factor", &settings.BokehBusyFactor, 0.0f, 1.0f, "%.2f");
 	ImGui::SliderFloat("Highlight Boost", &settings.HighlightBoost, 0.0f, 1.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Makes bright spots in blurred areas stand out as bokeh shapes.");
 	ImGui::SliderFloat("Post Blur Smoothing", &settings.PostBlurSmoothing, 0.0f, 2.0f, "%.2f");
 	ImGui::Combo("Highlight Custom Shape", &settings.HighlightShape, "Circle (No custom shape)\0Heart\0Hexagon\0Circle with fringe\0Hexagon with fringe\0Star\0Square\0");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Shape of bright out-of-focus spots (bokeh).");
 	ImGui::SliderFloat("Highlight Shape Rotation", &settings.HighlightShapeRotationAngle, 0.0f, 1.0f, "%.2f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Rotates the bokeh shape.");
 	ImGui::Checkbox("Target Focus", &settings.targetFocus);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Only blurs when there is a target (lock-on target, dialogue speaker or console-selected object) and focuses on it.");
 	ImGui::SliderFloat("Target Focus Focal Length", &settings.targetFocusFocalLength, 1.0f, 300.0f, "%.1f mm");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Focal length used while Target Focus is active. Higher = stronger background blur.");
 	ImGui::Checkbox("Console Selection", &settings.consoleSelection);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("With Target Focus: also focus on the object selected in the console.");
 	if (settings.consoleSelection && currentRef != 0) {
 		ImGui::Text("Selected Reference: %08X", currentRef);
 	}

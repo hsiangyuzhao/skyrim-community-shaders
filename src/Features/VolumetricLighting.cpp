@@ -42,6 +42,8 @@ void VolumetricLighting::DrawVolumetricLightingSettings(int32_t& quality, Textur
 		if (inLocationType)
 			SetupVL();
 	}
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Resolution of the light-shaft (god ray) effect. Higher = smoother light shafts but slower. Custom unlocks the sizes below.");
 
 	const bool isCustomQuality = static_cast<Quality>(quality) == Quality::Custom;
 	if (!isCustomQuality)
@@ -52,18 +54,24 @@ void VolumetricLighting::DrawVolumetricLightingSettings(int32_t& quality, Textur
 		if (inLocationType)
 			SetupVL();
 	}
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Size of the light-shaft grid in this direction (Custom quality only). Higher = finer detail but slower.");
 
 	if (ImGui::SliderInt(isInterior ? "Interior Height" : "Exterior Height", &Height, 1, 20, FromUnits(Height, 32), ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput)) {
 		customSize.Height = Height * 32;
 		if (inLocationType)
 			SetupVL();
 	}
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Size of the light-shaft grid in this direction (Custom quality only). Higher = finer detail but slower.");
 
 	if (ImGui::SliderInt(isInterior ? "Interior Depth" : "Exterior Depth", &Depth, 1, 64, FromUnits(Depth, 10), ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoInput)) {
 		customSize.Depth = Depth * 10;
 		if (inLocationType)
 			SetupVL();
 	}
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Size of the light-shaft grid in this direction (Custom quality only). Higher = finer detail but slower.");
 
 	if (!isCustomQuality)
 		ImGui::EndDisabled();
