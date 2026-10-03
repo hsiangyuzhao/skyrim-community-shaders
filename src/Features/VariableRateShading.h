@@ -64,6 +64,7 @@ struct VariableRateShading : Feature
 		bool IncludeAlphaTested = false;  // coarse-shade other alpha-tested draws (leaves, hair, LOD trees)
 		float PeripheryRadius = 0.8f;     // full-rate centre radius in half screen heights
 		bool DebugOverlay = false;
+		uint32_t CoarsenFrames = 8;  // consecutive frames a tile must qualify before it gets coarser, 0 = at once
 	};
 
 	Settings settings;
@@ -74,6 +75,8 @@ struct VariableRateShading : Feature
 	{
 		bool CoarseTerrain = false;       // let landscape draws be coarse-shaded again (the 36a behaviour)
 		bool FullRateEverywhere = false;  // keep the whole VRS pipeline running but shade every draw at 1x1
+		bool FreezeRates = false;         // stop rebuilding the rate image; the last one stays in use
+		bool RateBlindAnalysis = false;   // measure coarse tiles as if they were full rate (the 36b analysis)
 	};
 
 	Diagnostics diagnostics;
@@ -94,6 +97,10 @@ struct VariableRateShading : Feature
 		float EnvLuminance;
 		uint32_t HistoryValid;
 		float Hysteresis;
+		uint32_t CoarsenFrames;
+		uint32_t Pad0;
+		uint32_t RateAwareAnalysis;
+		uint32_t AppliedRatesValid;
 	};
 	STATIC_ASSERT_ALIGNAS_16(RateCB);
 
@@ -159,6 +166,10 @@ private:
 	IUnknown* rateImageView[2] = {};  // ID3D11NvShadingRateResourceView, owned (Released in SetupResources)
 	uint32_t currentImage = 0;
 
+	// Per tile: frames in a row it has asked to get coarser (BuildRateImageCS reads and writes it).
+	winrt::com_ptr<ID3D11Texture2D> tileState;
+	winrt::com_ptr<ID3D11UnorderedAccessView> tileStateUAV;
+
 	static constexpr uint32_t kRateIndices = 9;
 	static constexpr uint32_t kReadbackSlots = 3;
 	winrt::com_ptr<ID3D11Buffer> rateCounts;
@@ -179,6 +190,7 @@ private:
 	// Per-frame bookkeeping. frameIndex advances in Reset(), i.e. once per Present.
 	uint64_t frameIndex = 1;
 	uint64_t lastBuildFrame = 0;
+	uint64_t lastBoundFrame = 0;  // frame whose opaque pass had rateImage[currentImage] bound
 	uint64_t lastAnalysisFrame = 0;
 	uint32_t lastAnalysisRenderSize[2] = {};
 
