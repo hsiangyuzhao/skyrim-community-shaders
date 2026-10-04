@@ -42,6 +42,7 @@ struct PhysicalSky final : public Feature
 	void SettingsCelestials();
 	void SettingsAtmosphere();
 	void SettingsClouds();
+	void SettingsFixes();
 	void SettingsDebug();
 
 	// Resources
@@ -141,6 +142,9 @@ struct PhysicalSky final : public Feature
 		bool sunHideVanillaGlare = false;
 		/// Angular radius in degrees; 0.27 = the real sun (0.53 across).
 		float sunDiskRadiusDeg = 0.27f;
+
+		// (batch 37b) Upstream correctness fixes, each ANDed with Batch37b::IsOn().
+		bool fixSkyAlpha = true;  // 5846ad833: sky dome written opaque
 
 		float adaptationStart = DirectX::XMConvertToRadians(-2);
 		float adaptationEnd = DirectX::XMConvertToRadians(-15);

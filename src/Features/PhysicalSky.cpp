@@ -44,6 +44,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sunRadianceCap,
 	sunHideVanillaGlare,
 	sunDiskRadiusDeg,
+	fixSkyAlpha,
 	adaptationStart,
 	adaptationEnd,
 	dayExposure,
@@ -588,6 +589,19 @@ void PhysicalSky::SettingsAtmosphere()
 				"Atmosphere radius is the distance from the planet center to the top of atmosphere.\n"
 				"On Earth, they are about 6360 km and 6420 km respectively.");
 	}
+
+	SettingsFixes();
+}
+
+void PhysicalSky::SettingsFixes()
+{
+	ImGui::SeparatorText("Fixes (Batch 37b)");
+	if (!Batch37b::IsOn())
+		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
+
+	ImGui::Checkbox("Opaque Sky", &settings.fixSkyAlpha);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Writes the physical sky fully opaque. Off: the vanilla sky dome's transparency near the\nhorizon lets what is behind it show through (possible seams or bands).");
 }
 
 void PhysicalSky::SettingsClouds()
@@ -803,6 +817,8 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtSunPhysicalRadiance;
 	if (settings.sunHideVanillaGlare)
 		flags |= kExtHideSunGlare;
+	if (settings.fixSkyAlpha)
+		flags |= kExtSkyAlphaOpaque;
 	extCbData.flags = flags;
 	extCbData.sunRadianceCap = std::clamp(settings.sunRadianceCap, 1.f, 62250.f);
 }
