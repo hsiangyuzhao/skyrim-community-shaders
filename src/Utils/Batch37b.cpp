@@ -3,6 +3,7 @@
 #include <format>
 #include <imgui.h>
 
+#include "Features/PhysicalSky.h"
 #include "Features/VolumetricLighting.h"
 #include "Globals.h"
 #include "Menu.h"
@@ -34,9 +35,46 @@ namespace Batch37b
 				s.LinearizeColor ? "On" : "Off", "", where });
 		}
 
+		void RowsPhysicalSky(std::vector<Row>& rows)
+		{
+			auto& ps = globals::features::physicalSky;
+			const auto& s = ps.settings;
+			const char* group = "B. Physical Sky";
+
+			float zBottom = 0.f;
+			const auto status = ps.loaded ? ps.GetWorldspaceStatus(zBottom) : PhysicalSky::WorldspaceStatus::Unknown;
+			const char* statusText = "-";
+			switch (status) {
+			case PhysicalSky::WorldspaceStatus::Whitelist:
+				statusText = "here: on (list)";
+				break;
+			case PhysicalSky::WorldspaceStatus::AllExteriors:
+				statusText = "here: on (all exteriors)";
+				break;
+			case PhysicalSky::WorldspaceStatus::Excluded:
+				statusText = "here: off (excluded)";
+				break;
+			case PhysicalSky::WorldspaceStatus::NotListed:
+				statusText = "here: off (not listed)";
+				break;
+			case PhysicalSky::WorldspaceStatus::Interior:
+				statusText = "here: off (interior)";
+				break;
+			default:
+				break;
+			}
+
+			rows.push_back({ group, "Worldspace list (+DLC, saved, editable)", ps.loaded, true,
+				std::format("{} entries", s.worldspaceWhitelist.size()), statusText,
+				"Sky > Physical Sky > General > Worldspaces" });
+			rows.push_back({ group, "All exterior worldspaces", ps.loaded, s.enableAllExteriorWorldspaces,
+				s.enableAllExteriorWorldspaces ? "On" : "Off", "", "Sky > Physical Sky > General > Worldspaces" });
+		}
+
 		// Extension point: groups registered here, in table order. C./D. go after B.
 		constexpr RowProvider kRowProviders[] = {
 			RowsVolumetricLighting,
+			RowsPhysicalSky,
 		};
 	}
 

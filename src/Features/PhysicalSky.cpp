@@ -1,18 +1,30 @@
 #include "PhysicalSky.h"
 
+#include <cfloat>
+#include <imgui_stdlib.h>
+
 #include "CloudShadows.h"
 #include "Deferred.h"
 #include "LinearLighting.h"
 #include "SkySync.h"
 #include "TerrainShadows.h"
 
+#include "Menu.h"
 #include "State.h"
 #include "Util.h"
+#include "Utils/Batch37b.h"
 #include "Utils/GpuTimers.h"
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+	PhysicalSky::WorldspaceInfo,
+	zBottom)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PhysicalSky::Settings,
 	enabled,
+	worldspaceWhitelist,
+	worldspaceRemovedDefaults,
+	enableAllExteriorWorldspaces,
 	overrideDirLight,
 	tonemapper,
 	vanillaMix,
@@ -75,6 +87,134 @@ void PhysicalSky::RestoreDefaultSettings()
 void PhysicalSky::LoadSettings(json& o_json)
 {
 	settings = o_json;
+
+	// (batch 37b) A saved whitelist replaces the default one wholesale. Merge the defaults back
+	// in, except those the user removed, so defaults added later still reach older configs.
+	for (const auto& [name, info] : DefaultWorldspaceWhitelist()) {
+		if (!settings.worldspaceWhitelist.contains(name) &&
+			std::ranges::find(settings.worldspaceRemovedDefaults, name) == settings.worldspaceRemovedDefaults.end())
+			settings.worldspaceWhitelist.emplace(name, info);
+	}
+}
+
+const std::map<std::string, PhysicalSky::WorldspaceInfo>& PhysicalSky::LegacyWorldspaceWhitelist()
+{
+	static const std::map<std::string, WorldspaceInfo> legacy = {
+		{ "Tamriel", { -14500.f } },
+		{ "WindhelmWorld", { -14500.f } },
+		{ "RiftenWorld", { -14500.f } },
+		{ "MarkarthWorld", { -14500.f } },
+		{ "WhiterunWorld", { -14500.f } },
+		{ "SolitudeWorld", { -14500.f } },
+		{ "WhiterunDragonsreachWorld", { -14500.f } },
+		{ "DLC01FalmerValley", { 3000.f } },
+		{ "DLC2SolstheimWorld", { 256.f } }
+	};
+	return legacy;
+}
+
+std::map<std::string, PhysicalSky::WorldspaceInfo> PhysicalSky::DefaultWorldspaceWhitelist()
+{
+	auto list = LegacyWorldspaceWhitelist();
+	// Dawnguard.esm WRLD records (EDID, DNAM water height, PNAM parent-use flags):
+	// - DLC1HunterHQWorld: Fort Dawnguard. Child of Tamriel sharing its map/terrain heights
+	//   (own water -5000 is a placeholder), so Tamriel's -14500.
+	// - DLC1VampireCastleCourtyard: uses Tamriel's water (-14000) -> -14500.
+	// - DLC1AncestorsGladeWorld: separate grotto, own water -200 -> -700.
+	list.emplace("DLC1HunterHQWorld", WorldspaceInfo{ -14500.f });
+	list.emplace("DLC1VampireCastleCourtyard", WorldspaceInfo{ -14500.f });
+	list.emplace("DLC1AncestorsGladeWorld", WorldspaceInfo{ -700.f });
+	return list;
+}
+
+bool PhysicalSky::IsExcludedWorldspace(const RE::TESWorldSpace* a_worldspace)
+{
+	if (!a_worldspace)
+		return true;
+
+	// Other realms with a sky that is not Nirn's: Soul Cairn and the Boneyard (Dawnguard),
+	// Apocrypha (Dragonborn), Sovngarde (Skyrim).
+	static constexpr std::array<std::string_view, 4> otherRealms = {
+		"DLC01SoulCairn", "DLC01Boneyard", "DLC2ApocryphaWorld", "Sovngarde"
+	};
+	const std::string_view name = a_worldspace->GetFormEditorID();
+	for (const auto& realm : otherRealms)
+		if (_strnicmp(name.data(), realm.data(), realm.size()) == 0 && name.size() == realm.size())
+			return true;
+
+	// Underground worldspaces (Blackreach, Darkfall Passage, Forebears' Holdout, caves...).
+	return a_worldspace->flags.any(RE::TESWorldSpace::Flag::kNoSky);
+}
+
+float PhysicalSky::FallbackZBottom(const RE::TESWorldSpace* a_worldspace)
+{
+	constexpr float kTamrielZBottom = -14500.f;
+	constexpr float kBelowSeaLevel = 500.f;
+	constexpr float kSane = 100000.f;  // "no water" worldspaces store 9999999 or -500000
+
+	const RE::TESWorldSpace* world = a_worldspace;
+	while (world && world->parentWorld &&
+		   world->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLandData, RE::TESWorldSpace::ParentUseFlag::kUseWaterData))
+		world = world->parentWorld;
+	if (!world)
+		return kTamrielZBottom;
+
+	if (std::isfinite(world->defaultWaterHeight) && std::abs(world->defaultWaterHeight) < kSane)
+		return world->defaultWaterHeight - kBelowSeaLevel;
+	if (std::isfinite(world->defaultLandHeight) && std::abs(world->defaultLandHeight) < kSane)
+		return world->defaultLandHeight - kBelowSeaLevel;
+	return kTamrielZBottom;
+}
+
+RE::TESWorldSpace* PhysicalSky::GetCurrentWorldspace()
+{
+	auto* tes = RE::TES::GetSingleton();
+	auto* worldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+	if (!worldspace) {
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		auto* cell = player ? player->GetParentCell() : nullptr;
+		if (cell && !cell->IsInteriorCell())
+			worldspace = cell->GetRuntimeData().worldSpace;
+	}
+	return worldspace;
+}
+
+PhysicalSky::WorldspaceStatus PhysicalSky::GetWorldspaceStatus(float& a_zBottom) const
+{
+	a_zBottom = WorldspaceInfo{}.zBottom;
+
+	if (auto player = RE::PlayerCharacter::GetSingleton(); player)
+		if (auto cell = player->GetParentCell(); cell && cell->IsInteriorCell())
+			return WorldspaceStatus::Interior;
+
+	if (!Batch37b::IsOn()) {
+		// 37a: TES worldspace only, hard-coded list, no exclusions.
+		auto* tes = RE::TES::GetSingleton();
+		auto* worldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+		if (!worldspace)
+			return WorldspaceStatus::Unknown;
+		const auto& legacy = LegacyWorldspaceWhitelist();
+		if (auto it = legacy.find(worldspace->GetFormEditorID()); it != legacy.end()) {
+			a_zBottom = it->second.zBottom;
+			return WorldspaceStatus::Whitelist;
+		}
+		return WorldspaceStatus::NotListed;
+	}
+
+	auto* worldspace = GetCurrentWorldspace();
+	if (!worldspace)
+		return WorldspaceStatus::Unknown;
+	if (IsExcludedWorldspace(worldspace))
+		return WorldspaceStatus::Excluded;
+	if (auto it = settings.worldspaceWhitelist.find(worldspace->GetFormEditorID()); it != settings.worldspaceWhitelist.end()) {
+		a_zBottom = it->second.zBottom;
+		return WorldspaceStatus::Whitelist;
+	}
+	if (settings.enableAllExteriorWorldspaces) {
+		a_zBottom = FallbackZBottom(worldspace);
+		return WorldspaceStatus::AllExteriors;
+	}
+	return WorldspaceStatus::NotListed;
 }
 
 void PhysicalSky::SaveSettings(json& o_json)
@@ -123,20 +263,30 @@ void PhysicalSky::SettingsGeneral()
 		ImGui::TableNextColumn();
 		ImGui::Text("Worldspace: ");
 		ImGui::TableNextColumn();
-		if (RE::TES::GetSingleton()) {
-			bool inInterior = false;
-			if (auto player = RE::PlayerCharacter::GetSingleton(); player)
-				if (auto cell = player->GetParentCell(); cell)
-					inInterior = cell->IsInteriorCell();
-
-			if (inInterior)
+		{
+			float zBottom = 0.f;
+			const auto status = GetWorldspaceStatus(zBottom);
+			auto* worldspace = GetCurrentWorldspace();
+			const char* name = worldspace ? worldspace->GetFormEditorID() : "";
+			switch (status) {
+			case WorldspaceStatus::Interior:
 				ImGui::Text("Interior (Disabled)");
-			else if (auto worldspace = RE::TES::GetSingleton()->GetRuntimeData2().worldSpace; worldspace) {
-				std::string worldspaceName = worldspace->GetFormEditorID();
-				if (settings.worldspaceWhitelist.contains(worldspaceName))
-					ImGui::Text("%s (Enabled)", worldspaceName.c_str());
-				else
-					ImGui::Text("%s (Disabled)", worldspaceName.c_str());
+				break;
+			case WorldspaceStatus::Whitelist:
+				ImGui::Text("%s (Enabled, list, ground %.0f)", name, zBottom);
+				break;
+			case WorldspaceStatus::AllExteriors:
+				ImGui::Text("%s (Enabled, all exteriors, ground %.0f)", name, zBottom);
+				break;
+			case WorldspaceStatus::Excluded:
+				ImGui::Text("%s (Disabled, other realm / no sky)", name);
+				break;
+			case WorldspaceStatus::NotListed:
+				ImGui::Text("%s (Disabled, not listed)", name);
+				break;
+			default:
+				ImGui::Text("Unknown");
+				break;
 			}
 		}
 
@@ -144,6 +294,8 @@ void PhysicalSky::SettingsGeneral()
 	}
 
 	ImGui::Checkbox("Enabled", &settings.enabled);
+
+	SettingsWorldspaces();
 
 	ImGui::SeparatorText("Post Processing");
 	{
@@ -179,6 +331,102 @@ void PhysicalSky::SettingsGeneral()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Blend in vanilla sky color.");
 	}
+}
+
+void PhysicalSky::SettingsWorldspaces()
+{
+	// (batch 37b) Ported from upstream ba4b640f2 (editable list) + f3fb48d12 (all exteriors).
+	ImGui::SeparatorText("Worldspaces (Batch 37b)");
+	if (!Batch37b::IsOn())
+		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning,
+			"Batch 37b master switch is off: the old built-in list of 9 worldspaces is used.");
+
+	ImGui::Checkbox("All Exterior Worldspaces", &settings.enableAllExteriorWorldspaces);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Also use Physical Sky in exterior worldspaces that are not in the list below.\n"
+			"Their ground height is worked out from the worldspace's water level.\n"
+			"Other realms (Soul Cairn, Boneyard, Apocrypha, Sovngarde) and worldspaces\n"
+			"without a sky (Blackreach...) always stay vanilla.");
+
+	if (!ImGui::TreeNode("Worldspace List"))
+		return;
+
+	auto* currentWorldspace = GetCurrentWorldspace();
+	const std::string currentName = currentWorldspace ? currentWorldspace->GetFormEditorID() : "";
+	const auto defaults = DefaultWorldspaceWhitelist();
+
+	const auto removeEntry = [&](const std::string& name) {
+		settings.worldspaceWhitelist.erase(name);
+		if (defaults.contains(name) && std::ranges::find(settings.worldspaceRemovedDefaults, name) == settings.worldspaceRemovedDefaults.end())
+			settings.worldspaceRemovedDefaults.push_back(name);
+	};
+	const auto addEntry = [&](std::string name, float zBottom) {
+		const auto first = name.find_first_not_of(" \t");
+		const auto last = name.find_last_not_of(" \t");
+		if (first == std::string::npos)
+			return;
+		name = name.substr(first, last - first + 1);
+		settings.worldspaceWhitelist[name].zBottom = zBottom;
+		std::erase(settings.worldspaceRemovedDefaults, name);
+	};
+
+	static std::string newName;
+	static float newZBottom = -14500.f;
+	ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
+	ImGui::InputTextWithHint("##NewWorldspace", "Editor ID, e.g. Tamriel", &newName);
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.4f);
+	ImGui::InputFloat("Ground##NewWorldspace", &newZBottom, 10.f, 100.f, "%.0f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Planet ground height (Z) for this worldspace: about 500 below its sea level. Tamriel: -14500.");
+	if (ImGui::Button("Add / Update"))
+		addEntry(newName, newZBottom);
+
+	if (!currentName.empty()) {
+		ImGui::SameLine();
+		const bool listed = settings.worldspaceWhitelist.contains(currentName);
+		if (ImGui::Button(listed ? "Remove Current Worldspace" : "Add Current Worldspace")) {
+			if (listed)
+				removeEntry(currentName);
+			else
+				addEntry(currentName, FallbackZBottom(currentWorldspace));
+		}
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("%s", currentName.c_str());
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Restore Defaults")) {
+		for (const auto& [name, info] : defaults)
+			settings.worldspaceWhitelist.insert_or_assign(name, info);
+		settings.worldspaceRemovedDefaults.clear();
+	}
+
+	if (ImGui::BeginTable("WorldspaceWhitelist", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, { -1, 0 })) {
+		ImGui::TableSetupColumn("Editor ID");
+		ImGui::TableSetupColumn("Ground", ImGuiTableColumnFlags_WidthFixed, 160.f);
+		ImGui::TableSetupColumn("##Action", ImGuiTableColumnFlags_WidthFixed, 90.f);
+		ImGui::TableHeadersRow();
+
+		std::string toRemove;
+		for (auto& [name, info] : settings.worldspaceWhitelist) {
+			ImGui::PushID(name.c_str());
+			ImGui::TableNextRow();
+			ImGui::TableSetColumnIndex(0);
+			ImGui::TextUnformatted(name.c_str());
+			ImGui::TableSetColumnIndex(1);
+			ImGui::SetNextItemWidth(-FLT_MIN);
+			ImGui::InputFloat("##Ground", &info.zBottom, 10.f, 100.f, "%.0f");
+			ImGui::TableSetColumnIndex(2);
+			if (ImGui::Button("Remove", { -1, 0 }))
+				toRemove = name;
+			ImGui::PopID();
+		}
+		if (!toRemove.empty())
+			removeEntry(toRemove);
+		ImGui::EndTable();
+	}
+	ImGui::TreePop();
 }
 
 void PhysicalSky::SettingsCelestials()
@@ -504,25 +752,14 @@ void PhysicalSky::Reset()
 	bool allGood = settings.enabled && ShadersOK() && skySync.loaded && skySync.settings.Enabled;
 
 	// check worldspace
-	bool worldspaceEnabled = false;
-	bool inInterior = false;
 	bool inMainLoadingMenu = globals::game::ui && (globals::game::ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || globals::game::ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
 
+	// (batch 37b) Whitelist (saved, editable, DLC exteriors added) / all exteriors / exclusions.
+	// With the 37b master off this is the 37a hard-coded list.
 	WorldspaceInfo worldspaceInfo = {};
-	if (RE::TES::GetSingleton()) {
-		if (auto worldspace = RE::TES::GetSingleton()->GetRuntimeData2().worldSpace; worldspace) {
-			std::string worldspaceName = worldspace->GetFormEditorID();
-			worldspaceEnabled = settings.worldspaceWhitelist.contains(worldspaceName);
-			if (worldspaceEnabled)
-				worldspaceInfo = settings.worldspaceWhitelist.at(worldspaceName);
-		}
-		if (auto player = RE::PlayerCharacter::GetSingleton(); player) {
-			if (auto cell = player->GetParentCell(); cell) {
-				inInterior = cell->IsInteriorCell();
-			}
-		}
-	}
-	allGood &= worldspaceEnabled && !inInterior && !inMainLoadingMenu;
+	const auto worldspaceStatus = GetWorldspaceStatus(worldspaceInfo.zBottom);
+	const bool worldspaceEnabled = worldspaceStatus == WorldspaceStatus::Whitelist || worldspaceStatus == WorldspaceStatus::AllExteriors;
+	allGood &= worldspaceEnabled && !inMainLoadingMenu;
 
 	if (!allGood) {
 		if (skySync.loaded && skySync.settings.Enabled)

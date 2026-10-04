@@ -38,6 +38,7 @@ struct PhysicalSky final : public Feature
 
 	void DrawSettings() override;
 	void SettingsGeneral();
+	void SettingsWorldspaces();
 	void SettingsCelestials();
 	void SettingsAtmosphere();
 	void SettingsClouds();
@@ -74,6 +75,35 @@ struct PhysicalSky final : public Feature
 		float zBottom = -14500.f;
 	};
 
+	/// The 9 hard-coded worldspaces of 37a and earlier. Used as-is while the 37b master is off.
+	static const std::map<std::string, WorldspaceInfo>& LegacyWorldspaceWhitelist();
+	/// (batch 37b) Legacy list + the Dawnguard exteriors that are earthly skies:
+	/// DLC1HunterHQWorld (Fort Dawnguard), DLC1VampireCastleCourtyard (Castle Volkihar
+	/// courtyard), DLC1AncestorsGladeWorld. EDIDs and heights read from Dawnguard.esm.
+	static std::map<std::string, WorldspaceInfo> DefaultWorldspaceWhitelist();
+	/// (batch 37b) Never physical sky, even if listed: other realms (Soul Cairn, Boneyard,
+	/// Apocrypha, Sovngarde) and any worldspace flagged "No Sky" (Blackreach, Darkfall Passage...).
+	static bool IsExcludedWorldspace(const RE::TESWorldSpace* a_worldspace);
+	/// (batch 37b) Planet ground for worldspaces not in the list: default water height (following
+	/// the parent when the worldspace uses the parent's land or water) minus 500, the same offset
+	/// Tamriel's -14500 has from its -14000 sea level.
+	static float FallbackZBottom(const RE::TESWorldSpace* a_worldspace);
+
+	/// Current exterior worldspace; falls back to the player cell's worldspace (upstream 693f6a35e).
+	static RE::TESWorldSpace* GetCurrentWorldspace();
+
+	enum class WorldspaceStatus
+	{
+		Unknown,
+		Interior,
+		Whitelist,
+		AllExteriors,
+		Excluded,
+		NotListed
+	};
+	/// What Reset() decides for the current worldspace, also used by the menu.
+	WorldspaceStatus GetWorldspaceStatus(float& a_zBottom) const;
+
 	struct Settings
 	{
 		bool enabled = true;
@@ -98,17 +128,14 @@ struct PhysicalSky final : public Feature
 		float dayExposure = 1e-2f;
 		float nightExposure = 1e2f;
 
-		std::map<std::string, WorldspaceInfo> worldspaceWhitelist = {
-			{ "Tamriel", { -14500.f } },
-			{ "WindhelmWorld", { -14500.f } },
-			{ "RiftenWorld", { -14500.f } },
-			{ "MarkarthWorld", { -14500.f } },
-			{ "WhiterunWorld", { -14500.f } },
-			{ "SolitudeWorld", { -14500.f } },
-			{ "WhiterunDragonsreachWorld", { -14500.f } },
-			{ "DLC01FalmerValley", { 3000.f } },
-			{ "DLC2SolstheimWorld", { 256.f } }
-		};
+		// (batch 37b) Saved and editable now. Starts as DefaultWorldspaceWhitelist(); entries the
+		// user removes from that default set are remembered in worldspaceRemovedDefaults, so a
+		// later default addition still reaches old configs without resurrecting removed ones.
+		std::map<std::string, WorldspaceInfo> worldspaceWhitelist = DefaultWorldspaceWhitelist();
+		std::vector<std::string> worldspaceRemovedDefaults = {};
+		/// (batch 37b) Enable in every exterior worldspace, whitelisted or not, except the hard
+		/// exclusions (IsExcludedWorldspace). zBottom then comes from FallbackZBottom().
+		bool enableAllExteriorWorldspaces = false;
 		float3 groundAlbedo = { .2f, .2f, .2f };
 
 		float planetRadius = 6.36e3f;      // in km
