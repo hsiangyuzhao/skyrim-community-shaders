@@ -21,7 +21,8 @@ namespace Util
 			case GpuScope::ShadowMaps:
 				return GpuPhase::ShadowOther;
 			case GpuScope::ShadowSun:
-				return GpuPhase::ShadowSunCascade1;
+			case GpuScope::ShadowSlice:  // always pushed with an explicit phase
+				return GpuPhase::ShadowOther;
 			case GpuScope::ShadowLocal:
 				return GpuPhase::ShadowLocalLights;
 			case GpuScope::ShadowMask:
@@ -150,6 +151,9 @@ namespace Util
 		{
 			static void thunk(RE::BSShadowLight* a_light, void* a2)
 			{
+				auto* timeline = GpuPhaseTimeline::GetSingleton();
+				if (timeline->IsRecording())
+					timeline->NoteDirectionalLight(a_light);
 				GpuPhaseScope scope(GpuScope::ShadowSun);
 				func(a_light, a2);
 			}
@@ -160,6 +164,7 @@ namespace Util
 		{
 			static void thunk(RE::BSShadowLight* a_light, void* a2)
 			{
+				GpuPhaseTimeline::GetSingleton()->NoteLocalShadowMap();
 				GpuPhaseScope scope(GpuScope::ShadowLocal);
 				func(a_light, a2);
 			}
@@ -170,11 +175,91 @@ namespace Util
 		{
 			static void thunk(RE::BSShadowLight* a_light, void* a2)
 			{
+				GpuPhaseTimeline::GetSingleton()->NoteLocalShadowMap();
 				GpuPhaseScope scope(GpuScope::ShadowLocal);
 				func(a_light, a2);
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
+
+		// ---------------------------------------------------------------------------------
+		// (batch 37a) The three calls of BSShadowLight::RenderShadowmap (ID 100820) inside
+		// BSShadowDirectionalLight::RenderShadowmaps (ID 101495), SE 1.5.97:
+		//   +0x6F  god-ray (volumetric) maps, target 3, slice = cascade, flags 0x100
+		//   +0xC6  sun cascades,              target 2, slice = cascade
+		//   +0x12B character (focus) maps,    target 4
+		// Each call clears one shadow map, submits every draw collected for it and writes its
+		// light matrix. Bracketing the call bills the clear and the submit to the right row on
+		// both clocks. Measurement only: the original always runs with its own arguments.
+		// ---------------------------------------------------------------------------------
+		enum class SliceKind
+		{
+			GodRay,
+			Sun,
+			Focus
+		};
+
+		GpuPhase SlicePhase(SliceKind a_kind, uint32_t a_slice)
+		{
+			const int i = static_cast<int>(std::min<uint32_t>(a_slice, 2u));
+			switch (a_kind) {
+			case SliceKind::GodRay:
+				return static_cast<GpuPhase>(static_cast<int>(GpuPhase::ShadowGodRay1) + i);
+			case SliceKind::Sun:
+				return static_cast<GpuPhase>(static_cast<int>(GpuPhase::ShadowSun1) + i);
+			default:
+				return GpuPhase::ShadowFocus;
+			}
+		}
+
+		template <SliceKind Kind>
+		struct RenderShadowmapCall
+		{
+			static void thunk(RE::BSShadowLight* a_light, RE::BSShadowLight::ShadowmapDescriptor* a_desc, uintptr_t a3, uintptr_t a4)
+			{
+				auto* timeline = GpuPhaseTimeline::GetSingleton();
+				if (!timeline->IsRecording() || !a_desc) {
+					func(a_light, a_desc, a3, a4);
+					return;
+				}
+				if constexpr (Kind == SliceKind::Focus)
+					timeline->NoteFocusShadowMap();
+				if constexpr (Kind == SliceKind::GodRay)
+					timeline->NoteGodRayPass();
+				timeline->PushPhase(GpuScope::ShadowSlice, SlicePhase(Kind, a_desc->shadowmapIndex));
+				func(a_light, a_desc, a3, a4);
+				timeline->Pop(GpuScope::ShadowSlice);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+
+		/// True if a_site is a rel32 CALL to a_target (the bytes about to be patched).
+		bool IsCallTo(uintptr_t a_site, uintptr_t a_target)
+		{
+			const auto* p = reinterpret_cast<const uint8_t*>(a_site);
+			if (p[0] != 0xE8)
+				return false;
+			int32_t rel = 0;
+			std::memcpy(&rel, p + 1, sizeof(rel));
+			return a_site + 5 + static_cast<intptr_t>(rel) == a_target;
+		}
+
+		int64_t QpcNow()
+		{
+			LARGE_INTEGER t;
+			QueryPerformanceCounter(&t);
+			return t.QuadPart;
+		}
+
+		double QpcToMs()
+		{
+			static const double toMs = [] {
+				LARGE_INTEGER f;
+				QueryPerformanceFrequency(&f);
+				return f.QuadPart > 0 ? 1000.0 / static_cast<double>(f.QuadPart) : 0.0;
+			}();
+			return toMs;
+		}
 	}
 
 	void GpuPhaseTimeline::InstallHooks()
@@ -190,6 +275,25 @@ namespace Util
 		stl::write_vfunc<0xA, BSShadowDirectionalLight_RenderShadowmaps>(RE::VTABLE_BSShadowDirectionalLight[0]);
 		stl::write_vfunc<0xA, BSShadowFrustumLight_RenderShadowmaps>(RE::VTABLE_BSShadowFrustumLight[0]);
 		stl::write_vfunc<0xA, BSShadowParabolicLight_RenderShadowmaps>(RE::VTABLE_BSShadowParabolicLight[0]);
+
+		// (batch 37a) Per-shadow-map brackets. The offsets were read off SkyrimSE.exe 1.5.97
+		// only, so anything else keeps the per-draw classification (same rows, but the clear
+		// before a map's first draw is billed to the map before it).
+		bool sliceHooks = false;
+		if (REL::Module::IsSE()) {
+			const uintptr_t body = REL::ID(101495).address();
+			const uintptr_t target = REL::ID(100820).address();
+			const uintptr_t godRay = body + 0x6F, sun = body + 0xC6, focus = body + 0x12B;
+			if (IsCallTo(godRay, target) && IsCallTo(sun, target) && IsCallTo(focus, target)) {
+				stl::write_thunk_call<RenderShadowmapCall<SliceKind::GodRay>>(godRay);
+				stl::write_thunk_call<RenderShadowmapCall<SliceKind::Sun>>(sun);
+				stl::write_thunk_call<RenderShadowmapCall<SliceKind::Focus>>(focus);
+				sliceHooks = true;
+			} else {
+				logger::warn("[GpuPhaseTimeline] RenderShadowmap call sites do not match SE 1.5.97; per-shadow-map brackets off");
+			}
+		}
+		GetSingleton()->SetSliceHooksInstalled(sliceHooks);
 
 		logger::info("[GpuPhaseTimeline] Installed hooks");
 	}
@@ -262,9 +366,12 @@ namespace Util
 		depth = 0;
 		overflowDepth = 0;
 		current = GpuPhase::Untracked;
-		cascadeCount = 0;
 		frameDraws.fill(0);
 		frameUntrackedTypes.fill(0);
+		frameCpuTicks.fill(0);
+		lastSwitchTicks = 0;
+		reseedCpu = true;
+		frameShadow = {};
 		report = {};
 	}
 
@@ -272,6 +379,11 @@ namespace Util
 	{
 		if (a_phase == current)
 			return;
+		// (batch 37a) CPU side: the render thread's wall time since the last switch belongs to
+		// the stage that was active, the same exclusive rule as the GPU timestamps.
+		const int64_t now = QpcNow();
+		frameCpuTicks[static_cast<size_t>(current)] += now - lastSwitchTicks;
+		lastSwitchTicks = now;
 		current = a_phase;
 
 		auto& slot = slots[writeSlot];
@@ -295,11 +407,47 @@ namespace Util
 			++overflowDepth;
 			return;
 		}
-		if (a_scope == GpuScope::ShadowSun)
-			cascadeCount = 0;
 		const GpuPhase phase = InitialPhase(a_scope);
 		stack[depth++] = StackEntry{ a_scope, phase };
 		SwitchTo(phase);
+	}
+
+	void GpuPhaseTimeline::PushPhase(GpuScope a_scope, GpuPhase a_phase)
+	{
+		if (!frameActive)
+			return;
+		if (depth >= kMaxDepth) {
+			++overflowDepth;
+			return;
+		}
+		stack[depth++] = StackEntry{ a_scope, a_phase };
+		SwitchTo(a_phase);
+	}
+
+	void GpuPhaseTimeline::NoteDirectionalLight(void* a_light)
+	{
+		// Plain reads of the light the engine is about to render. SE/AE layout only: VR's
+		// descriptor array differs and is not read.
+		if (!a_light || REL::Module::IsVR())
+			return;
+		auto* light = static_cast<RE::BSShadowDirectionalLight*>(a_light);
+		ShadowInfo& s = frameShadow;
+		s.valid = true;
+		s.sunCascades = light->shadowMapCount;
+		s.drawFocusShadows = *reinterpret_cast<const bool*>(reinterpret_cast<const uint8_t*>(light) + 0x558);
+		const auto& dir = light->GetShadowDirectionalLightRuntimeData();
+		const auto& descs = light->GetRuntimeData().shadowmapDescriptors;
+		for (uint32_t i = 0; i < 3; ++i) {
+			s.startSplit[i] = dir.startSplitDistances[i];
+			s.endSplit[i] = dir.endSplitDistances[i];
+			if (i < descs.size() && i < s.sunCascades) {
+				const auto& d = descs[i];
+				float upt = 0.0f;
+				std::memcpy(&upt, &d.unitsPerTexel, sizeof(upt));  // a float in 1.5.97 (reset to 1.0f)
+				s.unitsPerTexel[i] = upt;
+				std::memcpy(s.port[i], &d.port, sizeof(s.port[i]));  // left, right, top, bottom (protected in NiRect)
+			}
+		}
 	}
 
 	void GpuPhaseTimeline::Pop(GpuScope a_scope)
@@ -319,37 +467,28 @@ namespace Util
 		}
 	}
 
-	GpuPhase GpuPhaseTimeline::ClassifySunCascade()
+	GpuPhase GpuPhaseTimeline::ClassifyDirectionalShadowDraw() const
 	{
-		// A cascade is wherever the draws go: the shadow-map slice and viewport the engine
-		// has set up for this draw. Numbered in the order the engine renders them.
+		// (batch 37a) The shadow map this draw renders into, read off the engine's render
+		// target state: target 3 = god-ray maps, 2 = sun cascades (slice = cascade, 0 nearest),
+		// 4 = character maps. Where the per-map call-site hooks are installed they push the
+		// same phase first, and this is not consulted.
 		auto shadowState = globals::game::shadowState;
 		if (!shadowState)
-			return GpuPhase::ShadowSunCascade1;
+			return GpuPhase::ShadowOther;
 		GET_INSTANCE_MEMBER(depthStencil, shadowState)
 		GET_INSTANCE_MEMBER(depthStencilSlice, shadowState)
-		GET_INSTANCE_MEMBER(viewPort, shadowState)
-		const uint64_t key = (static_cast<uint64_t>(depthStencil & 0xFFFF) << 48) |
-		                     (static_cast<uint64_t>(depthStencilSlice & 0xFFFF) << 32) |
-		                     (static_cast<uint64_t>(static_cast<uint32_t>(viewPort.TopLeftX) & 0xFFFF) << 16) |
-		                     static_cast<uint64_t>(static_cast<uint32_t>(viewPort.TopLeftY) & 0xFFFF);
-
-		int index = -1;
-		for (int i = 0; i < cascadeCount; ++i) {
-			if (cascadeKeys[i] == key) {
-				index = i;
-				break;
-			}
+		const uint32_t slice = std::min<uint32_t>(static_cast<uint32_t>(depthStencilSlice), 2u);
+		switch (static_cast<int>(depthStencil)) {
+		case RE::RENDER_TARGETS_DEPTHSTENCIL::kVOLUMETRIC_LIGHTING_SHADOWMAPS_ESRAM:
+			return static_cast<GpuPhase>(static_cast<int>(GpuPhase::ShadowGodRay1) + slice);
+		case RE::RENDER_TARGETS_DEPTHSTENCIL::kSHADOWMAPS_ESRAM:
+			return static_cast<GpuPhase>(static_cast<int>(GpuPhase::ShadowSun1) + slice);
+		case RE::RENDER_TARGETS_DEPTHSTENCIL::kSHADOWMAPS:
+			return GpuPhase::ShadowFocus;
+		default:
+			return GpuPhase::ShadowOther;
 		}
-		if (index < 0) {
-			if (cascadeCount < kMaxCascades) {
-				cascadeKeys[cascadeCount] = key;
-				index = cascadeCount++;
-			} else {
-				index = kMaxCascades - 1;
-			}
-		}
-		return static_cast<GpuPhase>(static_cast<int>(GpuPhase::ShadowSunCascade1) + index);
 	}
 
 	void GpuPhaseTimeline::OnDrawActive(RE::BSShader* a_shader, uint32_t a_vertexDescriptor, uint32_t a_pixelDescriptor)
@@ -362,7 +501,7 @@ namespace Util
 			auto& top = stack[depth - 1];
 			switch (top.scope) {
 			case GpuScope::ShadowSun:
-				top.phase = ClassifySunCascade();
+				top.phase = ClassifyDirectionalShadowDraw();
 				break;
 			case GpuScope::Opaque:
 				top.phase = ClassifyOpaque(a_shader, a_vertexDescriptor, a_pixelDescriptor);
@@ -392,6 +531,7 @@ namespace Util
 			frameActive = false;
 			reseed = true;
 			reseedDraws = true;
+			reseedCpu = true;
 			for (auto& slot : slots)
 				slot.pending = false;
 			return;
@@ -411,10 +551,12 @@ namespace Util
 		slot.truncated = false;
 		depth = 0;
 		overflowDepth = 0;
-		cascadeCount = 0;
 		current = GpuPhase::Untracked;
 		frameDraws.fill(0);
 		frameUntrackedTypes.fill(0);
+		frameCpuTicks.fill(0);
+		lastSwitchTicks = QpcNow();
+		frameShadow = {};
 
 		// The opening timestamp gets a degenerate disjoint window, which must not nest inside
 		// one of GpuPassTimers'. Nothing of ours is mid-pass at Present; skip the frame if so.
@@ -451,11 +593,25 @@ namespace Util
 			slot.pending = true;
 		}
 
-		// Draw counts are known now; the times arrive a few frames later.
+		// Draw counts and CPU times are known now; the GPU times arrive a few frames later.
+		{
+			const int64_t now = QpcNow();
+			frameCpuTicks[static_cast<size_t>(current)] += now - lastSwitchTicks;
+			lastSwitchTicks = now;
+		}
+		const double toMs = QpcToMs();
 		for (size_t i = 0; i < kPhaseCount; ++i) {
 			const float v = static_cast<float>(frameDraws[i]);
 			report.draws[i] = reseedDraws ? v : report.draws[i] * kSmoothingOld + v * kSmoothingNew;
+			report.lastDraws[i] = v;
+			const float c = static_cast<float>(static_cast<double>(frameCpuTicks[i]) * toMs);
+			report.cpuMs[i] = reseedCpu ? c : report.cpuMs[i] * kSmoothingOld + c * kSmoothingNew;
+			report.lastCpuMs[i] = c;
 		}
+		reseedCpu = false;
+		report.hasCpuSample = true;
+		frameShadow.sliceHooks = sliceHooksInstalled;
+		report.shadow = frameShadow;
 		for (size_t i = 0; i < kShaderTypeCount; ++i) {
 			const float v = static_cast<float>(frameUntrackedTypes[i]);
 			report.untrackedDrawsByType[i] = reseedDraws ? v : report.untrackedDrawsByType[i] * kSmoothingOld + v * kSmoothingNew;
@@ -538,6 +694,7 @@ namespace Util
 			for (size_t i = 0; i < kPhaseCount; ++i) {
 				const float v = static_cast<float>(sampleMs[i]);
 				report.ms[i] = reseed ? v : report.ms[i] * kSmoothingOld + v * kSmoothingNew;
+				report.lastMs[i] = v;
 			}
 			const float total = static_cast<float>(totalMs);
 			const float stamps = static_cast<float>(slot.count);

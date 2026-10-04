@@ -24,11 +24,16 @@ namespace Util
 	{
 		Untracked = 0,  // nothing below covers it
 
-		// Shadows
-		ShadowSunCascade1,
-		ShadowSunCascade2,
-		ShadowSunCascade3,
-		ShadowSunCascade4,
+		// Shadows. (batch 37a) Identified by the shadow map a draw goes to (target + slice), not
+		// by the order the draws arrive in. One call of the directional light renders the
+		// god-ray maps, then the sun cascades, then the character (focus) maps.
+		ShadowGodRay1,  // volumetric-lighting shadow map, cascade 1 (target 3, slice 0)
+		ShadowGodRay2,
+		ShadowGodRay3,
+		ShadowSun1,  // sun shadow map, cascade 1 = nearest (target 2, slice 0)
+		ShadowSun2,
+		ShadowSun3,
+		ShadowFocus,        // character (focus) shadow maps of the directional light (target 4)
 		ShadowLocalLights,  // spot + omni (torches, lamps, magic lights)
 		ShadowMask,         // the full-screen passes that apply shadow maps to the screen
 		ShadowOther,        // shadow pass work outside the per-light calls
@@ -70,7 +75,8 @@ namespace Util
 	enum class GpuScope : uint8_t
 	{
 		ShadowMaps,
-		ShadowSun,  // splits per cascade
+		ShadowSun,    // splits per shadow map (target + slice of each draw)
+		ShadowSlice,  // (batch 37a) one engine RenderShadowmap call; pushed with an explicit phase
 		ShadowLocal,
 		ShadowMask,
 		WaterPrep,
@@ -126,8 +132,48 @@ namespace Util
 		void EndFrame();
 
 		void Push(GpuScope a_scope);
+		/// @brief (batch 37a) Pushes a scope that bills to a_phase instead of the scope's default.
+		void PushPhase(GpuScope a_scope, GpuPhase a_phase);
 		/// @brief Pops a_scope and anything still above it. Ignored if it is not on the stack.
 		void Pop(GpuScope a_scope);
+
+		/// @brief True while a frame is being recorded (the overlay's engine table is on screen).
+		bool IsRecording() const { return frameActive; }
+
+		/// @brief (batch 37a) What the directional light reported this frame, for the shadow diagnostics.
+		struct ShadowInfo
+		{
+			bool valid = false;
+			bool sliceHooks = false;        ///< the per-shadow-map call-site hooks are installed (SE 1.5.97)
+			uint32_t sunCascades = 0;       ///< BSShadowLight::shadowMapCount of the directional light
+			bool drawFocusShadows = false;  ///< BSShadowDirectionalLight +0x558
+			uint32_t focusShadows = 0;      ///< focus maps rendered this frame
+			uint32_t localShadowMaps = 0;   ///< spot/omni RenderShadowmaps calls this frame
+			bool godRayPass = false;        ///< god-ray maps were rendered this frame
+			float startSplit[3]{};
+			float endSplit[3]{};
+			float unitsPerTexel[3]{};
+			int32_t port[3][4]{};  ///< left, right, top, bottom of each cascade's viewport
+		};
+
+		/// @brief (batch 37a) Called by the shadow hooks. Not part of the public interface otherwise.
+		void NoteDirectionalLight(void* a_light);
+		void NoteLocalShadowMap()
+		{
+			if (frameActive)
+				++frameShadow.localShadowMaps;
+		}
+		void NoteFocusShadowMap()
+		{
+			if (frameActive)
+				++frameShadow.focusShadows;
+		}
+		void NoteGodRayPass()
+		{
+			if (frameActive)
+				frameShadow.godRayPass = true;
+		}
+		void SetSliceHooksInstalled(bool a_installed) { sliceHooksInstalled = a_installed; }
 
 		/// @brief Per-draw hook (State::Draw). Reclassifies the draw in split scopes and counts it.
 		void OnDraw(RE::BSShader* a_shader, uint32_t a_vertexDescriptor, uint32_t a_pixelDescriptor)
@@ -149,6 +195,15 @@ namespace Util
 			uint32_t droppedFrames = 0;       ///< frames that hit the timestamp cap
 			/// Draws that landed in Untracked, by RE::BSShader::Type: what to hook next if that row is big.
 			std::array<float, kShaderTypeCount> untrackedDrawsByType{};
+
+			// (batch 37a) Render-thread CPU wall time while each stage was active (QPC at every
+			// stage switch), smoothed like the GPU times, plus the unsmoothed last frame of all three.
+			bool hasCpuSample = false;
+			std::array<float, static_cast<size_t>(GpuPhase::Count)> cpuMs{};
+			std::array<float, static_cast<size_t>(GpuPhase::Count)> lastMs{};
+			std::array<float, static_cast<size_t>(GpuPhase::Count)> lastDraws{};
+			std::array<float, static_cast<size_t>(GpuPhase::Count)> lastCpuMs{};
+			ShadowInfo shadow;  ///< last recorded frame
 		};
 
 		const Report& Get() const { return report; }
@@ -161,7 +216,6 @@ namespace Util
 		// dropped (its attribution after the cap would be wrong) and counted in the report.
 		static constexpr int kMaxTimestamps = 2048;
 		static constexpr int kMaxDepth = 16;
-		static constexpr int kMaxCascades = 4;
 		static constexpr float kSmoothingOld = 0.95f;
 		static constexpr float kSmoothingNew = 0.05f;
 		static constexpr double kMinPlausibleMs = 0.05;
@@ -196,7 +250,7 @@ namespace Util
 		bool EnsureDisjoint(FrameSlot& a_slot) const;
 		void SwitchTo(GpuPhase a_phase);
 		void OnDrawActive(RE::BSShader* a_shader, uint32_t a_vertexDescriptor, uint32_t a_pixelDescriptor);
-		GpuPhase ClassifySunCascade();
+		GpuPhase ClassifyDirectionalShadowDraw() const;
 		void Collect();
 		SlotStatus TryRead(FrameSlot& a_slot, std::array<double, static_cast<size_t>(GpuPhase::Count)>& a_outMs, double& a_outTotalMs);
 
@@ -212,10 +266,12 @@ namespace Util
 		int overflowDepth = 0;  // pushes beyond kMaxDepth, popped without effect
 		GpuPhase current = GpuPhase::Untracked;
 
-		uint64_t cascadeKeys[kMaxCascades]{};
-		int cascadeCount = 0;
-
 		std::array<uint32_t, static_cast<size_t>(GpuPhase::Count)> frameDraws{};
+		std::array<int64_t, static_cast<size_t>(GpuPhase::Count)> frameCpuTicks{};
+		int64_t lastSwitchTicks = 0;
+		bool reseedCpu = true;
+		ShadowInfo frameShadow;
+		bool sliceHooksInstalled = false;
 		std::array<uint32_t, kShaderTypeCount> frameUntrackedTypes{};
 		std::vector<UINT64> scratchTicks;
 		Report report;

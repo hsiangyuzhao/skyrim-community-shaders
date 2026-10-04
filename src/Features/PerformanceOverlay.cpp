@@ -1685,12 +1685,21 @@ namespace
 					"Water work done before the main scene: water reflections and ripples." } } },
 			{ "Shadows", "Drawing the shadow maps, and applying them to the screen.",
 				{
-					{ P::ShadowSunCascade1, "Sun cascade 1",
-						"Sun/moon shadows are drawn in distance bands (cascades). Cascade 1 is "
-						"normally the sharp one closest to the camera." },
-					{ P::ShadowSunCascade2, "Sun cascade 2", "Sun/moon shadow map, cascade 2 (further out than 1)." },
-					{ P::ShadowSunCascade3, "Sun cascade 3", "Sun/moon shadow map, cascade 3." },
-					{ P::ShadowSunCascade4, "Sun cascade 4", "Sun/moon shadow map, cascade 4 (and any beyond)." },
+					// (batch 37a) Named by the shadow map each draw goes into, not by arrival order.
+					// The labels of these rows are filled in per frame (EngineRowLabel) from the
+					// number of sun cascades the game is set to (iNumSplits).
+					{ P::ShadowGodRay1, "God-ray shadow, cascade 1",
+						"A second copy of the sun shadow map, cascade by cascade, used only for god rays\n"
+						"(volumetric light). The game draws it before the real sun shadows, with fewer objects." },
+					{ P::ShadowGodRay2, "God-ray shadow, cascade 2", "God-ray shadow map, next cascade out." },
+					{ P::ShadowGodRay3, "God-ray shadow, cascade 3", "God-ray shadow map, third cascade." },
+					{ P::ShadowSun1, "Sun shadow, cascade 1",
+						"Sun/moon shadows are drawn in distance bands (cascades).\n"
+						"The near cascade is the sharp one around you; the far one covers everything out to the shadow distance." },
+					{ P::ShadowSun2, "Sun shadow, cascade 2", "Sun/moon shadow map, next cascade out." },
+					{ P::ShadowSun3, "Sun shadow, cascade 3", "Sun/moon shadow map, third cascade." },
+					{ P::ShadowFocus, "Character shadows",
+						"Extra close-up shadow maps the game draws for a few characters near you (iNumFocusShadow)." },
 					{ P::ShadowLocalLights, "Lamps & torches", "Shadow maps of shadow-casting lamps, torches and spells." },
 					{ P::ShadowMask, "Shadow mask", "Full-screen passes that work out which pixels are in shadow." },
 					{ P::ShadowOther, "Other shadow work", "Shadow-pass time outside the per-light drawing (setup, clears)." },
@@ -1743,6 +1752,81 @@ namespace
 					"Small is good: the rows above then explain the whole frame." } } },
 		};
 		return layout;
+	}
+
+	/// (batch 37a) Display name of an engine row. The shadow rows are named after the shadow
+	/// map they render, with the cascade called near / far (or near / middle / far) from the
+	/// cascade count the directional light reported this frame.
+	std::string EngineRowLabel(const EnginePhaseRow& a_row, const Util::GpuPhaseTimeline::ShadowInfo& a_shadow)
+	{
+		using P = Util::GpuPhase;
+		const auto cascadeName = [&a_shadow](int a_index) -> std::string {
+			const uint32_t n = a_shadow.valid ? a_shadow.sunCascades : 0;
+			if (n == 1)
+				return "single cascade";
+			if (n == 2)
+				return a_index == 0 ? "near cascade" : (a_index == 1 ? "far cascade" : "cascade 3 (unused)");
+			if (n == 3)
+				return a_index == 0 ? "near cascade" : (a_index == 1 ? "middle cascade" : "far cascade");
+			return std::format("cascade {}", a_index + 1);
+		};
+		switch (a_row.phase) {
+		case P::ShadowGodRay1:
+		case P::ShadowGodRay2:
+		case P::ShadowGodRay3:
+			return "God-ray shadow, " + cascadeName(static_cast<int>(a_row.phase) - static_cast<int>(P::ShadowGodRay1));
+		case P::ShadowSun1:
+		case P::ShadowSun2:
+		case P::ShadowSun3:
+			return "Sun shadow, " + cascadeName(static_cast<int>(a_row.phase) - static_cast<int>(P::ShadowSun1));
+		case P::ShadowFocus:
+			return a_shadow.valid ? std::format("Character shadows ({} maps)", a_shadow.focusShadows) : std::string(a_row.label);
+		case P::ShadowLocalLights:
+			return a_shadow.valid || a_shadow.localShadowMaps ? std::format("Lamps & torches ({} lights)", a_shadow.localShadowMaps) : std::string(a_row.label);
+		default:
+			return a_row.label;
+		}
+	}
+
+	/// (batch 37a) Stable machine name of an engine row, used as the JSON key.
+	const char* EnginePhaseKey(Util::GpuPhase a_phase)
+	{
+		using P = Util::GpuPhase;
+		switch (a_phase) {
+		case P::Untracked: return "untracked";
+		case P::ShadowGodRay1: return "shadow_godray_c1";
+		case P::ShadowGodRay2: return "shadow_godray_c2";
+		case P::ShadowGodRay3: return "shadow_godray_c3";
+		case P::ShadowSun1: return "shadow_sun_c1";
+		case P::ShadowSun2: return "shadow_sun_c2";
+		case P::ShadowSun3: return "shadow_sun_c3";
+		case P::ShadowFocus: return "shadow_focus";
+		case P::ShadowLocalLights: return "shadow_local";
+		case P::ShadowMask: return "shadow_mask";
+		case P::ShadowOther: return "shadow_other";
+		case P::WaterPrep: return "water_prep";
+		case P::DepthPrepass: return "depth_prepass";
+		case P::OpaqueTerrain: return "opaque_terrain";
+		case P::OpaqueObjects: return "opaque_objects";
+		case P::OpaqueCharacters: return "opaque_characters";
+		case P::OpaqueTrees: return "opaque_trees";
+		case P::OpaqueGrass: return "opaque_grass";
+		case P::OpaqueDistant: return "opaque_distant";
+		case P::OpaqueOther: return "opaque_other";
+		case P::Sky: return "sky";
+		case P::Water: return "water";
+		case P::Transparent: return "transparent";
+		case P::WorldOther: return "world_other";
+		case P::FirstPerson: return "first_person";
+		case P::Reflections: return "reflections";
+		case P::Imagespace: return "imagespace";
+		case P::UI: return "ui";
+		case P::CsPasses: return "cs_timed_passes";
+		case P::CsOther: return "cs_other";
+		case P::CsUpscaling: return "cs_upscaling";
+		case P::CsOverlay: return "cs_overlay";
+		default: return "unknown";
+		}
 	}
 
 	// Below this a row is noise from timer resolution, not a stage that ran.
@@ -1810,17 +1894,20 @@ void PerformanceOverlay::DrawEngineGpuTable()
 			ImGui::TextUnformatted(
 				"Where each frame's GPU time goes, stage by stage. Rows do not overlap, so they add up to Total.\n\n"
 				"Read it with the frame rate uncapped: otherwise time the GPU spends waiting for the CPU "
-				"is counted in whichever stage was running.");
+				"is counted in whichever stage was running.\n\n"
+				"CPU: how long the game's render thread spent in that stage (preparing and sending its draws). "
+				"\"Untracked\" holds everything else the CPU does in a frame, game logic included.");
 		}
 	}
 
 	const bool peakColumn = settings.ShowPeakColumn;
-	if (!ImGui::BeginTable("EngineGpuPhases", peakColumn ? 5 : 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg))
+	if (!ImGui::BeginTable("EngineGpuPhases", peakColumn ? 6 : 5, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg))
 		return;
 
 	ImGui::TableSetupColumn("Stage");
 	ImGui::TableSetupColumn("GPU Time");
 	ImGui::TableSetupColumn("% of GPU frame");
+	ImGui::TableSetupColumn("CPU Time");
 	ImGui::TableSetupColumn("Draws");
 	if (peakColumn)
 		ImGui::TableSetupColumn("Peak");
@@ -1862,6 +1949,18 @@ void PerformanceOverlay::DrawEngineGpuTable()
 			ImGui::Text("%.1f%%", totalMs > 0.0f ? ms / totalMs * 100.0f : 0.0f);
 		else
 			ImGui::TextDisabled("-");
+
+		// (batch 37a) Render-thread CPU time of the same stage.
+		ImGui::TableNextColumn();
+		{
+			float cpuMs = 0.0f;
+			if (!view.engineCpu.DisplayValue(a_id, cfg, cpuMs))
+				ImGui::TextDisabled("-");
+			else if (cpuMs > 0.0f && cpuMs < 0.01f)
+				ImGui::TextUnformatted("< 0.01 ms");
+			else
+				ImGui::Text("%.2f ms", cpuMs);
+		}
 
 		ImGui::TableNextColumn();
 		if (a_showDraws && row->drawCalls >= 0)
@@ -3148,25 +3247,29 @@ void PerformanceOverlay::UpdateViews(double a_now, const DrawCallRowSets& a_rowS
 	// --- Engine passes (GPU) ---
 	{
 		std::vector<DcIn> in;
+		std::vector<DcIn> cpuIn;  // (batch 37a) same rows, CPU time
 		const auto& report = Util::GpuPhaseTimeline::GetSingleton()->Get();
 		if (report.hasSample) {
 			const auto msOf = [&report](Util::GpuPhase p) { return report.ms[static_cast<size_t>(p)]; };
 			const auto drawsOf = [&report](Util::GpuPhase p) { return report.draws[static_cast<size_t>(p)]; };
+			const auto cpuOf = [&report](Util::GpuPhase p) { return report.cpuMs[static_cast<size_t>(p)]; };
 			const auto rowVisible = [&](const EnginePhaseRow& a_row) {
-				return a_row.phase == Util::GpuPhase::Untracked || msOf(a_row.phase) >= kEnginePhaseVisibleMs || drawsOf(a_row.phase) >= 0.5f;
+				return a_row.phase == Util::GpuPhase::Untracked || msOf(a_row.phase) >= kEnginePhaseVisibleMs || drawsOf(a_row.phase) >= 0.5f ||
+				       cpuOf(a_row.phase) >= kEnginePhaseVisibleMs;
 			};
-			const auto makeRow = [](const char* a_label, std::string a_tooltip, int a_id, float a_ms, float a_draws) {
-				return DrawCallRow{ a_label, a_id, static_cast<int>(std::lround(a_draws)), a_ms, 0.0f, 0.0f, std::move(a_tooltip), true, std::nullopt, std::nullopt };
+			const auto makeRow = [](std::string a_label, std::string a_tooltip, int a_id, float a_ms, float a_draws) {
+				return DrawCallRow{ std::move(a_label), a_id, static_cast<int>(std::lround(a_draws)), a_ms, 0.0f, 0.0f, std::move(a_tooltip), true, std::nullopt, std::nullopt };
 			};
 
 			const auto& layout = EnginePhaseLayout();
 			for (size_t g = 0; g < layout.size(); ++g) {
 				const auto& group = layout[g];
-				float groupMs = 0.0f, groupDraws = 0.0f;
+				float groupMs = 0.0f, groupDraws = 0.0f, groupCpu = 0.0f;
 				bool anyVisible = false;
 				for (const auto& row : group.rows) {
 					groupMs += msOf(row.phase);
 					groupDraws += drawsOf(row.phase);
+					groupCpu += cpuOf(row.phase);
 					anyVisible |= rowVisible(row);
 					if (!rowVisible(row))
 						continue;
@@ -3185,11 +3288,14 @@ void PerformanceOverlay::UpdateViews(double a_now, const DrawCallRowSets& a_rowS
 							tooltip += "\n\nDraws in here, by shader:" + byType;
 					}
 					const int id = static_cast<int>(row.phase);
-					in.push_back(DcIn{ id, makeRow(row.label, std::move(tooltip), id, msOf(row.phase), drawsOf(row.phase)), msOf(row.phase), id });
+					std::string label = EngineRowLabel(row, report.shadow);
+					cpuIn.push_back(DcIn{ id, makeRow(label, {}, id, cpuOf(row.phase), drawsOf(row.phase)), cpuOf(row.phase), id });
+					in.push_back(DcIn{ id, makeRow(std::move(label), std::move(tooltip), id, msOf(row.phase), drawsOf(row.phase)), msOf(row.phase), id });
 				}
 				if (group.label && anyVisible) {
 					const int id = kEngineGroupRowIdBase + static_cast<int>(g);
 					in.push_back(DcIn{ id, makeRow(group.label, group.tooltip ? group.tooltip : "", id, groupMs, groupDraws), groupMs, id });
+					cpuIn.push_back(DcIn{ id, makeRow(group.label, {}, id, groupCpu, groupDraws), groupCpu, id });
 				}
 			}
 
@@ -3203,8 +3309,13 @@ void PerformanceOverlay::UpdateViews(double a_now, const DrawCallRowSets& a_rowS
 			if (report.droppedFrames > 0)
 				totalTooltip += std::format("\nFrames skipped (too many stage switches): {}", report.droppedFrames);
 			in.push_back(DcIn{ kEngineTotalRowId, makeRow("Total", std::move(totalTooltip), kEngineTotalRowId, report.totalMs, totalDraws), report.totalMs, kEngineTotalRowId });
+			float totalCpu = 0.0f;
+			for (float c : report.cpuMs)
+				totalCpu += c;
+			cpuIn.push_back(DcIn{ kEngineTotalRowId, makeRow("Total", {}, kEngineTotalRowId, totalCpu, totalDraws), totalCpu, kEngineTotalRowId });
 		}
 		view.engine.Update(a_now, std::move(in), a_cfg);
+		view.engineCpu.Update(a_now, std::move(cpuIn), a_cfg);
 	}
 
 	// --- Denoiser breakdown ---

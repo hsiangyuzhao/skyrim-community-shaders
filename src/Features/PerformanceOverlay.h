@@ -538,6 +538,7 @@ struct PerformanceOverlay : OverlayFeature
 		PerfView::StableTable<DrawCallRow> gpuPasses;
 		PerfView::StableTable<DrawCallRow> gpuFooter;
 		PerfView::StableTable<DrawCallRow> engine;
+		PerfView::StableTable<DrawCallRow> engineCpu;  ///< (batch 37a) same rows as `engine`, render-thread CPU ms
 		PerfView::StableTable<DenoiserRow> denoiser;
 		PerfView::StableTable<DenoiserRow> denoiserFooter;
 		PerfView::StableTable<int> summary;
