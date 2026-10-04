@@ -5,6 +5,7 @@
 #include "Deferred.h"
 #include "State.h"
 #include "Util.h"
+#include "Utils/Batch37b.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -79,6 +80,8 @@ void ScreenSpaceGI::DrawSettings()
 
 		ImGui::EndTable();
 	}
+
+	Batch37b::DrawSsgiCheckboxes();
 
 	///////////////////////////////
 	ImGui::SeparatorText("Quality/Performance");
@@ -652,6 +655,10 @@ void ScreenSpaceGI::ClearShaderCache()
 
 void ScreenSpaceGI::CompileComputeShaders()
 {
+	// (batch 37b, C-2) What this round compiles GI for. DrawSSGI decides the IL-only skips from
+	// this, not from the live setting, so the two can never disagree for a frame.
+	compiledWithGI = settings.EnableGI;
+
 	struct ShaderCompileInfo
 	{
 		winrt::com_ptr<ID3D11ComputeShader>* programPtr;
@@ -839,6 +846,7 @@ void ScreenSpaceGI::DrawSSGI()
 		ClearShaderCache();
 
 	if (!(settings.Enabled && ShadersOK())) {
+		ilPassesSkipped = false;
 		FLOAT clr[4] = { 0.f, 0.f, 0.f, 0.f };
 		context->ClearUnorderedAccessViewFloat(texAo[outputAoIdx]->uav.get(), clr);
 		context->ClearUnorderedAccessViewFloat(texIlY[outputIlIdx]->uav.get(), clr);
@@ -854,6 +862,10 @@ void ScreenSpaceGI::DrawSSGI()
 	static uint lastFrameAccumTexIdx = 0;
 	uint inputAoTexIdx = lastFrameAoTexIdx;
 	uint inputGITexIdx = lastFrameGITexIdx;
+
+	// (batch 37b, C-2) IL off: the radiance copy + prefilter and the IL blur serve nothing.
+	const bool skipIlPasses = !compiledWithGI && Batch37b::SsgiSkipIlPassesActive();
+	ilPassesSkipped = skipIlPasses;
 
 	//////////////////////////////////////////////////////
 
@@ -936,7 +948,11 @@ void ScreenSpaceGI::DrawSSGI()
 		context->Dispatch((internalRes[0] + 7u) >> 3, (internalRes[1] + 7u) >> 3, 1);
 
 		// Prefilter radiance texture instead of using GenerateMips for proper dynamic resolution handling
-		{
+		//
+		// (batch 37b, C-2) Only gi.cs.hlsl reads texRadiance, and only inside #ifdef GI (the
+		// IL sampling loop). With Indirect Lighting off nothing ever reads it, so the copy and
+		// the 5-level prefilter are pure waste; skipping them cannot change any other output.
+		if (!skipIlPasses) {
 			TracyD3D11Zone(globals::state->tracyCtx, "SSGI - Prefilter Radiance");
 
 			// First copy mip 0 from radiance to temporary texture to avoid read/write conflict
@@ -996,7 +1012,17 @@ void ScreenSpaceGI::DrawSSGI()
 	}
 
 	// blur
-	if (settings.EnableBlur) {
+	//
+	// (batch 37b, C-2) The blur only filters IL (outIlY / outIlCoCg); AO passes it untouched.
+	// Its one other store is accumFrames, an exact R8 copy of the same texel (blur.cs.hlsl), and
+	// the flip below makes the next frame read that copy. Skipping the pass and the flip makes the
+	// next frame read the original instead: identical bytes everywhere the copy would have
+	// written, and every reader of the accumulation buffer (radianceDisocc's history taps,
+	// gi.cs.hlsl, blur.cs.hlsl) only reads texels the copy covers or the current frame's
+	// radianceDisocc wrote. With IL off the IL buffers carry gi.cs.hlsl's decaying-to-zero
+	// history, which the AO path never reads (only their finiteness, which the blur preserves).
+	// So AO and contact AO stay bit-identical.
+	if (settings.EnableBlur && !skipIlPasses) {
 		TracyD3D11Zone(globals::state->tracyCtx, "SSGI - Diffuse Blur");
 
 		resetViews();

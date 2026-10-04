@@ -350,7 +350,14 @@ float SSRTCompositeViewZ(float screenDepth)
 #	if defined(SSGI)
 	float3 multiBounceAO = Color::MultiBounceAO(linAlbedo, ssgiAo);
 
+#		if !defined(SSGI_AO_SPARES_DIRECT)
 	linDiffuseColor *= sqrt(multiBounceAO);
+#		endif
+	// (batch 37b, C-4) SSGI_AO_SPARES_DIRECT ("SSGI AO does not darken direct light", off by
+	// default): what is left in linDiffuseColor here is MAIN minus the reconstructed ambient,
+	// i.e. direct light (plus, with SSRT diffuse on, the traced bounce light SSRT already added,
+	// which carries its own occlusion). Without the sqrt(AO) above, SSGI AO acts only on the
+	// ambient term re-added below and on nothing else.
 #	else
 	// No SSGI occlusion signal in this build, so the shaping the separation exists to apply is the
 	// identity and fxc folds it out. What is left of the subtract/re-add pair is

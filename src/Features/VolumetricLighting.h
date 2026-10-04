@@ -27,6 +27,8 @@ public:
 		/// intensity. Normalised at DensityGammaReference so that intensity looks unchanged.
 		bool DensityOnlyGamma = true;
 		float DensityGammaReference = 2.0f;
+		/// A2 sub-switch: clamp the remapped intensity to the original, so A2 only dims.
+		bool DensityGammaNeverBrighten = true;
 		/// A3: extra multiplier on the shafts while a moon is the light source (Sky Sync).
 		float NightIntensity = 0.5f;
 		/// A4: when Physical Sky does not override the light colour, the shaft colour (a gamma

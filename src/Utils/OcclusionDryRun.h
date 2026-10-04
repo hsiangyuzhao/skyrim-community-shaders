@@ -65,8 +65,27 @@ namespace Util::OcclusionDryRun
 		double testMs = 0.0;        ///< summed CPU time of the tests over all threads
 	};
 
+	/// (batch 37b, D) Counters since launch along the dry run's pipeline: world frame -> Hi-Z
+	/// build -> staging readback -> culling detours. The first one that stays at 0 is where it stalls.
+	struct Pipeline
+	{
+		uint64_t worldFrames = 0;   ///< frames the world was rendered (Deferred::EndDeferred reached)
+		uint64_t activeFrames = 0;  ///< ... of them with the test running
+		uint64_t builds = 0;        ///< Hi-Z built and queued for readback
+		uint64_t buildFails = 0;    ///< Hi-Z could not be built (lastFail says why)
+		uint64_t readTries = 0;     ///< readback attempts (Map with DO_NOT_WAIT)
+		uint64_t readOk = 0;        ///< readbacks that returned data
+		uint64_t readBusy = 0;      ///< readbacks the GPU had not finished yet (retried next frame)
+		uint64_t readErrors = 0;    ///< readbacks that failed otherwise (slot dropped)
+		uint64_t ringFull = 0;      ///< captures skipped because the oldest slot was still busy
+		uint64_t process1Calls = 0;  ///< culling detour hits while running
+		uint64_t process1Main = 0;   ///< ... for the main render camera
+		const char* lastFail = "";
+	};
+
 	struct Report
 	{
+		Pipeline pipeline;  ///< (batch 37b, D)
 		bool installed = false;
 		std::string status;   ///< one line for the panel
 		bool active = false;  ///< testing this frame

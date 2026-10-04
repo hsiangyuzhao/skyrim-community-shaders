@@ -19,6 +19,7 @@
 #include "Features/VariableRateShading.h"
 
 #include "Hooks.h"
+#include "Utils/Batch37b.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/OcclusionDryRun.h"
@@ -619,6 +620,12 @@ void Deferred::DeferredPasses()
 		if (ssrt.loaded)
 			ssrt.BindCompositeConstants();
 
+		// (batch 37b, C-4) "SSGI AO does not darken direct light" is a compile-time branch of the
+		// composite; when its effective state flips, both composite variants are rebuilt once.
+		if (const bool aoSparesDirect = Batch37b::SsgiAoSparesDirectActive(); aoSparesDirect != compositeAoSparesDirect) {
+			ClearShaderCache();
+			compositeAoSparesDirect = aoSparesDirect;
+		}
 		auto shader = interior ? GetComputeMainCompositeInterior() : GetComputeMainComposite();
 		context->CSSetShader(shader, nullptr, 0);
 
@@ -822,6 +829,8 @@ ID3D11ComputeShader* Deferred::GetComputeMainComposite()
 
 		if (globals::features::screenSpaceGI.loaded)
 			defines.push_back({ "SSGI", nullptr });
+		if (globals::features::screenSpaceGI.loaded && compositeAoSparesDirect)
+			defines.push_back({ "SSGI_AO_SPARES_DIRECT", nullptr });
 
 		if (globals::features::ibl.loaded)
 			defines.push_back({ "IBL", nullptr });
@@ -853,6 +862,8 @@ ID3D11ComputeShader* Deferred::GetComputeMainCompositeInterior()
 
 		if (globals::features::screenSpaceGI.loaded)
 			defines.push_back({ "SSGI", nullptr });
+		if (globals::features::screenSpaceGI.loaded && compositeAoSparesDirect)
+			defines.push_back({ "SSGI_AO_SPARES_DIRECT", nullptr });
 
 		if (globals::features::ibl.loaded)
 			defines.push_back({ "IBL", nullptr });

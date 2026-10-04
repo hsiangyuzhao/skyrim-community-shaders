@@ -38,6 +38,34 @@ namespace Util::OcclusionDryRun
 		uint64_t g_settleUntil = 0;           // render thread only
 		bool g_wasLoading = false;
 
+		// (batch 37b, D) The frame id of the last Deferred::EndDeferred that reached us, i.e. the
+		// last frame the world was actually rendered. Replaces State::inWorld as the "in game"
+		// test: inWorld is only true INSIDE Main_RenderWorld (Deferred.cpp sets it on entry and
+		// clears it on exit), so at Present -- where the next frame's activity is decided -- it
+		// is always false, and the dry run could never switch itself on. EndDeferred itself runs
+		// only with inWorld set, so this is the same condition, sampled where it is true.
+		uint64_t g_lastWorldFrame = 0;  // render thread only
+		constexpr uint64_t kWorldGraceFrames = 3;
+
+		// (batch 37b, D) Pipeline counters since launch, for the panel line that says which step
+		// a stuck dry run is waiting on. Render thread only, except the two culling-side ones.
+		struct PipelineCounters
+		{
+			uint64_t worldFrames = 0;   // EndDeferred calls (world rendered)
+			uint64_t activeFrames = 0;  // EndDeferred calls while the test was running
+			uint64_t builds = 0;        // Hi-Z built and its 1/16 level queued for readback
+			uint64_t buildFails = 0;    // Hi-Z could not be built (reason below)
+			uint64_t readTries = 0;     // Map(DO_NOT_WAIT) attempts on a pending slot
+			uint64_t readOk = 0;        // ... that returned data (a snapshot was published)
+			uint64_t readBusy = 0;      // ... that the GPU had not finished yet
+			uint64_t readErrors = 0;    // ... that failed for any other reason (slot dropped)
+			uint64_t ringFull = 0;      // frames skipped because the oldest slot was still busy
+			const char* lastFail = "";
+			std::atomic<uint64_t> process1Calls{ 0 };  // Process1 detour hits while running
+			std::atomic<uint64_t> process1Main{ 0 };   // ... of them for the main render camera
+		};
+		PipelineCounters g_pipe;
+
 		constexpr uint32_t kAccumulatedBit = 1u << 26;  // NiAVObject flags +0xF4, set/cleared by Process1 (1.5.97)
 		constexpr int kRing = 3;
 		constexpr int kSnapshots = 3;  // > 2, so a reader's snapshot is never the one being refilled
@@ -584,10 +612,16 @@ namespace Util::OcclusionDryRun
 		template <class Self>
 		void Process1Impl(RE::NiCullingProcess* a_self, RE::NiAVObject* a_object, std::int32_t a_arg)
 		{
-			if (!g_active.load(std::memory_order_relaxed) || !a_object || a_object == t_current || !IsMainView(a_self)) {
+			if (!g_active.load(std::memory_order_relaxed) || !a_object || a_object == t_current) {
 				Self::func(a_self, a_object, a_arg);
 				return;
 			}
+			g_pipe.process1Calls.fetch_add(1, std::memory_order_relaxed);
+			if (!IsMainView(a_self)) {
+				Self::func(a_self, a_object, a_arg);
+				return;
+			}
+			g_pipe.process1Main.fetch_add(1, std::memory_order_relaxed);
 			RE::NiAVObject* previous = t_current;
 			t_current = a_object;
 			EvaluateObject(a_object);
@@ -722,8 +756,18 @@ namespace Util::OcclusionDryRun
 		void Harvest(ID3D11DeviceContext* a_ctx, RingSlot& a_slot)
 		{
 			D3D11_MAPPED_SUBRESOURCE m{};
-			if (FAILED(a_ctx->Map(a_slot.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m)))
+			++g_pipe.readTries;
+			if (const HRESULT hr = a_ctx->Map(a_slot.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m); FAILED(hr)) {
+				if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+					++g_pipe.readBusy;
+				} else {
+					// Not "busy": this slot will never map. Drop it so the ring keeps moving.
+					++g_pipe.readErrors;
+					a_slot.pending = false;
+				}
 				return;  // still in flight: try again next frame, never wait
+			}
+			++g_pipe.readOk;
 			Snapshot& snap = g_snaps[g_snapWrite];
 			snap.grid.resize(static_cast<size_t>(a_slot.gridW) * a_slot.gridH);
 			for (uint32_t y = 0; y < a_slot.gridH; ++y)
@@ -775,13 +819,21 @@ namespace Util::OcclusionDryRun
 
 	void OnEndDeferred()
 	{
+		// (batch 37b, D) Record that the world was rendered this frame, before anything can return.
+		g_lastWorldFrame = g_frame.load(std::memory_order_relaxed);
+		++g_pipe.worldFrames;
+
 		if (!g_active.load(std::memory_order_relaxed))
 			return;
+		++g_pipe.activeFrames;
 		auto* device = globals::d3d::device;
 		auto* ctx = globals::d3d::context;
 		auto* cam = GetMainCamera();
-		if (!device || !ctx || !cam)
+		if (!device || !ctx || !cam) {
+			++g_pipe.buildFails;
+			g_pipe.lastFail = !cam ? "no main camera" : "no D3D device";
 			return;
+		}
 
 		if (!g_pyramid) {
 			g_pyramid = std::make_unique<HiZPyramid>();
@@ -792,8 +844,10 @@ namespace Util::OcclusionDryRun
 		RingSlot& slot = g_ring[g_ringWrite];
 		if (slot.pending && slot.staging)
 			Harvest(ctx, slot);
-		if (slot.pending)
+		if (slot.pending) {
+			++g_pipe.ringFull;
 			return;  // still in flight; this frame's capture is skipped, the ring catches up
+		}
 
 		// 2. Reduce this frame's depth (opaque pass complete) and queue its 1/16 level.
 		ComputeStateBackup backup;
@@ -801,14 +855,20 @@ namespace Util::OcclusionDryRun
 		const bool built = g_pyramid->Build(device, ctx);
 		backup.Restore(ctx);
 		ID3D11Texture2D* tex = g_pyramid->GetTexture();
-		if (!built || !tex || g_pyramid->GetMipCount() <= static_cast<uint32_t>(kHiZMip))
+		if (!built || !tex || g_pyramid->GetMipCount() <= static_cast<uint32_t>(kHiZMip)) {
+			++g_pipe.buildFails;
+			g_pipe.lastFail = !built ? "Hi-Z build failed (depth or shader unavailable)" : "Hi-Z has too few mip levels";
 			return;
+		}
 
 		D3D11_TEXTURE2D_DESC td{};
 		tex->GetDesc(&td);
 		const uint32_t mipW = std::max(1u, td.Width >> kHiZMip), mipH = std::max(1u, td.Height >> kHiZMip);
-		if (!EnsureStaging(device, mipW, mipH))
+		if (!EnsureStaging(device, mipW, mipH)) {
+			++g_pipe.buildFails;
+			g_pipe.lastFail = "readback texture could not be created";
 			return;
+		}
 
 		const uint32_t gridW = std::min(mipW, (g_pyramid->GetWidth() + 3) / 4);
 		const uint32_t gridH = std::min(mipH, (g_pyramid->GetHeight() + 3) / 4);
@@ -829,6 +889,7 @@ namespace Util::OcclusionDryRun
 		target.frame = g_frame.load(std::memory_order_relaxed);
 		target.pending = true;
 		g_ringWrite = (g_ringWrite + 1) % kRing;
+		++g_pipe.builds;
 	}
 
 	void OnFrameEnd(uint32_t a_mainViewDraws, bool a_drawsValid)
@@ -898,7 +959,12 @@ namespace Util::OcclusionDryRun
 		// ---- decide the next frame ----
 		g_frame.fetch_add(1, std::memory_order_acq_rel);
 
-		bool active = g_installed && g_settings.Enabled && OverlayOnScreen() && globals::state && globals::state->inWorld;
+		// (batch 37b, D) "In the world" = the world was rendered within the last few frames (see
+		// g_lastWorldFrame). The 37a test read State::inWorld here, which is false at Present on
+		// every frame, so `active` never became true and the status sat on "Waiting for the first
+		// depth readback" (the status chain below never checked it).
+		const bool inWorld = g_pipe.worldFrames > 0 && g_frame.load(std::memory_order_relaxed) - g_lastWorldFrame <= kWorldGraceFrames;
+		bool active = g_installed && g_settings.Enabled && OverlayOnScreen() && inWorld;
 		const bool loading = globals::game::ui && (globals::game::ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || globals::game::ui->IsMenuOpen(RE::MainMenu::MENU_NAME));
 		const uint64_t frame = g_frame.load(std::memory_order_relaxed);
 		if (loading) {
@@ -929,10 +995,34 @@ namespace Util::OcclusionDryRun
 			r.status = "Paused during loading";
 		else if (settling)
 			r.status = std::format("Waiting after loading ({} frames)", g_settleUntil - frame);
-		else if (!g_front.load(std::memory_order_relaxed))
-			r.status = "Waiting for the first depth readback";
+		else if (!inWorld)
+			r.status = "Paused: the world is not being rendered";
+		else if (!g_front.load(std::memory_order_relaxed)) {
+			if (g_pipe.builds == 0 && g_pipe.buildFails > 0)
+				r.status = std::format("Waiting: depth pyramid not built ({})", g_pipe.lastFail);
+			else if (g_pipe.builds == 0)
+				r.status = "Waiting: depth pyramid not built yet";
+			else
+				r.status = "Waiting for the first depth readback";
+		} else if (r.frames == 0 && g_pipe.process1Main.load(std::memory_order_relaxed) == 0)
+			r.status = "Waiting: no main-view culling seen yet";
 		else
 			r.status = "Running (counting only, nothing is skipped)";
+
+		r.pipeline = {
+			.worldFrames = g_pipe.worldFrames,
+			.activeFrames = g_pipe.activeFrames,
+			.builds = g_pipe.builds,
+			.buildFails = g_pipe.buildFails,
+			.readTries = g_pipe.readTries,
+			.readOk = g_pipe.readOk,
+			.readBusy = g_pipe.readBusy,
+			.readErrors = g_pipe.readErrors,
+			.ringFull = g_pipe.ringFull,
+			.process1Calls = g_pipe.process1Calls.load(std::memory_order_relaxed),
+			.process1Main = g_pipe.process1Main.load(std::memory_order_relaxed),
+			.lastFail = g_pipe.lastFail,
+		};
 	}
 
 	void Load(const nlohmann::json& a_json)
@@ -986,6 +1076,20 @@ namespace Util::OcclusionDryRun
 			"A test of how many objects an occlusion cull could skip: every object in the main view is checked against "
 			"the depth of a frame a few frames ago, and the result is only counted. Nothing is hidden; the picture is "
 			"exactly what it is without this.");
+
+		if (r.installed) {
+			// (batch 37b, D) One line per pipeline step, so a stall shows where it is.
+			const auto& p = r.pipeline;
+			ImGui::TextDisabled("Steps: world %llu (running %llu) | depth built %llu, failed %llu | readback ok %llu, busy %llu, error %llu | culling %llu, main view %llu",
+				p.worldFrames, p.activeFrames, p.builds, p.buildFails, p.readOk, p.readBusy, p.readErrors, p.process1Calls, p.process1Main);
+			tooltip(
+				"Counters since the game started, in pipeline order. world = frames the world was drawn; running = of those, "
+				"with this test on; depth built = depth snapshots queued; readback ok = snapshots that came back from the GPU "
+				"(busy = not finished yet, tried again next frame); culling = engine culling calls seen while running, main "
+				"view = those for the player's camera. The first number that stays at 0 is where it is stuck.");
+			if (p.buildFails > 0 && p.lastFail && *p.lastFail)
+				ImGui::TextDisabled("Last depth failure: %s", p.lastFail);
+		}
 
 		if (r.installed && r.frames > 0 && ImGui::BeginTable("OcclusionDryRun", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
 			ImGui::TableSetupColumn("##what");
@@ -1072,6 +1176,23 @@ namespace Util::OcclusionDryRun
 		j["active"] = r.active;
 		j["status"] = r.status;
 		j["frames_counted"] = r.frames;
+		{
+			const auto& p = r.pipeline;
+			j["pipeline"] = {
+				{ "world_frames", p.worldFrames },
+				{ "active_frames", p.activeFrames },
+				{ "hiz_builds", p.builds },
+				{ "hiz_build_fails", p.buildFails },
+				{ "last_fail", p.lastFail ? p.lastFail : "" },
+				{ "readback_tries", p.readTries },
+				{ "readback_ok", p.readOk },
+				{ "readback_busy", p.readBusy },
+				{ "readback_errors", p.readErrors },
+				{ "ring_full_skips", p.ringFull },
+				{ "culling_calls", p.process1Calls },
+				{ "culling_calls_main_view", p.process1Main },
+			};
+		}
 		j["settings"] = nlohmann::json::object();
 		Save(j["settings"]);
 		j["snapshot"] = { { "latency_frames", r.latencyFrames }, { "grid", { r.gridW, r.gridH } }, { "render", { r.renderW, r.renderH } },

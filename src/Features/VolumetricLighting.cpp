@@ -26,6 +26,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	WorldShadowPower,
 	DensityOnlyGamma,
 	DensityGammaReference,
+	DensityGammaNeverBrighten,
 	NightIntensity,
 	LinearizeColor);
 
@@ -71,6 +72,12 @@ void VolumetricLighting::DrawBatch37bSettings()
 		ImGui::SliderFloat("Reference Strength", &settings.DensityGammaReference, 0.5f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Weather shaft strength that looks exactly as before. 2 = vanilla clear day.");
+		ImGui::Checkbox("Never Brighten", &settings.DensityGammaNeverBrighten);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"On (default): this option only ever makes shafts weaker, never stronger.\n"
+				"Without it, weathers weaker than the reference strength (overcast, rain, fog)\n"
+				"would get ~1.3-1.8x brighter shafts than before. Off: plain remap.");
 	}
 
 	ImGui::SliderFloat("Night Strength", &settings.NightIntensity, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -166,7 +173,11 @@ float VolumetricLighting::AdjustIntensity(float a_intensity, [[maybe_unused]] bo
 		const float gamma = ll.vlGamma;
 		if (ll.enableLinearLighting && gamma > 1e-3f) {
 			const float reference = std::max(settings.DensityGammaReference, 1e-3f);
-			intensity = reference * std::pow(intensity / reference, 1.0f / gamma);
+			const float remapped = reference * std::pow(intensity / reference, 1.0f / gamma);
+			// Never brighten: for I < Iref the remap raises the output ((I/Iref) > (I/Iref)^g),
+			// e.g. overcast ~1.3x, rain/fog ~1.8x at gamma 3. pow is monotonic, so min() on the
+			// input is min() on the result: only ever dim (nights, dawn/dusk), never brighten.
+			intensity = settings.DensityGammaNeverBrighten ? std::min(remapped, intensity) : remapped;
 		}
 	}
 
