@@ -1,5 +1,7 @@
 ﻿#include "SkySync.h"
 
+#include "VolumetricLighting.h"
+
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SkySync::Settings,
 	Enabled,
@@ -355,6 +357,8 @@ void SkySync::ShadowFader::Update(const RE::Sun* sun, RE::NiPoint3 dirs[3], floa
 	if (colors.has_value())
 		color = { 0.f, 0.f, 0.f };
 
+	volumetricLightingIsMoon = current == Caster::Masser || current == Caster::Secunda;
+
 	if (current == Caster::None) {
 		fadePhase = Phase::None;
 		SetLighting(sun, { 0.0f, 0.0f, 1.0f }, 0.0f, color);
@@ -429,8 +433,12 @@ inline void SkySync::ShadowFader::ClampDirection(RE::NiPoint3& dir)
 SkySync::VolumetricLightingDescriptor* SkySync::ApplyVolumetricLighting_VolumetricLightingDescriptor_Get::thunk()
 {
 	const auto volumetricLightingDescriptor = func();
-	if (globals::features::skySync.settings.Enabled)
+	const bool skySyncEnabled = globals::features::skySync.settings.Enabled;
+	if (skySyncEnabled)
 		volumetricLightingDescriptor->lightingIntensity *= volumetricLightingIntensityFactor;
+	// (batch 37b, A2/A3) Night strength and "gamma on density only". Identity when 37b is off.
+	volumetricLightingDescriptor->lightingIntensity = globals::features::volumetricLighting.AdjustIntensity(
+		volumetricLightingDescriptor->lightingIntensity, skySyncEnabled && volumetricLightingIsMoon);
 	return volumetricLightingDescriptor;
 }
 

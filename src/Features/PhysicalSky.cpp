@@ -1,29 +1,54 @@
 #include "PhysicalSky.h"
 
+#include <cfloat>
+#include <imgui_stdlib.h>
+
 #include "CloudShadows.h"
 #include "Deferred.h"
 #include "LinearLighting.h"
 #include "SkySync.h"
 #include "TerrainShadows.h"
 
+#include "Menu.h"
 #include "State.h"
 #include "Util.h"
+#include "Utils/Batch37b.h"
 #include "Utils/GpuTimers.h"
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+	PhysicalSky::WorldspaceInfo,
+	zBottom)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PhysicalSky::Settings,
 	enabled,
+	worldspaceWhitelist,
+	worldspaceRemovedDefaults,
+	enableAllExteriorWorldspaces,
 	overrideDirLight,
 	tonemapper,
 	vanillaMix,
 	trMix,
 	apLumMix,
 	apTrMix,
+	cloudShadowRemapRange,
 	sunlightColor,
 	masserColor,
 	secundaColor,
 	proceduralSun,
 	sunDiskRad,
+	sunAlignToVanilla,
+	sunReplaceVanilla,
+	sunSoftEdge,
+	sunPhysicalRadiance,
+	sunRadianceCap,
+	sunHideVanillaGlare,
+	sunDiskRadiusDeg,
+	fixSkyAlpha,
+	fixTrLutEdge,
+	fixApShadowDepth,
+	fixReflectionSky,
+	fixMultiScatter,
 	adaptationStart,
 	adaptationEnd,
 	dayExposure,
@@ -75,6 +100,134 @@ void PhysicalSky::RestoreDefaultSettings()
 void PhysicalSky::LoadSettings(json& o_json)
 {
 	settings = o_json;
+
+	// (batch 37b) A saved whitelist replaces the default one wholesale. Merge the defaults back
+	// in, except those the user removed, so defaults added later still reach older configs.
+	for (const auto& [name, info] : DefaultWorldspaceWhitelist()) {
+		if (!settings.worldspaceWhitelist.contains(name) &&
+			std::ranges::find(settings.worldspaceRemovedDefaults, name) == settings.worldspaceRemovedDefaults.end())
+			settings.worldspaceWhitelist.emplace(name, info);
+	}
+}
+
+const std::map<std::string, PhysicalSky::WorldspaceInfo>& PhysicalSky::LegacyWorldspaceWhitelist()
+{
+	static const std::map<std::string, WorldspaceInfo> legacy = {
+		{ "Tamriel", { -14500.f } },
+		{ "WindhelmWorld", { -14500.f } },
+		{ "RiftenWorld", { -14500.f } },
+		{ "MarkarthWorld", { -14500.f } },
+		{ "WhiterunWorld", { -14500.f } },
+		{ "SolitudeWorld", { -14500.f } },
+		{ "WhiterunDragonsreachWorld", { -14500.f } },
+		{ "DLC01FalmerValley", { 3000.f } },
+		{ "DLC2SolstheimWorld", { 256.f } }
+	};
+	return legacy;
+}
+
+std::map<std::string, PhysicalSky::WorldspaceInfo> PhysicalSky::DefaultWorldspaceWhitelist()
+{
+	auto list = LegacyWorldspaceWhitelist();
+	// Dawnguard.esm WRLD records (EDID, DNAM water height, PNAM parent-use flags):
+	// - DLC1HunterHQWorld: Fort Dawnguard. Child of Tamriel sharing its map/terrain heights
+	//   (own water -5000 is a placeholder), so Tamriel's -14500.
+	// - DLC1VampireCastleCourtyard: uses Tamriel's water (-14000) -> -14500.
+	// - DLC1AncestorsGladeWorld: separate grotto, own water -200 -> -700.
+	list.emplace("DLC1HunterHQWorld", WorldspaceInfo{ -14500.f });
+	list.emplace("DLC1VampireCastleCourtyard", WorldspaceInfo{ -14500.f });
+	list.emplace("DLC1AncestorsGladeWorld", WorldspaceInfo{ -700.f });
+	return list;
+}
+
+bool PhysicalSky::IsExcludedWorldspace(const RE::TESWorldSpace* a_worldspace)
+{
+	if (!a_worldspace)
+		return true;
+
+	// Other realms with a sky that is not Nirn's: Soul Cairn and the Boneyard (Dawnguard),
+	// Apocrypha (Dragonborn), Sovngarde (Skyrim).
+	static constexpr std::array<std::string_view, 4> otherRealms = {
+		"DLC01SoulCairn", "DLC01Boneyard", "DLC2ApocryphaWorld", "Sovngarde"
+	};
+	const std::string_view name = a_worldspace->GetFormEditorID();
+	for (const auto& realm : otherRealms)
+		if (_strnicmp(name.data(), realm.data(), realm.size()) == 0 && name.size() == realm.size())
+			return true;
+
+	// Underground worldspaces (Blackreach, Darkfall Passage, Forebears' Holdout, caves...).
+	return a_worldspace->flags.any(RE::TESWorldSpace::Flag::kNoSky);
+}
+
+float PhysicalSky::FallbackZBottom(const RE::TESWorldSpace* a_worldspace)
+{
+	constexpr float kTamrielZBottom = -14500.f;
+	constexpr float kBelowSeaLevel = 500.f;
+	constexpr float kSane = 100000.f;  // "no water" worldspaces store 9999999 or -500000
+
+	const RE::TESWorldSpace* world = a_worldspace;
+	while (world && world->parentWorld &&
+		   world->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLandData, RE::TESWorldSpace::ParentUseFlag::kUseWaterData))
+		world = world->parentWorld;
+	if (!world)
+		return kTamrielZBottom;
+
+	if (std::isfinite(world->defaultWaterHeight) && std::abs(world->defaultWaterHeight) < kSane)
+		return world->defaultWaterHeight - kBelowSeaLevel;
+	if (std::isfinite(world->defaultLandHeight) && std::abs(world->defaultLandHeight) < kSane)
+		return world->defaultLandHeight - kBelowSeaLevel;
+	return kTamrielZBottom;
+}
+
+RE::TESWorldSpace* PhysicalSky::GetCurrentWorldspace()
+{
+	auto* tes = RE::TES::GetSingleton();
+	auto* worldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+	if (!worldspace) {
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		auto* cell = player ? player->GetParentCell() : nullptr;
+		if (cell && !cell->IsInteriorCell())
+			worldspace = cell->GetRuntimeData().worldSpace;
+	}
+	return worldspace;
+}
+
+PhysicalSky::WorldspaceStatus PhysicalSky::GetWorldspaceStatus(float& a_zBottom) const
+{
+	a_zBottom = WorldspaceInfo{}.zBottom;
+
+	if (auto player = RE::PlayerCharacter::GetSingleton(); player)
+		if (auto cell = player->GetParentCell(); cell && cell->IsInteriorCell())
+			return WorldspaceStatus::Interior;
+
+	if (!Batch37b::IsOn()) {
+		// 37a: TES worldspace only, hard-coded list, no exclusions.
+		auto* tes = RE::TES::GetSingleton();
+		auto* worldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+		if (!worldspace)
+			return WorldspaceStatus::Unknown;
+		const auto& legacy = LegacyWorldspaceWhitelist();
+		if (auto it = legacy.find(worldspace->GetFormEditorID()); it != legacy.end()) {
+			a_zBottom = it->second.zBottom;
+			return WorldspaceStatus::Whitelist;
+		}
+		return WorldspaceStatus::NotListed;
+	}
+
+	auto* worldspace = GetCurrentWorldspace();
+	if (!worldspace)
+		return WorldspaceStatus::Unknown;
+	if (IsExcludedWorldspace(worldspace))
+		return WorldspaceStatus::Excluded;
+	if (auto it = settings.worldspaceWhitelist.find(worldspace->GetFormEditorID()); it != settings.worldspaceWhitelist.end()) {
+		a_zBottom = it->second.zBottom;
+		return WorldspaceStatus::Whitelist;
+	}
+	if (settings.enableAllExteriorWorldspaces) {
+		a_zBottom = FallbackZBottom(worldspace);
+		return WorldspaceStatus::AllExteriors;
+	}
+	return WorldspaceStatus::NotListed;
 }
 
 void PhysicalSky::SaveSettings(json& o_json)
@@ -123,20 +276,30 @@ void PhysicalSky::SettingsGeneral()
 		ImGui::TableNextColumn();
 		ImGui::Text("Worldspace: ");
 		ImGui::TableNextColumn();
-		if (RE::TES::GetSingleton()) {
-			bool inInterior = false;
-			if (auto player = RE::PlayerCharacter::GetSingleton(); player)
-				if (auto cell = player->GetParentCell(); cell)
-					inInterior = cell->IsInteriorCell();
-
-			if (inInterior)
+		{
+			float zBottom = 0.f;
+			const auto status = GetWorldspaceStatus(zBottom);
+			auto* worldspace = GetCurrentWorldspace();
+			const char* name = worldspace ? worldspace->GetFormEditorID() : "";
+			switch (status) {
+			case WorldspaceStatus::Interior:
 				ImGui::Text("Interior (Disabled)");
-			else if (auto worldspace = RE::TES::GetSingleton()->GetRuntimeData2().worldSpace; worldspace) {
-				std::string worldspaceName = worldspace->GetFormEditorID();
-				if (settings.worldspaceWhitelist.contains(worldspaceName))
-					ImGui::Text("%s (Enabled)", worldspaceName.c_str());
-				else
-					ImGui::Text("%s (Disabled)", worldspaceName.c_str());
+				break;
+			case WorldspaceStatus::Whitelist:
+				ImGui::Text("%s (Enabled, list, ground %.0f)", name, zBottom);
+				break;
+			case WorldspaceStatus::AllExteriors:
+				ImGui::Text("%s (Enabled, all exteriors, ground %.0f)", name, zBottom);
+				break;
+			case WorldspaceStatus::Excluded:
+				ImGui::Text("%s (Disabled, other realm / no sky)", name);
+				break;
+			case WorldspaceStatus::NotListed:
+				ImGui::Text("%s (Disabled, not listed)", name);
+				break;
+			default:
+				ImGui::Text("Unknown");
+				break;
 			}
 		}
 
@@ -144,6 +307,8 @@ void PhysicalSky::SettingsGeneral()
 	}
 
 	ImGui::Checkbox("Enabled", &settings.enabled);
+
+	SettingsWorldspaces();
 
 	ImGui::SeparatorText("Post Processing");
 	{
@@ -181,6 +346,102 @@ void PhysicalSky::SettingsGeneral()
 	}
 }
 
+void PhysicalSky::SettingsWorldspaces()
+{
+	// (batch 37b) Ported from upstream ba4b640f2 (editable list) + f3fb48d12 (all exteriors).
+	ImGui::SeparatorText("Worldspaces (Batch 37b)");
+	if (!Batch37b::IsOn())
+		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning,
+			"Batch 37b master switch is off: the old built-in list of 9 worldspaces is used.");
+
+	ImGui::Checkbox("All Exterior Worldspaces", &settings.enableAllExteriorWorldspaces);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Also use Physical Sky in exterior worldspaces that are not in the list below.\n"
+			"Their ground height is worked out from the worldspace's water level.\n"
+			"Other realms (Soul Cairn, Boneyard, Apocrypha, Sovngarde) and worldspaces\n"
+			"without a sky (Blackreach...) always stay vanilla.");
+
+	if (!ImGui::TreeNode("Worldspace List"))
+		return;
+
+	auto* currentWorldspace = GetCurrentWorldspace();
+	const std::string currentName = currentWorldspace ? currentWorldspace->GetFormEditorID() : "";
+	const auto defaults = DefaultWorldspaceWhitelist();
+
+	const auto removeEntry = [&](const std::string& name) {
+		settings.worldspaceWhitelist.erase(name);
+		if (defaults.contains(name) && std::ranges::find(settings.worldspaceRemovedDefaults, name) == settings.worldspaceRemovedDefaults.end())
+			settings.worldspaceRemovedDefaults.push_back(name);
+	};
+	const auto addEntry = [&](std::string name, float zBottom) {
+		const auto first = name.find_first_not_of(" \t");
+		const auto last = name.find_last_not_of(" \t");
+		if (first == std::string::npos)
+			return;
+		name = name.substr(first, last - first + 1);
+		settings.worldspaceWhitelist[name].zBottom = zBottom;
+		std::erase(settings.worldspaceRemovedDefaults, name);
+	};
+
+	static std::string newName;
+	static float newZBottom = -14500.f;
+	ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
+	ImGui::InputTextWithHint("##NewWorldspace", "Editor ID, e.g. Tamriel", &newName);
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.4f);
+	ImGui::InputFloat("Ground##NewWorldspace", &newZBottom, 10.f, 100.f, "%.0f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Planet ground height (Z) for this worldspace: about 500 below its sea level. Tamriel: -14500.");
+	if (ImGui::Button("Add / Update"))
+		addEntry(newName, newZBottom);
+
+	if (!currentName.empty()) {
+		ImGui::SameLine();
+		const bool listed = settings.worldspaceWhitelist.contains(currentName);
+		if (ImGui::Button(listed ? "Remove Current Worldspace" : "Add Current Worldspace")) {
+			if (listed)
+				removeEntry(currentName);
+			else
+				addEntry(currentName, FallbackZBottom(currentWorldspace));
+		}
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("%s", currentName.c_str());
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Restore Defaults")) {
+		for (const auto& [name, info] : defaults)
+			settings.worldspaceWhitelist.insert_or_assign(name, info);
+		settings.worldspaceRemovedDefaults.clear();
+	}
+
+	if (ImGui::BeginTable("WorldspaceWhitelist", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp, { -1, 0 })) {
+		ImGui::TableSetupColumn("Editor ID");
+		ImGui::TableSetupColumn("Ground", ImGuiTableColumnFlags_WidthFixed, 160.f);
+		ImGui::TableSetupColumn("##Action", ImGuiTableColumnFlags_WidthFixed, 90.f);
+		ImGui::TableHeadersRow();
+
+		std::string toRemove;
+		for (auto& [name, info] : settings.worldspaceWhitelist) {
+			ImGui::PushID(name.c_str());
+			ImGui::TableNextRow();
+			ImGui::TableSetColumnIndex(0);
+			ImGui::TextUnformatted(name.c_str());
+			ImGui::TableSetColumnIndex(1);
+			ImGui::SetNextItemWidth(-FLT_MIN);
+			ImGui::InputFloat("##Ground", &info.zBottom, 10.f, 100.f, "%.0f");
+			ImGui::TableSetColumnIndex(2);
+			if (ImGui::Button("Remove", { -1, 0 }))
+				toRemove = name;
+			ImGui::PopID();
+		}
+		if (!toRemove.empty())
+			removeEntry(toRemove);
+		ImGui::EndTable();
+	}
+	ImGui::TreePop();
+}
+
 void PhysicalSky::SettingsCelestials()
 {
 	constexpr auto lightColorHint = "This sets the light color BEFORE it goes through the atmosphere i.e. extraterrestrial radiance.";
@@ -205,9 +466,47 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::Checkbox("Procedural Sun", &settings.proceduralSun);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Draws a physically-sized sun disk (size set below).");
-		ImGui::SliderAngle("Sun Disk Angular Radius", &settings.sunDiskRad, 0.f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
+		if (Batch37b::IsOn()) {
+			ImGui::SliderFloat("Sun Disk Angular Radius", &settings.sunDiskRadiusDeg, 0.05f, 2.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Radius of the disk. 0.27 = the real sun (0.53 degrees across).");
+			ImGui::SameLine();
+			ImGui::TextDisabled("(%.2f deg across)", settings.sunDiskRadiusDeg * 2.f);
+		} else {
+			ImGui::SliderAngle("Sun Disk Angular Radius (37a)", &settings.sunDiskRad, 0.f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Batch 37b master switch is off: the old size setting is in use.");
+		}
+
+		ImGui::SeparatorText("Procedural Sun (Batch 37b)");
+		if (!Batch37b::IsOn())
+			ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
+		ImGui::Checkbox("Align with Vanilla Sun", &settings.sunAlignToVanilla);
 		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Real world sun disk angular radius is about 0.27 degrees.");
+			ImGui::Text(
+				"Centres the disk (and the sky's glow around the sun) exactly where the game draws its sun.\n"
+				"Off: the old direction, which drifts 2-4 degrees off the game's sun as you climb.");
+		ImGui::Checkbox("Replace Vanilla Sun", &settings.sunReplaceVanilla);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("The disk replaces the game's sun picture instead of being added next to it (no second sun).");
+		ImGui::Checkbox("Soft Edge", &settings.sunSoftEdge);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Fades the rim of the disk so it does not shimmer with DLSS.");
+		ImGui::Checkbox("Physical Brightness", &settings.sunPhysicalRadiance);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Makes the disk as bright as a real sun for its size (blinding, strong bloom), limited by\n"
+				"the cap below. Off: the old dim flat disk.");
+		if (settings.sunPhysicalRadiance) {
+			ImGui::SliderFloat("Brightness Cap", &settings.sunRadianceCap, 10.f, 62250.f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text(
+					"Upper limit of the disk's brightness. Lower = less bloom and less DLSS/frame-gen\n"
+					"shimmer around the sun. Upstream uses 62250. Default 1000.");
+		}
+		ImGui::Checkbox("Hide Vanilla Sun Glare", &settings.sunHideVanillaGlare);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Removes the game's large halo around the sun while the procedural sun is on.");
 		ImGui::PopID();
 	}
 
@@ -294,6 +593,34 @@ void PhysicalSky::SettingsAtmosphere()
 				"Atmosphere radius is the distance from the planet center to the top of atmosphere.\n"
 				"On Earth, they are about 6360 km and 6420 km respectively.");
 	}
+
+	SettingsFixes();
+}
+
+void PhysicalSky::SettingsFixes()
+{
+	ImGui::SeparatorText("Fixes (Batch 37b)");
+	if (!Batch37b::IsOn())
+		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
+
+	ImGui::Checkbox("Opaque Sky", &settings.fixSkyAlpha);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Writes the physical sky fully opaque. Off: the vanilla sky dome's transparency near the\nhorizon lets what is behind it show through (possible seams or bands).");
+	ImGui::Checkbox("Transmittance Edge Fix", &settings.fixTrLutEdge);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Stops the sun-colour table from bleeding across its edge (odd colours at extreme angles,\npossibly a too-white sunset disk). Usually invisible.");
+	ImGui::Checkbox("Atmosphere Shadow Depth Fix", &settings.fixApShadowDepth);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("With DLSS Quality (not DLAA) the shadows inside distant haze and fog were offset from the\nmountains casting them. This reads the right depth. No change under DLAA.");
+	ImGui::Checkbox("Reflected Sky Fix", &settings.fixReflectionSky);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Removes random dark patches from the sky seen in reflections (environment cubemap).\nUses the cloud shadows there instead of the main view's haze shadow.");
+	ImGui::Checkbox("Multiple Scattering Fix (changes sky colour)", &settings.fixMultiScatter);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"The sky's multiple-scattering table only looked at half the sky. On: the full sky, as upstream.\n"
+			"Changes overall sky brightness and colour (usually the side away from the sun gets a little\n"
+			"brighter, the sun side a little darker). Off by default: compare and decide.");
 }
 
 void PhysicalSky::SettingsClouds()
@@ -494,8 +821,39 @@ bool PhysicalSky::ShadersOK()
 	return csTrLutGen && csMsLutGen && csSvLutGen && csApLutGen && csShadowAccum;
 }
 
+void PhysicalSky::UpdateExtCbData()
+{
+	extCbData = {};
+	if (!loaded || !Batch37b::IsOn())
+		return;
+
+	uint flags = 0;
+	if (settings.sunReplaceVanilla)
+		flags |= kExtSunReplace;
+	if (settings.sunSoftEdge)
+		flags |= kExtSunSoftEdge;
+	if (settings.sunPhysicalRadiance)
+		flags |= kExtSunPhysicalRadiance;
+	if (settings.sunHideVanillaGlare)
+		flags |= kExtHideSunGlare;
+	if (settings.fixSkyAlpha)
+		flags |= kExtSkyAlphaOpaque;
+	if (settings.fixTrLutEdge)
+		flags |= kExtTrLutEdgeFix;
+	if (settings.fixApShadowDepth)
+		flags |= kExtApShadowDepthFix;
+	if (settings.fixReflectionSky)
+		flags |= kExtReflectionSkyFix;
+	if (settings.fixMultiScatter)
+		flags |= kExtMultiScatterFix;
+	extCbData.flags = flags;
+	extCbData.sunRadianceCap = std::clamp(settings.sunRadianceCap, 1.f, 62250.f);
+}
+
 void PhysicalSky::Reset()
 {
+	UpdateExtCbData();
+
 	auto& skySync = globals::features::skySync;
 	skySync.lightColors = std::nullopt;
 
@@ -504,25 +862,14 @@ void PhysicalSky::Reset()
 	bool allGood = settings.enabled && ShadersOK() && skySync.loaded && skySync.settings.Enabled;
 
 	// check worldspace
-	bool worldspaceEnabled = false;
-	bool inInterior = false;
 	bool inMainLoadingMenu = globals::game::ui && (globals::game::ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || globals::game::ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
 
+	// (batch 37b) Whitelist (saved, editable, DLC exteriors added) / all exteriors / exclusions.
+	// With the 37b master off this is the 37a hard-coded list.
 	WorldspaceInfo worldspaceInfo = {};
-	if (RE::TES::GetSingleton()) {
-		if (auto worldspace = RE::TES::GetSingleton()->GetRuntimeData2().worldSpace; worldspace) {
-			std::string worldspaceName = worldspace->GetFormEditorID();
-			worldspaceEnabled = settings.worldspaceWhitelist.contains(worldspaceName);
-			if (worldspaceEnabled)
-				worldspaceInfo = settings.worldspaceWhitelist.at(worldspaceName);
-		}
-		if (auto player = RE::PlayerCharacter::GetSingleton(); player) {
-			if (auto cell = player->GetParentCell(); cell) {
-				inInterior = cell->IsInteriorCell();
-			}
-		}
-	}
-	allGood &= worldspaceEnabled && !inInterior && !inMainLoadingMenu;
+	const auto worldspaceStatus = GetWorldspaceStatus(worldspaceInfo.zBottom);
+	const bool worldspaceEnabled = worldspaceStatus == WorldspaceStatus::Whitelist || worldspaceStatus == WorldspaceStatus::AllExteriors;
+	allGood &= worldspaceEnabled && !inMainLoadingMenu;
 
 	if (!allGood) {
 		if (skySync.loaded && skySync.settings.Enabled)
@@ -538,6 +885,17 @@ void PhysicalSky::Reset()
 	dynres = { floor(dynres.x), floor(dynres.y) };
 
 	auto sunDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)];
+	// (batch 37b) Align with the vanilla sun quad. Sky Sync places it (and points the sun light)
+	// along the apparent direction -- dipped by atan(altitude / 325000), 1.5-4 degrees -- in the
+	// sky root's local frame, which Sky Sync rotates by the cell's north rotation. The raw
+	// direction used before sat that far off the quad: a second, clipped or missing disk.
+	if (Batch37b::IsOn() && settings.sunAlignToVanilla) {
+		RE::NiPoint3 apparent = skySync.directions[static_cast<int>(SkySync::Caster::Sun)];
+		if (auto* sky = globals::game::sky; sky && sky->root)
+			apparent = sky->root->world.rotate * apparent;
+		if (apparent.Unitize() > FLT_EPSILON)
+			sunDir = apparent;
+	}
 	auto masserDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)];
 	auto secundaDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)];
 
@@ -559,7 +917,7 @@ void PhysicalSky::Reset()
 		.masserColor = settings.masserColor * exposure,
 		.apTrMix = settings.apTrMix,
 		.secundaDir = { secundaDir.x, secundaDir.y, secundaDir.z },
-		.sunDiskCos = cos(settings.sunDiskRad) * (settings.proceduralSun ? 1.f : 0.f),
+		.sunDiskCos = cos(Batch37b::IsOn() ? DirectX::XMConvertToRadians(std::clamp(settings.sunDiskRadiusDeg, 0.05f, 10.f)) : settings.sunDiskRad) * (settings.proceduralSun ? 1.f : 0.f),
 		.secundaColor = settings.secundaColor * exposure,
 		.enabled = allGood,
 		.tonemapper = linearLighting.settings.enableLinearLighting ? 0 : settings.tonemapper,
@@ -771,14 +1129,36 @@ void PhysicalSky::RestoreSamplers()
 	PSSamplerModifiedBits &= ~(1 << 3);
 }
 
+void PhysicalSky::SetSunDrawFlags(const RE::BSRenderPass* a_pass)
+{
+	auto& descriptor = globals::state->permutationData.ExtraShaderDescriptor;
+	descriptor &= ~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare));
+
+	if (!a_pass || !a_pass->shaderProperty)
+		return;
+	const auto* skyProperty = static_cast<const RE::BSSkyShaderProperty*>(a_pass->shaderProperty);
+	if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_SUN)
+		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun);
+	else if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_SUN_GLARE)
+		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare);
+}
+
+void PhysicalSky::ClearSunDrawFlags()
+{
+	globals::state->permutationData.ExtraShaderDescriptor &=
+		~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare));
+}
+
 void PhysicalSky::Hooks::BSSkyShader_SetupGeometry::thunk(RE::BSShader* This, RE::BSRenderPass* Pass, uint32_t RenderFlags)
 {
 	globals::features::physicalSky.ModifySky();
+	SetSunDrawFlags(Pass);
 	func(This, Pass, RenderFlags);
 }
 
 void PhysicalSky::Hooks::BSSkyShader_RestoreGeometry::thunk(RE::BSShader* This, RE::BSRenderPass* Pass, uint32_t RenderFlags)
 {
 	globals::features::physicalSky.RestoreSamplers();
+	ClearSunDrawFlags();
 	func(This, Pass, RenderFlags);
 }

@@ -1,8 +1,13 @@
 #include "VolumetricLighting.h"
 
+#include "CloudShadows.h"
 #include "InteriorSun.h"
+#include "LinearLighting.h"
+#include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "TerrainShadows.h"
+#include "Utils/Batch37b.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	VolumetricLighting::TextureSize,
@@ -17,7 +22,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ExteriorCustomSize,
 	InteriorEnabled,
 	InteriorQuality,
-	InteriorCustomSize);
+	InteriorCustomSize,
+	WorldShadowPower,
+	DensityOnlyGamma,
+	DensityGammaReference,
+	NightIntensity,
+	LinearizeColor);
 
 void VolumetricLighting::DrawSettings()
 {
@@ -32,6 +42,135 @@ void VolumetricLighting::DrawSettings()
 
 	if (settings.InteriorEnabled)
 		DrawVolumetricLightingSettings(settings.InteriorQuality, settings.InteriorCustomSize, true, inInterior);
+
+	DrawBatch37bSettings();
+}
+
+void VolumetricLighting::DrawBatch37bSettings()
+{
+	ImGui::SeparatorText("Batch 37b");
+	if (!Batch37b::IsOn())
+		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
+
+	ImGui::SliderFloat("Cloud & Terrain Occlusion", &settings.WorldShadowPower, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"How much clouds and distant mountains block the light shafts.\n"
+			"0 = not at all (old behaviour). 0.5 = half strength (upstream, default). 1 = full.\n"
+			"Capped by Cloud Shadows' Opacity: clouds can never block more than that.");
+
+	ImGui::Checkbox("Gamma on Density Only", &settings.DensityOnlyGamma);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Linear Lighting's VL Gamma used to also boost the weather's shaft strength, so nights\n"
+			"(strength 3) and sunrise/sunset (4) came out far stronger than day (2).\n"
+			"On (default): the gamma only shapes the shafts; strength scales normally.\n"
+			"A clear day looks the same; nights ~2x weaker, sunrise/sunset ~4x weaker at VL Gamma 3.\n"
+			"Off: old behaviour. Needs Sky Sync.");
+	if (settings.DensityOnlyGamma) {
+		ImGui::SliderFloat("Reference Strength", &settings.DensityGammaReference, 0.5f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Weather shaft strength that looks exactly as before. 2 = vanilla clear day.");
+	}
+
+	ImGui::SliderFloat("Night Strength", &settings.NightIntensity, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Multiplies the light shafts while a moon is the light source.\n"
+			"1 = old behaviour. 0.5 = half (default). 0 = no moonlight shafts. Needs Sky Sync.\n"
+			"Does not change the moonlight itself.");
+
+	ImGui::Checkbox("Linearize Shaft Color", &settings.LinearizeColor);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Where Physical Sky does not set the light colour (worldspaces outside its list,\n"
+			"interiors with sun, Physical Sky off), converts the shaft colour the same way the\n"
+			"sunlight itself is converted. Dark (evening/night) shafts get dimmer there.\n"
+			"No effect where Physical Sky overrides the light colour. Needs Linear Lighting.");
+}
+
+float VolumetricLighting::WorldShadowPowerActive() const
+{
+	return Batch37b::IsOn() ? std::clamp(settings.WorldShadowPower, 0.0f, 1.0f) : 0.0f;
+}
+
+bool VolumetricLighting::DensityOnlyGammaActive() const
+{
+	return Batch37b::IsOn() && settings.DensityOnlyGamma;
+}
+
+float VolumetricLighting::NightIntensityActive() const
+{
+	return Batch37b::IsOn() ? std::clamp(settings.NightIntensity, 0.0f, 1.0f) : 1.0f;
+}
+
+bool VolumetricLighting::LinearizeColorActive() const
+{
+	return Batch37b::IsOn() && settings.LinearizeColor;
+}
+
+VolumetricLighting::CommonBufferData VolumetricLighting::GetCommonBufferData() const
+{
+	CommonBufferData data{};
+	data.WorldShadowPower = loaded ? WorldShadowPowerActive() : 0.0f;
+	data.LinearizeColor = loaded && LinearizeColorActive();
+	return data;
+}
+
+void VolumetricLighting::BindWorldShadowResources() const
+{
+	if (WorldShadowPowerActive() <= 0.0f)
+		return;
+
+	auto context = globals::d3d::context;
+	auto state = globals::state;
+
+	// The generate CS reads SharedData (b5) and FeatureData (b6). Renderer_ResetState binds both
+	// for CS, and CloudShadows/TerrainShadows::EarlyPrepass bind t25/t60; re-bind here so the
+	// occlusion never depends on nothing between EarlyPrepass and this dispatch touching them.
+	ID3D11Buffer* buffers[2] = { state->sharedDataCB->CB(), state->featureDataCB->CB() };
+	context->CSSetConstantBuffers(5, 2, buffers);
+
+	auto& cloudShadows = globals::features::cloudShadows;
+	if (cloudShadows.loaded && cloudShadows.texCubemapCloudOcc && globals::game::sky &&
+		globals::game::sky->mode.get() == RE::Sky::Mode::kFull && globals::game::sky->currentClimate) {
+		ID3D11ShaderResourceView* srv = cloudShadows.texCubemapCloudOcc->srv.get();
+		context->CSSetShaderResources(25, 1, &srv);
+	}
+
+	auto& terrainShadows = globals::features::terrainShadows;
+	if (terrainShadows.loaded && terrainShadows.settings.EnableTerrainShadow && terrainShadows.texShadowHeight) {
+		ID3D11ShaderResourceView* srv = terrainShadows.texShadowHeight->srv.get();
+		context->CSSetShaderResources(60, 1, &srv);
+	}
+}
+
+float VolumetricLighting::AdjustIntensity(float a_intensity, [[maybe_unused]] bool a_moonIsLightSource) const
+{
+	float intensity = a_intensity;
+
+	// A3. Night strength, on top of Sky Sync's moon visibility x phase factor. Applied before
+	// A2's remap, so with A2 on it scales the shafts linearly.
+	if (a_moonIsLightSource)
+		intensity *= NightIntensityActive();
+
+	// A2. With Linear Lighting the composite draws colour * pow(I * D, vlGamma): the weather
+	// intensity I is raised to vlGamma together with the density D, so a night VOLI of 3 against
+	// a day 2 becomes (1.5)^gamma brighter instead of 1.5x. Feeding I' = Iref * (I / Iref)^(1/g)
+	// instead gives pow(I' * D, g) = (I / Iref) * pow(Iref * D, g): the gamma now shapes the
+	// density only, intensity scales linearly, and at I = Iref (clear day, VOLI 2) nothing
+	// changes. Done on the CPU so no shader changes, and the temporal reprojection in
+	// ISApplyVolumetricLighting keeps seeing one consistent quantity.
+	if (DensityOnlyGammaActive() && intensity > 0.0f) {
+		const auto ll = globals::features::linearLighting.GetCommonBufferData();
+		const float gamma = ll.vlGamma;
+		if (ll.enableLinearLighting && gamma > 1e-3f) {
+			const float reference = std::max(settings.DensityGammaReference, 1e-3f);
+			intensity = reference * std::pow(intensity / reference, 1.0f / gamma);
+		}
+	}
+
+	return intensity;
 }
 
 void VolumetricLighting::DrawVolumetricLightingSettings(int32_t& quality, TextureSize& customSize, const bool isInterior, const bool inLocationType)

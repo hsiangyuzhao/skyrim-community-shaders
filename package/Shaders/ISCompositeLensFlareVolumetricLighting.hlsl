@@ -31,7 +31,13 @@ PS_OUTPUT main(PS_INPUT input)
 #	if defined(VOLUMETRIC_LIGHTING)
 	float2 screenPosition = FrameBuffer::GetDynamicResolutionAdjustedScreenPosition(input.TexCoord);
 	float volumetricLightingPower = VLSourceTex.Sample(VLSourceSampler, screenPosition).x;
-	color += VolumetricLightingColor.xyz * Color::VolumetricLighting(volumetricLightingPower.xxx).x;
+	float3 volumetricLightingColor = VolumetricLightingColor.xyz;
+	// (batch 37b) The engine passes the sun light's diffuse colour. Physical Sky's override makes
+	// it linear already; otherwise it is a gamma-space weather colour, which the scene's own
+	// directional light linearises (Color::DirectionalLight) but this pass used to add as is.
+	if (SharedData::volumetricLightingSettings.LinearizeColor && !SharedData::linearLightingSettings.isDirLightLinear)
+		volumetricLightingColor = Color::DirectionalLight(volumetricLightingColor, false);
+	color += volumetricLightingColor * Color::VolumetricLighting(volumetricLightingPower.xxx).x;
 #	endif
 
 #	if defined(LENS_FLARE)

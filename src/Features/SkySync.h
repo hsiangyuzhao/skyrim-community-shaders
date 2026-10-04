@@ -168,6 +168,8 @@ private:
 	inline static uint32_t* gSecundaSize = nullptr;
 
 	inline static float volumetricLightingIntensityFactor = 1.0f;
+	/// (batch 37b, A3) The shadow fader's current light source is Masser or Secunda.
+	inline static bool volumetricLightingIsMoon = false;
 
 	bool moonAndStarsLoaded = false;
 	RE::TESObjectCELL* currentCell = nullptr;

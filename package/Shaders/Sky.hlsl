@@ -184,6 +184,7 @@ cbuffer AlphaTestRefCB : register(b11)
 #	endif
 
 #	include "Common/MotionBlur.hlsli"
+#	include "Common/Permutation.hlsli"
 #	include "Common/SharedData.hlsli"
 
 #	if defined(CLOUD_SHADOWS)
@@ -199,6 +200,28 @@ cbuffer AlphaTestRefCB : register(b11)
 #	endif
 
 Texture2D<float> TexDepthSampler : register(t17);
+
+#	if defined(PHYSICAL_SKY)
+// (batch 37b) Upstream 23156dc5f. In the cubemap reflection pass TexApShadow (t64) still holds
+// the main view's half-res shadow -- or nothing bound for this pass at all -- so indexing it
+// with the reflection target's pixel gave the reflected sky random dark patches. There, take
+// the shadow from the cloud shadow cube along the view direction instead.
+bool UseReflectionSkyShadow()
+{
+	return (SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::ReflectionSkyFix) &&
+	       (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection);
+}
+
+float GetReflectionSkyShadow(float3 viewDir)
+{
+#		if defined(CLOUD_SHADOWS)
+	const float cloudCubeSample = CloudShadows::CloudShadowsTexture.SampleLevel(SampBaseSampler, viewDir, 0).x;
+	return saturate(cloudCubeSample * SharedData::cloudShadowsSettings.Opacity);
+#		else
+	return 0.0;
+#		endif
+}
+#	endif
 
 PS_OUTPUT main(PS_INPUT input)
 {
@@ -276,27 +299,91 @@ PS_OUTPUT main(PS_INPUT input)
 	{
 # 		if defined(DITHER) && !defined(TEX)
 		// SKY
-		float3 skyColor = PhysSky::SampleSky(normalize(input.WorldPosition.xyz), input.Position.xy, PhysSky::SampSv);
-		psout.Color.xyz = lerp(skyColor, psout.Color.xyz, SharedData::physSkyData.vanillaMix);
+		float3 skyColor;
+		[branch] if (UseReflectionSkyShadow())
+			skyColor = PhysSky::SampleSkyShadow(normalize(input.WorldPosition.xyz), GetReflectionSkyShadow(normalize(input.WorldPosition.xyz)), PhysSky::SampSv);
+		else
+			skyColor = PhysSky::SampleSky(normalize(input.WorldPosition.xyz), input.Position.xy, PhysSky::SampSv);
+		[branch] if (SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::SkyAlphaOpaque)
+			psout.Color = lerp(float4(skyColor, 1.0), psout.Color, SharedData::physSkyData.vanillaMix);  // upstream 5846ad833
+		else
+			psout.Color.xyz = lerp(skyColor, psout.Color.xyz, SharedData::physSkyData.vanillaMix);
 
 #		elif defined(PS_CLOUDS)
-		float4 apColor = PhysSky::SampleAp(viewDir, input.Position.xy, psCloudDist, PhysSky::SampSv);
+		float4 apColor;
+		[branch] if (UseReflectionSkyShadow())
+			apColor = PhysSky::SampleApShadow(viewDir, psCloudDist, GetReflectionSkyShadow(viewDir), PhysSky::SampSv);
+		else
+			apColor = PhysSky::SampleAp(viewDir, input.Position.xy, psCloudDist, PhysSky::SampSv);
 		psout.Color.xyz = psout.Color.xyz * apColor.a + apColor.rgb;
 #		elif defined(DEFERRED) && defined(TEX)
+		const uint extFlags = SharedData::physSkyExtData.Flags;
+		// (batch 37b) Replace mode: the disk lives on the vanilla sun quad only (main view, not
+		// reflections), and the quad's own texture is dropped. Without it the disk is added on
+		// top of every TEX quad as in 37a -- including the glare quad.
+		const bool replaceSun = (extFlags & SharedData::PhysSkyExtFlags::SunReplace) && SharedData::physSkyData.sunDiskCos > 0.0 &&
+		                        (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld) &&
+		                        !(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection);
+		const bool isSunQuad = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSun) != 0;
+
 		float3 sunDir = normalize(SharedData::physSkyData.sunDir);
 		float cosTheta = saturate(dot(normalize(input.WorldPosition.xyz), sunDir));
-		if (cosTheta > SharedData::physSkyData.sunDiskCos && SharedData::physSkyData.sunDiskCos > 0.0)
+		if (cosTheta > SharedData::physSkyData.sunDiskCos && SharedData::physSkyData.sunDiskCos > 0.0 && (!replaceSun || isSunQuad))
 		{
 			float sunDiskSin = sqrt(1.0 - SharedData::physSkyData.sunDiskCos * SharedData::physSkyData.sunDiskCos);
 			float tanTheta = sqrt(1.0 - cosTheta * cosTheta) / cosTheta;
 			float normDist = tanTheta * SharedData::physSkyData.sunDiskCos * rcp(sunDiskSin);
 			float3 limbFactor = PhysSky::LimbDarkenHestroffer(normDist);
 
-			float3 dirLightColor = SharedData::physSkyData.sunlightColor * limbFactor;
-			dirLightColor *= PhysSky::SampleTr(normalize(input.WorldPosition.xyz), SampBaseSampler);
-			psout.Color.xyz += dirLightColor;
+			// (batch 37b) TrLut edge fix: the LUT through Physical Sky's own clamp sampler (upstream
+			// fec65ed15 swapped samplers for the same reason) instead of the sun texture's sampler.
+			float3 sunTransmittance;
+			[branch] if (extFlags & SharedData::PhysSkyExtFlags::TrLutEdgeFix)
+				sunTransmittance = PhysSky::SampleTr(normalize(input.WorldPosition.xyz), PhysSky::SampTr);
+			else
+				sunTransmittance = PhysSky::SampleTr(normalize(input.WorldPosition.xyz), SampBaseSampler);
+
+			float3 dirLightColor;
+			[branch] if (extFlags & SharedData::PhysSkyExtFlags::SunPhysicalRadiance)
+			{
+				// Upstream 728eedd61 + d08484aef: the light colour is an irradiance, the disk shows
+				// radiance = irradiance / solid angle. Capped, keeping the hue (upstream clamps each
+				// channel at a fixed 62250).
+				const float sunSolidAngle = Math::TAU * (1.0 - SharedData::physSkyData.sunDiskCos);
+				float3 radiance = SharedData::physSkyData.sunlightColor / max(sunSolidAngle, 1e-6);
+				radiance *= sunTransmittance;
+				const float peak = max(max(radiance.r, radiance.g), radiance.b);
+				radiance *= min(1.0, SharedData::physSkyExtData.SunRadianceCap / max(peak, 1e-6));
+				dirLightColor = radiance * limbFactor;
+			}
+			else
+			{
+				dirLightColor = SharedData::physSkyData.sunlightColor * limbFactor;
+				dirLightColor *= sunTransmittance;
+			}
+
+			[branch] if (extFlags & SharedData::PhysSkyExtFlags::SunSoftEdge)
+			{
+				// Upstream fec65ed15: fade the outer 1/8 of the disk instead of a hard cut.
+				dirLightColor *= saturate(8.0 * (cosTheta - SharedData::physSkyData.sunDiskCos) / (1.0 - SharedData::physSkyData.sunDiskCos));
+			}
+
+			if (replaceSun)
+				psout.Color.xyz = dirLightColor;
+			else
+				psout.Color.xyz += dirLightColor;
 			psout.Color.w = 1.0;
+		} else if (replaceSun && isSunQuad) {
+			// Upstream 735ec68e4: the rest of the vanilla sun quad is cleared.
+			psout.Color = 0.0;
 		}
+#		endif
+
+#		if !defined(OCCLUSION)
+		// (batch 37b) Optionally hide the vanilla sun glare while the procedural sun is on.
+		if ((SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::HideSunGlare) && SharedData::physSkyData.sunDiskCos > 0.0 &&
+			(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSunGlare))
+			psout.Color = 0.0;
 #		endif
 	}
 #endif

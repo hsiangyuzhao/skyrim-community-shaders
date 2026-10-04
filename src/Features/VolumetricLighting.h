@@ -18,7 +18,42 @@ public:
 		bool InteriorEnabled = true;
 		int32_t InteriorQuality = 2;
 		TextureSize InteriorCustomSize;
+
+		// (batch 37b) Each is ANDed with Batch37b::IsOn(); see the *Active() helpers below.
+		/// A1: exponent on the cloud x terrain shadow multiplied into every light-shaft voxel.
+		/// 0 = no occlusion (37a), 0.5 = upstream d22b87a87 (sqrt), 1 = full cloud shadow.
+		float WorldShadowPower = 0.5f;
+		/// A2: Linear Lighting's vlGamma acts on the shaft density only, not on the weather
+		/// intensity. Normalised at DensityGammaReference so that intensity looks unchanged.
+		bool DensityOnlyGamma = true;
+		float DensityGammaReference = 2.0f;
+		/// A3: extra multiplier on the shafts while a moon is the light source (Sky Sync).
+		float NightIntensity = 0.5f;
+		/// A4: when Physical Sky does not override the light colour, the shaft colour (a gamma
+		/// space weather colour) is linearised exactly like the scene's directional light.
+		bool LinearizeColor = true;
 	};
+
+	/// (batch 37b) Mirrors SharedData::VolumetricLightingSettings (HLSL). Appended at the end
+	/// of FeatureData, so nothing before it moves.
+	struct alignas(16) CommonBufferData
+	{
+		float WorldShadowPower;  // 0 = the occlusion branch is skipped entirely
+		uint LinearizeColor;
+		float pad0[2];
+	};
+
+	[[nodiscard]] CommonBufferData GetCommonBufferData() const;
+	[[nodiscard]] float WorldShadowPowerActive() const;
+	[[nodiscard]] bool DensityOnlyGammaActive() const;
+	[[nodiscard]] float NightIntensityActive() const;
+	[[nodiscard]] bool LinearizeColorActive() const;
+	/// (batch 37b) Re-binds what the generate CS needs for cloud/terrain occlusion
+	/// (t25 cloud cube, t60 terrain heights, b5/b6 shared CBs). Called from the dispatch hook.
+	void BindWorldShadowResources() const;
+	/// (batch 37b, A2/A3) Applied to the weather intensity at ApplyVolumetricLighting.
+	/// a_moonIsLightSource: Sky Sync's current light is Masser or Secunda.
+	[[nodiscard]] float AdjustIntensity(float a_intensity, bool a_moonIsLightSource) const;
 
 	Settings settings;
 
@@ -48,6 +83,7 @@ public:
 	virtual void DataLoaded() override;
 	virtual void PostPostLoad() override;
 	virtual void SetupResources() override;
+	void DrawBatch37bSettings();
 	virtual void EarlyPrepass() override;
 
 	std::map<std::string, Util::GameSetting> hiddenVRSettings{
