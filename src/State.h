@@ -203,7 +203,12 @@ public:
 		// own LOD property flags. Merged grass LOD carries none of them (measured flags2
 		// 0x08000021 = ZBufWrite|VertexColors|BackLighting), so this bit is the only way to
 		// tell the shader "this draw is grass LOD".
-		IsLODGrass = 1 << 7
+		IsLODGrass = 1 << 7,
+		// (batch 37b) Set per draw by PhysicalSky's BSSkyShader::SetupGeometry hook from the
+		// sky object type: the vanilla sun quad (SO_SUN) and its glare (SO_SUN_GLARE). The
+		// procedural sun is drawn on, and replaces, only the former.
+		IsSun = 1 << 8,
+		IsSunGlare = 1 << 9
 	};
 
 	enum class ExtraFeatureDescriptors : uint32_t

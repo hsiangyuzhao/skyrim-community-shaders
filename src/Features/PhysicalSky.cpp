@@ -37,6 +37,13 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	secundaColor,
 	proceduralSun,
 	sunDiskRad,
+	sunAlignToVanilla,
+	sunReplaceVanilla,
+	sunSoftEdge,
+	sunPhysicalRadiance,
+	sunRadianceCap,
+	sunHideVanillaGlare,
+	sunDiskRadiusDeg,
 	adaptationStart,
 	adaptationEnd,
 	dayExposure,
@@ -454,9 +461,47 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::Checkbox("Procedural Sun", &settings.proceduralSun);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Draws a physically-sized sun disk (size set below).");
-		ImGui::SliderAngle("Sun Disk Angular Radius", &settings.sunDiskRad, 0.f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
+		if (Batch37b::IsOn()) {
+			ImGui::SliderFloat("Sun Disk Angular Radius", &settings.sunDiskRadiusDeg, 0.05f, 2.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Radius of the disk. 0.27 = the real sun (0.53 degrees across).");
+			ImGui::SameLine();
+			ImGui::TextDisabled("(%.2f deg across)", settings.sunDiskRadiusDeg * 2.f);
+		} else {
+			ImGui::SliderAngle("Sun Disk Angular Radius (37a)", &settings.sunDiskRad, 0.f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Batch 37b master switch is off: the old size setting is in use.");
+		}
+
+		ImGui::SeparatorText("Procedural Sun (Batch 37b)");
+		if (!Batch37b::IsOn())
+			ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
+		ImGui::Checkbox("Align with Vanilla Sun", &settings.sunAlignToVanilla);
 		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Real world sun disk angular radius is about 0.27 degrees.");
+			ImGui::Text(
+				"Centres the disk (and the sky's glow around the sun) exactly where the game draws its sun.\n"
+				"Off: the old direction, which drifts 2-4 degrees off the game's sun as you climb.");
+		ImGui::Checkbox("Replace Vanilla Sun", &settings.sunReplaceVanilla);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("The disk replaces the game's sun picture instead of being added next to it (no second sun).");
+		ImGui::Checkbox("Soft Edge", &settings.sunSoftEdge);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Fades the rim of the disk so it does not shimmer with DLSS.");
+		ImGui::Checkbox("Physical Brightness", &settings.sunPhysicalRadiance);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Makes the disk as bright as a real sun for its size (blinding, strong bloom), limited by\n"
+				"the cap below. Off: the old dim flat disk.");
+		if (settings.sunPhysicalRadiance) {
+			ImGui::SliderFloat("Brightness Cap", &settings.sunRadianceCap, 10.f, 62250.f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text(
+					"Upper limit of the disk's brightness. Lower = less bloom and less DLSS/frame-gen\n"
+					"shimmer around the sun. Upstream uses 62250. Default 1000.");
+		}
+		ImGui::Checkbox("Hide Vanilla Sun Glare", &settings.sunHideVanillaGlare);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Removes the game's large halo around the sun while the procedural sun is on.");
 		ImGui::PopID();
 	}
 
@@ -743,8 +788,29 @@ bool PhysicalSky::ShadersOK()
 	return csTrLutGen && csMsLutGen && csSvLutGen && csApLutGen && csShadowAccum;
 }
 
+void PhysicalSky::UpdateExtCbData()
+{
+	extCbData = {};
+	if (!loaded || !Batch37b::IsOn())
+		return;
+
+	uint flags = 0;
+	if (settings.sunReplaceVanilla)
+		flags |= kExtSunReplace;
+	if (settings.sunSoftEdge)
+		flags |= kExtSunSoftEdge;
+	if (settings.sunPhysicalRadiance)
+		flags |= kExtSunPhysicalRadiance;
+	if (settings.sunHideVanillaGlare)
+		flags |= kExtHideSunGlare;
+	extCbData.flags = flags;
+	extCbData.sunRadianceCap = std::clamp(settings.sunRadianceCap, 1.f, 62250.f);
+}
+
 void PhysicalSky::Reset()
 {
+	UpdateExtCbData();
+
 	auto& skySync = globals::features::skySync;
 	skySync.lightColors = std::nullopt;
 
@@ -776,6 +842,17 @@ void PhysicalSky::Reset()
 	dynres = { floor(dynres.x), floor(dynres.y) };
 
 	auto sunDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)];
+	// (batch 37b) Align with the vanilla sun quad. Sky Sync places it (and points the sun light)
+	// along the apparent direction -- dipped by atan(altitude / 325000), 1.5-4 degrees -- in the
+	// sky root's local frame, which Sky Sync rotates by the cell's north rotation. The raw
+	// direction used before sat that far off the quad: a second, clipped or missing disk.
+	if (Batch37b::IsOn() && settings.sunAlignToVanilla) {
+		RE::NiPoint3 apparent = skySync.directions[static_cast<int>(SkySync::Caster::Sun)];
+		if (auto* sky = globals::game::sky; sky && sky->root)
+			apparent = sky->root->world.rotate * apparent;
+		if (apparent.Unitize() > FLT_EPSILON)
+			sunDir = apparent;
+	}
 	auto masserDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)];
 	auto secundaDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)];
 
@@ -797,7 +874,7 @@ void PhysicalSky::Reset()
 		.masserColor = settings.masserColor * exposure,
 		.apTrMix = settings.apTrMix,
 		.secundaDir = { secundaDir.x, secundaDir.y, secundaDir.z },
-		.sunDiskCos = cos(settings.sunDiskRad) * (settings.proceduralSun ? 1.f : 0.f),
+		.sunDiskCos = cos(Batch37b::IsOn() ? DirectX::XMConvertToRadians(std::clamp(settings.sunDiskRadiusDeg, 0.05f, 10.f)) : settings.sunDiskRad) * (settings.proceduralSun ? 1.f : 0.f),
 		.secundaColor = settings.secundaColor * exposure,
 		.enabled = allGood,
 		.tonemapper = linearLighting.settings.enableLinearLighting ? 0 : settings.tonemapper,
@@ -1009,14 +1086,36 @@ void PhysicalSky::RestoreSamplers()
 	PSSamplerModifiedBits &= ~(1 << 3);
 }
 
+void PhysicalSky::SetSunDrawFlags(const RE::BSRenderPass* a_pass)
+{
+	auto& descriptor = globals::state->permutationData.ExtraShaderDescriptor;
+	descriptor &= ~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare));
+
+	if (!a_pass || !a_pass->shaderProperty)
+		return;
+	const auto* skyProperty = static_cast<const RE::BSSkyShaderProperty*>(a_pass->shaderProperty);
+	if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_SUN)
+		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun);
+	else if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_SUN_GLARE)
+		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare);
+}
+
+void PhysicalSky::ClearSunDrawFlags()
+{
+	globals::state->permutationData.ExtraShaderDescriptor &=
+		~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare));
+}
+
 void PhysicalSky::Hooks::BSSkyShader_SetupGeometry::thunk(RE::BSShader* This, RE::BSRenderPass* Pass, uint32_t RenderFlags)
 {
 	globals::features::physicalSky.ModifySky();
+	SetSunDrawFlags(Pass);
 	func(This, Pass, RenderFlags);
 }
 
 void PhysicalSky::Hooks::BSSkyShader_RestoreGeometry::thunk(RE::BSShader* This, RE::BSRenderPass* Pass, uint32_t RenderFlags)
 {
 	globals::features::physicalSky.RestoreSamplers();
+	ClearSunDrawFlags();
 	func(This, Pass, RenderFlags);
 }

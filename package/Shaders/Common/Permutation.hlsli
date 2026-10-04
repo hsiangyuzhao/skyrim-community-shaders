@@ -64,6 +64,8 @@ namespace Permutation
 		static const uint GrassSphereNormal = (1 << 5);
 		static const uint IsEye = (1 << 6);
 		static const uint IsLODGrass = (1 << 7);
+		static const uint IsSun = (1 << 8);       // (batch 37b) vanilla sun quad (Sky)
+		static const uint IsSunGlare = (1 << 9);  // (batch 37b) vanilla sun glare quad (Sky)
 	}
 
 	namespace ExtraFeatureFlags

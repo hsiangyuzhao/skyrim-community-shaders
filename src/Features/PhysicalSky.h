@@ -121,7 +121,26 @@ struct PhysicalSky final : public Feature
 		float3 secundaColor = float3{ 0.8f, 1.0f, 1.0f } * 5e-3f;
 
 		bool proceduralSun = true;
-		float sunDiskRad = DirectX::XMConvertToRadians(0.53f);
+		float sunDiskRad = DirectX::XMConvertToRadians(0.53f);  // 37a size (really a diameter)
+
+		// (batch 37b) Procedural sun v2. Each is ANDed with Batch37b::IsOn().
+		/// Disk centred where the vanilla sun is drawn (Sky Sync's apparent direction, dipped
+		/// with altitude, in the sky root's frame) instead of the raw sun direction. Also moves
+		/// the sky's sun glow and the scattering LUTs onto that direction.
+		bool sunAlignToVanilla = true;
+		/// Disk replaces the vanilla sun texture (upstream 45ad2c6f7 + 735ec68e4): drawn only on
+		/// the sun quad, quad pixels outside the disk cleared.
+		bool sunReplaceVanilla = true;
+		/// Soft disk edge (upstream fec65ed15).
+		bool sunSoftEdge = true;
+		/// Disk radiance = light colour / disk solid angle x transmittance (upstream 728eedd61 +
+		/// d08484aef), capped at sunRadianceCap (upstream: fixed 62250).
+		bool sunPhysicalRadiance = true;
+		float sunRadianceCap = 1000.f;
+		/// Hide the vanilla sun glare (large halo) while the procedural sun is on.
+		bool sunHideVanillaGlare = false;
+		/// Angular radius in degrees; 0.27 = the real sun (0.53 across).
+		float sunDiskRadiusDeg = 0.27f;
 
 		float adaptationStart = DirectX::XMConvertToRadians(-2);
 		float adaptationEnd = DirectX::XMConvertToRadians(-15);
@@ -212,6 +231,29 @@ struct PhysicalSky final : public Feature
 	} cbData;
 	static_assert(sizeof(CbData) % 16 == 0);
 
+	/// (batch 37b) Mirrors SharedData::PhysSkyExtData (HLSL), appended at the end of FeatureData.
+	/// Flags are the 37b switches ANDed with the master; all zero = the 37a shader paths.
+	enum ExtFlags : uint32_t
+	{
+		kExtSunReplace = 1u << 0,
+		kExtSunSoftEdge = 1u << 1,
+		kExtSunPhysicalRadiance = 1u << 2,
+		kExtHideSunGlare = 1u << 3,
+		kExtSkyAlphaOpaque = 1u << 4,
+		kExtTrLutEdgeFix = 1u << 5,
+		kExtApShadowDepthFix = 1u << 6,
+		kExtReflectionSkyFix = 1u << 7,
+		kExtMultiScatterFix = 1u << 8,
+	};
+	struct ExtCbData
+	{
+		uint flags = 0;
+		float sunRadianceCap = 62250.f;
+		float pad0[2] = {};
+	} extCbData;
+	static_assert(sizeof(ExtCbData) == 16);
+	void UpdateExtCbData();
+
 	eastl::unique_ptr<Texture2D> texTrLut = nullptr;  // transmittance
 	eastl::unique_ptr<Texture2D> texMsLut = nullptr;  // multiscattering
 	eastl::unique_ptr<Texture2D> texSvLut = nullptr;  // sky view
@@ -232,6 +274,9 @@ struct PhysicalSky final : public Feature
 
 	void ModifySky();
 	void RestoreSamplers();
+	/// (batch 37b) Marks the vanilla sun / sun glare quads for Sky.hlsl (ExtraShaderDescriptors).
+	static void SetSunDrawFlags(const RE::BSRenderPass* a_pass);
+	static void ClearSunDrawFlags();
 	struct Hooks
 	{
 		struct BSSkyShader_SetupGeometry

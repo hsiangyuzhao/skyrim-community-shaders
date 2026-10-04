@@ -443,6 +443,28 @@ namespace SharedData
 		float2 pad0;
 	};
 
+	// (batch 37b) Mirrors PhysicalSky::ExtCbData, after VolumetricLightingSettings (offset 1456).
+	// Every flag is a 37b switch ANDed with the master; Flags == 0 runs the 37a code paths.
+	struct PhysSkyExtData
+	{
+		uint Flags;
+		float SunRadianceCap;
+		float2 pad0;
+	};
+
+	namespace PhysSkyExtFlags
+	{
+		static const uint SunReplace = (1 << 0);           // disk replaces the vanilla sun quad
+		static const uint SunSoftEdge = (1 << 1);          // upstream fec65ed15
+		static const uint SunPhysicalRadiance = (1 << 2);  // upstream 728eedd61 + d08484aef
+		static const uint HideSunGlare = (1 << 3);         // clear the vanilla glare quad
+		static const uint SkyAlphaOpaque = (1 << 4);       // upstream 5846ad833
+		static const uint TrLutEdgeFix = (1 << 5);         // upstream 9fbd052ad (+ clamp sampler)
+		static const uint ApShadowDepthFix = (1 << 6);     // depth read of upstream 224312a11
+		static const uint ReflectionSkyFix = (1 << 7);     // upstream 23156dc5f
+		static const uint MultiScatterFix = (1 << 8);      // LutGen part of upstream c14664115
+	}
+
 	cbuffer FeatureData : register(b6)
 	{
 		GrassLightingSettings grassLightingSettings;
@@ -467,6 +489,7 @@ namespace SharedData
 		SSRTSettings ssrtSettings;
 		ExponentialHeightFogSettings exponentialHeightFogSettings;
 		VolumetricLightingSettings volumetricLightingSettings;
+		PhysSkyExtData physSkyExtData;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);

@@ -69,6 +69,19 @@ namespace Batch37b
 				"Sky > Physical Sky > General > Worldspaces" });
 			rows.push_back({ group, "All exterior worldspaces", ps.loaded, s.enableAllExteriorWorldspaces,
 				s.enableAllExteriorWorldspaces ? "On" : "Off", "", "Sky > Physical Sky > General > Worldspaces" });
+
+			const char* sunWhere = "Sky > Physical Sky > Celestials > Sun (needs Procedural Sun on)";
+			const auto onOff = [](bool b) { return std::string(b ? "On" : "Off"); };
+			rows.push_back({ group, "Sun: align with vanilla sun", ps.loaded, s.sunAlignToVanilla, onOff(s.sunAlignToVanilla), "",
+				"Sky > Physical Sky > Celestials > Sun" });
+			rows.push_back({ group, "Sun: replace vanilla sun", ps.loaded, s.sunReplaceVanilla, onOff(s.sunReplaceVanilla), "", sunWhere });
+			rows.push_back({ group, "Sun: soft edge", ps.loaded, s.sunSoftEdge, onOff(s.sunSoftEdge), "", sunWhere });
+			rows.push_back({ group, "Sun: physical brightness (cap)", ps.loaded, s.sunPhysicalRadiance,
+				s.sunPhysicalRadiance ? std::format("On, cap {:.0f}", s.sunRadianceCap) : std::string("Off"), "", sunWhere });
+			rows.push_back({ group, "Sun: hide vanilla glare", ps.loaded, s.sunHideVanillaGlare, onOff(s.sunHideVanillaGlare), "", sunWhere });
+			rows.push_back({ group, "Sun: disk radius", ps.loaded, true, std::format("{:.2f} deg", s.sunDiskRadiusDeg),
+				Batch37b::IsOn() ? std::format("{:.2f} deg", s.sunDiskRadiusDeg) : std::string(),
+				"Sky > Physical Sky > Celestials > Sun" });
 		}
 
 		// Extension point: groups registered here, in table order. C./D. go after B.

@@ -184,6 +184,7 @@ cbuffer AlphaTestRefCB : register(b11)
 #	endif
 
 #	include "Common/MotionBlur.hlsli"
+#	include "Common/Permutation.hlsli"
 #	include "Common/SharedData.hlsli"
 
 #	if defined(CLOUD_SHADOWS)
@@ -283,20 +284,65 @@ PS_OUTPUT main(PS_INPUT input)
 		float4 apColor = PhysSky::SampleAp(viewDir, input.Position.xy, psCloudDist, PhysSky::SampSv);
 		psout.Color.xyz = psout.Color.xyz * apColor.a + apColor.rgb;
 #		elif defined(DEFERRED) && defined(TEX)
+		const uint extFlags = SharedData::physSkyExtData.Flags;
+		// (batch 37b) Replace mode: the disk lives on the vanilla sun quad only (main view, not
+		// reflections), and the quad's own texture is dropped. Without it the disk is added on
+		// top of every TEX quad as in 37a -- including the glare quad.
+		const bool replaceSun = (extFlags & SharedData::PhysSkyExtFlags::SunReplace) && SharedData::physSkyData.sunDiskCos > 0.0 &&
+		                        (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld) &&
+		                        !(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection);
+		const bool isSunQuad = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSun) != 0;
+
 		float3 sunDir = normalize(SharedData::physSkyData.sunDir);
 		float cosTheta = saturate(dot(normalize(input.WorldPosition.xyz), sunDir));
-		if (cosTheta > SharedData::physSkyData.sunDiskCos && SharedData::physSkyData.sunDiskCos > 0.0)
+		if (cosTheta > SharedData::physSkyData.sunDiskCos && SharedData::physSkyData.sunDiskCos > 0.0 && (!replaceSun || isSunQuad))
 		{
 			float sunDiskSin = sqrt(1.0 - SharedData::physSkyData.sunDiskCos * SharedData::physSkyData.sunDiskCos);
 			float tanTheta = sqrt(1.0 - cosTheta * cosTheta) / cosTheta;
 			float normDist = tanTheta * SharedData::physSkyData.sunDiskCos * rcp(sunDiskSin);
 			float3 limbFactor = PhysSky::LimbDarkenHestroffer(normDist);
 
-			float3 dirLightColor = SharedData::physSkyData.sunlightColor * limbFactor;
-			dirLightColor *= PhysSky::SampleTr(normalize(input.WorldPosition.xyz), SampBaseSampler);
-			psout.Color.xyz += dirLightColor;
+			float3 dirLightColor;
+			[branch] if (extFlags & SharedData::PhysSkyExtFlags::SunPhysicalRadiance)
+			{
+				// Upstream 728eedd61 + d08484aef: the light colour is an irradiance, the disk shows
+				// radiance = irradiance / solid angle. Capped, keeping the hue (upstream clamps each
+				// channel at a fixed 62250).
+				const float sunSolidAngle = Math::TAU * (1.0 - SharedData::physSkyData.sunDiskCos);
+				float3 radiance = SharedData::physSkyData.sunlightColor / max(sunSolidAngle, 1e-6);
+				radiance *= PhysSky::SampleTr(normalize(input.WorldPosition.xyz), SampBaseSampler);
+				const float peak = max(max(radiance.r, radiance.g), radiance.b);
+				radiance *= min(1.0, SharedData::physSkyExtData.SunRadianceCap / max(peak, 1e-6));
+				dirLightColor = radiance * limbFactor;
+			}
+			else
+			{
+				dirLightColor = SharedData::physSkyData.sunlightColor * limbFactor;
+				dirLightColor *= PhysSky::SampleTr(normalize(input.WorldPosition.xyz), SampBaseSampler);
+			}
+
+			[branch] if (extFlags & SharedData::PhysSkyExtFlags::SunSoftEdge)
+			{
+				// Upstream fec65ed15: fade the outer 1/8 of the disk instead of a hard cut.
+				dirLightColor *= saturate(8.0 * (cosTheta - SharedData::physSkyData.sunDiskCos) / (1.0 - SharedData::physSkyData.sunDiskCos));
+			}
+
+			if (replaceSun)
+				psout.Color.xyz = dirLightColor;
+			else
+				psout.Color.xyz += dirLightColor;
 			psout.Color.w = 1.0;
+		} else if (replaceSun && isSunQuad) {
+			// Upstream 735ec68e4: the rest of the vanilla sun quad is cleared.
+			psout.Color = 0.0;
 		}
+#		endif
+
+#		if !defined(OCCLUSION)
+		// (batch 37b) Optionally hide the vanilla sun glare while the procedural sun is on.
+		if ((SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::HideSunGlare) && SharedData::physSkyData.sunDiskCos > 0.0 &&
+			(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSunGlare))
+			psout.Color = 0.0;
 #		endif
 	}
 #endif
