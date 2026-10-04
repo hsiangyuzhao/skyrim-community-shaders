@@ -2,6 +2,7 @@
 
 #include "CloudShadows.h"
 #include "InteriorSun.h"
+#include "LinearLighting.h"
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
@@ -57,6 +58,20 @@ void VolumetricLighting::DrawBatch37bSettings()
 			"How much clouds and distant mountains block the light shafts.\n"
 			"0 = not at all (old behaviour). 0.5 = half strength (upstream, default). 1 = full.\n"
 			"Capped by Cloud Shadows' Opacity: clouds can never block more than that.");
+
+	ImGui::Checkbox("Gamma on Density Only", &settings.DensityOnlyGamma);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Linear Lighting's VL Gamma used to also boost the weather's shaft strength, so nights\n"
+			"(strength 3) and sunrise/sunset (4) came out far stronger than day (2).\n"
+			"On (default): the gamma only shapes the shafts; strength scales normally.\n"
+			"A clear day looks the same; nights ~2x weaker, sunrise/sunset ~4x weaker at VL Gamma 3.\n"
+			"Off: old behaviour. Needs Sky Sync.");
+	if (settings.DensityOnlyGamma) {
+		ImGui::SliderFloat("Reference Strength", &settings.DensityGammaReference, 0.5f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Weather shaft strength that looks exactly as before. 2 = vanilla clear day.");
+	}
 }
 
 float VolumetricLighting::WorldShadowPowerActive() const
@@ -66,7 +81,7 @@ float VolumetricLighting::WorldShadowPowerActive() const
 
 bool VolumetricLighting::DensityOnlyGammaActive() const
 {
-	return false;
+	return Batch37b::IsOn() && settings.DensityOnlyGamma;
 }
 
 float VolumetricLighting::NightIntensityActive() const
@@ -117,7 +132,25 @@ void VolumetricLighting::BindWorldShadowResources() const
 
 float VolumetricLighting::AdjustIntensity(float a_intensity, [[maybe_unused]] bool a_moonIsLightSource) const
 {
-	return a_intensity;
+	float intensity = a_intensity;
+
+	// A2. With Linear Lighting the composite draws colour * pow(I * D, vlGamma): the weather
+	// intensity I is raised to vlGamma together with the density D, so a night VOLI of 3 against
+	// a day 2 becomes (1.5)^gamma brighter instead of 1.5x. Feeding I' = Iref * (I / Iref)^(1/g)
+	// instead gives pow(I' * D, g) = (I / Iref) * pow(Iref * D, g): the gamma now shapes the
+	// density only, intensity scales linearly, and at I = Iref (clear day, VOLI 2) nothing
+	// changes. Done on the CPU so no shader changes, and the temporal reprojection in
+	// ISApplyVolumetricLighting keeps seeing one consistent quantity.
+	if (DensityOnlyGammaActive() && intensity > 0.0f) {
+		const auto ll = globals::features::linearLighting.GetCommonBufferData();
+		const float gamma = ll.vlGamma;
+		if (ll.enableLinearLighting && gamma > 1e-3f) {
+			const float reference = std::max(settings.DensityGammaReference, 1e-3f);
+			intensity = reference * std::pow(intensity / reference, 1.0f / gamma);
+		}
+	}
+
+	return intensity;
 }
 
 void VolumetricLighting::DrawVolumetricLightingSettings(int32_t& quality, TextureSize& customSize, const bool isInterior, const bool inLocationType)

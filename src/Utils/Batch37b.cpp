@@ -25,6 +25,9 @@ namespace Batch37b
 			rows.push_back({ group, "Cloud & terrain occlusion", vl.loaded, s.WorldShadowPower > 0.0f,
 				s.WorldShadowPower > 0.0f ? std::format("{:.2f}", s.WorldShadowPower) : std::string("0 (off)"),
 				std::format("{:.2f}", vl.WorldShadowPowerActive()), where });
+			rows.push_back({ group, "Gamma on density only", vl.loaded, s.DensityOnlyGamma,
+				s.DensityOnlyGamma ? std::format("On, ref {:.2f}", s.DensityGammaReference) : std::string("Off"),
+				"", where });
 		}
 
 		// Extension point: groups registered here, in table order. C./D. go after B.
