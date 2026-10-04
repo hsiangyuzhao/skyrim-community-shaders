@@ -18,6 +18,7 @@
 #include "TruePBR.h"
 #include "Util.h"
 #include "Utils/Batch36f.h"
+#include "Utils/Batch37b.h"
 #include "Utils/Format.h"
 #include "Utils/UI.h"
 
@@ -27,6 +28,15 @@ void AdvancedSettingsRenderer::RenderAdvancedSettings(
 {
 	// Use TabBar system - tabs sorted alphabetically
 	if (ImGui::BeginTabBar("##AdvancedSettingsTabs", ImGuiTabBarFlags_None)) {
+		// Batch 37b Tab (first: the A/B master switch for the batch being tested)
+		if (MenuFonts::BeginTabItemWithFont("Batch 37b", Menu::FontRole::Subheading)) {
+			if (ImGui::BeginChild("##Batch37bContent", ImVec2(0, 0), false)) {
+				Batch37b::DrawTab();
+			}
+			ImGui::EndChild();
+			ImGui::EndTabItem();
+		}
+
 		// Batch 36f Tab (first, so the A/B master switch is one click from the Advanced page)
 		if (MenuFonts::BeginTabItemWithFont("Batch 36f", Menu::FontRole::Subheading)) {
 			if (ImGui::BeginChild("##Batch36fContent", ImVec2(0, 0), false)) {
