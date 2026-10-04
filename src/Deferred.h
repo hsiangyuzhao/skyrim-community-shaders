@@ -42,6 +42,8 @@ public:
 
 	ID3D11ComputeShader* mainCompositeCS = nullptr;
 	ID3D11ComputeShader* mainCompositeInteriorCS = nullptr;
+	/// (batch 37b, C-4) Whether the composite variants above were built with SSGI_AO_SPARES_DIRECT.
+	bool compositeAoSparesDirect = false;
 
 	bool deferredPass = false;
 
