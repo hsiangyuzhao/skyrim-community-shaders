@@ -286,6 +286,25 @@ float3 SampleSky(float3 viewDir, uint2 pxCoord, SamplerState sampSv)
 	return skyColor;
 }
 
+// (batch 37b) SampleSky with the AP shadow passed in (upstream 23156dc5f), for the reflection
+// pass, where TexApShadow holds main-view pixels. The original above is left untouched so the
+// other shaders that call it compile exactly as before.
+float3 SampleSkyShadow(float3 viewDir, float shadow, SamplerState sampSv)
+{
+	SharedData::PhysSkyData data = SharedData::physSkyData;
+
+	const float2 skyLutUv = SkyViewLutUv(viewDir);
+	float3 skyColor = TexSvLut.SampleLevel(sampSv, skyLutUv, 0).rgb;
+	skyColor *= 1 - shadow;
+
+	if (data.tonemapper == 1)
+		skyColor = Color::LinearToGamma(skyColor);
+	else if (data.tonemapper == 2)
+		skyColor = skyColor / (1 + skyColor);
+
+	return skyColor;
+}
+
 float3 SampleTr(float3 sunDir, SamplerState sampSv)
 {
 	SharedData::PhysSkyData data = SharedData::physSkyData;
@@ -383,6 +402,30 @@ float4 SampleAp(float3 viewDir, uint2 pxCoord, float dist, SamplerState sampSv)
         apColor.rgb = Color::LinearToGamma(apColor.rgb);
     else if (data.tonemapper == 2)
         apColor.rgb = apColor.rgb / (1 + apColor.rgb);
+
+	apColor.rgb = lerp(0, apColor.rgb, data.apLumMix);
+	apColor.a = lerp(1, apColor.a, data.apTrMix);
+
+	return apColor;
+}
+
+// (batch 37b) SampleAp with the AP shadow passed in (upstream 23156dc5f); see SampleSkyShadow.
+float4 SampleApShadow(float3 viewDir, float dist, float shadow, SamplerState sampSv)
+{
+	SharedData::PhysSkyData data = SharedData::physSkyData;
+
+	const float2 skyLutUv = SkyViewLutUv(viewDir);
+
+	uint3 apDims;
+	TexApLut.GetDimensions(apDims.x, apDims.y, apDims.z);
+	const float depth_slice = lerp(.5 / apDims.z, 1 - .5 / apDims.z, saturate(dist / AP_MAX_DIST));
+	float4 apColor = TexApLut.SampleLevel(sampSv, float3(skyLutUv, depth_slice), 0);
+	apColor.rgb *= 1 - shadow;
+
+	if (data.tonemapper == 1)
+		apColor.rgb = Color::LinearToGamma(apColor.rgb);
+	else if (data.tonemapper == 2)
+		apColor.rgb = apColor.rgb / (1 + apColor.rgb);
 
 	apColor.rgb = lerp(0, apColor.rgb, data.apLumMix);
 	apColor.a = lerp(1, apColor.a, data.apTrMix);

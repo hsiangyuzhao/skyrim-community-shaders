@@ -47,6 +47,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	fixSkyAlpha,
 	fixTrLutEdge,
 	fixApShadowDepth,
+	fixReflectionSky,
 	adaptationStart,
 	adaptationEnd,
 	dayExposure,
@@ -610,6 +611,9 @@ void PhysicalSky::SettingsFixes()
 	ImGui::Checkbox("Atmosphere Shadow Depth Fix", &settings.fixApShadowDepth);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("With DLSS Quality (not DLAA) the shadows inside distant haze and fog were offset from the\nmountains casting them. This reads the right depth. No change under DLAA.");
+	ImGui::Checkbox("Reflected Sky Fix", &settings.fixReflectionSky);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Removes random dark patches from the sky seen in reflections (environment cubemap).\nUses the cloud shadows there instead of the main view's haze shadow.");
 }
 
 void PhysicalSky::SettingsClouds()
@@ -831,6 +835,8 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtTrLutEdgeFix;
 	if (settings.fixApShadowDepth)
 		flags |= kExtApShadowDepthFix;
+	if (settings.fixReflectionSky)
+		flags |= kExtReflectionSkyFix;
 	extCbData.flags = flags;
 	extCbData.sunRadianceCap = std::clamp(settings.sunRadianceCap, 1.f, 62250.f);
 }

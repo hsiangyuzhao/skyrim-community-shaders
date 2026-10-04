@@ -201,6 +201,28 @@ cbuffer AlphaTestRefCB : register(b11)
 
 Texture2D<float> TexDepthSampler : register(t17);
 
+#	if defined(PHYSICAL_SKY)
+// (batch 37b) Upstream 23156dc5f. In the cubemap reflection pass TexApShadow (t64) still holds
+// the main view's half-res shadow -- or nothing bound for this pass at all -- so indexing it
+// with the reflection target's pixel gave the reflected sky random dark patches. There, take
+// the shadow from the cloud shadow cube along the view direction instead.
+bool UseReflectionSkyShadow()
+{
+	return (SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::ReflectionSkyFix) &&
+	       (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection);
+}
+
+float GetReflectionSkyShadow(float3 viewDir)
+{
+#		if defined(CLOUD_SHADOWS)
+	const float cloudCubeSample = CloudShadows::CloudShadowsTexture.SampleLevel(SampBaseSampler, viewDir, 0).x;
+	return saturate(cloudCubeSample * SharedData::cloudShadowsSettings.Opacity);
+#		else
+	return 0.0;
+#		endif
+}
+#	endif
+
 PS_OUTPUT main(PS_INPUT input)
 {
 	PS_OUTPUT psout;
@@ -277,14 +299,22 @@ PS_OUTPUT main(PS_INPUT input)
 	{
 # 		if defined(DITHER) && !defined(TEX)
 		// SKY
-		float3 skyColor = PhysSky::SampleSky(normalize(input.WorldPosition.xyz), input.Position.xy, PhysSky::SampSv);
+		float3 skyColor;
+		[branch] if (UseReflectionSkyShadow())
+			skyColor = PhysSky::SampleSkyShadow(normalize(input.WorldPosition.xyz), GetReflectionSkyShadow(normalize(input.WorldPosition.xyz)), PhysSky::SampSv);
+		else
+			skyColor = PhysSky::SampleSky(normalize(input.WorldPosition.xyz), input.Position.xy, PhysSky::SampSv);
 		[branch] if (SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::SkyAlphaOpaque)
 			psout.Color = lerp(float4(skyColor, 1.0), psout.Color, SharedData::physSkyData.vanillaMix);  // upstream 5846ad833
 		else
 			psout.Color.xyz = lerp(skyColor, psout.Color.xyz, SharedData::physSkyData.vanillaMix);
 
 #		elif defined(PS_CLOUDS)
-		float4 apColor = PhysSky::SampleAp(viewDir, input.Position.xy, psCloudDist, PhysSky::SampSv);
+		float4 apColor;
+		[branch] if (UseReflectionSkyShadow())
+			apColor = PhysSky::SampleApShadow(viewDir, psCloudDist, GetReflectionSkyShadow(viewDir), PhysSky::SampSv);
+		else
+			apColor = PhysSky::SampleAp(viewDir, input.Position.xy, psCloudDist, PhysSky::SampSv);
 		psout.Color.xyz = psout.Color.xyz * apColor.a + apColor.rgb;
 #		elif defined(DEFERRED) && defined(TEX)
 		const uint extFlags = SharedData::physSkyExtData.Flags;

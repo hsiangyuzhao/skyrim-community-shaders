@@ -87,6 +87,7 @@ namespace Batch37b
 			rows.push_back({ group, "Fix: opaque sky (5846ad833)", ps.loaded, s.fixSkyAlpha, onOff(s.fixSkyAlpha), "", fixWhere });
 			rows.push_back({ group, "Fix: transmittance LUT edge (9fbd052ad)", ps.loaded, s.fixTrLutEdge, onOff(s.fixTrLutEdge), "", fixWhere });
 			rows.push_back({ group, "Fix: haze shadow depth under DLSS (224312a11)", ps.loaded, s.fixApShadowDepth, onOff(s.fixApShadowDepth), "", fixWhere });
+			rows.push_back({ group, "Fix: dark patches in reflected sky (23156dc5f)", ps.loaded, s.fixReflectionSky, onOff(s.fixReflectionSky), "", fixWhere });
 			rows.push_back({ group, "Fix: Cloud Shadow Remap saved (1aaf5168d)", ps.loaded, true, "(no own switch)", "", "-" });
 		}
 
