@@ -30,6 +30,8 @@ namespace Batch37b
 				"", where });
 			rows.push_back({ group, "Night strength", vl.loaded, s.NightIntensity != 1.0f,
 				std::format("{:.2f}", s.NightIntensity), std::format("{:.2f}", vl.NightIntensityActive()), where });
+			rows.push_back({ group, "Linearize shaft colour (no Physical Sky override)", vl.loaded, s.LinearizeColor,
+				s.LinearizeColor ? "On" : "Off", "", where });
 		}
 
 		// Extension point: groups registered here, in table order. C./D. go after B.

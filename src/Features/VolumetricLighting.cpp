@@ -79,6 +79,14 @@ void VolumetricLighting::DrawBatch37bSettings()
 			"Multiplies the light shafts while a moon is the light source.\n"
 			"1 = old behaviour. 0.5 = half (default). 0 = no moonlight shafts. Needs Sky Sync.\n"
 			"Does not change the moonlight itself.");
+
+	ImGui::Checkbox("Linearize Shaft Color", &settings.LinearizeColor);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Where Physical Sky does not set the light colour (worldspaces outside its list,\n"
+			"interiors with sun, Physical Sky off), converts the shaft colour the same way the\n"
+			"sunlight itself is converted. Dark (evening/night) shafts get dimmer there.\n"
+			"No effect where Physical Sky overrides the light colour. Needs Linear Lighting.");
 }
 
 float VolumetricLighting::WorldShadowPowerActive() const
@@ -98,7 +106,7 @@ float VolumetricLighting::NightIntensityActive() const
 
 bool VolumetricLighting::LinearizeColorActive() const
 {
-	return false;
+	return Batch37b::IsOn() && settings.LinearizeColor;
 }
 
 VolumetricLighting::CommonBufferData VolumetricLighting::GetCommonBufferData() const
