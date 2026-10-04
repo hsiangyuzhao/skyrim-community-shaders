@@ -46,6 +46,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sunDiskRadiusDeg,
 	fixSkyAlpha,
 	fixTrLutEdge,
+	fixApShadowDepth,
 	adaptationStart,
 	adaptationEnd,
 	dayExposure,
@@ -606,6 +607,9 @@ void PhysicalSky::SettingsFixes()
 	ImGui::Checkbox("Transmittance Edge Fix", &settings.fixTrLutEdge);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Stops the sun-colour table from bleeding across its edge (odd colours at extreme angles,\npossibly a too-white sunset disk). Usually invisible.");
+	ImGui::Checkbox("Atmosphere Shadow Depth Fix", &settings.fixApShadowDepth);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("With DLSS Quality (not DLAA) the shadows inside distant haze and fog were offset from the\nmountains casting them. This reads the right depth. No change under DLAA.");
 }
 
 void PhysicalSky::SettingsClouds()
@@ -825,6 +829,8 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtSkyAlphaOpaque;
 	if (settings.fixTrLutEdge)
 		flags |= kExtTrLutEdgeFix;
+	if (settings.fixApShadowDepth)
+		flags |= kExtApShadowDepthFix;
 	extCbData.flags = flags;
 	extCbData.sunRadianceCap = std::clamp(settings.sunRadianceCap, 1.f, 62250.f);
 }

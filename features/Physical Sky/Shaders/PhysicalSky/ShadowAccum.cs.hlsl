@@ -84,7 +84,15 @@ void main(uint2 tid	: SV_DispatchThreadID)
 	const uint eyeIndex = Stereo::GetEyeIndexFromTexCoord(stereoUv);
 	const float2 uv = Stereo::ConvertFromStereoUV(stereoUv, eyeIndex);
 
-	const float depth = TexDepth.SampleLevel(SampTr, stereoUv, 0);
+	// (batch 37b) stereoUv is normalised to the render area, but TexDepth is the full-size target
+	// the render area sits in the corner of: with DLSS Quality (0.667) the UV read a different
+	// pixel, or outside the render area. Read the render pixel itself (the depth part of upstream
+	// 224312a11). Identical under DLAA.
+	float depth;
+	[branch] if (SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::ApShadowDepthFix)
+		depth = TexDepth.Load(int3(pxCoords * 2, 0));
+	else
+		depth = TexDepth.SampleLevel(SampTr, stereoUv, 0);
     float4 posWorld = float4(2 * float2(uv.x, -uv.y + 1) - 1, depth, 1);
 	posWorld = mul(FrameBuffer::CameraViewProjInverse[eyeIndex], posWorld);
 	posWorld.xyz /= posWorld.w;
