@@ -48,6 +48,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	fixTrLutEdge,
 	fixApShadowDepth,
 	fixReflectionSky,
+	fixMultiScatter,
 	adaptationStart,
 	adaptationEnd,
 	dayExposure,
@@ -614,6 +615,12 @@ void PhysicalSky::SettingsFixes()
 	ImGui::Checkbox("Reflected Sky Fix", &settings.fixReflectionSky);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Removes random dark patches from the sky seen in reflections (environment cubemap).\nUses the cloud shadows there instead of the main view's haze shadow.");
+	ImGui::Checkbox("Multiple Scattering Fix (changes sky colour)", &settings.fixMultiScatter);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"The sky's multiple-scattering table only looked at half the sky. On: the full sky, as upstream.\n"
+			"Changes overall sky brightness and colour (usually the side away from the sun gets a little\n"
+			"brighter, the sun side a little darker). Off by default: compare and decide.");
 }
 
 void PhysicalSky::SettingsClouds()
@@ -837,6 +844,8 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtApShadowDepthFix;
 	if (settings.fixReflectionSky)
 		flags |= kExtReflectionSkyFix;
+	if (settings.fixMultiScatter)
+		flags |= kExtMultiScatterFix;
 	extCbData.flags = flags;
 	extCbData.sunRadianceCap = std::clamp(settings.sunRadianceCap, 1.f, 62250.f);
 }

@@ -147,6 +147,7 @@ struct PhysicalSky final : public Feature
 		bool fixSkyAlpha = true;  // 5846ad833: sky dome written opaque
 		bool fixApShadowDepth = true;  // 224312a11 (depth read only): AP shadow under dynamic resolution
 		bool fixReflectionSky = true;  // 23156dc5f: reflected sky takes cloud-cube shadow, not TexApShadow
+		bool fixMultiScatter = false;  // c14664115 (LutGen part): full-sphere, isotropic MS LUT. Changes sky colour
 		bool fixTrLutEdge = true;  // 9fbd052ad: transmittance LUT read on texel centres, clamp sampler
 
 		float adaptationStart = DirectX::XMConvertToRadians(-2);

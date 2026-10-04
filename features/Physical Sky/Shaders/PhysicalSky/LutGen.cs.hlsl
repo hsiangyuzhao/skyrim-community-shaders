@@ -72,6 +72,16 @@ void rayMarch(
 	float uSun = dot(rayDir, sunDir);
 	float phaseAerosolSun = Phase::CornetteShanks(uSun, data.aerosolPhaseG);
 	float phaseRayleighSun = Phase::Rayleigh(uSun);
+#	if LUTGEN == 1
+	// (batch 37b) Upstream c14664115: the higher-order scattering this LUT approximates is
+	// isotropic. With the peaked aerosol phase, 16 directions decide whether a sample happens to
+	// land near the sun.
+	[branch] if (SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::MultiScatterFix)
+	{
+		phaseAerosolSun = 0.25 * RCP_PI;
+		phaseRayleighSun = 0.25 * RCP_PI;
+	}
+#	endif
 
 #	if LUTGEN != 1
 	float uMasser = dot(rayDir, data.masserDir);
@@ -197,9 +207,11 @@ void rayMarch(
 
 	float3 lumTotal = 0;
 	float3 fMs = 0;
+	// (batch 37b) Upstream c14664115: the azimuth covered only [0, pi), half the sphere.
+	const float azimuthRange = (SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::MultiScatterFix) ? 2.0 * Math::PI : Math::PI;
 	for (uint i = 0; i < sqrtSamples; ++i)
 		for (uint j = 0; j < sqrtSamples; ++j) {
-			const float theta = (i + 0.5) * Math::PI * rcpSqrtSamples;
+			const float theta = (i + 0.5) * azimuthRange * rcpSqrtSamples;
 			const float phi = acos(1.0 - 2.0 * (j + 0.5) * rcpSqrtSamples);
 			const float3 rayDir = SphericalDir(theta, phi);
 
