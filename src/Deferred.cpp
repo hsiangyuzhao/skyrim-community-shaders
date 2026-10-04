@@ -21,6 +21,7 @@
 #include "Hooks.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/OcclusionDryRun.h"
 
 // CPU-side timing of our own work. Purely observational: every one of these is a
 // QueryPerformanceCounter bracket around an existing call, and each is a no-op unless the
@@ -689,6 +690,11 @@ void Deferred::EndDeferred()
 
 	{
 		Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOther);
+
+		// (batch 37a) Occlusion dry run: max-reduce the finished opaque depth into its own Hi-Z
+		// and queue a readback. Writes only its own textures; a no-op unless the test is running.
+		Util::OcclusionDryRun::OnEndDeferred();
+
 		DeferredPasses();  // Perform deferred passes and composite forward buffers
 
 		// Measures the lit opaque scene for next frame's shading rates. Our work, so it stays

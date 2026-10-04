@@ -159,6 +159,8 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 
 	width = validW;
 	height = validH;
+	sourceWidth = srcW;
+	sourceHeight = srcH;
 
 	// One variant only, since the only source is the game's R24_UNORM_X8_TYPELESS prepass copy.
 	if (!baseCS) {

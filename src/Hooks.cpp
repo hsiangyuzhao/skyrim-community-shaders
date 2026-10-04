@@ -12,6 +12,7 @@
 #include "Utils/DenoiserTimers.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/OcclusionDryRun.h"
 
 #include "Features/GrassOptimizations.h"
 #include "Features/InteriorSun.h"
@@ -313,7 +314,17 @@ struct IDXGISwapChain_Present
 		// Close the GPU frame timeline right before the real Present and open the next one
 		// right after it, so its chain spans exactly the frame's own rendering.
 		auto* gpuTimeline = Util::GpuPhaseTimeline::GetSingleton();
+		const bool timelineRecorded = gpuTimeline->IsRecording();
 		gpuTimeline->EndFrame();
+		{
+			// (batch 37a) Close the occlusion dry run's frame. Its draw estimate is scaled by this
+			// frame's main-view draws (depth prepass + opaque pass) from the engine table.
+			const auto& draws = gpuTimeline->Get().lastDraws;
+			float mainViewDraws = draws[static_cast<size_t>(Util::GpuPhase::DepthPrepass)];
+			for (auto p = static_cast<size_t>(Util::GpuPhase::OpaqueTerrain); p <= static_cast<size_t>(Util::GpuPhase::OpaqueOther); ++p)
+				mainViewDraws += draws[p];
+			Util::OcclusionDryRun::OnFrameEnd(static_cast<uint32_t>(mainViewDraws), timelineRecorded);
+		}
 		// (batch 36e) Same frame bracket for the denoiser breakdown's timestamps.
 		auto* denoiserTimers = Util::DenoiserTimers::GetSingleton();
 		denoiserTimers->EndFrame();

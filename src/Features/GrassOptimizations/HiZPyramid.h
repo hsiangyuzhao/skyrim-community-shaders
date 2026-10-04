@@ -29,6 +29,12 @@ public:
 	uint32_t GetMipCount() const { return spdCS ? mipCount : 1u; }
 	/** @brief Returns how many nominal screen pixels one base-level texel covers, scaled by dynamic resolution. */
 	float GetTexelPixels() const { return texelPixels; }
+	/** @brief (batch 37a) Width in pixels of the rendered depth sub-rectangle the last build reduced. */
+	uint32_t GetSourceWidth() const { return sourceWidth; }
+	/** @brief (batch 37a) Height in pixels of the rendered depth sub-rectangle the last build reduced. */
+	uint32_t GetSourceHeight() const { return sourceHeight; }
+	/** @brief (batch 37a) The pyramid texture (all mips), or nullptr when the pyramid is not valid this frame. */
+	ID3D11Texture2D* GetTexture() const { return valid && texture ? texture->resource.get() : nullptr; }
 
 	/** @brief Creates the parameter constant buffer. Called from the feature's SetupResources. */
 	void SetupResources();
@@ -82,6 +88,8 @@ private:
 
 	uint32_t width = 0;
 	uint32_t height = 0;
+	uint32_t sourceWidth = 0;
+	uint32_t sourceHeight = 0;
 	float texelPixels = (float)kDownsampleFactor;
 	uint32_t paddedWidth = 0;
 	uint32_t paddedHeight = 0;
