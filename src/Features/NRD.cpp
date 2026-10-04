@@ -445,12 +445,12 @@ bool NRD::DrawReblurSettings(REBLURSettings& s, bool showAdvanced, const char* t
 				ImGui::TextUnformatted("A short backup history that catches quick lighting changes. Lower = reacts faster but noisier; setting it equal to the slider above turns it off.");
 
 			v = (int)s.MaxStabilizedFrameNum;
-			if (ImGui::SliderInt("Max Stabilized Frames", &v, 0, (int)s.MaxAccumulatedFrameNum)) {
+			if (ImGui::SliderInt("Max Stabilized Frames", &v, 0, (int)nrd::REBLUR_MAX_HISTORY_FRAME_NUM)) {
 				s.MaxStabilizedFrameNum = (uint32_t)v;
 				changed = true;
 			}
 			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("Extra smoothing over time on the final result to reduce shimmer. Higher = steadier but laggier; 0 = off.");
+				ImGui::TextUnformatted("Extra smoothing over time on the final result to reduce shimmer. Higher = steadier but laggier; 0 = off. Values above Max Accumulated Frames work the same as Max Accumulated Frames.");
 		}
 
 		ImGui::SeparatorText("Spatial Filter");
