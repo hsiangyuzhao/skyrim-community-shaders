@@ -120,6 +120,18 @@ cbuffer PerTechnique : register(b0)
 	float phaseContribution = lerp(1, phaseFactor, PhaseContribution);
 
 	float shadowContribution = noShadow;
+
+#	if defined(TERRAIN_SHADOWS) || defined(CLOUD_SHADOWS)
+	// (batch 37b) Cloud + terrain occlusion, ported from upstream d22b87a87 (which hard-codes
+	// sqrt, i.e. power 0.5). Power 0 skips the branch, which is the 37a result exactly.
+	const float worldShadowPower = SharedData::volumetricLightingSettings.WorldShadowPower;
+	[branch] if (noShadow && worldShadowPower > 0.0)
+	{
+		const float worldShadow = ShadowSampling::GetWorldShadow(positionWS.xyz, PosAdjust[eyeIndex], eyeIndex);
+		shadowContribution *= pow(saturate(worldShadow), worldShadowPower);
+	}
+#	endif
+
 	float vl = shadowContribution * densityContribution * phaseContribution;
 
 	DensityRW[dispatchID.xyz] = vl;

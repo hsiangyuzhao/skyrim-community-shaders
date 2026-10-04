@@ -20,6 +20,7 @@
 #include "Features/TerrainShadows.h"
 #include "Features/TerrainVariation.h"
 #include "Features/VanillaFresnel.h"
+#include "Features/VolumetricLighting.h"
 #include "Features/WetnessEffects.h"
 
 #include "TruePBR.h"
@@ -63,7 +64,8 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::vanillaFresnel.settings,
 		globals::features::physicalSky.cbData,
 		globals::features::screenSpaceRayTracing.GetCommonBufferData(),
-		globals::features::exponentialHeightFog.settings);
+		globals::features::exponentialHeightFog.settings,
+		globals::features::volumetricLighting.GetCommonBufferData());
 }
 
 namespace
@@ -104,6 +106,7 @@ namespace
 		SettingsOf<decltype(globals::features::physicalSky.cbData)> physicalSky;
 		SettingsOf<decltype(globals::features::screenSpaceRayTracing.GetCommonBufferData())> screenSpaceRayTracing;
 		SettingsOf<decltype(globals::features::exponentialHeightFog.settings)> exponentialHeightFog;
+		SettingsOf<decltype(globals::features::volumetricLighting.GetCommonBufferData())> volumetricLighting;
 	};
 
 	static_assert(offsetof(FeatureDataLayoutMirror, vanillaFresnel) == 1008,
@@ -114,6 +117,8 @@ namespace
 		"SharedData::ssrtSettings moved; update the HLSL mirror and this offset together.");
 	static_assert(offsetof(FeatureDataLayoutMirror, exponentialHeightFog) == 1376,
 		"SharedData::exponentialHeightFogSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(sizeof(FeatureDataLayoutMirror) == 1440,
+	static_assert(offsetof(FeatureDataLayoutMirror, volumetricLighting) == 1440,
+		"(batch 37b) SharedData::volumetricLightingSettings moved; update the HLSL mirror and this offset together.");
+	static_assert(sizeof(FeatureDataLayoutMirror) == 1456,
 		"FeatureData's total size changed; check every offset above against fxc's reflection listing.");
 }

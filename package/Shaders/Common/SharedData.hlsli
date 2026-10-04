@@ -434,6 +434,15 @@ namespace SharedData
 		float3 pad;
 	};
 
+	// (batch 37b) Mirrors VolumetricLighting::CommonBufferData. Appended after every older
+	// block so nothing before it moves (FeatureBuffer.cpp pins the offset at 1440).
+	struct VolumetricLightingSettings
+	{
+		float WorldShadowPower;  // 0 = no cloud/terrain occlusion of light shafts (37a)
+		uint LinearizeColor;     // linearise the shaft colour when the dir light is not linear
+		float2 pad0;
+	};
+
 	cbuffer FeatureData : register(b6)
 	{
 		GrassLightingSettings grassLightingSettings;
@@ -457,6 +466,7 @@ namespace SharedData
 		PhysSkyData physSkyData;
 		SSRTSettings ssrtSettings;
 		ExponentialHeightFogSettings exponentialHeightFogSettings;
+		VolumetricLightingSettings volumetricLightingSettings;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);

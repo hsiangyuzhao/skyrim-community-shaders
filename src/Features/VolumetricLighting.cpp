@@ -1,8 +1,12 @@
 #include "VolumetricLighting.h"
 
+#include "CloudShadows.h"
 #include "InteriorSun.h"
+#include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "TerrainShadows.h"
+#include "Utils/Batch37b.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	VolumetricLighting::TextureSize,
@@ -17,7 +21,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ExteriorCustomSize,
 	InteriorEnabled,
 	InteriorQuality,
-	InteriorCustomSize);
+	InteriorCustomSize,
+	WorldShadowPower,
+	DensityOnlyGamma,
+	DensityGammaReference,
+	NightIntensity,
+	LinearizeColor);
 
 void VolumetricLighting::DrawSettings()
 {
@@ -32,6 +41,83 @@ void VolumetricLighting::DrawSettings()
 
 	if (settings.InteriorEnabled)
 		DrawVolumetricLightingSettings(settings.InteriorQuality, settings.InteriorCustomSize, true, inInterior);
+
+	DrawBatch37bSettings();
+}
+
+void VolumetricLighting::DrawBatch37bSettings()
+{
+	ImGui::SeparatorText("Batch 37b");
+	if (!Batch37b::IsOn())
+		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
+
+	ImGui::SliderFloat("Cloud & Terrain Occlusion", &settings.WorldShadowPower, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"How much clouds and distant mountains block the light shafts.\n"
+			"0 = not at all (old behaviour). 0.5 = half strength (upstream, default). 1 = full.\n"
+			"Capped by Cloud Shadows' Opacity: clouds can never block more than that.");
+}
+
+float VolumetricLighting::WorldShadowPowerActive() const
+{
+	return Batch37b::IsOn() ? std::clamp(settings.WorldShadowPower, 0.0f, 1.0f) : 0.0f;
+}
+
+bool VolumetricLighting::DensityOnlyGammaActive() const
+{
+	return false;
+}
+
+float VolumetricLighting::NightIntensityActive() const
+{
+	return 1.0f;
+}
+
+bool VolumetricLighting::LinearizeColorActive() const
+{
+	return false;
+}
+
+VolumetricLighting::CommonBufferData VolumetricLighting::GetCommonBufferData() const
+{
+	CommonBufferData data{};
+	data.WorldShadowPower = loaded ? WorldShadowPowerActive() : 0.0f;
+	data.LinearizeColor = loaded && LinearizeColorActive();
+	return data;
+}
+
+void VolumetricLighting::BindWorldShadowResources() const
+{
+	if (WorldShadowPowerActive() <= 0.0f)
+		return;
+
+	auto context = globals::d3d::context;
+	auto state = globals::state;
+
+	// The generate CS reads SharedData (b5) and FeatureData (b6). Renderer_ResetState binds both
+	// for CS, and CloudShadows/TerrainShadows::EarlyPrepass bind t25/t60; re-bind here so the
+	// occlusion never depends on nothing between EarlyPrepass and this dispatch touching them.
+	ID3D11Buffer* buffers[2] = { state->sharedDataCB->CB(), state->featureDataCB->CB() };
+	context->CSSetConstantBuffers(5, 2, buffers);
+
+	auto& cloudShadows = globals::features::cloudShadows;
+	if (cloudShadows.loaded && cloudShadows.texCubemapCloudOcc && globals::game::sky &&
+		globals::game::sky->mode.get() == RE::Sky::Mode::kFull && globals::game::sky->currentClimate) {
+		ID3D11ShaderResourceView* srv = cloudShadows.texCubemapCloudOcc->srv.get();
+		context->CSSetShaderResources(25, 1, &srv);
+	}
+
+	auto& terrainShadows = globals::features::terrainShadows;
+	if (terrainShadows.loaded && terrainShadows.settings.EnableTerrainShadow && terrainShadows.texShadowHeight) {
+		ID3D11ShaderResourceView* srv = terrainShadows.texShadowHeight->srv.get();
+		context->CSSetShaderResources(60, 1, &srv);
+	}
+}
+
+float VolumetricLighting::AdjustIntensity(float a_intensity, [[maybe_unused]] bool a_moonIsLightSource) const
+{
+	return a_intensity;
 }
 
 void VolumetricLighting::DrawVolumetricLightingSettings(int32_t& quality, TextureSize& customSize, const bool isInterior, const bool inLocationType)

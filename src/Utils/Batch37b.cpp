@@ -3,6 +3,7 @@
 #include <format>
 #include <imgui.h>
 
+#include "Features/VolumetricLighting.h"
 #include "Globals.h"
 #include "Menu.h"
 #include "Util.h"
@@ -14,9 +15,21 @@ namespace Batch37b
 		// ---- Row providers -------------------------------------------------------------
 		// One per 37b group. To add a group: write a provider and list it in kRowProviders.
 
+		void RowsVolumetricLighting(std::vector<Row>& rows)
+		{
+			const auto& vl = globals::features::volumetricLighting;
+			const auto& s = vl.settings;
+			const char* group = "A. Volumetric Lighting";
+			const char* where = "Lighting > Volumetric Lighting > Batch 37b";
+
+			rows.push_back({ group, "Cloud & terrain occlusion", vl.loaded, s.WorldShadowPower > 0.0f,
+				s.WorldShadowPower > 0.0f ? std::format("{:.2f}", s.WorldShadowPower) : std::string("0 (off)"),
+				std::format("{:.2f}", vl.WorldShadowPowerActive()), where });
+		}
+
 		// Extension point: groups registered here, in table order. C./D. go after B.
 		constexpr RowProvider kRowProviders[] = {
-			nullptr,  // placeholder: providers are added by each item's commit
+			RowsVolumetricLighting,
 		};
 	}
 

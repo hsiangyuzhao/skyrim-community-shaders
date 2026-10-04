@@ -887,6 +887,8 @@ namespace Hooks
 							techniqueId = 0;
 							if (CurrentlyDispatchedComputeShader->name == "ISVolumetricLightingGenerateCS"sv) {
 								isShader = vl.GetOrCreateGenerateCS(CurrentlyDispatchedComputeShader);
+								// (batch 37b) cloud/terrain occlusion inputs
+								vl.BindWorldShadowResources();
 								timeVolumetricLighting = true;
 							} else if (CurrentlyDispatchedComputeShader->name == "ISVolumetricLightingRaymarchCS"sv) {
 								isShader = vl.GetOrCreateRaymarchCS(CurrentlyDispatchedComputeShader);
