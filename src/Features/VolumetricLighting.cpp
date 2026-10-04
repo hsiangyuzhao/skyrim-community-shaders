@@ -72,6 +72,13 @@ void VolumetricLighting::DrawBatch37bSettings()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Weather shaft strength that looks exactly as before. 2 = vanilla clear day.");
 	}
+
+	ImGui::SliderFloat("Night Strength", &settings.NightIntensity, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Multiplies the light shafts while a moon is the light source.\n"
+			"1 = old behaviour. 0.5 = half (default). 0 = no moonlight shafts. Needs Sky Sync.\n"
+			"Does not change the moonlight itself.");
 }
 
 float VolumetricLighting::WorldShadowPowerActive() const
@@ -86,7 +93,7 @@ bool VolumetricLighting::DensityOnlyGammaActive() const
 
 float VolumetricLighting::NightIntensityActive() const
 {
-	return 1.0f;
+	return Batch37b::IsOn() ? std::clamp(settings.NightIntensity, 0.0f, 1.0f) : 1.0f;
 }
 
 bool VolumetricLighting::LinearizeColorActive() const
@@ -133,6 +140,11 @@ void VolumetricLighting::BindWorldShadowResources() const
 float VolumetricLighting::AdjustIntensity(float a_intensity, [[maybe_unused]] bool a_moonIsLightSource) const
 {
 	float intensity = a_intensity;
+
+	// A3. Night strength, on top of Sky Sync's moon visibility x phase factor. Applied before
+	// A2's remap, so with A2 on it scales the shafts linearly.
+	if (a_moonIsLightSource)
+		intensity *= NightIntensityActive();
 
 	// A2. With Linear Lighting the composite draws colour * pow(I * D, vlGamma): the weather
 	// intensity I is raised to vlGamma together with the density D, so a night VOLI of 3 against

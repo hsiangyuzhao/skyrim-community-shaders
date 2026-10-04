@@ -28,6 +28,8 @@ namespace Batch37b
 			rows.push_back({ group, "Gamma on density only", vl.loaded, s.DensityOnlyGamma,
 				s.DensityOnlyGamma ? std::format("On, ref {:.2f}", s.DensityGammaReference) : std::string("Off"),
 				"", where });
+			rows.push_back({ group, "Night strength", vl.loaded, s.NightIntensity != 1.0f,
+				std::format("{:.2f}", s.NightIntensity), std::format("{:.2f}", vl.NightIntensityActive()), where });
 		}
 
 		// Extension point: groups registered here, in table order. C./D. go after B.

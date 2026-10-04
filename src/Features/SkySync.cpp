@@ -357,6 +357,8 @@ void SkySync::ShadowFader::Update(const RE::Sun* sun, RE::NiPoint3 dirs[3], floa
 	if (colors.has_value())
 		color = { 0.f, 0.f, 0.f };
 
+	volumetricLightingIsMoon = current == Caster::Masser || current == Caster::Secunda;
+
 	if (current == Caster::None) {
 		fadePhase = Phase::None;
 		SetLighting(sun, { 0.0f, 0.0f, 1.0f }, 0.0f, color);
