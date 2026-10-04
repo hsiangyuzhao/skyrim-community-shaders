@@ -305,6 +305,14 @@ PS_OUTPUT main(PS_INPUT input)
 			float normDist = tanTheta * SharedData::physSkyData.sunDiskCos * rcp(sunDiskSin);
 			float3 limbFactor = PhysSky::LimbDarkenHestroffer(normDist);
 
+			// (batch 37b) TrLut edge fix: the LUT through Physical Sky's own clamp sampler (upstream
+			// fec65ed15 swapped samplers for the same reason) instead of the sun texture's sampler.
+			float3 sunTransmittance;
+			[branch] if (extFlags & SharedData::PhysSkyExtFlags::TrLutEdgeFix)
+				sunTransmittance = PhysSky::SampleTr(normalize(input.WorldPosition.xyz), PhysSky::SampTr);
+			else
+				sunTransmittance = PhysSky::SampleTr(normalize(input.WorldPosition.xyz), SampBaseSampler);
+
 			float3 dirLightColor;
 			[branch] if (extFlags & SharedData::PhysSkyExtFlags::SunPhysicalRadiance)
 			{
@@ -313,7 +321,7 @@ PS_OUTPUT main(PS_INPUT input)
 				// channel at a fixed 62250).
 				const float sunSolidAngle = Math::TAU * (1.0 - SharedData::physSkyData.sunDiskCos);
 				float3 radiance = SharedData::physSkyData.sunlightColor / max(sunSolidAngle, 1e-6);
-				radiance *= PhysSky::SampleTr(normalize(input.WorldPosition.xyz), SampBaseSampler);
+				radiance *= sunTransmittance;
 				const float peak = max(max(radiance.r, radiance.g), radiance.b);
 				radiance *= min(1.0, SharedData::physSkyExtData.SunRadianceCap / max(peak, 1e-6));
 				dirLightColor = radiance * limbFactor;
@@ -321,7 +329,7 @@ PS_OUTPUT main(PS_INPUT input)
 			else
 			{
 				dirLightColor = SharedData::physSkyData.sunlightColor * limbFactor;
-				dirLightColor *= PhysSky::SampleTr(normalize(input.WorldPosition.xyz), SampBaseSampler);
+				dirLightColor *= sunTransmittance;
 			}
 
 			[branch] if (extFlags & SharedData::PhysSkyExtFlags::SunSoftEdge)

@@ -145,6 +145,7 @@ struct PhysicalSky final : public Feature
 
 		// (batch 37b) Upstream correctness fixes, each ANDed with Batch37b::IsOn().
 		bool fixSkyAlpha = true;  // 5846ad833: sky dome written opaque
+		bool fixTrLutEdge = true;  // 9fbd052ad: transmittance LUT read on texel centres, clamp sampler
 
 		float adaptationStart = DirectX::XMConvertToRadians(-2);
 		float adaptationEnd = DirectX::XMConvertToRadians(-15);

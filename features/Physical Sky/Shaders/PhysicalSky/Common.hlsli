@@ -99,6 +99,10 @@ float2 TrLutUv(float r, float cosSunZenith)
 	float2 uv = float2(
 		saturate((cosSunZenith - cosHorZenith) / (1 - cosHorZenith)),
 		saturate((r - data.rPlanet) / (data.rAtmosphere - data.rPlanet)));
+	// (batch 37b) Upstream 9fbd052ad: keep the lookup on texel centres of the 256x64 LUT, so a
+	// wrapping sampler cannot blend in the opposite edge.
+	[branch] if (SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::TrLutEdgeFix)
+		uv = clamp(uv, float2(0.5 / 256.0, 0.5 / 64.0), float2(1.0 - 0.5 / 256.0, 1.0 - 0.5 / 64.0));
 	return uv;
 }
 

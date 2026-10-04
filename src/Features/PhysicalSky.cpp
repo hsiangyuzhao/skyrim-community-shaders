@@ -45,6 +45,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sunHideVanillaGlare,
 	sunDiskRadiusDeg,
 	fixSkyAlpha,
+	fixTrLutEdge,
 	adaptationStart,
 	adaptationEnd,
 	dayExposure,
@@ -602,6 +603,9 @@ void PhysicalSky::SettingsFixes()
 	ImGui::Checkbox("Opaque Sky", &settings.fixSkyAlpha);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Writes the physical sky fully opaque. Off: the vanilla sky dome's transparency near the\nhorizon lets what is behind it show through (possible seams or bands).");
+	ImGui::Checkbox("Transmittance Edge Fix", &settings.fixTrLutEdge);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Stops the sun-colour table from bleeding across its edge (odd colours at extreme angles,\npossibly a too-white sunset disk). Usually invisible.");
 }
 
 void PhysicalSky::SettingsClouds()
@@ -819,6 +823,8 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtHideSunGlare;
 	if (settings.fixSkyAlpha)
 		flags |= kExtSkyAlphaOpaque;
+	if (settings.fixTrLutEdge)
+		flags |= kExtTrLutEdgeFix;
 	extCbData.flags = flags;
 	extCbData.sunRadianceCap = std::clamp(settings.sunRadianceCap, 1.f, 62250.f);
 }
