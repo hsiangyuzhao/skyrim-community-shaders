@@ -196,7 +196,9 @@ void ScreenSpaceRayTracing::DrawSettings()
             ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "Sparse diffuse sampling is inactive: SHARC is enabled.");
         else
 #endif
-            if (settings.DiffuseSamplingMode != kSamplingFull && activeSamplingMode == kSamplingFull && settings.EnableDiffuse)
+            if (settings.DiffuseSamplingMode != kSamplingFull && (b36g.pattern == kB36gA || b36g.pattern == kB36gB))
+            ImGui::TextDisabled("Overridden by Batch 36g tracing pattern %s (Advanced > Batch 36g); this setting applies again when the pattern is Full or C.", b36g.pattern == kB36gA ? "A" : "B");
+        else if (settings.DiffuseSamplingMode != kSamplingFull && activeSamplingMode == kSamplingFull && settings.EnableDiffuse)
             ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "Sparse diffuse sampling failed to start, so Full is running. See the log.");
     }
 
