@@ -72,6 +72,24 @@ struct PostProcessFeature
 	};
 	virtual void Draw(TextureInfo& inout_tex) = 0;  // read from last pass, do the thing, and replace it with output texture
 
+	/// @brief (batch 37b, C-1) Where the effect's full-screen result would go: its own output
+	/// texture. PostProcessing compares it with the game's buffer to decide whether the effect
+	/// may write there directly. Null = this effect cannot write anywhere but its own texture.
+	virtual ID3D11Texture2D* GetOwnOutputTexture() const { return nullptr; }
+
+	/// @brief (batch 37b, C-1) Target PostProcessing hands the last effect of the chain when the
+	/// game's buffer matches that effect's own output texture exactly (format and size). The
+	/// effect then stores into this UAV instead of its own texture and hands back {tex, srv}: the
+	/// same shader writes the same values, only into the buffer they would have been copied to
+	/// anyway. Lives in PostProcessing (directOutput / directOutputFor), not here, so that no
+	/// effect's memory layout changes.
+	struct DirectOutput
+	{
+		ID3D11Texture2D* tex = nullptr;
+		ID3D11ShaderResourceView* srv = nullptr;
+		ID3D11UnorderedAccessView* uav = nullptr;
+	};
+
 	virtual inline void Reset(){};
 };
 

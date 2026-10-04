@@ -734,7 +734,11 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 
 	// Apply LUT
 	std::array<ID3D11ShaderResourceView*, 2> srvs = { inout_tex.srv, texLUT->srv.get() };
-	uav = texColor->uav.get();
+	// (batch 37b, C-1) Same shader and inputs; only the store target changes when PostProcessing
+	// handed us the game's buffer (same format and size as texColor, checked by the caller).
+	const auto directOutput = pp.directOutputFor == this ? pp.directOutput : DirectOutput{};
+	const bool direct = directOutput.uav != nullptr;
+	uav = direct ? directOutput.uav : texColor->uav.get();
 	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 	context->CSSetShaderResources(0, 2, srvs.data());
 	context->CSSetShader(colorgradingCS.get(), nullptr, 0);
@@ -755,7 +759,10 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 		OutputTextures();
 	}
 
-	inout_tex = { texColor->resource.get(), texColor->srv.get() };
+	if (direct)
+		inout_tex = { directOutput.tex, directOutput.srv };
+	else
+		inout_tex = { texColor->resource.get(), texColor->srv.get() };
 
 	state->EndPerfEvent();
 }

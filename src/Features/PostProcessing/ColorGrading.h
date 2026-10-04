@@ -143,5 +143,9 @@ struct ColorGrading : public PostProcessFeature
 
 	virtual void Draw(TextureInfo&) override;
 
+	/// (batch 37b, C-1) texColor, except on the frame "Output Textures" was pressed: that path
+	/// captures texColor afterwards, so it has to hold the result.
+	virtual ID3D11Texture2D* GetOwnOutputTexture() const override { return (texColor && !saveImagesFlag) ? texColor->resource.get() : nullptr; }
+
     void OutputTextures();
 };

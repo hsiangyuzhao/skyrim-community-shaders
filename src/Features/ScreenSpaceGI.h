@@ -63,6 +63,10 @@ public:
 	/// CompileComputeShaders and ShadersOK. It is also the flag the *shared* CONTACT_AO define was
 	/// built from, so it, not the setting, is what the dispatch and the upsample binding must test.
 	bool contactAoActive = false;
+	/// @brief (batch 37b, C-2) Whether the current compile round has the GI define (IL on).
+	bool compiledWithGI = false;
+	/// @brief (batch 37b, C-2) Whether the last SSGI frame skipped the IL-only passes.
+	bool ilPassesSkipped = false;
 	uint outputAoIdx = 0;
 	uint outputIlIdx = 0;
 	/// @brief (contact AO) Index of the specular GI buffer to hand to consumers.

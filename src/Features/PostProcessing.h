@@ -114,6 +114,16 @@ struct PostProcessing : Feature
 	bool bypass = false;
 	bool isrefraction = false;
 
+	/// (batch 37b, C-1) What the last PreProcess did with the final effect: true when it wrote
+	/// straight into the game's buffer (one write-back copy instead of two). For the Batch 37b tab.
+	bool directOutputUsed = false;
+	/// (batch 37b, C-1) Why the direct path was or was not taken on the last PreProcess.
+	const char* directOutputStatus = "Not run yet";
+	/// (batch 37b, C-1) Set only for the duration of the last effect's Draw: the game buffer it may
+	/// store into, and which effect it is meant for. See PostProcessFeature::DirectOutput.
+	PostProcessFeature::DirectOutput directOutput{};
+	const PostProcessFeature* directOutputFor = nullptr;
+
 	struct ImageSpaceManager
 	{
 		float timeOfDay[6] = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };  // 0: dawn, 1: sunrise, 2: day, 3: sunset, 4: dusk, 5: night

@@ -6,6 +6,7 @@
 #include "JiayeStatement.h"
 #include "State.h"
 #include "Util.h"
+#include "Utils/Batch37b.h"
 #include "Utils/GpuTimers.h"
 
 #include "Features/Upscaling.h"
@@ -70,6 +71,7 @@ void PostProcessing::DrawSettings()
 	ImGui::Checkbox("Disable Vanilla Tonemapping", (bool*)&settings.DisableVanillaTonemapping);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Skips Skyrim's own final image pass (tonemapping, vanilla bloom and colour grading), so only the effects below shape the look.");
+	Batch37b::DrawPostProcessCheckbox();
 
 	ImGui::Separator();
 
@@ -708,24 +710,144 @@ void PostProcessing::PreProcess()
 	// Second post-processing leg; accumulates into the same bucket as the pre-upscale leg.
 	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::PostProcessing);
 
-	// go through each fx
+	// The draw order is unchanged: every regular effect in pipeline order, then every
+	// after-colour-grading one. Collected first so the last effect of the chain is known.
+	auto drawsHere = [&](const std::unique_ptr<PostProcessFeature>& a_pipe, bool a_afterColorGrading) {
+		return a_pipe && a_pipe->enabled && a_pipe->DrawAfterColorGrading() == a_afterColorGrading && !(inMainLoadingMenu && a_pipe->DisableInMainLoadingMenu()) &&
+		       (!a_pipe->DrawBeforeUpscaling() || !upscaling.loaded);
+	};
+	std::vector<PostProcessFeature*> chain;
+	chain.reserve(pipeline.size());
 	for (auto& pipe : pipeline) {
-		if (pipe && pipe->enabled && !pipe->DrawAfterColorGrading() && !(inMainLoadingMenu && pipe->DisableInMainLoadingMenu()) && (!pipe->DrawBeforeUpscaling() || !upscaling.loaded)) {
-			EnsureResources(pipe.get());
-			pipe->Draw(lastTexColor);
-		}
+		if (drawsHere(pipe, false))
+			chain.push_back(pipe.get());
+	}
+	for (auto& pipe : pipeline) {
+		if (drawsHere(pipe, true))
+			chain.push_back(pipe.get());
 	}
 
-	for (auto& pipe : pipeline) {
-		if (pipe && pipe->enabled && pipe->DrawAfterColorGrading() && !(inMainLoadingMenu && pipe->DisableInMainLoadingMenu()) && (!pipe->DrawBeforeUpscaling() || !upscaling.loaded)) {
-			EnsureResources(pipe.get());
-			pipe->Draw(lastTexColor);
+	// (batch 37b, C-1) Direct output. The old write-back copied the last effect's texture into
+	// BOTH game buffers: two full-screen copies at output resolution every frame. When the last
+	// effect can store into the game buffer itself -- same format, same size as its own texture,
+	// so the same shader stores the same bits -- it does, and only the copy into the other buffer
+	// remains, restricted to the same rectangle the old full-texture copy covered.
+	directOutputUsed = false;
+	if (!Batch37b::PostProcessDirectOutputActive())
+		directOutputStatus = "Off";
+	else if (chain.empty())
+		directOutputStatus = "No effect running";
+	else
+		directOutputStatus = "Last effect cannot write into the game buffer";
+
+	D3D11_BOX directBox{};
+	for (size_t i = 0; i < chain.size(); ++i) {
+		PostProcessFeature* pipe = chain[i];
+		EnsureResources(pipe);
+
+		bool direct = false;
+		if (i + 1 == chain.size() && Batch37b::PostProcessDirectOutputActive()) {
+			ID3D11Texture2D* own = pipe->GetOwnOutputTexture();
+			if (own && gameTexMain.texture && gameTexMain.UAV && gameTexMainAlt.texture && own != gameTexMain.texture &&
+				lastTexColor.tex != gameTexMain.texture) {  // the effect must not read the buffer it writes
+				D3D11_TEXTURE2D_DESC ownDesc{}, mainDesc{}, altDesc{};
+				own->GetDesc(&ownDesc);
+				gameTexMain.texture->GetDesc(&mainDesc);
+				gameTexMainAlt.texture->GetDesc(&altDesc);
+				D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+				gameTexMain.UAV->GetDesc(&uavDesc);
+				// Exact size match, not just "fits": the dispatch is rounded up to 8x8 groups and the
+				// stores past the edge must fall outside the target exactly as they did on the
+				// effect's own texture. Alt must take a raw copy of the same format, and the old
+				// path's first branch (formats equal to texCopy) is the only one reproduced here.
+				const bool match = ownDesc.Format == mainDesc.Format && ownDesc.Format == altDesc.Format && ownDesc.Format == texCopy->desc.Format &&
+				                   uavDesc.Format == ownDesc.Format && uavDesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2D && uavDesc.Texture2D.MipSlice == 0 &&
+				                   ownDesc.Width == mainDesc.Width && ownDesc.Height == mainDesc.Height && ownDesc.Width <= altDesc.Width &&
+				                   ownDesc.Height <= altDesc.Height && mainDesc.SampleDesc.Count == 1 && altDesc.SampleDesc.Count == 1;
+				if (match) {
+					direct = true;
+					directBox = { 0, 0, 0, ownDesc.Width, ownDesc.Height, 1 };
+				} else {
+					directOutputStatus = "Game buffer differs from the effect's texture (format or size)";
+				}
+			} else if (own && !gameTexMain.UAV) {
+				directOutputStatus = "Game buffer has no UAV";
+			}
 		}
+
+		if (!direct) {
+			pipe->Draw(lastTexColor);
+			continue;
+		}
+
+		// Binding the game buffer as a compute UAV makes D3D11 unbind it from every shader-resource
+		// slot and render target it may already sit in for the pass that follows. Put those
+		// bindings back afterwards so the engine finds exactly the state it left.
+		constexpr UINT kSlots = 16;
+		ID3D11ShaderResourceView* psSrvs[kSlots]{};
+		ID3D11ShaderResourceView* vsSrvs[kSlots]{};
+		ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+		ID3D11DepthStencilView* dsv = nullptr;
+		context->PSGetShaderResources(0, kSlots, psSrvs);
+		context->VSGetShaderResources(0, kSlots, vsSrvs);
+		context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
+
+		directOutput = { gameTexMain.texture, gameTexMain.SRV, gameTexMain.UAV };
+		directOutputFor = pipe;
+		pipe->Draw(lastTexColor);
+		directOutput = {};
+		directOutputFor = nullptr;
+
+		ID3D11UnorderedAccessView* nullUav = nullptr;
+		context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+		{
+			// Only touch the output merger if the UAV binding actually knocked a target out:
+			// OMSetRenderTargets has side effects of its own (output-merger UAV slots).
+			ID3D11RenderTargetView* rtvsAfter[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+			ID3D11DepthStencilView* dsvAfter = nullptr;
+			context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvsAfter, &dsvAfter);
+			bool omChanged = dsvAfter != dsv;
+			UINT numViews = 0;
+			for (UINT r = 0; r < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++r) {
+				omChanged |= rtvsAfter[r] != rtvs[r];
+				if (rtvs[r])
+					numViews = r + 1;
+				if (rtvsAfter[r])
+					rtvsAfter[r]->Release();
+			}
+			if (dsvAfter)
+				dsvAfter->Release();
+			if (omChanged)
+				context->OMSetRenderTargets(numViews, rtvs, dsv);
+		}
+		context->VSSetShaderResources(0, kSlots, vsSrvs);
+		context->PSSetShaderResources(0, kSlots, psSrvs);
+		for (auto* p : psSrvs) {
+			if (p)
+				p->Release();
+		}
+		for (auto* p : vsSrvs) {
+			if (p)
+				p->Release();
+		}
+		for (auto* p : rtvs) {
+			if (p)
+				p->Release();
+		}
+		if (dsv)
+			dsv->Release();
+
+		directOutputUsed = lastTexColor.tex == gameTexMain.texture;
+		directOutputStatus = directOutputUsed ? "On: one write-back copy instead of two" : "Effect did not take the game buffer";
 	}
 
 	D3D11_TEXTURE2D_DESC desc;
 	lastTexColor.tex->GetDesc(&desc);
-	if (desc.Format == texCopy->desc.Format) {
+	if (directOutputUsed) {
+		// (batch 37b, C-1) The image is already in gameTexMain; the second buffer gets the same
+		// rectangle the old full-texture copy wrote, from the same bits.
+		context->CopySubresourceRegion(gameTexMainAlt.texture, 0, 0, 0, 0, gameTexMain.texture, 0, &directBox);
+	} else if (desc.Format == texCopy->desc.Format) {
 		// either MAIN_COPY or MAIN is used as input for HDR pass
 		// so we copy to both so whatever the game wants we're not failing it
 		//
