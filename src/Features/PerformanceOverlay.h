@@ -320,6 +320,8 @@ struct PerformanceOverlay : OverlayFeature
 	void DrawViewOptions();
 	/// @brief (batch 36e) Per-dispatch timing of the SSRT denoiser chain (Util::DenoiserTimers).
 	void DrawDenoiserTable(const PerfView::ViewConfig& a_cfg);
+	/// @brief (batch 37a) Sun cascade setup (count, distances, texel size), character and lamp shadow maps.
+	void DrawShadowInfo();
 	/// @brief A collapsible section whose open state lives in the settings (so it is saved).
 	static bool Section(const char* a_label, bool& a_open, const char* a_tooltip = nullptr);
 	/// @brief Freeze / unfreeze every number on the overlay. Freezing also writes a snapshot to the log.
@@ -327,6 +329,14 @@ struct PerformanceOverlay : OverlayFeature
 	bool IsFrozen() const { return view.frozen; }
 	/// @brief Writes every table, as currently displayed, to CommunityShaders.log.
 	void WriteSnapshotToLog(const PerfView::ViewConfig& a_cfg);
+	/// @brief (batch 37a) Everything the overlay shows for this (or the frozen) frame, as one JSON document.
+	nlohmann::json BuildFrameJson(const PerfView::ViewConfig& a_cfg);
+	/// @brief (batch 37a) Writes BuildFrameJson to SKSE/CommunityShaders/Perf/perf-<time>.json; sets the panel message.
+	void SaveFrameJson(const PerfView::ViewConfig& a_cfg);
+	/// @brief (batch 37a) Moves the Freeze key off a key another Community Shaders hotkey already owns.
+	void ResolveFreezeKeyConflict();
+	/// @brief (batch 37a) Shows a short message at the top of the overlay for a few seconds.
+	void FlashMessage(std::string a_text, bool a_error = false);
 	/// @brief One line of smoothed denoiser timings, for the periodic log option.
 	std::string FormatDenoiserLogLine(const PerfView::ViewConfig& a_cfg) const;
 	/// @brief Rows of a DrawCallRow table, in display order, with the display values filled in.
@@ -526,6 +536,8 @@ struct PerformanceOverlay : OverlayFeature
 		bool SectionGrass = false;
 		bool SectionVram = true;
 		bool SectionView = false;
+		bool SectionOcclusion = false;  // (batch 37a) "Occlusion (dry run)"
+		bool SectionShadows = false;    // (batch 37a) "Shadow maps"
 	};
 	Settings settings;
 
@@ -545,6 +557,11 @@ struct PerformanceOverlay : OverlayFeature
 
 		bool frozen = false;
 		bool pendingSnapshot = false;
+		bool pendingJsonSave = false;  // (batch 37a) written after the tables, like the log snapshot
+		std::string message;           // (batch 37a) "Saved perf-....json" and similar
+		bool messageIsError = false;
+		double messageUntil = 0.0;
+		std::string lastSavedFile;
 		double frozenAt = 0.0;
 		double lastDenoiserLog = 0.0;
 		// Copies taken at the moment of freezing, so the FPS block and graphs freeze too.

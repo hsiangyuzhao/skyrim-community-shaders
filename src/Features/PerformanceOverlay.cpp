@@ -26,6 +26,7 @@
 #include "Features/Upscaling.h"
 #include "Globals.h"
 #include "Menu.h"
+#include "ShaderCache.h"
 #include "State.h"
 #include "Utils/FileSystem.h"
 #include "Utils/Format.h"
@@ -33,11 +34,14 @@
 #include "Utils/Game.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/OcclusionDryRun.h"
 #include "Utils/UI.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -49,6 +53,7 @@
 #include <map>
 #include <numeric>
 #include <string_view>
+#include <unordered_set>
 
 // --- Constants ---
 constexpr float kDefaultFPS = 60.0f;
@@ -182,7 +187,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SectionDenoiser,
 	SectionGrass,
 	SectionVram,
-	SectionView)
+	SectionView,
+	SectionOcclusion,
+	SectionShadows)
 
 static const std::unordered_map<RE::BSShader::Type, std::string> kShaderTypeTooltips = {
 	{ RE::BSShader::Type::Grass, "Draw calls using the Grass shader. Typically many, but each is usually cheap.\nWith Grass Optimizations on, each grass type is drawn in one call, so this count is much lower; its section below the GPU tables shows the real grass counts." },
@@ -308,6 +315,8 @@ void PerformanceOverlay::SaveSettings(json& j)
 {
 	// Persist all overlay settings to JSON
 	j = this->settings;  // uses NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT
+	// (batch 37a) The occlusion dry run's knobs live with the overlay that shows its numbers.
+	Util::OcclusionDryRun::Save(j["OcclusionDryRun"]);
 }
 
 void PerformanceOverlay::LoadSettings(json& j)
@@ -325,6 +334,8 @@ void PerformanceOverlay::LoadSettings(json& j)
 	this->settings.SmoothingWindow = std::clamp(this->settings.SmoothingWindow, 0.1f, 5.0f);
 	this->settings.TopN = std::clamp(this->settings.TopN, 0, 64);
 	this->settings.DenoiserLogInterval = std::clamp(this->settings.DenoiserLogInterval, 0, 600);
+	if (j.is_object() && j.contains("OcclusionDryRun"))
+		Util::OcclusionDryRun::Load(j["OcclusionDryRun"]);
 	// Ensure history buffers match loaded size
 	this->state.frameTimeHistory.Resize(this->settings.FrameHistorySize);
 	this->state.postFGFrameTimeHistory.Resize(this->settings.FrameHistorySize);
@@ -373,6 +384,8 @@ void PerformanceOverlay::PostPostLoad()
 	// Hooks that only bracket engine calls with a timeline scope; they cost one branch per
 	// call while the overlay table is closed.
 	Util::GpuPhaseTimeline::InstallHooks();
+	// (batch 37a) Occlusion culling phase 0: counts only, never culls. SE 1.5.97 flat only.
+	Util::OcclusionDryRun::Install();
 }
 
 void PerformanceOverlay::DrawOverlay()
@@ -534,6 +547,13 @@ void PerformanceOverlay::DrawOverlay()
 			DrawGpuPassTable(rowSets.gpuRows);
 		if (Section("Engine passes (GPU)", this->settings.SectionEngine))
 			DrawEngineGpuTable();
+		if (Section("Shadow maps", this->settings.SectionShadows,
+				"How the sun shadow is set up this frame: cascade count and distances, character and lamp shadow maps. "
+				"Their cost is in the Shadows rows of \"Engine passes\"."))
+			DrawShadowInfo();
+		if (Section("Occlusion (dry run)", this->settings.SectionOcclusion,
+				"How many objects an occlusion cull could skip here. Counting only: nothing is ever hidden."))
+			Util::OcclusionDryRun::DrawPanel(menu->IsEnabled);
 		if (Section("Denoiser breakdown", this->settings.SectionDenoiser,
 				"Every pass of the SSRT denoiser chain, timed on its own. Only measured while this section is open."))
 			DrawDenoiserTable(viewCfg);
@@ -551,6 +571,11 @@ void PerformanceOverlay::DrawOverlay()
 	if (view.pendingSnapshot) {
 		view.pendingSnapshot = false;
 		WriteSnapshotToLog(viewCfg);
+	}
+	// (batch 37a) "Save frame (JSON)" and the Freeze key: same moment, same values.
+	if (view.pendingJsonSave) {
+		view.pendingJsonSave = false;
+		SaveFrameJson(viewCfg);
 	}
 
 	ImGui::PopStyleVar();             // ItemSpacing
@@ -1793,39 +1818,72 @@ namespace
 	{
 		using P = Util::GpuPhase;
 		switch (a_phase) {
-		case P::Untracked: return "untracked";
-		case P::ShadowGodRay1: return "shadow_godray_c1";
-		case P::ShadowGodRay2: return "shadow_godray_c2";
-		case P::ShadowGodRay3: return "shadow_godray_c3";
-		case P::ShadowSun1: return "shadow_sun_c1";
-		case P::ShadowSun2: return "shadow_sun_c2";
-		case P::ShadowSun3: return "shadow_sun_c3";
-		case P::ShadowFocus: return "shadow_focus";
-		case P::ShadowLocalLights: return "shadow_local";
-		case P::ShadowMask: return "shadow_mask";
-		case P::ShadowOther: return "shadow_other";
-		case P::WaterPrep: return "water_prep";
-		case P::DepthPrepass: return "depth_prepass";
-		case P::OpaqueTerrain: return "opaque_terrain";
-		case P::OpaqueObjects: return "opaque_objects";
-		case P::OpaqueCharacters: return "opaque_characters";
-		case P::OpaqueTrees: return "opaque_trees";
-		case P::OpaqueGrass: return "opaque_grass";
-		case P::OpaqueDistant: return "opaque_distant";
-		case P::OpaqueOther: return "opaque_other";
-		case P::Sky: return "sky";
-		case P::Water: return "water";
-		case P::Transparent: return "transparent";
-		case P::WorldOther: return "world_other";
-		case P::FirstPerson: return "first_person";
-		case P::Reflections: return "reflections";
-		case P::Imagespace: return "imagespace";
-		case P::UI: return "ui";
-		case P::CsPasses: return "cs_timed_passes";
-		case P::CsOther: return "cs_other";
-		case P::CsUpscaling: return "cs_upscaling";
-		case P::CsOverlay: return "cs_overlay";
-		default: return "unknown";
+		case P::Untracked:
+			return "untracked";
+		case P::ShadowGodRay1:
+			return "shadow_godray_c1";
+		case P::ShadowGodRay2:
+			return "shadow_godray_c2";
+		case P::ShadowGodRay3:
+			return "shadow_godray_c3";
+		case P::ShadowSun1:
+			return "shadow_sun_c1";
+		case P::ShadowSun2:
+			return "shadow_sun_c2";
+		case P::ShadowSun3:
+			return "shadow_sun_c3";
+		case P::ShadowFocus:
+			return "shadow_focus";
+		case P::ShadowLocalLights:
+			return "shadow_local";
+		case P::ShadowMask:
+			return "shadow_mask";
+		case P::ShadowOther:
+			return "shadow_other";
+		case P::WaterPrep:
+			return "water_prep";
+		case P::DepthPrepass:
+			return "depth_prepass";
+		case P::OpaqueTerrain:
+			return "opaque_terrain";
+		case P::OpaqueObjects:
+			return "opaque_objects";
+		case P::OpaqueCharacters:
+			return "opaque_characters";
+		case P::OpaqueTrees:
+			return "opaque_trees";
+		case P::OpaqueGrass:
+			return "opaque_grass";
+		case P::OpaqueDistant:
+			return "opaque_distant";
+		case P::OpaqueOther:
+			return "opaque_other";
+		case P::Sky:
+			return "sky";
+		case P::Water:
+			return "water";
+		case P::Transparent:
+			return "transparent";
+		case P::WorldOther:
+			return "world_other";
+		case P::FirstPerson:
+			return "first_person";
+		case P::Reflections:
+			return "reflections";
+		case P::Imagespace:
+			return "imagespace";
+		case P::UI:
+			return "ui";
+		case P::CsPasses:
+			return "cs_timed_passes";
+		case P::CsOther:
+			return "cs_other";
+		case P::CsUpscaling:
+			return "cs_upscaling";
+		case P::CsOverlay:
+			return "cs_overlay";
+		default:
+			return "unknown";
 		}
 	}
 
@@ -2875,6 +2933,8 @@ void PerformanceOverlay::AdvanceFrameClock()
 	// the whole hidden period, which then sat inside the Avg / 1% Low window.
 	if (!loaded)
 		return;
+	// (batch 37a) Every Present, so the Freeze key is usable even while the overlay is hidden.
+	ResolveFreezeKeyConflict();
 	UpdateGraphValues();
 }
 
@@ -3083,6 +3143,9 @@ namespace
 		return static_cast<int>(std::hash<std::string_view>{}(a_key) & 0x3FFFFFFF);
 	}
 
+	// (batch 37a) How long a panel message ("Saved ...") stays up.
+	constexpr double kMessageSeconds = 8.0;
+
 	double NowSeconds()
 	{
 		LARGE_INTEGER freq, counter;
@@ -3155,6 +3218,7 @@ void PerformanceOverlay::ToggleFreeze()
 		view.frozenState = state;
 		view.frozenStats = ComputeFrameStats();
 		view.pendingSnapshot = true;  // written on the next overlay frame, once tables are drawn
+		view.pendingJsonSave = true;  // (batch 37a) and the same frame as a JSON file
 	} else {
 		view.frozen = false;
 		view.frozenState.reset();
@@ -3422,6 +3486,29 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 	const auto& theme = menu->GetTheme();
 	const auto value = [this, &a_cfg](int a_id, float& o_value) { return view.summary.DisplayValue(a_id, a_cfg, o_value); };
 
+	// (batch 37a) Top of the panel: save this frame as JSON (clickable while the CS menu is
+	// open, the overlay ignores the mouse otherwise), the hotkey that does the same, and the
+	// result of the last save.
+	if (menu->IsEnabled) {
+		if (ImGui::SmallButton("Save frame (JSON)"))
+			view.pendingJsonSave = true;
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted(
+					"Saves everything this overlay shows for the current frame (or the frozen one) to\n"
+					"Documents/My Games/Skyrim Special Edition/SKSE/CommunityShaders/Perf/perf-<time>.json");
+		}
+		ImGui::SameLine(0.0f, 12.0f);
+	}
+	ImGui::TextDisabled("%s: freeze + save", Util::Input::KeyIdToString(settings.FreezeKey));
+	if (!view.message.empty() && NowSeconds() < view.messageUntil) {
+		// Blinks for the first second so it is noticed, then stays steady.
+		const double age = view.messageUntil - NowSeconds();
+		const bool blinkOff = age > kMessageSeconds - 1.0 && std::fmod(age * 4.0, 1.0) < 0.35;
+		const ImVec4 color = view.messageIsError ? theme.StatusPalette.Error : theme.StatusPalette.SuccessColor;
+		ImGui::TextColored(blinkOff ? ImVec4(color.x, color.y, color.z, 0.35f) : color, "%s", view.message.c_str());
+	}
+
 	float frameMs = 0.0f;
 	if (value(kSummaryFrame, frameMs) && frameMs > 0.0f)
 		ImGui::Text("%s %.1f (%.2f ms)", state.isFrameGenerationActive ? "Raw FPS" : "FPS", 1000.0f / frameMs, frameMs);
@@ -3443,7 +3530,9 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 		ImGui::TextColored(theme.StatusPalette.Warning, "FROZEN");
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("All numbers are held. Press %s again (or the Unfreeze button) to resume. A snapshot was written to CommunityShaders.log.",
+				ImGui::Text(
+					"All numbers are held. Press %s again (or the Unfreeze button) to resume. "
+					"A snapshot was written to CommunityShaders.log and a JSON file to SKSE/CommunityShaders/Perf.",
 					Util::Input::KeyIdToString(settings.FreezeKey));
 		}
 	}
@@ -3476,7 +3565,9 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 			ToggleFreeze();
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Holds every number so it can be read or screenshotted, and writes them all to CommunityShaders.log. Hotkey: %s.",
+				ImGui::Text(
+					"Holds every number so it can be read or screenshotted, writes them all to CommunityShaders.log "
+					"and saves the frame as JSON. Hotkey: %s.",
 					Util::Input::KeyIdToString(settings.FreezeKey));
 		}
 		ImGui::SameLine();
@@ -3815,6 +3906,7 @@ void PerformanceOverlay::WriteSnapshotToLog(const PerfView::ViewConfig& a_cfg)
 	logTable("GPU passes", view.gpuPasses, cfg);
 	logTable("GPU passes", view.gpuFooter, fixedCfg);
 	logTable("Engine passes (GPU)", view.engine, fixedCfg);
+	logTable("Engine passes (CPU)", view.engineCpu, fixedCfg);
 
 	const auto logDenoiser = [&](const PerfView::StableTable<DenoiserRow>& a_table, const PerfView::ViewConfig& a_order) {
 		for (int id : a_table.DisplayOrder(a_order)) {
@@ -3838,4 +3930,433 @@ void PerformanceOverlay::WriteSnapshotToLog(const PerfView::ViewConfig& a_cfg)
 	logDenoiser(view.denoiserFooter, fixedCfg);
 
 	logger::info("[PerfSnapshot] ===== end =====");
+}
+
+// ============================================================================
+// (batch 37a) SHADOW INFO, FRAME JSON, FREEZE KEY
+// ============================================================================
+
+namespace
+{
+	const char* CascadeName(uint32_t a_count, uint32_t a_index)
+	{
+		if (a_count == 1)
+			return "single";
+		if (a_count == 2)
+			return a_index == 0 ? "near" : (a_index == 1 ? "far" : "unused");
+		if (a_count == 3)
+			return a_index == 0 ? "near" : (a_index == 1 ? "middle" : "far");
+		return "?";
+	}
+
+	const char* QualityModeName(uint a_mode)
+	{
+		switch (a_mode) {
+		case 0:
+			return "Native AA (DLAA)";
+		case 1:
+			return "Quality";
+		case 2:
+			return "Balanced";
+		case 3:
+			return "Performance";
+		case 4:
+			return "Ultra Performance";
+		default:
+			return "?";
+		}
+	}
+
+	/// The menu's own hotkeys, which win over the Freeze key when they are the same key.
+	std::vector<uint32_t> OtherHotkeys()
+	{
+		std::vector<uint32_t> keys;
+		if (auto* menu = Menu::GetSingleton()) {
+			auto& s = menu->GetSettings();
+			keys = { s.ToggleKey, s.SkipCompilationKey, s.EffectToggleKey, s.OverlayToggleKey, s.ShaderBlockPrevKey, s.ShaderBlockNextKey };
+		}
+		return keys;
+	}
+}
+
+void PerformanceOverlay::FlashMessage(std::string a_text, bool a_error)
+{
+	view.message = std::move(a_text);
+	view.messageIsError = a_error;
+	view.messageUntil = NowSeconds() + kMessageSeconds;
+}
+
+void PerformanceOverlay::ResolveFreezeKeyConflict()
+{
+	// Menu::ProcessInputEventQueue runs the FIRST action bound to a released key and stops, and
+	// the CS menu's own keys come first. A Freeze key equal to one of them (the 36g report: the
+	// menu was on F11, the default Freeze key) therefore never froze anything and never wrote a
+	// snapshot; F11 only opened and closed the menu. Move it to a free key and say so.
+	if (capturingFreezeKey || settings.FreezeKey == 0)
+		return;
+	const auto taken = OtherHotkeys();
+	if (std::find(taken.begin(), taken.end(), settings.FreezeKey) == taken.end())
+		return;
+	const uint32_t old = settings.FreezeKey;
+	for (uint32_t candidate : { (uint32_t)VK_F12, (uint32_t)VK_F8, (uint32_t)VK_F7, (uint32_t)VK_F6, (uint32_t)VK_PAUSE }) {
+		if (std::find(taken.begin(), taken.end(), candidate) == taken.end()) {
+			settings.FreezeKey = candidate;
+			break;
+		}
+	}
+	const std::string oldName = Util::Input::KeyIdToString(old);
+	const std::string newName = Util::Input::KeyIdToString(settings.FreezeKey);
+	logger::warn("[PerformanceOverlay] Freeze key {} is also a Community Shaders menu hotkey, which takes it first; Freeze moved to {}",
+		oldName, newName);
+	FlashMessage(std::format("Freeze key {} is your CS menu key - Freeze + save is now {}", oldName, newName), true);
+	view.messageUntil = NowSeconds() + 30.0;
+}
+
+void PerformanceOverlay::DrawShadowInfo()
+{
+	const auto& report = Util::GpuPhaseTimeline::GetSingleton()->Get();
+	const auto& s = report.shadow;
+	if (!report.hasCpuSample) {
+		ImGui::TextDisabled("Open \"Engine passes (GPU)\" once to start measuring.");
+		return;
+	}
+	if (!s.valid) {
+		ImGui::TextDisabled("No sun shadow this frame.");
+		ImGui::Text("Lamp & torch shadow maps: %u", s.localShadowMaps);
+		return;
+	}
+	ImGui::Text("Sun cascades: %u   Character shadow maps: %u%s   Lamp & torch shadow maps: %u", s.sunCascades, s.focusShadows,
+		s.drawFocusShadows ? "" : " (off)", s.localShadowMaps);
+	for (uint32_t i = 0; i < std::min(s.sunCascades, 3u); ++i) {
+		ImGui::Text("  %s: %.0f - %.0f units, %.1f units per shadow texel", CascadeName(s.sunCascades, i), s.startSplit[i], s.endSplit[i],
+			s.unitsPerTexel[i]);
+	}
+	ImGui::TextDisabled("God-ray maps %s | per-map timing %s", s.godRayPass ? "drawn" : "not drawn",
+		s.sliceHooks ? "exact (SE 1.5.97 hooks)" : "by draw target");
+	if (ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"God-ray maps: the game draws a second, lighter copy of each sun cascade for god rays (volumetric light).\n"
+				"Per-map timing: on SE 1.5.97 the clear and all draws of each shadow map are timed as one block; otherwise each draw is "
+				"assigned by the shadow map it goes into.");
+	}
+}
+
+nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_cfg)
+{
+	using nlohmann::json;
+	PerfView::ViewConfig cfg = a_cfg;
+	cfg.topN = 0;
+	PerfView::ViewConfig fixedCfg = cfg;
+	fixedCfg.sort = PerfView::SortMode::Fixed;
+
+	json j;
+	j["schema"] = "cs-perf-frame";
+	j["schema_version"] = 1;
+
+	// ---- meta ----
+	{
+		json& m = j["meta"];
+		const auto now = std::chrono::system_clock::now();
+		const std::time_t t = std::chrono::system_clock::to_time_t(now);
+		std::tm local{};
+		localtime_s(&local, &t);
+		char buf[64];
+		std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &local);
+		m["time_local"] = buf;
+		m["time_unix"] = static_cast<int64_t>(t);
+		m["plugin_version"] = Util::GetFormattedVersion(Plugin::VERSION);
+		m["build"] = "batch37a";
+		m["game_version"] = Util::GetFormattedVersion(REL::Module::get().version());
+		m["frozen"] = view.frozen;
+		m["values"] = cfg.showLive ? "live" : (cfg.smooth == PerfView::SmoothMode::Off ? "unsmoothed" : "smoothed");
+		m["smoothing"] = { { "mode", kSmoothModeNames[static_cast<int>(cfg.smooth)] }, { "window_s", cfg.windowSeconds } };
+
+		json loc = json::object();
+		if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+			const auto pos = player->GetPosition();
+			loc["position"] = { pos.x, pos.y, pos.z };
+			if (auto* cell = player->GetParentCell()) {
+				const char* name = cell->GetName();
+				const char* edid = cell->GetFormEditorID();
+				loc["cell_name"] = name ? name : "";
+				loc["cell_editor_id"] = edid ? edid : "";
+				loc["cell_form_id"] = std::format("{:08X}", cell->GetFormID());
+				loc["interior"] = cell->IsInteriorCell();
+			}
+			if (auto* ws = player->GetWorldspace()) {
+				const char* name = ws->GetName();
+				const char* edid = ws->GetFormEditorID();
+				loc["worldspace_name"] = name ? name : "";
+				loc["worldspace_editor_id"] = edid ? edid : "";
+				loc["worldspace_form_id"] = std::format("{:08X}", ws->GetFormID());
+			}
+		}
+		m["location"] = std::move(loc);
+
+		m["resolution"] = { { "render", { view.renderWidth, view.renderHeight } }, { "output", { view.outputWidth, view.outputHeight } } };
+		auto& up = globals::features::upscaling;
+		m["upscaling"] = {
+			{ "loaded", up.loaded },
+			{ "method", std::string(magic_enum::enum_name(up.GetUpscaleMethod())) },
+			{ "quality_mode", up.settings.qualityMode },
+			{ "quality", QualityModeName(up.settings.qualityMode) },
+			{ "scale", { up.resolutionScale.x, up.resolutionScale.y } },
+			{ "dlss_preset", up.settings.DLSSPreset },
+			{ "reflex_mode", up.settings.reflexMode },
+		};
+		const State& st = (view.frozen && view.frozenState) ? *view.frozenState : state;
+		m["frame_generation"] = {
+			{ "active", st.isFrameGenerationActive },
+			{ "dlssg", st.frameGenerationIsDLSSG },
+			{ "multiplier_applied", st.appliedFGMultiplier },
+			{ "multiplier_used_for_post_fg", st.postFGMultiplier },
+			{ "multiplier_measured", st.postFGIsMeasured },
+			{ "multiplier_rejected", st.rejectedFGMultiplier },
+		};
+		m["effects_enabled"] = globals::shaderCache ? globals::shaderCache->IsEnabled() : false;
+
+		// Every feature's load state, and the full settings of the ones whose numbers this
+		// overlay is usually read for. Their SaveSettings only copies the settings struct.
+		json features = json::object();
+		static const std::unordered_set<std::string> kSettingsDumped = { "ScreenSpaceRayTracing", "NRD", "VariableRateShading", "GrassOptimizations",
+			"ScreenSpaceGI", "Skylighting", "ScreenSpaceShadows", "TerrainShadows", "VolumetricLighting" };
+		json featureSettings = json::object();
+		for (auto* feature : Feature::GetFeatureList()) {
+			if (!feature)
+				continue;
+			const std::string name = feature->GetShortName();
+			features[name] = { { "loaded", feature->loaded }, { "version", feature->version } };
+			if (feature->loaded && kSettingsDumped.contains(name)) {
+				json fs;
+				feature->SaveSettings(fs);
+				featureSettings[name] = std::move(fs);
+			}
+		}
+		m["features"] = std::move(features);
+		m["feature_settings"] = std::move(featureSettings);
+	}
+
+	// ---- summary ----
+	{
+		const auto summary = [this, &cfg](int a_id) -> json {
+			float v = 0.0f;
+			return view.summary.DisplayValue(a_id, cfg, v) ? json(v) : json(nullptr);
+		};
+		float frameMs = 0.0f, cpuFrame = 0.0f, wait = 0.0f, postFg = 0.0f;
+		view.summary.DisplayValue(kSummaryFrame, cfg, frameMs);
+		view.summary.DisplayValue(kSummaryCpuFrame, cfg, cpuFrame);
+		view.summary.DisplayValue(kSummaryPresentWait, cfg, wait);
+		const bool hasPostFg = view.summary.DisplayValue(kSummaryPostFgFrame, cfg, postFg);
+		const auto verdict = BottleneckVerdict(Menu::GetSingleton()->GetTheme(), cpuFrame, wait);
+		const FrameStats stats = view.frozen ? view.frozenStats : ComputeFrameStats();
+		j["summary"] = {
+			{ "fps", frameMs > 0.0f ? 1000.0f / frameMs : 0.0f },
+			{ "frame_ms", summary(kSummaryFrame) },
+			{ "post_fg_fps", hasPostFg && postFg > 0.0f ? json(1000.0f / postFg) : json(nullptr) },
+			{ "cpu_frame_ms", summary(kSummaryCpuFrame) },
+			{ "present_wait_ms", summary(kSummaryPresentWait) },
+			{ "gpu_ours_ms", summary(kSummaryGpuOurs) },
+			{ "gpu_untracked_ms", summary(kSummaryGpuUntracked) },
+			{ "gpu_gap_ms", summary(kSummaryGpuGap) },
+			{ "bottleneck", verdict.first },
+			{ "stats_10s", { { "valid", stats.valid }, { "frames", stats.frames }, { "avg_ms", stats.averageMs }, { "low_1pct_ms", stats.percentile99Ms } } },
+		};
+	}
+
+	// ---- tables ----
+	{
+		const auto rowsOf = [&](const PerfView::StableTable<DrawCallRow>& a_table, const PerfView::ViewConfig& a_order, const char* a_countName) {
+			json rows = json::array();
+			for (int id : a_table.DisplayOrder(a_order)) {
+				const DrawCallRow* row = a_table.GetRow(id);
+				if (!row)
+					continue;
+				float v = 0.0f;
+				const bool has = a_table.DisplayValue(id, cfg, v);
+				const auto values = a_table.GetValues(id);
+				json r = {
+					{ "id", id },
+					{ "label", row->label },
+					{ "ms", has ? json(v) : json(nullptr) },
+					{ "smoothed_ms", values.smoothed },
+					{ "live_ms", values.live },
+					{ "peak_ms", values.peak },
+					{ "has_data", values.hasData },
+				};
+				if (row->drawCalls >= 0) {
+					r[a_countName] = row->drawCalls;
+					if (row->drawCalls > 0 && has)
+						r["ms_per_count"] = v / static_cast<float>(row->drawCalls);
+				}
+				rows.push_back(std::move(r));
+			}
+			return rows;
+		};
+		json& t = j["tables"];
+		t["shader_types_cpu"] = rowsOf(view.shaderTypes, cfg, "draws");
+		t["shader_types_cpu_footer"] = rowsOf(view.shaderFooter, fixedCfg, "draws");
+		t["cs_cpu_submit"] = rowsOf(view.csCpu, cfg, "calls");
+		t["gpu_passes"] = rowsOf(view.gpuPasses, cfg, "intervals");
+		t["gpu_passes_footer"] = rowsOf(view.gpuFooter, fixedCfg, "intervals");
+
+		// Engine passes: every row of the layout, always, in layout order (a stable shape).
+		const auto& report = Util::GpuPhaseTimeline::GetSingleton()->Get();
+		const auto shown = [&](const PerfView::StableTable<DrawCallRow>& a_table, int a_id) -> json {
+			float v = 0.0f;
+			return a_table.DisplayValue(a_id, cfg, v) ? json(v) : json(nullptr);
+		};
+		json engine = json::array();
+		const auto& layout = EnginePhaseLayout();
+		for (size_t g = 0; g < layout.size(); ++g) {
+			for (const auto& row : layout[g].rows) {
+				const size_t p = static_cast<size_t>(row.phase);
+				const int id = static_cast<int>(row.phase);
+				engine.push_back({
+					{ "key", EnginePhaseKey(row.phase) },
+					{ "group", layout[g].label ? layout[g].label : "" },
+					{ "label", EngineRowLabel(row, report.shadow) },
+					{ "gpu_ms", shown(view.engine, id) },
+					{ "gpu_ms_peak", view.engine.GetValues(id).peak },
+					{ "gpu_ms_last_frame", report.lastMs[p] },
+					{ "cpu_ms", shown(view.engineCpu, id) },
+					{ "cpu_ms_last_frame", report.lastCpuMs[p] },
+					{ "draws", report.draws[p] },
+					{ "draws_last_frame", report.lastDraws[p] },
+				});
+			}
+		}
+		t["engine_passes"] = std::move(engine);
+		t["engine_total"] = {
+			{ "gpu_ms", shown(view.engine, kEngineTotalRowId) },
+			{ "cpu_ms", shown(view.engineCpu, kEngineTotalRowId) },
+			{ "timestamps_per_frame", report.timestampsPerFrame },
+			{ "dropped_frames", report.droppedFrames },
+			{ "measuring", report.hasSample },
+		};
+	}
+
+	// ---- denoiser ----
+	{
+		json d = json::object();
+		d["measured"] = view.denoiser.RowCount() > 0;
+		json rows = json::array();
+		const auto add = [&](const PerfView::StableTable<DenoiserRow>& a_table, const PerfView::ViewConfig& a_order) {
+			for (int id : a_table.DisplayOrder(a_order)) {
+				const DenoiserRow* row = a_table.GetRow(id);
+				if (!row)
+					continue;
+				float v = 0.0f;
+				const bool has = a_table.DisplayValue(id, cfg, v);
+				const auto values = a_table.GetValues(id);
+				rows.push_back({
+					{ "label", row->label },
+					{ "group", row->group },
+					{ "footer", row->isFooter },
+					{ "ms", has ? json(v) : json(nullptr) },
+					{ "live_ms", values.live },
+					{ "peak_ms", values.peak },
+					{ "groups", { row->groupsX, row->groupsY } },
+					{ "covers", { row->threadsX, row->threadsY } },
+					{ "calls", row->calls },
+				});
+			}
+		};
+		add(view.denoiser, cfg);
+		add(view.denoiserFooter, fixedCfg);
+		d["rows"] = std::move(rows);
+		j["denoiser"] = std::move(d);
+	}
+
+	// ---- shadows ----
+	{
+		const auto& report = Util::GpuPhaseTimeline::GetSingleton()->Get();
+		const auto& s = report.shadow;
+		const auto stage = [&](Util::GpuPhase a_phase) -> json {
+			const size_t p = static_cast<size_t>(a_phase);
+			const int id = static_cast<int>(a_phase);
+			float gpu = 0.0f, cpu = 0.0f;
+			const bool hasGpu = view.engine.DisplayValue(id, cfg, gpu);
+			const bool hasCpu = view.engineCpu.DisplayValue(id, cfg, cpu);
+			return {
+				{ "gpu_ms", hasGpu ? json(gpu) : json(nullptr) },
+				{ "cpu_ms", hasCpu ? json(cpu) : json(nullptr) },
+				{ "draws", report.draws[p] },
+				{ "gpu_ms_last_frame", report.lastMs[p] },
+				{ "cpu_ms_last_frame", report.lastCpuMs[p] },
+				{ "draws_last_frame", report.lastDraws[p] },
+			};
+		};
+		json sh;
+		sh["measuring"] = report.hasCpuSample;
+		sh["per_map_hooks"] = s.sliceHooks;
+		sh["directional_light_seen"] = s.valid;
+		sh["sun_cascades"] = s.sunCascades;
+		sh["draw_focus_shadows"] = s.drawFocusShadows;
+		sh["focus_maps"] = s.focusShadows;
+		sh["local_shadow_lights"] = s.localShadowMaps;
+		sh["god_ray_maps_drawn"] = s.godRayPass;
+		json cascades = json::array();
+		const uint32_t cascadeRows = std::clamp(s.sunCascades, 1u, 3u);
+		for (uint32_t i = 0; i < cascadeRows; ++i) {
+			cascades.push_back({
+				{ "index", i },
+				{ "name", CascadeName(s.sunCascades, i) },
+				{ "start", s.startSplit[i] },
+				{ "end", s.endSplit[i] },
+				{ "units_per_texel", s.unitsPerTexel[i] },
+				{ "viewport_lrtb", { s.port[i][0], s.port[i][1], s.port[i][2], s.port[i][3] } },
+				{ "sun", stage(static_cast<Util::GpuPhase>(static_cast<int>(Util::GpuPhase::ShadowSun1) + static_cast<int>(i))) },
+				{ "god_ray", stage(static_cast<Util::GpuPhase>(static_cast<int>(Util::GpuPhase::ShadowGodRay1) + static_cast<int>(i))) },
+			});
+		}
+		sh["cascades"] = std::move(cascades);
+		sh["focus"] = stage(Util::GpuPhase::ShadowFocus);
+		sh["local"] = stage(Util::GpuPhase::ShadowLocalLights);
+		sh["mask"] = stage(Util::GpuPhase::ShadowMask);
+		sh["other"] = stage(Util::GpuPhase::ShadowOther);
+		j["shadows"] = std::move(sh);
+	}
+
+	// ---- occlusion dry run ----
+	j["occlusion"] = Util::OcclusionDryRun::ToJson();
+	return j;
+}
+
+void PerformanceOverlay::SaveFrameJson(const PerfView::ViewConfig& a_cfg)
+{
+	try {
+		auto dir = logger::log_directory();
+		if (!dir) {
+			FlashMessage("Save failed: SKSE log folder not found", true);
+			return;
+		}
+		std::filesystem::path path = *dir / "CommunityShaders" / "Perf";
+		std::filesystem::create_directories(path);
+
+		const auto now = std::chrono::system_clock::now();
+		const std::time_t t = std::chrono::system_clock::to_time_t(now);
+		std::tm local{};
+		localtime_s(&local, &t);
+		char stamp[32];
+		std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
+		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+		const std::string name = std::format("perf-{}-{:03}.json", stamp, ms);
+		path /= name;
+
+		const nlohmann::json j = BuildFrameJson(a_cfg);
+		std::ofstream out(path, std::ios::binary | std::ios::trunc);
+		if (!out) {
+			FlashMessage("Save failed: cannot write " + name, true);
+			return;
+		}
+		out << j.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
+		out.close();
+		view.lastSavedFile = name;
+		logger::info("[PerfSnapshot] Saved frame JSON: {}", path.string());
+		FlashMessage("Saved " + name);
+	} catch (const std::exception& e) {
+		logger::error("[PerfSnapshot] Saving frame JSON failed: {}", e.what());
+		FlashMessage(std::string("Save failed: ") + e.what(), true);
+	}
 }
