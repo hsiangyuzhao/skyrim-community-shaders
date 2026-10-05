@@ -125,6 +125,10 @@ namespace Batch37b
 			rows.push_back({ group, "Sun: disk radius", ps.loaded, true, std::format("{:.2f} deg", s.sunDiskRadiusDeg),
 				Batch37b::IsOn() ? std::format("{:.2f} deg", s.sunDiskRadiusDeg) : std::string(),
 				"Sky > Physical Sky > Celestials > Sun" });
+			rows.push_back({ group, "Sun: glow (37c)", ps.loaded, s.sunGlowIntensity > 0.f,
+				std::format("{:.1f} x, {:.2f} deg", s.sunGlowIntensity, s.sunGlowWidthDeg), "", sunWhere });
+			rows.push_back({ group, "Hide new moon disc (37c)", ps.loaded, s.hideNewMoonDisc, onOff(s.hideNewMoonDisc), "",
+				"Sky > Physical Sky > Celestials > New Moon" });
 
 			const char* fixWhere = "Sky > Physical Sky > Atmosphere > Fixes (Batch 37b)";
 			rows.push_back({ group, "Fix: opaque sky (5846ad833)", ps.loaded, s.fixSkyAlpha, onOff(s.fixSkyAlpha), "", fixWhere });

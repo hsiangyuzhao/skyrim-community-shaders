@@ -208,7 +208,12 @@ public:
 		// sky object type: the vanilla sun quad (SO_SUN) and its glare (SO_SUN_GLARE). The
 		// procedural sun is drawn on, and replaces, only the former.
 		IsSun = 1 << 8,
-		IsSunGlare = 1 << 9
+		IsSunGlare = 1 << 9,
+		// (batch 37c) Set per draw by the same hook on Masser's/Secunda's moon and moon-mask
+		// draws while that moon is in its new phase and "Hide New Moon Disc" is on. The vanilla
+		// new-moon textures (masser_new.dds / secunda_new.dds) are solid opaque black, so the
+		// game draws a black disc over the stars; the Sky PS discards these draws instead.
+		IsNewMoon = 1 << 10
 	};
 
 	enum class ExtraFeatureDescriptors : uint32_t

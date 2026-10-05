@@ -449,7 +449,8 @@ namespace SharedData
 	{
 		uint Flags;
 		float SunRadianceCap;
-		float2 pad0;
+		float SunGlowIntensity;  // (batch 37c) glow around the procedural sun, x a sunlit white wall; 0 = off
+		float SunGlowWidth;      // (batch 37c) glow falloff width, radians
 	};
 
 	namespace PhysSkyExtFlags

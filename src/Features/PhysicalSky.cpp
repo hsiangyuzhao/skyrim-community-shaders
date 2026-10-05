@@ -44,6 +44,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sunRadianceCap,
 	sunHideVanillaGlare,
 	sunDiskRadiusDeg,
+	sunGlowIntensity,
+	sunGlowWidthDeg,
+	sunLook,
+	hideNewMoonDisc,
 	fixSkyAlpha,
 	fixTrLutEdge,
 	fixApShadowDepth,
@@ -463,11 +467,29 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::ColorEdit3("Light Color", &settings.sunlightColor.x, ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(lightColorHint);
-		ImGui::Checkbox("Procedural Sun", &settings.proceduralSun);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Draws a physically-sized sun disk (size set below).");
 		if (Batch37b::IsOn()) {
-			ImGui::SliderFloat("Sun Disk Angular Radius", &settings.sunDiskRadiusDeg, 0.05f, 2.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+			static constexpr const char* sunLookNames[kSunLookCount] = { "Custom", "Bright (realistic)", "Soft", "Vanilla sun (procedural off)" };
+			int look = std::clamp(settings.sunLook, 0, kSunLookCount - 1);
+			if (ImGui::Combo("Sun Look", &look, sunLookNames, kSunLookCount))
+				ApplySunLook(look);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text(
+					"One-click looks for the sun (Batch 37c):\n"
+					"Bright: real-size disk with a strong glow around it, reads as blinding.\n"
+					"Soft: slightly larger disk, gentle glow.\n"
+					"Vanilla sun: procedural sun off, the game's own sun picture.\n"
+					"Moving any sun setting below switches this to Custom.");
+		}
+		if (ImGui::Checkbox("Procedural Sun", &settings.proceduralSun))
+			settings.sunLook = kSunLookCustom;
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Draws the sun as part of the physical sky: a real-size disk whose colour and brightness\n"
+				"come from the atmosphere (white at noon, orange and dimmer at sunset, gone below the\n"
+				"horizon), instead of the game's fixed sun picture. Off: the game's sun picture.");
+		if (Batch37b::IsOn()) {
+			if (ImGui::SliderFloat("Sun Disk Angular Radius", &settings.sunDiskRadiusDeg, 0.05f, 2.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
+				settings.sunLook = kSunLookCustom;
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("Radius of the disk. 0.27 = the real sun (0.53 degrees across).");
 			ImGui::SameLine();
@@ -486,24 +508,40 @@ void PhysicalSky::SettingsCelestials()
 			ImGui::Text(
 				"Centres the disk (and the sky's glow around the sun) exactly where the game draws its sun.\n"
 				"Off: the old direction, which drifts 2-4 degrees off the game's sun as you climb.");
-		ImGui::Checkbox("Replace Vanilla Sun", &settings.sunReplaceVanilla);
+		if (ImGui::Checkbox("Replace Vanilla Sun", &settings.sunReplaceVanilla))
+			settings.sunLook = kSunLookCustom;
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("The disk replaces the game's sun picture instead of being added next to it (no second sun).");
-		ImGui::Checkbox("Soft Edge", &settings.sunSoftEdge);
+		if (ImGui::Checkbox("Soft Edge", &settings.sunSoftEdge))
+			settings.sunLook = kSunLookCustom;
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Fades the rim of the disk so it does not shimmer with DLSS.");
-		ImGui::Checkbox("Physical Brightness", &settings.sunPhysicalRadiance);
+		if (ImGui::Checkbox("Physical Brightness", &settings.sunPhysicalRadiance))
+			settings.sunLook = kSunLookCustom;
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(
-				"Makes the disk as bright as a real sun for its size (blinding, strong bloom), limited by\n"
-				"the cap below. Off: the old dim flat disk.");
+				"Makes the disk as bright as a real sun for its size, limited by the cap below.\n"
+				"Anything far above a sunlit white wall already shows as pure white on screen; the extra\n"
+				"only matters for bloom (COD Bloom). Off: the old dim flat disk.");
 		if (settings.sunPhysicalRadiance) {
-			ImGui::SliderFloat("Brightness Cap", &settings.sunRadianceCap, 10.f, 62250.f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+			if (ImGui::SliderFloat("Brightness Cap", &settings.sunRadianceCap, 10.f, 62250.f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
+				settings.sunLook = kSunLookCustom;
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text(
-					"Upper limit of the disk's brightness. Lower = less bloom and less DLSS/frame-gen\n"
-					"shimmer around the sun. Upstream uses 62250. Default 1000.");
+					"Upper limit of the disk's brightness (1 = about a sunlit white wall). Only changes how\n"
+					"strongly COD Bloom spreads the sun; lower = less DLSS/frame-gen shimmer. Upstream 62250.");
 		}
+		if (ImGui::SliderFloat("Sun Glow", &settings.sunGlowIntensity, 0.f, 30.f, "%.1f", ImGuiSliderFlags_AlwaysClamp))
+			settings.sunLook = kSunLookCustom;
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Batch 37c. A glow in the sky around the disk, coloured by the atmosphere like the disk.\n"
+				"This is what makes the sun read as blinding: the game has no bloom on it unless COD Bloom\n"
+				"is on. 1 = as bright as a sunlit white wall at the disk's edge. 0 = no glow.");
+		if (ImGui::SliderFloat("Sun Glow Width", &settings.sunGlowWidthDeg, 0.1f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
+			settings.sunLook = kSunLookCustom;
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("How far the glow reaches from the disk's edge before fading (a faint wider tail follows).");
 		ImGui::Checkbox("Hide Vanilla Sun Glare", &settings.sunHideVanillaGlare);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Removes the game's large halo around the sun while the procedural sun is on.");
@@ -527,6 +565,15 @@ void PhysicalSky::SettingsCelestials()
 			ImGui::Text(lightColorHint);
 		ImGui::PopID();
 	}
+
+	ImGui::SeparatorText("New Moon (Batch 37c)");
+	ImGui::Checkbox("Hide New Moon Disc", &settings.hideNewMoonDisc);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On a new moon the game draws Masser and Secunda as solid black discs over the stars\n"
+			"(its new-moon pictures are plain black). Both moons share one phase calendar, so both\n"
+			"turn black on the same nights. On: a new moon is not drawn at all, like the real sky.\n"
+			"Off: the game's black discs.");
 }
 
 void PhysicalSky::SettingsAtmosphere()
@@ -848,6 +895,40 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtMultiScatterFix;
 	extCbData.flags = flags;
 	extCbData.sunRadianceCap = std::clamp(settings.sunRadianceCap, 1.f, 62250.f);
+	extCbData.sunGlowIntensity = settings.proceduralSun ? std::clamp(settings.sunGlowIntensity, 0.f, 30.f) : 0.f;
+	extCbData.sunGlowWidth = DirectX::XMConvertToRadians(std::clamp(settings.sunGlowWidthDeg, 0.1f, 5.f));
+}
+
+void PhysicalSky::ApplySunLook(int a_look)
+{
+	settings.sunLook = std::clamp(a_look, 0, kSunLookCount - 1);
+	switch (settings.sunLook) {
+	case kSunLookBright:
+		settings.proceduralSun = true;
+		settings.sunReplaceVanilla = true;
+		settings.sunSoftEdge = true;
+		settings.sunPhysicalRadiance = true;
+		settings.sunDiskRadiusDeg = 0.27f;
+		settings.sunRadianceCap = 4000.f;
+		settings.sunGlowIntensity = 6.f;
+		settings.sunGlowWidthDeg = 0.8f;
+		break;
+	case kSunLookSoft:
+		settings.proceduralSun = true;
+		settings.sunReplaceVanilla = true;
+		settings.sunSoftEdge = true;
+		settings.sunPhysicalRadiance = true;
+		settings.sunDiskRadiusDeg = 0.4f;
+		settings.sunRadianceCap = 100.f;
+		settings.sunGlowIntensity = 2.f;
+		settings.sunGlowWidthDeg = 1.5f;
+		break;
+	case kSunLookVanilla:
+		settings.proceduralSun = false;
+		break;
+	default:
+		break;
+	}
 }
 
 void PhysicalSky::Reset()
@@ -1132,7 +1213,8 @@ void PhysicalSky::RestoreSamplers()
 void PhysicalSky::SetSunDrawFlags(const RE::BSRenderPass* a_pass)
 {
 	auto& descriptor = globals::state->permutationData.ExtraShaderDescriptor;
-	descriptor &= ~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare));
+	descriptor &= ~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare) |
+	                static_cast<uint32_t>(State::ExtraShaderDescriptors::IsNewMoon));
 
 	if (!a_pass || !a_pass->shaderProperty)
 		return;
@@ -1141,12 +1223,46 @@ void PhysicalSky::SetSunDrawFlags(const RE::BSRenderPass* a_pass)
 		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun);
 	else if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_SUN_GLARE)
 		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare);
+	else if ((skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON ||
+				 skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON_SHADOW) &&
+			 globals::features::physicalSky.settings.hideNewMoonDisc && IsNewMoonDraw(a_pass))
+		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsNewMoon);
+}
+
+bool PhysicalSky::IsNewMoonDraw(const RE::BSRenderPass* a_pass)
+{
+	// (batch 37c) Which moon this draw belongs to (its disc or its star mask), and whether that
+	// moon currently shows its new-moon texture. The phase is read from the texture bound to the
+	// moon's own disc -- the same way Sky Sync reads it -- so mods that drive the phases (Moon and
+	// Stars) are followed too. Up to 4 draws a frame; the name test is a few dozen bytes.
+	const auto sky = RE::Sky::GetSingleton();
+	if (!sky || !a_pass->geometry)
+		return false;
+	for (const RE::Moon* moon : { sky->masser, sky->secunda }) {
+		if (!moon || !moon->moonMesh)
+			continue;
+		const auto* geometry = static_cast<const void*>(a_pass->geometry);
+		if (geometry != moon->moonMesh.get() && geometry != moon->shadowMesh.get())
+			continue;
+		const auto property = skyrim_cast<RE::BSSkyShaderProperty*>(moon->moonMesh->GetGeometryRuntimeData().properties[1].get());
+		const auto texture = property ? property->GetBaseTexture() : nullptr;
+		const char* name = texture ? texture->name.c_str() : nullptr;
+		if (!name)
+			return false;
+		// "..._new.dds" (vanilla and Moon and Stars naming); case-insensitive.
+		std::string_view view(name);
+		const auto dot = view.rfind('.');
+		const auto stem = view.substr(0, dot);
+		return stem.size() >= 4 && _strnicmp(stem.data() + stem.size() - 4, "_new", 4) == 0;
+	}
+	return false;
 }
 
 void PhysicalSky::ClearSunDrawFlags()
 {
 	globals::state->permutationData.ExtraShaderDescriptor &=
-		~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare));
+		~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare) |
+	                static_cast<uint32_t>(State::ExtraShaderDescriptors::IsNewMoon));
 }
 
 void PhysicalSky::Hooks::BSSkyShader_SetupGeometry::thunk(RE::BSShader* This, RE::BSRenderPass* Pass, uint32_t RenderFlags)

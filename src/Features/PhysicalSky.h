@@ -142,6 +142,17 @@ struct PhysicalSky final : public Feature
 		bool sunHideVanillaGlare = false;
 		/// Angular radius in degrees; 0.27 = the real sun (0.53 across).
 		float sunDiskRadiusDeg = 0.27f;
+		/// (batch 37c) Glow drawn into the physical sky around the procedural sun. Nothing in
+		/// this pipeline blooms the disk (vanilla bloom is skipped with "Disable Vanilla
+		/// Tonemapping", COD Bloom is opt-in), so without it a real-size disk is a small flat
+		/// white dot. Intensity is relative to a sunlit white wall; 0 = no glow.
+		float sunGlowIntensity = 6.f;
+		float sunGlowWidthDeg = 0.8f;
+		/// (batch 37c) Last "Sun Look" preset picked (SunLook); Custom once a slider is moved.
+		int sunLook = 1;
+		/// (batch 37c) Hide the solid black disc the game draws for a new moon (both moons share
+		/// the vanilla phase cycle, so both go black on the same nights).
+		bool hideNewMoonDisc = true;
 
 		// (batch 37b) Upstream correctness fixes, each ANDed with Batch37b::IsOn().
 		bool fixSkyAlpha = true;  // 5846ad833: sky dome written opaque
@@ -257,10 +268,22 @@ struct PhysicalSky final : public Feature
 	{
 		uint flags = 0;
 		float sunRadianceCap = 62250.f;
-		float pad0[2] = {};
+		float sunGlowIntensity = 0.f;  // (batch 37c) 0 = no glow
+		float sunGlowWidth = 0.f;      // (batch 37c) radians
 	} extCbData;
 	static_assert(sizeof(ExtCbData) == 16);
 	void UpdateExtCbData();
+
+	/// (batch 37c) "Sun Look" presets.
+	enum SunLook : int
+	{
+		kSunLookCustom = 0,
+		kSunLookBright,   // real size, strong glow: reads as a blinding sun without bloom
+		kSunLookSoft,     // slightly larger, gentle glow
+		kSunLookVanilla,  // procedural sun off: the game's own sun picture
+		kSunLookCount
+	};
+	void ApplySunLook(int a_look);
 
 	eastl::unique_ptr<Texture2D> texTrLut = nullptr;  // transmittance
 	eastl::unique_ptr<Texture2D> texMsLut = nullptr;  // multiscattering
@@ -285,6 +308,7 @@ struct PhysicalSky final : public Feature
 	/// (batch 37b) Marks the vanilla sun / sun glare quads for Sky.hlsl (ExtraShaderDescriptors).
 	static void SetSunDrawFlags(const RE::BSRenderPass* a_pass);
 	static void ClearSunDrawFlags();
+	static bool IsNewMoonDraw(const RE::BSRenderPass* a_pass);
 	struct Hooks
 	{
 		struct BSSkyShader_SetupGeometry

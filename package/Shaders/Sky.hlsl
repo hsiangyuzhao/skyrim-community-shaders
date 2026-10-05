@@ -221,12 +221,50 @@ float GetReflectionSkyShadow(float3 viewDir)
 	return 0.0;
 #		endif
 }
+
+// (batch 37c) Glow around the procedural sun, drawn into the sky dome. The disk alone is a few
+// dozen pixels of "far above white": the tonemapper turns it into a flat white dot, and nothing
+// spreads it (vanilla bloom is skipped by "Disable Vanilla Tonemapping", COD Bloom is opt-in).
+// Real eyes and cameras see the sun through a bright scattered glow; this adds it, coloured by
+// the same transmittance as the disk so noon is white and sunset orange. Units: 1 = a sunlit
+// white diffuse wall (sunlight / pi). Not in reflections (the water shader adds its own sun).
+float3 GetProceduralSunGlow(float3 viewDir)
+{
+	const float intensity = SharedData::physSkyExtData.SunGlowIntensity;
+	const float diskCos = SharedData::physSkyData.sunDiskCos;
+	[branch] if (intensity <= 0.0 || diskCos <= 0.0)
+		return 0.0;
+
+	const float3 sunDir = normalize(SharedData::physSkyData.sunDir);
+	const float cosTheta = dot(viewDir, sunDir);
+	[branch] if (cosTheta <= 0.0)
+		return 0.0;
+
+	// atan2 form: acos() of a cosine this close to 1 loses most of its precision in fp32.
+	const float theta = atan2(length(cross(viewDir, sunDir)), cosTheta);
+	const float diskRadius = atan2(sqrt(saturate(1.0 - diskCos * diskCos)), diskCos);
+	const float x = max(theta - diskRadius, 0.0);
+	const float width = max(SharedData::physSkyExtData.SunGlowWidth, 1e-4);
+	const float falloff = 0.85 * exp(-x / width) + 0.15 * exp(-x / (5.0 * width));
+
+	const float3 sunTransmittance = PhysSky::SampleTr(sunDir, PhysSky::SampTr);
+	return SharedData::physSkyData.sunlightColor * sunTransmittance * (intensity * falloff / Math::PI);
+}
 #	endif
 
 PS_OUTPUT main(PS_INPUT input)
 {
 	PS_OUTPUT psout;
 	float3 yyy = Color::Sky(PParams.yyy);
+
+#	if !defined(OCCLUSION)
+	// (batch 37c) A new moon: the game draws the moon with its new-moon texture, which is solid
+	// opaque black (masser_new.dds / secunda_new.dds), plus the star mask under it, so the moon
+	// shows as a black disc over the stars. Flagged per draw by PhysicalSky::SetSunDrawFlags while
+	// "Hide New Moon Disc" is on; both draws are dropped and the stars stay visible.
+	if (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsNewMoon)
+		discard;
+#	endif
 #	if !defined(VR)
 	uint eyeIndex = 0;
 #	else
@@ -304,6 +342,8 @@ PS_OUTPUT main(PS_INPUT input)
 			skyColor = PhysSky::SampleSkyShadow(normalize(input.WorldPosition.xyz), GetReflectionSkyShadow(normalize(input.WorldPosition.xyz)), PhysSky::SampSv);
 		else
 			skyColor = PhysSky::SampleSky(normalize(input.WorldPosition.xyz), input.Position.xy, PhysSky::SampSv);
+		if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection))
+			skyColor += GetProceduralSunGlow(normalize(input.WorldPosition.xyz));
 		[branch] if (SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::SkyAlphaOpaque)
 			psout.Color = lerp(float4(skyColor, 1.0), psout.Color, SharedData::physSkyData.vanillaMix);  // upstream 5846ad833
 		else
@@ -316,7 +356,8 @@ PS_OUTPUT main(PS_INPUT input)
 		else
 			apColor = PhysSky::SampleAp(viewDir, input.Position.xy, psCloudDist, PhysSky::SampSv);
 		psout.Color.xyz = psout.Color.xyz * apColor.a + apColor.rgb;
-#		elif defined(DEFERRED) && defined(TEX)
+#		elif defined(DEFERRED) && defined(TEX) && !defined(MOONMASK)
+		// (batch 37c) Not the moon/star mask: it is TEX too, but a sun disk has no business on it.
 		const uint extFlags = SharedData::physSkyExtData.Flags;
 		// (batch 37b) Replace mode: the disk lives on the vanilla sun quad only (main view, not
 		// reflections), and the quad's own texture is dropped. Without it the disk is added on
