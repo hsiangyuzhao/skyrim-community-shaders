@@ -469,7 +469,7 @@ void PhysicalSky::SettingsCelestials()
 			ImGui::Text(lightColorHint);
 		if (Batch37b::IsOn()) {
 			static constexpr const char* sunLookNames[kSunLookCount] = { "Custom", "Bright (realistic)", "Soft", "Vanilla sun (procedural off)" };
-			int look = std::clamp(settings.sunLook, 0, kSunLookCount - 1);
+			int look = settings.proceduralSun ? std::clamp(settings.sunLook, 0, kSunLookCount - 1) : static_cast<int>(kSunLookVanilla);
 			if (ImGui::Combo("Sun Look", &look, sunLookNames, kSunLookCount))
 				ApplySunLook(look);
 			if (auto _tt = Util::HoverTooltipWrapper())
@@ -481,7 +481,7 @@ void PhysicalSky::SettingsCelestials()
 					"Moving any sun setting below switches this to Custom.");
 		}
 		if (ImGui::Checkbox("Procedural Sun", &settings.proceduralSun))
-			settings.sunLook = kSunLookCustom;
+			settings.sunLook = settings.proceduralSun ? kSunLookCustom : kSunLookVanilla;
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(
 				"Draws the sun as part of the physical sky: a real-size disk whose colour and brightness\n"
