@@ -123,6 +123,18 @@ public:
 		uint style = 3;
 		bool useAutoMask = true;
 		bool uiCorrection = false;
+		// (batch 38a) The four below only act while Advanced > Batch 38 is on; off restores 37c.
+		// Run alongside frame generation (DLSS-G or FSR 3). 37c blocked the pass outright.
+		bool allowWithFrameGeneration = true;
+		// Run on the HDR scene at render resolution, before DLSS upscales it, instead of on the
+		// finished output-resolution image. Default off = 37c's place in the frame.
+		bool runBeforeUpscaling = false;
+		// The network's working resolution as a percentage of its input (DLSSNR.ScalingRatio):
+		// 100, 75 or 50. Cost falls roughly with the pixel count.
+		uint modelResolutionPercent = 100;
+		// Before upscaling only: add the camera-jitter step to the motion vectors the network
+		// reads, so its history lines up with the jittered image it is given.
+		bool jitterAwareMotion = true;
 	};
 
 	struct Settings

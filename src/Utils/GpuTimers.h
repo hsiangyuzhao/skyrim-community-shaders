@@ -48,6 +48,7 @@ namespace Util
 		DynamicCubemaps,         // capture / inferrence / irradiance convolution round-robin
 		GrassOptimizations,      // grass cell uploads + Hi-Z pyramid + per-instance cull dispatches
 		VariableRateShading,     // shading-rate image build + per-tile scene analysis (+ debug tint)
+		NeuralRendering,         // (batch 38a) DLSS Neural Rendering: guide prep, copies, cross-device wait, the network
 		Count
 	};
 

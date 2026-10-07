@@ -24,6 +24,7 @@
 #include "Features/NRD.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Features/Upscaling.h"
+#include "Features/Upscaling/NeuralRendering/Integration.h"
 #include "Globals.h"
 #include "Menu.h"
 #include "ShaderCache.h"
@@ -4105,6 +4106,8 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 			{ "dlss_preset", up.settings.DLSSPreset },
 			{ "reflex_mode", up.settings.reflexMode },
 		};
+		// (batch 38a) What DLSS 5 Neural Rendering did, and what its network alone cost on its own D3D12 queue.
+		m["upscaling"]["neural_rendering"] = NeuralRendering::StatusJson();
 		const State& st = (view.frozen && view.frozenState) ? *view.frozenState : state;
 		m["frame_generation"] = {
 			{ "active", st.isFrameGenerationActive },

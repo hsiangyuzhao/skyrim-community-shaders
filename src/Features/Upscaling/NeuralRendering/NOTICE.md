@@ -19,7 +19,10 @@ Community Shaders, and their maintainers do not support it.
   - `Util::LazyShader<ID3D11ComputeShader>` has no counterpart here, so it is replaced by a
     local `LazyComputeShader` with the same contract expressed through `Util::CompileShader`
   - `CS_GPU_PASS(...)` replaced by `Util::CpuPassScope`, this tree's scoped pass marker
-- `Runtime`, `D3D12Interop`, `CopyDepthGuideCS.hlsl` are unmodified
+- `Runtime`, `D3D12Interop`, `CopyDepthGuideCS.hlsl` were ported unmodified; batch 38a later changed
+  `Runtime` (model resolution via `DLSSNR.ScalingRatio`) and `D3D12Interop` (larger command ring,
+  D3D12 timestamps, SRVs on shared textures). `CopyDepthGuideCS.hlsl` is still unmodified and is
+  used only by the 37c path; batch 38a adds `PrepareGuidesCS.hlsl` and `ColorTransformCS.hlsl`.
 - `Integration` is **not** ported. The upstream version is built around Open Shaders' foveated
   rendering and HDR display features, neither of which exists here, so this tree has its own,
   which places the pass in `Upscaling::MenuManagerDrawInterfaceStartHook` and gates it on this

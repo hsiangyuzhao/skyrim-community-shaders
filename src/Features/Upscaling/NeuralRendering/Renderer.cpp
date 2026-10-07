@@ -244,15 +244,24 @@ namespace NeuralRendering
 			return true;
 		}
 
-		void Reset()
+		void Reset(bool unloadRuntime = true)
 		{
 			interop.WaitForIdle();
-			Runtime::Instance().Shutdown();
-			interop.Shutdown();
+			Runtime::Instance().Shutdown(unloadRuntime);
+			// (batch 38a) Textures before the device, so what is left holding the device is not ours.
 			eyes = {};
+			workingSet = {};
+			const bool hadDevice = interop.IsInitialized();
+			interop.Shutdown();
+			if (hadDevice)
+				logger::info("[DLSSNR] D3D12 device teardown: {} other reference(s) left (0 = all its video memory is returned)",
+					interop.LastShutdownOtherReferences());
 			resetPending = { true, true };
 			failureLatched = false;
 			copyDepthGuideCS.Reset();
+			prepareGuidesCS.Reset();
+			encodeCS.Reset();
+			decodeCS.Reset();
 		}
 
 		void ResetHistory()
@@ -262,9 +271,293 @@ namespace NeuralRendering
 			resetPending = { true, true };
 		}
 
+		// ---- (batch 38a) ------------------------------------------------------------------
+
+		bool Run(ID3D11Device* device, ID3D11DeviceContext* context, const Renderer::PassInput& in)
+		{
+			const bool before = in.placement == Renderer::Placement::BeforeUpscaling;
+			if (failureLatched || !device || !context || !in.sceneColor || !in.depthSRV || !in.motionSRV ||
+				in.width == 0 || in.height == 0 || in.motionSourceWidth == 0 || in.motionSourceHeight == 0 ||
+				(before && !in.sceneColorSRV))
+				return false;
+			Util::CpuPassScope evaluateScope("NeuralRendering::Evaluate");
+
+			if (!interop.IsInitialized() && !InitializeInterop(device, context))
+				return false;
+			if (Runtime::Instance().Status() != RuntimeStatus::Initialized && !InitializeRuntime())
+				return false;
+
+			D3D11_TEXTURE2D_DESC sceneDesc{}, motionDesc{};
+			Microsoft::WRL::ComPtr<ID3D11Resource> motionResource;
+			in.motionSRV->GetResource(&motionResource);
+			if (!GetTextureDesc(in.sceneColor, sceneDesc) || !GetTextureDesc(motionResource.Get(), motionDesc))
+				return LatchFailure("texture description", E_INVALIDARG);
+			if (in.width > sceneDesc.Width || in.height > sceneDesc.Height)
+				return LatchFailure("extent larger than the scene", E_INVALIDARG);
+			if (!EnsureWorkingSet(in, sceneDesc, motionDesc.Format))
+				return LatchFailure("shared resource creation", interop.LastError());
+
+			// A model-resolution change keeps every texture but needs a new NGX feature. Runtime::Execute
+			// would release the old one itself, but from inside a command list while earlier frames may
+			// still be using it on the GPU; release it here, once the queue has drained, instead.
+			auto& runtime = Runtime::Instance();
+			const float liveScale = runtime.FeatureScalingRatio(0);
+			if (liveScale > 0.0f && liveScale != in.modelScale) {
+				if (!interop.WaitForIdle())
+					return LatchFailure("WaitForIdle before model resolution change", interop.LastError());
+				runtime.ResetFeature(0);
+				resetPending[0] = true;
+			}
+
+			auto& ws = workingSet;
+			if (!PrepareGuides(context, in))
+				return LatchFailure("guide preparation", E_FAIL);
+
+			const D3D11_BOX box{ 0, 0, 0, in.width, in.height, 1 };
+			if (before) {
+				if (!TransformColor(context, encodeCS, {}, in.sceneColorSRV, nullptr, nullptr, ws.color.uav11.Get(), in.width, in.height))
+					return LatchFailure("colour encode", E_FAIL);
+			} else {
+				context->CopySubresourceRegion(ws.color.resource11.Get(), 0, 0, 0, 0, in.sceneColor, 0, &box);
+			}
+
+			ID3D12GraphicsCommandList* commandList = nullptr;
+			if (!interop.BeginD3D12(&commandList, D3D12Interop::kCommandContextCount))
+				return LatchFailure("BeginD3D12", interop.LastError());
+			D3D12_RESOURCE_BARRIER barriers[4]{};
+			ID3D12Resource* resources[4]{
+				ws.color.resource12.Get(), ws.depth.resource12.Get(),
+				ws.motionVectors.resource12.Get(), ws.output.resource12.Get()
+			};
+			for (std::size_t index = 0; index < std::size(barriers); ++index) {
+				barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barriers[index].Transition.pResource = resources[index];
+				barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+				barriers[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+				barriers[index].Transition.StateAfter = index == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS :
+				                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+			}
+			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+			// Colour and guides share one extent, so the vectors are scaled to that extent's pixels:
+			// the engine stores normalised screen units and the model wants pixels.
+			const bool succeeded = runtime.Execute(commandList, 0,
+				ws.color.resource12.Get(), ws.depth.resource12.Get(), ws.motionVectors.resource12.Get(),
+				ws.output.resource12.Get(), in.width, in.height, in.width, in.height,
+				static_cast<float>(in.width), static_cast<float>(in.height), in.tuning,
+				in.reset || resetPending[0], in.modelScale);
+			for (auto& barrier : barriers)
+				std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+			if (!interop.EndD3D12())
+				return LatchFailure("EndD3D12", interop.LastError());
+			if (!succeeded)
+				return LatchFailure("Feature 18", static_cast<HRESULT>(runtime.NgxResult()));
+
+			// EndD3D12 queued a GPU-side wait on the D3D11 timeline, so everything below -- and
+			// everything the frame does after it: DLSS super resolution, the HUD-less copy frame
+			// generation reads, the backbuffer -- sees the finished network output.
+			if (before) {
+				if (!TransformColor(context, decodeCS, { { "DECODE", "" } }, in.sceneColorSRV, ws.color.srv11.Get(),
+						ws.output.srv11.Get(), ws.decodeScratchUAV.Get(), in.width, in.height))
+					return LatchFailure("colour decode", E_FAIL);
+				context->CopySubresourceRegion(in.sceneColor, 0, 0, 0, 0, ws.decodeScratch.Get(), 0, &box);
+			} else {
+				context->CopySubresourceRegion(in.sceneColor, 0, 0, 0, 0, ws.output.resource11.Get(), 0, &box);
+			}
+			resetPending[0] = false;
+			return true;
+		}
+
+		void ReleaseWorkingSet()
+		{
+			interop.WaitForIdle();
+			Runtime::Instance().ResetFeature(0);
+			workingSet = {};
+			// The 37c path's textures too: whichever path runs next rebuilds what it needs.
+			eyes = {};
+			resetPending = { true, true };
+		}
+
+		[[nodiscard]] bool IsInitialized() const { return interop.IsInitialized(); }
+		[[nodiscard]] float ModelGpuMs() const { return interop.SmoothedGpuMs(); }
+		[[nodiscard]] float LastModelGpuMs() const { return interop.LastGpuMs(); }
+		[[nodiscard]] std::uint32_t MaxInFlight() const { return interop.MaxInFlight(); }
+		[[nodiscard]] std::uint32_t BackpressureWaits() const { return interop.BackpressureWaits(); }
+
 		[[nodiscard]] bool IsFailureLatched() const { return failureLatched; }
 
 	private:
+		// (batch 38a) Everything the Batch 38 pass owns. Kept apart from `eyes`, which stays the 37c
+		// path's, so the master switch can flip between the two without either one reusing a
+		// texture the other sized.
+		struct WorkingSet
+		{
+			SharedTexture color;
+			SharedTexture depth;
+			SharedTexture motionVectors;
+			SharedTexture output;
+			Microsoft::WRL::ComPtr<ID3D11Texture2D> decodeScratch;
+			Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> decodeScratchUAV;
+			Renderer::Placement placement = Renderer::Placement::AfterUpscaling;
+			std::uint32_t width = 0;
+			std::uint32_t height = 0;
+			DXGI_FORMAT sceneFormat = DXGI_FORMAT_UNKNOWN;
+			DXGI_FORMAT motionFormat = DXGI_FORMAT_UNKNOWN;
+		};
+
+		// Layouts match the cbuffers in PrepareGuidesCS.hlsl and ColorTransformCS.hlsl.
+		struct PrepareGuidesConstants
+		{
+			float motionSourceScale[2];
+			float motionOffset[2];
+			std::uint32_t extent[2];
+			std::uint32_t motionSourceMax[2];
+		};
+
+		struct ColorTransformConstants
+		{
+			std::uint32_t extent[2];
+			std::uint32_t pad[2];
+		};
+
+		bool EnsureWorkingSet(const Renderer::PassInput& in, const D3D11_TEXTURE2D_DESC& sceneDesc, DXGI_FORMAT motionFormat)
+		{
+			auto& ws = workingSet;
+			if (ws.color.resource11 && ws.placement == in.placement && ws.width == in.width && ws.height == in.height &&
+				ws.sceneFormat == sceneDesc.Format && ws.motionFormat == motionFormat)
+				return true;
+
+			if (!interop.WaitForIdle())
+				return false;
+			Runtime::Instance().ResetFeature(0);
+			ws = {};
+
+			const bool before = in.placement == Renderer::Placement::BeforeUpscaling;
+			const UINT sharedFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+			// Before upscaling the network reads the encoded RGBA8 image (see ColorTransformCS.hlsl).
+			// After upscaling it reads the finished frame in the target's own format, as in 37c.
+			auto colorDesc = MakeSharedDesc(sceneDesc, in.width, in.height, sharedFlags);
+			if (before)
+				colorDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			auto depthDesc = MakeSharedDesc(sceneDesc, in.width, in.height, sharedFlags);
+			depthDesc.Format = DXGI_FORMAT_R32_FLOAT;
+			auto motionDesc = MakeSharedDesc(sceneDesc, in.width, in.height, sharedFlags);
+			motionDesc.Format = motionFormat;
+			if (!interop.CreateSharedTexture(colorDesc, ws.color, "NeuralRendering::Color") ||
+				!interop.CreateSharedTexture(colorDesc, ws.output, "NeuralRendering::Output") ||
+				!interop.CreateSharedTexture(depthDesc, ws.depth, "NeuralRendering::Depth") ||
+				!interop.CreateSharedTexture(motionDesc, ws.motionVectors, "NeuralRendering::Motion")) {
+				ws = {};
+				return false;
+			}
+			if (before && (!ws.color.srv11 || !ws.output.srv11)) {
+				ws = {};
+				interop.RecordFailure(E_FAIL);
+				return false;
+			}
+			if (before) {
+				// The decoded HDR result, in the scene's own format so it copies straight back. The view
+				// takes the format the scene's own SRV reads it as, in case the texture is typeless.
+				auto scratchDesc = MakeSharedDesc(sceneDesc, in.width, in.height, D3D11_BIND_UNORDERED_ACCESS);
+				D3D11_SHADER_RESOURCE_VIEW_DESC sceneViewDesc{};
+				in.sceneColorSRV->GetDesc(&sceneViewDesc);
+				D3D11_UNORDERED_ACCESS_VIEW_DESC scratchViewDesc{};
+				scratchViewDesc.Format = sceneViewDesc.Format;
+				scratchViewDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+				scratchViewDesc.Texture2D.MipSlice = 0;
+				ID3D11Device* device11 = interop.device11_.Get();
+				HRESULT result = device11->CreateTexture2D(&scratchDesc, nullptr, &ws.decodeScratch);
+				if (SUCCEEDED(result))
+					result = device11->CreateUnorderedAccessView(ws.decodeScratch.Get(), &scratchViewDesc, &ws.decodeScratchUAV);
+				if (FAILED(result)) {
+					ws = {};
+					interop.RecordFailure(result);
+					return false;
+				}
+				Util::SetResourceName(ws.decodeScratch.Get(), "NeuralRendering::DecodeScratch");
+			}
+			ws.placement = in.placement;
+			ws.width = in.width;
+			ws.height = in.height;
+			ws.sceneFormat = sceneDesc.Format;
+			ws.motionFormat = motionFormat;
+			resetPending = { true, true };
+			logger::info("[DLSSNR] resources placement={} extent={}x{} sceneFormat={} networkInputFormat={}",
+				before ? "before-upscaling" : "after-upscaling", in.width, in.height,
+				static_cast<std::uint32_t>(sceneDesc.Format), static_cast<std::uint32_t>(colorDesc.Format));
+			return true;
+		}
+
+		bool PrepareGuides(ID3D11DeviceContext* context, const Renderer::PassInput& in)
+		{
+			auto* shader = prepareGuidesCS.Get(L"Data\\Shaders\\Upscaling\\NeuralRendering\\PrepareGuidesCS.hlsl", {}, "cs_5_0",
+				"main", "NeuralRendering::PrepareGuidesCS");
+			if (!shader)
+				return false;
+			if (!guidesCB)
+				guidesCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PrepareGuidesConstants>());
+			PrepareGuidesConstants constants{};
+			constants.motionSourceScale[0] = static_cast<float>(in.motionSourceWidth) / static_cast<float>(in.width);
+			constants.motionSourceScale[1] = static_cast<float>(in.motionSourceHeight) / static_cast<float>(in.height);
+			constants.motionOffset[0] = in.motionOffsetX;
+			constants.motionOffset[1] = in.motionOffsetY;
+			constants.extent[0] = in.width;
+			constants.extent[1] = in.height;
+			constants.motionSourceMax[0] = in.motionSourceWidth - 1;
+			constants.motionSourceMax[1] = in.motionSourceHeight - 1;
+			guidesCB->Update(constants);
+
+			ID3D11Buffer* cb = guidesCB->CB();
+			ID3D11ShaderResourceView* srvs[2]{ in.depthSRV, in.motionSRV };
+			ID3D11UnorderedAccessView* uavs[2]{ workingSet.depth.uav11.Get(), workingSet.motionVectors.uav11.Get() };
+			context->CSSetShader(shader, nullptr, 0);
+			context->CSSetConstantBuffers(0, 1, &cb);
+			context->CSSetShaderResources(0, 2, srvs);
+			context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+			context->Dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
+			ID3D11ShaderResourceView* nullSRVs[2]{};
+			ID3D11UnorderedAccessView* nullUAVs[2]{};
+			ID3D11Buffer* nullCB = nullptr;
+			context->CSSetShaderResources(0, 2, nullSRVs);
+			context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
+			context->CSSetConstantBuffers(0, 1, &nullCB);
+			context->CSSetShader(nullptr, nullptr, 0);
+			return true;
+		}
+
+		bool TransformColor(ID3D11DeviceContext* context, LazyComputeShader& lazyShader,
+			const std::vector<std::pair<const char*, const char*>>& defines,
+			ID3D11ShaderResourceView* original, ID3D11ShaderResourceView* encodedInput, ID3D11ShaderResourceView* networkOutput,
+			ID3D11UnorderedAccessView* destination, std::uint32_t width, std::uint32_t height)
+		{
+			auto* shader = lazyShader.Get(L"Data\\Shaders\\Upscaling\\NeuralRendering\\ColorTransformCS.hlsl", defines, "cs_5_0",
+				"main", "NeuralRendering::ColorTransformCS");
+			if (!shader || !destination)
+				return false;
+			if (!colorCB)
+				colorCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<ColorTransformConstants>());
+			ColorTransformConstants constants{};
+			constants.extent[0] = width;
+			constants.extent[1] = height;
+			colorCB->Update(constants);
+
+			ID3D11Buffer* cb = colorCB->CB();
+			ID3D11ShaderResourceView* srvs[3]{ original, encodedInput, networkOutput };
+			context->CSSetShader(shader, nullptr, 0);
+			context->CSSetConstantBuffers(0, 1, &cb);
+			context->CSSetShaderResources(0, 3, srvs);
+			context->CSSetUnorderedAccessViews(0, 1, &destination, nullptr);
+			context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+			ID3D11ShaderResourceView* nullSRVs[3]{};
+			ID3D11UnorderedAccessView* nullUAV = nullptr;
+			ID3D11Buffer* nullCB = nullptr;
+			context->CSSetShaderResources(0, 3, nullSRVs);
+			context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+			context->CSSetConstantBuffers(0, 1, &nullCB);
+			context->CSSetShader(nullptr, nullptr, 0);
+			return true;
+		}
+
 		bool CopyDepthGuide(ID3D11DeviceContext* context, ID3D11ShaderResourceView* source,
 			ID3D11UnorderedAccessView* destination, std::uint32_t width, std::uint32_t height)
 		{
@@ -299,7 +592,9 @@ namespace NeuralRendering
 		bool InitializeRuntime()
 		{
 			auto& runtime = Runtime::Instance();
-			if (!runtime.Probe() || !runtime.Initialize(interop.Device()))
+			// (batch 38a) A runtime still mapped from an earlier probe or a keep-module shutdown is reused
+			// rather than unloaded and mapped again.
+			if ((runtime.Status() != RuntimeStatus::Ready && !runtime.Probe()) || !runtime.Initialize(interop.Device()))
 				return LatchFailure("runtime initialization", static_cast<HRESULT>(runtime.NgxResult()));
 			logger::info("[DLSSNR] initialized version={} appId=0x{:08X} api=0x{:X}",
 				runtime.Version(), runtime.ApplicationId(), runtime.ApiVersion());
@@ -350,6 +645,12 @@ namespace NeuralRendering
 
 		D3D12Interop interop;
 		LazyComputeShader copyDepthGuideCS;
+		LazyComputeShader prepareGuidesCS;
+		LazyComputeShader encodeCS;
+		LazyComputeShader decodeCS;
+		std::unique_ptr<ConstantBuffer> guidesCB;
+		std::unique_ptr<ConstantBuffer> colorCB;
+		WorkingSet workingSet;
 		std::array<EyeResources, 2> eyes;
 		std::array<bool, 2> resetPending{ true, true };
 		bool failureLatched = false;
@@ -378,7 +679,14 @@ namespace NeuralRendering
 			guideWidth, guideHeight, colorWidth, colorHeight, tuning);
 	}
 
-	void Renderer::Reset() { state_->Reset(); }
+	bool Renderer::Run(ID3D11Device* device, ID3D11DeviceContext* context, const PassInput& input) { return state_->Run(device, context, input); }
+	void Renderer::ReleaseWorkingSet() { state_->ReleaseWorkingSet(); }
+	bool Renderer::IsInitialized() const { return state_->IsInitialized(); }
+	float Renderer::ModelGpuMs() const { return state_->ModelGpuMs(); }
+	float Renderer::LastModelGpuMs() const { return state_->LastModelGpuMs(); }
+	std::uint32_t Renderer::MaxInFlight() const { return state_->MaxInFlight(); }
+	std::uint32_t Renderer::BackpressureWaits() const { return state_->BackpressureWaits(); }
+	void Renderer::Reset(bool unloadRuntime) { state_->Reset(unloadRuntime); }
 	void Renderer::ResetHistory() { state_->ResetHistory(); }
 	bool Renderer::IsFailureLatched() const { return state_->IsFailureLatched(); }
 	std::uint32_t Renderer::NgxResult() const { return Runtime::Instance().NgxResult(); }

@@ -8,6 +8,7 @@
 #include "Upscaling/NeuralRendering/Integration.h"
 #include "Upscaling/NeuralRendering/Renderer.h"
 #include "Upscaling/NeuralRendering/Runtime.h"
+#include "Utils/Batch38.h"
 #include "Upscaling/Streamline.h"
 #include "VR.h"
 #include <Windows.h>
@@ -30,7 +31,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	skinStructureStrength,
 	style,
 	useAutoMask,
-	uiCorrection)
+	uiCorrection,
+	allowWithFrameGeneration,
+	runBeforeUpscaling,
+	modelResolutionPercent,
+	jitterAwareMotion)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Upscaling::Settings,
@@ -332,12 +337,20 @@ void Upscaling::DrawSettings()
 
 		if (nr.enabled) {
 			// Everything that can stop the pass, stated rather than left to a silent no-op.
-			if (d3d12SwapChainActive && IsFrameGenerationRequestedNow()) {
+			const bool batch38 = Batch38::IsOn();
+			if (!batch38 && d3d12SwapChainActive && IsFrameGenerationRequestedNow()) {
 				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 				ImGui::Text("Blocked: Frame Generation is running. Switch it off -- no restart needed.");
 				ImGui::PopStyleColor();
 				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("Neural Rendering and Frame Generation can't work on the same image. Turning Frame Generation off frees it at once (see the Frame Generation section for when turning it back on needs a restart).");
+					ImGui::TextUnformatted("Batch 38 is off (Advanced > Batch 38), so the 37c rule applies: no Neural Rendering while Frame Generation runs. Turn Batch 38 on to allow both.");
+			} else if (batch38) {
+				const auto& frameStatus = NeuralRendering::GetFrameStatus();
+				if (frameStatus.blockedReason[0] != '\0' && std::string_view(frameStatus.blockedReason) != "switched off") {
+					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+					ImGui::TextWrapped("Not running: %s.", frameStatus.blockedReason);
+					ImGui::PopStyleColor();
+				}
 			}
 
 			// Probe as soon as the feature is switched on, rather than waiting for the frame path
@@ -384,6 +397,53 @@ void Upscaling::DrawSettings()
 
 			ImGui::Checkbox("Auto Mask", &nr.useAutoMask);
 			ImGui::Checkbox("UI Correction", &nr.uiCorrection);
+
+			// (batch 38a) Placement, frame generation and cost. Governed by Advanced > Batch 38.
+			ImGui::SeparatorText("Placement and cost (Batch 38)");
+			if (!Batch38::IsOn())
+				ImGui::TextDisabled("Batch 38 is off (Advanced > Batch 38): these have no effect; 37c behaviour.");
+
+			ImGui::Checkbox("Allow with Frame Generation", &nr.allowWithFrameGeneration);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Lets Neural Rendering run while Frame Generation (DLSS-G, any multiplier) is on. It only processes the real frames; the generated ones are made from its result.");
+				ImGui::TextUnformatted("Off = Neural Rendering stops (and frees its video memory) whenever Frame Generation is on.");
+			}
+
+			ImGui::Checkbox("Run before upscaling", &nr.runBeforeUpscaling);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Off (default): runs on the finished image at screen resolution, just before the HUD.");
+				ImGui::TextUnformatted("On: runs on the internal resolution image (2560x1440 at Quality on a 4K screen) before DLSS upscales it, so it costs less. The look differs: it sees the scene before colour grading.");
+			}
+
+			const char* modelResolutions[] = { "100%", "75%", "50%" };
+			int modelIndex = nr.modelResolutionPercent == 50 ? 2 : (nr.modelResolutionPercent == 75 ? 1 : 0);
+			if (ImGui::Combo("Model Resolution", &modelIndex, modelResolutions, IM_ARRAYSIZE(modelResolutions)))
+				nr.modelResolutionPercent = modelIndex == 2 ? 50u : (modelIndex == 1 ? 75u : 100u);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Resolution the AI model works at, as a share of its input. Lower = cheaper (roughly with the pixel count) but softer detail from the model.");
+				ImGui::TextUnformatted("If 50% is not clearly cheaper than 100% in the GPU time below, report it: the setting would not be doing what it should.");
+			}
+
+			if (nr.runBeforeUpscaling) {
+				ImGui::Checkbox("Jitter-Aware Motion (before upscaling)", &nr.jitterAwareMotion);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted("Before upscaling the image still shakes by a fraction of a pixel every frame (DLSS needs that). On: the model is told about the shake, so it does not smear it away.");
+					ImGui::TextUnformatted("Compare on/off only if the image looks softer or shimmers with Run before upscaling on.");
+				}
+			}
+
+			if (Batch38::IsOn()) {
+				const auto& frameStatus = NeuralRendering::GetFrameStatus();
+				const auto& nrRenderer = NeuralRendering::Renderer::Instance();
+				if (frameStatus.running) {
+					ImGui::Text("Now: %s, %ux%u, model %u%%", frameStatus.beforeUpscaling ? "before upscaling" : "after upscaling",
+						frameStatus.width, frameStatus.height, frameStatus.modelPercent);
+					if (nrRenderer.ModelGpuMs() > 0.0f)
+						ImGui::Text("Model GPU time: %.2f ms (the overlay row adds the copies and the wait)", nrRenderer.ModelGpuMs());
+				} else {
+					ImGui::TextDisabled("Now: not running");
+				}
+			}
 
 			if (ImGui::Button("Reset Neural Rendering", { -1, 0 }))
 				NeuralRendering::Reset();
@@ -2215,6 +2275,12 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 		DX::ThrowIfFailed(dx12SwapChain.commandQueue->Signal(dx12SwapChain.upscalingFence.get(), dx12SwapChain.upscalingFenceValue));
 		DX::ThrowIfFailed(dx12SwapChain.commandQueue->Wait(dx12SwapChain.upscalingFence.get(), dx12SwapChain.upscalingFenceValue));
 	}
+
+	// (batch 38a) Every frame, whatever the upscaler: decides what Neural Rendering does this frame
+	// (and releases or rebuilds it), and with "Run before upscaling" on runs it here, on the HDR
+	// scene DLSS is about to read. Inert while Advanced > Batch 38 is off.
+	if (!globals::game::isVR)
+		NeuralRendering::BeforeUpscaling();
 
 	if (upscaleMethod != UpscaleMethod::kNONE && upscaleMethod != UpscaleMethod::kTAA)
 		upscaling.PerformUpscaling();

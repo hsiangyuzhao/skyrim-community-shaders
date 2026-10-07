@@ -73,6 +73,9 @@ namespace Util
 			{ "Variable Rate Shading",
 				"GPU time Variable Rate Shading itself costs (plus its debug overlay when shown). "
 				"Its savings show up in the engine's opaque geometry time, not here." },
+			{ "Neural Rendering (DLSS 5)",
+				"GPU time the DLSS 5 Neural Rendering pass adds to the frame: preparing its inputs, copying to and from its own "
+				"D3D12 device, and waiting there while the network runs. The network alone is shown under Upscaling > Neural Rendering." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

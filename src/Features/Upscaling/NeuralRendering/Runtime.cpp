@@ -290,7 +290,8 @@ namespace NeuralRendering
 	bool Runtime::Execute(ID3D12GraphicsCommandList* commandList, std::uint32_t slot,
 		ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motionVectors, ID3D12Resource* output,
 		std::uint32_t inputWidth, std::uint32_t inputHeight, std::uint32_t outputWidth, std::uint32_t outputHeight,
-		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset)
+		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset,
+		float modelScale)
 	{
 		if (status_ != RuntimeStatus::Initialized || !commandList || slot >= 2 || !color || !depth || !motionVectors || !output)
 			return false;
@@ -302,8 +303,15 @@ namespace NeuralRendering
 		if (!scope.IsInstalled())
 			return false;
 
+		// (batch 38a) modelScale > 0 is the Batch 38 path: DLSSNR.ScalingRatio is the network's own
+		// working resolution as a fraction of the colour extent (the runtime logs "network WxH from
+		// output WxH scale S"), i.e. the model-resolution option. 0 keeps the 37c value, the ratio of
+		// the colour extent to the guide extent, which only ever came out at 1 because the two were
+		// always the same size.
+		const float scalingRatio = modelScale > 0.0f ? modelScale : static_cast<float>(outputWidth) / inputWidth;
 		const bool dimensionsChanged = featureInputWidth_[slot] != inputWidth || featureInputHeight_[slot] != inputHeight ||
-			featureOutputWidth_[slot] != outputWidth || featureOutputHeight_[slot] != outputHeight;
+			featureOutputWidth_[slot] != outputWidth || featureOutputHeight_[slot] != outputHeight ||
+			featureScalingRatio_[slot] != scalingRatio;
 		if (featureHandles_[slot] && dimensionsChanged) {
 			release(static_cast<NVSDK_NGX_Handle*>(featureHandles_[slot]));
 			featureHandles_[slot] = nullptr;
@@ -325,7 +333,7 @@ namespace NeuralRendering
 			parameters->Set("DLSSNR.Output.Height", outputHeight);
 			parameters->Set("DLSSNR.Scale", static_cast<float>(outputWidth) / inputWidth);
 			parameters->Set("DLSSNR.Upscaling", 1u);
-			parameters->Set("DLSSNR.ScalingRatio", static_cast<float>(outputWidth) / inputWidth);
+			parameters->Set("DLSSNR.ScalingRatio", scalingRatio);
 			parameters->Set("DLSSNR.Hint.Render.Preset", 0u);
 			NVSDK_NGX_Handle* handle = nullptr;
 			ngxResult_ = static_cast<std::uint32_t>(create(commandList, kFeatureDlssNr, parameters, &handle));
@@ -338,6 +346,7 @@ namespace NeuralRendering
 			featureInputHeight_[slot] = inputHeight;
 			featureOutputWidth_[slot] = outputWidth;
 			featureOutputHeight_[slot] = outputHeight;
+			featureScalingRatio_[slot] = scalingRatio;
 			reset = true;
 		}
 
@@ -367,6 +376,8 @@ namespace NeuralRendering
 		parameters->Set("DLSSNR.DepthInverted", 0u);
 		parameters->Set("DLSSNR.Enabled", 1u);
 		parameters->Set("DLSSNR.Reset", reset ? 1u : 0u);
+		if (modelScale > 0.0f)
+			parameters->Set("DLSSNR.ScalingRatio", scalingRatio);
 		parameters->Set("DLSSNR.Intensity", tuning.intensity);
 		parameters->Set("DLSSNR.LocalToneStrength", tuning.localToneStrength);
 		parameters->Set("DLSSNR.LocalStructureStrength", tuning.localStructureStrength);
@@ -399,6 +410,7 @@ namespace NeuralRendering
 		featureHandles_[slot] = nullptr;
 		featureInputWidth_[slot] = featureInputHeight_[slot] = 0;
 		featureOutputWidth_[slot] = featureOutputHeight_[slot] = 0;
+		featureScalingRatio_[slot] = 0.0f;
 	}
 
 	void Runtime::ResetFeatures()
@@ -408,7 +420,7 @@ namespace NeuralRendering
 		successfulFrames_ = 0;
 	}
 
-	void Runtime::Shutdown()
+	void Runtime::Shutdown(bool unloadModule)
 	{
 		if (device_ && module_) {
 			ResetFeatures();
@@ -428,6 +440,17 @@ namespace NeuralRendering
 			}
 			device_->Release();
 			device_ = nullptr;
+		}
+		// (batch 38a) Switching the feature off releases everything NGX made on our device, and the device
+		// itself, but keeps the DLL mapped: it holds no video memory, and unloading a 158 MB runtime
+		// that talks to the driver, only to map it again on the next switch-on, is the riskier half of a
+		// toggle. NGX is built to be initialised again after Shutdown1.
+		if (!unloadModule && module_) {
+			status_ = RuntimeStatus::Ready;
+			detail_.clear();
+			ngxResult_ = 0;
+			successfulFrames_ = 0;
+			return;
 		}
 		if (module_) FreeLibrary(static_cast<HMODULE>(module_));
 		module_ = nullptr;
