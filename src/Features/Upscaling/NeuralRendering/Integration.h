@@ -50,6 +50,15 @@ namespace NeuralRendering
 		std::uint32_t outputHeight = 0;
 		std::uint32_t modelPercent = 100;  ///< model resolution in effect
 		std::uint64_t vramMB = 0;          ///< this process's local video memory at the last state change
+		// (batch 38c)
+		std::uint32_t workWidth = 0;  ///< the model's content extent (Model Resolution, our own downscale)
+		std::uint32_t workHeight = 0;
+		std::uint32_t paddedWidth = 0;  ///< the network's extent (content padded to the network grid)
+		std::uint32_t paddedHeight = 0;
+		bool toneMatched = false;          ///< before upscaling: tone-matched input in effect
+		std::uint32_t inputPrecision = 0;  ///< before upscaling: 0 8-bit, 1 10-bit, 2 16-bit float
+		float toneStrength = 0.0f;         ///< tone preservation in effect for the placement
+		bool tuningAtCreate = false;
 	};
 
 	/// @brief (batch 38a) Status as of the most recent frame.
@@ -57,4 +66,8 @@ namespace NeuralRendering
 
 	/// @brief (batch 38a) Status plus timings, for the performance overlay's saved frame.
 	json StatusJson();
+
+	/// @brief (batch 38c) Where the before-upscaling tone curve came from on the last frame
+	/// ("game exposure + colour grading", "fallback curve", ...), for the menu and the Batch 38 table.
+	const char* ToneSourceText();
 }

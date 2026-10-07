@@ -245,14 +245,11 @@ void HistogramAutoExposure::CompileComputeShaders()
 	}
 }
 
-void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
+void HistogramAutoExposure::GetExposureParameters(float& exposureCompensation, float2& adaptationRange) const
 {
-	auto context = globals::d3d::context;
-	auto state = globals::state;
-
 	auto& pp = globals::features::postProcessing;
-	float exposureCompensation = settings.ExposureCompensation;
-	float2 adaptationRange = settings.AdaptationRange;
+	exposureCompensation = settings.ExposureCompensation;
+	adaptationRange = settings.AdaptationRange;
 	if (pp.imageSpaceManager != nullptr) {
 		if (settings.EnableToD) {
 			exposureCompensation = pp.imageSpaceManager->timeOfDay[0] * settings.ToDExposure[0] +
@@ -273,6 +270,16 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 			adaptationRange = settings.InteriorAdaptationRange;
 		}
 	}
+}
+
+void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
+{
+	auto context = globals::d3d::context;
+	auto state = globals::state;
+
+	float exposureCompensation = 0.f;
+	float2 adaptationRange = {};
+	GetExposureParameters(exposureCompensation, adaptationRange);
 
 	AutoExposureCB cbData = {
 		.AdaptArea = settings.AdaptArea,

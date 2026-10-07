@@ -19,8 +19,10 @@
  * - E. DLSS 5 Neural Rendering: RowsNeuralRendering (Batch38NeuralRendering.cpp). Governs
  *   coexisting with frame generation, running before upscaling, model resolution, jitter-aware
  *   motion before upscaling, the guide/motion-vector fixes, the larger D3D12 command ring and
- *   the release-on-off of its GPU memory. Off = 37c's pass exactly. Not governed: the
- *   diagnostics (the overlay's Neural Rendering row, the model-only timer, the state log).
+ *   the release-on-off of its GPU memory. (38c) Our own model resolution, padding to the
+ *   network grid, tone-matched input and its precision, tone preservation, tuning at creation.
+ *   Off = 37c's pass exactly (blocked under frame generation, after upscaling). Not governed:
+ *   the diagnostics (the overlay's Neural Rendering row, the model-only timer, the state log).
  */
 namespace Batch38
 {

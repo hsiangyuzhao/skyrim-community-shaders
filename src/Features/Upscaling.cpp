@@ -35,7 +35,13 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	allowWithFrameGeneration,
 	runBeforeUpscaling,
 	modelResolutionPercent,
-	jitterAwareMotion)
+	jitterAwareMotion,
+	padToNetworkGrid,
+	toneMatchedInput,
+	inputPrecision,
+	tonePreservationBefore,
+	tonePreservationAfter,
+	tuningAtCreate)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Upscaling::Settings,
@@ -412,7 +418,7 @@ void Upscaling::DrawSettings()
 			ImGui::Checkbox("Run before upscaling", &nr.runBeforeUpscaling);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("Off (default): runs on the finished image at screen resolution, just before the HUD.");
-				ImGui::TextUnformatted("On: runs on the internal resolution image (2560x1440 at Quality on a 4K screen) before DLSS upscales it, so it costs less. The look differs: it sees the scene before colour grading.");
+				ImGui::TextUnformatted("On: runs on the internal resolution image (2560x1440 at Quality on a 4K screen) before DLSS upscales it, so it costs less. It sees the scene before colour grading; \"Tone-matched input\" below shows it the graded look instead.");
 			}
 
 			const char* modelResolutions[] = { "100%", "75%", "50%" };
@@ -420,8 +426,47 @@ void Upscaling::DrawSettings()
 			if (ImGui::Combo("Model Resolution", &modelIndex, modelResolutions, IM_ARRAYSIZE(modelResolutions)))
 				nr.modelResolutionPercent = modelIndex == 2 ? 50u : (modelIndex == 1 ? 75u : 100u);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Resolution the AI model works at, as a share of its input. Lower = cheaper (roughly with the pixel count) but softer detail from the model.");
-				ImGui::TextUnformatted("If 50% is not clearly cheaper than 100% in the GPU time below, report it: the setting would not be doing what it should.");
+				ImGui::TextUnformatted("Size the AI model works at, as a share of its input. Lower = cheaper (roughly with the pixel count): 50% is about a quarter of the model's time.");
+				ImGui::TextUnformatted("The picture itself stays full resolution: only the model's changes are made smaller and scaled back up (following depth, so edges stay clean). Lower = those changes are softer.");
+			}
+
+			ImGui::Checkbox("Pad to network grid", &nr.padToNetworkGrid);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Gives the AI model a picture whose size is a multiple of 8 (the edge repeated, then cut off again).");
+				ImGui::TextUnformatted("DLSS Balanced renders at 2227x1253, the only preset that is not such a size, and it came out in a different tone. On = every preset behaves the same.");
+			}
+
+			if (nr.runBeforeUpscaling) {
+				ImGui::Checkbox("Tone-matched input (before upscaling)", &nr.toneMatchedInput);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted("On: the model is shown the scene with the game's own exposure and colour grading / tone curve applied, i.e. close to what the finished image looks like. Its changes are converted back exactly.");
+					ImGui::TextUnformatted("Off: the 38a version, a darker and flatter picture the model tends to brighten and re-colour.");
+				}
+				if (nr.toneMatchedInput && Batch38::IsOn())
+					ImGui::TextDisabled("Curve from: %s", NeuralRendering::ToneSourceText());
+
+				const char* precisions[] = { "8-bit (38a)", "10-bit", "16-bit float" };
+				int precisionIndex = static_cast<int>(std::min(nr.inputPrecision, 2u));
+				if (ImGui::Combo("Input Precision (before upscaling)", &precisionIndex, precisions, IM_ARRAYSIZE(precisions)))
+					nr.inputPrecision = static_cast<uint>(precisionIndex);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted("Format of the picture handed to the model. Higher = finer steps in bright and dark areas.");
+					ImGui::TextUnformatted("Experimental: if the picture breaks or Neural Rendering stops (see the log), go back to 8-bit.");
+				}
+			}
+
+			float& toneStrength = nr.runBeforeUpscaling ? nr.tonePreservationBefore : nr.tonePreservationAfter;
+			ImGui::SliderFloat(nr.runBeforeUpscaling ? "Tone Preservation (before upscaling)" : "Tone Preservation (after upscaling)",
+				&toneStrength, 0.f, 1.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Keeps the overall brightness and colour of each area as it was, while keeping the model's local lighting and detail.");
+				ImGui::TextUnformatted("0 = the model's result as is. 1 = large-scale tone fully locked to the input. Separate values for before and after upscaling (defaults 0.5 and 0).");
+			}
+
+			ImGui::Checkbox("Apply tuning at creation", &nr.tuningAtCreate);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("The model only reads Intensity, the three strengths, Style, Auto Mask and UI Correction when it starts up, so 38a's sliders never reached it.");
+				ImGui::TextUnformatted("On: they are given at start-up, and a change restarts the model about half a second after you stop moving the slider.");
 			}
 
 			if (nr.runBeforeUpscaling) {
@@ -436,8 +481,9 @@ void Upscaling::DrawSettings()
 				const auto& frameStatus = NeuralRendering::GetFrameStatus();
 				const auto& nrRenderer = NeuralRendering::Renderer::Instance();
 				if (frameStatus.running) {
-					ImGui::Text("Now: %s, %ux%u, model %u%%", frameStatus.beforeUpscaling ? "before upscaling" : "after upscaling",
-						frameStatus.width, frameStatus.height, frameStatus.modelPercent);
+					ImGui::Text("Now: %s, %ux%u, model %u%% = %ux%u, network %ux%u", frameStatus.beforeUpscaling ? "before upscaling" : "after upscaling",
+						frameStatus.width, frameStatus.height, frameStatus.modelPercent, frameStatus.workWidth, frameStatus.workHeight,
+						frameStatus.paddedWidth, frameStatus.paddedHeight);
 					if (nrRenderer.ModelGpuMs() > 0.0f)
 						ImGui::Text("Model GPU time: %.2f ms (the overlay row adds the copies and the wait)", nrRenderer.ModelGpuMs());
 				} else {
