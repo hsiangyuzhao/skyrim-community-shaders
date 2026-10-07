@@ -38,6 +38,7 @@
 #include "Features/VanillaFresnel.h"
 #include "Features/VR.h"
 #include "Features/VariableRateShading.h"
+#include "Features/VolumetricShadows.h"
 #include "Features/VolumetricLighting.h"
 #include "Features/WaterEffects.h"
 #include "Features/WeatherPicker.h"
@@ -253,7 +254,8 @@ const std::vector<Feature*>& Feature::GetFeatureList()
 		&globals::features::postProcessing,
 		&globals::features::skin,
 		&globals::features::exponentialHeightFog,
-		&globals::features::variableRateShading
+		&globals::features::variableRateShading,
+		&globals::features::volumetricShadows
 	};
 
 	if (REL::Module::IsVR()) {

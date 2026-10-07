@@ -2871,7 +2871,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #	if !defined(DEFERRED)
 	else if (!SharedData::InInterior && inWorld) {
-		dirLightColorMultiplier *= ShadowSampling::GetLightingShadow(screenNoise, input.WorldPosition.xyz, eyeIndex);
+#		if defined(VOLUMETRIC_SHADOWS)
+		// (batch 38, A2, upstream 0f79d567a) soft VSM sun shadow instead of the 16-tap PCF
+		float vsmDetailedShadow;
+		[branch] if (VolumetricShadows::ForwardSoftShadowsEnabled() && !inReflection)
+		{
+			VolumetricShadows::GetVSMShadow2D(input.WorldPosition.xyz, eyeIndex, vsmDetailedShadow);
+			dirLightColorMultiplier *= vsmDetailedShadow;
+		}
+		else
+#		endif
+			dirLightColorMultiplier *= ShadowSampling::GetLightingShadow(screenNoise, input.WorldPosition.xyz, eyeIndex);
 	}
 #	endif
 
@@ -3876,7 +3886,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif
 #		if defined(EXP_HEIGHT_FOG)
 	if (SharedData::exponentialHeightFogSettings.enabled) {
-		float4 exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
+		// (batch 38, A1) the froxel volumes belong to the main camera: not in reflections
+		float4 exponentialHeightFog;
+		[branch] if (inWorld && !inReflection)
+			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, eyeIndex, input.Position.xy);
+		else
+			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
 		fogColor = exponentialHeightFog.xyz;
 		fogFactor = exponentialHeightFog.w;
 	}

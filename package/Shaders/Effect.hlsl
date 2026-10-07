@@ -550,6 +550,42 @@ float ComputeShadowVariance(float shadow)
     return (v < epsilon) ? 1.0 : 0.0;
 }
 
+#	if defined(LIGHTING) && defined(VOLUMETRIC_SHADOWS)
+// (batch 38, A2) Port of upstream ShadowSampling::ExtractLighting (0f79d567a): split the
+// engine's combined effect light colour into sun and ambient by the luminance ratio of the
+// sun colour and the ambient (DALC, with IBL where it replaces part of it). Returns the sun
+// part; the rest is ambient.
+float3 EstimateEffectDirectionalPart(float3 inputColor)
+{
+	float3 ambientColor = max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 1, 1)));
+#		if defined(IBL)
+	if (SharedData::iblSettings.EnableDiffuseIBL && (!SharedData::InInterior || SharedData::iblSettings.EnableInterior)) {
+		ambientColor *= SharedData::iblSettings.DALCAmount;
+#			if defined(SKYLIGHTING) && !defined(INTERIOR)
+		float3 iblColor = ImageBasedLighting::GetIBLColor(float3(0, 0, -1), 1.0);
+#			else
+		float3 iblColor = ImageBasedLighting::GetIBLColor(float3(0, 0, -1));
+#			endif
+		ambientColor += Color::IrradianceToGamma(Color::Saturation(iblColor, SharedData::iblSettings.IBLSaturation) * SharedData::iblSettings.DiffuseIBLScale);
+	}
+#		endif
+
+	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
+	float3 dirLightColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
+
+	float inputLuma = Color::RGBToLuminance(inputColor);
+	float ambientLuma = Color::RGBToLuminance(ambientColor);
+	float dirLightLuma = Color::RGBToLuminance(dirLightColor);
+	float totalLuma = ambientLuma + dirLightLuma;
+
+	// Scale the ambient so that ambient + sun luminance matches the input
+	if (totalLuma > 0.0 && ambientLuma > 0.0)
+		ambientColor *= inputLuma / totalLuma;
+
+	return max(0.0, inputColor - ambientColor);
+}
+#	endif
+
 #	if defined(LIGHTING)
 float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPosition, uint eyeIndex, inout float shadowVariance)
 {
@@ -627,7 +663,14 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 
 		if (!SharedData::InInterior){
 			bool isWorldShadow = false;
-			float shadow = ShadowSampling::GetEffectShadow(worldPosition.xyz, normalize(worldPosition.xyz), screenPosition.xy, eyeIndex, isWorldShadow);
+			float shadow;
+#		if defined(VOLUMETRIC_SHADOWS)
+			// (batch 38, A2) VSM along the view ray instead of the raw-cascade 3D filter
+			[branch] if (VolumetricShadows::ParticleShadowsEnabled())
+				shadow = VolumetricShadows::GetEffectShadow(worldPosition.xyz, normalize(worldPosition.xyz), screenPosition.xy, eyeIndex);
+			else
+#		endif
+				shadow = ShadowSampling::GetEffectShadow(worldPosition.xyz, normalize(worldPosition.xyz), screenPosition.xy, eyeIndex, isWorldShadow);
 			color += dirLightColor * shadow;
 			// Do not denoise world shadows
 			if (!isWorldShadow)
@@ -636,6 +679,17 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 			color += dirLightColor;
 		}
 	} else {
+#		if defined(VOLUMETRIC_SHADOWS)
+		// (batch 38, A2, upstream 0f79d567a) Every other lit effect in the world: the engine hands
+		// us one colour for sun + ambient. Estimate the sun's share (upstream ExtractLighting)
+		// and take the shadowed part of it away. Fully lit = exactly the old colour.
+		[branch] if (VolumetricShadows::ParticleShadowsEnabled() && !SharedData::InInterior && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld))
+		{
+			float shadow = VolumetricShadows::GetEffectShadow(worldPosition.xyz, normalize(worldPosition.xyz), screenPosition.xy, eyeIndex);
+			color -= EstimateEffectDirectionalPart(color) * (1.0 - shadow);
+			shadowVariance = ComputeShadowVariance(shadow);
+		}
+#		endif
 #		if defined(SKYLIGHTING)
 #			if defined(VR)
 		float3 positionMSSkylight = worldPosition + FrameBuffer::CameraPosAdjust[eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
@@ -901,7 +955,12 @@ PS_OUTPUT main(PS_INPUT input)
 #		endif
 #		if defined(EXP_HEIGHT_FOG)
 	if (SharedData::exponentialHeightFogSettings.enabled) {
-		float4 exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
+		// (batch 38, A1) + volumetric fog for effects drawn by the main camera
+		float4 exponentialHeightFog;
+		[branch] if ((Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld) && !(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection))
+			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, eyeIndex, input.Position.xy);
+		else
+			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
 		fogColor = exponentialHeightFog.xyz;
 		fogFactor = exponentialHeightFog.w;
 		fogMul = 1;

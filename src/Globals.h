@@ -39,6 +39,7 @@ struct PostProcessing;
 struct Skin;
 struct ExponentialHeightFog;
 struct VariableRateShading;
+struct VolumetricShadows;
 
 class State;
 class Deferred;
@@ -102,6 +103,7 @@ namespace globals
 		extern Skin skin;
 		extern ExponentialHeightFog exponentialHeightFog;
 		extern VariableRateShading variableRateShading;
+		extern VolumetricShadows volumetricShadows;
 
 		namespace llf
 		{

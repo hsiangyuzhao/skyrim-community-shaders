@@ -19,6 +19,7 @@
 #include "Util.h"
 #include "Utils/Batch36f.h"
 #include "Utils/Batch37b.h"
+#include "Utils/Batch38.h"
 #include "Utils/Format.h"
 #include "Utils/UI.h"
 
@@ -28,6 +29,15 @@ void AdvancedSettingsRenderer::RenderAdvancedSettings(
 {
 	// Use TabBar system - tabs sorted alphabetically
 	if (ImGui::BeginTabBar("##AdvancedSettingsTabs", ImGuiTabBarFlags_None)) {
+		// Batch 38 Tab (first: the A/B master switch for the batch being tested)
+		if (MenuFonts::BeginTabItemWithFont("Batch 38", Menu::FontRole::Subheading)) {
+			if (ImGui::BeginChild("##Batch38Content", ImVec2(0, 0), false)) {
+				Batch38::DrawTab();
+			}
+			ImGui::EndChild();
+			ImGui::EndTabItem();
+		}
+
 		// Batch 37b Tab (first: the A/B master switch for the batch being tested)
 		if (MenuFonts::BeginTabItemWithFont("Batch 37b", Menu::FontRole::Subheading)) {
 			if (ImGui::BeginChild("##Batch37bContent", ImVec2(0, 0), false)) {

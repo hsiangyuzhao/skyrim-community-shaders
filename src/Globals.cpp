@@ -37,6 +37,7 @@
 #include "Features/VanillaFresnel.h"
 #include "Features/VR.h"
 #include "Features/VariableRateShading.h"
+#include "Features/VolumetricShadows.h"
 #include "Features/VolumetricLighting.h"
 #include "Features/WaterEffects.h"
 #include "Features/WeatherPicker.h"
@@ -98,6 +99,7 @@ namespace globals
 		Skin skin{};
 		ExponentialHeightFog exponentialHeightFog{};
 		VariableRateShading variableRateShading{};
+		VolumetricShadows volumetricShadows{};
 
 		namespace llf
 		{

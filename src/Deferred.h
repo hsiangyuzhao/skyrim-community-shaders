@@ -76,6 +76,18 @@ public:
 	std::unique_ptr<Buffer> perShadow;
 	ID3D11ShaderResourceView* shadowView = nullptr;
 
+	/// (batch 38) The sun shadow capture shared by Volumetric Fog and Volumetric Shadows.
+	/// CopyShadowData runs on the engine's directional shadow-mask draw, the one moment the
+	/// sun's cascade array (PS t4) and its PerGeometry constants are both bound: it already
+	/// copies the constants into perShadow (t19, VR-aware per-eye camera-relative matrices);
+	/// from batch 38 it also keeps a reference to the cascade array so compute passes later in
+	/// the frame can sample it. capturedShadowFrame is State::frameCount at capture, so a
+	/// consumer can tell this frame's capture from one left over from the last exterior.
+	winrt::com_ptr<ID3D11ShaderResourceView> capturedShadowMap;
+	uint32_t capturedShadowFrame = UINT32_MAX;
+	/// True if the capture was taken this frame or the previous one.
+	[[nodiscard]] bool HasFreshShadowCapture() const;
+
 	struct Hooks
 	{
 		struct Main_RenderShadowMaps

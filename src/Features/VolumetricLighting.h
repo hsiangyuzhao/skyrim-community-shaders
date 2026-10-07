@@ -88,6 +88,11 @@ public:
 	void DrawBatch37bSettings();
 	virtual void EarlyPrepass() override;
 
+	/// (batch 38, A1) True while the engine's volumetric lighting is switched on this cell.
+	[[nodiscard]] bool IsVanillaVLRunning() const { return bEnableVolumetricLighting && *bEnableVolumetricLighting; }
+	/// (batch 38, A1) Volumetric Fog replaces the vanilla light shafts while it is on.
+	[[nodiscard]] static bool PausedForVolumetricFog();
+
 	std::map<std::string, Util::GameSetting> hiddenVRSettings{
 		{ "bEnableVolumetricLighting:Display", { "Enable VL Shaders (INI) ",
 												   "Enables volumetric lighting effects by creating shaders. "
@@ -167,6 +172,8 @@ private:
 	bool initialised = false;
 	bool inInterior = false;
 	bool inInteriorWithSun = false;
+	/// (batch 38, A1) PausedForVolumetricFog() as last applied by SetupVL.
+	bool pausedForFog = false;
 
 	struct VLData
 	{

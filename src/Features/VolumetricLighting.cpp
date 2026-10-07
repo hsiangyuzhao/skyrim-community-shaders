@@ -7,6 +7,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "TerrainShadows.h"
+#include "ExponentialHeightFog.h"
 #include "Utils/Batch37b.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -32,6 +33,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 
 void VolumetricLighting::DrawSettings()
 {
+	if (PausedForVolumetricFog())
+		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning,
+			"Paused: Volumetric Fog is on (Lighting > Exponential Height Fog > Volumetric Fog).\n"
+			"It lights its own fog with the sun, so these light shafts would be drawn twice.");
+
 	if (ImGui::Checkbox("Enable Volumetric Lighting in Exteriors", &settings.ExteriorEnabled))
 		SetupVL();
 
@@ -366,7 +372,8 @@ void VolumetricLighting::EarlyPrepass()
 	const auto interiorCell = RE::TES::GetSingleton()->interiorCell;
 	const bool currentlyInInterior = interiorCell != nullptr;
 
-	if (initialised && currentlyInInterior == inInterior)
+	// (batch 38, A1) Volumetric Fog switching on or off re-applies the enable flag below.
+	if (initialised && currentlyInInterior == inInterior && PausedForVolumetricFog() == pausedForFog)
 		return;
 
 	initialised = true;
@@ -375,20 +382,30 @@ void VolumetricLighting::EarlyPrepass()
 	SetupVL();
 }
 
+bool VolumetricLighting::PausedForVolumetricFog()
+{
+	return globals::features::exponentialHeightFog.VolumetricFogRequested();
+}
+
 void VolumetricLighting::SetupVL()
 {
+	// (batch 38, A1) Volumetric Fog lights its own fog with the sun (and 37b's cloud/terrain
+	// occlusion is inside it too); the engine's light shafts would add the sun a second time.
+	pausedForFog = PausedForVolumetricFog();
+	const bool allowed = !pausedForFog;
+
 	if (inInterior) {
 		if (globals::game::isVR)
-			SetBooleanSettings(hiddenVRSettings, GetName(), settings.InteriorEnabled && inInteriorWithSun);
+			SetBooleanSettings(hiddenVRSettings, GetName(), settings.InteriorEnabled && inInteriorWithSun && allowed);
 		else
-			*bEnableVolumetricLighting = settings.InteriorEnabled && inInteriorWithSun;
+			*bEnableVolumetricLighting = settings.InteriorEnabled && inInteriorWithSun && allowed;
 		*gVolumetricLightingSizeHigh = static_cast<Quality>(settings.InteriorQuality) == Quality::Custom ? settings.InteriorCustomSize : defaultSizeHigh;
 		SetVLQuality(GetVLDescriptor(), settings.InteriorQuality);
 	} else {
 		if (globals::game::isVR)
-			SetBooleanSettings(hiddenVRSettings, GetName(), settings.ExteriorEnabled);
+			SetBooleanSettings(hiddenVRSettings, GetName(), settings.ExteriorEnabled && allowed);
 		else
-			*bEnableVolumetricLighting = settings.ExteriorEnabled;
+			*bEnableVolumetricLighting = settings.ExteriorEnabled && allowed;
 		*gVolumetricLightingSizeHigh = static_cast<Quality>(settings.ExteriorQuality) == Quality::Custom ? settings.ExteriorCustomSize : defaultSizeHigh;
 		SetVLQuality(GetVLDescriptor(), settings.ExteriorQuality);
 	}

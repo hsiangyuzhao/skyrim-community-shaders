@@ -48,6 +48,9 @@ namespace Util
 		DynamicCubemaps,         // capture / inferrence / irradiance convolution round-robin
 		GrassOptimizations,      // grass cell uploads + Hi-Z pyramid + per-instance cull dispatches
 		VariableRateShading,     // shading-rate image build + per-tile scene analysis (+ debug tint)
+		VolumetricFogNear,       // (batch 38) volumetric fog near grid: conservative depth + medium + light scattering + integration
+		VolumetricFogFar,        // (batch 38) volumetric fog far grid, same four passes
+		VolumetricShadows,       // (batch 38) sun VSM for smoke and effects: downsample + 11x11 blur
 		Count
 	};
 

@@ -431,7 +431,11 @@ namespace SharedData
 		float directionalInscatteringExponent;
 		float4 inscatteringTint;
 		float cubemapMipLevel;
-		float3 pad;
+		// (batch 38, A1, upstream #2831) second stacked layer; occupies the former float3 pad,
+		// so nothing moves. Density 0 (default) = no second layer = 37c fog.
+		float fogHeight2;
+		float fogHeightFalloff2;
+		float fogDensity2;
 	};
 
 	// (batch 37b) Mirrors VolumetricLighting::CommonBufferData. Appended after every older
@@ -451,6 +455,31 @@ namespace SharedData
 		float SunRadianceCap;
 		float SunGlowIntensity;  // (batch 37c) glow around the procedural sun, x a sunlit white wall; 0 = off
 		float SunGlowWidth;      // (batch 37c) glow falloff width, radians
+	};
+
+	// (batch 38, A1) Mirrors ExponentialHeightFog::VolumetricFogPSData: what a pixel shader needs to
+	// look the froxel volumes up. Appended after PhysSkyExtData (offset 1472). Enabled == 0
+	// whenever the volumes were not built this frame (fog off, master off, interior map ...).
+	struct VolumetricFogSettings
+	{
+		uint Enabled;               // near volume valid this frame
+		uint FarEnabled;            // far volume valid this frame
+		float StartDistance;        // no volumetric fog closer than this (view depth)
+		float EndDistance;          // view depth where the far volume ends
+		float4 NearGridZParams;     // log2(depth * x + y) * z / w = normalized slice (w = slices)
+		float4 FarGridZParams;      // same for the far volume
+		float NearGridEndDistance;  // view depth where the near volume hands over to the far one
+		float UpsampleJitter;       // screen-space jitter of the lookup, in froxels
+		float2 pad0;
+	};
+
+	// (batch 38, A2) Mirrors VolumetricShadows::CommonBufferData, after VolumetricFogSettings
+	// (offset 1536). Non-zero only while the VSM was built this frame.
+	struct VolumetricShadowsSettings
+	{
+		uint ParticleShadows;
+		uint ForwardSoftShadows;
+		uint2 pad0;
 	};
 
 	namespace PhysSkyExtFlags
@@ -491,6 +520,8 @@ namespace SharedData
 		ExponentialHeightFogSettings exponentialHeightFogSettings;
 		VolumetricLightingSettings volumetricLightingSettings;
 		PhysSkyExtData physSkyExtData;
+		VolumetricFogSettings volumetricFogSettings;
+		VolumetricShadowsSettings volumetricShadowsSettings;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);
