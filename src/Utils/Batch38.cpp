@@ -16,6 +16,7 @@ namespace Batch38
 		constexpr RowProvider kRowProviders[] = {
 			// Part B: items 3-5
 			RowsSkinSss,
+			RowsLocalExposure,
 		};
 	}
 

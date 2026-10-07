@@ -284,6 +284,7 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 		.PurkinjeStrength = settings.PurkinjeStrength,
 	};
 	autoExposureCB->Update(cbData);
+	lastExposureCompensation = cbData.ExposureCompensation;
 
 	std::array<ID3D11ShaderResourceView*, 2> srvs = { nullptr };
 	std::array<ID3D11UnorderedAccessView*, 2> uavs = { nullptr };

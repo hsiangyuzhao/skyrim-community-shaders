@@ -59,6 +59,10 @@ struct HistogramAutoExposure : public PostProcessFeature
 
 	std::unique_ptr<Texture2D> texAdapt = nullptr;
 
+	/// (batch 38) Exposure Compensation (linear) of the last Draw, after time-of-day / interior
+	/// overrides. Local Exposure pivots around 0.18 x this, the middle grey this pass targets.
+	float lastExposureCompensation = 1.f;
+
 	virtual void SetupResources() override;
 	virtual void SetupShaders() override;
 	virtual void ReleaseResources() override;

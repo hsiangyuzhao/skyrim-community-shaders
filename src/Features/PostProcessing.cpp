@@ -332,7 +332,14 @@ void PostProcessing::SavePresetTo(std::string a_name)
 }
 
 void PostProcessing::RestoreDefaultSettings()
-{	
+{
+	// (batch 38) The shipped default preset predates Local Exposure; reset it here so the preset
+	// load below only overrides it when a preset actually carries it.
+	if (auto& le = pipeline[static_cast<size_t>(FeaturePipelineIndex::LocalExposure)]) {
+		le->enabled = true;
+		le->RestoreDefaultSettings();
+	}
+
 	try {
 		LoadPresetFrom("default");
 	} catch (const std::exception& e) {
@@ -415,6 +422,9 @@ void PostProcessing::SetupResources()
 	pipeline[static_cast<size_t>(FeaturePipelineIndex::LUT)].get()->enabled = false;
 
 	if (!REL::Module::IsVR()) {
+		// (batch 38, item 4) On by default; Advanced > Batch 38 can still switch it off.
+		pipeline[static_cast<size_t>(FeaturePipelineIndex::LocalExposure)] = std::make_unique<LocalExposure>();
+		pipeline[static_cast<size_t>(FeaturePipelineIndex::LocalExposure)].get()->enabled = true;
 		pipeline[static_cast<size_t>(FeaturePipelineIndex::MotionBlur)] = std::make_unique<MotionBlur>();
 		pipeline[static_cast<size_t>(FeaturePipelineIndex::MotionBlur)].get()->enabled = false;
 		pipeline[static_cast<size_t>(FeaturePipelineIndex::DoF)] = std::make_unique<DoF>();
@@ -515,7 +525,7 @@ void PostProcessing::ReleaseIdleResources()
 		if (!pipe || !pipe->resourcesResident)
 			continue;
 
-		if (pipe->enabled) {
+		if (pipe->enabled && pipe->RuntimeGateOpen()) {
 			pipe->disabledSince = {};
 			continue;
 		}
@@ -635,7 +645,7 @@ void PostProcessing::DrawBeforeUpscaling()
 	PostProcessFeature::TextureInfo lastTexColor = { gameTexMain.texture, gameTexMain.SRV };
 
 	auto drawsHere = [&](const std::unique_ptr<PostProcessFeature>& a_pipe) {
-		return a_pipe && a_pipe->enabled && !a_pipe->DrawAfterColorGrading() &&
+		return a_pipe && a_pipe->enabled && a_pipe->RuntimeGateOpen() && !a_pipe->DrawAfterColorGrading() &&
 		       !(inMainLoadingMenu && a_pipe->DisableInMainLoadingMenu()) && a_pipe->DrawBeforeUpscaling();
 	};
 
@@ -713,7 +723,7 @@ void PostProcessing::PreProcess()
 	// The draw order is unchanged: every regular effect in pipeline order, then every
 	// after-colour-grading one. Collected first so the last effect of the chain is known.
 	auto drawsHere = [&](const std::unique_ptr<PostProcessFeature>& a_pipe, bool a_afterColorGrading) {
-		return a_pipe && a_pipe->enabled && a_pipe->DrawAfterColorGrading() == a_afterColorGrading && !(inMainLoadingMenu && a_pipe->DisableInMainLoadingMenu()) &&
+		return a_pipe && a_pipe->enabled && a_pipe->RuntimeGateOpen() && a_pipe->DrawAfterColorGrading() == a_afterColorGrading && !(inMainLoadingMenu && a_pipe->DisableInMainLoadingMenu()) &&
 		       (!a_pipe->DrawBeforeUpscaling() || !upscaling.loaded);
 	};
 	std::vector<PostProcessFeature*> chain;

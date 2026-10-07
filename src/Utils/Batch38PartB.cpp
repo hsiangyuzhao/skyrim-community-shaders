@@ -55,4 +55,31 @@ namespace Batch38
 		a_rows.push_back(Fix(group, "Screen-space shadows read the shaded pixel, not its neighbour (8b91a37de)", "-"));
 		a_rows.push_back(Fix(group, "No crash when the IsBeastRace keyword is missing (c321154fa)", "-"));
 	}
+
+	void RowsLocalExposure(std::vector<Row>& a_rows)
+	{
+		auto& pp = globals::features::postProcessing;
+		const char* group = "4. Local Exposure";
+		const char* where = "Post-Processing > Local Exposure (list entry; the bars button opens its settings)";
+
+		auto* le = pp.loaded ? static_cast<LocalExposure*>(pp.pipeline[static_cast<size_t>(PostProcessing::FeaturePipelineIndex::LocalExposure)].get()) : nullptr;
+		if (!le) {
+			a_rows.push_back({ group, "Local Exposure", false, false, "", "", where });
+			return;
+		}
+
+		std::string now;
+		if (le->enabled)
+			now = le->lastDrawRan ? std::string(le->lastDrawStatus) : std::format("Idle: {}", le->lastDrawStatus);
+		a_rows.push_back(Toggle(group, "Local Exposure (upstream 86ae0fb3c..b4eb15b70)", true, le->enabled, now, where));
+
+		const auto& s = le->settings;
+		a_rows.push_back({ group, "  Strength / highlight / shadow contrast", true, le->enabled,
+			std::format("{:.2f} / {:.2f} / {:.2f}", s.Strength, s.HighlightContrast, s.ShadowContrast), "", where });
+
+		std::string res = "-";
+		if (le->texOutput)
+			res = std::format("{}x{} (output resolution, after upscaling)", le->texOutput->desc.Width, le->texOutput->desc.Height);
+		a_rows.push_back({ group, "  Runs at", true, le->enabled, "", res, "-" });
+	}
 }
