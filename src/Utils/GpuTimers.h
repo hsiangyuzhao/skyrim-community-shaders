@@ -49,7 +49,7 @@ namespace Util
 		GrassOptimizations,      // grass cell uploads + Hi-Z pyramid + per-instance cull dispatches
 		VariableRateShading,     // shading-rate image build + per-tile scene analysis (+ debug tint)
 		// (batch 38, part B) Split out of their parent rows so the new passes show their own cost.
-		SubsurfaceScatteringPrepass,  // SSS upgrade: copy of the lit image + albedo-removal pre-pass
+		SubsurfaceScatteringPrepass,  // SSS upgrade: albedo-removal pre-pass
 		LocalExposure,                // Post Processing > Local Exposure (taken out of the Post Processing row)
 		Count
 	};

@@ -285,7 +285,7 @@ void SubsurfaceScattering::DrawSSS()
 		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
 
 		if (upgrade) {
-			DrawSSSUpgrade(views, dispatchCount);
+			DrawSSSUpgrade(dispatchCount);
 		} else if (settings.SSMode == 0) {
 			context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 
@@ -336,8 +336,9 @@ void SubsurfaceScattering::DrawSSS()
 		uav = nullptr;
 		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 
-		// Composite SSS result back to main render target
-		{
+		// Composite SSS result back to main render target. (batch 38) The upgrade writes MAIN and the
+		// DLSS-RR guide in its last pass, so it needs neither this pass nor the copy into sssResult.
+		if (!upgrade) {
 			TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Composite");
 
 			views[0] = sssResult->srv.get();
@@ -383,7 +384,8 @@ void SubsurfaceScattering::DrawBatch38Settings()
 			"Batch 38, on by default. Takes the skin colour out of the light before blurring and puts it back after, so the\n"
 			"scatter spreads light instead of smearing skin texture (pores, freckles, brows stay sharp). Also fixes skin\n"
 			"getting darker with Linear Lighting on, and makes the blur width the same in DLAA and DLSS Quality.\n"
-			"Off = the 37c skin scatter. Costs one extra full-screen pass on frames that show faces.");
+			"Off = the 37c skin scatter. Adds a pre-pass but drops 37c's full-screen copy and composite, so it should cost\n"
+			"about the same or less (compare Subsurface Scattering + SSS Pre-pass (38) in the performance overlay).");
 	Batch38::MasterNote();
 
 	if (settings.SSMode == 0) {
@@ -405,7 +407,7 @@ void SubsurfaceScattering::DrawBatch38Settings()
 	ImGui::Spacing();
 }
 
-void SubsurfaceScattering::DrawSSSUpgrade(ID3D11ShaderResourceView* const* a_views, const Util::DispatchCount& a_dispatchCount)
+void SubsurfaceScattering::DrawSSSUpgrade(const Util::DispatchCount& a_dispatchCount)
 {
 	auto context = globals::d3d::context;
 	auto renderer = globals::game::renderer;
@@ -431,10 +433,6 @@ void SubsurfaceScattering::DrawSSSUpgrade(ID3D11ShaderResourceView* const* a_vie
 	{
 		TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Prepass (38)");
 
-		// sssResult starts as the lit image: the blur rewrites only skin pixels and reads each one's
-		// original colour back from here (upstream wrote into MAIN directly; ours composites after).
-		context->CopyResource(sssResult->resource.get(), main.texture);
-
 		ID3D11UnorderedAccessView* uav = diffuseNoAlbedoTex->uav.get();
 		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 		context->CSSetShader(GetComputeShaderPrepassV2(), nullptr, 0);
@@ -448,6 +446,11 @@ void SubsurfaceScattering::DrawSSSUpgrade(ID3D11ShaderResourceView* const* a_vie
 	// Colour input of the blur: the pre-pass output (t1..t4 stay as bound by DrawSSS).
 	ID3D11ShaderResourceView* colorSrv = diffuseNoAlbedoTex->srv.get();
 	context->CSSetShaderResources(0, 1, &colorSrv);
+
+	// Last pass: skin pixels straight into MAIN (each reads its own original colour back from there),
+	// and the DLSS-RR guide for every pixel, as the 37c composite did. No copy, no composite.
+	ID3D11UnorderedAccessView* outUavs[2] = { main.UAV, sssGuide->uav.get() };
+	ID3D11UnorderedAccessView* nullUavs[2] = { nullptr, nullptr };
 
 	if (settings.SSMode == 0) {
 		{
@@ -463,25 +466,21 @@ void SubsurfaceScattering::DrawSSSUpgrade(ID3D11ShaderResourceView* const* a_vie
 			TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Vertical (38)");
 			colorSrv = blurHorizontalTemp->srv.get();
 			context->CSSetShaderResources(0, 1, &colorSrv);
-			ID3D11UnorderedAccessView* uav = sssResult->uav.get();
-			context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+			context->CSSetUnorderedAccessViews(0, 2, outUavs, nullptr);
 			context->CSSetShader(GetComputeShaderVerticalBlurV2(), nullptr, 0);
 			context->Dispatch(a_dispatchCount.x, a_dispatchCount.y, 1);
-			uav = nullptr;
-			context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+			context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
 		}
 	} else {
 		TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Burley (38)");
-		ID3D11UnorderedAccessView* uav = sssResult->uav.get();
-		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		context->CSSetUnorderedAccessViews(0, 2, outUavs, nullptr);
 		context->CSSetShader(GetComputeShaderBurleyV2(), nullptr, 0);
 		context->Dispatch(a_dispatchCount.x, a_dispatchCount.y, 1);
-		uav = nullptr;
-		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
 	}
 
-	// Leave t0 as DrawSSS bound it; the composite rebinds it anyway.
-	context->CSSetShaderResources(0, 1, a_views);
+	colorSrv = nullptr;
+	context->CSSetShaderResources(0, 1, &colorSrv);
 	sampler = nullptr;
 	context->CSSetSamplers(0, 1, &sampler);
 }

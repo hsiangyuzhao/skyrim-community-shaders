@@ -145,8 +145,8 @@ public:
 	ID3D11ComputeShader* GetComputeShaderVerticalBlurV2();
 	ID3D11ComputeShader* GetComputeShaderBurleyV2();
 
-	/// @brief (batch 38) The upgraded chain: copy, pre-pass, then Separable or Burley into sssResult.
-	void DrawSSSUpgrade(ID3D11ShaderResourceView* const* a_views, const Util::DispatchCount& a_dispatchCount);
+	/// @brief (batch 38) The upgraded chain: pre-pass, then Separable or Burley straight into MAIN (+ DLSS-RR guide).
+	void DrawSSSUpgrade(const Util::DispatchCount& a_dispatchCount);
 	/// @brief (batch 38) Settings UI of the upgrade (switch + Separable scatter mode).
 	void DrawBatch38Settings();
 
