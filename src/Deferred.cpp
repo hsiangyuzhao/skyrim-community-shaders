@@ -21,6 +21,7 @@
 
 #include "Hooks.h"
 #include "Utils/Batch37b.h"
+#include "Utils/Batch39Engine.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/OcclusionDryRun.h"
@@ -715,6 +716,10 @@ void Deferred::EndDeferred()
 	{
 		Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOther);
 
+		// (batch 39, item 2) If a slimming switch kept geometry out of the depth prepass, bring
+		// the post-prepass depth copies up to date before anything below reads them.
+		Batch39Engine::AfterOpaquePass();
+
 		// (batch 37a) Occlusion dry run: max-reduce the finished opaque depth into its own Hi-Z
 		// and queue a readback. Writes only its own textures; a no-op unless the test is running.
 		Util::OcclusionDryRun::OnEndDeferred();
@@ -965,6 +970,19 @@ void Deferred::Hooks::BSCubeMapCamera_RenderCubemap::thunk(RE::NiAVObject* camer
 	auto deferred = globals::deferred;
 	auto state = globals::state;
 
+	// (batch 39, item 1) a2 is the bit mask of cube faces to draw (bit i = face i); a4 clears
+	// the camera's scene list after the call. Batch 39 may draw fewer faces (or none); a call
+	// that draws none still goes through, so the scene list is cleared exactly as before.
+	const int faces = Batch39Engine::FilterCubemapFaces(camera, a2, a4);
+	if (faces == 0) {
+		// The reflection pass "ran" this frame as far as Dynamic Cubemaps is concerned; it keeps
+		// using its reflection capture instead of flipping to the plain one on skipped frames.
+		state->activeReflections = true;
+		func(camera, 0, a3, a4, a5);
+		Batch39Engine::NoteCubemapCall(a2, 0);
+		return;
+	}
+
 	{
 		Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOther);
 		deferred->ReflectionsPrepasses();
@@ -972,9 +990,10 @@ void Deferred::Hooks::BSCubeMapCamera_RenderCubemap::thunk(RE::NiAVObject* camer
 	state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsReflections);
 	{
 		Util::GpuPhaseScope gpuPhase(Util::GpuScope::Reflections);
-		func(camera, a2, a3, a4, a5);
+		func(camera, faces, a3, a4, a5);
 	}
 	state->permutationData.ExtraShaderDescriptor &= ~static_cast<uint32_t>(State::ExtraShaderDescriptors::IsReflections);
+	Batch39Engine::NoteCubemapCall(a2, faces);
 }
 
 void Deferred::Hooks::Main_RenderFirstPersonView::thunk(bool a1, bool a2)

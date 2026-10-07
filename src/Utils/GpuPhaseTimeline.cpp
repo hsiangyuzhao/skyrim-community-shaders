@@ -5,6 +5,7 @@
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/Batch39Engine.h"
 #include "Utils/Game.h"
 #include "Utils/GpuTimers.h"
 
@@ -92,6 +93,129 @@ namespace Util
 				return GpuPhase::OpaqueDistant;
 			default:
 				return GpuPhase::OpaqueOther;
+			}
+		}
+
+		/// (batch 39) What a draw belongs to, read off the render pass being submitted (its shader
+		/// property flags), with the shader descriptors as the fallback. Shared by the depth
+		/// prepass and the reflection cubemap breakdowns.
+		enum class DrawKind
+		{
+			Terrain,
+			Objects,
+			Characters,
+			Trees,
+			Grass,
+			LODLand,
+			LODObjects,
+			LODTrees,
+			Sky,
+			Other
+		};
+
+		DrawKind ClassifyDrawKind(RE::BSShader* a_shader, uint32_t a_vertexDescriptor, uint32_t a_pixelDescriptor)
+		{
+			using Flag = RE::BSShaderProperty::EShaderPropertyFlag;
+			const auto type = a_shader->shaderType.get();
+			switch (type) {
+			case RE::BSShader::Type::Grass:
+				return DrawKind::Grass;
+			case RE::BSShader::Type::DistantTree:
+				return DrawKind::LODTrees;
+			case RE::BSShader::Type::Sky:
+				return DrawKind::Sky;
+			case RE::BSShader::Type::Lighting:
+			case RE::BSShader::Type::Utility:
+				break;
+			default:
+				return DrawKind::Other;
+			}
+
+			if (const auto* pass = Batch39Engine::CurrentPass(); pass && pass->shaderProperty) {
+				const auto& flags = pass->shaderProperty->flags;
+				if (flags.any(Flag::kLODLandscape))
+					return DrawKind::LODLand;
+				if (flags.any(Flag::kLODObjects, Flag::kHDLODObjects))
+					return DrawKind::LODObjects;
+				if (flags.any(Flag::kMultiTextureLandscape))
+					return DrawKind::Terrain;
+				if (flags.any(Flag::kTreeAnim))
+					return DrawKind::Trees;
+				if (flags.any(Flag::kSkinned, Flag::kFace))
+					return DrawKind::Characters;
+				return DrawKind::Objects;
+			}
+
+			if (type == RE::BSShader::Type::Lighting) {
+				using Tech = SIE::ShaderCache::LightingShaderTechniques;
+				switch (static_cast<Tech>(0x3F & (a_pixelDescriptor >> 24))) {
+				case Tech::MTLand:
+				case Tech::MTLandLODBlend:
+					return DrawKind::Terrain;
+				case Tech::LODLand:
+				case Tech::LODLandNoise:
+					return DrawKind::LODLand;
+				case Tech::LODObjects:
+				case Tech::LODObjectHD:
+					return DrawKind::LODObjects;
+				case Tech::TreeAnim:
+					return DrawKind::Trees;
+				default:
+					break;
+				}
+				return (a_vertexDescriptor & static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::Skinned)) ? DrawKind::Characters : DrawKind::Objects;
+			}
+
+			using UFlag = SIE::ShaderCache::UtilityShaderFlags;
+			const uint64_t vd = a_vertexDescriptor;
+			if (vd & static_cast<uint64_t>(UFlag::LodLandscape))
+				return DrawKind::LODLand;
+			if (vd & static_cast<uint64_t>(UFlag::LodObject))
+				return DrawKind::LODObjects;
+			if (vd & static_cast<uint64_t>(UFlag::TreeAnim))
+				return DrawKind::Trees;
+			if (vd & static_cast<uint64_t>(UFlag::Skinned))
+				return DrawKind::Characters;
+			return DrawKind::Objects;
+		}
+
+		GpuPhase ClassifyDepth(RE::BSShader* a_shader, uint32_t a_vertexDescriptor, uint32_t a_pixelDescriptor)
+		{
+			switch (ClassifyDrawKind(a_shader, a_vertexDescriptor, a_pixelDescriptor)) {
+			case DrawKind::Terrain:
+				return GpuPhase::DepthTerrain;
+			case DrawKind::Objects:
+				return GpuPhase::DepthObjects;
+			case DrawKind::Characters:
+				return GpuPhase::DepthCharacters;
+			case DrawKind::Trees:
+				return GpuPhase::DepthTrees;
+			case DrawKind::Grass:
+				return GpuPhase::DepthGrass;
+			case DrawKind::LODLand:
+				return GpuPhase::DepthLODLand;
+			case DrawKind::LODObjects:
+				return GpuPhase::DepthLODObjects;
+			case DrawKind::LODTrees:
+				return GpuPhase::DepthLODTrees;
+			default:
+				return GpuPhase::DepthPrepass;
+			}
+		}
+
+		GpuPhase ClassifyReflection(RE::BSShader* a_shader, uint32_t a_vertexDescriptor, uint32_t a_pixelDescriptor)
+		{
+			switch (ClassifyDrawKind(a_shader, a_vertexDescriptor, a_pixelDescriptor)) {
+			case DrawKind::LODLand:
+				return GpuPhase::ReflLODLand;
+			case DrawKind::LODObjects:
+				return GpuPhase::ReflLODObjects;
+			case DrawKind::LODTrees:
+				return GpuPhase::ReflLODTrees;
+			case DrawKind::Sky:
+				return GpuPhase::ReflSky;
+			default:
+				return GpuPhase::Reflections;
 			}
 		}
 
@@ -508,6 +632,12 @@ namespace Util
 				break;
 			case GpuScope::World:
 				top.phase = ClassifyWorld(a_shader);
+				break;
+			case GpuScope::DepthPrepass:
+				top.phase = ClassifyDepth(a_shader, a_vertexDescriptor, a_pixelDescriptor);
+				break;
+			case GpuScope::Reflections:
+				top.phase = ClassifyReflection(a_shader, a_vertexDescriptor, a_pixelDescriptor);
 				break;
 			default:
 				break;

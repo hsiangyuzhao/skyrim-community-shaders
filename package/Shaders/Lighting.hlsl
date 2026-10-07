@@ -809,9 +809,9 @@ float3 GetSnowSpecularColor(PS_INPUT input, float3 worldNormal, float3 viewDirec
 #	if defined(FACEGEN)
 float3 GetFacegenBaseColor(float3 rawBaseColor, float2 uv)
 {
-	float3 detailColor = TexDetailSampler.Sample(SampDetailSampler, uv).xyz;
+	float3 detailColor = TexDetailSampler.SampleBias(SampDetailSampler, uv, SharedData::MaterialMipBias()).xyz;
 	detailColor = float3(3.984375, 3.984375, 3.984375) * (float3(0.00392156886, 0, 0.00392156886) + detailColor);
-	float3 tintColor = TexTintSampler.Sample(SampTintSampler, uv).xyz;
+	float3 tintColor = TexTintSampler.SampleBias(SampTintSampler, uv, SharedData::MaterialMipBias()).xyz;
 	tintColor = tintColor * rawBaseColor * 2.0.xxx;
 	tintColor = tintColor - tintColor * rawBaseColor;
 	return (rawBaseColor * rawBaseColor + tintColor) * detailColor;
@@ -1187,7 +1187,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 					sh0 = TexEnvMaskSampler.SampleLevel(SampEnvMaskSampler, uv, mipLevel).w;
 			}
 
-			complexMaterialColor = TexEnvMaskSampler.Sample(SampEnvMaskSampler, uv);
+			complexMaterialColor = TexEnvMaskSampler.SampleBias(SampEnvMaskSampler, uv, SharedData::SpecularMipBias());
 		}
 	}
 
@@ -1197,7 +1197,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	bool PBRParallax = false;
 	[branch] if ((PBRFlags & PBR::Flags::HasFeatureTexture0) != 0)
 	{
-		float4 sampledCoatProperties = TexRimSoftLightWorldMapOverlaySampler.Sample(SampRimSoftLightWorldMapOverlaySampler, uv);
+		float4 sampledCoatProperties = TexRimSoftLightWorldMapOverlaySampler.SampleBias(SampRimSoftLightWorldMapOverlaySampler, uv, SharedData::MaterialMipBias());
 		sampledCoatColor.rgb *= Color::Diffuse(sampledCoatProperties.rgb);
 		sampledCoatColor.a *= sampledCoatProperties.a;
 	}
@@ -1213,11 +1213,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			eta = lerp(1.0, (1 - sqrt(MultiLayerParallaxData.y)) / (1 + sqrt(MultiLayerParallaxData.y)), sampledCoatColor.w);
 			[branch] if ((PBRFlags & PBR::Flags::CoatNormal) != 0)
 			{
-				entryNormalTS = normalize(TransformNormal(TexBackLightSampler.Sample(SampBackLightSampler, uvOriginal).xyz));
+				entryNormalTS = normalize(TransformNormal(TexBackLightSampler.SampleBias(SampBackLightSampler, uvOriginal, SharedData::MaterialMipBias()).xyz));
 			}
 			else
 			{
-				entryNormalTS = normalize(TransformNormal(TexNormalSampler.Sample(SampNormalSampler, uvOriginal).xyz));
+				entryNormalTS = normalize(TransformNormal(TexNormalSampler.SampleBias(SampNormalSampler, uvOriginal, SharedData::MaterialMipBias()).xyz));
 			}
 			entryNormal = normalize(mul(tbn, entryNormalTS));
 			refractedViewDirection = -refract(-viewDirection, entryNormal, eta);
@@ -1942,7 +1942,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	bool hasSkinExtra = false;
 	bool hasSkinWetness = false;
 	if (skinEnabled) {
-		skinsk = TexRimSoftLightWorldMapOverlaySampler.Sample(SampRimSoftLightWorldMapOverlaySampler, uv);
+		skinsk = TexRimSoftLightWorldMapOverlaySampler.SampleBias(SampRimSoftLightWorldMapOverlaySampler, uv, SharedData::MaterialMipBias());
 		TexSkinExtraSampler.GetDimensions(skinExtraDimensions.x, skinExtraDimensions.y);
 		TexSkinWetnessSampler.GetDimensions(wetnessDimensions.x, wetnessDimensions.y);
 		hasSkinExtra = skinExtraDimensions.x > 32 && skinExtraDimensions.y > 32;
@@ -1951,7 +1951,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float4 skinWetnessNormal = float4(0.f, 0.f, 0.f, 1.f);
 
 	if (hasSkinExtra && SharedData::skinData.skinParams.x > 0.0f) {
-		skinExtra = TexSkinExtraSampler.Sample(SampColorSampler, uv);
+		skinExtra = TexSkinExtraSampler.SampleBias(SampColorSampler, uv, SharedData::MaterialMipBias());
 		skinRoughness = skinExtra.x;
 		skinFuzzMask = skinExtra.y;
 		skinAO = skinExtra.z;
@@ -1961,7 +1961,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		skinRoughnessSet = false;
 	}
 	if (hasSkinWetness && skinEnabled) {
-		skinWetnessSample = TexSkinWetnessSampler.Sample(SampColorSampler, uv);
+		skinWetnessSample = TexSkinWetnessSampler.SampleBias(SampColorSampler, uv, SharedData::MaterialMipBias());
 		if ((skinWetnessSample.y == 0 && skinWetnessSample.z == 0) || (skinWetnessSample.x == skinWetnessSample.y && skinWetnessSample.y == skinWetnessSample.z && skinWetnessSample.w >= 0.99f)) {
 			skinWetMask = skinWetnessSample.x;
 			skinWetnessNormal.xyz = Skin::CalculateNormalFromHeight(skinWetMask, SharedData::skinData.wetParams.w * 0.0001, uv) * 0.5 + 0.5;
@@ -1993,7 +1993,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		else
 	normal.xyz = normal.xzy * 2.0.xxx + -1.0.xxx;
 	normal.w = 1;
-	glossiness = TexSpecularSampler.Sample(SampSpecularSampler, uv).x;
+	glossiness = TexSpecularSampler.SampleBias(SampSpecularSampler, uv, SharedData::SpecularMipBias()).x;
 #		endif  // LODLANDNOISE
 #	elif (defined(SNOW) && defined(LANDSCAPE))
 	normal.xyz = GetLandNormal(landSnowMask1, normal.xyz, uv, SampNormalSampler, TexNormalSampler);
@@ -2062,7 +2062,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(BACK_LIGHTING)
 	if (SharedData::hairSpecularSettings.Enabled) {
 		uint2 hairFlowDimensions = uint2(0, 0);
-		sampledHairFlow = float3(TexBackLightSampler.Sample(SampBackLightSampler, uv).xy, 0.5f);
+		sampledHairFlow = float3(TexBackLightSampler.SampleBias(SampBackLightSampler, uv, SharedData::MaterialMipBias()).xy, 0.5f);
 		TexBackLightSampler.GetDimensions(hairFlowDimensions.x, hairFlowDimensions.y);
 		useHairFlowMap = (sampledHairFlow.x > 0.0 || sampledHairFlow.y > 0.0) && hairFlowDimensions.x > 32 && hairFlowDimensions.y > 32;
 		sampledHairFlow = useHairFlowMap ? sampledHairFlow * 2.0f - 1.0f : float3(0.5f, 0.5f, 0.5f);
@@ -2110,7 +2110,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	endif  // SNOW
 
 #	if defined(BACK_LIGHTING)
-	float4 backLightColor = TexBackLightSampler.Sample(SampBackLightSampler, uv);
+	float4 backLightColor = TexBackLightSampler.SampleBias(SampBackLightSampler, uv, SharedData::MaterialMipBias());
 #		if defined(HAIR) && defined(CS_HAIR)
 	if (useHairFlowMap) {
 		backLightColor = 0.0f;
@@ -2119,7 +2119,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	endif  // BACK_LIGHTING
 
 #	if (defined(RIM_LIGHTING) || defined(SOFT_LIGHTING) || defined(LOAD_SOFT_LIGHTING))
-	float4 rimSoftLightColor = TexRimSoftLightWorldMapOverlaySampler.Sample(SampRimSoftLightWorldMapOverlaySampler, uv);
+	float4 rimSoftLightColor = TexRimSoftLightWorldMapOverlaySampler.SampleBias(SampRimSoftLightWorldMapOverlaySampler, uv, SharedData::MaterialMipBias());
 #	endif  // RIM_LIGHTING || SOFT_LIGHTING
 
 	uint numLights = min(7, uint(NumLightNumShadowLight.x));
@@ -2159,7 +2159,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		const float3 tangentNormal = normal.xyz;
 #		endif  // MODELSPACENORMALS
 		float3 detailNormal = float3(Skin::TexSkinDetailNormal.SampleBias(SampNormalSampler, detailUV, SharedData::MipBias).xy, 0.5f);
-		skinAO *= Skin::TexSkinDetailNormal.Sample(SampNormalSampler, detailUV).w;
+		skinAO *= Skin::TexSkinDetailNormal.SampleBias(SampNormalSampler, detailUV, SharedData::MaterialMipBias()).w;
 		detailNormal = (detailNormal * 2.0 - 1.0) * SharedData::skinData.skinDetailParams.z;
 		float3 combinedTangentNormal = normalize(float3(Skin::ReorientNormal(detailNormal, tangentNormal).xy, tangentNormal.z));
 		float3 combinedNormal = normalize(mul(tbn, combinedTangentNormal));
@@ -2226,11 +2226,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		elif !defined(FACEGEN) && !defined(MULTI_LAYER_PARALLAX) && !defined(PARALLAX) && !defined(SPARKLE)
 	if (ProjectedUVParams3.w > 0.5) {
 		float2 projNormalDiffuseUv = ProjectedUVParams3.x * projNoiseUv;
-		float3 projNormal = TransformNormal(TexProjNormalSampler.Sample(SampProjNormalSampler, projNormalDiffuseUv).xyz);
+		float3 projNormal = TransformNormal(TexProjNormalSampler.SampleBias(SampProjNormalSampler, projNormalDiffuseUv, SharedData::MaterialMipBias()).xyz);
 		float2 projDetailNormalUv = ProjectedUVParams3.y * projNoiseUv;
-		float3 projDetailNormal = TexProjDetail.Sample(SampProjDetailSampler, projDetailNormalUv).xyz;
+		float3 projDetailNormal = TexProjDetail.SampleBias(SampProjDetailSampler, projDetailNormalUv, SharedData::MaterialMipBias()).xyz;
 		float3 finalProjNormal = normalize(TransformNormal(projDetailNormal) * float3(1, 1, projNormal.z) + float3(projNormal.xy, 0));
-		float3 projBaseColor = Color::ColorToLinear(TexProjDiffuseSampler.Sample(SampProjDiffuseSampler, projNormalDiffuseUv).xyz) * ProjectedUVParams2.xyz;
+		float3 projBaseColor = Color::ColorToLinear(TexProjDiffuseSampler.SampleBias(SampProjDiffuseSampler, projNormalDiffuseUv, SharedData::MaterialMipBias()).xyz) * ProjectedUVParams2.xyz;
 		projectedMaterialWeight = smoothstep(0, 1, 5 * (0.1 + projWeight));
 #			if defined(TRUE_PBR)
 		projBaseColor = saturate(Color::ColorToLinear(EnvmapData.xyz) * projBaseColor);
@@ -2344,7 +2344,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		pbrSurfaceProperties.Thickness = PBRParams2.w;
 		[branch] if ((PBRFlags & PBR::Flags::HasFeatureTexture0) != 0)
 		{
-			float4 sampledSubsurfaceProperties = TexRimSoftLightWorldMapOverlaySampler.Sample(SampRimSoftLightWorldMapOverlaySampler, uv);
+			float4 sampledSubsurfaceProperties = TexRimSoftLightWorldMapOverlaySampler.SampleBias(SampRimSoftLightWorldMapOverlaySampler, uv, SharedData::MaterialMipBias());
 			pbrSurfaceProperties.SubsurfaceColor *= Color::Diffuse(sampledSubsurfaceProperties.xyz);
 			pbrSurfaceProperties.Thickness *= sampledSubsurfaceProperties.w;
 		}
@@ -2364,7 +2364,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 		[branch] if ((PBRFlags & PBR::Flags::HasFeatureTexture1) != 0)
 		{
-			float4 sampledCoatProperties = TexBackLightSampler.Sample(SampBackLightSampler, coatUv);
+			float4 sampledCoatProperties = TexBackLightSampler.SampleBias(SampBackLightSampler, coatUv, SharedData::MaterialMipBias());
 			pbrSurfaceProperties.CoatRoughness *= sampledCoatProperties.w;
 			[branch] if ((PBRFlags & PBR::Flags::CoatNormal) != 0)
 			{
@@ -2380,7 +2380,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		pbrSurfaceProperties.FuzzWeight = MultiLayerParallaxData.w;
 		[branch] if ((PBRFlags & PBR::Flags::HasFeatureTexture1) != 0)
 		{
-			float4 sampledFuzzProperties = TexBackLightSampler.Sample(SampBackLightSampler, uv);
+			float4 sampledFuzzProperties = TexBackLightSampler.SampleBias(SampBackLightSampler, uv, SharedData::MaterialMipBias());
 			pbrSurfaceProperties.FuzzColor *= Color::Diffuse(sampledFuzzProperties.xyz);
 			pbrSurfaceProperties.FuzzWeight *= sampledFuzzProperties.w;
 		}
@@ -2455,7 +2455,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	if (envMask > 0.0) {
 		if (EnvmapData.y) {
-			envMask *= TexEnvMaskSampler.Sample(SampEnvMaskSampler, uv).x;
+			envMask *= TexEnvMaskSampler.SampleBias(SampEnvMaskSampler, uv, SharedData::SpecularMipBias()).x;
 		} else {
 			envMask *= glossiness;
 		}
@@ -3388,7 +3388,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif
 	[branch] if (hasEmissive)
 	{
-		float3 glowColor = Color::Glowmap(TexGlowSampler.Sample(SampGlowSampler, uv).xyz);
+		float3 glowColor = Color::Glowmap(TexGlowSampler.SampleBias(SampGlowSampler, uv, SharedData::MaterialMipBias()).xyz);
 		emitColor *= glowColor;
 	}
 #	endif
@@ -3729,14 +3729,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	color.xyz *= vertexColor;
 
 #	if defined(MULTI_LAYER_PARALLAX)
-	float layerValue = MultiLayerParallaxData.x * TexLayerSampler.Sample(SampLayerSampler, uv).w;
+	float layerValue = MultiLayerParallaxData.x * TexLayerSampler.SampleBias(SampLayerSampler, uv, SharedData::MaterialMipBias()).w;
 	float3 tangentViewDirection = mul(viewDirection, tbn);
 	float3 layerNormal = MultiLayerParallaxData.yyy * (normalColor.xyz * 2.0.xxx + float3(-1, -1, -2)) + float3(0, 0, 1);
 	float layerViewAngle = dot(-tangentViewDirection.xyz, layerNormal.xyz) * 2;
 	float3 layerViewProjection = -layerNormal.xyz * layerViewAngle.xxx - tangentViewDirection.xyz;
 	float2 layerUv = uv * MultiLayerParallaxData.zw + (0.0009765625 * (layerValue / abs(layerViewProjection.z))).xx * layerViewProjection.xy;
 
-	float3 layerColor = TexLayerSampler.Sample(SampLayerSampler, layerUv).xyz;
+	float3 layerColor = TexLayerSampler.SampleBias(SampLayerSampler, layerUv, SharedData::MaterialMipBias()).xyz;
 
 	float mlpBlendFactor = saturate(viewNormalAngle) * (1.0 - baseColor.w);
 
@@ -3955,8 +3955,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			0.333333,
 		};
 
-		float testTmp = 0;
-		if (MaterialData.z - maskValues[alphaMask.x] < 0) {
+		// (batch 39, item 3) Per-frame noise instead of the fixed pattern when Temporal LOD dither
+		// is on; same pixel and frame as the depth prepass (Utility.hlsl), so the same pixels stay.
+		// The reflection cubemap is not accumulated over frames: it keeps a still pattern.
+		const uint stippleFrame = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection) ? 0 : SharedData::FrameCount;
+		const float stippleThreshold = SharedData::LODStippleThreshold(uint2(input.Position.xy), maskValues[alphaMask.x], stippleFrame);
+		if (MaterialData.z - stippleThreshold < 0) {
 			discard;
 		}
 	}

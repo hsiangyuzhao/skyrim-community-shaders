@@ -212,7 +212,8 @@ PS_OUTPUT main(PS_INPUT input)
 	uint2 temp = uint2(input.Position.xy);
 	uint index = ((temp.x << 2) & 12) | (temp.y & 3);
 
-	float depthOffset = 0.5 - DepthOffsets[index];
+	// (batch 39, item 3) Per-frame noise instead of the fixed 4x4 pattern when Temporal LOD dither is on.
+	float depthOffset = 0.5 - SharedData::LODStippleThreshold(temp, DepthOffsets[index], SharedData::FrameCount);
 	float depthModifier = (input.Depth.w * depthOffset) + input.Depth.z - 0.5;
 
 	if (depthModifier < 0) {

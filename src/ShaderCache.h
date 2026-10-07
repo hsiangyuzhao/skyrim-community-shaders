@@ -536,6 +536,9 @@ namespace SIE
 			// Community Shaders only, never set by the engine: selects the GRASS_OPTIMIZATIONS permutation,
 			// which Grass Optimizations binds around its own indirect draws.
 			Optimized = 0x40000000,
+			// (batch 39, item 2) Community Shaders only, never set by the engine: the main-pass
+			// GRASS_MAIN_ALPHA_TEST permutation, used while grass skips the depth prepass.
+			MainAlphaTest = 0x20000000,
 		};
 
 		enum class ParticleShaderTechniques

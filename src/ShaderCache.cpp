@@ -7,6 +7,7 @@
 
 #include "Features/DynamicCubemaps.h"
 #include "Features/GrassOptimizations.h"
+#include "Utils/Batch39Engine.h"
 
 namespace SIE
 {
@@ -234,6 +235,11 @@ namespace SIE
 			// regular permutations compile exactly as without the feature.
 			if ((descriptor & static_cast<uint32_t>(ShaderCache::GrassShaderFlags::Optimized)) && globals::features::grassOptimizations.loaded) {
 				defines[lastIndex++] = { globals::features::grassOptimizations.GetShaderDefineName().data(), nullptr };
+			}
+
+			// (batch 39, item 2) Selected while grass skips the depth prepass; never set by the engine.
+			if (descriptor & static_cast<uint32_t>(ShaderCache::GrassShaderFlags::MainAlphaTest)) {
+				defines[lastIndex++] = { "GRASS_MAIN_ALPHA_TEST", nullptr };
 			}
 
 			defines[lastIndex] = { nullptr, nullptr };
@@ -1907,6 +1913,7 @@ namespace SIE
 		}
 		compilationSet.Clear();
 		globals::deferred->ClearShaderCache();
+		Batch39Engine::ClearShaderCache();
 		for (auto* feature : Feature::GetFeatureList()) {
 			if (feature->loaded) {
 				feature->ClearShaderCache();

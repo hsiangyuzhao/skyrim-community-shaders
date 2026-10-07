@@ -40,7 +40,16 @@ namespace Util
 
 		// Main view, before the world
 		WaterPrep,     // engine water work before the main view (reflections, ripples)
-		DepthPrepass,  // engine depth-only prepass
+		DepthPrepass,  // engine depth-only prepass; (batch 39) the draws no row below claims, and clears
+		// (batch 39, item 2) The depth prepass split per draw, by the object being drawn.
+		DepthTerrain,
+		DepthObjects,
+		DepthCharacters,
+		DepthTrees,
+		DepthGrass,
+		DepthLODLand,
+		DepthLODObjects,
+		DepthLODTrees,
 
 		// Opaque G-buffer pass (Deferred::StartDeferred -> EndDeferred), split per draw
 		OpaqueTerrain,
@@ -58,7 +67,12 @@ namespace Util
 		WorldOther,   // world work before any draw could be classified
 
 		FirstPerson,
-		Reflections,  // BSCubeMapCamera cubemaps
+		Reflections,  // BSCubeMapCamera cubemaps; (batch 39) the draws no row below claims, and clears
+		// (batch 39, item 1) The water reflection cubemap split per draw.
+		ReflLODLand,
+		ReflLODObjects,
+		ReflLODTrees,
+		ReflSky,
 		Imagespace,   // the engine's post-processing chain (and imagespace draws inside the world)
 		UI,
 
@@ -80,11 +94,11 @@ namespace Util
 		ShadowLocal,
 		ShadowMask,
 		WaterPrep,
-		DepthPrepass,
-		World,   // splits into sky / water / transparent / imagespace
-		Opaque,  // splits into terrain / objects / characters / trees / grass / LOD
+		DepthPrepass,  // (batch 39) splits per draw into the Depth* rows
+		World,         // splits into sky / water / transparent / imagespace
+		Opaque,        // splits into terrain / objects / characters / trees / grass / LOD
 		FirstPerson,
-		Reflections,
+		Reflections,  // (batch 39) splits per draw into the Refl* rows
 		Imagespace,
 		UI,
 		CsPasses,
@@ -214,7 +228,8 @@ namespace Util
 		static constexpr int kFramesInFlight = 5;
 		// Per-frame cap. Normal frames need tens to a few hundred; a frame that runs out is
 		// dropped (its attribution after the cap would be wrong) and counted in the report.
-		static constexpr int kMaxTimestamps = 2048;
+		// (batch 39) 4096: the depth prepass and the reflection cubemap now switch rows per draw too.
+		static constexpr int kMaxTimestamps = 4096;
 		static constexpr int kMaxDepth = 16;
 		static constexpr float kSmoothingOld = 0.95f;
 		static constexpr float kSmoothingNew = 0.05f;

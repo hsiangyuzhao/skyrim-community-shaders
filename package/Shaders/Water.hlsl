@@ -783,12 +783,14 @@ float3 GetWaterSpecularColor(PS_INPUT input, float3 normal, float3 viewDirection
 
 #				if defined(VR)
 			// Reflection cubemap is incorrect for interiors in VR, ignore it
-			if (Permutation::PixelShaderDescriptor & Permutation::WaterFlags::Interior || SharedData::HideSky)
+			// (batch 39, item 1) Hand-off: the engine cubemap is not drawn, Dynamic Cubemaps at every distance.
+			if (Permutation::PixelShaderDescriptor & Permutation::WaterFlags::Interior || SharedData::HideSky || (SharedData::Batch39Flags & SharedData::Batch39Flag::WaterDynamicCubemapOnly))
 				reflectionColor = dynamicCubemap.xyz;
 			else
 				reflectionColor = lerp(dynamicCubemap.xyz, CubeMapTex.SampleLevel(CubeMapSampler, R, 0).xyz, saturate(length(input.WPosition.xyz) / 1024.0));
 #				else
-			if (SharedData::HideSky)
+			// (batch 39, item 1) Hand-off: the engine cubemap is not drawn, Dynamic Cubemaps at every distance.
+			if (SharedData::HideSky || (SharedData::Batch39Flags & SharedData::Batch39Flag::WaterDynamicCubemapOnly))
 				reflectionColor = dynamicCubemap.xyz;
 			else
 				reflectionColor = lerp(dynamicCubemap.xyz, CubeMapTex.SampleLevel(CubeMapSampler, R, 0).xyz, saturate(length(input.WPosition.xyz) / 1024.0));

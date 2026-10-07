@@ -20,6 +20,8 @@
 #include "Utils/Batch36f.h"
 #include "Utils/Batch37b.h"
 #include "Utils/Batch38.h"
+#include "Utils/Batch39.h"
+#include "Utils/Batch39Engine.h"
 #include "Utils/FileSystem.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
@@ -41,6 +43,10 @@ void State::Draw()
 
 	// Per-draw shading-rate selection; a single branch unless the opaque pass has VRS bound.
 	globals::features::variableRateShading.OnDraw();
+
+	// (batch 39, item 2) Depth writes for geometry that skipped the depth prepass. A couple of
+	// branches unless a prepass slimming switch is on.
+	Batch39Engine::OnDraw(currentShader, currentVertexDescriptor, currentPixelDescriptor);
 
 	if (shaderCache->IsEnabled()) {
 		if (terrainBlending.loaded)
@@ -202,6 +208,9 @@ void State::Reset()
 		RE::GetINISetting("bEnableImprovedSnow:Display")->data.b = false;
 	}
 
+	// (batch 39, items 1-2, 4) Engine INI overrides for the next frame, 16x AF swap, statistics.
+	Batch39Engine::OnFrameStart();
+
 	activeReflections = false;
 }
 
@@ -350,6 +359,10 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				Batch37b::Load(advanced["Batch 37b"]);
 			if (advanced.contains("Batch 38"))
 				Batch38::Load(advanced["Batch 38"]);
+			if (advanced.contains("Batch 39"))
+				Batch39::Load(advanced["Batch 39"]);
+			if (advanced.contains("Batch 39 Engine"))
+				Batch39Engine::Load(advanced["Batch 39 Engine"]);
 		}
 
 		if (settings["General"].is_object()) {
@@ -495,6 +508,8 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Batch 36f"] = Batch36f::Save();
 	advanced["Batch 37b"] = Batch37b::Save();
 	advanced["Batch 38"] = Batch38::Save();
+	advanced["Batch 39"] = Batch39::Save();
+	advanced["Batch 39 Engine"] = Batch39Engine::Save();
 	settings["Advanced"] = advanced;
 
 	json general;
@@ -753,6 +768,12 @@ void State::ModifyShaderLookup(const RE::BSShader& a_shader, uint& a_vertexDescr
 					technique = 0;
 				}
 				a_vertexDescriptor = flags | technique;
+
+				// (batch 39, item 2) Grass that skipped the depth prepass cuts its blades out in
+				// the main pass itself (GRASS_MAIN_ALPHA_TEST); its pixel shader is otherwise the same.
+				if ((a_pixelDescriptor & 0xF) != static_cast<uint32_t>(SIE::ShaderCache::GrassShaderTechniques::RenderDepth) &&
+					Batch39Engine::PrepassSkipGrassActive())
+					a_pixelDescriptor |= Batch39Engine::kGrassMainAlphaTestFlag;
 			}
 			break;
 		}
@@ -848,6 +869,10 @@ void State::UpdateSharedData([[maybe_unused]] bool a_inWorld, [[maybe_unused]] b
 		} else {
 			data.MipBias = 0;
 		}
+
+		// (batch 39) Temporal LOD dither, extended mip bias, water cubemap hand-off. Read the same
+		// way for the depth prepass (EarlyPrepasses) and the main pass (StartDeferred) of a frame.
+		data.Batch39Flags = Batch39Engine::ShaderFlags();
 
 		sharedDataCB->Update(data);
 	}

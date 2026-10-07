@@ -29,6 +29,7 @@
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/Batch39Engine.h"
 #include "Utils/FileSystem.h"
 #include "Utils/Format.h"
 #include "Utils/DenoiserTimers.h"
@@ -1730,8 +1731,19 @@ namespace
 					{ P::ShadowMask, "Shadow mask", "Full-screen passes that work out which pixels are in shadow." },
 					{ P::ShadowOther, "Other shadow work", "Shadow-pass time outside the per-light drawing (setup, clears)." },
 				} },
-			{ nullptr, nullptr,
-				{ { P::DepthPrepass, "Depth prepass", "The engine's depth-only pass over the scene,\nbefore the main geometry is drawn." } } },
+			// (batch 39, item 2) Split per draw by the object being drawn.
+			{ "Depth prepass", "The engine's depth-only pass over the scene, before the main geometry is drawn.\nLets the main pass skip pixels that end up hidden.",
+				{
+					{ P::DepthTerrain, "Terrain", "Landscape around the player." },
+					{ P::DepthObjects, "Objects", "Solid objects: buildings, rocks, clutter, furniture..." },
+					{ P::DepthCharacters, "Characters", "People and creatures." },
+					{ P::DepthTrees, "Trees", "Full-detail trees." },
+					{ P::DepthGrass, "Grass", "Grass blades (alpha-tested). Advanced > Batch 39 can leave grass out of the prepass." },
+					{ P::DepthLODLand, "LOD terrain", "Far-away terrain (bLodZPrepass)." },
+					{ P::DepthLODObjects, "LOD objects", "Far-away objects (distant buildings, mountains)." },
+					{ P::DepthLODTrees, "LOD trees", "Far-away tree billboards." },
+					{ P::DepthPrepass, "Other", "Clears and anything else in the prepass." },
+				} },
 			{ "Opaque geometry", "The main pass that draws all solid geometry.",
 				{
 					{ P::OpaqueTerrain, "Terrain", "Landscape around the player." },
@@ -1751,7 +1763,18 @@ namespace
 						"glass, particles, spell effects, fire, smoke, rain." },
 					{ P::WorldOther, "Other world work", "Main scene work that could not be assigned to any row here." },
 					{ P::FirstPerson, "First person", "Your hands and weapon in first person." },
-					{ P::Reflections, "Reflections", "The engine's cubemap reflections." },
+				} },
+			// (batch 39, item 1) Split per draw. The cubemap holds only these four kinds of things.
+			{ "Reflections", "The engine's water reflection cubemap (distant water). Advanced > Batch 39 can thin it out.",
+				{
+					{ P::ReflLODLand, "LOD terrain", "Far-away terrain in the reflection (bReflectLODLand)." },
+					{ P::ReflLODObjects, "LOD objects", "Far-away objects in the reflection (bReflectLODObjects)." },
+					{ P::ReflLODTrees, "LOD trees", "Far-away trees in the reflection (bReflectLODTrees)." },
+					{ P::ReflSky, "Sky", "Sky, clouds, sun and moons in the reflection (bReflectSky)." },
+					{ P::Reflections, "Other", "Clears and anything else in the reflection pass." },
+				} },
+			{ nullptr, nullptr,
+				{
 					{ P::Imagespace, "Post-processing (game)",
 						"The game's own image effects: bloom, tonemapping, TAA,\n"
 						"depth of field, underwater, and similar." },
@@ -1844,7 +1867,23 @@ namespace
 		case P::WaterPrep:
 			return "water_prep";
 		case P::DepthPrepass:
-			return "depth_prepass";
+			return "depth_prepass_other";  // (batch 39) the whole prepass is the "Depth prepass" group now
+		case P::DepthTerrain:
+			return "depth_prepass_terrain";
+		case P::DepthObjects:
+			return "depth_prepass_objects";
+		case P::DepthCharacters:
+			return "depth_prepass_characters";
+		case P::DepthTrees:
+			return "depth_prepass_trees";
+		case P::DepthGrass:
+			return "depth_prepass_grass";
+		case P::DepthLODLand:
+			return "depth_prepass_lod_terrain";
+		case P::DepthLODObjects:
+			return "depth_prepass_lod_objects";
+		case P::DepthLODTrees:
+			return "depth_prepass_lod_trees";
 		case P::OpaqueTerrain:
 			return "opaque_terrain";
 		case P::OpaqueObjects:
@@ -1870,7 +1909,15 @@ namespace
 		case P::FirstPerson:
 			return "first_person";
 		case P::Reflections:
-			return "reflections";
+			return "reflections_other";  // (batch 39) the whole cubemap is the "Reflections" group now
+		case P::ReflLODLand:
+			return "reflections_lod_terrain";
+		case P::ReflLODObjects:
+			return "reflections_lod_objects";
+		case P::ReflLODTrees:
+			return "reflections_lod_trees";
+		case P::ReflSky:
+			return "reflections_sky";
 		case P::Imagespace:
 			return "imagespace";
 		case P::UI:
@@ -4237,6 +4284,28 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 			{ "dropped_frames", report.droppedFrames },
 			{ "measuring", report.hasSample },
 		};
+		// (batch 39) Group sums, so "depth_prepass" / "reflections" stay comparable with older
+		// snapshots, where each was a single row.
+		json groups = json::object();
+		for (size_t g = 0; g < layout.size(); ++g) {
+			if (!layout[g].label)
+				continue;
+			float draws = 0.0f, lastMs = 0.0f, lastDraws = 0.0f;
+			for (const auto& row : layout[g].rows) {
+				const size_t p = static_cast<size_t>(row.phase);
+				draws += report.draws[p];
+				lastMs += report.lastMs[p];
+				lastDraws += report.lastDraws[p];
+			}
+			groups[layout[g].label] = {
+				{ "gpu_ms", shown(view.engine, kEngineGroupRowIdBase + static_cast<int>(g)) },
+				{ "cpu_ms", shown(view.engineCpu, kEngineGroupRowIdBase + static_cast<int>(g)) },
+				{ "draws", draws },
+				{ "gpu_ms_last_frame", lastMs },
+				{ "draws_last_frame", lastDraws },
+			};
+		}
+		t["engine_groups"] = std::move(groups);
 	}
 
 	// ---- denoiser ----
@@ -4323,6 +4392,9 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 
 	// ---- occlusion dry run ----
 	j["occlusion"] = Util::OcclusionDryRun::ToJson();
+
+	// ---- (batch 39, items 1-4) reflection cubemap + depth prepass breakdowns, switches ----
+	j["batch39_engine"] = Batch39Engine::DiagnosticsJson();
 	return j;
 }
 

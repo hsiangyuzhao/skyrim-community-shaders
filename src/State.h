@@ -266,7 +266,7 @@ public:
 		uint InMapMenu;
 		uint HideSky;
 		float MipBias;
-		float pad0;
+		uint Batch39Flags;  ///< (batch 39) Batch39Engine::ShaderFlag bits; was padding
 	};
 	STATIC_ASSERT_ALIGNAS_16(SharedDataCB);
 
