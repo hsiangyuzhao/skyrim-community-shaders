@@ -2,15 +2,81 @@
 
 #include <DDSTextureLoader.h>
 
+#include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/Batch38.h"
 #include "Utils/GpuTimers.h"
+
+#include <numbers>
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Skylighting::Settings,
 	MaxZenith,
 	MinDiffuseVisibility,
-	MinSpecularVisibility)
+	MinSpecularVisibility,
+	FixRoofMarkers,
+	FixResetClearsProbes,
+	FixZenithClamp,
+	FixZenithRadius,
+	FixFadeOutGridOffset,
+	SkipOccludersBelowGrid)
+
+bool Skylighting::RoofMarkersActive() const { return Batch38::IsOn() && settings.FixRoofMarkers; }
+bool Skylighting::ResetClearsProbesActive() const { return Batch38::IsOn() && settings.FixResetClearsProbes; }
+bool Skylighting::FadeOutGridOffsetActive() const { return Batch38::IsOn() && settings.FixFadeOutGridOffset; }
+bool Skylighting::SkipOccludersBelowGridActive() const { return Batch38::IsOn() && settings.SkipOccludersBelowGrid; }
+
+float Skylighting::EffectiveMaxZenith() const
+{
+	if (!(Batch38::IsOn() && settings.FixZenithClamp))
+		return settings.MaxZenith;
+	// (bff82b03e) A negative or non-finite zenith turns the sample disc radius into NaN.
+	return std::isfinite(settings.MaxZenith) ? std::clamp(settings.MaxZenith, 0.0f, std::numbers::pi_v<float> / 2.0f) : Settings{}.MaxZenith;
+}
+
+float Skylighting::SampleDiscRadius(float a_u) const
+{
+	const float sinZenith = sin(EffectiveMaxZenith());
+	// (4b5b99783) Uniform disc of radius sin(zenith) is sqrt(u) * sin(zenith). 37c took
+	// sqrt(u * sin(zenith)), a wider disc (sqrt(sin) > sin below 90 deg; identical at 90 deg).
+	if (Batch38::IsOn() && settings.FixZenithRadius)
+		return sqrt(a_u) * sinZenith;
+	return sqrt(a_u * sinZenith);
+}
+
+void Skylighting::DrawBatch38Settings()
+{
+	ImGui::SeparatorText("Fixes (Batch 38)");
+	if (!Batch38::IsOn())
+		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 38 master switch is off (37c behaviour).");
+
+	ImGui::Checkbox("Roofs flagged as editor markers block the sky (ca63a41d5)", &settings.FixRoofMarkers);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Some buildings and roofs carry an 'editor marker' flag in their mesh. 37c left every such mesh out of the\n"
+			"sky-occlusion map, so sky light leaked in under those roofs (porches, sheds, half-open interiors).\n"
+			"Builds up over a few seconds; press Rebuild Skylighting to see it at once.");
+	ImGui::Checkbox("Rebuild / loading screen resets probes to open sky (5b5361f53)", &settings.FixResetClearsProbes);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Probes the occlusion map does not reach no longer keep values from before the reset.");
+	ImGui::Checkbox("Keep Max Zenith Angle within 0-90 deg (bff82b03e)", &settings.FixZenithClamp);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("A typed-in value outside 0-90 deg (or a broken saved value) no longer breaks the sampling.");
+	ImGui::Checkbox("Correct sampling cone for Max Zenith Angle (4b5b99783)", &settings.FixZenithRadius);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Sky directions are now really limited to the Max Zenith Angle. No change at 90 deg (the default).");
+	ImGui::Checkbox("Edge fade-out centred on the probe grid (4b5b99783)", &settings.FixFadeOutGridOffset);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("The fade to open sky at the far edge of the probe area now lines up with the probes (off by up to half a probe before).");
+	ImGui::Checkbox("Skip objects below the probe grid in the height map (816888f04)", &settings.SkipOccludersBelowGrid);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Speed-up: objects entirely below every probe cannot block their view of the sky, so they are no longer drawn\n"
+			"into the height map. Same picture, fewer draw calls (Skylighting Height Map row).");
+	if (SkipOccludersBelowGridActive())
+		ImGui::TextDisabled("Objects skipped in the last height map: %u", occludersSkippedBelowGridLast);
+}
 
 void Skylighting::LoadSettings(json& o_json)
 {
@@ -30,8 +96,17 @@ void Skylighting::RestoreDefaultSettings()
 void Skylighting::ResetSkylighting()
 {
 	auto context = globals::d3d::context;
-	UINT clr[1] = { 0 };
+	// ClearUnorderedAccessViewUint always reads four values (37c passed a one-element array).
+	const UINT clr[4] = { 0, 0, 0, 0 };
 	context->ClearUnorderedAccessViewUint(texAccumFramesArray->uav.get(), clr);
+	if (ResetClearsProbesActive()) {
+		// (batch 38, 5b5361f53) Unit SH (fully unoccluded), matching UpdateProbesCS's unitSH;
+		// probes the occlusion map does not reach would otherwise keep the previous values.
+		const float unitSH[4] = { std::sqrt(4.0f * std::numbers::pi_v<float>), 0.0f, 0.0f, 0.0f };
+		context->ClearUnorderedAccessViewFloat(texProbeArray->uav.get(), unitSH);
+	}
+	// (batch 38, 816888f04) The grid bottom is stale until the next in-world buffer update.
+	probeGridBottomZ = -FLT_MAX;
 	queuedResetSkylighting = false;
 }
 
@@ -49,9 +124,12 @@ void Skylighting::DrawSettings()
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Changes below require rebuilding, a loading screen, or moving away from the current location to apply.");
 
-	ImGui::SliderAngle("Max Zenith Angle", &settings.MaxZenith, 0, 90);
+	ImGui::SliderAngle("Max Zenith Angle", &settings.MaxZenith, 0, 90, "%.0f deg",
+		(Batch38::IsOn() && settings.FixZenithClamp) ? ImGuiSliderFlags_AlwaysClamp : ImGuiSliderFlags_None);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Smaller angles creates more focused top-down shadow.");
+
+	DrawBatch38Settings();
 }
 
 void Skylighting::SetupResources()
@@ -188,6 +266,7 @@ Skylighting::SkylightingCB Skylighting::GetCommonBufferData(bool a_inWorld)
 	auto cellID = eyePos / cellSize;
 	cellID = { round(cellID.x), round(cellID.y), round(cellID.z) };
 	auto cellOrigin = cellID * cellSize;
+	probeGridBottomZ = cellOrigin.z - cellSize.z * probeArrayDims[2] * .5f;
 	float3 cellIDDiff = prevCellID - cellID;
 	prevCellID = cellID;
 
@@ -195,6 +274,7 @@ Skylighting::SkylightingCB Skylighting::GetCommonBufferData(bool a_inWorld)
 		.OcclusionViewProj = OcclusionTransform,
 		.OcclusionDir = OcclusionDir,
 		.PosOffset = cellOrigin - eyePos,
+		.FadeOutUsesGridOffset = FadeOutGridOffsetActive() ? 1.0f : 0.0f,
 		.ArrayOrigin = {
 			((int)cellID.x - probeArrayDims[0] / 2) % probeArrayDims[0],
 			((int)cellID.y - probeArrayDims[1] / 2) % probeArrayDims[1],
@@ -376,6 +456,13 @@ RE::BSLightingShaderProperty::Data* Skylighting::BSLightingShaderProperty_GetPre
 	}
 
 	if (skylighting.inOcclusion) {
+		// (batch 38, 816888f04) Only occluders above a probe lie on its ray to the sky.
+		if (skylighting.SkipOccludersBelowGridActive() &&
+			geometry->worldBound.center.z + geometry->worldBound.radius < skylighting.probeGridBottomZ - OCCLUSION_BELOW_GRID_MARGIN) {
+			skylighting.occludersSkippedBelowGrid++;
+			return precipitationOcclusionMapRenderPassList;
+		}
+
 		if (auto userData = geometry->GetUserData()) {
 			RE::BSFadeNode* fadeNode = nullptr;
 
@@ -386,12 +473,17 @@ RE::BSLightingShaderProperty::Data* Skylighting::BSLightingShaderProperty_GetPre
 			}
 
 			if (fadeNode) {
-				if (auto extraData = fadeNode->GetExtraData("BSX")) {
+				// (816888f04) One pooled string instead of a pool lookup per geometry.
+				static const RE::BSFixedString bsxKey{ "BSX" };
+				if (auto extraData = fadeNode->GetExtraData(bsxKey)) {
 					auto bsxFlags = (RE::BSXFlags*)extraData;
 					auto value = static_cast<int32_t>(bsxFlags->value);
 
+					// (batch 38, ca63a41d5) Roof markers carry kEditorMarker; with the fix they occlude.
+					const int32_t editorMarker = skylighting.RoofMarkersActive() ? 0 : static_cast<int32_t>(RE::BSXFlags::Flag::kEditorMarker);
+
 					if (value & (static_cast<int32_t>(RE::BSXFlags::Flag::kRagdoll) |
-									static_cast<int32_t>(RE::BSXFlags::Flag::kEditorMarker) |
+									editorMarker |
 									static_cast<int32_t>(RE::BSXFlags::Flag::kDynamic) |
 									static_cast<int32_t>(RE::BSXFlags::Flag::kAddon) |
 									static_cast<int32_t>(RE::BSXFlags::Flag::kNeedsTransformUpdate) |
@@ -569,8 +661,8 @@ void Skylighting::RenderOcclusion()
 						randSeed = std::rand();
 					}
 
-					// disc transformation
-					vPoint.x = sqrt(vPoint.x * sin(settings.MaxZenith));
+					// disc transformation ((batch 38) zenith clamp bff82b03e, radius fix 4b5b99783)
+					vPoint.x = SampleDiscRadius(vPoint.x);
 					vPoint.y *= 6.28318530718f;
 
 					vPoint = { vPoint.x * cos(vPoint.y), vPoint.x * sin(vPoint.y) };
@@ -589,7 +681,9 @@ void Skylighting::RenderOcclusion()
 				{
 					TracyD3D11Zone(state->tracyCtx, "Skylighting - Render Height Map");
 					Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SkylightingHeightMap);
+					occludersSkippedBelowGrid = 0;
 					precip->RenderMask((RE::BSParticleShaderRainEmitter*)rain);
+					occludersSkippedBelowGridLast = occludersSkippedBelowGrid;
 					Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SkylightingHeightMap);
 				}
 				inOcclusion = false;

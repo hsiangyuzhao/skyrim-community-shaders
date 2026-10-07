@@ -17,6 +17,7 @@ namespace Batch38
 			// Part B: items 3-5
 			RowsSkinSss,
 			RowsLocalExposure,
+			RowsSkylighting,
 		};
 	}
 

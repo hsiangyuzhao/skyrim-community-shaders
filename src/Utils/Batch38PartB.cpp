@@ -82,4 +82,22 @@ namespace Batch38
 			res = std::format("{}x{} (output resolution, after upscaling)", le->texOutput->desc.Width, le->texOutput->desc.Height);
 		a_rows.push_back({ group, "  Runs at", true, le->enabled, "", res, "-" });
 	}
+
+	void RowsSkylighting(std::vector<Row>& a_rows)
+	{
+		auto& sky = globals::features::skylighting;
+		auto& s = sky.settings;
+		const char* group = "5. Skylighting fixes";
+		const char* where = "Lighting > Skylighting > Fixes (Batch 38)";
+		const bool on = sky.loaded;
+
+		a_rows.push_back(Toggle(group, "Roofs flagged as editor markers block the sky (ca63a41d5)", on, s.FixRoofMarkers, "", where));
+		a_rows.push_back(Toggle(group, "Reset puts probes back to open sky (5b5361f53, probe part)", on, s.FixResetClearsProbes, "", where));
+		a_rows.push_back(Toggle(group, "Max Zenith kept within 0-90 deg (bff82b03e)", on, s.FixZenithClamp,
+			s.FixZenithClamp ? std::format("On ({:.0f} deg)", sky.EffectiveMaxZenith() * 57.29578f) : std::string(), where));
+		a_rows.push_back(Toggle(group, "Sampling cone radius sin(zenith) (4b5b99783)", on, s.FixZenithRadius, "", where));
+		a_rows.push_back(Toggle(group, "Edge fade-out from the probe grid's centre (4b5b99783)", on, s.FixFadeOutGridOffset, "", where));
+		a_rows.push_back(Toggle(group, "Height map skips objects below the probe grid (816888f04)", on, s.SkipOccludersBelowGrid,
+			s.SkipOccludersBelowGrid ? std::format("On ({} skipped last map)", sky.occludersSkippedBelowGridLast) : std::string(), where));
+	}
 }
