@@ -73,6 +73,11 @@ namespace Util
 			{ "Variable Rate Shading",
 				"GPU time Variable Rate Shading itself costs (plus its debug overlay when shown). "
 				"Its savings show up in the engine's opaque geometry time, not here." },
+			{ "SSS Pre-pass (38)",
+				"GPU time the batch 38 skin SSS upgrade adds before the blur: a copy of the lit image and the pass that "
+				"takes skin colour out of the light. Not counted in the Subsurface Scattering row. Only runs on frames that draw faces." },
+			{ "Local Exposure (38)",
+				"GPU time for Post Processing > Local Exposure (batch 38), all of its passes. Not counted in the Post Processing row." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
