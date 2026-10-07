@@ -23,7 +23,48 @@ namespace SharedData
 		bool InMapMenu;   // If the world/local map is open (note that the renderer is still deferred here)
 		bool HideSky;     // HideSky flag in WorldSpace, e.g. Blackreach
 		float MipBias;    // Offset to mip level for TAA sharpness#
+		uint Batch39Flags;  // (batch 39) Batch39Engine::ShaderFlag bits (SharedData::Batch39Flag below)
 	};
+
+	// (batch 39) Mirrors Batch39Engine::ShaderFlag.
+	namespace Batch39Flag
+	{
+		static const uint TemporalLODDither = (1 << 0);
+		static const uint MipBiasMaterials = (1 << 2);
+		static const uint MipBiasSpecular = (1 << 3);
+		static const uint WaterDynamicCubemapOnly = (1 << 4);
+	}
+
+	/// (batch 39, item 4) DLSS mip bias for the material textures that did not get it before
+	/// (projected snow/moss, glow, detail, skin/hair extras, ...); 0 = the 38b sampling.
+	float MaterialMipBias()
+	{
+		return (Batch39Flags & Batch39Flag::MipBiasMaterials) ? MipBias : 0.0;
+	}
+
+	/// (batch 39, item 4) Same for the specular / gloss / environment-mask textures.
+	float SpecularMipBias()
+	{
+		return (Batch39Flags & Batch39Flag::MipBiasSpecular) ? MipBias : 0.0;
+	}
+
+	/// (batch 39, item 3) Threshold of the screen-door fade of LOD transitions at pixel a_pixel.
+	/// Off: a_bayer, the engine's fixed 4x4 pattern. On: interleaved gradient noise shifted by a
+	/// golden-ratio step every frame, so the pattern changes each frame and the temporal upscaler
+	/// averages it into a smooth fade. Kept in the engine pattern's range (1/255 .. 254/255), so
+	/// alpha 0 still discards every pixel and alpha 1 none. The depth prepass and the main pass
+	/// call this with the same pixel and frame, so both keep exactly the same pixels.
+	float LODStippleThreshold(uint2 a_pixel, float a_bayer, uint a_frame)
+	{
+		float threshold = a_bayer;
+		[branch] if ((Batch39Flags & Batch39Flag::TemporalLODDither) != 0)
+		{
+			const float ign = frac(52.9829189 * frac(dot(float2(a_pixel), float2(0.06711056, 0.00583715))));
+			const float n = frac(ign + 0.61803398875 * float(a_frame % 1024u));
+			threshold = lerp(1.0 / 255.0, 254.0 / 255.0, n);
+		}
+		return threshold;
+	}
 
 	struct GrassLightingSettings
 	{

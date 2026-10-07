@@ -3,7 +3,7 @@
 #include <BS_thread_pool.hpp>
 #include <efsw/efsw.hpp>
 
-static constexpr REL::Version SHADER_CACHE_VERSION = { 0, 0, 0, 48 };
+static constexpr REL::Version SHADER_CACHE_VERSION = { 0, 0, 0, 49 };
 
 using namespace std::chrono;
 
@@ -536,6 +536,9 @@ namespace SIE
 			// Community Shaders only, never set by the engine: selects the GRASS_OPTIMIZATIONS permutation,
 			// which Grass Optimizations binds around its own indirect draws.
 			Optimized = 0x40000000,
+			// (batch 39, item 2) Community Shaders only, never set by the engine: the main-pass
+			// GRASS_MAIN_ALPHA_TEST permutation, used while grass skips the depth prepass.
+			MainAlphaTest = 0x20000000,
 		};
 
 		enum class ParticleShaderTechniques

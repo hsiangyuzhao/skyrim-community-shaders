@@ -9,6 +9,7 @@
 #include "State.h"
 #include "TruePBR.h"
 #include "Util.h"
+#include "Utils/Batch39Engine.h"
 #include "Utils/DenoiserTimers.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
@@ -320,7 +321,10 @@ struct IDXGISwapChain_Present
 			// (batch 37a) Close the occlusion dry run's frame. Its draw estimate is scaled by this
 			// frame's main-view draws (depth prepass + opaque pass) from the engine table.
 			const auto& draws = gpuTimeline->Get().lastDraws;
-			float mainViewDraws = draws[static_cast<size_t>(Util::GpuPhase::DepthPrepass)];
+			float mainViewDraws = 0.0f;
+			// (batch 39) The depth prepass is split per object type (DepthPrepass .. DepthLODTrees).
+			for (auto p = static_cast<size_t>(Util::GpuPhase::DepthPrepass); p <= static_cast<size_t>(Util::GpuPhase::DepthLODTrees); ++p)
+				mainViewDraws += draws[p];
 			for (auto p = static_cast<size_t>(Util::GpuPhase::OpaqueTerrain); p <= static_cast<size_t>(Util::GpuPhase::OpaqueOther); ++p)
 				mainViewDraws += draws[p];
 			Util::OcclusionDryRun::OnFrameEnd(static_cast<uint32_t>(mainViewDraws), timelineRecorded);
@@ -442,7 +446,16 @@ struct ID3D11Device_CreateSamplerState
 		// Limit Anisotropy to 8x for performance
 		D3D11_SAMPLER_DESC descCopy = *pSamplerDesc;  // make a copy, pSamplerDesc is supposed to be immutable
 		descCopy.MaxAnisotropy = std::min(descCopy.MaxAnisotropy, 8u);
-		return func(This, &descCopy, ppSamplerState);
+		const HRESULT hr = func(This, &descCopy, ppSamplerState);
+		// (batch 39, item 4) Samplers that asked for more than 8x also get an unclamped twin,
+		// swapped in at PSSetSamplers while "Anisotropic filtering up to 16x" is on.
+		if (SUCCEEDED(hr) && pSamplerDesc && ppSamplerState && *ppSamplerState)
+			Batch39Engine::OnSamplerCreated(This, *pSamplerDesc, *ppSamplerState, Create);
+		return hr;
+	}
+	static HRESULT STDMETHODCALLTYPE Create(ID3D11Device* a_device, D3D11_SAMPLER_DESC* a_desc, ID3D11SamplerState** a_out)
+	{
+		return func(a_device, a_desc, a_out);
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
@@ -543,6 +556,7 @@ namespace Hooks
 			stl::detour_vfunc<23, ID3D11Device_CreateSamplerState>(globals::d3d::device);
 
 			globals::InstallD3DHooks(globals::d3d::context);
+			Batch39Engine::InstallContextHooks(globals::d3d::context);
 
 			globals::menu->Init();
 		}
@@ -1031,6 +1045,11 @@ namespace Hooks
 
 		logger::info("Hooking Renderer::DispatchCSShader");
 		stl::detour_thunk<CSShadersSupport::Renderer_DispatchCSShader>(REL::RelocationID(75532, 77329));
+
+		// (batch 39) Render-pass entry and depth-prepass bracket. Installed here, before the
+		// features' PostPostLoad, so call-site hooks on RenderBatches (Terrain Blending, Interior
+		// Sun) still read the original call target and then chain into this detour.
+		Batch39Engine::InstallHooks();
 
 		logger::info("Hooking TESWaterReflections::Update_Actor::GetLOSPosition for Sky Reflection Fix");
 		stl::write_thunk_call<TESWaterReflections_Update_Actor_GetLOSPosition>(REL::RelocationID(31373, 32160).address() + REL::Relocate(0x1AD, 0x1CA, 0x1ed));

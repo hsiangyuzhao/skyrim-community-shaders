@@ -534,7 +534,8 @@ PS_OUTPUT main(PS_INPUT input)
 		0.333333,
 	};
 
-	if (AlphaTestRef.w - maskValues[alphaMask.x] < 0) {
+	// (batch 39, item 3) Same threshold as the main pass (Lighting.hlsl) for this pixel and frame.
+	if (AlphaTestRef.w - SharedData::LODStippleThreshold(uint2(input.PositionCS.xy), maskValues[alphaMask.x], SharedData::FrameCount) < 0) {
 		discard;
 	}
 #	endif

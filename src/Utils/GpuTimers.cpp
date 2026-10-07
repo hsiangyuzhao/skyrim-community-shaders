@@ -89,6 +89,9 @@ namespace Util
 				"GPU time for the coarse far grid of Volumetric Fog (Batch 38), the same four passes. No local lights out here." },
 			{ "Volumetric Shadows",
 				"GPU time for the small blurred sun shadow map that lets smoke and other effects darken in shadow (Batch 38)." },
+			{ "Depth refresh (39)",
+				"Batch 39: only while grass or LOD terrain skips the depth prepass. Copies the finished depth (and folds it into "
+				"Terrain Blending's copy) so SSAO, SSRT, fog and water see what the prepass no longer drew." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
