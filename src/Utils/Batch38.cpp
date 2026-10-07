@@ -15,6 +15,8 @@ namespace Batch38
 		// Extension point: one provider per batch 38 group, in table order. Each provider lives
 		// in its own file next to the group's code.
 		constexpr RowProvider kRowProviders[] = {
+			// A: items 1-2, volumetric fog + smoke receiving sun shadow (Batch38Fog.cpp)
+			RowsFogAndShadows,
 			// B: items 3-5 (Batch38PartB.cpp)
 			RowsSkinSss,
 			RowsLocalExposure,

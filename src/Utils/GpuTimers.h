@@ -52,6 +52,9 @@ namespace Util
 		// (batch 38, part B) Split out of their parent rows so the new passes show their own cost.
 		SubsurfaceScatteringPrepass,  // SSS upgrade: albedo-removal pre-pass
 		LocalExposure,                // Post Processing > Local Exposure (taken out of the Post Processing row)
+		VolumetricFogNear,       // (batch 38) volumetric fog near grid: conservative depth + medium + light scattering + integration
+		VolumetricFogFar,        // (batch 38) volumetric fog far grid, same four passes
+		VolumetricShadows,       // (batch 38) sun VSM for smoke and effects: downsample + 11x11 blur
 		Count
 	};
 

@@ -23,13 +23,14 @@ namespace TerrainShadows
 
 	float GetTerrainShadow(const float3 worldPos, SamplerState samp)
 	{
+		// (batch 38) single exit: the early return made fxc warn X4000 at every call site.
+		float shadowFraction = 1.0;
 		if (SharedData::terraOccSettings.EnableTerrainShadow) {
 			float2 terraOccUV = GetTerrainShadowUV(worldPos.xy);
 			float2 shadowHeight = GetTerrainZ(ShadowHeightTexture.SampleLevel(samp, terraOccUV, 0));
-			float shadowFraction = saturate((worldPos.z - shadowHeight.y) / (shadowHeight.x - shadowHeight.y));
-			return shadowFraction;
+			shadowFraction = saturate((worldPos.z - shadowHeight.y) / (shadowHeight.x - shadowHeight.y));
 		}
 
-		return 1.0;
+		return shadowFraction;
 	}
 }

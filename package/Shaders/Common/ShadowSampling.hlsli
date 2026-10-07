@@ -196,4 +196,9 @@ namespace ShadowSampling
 	}
 }
 
+// (batch 38, item A2) VSM lookups for effects, particles and forward objects.
+#if defined(VOLUMETRIC_SHADOWS)
+#	include "VolumetricShadows/VolumetricShadows.hlsli"
+#endif
+
 #endif  // __SHADOW_SAMPLING_DEPENDENCY_HLSL__

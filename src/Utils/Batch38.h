@@ -74,6 +74,10 @@ namespace Batch38
 	/// @brief "(off: Batch 38 master switch)" after an item's own checkbox, when the master is off.
 	void MasterNote();
 
+	// ---- A row provider (Batch38Fog.cpp) ---------------------------------------------------
+	/// @brief A. Volumetric fog (item 1) and smoke/effects receiving sun shadow (item 2).
+	void RowsFogAndShadows(std::vector<Row>& a_rows);
+
 	// ---- Part B row providers (Batch38PartB.cpp): items 3-5 -------------------------------
 	void RowsSkinSss(std::vector<Row>& a_rows);
 	void RowsLocalExposure(std::vector<Row>& a_rows);

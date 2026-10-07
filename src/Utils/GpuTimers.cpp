@@ -82,6 +82,13 @@ namespace Util
 				"37c copy and composite passes, so compare the sum of both rows with the 37c Subsurface Scattering row." },
 			{ "Local Exposure (38)",
 				"GPU time for Post Processing > Local Exposure (batch 38), all of its passes. Not counted in the Post Processing row." },
+			{ "Volumetric Fog (near)",
+				"GPU time for the detailed near grid of Volumetric Fog (Batch 38): finding where the scene is, the fog medium, "
+				"lighting every fog cell by the sun, sky and nearby lights, and adding it up along each view ray." },
+			{ "Volumetric Fog (far)",
+				"GPU time for the coarse far grid of Volumetric Fog (Batch 38), the same four passes. No local lights out here." },
+			{ "Volumetric Shadows",
+				"GPU time for the small blurred sun shadow map that lets smoke and other effects darken in shadow (Batch 38)." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

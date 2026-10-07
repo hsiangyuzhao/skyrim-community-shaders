@@ -1158,7 +1158,12 @@ PS_OUTPUT main(PS_INPUT input)
 #						if defined(EXP_HEIGHT_FOG)
 	if (SharedData::exponentialHeightFogSettings.enabled)
 	{
-		float4 exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
+		// (batch 38, A1) + volumetric fog when drawn by the main camera
+		float4 exponentialHeightFog;
+		[branch] if (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld)
+			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, eyeIndex, input.HPosition.xy);
+		else
+			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
 		fogColor = exponentialHeightFog.xyz;
 		fogFactor = exponentialHeightFog.w;
 	}
@@ -1188,7 +1193,12 @@ PS_OUTPUT main(PS_INPUT input)
 #						if defined(EXP_HEIGHT_FOG)
 	if (SharedData::exponentialHeightFogSettings.enabled)
 	{
-		float4 exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, preFogColor);
+		// (batch 38, A1) + volumetric fog when drawn by the main camera
+		float4 exponentialHeightFog;
+		[branch] if (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld)
+			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, preFogColor, eyeIndex, input.HPosition.xy);
+		else
+			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, preFogColor);
 		preFogColor = exponentialHeightFog.xyz;
 		preFogFactor = exponentialHeightFog.w;
 	}

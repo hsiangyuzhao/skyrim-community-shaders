@@ -17,6 +17,7 @@
 #include "Features/TerrainBlending.h"
 #include "Features/Upscaling.h"
 #include "Features/VariableRateShading.h"
+#include "Features/VolumetricShadows.h"
 
 #include "Hooks.h"
 #include "Utils/Batch37b.h"
@@ -308,10 +309,26 @@ void Deferred::CopyShadowData()
 
 		context->PSSetShaderResources(18, ARRAYSIZE(srvs), srvs);
 
+		// (batch 38) Shared capture for Volumetric Fog / Volumetric Shadows (see Deferred.h).
+		capturedShadowMap.copy_from(shadowView);
+		capturedShadowFrame = globals::state->frameCount;
+
 		// Release COM object to prevent memory leak
 		if (shadowView)
 			shadowView->Release();
 	}
+
+	// (batch 38) Volumetric Shadows builds its VSM from the capture right here, while the
+	// cascades are fresh and before any effect or particle that samples it is drawn.
+	if (globals::features::volumetricShadows.loaded)
+		globals::features::volumetricShadows.OnShadowCapture(capturedShadowMap.get());
+}
+
+bool Deferred::HasFreshShadowCapture() const
+{
+	if (!capturedShadowMap || capturedShadowFrame == UINT32_MAX)
+		return false;
+	return globals::state->frameCount - capturedShadowFrame <= 1u;
 }
 
 void Deferred::ReflectionsPrepasses()
