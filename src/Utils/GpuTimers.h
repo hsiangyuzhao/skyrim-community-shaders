@@ -55,6 +55,7 @@ namespace Util
 		VolumetricFogNear,       // (batch 38) volumetric fog near grid: conservative depth + medium + light scattering + integration
 		VolumetricFogFar,        // (batch 38) volumetric fog far grid, same four passes
 		VolumetricShadows,       // (batch 38) sun VSM for smoke and effects: downsample + 11x11 blur
+		SnowTrails,              // (batch 39) Dynamic Snow footprint map: scroll clear + refill + prints
 		Count
 	};
 

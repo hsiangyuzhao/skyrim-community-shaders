@@ -40,6 +40,7 @@ struct Skin;
 struct ExponentialHeightFog;
 struct VariableRateShading;
 struct VolumetricShadows;
+struct DynamicSnow;
 
 class State;
 class Deferred;
@@ -104,6 +105,7 @@ namespace globals
 		extern ExponentialHeightFog exponentialHeightFog;
 		extern VariableRateShading variableRateShading;
 		extern VolumetricShadows volumetricShadows;
+		extern DynamicSnow dynamicSnow;
 
 		namespace llf
 		{

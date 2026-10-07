@@ -89,6 +89,10 @@ namespace Util
 				"GPU time for the coarse far grid of Volumetric Fog (Batch 38), the same four passes. No local lights out here." },
 			{ "Volumetric Shadows",
 				"GPU time for the small blurred sun shadow map that lets smoke and other effects darken in shadow (Batch 38)." },
+			{ "Snow Footprints (39)",
+				"GPU time for keeping the footprint map around the player up to date (Dynamic Snow, Batch 39): clearing the "
+				"strip that scrolls into view, filling old prints back in, and stamping this frame's footprints. Reading the "
+				"map, and drawing accumulated snow, happen inside the normal object and ground drawing and are not in this row." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
@@ -681,6 +685,9 @@ namespace Util
 				"Runs up to three times per frame." },
 			{ "TruePBR", "TruePBR",
 				"CPU time spent on TruePBR's per-frame setup." },
+			{ "DynamicSnow", "Dynamic Snow",
+				"CPU time for Dynamic Snow (Batch 39): following the weather for snow build-up, finding the feet of nearby "
+				"actors and sending the footprint map update to the GPU." },
 			{ "GrassOptimizations", "Grass Optimizations",
 				"CPU time for Grass Optimizations' per-frame work: sorting newly loaded grass and choosing what to draw. "
 				"Drawing the grass itself stays in the Grass row of the table above." },

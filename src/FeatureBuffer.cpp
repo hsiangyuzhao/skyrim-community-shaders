@@ -2,6 +2,7 @@
 
 #include "Features/CloudShadows.h"
 #include "Features/DynamicCubemaps.h"
+#include "Features/DynamicSnow.h"
 #include "Features/ExponentialHeightFog.h"
 #include "Features/ExtendedMaterials.h"
 #include "Features/ExtendedTranslucency.h"
@@ -69,7 +70,8 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::volumetricLighting.GetCommonBufferData(),
 		globals::features::physicalSky.extCbData,
 		globals::features::exponentialHeightFog.GetVolumetricPSData(),
-		globals::features::volumetricShadows.GetCommonBufferData());
+		globals::features::volumetricShadows.GetCommonBufferData(),
+		globals::features::dynamicSnow.GetCommonBufferData());
 }
 
 namespace
@@ -114,6 +116,7 @@ namespace
 		SettingsOf<decltype(globals::features::physicalSky.extCbData)> physicalSkyExt;
 		SettingsOf<decltype(globals::features::exponentialHeightFog.GetVolumetricPSData())> volumetricFog;
 		SettingsOf<decltype(globals::features::volumetricShadows.GetCommonBufferData())> volumetricShadows;
+		SettingsOf<decltype(globals::features::dynamicSnow.GetCommonBufferData())> dynamicSnow;
 	};
 
 	static_assert(offsetof(FeatureDataLayoutMirror, vanillaFresnel) == 1008,
@@ -132,6 +135,8 @@ namespace
 		"(batch 38) SharedData::volumetricFogSettings moved; update the HLSL mirror and this offset together.");
 	static_assert(offsetof(FeatureDataLayoutMirror, volumetricShadows) == 1536,
 		"(batch 38) SharedData::volumetricShadowsSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(sizeof(FeatureDataLayoutMirror) == 1552,
+	static_assert(offsetof(FeatureDataLayoutMirror, dynamicSnow) == 1552,
+		"(batch 39) SharedData::dynamicSnowSettings moved; update the HLSL mirror and this offset together.");
+	static_assert(sizeof(FeatureDataLayoutMirror) == 1632,
 		"FeatureData's total size changed; check every offset above against fxc's reflection listing.");
 }

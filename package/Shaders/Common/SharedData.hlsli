@@ -482,6 +482,32 @@ namespace SharedData
 		uint2 pad0;
 	};
 
+	// (batch 39, items 5-6) Mirrors DynamicSnow::CommonBufferData, after VolumetricShadowsSettings
+	// (offset 1552). Flags == 0 (feature off, Batch 39 master off, interior) runs the 38b path.
+	struct DynamicSnowSettings
+	{
+		uint Flags;               // DynamicSnow::Flag* bits
+		float Amount;             // 0..1 global accumulation progress (0 = none, 1 = fully built up)
+		float MaxCoverage;        // cap on accumulated coverage
+		float NormalThreshold;    // surfaces flatter than this (world up . normal) gather snow
+
+		float3 SnowColor;         // sRGB albedo of the accumulated snow
+		float SnowRoughness;      // roughness of the accumulated snow
+
+		float2 TrailOrigin;       // world XY of the trail window's corner texel (absolute game units)
+		int2 TrailWrap;           // window texel -> physical texel offset (toroidal addressing)
+
+		uint TrailMapSize;        // texels per side (power of two)
+		float TrailTexelSize;     // game units per texel
+		float TrailDepth;         // depth of a full-strength print, game units
+		float TrailDarken;        // albedo darkening of a full-strength print on snow
+
+		float TrailZTolerance;    // a print only applies within this many units of the foot's height
+		float TrailMudStrength;   // print strength on non-snow terrain (FlagMudTrails)
+		float TrailEdgeFade;      // fade band at the window edge, texels
+		float pad0;
+	};
+
 	namespace PhysSkyExtFlags
 	{
 		static const uint SunReplace = (1 << 0);           // disk replaces the vanilla sun quad
@@ -522,6 +548,7 @@ namespace SharedData
 		PhysSkyExtData physSkyExtData;
 		VolumetricFogSettings volumetricFogSettings;
 		VolumetricShadowsSettings volumetricShadowsSettings;
+		DynamicSnowSettings dynamicSnowSettings;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);
