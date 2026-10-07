@@ -972,6 +972,14 @@ float GetSnowParameterY(float texProjTmp, float alpha)
 #		include "WetnessEffects/WetnessEffects.hlsli"
 #	endif
 
+// (batch 39, items 5-6) Surfaces that take accumulated snow and footprints: world geometry
+// only. Characters, creatures and their gear (SKINNED), skin, hair and eyes, animated trees
+// (alpha-tested leaves), the LOD noise overlay and the world map are left alone.
+#	if defined(DYNAMIC_SNOW) && !defined(SKINNED) && !defined(SKIN) && !defined(HAIR) && !defined(EYE) && !defined(TREE_ANIM) && !defined(LODLANDNOISE) && !defined(WORLD_MAP)
+#		define DYNAMIC_SNOW_SURFACE
+#		include "DynamicSnow/DynamicSnow.hlsli"
+#	endif
+
 #	if defined(TERRAIN_BLENDING)
 #		include "TerrainBlending/TerrainBlending.hlsli"
 #	endif
@@ -2285,6 +2293,98 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 vertexNormal = worldNormal;
 #	endif
 
+#	if defined(DYNAMIC_SNOW_SURFACE)
+	// (batch 39, items 5-6) Accumulated snow and snow/mud footprints. Runs after the material's
+	// own snow is known (psout.Parameters.y: landscape snow textures, directional snow
+	// projection, snow-flagged materials) and before anything reads the albedo, normal or
+	// roughness, so the lit colour, the G-buffer and everything downstream of it (SSRT, NRD,
+	// the deferred composite) all see one material. Flags == 0 (feature off, Batch 39 master
+	// off, interiors) skips the whole block: the 38b path.
+	float dynamicSnowCoverage = 0.0;
+	[branch] if (SharedData::dynamicSnowSettings.Flags != 0 && inWorld && !SharedData::InInterior)
+	{
+		const uint snowFlags = SharedData::dynamicSnowSettings.Flags;
+		float3 snowPositionWS = input.WorldPosition.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz;
+#		if defined(MODELSPACENORMALS) && !defined(SKINNED)
+		float3 snowGeometryNormal = worldNormal;
+#		else
+		float3 snowGeometryNormal = normalize(mul(tbn, float3(0, 0, 1)));
+#		endif
+
+#		if defined(SNOW) && defined(DEFERRED)
+		float snowExisting = saturate(psout.Parameters.y);
+#		else
+		float snowExisting = 0.0;
+#		endif
+
+		[branch] if (snowFlags & DynamicSnow::FlagAccumulation)
+		{
+			float snowCoverage = DynamicSnow::GetCoverage(snowPositionWS, worldNormal, snowGeometryNormal, 1.0, length(input.WorldPosition.xyz));
+			[branch] if (snowCoverage > 0.0)
+			{
+#		if defined(SKYLIGHTING)
+				// Same sky occlusion as Wetness Effects (the skylighting probes' up-facing
+				// visibility, squared), but sampled without the per-frame blue-noise jitter so the
+				// albedo and roughness written to the G-buffer do not shimmer under a roof edge.
+#			if defined(VR)
+				float3 snowPositionMS = input.WorldPosition.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+#			else
+				float3 snowPositionMS = input.WorldPosition.xyz;
+#			endif
+				sh2 snowSkySH = Skylighting::sampleNoBias(SharedData::skylightingSettings, Skylighting::SkylightingProbeArray, snowPositionMS + snowGeometryNormal * Skylighting::CELL_SIZE);
+				snowCoverage *= pow(saturate(SphericalHarmonics::Unproject(snowSkySH, float3(0, 0, 1))), 2);
+#		endif
+				// The material's own snow stays as it is; only the rest of the surface is covered.
+				dynamicSnowCoverage = snowCoverage * (1.0 - snowExisting);
+			}
+
+			[branch] if (dynamicSnowCoverage > 0.0)
+			{
+				baseColor.xyz = lerp(baseColor.xyz, Color::ColorToLinear(SharedData::dynamicSnowSettings.SnowColor), dynamicSnowCoverage);
+				worldNormal = normalize(lerp(worldNormal, snowGeometryNormal, dynamicSnowCoverage * 0.8));
+				// Snow is never smoother than SnowRoughness, and never makes a matte surface
+				// shinier: SSRT/NRD only ever see roughness go up on snow.
+#		if defined(TRUE_PBR)
+				rawRMAOS.x = lerp(rawRMAOS.x, max(rawRMAOS.x, SharedData::dynamicSnowSettings.SnowRoughness), dynamicSnowCoverage);
+				rawRMAOS.y = lerp(rawRMAOS.y, 0.0, dynamicSnowCoverage);
+				rawRMAOS.w = lerp(rawRMAOS.w, 0.02, dynamicSnowCoverage);
+#		else
+				glossiness = lerp(glossiness, min(glossiness, saturate(1.0 - SharedData::dynamicSnowSettings.SnowRoughness)), dynamicSnowCoverage);
+#		endif
+#		if defined(SNOW) && defined(DEFERRED)
+				psout.Parameters.y = saturate(snowExisting + dynamicSnowCoverage);
+#		endif
+			}
+		}
+
+		[branch] if (snowFlags & DynamicSnow::FlagTrails)
+		{
+			float trailSnow = 0.0;
+			if (snowFlags & DynamicSnow::FlagTrailsOnSnow)
+				trailSnow += snowExisting;
+			if (snowFlags & DynamicSnow::FlagTrailsOnAccumulated)
+				trailSnow += dynamicSnowCoverage;
+			trailSnow = saturate(trailSnow);
+			float trailMud = 0.0;
+#		if defined(LANDSCAPE)
+			if (snowFlags & DynamicSnow::FlagMudTrails)
+				trailMud = (1.0 - trailSnow) * SharedData::dynamicSnowSettings.TrailMudStrength;
+#		endif
+			float trailWeight = trailSnow + trailMud;
+			[branch] if (trailWeight > 0.01)
+			{
+				DynamicSnow::TrailSample trail = DynamicSnow::SampleTrail(snowPositionWS, viewDirection);
+				[branch] if (trail.pressed > 0.0)
+				{
+					float trailDarken = SharedData::dynamicSnowSettings.TrailDarken * trailSnow + 0.35 * trailMud;
+					baseColor.xyz *= saturate(1.0 - trailDarken * trail.pressed);
+					worldNormal = DynamicSnow::ApplyTrailNormal(worldNormal, snowGeometryNormal, trail, trailWeight);
+				}
+			}
+		}
+	}
+#	endif  // DYNAMIC_SNOW_SURFACE
+
 	float3 screenSpaceNormal = normalize(FrameBuffer::WorldToView(worldNormal, false, eyeIndex));
 
 #	if defined(HAIR) && defined(CS_HAIR)
@@ -2449,6 +2549,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #	if defined(ENVMAP) || defined(MULTI_LAYER_PARALLAX) || defined(EYE)
 	float envMask = EnvmapData.x * MaterialData.x;
+#		if defined(DYNAMIC_SNOW_SURFACE)
+	envMask *= 1.0 - dynamicSnowCoverage;  // (batch 39) snow hides the environment reflection
+#		endif
 
 	float viewNormalAngle = dot(worldNormal.xyz, viewDirection);
 	float3 envSamplingPoint = (viewNormalAngle * 2) * worldNormal.xyz - viewDirection;

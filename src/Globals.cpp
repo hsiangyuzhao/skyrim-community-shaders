@@ -3,6 +3,7 @@
 #include "Deferred.h"
 #include "Features/CloudShadows.h"
 #include "Features/DynamicCubemaps.h"
+#include "Features/DynamicSnow.h"
 #include "Features/ExponentialHeightFog.h"
 #include "Features/ExtendedMaterials.h"
 #include "Features/ExtendedTranslucency.h"
@@ -100,6 +101,7 @@ namespace globals
 		ExponentialHeightFog exponentialHeightFog{};
 		VariableRateShading variableRateShading{};
 		VolumetricShadows volumetricShadows{};
+		DynamicSnow dynamicSnow{};
 
 		namespace llf
 		{

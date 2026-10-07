@@ -17,6 +17,9 @@ namespace Batch39
 		constexpr RowProvider kRowProviders[] = {
 			// Items 1-4: reflection cubemap, depth prepass, LOD dither, texture clarity (Batch39Engine.cpp)
 			RowsEngine,
+			// Items 5-6: dynamic snow accumulation, snow/mud footprints (Batch39Snow.cpp)
+			RowsSnowAccumulation,
+			RowsSnowTrails,
 		};
 
 		// Extension point: extra controls / diagnostics drawn under the table, in order.
@@ -106,6 +109,9 @@ namespace Batch39
 			}
 			ImGui::EndTable();
 		}
+
+		ImGui::Spacing();
+		ImGui::TextDisabled("Idle = switched on, but nothing to do this frame (for example the feature itself is off; the reason is shown where known).");
 
 		for (auto section : kSections) {
 			if (section) {

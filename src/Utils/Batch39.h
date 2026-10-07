@@ -17,6 +17,9 @@
  *   clarity): RowsEngine / DrawEngineSection (Batch39Engine.cpp). Their settings live in
  *   Batch39Engine (saved under Advanced."Batch 39 Engine"), because they belong to the
  *   engine rather than to one feature.
+ * - Items 5-6 (dynamic snow accumulation, snow/mud footprints): RowsSnowAccumulation /
+ *   RowsSnowTrails (Batch39Snow.cpp). Their switches live in the Dynamic Snow feature (saved
+ *   with that feature).
  */
 namespace Batch39
 {
@@ -74,4 +77,10 @@ namespace Batch39
 	// ---- Items 1-4 (Batch39Engine.cpp) -----------------------------------------------------
 	void RowsEngine(std::vector<Row>& a_rows);
 	void DrawEngineSection();
+
+	// ---- Items 5-6 row providers (Batch39Snow.cpp) ----------------------------------------
+	/// @brief 5. Dynamic snow accumulation.
+	void RowsSnowAccumulation(std::vector<Row>& a_rows);
+	/// @brief 6. Snow / mud footprints and trails.
+	void RowsSnowTrails(std::vector<Row>& a_rows);
 }
