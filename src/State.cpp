@@ -19,6 +19,7 @@
 #include "TruePBR.h"
 #include "Utils/Batch36f.h"
 #include "Utils/Batch37b.h"
+#include "Utils/Batch38.h"
 #include "Utils/FileSystem.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
@@ -347,6 +348,8 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				Batch36f::Load(advanced["Batch 36f"]);
 			if (advanced.contains("Batch 37b"))
 				Batch37b::Load(advanced["Batch 37b"]);
+			if (advanced.contains("Batch 38"))
+				Batch38::Load(advanced["Batch 38"]);
 		}
 
 		if (settings["General"].is_object()) {
@@ -491,6 +494,7 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Frame Annotations"] = frameAnnotations;
 	advanced["Batch 36f"] = Batch36f::Save();
 	advanced["Batch 37b"] = Batch37b::Save();
+	advanced["Batch 38"] = Batch38::Save();
 	settings["Advanced"] = advanced;
 
 	json general;
