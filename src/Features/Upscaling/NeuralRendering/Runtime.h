@@ -23,6 +23,7 @@ namespace NeuralRendering
 		std::uint32_t style = 3;
 		bool useAutoMask = true;
 		bool uiCorrection = false;
+		bool operator==(const Tuning&) const = default;
 	};
 
 	enum class RuntimeStatus
@@ -45,7 +46,7 @@ namespace NeuralRendering
 			ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motionVectors, ID3D12Resource* output,
 			std::uint32_t inputWidth, std::uint32_t inputHeight, std::uint32_t outputWidth, std::uint32_t outputHeight,
 			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset,
-			float modelScale = 0.0f);
+			float modelScale = 0.0f, bool tuningAtCreate = false);
 		void ResetFeature(std::uint32_t slot);
 		void ResetFeatures();
 		/// @param unloadModule false = (batch 38a) keep nvngx_dlssnr.dll mapped and the probe result, so the
@@ -61,6 +62,14 @@ namespace NeuralRendering
 		[[nodiscard]] std::uint64_t SuccessfulFrames() const { return successfulFrames_; }
 		/// (batch 38a) DLSSNR.ScalingRatio the live feature in this slot was created with; 0 = no feature.
 		[[nodiscard]] float FeatureScalingRatio(std::uint32_t slot) const { return slot < 2 && featureHandles_[slot] ? featureScalingRatio_[slot] : 0.0f; }
+		/// (batch 38c) Whether the live feature in this slot was created with this tuning given at creation.
+		/// False when there is no feature (nothing to replace) is not what callers want, so: true when no feature.
+		[[nodiscard]] bool FeatureTuningMatches(std::uint32_t slot, const Tuning& tuning, bool tuningAtCreate) const
+		{
+			if (slot >= 2 || !featureHandles_[slot])
+				return true;
+			return featureTuningAtCreate_[slot] == tuningAtCreate && (!tuningAtCreate || featureTuning_[slot] == tuning);
+		}
 
 	private:
 		Runtime() = default;
@@ -73,6 +82,9 @@ namespace NeuralRendering
 		std::uint32_t featureOutputHeight_[2]{};
 		// (batch 38a) DLSSNR.ScalingRatio each feature was created with; part of the recreate key.
 		float featureScalingRatio_[2]{};
+		// (batch 38c) Tuning each feature was created with, when it was given at creation.
+		Tuning featureTuning_[2]{};
+		bool featureTuningAtCreate_[2]{};
 		ID3D12Device* device_ = nullptr;
 		RuntimeStatus status_ = RuntimeStatus::NotProbed;
 		std::filesystem::path path_;

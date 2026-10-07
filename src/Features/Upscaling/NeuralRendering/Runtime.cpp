@@ -291,7 +291,7 @@ namespace NeuralRendering
 		ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motionVectors, ID3D12Resource* output,
 		std::uint32_t inputWidth, std::uint32_t inputHeight, std::uint32_t outputWidth, std::uint32_t outputHeight,
 		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset,
-		float modelScale)
+		float modelScale, bool tuningAtCreate)
 	{
 		if (status_ != RuntimeStatus::Initialized || !commandList || slot >= 2 || !color || !depth || !motionVectors || !output)
 			return false;
@@ -303,11 +303,15 @@ namespace NeuralRendering
 		if (!scope.IsInstalled())
 			return false;
 
-		// (batch 38a) modelScale > 0 is the Batch 38 path: DLSSNR.ScalingRatio is the network's own
-		// working resolution as a fraction of the colour extent (the runtime logs "network WxH from
-		// output WxH scale S"), i.e. the model-resolution option. 0 keeps the 37c value, the ratio of
-		// the colour extent to the guide extent, which only ever came out at 1 because the two were
-		// always the same size.
+		// (batch 38a) modelScale > 0 is the Batch 38 path. 0 keeps the 37c value, the ratio of the
+		// colour extent to the guide extent, which only ever came out at 1 because the two were always
+		// the same size.
+		//
+		// (batch 38c) 38a passed the model-resolution option here as DLSSNR.ScalingRatio. The DLL does
+		// not act on it: the user's log shows the same video memory for the feature at 50% and 100%
+		// (+1028..1160 MB either way, after upscaling) and the GPU time did not move. The name is in the
+		// DLL, but only beside its ComputeScalingRatio callback, which answers it rather than reads it.
+		// Batch 38 now always passes 1 and shrinks the input itself (Renderer::Run).
 		const float scalingRatio = modelScale > 0.0f ? modelScale : static_cast<float>(outputWidth) / inputWidth;
 		const bool dimensionsChanged = featureInputWidth_[slot] != inputWidth || featureInputHeight_[slot] != inputHeight ||
 			featureOutputWidth_[slot] != outputWidth || featureOutputHeight_[slot] != outputHeight ||
@@ -335,6 +339,20 @@ namespace NeuralRendering
 			parameters->Set("DLSSNR.Upscaling", 1u);
 			parameters->Set("DLSSNR.ScalingRatio", scalingRatio);
 			parameters->Set("DLSSNR.Hint.Render.Preset", 0u);
+			// (batch 38c) The model reads its tuning when the feature is built (OptiScaler's DLSSNR
+			// branch found the evaluate-time values ignored; its README: "the model's tuning ... is
+			// latched at feature creation"). 38a set them only per evaluate, so the menu's sliders
+			// never reached the model. Given here as well; changes rebuild the feature (Renderer).
+			if (tuningAtCreate) {
+				parameters->Set("DLSSNR.Enabled", 1u);
+				parameters->Set("DLSSNR.Intensity", tuning.intensity);
+				parameters->Set("DLSSNR.LocalToneStrength", tuning.localToneStrength);
+				parameters->Set("DLSSNR.LocalStructureStrength", tuning.localStructureStrength);
+				parameters->Set("DLSSNR.SkinStructureStrength", tuning.skinStructureStrength);
+				parameters->Set("DLSSNR.UseAutoMask", tuning.useAutoMask ? 1u : 0u);
+				parameters->Set("DLSSNR.Style", tuning.style);
+				parameters->Set("DLSSNR.UICorrection", tuning.uiCorrection ? 1u : 0u);
+			}
 			NVSDK_NGX_Handle* handle = nullptr;
 			ngxResult_ = static_cast<std::uint32_t>(create(commandList, kFeatureDlssNr, parameters, &handle));
 			if (ngxResult_ != NVSDK_NGX_Result_Success || !handle) {
@@ -347,6 +365,8 @@ namespace NeuralRendering
 			featureOutputWidth_[slot] = outputWidth;
 			featureOutputHeight_[slot] = outputHeight;
 			featureScalingRatio_[slot] = scalingRatio;
+			featureTuning_[slot] = tuning;
+			featureTuningAtCreate_[slot] = tuningAtCreate;
 			reset = true;
 		}
 
@@ -411,6 +431,8 @@ namespace NeuralRendering
 		featureInputWidth_[slot] = featureInputHeight_[slot] = 0;
 		featureOutputWidth_[slot] = featureOutputHeight_[slot] = 0;
 		featureScalingRatio_[slot] = 0.0f;
+		featureTuning_[slot] = {};
+		featureTuningAtCreate_[slot] = false;
 	}
 
 	void Runtime::ResetFeatures()

@@ -72,4 +72,9 @@ struct HistogramAutoExposure : public PostProcessFeature
 	virtual void DrawSettings() override;
 
 	virtual void Draw(TextureInfo&) override;
+
+	/// @brief Exposure compensation (EV) and adaptation range (EV) in effect this frame, after the
+	/// time-of-day and interior overrides. (batch 38c) Shared with Neural Rendering's before-upscaling
+	/// encode, which applies the same exposure this effect will.
+	void GetExposureParameters(float& exposureCompensation, float2& adaptationRange) const;
 };

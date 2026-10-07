@@ -8,8 +8,12 @@
 #include "Utils/D3D.h"
 #include "Utils/GpuTimers.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
+#include <initializer_list>
 #include <utility>
+#include <vector>
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -260,8 +264,12 @@ namespace NeuralRendering
 			failureLatched = false;
 			copyDepthGuideCS.Reset();
 			prepareGuidesCS.Reset();
-			encodeCS.Reset();
-			decodeCS.Reset();
+			prepareColorCS.Reset();
+			finalizeCS.Reset();
+			toneStatsCS.Reset();
+			toneCurveCS.Reset();
+			linearClamp.Reset();
+			lastRoute = "";
 		}
 
 		void ResetHistory()
@@ -278,6 +286,8 @@ namespace NeuralRendering
 			const bool before = in.placement == Renderer::Placement::BeforeUpscaling;
 			if (failureLatched || !device || !context || !in.sceneColor || !in.depthSRV || !in.motionSRV ||
 				in.width == 0 || in.height == 0 || in.motionSourceWidth == 0 || in.motionSourceHeight == 0 ||
+				in.workWidth == 0 || in.workHeight == 0 || in.workWidth > in.width || in.workHeight > in.height ||
+				in.paddedWidth < in.workWidth || in.paddedHeight < in.workHeight ||
 				(before && !in.sceneColorSRV))
 				return false;
 			Util::CpuPassScope evaluateScope("NeuralRendering::Evaluate");
@@ -294,19 +304,31 @@ namespace NeuralRendering
 				return LatchFailure("texture description", E_INVALIDARG);
 			if (in.width > sceneDesc.Width || in.height > sceneDesc.Height)
 				return LatchFailure("extent larger than the scene", E_INVALIDARG);
-			if (!EnsureWorkingSet(in, sceneDesc, motionDesc.Format))
+
+			// (batch 38c) After upscaling, at the frame's own size, unpadded and without tone
+			// preservation, the colour goes in and out by plain copies exactly as in 37c / 38a.
+			// Everything else goes through PrepareColorCS and FinalizeCS.
+			const bool direct = !before && in.workWidth == in.width && in.workHeight == in.height &&
+			                    in.paddedWidth == in.width && in.paddedHeight == in.height && in.toneStrength <= 0.0f;
+			if (!EnsureWorkingSet(in, sceneDesc, motionDesc.Format, direct))
 				return LatchFailure("shared resource creation", interop.LastError());
 
-			// A model-resolution change keeps every texture but needs a new NGX feature. Runtime::Execute
-			// would release the old one itself, but from inside a command list while earlier frames may
-			// still be using it on the GPU; release it here, once the queue has drained, instead.
+			// A feature that has to be replaced -- one 38a made with a model-resolution ratio, or (batch
+			// 38c) one whose tuning, read only at creation, is no longer what the menu says -- is
+			// released here, once the queue has drained, rather than by Runtime::Execute from inside a
+			// command list while earlier frames may still be using it on the GPU.
 			auto& runtime = Runtime::Instance();
 			const float liveScale = runtime.FeatureScalingRatio(0);
-			if (liveScale > 0.0f && liveScale != in.modelScale) {
+			const bool tuningStale = !runtime.FeatureTuningMatches(0, in.tuning, in.tuningAtCreate);
+			if ((liveScale > 0.0f && liveScale != 1.0f) || tuningStale) {
 				if (!interop.WaitForIdle())
-					return LatchFailure("WaitForIdle before model resolution change", interop.LastError());
+					return LatchFailure("WaitForIdle before rebuilding the feature", interop.LastError());
 				runtime.ResetFeature(0);
 				resetPending[0] = true;
+				if (tuningStale)
+					logger::info("[DLSSNR] tuning changed (intensity {:.2f}, local tone {:.2f}, local structure {:.2f}, skin {:.2f}, style {}): rebuilding the feature",
+						in.tuning.intensity, in.tuning.localToneStrength, in.tuning.localStructureStrength,
+						in.tuning.skinStructureStrength, in.tuning.style);
 			}
 
 			auto& ws = workingSet;
@@ -314,11 +336,18 @@ namespace NeuralRendering
 				return LatchFailure("guide preparation", E_FAIL);
 
 			const D3D11_BOX box{ 0, 0, 0, in.width, in.height, 1 };
-			if (before) {
-				if (!TransformColor(context, encodeCS, {}, in.sceneColorSRV, nullptr, nullptr, ws.color.uav11.Get(), in.width, in.height))
-					return LatchFailure("colour encode", E_FAIL);
-			} else {
+			ID3D11ShaderResourceView* originalSRV = before ? in.sceneColorSRV : ws.sceneCopySRV.Get();
+			if (direct) {
 				context->CopySubresourceRegion(ws.color.resource11.Get(), 0, 0, 0, 0, in.sceneColor, 0, &box);
+			} else {
+				if (!before)
+					context->CopySubresourceRegion(ws.sceneCopy.Get(), 0, 0, 0, 0, in.sceneColor, 0, &box);
+				if (in.encode == Renderer::Encode::Curve && !BuildToneCurve(context, in.toneCurve))
+					return LatchFailure("tone curve", E_FAIL);
+				const std::uint32_t sourceWidth = before ? sceneDesc.Width : in.width;
+				const std::uint32_t sourceHeight = before ? sceneDesc.Height : in.height;
+				if (!PrepareColor(context, in, originalSRV, sourceWidth, sourceHeight))
+					return LatchFailure("colour preparation", E_FAIL);
 			}
 
 			ID3D12GraphicsCommandList* commandList = nullptr;
@@ -338,13 +367,14 @@ namespace NeuralRendering
 				                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 			}
 			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
-			// Colour and guides share one extent, so the vectors are scaled to that extent's pixels:
-			// the engine stores normalised screen units and the model wants pixels.
+			// Colour and guides share the network extent, padding included, so the network reads no
+			// margin it was not given. The vectors are in normalised screen units and the model wants
+			// pixels of the content it is looking at: the content extent, not the padded one.
 			const bool succeeded = runtime.Execute(commandList, 0,
 				ws.color.resource12.Get(), ws.depth.resource12.Get(), ws.motionVectors.resource12.Get(),
-				ws.output.resource12.Get(), in.width, in.height, in.width, in.height,
-				static_cast<float>(in.width), static_cast<float>(in.height), in.tuning,
-				in.reset || resetPending[0], in.modelScale);
+				ws.output.resource12.Get(), in.paddedWidth, in.paddedHeight, in.paddedWidth, in.paddedHeight,
+				static_cast<float>(in.workWidth), static_cast<float>(in.workHeight), in.tuning,
+				in.reset || resetPending[0], 1.0f, in.tuningAtCreate);
 			for (auto& barrier : barriers)
 				std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
 			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
@@ -356,13 +386,16 @@ namespace NeuralRendering
 			// EndD3D12 queued a GPU-side wait on the D3D11 timeline, so everything below -- and
 			// everything the frame does after it: DLSS super resolution, the HUD-less copy frame
 			// generation reads, the backbuffer -- sees the finished network output.
-			if (before) {
-				if (!TransformColor(context, decodeCS, { { "DECODE", "" } }, in.sceneColorSRV, ws.color.srv11.Get(),
-						ws.output.srv11.Get(), ws.decodeScratchUAV.Get(), in.width, in.height))
-					return LatchFailure("colour decode", E_FAIL);
-				context->CopySubresourceRegion(in.sceneColor, 0, 0, 0, 0, ws.decodeScratch.Get(), 0, &box);
-			} else {
+			if (direct) {
 				context->CopySubresourceRegion(in.sceneColor, 0, 0, 0, 0, ws.output.resource11.Get(), 0, &box);
+				lastRoute = "direct copy";
+			} else {
+				if (in.toneStrength > 0.0f && !Finalize(context, in, originalSRV, true))
+					return LatchFailure("tone statistics", E_FAIL);
+				if (!Finalize(context, in, originalSRV, false))
+					return LatchFailure("finalize", E_FAIL);
+				context->CopySubresourceRegion(in.sceneColor, 0, 0, 0, 0, ws.finalScratch.Get(), 0, &box);
+				lastRoute = "prepare + finalize";
 			}
 			resetPending[0] = false;
 			return true;
@@ -383,48 +416,142 @@ namespace NeuralRendering
 		[[nodiscard]] float LastModelGpuMs() const { return interop.LastGpuMs(); }
 		[[nodiscard]] std::uint32_t MaxInFlight() const { return interop.MaxInFlight(); }
 		[[nodiscard]] std::uint32_t BackpressureWaits() const { return interop.BackpressureWaits(); }
+		[[nodiscard]] const char* LastRoute() const { return lastRoute; }
 
 		[[nodiscard]] bool IsFailureLatched() const { return failureLatched; }
 
 	private:
+		// (batch 38c) Grid the tone statistics are averaged over: 18 cells high, as many wide as keeps
+		// them square.
+		static constexpr std::uint32_t kToneGridHeight = 18;
+		static constexpr std::uint32_t kToneCurveEntries = 257;  // Common.hlsli: kCurveSize + 1
+
 		// (batch 38a) Everything the Batch 38 pass owns. Kept apart from `eyes`, which stays the 37c
 		// path's, so the master switch can flip between the two without either one reusing a
 		// texture the other sized.
 		struct WorkingSet
 		{
+			// Shared with the network, at the network extent (padded).
 			SharedTexture color;
 			SharedTexture depth;
 			SharedTexture motionVectors;
 			SharedTexture output;
-			Microsoft::WRL::ComPtr<ID3D11Texture2D> decodeScratch;
-			Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> decodeScratchUAV;
+			// (batch 38c) Frame extent, scene format: FinalizeCS writes here, then it is copied into the
+			// scene (38a's decode scratch).
+			Microsoft::WRL::ComPtr<ID3D11Texture2D> finalScratch;
+			Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> finalScratchUAV;
+			// (batch 38c) After upscaling, shader route: the frame as it was, readable (the bound target
+			// may not be).
+			Microsoft::WRL::ComPtr<ID3D11Texture2D> sceneCopy;
+			Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> sceneCopySRV;
+			// (batch 38c) The tone curve (ToneCurveCS.hlsl) and the tone statistics grid.
+			Microsoft::WRL::ComPtr<ID3D11Buffer> curve;
+			Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> curveSRV;
+			Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> curveUAV;
+			std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 2> stats;
+			std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>, 2> statsSRV;
+			std::array<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>, 2> statsUAV;
+			std::uint32_t gridWidth = 0;
+			std::uint32_t gridHeight = 0;
+
 			Renderer::Placement placement = Renderer::Placement::AfterUpscaling;
 			std::uint32_t width = 0;
 			std::uint32_t height = 0;
+			std::uint32_t workWidth = 0;
+			std::uint32_t workHeight = 0;
+			std::uint32_t paddedWidth = 0;
+			std::uint32_t paddedHeight = 0;
+			bool direct = false;
 			DXGI_FORMAT sceneFormat = DXGI_FORMAT_UNKNOWN;
 			DXGI_FORMAT motionFormat = DXGI_FORMAT_UNKNOWN;
+			DXGI_FORMAT networkFormat = DXGI_FORMAT_UNKNOWN;
 		};
 
-		// Layouts match the cbuffers in PrepareGuidesCS.hlsl and ColorTransformCS.hlsl.
+		// Layouts match the cbuffers in PrepareGuidesCS.hlsl, PrepareColorCS.hlsl, ToneCurveCS.hlsl
+		// and FinalizeCS.hlsl.
 		struct PrepareGuidesConstants
 		{
 			float motionSourceScale[2];
 			float motionOffset[2];
 			std::uint32_t extent[2];
 			std::uint32_t motionSourceMax[2];
-		};
-
-		struct ColorTransformConstants
-		{
-			std::uint32_t extent[2];
+			float depthSourceScale[2];
+			std::uint32_t contentExtent[2];
+			std::uint32_t depthSourceMax[2];
 			std::uint32_t pad[2];
 		};
 
-		bool EnsureWorkingSet(const Renderer::PassInput& in, const D3D11_TEXTURE2D_DESC& sceneDesc, DXGI_FORMAT motionFormat)
+		struct PrepareColorConstants
 		{
+			std::uint32_t destinationExtent[2];
+			std::uint32_t contentExtent[2];
+			std::uint32_t sourceExtent[2];
+			float sourceTexelSize[2];
+			std::uint32_t encodeMode;
+			std::uint32_t resample;
+			std::uint32_t pad[2];
+		};
+
+		struct ToneCurveConstants
+		{
+			float tint[4];
+			float inputGamma;
+			float outputGamma;
+			float cinematicBrightness;
+			float cinematicContrast;
+			float exposureCompensation;
+			float adaptationMin;
+			float adaptationMax;
+			float fixedExposure;
+			std::uint32_t useGrading;
+			std::uint32_t useAutoExposure;
+			std::uint32_t gammaCorrect;
+			std::uint32_t pad;
+		};
+
+		struct FinalizeConstants
+		{
+			std::uint32_t fullExtent[2];
+			std::uint32_t workExtent[2];
+			std::uint32_t encodeMode;
+			std::uint32_t scaled;
+			std::uint32_t toneEnabled;
+			std::uint32_t displayEncoded;
+			float toneStrength;
+			float depthSigma;
+			float cameraNear;
+			float cameraFar;
+			std::uint32_t grid[2];
+			float gridTexel[2];
+		};
+
+		static_assert(sizeof(PrepareGuidesConstants) % 16 == 0);
+		static_assert(sizeof(PrepareColorConstants) % 16 == 0);
+		static_assert(sizeof(ToneCurveConstants) % 16 == 0);
+		static_assert(sizeof(FinalizeConstants) % 16 == 0);
+
+		bool CreatePlainTexture(const D3D11_TEXTURE2D_DESC& desc, Microsoft::WRL::ComPtr<ID3D11Texture2D>& texture, const char* name)
+		{
+			const HRESULT result = interop.device11_->CreateTexture2D(&desc, nullptr, &texture);
+			if (FAILED(result)) {
+				interop.RecordFailure(result);
+				return false;
+			}
+			Util::SetResourceName(texture.Get(), name);
+			return true;
+		}
+
+		bool EnsureWorkingSet(const Renderer::PassInput& in, const D3D11_TEXTURE2D_DESC& sceneDesc, DXGI_FORMAT motionFormat, bool direct)
+		{
+			const bool before = in.placement == Renderer::Placement::BeforeUpscaling;
+			// Before upscaling the network reads the wrapped HDR image in the chosen format. After
+			// upscaling it reads the finished frame in the target's own format, as in 37c.
+			const DXGI_FORMAT networkFormat = before ? in.networkFormat : sceneDesc.Format;
 			auto& ws = workingSet;
 			if (ws.color.resource11 && ws.placement == in.placement && ws.width == in.width && ws.height == in.height &&
-				ws.sceneFormat == sceneDesc.Format && ws.motionFormat == motionFormat)
+				ws.workWidth == in.workWidth && ws.workHeight == in.workHeight && ws.paddedWidth == in.paddedWidth &&
+				ws.paddedHeight == in.paddedHeight && ws.direct == direct && ws.sceneFormat == sceneDesc.Format &&
+				ws.motionFormat == motionFormat && ws.networkFormat == networkFormat)
 				return true;
 
 			if (!interop.WaitForIdle())
@@ -432,16 +559,12 @@ namespace NeuralRendering
 			Runtime::Instance().ResetFeature(0);
 			ws = {};
 
-			const bool before = in.placement == Renderer::Placement::BeforeUpscaling;
 			const UINT sharedFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-			// Before upscaling the network reads the encoded RGBA8 image (see ColorTransformCS.hlsl).
-			// After upscaling it reads the finished frame in the target's own format, as in 37c.
-			auto colorDesc = MakeSharedDesc(sceneDesc, in.width, in.height, sharedFlags);
-			if (before)
-				colorDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-			auto depthDesc = MakeSharedDesc(sceneDesc, in.width, in.height, sharedFlags);
+			auto colorDesc = MakeSharedDesc(sceneDesc, in.paddedWidth, in.paddedHeight, sharedFlags);
+			colorDesc.Format = networkFormat;
+			auto depthDesc = MakeSharedDesc(sceneDesc, in.paddedWidth, in.paddedHeight, sharedFlags);
 			depthDesc.Format = DXGI_FORMAT_R32_FLOAT;
-			auto motionDesc = MakeSharedDesc(sceneDesc, in.width, in.height, sharedFlags);
+			auto motionDesc = MakeSharedDesc(sceneDesc, in.paddedWidth, in.paddedHeight, sharedFlags);
 			motionDesc.Format = motionFormat;
 			if (!interop.CreateSharedTexture(colorDesc, ws.color, "NeuralRendering::Color") ||
 				!interop.CreateSharedTexture(colorDesc, ws.output, "NeuralRendering::Output") ||
@@ -450,42 +573,158 @@ namespace NeuralRendering
 				ws = {};
 				return false;
 			}
-			if (before && (!ws.color.srv11 || !ws.output.srv11)) {
-				ws = {};
-				interop.RecordFailure(E_FAIL);
-				return false;
-			}
-			if (before) {
-				// The decoded HDR result, in the scene's own format so it copies straight back. The view
-				// takes the format the scene's own SRV reads it as, in case the texture is typeless.
-				auto scratchDesc = MakeSharedDesc(sceneDesc, in.width, in.height, D3D11_BIND_UNORDERED_ACCESS);
-				D3D11_SHADER_RESOURCE_VIEW_DESC sceneViewDesc{};
-				in.sceneColorSRV->GetDesc(&sceneViewDesc);
-				D3D11_UNORDERED_ACCESS_VIEW_DESC scratchViewDesc{};
-				scratchViewDesc.Format = sceneViewDesc.Format;
-				scratchViewDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-				scratchViewDesc.Texture2D.MipSlice = 0;
+
+			if (!direct) {
 				ID3D11Device* device11 = interop.device11_.Get();
-				HRESULT result = device11->CreateTexture2D(&scratchDesc, nullptr, &ws.decodeScratch);
-				if (SUCCEEDED(result))
-					result = device11->CreateUnorderedAccessView(ws.decodeScratch.Get(), &scratchViewDesc, &ws.decodeScratchUAV);
-				if (FAILED(result)) {
+				if (!ws.color.srv11 || !ws.output.srv11 || !ws.depth.srv11) {
 					ws = {};
-					interop.RecordFailure(result);
+					interop.RecordFailure(E_FAIL);
 					return false;
 				}
-				Util::SetResourceName(ws.decodeScratch.Get(), "NeuralRendering::DecodeScratch");
+
+				// The finished result, in the scene's own format so it copies straight back. Before
+				// upscaling the view takes the format the scene's own SRV reads it as, in case the
+				// texture is typeless.
+				DXGI_FORMAT viewFormat = sceneDesc.Format;
+				if (before) {
+					D3D11_SHADER_RESOURCE_VIEW_DESC sceneViewDesc{};
+					in.sceneColorSRV->GetDesc(&sceneViewDesc);
+					viewFormat = sceneViewDesc.Format;
+				}
+				auto scratchDesc = MakeSharedDesc(sceneDesc, in.width, in.height, D3D11_BIND_UNORDERED_ACCESS);
+				D3D11_UNORDERED_ACCESS_VIEW_DESC scratchViewDesc{};
+				scratchViewDesc.Format = viewFormat;
+				scratchViewDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+				HRESULT result = S_OK;
+				if (!CreatePlainTexture(scratchDesc, ws.finalScratch, "NeuralRendering::FinalScratch") ||
+					FAILED(result = device11->CreateUnorderedAccessView(ws.finalScratch.Get(), &scratchViewDesc, &ws.finalScratchUAV))) {
+					if (FAILED(result))
+						interop.RecordFailure(result);
+					ws = {};
+					return false;
+				}
+
+				if (!before) {
+					auto copyDesc = MakeSharedDesc(sceneDesc, in.width, in.height, D3D11_BIND_SHADER_RESOURCE);
+					if (!CreatePlainTexture(copyDesc, ws.sceneCopy, "NeuralRendering::SceneCopy") ||
+						FAILED(result = device11->CreateShaderResourceView(ws.sceneCopy.Get(), nullptr, &ws.sceneCopySRV))) {
+						if (FAILED(result))
+							interop.RecordFailure(result);
+						ws = {};
+						return false;
+					}
+				}
+
+				D3D11_BUFFER_DESC curveDesc{};
+				curveDesc.ByteWidth = static_cast<UINT>(sizeof(float) * 4 * kToneCurveEntries);
+				curveDesc.Usage = D3D11_USAGE_DEFAULT;
+				curveDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+				curveDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+				curveDesc.StructureByteStride = sizeof(float) * 4;
+				D3D11_SHADER_RESOURCE_VIEW_DESC curveSRVDesc{};
+				curveSRVDesc.Format = DXGI_FORMAT_UNKNOWN;
+				curveSRVDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+				curveSRVDesc.Buffer.NumElements = kToneCurveEntries;
+				D3D11_UNORDERED_ACCESS_VIEW_DESC curveUAVDesc{};
+				curveUAVDesc.Format = DXGI_FORMAT_UNKNOWN;
+				curveUAVDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+				curveUAVDesc.Buffer.NumElements = kToneCurveEntries;
+				if (FAILED(result = device11->CreateBuffer(&curveDesc, nullptr, &ws.curve)) ||
+					FAILED(result = device11->CreateShaderResourceView(ws.curve.Get(), &curveSRVDesc, &ws.curveSRV)) ||
+					FAILED(result = device11->CreateUnorderedAccessView(ws.curve.Get(), &curveUAVDesc, &ws.curveUAV))) {
+					interop.RecordFailure(result);
+					ws = {};
+					return false;
+				}
+				Util::SetResourceName(ws.curve.Get(), "NeuralRendering::ToneCurve");
+
+				ws.gridHeight = kToneGridHeight;
+				ws.gridWidth = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(
+															 static_cast<double>(kToneGridHeight) * in.width / in.height)),
+					1u, 64u);
+				D3D11_TEXTURE2D_DESC statsDesc = MakeSharedDesc(sceneDesc, ws.gridWidth, ws.gridHeight, sharedFlags);
+				statsDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+				for (std::size_t index = 0; index < ws.stats.size(); ++index) {
+					if (!CreatePlainTexture(statsDesc, ws.stats[index], index == 0 ? "NeuralRendering::ToneStatsOriginal" : "NeuralRendering::ToneStatsResult") ||
+						FAILED(result = device11->CreateShaderResourceView(ws.stats[index].Get(), nullptr, &ws.statsSRV[index])) ||
+						FAILED(result = device11->CreateUnorderedAccessView(ws.stats[index].Get(), nullptr, &ws.statsUAV[index]))) {
+						if (FAILED(result))
+							interop.RecordFailure(result);
+						ws = {};
+						return false;
+					}
+				}
 			}
+
 			ws.placement = in.placement;
 			ws.width = in.width;
 			ws.height = in.height;
+			ws.workWidth = in.workWidth;
+			ws.workHeight = in.workHeight;
+			ws.paddedWidth = in.paddedWidth;
+			ws.paddedHeight = in.paddedHeight;
+			ws.direct = direct;
 			ws.sceneFormat = sceneDesc.Format;
 			ws.motionFormat = motionFormat;
+			ws.networkFormat = networkFormat;
 			resetPending = { true, true };
-			logger::info("[DLSSNR] resources placement={} extent={}x{} sceneFormat={} networkInputFormat={}",
-				before ? "before-upscaling" : "after-upscaling", in.width, in.height,
-				static_cast<std::uint32_t>(sceneDesc.Format), static_cast<std::uint32_t>(colorDesc.Format));
+			// (batch 38c) The exact extents, every rebuild: frame, model content, network (with the
+			// padding), and the scale the motion vectors are given in.
+			logger::info("[DLSSNR] extents: placement={} frame={}x{} model={}x{} ({}%) network={}x{} (padding +{} +{}) "
+						 "mvScale={}x{} route={} sceneFormat={} networkInputFormat={}",
+				before ? "before-upscaling" : "after-upscaling", in.width, in.height, in.workWidth, in.workHeight,
+				std::lround(100.0 * in.workWidth / in.width), in.paddedWidth, in.paddedHeight,
+				in.paddedWidth - in.workWidth, in.paddedHeight - in.workHeight, in.workWidth, in.workHeight,
+				direct ? "direct copy" : "prepare + finalize", static_cast<std::uint32_t>(sceneDesc.Format),
+				static_cast<std::uint32_t>(networkFormat));
 			return true;
+		}
+
+		/// Binds and unbinds one compute dispatch. Up to 8 SRVs and 2 UAVs, one sampler, one cbuffer.
+		void Dispatch(ID3D11DeviceContext* context, ID3D11ComputeShader* shader, ID3D11Buffer* cb,
+			std::initializer_list<ID3D11ShaderResourceView*> srvs, std::initializer_list<ID3D11UnorderedAccessView*> uavs,
+			bool sampler, UINT groupsX, UINT groupsY)
+		{
+			ID3D11ShaderResourceView* srvArray[8]{};
+			ID3D11UnorderedAccessView* uavArray[2]{};
+			UINT srvCount = 0;
+			UINT uavCount = 0;
+			for (auto* srv : srvs)
+				srvArray[srvCount++] = srv;
+			for (auto* uav : uavs)
+				uavArray[uavCount++] = uav;
+			ID3D11SamplerState* samplerState = sampler ? linearClamp.Get() : nullptr;
+			context->CSSetShader(shader, nullptr, 0);
+			context->CSSetConstantBuffers(0, 1, &cb);
+			if (srvCount)
+				context->CSSetShaderResources(0, srvCount, srvArray);
+			context->CSSetUnorderedAccessViews(0, uavCount, uavArray, nullptr);
+			if (sampler)
+				context->CSSetSamplers(0, 1, &samplerState);
+			context->Dispatch(groupsX, groupsY, 1);
+			ID3D11ShaderResourceView* nullSRVs[8]{};
+			ID3D11UnorderedAccessView* nullUAVs[2]{};
+			ID3D11Buffer* nullCB = nullptr;
+			ID3D11SamplerState* nullSampler = nullptr;
+			if (srvCount)
+				context->CSSetShaderResources(0, srvCount, nullSRVs);
+			context->CSSetUnorderedAccessViews(0, uavCount, nullUAVs, nullptr);
+			context->CSSetConstantBuffers(0, 1, &nullCB);
+			if (sampler)
+				context->CSSetSamplers(0, 1, &nullSampler);
+			context->CSSetShader(nullptr, nullptr, 0);
+		}
+
+		bool EnsureSampler()
+		{
+			if (linearClamp)
+				return true;
+			D3D11_SAMPLER_DESC desc{};
+			desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+			desc.AddressU = desc.AddressV = desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+			desc.MaxLOD = D3D11_FLOAT32_MAX;
+			desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+			return SUCCEEDED(interop.device11_->CreateSamplerState(&desc, &linearClamp));
 		}
 
 		bool PrepareGuides(ID3D11DeviceContext* context, const Renderer::PassInput& in)
@@ -496,65 +735,128 @@ namespace NeuralRendering
 				return false;
 			if (!guidesCB)
 				guidesCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PrepareGuidesConstants>());
+			// Content texel centre -> source texel. Depth sits 1:1 with the frame; the vectors at render
+			// resolution. At 100% the depth scale is 1 and the read is 38a's 1:1.
 			PrepareGuidesConstants constants{};
-			constants.motionSourceScale[0] = static_cast<float>(in.motionSourceWidth) / static_cast<float>(in.width);
-			constants.motionSourceScale[1] = static_cast<float>(in.motionSourceHeight) / static_cast<float>(in.height);
+			constants.motionSourceScale[0] = static_cast<float>(in.motionSourceWidth) / static_cast<float>(in.workWidth);
+			constants.motionSourceScale[1] = static_cast<float>(in.motionSourceHeight) / static_cast<float>(in.workHeight);
 			constants.motionOffset[0] = in.motionOffsetX;
 			constants.motionOffset[1] = in.motionOffsetY;
-			constants.extent[0] = in.width;
-			constants.extent[1] = in.height;
+			constants.extent[0] = in.paddedWidth;
+			constants.extent[1] = in.paddedHeight;
 			constants.motionSourceMax[0] = in.motionSourceWidth - 1;
 			constants.motionSourceMax[1] = in.motionSourceHeight - 1;
+			constants.depthSourceScale[0] = static_cast<float>(in.width) / static_cast<float>(in.workWidth);
+			constants.depthSourceScale[1] = static_cast<float>(in.height) / static_cast<float>(in.workHeight);
+			constants.contentExtent[0] = in.workWidth;
+			constants.contentExtent[1] = in.workHeight;
+			constants.depthSourceMax[0] = in.width - 1;
+			constants.depthSourceMax[1] = in.height - 1;
 			guidesCB->Update(constants);
 
-			ID3D11Buffer* cb = guidesCB->CB();
-			ID3D11ShaderResourceView* srvs[2]{ in.depthSRV, in.motionSRV };
-			ID3D11UnorderedAccessView* uavs[2]{ workingSet.depth.uav11.Get(), workingSet.motionVectors.uav11.Get() };
-			context->CSSetShader(shader, nullptr, 0);
-			context->CSSetConstantBuffers(0, 1, &cb);
-			context->CSSetShaderResources(0, 2, srvs);
-			context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-			context->Dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
-			ID3D11ShaderResourceView* nullSRVs[2]{};
-			ID3D11UnorderedAccessView* nullUAVs[2]{};
-			ID3D11Buffer* nullCB = nullptr;
-			context->CSSetShaderResources(0, 2, nullSRVs);
-			context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
-			context->CSSetConstantBuffers(0, 1, &nullCB);
-			context->CSSetShader(nullptr, nullptr, 0);
+			Dispatch(context, shader, guidesCB->CB(), { in.depthSRV, in.motionSRV },
+				{ workingSet.depth.uav11.Get(), workingSet.motionVectors.uav11.Get() }, false,
+				(in.paddedWidth + 7) / 8, (in.paddedHeight + 7) / 8);
 			return true;
 		}
 
-		bool TransformColor(ID3D11DeviceContext* context, LazyComputeShader& lazyShader,
-			const std::vector<std::pair<const char*, const char*>>& defines,
-			ID3D11ShaderResourceView* original, ID3D11ShaderResourceView* encodedInput, ID3D11ShaderResourceView* networkOutput,
-			ID3D11UnorderedAccessView* destination, std::uint32_t width, std::uint32_t height)
+		bool BuildToneCurve(ID3D11DeviceContext* context, const Renderer::ToneCurveSource& source)
 		{
-			auto* shader = lazyShader.Get(L"Data\\Shaders\\Upscaling\\NeuralRendering\\ColorTransformCS.hlsl", defines, "cs_5_0",
-				"main", "NeuralRendering::ColorTransformCS");
-			if (!shader || !destination)
+			auto* shader = toneCurveCS.Get(L"Data\\Shaders\\Upscaling\\NeuralRendering\\ToneCurveCS.hlsl", {}, "cs_5_0",
+				"main", "NeuralRendering::ToneCurveCS");
+			if (!shader || !workingSet.curveUAV || !EnsureSampler())
+				return false;
+			if (!curveCB)
+				curveCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<ToneCurveConstants>());
+			ToneCurveConstants constants{};
+			std::copy(std::begin(source.tint), std::end(source.tint), constants.tint);
+			constants.inputGamma = source.inputGamma;
+			constants.outputGamma = source.outputGamma;
+			constants.cinematicBrightness = source.cinematicBrightness;
+			constants.cinematicContrast = source.cinematicContrast;
+			constants.exposureCompensation = source.exposureCompensation;
+			constants.adaptationMin = source.adaptationMin;
+			constants.adaptationMax = source.adaptationMax;
+			constants.fixedExposure = source.fixedExposure;
+			constants.useGrading = source.gradingLUT ? 1u : 0u;
+			constants.useAutoExposure = source.adaptation ? 1u : 0u;
+			constants.gammaCorrect = source.gammaCorrect ? 1u : 0u;
+			curveCB->Update(constants);
+
+			Dispatch(context, shader, curveCB->CB(), { source.gradingLUT, source.adaptation }, { workingSet.curveUAV.Get() }, true, 1, 1);
+			return true;
+		}
+
+		bool PrepareColor(ID3D11DeviceContext* context, const Renderer::PassInput& in, ID3D11ShaderResourceView* source,
+			std::uint32_t sourceTextureWidth, std::uint32_t sourceTextureHeight)
+		{
+			auto* shader = prepareColorCS.Get(L"Data\\Shaders\\Upscaling\\NeuralRendering\\PrepareColorCS.hlsl", {}, "cs_5_0",
+				"main", "NeuralRendering::PrepareColorCS");
+			if (!shader || !source || !EnsureSampler())
 				return false;
 			if (!colorCB)
-				colorCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<ColorTransformConstants>());
-			ColorTransformConstants constants{};
-			constants.extent[0] = width;
-			constants.extent[1] = height;
+				colorCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PrepareColorConstants>());
+			PrepareColorConstants constants{};
+			constants.destinationExtent[0] = in.paddedWidth;
+			constants.destinationExtent[1] = in.paddedHeight;
+			constants.contentExtent[0] = in.workWidth;
+			constants.contentExtent[1] = in.workHeight;
+			constants.sourceExtent[0] = in.width;
+			constants.sourceExtent[1] = in.height;
+			constants.sourceTexelSize[0] = 1.0f / static_cast<float>(sourceTextureWidth);
+			constants.sourceTexelSize[1] = 1.0f / static_cast<float>(sourceTextureHeight);
+			constants.encodeMode = static_cast<std::uint32_t>(in.encode);
+			constants.resample = (in.workWidth != in.width || in.workHeight != in.height) ? 1u : 0u;
 			colorCB->Update(constants);
 
-			ID3D11Buffer* cb = colorCB->CB();
-			ID3D11ShaderResourceView* srvs[3]{ original, encodedInput, networkOutput };
-			context->CSSetShader(shader, nullptr, 0);
-			context->CSSetConstantBuffers(0, 1, &cb);
-			context->CSSetShaderResources(0, 3, srvs);
-			context->CSSetUnorderedAccessViews(0, 1, &destination, nullptr);
-			context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
-			ID3D11ShaderResourceView* nullSRVs[3]{};
-			ID3D11UnorderedAccessView* nullUAV = nullptr;
-			ID3D11Buffer* nullCB = nullptr;
-			context->CSSetShaderResources(0, 3, nullSRVs);
-			context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
-			context->CSSetConstantBuffers(0, 1, &nullCB);
-			context->CSSetShader(nullptr, nullptr, 0);
+			Dispatch(context, shader, colorCB->CB(), { source, workingSet.curveSRV.Get() }, { workingSet.color.uav11.Get() }, true,
+				(in.paddedWidth + 7) / 8, (in.paddedHeight + 7) / 8);
+			return true;
+		}
+
+		/// @param stats true = the STATS variant (tone statistics grid), false = the frame pass.
+		bool Finalize(ID3D11DeviceContext* context, const Renderer::PassInput& in, ID3D11ShaderResourceView* original, bool stats)
+		{
+			auto& lazy = stats ? toneStatsCS : finalizeCS;
+			std::vector<std::pair<const char*, const char*>> defines;
+			if (stats)
+				defines.emplace_back("STATS", "");
+			auto* shader = lazy.Get(L"Data\\Shaders\\Upscaling\\NeuralRendering\\FinalizeCS.hlsl", defines, "cs_5_0",
+				"main", stats ? "NeuralRendering::ToneStatsCS" : "NeuralRendering::FinalizeCS");
+			auto& ws = workingSet;
+			if (!shader || !original || !ws.finalScratchUAV || !ws.curveSRV || !ws.statsSRV[0] || !EnsureSampler())
+				return false;
+			if (!finalizeCB)
+				finalizeCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<FinalizeConstants>());
+			FinalizeConstants constants{};
+			constants.fullExtent[0] = in.width;
+			constants.fullExtent[1] = in.height;
+			constants.workExtent[0] = in.workWidth;
+			constants.workExtent[1] = in.workHeight;
+			constants.encodeMode = static_cast<std::uint32_t>(in.encode);
+			constants.scaled = (in.workWidth != in.width || in.workHeight != in.height) ? 1u : 0u;
+			constants.toneEnabled = in.toneStrength > 0.0f ? 1u : 0u;
+			constants.displayEncoded = in.placement == Renderer::Placement::AfterUpscaling ? 1u : 0u;
+			constants.toneStrength = std::clamp(in.toneStrength, 0.0f, 1.0f);
+			constants.depthSigma = 0.05f;
+			constants.cameraNear = in.cameraNear;
+			constants.cameraFar = std::max(in.cameraFar, in.cameraNear + 1.0f);
+			constants.grid[0] = ws.gridWidth;
+			constants.grid[1] = ws.gridHeight;
+			constants.gridTexel[0] = 1.0f / static_cast<float>(ws.gridWidth);
+			constants.gridTexel[1] = 1.0f / static_cast<float>(ws.gridHeight);
+			finalizeCB->Update(constants);
+
+			if (stats) {
+				Dispatch(context, shader, finalizeCB->CB(),
+					{ original, ws.color.srv11.Get(), ws.output.srv11.Get(), ws.curveSRV.Get(), in.depthSRV, ws.depth.srv11.Get() },
+					{ ws.statsUAV[0].Get(), ws.statsUAV[1].Get() }, false, ws.gridWidth, ws.gridHeight);
+			} else {
+				Dispatch(context, shader, finalizeCB->CB(),
+					{ original, ws.color.srv11.Get(), ws.output.srv11.Get(), ws.curveSRV.Get(), in.depthSRV, ws.depth.srv11.Get(),
+						ws.statsSRV[0].Get(), ws.statsSRV[1].Get() },
+					{ ws.finalScratchUAV.Get() }, true, (in.width + 7) / 8, (in.height + 7) / 8);
+			}
 			return true;
 		}
 
@@ -646,10 +948,16 @@ namespace NeuralRendering
 		D3D12Interop interop;
 		LazyComputeShader copyDepthGuideCS;
 		LazyComputeShader prepareGuidesCS;
-		LazyComputeShader encodeCS;
-		LazyComputeShader decodeCS;
+		LazyComputeShader prepareColorCS;
+		LazyComputeShader finalizeCS;
+		LazyComputeShader toneStatsCS;
+		LazyComputeShader toneCurveCS;
+		Microsoft::WRL::ComPtr<ID3D11SamplerState> linearClamp;
 		std::unique_ptr<ConstantBuffer> guidesCB;
 		std::unique_ptr<ConstantBuffer> colorCB;
+		std::unique_ptr<ConstantBuffer> curveCB;
+		std::unique_ptr<ConstantBuffer> finalizeCB;
+		const char* lastRoute = "";
 		WorkingSet workingSet;
 		std::array<EyeResources, 2> eyes;
 		std::array<bool, 2> resetPending{ true, true };
@@ -688,6 +996,7 @@ namespace NeuralRendering
 	std::uint32_t Renderer::BackpressureWaits() const { return state_->BackpressureWaits(); }
 	void Renderer::Reset(bool unloadRuntime) { state_->Reset(unloadRuntime); }
 	void Renderer::ResetHistory() { state_->ResetHistory(); }
+	const char* Renderer::LastRoute() const { return state_->LastRoute(); }
 	bool Renderer::IsFailureLatched() const { return state_->IsFailureLatched(); }
 	std::uint32_t Renderer::NgxResult() const { return Runtime::Instance().NgxResult(); }
 	std::uint64_t Renderer::SuccessfulFrames() const { return Runtime::Instance().SuccessfulFrames(); }

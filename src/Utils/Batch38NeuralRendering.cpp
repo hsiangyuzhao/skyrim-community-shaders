@@ -2,6 +2,7 @@
 // Kept in its own file so the other batch 38 groups add theirs without touching this one.
 #include "Utils/Batch38.h"
 
+#include <algorithm>
 #include <format>
 #include <string>
 
@@ -48,8 +49,55 @@ namespace Batch38
 			r.own = true;
 			rows.push_back(std::move(r));
 		}
-		rows.push_back({ group, "Model resolution", installed, true, std::format("{}%", nr.modelResolutionPercent),
-			!idle.empty() ? idle : std::format("{}%", status.modelPercent), where + std::string(" > Model Resolution") });
+		rows.push_back({ group, "Model resolution (38c: our own downscale; the DLL ignored 38a's)", installed, true,
+			std::format("{}%", nr.modelResolutionPercent),
+			!idle.empty() ? idle : std::format("{}% = {}x{}", status.modelPercent, status.workWidth, status.workHeight),
+			where + std::string(" > Model Resolution") });
+		{
+			Row r{ group, "38c: pad the network's picture to a multiple of 8 (Balanced tone fix)", installed, nr.padToNetworkGrid,
+				onOff(nr.padToNetworkGrid),
+				!nr.padToNetworkGrid ? std::string() :
+				!idle.empty()        ? idle :
+									   std::format("On, network {}x{}", status.paddedWidth, status.paddedHeight),
+				where + std::string(" > Pad to network grid") };
+			r.toggle = &nr.padToNetworkGrid;
+			rows.push_back(std::move(r));
+		}
+		{
+			Row r{ group, "38c: tone-matched input (before upscaling only)", installed, nr.toneMatchedInput,
+				onOff(nr.toneMatchedInput),
+				!nr.toneMatchedInput    ? std::string() :
+				!idle.empty()           ? idle :
+				!status.beforeUpscaling ? std::string("Idle: running after upscaling") :
+										  std::format("On ({})", NeuralRendering::ToneSourceText()),
+				where + std::string(" > Tone-matched input") };
+			r.toggle = &nr.toneMatchedInput;
+			rows.push_back(std::move(r));
+		}
+		{
+			const char* precisionNames[] = { "8-bit", "10-bit", "16-bit float" };
+			const char* precision = precisionNames[std::min(nr.inputPrecision, 2u)];
+			rows.push_back({ group, "38c: input precision (before upscaling only)", installed, nr.inputPrecision != 0, precision,
+				!idle.empty()           ? idle :
+				!status.beforeUpscaling ? std::string("Idle: running after upscaling") :
+										  std::string(precisionNames[std::min(status.inputPrecision, 2u)]),
+				where + std::string(" > Input Precision") });
+		}
+		{
+			const float strength = status.beforeUpscaling ? nr.tonePreservationBefore : nr.tonePreservationAfter;
+			rows.push_back({ group, "38c: tone preservation (before / after upscaling)", installed, strength > 0.0f,
+				std::format("{:.2f} / {:.2f}", nr.tonePreservationBefore, nr.tonePreservationAfter),
+				!idle.empty() ? idle : (status.toneStrength > 0.0f ? std::format("On, {:.2f}", status.toneStrength) : std::string("Off (0)")),
+				where + std::string(" > Tone Preservation") });
+		}
+		{
+			Row r{ group, "38c: give the model its tuning at creation", installed, nr.tuningAtCreate,
+				onOff(nr.tuningAtCreate),
+				!nr.tuningAtCreate ? std::string() : (!idle.empty() ? idle : std::string("On")),
+				where + std::string(" > Apply tuning at creation") };
+			r.toggle = &nr.tuningAtCreate;
+			rows.push_back(std::move(r));
+		}
 		{
 			Row r{ group, "Jitter-aware motion (before upscaling only)", installed, nr.jitterAwareMotion,
 				onOff(nr.jitterAwareMotion),

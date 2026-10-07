@@ -129,12 +129,29 @@ public:
 		// Run on the HDR scene at render resolution, before DLSS upscales it, instead of on the
 		// finished output-resolution image. Default off = 37c's place in the frame.
 		bool runBeforeUpscaling = false;
-		// The network's working resolution as a percentage of its input (DLSSNR.ScalingRatio):
-		// 100, 75 or 50. Cost falls roughly with the pixel count.
+		// The network's working resolution as a percentage of its input: 100, 75 or 50. Cost falls
+		// roughly with the pixel count. (batch 38c) Our own downscale: the DLL ignores
+		// DLSSNR.ScalingRatio, which is what 38a relied on. Only the network's edit is carried back
+		// up (depth-aware); the frame's own detail stays full resolution.
 		uint modelResolutionPercent = 100;
 		// Before upscaling only: add the camera-jitter step to the motion vectors the network
 		// reads, so its history lines up with the jittered image it is given.
 		bool jitterAwareMotion = true;
+		// (batch 38c) The rest act only while Advanced > Batch 38 is on.
+		// Pad the network's extent to a multiple of 8 (edge repeated), then crop. Balanced's
+		// 2227x1253 was the one extent the network got that is not, and the one that looked different.
+		bool padToNetworkGrid = true;
+		// Before upscaling only: show the network the frame as the post-processing chain will
+		// grade it (its auto exposure and colour grading / tone curve) instead of 38a's flat wrap.
+		bool toneMatchedInput = true;
+		// Before upscaling only: format the network reads. 0 = 8-bit (38a), 1 = 10-bit, 2 = 16-bit float.
+		uint inputPrecision = 0;
+		// Lock the picture's low-frequency brightness and colour to the input, 0..1, per placement.
+		float tonePreservationBefore = 0.5f;
+		float tonePreservationAfter = 0.0f;
+		// Give the model its tuning (intensity, strengths, style...) when the feature is created:
+		// it reads them only then. 38a set them per frame only, where they were ignored.
+		bool tuningAtCreate = true;
 	};
 
 	struct Settings
