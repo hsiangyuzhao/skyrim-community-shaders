@@ -15,7 +15,7 @@ namespace Batch38
 		// Extension point: groups registered here, in table order.
 		constexpr RowProvider kRowProviders[] = {
 			// Part B: items 3-5
-			nullptr,
+			RowsSkinSss,
 		};
 	}
 
