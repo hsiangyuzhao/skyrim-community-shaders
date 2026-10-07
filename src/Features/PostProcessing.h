@@ -9,6 +9,7 @@
 #include "PostProcessing/HistogramAutoExposure.h"
 #include "PostProcessing/LUT.h"
 #include "PostProcessing/LensFlare.h"
+#include "PostProcessing/LocalExposure.h"
 #include "PostProcessing/MotionBlur.h"
 #include "PostProcessing/ColorGrading.h"
 #include "PostProcessing/VanillaImagespace.h"
@@ -71,6 +72,7 @@ struct PostProcessing : Feature
 	enum class FeaturePipelineIndex : size_t
 	{
 		AutoExposure,
+		LocalExposure,  // (batch 38) right after auto exposure: works on the exposed image
 		MotionBlur,
 		DoF,
 		CODBloom,

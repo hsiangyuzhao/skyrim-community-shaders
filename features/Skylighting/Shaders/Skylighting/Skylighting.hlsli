@@ -19,7 +19,13 @@ namespace Skylighting
 
 	float getFadeOutFactor(float3 positionMS)
 	{
-		float3 uvw = saturate(positionMS / ARRAY_SIZE + .5);
+		// (batch 38, upstream 4b5b99783) The probe grid is centred on the snapped cell origin
+		// (PosOffset), not on the camera: measure the edge distance the way sample() addresses
+		// probes. PosOffset.w is the switch (0 = 37c: measured from the camera). Every reader --
+		// forward shaders, DeferredComposite and SSRT's sky fallback -- goes through here, so
+		// they stay in step.
+		const SharedData::SkylightingSettings params = SharedData::skylightingSettings;
+		float3 uvw = saturate((positionMS - params.PosOffset.xyz * params.PosOffset.w) / ARRAY_SIZE + .5);
 		float3 dists = min(uvw, 1 - uvw);
 		float edgeDist = min(dists.x, min(dists.y, dists.z));
 		return saturate(edgeDist * 20);

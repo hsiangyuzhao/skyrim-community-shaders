@@ -125,7 +125,7 @@ namespace SharedData
 		row_major float4x4 OcclusionViewProj;
 		float4 OcclusionDir;
 
-		float4 PosOffset;   // xyz: cell origin in camera model space
+		float4 PosOffset;   // xyz: cell origin in camera model space, w: (batch 38) 1 = fade-out from grid centre
 		uint4 ArrayOrigin;  // xyz: array origin
 		int4 ValidMargin;
 

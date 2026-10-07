@@ -3,6 +3,7 @@
 #include <imgui.h>
 #include <string>
 
+#include "Globals.h"
 #include "Menu.h"
 #include "Util.h"
 #include "Utils/UI.h"
@@ -11,17 +12,25 @@ namespace Batch38
 {
 	namespace
 	{
-		void Tooltip(const char* a_text)
-		{
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(a_text);
-		}
-
 		// Extension point: one provider per batch 38 group, in table order. Each provider lives
 		// in its own file next to the group's code.
 		constexpr RowProvider kRowProviders[] = {
+			// B: items 3-5 (Batch38PartB.cpp)
+			RowsSkinSss,
+			RowsLocalExposure,
+			RowsSkylighting,
+			// E: DLSS 5 Neural Rendering (Batch38NeuralRendering.cpp)
 			RowsNeuralRendering,
 		};
+	}
+
+	void MasterNote()
+	{
+		if (!IsOn()) {
+			const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
+			ImGui::SameLine();
+			ImGui::TextColored(palette.Warning, "(off: Batch 38 master switch)");
+		}
 	}
 
 	void DrawTab()
@@ -29,14 +38,16 @@ namespace Batch38
 		auto& master = settings.master;
 
 		ImGui::Checkbox("Batch 38 changes (all)", &master);
-		Tooltip(
-			"Off = every item below runs exactly as in batch 37c, whatever its own switch says\n"
-			"(diagnostics excepted).\n"
-			"Takes effect on the next frame: no restart. Independent of the 36f, 36g and 37b switches.");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Off = every item below runs exactly as in batch 37c, whatever its own switch says\n"
+				"(except the fixes marked \"always on\" and the diagnostics).\n"
+				"Takes effect on the next frame: no restart, no cache clear.\n"
+				"Independent of the 36f, 36g and 37b switches.");
 
 		ImGui::Spacing();
 		ImGui::TextWrapped(
-			"Each item keeps its own switch in its feature's menu (switches can also be toggled here). \"Now\" is what runs "
+			"Each item keeps its own switch in its feature's menu (most can also be toggled here). \"Now\" is what runs "
 			"this frame: the item's own setting, unless the master switch above is off.");
 		ImGui::Spacing();
 
@@ -63,7 +74,8 @@ namespace Batch38
 					ImGui::TextColored(palette.InfoColor, "%s", row.group.c_str());
 				}
 
-				ImGui::PushID(row.name.c_str());
+				// Group + name: two groups may use the same item name.
+				ImGui::PushID((row.group + row.name).c_str());
 				ImGui::TableNextRow();
 				ImGui::TableNextColumn();
 				ImGui::TextUnformatted(row.name.c_str());
@@ -94,6 +106,6 @@ namespace Batch38
 		}
 
 		ImGui::Spacing();
-		ImGui::TextDisabled("Idle = switched on, but nothing to do this frame (for example the feature itself is off).");
+		ImGui::TextDisabled("Idle = switched on, but nothing to do this frame (for example the feature itself is off; the reason is shown where known).");
 	}
 }

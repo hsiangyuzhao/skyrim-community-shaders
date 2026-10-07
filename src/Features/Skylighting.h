@@ -47,7 +47,27 @@ public:
 		float MaxZenith = 3.1415926f / 2.f;  // 90 deg
 		float MinDiffuseVisibility = 0.1f;
 		float MinSpecularVisibility = 0.1f;
+
+		// (batch 38, item 5) Upstream Skylighting fixes, one switch each, every one ANDed with
+		// Batch38::IsOn() (see the *Active() helpers). Off = the 37c code path.
+		bool FixRoofMarkers = true;          // ca63a41d5: meshes flagged "editor marker" (roof markers) occlude the sky
+		bool FixResetClearsProbes = true;    // 5b5361f53 (probe part): Rebuild / load screen resets probes to open sky
+		bool FixZenithClamp = true;          // bff82b03e: Max Zenith kept in 0..90 deg and finite
+		bool FixZenithRadius = true;         // 4b5b99783: sampling disc radius sin(zenith), not sqrt(sin(zenith))
+		bool FixFadeOutGridOffset = true;    // 4b5b99783: edge fade measured from the probe grid's centre
+		bool SkipOccludersBelowGrid = true;  // 816888f04: height map skips objects entirely below the probe grid
 	} settings;
+
+	bool RoofMarkersActive() const;
+	bool ResetClearsProbesActive() const;
+	bool FadeOutGridOffsetActive() const;
+	bool SkipOccludersBelowGridActive() const;
+	/// @brief (batch 38) Max Zenith as used for sampling: clamped to [0, 90 deg] and finite when
+	/// FixZenithClamp is active, the raw setting otherwise.
+	float EffectiveMaxZenith() const;
+	/// @brief (batch 38) Radius of the sky-direction sampling disc for a uniform u in [0,1).
+	float SampleDiscRadius(float a_u) const;
+	void DrawBatch38Settings();
 
 	struct SkylightingCB
 	{
@@ -55,7 +75,7 @@ public:
 		float4 OcclusionDir;
 
 		float3 PosOffset;  // cell origin in camera model space
-		uint _pad0;
+		float FadeOutUsesGridOffset;  // (batch 38, 4b5b99783) 1 = getFadeOutFactor subtracts PosOffset; 0 = 37c (HLSL PosOffset.w)
 		uint ArrayOrigin[3];  // xyz: array origin, w: max accum frames
 		uint _pad1;
 		int ValidMargin[4];
@@ -80,10 +100,18 @@ public:
 	// misc parameters
 	uint probeArrayDims[3] = { 256, 256, 128 };
 	float occlusionDistance = 4096.f * 2.5f;  // 5 ugrids
+	// (batch 38, 816888f04) Slack below the probe grid for eye movement between the grid update and
+	// the occlusion render.
+	static constexpr float OCCLUSION_BELOW_GRID_MARGIN = 512.f;
 
 	// cached variables
 	bool queuedResetSkylighting = true;
 	bool inOcclusion = false;
+	// (batch 38, 816888f04) World height of the probe grid's bottom layer, from the snapped grid origin.
+	float probeGridBottomZ = -FLT_MAX;
+	// (batch 38) Height-map occluders skipped below the grid during the last occlusion render.
+	uint occludersSkippedBelowGrid = 0;
+	uint occludersSkippedBelowGridLast = 0;
 	REX::W32::XMFLOAT4X4 OcclusionTransform;
 	float4 OcclusionDir;
 	uint frameCount = 0;

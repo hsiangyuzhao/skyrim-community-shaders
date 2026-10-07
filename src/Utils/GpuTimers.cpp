@@ -76,6 +76,12 @@ namespace Util
 			{ "Neural Rendering (DLSS 5)",
 				"GPU time the DLSS 5 Neural Rendering pass adds to the frame: preparing its inputs, copying to and from its own "
 				"D3D12 device, and waiting there while the network runs. The network alone is shown under Upscaling > Neural Rendering." },
+			{ "SSS Pre-pass (38)",
+				"GPU time of the batch 38 skin SSS upgrade's pre-pass (takes the skin colour out of the light before the blur). "
+				"Not counted in the Subsurface Scattering row. Only runs on frames that draw faces. The upgrade also drops the "
+				"37c copy and composite passes, so compare the sum of both rows with the 37c Subsurface Scattering row." },
+			{ "Local Exposure (38)",
+				"GPU time for Post Processing > Local Exposure (batch 38), all of its passes. Not counted in the Post Processing row." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
