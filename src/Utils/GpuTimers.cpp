@@ -96,6 +96,10 @@ namespace Util
 				"GPU time for keeping the footprint map around the player up to date (Dynamic Snow, Batch 39): clearing the "
 				"strip that scrolls into view, filling old prints back in, and stamping this frame's footprints. Reading the "
 				"map, and drawing accumulated snow, happen inside the normal object and ground drawing and are not in this row." },
+			{ "Terrain Shadows",
+				"GPU time for updating the mountain-shadow map (Terrain Shadows): one strip of the map per frame, the whole map "
+				"in one frame after a time jump or a new worldspace (Batch 40). Reading the shadows happens inside the normal "
+				"drawing and is not in this row." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

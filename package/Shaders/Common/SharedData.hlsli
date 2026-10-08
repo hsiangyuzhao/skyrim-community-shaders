@@ -106,6 +106,11 @@ namespace SharedData
 		float3 Scale;
 		float2 ZRange;
 		float2 Offset;
+		// (batch 40) Terrain Shadows > Stable Soft Edges (upstream #2729).
+		float ZBlur;           // world-space widening of the shadow transition (0 when off)
+		float SelfShadowBias;  // shadow heights are lowered by this much: 256 on, 1024 off
+		bool StablePenumbrae;
+		float pad0;
 	};
 
 	struct LightLimitFixSettings
