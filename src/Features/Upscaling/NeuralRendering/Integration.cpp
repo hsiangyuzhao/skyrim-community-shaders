@@ -8,7 +8,6 @@
 #include "Features/Upscaling.h"
 #include "Globals.h"
 #include "State.h"
-#include "Utils/Batch38.h"
 #include "Utils/GpuTimers.h"
 
 #include <d3d11.h>
@@ -68,134 +67,6 @@ namespace NeuralRendering
 			texture->GetDesc(&out);
 			texture->Release();
 			return true;
-		}
-
-		/// The 37c pass, unchanged. Batch 38 off runs exactly this.
-		bool ApplyLdrLegacy()
-		{
-			auto& upscaling = globals::features::upscaling;
-			if (!upscaling.loaded || !upscaling.settings.neuralRendering.enabled)
-				return false;
-
-			// The upscaler must be DLSS. Neural Rendering is an NGX feature and shares that
-			// machinery; the reference integration gates on the same thing. It is also the only
-			// configuration where the motion vector copy this pass reads is guaranteed to exist.
-			if (upscaling.GetUpscaleMethod() != Upscaling::UpscaleMethod::kDLSS) {
-				if (!g_loggedUpscalerBlock) {
-					logger::warn("[DLSSNR] Blocked: the upscaler must be DLSS (currently {})",
-						magic_enum::enum_name(upscaling.GetUpscaleMethod()));
-					g_loggedUpscalerBlock = true;
-				}
-				return false;
-			}
-
-			// Frame generation, either backend, and asked of the frame rather than of the session:
-			// DLSS-G intercepts Present asynchronously, and this pass writes into the scene through
-			// its own D3D12 device, so the two cannot both be operating on the same image. What
-			// matters is whether generation is running right now, not whether it was configured at
-			// boot -- the proxy swapchain can sit idle without conflicting, which is what lets the
-			// two features share a session.
-			if (upscaling.d3d12SwapChainActive && upscaling.IsFrameGenerationRequestedNow()) {
-				if (!g_loggedFrameGenerationBlock) {
-					logger::warn("[DLSSNR] Blocked: Frame Generation is running. Switching it off takes effect immediately -- no restart.");
-					g_loggedFrameGenerationBlock = true;
-				}
-				return false;
-			}
-
-			// Every path out of here used to be a bare return, which is how a blocked frame ends up
-			// indistinguishable from a working one that simply did nothing -- the exact failure this
-			// feature's diagnostics exist to avoid. Each now names itself once.
-			auto* renderer = globals::game::renderer;
-			auto* context = globals::d3d::context;
-			auto* device = globals::d3d::device;
-			if (!renderer || !context || !device || !upscaling.motionVectorCopyTexture)
-				return LogBlockOnce("prerequisites missing: renderer={} context={} device={} motionVectorCopy={}",
-					renderer != nullptr, context != nullptr, device != nullptr,
-					upscaling.motionVectorCopyTexture != nullptr);
-
-			auto& depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
-			auto* motionVectors = upscaling.motionVectorCopyTexture->resource.get();
-			if (!depth.texture || !depth.depthSRV || !motionVectors)
-				return LogBlockOnce("guides missing: depth={} depthSRV={} motionVectors={}",
-					depth.texture != nullptr, depth.depthSRV != nullptr, motionVectors != nullptr);
-
-			// The scene is taken from whatever render target is bound right now, not from a named
-			// slot. The first attempt read RENDER_TARGETS::kFRAMEBUFFER on the strength of the
-			// reference integration's comment, and it is empty here -- nothing else in this tree
-			// touches that slot. ApplyNISSharpening, a few lines below the call site, has always
-			// done it this way, and it is the only method that does not depend on guessing which
-			// slot the engine happens to be using at this point in its own chain.
-			//
-			// The depth-stencil view comes along only so the binding can be put back exactly as it
-			// was found. ApplyNISSharpening runs immediately after this and reads the bound target
-			// without checking it for null, so leaving the pipeline unbound here is an access
-			// violation in that function -- which is exactly what the first attempt did.
-			ID3D11RenderTargetView* renderTargetView = nullptr;
-			ID3D11DepthStencilView* depthStencilView = nullptr;
-			context->OMGetRenderTargets(1, &renderTargetView, &depthStencilView);
-			if (!renderTargetView) {
-				if (depthStencilView)
-					depthStencilView->Release();
-				return LogBlockOnce("no render target is bound at the call site");
-			}
-
-			ID3D11Resource* color = nullptr;
-			renderTargetView->GetResource(&color);
-
-			D3D11_TEXTURE2D_DESC colorDesc{}, motionDesc{};
-			const bool descsRead = GetTextureDesc(color, colorDesc) && GetTextureDesc(motionVectors, motionDesc);
-
-			// (batch 38a) This comment had the cause backwards. The scene here is the finished
-			// output-resolution image (the log says scene=3840x2160 at any DLSS preset), and the
-			// "motion vector copy" is a texture nothing ever writes: the network was being fed
-			// zeros, declared at the full output extent, while the engine's real vectors sit in the
-			// render-resolution corner of another target. Batch 38 feeds the real vectors, resampled
-			// onto the output grid (PrepareGuidesCS.hlsl). Kept as it was for the 37c path.
-			static bool loggedExtents = false;
-			if (descsRead && !loggedExtents) {
-				logger::info("[DLSSNR] extents: scene={}x{} guides={}x{} scale={:.3f}",
-					colorDesc.Width, colorDesc.Height, motionDesc.Width, motionDesc.Height,
-					motionDesc.Width ? static_cast<float>(colorDesc.Width) / motionDesc.Width : 0.f);
-				loggedExtents = true;
-			}
-
-			bool applied = false;
-			if (descsRead) {
-				// Unbind first: Renderer copies into and back out of this resource, which D3D11 will
-				// not do while it is bound as a render target. Same reason ApplyNISSharpening unbinds.
-				context->OMSetRenderTargets(0, nullptr, nullptr);
-
-				// The guides run at the motion vector extent and the colour at the scene extent --
-				// the two differ whenever DLSS is upscaling, which is the normal case. Motion vector
-				// scale is the guide extent because the engine stores its vectors in normalised
-				// screen units and the model wants pixels.
-				Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::NeuralRendering);
-				applied = Renderer::Instance().Apply(device, context, 0,
-					color, depth.texture, depth.depthSRV, motionVectors,
-					motionDesc.Width, motionDesc.Height,
-					colorDesc.Width, colorDesc.Height,
-					static_cast<float>(motionDesc.Width), static_cast<float>(motionDesc.Height),
-					MakeTuning(upscaling.settings.neuralRendering));
-				Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::NeuralRendering);
-
-				// Put the binding back rather than leaving it to the engine's dirty flag. The
-				// sharpening pass gets away with not restoring because nothing else reads the
-				// binding before the engine's next draw; this pass is not last, so it has to leave
-				// the pipeline as it found it.
-				context->OMSetRenderTargets(1, &renderTargetView, depthStencilView);
-			}
-
-			if (color)
-				color->Release();
-			if (depthStencilView)
-				depthStencilView->Release();
-			renderTargetView->Release();
-
-			if (!descsRead)
-				return LogBlockOnce("could not read a texture description for the scene or the motion vectors");
-
-			return applied;
 		}
 
 		// ---- (batch 38a) ----------------------------------------------------------------------
@@ -285,7 +156,6 @@ namespace NeuralRendering
 		bool g_haveLogKey = false;
 		ResourceKey g_lastResourceKey{};
 		bool g_haveResourceKey = false;
-		bool g_wasBatch38 = true;
 		bool g_ranLastFrame = false;
 		std::uint32_t g_lastRunFrame = 0;
 		float g_previousJitter[2]{};
@@ -503,32 +373,9 @@ namespace NeuralRendering
 		const auto& nr = upscaling.settings.neuralRendering;
 		const std::uint32_t frame = globals::state ? globals::state->frameCount : 0;
 
-		g_status.batch38 = Batch38::IsOn();
 		g_status.enabled = upscaling.loaded && nr.enabled;
 		g_decision = {};
 		g_decision.frame = frame;
-
-		if (!Batch38::IsOn()) {
-			// 37c has no hook here. The one thing done is to give back the Batch 38 working set the
-			// moment the switch goes off, so the old path does not run with a second set of textures
-			// sitting unused beside its own.
-			if (g_wasBatch38) {
-				if (Renderer::Instance().IsInitialized()) {
-					const auto before = QueryVramMB();
-					Renderer::Instance().ReleaseWorkingSet();
-					logger::info("[DLSSNR] state: Batch 38 off -- 37c pass (after upscaling, blocked under frame generation); video memory {}",
-						SignedMB(before, QueryVramMB()));
-				} else {
-					logger::info("[DLSSNR] state: Batch 38 off -- 37c pass (after upscaling, blocked under frame generation)");
-				}
-				g_wasBatch38 = false;
-				g_haveLogKey = false;
-				g_haveResourceKey = false;
-			}
-			g_status.blockedReason = "";
-			return;
-		}
-		g_wasBatch38 = true;
 
 		const bool frameGeneration = upscaling.d3d12SwapChainActive && upscaling.IsFrameGenerationRequestedNow();
 		const char* blockedReason = "";
@@ -703,9 +550,6 @@ namespace NeuralRendering
 
 	bool ApplyLdr()
 	{
-		if (!Batch38::IsOn())
-			return ApplyLdrLegacy();
-
 		const std::uint32_t frame = globals::state ? globals::state->frameCount : 0;
 		if (!g_decision.run || g_decision.before || g_decision.frame != frame)
 			return false;
@@ -784,16 +628,15 @@ namespace NeuralRendering
 		const auto& renderer = Renderer::Instance();
 		const auto& s = g_status;
 		json o;
-		o["batch38"] = s.batch38;
 		o["enabled"] = s.enabled;
 		o["running"] = s.running;
 		o["blocked_reason"] = std::string(s.blockedReason);
-		o["placement"] = s.batch38 ? (s.beforeUpscaling ? "before-upscaling" : "after-upscaling") : "after-upscaling (37c)";
+		o["placement"] = s.beforeUpscaling ? "before-upscaling" : "after-upscaling";
 		o["frame_generation"] = s.frameGeneration;
 		o["extent"] = { s.width, s.height };
 		o["render"] = { s.renderWidth, s.renderHeight };
 		o["output"] = { s.outputWidth, s.outputHeight };
-		o["model_percent"] = s.batch38 ? s.modelPercent : 100u;
+		o["model_percent"] = s.modelPercent;
 		o["model_extent"] = { s.workWidth, s.workHeight };
 		o["network_extent"] = { s.paddedWidth, s.paddedHeight };
 		o["input"] = s.beforeUpscaling ? (s.toneMatched ? "tone-matched" : "38a wrap") : "finished image";

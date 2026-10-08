@@ -13,7 +13,7 @@ namespace NeuralRendering
 	 * logs one state line whenever any of that changes. With "Run before upscaling" on it also runs
 	 * the pass here, on the HDR scene at render resolution, so DLSS upscales the network's output.
 	 *
-	 * Does nothing while Advanced > Batch 38 is off (37c had no such hook).
+	 * Runs every frame.
 	 */
 	void BeforeUpscaling();
 
@@ -22,7 +22,7 @@ namespace NeuralRendering
 	 *
 	 * Called from Upscaling's post-processing hook after the engine's post chain, the one moment in
 	 * the frame where the bound target holds the finished LDR image and nothing has drawn over it.
-	 * With Batch 38 on it runs only when BeforeUpscaling armed the after-upscaling pass this frame.
+	 * It runs only when BeforeUpscaling armed the after-upscaling pass this frame.
 	 *
 	 * @return true when the neural pass ran this frame. Every reason it might not -- the feature
 	 *         being off, a precondition unmet, the runtime absent -- returns false without
@@ -36,7 +36,6 @@ namespace NeuralRendering
 	/// @brief (batch 38a) What the pass did, for the menu, the Batch 38 table and the F12 JSON.
 	struct FrameStatus
 	{
-		bool batch38 = true;             ///< Batch 38 master switch, as read this frame
 		bool enabled = false;            ///< the feature's own switch
 		bool running = false;            ///< the pass ran on the most recent frame it was asked to
 		bool beforeUpscaling = false;    ///< placement in effect

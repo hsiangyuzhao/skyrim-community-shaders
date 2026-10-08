@@ -8,7 +8,6 @@
 #include "State.h"
 #include "TerrainShadows.h"
 #include "ExponentialHeightFog.h"
-#include "Utils/Batch37b.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	VolumetricLighting::TextureSize,
@@ -55,9 +54,7 @@ void VolumetricLighting::DrawSettings()
 
 void VolumetricLighting::DrawBatch37bSettings()
 {
-	ImGui::SeparatorText("Batch 37b");
-	if (!Batch37b::IsOn())
-		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
+	ImGui::SeparatorText("Shafts");
 
 	ImGui::SliderFloat("Cloud & Terrain Occlusion", &settings.WorldShadowPower, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -104,22 +101,22 @@ void VolumetricLighting::DrawBatch37bSettings()
 
 float VolumetricLighting::WorldShadowPowerActive() const
 {
-	return Batch37b::IsOn() ? std::clamp(settings.WorldShadowPower, 0.0f, 1.0f) : 0.0f;
+	return std::clamp(settings.WorldShadowPower, 0.0f, 1.0f);
 }
 
 bool VolumetricLighting::DensityOnlyGammaActive() const
 {
-	return Batch37b::IsOn() && settings.DensityOnlyGamma;
+	return settings.DensityOnlyGamma;
 }
 
 float VolumetricLighting::NightIntensityActive() const
 {
-	return Batch37b::IsOn() ? std::clamp(settings.NightIntensity, 0.0f, 1.0f) : 1.0f;
+	return std::clamp(settings.NightIntensity, 0.0f, 1.0f);
 }
 
 bool VolumetricLighting::LinearizeColorActive() const
 {
-	return Batch37b::IsOn() && settings.LinearizeColor;
+	return settings.LinearizeColor;
 }
 
 VolumetricLighting::CommonBufferData VolumetricLighting::GetCommonBufferData() const

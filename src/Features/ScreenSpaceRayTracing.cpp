@@ -49,8 +49,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurHitDistC,
     SpecularPrepassBlurRadius,
     UsePrepassOnlyForSpecularMotionEstimation,
-    ReblurSkipSpecularPrepass,
-    ReblurFoldUnpack,
     DistanceLimit,
     DistanceLimitMeters,
     EnablePreBlur,
@@ -110,8 +108,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurHitDistC,
     SpecularPrepassBlurRadius,
     UsePrepassOnlyForSpecularMotionEstimation,
-    ReblurSkipSpecularPrepass,
-    ReblurFoldUnpack,
     DistanceLimit,
     DistanceLimitMeters,
     EnablePreBlur,
@@ -362,21 +358,6 @@ void ScreenSpaceRayTracing::DrawSettings()
 
         bool reblurChanged = false;
 
-        // (batch 36f) Cost switches. Both are runtime switches; the master switch under
-        // Advanced > Batch 36f overrides them.
-        ImGui::Checkbox("Skip Reflection Pre-pass", &settings.ReblurSkipSpecularPrepass);
-        if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Drops REBLUR's reflection pre-pass (~0.3 ms at 1440p). It was only used to track how reflections move, and our reflections are already clean. "
-                "Risk: a little more smearing in reflections during fast camera turns. Off = the 36e behaviour.");
-        ImGui::Checkbox("Fold Unpack Into Composite", &settings.ReblurFoldUnpack);
-        if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Converts REBLUR's output inside the final composite instead of in two extra full-screen passes (~0.15 ms). "
-                "The picture is identical either way; Off = the 36e separate passes.");
-        if (!Batch36f::IsOn())
-            ImGui::TextDisabled("Batch 36f master switch is off (Advanced > Batch 36f): both run as in 36e.");
-
         // (S1.1) The confidence input, off by default and labelled for what it is.
         if (ImGui::Checkbox("Feed Hit Coverage as History Confidence (experimental)", &settings.ReblurFeedHitCoverageConfidence))
             reblurChanged = true;
@@ -426,9 +407,6 @@ void ScreenSpaceRayTracing::DrawSettings()
         if (!settings.EnableAmbientReinjection)
             ImGui::TextDisabled("Ambient Reinjection is off: only reflections are limited.");
     }
-    if (!Batch36f::IsOn())
-        ImGui::TextDisabled("Batch 36f master switch is off (Advanced > Batch 36f): no distance limit.");
-
     if (SVGFSelected()) {
         ImGui::Checkbox("Pre-Blur", &settings.EnablePreBlur);
         if (auto _tt = Util::HoverTooltipWrapper())
@@ -2883,8 +2861,8 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
         reblurNative.hitDistanceParameters.C = settings.ReblurHitDistC;
         if (a_specular) {
             // (batch 36f, item 1) Radius 0 makes NRD drop the PrePass dispatch (Reblur.cpp
-            // skipPrePass: diffuse radius is always 0 here and checkerboard is OFF). Off, or with
-            // the Batch 36f master switch off: the batch 34 / 36e values.
+            // skipPrePass: diffuse radius is always 0 here and checkerboard is OFF). Always on.
+            // (The else branch is the old batch 34 / 36e setting, kept for reference.)
             if (SkipSpecularPrepassActive()) {
                 reblurNative.specularPrepassBlurRadius = 0.0f;
                 reblurNative.usePrepassOnlyForSpecularMotionEstimation = false;

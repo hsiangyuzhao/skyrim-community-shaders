@@ -536,7 +536,6 @@ struct PerformanceOverlay : OverlayFeature
 		bool SectionGrass = false;
 		bool SectionVram = true;
 		bool SectionView = false;
-		bool SectionOcclusion = false;  // (batch 37a) "Occlusion (dry run)"
 		bool SectionShadows = false;    // (batch 37a) "Shadow maps"
 	};
 	Settings settings;

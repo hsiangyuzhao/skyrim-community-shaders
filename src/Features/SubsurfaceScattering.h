@@ -31,8 +31,8 @@ public:
 		uint EnableCharacterLighting = false;
 		float CharacterLightingStrength = 1.0f;
 		int SSMode = 1;
-		/// (batch 38, item 3) Upgraded SSS: diffuse-extraction pre-pass, scatter modes, LL albedo
-		/// fix. ANDed with Batch38::IsOn(); off = the 37c shaders and passes.
+		/// Upgraded SSS (diffuse-extraction pre-pass, scatter modes, LL albedo fix): always on,
+		/// no longer saved (kept in the struct for layout only).
 		bool Batch38Upgrade = true;
 		/// (batch 38, item 3) Separable SSS only; Burley always takes the albedo out fully.
 		int ScatterMode = kPreAndPostScatter;
@@ -91,9 +91,9 @@ public:
 	ID3D11ComputeShader* verticalSSBlurV2 = nullptr;
 	ID3D11ComputeShader* burleySSV2 = nullptr;
 
-	/// @brief (batch 38) The SSS upgrade runs this frame (own switch AND the Batch 38 master).
+	/// @brief (batch 38) The SSS upgrade runs this frame (always on).
 	bool UpgradeActive() const;
-	/// @brief (batch 38) Whether the last DrawSSS used the v2 path (for the Batch 38 table).
+	/// @brief (batch 38) Whether the last DrawSSS used the v2 path (diagnostics).
 	bool lastDrawUsedUpgrade = false;
 	/// @brief (batch 38) Whether DrawSSS ran at all in the last ~second (faces on screen).
 	std::chrono::steady_clock::time_point lastDrawTime{};

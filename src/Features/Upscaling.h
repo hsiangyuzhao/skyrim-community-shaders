@@ -123,8 +123,8 @@ public:
 		uint style = 3;
 		bool useAutoMask = true;
 		bool uiCorrection = false;
-		// (batch 38a) The four below only act while Advanced > Batch 38 is on; off restores 37c.
-		// Run alongside frame generation (DLSS-G or FSR 3). 37c blocked the pass outright.
+		// The bools marked "fixed" below are no longer saved or shown: always on.
+		// Run alongside frame generation (DLSS-G or FSR 3). Fixed.
 		bool allowWithFrameGeneration = true;
 		// Run on the HDR scene at render resolution, before DLSS upscales it, instead of on the
 		// finished output-resolution image. Default off = 37c's place in the frame.
@@ -136,14 +136,13 @@ public:
 		uint modelResolutionPercent = 100;
 		// Before upscaling only: add the camera-jitter step to the motion vectors the network
 		// reads, so its history lines up with the jittered image it is given.
-		bool jitterAwareMotion = true;
-		// (batch 38c) The rest act only while Advanced > Batch 38 is on.
+		bool jitterAwareMotion = true;  // fixed
 		// Pad the network's extent to a multiple of 8 (edge repeated), then crop. Balanced's
 		// 2227x1253 was the one extent the network got that is not, and the one that looked different.
-		bool padToNetworkGrid = true;
+		bool padToNetworkGrid = true;  // fixed
 		// Before upscaling only: show the network the frame as the post-processing chain will
 		// grade it (its auto exposure and colour grading / tone curve) instead of 38a's flat wrap.
-		bool toneMatchedInput = true;
+		bool toneMatchedInput = true;  // fixed
 		// Before upscaling only: format the network reads. 0 = 8-bit (38a), 1 = 10-bit, 2 = 16-bit float.
 		uint inputPrecision = 0;
 		// Lock the picture's low-frequency brightness and colour to the input, 0..1, per placement.
@@ -151,7 +150,7 @@ public:
 		float tonePreservationAfter = 0.0f;
 		// Give the model its tuning (intensity, strengths, style...) when the feature is created:
 		// it reads them only then. 38a set them per frame only, where they were ignored.
-		bool tuningAtCreate = true;
+		bool tuningAtCreate = true;  // fixed
 	};
 
 	struct Settings

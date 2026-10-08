@@ -76,24 +76,20 @@ namespace Util
 			{ "Neural Rendering (DLSS 5)",
 				"GPU time the DLSS 5 Neural Rendering pass adds to the frame: preparing its inputs, copying to and from its own "
 				"D3D12 device, and waiting there while the network runs. The network alone is shown under Upscaling > Neural Rendering." },
-			{ "SSS Pre-pass (38)",
-				"GPU time of the batch 38 skin SSS upgrade's pre-pass (takes the skin colour out of the light before the blur). "
-				"Not counted in the Subsurface Scattering row. Only runs on frames that draw faces. The upgrade also drops the "
-				"37c copy and composite passes, so compare the sum of both rows with the 37c Subsurface Scattering row." },
-			{ "Local Exposure (38)",
-				"GPU time for Post Processing > Local Exposure (batch 38), all of its passes. Not counted in the Post Processing row." },
+			{ "SSS Pre-pass",
+				"GPU time of the skin SSS pre-pass (takes the skin colour out of the light before the blur). "
+				"Not counted in the Subsurface Scattering row. Only runs on frames that draw faces." },
+			{ "Local Exposure",
+				"GPU time for Post Processing > Local Exposure, all of its passes. Not counted in the Post Processing row." },
 			{ "Volumetric Fog (near)",
-				"GPU time for the detailed near grid of Volumetric Fog (Batch 38): finding where the scene is, the fog medium, "
+				"GPU time for the detailed near grid of Volumetric Fog: finding where the scene is, the fog medium, "
 				"lighting every fog cell by the sun, sky and nearby lights, and adding it up along each view ray." },
 			{ "Volumetric Fog (far)",
-				"GPU time for the coarse far grid of Volumetric Fog (Batch 38), the same four passes. No local lights out here." },
+				"GPU time for the coarse far grid of Volumetric Fog, the same four passes. No local lights out here." },
 			{ "Volumetric Shadows",
-				"GPU time for the small blurred sun shadow map that lets smoke and other effects darken in shadow (Batch 38)." },
-			{ "Depth refresh (39)",
-				"Batch 39: only while grass or LOD terrain skips the depth prepass. Copies the finished depth (and folds it into "
-				"Terrain Blending's copy) so SSAO, SSRT, fog and water see what the prepass no longer drew." },
-			{ "Snow Footprints (39)",
-				"GPU time for keeping the footprint map around the player up to date (Dynamic Snow, Batch 39): clearing the "
+				"GPU time for the small blurred sun shadow map that lets smoke and other effects darken in shadow." },
+			{ "Snow Footprints",
+				"GPU time for keeping the footprint map around the player up to date (Dynamic Snow): clearing the "
 				"strip that scrolls into view, filling old prints back in, and stamping this frame's footprints. Reading the "
 				"map, and drawing accumulated snow, happen inside the normal object and ground drawing and are not in this row." },
 			{ "Terrain Shadows",
@@ -693,7 +689,7 @@ namespace Util
 			{ "TruePBR", "TruePBR",
 				"CPU time spent on TruePBR's per-frame setup." },
 			{ "DynamicSnow", "Dynamic Snow",
-				"CPU time for Dynamic Snow (Batch 39): following the weather for snow build-up, finding the feet of nearby "
+				"CPU time for Dynamic Snow: following the weather for snow build-up, finding the feet of nearby "
 				"actors and sending the footprint map update to the GPU." },
 			{ "GrassOptimizations", "Grass Optimizations",
 				"CPU time for Grass Optimizations' per-frame work: sorting newly loaded grass and choosing what to draw. "

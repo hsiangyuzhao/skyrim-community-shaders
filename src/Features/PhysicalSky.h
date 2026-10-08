@@ -76,7 +76,7 @@ struct PhysicalSky final : public Feature
 		float zBottom = -14500.f;
 	};
 
-	/// The 9 hard-coded worldspaces of 37a and earlier. Used as-is while the 37b master is off.
+	/// The 9 hard-coded worldspaces of 37a and earlier (seed for the editable whitelist).
 	static const std::map<std::string, WorldspaceInfo>& LegacyWorldspaceWhitelist();
 	/// (batch 37b) Legacy list + the Dawnguard exteriors that are earthly skies:
 	/// DLC1HunterHQWorld (Fort Dawnguard), DLC1VampireCastleCourtyard (Castle Volkihar
@@ -122,9 +122,7 @@ struct PhysicalSky final : public Feature
 		float3 secundaColor = float3{ 0.8f, 1.0f, 1.0f } * 5e-3f;
 
 		bool proceduralSun = true;
-		float sunDiskRad = DirectX::XMConvertToRadians(0.53f);  // 37a size (really a diameter)
-
-		// (batch 37b) Procedural sun v2. Each is ANDed with Batch37b::IsOn().
+		// Procedural sun v2.
 		/// Disk centred where the vanilla sun is drawn (Sky Sync's apparent direction, dipped
 		/// with altitude, in the sky root's frame) instead of the raw sun direction. Also moves
 		/// the sky's sun glow and the scattering LUTs onto that direction.
@@ -154,12 +152,12 @@ struct PhysicalSky final : public Feature
 		/// the vanilla phase cycle, so both go black on the same nights).
 		bool hideNewMoonDisc = true;
 
-		// (batch 37b) Upstream correctness fixes, each ANDed with Batch37b::IsOn().
-		bool fixSkyAlpha = true;  // 5846ad833: sky dome written opaque
-		bool fixApShadowDepth = true;  // 224312a11 (depth read only): AP shadow under dynamic resolution
-		bool fixReflectionSky = true;  // 23156dc5f: reflected sky takes cloud-cube shadow, not TexApShadow
-		bool fixMultiScatter = false;  // c14664115 (LutGen part): full-sphere, isotropic MS LUT. Changes sky colour
-		bool fixTrLutEdge = true;  // 9fbd052ad: transmittance LUT read on texel centres, clamp sampler
+		// Upstream fixes 5846ad833 (opaque sky), 224312a11 (AP shadow depth), 23156dc5f (reflected
+		// sky) and 9fbd052ad (transmittance LUT edge) are always on (UpdateExtData).
+		/// c14664115 (LutGen part): full-sphere, isotropic MS LUT. Changes sky colour; an option.
+		bool fixMultiScatter = false;
+		/// Upstream 25013493d (Effect part): aerial perspective per effect blend mode. JSON "fixEffectBlend".
+		bool fixEffectBlend = true;
 
 		float adaptationStart = DirectX::XMConvertToRadians(-2);
 		float adaptationEnd = DirectX::XMConvertToRadians(-15);
@@ -251,7 +249,6 @@ struct PhysicalSky final : public Feature
 	static_assert(sizeof(CbData) % 16 == 0);
 
 	/// (batch 37b) Mirrors SharedData::PhysSkyExtData (HLSL), appended at the end of FeatureData.
-	/// Flags are the 37b switches ANDed with the master; all zero = the 37a shader paths.
 	enum ExtFlags : uint32_t
 	{
 		kExtSunReplace = 1u << 0,
@@ -263,6 +260,7 @@ struct PhysicalSky final : public Feature
 		kExtApShadowDepthFix = 1u << 6,
 		kExtReflectionSkyFix = 1u << 7,
 		kExtMultiScatterFix = 1u << 8,
+		kExtEffectBlendFix = 1u << 9,  // upstream 25013493d (Effect part)
 	};
 	struct ExtCbData
 	{

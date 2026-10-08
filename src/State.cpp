@@ -17,10 +17,6 @@
 #include "SettingsOverrideManager.h"
 #include "ShaderCache.h"
 #include "TruePBR.h"
-#include "Utils/Batch36f.h"
-#include "Utils/Batch37b.h"
-#include "Utils/Batch38.h"
-#include "Utils/Batch39.h"
 #include "Utils/Batch39Engine.h"
 #include "Utils/FileSystem.h"
 #include "Utils/GpuPhaseTimeline.h"
@@ -46,7 +42,6 @@ void State::Draw()
 
 	// (batch 39, item 2) Depth writes for geometry that skipped the depth prepass. A couple of
 	// branches unless a prepass slimming switch is on.
-	Batch39Engine::OnDraw(currentShader, currentVertexDescriptor, currentPixelDescriptor);
 
 	if (shaderCache->IsEnabled()) {
 		if (terrainBlending.loaded)
@@ -353,16 +348,29 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				shaderCache->SetFileWatcher(advanced["Use FileWatcher"]);
 			if (advanced["Frame Annotations"].is_boolean())
 				frameAnnotations = advanced["Frame Annotations"];
-			if (advanced.contains("Batch 36f"))
-				Batch36f::Load(advanced["Batch 36f"]);
-			if (advanced.contains("Batch 37b"))
-				Batch37b::Load(advanced["Batch 37b"]);
-			if (advanced.contains("Batch 38"))
-				Batch38::Load(advanced["Batch 38"]);
-			if (advanced.contains("Batch 39"))
-				Batch39::Load(advanced["Batch 39"]);
-			if (advanced.contains("Batch 39 Engine"))
-				Batch39Engine::Load(advanced["Batch 39 Engine"]);
+			// (40b) The old batch tabs ("Batch 36f", "Batch 37b", "Batch 38", "Batch 39",
+			// "Batch 39 Engine") are gone; their keys are ignored and vanish on the next save,
+			// because Advanced is rewritten whole. Four options moved into their features: copy
+			// each old value into the feature's JSON once, unless the feature already has the
+			// new key. Features are loaded after this block, from the same merged settings.
+			const auto migrate = [&settings, &advanced](const char* a_group, const char* a_oldKey, const char* a_feature, const char* a_newKey) {
+				if (!advanced.contains(a_group) || !advanced[a_group].is_object())
+					return;
+				const json& group = advanced[a_group];
+				if (!group.contains(a_oldKey) || group[a_oldKey].is_null())
+					return;
+				json& feature = settings[a_feature];
+				if (feature.is_null())
+					feature = json::object();
+				if (!feature.is_object() || feature.contains(a_newKey))
+					return;
+				feature[a_newKey] = group[a_oldKey];
+				logger::info("Moved Advanced.\"{}\".{} to \"{}\".{}", a_group, a_oldKey, a_feature, a_newKey);
+			};
+			migrate("Batch 37b", "SsgiAoSparesDirect", "Screen Space GI", "AoSparesDirect");
+			migrate("Batch 39 Engine", "ReflSkipLODObjects", "Water Effects", "ReflectionSkipLODObjects");
+			migrate("Batch 39 Engine", "ReflHandOffToDynamicCubemaps", "Water Effects", "ReflectionHandOffToDynamicCubemaps");
+			migrate("Batch 39 Engine", "ReflHandOffCaptureWeight", "Water Effects", "ReflectionHandOffCaptureWeight");
 		}
 
 		if (settings["General"].is_object()) {
@@ -505,11 +513,6 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Background Compiler Threads"] = shaderCache->backgroundCompilationThreadCount;
 	advanced["Use FileWatcher"] = shaderCache->UseFileWatcher();
 	advanced["Frame Annotations"] = frameAnnotations;
-	advanced["Batch 36f"] = Batch36f::Save();
-	advanced["Batch 37b"] = Batch37b::Save();
-	advanced["Batch 38"] = Batch38::Save();
-	advanced["Batch 39"] = Batch39::Save();
-	advanced["Batch 39 Engine"] = Batch39Engine::Save();
 	settings["Advanced"] = advanced;
 
 	json general;
@@ -881,7 +884,7 @@ void State::UpdateSharedData([[maybe_unused]] bool a_inWorld, [[maybe_unused]] b
 
 	const auto& depth = globals::game::renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 	auto& terrainBlending = globals::features::terrainBlending;
-	auto srv = (terrainBlending.loaded ? terrainBlending.blendedDepthTexture16->srv.get() : depth.depthSRV);
+	auto srv = (terrainBlending.IsBlendingActive() ? terrainBlending.blendedDepthTexture16->srv.get() : depth.depthSRV);
 
 	globals::d3d::context->PSSetShaderResources(17, 1, &srv);
 }

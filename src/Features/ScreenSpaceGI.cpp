@@ -5,7 +5,6 @@
 #include "Deferred.h"
 #include "State.h"
 #include "Util.h"
-#include "Utils/Batch37b.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -35,7 +34,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DistanceNormalisation,
 	EnableContactAo,
 	ContactRadius,
-	ContactStrength)
+	ContactStrength,
+	AoSparesDirect)
 
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -81,7 +81,12 @@ void ScreenSpaceGI::DrawSettings()
 		ImGui::EndTable();
 	}
 
-	Batch37b::DrawSsgiCheckboxes();
+	ImGui::Checkbox("AO does not darken direct light", &settings.AoSparesDirect);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Off by default (the usual look). Off: AO dims the ambient light fully and everything else (sunlight, lamps) by its "
+			"square root. On: AO dims only the ambient light; sunlit corners stay as bright as the sun makes them. With SSRT "
+			"diffuse on, its traced bounce light is no longer dimmed either (it has its own occlusion).");
 
 	///////////////////////////////
 	ImGui::SeparatorText("Quality/Performance");
@@ -864,7 +869,7 @@ void ScreenSpaceGI::DrawSSGI()
 	uint inputGITexIdx = lastFrameGITexIdx;
 
 	// (batch 37b, C-2) IL off: the radiance copy + prefilter and the IL blur serve nothing.
-	const bool skipIlPasses = !compiledWithGI && Batch37b::SsgiSkipIlPassesActive();
+	const bool skipIlPasses = !compiledWithGI;
 	ilPassesSkipped = skipIlPasses;
 
 	//////////////////////////////////////////////////////

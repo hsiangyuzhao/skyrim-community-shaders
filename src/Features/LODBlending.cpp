@@ -49,7 +49,7 @@ void LODBlending::DrawSettings()
 	}
 
 	// (batch 40) Upstream LOD fixes, each switchable for A/B; off = the batch 39 behaviour.
-	ImGui::SeparatorText("Fixes (Batch 40)");
+	ImGui::SeparatorText("Fixes");
 	ImGui::Checkbox("Distant Trees: Sun Haze Once", &fixes.TreeSunTransmittanceOnce);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::TextUnformatted(

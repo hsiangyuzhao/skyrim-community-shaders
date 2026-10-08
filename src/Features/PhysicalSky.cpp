@@ -12,7 +12,6 @@
 #include "Menu.h"
 #include "State.h"
 #include "Util.h"
-#include "Utils/Batch37b.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -36,7 +35,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	masserColor,
 	secundaColor,
 	proceduralSun,
-	sunDiskRad,
 	sunAlignToVanilla,
 	sunReplaceVanilla,
 	sunSoftEdge,
@@ -48,11 +46,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sunGlowWidthDeg,
 	sunLook,
 	hideNewMoonDisc,
-	fixSkyAlpha,
-	fixTrLutEdge,
-	fixApShadowDepth,
-	fixReflectionSky,
 	fixMultiScatter,
+	fixEffectBlend,
 	adaptationStart,
 	adaptationEnd,
 	dayExposure,
@@ -204,20 +199,6 @@ PhysicalSky::WorldspaceStatus PhysicalSky::GetWorldspaceStatus(float& a_zBottom)
 		if (auto cell = player->GetParentCell(); cell && cell->IsInteriorCell())
 			return WorldspaceStatus::Interior;
 
-	if (!Batch37b::IsOn()) {
-		// 37a: TES worldspace only, hard-coded list, no exclusions.
-		auto* tes = RE::TES::GetSingleton();
-		auto* worldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
-		if (!worldspace)
-			return WorldspaceStatus::Unknown;
-		const auto& legacy = LegacyWorldspaceWhitelist();
-		if (auto it = legacy.find(worldspace->GetFormEditorID()); it != legacy.end()) {
-			a_zBottom = it->second.zBottom;
-			return WorldspaceStatus::Whitelist;
-		}
-		return WorldspaceStatus::NotListed;
-	}
-
 	auto* worldspace = GetCurrentWorldspace();
 	if (!worldspace)
 		return WorldspaceStatus::Unknown;
@@ -353,10 +334,7 @@ void PhysicalSky::SettingsGeneral()
 void PhysicalSky::SettingsWorldspaces()
 {
 	// (batch 37b) Ported from upstream ba4b640f2 (editable list) + f3fb48d12 (all exteriors).
-	ImGui::SeparatorText("Worldspaces (Batch 37b)");
-	if (!Batch37b::IsOn())
-		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning,
-			"Batch 37b master switch is off: the old built-in list of 9 worldspaces is used.");
+	ImGui::SeparatorText("Worldspaces");
 
 	ImGui::Checkbox("All Exterior Worldspaces", &settings.enableAllExteriorWorldspaces);
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -467,14 +445,14 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::ColorEdit3("Light Color", &settings.sunlightColor.x, ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(lightColorHint);
-		if (Batch37b::IsOn()) {
+		{
 			static constexpr const char* sunLookNames[kSunLookCount] = { "Custom", "Bright (realistic)", "Soft", "Vanilla sun (procedural off)" };
 			int look = settings.proceduralSun ? std::clamp(settings.sunLook, 0, kSunLookCount - 1) : static_cast<int>(kSunLookVanilla);
 			if (ImGui::Combo("Sun Look", &look, sunLookNames, kSunLookCount))
 				ApplySunLook(look);
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text(
-					"One-click looks for the sun (Batch 37c):\n"
+					"One-click looks for the sun:\n"
 					"Bright: real-size disk with a strong glow around it, reads as blinding.\n"
 					"Soft: slightly larger disk, gentle glow.\n"
 					"Vanilla sun: procedural sun off, the game's own sun picture.\n"
@@ -487,22 +465,14 @@ void PhysicalSky::SettingsCelestials()
 				"Draws the sun as part of the physical sky: a real-size disk whose colour and brightness\n"
 				"come from the atmosphere (white at noon, orange and dimmer at sunset, gone below the\n"
 				"horizon), instead of the game's fixed sun picture. Off: the game's sun picture.");
-		if (Batch37b::IsOn()) {
-			if (ImGui::SliderFloat("Sun Disk Angular Radius", &settings.sunDiskRadiusDeg, 0.05f, 2.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
-				settings.sunLook = kSunLookCustom;
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Radius of the disk. 0.27 = the real sun (0.53 degrees across).");
-			ImGui::SameLine();
-			ImGui::TextDisabled("(%.2f deg across)", settings.sunDiskRadiusDeg * 2.f);
-		} else {
-			ImGui::SliderAngle("Sun Disk Angular Radius (37a)", &settings.sunDiskRad, 0.f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Batch 37b master switch is off: the old size setting is in use.");
-		}
+		if (ImGui::SliderFloat("Sun Disk Angular Radius", &settings.sunDiskRadiusDeg, 0.05f, 2.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
+			settings.sunLook = kSunLookCustom;
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Radius of the disk. 0.27 = the real sun (0.53 degrees across).");
+		ImGui::SameLine();
+		ImGui::TextDisabled("(%.2f deg across)", settings.sunDiskRadiusDeg * 2.f);
 
-		ImGui::SeparatorText("Procedural Sun (Batch 37b)");
-		if (!Batch37b::IsOn())
-			ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
+		ImGui::SeparatorText("Procedural Sun");
 		ImGui::Checkbox("Align with Vanilla Sun", &settings.sunAlignToVanilla);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(
@@ -535,7 +505,7 @@ void PhysicalSky::SettingsCelestials()
 			settings.sunLook = kSunLookCustom;
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(
-				"Batch 37c. A glow in the sky around the disk, coloured by the atmosphere like the disk.\n"
+				"A glow in the sky around the disk, coloured by the atmosphere like the disk.\n"
 				"This is what makes the sun read as blinding: the game has no bloom on it unless COD Bloom\n"
 				"is on. 1 = as bright as a sunlit white wall at the disk's edge. 0 = no glow.");
 		if (ImGui::SliderFloat("Sun Glow Width", &settings.sunGlowWidthDeg, 0.1f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
@@ -566,7 +536,7 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::PopID();
 	}
 
-	ImGui::SeparatorText("New Moon (Batch 37c)");
+	ImGui::SeparatorText("New Moon");
 	ImGui::Checkbox("Hide New Moon Disc", &settings.hideNewMoonDisc);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
@@ -646,28 +616,21 @@ void PhysicalSky::SettingsAtmosphere()
 
 void PhysicalSky::SettingsFixes()
 {
-	ImGui::SeparatorText("Fixes (Batch 37b)");
-	if (!Batch37b::IsOn())
-		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
-
-	ImGui::Checkbox("Opaque Sky", &settings.fixSkyAlpha);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Writes the physical sky fully opaque. Off: the vanilla sky dome's transparency near the\nhorizon lets what is behind it show through (possible seams or bands).");
-	ImGui::Checkbox("Transmittance Edge Fix", &settings.fixTrLutEdge);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Stops the sun-colour table from bleeding across its edge (odd colours at extreme angles,\npossibly a too-white sunset disk). Usually invisible.");
-	ImGui::Checkbox("Atmosphere Shadow Depth Fix", &settings.fixApShadowDepth);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("With DLSS Quality (not DLAA) the shadows inside distant haze and fog were offset from the\nmountains casting them. This reads the right depth. No change under DLAA.");
-	ImGui::Checkbox("Reflected Sky Fix", &settings.fixReflectionSky);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Removes random dark patches from the sky seen in reflections (environment cubemap).\nUses the cloud shadows there instead of the main view's haze shadow.");
-	ImGui::Checkbox("Multiple Scattering Fix (changes sky colour)", &settings.fixMultiScatter);
+	ImGui::SeparatorText("Multiple Scattering");
+	ImGui::Checkbox("Full-Sky Multiple Scattering (changes sky colour)", &settings.fixMultiScatter);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
 			"The sky's multiple-scattering table only looked at half the sky. On: the full sky, as upstream.\n"
 			"Changes overall sky brightness and colour (usually the side away from the sun gets a little\n"
 			"brighter, the sun side a little darker). Off by default: compare and decide.");
+
+	ImGui::SeparatorText("Fixes");
+	ImGui::Checkbox("Upstream fix: distance haze on effects", &settings.fixEffectBlend);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Distant haze treated every effect the same: glowing effects (fire, magic) got extra haze light\n"
+			"on every layer and darkening decals (blood) were brightened. On: glow effects only fade, decals are\n"
+			"left alone. Off = old behaviour.");
 }
 
 void PhysicalSky::SettingsClouds()
@@ -871,7 +834,7 @@ bool PhysicalSky::ShadersOK()
 void PhysicalSky::UpdateExtCbData()
 {
 	extCbData = {};
-	if (!loaded || !Batch37b::IsOn())
+	if (!loaded)
 		return;
 
 	uint flags = 0;
@@ -883,16 +846,12 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtSunPhysicalRadiance;
 	if (settings.sunHideVanillaGlare)
 		flags |= kExtHideSunGlare;
-	if (settings.fixSkyAlpha)
-		flags |= kExtSkyAlphaOpaque;
-	if (settings.fixTrLutEdge)
-		flags |= kExtTrLutEdgeFix;
-	if (settings.fixApShadowDepth)
-		flags |= kExtApShadowDepthFix;
-	if (settings.fixReflectionSky)
-		flags |= kExtReflectionSkyFix;
+	// Upstream correctness fixes, always on.
+	flags |= kExtSkyAlphaOpaque | kExtTrLutEdgeFix | kExtApShadowDepthFix | kExtReflectionSkyFix;
 	if (settings.fixMultiScatter)
 		flags |= kExtMultiScatterFix;
+	if (settings.fixEffectBlend)
+		flags |= kExtEffectBlendFix;
 	extCbData.flags = flags;
 	extCbData.sunRadianceCap = std::clamp(settings.sunRadianceCap, 1.f, 62250.f);
 	extCbData.sunGlowIntensity = settings.proceduralSun ? std::clamp(settings.sunGlowIntensity, 0.f, 30.f) : 0.f;
@@ -945,8 +904,7 @@ void PhysicalSky::Reset()
 	// check worldspace
 	bool inMainLoadingMenu = globals::game::ui && (globals::game::ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || globals::game::ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
 
-	// (batch 37b) Whitelist (saved, editable, DLC exteriors added) / all exteriors / exclusions.
-	// With the 37b master off this is the 37a hard-coded list.
+	// Whitelist (saved, editable, DLC exteriors added) / all exteriors / exclusions.
 	WorldspaceInfo worldspaceInfo = {};
 	const auto worldspaceStatus = GetWorldspaceStatus(worldspaceInfo.zBottom);
 	const bool worldspaceEnabled = worldspaceStatus == WorldspaceStatus::Whitelist || worldspaceStatus == WorldspaceStatus::AllExteriors;
@@ -970,7 +928,7 @@ void PhysicalSky::Reset()
 	// along the apparent direction -- dipped by atan(altitude / 325000), 1.5-4 degrees -- in the
 	// sky root's local frame, which Sky Sync rotates by the cell's north rotation. The raw
 	// direction used before sat that far off the quad: a second, clipped or missing disk.
-	if (Batch37b::IsOn() && settings.sunAlignToVanilla) {
+	if (settings.sunAlignToVanilla) {
 		RE::NiPoint3 apparent = skySync.directions[static_cast<int>(SkySync::Caster::Sun)];
 		if (auto* sky = globals::game::sky; sky && sky->root)
 			apparent = sky->root->world.rotate * apparent;
@@ -998,7 +956,7 @@ void PhysicalSky::Reset()
 		.masserColor = settings.masserColor * exposure,
 		.apTrMix = settings.apTrMix,
 		.secundaDir = { secundaDir.x, secundaDir.y, secundaDir.z },
-		.sunDiskCos = cos(Batch37b::IsOn() ? DirectX::XMConvertToRadians(std::clamp(settings.sunDiskRadiusDeg, 0.05f, 10.f)) : settings.sunDiskRad) * (settings.proceduralSun ? 1.f : 0.f),
+		.sunDiskCos = cos(DirectX::XMConvertToRadians(std::clamp(settings.sunDiskRadiusDeg, 0.05f, 10.f))) * (settings.proceduralSun ? 1.f : 0.f),
 		.secundaColor = settings.secundaColor * exposure,
 		.enabled = allGood,
 		.tonemapper = linearLighting.settings.enableLinearLighting ? 0 : settings.tonemapper,

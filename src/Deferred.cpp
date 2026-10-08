@@ -20,11 +20,9 @@
 #include "Features/VolumetricShadows.h"
 
 #include "Hooks.h"
-#include "Utils/Batch37b.h"
 #include "Utils/Batch39Engine.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
-#include "Utils/OcclusionDryRun.h"
 
 // CPU-side timing of our own work. Purely observational: every one of these is a
 // QueryPerformanceCounter bracket around an existing call, and each is a no-op unless the
@@ -595,7 +593,7 @@ void Deferred::DeferredPasses()
 			albedo.SRV,
 			normalRoughness.SRV,
 			masks.SRV,
-			dynamicCubemaps.loaded || REL::Module::IsVR() ? (terrainBlending.loaded ? terrainBlending.blendedDepthTexture16->srv.get() : depth.depthSRV) : nullptr,
+			dynamicCubemaps.loaded || REL::Module::IsVR() ? (terrainBlending.IsBlendingActive() ? terrainBlending.blendedDepthTexture16->srv.get() : depth.depthSRV) : nullptr,
 			dynamicCubemaps.loaded ? reflectance.SRV : nullptr,
 			dynamicCubemaps.loaded ? dynamicCubemaps.envTexture->srv.get() : nullptr,
 			dynamicCubemaps.loaded ? dynamicCubemaps.envReflectionsTexture->srv.get() : nullptr,
@@ -640,7 +638,7 @@ void Deferred::DeferredPasses()
 
 		// (batch 37b, C-4) "SSGI AO does not darken direct light" is a compile-time branch of the
 		// composite; when its effective state flips, both composite variants are rebuilt once.
-		if (const bool aoSparesDirect = Batch37b::SsgiAoSparesDirectActive(); aoSparesDirect != compositeAoSparesDirect) {
+		if (const bool aoSparesDirect = globals::features::screenSpaceGI.loaded && globals::features::screenSpaceGI.settings.AoSparesDirect; aoSparesDirect != compositeAoSparesDirect) {
 			ClearShaderCache();
 			compositeAoSparesDirect = aoSparesDirect;
 		}
@@ -716,13 +714,6 @@ void Deferred::EndDeferred()
 	{
 		Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOther);
 
-		// (batch 39, item 2) If a slimming switch kept geometry out of the depth prepass, bring
-		// the post-prepass depth copies up to date before anything below reads them.
-		Batch39Engine::AfterOpaquePass();
-
-		// (batch 37a) Occlusion dry run: max-reduce the finished opaque depth into its own Hi-Z
-		// and queue a readback. Writes only its own textures; a no-op unless the test is running.
-		Util::OcclusionDryRun::OnEndDeferred();
 
 		DeferredPasses();  // Perform deferred passes and composite forward buffers
 

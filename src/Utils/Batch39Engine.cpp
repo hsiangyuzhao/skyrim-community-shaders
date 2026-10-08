@@ -1,4 +1,4 @@
-// Batch 39, items 1-4: water reflection cubemap relief, depth prepass breakdown + slimming,
+// Engine-level changes: water reflection cubemap relief, depth prepass breakdown,
 // temporal LOD dither, texture clarity. See Batch39Engine.h for what the engine does and why
 // each switch is built the way it is.
 #include "Utils/Batch39Engine.h"
@@ -48,7 +48,7 @@ namespace Batch39Engine
 					setting = RE::GetINISetting(name);
 					lookedUp = true;
 					if (!setting)
-						logger::warn("[Batch 39] engine setting {} not found", name);
+						logger::warn("[Engine] engine setting {} not found", name);
 				}
 				return setting;
 			}
@@ -268,52 +268,6 @@ namespace Batch39Engine
 		const void* g_cubeLastCamera = nullptr;
 		uint64_t g_cubeTotalCalls = 0;
 
-		// ---------------------------------------------------------------------------------
-		// 2. Depth refresh after the opaque pass.
-		// ---------------------------------------------------------------------------------
-		ID3D11ComputeShader* g_depthRefreshCS = nullptr;
-		bool g_depthRefreshCSFailed = false;
-		uint32_t g_depthRefreshFrame = UINT32_MAX;
-		std::string g_depthRefreshPath = "-";
-
-		ID3D11ComputeShader* GetDepthRefreshCS()
-		{
-			if (!g_depthRefreshCS && !g_depthRefreshCSFailed) {
-				g_depthRefreshCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\Batch39DepthRefreshCS.hlsl", {}, "cs_5_0"));
-				if (!g_depthRefreshCS) {
-					g_depthRefreshCSFailed = true;
-					logger::error("[Batch 39] Batch39DepthRefreshCS.hlsl failed to compile; Terrain Blending's depth is not refreshed after the opaque pass");
-				}
-			}
-			return g_depthRefreshCS;
-		}
-
-		// Depth states for draws that skipped the prepass: the engine's state with the test
-		// relaxed to LESS_EQUAL and depth writes on (stencil kept).
-		std::unordered_map<ID3D11DepthStencilState*, winrt::com_ptr<ID3D11DepthStencilState>> g_depthWriteStates;
-		uint32_t g_depthOverridesThisFrame = 0, g_depthOverridesLast = 0;
-
-		ID3D11DepthStencilState* DepthWriteVariant(ID3D11DepthStencilState* a_state)
-		{
-			if (auto it = g_depthWriteStates.find(a_state); it != g_depthWriteStates.end())
-				return it->second.get();
-
-			winrt::com_ptr<ID3D11DepthStencilState> variant;
-			D3D11_DEPTH_STENCIL_DESC desc{};
-			a_state->GetDesc(&desc);
-			const bool alreadyWrites = desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL &&
-			                           (desc.DepthFunc == D3D11_COMPARISON_LESS_EQUAL || desc.DepthFunc == D3D11_COMPARISON_LESS);
-			if (desc.DepthEnable && !alreadyWrites) {
-				desc.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
-				desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-				if (FAILED(globals::d3d::device->CreateDepthStencilState(&desc, variant.put())))
-					variant = nullptr;
-			}
-			// Keyed by the engine's own (persistent) state object; a null value means "leave as is".
-			auto* raw = variant.get();
-			g_depthWriteStates.emplace(a_state, std::move(variant));
-			return raw;
-		}
 
 	}
 
@@ -321,44 +275,8 @@ namespace Batch39Engine
 	// Settings
 	// =====================================================================================
 
-	NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-		Settings,
-		ReflThrottle,
-		ReflFacesPerUpdate,
-		ReflEveryNFrames,
-		ReflSkipLODTrees,
-		ReflSkipLODObjects,
-		ReflHandOffToDynamicCubemaps,
-		ReflHandOffKeepSky,
-		ReflHandOffFastCapture,
-		ReflHandOffCaptureWeight,
-		PrepassSkipLODLand,
-		PrepassFrontToBack,
-		TemporalLODDither,
-		MipBiasMaterials,
-		MipBiasSpecular,
-		Anisotropic16x)
-
-	void Load(const json& a_json)
-	{
-		if (!a_json.is_object())
-			return;
-		try {
-			settings = a_json.get<Settings>();
-		} catch (const std::exception& e) {
-			logger::warn("[Batch 39] engine settings unreadable ({}); using defaults", e.what());
-			settings = {};
-		}
-		if (settings.ReflFacesPerUpdate != 1 && settings.ReflFacesPerUpdate != 2 && settings.ReflFacesPerUpdate != 3 && settings.ReflFacesPerUpdate != 6)
-			settings.ReflFacesPerUpdate = 1;
-		settings.ReflEveryNFrames = std::clamp(settings.ReflEveryNFrames, 1, 8);
-		settings.ReflHandOffCaptureWeight = std::clamp(settings.ReflHandOffCaptureWeight, 0.25f, 1.0f);
-	}
-
-	json Save()
-	{
-		return settings;
-	}
+	// The three water reflection options are loaded, saved and drawn by Water Effects
+	// (Water > Water Effects > Reflection Cubemap). Everything else is fixed.
 
 	// =====================================================================================
 	// Effective state
@@ -366,21 +284,20 @@ namespace Batch39Engine
 
 	bool ReflHandOffActive()
 	{
-		return Batch39::IsOn() && settings.ReflHandOffToDynamicCubemaps && globals::features::dynamicCubemaps.loaded;
+		return settings.ReflHandOffToDynamicCubemaps && globals::features::dynamicCubemaps.loaded;
 	}
-	bool ReflThrottleActive() { return Batch39::IsOn() && settings.ReflThrottle && !ReflHandOffActive(); }
-	bool ReflHandOffKeepSkyActive() { return ReflHandOffActive() && settings.ReflHandOffKeepSky; }
-	bool ReflHandOffFastCaptureActive() { return ReflHandOffActive() && settings.ReflHandOffFastCapture; }
+	// Fixed: one face per frame round robin unless handed off; while handed off the game's
+	// cubemap keeps the sky only and Dynamic Cubemaps captures every frame (39b lag fixes).
+	bool ReflThrottleActive() { return !ReflHandOffActive(); }
+	bool ReflHandOffKeepSkyActive() { return ReflHandOffActive(); }
+	bool ReflHandOffFastCaptureActive() { return ReflHandOffActive(); }
 	float DynamicCubemapCaptureWeight() { return ReflHandOffFastCaptureActive() ? std::clamp(settings.ReflHandOffCaptureWeight, 0.25f, 1.0f) : 0.5f; }
-	bool ReflSkipLODTreesActive() { return Batch39::IsOn() && settings.ReflSkipLODTrees; }
-	bool ReflSkipLODObjectsActive() { return Batch39::IsOn() && settings.ReflSkipLODObjects; }
-	bool PrepassSkipLODLandActive() { return Batch39::IsOn() && settings.PrepassSkipLODLand; }
-	bool PrepassFrontToBackActive() { return Batch39::IsOn() && settings.PrepassFrontToBack; }
-	bool TemporalLODDitherActive() { return Batch39::IsOn() && settings.TemporalLODDither; }
-	bool MipBiasMaterialsActive() { return Batch39::IsOn() && settings.MipBiasMaterials; }
-	bool MipBiasSpecularActive() { return Batch39::IsOn() && settings.MipBiasSpecular; }
-	bool Anisotropic16xActive() { return Batch39::IsOn() && settings.Anisotropic16x && g_samplerHookInstalled; }
-	bool PrepassSlimmingActive() { return PrepassSkipLODLandActive(); }
+	bool ReflSkipLODTreesActive() { return true; }
+	bool ReflSkipLODObjectsActive() { return settings.ReflSkipLODObjects; }
+	bool TemporalLODDitherActive() { return true; }
+	bool MipBiasMaterialsActive() { return true; }
+	bool MipBiasSpecularActive() { return true; }
+	bool Anisotropic16xActive() { return g_samplerHookInstalled; }
 
 	uint32_t ShaderFlags()
 	{
@@ -432,13 +349,13 @@ namespace Batch39Engine
 			g_passHookInstalled = DetourTransactionCommit() == NO_ERROR;
 		}
 		if (!g_passHookInstalled)
-			logger::warn("[Batch 39] RenderPassImmediately not hooked: no per-object prepass breakdown");
+			logger::warn("[Engine] RenderPassImmediately not hooked: no per-object prepass breakdown");
 
 		// Main_RenderDepth (same function the overlay's timeline and Terrain Blending bracket).
 		stl::detour_thunk<Main_RenderDepth>(REL::RelocationID(100421, 107139));
 		g_depthHookInstalled = true;
 
-		logger::info("[Batch 39] Installed engine hooks");
+		logger::info("[Engine] Installed engine hooks");
 	}
 
 	void InstallContextHooks(ID3D11DeviceContext* a_context)
@@ -494,8 +411,6 @@ namespace Batch39Engine
 		g_reflectLODTrees.Apply(ReflSkipLODTreesActive() || skyOnly, false);
 		g_reflectLODObjects.Apply(ReflSkipLODObjectsActive() || skyOnly, false);
 		g_reflectLODLand.Apply(skyOnly, false);
-		g_lodZPrepass.Apply(PrepassSkipLODLandActive(), false);
-		g_frontToBackPrepass.Apply(PrepassFrontToBackActive(), true);
 
 		// 16x AF: swap what is bound right now when the effective state flips.
 		const bool aniso = Anisotropic16xActive();
@@ -520,8 +435,6 @@ namespace Batch39Engine
 		g_cubeThis = {};
 		g_cubeLastCamera = nullptr;
 
-		g_depthOverridesLast = g_depthOverridesThisFrame;
-		g_depthOverridesThisFrame = 0;
 	}
 
 	// =====================================================================================
@@ -562,14 +475,9 @@ namespace Batch39Engine
 		if (cam.lastFrame == frame)
 			return 0;
 		cam.lastFrame = frame;
-		const uint32_t everyN = static_cast<uint32_t>(std::clamp(settings.ReflEveryNFrames, 1, 8));
-		if (frame % everyN != 0)
-			return 0;
-		const uint32_t faces = static_cast<uint32_t>(std::clamp(settings.ReflFacesPerUpdate, 1, 6));
-		int mask = 0;
-		for (uint32_t i = 0; i < faces; ++i)
-			mask |= 1 << ((cam.cursor + i) % 6);
-		cam.cursor = (cam.cursor + faces) % 6;
+		// One face per frame: a whole cube every 6 frames.
+		const int mask = 1 << cam.cursor;
+		cam.cursor = (cam.cursor + 1) % 6;
 		return mask;
 	}
 
@@ -578,100 +486,7 @@ namespace Batch39Engine
 		g_cubeThis.facesDrawn += std::popcount(static_cast<uint32_t>(a_drawnMask) & 0x3Fu);
 	}
 
-	// =====================================================================================
-	// 2. Depth prepass
-	// =====================================================================================
-
-	void OnDraw(RE::BSShader* a_shader, uint32_t, uint32_t a_pixelDescriptor)
-	{
-		if (!a_shader || !globals::deferred || !globals::deferred->deferredPass)
-			return;
-
-		bool needsDepthWrite = false;
-		if (a_shader->shaderType.get() == RE::BSShader::Type::Lighting && PrepassSkipLODLandActive()) {
-			using Tech = SIE::ShaderCache::LightingShaderTechniques;
-			const auto tech = static_cast<Tech>(0x3F & (a_pixelDescriptor >> 24));
-			needsDepthWrite = tech == Tech::LODLand || tech == Tech::LODLandNoise;
-		}
-		if (!needsDepthWrite)
-			return;
-
-		auto* context = globals::d3d::context;
-		winrt::com_ptr<ID3D11DepthStencilState> current;
-		UINT stencilRef = 0;
-		context->OMGetDepthStencilState(current.put(), &stencilRef);
-		if (!current)
-			return;
-		if (auto* variant = DepthWriteVariant(current.get())) {
-			context->OMSetDepthStencilState(variant, stencilRef);
-			// The engine re-applies its own depth state before its next draw.
-			globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_DEPTH_MODE);
-			++g_depthOverridesThisFrame;
-		}
-	}
-
-	void AfterOpaquePass()
-	{
-		if (!PrepassSlimmingActive())
-			return;
-
-		auto* renderer = globals::game::renderer;
-		auto* context = globals::d3d::context;
-		if (!renderer || !context)
-			return;
-
-		auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
-		auto& zPrepassCopy = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
-		if (!mainDepth.texture || !zPrepassCopy.texture)
-			return;
-
-		auto* timers = Util::GpuPassTimers::GetSingleton();
-		timers->Begin(Util::GpuBucket::Batch39DepthRefresh);
-
-		// Everything after the opaque pass that reads "the prepass depth" (SSAO/SSGI, SSRT,
-		// screen-space shadows, SSS, fog, the deferred composite, water) sees the complete
-		// opaque depth again, including the geometry that skipped the prepass.
-		context->CopyResource(zPrepassCopy.texture, mainDepth.texture);
-		g_depthRefreshPath = "copy";
-
-		// With Terrain Blending, those readers get its blended copy instead (made right after
-		// the prepass): fold the finished depth into it. min() keeps its blended terrain.
-		auto& tb = globals::features::terrainBlending;
-		if (tb.loaded && tb.blendedDepthTexture && tb.blendedDepthTexture16 && tb.depthSRVBackup) {
-			if (auto* cs = GetDepthRefreshCS()) {
-				ID3D11ShaderResourceView* srv = tb.depthSRVBackup;
-				ID3D11UnorderedAccessView* uavs[2] = { tb.blendedDepthTexture->uav.get(), tb.blendedDepthTexture16->uav.get() };
-				context->CSSetShaderResources(0, 1, &srv);
-				context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-				context->CSSetShader(cs, nullptr, 0);
-				const auto dispatch = Util::GetScreenDispatchCount();
-				context->Dispatch(dispatch.x, dispatch.y, 1);
-
-				ID3D11ShaderResourceView* nullSrv = nullptr;
-				ID3D11UnorderedAccessView* nullUavs[2] = { nullptr, nullptr };
-				context->CSSetShaderResources(0, 1, &nullSrv);
-				context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
-				context->CSSetShader(nullptr, nullptr, 0);
-
-				// Writing it as a UAV unbinds it from the pixel shader slot State binds it to.
-				ID3D11ShaderResourceView* blended16 = tb.blendedDepthTexture16->srv.get();
-				context->PSSetShaderResources(17, 1, &blended16);
-				g_depthRefreshPath = "copy + Terrain Blending merge";
-			}
-		}
-
-		timers->End(Util::GpuBucket::Batch39DepthRefresh);
-		g_depthRefreshFrame = globals::state ? globals::state->frameCount : 0;
-	}
-
-	void ClearShaderCache()
-	{
-		if (g_depthRefreshCS) {
-			g_depthRefreshCS->Release();
-			g_depthRefreshCS = nullptr;
-		}
-		g_depthRefreshCSFailed = false;
-	}
+	void ClearShaderCache() {}
 
 	// =====================================================================================
 	// Diagnostics
@@ -722,8 +537,11 @@ namespace Batch39Engine
 	json DiagnosticsJson()
 	{
 		json j;
-		j["master"] = Batch39::IsOn();
-		j["settings"] = settings;
+		j["settings"] = {
+			{ "refl_skip_lod_objects", settings.ReflSkipLODObjects },
+			{ "refl_handoff_dynamic_cubemaps", settings.ReflHandOffToDynamicCubemaps },
+			{ "refl_handoff_capture_weight", settings.ReflHandOffCaptureWeight },
+		};
 		j["active"] = {
 			{ "refl_throttle", ReflThrottleActive() },
 			{ "refl_handoff_dynamic_cubemaps", ReflHandOffActive() },
@@ -732,8 +550,6 @@ namespace Batch39Engine
 			{ "refl_handoff_keep_sky", ReflHandOffKeepSkyActive() },
 			{ "refl_handoff_fast_capture", ReflHandOffFastCaptureActive() },
 			{ "dynamic_cubemaps_capture_weight", DynamicCubemapCaptureWeight() },
-			{ "prepass_skip_lod_land", PrepassSkipLODLandActive() },
-			{ "prepass_front_to_back", PrepassFrontToBackActive() },
 			{ "temporal_lod_dither", TemporalLODDitherActive() },
 			{ "mip_bias_materials", MipBiasMaterialsActive() },
 			{ "mip_bias_specular", MipBiasSpecularActive() },
@@ -748,8 +564,8 @@ namespace Batch39Engine
 			{ "bReflectLODObjects:Water", { { "now", g_reflectLODObjects.Current() }, { "user", g_reflectLODObjects.UserValue() } } },
 			{ "bReflectLODLand:Water", { { "now", g_reflectLODLand.Current() }, { "user", g_reflectLODLand.UserValue() } } },
 			{ "bReflectSky:Water", g_reflectSky.Current() },
-			{ "bLodZPrepass:Display", { { "now", g_lodZPrepass.Current() }, { "user", g_lodZPrepass.UserValue() } } },
-			{ "bEnableFrontToBackPrepass:Display", { { "now", g_frontToBackPrepass.Current() }, { "user", g_frontToBackPrepass.UserValue() } } },
+			{ "bLodZPrepass:Display", g_lodZPrepass.Current() },
+			{ "bEnableFrontToBackPrepass:Display", g_frontToBackPrepass.Current() },
 			{ "bEnableStippleFade:Display", g_stippleFade.Current() },
 		};
 
@@ -789,8 +605,6 @@ namespace Batch39Engine
 						 } },
 			{ "opaque_grass", PhaseJson(Util::GpuPhase::OpaqueGrass) },
 			{ "opaque_distant", PhaseJson(Util::GpuPhase::OpaqueDistant) },
-			{ "depth_write_overrides_last_frame", g_depthOverridesLast },
-			{ "depth_refresh", { { "ran_last_frame", globals::state && g_depthRefreshFrame + 1 >= globals::state->frameCount }, { "path", g_depthRefreshPath } } },
 		};
 
 		json samplers = json::object();
@@ -805,239 +619,3 @@ namespace Batch39Engine
 	}
 }
 
-// =========================================================================================
-// Batch 39 tab: rows and section (items 1-4)
-// =========================================================================================
-
-namespace Batch39
-{
-	using namespace Batch39Engine;
-
-	namespace
-	{
-		Row Toggle(const char* a_group, const char* a_name, bool a_installed, bool& a_value, std::string a_nowText, const char* a_where, const char* a_default = nullptr)
-		{
-			std::string own = a_value ? "On" : "Off";
-			if (a_default)
-				own += std::format(" (default {})", a_default);
-			Row r{ a_group, a_name, a_installed, a_value, std::move(own), std::move(a_nowText), a_where };
-			r.toggle = &a_value;
-			return r;
-		}
-
-		Row Info(const char* a_group, const char* a_name, std::string a_text)
-		{
-			Row r{ a_group, a_name, true, true, "(diagnostic)", std::move(a_text), "Performance overlay > Engine passes; F12 / Save frame (JSON)" };
-			r.governed = false;
-			return r;
-		}
-	}
-
-	void RowsEngine(std::vector<Row>& a_rows)
-	{
-		auto& s = Batch39Engine::settings;
-		const bool dcLoaded = globals::features::dynamicCubemaps.loaded;
-
-		// ---- 1. Water reflection cubemap ----
-		{
-			const char* g = "1. Water reflection cubemap";
-			const char* where = "Advanced > Batch 39 (below)";
-			a_rows.push_back(Info(g, "Breakdown by object type (LOD terrain / objects / trees, sky)",
-				std::format("{:.1f} faces/frame, {:.1f} calls/frame", g_cubeDrawnAvg, g_cubeCallsAvg)));
-
-			std::string now;
-			if (s.ReflThrottle && ReflHandOffActive())
-				now = ReflHandOffKeepSkyActive() ? "Hand-off: sky-only faces at this rate" : "Idle: Dynamic Cubemaps hand-off is on";
-			else if (ReflThrottleActive())
-				now = std::format("On ({} face{} every {} frame{})", s.ReflFacesPerUpdate, s.ReflFacesPerUpdate == 1 ? "" : "s", s.ReflEveryNFrames, s.ReflEveryNFrames == 1 ? "" : "s");
-			a_rows.push_back(Toggle(g, "Fewer face updates (round robin)", true, s.ReflThrottle, now, where, "On"));
-			a_rows.push_back(Toggle(g, "Leave LOD trees out (bReflectLODTrees = 0)", true, s.ReflSkipLODTrees, "", where, "On"));
-			a_rows.push_back(Toggle(g, "Leave LOD objects out (bReflectLODObjects = 0)", true, s.ReflSkipLODObjects, "Note: visibly hurts reflections", where, "Off"));
-			a_rows.push_back(Toggle(g, "Hand off to Dynamic Cubemaps (no engine cubemap)", dcLoaded, s.ReflHandOffToDynamicCubemaps, "", where, "Off"));
-			a_rows.push_back(Toggle(g, "  Hand-off: game cubemap keeps the sky (39b)", dcLoaded, s.ReflHandOffKeepSky, "", where, "On"));
-			a_rows.push_back(Toggle(g, "  Hand-off: Dynamic Cubemaps captures every frame (39b, lag fix)", dcLoaded, s.ReflHandOffFastCapture,
-				ReflHandOffFastCaptureActive() ? std::format("New capture weight {:.2f}", DynamicCubemapCaptureWeight()) : "", where, "On"));
-		}
-
-		// ---- 2. Depth prepass ----
-		{
-			const char* g = "2. Depth prepass";
-			const char* where = "Advanced > Batch 39 (below)";
-			const auto depth = SumPhases(kDepthPhases);
-			a_rows.push_back(Info(g, "Breakdown by object type (terrain, objects, characters, trees, grass, LOD)",
-				std::format("{:.2f} ms, {:.0f} draws (overlay open)", depth.ms, depth.draws)));
-
-			a_rows.push_back(Toggle(g, "LOD terrain skips the prepass (bLodZPrepass = 0)", true, s.PrepassSkipLODLand, "", where, "Off"));
-			a_rows.push_back(Toggle(g, "Sort prepass front to back (bEnableFrontToBackPrepass = 1)", true, s.PrepassFrontToBack, "", where, "Off"));
-		}
-
-		// ---- 3. Temporal LOD dither ----
-		{
-			const char* g = "3. Temporal LOD dither";
-			std::string now;
-			if (TemporalLODDitherActive() && !g_stippleFade.Current())
-				now = "Idle: bEnableStippleFade is 0";
-			a_rows.push_back(Toggle(g, "Fade-in/out pattern changes every frame (DLSS blends it)", true, s.TemporalLODDither, now, "Advanced > Batch 39"));
-		}
-
-		// ---- 4. Texture clarity ----
-		{
-			const char* g = "4. Texture clarity";
-			a_rows.push_back(Toggle(g, "DLSS mip bias on more material textures", true, s.MipBiasMaterials, "", "Advanced > Batch 39"));
-			a_rows.push_back(Toggle(g, "DLSS mip bias on specular / gloss / env-mask textures", true, s.MipBiasSpecular, "", "Advanced > Batch 39"));
-			std::string afNow;
-			bool noTwins = false;
-			{
-				std::shared_lock lock(g_samplerMutex);
-				noTwins = g_samplerTwins.empty();
-			}
-			if (s.Anisotropic16x && !g_samplerHookInstalled)
-				afNow = "Unavailable: sampler hook missing";
-			else if (Anisotropic16xActive() && noTwins)
-				afNow = "Idle: no sampler asked for more than 8x";
-			a_rows.push_back(Toggle(g, "Anisotropic filtering up to 16x (was clamped to 8x)", true, s.Anisotropic16x, afNow, "Advanced > Batch 39"));
-		}
-	}
-
-	void DrawEngineSection()
-	{
-		auto& s = Batch39Engine::settings;
-		const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
-
-		if (ImGui::CollapsingHeader("1. Water reflection cubemap", ImGuiTreeNodeFlags_DefaultOpen)) {
-			ImGui::TextWrapped(
-				"The game redraws a small cubemap around you for the reflections on distant water. It only holds far-away "
-				"terrain, objects, trees and the sky (\"LOD\"), and normally redraws 2 of its 6 sides every frame.");
-			ImGui::Checkbox("Fewer face updates", &s.ReflThrottle);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"Redraw fewer sides per frame, in turn. The sides that are not redrawn keep last frame's picture.\n"
-					"Moving fast, far-away water reflections can lag a few frames behind.\n"
-					"Default (39b): on, 1 side every frame = the whole cube every 6 frames (about 75 ms at 80 fps), half the game's\n"
-					"drawing. Tested in 39a: a clear saving with no visible change; distant reflections barely change in 6 frames.");
-			Batch39::MasterNote();
-			ImGui::BeginDisabled(!s.ReflThrottle);
-			static constexpr int kFaces[] = { 1, 2, 3, 6 };
-			static constexpr const char* kFaceNames[] = { "1 side", "2 sides (as the game)", "3 sides", "all 6 sides" };
-			int faceIndex = 0;
-			for (int i = 0; i < 4; ++i)
-				if (kFaces[i] == s.ReflFacesPerUpdate)
-					faceIndex = i;
-			ImGui::SetNextItemWidth(180.0f);
-			if (ImGui::Combo("Sides per update", &faceIndex, kFaceNames, 4))
-				s.ReflFacesPerUpdate = kFaces[faceIndex];
-			ImGui::SetNextItemWidth(180.0f);
-			ImGui::SliderInt("Update every N frames", &s.ReflEveryNFrames, 1, 8, "%d", ImGuiSliderFlags_AlwaysClamp);
-			ImGui::Text("Whole cube refreshed every %d frames (the game: every 3).", (6 + s.ReflFacesPerUpdate - 1) / s.ReflFacesPerUpdate * s.ReflEveryNFrames);
-			ImGui::EndDisabled();
-
-			ImGui::Checkbox("Leave LOD trees out of the reflection", &s.ReflSkipLODTrees);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("Default (39b): on. Tested in 39a: a clear saving, no visible change (distant tree LOD is tiny in a reflection).");
-			ImGui::Checkbox("Leave LOD objects out of the reflection", &s.ReflSkipLODObjects);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"LOD objects include distant buildings and many mountain and cliff meshes.\n"
-					"Tested in 39a: this visibly hurts the reflections (distant mountains and buildings drop out). Keep it off.");
-			ImGui::BeginDisabled(!globals::features::dynamicCubemaps.loaded);
-			ImGui::Checkbox("Hand off to Dynamic Cubemaps (skip the game's cubemap)", &s.ReflHandOffToDynamicCubemaps);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"The game's cubemap no longer draws distant terrain, objects and trees; all water reflects Dynamic Cubemaps'\n"
-					"capture instead, as near water already does. Saves most of the Reflections row. Distant mountains are then\n"
-					"reflected only as well as Dynamic Cubemaps sees them. Water screen-space reflections are unaffected.\n"
-					"Dynamic Cubemaps builds its picture from what is on screen, a little at a time, so reflections trail\n"
-					"behind the view; the two options below shorten that.");
-			ImGui::BeginDisabled(!s.ReflHandOffToDynamicCubemaps);
-			ImGui::Indent();
-			ImGui::Checkbox("Keep the sky in the game's cubemap", &s.ReflHandOffKeepSky);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"The game's cubemap still draws, but the sky alone (cheap), at the 'Fewer face updates' rate.\n"
-					"Dynamic Cubemaps fills every direction it has not seen on screen from it. Off = 39a: those directions\n"
-					"kept the picture from the moment the hand-off was switched on, which looked like a stuck, lagging reflection.");
-			ImGui::Checkbox("Dynamic Cubemaps captures every frame", &s.ReflHandOffFastCapture);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"Dynamic Cubemaps normally refreshes the reflection capture once every 6 frames and mixes each new capture\n"
-					"half and half with the old one, so the reflection needs 10-20 frames to catch up. With this on, the reflection\n"
-					"capture is refreshed every frame (its three small steps run together) and the new capture counts more.\n"
-					"Costs the Dynamic Cubemaps row about 3x (still small).");
-			ImGui::BeginDisabled(!s.ReflHandOffFastCapture);
-			ImGui::SetNextItemWidth(180.0f);
-			ImGui::SliderFloat("New capture weight", &s.ReflHandOffCaptureWeight, 0.25f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("1.0 = only the newest capture (fastest, may flicker a little); 0.5 = Dynamic Cubemaps' own mix.");
-			ImGui::EndDisabled();
-			ImGui::Unindent();
-			ImGui::EndDisabled();
-			ImGui::EndDisabled();
-			if (!globals::features::dynamicCubemaps.loaded)
-				ImGui::TextDisabled("(needs Dynamic Cubemaps)");
-
-			ImGui::Spacing();
-			const auto refl = SumPhases(kReflPhases);
-			ImGui::Text("Now: %.2f calls, %.2f sides requested, %.2f sides drawn per frame%s", g_cubeCallsAvg, g_cubeRequestedAvg, g_cubeDrawnAvg, g_cubeLast.mapMenu ? " (map open: all 6)" : "");
-			if (refl.ms > 0.0f || refl.draws > 0.0f)
-				ImGui::Text("GPU %.2f ms, %.0f draws (%.0f per side)", refl.ms, refl.draws, g_cubeDrawnAvg > 0.01f ? refl.draws / g_cubeDrawnAvg : 0.0f);
-			else
-				ImGui::TextDisabled("GPU time and draws: open the performance overlay with its draw-call table.");
-			ImGui::TextDisabled("fCubeMapRefreshRate = %.2f s (pause between full turns; 0 = never pause). bReflectLODLand %d, bReflectSky %d.",
-				ReadEngineFloat("fCubeMapRefreshRate:Water", -1.0f), g_reflectLODLand.Current() ? 1 : 0, g_reflectSky.Current() ? 1 : 0);
-		}
-
-		if (ImGui::CollapsingHeader("2. Depth prepass", ImGuiTreeNodeFlags_DefaultOpen)) {
-			ImGui::TextWrapped(
-				"Before drawing the scene properly, the game draws it once as depth only, so hidden pixels are skipped later. "
-				"The overlay's \"Depth prepass\" group now shows what that costs per object type.");
-			ImGui::TextDisabled("(39b) \"Grass skips the prepass\" was removed: in 39a it cost about 4 ms instead of saving time.");
-			ImGui::Checkbox("LOD terrain skips the prepass (bLodZPrepass = 0)", &s.PrepassSkipLODLand);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"The game's own switch. Far-away terrain then writes its depth in the main pass (forced here, so it cannot vanish),\n"
-					"and the same depth refresh keeps fog and the screen-space effects correct.");
-			ImGui::Checkbox("Sort the prepass front to back (bEnableFrontToBackPrepass = 1)", &s.PrepassFrontToBack);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"The game's own switch, off by default. Sorts the prepass so near objects hide far ones sooner.\n"
-					"Costs a little CPU for the sort; changes no picture.");
-			Batch39::MasterNote();
-
-			const bool slim = PrepassSlimmingActive();
-			ImGui::TextColored(slim ? palette.SuccessColor : palette.Disable, "Depth refresh after the main pass: %s%s",
-				slim ? "runs" : "not needed", slim ? std::format(" ({})", g_depthRefreshPath).c_str() : "");
-			ImGui::TextDisabled("Engine values now: bLodZPrepass %d (yours %d), bEnableFrontToBackPrepass %d (yours %d), depth-write overrides last frame: %u",
-				g_lodZPrepass.Current() ? 1 : 0, g_lodZPrepass.UserValue() ? 1 : 0, g_frontToBackPrepass.Current() ? 1 : 0, g_frontToBackPrepass.UserValue() ? 1 : 0, g_depthOverridesLast);
-		}
-
-		if (ImGui::CollapsingHeader("3-4. LOD dither, texture clarity")) {
-			ImGui::Checkbox("Temporal LOD dither", &s.TemporalLODDither);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"Objects fading in or out at the edge of the view distance used a fixed 4x4 screen-door pattern.\n"
-					"It now changes every frame (interleaved gradient noise, golden-ratio step), and DLSS blends it into a\n"
-					"smooth see-through fade. The depth prepass and the main pass use the same pattern, so no holes.\n"
-					"Takes effect immediately. Off = the old fixed pattern.");
-			ImGui::Checkbox("DLSS mip bias on more material textures", &s.MipBiasMaterials);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"DLSS renders at a lower resolution, so textures get a sharper mip level (negative bias) to look native.\n"
-					"Base colour, normal and RMAOS already had it. Now also: the snow/moss layer on rocks and mountains\n"
-					"(directional projection), glow maps, detail/tint, skin and hair extras, back/rim light, multi-layer\n"
-					"parallax and the PBR coat/fuzz/subsurface maps.");
-			ImGui::Checkbox("DLSS mip bias on specular / gloss / env-mask textures", &s.MipBiasSpecular);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("Sharper shine maps. Separate because it can add a little sparkle on distant shiny surfaces.");
-			ImGui::Checkbox("Anisotropic filtering up to 16x", &s.Anisotropic16x);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"Community Shaders clamped every game sampler to 8x. With this on, samplers the game created with 16x get 16x.\n"
-					"Only changes ground seen at a very flat angle (beyond 8:1 stretch); on an RTX 4070 Ti Super the cost is\n"
-					"typically well under 0.1 ms at 1440p.");
-			{
-				std::shared_lock lock(g_samplerMutex);
-				ImGui::TextDisabled("Samplers that asked for more than 8x: %zu", g_samplerTwins.size());
-			}
-		}
-	}
-}

@@ -117,6 +117,9 @@ public:
 		bool EnableContactAo = true;
 		float ContactRadius = 15.f;  // centimetres
 		float ContactStrength = 1.f;
+		/// AO dims only the ambient light, not direct light (sun, lamps). Off by default (the
+		/// usual look). A compile-time branch of the deferred composite (Deferred.cpp).
+		bool AoSparesDirect = false;
 	} settings;
 
 	struct alignas(16) SSGICB

@@ -19,7 +19,7 @@ public:
 		int32_t InteriorQuality = 2;
 		TextureSize InteriorCustomSize;
 
-		// (batch 37b) Each is ANDed with Batch37b::IsOn(); see the *Active() helpers below.
+		// Shaft settings; see the *Active() helpers below.
 		/// A1: exponent on the cloud x terrain shadow multiplied into every light-shaft voxel.
 		/// 0 = no occlusion (37a), 0.5 = upstream d22b87a87 (sqrt), 1 = full cloud shadow.
 		float WorldShadowPower = 0.5f;

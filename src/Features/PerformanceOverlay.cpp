@@ -18,6 +18,7 @@
  */
 
 #include "PerformanceOverlay.h"
+#include "BuildLabel.h"
 #include "Feature.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTestAggregator.h"
 #include "Features/GrassOptimizations.h"
@@ -36,7 +37,6 @@
 #include "Utils/Game.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
-#include "Utils/OcclusionDryRun.h"
 #include "Utils/UI.h"
 #include <nlohmann/json.hpp>
 
@@ -190,7 +190,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SectionGrass,
 	SectionVram,
 	SectionView,
-	SectionOcclusion,
 	SectionShadows)
 
 static const std::unordered_map<RE::BSShader::Type, std::string> kShaderTypeTooltips = {
@@ -317,8 +316,6 @@ void PerformanceOverlay::SaveSettings(json& j)
 {
 	// Persist all overlay settings to JSON
 	j = this->settings;  // uses NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT
-	// (batch 37a) The occlusion dry run's knobs live with the overlay that shows its numbers.
-	Util::OcclusionDryRun::Save(j["OcclusionDryRun"]);
 }
 
 void PerformanceOverlay::LoadSettings(json& j)
@@ -336,8 +333,6 @@ void PerformanceOverlay::LoadSettings(json& j)
 	this->settings.SmoothingWindow = std::clamp(this->settings.SmoothingWindow, 0.1f, 5.0f);
 	this->settings.TopN = std::clamp(this->settings.TopN, 0, 64);
 	this->settings.DenoiserLogInterval = std::clamp(this->settings.DenoiserLogInterval, 0, 600);
-	if (j.is_object() && j.contains("OcclusionDryRun"))
-		Util::OcclusionDryRun::Load(j["OcclusionDryRun"]);
 	// Ensure history buffers match loaded size
 	this->state.frameTimeHistory.Resize(this->settings.FrameHistorySize);
 	this->state.postFGFrameTimeHistory.Resize(this->settings.FrameHistorySize);
@@ -386,8 +381,6 @@ void PerformanceOverlay::PostPostLoad()
 	// Hooks that only bracket engine calls with a timeline scope; they cost one branch per
 	// call while the overlay table is closed.
 	Util::GpuPhaseTimeline::InstallHooks();
-	// (batch 37a) Occlusion culling phase 0: counts only, never culls. SE 1.5.97 flat only.
-	Util::OcclusionDryRun::Install();
 }
 
 void PerformanceOverlay::DrawOverlay()
@@ -553,9 +546,6 @@ void PerformanceOverlay::DrawOverlay()
 				"How the sun shadow is set up this frame: cascade count and distances, character and lamp shadow maps. "
 				"Their cost is in the Shadows rows of \"Engine passes\"."))
 			DrawShadowInfo();
-		if (Section("Occlusion (dry run)", this->settings.SectionOcclusion,
-				"How many objects an occlusion cull could skip here. Counting only: nothing is ever hidden."))
-			Util::OcclusionDryRun::DrawPanel(menu->IsEnabled);
 		if (Section("Denoiser breakdown", this->settings.SectionDenoiser,
 				"Every pass of the SSRT denoiser chain, timed on its own. Only measured while this section is open."))
 			DrawDenoiserTable(viewCfg);
@@ -1738,7 +1728,7 @@ namespace
 					{ P::DepthObjects, "Objects", "Solid objects: buildings, rocks, clutter, furniture..." },
 					{ P::DepthCharacters, "Characters", "People and creatures." },
 					{ P::DepthTrees, "Trees", "Full-detail trees." },
-					{ P::DepthGrass, "Grass", "Grass blades (alpha-tested). Advanced > Batch 39 can leave grass out of the prepass." },
+					{ P::DepthGrass, "Grass", "Grass blades (alpha-tested)." },
 					{ P::DepthLODLand, "LOD terrain", "Far-away terrain (bLodZPrepass)." },
 					{ P::DepthLODObjects, "LOD objects", "Far-away objects (distant buildings, mountains)." },
 					{ P::DepthLODTrees, "LOD trees", "Far-away tree billboards." },
@@ -1765,7 +1755,7 @@ namespace
 					{ P::FirstPerson, "First person", "Your hands and weapon in first person." },
 				} },
 			// (batch 39, item 1) Split per draw. The cubemap holds only these four kinds of things.
-			{ "Reflections", "The engine's water reflection cubemap (distant water). Advanced > Batch 39 can thin it out.",
+			{ "Reflections", "The engine's water reflection cubemap (distant water); one face per frame.",
 				{
 					{ P::ReflLODLand, "LOD terrain", "Far-away terrain in the reflection (bReflectLODLand)." },
 					{ P::ReflLODObjects, "LOD objects", "Far-away objects in the reflection (bReflectLODObjects)." },
@@ -4037,7 +4027,7 @@ void PerformanceOverlay::FlashMessage(std::string a_text, bool a_error)
 void PerformanceOverlay::ResolveFreezeKeyConflict()
 {
 	// Menu::ProcessInputEventQueue runs the FIRST action bound to a released key and stops, and
-	// the CS menu's own keys come first. A Freeze key equal to one of them (the 36g report: the
+	// the CS menu's own keys come first. A Freeze key equal to one of them (found in testing: the
 	// menu was on F11, the default Freeze key) therefore never froze anything and never wrote a
 	// snapshot; F11 only opened and closed the menu. Move it to a free key and say so.
 	if (capturingFreezeKey || settings.FreezeKey == 0)
@@ -4114,7 +4104,7 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 		m["time_local"] = buf;
 		m["time_unix"] = static_cast<int64_t>(t);
 		m["plugin_version"] = Util::GetFormattedVersion(Plugin::VERSION);
-		m["build"] = "batch37a";
+		m["build"] = kBuildLabel;
 		m["game_version"] = Util::GetFormattedVersion(REL::Module::get().version());
 		m["frozen"] = view.frozen;
 		m["values"] = cfg.showLive ? "live" : (cfg.smooth == PerfView::SmoothMode::Off ? "unsmoothed" : "smoothed");
@@ -4390,11 +4380,8 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 		j["shadows"] = std::move(sh);
 	}
 
-	// ---- occlusion dry run ----
-	j["occlusion"] = Util::OcclusionDryRun::ToJson();
-
-	// ---- (batch 39, items 1-4) reflection cubemap + depth prepass breakdowns, switches ----
-	j["batch39_engine"] = Batch39Engine::DiagnosticsJson();
+	// ---- engine: reflection cubemap + depth prepass breakdowns ----
+	j["engine"] = Batch39Engine::DiagnosticsJson();
 	return j;
 }
 

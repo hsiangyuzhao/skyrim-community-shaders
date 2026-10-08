@@ -8,7 +8,6 @@
 #include "Upscaling/NeuralRendering/Integration.h"
 #include "Upscaling/NeuralRendering/Renderer.h"
 #include "Upscaling/NeuralRendering/Runtime.h"
-#include "Utils/Batch38.h"
 #include "Upscaling/Streamline.h"
 #include "VR.h"
 #include <Windows.h>
@@ -32,16 +31,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	style,
 	useAutoMask,
 	uiCorrection,
-	allowWithFrameGeneration,
 	runBeforeUpscaling,
 	modelResolutionPercent,
-	jitterAwareMotion,
-	padToNetworkGrid,
-	toneMatchedInput,
 	inputPrecision,
 	tonePreservationBefore,
-	tonePreservationAfter,
-	tuningAtCreate)
+	tonePreservationAfter)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Upscaling::Settings,
@@ -343,14 +337,7 @@ void Upscaling::DrawSettings()
 
 		if (nr.enabled) {
 			// Everything that can stop the pass, stated rather than left to a silent no-op.
-			const bool batch38 = Batch38::IsOn();
-			if (!batch38 && d3d12SwapChainActive && IsFrameGenerationRequestedNow()) {
-				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Blocked: Frame Generation is running. Switch it off -- no restart needed.");
-				ImGui::PopStyleColor();
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("Batch 38 is off (Advanced > Batch 38), so the 37c rule applies: no Neural Rendering while Frame Generation runs. Turn Batch 38 on to allow both.");
-			} else if (batch38) {
+			{
 				const auto& frameStatus = NeuralRendering::GetFrameStatus();
 				if (frameStatus.blockedReason[0] != '\0' && std::string_view(frameStatus.blockedReason) != "switched off") {
 					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
@@ -404,16 +391,10 @@ void Upscaling::DrawSettings()
 			ImGui::Checkbox("Auto Mask", &nr.useAutoMask);
 			ImGui::Checkbox("UI Correction", &nr.uiCorrection);
 
-			// (batch 38a) Placement, frame generation and cost. Governed by Advanced > Batch 38.
-			ImGui::SeparatorText("Placement and cost (Batch 38)");
-			if (!Batch38::IsOn())
-				ImGui::TextDisabled("Batch 38 is off (Advanced > Batch 38): these have no effect; 37c behaviour.");
-
-			ImGui::Checkbox("Allow with Frame Generation", &nr.allowWithFrameGeneration);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Lets Neural Rendering run while Frame Generation (DLSS-G, any multiplier) is on. It only processes the real frames; the generated ones are made from its result.");
-				ImGui::TextUnformatted("Off = Neural Rendering stops (and frees its video memory) whenever Frame Generation is on.");
-			}
+			// Placement and cost. Runs alongside Frame Generation (real frames only), pads to the
+			// network grid, applies tuning at creation, and (before upscaling) uses tone-matched
+			// input and jitter-aware motion: all always on.
+			ImGui::SeparatorText("Placement and cost");
 
 			ImGui::Checkbox("Run before upscaling", &nr.runBeforeUpscaling);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -430,22 +411,10 @@ void Upscaling::DrawSettings()
 				ImGui::TextUnformatted("The picture itself stays full resolution: only the model's changes are made smaller and scaled back up (following depth, so edges stay clean). Lower = those changes are softer.");
 			}
 
-			ImGui::Checkbox("Pad to network grid", &nr.padToNetworkGrid);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Gives the AI model a picture whose size is a multiple of 8 (the edge repeated, then cut off again).");
-				ImGui::TextUnformatted("DLSS Balanced renders at 2227x1253, the only preset that is not such a size, and it came out in a different tone. On = every preset behaves the same.");
-			}
-
 			if (nr.runBeforeUpscaling) {
-				ImGui::Checkbox("Tone-matched input (before upscaling)", &nr.toneMatchedInput);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted("On: the model is shown the scene with the game's own exposure and colour grading / tone curve applied, i.e. close to what the finished image looks like. Its changes are converted back exactly.");
-					ImGui::TextUnformatted("Off: the 38a version, a darker and flatter picture the model tends to brighten and re-colour.");
-				}
-				if (nr.toneMatchedInput && Batch38::IsOn())
-					ImGui::TextDisabled("Curve from: %s", NeuralRendering::ToneSourceText());
+				ImGui::TextDisabled("Tone curve from: %s", NeuralRendering::ToneSourceText());
 
-				const char* precisions[] = { "8-bit (38a)", "10-bit", "16-bit float" };
+				const char* precisions[] = { "8-bit", "10-bit", "16-bit float" };
 				int precisionIndex = static_cast<int>(std::min(nr.inputPrecision, 2u));
 				if (ImGui::Combo("Input Precision (before upscaling)", &precisionIndex, precisions, IM_ARRAYSIZE(precisions)))
 					nr.inputPrecision = static_cast<uint>(precisionIndex);
@@ -463,21 +432,7 @@ void Upscaling::DrawSettings()
 				ImGui::TextUnformatted("0 = the model's result as is. 1 = large-scale tone fully locked to the input. Separate values for before and after upscaling (defaults 0.5 and 0).");
 			}
 
-			ImGui::Checkbox("Apply tuning at creation", &nr.tuningAtCreate);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("The model only reads Intensity, the three strengths, Style, Auto Mask and UI Correction when it starts up, so 38a's sliders never reached it.");
-				ImGui::TextUnformatted("On: they are given at start-up, and a change restarts the model about half a second after you stop moving the slider.");
-			}
-
-			if (nr.runBeforeUpscaling) {
-				ImGui::Checkbox("Jitter-Aware Motion (before upscaling)", &nr.jitterAwareMotion);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted("Before upscaling the image still shakes by a fraction of a pixel every frame (DLSS needs that). On: the model is told about the shake, so it does not smear it away.");
-					ImGui::TextUnformatted("Compare on/off only if the image looks softer or shimmers with Run before upscaling on.");
-				}
-			}
-
-			if (Batch38::IsOn()) {
+			{
 				const auto& frameStatus = NeuralRendering::GetFrameStatus();
 				const auto& nrRenderer = NeuralRendering::Renderer::Instance();
 				if (frameStatus.running) {

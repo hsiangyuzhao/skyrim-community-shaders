@@ -13,7 +13,6 @@
 #include "Utils/DenoiserTimers.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
-#include "Utils/OcclusionDryRun.h"
 
 #include "Features/GrassOptimizations.h"
 #include "Features/InteriorSun.h"
@@ -324,20 +323,7 @@ struct IDXGISwapChain_Present
 		// Close the GPU frame timeline right before the real Present and open the next one
 		// right after it, so its chain spans exactly the frame's own rendering.
 		auto* gpuTimeline = Util::GpuPhaseTimeline::GetSingleton();
-		const bool timelineRecorded = gpuTimeline->IsRecording();
 		gpuTimeline->EndFrame();
-		{
-			// (batch 37a) Close the occlusion dry run's frame. Its draw estimate is scaled by this
-			// frame's main-view draws (depth prepass + opaque pass) from the engine table.
-			const auto& draws = gpuTimeline->Get().lastDraws;
-			float mainViewDraws = 0.0f;
-			// (batch 39) The depth prepass is split per object type (DepthPrepass .. DepthLODTrees).
-			for (auto p = static_cast<size_t>(Util::GpuPhase::DepthPrepass); p <= static_cast<size_t>(Util::GpuPhase::DepthLODTrees); ++p)
-				mainViewDraws += draws[p];
-			for (auto p = static_cast<size_t>(Util::GpuPhase::OpaqueTerrain); p <= static_cast<size_t>(Util::GpuPhase::OpaqueOther); ++p)
-				mainViewDraws += draws[p];
-			Util::OcclusionDryRun::OnFrameEnd(static_cast<uint32_t>(mainViewDraws), timelineRecorded);
-		}
 		// (batch 36e) Same frame bracket for the denoiser breakdown's timestamps.
 		auto* denoiserTimers = Util::DenoiserTimers::GetSingleton();
 		denoiserTimers->EndFrame();
@@ -802,6 +788,11 @@ namespace Hooks
 	{
 		static void thunk(RE::BSLightingShader* shader, RE::BSLightingShaderMaterialBase const* material)
 		{
+			// Upstream 5ef413e52: a decal whose textures all failed to load can arrive with a null
+			// material; the vanilla function dereferences it unconditionally.
+			if (!material)
+				return;
+
 			// setup material for PBR
 			auto TruePBRSingleton = globals::truePBR;
 			if (TruePBRSingleton->BSLightingShader_SetupMaterial(shader, material)) {

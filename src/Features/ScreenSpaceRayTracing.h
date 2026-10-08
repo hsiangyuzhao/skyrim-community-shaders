@@ -2,7 +2,6 @@
 #define ENABLE_SHARC
 
 #include "NRD.h"
-#include "Utils/Batch36f.h"
 
 struct ScreenSpaceRayTracing : Feature
 {
@@ -459,25 +458,13 @@ struct ScreenSpaceRayTracing : Feature
         /// estimation, not to blur the signal (the second flag).
         float SpecularPrepassBlurRadius = 50.0f;
         bool UsePrepassOnlyForSpecularMotionEstimation = true;
-        /// @brief (batch 36f, item 1) Skip REBLUR's specular pre-pass: the specular instance
-        /// gets specularPrepassBlurRadius 0, so NRD drops the PrePass dispatch altogether (its
-        /// skipPrePass test in Reblur.cpp). Off = the two settings above, i.e. batch 34/36e.
-        /// The pre-pass was configured for motion estimation only, and the reflection signal fed
-        /// to it is already low-noise. Governed by the Batch 36f master switch.
-        bool ReblurSkipSpecularPrepass = true;
-        /// @brief (batch 36f, item 4) Leave REBLUR's output packed and let the two composites
-        /// (ssrt_diffuse_composite.hlsl for diffuse, DeferredCompositeCS.hlsl for specular)
-        /// decode it in registers, instead of running ssrt_nrd_unpack.hlsl once per chain. The
-        /// decode includes the RGBA16F round trip the unpack pass's store did, so the picture is
-        /// bit-identical. Governed by the Batch 36f master switch.
-        bool ReblurFoldUnpack = true;
         /// @brief (batch 36f, item 2) Distance limit: pixels farther than DistanceLimitMeters are
         /// neither traced nor denoised (NRD denoisingRange), and keep the game's own lighting --
         /// vanilla ambient for diffuse (confidence 0 under ambient reinjection), the cubemap for
         /// reflections. The last 20% of the range fades smoothly. Diffuse needs Ambient
         /// Reinjection on (without it there is no vanilla ambient left to fall back to), so it is
-        /// limited only then; reflections are limited either way. Default off; governed by the
-        /// Batch 36f master switch.
+        /// limited only then; reflections are limited either way. Default off.
+        ///
         bool DistanceLimit = false;
         /// @brief Default 150 m (~10500 game units): about the radius of the loaded cells at
         /// uGridsToLoad = 5 (2.5 cells x 4096 units x 1.428 cm). Beyond it is LOD terrain, where
@@ -1432,10 +1419,13 @@ struct ScreenSpaceRayTracing : Feature
     /// Settings::ReblurFoldUnpack.
     [[nodiscard]] bool RunReblur(bool a_specular, bool a_skipUnpack = false);
 
-    /// @brief (batch 36f) Effective switches: own setting AND the Batch 36f master switch.
-    [[nodiscard]] bool SkipSpecularPrepassActive() const { return Batch36f::IsOn() && settings.ReblurSkipSpecularPrepass; }
-    [[nodiscard]] bool FoldUnpackActive() const { return Batch36f::IsOn() && settings.ReblurFoldUnpack; }
-    [[nodiscard]] bool DistanceLimitActive() const { return Batch36f::IsOn() && settings.DistanceLimit; }
+    /// @brief REBLUR's specular pre-pass is always skipped (the specular instance gets
+    /// specularPrepassBlurRadius 0, so NRD drops the PrePass dispatch), and REBLUR's output is
+    /// always left packed for the two composites to decode in registers (bit-identical to the
+    /// old separate unpack pass). Both frozen on in 40b.
+    [[nodiscard]] static bool SkipSpecularPrepassActive() { return true; }
+    [[nodiscard]] static bool FoldUnpackActive() { return true; }
+    [[nodiscard]] bool DistanceLimitActive() const { return settings.DistanceLimit; }
     /// @brief (batch 36f) Whether the distance limit applies to this chain this frame. Diffuse
     /// needs ambient reinjection: without it the forward ambient is gone (AmbientMult) and a
     /// pixel past the limit would have no ambient at all.

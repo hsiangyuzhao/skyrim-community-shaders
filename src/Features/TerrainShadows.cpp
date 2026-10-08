@@ -29,7 +29,7 @@ void TerrainShadows::DrawSettings()
 	ImGui::Checkbox("Enable Terrain Shadow", &settings.EnableTerrainShadow);
 
 	// (batch 40) Upstream fixes, each switchable for A/B; off = the batch 39 behaviour.
-	ImGui::SeparatorText("Fixes (Batch 40)");
+	ImGui::SeparatorText("Fixes");
 	ImGui::Checkbox("Stable Soft Edges", &settings.StablePenumbrae);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::TextUnformatted(

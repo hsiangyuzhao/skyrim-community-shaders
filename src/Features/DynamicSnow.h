@@ -39,8 +39,8 @@
  *   left to its decals by default. Ragdolls and loose objects carve trenches from their Havok
  *   shapes (after community-shaders PR #2659).
  *
- * Every switch is ANDed with Batch39::IsOn(); with the master off nothing is built or bound and
- * Lighting.hlsl skips the whole block (Flags == 0): the 38b path.
+ * With both switches off nothing is built or bound and Lighting.hlsl skips the whole block
+ * (Flags == 0).
  */
 struct DynamicSnow : Feature
 {
@@ -55,7 +55,7 @@ public:
 	{
 		return {
 			"Snow builds up on the ground, roofs and rocks while it snows and melts away afterwards, "
-			"and people and creatures leave footprints in snow (Batch 39).",
+			"and people and creatures leave footprints in snow.",
 			{ "Snow builds up on upward-facing surfaces while it snows, not under roofs",
 				"Melts gradually after the snow stops",
 				"Snow on trees, bushes, grass and distant trees",
@@ -101,7 +101,6 @@ public:
 		bool MudTrails = false;           ///< any other terrain, as mud/dirt
 		bool TrailsFromNPCs = true;       ///< nearby actors and creatures, not only the player
 		int TrailResolution = 1;          ///< 0 = 1024 texels (4 units each), 1 = 2048 (2 units each), 2 = 4096 (1 unit each)
-		bool SmoothTrails = true;         ///< (39b) bicubic reconstruction; off = 39a's bilinear (mosaic)
 		bool DetectAuthoredSnow = true;   ///< (39b) snow ground recognised from its land texture (PBR terrain too) and white directional snow
 		bool AlbedoSnowGuess = false;     ///< (39b) also bright grey-white terrain (last resort)
 		bool SnowOnCharacters = false;    ///< (39b) accumulated snow on actors and their gear
@@ -220,7 +219,7 @@ public:
 	static constexpr float kTrailZWrap = 1024.0f;        ///< mirrors DynamicSnow::kTrailZWrap (HLSL)
 	static constexpr uint32_t kMaxStamps = 512;  ///< (39c) 256 -> 512: body and object trenches too
 
-	// ---- Diagnostics (menu, Batch 39 table) ----
+	// ---- Diagnostics (menu) ----
 	struct Status
 	{
 		bool exterior = false;

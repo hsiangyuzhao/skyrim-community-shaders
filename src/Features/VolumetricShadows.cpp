@@ -5,7 +5,6 @@
 #include "Menu.h"
 #include "State.h"
 #include "Util.h"
-#include "Utils/Batch38.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -27,12 +26,12 @@ bool VolumetricShadows::HasShaderDefine(RE::BSShader::Type shaderType)
 
 bool VolumetricShadows::ParticleShadowsActive() const
 {
-	return loaded && Batch38::IsOn() && settings.ParticleShadows;
+	return loaded && settings.ParticleShadows;
 }
 
 bool VolumetricShadows::ForwardSoftShadowsActive() const
 {
-	return loaded && Batch38::IsOn() && settings.ForwardSoftShadows;
+	return loaded && settings.ForwardSoftShadows;
 }
 
 bool VolumetricShadows::WantsVsm() const
@@ -274,10 +273,7 @@ void VolumetricShadows::OnShadowCapture(ID3D11ShaderResourceView* a_shadowMap)
 
 void VolumetricShadows::DrawSettings()
 {
-	const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
-	ImGui::SeparatorText("Batch 38");
-	if (!Batch38::IsOn())
-		ImGui::TextColored(palette.Warning, "Off: Advanced > Batch 38 master switch is off (37c behaviour).");
+	ImGui::SeparatorText("Smoke & Forward Shadows");
 
 	ImGui::Checkbox("Smoke & Particles Receive Sun Shadow", &settings.ParticleShadows);
 	if (auto _tt = Util::HoverTooltipWrapper())

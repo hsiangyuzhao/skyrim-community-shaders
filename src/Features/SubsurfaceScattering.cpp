@@ -4,7 +4,6 @@
 #include "Features/TerrainBlending.h"
 #include "ShaderCache.h"
 #include "State.h"
-#include "Utils/Batch38.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SubsurfaceScattering::DiffusionProfile,
@@ -15,7 +14,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	EnableCharacterLighting,
 	CharacterLightingStrength,
 	SSMode,
-	Batch38Upgrade,
 	ScatterMode,
 	BaseProfile,
 	HumanProfile,
@@ -277,7 +275,7 @@ void SubsurfaceScattering::DrawSSS()
 
 		ID3D11ShaderResourceView* views[5];
 		views[0] = main.SRV;
-		views[1] = terrainBlending.loaded ? terrainBlending.blendedDepthTexture16->srv.get() : depth.depthSRV;
+		views[1] = terrainBlending.IsBlendingActive() ? terrainBlending.blendedDepthTexture16->srv.get() : depth.depthSRV;
 		views[2] = mask.SRV;
 		views[3] = albedo.SRV;
 		views[4] = normal.SRV;
@@ -373,24 +371,13 @@ void SubsurfaceScattering::DrawSSS()
 
 bool SubsurfaceScattering::UpgradeActive() const
 {
-	return Batch38::IsOn() && settings.Batch38Upgrade;
+	return true;
 }
 
 void SubsurfaceScattering::DrawBatch38Settings()
 {
-	ImGui::Checkbox("SSS upgrade (Batch 38)", &settings.Batch38Upgrade);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Batch 38, on by default. Takes the skin colour out of the light before blurring and puts it back after, so the\n"
-			"scatter spreads light instead of smearing skin texture (pores, freckles, brows stay sharp). Also fixes skin\n"
-			"getting darker with Linear Lighting on, and makes the blur width the same in DLAA and DLSS Quality.\n"
-			"Off = the 37c skin scatter. Adds a pre-pass but drops 37c's full-screen copy and composite, so it should cost\n"
-			"about the same or less (compare Subsurface Scattering + SSS Pre-pass (38) in the performance overlay).");
-	Batch38::MasterNote();
-
 	if (settings.SSMode == 0) {
-		ImGui::BeginDisabled(!UpgradeActive());
-		ImGui::Text("Albedo Handling (SSS upgrade)");
+		ImGui::Text("Albedo Handling");
 		ImGui::RadioButton("Pre-scatter", &settings.ScatterMode, kPreScatter);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Blur the lit colour directly. Blurs skin texture detail along with the light.");
@@ -402,7 +389,6 @@ void SubsurfaceScattering::DrawBatch38Settings()
 		ImGui::RadioButton("Pre and Post", &settings.ScatterMode, kPreAndPostScatter);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Half of the skin colour before the blur, half after (square root on each side). The default, a middle ground.");
-		ImGui::EndDisabled();
 	}
 	ImGui::Spacing();
 }
@@ -431,7 +417,7 @@ void SubsurfaceScattering::DrawSSSUpgrade(const Util::DispatchCount& a_dispatchC
 	timers->End(Util::GpuBucket::SubsurfaceScattering);
 	timers->Begin(Util::GpuBucket::SubsurfaceScatteringPrepass);
 	{
-		TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Prepass (38)");
+		TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Prepass");
 
 		ID3D11UnorderedAccessView* uav = diffuseNoAlbedoTex->uav.get();
 		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
@@ -454,7 +440,7 @@ void SubsurfaceScattering::DrawSSSUpgrade(const Util::DispatchCount& a_dispatchC
 
 	if (settings.SSMode == 0) {
 		{
-			TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Horizontal (38)");
+			TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Horizontal");
 			ID3D11UnorderedAccessView* uav = blurHorizontalTemp->uav.get();
 			context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 			context->CSSetShader(GetComputeShaderHorizontalBlurV2(), nullptr, 0);
@@ -463,7 +449,7 @@ void SubsurfaceScattering::DrawSSSUpgrade(const Util::DispatchCount& a_dispatchC
 			context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 		}
 		{
-			TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Vertical (38)");
+			TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Vertical");
 			colorSrv = blurHorizontalTemp->srv.get();
 			context->CSSetShaderResources(0, 1, &colorSrv);
 			context->CSSetUnorderedAccessViews(0, 2, outUavs, nullptr);
@@ -472,7 +458,7 @@ void SubsurfaceScattering::DrawSSSUpgrade(const Util::DispatchCount& a_dispatchC
 			context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
 		}
 	} else {
-		TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Burley (38)");
+		TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Burley");
 		context->CSSetUnorderedAccessViews(0, 2, outUavs, nullptr);
 		context->CSSetShader(GetComputeShaderBurleyV2(), nullptr, 0);
 		context->Dispatch(a_dispatchCount.x, a_dispatchCount.y, 1);
