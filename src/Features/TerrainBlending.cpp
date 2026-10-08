@@ -5,6 +5,47 @@
 #include "State.h"
 #include "Utils/GpuTimers.h"
 
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+	TerrainBlending::Settings,
+	Enabled)
+
+void TerrainBlending::DrawSettings()
+{
+	bool enabled = settings.Enabled != 0;
+	if (ImGui::Checkbox("Enable Terrain Blending", &enabled))
+		settings.Enabled = enabled;
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Blends objects (rocks, roads, buildings) smoothly into the terrain where they meet the ground.");
+		ImGui::Text("When off, the extra terrain depth passes are skipped and every effect uses the original depth.");
+	}
+}
+
+void TerrainBlending::LoadSettings(json& o_json)
+{
+	settings = o_json;
+}
+
+void TerrainBlending::SaveSettings(json& o_json)
+{
+	o_json = settings;
+}
+
+void TerrainBlending::RestoreDefaultSettings()
+{
+	settings = {};
+}
+
+namespace
+{
+	// Upstream c46d623fd: RE::BSGraphics::State::SetCameraData (not in our CommonLib revision).
+	void SetGraphicsStateCameraData(const RE::NiCamera* a_camera, std::uint32_t a_flags)
+	{
+		using func_t = void (*)(RE::BSGraphics::State*, const RE::NiCamera*, std::uint32_t);
+		static REL::Relocation<func_t> func{ RELOCATION_ID(75694, 77503) };
+		func(globals::game::graphicsState, a_camera, a_flags);
+	}
+}
+
 ID3D11VertexShader* TerrainBlending::GetTerrainVertexShader()
 {
 	if (!terrainVertexShader) {
@@ -242,9 +283,14 @@ void TerrainBlending::Hooks::Main_RenderDepth::thunk(bool a1, bool a2)
 	auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 	auto& zPrepassCopy = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 
+	// Upstream c46d623fd: make sure the camera constants are current before the terrain depth draw.
+	// Without Volumetric Lighting nothing else refreshes them here and the blend is misaligned.
+	if (globals::game::graphicsState)
+		SetGraphicsStateCameraData(RE::Main::WorldRootCamera(), 1);
+
 	singleton.averageEyePosition = Util::GetAverageEyePosition();
 
-	if (shaderCache->IsEnabled()) {
+	if (shaderCache->IsEnabled() && singleton.settings.Enabled) {
 		mainDepth.depthSRV = singleton.blendedDepthTexture->srv.get();
 		zPrepassCopy.depthSRV = singleton.blendedDepthTexture->srv.get();
 
@@ -274,13 +320,13 @@ void TerrainBlending::Hooks::BSBatchRenderer__RenderPassImmediately::thunk(RE::B
 	auto& singleton = globals::features::terrainBlending;
 	auto shaderCache = globals::shaderCache;
 
-	if (shaderCache->IsEnabled()) {
+	if (shaderCache->IsEnabled() && singleton.settings.Enabled) {
 		if (singleton.renderDepth) {
 			// Entering or exiting terrain depth section
 			bool inTerrain = a_pass->shaderProperty && a_pass->shaderProperty->flags.all(RE::BSShaderProperty::EShaderPropertyFlag::kMultiTextureLandscape);
 
 			if (inTerrain) {
-				if ((a_pass->geometry->worldBound.center.GetDistance(singleton.averageEyePosition) - a_pass->geometry->worldBound.radius) > 2048.0f) {
+				if ((a_pass->geometry->worldBound.center.GetDistance(singleton.averageEyePosition) - a_pass->geometry->worldBound.radius) > 1024.0f) {  // upstream 93def6b33: 2048 -> 1024
 					inTerrain = false;
 				}
 			}

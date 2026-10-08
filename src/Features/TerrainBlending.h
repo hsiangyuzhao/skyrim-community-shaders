@@ -20,6 +20,25 @@ public:
 	}
 	virtual inline bool HasShaderDefine(RE::BSShader::Type) override { return true; }
 
+	// Upstream df531ac78: runtime enable switch. Mirrored into the FeatureData cbuffer
+	// (SharedData::terrainBlendingSettings) so Lighting.hlsl can skip the blend when off.
+	struct Settings
+	{
+		uint32_t Enabled = true;
+		uint32_t pad[3] = { 0, 0, 0 };
+	};
+	STATIC_ASSERT_ALIGNAS_16(Settings);
+
+	Settings settings;
+
+	virtual void DrawSettings() override;
+	virtual void LoadSettings(json& o_json) override;
+	virtual void SaveSettings(json& o_json) override;
+	virtual void RestoreDefaultSettings() override;
+
+	/// True when the blended depth replaces the original depth for downstream readers.
+	bool IsBlendingActive() const { return loaded && settings.Enabled; }
+
 	virtual void SetupResources() override;
 
 	ID3D11VertexShader* GetTerrainVertexShader();

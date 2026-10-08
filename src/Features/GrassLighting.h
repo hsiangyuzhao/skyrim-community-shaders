@@ -38,7 +38,8 @@ public:
 		// Only consumed by the GRASS_OPTIMIZATIONS permutation, for grass drawn with an LOD mesh.
 		float MidLODBrightness = 1.0f;
 		float FarLODBrightness = 1.0f;
-		uint pad0 = 0;
+		// (batch 40b, upstream a01d4713b) RunGrass: |length(normal-map row) - 1| below this marks complex grass.
+		float ComplexGrassThreshold = 0.03f;
 	};
 	STATIC_ASSERT_ALIGNAS_16(Settings);
 

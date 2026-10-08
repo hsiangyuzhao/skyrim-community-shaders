@@ -10,7 +10,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	OverrideComplexGrassSettings,
 	BasicGrassBrightness,
 	MidLODBrightness,
-	FarLODBrightness)
+	FarLODBrightness,
+	ComplexGrassThreshold)
 
 void GrassLighting::DrawSettings()
 {
@@ -24,6 +25,13 @@ void GrassLighting::DrawSettings()
 		ImGui::SliderFloat("Specular Strength", &settings.SpecularStrength, 0.0f, 1.0f);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Specular highlight strength.");
+		}
+
+		ImGui::Spacing();
+		ImGui::TextWrapped("Complex Grass Detection");
+		ImGui::SliderFloat("Detection Threshold", &settings.ComplexGrassThreshold, 0.001f, 0.1f, "%.3f");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("How strictly a grass texture is recognised as \"complex grass\" (grass with its own lighting data). Lower is stricter. Default 0.030.");
 		}
 
 		ImGui::Spacing();
