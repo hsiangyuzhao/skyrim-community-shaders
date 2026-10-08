@@ -56,6 +56,11 @@ public:
 	std::array<float, NumTiles> specularLevels;
 
 	std::array<GlintParameters, NumTiles> glintParameters;
+
+	/// (batch 39b) Dynamic Snow: the tile's land texture is snow -- the LTEX "is snow" flag (what the
+	/// vanilla landscape material's textureIsSnow is set from), a snow material type, or "snow" in
+	/// its diffuse path. Passed to the shader in PBRFlags bits 24..29 (PBR::TerrainFlags::LandTile0IsSnow).
+	std::array<bool, NumTiles> isSnow{};
 };
 static_assert(offsetof(BSLightingShaderMaterialPBRLandscape, terrainOverlayTexture) == offsetof(RE::BSLightingShaderMaterialLandscape, terrainOverlayTexture));
 static_assert(offsetof(BSLightingShaderMaterialPBRLandscape, terrainNoiseTexture) == offsetof(RE::BSLightingShaderMaterialLandscape, terrainNoiseTexture));

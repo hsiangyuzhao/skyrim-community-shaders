@@ -24,6 +24,11 @@ namespace DynamicSnow
 	static const uint FlagTrailsOnSnow = 1 << 2;      // prints on landscape snow and snow materials
 	static const uint FlagTrailsOnAccumulated = 1 << 3;  // prints on accumulated snow
 	static const uint FlagMudTrails = 1 << 4;         // prints on non-snow terrain
+	// (batch 39b)
+	static const uint FlagSmoothTrails = 1 << 5;        // bicubic trail reconstruction (39a: bilinear)
+	static const uint FlagLandSnowDetect = 1 << 6;      // authored snow recognised from the land texture / projected snow
+	static const uint FlagAlbedoSnowGuess = 1 << 7;     // bright, grey-white ground counts as snow too
+	static const uint FlagSnowOnCharacters = 1 << 8;    // accumulated snow on actors and what they wear
 
 	// Height is stored modulo this many units. Two surfaces exactly a multiple of it apart
 	// (14.6 m) would share prints; anything else is told apart by TrailZTolerance.
@@ -80,6 +85,18 @@ namespace DynamicSnow
 		float coverage = smoothstep(t - 0.1, t + 0.1, h) * saturate(slope * 3.0);
 
 		return coverage * s.MaxCoverage * skyVisibility;
+	}
+
+	// (batch 39b) Last-resort snow test from the colour alone (FlagAlbedoSnowGuess): bright and
+	// close to grey-white. Only used on terrain and on the projected (directional) layer of
+	// rocks and mountains, where white means snow far more often than not.
+	float AlbedoSnowGuess(float3 color)
+	{
+		float mx = max(color.r, max(color.g, color.b));
+		float mn = min(color.r, min(color.g, color.b));
+		float lum = dot(color, float3(0.2126, 0.7152, 0.0722));
+		float sat = (mx - mn) / max(mx, 1e-3);
+		return smoothstep(0.35, 0.55, lum) * (1.0 - smoothstep(0.12, 0.3, sat));
 	}
 
 	struct TrailSample
@@ -147,6 +164,77 @@ namespace DynamicSnow
 		return o;
 	}
 
+	// (batch 39b) Smooth reconstruction of the trail map. 39a read it bilinearly and took the
+	// slope from the four texels' differences, which is constant across each texel: the
+	// print's normal jumped at every texel edge and the print looked like a mosaic. Now a
+	// uniform cubic B-spline over the 4x4 texels around the point: the strength and its
+	// slope are both continuous (C2 / C1), so the normal derived from it varies smoothly and
+	// no texel grid shows, at any DLSS jitter offset. The idea of a B-spline-filtered field
+	// for the print normal follows community-shaders PR #2659 (PppPlyr1, "Snow
+	// Deformation"); that PR samples a filterable float map with 4 bilinear taps, here the
+	// map stays R32_UINT (strength + foot height, for the per-surface height test) so the
+	// 16 texels are loaded and decoded one by one.
+	TrailSample SampleTrailBicubic(float2 positionXY, float z)
+	{
+		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
+		TrailSample o;
+		o.pressed = 0;
+		o.gradient = 0;
+		o.any = false;
+
+		float2 t = (positionXY - s.TrailOrigin) / s.TrailTexelSize - 0.5;
+		float size = float(s.TrailMapSize);
+		float2 edge = min(t + 0.5, size - (t + 0.5));
+		float fade = saturate((min(edge.x, edge.y) - 2.0) / max(s.TrailEdgeFade, 1.0));
+		[branch] if (fade <= 0.0) return o;
+
+		float2 tf = floor(t);
+		float2 f = t - tf;
+		int2 i0 = int2(tf) - 1;
+
+		uint raw[16];
+		uint anyBits = 0;
+		[unroll] for (int ly = 0; ly < 4; ++ly)
+		{
+			[unroll] for (int lx = 0; lx < 4; ++lx)
+			{
+				uint v = LoadTrailTexel(i0 + int2(lx, ly));
+				raw[ly * 4 + lx] = v;
+				anyBits |= v;
+			}
+		}
+		o.any = anyBits >= 0x10000;
+		[branch] if (!o.any) return o;
+
+		// Cubic B-spline weights and their derivatives (per texel).
+		float2 f2 = f * f;
+		float2 f3 = f2 * f;
+		float2 g = 1.0 - f;
+		float2 w[4] = { g * g * g / 6.0, (3.0 * f3 - 6.0 * f2 + 4.0) / 6.0, (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0) / 6.0, f3 / 6.0 };
+		float2 dw[4] = { -0.5 * g * g, 1.5 * f2 - 2.0 * f, -1.5 * f2 + f + 0.5, 0.5 * f2 };
+
+		float value = 0.0;
+		float2 grad = 0.0;
+		[unroll] for (int y = 0; y < 4; ++y)
+		{
+			float row = 0.0;
+			float rowD = 0.0;
+			[unroll] for (int x = 0; x < 4; ++x)
+			{
+				float v = DecodeTrailTexel(raw[y * 4 + x], z);
+				row += w[x].x * v;
+				rowD += dw[x].x * v;
+			}
+			value += w[y].y * row;
+			grad.x += w[y].y * rowD;
+			grad.y += dw[y].y * row;
+		}
+
+		o.pressed = saturate(value) * fade;
+		o.gradient = grad * (fade / s.TrailTexelSize);
+		return o;
+	}
+
 	/**
 	 * Print strength at a surface point, with one step of parallax so the print reads as a
 	 * dent rather than a decal: the lookup is shifted along the view ray by the print's depth.
@@ -154,15 +242,22 @@ namespace DynamicSnow
 	 * @param positionWS absolute world position
 	 * @param viewDirectionWS surface -> camera, normalised
 	 */
+	TrailSample SampleTrailAt(float2 positionXY, float z)
+	{
+		[branch] if (SharedData::dynamicSnowSettings.Flags & FlagSmoothTrails)
+			return SampleTrailBicubic(positionXY, z);
+		return SampleTrailBilinear(positionXY, z);
+	}
+
 	TrailSample SampleTrail(float3 positionWS, float3 viewDirectionWS)
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
-		TrailSample o = SampleTrailBilinear(positionWS.xy, positionWS.z);
+		TrailSample o = SampleTrailAt(positionWS.xy, positionWS.z);
 		[branch] if (o.any && o.pressed > 1e-3)
 		{
 			float h = o.pressed * s.TrailDepth;
 			float2 offset = -viewDirectionWS.xy * (h / max(viewDirectionWS.z, 0.3));
-			TrailSample p = SampleTrailBilinear(positionWS.xy + offset, positionWS.z);
+			TrailSample p = SampleTrailAt(positionWS.xy + offset, positionWS.z);
 			if (p.any)
 				o = p;
 		}

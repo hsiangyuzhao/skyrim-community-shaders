@@ -80,7 +80,9 @@ RWTexture2D<uint> TrailMap : register(u0);
 			float2 d = float2(x, y) + 0.5 - st.Center;
 			float2 local = float2(dot(d, st.Axis), dot(d, side)) * invRadii;
 			float e = length(local);
-			float w = (1.0 - smoothstep(0.5, 1.0, e)) * st.Strength;
+			// (batch 39b) Softer wall: 39a went from full depth to none over the outer half of the
+			// radius (one or two texels on a human print), a step the smooth read-out then had to hide.
+			float w = (1.0 - smoothstep(0.3, 1.0, e)) * st.Strength;
 			if (w <= 0.0)
 				continue;
 			uint v = (uint(saturate(w) * 65535.0 + 0.5) << 16) | (st.Z16 & 0xFFFF);

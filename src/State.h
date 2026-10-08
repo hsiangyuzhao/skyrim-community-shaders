@@ -213,7 +213,11 @@ public:
 		// draws while that moon is in its new phase and "Hide New Moon Disc" is on. The vanilla
 		// new-moon textures (masser_new.dds / secunda_new.dds) are solid opaque black, so the
 		// game draws a black disc over the stars; the Sky PS discards these draws instead.
-		IsNewMoon = 1 << 10
+		IsNewMoon = 1 << 10,
+		// (batch 39b) Set per draw by the BSLightingShader::SetupGeometry hook in Hooks.cpp: the
+		// geometry is skinned or belongs to an actor (body, worn armour and clothing, weapons and
+		// anything else attached to the actor's 3D). Dynamic Snow keeps its snow off these.
+		IsActorGeometry = 1 << 11
 	};
 
 	enum class ExtraFeatureDescriptors : uint32_t

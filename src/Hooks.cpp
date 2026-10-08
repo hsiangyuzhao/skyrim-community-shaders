@@ -236,12 +236,21 @@ namespace LightingExtensions
 
 			auto state = globals::state;
 
-			state->permutationData.ExtraShaderDescriptor &= ~static_cast<uint32_t>(State::ExtraShaderDescriptors::IsTree);
+			state->permutationData.ExtraShaderDescriptor &= ~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsTree) |
+																static_cast<uint32_t>(State::ExtraShaderDescriptors::IsActorGeometry));
 
-			if (auto userData = pass->geometry->GetUserData())
+			auto userData = pass->geometry->GetUserData();
+			if (userData)
 				if (auto baseObject = userData->GetBaseObject())
 					if (baseObject->As<RE::TESObjectTREE>())
 						state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsTree);
+
+			// (batch 39b) Actor geometry for Dynamic Snow: skinned meshes (bodies, worn armour and
+			// clothing, also on the first-person arms) and everything else hanging off an actor's
+			// 3D (helmets and weapons that are not skinned, quivers, arrows stuck in them).
+			// GetUserData walks up to the actor's root node.
+			if (pass->geometry->GetGeometryRuntimeData().skinInstance || (userData && userData->Is(RE::FormType::ActorCharacter)))
+				state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsActorGeometry);
 
 			state->permutationData.ExtraShaderDescriptor &= ~static_cast<uint32_t>(State::ExtraShaderDescriptors::IsLODGrass);
 

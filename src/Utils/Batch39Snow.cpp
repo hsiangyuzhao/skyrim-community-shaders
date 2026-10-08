@@ -61,6 +61,9 @@ namespace Batch39
 			std::format("{:.1f} h / {:.1f} h (game time)", s.AccumulationHours, s.MeltHours), kWhere));
 		a_rows.push_back(Value(group, "  Max coverage / normal threshold", installed, s.EnableAccumulation,
 			std::format("{:.2f} / {:.2f}", s.MaxCoverage, s.NormalThreshold), kWhere));
+		a_rows.push_back(Toggle(group, "  Snow on characters (39b, default Off)", installed, s.SnowOnCharacters, "", kWhere));
+		a_rows.push_back(Toggle(group, "  Recognise snowy ground: land texture, PBR terrain (39b)", installed, s.DetectAuthoredSnow, "", kWhere));
+		a_rows.push_back(Toggle(group, "  ... also guess from colour (39b, default Off)", installed, s.AlbedoSnowGuess, "", kWhere));
 	}
 
 	void RowsSnowTrails(std::vector<Row>& a_rows)
@@ -96,8 +99,9 @@ namespace Batch39
 		a_rows.push_back(Value(group, "  Surfaces", installed, s.EnableTrails, surfaces.empty() ? "none" : surfaces, kWhere));
 		a_rows.push_back(Value(group, "  Size / depth / refill", installed, s.EnableTrails,
 			std::format("{:.2f}x / {:.1f} units / {:.0f} s", s.TrailSize, s.TrailDepth, s.TrailRefillSeconds), kWhere));
-		const uint32_t size = s.TrailResolution == 0 ? 1024u : 2048u;
+		const uint32_t size = 1024u << std::clamp(s.TrailResolution, 0, 2);
 		a_rows.push_back(Value(group, "  Trail map", installed, s.EnableTrails,
 			std::format("{0}x{0}, {1:.0f} units per texel, 58 m across", size, DynamicSnow::kTrailWindowUnits / static_cast<float>(size)), kWhere));
+		a_rows.push_back(Toggle(group, "  Smooth footprints (bicubic, 39b)", installed, s.SmoothTrails, "", kWhere));
 	}
 }

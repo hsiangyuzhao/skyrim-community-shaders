@@ -2317,7 +2317,49 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float snowExisting = 0.0;
 #		endif
 
-		[branch] if (snowFlags & DynamicSnow::FlagAccumulation)
+		// (batch 39b) Characters, creatures and everything attached to them or worn by them
+		// (Hooks.cpp sets IsActorGeometry per draw; the SKINNED macro this block used to rely on
+		// never reaches a pixel shader, the engine strips it from pixel descriptors).
+		const bool snowOnActor = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsActorGeometry) != 0;
+
+		// (batch 39b) Authored snow the material path above does not report. 39a only had
+		// psout.Parameters.y, which exists only in SNOW permutations: True PBR terrain (every
+		// landscape with a PBR texture set, e.g. Vanaheimr Landscapes) has no SNOW permutation and
+		// no per-layer snow constants, so High Hrothgar's snow counted as bare ground (mud).
+		[branch] if ((snowFlags & DynamicSnow::FlagLandSnowDetect) && !snowOnActor)
+		{
+			float authoredSnow = 0.0;
+#		if defined(LANDSCAPE)
+			float4 snowLayerW1 = input.LandBlendWeights1;
+			float2 snowLayerW2 = input.LandBlendWeights2.xy;
+#			if defined(TRUE_PBR)
+			// TruePBR.cpp puts each tile's "is snow" (LTEX flag / snow material / "snow" texture
+			// set) into PBRFlags bits 24..29.
+			const uint snowTiles = PBRFlags >> 24;
+			float4 snowLayer1 = float4((snowTiles >> uint4(0, 1, 2, 3)) & 1);
+			float2 snowLayer2 = float2((snowTiles >> uint2(4, 5)) & 1);
+#			else
+			// The engine's own per-layer flags (LTEX "is snow"), also outside SNOW permutations.
+			float4 snowLayer1 = saturate(LandscapeTexture1to4IsSnow);
+			float2 snowLayer2 = saturate(LandscapeTexture5to6IsSnow.xy);
+#			endif
+			float snowLayerTotal = dot(snowLayerW1, float4(1, 1, 1, 1)) + snowLayerW2.x + snowLayerW2.y;
+			authoredSnow = (dot(snowLayerW1, snowLayer1) + dot(snowLayerW2, snowLayer2)) / max(snowLayerTotal, 1e-3);
+#		endif
+#		if defined(PROJECTED_UV)
+			// Directional snow on rocks and mountains. The same projection also lays moss, so only
+			// a white projected layer counts.
+			float projectedSnow = saturate(max(projectedMaterialWeight, projWeight));
+			authoredSnow = max(authoredSnow, projectedSnow * DynamicSnow::AlbedoSnowGuess(baseColor.xyz));
+#		endif
+#		if defined(LANDSCAPE)
+			if (snowFlags & DynamicSnow::FlagAlbedoSnowGuess)
+				authoredSnow = max(authoredSnow, DynamicSnow::AlbedoSnowGuess(baseColor.xyz));
+#		endif
+			snowExisting = max(snowExisting, saturate(authoredSnow));
+		}
+
+		[branch] if ((snowFlags & DynamicSnow::FlagAccumulation) && (!snowOnActor || (snowFlags & DynamicSnow::FlagSnowOnCharacters)))
 		{
 			float snowCoverage = DynamicSnow::GetCoverage(snowPositionWS, worldNormal, snowGeometryNormal, 1.0, length(input.WorldPosition.xyz));
 			[branch] if (snowCoverage > 0.0)
@@ -2357,7 +2399,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			}
 		}
 
-		[branch] if (snowFlags & DynamicSnow::FlagTrails)
+		[branch] if ((snowFlags & DynamicSnow::FlagTrails) && !snowOnActor)
 		{
 			float trailSnow = 0.0;
 			if (snowFlags & DynamicSnow::FlagTrailsOnSnow)

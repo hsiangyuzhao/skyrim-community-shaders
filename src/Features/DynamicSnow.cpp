@@ -28,6 +28,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	MudTrails,
 	TrailsFromNPCs,
 	TrailResolution,
+	SmoothTrails,
+	DetectAuthoredSnow,
+	AlbedoSnowGuess,
+	SnowOnCharacters,
 	TrailSize,
 	TrailDepth,
 	TrailRefillSeconds,
@@ -286,8 +290,11 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 
 	const float drawnAmount = settings.OverrideAmount ? std::clamp(settings.AmountOverride, 0.0f, 1.0f) : amount;
 	data.Amount = drawnAmount;
-	if (AccumulationActive() && status.exterior && drawnAmount > 0.0f)
+	if (AccumulationActive() && status.exterior && drawnAmount > 0.0f) {
 		data.Flags |= FlagAccumulation;
+		if (settings.SnowOnCharacters)
+			data.Flags |= FlagSnowOnCharacters;
+	}
 
 	// Prints are drawn only once the map holds this window's content (cleared at least once
 	// by a Prepass); the first frame after enabling simply has none.
@@ -299,6 +306,15 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 			data.Flags |= FlagTrailsOnAccumulated;
 		if (settings.MudTrails)
 			data.Flags |= FlagMudTrails;
+		if (settings.SmoothTrails)
+			data.Flags |= FlagSmoothTrails;
+	}
+	// Authored-snow recognition matters to both halves: accumulation leaves authored snow as it
+	// is, and prints there are snow prints, not mud.
+	if (data.Flags != 0 && settings.DetectAuthoredSnow) {
+		data.Flags |= FlagLandSnowDetect;
+		if (settings.AlbedoSnowGuess)
+			data.Flags |= FlagAlbedoSnowGuess;
 	}
 
 	data.TrailMapSize = trailMapSize ? trailMapSize : 1;
@@ -375,7 +391,7 @@ void DynamicSnow::ClearShaderCache()
 
 bool DynamicSnow::EnsureTrailResources()
 {
-	const uint32_t wantedSize = settings.TrailResolution == 0 ? 1024u : 2048u;
+	const uint32_t wantedSize = 1024u << std::clamp(settings.TrailResolution, 0, 2);
 	if (trailTexture && trailMapSize == wantedSize)
 		return true;
 	ReleaseTrailResources();
@@ -787,6 +803,11 @@ void DynamicSnow::DrawSettings()
 				"How flat a surface must be to hold snow. %.2f is about %.0f degrees from level;\n"
 				"higher = only flatter surfaces get snow.",
 				settings.NormalThreshold, std::acos(std::clamp(settings.NormalThreshold, 0.0f, 1.0f)) * 57.2958f);
+		ImGui::Checkbox("Snow on Characters", &settings.SnowOnCharacters);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Off (default): people, creatures and everything they wear or carry stay free of built-up snow.\n"
+				"On: their upward-facing parts (shoulders, hoods) get snow like the ground does.");
 
 		if (ImGui::TreeNodeEx("Snow Look")) {
 			ImGui::ColorEdit3("Snow Colour", &settings.SnowColor.x);
@@ -849,10 +870,32 @@ void DynamicSnow::DrawSettings()
 		ImGui::BeginDisabled(!settings.MudTrails);
 		ImGui::SliderFloat("Mud Strength", &settings.MudStrength, 0.0f, 1.0f, "%.2f");
 		ImGui::EndDisabled();
-		const char* resolutions[] = { "1024 (4 units per texel, 4 MB)", "2048 (2 units per texel, 16 MB)" };
-		ImGui::Combo("Trail Map Detail", &settings.TrailResolution, resolutions, 2);
+		ImGui::Checkbox("Smooth Footprints", &settings.SmoothTrails);
 		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("Detail of the footprint map around the player (always 58 m across). Changing it clears existing prints.");
+			ImGui::TextUnformatted(
+				"Reads the footprint map with a smooth (bicubic) filter, so the print's edges and slopes are soft\n"
+				"instead of showing the map's square grid (the 'mosaic' look). Off = the 39a reading, for comparison.");
+		const char* resolutions[] = { "1024 (4 units per texel, 4 MB)", "2048 (2 units per texel, 16 MB)", "4096 (1 unit per texel, 64 MB)" };
+		ImGui::Combo("Trail Map Detail", &settings.TrailResolution, resolutions, 3);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Detail of the footprint map around the player (always 58 m across). Changing it clears existing prints.\n"
+				"4096 gives the sharpest prints; it costs 64 MB of video memory and its refill pass touches 4x more memory.");
+		ImGui::EndDisabled();
+
+		ImGui::Spacing();
+		ImGui::Checkbox("Recognise Snowy Ground", &settings.DetectAuthoredSnow);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Finds the snow that is already part of the map (e.g. High Hrothgar): ground whose land texture is marked as snow,\n"
+				"has a snow material, or has 'snow' in its file name, also with PBR terrain mods; and white directional snow on rocks.\n"
+				"Prints there are snow prints, and built-up snow leaves it as it is. Off = 39a, where PBR terrain never counted as snow.");
+		ImGui::BeginDisabled(!settings.DetectAuthoredSnow);
+		ImGui::Checkbox("Also Guess From Colour (bright white ground)", &settings.AlbedoSnowGuess);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Last resort for land textures that carry no snow marking at all: bright, grey-white ground counts as snow.\n"
+				"Can also catch pale rock or sand.");
 		ImGui::EndDisabled();
 
 		ImGui::Spacing();
@@ -881,7 +924,7 @@ void DynamicSnow::LoadSettings(json& o_json)
 {
 	settings = o_json;
 	settings.Condition = std::clamp(settings.Condition, 0, static_cast<int>(SnowCondition::Count) - 1);
-	settings.TrailResolution = std::clamp(settings.TrailResolution, 0, 1);
+	settings.TrailResolution = std::clamp(settings.TrailResolution, 0, 2);
 	coldCacheCell = nullptr;
 }
 

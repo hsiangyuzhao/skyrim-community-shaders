@@ -768,12 +768,6 @@ void State::ModifyShaderLookup(const RE::BSShader& a_shader, uint& a_vertexDescr
 					technique = 0;
 				}
 				a_vertexDescriptor = flags | technique;
-
-				// (batch 39, item 2) Grass that skipped the depth prepass cuts its blades out in
-				// the main pass itself (GRASS_MAIN_ALPHA_TEST); its pixel shader is otherwise the same.
-				if ((a_pixelDescriptor & 0xF) != static_cast<uint32_t>(SIE::ShaderCache::GrassShaderTechniques::RenderDepth) &&
-					Batch39Engine::PrepassSkipGrassActive())
-					a_pixelDescriptor |= Batch39Engine::kGrassMainAlphaTestFlag;
 			}
 			break;
 		}

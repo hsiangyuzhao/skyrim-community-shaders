@@ -86,7 +86,11 @@ public:
 		bool TrailsOnAccumulated = true;  ///< item 5's accumulated snow
 		bool MudTrails = false;           ///< any other terrain, as mud/dirt
 		bool TrailsFromNPCs = true;       ///< nearby actors and creatures, not only the player
-		int TrailResolution = 1;          ///< 0 = 1024 texels (4 units each), 1 = 2048 (2 units each)
+		int TrailResolution = 1;          ///< 0 = 1024 texels (4 units each), 1 = 2048 (2 units each), 2 = 4096 (1 unit each)
+		bool SmoothTrails = true;         ///< (39b) bicubic reconstruction; off = 39a's bilinear (mosaic)
+		bool DetectAuthoredSnow = true;   ///< (39b) snow ground recognised from its land texture (PBR terrain too) and white directional snow
+		bool AlbedoSnowGuess = false;     ///< (39b) also bright grey-white terrain (last resort)
+		bool SnowOnCharacters = false;    ///< (39b) accumulated snow on actors and their gear
 		float TrailSize = 1.0f;
 		float TrailDepth = 5.0f;            ///< game units
 		float TrailRefillSeconds = 180.0f;  ///< real seconds for a full print to fill back in
@@ -136,6 +140,10 @@ public:
 		FlagTrailsOnSnow = 1 << 2,
 		FlagTrailsOnAccumulated = 1 << 3,
 		FlagMudTrails = 1 << 4,
+		FlagSmoothTrails = 1 << 5,
+		FlagLandSnowDetect = 1 << 6,
+		FlagAlbedoSnowGuess = 1 << 7,
+		FlagSnowOnCharacters = 1 << 8,
 	};
 
 	[[nodiscard]] CommonBufferData GetCommonBufferData();

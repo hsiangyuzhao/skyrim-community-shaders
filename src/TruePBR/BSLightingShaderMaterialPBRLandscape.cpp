@@ -48,6 +48,7 @@ void BSLightingShaderMaterialPBRLandscape::CopyMembers(RE::BSShaderMaterial* tha
 	pbrThat->terrainTexOffsetY = terrainTexOffsetY;
 	pbrThat->terrainTexFade = terrainTexFade;
 	pbrThat->glintParameters = glintParameters;
+	pbrThat->isSnow = isSnow;
 
 	All[this] = All[pbrThat];
 }

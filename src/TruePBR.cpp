@@ -759,6 +759,10 @@ bool TruePBR::BSLightingShader_SetupMaterial(RE::BSLightingShader* shader, RE::B
 							flags |= (1 << (2 * BSLightingShaderMaterialPBRLandscape::NumTiles + textureIndex));
 						}
 					}
+					// (batch 39b) Dynamic Snow, any tile (PBR or not): PBR::TerrainFlags::LandTile0IsSnow << i.
+					if (pbrMaterial->isSnow[textureIndex]) {
+						flags |= (1u << (24 + textureIndex));
+					}
 				}
 				shadowState->SetPSConstant(flags, RE::BSGraphics::ConstantGroupLevel::PerMaterial, lightingPSConstants.PBRFlags);
 			}
@@ -1052,6 +1056,26 @@ void SetupLandscapeTexture(BSLightingShaderMaterialPBRLandscape& material, RE::T
 		SetupPBRLandscapeTextureParameters(material, *textureSetData, textureIndex);
 	}
 	material.isPbr[textureIndex] = isPbr;
+
+	// (batch 39b) Dynamic Snow: is this tile snow? The vanilla landscape material takes
+	// textureIsSnow[i] from the LTEX "is snow" flag (INAM, TESLandTexture+0x3C read as
+	// shaderTextureIndex; SkyrimSE.exe 1.5.97 ID 18368 -> 0x1412C5930). The PBR material dropped
+	// it, so on PBR terrain nothing was snow. Also accepted: a snow material type (as
+	// community-shaders PR #2659 "Snow Deformation" by PppPlyr1 does) and "snow" in the diffuse
+	// path, for land texture mods that set neither.
+	{
+		bool snow = landTexture.shaderTextureIndex != 0;
+		if (!snow && landTexture.materialType) {
+			const auto id = landTexture.materialType->materialID;
+			snow = id == RE::MATERIAL_ID::kSnow || id == RE::MATERIAL_ID::kSnowStairs;
+		}
+		if (!snow) {
+			std::string path = textureSet->textures[0].textureName.c_str();
+			std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			snow = path.find("snow") != std::string::npos;
+		}
+		material.isSnow[textureIndex] = snow;
+	}
 
 	if (material.landscapeBaseColorTextures[textureIndex] != nullptr) {
 		material.numLandscapeTextures = std::max(material.numLandscapeTextures, textureIndex + 1);

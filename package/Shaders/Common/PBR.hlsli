@@ -45,6 +45,9 @@ namespace PBR
 		static const uint LandTile3HasGlint = (1 << 15);
 		static const uint LandTile4HasGlint = (1 << 16);
 		static const uint LandTile5HasGlint = (1 << 17);
+		// (batch 39b) Dynamic Snow: tile N's land texture is snow (bit 24 + N): the LTEX "is snow"
+		// flag, a snow material type, or "snow" in its texture set. Set by TruePBR.cpp.
+		static const uint LandTile0IsSnow = (1 << 24);
 	}
 
 	namespace Constants

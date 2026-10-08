@@ -67,6 +67,7 @@ namespace Permutation
 		static const uint IsSun = (1 << 8);       // (batch 37b) vanilla sun quad (Sky)
 		static const uint IsSunGlare = (1 << 9);  // (batch 37b) vanilla sun glare quad (Sky)
 		static const uint IsNewMoon = (1 << 10);  // (batch 37c) moon / moon mask in its new phase, to hide (Sky)
+		static const uint IsActorGeometry = (1 << 11);  // (batch 39b) actor / creature / worn or carried gear (Lighting)
 	}
 
 	namespace ExtraFeatureFlags
