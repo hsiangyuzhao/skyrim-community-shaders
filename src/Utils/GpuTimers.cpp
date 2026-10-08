@@ -52,7 +52,8 @@ namespace Util
 			{ "Skylighting Probes",
 				"GPU time for updating Skylighting's light probes, done every frame." },
 			{ "Terrain Blending",
-				"GPU time for Terrain Blending. It has no on/off switch and still runs indoors." },
+				"GPU time for Terrain Blending. Only its own extra work: clearing and blending the terrain depth and copying it. "
+				"The terrain's own shading is in the Terrain Blending Draws row. Zero when switched off." },
 			{ "SSPLS",
 				"GPU time for Screen Space Point Light Shadows' depth preparation. "
 				"Nothing currently uses its result, so this time is wasted." },
@@ -96,6 +97,9 @@ namespace Util
 				"GPU time for updating the mountain-shadow map (Terrain Shadows): one strip of the map per frame, the whole map "
 				"in one frame after a time jump or a new worldspace (Batch 40). Reading the shadows happens inside the normal "
 				"drawing and is not in this row." },
+			{ "Terrain Blending Draws",
+				"GPU time for drawing the ground (and objects marked for blending) inside Terrain Blending. This is the ground's "
+				"normal shading, moved here from the opaque pass so it can be blended: not extra cost. Switching Terrain Blending off moves it back." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

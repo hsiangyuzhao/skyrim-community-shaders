@@ -25,7 +25,10 @@ public:
 	struct Settings
 	{
 		uint32_t Enabled = true;
-		uint32_t pad[3] = { 0, 0, 0 };
+		// (40c) Terrain closer than this (game units) is drawn a second time for the blend.
+		// Occupies the first padding slot of the shader-side struct; no shader reads it.
+		float Distance = 1024.0f;
+		uint32_t pad[2] = { 0, 0 };
 	};
 	STATIC_ASSERT_ALIGNAS_16(Settings);
 

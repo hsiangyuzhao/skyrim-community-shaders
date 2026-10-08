@@ -57,6 +57,7 @@ namespace Util
 		VolumetricShadows,       // (batch 38) sun VSM for smoke and effects: downsample + 11x11 blur
 		SnowTrails,              // (batch 39) Dynamic Snow footprint map: scroll clear + refill + prints
 		TerrainShadows,           // (batch 40) Terrain Shadows heightmap sweep (one band per frame, the whole map on a refresh)
+		TerrainBlendingDraws,     // (40c) terrain + flagged objects shaded by Terrain Blending (moved out of the opaque pass, not extra work)
 		Count
 	};
 

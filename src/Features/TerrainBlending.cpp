@@ -7,7 +7,8 @@
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	TerrainBlending::Settings,
-	Enabled)
+	Enabled,
+	Distance)
 
 void TerrainBlending::DrawSettings()
 {
@@ -18,11 +19,18 @@ void TerrainBlending::DrawSettings()
 		ImGui::Text("Blends objects (rocks, roads, buildings) smoothly into the terrain where they meet the ground.");
 		ImGui::Text("When off, the extra terrain depth passes are skipped and every effect uses the original depth.");
 	}
+
+	ImGui::SliderFloat("Blend Distance", &settings.Distance, 256.0f, 4096.0f, "%.0f units", ImGuiSliderFlags_AlwaysClamp);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("Only terrain closer than this is drawn a second time for blending. Beyond it, objects meet the ground with a hard edge as in vanilla.");
+		ImGui::Text("Lower = cheaper. 1024 is the default (40a used 2048).");
+	}
 }
 
 void TerrainBlending::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	settings.Distance = std::clamp(settings.Distance, 256.0f, 4096.0f);
 }
 
 void TerrainBlending::SaveSettings(json& o_json)
@@ -33,17 +41,6 @@ void TerrainBlending::SaveSettings(json& o_json)
 void TerrainBlending::RestoreDefaultSettings()
 {
 	settings = {};
-}
-
-namespace
-{
-	// Upstream c46d623fd: RE::BSGraphics::State::SetCameraData (not in our CommonLib revision).
-	void SetGraphicsStateCameraData(const RE::NiCamera* a_camera, std::uint32_t a_flags)
-	{
-		using func_t = void (*)(RE::BSGraphics::State*, const RE::NiCamera*, std::uint32_t);
-		static REL::Relocation<func_t> func{ RELOCATION_ID(75694, 77503) };
-		func(globals::game::graphicsState, a_camera, a_flags);
-	}
 }
 
 ID3D11VertexShader* TerrainBlending::GetTerrainVertexShader()
@@ -283,10 +280,10 @@ void TerrainBlending::Hooks::Main_RenderDepth::thunk(bool a1, bool a2)
 	auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
 	auto& zPrepassCopy = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 
-	// Upstream c46d623fd: make sure the camera constants are current before the terrain depth draw.
-	// Without Volumetric Lighting nothing else refreshes them here and the blend is misaligned.
-	if (globals::game::graphicsState)
-		SetGraphicsStateCameraData(RE::Main::WorldRootCamera(), 1);
+	// (40c) Upstream c46d623fd called BSGraphics::State::SetCameraData(WorldRootCamera, 1) here.
+	// Removed: re-deriving the camera constants mid-frame, after Upscaling has applied its jitter,
+	// rewrote the view/projection (and previous-frame) matrices DLSS relies on -> blurry image in
+	// 40b. The original misalignment it fixed was never seen on this fork.
 
 	singleton.averageEyePosition = Util::GetAverageEyePosition();
 
@@ -326,7 +323,7 @@ void TerrainBlending::Hooks::BSBatchRenderer__RenderPassImmediately::thunk(RE::B
 			bool inTerrain = a_pass->shaderProperty && a_pass->shaderProperty->flags.all(RE::BSShaderProperty::EShaderPropertyFlag::kMultiTextureLandscape);
 
 			if (inTerrain) {
-				if ((a_pass->geometry->worldBound.center.GetDistance(singleton.averageEyePosition) - a_pass->geometry->worldBound.radius) > 1024.0f) {  // upstream 93def6b33: 2048 -> 1024
+				if ((a_pass->geometry->worldBound.center.GetDistance(singleton.averageEyePosition) - a_pass->geometry->worldBound.radius) > singleton.settings.Distance) {  // upstream 93def6b33: 2048 -> 1024 (default)
 					inTerrain = false;
 				}
 			}
@@ -373,7 +370,7 @@ void TerrainBlending::RenderTerrainBlendingPasses()
 	context->PSSetShaderResources(55, 1, &view);
 
 	if (!terrainRenderPasses.empty() || !renderPasses.empty()) {
-		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::TerrainBlending);
+		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::TerrainBlendingDraws);
 		GET_INSTANCE_MEMBER(alphaBlendMode, shadowState)
 		GET_INSTANCE_MEMBER(alphaBlendWriteMode, shadowState)
 		GET_INSTANCE_MEMBER(depthStencilDepthMode, shadowState)
@@ -402,7 +399,7 @@ void TerrainBlending::RenderTerrainBlendingPasses()
 
 		terrainRenderPasses.clear();
 		renderPasses.clear();
-		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::TerrainBlending);
+		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::TerrainBlendingDraws);
 	}
 
 	auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
