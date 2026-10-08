@@ -13,8 +13,10 @@
 namespace DynamicSnow
 {
 #if defined(PSHADER)
-	// R32_UINT, toroidally addressed: hi 16 bits = print strength (UNORM), lo 16 bits = the
-	// foot's height modulo kTrailZWrap (UNORM). Written by SnowTrailsCS.hlsl.
+	// R32_UINT, toroidally addressed: hi 16 bits = print code, lo 16 bits = the foot's height
+	// modulo kTrailZWrap (UNORM). Written by SnowTrailsCS.hlsl. (batch 39c) Code 0 = untouched,
+	// 1..32767 = a pushed-up rim (height = code / 32767), 32768..65535 = a dent (depth =
+	// (code - 32768) / 32767): InterlockedMax keeps the deepest dent, and any dent beats a rim.
 	Texture2D<uint> SnowTrailMap : register(t101);
 #endif
 
@@ -29,6 +31,11 @@ namespace DynamicSnow
 	static const uint FlagLandSnowDetect = 1 << 6;      // authored snow recognised from the land texture / projected snow
 	static const uint FlagAlbedoSnowGuess = 1 << 7;     // bright, grey-white ground counts as snow too
 	static const uint FlagSnowOnCharacters = 1 << 8;    // accumulated snow on actors and what they wear
+	// (batch 39c)
+	static const uint FlagCoverageSlope = 1 << 9;  // coverage from the geometry slope on a soft ramp (39b: normal threshold)
+	static const uint FlagTrees = 1 << 10;         // snow on animated trees and foliage (Lighting, TREE_ANIM)
+	static const uint FlagGrass = 1 << 11;         // snow on grass (RunGrass)
+	static const uint FlagLodTrees = 1 << 12;      // snow on distant billboard trees (DistantTree)
 
 	// Height is stored modulo this many units. Two surfaces exactly a multiple of it apart
 	// (14.6 m) would share prints; anything else is told apart by TrailZTolerance.
@@ -66,11 +73,23 @@ namespace DynamicSnow
 	float GetCoverage(float3 positionWS, float3 normalWS, float3 geometryNormalWS, float skyVisibility, float viewDistance)
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
+		const bool slopeModel = (s.Flags & FlagCoverageSlope) != 0;
 
-		// Half geometry, half normal map: crevices in the normal map that face up hold snow,
-		// but a steep wall with a bumpy normal map does not.
-		float up = lerp(geometryNormalWS.z, normalWS.z, 0.5);
-		float slope = saturate((up - s.NormalThreshold) / max(1.0 - s.NormalThreshold, 1e-3));
+		float slope;
+		[branch] if (slopeModel)
+		{
+			// (batch 39c) The slope comes from the geometry alone, on a soft ramp that starts well
+			// below typical roof pitches. 39b gated on half geometry / half normal map against a
+			// hard 0.6 (53 degrees) threshold with a 3x ramp: thatch roofs (vertex normals 0.45..0.85
+			// on the PBR Unique Northern Vanilla Farmhouses inn, lumpy by design) straddled the
+			// threshold, so the snow followed the thatch's lumps in streaks while flatter shingles
+			// and boardwalks went fully white.
+			slope = smoothstep(s.SlopeStart, s.SlopeFull, geometryNormalWS.z);
+		} else {
+			// 39b: half geometry, half normal map, hard threshold.
+			float up = lerp(geometryNormalWS.z, normalWS.z, 0.5);
+			slope = saturate((up - s.NormalThreshold) / max(1.0 - s.NormalThreshold, 1e-3));
+		}
 		[branch] if (slope <= 0.0) return 0.0;  // walls and overhangs: no noise, no sky lookup
 
 		float2 p = positionWS.xy;
@@ -82,9 +101,63 @@ namespace DynamicSnow
 		// the normal threshold.
 		float h = slope * 0.7 + noise * 0.3;
 		float t = 1.1 - s.Amount * 1.2;
-		float coverage = smoothstep(t - 0.1, t + 0.1, h) * saturate(slope * 3.0);
+		float coverage = smoothstep(t - 0.1, t + 0.1, h);
+
+		[branch] if (slopeModel)
+		{
+			coverage *= slope;
+			// The normal map only shapes partial cover (up-facing detail fills first, the
+			// grooves last); full cover stays full, so a bumpy texture never punches holes.
+			float detail = normalWS.z - geometryNormalWS.z;
+			coverage = saturate(coverage + detail * 2.0 * coverage * (1.0 - coverage));
+		} else {
+			coverage *= saturate(slope * 3.0);
+		}
 
 		return coverage * s.MaxCoverage * skyVisibility;
+	}
+
+	// (batch 39c) Animated trees and foliage (Lighting.hlsl, TREE_ANIM). The leaves sway, so
+	// nothing here may follow the swaying world position closely: the slope comes from the
+	// vertex normal (tree mods give leaf cards normals that point out of the canopy, so the top
+	// of the crown faces up), the fine breakup is in texture space and moves with the leaf, and
+	// the world-space noise is only the 300-unit octave, against which a sway of a few units is
+	// invisible. No front/back-face term either: a swaying card flips sides against the camera.
+	float GetTreeCoverage(float3 positionWS, float3 geometryNormalWS, float2 uv)
+	{
+		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
+		float slope = smoothstep(-0.1, 0.6, geometryNormalWS.z);
+		[branch] if (slope <= 0.0) return 0.0;
+		float noise = ValueNoise(positionWS.xy * (1.0 / 300.0)) * 0.6 + ValueNoise(uv * 6.0) * 0.4;
+		float h = slope * 0.7 + noise * 0.3;
+		float t = 1.1 - s.Amount * 1.2;
+		return smoothstep(t - 0.1, t + 0.1, h) * slope * s.TreeCoverage * s.MaxCoverage;
+	}
+
+	// (batch 39c) Grass (RunGrass.hlsl). Snow buries a blade from the root up as it builds (the
+	// root is white with the ground around it), and dusts the up-facing upper part. tip = the
+	// vertex's wind weight (0 at the root, 1 at the tip in Skyrim grass meshes): a per-vertex
+	// constant, so the cover does not move with the wind.
+	float GetGrassCoverage(float3 positionWS, float tip, float upZ)
+	{
+		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
+		float snowLine = s.Amount * 0.7;
+		float buried = 1.0 - smoothstep(snowLine - 0.15, snowLine + 0.05, tip);
+		buried *= smoothstep(0.0, 0.15, s.Amount);
+		float dust = smoothstep(-0.6, 0.8, upZ) * smoothstep(0.0, 0.6, s.Amount) * 0.6;
+		float noise = ValueNoise(positionWS.xy * (1.0 / 300.0));
+		return saturate(max(buried, dust) * lerp(0.75, 1.0, noise)) * s.GrassCoverage * s.MaxCoverage;
+	}
+
+	// (batch 39c) Distant billboard trees (DistantTree.hlsl): a tint that matches the average
+	// of the near trees, whiter towards the top of the billboard. heightFraction is 0 at the
+	// billboard's base and 1 at its top; the breakup is in atlas space.
+	float GetLodTreeCoverage(float heightFraction, float2 uv)
+	{
+		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
+		float amount = smoothstep(0.0, 1.0, s.Amount);
+		float noise = ValueNoise(uv * 48.0);
+		return amount * lerp(0.45, 1.0, heightFraction) * lerp(0.7, 1.0, noise) * s.LodTreeCoverage * s.MaxCoverage;
 	}
 
 	// (batch 39b) Last-resort snow test from the colour alone (FlagAlbedoSnowGuess): bright and
@@ -101,7 +174,7 @@ namespace DynamicSnow
 
 	struct TrailSample
 	{
-		float pressed;   // [0,1] print strength
+		float pressed;   // [-1,1] print depth (negative = the pushed-up rim)
 		float2 gradient; // d(pressed)/d(world xy), per game unit
 		bool any;        // any of the four texels carries a print
 	};
@@ -117,13 +190,14 @@ namespace DynamicSnow
 #endif
 	}
 
-	// Strength of one texel's print as seen from a surface at height z: zero unless the foot
+	// Signed depth of one texel's print (rim negative) as seen from a surface at height z: zero unless the foot
 	// that made it stood within TrailZTolerance of this surface (bridges, roofs, caves above
 	// or below a trail do not receive it).
 	float DecodeTrailTexel(uint v, float z)
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
-		float strength = float(v >> 16) * (1.0 / 65535.0);
+		uint code = v >> 16;
+		float strength = code >= 32768 ? float(code - 32768) * (1.0 / 32767.0) : -float(code) * (s.TrailRim / 32767.0);
 		float footZ = float(v & 0xFFFF) * (kTrailZWrap / 65535.0);
 		float dz = (frac((z - footZ) / kTrailZWrap + 0.5) - 0.5) * kTrailZWrap;
 		return strength * (1.0 - smoothstep(s.TrailZTolerance * 0.5, s.TrailZTolerance, abs(dz)));
@@ -230,7 +304,7 @@ namespace DynamicSnow
 			grad.y += dw[y].y * row;
 		}
 
-		o.pressed = saturate(value) * fade;
+		o.pressed = clamp(value, -1.0, 1.0) * fade;
 		o.gradient = grad * (fade / s.TrailTexelSize);
 		return o;
 	}
@@ -253,7 +327,7 @@ namespace DynamicSnow
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
 		TrailSample o = SampleTrailAt(positionWS.xy, positionWS.z);
-		[branch] if (o.any && o.pressed > 1e-3)
+		[branch] if (o.any && abs(o.pressed) > 1e-3)
 		{
 			float h = o.pressed * s.TrailDepth;
 			float2 offset = -viewDirectionWS.xy * (h / max(viewDirectionWS.z, 0.3));

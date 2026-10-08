@@ -547,6 +547,16 @@ namespace SharedData
 		float TrailMudStrength;   // print strength on non-snow terrain (FlagMudTrails)
 		float TrailEdgeFade;      // fade band at the window edge, texels
 		float pad0;
+
+		// (batch 39c)
+		float SlopeStart;         // FlagCoverageSlope: geometry up-facing (normal.z) where snow starts to hold
+		float SlopeFull;          // ... and where it holds fully
+		float TreeCoverage;       // FlagTrees: cap on snow on animated trees and foliage
+		float GrassCoverage;      // FlagGrass: cap on snow on grass
+
+		float LodTreeCoverage;    // FlagLodTrees: cap on snow on distant (billboard) trees
+		float TrailRim;           // height of a print's pushed-up rim, relative to its depth
+		float2 pad1;
 	};
 
 	namespace PhysSkyExtFlags

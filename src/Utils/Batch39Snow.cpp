@@ -59,8 +59,12 @@ namespace Batch39
 		a_rows.push_back(Value(group, "  When it builds up", installed, s.EnableAccumulation, condition, kWhere));
 		a_rows.push_back(Value(group, "  Build-up / melt time", installed, s.EnableAccumulation,
 			std::format("{:.1f} h / {:.1f} h (game time)", s.AccumulationHours, s.MeltHours), kWhere));
-		a_rows.push_back(Value(group, "  Max coverage / normal threshold", installed, s.EnableAccumulation,
-			std::format("{:.2f} / {:.2f}", s.MaxCoverage, s.NormalThreshold), kWhere));
+		a_rows.push_back(Toggle(group, "  Even cover on roofs and slopes (39c)", installed, s.SlopeCoverage, "", kWhere));
+		a_rows.push_back(Value(group, s.SlopeCoverage ? "  Max coverage / slope start, full" : "  Max coverage / normal threshold", installed, s.EnableAccumulation,
+			s.SlopeCoverage ? std::format("{:.2f} / {:.2f}, {:.2f}", s.MaxCoverage, s.SlopeStart, s.SlopeFull) : std::format("{:.2f} / {:.2f}", s.MaxCoverage, s.NormalThreshold), kWhere));
+		a_rows.push_back(Toggle(group, "  Snow on trees and bushes (39c)", installed, s.SnowOnTrees, "", kWhere));
+		a_rows.push_back(Toggle(group, "  Snow on grass (39c)", installed, s.SnowOnGrass, "", kWhere));
+		a_rows.push_back(Toggle(group, "  Snow on distant trees (39c)", installed, s.SnowOnLodTrees, "", kWhere));
 		a_rows.push_back(Toggle(group, "  Snow on characters (39b, default Off)", installed, s.SnowOnCharacters, "", kWhere));
 		a_rows.push_back(Toggle(group, "  Recognise snowy ground: land texture, PBR terrain (39b)", installed, s.DetectAuthoredSnow, "", kWhere));
 		a_rows.push_back(Toggle(group, "  ... also guess from colour (39b, default Off)", installed, s.AlbedoSnowGuess, "", kWhere));
@@ -103,5 +107,11 @@ namespace Batch39
 		a_rows.push_back(Value(group, "  Trail map", installed, s.EnableTrails,
 			std::format("{0}x{0}, {1:.0f} units per texel, 58 m across", size, DynamicSnow::kTrailWindowUnits / static_cast<float>(size)), kWhere));
 		a_rows.push_back(Toggle(group, "  Smooth footprints (bicubic, 39b)", installed, s.SmoothTrails, "", kWhere));
+		a_rows.push_back(Toggle(group, "  Use installed footprint textures (39c)", installed, s.UseModFootprintShapes,
+			st.shapesLoaded ? std::format("{} shapes ({})", st.shapesLoaded, st.shapeSource) : "", kWhere));
+		a_rows.push_back(Toggle(group, "  Leave snowy ground to the Footprints mod (39c)", installed, s.YieldToFootprintsMod,
+			!st.footprintsMod ? "Footprints mod not loaded" : st.yieldingToMod ? "Ours: built-up snow only" : "Both draw", kWhere));
+		a_rows.push_back(Toggle(group, "  Trenches from bodies and objects (39c)", installed, s.BodyAndObjectTrails,
+			st.bodyStamps ? std::format("{} this frame", st.bodyStamps) : "", kWhere));
 	}
 }

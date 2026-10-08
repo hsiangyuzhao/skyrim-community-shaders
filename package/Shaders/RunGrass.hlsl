@@ -543,6 +543,10 @@ cbuffer AlphaTestRefCB : register(b11)
 #		include "Skylighting/Skylighting.hlsli"
 #	endif
 
+#	if defined(DYNAMIC_SNOW)
+#		include "DynamicSnow/DynamicSnow.hlsli"
+#	endif
+
 #	if defined(WATER_LIGHTING)
 #		include "WaterLighting/WaterCaustics.hlsli"
 #	endif
@@ -673,6 +677,34 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	baseColor.xyz *= lerp(1.0, lodBrightness, saturate(input.LodTier));
 #			endif
 
+#			if defined(DYNAMIC_SNOW)
+	// (batch 39c) Snow on grass: same global amount and sky occlusion as the ground under it
+	// (Lighting.hlsl), buried from the root up and dusted on top (DynamicSnow::GetGrassCoverage).
+	// Applied to the albedo after the vertex colour below, so the snow is not tinted by it.
+	float grassSnow = 0.0;
+	[branch] if (SharedData::dynamicSnowSettings.Flags & DynamicSnow::FlagGrass)
+	{
+		float3 snowPositionWS = input.WorldPosition.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz;
+		grassSnow = DynamicSnow::GetGrassCoverage(snowPositionWS, saturate(input.VertexNormal.w), normal.z);
+#				if defined(SKYLIGHTING)
+		[branch] if (grassSnow > 0.0)
+		{
+#					if defined(VR)
+			float3 snowPositionMS = input.WorldPosition.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz - FrameBuffer::CameraPosAdjust[0].xyz;
+#					else
+			float3 snowPositionMS = input.WorldPosition.xyz;
+#					endif
+			sh2 snowSkySH = Skylighting::sampleNoBias(SharedData::skylightingSettings, Skylighting::SkylightingProbeArray, snowPositionMS + float3(0, 0, 1) * Skylighting::CELL_SIZE);
+			grassSnow *= pow(saturate(SphericalHarmonics::Unproject(snowSkySH, float3(0, 0, 1))), 2);
+		}
+#				endif
+	}
+	const float3 grassSnowColor = Color::ColorToLinear(SharedData::dynamicSnowSettings.SnowColor);
+#				if !defined(TRUE_PBR)
+	specColor.w *= 1.0 - grassSnow;  // snow is matte
+#				endif
+#			endif
+
 #			if defined(VANILLA_FRESNEL)
 	const bool enableVanillaFresnel = SharedData::vanillaFresnelSettings.Enable;
 	float3 F0 = enableVanillaFresnel ? max(SharedData::vanillaFresnelSettings.MinF0, saturate(specColor.w * SharedData::grassLightingSettings.SpecularStrength * SharedData::vanillaFresnelSettings.BaseF0Multiplier / Math::PI)) : 0.0;
@@ -680,9 +712,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 F0 = 0.0;
 #			endif
 	float roughness = saturate(1.0 - SharedData::grassLightingSettings.Glossiness * 0.01);
+#			if defined(DYNAMIC_SNOW)
+	roughness = lerp(roughness, max(roughness, SharedData::dynamicSnowSettings.SnowRoughness), grassSnow);
+#			endif
 
 #			if defined(TRUE_PBR)
 	float4 rawRMAOS = TexRMAOSSampler.SampleBias(SampRMAOSSampler, input.TexCoord.xy, SharedData::MipBias) * float4(PBRParams1.x, 1, 1, PBRParams1.y);
+#				if defined(DYNAMIC_SNOW)
+	baseColor.xyz = lerp(baseColor.xyz, grassSnowColor, grassSnow);
+	rawRMAOS.x = lerp(rawRMAOS.x, max(rawRMAOS.x, SharedData::dynamicSnowSettings.SnowRoughness), grassSnow);
+	rawRMAOS.y = lerp(rawRMAOS.y, 0.0, grassSnow);
+	rawRMAOS.w = lerp(rawRMAOS.w, 0.02, grassSnow);
+#				endif
 
 	PBR::SurfaceProperties pbrSurfaceProperties = PBR::InitSurfaceProperties();
 
@@ -777,8 +818,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #				endif
 
 	float3 albedo = max(0, baseColor.xyz * Color::ColorToLinear(vertexColor));
+#				if defined(DYNAMIC_SNOW)
+	albedo = lerp(albedo, grassSnowColor, grassSnow);
+#				endif
 
 	float3 subsurfaceColor = lerp(dot(albedo, 1.0 / 3.0), albedo, 2.0) * saturate(input.VertexNormal.w * 10.0);
+#				if defined(DYNAMIC_SNOW)
+	subsurfaceColor *= 1.0 - grassSnow;  // snow does not let light through like a blade does
+#				endif
 	float3 sss = dirLightColor * saturate(-dirLightAngle) * Color::GrassDiffuseMult();
 
 #				if defined(GRASS_OPTIMIZATIONS)
