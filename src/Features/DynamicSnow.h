@@ -127,8 +127,9 @@ public:
 		/// Footprints _h), loaded from the game's data; procedural ovals when none are found.
 		bool UseModFootprintShapes = true;
 		/// With the Footprints mod (Footprints.esp) loaded: leave snowy ground and mud to its decals
-		/// and print only in built-up snow, so the two never double up.
-		bool YieldToFootprintsMod = true;
+		/// and print only in built-up snow, so the two never double up. Default off (40a): the user has never
+		/// seen the mod's prints, so ours go on all snowy ground; turn on once the mod works.
+		bool YieldToFootprintsMod = false;
 		/// Ragdolls being dragged or sliding and loose objects moving through snow carve trenches
 		/// (Havok collision shapes, after community-shaders PR #2659).
 		bool BodyAndObjectTrails = true;

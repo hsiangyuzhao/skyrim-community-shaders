@@ -1481,9 +1481,9 @@ void DynamicSnow::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Only matters when the Footprints mod (Footprints.esp) is loaded. It already puts its own prints on\n"
-				"snowy ground and mud, so on (default) ours are made only in built-up snow and the two never double up.\n"
-				"Off: ours everywhere set above as well - pick this if you switched the Footprints mod's prints off\n"
-				"in its MCM and want ours instead. Theirs are sharper close up; ours are real dents that fill back\n"
+				"snowy ground and mud, so when on, ours are made only in built-up snow and the two never double up.\n"
+				"Off (default): ours on all snowy ground set above. If you get the Footprints mod's prints\n"
+				"working, turn this on to avoid double prints. Theirs are sharper close up; ours are real dents that fill back\n"
 				"in, work on built-up snow and for every nearby actor.");
 		ImGui::SameLine();
 		ImGui::TextDisabled(status.footprintsMod ? "(Footprints mod: loaded)" : "(Footprints mod: not loaded)");
