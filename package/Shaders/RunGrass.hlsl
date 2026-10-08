@@ -766,13 +766,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	lightsDiffuseColor += dirLightColor * saturate(dirLightAngle) * Color::GrassDiffuseMult();
 
-	float3 vertexColor = input.VertexColor.xyz;
+	// (batch 40) Grass takes its tint from the ground's vertex colours, so LOD Blending's "Disable
+	// Terrain Vertex Colors" drops it here too, as upstream does (df00b70a0); otherwise tinted grass
+	// would stand on untinted ground.
+	const float3 grassVertexTint = SharedData::lodBlendingSettings.DisableTerrainVertexColors ? 1.0.xxx : input.VertexColor.xyz;
+	float3 vertexColor = grassVertexTint;
 
 #				if defined(SKYLIGHTING)
 	float skylightingFadeOutFactor = 1.0;
 	if (!SharedData::InInterior) {
 		skylightingFadeOutFactor = Skylighting::getFadeOutFactor(input.WorldPosition.xyz);
-		vertexColor = lerp(input.VertexColor.xyz * input.VertexMult, vertexColor, skylightingFadeOutFactor);
+		vertexColor = lerp(grassVertexTint * input.VertexMult, vertexColor, skylightingFadeOutFactor);
 	}
 #				endif
 
@@ -1123,13 +1127,17 @@ PS_OUTPUT main(PS_INPUT input)
 
 	normal = normalize(float3(normal.xy, max(0, normal.z)));
 
-	float3 vertexColor = input.VertexColor.xyz;
+	// (batch 40) Grass takes its tint from the ground's vertex colours, so LOD Blending's "Disable
+	// Terrain Vertex Colors" drops it here too, as upstream does (df00b70a0); otherwise tinted grass
+	// would stand on untinted ground.
+	const float3 grassVertexTint = SharedData::lodBlendingSettings.DisableTerrainVertexColors ? 1.0.xxx : input.VertexColor.xyz;
+	float3 vertexColor = grassVertexTint;
 
 #			if defined(SKYLIGHTING)
 	float skylightingFadeOutFactor = 1.0;
 	if (!SharedData::InInterior) {
 		skylightingFadeOutFactor = Skylighting::getFadeOutFactor(input.WorldPosition.xyz);
-		vertexColor = lerp(input.VertexColor.xyz * input.VertexMult, vertexColor, skylightingFadeOutFactor);
+		vertexColor = lerp(grassVertexTint * input.VertexMult, vertexColor, skylightingFadeOutFactor);
 	}
 #			endif
 

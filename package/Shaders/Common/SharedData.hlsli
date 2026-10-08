@@ -196,7 +196,16 @@ namespace SharedData
 		float LODObjectGamma;
 		float LODObjectSnowGamma;
 		float LODGrassGamma;
+		uint FixFlags;  // (batch 40) SharedData::LODBlendingFix bits, LOD Blending > Fixes
+		float3 pad0;
 	};
+
+	// (batch 40) Mirrors LODBlending::FixFlag.
+	namespace LODBlendingFix
+	{
+		static const uint TreeSunTransmittanceOnce = (1 << 0);
+		static const uint LandBlendRawColor = (1 << 1);
+	}
 
 	struct HairSpecularSettings
 	{

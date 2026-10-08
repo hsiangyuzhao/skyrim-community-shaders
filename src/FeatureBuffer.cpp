@@ -54,7 +54,7 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::wetnessEffects.GetCommonBufferData(),
 		globals::features::skylighting.GetCommonBufferData(a_inWorld),
 		globals::features::cloudShadows.settings,
-		globals::features::lodBlending.settings,
+		globals::features::lodBlending.GetCommonBufferData(),
 		globals::features::hairSpecular.settings,
 		globals::features::terrainVariation.settings,
 		globals::features::ibl.settings,
@@ -86,8 +86,8 @@ namespace
 	// listing for Lighting.hlsl (fxc -Fc, `cbuffer SharedData::FeatureData`), not calculated.
 	// Batch 15 grew VanillaFresnel::Settings from 64 to 80 bytes, which is why every entry after
 	// it sits 16 bytes later than it did at ea8459bd0.
-	// Batch 40 grew TerrainShadows::PerFrame by 16 bytes, so every entry from vanillaFresnel
-	// on sits 16 bytes later than in batch 39.
+	// Batch 40 grew TerrainShadows::PerFrame and the LOD Blending block by 16 bytes each, so
+	// every entry from vanillaFresnel on sits 32 bytes later than in batch 39.
 	template <class T>
 	using SettingsOf = std::decay_t<T>;
 
@@ -101,7 +101,7 @@ namespace
 		SettingsOf<decltype(globals::features::wetnessEffects.GetCommonBufferData())> wetnessEffects;
 		SettingsOf<decltype(globals::features::skylighting.GetCommonBufferData(true))> skylighting;
 		SettingsOf<decltype(globals::features::cloudShadows.settings)> cloudShadows;
-		SettingsOf<decltype(globals::features::lodBlending.settings)> lodBlending;
+		SettingsOf<decltype(globals::features::lodBlending.GetCommonBufferData())> lodBlending;
 		SettingsOf<decltype(globals::features::hairSpecular.settings)> hairSpecular;
 		SettingsOf<decltype(globals::features::terrainVariation.settings)> terrainVariation;
 		SettingsOf<decltype(globals::features::ibl.settings)> ibl;
@@ -121,24 +121,24 @@ namespace
 		SettingsOf<decltype(globals::features::dynamicSnow.GetCommonBufferData())> dynamicSnow;
 	};
 
-	static_assert(offsetof(FeatureDataLayoutMirror, vanillaFresnel) == 1024,
+	static_assert(offsetof(FeatureDataLayoutMirror, vanillaFresnel) == 1040,
 		"SharedData::vanillaFresnelSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, physicalSky) == 1104,
+	static_assert(offsetof(FeatureDataLayoutMirror, physicalSky) == 1120,
 		"SharedData::physSkyData moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, screenSpaceRayTracing) == 1360,
+	static_assert(offsetof(FeatureDataLayoutMirror, screenSpaceRayTracing) == 1376,
 		"SharedData::ssrtSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, exponentialHeightFog) == 1392,
+	static_assert(offsetof(FeatureDataLayoutMirror, exponentialHeightFog) == 1408,
 		"SharedData::exponentialHeightFogSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, volumetricLighting) == 1456,
+	static_assert(offsetof(FeatureDataLayoutMirror, volumetricLighting) == 1472,
 		"(batch 37b) SharedData::volumetricLightingSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyExt) == 1472,
+	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyExt) == 1488,
 		"(batch 37b) SharedData::physSkyExtData moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, volumetricFog) == 1488,
+	static_assert(offsetof(FeatureDataLayoutMirror, volumetricFog) == 1504,
 		"(batch 38) SharedData::volumetricFogSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, volumetricShadows) == 1552,
+	static_assert(offsetof(FeatureDataLayoutMirror, volumetricShadows) == 1568,
 		"(batch 38) SharedData::volumetricShadowsSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, dynamicSnow) == 1568,
+	static_assert(offsetof(FeatureDataLayoutMirror, dynamicSnow) == 1584,
 		"(batch 39) SharedData::dynamicSnowSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(sizeof(FeatureDataLayoutMirror) == 1648,
+	static_assert(sizeof(FeatureDataLayoutMirror) == 1664,
 		"FeatureData's total size changed; check every offset above against fxc's reflection listing.");
 }

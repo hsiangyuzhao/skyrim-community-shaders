@@ -254,18 +254,16 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 diffuseColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * dirShadow * 0.5 * llDirLightMult * Color::VanillaDiffuseMult();
 
 #			if defined(PHYSICAL_SKY)
-	if (SharedData::physSkyData.enabled)
-		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
-#			endif
-
-#			if defined(PHYSICAL_SKY)
-	if (SharedData::physSkyData.enabled)
-		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
-#			endif
-
-#			if defined(PHYSICAL_SKY)
-	if (SharedData::physSkyData.enabled)
-		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
+	if (SharedData::physSkyData.enabled) {
+		// (batch 40) Sunlight transmittance through the atmosphere, once, as Lighting.hlsl and
+		// RunGrass.hlsl apply it. Three merges ("add transmittance settings", 2025-07) had each left
+		// a copy of this block here, so LOD trees took it cubed; upstream dropped the copies in
+		// 5df81c984. LOD Blending > Fixes > "Distant Trees: Sun Haze Once"; off = cubed as before.
+		const float3 sunTransmittance = PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
+		diffuseColor *= (SharedData::lodBlendingSettings.FixFlags & SharedData::LODBlendingFix::TreeSunTransmittanceOnce) ?
+		                    sunTransmittance :
+		                    sunTransmittance * sunTransmittance * sunTransmittance;
+	}
 #			endif
 
 	float3 ddx = ddx_coarse(input.WorldPosition.xyz);
@@ -344,18 +342,16 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 diffuseColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * dirShadow * 0.5 * llDirLightMult * Color::VanillaDiffuseMult();
 
 #			if defined(PHYSICAL_SKY)
-	if (SharedData::physSkyData.enabled)
-		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
-#			endif
-
-#			if defined(PHYSICAL_SKY)
-	if (SharedData::physSkyData.enabled)
-		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
-#			endif
-
-#			if defined(PHYSICAL_SKY)
-	if (SharedData::physSkyData.enabled)
-		diffuseColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
+	if (SharedData::physSkyData.enabled) {
+		// (batch 40) Sunlight transmittance through the atmosphere, once, as Lighting.hlsl and
+		// RunGrass.hlsl apply it. Three merges ("add transmittance settings", 2025-07) had each left
+		// a copy of this block here, so LOD trees took it cubed; upstream dropped the copies in
+		// 5df81c984. LOD Blending > Fixes > "Distant Trees: Sun Haze Once"; off = cubed as before.
+		const float3 sunTransmittance = PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
+		diffuseColor *= (SharedData::lodBlendingSettings.FixFlags & SharedData::LODBlendingFix::TreeSunTransmittanceOnce) ?
+		                    sunTransmittance :
+		                    sunTransmittance * sunTransmittance * sunTransmittance;
+	}
 #			endif
 
 	float3 ddx = ddx_coarse(input.WorldPosition.xyz);
