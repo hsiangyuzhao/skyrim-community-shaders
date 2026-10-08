@@ -2368,7 +2368,24 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		else
 		[branch] if ((snowFlags & DynamicSnow::FlagAccumulation) && (!snowOnActor || (snowFlags & DynamicSnow::FlagSnowOnCharacters)))
 		{
-			float snowCoverage = DynamicSnow::GetCoverage(snowPositionWS, worldNormal, snowGeometryNormal, 1.0, length(input.WorldPosition.xyz));
+			// (40b) Characters: coverage in the mesh's bind pose, so snow stays put while limbs move.
+			// ModelPosition is the pre-skinning vertex position; its screen derivatives give the
+			// bind-pose face normal (model Z is up). The handedness comes from the same derivatives
+			// in world space. Noise runs on the model position too. Other geometry is unchanged.
+			float3 snowCoverPosition = snowPositionWS;
+			float3 snowCoverNormal = worldNormal;
+			float3 snowCoverGeometryNormal = snowGeometryNormal;
+			[branch] if (snowOnActor)
+			{
+				float3 bindFace = cross(ddx(input.ModelPosition.xyz), ddy(input.ModelPosition.xyz));
+				float3 worldFace = cross(ddx(input.WorldPosition.xyz), ddy(input.WorldPosition.xyz));
+				bindFace *= (dot(worldFace, snowGeometryNormal) < 0.0) ? -1.0 : 1.0;
+				bindFace = bindFace * rsqrt(max(dot(bindFace, bindFace), 1e-12));
+				snowCoverGeometryNormal = bindFace;
+				snowCoverNormal = bindFace;
+				snowCoverPosition = input.ModelPosition.xyz * 8.0;
+			}
+			float snowCoverage = DynamicSnow::GetCoverage(snowCoverPosition, snowCoverNormal, snowCoverGeometryNormal, 1.0, length(input.WorldPosition.xyz));
 #		endif
 			[branch] if (snowCoverage > 0.0)
 			{
