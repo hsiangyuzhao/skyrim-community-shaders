@@ -48,6 +48,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sunGlowWidthDeg,
 	sunLook,
 	hideNewMoonDisc,
+	moonGlowStrength,
+	moonGlowFollowsMoon,
+	moonPhysicalRadiance,
+	moonRadianceCap,
 	fixSkyAlpha,
 	fixTrLutEdge,
 	fixApShadowDepth,
@@ -553,6 +557,31 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::PopID();
 	}
 
+	ImGui::SeparatorText("Moon Glow and Discs");
+	ImGui::SliderFloat("Moon Sky Glow Strength", &settings.moonGlowStrength, 0.f, 1.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"How strongly each moon lights up the sky around it (the glow and the night sky's brightness).\n"
+			"Does not change the moonlight on the ground, characters or shadows (Light Color above).\n"
+			"1 = the moon light colour in full: with bright moonlight the glow is as bright as the discs,\n"
+			"which then look washed out. Default 0.2: the discs stand clearly out of their glow.");
+	ImGui::Checkbox("Moon Glow Follows Phase and Visibility", &settings.moonGlowFollowsMoon);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"On (default): a new moon, or a moon the game has hidden or is fading out at the horizon, puts little or\n"
+			"no glow into the sky. Off: both moons always glow at full strength, wherever they are.");
+	ImGui::Checkbox("Moon Physical Brightness", &settings.moonPhysicalRadiance);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Like the sun's Physical Brightness: the moon discs get brighter by their light colour divided by their\n"
+			"size in the sky, up to the cap below. The phase picture and the fade at the horizon are kept.\n"
+			"Off (default): the game's own disc brightness.");
+	if (settings.moonPhysicalRadiance) {
+		ImGui::SliderFloat("Moon Brightness Cap", &settings.moonRadianceCap, 1.f, 50.f, "%.1f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Largest multiple of the game's disc brightness. Now: Masser x%.1f, Secunda x%.1f.", moonCbData.masserDiskScale, moonCbData.secundaDiskScale);
+	}
+
 	ImGui::SeparatorText("New Moon");
 	ImGui::Checkbox("Hide New Moon Disc", &settings.hideNewMoonDisc);
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -878,10 +907,54 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtReflectionSkyFix;
 	if (settings.fixMultiScatter)
 		flags |= kExtMultiScatterFix;
+	if (settings.moonPhysicalRadiance)
+		flags |= kExtMoonPhysicalRadiance;
 	extCbData.flags = flags;
 	extCbData.sunRadianceCap = std::clamp(settings.sunRadianceCap, 1.f, 62250.f);
 	extCbData.sunGlowIntensity = settings.proceduralSun ? std::clamp(settings.sunGlowIntensity, 0.f, 30.f) : 0.f;
 	extCbData.sunGlowWidth = DirectX::XMConvertToRadians(std::clamp(settings.sunGlowWidthDeg, 0.1f, 5.f));
+}
+
+void PhysicalSky::UpdateMoonData(float a_exposure, float3& a_masserGlow, float3& a_secundaGlow)
+{
+	// (40d) The moon colours stay the user's (they light the scene through Sky Sync); only their
+	// glow in the scattering LUTs is scaled here.
+	const float strength = std::clamp(settings.moonGlowStrength, 0.f, 1.f);
+	a_masserGlow = settings.masserColor * (a_exposure * strength);
+	a_secundaGlow = settings.secundaColor * (a_exposure * strength);
+	moonCbData = {};
+
+	auto* sky = globals::game::sky;
+	if (!sky)
+		return;
+
+	if (settings.moonGlowFollowsMoon) {
+		// A new moon (or a moon the game has hidden or faded out) no longer lights the sky.
+		a_masserGlow = a_masserGlow * (SkySync::PhaseFactorFromTexture(sky->masser) * SkySync::VanillaVisibility(sky->masser));
+		a_secundaGlow = a_secundaGlow * (SkySync::PhaseFactorFromTexture(sky->secunda) * SkySync::VanillaVisibility(sky->secunda));
+	}
+
+	if (settings.moonPhysicalRadiance) {
+		// Like the sun's Physical Brightness: the moonlight colour is an irradiance, the disc shows
+		// radiance = irradiance / disc solid angle. The vanilla disc (phase picture, about 1 at
+		// its brightest) is multiplied by that, never darkened, capped at moonRadianceCap.
+		const float cap = std::clamp(settings.moonRadianceCap, 1.f, 1000.f);
+		auto discScale = [&](const RE::Moon* a_moon, const float3& a_color) {
+			if (!a_moon || !a_moon->moonMesh || !sky->root)
+				return 1.f;
+			const float dist = (a_moon->moonMesh->world.translate - sky->root->world.translate).Length();
+			// Bounding sphere of the square moon quad -> radius of the inscribed disc.
+			const float radius = a_moon->moonMesh->worldBound.radius * 0.70710678f;
+			if (!(radius > 0.f) || dist <= radius)
+				return 1.f;
+			const float sinR = radius / dist;
+			const float solidAngle = 2.f * DirectX::XM_PI * (1.f - std::sqrt(1.f - sinR * sinR));
+			const float irradiance = (0.2126f * a_color.x + 0.7152f * a_color.y + 0.0722f * a_color.z) * a_exposure;
+			return std::clamp(irradiance / std::max(solidAngle, 1e-6f), 1.f, cap);
+		};
+		moonCbData.masserDiskScale = discScale(sky->masser, settings.masserColor);
+		moonCbData.secundaDiskScale = discScale(sky->secunda, settings.secundaColor);
+	}
 }
 
 void PhysicalSky::ApplySunLook(int a_look)
@@ -964,11 +1037,27 @@ void PhysicalSky::Reset()
 	}
 	auto masserDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)];
 	auto secundaDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)];
+	// (40d) With the discs left where the game puts them, the glow follows each disc's on-screen
+	// direction (world frame, like the aligned sun above; upstream b2d671ba8's idea). The raw
+	// direction is in the sky root's local frame, so it missed the disc by the north rotation and
+	// the altitude dip.
+	if (skySync.settings.KeepMoonPosition) {
+		if (auto* sky = globals::game::sky) {
+			RE::NiPoint3 onScreen;
+			if (SkySync::OnScreenDirection(sky->masser, sky, onScreen))
+				masserDir = onScreen;
+			if (SkySync::OnScreenDirection(sky->secunda, sky, onScreen))
+				secundaDir = onScreen;
+		}
+	}
 
 	float sunAngle = DirectX::XMConvertToRadians(90.f) - acos(sunDir.z);
 	float adaptAmount = (sunAngle - settings.adaptationStart) / (settings.adaptationEnd - settings.adaptationStart);
 	adaptAmount = std::min(1.f, std::max(0.f, adaptAmount));
 	float exposure = settings.dayExposure * exp(log(settings.nightExposure / settings.dayExposure) * adaptAmount);
+
+	float3 masserGlow, secundaGlow;
+	UpdateMoonData(exposure, masserGlow, secundaGlow);
 
 	cbData = {
 		.texDim = res,
@@ -980,11 +1069,11 @@ void PhysicalSky::Reset()
 		.trMix = settings.trMix,
 		.masserDir = { masserDir.x, masserDir.y, masserDir.z },
 		.apLumMix = settings.apLumMix,
-		.masserColor = settings.masserColor * exposure,
+		.masserColor = masserGlow,
 		.apTrMix = settings.apTrMix,
 		.secundaDir = { secundaDir.x, secundaDir.y, secundaDir.z },
 		.sunDiskCos = cos(Batch37b::IsOn() ? DirectX::XMConvertToRadians(std::clamp(settings.sunDiskRadiusDeg, 0.05f, 10.f)) : settings.sunDiskRad) * (settings.proceduralSun ? 1.f : 0.f),
-		.secundaColor = settings.secundaColor * exposure,
+		.secundaColor = secundaGlow,
 		.enabled = allGood,
 		.tonemapper = linearLighting.settings.enableLinearLighting ? 0 : settings.tonemapper,
 		.vanillaMix = settings.vanillaMix,
@@ -1015,7 +1104,8 @@ void PhysicalSky::Reset()
 			color /= pbrCompensationMult;
 			return RE::NiColor(color.x, color.y, color.z);
 		};
-		skySync.lightColors = { LightConvFn(cbData.sunlightColor), LightConvFn(cbData.masserColor), LightConvFn(cbData.secundaColor) };
+		// (40d) The moonlight keeps the full colour: the glow strength only scales the sky LUTs.
+		skySync.lightColors = { LightConvFn(cbData.sunlightColor), LightConvFn(settings.masserColor * exposure), LightConvFn(settings.secundaColor * exposure) };
 	} else {
 		linearLighting.isDirLightLinear = false;
 	}
@@ -1199,7 +1289,8 @@ void PhysicalSky::SetSunDrawFlags(const RE::BSRenderPass* a_pass)
 {
 	auto& descriptor = globals::state->permutationData.ExtraShaderDescriptor;
 	descriptor &= ~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare) |
-	                static_cast<uint32_t>(State::ExtraShaderDescriptors::IsNewMoon));
+	                static_cast<uint32_t>(State::ExtraShaderDescriptors::IsNewMoon) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsMoon) |
+	                static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSecunda));
 
 	if (!a_pass || !a_pass->shaderProperty)
 		return;
@@ -1212,6 +1303,17 @@ void PhysicalSky::SetSunDrawFlags(const RE::BSRenderPass* a_pass)
 				 skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON_SHADOW) &&
 			 globals::features::physicalSky.settings.hideNewMoonDisc && IsNewMoonDraw(a_pass))
 		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsNewMoon);
+
+	// (40d) The moon disc itself (not its star mask, SO_MOON_SHADOW), for "Moon Physical Brightness".
+	if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON && globals::features::physicalSky.settings.moonPhysicalRadiance) {
+		if (const auto sky = RE::Sky::GetSingleton(); sky && a_pass->geometry) {
+			const auto* geometry = static_cast<const void*>(a_pass->geometry);
+			if (sky->masser && geometry == sky->masser->moonMesh.get())
+				descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsMoon);
+			else if (sky->secunda && geometry == sky->secunda->moonMesh.get())
+				descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsMoon) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSecunda);
+		}
+	}
 }
 
 bool PhysicalSky::IsNewMoonDraw(const RE::BSRenderPass* a_pass)
@@ -1247,7 +1349,8 @@ void PhysicalSky::ClearSunDrawFlags()
 {
 	globals::state->permutationData.ExtraShaderDescriptor &=
 		~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSun) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare) |
-	                static_cast<uint32_t>(State::ExtraShaderDescriptors::IsNewMoon));
+	                static_cast<uint32_t>(State::ExtraShaderDescriptors::IsNewMoon) | static_cast<uint32_t>(State::ExtraShaderDescriptors::IsMoon) |
+	                static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSecunda));
 }
 
 void PhysicalSky::Hooks::BSSkyShader_SetupGeometry::thunk(RE::BSShader* This, RE::BSRenderPass* Pass, uint32_t RenderFlags)

@@ -153,6 +153,19 @@ struct PhysicalSky final : public Feature
 		/// (batch 37c) Hide the solid black disc the game draws for a new moon (both moons share
 		/// the vanilla phase cycle, so both go black on the same nights).
 		bool hideNewMoonDisc = true;
+		/// (40d) Scales only the glow each moon puts into the physical sky (the scattering LUTs),
+		/// not the moonlight used for lighting and shadows. At 1 the glow next to the disc is about
+		/// as bright as the vanilla disc itself with strong moonlight, so the discs look washed out;
+		/// 0.2 keeps the disc about 5x brighter than its glow while the night sky keeps a moonlit
+		/// tint.
+		float moonGlowStrength = 0.2f;
+		/// (40d) Each moon's glow follows its phase (new moon ~0) and its vanilla visibility
+		/// (hidden or faded out = no glow).
+		bool moonGlowFollowsMoon = true;
+		/// (40d) Moon disc brightness = moonlight / disc solid angle (like the sun's Physical
+		/// Brightness), capped at moonRadianceCap; the phase picture keeps its shading.
+		bool moonPhysicalRadiance = false;
+		float moonRadianceCap = 8.f;
 
 		// (batch 37b) Upstream correctness fixes, each ANDed with Batch37b::IsOn().
 		bool fixSkyAlpha = true;  // 5846ad833: sky dome written opaque
@@ -263,6 +276,7 @@ struct PhysicalSky final : public Feature
 		kExtApShadowDepthFix = 1u << 6,
 		kExtReflectionSkyFix = 1u << 7,
 		kExtMultiScatterFix = 1u << 8,
+		kExtMoonPhysicalRadiance = 1u << 9,  // (40d)
 	};
 	struct ExtCbData
 	{
@@ -273,6 +287,19 @@ struct PhysicalSky final : public Feature
 	} extCbData;
 	static_assert(sizeof(ExtCbData) == 16);
 	void UpdateExtCbData();
+
+	/// (40d) Mirrors SharedData::PhysSkyMoonData (HLSL), appended at the very end of FeatureData.
+	/// Multipliers for the vanilla moon disc colour under "Moon Physical Brightness".
+	struct MoonCbData
+	{
+		float masserDiskScale = 1.f;
+		float secundaDiskScale = 1.f;
+		float pad0 = 0.f;
+		float pad1 = 0.f;
+	} moonCbData;
+	static_assert(sizeof(MoonCbData) == 16);
+	/// (40d) Moon glow scale for the LUTs (strength x phase x visibility) and disc scales.
+	void UpdateMoonData(float a_exposure, float3& a_masserGlow, float3& a_secundaGlow);
 
 	/// (batch 37c) "Sun Look" presets.
 	enum SunLook : int

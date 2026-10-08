@@ -217,7 +217,11 @@ public:
 		// (batch 39b) Set per draw by the BSLightingShader::SetupGeometry hook in Hooks.cpp: the
 		// geometry is skinned or belongs to an actor (body, worn armour and clothing, weapons and
 		// anything else attached to the actor's 3D). Dynamic Snow keeps its snow off these.
-		IsActorGeometry = 1 << 11
+		IsActorGeometry = 1 << 11,
+		// (40d) Set per draw by PhysicalSky's sky hook on Masser's / Secunda's disc (not the star
+		// mask) while "Moon Physical Brightness" is on; IsSecunda picks the second moon's scale.
+		IsMoon = 1 << 12,
+		IsSecunda = 1 << 13
 	};
 
 	enum class ExtraFeatureDescriptors : uint32_t

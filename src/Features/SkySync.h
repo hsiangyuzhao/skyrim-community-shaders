@@ -35,6 +35,14 @@ public:
 		int32_t MoonLightSource = 0;
 		int32_t SunPath = 0;
 		float CustomAngle = -35.0f;
+		/// (40d) Each moon's orbit angle follows the total game time instead of the engine's
+		/// per-frame accumulation (which counts a backwards time change as +24 h and throws
+		/// Secunda, 20% faster than Masser, to a random place on every time skip).
+		bool StableMoonOrbit = true;
+		/// (40d) Leave the moons where the game puts them: no altitude dip written into their
+		/// rotation (upstream 54962ef3b). Physical Sky then reads each moon's on-screen
+		/// direction (upstream b2d671ba8's idea), so its glow sits on the disc.
+		bool KeepMoonPosition = true;
 	};
 
 	Settings settings;
@@ -211,6 +219,19 @@ private:
 	static float CalculateVisibility(const RE::NiPoint3& dir, float dist, float radius);
 
 	static void SetSunBaseVisibility(const RE::Sun* sun, float visibility);
+
+	/// (40d) Writes the orbit angle (Moon+0xCC) from the total game hours and sets the last
+	/// hour (+0xD0) to the current hour, so the engine's own update adds nothing. SE 1.5.97 only.
+	static void SetStableMoonAngle(RE::Moon* moon, const RE::Sky* sky);
+
+public:
+	/// (40d) Brightness factor of the moon's current phase picture (new 0.05 .. full 1), read
+	/// from the texture on its disc, as the phase factor above.
+	static float PhaseFactorFromTexture(const RE::Moon* moon);
+	/// (40d) The moon's vanilla visibility: 0 when hidden, else its disc's fade alpha.
+	static float VanillaVisibility(const RE::Moon* moon);
+	/// (40d) World-space direction from the sky's centre to the moon's disc; false if unknown.
+	static bool OnScreenDirection(const RE::Moon* moon, const RE::Sky* sky, RE::NiPoint3& outDir);
 
 	static float SmoothStep(float start, float end, float x);
 };

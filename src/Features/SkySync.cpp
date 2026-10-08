@@ -8,7 +8,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	UseAlternateSunPath,
 	MoonLightSource,
 	SunPath,
-	CustomAngle)
+	CustomAngle,
+	StableMoonOrbit,
+	KeepMoonPosition)
 
 void SkySync::DrawSettings()
 {
@@ -35,6 +37,23 @@ void SkySync::DrawSettings()
 	ImGui::SliderInt("Moon light source", &settings.MoonLightSource, 0, static_cast<uint8_t>(MoonLightSource::Count) - 1, MoonLightSourceNames[settings.MoonLightSource], ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Which moon lights the night. Brightest = whichever moon is brighter.");
+
+	ImGui::Checkbox("Stable Moon Orbit", &settings.StableMoonOrbit);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted(
+			"Places each moon from the date and time instead of stepping it forward every frame.\n"
+			"The game counts a time change backwards as almost a whole day forwards, and Secunda moves 20% faster\n"
+			"than Masser, so every time skip threw Secunda to a random spot, often below the horizon.\n"
+			"On (default): the moons are always where the date and time say. Off: the game's own stepping.");
+	if (!REL::Module::IsSE())
+		ImGui::TextDisabled("(only on Skyrim SE 1.5.97; does nothing here)");
+
+	ImGui::Checkbox("Keep Moons Where the Game Puts Them", &settings.KeepMoonPosition);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted(
+			"On (default): Sky Sync no longer lowers the moon discs by your altitude (1.5-4 degrees), as in current\n"
+			"upstream; Physical Sky's moon glow follows the disc's real position on screen. The moonlight direction is\n"
+			"unchanged. Off: the discs are lowered as before and the glow uses the un-lowered direction.");
 }
 
 void SkySync::LoadSettings(json& o_json)
@@ -202,7 +221,10 @@ void SkySync::ProcessMoon(const RE::Moon* moon, const float time, const Caster t
 	rawDirections[static_cast<int>(type)] = dir;
 
 	auto apparentDir = GetApparentDirection(dir, altitude);
-	SetMoonDirection(moon, apparentDir);
+	// (40d) Off = the old behaviour: the altitude dip is written into the moon's rotation, which
+	// moves the disc. On: the disc stays where the game put it; only the light uses the dip.
+	if (!settings.KeepMoonPosition)
+		SetMoonDirection(moon, apparentDir);
 
 	// Moon and Stars adjusts some intermediary rotation matrices for the moon
 	// Directly changing the directions here avoids 3 matrix multiplications and a vector rotation
@@ -467,6 +489,9 @@ void SkySync::Moon_Update::thunk(RE::Moon* moon, RE::Sky* sky)
 {
 	const auto updateMoonTexture = moon->updateMoonTexture;
 
+	if (const auto& singleton = globals::features::skySync; singleton.settings.Enabled && singleton.settings.StableMoonOrbit)
+		SetStableMoonAngle(moon, sky);
+
 	func(moon, sky);
 
 	if (auto& singleton = globals::features::skySync; singleton.settings.Enabled && updateMoonTexture != moon->updateMoonTexture) {
@@ -515,4 +540,93 @@ inline float SkySync::SmoothStep(const float start, const float end, const float
 {
 	const float t = std::clamp((x - start) / (end - start), 0.0f, 1.0f);
 	return t * t * (3.0f - 2.0f * t);
+}
+
+void SkySync::SetStableMoonAngle(RE::Moon* moon, const RE::Sky* sky)
+{
+	// (40d) SkyrimSE.exe 1.5.97, Moon::Update (ID 25626 = 0x1403ADF90), read with dumpbin for
+	// this change:
+	//   if (moon+0xD0 == FLT_MAX) { moon+0xCC = 90.0f; moon+0xD0 = 0 }     first update
+	//   dHour = sky+0x1B0 (currentGameHour) - moon+0xD0;  if (dHour < 0) dHour += 24
+	//   moon+0xCC += moon+0xBC (speed) * 60.0f * dHour, wrapped into [0, 360)
+	//   moon+0xD0 = sky+0x1B0
+	// Writing the angle for the total game time and moon+0xD0 = the current hour makes dHour 0,
+	// so the engine keeps the angle (and does everything else as before). With no time skip the
+	// result equals the engine's own stepping. The offsets are not verified on other runtimes:
+	// there this does nothing. Moon and Stars drives the moons itself: left alone.
+	static const bool verified = !REL::Module::IsVR() && REL::Module::get().version() == SKSE::RUNTIME_SSE_1_5_97;
+	if (!verified || !moon || !sky || globals::features::skySync.moonAndStarsLoaded)
+		return;
+	const auto calendar = RE::Calendar::GetSingleton();
+	if (!calendar)
+		return;
+	const double hours = static_cast<double>(calendar->GetHoursPassed());
+	const double speed = static_cast<double>(moon->speed);
+	if (!std::isfinite(hours) || hours < 0.0 || !std::isfinite(speed))
+		return;
+	double angle = std::fmod(90.0 + speed * 60.0 * hours, 360.0);
+	if (angle < 0.0)
+		angle += 360.0;
+	moon->unkCC = static_cast<float>(angle);
+	moon->unkD0 = sky->currentGameHour;
+}
+
+float SkySync::PhaseFactorFromTexture(const RE::Moon* moon)
+{
+	if (!moon || !moon->moonMesh)
+		return 1.0f;
+	const auto property = skyrim_cast<RE::BSSkyShaderProperty*>(moon->moonMesh->GetGeometryRuntimeData().properties[1].get());
+	const auto texture = property ? property->GetBaseTexture() : nullptr;
+	const char* name = texture ? texture->name.c_str() : nullptr;
+	if (!name)
+		return 1.0f;
+	std::string lower(name);
+	for (auto& c : lower)
+		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+	// Same table and factors as Moon_Update's phase tracking above.
+	static constexpr std::array<std::pair<std::string_view, RE::Moon::Phases::Phase>, 8> Lookup{
+		{ { "full", RE::Moon::Phases::Phase::kFull },
+			{ "three_wan", RE::Moon::Phases::Phase::kWaningGibbous },
+			{ "half_wan", RE::Moon::Phases::Phase::kWaningQuarter },
+			{ "one_wan", RE::Moon::Phases::Phase::kWaningCrescent },
+			{ "new", RE::Moon::Phases::Phase::kNewMoon },
+			{ "one_wax", RE::Moon::Phases::Phase::kWaxingCrescent },
+			{ "half_wax", RE::Moon::Phases::Phase::kWaxingQuarter },
+			{ "three_wax", RE::Moon::Phases::Phase::kWaxingGibbous } }
+	};
+	RE::Moon::Phases::Phase phase = RE::Moon::Phases::Phase::kFull;
+	for (auto& [suffix, id] : Lookup) {
+		if (lower.find(suffix) != std::string::npos) {
+			phase = id;
+			break;
+		}
+	}
+	if (phase == RE::Moon::Phases::Phase::kNewMoon)
+		return NewMoonIntensityFactor;
+	const float t = (abs(static_cast<float>(phase) - static_cast<float>(RE::Moon::Phases::Phase::kNewMoon)) - 1.0f) / 3.0f;
+	return std::lerp(CrescentMoonIntensityFactor, FullMoonIntensityFactor, t);
+}
+
+float SkySync::VanillaVisibility(const RE::Moon* moon)
+{
+	if (!moon || !moon->root || !moon->moonMesh)
+		return 0.0f;
+	if (moon->root->GetFlags().any(RE::NiAVObject::Flag::kHidden) ||
+		(moon->moonNode && moon->moonNode->GetFlags().any(RE::NiAVObject::Flag::kHidden)) ||
+		moon->moonMesh->GetFlags().any(RE::NiAVObject::Flag::kHidden))
+		return 0.0f;
+	const auto property = skyrim_cast<RE::BSSkyShaderProperty*>(moon->moonMesh->GetGeometryRuntimeData().properties[1].get());
+	return property ? std::clamp(property->kBlendColor.alpha, 0.0f, 1.0f) : 1.0f;
+}
+
+bool SkySync::OnScreenDirection(const RE::Moon* moon, const RE::Sky* sky, RE::NiPoint3& outDir)
+{
+	if (!moon || !moon->moonMesh || !sky || !sky->root)
+		return false;
+	RE::NiPoint3 dir = moon->moonMesh->world.translate - sky->root->world.translate;
+	if (dir.Unitize() <= FLT_EPSILON)
+		return false;
+	outDir = dir;
+	return true;
 }

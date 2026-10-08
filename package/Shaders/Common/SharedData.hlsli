@@ -559,6 +559,15 @@ namespace SharedData
 		float2 pad1;
 	};
 
+	// (40d) Mirrors PhysicalSky::MoonCbData, appended at the very end of FeatureData (offset 1664).
+	// Multipliers for the vanilla moon disc colour under "Moon Physical Brightness".
+	struct PhysSkyMoonData
+	{
+		float MasserDiskScale;
+		float SecundaDiskScale;
+		float2 pad0;
+	};
+
 	namespace PhysSkyExtFlags
 	{
 		static const uint SunReplace = (1 << 0);           // disk replaces the vanilla sun quad
@@ -570,6 +579,7 @@ namespace SharedData
 		static const uint ApShadowDepthFix = (1 << 6);     // depth read of upstream 224312a11
 		static const uint ReflectionSkyFix = (1 << 7);     // upstream 23156dc5f
 		static const uint MultiScatterFix = (1 << 8);      // LutGen part of upstream c14664115
+		static const uint MoonPhysicalRadiance = (1 << 9);  // (40d) moon disc x PhysSkyMoonData scale
 	}
 
 	cbuffer FeatureData : register(b6)
@@ -600,6 +610,7 @@ namespace SharedData
 		VolumetricFogSettings volumetricFogSettings;
 		VolumetricShadowsSettings volumetricShadowsSettings;
 		DynamicSnowSettings dynamicSnowSettings;
+		PhysSkyMoonData physSkyMoonData;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);

@@ -359,6 +359,11 @@ PS_OUTPUT main(PS_INPUT input)
 #		elif defined(DEFERRED) && defined(TEX) && !defined(MOONMASK)
 		// (batch 37c) Not the moon/star mask: it is TEX too, but a sun disk has no business on it.
 		const uint extFlags = SharedData::physSkyExtData.Flags;
+		// (40d) Moon Physical Brightness: the vanilla disc (phase picture and fade alpha kept) is
+		// brightened to moonlight / disc solid angle, so it stands out of its own sky glow.
+		// IsMoon is only set on the two discs, never on the star mask.
+		[branch] if ((extFlags & SharedData::PhysSkyExtFlags::MoonPhysicalRadiance) && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsMoon))
+			psout.Color.xyz *= (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSecunda) ? SharedData::physSkyMoonData.SecundaDiskScale : SharedData::physSkyMoonData.MasserDiskScale;
 		// (batch 37b) Replace mode: the disk lives on the vanilla sun quad only (main view, not
 		// reflections), and the quad's own texture is dropped. Without it the disk is added on
 		// top of every TEX quad as in 37a -- including the glare quad.
