@@ -42,6 +42,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 void ScreenSpaceGI::RestoreDefaultSettings()
 {
 	settings = {};
+	Batch37b::settings.ssgiAoSparesDirect = false;
 	recompileFlag = true;
 }
 
@@ -81,7 +82,13 @@ void ScreenSpaceGI::DrawSettings()
 		ImGui::EndTable();
 	}
 
-	Batch37b::DrawSsgiCheckboxes();
+	ImGui::Checkbox("AO does not darken direct light", &Batch37b::settings.ssgiAoSparesDirect);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted(
+			"Off (default): SSGI's AO dims the ambient light fully and everything else (sunlight, lamps) by its square root.\n"
+			"On: SSGI's AO dims only the ambient light; sunlit corners stay as bright as the sun makes them. With SSRT\n"
+			"diffuse on, its traced bounce light is no longer dimmed either (it has its own occlusion).\n"
+			"Switching it rebuilds one shader: a brief hitch.");
 
 	///////////////////////////////
 	ImGui::SeparatorText("Quality/Performance");
@@ -419,6 +426,9 @@ void ScreenSpaceGI::DrawSettings()
 void ScreenSpaceGI::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	// Its own key wins over the value migrated from the old Advanced."Batch 37b" object.
+	if (o_json.is_object() && o_json.contains("AoSparesDirect") && o_json["AoSparesDirect"].is_boolean())
+		Batch37b::settings.ssgiAoSparesDirect = o_json["AoSparesDirect"].get<bool>();
 
 	recompileFlag = true;
 }
@@ -426,6 +436,7 @@ void ScreenSpaceGI::LoadSettings(json& o_json)
 void ScreenSpaceGI::SaveSettings(json& o_json)
 {
 	o_json = settings;
+	o_json["AoSparesDirect"] = Batch37b::settings.ssgiAoSparesDirect;
 }
 
 void ScreenSpaceGI::SetupResources()

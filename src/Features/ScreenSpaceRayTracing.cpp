@@ -362,20 +362,18 @@ void ScreenSpaceRayTracing::DrawSettings()
 
         bool reblurChanged = false;
 
-        // (batch 36f) Cost switches. Both are runtime switches; the master switch under
-        // Advanced > Batch 36f overrides them.
+        // (batch 36f) Cost switches. Both are runtime switches, on by default (the old master switch
+        // that could override them is frozen on).
         ImGui::Checkbox("Skip Reflection Pre-pass", &settings.ReblurSkipSpecularPrepass);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
                 "Drops REBLUR's reflection pre-pass (~0.3 ms at 1440p). It was only used to track how reflections move, and our reflections are already clean. "
-                "Risk: a little more smearing in reflections during fast camera turns. Off = the 36e behaviour.");
+                "Risk: a little more smearing in reflections during fast camera turns. On by default.");
         ImGui::Checkbox("Fold Unpack Into Composite", &settings.ReblurFoldUnpack);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
                 "Converts REBLUR's output inside the final composite instead of in two extra full-screen passes (~0.15 ms). "
-                "The picture is identical either way; Off = the 36e separate passes.");
-        if (!Batch36f::IsOn())
-            ImGui::TextDisabled("Batch 36f master switch is off (Advanced > Batch 36f): both run as in 36e.");
+                "The picture is identical either way; Off = two separate passes. On by default.");
 
         // (S1.1) The confidence input, off by default and labelled for what it is.
         if (ImGui::Checkbox("Feed Hit Coverage as History Confidence (experimental)", &settings.ReblurFeedHitCoverageConfidence))
@@ -426,8 +424,6 @@ void ScreenSpaceRayTracing::DrawSettings()
         if (!settings.EnableAmbientReinjection)
             ImGui::TextDisabled("Ambient Reinjection is off: only reflections are limited.");
     }
-    if (!Batch36f::IsOn())
-        ImGui::TextDisabled("Batch 36f master switch is off (Advanced > Batch 36f): no distance limit.");
 
     if (SVGFSelected()) {
         ImGui::Checkbox("Pre-Blur", &settings.EnablePreBlur);

@@ -31,7 +31,7 @@ public:
 	virtual std::pair<std::string, std::vector<std::string>> GetFeatureSummary() override
 	{
 		return {
-			"Lets smoke, steam, mist and other see-through effects receive the sun's shadow (Batch 38).\n"
+			"Lets smoke, steam, mist and other see-through effects receive the sun's shadow.\n"
 			"A small blurred copy of the sun shadow map is made each frame and effects sample it.",
 			{ "Smoke and steam darken in shadow",
 				"Soft, cheap shadow lookups (variance shadow map)",
@@ -86,7 +86,7 @@ public:
 	static constexpr uint32_t kVsmSlot = 23;  ///< PS register of the VSM (t23)
 	static constexpr uint32_t kVsmSize = 512;
 
-	// Diagnostics for the Batch 38 table
+	// Diagnostics
 	uint32_t lastBuildFrame = UINT32_MAX;
 	uint32_t sourceWidth = 0;
 	bool usedGodRayMaps = false;

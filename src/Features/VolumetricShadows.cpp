@@ -274,10 +274,7 @@ void VolumetricShadows::OnShadowCapture(ID3D11ShaderResourceView* a_shadowMap)
 
 void VolumetricShadows::DrawSettings()
 {
-	const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
-	ImGui::SeparatorText("Batch 38");
-	if (!Batch38::IsOn())
-		ImGui::TextColored(palette.Warning, "Off: Advanced > Batch 38 master switch is off (37c behaviour).");
+	ImGui::SeparatorText("Sun Shadow on Effects");
 
 	ImGui::Checkbox("Smoke & Particles Receive Sun Shadow", &settings.ParticleShadows);
 	if (auto _tt = Util::HoverTooltipWrapper())

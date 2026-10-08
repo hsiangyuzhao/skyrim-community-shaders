@@ -2,6 +2,8 @@
 
 #include <DDSTextureLoader.h>
 
+#include "Utils/Batch39Engine.h"
+
 void WaterEffects::SetupResources()
 {
 	auto device = globals::d3d::device;
@@ -20,4 +22,9 @@ void WaterEffects::Prepass()
 bool WaterEffects::HasShaderDefine(RE::BSShader::Type)
 {
 	return true;
+}
+
+void WaterEffects::DrawSettings()
+{
+	Batch39Engine::DrawWaterReflectionSettings();
 }

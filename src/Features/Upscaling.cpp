@@ -343,14 +343,7 @@ void Upscaling::DrawSettings()
 
 		if (nr.enabled) {
 			// Everything that can stop the pass, stated rather than left to a silent no-op.
-			const bool batch38 = Batch38::IsOn();
-			if (!batch38 && d3d12SwapChainActive && IsFrameGenerationRequestedNow()) {
-				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Blocked: Frame Generation is running. Switch it off -- no restart needed.");
-				ImGui::PopStyleColor();
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("Batch 38 is off (Advanced > Batch 38), so the 37c rule applies: no Neural Rendering while Frame Generation runs. Turn Batch 38 on to allow both.");
-			} else if (batch38) {
+			{
 				const auto& frameStatus = NeuralRendering::GetFrameStatus();
 				if (frameStatus.blockedReason[0] != '\0' && std::string_view(frameStatus.blockedReason) != "switched off") {
 					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
@@ -404,10 +397,8 @@ void Upscaling::DrawSettings()
 			ImGui::Checkbox("Auto Mask", &nr.useAutoMask);
 			ImGui::Checkbox("UI Correction", &nr.uiCorrection);
 
-			// (batch 38a) Placement, frame generation and cost. Governed by Advanced > Batch 38.
-			ImGui::SeparatorText("Placement and cost (Batch 38)");
-			if (!Batch38::IsOn())
-				ImGui::TextDisabled("Batch 38 is off (Advanced > Batch 38): these have no effect; 37c behaviour.");
+			// (batch 38a) Placement, frame generation and cost.
+			ImGui::SeparatorText("Placement and cost");
 
 			ImGui::Checkbox("Allow with Frame Generation", &nr.allowWithFrameGeneration);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -440,12 +431,12 @@ void Upscaling::DrawSettings()
 				ImGui::Checkbox("Tone-matched input (before upscaling)", &nr.toneMatchedInput);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::TextUnformatted("On: the model is shown the scene with the game's own exposure and colour grading / tone curve applied, i.e. close to what the finished image looks like. Its changes are converted back exactly.");
-					ImGui::TextUnformatted("Off: the 38a version, a darker and flatter picture the model tends to brighten and re-colour.");
+					ImGui::TextUnformatted("Off: a darker and flatter picture (plain Reinhard wrap) the model tends to brighten and re-colour.");
 				}
-				if (nr.toneMatchedInput && Batch38::IsOn())
+				if (nr.toneMatchedInput)
 					ImGui::TextDisabled("Curve from: %s", NeuralRendering::ToneSourceText());
 
-				const char* precisions[] = { "8-bit (38a)", "10-bit", "16-bit float" };
+				const char* precisions[] = { "8-bit", "10-bit", "16-bit float" };
 				int precisionIndex = static_cast<int>(std::min(nr.inputPrecision, 2u));
 				if (ImGui::Combo("Input Precision (before upscaling)", &precisionIndex, precisions, IM_ARRAYSIZE(precisions)))
 					nr.inputPrecision = static_cast<uint>(precisionIndex);
@@ -465,7 +456,7 @@ void Upscaling::DrawSettings()
 
 			ImGui::Checkbox("Apply tuning at creation", &nr.tuningAtCreate);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("The model only reads Intensity, the three strengths, Style, Auto Mask and UI Correction when it starts up, so 38a's sliders never reached it.");
+				ImGui::TextUnformatted("The model only reads Intensity, the three strengths, Style, Auto Mask and UI Correction when it starts up, so without this the sliders never reach it.");
 				ImGui::TextUnformatted("On: they are given at start-up, and a change restarts the model about half a second after you stop moving the slider.");
 			}
 
@@ -477,7 +468,7 @@ void Upscaling::DrawSettings()
 				}
 			}
 
-			if (Batch38::IsOn()) {
+			{
 				const auto& frameStatus = NeuralRendering::GetFrameStatus();
 				const auto& nrRenderer = NeuralRendering::Renderer::Instance();
 				if (frameStatus.running) {

@@ -17,10 +17,7 @@
 #include "SettingsOverrideManager.h"
 #include "ShaderCache.h"
 #include "TruePBR.h"
-#include "Utils/Batch36f.h"
 #include "Utils/Batch37b.h"
-#include "Utils/Batch38.h"
-#include "Utils/Batch39.h"
 #include "Utils/Batch39Engine.h"
 #include "Utils/FileSystem.h"
 #include "Utils/GpuPhaseTimeline.h"
@@ -353,15 +350,13 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				shaderCache->SetFileWatcher(advanced["Use FileWatcher"]);
 			if (advanced["Frame Annotations"].is_boolean())
 				frameAnnotations = advanced["Frame Annotations"];
-			if (advanced.contains("Batch 36f"))
-				Batch36f::Load(advanced["Batch 36f"]);
+			// Old per-batch objects: master switches and frozen items are ignored; the remaining
+			// options are migrated (their new home wins when both exist).
 			if (advanced.contains("Batch 37b"))
 				Batch37b::Load(advanced["Batch 37b"]);
-			if (advanced.contains("Batch 38"))
-				Batch38::Load(advanced["Batch 38"]);
-			if (advanced.contains("Batch 39"))
-				Batch39::Load(advanced["Batch 39"]);
-			if (advanced.contains("Batch 39 Engine"))
+			if (advanced.contains("Engine"))
+				Batch39Engine::Load(advanced["Engine"]);
+			else if (advanced.contains("Batch 39 Engine"))
 				Batch39Engine::Load(advanced["Batch 39 Engine"]);
 		}
 
@@ -505,11 +500,7 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Background Compiler Threads"] = shaderCache->backgroundCompilationThreadCount;
 	advanced["Use FileWatcher"] = shaderCache->UseFileWatcher();
 	advanced["Frame Annotations"] = frameAnnotations;
-	advanced["Batch 36f"] = Batch36f::Save();
-	advanced["Batch 37b"] = Batch37b::Save();
-	advanced["Batch 38"] = Batch38::Save();
-	advanced["Batch 39"] = Batch39::Save();
-	advanced["Batch 39 Engine"] = Batch39Engine::Save();
+	advanced["Engine"] = Batch39Engine::Save();
 	settings["Advanced"] = advanced;
 
 	json general;

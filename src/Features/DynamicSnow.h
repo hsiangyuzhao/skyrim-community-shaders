@@ -55,7 +55,7 @@ public:
 	{
 		return {
 			"Snow builds up on the ground, roofs and rocks while it snows and melts away afterwards, "
-			"and people and creatures leave footprints in snow (Batch 39).",
+			"and people and creatures leave footprints in snow.",
 			{ "Snow builds up on upward-facing surfaces while it snows, not under roofs",
 				"Melts gradually after the snow stops",
 				"Snow on trees, bushes, grass and distant trees",

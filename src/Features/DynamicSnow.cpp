@@ -1312,9 +1312,8 @@ void DynamicSnow::Prepass()
 
 void DynamicSnow::DrawSettings()
 {
-	if (ImGui::TreeNodeEx("Snow Accumulation (Batch 39)", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::TreeNodeEx("Snow Accumulation", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Enable Snow Accumulation", &settings.EnableAccumulation);
-		Batch39::MasterNote();
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"While it snows, the tops of the ground, roofs, rocks and other upward-facing surfaces slowly turn white;\n"
@@ -1356,13 +1355,13 @@ void DynamicSnow::DrawSettings()
 		ImGui::SliderFloat("Max Coverage", &settings.MaxCoverage, 0.0f, 1.0f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted("How white a fully snowed-over surface gets. 1 = completely covered.");
-		ImGui::Checkbox("Even Cover on Roofs and Slopes (39c)", &settings.SlopeCoverage);
+		ImGui::Checkbox("Even Cover on Roofs and Slopes", &settings.SlopeCoverage);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"On (default): how much snow a surface holds depends on its overall slope only, with a gentle\n"
 				"fade between the two angles below, so a roof gets the same cover whatever its texture. The\n"
 				"texture's bumps only decide where thin snow sits first, and thick snow hides them.\n"
-				"Off: the 39b rule (a hard cut at Normal Threshold, half decided by the texture's bumps):\n"
+				"Off: the older rule (a hard cut at Normal Threshold, half decided by the texture's bumps):\n"
 				"steep thatch roofs came out thin and streaky.");
 		if (settings.SlopeCoverage) {
 			auto degrees = [](float a_z) { return std::acos(std::clamp(a_z, 0.0f, 1.0f)) * 57.2958f; };
@@ -1385,7 +1384,7 @@ void DynamicSnow::DrawSettings()
 					settings.NormalThreshold, std::acos(std::clamp(settings.NormalThreshold, 0.0f, 1.0f)) * 57.2958f);
 		}
 
-		ImGui::Checkbox("Snow on Trees and Bushes (39c)", &settings.SnowOnTrees);
+		ImGui::Checkbox("Snow on Trees and Bushes", &settings.SnowOnTrees);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Trees, bushes and ferns get snow on the tops of their branches and leaves.\n"
@@ -1393,7 +1392,7 @@ void DynamicSnow::DrawSettings()
 		ImGui::BeginDisabled(!settings.SnowOnTrees);
 		ImGui::SliderFloat("Tree Snow Amount", &settings.TreeCoverage, 0.0f, 1.0f, "%.2f");
 		ImGui::EndDisabled();
-		ImGui::Checkbox("Snow on Grass (39c)", &settings.SnowOnGrass);
+		ImGui::Checkbox("Snow on Grass", &settings.SnowOnGrass);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Grass turns white from the root up as snow builds (as if half buried), with a dusting on top.\n"
@@ -1401,7 +1400,7 @@ void DynamicSnow::DrawSettings()
 		ImGui::BeginDisabled(!settings.SnowOnGrass);
 		ImGui::SliderFloat("Grass Snow Amount", &settings.GrassCoverage, 0.0f, 1.0f, "%.2f");
 		ImGui::EndDisabled();
-		ImGui::Checkbox("Snow on Distant Trees (39c)", &settings.SnowOnLodTrees);
+		ImGui::Checkbox("Snow on Distant Trees", &settings.SnowOnLodTrees);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Far-away (LOD) trees get a matching white tint, whiter towards the top,\n"
@@ -1438,9 +1437,8 @@ void DynamicSnow::DrawSettings()
 
 	ImGui::Spacing();
 
-	if (ImGui::TreeNodeEx("Footprints and Trails (Batch 39)", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::TreeNodeEx("Footprints and Trails", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Enable Footprints", &settings.EnableTrails);
-		Batch39::MasterNote();
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"The player and nearby people and creatures leave footprints in snow, which slowly fill back in.\n"
@@ -1462,7 +1460,7 @@ void DynamicSnow::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted("Off = only the player leaves prints.");
 
-		ImGui::Checkbox("Use Installed Footprint Textures (39c)", &settings.UseModFootprintShapes);
+		ImGui::Checkbox("Use Installed Footprint Textures", &settings.UseModFootprintShapes);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Shapes the prints like real boots and paws, read from the footprint textures of mods you have\n"
@@ -1477,7 +1475,7 @@ void DynamicSnow::DrawSettings()
 			else
 				ImGui::TextDisabled("  none found: oval prints");
 		}
-		ImGui::Checkbox("Leave Snowy Ground to the Footprints Mod (39c)", &settings.YieldToFootprintsMod);
+		ImGui::Checkbox("Leave Snowy Ground to the Footprints Mod", &settings.YieldToFootprintsMod);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Only matters when the Footprints mod (Footprints.esp) is loaded. It already puts its own prints on\n"
@@ -1487,7 +1485,7 @@ void DynamicSnow::DrawSettings()
 				"in, work on built-up snow and for every nearby actor.");
 		ImGui::SameLine();
 		ImGui::TextDisabled(status.footprintsMod ? "(Footprints mod: loaded)" : "(Footprints mod: not loaded)");
-		ImGui::Checkbox("Trenches from Bodies and Objects (39c)", &settings.BodyAndObjectTrails);
+		ImGui::Checkbox("Trenches from Bodies and Objects", &settings.BodyAndObjectTrails);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Bodies being dragged or sliding, and loose objects moving through snow, leave trenches\n"
@@ -1514,7 +1512,7 @@ void DynamicSnow::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Reads the footprint map with a smooth (bicubic) filter, so the print's edges and slopes are soft\n"
-				"instead of showing the map's square grid (the 'mosaic' look). Off = the 39a reading, for comparison.");
+				"instead of showing the map's square grid (the 'mosaic' look). Off = the plain blocky reading, for comparison.");
 		const char* resolutions[] = { "1024 (4 units per texel, 4 MB)", "2048 (2 units per texel, 16 MB)", "4096 (1 unit per texel, 64 MB)" };
 		ImGui::Combo("Trail Map Detail", &settings.TrailResolution, resolutions, 3);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -1529,7 +1527,7 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextUnformatted(
 				"Finds the snow that is already part of the map (e.g. High Hrothgar): ground whose land texture is marked as snow,\n"
 				"has a snow material, or has 'snow' in its file name, also with PBR terrain mods; and white directional snow on rocks.\n"
-				"Prints there are snow prints, and built-up snow leaves it as it is. Off = 39a, where PBR terrain never counted as snow.");
+				"Prints there are snow prints, and built-up snow leaves it as it is. Off = PBR terrain never counts as snow.");
 		ImGui::BeginDisabled(!settings.DetectAuthoredSnow);
 		ImGui::Checkbox("Also Guess From Colour (bright white ground)", &settings.AlbedoSnowGuess);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -1560,7 +1558,7 @@ void DynamicSnow::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Check only: if the shaped prints point backwards (toe where the heel should be), tick this.\n"
-				"The installed textures carry no direction marker; 39c assumes the heel is at the image's top.");
+				"The installed textures carry no direction marker; the heel is assumed to be at the image's top.");
 		ImGui::TreePop();
 	}
 }

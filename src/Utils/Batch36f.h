@@ -1,42 +1,18 @@
 #pragma once
 
 /**
- * @brief Batch 36f master switch (Advanced -> "Batch 36f").
+ * @brief Denoiser savings (former batch 36f master switch).
  *
- * Off = every batch 36f denoiser saving takes its batch 36e path, whatever its own switch says.
- * Each call site ANDs its own setting with IsOn(), so the switch is read every frame: no
- * restart, no cache clear.
+ * The master switch was removed from the menu: the savings are always on, which is how every
+ * saved configuration ran them (the switch defaulted to on and was never turned off). The old
+ * key Advanced."Batch 36f".Master is ignored. Call sites keep ANDing their own setting with
+ * IsOn(), so each item still follows its own switch exactly as before.
  *
- * Governed (36f items only; later batches get their own switch):
- * - Screen Space Ray Tracing: Skip Reflection Pre-pass (Settings::ReblurSkipSpecularPrepass),
- *   Distance Limit (Settings::DistanceLimit), Fold Unpack Into Composite
- *   (Settings::ReblurFoldUnpack)
- * - NRD: motion-vector copy limited to the render rectangle (no switch of its own)
- *
- * Not governed: the Denoiser breakdown panel fixes (display only).
+ * Covers: Screen Space Ray Tracing Skip Reflection Pre-pass, Distance Limit, Fold Unpack Into
+ * Composite; NRD motion-vector copy limited to the render rectangle.
  */
 namespace Batch36f
 {
-	struct Settings
-	{
-		bool master = true;
-	};
-
-	inline Settings settings{};
-
-	/// @brief Whether batch 36f savings may run this frame.
-	inline bool IsOn() { return settings.master; }
-
-	inline void Load(const json& a_json)
-	{
-		if (a_json.is_object() && a_json.contains("Master") && a_json["Master"].is_boolean())
-			settings.master = a_json["Master"].get<bool>();
-	}
-
-	inline json Save()
-	{
-		json o;
-		o["Master"] = settings.master;
-		return o;
-	}
+	/// @brief Always true (the master switch is frozen on).
+	constexpr bool IsOn() { return true; }
 }

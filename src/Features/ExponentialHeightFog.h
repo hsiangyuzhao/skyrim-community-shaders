@@ -18,7 +18,7 @@ struct ExponentialHeightFog : Feature
 				"Added exponential height fog effect",
 				"Adapted to vanilla fog settings",
 				"Creates atmospheric depth",
-				"Optional volumetric fog lit by the sun, sky and nearby lights (Batch 38)",
+				"Optional volumetric fog lit by the sun, sky and nearby lights",
 			}
 		};
 	}

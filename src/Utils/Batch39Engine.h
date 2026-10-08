@@ -20,9 +20,10 @@ namespace RE
  *  3. Temporal LOD dither (the fade-in/out screen door re-thresholded every frame).
  *  4. Texture clarity: DLSS mip bias on the remaining material textures, optional 16x AF.
  *
- * Every switch is ANDed with Batch39::IsOn() (see the *Active() helpers); with the master off
- * every path is the 38b one. The breakdowns (overlay rows, F12 JSON) are diagnostics and run
- * regardless. Settings are saved under Advanced."Batch 39 Engine".
+ * The batch master switch is frozen on (Batch39::IsOn() is always true). Only three options are
+ * left in the menu (Water > Water Effects > Reflection Cubemap) and saved, under Advanced."Engine";
+ * every other setting keeps its default, the frozen value. The breakdowns (overlay rows, F12
+ * JSON) are diagnostics.
  *
  * What the engine does (SkyrimSE.exe 1.5.97, read off the binary for batch 39):
  * - TESWaterReflections::Update (ID 31373) renders the water cubemap only through
@@ -151,8 +152,11 @@ namespace Batch39Engine
 	void OnSamplerCreated(ID3D11Device* a_device, const D3D11_SAMPLER_DESC& a_requested, ID3D11SamplerState* a_clamped, CreateSamplerFn a_create);
 
 	// ---- diagnostics -----------------------------------------------------------------------
-	/// @brief Batch 39 section of the F12 frame JSON.
+	/// @brief "engine" section of the F12 frame JSON.
 	json DiagnosticsJson();
+
+	/// @brief Water > Water Effects > Reflection Cubemap: the options that stayed in the menu.
+	void DrawWaterReflectionSettings();
 
 	/// @brief Releases resources (shader cache clear / device reset).
 	void ClearShaderCache();

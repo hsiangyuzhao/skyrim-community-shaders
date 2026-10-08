@@ -71,7 +71,6 @@ void PostProcessing::DrawSettings()
 	ImGui::Checkbox("Disable Vanilla Tonemapping", (bool*)&settings.DisableVanillaTonemapping);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Skips Skyrim's own final image pass (tonemapping, vanilla bloom and colour grading), so only the effects below shape the look.");
-	Batch37b::DrawPostProcessCheckbox();
 
 	ImGui::Separator();
 

@@ -29,6 +29,7 @@
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "BuildLabel.h"
 #include "Utils/Batch39Engine.h"
 #include "Utils/FileSystem.h"
 #include "Utils/Format.h"
@@ -1738,7 +1739,7 @@ namespace
 					{ P::DepthObjects, "Objects", "Solid objects: buildings, rocks, clutter, furniture..." },
 					{ P::DepthCharacters, "Characters", "People and creatures." },
 					{ P::DepthTrees, "Trees", "Full-detail trees." },
-					{ P::DepthGrass, "Grass", "Grass blades (alpha-tested). Advanced > Batch 39 can leave grass out of the prepass." },
+					{ P::DepthGrass, "Grass", "Grass blades (alpha-tested)." },
 					{ P::DepthLODLand, "LOD terrain", "Far-away terrain (bLodZPrepass)." },
 					{ P::DepthLODObjects, "LOD objects", "Far-away objects (distant buildings, mountains)." },
 					{ P::DepthLODTrees, "LOD trees", "Far-away tree billboards." },
@@ -1765,7 +1766,7 @@ namespace
 					{ P::FirstPerson, "First person", "Your hands and weapon in first person." },
 				} },
 			// (batch 39, item 1) Split per draw. The cubemap holds only these four kinds of things.
-			{ "Reflections", "The engine's water reflection cubemap (distant water). Advanced > Batch 39 can thin it out.",
+			{ "Reflections", "The engine's water reflection cubemap (distant water). Options: Water > Water Effects > Reflection Cubemap.",
 				{
 					{ P::ReflLODLand, "LOD terrain", "Far-away terrain in the reflection (bReflectLODLand)." },
 					{ P::ReflLODObjects, "LOD objects", "Far-away objects in the reflection (bReflectLODObjects)." },
@@ -4114,7 +4115,7 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 		m["time_local"] = buf;
 		m["time_unix"] = static_cast<int64_t>(t);
 		m["plugin_version"] = Util::GetFormattedVersion(Plugin::VERSION);
-		m["build"] = "batch37a";
+		m["build"] = BuildLabel::kBuild;
 		m["game_version"] = Util::GetFormattedVersion(REL::Module::get().version());
 		m["frozen"] = view.frozen;
 		m["values"] = cfg.showLive ? "live" : (cfg.smooth == PerfView::SmoothMode::Off ? "unsmoothed" : "smoothed");
@@ -4394,7 +4395,7 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 	j["occlusion"] = Util::OcclusionDryRun::ToJson();
 
 	// ---- (batch 39, items 1-4) reflection cubemap + depth prepass breakdowns, switches ----
-	j["batch39_engine"] = Batch39Engine::DiagnosticsJson();
+	j["engine"] = Batch39Engine::DiagnosticsJson();
 	return j;
 }
 

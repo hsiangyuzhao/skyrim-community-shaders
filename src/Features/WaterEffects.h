@@ -34,5 +34,7 @@ public:
 
 	virtual void Prepass() override;
 
+	virtual void DrawSettings() override;
+
 	virtual bool SupportsVR() override { return true; };
 };

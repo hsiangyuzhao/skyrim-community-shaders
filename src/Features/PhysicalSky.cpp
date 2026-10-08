@@ -353,10 +353,7 @@ void PhysicalSky::SettingsGeneral()
 void PhysicalSky::SettingsWorldspaces()
 {
 	// (batch 37b) Ported from upstream ba4b640f2 (editable list) + f3fb48d12 (all exteriors).
-	ImGui::SeparatorText("Worldspaces (Batch 37b)");
-	if (!Batch37b::IsOn())
-		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning,
-			"Batch 37b master switch is off: the old built-in list of 9 worldspaces is used.");
+	ImGui::SeparatorText("Worldspaces");
 
 	ImGui::Checkbox("All Exterior Worldspaces", &settings.enableAllExteriorWorldspaces);
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -467,19 +464,17 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::ColorEdit3("Light Color", &settings.sunlightColor.x, ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(lightColorHint);
-		if (Batch37b::IsOn()) {
-			static constexpr const char* sunLookNames[kSunLookCount] = { "Custom", "Bright (realistic)", "Soft", "Vanilla sun (procedural off)" };
-			int look = settings.proceduralSun ? std::clamp(settings.sunLook, 0, kSunLookCount - 1) : static_cast<int>(kSunLookVanilla);
-			if (ImGui::Combo("Sun Look", &look, sunLookNames, kSunLookCount))
-				ApplySunLook(look);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text(
-					"One-click looks for the sun (Batch 37c):\n"
-					"Bright: real-size disk with a strong glow around it, reads as blinding.\n"
-					"Soft: slightly larger disk, gentle glow.\n"
-					"Vanilla sun: procedural sun off, the game's own sun picture.\n"
-					"Moving any sun setting below switches this to Custom.");
-		}
+		static constexpr const char* sunLookNames[kSunLookCount] = { "Custom", "Bright (realistic)", "Soft", "Vanilla sun (procedural off)" };
+		int look = settings.proceduralSun ? std::clamp(settings.sunLook, 0, kSunLookCount - 1) : static_cast<int>(kSunLookVanilla);
+		if (ImGui::Combo("Sun Look", &look, sunLookNames, kSunLookCount))
+			ApplySunLook(look);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"One-click looks for the sun:\n"
+				"Bright: real-size disk with a strong glow around it, reads as blinding.\n"
+				"Soft: slightly larger disk, gentle glow.\n"
+				"Vanilla sun: procedural sun off, the game's own sun picture.\n"
+				"Moving any sun setting below switches this to Custom.");
 		if (ImGui::Checkbox("Procedural Sun", &settings.proceduralSun))
 			settings.sunLook = settings.proceduralSun ? kSunLookCustom : kSunLookVanilla;
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -487,22 +482,14 @@ void PhysicalSky::SettingsCelestials()
 				"Draws the sun as part of the physical sky: a real-size disk whose colour and brightness\n"
 				"come from the atmosphere (white at noon, orange and dimmer at sunset, gone below the\n"
 				"horizon), instead of the game's fixed sun picture. Off: the game's sun picture.");
-		if (Batch37b::IsOn()) {
-			if (ImGui::SliderFloat("Sun Disk Angular Radius", &settings.sunDiskRadiusDeg, 0.05f, 2.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
-				settings.sunLook = kSunLookCustom;
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Radius of the disk. 0.27 = the real sun (0.53 degrees across).");
-			ImGui::SameLine();
-			ImGui::TextDisabled("(%.2f deg across)", settings.sunDiskRadiusDeg * 2.f);
-		} else {
-			ImGui::SliderAngle("Sun Disk Angular Radius (37a)", &settings.sunDiskRad, 0.f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Batch 37b master switch is off: the old size setting is in use.");
-		}
+		if (ImGui::SliderFloat("Sun Disk Angular Radius", &settings.sunDiskRadiusDeg, 0.05f, 2.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
+			settings.sunLook = kSunLookCustom;
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Radius of the disk. 0.27 = the real sun (0.53 degrees across).");
+		ImGui::SameLine();
+		ImGui::TextDisabled("(%.2f deg across)", settings.sunDiskRadiusDeg * 2.f);
 
-		ImGui::SeparatorText("Procedural Sun (Batch 37b)");
-		if (!Batch37b::IsOn())
-			ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
+		ImGui::SeparatorText("Procedural Sun");
 		ImGui::Checkbox("Align with Vanilla Sun", &settings.sunAlignToVanilla);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(
@@ -535,7 +522,7 @@ void PhysicalSky::SettingsCelestials()
 			settings.sunLook = kSunLookCustom;
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(
-				"Batch 37c. A glow in the sky around the disk, coloured by the atmosphere like the disk.\n"
+				"A glow in the sky around the disk, coloured by the atmosphere like the disk.\n"
 				"This is what makes the sun read as blinding: the game has no bloom on it unless COD Bloom\n"
 				"is on. 1 = as bright as a sunlit white wall at the disk's edge. 0 = no glow.");
 		if (ImGui::SliderFloat("Sun Glow Width", &settings.sunGlowWidthDeg, 0.1f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
@@ -566,7 +553,7 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::PopID();
 	}
 
-	ImGui::SeparatorText("New Moon (Batch 37c)");
+	ImGui::SeparatorText("New Moon");
 	ImGui::Checkbox("Hide New Moon Disc", &settings.hideNewMoonDisc);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
@@ -646,9 +633,7 @@ void PhysicalSky::SettingsAtmosphere()
 
 void PhysicalSky::SettingsFixes()
 {
-	ImGui::SeparatorText("Fixes (Batch 37b)");
-	if (!Batch37b::IsOn())
-		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
+	ImGui::SeparatorText("Fixes");
 
 	ImGui::Checkbox("Opaque Sky", &settings.fixSkyAlpha);
 	if (auto _tt = Util::HoverTooltipWrapper())

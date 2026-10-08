@@ -55,9 +55,7 @@ void VolumetricLighting::DrawSettings()
 
 void VolumetricLighting::DrawBatch37bSettings()
 {
-	ImGui::SeparatorText("Batch 37b");
-	if (!Batch37b::IsOn())
-		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 37b master switch is off (37a behaviour).");
+	ImGui::SeparatorText("Shafts");
 
 	ImGui::SliderFloat("Cloud & Terrain Occlusion", &settings.WorldShadowPower, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())

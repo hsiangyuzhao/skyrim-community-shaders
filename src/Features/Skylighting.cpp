@@ -47,14 +47,12 @@ float Skylighting::SampleDiscRadius(float a_u) const
 
 void Skylighting::DrawBatch38Settings()
 {
-	ImGui::SeparatorText("Fixes (Batch 38)");
-	if (!Batch38::IsOn())
-		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 38 master switch is off (37c behaviour).");
+	ImGui::SeparatorText("Fixes");
 
 	ImGui::Checkbox("Roofs flagged as editor markers block the sky (ca63a41d5)", &settings.FixRoofMarkers);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
-			"Some buildings and roofs carry an 'editor marker' flag in their mesh. 37c left every such mesh out of the\n"
+			"Some buildings and roofs carry an 'editor marker' flag in their mesh. Without this fix every such mesh is left out of the\n"
 			"sky-occlusion map, so sky light leaked in under those roofs (porches, sheds, half-open interiors).\n"
 			"Builds up over a few seconds; press Rebuild Skylighting to see it at once.");
 	ImGui::Checkbox("Rebuild / loading screen resets probes to open sky (5b5361f53)", &settings.FixResetClearsProbes);

@@ -29,7 +29,7 @@ struct LocalExposure : public PostProcessFeature
 	virtual inline std::string GetType() const override { return "Local Exposure"; }
 	virtual inline std::string GetDesc() const override
 	{
-		return "Batch 38. Balances bright and dark areas (a sunlit doorway seen from a dark room, a cave mouth) while keeping "
+		return "Balances bright and dark areas (a sunlit doorway seen from a dark room, a cave mouth) while keeping "
 		       "edge detail. Works on the image after Histogram Auto Exposure, before Color Grading.";
 	}
 	virtual inline bool DisableInMainLoadingMenu() const override { return true; }

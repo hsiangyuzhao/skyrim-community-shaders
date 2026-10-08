@@ -481,7 +481,7 @@ namespace NeuralRendering
 			if (input.encode == Renderer::Encode::Curve)
 				input.toneCurve = GatherToneCurve(g_toneSource);
 			else
-				g_toneSource = decision.before ? "38a wrap (Reinhard, no exposure)" : "the finished image";
+				g_toneSource = decision.before ? "Reinhard wrap (no exposure)" : "the finished image";
 			input.toneStrength = std::clamp(decision.before ? nr.tonePreservationBefore : nr.tonePreservationAfter, 0.0f, 1.0f);
 			if (globals::game::cameraNear && globals::game::cameraFar) {
 				input.cameraNear = std::max(*globals::game::cameraNear, 0.01f);
@@ -605,7 +605,7 @@ namespace NeuralRendering
 					outputWidth, outputHeight, modelPercent, g_status.workWidth, g_status.workHeight, g_status.paddedWidth,
 					g_status.paddedHeight, pad ? " (padded to 8)" : " (no padding)", fg, vram);
 				logger::info("[DLSSNR] state: input {}{}, tone preservation {:.2f}, tuning at creation {}",
-					before ? (toneMatched ? "tone-matched" : "38a wrap") : "finished image",
+					before ? (toneMatched ? "tone-matched" : "Reinhard wrap") : "finished image",
 					before ? std::format(" ({})", InputPrecisionName(inputPrecision)) : std::string(), toneStrength,
 					nr.tuningAtCreate ? "on" : "off");
 			} else {
@@ -784,19 +784,18 @@ namespace NeuralRendering
 		const auto& renderer = Renderer::Instance();
 		const auto& s = g_status;
 		json o;
-		o["batch38"] = s.batch38;
 		o["enabled"] = s.enabled;
 		o["running"] = s.running;
 		o["blocked_reason"] = std::string(s.blockedReason);
-		o["placement"] = s.batch38 ? (s.beforeUpscaling ? "before-upscaling" : "after-upscaling") : "after-upscaling (37c)";
+		o["placement"] = s.beforeUpscaling ? "before-upscaling" : "after-upscaling";
 		o["frame_generation"] = s.frameGeneration;
 		o["extent"] = { s.width, s.height };
 		o["render"] = { s.renderWidth, s.renderHeight };
 		o["output"] = { s.outputWidth, s.outputHeight };
-		o["model_percent"] = s.batch38 ? s.modelPercent : 100u;
+		o["model_percent"] = s.modelPercent;
 		o["model_extent"] = { s.workWidth, s.workHeight };
 		o["network_extent"] = { s.paddedWidth, s.paddedHeight };
-		o["input"] = s.beforeUpscaling ? (s.toneMatched ? "tone-matched" : "38a wrap") : "finished image";
+		o["input"] = s.beforeUpscaling ? (s.toneMatched ? "tone-matched" : "Reinhard wrap") : "finished image";
 		o["input_precision"] = s.beforeUpscaling ? InputPrecisionName(s.inputPrecision) : "scene format";
 		o["tone_source"] = std::string(g_toneSource);
 		o["tone_preservation"] = s.toneStrength;

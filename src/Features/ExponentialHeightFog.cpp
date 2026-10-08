@@ -74,7 +74,8 @@ namespace
         return result;
     }
 
-    constexpr const char* kVolumetricKey = "Volumetric Fog (Batch 38)";
+    constexpr const char* kVolumetricKey = "Volumetric Fog";
+    constexpr const char* kVolumetricKeyOld = "Volumetric Fog (Batch 38)";  // read only, migrated on the next save
 }
 
 void ExponentialHeightFog::RestoreDefaultSettings()
@@ -88,6 +89,8 @@ void ExponentialHeightFog::LoadSettings(json& o_json)
     settings = o_json;
     if (o_json.contains(kVolumetricKey) && o_json[kVolumetricKey].is_object())
         volumetric = o_json[kVolumetricKey];
+    else if (o_json.contains(kVolumetricKeyOld) && o_json[kVolumetricKeyOld].is_object())
+        volumetric = o_json[kVolumetricKeyOld];
 }
 
 void ExponentialHeightFog::SaveSettings(json& o_json)
@@ -712,9 +715,7 @@ void ExponentialHeightFog::DrawSettings()
 
     const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
 
-    if (ImGui::TreeNode("Second Fog Layer (Batch 38)")) {
-        if (!Batch38::IsOn())
-            ImGui::TextColored(palette.Warning, "Off: Advanced > Batch 38 master switch is off (37c behaviour).");
+    if (ImGui::TreeNode("Second Fog Layer")) {
         ImGui::SliderFloat("Fog Height 2", &settings.fogHeight2, -22000.0f, 22000.0f, "%.1f");
         ImGui::SliderFloat("Fog Height Falloff 2", &settings.fogHeightFalloff2, 0.001f, 2.0f, "%.3f");
         ImGui::SliderFloat("Fog Density 2", &settings.fogDensity2, 0.0f, 1.0f, "%.3f");
@@ -725,9 +726,7 @@ void ExponentialHeightFog::DrawSettings()
         ImGui::TreePop();
     }
 
-    ImGui::SeparatorText("Volumetric Fog (Batch 38)");
-    if (!Batch38::IsOn())
-        ImGui::TextColored(palette.Warning, "Off: Advanced > Batch 38 master switch is off (37c behaviour).");
+    ImGui::SeparatorText("Volumetric Fog");
     ImGui::Checkbox("Enable Volumetric Fog", &volumetric.Enabled);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(

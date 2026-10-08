@@ -42,11 +42,6 @@ bool LocalExposure::RuntimeGateOpen() const
 
 void LocalExposure::DrawSettings()
 {
-	if (!Batch38::IsOn()) {
-		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 38 master switch is off (37c behaviour).");
-		ImGui::Spacing();
-	}
-
 	if (!GetActiveAutoExposure()) {
 		ImGui::SliderFloat("Exposure", &settings.Exposure, 0.f, 4.f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper())
