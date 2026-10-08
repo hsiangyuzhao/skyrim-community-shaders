@@ -915,15 +915,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	diffuseColor += lightsDiffuseColor;
 
-#			if defined(TRUE_PBR)
-	float3 indirectDiffuseLobeWeight, indirectSpecularLobeWeight;
-	PBR::GetIndirectLobeWeights(indirectDiffuseLobeWeight, indirectSpecularLobeWeight, normal, normal, viewDirection, baseColor.xyz, pbrSurfaceProperties);
-
-	diffuseColor.xyz += transmissionColor;
-	specularColor.xyz += specularColorPBR;
-	specularColor.xyz = Color::IrradianceToGamma(specularColor.xyz);
-	diffuseColor.xyz = Color::IrradianceToGamma(diffuseColor.xyz);
-#			else
+	// (batch 40a) The directional ambient below is shared by both paths. Since upstream a04ff60d1
+	// (SSGI optimize, 2025-09) the G-buffer Masks write at the end reads directionalAmbientColor,
+	// but only the non-PBR path declared it, so no TRUE_PBR grass permutation compiled.
+#			if defined(TRUE_PBR) && defined(SKYLIGHTING)
+	float skylightingFadeOutFactor = 1.0;
+	if (!SharedData::InInterior)
+		skylightingFadeOutFactor = Skylighting::getFadeOutFactor(input.WorldPosition.xyz);
+#			endif
 
 	float3 directionalAmbientColor = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(normal, 1.0))));
 
@@ -988,6 +987,29 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #				endif
 
+#			if defined(TRUE_PBR)
+	float3 indirectDiffuseLobeWeight, indirectSpecularLobeWeight;
+	PBR::GetIndirectLobeWeights(indirectDiffuseLobeWeight, indirectSpecularLobeWeight, normal, normal, viewDirection, baseColor.xyz, pbrSurfaceProperties);
+
+	diffuseColor.xyz += transmissionColor;
+	specularColor.xyz += specularColorPBR;
+	specularColor.xyz = Color::IrradianceToGamma(specularColor.xyz);
+	diffuseColor.xyz = Color::IrradianceToGamma(diffuseColor.xyz);
+
+	// (batch 40a) Ambient through the indirect diffuse lobe, the way Lighting.hlsl's TRUE_PBR path
+	// (and upstream's PBR grass) does it; the G-buffer albedo below is that same lobe weight.
+	diffuseColor.xyz += indirectDiffuseLobeWeight * directionalAmbientColor;
+#				if defined(IBL) && defined(SKYLIGHTING)
+	directionalAmbientColor -= iblColor;
+#				endif
+	directionalAmbientColor *= indirectDiffuseLobeWeight;
+#				if defined(SKYLIGHTING)
+	Skylighting::applySkylighting(diffuseColor, directionalAmbientColor, indirectDiffuseLobeWeight, skylightingDiffuse);
+#				endif
+#				if defined(IBL) && defined(SKYLIGHTING)
+	directionalAmbientColor += iblColor * indirectDiffuseLobeWeight;
+#				endif
+#			else
 	diffuseColor += directionalAmbientColor;
 
 #				if defined(IBL) && defined(SKYLIGHTING)
