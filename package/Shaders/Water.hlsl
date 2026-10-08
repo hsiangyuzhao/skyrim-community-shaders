@@ -689,7 +689,9 @@ WaterNormalData GetWaterNormal(PS_INPUT input, float distanceFactor, float norma
 
 	float4 raindropInfo = float4(0, 0, 1, 0);
 	float maxRainDropDistance = SharedData::wetnessEffectsSettings.RaindropFxRange * SharedData::wetnessEffectsSettings.RaindropFxRange * 3;
-	float rainDropDistance = dot(input.WPosition, input.WPosition);
+	// (batch 40a) .xyz only: WPosition.w holds length(xyz) (VS), which doubled the squared distance
+	// and cut the ripple range to ~71% of the setting.
+	float rainDropDistance = dot(input.WPosition.xyz, input.WPosition.xyz);
 	float distanceFadeout = saturate((1 - saturate(rainDropDistance / maxRainDropDistance)) * 3);
 	if (finalNormal.z > 0 && SharedData::wetnessEffectsSettings.Raining > 0.0f && SharedData::wetnessEffectsSettings.EnableRaindropFx &&
 		(rainDropDistance < maxRainDropDistance) && wetnessOcclusion > 0.05) {
