@@ -106,6 +106,12 @@ struct VS_OUTPUT
 #endif
 
 	float3 ModelPosition : TEXCOORD12;
+
+	// (40d) Dynamic Snow on characters: the smooth vertex normal in the mesh's own space, before
+	// skinning (= the bind pose for skinned meshes), so the snow cover does not follow the limbs'
+	// motion and is not faceted. In every permutation: the engine strips SKINNED from pixel
+	// shader descriptors, so a pixel shader cannot know whether its vertex shader skinned.
+	centroid float3 SnowBindNormal : TEXCOORD13;
 };
 #ifdef VSHADER
 
@@ -332,6 +338,14 @@ VS_OUTPUT main(VS_INPUT input)
 #	endif  // VR
 
 	vsout.ModelPosition = input.Position.xyz;
+
+#	if !defined(MODELSPACENORMALS)
+	// Pre-skinning (bind-pose) normal for skinned meshes, the model-space normal otherwise.
+	vsout.SnowBindNormal = input.Normal.xyz * 2.0.xxx - 1.0.xxx;
+#	else
+	// No vertex normal: the pixel shader reads the model-space normal map instead.
+	vsout.SnowBindNormal = float3(0, 0, 1);
+#	endif
 
 	return vsout;
 }
@@ -2368,24 +2382,29 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		else
 		[branch] if ((snowFlags & DynamicSnow::FlagAccumulation) && (!snowOnActor || (snowFlags & DynamicSnow::FlagSnowOnCharacters)))
 		{
-			// (40b) Characters: coverage in the mesh's bind pose, so snow stays put while limbs move.
-			// ModelPosition is the pre-skinning vertex position; its screen derivatives give the
-			// bind-pose face normal (model Z is up). The handedness comes from the same derivatives
-			// in world space. Noise runs on the model position too. Other geometry is unchanged.
-			float3 snowCoverPosition = snowPositionWS;
-			float3 snowCoverNormal = worldNormal;
-			float3 snowCoverGeometryNormal = snowGeometryNormal;
+			float snowCoverage;
 			[branch] if (snowOnActor)
 			{
-				float3 bindFace = cross(ddx(input.ModelPosition.xyz), ddy(input.ModelPosition.xyz));
-				float3 worldFace = cross(ddx(input.WorldPosition.xyz), ddy(input.WorldPosition.xyz));
-				bindFace *= (dot(worldFace, snowGeometryNormal) < 0.0) ? -1.0 : 1.0;
-				bindFace = bindFace * rsqrt(max(dot(bindFace, bindFace), 1e-12));
-				snowCoverGeometryNormal = bindFace;
-				snowCoverNormal = bindFace;
-				snowCoverPosition = input.ModelPosition.xyz * 8.0;
+				// (40d) Characters: coverage in the mesh's bind pose, so snow stays put while limbs
+				// move. The normal is the interpolated vertex normal from before skinning (smooth
+				// across the mesh, unlike a per-triangle derivative normal, which gave faceted
+				// diamonds); model Z is up. Model-space normal-map meshes have no vertex normal and
+				// use their normal map at a fixed low mip (no derivatives in this branch), so only the
+				// broad shape remains.
+#			if defined(MODELSPACENORMALS)
+				float3 snowBindNormal = TexNormalSampler.SampleLevel(SampNormalSampler, uv, 4.0).xzy * 2.0 - 1.0;
+#			else
+				float3 snowBindNormal = input.SnowBindNormal;
+#			endif
+				snowBindNormal = snowBindNormal * rsqrt(max(dot(snowBindNormal, snowBindNormal), 1e-8));
+				// Double-sided cloth seen from behind: the back side faces the other way.
+				snowBindNormal = frontFace ? snowBindNormal : -snowBindNormal;
+				snowCoverage = DynamicSnow::GetActorCoverage(input.ModelPosition.xyz, snowBindNormal, length(input.WorldPosition.xyz));
 			}
-			float snowCoverage = DynamicSnow::GetCoverage(snowCoverPosition, snowCoverNormal, snowCoverGeometryNormal, 1.0, length(input.WorldPosition.xyz));
+			else
+			{
+				snowCoverage = DynamicSnow::GetCoverage(snowPositionWS, worldNormal, snowGeometryNormal, 1.0, length(input.WorldPosition.xyz));
+			}
 #		endif
 			[branch] if (snowCoverage > 0.0)
 			{

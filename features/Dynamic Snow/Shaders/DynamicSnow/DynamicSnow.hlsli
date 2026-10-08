@@ -117,6 +117,30 @@ namespace DynamicSnow
 		return coverage * s.MaxCoverage * skyVisibility;
 	}
 
+	// (40d) Characters, creatures and what they wear or carry (Lighting.hlsl, IsActorGeometry).
+	// Everything is in the mesh's own space before skinning (Z up): positionMS is the vertex
+	// position, normalMS the interpolated vertex normal (smooth over the mesh). So the cover stays
+	// on the same patch of cloth while the limbs move, and follows the mesh's curvature instead of
+	// its triangles. Softer than the ground: a gentle slope ramp, a wide noise ramp and a lower
+	// ceiling, so a shoulder gets a dusting that fades out rather than a hard white patch.
+	float GetActorCoverage(float3 positionMS, float3 normalMS, float viewDistance)
+	{
+		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
+		float slope = smoothstep(0.2, 0.95, normalMS.z);
+		[branch] if (slope <= 0.0) return 0.0;
+
+		// Model units (~1.4 cm). Coarse ~40 units (a hand's span), fine ~6 units; the height term
+		// keeps stacked layers (hood over shoulders) from sharing one pattern.
+		float2 p = positionMS.xy + positionMS.zz * float2(0.37, -0.61);
+		float fine = lerp(0.5, ValueNoise(p * (1.0 / 6.0)), saturate(1.0 - viewDistance / 4096.0));
+		float noise = ValueNoise(p * (1.0 / 40.0)) * 0.65 + fine * 0.35;
+
+		float h = slope * 0.7 + noise * 0.3;
+		float t = 1.1 - s.Amount * 1.2;
+		float coverage = smoothstep(t - 0.25, t + 0.25, h) * slope;
+		return coverage * s.MaxCoverage * 0.8;
+	}
+
 	// (batch 39c) Animated trees and foliage (Lighting.hlsl, TREE_ANIM). The leaves sway, so
 	// nothing here may follow the swaying world position closely: the slope comes from the
 	// vertex normal (tree mods give leaf cards normals that point out of the canopy, so the top
