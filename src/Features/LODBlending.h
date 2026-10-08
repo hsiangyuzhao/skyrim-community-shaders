@@ -56,6 +56,38 @@ struct LODBlending : Feature
 
 	GrassDetection grassDetection = GrassDetection::Name;
 
+	// (batch 40) Upstream LOD fixes, each switchable for A/B; off = the batch 39 behaviour. Kept
+	// out of Settings (saved as their own keys) so Settings stays the batch 39 JSON object.
+	struct Fixes
+	{
+		/// Distant (LOD) trees took Physical Sky's sun transmittance three times (a merge
+		/// duplication, fixed upstream in 5df81c984); near objects and grass take it once.
+		bool TreeSunTransmittanceOnce = true;
+		/// The vanilla snow/rock classification of LOD ground (noise on LOD terrain, and the near
+		/// ground's fade into the LOD texture) reads the texture as stored, not after Linear
+		/// Lighting and the LOD gamma (upstream a4c8715a0).
+		bool LandBlendRawColor = true;
+	} fixes;
+
+	/// Bit layout mirrored in Common/SharedData.hlsli (SharedData::LODBlendingFix).
+	enum FixFlag : uint
+	{
+		kTreeSunTransmittanceOnce = 1u << 0,
+		kLandBlendRawColor = 1u << 1,
+	};
+
+	/// GPU side: Settings plus the fix bits (SharedData::LODBlendingSettings).
+	struct alignas(16) GPUData
+	{
+		Settings settings;
+		uint FixFlags;
+		float pad0[3];
+	};
+	STATIC_ASSERT_ALIGNAS_16(GPUData);
+	static_assert(sizeof(GPUData) == 48);
+
+	GPUData GetCommonBufferData() const;
+
 	virtual void DrawSettings() override;
 
 	virtual void LoadSettings(json& o_json) override;

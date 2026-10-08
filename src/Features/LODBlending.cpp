@@ -43,9 +43,26 @@ void LODBlending::DrawSettings()
 	ImGui::Checkbox("Disable Terrain Vertex Colors", (bool*)&settings.DisableTerrainVertexColors);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text(
-			"Disables vertex coloring on nearby terrain. "
+			"Disables vertex coloring on nearby terrain, and (Batch 40, as upstream) on the grass growing on it, "
+			"which takes its tint from the ground.\n"
 			"Best combined with terrain LOD generated in xLODGen with Vertex Color Intensity set to 0. ");
 	}
+
+	// (batch 40) Upstream LOD fixes, each switchable for A/B; off = the batch 39 behaviour.
+	ImGui::SeparatorText("Fixes (Batch 40)");
+	ImGui::Checkbox("Distant Trees: Sun Haze Once", &fixes.TreeSunTransmittanceOnce);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted(
+			"With Physical Sky, distant (LOD) trees had the sunlight's dimming and reddening through the air applied three\n"
+			"times instead of once, so at sunrise and sunset they were much darker and redder than the trees next to them.\n"
+			"Off = the old triple dimming.");
+	ImGui::Checkbox("Distant Ground: Vanilla Snow/Rock Pattern", &fixes.LandBlendRawColor);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted(
+			"The game darkens distant ground with a noise pattern except where it looks like snow, and near ground fades into\n"
+			"the distant texture the same way. With Linear Lighting (or a LOD Terrain Gamma) that brightness test saw the\n"
+			"converted colour and took light ground for dark, so it got speckled. This tests the texture as stored, like the\n"
+			"game does. Off = the old test.");
 
 	ImGui::SeparatorText("Distant grass");
 
@@ -71,9 +88,24 @@ void LODBlending::DrawSettings()
 	}
 }
 
+LODBlending::GPUData LODBlending::GetCommonBufferData() const
+{
+	GPUData data{};
+	data.settings = settings;
+	data.FixFlags = (fixes.TreeSunTransmittanceOnce ? kTreeSunTransmittanceOnce : 0u) |
+	                (fixes.LandBlendRawColor ? kLandBlendRawColor : 0u);
+	return data;
+}
+
 void LODBlending::LoadSettings(json& o_json)
 {
 	settings = o_json;
+
+	// (batch 40) Fix switches; missing in older configs = default (on).
+	if (o_json.contains("FixTreeSunTransmittanceOnce") && o_json["FixTreeSunTransmittanceOnce"].is_boolean())
+		fixes.TreeSunTransmittanceOnce = o_json["FixTreeSunTransmittanceOnce"].get<bool>();
+	if (o_json.contains("FixLandBlendRawColor") && o_json["FixLandBlendRawColor"].is_boolean())
+		fixes.LandBlendRawColor = o_json["FixLandBlendRawColor"].get<bool>();
 
 	// Not part of Settings because it never reaches the GPU: the hook alone acts on it, and
 	// keeping it out of the struct is what leaves the shared feature buffer layout untouched.
@@ -88,10 +120,13 @@ void LODBlending::SaveSettings(json& o_json)
 {
 	o_json = settings;
 	o_json["GrassDetection"] = static_cast<uint>(grassDetection);
+	o_json["FixTreeSunTransmittanceOnce"] = fixes.TreeSunTransmittanceOnce;
+	o_json["FixLandBlendRawColor"] = fixes.LandBlendRawColor;
 }
 
 void LODBlending::RestoreDefaultSettings()
 {
 	settings = {};
 	grassDetection = GrassDetection::Name;
+	fixes = {};
 }

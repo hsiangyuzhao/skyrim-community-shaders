@@ -1989,7 +1989,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	if defined(MODELSPACENORMALS)
 #		if defined(LODLANDNOISE)
 	normal.xyz = normal.xzy - 0.5.xxx;
-	float lodLandNoiseParameter = GetLodLandBlendParameter(baseColor.xyz);
+	// (batch 40) Upstream a4c8715a0 (LL refactor): the vanilla snow/rock classification reads the
+	// texture as stored (sRGB). baseColor is already linearised (Linear Lighting) and LOD-graded here,
+	// which pushed bright LOD ground into the noisy dark-ground branch. LOD Blending > Fixes.
+	float lodLandNoiseParameter = GetLodLandBlendParameter(
+		(SharedData::lodBlendingSettings.FixFlags & SharedData::LODBlendingFix::LandBlendRawColor) ? rawBaseColor.xyz : baseColor.xyz);
 	float noise = TexLandLodNoiseSampler.Sample(SampLandLodNoiseSampler, uv * 3.0.xx).x;
 	float lodLandNoiseMultiplier = GetLodLandBlendMultiplier(lodLandNoiseParameter, noise);
 	baseColor.xyz *= lodLandNoiseMultiplier;
@@ -2098,11 +2102,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	lodLandColor = TexLandLodBlend1Sampler.Sample(SampLandLodBlend1Sampler, input.TexCoord0.zw);
 #		endif
 
+	// (batch 40) the texture as stored, for the vanilla blend classification below
+	const float3 rawLodLandColor = lodLandColor.xyz;
 	lodLandColor.xyz = Color::ColorToLinear(lodLandColor.xyz) * Color::VanillaDiffuseColorMult();
 #		if defined(LOD_BLENDING)
 	lodLandColor.xyz = pow(abs(lodLandColor.xyz), SharedData::lodBlendingSettings.LODTerrainGamma) * SharedData::lodBlendingSettings.LODTerrainBrightness;
 #		endif  // LOD_BLENDING
-	float lodBlendParameter = GetLodLandBlendParameter(lodLandColor.xyz);
+	// (batch 40) Same fix as the LODLANDNOISE branch: classify on the stored colour, so the near
+	// ground fades into the LOD texture with the same multiplier the LOD ground itself uses.
+	float lodBlendParameter = GetLodLandBlendParameter(
+		(SharedData::lodBlendingSettings.FixFlags & SharedData::LODBlendingFix::LandBlendRawColor) ? rawLodLandColor : lodLandColor.xyz);
 	float lodBlendMask = TexLandLodBlend2Sampler.Sample(SampLandLodBlend2Sampler, 3.0.xx * input.TexCoord0.zw).x;
 	float lodLandFadeFactor = GetLodLandBlendMultiplier(lodBlendParameter, lodBlendMask);
 	float lodLandBlendFactor = LODTexParams.z * input.LandBlendWeights2.w;

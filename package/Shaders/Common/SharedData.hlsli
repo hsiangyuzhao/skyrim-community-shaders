@@ -106,6 +106,11 @@ namespace SharedData
 		float3 Scale;
 		float2 ZRange;
 		float2 Offset;
+		// (batch 40) Terrain Shadows > Stable Soft Edges (upstream #2729).
+		float ZBlur;           // world-space widening of the shadow transition (0 when off)
+		float SelfShadowBias;  // shadow heights are lowered by this much: 256 on, 1024 off
+		bool StablePenumbrae;
+		float pad0;
 	};
 
 	struct LightLimitFixSettings
@@ -191,7 +196,16 @@ namespace SharedData
 		float LODObjectGamma;
 		float LODObjectSnowGamma;
 		float LODGrassGamma;
+		uint FixFlags;  // (batch 40) SharedData::LODBlendingFix bits, LOD Blending > Fixes
+		float3 pad0;
 	};
+
+	// (batch 40) Mirrors LODBlending::FixFlag.
+	namespace LODBlendingFix
+	{
+		static const uint TreeSunTransmittanceOnce = (1 << 0);
+		static const uint LandBlendRawColor = (1 << 1);
+	}
 
 	struct HairSpecularSettings
 	{
@@ -480,7 +494,7 @@ namespace SharedData
 	};
 
 	// (batch 37b) Mirrors VolumetricLighting::CommonBufferData. Appended after every older
-	// block so nothing before it moves (FeatureBuffer.cpp pins the offset at 1440).
+	// block so nothing before it moves (FeatureBuffer.cpp pins the offset at 1472 since batch 40; 1440 before).
 	struct VolumetricLightingSettings
 	{
 		float WorldShadowPower;  // 0 = no cloud/terrain occlusion of light shafts (37a)
@@ -488,7 +502,7 @@ namespace SharedData
 		float2 pad0;
 	};
 
-	// (batch 37b) Mirrors PhysicalSky::ExtCbData, after VolumetricLightingSettings (offset 1456).
+	// (batch 37b) Mirrors PhysicalSky::ExtCbData, after VolumetricLightingSettings (offset 1488 since batch 40).
 	// Every flag is a 37b switch ANDed with the master; Flags == 0 runs the 37a code paths.
 	struct PhysSkyExtData
 	{
@@ -499,7 +513,7 @@ namespace SharedData
 	};
 
 	// (batch 38, A1) Mirrors ExponentialHeightFog::VolumetricFogPSData: what a pixel shader needs to
-	// look the froxel volumes up. Appended after PhysSkyExtData (offset 1472). Enabled == 0
+	// look the froxel volumes up. Appended after PhysSkyExtData (offset 1504 since batch 40). Enabled == 0
 	// whenever the volumes were not built this frame (fog off, master off, interior map ...).
 	struct VolumetricFogSettings
 	{
@@ -515,7 +529,7 @@ namespace SharedData
 	};
 
 	// (batch 38, A2) Mirrors VolumetricShadows::CommonBufferData, after VolumetricFogSettings
-	// (offset 1536). Non-zero only while the VSM was built this frame.
+	// (offset 1568 since batch 40). Non-zero only while the VSM was built this frame.
 	struct VolumetricShadowsSettings
 	{
 		uint ParticleShadows;
@@ -524,7 +538,7 @@ namespace SharedData
 	};
 
 	// (batch 39, items 5-6) Mirrors DynamicSnow::CommonBufferData, after VolumetricShadowsSettings
-	// (offset 1552). Flags == 0 (feature off, Batch 39 master off, interior) runs the 38b path.
+	// (offset 1584 since batch 40). Flags == 0 (feature off, Batch 39 master off, interior) runs the 38b path.
 	struct DynamicSnowSettings
 	{
 		uint Flags;               // DynamicSnow::Flag* bits
