@@ -601,9 +601,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	baseColor.xyz = Color::Diffuse(baseColor.xyz);
 
-		// (batch 39, item 2) GRASS_MAIN_ALPHA_TEST: grass skipped the depth prepass, so the main
-		// pass cuts the blades out itself, with the prepass's own test.
-#		if defined(RENDER_DEPTH) || defined(GRASS_MAIN_ALPHA_TEST)
+#		if defined(RENDER_DEPTH)
 	float diffuseAlpha = input.VertexColor.w * baseColor.w;
 	if ((diffuseAlpha - AlphaTestRefRS) < 0) {
 		discard;
@@ -1017,8 +1015,7 @@ PS_OUTPUT main(PS_INPUT input)
 
 	float4 baseColor = TexBaseSampler.SampleBias(SampBaseSampler, input.TexCoord.xy, SharedData::MipBias);
 
-		// (batch 39, item 2) See the first main() above.
-#		if defined(RENDER_DEPTH) || defined(GRASS_MAIN_ALPHA_TEST)
+#		if defined(RENDER_DEPTH)
 	float diffuseAlpha = input.VertexColor.w * baseColor.w;
 
 	if ((diffuseAlpha - AlphaTestRefRS) < 0) {

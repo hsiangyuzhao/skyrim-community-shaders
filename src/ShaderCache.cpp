@@ -237,11 +237,6 @@ namespace SIE
 				defines[lastIndex++] = { globals::features::grassOptimizations.GetShaderDefineName().data(), nullptr };
 			}
 
-			// (batch 39, item 2) Selected while grass skips the depth prepass; never set by the engine.
-			if (descriptor & static_cast<uint32_t>(ShaderCache::GrassShaderFlags::MainAlphaTest)) {
-				defines[lastIndex++] = { "GRASS_MAIN_ALPHA_TEST", nullptr };
-			}
-
 			defines[lastIndex] = { nullptr, nullptr };
 		}
 

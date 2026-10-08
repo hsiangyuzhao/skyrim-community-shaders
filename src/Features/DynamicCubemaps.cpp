@@ -5,6 +5,7 @@
 
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/Batch39Engine.h"
 #include "Utils/GpuTimers.h"
 
 constexpr auto MIPLEVELS = 8;
@@ -355,6 +356,8 @@ void DynamicCubemaps::UpdateCubemapCapture(bool a_reflections)
 
 	static float3 cameraPreviousPosAdjust[2] = { { 0, 0, 0 }, { 0, 0, 0 } };
 	updateData.CameraPreviousPosAdjust = cameraPreviousPosAdjust[index];
+	// (batch 39b) Faster convergence while Dynamic Cubemaps alone feeds the water reflections.
+	updateData.CaptureWeight = a_reflections ? Batch39Engine::DynamicCubemapCaptureWeight() : 0.5f;
 
 	auto eyePosition = Util::GetEyePosition(0);
 
@@ -498,6 +501,25 @@ void DynamicCubemaps::UpdateCubemap()
 			// if can't find specific hlsl file cache, clear all image space files
 			shaderCache->Clear(RE::BSShader::Types::ImageSpace);
 		recompileFlag = false;
+	}
+
+	// (batch 39b) While Dynamic Cubemaps alone feeds the water reflections (Batch 39 hand-off with
+	// its fast capture), the reflection chain -- capture, inferrence, irradiance -- runs whole
+	// every frame instead of one step of six, so water reflections no longer trail the view by
+	// 6+ frames. The plain (no reflections) chain runs whole every third frame, the same average
+	// rate as before; each chain completes within its frame because both share envInferredTexture.
+	if (activeReflections && Batch39Engine::ReflHandOffFastCaptureActive()) {
+		if (++fastPlainCounter >= 3) {
+			fastPlainCounter = 0;
+			UpdateCubemapCapture(false);
+			Inferrence(false);
+			Irradiance(false);
+		}
+		UpdateCubemapCapture(true);
+		Inferrence(true);
+		Irradiance(true);
+		nextTask = NextTask::kCapture;  // the round robin restarts cleanly when the fast capture ends
+		return;
 	}
 
 	switch (nextTask) {

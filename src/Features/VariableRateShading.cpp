@@ -4,7 +4,6 @@
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
-#include "Utils/Batch39Engine.h"
 #include "Utils/GpuTimers.h"
 
 // NVAPI is only used for its types; every entry point is resolved at runtime through the
@@ -531,8 +530,7 @@ VariableRateShading::Table VariableRateShading::ClassifyDraw() const
 	case RE::BSShader::Type::Grass:
 		if (!settings.IncludeGrass || IsAlphaBlendedDraw())
 			return Table::Off;
-		// (batch 39) Grass that skipped the depth prepass cuts its blades out in the main pass.
-		return ((pixelDescriptor & static_cast<uint32_t>(SIE::ShaderCache::GrassShaderFlags::AlphaTest)) || Batch39Engine::PrepassSkipGrassActive()) ? Table::AlphaTested : Table::Full;
+		return (pixelDescriptor & static_cast<uint32_t>(SIE::ShaderCache::GrassShaderFlags::AlphaTest)) ? Table::AlphaTested : Table::Full;
 	case RE::BSShader::Type::DistantTree:
 		if (IsAlphaBlendedDraw())
 			return Table::Off;

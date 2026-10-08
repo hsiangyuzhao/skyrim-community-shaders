@@ -50,16 +50,26 @@ namespace Batch39Engine
 {
 	struct Settings
 	{
-		// 1. Water reflection cubemap. All off by default: this package measures first.
-		bool ReflThrottle = false;                  ///< draw ReflFacesPerUpdate faces every ReflEveryNFrames frames
+		// 1. Water reflection cubemap. (39b) Fewer faces and no LOD trees are on by default: the
+		// user measured a clear saving with no visible change in 39a. LOD objects stay off (they
+		// visibly carry distant mountains and buildings), the hand-off stays off (it lags).
+		bool ReflThrottle = true;                   ///< draw ReflFacesPerUpdate faces every ReflEveryNFrames frames
 		int ReflFacesPerUpdate = 1;                 ///< 1, 2, 3 or 6
 		int ReflEveryNFrames = 1;                   ///< 1..8
-		bool ReflSkipLODTrees = false;              ///< bReflectLODTrees = 0
+		bool ReflSkipLODTrees = true;               ///< bReflectLODTrees = 0
 		bool ReflSkipLODObjects = false;            ///< bReflectLODObjects = 0
 		bool ReflHandOffToDynamicCubemaps = false;  ///< no engine cubemap; water uses Dynamic Cubemaps at every distance
+		/// (39b) While handed off, the game's cubemap still draws the sky alone (same round robin):
+		/// Dynamic Cubemaps fills the directions it never saw on screen from it, instead of from a
+		/// cubemap frozen at the moment of the hand-off.
+		bool ReflHandOffKeepSky = true;
+		/// (39b) While handed off, Dynamic Cubemaps refreshes its reflection capture every frame
+		/// (normally once every 6 frames) and blends less with the old capture.
+		bool ReflHandOffFastCapture = true;
+		float ReflHandOffCaptureWeight = 0.75f;  ///< share of a new capture (Dynamic Cubemaps: 0.5)
 
-		// 2. Depth prepass slimming. All off by default.
-		bool PrepassSkipGrass = false;    ///< grass skips the prepass; alpha-tested + depth-writing in the main pass
+		// 2. Depth prepass slimming. All off by default. (39b: "grass skips the prepass" removed,
+		// it cost about 4 ms; see the spec's 39a findings.)
 		bool PrepassSkipLODLand = false;  ///< bLodZPrepass = 0
 		bool PrepassFrontToBack = false;  ///< bEnableFrontToBackPrepass = 1
 
@@ -80,9 +90,14 @@ namespace Batch39Engine
 	// ---- effective state (setting && master && prerequisites) -----------------------------
 	bool ReflThrottleActive();
 	bool ReflHandOffActive();
+	/// @brief (39b) The game's cubemap keeps drawing the sky only while handed off.
+	bool ReflHandOffKeepSkyActive();
+	/// @brief (39b) Dynamic Cubemaps' reflection capture runs every frame while it feeds water.
+	bool ReflHandOffFastCaptureActive();
+	/// @brief (39b) Weight of a new Dynamic Cubemaps capture (0.5 unless the fast capture is on).
+	float DynamicCubemapCaptureWeight();
 	bool ReflSkipLODTreesActive();
 	bool ReflSkipLODObjectsActive();
-	bool PrepassSkipGrassActive();
 	bool PrepassSkipLODLandActive();
 	bool PrepassFrontToBackActive();
 	bool TemporalLODDitherActive();
@@ -101,10 +116,6 @@ namespace Batch39Engine
 		inline constexpr uint32_t MipBiasSpecular = 1u << 3;
 		inline constexpr uint32_t WaterDynamicCubemapOnly = 1u << 4;
 	}
-
-	/// @brief Grass pixel-descriptor bit (CS only, never set by the engine): selects the
-	/// GRASS_MAIN_ALPHA_TEST permutation, which alpha-tests in the main pass.
-	inline constexpr uint32_t kGrassMainAlphaTestFlag = 0x20000000;
 
 	// ---- engine hooks -----------------------------------------------------------------------
 	/// @brief Installs the always-on hooks (render pass entry, depth prepass bracket, PSSetSamplers).

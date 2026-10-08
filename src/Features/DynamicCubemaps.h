@@ -45,7 +45,7 @@ public:
 	struct alignas(16) UpdateCubemapCB
 	{
 		float3 CameraPreviousPosAdjust;
-		uint pad0;
+		float CaptureWeight;  ///< (batch 39b) share of a new capture (was a fixed 0.5 in the shader)
 	};
 	STATIC_ASSERT_ALIGNAS_16(UpdateCubemapCB);
 
@@ -88,6 +88,7 @@ public:
 	};
 
 	NextTask nextTask = NextTask::kCapture;
+	uint32_t fastPlainCounter = 0;  ///< (batch 39b) frames since the plain chain last ran in the fast-capture schedule
 
 	// Editor window
 

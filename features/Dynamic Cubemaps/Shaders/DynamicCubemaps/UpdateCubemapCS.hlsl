@@ -53,7 +53,7 @@ float3 GetSamplingVector(uint3 ThreadID, in RWTexture2DArray<float4> OutputTextu
 cbuffer UpdateData : register(b0)
 {
 	float3 CameraPreviousPosAdjust2;
-	uint padb10;
+	float CaptureWeight;  // (batch 39b) share of a new capture; Dynamic Cubemaps always used 0.5
 }
 
 float smoothbumpstep(float edge0, float edge1, float x)
@@ -101,7 +101,7 @@ float smoothbumpstep(float edge0, float edge1, float x)
 			float4 positionFinal = float4(position.xyz * 0.001, length(position) < (4096.0 * 2.5));
 			float4 colorFinal = float4(Color::IrradianceToLinear(color), 1.0);
 
-			float lerpFactor = 0.5;
+			float lerpFactor = CaptureWeight;
 
 			DynamicCubemapPosition[ThreadID] = lerp(DynamicCubemapPosition[ThreadID], positionFinal, lerpFactor);
 			DynamicCubemapRaw[ThreadID] = max(0, lerp(DynamicCubemapRaw[ThreadID], colorFinal, lerpFactor));
