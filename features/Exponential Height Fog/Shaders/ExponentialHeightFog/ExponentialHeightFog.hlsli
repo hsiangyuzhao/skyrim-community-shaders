@@ -74,11 +74,14 @@ namespace ExponentialHeightFog
         float expFogFactor = saturate(exp2(-exponentialHeightLineIntegral));
 
 #   if defined(DYNAMIC_CUBEMAPS)
-        if (SharedData::exponentialHeightFogSettings.useDynamicCubemaps > 0)
+        if ((SharedData::exponentialHeightFogSettings.useDynamicCubemaps & 1) != 0)
         {
             float3 tintColor = lerp(fogColor, SharedData::exponentialHeightFogSettings.inscatteringTint.xyz, SharedData::exponentialHeightFogSettings.inscatteringTint.w);
             float3 cubemapColor = DynamicCubemaps::EnvReflectionsTexture.SampleLevel(SampColorSampler, normalize(positionWS), SharedData::exponentialHeightFogSettings.cubemapMipLevel).xyz;
-            fogColor = tintColor * cubemapColor * (1.0f - expFogFactor);
+            // Upstream fix 22ac9859c (bit 1): callers blend with the returned opacity (.w), so the colour must not be pre-weighted by it.
+            fogColor = tintColor * cubemapColor;
+            if ((SharedData::exponentialHeightFogSettings.useDynamicCubemaps & 2) == 0)
+                fogColor *= (1.0f - expFogFactor);
         }
 #   endif
 
@@ -97,7 +100,12 @@ namespace ExponentialHeightFog
             float3 directionalLightInscattering = dirLightColor * pow(saturate((dot(normalize(positionWS), SharedData::DirLightDirection.xyz) + 1) / 2), SharedData::exponentialHeightFogSettings.directionalInscatteringExponent) / Math::TAU;
             float dirExponentialHeightLineIntegral = exponentialHeightLineIntegralCalc * max(rayLength - SharedData::exponentialHeightFogSettings.startDistance, 0);
             float dirExpFogFactor = saturate(exp2(-dirExponentialHeightLineIntegral));
-            directionalInscattering = directionalLightInscattering * (1 - dirExpFogFactor) * SharedData::exponentialHeightFogSettings.directionalInscatteringMultiplier;
+            float dirOpacity = 1 - dirExpFogFactor;
+            // Upstream fix 22ac9859c (bit 1): the caller multiplies by the full opacity (1 - expFogFactor) again, so keep
+            // only the start-distance share of it here (dirOpacity <= fog opacity, ratio in [0, 1]).
+            if ((SharedData::exponentialHeightFogSettings.useDynamicCubemaps & 2) != 0)
+                dirOpacity = saturate(dirOpacity / max(1.0f - expFogFactor, 1e-5f));
+            directionalInscattering = directionalLightInscattering * dirOpacity * SharedData::exponentialHeightFogSettings.directionalInscatteringMultiplier;
         }
 
         fogColor += directionalInscattering;

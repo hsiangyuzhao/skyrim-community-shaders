@@ -77,7 +77,7 @@ namespace SharedData
 		// Only read by the GRASS_OPTIMIZATIONS permutation, for grass drawn with an LOD mesh.
 		float MidLODBrightness;
 		float FarLODBrightness;
-		float pad0;
+		float ComplexGrassThreshold;  // (batch 40b, upstream a01d4713b) default 0.03
 	};
 
 	struct CPMSettings
@@ -95,7 +95,9 @@ namespace SharedData
 	struct CubemapCreatorSettings
 	{
 		uint Enabled;
-		float3 pad0;
+		uint EnabledSSR;                  // (was pad0.x) C++ DynamicCubemaps::Settings::EnabledSSR
+		uint UpstreamFixSpecularAmbient;  // upstream b11ba7ddd (was pad0.y)
+		float pad0;
 
 		float4 CubemapColor;
 	};
@@ -163,7 +165,7 @@ namespace SharedData
 		float RippleRadius;
 		float RippleBreadth;
 		float RippleLifetimeRcp;
-		float pad0;
+		uint UpstreamFixPuddleRoughness;  // upstream 12088c356 (was pad0)
 	};
 
 	struct SkylightingSettings
@@ -177,7 +179,8 @@ namespace SharedData
 
 		float MinDiffuseVisibility;
 		float MinSpecularVisibility;
-		uint2 pad0;
+		uint UpstreamFixVertexAODivide;  // upstream df00b70a0 (was pad0.x)
+		uint pad0;
 	};
 
 	struct CloudShadowsSettings
@@ -233,7 +236,8 @@ namespace SharedData
 	{
 		uint enableTilingFix;
 		uint enableLODTerrainTilingFix;
-		float2 pad0;
+		uint UpstreamFixPBRTerrainBlend;  // upstream 53469cd49 (was pad0.x)
+		float pad0;
 	};
 
 	struct IBLSettings
@@ -573,6 +577,22 @@ namespace SharedData
 		float2 pad1;
 	};
 
+	// (batch 40b, upstream df531ac78) Mirrors TerrainBlending::Settings, after DynamicSnowSettings (offset 1696).
+	struct TerrainBlendingSettings
+	{
+		uint Enabled;
+		uint3 _padding;
+	};
+
+	// (batch 40b) Mirrors WaterEffects::Settings, after TerrainBlendingSettings (offset 1712).
+	// Non-zero = upstream fix on, 0 = the old maths.
+	struct WaterEffectsSettings
+	{
+		uint UpstreamFixParallax;     // c6c94acb7 (water part) + d50af1036 + b6de23b0c
+		uint UpstreamFixSunSpecular;  // 3943c4502
+		uint2 pad0;
+	};
+
 	namespace PhysSkyExtFlags
 	{
 		static const uint SunReplace = (1 << 0);           // disk replaces the vanilla sun quad
@@ -584,6 +604,7 @@ namespace SharedData
 		static const uint ApShadowDepthFix = (1 << 6);     // depth read of upstream 224312a11
 		static const uint ReflectionSkyFix = (1 << 7);     // upstream 23156dc5f
 		static const uint MultiScatterFix = (1 << 8);      // LutGen part of upstream c14664115
+		static const uint EffectBlendFix = (1 << 9);       // Effect part of upstream 25013493d
 	}
 
 	cbuffer FeatureData : register(b6)
@@ -614,6 +635,8 @@ namespace SharedData
 		VolumetricFogSettings volumetricFogSettings;
 		VolumetricShadowsSettings volumetricShadowsSettings;
 		DynamicSnowSettings dynamicSnowSettings;
+		TerrainBlendingSettings terrainBlendingSettings;
+		WaterEffectsSettings waterEffectsSettings;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);

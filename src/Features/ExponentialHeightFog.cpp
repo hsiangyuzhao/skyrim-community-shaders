@@ -12,7 +12,6 @@
 #include "Menu.h"
 #include "State.h"
 #include "Util.h"
-#include "Utils/Batch38.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -81,6 +80,7 @@ void ExponentialHeightFog::RestoreDefaultSettings()
 {
     settings = {};
     volumetric = {};
+    upstreamFixFogDoubleOpacity = true;
 }
 
 void ExponentialHeightFog::LoadSettings(json& o_json)
@@ -88,26 +88,27 @@ void ExponentialHeightFog::LoadSettings(json& o_json)
     settings = o_json;
     if (o_json.contains(kVolumetricKey) && o_json[kVolumetricKey].is_object())
         volumetric = o_json[kVolumetricKey];
+    upstreamFixFogDoubleOpacity = o_json.value("UpstreamFixFogDoubleOpacity", true);
 }
 
 void ExponentialHeightFog::SaveSettings(json& o_json)
 {
     o_json = settings;
     o_json[kVolumetricKey] = volumetric;
+    o_json["UpstreamFixFogDoubleOpacity"] = upstreamFixFogDoubleOpacity;
 }
 
 ExponentialHeightFog::Settings ExponentialHeightFog::GetCommonBufferData() const
 {
     Settings data = settings;
-    // The second layer is a batch 38 addition: master off = the 37c single layer.
-    if (!Batch38::IsOn())
-        data.fogDensity2 = 0.0f;
+    // bit 0 = use cubemaps, bit 1 = upstream fix 22ac9859c (fog colour not pre-weighted by opacity)
+    data.useDynamicCubemaps = (settings.useDynamicCubemaps ? 1u : 0u) | (upstreamFixFogDoubleOpacity ? 2u : 0u);
     return data;
 }
 
 bool ExponentialHeightFog::VolumetricFogRequested() const
 {
-    return loaded && Batch38::IsOn() && volumetric.Enabled && settings.enabled;
+    return loaded && volumetric.Enabled && settings.enabled;
 }
 
 bool ExponentialHeightFog::VolumetricFogActive() const
@@ -426,7 +427,7 @@ void ExponentialHeightFog::Prepass()
     const bool hasLocalLights = lightLimitFix.loaded && lightLimitFix.lights && lightLimitFix.lightIndexList && lightLimitFix.lightGrid;
     const auto& depthStencil = globals::game::renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
     auto& terrainBlending = globals::features::terrainBlending;
-    ID3D11ShaderResourceView* depthSrv = terrainBlending.loaded && terrainBlending.blendedDepthTexture16 ? terrainBlending.blendedDepthTexture16->srv.get() : depthStencil.depthSRV;
+    ID3D11ShaderResourceView* depthSrv = terrainBlending.IsBlendingActive() && terrainBlending.blendedDepthTexture16 ? terrainBlending.blendedDepthTexture16->srv.get() : depthStencil.depthSRV;
     const bool hasIBL = ibl.loaded && ibl.settings.EnableDiffuseIBL && ibl.diffuseIBLTexture && ibl.diffuseSkyIBLTexture;
     const bool hasSkylighting = skylighting.loaded && skylighting.texProbeArray;
 
@@ -700,6 +701,9 @@ void ExponentialHeightFog::DrawSettings()
     ImGui::Checkbox("Use Dynamic Cubemaps for Inscattering", (bool*)&settings.useDynamicCubemaps);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Colours the fog with the surroundings (needs Dynamic Cubemaps) instead of a flat fog colour.");
+    ImGui::Checkbox("Upstream fix: fog colour darkened twice", &upstreamFixFogDoubleOpacity);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text("The cubemap fog colour and the sun glow in fog were dimmed by the fog amount twice, so thin fog looked too dark. Off = old behaviour.");
     ImGui::ColorEdit3("Inscattering Cubemap Tint", (float*)&settings.inscatteringTint);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Tint colour for the cubemap-coloured fog.");
@@ -712,9 +716,7 @@ void ExponentialHeightFog::DrawSettings()
 
     const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
 
-    if (ImGui::TreeNode("Second Fog Layer (Batch 38)")) {
-        if (!Batch38::IsOn())
-            ImGui::TextColored(palette.Warning, "Off: Advanced > Batch 38 master switch is off (37c behaviour).");
+    if (ImGui::TreeNode("Second Fog Layer")) {
         ImGui::SliderFloat("Fog Height 2", &settings.fogHeight2, -22000.0f, 22000.0f, "%.1f");
         ImGui::SliderFloat("Fog Height Falloff 2", &settings.fogHeightFalloff2, 0.001f, 2.0f, "%.3f");
         ImGui::SliderFloat("Fog Density 2", &settings.fogDensity2, 0.0f, 1.0f, "%.3f");
@@ -725,9 +727,7 @@ void ExponentialHeightFog::DrawSettings()
         ImGui::TreePop();
     }
 
-    ImGui::SeparatorText("Volumetric Fog (Batch 38)");
-    if (!Batch38::IsOn())
-        ImGui::TextColored(palette.Warning, "Off: Advanced > Batch 38 master switch is off (37c behaviour).");
+    ImGui::SeparatorText("Volumetric Fog");
     ImGui::Checkbox("Enable Volumetric Fog", &volumetric.Enabled);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
@@ -739,6 +739,8 @@ void ExponentialHeightFog::DrawSettings()
     if (volumetric.Enabled) {
         if (VolumetricFogRequested() && globals::features::volumetricLighting.loaded)
             ImGui::TextColored(palette.InfoColor, "Vanilla Volumetric Lighting is paused while this is on.");
+        if (VolumetricFogActive() && lastBuildFrame != UINT32_MAX)
+            ImGui::TextDisabled("Sun shadow in the fog: %s", lastBuildHadShadows ? "on" : "off (no shadow capture this frame)");
         if (!settings.enabled)
             ImGui::TextColored(palette.Warning, "Needs Enable Exponential Height Fog (top of this page).");
         else if (const auto reason = VolumetricFogIdleReason(); !reason.empty())

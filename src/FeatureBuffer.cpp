@@ -18,11 +18,13 @@
 #include "Features/ScreenSpacePointLightShadows.h"
 #include "Features/ScreenSpaceRayTracing.h"
 #include "Features/Skylighting.h"
+#include "Features/TerrainBlending.h"
 #include "Features/TerrainShadows.h"
 #include "Features/TerrainVariation.h"
 #include "Features/VanillaFresnel.h"
 #include "Features/VolumetricLighting.h"
 #include "Features/VolumetricShadows.h"
+#include "Features/WaterEffects.h"
 #include "Features/WetnessEffects.h"
 
 #include "TruePBR.h"
@@ -71,7 +73,9 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::physicalSky.extCbData,
 		globals::features::exponentialHeightFog.GetVolumetricPSData(),
 		globals::features::volumetricShadows.GetCommonBufferData(),
-		globals::features::dynamicSnow.GetCommonBufferData());
+		globals::features::dynamicSnow.GetCommonBufferData(),
+		globals::features::terrainBlending.settings,
+		globals::features::waterEffects.settings);
 }
 
 namespace
@@ -119,6 +123,8 @@ namespace
 		SettingsOf<decltype(globals::features::exponentialHeightFog.GetVolumetricPSData())> volumetricFog;
 		SettingsOf<decltype(globals::features::volumetricShadows.GetCommonBufferData())> volumetricShadows;
 		SettingsOf<decltype(globals::features::dynamicSnow.GetCommonBufferData())> dynamicSnow;
+		SettingsOf<decltype(globals::features::terrainBlending.settings)> terrainBlending;  // (batch 40b) upstream df531ac78
+		SettingsOf<decltype(globals::features::waterEffects.settings)> waterEffects;        // (batch 40b) upstream water fixes
 	};
 
 	static_assert(offsetof(FeatureDataLayoutMirror, vanillaFresnel) == 1040,
@@ -139,6 +145,10 @@ namespace
 		"(batch 38) SharedData::volumetricShadowsSettings moved; update the HLSL mirror and this offset together.");
 	static_assert(offsetof(FeatureDataLayoutMirror, dynamicSnow) == 1584,
 		"(batch 39) SharedData::dynamicSnowSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(sizeof(FeatureDataLayoutMirror) == 1696,  // (batch 39c) DynamicSnow 80 -> 112, (batch 40) +32 before it
+	static_assert(offsetof(FeatureDataLayoutMirror, terrainBlending) == 1696,
+		"(batch 40b) SharedData::terrainBlendingSettings moved; update the HLSL mirror and this offset together.");
+	static_assert(offsetof(FeatureDataLayoutMirror, waterEffects) == 1712,
+		"(batch 40b) SharedData::waterEffectsSettings moved; update the HLSL mirror and this offset together.");
+	static_assert(sizeof(FeatureDataLayoutMirror) == 1728,  // (batch 39c) DynamicSnow 80 -> 112, (batch 40) +32 before it, (batch 40b) +16 TerrainBlending, +16 WaterEffects
 		"FeatureData's total size changed; check every offset above against fxc's reflection listing.");
 }

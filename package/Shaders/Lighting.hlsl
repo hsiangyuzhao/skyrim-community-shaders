@@ -1090,17 +1090,21 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	endif
 
 #	if defined(TERRAIN_BLENDING)
-	float depthSampled = TerrainBlending::TerrainBlendingMaskTexture[input.Position.xy].x;
+	// (batch 40b, upstream df531ac78) runtime Enabled switch; when off the terrain keeps its
+	// vanilla output alpha below.
+	float blendFactorTerrain = 0.0;
+	[flatten] if (SharedData::terrainBlendingSettings.Enabled)
+	{
+		float depthSampled = TerrainBlending::TerrainBlendingMaskTexture[input.Position.xy].x;
 
-	float depthSampledLinear = SharedData::GetScreenDepth(depthSampled);
-	float depthPixelLinear = SharedData::GetScreenDepth(input.Position.z);
+		float depthSampledLinear = SharedData::GetScreenDepth(depthSampled);
+		float depthPixelLinear = SharedData::GetScreenDepth(input.Position.z);
 
-	float blendFactorTerrain = saturate((depthSampledLinear - depthPixelLinear) / 10.0);
+		blendFactorTerrain = saturate((depthSampledLinear - depthPixelLinear) / 10.0);
 
-	if (input.Position.z == depthSampled)
-		blendFactorTerrain = 1;
-
-	blendFactorTerrain = saturate(blendFactorTerrain);
+		if (input.Position.z == depthSampled)
+			blendFactorTerrain = 1;
+	}
 #	endif
 
 	float2 uv = input.TexCoord0.xy;
@@ -1474,7 +1478,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 		else
 		{
-			landRMAOS1 = input.LandBlendWeights1.x * float4(1 - glossiness.x, 0, 1, 0);
+			landRMAOS1 = (SharedData::terrainVariationSettings.UpstreamFixPBRTerrainBlend ? 1.0 : input.LandBlendWeights1.x) * float4(1 - glossiness.x, 0, 1, 0);  // upstream 53469cd49: weight is applied once below
 		}
 		blendedRMAOS += landRMAOS1 * weight;
 #		endif
@@ -1555,7 +1559,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 		else
 		{
-			landRMAOS2 = input.LandBlendWeights1.y * float4(1 - glossiness.x, 0, 1, 0);
+			landRMAOS2 = (SharedData::terrainVariationSettings.UpstreamFixPBRTerrainBlend ? 1.0 : input.LandBlendWeights1.y) * float4(1 - glossiness.x, 0, 1, 0);  // upstream 53469cd49: weight is applied once below
 		}
 		blendedRMAOS += landRMAOS2 * weight;
 #		endif
@@ -1635,7 +1639,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 		else
 		{
-			landRMAOS3 = input.LandBlendWeights1.z * float4(1 - glossiness.x, 0, 1, 0);
+			landRMAOS3 = (SharedData::terrainVariationSettings.UpstreamFixPBRTerrainBlend ? 1.0 : input.LandBlendWeights1.z) * float4(1 - glossiness.x, 0, 1, 0);  // upstream 53469cd49: weight is applied once below
 		}
 		blendedRMAOS += landRMAOS3 * weight;
 #		endif
@@ -1715,7 +1719,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 		else
 		{
-			landRMAOS4 = input.LandBlendWeights1.w * float4(1 - glossiness.x, 0, 1, 0);
+			landRMAOS4 = (SharedData::terrainVariationSettings.UpstreamFixPBRTerrainBlend ? 1.0 : input.LandBlendWeights1.w) * float4(1 - glossiness.x, 0, 1, 0);  // upstream 53469cd49: weight is applied once below
 		}
 		blendedRMAOS += landRMAOS4 * weight;
 #		endif
@@ -1796,7 +1800,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 		else
 		{
-			landRMAOS5 = input.LandBlendWeights2.x * float4(1 - glossiness.x, 0, 1, 0);
+			landRMAOS5 = (SharedData::terrainVariationSettings.UpstreamFixPBRTerrainBlend ? 1.0 : input.LandBlendWeights2.x) * float4(1 - glossiness.x, 0, 1, 0);  // upstream 53469cd49: weight is applied once below
 		}
 		blendedRMAOS += landRMAOS5 * weight;
 #		endif
@@ -1876,7 +1880,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 		else
 		{
-			landRMAOS6 = input.LandBlendWeights2.y * float4(1 - glossiness.x, 0, 1, 0);
+			landRMAOS6 = (SharedData::terrainVariationSettings.UpstreamFixPBRTerrainBlend ? 1.0 : input.LandBlendWeights2.y) * float4(1 - glossiness.x, 0, 1, 0);  // upstream 53469cd49: weight is applied once below
 		}
 		blendedRMAOS += landRMAOS6 * weight;
 #		endif
@@ -3020,6 +3024,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	wetnessNormal = WetnessEffects::ReorientNormal(rippleNormal, wetnessNormal);
 
 	waterRoughnessSpecular = 1.0 - wetnessGlossinessSpecular;
+	// Upstream fix 12088c356: a perfectly smooth puddle gives an extreme GGX peak (pin-point highlights, NaN)
+	if (SharedData::wetnessEffectsSettings.UpstreamFixPuddleRoughness)
+		waterRoughnessSpecular = max(saturate(waterRoughnessSpecular), 0.05);
 #	endif
 
 	float llDirLightMult = SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear && (inWorld || inReflection) && !SharedData::InInterior ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
@@ -3763,11 +3770,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	elif defined(SKYLIGHTING)
 	float3 vertexColor = input.Color.xyz;
 	float vertexAO = max(max(vertexColor.r, vertexColor.g), vertexColor.b);
+	// Upstream fix df00b70a0: a pure-black vertex colour made the AO removal 0/0 = NaN
+	float vertexAODivisor = SharedData::skylightingSettings.UpstreamFixVertexAODivide ? max(vertexAO, EPSILON_DIVISION) : vertexAO;
 
 	if (!SharedData::InInterior) {
 #		if defined(LANDSCAPE)
 		// Remove AO
-		vertexColor = vertexColor / vertexAO;
+		vertexColor = vertexColor / vertexAODivisor;
 #			if defined(LOD_BLENDING)
 		vertexColor = lerp(vertexColor, 1, SharedData::lodBlendingSettings.DisableTerrainVertexColors);
 #			endif  // LOD_BLENDING
@@ -3776,7 +3785,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		if (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsTree) {
 			// Remove AO
 			float3 originalVertexColor = vertexColor;
-			vertexColor = lerp(vertexColor, vertexColor / vertexAO, sqrt(vertexAO));
+			vertexColor = lerp(vertexColor, vertexColor / vertexAODivisor, sqrt(vertexAO));
 			vertexColor = lerp(input.Color.xyz, vertexColor, skylightingFadeOutFactor);
 
 			// Apply AO to direct lighting only
@@ -4235,7 +4244,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	if defined(DEFERRED)
 
 #		if defined(TERRAIN_BLENDING)
-	psout.Diffuse.w = blendFactorTerrain;
+	[flatten] if (SharedData::terrainBlendingSettings.Enabled)
+		psout.Diffuse.w = blendFactorTerrain;
 #		endif
 
 	psout.MotionVectors.zw = float2(0.0, psout.Diffuse.w);

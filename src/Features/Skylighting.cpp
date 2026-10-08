@@ -5,7 +5,6 @@
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
-#include "Utils/Batch38.h"
 #include "Utils/GpuTimers.h"
 
 #include <numbers>
@@ -14,23 +13,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Skylighting::Settings,
 	MaxZenith,
 	MinDiffuseVisibility,
-	MinSpecularVisibility,
-	FixRoofMarkers,
-	FixResetClearsProbes,
-	FixZenithClamp,
-	FixZenithRadius,
-	FixFadeOutGridOffset,
-	SkipOccludersBelowGrid)
-
-bool Skylighting::RoofMarkersActive() const { return Batch38::IsOn() && settings.FixRoofMarkers; }
-bool Skylighting::ResetClearsProbesActive() const { return Batch38::IsOn() && settings.FixResetClearsProbes; }
-bool Skylighting::FadeOutGridOffsetActive() const { return Batch38::IsOn() && settings.FixFadeOutGridOffset; }
-bool Skylighting::SkipOccludersBelowGridActive() const { return Batch38::IsOn() && settings.SkipOccludersBelowGrid; }
+	MinSpecularVisibility)
 
 float Skylighting::EffectiveMaxZenith() const
 {
-	if (!(Batch38::IsOn() && settings.FixZenithClamp))
-		return settings.MaxZenith;
 	// (bff82b03e) A negative or non-finite zenith turns the sample disc radius into NaN.
 	return std::isfinite(settings.MaxZenith) ? std::clamp(settings.MaxZenith, 0.0f, std::numbers::pi_v<float> / 2.0f) : Settings{}.MaxZenith;
 }
@@ -40,57 +26,31 @@ float Skylighting::SampleDiscRadius(float a_u) const
 	const float sinZenith = sin(EffectiveMaxZenith());
 	// (4b5b99783) Uniform disc of radius sin(zenith) is sqrt(u) * sin(zenith). 37c took
 	// sqrt(u * sin(zenith)), a wider disc (sqrt(sin) > sin below 90 deg; identical at 90 deg).
-	if (Batch38::IsOn() && settings.FixZenithRadius)
-		return sqrt(a_u) * sinZenith;
-	return sqrt(a_u * sinZenith);
+	// (4b5b99783) Sampling disc radius sin(zenith), not sqrt(sin(zenith)).
+	return sqrt(a_u) * sinZenith;
 }
 
 void Skylighting::DrawBatch38Settings()
 {
-	ImGui::SeparatorText("Fixes (Batch 38)");
-	if (!Batch38::IsOn())
-		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 38 master switch is off (37c behaviour).");
-
-	ImGui::Checkbox("Roofs flagged as editor markers block the sky (ca63a41d5)", &settings.FixRoofMarkers);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Some buildings and roofs carry an 'editor marker' flag in their mesh. 37c left every such mesh out of the\n"
-			"sky-occlusion map, so sky light leaked in under those roofs (porches, sheds, half-open interiors).\n"
-			"Builds up over a few seconds; press Rebuild Skylighting to see it at once.");
-	ImGui::Checkbox("Rebuild / loading screen resets probes to open sky (5b5361f53)", &settings.FixResetClearsProbes);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Probes the occlusion map does not reach no longer keep values from before the reset.");
-	ImGui::Checkbox("Keep Max Zenith Angle within 0-90 deg (bff82b03e)", &settings.FixZenithClamp);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("A typed-in value outside 0-90 deg (or a broken saved value) no longer breaks the sampling.");
-	ImGui::Checkbox("Correct sampling cone for Max Zenith Angle (4b5b99783)", &settings.FixZenithRadius);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Sky directions are now really limited to the Max Zenith Angle. No change at 90 deg (the default).");
-	ImGui::Checkbox("Edge fade-out centred on the probe grid (4b5b99783)", &settings.FixFadeOutGridOffset);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("The fade to open sky at the far edge of the probe area now lines up with the probes (off by up to half a probe before).");
-	ImGui::Checkbox("Skip objects below the probe grid in the height map (816888f04)", &settings.SkipOccludersBelowGrid);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Speed-up: objects entirely below every probe cannot block their view of the sky, so they are no longer drawn\n"
-			"into the height map. Same picture, fewer draw calls (Skylighting Height Map row).");
-	if (SkipOccludersBelowGridActive())
-		ImGui::TextDisabled("Objects skipped in the last height map: %u", occludersSkippedBelowGridLast);
+	ImGui::TextDisabled("Objects below the probe grid skipped in the last height map: %u", occludersSkippedBelowGridLast);
 }
 
 void Skylighting::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	upstreamFixVertexAODivide = o_json.value("UpstreamFixVertexAODivide", true);
 }
 
 void Skylighting::SaveSettings(json& o_json)
 {
 	o_json = settings;
+	o_json["UpstreamFixVertexAODivide"] = upstreamFixVertexAODivide;
 }
 
 void Skylighting::RestoreDefaultSettings()
 {
 	settings = {};
+	upstreamFixVertexAODivide = true;
 }
 
 void Skylighting::ResetSkylighting()
@@ -115,6 +75,9 @@ void Skylighting::DrawSettings()
 	ImGui::Text("Minimum visibility values. Diffuse darkens objects. Specular removes the sky from reflections.");
 	ImGui::SliderFloat("Diffuse Min Visibility", &settings.MinDiffuseVisibility, 0.01f, 1.f, "%.2f");
 	ImGui::SliderFloat("Specular Min Visibility", &settings.MinSpecularVisibility, 0.01f, 1.f, "%.2f");
+	ImGui::Checkbox("Upstream fix: black vertex colour NaN", &upstreamFixVertexAODivide);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Pure-black vertex colours on terrain and trees divided by zero, leaving black or flashing blocks. Normal pixels are unchanged. Off = old behaviour.");
 
 	ImGui::Separator();
 
@@ -125,7 +88,7 @@ void Skylighting::DrawSettings()
 		ImGui::Text("Changes below require rebuilding, a loading screen, or moving away from the current location to apply.");
 
 	ImGui::SliderAngle("Max Zenith Angle", &settings.MaxZenith, 0, 90, "%.0f deg",
-		(Batch38::IsOn() && settings.FixZenithClamp) ? ImGuiSliderFlags_AlwaysClamp : ImGuiSliderFlags_None);
+		ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Smaller angles creates more focused top-down shadow.");
 
@@ -246,12 +209,15 @@ void Skylighting::CompileComputeShaders()
 
 Skylighting::SkylightingCB Skylighting::GetCommonBufferData(bool a_inWorld)
 {
+	Skylighting::SkylightingCB emptyCB{};
+	emptyCB.UpstreamFixVertexAODivide = upstreamFixVertexAODivide ? 1u : 0u;
+
 	if (!a_inWorld)
-		return Skylighting::SkylightingCB{};
+		return emptyCB;
 
 	if (auto ui = globals::game::ui)
 		if (ui->IsMenuOpen(RE::MapMenu::MENU_NAME))
-			return Skylighting::SkylightingCB{};
+			return emptyCB;
 
 	static float3 prevCellID = { 0, 0, 0 };
 
@@ -281,7 +247,8 @@ Skylighting::SkylightingCB Skylighting::GetCommonBufferData(bool a_inWorld)
 			((int)cellID.z - probeArrayDims[2] / 2) % probeArrayDims[2] },
 		.ValidMargin = { (int)cellIDDiff.x, (int)cellIDDiff.y, (int)cellIDDiff.z },
 		.MinDiffuseVisibility = settings.MinDiffuseVisibility,
-		.MinSpecularVisibility = settings.MinSpecularVisibility
+		.MinSpecularVisibility = settings.MinSpecularVisibility,
+		.UpstreamFixVertexAODivide = upstreamFixVertexAODivide ? 1u : 0u
 	};
 }
 

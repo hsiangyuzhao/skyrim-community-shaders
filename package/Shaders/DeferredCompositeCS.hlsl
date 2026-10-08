@@ -419,7 +419,11 @@ float SSRTCompositeViewZ(float screenDepth)
 
 		float3 finalIrradiance = 0;
 
-        float directionalAmbientColorSpecular = Color::RGBToLuminance(max(0, mul(SharedData::DirectionalAmbient, float4(R, 1.0)))) * Color::ReflectionNormalisationScale;
+        // Upstream fix b11ba7ddd: the specular DALC base was missing the Color::Ambient conversion
+        float3 directionalAmbientSpecularRGB = max(0, mul(SharedData::DirectionalAmbient, float4(R, 1.0)));
+        if (SharedData::cubemapCreatorSettings.UpstreamFixSpecularAmbient)
+            directionalAmbientSpecularRGB = Color::Ambient(directionalAmbientSpecularRGB);
+        float directionalAmbientColorSpecular = Color::RGBToLuminance(directionalAmbientSpecularRGB) * Color::ReflectionNormalisationScale;
 
 #	if defined(INTERIOR)
 		float3 specularIrradiance = EnvTexture.SampleLevel(LinearSampler, R, level);

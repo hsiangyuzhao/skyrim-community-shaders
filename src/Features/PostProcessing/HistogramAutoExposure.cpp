@@ -5,6 +5,11 @@
 
 #include "Features/PostProcessing.h"
 
+bool HistogramAutoExposure::DisableInMainLoadingMenu() const
+{
+	return globals::features::postProcessing.settings.UpstreamFixMenuSkip != 0;
+}
+
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	HistogramAutoExposure::Settings,
 	ExposureCompensation,

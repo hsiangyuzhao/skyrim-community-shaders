@@ -27,7 +27,8 @@ struct PostProcessing : Feature
 	struct alignas(16) Settings
 	{
 		uint DisableVanillaTonemapping = 1;
-		uint pad[3];
+		uint UpstreamFixMenuSkip = 1;  // upstream 2fb3f8e9b: Border + Histogram Auto Exposure skip main/loading menus (CPU only; HLSL pad0.x)
+		uint pad[2];
 	} settings;
 
 	const std::string ppPresetPath = "Data\\SKSE\\Plugins\\CommunityShaders\\PostProcessing";
@@ -117,7 +118,7 @@ struct PostProcessing : Feature
 	bool isrefraction = false;
 
 	/// (batch 37b, C-1) What the last PreProcess did with the final effect: true when it wrote
-	/// straight into the game's buffer (one write-back copy instead of two). For the Batch 37b tab.
+	/// straight into the game's buffer (one write-back copy instead of two). For the menu.
 	bool directOutputUsed = false;
 	/// (batch 37b, C-1) Why the direct path was or was not taken on the last PreProcess.
 	const char* directOutputStatus = "Not run yet";

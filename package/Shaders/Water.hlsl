@@ -958,6 +958,9 @@ float3 GetSunColor(float3 normal, float3 viewDirection)
 	float reflectionMul = exp2(VarAmounts.x * log2(saturate(dot(reflectionDirection, SunDir.xyz))));
 
 	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
+	// Upstream fix 3943c4502: saturating curve instead of a linear multiply by DeepColor.w (blown-out sun glint)
+	if (SharedData::waterEffectsSettings.UpstreamFixSunSpecular)
+		return reflectionMul * Color::DirectionalLight((SunColor.xyz * SunDir.w) / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * (1.0 - exp(-DeepColor.w)) * llDirLightMult;
 	return reflectionMul * Color::DirectionalLight(SunColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * SunDir.w * DeepColor.w * llDirLightMult;
 #			endif
 }

@@ -76,6 +76,7 @@ public:
 
 	bool resetCapture[2] = { true, true };
 	bool recompileFlag = false;
+	float previousHoursPassed = 0.0f;
 
 	enum class NextTask
 	{
@@ -96,7 +97,8 @@ public:
 	{
 		uint EnabledCreator = false;
 		uint EnabledSSR = true;
-		uint pad0[2];
+		uint UpstreamFixSpecularAmbient = true;  // upstream b11ba7ddd: Color::Ambient on the specular DALC base (HLSL cubemapCreatorSettings)
+		uint pad0;
 		float4 CubemapColor{ 1.0f, 1.0f, 1.0f, 0.0f };
 	};
 

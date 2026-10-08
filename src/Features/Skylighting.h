@@ -48,20 +48,16 @@ public:
 		float MinDiffuseVisibility = 0.1f;
 		float MinSpecularVisibility = 0.1f;
 
-		// (batch 38, item 5) Upstream Skylighting fixes, one switch each, every one ANDed with
-		// Batch38::IsOn() (see the *Active() helpers). Off = the 37c code path.
-		bool FixRoofMarkers = true;          // ca63a41d5: meshes flagged "editor marker" (roof markers) occlude the sky
-		bool FixResetClearsProbes = true;    // 5b5361f53 (probe part): Rebuild / load screen resets probes to open sky
-		bool FixZenithClamp = true;          // bff82b03e: Max Zenith kept in 0..90 deg and finite
-		bool FixZenithRadius = true;         // 4b5b99783: sampling disc radius sin(zenith), not sqrt(sin(zenith))
-		bool FixFadeOutGridOffset = true;    // 4b5b99783: edge fade measured from the probe grid's centre
-		bool SkipOccludersBelowGrid = true;  // 816888f04: height map skips objects entirely below the probe grid
 	} settings;
 
-	bool RoofMarkersActive() const;
-	bool ResetClearsProbesActive() const;
-	bool FadeOutGridOffsetActive() const;
-	bool SkipOccludersBelowGridActive() const;
+	// Upstream Skylighting fixes, always on: ca63a41d5 (roof markers occlude the sky), 5b5361f53
+	// (Rebuild / load screen resets probes to open sky), 4b5b99783 (edge fade from the probe
+	// grid's centre), 816888f04 (height map skips objects below the probe grid). Also always on:
+	// bff82b03e (Max Zenith kept in 0..90 deg) and 4b5b99783 (disc radius sin(zenith)).
+	static bool RoofMarkersActive() { return true; }
+	static bool ResetClearsProbesActive() { return true; }
+	static bool FadeOutGridOffsetActive() { return true; }
+	static bool SkipOccludersBelowGridActive() { return true; }
 	/// @brief (batch 38) Max Zenith as used for sampling: clamped to [0, 90 deg] and finite when
 	/// FixZenithClamp is active, the raw setting otherwise.
 	float EffectiveMaxZenith() const;
@@ -82,9 +78,14 @@ public:
 
 		float MinDiffuseVisibility;
 		float MinSpecularVisibility;
-		uint _pad2[2];
+		uint UpstreamFixVertexAODivide;  // upstream df00b70a0: floor the vertex-AO divide (was _pad2[0])
+		uint _pad2;
 	};
 	static_assert(sizeof(SkylightingCB) % 16 == 0);
+
+	/// Upstream fix df00b70a0: removing vertex AO divided by it, so pure-black vertex colours gave 0/0 = NaN
+	/// (black or flashing blocks after TAA/bloom). JSON "UpstreamFixVertexAODivide".
+	bool upstreamFixVertexAODivide = true;
 
 	SkylightingCB GetCommonBufferData(bool a_inWorld);
 

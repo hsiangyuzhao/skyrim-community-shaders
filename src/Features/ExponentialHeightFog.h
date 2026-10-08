@@ -18,7 +18,7 @@ struct ExponentialHeightFog : Feature
 				"Added exponential height fog effect",
 				"Adapted to vanilla fog settings",
 				"Creates atmospheric depth",
-				"Optional volumetric fog lit by the sun, sky and nearby lights (Batch 38)",
+				"Optional volumetric fog lit by the sun, sky and nearby lights",
 			}
 		};
 	}
@@ -57,6 +57,10 @@ struct ExponentialHeightFog : Feature
 		float fogDensity2 = 0.0f;
 	} settings;
 	STATIC_ASSERT_ALIGNAS_16(Settings);
+
+	/// Upstream fix 22ac9859c: fog colour was weighted by fog opacity twice (cubemap colour and
+	/// sun glow). CPU side only; reaches the shaders as bit 1 of useDynamicCubemaps.
+	bool upstreamFixFogDoubleOpacity = true;
 
 	/// (batch 38, A1) Volumetric fog settings. CPU side only: the compute passes get them in
 	/// their own constant buffer, pixel shaders get VolumetricFogPSData.
@@ -118,7 +122,7 @@ struct ExponentialHeightFog : Feature
 	/// Why VolumetricFogActive() is false while requested (for the UI), or empty.
 	[[nodiscard]] std::string VolumetricFogIdleReason() const;
 
-	// Diagnostics for the Batch 38 table
+	// Diagnostics (shown under Volumetric Fog)
 	DirectX::XMUINT4 currentGridSize = {};
 	DirectX::XMUINT4 currentFarGridSize = {};
 	uint32_t lastBuildFrame = UINT32_MAX;

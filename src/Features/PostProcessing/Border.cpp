@@ -3,6 +3,13 @@
 #include "State.h"
 #include "Util.h"
 
+#include "Features/PostProcessing.h"
+
+bool Border::DisableInMainLoadingMenu() const
+{
+	return globals::features::postProcessing.settings.UpstreamFixMenuSkip != 0;
+}
+
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     Border::Settings,
     BorderColor,

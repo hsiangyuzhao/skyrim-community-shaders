@@ -19,7 +19,7 @@ struct PostProcessFeature
 	virtual bool DrawBeforeUpscaling() const { return false; }
 	virtual bool DrawAfterColorGrading() const { return false; }
 	virtual bool DisableInMainLoadingMenu() const { return false; }
-	/// @brief (batch 38) False = a batch master switch keeps this effect from running (and from
+	/// @brief False = something keeps this effect from running (and from
 	/// holding memory), whatever its own checkbox says.
 	virtual bool RuntimeGateOpen() const { return true; }
 

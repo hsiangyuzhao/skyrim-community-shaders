@@ -34,7 +34,8 @@ public:
 	{
 		uint enableTilingFix = true;
 		uint enableLODTerrainTilingFix = true;
-		float pad0[2];
+		uint UpstreamFixPBRTerrainBlend = true;  // upstream 53469cd49: drop the double blend weight on non-PBR tiles' RMAOS
+		float pad0;
 	} settings;
 
 	virtual void DrawSettings() override;

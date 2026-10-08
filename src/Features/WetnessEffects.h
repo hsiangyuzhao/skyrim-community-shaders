@@ -69,7 +69,7 @@ public:
 		float Wetness;
 		float PuddleWetness;
 		Settings settings;
-		uint pad0;
+		uint UpstreamFixPuddleRoughness;  // upstream 12088c356: puddle roughness floor (was pad0)
 	};
 	STATIC_ASSERT_ALIGNAS_16(PerFrame);
 
@@ -85,6 +85,8 @@ public:
 	} debugSettings;
 
 	Settings settings;
+	/// Upstream fix 12088c356: floor puddle roughness at 0.05 (no pin-point highlights / NaN). JSON "UpstreamFixPuddleRoughness".
+	bool upstreamFixPuddleRoughness = true;
 	// Climate preset system
 	enum class ClimatePreset : uint32_t
 	{

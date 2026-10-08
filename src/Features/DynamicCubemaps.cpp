@@ -13,7 +13,8 @@ constexpr auto MIPLEVELS = 8;
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DynamicCubemaps::Settings,
 	EnabledSSR,
-	EnabledCreator);
+	EnabledCreator,
+	UpstreamFixSpecularAmbient);
 
 std::vector<std::pair<std::string_view, std::string_view>> DynamicCubemaps::GetShaderDefineOptions()
 {
@@ -27,6 +28,12 @@ std::vector<std::pair<std::string_view, std::string_view>> DynamicCubemaps::GetS
 
 void DynamicCubemaps::DrawSettings()
 {
+	ImGui::Checkbox("Upstream fix: reflection brightness with linear lighting", reinterpret_cast<bool*>(&settings.UpstreamFixSpecularAmbient));
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"With Linear Lighting on, cubemap reflections on some objects skipped one ambient colour conversion,\n"
+			"so reflections on deferred and forward-rendered objects differed in brightness. Off = old behaviour.");
+	}
 	if (ImGui::TreeNodeEx("Screen Space Reflections", ImGuiTreeNodeFlags_DefaultOpen)) {
 		recompileFlag |= ImGui::Checkbox("Enable Screen Space Reflections", reinterpret_cast<bool*>(&settings.EnabledSSR));
 		if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -494,6 +501,20 @@ void DynamicCubemaps::Irradiance(bool a_reflections)
 void DynamicCubemaps::UpdateCubemap()
 {
 	TracyD3D11Zone(globals::state->tracyCtx, "Cubemap Update");
+
+	// Upstream f4cbd4b2d: reset capture when game time jumps (wait/sleep menu, timescale changes,
+	// console commands) so reflections do not keep showing the old sky for a while.
+	if (auto calendar = RE::Calendar::GetSingleton()) {
+		float currentHoursPassed = calendar->GetHoursPassed();
+		float hoursPassedDiff = std::abs(currentHoursPassed - previousHoursPassed);
+		previousHoursPassed = currentHoursPassed;
+
+		if (hoursPassedDiff >= 0.01f) {  // ~36 seconds game time
+			resetCapture[0] = true;
+			resetCapture[1] = true;
+		}
+	}
+
 	if (recompileFlag) {
 		logger::debug("Recompiling for Dynamic Cubemaps");
 		auto shaderCache = globals::shaderCache;

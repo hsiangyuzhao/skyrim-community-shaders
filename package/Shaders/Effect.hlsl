@@ -1046,7 +1046,17 @@ PS_OUTPUT main(PS_INPUT input)
 #		if defined(PHYSICAL_SKY)
 	if (SharedData::physSkyData.enabled && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld)) {
 		const float4 apSample = PhysSky::SampleAp(normalize(input.WorldPosition.xyz), input.Position.xy, length(input.WorldPosition.xyz), SampBaseSampler);
-		psout.Diffuse.xyz = psout.Diffuse.xyz * apSample.w + apSample.xyz;
+		// Upstream fix 25013493d (Effect part): additive effects only fade (each layer would add the haze
+		// light again), multiplicative ones (decals) are left alone. Flag off = every mode composited.
+		if ((SharedData::physSkyExtData.Flags & SharedData::PhysSkyExtFlags::EffectBlendFix) != 0) {
+#			if defined(ADDBLEND)
+			psout.Diffuse.xyz *= apSample.w;
+#			elif !defined(MULTBLEND) && !defined(MULTBLEND_DECAL)
+			psout.Diffuse.xyz = psout.Diffuse.xyz * apSample.w + apSample.xyz;
+#			endif
+		} else {
+			psout.Diffuse.xyz = psout.Diffuse.xyz * apSample.w + apSample.xyz;
+		}
 	}
 #		endif
 #	endif

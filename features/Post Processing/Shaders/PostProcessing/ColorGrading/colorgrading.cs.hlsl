@@ -41,6 +41,9 @@ cbuffer ColorCB : register(b1) {
     uint skipLDR;
     uint enableTonemap;
     uint enableColorSpaceTransform;
+
+    uint upstreamFixLUT;  // Upstream fix (350c6fe82 + 30a6ed06b): LUT half-texel addressing, white balance temperature test
+    uint3 upstreamFixPad;
 };
 
 namespace LogType {
@@ -187,7 +190,7 @@ float3 WhiteBalance(float3 linearColor)
 	float2 srcWhiteDaylight = IlluminantChromaticity(temp);
 	float2 srcWhitePlankian = PlanckianLocusChromaticity(temp);
 
-	float2 srcWhite = exposureTemperatureTint.y < 4000 ? srcWhitePlankian : srcWhiteDaylight;
+	float2 srcWhite = (upstreamFixLUT ? temp : exposureTemperatureTint.y) < 4000 ? srcWhitePlankian : srcWhiteDaylight;
 	float2 d65White = float2(0.31270, 0.32900);
 
 	float2 isothermal = PlanckianIsothermal(temp, tint) - srcWhitePlankian;
@@ -754,6 +757,8 @@ float3 ColorGrading(float3 color)
 float3 ApplyLUT(float3 color)
 {
 	color = LinearToLog(color + LogToLinear(0));
+	if (upstreamFixLUT)
+		color = color * ((LUT_SIZE - 1.0) / LUT_SIZE) + (0.5 / LUT_SIZE);
 	color = TexLUT.SampleLevel(LinearSampler, color, 0).xyz;
 	return color;
 }
@@ -782,7 +787,7 @@ float3 ApplyLUT(float3 color)
 RWTexture3D<float4> RWLUT : register(u0);
 
 [numthreads(8, 8, 8)] void CSLUTGen(uint3 DTid : SV_DispatchThreadID) {
-	float3 uvw = float3(DTid + 0.5) / float3((LUT_SIZE - 1).xxx);
+	float3 uvw = (upstreamFixLUT ? float3(DTid) : float3(DTid + 0.5)) / float3((LUT_SIZE - 1).xxx);
 	float4 neutralColor = float4(uvw, 1);
 	float3 linearColor = LogToLinear(neutralColor.xyz) - LogToLinear(0);
 	linearColor = ColorGrading(linearColor);

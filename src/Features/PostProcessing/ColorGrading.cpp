@@ -30,6 +30,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     invertLog,
     enableTonemap,
     enableColorSpaceTransform,
+    upstreamFixLUT,
     inputColorSpace,
     processColorSpace,
     outputColorSpace,
@@ -251,6 +252,10 @@ void ColorGrading::DrawSettings()
     ImGui::Checkbox("Skip LDR Color Grading", &settings.skipLDR);
     if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Skip color grading after tonemapping. This includes Lift Gamma Gain and Oklch adjustments.");
+
+    ImGui::Checkbox("Upstream fix: LUT colour offset and white balance", &settings.upstreamFixLUT);
+    if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Samples the colour lookup table at texel centres (removes a slight overall colour shift) and fixes the warm/cool white balance test. Off = old behaviour.");
 
     ImGui::Checkbox("Convert Linear to Log Before HDR Color Grading", &settings.useLog);
     if (settings.useLog) {
@@ -700,7 +705,8 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 		.logType = settings.useLog ? ((1u << settings.logType) | (settings.invertLog ? (1u << 3u) : 0u)) : 0u,
 		.skipLDR = settings.skipLDR,
 		.enableTonemap = settings.enableTonemap,
-		.enableColorSpaceTransform = settings.enableColorSpaceTransform
+		.enableColorSpaceTransform = settings.enableColorSpaceTransform,
+		.upstreamFixLUT = settings.upstreamFixLUT ? 1u : 0u
 	};
 	colorCB->Update(colorCBData);
 

@@ -7,7 +7,8 @@
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	TerrainVariation::Settings,
 	enableTilingFix,
-	enableLODTerrainTilingFix)
+	enableLODTerrainTilingFix,
+	UpstreamFixPBRTerrainBlend)
 
 void TerrainVariation::DrawSettings()
 {
@@ -36,6 +37,15 @@ void TerrainVariation::DrawSettings()
 		ImGui::Text(
 			"Applies the tiling fix to LOD terrain objects.\n"
 			"This helps reduce the visible tiling effect on distant terrain.");
+	}
+
+	ImGui::Separator();
+
+	ImGui::Checkbox("Upstream fix: PBR terrain dark seams", (bool*)&settings.UpstreamFixPBRTerrainBlend);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text(
+			"On PBR terrain, non-PBR tiles had their roughness/AO weighted by the blend amount twice,\n"
+			"leaving dark AO bands where tiles meet. Only matters with PBR terrain mods. Off = old behaviour.");
 	}
 }
 

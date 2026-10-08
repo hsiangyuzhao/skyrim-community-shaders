@@ -4,7 +4,6 @@
 #include "Menu.h"
 #include "State.h"
 #include "Util.h"
-#include "Utils/Batch38.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/UI.h"
 
@@ -35,18 +34,8 @@ namespace
 	}
 }
 
-bool LocalExposure::RuntimeGateOpen() const
-{
-	return Batch38::IsOn();
-}
-
 void LocalExposure::DrawSettings()
 {
-	if (!Batch38::IsOn()) {
-		ImGui::TextColored(Menu::GetSingleton()->GetTheme().StatusPalette.Warning, "Off: Advanced > Batch 38 master switch is off (37c behaviour).");
-		ImGui::Spacing();
-	}
-
 	if (!GetActiveAutoExposure()) {
 		ImGui::SliderFloat("Exposure", &settings.Exposure, 0.f, 4.f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper())

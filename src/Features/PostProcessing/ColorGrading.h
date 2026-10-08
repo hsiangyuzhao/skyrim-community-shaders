@@ -56,6 +56,7 @@ struct ColorGrading : public PostProcessFeature
         bool invertLog = false;
         bool enableTonemap = true;
         bool enableColorSpaceTransform = false;
+        bool upstreamFixLUT = true;  // Upstream fix: LUT half-texel addressing + white balance temperature test
         int inputColorSpace = 0;
         int processColorSpace = 0;
         int outputColorSpace = 0;
@@ -104,6 +105,9 @@ struct ColorGrading : public PostProcessFeature
         uint skipLDR;
         uint enableTonemap;
         uint enableColorSpaceTransform;
+
+        uint upstreamFixLUT;  // Upstream fix (350c6fe82 + 30a6ed06b)
+        uint upstreamFixPad[3];
     };
 	std::unique_ptr<ConstantBuffer> colorCB = nullptr;
 

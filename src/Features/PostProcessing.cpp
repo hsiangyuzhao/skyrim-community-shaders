@@ -6,14 +6,14 @@
 #include "JiayeStatement.h"
 #include "State.h"
 #include "Util.h"
-#include "Utils/Batch37b.h"
 #include "Utils/GpuTimers.h"
 
 #include "Features/Upscaling.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PostProcessing::Settings,
-	DisableVanillaTonemapping)
+	DisableVanillaTonemapping,
+	UpstreamFixMenuSkip)
 
 void PostProcessing::DrawSettings()
 {
@@ -71,7 +71,9 @@ void PostProcessing::DrawSettings()
 	ImGui::Checkbox("Disable Vanilla Tonemapping", (bool*)&settings.DisableVanillaTonemapping);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Skips Skyrim's own final image pass (tonemapping, vanilla bloom and colour grading), so only the effects below shape the look.");
-	Batch37b::DrawPostProcessCheckbox();
+	ImGui::Checkbox("Upstream fix: no border / auto exposure in menus", (bool*)&settings.UpstreamFixMenuSkip);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text("Border and Histogram Auto Exposure no longer run on the main menu and loading screens. Off = old behaviour.");
 
 	ImGui::Separator();
 
@@ -247,6 +249,13 @@ void PostProcessing::ProcessSettings(json& o_json)
 
 void PostProcessing::SaveSettings(json& o_json)
 {
+	// Upstream 7697a8819: settings loaded but not yet applied to the pipeline — save them as-is
+	// instead of serialising the still-empty pipeline (which would wipe the user's settings).
+	if (!pendingSettings.empty()) {
+		o_json = pendingSettings;
+		return;
+	}
+
 	for (auto& pipe : pipeline) {
 		if (pipe) {
 			json featureSetting{};
@@ -422,7 +431,7 @@ void PostProcessing::SetupResources()
 	pipeline[static_cast<size_t>(FeaturePipelineIndex::LUT)].get()->enabled = false;
 
 	if (!REL::Module::IsVR()) {
-		// (batch 38, item 4) On by default; Advanced > Batch 38 can still switch it off.
+		// On by default.
 		pipeline[static_cast<size_t>(FeaturePipelineIndex::LocalExposure)] = std::make_unique<LocalExposure>();
 		pipeline[static_cast<size_t>(FeaturePipelineIndex::LocalExposure)].get()->enabled = true;
 		pipeline[static_cast<size_t>(FeaturePipelineIndex::MotionBlur)] = std::make_unique<MotionBlur>();
@@ -743,9 +752,7 @@ void PostProcessing::PreProcess()
 	// so the same shader stores the same bits -- it does, and only the copy into the other buffer
 	// remains, restricted to the same rectangle the old full-texture copy covered.
 	directOutputUsed = false;
-	if (!Batch37b::PostProcessDirectOutputActive())
-		directOutputStatus = "Off";
-	else if (chain.empty())
+	if (chain.empty())
 		directOutputStatus = "No effect running";
 	else
 		directOutputStatus = "Last effect cannot write into the game buffer";
@@ -756,7 +763,7 @@ void PostProcessing::PreProcess()
 		EnsureResources(pipe);
 
 		bool direct = false;
-		if (i + 1 == chain.size() && Batch37b::PostProcessDirectOutputActive()) {
+		if (i + 1 == chain.size()) {
 			ID3D11Texture2D* own = pipe->GetOwnOutputTexture();
 			if (own && gameTexMain.texture && gameTexMain.UAV && gameTexMainAlt.texture && own != gameTexMain.texture &&
 				lastTexColor.tex != gameTexMain.texture) {  // the effect must not read the buffer it writes

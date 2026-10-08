@@ -30,6 +30,21 @@ public:
 
 	bool HasShaderDefine(RE::BSShader::Type shaderType) override;
 
+	/// (batch 40b) Upstream fixes, mirrors SharedData::WaterEffectsSettings (HLSL), appended at the
+	/// end of FeatureData. Non-zero = upstream behaviour, 0 = the old maths.
+	struct Settings
+	{
+		uint UpstreamFixParallax = 1;      // c6c94acb7 (water part) + d50af1036 + b6de23b0c
+		uint UpstreamFixSunSpecular = 1;   // 3943c4502
+		uint pad0[2] = { 0, 0 };
+	} settings;
+	static_assert(sizeof(Settings) == 16);
+
+	virtual void DrawSettings() override;
+	virtual void LoadSettings(json& o_json) override;
+	virtual void SaveSettings(json& o_json) override;
+	virtual void RestoreDefaultSettings() override;
+
 	virtual void SetupResources() override;
 
 	virtual void Prepass() override;
