@@ -35,6 +35,10 @@ struct VS_OUTPUT
 	float4 PreviousWorldPosition : POSITION2;
 #endif  // RENDER_DEPTH
 	float4 ViewPosition : POSITION3;
+#if defined(DYNAMIC_SNOW) && !defined(RENDER_DEPTH)
+	// (batch 39c) 0 at the billboard's base, 1 at its top: drives the LOD-tree snow tint.
+	float SnowHeight : TEXCOORD1;
+#endif
 
 #if defined(VR)
 	float ClipDistance : SV_ClipDistance0;  // o11
@@ -90,6 +94,11 @@ VS_OUTPUT main(VS_INPUT input)
 
 	vsout.Position = viewPosition;
 	vsout.TexCoord = float3(input.TexCoord0.xy, FogParam.z);
+#	if defined(DYNAMIC_SNOW) && !defined(RENDER_DEPTH)
+	// Billboard vertices sit at the base (z <= 0) or at the top: a 0/1 per vertex that the
+	// rasteriser turns into the height fraction.
+	vsout.SnowHeight = saturate(input.Position.z * 1000.0);
+#	endif
 
 #	ifdef VR
 	vsout.EyeIndex = eyeIndex;
@@ -194,6 +203,10 @@ const static float DepthOffsets[16] = {
 #		include "PhysicalSky/Common.hlsli"
 #	endif
 
+#	if defined(DYNAMIC_SNOW)
+#		include "DynamicSnow/DynamicSnow.hlsli"
+#	endif
+
 #	define LinearSampler SampDiffuse
 
 #	include "Common/ShadowSampling.hlsli"
@@ -235,6 +248,13 @@ PS_OUTPUT main(PS_INPUT input)
 	if ((baseColor.w - AlphaTestRefRS) < 0) {
 		discard;
 	}
+
+#		if defined(DYNAMIC_SNOW)
+	// (batch 39c) Snow on distant trees, matching the near trees' average cover (DynamicSnow::
+	// GetLodTreeCoverage). Only the colour changes; the alpha test above used the original alpha.
+	[branch] if (SharedData::dynamicSnowSettings.Flags & DynamicSnow::FlagLodTrees)
+		baseColor.xyz = lerp(baseColor.xyz, Color::ColorToLinear(SharedData::dynamicSnowSettings.SnowColor), DynamicSnow::GetLodTreeCoverage(input.SnowHeight, input.TexCoord.xy));
+#		endif
 
 #		if defined(DEFERRED)
 	float3 viewPosition = mul(FrameBuffer::CameraView[eyeIndex], float4(input.WorldPosition.xyz, 1)).xyz;

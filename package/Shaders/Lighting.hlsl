@@ -973,9 +973,11 @@ float GetSnowParameterY(float texProjTmp, float alpha)
 #	endif
 
 // (batch 39, items 5-6) Surfaces that take accumulated snow and footprints: world geometry
-// only. Characters, creatures and their gear (SKINNED), skin, hair and eyes, animated trees
-// (alpha-tested leaves), the LOD noise overlay and the world map are left alone.
-#	if defined(DYNAMIC_SNOW) && !defined(SKINNED) && !defined(SKIN) && !defined(HAIR) && !defined(EYE) && !defined(TREE_ANIM) && !defined(LODLANDNOISE) && !defined(WORLD_MAP)
+// only. Skin, hair and eyes, the LOD noise overlay and the world map are left alone; actors and
+// their gear are excluded per draw (IsActorGeometry). (batch 39c) Animated trees and foliage
+// (TREE_ANIM) take snow too, through their own coverage (DynamicSnow::GetTreeCoverage, switch
+// FlagTrees), and get no footprints.
+#	if defined(DYNAMIC_SNOW) && !defined(SKINNED) && !defined(SKIN) && !defined(HAIR) && !defined(EYE) && !defined(LODLANDNOISE) && !defined(WORLD_MAP)
 #		define DYNAMIC_SNOW_SURFACE
 #		include "DynamicSnow/DynamicSnow.hlsli"
 #	endif
@@ -2359,9 +2361,15 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			snowExisting = max(snowExisting, saturate(authoredSnow));
 		}
 
+#		if defined(TREE_ANIM)
+		[branch] if ((snowFlags & DynamicSnow::FlagAccumulation) && (snowFlags & DynamicSnow::FlagTrees) && !snowOnActor)
+		{
+			float snowCoverage = DynamicSnow::GetTreeCoverage(snowPositionWS, snowGeometryNormal, uv);
+#		else
 		[branch] if ((snowFlags & DynamicSnow::FlagAccumulation) && (!snowOnActor || (snowFlags & DynamicSnow::FlagSnowOnCharacters)))
 		{
 			float snowCoverage = DynamicSnow::GetCoverage(snowPositionWS, worldNormal, snowGeometryNormal, 1.0, length(input.WorldPosition.xyz));
+#		endif
 			[branch] if (snowCoverage > 0.0)
 			{
 #		if defined(SKYLIGHTING)
@@ -2383,7 +2391,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			[branch] if (dynamicSnowCoverage > 0.0)
 			{
 				baseColor.xyz = lerp(baseColor.xyz, Color::ColorToLinear(SharedData::dynamicSnowSettings.SnowColor), dynamicSnowCoverage);
-				worldNormal = normalize(lerp(worldNormal, snowGeometryNormal, dynamicSnowCoverage * 0.8));
+#		if defined(TREE_ANIM)
+				// Leaf cards: keep most of their shading normal (it carries the canopy's volume).
+				worldNormal = normalize(lerp(worldNormal, snowGeometryNormal, dynamicSnowCoverage * 0.5));
+#		else
+				// (batch 39c) Thick snow hides the material's relief completely: its own normal is the
+				// geometry's (39b kept 20% of the normal map under full cover).
+				worldNormal = normalize(lerp(worldNormal, snowGeometryNormal, dynamicSnowCoverage * ((snowFlags & DynamicSnow::FlagCoverageSlope) ? 1.0 : 0.8)));
+#		endif
 				// Snow is never smoother than SnowRoughness, and never makes a matte surface
 				// shinier: SSRT/NRD only ever see roughness go up on snow.
 #		if defined(TRUE_PBR)
@@ -2399,6 +2414,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			}
 		}
 
+#		if !defined(TREE_ANIM)
 		[branch] if ((snowFlags & DynamicSnow::FlagTrails) && !snowOnActor)
 		{
 			float trailSnow = 0.0;
@@ -2416,14 +2432,15 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			[branch] if (trailWeight > 0.01)
 			{
 				DynamicSnow::TrailSample trail = DynamicSnow::SampleTrail(snowPositionWS, viewDirection);
-				[branch] if (trail.pressed > 0.0)
+				[branch] if (abs(trail.pressed) > 1e-3)
 				{
 					float trailDarken = SharedData::dynamicSnowSettings.TrailDarken * trailSnow + 0.35 * trailMud;
-					baseColor.xyz *= saturate(1.0 - trailDarken * trail.pressed);
+					baseColor.xyz *= saturate(1.0 - trailDarken * saturate(trail.pressed));  // dents darken, rims do not
 					worldNormal = DynamicSnow::ApplyTrailNormal(worldNormal, snowGeometryNormal, trail, trailWeight);
 				}
 			}
 		}
+#		endif  // !TREE_ANIM
 	}
 #	endif  // DYNAMIC_SNOW_SURFACE
 
@@ -3090,6 +3107,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #	endif  // defined(EMAT) && (defined(SKINNED) || !defined(MODELSPACENORMALS))
 
+#	if defined(DYNAMIC_SNOW_SURFACE)
+	// (batch 39c) Snow fills the material's relief, so its parallax self-shadow fades with the cover.
+	if (SharedData::dynamicSnowSettings.Flags & DynamicSnow::FlagCoverageSlope)
+		parallaxShadow = lerp(parallaxShadow, 1.0, dynamicSnowCoverage);
+#	endif
+
 	if (dirShadow != 0.0 && (inWorld || inReflection))
 		dirShadow *= ShadowSampling::GetWorldShadow(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, eyeIndex);
 
@@ -3417,6 +3440,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				parallaxShadow = ExtendedMaterials::GetParallaxSoftShadowMultiplier(uv, mipLevel, lightDirectionTS, sh0, TexParallaxSampler, SampParallaxSampler, 0, parallaxShadowQuality, screenNoise, displacementParams);
 #				endif
 		}
+#			endif
+
+#			if defined(DYNAMIC_SNOW_SURFACE)
+		// (batch 39c) As for the sun: snow fills the relief.
+		if (SharedData::dynamicSnowSettings.Flags & DynamicSnow::FlagCoverageSlope)
+			parallaxShadow = lerp(parallaxShadow, 1.0, dynamicSnowCoverage);
 #			endif
 
 #			if defined(TRUE_PBR)
