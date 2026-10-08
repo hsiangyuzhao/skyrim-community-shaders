@@ -193,6 +193,12 @@ void LinearLighting::PostPostLoad()
 
 LinearLighting::PerFrameData LinearLighting::GetCommonBufferData()
 {
+	// Upstream ba0adedac: when the feature is not loaded, never leak the default "on" into shaders.
+	if (!loaded) {
+		auto data = PerFrameData{};
+		data.enableLinearLighting = false;
+		return data;
+	}
 	bool isMainLoadingMenu = globals::game::ui && (globals::game::ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || globals::game::ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
 	auto data = PerFrameData{};
 	data.enableLinearLighting = settings.enableLinearLighting && !isMainLoadingMenu;

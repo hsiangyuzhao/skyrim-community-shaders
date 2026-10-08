@@ -36,6 +36,7 @@ public:
 	virtual void LoadSettings(json& o_json) override;
 	virtual void SaveSettings(json& o_json) override;
 
+	virtual void ReflectionsPrepass() override;
 	virtual void EarlyPrepass() override;
 	virtual void Prepass() override;
 	virtual void SetupResources() override;

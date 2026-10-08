@@ -131,6 +131,14 @@ void InteriorSun::BSBatchRenderer_RenderPassImmediately::thunk(RE::BSRenderPass*
 	func(a_pass, a_technique, a_alphaTest, a_renderFlags);
 }
 
+RE::BSEventNotifyControl InteriorSun::MenuOpenCloseEventHandler::ProcessEvent(const RE::MenuOpenCloseEvent* a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*)
+{
+	if (a_event && a_event->opening && a_event->menuName == RE::MainMenu::MENU_NAME)
+		globals::features::interiorSun.isInteriorWithSun = false;
+
+	return RE::BSEventNotifyControl::kContinue;
+}
+
 void InteriorSun::ClearArrays()
 {
 	currentCellRoomsAndPortals.clear();

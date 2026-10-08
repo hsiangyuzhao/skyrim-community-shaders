@@ -28,6 +28,11 @@ public:
 	virtual void PostPostLoad() override;
 	virtual void EarlyPrepass() override;
 
+	virtual void DataLoaded() override
+	{
+		MenuOpenCloseEventHandler::Register();
+	}
+
 	struct Settings
 	{
 		bool ForceDoubleSidedRendering = true;
@@ -36,7 +41,8 @@ public:
 
 	Settings settings;
 
-	bool isInteriorWithSun = false;
+	// Upstream df4d670d3: reset on main menu so a loaded save does not inherit the previous cell's state.
+	std::atomic<bool> isInteriorWithSun = false;
 
 	struct GetWorldSpace
 	{
@@ -70,6 +76,24 @@ public:
 			}
 		}
 	}
+
+	class MenuOpenCloseEventHandler : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
+	{
+	public:
+		virtual RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override;
+
+		static bool Register()
+		{
+			static MenuOpenCloseEventHandler singleton;
+			auto ui = globals::game::ui;
+			if (!ui) {
+				logger::error("UI event source not found");
+				return false;
+			}
+			ui->GetEventSource<RE::MenuOpenCloseEvent>()->AddEventSink(&singleton);
+			return true;
+		}
+	};
 
 	static bool IsInteriorWithSun(const RE::TESObjectCELL* cell);
 

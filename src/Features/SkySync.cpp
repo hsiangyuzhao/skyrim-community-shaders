@@ -113,8 +113,10 @@ void SkySync::Update(const RE::Sky* sky)
 		return;
 
 	if (const auto cell = player->GetParentCell(); cell != currentCell) {
-		SetSkyRotation(sky, cell);
-		if (currentCell && (cell->IsInteriorCell() != currentCell->IsInteriorCell() || cell->GetRuntimeData().worldSpace != currentCell->GetRuntimeData().worldSpace))
+		// Upstream a59c212f7: the parent cell can be null during load/transition.
+		if (cell)
+			SetSkyRotation(sky, cell);
+		if (cell && currentCell && (cell->IsInteriorCell() != currentCell->IsInteriorCell() || cell->GetRuntimeData().worldSpace != currentCell->GetRuntimeData().worldSpace))
 			shadowFader.Reset();
 	}
 

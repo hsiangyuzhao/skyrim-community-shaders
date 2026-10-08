@@ -223,11 +223,14 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 
 	// Wait for D3D11 to finish
+	fenceValue++;
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
-	fenceValue++;
 
-	// New frame, reset
+	// New frame, reset. Upstream c4b294f1a: make sure the GPU has finished the work last
+	// recorded with this allocator before resetting it (crash on Proton / strict drivers).
+	if (frameFenceValues[frameIndex])
+		DX::ThrowIfFailed(d3d12Fence->SetEventOnCompletion(frameFenceValues[frameIndex], nullptr));
 	DX::ThrowIfFailed(commandAllocators[frameIndex]->Reset());
 	DX::ThrowIfFailed(commandLists[frameIndex]->Reset(commandAllocators[frameIndex].get(), nullptr));
 
@@ -361,9 +364,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	DX::ThrowIfFailed(presentResult);
 
 	// Wait for D3D12 to finish
-	DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), fenceValue));
-	DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), fenceValue));
 	fenceValue++;
+	DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), fenceValue));
+	frameFenceValues[frameIndex] = fenceValue;
+	DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), fenceValue));
 
 	// Update the frame index
 	frameIndex = swapChain->GetCurrentBackBufferIndex();

@@ -107,6 +107,14 @@ void IBL::RestoreDefaultSettings()
 	settings = {};
 }
 
+// Upstream e6b47313e moved this binding from EarlyPrepass to ReflectionsPrepass so the reflection
+// (cubemap) capture, which renders before the main scene, also sees the IBL textures. We bind in
+// both: our cubemap face filter can skip ReflectionsPrepasses on some frames.
+void IBL::ReflectionsPrepass()
+{
+	EarlyPrepass();
+}
+
 void IBL::EarlyPrepass()
 {
 	if (loaded && diffuseIBLTexture && diffuseSkyIBLTexture && staticDiffuseIBLTexture && staticSpecularIBLTexture) {

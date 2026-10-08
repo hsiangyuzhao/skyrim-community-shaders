@@ -123,6 +123,7 @@ public:
 
 	UINT frameIndex = 0;
 	UINT64 fenceValue = 0;
+	UINT64 frameFenceValues[2] = { 0, 0 };  // last fence value signalled after recording with commandAllocators[i]
 
 	UINT64 upscalingFenceValue = 0;
 
