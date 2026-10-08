@@ -54,7 +54,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	BodyAndObjectTrails,
 	TrailRim,
 	OverrideAmount,
-	AmountOverride)
+	AmountOverride,
+	FlipPrintShapes)
 
 namespace
 {
@@ -859,6 +860,11 @@ void DynamicSnow::AddStamp(float a_x, float a_y, float a_z, float a_dirX, float 
 	s.Strength = 1.0f;
 	s.End = s.Center;
 	s.Shape = a_shape;
+	if ((a_shape & 0xFFFF) < kShapeCapsule && settings.FlipPrintShapes) {
+		// Debug: heel and toe of the installed textures the other way round.
+		s.Axis = { -s.Axis.x, -s.Axis.y };
+		s.Shape ^= kShapeMirror;
+	}
 	s.Rim = 0.5f;  // shape-level rim; TrailRim scales every rim when the map is read
 
 	// Whole print inside the window, away from the faded edge.
@@ -1550,6 +1556,11 @@ void DynamicSnow::DrawSettings()
 		ImGui::BeginDisabled(!settings.OverrideAmount);
 		ImGui::SliderFloat("Amount", &settings.AmountOverride, 0.0f, 1.0f, "%.2f");
 		ImGui::EndDisabled();
+		ImGui::Checkbox("Turn Footprint Shapes Around", &settings.FlipPrintShapes);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Check only: if the shaped prints point backwards (toe where the heel should be), tick this.\n"
+				"The installed textures carry no direction marker; 39c assumes the heel is at the image's top.");
 		ImGui::TreePop();
 	}
 }

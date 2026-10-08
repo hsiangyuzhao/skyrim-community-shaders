@@ -135,6 +135,7 @@ public:
 		float TrailRim = 0.35f;  ///< pushed-up rim around a print, relative to its depth
 
 		// ---- Debug ----
+		bool FlipPrintShapes = false;  ///< (39c) debug: installed print textures heel/toe reversed
 		bool OverrideAmount = false;
 		float AmountOverride = 1.0f;
 	};
