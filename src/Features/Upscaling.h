@@ -264,6 +264,8 @@ public:
 	// Feature interface overrides
 	virtual void DrawSettings() override;
 	virtual void SaveSettings(json& o_json) override;
+	/// (41a) The settings object only, without SaveSettings' bUseTAA write to SkyrimPrefs.ini (A/B Compare snapshots).
+	void SaveSettingsValues(json& o_json) const;
 	virtual void LoadSettings(json& o_json) override;
 	virtual void RestoreDefaultSettings() override;
 	virtual void DataLoaded() override;

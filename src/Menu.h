@@ -367,6 +367,9 @@ public:
 		uint32_t OverlayToggleKey = VK_F10;      // Global overlay toggle key for all overlays
 		uint32_t ShaderBlockPrevKey = VK_PRIOR;  // Debug: cycle backward through shaders (PageUp)
 		uint32_t ShaderBlockNextKey = VK_NEXT;   // Debug: cycle forward through shaders (PageDown)
+		uint32_t ABCompareKey = VK_F9;           // (41a) A/B Compare switch; 0 = none. Kept away from the game (F9 = Quickload)
+		bool ABCompareKeepEdits = true;          // (41a) edits made while a slot is showing are kept in that slot
+		bool ABComparePersist = true;            // (41a) keep the A/B slots in SettingsAB.json across restarts
 		bool EnableShaderBlocking = false;       // Enable shader blocking hotkeys for debugging
 		bool FirstTimeSetupCompleted = false;    // Track if first-time setup has been completed
 		ThemeSettings Theme;

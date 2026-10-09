@@ -35,6 +35,7 @@
 #include "State.h"
 #include "TruePBR.h"
 #include "Util.h"
+#include "Utils/ABCompare.h"
 #include "Utils/UI.h"
 
 #include "Features/PerformanceOverlay.h"
@@ -143,6 +144,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	OverlayToggleKey,
 	ShaderBlockPrevKey,
 	ShaderBlockNextKey,
+	ABCompareKey,
+	ABCompareKeepEdits,
+	ABComparePersist,
 	EnableShaderBlocking,
 	FirstTimeSetupCompleted,
 	Theme,
@@ -449,6 +453,12 @@ void Menu::DrawSettings()
 		// Render header using extracted component
 		MenuHeaderRenderer::RenderHeader(isDocked, showLogo, canShowIcons, uiScale, uiIcons);
 
+		// (41a) A/B Compare strip: on top of every page, so a feature's own settings stay in view.
+		ABCompare::DrawMenuStrip();
+		ImGui::Spacing();
+		ImGui::SeparatorEx(ImGuiSeparatorFlags_Horizontal, ThemeManager::Constants::SEPARATOR_THICKNESS);
+		ImGui::Spacing();
+
 		// Main content starts here - no additional separator needed as it's already handled in the conditions above
 
 		float footer_height = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y * 3 + 3.0f;  // text + separator
@@ -692,6 +702,8 @@ void Menu::ProcessInputEventQueue()
 					{ &settings.ShaderBlockNextKey, &settingShaderBlockNextKey, [this](uint32_t key) { settings.ShaderBlockNextKey = key; settingShaderBlockNextKey = false; } },
 					// (batch 36e) Performance Overlay freeze key, set from its settings page.
 					{ &globals::features::performanceOverlay.settings.FreezeKey, &globals::features::performanceOverlay.capturingFreezeKey, [](uint32_t key) { globals::features::performanceOverlay.settings.FreezeKey = key; globals::features::performanceOverlay.capturingFreezeKey = false; } },
+					// (41a) A/B Compare switch key, set from the A/B strip at the top of the menu. Esc cancels.
+					{ &settings.ABCompareKey, &ABCompare::capturingKey, [this](uint32_t key) { if (key != VK_ESCAPE) settings.ABCompareKey = key; ABCompare::capturingKey = false; } },
 				};
 				bool handled = false;
 				for (auto& h : hotkeyActions) {
@@ -728,6 +740,11 @@ void Menu::ProcessInputEventQueue()
 							 auto& overlay = globals::features::performanceOverlay;
 							 if (overlay.loaded && overlay.settings.FreezeKey != 0)
 								 overlay.ToggleFreeze();
+						 } },
+						// (41a) A/B Compare: queue a switch to the other slot (applied at the next Present).
+						{ settings.ABCompareKey, []() {
+							 if (Menu::GetSingleton()->GetSettings().ABCompareKey != 0)
+								 ABCompare::RequestToggle();
 						 } },
 					};
 					for (const auto& ka : keyActions) {

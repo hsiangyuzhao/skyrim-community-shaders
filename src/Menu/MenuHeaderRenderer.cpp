@@ -9,6 +9,7 @@
 #include "State.h"
 #include "ThemeManager.h"
 #include "Util.h"
+#include "Utils/ABCompare.h"
 
 namespace
 {
@@ -153,6 +154,7 @@ void MenuHeaderRenderer::RenderHeader(bool isDocked, bool showLogo, bool canShow
 			ImGui::TableNextColumn();
 			if (ImGui::Button("Restore Saved Settings", { -1, 0 })) {
 				globals::state->Load();
+				ABCompare::OnSettingsReloaded();
 			}
 
 			// Clear Shader Cache Button
@@ -239,6 +241,7 @@ std::vector<MenuHeaderRenderer::ActionIcon> MenuHeaderRenderer::BuildActionIcons
 			"Restore Saved Settings",
 			[]() {
 				globals::state->Load();
+				ABCompare::OnSettingsReloaded();
 			} });
 	}
 	if (uiIcons.clearCache.texture) {

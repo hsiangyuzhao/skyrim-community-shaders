@@ -30,6 +30,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "BuildLabel.h"
+#include "Utils/ABCompare.h"
 #include "Utils/Batch39Engine.h"
 #include "Utils/FileSystem.h"
 #include "Utils/Format.h"
@@ -526,6 +527,9 @@ void PerformanceOverlay::DrawOverlay()
 				logger::info("{}", line);
 		}
 	}
+
+	// (41a) Which A/B Compare slot is showing (nothing until a slot has been stored).
+	ABCompare::DrawOverlayHeaderLine();
 
 	// Always on top, never collapsible: the four numbers that answer "how is it going".
 	DrawCompactSummary(viewCfg);
@@ -4116,6 +4120,7 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 		m["time_unix"] = static_cast<int64_t>(t);
 		m["plugin_version"] = Util::GetFormattedVersion(Plugin::VERSION);
 		m["build"] = BuildLabel::kBuild;
+		m["ab_compare"] = ABCompare::GetMetaJson();
 		m["game_version"] = Util::GetFormattedVersion(REL::Module::get().version());
 		m["frozen"] = view.frozen;
 		m["values"] = cfg.showLive ? "live" : (cfg.smooth == PerfView::SmoothMode::Off ? "unsmoothed" : "smoothed");

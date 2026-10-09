@@ -9,6 +9,7 @@
 #include "State.h"
 #include "TruePBR.h"
 #include "Util.h"
+#include "Utils/ABCompare.h"
 #include "Utils/Batch39Engine.h"
 #include "Utils/DenoiserTimers.h"
 #include "Utils/GpuPhaseTimeline.h"
@@ -538,6 +539,47 @@ struct BSInputDeviceManager_PollInputDevices
 			constexpr RE::InputEvent* const dummy[] = { nullptr };
 			func(a_dispatcher, dummy);
 			return;
+		}
+
+		// (41a) The A/B Compare key (default F9, which is Skyrim's Quickload) is CS's alone: its
+		// keyboard events are unlinked for this dispatch only and relinked straight after, so the
+		// engine's own event list is left exactly as it was.
+		if (a_events && *a_events) {
+			struct Cut
+			{
+				RE::InputEvent* prev;
+				RE::InputEvent* event;
+			};
+			std::array<Cut, 16> cuts{};
+			size_t cutCount = 0;
+			RE::InputEvent* head = *a_events;
+			RE::InputEvent* prev = nullptr;
+			for (RE::InputEvent* ev = head; ev;) {
+				RE::InputEvent* next = ev->next;
+				const bool isAbKey = cutCount < cuts.size() &&
+				                     ev->GetEventType() == RE::INPUT_EVENT_TYPE::kButton &&
+				                     ev->GetDevice() == RE::INPUT_DEVICE::kKeyboard &&
+				                     ABCompare::ShouldBlockKeyFromGame(static_cast<RE::ButtonEvent*>(ev)->GetIDCode());
+				if (isAbKey) {
+					if (prev)
+						prev->next = next;
+					else
+						head = next;
+					cuts[cutCount++] = { prev, ev };
+				} else {
+					prev = ev;
+				}
+				ev = next;
+			}
+			if (cutCount > 0) {
+				RE::InputEvent* const filtered[] = { head };
+				func(a_dispatcher, filtered);
+				for (size_t i = cutCount; i-- > 0;) {
+					if (cuts[i].prev)
+						cuts[i].prev->next = cuts[i].event;
+				}
+				return;
+			}
 		}
 
 		func(a_dispatcher, a_events);

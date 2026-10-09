@@ -759,9 +759,14 @@ void Upscaling::DrawSettings()
 	}
 }
 
-void Upscaling::SaveSettings(json& o_json)
+void Upscaling::SaveSettingsValues(json& o_json) const
 {
 	o_json = settings;
+}
+
+void Upscaling::SaveSettings(json& o_json)
+{
+	SaveSettingsValues(o_json);
 	auto iniSettingCollection = globals::game::iniPrefSettingCollection;
 	if (iniSettingCollection) {
 		auto setting = iniSettingCollection->GetSetting("bUseTAA:Display");

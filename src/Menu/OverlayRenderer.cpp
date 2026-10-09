@@ -13,6 +13,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "Util.h"
+#include "Utils/ABCompare.h"
 
 #include "Features/PerformanceOverlay.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
@@ -28,6 +29,10 @@ void OverlayRenderer::RenderOverlay(
 {
 	HandleVRSetup();
 	processInputEventQueue();
+
+	// (41a) A queued A/B Compare switch runs here: this frame has been rendered, the next has not
+	// started, and no ImGui frame (so no settings widget) is open yet.
+	ABCompare::ProcessPending();
 
 	if (globals::features::vr.IsOpenVRCompatible()) {
 		globals::features::vr.ProcessControllerInputForImGui();
@@ -58,6 +63,7 @@ void OverlayRenderer::RenderOverlay(
 
 	RenderFeatureOverlays();
 	HandleABTesting();
+	ABCompare::DrawIndicator();
 	FinalizeImGuiFrame();
 }
 
@@ -81,6 +87,7 @@ bool OverlayRenderer::ShouldSkipRendering()
 			 abTestingManager->IsEnabled() ||
 			 (failed && !hide) ||
 			 globals::features::performanceOverlay.settings.ShowInOverlay ||
+			 ABCompare::WantsOverlayFrame() ||
 			 renderDoc->IsAvailable());
 }
 
