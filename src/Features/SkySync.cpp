@@ -1,5 +1,6 @@
 ﻿#include "SkySync.h"
 
+#include "PhysicalSky.h"
 #include "VolumetricLighting.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -41,6 +42,8 @@ void SkySync::DrawSettings()
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Which moon lights the night. Brightest = whichever moon is brighter.");
 
+	if (globals::features::physicalSky.IsLegacy())
+		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Physical Sky's Sky Model is Legacy (36f): Moon Orbit is Vanilla and the discs\nare lowered by altitude right now, whatever is set below.");
 	ImGui::Combo("Moon Orbit", &settings.MoonOrbit, MoonOrbitNames, static_cast<int>(MoonOrbit::Count));
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::TextUnformatted(
@@ -76,6 +79,17 @@ void SkySync::DrawSettings()
 			"On (default): Sky Sync no longer lowers the moon discs by your altitude (1.5-4 degrees), as in current\n"
 			"upstream; Physical Sky's moon glow follows the disc's real position on screen. The moonlight direction is\n"
 			"unchanged. Off: the discs are lowered as before and the glow uses the un-lowered direction.");
+}
+
+SkySync::Settings SkySync::Effective() const
+{
+	Settings s = settings;
+	if (globals::features::physicalSky.IsLegacy()) {
+		// 36f: the engine's own moon stepping, discs lowered by altitude (40d/40e options off).
+		s.MoonOrbit = static_cast<int32_t>(MoonOrbit::Vanilla);
+		s.KeepMoonPosition = false;
+	}
+	return s;
 }
 
 void SkySync::LoadSettings(json& o_json)
@@ -249,7 +263,7 @@ void SkySync::ProcessMoon(const RE::Moon* moon, const float time, const Caster t
 	auto apparentDir = GetApparentDirection(dir, altitude);
 	// (40d) Off = the old behaviour: the altitude dip is written into the moon's rotation, which
 	// moves the disc. On: the disc stays where the game put it; only the light uses the dip.
-	if (!settings.KeepMoonPosition)
+	if (!Effective().KeepMoonPosition)
 		SetMoonDirection(moon, apparentDir);
 
 	// Moon and Stars adjusts some intermediary rotation matrices for the moon
@@ -515,7 +529,7 @@ void SkySync::Moon_Update::thunk(RE::Moon* moon, RE::Sky* sky)
 {
 	const auto updateMoonTexture = moon->updateMoonTexture;
 
-	if (const auto& singleton = globals::features::skySync; singleton.settings.Enabled && singleton.settings.MoonOrbit != static_cast<int32_t>(MoonOrbit::Vanilla))
+	if (const auto& singleton = globals::features::skySync; singleton.settings.Enabled && singleton.Effective().MoonOrbit != static_cast<int32_t>(MoonOrbit::Vanilla))
 		SetMoonAngle(moon, sky);
 
 	func(moon, sky);
@@ -602,7 +616,8 @@ void SkySync::SetMoonAngle(RE::Moon* moon, const RE::Sky* sky)
 		return;
 
 	double angle;
-	if (singleton.settings.MoonOrbit == static_cast<int32_t>(MoonOrbit::Stable)) {
+	const auto effective = singleton.Effective();
+	if (effective.MoonOrbit == static_cast<int32_t>(MoonOrbit::Stable)) {
 		const auto calendar = RE::Calendar::GetSingleton();
 		if (!calendar)
 			return;
@@ -614,7 +629,7 @@ void SkySync::SetMoonAngle(RE::Moon* moon, const RE::Sky* sky)
 		// exactly a turn a day) is overhead at midnight whatever offset the save has between them.
 		const double days = std::floor((hours - hour) / 24.0 + 0.5);
 		angle = 90.0 + speed * 60.0 * (days * 24.0 + hour);
-	} else if (singleton.settings.MoonOrbit == static_cast<int32_t>(MoonOrbit::NightSky)) {
+	} else if (effective.MoonOrbit == static_cast<int32_t>(MoonOrbit::NightSky)) {
 		// Night = from an hour before the end of sunset to an hour after the start of sunrise, the
 		// span in which Sky Sync lets the moons light the scene (NAT's Skyrim climate: 19:30-06:30).
 		// Through the night the angle moves evenly from centre - arc/2 to centre + arc/2; over the day
@@ -629,7 +644,7 @@ void SkySync::SetMoonAngle(RE::Moon* moon, const RE::Sky* sky)
 				night = n;
 			}
 		}
-		const auto& s = singleton.settings;
+		const auto& s = effective;
 		const double arc = std::clamp(static_cast<double>(s.NightArc), 0.0, 140.0);
 		const double centre = 90.0 + std::clamp(static_cast<double>(moon == sky->masser ? s.MasserNightPosition : s.SecundaNightPosition), -60.0, 60.0);
 		const double t = std::fmod(hour - dusk + 48.0, 24.0);

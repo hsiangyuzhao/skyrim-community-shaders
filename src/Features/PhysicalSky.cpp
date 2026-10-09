@@ -52,6 +52,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	moonGlowFollowsMoon,
 	moonPhysicalRadiance,
 	moonRadianceCap,
+	moonGlowFade,
+	nightBaseLight,
+	skyTrueSunHeight,
+	twilightLength,
+	skyModel,
 	fixSkyAlpha,
 	fixTrLutEdge,
 	fixApShadowDepth,
@@ -88,6 +93,13 @@ namespace
 			ImGui::EndTable();
 		}
 	}
+
+	/// (41b, F5) Shown where options are overridden by "Sky Model: Legacy (36f)".
+	void LegacyNote(bool a_legacy)
+	{
+		if (a_legacy)
+			ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Sky Model is Legacy (36f): options added after 36f are not used right now.");
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -103,11 +115,16 @@ void PhysicalSky::DataLoaded()
 void PhysicalSky::RestoreDefaultSettings()
 {
 	settings = {};
+	UpdateEffective();
 }
 
 void PhysicalSky::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	settings.moonGlowFade = std::clamp(settings.moonGlowFade, 0, kMoonGlowFadeCount - 1);
+	settings.skyModel = std::clamp(settings.skyModel, 0, kSkyModelCount - 1);
+	settings.nightBaseLight = std::clamp(settings.nightBaseLight, 0.f, 1.f);
+	settings.twilightLength = std::clamp(settings.twilightLength, 1.f, 3.f);
 
 	// (batch 37b) A saved whitelist replaces the default one wholesale. Merge the defaults back
 	// in, except those the user removed, so defaults added later still reach older configs.
@@ -116,6 +133,7 @@ void PhysicalSky::LoadSettings(json& o_json)
 			std::ranges::find(settings.worldspaceRemovedDefaults, name) == settings.worldspaceRemovedDefaults.end())
 			settings.worldspaceWhitelist.emplace(name, info);
 	}
+	UpdateEffective();
 }
 
 const std::map<std::string, PhysicalSky::WorldspaceInfo>& PhysicalSky::LegacyWorldspaceWhitelist()
@@ -208,7 +226,7 @@ PhysicalSky::WorldspaceStatus PhysicalSky::GetWorldspaceStatus(float& a_zBottom)
 		if (auto cell = player->GetParentCell(); cell && cell->IsInteriorCell())
 			return WorldspaceStatus::Interior;
 
-	if (!Batch37b::IsOn()) {
+	if (UseLegacyPaths()) {
 		// 37a: TES worldspace only, hard-coded list, no exclusions.
 		auto* tes = RE::TES::GetSingleton();
 		auto* worldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
@@ -315,6 +333,17 @@ void PhysicalSky::SettingsGeneral()
 	}
 
 	ImGui::Checkbox("Enabled", &settings.enabled);
+
+	static constexpr const char* skyModelNames[kSkyModelCount] = { "Current", "Legacy (36f)" };
+	ImGui::Combo("Sky Model", &settings.skyModel, skyModelNames, kSkyModelCount);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"For comparing only. Legacy (36f): every Physical Sky and Sky Sync option added after 36f is\n"
+			"used at its 36f value while this is selected (sun look and alignment, fixes, moon glow at full\n"
+			"strength without fading, new-moon disc, Vanilla moon orbit, discs lowered by altitude, no night\n"
+			"base light, no twilight changes, the old worldspace list). Your own values are kept and come back\n"
+			"with Current. Colours, exposures, atmosphere and clouds are always yours.");
+	LegacyNote(IsLegacy());
 
 	SettingsWorldspaces();
 
@@ -452,6 +481,7 @@ void PhysicalSky::SettingsCelestials()
 	constexpr auto lightColorHint = "This sets the light color BEFORE it goes through the atmosphere i.e. extraterrestrial radiance.";
 
 	InfoBox("The sun and moons, and their lights.");
+	LegacyNote(IsLegacy());
 
 	ImGui::Checkbox("Override Directional Light", &settings.overrideDirLight);
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -539,6 +569,30 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::PopID();
 	}
 
+	ImGui::SeparatorText("Night and Twilight");
+	ImGui::SliderFloat("Night Sky Base Light", &settings.nightBaseLight, 0.f, 1.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"A faint glow of the night sky itself, in the current weather's own night sky colours (zenith,\n"
+			"horizon, below), with a little deep-blue airglow where a weather's night sky is pure black.\n"
+			"Without it the sky is black whenever no moon is up and the sun is far below the horizon\n"
+			"(before dawn, after dusk). It also tints distant haze, reflections and the sky's ambient light.\n"
+			"Fades out as the sun climbs from 6 degrees below the horizon to 4 above.\n"
+			"0 = off (exactly as before). Default 0.2.");
+	ImGui::Checkbox("Sky Uses True Sun Height", &settings.skyTrueSunHeight);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"The sky colours (dawn glow, dusk, haze) use where the sun really is. The game draws the sun disc\n"
+			"lower the higher you stand (1.5-6 degrees); that drawing offset stays on the disc and its glow.\n"
+			"Off: the sky uses the lowered sun too, so dawn comes later and dusk earlier, more so on mountains.\n"
+			"Only matters with Align with Vanilla Sun on.");
+	ImGui::SliderFloat("Twilight Length", &settings.twilightLength, 1.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Stretches dawn and dusk in the sky only: with 2, a sun 12 degrees below the horizon lights the sky\n"
+			"like one 6 degrees below, so the sky starts to brighten earlier and stays lit longer after sunset.\n"
+			"Does not change the sun or moon light on the ground. 1 = real twilight (default).");
+
 	ImGui::SeparatorText("Masser");
 	{
 		ImGui::PushID("Masser");
@@ -570,6 +624,17 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::Text(
 			"On (default): a new moon, or a moon the game has hidden or is fading out at the horizon, puts little or\n"
 			"no glow into the sky. Off: both moons always glow at full strength, wherever they are.");
+	if (settings.moonGlowFollowsMoon) {
+		static constexpr const char* fadeNames[kMoonGlowFadeCount] = { "With Disc (40d)", "At Horizon" };
+		ImGui::Combo("Moon Glow Fades", &settings.moonGlowFade, fadeNames, kMoonGlowFadeCount);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"When a setting moon's glow goes out.\n"
+				"At Horizon (default): as the moon itself reaches the horizon (from 3 degrees above to 2 below).\n"
+				"With Disc (40d): together with the game's moon disc, which the game fades out while the moon is\n"
+				"still 16-28 degrees up, so the sky went dark long before moonset.\n"
+				"Either way the glow is off when the weather hides the moons.");
+	}
 	ImGui::Checkbox("Moon Physical Brightness", &settings.moonPhysicalRadiance);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
@@ -663,6 +728,7 @@ void PhysicalSky::SettingsAtmosphere()
 void PhysicalSky::SettingsFixes()
 {
 	ImGui::SeparatorText("Fixes");
+	LegacyNote(IsLegacy());
 
 	ImGui::Checkbox("Opaque Sky", &settings.fixSkyAlpha);
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -885,41 +951,43 @@ bool PhysicalSky::ShadersOK()
 void PhysicalSky::UpdateExtCbData()
 {
 	extCbData = {};
-	if (!loaded || !Batch37b::IsOn())
+	if (!loaded || UseLegacyPaths())
 		return;
 
+	const auto& s = effective;
 	uint flags = 0;
-	if (settings.sunReplaceVanilla)
+	if (s.sunReplaceVanilla)
 		flags |= kExtSunReplace;
-	if (settings.sunSoftEdge)
+	if (s.sunSoftEdge)
 		flags |= kExtSunSoftEdge;
-	if (settings.sunPhysicalRadiance)
+	if (s.sunPhysicalRadiance)
 		flags |= kExtSunPhysicalRadiance;
-	if (settings.sunHideVanillaGlare)
+	if (s.sunHideVanillaGlare)
 		flags |= kExtHideSunGlare;
-	if (settings.fixSkyAlpha)
+	if (s.fixSkyAlpha)
 		flags |= kExtSkyAlphaOpaque;
-	if (settings.fixTrLutEdge)
+	if (s.fixTrLutEdge)
 		flags |= kExtTrLutEdgeFix;
-	if (settings.fixApShadowDepth)
+	if (s.fixApShadowDepth)
 		flags |= kExtApShadowDepthFix;
-	if (settings.fixReflectionSky)
+	if (s.fixReflectionSky)
 		flags |= kExtReflectionSkyFix;
-	if (settings.fixMultiScatter)
+	if (s.fixMultiScatter)
 		flags |= kExtMultiScatterFix;
-	if (settings.moonPhysicalRadiance)
+	if (s.moonPhysicalRadiance)
 		flags |= kExtMoonPhysicalRadiance;
 	extCbData.flags = flags;
-	extCbData.sunRadianceCap = std::clamp(settings.sunRadianceCap, 1.f, 62250.f);
-	extCbData.sunGlowIntensity = settings.proceduralSun ? std::clamp(settings.sunGlowIntensity, 0.f, 30.f) : 0.f;
-	extCbData.sunGlowWidth = DirectX::XMConvertToRadians(std::clamp(settings.sunGlowWidthDeg, 0.1f, 5.f));
+	extCbData.sunRadianceCap = std::clamp(s.sunRadianceCap, 1.f, 62250.f);
+	extCbData.sunGlowIntensity = s.proceduralSun ? std::clamp(s.sunGlowIntensity, 0.f, 30.f) : 0.f;
+	extCbData.sunGlowWidth = DirectX::XMConvertToRadians(std::clamp(s.sunGlowWidthDeg, 0.1f, 5.f));
 }
 
 void PhysicalSky::UpdateMoonData(float a_exposure, float3& a_masserGlow, float3& a_secundaGlow)
 {
 	// (40d) The moon colours stay the user's (they light the scene through Sky Sync); only their
 	// glow in the scattering LUTs is scaled here.
-	const float strength = std::clamp(settings.moonGlowStrength, 0.f, 1.f);
+	const auto& s = effective;
+	const float strength = std::clamp(s.moonGlowStrength, 0.f, 1.f);
 	a_masserGlow = settings.masserColor * (a_exposure * strength);
 	a_secundaGlow = settings.secundaColor * (a_exposure * strength);
 	moonCbData = {};
@@ -928,17 +996,28 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float3& a_masserGlow, float3&
 	if (!sky)
 		return;
 
-	if (settings.moonGlowFollowsMoon) {
+	if (s.moonGlowFollowsMoon) {
 		// A new moon (or a moon the game has hidden or faded out) no longer lights the sky.
-		a_masserGlow = a_masserGlow * (SkySync::PhaseFactorFromTexture(sky->masser) * SkySync::VanillaVisibility(sky->masser));
-		a_secundaGlow = a_secundaGlow * (SkySync::PhaseFactorFromTexture(sky->secunda) * SkySync::VanillaVisibility(sky->secunda));
+		float masserVisibility, secundaVisibility;
+		if (s.moonGlowFade == kMoonGlowFadeAtHorizon) {
+			// (41b, F2) The vanilla disc is faded out 16-28 degrees above the horizon (orbit angle
+			// 145-160), long before the moon sets; the glow now follows the moon down to it.
+			const auto& skySync = globals::features::skySync;
+			masserVisibility = MoonHorizonVisibility(sky->masser, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)].z);
+			secundaVisibility = MoonHorizonVisibility(sky->secunda, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)].z);
+		} else {
+			masserVisibility = SkySync::VanillaVisibility(sky->masser);
+			secundaVisibility = SkySync::VanillaVisibility(sky->secunda);
+		}
+		a_masserGlow = a_masserGlow * (SkySync::PhaseFactorFromTexture(sky->masser) * masserVisibility);
+		a_secundaGlow = a_secundaGlow * (SkySync::PhaseFactorFromTexture(sky->secunda) * secundaVisibility);
 	}
 
-	if (settings.moonPhysicalRadiance) {
+	if (s.moonPhysicalRadiance) {
 		// Like the sun's Physical Brightness: the moonlight colour is an irradiance, the disc shows
 		// radiance = irradiance / disc solid angle. The vanilla disc (phase picture, about 1 at
 		// its brightest) is multiplied by that, never darkened, capped at moonRadianceCap.
-		const float cap = std::clamp(settings.moonRadianceCap, 1.f, 1000.f);
+		const float cap = std::clamp(s.moonRadianceCap, 1.f, 1000.f);
 		auto discScale = [&](const RE::Moon* a_moon, const float3& a_color) {
 			if (!a_moon || !a_moon->moonMesh || !sky->root)
 				return 1.f;
@@ -955,6 +1034,127 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float3& a_masserGlow, float3&
 		moonCbData.masserDiskScale = discScale(sky->masser, settings.masserColor);
 		moonCbData.secundaDiskScale = discScale(sky->secunda, settings.secundaColor);
 	}
+}
+
+float PhysicalSky::MoonHorizonVisibility(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation)
+{
+	if (!a_moon || !a_moon->moonMesh || !a_sky)
+		return 0.f;
+
+	// The weather still hides the moon. SkyrimSE.exe 1.5.97 Moon::Update (0x1403AE337) hides the
+	// whole moon while the blended Moon Glare colour (Sky+0x168, skyColor[kMoonGlare]) equals a
+	// fixed colour at 0x1430135F0 (presumably black); other runtimes get only the black test below.
+	// The disc is drawn in the Moon Glare colour, so the glow also ramps in over its first 10% (no
+	// pop when a weather change brings the moon back).
+	const RE::NiColor& glare = a_sky->skyColor[RE::TESWeather::ColorTypes::kMoonGlare];
+	static const RE::NiColor* hideColor = (!REL::Module::IsVR() && REL::Module::get().version() == SKSE::RUNTIME_SSE_1_5_97) ?
+	                                          reinterpret_cast<const RE::NiColor*>(REL::Offset(0x30135F0).address()) :
+	                                          nullptr;
+	if (hideColor && glare.red == hideColor->red && glare.green == hideColor->green && glare.blue == hideColor->blue)
+		return 0.f;
+	const float glarePeak = std::max({ glare.red, glare.green, glare.blue });
+	const float weather = std::clamp(glarePeak / 0.1f, 0.f, 1.f);
+	if (!(weather > 0.f))
+		return 0.f;
+
+	// The moon's true elevation (its orbit direction, without Sky Sync's altitude dip).
+	const float elevationDeg = DirectX::XMConvertToDegrees(std::asin(std::clamp(a_sinElevation, -1.f, 1.f)));
+	return weather * SkySync::SmoothStep(-2.f, 3.f, elevationDeg);
+}
+
+void PhysicalSky::UpdateNightBaseLight(float a_sunElevation)
+{
+	nightCbData.flags = 0;
+	nightCbData.baseUpper = {};
+	nightCbData.baseHorizon = {};
+	nightCbData.baseLower = {};
+
+	const float strength = std::clamp(effective.nightBaseLight, 0.f, 1.f);
+	if (!(strength > 0.f))
+		return;  // 0: no flag, the LUTs run exactly the 41a code
+	// Gone once the sun's own twilight has taken over: full at -6 degrees, 0 at +4.
+	const float fade = 1.f - SkySync::SmoothStep(-6.f, 4.f, DirectX::XMConvertToDegrees(a_sunElevation));
+	if (!(fade > 0.f))
+		return;
+
+	// The weather's night keyframes (sRGB 0-255), blended like the game blends weathers.
+	using ColorTypes = RE::TESWeather::ColorTypes;
+	auto nightColor = [](const RE::TESWeather* a_weather, int a_type) {
+		const auto& c = a_weather->colorData[a_type][RE::TESWeather::ColorTime::kNight];
+		return float3(c.red, c.green, c.blue) * (1.f / 255.f);
+	};
+	float3 upper = {}, horizon = {}, lower = {};
+	if (auto* sky = globals::game::sky; sky && sky->currentWeather) {
+		upper = nightColor(sky->currentWeather, ColorTypes::kSkyUpper);
+		horizon = nightColor(sky->currentWeather, ColorTypes::kHorizon);
+		lower = nightColor(sky->currentWeather, ColorTypes::kSkyLower);
+		const float pct = std::clamp(sky->currentWeatherPct, 0.f, 1.f);
+		if (sky->lastWeather && sky->lastWeather != sky->currentWeather && pct < 1.f) {
+			upper = float3::Lerp(nightColor(sky->lastWeather, ColorTypes::kSkyUpper), upper, pct);
+			horizon = float3::Lerp(nightColor(sky->lastWeather, ColorTypes::kHorizon), horizon, pct);
+			lower = float3::Lerp(nightColor(sky->lastWeather, ColorTypes::kSkyLower), lower, pct);
+		}
+	}
+
+	// Airglow floor: many NAT night skies have SkyUpper = 0 (pure black zenith). A real moonless
+	// sky never is; sRGB (8, 12, 20) is a deep navy, before the strength below.
+	const float3 airglow = float3(8.f, 12.f, 20.f) * (1.f / 255.f);
+	auto toLinear = [&](float3 c) {
+		c = float3(std::max(c.x, airglow.x), std::max(c.y, airglow.y), std::max(c.z, airglow.z));
+		// The same linearisation as the vanilla sky colours (Color::Sky in Color.hlsli).
+		const auto& ll = globals::features::linearLighting.settings;
+		if (ll.enableLinearLighting) {
+			const float g = ll.skyGamma;
+			c = float3(std::pow(c.x, g), std::pow(c.y, g), std::pow(c.z, g));
+		}
+		return c * (strength * fade);
+	};
+	nightCbData.baseUpper = toLinear(upper);
+	nightCbData.baseHorizon = toLinear(horizon);
+	nightCbData.baseLower = toLinear(lower);
+	nightCbData.flags = kNightBaseLight;
+}
+
+bool PhysicalSky::UseLegacyPaths() const
+{
+	return !Batch37b::IsOn() || IsLegacy();
+}
+
+void PhysicalSky::UpdateEffective()
+{
+	effective = settings;
+	if (!IsLegacy())
+		return;
+
+	// (41b, F5) Legacy (36f): every Physical Sky option added after 36f at its 36f value. The
+	// worldspace list and the 37a sun disc size come from UseLegacyPaths(). Kept as the user set
+	// them: enabled, colours, exposures, tonemapper, mixes, procedural sun on/off, atmosphere,
+	// clouds.
+	auto& e = effective;
+	// 37b
+	e.enableAllExteriorWorldspaces = false;
+	e.sunAlignToVanilla = false;
+	e.sunReplaceVanilla = false;
+	e.sunSoftEdge = false;
+	e.sunPhysicalRadiance = false;
+	e.sunHideVanillaGlare = false;
+	e.fixSkyAlpha = false;
+	e.fixTrLutEdge = false;
+	e.fixApShadowDepth = false;
+	e.fixReflectionSky = false;
+	e.fixMultiScatter = false;
+	// 37c
+	e.sunGlowIntensity = 0.f;
+	e.hideNewMoonDisc = false;
+	// 40d
+	e.moonGlowStrength = 1.f;
+	e.moonGlowFollowsMoon = false;
+	e.moonPhysicalRadiance = false;
+	// 41b
+	e.moonGlowFade = kMoonGlowFadeWithDisc;
+	e.nightBaseLight = 0.f;
+	e.skyTrueSunHeight = false;
+	e.twilightLength = 1.f;
 }
 
 void PhysicalSky::ApplySunLook(int a_look)
@@ -991,6 +1191,8 @@ void PhysicalSky::ApplySunLook(int a_look)
 
 void PhysicalSky::Reset()
 {
+	UpdateEffective();
+	const auto& s = effective;
 	UpdateExtCbData();
 
 	auto& skySync = globals::features::skySync;
@@ -1024,24 +1226,48 @@ void PhysicalSky::Reset()
 	dynres = { floor(dynres.x), floor(dynres.y) };
 
 	auto sunDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)];
+	// (41b, F4a) The scattering LUTs' sun. Without sunAlignToVanilla it is sunDir, as before.
+	RE::NiPoint3 lutSunDir = sunDir;
 	// (batch 37b) Align with the vanilla sun quad. Sky Sync places it (and points the sun light)
 	// along the apparent direction -- dipped by atan(altitude / 325000), 1.5-4 degrees -- in the
 	// sky root's local frame, which Sky Sync rotates by the cell's north rotation. The raw
 	// direction used before sat that far off the quad: a second, clipped or missing disk.
-	if (Batch37b::IsOn() && settings.sunAlignToVanilla) {
+	if (Batch37b::IsOn() && s.sunAlignToVanilla) {
 		RE::NiPoint3 apparent = skySync.directions[static_cast<int>(SkySync::Caster::Sun)];
-		if (auto* sky = globals::game::sky; sky && sky->root)
+		RE::NiPoint3 trueDir = sunDir;
+		if (auto* sky = globals::game::sky; sky && sky->root) {
 			apparent = sky->root->world.rotate * apparent;
+			trueDir = sky->root->world.rotate * trueDir;
+		}
 		if (apparent.Unitize() > FLT_EPSILON)
 			sunDir = apparent;
+		lutSunDir = sunDir;
+		// (41b, F4a) The dip is a drawing correction for the disc (the game's sky dome is centred on
+		// the camera, so a higher camera sees the sun lower). Fed to the LUTs it made the whole sky
+		// think the sun was 1.5-6 degrees lower: dawn 7-25 minutes late, dusk as early. The LUTs
+		// now get the true height in the same (world) frame; the disc and its glow keep the dip.
+		if (s.skyTrueSunHeight && trueDir.Unitize() > FLT_EPSILON)
+			lutSunDir = trueDir;
 	}
+	// (41b, F4b) Longer twilight, LUTs only: a sun below the horizon is taken as elevation / L.
+	if (const float twilight = std::clamp(s.twilightLength, 1.f, 3.f); twilight > 1.f && lutSunDir.z < 0.f) {
+		const float horizontal = std::sqrt(lutSunDir.x * lutSunDir.x + lutSunDir.y * lutSunDir.y);
+		if (horizontal > 1e-6f) {
+			const float elevation = std::asin(std::clamp(lutSunDir.z, -1.f, 1.f)) / twilight;
+			const float scale = std::cos(elevation) / horizontal;
+			lutSunDir = { lutSunDir.x * scale, lutSunDir.y * scale, std::sin(elevation) };
+		}
+	}
+	nightCbData.lutSunDir = { lutSunDir.x, lutSunDir.y, lutSunDir.z };
+	// (41b, F1) Faded by the sun height the sky itself uses.
+	UpdateNightBaseLight(std::asin(std::clamp(lutSunDir.z, -1.f, 1.f)));
 	auto masserDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)];
 	auto secundaDir = skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)];
 	// (40d) With the discs left where the game puts them, the glow follows each disc's on-screen
 	// direction (world frame, like the aligned sun above; upstream b2d671ba8's idea). The raw
 	// direction is in the sky root's local frame, so it missed the disc by the north rotation and
 	// the altitude dip.
-	if (skySync.settings.KeepMoonPosition) {
+	if (skySync.Effective().KeepMoonPosition) {
 		if (auto* sky = globals::game::sky) {
 			RE::NiPoint3 onScreen;
 			if (SkySync::OnScreenDirection(sky->masser, sky, onScreen))
@@ -1072,7 +1298,7 @@ void PhysicalSky::Reset()
 		.masserColor = masserGlow,
 		.apTrMix = settings.apTrMix,
 		.secundaDir = { secundaDir.x, secundaDir.y, secundaDir.z },
-		.sunDiskCos = cos(Batch37b::IsOn() ? DirectX::XMConvertToRadians(std::clamp(settings.sunDiskRadiusDeg, 0.05f, 10.f)) : settings.sunDiskRad) * (settings.proceduralSun ? 1.f : 0.f),
+		.sunDiskCos = cos(!UseLegacyPaths() ? DirectX::XMConvertToRadians(std::clamp(s.sunDiskRadiusDeg, 0.05f, 10.f)) : settings.sunDiskRad) * (settings.proceduralSun ? 1.f : 0.f),
 		.secundaColor = secundaGlow,
 		.enabled = allGood,
 		.tonemapper = linearLighting.settings.enableLinearLighting ? 0 : settings.tonemapper,
@@ -1301,11 +1527,11 @@ void PhysicalSky::SetSunDrawFlags(const RE::BSRenderPass* a_pass)
 		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare);
 	else if ((skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON ||
 				 skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON_SHADOW) &&
-			 globals::features::physicalSky.settings.hideNewMoonDisc && IsNewMoonDraw(a_pass))
+			 globals::features::physicalSky.Effective().hideNewMoonDisc && IsNewMoonDraw(a_pass))
 		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsNewMoon);
 
 	// (40d) The moon disc itself (not its star mask, SO_MOON_SHADOW), for "Moon Physical Brightness".
-	if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON && globals::features::physicalSky.settings.moonPhysicalRadiance) {
+	if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON && globals::features::physicalSky.Effective().moonPhysicalRadiance) {
 		if (const auto sky = RE::Sky::GetSingleton(); sky && a_pass->geometry) {
 			const auto* geometry = static_cast<const void*>(a_pass->geometry);
 			if (sky->masser && geometry == sky->masser->moonMesh.get())

@@ -573,6 +573,25 @@ namespace SharedData
 		float2 pad0;
 	};
 
+	// (41b) Mirrors PhysicalSky::NightCbData, appended after PhysSkyMoonData (offset 1680). Read only
+	// by PhysicalSky/LutGen.cs.hlsl (sky-view and aerial perspective LUTs).
+	struct PhysSkyNightData
+	{
+		float3 LutSunDir;    // F4a/F4b: the sun direction the LUTs use (equals physSkyData.sunDir when both are off)
+		uint Flags;          // PhysSkyNightFlags
+		float3 BaseUpper;    // F1 night sky base light, linear, already x strength x fade: zenith
+		float pad0;
+		float3 BaseHorizon;  // horizon; also the aerial perspective's even glow of the air
+		float pad1;
+		float3 BaseLower;    // below the horizon
+		float pad2;
+	};
+
+	namespace PhysSkyNightFlags
+	{
+		static const uint BaseLight = (1 << 0);  // F1 on this frame; 0 = the 41a LUT code exactly
+	}
+
 	namespace PhysSkyExtFlags
 	{
 		static const uint SunReplace = (1 << 0);           // disk replaces the vanilla sun quad
@@ -616,6 +635,7 @@ namespace SharedData
 		VolumetricShadowsSettings volumetricShadowsSettings;
 		DynamicSnowSettings dynamicSnowSettings;
 		PhysSkyMoonData physSkyMoonData;
+		PhysSkyNightData physSkyNightData;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);

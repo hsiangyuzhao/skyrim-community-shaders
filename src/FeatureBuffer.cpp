@@ -72,7 +72,8 @@ std::pair<unsigned char*, size_t> GetFeatureBufferData(bool a_inWorld)
 		globals::features::exponentialHeightFog.GetVolumetricPSData(),
 		globals::features::volumetricShadows.GetCommonBufferData(),
 		globals::features::dynamicSnow.GetCommonBufferData(),
-		globals::features::physicalSky.moonCbData);
+		globals::features::physicalSky.moonCbData,
+		globals::features::physicalSky.nightCbData);
 }
 
 namespace
@@ -119,6 +120,7 @@ namespace
 		SettingsOf<decltype(globals::features::volumetricShadows.GetCommonBufferData())> volumetricShadows;
 		SettingsOf<decltype(globals::features::dynamicSnow.GetCommonBufferData())> dynamicSnow;
 		SettingsOf<decltype(globals::features::physicalSky.moonCbData)> physicalSkyMoon;
+		SettingsOf<decltype(globals::features::physicalSky.nightCbData)> physicalSkyNight;
 	};
 
 	static_assert(offsetof(FeatureDataLayoutMirror, vanillaFresnel) == 1008,
@@ -141,6 +143,8 @@ namespace
 		"(batch 39) SharedData::dynamicSnowSettings moved; update the HLSL mirror and this offset together.");
 	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyMoon) == 1664,
 		"(40d) SharedData::physSkyMoonData moved; update the HLSL mirror and this offset together.");
-	static_assert(sizeof(FeatureDataLayoutMirror) == 1680,  // (40d) + PhysSkyMoonData 16; (batch 39c) DynamicSnow 80 -> 112
+	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyNight) == 1680,
+		"(41b) SharedData::physSkyNightData moved; update the HLSL mirror and this offset together.");
+	static_assert(sizeof(FeatureDataLayoutMirror) == 1744,  // (41b) + PhysSkyNightData 64; (40d) + PhysSkyMoonData 16; (batch 39c) DynamicSnow 80 -> 112
 		"FeatureData's total size changed; check every offset above against fxc's reflection listing.");
 }

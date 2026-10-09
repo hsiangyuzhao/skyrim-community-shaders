@@ -105,6 +105,21 @@ struct PhysicalSky final : public Feature
 	/// What Reset() decides for the current worldspace, also used by the menu.
 	WorldspaceStatus GetWorldspaceStatus(float& a_zBottom) const;
 
+	/// (41b, F2) "Moon Glow Fades".
+	enum MoonGlowFade : int
+	{
+		kMoonGlowFadeWithDisc = 0,  // 40d: the vanilla disc's fade alpha (gone 16 degrees up)
+		kMoonGlowFadeAtHorizon,     // the moon's true elevation, -2 -> +3 degrees
+		kMoonGlowFadeCount
+	};
+	/// (41b, F5) "Sky Model".
+	enum SkyModel : int
+	{
+		kSkyModelCurrent = 0,
+		kSkyModelLegacy36f,
+		kSkyModelCount
+	};
+
 	struct Settings
 	{
 		bool enabled = true;
@@ -166,6 +181,22 @@ struct PhysicalSky final : public Feature
 		/// Brightness), capped at moonRadianceCap; the phase picture keeps its shading.
 		bool moonPhysicalRadiance = false;
 		float moonRadianceCap = 8.f;
+		/// (41b, F2) What fades each moon's sky glow (with moonGlowFollowsMoon): MoonGlowFade.
+		int moonGlowFade = kMoonGlowFadeAtHorizon;
+
+		/// (41b, F1) Night sky base light: the current weather's night sky colours (SkyUpper,
+		/// Horizon, SkyLower) x this, with a faint airglow floor, faded out as the sun rises from
+		/// -6 to +4 degrees. Added to the sky-view LUT as a gradient and to the aerial
+		/// perspective LUT as an even glow of the air. 0 = the 41a image exactly.
+		float nightBaseLight = 0.2f;
+		/// (41b, F4a) The scattering LUTs use the sun's true height. The vanilla altitude dip
+		/// stays on the disc and its glow (sunAlignToVanilla).
+		bool skyTrueSunHeight = true;
+		/// (41b, F4b) In the LUTs only, a sun below the horizon is taken as elevation / this:
+		/// 1 = real twilight, 2 = twilight twice as long. Never the directional light.
+		float twilightLength = 1.f;
+		/// (41b, F5) SkyModel: Current, or Legacy (36f) for comparison (see Effective()).
+		int skyModel = kSkyModelCurrent;
 
 		// (batch 37b) Upstream correctness fixes, each ANDed with Batch37b::IsOn().
 		bool fixSkyAlpha = true;  // 5846ad833: sky dome written opaque
@@ -207,6 +238,19 @@ struct PhysicalSky final : public Feature
 		float silverLiningMix = 1.f;
 		float silverLiningSpread = 0.f;
 	} settings;
+
+	/// (41b, F5) The settings as used this frame. In "Legacy (36f)" mode every option added after
+	/// 36f is temporarily at its 36f value (and the 41b options at their "off" values); the saved
+	/// settings above are never written. Colours, exposures, atmosphere and clouds are the user's.
+	/// Rebuilt by UpdateEffective() (every Reset and after a load).
+	const Settings& Effective() const { return effective; }
+	/// (41b, F5) Legacy (36f) mode is active.
+	bool IsLegacy() const { return loaded && settings.skyModel == kSkyModelLegacy36f; }
+	/// (41b, F5) 36f code paths for what the old Batch 37b master switched: hard-coded worldspace
+	/// list, 37a sun disc size, no 37b/37c shader flags.
+	bool UseLegacyPaths() const;
+	void UpdateEffective();
+	Settings effective;
 
 	struct CbData
 	{
@@ -300,6 +344,29 @@ struct PhysicalSky final : public Feature
 	static_assert(sizeof(MoonCbData) == 16);
 	/// (40d) Moon glow scale for the LUTs (strength x phase x visibility) and disc scales.
 	void UpdateMoonData(float a_exposure, float3& a_masserGlow, float3& a_secundaGlow);
+
+	/// (41b) Mirrors SharedData::PhysSkyNightData (HLSL), appended after PhysSkyMoonData. Read only
+	/// by LutGen (sky-view and aerial perspective LUTs).
+	enum NightFlags : uint32_t
+	{
+		kNightBaseLight = 1u << 0,  // F1: add the Base* colours below
+	};
+	struct NightCbData
+	{
+		float3 lutSunDir = { 0.f, 0.f, 1.f };  // F4a/F4b: sun direction the LUTs use
+		uint flags = 0;
+		float3 baseUpper = {};    // F1: linear, x strength x fade (zenith)
+		float pad0 = 0.f;
+		float3 baseHorizon = {};  // horizon; also the aerial perspective's even glow
+		float pad1 = 0.f;
+		float3 baseLower = {};    // below the horizon
+		float pad2 = 0.f;
+	} nightCbData;
+	static_assert(sizeof(NightCbData) == 64);
+	/// (41b, F1) Fills nightCbData's base light from the current weather; a_sunElevation in radians.
+	void UpdateNightBaseLight(float a_sunElevation);
+	/// (41b, F2) Glow visibility of a moon by its true elevation; 0 when the weather hides it.
+	static float MoonHorizonVisibility(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation);
 
 	/// (batch 37c) "Sun Look" presets.
 	enum SunLook : int

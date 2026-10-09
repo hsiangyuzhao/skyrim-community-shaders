@@ -48,7 +48,18 @@ void rayMarch(
 #endif
 
 #if LUTGEN > 1
-	const float3 sunDir = data.sunDir;
+	// (41b, F4a/F4b) The LUTs' own sun: the true height and/or a stretched twilight. Equal to
+	// data.sunDir when both options are off.
+	const float3 sunDir = SharedData::physSkyNightData.LutSunDir;
+#endif
+#if LUTGEN == 3
+	// (41b, F1) Night sky base light in the aerial perspective: the air itself glows evenly with
+	// the weather's night horizon colour (in-scattered like the moonlight, without a phase lobe),
+	// so a long path tends to that colour and distant mountains fade into the night horizon.
+	// Accumulated apart from lum and added only when on, so 0 writes exactly the 41a values.
+	const bool nightBaseLight = (SharedData::physSkyNightData.Flags & SharedData::PhysSkyNightFlags::BaseLight) != 0;
+	const float3 nightGlow = SharedData::physSkyNightData.BaseHorizon;
+	float3 lumNight = 0;
 #endif
 
 	float tGround = RayIntersectSphere(pos, rayDir, 0, data.rPlanet);
@@ -146,10 +157,17 @@ void rayMarch(
 
 		lum += scatterIntegeral * tr;
 #endif
+#if LUTGEN == 3
+		[branch] if (nightBaseLight)
+			lumNight += scatterNoPhase * nightGlow * scatterFactor * tr;
+#endif
 		tr *= trSample;
 
 #if LUTGEN == 3
-		RWTexOutput[uint3(tid.xy, i + 1)] = float4(lum, dot(tr, float3(0.2126, 0.7152, 0.0722)));
+		float3 lumOut = lum;
+		[branch] if (nightBaseLight)
+			lumOut = lum + lumNight;
+		RWTexOutput[uint3(tid.xy, i + 1)] = float4(lumOut, dot(tr, float3(0.2126, 0.7152, 0.0722)));
 #endif
 	}
 
@@ -164,6 +182,20 @@ void rayMarch(
 	}
 #endif
 }
+
+#if LUTGEN == 2
+// (41b, F1) Night sky base light on the sky dome: the weather's own night gradient (horizon colour
+// at the horizon, its sky-upper colour from about 30 degrees up, sky-lower below), added on top of
+// the scattering. Not injected as scattering: an even glow of the air comes out ~10x brighter at
+// the horizon than at the zenith, while weathers often want the zenith as bright or brighter.
+float3 NightSkyBase(float3 rayDir)
+{
+	const SharedData::PhysSkyNightData night = SharedData::physSkyNightData;
+	[flatten] if (rayDir.z >= 0.0)
+		return lerp(night.BaseHorizon, night.BaseUpper, smoothstep(0.0, 0.5, rayDir.z));
+	return lerp(night.BaseHorizon, night.BaseLower, smoothstep(0.0, 0.3, -rayDir.z));
+}
+#endif
 
 [numthreads(8, 8, 1)] void main(uint3 tid
 								: SV_DispatchThreadID) {
@@ -191,7 +223,6 @@ void rayMarch(
 	float3 sunDir = float3(0, sqrt(1 - zenithCos * zenithCos), zenithCos);
 #else
 	float3 rayDir = InvSkyViewLutUv(uv);
-	float3 sunDir = data.sunDir;
 	float3 pos = float3(0, 0, data.zCameraPlanet);
 #endif
 
@@ -228,6 +259,8 @@ void rayMarch(
 #elif LUTGEN == 2
 	float3 lum = 0;
 	rayMarch(pos, rayDir, tr, lum);
+	[branch] if (SharedData::physSkyNightData.Flags & SharedData::PhysSkyNightFlags::BaseLight)
+		lum += NightSkyBase(rayDir);
 	RWTexOutput[tid.xy] = float4(lum, 1.0);
 
 #elif LUTGEN == 3

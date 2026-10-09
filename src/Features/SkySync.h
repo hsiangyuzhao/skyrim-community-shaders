@@ -59,6 +59,11 @@ public:
 
 	Settings settings;
 
+	/// (41b, F5) Settings as used this frame: in Physical Sky's "Legacy (36f)" mode the moon options
+	/// added after 36f are at their 36f values (Vanilla orbit, discs lowered by altitude). The saved
+	/// settings are never changed.
+	Settings Effective() const;
+
 	virtual void DrawSettings() override;
 
 	virtual void LoadSettings(json& o_json) override;
