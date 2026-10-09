@@ -237,7 +237,8 @@ namespace LightingExtensions
 			auto state = globals::state;
 
 			state->permutationData.ExtraShaderDescriptor &= ~(static_cast<uint32_t>(State::ExtraShaderDescriptors::IsTree) |
-																static_cast<uint32_t>(State::ExtraShaderDescriptors::IsActorGeometry));
+																static_cast<uint32_t>(State::ExtraShaderDescriptors::IsActorGeometry) |
+																static_cast<uint32_t>(State::ExtraShaderDescriptors::IsActorRigid));
 
 			auto userData = pass->geometry->GetUserData();
 			if (userData)
@@ -249,8 +250,12 @@ namespace LightingExtensions
 			// clothing, also on the first-person arms) and everything else hanging off an actor's
 			// 3D (helmets and weapons that are not skinned, quivers, arrows stuck in them).
 			// GetUserData walks up to the actor's root node.
-			if (pass->geometry->GetGeometryRuntimeData().skinInstance || (userData && userData->Is(RE::FormType::ActorCharacter)))
+			if (pass->geometry->GetGeometryRuntimeData().skinInstance)
 				state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsActorGeometry);
+			else if (userData && userData->Is(RE::FormType::ActorCharacter))
+				// (40e) Rigid gear (shield, weapon, quiver, helmet): its model space is not the actor's.
+				state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsActorGeometry) |
+				                                                static_cast<uint32_t>(State::ExtraShaderDescriptors::IsActorRigid);
 
 			state->permutationData.ExtraShaderDescriptor &= ~static_cast<uint32_t>(State::ExtraShaderDescriptors::IsLODGrass);
 

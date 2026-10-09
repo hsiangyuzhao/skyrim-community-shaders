@@ -134,6 +134,17 @@ public:
 		bool BodyAndObjectTrails = true;
 		float TrailRim = 0.35f;  ///< pushed-up rim around a print, relative to its depth
 
+		// ---- (40e) ----
+		/// Even Cover: how far snow flattens the material's relief (normal map, parallax self-shadow,
+		/// and how much less the texture's grooves hold). 0 = the relief shows fully, 1 = 39c (flat).
+		float SnowSmoothing = 0.2f;
+		/// Even Cover: cover on roofs and slopes (steeper than about 37 degrees, rising to full by 23).
+		/// 1 = 39c (everything flatter than Full Cover From is fully white).
+		float SteepCover = 0.8f;
+		/// Snow on Characters: rigid gear (shields, weapons, quivers, helmets) takes its slope from
+		/// world up instead of its own model space, and back faces get no snow. Off = 40d.
+		bool RigidGearWorldUp = true;
+
 		// ---- Debug ----
 		bool FlipPrintShapes = false;  ///< (39c) debug: installed print textures heel/toe reversed
 		bool OverrideAmount = false;
@@ -175,7 +186,9 @@ public:
 
 		float LodTreeCoverage;
 		float TrailRim;
-		float pad1[2];
+		// (40e)
+		float SnowSmoothing;
+		float SteepCover;
 	};
 	STATIC_ASSERT_ALIGNAS_16(CommonBufferData);
 	static_assert(sizeof(CommonBufferData) == 112);
@@ -197,6 +210,8 @@ public:
 		FlagTrees = 1 << 10,
 		FlagGrass = 1 << 11,
 		FlagLodTrees = 1 << 12,
+		// (40e)
+		FlagActorRigidWorldUp = 1 << 13,
 	};
 
 	[[nodiscard]] CommonBufferData GetCommonBufferData();

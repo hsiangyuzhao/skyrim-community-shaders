@@ -53,6 +53,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	YieldToFootprintsMod,
 	BodyAndObjectTrails,
 	TrailRim,
+	SnowSmoothing,
+	SteepCover,
+	RigidGearWorldUp,
 	OverrideAmount,
 	AmountOverride,
 	FlipPrintShapes)
@@ -313,8 +316,11 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 	data.Amount = drawnAmount;
 	if (AccumulationActive() && status.exterior && drawnAmount > 0.0f) {
 		data.Flags |= FlagAccumulation;
-		if (settings.SnowOnCharacters)
+		if (settings.SnowOnCharacters) {
 			data.Flags |= FlagSnowOnCharacters;
+			if (settings.RigidGearWorldUp)
+				data.Flags |= FlagActorRigidWorldUp;
+		}
 		// (batch 39c)
 		if (settings.SlopeCoverage)
 			data.Flags |= FlagCoverageSlope;
@@ -371,6 +377,9 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 	data.GrassCoverage = std::clamp(settings.GrassCoverage, 0.0f, 1.0f);
 	data.LodTreeCoverage = std::clamp(settings.LodTreeCoverage, 0.0f, 1.0f);
 	data.TrailRim = std::clamp(settings.TrailRim, 0.0f, 1.0f);
+	// (40e)
+	data.SnowSmoothing = std::clamp(settings.SnowSmoothing, 0.0f, 1.0f);
+	data.SteepCover = std::clamp(settings.SteepCover, 0.0f, 1.0f);
 
 	status.accumulationDrawn = (data.Flags & FlagAccumulation) != 0;
 	status.trailsDrawn = (data.Flags & FlagTrails) != 0;
@@ -1358,9 +1367,10 @@ void DynamicSnow::DrawSettings()
 		ImGui::Checkbox("Even Cover on Roofs and Slopes", &settings.SlopeCoverage);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
-				"On (default): how much snow a surface holds depends on its overall slope only, with a gentle\n"
-				"fade between the two angles below, so a roof gets the same cover whatever its texture. The\n"
-				"texture's bumps only decide where thin snow sits first, and thick snow hides them.\n"
+				"On (default): how much snow a surface holds depends on its overall slope, with gentle fades,\n"
+				"so a lumpy thatch roof gets the same even cover as a flat one. Roofs and slopes get the\n"
+				"lighter Roof and Slope Cover, level ground full cover. The snow keeps the texture's bumps\n"
+				"(see Snow Smoothing).\n"
 				"Off: the older rule (a hard cut at Normal Threshold, half decided by the texture's bumps):\n"
 				"steep thatch roofs came out thin and streaky.");
 		if (settings.SlopeCoverage) {
@@ -1375,6 +1385,17 @@ void DynamicSnow::DrawSettings()
 					"Most roofs are 35-55 degrees.",
 					settings.SlopeFull, degrees(settings.SlopeFull));
 			settings.SlopeFull = std::max(settings.SlopeFull, settings.SlopeStart + 0.02f);
+			ImGui::SliderFloat("Roof and Slope Cover", &settings.SteepCover, 0.0f, 1.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted(
+					"How white roofs and slopes get (steeper than about 37 degrees; level ground is always full).\n"
+					"0.8 (default) is close to the older rule overall. 1 = 40d: every roof solid white.");
+			ImGui::SliderFloat("Snow Smoothing", &settings.SnowSmoothing, 0.0f, 1.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted(
+					"How much the snow evens out the texture's bumps (cobbles, planks, stones).\n"
+					"0.2 (default): the bumps, their shadows and the gaps between stones still show through.\n"
+					"0 = all of the relief shows. 1 = 40d: a flat white sheet.");
 		} else {
 			ImGui::SliderFloat("Normal Threshold", &settings.NormalThreshold, 0.0f, 0.95f, "%.2f");
 			if (auto _tt = Util::HoverTooltipWrapper())
@@ -1413,6 +1434,14 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextUnformatted(
 				"Off (default): people, creatures and everything they wear or carry stay free of built-up snow.\n"
 				"On: their upward-facing parts (shoulders, hoods) get snow like the ground does.");
+		ImGui::BeginDisabled(!settings.SnowOnCharacters);
+		ImGui::Checkbox("Shields and Weapons Use World Up", &settings.RigidGearWorldUp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"On (default): shields, weapons, quivers and helmets get snow only where they really face up\n"
+				"(a shield on the back gets a little on its top rim), and the inside of a surface never gets any.\n"
+				"Off: 40d, where a shield on the back could turn fully white because its own 'up' was used.");
+		ImGui::EndDisabled();
 
 		if (ImGui::TreeNodeEx("Snow Look")) {
 			ImGui::ColorEdit3("Snow Colour", &settings.SnowColor.x);

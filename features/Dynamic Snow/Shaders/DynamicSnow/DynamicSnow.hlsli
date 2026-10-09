@@ -36,6 +36,16 @@ namespace DynamicSnow
 	static const uint FlagTrees = 1 << 10;         // snow on animated trees and foliage (Lighting, TREE_ANIM)
 	static const uint FlagGrass = 1 << 11;         // snow on grass (RunGrass)
 	static const uint FlagLodTrees = 1 << 12;      // snow on distant billboard trees (DistantTree)
+	// (40e)
+	static const uint FlagActorRigidWorldUp = 1 << 13;  // rigid gear on actors: slope from world up; back faces get none
+	// (40e) Permutation::ExtraShaderDescriptor bit, mirrors State::ExtraShaderDescriptors::IsActorRigid
+	// (set with IsActorGeometry when the geometry is not skinned). Kept here rather than in
+	// Permutation.hlsli, where a new constant reshuffles fxc's output for unrelated permutations.
+	static const uint ExtraIsActorRigid = 1 << 14;
+
+	// (40e) Mirrors CommonBufferData::SnowSmoothing / SteepCover (stored in pad1, see SharedData.hlsli).
+	float SnowSmoothing() { return SharedData::dynamicSnowSettings.pad1.x; }
+	float SteepCover() { return SharedData::dynamicSnowSettings.pad1.y; }
 
 	// Height is stored modulo this many units. Two surfaces exactly a multiple of it apart
 	// (14.6 m) would share prints; anything else is told apart by TrailZTolerance.
@@ -85,6 +95,13 @@ namespace DynamicSnow
 			// threshold, so the snow followed the thatch's lumps in streaks while flatter shingles
 			// and boardwalks went fully white.
 			slope = smoothstep(s.SlopeStart, s.SlopeFull, geometryNormalWS.z);
+			// (40e) 39c gave every surface flatter than SlopeFull (57 degrees) full cover: roofs,
+			// rock faces and wall tops all went solid white, far more than 39b (which covered
+			// nothing steeper than 53 degrees and only partly up to 43). Roofs and slopes now hold
+			// an even SteepCover; the cover rises to full only towards level ground (37 -> 23
+			// degrees). The plateau spans nearly the whole thatch range, so the lumps stay even.
+			// SteepCover 1 = 39c.
+			slope *= lerp(SteepCover(), 1.0, smoothstep(0.80, 0.92, geometryNormalWS.z));
 		} else {
 			// 39b: half geometry, half normal map, hard threshold.
 			float up = lerp(geometryNormalWS.z, normalWS.z, 0.5);
@@ -110,6 +127,10 @@ namespace DynamicSnow
 			// grooves last); full cover stays full, so a bumpy texture never punches holes.
 			float detail = normalWS.z - geometryNormalWS.z;
 			coverage = saturate(coverage + detail * 2.0 * coverage * (1.0 - coverage));
+			// (40e) At any cover, the normal map's grooves and steep facets hold less than its
+			// up-facing tops, so the cobbles, planks and stones stay readable under the snow as
+			// they did in 39b. SnowSmoothing 1 = 39c (thick snow ignores the texture).
+			coverage *= saturate(1.0 + detail * 1.5 * (1.0 - SnowSmoothing()));
 		} else {
 			coverage *= saturate(slope * 3.0);
 		}

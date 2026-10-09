@@ -2396,10 +2396,27 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			else
 				float3 snowBindNormal = input.SnowBindNormal;
 #			endif
-				snowBindNormal = snowBindNormal * rsqrt(max(dot(snowBindNormal, snowBindNormal), 1e-8));
-				// Double-sided cloth seen from behind: the back side faces the other way.
-				snowBindNormal = frontFace ? snowBindNormal : -snowBindNormal;
-				snowCoverage = DynamicSnow::GetActorCoverage(input.ModelPosition.xyz, snowBindNormal, length(input.WorldPosition.xyz));
+				[branch] if (snowFlags & DynamicSnow::FlagActorRigidWorldUp)
+				{
+					// (40e) Rigid gear (shield, weapon, quiver, helmet; IsActorRigid) has a model space of
+					// its own: a shield's face is "up" in it wherever it is worn, so a shield on the back
+					// turned fully white. Its slope comes from the world vertex normal instead: an upright
+					// actor only turns about Z, which leaves the up component of a normal unchanged, so
+					// this equals the normal in the actor's own frame (inverse yaw). The noise stays in
+					// model space and so stays on the gear. Back faces (the inside of a double-sided
+					// surface) take no snow, on skinned meshes too.
+					[branch] if (Permutation::ExtraShaderDescriptor & DynamicSnow::ExtraIsActorRigid)
+						snowBindNormal = snowGeometryNormal;
+					snowBindNormal = snowBindNormal * rsqrt(max(dot(snowBindNormal, snowBindNormal), 1e-8));
+					snowCoverage = frontFace ? DynamicSnow::GetActorCoverage(input.ModelPosition.xyz, snowBindNormal, length(input.WorldPosition.xyz)) : 0.0;
+				}
+				else
+				{
+					snowBindNormal = snowBindNormal * rsqrt(max(dot(snowBindNormal, snowBindNormal), 1e-8));
+					// Double-sided cloth seen from behind: the back side faces the other way.
+					snowBindNormal = frontFace ? snowBindNormal : -snowBindNormal;
+					snowCoverage = DynamicSnow::GetActorCoverage(input.ModelPosition.xyz, snowBindNormal, length(input.WorldPosition.xyz));
+				}
 			}
 			else
 			{
@@ -2432,8 +2449,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				worldNormal = normalize(lerp(worldNormal, snowGeometryNormal, dynamicSnowCoverage * 0.5));
 #		else
 				// (batch 39c) Thick snow hides the material's relief completely: its own normal is the
-				// geometry's (39b kept 20% of the normal map under full cover).
-				worldNormal = normalize(lerp(worldNormal, snowGeometryNormal, dynamicSnowCoverage * ((snowFlags & DynamicSnow::FlagCoverageSlope) ? 1.0 : 0.8)));
+				// geometry's (39b kept 20% of the normal map under full cover). (40e) Under Even Cover
+				// only SnowSmoothing of it (default 0.2): snow follows the bumps below it.
+				worldNormal = normalize(lerp(worldNormal, snowGeometryNormal, dynamicSnowCoverage * ((snowFlags & DynamicSnow::FlagCoverageSlope) ? DynamicSnow::SnowSmoothing() : 0.8)));
 #		endif
 				// Snow is never smoother than SnowRoughness, and never makes a matte surface
 				// shinier: SSRT/NRD only ever see roughness go up on snow.
@@ -3145,8 +3163,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #	if defined(DYNAMIC_SNOW_SURFACE)
 	// (batch 39c) Snow fills the material's relief, so its parallax self-shadow fades with the cover.
+	// (40e) Only by SnowSmoothing (default 0.2): the relief still shades the snow on it.
 	if (SharedData::dynamicSnowSettings.Flags & DynamicSnow::FlagCoverageSlope)
-		parallaxShadow = lerp(parallaxShadow, 1.0, dynamicSnowCoverage);
+		parallaxShadow = lerp(parallaxShadow, 1.0, dynamicSnowCoverage * DynamicSnow::SnowSmoothing());
 #	endif
 
 	if (dirShadow != 0.0 && (inWorld || inReflection))
@@ -3481,7 +3500,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			if defined(DYNAMIC_SNOW_SURFACE)
 		// (batch 39c) As for the sun: snow fills the relief.
 		if (SharedData::dynamicSnowSettings.Flags & DynamicSnow::FlagCoverageSlope)
-			parallaxShadow = lerp(parallaxShadow, 1.0, dynamicSnowCoverage);
+			parallaxShadow = lerp(parallaxShadow, 1.0, dynamicSnowCoverage * DynamicSnow::SnowSmoothing());
 #			endif
 
 #			if defined(TRUE_PBR)

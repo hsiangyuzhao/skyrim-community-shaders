@@ -9,7 +9,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	MoonLightSource,
 	SunPath,
 	CustomAngle,
-	StableMoonOrbit,
+	MoonOrbit,
+	MasserNightPosition,
+	SecundaNightPosition,
+	NightArc,
 	KeepMoonPosition)
 
 void SkySync::DrawSettings()
@@ -38,15 +41,34 @@ void SkySync::DrawSettings()
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Which moon lights the night. Brightest = whichever moon is brighter.");
 
-	ImGui::Checkbox("Stable Moon Orbit", &settings.StableMoonOrbit);
+	ImGui::Combo("Moon Orbit", &settings.MoonOrbit, MoonOrbitNames, static_cast<int>(MoonOrbit::Count));
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::TextUnformatted(
-			"Places each moon from the date and time instead of stepping it forward every frame.\n"
-			"The game counts a time change backwards as almost a whole day forwards, and Secunda moves 20% faster\n"
-			"than Masser, so every time skip threw Secunda to a random spot, often below the horizon.\n"
-			"On (default): the moons are always where the date and time say. Off: the game's own stepping.");
+			"Where Masser and Secunda are in the sky.\n"
+			"Night Sky (default): both moons are up every night, Secunda a little ahead of Masser on the same path across the sky.\n"
+			"  They are up at dusk, cross the sky slowly through the night and set after dawn.\n"
+			"Stable: each moon follows the date and time at its own speed (Masser overhead at midnight).\n"
+			"  Secunda is faster and drifts a fifth of a turn a day, so it is up at night only about 2 nights in 5.\n"
+			"Vanilla: the game's own stepping. Changing the time throws Secunda to a new place each time.");
+	if (settings.MoonOrbit == static_cast<int32_t>(MoonOrbit::NightSky)) {
+		ImGui::SliderFloat("Masser Position", &settings.MasserNightPosition, -60.0f, 60.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Where Masser is along its path at the middle of the night, in degrees from its highest point.\n"
+				"Negative = towards the side it rises on. Default -15.");
+		ImGui::SliderFloat("Secunda Position", &settings.SecundaNightPosition, -60.0f, 60.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Same for Secunda. Default +15: about 25 degrees from Masser in the sky, close but not touching.\n"
+				"Both at the same number puts Secunda against Masser's lower edge, as the game often does.");
+		ImGui::SliderFloat("Movement Through the Night", &settings.NightArc, 0.0f, 140.0f, "%.0f degrees", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"How far the moons travel from dusk to dawn. 0 = they stand still all night.\n"
+				"Above about 80 with the default positions, a moon starts the night or ends it low and faint.");
+	}
 	if (!REL::Module::IsSE())
-		ImGui::TextDisabled("(only on Skyrim SE 1.5.97; does nothing here)");
+		ImGui::TextDisabled("(Stable and Night Sky only work on Skyrim SE 1.5.97; Vanilla is used here)");
 
 	ImGui::Checkbox("Keep Moons Where the Game Puts Them", &settings.KeepMoonPosition);
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -61,6 +83,10 @@ void SkySync::LoadSettings(json& o_json)
 	settings = o_json;
 	settings.MoonLightSource = std::clamp(settings.MoonLightSource, static_cast<int32_t>(MoonLightSource::Brightest), static_cast<int32_t>(MoonLightSource::Secunda));
 	settings.SunPath = std::clamp(settings.SunPath, static_cast<int32_t>(SunPath::Southern), static_cast<int32_t>(SunPath::Custom));
+	settings.MoonOrbit = std::clamp(settings.MoonOrbit, static_cast<int32_t>(MoonOrbit::Vanilla), static_cast<int32_t>(MoonOrbit::NightSky));
+	settings.MasserNightPosition = std::clamp(settings.MasserNightPosition, -60.0f, 60.0f);
+	settings.SecundaNightPosition = std::clamp(settings.SecundaNightPosition, -60.0f, 60.0f);
+	settings.NightArc = std::clamp(settings.NightArc, 0.0f, 140.0f);
 	SetSunAngle();
 }
 
@@ -489,8 +515,8 @@ void SkySync::Moon_Update::thunk(RE::Moon* moon, RE::Sky* sky)
 {
 	const auto updateMoonTexture = moon->updateMoonTexture;
 
-	if (const auto& singleton = globals::features::skySync; singleton.settings.Enabled && singleton.settings.StableMoonOrbit)
-		SetStableMoonAngle(moon, sky);
+	if (const auto& singleton = globals::features::skySync; singleton.settings.Enabled && singleton.settings.MoonOrbit != static_cast<int32_t>(MoonOrbit::Vanilla))
+		SetMoonAngle(moon, sky);
 
 	func(moon, sky);
 
@@ -542,7 +568,7 @@ inline float SkySync::SmoothStep(const float start, const float end, const float
 	return t * t * (3.0f - 2.0f * t);
 }
 
-void SkySync::SetStableMoonAngle(RE::Moon* moon, const RE::Sky* sky)
+void SkySync::SetMoonAngle(RE::Moon* moon, const RE::Sky* sky)
 {
 	// (40d) SkyrimSE.exe 1.5.97, Moon::Update (ID 25626 = 0x1403ADF90), read with dumpbin for
 	// this change:
@@ -554,17 +580,67 @@ void SkySync::SetStableMoonAngle(RE::Moon* moon, const RE::Sky* sky)
 	// so the engine keeps the angle (and does everything else as before). With no time skip the
 	// result equals the engine's own stepping. The offsets are not verified on other runtimes:
 	// there this does nothing. Moon and Stars drives the moons itself: left alone.
+	//
+	// (40e) What the angle means, from the same function and the routines it calls (dumpbin on
+	// 1.5.97; sin/cos identified from the import table):
+	//   root rotation = Rx(-angle) * Rz(+moon+0xC0), so the disc direction (rotation column Y) is
+	//   (sin c0, cos(angle) cos c0, sin(angle) cos c0): angle 0 and 180 are the two horizons and 90
+	//   is the moon's highest point (55 degrees up for Masser, c0 = 35; 40 for Secunda, c0 = 50).
+	//   The disc's alpha (0x1403AD260) is 1 for angle in [fadeStart, 180 - fadeStart] = [35, 145],
+	//   fades linearly to 0 at fadeEnd = 20 and 160, and is 0 outside (below the horizon).
+	//   The phase texture is swapped only while both alphas are 0 (moon+0xC8 == 1).
+	// 40d set angle = 90 + speed * 60 * (hours passed). Hours passed is GameDaysPassed * 24, and a
+	// new game starts at GameDaysPassed 1.0 with GameHour 8 (Skyrim.esm), so the total ran 8 hours
+	// behind the clock: Masser was overhead at 8 am and up at night only from about 3 am; Secunda
+	// (18 degrees an hour) drifted 72 degrees a day and was up at night about 2 nights in 5.
 	static const bool verified = !REL::Module::IsVR() && REL::Module::get().version() == SKSE::RUNTIME_SSE_1_5_97;
-	if (!verified || !moon || !sky || globals::features::skySync.moonAndStarsLoaded)
+	const auto& singleton = globals::features::skySync;
+	if (!verified || !moon || !sky || singleton.moonAndStarsLoaded)
 		return;
-	const auto calendar = RE::Calendar::GetSingleton();
-	if (!calendar)
+	const double hour = static_cast<double>(sky->currentGameHour);
+	if (!std::isfinite(hour) || hour < 0.0 || hour > 24.0)
 		return;
-	const double hours = static_cast<double>(calendar->GetHoursPassed());
-	const double speed = static_cast<double>(moon->speed);
-	if (!std::isfinite(hours) || hours < 0.0 || !std::isfinite(speed))
+
+	double angle;
+	if (singleton.settings.MoonOrbit == static_cast<int32_t>(MoonOrbit::Stable)) {
+		const auto calendar = RE::Calendar::GetSingleton();
+		if (!calendar)
+			return;
+		const double hours = static_cast<double>(calendar->GetHoursPassed());
+		const double speed = static_cast<double>(moon->speed);
+		if (!std::isfinite(hours) || hours < 0.0 || !std::isfinite(speed))
+			return;
+		// Whole days from the calendar, the time of day from the clock: Masser (15 degrees an hour,
+		// exactly a turn a day) is overhead at midnight whatever offset the save has between them.
+		const double days = std::floor((hours - hour) / 24.0 + 0.5);
+		angle = 90.0 + speed * 60.0 * (days * 24.0 + hour);
+	} else if (singleton.settings.MoonOrbit == static_cast<int32_t>(MoonOrbit::NightSky)) {
+		// Night = from an hour before the end of sunset to an hour after the start of sunrise, the
+		// span in which Sky Sync lets the moons light the scene (NAT's Skyrim climate: 19:30-06:30).
+		// Through the night the angle moves evenly from centre - arc/2 to centre + arc/2; over the day
+		// it carries on round the rest of the circle (below the horizon) to the next dusk.
+		double dusk = 19.5;
+		double night = 11.0;
+		if (const auto climate = sky->currentClimate) {
+			const double d = climate->timing.sunset.end / 6.0 - 1.0;
+			const double n = std::fmod(climate->timing.sunrise.begin / 6.0 + 1.0 - d + 48.0, 24.0);
+			if (n >= 4.0 && n <= 20.0) {
+				dusk = d;
+				night = n;
+			}
+		}
+		const auto& s = singleton.settings;
+		const double arc = std::clamp(static_cast<double>(s.NightArc), 0.0, 140.0);
+		const double centre = 90.0 + std::clamp(static_cast<double>(moon == sky->masser ? s.MasserNightPosition : s.SecundaNightPosition), -60.0, 60.0);
+		const double t = std::fmod(hour - dusk + 48.0, 24.0);
+		if (t < night)
+			angle = centre + arc * (t / night - 0.5);
+		else
+			angle = centre + arc * 0.5 + (360.0 - arc) * ((t - night) / (24.0 - night));
+	} else
 		return;
-	double angle = std::fmod(90.0 + speed * 60.0 * hours, 360.0);
+
+	angle = std::fmod(angle, 360.0);
 	if (angle < 0.0)
 		angle += 360.0;
 	moon->unkCC = static_cast<float>(angle);

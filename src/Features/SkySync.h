@@ -35,10 +35,22 @@ public:
 		int32_t MoonLightSource = 0;
 		int32_t SunPath = 0;
 		float CustomAngle = -35.0f;
-		/// (40d) Each moon's orbit angle follows the total game time instead of the engine's
-		/// per-frame accumulation (which counts a backwards time change as +24 h and throws
-		/// Secunda, 20% faster than Masser, to a random place on every time skip).
-		bool StableMoonOrbit = true;
+		/// (40e) Where the moons are placed (MoonOrbit values):
+		/// 0 Vanilla: the engine steps each orbit angle forward every frame (a backwards time change
+		///   counts as +24 h; Secunda, 20% faster than Masser, lands somewhere new on every skip).
+		/// 1 Stable (40d fix C): the angle follows whole days + the clock at each moon's own speed.
+		///   Masser is overhead at midnight; Secunda drifts 72 degrees a day (a 5-day cycle in
+		///   which it is up at night on about two nights).
+		/// 2 Night Sky (default): both moons are tied to the clock and stay up all night: they are
+		///   up at dusk, cross the sky slowly and set after dawn, Secunda a little ahead of Masser, a
+		///   fixed distance apart. Each day both pass below the horizon, so phases still change.
+		int32_t MoonOrbit = 2;
+		/// (40e) Night Sky: each moon's place on its orbit at the middle of the night, in degrees
+		/// from its highest point (negative = earlier, towards the side it rises on).
+		float MasserNightPosition = -15.0f;
+		float SecundaNightPosition = 15.0f;
+		/// (40e) Night Sky: degrees each moon moves along its orbit from dusk to dawn.
+		float NightArc = 80.0f;
 		/// (40d) Leave the moons where the game puts them: no altitude dip written into their
 		/// rotation (upstream 54962ef3b). Physical Sky then reads each moon's on-screen
 		/// direction (upstream b2d671ba8's idea), so its glow sits on the disc.
@@ -104,6 +116,14 @@ private:
 		None
 	};
 
+	enum class MoonOrbit : int32_t
+	{
+		Vanilla,
+		Stable,
+		NightSky,
+		Count
+	};
+
 	enum class SunPath : uint8_t
 	{
 		Southern,
@@ -115,6 +135,7 @@ private:
 
 	const char* MoonLightSourceNames[static_cast<uint8_t>(MoonLightSource::Count)] = { "Brightest", "Masser", "Secunda" };
 	const char* SunPathNames[static_cast<uint8_t>(SunPath::Count)] = { "Southern Sky", "Northern Sky", "Vanilla", "Custom" };
+	const char* MoonOrbitNames[static_cast<int32_t>(MoonOrbit::Count)] = { "Vanilla", "Stable", "Night Sky" };
 
 	struct ClimateTimings
 	{
@@ -220,9 +241,10 @@ private:
 
 	static void SetSunBaseVisibility(const RE::Sun* sun, float visibility);
 
-	/// (40d) Writes the orbit angle (Moon+0xCC) from the total game hours and sets the last
-	/// hour (+0xD0) to the current hour, so the engine's own update adds nothing. SE 1.5.97 only.
-	static void SetStableMoonAngle(RE::Moon* moon, const RE::Sky* sky);
+	/// (40d, 40e) Writes the orbit angle (Moon+0xCC) for the Stable or Night Sky orbit and sets
+	/// the last hour (+0xD0) to the current hour, so the engine's own update adds nothing.
+	/// SE 1.5.97 only.
+	static void SetMoonAngle(RE::Moon* moon, const RE::Sky* sky);
 
 public:
 	/// (40d) Brightness factor of the moon's current phase picture (new 0.05 .. full 1), read

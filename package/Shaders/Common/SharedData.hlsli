@@ -556,6 +556,11 @@ namespace SharedData
 
 		float LodTreeCoverage;    // FlagLodTrees: cap on snow on distant (billboard) trees
 		float TrailRim;           // height of a print's pushed-up rim, relative to its depth
+		// (40e) pad1.x = SnowSmoothing (FlagCoverageSlope: how far snow flattens the material's relief),
+		// pad1.y = SteepCover (FlagCoverageSlope: cover on roofs and slopes). Read through
+		// DynamicSnow::SnowSmoothing() / SteepCover(). The member keeps its old name so the
+		// cbuffer's reflection data, and with it every shader that does not read them, stays
+		// byte-identical.
 		float2 pad1;
 	};
 

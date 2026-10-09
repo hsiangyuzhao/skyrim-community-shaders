@@ -70,6 +70,8 @@ namespace Permutation
 		static const uint IsActorGeometry = (1 << 11);  // (batch 39b) actor / creature / worn or carried gear (Lighting)
 		static const uint IsMoon = (1 << 12);           // (40d) Masser's or Secunda's disc, "Moon Physical Brightness" on (Sky)
 		static const uint IsSecunda = (1 << 13);        // (40d) with IsMoon: the disc is Secunda's (Sky)
+		// (1 << 14) IsActorRigid (40e): defined as DynamicSnow::ExtraIsActorRigid, not here; a new
+		// constant in this namespace changes fxc's register allocation in unrelated permutations.
 	}
 
 	namespace ExtraFeatureFlags

@@ -221,7 +221,12 @@ public:
 		// (40d) Set per draw by PhysicalSky's sky hook on Masser's / Secunda's disc (not the star
 		// mask) while "Moon Physical Brightness" is on; IsSecunda picks the second moon's scale.
 		IsMoon = 1 << 12,
-		IsSecunda = 1 << 13
+		IsSecunda = 1 << 13,
+		// (40e) Set with IsActorGeometry by the BSLightingShader::SetupGeometry hook in Hooks.cpp when
+		// the geometry has no skin instance (shield, weapon, quiver, helmet): rigid gear hanging off a
+		// bone. Its model space is its own, not the actor's, so Dynamic Snow takes its slope from the
+		// world normal instead of the pre-skinning one.
+		IsActorRigid = 1 << 14
 	};
 
 	enum class ExtraFeatureDescriptors : uint32_t
