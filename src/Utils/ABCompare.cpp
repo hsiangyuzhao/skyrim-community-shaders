@@ -181,6 +181,8 @@ namespace ABCompare
 		{
 			if (!globals::menu->GetSettings().ABComparePersist || writtenVersion == slotsVersion)
 				return;
+			if (!slotA.stored && !slotB.stored)
+				return;  // never replace slots kept from an earlier session with nothing
 			writtenVersion = slotsVersion;
 			const auto path = FilePath();
 			try {
@@ -680,7 +682,10 @@ namespace ABCompare
 			ImGui::TextUnformatted("Switch key:");
 			ImGui::SameLine();
 			if (capturingKey) {
-				ImGui::TextUnformatted("press a key (Esc cancels)...");
+				ImGui::TextUnformatted("press a key...");
+				ImGui::SameLine();
+				if (ImGui::SmallButton("Cancel"))
+					capturingKey = false;
 			} else {
 				ImGui::TextColored(theme.StatusPalette.CurrentHotkey, "%s", KeyName(settings.ABCompareKey).c_str());
 				ImGui::SameLine();
