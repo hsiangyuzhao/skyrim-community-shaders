@@ -14,6 +14,7 @@
 #include "State.h"
 #include "Util.h"
 #include "Utils/ABCompare.h"
+#include "Utils/DisplayHDRInfo.h"
 
 #include "Features/PerformanceOverlay.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
@@ -33,6 +34,9 @@ void OverlayRenderer::RenderOverlay(
 	// (41a) A queued A/B Compare switch runs here: this frame has been rendered, the next has not
 	// started, and no ImGui frame (so no settings widget) is open yet.
 	ABCompare::ProcessPending();
+
+	// (42c) Display / HDR diagnostics: logged at startup and on a display change (read-only).
+	DisplayHDRInfo::Tick();
 
 	if (globals::features::vr.IsOpenVRCompatible()) {
 		globals::features::vr.ProcessControllerInputForImGui();

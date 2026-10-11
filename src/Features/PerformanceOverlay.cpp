@@ -32,6 +32,7 @@
 #include "BuildLabel.h"
 #include "Utils/ABCompare.h"
 #include "Utils/Batch39Engine.h"
+#include "Utils/DisplayHDRInfo.h"
 #include "Utils/FileSystem.h"
 #include "Utils/Format.h"
 #include "Utils/DenoiserTimers.h"
@@ -4121,6 +4122,7 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 		m["plugin_version"] = Util::GetFormattedVersion(Plugin::VERSION);
 		m["build"] = BuildLabel::kBuild;
 		m["ab_compare"] = ABCompare::GetMetaJson();
+		m["display_hdr"] = DisplayHDRInfo::GetMetaJson();  // (42c) native HDR phase 0, read-only
 		m["game_version"] = Util::GetFormattedVersion(REL::Module::get().version());
 		m["frozen"] = view.frozen;
 		m["values"] = cfg.showLive ? "live" : (cfg.smooth == PerfView::SmoothMode::Off ? "unsmoothed" : "smoothed");

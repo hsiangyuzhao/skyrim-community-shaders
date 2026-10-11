@@ -22,6 +22,7 @@
 #include "Features/SubsurfaceScattering.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/DisplayHDRInfo.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Upscaling::NeuralRenderingSettings,
@@ -809,6 +810,9 @@ void Upscaling::DrawSettings()
 			slSorters);
 		ImGui::TreePop();
 	}
+
+	// (42c) Native HDR phase 0: read-only display / swap-chain diagnostics.
+	DisplayHDRInfo::DrawSettings();
 }
 
 void Upscaling::SaveSettingsValues(json& o_json) const
