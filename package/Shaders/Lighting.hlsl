@@ -984,6 +984,29 @@ float GetSnowParameterY(float texProjTmp, float alpha)
 
 #	if defined(WETNESS_EFFECTS)
 #		include "WetnessEffects/WetnessEffects.hlsli"
+
+// (42c) Character wetness (Wetness Effects > Characters). Permutations that can draw a
+// character: skin and hair by technique, anything else only when Hooks.cpp flags the draw as
+// actor geometry (SKINNED never reaches a pixel shader). Eyes, terrain and LOD never do, so
+// their code is untouched.
+#		if !defined(EYE) && !defined(LANDSCAPE) && !defined(LODLANDSCAPE) && !defined(LOD) && !defined(LOD_LAND_BLEND)
+#			define WET_CHARACTER_PERM
+#		endif
+
+// Clear-coat style water film: GGX with water's F0 and a fixed roughness. Caller scales by the
+// film weight; the base layer is attenuated separately.
+float3 GetWetFilmSpecular(float3 N, float3 V, float3 L, float3 lightColor, float roughness)
+{
+	float3 H = normalize(V + L);
+	float NdotL = saturate(dot(N, L));
+	float NdotV = saturate(abs(dot(N, V)) + 1e-5);
+	float NdotH = saturate(dot(N, H));
+	float VdotH = saturate(dot(V, H));
+	float D = BRDF::D_GGX(roughness, NdotH);
+	float Vis = BRDF::Vis_SmithJointApprox(roughness, NdotV, max(NdotL, 1e-5));
+	float F = BRDF::F_Schlick(0.02.xxx, VdotH).x;
+	return (D * Vis * F * NdotL) * lightColor;
+}
 #	endif
 
 // (batch 39, items 5-6) Surfaces that take accumulated snow and footprints: world geometry
@@ -2168,7 +2191,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float2 wetUV = uv * SharedData::skinData.skinDetailParams.y;
 #		endif
 	float2 dynamicWet = Skin::GetWetness(input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z, worldNormal.xyz);
-	float skinWetness = Skin::PerlinNoise(wetUV, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z, clamp(dynamicWet.x + dynamicWet.y + SharedData::skinData.skinParams2.y, 0.f, 2.f) * (hasSkinWetness ? 1.0 : 0.5));
+	float skinFilmStrength = clamp(dynamicWet.x + dynamicWet.y + SharedData::skinData.skinParams2.y, 0.f, 2.f) * (hasSkinWetness ? 1.0 : 0.5);
+	// (42c, 4.3) Rain feeds the same film as swimming and sweat: its share of the strength is
+	// remembered so the sky occlusion can be applied to it later (the probes are sampled after
+	// the normal is final) and so it never raises the G-buffer gloss.
+	float skinRainStrength = 0.0;
+#		if defined(WETNESS_EFFECTS)
+	if (SharedData::wetnessEffectsSettings.EnableRainSkinFilm && inWorld)
+		skinRainStrength = saturate(SharedData::wetnessEffectsSettings.SkinWetness * SharedData::wetnessEffectsSettings.Wetness);
+#		endif
+	const float skinRainShare = skinRainStrength / max(skinFilmStrength + skinRainStrength, 1e-4);
+	float skinWetness = Skin::PerlinNoise(wetUV, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z, min(skinFilmStrength + skinRainStrength, 2.f));
 	if ((SharedData::skinData.skinDetailParams.w > 0.0f || skinWetness > 0.0f) && skinEnabled) {
 #		if defined(FACEGEN)
 		float2 detailUV = input.TexCoord0.xy * SharedData::skinData.skinDetailParams.x;
@@ -2946,7 +2979,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float averageRoughness = lerp(skinSurfaceProperties.RoughnessPrimary, skinSurfaceProperties.RoughnessSecondary, skinSurfaceProperties.SecondarySpecIntensity);
 
 	float pbrWeight = 1;
-	float pbrGlossiness = lerp(1 - averageRoughness, 1 - WATER_ROUGHNESS, saturate(Skin::GetWetnessOpticalResponse(skinSurfaceProperties.Wetness) * skinSurfaceProperties.WetnessFilmStrength));
+	// (42c) The rain part of the film (skinRainShare, 0 unless "Rain Wets Advanced Skin") is
+	// left out of the G-buffer gloss: SSRT/NRD see the same roughness as before 42c.
+	float pbrGlossiness = lerp(1 - averageRoughness, 1 - WATER_ROUGHNESS, saturate(Skin::GetWetnessOpticalResponse(skinSurfaceProperties.Wetness) * skinSurfaceProperties.WetnessFilmStrength) * (1.0 - skinRainShare));
 #	endif  // CS_SKIN
 
 	float porosity = 1.0;
@@ -2975,6 +3010,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float wetness = 0.0;
 	float3 wetnessSpecular = 0.0;
 	float3 wetnessNormal = worldNormal;
+
+	// (42c) Is this pixel a character (skin, hair, or anything an actor wears or carries)?
+	// Every 42c change below is gated on it, so world surfaces keep the old wetness exactly.
+#		if defined(WET_CHARACTER_PERM)
+#			if defined(SKIN) || defined(HAIR)
+	const bool wetCharacter = true;
+#			else
+	const bool wetCharacter = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsActorGeometry) != 0;
+#			endif
+#		else
+	const bool wetCharacter = false;
+#		endif
 
 	// Calculate shore wetness factors
 	float wetnessDistToWater = abs(input.WorldPosition.z - waterHeight);
@@ -3056,6 +3103,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (input.WorldPosition.z < waterHeight) {
 		wetnessGlossinessSpecular *= shoreFactor;
 	}
+	// (42c, 4.4, always on) Characters: wetness above 1 (up-facing gear reaches ~1.05) made the
+	// highlight stronger than the light (x w > 1) and pushed the G-buffer gloss past 1.
+	if (wetCharacter)
+		wetnessGlossinessSpecular = saturate(wetnessGlossinessSpecular);
 
 	// Update flatness and normal calculations
 	flatnessAmount *= smoothstep(SharedData::wetnessEffectsSettings.PuddleMinWetness, 1.0, wetnessGlossinessSpecular);
@@ -3065,6 +3116,79 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	wetnessNormal = WetnessEffects::ReorientNormal(rippleNormal, wetnessNormal);
 
 	waterRoughnessSpecular = 1.0 - wetnessGlossinessSpecular;
+	// (42c, 4.4, always on) Characters: a fully wet surface had roughness 0, a highlight too
+	// small to see (and a 0/0 at its centre). Same 0.05 floor as upstream.
+	if (wetCharacter)
+		waterRoughnessSpecular = max(waterRoughnessSpecular, 0.05);
+
+	// (42c) Character wetness: 4.3 occlusion for the rain-fed skin film, 4.2 darkening, 4.1 film.
+#		if defined(SKIN) && defined(CS_SKIN)
+	// 4.3: the rain share of the Advanced Skin film follows the same sky occlusion as the rest
+	// of Wetness Effects (a character under a roof is not rained on).
+	skinSurfaceProperties.Wetness *= lerp(1.0, saturate(wetnessOcclusion * nearFactor), skinRainShare);
+#		endif
+
+#		if defined(WET_CHARACTER_PERM)
+	// 4.2: darken here, before any light is evaluated and before the skin takes its albedo,
+	// so the sun, ambient, SSGI (G-buffer albedo) and SSS all see the wet colour. The face
+	// (FACEGEN) is included, so face and body match. Wet albedo of a fully soaked porous
+	// material: A / (n^2 - (n^2 - 1) A) with n = 1.33 (Twomey et al. 1986), per channel, which
+	// darkens dark colours relatively more and saturates slightly. Porosity scales the step
+	// (1 = fully absorbent, about a third darker at A = 0.4).
+	const bool wetDarkenNew = wetCharacter && SharedData::wetnessEffectsSettings.EnableWetDarkening;
+	[branch] if (wetDarkenNew)
+	{
+		float wetDarkenWetness = saturate(max(puddle, shoreFactorAlbedo * SharedData::wetnessEffectsSettings.MaxShoreWetness));
+#			if defined(SKIN) && defined(CS_SKIN)
+		if (skinEnabled)
+			wetDarkenWetness = max(wetDarkenWetness, skinSurfaceProperties.Wetness);
+#			endif
+#			if defined(SKIN)
+		float wetPorosity = SharedData::wetnessEffectsSettings.PorositySkin;
+#			elif defined(HAIR)
+		float wetPorosity = SharedData::wetnessEffectsSettings.PorosityOther;
+#			else
+		float wetMetalness = 0.0;
+#				if defined(TRUE_PBR)
+		wetMetalness = ((PBRFlags & PBR::Flags::TwoLayer) != 0) ? 1.0 : saturate(sqrt(pbrSurfaceProperties.Metallic));
+#				elif defined(ENVMAP) || defined(MULTI_LAYER_PARALLAX)
+		wetMetalness = saturate(sqrt(envMask));
+#				endif
+		float wetPorosity = lerp(SharedData::wetnessEffectsSettings.PorosityCloth, SharedData::wetnessEffectsSettings.PorosityMetal, wetMetalness);
+#			endif
+#			if defined(DYNAMIC_SNOW_SURFACE)
+		wetPorosity *= 1.0 - dynamicSnowCoverage;  // snow lies on top of the wet surface
+#			endif
+		// Darkening shows as soon as the surface layer is damp, well before it is soaked.
+		const float wetDarkenAmount = wetPorosity * sqrt(wetDarkenWetness);
+		const float3 wetAlbedo = baseColor.xyz / (1.77 - 0.77 * saturate(baseColor.xyz));
+		baseColor.xyz = max(lerp(baseColor.xyz, wetAlbedo, wetDarkenAmount), 0.0);
+#			if defined(SKIN) && defined(CS_SKIN)
+		skinSurfaceProperties.Albedo = baseColor.xyz;
+#			endif
+	}
+#		endif
+
+	// 4.1: film weight = wetness (once, clamped), times the strength slider. On skin with
+	// Advanced Skin the film replaces the Advanced Skin direct film (rain and swimming merged
+	// with max, so they never stack); elsewhere it replaces the old "rougher when drier,
+	// then x wetness" lobe.
+	const bool wetFilm = wetCharacter && SharedData::wetnessEffectsSettings.EnableWetFilm;
+	const float wetFilmRoughness = SharedData::wetnessEffectsSettings.WetFilmRoughness;
+	const float wetFilmWeight = saturate(wetnessGlossinessSpecular);
+	float3 wetFilmSpecular = 0.0;
+#		if defined(SKIN) && defined(CS_SKIN)
+	const bool wetFilmInSkin = wetFilm && skinEnabled;
+	if (wetFilmInSkin) {
+		skinSurfaceProperties.WetFilmRoughness = wetFilmRoughness;
+		skinSurfaceProperties.WetFilmEnergy = saturate(max(wetFilmWeight, Skin::GetWetnessOpticalResponse(skinSurfaceProperties.Wetness) * max(skinSurfaceProperties.WetnessFilmStrength, 0.0))) * SharedData::wetnessEffectsSettings.WetFilmStrength;
+	}
+#		else
+	const bool wetFilmInSkin = false;
+#		endif
+	// Film handled here (not inside the Advanced Skin BRDF), and its weight.
+	const bool wetFilmGeneric = wetFilm && !wetFilmInSkin && wetFilmWeight > 0.0;
+	const float wetFilmEnergy = wetFilmWeight * SharedData::wetnessEffectsSettings.WetFilmStrength;
 #	endif
 
 	float llDirLightMult = SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear && (inWorld || inReflection) && !SharedData::InInterior ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
@@ -3195,7 +3319,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		lodLandDiffuseColor += dirLightColor / Math::PI * saturate(dirLightAngle) * dirLightColorMultiplier * dirDetailShadow * parallaxShadow;
 #		endif
 #		if defined(WETNESS_EFFECTS)
-		if (waterRoughnessSpecular < 1.0)
+		if (wetFilmGeneric)
+			wetFilmSpecular += GetWetFilmSpecular(wetnessNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, wetFilmRoughness);
+		else if (waterRoughnessSpecular < 1.0 && !wetFilm)
 			specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
 #		endif
 	}
@@ -3216,7 +3342,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		transmissionColor += min(sssTransmittance * lightProperties.LightColor * skinSurfaceProperties.Albedo, dirLightColor * dirLightColorMultiplier);
 		specularColorPBR += dirSpecularColor * !SharedData::InInterior;
 #		if defined(WETNESS_EFFECTS)
-		if (waterRoughnessSpecular < 1.0)
+		// (42c) With the film on, the Advanced Skin BRDF above already drew it.
+		if (waterRoughnessSpecular < 1.0 && !wetFilmInSkin && skinRainStrength <= 0.0)
 			specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
 #		endif
 	} else {
@@ -3231,7 +3358,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		lightsDiffuseColor += dirDiffuseColor;
 
 #		if defined(WETNESS_EFFECTS)
-		if (waterRoughnessSpecular < 1.0)
+		if (wetFilmGeneric)
+			wetFilmSpecular += GetWetFilmSpecular(wetnessNormal, viewDirection, DirLightDirection, dirLightColor * dirDetailShadow, wetFilmRoughness);
+		else if (waterRoughnessSpecular < 1.0 && !wetFilm)
 			wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, DirLightDirection, viewDirection, dirLightColor * dirDetailShadow, waterRoughnessSpecular);
 #		endif
 	}
@@ -3278,7 +3407,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	lightsDiffuseColor += dirDiffuseColor;
 
 #		if defined(WETNESS_EFFECTS)
-	if (waterRoughnessSpecular < 1.0)
+	if (wetFilmGeneric)
+		wetFilmSpecular += GetWetFilmSpecular(wetnessNormal, viewDirection, DirLightDirection, dirLightColor * dirDetailShadow, wetFilmRoughness);
+	else if (waterRoughnessSpecular < 1.0 && !wetFilm)
 		wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, DirLightDirection, viewDirection, dirLightColor * dirDetailShadow, waterRoughnessSpecular);
 #		endif
 #	endif
@@ -3513,7 +3644,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			transmissionColor += pointTransmissionColor;
 			specularColorPBR += pointSpecularColor;
 #				if defined(WETNESS_EFFECTS)
-			if (waterRoughnessSpecular < 1.0)
+			if (wetFilmGeneric)
+				wetFilmSpecular += GetWetFilmSpecular(wetnessNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, wetFilmRoughness);
+			else if (waterRoughnessSpecular < 1.0 && !wetFilm)
 				specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
 #				endif
 		}
@@ -3534,7 +3667,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			transmissionColor += min(sssTransmittance * lightProperties.LightColor * skinSurfaceProperties.Albedo, lightProperties.LightColor);
 			specularColorPBR += pointSpecularColor;
 #				if defined(WETNESS_EFFECTS)
-			if (waterRoughnessSpecular < 1.0)
+			if (waterRoughnessSpecular < 1.0 && !wetFilmInSkin && skinRainStrength <= 0.0)
 				specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
 #				endif
 		} else {
@@ -3587,11 +3720,33 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			endif
 
 #			if defined(WETNESS_EFFECTS)
-		if (waterRoughnessSpecular < 1.0)
-			wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, normalizedLightDirection, viewDirection, lightColor, waterRoughnessSpecular);
+#				if !defined(TRUE_PBR)
+		if (wetFilmGeneric)
+			wetFilmSpecular += GetWetFilmSpecular(wetnessNormal, viewDirection, normalizedLightDirection, lightColor, wetFilmRoughness);
+		else
+#				endif
+			if (waterRoughnessSpecular < 1.0 && !wetFilm)
+				wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, normalizedLightDirection, viewDirection, lightColor, waterRoughnessSpecular);
 #			endif
 	}
 #		endif
+#	endif
+
+#	if defined(WETNESS_EFFECTS)
+	// (42c, 4.1) Energy conservation for the film: what the water reflects never reaches the
+	// surface below. One view-angle Fresnel for all direct light (F0 = 0.02, so ~2% facing the
+	// camera, more at the silhouette). Advanced Skin does this per light inside its BRDF.
+	[branch] if (wetFilmGeneric)
+	{
+		const float wetFilmBaseScale = 1.0 - saturate(wetFilmEnergy) * BRDF::F_Schlick(0.02.xxx, saturate(abs(dot(wetnessNormal, viewDirection)) + 1e-5)).x;
+		lightsDiffuseColor *= wetFilmBaseScale;
+		lightsSpecularColor *= wetFilmBaseScale;
+#		if defined(TRUE_PBR)
+		coatLightsDiffuseColor *= wetFilmBaseScale;
+		specularColorPBR *= wetFilmBaseScale;
+		specularColorPBR += wetFilmSpecular * wetFilmEnergy;
+#		endif
+	}
 #	endif
 
 	diffuseColor += lightsDiffuseColor;
@@ -3762,6 +3917,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #	if defined(WETNESS_EFFECTS)
 #		if !(defined(FACEGEN) || defined(FACEGEN_RGB_TINT) || defined(EYE)) || defined(TREE_ANIM)
+#			if defined(WET_CHARACTER_PERM)
+	// (42c) Characters with "Wet Darkening" on were darkened before lighting (4.2).
+	[branch] if (!wetDarkenNew)
+#			endif
+	{
 #			if defined(TRUE_PBR)
 #				if !defined(LANDSCAPE)
 	[branch] if ((PBRFlags & PBR::Flags::TwoLayer) != 0)
@@ -3778,6 +3938,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			endif
 	float wetnessDarkeningAmount = porosity * wetnessGlossinessAlbedo;
 	baseColor.xyz = lerp(baseColor.xyz, pow(abs(baseColor.xyz), 1.0 + wetnessDarkeningAmount), 0.5);
+	}
 #		endif
 
 #		if defined(DYNAMIC_CUBEMAPS)
@@ -3896,7 +4057,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		Skin::SkinIndirectLobeWeights(indirectDiffuseLobeWeight, indirectSpecularLobeWeight, skinSurfaceProperties, originalWorldNormal, viewDirection, vertexNormal, wetWorldNormal);
 
 #		if defined(WETNESS_EFFECTS)
-		if (waterRoughnessSpecular < 1.0)
+		// (42c, 4.3) While rain feeds the Advanced Skin film, its indirect lobe (above) already
+		// carries the rain; adding this one too would count the same water twice.
+		if (waterRoughnessSpecular < 1.0 && skinRainStrength <= 0.0)
 			indirectSpecularLobeWeight += PBR::GetWetnessIndirectSpecularLobeWeight(wetnessNormal, viewDirection, vertexNormal, waterRoughnessSpecular) * wetnessGlossinessSpecular;
 #		endif
 
@@ -4065,6 +4228,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (skinEnabled) {
 		specularColor = specularColorPBR;
 	}
+#	endif
+
+#	if defined(WETNESS_EFFECTS) && !defined(TRUE_PBR)
+	// (42c, 4.1) The water film on top of everything else (True PBR added it to its own
+	// specular before the PBR scale). Not gated by the material's gloss or specular maps.
+	if (wetFilmGeneric)
+		specularColor += wetFilmSpecular * wetFilmEnergy;
 #	endif
 
 	float3 outputAlbedo = baseColor.xyz * vertexColor;

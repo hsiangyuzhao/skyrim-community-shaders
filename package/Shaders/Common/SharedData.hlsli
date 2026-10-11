@@ -158,7 +158,17 @@ namespace SharedData
 		float RippleRadius;
 		float RippleBreadth;
 		float RippleLifetimeRcp;
-		float pad0;
+		uint EnableWetFilm;  // (42c) character wetness, see WetnessEffects.h
+
+		float WetFilmRoughness;
+		float WetFilmStrength;
+		uint EnableWetDarkening;
+		float PorositySkin;
+
+		float PorosityCloth;
+		float PorosityMetal;
+		float PorosityOther;
+		uint EnableRainSkinFilm;
 	};
 
 	struct SkylightingSettings

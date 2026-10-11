@@ -41,6 +41,11 @@ namespace Skin
 		float FuzzWeight;
 		float Wetness;
 		float WetnessFilmStrength;
+		// (42c, Wetness Effects "Wet Film Highlight") Direct-light water film override.
+		// WetFilmEnergy < 0 keeps the original film (WATER_ROUGHNESS, energy from Wetness and
+		// WetnessFilmStrength). The indirect lobe never reads these two.
+		float WetFilmRoughness;
+		float WetFilmEnergy;
 	};
 
 	SkinSurfaceProperties InitSkinSurfaceProperties()
@@ -60,6 +65,8 @@ namespace Skin
 		skin.FuzzWeight = 0.0;
 		skin.Wetness = 0.0;
 		skin.WetnessFilmStrength = 1.0;
+		skin.WetFilmRoughness = WATER_ROUGHNESS;
+		skin.WetFilmEnergy = -1.0;
 		return skin;
 	}
 
@@ -188,16 +195,19 @@ namespace Skin
 			specular += fuzzSpecular * skin.FuzzWeight;
 		}
 
-		if (skin.Wetness > 0.0) {
-			const float wetnessAmount = GetWetnessOpticalResponse(skin.Wetness);
-			const float wetnessEnergy = wetnessAmount * max(skin.WetnessFilmStrength, 0.0f);
+		// (42c) WetFilmEnergy >= 0: the Wetness Effects film (rain and swimming merged with
+		// max, its own roughness); otherwise the original Advanced Skin film.
+		const bool wetFilmOverride = skin.WetFilmEnergy >= 0.0;
+		if (wetFilmOverride ? (skin.WetFilmEnergy > 0.0) : (skin.Wetness > 0.0)) {
+			const float wetnessEnergy = wetFilmOverride ? skin.WetFilmEnergy : GetWetnessOpticalResponse(skin.Wetness) * max(skin.WetnessFilmStrength, 0.0f);
+			const float wetRoughness = wetFilmOverride ? skin.WetFilmRoughness : WATER_ROUGHNESS;
 			float3 wetnessF;
 			float WNdotL = clamp(dot(WN, L), 1e-5, 1.0);
 			float WNdotV = saturate(abs(dot(WN, V)) + 1e-5);
 			float WNdotH = saturate(dot(WN, H));
 
-			float3 wetSpecular = PBR::GetSpecularDirectLightMultiplierMicrofacet(WATER_ROUGHNESS, WATER_F0, WNdotL, WNdotV, WNdotH, oVdotH, wetnessF) * light.LightColor * WNdotL;
-			float2 wetSpecularBRDF = BRDF::EnvBRDFApproxLazarov(WATER_ROUGHNESS, WNdotV);
+			float3 wetSpecular = PBR::GetSpecularDirectLightMultiplierMicrofacet(wetRoughness, WATER_F0, WNdotL, WNdotV, WNdotH, oVdotH, wetnessF) * light.LightColor * WNdotL;
+			float2 wetSpecularBRDF = BRDF::EnvBRDFApproxLazarov(wetRoughness, WNdotV);
 			wetSpecular *= 1 + WATER_F0 * (1 / (wetSpecularBRDF.x + wetSpecularBRDF.y) - 1);
 			const float waterTransmission = lerp(1.0, 1.0 - wetnessF.x, saturate(wetnessEnergy));
 			specular *= waterTransmission;

@@ -59,6 +59,20 @@ public:
 		float RippleRadius = 1.f;
 		float RippleBreadth = .5f;
 		float RippleLifetime = .5f;
+
+		// (42c) Character wetness. Each switch applies to characters only: skin, hair,
+		// and whatever an actor wears or carries (IsActorGeometry). World surfaces keep
+		// the old model. With all three switches off the characters look as before
+		// (apart from the always-on numeric fixes, 4.4).
+		uint EnableWetFilm = true;       // 4.1 clear-coat water lobe on direct light
+		float WetFilmRoughness = 0.2f;   // 4.1 fixed film roughness (was 1 - wetness)
+		float WetFilmStrength = 1.0f;    // 4.1 film multiplier, 1 = physical
+		uint EnableWetDarkening = true;  // 4.2 darkening before the skin takes its albedo, face included
+		float PorositySkin = 0.6f;       // 4.2 how far each material darkens when soaked
+		float PorosityCloth = 1.0f;      //     cloth / leather (non-metal gear)
+		float PorosityMetal = 0.0f;      //     metal (metallic / env-mapped gear)
+		float PorosityOther = 0.8f;      //     hair, fur
+		uint EnableRainSkinFilm = true;  // 4.3 rain feeds the Advanced Skin wet film
 	};
 
 	struct alignas(16) PerFrame
@@ -68,8 +82,7 @@ public:
 		float Raining;
 		float Wetness;
 		float PuddleWetness;
-		Settings settings;
-		uint pad0;
+		Settings settings;  // 36 x 4 bytes: the (42c) fields took the old pad0
 	};
 	STATIC_ASSERT_ALIGNAS_16(PerFrame);
 

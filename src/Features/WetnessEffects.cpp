@@ -30,7 +30,16 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	RippleStrength,
 	RippleRadius,
 	RippleBreadth,
-	RippleLifetime)
+	RippleLifetime,
+	EnableWetFilm,
+	WetFilmRoughness,
+	WetFilmStrength,
+	EnableWetDarkening,
+	PorositySkin,
+	PorosityCloth,
+	PorosityMetal,
+	PorosityOther,
+	EnableRainSkinFilm)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	WetnessEffects::DebugSettings,
@@ -337,6 +346,49 @@ void WetnessEffects::DrawSettings()
 		ImGui::SliderFloat("Shore Wetness", &settings.MaxShoreWetness, 0.0f, 1.0f);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("How wet surfaces get near water (shores, rivers). See Shore Range below.");
+		ImGui::TreePop();
+	}
+
+	ImGui::Spacing();
+	ImGui::Spacing();
+
+	// (42c) Character wetness: skin, hair and everything an actor wears or carries.
+	if (ImGui::TreeNodeEx("Characters", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::Checkbox("Wet Film Highlight", (bool*)&settings.EnableWetFilm);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			Util::DrawMultiLineTooltip({ "A thin layer of water on top of skin, hair and gear: a soft, clearly visible sheen in sunlight.",
+				"Off: the old wet highlight, which gets smaller and sharper the wetter a character is and is nearly invisible in sun.",
+				"Direct light only; reflections, SSR/SSGI inputs and the G-buffer are not changed." });
+		}
+		ImGui::BeginDisabled(!settings.EnableWetFilm);
+		ImGui::SliderFloat("Film Roughness", &settings.WetFilmRoughness, 0.08f, 0.4f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Lower = smaller, sharper highlight (can sparkle under DLSS). Higher = broader, softer sheen.");
+		ImGui::SliderFloat("Film Strength", &settings.WetFilmStrength, 0.0f, 3.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("1.0 = physically based water. Raise only if you want an exaggerated wet look.");
+		ImGui::EndDisabled();
+
+		ImGui::Checkbox("Wet Darkening", (bool*)&settings.EnableWetDarkening);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			Util::DrawMultiLineTooltip({ "Wet materials get darker and a little more saturated. Applied before lighting, so sun, ambient, SSGI and skin SSS all see it.",
+				"Face and body darken together (no neck seam).",
+				"Off: the old darkening (skin and face never darkened)." });
+		}
+		ImGui::BeginDisabled(!settings.EnableWetDarkening);
+		ImGui::SliderFloat("Porosity: Skin", &settings.PorositySkin, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		ImGui::SliderFloat("Porosity: Cloth / Leather", &settings.PorosityCloth, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		ImGui::SliderFloat("Porosity: Metal", &settings.PorosityMetal, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		ImGui::SliderFloat("Porosity: Other (hair, fur)", &settings.PorosityOther, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("How much each material darkens when soaked. 1.0 = a fully absorbent material (about a third darker); 0 = no change.");
+		ImGui::EndDisabled();
+
+		ImGui::Checkbox("Rain Wets Advanced Skin", (bool*)&settings.EnableRainSkinFilm);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			Util::DrawMultiLineTooltip({ "Rain also drives the Advanced Skin water film (its rivulet normals and the softer subsurface glow), not only swimming and sweat.",
+				"Needs Advanced Skin enabled. Off: rain only uses the generic wet highlight on skin." });
+		}
 		ImGui::TreePop();
 	}
 
@@ -804,6 +856,15 @@ WetnessEffects::PerFrame WetnessEffects::GetCommonBufferData() const
 	data.settings.RaindropGridSize = 1.0f / settings.RaindropGridSize;
 	data.settings.RaindropInterval = 1.0f / settings.RaindropInterval;
 	data.settings.RippleLifetime = settings.RaindropInterval / settings.RippleLifetime;
+
+	// (42c) Keep hand-edited JSON inside the ranges the shader assumes (the 0.05 floor is
+	// the same one the always-on numeric fix uses).
+	data.settings.WetFilmRoughness = std::clamp(settings.WetFilmRoughness, 0.05f, 1.0f);
+	data.settings.WetFilmStrength = std::clamp(settings.WetFilmStrength, 0.0f, 3.0f);
+	data.settings.PorositySkin = std::clamp(settings.PorositySkin, 0.0f, 2.0f);
+	data.settings.PorosityCloth = std::clamp(settings.PorosityCloth, 0.0f, 2.0f);
+	data.settings.PorosityMetal = std::clamp(settings.PorosityMetal, 0.0f, 2.0f);
+	data.settings.PorosityOther = std::clamp(settings.PorosityOther, 0.0f, 2.0f);
 
 	return data;
 }
