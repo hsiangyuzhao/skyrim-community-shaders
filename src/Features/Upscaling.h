@@ -129,7 +129,9 @@ public:
 		// Run on the HDR scene at render resolution, before DLSS upscales it, instead of on the
 		// finished output-resolution image. Default off = 37c's place in the frame.
 		bool runBeforeUpscaling = false;
-		// The network's working resolution as a percentage of its input: 100, 75 or 50. Cost falls
+		// (batch 42a) Before upscaling only now; after upscaling has modelResolutionPercentAfter.
+		// The network's working resolution as a percentage of its input: 100, 67, 50 or 40 (a 75
+		// saved by 38c-41b reads as 67). Cost falls
 		// roughly with the pixel count. (batch 38c) Our own downscale: the DLL ignores
 		// DLSSNR.ScalingRatio, which is what 38a relied on. Only the network's edit is carried back
 		// up (depth-aware); the frame's own detail stays full resolution.
@@ -152,6 +154,20 @@ public:
 		// Give the model its tuning (intensity, strengths, style...) when the feature is created:
 		// it reads them only then. 38a set them per frame only, where they were ignored.
 		bool tuningAtCreate = true;
+		// (batch 42a) Model resolution after upscaling, separate from the before-upscaling one above
+		// (modelResolutionPercent): 40, 50, 67 or 100. 67 is exactly 2/3 (2560x1440 on a 4K frame,
+		// the same network size as Quality before upscaling). Default 50: the network reads 1920x1080
+		// of the finished 4K image, about a quarter of the full-size cost.
+		uint modelResolutionPercentAfter = 50;
+		// (batch 42a) How the network's edit is carried back up below 100%: 0 = additive (41b),
+		// 1 = log-ratio split (a smooth, depth- and colour-guided lighting part plus detail only
+		// where the small and the full image agree). FinalizeCS.hlsl.
+		uint residualMode = 1;
+		// (batch 42a, experimental) Hand the network a DLSSNR.ControlMask marking the sky (depth at
+		// the far plane, so the moons too). What the mask's values mean is undocumented, hence the
+		// polarity: maskSkyValue is the value written for sky texels (the rest get the other one).
+		bool protectSky = false;
+		uint maskSkyValue = 1;
 	};
 
 	struct Settings

@@ -4,6 +4,7 @@
 // list of changes made during the port.
 #include "Runtime.h"
 
+#include "Integration.h"
 #include "Util.h"
 
 #include <Windows.h>
@@ -149,6 +150,33 @@ namespace NeuralRendering
 			bool installed_ = false;
 		};
 
+		// (batch 42a) NGX results that have a known cause outside our code, as a hint for the log.
+		const char* NgxResultHint(std::uint32_t result)
+		{
+			// DLSS5oneclick v0.13.0: a second Neural Rendering user in the same process makes the second
+			// CreateFeature(18) fail with this. In Skyrim that is a RenoDX DLSS 5 add-on or an OptiScaler
+			// NR build left in the game folder.
+			if (result == 0xBAD0000Bu)
+				return " -- hint: leftover RenoDX/OptiScaler NR add-ons in the game folder (another Neural Rendering user in this "
+				       "process, e.g. renodx-dlss5.addon64 or an OptiScaler DLSSNR build next to SkyrimSE.exe); remove them";
+			return "";
+		}
+
+		using ScalingRatioCallback = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Parameter*);
+		using GetCapabilityParameters = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Parameter**);
+
+		// No C++ objects here, so it can hold an SEH frame: the callback's signature is inferred
+		// (NGX's usual "callback(parameters)" shape, as DLSS's optimal-settings callback), not documented.
+		NVSDK_NGX_Result CallScalingCallbackGuarded(ScalingRatioCallback callback, NVSDK_NGX_Parameter* parameters, bool* faulted)
+		{
+			__try {
+				return callback(parameters);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				*faulted = true;
+				return NVSDK_NGX_Result_Fail;
+			}
+		}
+
 		std::filesystem::path ResolveRuntimePath(const std::filesystem::path& explicitPath)
 		{
 			if (!explicitPath.empty())
@@ -291,7 +319,7 @@ namespace NeuralRendering
 		ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motionVectors, ID3D12Resource* output,
 		std::uint32_t inputWidth, std::uint32_t inputHeight, std::uint32_t outputWidth, std::uint32_t outputHeight,
 		float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset,
-		float modelScale, bool tuningAtCreate)
+		float modelScale, bool tuningAtCreate, ID3D12Resource* controlMask, std::uint32_t maskSkyValue)
 	{
 		if (status_ != RuntimeStatus::Initialized || !commandList || slot >= 2 || !color || !depth || !motionVectors || !output)
 			return false;
@@ -315,28 +343,31 @@ namespace NeuralRendering
 		const float scalingRatio = modelScale > 0.0f ? modelScale : static_cast<float>(outputWidth) / inputWidth;
 		const bool dimensionsChanged = featureInputWidth_[slot] != inputWidth || featureInputHeight_[slot] != inputHeight ||
 			featureOutputWidth_[slot] != outputWidth || featureOutputHeight_[slot] != outputHeight ||
-			featureScalingRatio_[slot] != scalingRatio;
+			featureScalingRatio_[slot] != scalingRatio || featureControlMask_[slot] != (controlMask != nullptr);
 		if (featureHandles_[slot] && dimensionsChanged) {
 			release(static_cast<NVSDK_NGX_Handle*>(featureHandles_[slot]));
 			featureHandles_[slot] = nullptr;
 		}
 
 		if (!featureHandles_[slot]) {
+			// (batch 42a) One-off: what the DLL's own scaling callback answers (logged only).
+			if (!scalingProbeDone_) {
+				scalingProbeDone_ = true;
+				ProbeScalingCallback(outputWidth, outputHeight);
+			}
+			const auto vramBefore = QueryProcessVramMB();
 			parameters->Reset();
 			parameters->Set("Width", outputWidth);
 			parameters->Set("Height", outputHeight);
+			// Not in nvngx_dlssnr.dll (byte scan); kept because the NGX core may read them.
 			parameters->Set("OutWidth", outputWidth);
 			parameters->Set("OutHeight", outputHeight);
 			parameters->Set("DLSSNR.Width", outputWidth);
 			parameters->Set("DLSSNR.Height", outputHeight);
-			parameters->Set("DLSSNR.InputWidth", inputWidth);
-			parameters->Set("DLSSNR.InputHeight", inputHeight);
-			parameters->Set("DLSSNR.OutputWidth", outputWidth);
-			parameters->Set("DLSSNR.OutputHeight", outputHeight);
-			parameters->Set("DLSSNR.Output.Width", outputWidth);
-			parameters->Set("DLSSNR.Output.Height", outputHeight);
-			parameters->Set("DLSSNR.Scale", static_cast<float>(outputWidth) / inputWidth);
-			parameters->Set("DLSSNR.Upscaling", 1u);
+			// (batch 42a) Removed, none of them is anywhere in nvngx_dlssnr.dll 310.8 (byte scan of
+			// the shipped DLL, reviews/research-dlss5-update-2026-10-12.md 3.6): DLSSNR.InputWidth,
+			// .InputHeight, .OutputWidth, .OutputHeight, .Output.Width, .Output.Height, .Scale,
+			// .Upscaling.
 			parameters->Set("DLSSNR.ScalingRatio", scalingRatio);
 			parameters->Set("DLSSNR.Hint.Render.Preset", 0u);
 			// (batch 38c) The model reads its tuning when the feature is built (OptiScaler's DLSSNR
@@ -353,12 +384,43 @@ namespace NeuralRendering
 				parameters->Set("DLSSNR.Style", tuning.style);
 				parameters->Set("DLSSNR.UICorrection", tuning.uiCorrection ? 1u : 0u);
 			}
+			if (controlMask) {
+				// (batch 42a) Given at creation as well as per evaluate: whether the model latches its
+				// presence at creation is not known.
+				parameters->Set("DLSSNR.ControlMask", controlMask);
+				parameters->Set("DLSSNR.ControlMaskSubrectBaseX", 0u);
+				parameters->Set("DLSSNR.ControlMaskSubrectBaseY", 0u);
+				parameters->Set("DLSSNR.ControlMaskSubrectWidth", inputWidth);
+				parameters->Set("DLSSNR.ControlMaskSubrectHeight", inputHeight);
+			}
 			NVSDK_NGX_Handle* handle = nullptr;
 			ngxResult_ = static_cast<std::uint32_t>(create(commandList, kFeatureDlssNr, parameters, &handle));
 			if (ngxResult_ != NVSDK_NGX_Result_Success || !handle) {
-				detail_ = std::format("Feature 18 create failed slot={} result=0x{:08X} proxyHits={}", slot, ngxResult_, scope.Hits());
+				detail_ = std::format("Feature 18 create failed slot={} network={}x{} result=0x{:08X} proxyHits={}{}", slot,
+					outputWidth, outputHeight, ngxResult_, scope.Hits(), NgxResultHint(ngxResult_));
+				logger::error("[DLSSNR] {}", detail_);
 				return false;
 			}
+			++featureCreations_;
+			const auto vramAfter = QueryProcessVramMB();
+			const auto growth = static_cast<std::int64_t>(vramAfter) - static_cast<std::int64_t>(vramBefore);
+			logger::info("[DLSSNR] feature created #{} slot={}: network {}x{} (colour = guides = output, given to NGX as Width/Height), "
+						 "ScalingRatio {:.3f}, tuning at creation {}, control mask {}; video memory {} MB -> {} MB ({:+} MB)",
+				featureCreations_, slot, outputWidth, outputHeight, scalingRatio, tuningAtCreate ? "on" : "off",
+				controlMask ? std::format("on (sky = {})", maskSkyValue) : std::string("off"), vramBefore, vramAfter, growth);
+			// A leak shows as the process holding more after each rebuild at the same size than it
+			// did after the previous one (the old feature is released before the new one is made).
+			// Warned past 300 MB per rebuild. A bigger network (higher Model Resolution) legitimately
+			// takes more, so the sizes are in the line.
+			if (lastCreationVramMB_ && vramAfter > lastCreationVramMB_ + 300)
+				logger::warn("[DLSSNR] video memory after this rebuild is {} MB above the previous build ({} MB -> {} MB; network {}x{}, "
+							 "previous {}x{}). At the same or a smaller size this is a leak: avoid toggling Neural Rendering settings "
+							 "repeatedly and keep the log",
+					vramAfter - lastCreationVramMB_, lastCreationVramMB_, vramAfter, outputWidth, outputHeight,
+					lastCreationWidth_, lastCreationHeight_);
+			lastCreationVramMB_ = vramAfter;
+			lastCreationWidth_ = outputWidth;
+			lastCreationHeight_ = outputHeight;
 			featureHandles_[slot] = handle;
 			featureInputWidth_[slot] = inputWidth;
 			featureInputHeight_[slot] = inputHeight;
@@ -367,6 +429,7 @@ namespace NeuralRendering
 			featureScalingRatio_[slot] = scalingRatio;
 			featureTuning_[slot] = tuning;
 			featureTuningAtCreate_[slot] = tuningAtCreate;
+			featureControlMask_[slot] = controlMask != nullptr;
 			reset = true;
 		}
 
@@ -391,6 +454,13 @@ namespace NeuralRendering
 		parameters->Set("DLSSNR.OutputSubrectBaseY", 0u);
 		parameters->Set("DLSSNR.OutputSubrectWidth", outputWidth);
 		parameters->Set("DLSSNR.OutputSubrectHeight", outputHeight);
+		if (controlMask) {
+			parameters->Set("DLSSNR.ControlMask", controlMask);
+			parameters->Set("DLSSNR.ControlMaskSubrectBaseX", 0u);
+			parameters->Set("DLSSNR.ControlMaskSubrectBaseY", 0u);
+			parameters->Set("DLSSNR.ControlMaskSubrectWidth", inputWidth);
+			parameters->Set("DLSSNR.ControlMaskSubrectHeight", inputHeight);
+		}
 		parameters->Set("DLSSNR.MVecScaleX", motionVectorScaleX);
 		parameters->Set("DLSSNR.MVecScaleY", motionVectorScaleY);
 		parameters->Set("DLSSNR.DepthInverted", 0u);
@@ -408,11 +478,91 @@ namespace NeuralRendering
 		ngxResult_ = static_cast<std::uint32_t>(evaluate(commandList,
 			static_cast<NVSDK_NGX_Handle*>(featureHandles_[slot]), parameters, nullptr));
 		if (ngxResult_ != NVSDK_NGX_Result_Success) {
-			detail_ = std::format("Feature 18 evaluate failed slot={} result=0x{:08X}", slot, ngxResult_);
+			detail_ = std::format("Feature 18 evaluate failed slot={} result=0x{:08X}{}", slot, ngxResult_, NgxResultHint(ngxResult_));
 			return false;
 		}
 		++successfulFrames_;
 		return true;
+	}
+
+	void Runtime::ProbeScalingCallback(std::uint32_t width, std::uint32_t height)
+	{
+		// (batch 42a) Debug probe, logged once per session at the first feature creation. The DLL has a
+		// DLSSNRComputeScalingRatioCallback and reads PerfQualityValue beside it, which suggests the
+		// official "model resolution" is a quality mode answered by that callback rather than a ratio
+		// the caller sets. Look in the capability parameters (where NGX publishes such callbacks) and in
+		// our own block; when found, ask it for every quality mode 0..5 on a scratch block and log what
+		// comes back. Nothing here changes what is created.
+		HMODULE core = FindNgxCoreModule();
+		if (!core) {
+			logger::info("[DLSSNR] scaling probe: NGX parameter module not found");
+			return;
+		}
+		auto getCaps = reinterpret_cast<GetCapabilityParameters>(GetProcAddress(core, "NVSDK_NGX_D3D12_GetCapabilityParameters"));
+		auto allocate = reinterpret_cast<AllocateParameters>(GetProcAddress(core, "NVSDK_NGX_D3D12_AllocateParameters"));
+		auto destroy = reinterpret_cast<DestroyParameters>(GetProcAddress(core, "NVSDK_NGX_D3D12_DestroyParameters"));
+		NVSDK_NGX_Parameter* caps = nullptr;
+		NVSDK_NGX_Result capsResult = NVSDK_NGX_Result_Fail;
+		if (getCaps)
+			capsResult = getCaps(&caps);
+
+		void* callback = nullptr;
+		const char* foundIn = "nowhere";
+		auto lookIn = [&](NVSDK_NGX_Parameter* block, const char* name) {
+			if (!block || callback)
+				return;
+			void* pointer = nullptr;
+			if (NVSDK_NGX_SUCCEED(block->Get("DLSSNRComputeScalingRatioCallback", &pointer)) && pointer) {
+				callback = pointer;
+				foundIn = name;
+			}
+			int perfQuality = -1;
+			unsigned int perfQualityU = 0xFFFFFFFFu;
+			const bool haveInt = NVSDK_NGX_SUCCEED(block->Get("PerfQualityValue", &perfQuality));
+			const bool haveUint = NVSDK_NGX_SUCCEED(block->Get("PerfQualityValue", &perfQualityU));
+			logger::info("[DLSSNR] scaling probe: {} block: callback {}, PerfQualityValue {}", name,
+				pointer ? "present" : "absent",
+				haveInt ? std::format("{} (int)", perfQuality) : haveUint ? std::format("{} (uint)", perfQualityU) : std::string("not set"));
+		};
+		lookIn(caps, "capability");
+		lookIn(static_cast<NVSDK_NGX_Parameter*>(parameters_), "feature");
+		if (!getCaps || !NVSDK_NGX_SUCCEED(capsResult))
+			logger::info("[DLSSNR] scaling probe: capability parameters unavailable (export {}, result 0x{:08X})",
+				getCaps ? "present" : "absent", static_cast<std::uint32_t>(capsResult));
+
+		if (callback && allocate && destroy) {
+			NVSDK_NGX_Parameter* scratch = nullptr;
+			if (NVSDK_NGX_SUCCEED(allocate(&scratch)) && scratch) {
+				for (int quality = 0; quality <= 5; ++quality) {
+					scratch->Reset();
+					scratch->Set("Width", width);
+					scratch->Set("Height", height);
+					scratch->Set("DLSSNR.Width", width);
+					scratch->Set("DLSSNR.Height", height);
+					scratch->Set("PerfQualityValue", quality);
+					bool faulted = false;
+					const auto result = CallScalingCallbackGuarded(reinterpret_cast<ScalingRatioCallback>(callback), scratch, &faulted);
+					float ratio = -1.0f;
+					unsigned int outWidth = 0, outHeight = 0, renderWidth = 0, renderHeight = 0;
+					scratch->Get("DLSSNR.ScalingRatio", &ratio);
+					scratch->Get("OutWidth", &outWidth);
+					scratch->Get("OutHeight", &outHeight);
+					scratch->Get("DLSSNR.Width", &renderWidth);
+					scratch->Get("DLSSNR.Height", &renderHeight);
+					logger::info("[DLSSNR] scaling probe: PerfQualityValue {} at {}x{} -> result 0x{:08X}{} ScalingRatio {:.4f} OutWidth/Height {}x{} DLSSNR.Width/Height {}x{}",
+						quality, width, height, static_cast<std::uint32_t>(result), faulted ? " (faulted)" : "", ratio,
+						outWidth, outHeight, renderWidth, renderHeight);
+					if (faulted)
+						break;
+				}
+				destroy(scratch);
+			}
+		} else {
+			logger::info("[DLSSNR] scaling probe: no DLSSNRComputeScalingRatioCallback published ({}); model resolution stays our own downscale",
+				foundIn);
+		}
+		if (caps && destroy)
+			destroy(caps);
 	}
 
 	void Runtime::ResetFeature(std::uint32_t slot)
@@ -433,6 +583,7 @@ namespace NeuralRendering
 		featureScalingRatio_[slot] = 0.0f;
 		featureTuning_[slot] = {};
 		featureTuningAtCreate_[slot] = false;
+		featureControlMask_[slot] = false;
 	}
 
 	void Runtime::ResetFeatures()

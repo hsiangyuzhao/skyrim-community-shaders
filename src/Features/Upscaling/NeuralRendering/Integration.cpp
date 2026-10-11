@@ -262,6 +262,10 @@ namespace NeuralRendering
 			std::uint32_t inputPrecision = 0;
 			bool toneOn = false;
 			bool tuningAtCreate = false;
+			// (batch 42a)
+			std::uint32_t residualMode = 0;
+			bool protectSky = false;
+			std::uint32_t maskSkyValue = 0;
 			bool operator==(const LogKey&) const = default;
 		};
 
@@ -276,6 +280,8 @@ namespace NeuralRendering
 			bool pad = false;
 			std::uint32_t inputPrecision = 0;
 			bool toneOn = false;
+			// (batch 42a) Protect Sky adds the mask texture and rebuilds the feature with it.
+			bool protectSky = false;
 			bool operator==(const ResourceKey&) const = default;
 		};
 
@@ -297,8 +303,11 @@ namespace NeuralRendering
 
 		std::uint32_t ClampModelPercent(std::uint32_t percent)
 		{
-			// Only the three steps the menu offers; anything else in a hand-edited file snaps to 100.
-			return percent == 50 || percent == 75 ? percent : 100;
+			// (batch 42a) The four steps the menu offers: 100, 67, 50, 40. 38c-41b's 75 reads as 67; anything
+			// else in a hand-edited file snaps to 100.
+			if (percent == 75)
+				return 67;
+			return percent == 40 || percent == 50 || percent == 67 ? percent : 100;
 		}
 
 		// ---- (batch 38c) -----------------------------------------------------------------------
@@ -325,8 +334,11 @@ namespace NeuralRendering
 		{
 			Extents e{ width, height, width, height, width, height };
 			if (modelPercent < 100) {
-				e.workWidth = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(width * (modelPercent / 100.0))), std::min(width, 16u), width);
-				e.workHeight = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(height * (modelPercent / 100.0))), std::min(height, 16u), height);
+				// (batch 42a) 67% is exactly two thirds: 3840x2160 -> 2560x1440, the network size of Quality
+				// before upscaling (0.67 would give 2573x1447, padded to 2576x1448).
+				const double fraction = modelPercent == 67 ? 2.0 / 3.0 : modelPercent / 100.0;
+				e.workWidth = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(width * fraction)), std::min(width, 16u), width);
+				e.workHeight = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(height * fraction)), std::min(height, 16u), height);
 			}
 			e.paddedWidth = pad ? (e.workWidth + kNetworkAlign - 1) / kNetworkAlign * kNetworkAlign : e.workWidth;
 			e.paddedHeight = pad ? (e.workHeight + kNetworkAlign - 1) / kNetworkAlign * kNetworkAlign : e.workHeight;
@@ -435,9 +447,8 @@ namespace NeuralRendering
 
 		bool RunPass(const Decision& decision, const Renderer::PassInput& input)
 		{
-			Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::NeuralRendering);
+			// (batch 42a) Timed inside Run, in three rows (prepare / model / finalize).
 			const bool ran = Renderer::Instance().Run(globals::d3d::device, globals::d3d::context, input);
-			Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::NeuralRendering);
 
 			g_status.running = ran;
 			g_ranLastFrame = ran;
@@ -491,9 +502,14 @@ namespace NeuralRendering
 			input.tuningAtCreate = nr.tuningAtCreate;
 			const auto current = MakeTuning(nr);
 			input.tuning = nr.tuningAtCreate ? SettledTuning(current, decision.frame) : current;
+			input.residualMode = std::min(nr.residualMode, 1u);
+			input.protectSky = nr.protectSky;
+			input.maskSkyValue = nr.maskSkyValue ? 1u : 0u;
 			return input;
 		}
 	}
+
+	std::uint64_t QueryProcessVramMB() { return QueryVramMB(); }
 
 	void BeforeUpscaling()
 	{
@@ -549,7 +565,8 @@ namespace NeuralRendering
 		const std::uint32_t renderWidth = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(screen.x * scale.x)), 1u, std::max(outputWidth, 1u));
 		const std::uint32_t renderHeight = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(screen.y * scale.y)), 1u, std::max(outputHeight, 1u));
 		const bool before = nr.runBeforeUpscaling;
-		const std::uint32_t modelPercent = ClampModelPercent(nr.modelResolutionPercent);
+		// (batch 42a) One model resolution per placement.
+		const std::uint32_t modelPercent = ClampModelPercent(before ? nr.modelResolutionPercent : nr.modelResolutionPercentAfter);
 
 		g_status.blockedReason = blockedReason;
 		g_status.frameGeneration = frameGeneration;
@@ -591,7 +608,7 @@ namespace NeuralRendering
 
 		LogKey key{ true, run, blockedReason, before, g_status.width, g_status.height, renderWidth, renderHeight, modelPercent,
 			frameGeneration, frameGeneration ? upscaling.GetFrameGenerationAppliedMultiplier() : 0u, nr.allowWithFrameGeneration,
-			pad, toneMatched, inputPrecision, toneOn, nr.tuningAtCreate };
+			pad, toneMatched, inputPrecision, toneOn, nr.tuningAtCreate, std::min(nr.residualMode, 1u), nr.protectSky, nr.maskSkyValue ? 1u : 0u };
 		if (!g_haveLogKey || !(key == g_lastLogKey)) {
 			const auto vram = QueryVramMB();
 			g_status.vramMB = vram;
@@ -604,6 +621,8 @@ namespace NeuralRendering
 					before ? "before upscaling" : "after upscaling", g_status.width, g_status.height, renderWidth, renderHeight,
 					outputWidth, outputHeight, modelPercent, g_status.workWidth, g_status.workHeight, g_status.paddedWidth,
 					g_status.paddedHeight, pad ? " (padded to 8)" : " (no padding)", fg, vram);
+				logger::info("[DLSSNR] state: residual {} (below 100% only), Protect Sky {}", nr.residualMode ? "log-ratio split" : "additive (41b)",
+					nr.protectSky ? std::format("on, control mask sky = {}, rest = {}", nr.maskSkyValue ? 1 : 0, nr.maskSkyValue ? 0 : 1) : std::string("off"));
 				logger::info("[DLSSNR] state: input {}{}, tone preservation {:.2f}, tuning at creation {}",
 					before ? (toneMatched ? "tone-matched" : "Reinhard wrap") : "finished image",
 					before ? std::format(" ({})", InputPrecisionName(inputPrecision)) : std::string(), toneStrength,
@@ -619,7 +638,7 @@ namespace NeuralRendering
 
 		// Placement, extent or model resolution moved: drop the old feature and textures before the
 		// new ones are made, with the queue drained first, and say what that did to video memory.
-		const ResourceKey resourceKey{ before, g_status.width, g_status.height, modelPercent, pad, inputPrecision, toneOn };
+		const ResourceKey resourceKey{ before, g_status.width, g_status.height, modelPercent, pad, inputPrecision, toneOn, nr.protectSky };
 		if (!g_haveResourceKey || !(resourceKey == g_lastResourceKey)) {
 			// (batch 38c) A mode change after a failure tries again (a format the network refuses, say,
 			// latches the pass off; switching back to another must not need the Reset button).
@@ -803,6 +822,26 @@ namespace NeuralRendering
 		o["route"] = std::string(renderer.LastRoute());
 		o["model_gpu_ms"] = renderer.ModelGpuMs();
 		o["model_gpu_ms_last"] = renderer.LastModelGpuMs();
+		// (batch 42a) The pass's GPU time on the frame, in its three overlay rows (D3D11 timestamps;
+		// 0 while the overlay's GPU table is hidden), plus the network alone on its own D3D12 queue.
+		{
+			auto* timers = Util::GpuPassTimers::GetSingleton();
+			const float prepare = timers->SmoothedMs(Util::GpuBucket::NeuralRendering);
+			const float model = timers->SmoothedMs(Util::GpuBucket::NeuralRenderingModel);
+			const float finalize = timers->SmoothedMs(Util::GpuBucket::NeuralRenderingFinalize);
+			o["nr_time_ms"] = {
+				{ "prepare", prepare },
+				{ "model", model },
+				{ "finalize", finalize },
+				{ "total", prepare + model + finalize },
+				{ "network_d3d12", renderer.ModelGpuMs() },
+			};
+		}
+		const auto& nr = globals::features::upscaling.settings.neuralRendering;
+		o["residual_mode"] = nr.residualMode ? "log-ratio split" : "additive (41b)";
+		o["protect_sky"] = nr.protectSky;
+		o["mask_sky_value"] = nr.maskSkyValue ? 1 : 0;
+		o["feature_creations"] = Runtime::Instance().FeatureCreations();
 		o["max_in_flight"] = renderer.MaxInFlight();
 		o["backpressure_waits"] = renderer.BackpressureWaits();
 		o["frames"] = renderer.SuccessfulFrames();

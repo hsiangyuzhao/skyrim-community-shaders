@@ -46,7 +46,8 @@ namespace NeuralRendering
 			ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motionVectors, ID3D12Resource* output,
 			std::uint32_t inputWidth, std::uint32_t inputHeight, std::uint32_t outputWidth, std::uint32_t outputHeight,
 			float motionVectorScaleX, float motionVectorScaleY, const Tuning& tuning, bool reset,
-			float modelScale = 0.0f, bool tuningAtCreate = false);
+			float modelScale = 0.0f, bool tuningAtCreate = false,
+			ID3D12Resource* controlMask = nullptr, std::uint32_t maskSkyValue = 1);
 		void ResetFeature(std::uint32_t slot);
 		void ResetFeatures();
 		/// @param unloadModule false = (batch 38a) keep nvngx_dlssnr.dll mapped and the probe result, so the
@@ -71,8 +72,20 @@ namespace NeuralRendering
 			return featureTuningAtCreate_[slot] == tuningAtCreate && (!tuningAtCreate || featureTuning_[slot] == tuning);
 		}
 
+		/// (batch 42a) Features created this session (each rebuild counts).
+		[[nodiscard]] std::uint32_t FeatureCreations() const { return featureCreations_; }
+
 	private:
 		Runtime() = default;
+		void ProbeScalingCallback(std::uint32_t width, std::uint32_t height);
+		// (batch 42a) Whether each feature was created with a DLSSNR.ControlMask; part of the recreate key.
+		bool featureControlMask_[2]{};
+		std::uint32_t featureCreations_ = 0;
+		bool scalingProbeDone_ = false;
+		// (batch 42a) Process video memory right after the previous creation, and its network size.
+		std::uint64_t lastCreationVramMB_ = 0;
+		std::uint32_t lastCreationWidth_ = 0;
+		std::uint32_t lastCreationHeight_ = 0;
 		void* module_ = nullptr;
 		void* parameters_ = nullptr;
 		void* featureHandles_[2]{};

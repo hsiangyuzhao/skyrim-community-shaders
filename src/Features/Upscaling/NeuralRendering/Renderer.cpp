@@ -55,6 +55,28 @@ namespace NeuralRendering
 			Microsoft::WRL::ComPtr<ID3D11ComputeShader> shader_;
 			bool failed_ = false;
 		};
+
+		/// (batch 42a) One GPU timer row for a stretch of the pass; closes on any early return too
+		/// (an interval left open would keep every other bucket from opening one).
+		class GpuBucketScope
+		{
+		public:
+			explicit GpuBucketScope(Util::GpuBucket bucket) : bucket_(bucket) { Util::GpuPassTimers::GetSingleton()->Begin(bucket_); }
+			~GpuBucketScope() { Close(); }
+			GpuBucketScope(const GpuBucketScope&) = delete;
+			GpuBucketScope& operator=(const GpuBucketScope&) = delete;
+			void Close()
+			{
+				if (open_) {
+					Util::GpuPassTimers::GetSingleton()->End(bucket_);
+					open_ = false;
+				}
+			}
+
+		private:
+			Util::GpuBucket bucket_;
+			bool open_ = true;
+		};
 	}
 
 	namespace
@@ -267,6 +289,7 @@ namespace NeuralRendering
 			prepareColorCS.Reset();
 			finalizeCS.Reset();
 			toneStatsCS.Reset();
+			ratioCS.Reset();
 			toneCurveCS.Reset();
 			linearClamp.Reset();
 			lastRoute = "";
@@ -332,6 +355,9 @@ namespace NeuralRendering
 			}
 
 			auto& ws = workingSet;
+			// (batch 42a) Three disjoint timer rows: prepare, model (the D3D11 queue waiting on the
+			// network's D3D12 submission), finalize.
+			GpuBucketScope prepareTimer(Util::GpuBucket::NeuralRendering);
 			if (!PrepareGuides(context, in))
 				return LatchFailure("guide preparation", E_FAIL);
 
@@ -350,15 +376,21 @@ namespace NeuralRendering
 					return LatchFailure("colour preparation", E_FAIL);
 			}
 
+			prepareTimer.Close();
+			GpuBucketScope modelTimer(Util::GpuBucket::NeuralRenderingModel);
+
 			ID3D12GraphicsCommandList* commandList = nullptr;
 			if (!interop.BeginD3D12(&commandList, D3D12Interop::kCommandContextCount))
 				return LatchFailure("BeginD3D12", interop.LastError());
-			D3D12_RESOURCE_BARRIER barriers[4]{};
-			ID3D12Resource* resources[4]{
+			// (batch 42a) The control mask, when Protect Sky is on, is a fifth input.
+			ID3D12Resource* controlMask = in.protectSky ? ws.controlMask.resource12.Get() : nullptr;
+			D3D12_RESOURCE_BARRIER barriers[5]{};
+			ID3D12Resource* resources[5]{
 				ws.color.resource12.Get(), ws.depth.resource12.Get(),
-				ws.motionVectors.resource12.Get(), ws.output.resource12.Get()
+				ws.motionVectors.resource12.Get(), ws.output.resource12.Get(), controlMask
 			};
-			for (std::size_t index = 0; index < std::size(barriers); ++index) {
+			const UINT barrierCount = controlMask ? 5u : 4u;
+			for (std::size_t index = 0; index < barrierCount; ++index) {
 				barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 				barriers[index].Transition.pResource = resources[index];
 				barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -366,22 +398,27 @@ namespace NeuralRendering
 				barriers[index].Transition.StateAfter = index == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS :
 				                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 			}
-			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+			commandList->ResourceBarrier(barrierCount, barriers);
 			// Colour and guides share the network extent, padding included, so the network reads no
 			// margin it was not given. The vectors are in normalised screen units and the model wants
 			// pixels of the content it is looking at: the content extent, not the padded one.
+			// (batch 42a, checked) Below 100% this is the shrunken extent: the shared textures are made
+			// at paddedWidth x paddedHeight (EnsureWorkingSet) and the same numbers reach CreateFeature as
+			// Width/Height and every subrect, so the network itself runs smaller (logged at creation).
 			const bool succeeded = runtime.Execute(commandList, 0,
 				ws.color.resource12.Get(), ws.depth.resource12.Get(), ws.motionVectors.resource12.Get(),
 				ws.output.resource12.Get(), in.paddedWidth, in.paddedHeight, in.paddedWidth, in.paddedHeight,
 				static_cast<float>(in.workWidth), static_cast<float>(in.workHeight), in.tuning,
-				in.reset || resetPending[0], 1.0f, in.tuningAtCreate);
-			for (auto& barrier : barriers)
-				std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+				in.reset || resetPending[0], 1.0f, in.tuningAtCreate, controlMask, in.maskSkyValue);
+			for (UINT index = 0; index < barrierCount; ++index)
+				std::swap(barriers[index].Transition.StateBefore, barriers[index].Transition.StateAfter);
+			commandList->ResourceBarrier(barrierCount, barriers);
 			if (!interop.EndD3D12())
 				return LatchFailure("EndD3D12", interop.LastError());
 			if (!succeeded)
 				return LatchFailure("Feature 18", static_cast<HRESULT>(runtime.NgxResult()));
+			modelTimer.Close();
+			GpuBucketScope finalizeTimer(Util::GpuBucket::NeuralRenderingFinalize);
 
 			// EndD3D12 queued a GPU-side wait on the D3D11 timeline, so everything below -- and
 			// everything the frame does after it: DLSS super resolution, the HUD-less copy frame
@@ -390,9 +427,12 @@ namespace NeuralRendering
 				context->CopySubresourceRegion(in.sceneColor, 0, 0, 0, 0, ws.output.resource11.Get(), 0, &box);
 				lastRoute = "direct copy";
 			} else {
-				if (in.toneStrength > 0.0f && !Finalize(context, in, originalSRV, true))
+				// (batch 42a) Log-ratio split below 100%: the per-model-texel ratio first.
+				if (UsesRatio(in) && !Finalize(context, in, originalSRV, FinalizePass::Ratio))
+					return LatchFailure("log-ratio edit", E_FAIL);
+				if (in.toneStrength > 0.0f && !Finalize(context, in, originalSRV, FinalizePass::Stats))
 					return LatchFailure("tone statistics", E_FAIL);
-				if (!Finalize(context, in, originalSRV, false))
+				if (!Finalize(context, in, originalSRV, FinalizePass::Frame))
 					return LatchFailure("finalize", E_FAIL);
 				context->CopySubresourceRegion(in.sceneColor, 0, 0, 0, 0, ws.finalScratch.Get(), 0, &box);
 				lastRoute = "prepare + finalize";
@@ -436,6 +476,8 @@ namespace NeuralRendering
 			SharedTexture depth;
 			SharedTexture motionVectors;
 			SharedTexture output;
+			// (batch 42a) DLSSNR.ControlMask (Protect Sky), network extent, R8; only while it is on.
+			SharedTexture controlMask;
 			// (batch 38c) Frame extent, scene format: FinalizeCS writes here, then it is copied into the
 			// scene (38a's decode scratch).
 			Microsoft::WRL::ComPtr<ID3D11Texture2D> finalScratch;
@@ -451,6 +493,12 @@ namespace NeuralRendering
 			std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 2> stats;
 			std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>, 2> statsSRV;
 			std::array<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>, 2> statsUAV;
+			// (batch 42a) Log-ratio split: the edit per model texel (FinalizeCS.hlsl, RATIO).
+			Microsoft::WRL::ComPtr<ID3D11Texture2D> ratio;
+			Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> ratioSRV;
+			Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> ratioUAV;
+			std::uint32_t ratioWidth = 0;
+			std::uint32_t ratioHeight = 0;
 			std::uint32_t gridWidth = 0;
 			std::uint32_t gridHeight = 0;
 
@@ -462,6 +510,7 @@ namespace NeuralRendering
 			std::uint32_t paddedWidth = 0;
 			std::uint32_t paddedHeight = 0;
 			bool direct = false;
+			bool protectSky = false;  // (batch 42a)
 			DXGI_FORMAT sceneFormat = DXGI_FORMAT_UNKNOWN;
 			DXGI_FORMAT motionFormat = DXGI_FORMAT_UNKNOWN;
 			DXGI_FORMAT networkFormat = DXGI_FORMAT_UNKNOWN;
@@ -478,7 +527,8 @@ namespace NeuralRendering
 			float depthSourceScale[2];
 			std::uint32_t contentExtent[2];
 			std::uint32_t depthSourceMax[2];
-			std::uint32_t pad[2];
+			std::uint32_t maskMode;  // (batch 42a) 0 none, 1 sky = 1, 2 sky = 0
+			std::uint32_t pad;
 		};
 
 		struct PrepareColorConstants
@@ -523,6 +573,11 @@ namespace NeuralRendering
 			float cameraFar;
 			std::uint32_t grid[2];
 			float gridTexel[2];
+			// (batch 42a)
+			std::uint32_t residualMode;
+			float detailSigma;
+			float guideSigma;
+			float ratioClamp;
 		};
 
 		static_assert(sizeof(PrepareGuidesConstants) % 16 == 0);
@@ -541,6 +596,14 @@ namespace NeuralRendering
 			return true;
 		}
 
+		/// (batch 42a) The Protect Sky mask: one channel, network extent, written by PrepareGuidesCS.
+		bool CreateControlMask(const Renderer::PassInput& in, const D3D11_TEXTURE2D_DESC& sceneDesc)
+		{
+			auto desc = MakeSharedDesc(sceneDesc, in.paddedWidth, in.paddedHeight, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+			desc.Format = DXGI_FORMAT_R8_UNORM;
+			return interop.CreateSharedTexture(desc, workingSet.controlMask, "NeuralRendering::ControlMask") && workingSet.controlMask.uav11;
+		}
+
 		bool EnsureWorkingSet(const Renderer::PassInput& in, const D3D11_TEXTURE2D_DESC& sceneDesc, DXGI_FORMAT motionFormat, bool direct)
 		{
 			const bool before = in.placement == Renderer::Placement::BeforeUpscaling;
@@ -551,7 +614,7 @@ namespace NeuralRendering
 			if (ws.color.resource11 && ws.placement == in.placement && ws.width == in.width && ws.height == in.height &&
 				ws.workWidth == in.workWidth && ws.workHeight == in.workHeight && ws.paddedWidth == in.paddedWidth &&
 				ws.paddedHeight == in.paddedHeight && ws.direct == direct && ws.sceneFormat == sceneDesc.Format &&
-				ws.motionFormat == motionFormat && ws.networkFormat == networkFormat)
+				ws.motionFormat == motionFormat && ws.networkFormat == networkFormat && ws.protectSky == in.protectSky)
 				return true;
 
 			if (!interop.WaitForIdle())
@@ -569,7 +632,8 @@ namespace NeuralRendering
 			if (!interop.CreateSharedTexture(colorDesc, ws.color, "NeuralRendering::Color") ||
 				!interop.CreateSharedTexture(colorDesc, ws.output, "NeuralRendering::Output") ||
 				!interop.CreateSharedTexture(depthDesc, ws.depth, "NeuralRendering::Depth") ||
-				!interop.CreateSharedTexture(motionDesc, ws.motionVectors, "NeuralRendering::Motion")) {
+				!interop.CreateSharedTexture(motionDesc, ws.motionVectors, "NeuralRendering::Motion") ||
+				(in.protectSky && !CreateControlMask(in, sceneDesc))) {
 				ws = {};
 				return false;
 			}
@@ -667,26 +731,27 @@ namespace NeuralRendering
 			ws.sceneFormat = sceneDesc.Format;
 			ws.motionFormat = motionFormat;
 			ws.networkFormat = networkFormat;
+			ws.protectSky = in.protectSky;
 			resetPending = { true, true };
 			// (batch 38c) The exact extents, every rebuild: frame, model content, network (with the
 			// padding), and the scale the motion vectors are given in.
 			logger::info("[DLSSNR] extents: placement={} frame={}x{} model={}x{} ({}%) network={}x{} (padding +{} +{}) "
-						 "mvScale={}x{} route={} sceneFormat={} networkInputFormat={}",
+						 "mvScale={}x{} route={} sceneFormat={} networkInputFormat={} controlMask={}",
 				before ? "before-upscaling" : "after-upscaling", in.width, in.height, in.workWidth, in.workHeight,
 				std::lround(100.0 * in.workWidth / in.width), in.paddedWidth, in.paddedHeight,
 				in.paddedWidth - in.workWidth, in.paddedHeight - in.workHeight, in.workWidth, in.workHeight,
 				direct ? "direct copy" : "prepare + finalize", static_cast<std::uint32_t>(sceneDesc.Format),
-				static_cast<std::uint32_t>(networkFormat));
+				static_cast<std::uint32_t>(networkFormat), in.protectSky ? "R8 (Protect Sky)" : "none");
 			return true;
 		}
 
-		/// Binds and unbinds one compute dispatch. Up to 8 SRVs and 2 UAVs, one sampler, one cbuffer.
+		/// Binds and unbinds one compute dispatch. Up to 9 SRVs and 3 UAVs, one sampler, one cbuffer.
 		void Dispatch(ID3D11DeviceContext* context, ID3D11ComputeShader* shader, ID3D11Buffer* cb,
 			std::initializer_list<ID3D11ShaderResourceView*> srvs, std::initializer_list<ID3D11UnorderedAccessView*> uavs,
 			bool sampler, UINT groupsX, UINT groupsY)
 		{
-			ID3D11ShaderResourceView* srvArray[8]{};
-			ID3D11UnorderedAccessView* uavArray[2]{};
+			ID3D11ShaderResourceView* srvArray[9]{};
+			ID3D11UnorderedAccessView* uavArray[3]{};
 			UINT srvCount = 0;
 			UINT uavCount = 0;
 			for (auto* srv : srvs)
@@ -702,8 +767,8 @@ namespace NeuralRendering
 			if (sampler)
 				context->CSSetSamplers(0, 1, &samplerState);
 			context->Dispatch(groupsX, groupsY, 1);
-			ID3D11ShaderResourceView* nullSRVs[8]{};
-			ID3D11UnorderedAccessView* nullUAVs[2]{};
+			ID3D11ShaderResourceView* nullSRVs[9]{};
+			ID3D11UnorderedAccessView* nullUAVs[3]{};
 			ID3D11Buffer* nullCB = nullptr;
 			ID3D11SamplerState* nullSampler = nullptr;
 			if (srvCount)
@@ -752,10 +817,12 @@ namespace NeuralRendering
 			constants.contentExtent[1] = in.workHeight;
 			constants.depthSourceMax[0] = in.width - 1;
 			constants.depthSourceMax[1] = in.height - 1;
+			const bool mask = in.protectSky && workingSet.controlMask.uav11;
+			constants.maskMode = mask ? (in.maskSkyValue ? 1u : 2u) : 0u;
 			guidesCB->Update(constants);
 
 			Dispatch(context, shader, guidesCB->CB(), { in.depthSRV, in.motionSRV },
-				{ workingSet.depth.uav11.Get(), workingSet.motionVectors.uav11.Get() }, false,
+				{ workingSet.depth.uav11.Get(), workingSet.motionVectors.uav11.Get(), mask ? workingSet.controlMask.uav11.Get() : nullptr }, false,
 				(in.paddedWidth + 7) / 8, (in.paddedHeight + 7) / 8);
 			return true;
 		}
@@ -814,17 +881,34 @@ namespace NeuralRendering
 			return true;
 		}
 
-		/// @param stats true = the STATS variant (tone statistics grid), false = the frame pass.
-		bool Finalize(ID3D11DeviceContext* context, const Renderer::PassInput& in, ID3D11ShaderResourceView* original, bool stats)
+		enum class FinalizePass
 		{
-			auto& lazy = stats ? toneStatsCS : finalizeCS;
+			Ratio,  ///< (batch 42a) RATIO variant: the edit as a log2 ratio per model texel
+			Stats,  ///< STATS variant: tone statistics grid
+			Frame,  ///< the frame pass
+		};
+
+		/// (batch 42a) The log-ratio split runs below 100% only; at 100% the frame pass is 41b's.
+		static bool UsesRatio(const Renderer::PassInput& in)
+		{
+			return in.residualMode == 1 && (in.workWidth != in.width || in.workHeight != in.height);
+		}
+
+		bool Finalize(ID3D11DeviceContext* context, const Renderer::PassInput& in, ID3D11ShaderResourceView* original, FinalizePass pass)
+		{
+			auto& lazy = pass == FinalizePass::Ratio ? ratioCS : pass == FinalizePass::Stats ? toneStatsCS : finalizeCS;
 			std::vector<std::pair<const char*, const char*>> defines;
-			if (stats)
+			if (pass == FinalizePass::Stats)
 				defines.emplace_back("STATS", "");
+			else if (pass == FinalizePass::Ratio)
+				defines.emplace_back("RATIO", "");
 			auto* shader = lazy.Get(L"Data\\Shaders\\Upscaling\\NeuralRendering\\FinalizeCS.hlsl", defines, "cs_5_0",
-				"main", stats ? "NeuralRendering::ToneStatsCS" : "NeuralRendering::FinalizeCS");
+				"main", pass == FinalizePass::Ratio ? "NeuralRendering::RatioCS" : pass == FinalizePass::Stats ? "NeuralRendering::ToneStatsCS" : "NeuralRendering::FinalizeCS");
 			auto& ws = workingSet;
 			if (!shader || !original || !ws.finalScratchUAV || !ws.curveSRV || !ws.statsSRV[0] || !EnsureSampler())
+				return false;
+			const bool ratio = UsesRatio(in);
+			if (ratio && !EnsureRatioTexture(in))
 				return false;
 			if (!finalizeCB)
 				finalizeCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<FinalizeConstants>());
@@ -845,18 +929,66 @@ namespace NeuralRendering
 			constants.grid[1] = ws.gridHeight;
 			constants.gridTexel[0] = 1.0f / static_cast<float>(ws.gridWidth);
 			constants.gridTexel[1] = 1.0f / static_cast<float>(ws.gridHeight);
+			constants.residualMode = ratio ? 1u : 0u;
+			constants.detailSigma = 0.2f;  // stops: detail fades out where the small and the full picture differ by more
+			constants.guideSigma = 0.5f;   // stops: colour similarity of the broad part's joint-bilateral weights
+			constants.ratioClamp = 3.0f;   // stops: the most the edit may brighten or darken a pixel
 			finalizeCB->Update(constants);
 
-			if (stats) {
-				Dispatch(context, shader, finalizeCB->CB(),
-					{ original, ws.color.srv11.Get(), ws.output.srv11.Get(), ws.curveSRV.Get(), in.depthSRV, ws.depth.srv11.Get() },
-					{ ws.statsUAV[0].Get(), ws.statsUAV[1].Get() }, false, ws.gridWidth, ws.gridHeight);
-			} else {
+			ID3D11ShaderResourceView* ratioSRV = ratio ? ws.ratioSRV.Get() : nullptr;
+			switch (pass) {
+			case FinalizePass::Ratio:
+				Dispatch(context, shader, finalizeCB->CB(), { nullptr, ws.color.srv11.Get(), ws.output.srv11.Get() },
+					{ ws.ratioUAV.Get() }, false, (in.workWidth + 7) / 8, (in.workHeight + 7) / 8);
+				break;
+			case FinalizePass::Stats:
 				Dispatch(context, shader, finalizeCB->CB(),
 					{ original, ws.color.srv11.Get(), ws.output.srv11.Get(), ws.curveSRV.Get(), in.depthSRV, ws.depth.srv11.Get(),
-						ws.statsSRV[0].Get(), ws.statsSRV[1].Get() },
+						nullptr, nullptr, ratioSRV },
+					{ ws.statsUAV[0].Get(), ws.statsUAV[1].Get() }, false, ws.gridWidth, ws.gridHeight);
+				break;
+			case FinalizePass::Frame:
+				Dispatch(context, shader, finalizeCB->CB(),
+					{ original, ws.color.srv11.Get(), ws.output.srv11.Get(), ws.curveSRV.Get(), in.depthSRV, ws.depth.srv11.Get(),
+						ws.statsSRV[0].Get(), ws.statsSRV[1].Get(), ratioSRV },
 					{ ws.finalScratchUAV.Get() }, true, (in.width + 7) / 8, (in.height + 7) / 8);
+				break;
 			}
+			return true;
+		}
+
+		/// (batch 42a) The RATIO variant's target: model extent, RGBA16F (log2 ratio rgb, input log luma a).
+		/// Made on first use, kept with the working set.
+		bool EnsureRatioTexture(const Renderer::PassInput& in)
+		{
+			auto& ws = workingSet;
+			if (ws.ratio && ws.ratioWidth == in.workWidth && ws.ratioHeight == in.workHeight)
+				return true;
+			ws.ratio.Reset();
+			ws.ratioSRV.Reset();
+			ws.ratioUAV.Reset();
+			D3D11_TEXTURE2D_DESC desc{};
+			desc.Width = in.workWidth;
+			desc.Height = in.workHeight;
+			desc.MipLevels = 1;
+			desc.ArraySize = 1;
+			desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+			desc.SampleDesc.Count = 1;
+			desc.Usage = D3D11_USAGE_DEFAULT;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+			HRESULT result = S_OK;
+			if (!CreatePlainTexture(desc, ws.ratio, "NeuralRendering::LogRatio") ||
+				FAILED(result = interop.device11_->CreateShaderResourceView(ws.ratio.Get(), nullptr, &ws.ratioSRV)) ||
+				FAILED(result = interop.device11_->CreateUnorderedAccessView(ws.ratio.Get(), nullptr, &ws.ratioUAV))) {
+				if (FAILED(result))
+					interop.RecordFailure(result);
+				ws.ratio.Reset();
+				ws.ratioSRV.Reset();
+				ws.ratioUAV.Reset();
+				return false;
+			}
+			ws.ratioWidth = in.workWidth;
+			ws.ratioHeight = in.workHeight;
 			return true;
 		}
 
@@ -951,6 +1083,7 @@ namespace NeuralRendering
 		LazyComputeShader prepareColorCS;
 		LazyComputeShader finalizeCS;
 		LazyComputeShader toneStatsCS;
+		LazyComputeShader ratioCS;  // (batch 42a)
 		LazyComputeShader toneCurveCS;
 		Microsoft::WRL::ComPtr<ID3D11SamplerState> linearClamp;
 		std::unique_ptr<ConstantBuffer> guidesCB;

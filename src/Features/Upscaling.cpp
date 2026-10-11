@@ -21,6 +21,7 @@
 #include "Features/ScreenSpaceRayTracing.h"
 #include "Features/SubsurfaceScattering.h"
 #include "Utils/GpuPhaseTimeline.h"
+#include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Upscaling::NeuralRenderingSettings,
@@ -41,7 +42,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	inputPrecision,
 	tonePreservationBefore,
 	tonePreservationAfter,
-	tuningAtCreate)
+	tuningAtCreate,
+	modelResolutionPercentAfter,
+	residualMode,
+	protectSky,
+	maskSkyValue)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Upscaling::Settings,
@@ -412,13 +417,50 @@ void Upscaling::DrawSettings()
 				ImGui::TextUnformatted("On: runs on the internal resolution image (2560x1440 at Quality on a 4K screen) before DLSS upscales it, so it costs less. It sees the scene before colour grading; \"Tone-matched input\" below shows it the graded look instead.");
 			}
 
-			const char* modelResolutions[] = { "100%", "75%", "50%" };
-			int modelIndex = nr.modelResolutionPercent == 50 ? 2 : (nr.modelResolutionPercent == 75 ? 1 : 0);
-			if (ImGui::Combo("Model Resolution", &modelIndex, modelResolutions, IM_ARRAYSIZE(modelResolutions)))
-				nr.modelResolutionPercent = modelIndex == 2 ? 50u : (modelIndex == 1 ? 75u : 100u);
+			// (batch 42a) 100 / 67 / 50 / 40, one value per placement (after upscaling defaults to 50).
+			{
+				const char* modelResolutions[] = { "100%", "67%", "50%", "40%" };
+				constexpr uint kModelPercents[] = { 100u, 67u, 50u, 40u };
+				uint& percent = nr.runBeforeUpscaling ? nr.modelResolutionPercent : nr.modelResolutionPercentAfter;
+				int modelIndex = 0;
+				for (int i = 0; i < static_cast<int>(std::size(kModelPercents)); ++i)
+					if (percent == kModelPercents[i] || (percent == 75u && kModelPercents[i] == 67u))
+						modelIndex = i;
+				if (ImGui::Combo(nr.runBeforeUpscaling ? "Model Resolution (before upscaling)" : "Model Resolution (after upscaling)",
+						&modelIndex, modelResolutions, IM_ARRAYSIZE(modelResolutions)))
+					percent = kModelPercents[std::clamp(modelIndex, 0, static_cast<int>(std::size(kModelPercents)) - 1)];
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted("Size the AI model works at, as a share of its input. Lower = cheaper (roughly with the pixel count): 50% is about a quarter of the model's time.");
+					ImGui::TextUnformatted("After upscaling on a 4K screen: 67% = 2560x1440 (same cost as Quality before upscaling), 50% = 1920x1080, 40% = 1536x864.");
+					ImGui::TextUnformatted("The picture itself stays full resolution: only the model's changes are made smaller and scaled back up (following depth and colour, so edges stay clean). Lower = those changes are softer.");
+					ImGui::TextUnformatted("Separate values for before and after upscaling (defaults 100% and 50%).");
+				}
+			}
+
+			{
+				const char* residualModes[] = { "Additive (41b)", "Log-Ratio Split" };
+				int residualIndex = static_cast<int>(std::min(nr.residualMode, 1u));
+				if (ImGui::Combo("Residual Mode", &residualIndex, residualModes, IM_ARRAYSIZE(residualModes)))
+					nr.residualMode = static_cast<uint>(residualIndex);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::TextUnformatted("How the model's changes are scaled back up when Model Resolution is below 100% (no effect at 100%).");
+					ImGui::TextUnformatted("Additive (41b): the change is added as a difference. Can leave bright or dark fringes at contrasty edges.");
+					ImGui::TextUnformatted("Log-Ratio Split (default): the change is a brightness ratio, split in two: the broad lighting is spread smoothly (following depth and the full-size picture), the fine detail is only added where the small and full-size pictures agree.");
+				}
+			}
+
+			ImGui::Checkbox("Protect Sky (experimental)", &nr.protectSky);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Size the AI model works at, as a share of its input. Lower = cheaper (roughly with the pixel count): 50% is about a quarter of the model's time.");
-				ImGui::TextUnformatted("The picture itself stays full resolution: only the model's changes are made smaller and scaled back up (following depth, so edges stay clean). Lower = those changes are softer.");
+				ImGui::TextUnformatted("Gives the model a mask of the sky (and so the moons), meant to keep it from restyling them. NVIDIA has not documented the mask, so whether it works, and which way round, is what this test finds out.");
+				ImGui::TextUnformatted("Turning it on or off restarts the model (a short hitch).");
+			}
+			if (nr.protectSky) {
+				const char* polarities[] = { "Sky = 0", "Sky = 1" };
+				int polarity = nr.maskSkyValue ? 1 : 0;
+				if (ImGui::Combo("Mask Value Polarity", &polarity, polarities, IM_ARRAYSIZE(polarities)))
+					nr.maskSkyValue = polarity ? 1u : 0u;
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::TextUnformatted("Which value marks the sky in the mask (the rest gets the other). If the sky changes more instead of less, or nothing changes, try the other one.");
 			}
 
 			ImGui::Checkbox("Pad to network grid", &nr.padToNetworkGrid);
@@ -476,7 +518,17 @@ void Upscaling::DrawSettings()
 						frameStatus.width, frameStatus.height, frameStatus.modelPercent, frameStatus.workWidth, frameStatus.workHeight,
 						frameStatus.paddedWidth, frameStatus.paddedHeight);
 					if (nrRenderer.ModelGpuMs() > 0.0f)
-						ImGui::Text("Model GPU time: %.2f ms (the overlay row adds the copies and the wait)", nrRenderer.ModelGpuMs());
+						ImGui::Text("Model GPU time: %.2f ms (on its own device)", nrRenderer.ModelGpuMs());
+					// (batch 42a) The three overlay rows, when the overlay's GPU table is up.
+					auto* timers = Util::GpuPassTimers::GetSingleton();
+					const float prepareMs = timers->SmoothedMs(Util::GpuBucket::NeuralRendering);
+					const float modelMs = timers->SmoothedMs(Util::GpuBucket::NeuralRenderingModel);
+					const float finalizeMs = timers->SmoothedMs(Util::GpuBucket::NeuralRenderingFinalize);
+					if (prepareMs + modelMs + finalizeMs > 0.0f)
+						ImGui::Text("Frame cost: %.2f ms = prepare %.2f + model %.2f + finalize %.2f", prepareMs + modelMs + finalizeMs,
+							prepareMs, modelMs, finalizeMs);
+					else
+						ImGui::TextDisabled("Frame cost: open the Performance Overlay's GPU table to measure");
 				} else {
 					ImGui::TextDisabled("Now: not running");
 				}

@@ -29,7 +29,8 @@ cbuffer PrepareGuidesCB : register(b0)
 	float2 DepthSourceScale;   // (batch 38c) content texel centre -> depth texel (frame / content extent)
 	uint2 ContentExtent;       // (batch 38c) model content extent; texels past it repeat the edge
 	uint2 DepthSourceMax;      // (batch 38c) last valid depth texel (frame extent - 1)
-	uint2 Pad0;
+	uint MaskMode;             // (batch 42a) control mask: 0 none, 1 sky = 1 / rest = 0, 2 sky = 0 / rest = 1
+	uint Pad0;
 };
 
 Texture2D<float> SourceDepth : register(t0);
@@ -37,6 +38,10 @@ Texture2D<float2> SourceMotion : register(t1);
 
 RWTexture2D<float> DestinationDepth : register(u0);
 RWTexture2D<float2> DestinationMotion : register(u1);
+// (batch 42a) DLSSNR.ControlMask for Protect Sky. Sky = depth at the far plane (the depth here is not
+// inverted: DLSSNR.DepthInverted = 0), which takes in the moons and stars drawn there. The meaning of
+// the values to the network is undocumented, so the polarity is a menu choice.
+RWTexture2D<float> DestinationMask : register(u2);
 
 [numthreads(8, 8, 1)] void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
 	const uint2 pixel = dispatchThreadID.xy;
@@ -46,7 +51,14 @@ RWTexture2D<float2> DestinationMotion : register(u1);
 	const float2 centre = float2(min(pixel, ContentExtent - 1)) + 0.5;
 
 	const uint2 depthPixel = min(uint2(centre * DepthSourceScale), DepthSourceMax);
-	DestinationDepth[pixel] = SourceDepth[depthPixel];
+	const float depth = SourceDepth[depthPixel];
+	DestinationDepth[pixel] = depth;
+
+	[branch] if (MaskMode != 0)
+	{
+		const bool sky = depth >= 1.0 - 1e-6;
+		DestinationMask[pixel] = (sky == (MaskMode == 1)) ? 1.0 : 0.0;
+	}
 
 	const uint2 motionPixel = min(uint2(centre * MotionSourceScale), MotionSourceMax);
 	DestinationMotion[pixel] = SourceMotion[motionPixel] + MotionOffset;

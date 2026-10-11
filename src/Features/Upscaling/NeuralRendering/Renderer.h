@@ -128,6 +128,12 @@ namespace NeuralRendering
 			/// Ask the network to drop its history this frame.
 			bool reset = false;
 			Tuning tuning{};
+			/// (batch 42a) Below 100%: 0 = additive edit (41b), 1 = log-ratio split (FinalizeCS.hlsl).
+			std::uint32_t residualMode = 1;
+			/// (batch 42a, experimental) Give the network a DLSSNR.ControlMask marking the sky (depth at
+			/// the far plane); sky texels get maskSkyValue (0 or 1), the rest the other.
+			bool protectSky = false;
+			std::uint32_t maskSkyValue = 1;
 		};
 
 		/// (batch 38a) The Batch 38 pass. Leaves the colour untouched and returns false on any

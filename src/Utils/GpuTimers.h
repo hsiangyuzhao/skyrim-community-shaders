@@ -57,6 +57,12 @@ namespace Util
 		VolumetricShadows,       // (batch 38) sun VSM for smoke and effects: downsample + 11x11 blur
 		Batch39DepthRefresh,     // (batch 39) depth copy / Terrain Blending merge after the opaque pass (prepass slimming only)
 		SnowTrails,              // (batch 39) Dynamic Snow footprint map: scroll clear + refill + prints
+		// (batch 42a) Neural Rendering split three ways on the D3D11 timeline (the Batch 38 path):
+		// NeuralRendering above keeps "prepare" (guides, colour copy, tone curve, downscale), these
+		// two take the network (its D3D12 submission, as the D3D11 queue waits for it) and the
+		// finalize (upsample of the edit, tone statistics, copy back). Disjoint, so the rows add up.
+		NeuralRenderingModel,
+		NeuralRenderingFinalize,
 		Count
 	};
 
@@ -114,6 +120,10 @@ namespace Util
 		 * @brief Iterates buckets that reported GPU work within the activity timeout.
 		 */
 		void ForEachActiveBucket(const std::function<void(const BucketReport&)>& a_callback);
+
+		/// @brief (batch 42a) A bucket's smoothed GPU time, or 0 while it has no recent sample (the
+		/// overlay's table is hidden, or its passes stopped). For the F12 JSON and the feature menus.
+		float SmoothedMs(GpuBucket a_bucket) const;
 
 		/**
 		 * @brief Releases every query and clears all smoothing/pending state.

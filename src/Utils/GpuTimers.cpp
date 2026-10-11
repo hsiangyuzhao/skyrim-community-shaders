@@ -74,8 +74,8 @@ namespace Util
 				"GPU time Variable Rate Shading itself costs (plus its debug overlay when shown). "
 				"Its savings show up in the engine's opaque geometry time, not here." },
 			{ "Neural Rendering (DLSS 5)",
-				"GPU time the DLSS 5 Neural Rendering pass adds to the frame: preparing its inputs, copying to and from its own "
-				"D3D12 device, and waiting there while the network runs. The network alone is shown under Upscaling > Neural Rendering." },
+				"GPU time the DLSS 5 Neural Rendering pass spends preparing its inputs: copying the picture, depth and motion, and "
+				"shrinking them to the Model Resolution. The model itself and the finishing step have their own rows (NR Model, NR Finalize)." },
 			{ "SSS Pre-pass",
 				"GPU time of the skin SSS upgrade's pre-pass (takes the skin colour out of the light before the blur). "
 				"Not counted in the Subsurface Scattering row. Only runs on frames that draw faces. The upgrade also drops the "
@@ -96,6 +96,12 @@ namespace Util
 				"GPU time for keeping the footprint map around the player up to date (Dynamic Snow): clearing the "
 				"strip that scrolls into view, filling old prints back in, and stamping this frame's footprints. Reading the "
 				"map, and drawing accumulated snow, happen inside the normal object and ground drawing and are not in this row." },
+			{ "NR Model (DLSS 5)",
+				"GPU time of the DLSS 5 Neural Rendering model as the frame waits for it (it runs on its own D3D12 device). "
+				"This is the part Model Resolution makes cheaper. The model alone, measured on its own device, is under Upscaling > Neural Rendering." },
+			{ "NR Finalize (DLSS 5)",
+				"GPU time for bringing the model's changes back onto the full-size picture (scaling them up when Model Resolution "
+				"is below 100%) and copying the result back." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
@@ -379,6 +385,18 @@ namespace Util
 			a_callback(BucketReport{ kBucketInfo[i].label, kRowIdBase + i, bucket.smoothedMs,
 				bucket.lastSampleIntervals, kBucketInfo[i].tooltip });
 		}
+	}
+
+	float GpuPassTimers::SmoothedMs(GpuBucket a_bucket) const
+	{
+		const int index = static_cast<int>(a_bucket);
+		if (index < 0 || index >= static_cast<int>(GpuBucket::Count))
+			return 0.0f;
+		const auto& bucket = buckets[index];
+		if (!bucket.everActive || !bucket.hasSample ||
+			frameIndex - bucket.lastActiveFrame > static_cast<uint64_t>(kActiveTimeoutFrames))
+			return 0.0f;
+		return bucket.smoothedMs;
 	}
 
 	// ========================================================================

@@ -67,6 +67,10 @@ namespace NeuralRendering
 	/// @brief (batch 38a) Status plus timings, for the performance overlay's saved frame.
 	json StatusJson();
 
+	/// @brief (batch 42a) This process's use of the adapter's local video memory in MB (0 when
+	/// unavailable). Every device the process has on that adapter, the network's own included.
+	std::uint64_t QueryProcessVramMB();
+
 	/// @brief (batch 38c) Where the before-upscaling tone curve came from on the last frame
 	/// ("game exposure + colour grading", "fallback curve", ...), for the menu and the Batch 38 table.
 	const char* ToneSourceText();
