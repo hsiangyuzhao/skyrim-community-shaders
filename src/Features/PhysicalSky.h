@@ -112,6 +112,13 @@ struct PhysicalSky final : public Feature
 		kMoonGlowFadeAtHorizon,     // the moon's true elevation, -2 -> +3 degrees
 		kMoonGlowFadeCount
 	};
+	/// (42b) "Cloud Lighting".
+	enum CloudLighting : int
+	{
+		kCloudLightingSingle = 0,  // 42a and earlier: the one directional light (sun or a moon)
+		kCloudLightingAll,         // the sun, both moons and the sky, each on its own
+		kCloudLightingCount
+	};
 	/// (41b, F5) "Sky Model".
 	enum SkyModel : int
 	{
@@ -197,6 +204,21 @@ struct PhysicalSky final : public Feature
 		float twilightLength = 1.f;
 		/// (41b, F5) SkyModel: Current, or Legacy (36f) for comparison (see Effective()).
 		int skyModel = kSkyModelCurrent;
+
+		/// (42b) CloudLighting. Single: clouds are lit only by the directional light (whichever body
+		/// Sky Sync made it), so they went black whenever it was off (dawn, dusk) and never caught the
+		/// sun after sunset. All: the sun (through the air above the cloud, with the planet's shadow),
+		/// both moons and the sky's own light, each on its own.
+		int cloudLighting = kCloudLightingAll;
+		/// (42b) Sky light on clouds (the sky-view LUT, which holds the 41b night base light): 0 = none.
+		float cloudSkyAmbient = 1.f;
+		/// (42b) Height of the clouds above you used for their sunlight only, km. Higher = they keep
+		/// the sun (pink/orange) longer after sunset. The drawn cloud layer is unchanged.
+		float cloudLightHeightKm = 2.f;
+		/// (42b) Moon discs lose contrast against a bright sky, as a real daytime moon does.
+		bool moonsFadeInDaylight = true;
+		/// (42b) How strongly: disc alpha x 1 / (1 + this x sky luminance / disc luminance).
+		float moonDaylightFade = 20.f;
 
 		// (batch 37b) Upstream correctness fixes, each ANDed with Batch37b::IsOn().
 		bool fixSkyAlpha = true;  // 5846ad833: sky dome written opaque
@@ -367,6 +389,28 @@ struct PhysicalSky final : public Feature
 	void UpdateNightBaseLight(float a_sunElevation);
 	/// (41b, F2) Glow visibility of a moon by its true elevation; 0 when the weather hides it.
 	static float MoonHorizonVisibility(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation);
+
+	/// (42b) Mirrors SharedData::PhysSkyCloudData (HLSL), appended after PhysSkyNightData. Read only
+	/// by Sky.hlsl.
+	enum CloudFlags : uint32_t
+	{
+		kCloudMultiLight = 1u << 0,        // "Cloud Lighting: Sun + Moons + Sky"
+		kCloudMoonDaylightFade = 1u << 1,  // "Moons Fade in Daylight"
+	};
+	struct CloudCbData
+	{
+		float3 sunColor = {};  // DirLightColor units, before transmittance
+		uint flags = 0;
+		float3 masserColor = {};
+		float skyAmbient = 0.f;
+		float3 secundaColor = {};
+		float heightOffset = 0.f;  // game units
+		float moonDaylightFade = 0.f;
+		float pad0[3] = {};
+	} cloudCbData;
+	static_assert(sizeof(CloudCbData) == 64);
+	/// (42b) Fills cloudCbData. a_exposure as for the LUTs, a_sunElevation (radians) of the LUTs' sun.
+	void UpdateCloudData(float a_exposure, float a_sunElevation);
 
 	/// (batch 37c) "Sun Look" presets.
 	enum SunLook : int

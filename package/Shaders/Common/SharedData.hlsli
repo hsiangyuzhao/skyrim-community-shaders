@@ -592,6 +592,26 @@ namespace SharedData
 		static const uint BaseLight = (1 << 0);  // F1 on this frame; 0 = the 41a LUT code exactly
 	}
 
+	// (42b) Mirrors PhysicalSky::CloudCbData, appended after PhysSkyNightData (offset 1744). Read only
+	// by Sky.hlsl (cloud lighting, moon discs by day).
+	struct PhysSkyCloudData
+	{
+		float3 SunColor;      // sun light on clouds (same units as DirLightColor), before transmittance
+		uint Flags;           // PhysSkyCloudFlags
+		float3 MasserColor;   // Masser's light on clouds: x phase x elevation/weather x day fade
+		float SkyAmbient;     // strength of the sky-view LUT as light on clouds; 0 = none
+		float3 SecundaColor;  // same for Secunda
+		float HeightOffset;   // extra cloud height used only for the light's transmittance / planet shadow
+		float MoonDaylightFade;  // moon disc: alpha x 1 / (1 + this x sky luminance / disc luminance)
+		float3 pad0;
+	};
+
+	namespace PhysSkyCloudFlags
+	{
+		static const uint MultiLight = (1 << 0);        // clouds: sun + both moons + sky (0 = the 42a single-light code)
+		static const uint MoonDaylightFade = (1 << 1);  // moon discs fade against a bright sky
+	}
+
 	namespace PhysSkyExtFlags
 	{
 		static const uint SunReplace = (1 << 0);           // disk replaces the vanilla sun quad
@@ -636,6 +656,7 @@ namespace SharedData
 		DynamicSnowSettings dynamicSnowSettings;
 		PhysSkyMoonData physSkyMoonData;
 		PhysSkyNightData physSkyNightData;
+		PhysSkyCloudData physSkyCloudData;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);

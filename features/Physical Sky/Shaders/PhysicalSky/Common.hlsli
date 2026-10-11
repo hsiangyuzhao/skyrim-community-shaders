@@ -381,6 +381,115 @@ float3 RelightCloud(float4 baseColor, float3 viewDir, float3 cloudPosWS, Sampler
 
 	return cloudColor;
 }
+
+// (42b) "Cloud Lighting: Sun + Moons + Sky". RelightCloud above is left exactly as it was (the
+// "Single light (old)" choice).
+
+// Light from a body reaching a point (planet-centred, game units): 0 once the body is below that
+// point's geometric horizon, i.e. inside the planet's shadow, softened over about half a degree
+// (the sun's own size) so the edge does not crawl.
+float PlanetShadow(float3 posPlanet, float3 lightDir)
+{
+	const float r = length(posPlanet);
+	const float mu = dot(posPlanet / r, lightDir);
+	const float sinHorizon = saturate(SharedData::physSkyData.rPlanet / r);
+	const float muHorizon = -sqrt(saturate(1.0 - sinHorizon * sinHorizon));
+	return smoothstep(muHorizon - 0.005, muHorizon + 0.005, mu);
+}
+
+// The self-shadow of RelightCloud, towards any light.
+float CloudSelfShadow(float3 viewDir, float3 lightDir, SamplerState sampCube)
+{
+	float rayStep = 1.0 / 32.0;
+	float rayPos = rayStep * 0.5;
+	float4 rayShadow = 0.0;
+
+	float3 PoissonDisc[] = {
+		float3(0.460921f, 0.615192f, 0.887539f),
+		float3(0.757347f, 0.911008f, 0.189581f),
+		float3(0.548753f, 0.145482f, 0.0548723f),
+		float3(0.90051f, 0.157048f, 0.623493f)
+	};
+
+	[unroll] for (int i = 0; i < 4; i++)
+	{
+		float3 raySample = normalize(lerp(viewDir, lightDir, rayPos));
+		raySample += (PoissonDisc[i] * 2.0 - 1.0) * 0.01;
+
+		if (raySample.z < 0.0)
+			rayShadow[i] += -raySample.z;  // World shadow
+		else
+			rayShadow[i] = max(rayShadow[i], CloudShadows::CloudShadowsTexture.SampleLevel(sampCube, raySample, 0).x);
+
+		rayPos += rayStep;
+	}
+	return saturate(dot(rayShadow, 0.25));
+}
+
+// RelightCloud's phase term, towards any light.
+float CloudPhase(float alpha, float3 viewDir, float3 lightDir)
+{
+	const SharedData::PhysSkyData data = SharedData::physSkyData;
+	const float u = dot(viewDir, lightDir);
+	return Remap(
+		alpha,
+		data.silverLiningSpread > 0 ? data.silverLiningSpread : 0,
+		data.silverLiningSpread < 0 ? 1 + data.silverLiningSpread : 1,
+		lerp(0.25 * RCP_PI, Phase::ThomasSchander(u), data.silverLiningMix),
+		0.25 * RCP_PI) * 2 * Math::PI * data.cloudRelightMix;
+}
+
+// One body's light on the cloud: colour x the air between it and the cloud x the planet's shadow x
+// phase x self-shadow.
+float3 CloudBodyLight(float4 baseColor, float3 viewDir, float3 posPlanet, float3 lightDir, float3 lightColor, SamplerState sampTr, SamplerState sampCube)
+{
+	float3 result = 0.0;
+	const float planetShadow = PlanetShadow(posPlanet, lightDir);
+	[branch] if (any(lightColor > 0.0) && planetShadow > 0.0)
+	{
+		float3 trAtmos = TexTrLut.SampleLevel(sampTr, TrLutUvPlanet(posPlanet, lightDir), 0).rgb;
+		trAtmos = lerp(1, trAtmos, SharedData::physSkyData.trMix);
+		result = lightColor * trAtmos * planetShadow * CloudPhase(baseColor.w, viewDir, lightDir) * (1.0 - CloudSelfShadow(viewDir, lightDir, sampCube));
+	}
+	return result;
+}
+
+float3 RelightCloudMulti(float4 baseColor, float3 viewDir, float3 cloudPosWS, SamplerState sampTr, SamplerState sampSv, SamplerState sampCube)
+{
+	if (baseColor.w <= 0)
+		return baseColor.rgb;
+
+	const SharedData::PhysSkyData data = SharedData::physSkyData;
+	const SharedData::PhysSkyCloudData cloud = SharedData::physSkyCloudData;
+
+	// The cloud as the light sees it: raised by "Cloud Height for Sunlight" (the drawn layer is not).
+	const float3 posPlanet = cloudPosWS + float3(0, 0, data.zCameraPlanet + cloud.HeightOffset);
+
+	// The sun along the same direction the sky's LUTs use (true height, Twilight Length), so the
+	// clouds turn with the sky around them; the moons along their glow's directions.
+	float3 light = CloudBodyLight(baseColor, viewDir, posPlanet, normalize(SharedData::physSkyNightData.LutSunDir), cloud.SunColor, sampTr, sampCube);
+	light += CloudBodyLight(baseColor, viewDir, posPlanet, normalize(data.masserDir), cloud.MasserColor, sampTr, sampCube);
+	light += CloudBodyLight(baseColor, viewDir, posPlanet, normalize(data.secundaDir), cloud.SecundaColor, sampTr, sampCube);
+
+	// The sky's own light: the sky-view LUT (sun and moon scattering, the night base light) averaged
+	// over the upper sky, the zenith and four directions 15 degrees up. A white matte layer under an
+	// even sky of radiance L sends back L; a light of irradiance E sends back E / pi, which the phase
+	// normalisation above turns into E / 2. The same factor (pi / 2) is applied to the sky.
+	[branch] if (cloud.SkyAmbient > 0.0)
+	{
+		const float c15 = 0.9659258, s15 = 0.2588190;
+		float3 sky = 0.3 * TexSvLut.SampleLevel(sampSv, float2(0.0, 0.01), 0).rgb;  // the zenith (SkyViewLutUv's v floor)
+		sky += 0.175 * TexSvLut.SampleLevel(sampSv, SkyViewLutUv(float3(c15, 0, s15)), 0).rgb;
+		sky += 0.175 * TexSvLut.SampleLevel(sampSv, SkyViewLutUv(float3(-c15, 0, s15)), 0).rgb;
+		sky += 0.175 * TexSvLut.SampleLevel(sampSv, SkyViewLutUv(float3(0, c15, s15)), 0).rgb;
+		sky += 0.175 * TexSvLut.SampleLevel(sampSv, SkyViewLutUv(float3(0, -c15, s15)), 0).rgb;
+		light += sky * (Math::PI * 0.5 * cloud.SkyAmbient * data.cloudRelightMix);
+	}
+
+	float3 cloudColor = baseColor.rgb * data.cloudOriginalMix;
+	cloudColor += baseColor.a * baseColor.rgb * light;
+	return cloudColor;
+}
 #		endif
 #	endif
 

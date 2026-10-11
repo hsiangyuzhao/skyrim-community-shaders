@@ -55,6 +55,15 @@ public:
 		/// rotation (upstream 54962ef3b). Physical Sky then reads each moon's on-screen
 		/// direction (upstream b2d671ba8's idea), so its glow sits on the disc.
 		bool KeepMoonPosition = true;
+		/// (42b) LightSourceModel: what the one directional (shadow-casting) light is.
+		/// 0 Clock (42a and earlier): the sun from 6:30 to 19:30 by the climate's clock, a moon outside
+		///   it with clock fades, so there was a stretch at dawn and dusk with no light at all.
+		/// 1 Combined (default): sun + moons added, each by its true height above the horizon; the
+		///   direction follows the brightest body and hands over smoothly (spec-skysync D1-D6).
+		int32_t LightSourceModel = 1;
+		/// (42b) Combined: both moons add their light (Secunda at 0.67, by phase). Off: only the moon
+		/// picked by "Moon light source" (Brightest = a smooth blend that is as bright as the brighter).
+		bool BothMoonsLight = false;
 	};
 
 	Settings settings;
@@ -129,6 +138,13 @@ private:
 		Count
 	};
 
+	enum class LightSourceModel : int32_t
+	{
+		Clock,
+		Combined,
+		Count
+	};
+
 	enum class SunPath : uint8_t
 	{
 		Southern,
@@ -141,6 +157,7 @@ private:
 	const char* MoonLightSourceNames[static_cast<uint8_t>(MoonLightSource::Count)] = { "Brightest", "Masser", "Secunda" };
 	const char* SunPathNames[static_cast<uint8_t>(SunPath::Count)] = { "Southern Sky", "Northern Sky", "Vanilla", "Custom" };
 	const char* MoonOrbitNames[static_cast<int32_t>(MoonOrbit::Count)] = { "Vanilla", "Stable", "Night Sky" };
+	const char* LightSourceModelNames[static_cast<int32_t>(LightSourceModel::Count)] = { "Clock (old)", "Combined" };
 
 	struct ClimateTimings
 	{
@@ -181,6 +198,52 @@ private:
 		void Reset();
 	};
 
+	/// (42b) Direction hand-over of the Combined light model (spec-skysync D2): the light's direction
+	/// follows `dominant`. A new dominant body close in the sky (TurnMaxAngle) is turned to over
+	/// FadeTime at full brightness; one far away is reached by fading the light to 0 on the old
+	/// direction, switching while it is 0, and fading back in (FadeTime in all), so the direction
+	/// never sweeps across the sky under visible light.
+	struct CombinedHandover
+	{
+		enum class Phase : uint8_t
+		{
+			Steady,
+			Turn,
+			FadeOut,
+			FadeIn
+		};
+
+		static constexpr float FadeTime = 100.0f;      // game seconds: 5 real seconds at timescale 20, as ShadowFader
+		static constexpr float TurnMaxAngle = 25.0f;   // degrees: closer than this, turn instead of fading
+		static constexpr float Hysteresis = 1.25f;     // a new body must be this much brighter to take over
+
+		Phase phase = Phase::Steady;
+		Caster dominant = Caster::None;  // body whose direction the light uses now
+		Caster target = Caster::None;    // body it is heading to
+		float weight = 1.0f;             // hand-over brightness (1 outside a fade)
+		float turnTimer = 0.0f;
+		RE::NiPoint3 turnFrom = { 0.0f, 0.0f, 1.0f };
+		RE::NiPoint3 lastDir = { 0.0f, 0.0f, 1.0f };
+		float previousHoursPassed = -1.0f;
+
+		/// Advances by a_advance game seconds towards a_best; a_snap jumps straight there (time skip,
+		/// load). Returns the direction to use this frame.
+		RE::NiPoint3 Step(Caster a_best, const RE::NiPoint3 a_dirs[3], float a_advance, bool a_snap);
+		void Reset();
+	};
+
+	// (42b) Combined model constants (degrees of true elevation).
+	static constexpr float SunFullElevation = 3.0f;         // sun at full strength from here up
+	static constexpr float SunResidual = 0.1f;              // sun strength left at the horizon...
+	static constexpr float SunResidualEndElevation = -4.0f;  // ...fading to 0 here (x Physical Sky's Twilight Length)
+	static constexpr float MoonStartElevation = -1.0f;      // moon light 0 here...
+	static constexpr float MoonFullElevation = 3.0f;        // ...full here
+	static constexpr float MoonDayFadeStart = -2.0f;        // moons fade out as the sun climbs from here...
+	static constexpr float MoonDayFadeEnd = 6.0f;           // ...to here
+	/// Warm tint of the twilight sun while the light points at a moon: the shaders take the air's
+	/// colouring along the light's direction, which is then the moon's, not the low sun's.
+	static constexpr float SunTwilightTint[3] = { 1.0f, 0.5f, 0.25f };
+
 	static constexpr float RenderDistance = 325000.0f;
 	static constexpr float SunHorizonDistance = 280.0f;
 	static constexpr float SunPeakDistance = 400.0f;
@@ -219,8 +282,17 @@ private:
 	float intensities[3] = {};
 	std::optional<std::array<RE::NiColor, 3>> lightColors = {};  // assigned externally by Physical Sky
 	ShadowFader shadowFader;
+	CombinedHandover combinedHandover;
+	int32_t lastLightSourceModel = -1;
 
 	void DisableOnConflict(std::string_view conflictName);
+
+	/// (42b) The Combined light model: sums sun + moons by true elevation and writes the light.
+	void UpdateCombined(const RE::Sky* sky);
+	/// (42b) Writes the light for the Combined model. With Physical Sky's colours the brightness goes
+	/// into the colour and fade stays 1 (upstream 56784ccd1); without them (vanilla colour, which the
+	/// game writes) fade is still the dimmer.
+	static void SetLightingCombined(const RE::Sun* sun, RE::NiPoint3 dir, std::optional<RE::NiColor> color, float vanillaFade, float vlFactor);
 
 	void Update(const RE::Sky* sky);
 
@@ -261,4 +333,9 @@ public:
 	static bool OnScreenDirection(const RE::Moon* moon, const RE::Sky* sky, RE::NiPoint3& outDir);
 
 	static float SmoothStep(float start, float end, float x);
+
+	/// (42b) How much of the moons' light is left with the sun at this true elevation (degrees):
+	/// 1 below MoonDayFadeStart, 0 above MoonDayFadeEnd. Used by the Combined light model and by
+	/// Physical Sky's cloud lighting.
+	static float MoonDayFade(float sunElevationDeg);
 };

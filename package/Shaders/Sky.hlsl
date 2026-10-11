@@ -296,8 +296,13 @@ PS_OUTPUT main(PS_INPUT input)
 #		endif
 
 #		if defined(PS_CLOUDS) && defined(CLOUD_SHADOWS) 
-	if (SharedData::physSkyData.enabled)
-		baseColor.rgb = PhysSky::RelightCloud(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, SampBaseSampler);
+	if (SharedData::physSkyData.enabled) {
+		// (42b) "Cloud Lighting": Sun + Moons + Sky, or the single directional light as before.
+		[branch] if (SharedData::physSkyCloudData.Flags & SharedData::PhysSkyCloudFlags::MultiLight)
+			baseColor.rgb = PhysSky::RelightCloudMulti(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, PhysSky::SampSv, SampBaseSampler);
+		else
+			baseColor.rgb = PhysSky::RelightCloud(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, SampBaseSampler);
+	}
 #		endif
 
 #		if defined(DITHER)
@@ -364,6 +369,28 @@ PS_OUTPUT main(PS_INPUT input)
 		// IsMoon is only set on the two discs, never on the star mask.
 		[branch] if ((extFlags & SharedData::PhysSkyExtFlags::MoonPhysicalRadiance) && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsMoon))
 			psout.Color.xyz *= (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSecunda) ? SharedData::physSkyMoonData.SecundaDiskScale : SharedData::physSkyMoonData.MasserDiskScale;
+		// (42b) Moons Fade in Daylight. The disc is drawn in the weather's moon colour whatever the time
+		// of day; the physical sky by day is far darker than that colour (it is brought up later by the
+		// exposure), so a daytime moon stood out as at night. A real daytime moon is pale: the bright
+		// air in front of it adds to it. Here the disc becomes more see-through as the sky around it
+		// gets brighter compared with the disc: alpha x 1 / (1 + strength x day x sky / disc).
+		// The sky is read 30 degrees to either side of the moon, outside the moon's own glow, and the
+		// whole effect is gated by daylight (sun -6 -> +6 degrees), so nights are never changed.
+		[branch] if ((SharedData::physSkyCloudData.Flags & SharedData::PhysSkyCloudFlags::MoonDaylightFade) && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsMoon))
+		{
+			const float3 moonViewDir = normalize(input.WorldPosition.xyz);
+			const float rotCos = 0.8660254, rotSin = 0.5;
+			const float3 sideA = float3(moonViewDir.x * rotCos - moonViewDir.y * rotSin, moonViewDir.x * rotSin + moonViewDir.y * rotCos, moonViewDir.z);
+			const float3 sideB = float3(moonViewDir.x * rotCos + moonViewDir.y * rotSin, -moonViewDir.x * rotSin + moonViewDir.y * rotCos, moonViewDir.z);
+			const float day = smoothstep(-0.1045285, 0.1045285, normalize(SharedData::physSkyNightData.LutSunDir).z);
+			const float skyLuminance = day * 0.5 *
+			                           (Color::RGBToLuminance(PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(sideA), 0).rgb) +
+										   Color::RGBToLuminance(PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(sideB), 0).rgb));
+			float discLuminance = Color::RGBToLuminance(Color::Sky(input.Color.xyz));
+			[branch] if (extFlags & SharedData::PhysSkyExtFlags::MoonPhysicalRadiance)
+				discLuminance *= (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSecunda) ? SharedData::physSkyMoonData.SecundaDiskScale : SharedData::physSkyMoonData.MasserDiskScale;
+			psout.Color.w *= rcp(1.0 + SharedData::physSkyCloudData.MoonDaylightFade * max(skyLuminance, 0.0) / max(discLuminance, 1e-4));
+		}
 		// (batch 37b) Replace mode: the disk lives on the vanilla sun quad only (main view, not
 		// reflections), and the quad's own texture is dropped. Without it the disk is added on
 		// top of every TEX quad as in 37a -- including the glare quad.

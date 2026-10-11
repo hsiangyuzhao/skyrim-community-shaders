@@ -121,10 +121,23 @@ void PhysicalSky::RestoreDefaultSettings()
 void PhysicalSky::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	// (42b) Outside the NLOHMANN macro, which takes at most 64 fields.
+	if (o_json.is_object()) {
+		const Settings defaults{};
+		settings.cloudLighting = o_json.value("cloudLighting", defaults.cloudLighting);
+		settings.cloudSkyAmbient = o_json.value("cloudSkyAmbient", defaults.cloudSkyAmbient);
+		settings.cloudLightHeightKm = o_json.value("cloudLightHeightKm", defaults.cloudLightHeightKm);
+		settings.moonsFadeInDaylight = o_json.value("moonsFadeInDaylight", defaults.moonsFadeInDaylight);
+		settings.moonDaylightFade = o_json.value("moonDaylightFade", defaults.moonDaylightFade);
+	}
 	settings.moonGlowFade = std::clamp(settings.moonGlowFade, 0, kMoonGlowFadeCount - 1);
 	settings.skyModel = std::clamp(settings.skyModel, 0, kSkyModelCount - 1);
 	settings.nightBaseLight = std::clamp(settings.nightBaseLight, 0.f, 1.f);
 	settings.twilightLength = std::clamp(settings.twilightLength, 1.f, 3.f);
+	settings.cloudLighting = std::clamp(settings.cloudLighting, 0, kCloudLightingCount - 1);
+	settings.cloudSkyAmbient = std::clamp(settings.cloudSkyAmbient, 0.f, 4.f);
+	settings.cloudLightHeightKm = std::clamp(settings.cloudLightHeightKm, 0.5f, 12.f);
+	settings.moonDaylightFade = std::clamp(settings.moonDaylightFade, 0.f, 100.f);
 
 	// (batch 37b) A saved whitelist replaces the default one wholesale. Merge the defaults back
 	// in, except those the user removed, so defaults added later still reach older configs.
@@ -259,6 +272,12 @@ PhysicalSky::WorldspaceStatus PhysicalSky::GetWorldspaceStatus(float& a_zBottom)
 void PhysicalSky::SaveSettings(json& o_json)
 {
 	o_json = settings;
+	// (42b) See LoadSettings.
+	o_json["cloudLighting"] = settings.cloudLighting;
+	o_json["cloudSkyAmbient"] = settings.cloudSkyAmbient;
+	o_json["cloudLightHeightKm"] = settings.cloudLightHeightKm;
+	o_json["moonsFadeInDaylight"] = settings.moonsFadeInDaylight;
+	o_json["moonDaylightFade"] = settings.moonDaylightFade;
 }
 
 void PhysicalSky::DrawSettings()
@@ -341,7 +360,8 @@ void PhysicalSky::SettingsGeneral()
 			"For comparing only. Legacy (36f): every Physical Sky and Sky Sync option added after 36f is\n"
 			"used at its 36f value while this is selected (sun look and alignment, fixes, moon glow at full\n"
 			"strength without fading, new-moon disc, Vanilla moon orbit, discs lowered by altitude, no night\n"
-			"base light, no twilight changes, the old worldspace list). Your own values are kept and come back\n"
+			"base light, no twilight changes, the old worldspace list, the 42a cloud lighting and moon discs, the\n"
+			"Clock light source model). Your own values are kept and come back\n"
 			"with Current. Colours, exposures, atmosphere and clouds are always yours.");
 	LegacyNote(IsLegacy());
 
@@ -646,6 +666,21 @@ void PhysicalSky::SettingsCelestials()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Largest multiple of the game's disc brightness. Now: Masser x%.1f, Secunda x%.1f.", moonCbData.masserDiskScale, moonCbData.secundaDiskScale);
 	}
+	ImGui::Checkbox("Moons Fade in Daylight", &settings.moonsFadeInDaylight);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"A moon in the daytime sky is pale and washed out, because the bright sky lies in front of it.\n"
+			"The game draws the discs at the same strength by day and by night, and the physical sky by day is\n"
+			"much darker than the disc, so a moon at 10:00 stood out as clearly as at night.\n"
+			"On (default): the disc is drawn more see-through the brighter the sky is around it compared with\n"
+			"the disc. No change at night. Off: as before.");
+	if (settings.moonsFadeInDaylight) {
+		ImGui::SliderFloat("Daylight Fade Strength", &settings.moonDaylightFade, 0.f, 100.f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Higher = paler moons by day. Default 20: at noon a moon keeps roughly 40%% of its contrast,\n"
+				"in the early morning about 60%%, in twilight almost all of it.");
+	}
 
 	ImGui::SeparatorText("New Moon");
 	ImGui::Checkbox("Hide New Moon Disc", &settings.hideNewMoonDisc);
@@ -753,6 +788,33 @@ void PhysicalSky::SettingsFixes()
 void PhysicalSky::SettingsClouds()
 {
 	InfoBox("Clouds.");
+	LegacyNote(IsLegacy());
+
+	static constexpr const char* cloudLightingNames[kCloudLightingCount] = { "Single light (old)", "Sun + Moons + Sky" };
+	ImGui::Combo("Cloud Lighting", &settings.cloudLighting, cloudLightingNames, kCloudLightingCount);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"What lights the clouds.\n"
+			"Sun + Moons + Sky (default): the sun lights them whatever lights the ground, coloured by the air\n"
+			"between the sun and the cloud, so high clouds stay pink and orange for a while after sunset and\n"
+			"turn first at dawn; they go dark only when the planet's own shadow reaches them. Both moons add\n"
+			"their light (by phase, gone below the horizon or in weathers that hide them), and the sky adds\n"
+			"its own glow, so clouds are never pitch black against a lit sky.\n"
+			"Single light (old): only the one sun-or-moon light that casts shadows. Clouds went black at dawn\n"
+			"and dusk while it switched over, and lost the sun the moment it set.");
+	if (settings.cloudLighting == kCloudLightingAll) {
+		ImGui::SliderFloat("Sky Light on Clouds", &settings.cloudSkyAmbient, 0.f, 4.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"How much the sky's own light (blue by day, the night base light at night) brightens the clouds,\n"
+				"mostly their shaded sides. 0 = none. Default 1.");
+		ImGui::SliderFloat("Cloud Height for Sunlight", &settings.cloudLightHeightKm, 0.5f, 12.f, "%.1f km", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"How high the clouds count as for catching the sun (the drawn clouds do not move). Higher = they\n"
+				"stay lit longer after sunset and light up earlier before sunrise, redder. Default 2 km: lit until\n"
+				"the sun is about 1.5 degrees below the horizon (more with a longer Twilight Length).");
+	}
 
 	ImGui::SliderFloat("Vanilla Mix", &settings.cloudOriginalMix, 0.f, 2.f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -1115,6 +1177,54 @@ void PhysicalSky::UpdateNightBaseLight(float a_sunElevation)
 	nightCbData.flags = kNightBaseLight;
 }
 
+void PhysicalSky::UpdateCloudData(float a_exposure, float a_sunElevation)
+{
+	cloudCbData = {};
+	const auto& s = effective;
+
+	if (s.moonsFadeInDaylight) {
+		cloudCbData.flags |= kCloudMoonDaylightFade;
+		cloudCbData.moonDaylightFade = std::clamp(s.moonDaylightFade, 0.f, 100.f);
+	}
+
+	if (s.cloudLighting != kCloudLightingAll)
+		return;  // no flag: Sky.hlsl runs the 42a RelightCloud exactly
+	cloudCbData.flags |= kCloudMultiLight;
+
+	// The same scale the directional light reaches the shaders with (State::UpdateSharedData):
+	// colour x exposure / PBR compensation (as overrideDirLight writes it) x the image space's
+	// sunlight scale. At noon the sun on the clouds is then exactly what the old single light gave.
+	const float pbrCompensation = globals::features::linearLighting.settings.enableLinearLighting ? 1.f : RE::NI_PI;
+	float sunlightScale = 1.f;
+	if (auto* imageSpaceManager = RE::ImageSpaceManager::GetSingleton())
+		sunlightScale = !globals::game::isVR ? imageSpaceManager->GetRuntimeData().data.baseData.hdr.sunlightScale : imageSpaceManager->GetVRRuntimeData().data.baseData.hdr.sunlightScale;
+	if (!std::isfinite(sunlightScale) || sunlightScale < 0.f)
+		sunlightScale = 1.f;
+	const float scale = a_exposure * sunlightScale / pbrCompensation;
+
+	// The sun: no horizon factor here. Sky.hlsl applies the transmittance and the planet's shadow
+	// at the cloud, which is what keeps high clouds lit after sunset.
+	cloudCbData.sunColor = settings.sunlightColor * scale;
+
+	// The moons: phase, the true elevation with the weather (the 41b glow visibility) and, as for the
+	// ground light in Sky Sync's Combined model, gone as the sun comes up (the moonlight colours are
+	// far above a real moon's, so by day they would brighten the clouds).
+	if (auto* sky = globals::game::sky) {
+		const auto& skySync = globals::features::skySync;
+		const float dayFade = SkySync::MoonDayFade(DirectX::XMConvertToDegrees(a_sunElevation));
+		const float masser = SkySync::PhaseFactorFromTexture(sky->masser) *
+		                     MoonHorizonVisibility(sky->masser, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)].z) * dayFade;
+		const float secunda = SkySync::PhaseFactorFromTexture(sky->secunda) * SkySync::SecundaIntensityFactor *
+		                      MoonHorizonVisibility(sky->secunda, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)].z) * dayFade;
+		cloudCbData.masserColor = settings.masserColor * (scale * masser);
+		cloudCbData.secundaColor = settings.secundaColor * (scale * secunda);
+	}
+
+	cloudCbData.skyAmbient = std::clamp(s.cloudSkyAmbient, 0.f, 4.f);
+	// Cloud Shadows' layer is 0.5 km above the camera's ground; only the extra goes in.
+	cloudCbData.heightOffset = (std::clamp(s.cloudLightHeightKm, 0.5f, 12.f) - 0.5f) / Util::Units::GAME_UNIT_TO_KM;
+}
+
 bool PhysicalSky::UseLegacyPaths() const
 {
 	return !Batch37b::IsOn() || IsLegacy();
@@ -1155,6 +1265,9 @@ void PhysicalSky::UpdateEffective()
 	e.nightBaseLight = 0.f;
 	e.skyTrueSunHeight = false;
 	e.twilightLength = 1.f;
+	// 42b
+	e.cloudLighting = kCloudLightingSingle;
+	e.moonsFadeInDaylight = false;
 }
 
 void PhysicalSky::ApplySunLook(int a_look)
@@ -1216,6 +1329,7 @@ void PhysicalSky::Reset()
 		if (skySync.loaded && skySync.settings.Enabled)
 			skySync.lightColors = std::nullopt;
 		cbData.enabled = allGood;
+		cloudCbData = {};
 		linearLighting.isDirLightLinear = false;
 		return;
 	}
@@ -1284,6 +1398,7 @@ void PhysicalSky::Reset()
 
 	float3 masserGlow, secundaGlow;
 	UpdateMoonData(exposure, masserGlow, secundaGlow);
+	UpdateCloudData(exposure, std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f)));
 
 	cbData = {
 		.texDim = res,
@@ -1530,8 +1645,10 @@ void PhysicalSky::SetSunDrawFlags(const RE::BSRenderPass* a_pass)
 			 globals::features::physicalSky.Effective().hideNewMoonDisc && IsNewMoonDraw(a_pass))
 		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsNewMoon);
 
-	// (40d) The moon disc itself (not its star mask, SO_MOON_SHADOW), for "Moon Physical Brightness".
-	if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON && globals::features::physicalSky.Effective().moonPhysicalRadiance) {
+	// (40d) The moon disc itself (not its star mask, SO_MOON_SHADOW), for "Moon Physical Brightness"
+	// and (42b) "Moons Fade in Daylight". Sky.hlsl checks each option's own flag.
+	if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON &&
+		(globals::features::physicalSky.Effective().moonPhysicalRadiance || globals::features::physicalSky.Effective().moonsFadeInDaylight)) {
 		if (const auto sky = RE::Sky::GetSingleton(); sky && a_pass->geometry) {
 			const auto* geometry = static_cast<const void*>(a_pass->geometry);
 			if (sky->masser && geometry == sky->masser->moonMesh.get())

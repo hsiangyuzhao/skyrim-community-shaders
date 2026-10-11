@@ -14,7 +14,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	MasserNightPosition,
 	SecundaNightPosition,
 	NightArc,
-	KeepMoonPosition)
+	KeepMoonPosition,
+	LightSourceModel,
+	BothMoonsLight)
 
 void SkySync::DrawSettings()
 {
@@ -40,7 +42,32 @@ void SkySync::DrawSettings()
 
 	ImGui::SliderInt("Moon light source", &settings.MoonLightSource, 0, static_cast<uint8_t>(MoonLightSource::Count) - 1, MoonLightSourceNames[settings.MoonLightSource], ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Which moon lights the night. Brightest = whichever moon is brighter.");
+		ImGui::Text(
+			"Which moon lights the night. Brightest = whichever moon is brighter (recommended: when one moon\n"
+			"sets, the other takes over). Masser or Secunda: only that moon, so the night goes dark when it sets.");
+
+	if (globals::features::physicalSky.IsLegacy())
+		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Physical Sky's Sky Model is Legacy (36f): Light Source Model is Clock right now.");
+	if (ImGui::Combo("Light Source Model", &settings.LightSourceModel, LightSourceModelNames, static_cast<int>(LightSourceModel::Count)))
+		settings.LightSourceModel = std::clamp(settings.LightSourceModel, 0, static_cast<int32_t>(LightSourceModel::Count) - 1);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted(
+			"How the one sun/moon light (the light that casts shadows) is chosen.\n"
+			"Combined (default): sun and moon light are added together, each by how high it really is in the\n"
+			"sky. The sun keeps a faint warm glow until a few degrees below the horizon, the moons come in as\n"
+			"they rise and fade as the sun comes up, so dawn and dusk have no dark gap. Shadows come from the\n"
+			"brightest body; when that changes, the light turns over (nearby) or dips for a few seconds and\n"
+			"comes back from the new side (far apart), instead of sweeping across the sky.\n"
+			"Clock (old): the sun from 6:30 to 19:30, a moon outside that, switched by the clock. Before\n"
+			"sunrise and after sunset there was a stretch with no light at all.");
+	if (settings.LightSourceModel == static_cast<int32_t>(LightSourceModel::Combined)) {
+		ImGui::Checkbox("Both Moons Light the Scene", &settings.BothMoonsLight);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"On: Masser and Secunda both add their light (each by its phase and height), so a night with\n"
+				"both moons up is brighter. Shadows still come from the moon picked above.\n"
+				"Off (default): only the moon picked by \"Moon light source\" lights the scene, as bright as before.");
+	}
 
 	if (globals::features::physicalSky.IsLegacy())
 		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Physical Sky's Sky Model is Legacy (36f): Moon Orbit is Vanilla and the discs\nare lowered by altitude right now, whatever is set below.");
@@ -88,6 +115,7 @@ SkySync::Settings SkySync::Effective() const
 		// 36f: the engine's own moon stepping, discs lowered by altitude (40d/40e options off).
 		s.MoonOrbit = static_cast<int32_t>(MoonOrbit::Vanilla);
 		s.KeepMoonPosition = false;
+		s.LightSourceModel = static_cast<int32_t>(LightSourceModel::Clock);  // (42b)
 	}
 	return s;
 }
@@ -101,6 +129,7 @@ void SkySync::LoadSettings(json& o_json)
 	settings.MasserNightPosition = std::clamp(settings.MasserNightPosition, -60.0f, 60.0f);
 	settings.SecundaNightPosition = std::clamp(settings.SecundaNightPosition, -60.0f, 60.0f);
 	settings.NightArc = std::clamp(settings.NightArc, 0.0f, 140.0f);
+	settings.LightSourceModel = std::clamp(settings.LightSourceModel, 0, static_cast<int32_t>(LightSourceModel::Count) - 1);
 	SetSunAngle();
 }
 
@@ -174,7 +203,10 @@ void SkySync::Update(const RE::Sky* sky)
 	if (const auto cell = player->GetParentCell(); cell != currentCell) {
 		SetSkyRotation(sky, cell);
 		if (currentCell && (cell->IsInteriorCell() != currentCell->IsInteriorCell() || cell->GetRuntimeData().worldSpace != currentCell->GetRuntimeData().worldSpace))
-			shadowFader.Reset();
+			{
+				shadowFader.Reset();
+				combinedHandover.Reset();
+			}
 	}
 
 	const float time = sky->currentGameHour;
@@ -187,7 +219,267 @@ void SkySync::Update(const RE::Sky* sky)
 	ProcessMoon(sky->masser, time, Caster::Masser, altitude, isDayTime);
 	ProcessMoon(sky->secunda, time, Caster::Secunda, altitude, isDayTime);
 
-	shadowFader.Update(sun, directions, intensities, lightColors, isDayTime);
+	// (42b) A model change (menu, A/B Compare) starts the new model from scratch.
+	const int32_t model = Effective().LightSourceModel;
+	if (model != lastLightSourceModel) {
+		shadowFader.Reset();
+		combinedHandover.Reset();
+		lastLightSourceModel = model;
+	}
+
+	if (model == static_cast<int32_t>(LightSourceModel::Combined))
+		UpdateCombined(sky);
+	else
+		shadowFader.Update(sun, directions, intensities, lightColors, isDayTime);
+}
+
+float SkySync::MoonDayFade(const float sunElevationDeg)
+{
+	return 1.0f - SmoothStep(MoonDayFadeStart, MoonDayFadeEnd, sunElevationDeg);
+}
+
+void SkySync::UpdateCombined(const RE::Sky* sky)
+{
+	constexpr int sunIdx = static_cast<int>(Caster::Sun);
+	constexpr int masserIdx = static_cast<int>(Caster::Masser);
+	constexpr int secundaIdx = static_cast<int>(Caster::Secunda);
+	auto elevationDeg = [](const RE::NiPoint3& d) {
+		return DirectX::XMConvertToDegrees(std::asin(std::clamp(d.z, -1.0f, 1.0f)));
+	};
+
+	// Strength of each body from its true elevation (rawDirections: no altitude dip, no clamp).
+	const float sunElevation = elevationDeg(rawDirections[sunIdx]);
+	float twilight = 1.0f;
+	if (const auto& physicalSky = globals::features::physicalSky; physicalSky.loaded)
+		twilight = std::clamp(physicalSky.Effective().twilightLength, 1.0f, 3.0f);
+	float strength[3] = {};
+	strength[sunIdx] = SunResidual * SmoothStep(SunResidualEndElevation * twilight, 0.0f, sunElevation) +
+	                   (1.0f - SunResidual) * SmoothStep(0.0f, SunFullElevation, sunElevation);
+
+	// The moons: phase, height, and gone by day. The weather does not switch them off (as in the
+	// Clock model: overcast nights keep their moonlight).
+	const float dayFade = MoonDayFade(sunElevation);
+	const RE::Moon* moons[3] = { nullptr, sky->masser, sky->secunda };
+	for (const int i : { masserIdx, secundaIdx }) {
+		if (!moons[i] || !moons[i]->moonMesh)
+			continue;
+		float s = SmoothStep(MoonStartElevation, MoonFullElevation, elevationDeg(rawDirections[i]));
+		s *= PhaseFactorFromTexture(moons[i]) * dayFade;
+		if (i == secundaIdx)
+			s *= SecundaIntensityFactor;
+		strength[i] = s;
+	}
+
+	// Brightness of each, for picking the direction and blending the moons.
+	const bool hasColors = lightColors.has_value();
+	auto luminance = [](const RE::NiColor& c) { return 0.2126f * c.red + 0.7152f * c.green + 0.0722f * c.blue; };
+	float weight[3];
+	for (int i = 0; i < 3; ++i)
+		weight[i] = strength[i] * (hasColors ? std::max(luminance((*lightColors)[i]), 0.0f) : 1.0f);
+
+	// Which moons are in the sum.
+	const auto src = static_cast<MoonLightSource>(settings.MoonLightSource);
+	float share[3] = { 1.0f, 0.0f, 0.0f };
+	if (settings.BothMoonsLight) {
+		share[masserIdx] = 1.0f;
+		share[secundaIdx] = 1.0f;
+	} else if (src == MoonLightSource::Masser) {
+		share[masserIdx] = 1.0f;
+	} else if (src == MoonLightSource::Secunda) {
+		share[secundaIdx] = 1.0f;
+	} else if (const float moonSum = weight[masserIdx] + weight[secundaIdx]; moonSum > 0.0f) {
+		// Brightest, without a jump when the two cross: each by its share of the moonlight. As bright as
+		// the brighter moon when one dominates, and at the crossing.
+		share[masserIdx] = weight[masserIdx] / moonSum;
+		share[secundaIdx] = weight[secundaIdx] / moonSum;
+	}
+
+	// Direction: the brightest body, among the moons only those "Moon light source" allows.
+	auto best = Caster::None;
+	float bestWeight = 0.0f;
+	for (int i = 0; i < 3; ++i) {
+		if ((i == masserIdx && src == MoonLightSource::Secunda) || (i == secundaIdx && src == MoonLightSource::Masser))
+			continue;
+		if (weight[i] > bestWeight) {
+			bestWeight = weight[i];
+			best = static_cast<Caster>(i);
+		}
+	}
+	// Hysteresis (D1): the body the light is heading to keeps it until another is clearly brighter.
+	if (const auto held = combinedHandover.target; held != Caster::None && best != held) {
+		const float heldWeight = weight[static_cast<int>(held)];
+		const bool heldAllowed = !((held == Caster::Masser && src == MoonLightSource::Secunda) || (held == Caster::Secunda && src == MoonLightSource::Masser));
+		if (heldAllowed && heldWeight > 0.0f && bestWeight < heldWeight * CombinedHandover::Hysteresis)
+			best = held;
+	}
+
+	// Time skips (waiting, fast travel, console) and a stopped clock jump straight to the result.
+	const auto calendar = RE::Calendar::GetSingleton();
+	const float hoursPassed = calendar ? calendar->GetHoursPassed() : 0.0f;
+	const float timeScale = calendar ? calendar->GetTimescale() : 0.0f;
+	const bool snap = combinedHandover.previousHoursPassed < 0.0f || timeScale <= 0.0f || std::abs(hoursPassed - combinedHandover.previousHoursPassed) >= 0.01f;
+	combinedHandover.previousHoursPassed = hoursPassed;
+	const float deltaTime = globals::game::deltaTime ? *globals::game::deltaTime : 0.0f;
+	const float advance = std::max(deltaTime * timeScale, 0.0f);
+
+	const RE::NiPoint3 dir = combinedHandover.Step(best, directions, advance, snap);
+	const float handover = combinedHandover.weight;
+	const auto dominant = combinedHandover.dominant;
+
+	// The sum. The twilight sun gets a warm tint while the light points at a moon (see SunTwilightTint).
+	std::optional<RE::NiColor> color = std::nullopt;
+	float total = 0.0f;
+	RE::NiColor sum{ 0.0f, 0.0f, 0.0f };
+	for (int i = 0; i < 3; ++i) {
+		const float f = share[i] * strength[i];
+		if (!(f > 0.0f))
+			continue;
+		total += f;
+		if (hasColors) {
+			RE::NiColor c = f * (*lightColors)[i];
+			if (i == sunIdx && dominant != Caster::Sun) {
+				c.red *= SunTwilightTint[0];
+				c.green *= SunTwilightTint[1];
+				c.blue *= SunTwilightTint[2];
+			}
+			sum += c;
+		}
+	}
+	if (hasColors)
+		color = handover * sum;
+
+	const float dominantStrength = dominant == Caster::None ? 0.0f : strength[static_cast<int>(dominant)];
+	volumetricLightingIsMoon = dominant == Caster::Masser || dominant == Caster::Secunda;
+	SetLightingCombined(sky->sun, dir, color, std::min(total, 1.0f) * handover, std::min(dominantStrength, 1.0f) * handover);
+}
+
+void SkySync::SetLightingCombined(const RE::Sun* sun, RE::NiPoint3 dir, std::optional<RE::NiColor> color, const float vanillaFade, const float vlFactor)
+{
+	ShadowFader::ClampDirection(dir);
+
+	RE::NiMatrix3& m = sun->light->local.rotate;
+	m.entry[0][0] = -dir.x;
+	m.entry[1][0] = -dir.y;
+	m.entry[2][0] = -dir.z;
+
+	auto& light = sun->light->GetLightRuntimeData();
+	if (color.has_value()) {
+		// Upstream 56784ccd1: fade = 0 blacked out effect meshes while the light changed over. The
+		// brightness is in the colour instead.
+		light.diffuse = *color;
+		light.fade = 1.0f;
+	} else {
+		// No Physical Sky colours: the colour is the weather's, written by the game, so fade stays the
+		// dimmer here (as in the Clock model).
+		light.fade = std::clamp(vanillaFade, 0.0f, 1.0f);
+	}
+
+	RE::NiUpdateData updateData;
+	sun->light->Update(updateData);
+
+	volumetricLightingIntensityFactor = std::clamp(vlFactor, 0.0f, 1.0f);
+}
+
+void SkySync::CombinedHandover::Reset()
+{
+	phase = Phase::Steady;
+	dominant = Caster::None;
+	target = Caster::None;
+	weight = 1.0f;
+	turnTimer = 0.0f;
+	turnFrom = { 0.0f, 0.0f, 1.0f };
+	lastDir = { 0.0f, 0.0f, 1.0f };
+	previousHoursPassed = -1.0f;
+}
+
+RE::NiPoint3 SkySync::CombinedHandover::Step(const Caster a_best, const RE::NiPoint3 a_dirs[3], const float a_advance, const bool a_snap)
+{
+	// A usable direction for a body (None: keep the last one; the light is ~0 then anyway).
+	auto dirOf = [&](const Caster c) {
+		if (c == Caster::None)
+			return lastDir;
+		RE::NiPoint3 d = a_dirs[static_cast<int>(c)];
+		if (d.Unitize() <= FLT_EPSILON)  // D6: never a zero vector
+			return lastDir;
+		return d;
+	};
+	auto angleDeg = [](const RE::NiPoint3& a, const RE::NiPoint3& b) {
+		return DirectX::XMConvertToDegrees(std::acos(std::clamp(a.Dot(b), -1.0f, 1.0f)));
+	};
+
+	if (a_snap) {
+		dominant = target = a_best;
+		phase = Phase::Steady;
+		weight = 1.0f;
+		lastDir = dirOf(dominant);
+		return lastDir;
+	}
+
+	const float half = FadeTime * 0.5f;
+	if (a_best != target) {
+		target = a_best;
+		if (dominant == Caster::None || target == Caster::None) {
+			// Coming from or going to "no light": the sum is ~0 at that moment, so the direction can
+			// change at once; the body's own horizon ramp does the fading.
+			if (phase == Phase::FadeOut || phase == Phase::FadeIn)
+				phase = Phase::FadeIn;  // finish bringing the weight back up
+			else
+				phase = Phase::Steady;
+			if (target != Caster::None)
+				dominant = target;
+			else
+				dominant = Caster::None;
+		} else if (phase != Phase::FadeOut && phase != Phase::FadeIn && angleDeg(lastDir, dirOf(target)) <= TurnMaxAngle) {
+			phase = Phase::Turn;
+			turnFrom = lastDir;
+			turnTimer = 0.0f;
+			dominant = target;
+		} else if (phase == Phase::FadeOut && target == dominant) {
+			phase = Phase::FadeIn;  // the old body is back on top: fade back in, same direction
+		} else if (phase != Phase::FadeOut) {
+			phase = Phase::FadeOut;  // from the current weight (re-planned mid fade-in, D2)
+		}
+	}
+
+	RE::NiPoint3 dir = dirOf(dominant);
+	switch (phase) {
+	case Phase::Turn:
+		{
+			turnTimer = std::min(turnTimer + a_advance, FadeTime);
+			const float t = SmoothStep(0.0f, 1.0f, turnTimer / FadeTime);
+			RE::NiPoint3 blended = turnFrom * (1.0f - t) + dir * t;  // < 25 degrees apart: no cancellation
+			if (blended.Unitize() > FLT_EPSILON)
+				dir = blended;
+			weight = 1.0f;
+			if (turnTimer >= FadeTime)
+				phase = Phase::Steady;
+			break;
+		}
+	case Phase::FadeOut:
+		weight = std::max(weight - a_advance / half, 0.0f);
+		dir = lastDir;  // the old direction, held while the light fades (also mid-turn)
+		if (weight <= 0.0f) {
+			// The direction changes only here, at zero light (D2).
+			dominant = target;
+			dir = dirOf(dominant);
+			phase = target == Caster::None ? Phase::Steady : Phase::FadeIn;
+			if (target == Caster::None)
+				weight = 1.0f;
+		}
+		break;
+	case Phase::FadeIn:
+		weight = std::min(weight + a_advance / half, 1.0f);
+		if (weight >= 1.0f)
+			phase = Phase::Steady;
+		break;
+	case Phase::Steady:
+	default:
+		weight = 1.0f;
+		break;
+	}
+
+	lastDir = dir;
+	return dir;
 }
 void SkySync::SetSunAngle()
 {
@@ -457,7 +749,7 @@ void SkySync::ShadowFader::Update(const RE::Sun* sun, RE::NiPoint3 dirs[3], floa
 
 void SkySync::ShadowFader::SetLighting(const RE::Sun* sun, RE::NiPoint3 dir, float intensity, std::optional<RE::NiColor> color)
 {
-	ClampDirection(dir);
+	ShadowFader::ClampDirection(dir);
 
 	RE::NiMatrix3& m = sun->light->local.rotate;
 	m.entry[0][0] = -dir.x;
