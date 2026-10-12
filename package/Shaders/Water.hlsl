@@ -902,7 +902,8 @@ DiffuseOutput GetWaterDiffuseColor(PS_INPUT input, float3 normal, float3 viewDir
 	float3 refractionDepthAdjustedViewDirection = -viewDirection * refractionDepthMul;
 	float refractionViewSurfaceAngle = dot(refractionDepthAdjustedViewDirection, ReflectPlane[eyeIndex].xyz);
 
-	float refractionPlaneMul = (1 - ReflectPlane[eyeIndex].w / refractionViewSurfaceAngle);
+	// (44b) Camera on the water plane: 0 / 0 here. The divisor keeps its sign, never below 1e-4 units.
+	float refractionPlaneMul = (1 - ReflectPlane[eyeIndex].w / (refractionViewSurfaceAngle < 0.0 ? min(refractionViewSurfaceAngle, -1e-4) : max(refractionViewSurfaceAngle, 1e-4)));
 
 	if (refractionPlaneMul < 0.0) {
 		refractionUvRaw = FrameBuffer::DynamicResolutionParams2.xy * input.HPosition.xy * VPOSOffset.xy + VPOSOffset.zw;  // This value is already stereo converted for VR
@@ -1013,7 +1014,8 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 depthAdjustedViewDirection = -viewDirection * depthMul;
 	float viewSurfaceAngle = dot(depthAdjustedViewDirection, ReflectPlane[eyeIndex].xyz);
 
-	float planeMul = (1 - ReflectPlane[eyeIndex].w / viewSurfaceAngle);
+	// (44b) Camera on the water plane: 0 / 0 here. The divisor keeps its sign, never below 1e-4 units.
+	float planeMul = (1 - ReflectPlane[eyeIndex].w / (viewSurfaceAngle < 0.0 ? min(viewSurfaceAngle, -1e-4) : max(viewSurfaceAngle, 1e-4)));
 	distanceMul = saturate(
 		planeMul * float4(length(depthAdjustedViewDirection).xx, abs(viewSurfaceAngle).xx) /
 		FogParam.z);
@@ -1238,13 +1240,19 @@ PS_OUTPUT main(PS_INPUT input)
 
 #				endif
 #			endif
+	// (44b) Never hand a NaN / Inf on: the water is drawn into the fp16 scene (no clamp since
+	// upstream 2d3c1af68) and, with HDR on, the image-space chain after it is fp16 too.
+	finalColor = ((asuint(finalColor) & 0x7F800000u) == 0x7F800000u) ? 0.0 : finalColor;
 	psout.Lighting = float4(finalColor, isSpecular);
 #		endif
 
 #		if defined(STENCIL)
 	float3 viewDirection = normalize(input.WorldPosition.xyz);
-	float3 normal =
-		normalize(cross(ddx_coarse(input.WorldPosition.xyz), ddy_coarse(input.WorldPosition.xyz)));
+	// (44b) Edge-on (camera on the water plane) the two derivatives are parallel: the cross product
+	// is 0 and normalize() gave NaN in the water mask. VdotN is 0 there (the mask's "no water").
+	const float3 waterFaceCross = cross(ddx_coarse(input.WorldPosition.xyz), ddy_coarse(input.WorldPosition.xyz));
+	const float waterFaceLen2 = dot(waterFaceCross, waterFaceCross);
+	float3 normal = waterFaceLen2 > 1e-30 ? waterFaceCross * rsqrt(waterFaceLen2) : 0.0;
 	float VdotN = dot(viewDirection, normal);
 	psout.WaterMask = float4(0, 0, VdotN, 0);
 

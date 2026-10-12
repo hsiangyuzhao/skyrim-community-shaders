@@ -49,7 +49,11 @@ namespace WaterEffects
 	float2 GetParallaxOffset(PS_INPUT input, float3 normalScalesRcp)
 	{
 		float3 viewDirection = normalize(input.WPosition.xyz);
-		float2 parallaxOffsetTS = viewDirection.xy / -viewDirection.z;
+		// (44b) With the camera exactly at the water height the surface is seen edge-on: view z was 0
+		// and the offset infinite (Inf / NaN water colour; with HDR on the fp16 image-space chain kept
+		// it and the screen went black). The grazing angle is limited to about 3 degrees, sign kept.
+		const float viewZ = -viewDirection.z;
+		float2 parallaxOffsetTS = viewDirection.xy / (viewZ < 0.0 ? min(viewZ, -0.05) : max(viewZ, 0.05));
 
 		// Parallax scale is also multiplied by normalScalesRcp
 		parallaxOffsetTS *= 20.0;
@@ -82,7 +86,8 @@ namespace WaterEffects
 		float delta2 = prevBound - prevHeight;
 		float delta1 = currBound - currHeight;
 		float denominator = delta2 - delta1;
-		float parallaxAmount = (currBound * delta2 - prevBound * delta1) / denominator;
+		// (44b) A zero denominator was 0/0.
+		float parallaxAmount = abs(denominator) > 1e-6 ? (currBound * delta2 - prevBound * delta1) / denominator : currBound;
 
 		return parallaxOffsetTS.xy * parallaxAmount;
 	}

@@ -38,6 +38,16 @@ static const float3x3 kBT2020ToBT709 = {
 	-0.0181508, -0.1005789, 1.1187297
 };
 
+// (44b) The HDR entry guard: the scene is fp16 here and a NaN / Inf survives (in SDR the 8-bit targets
+// turn it into 0). NaN and -Inf -> 0, +Inf -> the fp16 maximum, negatives -> 0 (they mean nothing in
+// display gamma). Cheap: an exponent test and a clamp per channel.
+float3 SanitizeScene(float3 v)
+{
+	const uint3 bits = asuint(v);
+	v = ((bits & 0x7F800000u) == 0x7F800000u) ? ((bits == 0x7F800000u) ? 65504.0 : 0.0) : v;
+	return clamp(v, 0.0, 65504.0);
+}
+
 float3 GammaToLinear(float3 v)
 {
 	return pow(max(v, 0.0), 2.2);
@@ -61,7 +71,7 @@ float3 EncodeHDR10(float3 linear2020)
 // BT.2020. An SDR scene (menus) is clamped to SDR white in BT.709 first, as before.
 float3 SceneToLinear2020(float3 v)
 {
-	float3 c = GammaToLinear(v);
+	float3 c = GammaToLinear(SanitizeScene(v));
 	if (SceneIsSDR > 0.5) {
 		if (SceneBT2020)
 			c = mul(kBT2020ToBT709, c);
@@ -92,7 +102,7 @@ RWTexture2D<float4> Output : register(u0);
 	Output.GetDimensions(w, h);
 	if (id.x >= w || id.y >= h)
 		return;
-	float3 c = Scene[id.xy].rgb;
+	float3 c = SanitizeScene(Scene[id.xy].rgb);
 	// (44a) A BT.2020 scene shown as SDR: back to BT.709 in linear light, then display gamma again.
 	[branch] if (SceneBT2020)
 		c = pow(saturate(mul(kBT2020ToBT709, GammaToLinear(c))), 1.0 / 2.2);
@@ -150,7 +160,7 @@ RWTexture2D<float4> Output : register(u0);
 	Output.GetDimensions(w, h);
 	if (id.x >= w || id.y >= h)
 		return;
-	Output[id.xy] = float4(GammaToLinear(Source[id.xy].rgb), 1.0);
+	Output[id.xy] = float4(GammaToLinear(SanitizeScene(Source[id.xy].rgb)), 1.0);
 }
 #endif
 
@@ -163,6 +173,6 @@ RWTexture2D<float4> Output : register(u0);
 	Output.GetDimensions(w, h);
 	if (id.x >= w || id.y >= h)
 		return;
-	Output[id.xy] = float4(pow(max(Source[id.xy].rgb, 0.0), 1.0 / 2.2), 1.0);
+	Output[id.xy] = float4(pow(SanitizeScene(Source[id.xy].rgb), 1.0 / 2.2), 1.0);
 }
 #endif

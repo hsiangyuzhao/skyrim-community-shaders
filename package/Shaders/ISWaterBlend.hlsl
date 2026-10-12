@@ -50,7 +50,7 @@ PS_OUTPUT main(PS_INPUT input)
 	uint eyeIndex = Stereo::GetEyeIndexFromTexCoord(input.TexCoord);
 	float2 adjustedScreenPosition = FrameBuffer::GetDynamicResolutionAdjustedScreenPosition(input.TexCoord);
 	float waterMask = waterMaskTex.Sample(waterMaskSampler, adjustedScreenPosition).z;
-	if (waterMask < 1e-4) {
+	if (waterMask < 1e-4 || (asuint(waterMask) & 0x7F800000u) == 0x7F800000u) {  // (44b) a NaN / Inf mask is "no water" too
 		discard;
 	}
 

@@ -53,6 +53,17 @@ float3 GetTonemapFactorHejlBurgessDawson(float3 luminance)
 
 #	include "Common/DisplayMapping.hlsli"
 
+// (44b) The image-space chain after this pass is 8-bit in SDR (a NaN / Inf / negative becomes 0 or 1
+// there by itself) but fp16 with HDR on, where one bad pixel survives and blurs, downsamples and
+// DLSS-G spread it until the screen is black. Same result as the 8-bit target in SDR: NaN and
+// -Inf -> 0, +Inf -> the fp16 maximum, negatives -> 0.
+float3 SanitizeSceneColor(float3 c)
+{
+	const uint3 bits = asuint(c);
+	c = ((bits & 0x7F800000u) == 0x7F800000u) ? ((bits == 0x7F800000u) ? 65504.0 : 0.0) : c;
+	return clamp(c, 0.0, 65504.0);
+}
+
 PS_OUTPUT main(PS_INPUT input)
 {
 	PS_OUTPUT psout;
@@ -93,6 +104,7 @@ PS_OUTPUT main(PS_INPUT input)
 		if (SharedData::linearLightingSettings.enableLinearLighting && SharedData::linearLightingSettings.enableGammaCorrection) {
 			psout.Color.xyz = Color::TrueLinearToGamma(psout.Color.xyz);
 		}
+		psout.Color.xyz = SanitizeSceneColor(psout.Color.xyz);
 		return psout;
 	}
 #		endif
@@ -124,7 +136,8 @@ PS_OUTPUT main(PS_INPUT input)
 		{
 			float maxCol = Color::RGBToLuminance(inputColor);
 			float mappedMax = GetTonemapFactorReinhard(maxCol).x;
-			float3 compressedHuePreserving = inputColor * mappedMax / maxCol;
+			// (44b) A black pixel (or one a NaN turned black) was 0 * 0 / 0.
+			float3 compressedHuePreserving = maxCol > 0.0 ? inputColor * mappedMax / maxCol : 0.0;
 			blendedColor = compressedHuePreserving;
 			blendedColor += saturate(Param.x - blendedColor) * bloomColor;
 		}
@@ -151,7 +164,7 @@ PS_OUTPUT main(PS_INPUT input)
 	}
 	srgbColor = FrameBuffer::ToSRGBColor(srgbColor);
 
-	psout.Color = float4(srgbColor, 1.0);
+	psout.Color = float4(SanitizeSceneColor(srgbColor), 1.0);
 
 #	endif
 

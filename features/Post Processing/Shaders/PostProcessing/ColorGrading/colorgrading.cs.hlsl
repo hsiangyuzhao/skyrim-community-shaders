@@ -1043,9 +1043,25 @@ float3 ApplyLUT(float3 color)
 }
 #endif
 
+#if defined(HDR_OUTPUT)
+// (44b) HDR only: NaN / Inf / negative guard at the HDR entry and exit. With HDR on, everything from
+// here to the swap chain is fp16 and keeps a bad pixel (SDR's 8-bit targets turn it into 0), so
+// one NaN could spread until the screen was black. NaN and -Inf -> 0, +Inf -> the fp16 maximum.
+float3 SanitizeHDRColor(float3 c, float lo)
+{
+	const uint3 bits = asuint(c);
+	c = ((bits & 0x7F800000u) == 0x7F800000u) ? ((bits == 0x7F800000u) ? 65504.0 : 0.0) : c;
+	return clamp(c, lo, 65504.0);
+}
+#endif
+
 [numthreads(8, 8, 1)] void CSColorGrading(uint2 DTid : SV_DispatchThreadID) {
 	// Game cinematic
+#if defined(HDR_OUTPUT)
+	float3 color = pow(abs(SanitizeHDRColor(TexColor[DTid].xyz, -65504.0)), saturationHueInOutGamma.z) * cinematic.y;
+#else
 	float3 color = pow(abs(TexColor[DTid].xyz), saturationHueInOutGamma.z) * cinematic.y;
+#endif
 	color = Saturation(color, cinematic.x);
 	color = LinearContrast(color, cinematic.z, 0.18);
 
@@ -1071,7 +1087,7 @@ float3 ApplyLUT(float3 color)
 		const float luma2020 = dot(color, kHDRLuma2020);
 		color = lerp(color, luma2020 * mul(kHDR709To2020, tint.xyz), tint.w);
 		color = lerp(color, mul(kHDR709To2020, fade.xyz), fade.w);
-		RWTexOut[DTid] = float4(color, 1);
+		RWTexOut[DTid] = float4(SanitizeHDRColor(color, -65504.0), 1);
 		return;
 	}
 #endif
@@ -1083,6 +1099,9 @@ float3 ApplyLUT(float3 color)
     // Game fade
     color = lerp(color, fade.xyz, fade.w);
 
+#if defined(HDR_OUTPUT)
+	color = SanitizeHDRColor(color, -65504.0);
+#endif
 	RWTexOut[DTid] = float4(color, 1);
 }
 
