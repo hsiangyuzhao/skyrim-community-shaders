@@ -6,6 +6,7 @@
 #include <imgui_stdlib.h>
 #include <thread>
 
+#include "EngineFixes/WndProcPseudoHandleFix.h"
 #include "FeatureIssues.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Features/NRD.h"
@@ -48,6 +49,15 @@ void AdvancedSettingsRenderer::RenderAdvancedSettings(
 		if (MenuFonts::BeginTabItemWithFont("Logging", Menu::FontRole::Subheading)) {
 			if (ImGui::BeginChild("##LoggingContent", ImVec2(0, 0), false)) {
 				RenderLoggingSection();
+			}
+			ImGui::EndChild();
+			ImGui::EndTabItem();
+		}
+
+		// (44d) Overlays & Window Tab
+		if (MenuFonts::BeginTabItemWithFont("Overlays & Window", Menu::FontRole::Subheading)) {
+			if (ImGui::BeginChild("##OverlaysWindowContent", ImVec2(0, 0), false)) {
+				WndProcPseudoHandleFix::DrawSettings();
 			}
 			ImGui::EndChild();
 			ImGui::EndTabItem();

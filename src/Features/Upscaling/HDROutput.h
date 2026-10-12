@@ -57,6 +57,15 @@ namespace HDROutput
 		/// (43c, restart) Which swap chain gets SetColorSpace1: 0 = Streamline proxy (falls back to the
 		/// native one if it refuses), 1 = native chain below Streamline, 2 = both.
 		uint colorSpaceChain = 0;
+		/// (44d) How the end of the image-space chain is judged. 0 = by the chain's own target: when the
+		/// game drew the chain into the frame buffer (whose slot points at the fp16 scene), the scene is
+		/// there even if a last helper pass left another target bound (the depth-of-field effect clears the
+		/// underwater mask after it at the water surface). 1 = as 44c: only the target bound at the end
+		/// counts (the water-surface black screen).
+		uint chainEndMode = 0;
+		/// (44d) Watch CopyResource / CopySubresourceRegion for copies between an fp16-upgraded target (or
+		/// the 10-bit back buffer) and a target of another format, which D3D11 silently drops. Log only.
+		bool copyCheck = true;
 	};
 
 	NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -71,7 +80,9 @@ namespace HDROutput
 		uiBlendFix,
 		menuMode,
 		nisMode,
-		colorSpaceChain)
+		colorSpaceChain,
+		chainEndMode,
+		copyCheck)
 
 	/// (44a) The settings, owned by the "HDR Output" feature (HDROutputFeature) and stored here.
 	Settings& GetSettings();
@@ -103,9 +114,10 @@ namespace HDROutput
 
 	// ---- per frame ---------------------------------------------------------------------------------
 
-	/// Main_PostProcessing, around the game's image-space chain.
+	/// Main_PostProcessing, around the game's image-space chain. a_target is the chain's own final
+	/// target (RE::RENDER_TARGET; kFRAMEBUFFER in gameplay).
 	void BeginPostProcessing();
-	void EndPostProcessing();
+	void EndPostProcessing(int a_target);
 
 	/// (44a) What Color Grading needs for this frame: whether the scene is produced for HDR, and the
 	/// levels. hdr = false: grade as SDR.

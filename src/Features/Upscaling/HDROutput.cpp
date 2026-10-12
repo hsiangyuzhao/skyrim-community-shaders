@@ -148,6 +148,30 @@ namespace HDROutput
 		float g_lastPeakNits = kPeakFallback;
 		const char* g_lastPeakSource = "fallback";
 
+		// (44d) chain-end recovery and copy-format diagnostics
+		uint64_t g_frameCounter = 0;
+		uint64_t g_chainRecovered = 0;      // frames whose scene was taken from the fp16 target although another target was bound last
+		bool g_lastChainEndOk = true;       // the previous redirected frame ended on the scene (episode tracking for the log)
+		uint32_t g_chainLogLines = 0;
+		std::string g_lastChainEndNote;     // the last "ended on another target" situation, for the status page
+		constexpr uint32_t kMaxChainLogLines = 40;
+
+		bool g_copyHooksInstalled = false;
+		std::array<ID3D11Resource*, 12> g_watchedCopyResources{};
+		struct CopyMismatch
+		{
+			int dst;
+			int src;
+			uint32_t dstFormat;
+			uint32_t srcFormat;
+			uint64_t count;
+			uint64_t lastFrame;
+		};
+		std::vector<CopyMismatch> g_copyMismatches;
+		uint64_t g_copyMismatchTotal = 0;
+		uint32_t g_copyLogLines = 0;
+		constexpr uint32_t kMaxCopyLogLines = 60;
+
 		DX12SwapChain& SwapChain()
 		{
 			return Upscaling::dx12SwapChain;
@@ -582,6 +606,238 @@ namespace HDROutput
 			g_frame.uiRedirected = false;
 			globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
 		}
+
+		// ---- (44d) which target is this, chain end, format-mismatched copies ----------------------------
+
+		constexpr int kTargetUnknown = -1;
+		constexpr int kTargetScene = -2;
+		constexpr int kTargetBackBuffer = -3;
+		constexpr int kTargetUILayer = -4;
+		constexpr int kTargetOldTextureBase = 1000;  // + id: the original 8-bit texture of an upgraded target
+
+		/// Which render target (RE::RENDER_TARGET index) or texture of ours a resource is. Only used for
+		/// log lines and rare checks: a linear scan of the engine's table.
+		int IdentifyTexture(ID3D11Resource* a_resource)
+		{
+			if (!a_resource)
+				return kTargetUnknown;
+			if (g_scene && a_resource == g_scene->resource.get())
+				return kTargetScene;
+			if (g_uiLayer && a_resource == g_uiLayer->resource.get())
+				return kTargetUILayer;
+			if (auto* backBuffer = SwapChain().swapChainBufferWrapped.get(); backBuffer && a_resource == backBuffer->resource11)
+				return kTargetBackBuffer;
+			const auto& targets = globals::game::renderer->GetRuntimeData().renderTargets;
+			for (int i = 0; i < static_cast<int>(std::size(targets)); ++i) {
+				if (targets[i].texture && targets[i].texture == a_resource)
+					return i;
+			}
+			for (const auto& saved : g_upgradedTargets) {
+				if (saved.texture == a_resource)
+					return kTargetOldTextureBase + static_cast<int>(saved.target);
+			}
+			return kTargetUnknown;
+		}
+
+		std::string TargetName(int a_id)
+		{
+			switch (a_id) {
+			case kTargetUnknown:
+				return "an untracked texture";
+			case kTargetScene:
+				return "the fp16 HDR scene";
+			case kTargetBackBuffer:
+				return "the back buffer";
+			case kTargetUILayer:
+				return "the HDR UI layer";
+			default:
+				break;
+			}
+			if (a_id >= kTargetOldTextureBase)
+				return std::format("the old 8-bit texture of render target {}", a_id - kTargetOldTextureBase);
+			const char* name = nullptr;
+			switch (static_cast<RE::RENDER_TARGET>(a_id)) {
+			case RE::RENDER_TARGET::kFRAMEBUFFER:
+				name = "FRAMEBUFFER";
+				break;
+			case RE::RENDER_TARGET::kMAIN:
+				name = "MAIN";
+				break;
+			case RE::RENDER_TARGET::kMAIN_COPY:
+				name = "MAIN_COPY";
+				break;
+			case RE::RENDER_TARGET::kUNDERWATER_MASK:
+				name = "UNDERWATER_MASK";
+				break;
+			case RE::RENDER_TARGET::kMENUBG:
+				name = "MENUBG";
+				break;
+			case RE::RENDER_TARGET::kBLURFULL_BUFFER:
+				name = "BLURFULL_BUFFER";
+				break;
+			case RE::RENDER_TARGET::kLDR_BLURSWAP:
+				name = "LDR_BLURSWAP";
+				break;
+			case RE::RENDER_TARGET::kLDR_DOWNSAMPLE0:
+				name = "LDR_DOWNSAMPLE0";
+				break;
+			case RE::RENDER_TARGET::kIMAGESPACE_TEMP_COPY:
+				name = "IMAGESPACE_TEMP_COPY";
+				break;
+			case RE::RENDER_TARGET::kIMAGESPACE_TEMP_COPY2:
+				name = "IMAGESPACE_TEMP_COPY2";
+				break;
+			case RE::RENDER_TARGET::kSAVE_GAME_SCREENSHOT:
+				name = "SAVE_GAME_SCREENSHOT";
+				break;
+			case RE::RENDER_TARGET::kSCREENSHOT:
+				name = "SCREENSHOT";
+				break;
+			case RE::RENDER_TARGET::kTEMPORAL_AA_UI_ACCUMULATION_1:
+				name = "TEMPORAL_AA_UI_ACCUMULATION_1";
+				break;
+			case RE::RENDER_TARGET::kTEMPORAL_AA_UI_ACCUMULATION_2:
+				name = "TEMPORAL_AA_UI_ACCUMULATION_2";
+				break;
+			case RE::RENDER_TARGET::kWATER_1:
+				name = "WATER_1";
+				break;
+			case RE::RENDER_TARGET::kWATER_2:
+				name = "WATER_2";
+				break;
+			case RE::RENDER_TARGET::kRAW_WATER:
+				name = "RAW_WATER";
+				break;
+			default:
+				break;
+			}
+			return name ? std::format("render target {} ({})", a_id, name) : std::format("render target {}", a_id);
+		}
+
+		/// The copy-compatibility group of a format (D3D11 copies need the same group). Formats not
+		/// listed are their own group.
+		uint32_t FormatGroup(DXGI_FORMAT a_format)
+		{
+			const auto f = static_cast<uint32_t>(a_format);
+			if (f >= 1 && f <= 4)
+				return 1;  // R32G32B32A32
+			if (f >= 9 && f <= 14)
+				return 9;  // R16G16B16A16
+			if (f >= 23 && f <= 25)
+				return 23;  // R10G10B10A2
+			if (f >= 27 && f <= 32)
+				return 27;  // R8G8B8A8
+			if (f >= 33 && f <= 38)
+				return 33;  // R16G16
+			if (f >= 39 && f <= 43)
+				return 39;  // R32
+			if (f >= 48 && f <= 52)
+				return 48;  // R8G8
+			if (f >= 53 && f <= 59)
+				return 53;  // R16
+			if (f >= 60 && f <= 64)
+				return 60;  // R8
+			if (f == 87 || f == 90 || f == 91)
+				return 90;  // B8G8R8A8
+			if (f == 88 || f == 92 || f == 93)
+				return 92;  // B8G8R8X8
+			return f;
+		}
+
+		void CheckCopy(ID3D11Resource* a_dst, ID3D11Resource* a_src, const char* a_api)
+		{
+			if (!a_dst || !a_src)
+				return;
+			bool watched = false;
+			for (auto* resource : g_watchedCopyResources) {
+				if (resource && (resource == a_dst || resource == a_src)) {
+					watched = true;
+					break;
+				}
+			}
+			if (!watched)
+				return;
+			D3D11_RESOURCE_DIMENSION dstType{}, srcType{};
+			a_dst->GetType(&dstType);
+			a_src->GetType(&srcType);
+			if (dstType != D3D11_RESOURCE_DIMENSION_TEXTURE2D || srcType != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+				return;
+			D3D11_TEXTURE2D_DESC dstDesc{}, srcDesc{};
+			static_cast<ID3D11Texture2D*>(a_dst)->GetDesc(&dstDesc);
+			static_cast<ID3D11Texture2D*>(a_src)->GetDesc(&srcDesc);
+			if (FormatGroup(dstDesc.Format) == FormatGroup(srcDesc.Format))
+				return;
+
+			++g_copyMismatchTotal;
+			const int dstId = IdentifyTexture(a_dst);
+			const int srcId = IdentifyTexture(a_src);
+			auto it = std::ranges::find_if(g_copyMismatches, [&](const CopyMismatch& m) { return m.dst == dstId && m.src == srcId; });
+			if (it == g_copyMismatches.end()) {
+				g_copyMismatches.push_back({ dstId, srcId, static_cast<uint32_t>(dstDesc.Format), static_cast<uint32_t>(srcDesc.Format), 0, 0 });
+				it = std::prev(g_copyMismatches.end());
+			}
+			// One line per occurrence: the first time, and again after two seconds or more without it.
+			const bool newOccurrence = it->count == 0 || g_frameCounter > it->lastFrame + 240;
+			++it->count;
+			it->lastFrame = g_frameCounter;
+			if (newOccurrence && g_copyLogLines < kMaxCopyLogLines) {
+				++g_copyLogLines;
+				logger::warn("[HDR] Mismatched {}: {} (format {}) -> {} (format {}); D3D11 drops this copy, the destination keeps old or black content (frame {}, {} so far)",
+					a_api, TargetName(srcId), static_cast<uint32_t>(srcDesc.Format), TargetName(dstId), static_cast<uint32_t>(dstDesc.Format), g_frameCounter, it->count);
+				if (g_copyLogLines == kMaxCopyLogLines)
+					logger::warn("[HDR] Further mismatched copies are only counted (HDR Output status page, F12 JSON)");
+			}
+		}
+
+		struct ID3D11DeviceContext_CopySubresourceRegion
+		{
+			static void WINAPI thunk(ID3D11DeviceContext* This, ID3D11Resource* a_dst, UINT a_dstSubresource, UINT a_dstX, UINT a_dstY, UINT a_dstZ,
+				ID3D11Resource* a_src, UINT a_srcSubresource, const D3D11_BOX* a_srcBox)
+			{
+				if (This == globals::d3d::context && g_settings.copyCheck)
+					CheckCopy(a_dst, a_src, "CopySubresourceRegion");
+				func(This, a_dst, a_dstSubresource, a_dstX, a_dstY, a_dstZ, a_src, a_srcSubresource, a_srcBox);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+
+		struct ID3D11DeviceContext_CopyResource
+		{
+			static void WINAPI thunk(ID3D11DeviceContext* This, ID3D11Resource* a_dst, ID3D11Resource* a_src)
+			{
+				if (This == globals::d3d::context && g_settings.copyCheck)
+					CheckCopy(a_dst, a_src, "CopyResource");
+				func(This, a_dst, a_src);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+
+		/// The resources whose copies are checked: every fp16-upgraded target, the scene, the UI layer and
+		/// the 10-bit back buffer.
+		void InstallCopyCheck()
+		{
+			g_watchedCopyResources.fill(nullptr);
+			size_t n = 0;
+			auto add = [&](ID3D11Resource* a_resource) {
+				if (a_resource && n < g_watchedCopyResources.size())
+					g_watchedCopyResources[n++] = a_resource;
+			};
+			const auto& targets = globals::game::renderer->GetRuntimeData().renderTargets;
+			for (const auto& saved : g_upgradedTargets)
+				add(targets[saved.target].texture);
+			if (g_scene)
+				add(g_scene->resource.get());
+			if (g_uiLayer)
+				add(g_uiLayer->resource.get());
+			if (auto* backBuffer = SwapChain().swapChainBufferWrapped.get())
+				add(backBuffer->resource11);
+
+			if (!g_copyHooksInstalled) {
+				stl::detour_vfunc<46, ID3D11DeviceContext_CopySubresourceRegion>(globals::d3d::context);
+				stl::detour_vfunc<47, ID3D11DeviceContext_CopyResource>(globals::d3d::context);
+				g_copyHooksInstalled = true;
+			}
+		}
 	}
 
 	// ---- settings, migration ---------------------------------------------------------------------
@@ -766,6 +1022,7 @@ namespace HDROutput
 		CreateUILayer(desc.Width, desc.Height);
 		EnsureCB();
 		UpgradeLDRRenderTargets();
+		InstallCopyCheck();  // (44d) after the upgrade: it watches the new fp16 textures
 
 		if (!g_blendHookInstalled) {
 			stl::detour_vfunc<35, ID3D11DeviceContext_OMSetBlendState>(globals::d3d::context);
@@ -822,27 +1079,32 @@ namespace HDROutput
 		globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
 	}
 
-	void EndPostProcessing()
+	void EndPostProcessing(int a_target)
 	{
 		if (!g_frame.redirected || g_savedFramebufferRTV == nullptr)
 			return;
 
-		// The chain's last pass should have drawn into the slot we pointed at hdrScene. Anything else
-		// means the redirect did not take, and the scene went where it always went: show that as SDR.
+		// The chain's last pass normally leaves the slot we pointed at hdrScene bound.
+		auto* context = globals::d3d::context;
 		ID3D11RenderTargetView* bound = nullptr;
-		globals::d3d::context->OMGetRenderTargets(1, &bound, nullptr);
-		bool confirmed = false;
+		context->OMGetRenderTargets(1, &bound, nullptr);
+		bool onScene = false;
 		uint32_t boundFormat = 0;
+		int boundId = kTargetUnknown;
 		if (bound) {
 			winrt::com_ptr<ID3D11Resource> resource;
 			bound->GetResource(resource.put());
-			confirmed = resource.get() == g_scene->resource.get();
+			onScene = resource.get() == g_scene->resource.get();
+			if (!onScene)
+				boundId = IdentifyTexture(resource.get());
 			D3D11_RENDER_TARGET_VIEW_DESC desc{};
 			bound->GetDesc(&desc);
 			boundFormat = static_cast<uint32_t>(desc.Format);
 			bound->Release();
 		}
-		if (confirmed) {
+
+		bool confirmed = onScene;
+		if (onScene) {
 			++g_redirectConfirmed;
 			if (!g_loggedConfirmed) {
 				logger::info("[HDR] Image-space output confirmed in the fp16 scene target");
@@ -850,11 +1112,45 @@ namespace HDROutput
 			}
 		} else {
 			++g_redirectUnconfirmed;
-			if (!g_loggedUnconfirmed) {
-				logger::warn("[HDR] Image-space chain ended on another target (format {}); this frame is shown as SDR", boundFormat);
-				g_loggedUnconfirmed = true;
+			// (44d) At the water surface (camera half under water) the game's depth-of-field effect is the
+			// last of the chain: it draws the final image into the frame buffer -- hdrScene, through our
+			// redirect -- and afterwards binds and clears UNDERWATER_MASK (R8, format 61) for the next
+			// frame, setting its own render-target state back without re-binding it (SkyrimSE 1.5.97,
+			// ImageSpaceEffectDepthOfField::Render, the tail after its last pass). 44c read that as "the
+			// redirect did not take", showed the back buffer -- black at that point -- and drew the HUD
+			// over it: the black scene with a visible UI. What the chain was drawn into is its own target
+			// argument; when that is the frame buffer, the image is in hdrScene.
+			int pendingTarget = -1;
+			{
+				auto* shadowState = globals::game::shadowState;
+				GET_INSTANCE_MEMBER(renderTargets, shadowState)
+				pendingTarget = static_cast<int>(renderTargets[0]);
 			}
+			const bool chainToFramebuffer = a_target == static_cast<int>(RE::RENDER_TARGET::kFRAMEBUFFER);
+			const bool recover = chainToFramebuffer && g_settings.chainEndMode == 0;
+			if (recover) {
+				confirmed = true;
+				++g_chainRecovered;
+				// Leave the scene bound as on any other frame: the sharpener and Neural Rendering read
+				// the bound target. The engine re-binds its own state on its next draw.
+				ID3D11RenderTargetView* rtv = g_scene->rtv.get();
+				context->OMSetRenderTargets(1, &rtv, nullptr);
+				globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
+			}
+			g_lastChainEndNote = std::format("chain into {}, ended on {} (format {}), engine's pending target {}: {}",
+				TargetName(a_target), TargetName(boundId), boundFormat, pendingTarget,
+				recover ? "scene taken from the fp16 target" : (chainToFramebuffer ? "shown as SDR (Chain End Check = 44c)" : "shown as SDR (not a frame-buffer chain)"));
+			// One line per occurrence (the first frame after a frame that ended normally).
+			if (g_lastChainEndOk && g_chainLogLines < kMaxChainLogLines) {
+				++g_chainLogLines;
+				logger::warn("[HDR] Image-space chain ended on another target (frame {}): {}", g_frameCounter, g_lastChainEndNote);
+				if (g_chainLogLines == kMaxChainLogLines)
+					logger::warn("[HDR] Further chain-end cases are only counted (HDR Output status page, F12 JSON)");
+			}
+			if (!g_loggedUnconfirmed)
+				g_loggedUnconfirmed = true;
 		}
+		g_lastChainEndOk = onScene;
 		g_frame.sceneFresh = confirmed;
 
 		auto& fb = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER];
@@ -1125,6 +1421,7 @@ namespace HDROutput
 		// Normally done by CompositeForPresent; never leave the frame-buffer slot on the UI layer.
 		RestoreUIRedirect();
 		g_frame = {};
+		++g_frameCounter;
 		g_lastSceneBT2020 = g_sceneBT2020;
 		g_sceneBT2020 = false;
 
@@ -1285,6 +1582,24 @@ namespace HDROutput
 
 		ImGui::EndDisabled();
 
+		// (44d) Water-surface fix and its diagnostics (also matter for "HDR Off Path: As 43b").
+		{
+			const char* chainEndModes[] = { "By the chain's target (44d fix)", "Last bound target only (44c)" };
+			int chainEndMode = s.chainEndMode == 1 ? 1 : 0;
+			if (ImGui::Combo("Chain End Check", &chainEndMode, chainEndModes, IM_ARRAYSIZE(chainEndModes)))
+				s.chainEndMode = static_cast<uint>(chainEndMode);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("The fix for the black picture with the camera exactly at the water surface (HDR on).");
+				ImGui::TextUnformatted("There the game's last image effect clears the underwater mask after drawing the picture, which 44c took for");
+				ImGui::TextUnformatted("\"the picture went somewhere else\" and showed black instead. 44c here brings the black back, for A/B only.");
+			}
+			ImGui::Checkbox("Log Mismatched Copies", &s.copyCheck);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Diagnostics only: writes a log line when the game copies between one of the HDR-upgraded");
+				ImGui::TextUnformatted("images and one of another format (such a copy silently does nothing). Changes nothing on screen.");
+			}
+		}
+
 		ImGui::Spacing();
 		ImGui::TextDisabled("Tone curve in HDR (Extend / Native, roll-off): Post Processing > Color Grading and Tone Mapping.");
 
@@ -1303,8 +1618,14 @@ namespace HDROutput
 			const auto levels = ResolveLevels();
 			ImGui::Text("Peak %.0f nits (%s), paper white %.0f nits, HUD %.0f nits", levels.peakNits, g_lastPeakSource, levels.paperWhiteNits, levels.hudNits);
 			ImGui::Text("Last frame: %s%s", PathName(g_lastPath), g_lastSceneBT2020 ? ", scene graded in BT.2020" : "");
-			ImGui::Text("Scene in fp16 target: confirmed %llu, not confirmed %llu frames; %zu image-space targets upgraded",
-				g_redirectConfirmed, g_redirectUnconfirmed, g_upgradedTargets.size());
+			ImGui::Text("Scene in fp16 target: chain ended on it %llu, elsewhere %llu frames (%llu of those taken from it anyway); %zu image-space targets upgraded",
+				g_redirectConfirmed, g_redirectUnconfirmed, g_chainRecovered, g_upgradedTargets.size());
+			if (!g_lastChainEndNote.empty())
+				ImGui::TextDisabled("Last chain end elsewhere: %s", g_lastChainEndNote.c_str());
+			if (g_copyMismatchTotal > 0)
+				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Mismatched-format copies seen: %llu (%zu kinds, see the log)", g_copyMismatchTotal, g_copyMismatches.size());
+			else
+				ImGui::TextDisabled("Mismatched-format copies seen: none%s", s.copyCheck ? "" : " (check off)");
 			ImGui::Text("Mod UI transparency fixes: %llu (%zu blend states seen)", g_blendPatchCount, g_patchedBlends.size());
 			if (g_dlssGRejectedHDR)
 				ImGui::TextColored({ 1.0f, 0.4f, 0.4f, 1.0f }, "DLSS-G rejected the HDR format (eFailHDRFormatNotSupported, status 0x%X)", g_lastDLSSGStatus);
@@ -1344,6 +1665,15 @@ namespace HDROutput
 			j["last_path"] = PathName(g_lastPath);
 			j["scene_confirmed_frames"] = g_redirectConfirmed;
 			j["scene_unconfirmed_frames"] = g_redirectUnconfirmed;
+			j["scene_recovered_frames"] = g_chainRecovered;
+			j["chain_end_mode"] = s.chainEndMode == 1 ? "44c" : "44d";
+			j["chain_end_last_note"] = g_lastChainEndNote;
+			j["copy_check"] = s.copyCheck;
+			j["copy_mismatch_total"] = g_copyMismatchTotal;
+			nlohmann::json mismatches = nlohmann::json::array();
+			for (const auto& m : g_copyMismatches)
+				mismatches.push_back({ { "src", TargetName(m.src) }, { "dst", TargetName(m.dst) }, { "src_format", m.srcFormat }, { "dst_format", m.dstFormat }, { "count", m.count } });
+			j["copy_mismatches"] = mismatches;
 			j["menu_mode"] = s.menuMode == 1 ? "separate" : "sdr";
 			j["ui_blend_fix"] = s.uiBlendFix;
 			j["ui_blend_patches"] = g_blendPatchCount;

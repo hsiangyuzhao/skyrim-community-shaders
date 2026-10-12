@@ -1,5 +1,7 @@
 #include "Hooks.h"
 
+#include "EngineFixes/WndProcPseudoHandleFix.h"
+
 #include "ShaderTools/BSShaderHooks.h"
 
 #include "Feature.h"
@@ -629,6 +631,11 @@ namespace Hooks
 			auto menu = globals::menu;
 			if ((a_msg == WM_KILLFOCUS || a_msg == WM_SETFOCUS) && menu->initialized) {
 				menu->focusChanged = true;
+			}
+			// (44d) With Alt let through to Windows (Overlay Hotkeys), a tapped Alt or Alt+letter would
+			// enter the window's keyboard-menu mode; vanilla never saw these keys, so drop that command.
+			if (a_msg == WM_SYSCOMMAND && (a_wParam & 0xFFF0) == SC_KEYMENU && WndProcPseudoHandleFix::BlockKeyMenu()) {
+				return 0;
 			}
 			return func(a_hwnd, a_msg, a_wParam, a_lParam);
 		}

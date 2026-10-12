@@ -4,6 +4,7 @@
 #include <dxgi1_6.h>
 
 #include "../../Deferred.h"
+#include "../../EngineFixes/WndProcPseudoHandleFix.h"
 #include "../Upscaling.h"
 #include "FidelityFX.h"
 #include "HDROutput.h"
@@ -354,6 +355,16 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		logger::info("[Upscaling] First Present: syncInterval={} flags=0x{:X} allowTearing={}",
 			SyncInterval, Flags, (Flags & DXGI_PRESENT_ALLOW_TEARING) != 0);
 		loggedPresentParameters = true;
+	}
+
+	// (44d) Which modules the swap chains' Present leads into (overlays hook it there): logged at the
+	// first Present and whenever it changes, checked about every ten seconds.
+	static uint32_t presentProbeCounter = 0;
+	if (presentProbeCounter++ % 1200 == 0) {
+		IDXGISwapChain4* native = GetNativeSwapChain();
+		WndProcPseudoHandleFix::ProbePresentHooks(swapChain, native && native != swapChain ? "D3D12 Streamline proxy" : "D3D12");
+		if (native && native != swapChain)
+			WndProcPseudoHandleFix::ProbePresentHooks(native, "D3D12 native (below Streamline)");
 	}
 
 	const auto presentResult = swapChain->Present(SyncInterval, Flags);

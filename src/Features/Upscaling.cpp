@@ -2425,7 +2425,7 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 	HDROutput::BeginPostProcessing();
 	gpuTimeline->Pop(Util::GpuScope::CsUpscaling);
 	func(a_this, a3, a_target, a_4, a_5);
-	HDROutput::EndPostProcessing();
+	HDROutput::EndPostProcessing(static_cast<int>(a_target));
 	gpuTimeline->Push(Util::GpuScope::CsUpscaling);
 
 	if (upscaling.d3d12SwapChainActive) {

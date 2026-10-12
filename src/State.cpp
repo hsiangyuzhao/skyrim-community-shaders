@@ -5,6 +5,7 @@
 #include <pystring/pystring.h>
 
 #include "Deferred.h"
+#include "EngineFixes/WndProcPseudoHandleFix.h"
 #include "FeatureIssues.h"
 #include "Features/CloudShadows.h"
 #include "Features/PerformanceOverlay.h"
@@ -358,6 +359,8 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				Batch39Engine::Load(advanced["Engine"]);
 			else if (advanced.contains("Batch 39 Engine"))
 				Batch39Engine::Load(advanced["Batch 39 Engine"]);
+			if (advanced.contains("Window Compatibility"))
+				WndProcPseudoHandleFix::Load(advanced["Window Compatibility"]);
 		}
 
 		if (settings["General"].is_object()) {
@@ -501,6 +504,7 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Use FileWatcher"] = shaderCache->UseFileWatcher();
 	advanced["Frame Annotations"] = frameAnnotations;
 	advanced["Engine"] = Batch39Engine::Save();
+	advanced["Window Compatibility"] = WndProcPseudoHandleFix::Save();
 	settings["Advanced"] = advanced;
 
 	json general;
