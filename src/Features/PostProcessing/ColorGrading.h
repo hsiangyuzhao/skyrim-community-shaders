@@ -104,6 +104,10 @@ struct ColorGrading : public PostProcessFeature
         uint skipLDR;
         uint enableTonemap;
         uint enableColorSpaceTransform;
+
+        // (batch 43) Native HDR output: mode (0 SDR, 1 extend tone mapper, 2 GT7 HDR), peak / paper
+        // white, roll-off start, display-gamma chain. All zero while HDR output is off.
+        float4 hdrParams;
     };
 	std::unique_ptr<ConstantBuffer> colorCB = nullptr;
 
@@ -126,6 +130,10 @@ struct ColorGrading : public PostProcessFeature
     bool saveImagesFlag = false;
 	winrt::com_ptr<ID3D11ComputeShader> colorgradingCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> lutgenCS = nullptr;
+    // (batch 43) HDR_OUTPUT variants, compiled only in a native-HDR session and used while HDR output
+    // tone-maps the frame. The SDR pair above is the pre-43 code.
+    winrt::com_ptr<ID3D11ComputeShader> colorgradingHdrCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> lutgenHdrCS = nullptr;
 
     winrt::com_ptr<ID3D11SamplerState> linearSampler = nullptr;
 

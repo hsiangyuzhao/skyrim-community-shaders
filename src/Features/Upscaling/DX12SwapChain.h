@@ -87,6 +87,8 @@ public:
 
 	std::unique_ptr<WrappedResource> swapChainBufferWrapped;
 	std::unique_ptr<WrappedResource> uiBufferWrapped;
+	// (batch 43) HDR session only: the HDR10 image shown while HDR output is on.
+	std::unique_ptr<WrappedResource> hdrOutputWrapped;
 
 	// D3D12 interop resources for frame generation
 	std::unique_ptr<WrappedResource> depthBufferShared12;

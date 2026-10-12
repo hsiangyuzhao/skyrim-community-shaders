@@ -373,6 +373,15 @@ float3 GT7ToneMappingHDR(float3 linearRgb, float targetLuminanceNits)
     return applyGT7ToneMapping(toneMapper, linearRgb);
 }
 
+// (batch 43) HDR with the target given in framebuffer units (1.0 = 100 nits) and the end of the
+// linear section as a fraction of it (GT7's own value is 0.444).
+float3 GT7ToneMappingHDRRolloff(float3 linearRgb, float targetFrameBufferValue, float linearSection)
+{
+    GT7ToneMapper toneMapper = initializeHDR(frameBufferValueToPhysicalValue(targetFrameBufferValue));
+    toneMapper.curve = initializeCurve(toneMapper.framebufferLuminanceTarget, 0.25f, 0.538f, linearSection, 1.280f);
+    return applyGT7ToneMapping(toneMapper, linearRgb);
+}
+
 // Apply GT7 tone mapping for SDR output
 float3 GT7ToneMappingSDR(float3 linearRgb)
 {

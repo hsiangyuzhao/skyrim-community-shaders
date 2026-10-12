@@ -3,6 +3,7 @@
 #include "Feature.h"
 #include "Upscaling/DX12SwapChain.h"
 #include "Upscaling/FidelityFX.h"
+#include "Upscaling/HDROutput.h"
 #include "Upscaling/Streamline.h"
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -218,6 +219,9 @@ public:
 		uint reflexFrameLimit = 0;
 
 		NeuralRenderingSettings neuralRendering;
+
+		// (batch 43) Native HDR10 output (Upscaling > HDR Output). Default off.
+		HDROutput::Settings hdrOutput;
 	};
 
 	Settings settings;

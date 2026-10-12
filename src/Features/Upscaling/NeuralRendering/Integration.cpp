@@ -6,6 +6,7 @@
 #include "Features/LinearLighting.h"
 #include "Features/PostProcessing.h"
 #include "Features/Upscaling.h"
+#include "Features/Upscaling/HDROutput.h"
 #include "Globals.h"
 #include "State.h"
 #include "Utils/Batch38.h"
@@ -722,6 +723,11 @@ namespace NeuralRendering
 
 	bool ApplyLdr()
 	{
+		// (batch 43) The finished image is HDR (values above SDR white) while HDR output is on; the
+		// after-upscaling model only knows SDR. 43c moves the pass before upscaling instead.
+		if (HDROutput::IsSceneHDRThisFrame())
+			return false;
+
 		if (!Batch38::IsOn())
 			return ApplyLdrLegacy();
 

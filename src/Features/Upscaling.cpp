@@ -68,7 +68,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DLSSDPreset,
 	reflexMode,
 	reflexFrameLimit,
-	neuralRendering);
+	neuralRendering,
+	hdrOutput);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
 
@@ -811,6 +812,12 @@ void Upscaling::DrawSettings()
 		ImGui::TreePop();
 	}
 
+	// (batch 43) Native HDR10 output.
+	if (!globals::game::isVR && ImGui::TreeNodeEx("HDR Output")) {
+		HDROutput::DrawSettings();
+		ImGui::TreePop();
+	}
+
 	// (42c) Native HDR phase 0: read-only display / swap-chain diagnostics.
 	DisplayHDRInfo::DrawSettings();
 }
@@ -1383,11 +1390,16 @@ void Upscaling::SetupResources()
 	if (d3d12SwapChainActive)
 		dx12SwapChain.CreateSharedResources();
 
+	// (batch 43) Native HDR: the fp16 scene target and the image-space target upgrade (HDR session only).
+	if (d3d12SwapChainActive)
+		HDROutput::SetupResources();
+
 	copyDepthToSharedBufferPS.attach((ID3D11PixelShader*)Util::CompileShader(L"Data\\Shaders\\Upscaling\\CopyDepthToSharedBufferPS.hlsl", { { "PSHADER", "" } }, "ps_5_0"));
 }
 
 void Upscaling::ClearShaderCache()
 {
+	HDROutput::ClearShaderCache();
 	for (int i = 0; i < 5; ++i) {
 		encodeTexturesCS[i] = nullptr;  // com_ptr automatically releases
 	}
@@ -2267,6 +2279,11 @@ void Upscaling::ApplyNISSharpening()
 		return;
 	}
 
+	// (batch 43) In an HDR session the image here is the fp16 scene target, which the R11G11B10
+	// sharpener textures cannot be copied from. 43c adds the HDR path.
+	if (HDROutput::IsSession())
+		return;
+
 	auto context = globals::d3d::context;
 
 	ID3D11RenderTargetView* renderTarget = nullptr;
@@ -2388,8 +2405,11 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 
 	BSImagespaceShaderISTemporalAA->taaEnabled = upscaleMethod == UpscaleMethod::kTAA;
 
+	// (batch 43) Native HDR: the image-space chain draws into an fp16 frame-buffer target.
+	HDROutput::BeginPostProcessing();
 	gpuTimeline->Pop(Util::GpuScope::CsUpscaling);
 	func(a_this, a3, a_target, a_4, a_5);
+	HDROutput::EndPostProcessing();
 	gpuTimeline->Push(Util::GpuScope::CsUpscaling);
 
 	if (upscaling.d3d12SwapChainActive) {

@@ -5,6 +5,7 @@
 
 #include "ColourSpace.h"
 #include "Features/PostProcessing.h"
+#include "Features/Upscaling/HDROutput.h"
 
 #include <DDSTextureLoader.h>
 #include <DirectXTex.h>
@@ -211,7 +212,7 @@ struct TonemapperInfo
 				"Tonemapper designed for Gran Turismo 7."sv,
 				[](CTP& params) {
                     exposureSlider(&params[0].x);
-                    ImGui::Checkbox("HDR Output (not working for now)", (bool*)&params[0].y);
+                    ImGui::Checkbox("HDR Output (old, does not work - use Upscaling > HDR Output)", (bool*)&params[0].y);
                     if (params[0].y)
                         ImGui::InputFloat("HDR Max Brightness", &params[0].z, 0.f, 0.f, "%1.f nits");
                 },
@@ -566,7 +567,9 @@ void ColorGrading::ClearShaderCache()
 {
 	const auto shaderPtrs = std::array{
 		&colorgradingCS,
-		&lutgenCS
+		&lutgenCS,
+		&colorgradingHdrCS,
+		&lutgenHdrCS
 	};
 
 	for (auto shader : shaderPtrs)
@@ -598,6 +601,13 @@ void ColorGrading::CompileComputeShaders()
 			{ &colorgradingCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() } }, "CSColorGrading" },
 			{ &lutgenCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() } }, "CSLUTGen" }
 		};
+
+	// (batch 43) The HDR variants only exist in a native-HDR session, so an SDR session compiles exactly
+	// what it did before.
+	if (HDROutput::IsSession()) {
+		shaderInfos.push_back({ &colorgradingHdrCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() }, { "HDR_OUTPUT", "" } }, "CSColorGrading" });
+		shaderInfos.push_back({ &lutgenHdrCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() }, { "HDR_OUTPUT", "" } }, "CSLUTGen" });
+	}
 
 	for (auto& info : shaderInfos) {
 		auto path = std::filesystem::path("Data\\Shaders\\PostProcessing\\ColorGrading") / info.filename;
@@ -700,8 +710,15 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 		.logType = settings.useLog ? ((1u << settings.logType) | (settings.invertLog ? (1u << 3u) : 0u)) : 0u,
 		.skipLDR = settings.skipLDR,
 		.enableTonemap = settings.enableTonemap,
-		.enableColorSpaceTransform = settings.enableColorSpaceTransform
+		.enableColorSpaceTransform = settings.enableColorSpaceTransform,
+		// (batch 43) Zero (SDR, unchanged) unless HDR output tone-maps this frame's scene.
+		.hdrParams = HDROutput::GetColorGradingParams()
 	};
+	// (batch 43) HDR highlights need the HDR_OUTPUT pair; without it (not an HDR session, or it failed to
+	// compile) the frame is graded as SDR, which the HDR output then shows at paper white.
+	const bool hdrGrading = colorCBData.hdrParams.x > 0.5f && colorgradingHdrCS && lutgenHdrCS;
+	if (!hdrGrading)
+		colorCBData.hdrParams = float4{ 0.0f, 0.0f, 0.0f, 0.0f };
 	colorCB->Update(colorCBData);
 
 	ID3D11Buffer* cb = colorCB->CB();
@@ -721,7 +738,7 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 	if (!lutValid || std::memcmp(&bakedColorCBData, &colorCBData, sizeof(ColorCB)) != 0) {
 		uav = texLUT->uav.get();
 		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-		context->CSSetShader(lutgenCS.get(), nullptr, 0);
+		context->CSSetShader(hdrGrading ? lutgenHdrCS.get() : lutgenCS.get(), nullptr, 0);
 		context->Dispatch(LUTDim >> 3, LUTDim >> 3, LUTDim >> 3);
 
 		uav = nullptr;
@@ -741,7 +758,7 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 	uav = direct ? directOutput.uav : texColor->uav.get();
 	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 	context->CSSetShaderResources(0, 2, srvs.data());
-	context->CSSetShader(colorgradingCS.get(), nullptr, 0);
+	context->CSSetShader(hdrGrading ? colorgradingHdrCS.get() : colorgradingCS.get(), nullptr, 0);
 
 	context->Dispatch((texColor->desc.Width + 7) >> 3, (texColor->desc.Height + 7) >> 3, 1);
 

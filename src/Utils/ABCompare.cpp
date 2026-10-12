@@ -5,6 +5,7 @@
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Features/PostProcessing.h"
 #include "Features/Upscaling.h"
+#include "Features/Upscaling/HDROutput.h"
 #include "Globals.h"
 #include "Menu.h"
 #include "ShaderCache.h"
@@ -243,6 +244,8 @@ namespace ABCompare
 					return "needs a restart";
 				if (a_key == "frameGenerationMode" && globals::features::upscaling.GetFrameGenerationBackend() != Upscaling::FrameGenerationBackend::kDLSSG)
 					return "FSR frame generation: may need a restart";
+				if (auto note = HDROutput::RestartNote(a_key); !note.empty())  // (batch 43)
+					return note;
 			}
 			return {};
 		}

@@ -6,6 +6,7 @@
 #include "../../Deferred.h"
 #include "../Upscaling.h"
 #include "FidelityFX.h"
+#include "HDROutput.h"
 #include "Streamline.h"
 
 void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
@@ -83,6 +84,23 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 
 	auto& upscaling = globals::features::upscaling;
 	const bool useDLSSG = upscaling.IsDLSSGBackend() && upscaling.streamline.featureDLSS_G && upscaling.streamline.featureReflex && upscaling.streamline.featurePCL;
+
+	// (batch 43) Native HDR: a 10-bit chain only when HDR output was saved on, so an SDR session
+	// keeps the game's own format and every byte it showed before. DLSS-G takes HDR10 as
+	// R10G10B10A2 + G2084/P2020 (Streamline DLSS-G guide, section 11); it does not take scRGB.
+	if (useDLSSG && HDROutput::WantsTenBitSwapChain()) {
+		D3D12_FEATURE_DATA_FORMAT_SUPPORT support{ DXGI_FORMAT_R10G10B10A2_UNORM, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE };
+		const bool supported = SUCCEEDED(d3d12Device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
+		                       (support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) && (support.Support1 & D3D12_FORMAT_SUPPORT1_DISPLAY);
+		if (supported) {
+			logger::info("[HDR] HDR output is on: swap chain format {} -> {} (R10G10B10A2_UNORM)", static_cast<uint32_t>(swapChainDesc.Format),
+				static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_UNORM));
+			swapChainDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+		} else {
+			logger::warn("[HDR] R10G10B10A2_UNORM is not a displayable render-target format here; keeping format {}", static_cast<uint32_t>(swapChainDesc.Format));
+		}
+	}
+
 	if (useDLSSG) {
 		// DLSS-G owns the presentation path through Streamline. The factory
 		// must be upgraded before CreateSwapChainForHwnd; creating an FFX
@@ -139,6 +157,8 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 		swapChainDesc.BufferCount, static_cast<uint32_t>(swapChainDesc.SwapEffect), swapChainDesc.Flags,
 		(swapChainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0);
 
+	HDROutput::OnSwapChainCreated();
+
 	if (!useDLSSG)
 		upscaling.fidelityFX.SetupFrameGeneration();
 }
@@ -164,6 +184,10 @@ void DX12SwapChain::CreateInterop()
 	texDesc11.SampleDesc.Count = 1;
 	texDesc11.SampleDesc.Quality = 0;
 	texDesc11.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	// (batch 43) HDR session only: the HDR passes write the back buffer and the HUD-less image directly.
+	const bool hdrSession = HDROutput::IsSession();
+	if (hdrSession)
+		texDesc11.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
 
 	swapChainBufferWrapped = std::make_unique<WrappedResource>(texDesc11, d3d11Device.get(), d3d12Device.get());
 
@@ -172,6 +196,15 @@ void DX12SwapChain::CreateInterop()
 	if (!globals::features::upscaling.IsDLSSGBackend())
 		texDesc11.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	uiBufferWrapped = std::make_unique<WrappedResource>(texDesc11, d3d11Device.get(), d3d12Device.get());
+
+	if (hdrSession) {
+		// The HDR10 image the swap chain is filled from while HDR output is on (the back buffer
+		// above is then the input: the SDR frame, or what Present-hook mods drew).
+		D3D11_TEXTURE2D_DESC outputDesc = texDesc11;
+		outputDesc.Format = swapChainDesc.Format;
+		outputDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		hdrOutputWrapped = std::make_unique<WrappedResource>(outputDesc, d3d11Device.get(), d3d12Device.get());
+	}
 }
 
 DXGISwapChainProxy* DX12SwapChain::GetSwapChainProxy()
@@ -222,6 +255,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		frameIndex = swapChain->GetCurrentBackBufferIndex();
 	}
 
+	// (batch 43) Native HDR: the last D3D11 work of the frame, after every Present hook has drawn.
+	// Returns the HDR10 image to show instead of the back buffer, or nullptr.
+	ID3D12Resource* hdrSource = HDROutput::CompositeForPresent();
+
 	// Wait for D3D11 to finish
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
@@ -233,7 +270,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 	// Copy shared texture to swap chain buffer
 	{
-		auto fakeSwapChain = swapChainBufferWrapped->resource.get();
+		auto fakeSwapChain = hdrSource ? hdrSource : swapChainBufferWrapped->resource.get();
 		auto realSwapChain = swapChainBuffers[frameIndex].get();
 		{
 			std::vector<D3D12_RESOURCE_BARRIER> barriers;
@@ -370,6 +407,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 	float clearColor[4]{ 0, 0, 0, 0 };
 	d3d11Context->ClearRenderTargetView(uiBufferWrapped->rtv, clearColor);
+
+	// (batch 43) Per-frame reset and colour-space changes for the next frame.
+	HDROutput::AfterPresent();
 
 	// If VSync is disabled, use frame limiter to prevent tearing and optimise pacing
 	if (SyncInterval == 0)
@@ -602,6 +642,9 @@ void DX12SwapChain::SetUIBuffer()
 {
 	auto& upscaling = globals::features::upscaling;
 
+	// (batch 43) Native HDR: the scene goes into the back buffer here (HDR10 or SDR).
+	HDROutput::OnUIStartBeforeHUDLess();
+
 	if (upscaling.IsDLSSGBackend()) {
 		dlssGHUDLessFrameIndex = UINT32_MAX;
 		auto* ui = globals::game::ui;
@@ -621,6 +664,7 @@ void DX12SwapChain::SetUIBuffer()
 			d3d11Context->CopyResource(uiBufferWrapped->resource11, swapChainBufferWrapped->resource11);
 			dlssGHUDLessFrameIndex = upscaling.streamline.GetLatchedFrameTokenIndex();
 		}
+		HDROutput::OnUIStartAfterHUDLess();
 		return;
 	}
 

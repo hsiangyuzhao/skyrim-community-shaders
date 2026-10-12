@@ -4,6 +4,7 @@
 #include <winrt/base.h>
 
 #include "Features/Upscaling.h"
+#include "Features/Upscaling/HDROutput.h"
 #include "Utils/UI.h"
 
 namespace DisplayHDRInfo
@@ -48,8 +49,49 @@ namespace DisplayHDRInfo
 			bool haveSdrWhite = false;
 			float sdrWhiteNits = 0.0f;
 
+			// (43a) Windows 11 24H2 DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2: HDR (not just wide colour)
+			// actually active. Ported from upstream HDRDisplay (credit there: renodx, MIT).
+			bool haveAdvancedColor2 = false;
+			bool hdrSupported2 = false;
+			bool hdrActive2 = false;
+
 			std::vector<SwapChainInfo> swapChains;
 		};
+
+		// (43a) Windows 11 24H2 display-config query, ported from upstream HDRDisplay (which credits
+		// renodx by clshortfuse, MIT). Compat_ names avoid clashing with newer SDK headers.
+		typedef enum
+		{
+			Compat_DISPLAYCONFIG_ADVANCED_COLOR_MODE_SDR = 0,
+			Compat_DISPLAYCONFIG_ADVANCED_COLOR_MODE_WCG = 1,
+			Compat_DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR = 2
+		} Compat_DISPLAYCONFIG_ADVANCED_COLOR_MODE;
+
+		typedef struct Compat_DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2
+		{
+			DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+			union
+			{
+				struct
+				{
+					UINT32 advancedColorSupported: 1;
+					UINT32 advancedColorActive: 1;
+					UINT32 reserved1: 1;
+					UINT32 advancedColorLimitedByPolicy: 1;
+					UINT32 highDynamicRangeSupported: 1;
+					UINT32 highDynamicRangeUserEnabled: 1;
+					UINT32 wideColorSupported: 1;
+					UINT32 wideColorUserEnabled: 1;
+					UINT32 reserved: 24;
+				};
+				UINT32 value;
+			};
+			DISPLAYCONFIG_COLOR_ENCODING colorEncoding;
+			UINT32 bitsPerColorChannel;
+			Compat_DISPLAYCONFIG_ADVANCED_COLOR_MODE activeColorMode;
+		} Compat_DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2;
+
+		constexpr DISPLAYCONFIG_DEVICE_INFO_TYPE kDisplayConfigGetAdvancedColorInfo2 = static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(15);
 
 		std::mutex g_mutex;
 		Snapshot g_snapshot;
@@ -167,6 +209,17 @@ namespace DisplayHDRInfo
 					a_snap.advancedColorBits = static_cast<uint32_t>(color.bitsPerColorChannel);
 				}
 
+				Compat_DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 color2{};
+				color2.header.type = kDisplayConfigGetAdvancedColorInfo2;
+				color2.header.size = sizeof(color2);
+				color2.header.adapterId = path.targetInfo.adapterId;
+				color2.header.id = path.targetInfo.id;
+				if (DisplayConfigGetDeviceInfo(&color2.header) == ERROR_SUCCESS) {
+					a_snap.haveAdvancedColor2 = true;
+					a_snap.hdrSupported2 = color2.highDynamicRangeSupported != 0;
+					a_snap.hdrActive2 = color2.activeColorMode == Compat_DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR;
+				}
+
 				DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
 				white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
 				white.header.size = sizeof(white);
@@ -270,6 +323,8 @@ namespace DisplayHDRInfo
 				logger::info("[Display/HDR] Advanced colour: supported {}, enabled {}, force-disabled {}, {} bits per channel; SDR white {:.0f} nits",
 					snap.advancedColorSupported, snap.advancedColorEnabled, snap.advancedColorForceDisabled, snap.advancedColorBits,
 					snap.haveSdrWhite ? snap.sdrWhiteNits : 0.0f);
+			if (snap.haveAdvancedColor2)
+				logger::info("[Display/HDR] Windows 11 24H2 query: HDR supported {}, HDR active {}", snap.hdrSupported2, snap.hdrActive2);
 			for (const auto& sc : snap.swapChains) {
 				if (sc.queried)
 					logger::info("[Display/HDR] Swap chain {}: format {}, CheckColorSpaceSupport HDR10 0x{:X} ({}), scRGB 0x{:X} ({}), sRGB 0x{:X} ({})",
@@ -318,6 +373,20 @@ namespace DisplayHDRInfo
 		g_requested = true;
 	}
 
+	DisplayState GetDisplayState()
+	{
+		std::lock_guard lock(g_mutex);
+		DisplayState state;
+		state.valid = g_snapshot.valid && g_snapshot.haveOutput;
+		if (!state.valid)
+			return state;
+		state.windowsHDR = g_snapshot.haveAdvancedColor2 ? g_snapshot.hdrActive2 : g_snapshot.windowsHdrByColorSpace;
+		state.maxLuminance = g_snapshot.maxLuminance;
+		state.maxFullFrameLuminance = g_snapshot.maxFullFrameLuminance;
+		state.sdrWhiteNits = g_snapshot.haveSdrWhite ? g_snapshot.sdrWhiteNits : 0.0f;
+		return state;
+	}
+
 	void DrawSettings()
 	{
 		Snapshot snap;
@@ -330,8 +399,12 @@ namespace DisplayHDRInfo
 			return;
 
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Read-only. What Windows and the monitor report, for the native HDR work. Nothing here changes the picture.");
+			ImGui::Text("Read-only. What Windows and the monitor report, and what native HDR output is doing. Nothing here changes the picture.");
 		}
+
+		// (43a) Native HDR output: state, the format and colour space actually set, cost.
+		HDROutput::DrawStatus();
+		ImGui::Separator();
 
 		if (!snap.valid) {
 			ImGui::TextUnformatted("Not queried yet.");
@@ -350,6 +423,8 @@ namespace DisplayHDRInfo
 			}
 			if (snap.haveSdrWhite)
 				ImGui::Text("Windows SDR content brightness: %.0f nits", snap.sdrWhiteNits);
+			if (snap.haveAdvancedColor2)
+				ImGui::Text("Windows 11 24H2 query: HDR supported %s, HDR active %s", snap.hdrSupported2 ? "yes" : "no", snap.hdrActive2 ? "yes" : "no");
 			for (const auto& sc : snap.swapChains) {
 				if (sc.queried)
 					ImGui::Text("%s (format %u): HDR10 %s, scRGB %s, sRGB %s", sc.label.c_str(), sc.format,
@@ -373,6 +448,7 @@ namespace DisplayHDRInfo
 		}
 		nlohmann::json j = nlohmann::json::object();
 		j["valid"] = snap.valid;
+		j["hdr_output"] = HDROutput::GetMetaJson();  // (43a)
 		if (!snap.valid)
 			return j;
 		j["queried"] = snap.timeLocal;

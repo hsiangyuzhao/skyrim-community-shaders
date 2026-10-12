@@ -102,6 +102,9 @@ namespace Util
 			{ "NR Finalize (DLSS 5)",
 				"GPU time for bringing the model's changes back onto the full-size picture (scaling them up when Model Resolution "
 				"is below 100%) and copying the result back." },
+			{ "HDR Output",
+				"GPU time for native HDR output: turning the finished picture into HDR10 (and, with the HUD on its own layer, "
+				"putting the HUD and menus back on top at their own brightness). Only runs while Upscaling > HDR Output is on." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

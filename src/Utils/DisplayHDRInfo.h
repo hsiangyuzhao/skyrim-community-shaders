@@ -26,6 +26,17 @@ namespace DisplayHDRInfo
 	/// Re-query on the next Tick().
 	void RequestRefresh();
 
+	/// (43a) What the last query found, for native HDR output.
+	struct DisplayState
+	{
+		bool valid = false;       ///< the game window's monitor was read
+		bool windowsHDR = false;  ///< Windows HDR is on for it (24H2 query when available, else the output colour space)
+		float maxLuminance = 0.0f;
+		float maxFullFrameLuminance = 0.0f;
+		float sdrWhiteNits = 0.0f;
+	};
+	DisplayState GetDisplayState();
+
 	/// Read-only ImGui section (with a Refresh button).
 	void DrawSettings();
 

@@ -41,6 +41,11 @@ cbuffer ColorCB : register(b1) {
     uint skipLDR;
     uint enableTonemap;
     uint enableColorSpaceTransform;
+
+	// (batch 43) Native HDR output. x: 0 = SDR (unchanged), 1 = extend the selected tone mapper,
+	// 2 = GT7 HDR curve; y: peak / paper white; z: roll-off start; w: 1 when the chain's output is
+	// display gamma (Linear Lighting's gamma correction off) rather than display linear.
+	float4 hdrParams;
 };
 
 namespace LogType {
@@ -589,6 +594,111 @@ float3 GT7ToneMapping(float3 color)
 }
 
 ////////////////////////////////////////////////////////////////////////
+// (batch 43) Native HDR output: highlight extension.
+//
+// The LUT keeps the SDR result in rgb, exactly as before, and the HDR brightness factor for that
+// texel in alpha (1 in SDR). CSColorGrading multiplies by it only while HDR output is on, so the SDR
+// picture, and everything else that reads this LUT (DLSS 5's tone-matched curve), is unchanged.
+//
+// Mode 1, extend the selected tone mapper: below the knee the picture is the SDR one. The knee is
+// where the tone mapper's neutral curve reaches hdrParams.z of SDR white. Above it the brightest
+// channel follows an exponential shoulder that leaves the knee with the tone mapper's own slope and
+// approaches the peak (hdrParams.y, in paper whites) instead of SDR white.
+//
+// Mode 2, GT7 HDR: Gran Turismo 7's curve with its target at the peak and its linear section ending
+// at hdrParams.z of the peak; the SDR result is GT7's SDR curve. The same scale-the-SDR-colour
+// approach, so mid-tones are GT7 SDR's exactly.
+//
+// All of it is compiled only into the HDR_OUTPUT variants, which Color Grading uses only while HDR
+// output is on: the SDR variants compile to the same code as before batch 43.
+#if defined(HDR_OUTPUT)
+
+float HDRMax3(float3 v)
+{
+	return max(max(v.r, v.g), v.b);
+}
+
+float HDRToDisplayLinear(float v)
+{
+	return hdrParams.w > 0.5 ? pow(max(v, 0.0), 2.2) : max(v, 0.0);
+}
+
+float HDRGreyCurve(float s)
+{
+	return HDRToDisplayLinear(HDRMax3(TONEMAP_FUNC(s.xxx)));
+}
+
+struct HDRKnee
+{
+	float x;
+	float y;
+	float slope;
+	float valid;
+};
+
+HDRKnee HDRNoKnee()
+{
+	HDRKnee k;
+	k.x = 0.0;
+	k.y = 0.0;
+	k.slope = 0.0;
+	k.valid = 0.0;
+	return k;
+}
+
+HDRKnee HDRFindKnee()
+{
+	HDRKnee k = HDRNoKnee();
+	k.y = hdrParams.z;
+	if (k.y <= 0.0 || hdrParams.y <= k.y)
+		return k;
+
+	// Bisection on log2 of the tone mapper's input for the point where it reaches the knee.
+	float lo = -16.0;
+	float hi = 16.0;
+	if (HDRGreyCurve(exp2(hi)) < k.y || HDRGreyCurve(exp2(lo)) >= k.y)
+		return k;
+	[loop] for (int i = 0; i < 24; ++i)
+	{
+		const float mid = 0.5 * (lo + hi);
+		if (HDRGreyCurve(exp2(mid)) < k.y)
+			lo = mid;
+		else
+			hi = mid;
+	}
+	k.x = exp2(hi);
+	const float a = k.x * 0.97;
+	const float b = k.x * 1.03;
+	k.slope = max((HDRGreyCurve(b) - HDRGreyCurve(a)) / (b - a), 1e-4);
+	k.valid = 1.0;
+	return k;
+}
+
+float HDRExtendScale(float3 preTonemap, HDRKnee knee)
+{
+	if (knee.valid < 0.5)
+		return 1.0;
+	const float m = HDRMax3(preTonemap);
+	if (m <= knee.x)
+		return 1.0;
+	const float room = hdrParams.y - knee.y;
+	const float h = knee.y + room * (1.0 - exp(-knee.slope * (m - knee.x) / room));
+	return max(h / max(HDRGreyCurve(m), 1e-4), 1.0);
+}
+
+float HDRGT7Scale(float3 preTonemap, out float3 sdr)
+{
+	sdr = GT7ToneMappingSDR(preTonemap);
+	const float target = physicalValueToFrameBufferValue(GRAN_TURISMO_SDR_PAPER_WHITE) * hdrParams.y;
+	const float3 hdr = GT7ToneMappingHDRRolloff(preTonemap, target, clamp(hdrParams.z, 0.3, 0.9)) /
+	                   physicalValueToFrameBufferValue(GRAN_TURISMO_SDR_PAPER_WHITE);
+	const float s = HDRToDisplayLinear(HDRMax3(sdr));
+	const float h = HDRToDisplayLinear(HDRMax3(hdr));
+	return max(h / max(s, 1e-4), 1.0);
+}
+#endif  // HDR_OUTPUT
+
+////////////////////////////////////////////////////////////////////////
 
 // Linear to Log
 float3 ACEScct(float3 linearColor, bool inverse)
@@ -691,8 +801,15 @@ float3 LogToLinearSpace(float3 val, uint logType)
 
 ////////////////////////////////////////////////////////////////////////
 
+#if defined(HDR_OUTPUT)
+float3 ColorGrading(float3 color, HDRKnee hdrKnee, out float hdrScale)
+{
+	hdrScale = 1.0;
+#else
 float3 ColorGrading(float3 color)
 {
+#endif
+
 	// Color space transform (preferably sRGB to ACEScg)
     if (enableColorSpaceTransform) {
 		const float3x3 colorSpaceTransformMat = float3x3(colorSpaceTransform[0].xyz, colorSpaceTransform[1].xyz, colorSpaceTransform[2].xyz);
@@ -727,7 +844,20 @@ float3 ColorGrading(float3 color)
 
     // Tonemap
     if (enableTonemap) {
+#if defined(HDR_OUTPUT)
+		[branch] if (hdrParams.x > 1.5) {
+			// (batch 43) GT7 HDR: GT7's SDR curve here, its HDR brightness in hdrScale.
+			const float3 preTonemap = color;
+			hdrScale = HDRGT7Scale(preTonemap, color);
+		} else {
+			const float3 preTonemap = color;
+			color = TONEMAP_FUNC(color);
+			[branch] if (hdrParams.x > 0.5)
+				hdrScale = HDRExtendScale(preTonemap, hdrKnee);
+		}
+#else
         color = TONEMAP_FUNC(color);
+#endif
     }
 
 	// Inverse color space transform
@@ -751,12 +881,20 @@ float3 ColorGrading(float3 color)
 	return color;
 }
 
+#if defined(HDR_OUTPUT)
+float4 ApplyLUT(float3 color)
+{
+	color = LinearToLog(color + LogToLinear(0));
+	return TexLUT.SampleLevel(LinearSampler, color, 0);
+}
+#else
 float3 ApplyLUT(float3 color)
 {
 	color = LinearToLog(color + LogToLinear(0));
 	color = TexLUT.SampleLevel(LinearSampler, color, 0).xyz;
 	return color;
 }
+#endif
 
 [numthreads(8, 8, 1)] void CSColorGrading(uint2 DTid : SV_DispatchThreadID) {
 	// Game cinematic
@@ -765,9 +903,20 @@ float3 ApplyLUT(float3 color)
 	color = LinearContrast(color, cinematic.z, 0.18);
 
 	// Apply LUT or Color Grading
+#if defined(HDR_OUTPUT)
+	const float4 graded = ApplyLUT(color);
+	color = graded.xyz;
+#else
 	color = ApplyLUT(color);
+#endif
 
 	color = pow(abs(color), saturationHueInOutGamma.w);
+
+#if defined(HDR_OUTPUT)
+	// (batch 43) HDR output: the texel's highlight factor (see the HDR block above).
+	[branch] if (hdrParams.x > 0.5)
+		color *= max(graded.w, 1.0);
+#endif
 
     // Game tint
     float luma = Color::RGBToLuminance(color);
@@ -781,6 +930,39 @@ float3 ApplyLUT(float3 color)
 
 RWTexture3D<float4> RWLUT : register(u0);
 
+#if defined(HDR_OUTPUT)
+// (batch 43) The knee depends only on the tone mapper and the HDR settings: found once per group.
+groupshared float gHdrKnee[4];
+
+[numthreads(8, 8, 8)] void CSLUTGen(uint3 DTid : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex) {
+	[branch] if (groupIndex == 0)
+	{
+		HDRKnee knee = HDRNoKnee();
+		[branch] if (hdrParams.x > 0.5 && hdrParams.x < 1.5)
+			knee = HDRFindKnee();
+		gHdrKnee[0] = knee.x;
+		gHdrKnee[1] = knee.y;
+		gHdrKnee[2] = knee.slope;
+		gHdrKnee[3] = knee.valid;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	HDRKnee hdrKnee;
+	hdrKnee.x = gHdrKnee[0];
+	hdrKnee.y = gHdrKnee[1];
+	hdrKnee.slope = gHdrKnee[2];
+	hdrKnee.valid = gHdrKnee[3];
+
+	float3 uvw = float3(DTid + 0.5) / float3((LUT_SIZE - 1).xxx);
+	float4 neutralColor = float4(uvw, 1);
+	float3 linearColor = LogToLinear(neutralColor.xyz) - LogToLinear(0);
+	float hdrScale = 1.0;
+	linearColor = ColorGrading(linearColor, hdrKnee, hdrScale);
+	// Display-gamma chain (Linear Lighting gamma correction off): the factor is applied to gamma values.
+	if (hdrParams.w > 0.5)
+		hdrScale = pow(hdrScale, 1.0 / 2.2);
+	RWLUT[DTid] = float4(linearColor, hdrParams.x > 0.5 ? hdrScale : 1.0);
+}
+#else
 [numthreads(8, 8, 8)] void CSLUTGen(uint3 DTid : SV_DispatchThreadID) {
 	float3 uvw = float3(DTid + 0.5) / float3((LUT_SIZE - 1).xxx);
 	float4 neutralColor = float4(uvw, 1);
@@ -788,3 +970,4 @@ RWTexture3D<float4> RWLUT : register(u0);
 	linearColor = ColorGrading(linearColor);
 	RWLUT[DTid] = float4(linearColor, 1);
 }
+#endif

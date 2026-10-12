@@ -63,6 +63,8 @@ namespace Util
 		// finalize (upsample of the edit, tone statistics, copy back). Disjoint, so the rows add up.
 		NeuralRenderingModel,
 		NeuralRenderingFinalize,
+		// (batch 43) Native HDR output: scene encode / SDR resolve at UI start + the final composite before Present.
+		HDROutput,
 		Count
 	};
 
