@@ -26,12 +26,108 @@ namespace Skin
 		float4 wetSkinPerGeometry;
 		// (44a) Wet Skin settings (WetSkin.cpp, WetSkin::GPUParams).
 		float4 wetSkinParams[6];
+		// (44c) Character Wetness, per character / per geometry: x = seconds since leaving the
+		// water (0 while in it), y = item class prior from the worn item's keywords (0 unknown,
+		// 1 cloth, 2 leather, 3 metal, 4 fur), z = 1 while in the water, w unused.
+		float4 wetCharPerGeometry;
+		// (44c) Character Wetness: hair and gear settings (WetSkin::GPUParams::c, layout there).
+		float4 wetCharParams[12];
 	};
 
 	// (44a) Wet Skin model: New (1) or Original (0).
 	bool WetSkinNewModel()
 	{
 		return wetSkinParams[0].x > 0.5;
+	}
+
+	/// (44c) Twomey wet albedo, d = 0..2: d <= 1 moves toward one soaking step A / (1.77 - 0.77 A),
+	/// above 1 a second step on top (the same formula again), so a "darker than soaked" slider
+	/// stays a plausible colour.
+	float3 WetDarkenAlbedo(float3 A, float d)
+	{
+		A = max(A, 0.0);
+		const float3 a1 = lerp(A, A / (1.77 - 0.77 * saturate(A)), saturate(d));
+		[branch] if (d > 1.0)
+			return lerp(a1, a1 / (1.77 - 0.77 * saturate(a1)), saturate(d - 1.0));
+		return a1;
+	}
+
+	/// (44c) Swimming wetness of one material class with its own drying multiplier (skin = 1,
+	/// hair, cloth, leather, metal, fur from Character Wetness): full in the water, held for
+	/// Hold x mult after leaving it, then a smooth dry-off over Dry x mult. progress: 0..1 how far
+	/// the dry-off is.
+	float CharSwimClass(float dryMult, out float progress)
+	{
+		progress = 0.0;
+		if (wetCharPerGeometry.z > 0.5)
+			return 1.0;
+		const float hold = max(wetCharParams[0].x, 0.0) * dryMult;
+		const float dry = max(wetCharParams[0].y * dryMult, 1.0);
+		const float t = saturate((wetCharPerGeometry.x - hold) / dry);
+		progress = t;
+		return 1.0 - t * t * (3.0 - 2.0 * t);
+	}
+
+	/// (44c) CharDryWetness for hair and gear: their own swimming wetness (CharSwimClass), the
+	/// water line raised / lowered by levelOffset (cloth wicking, receding while drying), and
+	/// their share of the sweat.
+	float CharDryWetnessClass(float worldZ, float sweat, float swimClass, float levelOffset, float sweatShare, out float wSwim, out float wManual, out float wSweat)
+	{
+		const float waterLevel = skinPerGeometry.z + wetSkinPerGeometry.y + levelOffset;
+		const float swim = wetSkinPerGeometry.y > 0.0 ? swimClass * (1.0 - smoothstep(waterLevel - 2.5, waterLevel + 2.5, worldZ)) : 0.0;
+		wSwim = saturate(swim * wetSkinParams[0].z);
+		wManual = saturate(wetSkinParams[0].y);
+		wSweat = saturate(sweat * wetSkinParams[1].x * sweatShare);
+		return 1.0 - (1.0 - wSwim) * (1.0 - wManual) * (1.0 - wSweat);
+	}
+
+	// ---- (44c) Gear: soft material classes ------------------------------------------------------
+	//
+	// wetCharParams (WetSkin::GPUParams::c):
+	//   [0] x hold (s), y dry-off (s), z hair dry-time multiplier, w hair sweat share
+	//   [1] x wet hair on, y hair darkening, z highlight sharpness, w highlight strength
+	//   [2] x secondary highlight loss, y scatter loss, z clumping, w clump count
+	//   [3] x clump streakiness, y gap darkening, z debug class tint, w unused
+	//   [4] x gear mode (0 off, 1 New, 2 42c), y overall sheen, z patch contrast, w cloth wicking
+	//   [5] x gear sweat share, y item keyword trust (0 = pixels only), z leather droplets, w leather rivulets
+	//   [6] x metal droplets, y metal rivulets, z unused, w unused
+	//   [7..10] cloth, leather, metal, fur: x darkening, y sheen, z roughness floor, w dry-time multiplier
+	//   [11] unused
+
+	/// Class weights: x cloth, y leather, z metal (x + y + z = 1), w fur / other (blends the result
+	/// toward the fur parameters). m0: metal evidence (TruePBR metallic, env mask); g0: gloss;
+	/// l0: leather-vs-cloth from the gloss. The item keyword prior (44f) nudges l0 / m0 without
+	/// overriding the pixel: a buckle on a shirt still reads as metal.
+	float4 GearClassWeights(float m0, float g0, float l0, bool fur)
+	{
+		const float prior = wetCharPerGeometry.y;
+		const float trust = saturate(wetCharParams[5].y);
+		float f = fur ? 1.0 : 0.0;
+		[branch] if (trust > 0.0 && prior > 0.5)
+		{
+			if (prior < 1.5)
+				l0 *= 1.0 - trust;  // cloth
+			else if (prior < 2.5)
+				l0 = max(l0, trust);  // leather
+			else if (prior < 3.5)
+				m0 = max(m0, trust * smoothstep(0.25, 0.6, g0));  // metal without an env mask
+			else
+				f = max(f, trust);  // fur (animals)
+		}
+		const float m = saturate(m0);
+		l0 = saturate(l0);
+		return float4((1.0 - m) * (1.0 - l0), (1.0 - m) * l0, m, f);
+	}
+
+	float4 GearClassParams(float4 w)
+	{
+		return lerp(w.x * wetCharParams[7] + w.y * wetCharParams[8] + w.z * wetCharParams[9], wetCharParams[10], w.w);
+	}
+
+	/// G-buffer gloss cap per class (cloth 0.55, leather 0.70, metal 0.75, fur 0.50).
+	float GearClassGlossCap(float4 w)
+	{
+		return lerp(w.x * 0.55 + w.y * 0.70 + w.z * 0.75, 0.50, w.w);
 	}
 
 	/// (44b) Wet Skin New model: one character's wetness without the rain, the same for skin, hair
@@ -374,13 +470,16 @@ namespace Skin
 		return normal * heightScale + float3(0, 0, 1);
 	}
 
-	float FBM(float2 uv, float base_scale, int octaves, float lacunarity, float persistence, float z_offset_multiplier)
+#endif  // SKIN
+#if defined(PSHADER)
+	// (44c) uv_pixel_footprint passed in: callers in divergent control flow take it where the
+	// derivatives are defined.
+	float FBMFootprint(float2 uv, float uv_pixel_footprint, float base_scale, int octaves, float lacunarity, float persistence, float z_offset_multiplier)
 	{
 		float total = 0.0;
 		float frequency = base_scale;
 		float amplitude = 1.0;
 		float max_amplitude = 0.0;
-		const float uv_pixel_footprint = max(length(ddx(uv)), length(ddy(uv)));
 		for (int i = 0; i < octaves; i++)
 		{
 			const float2 octave_uv = uv * frequency;
@@ -401,6 +500,11 @@ namespace Skin
 			return total / max_amplitude;
 		}
 		return 0.0;
+	}
+
+	float FBM(float2 uv, float base_scale, int octaves, float lacunarity, float persistence, float z_offset_multiplier)
+	{
+		return FBMFootprint(uv, max(length(ddx(uv)), length(ddy(uv))), base_scale, octaves, lacunarity, persistence, z_offset_multiplier);
 	}
 
 	float PerlinNoise(float2 uv, float scale, float lacunarity, float persistence, float strength)
@@ -481,18 +585,24 @@ namespace Skin
 	/// Soft wet patches: the Perlin noise (Scale / Lacunarity / Persistence) against a threshold that
 	/// falls as the wetness rises, through a wide smoothstep. Patches grow and merge; at full wetness
 	/// the coverage is 1 everywhere. Contrast blends between an even film (0) and the patches (1).
-	float WetCoverage(float2 uv, float wetness, float scale, float lacunarity, float persistence)
+	float WetCoverageEx(float2 uv, float uvFootprint, float wetness, float scale, float lacunarity, float persistence, float softness, float contrast)
 	{
-		const float softness = clamp(wetSkinParams[2].x, 0.05, 0.6);
-		const float contrast = saturate(wetSkinParams[2].y);
+		softness = clamp(softness, 0.05, 0.6);
+		contrast = saturate(contrast);
 		if (wetness <= 0.0)
 			return 0.0;
 		if (contrast <= 0.0 || wetness >= 1.0)
 			return wetness;
-		const float noise = saturate((FBM(uv, scale, 5, lacunarity, persistence, 7.375f) - 0.5) * 3.0 + 0.5);
+		const float noise = saturate((FBMFootprint(uv, uvFootprint, scale, 5, lacunarity, persistence, 7.375f) - 0.5) * 3.0 + 0.5);
 		const float threshold = lerp(1.0 + softness, -softness, wetness);
 		const float patches = smoothstep(threshold - softness, threshold + softness, noise);
 		return wetness * lerp(1.0, patches, contrast);
+	}
+
+	float WetCoverage(float2 uv, float wetness, float scale, float lacunarity, float persistence)
+	{
+		const float uvFootprint = max(length(ddx(uv)), length(ddy(uv)));
+		return WetCoverageEx(uv, uvFootprint, wetness, scale, lacunarity, persistence, wetSkinParams[2].x, wetSkinParams[2].y);
 	}
 
 	struct WetSkinDetail
@@ -618,6 +728,8 @@ namespace Skin
 		return streak;
 	}
 
+#endif  // PSHADER (44c: the wet helpers are shared by skin, hair and gear)
+#if defined(SKIN)
 	/// How far the skin darkens toward its soaked colour (0..1): follows the soft coverage, plus
 	/// (44b) clearly along rivulets (more water standing in the skin's micro-relief) and at the
 	/// droplets' edges (their refractive rim).

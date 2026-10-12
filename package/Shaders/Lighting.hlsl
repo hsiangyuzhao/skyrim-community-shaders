@@ -1000,6 +1000,17 @@ float CapCharacterWetGloss(float wetGloss, float dryGloss, bool character)
 	return character ? min(wetGloss, max(dryGloss, 0.8)) : wetGloss;
 }
 
+// (44c) G-buffer gloss of a wet character pixel. Gear in the Character Wetness New model
+// (gearTarget >= 0): toward its film's gloss by the film's reflection energy, never above
+// max(dry gloss, class cap) (cloth 0.55, leather 0.7, metal 0.75): wet never turns gear into a
+// mirror, and metal that was already glossy keeps its own value. Otherwise the 42c / 44b rule.
+float CharacterWetGBufferGloss(float dryGloss, float wetWeight, bool character, float gearTarget, float gearCap)
+{
+	[branch] if (gearTarget >= 0.0)
+		return min(lerp(dryGloss, max(dryGloss, gearTarget), saturate(wetWeight)), max(dryGloss, gearCap));
+	return CapCharacterWetGloss(lerp(dryGloss, max(dryGloss, wetWeight), wetWeight), dryGloss, character);
+}
+
 // Clear-coat style water film: GGX with water's F0 and a fixed roughness. Caller scales by the
 // film weight; the base layer is attenuated separately.
 float3 GetWetFilmSpecular(float3 N, float3 V, float3 L, float3 lightColor, float roughness)
@@ -2636,6 +2647,43 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif
 	hairT = Hair::ReorientTangent(hairT, worldNormal);
 
+	// (44c) Wet hair clumps and specular AA, from screen derivatives taken here (uniform control
+	// flow; the per-pixel wetness comes later). Strand space: the hair tangent projected into uv
+	// gives "along" the strands; clumps are bands across them, slightly bent by a value noise
+	// along the strand. All fixed in uv (no time dependence), so DLSS accumulates them normally.
+	float hairClumpX = 0.5;     // 0..1, position across the clump
+	float hairClumpR = 0.0;     // -0.5..0.5, the clump's random highlight offset
+	float hairClumpFade = 0.0;  // 0 where a clump is narrower than ~2.5 px, 1 above ~5 px
+	float hairWetSpecAA = 0.0;  // squared widening of the highlight lobes
+#		if defined(CS_SKIN) && defined(WETNESS_EFFECTS)
+	[branch] if (skinEnabled && SharedData::hairSpecularSettings.Enabled && Skin::WetSkinNewModel() && Skin::wetCharParams[1].x > 0.5)
+	{
+		const float3 dPdx = ddx(input.WorldPosition.xyz);
+		const float3 dPdy = ddy(input.WorldPosition.xyz);
+		const float2 dUVdx = ddx(uv);
+		const float2 dUVdy = ddy(uv);
+		const float3 dTdx = ddx(hairT);
+		const float3 dTdy = ddy(hairT);
+		hairWetSpecAA = min(0.5 * (dot(dTdx, dTdx) + dot(dTdy, dTdy)), 0.3);
+		const float uvDet = dUVdx.x * dUVdy.y - dUVdx.y * dUVdy.x;
+		const float uvDetSafe = abs(uvDet) > 1e-12 ? uvDet : 1e-12;
+		const float3 dPdu = (dPdx * dUVdy.y - dPdy * dUVdx.y) / uvDetSafe;
+		const float3 dPdv = (dPdy * dUVdx.x - dPdx * dUVdy.x) / uvDetSafe;
+		float2 tUV = float2(dot(hairT, dPdu) / max(dot(dPdu, dPdu), 1e-12), dot(hairT, dPdv) / max(dot(dPdv, dPdv), 1e-12));
+		tUV = dot(tUV, tUV) > 1e-20 ? normalize(tUV) : float2(0.0, 1.0);
+		const float2 aUV = float2(-tUV.y, tUV.x);
+		const float clumpCount = clamp(Skin::wetCharParams[2].w, 16.0, 128.0);
+		const float l = dot(uv, tUV);
+		float s = dot(uv, aUV) * clumpCount;
+		s += 0.7 * (Skin::WetValueNoise(float2(l * 3.0, s * 0.1)) - 0.5);
+		const float id = floor(s);
+		hairClumpX = s - id;
+		hairClumpR = Skin::WetHash12(float2(id, 7.31)) - 0.5;
+		const float sPerPixel = max(abs(dot(dUVdx, aUV)), abs(dot(dUVdy, aUV))) * clumpCount;
+		hairClumpFade = smoothstep(2.5, 5.0, 1.0 / max(sPerPixel, 1e-6));
+	}
+#		endif
+
 	if (SharedData::hairSpecularSettings.Enabled) {
 		if (SharedData::hairSpecularSettings.EnableTangentShift && SharedData::hairSpecularSettings.HairMode != 1) {
 			float3 shiftedNormal = Hair::ShiftWorldNormal(hairT, worldNormal, 0, uv);
@@ -3169,6 +3217,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// with the same hold and dry-off as the skin, the manual slider, sweat). Added after the sky
 	// occlusion below: only the rain stays dry under a roof.
 	float charDryWetness = 0.0;
+	// (44c) Character Wetness New model: hair and gear (per-class) state, filled below.
+	bool charWetNew = false;    // the New model owns this character pixel's wetness (hair or gear)
+	bool hairWetActive = false; // HAIR: wet hair in the New model
+	bool gearWetNew = false;    // gear: the New per-class gear model
+	float4 gearClass = float4(1.0, 0.0, 0.0, 0.0);  // cloth, leather, metal weights; w = fur
+	float4 gearParams = 0.0;    // blended class darkening, sheen, roughness floor, dry multiplier
+	float gearSwimProgress = 0.0;
+	float charWetSwim = 0.0, charWetManual = 0.0, charWetSweat = 0.0;
+	float3 geardPdx = 0.0, geardPdy = 0.0;
+	float2 gearUVdx = 0.0, gearUVdy = 0.0;
+	float gearNormalVariance = 0.0;
 #		if defined(CS_SKIN) && !defined(SKIN)
 	if (skinEnabled) {
 		const float charWorldZ = input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z;
@@ -3178,9 +3237,83 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			endif
 		[branch] if (Skin::WetSkinNewModel())
 		{
-			float wSwim, wManual, wSweat;
-			if (wetCharacter)
+			float wSwim = 0.0, wManual = 0.0, wSweat = 0.0;
+#			if defined(HAIR)
+			// (44c) Hair: its own drying time (x Hair Dry Time) and sweat share; rain weighted like skin.
+			charWetNew = wetCharacter;
+			[branch] if (wetCharacter && Skin::wetCharParams[1].x > 0.5)
+			{
+				hairWetActive = true;
+				float progress;
+				const float swimHair = Skin::CharSwimClass(clamp(Skin::wetCharParams[0].z, 0.25, 4.0), progress);
+				charDryWetness = Skin::CharDryWetnessClass(charWorldZ, dynamicWetness.x, swimHair, 0.0, saturate(Skin::wetCharParams[0].w), wSwim, wManual, wSweat);
+				rainWetness *= saturate(Skin::wetSkinParams[0].w);
+			}
+			else
+				rainWetness = 0.0;  // Wet Hair off: not wet at all
+#			else
+			const float gearMode = Skin::wetCharParams[4].x;  // 0 off, 1 New, 2 42c (44b)
+			if (wetCharacter && gearMode > 1.5) {
 				charDryWetness = Skin::CharDryWetness(charWorldZ, dynamicWetness.x, wSwim, wManual, wSweat);
+			} else if (wetCharacter && gearMode > 0.5) {
+				// (44c) Gear: a soft per-pixel material class (cloth / leather / metal, fur), each with
+				// its own darkening, sheen, roughness floor and drying time.
+				charWetNew = true;
+				gearWetNew = true;
+				float m0 = 0.0, g0 = 0.0, l0 = 0.0;
+#				if defined(TRUE_PBR)
+				m0 = ((PBRFlags & PBR::Flags::TwoLayer) != 0) ? 0.7 : saturate(sqrt(pbrSurfaceProperties.Metallic));
+				g0 = 1.0 - pbrSurfaceProperties.Roughness;
+				l0 = smoothstep(0.25, 0.55, g0);
+#				else
+#					if defined(SPECULAR)
+				g0 = glossiness * Color::RGBToLuminance(SpecularColor.xyz);
+#					endif
+#					if defined(ENVMAP) || defined(MULTI_LAYER_PARALLAX)
+				m0 = saturate(sqrt(envMask));
+#					else
+				m0 = 0.6 * smoothstep(0.55, 0.85, g0);
+#					endif
+				l0 = smoothstep(0.08, 0.35, g0);
+#				endif
+#				if defined(BACK_LIGHTING) || defined(SOFT_LIGHTING)
+				const bool gearFur = true;
+#				else
+				const bool gearFur = false;
+#				endif
+				gearClass = Skin::GearClassWeights(m0, g0, l0, gearFur);
+				gearParams = Skin::GearClassParams(gearClass);
+				// Swimming per class (cloth stays wet longest), blended like the other parameters.
+				float pC, pL, pM, pF;
+				const float sC = Skin::CharSwimClass(Skin::wetCharParams[7].w, pC);
+				const float sL = Skin::CharSwimClass(Skin::wetCharParams[8].w, pL);
+				const float sM = Skin::CharSwimClass(Skin::wetCharParams[9].w, pM);
+				const float sF = Skin::CharSwimClass(Skin::wetCharParams[10].w, pF);
+				const float swimGear = lerp(gearClass.x * sC + gearClass.y * sL + gearClass.z * sM, sF, gearClass.w);
+				gearSwimProgress = lerp(gearClass.x * pC + gearClass.y * pL + gearClass.z * pM, pF, gearClass.w);
+				// Cloth wicks water a few units above the water line (irregular tide mark), and the
+				// line recedes while drying: the top dries first, the hem last.
+				const float clothW = gearClass.x * (1.0 - gearClass.w);
+				const float wick = max(Skin::wetCharParams[4].w, 0.0) * clothW;
+				const float tide = (Skin::WetValueNoise(uv * 40.0) - 0.5) * 4.0 * clothW;
+				const float recede = 0.6 * Skin::wetSkinPerGeometry.y * gearSwimProgress;
+				charDryWetness = Skin::CharDryWetnessClass(charWorldZ, dynamicWetness.x, swimGear, wick + tide - recede, saturate(Skin::wetCharParams[5].x), wSwim, wManual, wSweat);
+				// Screen derivatives for droplets, rivulets and the specular AA, here in uniform
+				// control flow (everything above is per draw).
+				geardPdx = ddx(input.WorldPosition.xyz);
+				geardPdy = ddy(input.WorldPosition.xyz);
+				gearUVdx = ddx(uv);
+				gearUVdy = ddy(uv);
+				const float3 dNdx = ddx(worldNormal.xyz);
+				const float3 dNdy = ddy(worldNormal.xyz);
+				gearNormalVariance = 0.5 * (dot(dNdx, dNdx) + dot(dNdy, dNdy));
+			} else if (wetCharacter) {
+				rainWetness = 0.0;  // Wet Gear off: no character wetness (world surfaces untouched)
+			}
+#			endif
+			charWetSwim = wSwim;
+			charWetManual = wManual;
+			charWetSweat = wSweat;
 		}
 		else
 		{
@@ -3210,6 +3343,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	// Apply occlusion and distance factors
 	puddle *= wetnessOcclusion * nearFactor;
+	const float charRainPart = saturate(puddle);  // (44c) the sky-occluded rain part (gear droplets, rivulets)
 	// (44b) Wet Skin New model, hair and gear: swimming, manual and sweat are not sky-occluded.
 	[branch] if (charDryWetness > 0.0)
 		puddle = max(puddle, 1.0 - (1.0 - saturate(puddle)) * (1.0 - saturate(charDryWetness)));
@@ -3230,9 +3364,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// Update flatness and normal calculations
 	flatnessAmount *= smoothstep(SharedData::wetnessEffectsSettings.PuddleMinWetness, 1.0, wetnessGlossinessSpecular);
 
-	// Apply ripple normal effects
-	float3 rippleNormal = normalize(lerp(float3(0, 0, 1), raindropInfo.xyz, lerp(flatnessAmount, 1.0, 0.5)));
-	wetnessNormal = WetnessEffects::ReorientNormal(rippleNormal, wetnessNormal);
+	// Apply ripple normal effects. (44c) Not on characters in the Character Wetness New model: rain
+	// ripples are a puddle effect (they looked like puddle rings on shoulders); the G-buffer keeps the
+	// base normal.
+#		if defined(SKIN) && defined(CS_SKIN)
+	const bool charNoRipple = skinWetNew && skinEnabled;
+#		else
+	const bool charNoRipple = charWetNew;
+#		endif
+	if (!charNoRipple) {
+		float3 rippleNormal = normalize(lerp(float3(0, 0, 1), raindropInfo.xyz, lerp(flatnessAmount, 1.0, 0.5)));
+		wetnessNormal = WetnessEffects::ReorientNormal(rippleNormal, wetnessNormal);
+	}
 
 	waterRoughnessSpecular = 1.0 - wetnessGlossinessSpecular;
 	// (42c, 4.4, always on) Characters: a fully wet surface had roughness 0, a highlight too
@@ -3241,13 +3384,148 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		waterRoughnessSpecular = max(waterRoughnessSpecular, 0.05);
 	// (44b) Anti-mirror for every character path: what the reflections (SSRT, IBL, cubemaps) see of
 	// the water on a character is never smoother than roughness 0.2 (44a did this for skin only).
-	const float wetIndirectRoughness = wetCharacter ? max(waterRoughnessSpecular, 0.2) : waterRoughnessSpecular;
+	float wetIndirectRoughness = wetCharacter ? max(waterRoughnessSpecular, 0.2) : waterRoughnessSpecular;
 	// (44b) Wet Skin New model owns hair wetness: hair writes its dry G-buffer values (gloss,
 	// reflectance), so SSRT / NRD see wet hair exactly as dry hair.
 #		if defined(HAIR) && defined(CS_SKIN)
 	const bool hairWetNew = skinEnabled && Skin::WetSkinNewModel();
 #		else
 	const bool hairWetNew = false;
+#		endif
+
+	// (44c) Character Wetness New model, hair and gear. Both read the character's wetness (rain
+	// part sky-occluded, the rest not). Hair: its own highlight model gets wet (darker, sharper and
+	// brighter primary highlight, weaker secondary, clumps); no water film, dry G-buffer. Gear: soft
+	// material classes, each with its own darkening, sheen, roughness floor and G-buffer gloss cap;
+	// droplets and rivulets on metal and leather (direct light only).
+	float3 wetFilmNormal = wetnessNormal;  // the water film's normal (gear droplet domes); direct light only
+	float charWetGlossTarget = -1.0;       // gear New: G-buffer gloss target (1 - film roughness), < 0 = 42c rule
+	float charWetGlossCap = 0.8;           // gear New: the class cap
+	float charWetDarken = 0.0;             // hair / gear New: how far toward the soaked colour (0..2)
+	float gearFilmRoughness = 0.2;
+	float gearFilmEnergy = 0.0;
+	float gearIndirectEnergy = 0.0;
+	float hairWetK = 0.0;
+#		if defined(CS_SKIN) && !defined(SKIN)
+	[branch] if (charWetNew)
+	{
+		const float wChar = saturate(puddle);
+#			if defined(HAIR)
+		const float hairWetW = hairWetActive ? wChar : 0.0;
+		hairWetK = smoothstep(0.05, 0.85, hairWetW);
+		charWetDarken = clamp(Skin::wetCharParams[1].y, 0.0, 1.5) * hairWetK;
+#				if defined(CS_HAIR)
+		[branch] if (hairWetK > 0.0 && SharedData::hairSpecularSettings.Enabled)
+		{
+			Hair::WetK = hairWetK;
+			Hair::WetSharpness = lerp(1.0, clamp(Skin::wetCharParams[1].z, 0.4, 1.0), hairWetK);
+			Hair::WetGain = lerp(1.0, clamp(Skin::wetCharParams[1].w, 0.5, 1.6), hairWetK);
+			Hair::WetTRT = lerp(1.0, 1.0 - saturate(Skin::wetCharParams[2].x), hairWetK);
+			Hair::WetScatter = 1.0 - saturate(Skin::wetCharParams[2].y) * hairWetK;
+			Hair::WetSpecAA = hairWetSpecAA;
+			// Clumps: strength from the wetness, faded out where a clump is narrower than ~3 px.
+			const float clump = saturate(Skin::wetCharParams[2].z) * smoothstep(0.3, 0.9, hairWetW) * hairClumpFade;
+			const float x = hairClumpX;
+			const float window = smoothstep(0.0, 0.25, x) * smoothstep(1.0, 0.75, x);
+			const float edge = smoothstep(0.0, 0.15, x) * smoothstep(1.0, 0.85, x);
+			const float gapWidth = 0.12;
+			const float gap = 1.0 - smoothstep(0.0, gapWidth, x) * smoothstep(1.0, 1.0 - gapWidth, x);
+			Hair::WetShift = hairClumpR * clamp(Skin::wetCharParams[3].x, 0.0, 0.4) * clump * window;
+			Hair::WetCylinder = (x - 0.5) * edge * clump;  // up to +-0.5 rad at the clump's sides
+			Hair::WetGap = 1.0 - clamp(Skin::wetCharParams[3].y, 0.0, 0.7) * gap * clump;
+		}
+		const bool hairVanillaWet = !SharedData::hairSpecularSettings.Enabled;
+#				else
+		const bool hairVanillaWet = true;
+#				endif
+		// Hair Specular off: the vanilla highlight, tighter and a little stronger (below).
+		if (hairVanillaWet)
+			shininess *= lerp(1.0, 2.5, hairWetK);
+#			else
+		[branch] if (gearWetNew)
+		{
+			const float clothW = gearClass.x * (1.0 - gearClass.w);
+			const float hardW = (gearClass.y + gearClass.z) * (1.0 - gearClass.w);  // leather + metal
+			// Soft wet patches (lower contrast than skin: cloth soaks in sheets); cloth spreads sooner.
+			float cov = Skin::WetCoverageEx(uv, max(length(gearUVdx), length(gearUVdy)), wChar, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z, Skin::wetSkinParams[2].x, Skin::wetCharParams[4].z);
+			cov = lerp(cov, saturate(cov * 1.25), clothW);
+			const float resp = pow(saturate(cov), 1.3);
+
+			// Droplets (metal, leather) and rivulets, in mesh uv like skin: they stay put on a moving
+			// character; gravity is world down projected on the surface.
+			float dropMask = 0.0, dropRim = 0.0, streak = 0.0;
+			float2 dropSlope = 0.0;
+			float3 tu = float3(1.0, 0.0, 0.0), tv = float3(0.0, 1.0, 0.0);
+			const float dropDensity = saturate(Skin::wetSkinParams[2].w) * (gearClass.z * saturate(Skin::wetCharParams[6].x) + gearClass.y * saturate(Skin::wetCharParams[5].z)) * (1.0 - gearClass.w);
+			const float rivAmount = (gearClass.z * saturate(Skin::wetCharParams[6].y) + gearClass.y * saturate(Skin::wetCharParams[5].w)) * (1.0 - gearClass.w);
+			[branch] if ((dropDensity > 0.0 || rivAmount > 0.0) && wChar > 0.0)
+			{
+				const float3 baseN = worldNormal.xyz;
+				const float uvDet = gearUVdx.x * gearUVdy.y - gearUVdx.y * gearUVdy.x;
+				const float uvDetSafe = abs(uvDet) > 1e-12 ? uvDet : 1e-12;
+				float3 dPdu = (geardPdx * gearUVdy.y - geardPdy * gearUVdx.y) / uvDetSafe;
+				float3 dPdv = (geardPdy * gearUVdx.x - geardPdx * gearUVdy.x) / uvDetSafe;
+				dPdu -= baseN * dot(baseN, dPdu);
+				dPdv -= baseN * dot(baseN, dPdv);
+				const float3 down = float3(0.0, 0.0, -1.0);
+				const float alignment = saturate(length(down - baseN * dot(baseN, down)));
+				float2 gravityUV = float2(dot(down, dPdu) / max(dot(dPdu, dPdu), 1e-12), dot(down, dPdv) / max(dot(dPdv, dPdv), 1e-12));
+				gravityUV = dot(gravityUV, gravityUV) > 1e-20 ? normalize(gravityUV) : float2(0.0, 1.0);
+				const float uvFootprint = max(length(gearUVdx), length(gearUVdy));
+				tu = dot(dPdu, dPdu) > 1e-20 ? normalize(dPdu) : tu;
+				tv = dot(dPdv, dPdv) > 1e-20 ? normalize(dPdv) : tv;
+
+				const float dropOthers = max(charWetSwim, charWetManual);
+				const float dropRain = charRainPart * saturate(Skin::wetSkinParams[5].w);
+				const float dropDriver = smoothstep(0.35, 0.9, max(dropOthers, dropRain));
+				const float cellsPerUV = 230.0 / clamp(Skin::wetSkinParams[3].x, 0.25, 4.0);
+				const float footprint = max(uvFootprint * cellsPerUV, 1e-6);
+				// Beads are about 0.3 cell in radius: fade them out below ~1.5 pixels (no DLSS sparkle).
+				const float dropVisibility = smoothstep(1.0, 2.5, 0.3 / footprint);
+				const float restFactor = lerp(0.7, 1.2, saturate(baseN.z * 0.5 + 0.5));
+				const float streakDriver = max(smoothstep(0.2, 0.85, dropOthers), charRainPart);
+				const float presence = dropDensity * dropDriver * restFactor * (dropVisibility > 0.0 ? 1.0 : 0.0);
+				const Skin::WetSkinDetail detail = Skin::WetSkinDroplets(uv * cellsPerUV, footprint, gravityUV, alignment, presence, streakDriver);
+				dropMask = detail.dropMask * dropVisibility;
+				dropRim = detail.dropRim * dropMask;
+				dropSlope = detail.dropSlope;
+				const float rivulets = rivAmount > 0.0 ? Skin::WetSkinRivulets(uv, 25.0, uvFootprint, gravityUV, alignment, streakDriver * rivAmount) : 0.0;
+				streak = saturate(max(rivulets, detail.trail * 0.8 * dropVisibility * hardW));
+			}
+
+			// Darkening: per class (metal none), more along leather rivulets and at bead rims on leather.
+			charWetDarken = gearParams.x * pow(saturate(cov), 0.8) + (0.5 * streak + saturate(Skin::wetSkinParams[3].w) * dropRim) * gearClass.y * (1.0 - gearClass.w);
+#				if defined(DYNAMIC_SNOW_SURFACE)
+			charWetDarken *= 1.0 - dynamicSnowCoverage;  // snow lies on top of the wet surface
+#				endif
+
+			// Sheen: the 42c film, its roughness and energy per class. Specular AA: curved or distant
+			// gear (normal varying across the pixel) gets a wider lobe, never a single bright pixel.
+			const float overall = clamp(Skin::wetCharParams[4].y, 0.0, 3.0);
+			const float sheen = max(gearParams.y, 0.0) * overall;
+			const float fullStrength = clamp(Skin::wetSkinParams[1].w, 0.0, 2.5);
+			float rough = max(lerp(gearParams.z + 0.15, gearParams.z, resp) - 0.04 * streak, 0.2);
+			const float aaVar = min(2.0 * gearNormalVariance, 0.18);
+			rough = sqrt(sqrt(rough * rough * rough * rough + aaVar));
+			const float dropRough = sqrt(sqrt(0.0001 + aaVar));
+			float energy = sheen * resp * fullStrength * (1.0 + 1.5 * streak);
+			energy += 1.5 * dropMask * saturate(wChar * 2.0) * min(overall, 1.0);
+			gearFilmRoughness = lerp(rough, max(dropRough, 0.1), saturate(dropMask));
+			gearFilmEnergy = min(max(energy, 0.0), 2.5);
+			gearIndirectEnergy = saturate(resp * sheen * 0.6);
+			charWetGlossTarget = 1.0 - rough;
+			charWetGlossCap = Skin::GearClassGlossCap(gearClass);
+			const float domeStrength = clamp(Skin::wetSkinParams[5].z, 0.0, 2.0);
+			[branch] if (dropMask > 0.0)
+				wetFilmNormal = normalize(wetnessNormal + (dropSlope.x * tu + dropSlope.y * tv) * domeStrength * dropMask);
+		}
+#			endif
+		// The New model replaces the 42c generic lobes on hair and gear: hair has no water film and
+		// reflects as when dry; gear reflects its own film (energy <= 1, roughness >= 0.2).
+		wetnessGlossinessSpecular = gearWetNew ? gearIndirectEnergy : 0.0;
+		waterRoughnessSpecular = (gearWetNew && gearIndirectEnergy > 0.0) ? max(1.0 - charWetGlossTarget, 0.2) : 1.0;
+		wetIndirectRoughness = max(waterRoughnessSpecular, 0.2);
+	}
 #		endif
 
 	// (42c) Character wetness: 4.3 occlusion for the rain-fed skin film, 4.2 darkening, 4.1 film.
@@ -3273,7 +3551,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			else
 	const bool skinWetNewActive = false;
 #			endif
-	const bool wetDarkenNew = wetCharacter && (SharedData::wetnessEffectsSettings.EnableWetDarkening || skinWetNewActive);
+	// (44c) Character Wetness New: hair and gear darken by their own amount (charWetDarken), the 42c
+	// switch has no say there.
+	const bool wetDarkenNew = wetCharacter && (SharedData::wetnessEffectsSettings.EnableWetDarkening || skinWetNewActive || charWetNew);
 	[branch] if (wetDarkenNew)
 	{
 		float wetDarkenWetness = saturate(max(puddle, shoreFactorAlbedo * SharedData::wetnessEffectsSettings.MaxShoreWetness));
@@ -3304,7 +3584,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			wetDarkenAmount = Skin::WetSkinDarkening(skinSurfaceProperties.Wetness, skinWetStreak, skinWetDropRim);
 #			endif
 		const float3 wetAlbedo = baseColor.xyz / (1.77 - 0.77 * saturate(baseColor.xyz));
-		baseColor.xyz = max(lerp(baseColor.xyz, wetAlbedo, wetDarkenAmount), 0.0);
+#			if defined(CS_SKIN)
+		[branch] if (charWetNew)
+			baseColor.xyz = Skin::WetDarkenAlbedo(baseColor.xyz, charWetDarken);
+		else
+#			endif
+			baseColor.xyz = max(lerp(baseColor.xyz, wetAlbedo, wetDarkenAmount), 0.0);
 #			if defined(SKIN) && defined(CS_SKIN)
 		skinSurfaceProperties.Albedo = baseColor.xyz;
 #			endif
@@ -3315,8 +3600,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// Advanced Skin the film replaces the Advanced Skin direct film (rain and swimming merged
 	// with max, so they never stack); elsewhere it replaces the old "rougher when drier,
 	// then x wetness" lobe.
-	const bool wetFilm = wetCharacter && SharedData::wetnessEffectsSettings.EnableWetFilm;
-	const float wetFilmRoughness = SharedData::wetnessEffectsSettings.WetFilmRoughness;
+	// (44c) Character Wetness New: gear draws its own per-class film here (hair none); the 42c generic
+	// lobes are off for both.
+	const bool wetFilm = wetCharacter && (SharedData::wetnessEffectsSettings.EnableWetFilm || charWetNew);
+	const float wetFilmRoughness = gearWetNew ? gearFilmRoughness : SharedData::wetnessEffectsSettings.WetFilmRoughness;
 	const float wetFilmWeight = saturate(wetnessGlossinessSpecular);
 	float3 wetFilmSpecular = 0.0;
 #		if defined(SKIN) && defined(CS_SKIN)
@@ -3330,8 +3617,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	const bool wetFilmInSkin = false;
 #		endif
 	// Film handled here (not inside the Advanced Skin BRDF), and its weight.
-	const bool wetFilmGeneric = wetFilm && !wetFilmInSkin && wetFilmWeight > 0.0;
-	const float wetFilmEnergy = wetFilmWeight * SharedData::wetnessEffectsSettings.WetFilmStrength;
+	const bool wetFilmGeneric = charWetNew ? (gearWetNew && gearFilmEnergy > 0.0) : (wetFilm && !wetFilmInSkin && wetFilmWeight > 0.0);
+	const float wetFilmEnergy = gearWetNew ? gearFilmEnergy : wetFilmWeight * SharedData::wetnessEffectsSettings.WetFilmStrength;
 #	endif
 
 #	if defined(SKIN) && defined(CS_SKIN)
@@ -3477,7 +3764,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif
 #		if defined(WETNESS_EFFECTS)
 		if (wetFilmGeneric)
-			wetFilmSpecular += GetWetFilmSpecular(wetnessNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, wetFilmRoughness);
+			wetFilmSpecular += GetWetFilmSpecular(wetFilmNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, wetFilmRoughness);
 		else if (waterRoughnessSpecular < 1.0 && !wetFilm)
 			specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
 #		endif
@@ -3516,7 +3803,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #		if defined(WETNESS_EFFECTS)
 		if (wetFilmGeneric)
-			wetFilmSpecular += GetWetFilmSpecular(wetnessNormal, viewDirection, DirLightDirection, dirLightColor * dirDetailShadow, wetFilmRoughness);
+			wetFilmSpecular += GetWetFilmSpecular(wetFilmNormal, viewDirection, DirLightDirection, dirLightColor * dirDetailShadow, wetFilmRoughness);
 		else if (waterRoughnessSpecular < 1.0 && !wetFilm)
 			wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, DirLightDirection, viewDirection, dirLightColor * dirDetailShadow, waterRoughnessSpecular);
 #		endif
@@ -3565,7 +3852,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #		if defined(WETNESS_EFFECTS)
 	if (wetFilmGeneric)
-		wetFilmSpecular += GetWetFilmSpecular(wetnessNormal, viewDirection, DirLightDirection, dirLightColor * dirDetailShadow, wetFilmRoughness);
+		wetFilmSpecular += GetWetFilmSpecular(wetFilmNormal, viewDirection, DirLightDirection, dirLightColor * dirDetailShadow, wetFilmRoughness);
 	else if (waterRoughnessSpecular < 1.0 && !wetFilm)
 		wetnessSpecular += WetnessEffects::GetWetnessSpecular(wetnessNormal, DirLightDirection, viewDirection, dirLightColor * dirDetailShadow, waterRoughnessSpecular);
 #		endif
@@ -3802,7 +4089,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			specularColorPBR += pointSpecularColor;
 #				if defined(WETNESS_EFFECTS)
 			if (wetFilmGeneric)
-				wetFilmSpecular += GetWetFilmSpecular(wetnessNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, wetFilmRoughness);
+				wetFilmSpecular += GetWetFilmSpecular(wetFilmNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, wetFilmRoughness);
 			else if (waterRoughnessSpecular < 1.0 && !wetFilm)
 				specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
 #				endif
@@ -3879,7 +4166,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			if defined(WETNESS_EFFECTS)
 #				if !defined(TRUE_PBR)
 		if (wetFilmGeneric)
-			wetFilmSpecular += GetWetFilmSpecular(wetnessNormal, viewDirection, normalizedLightDirection, lightColor, wetFilmRoughness);
+			wetFilmSpecular += GetWetFilmSpecular(wetFilmNormal, viewDirection, normalizedLightDirection, lightColor, wetFilmRoughness);
 		else
 #				endif
 			if (waterRoughnessSpecular < 1.0 && !wetFilm)
@@ -3895,7 +4182,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// camera, more at the silhouette). Advanced Skin does this per light inside its BRDF.
 	[branch] if (wetFilmGeneric)
 	{
-		const float wetFilmBaseScale = 1.0 - saturate(wetFilmEnergy) * BRDF::F_Schlick(0.02.xxx, saturate(abs(dot(wetnessNormal, viewDirection)) + 1e-5)).x;
+		const float wetFilmBaseScale = 1.0 - saturate(wetFilmEnergy) * BRDF::F_Schlick(0.02.xxx, saturate(abs(dot(wetFilmNormal, viewDirection)) + 1e-5)).x;
 		lightsDiffuseColor *= wetFilmBaseScale;
 		lightsSpecularColor *= wetFilmBaseScale;
 #		if defined(TRUE_PBR)
@@ -3906,6 +4193,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #	endif
 
+#	if defined(HAIR) && defined(WETNESS_EFFECTS)
+	// (44c) Wet hair with Hair Specular off: the vanilla highlight a little stronger (shininess x2.5 above).
+#		if defined(CS_HAIR)
+	if (!SharedData::hairSpecularSettings.Enabled)
+#		endif
+		lightsSpecularColor *= 1.0 + 0.3 * hairWetK;
+#	endif
 	diffuseColor += lightsDiffuseColor;
 	specularColor += lightsSpecularColor;
 
@@ -4123,6 +4417,15 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	indirectDiffuseLobeWeight *= SharedData::hairSpecularSettings.DiffuseIndirectMult;
 	indirectSpecularLobeWeightPrim *= SharedData::hairSpecularSettings.SpecularIndirectMult;
 	indirectSpecularLobeWeightSec *= SharedData::hairSpecularSettings.SpecularIndirectMult;
+#			if defined(WETNESS_EFFECTS)
+	{
+		// (44c) Wet clumps: the gaps between them are darker for ambient light too, at half strength.
+		const float hairAmbientGap = 1.0 - 0.5 * (1.0 - Hair::WetGap);
+		indirectDiffuseLobeWeight *= hairAmbientGap;
+		indirectSpecularLobeWeightPrim *= hairAmbientGap;
+		indirectSpecularLobeWeightSec *= hairAmbientGap;
+	}
+#			endif
 #		endif  // CS_HAIR
 #	elif defined(SKYLIGHTING)
 	float3 vertexColor = input.Color.xyz;
@@ -4180,7 +4483,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	PBR::GetIndirectLobeWeights(indirectDiffuseLobeWeight, indirectSpecularLobeWeight, worldNormal.xyz, viewDirection, vertexNormal, baseColor.xyz, pbrSurfaceProperties);
 #		if defined(WETNESS_EFFECTS)
 	if (waterRoughnessSpecular < 1.0)
-		indirectSpecularLobeWeight = max(indirectSpecularLobeWeight, PBR::GetWetnessIndirectSpecularLobeWeight(wetnessNormal, viewDirection, vertexNormal, wetIndirectRoughness));
+		indirectSpecularLobeWeight = max(indirectSpecularLobeWeight, PBR::GetWetnessIndirectSpecularLobeWeight(wetnessNormal, viewDirection, vertexNormal, wetIndirectRoughness) * (gearWetNew ? wetnessGlossinessSpecular : 1.0));  // (44c) gear New: x its film energy (<= 1)
 #		endif
 
 	color.xyz += indirectDiffuseLobeWeight * directionalAmbientColor;
@@ -4583,6 +4886,22 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	psout.Diffuse.w = alpha;
 #	endif
 
+#	if defined(WETNESS_EFFECTS) && defined(CS_SKIN) && !defined(SKIN)
+	// (44c) Character Wetness debug view: tint hair and gear by material class (red cloth, yellow
+	// leather, blue metal, green fur / other, purple hair), shaded by the base colour.
+	[branch] if (charWetNew && Skin::wetCharParams[3].z > 0.5)
+	{
+#		if defined(HAIR)
+		const float3 classTint = float3(0.7, 0.3, 1.0);
+#		else
+		const float3 classTint = lerp(gearClass.x * float3(1.0, 0.15, 0.1) + gearClass.y * float3(1.0, 0.8, 0.1) + gearClass.z * float3(0.15, 0.4, 1.0), float3(0.2, 0.9, 0.2), gearClass.w);
+#		endif
+		color.xyz = classTint * (0.3 + 0.7 * saturate(Color::RGBToLuminance(baseColor.xyz) * 2.0));
+		outputAlbedo = 0.0;
+		specularColor = 0.0;
+	}
+#	endif
+
 #	if defined(LIGHT_LIMIT_FIX) && defined(LLFDEBUG)
 	if (SharedData::lightLimitFixSettings.EnableLightsVisualisation) {
 		if (SharedData::lightLimitFixSettings.LightsVisualisationMode == 0) {
@@ -4628,7 +4947,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(TRUE_PBR)
 	psout.Reflectance = float4(indirectSpecularLobeWeight, psout.Diffuse.w);
 #			if defined(WETNESS_EFFECTS)
-	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), CapCharacterWetGloss(lerp(pbrGlossiness, max(pbrGlossiness, wetnessGlossinessSpecular), wetnessGlossinessSpecular), pbrGlossiness, wetCharacter), psout.Diffuse.w);
+	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), CharacterWetGBufferGloss(pbrGlossiness, wetnessGlossinessSpecular, wetCharacter, charWetGlossTarget, charWetGlossCap), psout.Diffuse.w);
 #			else
 	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), pbrGlossiness, psout.Diffuse.w);
 #			endif
@@ -4669,7 +4988,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 #		elif defined(WETNESS_EFFECTS)
 	psout.Reflectance = float4(max(reflectance, wetnessReflectance), psout.Diffuse.w);
-	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), CapCharacterWetGloss(lerp(1.0 - roughness, max(1 - roughness, wetnessGlossinessSpecular), wetnessGlossinessSpecular), 1.0 - roughness, wetCharacter), psout.Diffuse.w);
+	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), CharacterWetGBufferGloss(1.0 - roughness, wetnessGlossinessSpecular, wetCharacter, charWetGlossTarget, charWetGlossCap), psout.Diffuse.w);
 #		else
 	psout.Reflectance = float4(reflectance, psout.Diffuse.w);
 	psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), 1.0 - roughness, psout.Diffuse.w);

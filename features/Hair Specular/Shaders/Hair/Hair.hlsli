@@ -10,6 +10,29 @@ namespace Hair
 {
 	Texture2D<float> TexTangentShift : register(t73);
 
+	// (44c) Wet hair (Character Wetness, New model). Set per pixel in Lighting.hlsl before any
+	// hair lighting; the defaults leave every function below exactly as before (dry hair and the
+	// Original model).
+	static float WetK = 0.0;          // 0..1 wet response
+	static float WetSharpness = 1.0;  // R lobe width factor (already blended by the response)
+	static float WetGain = 1.0;       // R lobe strength
+	static float WetTRT = 1.0;        // TRT (secondary, coloured highlight) strength
+	static float WetScatter = 1.0;    // inter-strand scatter
+	static float WetSpecAA = 0.0;     // squared lobe widening from the tangent's screen variation
+	static float WetShift = 0.0;      // clump tangent shift
+	static float WetCylinder = 0.0;   // clump "cylinder" normal rotation around the strand (rad)
+	static float WetGap = 1.0;        // direct light between clumps
+
+	// (44c) Rotates N around the strand by the clump's cylinder angle.
+	float3 WetClumpNormal(float3 T, float3 N)
+	{
+		[branch] if (WetCylinder == 0.0)
+			return N;
+		float s, c;
+		sincos(WetCylinder, s, c);
+		return normalize(N * c + cross(T, N) * s);
+	}
+
 	float3 ReorientTangent(float3 T, float3 N)
 	{
 		// Reorient tangent to be orthogonal to normal
@@ -79,17 +102,32 @@ namespace Hair
 		float3 TshiftPrimary;
 		float3 TshiftSecondary;
 
+		// (44c) Wet: the secondary shift moves toward the primary (0.4 k), both get the clump shift.
+		const float secondaryShift = lerp(SharedData::hairSpecularSettings.SecondaryTangentShift, SharedData::hairSpecularSettings.PrimaryTangentShift, 0.4 * WetK);
 		if (SharedData::hairSpecularSettings.EnableTangentShift) {
 			const float shift = TexTangentShift.SampleLevel(SampColorSampler, uv, 0).x - 0.5;
-			TshiftPrimary = ShiftTangent(T, N, shift + SharedData::hairSpecularSettings.PrimaryTangentShift);
-			TshiftSecondary = ShiftTangent(T, N, shift + SharedData::hairSpecularSettings.SecondaryTangentShift);
+			TshiftPrimary = ShiftTangent(T, N, shift + SharedData::hairSpecularSettings.PrimaryTangentShift + WetShift);
+			TshiftSecondary = ShiftTangent(T, N, shift + secondaryShift + WetShift);
+		} else if (WetShift != 0.0) {
+			TshiftPrimary = ShiftTangent(T, N, WetShift);
+			TshiftSecondary = TshiftPrimary;
 		} else {
 			TshiftPrimary = T;
 			TshiftSecondary = T;
 		}
 
-		const float3 specPrimary = D_KajiyaKay(TshiftPrimary, H, shininess);
-		const float3 specSecondary = D_KajiyaKay(TshiftSecondary, H, shininess * 0.5);
+		// (44c) Wet: primary width x Sharpness (exponent / Sharpness^2, <= 1024), widened again by
+		// the tangent's screen variation (sigma^2 = 1/n + AA), so it never collapses to a pixel.
+		float primaryShininess = shininess;
+		float secondaryScale = 1.0;
+		[branch] if (WetK > 0.0)
+		{
+			primaryShininess = min(shininess / max(WetSharpness * WetSharpness, 0.01), 1024.0);
+			primaryShininess = 1.0 / (1.0 / max(primaryShininess, 1e-3) + WetSpecAA);
+			secondaryScale = WetTRT;
+		}
+		const float3 specPrimary = D_KajiyaKay(TshiftPrimary, H, primaryShininess) * (WetK > 0.0 ? WetGain : 1.0);
+		const float3 specSecondary = D_KajiyaKay(TshiftSecondary, H, shininess * 0.5) * secondaryScale;
 		const float3 F = BRDF::F_Schlick(HairF0(), HdotL);
 		float3 specR = 0.25 * F * (specPrimary + specSecondary * scatterColor) * NdotL * saturate(VNdotV * (3.4e+38));
 		float scatterFresnel1 = pow(saturate(-dot(L, V)), 9) * pow(saturate(1 - VNdotV * VNdotV), 12);
@@ -125,7 +163,7 @@ namespace Hair
 		float n_prime = 1.19 / cosThetaD + 0.36 * cosThetaD;
 
 		const float Shift = 0.0499f;
-		const float Alpha[] = {
+		float Alpha[] = {
 			-Shift * 2,
 			Shift,
 			Shift * 4
@@ -135,6 +173,17 @@ namespace Hair
 			area + roughness / 2,
 			area + roughness * 2
 		};
+		// (44c) Wet hair: water smooths the cuticle scales (R narrower, >= 0.10 rad, closer to the
+		// mirror direction) and replaces the air behind the fibre's back wall (TRT much weaker,
+		// also closer). The width is widened again by the tangent's screen variation (specular
+		// AA). Dry hair (WetK = 0) is untouched.
+		[branch] if (WetK > 0.0)
+		{
+			const float bR = max(B[0] * WetSharpness, min(B[0], 0.10));  // never wider than dry
+			B[0] = sqrt(bR * bR + WetSpecAA);
+			Alpha[0] *= 1.0 - 0.5 * WetK;
+			Alpha[2] *= 1.0 - 0.5 * WetK;
+		}
 
 		float hairIOR = 1.55;
 		float3 specularColor = HairF0();
@@ -169,6 +218,12 @@ namespace Hair
 		Np = exp(17 * cosPhi - 16.78);
 		TRT = (Mp * Np) * (Fp * Tp);
 
+		[branch] if (WetK > 0.0)
+		{
+			R *= WetGain;
+			TRT *= WetTRT;
+		}
+
 		return max(R + TT + TRT, 0);
 	}
 
@@ -187,6 +242,7 @@ namespace Hair
 		float luma = max(Color::RGBToLuminance(baseColor), 1e-4);
 		float3 scatterTint = shadow < 1 ? pow(abs(baseColor / luma), 1 - shadow) : 1;
 		S += sqrt(baseColor) * diffuseScatter * scatterTint;
+		S *= WetScatter;  // (44c) water between the strands: less light bounces back out
 
 		return max(S, 0);
 	}
@@ -203,6 +259,8 @@ namespace Hair
 			const float shift = TexTangentShift.SampleLevel(SampColorSampler, uv, 0).x - 0.5;
 			T = ShiftTangent(T, N, shift);
 		}
+		if (WetShift != 0.0)
+			T = ShiftTangent(T, N, WetShift);  // (44c) clumps: each clump's highlight at its own height
 
 		const float cosThetaV = dot(VN, V);
 
@@ -214,6 +272,9 @@ namespace Hair
 
 	void GetHairDirectLight(out float3 dirDiffuse, out float3 dirSpecular, out float3 dirTransmission, float3 T, float3 L, float3 V, float3 N, float3 VN, float3 lightColor, float shininess, float selfShadow, float2 uv, float3 baseColor)
 	{
+		// (44c) Wet clumps: each clump a little cylinder, darker in the gaps between them.
+		N = WetClumpNormal(T, N);
+		lightColor *= WetGap;
 		if (SharedData::hairSpecularSettings.HairMode == 0) {
 			GetHairDirectLightScheuermann(dirDiffuse, dirSpecular, dirTransmission, T, L, V, N, VN, lightColor, shininess, selfShadow, uv, baseColor);
 		} else {
