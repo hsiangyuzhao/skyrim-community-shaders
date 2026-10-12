@@ -38,15 +38,15 @@ namespace HDROutput
 		enum class Path : uint8_t
 		{
 			kNone,            // nothing decided yet this frame
-			kScenePQ,         // 1a: the HDR scene encoded into the back buffer at UI start, UI drawn over it
+			kSeparated,       // HDR scene + the UI on its own layer, composited at Present
 			kWholeFrameSDR,   // everything in the back buffer as SDR, shown at paper white
 		};
 
 		const char* PathName(Path a_path)
 		{
 			switch (a_path) {
-			case Path::kScenePQ:
-				return "HDR scene (UI drawn over it)";
+			case Path::kSeparated:
+				return "HDR scene + separate HUD layer";
 			case Path::kWholeFrameSDR:
 				return "whole frame as SDR (menu / loading / no scene)";
 			default:
@@ -61,6 +61,7 @@ namespace HDROutput
 			bool sceneHDR = false;     // Color Grading was asked for HDR highlights this frame
 			bool uiStart = false;      // the UI-start hook ran
 			bool resolved = false;     // the scene was put into the back buffer (SDR or PQ)
+			bool uiRedirected = false; // the frame-buffer RTV points at the UI layer (separated path)
 			Path path = Path::kNone;
 		};
 
@@ -87,6 +88,9 @@ namespace HDROutput
 
 		// resources
 		std::unique_ptr<Texture2D> g_scene;
+		// (43b) The game's UI, third-party UI drawn through the game, and ImGui, during gameplay. 8-bit
+		// like upstream's: the UI is SDR, and 8 bits round near-black fringes to zero.
+		std::unique_ptr<Texture2D> g_uiLayer;
 		std::unique_ptr<ConstantBuffer> g_cb;
 		winrt::com_ptr<ID3D11ComputeShader> g_encodeCS;
 		winrt::com_ptr<ID3D11ComputeShader> g_resolveCS;
@@ -99,6 +103,20 @@ namespace HDROutput
 		ID3D11Texture2D* g_savedFramebufferTexture = nullptr;
 		ID3D11ShaderResourceView* g_savedFramebufferSRV = nullptr;
 		ID3D11RenderTargetView* g_savedFramebufferRTV = nullptr;
+		ID3D11RenderTargetView* g_savedUIFramebufferRTV = nullptr;  // (43b) while the UI layer is the target
+		D3D11_VIEWPORT g_savedImGuiViewport{};
+		bool g_imGuiRedirected = false;
+
+		// (43b) Third-party UI alpha-blend fix (upstream HDRDisplay's OMSetBlendState detour)
+		bool g_blendHookInstalled = false;
+		struct PatchedBlend
+		{
+			D3D11_BLEND_DESC original;
+			winrt::com_ptr<ID3D11BlendState> patched;  // null: no change needed
+		};
+		std::unordered_map<ID3D11BlendState*, PatchedBlend> g_patchedBlends;
+		std::unordered_map<ID3D11BlendState*, ID3D11BlendState*> g_patchedToOriginal;
+		uint64_t g_blendPatchCount = 0;
 
 		// diagnostics
 		uint64_t g_redirectConfirmed = 0;
@@ -122,6 +140,16 @@ namespace HDROutput
 		{
 			auto* ui = globals::game::ui;
 			return ui && (ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
+		}
+
+		/// A menu that takes over the screen (pauses, or is an item / application / modal menu, or the map).
+		bool IsMenuScene()
+		{
+			auto* ui = globals::game::ui;
+			if (!ui)
+				return false;
+			return ui->GameIsPaused() || ui->IsApplicationMenuOpen() || ui->IsItemMenuOpen() || ui->IsModalMenuOpen() ||
+			       ui->IsMenuOpen(RE::MapMenu::MENU_NAME) || ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME);
 		}
 
 		float ResolvePeakNits()
@@ -260,9 +288,9 @@ namespace HDROutput
 		{
 			if (!g_outputActive || IsMainOrLoadingMenu())
 				return false;
-			auto* ui = globals::game::ui;
-			// (43a) Paused menus are always shown whole as SDR; 43b makes it a choice.
-			if (ui && ui->GameIsPaused())
+			// (43b) Menus: shown whole as SDR by default (no layer split, nothing for a menu's own
+			// background effects to lose); "Separate UI layer" keeps them like gameplay.
+			if (GetSettings().menuMode == 0 && IsMenuScene())
 				return false;
 			return true;
 		}
@@ -409,6 +437,125 @@ namespace HDROutput
 				logger::info("[HDR] Upgraded render target {} to R16G16B16A16_FLOAT (was format {})", static_cast<int>(id), static_cast<int>(oldFormat));
 			}
 		}
+
+		// ---- (43b) third-party UI alpha blending ------------------------------------------------------
+		//
+		// Ported from upstream HDRDisplay::GetPatchedAlphaBlendState and its OMSetBlendState detour. The UI
+		// layer is composited by its alpha. A mod that blends alpha as [SrcAlpha, InvSrcAlpha] or
+		// [InvSrcAlpha, Zero] (IED, for one) leaves alpha*(1-alpha) or less there, and its opaque panels
+		// then let most of the scene through. While the UI layer is the target, every blended state's
+		// alpha is rewritten to premultiplied [One, InvSrcAlpha, Add]; colour blending is untouched.
+		// Only the immediate context, only during the UI-capture window, and the patched state is swapped
+		// back for its original at the end of the window so the engine's state cache stays truthful.
+
+		ID3D11BlendState* GetPatchedAlphaBlendState(ID3D11BlendState* a_original)
+		{
+			D3D11_BLEND_DESC desc{};
+			a_original->GetDesc(&desc);
+			if (auto it = g_patchedBlends.find(a_original); it != g_patchedBlends.end()) {
+				if (std::memcmp(&it->second.original, &desc, sizeof(desc)) == 0)
+					return it->second.patched ? it->second.patched.get() : a_original;
+				// The address was released and reused for a different state.
+				if (it->second.patched)
+					g_patchedToOriginal.erase(it->second.patched.get());
+				g_patchedBlends.erase(it);
+			}
+
+			PatchedBlend entry{ desc, nullptr };
+			const int slots = desc.IndependentBlendEnable ? 8 : 1;
+			bool needsPatch = false;
+			for (int i = 0; i < slots; ++i) {
+				const auto& rt = desc.RenderTarget[i];
+				if (rt.BlendEnable && (rt.SrcBlendAlpha != D3D11_BLEND_ONE || rt.DestBlendAlpha != D3D11_BLEND_INV_SRC_ALPHA || rt.BlendOpAlpha != D3D11_BLEND_OP_ADD))
+					needsPatch = true;
+			}
+			if (needsPatch) {
+				D3D11_BLEND_DESC patchedDesc = desc;
+				for (int i = 0; i < slots; ++i) {
+					auto& rt = patchedDesc.RenderTarget[i];
+					if (rt.BlendEnable) {
+						rt.SrcBlendAlpha = D3D11_BLEND_ONE;
+						rt.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+						rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+					}
+				}
+				if (FAILED(globals::d3d::device->CreateBlendState(&patchedDesc, entry.patched.put())))
+					entry.patched = nullptr;
+				if (entry.patched)
+					g_patchedToOriginal[entry.patched.get()] = a_original;
+			}
+			auto* result = entry.patched ? entry.patched.get() : a_original;
+			g_patchedBlends.emplace(a_original, std::move(entry));
+			return result;
+		}
+
+		struct ID3D11DeviceContext_OMSetBlendState
+		{
+			static void WINAPI thunk(ID3D11DeviceContext* This, ID3D11BlendState* a_blendState, const FLOAT a_blendFactor[4], UINT a_sampleMask)
+			{
+				if (a_blendState && This == globals::d3d::context && g_frame.uiRedirected && GetSettings().uiBlendFix) {
+					auto* patched = GetPatchedAlphaBlendState(a_blendState);
+					if (patched != a_blendState)
+						++g_blendPatchCount;
+					a_blendState = patched;
+				}
+				func(This, a_blendState, a_blendFactor, a_sampleMask);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+
+		void RestoreUnpatchedBlendState()
+		{
+			if (!g_blendHookInstalled || g_patchedToOriginal.empty())
+				return;
+			auto* context = globals::d3d::context;
+			ID3D11BlendState* current = nullptr;
+			FLOAT factor[4]{};
+			UINT mask = 0;
+			context->OMGetBlendState(&current, factor, &mask);
+			if (!current)
+				return;
+			if (auto it = g_patchedToOriginal.find(current); it != g_patchedToOriginal.end())
+				ID3D11DeviceContext_OMSetBlendState::func(context, it->second, factor, mask);
+			current->Release();
+		}
+
+		void CreateUILayer(uint32_t a_width, uint32_t a_height)
+		{
+			D3D11_TEXTURE2D_DESC desc{};
+			desc.Width = a_width;
+			desc.Height = a_height;
+			desc.MipLevels = 1;
+			desc.ArraySize = 1;
+			desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			desc.SampleDesc.Count = 1;
+			desc.Usage = D3D11_USAGE_DEFAULT;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+			g_uiLayer = std::make_unique<Texture2D>(desc);
+			D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+			srvDesc.Format = desc.Format;
+			srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srvDesc.Texture2D.MipLevels = 1;
+			g_uiLayer->CreateSRV(srvDesc);
+			D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+			rtvDesc.Format = desc.Format;
+			rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+			g_uiLayer->CreateRTV(rtvDesc);
+		}
+
+		/// (43b) The frame-buffer slot's RTV back to the back buffer, if the UI layer had it.
+		void RestoreUIRedirect()
+		{
+			if (!g_frame.uiRedirected)
+				return;
+			auto& fb = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER];
+			if (g_savedUIFramebufferRTV)
+				fb.RTV = g_savedUIFramebufferRTV;
+			g_savedUIFramebufferRTV = nullptr;
+			RestoreUnpatchedBlendState();
+			g_frame.uiRedirected = false;
+			globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
+		}
 	}
 
 	// ---- startup ---------------------------------------------------------------------------------------
@@ -468,9 +615,30 @@ namespace HDROutput
 		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
 		g_scene->CreateUAV(uavDesc);
 
+		CreateUILayer(desc.Width, desc.Height);
 		EnsureCB();
 		UpgradeLDRRenderTargets();
-		logger::info("[HDR] Resources ready: scene {}x{} fp16, {} image-space targets upgraded", desc.Width, desc.Height, g_upgradedTargets.size());
+
+		if (!g_blendHookInstalled) {
+			stl::detour_vfunc<35, ID3D11DeviceContext_OMSetBlendState>(globals::d3d::context);
+			g_blendHookInstalled = true;
+		}
+
+		// (port of ba9b41e81 / f748118bb) New targets start black, not with whatever the memory held:
+		// the first frames (startup, main menu) can be shown before anything has drawn into them.
+		auto* context = globals::d3d::context;
+		const float clear[4]{ 0.0f, 0.0f, 0.0f, 0.0f };
+		context->ClearRenderTargetView(g_scene->rtv.get(), clear);
+		context->ClearRenderTargetView(g_uiLayer->rtv.get(), clear);
+		if (sc.swapChainBufferWrapped && sc.swapChainBufferWrapped->rtv)
+			context->ClearRenderTargetView(sc.swapChainBufferWrapped->rtv, clear);
+		if (sc.uiBufferWrapped && sc.uiBufferWrapped->rtv)
+			context->ClearRenderTargetView(sc.uiBufferWrapped->rtv, clear);
+		if (sc.hdrOutputWrapped && sc.hdrOutputWrapped->uav)
+			context->ClearUnorderedAccessViewFloat(sc.hdrOutputWrapped->uav, clear);
+
+		logger::info("[HDR] Resources ready: scene {}x{} fp16, UI layer 8-bit, {} image-space targets upgraded, UI alpha fix hook installed",
+			desc.Width, desc.Height, g_upgradedTargets.size());
 	}
 
 	void ClearShaderCache()
@@ -579,11 +747,13 @@ namespace HDROutput
 			return;
 		}
 
-		if (IsOutputActive() && g_frame.sceneHDR) {
+		if (IsOutputActive() && g_frame.sceneHDR && g_uiLayer) {
+			// The HDR10 scene goes into the back buffer first: DLSS-G's HUD-less capture right after
+			// this takes it from there (43c writes it into the HUD-less image directly instead).
 			auto* backBuffer = SwapChain().swapChainBufferWrapped.get();
 			if (backBuffer && EncodeSceneTo(backBuffer->uav, false)) {
 				g_frame.resolved = true;
-				g_frame.path = Path::kScenePQ;
+				g_frame.path = Path::kSeparated;
 				RebindFramebuffer();
 				return;
 			}
@@ -596,14 +766,54 @@ namespace HDROutput
 
 	void OnUIStartAfterHUDLess()
 	{
+		if (!g_session || g_frame.path != Path::kSeparated || !g_uiLayer)
+			return;
+
+		// (43b) Split the UI off. The back buffer is cleared and becomes the overlay layer (whatever
+		// Present-hook mods draw into it); the game's UI, and every mod that draws through the game's
+		// frame-buffer slot, goes to the 8-bit UI layer.
+		auto* context = globals::d3d::context;
+		const float clear[4]{ 0.0f, 0.0f, 0.0f, 0.0f };
+		if (auto* backBuffer = SwapChain().swapChainBufferWrapped.get(); backBuffer && backBuffer->rtv)
+			context->ClearRenderTargetView(backBuffer->rtv, clear);
+		context->ClearRenderTargetView(g_uiLayer->rtv.get(), clear);
+
+		auto& fb = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER];
+		g_savedUIFramebufferRTV = fb.RTV;
+		fb.RTV = g_uiLayer->rtv.get();
+		g_frame.uiRedirected = true;
+		RebindFramebuffer();
 	}
 
 	void BeginImGui()
 	{
+		g_imGuiRedirected = false;
+		if (!g_session || !g_frame.uiRedirected || !g_uiLayer)
+			return;
+		// (43b) ImGui (the CS menu and overlays) inherits whatever is bound; on the separated path that
+		// must be the UI layer, at its own size, so it is composited at the HUD brightness.
+		auto* context = globals::d3d::context;
+		UINT count = 1;
+		context->RSGetViewports(&count, &g_savedImGuiViewport);
+		if (count == 0)
+			g_savedImGuiViewport = {};
+		ID3D11RenderTargetView* rtv = g_uiLayer->rtv.get();
+		context->OMSetRenderTargets(1, &rtv, nullptr);
+		D3D11_VIEWPORT viewport{};
+		viewport.Width = static_cast<float>(g_uiLayer->desc.Width);
+		viewport.Height = static_cast<float>(g_uiLayer->desc.Height);
+		viewport.MaxDepth = 1.0f;
+		context->RSSetViewports(1, &viewport);
+		g_imGuiRedirected = true;
 	}
 
 	void EndImGui()
 	{
+		if (!g_imGuiRedirected)
+			return;
+		if (g_savedImGuiViewport.Width > 0.0f)
+			globals::d3d::context->RSSetViewports(1, &g_savedImGuiViewport);
+		g_imGuiRedirected = false;
 	}
 
 	ID3D12Resource* CompositeForPresent()
@@ -616,27 +826,36 @@ namespace HDROutput
 			ResolveSceneToBackBuffer();
 
 		if (!IsOutputActive()) {
+			RestoreUIRedirect();
 			g_lastPath = Path::kNone;
 			return nullptr;
 		}
 
 		auto& sc = SwapChain();
-		if (g_frame.path == Path::kScenePQ) {
-			g_lastPath = g_frame.path;
-			return nullptr;  // already HDR10 in the back buffer
-		}
-
 		auto* backBuffer = sc.swapChainBufferWrapped.get();
 		auto* output = sc.hdrOutputWrapped.get();
 		auto* shader = GetShader(g_compositeCS, "COMPOSITE", "CSComposite");
-		if (!backBuffer || !backBuffer->srv || !output || !output->uav || !shader || !EnsureCB())
+		const bool separated = g_frame.path == Path::kSeparated && g_frame.uiRedirected && g_scene && g_uiLayer;
+		if (!backBuffer || !backBuffer->srv || !output || !output->uav || !shader || !EnsureCB()) {
+			RestoreUIRedirect();
 			return nullptr;
+		}
+
+		// Last D3D11 work of the frame: every UI layer is final now.
+		RestoreUIRedirect();
 
 		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::HDROutput);
-		Dispatch(shader, { backBuffer->srv }, output->uav, sc.swapChainDesc.Width, sc.swapChainDesc.Height, MakeCB(ResolveLevels(), true, 0));
+		if (separated) {
+			// Scene (HDR) + game UI layer + what Present-hook mods drew into the cleared back buffer.
+			Dispatch(shader, { g_scene->srv.get(), g_uiLayer->srv.get(), backBuffer->srv }, output->uav,
+				sc.swapChainDesc.Width, sc.swapChainDesc.Height, MakeCB(ResolveLevels(), false, 1, true));
+		} else {
+			// Everything already in the back buffer as SDR: shown at paper white.
+			Dispatch(shader, { backBuffer->srv }, output->uav, sc.swapChainDesc.Width, sc.swapChainDesc.Height, MakeCB(ResolveLevels(), true, 0));
+		}
 		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::HDROutput);
 		globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
-		g_lastPath = Path::kWholeFrameSDR;
+		g_lastPath = separated ? Path::kSeparated : Path::kWholeFrameSDR;
 		return output->resource.get();
 	}
 
@@ -726,6 +945,27 @@ namespace HDROutput
 			ImGui::TextUnformatted("203 is the HDR standard. Raise it if the picture looks darker than SDR; Windows' own SDR brightness is shown under Display / HDR info.");
 		}
 
+		ImGui::SliderFloat("HUD Brightness (nits)", &s.hudNits, 80.0f, 400.0f, "%.0f nits");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("How bright the HUD, the CS menu and other mods' widgets are during play (they are drawn on their own layer).");
+			ImGui::TextUnformatted("A little under paper white is easier on the eyes and on an OLED. Menus, the main menu and loading screens use paper white.");
+		}
+
+		const char* menuModes[] = { "Show whole frame as SDR (safe)", "Separate UI layer, like gameplay" };
+		int menuMode = s.menuMode == 1 ? 1 : 0;
+		if (ImGui::Combo("Menus", &menuMode, menuModes, IM_ARRAYSIZE(menuModes)))
+			s.menuMode = static_cast<uint>(menuMode);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Inventory, map, pause and other full-screen menus. SDR: the frame behind the menu loses its highlights while");
+			ImGui::TextUnformatted("the menu is open, but nothing can go wrong with the menu itself. Separate: the world keeps its HDR highlights.");
+		}
+
+		ImGui::Checkbox("Fix Mod UI Transparency", &s.uiBlendFix);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Some mods' UI (IED, for one) writes transparency in a way that makes its panels see-through once the HUD is on its own layer.");
+			ImGui::TextUnformatted("This corrects it while the HUD is drawn. Only matters with HDR on.");
+		}
+
 		const char* curves[] = { "Extend my tone mapper (keeps the SDR look)", "GT7 HDR curve" };
 		int curve = s.toneCurve == 2 ? 1 : 0;
 		if (ImGui::Combo("HDR Tone Curve", &curve, curves, IM_ARRAYSIZE(curves)))
@@ -763,6 +1003,7 @@ namespace HDROutput
 			ImGui::Text("Last frame: %s", PathName(g_lastPath));
 			ImGui::Text("Scene in fp16 target: confirmed %llu, not confirmed %llu frames; %zu image-space targets upgraded",
 				g_redirectConfirmed, g_redirectUnconfirmed, g_upgradedTargets.size());
+			ImGui::Text("Mod UI transparency fixes: %llu (%zu blend states seen)", g_blendPatchCount, g_patchedBlends.size());
 			const float ms = Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::HDROutput);
 			if (ms > 0.0f)
 				ImGui::Text("GPU cost: %.3f ms per frame (HDR Output row)", ms);
@@ -792,6 +1033,9 @@ namespace HDROutput
 			j["last_path"] = PathName(g_lastPath);
 			j["scene_confirmed_frames"] = g_redirectConfirmed;
 			j["scene_unconfirmed_frames"] = g_redirectUnconfirmed;
+			j["menu_mode"] = s.menuMode == 1 ? "separate" : "sdr";
+			j["ui_blend_fix"] = s.uiBlendFix;
+			j["ui_blend_patches"] = g_blendPatchCount;
 			j["gpu_ms"] = Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::HDROutput);
 		}
 		return j;

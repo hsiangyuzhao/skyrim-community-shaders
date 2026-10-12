@@ -325,7 +325,10 @@ struct IDXGISwapChain_Present
 		{
 			// (batch 36) ImGui (this overlay, the CS menu) gets its own row in the frame timeline.
 			Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOverlay);
+			// (batch 43) Native HDR: ImGui joins the HUD layer when the HUD has its own.
+			HDROutput::BeginImGui();
 			menu->DrawOverlay();
+			HDROutput::EndImGui();
 		}
 		// Close the GPU frame timeline right before the real Present and open the next one
 		// right after it, so its chain spans exactly the frame's own rendering.
