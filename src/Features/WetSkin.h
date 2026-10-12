@@ -99,7 +99,11 @@ struct WetSkin : Feature
 		float StreakAmount = 0.5f;
 		float StreakLength = 1.0f;
 		float StreakWidth = 1.0f;
-		float StreakContrast = 0.5f;
+		// (44e) RivuletContrast2: higher = more visible trails (was StreakContrast, reversed: new = 1 - old).
+		// RivuletBetweenDulling: the film between the trails (was the same old value). FaceRivulets: x on the face.
+		float RivuletContrast2 = 0.5f;
+		float RivuletBetweenDulling = 0.5f;
+		float FaceRivulets = 1.0f;
 
 		// (44c) Hair (New model). Hair Specular on: its Marschner / Kajiya-Kay highlight gets wet;
 		// off: the vanilla highlight. No water film, dry G-buffer.

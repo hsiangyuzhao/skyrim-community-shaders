@@ -712,8 +712,12 @@ namespace Skin
 			const float width = clamp(wetSkinParams[4].w, 0.1, 3.0);
 			const float2 p = uv * (columnsPerUV / width);
 			const float aFoot = max(uvFootprint * columnsPerUV / width, 1e-6);
-			// Contrast: fewer, crisper rivulets (and, in WetSkinFilm, the film between them a little less wet).
-			const float threshold = lerp(0.48, 0.68, saturate(wetSkinParams[5].x));
+			// (44e) Contrast (RivuletContrast2): higher = more of each trail runs unbroken, so the trails
+			// read more clearly against the skin. 44b-44d raised the segment threshold with Contrast
+			// (fewer, broken trails), which is why a high value looked weaker. Same range, reversed:
+			// new = 1 - old gives exactly the old threshold. The film between the trails is a
+			// separate setting now (WetSkinFilm, Between-Trail Dulling).
+			const float threshold = lerp(0.68, 0.48, saturate(wetSkinParams[5].x));
 			const float2 g2 = gravityUV * gravityUV;
 			const float wU = g2.x / max(g2.x + g2.y, 1e-4);
 			float lines = 0.0;
@@ -749,7 +753,9 @@ namespace Skin
 		const float wetness = saturate(skin.Wetness);
 		const float response = pow(wetness, 1.3);
 		const float roughness = max(lerp(wetSkinParams[1].y, wetSkinParams[1].z, response) - 0.04 * streak, 0.2);
-		const float between = 1.0 - 0.35 * saturate(wetSkinParams[5].x) * saturate(wetSkinParams[4].y) * streakDriver;
+		// (44e) Between-Trail Dulling (wetCharParams[6].w): how much less wet the film between the
+		// trails looks. Was the old Contrast value itself; migrated 1:1.
+		const float between = 1.0 - 0.35 * saturate(wetCharParams[6].w) * saturate(wetSkinParams[4].y) * streakDriver;
 		const float strength = clamp(wetSkinParams[1].w, 0.0, 2.5);
 		// (44b) Rivulets: a clearly stronger, tighter highlight on the trails (their own roughness on
 		// the direct lobe only, like the beads) and a little more reflection; G-buffer gloss unchanged.

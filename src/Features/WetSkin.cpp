@@ -33,7 +33,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	StreakAmount,
 	StreakLength,
 	StreakWidth,
-	StreakContrast,
+	RivuletContrast2,
+	RivuletBetweenDulling,
+	FaceRivulets,
 	HairEnabled,
 	HairDarkening,
 	HairSharpness,
@@ -130,7 +132,7 @@ WetSkin::GPUParams WetSkin::GetGPUParams() const
 	g.p[2] = float4(std::clamp(s.PatchSoftness, 0.05f, 0.6f), std::clamp(s.PatchContrast, 0.0f, 1.0f), std::clamp(s.DropletAmount, 0.0f, 1.0f), std::clamp(s.DropletDensity, 0.0f, 1.0f));
 	g.p[3] = float4(std::clamp(s.DropletSize, 0.25f, 4.0f), std::clamp(s.DropletSizeRandom, 0.0f, 1.0f), std::clamp(s.FaceDroplets, 0.0f, 1.0f), std::clamp(s.DropletRim, 0.0f, 1.0f));
 	g.p[4] = float4(std::clamp(s.DropletTrails, 0.0f, 1.0f), std::clamp(s.StreakAmount, 0.0f, 1.0f), std::clamp(s.StreakLength, 0.1f, 4.0f), std::clamp(s.StreakWidth, 0.1f, 3.0f));
-	g.p[5] = float4(std::clamp(s.StreakContrast, 0.0f, 1.0f), std::clamp(s.Darkening, 0.0f, 2.0f), std::clamp(s.DropletNormal, 0.0f, 2.0f), std::clamp(s.RainDroplets, 0.0f, 1.0f));
+	g.p[5] = float4(std::clamp(s.RivuletContrast2, 0.0f, 1.0f), std::clamp(s.Darkening, 0.0f, 2.0f), std::clamp(s.DropletNormal, 0.0f, 2.0f), std::clamp(s.RainDroplets, 0.0f, 1.0f));
 
 	// (44c) Hair and gear (Skin.hlsli wetCharParams). Original: hair and gear off (the shader does
 	// not read these then; zeroed so nothing can leak in).
@@ -145,7 +147,8 @@ WetSkin::GPUParams WetSkin::GetGPUParams() const
 	g.c[3] = float4(std::clamp(s.HairClumpShift, 0.0f, 0.4f), std::clamp(s.HairGapDarkening, 0.0f, 0.7f), isNew && s.DebugClassTint ? 1.0f : 0.0f, 0.0f);
 	g.c[4] = float4(gearMode, std::clamp(s.GearSheen, 0.0f, 3.0f), std::clamp(s.GearPatchContrast, 0.0f, 1.0f), std::clamp(s.GearWicking, 0.0f, 16.0f));
 	g.c[5] = float4(std::clamp(s.GearSweatShare, 0.0f, 1.0f), keywords ? std::clamp(s.GearKeywordTrust, 0.0f, 1.0f) : 0.0f, std::clamp(s.LeatherDroplets, 0.0f, 1.0f), std::clamp(s.LeatherRivulets, 0.0f, 1.0f));
-	g.c[6] = float4(std::clamp(s.MetalDroplets, 0.0f, 1.0f), std::clamp(s.MetalRivulets, 0.0f, 1.0f), 0.0f, 0.0f);
+	// (44e) z: Rivulets on Face, w: Between-Trail Dulling (the old Contrast's film half).
+	g.c[6] = float4(std::clamp(s.MetalDroplets, 0.0f, 1.0f), std::clamp(s.MetalRivulets, 0.0f, 1.0f), std::clamp(s.FaceRivulets, 0.0f, 1.0f), std::clamp(s.RivuletBetweenDulling, 0.0f, 1.0f));
 	g.c[7] = classParams(s.GearCloth);
 	g.c[8] = classParams(s.GearLeather);
 	g.c[9] = classParams(s.GearMetal);
@@ -258,8 +261,14 @@ void WetSkin::DrawSettings()
 			"present when soaked, while drying after leaving the water, and in rain." });
 		ImGui::SliderFloat("Rivulet Length", &s.StreakLength, 0.1f, 4.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
 		ImGui::SliderFloat("Rivulet Width", &s.StreakWidth, 0.1f, 3.0f, "%.2f");
-		ImGui::SliderFloat("Rivulet Contrast", &s.StreakContrast, 0.0f, 1.0f, "%.2f");
-		Tooltip({ "Higher = fewer, crisper trails and the film between them a little less wet. Never dry holes." });
+		ImGui::SliderFloat("Rivulet Contrast", &s.RivuletContrast2, 0.0f, 1.0f, "%.2f");
+		Tooltip({ "Higher = the trails stand out more (they run longer before breaking up). Never dry holes." });
+		ImGui::SliderFloat("Between-Trail Dulling", &s.RivuletBetweenDulling, 0.0f, 1.0f, "%.2f");
+		Tooltip({ "Higher = the wet film between the trails is a little duller, so the trails stand out more.",
+			"(Before 44e this was part of Rivulet Contrast.)" });
+		ImGui::TextDisabled("Contrast now works the intuitive way; your previous value was converted automatically.");
+		ImGui::SliderFloat("Rivulets on the Face", &s.FaceRivulets, 0.0f, 1.0f, "%.2f");
+		Tooltip({ "How much rivulet the face gets compared with the body (1 = the same, as before 44e)." });
 	}
 
 	if (ImGui::CollapsingHeader("Hair", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -347,6 +356,19 @@ void WetSkin::DrawSettings()
 void WetSkin::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	// (44e) Rivulet Contrast reversed. Old key StreakContrast c (0..1): trail threshold lerp(0.48, 0.68, c)
+	// and film-between dulling 0.35 c. New: RivuletContrast2 = 1 - c gives the same threshold
+	// (lerp(0.68, 0.48, 1 - c)), RivuletBetweenDulling = c the same dulling. Exact, and taken from the
+	// saved value, once (a config that has RivuletContrast2 is never migrated again).
+	if (o_json.is_object() && o_json.contains("StreakContrast") && !o_json.contains("RivuletContrast2")) {
+		try {
+			const float c = std::clamp(o_json["StreakContrast"].get<float>(), 0.0f, 1.0f);
+			settings.RivuletContrast2 = 1.0f - c;
+			settings.RivuletBetweenDulling = c;
+			logger::info("[Character Wetness] Rivulet Contrast {:.3f} converted: Contrast {:.3f}, Between-Trail Dulling {:.3f}", c, settings.RivuletContrast2, settings.RivuletBetweenDulling);
+		} catch (...) {
+		}
+	}
 	// (44c) Saved before the Gear section existed: take it from the 42c options once.
 	if (!o_json.contains("GearCloth") && g_legacyWetness.is_object()) {
 		try {

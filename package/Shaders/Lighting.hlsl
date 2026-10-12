@@ -2303,10 +2303,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(FACEGEN)
 			const float cellsPerUV = 140.0 / clamp(Skin::wetSkinParams[3].x, 0.25, 4.0);
 			const float faceDroplets = saturate(Skin::wetSkinParams[3].z);
+			const float faceRivulets = saturate(Skin::wetCharParams[6].z);  // (44e) Rivulets on Face
 			const float rivuletColumnsPerUV = 11.0;  // (44b) the face uv covers the head: same size in cm
 #		else
 			const float cellsPerUV = 320.0 / clamp(Skin::wetSkinParams[3].x, 0.25, 4.0);
 			const float faceDroplets = 1.0;
+			const float faceRivulets = 1.0;
 			const float rivuletColumnsPerUV = 25.0;  // (44b) about 3 cm per rivulet column on the body
 #		endif
 			const float2 cellUV = wetUV * cellsPerUV;
@@ -2321,7 +2323,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			skinWetDropRim = detail.dropRim * skinWetDropMask;
 			// (44b) Rivulets on their own scale (they used the droplet cells, about 1/800 uv wide, and
 			// faded out below a pixel at any normal viewing distance).
-			const float rivulets = Skin::WetSkinRivulets(wetUV, rivuletColumnsPerUV, max(length(dUVdx), length(dUVdy)), gravityUV, alignment, skinWetStreakDriver);
+			const float rivulets = Skin::WetSkinRivulets(wetUV, rivuletColumnsPerUV, max(length(dUVdx), length(dUVdy)), gravityUV, alignment, skinWetStreakDriver * faceRivulets);
 			skinWetStreak = saturate(max(rivulets, detail.trail * 0.8 * dropVisibility));
 
 			const float3 tu = dot(dPdu, dPdu) > 1e-20 ? normalize(dPdu) : float3(1.0, 0.0, 0.0);
