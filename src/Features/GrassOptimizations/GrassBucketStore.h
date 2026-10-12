@@ -236,7 +236,34 @@ public:
 		bool enableMidLOD = false;
 		bool enableFarLOD = false;
 		float fadeStart = 0.0f;  // stamped on newly captured slices as their fade-in start
+		// (44e, fix A) Removals leave gaps instead of rebuilding every touched type at once; a type is
+		// compacted only when new grass would not fit behind its last instance, or when gaps exceed half
+		// its capacity, and at most one gap-only compaction runs per frame, through a shared scratch buffer.
+		bool deferredCompaction = true;
+		// (44e, fix B) 0 = no limit. Captures beyond this many bytes per frame wait for the next frame.
+		uint32_t uploadBudgetBytes = 0;
+		// (44e, fix B) Types allowed to grow their buffers per frame (0 = no limit).
+		uint32_t maxGrowthsPerFrame = 0;
+		// (44e, fix C) Grow to at least 1.25x what is needed (doubling as before, once more if short).
+		bool growthHeadroom = false;
 	};
+
+	/** @brief (44e, fix D) What the last ApplyPending did. */
+	struct ApplyStats
+	{
+		uint32_t removals = 0;             ///< shapes removed
+		uint32_t captures = 0;             ///< captures folded in
+		uint32_t capturesDeferred = 0;     ///< captures left for a later frame (upload budget)
+		uint32_t compactions = 0;          ///< types compacted this frame
+		uint32_t compactionsDeferred = 0;  ///< types with gaps whose compaction was put off
+		uint32_t rebuilds = 0;             ///< CPU re-uploads (full or from a slice)
+		uint32_t growths = 0;              ///< buffer reallocations
+		uint32_t growthsDeferred = 0;      ///< growths put off (budget)
+		uint64_t allocatedBytes = 0;       ///< GPU memory newly allocated
+		uint64_t uploadedBytes = 0;        ///< CPU -> GPU bytes
+		uint64_t copiedBytes = 0;          ///< GPU -> GPU bytes (compaction / growth)
+	};
+	ApplyStats lastApply;
 
 	void BeginFrame(const FrameParams& params) { frameParams = params; }
 
@@ -313,6 +340,20 @@ private:
 
 	/** @brief Caches per-type parameters (wave period, bound, mesh cost) from a source shape. */
 	void CacheBucketTypeParams(GrassBucket& b, RE::BSMultiStreamInstanceTriShape* shape);
+
+	/** @brief (44e, fix A) Compacts through the shared scratch buffer: no allocation per type, no overlapping copy. */
+	bool CompactBucketScratch(GrassBucket& b, ID3D11Device* device, ID3D11DeviceContext* ctx);
+	/** @brief (44e) End of the resident instances of slices [0, sliceCount), gaps included. False if one is not resident. */
+	static bool ResidentEnd(const GrassBucket& b, uint32_t sliceCount, uint32_t& o_end);
+	/** @brief (44e) Instances in slices [from, end). */
+	static uint32_t InstancesFrom(const GrassBucket& b, uint32_t from);
+
+	// (44e, fix A) Shared compaction scratch: grow-only, instance records and origins.
+	winrt::com_ptr<ID3D11Buffer> scratchInstance;
+	winrt::com_ptr<ID3D11Buffer> scratchOrigin;
+	uint32_t scratchCapacity = 0;
+	// (44e, fix B) Captures held back by the upload budget, applied first next frame.
+	std::vector<PendingCapture> deferredCaptures;
 
 	FrameParams frameParams;
 

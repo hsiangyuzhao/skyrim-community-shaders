@@ -62,6 +62,13 @@ public:
 		bool EnableFarLOD = true;
 		float FarLODPixelSize = 4.0f;
 		float MeshLODBandPixels = 3.0f;
+		// (44e) Spike fixes (see reviews/diag-grass-opt-frame-spikes-2026-10.md). A: gaps instead of rebuilding every
+		// grass type when a cell unloads. B: per-frame upload / growth budget. C: growth headroom.
+		bool DeferredCompaction = true;
+		bool UploadBudget = false;
+		float UploadBudgetMB = 8.0f;
+		int MaxGrowthsPerFrame = 4;
+		bool GrowthHeadroom = false;
 	};
 
 	Settings settings;
@@ -199,6 +206,21 @@ public:
 	/** @brief Folds any completed drawn-instance readback into the statistics. Never waits on the GPU. */
 	void CollectDrawnInstanceCounts(ID3D11DeviceContext* ctx);
 
+	/** @brief (44e, fix D) Records one ApplyPending's time: peak, last spike, a log line above 1 ms. */
+	void NoteApplyPending(float a_ms);
+
+	/// (44e, fix D) Unsmoothed ApplyPending time of the last grass frame (ms), for the frame trace.
+	float lastApplyPendingMs = 0.0f;
+	/// Highest single-frame time in the last 10 s, and the last frame above 1 ms (time, MB, when).
+	float applyPeakMs = 0.0f;
+	float applyPeakWindowMs = 0.0f;
+	std::chrono::steady_clock::time_point applyPeakWindowStart{};
+	float lastSpikeMs = 0.0f;
+	float lastSpikeMB = 0.0f;
+	std::chrono::steady_clock::time_point lastSpikeTime{};
+	uint32_t spikeCount = 0;
+
+
 	GrassBucketStore bucketStore;
 	HiZPyramid hiZ;
 
@@ -284,6 +306,7 @@ public:
 		uint32_t capacity = 0;
 		uint32_t count = 0;
 		bool pending = false;
+		uint32_t frameWritten = 0;  // (44e, fix E) read back only once at least two frames old
 	};
 	std::array<ReadbackSlot, kReadbackSlots> readbackSlots;
 	uint32_t readbackWrite = 0;

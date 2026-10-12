@@ -27,7 +27,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	MidLODPixelSize,
 	EnableFarLOD,
 	FarLODPixelSize,
-	MeshLODBandPixels)
+	MeshLODBandPixels,
+	DeferredCompaction,
+	UploadBudget,
+	UploadBudgetMB,
+	MaxGrowthsPerFrame,
+	GrowthHeadroom)
 
 namespace
 {
@@ -86,6 +91,31 @@ void GrassOptimizations::DrawSettings()
 			ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Unavailable: the culling shader failed to compile; grass is drawn by the game.");
 		else if (!shadersReady)
 			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Compiling optimized grass shaders; grass is drawn by the game until they are ready.");
+	}
+
+	if (ImGui::TreeNode("Load Spikes (44e)")) {
+		ImGui::Checkbox("Deferred Compaction", &settings.DeferredCompaction);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"On: when grass unloads, the gaps it leaves are tidied up later, one grass type per frame, only when needed.\n"
+				"Off (44d): every grass type touched is rebuilt in the same frame, which is the suspected periodic spike.\n"
+				"Same picture either way.");
+		}
+		ImGui::Checkbox("Upload Budget", &settings.UploadBudget);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"Spreads newly loaded grass over several frames. Grass still waiting is drawn by the game meanwhile;\n"
+				"a type whose buffers must grow may appear a frame or two late (it fades in anyway). Off = no limit.");
+		}
+		if (settings.UploadBudget) {
+			ImGui::SliderFloat("Budget (MB per frame)", &settings.UploadBudgetMB, 0.25f, 64.0f, "%.2f MB", ImGuiSliderFlags_Logarithmic);
+			ImGui::SliderInt("Buffer Growths per Frame", &settings.MaxGrowthsPerFrame, 1, 16);
+		}
+		ImGui::Checkbox("Growth Headroom", &settings.GrowthHeadroom);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("When a grass type's buffers must grow, leave at least 25%% room, so the next cells fit without growing again. Uses more video memory.");
+		}
+		ImGui::TreePop();
 	}
 
 	ImGui::SeparatorText("Culling & LOD");
@@ -356,12 +386,24 @@ void GrassOptimizations::UpdateGrass()
 	maxGrassDistance = settings.RenderDistanceOverride > 0.0f ? settings.RenderDistanceOverride : vanillaMaxDistance;
 	maxDistSq = maxGrassDistance * maxGrassDistance;
 
-	bucketStore.BeginFrame({ settings.EnableMeshLOD, settings.EnableMidLOD, settings.EnableFarLOD, timeAccum });
+	bucketStore.BeginFrame({ settings.EnableMeshLOD, settings.EnableMidLOD, settings.EnableFarLOD, timeAccum,
+		settings.DeferredCompaction,
+		settings.UploadBudget ? static_cast<uint32_t>(std::clamp(settings.UploadBudgetMB, 0.25f, 256.0f) * 1048576.0f) : 0u,
+		settings.UploadBudget ? static_cast<uint32_t>(std::clamp(settings.MaxGrowthsPerFrame, 1, 64)) : 0u,
+		settings.GrowthHeadroom });
 
 	// Captures are folded in and uploaded whether or not the optimized path is on, so switching it on
 	// mid-session finds every loaded cell already bucketed. This only does work on frames where grass
 	// cells were loaded or unloaded.
-	bucketStore.ApplyPending(device, ctx);
+	{
+		// (44e, fix D) Timed on its own, unsmoothed: the CPU timer row is a 0.95 EMA and hides single-frame spikes.
+		LARGE_INTEGER t0, t1, freq;
+		QueryPerformanceCounter(&t0);
+		bucketStore.ApplyPending(device, ctx);
+		QueryPerformanceCounter(&t1);
+		QueryPerformanceFrequency(&freq);
+		NoteApplyPending(static_cast<float>(static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart)));
+	}
 
 	for (auto& [key, b] : bucketStore.buckets)
 		b.ResetCullState();
@@ -905,13 +947,16 @@ void GrassOptimizations::GatherDrawnInstanceCounts(ID3D11DeviceContext* ctx)
 		slot.count = buckets;
 	}
 
+	slot.frameWritten = globals::game::graphicsState ? globals::game::graphicsState->frameCount : 0;
 	slot.pending = true;
 	readbackWrite = (readbackWrite + 1) % kReadbackSlots;
 }
 
 void GrassOptimizations::CollectDrawnInstanceCounts(ID3D11DeviceContext* ctx)
 {
-	// Oldest slot first; the newest result that is ready wins.
+	// (44e, fix E) One Map per frame, on the oldest pending slot, and only once it is at least two
+	// frames old (it is then almost always ready). 44d tried every pending slot every frame.
+	const uint32_t frame = globals::game::graphicsState ? globals::game::graphicsState->frameCount : 0;
 	for (uint32_t i = 0; i < kReadbackSlots; ++i) {
 		auto& slot = readbackSlots[(readbackWrite + i) % kReadbackSlots];
 		if (!slot.pending)
@@ -922,9 +967,11 @@ void GrassOptimizations::CollectDrawnInstanceCounts(ID3D11DeviceContext* ctx)
 			slot.pending = false;
 			continue;
 		}
+		if (frame - slot.frameWritten < 2)
+			break;
 		D3D11_MAPPED_SUBRESOURCE m{};
 		if (ctx->Map(slot.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m) != S_OK)
-			continue;
+			break;
 		uint64_t sum = 0;
 		const auto* counts = static_cast<const uint32_t*>(m.pData);
 		for (uint32_t c = 0; c < slot.count * kCountsPerBucket; ++c)
@@ -933,7 +980,34 @@ void GrassOptimizations::CollectDrawnInstanceCounts(ID3D11DeviceContext* ctx)
 		drawnInstances = sum;
 		drawnInstancesValid = true;
 		slot.pending = false;
+		break;
 	}
+}
+
+void GrassOptimizations::NoteApplyPending(float a_ms)
+{
+	lastApplyPendingMs = a_ms;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - applyPeakWindowStart > std::chrono::seconds(10)) {
+		applyPeakMs = applyPeakWindowMs;
+		applyPeakWindowMs = 0.0f;
+		applyPeakWindowStart = now;
+	}
+	applyPeakWindowMs = std::max(applyPeakWindowMs, a_ms);
+	applyPeakMs = std::max(applyPeakMs, a_ms);
+	if (a_ms <= 1.0f)
+		return;
+
+	const auto& a = bucketStore.lastApply;
+	const float mb = static_cast<float>(static_cast<double>(a.allocatedBytes) / 1048576.0);
+	lastSpikeMs = a_ms;
+	lastSpikeMB = mb;
+	lastSpikeTime = now;
+	++spikeCount;
+	logger::info("[GRASS OPTIMIZATIONS] Load spike {:.2f} ms: removed {} shapes, added {} (+{} waiting), compacted {} types ({} put off), rebuilt {}, grew {} ({} put off), "
+		"allocated {:.1f} MB, uploaded {:.1f} MB, GPU-copied {:.1f} MB [compaction {}]",
+		a_ms, a.removals, a.captures, a.capturesDeferred, a.compactions, a.compactionsDeferred, a.rebuilds, a.growths, a.growthsDeferred,
+		mb, static_cast<double>(a.uploadedBytes) / 1048576.0, static_cast<double>(a.copiedBytes) / 1048576.0, settings.DeferredCompaction ? "deferred" : "44d");
 }
 
 void GrassOptimizations::DrawOverlayStats()
@@ -984,6 +1058,17 @@ void GrassOptimizations::DrawOverlayStats()
 		row("Instances drawn:", drawnInstancesValid && s.optimizedPath ? std::format("{}", drawnInstances) : std::string("-"),
 			"Instances that survived GPU culling and were drawn, read back a few frames late without stalling.\n"
 			"Compare with the game's instance count above with the optimized path off.");
+		{
+			// (44e, fix D) Unsmoothed: the CPU timer row hides single-frame spikes.
+			const float ago = lastSpikeTime == std::chrono::steady_clock::time_point{} ? -1.0f :
+				std::chrono::duration<float>(std::chrono::steady_clock::now() - lastSpikeTime).count();
+			row("Load work (now / 10 s peak):", std::format("{:.2f} / {:.2f} ms", lastApplyPendingMs, std::max(applyPeakMs, applyPeakWindowMs)),
+				"CPU time of folding newly loaded grass in and unloaded grass out, this frame and the highest single frame\n"
+				"in about the last 10 s. Not smoothed. Grass loads and unloads as you cross a cell (about every 10 s running).");
+			row("Last load spike (> 1 ms):", ago < 0.0f ? std::string("none yet") : std::format("{:.2f} ms, {:.1f} MB new, {:.0f} s ago ({} total)", lastSpikeMs, lastSpikeMB, ago, spikeCount),
+				"The last frame whose grass load work took over 1 ms, and the GPU memory it allocated.\n"
+				"Each one also writes a line to CommunityShaders.log.");
+		}
 
 		ImGui::EndTable();
 	}
