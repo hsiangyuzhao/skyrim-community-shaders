@@ -11,6 +11,7 @@
 #include "Features/GrassCollision.h"
 #include "Features/GrassLighting.h"
 #include "Features/GrassOptimizations.h"
+#include "Features/HDROutputFeature.h"
 #include "Features/HairSpecular.h"
 #include "Features/IBL.h"
 #include "Features/InteriorSun.h"
@@ -249,6 +250,7 @@ const std::vector<Feature*>& Feature::GetFeatureList()
 		&globals::features::ibl,
 		&globals::features::extendedTranslucency,
 		&globals::features::upscaling,
+		&globals::features::hdrOutput,  // (44a) after Upscaling: takes over its 43b HDR settings
 		&globals::features::renderDoc,
 		&globals::features::linearLighting,
 		&globals::features::physicalSky,

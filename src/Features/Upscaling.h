@@ -219,9 +219,6 @@ public:
 		uint reflexFrameLimit = 0;
 
 		NeuralRenderingSettings neuralRendering;
-
-		// (batch 43) Native HDR10 output (Upscaling > HDR Output). Default off.
-		HDROutput::Settings hdrOutput;
 	};
 
 	Settings settings;

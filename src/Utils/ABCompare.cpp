@@ -244,9 +244,9 @@ namespace ABCompare
 					return "needs a restart";
 				if (a_key == "frameGenerationMode" && globals::features::upscaling.GetFrameGenerationBackend() != Upscaling::FrameGenerationBackend::kDLSSG)
 					return "FSR frame generation: may need a restart";
-				if (auto note = HDROutput::RestartNote(a_key); !note.empty())  // (batch 43)
-					return note;
 			}
+			if (a_feature == "HDR Output")  // (44a) its own feature; display format needs a restart
+				return HDROutput::RestartNote(a_key);
 			return {};
 		}
 

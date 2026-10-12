@@ -85,10 +85,11 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 	auto& upscaling = globals::features::upscaling;
 	const bool useDLSSG = upscaling.IsDLSSGBackend() && upscaling.streamline.featureDLSS_G && upscaling.streamline.featureReflex && upscaling.streamline.featurePCL;
 
-	// (batch 43) Native HDR: a 10-bit chain only when HDR output was saved on, so an SDR session
-	// keeps the game's own format and every byte it showed before. DLSS-G takes HDR10 as
+	// (batch 43, 44a) Native HDR: a 10-bit chain on an HDR-capable display ("Display format: Auto"),
+	// or with HDR saved on in "8-bit (legacy)", so HDR switches live. DLSS-G takes HDR10 as
 	// R10G10B10A2 + G2084/P2020 (Streamline DLSS-G guide, section 11); it does not take scRGB.
-	if (useDLSSG && HDROutput::WantsTenBitSwapChain()) {
+	const DXGI_FORMAT gameFormat = swapChainDesc.Format;
+	if (useDLSSG && HDROutput::WantsTenBitSwapChain(a_swapChainDesc.OutputWindow)) {
 		D3D12_FEATURE_DATA_FORMAT_SUPPORT support{ DXGI_FORMAT_R10G10B10A2_UNORM, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE };
 		const bool supported = SUCCEEDED(d3d12Device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
 		                       (support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) && (support.Support1 & D3D12_FORMAT_SUPPORT1_DISPLAY);
@@ -98,6 +99,7 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 			swapChainDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
 		} else {
 			logger::warn("[HDR] R10G10B10A2_UNORM is not a displayable render-target format here; keeping format {}", static_cast<uint32_t>(swapChainDesc.Format));
+			HDROutput::NoteTenBitFailure("R10G10B10A2 is not a displayable render-target format on this GPU");
 		}
 	}
 
@@ -109,13 +111,16 @@ void DX12SwapChain::CreateSwapChain(IDXGIAdapter* adapter, DXGI_SWAP_CHAIN_DESC 
 		upscaling.UpgradeBackendInterface(reinterpret_cast<void**>(&proxyFactory));
 
 		winrt::com_ptr<IDXGISwapChain1> proxySwapChain;
-		DX::ThrowIfFailed(proxyFactory->CreateSwapChainForHwnd(
-			commandQueueProxy.get(),
-			a_swapChainDesc.OutputWindow,
-			&swapChainDesc,
-			nullptr,
-			nullptr,
-			proxySwapChain.put()));
+		HRESULT created = proxyFactory->CreateSwapChainForHwnd(commandQueueProxy.get(), a_swapChainDesc.OutputWindow, &swapChainDesc, nullptr, nullptr, proxySwapChain.put());
+		if (FAILED(created) && swapChainDesc.Format != gameFormat) {
+			// (44a) The 10-bit chain was refused: fall back to the game's own format now and remember it.
+			logger::warn("[HDR] Creating the 10-bit swap chain failed (0x{:08X}); retrying with format {}", static_cast<uint32_t>(created), static_cast<uint32_t>(gameFormat));
+			HDROutput::NoteTenBitFailure("creating the 10-bit DLSS-G swap chain failed");
+			swapChainDesc.Format = gameFormat;
+			proxySwapChain = nullptr;
+			created = proxyFactory->CreateSwapChainForHwnd(commandQueueProxy.get(), a_swapChainDesc.OutputWindow, &swapChainDesc, nullptr, nullptr, proxySwapChain.put());
+		}
+		DX::ThrowIfFailed(created);
 		DX::ThrowIfFailed(proxySwapChain->QueryInterface(IID_PPV_ARGS(&swapChain)));
 		void* nativeInterface = nullptr;
 		if (upscaling.streamline.GetNativeInterface(swapChain, &nativeInterface) == sl::Result::eOk) {

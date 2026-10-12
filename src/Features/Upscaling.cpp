@@ -68,8 +68,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DLSSDPreset,
 	reflexMode,
 	reflexFrameLimit,
-	neuralRendering,
-	hdrOutput);
+	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
 
@@ -816,14 +815,9 @@ void Upscaling::DrawSettings()
 		ImGui::TreePop();
 	}
 
-	// (batch 43) Native HDR10 output.
-	if (!globals::game::isVR && ImGui::TreeNodeEx("HDR Output")) {
-		HDROutput::DrawSettings();
-		ImGui::TreePop();
-	}
-
-	// (42c) Native HDR phase 0: read-only display / swap-chain diagnostics.
-	DisplayHDRInfo::DrawSettings();
+	// (44a) Native HDR output and the Display / HDR info moved to their own page.
+	if (!globals::game::isVR)
+		ImGui::TextDisabled("HDR output and Display / HDR info: see the HDR Output page (Display).");
 }
 
 void Upscaling::SaveSettingsValues(json& o_json) const
@@ -845,6 +839,8 @@ void Upscaling::SaveSettings(json& o_json)
 
 void Upscaling::LoadSettings(json& o_json)
 {
+	// (44a) HDR Output is its own feature now; 43b saved its settings here (hdrOutput).
+	HDROutput::StashLegacyUpscalingJson(o_json);
 	settings = o_json;
 
 	// Sanitize loaded settings to ensure enum indices are valid

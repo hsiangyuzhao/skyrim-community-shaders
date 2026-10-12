@@ -373,6 +373,53 @@ namespace DisplayHDRInfo
 		g_requested = true;
 	}
 
+	Capability QueryCapability(HWND a_window)
+	{
+		Capability cap;
+		const HMONITOR monitor = a_window ? MonitorFromWindow(a_window, MONITOR_DEFAULTTOPRIMARY) : MonitorFromWindow(nullptr, MONITOR_DEFAULTTOPRIMARY);
+		auto factory = CreateFactory();
+		if (!factory || !monitor) {
+			cap.detail = "no DXGI factory or monitor";
+			return cap;
+		}
+		Snapshot snap;
+		winrt::com_ptr<IDXGIAdapter1> adapter;
+		for (UINT a = 0; !snap.haveOutput && factory->EnumAdapters1(a, adapter.put()) != DXGI_ERROR_NOT_FOUND; ++a) {
+			winrt::com_ptr<IDXGIOutput> output;
+			for (UINT o = 0; adapter->EnumOutputs(o, output.put()) != DXGI_ERROR_NOT_FOUND; ++o) {
+				DXGI_OUTPUT_DESC desc{};
+				if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == monitor) {
+					winrt::com_ptr<IDXGIOutput6> output6;
+					DXGI_OUTPUT_DESC1 desc1{};
+					if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(output6.put()))) && SUCCEEDED(output6->GetDesc1(&desc1))) {
+						snap.haveOutput = true;
+						snap.maxLuminance = desc1.MaxLuminance;
+						snap.windowsHdrByColorSpace = desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+						QueryAdvancedColor(snap, desc1.DeviceName);
+					}
+					break;
+				}
+				output = nullptr;
+			}
+			adapter = nullptr;
+		}
+		if (!snap.haveOutput) {
+			cap.detail = "the monitor's IDXGIOutput6 was not found";
+			return cap;
+		}
+		cap.known = true;
+		cap.hdrActive = snap.haveAdvancedColor2 ? snap.hdrActive2 : snap.windowsHdrByColorSpace;
+		// HDR-capable: the 24H2 query when Windows has it; otherwise "advanced colour supported"
+		// (which also covers wide-colour-only panels, harmless here) or HDR already on.
+		if (snap.haveAdvancedColor2)
+			cap.hdrCapable = snap.hdrSupported2 || cap.hdrActive;
+		else
+			cap.hdrCapable = (snap.haveAdvancedColor && snap.advancedColorSupported) || cap.hdrActive;
+		cap.detail = std::format("monitor '{}': HDR capable {}, Windows HDR {}, max {:.0f} nits ({})", snap.monitorName, cap.hdrCapable, cap.hdrActive,
+			snap.maxLuminance, snap.haveAdvancedColor2 ? "24H2 query" : (snap.haveAdvancedColor ? "advanced colour query" : "output colour space"));
+		return cap;
+	}
+
 	DisplayState GetDisplayState()
 	{
 		std::lock_guard lock(g_mutex);

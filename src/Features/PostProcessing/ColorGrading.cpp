@@ -6,8 +6,10 @@
 #include "ColourSpace.h"
 #include "Features/PostProcessing.h"
 #include "Features/Upscaling/HDROutput.h"
+#include "Utils/UI.h"
 
 #include <DDSTextureLoader.h>
+#include <DirectXPackedVector.h>
 #include <DirectXTex.h>
 
 #include "IconsFontAwesome5.h"
@@ -15,6 +17,12 @@
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ColorGrading::ColorProfile,
     params)
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+    ColorGrading::TonemapHDR,
+    mode,
+    knee,
+    option)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ColorGrading::Settings,
@@ -35,7 +43,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     processColorSpace,
     outputColorSpace,
 	colorSpaceTransform,
-	invColorSpaceTransform
+	invColorSpaceTransform,
+	tonemapHDR
 )
 
 template <int num = 3>
@@ -212,11 +221,21 @@ struct TonemapperInfo
 				"Tonemapper designed for Gran Turismo 7."sv,
 				[](CTP& params) {
                     exposureSlider(&params[0].x);
-                    ImGui::Checkbox("HDR Output (old, does not work - use Upscaling > HDR Output)", (bool*)&params[0].y);
-                    if (params[0].y)
-                        ImGui::InputFloat("HDR Max Brightness", &params[0].z, 0.f, 0.f, "%1.f nits");
+                    // (44a) The old "HDR Output" checkbox (params[0].y) is gone: HDR is HDR Mode below.
                 },
-				{ f4{ 1.f, 0.f, 400.f, 0.f } } }
+				{ f4{ 1.f, 0.f, 400.f, 0.f } } },
+
+			// (44a) Neutwo (RenoDX, MIT): neutral, luminance-only; has a Native HDR form.
+			{ "Neutwo"sv, "NeutwoTonemap"sv,
+				"Neutwo by Carlos Lopez (RenoDX): a neutral curve on brightness only, so colours keep their hue and saturation. "
+				"Its HDR form simply raises the peak, the smoothest change from SDR to HDR."sv,
+				[](CTP& params) {
+					exposureSlider(&params[0].x);
+					ImGui::SliderFloat("Clip Point", &params[0].y, 1.f, 100.f, "%.2f", ImGuiSliderFlags_Logarithmic);
+					if (auto _tt = Util::HoverTooltipWrapper())
+						ImGui::Text("Scene brightness that reaches the peak. Higher = softer shoulder.");
+				},
+				{ f4{ 1.f, 100.f, 0.f, 0.f } } }
 		};
 
 		static std::once_flag flag;
@@ -383,6 +402,60 @@ void ColorGrading::DrawSettings()
         ImGui::PushID(tonemapperType);
         tonemappers[tonemapperType].draw_settings_func(settings.tonemapParams);
         ImGui::PopID();
+
+        // (44a) HDR: this page owns the curve in SDR and in HDR.
+        {
+            const std::string tmName(tonemappers[tonemapperType].name);
+            const bool native = HasNativeHDR(tmName);
+            const bool isGT7 = tmName == "GT7";
+            auto hdr = GetTonemapHDR(tmName);
+            const auto levels = HDROutput::GetDisplayLevels();
+
+            ImGui::SeparatorText("HDR");
+            ImGui::TextDisabled("HDR output %s. Peak %.0f nits, paper white %.0f nits (peak = %.2f x white). Set on the HDR Output page.",
+                levels.hdr ? "on" : "off", levels.peakNits, levels.paperWhiteNits, levels.peakRel);
+
+            const char* modes[] = { "Extend (keeps the SDR look)", "Native" };
+            int mode = native && hdr.mode == 1 ? 1 : 0;
+            ImGui::BeginDisabled(!native);
+            if (ImGui::Combo("HDR Mode", &mode, modes, IM_ARRAYSIZE(modes)))
+                hdr.mode = static_cast<uint>(mode);
+            ImGui::EndDisabled();
+            if (auto _tt = Util::HoverTooltipWrapper()) {
+                ImGui::TextUnformatted("How this tone mapper behaves with HDR output on (saved for each tone mapper).");
+                ImGui::TextUnformatted("Extend: the picture is exactly the SDR one up to the roll-off start; only brighter highlights go above white, up to the peak.");
+                ImGui::TextUnformatted("Native: the tone mapper's own HDR form (Lottes: the curve re-solved for the peak, mid-grey kept;");
+                ImGui::TextUnformatted("GT7: its HDR curve matched to its SDR mid-tones; Neutwo: its peak raised). Only Lottes, GT7 and Neutwo have one.");
+            }
+            const bool kneeUsed = hdr.mode == 0 || !native || isGT7;
+            if (kneeUsed) {
+                ImGui::SliderFloat("Highlight Roll-off Start", &hdr.knee, 0.3f, 0.9f, "%.2f");
+                if (auto _tt = Util::HoverTooltipWrapper()) {
+                    if (native && hdr.mode == 1 && isGT7)
+                        ImGui::Text("GT7: the curve stays straight up to this fraction of the peak (now %.0f nits), then bends toward it.", hdr.knee * levels.peakNits);
+                    else {
+                        ImGui::Text("Extend: everything up to this fraction of SDR white (now %.0f nits) is exactly as in SDR;", hdr.knee * levels.paperWhiteNits);
+                        ImGui::TextUnformatted("above it highlights bend smoothly up toward the peak. Lower = more highlight punch, higher = closer to SDR.");
+                    }
+                }
+            }
+            if (native && hdr.mode == 1 && isGT7) {
+                bool reference = hdr.option == 1;
+                if (ImGui::Checkbox("Upstream Reference Brightness", &reference))
+                    hdr.option = reference ? 1u : 0u;
+                if (auto _tt = Util::HoverTooltipWrapper()) {
+                    ImGui::TextUnformatted("Off: GT7's HDR curve with the same mid-tones as GT7 in SDR.");
+                    ImGui::TextUnformatted("On: GT7's HDR curve as upstream uses it: everything about 2.5x (1.3 stops) brighter than SDR.");
+                }
+            }
+            settings.tonemapHDR[tmName] = hdr;
+
+            if (ImGui::TreeNode("Curve Preview")) {
+                curvePreviewOpen = true;
+                DrawCurvePreview();
+                ImGui::TreePop();
+            }
+        }
     }
 
     ImGui::SeparatorText("Game Color Grading");
@@ -397,7 +470,11 @@ void ColorGrading::DrawSettings()
         auto& spaces = getAvailableColourSpaces();
         ImGui::Combo("Input Color Space", &settings.inputColorSpace, spaces.data(), (int)spaces.size());
         ImGui::Combo("Process Color Space", &settings.processColorSpace, spaces.data(), (int)spaces.size());
-        ImGui::Combo("Output Color Space", &settings.outputColorSpace, spaces.data(), (int)spaces.size());
+        // (44a) The output space is automatic: sRGB in SDR, BT.2020 with HDR output on.
+        settings.outputColorSpace = 0;
+        ImGui::Text("Output Color Space: auto (SDR -> sRGB, HDR -> BT.2020)%s", HDROutput::GetDisplayLevels().hdr ? ", now BT.2020" : "");
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::TextUnformatted("With HDR output on, the result goes from the process space to BT.2020 through sRGB, so greys match SDR exactly and colours beyond sRGB are kept.");
 
         auto colorSpaceTransformMatrix = getRGBMatrix(spaces[settings.inputColorSpace], spaces[settings.processColorSpace]);
         auto invColorSpaceTransformMatrix = getRGBMatrix(spaces[settings.processColorSpace], spaces[settings.outputColorSpace]);
@@ -443,12 +520,57 @@ void ColorGrading::LoadSettings(json& o_json)
 		} else {
 			TonemapperInfo::GetDefaultParams(tonemapperType, settings.tonemapParams);
 		}
+
+		// (44a) The curve moved here from Upscaling > HDR Output (43b: toneCurve, rolloffStart). Taken
+		// once, when these settings have no per-tone-mapper HDR entries yet.
+		uint legacyCurve = 1;
+		float legacyRolloff = 0.6f;
+		const bool hasOwn = o_json.is_object() && o_json.contains("tonemapHDR");
+		if (HDROutput::TakeLegacyCurve(legacyCurve, legacyRolloff) && !hasOwn) {
+			const std::string current(tonemappers[tonemapperType].name);
+			if (legacyCurve == 2) {
+				// "GT7 HDR curve" -> GT7 with HDR Mode Native.
+				if (auto it = std::ranges::find_if(tonemappers, [](TonemapperInfo& x) { return x.name == "GT7"sv; }); it != tonemappers.end()) {
+					const int gt7 = (int)(it - tonemappers.begin());
+					if (gt7 != tonemapperType) {
+						tonemappers[tonemapperType].cached_settings = settings.tonemapParams;
+						settings.tonemapParams = tonemappers[gt7].cached_settings;
+						tonemapperType = gt7;
+					}
+				}
+				settings.tonemapHDR["GT7"] = TonemapHDR{ 1u, std::clamp(legacyRolloff, 0.3f, 0.9f), 0u };
+				logger::info("[Color Grading] Migrated 43b HDR tone curve: GT7, HDR Mode Native, roll-off {:.2f}", legacyRolloff);
+			} else {
+				// "Extend my tone mapper" -> the current tone mapper, HDR Mode Extend, same roll-off.
+				settings.tonemapHDR[current] = TonemapHDR{ 0u, std::clamp(legacyRolloff, 0.3f, 0.9f), 0u };
+				logger::info("[Color Grading] Migrated 43b HDR tone curve: {}, HDR Mode Extend, roll-off {:.2f}", current, legacyRolloff);
+			}
+		}
+		// (44a) The old GT7 "HDR Output" checkbox lived in tonemapParams[0].y; it is gone.
+		if (tonemappers[tonemapperType].name == "GT7"sv)
+			settings.tonemapParams[0].y = 0.0f;
+		settings.outputColorSpace = 0;  // (44a) automatic: sRGB in SDR, BT.2020 in HDR
 	} catch (const json::exception& e) {
 		logger::error("Failed to load Color Grading settings: {}", e.what());
 		RestoreDefaultSettings();
 	}
 
     recompileFlag = true;
+}
+
+ColorGrading::TonemapHDR ColorGrading::GetTonemapHDR(std::string_view a_name) const
+{
+	if (auto it = settings.tonemapHDR.find(std::string(a_name)); it != settings.tonemapHDR.end())
+		return it->second;
+	TonemapHDR defaults{};
+	if (a_name == "Neutwo")
+		defaults.mode = 1;  // made for HDR: its Native form is the point of it
+	return defaults;
+}
+
+bool ColorGrading::HasNativeHDR(std::string_view a_name)
+{
+	return a_name == "Lottes Filmic/AMD Curve" || a_name == "GT7" || a_name == "Neutwo";
 }
 
 void ColorGrading::SaveSettings(json& o_json)
@@ -605,8 +727,11 @@ void ColorGrading::CompileComputeShaders()
 	// (batch 43) The HDR variants only exist in a native-HDR session, so an SDR session compiles exactly
 	// what it did before.
 	if (HDROutput::IsSession()) {
-		shaderInfos.push_back({ &colorgradingHdrCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() }, { "HDR_OUTPUT", "" } }, "CSColorGrading" });
-		shaderInfos.push_back({ &lutgenHdrCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() }, { "HDR_OUTPUT", "" } }, "CSLUTGen" });
+		std::vector<std::pair<const char*, const char*>> hdrDefines = { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() }, { "HDR_OUTPUT", "" } };
+		if (tonemappers[tonemapperType].name == "GT7"sv)
+			hdrDefines.push_back({ "TONEMAP_GT7", "" });  // (44a) GT7's Native form lives in ColorGrading()
+		shaderInfos.push_back({ &colorgradingHdrCS, "colorgrading.cs.hlsl", hdrDefines, "CSColorGrading" });
+		shaderInfos.push_back({ &lutgenHdrCS, "colorgrading.cs.hlsl", hdrDefines, "CSLUTGen" });
 	}
 
 	for (auto& info : shaderInfos) {
@@ -711,14 +836,44 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 		.skipLDR = settings.skipLDR,
 		.enableTonemap = settings.enableTonemap,
 		.enableColorSpaceTransform = settings.enableColorSpaceTransform,
-		// (batch 43) Zero (SDR, unchanged) unless HDR output tone-maps this frame's scene.
-		.hdrParams = HDROutput::GetColorGradingParams()
+		.hdrParams = float4{ 0.0f, 0.0f, 0.0f, 0.0f },
+		.hdrParams2 = float4{ 0.0f, 0.0f, 0.0f, 0.0f },
+		.hdrOutputTransform = {}
 	};
-	// (batch 43) HDR highlights need the HDR_OUTPUT pair; without it (not an HDR session, or it failed to
-	// compile) the frame is graded as SDR, which the HDR output then shows at paper white.
-	const bool hdrGrading = colorCBData.hdrParams.x > 0.5f && colorgradingHdrCS && lutgenHdrCS;
-	if (!hdrGrading)
-		colorCBData.hdrParams = float4{ 0.0f, 0.0f, 0.0f, 0.0f };
+	auto& tonemapperList = TonemapperInfo::GetTonemappers();
+	const std::string_view tonemapperName = tonemapperList[tonemapperType].name;
+	// (44a) The old GT7 "HDR Output" checkbox (tonemapParams[0].y) never reaches the shader.
+	if (tonemapperName == "GT7"sv)
+		colorCBData.tonemapParams[0].y = 0.0f;
+	// (batch 43, 44a) HDR: this page's per-tone-mapper HDR Mode, the levels from HDR Output, and the
+	// BT.2020 output. Without the HDR_OUTPUT pair (not a 10-bit session, or it failed to compile) the
+	// frame is graded as SDR, which the HDR output then shows at paper white.
+	const auto levels = HDROutput::GetSceneLevels();
+	const bool hdrGrading = levels.hdr && colorgradingHdrCS && lutgenHdrCS;
+	if (hdrGrading) {
+		const auto hdr = GetTonemapHDR(tonemapperName);
+		const bool native = hdr.mode == 1 && HasNativeHDR(tonemapperName);
+		colorCBData.hdrParams = float4{ native ? 2.0f : 1.0f, levels.peakRel, std::clamp(hdr.knee, 0.3f, 0.9f), levels.displayGamma ? 1.0f : 0.0f };
+		colorCBData.hdrParams2 = float4{ (native && hdr.option == 1) ? 1.0f : 0.0f, 1.0f, 0.0f, 0.0f };
+		// processing -> BT.2020 = (709 -> 2020) x (processing -> sRGB): greys exactly as in SDR.
+		const int process = settings.enableColorSpaceTransform ? settings.processColorSpace : -1;
+		if (process != cachedOutputProcessSpace) {
+			auto& spaces = getAvailableColourSpaces();
+			DirectX::SimpleMath::Matrix toSRGB = DirectX::SimpleMath::Matrix::Identity;
+			if (process >= 0 && process < static_cast<int>(spaces.size()))
+				toSRGB = getRGBMatrix(spaces[process], "sRGB");
+			const DirectX::SimpleMath::Matrix to2020{ DirectX::XMFLOAT3X3{
+				0.6274039f, 0.3292830f, 0.0433131f,
+				0.0690973f, 0.9195404f, 0.0113623f,
+				0.0163914f, 0.0880133f, 0.8955953f } };
+			const auto m = DirectX::XMMatrixMultiply(to2020, toSRGB);
+			for (int r = 0; r < 3; ++r)
+				cachedOutputTransform[r] = float4{ DirectX::XMVectorGetByIndex(m.r[r], 0), DirectX::XMVectorGetByIndex(m.r[r], 1), DirectX::XMVectorGetByIndex(m.r[r], 2), 0.0f };
+			cachedOutputProcessSpace = process;
+		}
+		for (int r = 0; r < 3; ++r)
+			colorCBData.hdrOutputTransform[r] = cachedOutputTransform[r];
+	}
 	colorCB->Update(colorCBData);
 
 	ID3D11Buffer* cb = colorCB->CB();
@@ -771,6 +926,12 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 	context->CSSetConstantBuffers(0, 1, &cb);
 	context->CSSetShader(nullptr, nullptr, 0);
 
+	// (44a) The output passes must not convert this scene to BT.2020 a second time.
+	if (hdrGrading)
+		HDROutput::NoteSceneBT2020();
+
+	UpdateCurvePreview();
+
 	if (saveImagesFlag) {
 		saveImagesFlag = false;
 		OutputTextures();
@@ -813,4 +974,101 @@ void ColorGrading::OutputTextures()
 
 	DX::ThrowIfFailed(SaveToDDSFile(lutImage.GetImages(), lutImage.GetImageCount(), lutImage.GetMetadata(), DirectX::DDS_FLAGS::DDS_FLAGS_NONE, lutPath.c_str()));
 	DX::ThrowIfFailed(SaveToDDSFile(colorImage.GetImages(), colorImage.GetImageCount(), colorImage.GetMetadata(), DirectX::DDS_FLAGS::DDS_FLAGS_NONE, colorPath.c_str()));
+}
+// (44a) Curve preview. The LUT's neutral diagonal (64 texels) is copied to a small staging texture
+// while the preview is open and read two frames later without stalling, so what is drawn is exactly
+// what the GPU bakes: the grading, the tone mapper and, with HDR output on, its HDR Mode.
+void ColorGrading::UpdateCurvePreview()
+{
+	if (!curvePreviewOpen || !texLUT)
+		return;
+	curvePreviewOpen = false;
+
+	auto* device = globals::d3d::device;
+	auto* context = globals::d3d::context;
+	if (!curveStaging) {
+		D3D11_TEXTURE3D_DESC desc{};
+		desc.Width = LUTDim;
+		desc.Height = 1;
+		desc.Depth = 1;
+		desc.MipLevels = 1;
+		desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		desc.Usage = D3D11_USAGE_STAGING;
+		desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(device->CreateTexture3D(&desc, nullptr, curveStaging.put())))
+			return;
+	}
+
+	const uint64_t frame = globals::state->frameCount;
+	if (curveCopyPending && frame >= curveCopyFrame + 2) {
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		if (SUCCEEDED(context->Map(curveStaging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped))) {
+			const auto* texels = static_cast<const uint16_t*>(mapped.pData);
+			const bool extend = bakedColorCBData.hdrParams.x > 0.5f && bakedColorCBData.hdrParams.x < 1.5f;
+			const bool gt7Scaled = bakedColorCBData.hdrParams.x > 1.5f;  // GT7 Native keeps its factor in alpha too
+			for (int i = 0; i < LUTDim; ++i) {
+				const float r = DirectX::PackedVector::XMConvertHalfToFloat(texels[i * 4 + 0]);
+				const float g = DirectX::PackedVector::XMConvertHalfToFloat(texels[i * 4 + 1]);
+				const float b = DirectX::PackedVector::XMConvertHalfToFloat(texels[i * 4 + 2]);
+				const float a = DirectX::PackedVector::XMConvertHalfToFloat(texels[i * 4 + 3]);
+				const float scale = (extend || gt7Scaled) ? std::max(a, 1.0f) : 1.0f;
+				curveValues[i] = std::max({ r, g, b }) * scale;
+			}
+			context->Unmap(curveStaging.get(), 0);
+			curveHDR = bakedColorCBData.hdrParams.x > 0.5f;
+			curvePeakRel = curveHDR ? std::max(bakedColorCBData.hdrParams.y, 1.0f) : 1.0f;
+			curveValid = true;
+			curveCopyPending = false;
+		}
+	}
+	if (!curveCopyPending && lutValid) {
+		for (UINT i = 0; i < static_cast<UINT>(LUTDim); ++i) {
+			const D3D11_BOX box{ i, i, i, i + 1, i + 1, i + 1 };
+			context->CopySubresourceRegion(curveStaging.get(), 0, i, 0, 0, texLUT->resource.get(), 0, &box);
+		}
+		curveCopyPending = true;
+		curveCopyFrame = frame;
+	}
+}
+
+void ColorGrading::DrawCurvePreview()
+{
+	if (!curveValid) {
+		ImGui::TextDisabled("Reading the curve...");
+		return;
+	}
+	// Input of texel i: the LUT's log shaper (CSLUTGen), 14 stops around 0.18.
+	auto inputOf = [](int i) {
+		const auto logToLinear = [](float v) { return std::exp2((v - 444.0f / 1023.0f) * 14.0f) * 0.18f; };
+		return logToLinear((static_cast<float>(i) + 0.5f) / static_cast<float>(LUTDim - 1)) - logToLinear(0.0f);
+	};
+	const float yMax = std::max(curvePeakRel, 1.0f) * 1.05f;
+	const float xMin = std::log2(std::max(inputOf(1), 1e-4f));
+	const float xMax = std::log2(inputOf(LUTDim - 1));
+
+	const ImVec2 size{ std::max(ImGui::GetContentRegionAvail().x, 200.0f), 160.0f };
+	const ImVec2 p0 = ImGui::GetCursorScreenPos();
+	const ImVec2 p1{ p0.x + size.x, p0.y + size.y };
+	ImGui::InvisibleButton("##curve_preview", size);
+	auto* draw = ImGui::GetWindowDrawList();
+	draw->AddRectFilled(p0, p1, IM_COL32(20, 20, 24, 255));
+	draw->AddRect(p0, p1, IM_COL32(90, 90, 100, 255));
+	auto toScreen = [&](float x, float y) {
+		const float u = (std::log2(std::max(x, 1e-6f)) - xMin) / (xMax - xMin);
+		const float v = std::clamp(y / yMax, 0.0f, 1.0f);
+		return ImVec2{ p0.x + std::clamp(u, 0.0f, 1.0f) * size.x, p1.y - v * size.y };
+	};
+	// Reference lines: SDR white / paper white (1.0) and, in HDR, the peak.
+	const float yWhite = p1.y - (1.0f / yMax) * size.y;
+	draw->AddLine({ p0.x, yWhite }, { p1.x, yWhite }, IM_COL32(120, 120, 120, 200));
+	if (curveHDR) {
+		const float yPeak = p1.y - (curvePeakRel / yMax) * size.y;
+		draw->AddLine({ p0.x, yPeak }, { p1.x, yPeak }, IM_COL32(200, 150, 60, 200));
+	}
+	const float xGrey = toScreen(0.18f, 0.0f).x;
+	draw->AddLine({ xGrey, p0.y }, { xGrey, p1.y }, IM_COL32(80, 80, 90, 200));
+	for (int i = 2; i < LUTDim; ++i)
+		draw->AddLine(toScreen(inputOf(i - 1), curveValues[i - 1]), toScreen(inputOf(i), curveValues[i]), IM_COL32(230, 230, 230, 255), 2.0f);
+	ImGui::TextDisabled("Neutral grey in (log scale, vertical line = mid grey 0.18) -> out. Grey line = %s white (1.0)%s.",
+		curveHDR ? "paper" : "SDR", curveHDR ? std::format(", orange = peak ({:.2f} x)", curvePeakRel).c_str() : "");
 }

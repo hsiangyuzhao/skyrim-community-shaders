@@ -33,10 +33,16 @@ cbuffer ToneCurveCB : register(b0)
 	uint UseGrading;
 	uint UseAutoExposure;
 	uint GammaCorrect;
-	uint Pad0;
+	uint LutBT2020;  // (44a) the LUT holds BT.2020 (HDR output): back to BT.709, the scene's primaries, first
 };
 
 static const float3 kLuma = float3(0.2125, 0.7154, 0.0721);  // Color::RGBToLuminance
+
+static const float3x3 kBT2020ToBT709 = {
+	1.6604910, -0.5876411, -0.0728499,
+	-0.1245505, 1.1328999, -0.0083494,
+	-0.0181508, -0.1005789, 1.1187297
+};
 
 // Color Grading's LUT addressing (colorgrading.cs.hlsl, LogToLinear / LinearToLog).
 float3 GradingLogToLinear(float3 logColor)
@@ -67,6 +73,8 @@ groupshared float3 gCurve[kCurveSize];
 		color = pow(x, InputGamma) * CinematicBrightness;
 		color = GradingLinearContrast(color, CinematicContrast, 0.18);
 		color = GradingLUT.SampleLevel(LinearClamp, GradingLinearToLog(color + GradingLogToLinear(0.0)), 0).rgb;
+		[branch] if (LutBT2020)
+			color = mul(kBT2020ToBT709, color);
 		color = pow(abs(color), OutputGamma);
 		const float luma = dot(color, kLuma);
 		color = lerp(color, luma * Tint.rgb, Tint.w);

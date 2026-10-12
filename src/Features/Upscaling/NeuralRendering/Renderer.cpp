@@ -556,7 +556,7 @@ namespace NeuralRendering
 			std::uint32_t useGrading;
 			std::uint32_t useAutoExposure;
 			std::uint32_t gammaCorrect;
-			std::uint32_t pad;
+			std::uint32_t lutBT2020;  // (44a)
 		};
 
 		struct FinalizeConstants
@@ -848,6 +848,7 @@ namespace NeuralRendering
 			constants.useGrading = source.gradingLUT ? 1u : 0u;
 			constants.useAutoExposure = source.adaptation ? 1u : 0u;
 			constants.gammaCorrect = source.gammaCorrect ? 1u : 0u;
+			constants.lutBT2020 = source.lutBT2020 ? 1u : 0u;
 			curveCB->Update(constants);
 
 			Dispatch(context, shader, curveCB->CB(), { source.gradingLUT, source.adaptation }, { workingSet.curveUAV.Get() }, true, 1, 1);

@@ -389,6 +389,7 @@ namespace NeuralRendering
 			if (grading && grading->enabled && grading->texLUT && grading->lutValid) {
 				const auto& cb = grading->bakedColorCBData;
 				source.gradingLUT = grading->texLUT->srv.get();
+				source.lutBT2020 = grading->LUTIsBT2020();  // (44a)
 				source.inputGamma = cb.saturationHueInOutGamma.z;
 				source.outputGamma = cb.saturationHueInOutGamma.w;
 				source.cinematicBrightness = cb.cinematic.y;

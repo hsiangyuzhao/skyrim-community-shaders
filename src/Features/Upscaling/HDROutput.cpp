@@ -7,7 +7,9 @@
 #include "Features/Upscaling.h"
 #include "State.h"
 #include "Util.h"
+#include "Features/HDROutputFeature.h"
 #include "Utils/DisplayHDRInfo.h"
+#include "Utils/FileSystem.h"
 #include "Utils/GpuTimers.h"
 
 namespace HDROutput
@@ -30,7 +32,7 @@ namespace HDROutput
 			float sceneIsSDR;
 			uint compositeMode;
 			uint useOverlay;
-			uint pad0;
+			uint sceneBT2020;  // (44a) the scene is already BT.2020 (Color Grading HDR output)
 			uint pad1;
 		};
 		static_assert(sizeof(OutputCB) % 16 == 0);
@@ -125,6 +127,19 @@ namespace HDROutput
 		uint32_t g_lastDLSSGStatus = 0;
 		bool g_dlssGRejectedHDR = false;
 
+		// (44a) settings, migration, display format
+		Settings g_settings;
+		nlohmann::json g_legacyJson;  // 43b Upscaling.hdrOutput, until taken
+		bool g_legacySettingsPending = false;
+		bool g_legacyCurvePending = false;
+		bool g_tenBitWanted = false;          // what WantsTenBitSwapChain decided at startup
+		std::string g_tenBitDecision = "not decided";
+		std::string g_tenBitFallbackReason;  // non-empty: the on-disk fallback marker's reason
+		bool g_tenBitFallbackLoaded = false;
+		bool g_sceneBT2020 = false;          // this frame: Color Grading wrote the scene in BT.2020
+		bool g_lastSceneBT2020 = false;      // the previous frame's value (status / F12)
+		ID3D11UnorderedAccessView* g_nisTargetUAV = nullptr;  // where FinishNIS writes back
+
 		// diagnostics
 		uint64_t g_redirectConfirmed = 0;
 		uint64_t g_redirectUnconfirmed = 0;
@@ -132,11 +147,6 @@ namespace HDROutput
 		bool g_loggedUnconfirmed = false;
 		float g_lastPeakNits = kPeakFallback;
 		const char* g_lastPeakSource = "fallback";
-
-		Settings& GetSettings()
-		{
-			return globals::features::upscaling.settings.hdrOutput;
-		}
 
 		DX12SwapChain& SwapChain()
 		{
@@ -198,7 +208,7 @@ namespace HDROutput
 		ID3D11ComputeShader* GetShader(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const char* a_define, const char* a_entry)
 		{
 			if (!a_shader) {
-				if (auto raw = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\Upscaling\\HDR\\HDROutputCS.hlsl", { { a_define, "" } }, "cs_5_0", a_entry)))
+				if (auto raw = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\HDROutput\\HDROutputCS.hlsl", { { a_define, "" } }, "cs_5_0", a_entry)))
 					a_shader.attach(raw);
 				else
 					logger::error("[HDR] Failed to compile HDROutputCS.hlsl ({})", a_entry);
@@ -244,7 +254,7 @@ namespace HDROutput
 			context->CSSetShader(nullptr, nullptr, 0);
 		}
 
-		OutputCB MakeCB(const Levels& a_levels, bool a_sceneIsSDR, uint a_compositeMode = 0, bool a_useOverlay = false)
+		OutputCB MakeCB(const Levels& a_levels, bool a_sceneIsSDR, uint a_compositeMode = 0, bool a_useOverlay = false, bool a_sceneBT2020 = false)
 		{
 			OutputCB data{};
 			data.paperWhiteNits = a_levels.paperWhiteNits;
@@ -253,7 +263,14 @@ namespace HDROutput
 			data.sceneIsSDR = a_sceneIsSDR ? 1.0f : 0.0f;
 			data.compositeMode = a_compositeMode;
 			data.useOverlay = a_useOverlay ? 1u : 0u;
+			data.sceneBT2020 = a_sceneBT2020 ? 1u : 0u;
 			return data;
+		}
+
+		/// (44a) This frame's scene was graded to BT.2020 (only ever for an HDR scene).
+		bool SceneIsBT2020()
+		{
+			return g_sceneBT2020 && g_frame.sceneHDR;
 		}
 
 		/// The scene as plain SDR into the back buffer (menus, HDR off in an HDR session).
@@ -265,7 +282,8 @@ namespace HDROutput
 			if (!g_scene || !backBuffer || !backBuffer->uav || !shader || !EnsureCB())
 				return;
 			Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::HDROutput);
-			Dispatch(shader, { g_scene->srv.get() }, backBuffer->uav, sc.swapChainDesc.Width, sc.swapChainDesc.Height, MakeCB(ResolveLevels(), true));
+			// (44a) A BT.2020 scene that ends up shown as SDR goes back to BT.709 first.
+			Dispatch(shader, { g_scene->srv.get() }, backBuffer->uav, sc.swapChainDesc.Width, sc.swapChainDesc.Height, MakeCB(ResolveLevels(), true, 0, false, SceneIsBT2020()));
 			Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::HDROutput);
 			g_frame.resolved = true;
 		}
@@ -278,7 +296,7 @@ namespace HDROutput
 			if (!g_scene || !a_target || !shader || !EnsureCB())
 				return false;
 			Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::HDROutput);
-			Dispatch(shader, { g_scene->srv.get() }, a_target, sc.swapChainDesc.Width, sc.swapChainDesc.Height, MakeCB(ResolveLevels(), a_sceneIsSDR));
+			Dispatch(shader, { g_scene->srv.get() }, a_target, sc.swapChainDesc.Width, sc.swapChainDesc.Height, MakeCB(ResolveLevels(), a_sceneIsSDR, 0, false, SceneIsBT2020()));
 			Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::HDROutput);
 			return true;
 		}
@@ -566,11 +584,131 @@ namespace HDROutput
 		}
 	}
 
+	// ---- settings, migration ---------------------------------------------------------------------
+
+	Settings& GetSettings()
+	{
+		return g_settings;
+	}
+
+	void StashLegacyUpscalingJson(const nlohmann::json& a_upscalingJson)
+	{
+		if (!a_upscalingJson.is_object() || !a_upscalingJson.contains("hdrOutput") || !a_upscalingJson["hdrOutput"].is_object())
+			return;
+		g_legacyJson = a_upscalingJson["hdrOutput"];
+		g_legacySettingsPending = true;
+		g_legacyCurvePending = true;
+	}
+
+	bool TakeLegacySettings(Settings& o_settings)
+	{
+		if (!g_legacySettingsPending)
+			return false;
+		g_legacySettingsPending = false;
+		try {
+			o_settings = g_legacyJson;  // unknown keys (toneCurve, rolloffStart) are ignored here
+			logger::info("[HDR] Settings migrated from Upscaling > HDR Output (43b)");
+			return true;
+		} catch (const std::exception& e) {
+			logger::warn("[HDR] Could not migrate the 43b HDR settings: {}", e.what());
+			return false;
+		}
+	}
+
+	bool TakeLegacyCurve(uint& o_toneCurve, float& o_rolloffStart)
+	{
+		if (!g_legacyCurvePending)
+			return false;
+		g_legacyCurvePending = false;
+		o_toneCurve = g_legacyJson.value("toneCurve", 1u);
+		o_rolloffStart = g_legacyJson.value("rolloffStart", 0.6f);
+		return true;
+	}
+
+	void ClearLegacy()
+	{
+		// The curve part stays until Color Grading has loaded (it may load later than this).
+		g_legacySettingsPending = false;
+	}
+
+	namespace
+	{
+		std::filesystem::path FallbackMarkerPath()
+		{
+			return Util::PathHelpers::GetSettingsUserPath().parent_path() / "HDROutputFormatFallback.txt";
+		}
+
+		void LoadFallbackMarker()
+		{
+			if (g_tenBitFallbackLoaded)
+				return;
+			g_tenBitFallbackLoaded = true;
+			std::error_code ec;
+			const auto path = FallbackMarkerPath();
+			if (!std::filesystem::exists(path, ec))
+				return;
+			std::ifstream file(path);
+			std::getline(file, g_tenBitFallbackReason);
+			if (g_tenBitFallbackReason.empty())
+				g_tenBitFallbackReason = "unknown";
+		}
+
+		void ClearFallbackMarker()
+		{
+			std::error_code ec;
+			std::filesystem::remove(FallbackMarkerPath(), ec);
+			g_tenBitFallbackReason.clear();
+		}
+	}
+
+	void NoteTenBitFailure(const char* a_reason)
+	{
+		LoadFallbackMarker();
+		if (!g_tenBitFallbackReason.empty())
+			return;
+		g_tenBitFallbackReason = a_reason ? a_reason : "unknown";
+		logger::warn("[HDR] 10-bit display format failed ({}); the next start uses 8-bit (HDR Output > Retry 10-bit to undo)", g_tenBitFallbackReason);
+		std::error_code ec;
+		std::filesystem::create_directories(FallbackMarkerPath().parent_path(), ec);
+		std::ofstream file(FallbackMarkerPath(), std::ios::trunc);
+		file << g_tenBitFallbackReason << "\n";
+	}
+
 	// ---- startup ---------------------------------------------------------------------------------------
 
-	bool WantsTenBitSwapChain()
+	bool WantsTenBitSwapChain(HWND a_window)
 	{
-		return !globals::game::isVR && GetSettings().enabled;
+		const auto& s = GetSettings();
+		g_tenBitWanted = false;
+		if (globals::game::isVR) {
+			g_tenBitDecision = "8-bit: VR";
+			return false;
+		}
+		if (!globals::features::hdrOutput.loaded) {
+			g_tenBitDecision = "8-bit: the HDR Output feature is not loaded";
+			return false;
+		}
+		if (s.displayFormat == 1) {
+			g_tenBitWanted = s.enabled;
+			g_tenBitDecision = s.enabled ? "10-bit: Display format 8-bit (legacy) with HDR saved on" : "8-bit: Display format 8-bit (legacy), HDR off";
+			return g_tenBitWanted;
+		}
+		LoadFallbackMarker();
+		if (!g_tenBitFallbackReason.empty()) {
+			g_tenBitDecision = std::format("8-bit: automatic fallback after a failure ({})", g_tenBitFallbackReason);
+			return false;
+		}
+		const auto cap = DisplayHDRInfo::QueryCapability(a_window);
+		logger::info("[HDR] Display format Auto: {}", cap.known ? cap.detail : ("not known: " + cap.detail));
+		if (!cap.known && s.enabled) {
+			// Could not read the display: trust the saved HDR choice.
+			g_tenBitWanted = true;
+			g_tenBitDecision = "10-bit: Auto, display not readable, HDR saved on";
+		} else {
+			g_tenBitWanted = cap.known && cap.hdrCapable;
+			g_tenBitDecision = g_tenBitWanted ? "10-bit: Auto, the display is HDR-capable" : "8-bit: Auto, the display does not report HDR";
+		}
+		return g_tenBitWanted;
 	}
 
 	void OnSwapChainCreated()
@@ -579,8 +717,10 @@ namespace HDROutput
 		g_chainFormat = sc.swapChainDesc.Format;
 		g_session = g_chainFormat == DXGI_FORMAT_R10G10B10A2_UNORM;
 		g_colorSpaceChainLatched = std::min(GetSettings().colorSpaceChain, 2u);
-		logger::info("[HDR] Swap chain format {} -> native HDR output {} for this session", static_cast<uint32_t>(g_chainFormat),
-			g_session ? "available" : "not available (HDR was off at startup)");
+		if (g_tenBitWanted && !g_session)
+			NoteTenBitFailure("the 10-bit swap chain could not be created");
+		logger::info("[HDR] Swap chain format {} -> 10-bit session {} ({})", static_cast<uint32_t>(g_chainFormat),
+			g_session ? "yes, HDR switches live" : "no", g_tenBitDecision);
 		if (g_session && WantsOutput()) {
 			g_lastWanted = true;
 			g_outputActive = ApplyColorSpace(true);
@@ -664,6 +804,10 @@ namespace HDROutput
 	{
 		if (!g_session || !g_scene || g_frame.redirected)
 			return;
+		// (44a) HDR off: the lean path. The game draws into the 10-bit back buffer exactly as it
+		// would into an 8-bit one; nothing of ours runs this frame.
+		if (!g_outputActive && GetSettings().sdrPath == 0)
+			return;
 
 		g_frame.sceneHDR = WantsSceneHDR();
 
@@ -722,16 +866,32 @@ namespace HDROutput
 		g_savedFramebufferRTV = nullptr;
 	}
 
-	float4 GetColorGradingParams()
+	SceneLevels GetDisplayLevels()
+	{
+		SceneLevels out;
+		const auto levels = ResolveLevels();
+		out.peakRel = levels.peakRel;
+		out.peakNits = levels.peakNits;
+		out.paperWhiteNits = levels.paperWhiteNits;
+		const auto& ll = globals::features::linearLighting;
+		out.displayGamma = !(ll.loaded && ll.settings.enableLinearLighting && ll.settings.enableGammaCorrection);
+		out.hdr = IsOutputActive();
+		return out;
+	}
+
+	SceneLevels GetSceneLevels()
 	{
 		if (!g_frame.redirected || !g_frame.sceneHDR)
-			return { 0.0f, 0.0f, 0.0f, 0.0f };
-		const auto& s = GetSettings();
-		const auto levels = ResolveLevels();
-		const auto& ll = globals::features::linearLighting;
-		const bool displayLinear = ll.loaded && ll.settings.enableLinearLighting && ll.settings.enableGammaCorrection;
-		const float mode = s.toneCurve == 2 ? 2.0f : 1.0f;
-		return { mode, levels.peakRel, std::clamp(s.rolloffStart, 0.3f, 0.9f), displayLinear ? 0.0f : 1.0f };
+			return {};
+		auto out = GetDisplayLevels();
+		out.hdr = true;
+		return out;
+	}
+
+	void NoteSceneBT2020()
+	{
+		if (g_frame.redirected && g_frame.sceneHDR)
+			g_sceneBT2020 = true;
 	}
 
 	bool IsSceneHDRThisFrame()
@@ -791,29 +951,58 @@ namespace HDROutput
 	bool PrepareNISInput(ID3D11Resource* a_bound, ID3D11UnorderedAccessView* a_nisInput, bool& a_linear)
 	{
 		a_linear = false;
-		if (!g_session || !g_scene || !a_nisInput || a_bound != g_scene->resource.get())
+		g_nisTargetUAV = nullptr;
+		if (!g_session || !a_nisInput || !a_bound)
 			return false;
-		a_linear = IsSceneHDRThisFrame();
-		if (a_linear && GetSettings().nisMode == 0)
-			return false;  // "Sharpening in HDR: Off"
+		ID3D11ShaderResourceView* source = nullptr;
+		uint32_t width = 0, height = 0;
+		if (g_scene && a_bound == g_scene->resource.get()) {
+			a_linear = IsSceneHDRThisFrame();
+			if (a_linear && GetSettings().nisMode == 0)
+				return false;  // "Sharpening in HDR: Off"
+			source = g_scene->srv.get();
+			g_nisTargetUAV = g_scene->uav.get();
+			width = g_scene->desc.Width;
+			height = g_scene->desc.Height;
+		} else if (auto* backBuffer = SwapChain().swapChainBufferWrapped.get(); backBuffer && a_bound == backBuffer->resource11 && backBuffer->srv && backBuffer->uav) {
+			// (44a) Lean SDR path: the image is the 10-bit back buffer itself (not copyable into the
+			// R11G11B10 sharpener input); plain SDR copy in and out.
+			source = backBuffer->srv;
+			g_nisTargetUAV = backBuffer->uav;
+			width = SwapChain().swapChainDesc.Width;
+			height = SwapChain().swapChainDesc.Height;
+		} else {
+			return false;
+		}
 		auto* shader = a_linear ? GetShader(g_nisDecodeCS, "NIS_DECODE", "CSGammaToLinear") : GetShader(g_resolveCS, "RESOLVE_SDR", "CSResolveSDR");
-		if (!shader || !EnsureCB())
+		if (!shader || !EnsureCB()) {
+			g_nisTargetUAV = nullptr;
 			return false;
+		}
 		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::HDROutput);
-		Dispatch(shader, { g_scene->srv.get() }, a_nisInput, g_scene->desc.Width, g_scene->desc.Height, MakeCB(ResolveLevels(), true));
+		Dispatch(shader, { source }, a_nisInput, width, height, MakeCB(ResolveLevels(), true));
 		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::HDROutput);
 		return true;
 	}
 
 	void FinishNIS(ID3D11ShaderResourceView* a_nisOutput, bool a_linear)
 	{
-		if (!g_scene || !a_nisOutput)
+		auto* target = g_nisTargetUAV;
+		g_nisTargetUAV = nullptr;
+		if (!target || !a_nisOutput)
 			return;
 		auto* shader = a_linear ? GetShader(g_nisEncodeCS, "NIS_ENCODE", "CSLinearToGamma") : GetShader(g_resolveCS, "RESOLVE_SDR", "CSResolveSDR");
 		if (!shader || !EnsureCB())
 			return;
+		ID3D11Resource* resource = nullptr;
+		target->GetResource(&resource);
+		D3D11_TEXTURE2D_DESC desc{};
+		if (resource) {
+			static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
+			resource->Release();
+		}
 		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::HDROutput);
-		Dispatch(shader, { a_nisOutput }, g_scene->uav.get(), g_scene->desc.Width, g_scene->desc.Height, MakeCB(ResolveLevels(), true));
+		Dispatch(shader, { a_nisOutput }, target, desc.Width, desc.Height, MakeCB(ResolveLevels(), true));
 		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::HDROutput);
 		globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
 	}
@@ -821,8 +1010,14 @@ namespace HDROutput
 	void NoteDLSSGStatus(uint32_t a_status)
 	{
 		g_lastDLSSGStatus = a_status;
-		if (a_status & (1u << 2))
+		if (a_status & (1u << 2)) {
 			g_dlssGRejectedHDR = true;
+			// (44a) Refused while HDR is off: the 10-bit chain itself is the problem (the default the
+			// user did not ask for), so the next start goes back to 8-bit. Refused with HDR on is the
+			// 43b situation and only reported.
+			if (g_session && !g_outputActive && GetSettings().displayFormat == 0)
+				NoteTenBitFailure("DLSS-G refused the 10-bit format (eFailHDRFormatNotSupported)");
+		}
 	}
 
 	void OnUIStartAfterHUDLess()
@@ -912,7 +1107,7 @@ namespace HDROutput
 		if (separated) {
 			// Scene (HDR) + game UI layer + what Present-hook mods drew into the cleared back buffer.
 			Dispatch(shader, { g_scene->srv.get(), g_uiLayer->srv.get(), backBuffer->srv }, output->uav,
-				sc.swapChainDesc.Width, sc.swapChainDesc.Height, MakeCB(ResolveLevels(), false, 1, true));
+				sc.swapChainDesc.Width, sc.swapChainDesc.Height, MakeCB(ResolveLevels(), false, 1, true, SceneIsBT2020()));
 		} else {
 			// Everything already in the back buffer as SDR: shown at paper white.
 			Dispatch(shader, { backBuffer->srv }, output->uav, sc.swapChainDesc.Width, sc.swapChainDesc.Height, MakeCB(ResolveLevels(), true, 0));
@@ -930,6 +1125,8 @@ namespace HDROutput
 		// Normally done by CompositeForPresent; never leave the frame-buffer slot on the UI layer.
 		RestoreUIRedirect();
 		g_frame = {};
+		g_lastSceneBT2020 = g_sceneBT2020;
+		g_sceneBT2020 = false;
 
 		// Colour-space changes land between frames, so the next frame is produced for the new one.
 		const bool wanted = WantsOutput();
@@ -973,8 +1170,8 @@ namespace HDROutput
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::TextUnformatted("Real HDR10 for an HDR monitor: highlights (sun, sky, fire, metal glints) go brighter than white,");
 			ImGui::TextUnformatted("the rest of the picture stays as you tuned it. Needs Windows HDR on, and NVIDIA RTX HDR / Windows Auto HDR off.");
-			ImGui::TextUnformatted("The first time it is turned on the game must be restarted (the display format changes to 10-bit).");
-			ImGui::TextUnformatted("After that it switches instantly, so it works with A/B Compare.");
+			ImGui::TextUnformatted("With Display Format = Auto the display is already 10-bit, so this switches instantly (and with A/B Compare).");
+			ImGui::TextUnformatted("The tone curve in HDR is set in Post Processing > Color Grading and Tone Mapping (HDR Mode).");
 		}
 
 		if (globals::game::isVR) {
@@ -982,15 +1179,45 @@ namespace HDROutput
 		} else if (!dlssGPath) {
 			ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Needs Frame Generation backend = DLSS-G (the D3D12 path). Not active this session.");
 		} else if (s.enabled && !g_session) {
-			ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Restart the game to switch the display to 10-bit HDR10.");
+			ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "The display is 8-bit this session (%s). Restart to switch it to 10-bit.", g_tenBitDecision.c_str());
 		} else if (!s.enabled && g_session) {
-			ImGui::TextDisabled("Off. The display stays 10-bit until the next restart (the picture is SDR).");
+			ImGui::TextDisabled("Off: SDR on the 10-bit display chain (switches on instantly).");
 		} else if (s.enabled && display.valid && !display.windowsHDR) {
 			ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Windows HDR is off for this monitor: turn it on in Windows display settings.");
 		} else if (s.enabled && g_colorSpaceFailed) {
 			ImGui::TextColored({ 1.0f, 0.4f, 0.4f, 1.0f }, "The swap chain refused the HDR10 colour space (see the log). Showing SDR.");
 		} else if (IsOutputActive()) {
 			ImGui::TextColored({ 0.5f, 1.0f, 0.5f, 1.0f }, "HDR10 output active.");
+		}
+
+		// (44a) Display format (restart).
+		{
+			const char* formats[] = { "Auto (10-bit on an HDR display)", "8-bit (legacy, HDR needs a restart)" };
+			int format = s.displayFormat == 1 ? 1 : 0;
+			if (ImGui::Combo("Display Format (restart)", &format, formats, IM_ARRAYSIZE(formats)))
+				s.displayFormat = static_cast<uint>(format);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Auto: whenever Windows says the monitor can do HDR, the game's display chain is 10-bit (HDR10's format),");
+				ImGui::TextUnformatted("so HDR can be switched on and off at any time. With HDR off it looks the same as 8-bit, gradients slightly finer.");
+				ImGui::TextUnformatted("8-bit (legacy): the game's own format, as before 44a; HDR then takes a restart to turn on.");
+				ImGui::TextUnformatted("If the 10-bit chain or DLSS-G fails, the next start goes back to 8-bit by itself (shown below).");
+			}
+			ImGui::TextDisabled("This session: %s", g_tenBitDecision.c_str());
+			LoadFallbackMarker();
+			if (!g_tenBitFallbackReason.empty() && s.displayFormat == 0) {
+				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Auto fell back to 8-bit: %s", g_tenBitFallbackReason.c_str());
+				if (ImGui::SmallButton("Retry 10-bit (next start)"))
+					ClearFallbackMarker();
+			}
+		}
+
+		const char* sdrPaths[] = { "Lean (nothing extra runs)", "As 43b (fp16 scene + SDR copy)" };
+		int sdrPath = s.sdrPath == 1 ? 1 : 0;
+		if (ImGui::Combo("HDR Off Path", &sdrPath, sdrPaths, IM_ARRAYSIZE(sdrPaths)))
+			s.sdrPath = static_cast<uint>(sdrPath);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Only matters on the 10-bit display with HDR off. Lean: the game draws straight to the screen as in 8-bit.");
+			ImGui::TextUnformatted("As 43b: the frame goes through the HDR scene target and is copied out as SDR (the path you tested in 43b). For A/B only.");
 		}
 
 		ImGui::BeginDisabled(!s.enabled);
@@ -1036,16 +1263,6 @@ namespace HDROutput
 			ImGui::TextUnformatted("This corrects it while the HUD is drawn. Only matters with HDR on.");
 		}
 
-		const char* curves[] = { "Extend my tone mapper (keeps the SDR look)", "GT7 HDR curve" };
-		int curve = s.toneCurve == 2 ? 1 : 0;
-		if (ImGui::Combo("HDR Tone Curve", &curve, curves, IM_ARRAYSIZE(curves)))
-			s.toneCurve = curve == 1 ? 2u : 1u;
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Extend: the tone mapper chosen in Post Processing > Color Grading stays; only highlights above the roll-off");
-			ImGui::TextUnformatted("start are allowed to go brighter, smoothly up to the peak.");
-			ImGui::TextUnformatted("GT7: Gran Turismo 7's own HDR curve replaces the selected tone mapper (darker mid-tones unless you re-tune exposure).");
-		}
-
 		const char* nisModes[] = { "Off", "Linear mode" };
 		int nisMode = s.nisMode == 1 ? 1 : 0;
 		if (ImGui::Combo("Sharpening in HDR", &nisMode, nisModes, IM_ARRAYSIZE(nisModes)))
@@ -1066,18 +1283,13 @@ namespace HDROutput
 		if (s.colorSpaceChain != g_colorSpaceChainLatched && g_session)
 			ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Restart to apply the colour-space choice.");
 
-		ImGui::SliderFloat("Highlight Roll-off Start", &s.rolloffStart, 0.3f, 0.9f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			const auto levels = ResolveLevels();
-			if (s.toneCurve == 2) {
-				ImGui::Text("GT7: the curve stays straight up to this fraction of the peak (now %.0f nits), then bends toward it.", s.rolloffStart * levels.peakNits);
-			} else {
-				ImGui::Text("Extend: everything up to this fraction of SDR white (now %.0f nits) is exactly as in SDR;", s.rolloffStart * levels.paperWhiteNits);
-				ImGui::TextUnformatted("above it highlights bend smoothly up toward the peak. Lower = more highlight punch, higher = closer to SDR.");
-			}
-		}
-
 		ImGui::EndDisabled();
+
+		ImGui::Spacing();
+		ImGui::TextDisabled("Tone curve in HDR (Extend / Native, roll-off): Post Processing > Color Grading and Tone Mapping.");
+
+		// (44a) Moved here from Upscaling: read-only display / swap-chain / HDR status.
+		DisplayHDRInfo::DrawSettings();
 	}
 
 	void DrawStatus()
@@ -1090,7 +1302,7 @@ namespace HDROutput
 		if (g_session) {
 			const auto levels = ResolveLevels();
 			ImGui::Text("Peak %.0f nits (%s), paper white %.0f nits, HUD %.0f nits", levels.peakNits, g_lastPeakSource, levels.paperWhiteNits, levels.hudNits);
-			ImGui::Text("Last frame: %s", PathName(g_lastPath));
+			ImGui::Text("Last frame: %s%s", PathName(g_lastPath), g_lastSceneBT2020 ? ", scene graded in BT.2020" : "");
 			ImGui::Text("Scene in fp16 target: confirmed %llu, not confirmed %llu frames; %zu image-space targets upgraded",
 				g_redirectConfirmed, g_redirectUnconfirmed, g_upgradedTargets.size());
 			ImGui::Text("Mod UI transparency fixes: %llu (%zu blend states seen)", g_blendPatchCount, g_patchedBlends.size());
@@ -1114,6 +1326,11 @@ namespace HDROutput
 		nlohmann::json j = nlohmann::json::object();
 		j["enabled_setting"] = s.enabled;
 		j["session_10bit"] = g_session;
+		j["display_format"] = s.displayFormat == 1 ? "8-bit legacy" : "auto";
+		j["format_decision"] = g_tenBitDecision;
+		j["format_fallback"] = g_tenBitFallbackReason;
+		j["sdr_path"] = s.sdrPath == 1 ? "43b" : "lean";
+		j["scene_bt2020_last"] = g_lastSceneBT2020;
 		j["active"] = IsOutputActive();
 		j["swap_chain_format"] = static_cast<uint32_t>(g_chainFormat);
 		j["color_space"] = g_colorSpaceWhere;
@@ -1124,8 +1341,6 @@ namespace HDROutput
 			j["peak_source"] = g_lastPeakSource;
 			j["paper_white_nits"] = levels.paperWhiteNits;
 			j["hud_nits"] = levels.hudNits;
-			j["tone_curve"] = s.toneCurve == 2 ? "gt7" : "extend";
-			j["rolloff_start"] = s.rolloffStart;
 			j["last_path"] = PathName(g_lastPath);
 			j["scene_confirmed_frames"] = g_redirectConfirmed;
 			j["scene_unconfirmed_frames"] = g_redirectUnconfirmed;
@@ -1144,9 +1359,9 @@ namespace HDROutput
 
 	std::string RestartNote(const std::string& a_key)
 	{
-		if (a_key == "hdrOutput/enabled" && !g_session)
-			return "needs a restart (10-bit display format)";
-		if (a_key == "hdrOutput/colorSpaceChain")
+		if (a_key == "enabled" && !g_session)
+			return "needs a restart (8-bit display this session)";
+		if (a_key == "displayFormat" || a_key == "colorSpaceChain")
 			return "needs a restart";
 		return {};
 	}

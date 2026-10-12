@@ -8,8 +8,12 @@ class WrappedResource;
 /**
  * @brief (batch 43) Native HDR10 output for the D3D12 / DLSS-G presentation path.
  *
- * Settings live in Upscaling::Settings::hdrOutput (Upscaling > HDR Output). Default off; with it
- * off at startup nothing here runs and the swap chain keeps the game's own 8-bit format.
+ * (44a) Settings belong to the standalone "HDR Output" feature (category Display,
+ * HDROutputFeature). The swap chain is 10-bit by default whenever Windows reports an
+ * HDR-capable display ("Display format: Auto"), so HDR switches on and off live; with HDR off
+ * the frame takes the lean path (no redirect, no resolve, no composite). "8-bit (legacy)" keeps
+ * the game's own format and makes HDR need a restart, as in 43b. The tone curve belongs to Post
+ * Processing > Color Grading (per tone mapper "HDR mode"); in HDR it outputs BT.2020.
  *
  * Pipeline (HDR on, gameplay):
  *  1. Main_PostProcessing: the game's frame-buffer slot is pointed at an fp16 texture (hdrScene) for
@@ -28,9 +32,15 @@ namespace HDROutput
 {
 	struct Settings
 	{
-		/// Runtime switch. The 10-bit swap chain it needs is made at startup only when this is on,
-		/// so turning it on for the first time takes a restart.
+		/// Runtime switch. With "Display format: Auto" the chain is already 10-bit on an HDR-capable
+		/// display, so this switches live; with "8-bit (legacy)" turning it on takes a restart.
 		bool enabled = false;
+		/// (44a, restart) 0 = Auto: 10-bit swap chain when Windows reports an HDR-capable display;
+		/// 1 = 8-bit (legacy): the game's own format, 10-bit only when HDR is saved on (43b).
+		uint displayFormat = 0;
+		/// (44a) HDR off in a 10-bit session: 0 = lean (the game draws straight into the back buffer,
+		/// nothing of ours runs), 1 = as 43b (fp16 scene target + SDR resolve).
+		uint sdrPath = 0;
 		/// 0 = auto (the display's reported maximum, 400-1000 nits, 450 if it reports nothing), 1 = manual.
 		uint peakMode = 0;
 		float peakNitsManual = 450.0f;
@@ -38,11 +48,6 @@ namespace HDROutput
 		float paperWhiteNits = 203.0f;
 		/// HUD and menu text brightness during gameplay (43b).
 		float hudNits = 160.0f;
-		/// Where highlight compression starts. Extend mode: fraction of SDR white kept exactly as in
-		/// SDR; GT7 mode: fraction of the peak where GT7's linear section ends.
-		float rolloffStart = 0.6f;
-		/// 1 = extend the selected tone mapper (keeps the SDR look), 2 = GT7 HDR curve.
-		uint toneCurve = 1;
 		/// (43b) Rewrite third-party UI alpha blending so their panels cover the scene in the HUD layer.
 		bool uiBlendFix = true;
 		/// (43b) Paused menus: 0 = whole frame shown as SDR (safe), 1 = UI on its own layer like gameplay.
@@ -57,21 +62,36 @@ namespace HDROutput
 	NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 		Settings,
 		enabled,
+		displayFormat,
+		sdrPath,
 		peakMode,
 		peakNitsManual,
 		paperWhiteNits,
 		hudNits,
-		rolloffStart,
-		toneCurve,
 		uiBlendFix,
 		menuMode,
 		nisMode,
 		colorSpaceChain)
 
+	/// (44a) The settings, owned by the "HDR Output" feature (HDROutputFeature) and stored here.
+	Settings& GetSettings();
+
+	/// (44a) Settings migration from 43b (Upscaling > hdrOutput). Upscaling::LoadSettings hands over
+	/// its raw JSON; the HDR Output feature takes it when it has no settings of its own, and Color
+	/// Grading takes the old tone-curve choice (toneCurve, rolloffStart) when its own JSON has none.
+	void StashLegacyUpscalingJson(const nlohmann::json& a_upscalingJson);
+	bool TakeLegacySettings(Settings& o_settings);
+	bool TakeLegacyCurve(uint& o_toneCurve, float& o_rolloffStart);
+	void ClearLegacy();
+
 	// ---- startup (device / swap-chain creation, render thread) -----------------------------------
 
-	/// Whether the D3D12 swap chain being created should be R10G10B10A2: HDR saved on, DLSS-G path.
-	bool WantsTenBitSwapChain();
+	/// Whether the D3D12 swap chain being created should be R10G10B10A2 (DLSS-G path): "Auto" and
+	/// an HDR-capable display (a_window's monitor), or "8-bit (legacy)" with HDR saved on.
+	bool WantsTenBitSwapChain(HWND a_window);
+	/// (44a) The 10-bit chain could not be used (format not displayable, creation failed, DLSS-G
+	/// refused it): remembered on disk, the next start uses 8-bit until "Retry 10-bit".
+	void NoteTenBitFailure(const char* a_reason);
 	/// After CreateSwapChainForHwnd. Records the chain, sets the initial colour space.
 	void OnSwapChainCreated();
 	/// True for the whole session when the swap chain is 10-bit (HDR was on at startup).
@@ -87,8 +107,22 @@ namespace HDROutput
 	void BeginPostProcessing();
 	void EndPostProcessing();
 
-	/// Color Grading's hdrParams for this frame's scene: zero unless HDR output tone-maps it.
-	float4 GetColorGradingParams();
+	/// (44a) What Color Grading needs for this frame: whether the scene is produced for HDR, and the
+	/// levels. hdr = false: grade as SDR.
+	struct SceneLevels
+	{
+		bool hdr = false;
+		float peakRel = 1.0f;         ///< peak / paper white
+		float peakNits = 0.0f;
+		float paperWhiteNits = 0.0f;
+		bool displayGamma = false;    ///< the chain's output is display gamma (Linear Lighting gamma correction off)
+	};
+	SceneLevels GetSceneLevels();
+	/// (44a) Peak and paper white as they would be used now (read-only display on the Tone Mapping page).
+	SceneLevels GetDisplayLevels();
+	/// (44a) Color Grading wrote this frame's scene in BT.2020 (HDR variant): the output passes then
+	/// leave the scene's primaries alone and convert only the UI / overlays.
+	void NoteSceneBT2020();
 	/// True when this frame's scene is being produced for HDR (DLSS 5, NIS decide from it).
 	bool IsSceneHDRThisFrame();
 	/// True while HDR10 is what the swap chain shows (colour space applied).
@@ -129,10 +163,11 @@ namespace HDROutput
 
 	// ---- UI ------------------------------------------------------------------------------------------
 
+	/// The HDR Output feature page (settings, status, Display / HDR info).
 	void DrawSettings();
-	/// Read-only status for Upscaling > Display / HDR info.
+	/// Read-only status lines.
 	void DrawStatus();
 	nlohmann::json GetMetaJson();
-	/// A/B Compare: restart note for a flattened Upscaling key, empty if none.
+	/// A/B Compare: restart note for a flattened "HDR Output" key, empty if none.
 	std::string RestartNote(const std::string& a_key);
 }

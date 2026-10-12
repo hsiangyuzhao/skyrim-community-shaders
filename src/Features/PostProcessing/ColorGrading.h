@@ -41,6 +41,15 @@ struct ColorGrading : public PostProcessFeature
         };
     };
 
+    /// (44a) Per tone mapper HDR behaviour (Tone Mapping page, "HDR Mode"), keyed by the tone
+    /// mapper's name. mode 0 = Extend (every curve), 1 = Native (tone mappers with an HDR form).
+    struct TonemapHDR
+    {
+        uint mode = 0;
+        float knee = 0.6f;   ///< roll-off start: Extend, fraction of SDR white kept as in SDR; GT7 Native, of the peak
+        uint option = 0;     ///< GT7 Native: 1 = upstream reference brightness
+    };
+
     struct Settings
     {
         bool useToDInterior = false;
@@ -61,6 +70,7 @@ struct ColorGrading : public PostProcessFeature
         int outputColorSpace = 0;
         std::array<float3, 3> colorSpaceTransform = { float3{ 1.0f, 0.0f, 0.0f }, float3{ 0.0f, 1.0f, 0.0f }, float3{ 0.0f, 0.0f, 1.0f } };
         std::array<float3, 3> invColorSpaceTransform = { float3{ 1.0f, 0.0f, 0.0f }, float3{ 0.0f, 1.0f, 0.0f }, float3{ 0.0f, 0.0f, 1.0f } };
+        std::map<std::string, TonemapHDR> tonemapHDR = {};  // (44a)
     } settings;
 
     int tonemapperType = 11;
@@ -105,9 +115,11 @@ struct ColorGrading : public PostProcessFeature
         uint enableTonemap;
         uint enableColorSpaceTransform;
 
-        // (batch 43) Native HDR output: mode (0 SDR, 1 extend tone mapper, 2 GT7 HDR), peak / paper
-        // white, roll-off start, display-gamma chain. All zero while HDR output is off.
+        // (batch 43, 44a) Native HDR output: mode (0 SDR, 1 Extend, 2 Native), peak / paper white,
+        // roll-off start, display-gamma chain. All zero while HDR output is off.
         float4 hdrParams;
+        float4 hdrParams2;             // (44a) x: Native option (GT7 reference), y: BT.2020 output
+        float4 hdrOutputTransform[3];  // (44a) processing -> BT.2020
     };
 	std::unique_ptr<ConstantBuffer> colorCB = nullptr;
 
@@ -156,4 +168,26 @@ struct ColorGrading : public PostProcessFeature
 	virtual ID3D11Texture2D* GetOwnOutputTexture() const override { return (texColor && !saveImagesFlag) ? texColor->resource.get() : nullptr; }
 
     void OutputTextures();
+
+    /// (44a) The HDR behaviour of a tone mapper (stored, or its default: Neutwo Native, others Extend).
+    TonemapHDR GetTonemapHDR(std::string_view a_name) const;
+    /// (44a) The tone mapper has a Native HDR form (Lottes, GT7, Neutwo).
+    static bool HasNativeHDR(std::string_view a_name);
+    /// (44a) True when the last bake was the HDR variant writing BT.2020 (DLSS 5 tone match reads it).
+    bool LUTIsBT2020() const { return lutValid && bakedColorCBData.hdrParams2.y > 0.5f; }
+
+    // (44a) Curve preview: the LUT's neutral diagonal read back while the preview is open.
+    winrt::com_ptr<ID3D11Texture3D> curveStaging = nullptr;
+    bool curveCopyPending = false;
+    bool curvePreviewOpen = false;
+    uint64_t curveCopyFrame = 0;
+    std::array<float, 64> curveValues = {};
+    std::array<float, 64> curveScale = {};
+    bool curveValid = false;
+    bool curveHDR = false;
+    float curvePeakRel = 1.0f;
+    void UpdateCurvePreview();
+    int cachedOutputProcessSpace = -2;
+    std::array<float4, 3> cachedOutputTransform = {};
+    void DrawCurvePreview();
 };

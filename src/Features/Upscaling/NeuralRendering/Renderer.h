@@ -79,6 +79,7 @@ namespace NeuralRendering
 			float adaptationMax = 1e6f;
 			float fixedExposure = 1.0f;
 			bool gammaCorrect = false;  ///< Linear Lighting's final gamma
+			bool lutBT2020 = false;     ///< (44a) the LUT was baked for HDR output: BT.2020 primaries
 		};
 
 		/// (batch 38a) Everything the Batch 38 pass needs for one frame. Colour and guides are given

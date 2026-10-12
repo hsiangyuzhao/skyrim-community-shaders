@@ -35,6 +35,7 @@ struct PerformanceOverlay;
 struct WetnessEffects;
 struct ExtendedTranslucency;
 struct Upscaling;
+struct HDROutputFeature;
 struct PostProcessing;
 struct Skin;
 struct ExponentialHeightFog;
@@ -99,6 +100,7 @@ namespace globals
 		extern WetnessEffects wetnessEffects;
 		extern ExtendedTranslucency extendedTranslucency;
 		extern Upscaling upscaling;
+		extern HDROutputFeature hdrOutput;  // (44a)
 		extern RenderDoc renderDoc;
 		extern PostProcessing postProcessing;
 		extern Skin skin;

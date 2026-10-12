@@ -37,6 +37,17 @@ namespace DisplayHDRInfo
 	};
 	DisplayState GetDisplayState();
 
+	/// (44a) Whether the monitor of a_window (primary if null) can show HDR, read right now (used
+	/// once at swap-chain creation, before the first Tick).
+	struct Capability
+	{
+		bool known = false;
+		bool hdrCapable = false;
+		bool hdrActive = false;
+		std::string detail;
+	};
+	Capability QueryCapability(HWND a_window);
+
 	/// Read-only ImGui section (with a Refresh button).
 	void DrawSettings();
 

@@ -2,6 +2,7 @@
 
 #include "State.h"
 #include "Util.h"
+#include "Features/Upscaling/HDROutput.h"
 
 #include <DDSTextureLoader.h>
 #include <DirectXTex.h>
@@ -21,6 +22,7 @@ void LUT::DrawSettings()
 	ImGui::BulletText("3D LUT in 2D format: N (R) x N (G) sized images, stacked horizontally along blue axis.");
 	ImGui::BulletText("3D LUT: 3D dds only.");
 
+	ImGui::TextDisabled("Bypassed while HDR output is on (an external LUT is an SDR look).");
 	ImGui::InputText("LUT Texture Path", &tempPath);
 
 	if (ImGui::Button("Load"))
@@ -262,6 +264,9 @@ void LUT::CompileComputeShaders()
 void LUT::Draw(TextureInfo& inout_tex)
 {
 	if (LutType == -1)
+		return;
+	// (44a) An external LUT is an SDR, BT.709 look: with HDR output on (BT.2020, above white) it is bypassed.
+	if (HDROutput::IsSceneHDRThisFrame())
 		return;
 
 	auto context = globals::d3d::context;

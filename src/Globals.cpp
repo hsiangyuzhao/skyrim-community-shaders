@@ -10,6 +10,7 @@
 #include "Features/GrassCollision.h"
 #include "Features/GrassLighting.h"
 #include "Features/GrassOptimizations.h"
+#include "Features/HDROutputFeature.h"
 #include "Features/HairSpecular.h"
 #include "Features/IBL.h"
 #include "Features/InteriorSun.h"
@@ -95,6 +96,7 @@ namespace globals
 		WetnessEffects wetnessEffects{};
 		ExtendedTranslucency extendedTranslucency{};
 		Upscaling upscaling{};
+		HDROutputFeature hdrOutput{};
 		RenderDoc renderDoc{};
 		PostProcessing postProcessing{};
 		Skin skin{};
