@@ -3,7 +3,15 @@
 #include "Feature.h"
 
 /**
- * @brief (44a) "Wet Skin": everything about wet skin on characters, in one page (Characters).
+ * @brief (44a) "Wet Skin", (44c) "Character Wetness": everything about wet characters (skin,
+ * hair, gear), in one page (Characters).
+ *
+ * (44c) Hair (New): the hair highlight model gets wet (darker, R lobe narrower and brighter, TRT
+ * weaker, less inter-strand scatter, clumps from strand-space noise), no water film, dry
+ * G-buffer. Gear (New): a soft per-pixel class (cloth / leather / metal from TruePBR metallic or
+ * the env mask and the gloss; fur for back / soft lit gear; optional item-keyword prior), each
+ * class with its own darkening, sheen, roughness floor, drying multiplier and G-buffer gloss cap;
+ * droplets and rivulets on metal and leather (direct light only), wicking on cloth.
  *
  * Two models, chosen at runtime (A/B Compare works):
  *  - New (default): one wetness per character from the manual slider, swimming (full while in
@@ -23,7 +31,10 @@
  */
 struct WetSkin : Feature
 {
-	virtual inline std::string GetName() override { return "Wet Skin"; }
+	// (44c) Renamed from "Wet Skin" (the settings key migrates, see GetLegacySettingsName); the short
+	// name stays, so WetSkin.ini and the disk cache check do not change.
+	virtual inline std::string GetName() override { return "Character Wetness"; }
+	virtual std::string_view GetLegacySettingsName() const override { return "Wet Skin"; }
 	virtual inline std::string GetShortName() override { return "WetSkin"; }
 	virtual std::string_view GetCategory() const override { return "Characters"; }
 	virtual inline bool SupportsVR() override { return true; }
@@ -31,10 +42,10 @@ struct WetSkin : Feature
 	virtual std::pair<std::string, std::vector<std::string>> GetFeatureSummary() override
 	{
 		return {
-			"Wet skin for characters: swimming, rain, sweat and a manual slider, with a soft water sheen, droplets and rivulets.",
-			{ "Strong but soft sheen when soaked, never a mirror",
-				"Droplets and rivulets that follow gravity and stay on the skin",
-				"Wet patches that spread as the skin gets wetter",
+			"Wet characters: skin, hair and gear get wet together from swimming, rain, sweat and a manual slider, and dry at their own pace.",
+			{ "Skin: soft water sheen, droplets and rivulets, never a mirror",
+				"Hair: darker, sharper highlight, clumps",
+				"Gear: cloth darkens and dries slowest, leather shines a little, metal gets beads",
 				"Original (pre-42c) model for A/B comparison" }
 		};
 	}
@@ -89,13 +100,52 @@ struct WetSkin : Feature
 		float StreakLength = 1.0f;
 		float StreakWidth = 1.0f;
 		float StreakContrast = 0.5f;
+
+		// (44c) Hair (New model). Hair Specular on: its Marschner / Kajiya-Kay highlight gets wet;
+		// off: the vanilla highlight. No water film, dry G-buffer.
+		uint32_t HairEnabled = 1;
+		float HairDarkening = 0.8f;
+		float HairSharpness = 0.55f;       // primary highlight width at full wetness (1 = unchanged)
+		float HairHighlightGain = 1.15f;   // primary highlight strength
+		float HairSecondaryLoss = 0.65f;   // TRT (secondary, coloured highlight) x (1 - loss)
+		float HairScatterLoss = 0.25f;     // inter-strand scatter x (1 - loss)
+		float HairClumping = 0.7f;
+		float HairClumpCount = 48.0f;      // clumps across one uv
+		float HairClumpShift = 0.18f;      // how far each clump's highlight moves
+		float HairGapDarkening = 0.35f;
+		float HairDryTime = 1.5f;          // x the skin's hold and dry-off times
+		float HairSweatShare = 0.3f;
+
+		// (44c) Gear (New model): soft per-pixel classes. GearModel 0 = New, 1 = 42c (44b, A/B).
+		uint32_t GearEnabled = 1;
+		uint32_t GearModel = 0;
+		uint32_t GearKeywords = 1;         // (44f) use the worn item's keywords as a prior
+		float GearKeywordTrust = 0.5f;
+		uint32_t DebugClassTint = 0;
+		float GearSheen = 1.0f;            // overall sheen multiplier
+		float GearPatchContrast = 0.25f;
+		float GearWicking = 4.0f;          // game units the water climbs up cloth above the water line
+		float GearSweatShare = 0.3f;
+		float4 GearCloth = { 1.0f, 0.25f, 0.45f, 2.5f };    // darkening, sheen, roughness floor, dry-time multiplier
+		float4 GearLeather = { 0.55f, 0.7f, 0.30f, 1.5f };
+		float4 GearMetal = { 0.0f, 0.6f, 0.25f, 0.5f };
+		float4 GearFur = { 0.7f, 0.15f, 0.50f, 2.0f };
+		float LeatherDroplets = 0.6f;
+		float LeatherRivulets = 0.4f;
+		float MetalDroplets = 1.0f;
+		float MetalRivulets = 0.6f;
 	} settings;
 
 	/// What the shader reads (Skin.hlsli wetSkinParams[6]).
 	struct alignas(16) GPUParams
 	{
 		float4 p[6];
+		float4 c[12];  // (44c) Skin.hlsli wetCharParams[12]: hair and gear
 	};
+
+	/// (44c) The longest drying multiplier of any class (skin = 1): the water line is kept until the
+	/// slowest one is dry.
+	float MaxDryMultiplier() const;
 	GPUParams GetGPUParams() const;
 
 	bool IsOriginal() const { return settings.Model == static_cast<uint32_t>(Model::Original); }

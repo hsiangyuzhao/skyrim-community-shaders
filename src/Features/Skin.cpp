@@ -115,7 +115,7 @@ void Skin::DrawSettings()
 	ImGui::Spacing();
 
 	// (44a) Skin wetness has its own page.
-	ImGui::TextDisabled("Skin wetness (model, extra wetness, sheen, droplets, rivulets): see the Wet Skin page (Characters).");
+	ImGui::TextDisabled("Skin wetness (model, extra wetness, sheen, droplets, rivulets): see the Character Wetness page (Characters).");
 
 	ImGui::SliderFloat("Wetness Fade Out Time", &settings.WetFadeTime, 0.0f, 50.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -356,9 +356,11 @@ void Skin::PruneActorWetStates(uint32_t a_frame)
 		actorWetStates.clear();
 }
 
-float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin)
+float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_wetChar)
 {
 	o_wetSkin = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	o_wetChar = float4(1e6f, 0.0f, 0.0f, 0.0f);
+	lastWetState = nullptr;
 	auto userData = geometry->GetUserData();
 	auto actor = userData ? userData->As<RE::Character>() : nullptr;
 	if (!actor)
@@ -376,7 +378,9 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin)
 	const RE::FormID id = actor->GetFormID();
 	auto it = actorWetStates.find(id);
 	if (it != actorWetStates.end() && it->second.valid && it->second.frame == frame) {
+		lastWetState = &it->second;
 		o_wetSkin = it->second.wetSkin;
+		o_wetChar = it->second.wetChar;
 		return it->second.skin;
 	}
 	if (it == actorWetStates.end()) {
@@ -400,6 +404,10 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin)
 	// who climbed out stays wet up to where the water reached.
 	{
 		const auto& wet = globals::features::wetSkin.settings;
+		const float hold = std::max(wet.HoldTime, 0.0f);
+		const float dry = std::max(wet.DryTime, 1.0f);
+		// (44c) Everything (hair, the slowest gear class) is dry after this.
+		const float allDry = (hold + dry) * globals::features::wetSkin.MaxDryMultiplier();
 		float swim = 0.0f;
 		if (inWater) {
 			state.timeOut = 0.0f;
@@ -407,14 +415,16 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin)
 			swim = 1.0f;
 		} else {
 			state.timeOut = std::min(state.timeOut + dt, 1e6f);
-			const float hold = std::max(wet.HoldTime, 0.0f);
-			const float dry = std::max(wet.DryTime, 1.0f);
 			const float t = std::clamp((state.timeOut - hold) / dry, 0.0f, 1.0f);
 			swim = 1.0f - t * t * (3.0f - 2.0f * t);
-			if (swim <= 0.0f)
+			// (44c) The water line is kept until the slowest class (hair, cloth ...) is dry too.
+			if (state.timeOut >= allDry)
 				state.maxDepth = 0.0f;
 		}
 		state.wetSkin = float4(swim, state.maxDepth, inWater ? 1.0f : 0.0f, 0.0f);
+		// (44c) Hair and gear dry at their own pace: the shader gets the time since leaving the water
+		// (held at "all dry" afterwards, so the constant buffer stops changing).
+		state.wetChar = float4(inWater ? 0.0f : std::min(state.timeOut, allDry + 1.0f), 0.0f, inWater ? 1.0f : 0.0f, 0.0f);
 	}
 
 	// Sweat and the Original model's swim wetness (Advanced Skin's WetFadeTime fade).
@@ -472,8 +482,117 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin)
 	state.skin = wetness;
 	state.valid = true;
 
+	lastWetState = &state;
 	o_wetSkin = state.wetSkin;
+	o_wetChar = state.wetChar;
 	return state.skin;
+}
+
+namespace
+{
+	/// (44f) Item class from an item's keywords: 0 unknown, 1 cloth, 2 leather, 3 metal, 4 fur.
+	/// Material keywords first (leather words before metal words: "ImperialStudded" is studded
+	/// leather), then clothing / jewelry, then light / heavy armour as a weak fallback.
+	uint8_t ClassifyItemKeywords(RE::TESForm* a_item)
+	{
+		if (!a_item)
+			return 0;
+		if (auto weapon = a_item->As<RE::TESObjectWEAP>())
+			return (weapon->IsBow() || weapon->IsCrossbow() || weapon->IsStaff()) ? 2 : 3;  // wood / leather grips; blades
+		auto keywordForm = a_item->As<RE::BGSKeywordForm>();
+		if (!keywordForm)
+			return 0;
+		static constexpr std::array<std::string_view, 12> leatherWords = { "Leather", "Hide", "Studded", "Scaled", "Stormcloak", "Thieves", "Dragonscale", "Forsworn", "Chitin", "Fur", "DarkBrotherhood", "Nightingale" };
+		static constexpr std::array<std::string_view, 16> metalWords = { "Iron", "Steel", "Dwarven", "Orcish", "Ebony", "Daedric", "Dragonplate", "Nordic", "Stalhrim", "Elven", "Glass", "Imperial", "Blades", "Dawnguard", "Falmer", "Bonemold" };
+		uint8_t material = 0;
+		bool clothing = false, jewelry = false, light = false, heavy = false;
+		keywordForm->ForEachKeyword([&](RE::BGSKeyword* a_keyword) {
+			if (!a_keyword)
+				return RE::BSContainer::ForEachResult::kContinue;
+			const std::string_view id = a_keyword->GetFormEditorID() ? a_keyword->GetFormEditorID() : "";
+			if (id.empty())
+				return RE::BSContainer::ForEachResult::kContinue;
+			if (material == 0 && id.find("ArmorMaterial") != std::string_view::npos) {
+				for (const auto word : leatherWords) {
+					if (id.find(word) != std::string_view::npos) {
+						material = 2;
+						break;
+					}
+				}
+				if (material == 0) {
+					for (const auto word : metalWords) {
+						if (id.find(word) != std::string_view::npos) {
+							material = 3;
+							break;
+						}
+					}
+				}
+			} else if (id.find("Clothing") != std::string_view::npos) {
+				clothing = true;
+			} else if (id.find("Jewelry") != std::string_view::npos) {
+				jewelry = true;
+			} else if (id == "ArmorLight") {
+				light = true;
+			} else if (id == "ArmorHeavy") {
+				heavy = true;
+			}
+			return RE::BSContainer::ForEachResult::kContinue;
+		});
+		if (material != 0)
+			return material;
+		if (clothing)
+			return 1;
+		if (jewelry)
+			return 3;
+		if (heavy)
+			return 3;
+		if (light)
+			return 2;
+		// A wig or other hair-slot-only item without any armour keyword: hair-like (fur parameters).
+		if (auto biped = a_item->As<RE::BGSBipedObjectForm>()) {
+			const bool hairSlot = biped->HasPartOf(RE::BGSBipedObjectForm::BipedObjectSlot::kHair) || biped->HasPartOf(RE::BGSBipedObjectForm::BipedObjectSlot::kLongHair);
+			if (hairSlot && !biped->HasPartOf(RE::BGSBipedObjectForm::BipedObjectSlot::kBody))
+				return 4;
+		}
+		return 0;
+	}
+}
+
+uint8_t Skin::GetItemClassPrior(RE::Actor* a_actor, ActorWetState& a_state, const RE::BSGeometry* a_geometry, uint32_t a_frame)
+{
+	if (a_state.itemClassValid && a_frame - a_state.itemClassFrame > 600)
+		a_state.itemClassValid = false;
+	if (a_state.itemClassValid) {
+		if (auto it = a_state.itemClass.find(a_geometry); it != a_state.itemClass.end())
+			return it->second;
+	}
+	// A geometry not seen yet (new equipment, a rebuilt 3D, or one that belongs to no worn item):
+	// rebuild the map, at most every 15 frames per character, and start over every ~10 s so
+	// entries of geometry that no longer exists do not pile up.
+	const uint8_t fallback = a_state.animal ? 4 : 0;
+	if (a_state.itemClassValid && a_frame - a_state.itemClassFrame < 15) {
+		a_state.itemClass.emplace(a_geometry, fallback);
+		return fallback;
+	}
+	a_state.itemClass.clear();
+	a_state.itemClassFrame = a_frame;
+	a_state.itemClassValid = true;
+	const auto race = a_actor->GetRace();
+	a_state.animal = race && race->HasKeywordString("ActorTypeAnimal");
+	if (const auto& biped = a_actor->GetBiped(false)) {
+		for (const auto& object : biped->objects) {
+			if (!object.item || !object.partClone)
+				continue;
+			const uint8_t itemClass = ClassifyItemKeywords(object.item);
+			if (itemClass == 0)
+				continue;
+			RE::BSVisit::TraverseScenegraphGeometries(object.partClone.get(), [&](RE::BSGeometry* a_geom) {
+				a_state.itemClass.emplace(a_geom, itemClass);
+				return RE::BSVisit::BSVisitControl::kContinue;
+			});
+		}
+	}
+	return a_state.itemClass.emplace(a_geometry, static_cast<uint8_t>(a_state.animal ? 4 : 0)).first->second;
 }
 
 struct SkinExtendedRendererState
@@ -708,12 +827,21 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 	if (settings.EnableSkin) {
 		auto geometry = a_pass->geometry;
 		PerGeometryData perGeometryData{};
-		perGeometryData.skinPerGeometry = GetWetness(geometry, perGeometryData.wetSkinPerGeometry);
+		perGeometryData.skinPerGeometry = GetWetness(geometry, perGeometryData.wetSkinPerGeometry, perGeometryData.wetCharPerGeometry);
 		// (44a) Wet Skin settings ride along (they change rarely; the buffer is only rewritten
 		// when something in it changed).
-		const auto params = globals::features::wetSkin.GetGPUParams();
+		const auto& wetSkin = globals::features::wetSkin;
+		const auto params = wetSkin.GetGPUParams();
 		for (int i = 0; i < 6; ++i)
 			perGeometryData.wetSkinParams[i] = params.p[i];
+		for (int i = 0; i < 12; ++i)
+			perGeometryData.wetCharParams[i] = params.c[i];
+		// (44f) Item class prior from the keywords of the worn item this geometry belongs to.
+		if (lastWetState && !wetSkin.IsOriginal() && wetSkin.settings.GearEnabled && wetSkin.settings.GearModel == 0 && wetSkin.settings.GearKeywords) {
+			auto userData = geometry->GetUserData();
+			if (auto actor = userData ? userData->As<RE::Character>() : nullptr)
+				perGeometryData.wetCharPerGeometry.y = static_cast<float>(GetItemClassPrior(actor, *lastWetState, geometry, globals::state->frameCount));
+		}
 
 		if (!perGeometryValid || std::memcmp(currentPerGeometry.data(), &perGeometryData, sizeof(PerGeometryData)) != 0) {
 			std::memcpy(currentPerGeometry.data(), &perGeometryData, sizeof(PerGeometryData));

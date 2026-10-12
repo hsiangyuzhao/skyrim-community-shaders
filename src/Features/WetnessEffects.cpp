@@ -2,6 +2,7 @@
 #include "Menu.h"
 #include "WeatherPicker.h"
 #include "WetSkin.h"
+#include "Skin.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	WetnessEffects::Settings,
@@ -355,40 +356,52 @@ void WetnessEffects::DrawSettings()
 
 	// (42c) Character wetness: skin, hair and everything an actor wears or carries.
 	if (ImGui::TreeNodeEx("Characters", ImGuiTreeNodeFlags_DefaultOpen)) {
-		ImGui::Checkbox("Wet Film Highlight", (bool*)&settings.EnableWetFilm);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			Util::DrawMultiLineTooltip({ "A thin layer of water on top of skin, hair and gear: a soft, clearly visible sheen in sunlight.",
-				"Off: the old wet highlight, which gets smaller and sharper the wetter a character is and is nearly invisible in sun.",
-				"Direct light only; reflections, SSR/SSGI inputs and the G-buffer are not changed." });
-		}
-		ImGui::BeginDisabled(!settings.EnableWetFilm);
-		ImGui::SliderFloat("Film Roughness", &settings.WetFilmRoughness, 0.2f, 0.4f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Lower = smaller, sharper highlight (can sparkle under DLSS). Higher = broader, softer sheen.");
-		ImGui::SliderFloat("Film Strength", &settings.WetFilmStrength, 0.0f, 3.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("1.0 = physically based water. Raise only if you want an exaggerated wet look.");
-		ImGui::EndDisabled();
+		// (44c) Character Wetness New model with the New gear model: skin, hair and gear are all on
+		// that page and these 42c options do nothing; Original turns them off.
+		const auto& charWet = globals::features::wetSkin;
+		const bool charWetActive = charWet.loaded && globals::features::skin.loaded && globals::features::skin.settings.EnableSkin;
+		const bool charWetOwnsAll = charWetActive && !charWet.IsOriginal() && charWet.settings.GearEnabled && charWet.settings.GearModel == 0;
+		if (charWetOwnsAll || (charWetActive && charWet.IsOriginal())) {
+			ImGui::TextDisabled("Characters (skin, hair, gear): see the Character Wetness page (Characters).");
+			if (charWet.IsOriginal())
+				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Character Wetness Model is Original (pre-42c): the 42c character options are off.");
+			ImGui::TreePop();
+		} else {
+			if (charWetActive && !charWet.IsOriginal())
+				ImGui::TextDisabled("Used by gear with Character Wetness > Gear Model 42c. Skin and hair: Character Wetness page.");
+			ImGui::Checkbox("Wet Film Highlight", (bool*)&settings.EnableWetFilm);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				Util::DrawMultiLineTooltip({ "A thin layer of water on top of skin, hair and gear: a soft, clearly visible sheen in sunlight.",
+					"Off: the old wet highlight, which gets smaller and sharper the wetter a character is and is nearly invisible in sun.",
+					"Direct light only; reflections, SSR/SSGI inputs and the G-buffer are not changed." });
+			}
+			ImGui::BeginDisabled(!settings.EnableWetFilm);
+			ImGui::SliderFloat("Film Roughness", &settings.WetFilmRoughness, 0.2f, 0.4f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Lower = smaller, sharper highlight (can sparkle under DLSS). Higher = broader, softer sheen.");
+			ImGui::SliderFloat("Film Strength", &settings.WetFilmStrength, 0.0f, 3.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("1.0 = physically based water. Raise only if you want an exaggerated wet look.");
+			ImGui::EndDisabled();
 
-		ImGui::Checkbox("Wet Darkening", (bool*)&settings.EnableWetDarkening);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			Util::DrawMultiLineTooltip({ "Wet materials get darker and a little more saturated. Applied before lighting, so sun, ambient, SSGI and skin SSS all see it.",
-				"Face and body darken together (no neck seam).",
-				"Off: the old darkening (skin and face never darkened)." });
-		}
-		ImGui::BeginDisabled(!settings.EnableWetDarkening);
-		ImGui::SliderFloat("Porosity: Cloth / Leather", &settings.PorosityCloth, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		ImGui::SliderFloat("Porosity: Metal", &settings.PorosityMetal, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		ImGui::SliderFloat("Porosity: Other (hair, fur)", &settings.PorosityOther, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("How much each material darkens when soaked. 1.0 = a fully absorbent material (about a third darker); 0 = no change.");
-		ImGui::EndDisabled();
+			ImGui::Checkbox("Wet Darkening", (bool*)&settings.EnableWetDarkening);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				Util::DrawMultiLineTooltip({ "Wet materials get darker and a little more saturated. Applied before lighting, so sun, ambient, SSGI and skin SSS all see it.",
+					"Face and body darken together (no neck seam).",
+					"Off: the old darkening (skin and face never darkened)." });
+			}
+			ImGui::BeginDisabled(!settings.EnableWetDarkening);
+			ImGui::SliderFloat("Porosity: Cloth / Leather", &settings.PorosityCloth, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			ImGui::SliderFloat("Porosity: Metal", &settings.PorosityMetal, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			ImGui::SliderFloat("Porosity: Other (hair, fur)", &settings.PorosityOther, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How much each material darkens when soaked. 1.0 = a fully absorbent material (about a third darker); 0 = no change.");
+			ImGui::EndDisabled();
 
-		// (44a) Skin wetness (rain on skin, darkening of skin, the film) is on the Wet Skin page.
-		ImGui::TextDisabled("Skin (rain on skin, skin darkening, sheen, droplets): Wet Skin page (Characters).");
-		if (globals::features::wetSkin.IsOriginal())
-			ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Wet Skin Model is Original (pre-42c): the three options above are off for all characters.");
-		ImGui::TreePop();
+			// (44a) Skin wetness (rain on skin, darkening of skin, the film) is on the Character Wetness page.
+			ImGui::TextDisabled("Skin (rain on skin, skin darkening, sheen, droplets): Character Wetness page (Characters).");
+			ImGui::TreePop();
+		}
 	}
 
 	ImGui::Spacing();

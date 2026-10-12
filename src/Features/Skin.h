@@ -92,6 +92,10 @@ struct Skin : Feature
 		// (44a) Wet Skin: x swim wetness with hold + dry-off (New), y deepest submersion, z in water.
 		float4 wetSkinPerGeometry;
 		float4 wetSkinParams[6];  // WetSkin::GPUParams
+		// (44c) Character Wetness: x s since leaving the water (0 in it), y item class prior of this
+		// geometry (0 unknown, 1 cloth, 2 leather, 3 metal, 4 fur), z in water, w 0.
+		float4 wetCharPerGeometry;
+		float4 wetCharParams[12];  // WetSkin::GPUParams::c
 	};
 
 	/// (44b) Per character (form ID), computed once per frame and shared by every geometry of that
@@ -106,7 +110,18 @@ struct Skin : Feature
 		float4 old{};             // the Original model's sweat and swim fade (Advanced Skin WetFadeTime)
 		float4 skin{};            // skinPerGeometry
 		float4 wetSkin{};         // wetSkinPerGeometry
+		float4 wetChar{};         // (44c) wetCharPerGeometry without the per-geometry prior
+		// (44f) Item class prior per geometry of this character, from the worn items' keywords.
+		std::unordered_map<const RE::BSGeometry*, uint8_t> itemClass;
+		uint32_t itemClassFrame = 0;
+		bool itemClassValid = false;
+		bool animal = false;
 	};
+	/// (44f) Item class prior (0 unknown, 1 cloth, 2 leather, 3 metal, 4 fur) of one geometry of a
+	/// character, from the keywords of the worn item it belongs to (rebuilt on a miss, at most
+	/// every 15 frames; animals are fur).
+	uint8_t GetItemClassPrior(RE::Actor* a_actor, ActorWetState& a_state, const RE::BSGeometry* a_geometry, uint32_t a_frame);
+	ActorWetState* lastWetState = nullptr;  // (44c) the state GetWetness last returned (this draw)
 	static constexpr size_t kMaxActorWetStates = 1024;
 	static constexpr uint32_t kActorWetStaleFrames = 600;
 	std::unordered_map<RE::FormID, ActorWetState> actorWetStates;
@@ -164,7 +179,7 @@ struct Skin : Feature
 
 	SkinData GetCommonBufferData();
 	float GetWaterHeight(const RE::TESObjectREFR* a_ref, const RE::NiPoint3& a_pos);
-	float4 GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin);
+	float4 GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_wetChar);
 
 	void SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, RE::BSTextureSet* inTextureSet, uint32_t i_hashKey);
 	void BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialBase const* material);

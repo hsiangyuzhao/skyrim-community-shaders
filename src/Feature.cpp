@@ -154,6 +154,14 @@ void Feature::Load(json& o_json)
 		}
 	} else {
 		// No errors, load settings now
+		// (44c) A renamed feature: take the settings saved under its old name, once.
+		if (const auto legacyName = GetLegacySettingsName(); !legacyName.empty() && !o_json[GetName()].is_structured()) {
+			const std::string legacyKey(legacyName);
+			if (o_json.contains(legacyKey) && o_json[legacyKey].is_structured()) {
+				logger::info("Loading {} settings from \"{}\"", GetName(), legacyKey);
+				o_json[GetName()] = o_json[legacyKey];
+			}
+		}
 		if (o_json[GetName()].is_structured()) {
 			logger::info("Loading {} settings", GetName());
 			try {
