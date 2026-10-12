@@ -347,104 +347,133 @@ float Skin::GetWaterHeight(const RE::TESObjectREFR* a_ref, const RE::NiPoint3& a
 	return waterHeight;
 }
 
+void Skin::PruneActorWetStates(uint32_t a_frame)
+{
+	// (44b) Drop the characters not drawn for a while first (their state is rebuilt from the game
+	// when they are drawn again); if every entry is recent, start over (upstream 176a00831).
+	std::erase_if(actorWetStates, [a_frame](const auto& a_entry) { return a_frame - a_entry.second.frame > kActorWetStaleFrames; });
+	if (actorWetStates.size() >= kMaxActorWetStates)
+		actorWetStates.clear();
+}
+
 float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin)
 {
-	float4 wetness = float4(0.0f, 0.0f, 0.0f, 0.0f);
 	o_wetSkin = float4(0.0f, 0.0f, 0.0f, 0.0f);
-	if (auto userData = geometry->GetUserData())
-		if (auto actor = userData->As<RE::Character>())
-		{
-			// (44a) Wet Skin New model: in the water = 1; out of it, held for HoldTime, then drying
-			// off over DryTime (smooth). The deepest submersion is kept until the skin is dry, so a
-			// character who climbed out stays wet up to where the water reached.
-			{
-				const auto& wet = globals::features::wetSkin.settings;
-				const bool inWater = actor->IsInWater();
-				float depth = 0.0f;
-				if (inWater)
-					depth = std::max(0.0f, GetWaterHeight(actor->AsReference(), actor->GetPosition()) - actor->GetPositionZ());
-				auto& timer = wetSkinTimers[static_cast<void*>(geometry)];
-				float swim = 0.0f;
-				if (inWater) {
-					timer.timeOut = 0.0f;
-					timer.maxDepth = std::max(timer.maxDepth, depth);
-					swim = 1.0f;
-				} else {
-					timer.timeOut = std::min(timer.timeOut + *globals::game::deltaTime, 1e6f);
-					const float hold = std::max(wet.HoldTime, 0.0f);
-					const float dry = std::max(wet.DryTime, 1.0f);
-					const float t = std::clamp((timer.timeOut - hold) / dry, 0.0f, 1.0f);
-					swim = 1.0f - t * t * (3.0f - 2.0f * t);
-					if (swim <= 0.0f)
-						timer.maxDepth = 0.0f;
-				}
-				o_wetSkin = float4(swim, timer.maxDepth, inWater ? 1.0f : 0.0f, 0.0f);
-			}
-			// uint32_t refid = actor->AsReference()->formID;
-			const float positionZ = actor->GetPositionZ();
-			wetness.z = positionZ;
-			if (settings.UseDynamicWetness && isDynamicWetnessAvailable) {
-				float dynamicWetness = SWE::API::GetFinalWetness(actor);
-				wetness.x = dynamicWetness;
-			} else {
-				const float stamina = actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kStamina);
-				const float permanentStamina = actor->AsActorValueOwner()->GetPermanentActorValue(RE::ActorValue::kStamina);
-				const float temporaryStamina = actor->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kTemporary, RE::ActorValue::kStamina);
-				const float maxStamina = permanentStamina + temporaryStamina;
-				const float staminaPercentage = actor->IsDead() ? 1.0f : (stamina / maxStamina);
-				wetness.x = (staminaPercentage >= settings.StartSweat) ? 0.0f : 
-							(staminaPercentage <= settings.FullSweat) ? 1.0f : 
-							(settings.StartSweat - staminaPercentage) / (settings.StartSweat - settings.FullSweat);
-			}
-			if (actor->IsInWater()) {
-				wetness.y = 2.0f;
-				float waterHeight = GetWaterHeight(actor->AsReference(), actor->GetPosition());
-				wetness.w = std::max(0.0f, waterHeight - positionZ);
-			} else {
-				wetness.y = 0.0f;
-				wetness.w = 0.0f;
-			}
+	auto userData = geometry->GetUserData();
+	auto actor = userData ? userData->As<RE::Character>() : nullptr;
+	if (!actor)
+		return float4(0.0f, 0.0f, 0.0f, 0.0f);
 
-			void* geometryPtr = static_cast<void*>(geometry);
+	// (44b) One state per character (form ID), computed once per frame: skin, hair, every piece of
+	// gear and anything equipped later all read the same wetness and the same drying timers.
+	// Before, each geometry had its own timer (from "dry" for gear put on after leaving the water)
+	// and the timers advanced once per draw, never pruned.
+	const uint32_t frame = globals::state->frameCount;
+	if (frame != wetClockFrame) {
+		wetClockFrame = frame;
+		wetClock += std::max(*globals::game::deltaTime, 0.0f);
+	}
+	const RE::FormID id = actor->GetFormID();
+	auto it = actorWetStates.find(id);
+	if (it != actorWetStates.end() && it->second.valid && it->second.frame == frame) {
+		o_wetSkin = it->second.wetSkin;
+		return it->second.skin;
+	}
+	if (it == actorWetStates.end()) {
+		if (actorWetStates.size() >= kMaxActorWetStates)
+			PruneActorWetStates(frame);
+		it = actorWetStates.emplace(id, ActorWetState{}).first;
+	}
+	auto& state = it->second;
+	// Game time since this character was last updated (paused menus add nothing). A character not
+	// drawn for a while catches up at once.
+	const float dt = state.valid ? std::clamp(static_cast<float>(wetClock - state.clock), 0.0f, 1e6f) : 0.0f;
+	state.clock = wetClock;
+	state.frame = frame;
 
-			if(actorWetnessMap.contains(geometryPtr)) {
-				if (actorWetnessMap[geometryPtr].x < wetness.x) {
-					actorWetnessMap[geometryPtr].x = wetness.x;
-				} else if (actorWetnessMap[geometryPtr].x > wetness.x) {
-					actorWetnessMap[geometryPtr].x -= *globals::game::deltaTime * (1.0f / settings.WetFadeTime);
-					actorWetnessMap[geometryPtr].x = std::max(actorWetnessMap[geometryPtr].x, 0.0f);
-					wetness.x = actorWetnessMap[geometryPtr].x;
-				}
+	const bool inWater = actor->IsInWater();
+	const float positionZ = actor->GetPositionZ();
+	const float depth = inWater ? std::max(0.0f, GetWaterHeight(actor->AsReference(), actor->GetPosition()) - positionZ) : 0.0f;
 
-				if (actorWetnessMap[geometryPtr].y < wetness.y) {
-					actorWetnessMap[geometryPtr].y = wetness.y;
-					if (actorWetnessMap[geometryPtr].w < wetness.w) {
-						actorWetnessMap[geometryPtr].w = wetness.w;
-					} else {
-						wetness.w = actorWetnessMap[geometryPtr].w;
-					}
-				} else if (actorWetnessMap[geometryPtr].y > wetness.y) {
-					actorWetnessMap[geometryPtr].y -= *globals::game::deltaTime * (1.0f / settings.WetFadeTime);
-					actorWetnessMap[geometryPtr].y = std::max(actorWetnessMap[geometryPtr].y, 0.0f);
-					wetness.y = actorWetnessMap[geometryPtr].y;
-					if (wetness.y == 0.0f) {
-						wetness.w = 0.0f;
-						actorWetnessMap[geometryPtr].w = 0.0f;
-					} else if (actorWetnessMap[geometryPtr].w < wetness.w) {
-						actorWetnessMap[geometryPtr].w = wetness.w;
-					} else {
-						wetness.w = actorWetnessMap[geometryPtr].w;
-					}
-				} else if (actorWetnessMap[geometryPtr].w < wetness.w) {
-					actorWetnessMap[geometryPtr].w = wetness.w;
-				} else {
-					wetness.w = actorWetnessMap[geometryPtr].w;
-				}
-			} else {
-				actorWetnessMap.emplace(geometryPtr, wetness);
-			}
+	// (44a) Wet Skin New model: in the water = 1; out of it, held for HoldTime, then drying off over
+	// DryTime (smooth). The deepest submersion is kept until the character is dry, so a character
+	// who climbed out stays wet up to where the water reached.
+	{
+		const auto& wet = globals::features::wetSkin.settings;
+		float swim = 0.0f;
+		if (inWater) {
+			state.timeOut = 0.0f;
+			state.maxDepth = std::max(state.maxDepth, depth);
+			swim = 1.0f;
+		} else {
+			state.timeOut = std::min(state.timeOut + dt, 1e6f);
+			const float hold = std::max(wet.HoldTime, 0.0f);
+			const float dry = std::max(wet.DryTime, 1.0f);
+			const float t = std::clamp((state.timeOut - hold) / dry, 0.0f, 1.0f);
+			swim = 1.0f - t * t * (3.0f - 2.0f * t);
+			if (swim <= 0.0f)
+				state.maxDepth = 0.0f;
 		}
-	return wetness;
+		state.wetSkin = float4(swim, state.maxDepth, inWater ? 1.0f : 0.0f, 0.0f);
+	}
+
+	// Sweat and the Original model's swim wetness (Advanced Skin's WetFadeTime fade).
+	float4 wetness = float4(0.0f, 0.0f, positionZ, 0.0f);
+	if (settings.UseDynamicWetness && isDynamicWetnessAvailable) {
+		wetness.x = SWE::API::GetFinalWetness(actor);
+	} else {
+		const float stamina = actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kStamina);
+		const float permanentStamina = actor->AsActorValueOwner()->GetPermanentActorValue(RE::ActorValue::kStamina);
+		const float temporaryStamina = actor->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kTemporary, RE::ActorValue::kStamina);
+		const float maxStamina = permanentStamina + temporaryStamina;
+		const float staminaPercentage = actor->IsDead() ? 1.0f : (maxStamina > 0.0f ? stamina / maxStamina : 1.0f);
+		wetness.x = (staminaPercentage >= settings.StartSweat) ? 0.0f :
+		            (staminaPercentage <= settings.FullSweat)  ? 1.0f :
+		                                                         (settings.StartSweat - staminaPercentage) / (settings.StartSweat - settings.FullSweat);
+	}
+	wetness.y = inWater ? 2.0f : 0.0f;
+	wetness.w = depth;
+
+	const float fade = dt * (1.0f / std::max(settings.WetFadeTime, 0.01f));
+	if (!state.valid) {
+		state.old = wetness;
+	} else {
+		auto& old = state.old;
+		if (old.x < wetness.x) {
+			old.x = wetness.x;
+		} else if (old.x > wetness.x) {
+			old.x = std::max(old.x - fade, 0.0f);
+			wetness.x = old.x;
+		}
+
+		if (old.y < wetness.y) {
+			old.y = wetness.y;
+			if (old.w < wetness.w)
+				old.w = wetness.w;
+			else
+				wetness.w = old.w;
+		} else if (old.y > wetness.y) {
+			old.y = std::max(old.y - fade, 0.0f);
+			wetness.y = old.y;
+			if (wetness.y == 0.0f) {
+				wetness.w = 0.0f;
+				old.w = 0.0f;
+			} else if (old.w < wetness.w) {
+				old.w = wetness.w;
+			} else {
+				wetness.w = old.w;
+			}
+		} else if (old.w < wetness.w) {
+			old.w = wetness.w;
+		} else {
+			wetness.w = old.w;
+		}
+	}
+	state.skin = wetness;
+	state.valid = true;
+
+	o_wetSkin = state.wetSkin;
+	return state.skin;
 }
 
 struct SkinExtendedRendererState

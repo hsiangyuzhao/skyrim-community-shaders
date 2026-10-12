@@ -94,14 +94,25 @@ struct Skin : Feature
 		float4 wetSkinParams[6];  // WetSkin::GPUParams
 	};
 
-	/// (44a) Wet Skin New model: per geometry, seconds since leaving the water and the deepest
-	/// submersion since entering it.
-	struct WetSkinTimer
+	/// (44b) Per character (form ID), computed once per frame and shared by every geometry of that
+	/// character: skin, hair and gear read the same wetness and drying timers.
+	struct ActorWetState
 	{
-		float timeOut = 1e6f;
-		float maxDepth = 0.0f;
+		uint32_t frame = 0;       // State::frameCount of the last update
+		double clock = 0.0;       // wetClock at the last update
+		bool valid = false;
+		float timeOut = 1e6f;     // (44a) s since leaving the water (New model)
+		float maxDepth = 0.0f;    // (44a) deepest submersion since entering it
+		float4 old{};             // the Original model's sweat and swim fade (Advanced Skin WetFadeTime)
+		float4 skin{};            // skinPerGeometry
+		float4 wetSkin{};         // wetSkinPerGeometry
 	};
-	std::unordered_map<void*, WetSkinTimer> wetSkinTimers;
+	static constexpr size_t kMaxActorWetStates = 1024;
+	static constexpr uint32_t kActorWetStaleFrames = 600;
+	std::unordered_map<RE::FormID, ActorWetState> actorWetStates;
+	double wetClock = 0.0;          // game seconds, advanced once per frame
+	uint32_t wetClockFrame = UINT32_MAX;
+	void PruneActorWetStates(uint32_t a_frame);
 	std::array<float, sizeof(PerGeometryData) / sizeof(float)> currentPerGeometry{};  // last uploaded (raw, avoids padding Skin)
 	bool perGeometryValid = false;
 
@@ -150,7 +161,6 @@ struct Skin : Feature
 
 	eastl::unique_ptr<Texture2D> texSkinDetail = nullptr;
 	std::unordered_map<uint32_t, ExtraTextures> skinExtraTextures;
-	std::unordered_map<void*, float4> actorWetnessMap;
 
 	SkinData GetCommonBufferData();
 	float GetWaterHeight(const RE::TESObjectREFR* a_ref, const RE::NiPoint3& a_pos);

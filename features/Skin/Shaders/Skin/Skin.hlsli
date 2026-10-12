@@ -27,6 +27,27 @@ namespace Skin
 		// (44a) Wet Skin settings (WetSkin.cpp, WetSkin::GPUParams).
 		float4 wetSkinParams[6];
 	};
+
+	// (44a) Wet Skin model: New (1) or Original (0).
+	bool WetSkinNewModel()
+	{
+		return wetSkinParams[0].x > 0.5;
+	}
+
+	/// (44b) Wet Skin New model: one character's wetness without the rain, the same for skin, hair
+	/// and gear: swimming (in the water, then held, then drying off; below the deepest water line
+	/// only), the manual slider and sweat, each weighted, combined as independent layers. Rain is
+	/// added by the caller, where the sky occlusion is known: only the rain is sky-occluded.
+	/// sweat: Advanced Skin's sweat for this pixel (Skin::GetWetness().x).
+	float CharDryWetness(float worldZ, float sweat, out float wSwim, out float wManual, out float wSweat)
+	{
+		const float waterLevel = skinPerGeometry.z + wetSkinPerGeometry.y;
+		const float swim = wetSkinPerGeometry.x * (1.0 - smoothstep(waterLevel - 2.5, waterLevel + 2.5, worldZ));
+		wSwim = saturate(swim * wetSkinParams[0].z);
+		wManual = saturate(wetSkinParams[0].y);
+		wSweat = saturate(sweat * wetSkinParams[1].x);
+		return 1.0 - (1.0 - wSwim) * (1.0 - wManual) * (1.0 - wSweat);
+	}
 #endif
 #if defined(SKIN)
 	Texture2D<float4> TexSkinDetailNormal : register(t72);
@@ -435,11 +456,6 @@ namespace Skin
 	//   [4] x droplet trails, y streak amount, z streak length, w streak width
 	//   [5] x streak contrast, y darkening, z droplet normal strength, w rain droplets
 
-	bool WetSkinNewModel()
-	{
-		return wetSkinParams[0].x > 0.5;
-	}
-
 	float WetHash12(float2 p)
 	{
 		float3 p3 = frac(p.xyx * 0.1031);
@@ -547,34 +563,68 @@ namespace Skin
 			o.dropMask = best;
 		}
 
-		// Rivulets: two value-noise fields stretched along u and along v, weighted by how gravity
-		// runs in uv, so the pattern stays put on the mesh and still runs downhill.
-		const float streakAmount = saturate(wetSkinParams[4].y) * streakDriver * alignment;
-		[branch] if (streakAmount > 0.0)
-		{
-			const float lengthScale = max(wetSkinParams[4].z, 0.1);
-			const float width = clamp(wetSkinParams[4].w, 0.1, 3.0);
-			const float acrossFreq = 2.5 / width;
-			const float alongFreq = 0.25 / lengthScale;
-			const float nV = WetValueNoise(float2(p.x * acrossFreq, p.y * alongFreq) + 31.7);
-			const float nU = WetValueNoise(float2(p.x * alongFreq, p.y * acrossFreq) + 7.3);
-			const float2 g2 = gravityUV * gravityUV;
-			const float n = (nU * g2.x + nV * g2.y) / max(g2.x + g2.y, 1e-4);
-			const float contrast = saturate(wetSkinParams[5].x);
-			const float lines = smoothstep(lerp(0.55, 0.75, contrast), 0.9, n);
-			// Fades out when a streak is narrower than about a pixel (no shimmer under DLSS).
-			const float streakPixels = (1.0 / acrossFreq) / max(footprint, 1e-6);
-			o.streak = lines * streakAmount * smoothstep(1.0, 3.0, streakPixels);
-		}
+		// (44b) Rivulets: WetSkinRivulets (their own scale, not the droplet cells).
 		return o;
 	}
 
-	/// How far the skin darkens toward its soaked colour (0..1): follows the soft coverage, plus a
-	/// little along rivulets and at the droplets' edges (their refractive rim).
+	/// (44b) One family of rivulets running along l, spaced across a; both in rivulet columns (one
+	/// column holds at most one rivulet). aFoot: columns per pixel across. Each column gets a
+	/// randomly placed, slightly meandering line of random width, broken into segments along l.
+	/// The line is widened to at least about a pixel and dimmed by the same factor (its average is
+	/// kept, nothing thinner than a pixel is drawn), so it never sparkles.
+	float WetRivuletField(float a, float l, float aFoot, float lengthScale, float threshold, float seed)
+	{
+		const float s = a + 0.7 * (WetValueNoise(float2(l * 0.12 / lengthScale, a * 0.07 + seed)) - 0.5);
+		const float id = floor(s);
+		const float x = frac(s) - 0.5;
+		const float2 h = WetHash22(float2(id, seed));
+		const float center = (h.x - 0.5) * 0.4;
+		const float halfWidth = 0.13 * lerp(0.7, 1.3, h.y);
+		const float w = max(halfWidth, 0.6 * aFoot);
+		const float profile = (1.0 - smoothstep(0.35 * w, w, abs(x - center))) * (halfWidth / w);
+		const float segment = WetValueNoise(float2(l * 0.25 / lengthScale + h.y * 13.0, id * 1.37 + seed));
+		return profile * smoothstep(threshold, threshold + 0.12, segment) * lerp(0.6, 1.0, h.x);
+	}
+
+	/// (44b) Rivulets for one pixel, 0..1. uv: the skin's wet uv; columnsPerUV: rivulet columns per uv
+	/// (about 3 cm on the body at width 1); uvFootprint: uv per pixel; gravityUV: unit "down" in uv;
+	/// alignment: how far the surface is from facing straight up or down; driver: 0..1 how much
+	/// rivulet-making water there is. Two families (along u, along v) are blended by how gravity runs
+	/// in uv, so the pattern stays put on the mesh and still runs downhill. They fade only when a
+	/// rivulet would be narrower than about a pixel.
+	float WetSkinRivulets(float2 uv, float columnsPerUV, float uvFootprint, float2 gravityUV, float alignment, float driver)
+	{
+		const float amount = saturate(wetSkinParams[4].y) * driver * alignment;
+		float streak = 0.0;
+		[branch] if (amount > 0.0)
+		{
+			const float lengthScale = clamp(wetSkinParams[4].z, 0.1, 4.0);
+			const float width = clamp(wetSkinParams[4].w, 0.1, 3.0);
+			const float2 p = uv * (columnsPerUV / width);
+			const float aFoot = max(uvFootprint * columnsPerUV / width, 1e-6);
+			// Contrast: fewer, crisper rivulets (and, in WetSkinFilm, the film between them a little less wet).
+			const float threshold = lerp(0.48, 0.68, saturate(wetSkinParams[5].x));
+			const float2 g2 = gravityUV * gravityUV;
+			const float wU = g2.x / max(g2.x + g2.y, 1e-4);
+			float lines = 0.0;
+			[branch] if (wU < 0.999)
+				lines += (1.0 - wU) * WetRivuletField(p.x, p.y, aFoot, lengthScale, threshold, 31.7);
+			[branch] if (wU > 0.001)
+				lines += wU * WetRivuletField(p.y, p.x, aFoot, lengthScale, threshold, 7.3);
+			// A rivulet is about 0.26 column wide: fade below about a pixel.
+			const float linePixels = 0.26 / aFoot;
+			streak = saturate(lines) * amount * smoothstep(0.5, 1.2, linePixels);
+		}
+		return streak;
+	}
+
+	/// How far the skin darkens toward its soaked colour (0..1): follows the soft coverage, plus
+	/// (44b) clearly along rivulets (more water standing in the skin's micro-relief) and at the
+	/// droplets' edges (their refractive rim).
 	float WetSkinDarkening(float wetness, float streak, float rim)
 	{
 		const float darkening = clamp(wetSkinParams[5].y, 0.0, 2.0);
-		return saturate(darkening * pow(saturate(wetness), 0.8) + 0.1 * streak * wetness + saturate(wetSkinParams[3].w) * rim);
+		return saturate(darkening * pow(saturate(wetness), 0.8) + 0.8 * streak * saturate(wetness) + saturate(wetSkinParams[3].w) * rim);
 	}
 
 	/// Fills the film fields of SkinSurfaceProperties for the New model: a broad sheen whose
@@ -587,16 +637,19 @@ namespace Skin
 		const float wetness = saturate(skin.Wetness);
 		const float response = pow(wetness, 1.3);
 		const float roughness = max(lerp(wetSkinParams[1].y, wetSkinParams[1].z, response) - 0.04 * streak, 0.2);
-		const float between = 1.0 - 0.25 * saturate(wetSkinParams[5].x) * saturate(wetSkinParams[4].y) * streakDriver;
+		const float between = 1.0 - 0.35 * saturate(wetSkinParams[5].x) * saturate(wetSkinParams[4].y) * streakDriver;
 		const float strength = clamp(wetSkinParams[1].w, 0.0, 2.5);
-		float energy = strength * response * (between + 0.8 * streak);
+		// (44b) Rivulets: a clearly stronger, tighter highlight on the trails (their own roughness on
+		// the direct lobe only, like the beads) and a little more reflection; G-buffer gloss unchanged.
+		float energy = strength * response * (between + 1.5 * streak);
 		energy += 1.5 * dropMask * saturate(wetness * 2.0);
 		skin.WetFilmRoughness = roughness;
 		skin.WetFilmEnergy = max(energy, 0.0);
-		skin.WetDropletMask = dropMask;
-		skin.WetDropletRoughness = 0.1;
+		const float trailMask = 0.6 * saturate(streak) * response;
+		skin.WetDropletMask = max(dropMask, trailMask);
+		skin.WetDropletRoughness = dropMask >= trailMask ? 0.1 : 0.15;
 		skin.WetIndirectRoughness = roughness;
-		skin.WetIndirectEnergy = saturate(response * strength * 0.6);
+		skin.WetIndirectEnergy = saturate(response * strength * 0.6 * between + 0.5 * streak * response);
 	}
 #endif
 
