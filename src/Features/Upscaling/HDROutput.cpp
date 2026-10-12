@@ -106,6 +106,7 @@ namespace HDROutput
 		ID3D11ShaderResourceView* g_savedFramebufferSRV = nullptr;
 		ID3D11RenderTargetView* g_savedFramebufferRTV = nullptr;
 		ID3D11RenderTargetView* g_savedUIFramebufferRTV = nullptr;  // (43b) while the UI layer is the target
+		ID3D11RenderTargetView* g_backBufferRTV = nullptr;  // (43b) the slot's own RTV, last seen
 		D3D11_VIEWPORT g_savedImGuiViewport{};
 		bool g_imGuiRedirected = false;
 
@@ -552,11 +553,12 @@ namespace HDROutput
 		/// (43b) The frame-buffer slot's RTV back to the back buffer, if the UI layer had it.
 		void RestoreUIRedirect()
 		{
-			if (!g_frame.uiRedirected)
-				return;
 			auto& fb = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER];
-			if (g_savedUIFramebufferRTV)
-				fb.RTV = g_savedUIFramebufferRTV;
+			const bool slotOnUILayer = g_uiLayer && fb.RTV == g_uiLayer->rtv.get();
+			if (!g_frame.uiRedirected && !slotOnUILayer)
+				return;
+			if (auto* original = g_savedUIFramebufferRTV ? g_savedUIFramebufferRTV : g_backBufferRTV)
+				fb.RTV = original;
 			g_savedUIFramebufferRTV = nullptr;
 			RestoreUnpatchedBlendState();
 			g_frame.uiRedirected = false;
@@ -838,7 +840,10 @@ namespace HDROutput
 		context->ClearRenderTargetView(g_uiLayer->rtv.get(), clear);
 
 		auto& fb = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER];
-		g_savedUIFramebufferRTV = fb.RTV;
+		if (fb.RTV != g_uiLayer->rtv.get()) {
+			g_savedUIFramebufferRTV = fb.RTV;
+			g_backBufferRTV = fb.RTV;
+		}
 		fb.RTV = g_uiLayer->rtv.get();
 		g_frame.uiRedirected = true;
 		RebindFramebuffer();
@@ -920,9 +925,11 @@ namespace HDROutput
 
 	void AfterPresent()
 	{
-		g_frame = {};
 		if (!g_session)
 			return;
+		// Normally done by CompositeForPresent; never leave the frame-buffer slot on the UI layer.
+		RestoreUIRedirect();
+		g_frame = {};
 
 		// Colour-space changes land between frames, so the next frame is produced for the new one.
 		const bool wanted = WantsOutput();

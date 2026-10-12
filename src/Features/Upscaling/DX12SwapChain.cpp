@@ -202,7 +202,7 @@ void DX12SwapChain::CreateInterop()
 		// above is then the input: the SDR frame, or what Present-hook mods drew).
 		D3D11_TEXTURE2D_DESC outputDesc = texDesc11;
 		outputDesc.Format = swapChainDesc.Format;
-		outputDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		outputDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
 		hdrOutputWrapped = std::make_unique<WrappedResource>(outputDesc, d3d11Device.get(), d3d12Device.get());
 	}
 }
