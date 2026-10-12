@@ -38,6 +38,7 @@ struct Upscaling;
 struct HDROutputFeature;
 struct PostProcessing;
 struct Skin;
+struct WetSkin;
 struct ExponentialHeightFog;
 struct VariableRateShading;
 struct VolumetricShadows;
@@ -104,6 +105,7 @@ namespace globals
 		extern RenderDoc renderDoc;
 		extern PostProcessing postProcessing;
 		extern Skin skin;
+		extern WetSkin wetSkin;  // (44a)
 		extern ExponentialHeightFog exponentialHeightFog;
 		extern VariableRateShading variableRateShading;
 		extern VolumetricShadows volumetricShadows;

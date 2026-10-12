@@ -61,12 +61,9 @@ struct Skin : Feature
 		float SkinDetailStrength = 0.25f;
 		float SkinDetailTiling = 10.0f;
 		float BodyTilingMultiplier = 2.0f;
-		float ExtraSkinWetness = 0.0f;
 		float WetFadeTime = 10.0f;
 		float StartSweat = 0.75f;
 		float FullSweat = 0.15f;
-		float4 WetParams = { 512.0f, 0.7, 10.0, 4.0f };
-		float WetnessFilmStrength = 1.5f;
 		float Translucency = 0.1f;
 		float sssWidth = 0.2f;
 		bool UseSSS = true;
@@ -74,10 +71,8 @@ struct Skin : Feature
 		float FuzzRoughness = 0.35f;
 		float FuzzF0 = 0.045f;
 		bool UseDynamicWetness = false;
-		// (43b) Skin Wetness Coverage: 0 = Advanced Skin noise (original, 42c / 41b exactly),
-		// 1 = Uniform (natural): smooth coverage, no _wet mask, no halving for mask-less skins.
-		uint32_t SkinWetnessCoverage = 1;
-		float WetDropletDetail = 0.15f;  // (43b) Uniform only: fine droplet / rivulet normal detail, 0..1
+		// (44a) Extra wetness, the Perlin wetness parameters, the film strength and the 43b
+		// coverage options moved to the Wet Skin page (WetSkin.h).
 	} settings;
 
 	struct alignas(16) SkinData
@@ -94,7 +89,21 @@ struct Skin : Feature
 	struct alignas(16) PerGeometryData
 	{
 		float4 skinPerGeometry;
+		// (44a) Wet Skin: x swim wetness with hold + dry-off (New), y deepest submersion, z in water.
+		float4 wetSkinPerGeometry;
+		float4 wetSkinParams[6];  // WetSkin::GPUParams
 	};
+
+	/// (44a) Wet Skin New model: per geometry, seconds since leaving the water and the deepest
+	/// submersion since entering it.
+	struct WetSkinTimer
+	{
+		float timeOut = 1e6f;
+		float maxDepth = 0.0f;
+	};
+	std::unordered_map<void*, WetSkinTimer> wetSkinTimers;
+	std::array<float, sizeof(PerGeometryData) / sizeof(float)> currentPerGeometry{};  // last uploaded (raw, avoids padding Skin)
+	bool perGeometryValid = false;
 
 	std::unique_ptr<ConstantBuffer> PerGeometryCB;
 	float4 currentWetness = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -145,7 +154,7 @@ struct Skin : Feature
 
 	SkinData GetCommonBufferData();
 	float GetWaterHeight(const RE::TESObjectREFR* a_ref, const RE::NiPoint3& a_pos);
-	float4 GetWetness(RE::BSGeometry* geometry);
+	float4 GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin);
 
 	void SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, RE::BSTextureSet* inTextureSet, uint32_t i_hashKey);
 	void BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialBase const* material);

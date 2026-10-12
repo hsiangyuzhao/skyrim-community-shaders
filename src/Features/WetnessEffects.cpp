@@ -1,6 +1,7 @@
 #include "WetnessEffects.h"
 #include "Menu.h"
 #include "WeatherPicker.h"
+#include "WetSkin.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	WetnessEffects::Settings,
@@ -361,7 +362,7 @@ void WetnessEffects::DrawSettings()
 				"Direct light only; reflections, SSR/SSGI inputs and the G-buffer are not changed." });
 		}
 		ImGui::BeginDisabled(!settings.EnableWetFilm);
-		ImGui::SliderFloat("Film Roughness", &settings.WetFilmRoughness, 0.08f, 0.4f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		ImGui::SliderFloat("Film Roughness", &settings.WetFilmRoughness, 0.2f, 0.4f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Lower = smaller, sharper highlight (can sparkle under DLSS). Higher = broader, softer sheen.");
 		ImGui::SliderFloat("Film Strength", &settings.WetFilmStrength, 0.0f, 3.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -376,7 +377,6 @@ void WetnessEffects::DrawSettings()
 				"Off: the old darkening (skin and face never darkened)." });
 		}
 		ImGui::BeginDisabled(!settings.EnableWetDarkening);
-		ImGui::SliderFloat("Porosity: Skin", &settings.PorositySkin, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		ImGui::SliderFloat("Porosity: Cloth / Leather", &settings.PorosityCloth, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		ImGui::SliderFloat("Porosity: Metal", &settings.PorosityMetal, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		ImGui::SliderFloat("Porosity: Other (hair, fur)", &settings.PorosityOther, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -384,13 +384,10 @@ void WetnessEffects::DrawSettings()
 			ImGui::Text("How much each material darkens when soaked. 1.0 = a fully absorbent material (about a third darker); 0 = no change.");
 		ImGui::EndDisabled();
 
-		ImGui::Checkbox("Rain Wets Advanced Skin", (bool*)&settings.EnableRainSkinFilm);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			Util::DrawMultiLineTooltip({ "Rain also drives the Advanced Skin water film (its rivulet normals and the softer subsurface glow), not only swimming and sweat.",
-				"Needs Advanced Skin enabled. Off: rain only uses the generic wet highlight on skin." });
-		}
-		// (43b) The skin film's coverage lives with the other skin wetness settings.
-		ImGui::TextDisabled("Skin film coverage (Uniform / original noise) and Droplet Detail: Advanced Skin menu.");
+		// (44a) Skin wetness (rain on skin, darkening of skin, the film) is on the Wet Skin page.
+		ImGui::TextDisabled("Skin (rain on skin, skin darkening, sheen, droplets): Wet Skin page (Characters).");
+		if (globals::features::wetSkin.IsOriginal())
+			ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Wet Skin Model is Original (pre-42c): the three options above are off for all characters.");
 		ImGui::TreePop();
 	}
 
@@ -861,9 +858,17 @@ WetnessEffects::PerFrame WetnessEffects::GetCommonBufferData() const
 
 	// (42c) Keep hand-edited JSON inside the ranges the shader assumes (the 0.05 floor is
 	// the same one the always-on numeric fix uses).
-	data.settings.WetFilmRoughness = std::clamp(settings.WetFilmRoughness, 0.05f, 1.0f);
+	data.settings.WetFilmRoughness = std::clamp(settings.WetFilmRoughness, 0.2f, 1.0f);  // (44a) anti-mirror floor
 	data.settings.WetFilmStrength = std::clamp(settings.WetFilmStrength, 0.0f, 3.0f);
-	data.settings.PorositySkin = std::clamp(settings.PorositySkin, 0.0f, 2.0f);
+	// (44a) Skin darkening comes from Wet Skin; its Original model turns the 42c character
+	// switches off for every character (gear included), as before 42c.
+	const auto& wetSkin = globals::features::wetSkin;
+	data.settings.PorositySkin = std::clamp(wetSkin.settings.Darkening, 0.0f, 2.0f);
+	if (wetSkin.IsOriginal()) {
+		data.settings.EnableWetFilm = 0;
+		data.settings.EnableWetDarkening = 0;
+		data.settings.EnableRainSkinFilm = 0;
+	}
 	data.settings.PorosityCloth = std::clamp(settings.PorosityCloth, 0.0f, 2.0f);
 	data.settings.PorosityMetal = std::clamp(settings.PorosityMetal, 0.0f, 2.0f);
 	data.settings.PorosityOther = std::clamp(settings.PorosityOther, 0.0f, 2.0f);
@@ -883,6 +888,8 @@ void WetnessEffects::Prepass()
 
 void WetnessEffects::LoadSettings(json& o_json)
 {
+	// (44a) Porosity: Skin moved to Wet Skin ("Darkening"), which takes it from here once.
+	WetSkin::StashLegacyWetnessJson(o_json);
     settings = o_json;
 
 	// Auto-detect which preset matches the loaded settings

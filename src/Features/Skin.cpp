@@ -7,6 +7,7 @@
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "Features/WetSkin.h"
 
 #include "DynamicWetness_PublicAPI.h"
 
@@ -27,21 +28,16 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SkinDetailStrength,
 	SkinDetailTiling,
 	BodyTilingMultiplier,
-	ExtraSkinWetness,
 	WetFadeTime,
 	StartSweat,
 	FullSweat,
-	WetParams,
-	WetnessFilmStrength,
 	Translucency,
 	sssWidth,
 	UseSSS,
 	FuzzStrength,
 	FuzzRoughness,
 	FuzzF0,
-	UseDynamicWetness,
-	SkinWetnessCoverage,
-	WetDropletDetail);
+	UseDynamicWetness);
 
 void Skin::DrawSettings()
 {
@@ -118,10 +114,8 @@ void Skin::DrawSettings()
 
 	ImGui::Spacing();
 
-	ImGui::SliderFloat("Extra Skin Wetness", &settings.ExtraSkinWetness, 0.0f, 2.0f, "%.2f");
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Extra wetness for skin adding to wetness feature");
-	}
+	// (44a) Skin wetness has its own page.
+	ImGui::TextDisabled("Skin wetness (model, extra wetness, sheen, droplets, rivulets): see the Wet Skin page (Characters).");
 
 	ImGui::SliderFloat("Wetness Fade Out Time", &settings.WetFadeTime, 0.0f, 50.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -149,38 +143,6 @@ void Skin::DrawSettings()
 			ImGui::Text("Stamina fraction at which sweat reaches full strength.");
 	}
 
-	// (43b) How the wet film covers the skin.
-	{
-		static const char* coverageModes[] = { "Advanced Skin noise (original)", "Uniform (natural)" };
-		int coverage = settings.SkinWetnessCoverage == 0 ? 0 : 1;
-		if (ImGui::Combo("Skin Wetness Coverage", &coverage, coverageModes, IM_ARRAYSIZE(coverageModes)))
-			settings.SkinWetnessCoverage = static_cast<uint32_t>(coverage);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			Util::DrawMultiLineTooltip({ "Uniform (natural): an even, thin film over all wet skin. The same slider value looks the same on every skin mod,",
-				"with or without _wet mask textures (those masks are ignored, and mask-less skins are no longer halved).",
-				"Advanced Skin noise (original): the older wet/dry noise pattern; on some skins it shows as blotches." });
-		}
-		ImGui::BeginDisabled(settings.SkinWetnessCoverage == 0);
-		ImGui::SliderFloat("Droplet / Rivulet Detail", &settings.WetDropletDetail, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			Util::DrawMultiLineTooltip({ "Fine droplets and rivulets on top of the uniform film: they only bend the shine a little.",
-				"They never make dry spots. 0 = perfectly smooth film. Size follows the Perlin Noise Scale below. Uniform only." });
-		}
-		ImGui::EndDisabled();
-	}
-
-	ImGui::SliderFloat("Wetness Perlin Noise Scale", &settings.WetParams.x, 0.0f, 1024.0f, "%1.f");
-	ImGui::BeginDisabled(settings.SkinWetnessCoverage != 0);
-	ImGui::SliderFloat("Wetness Perlin Noise Lacunarity", &settings.WetParams.y, 0.0f, 2.0f, "%.1f");
-	ImGui::SliderFloat("Wetness Perlin Noise Persistence", &settings.WetParams.z, 0.0f, 20.0f, "%.2f");
-	ImGui::SliderFloat("Wetness Normal Scale", &settings.WetParams.w, 0.0f, 20.0f, "%.1f");
-	ImGui::EndDisabled();
-	if (settings.SkinWetnessCoverage != 0)
-		ImGui::TextDisabled("(Lacunarity, Persistence and Normal Scale: original coverage only)");
-	ImGui::SliderFloat("Wetness Film Strength", &settings.WetnessFilmStrength, 0.0f, 3.0f, "%.2f");
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("How visible the wet/sweat film on skin is (shine and darkening), without changing its pattern.");
-	}
 
 	ImGui::Spacing();
 
@@ -317,20 +279,21 @@ Skin::SkinData Skin::GetCommonBufferData()
 {
 	SkinData data{};
 	data.skinParams = float4(settings.SkinMainRoughness, settings.SkinSecondRoughness, settings.SkinSpecularTexMultiplier, float(settings.EnableSkin));
-	data.skinParams2 = float4(settings.SecondarySpecularStrength, settings.ExtraSkinWetness, settings.F0, settings.BaseColorMultiplier);
+	// (44a) The wetness values come from the Wet Skin page.
+	const auto& wet = globals::features::wetSkin.settings;
+	data.skinParams2 = float4(settings.SecondarySpecularStrength, std::clamp(wet.ExtraWetness, 0.0f, 2.0f), settings.F0, settings.BaseColorMultiplier);
 	data.skinDetailParams = float4(settings.SkinDetailTiling, settings.BodyTilingMultiplier, settings.SkinDetailStrength, float(settings.EnableSkinDetail && settings.EnableSkin));
-	// (43b) sssParams.z: Skin Wetness Coverage. >= 0 = Uniform, the value being the droplet
-	// detail; -1 = the original Advanced Skin noise coverage. No layout change.
-	const float wetCoverage = settings.SkinWetnessCoverage != 0 ? std::clamp(settings.WetDropletDetail, 0.0f, 1.0f) : -1.0f;
-	data.sssParams = float4(settings.Translucency, settings.sssWidth, wetCoverage, float(settings.UseSSS));
+	data.sssParams = float4(settings.Translucency, settings.sssWidth, 0.0f, float(settings.UseSSS));
 	data.fuzzParams = float4(settings.FuzzStrength, settings.FuzzRoughness, settings.FuzzF0, settings.ExtraEdgeRoughness);
-	data.physicalParams = float4(settings.PhysicalMainRoughnessMultiplier, settings.PhysicalSecondRoughnessMultiplier, settings.PhysicalSpecularStrength, settings.WetnessFilmStrength);
-	data.wetParams = settings.WetParams;
+	data.physicalParams = float4(settings.PhysicalMainRoughnessMultiplier, settings.PhysicalSecondRoughnessMultiplier, settings.PhysicalSpecularStrength, std::clamp(wet.FilmStrength, 0.0f, 3.0f));
+	data.wetParams = wet.WetParams;
 	return data;
 }
 
 void Skin::LoadSettings(json& o_json)
 {
+	// (44a) The skin wetness options moved to Wet Skin, which takes them from here once.
+	WetSkin::StashLegacySkinJson(o_json);
 	settings = o_json;
 }
 
@@ -384,12 +347,39 @@ float Skin::GetWaterHeight(const RE::TESObjectREFR* a_ref, const RE::NiPoint3& a
 	return waterHeight;
 }
 
-float4 Skin::GetWetness(RE::BSGeometry* geometry)
+float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin)
 {
 	float4 wetness = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	o_wetSkin = float4(0.0f, 0.0f, 0.0f, 0.0f);
 	if (auto userData = geometry->GetUserData())
 		if (auto actor = userData->As<RE::Character>())
 		{
+			// (44a) Wet Skin New model: in the water = 1; out of it, held for HoldTime, then drying
+			// off over DryTime (smooth). The deepest submersion is kept until the skin is dry, so a
+			// character who climbed out stays wet up to where the water reached.
+			{
+				const auto& wet = globals::features::wetSkin.settings;
+				const bool inWater = actor->IsInWater();
+				float depth = 0.0f;
+				if (inWater)
+					depth = std::max(0.0f, GetWaterHeight(actor->AsReference(), actor->GetPosition()) - actor->GetPositionZ());
+				auto& timer = wetSkinTimers[static_cast<void*>(geometry)];
+				float swim = 0.0f;
+				if (inWater) {
+					timer.timeOut = 0.0f;
+					timer.maxDepth = std::max(timer.maxDepth, depth);
+					swim = 1.0f;
+				} else {
+					timer.timeOut = std::min(timer.timeOut + *globals::game::deltaTime, 1e6f);
+					const float hold = std::max(wet.HoldTime, 0.0f);
+					const float dry = std::max(wet.DryTime, 1.0f);
+					const float t = std::clamp((timer.timeOut - hold) / dry, 0.0f, 1.0f);
+					swim = 1.0f - t * t * (3.0f - 2.0f * t);
+					if (swim <= 0.0f)
+						timer.maxDepth = 0.0f;
+				}
+				o_wetSkin = float4(swim, timer.maxDepth, inWater ? 1.0f : 0.0f, 0.0f);
+			}
 			// uint32_t refid = actor->AsReference()->formID;
 			const float positionZ = actor->GetPositionZ();
 			wetness.z = positionZ;
@@ -688,12 +678,18 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 
 	if (settings.EnableSkin) {
 		auto geometry = a_pass->geometry;
-		float4 wetness = GetWetness(geometry);
+		PerGeometryData perGeometryData{};
+		perGeometryData.skinPerGeometry = GetWetness(geometry, perGeometryData.wetSkinPerGeometry);
+		// (44a) Wet Skin settings ride along (they change rarely; the buffer is only rewritten
+		// when something in it changed).
+		const auto params = globals::features::wetSkin.GetGPUParams();
+		for (int i = 0; i < 6; ++i)
+			perGeometryData.wetSkinParams[i] = params.p[i];
 
-		if (currentWetness != wetness) {
-			currentWetness = wetness;
-			PerGeometryData perGeometryData{};
-			perGeometryData.skinPerGeometry = wetness;
+		if (!perGeometryValid || std::memcmp(currentPerGeometry.data(), &perGeometryData, sizeof(PerGeometryData)) != 0) {
+			std::memcpy(currentPerGeometry.data(), &perGeometryData, sizeof(PerGeometryData));
+			perGeometryValid = true;
+			currentWetness = perGeometryData.skinPerGeometry;
 			PerGeometryCB->Update(perGeometryData);
 		}
 

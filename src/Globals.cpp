@@ -28,6 +28,7 @@
 #include "Features/ScreenSpaceRayTracing.h"
 #include "Features/ScreenSpaceShadows.h"
 #include "Features/Skin.h"
+#include "Features/WetSkin.h"
 #include "Features/SkySync.h"
 #include "Features/Skylighting.h"
 #include "Features/SubsurfaceScattering.h"
@@ -100,6 +101,7 @@ namespace globals
 		RenderDoc renderDoc{};
 		PostProcessing postProcessing{};
 		Skin skin{};
+		WetSkin wetSkin{};
 		ExponentialHeightFog exponentialHeightFog{};
 		VariableRateShading variableRateShading{};
 		VolumetricShadows volumetricShadows{};

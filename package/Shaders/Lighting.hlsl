@@ -2191,35 +2191,53 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float2 wetUV = uv * SharedData::skinData.skinDetailParams.y;
 #		endif
 	float2 dynamicWet = Skin::GetWetness(input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z, worldNormal.xyz);
-	// (43b) Skin Wetness Coverage (Advanced Skin menu). sssParams.z >= 0: "Uniform (natural)",
-	// and the value is the Droplet / Rivulet Detail; < 0: "Advanced Skin noise (original)",
-	// which keeps the 42c / 41b code below exactly. Uniform does not halve the strength of skins
-	// without a _wet mask: every skin gets the same response from the same slider.
-	const float skinWetDetail = SharedData::skinData.sssParams.z;
-	const bool skinWetUniform = skinWetDetail >= 0.0;
-	float skinFilmStrength = clamp(dynamicWet.x + dynamicWet.y + SharedData::skinData.skinParams2.y, 0.f, 2.f) * ((hasSkinWetness || skinWetUniform) ? 1.0 : 0.5);
+	// (44a) Wet Skin model (Characters > Wet Skin). "Original (pre-42c)": the 41b Advanced Skin
+	// film exactly (Perlin coverage, _wet mask, half strength for skins without one); the CPU
+	// also turns the 42c character switches off. "New": one wetness per character from the
+	// manual slider, swimming (hold + dry-off), rain and sweat; soft patches; a broad sheen;
+	// droplets and rivulets on the film only.
+	const bool skinWetNew = Skin::WetSkinNewModel();
+	float skinFilmStrength = clamp(dynamicWet.x + dynamicWet.y + SharedData::skinData.skinParams2.y, 0.f, 2.f) * (hasSkinWetness ? 1.0 : 0.5);
 	// (42c, 4.3) Rain feeds the same film as swimming and sweat: its share of the strength is
 	// remembered so the sky occlusion can be applied to it later (the probes are sampled after
-	// the normal is final) and so it never raises the G-buffer gloss.
+	// the normal is final) and so it never raises the G-buffer gloss. (44a) New model: always;
+	// Original: the switch is forced off on the CPU, as before 42c.
 	float skinRainStrength = 0.0;
 #		if defined(WETNESS_EFFECTS)
-	if (SharedData::wetnessEffectsSettings.EnableRainSkinFilm && inWorld)
+	if ((skinWetNew || SharedData::wetnessEffectsSettings.EnableRainSkinFilm) && inWorld)
 		skinRainStrength = saturate(SharedData::wetnessEffectsSettings.SkinWetness * SharedData::wetnessEffectsSettings.Wetness);
 #		endif
-	const float skinRainShare = skinRainStrength / max(skinFilmStrength + skinRainStrength, 1e-4);
-	// (43b) Uniform: smooth coverage saturate(strength), no Perlin threshold and no _wet mask
-	// (the mask is set to 1 for every skin). Calibration: the film is as wet as the Diamond
-	// female skin was at the same slider value. Its _wet masks average about 2.3 %, so a full
-	// film there had wetness 0.023; Uniform uses 0.025 x coverage for every skin. Film
-	// highlight, G-buffer gloss and darkening all read this one smooth value, so one slider
-	// gives one look on every skin mod.
-	float skinWetness;
-	float skinWetDetailMod = 1.0;
-	if (skinWetUniform) {
-		skinWetness = 0.025 * saturate(skinFilmStrength + skinRainStrength);
+	float skinRainShare = 0.0;
+	float skinWetness = 0.0;
+	float skinWetDropDriver = 0.0;   // (44a) how many droplets (0..1)
+	float skinWetDropRainOnly = 0.0; // (44a) 1 when rain is what makes them (sky occlusion applies)
+	float skinWetStreakDriver = 0.0; // (44a) rivulets
+	float skinWetDropMask = 0.0;
+	float skinWetDropRim = 0.0;
+	float skinWetStreak = 0.0;
+	[branch] if (skinWetNew)
+	{
+		const float worldZ = input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z;
+		const float waterLevel = Skin::skinPerGeometry.z + Skin::wetSkinPerGeometry.y;
+		const float swim = Skin::wetSkinPerGeometry.x * (1.0 - smoothstep(waterLevel - 2.5, waterLevel + 2.5, worldZ));
+		const float wSwim = saturate(swim * Skin::wetSkinParams[0].z);
+		const float wManual = saturate(Skin::wetSkinParams[0].y);
+		const float wSweat = saturate(dynamicWet.x * Skin::wetSkinParams[1].x);
+		const float wRain = saturate(skinRainStrength * Skin::wetSkinParams[0].w);
+		const float wDry = 1.0 - (1.0 - wSwim) * (1.0 - wManual) * (1.0 - wSweat);
+		const float wAll = 1.0 - (1.0 - wDry) * (1.0 - wRain);
+		skinRainShare = wAll > 0.0 ? saturate((wAll - wDry) / wAll) : 0.0;
+		skinWetness = Skin::WetCoverage(wetUV, wAll, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z);
 		skinWetMask = 1.0;
-	} else
+		const float dropOthers = max(max(wSwim, wManual), wSweat * 0.5);
+		const float dropRain = wRain * saturate(Skin::wetSkinParams[5].w);
+		skinWetDropDriver = smoothstep(0.35, 0.9, max(dropOthers, dropRain));
+		skinWetDropRainOnly = dropRain > dropOthers ? 1.0 : 0.0;
+		skinWetStreakDriver = max(smoothstep(0.45, 1.0, max(wSwim, wManual)), wRain);
+	} else {
+		skinRainShare = skinRainStrength / max(skinFilmStrength + skinRainStrength, 1e-4);
 		skinWetness = Skin::PerlinNoise(wetUV, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z, min(skinFilmStrength + skinRainStrength, 2.f));
+	}
 	if ((SharedData::skinData.skinDetailParams.w > 0.0f || skinWetness > 0.0f) && skinEnabled) {
 #		if defined(FACEGEN)
 		float2 detailUV = input.TexCoord0.xy * SharedData::skinData.skinDetailParams.x;
@@ -2242,18 +2260,51 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			worldNormal.xyz = combinedNormal;
 		originalWorldNormal = worldNormal.xyz;
 		wetWorldNormal = worldNormal.xyz;
-		if (skinWetness > 0.0f) {
-			float3 wetNormal;
-			if (skinWetUniform) {
-				// (43b) Droplet / Rivulet Detail: a fine, never-thresholded height tilts the film
-				// normal (rivulet normals, size from the Perlin Noise Scale) and moves the direct
-				// film highlight by at most +-40 % x detail. Coverage stays smooth.
-				const float wetDetailHeight = skinWetDetail > 0.0 ? Skin::WetDetailHeight(wetUV, max(SharedData::skinData.wetParams.x * 0.25, 1.0)) : 0.5;
-				wetNormal = Skin::CalculateNormalFromHeight(wetDetailHeight, 0.01 * skinWetDetail, uv);
-				skinWetDetailMod = 1.0 + 0.4 * saturate(skinWetDetail) * (2.0 * wetDetailHeight - 1.0);
-			} else
-				wetNormal = Skin::CalculateNormalFromHeight(skinWetness, SharedData::skinData.wetParams.w * 0.0005, uv);
-			if (hasSkinWetness && !skinWetUniform) {
+		if (skinWetness > 0.0f && skinWetNew) {
+			// (44a) New model: the skin keeps its own normal; only the water film gets the droplet
+			// domes (inside each bead only). Droplets and rivulets live in uv cells, so they stay
+			// put on a moving character; gravity is world down projected on the surface.
+			const float3 dPdx = ddx(input.WorldPosition.xyz);
+			const float3 dPdy = ddy(input.WorldPosition.xyz);
+			const float2 dUVdx = ddx(wetUV);
+			const float2 dUVdy = ddy(wetUV);
+			const float uvDet = dUVdx.x * dUVdy.y - dUVdx.y * dUVdy.x;
+			const float3 baseN = worldNormal.xyz;
+			float3 dPdu = (dPdx * dUVdy.y - dPdy * dUVdx.y) / (abs(uvDet) > 1e-12 ? uvDet : 1e-12);
+			float3 dPdv = (dPdy * dUVdx.x - dPdx * dUVdy.x) / (abs(uvDet) > 1e-12 ? uvDet : 1e-12);
+			dPdu -= baseN * dot(baseN, dPdu);
+			dPdv -= baseN * dot(baseN, dPdv);
+			const float3 down = float3(0.0, 0.0, -1.0);
+			const float alignment = saturate(length(down - baseN * dot(baseN, down)));
+			float2 gravityUV = float2(dot(down, dPdu) / max(dot(dPdu, dPdu), 1e-12), dot(down, dPdv) / max(dot(dPdv, dPdv), 1e-12));
+			gravityUV = dot(gravityUV, gravityUV) > 1e-20 ? normalize(gravityUV) : float2(0.0, 1.0);
+
+#		if defined(FACEGEN)
+			const float cellsPerUV = 140.0 / clamp(Skin::wetSkinParams[3].x, 0.25, 4.0);
+			const float faceDroplets = saturate(Skin::wetSkinParams[3].z);
+#		else
+			const float cellsPerUV = 320.0 / clamp(Skin::wetSkinParams[3].x, 0.25, 4.0);
+			const float faceDroplets = 1.0;
+#		endif
+			const float2 cellUV = wetUV * cellsPerUV;
+			const float footprint = max(max(length(dUVdx), length(dUVdy)) * cellsPerUV, 1e-6);
+			// Beads are about 0.3 cell in radius: fade them out below ~1.5 pixels (no DLSS sparkle).
+			const float dropVisibility = smoothstep(1.0, 2.5, 0.3 / footprint);
+			// More beads where water rests (shoulders, chest), fewer on undersides.
+			const float restFactor = lerp(0.7, 1.2, saturate(baseN.z * 0.5 + 0.5));
+			const float presence = saturate(Skin::wetSkinParams[2].w) * saturate(Skin::wetSkinParams[2].z) * skinWetDropDriver * restFactor * faceDroplets * (dropVisibility > 0.0 ? 1.0 : 0.0);
+			const Skin::WetSkinDetail detail = Skin::WetSkinDroplets(cellUV, footprint, gravityUV, alignment, presence, skinWetStreakDriver);
+			skinWetDropMask = detail.dropMask * dropVisibility;
+			skinWetDropRim = detail.dropRim * skinWetDropMask;
+			skinWetStreak = saturate(max(detail.streak, detail.trail * 0.8 * dropVisibility));
+
+			const float3 tu = dot(dPdu, dPdu) > 1e-20 ? normalize(dPdu) : float3(1.0, 0.0, 0.0);
+			const float3 tv = dot(dPdv, dPdv) > 1e-20 ? normalize(dPdv) : float3(0.0, 1.0, 0.0);
+			const float domeStrength = clamp(Skin::wetSkinParams[5].z, 0.0, 2.0);
+			wetWorldNormal = normalize(baseN + (detail.dropSlope.x * tu + detail.dropSlope.y * tv) * domeStrength * skinWetDropMask);
+		} else if (skinWetness > 0.0f) {
+			float3 wetNormal = Skin::CalculateNormalFromHeight(skinWetness, SharedData::skinData.wetParams.w * 0.0005, uv);
+			if (hasSkinWetness) {
 				// float3 wetMaskNormal = Skin::CalculateNormalFromHeight(skinWetMask, SharedData::skinData.wetParams.w * 0.00005, uv);
 				float3 wetMaskNormal = (skinWetnessNormal.xyz * 2.0 - 1.0);
 				wetNormal = Skin::ReorientNormal(wetMaskNormal, wetNormal);
@@ -2994,7 +3045,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	const float skinWetMaskCoverage = saturate(skinWetMask);
 	skinSurfaceProperties.Wetness = saturate(skinWetness * skinWetMaskCoverage);
 	skinSurfaceProperties.WetnessFilmStrength = max(SharedData::skinData.physicalParams.w, 0.0f);
-	skinSurfaceProperties.WetFilmDetail = skinWetDetailMod;  // (43b) 1 unless Uniform with droplet detail
 
 	if (skinRoughnessSet) {
 		skinSurfaceProperties.F0 = 0.08f * skinSpecular * SharedData::skinData.physicalParams.z;
@@ -3010,6 +3060,15 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// (42c) The rain part of the film (skinRainShare, 0 unless "Rain Wets Advanced Skin") is
 	// left out of the G-buffer gloss: SSRT/NRD see the same roughness as before 42c.
 	float pbrGlossiness = lerp(1 - averageRoughness, 1 - WATER_ROUGHNESS, saturate(Skin::GetWetnessOpticalResponse(skinSurfaceProperties.Wetness) * skinSurfaceProperties.WetnessFilmStrength) * (1.0 - skinRainShare));
+	// (44a) New model: the film's own roughness (>= 0.2) and response. Either model: the gloss the
+	// reflections (SSRT / IBL) see on skin never exceeds 0.8, i.e. roughness >= 0.2 (anti-mirror).
+	[branch] if (skinWetNew)
+	{
+		const float skinWetResponse = pow(saturate(skinSurfaceProperties.Wetness), 1.3);
+		const float skinWetFilmRoughness = max(lerp(Skin::wetSkinParams[1].y, Skin::wetSkinParams[1].z, skinWetResponse), 0.2);
+		pbrGlossiness = lerp(1 - averageRoughness, 1 - skinWetFilmRoughness, saturate(skinWetResponse * Skin::wetSkinParams[1].w));
+	}
+	pbrGlossiness = min(pbrGlossiness, max(1 - averageRoughness, 0.8));  // dry skin keeps its own value
 #	endif  // CS_SKIN
 
 	float porosity = 1.0;
@@ -3154,6 +3213,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// 4.3: the rain share of the Advanced Skin film follows the same sky occlusion as the rest
 	// of Wetness Effects (a character under a roof is not rained on).
 	skinSurfaceProperties.Wetness *= lerp(1.0, saturate(wetnessOcclusion * nearFactor), skinRainShare);
+	// (44a) New model: droplets made by rain, and the rain's rivulets, follow it too.
+	skinWetDropMask *= lerp(1.0, saturate(wetnessOcclusion * nearFactor), skinWetDropRainOnly);
+	skinWetDropRim *= lerp(1.0, saturate(wetnessOcclusion * nearFactor), skinWetDropRainOnly);
+	skinWetStreak *= lerp(1.0, saturate(wetnessOcclusion * nearFactor), skinRainShare);
 #		endif
 
 #		if defined(WET_CHARACTER_PERM)
@@ -3163,7 +3226,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// material: A / (n^2 - (n^2 - 1) A) with n = 1.33 (Twomey et al. 1986), per channel, which
 	// darkens dark colours relatively more and saturates slightly. Porosity scales the step
 	// (1 = fully absorbent, about a third darker at A = 0.4).
-	const bool wetDarkenNew = wetCharacter && SharedData::wetnessEffectsSettings.EnableWetDarkening;
+#			if defined(SKIN) && defined(CS_SKIN)
+	const bool skinWetNewActive = skinWetNew && skinEnabled;  // (44a) the Wet Skin New model owns skin wetness
+#			else
+	const bool skinWetNewActive = false;
+#			endif
+	const bool wetDarkenNew = wetCharacter && (SharedData::wetnessEffectsSettings.EnableWetDarkening || skinWetNewActive);
 	[branch] if (wetDarkenNew)
 	{
 		float wetDarkenWetness = saturate(max(puddle, shoreFactorAlbedo * SharedData::wetnessEffectsSettings.MaxShoreWetness));
@@ -3188,7 +3256,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		wetPorosity *= 1.0 - dynamicSnowCoverage;  // snow lies on top of the wet surface
 #			endif
 		// Darkening shows as soon as the surface layer is damp, well before it is soaked.
-		const float wetDarkenAmount = wetPorosity * sqrt(wetDarkenWetness);
+		float wetDarkenAmount = wetPorosity * sqrt(wetDarkenWetness);
+#			if defined(SKIN) && defined(CS_SKIN)
+		if (skinWetNewActive)  // (44a) the soft coverage, rivulets and bead rims
+			wetDarkenAmount = Skin::WetSkinDarkening(skinSurfaceProperties.Wetness, skinWetStreak, skinWetDropRim);
+#			endif
 		const float3 wetAlbedo = baseColor.xyz / (1.77 - 0.77 * saturate(baseColor.xyz));
 		baseColor.xyz = max(lerp(baseColor.xyz, wetAlbedo, wetDarkenAmount), 0.0);
 #			if defined(SKIN) && defined(CS_SKIN)
@@ -3206,8 +3278,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	const float wetFilmWeight = saturate(wetnessGlossinessSpecular);
 	float3 wetFilmSpecular = 0.0;
 #		if defined(SKIN) && defined(CS_SKIN)
-	const bool wetFilmInSkin = wetFilm && skinEnabled;
-	if (wetFilmInSkin) {
+	// (44a) The New model always draws the skin film itself (WetSkinFilm below).
+	const bool wetFilmInSkin = (wetFilm || skinWetNew) && skinEnabled;
+	if (wetFilmInSkin && !skinWetNew) {
 		skinSurfaceProperties.WetFilmRoughness = wetFilmRoughness;
 		skinSurfaceProperties.WetFilmEnergy = saturate(max(wetFilmWeight, Skin::GetWetnessOpticalResponse(skinSurfaceProperties.Wetness) * max(skinSurfaceProperties.WetnessFilmStrength, 0.0))) * SharedData::wetnessEffectsSettings.WetFilmStrength;
 	}
@@ -3217,6 +3290,20 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// Film handled here (not inside the Advanced Skin BRDF), and its weight.
 	const bool wetFilmGeneric = wetFilm && !wetFilmInSkin && wetFilmWeight > 0.0;
 	const float wetFilmEnergy = wetFilmWeight * SharedData::wetnessEffectsSettings.WetFilmStrength;
+#	endif
+
+#	if defined(SKIN) && defined(CS_SKIN)
+	// (44a) Wet Skin New model: the film this pixel shows (with or without Wetness Effects).
+	[branch] if (skinWetNew && skinEnabled)
+	{
+#		if !defined(WETNESS_EFFECTS)
+		// Without Wetness Effects there is no 4.2 pass above: darken here.
+		const float3 skinWetAlbedo = baseColor.xyz / (1.77 - 0.77 * saturate(baseColor.xyz));
+		baseColor.xyz = max(lerp(baseColor.xyz, skinWetAlbedo, Skin::WetSkinDarkening(skinSurfaceProperties.Wetness, skinWetStreak, skinWetDropRim)), 0.0);
+		skinSurfaceProperties.Albedo = baseColor.xyz;
+#		endif
+		Skin::WetSkinFilm(skinSurfaceProperties, skinWetStreak, skinWetStreakDriver, skinWetDropMask);
+	}
 #	endif
 
 	float llDirLightMult = SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear && (inWorld || inReflection) && !SharedData::InInterior ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
@@ -3372,7 +3459,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(WETNESS_EFFECTS)
 		// (42c) With the film on, the Advanced Skin BRDF above already drew it.
 		if (waterRoughnessSpecular < 1.0 && !wetFilmInSkin && skinRainStrength <= 0.0)
-			specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
+			specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, DirLightDirection, lightProperties.CoatLightColor, max(waterRoughnessSpecular, 0.2)) * wetnessGlossinessSpecular;
 #		endif
 	} else {
 		dirDetailShadow *= parallaxShadow;
@@ -3696,7 +3783,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			specularColorPBR += pointSpecularColor;
 #				if defined(WETNESS_EFFECTS)
 			if (waterRoughnessSpecular < 1.0 && !wetFilmInSkin && skinRainStrength <= 0.0)
-				specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, waterRoughnessSpecular) * wetnessGlossinessSpecular;
+				specularColorPBR += PBR::GetWetnessDirectLightSpecularInput(wetnessNormal, viewDirection, normalizedLightDirection, lightProperties.CoatLightColor, max(waterRoughnessSpecular, 0.2)) * wetnessGlossinessSpecular;
 #				endif
 		} else {
 			lightColor *= lightShadow;
@@ -4087,8 +4174,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(WETNESS_EFFECTS)
 		// (42c, 4.3) While rain feeds the Advanced Skin film, its indirect lobe (above) already
 		// carries the rain; adding this one too would count the same water twice.
-		if (waterRoughnessSpecular < 1.0 && skinRainStrength <= 0.0)
-			indirectSpecularLobeWeight += PBR::GetWetnessIndirectSpecularLobeWeight(wetnessNormal, viewDirection, vertexNormal, waterRoughnessSpecular) * wetnessGlossinessSpecular;
+		if (waterRoughnessSpecular < 1.0 && skinRainStrength <= 0.0 && !skinWetNew)  // (44a) anti-mirror: >= 0.2 on skin
+			indirectSpecularLobeWeight += PBR::GetWetnessIndirectSpecularLobeWeight(wetnessNormal, viewDirection, vertexNormal, max(waterRoughnessSpecular, 0.2)) * wetnessGlossinessSpecular;
 #		endif
 
 #		if !(defined(DEFERRED) && defined(SSGI))
@@ -4507,7 +4594,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (skinEnabled) {
 		psout.Reflectance = float4(indirectSpecularLobeWeight, psout.Diffuse.w);
 #			if defined(WETNESS_EFFECTS)
-		psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), lerp(pbrGlossiness, max(pbrGlossiness, wetnessGlossinessSpecular), wetnessGlossinessSpecular), psout.Diffuse.w);
+		psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), skinWetNew ? pbrGlossiness : min(lerp(pbrGlossiness, max(pbrGlossiness, wetnessGlossinessSpecular), wetnessGlossinessSpecular), max(pbrGlossiness, 0.8)), psout.Diffuse.w);  // (44a) anti-mirror; New: rain is in pbrGlossiness
 #			else
 		psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), pbrGlossiness, psout.Diffuse.w);
 #			endif

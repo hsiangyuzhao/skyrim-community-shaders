@@ -29,6 +29,7 @@
 #include "Features/ScreenSpaceRayTracing.h"
 #include "Features/ScreenSpaceShadows.h"
 #include "Features/Skin.h"
+#include "Features/WetSkin.h"
 #include "Features/SkySync.h"
 #include "Features/Skylighting.h"
 #include "Features/SubsurfaceScattering.h"
@@ -256,6 +257,7 @@ const std::vector<Feature*>& Feature::GetFeatureList()
 		&globals::features::physicalSky,
 		&globals::features::postProcessing,
 		&globals::features::skin,
+		&globals::features::wetSkin,  // (44a) after Advanced Skin: takes over its 43b wetness settings
 		&globals::features::exponentialHeightFog,
 		&globals::features::variableRateShading,
 		&globals::features::volumetricShadows,
