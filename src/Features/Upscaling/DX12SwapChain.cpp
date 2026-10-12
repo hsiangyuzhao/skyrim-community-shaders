@@ -661,7 +661,10 @@ void DX12SwapChain::SetUIBuffer()
 			upscaling.IsDLSSGAvailable()) {
 			// Capture the scene immediately before UI rendering. Keep the game
 			// framebuffer bound so FinalColor remains scene plus UI.
-			d3d11Context->CopyResource(uiBufferWrapped->resource11, swapChainBufferWrapped->resource11);
+			// (batch 43) With HDR output on, the HUD-less image is the HDR10-encoded scene, written
+			// straight from the fp16 scene in the same encoding as FinalColor.
+			if (!HDROutput::WriteHUDLess(uiBufferWrapped.get()))
+				d3d11Context->CopyResource(uiBufferWrapped->resource11, swapChainBufferWrapped->resource11);
 			dlssGHUDLessFrameIndex = upscaling.streamline.GetLatchedFrameTokenIndex();
 		}
 		HDROutput::OnUIStartAfterHUDLess();
@@ -674,6 +677,15 @@ void DX12SwapChain::SetUIBuffer()
 	auto& data = globals::game::renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kFRAMEBUFFER];
 	data.RTV = uiBufferWrapped->rtv;
 	d3d11Context->OMSetRenderTargets(1, &data.RTV, nullptr);
+}
+
+void DX12SwapChain::RequestDLSSGResume(const char* a_reason)
+{
+	if (dlssGPresentationState != DLSSGPresentationState::kGameplay)
+		return;  // already suspended or warming up (map, resume): that path re-syncs anyway
+	dlssGPresentationState = DLSSGPresentationState::kResumePending;
+	dlssGResumeWarmupFrameIndex = UINT32_MAX;
+	logger::info("[DLSS-G] {}: generation off for one aligned frame before resuming", a_reason);
 }
 
 void DX12SwapChain::MarkDLSSGSceneResourcesReady(uint32_t a_frameIndex)

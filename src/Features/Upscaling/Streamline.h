@@ -276,7 +276,8 @@ public:
 	void DestroyDLSSResources(bool modeSwitch = false);
 	void DestroyDLSSRRResources(bool modeSwitch = false);
 
-	void ApplyNISSharpening(ID3D12Resource* a_inputColorTexture, ID3D12Resource* a_outputTexture, float sharpness, ID3D12GraphicsCommandList* a_commandList);
+	/// (batch 43) a_linearHDR: NIS HDR mode eLinear (native HDR output, "Sharpening in HDR: Linear mode").
+	void ApplyNISSharpening(ID3D12Resource* a_inputColorTexture, ID3D12Resource* a_outputTexture, float sharpness, ID3D12GraphicsCommandList* a_commandList, bool a_linearHDR = false);
 
 private:
 	void FallbackDLSSG(const char* a_reason, sl::Result a_result, sl::DLSSGStatus a_status);

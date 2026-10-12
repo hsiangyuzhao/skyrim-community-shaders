@@ -95,6 +95,8 @@ namespace HDROutput
 		winrt::com_ptr<ID3D11ComputeShader> g_encodeCS;
 		winrt::com_ptr<ID3D11ComputeShader> g_resolveCS;
 		winrt::com_ptr<ID3D11ComputeShader> g_compositeCS;
+		winrt::com_ptr<ID3D11ComputeShader> g_nisDecodeCS;  // (43c)
+		winrt::com_ptr<ID3D11ComputeShader> g_nisEncodeCS;
 		std::vector<SavedRenderTarget> g_upgradedTargets;
 
 		// frame
@@ -117,6 +119,10 @@ namespace HDROutput
 		std::unordered_map<ID3D11BlendState*, PatchedBlend> g_patchedBlends;
 		std::unordered_map<ID3D11BlendState*, ID3D11BlendState*> g_patchedToOriginal;
 		uint64_t g_blendPatchCount = 0;
+
+		// (43c) DLSS-G
+		uint32_t g_lastDLSSGStatus = 0;
+		bool g_dlssGRejectedHDR = false;
 
 		// diagnostics
 		uint64_t g_redirectConfirmed = 0;
@@ -646,6 +652,8 @@ namespace HDROutput
 		g_encodeCS = nullptr;
 		g_resolveCS = nullptr;
 		g_compositeCS = nullptr;
+		g_nisDecodeCS = nullptr;
+		g_nisEncodeCS = nullptr;
 	}
 
 	// ---- per frame ---------------------------------------------------------------------------------------
@@ -747,21 +755,72 @@ namespace HDROutput
 			return;
 		}
 
-		if (IsOutputActive() && g_frame.sceneHDR && g_uiLayer) {
-			// The HDR10 scene goes into the back buffer first: DLSS-G's HUD-less capture right after
-			// this takes it from there (43c writes it into the HUD-less image directly instead).
-			auto* backBuffer = SwapChain().swapChainBufferWrapped.get();
-			if (backBuffer && EncodeSceneTo(backBuffer->uav, false)) {
-				g_frame.resolved = true;
-				g_frame.path = Path::kSeparated;
-				RebindFramebuffer();
-				return;
-			}
+		if (IsOutputActive() && g_frame.sceneHDR && g_uiLayer && SwapChain().hdrOutputWrapped) {
+			// The scene stays in the fp16 target; the Present composite reads it from there, and
+			// DLSS-G's HUD-less image is encoded from it (WriteHUDLess).
+			g_frame.resolved = true;
+			g_frame.path = Path::kSeparated;
+			return;
 		}
 
 		ResolveSceneToBackBuffer();
 		g_frame.path = Path::kWholeFrameSDR;
 		RebindFramebuffer();
+	}
+
+	bool WriteHUDLess(WrappedResource* a_hudless)
+	{
+		if (!g_session || !IsOutputActive() || !g_frame.sceneFresh || !a_hudless || !a_hudless->uav)
+			return false;
+		// Separated: the HDR scene. Whole frame as SDR: the same SDR scene the back buffer got, at
+		// paper white -- in both cases the encoding of the FinalColor composite.
+		const bool sdr = g_frame.path != Path::kSeparated;
+		if (!EncodeSceneTo(a_hudless->uav, sdr))
+			return false;
+		RebindFramebuffer();
+		return true;
+	}
+
+	bool WillSceneBeHDR()
+	{
+		return g_session && g_scene && WantsSceneHDR();
+	}
+
+	bool PrepareNISInput(ID3D11Resource* a_bound, ID3D11UnorderedAccessView* a_nisInput, bool& a_linear)
+	{
+		a_linear = false;
+		if (!g_session || !g_scene || !a_nisInput || a_bound != g_scene->resource.get())
+			return false;
+		a_linear = IsSceneHDRThisFrame();
+		if (a_linear && GetSettings().nisMode == 0)
+			return false;  // "Sharpening in HDR: Off"
+		auto* shader = a_linear ? GetShader(g_nisDecodeCS, "NIS_DECODE", "CSGammaToLinear") : GetShader(g_resolveCS, "RESOLVE_SDR", "CSResolveSDR");
+		if (!shader || !EnsureCB())
+			return false;
+		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::HDROutput);
+		Dispatch(shader, { g_scene->srv.get() }, a_nisInput, g_scene->desc.Width, g_scene->desc.Height, MakeCB(ResolveLevels(), true));
+		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::HDROutput);
+		return true;
+	}
+
+	void FinishNIS(ID3D11ShaderResourceView* a_nisOutput, bool a_linear)
+	{
+		if (!g_scene || !a_nisOutput)
+			return;
+		auto* shader = a_linear ? GetShader(g_nisEncodeCS, "NIS_ENCODE", "CSLinearToGamma") : GetShader(g_resolveCS, "RESOLVE_SDR", "CSResolveSDR");
+		if (!shader || !EnsureCB())
+			return;
+		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::HDROutput);
+		Dispatch(shader, { a_nisOutput }, g_scene->uav.get(), g_scene->desc.Width, g_scene->desc.Height, MakeCB(ResolveLevels(), true));
+		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::HDROutput);
+		globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
+	}
+
+	void NoteDLSSGStatus(uint32_t a_status)
+	{
+		g_lastDLSSGStatus = a_status;
+		if (a_status & (1u << 2))
+			g_dlssGRejectedHDR = true;
 	}
 
 	void OnUIStartAfterHUDLess()
@@ -872,10 +931,14 @@ namespace HDROutput
 			g_colorSpaceFailed = false;
 		}
 		if (wanted != g_outputActive && !g_colorSpaceFailed) {
-			if (ApplyColorSpace(wanted))
+			if (ApplyColorSpace(wanted)) {
 				g_outputActive = wanted;
-			else
+				// (43c) The encoding of FinalColor and the HUD-less image changes with the next frame:
+				// DLSS-G must not interpolate between an SDR and an HDR10 frame.
+				SwapChain().RequestDLSSGResume(wanted ? "HDR output switched on" : "HDR output switched off");
+			} else {
 				g_colorSpaceFailed = true;
+			}
 			logger::info("[HDR] Output {} ({})", g_outputActive ? "HDR10" : "SDR", g_colorSpaceWhere);
 		}
 
@@ -976,6 +1039,26 @@ namespace HDROutput
 			ImGui::TextUnformatted("GT7: Gran Turismo 7's own HDR curve replaces the selected tone mapper (darker mid-tones unless you re-tune exposure).");
 		}
 
+		const char* nisModes[] = { "Off", "Linear mode" };
+		int nisMode = s.nisMode == 1 ? 1 : 0;
+		if (ImGui::Combo("Sharpening in HDR", &nisMode, nisModes, IM_ARRAYSIZE(nisModes)))
+			s.nisMode = static_cast<uint>(nisMode);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("The DLSS Sharpness slider (NIS) while HDR is on. Off: no sharpening in HDR.");
+			ImGui::TextUnformatted("Linear mode: the picture is handed to NIS in linear light, NIS's own HDR mode. Menus (shown as SDR) always sharpen as before.");
+		}
+
+		const char* chains[] = { "Streamline proxy (native if refused)", "Native chain below Streamline", "Both" };
+		int chain = static_cast<int>(std::min(s.colorSpaceChain, 2u));
+		if (ImGui::Combo("Colour Space Set On (restart)", &chain, chains, IM_ARRAYSIZE(chains)))
+			s.colorSpaceChain = static_cast<uint>(chain);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Which swap chain is told the picture is HDR10. Under DLSS-G there are two: Streamline's and the real one below it.");
+			ImGui::TextUnformatted("Only change this if the picture looks washed out or too dark with HDR on. Takes effect after a restart.");
+		}
+		if (s.colorSpaceChain != g_colorSpaceChainLatched && g_session)
+			ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Restart to apply the colour-space choice.");
+
 		ImGui::SliderFloat("Highlight Roll-off Start", &s.rolloffStart, 0.3f, 0.9f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			const auto levels = ResolveLevels();
@@ -1004,6 +1087,12 @@ namespace HDROutput
 			ImGui::Text("Scene in fp16 target: confirmed %llu, not confirmed %llu frames; %zu image-space targets upgraded",
 				g_redirectConfirmed, g_redirectUnconfirmed, g_upgradedTargets.size());
 			ImGui::Text("Mod UI transparency fixes: %llu (%zu blend states seen)", g_blendPatchCount, g_patchedBlends.size());
+			if (g_dlssGRejectedHDR)
+				ImGui::TextColored({ 1.0f, 0.4f, 0.4f, 1.0f }, "DLSS-G rejected the HDR format (eFailHDRFormatNotSupported, status 0x%X)", g_lastDLSSGStatus);
+			else if (g_lastDLSSGStatus)
+				ImGui::Text("DLSS-G last failure status: 0x%X (see the log)", g_lastDLSSGStatus);
+			else
+				ImGui::TextDisabled("DLSS-G: no failure reported");
 			const float ms = Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::HDROutput);
 			if (ms > 0.0f)
 				ImGui::Text("GPU cost: %.3f ms per frame (HDR Output row)", ms);
@@ -1036,6 +1125,11 @@ namespace HDROutput
 			j["menu_mode"] = s.menuMode == 1 ? "separate" : "sdr";
 			j["ui_blend_fix"] = s.uiBlendFix;
 			j["ui_blend_patches"] = g_blendPatchCount;
+			j["nis_in_hdr"] = s.nisMode == 1 ? "linear" : "off";
+			j["color_space_chain_setting"] = s.colorSpaceChain;
+			j["color_space_chain_session"] = g_colorSpaceChainLatched;
+			j["dlssg_last_failure_status"] = g_lastDLSSGStatus;
+			j["dlssg_rejected_hdr_format"] = g_dlssGRejectedHDR;
 			j["gpu_ms"] = Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::HDROutput);
 		}
 		return j;

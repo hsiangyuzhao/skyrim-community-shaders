@@ -418,6 +418,10 @@ void Upscaling::DrawSettings()
 				ImGui::TextUnformatted("Off (default): runs on the finished image at screen resolution, just before the HUD.");
 				ImGui::TextUnformatted("On: runs on the internal resolution image (2560x1440 at Quality on a 4K screen) before DLSS upscales it, so it costs less. It sees the scene before colour grading; \"Tone-matched input\" below shows it the graded look instead.");
 			}
+			// (batch 43)
+			if (HDROutput::IsOutputActive())
+				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "HDR output is on: Neural Rendering runs before upscaling with tone-matched input, whatever is set here (the after-upscaling model only knows SDR).%s",
+					Batch38::IsOn() ? "" : " With Batch 38 off it is paused.");
 
 			// (batch 42a) 100 / 67 / 50 / 40, one value per placement (after upscaling defaults to 50).
 			{
@@ -2279,22 +2283,35 @@ void Upscaling::ApplyNISSharpening()
 		return;
 	}
 
-	// (batch 43) In an HDR session the image here is the fp16 scene target, which the R11G11B10
-	// sharpener textures cannot be copied from. 43c adds the HDR path.
-	if (HDROutput::IsSession())
-		return;
+	// (batch 43) In a native-HDR session the image here is the fp16 scene target, which the R11G11B10
+	// sharpener textures cannot be copied from: compute passes move it in and out instead (in linear
+	// light for an HDR frame with "Sharpening in HDR: Linear mode", where NIS runs its own HDR mode).
+	const bool hdrSession = HDROutput::IsSession();
 
 	auto context = globals::d3d::context;
 
 	ID3D11RenderTargetView* renderTarget = nullptr;
 	context->OMGetRenderTargets(1, &renderTarget, nullptr);
 
+	if (!renderTarget)
+		return;
+
 	winrt::com_ptr<ID3D11Resource> mainResource;
 	renderTarget->GetResource(mainResource.put());
 
 	context->OMSetRenderTargets(0, nullptr, nullptr);  // Unbind all bound render targets
 
-	context->CopyResource(dx12SwapChain.nisSharpenerInputShared12->resource11, mainResource.get());
+	bool linearHDR = false;
+	if (hdrSession) {
+		if (!HDROutput::PrepareNISInput(mainResource.get(), dx12SwapChain.nisSharpenerInputShared12->uav, linearHDR)) {
+			globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
+			if (renderTarget)
+				renderTarget->Release();
+			return;
+		}
+	} else {
+		context->CopyResource(dx12SwapChain.nisSharpenerInputShared12->resource11, mainResource.get());
+	}
 
 	// Wait for D3D11 to finish
 	auto fence = dx12SwapChain.fenceValue;
@@ -2311,7 +2328,7 @@ void Upscaling::ApplyNISSharpening()
 	DX::ThrowIfFailed(dx12SwapChain.nisSharpenerCommandAllocator[frameIndex]->Reset());
 	DX::ThrowIfFailed(dx12SwapChain.nisSharpenerCommandList[frameIndex]->Reset(dx12SwapChain.nisSharpenerCommandAllocator[frameIndex].get(), nullptr));
 
-	streamline.ApplyNISSharpening(dx12SwapChain.nisSharpenerInputShared12->resource.get(), dx12SwapChain.nisSharpenerOutputShared12->resource.get(), settings.sharpnessDLSS, dx12SwapChain.nisSharpenerCommandList[frameIndex].get());
+	streamline.ApplyNISSharpening(dx12SwapChain.nisSharpenerInputShared12->resource.get(), dx12SwapChain.nisSharpenerOutputShared12->resource.get(), settings.sharpnessDLSS, dx12SwapChain.nisSharpenerCommandList[frameIndex].get(), linearHDR);
 
 	// Close and execute command list
 	DX::ThrowIfFailed(dx12SwapChain.nisSharpenerCommandList[frameIndex]->Close());
@@ -2328,7 +2345,10 @@ void Upscaling::ApplyNISSharpening()
 	dx12SwapChain.fenceValue++;
 
 	// Copy back to main buffer
-	context->CopyResource(mainResource.get(), dx12SwapChain.nisSharpenerOutputShared12->resource11);
+	if (hdrSession)
+		HDROutput::FinishNIS(dx12SwapChain.nisSharpenerOutputShared12->srv, linearHDR);
+	else
+		context->CopyResource(mainResource.get(), dx12SwapChain.nisSharpenerOutputShared12->resource11);
 
 	globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);  // Run OMSetRenderTargets again
 

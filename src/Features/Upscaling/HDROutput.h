@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 struct ID3D12Resource;
+class WrappedResource;
 
 /**
  * @brief (batch 43) Native HDR10 output for the D3D12 / DLSS-G presentation path.
@@ -97,6 +98,24 @@ namespace HDROutput
 	void OnUIStartBeforeHUDLess();
 	/// DX12SwapChain::SetUIBuffer, after its DLSS-G HUD-less capture (or where it would be).
 	void OnUIStartAfterHUDLess();
+
+	/// (43c) DLSS-G's HUD-less capture: with HDR output on, write the HDR10-encoded scene (the same
+	/// encoding FinalColor has) into it. False = not handled, the caller copies the back buffer.
+	bool WriteHUDLess(WrappedResource* a_hudless);
+
+	/// (43c) Whether this frame's scene will be produced for HDR; usable before Main_PostProcessing
+	/// has started (DLSS 5's placement decision).
+	bool WillSceneBeHDR();
+
+	/// (43c) NIS in an HDR session. The image is the fp16 scene target: copy it into the sharpener's
+	/// input (display gamma for SDR frames; display-linear for HDR frames in "Linear" mode). False =
+	/// do not sharpen this frame. a_linear tells the caller which NIS HDR mode to use.
+	bool PrepareNISInput(ID3D11Resource* a_bound, ID3D11UnorderedAccessView* a_nisInput, bool& a_linear);
+	/// (43c) The sharpener's output back into the fp16 scene target.
+	void FinishNIS(ID3D11ShaderResourceView* a_nisOutput, bool a_linear);
+
+	/// (43c) DLSS-G status bits from a failed state query, for the HDR status lines.
+	void NoteDLSSGStatus(uint32_t a_status);
 
 	/// The Present hook, around menu->DrawOverlay(): ImGui goes to the UI layer when there is one.
 	void BeginImGui();

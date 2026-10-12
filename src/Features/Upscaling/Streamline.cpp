@@ -684,6 +684,47 @@ sl::Result Streamline::SetTagsForLatchedFrame(const sl::ResourceTag* a_tags, uin
 	return slSetTagForFrame(*frameToken, viewport, a_tags, a_numTags, a_commandList);
 }
 
+namespace
+{
+	/// (batch 43) The DLSSGStatus bits by name (sl_dlss_g.h), and the HDR one called out on its own
+	/// line, since native HDR output is the first thing here that can trigger it.
+	std::string DescribeDLSSGStatus(sl::DLSSGStatus a_status)
+	{
+		const auto bits = static_cast<uint32_t>(a_status);
+		if (bits == 0)
+			return "eOk";
+		std::string text;
+		auto add = [&](uint32_t a_bit, const char* a_name) {
+			if (bits & a_bit) {
+				if (!text.empty())
+					text += " | ";
+				text += a_name;
+			}
+		};
+		add(static_cast<uint32_t>(sl::DLSSGStatus::eFailResolutionTooLow), "eFailResolutionTooLow");
+		add(static_cast<uint32_t>(sl::DLSSGStatus::eFailReflexNotDetectedAtRuntime), "eFailReflexNotDetectedAtRuntime");
+		add(static_cast<uint32_t>(sl::DLSSGStatus::eFailHDRFormatNotSupported), "eFailHDRFormatNotSupported");
+		add(static_cast<uint32_t>(sl::DLSSGStatus::eFailCommonConstantsInvalid), "eFailCommonConstantsInvalid");
+		add(static_cast<uint32_t>(sl::DLSSGStatus::eFailGetCurrentBackBufferIndexNotCalled), "eFailGetCurrentBackBufferIndexNotCalled");
+		if (text.empty())
+			text = std::format("0x{:X}", bits);
+		return text;
+	}
+
+	void LogDLSSGStatusFailure(sl::DLSSGStatus a_status)
+	{
+		const auto bits = static_cast<uint32_t>(a_status);
+		if (bits == 0)
+			return;
+		HDROutput::NoteDLSSGStatus(bits);
+		if (bits & static_cast<uint32_t>(sl::DLSSGStatus::eFailHDRFormatNotSupported)) {
+			const auto& swapChain = globals::features::upscaling.dx12SwapChain;
+			logger::error("[HDR] DLSS-G reports eFailHDRFormatNotSupported: it does not accept swap-chain format {} with the current colour space (HDR output {})",
+				static_cast<uint32_t>(swapChain.swapChainDesc.Format), HDROutput::IsOutputActive() ? "on" : "off");
+		}
+	}
+}
+
 void Streamline::FallbackDLSSG(const char* a_reason, sl::Result a_result, sl::DLSSGStatus a_status)
 {
 	if (dlssGStateFallbackApplied)
@@ -693,7 +734,9 @@ void Streamline::FallbackDLSSG(const char* a_reason, sl::Result a_result, sl::DL
 	dlssGRuntimeFaulted = true;
 	dlssGActive = false;
 	dlssGOptionsInitialized = true;
-	logger::error("[Streamline] DLSS-G {} (result={}, status={}); disabling DLSS-G for this session", a_reason, magic_enum::enum_name(a_result), static_cast<uint32_t>(a_status));
+	LogDLSSGStatusFailure(a_status);
+	logger::error("[Streamline] DLSS-G {} (result={}, status={} = {}); disabling DLSS-G for this session", a_reason, magic_enum::enum_name(a_result),
+		static_cast<uint32_t>(a_status), DescribeDLSSGStatus(a_status));
 
 	if (slDLSSGSetOptions != nullptr) {
 		sl::DLSSGOptions options{};
@@ -875,8 +918,9 @@ bool Streamline::GetDLSSGState(sl::DLSSGState& a_state)
 		// Same rule as a refused SetOptions: a multi-frame configuration that DLSS-G accepted but
 		// then could not run is first taken back to 2x, which the next SetDLSSGMode applies on
 		// the following Present. Only a failure at 2x reaches the session-wide fallback.
-		logger::warn("[Streamline] DLSS-G reported a failure at {}x (result={}, status={}); falling back to 2x",
-			dlssGAppliedFramesToGenerate + 1, magic_enum::enum_name(result), static_cast<uint32_t>(a_state.status));
+		LogDLSSGStatusFailure(a_state.status);
+		logger::warn("[Streamline] DLSS-G reported a failure at {}x (result={}, status={} = {}); falling back to 2x",
+			dlssGAppliedFramesToGenerate + 1, magic_enum::enum_name(result), static_cast<uint32_t>(a_state.status), DescribeDLSSGStatus(a_state.status));
 		dlssGRejectedFramesToGenerate = dlssGAppliedFramesToGenerate;
 		return false;
 	}
@@ -1488,7 +1532,7 @@ void Streamline::DestroyDLSSRRResources(bool modeSwitch)
 	slFreeResources(sl::kFeatureDLSS_RR, viewport);
 }
 
-void Streamline::ApplyNISSharpening(ID3D12Resource* a_inputColorTexture, ID3D12Resource* a_outputTexture, float sharpness, ID3D12GraphicsCommandList* a_commandList)
+void Streamline::ApplyNISSharpening(ID3D12Resource* a_inputColorTexture, ID3D12Resource* a_outputTexture, float sharpness, ID3D12GraphicsCommandList* a_commandList, bool a_linearHDR)
 {
 	if (!featureNIS) {
 		return;
@@ -1499,7 +1543,7 @@ void Streamline::ApplyNISSharpening(ID3D12Resource* a_inputColorTexture, ID3D12R
 	sl::NISOptions nisOptions{};
 	nisOptions.mode = sl::NISMode::eSharpen;
 	nisOptions.sharpness = std::clamp(sharpness, 0.0f, 1.0f);
-	nisOptions.hdrMode = sl::NISHDR::eNone;
+	nisOptions.hdrMode = a_linearHDR ? sl::NISHDR::eLinear : sl::NISHDR::eNone;
 
 	if (SL_FAILED(result, slNISSetOptions(viewport, nisOptions))) {
 		logger::error("[Streamline] Could not set NIS options");

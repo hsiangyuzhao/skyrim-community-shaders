@@ -174,6 +174,9 @@ public:
 	IDXGISwapChain4* GetNativeSwapChain() const;
 
 	void SetUIBuffer();
+	/// (batch 43) Take DLSS-G through its resume warm-up (generation off for one aligned frame), so it
+	/// does not interpolate across a change of output encoding (HDR output switched on or off).
+	void RequestDLSSGResume(const char* a_reason);
 	void MarkDLSSGSceneResourcesReady(uint32_t a_frameIndex);
 	void SetDLSSGInputExtent(uint32_t a_width, uint32_t a_height, uint32_t a_frameIndex);
 	uint32_t GetDLSSGInputWidth() const;

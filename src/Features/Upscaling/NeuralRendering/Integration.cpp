@@ -565,7 +565,11 @@ namespace NeuralRendering
 		// is 2560x1440.
 		const std::uint32_t renderWidth = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(screen.x * scale.x)), 1u, std::max(outputWidth, 1u));
 		const std::uint32_t renderHeight = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::lround(screen.y * scale.y)), 1u, std::max(outputHeight, 1u));
-		const bool before = nr.runBeforeUpscaling;
+		// (batch 43) HDR output: the after-upscaling model only knows SDR, and the image there is HDR. Run
+		// before upscaling, tone-matched (the curve is built from Color Grading's SDR LUT and inverted
+		// exactly), whatever the placement setting says.
+		const bool hdrForcesBefore = HDROutput::WillSceneBeHDR();
+		const bool before = nr.runBeforeUpscaling || hdrForcesBefore;
 		// (batch 42a) One model resolution per placement.
 		const std::uint32_t modelPercent = ClampModelPercent(before ? nr.modelResolutionPercent : nr.modelResolutionPercentAfter);
 
@@ -581,7 +585,7 @@ namespace NeuralRendering
 		g_status.modelPercent = modelPercent;
 		// (batch 38c)
 		const bool pad = nr.padToNetworkGrid;
-		const bool toneMatched = before && nr.toneMatchedInput;
+		const bool toneMatched = before && (nr.toneMatchedInput || hdrForcesBefore);
 		const std::uint32_t inputPrecision = before ? std::min(nr.inputPrecision, 2u) : 0u;
 		const float toneStrength = std::clamp(before ? nr.tonePreservationBefore : nr.tonePreservationAfter, 0.0f, 1.0f);
 		const bool toneOn = toneStrength > 0.0f;
