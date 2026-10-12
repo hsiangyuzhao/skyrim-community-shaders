@@ -46,6 +46,9 @@ namespace Skin
 		// WetnessFilmStrength). The indirect lobe never reads these two.
 		float WetFilmRoughness;
 		float WetFilmEnergy;
+		// (43b, "Uniform (natural)" coverage) Droplet detail: a small multiplier on the direct
+		// film highlight only, around 1 and never below 0.5 (no holes). 1 = no detail.
+		float WetFilmDetail;
 	};
 
 	SkinSurfaceProperties InitSkinSurfaceProperties()
@@ -67,6 +70,7 @@ namespace Skin
 		skin.WetnessFilmStrength = 1.0;
 		skin.WetFilmRoughness = WATER_ROUGHNESS;
 		skin.WetFilmEnergy = -1.0;
+		skin.WetFilmDetail = 1.0;
 		return skin;
 	}
 
@@ -199,7 +203,7 @@ namespace Skin
 		// max, its own roughness); otherwise the original Advanced Skin film.
 		const bool wetFilmOverride = skin.WetFilmEnergy >= 0.0;
 		if (wetFilmOverride ? (skin.WetFilmEnergy > 0.0) : (skin.Wetness > 0.0)) {
-			const float wetnessEnergy = wetFilmOverride ? skin.WetFilmEnergy : GetWetnessOpticalResponse(skin.Wetness) * max(skin.WetnessFilmStrength, 0.0f);
+			const float wetnessEnergy = (wetFilmOverride ? skin.WetFilmEnergy : GetWetnessOpticalResponse(skin.Wetness) * max(skin.WetnessFilmStrength, 0.0f)) * skin.WetFilmDetail;
 			const float wetRoughness = wetFilmOverride ? skin.WetFilmRoughness : WATER_ROUGHNESS;
 			float3 wetnessF;
 			float WNdotL = clamp(dot(WN, L), 1e-5, 1.0);
@@ -389,6 +393,16 @@ namespace Skin
 		}
 
 		return pow(sweat_intensity, 0.1f);
+	}
+
+	// (43b) Fine droplet / rivulet height for "Uniform (natural)" coverage, 0..1 around 0.5.
+	// Unlike PerlinNoise it is never thresholded, so it can only tilt the film normal and
+	// nudge its highlight; it cannot cut the film into wet and dry patches. Three octaves
+	// going finer (lacunarity 2, persistence 0.5); FBM fades each octave to its mean before it
+	// would alias, so far away the film is simply smooth.
+	float WetDetailHeight(float2 uv, float scale)
+	{
+		return FBM(uv, scale, 3, 2.0f, 0.5f, 7.375f);
 	}
 #endif
 

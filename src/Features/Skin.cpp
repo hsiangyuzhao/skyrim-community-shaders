@@ -39,7 +39,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	FuzzStrength,
 	FuzzRoughness,
 	FuzzF0,
-	UseDynamicWetness);
+	UseDynamicWetness,
+	SkinWetnessCoverage,
+	WetDropletDetail);
 
 void Skin::DrawSettings()
 {
@@ -147,10 +149,34 @@ void Skin::DrawSettings()
 			ImGui::Text("Stamina fraction at which sweat reaches full strength.");
 	}
 
+	// (43b) How the wet film covers the skin.
+	{
+		static const char* coverageModes[] = { "Advanced Skin noise (original)", "Uniform (natural)" };
+		int coverage = settings.SkinWetnessCoverage == 0 ? 0 : 1;
+		if (ImGui::Combo("Skin Wetness Coverage", &coverage, coverageModes, IM_ARRAYSIZE(coverageModes)))
+			settings.SkinWetnessCoverage = static_cast<uint32_t>(coverage);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			Util::DrawMultiLineTooltip({ "Uniform (natural): an even, thin film over all wet skin. The same slider value looks the same on every skin mod,",
+				"with or without _wet mask textures (those masks are ignored, and mask-less skins are no longer halved).",
+				"Advanced Skin noise (original): the older wet/dry noise pattern; on some skins it shows as blotches." });
+		}
+		ImGui::BeginDisabled(settings.SkinWetnessCoverage == 0);
+		ImGui::SliderFloat("Droplet / Rivulet Detail", &settings.WetDropletDetail, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			Util::DrawMultiLineTooltip({ "Fine droplets and rivulets on top of the uniform film: they only bend the shine a little.",
+				"They never make dry spots. 0 = perfectly smooth film. Size follows the Perlin Noise Scale below. Uniform only." });
+		}
+		ImGui::EndDisabled();
+	}
+
 	ImGui::SliderFloat("Wetness Perlin Noise Scale", &settings.WetParams.x, 0.0f, 1024.0f, "%1.f");
+	ImGui::BeginDisabled(settings.SkinWetnessCoverage != 0);
 	ImGui::SliderFloat("Wetness Perlin Noise Lacunarity", &settings.WetParams.y, 0.0f, 2.0f, "%.1f");
 	ImGui::SliderFloat("Wetness Perlin Noise Persistence", &settings.WetParams.z, 0.0f, 20.0f, "%.2f");
 	ImGui::SliderFloat("Wetness Normal Scale", &settings.WetParams.w, 0.0f, 20.0f, "%.1f");
+	ImGui::EndDisabled();
+	if (settings.SkinWetnessCoverage != 0)
+		ImGui::TextDisabled("(Lacunarity, Persistence and Normal Scale: original coverage only)");
 	ImGui::SliderFloat("Wetness Film Strength", &settings.WetnessFilmStrength, 0.0f, 3.0f, "%.2f");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("How visible the wet/sweat film on skin is (shine and darkening), without changing its pattern.");
@@ -293,7 +319,10 @@ Skin::SkinData Skin::GetCommonBufferData()
 	data.skinParams = float4(settings.SkinMainRoughness, settings.SkinSecondRoughness, settings.SkinSpecularTexMultiplier, float(settings.EnableSkin));
 	data.skinParams2 = float4(settings.SecondarySpecularStrength, settings.ExtraSkinWetness, settings.F0, settings.BaseColorMultiplier);
 	data.skinDetailParams = float4(settings.SkinDetailTiling, settings.BodyTilingMultiplier, settings.SkinDetailStrength, float(settings.EnableSkinDetail && settings.EnableSkin));
-	data.sssParams = float4(settings.Translucency, settings.sssWidth, 0.0f, float(settings.UseSSS));
+	// (43b) sssParams.z: Skin Wetness Coverage. >= 0 = Uniform, the value being the droplet
+	// detail; -1 = the original Advanced Skin noise coverage. No layout change.
+	const float wetCoverage = settings.SkinWetnessCoverage != 0 ? std::clamp(settings.WetDropletDetail, 0.0f, 1.0f) : -1.0f;
+	data.sssParams = float4(settings.Translucency, settings.sssWidth, wetCoverage, float(settings.UseSSS));
 	data.fuzzParams = float4(settings.FuzzStrength, settings.FuzzRoughness, settings.FuzzF0, settings.ExtraEdgeRoughness);
 	data.physicalParams = float4(settings.PhysicalMainRoughnessMultiplier, settings.PhysicalSecondRoughnessMultiplier, settings.PhysicalSpecularStrength, settings.WetnessFilmStrength);
 	data.wetParams = settings.WetParams;

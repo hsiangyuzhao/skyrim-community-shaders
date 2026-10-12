@@ -74,6 +74,10 @@ struct Skin : Feature
 		float FuzzRoughness = 0.35f;
 		float FuzzF0 = 0.045f;
 		bool UseDynamicWetness = false;
+		// (43b) Skin Wetness Coverage: 0 = Advanced Skin noise (original, 42c / 41b exactly),
+		// 1 = Uniform (natural): smooth coverage, no _wet mask, no halving for mask-less skins.
+		uint32_t SkinWetnessCoverage = 1;
+		float WetDropletDetail = 0.15f;  // (43b) Uniform only: fine droplet / rivulet normal detail, 0..1
 	} settings;
 
 	struct alignas(16) SkinData

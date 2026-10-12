@@ -389,6 +389,8 @@ void WetnessEffects::DrawSettings()
 			Util::DrawMultiLineTooltip({ "Rain also drives the Advanced Skin water film (its rivulet normals and the softer subsurface glow), not only swimming and sweat.",
 				"Needs Advanced Skin enabled. Off: rain only uses the generic wet highlight on skin." });
 		}
+		// (43b) The skin film's coverage lives with the other skin wetness settings.
+		ImGui::TextDisabled("Skin film coverage (Uniform / original noise) and Droplet Detail: Advanced Skin menu.");
 		ImGui::TreePop();
 	}
 

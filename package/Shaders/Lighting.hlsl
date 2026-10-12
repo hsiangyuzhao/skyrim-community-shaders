@@ -2191,7 +2191,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float2 wetUV = uv * SharedData::skinData.skinDetailParams.y;
 #		endif
 	float2 dynamicWet = Skin::GetWetness(input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z, worldNormal.xyz);
-	float skinFilmStrength = clamp(dynamicWet.x + dynamicWet.y + SharedData::skinData.skinParams2.y, 0.f, 2.f) * (hasSkinWetness ? 1.0 : 0.5);
+	// (43b) Skin Wetness Coverage (Advanced Skin menu). sssParams.z >= 0: "Uniform (natural)",
+	// and the value is the Droplet / Rivulet Detail; < 0: "Advanced Skin noise (original)",
+	// which keeps the 42c / 41b code below exactly. Uniform does not halve the strength of skins
+	// without a _wet mask: every skin gets the same response from the same slider.
+	const float skinWetDetail = SharedData::skinData.sssParams.z;
+	const bool skinWetUniform = skinWetDetail >= 0.0;
+	float skinFilmStrength = clamp(dynamicWet.x + dynamicWet.y + SharedData::skinData.skinParams2.y, 0.f, 2.f) * ((hasSkinWetness || skinWetUniform) ? 1.0 : 0.5);
 	// (42c, 4.3) Rain feeds the same film as swimming and sweat: its share of the strength is
 	// remembered so the sky occlusion can be applied to it later (the probes are sampled after
 	// the normal is final) and so it never raises the G-buffer gloss.
@@ -2201,7 +2207,19 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		skinRainStrength = saturate(SharedData::wetnessEffectsSettings.SkinWetness * SharedData::wetnessEffectsSettings.Wetness);
 #		endif
 	const float skinRainShare = skinRainStrength / max(skinFilmStrength + skinRainStrength, 1e-4);
-	float skinWetness = Skin::PerlinNoise(wetUV, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z, min(skinFilmStrength + skinRainStrength, 2.f));
+	// (43b) Uniform: smooth coverage saturate(strength), no Perlin threshold and no _wet mask
+	// (the mask is set to 1 for every skin). Calibration: the film is as wet as the Diamond
+	// female skin was at the same slider value. Its _wet masks average about 2.3 %, so a full
+	// film there had wetness 0.023; Uniform uses 0.025 x coverage for every skin. Film
+	// highlight, G-buffer gloss and darkening all read this one smooth value, so one slider
+	// gives one look on every skin mod.
+	float skinWetness;
+	float skinWetDetailMod = 1.0;
+	if (skinWetUniform) {
+		skinWetness = 0.025 * saturate(skinFilmStrength + skinRainStrength);
+		skinWetMask = 1.0;
+	} else
+		skinWetness = Skin::PerlinNoise(wetUV, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z, min(skinFilmStrength + skinRainStrength, 2.f));
 	if ((SharedData::skinData.skinDetailParams.w > 0.0f || skinWetness > 0.0f) && skinEnabled) {
 #		if defined(FACEGEN)
 		float2 detailUV = input.TexCoord0.xy * SharedData::skinData.skinDetailParams.x;
@@ -2225,8 +2243,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		originalWorldNormal = worldNormal.xyz;
 		wetWorldNormal = worldNormal.xyz;
 		if (skinWetness > 0.0f) {
-			float3 wetNormal = Skin::CalculateNormalFromHeight(skinWetness, SharedData::skinData.wetParams.w * 0.0005, uv);
-			if (hasSkinWetness) {
+			float3 wetNormal;
+			if (skinWetUniform) {
+				// (43b) Droplet / Rivulet Detail: a fine, never-thresholded height tilts the film
+				// normal (rivulet normals, size from the Perlin Noise Scale) and moves the direct
+				// film highlight by at most +-40 % x detail. Coverage stays smooth.
+				const float wetDetailHeight = skinWetDetail > 0.0 ? Skin::WetDetailHeight(wetUV, max(SharedData::skinData.wetParams.x * 0.25, 1.0)) : 0.5;
+				wetNormal = Skin::CalculateNormalFromHeight(wetDetailHeight, 0.01 * skinWetDetail, uv);
+				skinWetDetailMod = 1.0 + 0.4 * saturate(skinWetDetail) * (2.0 * wetDetailHeight - 1.0);
+			} else
+				wetNormal = Skin::CalculateNormalFromHeight(skinWetness, SharedData::skinData.wetParams.w * 0.0005, uv);
+			if (hasSkinWetness && !skinWetUniform) {
 				// float3 wetMaskNormal = Skin::CalculateNormalFromHeight(skinWetMask, SharedData::skinData.wetParams.w * 0.00005, uv);
 				float3 wetMaskNormal = (skinWetnessNormal.xyz * 2.0 - 1.0);
 				wetNormal = Skin::ReorientNormal(wetMaskNormal, wetNormal);
@@ -2967,6 +2994,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	const float skinWetMaskCoverage = saturate(skinWetMask);
 	skinSurfaceProperties.Wetness = saturate(skinWetness * skinWetMaskCoverage);
 	skinSurfaceProperties.WetnessFilmStrength = max(SharedData::skinData.physicalParams.w, 0.0f);
+	skinSurfaceProperties.WetFilmDetail = skinWetDetailMod;  // (43b) 1 unless Uniform with droplet detail
 
 	if (skinRoughnessSet) {
 		skinSurfaceProperties.F0 = 0.08f * skinSpecular * SharedData::skinData.physicalParams.z;
