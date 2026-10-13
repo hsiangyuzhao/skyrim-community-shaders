@@ -44,7 +44,7 @@ namespace RayTracingRT
 	// Process exit: no GPU wait (the GPU work of a closing game does not matter any more).
 	Backend::~Backend() { Shutdown(false); }
 
-	bool Backend::Fail(const char* a_operation, HRESULT a_result)
+	bool Backend::Fail(const std::string& a_operation, HRESULT a_result)
 	{
 		lastError_ = std::format("{} failed ({})", a_operation, HrString(a_result));
 		if (device_) {
@@ -303,8 +303,57 @@ namespace RayTracingRT
 		return resource;
 	}
 
-	bool Backend::CreateSharedTexture(std::uint32_t a_width, std::uint32_t a_height, DXGI_FORMAT a_format, SharedTexture& o_texture, const char* a_name)
+	bool Backend::CheckSharedFormat(DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store, const char* a_name)
 	{
+		// A D3D11 texture shared with D3D12 needs a format the driver marks as shareable: the
+		// two-channel formats (R32G32, R8G8, ...) are not on the guaranteed list and the driver
+		// refuses them with E_INVALIDARG. Every bit this texture relies on is checked here so a
+		// refusal names the exact reason instead of failing inside CreateTexture2D.
+		UINT support11 = 0;
+		if (FAILED(device11_->CheckFormatSupport(a_format, &support11)))
+			support11 = 0;
+		D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support11b{ a_format, 0 };
+		if (FAILED(device11_->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support11b, sizeof(support11b))))
+			support11b.OutFormatSupport2 = 0;
+		D3D12_FEATURE_DATA_FORMAT_SUPPORT support12{ a_format, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE };
+		if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support12, sizeof(support12))))
+			support12 = { a_format, D3D12_FORMAT_SUPPORT1_NONE, D3D12_FORMAT_SUPPORT2_NONE };
+
+		std::string missing;
+		auto need = [&](bool a_ok, const char* a_what) {
+			if (!a_ok)
+				missing += missing.empty() ? std::string(a_what) : std::string(", ") + a_what;
+		};
+		need((support11b.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_SHAREABLE) != 0, "D3D11 shareable");
+		need((support11 & D3D11_FORMAT_SUPPORT_TEXTURE2D) != 0, "D3D11 texture2D");
+		need((support11 & D3D11_FORMAT_SUPPORT_SHADER_LOAD) != 0, "D3D11 shader load");
+		need((support11 & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) != 0, "D3D11 typed UAV");
+		need(!a_d3d11Store || (support11b.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0, "D3D11 typed UAV store");
+		need((support12.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) != 0, "D3D12 texture2D");
+		need((support12.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD) != 0, "D3D12 shader load");
+		need(!a_d3d12Store || (support12.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0, "D3D12 typed UAV");
+		need(!a_d3d12Store || (support12.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0, "D3D12 typed UAV store");
+
+		const std::string bits = std::format("format {}, D3D11 support 0x{:08X} / 0x{:08X}, D3D12 support 0x{:08X} / 0x{:08X}",
+			static_cast<int>(a_format), support11, support11b.OutFormatSupport2, static_cast<std::uint32_t>(support12.Support1),
+			static_cast<std::uint32_t>(support12.Support2));
+		if (!missing.empty()) {
+			lastError_ = std::format("{}: the GPU / driver lacks {} ({})", a_name, missing, bits);
+			logger::error("[RayTracing] {}", lastError_);
+			failed_ = true;
+			return false;
+		}
+		logger::info("[RayTracing] {}: {}", a_name, bits);
+		return true;
+	}
+
+	bool Backend::CreateSharedTexture(std::uint32_t a_width, std::uint32_t a_height, DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store,
+		SharedTexture& o_texture, const char* a_name)
+	{
+		if (!CheckSharedFormat(a_format, a_d3d11Store, a_d3d12Store, a_name))
+			return false;
+		// Same creation path as Neural Rendering's D3D12Interop (proven in game): D3D11 creates the
+		// texture with an NT handle, D3D12 opens it (state COMMON, no simultaneous access).
 		D3D11_TEXTURE2D_DESC desc{};
 		desc.Width = a_width;
 		desc.Height = a_height;
@@ -316,23 +365,24 @@ namespace RayTracingRT
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 		desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
 		SharedTexture texture;
+		const std::string what = std::format("{} ({}x{}, format {})", a_name, a_width, a_height, static_cast<int>(a_format));
 		HRESULT hr = device11_->CreateTexture2D(&desc, nullptr, &texture.resource11);
 		if (FAILED(hr))
-			return Fail("CreateTexture2D (shared)", hr);
+			return Fail(std::format("CreateTexture2D (shared) {}", what), hr);
 		Util::SetResourceName(texture.resource11.Get(), a_name);
 		if (FAILED(hr = device11_->CreateShaderResourceView(texture.resource11.Get(), nullptr, &texture.srv11)) ||
 			FAILED(hr = device11_->CreateUnorderedAccessView(texture.resource11.Get(), nullptr, &texture.uav11)))
-			return Fail("shared texture views", hr);
+			return Fail(std::format("shared texture views {}", what), hr);
 		ComPtr<IDXGIResource1> dxgiResource;
 		if (FAILED(hr = texture.resource11.As(&dxgiResource)))
 			return Fail("IDXGIResource1", hr);
 		HANDLE handle = nullptr;
 		if (FAILED(hr = dxgiResource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle)))
-			return Fail("CreateSharedHandle (texture)", hr);
+			return Fail(std::format("CreateSharedHandle {}", what), hr);
 		hr = device_->OpenSharedHandle(handle, IID_PPV_ARGS(&texture.resource12));
 		CloseHandle(handle);
 		if (FAILED(hr))
-			return Fail("OpenSharedHandle (texture)", hr);
+			return Fail(std::format("OpenSharedHandle {}", what), hr);
 		o_texture = std::move(texture);
 		return true;
 	}
@@ -351,14 +401,17 @@ namespace RayTracingRT
 		depthMask_ = {};
 		visibility_ = {};
 		textureWidth_ = textureHeight_ = 0;
-		if (!CreateSharedTexture(a_width, a_height, DXGI_FORMAT_R32G32_FLOAT, depthMask_, "RayTracing DepthMask") ||
-			!CreateSharedTexture(a_width, a_height, DXGI_FORMAT_R8G8_UNORM, visibility_, "RayTracing Visibility")) {
+		// Only formats on D3D11's guaranteed-shareable list (R32_FLOAT and R8G8B8A8_UNORM are also
+		// what Neural Rendering shares in game). DepthMask: depth, sign bit = engine mask already 0
+		// (written by D3D11, read by D3D12). Visibility: r visibility, g coverage (written by D3D12).
+		if (!CreateSharedTexture(a_width, a_height, kDepthMaskFormat, true, false, depthMask_, "RayTracing DepthMask") ||
+			!CreateSharedTexture(a_width, a_height, kVisibilityFormat, false, true, visibility_, "RayTracing Visibility")) {
 			o_reason = lastError_;
 			return false;
 		}
 		textureWidth_ = a_width;
 		textureHeight_ = a_height;
-		stats_.sharedTextureBytes = static_cast<std::uint64_t>(a_width) * a_height * (8 + 2);
+		stats_.sharedTextureBytes = static_cast<std::uint64_t>(a_width) * a_height * (4 + 4);
 		WriteDescriptors();
 		logger::info("[RayTracing] Shared textures {}x{}", a_width, a_height);
 		return true;
@@ -368,14 +421,14 @@ namespace RayTracingRT
 	{
 		auto cpu = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
 		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-		srvDesc.Format = DXGI_FORMAT_R32G32_FLOAT;
+		srvDesc.Format = kDepthMaskFormat;
 		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srvDesc.Texture2D.MipLevels = 1;
 		device_->CreateShaderResourceView(depthMask_.resource12.Get(), &srvDesc, cpu);
 		cpu.ptr += descriptorSize_;
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-		uavDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+		uavDesc.Format = kVisibilityFormat;
 		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 		device_->CreateUnorderedAccessView(visibility_.resource12.Get(), nullptr, &uavDesc, cpu);
 	}

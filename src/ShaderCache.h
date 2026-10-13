@@ -10,7 +10,7 @@
 // Shader source edits no longer need a bump: Info.ini carries a fingerprint of Data/Shaders, and a
 // mismatch drops the per-descriptor cache while the content store restores unchanged shaders.
 // Still bump this when C++ changes how a descriptor maps to defines (GetShaderDefines etc.).
-static constexpr REL::Version SHADER_CACHE_VERSION = { 0, 0, 0, 75 };
+static constexpr REL::Version SHADER_CACHE_VERSION = { 0, 0, 0, 76 };
 
 using namespace std::chrono;
 

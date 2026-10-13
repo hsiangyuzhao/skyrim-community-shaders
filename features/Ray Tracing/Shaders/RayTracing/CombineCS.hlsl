@@ -11,8 +11,8 @@
 #include "RayTracing/Common.hlsli"
 
 Texture2D<float4> Mask : register(t0);
-Texture2D<float2> Visibility : register(t1);
-Texture2D<float2> DepthMask : register(t2);
+Texture2D<unorm float4> Visibility : register(t1);  // r visibility, g coverage (R8G8B8A8_UNORM)
+Texture2D<float> DepthMask : register(t2);  // signed depth, see PrepareCS (R32_FLOAT)
 
 RWTexture2D<unorm float4> OutMask : register(u0);
 RWTexture2D<unorm float> ScreenSpaceShadows : register(u1);
@@ -25,7 +25,7 @@ RWTexture2D<unorm float4> DebugColor : register(u2);
 
 	float4 mask = Mask[p];
 	const float engineMask = mask.x;
-	const float depth = DepthMask[p].x;
+	const float depth = abs(DepthMask[p]);
 	const uint flags = asuint(Band.z);
 	const uint view = Size.z;
 
@@ -48,7 +48,7 @@ RWTexture2D<unorm float4> DebugColor : register(u2);
 			for (int dy = -radius; dy <= radius; ++dy) {
 				for (int dx = -radius; dx <= radius; ++dx) {
 					const int2 q = clamp(p + int2(dx, dy), int2(0, 0), int2(Size.xy) - 1);
-					const float dq = DepthMask[q].x;
+					const float dq = abs(DepthMask[q]);
 					if (RTIsSky(dq))
 						continue;
 					const float distQ = length(RTPosition(q, dq));

@@ -151,7 +151,8 @@ ID3D11ComputeShader* RayTracing::GetShader(winrt::com_ptr<ID3D11ComputeShader>& 
 void RayTracing::Disable(Status a_status, std::string a_reason)
 {
 	status = a_status;
-	statusReason = std::move(a_reason);
+	statusReason = a_reason.empty() ? std::string("unknown error (see the log)") : std::move(a_reason);
+	lastFailureReason = statusReason;
 	activeThisFrame = false;
 	RayTracingCasterFilter::Clear();
 	scene.ReleaseAll(backend);
@@ -165,19 +166,27 @@ bool RayTracing::EnsureBackend()
 {
 	if (backend.IsReady())
 		return true;
-	if (backendTried)
+	if (backendTried) {
+		// Never sit at "Starting": a start-up that already failed shows its reason (and Try Again).
+		if (status != Status::Unavailable && status != Status::Failed) {
+			status = Status::Unavailable;
+			statusReason = lastFailureReason.empty() ? std::string("start-up failed (see the log)") : lastFailureReason;
+		}
 		return false;
+	}
 	backendTried = true;
 	std::string reason;
 	try {
 		if (!backend.Initialize(globals::d3d::device, globals::d3d::context, reason)) {
 			status = Status::Unavailable;
 			statusReason = reason;
+			lastFailureReason = reason;
 			return false;
 		}
 	} catch (const std::exception& e) {
 		status = Status::Unavailable;
 		statusReason = std::format("exception during start-up: {}", e.what());
+		lastFailureReason = statusReason;
 		logger::error("[RayTracing] {}", statusReason);
 		backend.Shutdown(false);
 		return false;
@@ -288,7 +297,7 @@ void RayTracing::Prepass()
 	const std::int64_t start = Qpc();
 
 	if (!settings.Enabled) {
-		if (status != Status::Off && status != Status::Unavailable) {
+		if (status != Status::Off) {
 			// Switched off: the scene goes (BLASes retire on the GPU's schedule); the device stays.
 			RayTracingCasterFilter::Clear();
 			if (backend.IsReady())
@@ -297,6 +306,8 @@ void RayTracing::Prepass()
 			statusReason.clear();
 			logger::info("[RayTracing] Switched off");
 		}
+		// Switching back on is a fresh attempt (also after a failure), never a silent "Starting".
+		backendTried = false;
 		if (backend.IsReady())
 			backend.Tick();
 		traceSample = {};
@@ -605,11 +616,11 @@ void RayTracing::DrawSettings()
 			statusText = settings.Enabled ? "Starting" : "Off";
 			break;
 		case Status::Unavailable:
-			statusText = "Not available";
+			statusText = "Off, could not start (the game's shadows are used)";
 			color = { 1.0f, 0.4f, 0.3f, 1.0f };
 			break;
 		case Status::Failed:
-			statusText = "Stopped after an error (the game's shadows are used)";
+			statusText = "Off, stopped after an error (the game's shadows are used)";
 			color = { 1.0f, 0.4f, 0.3f, 1.0f };
 			break;
 		case Status::Inactive:
@@ -626,8 +637,15 @@ void RayTracing::DrawSettings()
 		}
 		ImGui::TextColored(color, "Status: %s", statusText);
 		if (!statusReason.empty()) {
-			ImGui::SameLine();
-			ImGui::TextDisabled("(%s)", statusReason.c_str());
+			if (status == Status::Unavailable || status == Status::Failed) {
+				// The reason is the whole point here (and can be long): its own wrapped line.
+				ImGui::PushStyleColor(ImGuiCol_Text, color);
+				ImGui::TextWrapped("Reason: %s", statusReason.c_str());
+				ImGui::PopStyleColor();
+			} else {
+				ImGui::SameLine();
+				ImGui::TextDisabled("(%s)", statusReason.c_str());
+			}
 		}
 		if (status == Status::Unavailable || status == Status::Failed) {
 			if (ImGui::Button("Try Again")) {

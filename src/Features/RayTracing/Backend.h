@@ -134,6 +134,9 @@ namespace RayTracingRT
 	private:
 		static constexpr std::size_t kContexts = 8;
 		static constexpr std::uint32_t kPostbuildSlots = 1024;
+		// Both on D3D11's guaranteed-shareable list; the shaders' declared types follow these.
+		static constexpr DXGI_FORMAT kDepthMaskFormat = DXGI_FORMAT_R32_FLOAT;        // depth; negative = engine mask already 0
+		static constexpr DXGI_FORMAT kVisibilityFormat = DXGI_FORMAT_R8G8B8A8_UNORM;  // r visibility, g coverage
 
 		struct SharedTexture
 		{
@@ -181,12 +184,14 @@ namespace RayTracingRT
 			std::uint64_t* counter;  // stat to subtract from when released (may be null)
 		};
 
-		bool Fail(const char* a_operation, HRESULT a_result);
+		bool Fail(const std::string& a_operation, HRESULT a_result);
 		void Retire(ComPtr<ID3D12Pageable> a_object, std::uint64_t a_bytes, std::uint64_t* a_counter);
 		void CollectRetired();
 		void CollectTimestamps(std::size_t a_index);
 		ComPtr<ID3D12Resource> CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav);
-		bool CreateSharedTexture(std::uint32_t a_width, std::uint32_t a_height, DXGI_FORMAT a_format, SharedTexture& o_texture, const char* a_name);
+		bool CheckSharedFormat(DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store, const char* a_name);
+		bool CreateSharedTexture(std::uint32_t a_width, std::uint32_t a_height, DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store,
+			SharedTexture& o_texture, const char* a_name);
 		bool CreatePipeline(std::string& o_reason);
 		void WriteDescriptors();
 		bool EnsureScratch(std::uint64_t a_bytes);
@@ -212,8 +217,8 @@ namespace RayTracingRT
 		ComPtr<ID3D12DescriptorHeap> descriptorHeap_;
 		UINT descriptorSize_ = 0;
 
-		SharedTexture depthMask_;   // R32G32_FLOAT: depth, engine sun mask
-		SharedTexture visibility_;  // R8G8_UNORM: visibility, coverage
+		SharedTexture depthMask_;   // kDepthMaskFormat
+		SharedTexture visibility_;  // kVisibilityFormat
 		std::uint32_t textureWidth_ = 0, textureHeight_ = 0;
 
 		ComPtr<ID3D12Resource> tlas_;

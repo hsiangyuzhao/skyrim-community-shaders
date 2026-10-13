@@ -3,9 +3,9 @@
 // Compiled at build time with the Windows SDK's dxc (see CMakeLists.txt, "Ray Tracing DXIL")
 // and embedded in the DLL; it runs on the feature's own D3D12 queue, never on the game's D3D11
 // device. Inputs are D3D11 textures shared with D3D12:
-//   t1 DepthMask.x = the game's depth after the depth prepass (same value the engine's shadow
-//                    mask pass read), .y = the engine's sun shadow mask (red channel).
-// Output u0: .x = sun visibility (1 lit, 0 shadow), .y = 1 where the surface itself is in the
+//   t1 DepthMask (R32_FLOAT): |value| = the game's depth after the depth prepass (the value the
+//      engine's shadow mask pass read); negative where the engine's sun shadow mask is already 0.
+// Output u0 (R8G8B8A8_UNORM): .x = sun visibility (1 lit, 0 shadow), .y = 1 where the surface is in the
 // BLAS set (only computed for the coverage debug view).
 //
 // Positions are camera-relative (the game's CameraPosAdjust space): the TLAS is built with
@@ -23,8 +23,8 @@ struct TraceConstants
 
 ConstantBuffer<TraceConstants> C : register(b0);
 RaytracingAccelerationStructure Scene : register(t0);
-Texture2D<float2> DepthMask : register(t1);
-RWTexture2D<float2> Output : register(u0);
+Texture2D<float> DepthMask : register(t1);
+RWTexture2D<unorm float4> Output : register(u0);
 
 static const uint kFlagSkipShadowed = 1u;  // engine mask already 0: min() keeps 0, skip the rays
 static const uint kFlagCoverage = 2u;      // also probe whether the surface itself is ray-traceable
@@ -62,17 +62,17 @@ bool AnyHit(float3 origin, float3 direction, float tMax)
 	if (any(float2(p) >= C.RenderSize.xy))
 		return;
 
-	const float2 dm = DepthMask[p];
-	const float depth = dm.x;
+	const float dm = DepthMask[p];
+	const float depth = abs(dm);
 	const uint flags = asuint(C.Params.z);
 	if (depth >= 0.999999 || depth <= 0.0) {
-		Output[p] = float2(1.0, 0.0);
+		Output[p] = float4(1.0, 0.0, 0.0, 0.0);
 		return;
 	}
 
 	const float3 P = PositionAt(p, depth);
 	if (P.x < C.Rect.x || P.y < C.Rect.y || P.x > C.Rect.z || P.y > C.Rect.w) {
-		Output[p] = float2(1.0, 0.0);
+		Output[p] = float4(1.0, 0.0, 0.0, 0.0);
 		return;
 	}
 
@@ -80,7 +80,7 @@ bool AnyHit(float3 origin, float3 direction, float tMax)
 	const int2 maxP = int2(C.RenderSize.xy) - 1;
 	const int2 pl = int2(max(p.x - 1, 0), p.y), pr = int2(min(p.x + 1, maxP.x), p.y);
 	const int2 pu = int2(p.x, max(p.y - 1, 0)), pd = int2(p.x, min(p.y + 1, maxP.y));
-	const float dl = DepthMask[pl].x, dr = DepthMask[pr].x, du = DepthMask[pu].x, dd = DepthMask[pd].x;
+	const float dl = abs(DepthMask[pl]), dr = abs(DepthMask[pr]), du = abs(DepthMask[pu]), dd = abs(DepthMask[pd]);
 	const float3 dx = abs(dl - depth) < abs(dr - depth) ? P - PositionAt(pl, dl) : PositionAt(pr, dr) - P;
 	const float3 dy = abs(du - depth) < abs(dd - depth) ? P - PositionAt(pu, du) : PositionAt(pd, dd) - P;
 	float3 N = cross(dy, dx);
@@ -100,8 +100,8 @@ bool AnyHit(float3 origin, float3 direction, float tMax)
 		coverage = AnyHit(P + V * probe, -V, probe * 2.0) ? 1.0 : 0.0;
 	}
 
-	if ((flags & kFlagSkipShadowed) && dm.y <= (0.5 / 255.0)) {
-		Output[p] = float2(0.0, coverage);
+	if ((flags & kFlagSkipShadowed) && dm < 0.0) {
+		Output[p] = float4(0.0, coverage, 0.0, 0.0);
 		return;
 	}
 
@@ -128,5 +128,5 @@ bool AnyHit(float3 origin, float3 direction, float tMax)
 		hits += AnyHit(origin, dir, C.Params.w) ? 1u : 0u;
 	}
 
-	Output[p] = float2(1.0 - float(hits) / float(rays), coverage);
+	Output[p] = float4(1.0 - float(hits) / float(rays), coverage, 0.0, 0.0);
 }

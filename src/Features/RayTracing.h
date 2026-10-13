@@ -150,6 +150,7 @@ private:
 
 	Status status = Status::Off;
 	std::string statusReason;
+	std::string lastFailureReason;  // shown again if the start-up is not retried (45d)
 	bool backendTried = false;
 	bool activeThisFrame = false;
 	bool combinedThisFrame = false;
