@@ -295,12 +295,15 @@ PS_OUTPUT main(PS_INPUT input)
 	baseColor = PParams.xxxx * (-baseColor + blendColor) + baseColor;
 #		endif
 
-#		if defined(PS_CLOUDS) && defined(CLOUD_SHADOWS) 
+#		if defined(PS_CLOUDS) && defined(CLOUD_SHADOWS)
+	// (44h) "Moonlight on Clouds": the moons' light, added after the weather's cloud colour below.
+	float3 cloudMoonLight = 0.0;
 	if (SharedData::physSkyData.enabled) {
 		// (42b) "Cloud Lighting": Sun + Moons + Sky, or the single directional light as before.
-		[branch] if (SharedData::physSkyCloudData.Flags & SharedData::PhysSkyCloudFlags::MultiLight)
+		[branch] if (SharedData::physSkyCloudData.Flags & SharedData::PhysSkyCloudFlags::MultiLight) {
+			cloudMoonLight = PhysSky::CloudMoonLight(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, SampBaseSampler);
 			baseColor.rgb = PhysSky::RelightCloudMulti(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, PhysSky::SampSv, SampBaseSampler);
-		else
+		} else
 			baseColor.rgb = PhysSky::RelightCloud(baseColor, viewDir, float3(0, 0, 0) + viewDir * psCloudDist, PhysSky::SampTr, SampBaseSampler);
 	}
 #		endif
@@ -331,6 +334,9 @@ PS_OUTPUT main(PS_INPUT input)
 #		else
 	psout.Color.w = input.Color.w * baseColor.w;
 	psout.Color.xyz = Color::Sky(input.Color.xyz) * baseColor.xyz + yyy;
+#			if defined(PS_CLOUDS) && defined(CLOUD_SHADOWS)
+	psout.Color.xyz += cloudMoonLight;  // (44h) not dimmed by the (near-black night) weather cloud colour
+#			endif
 #		endif
 
 #	else

@@ -222,6 +222,14 @@ struct PhysicalSky final : public Feature
 		bool moonsFadeInDaylight = true;
 		/// (42b) How strongly: disc alpha x 1 / (1 + this x sky luminance / disc luminance).
 		float moonDaylightFade = 20.f;
+		/// (44h) "Moonlight on Clouds": the moons light the clouds after the weather's cloud colour
+		/// (near black at night) instead of through it. Off = the 42b picture exactly. Needs
+		/// Cloud Lighting "Sun + Moons + Sky".
+		bool moonCloudLight = true;
+		/// (44h) "Moonlight Strength", 0-3.
+		float moonCloudStrength = 0.5f;
+		/// (44h) "Moon Halo": forward-scatter glow on thin cloud near the moon, 0-4.
+		float moonCloudHalo = 1.f;
 
 		// (batch 37b) Upstream correctness fixes (the old master switch is gone).
 		// (44h) removed from the menu and the JSON; now fixed on (UpdateEffective() forces them on
@@ -402,6 +410,7 @@ struct PhysicalSky final : public Feature
 	{
 		kCloudMultiLight = 1u << 0,        // "Cloud Lighting: Sun + Moons + Sky"
 		kCloudMoonDaylightFade = 1u << 1,  // "Moons Fade in Daylight"
+		kCloudMoonDirect = 1u << 2,        // (44h) "Moonlight on Clouds": moons added after the weather cloud colour
 	};
 	struct CloudCbData
 	{
@@ -412,7 +421,9 @@ struct PhysicalSky final : public Feature
 		float3 secundaColor = {};
 		float heightOffset = 0.f;  // game units
 		float moonDaylightFade = 0.f;
-		float pad0[3] = {};
+		float moonCloudStrength = 0.f;    // (44h) "Moonlight Strength"
+		float moonCloudHalo = 0.f;        // (44h) "Moon Halo"
+		float moonCloudSaturation = 0.f;  // (44h) colour kept in the moon term, fixed 0.35
 	} cloudCbData;
 	static_assert(sizeof(CloudCbData) == 64);
 	/// (42b) Fills cloudCbData. a_exposure as for the LUTs, a_sunElevation (radians) of the LUTs' sun.

@@ -125,6 +125,9 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.cloudLightHeightKm = o_json.value("cloudLightHeightKm", defaults.cloudLightHeightKm);
 		// (44h) moonsFadeInDaylight no longer loaded: fixed on in UpdateEffective().
 		settings.moonDaylightFade = o_json.value("moonDaylightFade", defaults.moonDaylightFade);
+		settings.moonCloudLight = o_json.value("moonCloudLight", defaults.moonCloudLight);
+		settings.moonCloudStrength = o_json.value("moonCloudStrength", defaults.moonCloudStrength);
+		settings.moonCloudHalo = o_json.value("moonCloudHalo", defaults.moonCloudHalo);
 	}
 	settings.skyModel = std::clamp(settings.skyModel, 0, kSkyModelCount - 1);
 	settings.nightBaseLight = std::clamp(settings.nightBaseLight, 0.f, 1.f);
@@ -133,6 +136,8 @@ void PhysicalSky::LoadSettings(json& o_json)
 	settings.cloudSkyAmbient = std::clamp(settings.cloudSkyAmbient, 0.f, 4.f);
 	settings.cloudLightHeightKm = std::clamp(settings.cloudLightHeightKm, 0.5f, 12.f);
 	settings.moonDaylightFade = std::clamp(settings.moonDaylightFade, 0.f, 100.f);
+	settings.moonCloudStrength = std::clamp(settings.moonCloudStrength, 0.f, 3.f);
+	settings.moonCloudHalo = std::clamp(settings.moonCloudHalo, 0.f, 4.f);
 
 	// (batch 37b) A saved whitelist replaces the default one wholesale. Merge the defaults back
 	// in, except those the user removed, so defaults added later still reach older configs.
@@ -273,6 +278,9 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["cloudLightHeightKm"] = settings.cloudLightHeightKm;
 	// (44h) moonsFadeInDaylight no longer saved: fixed on in UpdateEffective().
 	o_json["moonDaylightFade"] = settings.moonDaylightFade;
+	o_json["moonCloudLight"] = settings.moonCloudLight;
+	o_json["moonCloudStrength"] = settings.moonCloudStrength;
+	o_json["moonCloudHalo"] = settings.moonCloudHalo;
 }
 
 void PhysicalSky::DrawSettings()
@@ -750,6 +758,17 @@ void PhysicalSky::SettingsClouds()
 				"How high the clouds count as for catching the sun (the drawn clouds do not move). Higher = they\n"
 				"stay lit longer after sunset and light up earlier before sunrise, redder. Default 2 km: lit until\n"
 				"the sun is about 1.5 degrees below the horizon (more with a longer Twilight Length).");
+		ImGui::Checkbox("Moonlight on Clouds", &settings.moonCloudLight);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Lets the moons light up the night clouds (the weather's dark night cloud colour no longer\nswallows it). Off = clouds look exactly as before.");
+		if (settings.moonCloudLight) {
+			ImGui::SliderFloat("Moonlight Strength", &settings.moonCloudStrength, 0.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How bright the moonlight on clouds is. Default 0.5.");
+			ImGui::SliderFloat("Moon Halo", &settings.moonCloudHalo, 0.f, 4.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Extra glow on thin clouds right around the moon. 0 = none. Default 1.");
+		}
 	}
 
 	ImGui::SliderFloat("Vanilla Mix", &settings.cloudOriginalMix, 0.f, 2.f, "%.2f");
@@ -1156,6 +1175,15 @@ void PhysicalSky::UpdateCloudData(float a_exposure, float a_sunElevation)
 		cloudCbData.secundaColor = settings.secundaColor * (scale * secunda);
 	}
 
+	// (44h) "Moonlight on Clouds": Sky.hlsl takes the moons out of RelightCloudMulti and adds them
+	// after the weather's cloud colour (CloudMoonLight).
+	if (s.moonCloudLight) {
+		cloudCbData.flags |= kCloudMoonDirect;
+		cloudCbData.moonCloudStrength = std::clamp(s.moonCloudStrength, 0.f, 3.f);
+		cloudCbData.moonCloudHalo = std::clamp(s.moonCloudHalo, 0.f, 4.f);
+		cloudCbData.moonCloudSaturation = 0.35f;
+	}
+
 	cloudCbData.skyAmbient = std::clamp(s.cloudSkyAmbient, 0.f, 4.f);
 	// Cloud Shadows' layer is 0.5 km above the camera's ground; only the extra goes in.
 	cloudCbData.heightOffset = (std::clamp(s.cloudLightHeightKm, 0.5f, 12.f) - 0.5f) / Util::Units::GAME_UNIT_TO_KM;
@@ -1222,6 +1250,8 @@ void PhysicalSky::UpdateEffective()
 	// 42b
 	e.cloudLighting = kCloudLightingSingle;
 	e.moonsFadeInDaylight = false;
+	// 44h
+	e.moonCloudLight = false;
 }
 
 void PhysicalSky::ApplySunLook(int a_look)

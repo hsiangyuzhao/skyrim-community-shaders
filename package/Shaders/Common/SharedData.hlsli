@@ -617,7 +617,9 @@ namespace SharedData
 		float3 SecundaColor;  // same for Secunda
 		float HeightOffset;   // extra cloud height used only for the light's transmittance / planet shadow
 		float MoonDaylightFade;  // moon disc: alpha x 1 / (1 + this x sky luminance / disc luminance)
-		float3 pad0;
+		float MoonCloudStrength;    // (44h) "Moonlight Strength" (MoonDirect only)
+		float MoonCloudHalo;        // (44h) "Moon Halo": forward-scatter glow around the moon
+		float MoonCloudSaturation;  // (44h) colour kept in the moon term (0 = grey, 1 = full)
 	};
 
 	// (44h) Mirrors DynamicSnow::MapCbData, appended at the very end of FeatureData (offset 1856).
@@ -639,6 +641,7 @@ namespace SharedData
 	{
 		static const uint MultiLight = (1 << 0);        // clouds: sun + both moons + sky (0 = the 42a single-light code)
 		static const uint MoonDaylightFade = (1 << 1);  // moon discs fade against a bright sky
+		static const uint MoonDirect = (1 << 2);        // (44h) moons light clouds after the weather colour (CloudMoonLight)
 	}
 
 	namespace PhysSkyExtFlags

@@ -468,8 +468,13 @@ float3 RelightCloudMulti(float4 baseColor, float3 viewDir, float3 cloudPosWS, Sa
 	// The sun along the same direction the sky's LUTs use (true height, Twilight Length), so the
 	// clouds turn with the sky around them; the moons along their glow's directions.
 	float3 light = CloudBodyLight(baseColor, viewDir, posPlanet, normalize(SharedData::physSkyNightData.LutSunDir), cloud.SunColor, sampTr, sampCube);
-	light += CloudBodyLight(baseColor, viewDir, posPlanet, normalize(data.masserDir), cloud.MasserColor, sampTr, sampCube);
-	light += CloudBodyLight(baseColor, viewDir, posPlanet, normalize(data.secundaDir), cloud.SecundaColor, sampTr, sampCube);
+	// (44h) With "Moonlight on Clouds" the moons go through CloudMoonLight instead (added by Sky.hlsl
+	// after the weather's cloud colour), so they are not counted twice.
+	[branch] if (!(cloud.Flags & SharedData::PhysSkyCloudFlags::MoonDirect))
+	{
+		light += CloudBodyLight(baseColor, viewDir, posPlanet, normalize(data.masserDir), cloud.MasserColor, sampTr, sampCube);
+		light += CloudBodyLight(baseColor, viewDir, posPlanet, normalize(data.secundaDir), cloud.SecundaColor, sampTr, sampCube);
+	}
 
 	// The sky's own light: the sky-view LUT (sun and moon scattering, the night base light) averaged
 	// over the upper sky, the zenith and four directions 15 degrees up. A white matte layer under an
@@ -489,6 +494,35 @@ float3 RelightCloudMulti(float4 baseColor, float3 viewDir, float3 cloudPosWS, Sa
 	float3 cloudColor = baseColor.rgb * data.cloudOriginalMix;
 	cloudColor += baseColor.a * baseColor.rgb * light;
 	return cloudColor;
+}
+
+// (44h) "Moonlight on Clouds". Sky.hlsl multiplies the relit cloud by the weather's cloud colour,
+// which is near black at night, so the moons' light on clouds was cut to a few percent. This is
+// the moons' share on its own, for Sky.hlsl to ADD after that multiply: each moon's body light
+// (as in RelightCloudMulti) x a capped forward-scatter halo, which thick cloud mostly hides, made
+// partly grey, scaled by "Moonlight Strength" and capped. 0 unless MoonDirect is set; 0 by day
+// (the moon colours carry MoonDayFade).
+float3 CloudMoonLight(float4 baseColor, float3 viewDir, float3 cloudPosWS, SamplerState sampTr, SamplerState sampCube)
+{
+	const SharedData::PhysSkyCloudData cloud = SharedData::physSkyCloudData;
+	float3 result = 0.0;
+	[branch] if ((cloud.Flags & SharedData::PhysSkyCloudFlags::MoonDirect) && baseColor.w > 0 && cloud.MoonCloudStrength > 0)
+	{
+		const SharedData::PhysSkyData data = SharedData::physSkyData;
+		const float3 posPlanet = cloudPosWS + float3(0, 0, data.zCameraPlanet + cloud.HeightOffset);
+		const float haloFade = 1.0 - 0.6 * saturate(baseColor.w);
+
+		const float3 masserDir = normalize(data.masserDir);
+		const float3 secundaDir = normalize(data.secundaDir);
+		const float masserHalo = 1.0 + min(cloud.MoonCloudHalo * Phase::HG(dot(viewDir, masserDir), 0.75), 8.0) * haloFade;
+		const float secundaHalo = 1.0 + min(cloud.MoonCloudHalo * Phase::HG(dot(viewDir, secundaDir), 0.75), 8.0) * haloFade;
+		float3 light = CloudBodyLight(baseColor, viewDir, posPlanet, masserDir, cloud.MasserColor, sampTr, sampCube) * masserHalo;
+		light += CloudBodyLight(baseColor, viewDir, posPlanet, secundaDir, cloud.SecundaColor, sampTr, sampCube) * secundaHalo;
+
+		light = lerp(Color::RGBToLuminance(light), light, saturate(cloud.MoonCloudSaturation));
+		result = min(baseColor.a * baseColor.rgb * light * cloud.MoonCloudStrength, 16.0);
+	}
+	return result;
 }
 #		endif
 #	endif
