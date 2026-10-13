@@ -422,6 +422,14 @@ public:
 private:
 	bool dlssGMapRenderingContextActive = false;
 
+	// (45a) DrawSettings sections, in page order.
+	void DrawUpscalingSettings();
+	void DrawSharpeningSettings();
+	void DrawFrameGenerationSettings();
+	void DrawLatencySettings();
+	void DrawNeuralRenderingSettings();
+	void DrawAdvancedSettings();
+
 	struct Main_UpdateJitter
 	{
 		static void thunk(RE::BSGraphics::State* a_state);

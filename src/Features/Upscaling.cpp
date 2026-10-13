@@ -8,7 +8,6 @@
 #include "Upscaling/NeuralRendering/Integration.h"
 #include "Upscaling/NeuralRendering/Renderer.h"
 #include "Upscaling/NeuralRendering/Runtime.h"
-#include "Utils/Batch38.h"
 #include "Upscaling/Streamline.h"
 #include "VR.h"
 #include <Windows.h>
@@ -216,37 +215,58 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 
 void Upscaling::DrawSettings()
 {
+	// (45a) Layout: Upscaling / Frame Generation / Latency / Neural Rendering (collapsed) /
+	// Advanced / Diagnostics (collapsed), then the HDR pointer.
+	DrawUpscalingSettings();
+
+	if (!globals::game::isVR) {
+		DrawFrameGenerationSettings();
+		DrawLatencySettings();
+	} else if (ImGui::TreeNodeEx("Frame Generation", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::Text("Frame Generation is not available on your system.\nThis requires either NVIDIA DLSS-G or AMD FSR 3.1 Frame Generation support and D3D12 interop.");
+		ImGui::TreePop();
+	}
+
+	DrawNeuralRenderingSettings();
+	DrawAdvancedSettings();
+
+	// (44a) Native HDR output and the Display / HDR info moved to their own page.
+	if (!globals::game::isVR)
+		ImGui::TextDisabled("HDR output and Display / HDR info: see the HDR Output page (Display).");
+}
+
+void Upscaling::DrawUpscalingSettings()
+{
+	if (!ImGui::TreeNodeEx("Upscaling", ImGuiTreeNodeFlags_DefaultOpen))
+		return;
+
 	// Display upscaling options in the UI
-	std::vector<std::string> upscaleModes = { "None", "TAA" };
-
-	std::string fsrLabel = "AMD FSR 3.1";
-	upscaleModes.push_back(fsrLabel);
-
-	std::string dlssLabel = "NVIDIA DLSS";
-	upscaleModes.push_back(dlssLabel);
+	const char* upscaleModes[] = { "None", "TAA", "AMD FSR 3.1", "NVIDIA DLSS" };
 
 	// Determine available modes
 	bool featureDLSS = streamline.featureDLSS;
-	bool featureFSR = true;  // FSR is always available
 
 	uint32_t* currentUpscaleMode = &settings.upscaleMethod;
-	uint32_t availableModes = 1;  // Start with TAA
-	if (featureFSR)
-		availableModes = 2;  // Add FSR
+	uint32_t availableModes = 2;  // None, TAA and FSR (FSR is always available)
 	if (featureDLSS)
 		availableModes = 3;  // Add DLSS if available
 	else
 		currentUpscaleMode = &settings.upscaleMethodNoDLSS;
 
-	// Slider for method selection
-	// Clamp the index used to read from the built label vector to avoid OOB if the stored value is stale
-	uint32_t modeLabelIndex = std::min(*currentUpscaleMode, static_cast<uint32_t>(upscaleModes.size() - 1));
-	std::string currentLabel = upscaleModes[modeLabelIndex];
-	ImGui::SliderInt("Method", (int*)currentUpscaleMode, 0, availableModes, currentLabel.c_str());
+	*currentUpscaleMode = std::min(availableModes, *currentUpscaleMode);
+
+	if (ImGui::BeginCombo("Method", upscaleModes[*currentUpscaleMode])) {
+		for (uint32_t mode = 0; mode <= availableModes; ++mode) {
+			const bool isSelected = mode == *currentUpscaleMode;
+			if (ImGui::Selectable(upscaleModes[mode], isSelected))
+				*currentUpscaleMode = mode;
+			if (isSelected)
+				ImGui::SetItemDefaultFocus();
+		}
+		ImGui::EndCombo();
+	}
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::TextUnformatted("How edges are smoothed (anti-aliasing). None = off, TAA = the game's own. FSR/DLSS can also render at a lower resolution and upscale it for more FPS (DLSS needs an NVIDIA RTX card).");
-
-	*currentUpscaleMode = std::min(availableModes, *currentUpscaleMode);
 
 	// Check the current upscale method
 	auto upscaleMethod = GetUpscaleMethod();
@@ -262,33 +282,21 @@ void Upscaling::DrawSettings()
 			presetIndex = 4 - static_cast<int>(settings.qualityMode);
 		presetIndex = std::clamp(presetIndex, 0, 4);
 
-		// Choose preset name set and the corresponding scales once, then show a
-		// single SliderInt to avoid duplicated calls.
-		const char* baseLabel = nullptr;
+		const char* baseLabel = upscaleMethod == UpscaleMethod::kDLSS ? upscalePresetsDLSS[presetIndex] : upscalePresets[presetIndex];
 
-		if (upscaleMethod == UpscaleMethod::kFSR) {
-			baseLabel = upscalePresets[presetIndex];
-		} else if (upscaleMethod == UpscaleMethod::kDLSS) {
-			baseLabel = upscalePresetsDLSS[presetIndex];
-		}
+		// Format the label with preset name and resolution scale
+		std::string labelWithScale = std::format("{} ( {:.2f}x )", baseLabel, (resolutionScale.x + resolutionScale.y) * 0.5f);
 
-		if (baseLabel) {
-			// Format the label with preset name and resolution scale
-			std::string labelWithScale = std::format("{} ( {:.2f}x )", baseLabel, (resolutionScale.x + resolutionScale.y) * 0.5f);
-
-			ImGui::SliderInt("Upscale Preset", (int*)&settings.qualityMode, 0, 4, labelWithScale.c_str());
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("Internal render resolution (the number is the upscale factor). Toward Performance = more FPS but softer image; DLAA/Native AA = full resolution, best quality, slowest.");
-		}
+		ImGui::SliderInt("Upscale Preset", (int*)&settings.qualityMode, 0, 4, labelWithScale.c_str(), ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Internal render resolution (the number is the upscale factor). Toward Performance = more FPS but softer image; DLAA/Native AA = full resolution, best quality, slowest.");
 
 		if (upscaleMethod == UpscaleMethod::kFSR) {
 			ImGui::SliderFloat("Sharpness", &settings.sharpnessFSR, 0.0f, 1.0f, "%.1f");
 			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("Sharpening applied after upscaling. Higher = crisper, but too high adds halos and shimmer.");
+				ImGui::TextUnformatted("FSR's own sharpening after upscaling. Higher = crisper, but too high adds halos and shimmer.");
 		} else if (upscaleMethod == UpscaleMethod::kDLSS) {
-			ImGui::SliderFloat("Sharpness", &settings.sharpnessDLSS, 0.0f, 1.0f, "%.1f");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("Extra sharpening (NVIDIA NIS) after DLSS. 0 = off. Higher = crisper, but too high adds halos and shimmer.");
+			DrawSharpeningSettings();
 
 			const bool rayReconstructionActive = settings.enableDLSSRR && streamline.featureDLSS_RR;
 			if (rayReconstructionActive)
@@ -311,35 +319,343 @@ void Upscaling::DrawSettings()
 
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("Which DLSS AI model to use. F-M force one model for every preset; the last option picks per preset (K for DLAA/Quality/Balanced, M for Performance, L for Ultra Performance).");
+				if (rayReconstructionActive)
+					ImGui::TextUnformatted("Not used while Ray Reconstruction is on: it has its own model (below).");
+			}
+
+			if (streamline.featureDLSS_RR) {
+				ImGui::Checkbox("Ray Reconstruction", &settings.enableDLSSRR);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::TextUnformatted("Swaps regular DLSS for Ray Reconstruction (RR), which also cleans up noisy reflections and lighting. Costs more GPU time than regular DLSS.");
+				if (settings.enableDLSSRR) {
+					// Only D and F are offered. The NVIDIA App's Ray Reconstruction dropdown exposes
+					// nothing but Recommended and Preset F, which is the only signal available from
+					// outside NVIDIA about which models are worth running at all.
+					const char* dlssdPresets[] = {
+						"D (previous default)",
+						"F (DLSS 4.5, NVIDIA's current default)"
+					};
+					int dlssdPresetIndex = settings.DLSSDPreset == static_cast<uint>(DLSSDModelPreset::kF) ? 1 : 0;
+					if (ImGui::Combo("DLSS RR Model Preset", &dlssdPresetIndex, dlssdPresets, IM_ARRAYSIZE(dlssdPresets)))
+						settings.DLSSDPreset = static_cast<uint>(dlssdPresetIndex == 1 ? DLSSDModelPreset::kF : DLSSDModelPreset::kD);
+
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::TextUnformatted("Which Ray Reconstruction AI model to use. Switches instantly, so you can compare.");
+						ImGui::TextUnformatted("F = newest model and NVIDIA's default. D = the older model this mod used before.");
+					}
+				}
 			}
 		}
 	}
 
-	if (upscaleMethod == UpscaleMethod::kDLSS && streamline.featureDLSS_RR && ImGui::TreeNodeEx("Ray Reconstruction")) {
-		ImGui::Checkbox("Enable DLSS Ray Reconstruction", &settings.enableDLSSRR);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("Swaps regular DLSS for Ray Reconstruction (RR), which also cleans up noisy reflections and lighting. Costs more GPU time than regular DLSS.");
-		if (settings.enableDLSSRR) {
-			ImGui::TextDisabled("DLSS SR model presets do not apply while Ray Reconstruction is enabled.");
+	ImGui::TreePop();
+}
 
-			// Only D and F are offered. The NVIDIA App's Ray Reconstruction dropdown exposes
-			// nothing but Recommended and Preset F, which is the only signal available from
-			// outside NVIDIA about which models are worth running at all.
-			const char* dlssdPresets[] = {
-				"D (previous default)",
-				"F (DLSS 4.5, NVIDIA's current default)"
-			};
-			int dlssdPresetIndex = settings.DLSSDPreset == static_cast<uint>(DLSSDModelPreset::kF) ? 1 : 0;
-			if (ImGui::Combo("DLSS RR Model Preset", &dlssdPresetIndex, dlssdPresets, IM_ARRAYSIZE(dlssdPresets)))
-				settings.DLSSDPreset = static_cast<uint>(dlssdPresetIndex == 1 ? DLSSDModelPreset::kF : DLSSDModelPreset::kD);
+void Upscaling::DrawSharpeningSettings()
+{
+	ImGui::SliderFloat("Sharpness", &settings.sharpnessDLSS, 0.0f, 1.0f, "%.1f");
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::TextUnformatted("Extra sharpening (NVIDIA NIS) after DLSS. 0 = off. Higher = crisper, but too high adds halos and shimmer.");
+}
 
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Which Ray Reconstruction AI model to use. Switches instantly, so you can compare.");
-				ImGui::TextUnformatted("F = newest model and NVIDIA's default. D = the older model this mod used before.");
+void Upscaling::DrawFrameGenerationSettings()
+{
+	if (!ImGui::TreeNodeEx("Frame Generation", ImGuiTreeNodeFlags_DefaultOpen))
+		return;
+
+	const auto configuredBackend = GetConfiguredFrameGenerationBackend();
+	const auto activeBackend = GetFrameGenerationBackend();
+
+	bool frameGenerationOn = settings.frameGenerationMode != 0;
+	if (ImGui::Checkbox("Frame Generation", &frameGenerationOn))
+		settings.frameGenerationMode = frameGenerationOn ? 1u : 0u;
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted("Inserts generated frames between the real ones for smoother motion. Adds some input lag.");
+		if (activeBackend == FrameGenerationBackend::kDLSSG)
+			ImGui::TextUnformatted("DLSS-G: switches live in both directions, e.g. off for Neural Rendering and back on later, no restart.");
+		else
+			ImGui::TextUnformatted("FSR 3.1: only set up at game start. If the game started with it off, switching it on needs a restart.");
+	}
+
+	if (activeBackend == FrameGenerationBackend::kDLSSG) {
+		// Only what DLSS-G reported for this session is offered. The saved preference is
+		// left alone when it is above that, so it comes back in a session that allows it.
+		const uint32_t reportedFramesMax = streamline.GetDLSSGFramesToGenerateMax();
+		const uint availableMultiplierMax = reportedFramesMax > 0 ?
+		                                        std::clamp(static_cast<uint>(reportedFramesMax) + 1u, kMinFrameGenerationMultiplier, kMaxFrameGenerationMultiplier) :
+		                                        kMinFrameGenerationMultiplier;
+		const uint shownMultiplier = std::clamp(settings.frameGenerationMultiplier, kMinFrameGenerationMultiplier, availableMultiplierMax);
+		const auto previewLabel = std::format("{}x", shownMultiplier);
+		if (ImGui::BeginCombo("Frame Generation Multiplier", previewLabel.c_str())) {
+			for (uint multiplier = kMinFrameGenerationMultiplier; multiplier <= availableMultiplierMax; ++multiplier) {
+				const bool isSelected = multiplier == shownMultiplier;
+				const auto itemLabel = std::format("{}x", multiplier);
+				if (ImGui::Selectable(itemLabel.c_str(), isSelected)) {
+					settings.frameGenerationMultiplier = multiplier;
+					// Picking a multiplier -- even the one that was refused -- is the
+					// explicit request to try it again.
+					streamline.ClearDLSSGMultiFrameRejection();
+				}
+				if (isSelected)
+					ImGui::SetItemDefaultFocus();
 			}
+			ImGui::EndCombo();
 		}
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Generated frames per real frame: 2x adds one, 3x two, 4x three. Applies instantly.");
+			ImGui::TextUnformatted("Only what DLSS-G allows on this system is listed (RTX 40: 2x unless unlocked; RTX 50: up to 4x).");
+			ImGui::TextUnformatted("At the same frame limit, higher = fewer real frames, so more input lag.");
+			if (reportedFramesMax == 0)
+				ImGui::TextUnformatted("Multipliers above 2x are listed once DLSS-G reports this system's limit.");
+			else if (reportedFramesMax == 1)
+				ImGui::TextUnformatted("DLSS-G reports 2x as this system's limit.");
+		}
+
+		if (reportedFramesMax > 0 && settings.frameGenerationMultiplier > availableMultiplierMax) {
+			ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+			ImGui::Text("Saved choice %ux is above this session's limit; using %ux.", settings.frameGenerationMultiplier, availableMultiplierMax);
+			ImGui::PopStyleColor();
+		}
+		if (const uint32_t rejectedFrames = streamline.GetDLSSGRejectedFramesToGenerate(); rejectedFrames > 0) {
+			ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+			ImGui::Text("DLSS-G refused %ux and fell back to 2x. Select it again to retry.", rejectedFrames + 1);
+			ImGui::PopStyleColor();
+		}
+	}
+
+	// One status line: what is wrong if anything is, otherwise what is running.
+	{
+		const char* backendName = activeBackend == FrameGenerationBackend::kDLSSG ? "DLSS-G" : "FSR 3.1";
+		std::vector<std::string> problems;
+
+		const bool backendPendingRestart = frameGenerationBackendLatched && configuredBackend != frameGenerationBackendAtStartup;
+		// Only the FSR path still reads its enable state once. On DLSS-G the toggle is live
+		// in both directions, so warning about a restart there would be wrong.
+		const bool enabledPendingRestart = frameGenerationBackendLatched &&
+		                                   activeBackend != FrameGenerationBackend::kDLSSG &&
+		                                   (settings.frameGenerationMode != (frameGenerationEnabledAtStartup ? 1u : 0u));
+
+		if (configuredBackend == activeBackend) {
+			if (activeBackend == FrameGenerationBackend::kDLSSG && !IsDLSSGAvailable())
+				problems.emplace_back("DLSS-G is not available through Streamline");
+			else if (activeBackend == FrameGenerationBackend::kFSR3FG && !fidelityFX.featureFSR3FG)
+				problems.emplace_back("FSR 3.1 frame generation is not available");
+		}
+		if (!isWindowed)
+			problems.emplace_back("requires windowed mode");
+		if (fidelityFXMissing && activeBackend == FrameGenerationBackend::kFSR3FG)
+			problems.emplace_back("FidelityFX DLLs are not loaded");
+		if (backendPendingRestart || enabledPendingRestart)
+			problems.emplace_back("restart the game to apply");
+
+		if (!problems.empty()) {
+			std::string line = "Status: ";
+			for (size_t i = 0; i < problems.size(); ++i) {
+				if (i)
+					line += "; ";
+				line += problems[i];
+			}
+			ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+			ImGui::TextWrapped("%s", line.c_str());
+			ImGui::PopStyleColor();
+		} else if (IsFrameGenerationActive()) {
+			ImGui::Text("Status: %s running at %ux", backendName, GetFrameGenerationAppliedMultiplier());
+		} else {
+			ImGui::TextDisabled("Status: %s available, not generating now", backendName);
+		}
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Running: the multiplier the backend accepted, not just the setting.");
+			ImGui::TextUnformatted("Not generating: switched off, or paused here (main menu, loading screens, and pause menus unless Frame Generation in Menus is on).");
+		}
+	}
+
+	ImGui::Checkbox("Frame Generation in Menus", &settings.frameGenerationAllowInMenus);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted("Keeps frame generation on in pause menus (inventory, journal, system menu), so FPS doesn't drop when one opens.");
+		ImGui::TextUnformatted("Main menu and loading screens are always excluded. Off by default: menus feel laggier with it.");
+	}
+
+	ImGui::SeparatorText("Backend (restart)");
+	{
+		const char* frameGenerationBackends[] = { "AMD FSR 3.1", "NVIDIA DLSS-G" };
+		int backendIndex = static_cast<int>(configuredBackend);
+		if (ImGui::Combo("Frame Generation Backend", &backendIndex, frameGenerationBackends, IM_ARRAYSIZE(frameGenerationBackends)))
+			settings.frameGenerationBackend = static_cast<uint>(backendIndex);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Chosen when the game starts; changing it takes effect after a restart (its availability is checked then too).");
+			ImGui::TextUnformatted("DLSS-G: the Frame Generation switch above works live in both directions.");
+			ImGui::TextUnformatted("FSR 3.1: if the game started with Frame Generation off, switching it on needs a restart.");
+		}
+		if (configuredBackend != activeBackend)
+			ImGui::TextDisabled("This session runs %s until the restart.", activeBackend == FrameGenerationBackend::kDLSSG ? "DLSS-G" : "FSR 3.1");
+	}
+
+	ImGui::TreePop();
+}
+
+void Upscaling::DrawLatencySettings()
+{
+	if (!ImGui::TreeNodeEx("Latency (NVIDIA Reflex)", ImGuiTreeNodeFlags_DefaultOpen))
+		return;
+
+	if (!streamline.featureReflex) {
+		ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+		ImGui::Text("Reflex is not available through Streamline on this system.");
+		ImGui::PopStyleColor();
 		ImGui::TreePop();
+		return;
 	}
+
+	const char* reflexModes[] = { "Off", "On", "On + Boost" };
+	int reflexModeIndex = static_cast<int>(std::min(settings.reflexMode, 2u));
+	if (ImGui::Combo("Reflex Low Latency", &reflexModeIndex, reflexModes, IM_ARRAYSIZE(reflexModes)))
+		settings.reflexMode = static_cast<uint>(reflexModeIndex);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted("Reduces input lag by stopping the CPU from queuing frames ahead of the GPU.");
+		ImGui::TextUnformatted("Boost also keeps GPU clocks high: slightly less lag for more power use; mostly useful when the GPU isn't fully busy.");
+	}
+
+	if (IsFrameGenerationRequestedNow() && settings.reflexMode == 0) {
+		ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+		ImGui::Text("Held at On: Frame Generation requires Reflex.");
+		ImGui::PopStyleColor();
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("DLSS-G needs Reflex, or input lag gets much worse. Your choice is kept and applies again once Frame Generation is off.");
+	}
+
+	int reflexFrameLimit = static_cast<int>(settings.reflexFrameLimit);
+	if (ImGui::SliderInt("Reflex Frame Limit", &reflexFrameLimit, 0, 240,
+			reflexFrameLimit > 0 ? "%d presented fps" : "Off", ImGuiSliderFlags_AlwaysClamp))
+		settings.reflexFrameLimit = static_cast<uint>(std::max(reflexFrameLimit, 0));
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted("FPS cap on frames shown, including generated ones: 120 at 2x renders 60 real frames (40 at 3x, 30 at 4x). 0 = no cap.");
+		ImGui::TextUnformatted("Best cap for VRR/G-Sync, with the least added lag. Keep it below the monitor's max refresh, and low enough to hold steady.");
+		ImGui::TextUnformatted("Keep it at or below about 180 fps: above that, latency explodes and the menu mouse becomes unusable (known issue).");
+	}
+
+	ImGui::Text("Display reports %.0f Hz", refreshRate);
+	if (settings.reflexFrameLimit > 0) {
+		if (IsFrameGenerationRequestedNow()) {
+			const uint multiplier = GetFrameGenerationAppliedMultiplier();
+			ImGui::SameLine();
+			ImGui::Text("- about %u presented from %u rendered at %ux",
+				settings.reflexFrameLimit, settings.reflexFrameLimit / multiplier, multiplier);
+		}
+		if (settings.reflexFrameLimit > refreshRate) {
+			ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+			ImGui::Text("Above the refresh rate: presentation leaves the variable-refresh window.");
+			ImGui::PopStyleColor();
+		}
+	}
+
+	sl::ReflexState reflexState{};
+	if (streamline.GetReflexState(reflexState) && reflexState.latencyReportAvailable) {
+		// The report is a 64-entry ring whose fill order is Streamline's business, so
+		// pick the newest complete frame by frameID rather than assuming an end.
+		const sl::ReflexReport* newest = nullptr;
+		for (const auto& report : reflexState.frameReport) {
+			if (report.gpuRenderEndTime > report.simStartTime && report.simStartTime != 0 &&
+				(newest == nullptr || report.frameID > newest->frameID))
+				newest = &report;
+		}
+		if (newest) {
+			// Simulation start to GPU render end: the span Reflex itself acts on, and
+			// the only one assembled entirely from markers this tree places.
+			ImGui::Text("Reported latency %.1f ms",
+				static_cast<double>(newest->gpuRenderEndTime - newest->simStartTime) / 1000.0);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Driver-measured time from game update to GPU finish for the latest frame. Excludes the monitor, so use it to compare settings, not as total input lag.");
+		}
+	}
+
+	ImGui::TreePop();
+}
+
+void Upscaling::DrawAdvancedSettings()
+{
+	if (!ImGui::TreeNodeEx("Advanced / Diagnostics"))
+		return;
+
+	if (!globals::game::isVR) {
+		// (44f, A)
+		if (streamline.featureReflex) {
+			ImGui::Checkbox("Reflex Markers at Render Start (44f)", &settings.reflexMarkersAtRenderStart);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Tells Reflex when the game really finishes its update and starts rendering, so Reflex can see the GPU is the limit and");
+				ImGui::TextUnformatted("let the CPU start the next frame later instead of waiting inside Present. Expected: 10-20 ms less input lag.");
+				ImGui::TextUnformatted("Risk: with less queued up, the game's own CPU hitches can show more. Off (default) = the old marker placement.");
+				if (!Util::EngineTiming::ProbesInstalled())
+					ImGui::TextUnformatted("Needs the Engine Timing Probes (Performance Overlay settings, SE 1.5.97 only); without them the old placement is used.");
+			}
+			if (settings.reflexMarkersAtRenderStart && !Util::EngineTiming::ProbesInstalled())
+				ImGui::TextDisabled("(probes %s: old placement in use)", Util::EngineTiming::ProbeStatus());
+		}
+
+		if (!d3d12SwapChainActive)
+			ImGui::BeginDisabled();
+
+		bool legacyFrameLimit = settings.frameLimitMode != 0;
+		if (ImGui::Checkbox("Legacy Frame Limiter (VSync off only)", &legacyFrameLimit))
+			settings.frameLimitMode = legacyFrameLimit ? 1u : 0u;
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Caps FPS to the monitor's refresh rate. Does nothing while VSync is on (e.g. set by SSE Display Tweaks).");
+			ImGui::TextUnformatted("Adds more input lag than the Reflex Frame Limit, and stacks with it; with a VRR/G-Sync monitor use that one instead.");
+		}
+
+		if (!d3d12SwapChainActive)
+			ImGui::EndDisabled();
+	}
+
+	// Streamline log level selection
+	const char* logLevels[] = { "Off", "Default", "Verbose" };
+	int logLevelIdx = static_cast<int>(std::min(settings.streamlineLogLevel, 2u));
+	if (ImGui::Combo("Streamline Logging (restart)", &logLevelIdx, logLevels, IM_ARRAYSIZE(logLevels))) {
+		settings.streamlineLogLevel = static_cast<uint>(logLevelIdx);
+	}
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted("How much the NVIDIA Streamline backend writes to its log. Useful for debugging DLSS/DLSS-G issues.");
+		ImGui::TextUnformatted("Takes effect after a restart.");
+	}
+	ImGui::Separator();
+	// FidelityFX section
+	if (ImGui::Selectable("AMD FidelityFX DLLs (click to open folder)")) {
+		ShellExecuteW(nullptr, L"open", FidelityFX::PluginDir, nullptr, nullptr, SW_SHOWNORMAL);
+	}
+	std::vector<std::string> headers = { "DLL Name", "Version" };
+	std::vector<std::vector<std::string>> ffRows;
+	for (const auto& [name, dllVersion] : FidelityFX::dllVersions)
+		ffRows.push_back({ name, dllVersion });
+	std::vector<Util::TableSortFunc> ffSorters = { nullptr, Util::VersionSortComparator };
+	Util::ShowSortedStringTableStrings(
+		"ffx_dll_versions",
+		headers,
+		ffRows,
+		0,
+		true,
+		ffSorters);
+
+	// Streamline section
+	if (ImGui::Selectable("NVIDIA Streamline DLLs (click to open folder)")) {
+		ShellExecuteW(nullptr, L"open", Streamline::PluginDir, nullptr, nullptr, SW_SHOWNORMAL);
+	}
+	std::vector<std::vector<std::string>> slRows;
+	for (const auto& [name, dllVersion] : Streamline::dllVersions)
+		slRows.push_back({ name, dllVersion });
+	std::vector<Util::TableSortFunc> slSorters = { nullptr, Util::VersionSortComparator };
+	Util::ShowSortedStringTableStrings(
+		"sl_dll_versions",
+		headers,
+		slRows,
+		0,
+		true,
+		slSorters);
+
+	ImGui::TreePop();
+}
+
+void Upscaling::DrawNeuralRenderingSettings()
+{
+	auto upscaleMethod = GetUpscaleMethod();
 
 	if (upscaleMethod == UpscaleMethod::kDLSS && !globals::game::isVR && ImGui::TreeNodeEx("Neural Rendering (DLSS 5, experimental)")) {
 		auto& nr = settings.neuralRendering;
@@ -421,8 +737,7 @@ void Upscaling::DrawSettings()
 			}
 			// (batch 43)
 			if (HDROutput::IsOutputActive())
-				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "HDR output is on: Neural Rendering runs before upscaling with tone-matched input, whatever is set here (the after-upscaling model only knows SDR).%s",
-					Batch38::IsOn() ? "" : " With Batch 38 off it is paused.");
+				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "HDR output is on: Neural Rendering runs before upscaling with tone-matched input, whatever is set here (the after-upscaling model only knows SDR).");
 
 			// (batch 42a) 100 / 67 / 50 / 40, one value per placement (after upscaling defaults to 50).
 			{
@@ -548,291 +863,6 @@ void Upscaling::DrawSettings()
 		}
 		ImGui::TreePop();
 	}
-
-	if (!globals::game::isVR) {
-		if (ImGui::TreeNodeEx("Frame Generation", ImGuiTreeNodeFlags_DefaultOpen)) {
-			ImGui::Text("Frame Generation interpolates real frames with generated ones for a smoother experience");
-
-			const char* frameGenerationBackends[] = { "AMD FSR 3.1", "NVIDIA DLSS-G" };
-			const auto configuredBackend = GetConfiguredFrameGenerationBackend();
-			int backendIndex = static_cast<int>(configuredBackend);
-			if (ImGui::Combo("Frame Generation Backend", &backendIndex, frameGenerationBackends, IM_ARRAYSIZE(frameGenerationBackends)))
-				settings.frameGenerationBackend = static_cast<uint>(backendIndex);
-
-			const auto activeBackend = GetFrameGenerationBackend();
-			if (configuredBackend != activeBackend) {
-				ImGui::TextDisabled("Backend availability will be checked after restart.");
-			} else if (configuredBackend == FrameGenerationBackend::kFSR3FG) {
-				if (fidelityFX.featureFSR3FG)
-					ImGui::Text("AMD FSR 3.1 Frame Generation is available.");
-			} else if (IsDLSSGAvailable()) {
-				ImGui::Text("NVIDIA DLSS-G Frame Generation is available.");
-			} else {
-				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Warning: NVIDIA DLSS-G is not available through Streamline");
-				ImGui::PopStyleColor();
-			}
-
-			ImGui::Text("Requires a D3D11 to D3D12 proxy which can create compatibility issues");
-			ImGui::Text("Backend is selected at game startup; changing it requires a restart");
-			if (activeBackend == FrameGenerationBackend::kDLSSG) {
-				ImGui::Text("On this backend it can be switched off and back on freely, in either direction");
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("With DLSS-G the Frame Generation switch below works live in both directions, e.g. to turn it off for Neural Rendering and back on later without restarting.");
-			} else if (frameGenerationEnabledAtStartup) {
-				ImGui::Text("This session booted with it on, so it can be switched off and back on freely");
-			} else {
-				ImGui::Text("This session booted with it off, so switching it on requires a restart");
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("FSR frame generation is only set up at game start. The DLSS-G backend doesn't have this limit.");
-			}
-
-			if (!isWindowed) {
-				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Warning: Requires windowed mode");
-				ImGui::PopStyleColor();
-			}
-
-			if (lowRefreshRate && !settings.frameGenerationForceEnable) {
-				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Warning: Requires a high refresh rate monitor or Force Enable Frame Generation");
-				ImGui::PopStyleColor();
-			}
-
-			if (fidelityFXMissing && activeBackend == FrameGenerationBackend::kFSR3FG) {
-				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Warning: FidelityFX DLLs are not loaded");
-				ImGui::PopStyleColor();
-			}
-
-			const bool backendPendingRestart = frameGenerationBackendLatched && configuredBackend != frameGenerationBackendAtStartup;
-			// Only the FSR path still reads its enable state once. On DLSS-G the toggle is live
-			// in both directions, so warning about a restart there would be wrong.
-			const bool enabledPendingRestart = frameGenerationBackendLatched &&
-			                                   activeBackend != FrameGenerationBackend::kDLSSG &&
-			                                   (settings.frameGenerationMode != (frameGenerationEnabledAtStartup ? 1u : 0u));
-			if (backendPendingRestart || enabledPendingRestart) {
-				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Warning: Restart the game to apply frame-generation changes");
-				ImGui::PopStyleColor();
-			}
-
-			std::string enabledLabel = "Enabled";
-			const char* toggleModes[] = { "Disabled", "Enabled" };
-			const char* toggleModesFG[] = { "Disabled", enabledLabel.c_str() };
-
-			ImGui::SliderInt("Frame Generation", (int*)&settings.frameGenerationMode, 0, 1, toggleModesFG[settings.frameGenerationMode]);
-
-			if (activeBackend == FrameGenerationBackend::kDLSSG) {
-				// Only what DLSS-G reported for this session is offered. The saved preference is
-				// left alone when it is above that, so it comes back in a session that allows it.
-				const uint32_t reportedFramesMax = streamline.GetDLSSGFramesToGenerateMax();
-				const uint availableMultiplierMax = reportedFramesMax > 0 ?
-				                                        std::clamp(static_cast<uint>(reportedFramesMax) + 1u, kMinFrameGenerationMultiplier, kMaxFrameGenerationMultiplier) :
-				                                        kMinFrameGenerationMultiplier;
-				const uint shownMultiplier = std::clamp(settings.frameGenerationMultiplier, kMinFrameGenerationMultiplier, availableMultiplierMax);
-				const auto previewLabel = std::format("{}x", shownMultiplier);
-				if (ImGui::BeginCombo("Frame Generation Multiplier", previewLabel.c_str())) {
-					for (uint multiplier = kMinFrameGenerationMultiplier; multiplier <= availableMultiplierMax; ++multiplier) {
-						const bool isSelected = multiplier == shownMultiplier;
-						const auto itemLabel = std::format("{}x", multiplier);
-						if (ImGui::Selectable(itemLabel.c_str(), isSelected)) {
-							settings.frameGenerationMultiplier = multiplier;
-							// Picking a multiplier -- even the one that was refused -- is the
-							// explicit request to try it again.
-							streamline.ClearDLSSGMultiFrameRejection();
-						}
-						if (isSelected)
-							ImGui::SetItemDefaultFocus();
-					}
-					ImGui::EndCombo();
-				}
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted("Generated frames per real frame: 2x adds one, 3x two, 4x three. Applies instantly.");
-					ImGui::TextUnformatted("Only what DLSS-G allows on this system is listed (RTX 40: 2x unless unlocked; RTX 50: up to 4x).");
-					ImGui::TextUnformatted("At the same frame limit, higher = fewer real frames, so more input lag.");
-				}
-
-				if (reportedFramesMax == 0) {
-					ImGui::TextDisabled("Multipliers above 2x are listed once DLSS-G reports this system's limit.");
-				} else if (reportedFramesMax == 1) {
-					ImGui::TextDisabled("DLSS-G reports 2x as this system's limit.");
-				}
-				if (reportedFramesMax > 0 && settings.frameGenerationMultiplier > availableMultiplierMax) {
-					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-					ImGui::Text("Saved choice %ux is above this session's limit; using %ux.", settings.frameGenerationMultiplier, availableMultiplierMax);
-					ImGui::PopStyleColor();
-				}
-				if (const uint32_t rejectedFrames = streamline.GetDLSSGRejectedFramesToGenerate(); rejectedFrames > 0) {
-					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-					ImGui::Text("DLSS-G refused %ux and fell back to 2x. Select it again to retry.", rejectedFrames + 1);
-					ImGui::PopStyleColor();
-				}
-				if (IsFrameGenerationActive())
-					ImGui::Text("Running: %ux (as accepted by DLSS-G)", GetFrameGenerationAppliedMultiplier());
-			}
-
-			if (!d3d12SwapChainActive)
-				ImGui::BeginDisabled();
-
-			ImGui::SliderInt("Frame Limit (VSync off only)", (int*)&settings.frameLimitMode, 0, 1, std::format("{}", toggleModes[settings.frameLimitMode]).c_str());
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Caps FPS to the monitor's refresh rate. Does nothing while VSync is on (e.g. set by SSE Display Tweaks).");
-				ImGui::TextUnformatted("Adds more input lag than the Reflex Frame Limit; with a VRR/G-Sync monitor use that one instead.");
-			}
-
-			if (!d3d12SwapChainActive)
-				ImGui::EndDisabled();
-
-			ImGui::Text("Allows frame generation to function on low refresh rate monitors");
-			ImGui::SliderInt("Force Enable Frame Generation", (int*)&settings.frameGenerationForceEnable, 0, 1, std::format("{}", toggleModes[settings.frameGenerationForceEnable]).c_str());
-
-			ImGui::Checkbox("Frame Generation in Menus", &settings.frameGenerationAllowInMenus);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Keeps frame generation on in pause menus (inventory, journal, system menu), so FPS doesn't drop when one opens.");
-				ImGui::TextUnformatted("Main menu and loading screens are always excluded. Off by default: menus feel laggier with it.");
-			}
-
-			ImGui::TreePop();
-		}
-	} else {
-		if (ImGui::TreeNodeEx("Frame Generation", ImGuiTreeNodeFlags_DefaultOpen)) {
-			ImGui::Text("Frame Generation is not available on your system.\nThis requires either NVIDIA DLSS-G or AMD FSR 3.1 Frame Generation support and D3D12 interop.");
-			ImGui::TreePop();
-		}
-	}
-
-	if (!globals::game::isVR && ImGui::TreeNodeEx("Latency (NVIDIA Reflex)")) {
-		if (!streamline.featureReflex) {
-			ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-			ImGui::Text("Reflex is not available through Streamline on this system.");
-			ImGui::PopStyleColor();
-		} else {
-			const char* reflexModes[] = { "Off", "On", "On + Boost" };
-			int reflexModeIndex = static_cast<int>(std::min(settings.reflexMode, 2u));
-			if (ImGui::Combo("Reflex Low Latency", &reflexModeIndex, reflexModes, IM_ARRAYSIZE(reflexModes)))
-				settings.reflexMode = static_cast<uint>(reflexModeIndex);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Reduces input lag by stopping the CPU from queuing frames ahead of the GPU.");
-				ImGui::TextUnformatted("Boost also keeps GPU clocks high: slightly less lag for more power use; mostly useful when the GPU isn't fully busy.");
-			}
-
-			if (IsFrameGenerationRequestedNow() && settings.reflexMode == 0) {
-				ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-				ImGui::Text("Held at On: Frame Generation requires Reflex.");
-				ImGui::PopStyleColor();
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("DLSS-G needs Reflex, or input lag gets much worse. Your choice is kept and applies again once Frame Generation is off.");
-			}
-
-			// (44f, A)
-			ImGui::Checkbox("Reflex Markers at Render Start (44f)", &settings.reflexMarkersAtRenderStart);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Tells Reflex when the game really finishes its update and starts rendering, so Reflex can see the GPU is the limit and");
-				ImGui::TextUnformatted("let the CPU start the next frame later instead of waiting inside Present. Expected: 10-20 ms less input lag.");
-				ImGui::TextUnformatted("Risk: with less queued up, the game's own CPU hitches can show more. Off (default) = the old marker placement.");
-				if (!Util::EngineTiming::ProbesInstalled())
-					ImGui::TextUnformatted("Needs the Engine Timing Probes (Performance Overlay settings, SE 1.5.97 only); without them the old placement is used.");
-			}
-			if (settings.reflexMarkersAtRenderStart && !Util::EngineTiming::ProbesInstalled())
-				ImGui::TextDisabled("(probes %s: old placement in use)", Util::EngineTiming::ProbeStatus());
-
-			int reflexFrameLimit = static_cast<int>(settings.reflexFrameLimit);
-			if (ImGui::SliderInt("Reflex Frame Limit", &reflexFrameLimit, 0, 240,
-					reflexFrameLimit > 0 ? "%d presented fps" : "Off", ImGuiSliderFlags_AlwaysClamp))
-				settings.reflexFrameLimit = static_cast<uint>(std::max(reflexFrameLimit, 0));
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("FPS cap on frames shown, including generated ones: 120 at 2x renders 60 real frames (40 at 3x, 30 at 4x). 0 = no cap.");
-				ImGui::TextUnformatted("Best cap for VRR/G-Sync, with the least added lag. Keep it below the monitor's max refresh, and low enough to hold steady.");
-			}
-
-			ImGui::Text("Display reports %.0f Hz", refreshRate);
-			if (settings.reflexFrameLimit > 0) {
-				if (IsFrameGenerationRequestedNow()) {
-					const uint multiplier = GetFrameGenerationAppliedMultiplier();
-					ImGui::Text("About %u presented, from %u rendered while generating at %ux",
-						settings.reflexFrameLimit, settings.reflexFrameLimit / multiplier, multiplier);
-				}
-				if (settings.reflexFrameLimit > refreshRate) {
-					ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
-					ImGui::Text("Above the refresh rate: presentation leaves the variable-refresh window.");
-					ImGui::PopStyleColor();
-				}
-			}
-
-			sl::ReflexState reflexState{};
-			if (streamline.GetReflexState(reflexState) && reflexState.latencyReportAvailable) {
-				// The report is a 64-entry ring whose fill order is Streamline's business, so
-				// pick the newest complete frame by frameID rather than assuming an end.
-				const sl::ReflexReport* newest = nullptr;
-				for (const auto& report : reflexState.frameReport) {
-					if (report.gpuRenderEndTime > report.simStartTime && report.simStartTime != 0 &&
-						(newest == nullptr || report.frameID > newest->frameID))
-						newest = &report;
-				}
-				if (newest) {
-					// Simulation start to GPU render end: the span Reflex itself acts on, and
-					// the only one assembled entirely from markers this tree places.
-					ImGui::Text("Reported latency %.1f ms",
-						static_cast<double>(newest->gpuRenderEndTime - newest->simStartTime) / 1000.0);
-					if (auto _tt = Util::HoverTooltipWrapper())
-						ImGui::TextUnformatted("Driver-measured time from game update to GPU finish for the latest frame. Excludes the monitor, so use it to compare settings, not as total input lag.");
-				}
-			}
-		}
-		ImGui::TreePop();
-	}
-
-	if (ImGui::TreeNodeEx("Backend Diagnostics")) {
-		// Streamline log level selection
-		const char* logLevels[] = { "Off", "Default", "Verbose" };
-		int logLevelIdx = static_cast<int>(settings.streamlineLogLevel);
-		if (ImGui::Combo("Streamline Logging", &logLevelIdx, logLevels, IM_ARRAYSIZE(logLevels))) {
-			settings.streamlineLogLevel = static_cast<uint>(logLevelIdx);
-		}
-		ImGui::TextUnformatted("Changing this requires a restart to take effect.");
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Streamline logging controls the verbosity of NVIDIA Streamline backend logs. Useful for debugging issues with DLSS/DLSS-G.");
-		}
-		ImGui::Separator();
-		// FidelityFX section
-		if (ImGui::Selectable("AMD FidelityFX DLLs (click to open folder)")) {
-			ShellExecuteW(nullptr, L"open", FidelityFX::PluginDir, nullptr, nullptr, SW_SHOWNORMAL);
-		}
-		std::vector<std::string> headers = { "DLL Name", "Version" };
-		std::vector<std::vector<std::string>> ffRows;
-		for (const auto& [name, dllVersion] : FidelityFX::dllVersions)
-			ffRows.push_back({ name, dllVersion });
-		std::vector<Util::TableSortFunc> ffSorters = { nullptr, Util::VersionSortComparator };
-		Util::ShowSortedStringTableStrings(
-			"ffx_dll_versions",
-			headers,
-			ffRows,
-			0,
-			true,
-			ffSorters);
-
-		// Streamline section
-		if (ImGui::Selectable("NVIDIA Streamline DLLs (click to open folder)")) {
-			ShellExecuteW(nullptr, L"open", Streamline::PluginDir, nullptr, nullptr, SW_SHOWNORMAL);
-		}
-		std::vector<std::vector<std::string>> slRows;
-		for (const auto& [name, dllVersion] : Streamline::dllVersions)
-			slRows.push_back({ name, dllVersion });
-		std::vector<Util::TableSortFunc> slSorters = { nullptr, Util::VersionSortComparator };
-		Util::ShowSortedStringTableStrings(
-			"sl_dll_versions",
-			headers,
-			slRows,
-			0,
-			true,
-			slSorters);
-		ImGui::TreePop();
-	}
-
-	// (44a) Native HDR output and the Display / HDR info moved to their own page.
-	if (!globals::game::isVR)
-		ImGui::TextDisabled("HDR output and Display / HDR info: see the HDR Output page (Display).");
 }
 
 void Upscaling::SaveSettingsValues(json& o_json) const
