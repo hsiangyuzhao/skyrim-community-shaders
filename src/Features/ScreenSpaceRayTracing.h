@@ -1649,6 +1649,15 @@ struct ScreenSpaceRayTracing : Feature
     /// the Buffer Viewer and the UI's status line; the draw pass itself uses the returned local.
     uint activeSamplingMode = kSamplingFull;
 
+    /// @brief (44h) True once ResolveSamplingMode has run since the last ResetFrameState, i.e.
+    /// activeSamplingMode reflects a real world frame. The UI only reports a sparse-sampling
+    /// fallback when this is set, so the main menu does not show a false alarm.
+    bool samplingResolvedSinceSetup = false;
+
+    /// @brief (44h) Last outcome ResolveSamplingMode logged, so the fallback warning / active info
+    /// line is written once per change of outcome rather than every frame.
+    int lastSamplingLogOutcome = -1000;
+
     eastl::unique_ptr<Texture2D> texSSRTConfidenceLo = nullptr;
     eastl::unique_ptr<Texture2D> texSSRTConfidenceLoBlur = nullptr;
     eastl::unique_ptr<Texture2D> texSSRTConfidenceLoDepth = nullptr;

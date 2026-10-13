@@ -188,8 +188,14 @@ void ScreenSpaceRayTracing::DrawSettings()
             ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "Sparse diffuse sampling is inactive: SHARC is enabled.");
         else
 #endif
-            if (settings.DiffuseSamplingMode != kSamplingFull && activeSamplingMode == kSamplingFull && settings.EnableDiffuse)
-            ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "Sparse diffuse sampling failed to start, so Full is running. See the log.");
+            if (settings.DiffuseSamplingMode != kSamplingFull && settings.EnableDiffuse) {
+            // (44h) activeSamplingMode only means something once ResolveSamplingMode has run for a
+            // world frame since the last SetupResources; before that (main menu) it is the initial Full.
+            if (!samplingResolvedSinceSetup)
+                ImGui::TextDisabled("Takes effect once the world is drawn.");
+            else if (activeSamplingMode == kSamplingFull)
+                ImGui::TextColored({ 1.0f, 0.7f, 0.2f, 1.0f }, "Sparse diffuse sampling failed to start, so Full is running. See the log.");
+        }
     }
 
     ImGui::SliderFloat("Specular Multiplier", &settings.SpecularMult, 0.0f, 5.0f, "%.2f");
@@ -1478,18 +1484,42 @@ uint ScreenSpaceRayTracing::ResolveSamplingMode()
     // D3D11 is a silent no-op: the ray march would write nothing, the resolve would read an
     // unwritten compact surface, and the frame would look plausible and be wrong. Same argument as
     // the whole-chain readiness guard at the top of DrawSSRTDiffuse.
-    if (mode == kSamplingHalfRes && (!raymarchDiffuseHalfResCS || !sparseResolveHalfResCS))
-        mode = kSamplingFull;
-    if (mode == kSamplingCheckerboard && (!raymarchDiffuseCheckerCS || !sparseResolveCheckerCS))
-        mode = kSamplingFull;
+    // (44h) Which fallback, if any, turned a requested sparse mode into Full. Only used for the
+    // log below; the resolution itself is unchanged.
+    const uint requestedMode = mode;
+    const char* fallbackReason = nullptr;
 
-    if (mode != kSamplingFull && !EnsureSparseResources())
+    if (mode == kSamplingHalfRes && (!raymarchDiffuseHalfResCS || !sparseResolveHalfResCS)) {
+        fallbackReason = !raymarchDiffuseHalfResCS ? (!sparseResolveHalfResCS ? "raymarchDiffuseHalfResCS and sparseResolveHalfResCS are null (shader compile failed)" : "raymarchDiffuseHalfResCS is null (shader compile failed)") : "sparseResolveHalfResCS is null (shader compile failed)";
         mode = kSamplingFull;
+    }
+    if (mode == kSamplingCheckerboard && (!raymarchDiffuseCheckerCS || !sparseResolveCheckerCS)) {
+        fallbackReason = !raymarchDiffuseCheckerCS ? (!sparseResolveCheckerCS ? "raymarchDiffuseCheckerCS and sparseResolveCheckerCS are null (shader compile failed)" : "raymarchDiffuseCheckerCS is null (shader compile failed)") : "sparseResolveCheckerCS is null (shader compile failed)";
+        mode = kSamplingFull;
+    }
+
+    if (mode != kSamplingFull && !EnsureSparseResources()) {
+        fallbackReason = "EnsureSparseResources failed (could not create the compact sparse surfaces)";
+        mode = kSamplingFull;
+    }
 
     if (mode == kSamplingFull)
         ReleaseSparseResources();
 
+    // (44h) Log once per change of outcome, never per frame. A request that was Full to begin
+    // with (setting, diffuse off, SHARC) is not a fallback and stays silent.
+    const int outcome = fallbackReason ? -1 - (int)requestedMode : (requestedMode != kSamplingFull ? (int)mode : -100);
+    if (outcome != lastSamplingLogOutcome) {
+        const char* requestedName = requestedMode == kSamplingHalfRes ? "Half-Res" : "Checkerboard";
+        if (fallbackReason)
+            logger::warn("[SSRT] Sparse diffuse sampling ({}) fell back to Full: {}", requestedName, fallbackReason);
+        else if (requestedMode != kSamplingFull)
+            logger::info("[SSRT] Sparse diffuse sampling ({}) is active", requestedName);
+        lastSamplingLogOutcome = outcome;
+    }
+
     activeSamplingMode = mode;
+    samplingResolvedSinceSetup = true;
     return mode;
 }
 
@@ -1754,6 +1784,7 @@ void ScreenSpaceRayTracing::ResetFrameState()
     // asks for a sparse mode.
     ReleaseSparseResources();
     activeSamplingMode = kSamplingFull;
+    samplingResolvedSinceSetup = false;
 }
 
 void ScreenSpaceRayTracing::ClearShaderCache()
