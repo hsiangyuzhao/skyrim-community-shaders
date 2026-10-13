@@ -349,15 +349,30 @@ namespace Util::EngineTiming
 			return;
 		}
 
-		// One code buffer for every stub, read/execute once written.
-		auto* gen = new Xbyak::CodeGenerator(static_cast<size_t>(kSiteCount) * 256, Xbyak::DontSetProtectRWE);
+		// One code buffer for every stub, in its own pages, read/execute once written. (Xbyak's
+		// ready() only changes protection for AutoGrow buffers, so the pages are flipped here.)
+		const size_t codeSize = static_cast<size_t>(kSiteCount) * 256;
+		void* code = VirtualAlloc(nullptr, codeSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+		if (!code) {
+			g_probeStatus = "failed (no code memory)";
+			logger::warn("[EngineTiming] Main::Update probes FAILED: VirtualAlloc error {}; nothing installed", GetLastError());
+			return;
+		}
+		auto* gen = new Xbyak::CodeGenerator(codeSize, code);
 		std::array<const uint8_t*, kSiteCount> stubs{};
 		for (int i = 0; i < kSiteCount; ++i) {
 			gen->align(16);
 			stubs[i] = gen->getCurr();
 			EmitStub(*gen, i, targets[i]);
 		}
-		gen->ready(Xbyak::CodeGenerator::PROTECT_RE);
+		gen->ready();
+		DWORD oldProtect = 0;
+		if (!VirtualProtect(code, codeSize, PAGE_EXECUTE_READ, &oldProtect)) {
+			g_probeStatus = "failed (protect)";
+			logger::warn("[EngineTiming] Main::Update probes FAILED: VirtualProtect error {}; nothing installed", GetLastError());
+			return;
+		}
+		FlushInstructionCache(GetCurrentProcess(), code, codeSize);
 
 		SKSE::AllocTrampoline(static_cast<size_t>(kSiteCount) * 14);
 		auto& trampoline = SKSE::GetTrampoline();
