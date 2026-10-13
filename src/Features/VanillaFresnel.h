@@ -214,9 +214,19 @@ struct VanillaFresnel : public Feature
         // sizeof stays 80 and nothing downstream in FeatureData moves. The six offsetof
         // assertions batch 15 left in src/FeatureBuffer.cpp are what proves that rather than
         // assumes it: if this struct had grown past 80 they would fail to compile.
-        float pad0 = 0.0f;
-        float pad1 = 0.0f;
-        float pad2 = 0.0f;
+        //
+        // (44h) The last three pads became the eye-reflection controls below, so sizeof stays
+        // 80 and nothing downstream in FeatureData moves. All three only act on eye materials
+        // with Enable Eye Special Handling on; each has a value that reproduces the old picture.
+        //
+        // EyeReflectionStrength: multiplies the eye's environment reflection. 1 = previous.
+        float EyeReflectionStrength = 0.35f;
+        // EyeGrazingLimit: floor on N.V for the eye's env BRDF, so the edge of the eyeball does
+        // not pick up a bright Fresnel ring. 0 = previous.
+        float EyeGrazingLimit = 0.5f;
+        // EyeBackLightCut: fades the eye's soft and rim lighting out as the light moves behind
+        // the head (L.V from 0 down to -cut). 0 = previous (off).
+        float EyeBackLightCut = 0.4f;
 	} settings;
 
 	// (batch 10b) FeatureData is a naked concatenation of every feature's settings struct

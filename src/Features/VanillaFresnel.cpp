@@ -20,7 +20,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     EyeRoughness,
     EnvMaskStrength,
     EyeSoftLightingScale,
-    ShadowSoftLighting)
+    ShadowSoftLighting,
+    EyeReflectionStrength,
+    EyeGrazingLimit,
+    EyeBackLightCut)
 // (44h) Removed from JSON after the user's review, now fixed; their old keys are ignored:
 // EyeDirectSpecularMode (pinned to Vanilla Phong), EyeDirectRoughness (only used by the GGX
 // modes; pinned to its old default 0.1). Both stay in Settings for the cbuffer layout.
@@ -140,6 +143,9 @@ void VanillaFresnel::LoadSettings(json& o_json)
     // light term, so a hand-edited 50 would not fail, it would just make eyes glow far worse
     // than the defect this setting exists to fix. The UI range is 0..1.
     settings.EyeSoftLightingScale = std::clamp(settings.EyeSoftLightingScale, 0.0f, 1.0f);
+    settings.EyeReflectionStrength = std::clamp(settings.EyeReflectionStrength, 0.0f, 1.0f);
+    settings.EyeGrazingLimit = std::clamp(settings.EyeGrazingLimit, 0.0f, 1.0f);
+    settings.EyeBackLightCut = std::clamp(settings.EyeBackLightCut, 0.0f, 1.0f);
 }
 
 void VanillaFresnel::SaveSettings(json& o_json)
@@ -218,6 +224,17 @@ void VanillaFresnel::DrawSettings()
         ImGui::Text(
             "How much of Skyrim's \"soft lighting\" (fake light glowing through thin surfaces) eyes keep. Needs Enable Eye Special Handling.\n"
             "It ignores shadows and peaks in side-on sun, so it can make eyes glow. 0 = none (matches skin with Subsurface Scattering), 1 = vanilla.");
+
+    // (44h) Eye night-glow controls. All need Enable Eye Special Handling.
+    ImGui::SliderFloat("Eye Reflection Strength", &settings.EyeReflectionStrength, 0.0f, 1.0f, "%.2f");
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text("How bright the room/sky reflection in eyes is. Lower stops eyes shining at night. 1 = old behaviour.");
+    ImGui::SliderFloat("Eye Grazing Limit", &settings.EyeGrazingLimit, 0.0f, 1.0f, "%.2f");
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text("Removes the bright ring at the edge of the eyeball. Higher = weaker ring. 0 = old behaviour.");
+    ImGui::SliderFloat("Eye Back-Light Cut", &settings.EyeBackLightCut, 0.0f, 1.0f, "%.2f");
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text("Stops lights behind the head from lighting up the eyes. Higher = cuts more. 0 = off (old behaviour).");
 
     ImGui::Checkbox("Shadow Soft/Rim/Back Lighting (Sun)", reinterpret_cast<bool*>(&settings.ShadowSoftLighting));
     if (auto _tt = Util::HoverTooltipWrapper())

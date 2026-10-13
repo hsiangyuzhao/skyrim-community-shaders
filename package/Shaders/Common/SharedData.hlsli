@@ -368,9 +368,10 @@ namespace SharedData
 		uint EyeDirectSpecularMode;
 		float EyeSoftLightingScale;
 		uint ShadowSoftLighting;
-		float pad0;
-		float pad1;
-		float pad2;
+		// (44h) Took pad0..pad2; still 20 slots = 80 bytes.
+		float EyeReflectionStrength;
+		float EyeGrazingLimit;
+		float EyeBackLightCut;
 	};
 
 	// (batch 15) Values for VanillaFresnelSettings::EyeDirectSpecularMode. Mirrors

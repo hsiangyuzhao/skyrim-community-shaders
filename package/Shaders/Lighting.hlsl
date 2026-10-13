@@ -3074,10 +3074,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// occluders. Folded to a compile-time false the ternary becomes 1.0 and the multiply
 	// disappears, so the default is a zero-instruction no-op rather than a value that happens
 	// to be one.
+	//
+	// (44h) EYE_BACK_LIGHT_GATE(L) -- same pattern. Fades the eye's soft and rim lighting out as
+	// the light moves behind the head: 1 for side light (L.V ~ 0), 0 once L.V <= -cut. A
+	// non-eye pixel (or cut 0) multiplies by exactly 1.0.
 #	if defined(VANILLA_FRESNEL)
 #		define EYE_SOFT_LIGHTING_SCALE ((enableVanillaFresnel && applyEyeHandling) ? SharedData::vanillaFresnelSettings.EyeSoftLightingScale : 1.0)
+#		define EYE_BACK_LIGHT_GATE(L) ((enableVanillaFresnel && applyEyeHandling && SharedData::vanillaFresnelSettings.EyeBackLightCut > 0.0) ? saturate((dot((L), viewDirection) + SharedData::vanillaFresnelSettings.EyeBackLightCut) / SharedData::vanillaFresnelSettings.EyeBackLightCut) : 1.0)
 #	else
 #		define EYE_SOFT_LIGHTING_SCALE 1.0
+#		define EYE_BACK_LIGHT_GATE(L) 1.0
 #	endif
 #	define SUN_SOFT_SHADOW (SharedData::vanillaFresnelSettings.ShadowSoftLighting ? dirDetailShadow : 1.0)
 
@@ -3817,11 +3823,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 dirDiffuseColor = dirLightColor * saturate(dirLightAngle) * dirDetailShadow * Color::VanillaDiffuseMult();
 
 #		if defined(SOFT_LIGHTING)
-	lightsDiffuseColor += dirLightColor * GetSoftLightMultiplier(dirLightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_SOFT_LIGHTING_SCALE * SUN_SOFT_SHADOW;
+	lightsDiffuseColor += dirLightColor * GetSoftLightMultiplier(dirLightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_SOFT_LIGHTING_SCALE * EYE_BACK_LIGHT_GATE(DirLightDirection) * SUN_SOFT_SHADOW;
 #		endif
 
 #		if defined(RIM_LIGHTING)
-	lightsDiffuseColor += dirLightColor * GetRimLightMultiplier(DirLightDirection, viewDirection, worldNormal.xyz) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * SUN_SOFT_SHADOW;
+	lightsDiffuseColor += dirLightColor * GetRimLightMultiplier(DirLightDirection, viewDirection, worldNormal.xyz) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_BACK_LIGHT_GATE(DirLightDirection) * SUN_SOFT_SHADOW;
 #		endif
 
 #		if defined(BACK_LIGHTING)
@@ -3932,11 +3938,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float3 lightDiffuseColor = lightColor * saturate(lightAngle.xxx) * Color::VanillaDiffuseMult();
 
 #				if defined(SOFT_LIGHTING)
-		lightDiffuseColor += lightColor * GetSoftLightMultiplier(lightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_SOFT_LIGHTING_SCALE;
+		lightDiffuseColor += lightColor * GetSoftLightMultiplier(lightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_SOFT_LIGHTING_SCALE * EYE_BACK_LIGHT_GATE(normalizedLightDirection);
 #				endif  // SOFT_LIGHTING
 
 #				if defined(RIM_LIGHTING)
-		lightDiffuseColor += lightColor * GetRimLightMultiplier(normalizedLightDirection, viewDirection, worldNormal.xyz) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult();
+		lightDiffuseColor += lightColor * GetRimLightMultiplier(normalizedLightDirection, viewDirection, worldNormal.xyz) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_BACK_LIGHT_GATE(normalizedLightDirection);
 #				endif  // RIM_LIGHTING
 
 #				if defined(BACK_LIGHTING)
@@ -4134,11 +4140,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float lightBacklighting = 1.0 + saturate(dot(normalizedLightDirection.xyz, viewDirection));
 
 #				if defined(SOFT_LIGHTING)
-		lightDiffuseColor += lightBacklighting * lightColor * GetSoftLightMultiplier(lightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_SOFT_LIGHTING_SCALE;
+		lightDiffuseColor += lightBacklighting * lightColor * GetSoftLightMultiplier(lightAngle) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_SOFT_LIGHTING_SCALE * EYE_BACK_LIGHT_GATE(normalizedLightDirection);
 #				endif
 
 #				if defined(RIM_LIGHTING)
-		lightDiffuseColor += lightBacklighting * lightColor * GetRimLightMultiplier(normalizedLightDirection, viewDirection, worldNormal.xyz) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult();
+		lightDiffuseColor += lightBacklighting * lightColor * GetRimLightMultiplier(normalizedLightDirection, viewDirection, worldNormal.xyz) * rimSoftLightColor.xyz * Color::VanillaDiffuseMult() * EYE_BACK_LIGHT_GATE(normalizedLightDirection);
 #				endif
 
 #				if defined(BACK_LIGHTING)
@@ -4358,6 +4364,23 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			else
 		reflectance *= envMask;
 #			endif
+#		endif
+
+#		if defined(VANILLA_FRESNEL)
+		// (44h) Eye night-glow controls, eye-only. EyeGrazingLimit re-evaluates the env BRDF
+		// GetDynamicCubemap applied with N.V floored at the limit (ratio new/old, so horizon and
+		// the env mask above are kept and the forward path is covered too); EyeReflectionStrength
+		// then scales the whole reflection. Limit 0 and strength 1 reproduce the old result.
+		if (enableVanillaFresnel && applyEyeHandling) {
+			float eyeGrazingLimit = SharedData::vanillaFresnelSettings.EyeGrazingLimit;
+			float eyeNoV = saturate(dot(worldNormal, viewDirection));
+			if (eyeGrazingLimit > 0.0 && eyeNoV < eyeGrazingLimit) {
+				float2 eyeBRDFOld = BRDF::EnvBRDF(roughness, eyeNoV);
+				float2 eyeBRDFNew = BRDF::EnvBRDF(roughness, eyeGrazingLimit);
+				reflectance *= (F0 * eyeBRDFNew.x + eyeBRDFNew.y) / max(F0 * eyeBRDFOld.x + eyeBRDFOld.y, 1e-4);
+			}
+			reflectance *= SharedData::vanillaFresnelSettings.EyeReflectionStrength;
+		}
 #		endif
 	}
 #	endif
