@@ -209,9 +209,57 @@ add_custom_command(
     COMMENT "Compiling Ray Tracing DXIL (TraceShadowsCS with RT_ALPHA, cs_6_5)"
     VERBATIM
 )
+# (45i) With RT_CHARACTERS (and RT_ALPHA): skinned characters traced by a second, character-only ray.
+set(CS_RT_CHAR_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/TraceShadowsCharCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_CHAR_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -D
+        RT_CHARACTERS=1 -Fh "${CS_RT_CHAR_SHADER_HEADER}" -Vn
+        g_TraceShadowsCharCS "${CS_RT_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (TraceShadowsCS with RT_CHARACTERS, cs_6_5)"
+    VERBATIM
+)
+set(CS_RT_CHAR_ALPHA_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/TraceShadowsCharAlphaCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_CHAR_ALPHA_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -D
+        RT_CHARACTERS=1 -D RT_ALPHA=1 -Fh "${CS_RT_CHAR_ALPHA_SHADER_HEADER}" -Vn
+        g_TraceShadowsCharAlphaCS "${CS_RT_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (TraceShadowsCS with RT_CHARACTERS and RT_ALPHA, cs_6_5)"
+    VERBATIM
+)
+set(CS_RT_SKIN_SHADER_SOURCE
+    "${CMAKE_SOURCE_DIR}/src/Features/RayTracing/Shaders/SkinCharactersCS.hlsl"
+)
+set(CS_RT_SKIN_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/SkinCharactersCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_SKIN_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -Fh
+        "${CS_RT_SKIN_SHADER_HEADER}" -Vn g_SkinCharactersCS
+        "${CS_RT_SKIN_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_SKIN_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (SkinCharactersCS, cs_6_5)"
+    VERBATIM
+)
 target_sources(
     "${PROJECT_NAME}"
-    PRIVATE "${CS_RT_SHADER_HEADER}" "${CS_RT_ALPHA_SHADER_HEADER}"
+    PRIVATE
+        "${CS_RT_SHADER_HEADER}"
+        "${CS_RT_ALPHA_SHADER_HEADER}"
+        "${CS_RT_CHAR_SHADER_HEADER}"
+        "${CS_RT_CHAR_ALPHA_SHADER_HEADER}"
+        "${CS_RT_SKIN_SHADER_HEADER}"
 )
 target_include_directories(
     "${PROJECT_NAME}"

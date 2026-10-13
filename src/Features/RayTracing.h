@@ -4,6 +4,7 @@
 #include "Feature.h"
 
 #include "Features/RayTracing/Backend.h"
+#include "Features/RayTracing/Characters.h"
 #include "Features/RayTracing/Scene.h"
 
 /**
@@ -72,6 +73,11 @@ public:
 		bool CutoutAsOpaque = true;
 		// (45h) Alpha-tested shapes (leaves, bushes, banners, fences) traced with their cut-out.
 		bool AlphaCasters = false;
+		// (45i) Characters (skinned bodies, clothes, armour, weapons) and their physics parts (HDT-SMP, hair).
+		bool Characters = false;
+		bool PhysicsParts = false;
+		bool KeepCharactersInShadowMap = false;  // debug A/B
+		float CharacterSelfShadowOffset = 6.0f;  // debug: hits on characters nearer than this are ignored (units)
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted
@@ -138,6 +144,9 @@ private:
 
 	RayTracingRT::Backend backend;
 	RayTracingScene::Scene scene;
+	RayTracingCharacters::Characters characters;  // (45i)
+	std::vector<RayTracingRT::SkinDraw> skinDraws;
+	std::vector<float> skinBones;
 	std::vector<RayTracingRT::Instance> instances;
 
 	winrt::com_ptr<ID3D11ComputeShader> prepareCS;
@@ -177,4 +186,8 @@ private:
 	bool alphaRequested = false;
 	std::string alphaOffReason;
 	void UpdateAlphaCasters();
+	// (45i) Characters: likewise.
+	bool charactersRequested = false;
+	std::string charactersOffReason;
+	void UpdateCharacters();
 };

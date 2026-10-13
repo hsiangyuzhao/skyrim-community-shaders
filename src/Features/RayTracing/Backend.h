@@ -83,6 +83,60 @@ namespace RayTracingRT
 		bool sharedPathOff = false;          // D3D12 never opened one: only copies this session
 	};
 
+	// (45i) Skinned characters: a shape's vertices in the mesh's own space with their bone indices
+	// and weights, skinned every frame on our queue (SkinCharactersCS) into a vertex buffer whose
+	// BLAS is refit (ALLOW_UPDATE / PERFORM_UPDATE) and rebuilt now and then.
+	struct SkinVertex
+	{
+		float position[3];
+		std::uint32_t bones;  // 4 x u8 bone index (into the shape's bone list)
+		float weights[4];     // normalized
+	};
+	static_assert(sizeof(SkinVertex) == 32);
+
+	struct SkinGeometry
+	{
+		std::vector<SkinVertex> vertices;
+		std::vector<std::uint32_t> indices;
+		std::vector<std::uint32_t> alphaUV;  // as ChunkGeometry::alphaUV (alpha-tested parts: hair)
+		std::uint32_t boneCount = 0;
+		[[nodiscard]] std::uint32_t Triangles() const { return static_cast<std::uint32_t>(indices.size() / 3); }
+		[[nodiscard]] std::uint32_t Vertices() const { return static_cast<std::uint32_t>(vertices.size()); }
+		[[nodiscard]] bool Opaque() const { return alphaUV.empty(); }
+	};
+
+	using SkinHandle = std::uint32_t;
+	inline constexpr SkinHandle kInvalidSkin = UINT32_MAX;
+
+	/// One skinned shape in this frame's TLAS: its bones are FrameInput::skinBones[boneOffset ..]
+	/// (12 floats each: row-major 3x4, translation relative to x, y, z).
+	struct SkinDraw
+	{
+		SkinHandle shape = kInvalidSkin;
+		double x = 0.0, y = 0.0, z = 0.0;
+		std::uint32_t boneOffset = 0;
+		std::uint32_t alphaInfo = UINT32_MAX;  // alpha-tested parts: the record (CreateSkinAlphaInfo)
+	};
+
+	struct SkinStats
+	{
+		std::uint32_t shapes = 0;             // live skinned shapes
+		std::uint32_t pending = 0;            // waiting for their upload
+		std::uint64_t vertices = 0;           // of the live shapes
+		std::uint64_t triangles = 0;
+		std::uint32_t drawsLastFrame = 0;     // skinned and in the TLAS last frame
+		std::uint64_t verticesLastFrame = 0;  // skinned last frame
+		std::uint32_t refitsLastFrame = 0;
+		std::uint32_t buildsLastFrame = 0;    // first builds and periodic rebuilds
+		std::uint32_t notReadyLastFrame = 0;  // draws not traced (not uploaded / built yet, build cap)
+		std::uint64_t buildsTotal = 0;
+		std::uint64_t bytes = 0;              // rest, index and vertex buffers + BLASes (live shapes)
+		std::uint64_t scratchBytes = 0;
+		std::uint64_t boneBytes = 0;          // per-context bone matrix uploads
+		std::uint64_t overBudget = 0;         // shapes refused: VRAM budget
+		std::uint64_t refused = 0;            // shapes refused: too big / bad data
+	};
+
 	struct TraceConstants
 	{
 		float invViewProj[16];
@@ -102,10 +156,11 @@ namespace RayTracingRT
 		kCategoryItem,     // loose items
 		kCategoryTree,     // opaque parts of trees and plants
 		kCategoryAlpha,    // (45h) alpha-tested shapes traced with their cut-out (leaves, banners, fences)
+		kCategoryCharacter,  // (45i) skinned character shapes
 		kInstanceCategories
 	};
 	inline constexpr const char* kInstanceCategoryNames[kInstanceCategories] = { "cell chunk", "door/activator/movable", "item", "tree/plant",
-		"alpha-tested" };
+		"alpha-tested", "character" };
 
 	struct Instance
 	{
@@ -134,6 +189,9 @@ namespace RayTracingRT
 		const std::vector<Instance>* instances = nullptr;
 		std::uint32_t buildTriangleBudget = 0;
 		bool validate = false;  // (45f) run the TLAS self-check on this frame's instances
+		// (45i) Skinned characters (null / empty = none: the 45h pipelines run).
+		const std::vector<SkinDraw>* skinDraws = nullptr;
+		const std::vector<float>* skinBones = nullptr;
 	};
 
 	/// (45f) TLAS contents and the placement self-check.
@@ -241,6 +299,36 @@ namespace RayTracingRT
 		/// Format of the copy layers for AlphaMaskCS (R8_UNORM, or R8G8B8A8_UNORM where R8 is not shareable).
 		[[nodiscard]] bool AlphaCopiesRgba() const { return alphaLayerFormat_ == DXGI_FORMAT_R8G8B8A8_UNORM; }
 
+		// (45i) Skinned characters. Created on first use only (never with the switch off).
+		/// The skinning shader and the character variants of the trace pipeline exist.
+		/// (With the alpha variant present, its character counterpart is needed too: a frame may hold both.)
+		[[nodiscard]] bool SkinAvailable() const
+		{
+			return ready_ && !failed_ && skinPipeline_ && charPipeline_ && (charAlphaPipeline_ || !alphaPipeline_) && skinFault_.empty();
+		}
+		/// Character variant with alpha-tested parts (hair) available too.
+		[[nodiscard]] bool SkinAlphaAvailable() const { return SkinAvailable() && charAlphaPipeline_ && AlphaAvailable(); }
+		/// Takes the geometry; its buffers are created and uploaded over the next frames (a few per
+		/// frame). kInvalidSkin when refused (counted: VRAM budget, size, alpha texcoord buffer).
+		SkinHandle CreateSkinShape(std::unique_ptr<SkinGeometry> a_geometry);
+		/// Its GPU resources go once every submission that may use them has completed.
+		void ReleaseSkinShape(SkinHandle a_shape);
+		/// Built at least once: from now on it is skinned, refit and traced on every frame it is drawn.
+		[[nodiscard]] bool IsSkinShapeReady(SkinHandle a_shape) const;
+		/// The record of an alpha-tested skinned shape (texture, threshold), as CreateAlphaInfo.
+		std::uint32_t CreateSkinAlphaInfo(SkinHandle a_shape, AlphaTexture a_texture, const AlphaMaterial& a_material);
+		[[nodiscard]] bool SkinIdle() const { return skinLive_ == 0; }
+		/// Scratch and bone uploads (only when SkinIdle()).
+		void ReleaseSkinResources();
+		/// Set when a skinning resource could not be created: the feature turns the switch off.
+		[[nodiscard]] const std::string& SkinFault() const { return skinFault_; }
+		void ClearSkinFault() { skinFault_.clear(); }
+		[[nodiscard]] const SkinStats& GetSkinStats() const { return skinStats_; }
+		/// Instance mask of character instances (TraceShadowsCS kCharacterMask); every other instance is 0xFF.
+		static constexpr std::uint32_t kCharacterMask = 0x02;
+		/// VRAM for skinned characters (buffers + BLASes); shapes past it keep their shadow-map shadow.
+		static constexpr std::uint64_t kSkinBudgetBytes = 512ull << 20;
+
 		/// True when the device was removed or a D3D12 call failed; the feature then turns itself off.
 		[[nodiscard]] bool HasFailed() const { return failed_; }
 		[[nodiscard]] const std::string& LastError() const { return lastError_; }
@@ -283,6 +371,10 @@ namespace RayTracingRT
 			void* alphaInfoMapped = nullptr;
 			std::uint32_t alphaInfoCapacity = 0;
 			std::uint64_t alphaInfoVersion = 0;
+			// (45i) This context's bone matrices (upload heap, persistently mapped).
+			ComPtr<ID3D12Resource> boneBuffer;
+			void* boneMapped = nullptr;
+			std::uint64_t boneCapacity = 0;  // bytes
 		};
 
 		enum class BlasState : std::uint8_t
@@ -357,6 +449,42 @@ namespace RayTracingRT
 		void CollectAlphaRetired(std::uint64_t a_completed);
 		bool EnsureAlphaInfoBuffer(CommandContext& a_context);
 		void UpdateAlphaTextureStats();
+
+		// (45i) Skinned characters.
+		static constexpr std::uint32_t kSkinMaxVertices = 65536;          // per shape (16-bit indices in the game's data)
+		static constexpr std::uint32_t kSkinMaxTriangles = 131072;        // per shape
+		static constexpr std::uint32_t kSkinMaxBones = 256;               // per shape (8-bit bone indices)
+		static constexpr std::uint32_t kSkinUploadsPerFrame = 8;          // new shapes made per frame
+		static constexpr std::uint32_t kSkinUploadVerticesPerFrame = 400000;
+		static constexpr std::uint32_t kSkinBuildsPerFrame = 8;           // first builds per frame (refits are never capped)
+		static constexpr std::uint32_t kSkinRebuildsPerFrame = 2;         // periodic rebuilds per frame
+		static constexpr std::uint32_t kSkinRebuildFrames = 240;          // a shape is rebuilt after this many refits
+		static constexpr std::uint64_t kSkinMaxBoneFloats = 4ull << 20;   // 16 MB of bone matrices per frame
+
+		struct SkinShape
+		{
+			bool live = false;
+			bool uploaded = false;  // buffers created and filled
+			bool built = false;     // BLAS built at least once
+			bool outputInUav = true;
+			std::unique_ptr<SkinGeometry> geometry;  // until uploaded
+			ComPtr<ID3D12Resource> rest, index, output, blas;
+			std::uint64_t restBytes = 0, indexBytes = 0, outputBytes = 0, blasBytes = 0;
+			std::uint64_t buildScratch = 0, updateScratch = 0;
+			std::uint32_t vertices = 0, triangles = 0, boneCount = 0;
+			std::uint32_t uvOffset = UINT32_MAX, uvCount = 0;  // alpha texcoords (hair)
+			std::uint32_t refits = 0;                          // since the last build
+			std::uint64_t lastSubmission = 0;                  // a shape is skinned once per frame
+			[[nodiscard]] std::uint64_t Bytes() const { return restBytes + indexBytes + outputBytes + blasBytes; }
+		};
+
+		bool CreateSkinPipelines();
+		void SetSkinFault(std::string a_reason);
+		void UploadSkinShapes(ID3D12GraphicsCommandList4* a_list);
+		/// Skins this frame's draws, builds / refits their BLASes; o_ready[i] = draw i can be traced.
+		void RecordSkinning(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, const FrameInput& a_input,
+			std::vector<std::uint8_t>& o_ready);
+		std::uint32_t CreateAlphaInfoAt(std::uint32_t a_uvOffset, std::uint32_t a_triangles, AlphaTexture a_texture, const AlphaMaterial& a_material);
 
 		struct Retired
 		{
@@ -450,6 +578,22 @@ namespace RayTracingRT
 		std::uint64_t alphaSharedOpened_ = 0;
 		std::string alphaFault_;
 		AlphaStats alphaStats_{};
+
+		// (45i) Skinned characters.
+		ComPtr<ID3D12RootSignature> skinRootSignature_;
+		ComPtr<ID3D12PipelineState> skinPipeline_;       // SkinCharactersCS
+		ComPtr<ID3D12PipelineState> charPipeline_;       // TraceShadowsCS with RT_CHARACTERS
+		ComPtr<ID3D12PipelineState> charAlphaPipeline_;  // ... and RT_ALPHA
+		std::vector<SkinShape> skins_;
+		std::vector<SkinHandle> freeSkins_;
+		std::deque<SkinHandle> skinUploadQueue_;
+		ComPtr<ID3D12Resource> skinScratch_;
+		std::uint64_t skinScratchBytes_ = 0;
+		std::uint32_t skinLive_ = 0;
+		std::string skinFault_;
+		SkinStats skinStats_{};
+		std::vector<std::uint8_t> skinReady_;  // per draw, this frame
+		bool skinRecorded_ = false;            // uploads or builds recorded in this frame's list
 
 		HANDLE fenceEvent_ = nullptr;
 		Stats stats_{};

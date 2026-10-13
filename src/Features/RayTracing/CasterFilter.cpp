@@ -12,6 +12,7 @@ namespace RayTracingCasterFilter
 		float g_rect[4]{};
 		std::uint32_t g_skipped = 0;
 		std::uint32_t g_skippedLast = 0;
+		std::uint32_t g_epoch = 1;  // (45i)
 
 		// (45f) Missed casters: seen once each (the set), handed over a few at a time (the queue).
 		constexpr std::size_t kMissedSetLimit = 16384;
@@ -86,10 +87,13 @@ namespace RayTracingCasterFilter
 	void Clear()
 	{
 		g_geometries.clear();
+		++g_epoch;
 		g_latched = false;
 		g_watch = false;
 		g_missedQueue.clear();
 	}
+
+	std::uint32_t Epoch() { return g_epoch; }
 
 	std::uint32_t RegisteredCount() { return static_cast<std::uint32_t>(g_geometries.size()); }
 

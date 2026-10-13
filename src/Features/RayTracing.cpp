@@ -15,7 +15,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	KeepCastersInShadowMap,
 	KeepScreenSpaceShadows,
 	CutoutAsOpaque,
-	AlphaCasters)
+	AlphaCasters,
+	Characters,
+	PhysicsParts,
+	KeepCharactersInShadowMap,
+	CharacterSelfShadowOffset)
 
 namespace
 {
@@ -39,7 +43,7 @@ namespace
 	constexpr float kHandOffBand = 2048.0f;       // half a cell: RT fades back to the cascades here
 	constexpr float kMaxRayLength = 16384.0f;
 	constexpr std::uint64_t kAccelerationBudgetBytes = 1200ull << 20;  // BLAS + scratch; spec target is 1.5 GB in total
-	constexpr std::uint32_t kFlagSkipShadowed = 1u, kFlagCoverage = 2u;  // TraceShadowsCS
+	constexpr std::uint32_t kFlagSkipShadowed = 1u, kFlagCoverage = 2u, kFlagFirstPerson = 4u;  // TraceShadowsCS
 	constexpr std::uint32_t kFlagHandOffSSS = 1u, kFlagDebug = 2u;       // Common.hlsli
 	constexpr std::uint32_t kAlphaCopiesPerFrame = 16;  // (45h) 256x256 alpha copies made per frame (5 small dispatches each)
 
@@ -88,6 +92,7 @@ namespace
 void RayTracing::OnLoadingScreen()
 {
 	scene.RequestFlush();
+	characters.RequestFlush();  // (45i)
 }
 
 void RayTracing::UpdateAlphaCasters()
@@ -114,6 +119,35 @@ void RayTracing::UpdateAlphaCasters()
 		backend.ReleaseAlphaResources();
 }
 
+void RayTracing::UpdateCharacters()
+{
+	// (45i) Turned on (again) by the user: an earlier automatic switch-off is forgotten.
+	if (settings.Characters && !charactersRequested) {
+		backend.ClearSkinFault();
+		charactersOffReason.clear();
+	}
+	// Any failure of its D3D12 resources switches it off (the rest of Ray Tracing goes on).
+	if (settings.Characters && !backend.SkinFault().empty()) {
+		charactersOffReason = backend.SkinFault();
+		settings.Characters = false;
+		logger::warn("[RayTracing] Characters switched off: {}", charactersOffReason);
+	} else if (settings.Characters && backend.IsReady() && !backend.SkinAvailable()) {
+		charactersOffReason = "the GPU driver did not accept the character skinning / ray query shaders";
+		settings.Characters = false;
+		logger::warn("[RayTracing] Characters switched off: {}", charactersOffReason);
+	}
+	charactersRequested = settings.Characters;
+	if (!settings.Characters || !backend.SkinAvailable()) {
+		if (!characters.Empty())
+			characters.ReleaseAll(backend);
+		if (backend.IsReady() && backend.SkinIdle())
+			backend.ReleaseSkinResources();
+		return;
+	}
+	// Alpha-tested parts (hair) need the Alpha-tested casters switch; a change re-captures them.
+	characters.Configure(settings.PhysicsParts, settings.AlphaCasters && backend.AlphaAvailable(), settings.KeepCharactersInShadowMap);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------------------------
@@ -122,6 +156,7 @@ void RayTracing::LoadSettings(json& o_json)
 {
 	settings = o_json;
 	settings.QualityLevel = std::clamp(settings.QualityLevel, 0, 2);
+	settings.CharacterSelfShadowOffset = std::isfinite(settings.CharacterSelfShadowOffset) ? std::clamp(settings.CharacterSelfShadowOffset, 0.0f, 32.0f) : 6.0f;
 	// (45h) Before the first save is loaded (no frame runs during loading screens): its textures are
 	// then created shareable when both switches are on.
 	RayTracingTextureSharing::SetEnabled(settings.Enabled && settings.AlphaCasters);
@@ -187,6 +222,7 @@ void RayTracing::Disable(Status a_status, std::string a_reason)
 	lastFailureReason = statusReason;
 	activeThisFrame = false;
 	RayTracingCasterFilter::Clear();
+	characters.ReleaseAll(backend);  // (45i) (a backend that is gone ignores the handles)
 	scene.ReleaseAll(backend);
 	// After a D3D12 failure the device is gone or unusable: no GPU wait, drop everything.
 	if (backend.HasFailed())
@@ -351,6 +387,7 @@ void RayTracing::Prepass()
 		if (status != Status::Off) {
 			// Switched off: the scene goes (BLASes retire on the GPU's schedule); the device stays.
 			RayTracingCasterFilter::Clear();
+			characters.ReleaseAll(backend);  // (45i)
 			if (backend.IsReady())
 				scene.ReleaseAll(backend);
 			status = Status::Off;
@@ -364,6 +401,8 @@ void RayTracing::Prepass()
 			backend.Tick();
 			if (backend.AlphaIdle())
 				backend.ReleaseAlphaResources();  // (45h) once the GPU is done with the released scene
+			if (backend.SkinIdle())
+				backend.ReleaseSkinResources();  // (45i)
 		}
 		traceSample = {};
 		return;
@@ -374,8 +413,10 @@ void RayTracing::Prepass()
 	try {
 		RunFrame();
 		// (45e) Captures that left the scene this frame go only now, after the trace was submitted.
-		if (backend.IsReady())
+		if (backend.IsReady()) {
 			scene.EndFrame(backend);
+			characters.EndFrame(backend);  // (45i)
+		}
 	} catch (const std::exception& e) {
 		Disable(Status::Failed, std::format("exception: {}", e.what()));
 	}
@@ -403,6 +444,7 @@ void RayTracing::RunFrame()
 		return;
 	scene.SetCutoutAsOpaque(settings.CutoutAsOpaque);  // (45g) a change re-captures the scene
 	UpdateAlphaCasters();                              // (45h) likewise
+	UpdateCharacters();                                // (45i)
 	if (status == Status::Off || status == Status::Unavailable)
 		status = Status::Waiting;
 
@@ -411,6 +453,8 @@ void RayTracing::RunFrame()
 		status = Status::Inactive;
 		statusReason = Util::IsInterior() ? "interior" : "no sky";
 		scene.Update(backend, kCaptureBudgetMs, globals::state->frameCount);  // drops exterior cells in interiors
+		if (!characters.Empty())
+			characters.ReleaseAll(backend);  // (45i) nothing is left out of the shadow maps here
 		backend.Tick();
 		return;
 	}
@@ -455,6 +499,16 @@ void RayTracing::RunFrame()
 	const bool validate = frameIndex % 30 == 0;
 	scene.CollectInstances(instances, validate);
 	scene.DescribeMissedCasters();
+	// (45i) Characters in the traced area: capture, bone matrices, draws (none with the switch off).
+	skinDraws.clear();
+	skinBones.clear();
+	if (settings.Characters && backend.SkinAvailable()) {
+		float world[4];
+		if (scene.GetLoadedRect(world, false))
+			characters.Update(backend, globals::state->frameCount, world);
+		// Every captured (and retiring) shape is traced, also on a frame without an update.
+		characters.CollectDraws(skinDraws, skinBones);
+	}
 
 	const float2 renderSize = Util::ConvertToDynamic(globals::state->screenSize);
 	const std::uint32_t width = std::min<std::uint32_t>(static_cast<std::uint32_t>(renderSize.x), desc.Width);
@@ -489,6 +543,9 @@ void RayTracing::RunFrame()
 		traceFlags |= kFlagSkipShadowed;
 	if (debugView == DebugView::Coverage || debugView == DebugView::HitDepth)
 		traceFlags |= kFlagCoverage;
+	// (45i) First person: no character ray for the arms / weapon (inside the third-person body).
+	if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); !skinDraws.empty() && playerCamera && playerCamera->IsInFirstPerson())
+		traceFlags |= kFlagFirstPerson;
 	input.constants.params[0] = static_cast<float>(preset.rays);
 	input.constants.params[1] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&input.constants.params[2], &traceFlags, sizeof(float));
@@ -501,6 +558,7 @@ void RayTracing::RunFrame()
 	input.constants.bias[0] = 2.0f;
 	input.constants.bias[1] = 0.0015f;
 	input.constants.bias[2] = 8.0f;
+	input.constants.bias[3] = skinDraws.empty() ? 0.0f : settings.CharacterSelfShadowOffset;  // (45i) character ray TMin (character variants only)
 	input.renderWidth = width;
 	input.renderHeight = height;
 	input.cameraX = camX;
@@ -509,6 +567,8 @@ void RayTracing::RunFrame()
 	input.instances = &instances;
 	input.buildTriangleBudget = kBuildBudget;
 	input.validate = validate;
+	input.skinDraws = &skinDraws;  // (45i) empty: the 45h pipelines run
+	input.skinBones = &skinBones;
 
 	auto* context = globals::d3d::context;
 	auto* screenSpaceShadows = &globals::features::screenSpaceShadows;
@@ -672,6 +732,18 @@ void RayTracing::RunFrame()
 			static_cast<std::uint32_t>(RayTracingRT::Backend::kInstanceFlags), mismatched, check.checked, check.mismatched[RayTracingRT::kCategoryCell],
 			mismatched - check.mismatched[RayTracingRT::kCategoryCell], check.mismatchedTotal, sc.missedConfirmed, reasons.empty() ? "none" : reasons,
 			sc.missedPending, sc.missedRecaptures, sc.skipped.cutoutAsOpaque, sc.alpha.registered, sc.persistentRefs, sc.persistentObjects);
+		if (settings.Characters) {
+			// (45i)
+			const auto& ch = characters.GetStats();
+			const auto& sk = backend.GetSkinStats();
+			logger::info("[RayTracing] Characters: {} actors ({} in range), {} of {} shapes traced ({} skinned, {} rigid, {} physics, {} alpha-tested), "
+						 "{} in the TLAS, {:.2f} M vertices skinned, {} refits / {} builds last frame, {:.0f} MB; left to the shadow map: physics off {}, "
+						 "alpha off {}, alpha failed {}, shader {}, type {}, no CPU data {}, bad data {}, placement {}, budget/size {}; bone indices palette {}, global {}",
+				ch.actors, ch.inRange, ch.registered, ch.shapes, ch.skinnedShapes, ch.rigidShapes, ch.physicsShapes, ch.alphaShapes, sk.drawsLastFrame,
+				static_cast<double>(sk.verticesLastFrame) / 1e6, sk.refitsLastFrame, sk.buildsLastFrame,
+				static_cast<double>(sk.bytes + sk.scratchBytes + sk.boneBytes) / (1024.0 * 1024.0), ch.skipPhysicsOff, ch.skipAlphaOff, ch.skipAlphaFailed,
+				ch.skipShader, ch.skipGeometryType, ch.skipNoCpuData, ch.skipBadData, ch.skipPlacement, ch.skipBackend, ch.paletteMode, ch.globalMode);
+		}
 	}
 }
 
@@ -713,7 +785,7 @@ void RayTracing::DrawSettings()
 		ImGui::Checkbox("Ray Tracing", &settings.Enabled);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("On: sun shadows of buildings, rocks, furniture, doors, items and tree trunks inside the loaded area are ray traced.");
-			ImGui::Text("Characters, leaves, grass and the terrain itself (hills) keep their normal shadows; the ground still receives traced shadows.");
+			ImGui::Text("Characters and leaves (unless switched on below), grass and the terrain itself (hills) keep their normal shadows; the ground still receives traced shadows.");
 			ImGui::Text("Screen Space Shadows are switched off where ray tracing is in charge.");
 			ImGui::Text("Off: the game's shadows exactly as before (nothing of this feature runs).");
 		}
@@ -738,6 +810,37 @@ void RayTracing::DrawSettings()
 		if (!alphaOffReason.empty()) {
 			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
 			ImGui::TextWrapped("Alpha-tested casters were switched off automatically: %s", alphaOffReason.c_str());
+			ImGui::PopStyleColor();
+		}
+
+		// (45i)
+		ImGui::Checkbox("Characters", &settings.Characters);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: the player and nearby NPCs and creatures (up to %u, within 40 m, inside the ray-traced area) cast ray-traced sun shadows:",
+				RayTracingCharacters::kMaxActors);
+			ImGui::Text("  body, head, clothes, armour and weapons, posed every frame (skinned on the GPU).");
+			ImGui::Text("  Hair and other cut-out parts need Alpha-tested casters too; hair and HDT-SMP parts need Physics parts.");
+			ImGui::Text("  Anything that cannot be traced keeps its normal shadow-map shadow.");
+			ImGui::Text("Off: characters keep their shadow-map shadow, exactly as before.");
+		}
+		{
+			ImGui::Indent();
+			if (!settings.Characters)
+				ImGui::BeginDisabled();
+			ImGui::Checkbox("Physics parts (HDT-SMP, hair)", &settings.PhysicsParts);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On: hair, capes, skirts and other parts moved by HDT-SMP / HDT-PE are ray traced as well (with the bones' pose of the frame).");
+				ImGui::Text("  Hair is alpha-tested: it also needs Alpha-tested casters, otherwise it keeps its shadow-map shadow.");
+				ImGui::Text("  CBPC / body physics needs nothing extra: it moves the body's own bones, which Characters follows.");
+				ImGui::Text("Off: these parts keep their shadow-map shadow. Switching re-captures the characters.");
+			}
+			if (!settings.Characters)
+				ImGui::EndDisabled();
+			ImGui::Unindent();
+		}
+		if (!charactersOffReason.empty()) {
+			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
+			ImGui::TextWrapped("Characters was switched off automatically: %s", charactersOffReason.c_str());
 			ImGui::PopStyleColor();
 		}
 
@@ -806,6 +909,7 @@ void RayTracing::DrawSettings()
 			ImGui::Text("  yellow/orange = the ray-traced scene has a surface up to a few metres IN FRONT of the depth the game wrote here:");
 			ImGui::Text("  something the game does not draw (faded out, switched off), a part that moved since capture, or a surface");
 			ImGui::Text("  missing from the depth buffer (seen through alpha-tested cut-outs). Small yellow seams along edges are harmless.");
+			ImGui::Text("  Cyan = an alpha-tested surface traced with its cut-out, purple = a ray-traced character.");
 			ImGui::Text("Raw RT Visibility: the traced result before smoothing and merging.");
 			ImGui::Text("RT Hit vs Depth: white = the ray-traced surface sits exactly where the game draws it,");
 			ImGui::Text("  red = it is in front (full red = 256 units), blue = behind, black = nothing there.");
@@ -818,6 +922,17 @@ void RayTracing::DrawSettings()
 			ImGui::Text("On: big one-sided shapes whose cut-out only trims their edges (roof tiles, plank ends, stall canopies) block the sun");
 			ImGui::Text("  in the ray tracer as if solid. Two-sided cut-outs (banners, leaves, fences with holes) and small shapes stay out.");
 			ImGui::Text("Off: every alpha-tested shape keeps its shadow-map shadow (magenta in BLAS Coverage). Switching re-captures the scene.");
+		}
+		// (45i)
+		ImGui::Checkbox("Keep Characters in the Shadow Map", &settings.KeepCharactersInShadowMap);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("A/B: normally a ray-traced character part is left out of the sun shadow map.");
+			ImGui::Text("On = it stays there too (the darker of both wins): a safety net if a character shadow goes missing.");
+		}
+		ImGui::SliderFloat("Character Self-Shadow Offset", &settings.CharacterSelfShadowOffset, 0.0f, 16.0f, "%.1f units");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Character surfaces nearer than this along a sun ray are ignored. Larger = less blocky self-shadowing");
+			ImGui::Text("  (shadow 'acne' on the body where it turns away from the sun), smaller = tighter contact shadows (feet, arms).");
 		}
 		ImGui::Checkbox("Keep Screen Space Shadows", &settings.KeepScreenSpaceShadows);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -880,11 +995,37 @@ void RayTracing::DrawSettings()
 					static_cast<unsigned long long>(ab.uvFull), static_cast<unsigned long long>(ab.infosFull));
 			}
 		}
+		{
+			// (45i) Characters.
+			const auto& ch = characters.GetStats();
+			const auto& sk = backend.GetSkinStats();
+			ImGui::Text("Characters: %u actors (%u in range), %u shapes traced of %u captured (%u skinned, %u rigid, %u physics, %u alpha-tested)",
+				ch.actors, ch.inRange, ch.registered, ch.shapes, ch.skinnedShapes, ch.rigidShapes, ch.physicsShapes, ch.alphaShapes);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Traced = in the TLAS and left out of the shadow map. Rigid = weapons, shields, quivers (one bone: the shape itself).");
+				ImGui::Text("Purple in BLAS Coverage = a character surface the ray tracer sees.");
+			}
+			ImGui::Text("  Skinned %.2f M vertices last frame, %u in the TLAS; refits %u, builds %u (%llu total), %u not ready; %u waiting for upload",
+				static_cast<double>(sk.verticesLastFrame) / 1e6, sk.drawsLastFrame, sk.refitsLastFrame, sk.buildsLastFrame,
+				static_cast<unsigned long long>(sk.buildsTotal), sk.notReadyLastFrame, sk.pending);
+			ImGui::Text("  VRAM: %s (of %s budget), scratch %s, bones %s; CPU %.2f ms (worst %.2f ms)", Megabytes(sk.bytes).c_str(),
+				Megabytes(RayTracingRT::Backend::kSkinBudgetBytes).c_str(), Megabytes(sk.scratchBytes).c_str(), Megabytes(sk.boneBytes).c_str(), ch.lastMs, ch.maxMs);
+			ImGui::Text("  Left to the shadow map: physics off %u, alpha off %u, alpha failed %u, shader %u, type %u, no CPU data %u, bad data %u,",
+				ch.skipPhysicsOff, ch.skipAlphaOff, ch.skipAlphaFailed, ch.skipShader, ch.skipGeometryType, ch.skipNoCpuData, ch.skipBadData);
+			ImGui::Text("    placement %u, budget/size %u (VRAM %llu), shape cap %u; bone indices: palette %u, global %u; faces (morphs at capture) %u",
+				ch.skipPlacement, ch.skipBackend, static_cast<unsigned long long>(sk.overBudget), ch.skipShapeCap, ch.paletteMode, ch.globalMode,
+				ch.dynamicShapes);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Each distinct shape is counted once. Placement: its skinned vertices did not fit the game's own bounds (details in the log).");
+				ImGui::Text("Shader: decals, effect shaders, alpha-blended only, does not cast shadows. Changes (equip, dismember) so far: %u.", ch.retiredShapes);
+			}
+		}
 		ImGui::Text("BLAS: %u built (%.2f M triangles), %u queued, %u instances, %llu builds total", rt.blasCount,
 			static_cast<double>(rt.blasTriangles) / 1e6, rt.blasQueued, rt.instancesLastFrame, static_cast<unsigned long long>(rt.buildsTotal));
 		const auto& alphaBytes = backend.GetAlphaStats();
 		const std::uint64_t vram = rt.blasBytes + rt.scratchBytes + rt.tlasBytes + rt.uploadBytes + rt.sharedTextureBytes + d3d11Bytes +
-		                           alphaBytes.uvBytes + alphaBytes.layerBytes + alphaBytes.infoBytes;
+		                           alphaBytes.uvBytes + alphaBytes.layerBytes + alphaBytes.infoBytes +
+		                           backend.GetSkinStats().bytes + backend.GetSkinStats().scratchBytes + backend.GetSkinStats().boneBytes;  // (45i)
 		ImGui::Text("VRAM: %s total (BLAS %s, scratch %s, TLAS %s, uploads %s, textures %s)", Megabytes(vram).c_str(),
 			Megabytes(rt.blasBytes).c_str(), Megabytes(rt.scratchBytes).c_str(), Megabytes(rt.tlasBytes).c_str(),
 			Megabytes(rt.uploadBytes).c_str(), Megabytes(rt.sharedTextureBytes + d3d11Bytes).c_str());
@@ -898,8 +1039,10 @@ void RayTracing::DrawSettings()
 		ImGui::Text("CPU: %.2f ms this frame, capture %.2f ms (worst %.2f ms, last cell %.1f ms in total)", lastCpuMs, sc.lastGatherMs,
 			sc.maxGatherMs, sc.lastCellMs);
 		ImGui::SameLine();
-		if (ImGui::SmallButton("Reset worst"))
+		if (ImGui::SmallButton("Reset worst")) {
 			scene.ResetPeaks();
+			characters.ResetPeaks();
+		}
 		ImGui::Text("Shadow map: %u casters handed to RT, %u draws left out last frame%s", RayTracingCasterFilter::RegisteredCount(),
 			RayTracingCasterFilter::SkippedLastFrame(), filterLatched ? "" : " (not active)");
 		{
@@ -910,9 +1053,9 @@ void RayTracing::DrawSettings()
 				mismatched += check.mismatched[c];
 				notBuilt += check.notBuilt[c];
 			}
-			ImGui::Text("TLAS: %u cell chunks, %u doors/activators, %u items, %u trees, %u alpha-tested (%u not built yet)", check.written[RayTracingRT::kCategoryCell],
-				check.written[RayTracingRT::kCategoryMovable], check.written[RayTracingRT::kCategoryItem], check.written[RayTracingRT::kCategoryTree],
-				check.written[RayTracingRT::kCategoryAlpha], notBuilt);
+			ImGui::Text("TLAS: %u cell chunks, %u doors/activators, %u items, %u trees, %u alpha-tested, %u character parts (%u not built yet)",
+				check.written[RayTracingRT::kCategoryCell], check.written[RayTracingRT::kCategoryMovable], check.written[RayTracingRT::kCategoryItem],
+				check.written[RayTracingRT::kCategoryTree], check.written[RayTracingRT::kCategoryAlpha], check.written[RayTracingRT::kCategoryCharacter], notBuilt);
 			const ImVec4 bad{ 1.0f, 0.5f, 0.3f, 1.0f }, good{ 0.6f, 0.9f, 0.6f, 1.0f };
 			ImGui::TextColored(mismatched ? bad : good, "Self-check: %u of %u instances outside the game's own bounds (%llu so far, should be 0)", mismatched,
 				check.checked, static_cast<unsigned long long>(check.mismatchedTotal));

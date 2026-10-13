@@ -14,6 +14,14 @@
 // (45h) Built twice: as is (every instance opaque; the pipeline of every frame without
 // alpha-tested instances, identical to 45g) and with RT_ALPHA (non-opaque alpha-tested instances
 // are tested against their cut-out, see AlphaBlocks).
+//
+// (45i) And twice more with RT_CHARACTERS (with and without RT_ALPHA): skinned characters are
+// instances with mask kCharacterMask only (every other instance keeps mask 0xFF), so the scene
+// ray skips them (mask kSceneMask) and a second ray (mask kCharacterMask, TMin = Bias.w) tests
+// them alone: hits closer than Bias.w are ignored, which keeps a character's own coarse polygons
+// from shadowing the smooth surface the game draws (terminator acne). In first person the
+// character ray is not traced for pixels nearer than kFirstPersonNear (the arms and weapon sit
+// inside the player's third-person body). Without RT_CHARACTERS the source is exactly 45h's.
 
 struct TraceConstants
 {
@@ -32,6 +40,15 @@ RWTexture2D<unorm float4> Output : register(u0);
 
 static const uint kFlagSkipShadowed = 1u;  // engine mask already 0: min() keeps 0, skip the rays
 static const uint kFlagCoverage = 2u;      // also probe whether the surface itself is ray-traceable
+#if defined(RT_CHARACTERS)
+static const uint kFlagFirstPerson = 4u;             // (45i) player in first person: no character ray for near pixels
+static const uint kSceneMask = 0x01u;                // every instance but characters
+static const uint kCharacterMask = 0x02u;            // characters only (Backend::kCharacterMask)
+static const float kFirstPersonNear = 96.0;
+#	define RT_SCENE_MASK kSceneMask
+#else
+#	define RT_SCENE_MASK 0xFF
+#endif
 
 float3 PositionAt(int2 p, float depth)
 {
@@ -127,7 +144,7 @@ bool AnyHit(float3 origin, float3 direction, float tMax, float footprint)
 	ray.TMin = 0.0;
 	ray.TMax = tMax;
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, RT_SCENE_MASK, ray);
 	uint budget = kAlphaCandidateBudget;
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
@@ -177,7 +194,7 @@ bool AnyHit(float3 origin, float3 direction, float tMax)
 	ray.TMin = 0.0;
 	ray.TMax = tMax;
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
-	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, RT_SCENE_MASK, ray);
 	q.Proceed();
 	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
@@ -191,6 +208,63 @@ bool ClosestHit(float3 origin, float3 direction, float tMax, out float tHit)
 	ray.TMax = tMax;
 	RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
 	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+	while (q.Proceed()) {
+	}
+	tHit = q.CommittedRayT();
+	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+#endif
+
+#if defined(RT_CHARACTERS)
+// (45i) The character ray: characters only, hits nearer than tMin ignored (self-shadow acne).
+#	if defined(RT_ALPHA)
+// Alpha-tested character parts (hair) are non-opaque: tested against their cut-out like AnyHit.
+bool CharacterAnyHit(float3 origin, float3 direction, float tMin, float tMax, float footprint)
+{
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = direction;
+	ray.TMin = tMin;
+	ray.TMax = tMax;
+	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, kCharacterMask, ray);
+	uint budget = kAlphaCandidateBudget;
+	while (q.Proceed()) {
+		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+			continue;
+		if (budget == 0u || AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(),
+								footprint + q.CandidateTriangleRayT() * C.ToSun.w))
+			q.CommitNonOpaqueTriangleHit();
+		else
+			budget -= 1u;
+	}
+	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+#	else
+bool CharacterAnyHit(float3 origin, float3 direction, float tMin, float tMax, float footprint)
+{
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = direction;
+	ray.TMin = tMin;
+	ray.TMax = tMax;
+	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, kCharacterMask, ray);
+	q.Proceed();
+	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+#	endif
+
+// Coverage view only: the nearest character surface along the probe (cut-outs ignored).
+bool CharacterClosestHit(float3 origin, float3 direction, float tMax, out float tHit)
+{
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = direction;
+	ray.TMin = 0.0;
+	ray.TMax = tMax;
+	RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, kCharacterMask, ray);
 	while (q.Proceed()) {
 	}
 	tHit = q.CommittedRayT();
@@ -267,6 +341,12 @@ bool ClosestHit(float3 origin, float3 direction, float tMax, out float tHit)
 		} else {
 			hitDelta = 0.0;  // with coverage 0: nothing within reach
 		}
+#if defined(RT_CHARACTERS)
+		// (45i) A match on a ray-traced character is its own class: 0.65.
+		float tCharacter;
+		if (CharacterClosestHit(P + V * reach, -V, reach * 2.0, tCharacter) && abs(reach - tCharacter) <= tolerance)
+			coverage = 0.65;
+#endif
 	}
 
 	if ((flags & kFlagSkipShadowed) && dm < 0.0) {
@@ -284,6 +364,9 @@ bool ClosestHit(float3 origin, float3 direction, float tMax, out float tHit)
 	const uint frame = uint(C.Params.y);
 	const float n0 = InterleavedGradientNoise(float2(p), frame);
 	const float n1 = InterleavedGradientNoise(float2(p.yx) + 17.0, frame + 7u);
+#if defined(RT_CHARACTERS)
+	const bool characterRay = !((flags & kFlagFirstPerson) && dist < kFirstPersonNear);
+#endif
 
 	uint hits = 0;
 	[loop] for (uint i = 0; i < rays; ++i)
@@ -294,7 +377,16 @@ bool ClosestHit(float3 origin, float3 direction, float tMax, out float tHit)
 		float s, c;
 		sincos(6.2831853 * u2, s, c);
 		const float3 dir = normalize(L + (T * c + B * s) * r);
-#if defined(RT_ALPHA)
+#if defined(RT_CHARACTERS)
+#	if defined(RT_ALPHA)
+		bool blocked = AnyHit(origin, dir, C.Params.w, dist * C.RenderSize.w * 1.2);
+#	else
+		bool blocked = AnyHit(origin, dir, C.Params.w);
+#	endif
+		if (!blocked && characterRay)
+			blocked = CharacterAnyHit(origin, dir, C.Bias.w, C.Params.w, dist * C.RenderSize.w * 1.2);
+		hits += blocked ? 1u : 0u;
+#elif defined(RT_ALPHA)
 		hits += AnyHit(origin, dir, C.Params.w, dist * C.RenderSize.w * 1.2) ? 1u : 0u;
 #else
 		hits += AnyHit(origin, dir, C.Params.w) ? 1u : 0u;

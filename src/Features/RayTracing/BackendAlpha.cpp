@@ -484,8 +484,14 @@ namespace RayTracingRT
 
 	std::uint32_t Backend::CreateAlphaInfo(BlasHandle a_blas, AlphaTexture a_texture, const AlphaMaterial& a_material)
 	{
-		if (!AlphaAvailable() || a_blas >= blas_.size() || blas_[a_blas].uvOffset == UINT32_MAX || a_texture >= alphaTextures_.size() ||
-			!alphaTextures_[a_texture].live)
+		if (a_blas >= blas_.size() || blas_[a_blas].uvOffset == UINT32_MAX)
+			return kInvalidAlphaInfo;
+		return CreateAlphaInfoAt(blas_[a_blas].uvOffset, blas_[a_blas].triangles, a_texture, a_material);
+	}
+
+	std::uint32_t Backend::CreateAlphaInfoAt(std::uint32_t a_uvOffset, std::uint32_t a_triangles, AlphaTexture a_texture, const AlphaMaterial& a_material)
+	{
+		if (!AlphaAvailable() || a_uvOffset == UINT32_MAX || a_triangles == 0 || a_texture >= alphaTextures_.size() || !alphaTextures_[a_texture].live)
 			return kInvalidAlphaInfo;
 		std::uint32_t slot;
 		if (!freeAlphaInfos_.empty()) {
@@ -500,8 +506,8 @@ namespace RayTracingRT
 		}
 		auto finite = [](float a_value, float a_fallback) { return std::isfinite(a_value) ? a_value : a_fallback; };
 		AlphaInfoGpu info{};
-		info.uvBase = blas_[a_blas].uvOffset;
-		info.triangles = blas_[a_blas].triangles;
+		info.uvBase = a_uvOffset;
+		info.triangles = a_triangles;
 		info.texture = alphaTextures_[a_texture].gpuIndex;
 		info.flags = 0;
 		info.threshold = std::clamp(finite(a_material.threshold, 0.5f), 0.0f, 1.0f);

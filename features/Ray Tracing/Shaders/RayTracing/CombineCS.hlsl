@@ -98,10 +98,12 @@ RWTexture2D<unorm float4> DebugColor : register(u2);
 			// scene, magenta = it is not, orange = the scene has a surface in FRONT of the visible one
 			// (geometry in the wrong place, or something the game hides).
 			// (45h) cyan = an alpha-tested surface traced with its cut-out (0.8, Alpha-tested casters).
+			// (45i) purple = a ray-traced character surface (0.65, Characters).
 			if (w > 0.0) {
 				const float c = Visibility[p].y;
 				debug = c > 0.9 ? float4(0.1, 1.0, 0.2, 0.45) :
-				        (c > 0.7 ? float4(0.0, 0.85, 1.0, 0.5) : (c > 0.375 ? float4(1.0, 0.55, 0.0, 0.6) : float4(1.0, 0.1, 1.0, 0.45)));
+				        (c > 0.7 ? float4(0.0, 0.85, 1.0, 0.5) :
+				        (c > 0.6 ? float4(0.55, 0.35, 1.0, 0.6) : (c > 0.375 ? float4(1.0, 0.55, 0.0, 0.6) : float4(1.0, 0.1, 1.0, 0.45))));
 			}
 		} else if (view == kViewHitDepth) {
 			// (45e) Ray-traced first hit minus the game's depth along the view ray: white = match,

@@ -12,6 +12,9 @@
 #include "RayTracing/TraceShadowsCS.dxil.h"
 // (45h) The same shader with RT_ALPHA: non-opaque (alpha-tested) triangles are tested against their cut-out.
 #include "RayTracing/TraceShadowsAlphaCS.dxil.h"
+// (45i) With RT_CHARACTERS (and RT_ALPHA): skinned characters traced by a second, character-only ray.
+#include "RayTracing/TraceShadowsCharAlphaCS.dxil.h"
+#include "RayTracing/TraceShadowsCharCS.dxil.h"
 
 namespace RayTracingRT
 {
@@ -298,6 +301,23 @@ namespace RayTracingRT
 			alphaPipeline_.Reset();
 			logger::warn("[RayTracing] The alpha-tested ray query shader was rejected by the driver ({}); Alpha-tested casters unavailable", HrString(hr));
 		}
+
+		// (45i) The character variants and the skinning shader: not fatal either (Characters then stays unavailable).
+		psoDesc.CS.pShaderBytecode = g_TraceShadowsCharCS;
+		psoDesc.CS.BytecodeLength = sizeof(g_TraceShadowsCharCS);
+		if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&charPipeline_)))) {
+			charPipeline_.Reset();
+			logger::warn("[RayTracing] The character ray query shader was rejected by the driver ({}); Characters unavailable", HrString(hr));
+		}
+		psoDesc.CS.pShaderBytecode = g_TraceShadowsCharAlphaCS;
+		psoDesc.CS.BytecodeLength = sizeof(g_TraceShadowsCharAlphaCS);
+		if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&charAlphaPipeline_)))) {
+			charAlphaPipeline_.Reset();
+			logger::warn("[RayTracing] The character + alpha ray query shader was rejected by the driver ({}); alpha-tested character parts unavailable",
+				HrString(hr));
+		}
+		if (charPipeline_ && !CreateSkinPipelines())
+			charPipeline_.Reset();
 		return true;
 	}
 
@@ -320,6 +340,8 @@ namespace RayTracingRT
 				context.instanceBuffer->Unmap(0, nullptr);
 			if (context.alphaInfoBuffer && context.alphaInfoMapped)
 				context.alphaInfoBuffer->Unmap(0, nullptr);
+			if (context.boneBuffer && context.boneMapped)
+				context.boneBuffer->Unmap(0, nullptr);
 			context = {};
 		}
 		depthMask_ = {};
@@ -366,6 +388,20 @@ namespace RayTracingRT
 		alphaSharedOpened_ = 0;
 		alphaFault_.clear();
 		alphaStats_ = {};
+		// (45i)
+		skins_.clear();
+		freeSkins_.clear();
+		skinUploadQueue_.clear();
+		skinScratch_.Reset();
+		skinScratchBytes_ = 0;
+		skinLive_ = 0;
+		skinFault_.clear();
+		skinStats_ = {};
+		skinReady_.clear();
+		charAlphaPipeline_.Reset();
+		charPipeline_.Reset();
+		skinPipeline_.Reset();
+		skinRootSignature_.Reset();
 		rootSignature_.Reset();
 		fence11_.Reset();
 		fence_.Reset();
@@ -1060,9 +1096,22 @@ namespace RayTracingRT
 		const std::uint32_t builtNow = BuildQueued(list, a_input.buildTriangleBudget);
 		stats_.buildsLastFrame = builtNow;
 
+		// (45i) Skinned characters: uploads, skinning, BLAS builds / refits (none without draws).
+		static const std::vector<SkinDraw> kNoSkinDraws;
+		const std::vector<SkinDraw>& skinDraws = a_input.skinDraws && SkinAvailable() ? *a_input.skinDraws : kNoSkinDraws;
+		skinReady_.assign(skinDraws.size(), 0);
+		skinRecorded_ = false;
+		if (!skinDraws.empty() || !skinUploadQueue_.empty())
+			RecordSkinning(list, context, a_input, skinReady_);
+		if (failed_) {
+			list->Close();
+			return false;
+		}
+
 		// TLAS over every built BLAS that has an instance this frame.
 		std::uint32_t instanceCount = 0;
-		if (!EnsureTlas(static_cast<std::uint32_t>(instances.size())) || !EnsureInstanceBuffer(context, static_cast<std::uint32_t>(instances.size()))) {
+		const auto maxInstances = static_cast<std::uint32_t>(instances.size() + skinDraws.size());
+		if (!EnsureTlas(maxInstances) || !EnsureInstanceBuffer(context, maxInstances)) {
 			list->Close();
 			return false;
 		}
@@ -1115,11 +1164,51 @@ namespace RayTracingRT
 			++check_.written[category];
 			descs[instanceCount++] = desc;
 		}
+		// (45i) Skinned characters: identity rotation (the skinning put the vertices in world axes),
+		// translated to their origin, instance mask kCharacterMask only (the scene ray skips them).
+		std::uint32_t characterInstances = 0;
+		// A frame with alpha-tested scene instances needs the character + alpha variant.
+		const bool charactersTraceable = charPipeline_ && (alphaInstances == 0 || charAlphaPipeline_);
+		for (std::size_t d = 0; d < skinDraws.size(); ++d) {
+			if (!skinReady_[d] || !charactersTraceable) {
+				++check_.notBuilt[kCategoryCharacter];
+				continue;
+			}
+			const auto& draw = skinDraws[d];
+			const auto& skin = skins_[draw.shape];
+			const bool alpha = skin.uvOffset != UINT32_MAX;
+			if (alpha && (!charAlphaPipeline_ || !alphaPipeline_ || !alphaUv_ || draw.alphaInfo >= alphaInfos_.size() || draw.alphaInfo + 1 >= (1u << 24))) {
+				++check_.notBuilt[kCategoryCharacter];
+				continue;
+			}
+			D3D12_RAYTRACING_INSTANCE_DESC desc{};
+			desc.Transform[0][0] = desc.Transform[1][1] = desc.Transform[2][2] = 1.0f;
+			desc.Transform[0][3] = static_cast<float>(draw.x - a_input.cameraX);
+			desc.Transform[1][3] = static_cast<float>(draw.y - a_input.cameraY);
+			desc.Transform[2][3] = static_cast<float>(draw.z - a_input.cameraZ);
+			desc.InstanceMask = kCharacterMask;
+			desc.Flags = kInstanceFlags;
+			if (alpha) {
+				desc.InstanceID = draw.alphaInfo + 1;
+				desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
+				++alphaInstances;
+			}
+			desc.AccelerationStructure = skin.blas->GetGPUVirtualAddress();
+			++check_.written[kCategoryCharacter];
+			descs[instanceCount++] = desc;
+			++characterInstances;
+		}
+		skinStats_.drawsLastFrame = characterInstances;
+
 		stats_.instancesLastFrame = instanceCount;
 		// (45h) The alpha pipeline only on frames that hold alpha-tested instances (and their records
 		// are in this context's copy); every other frame runs exactly the opaque pipeline.
 		bool alphaFrame = alphaInstances > 0;
 		if (alphaFrame && !EnsureAlphaInfoBuffer(context)) {
+			// (45i) Character uploads / builds recorded in this list must run (later refits rely on
+			// them): a list that cannot be submitted takes the whole feature down instead.
+			if (skinRecorded_)
+				return Fail("alpha record buffer (with character work recorded)", E_OUTOFMEMORY);
 			// Nothing written above can be traced without its record: drop the frame's trace.
 			list->Close();
 			return false;
@@ -1151,7 +1240,13 @@ namespace RayTracingRT
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
 		list->SetDescriptorHeaps(1, heaps);
 		list->SetComputeRootSignature(rootSignature_.Get());
-		list->SetPipelineState(alphaFrame ? alphaPipeline_.Get() : pipeline_.Get());
+		// (45i) The character variants only on frames with character instances: every other frame
+		// runs exactly the 45h pipelines.
+		const bool characterFrame = characterInstances > 0;
+		if (characterFrame)
+			list->SetPipelineState(alphaFrame ? charAlphaPipeline_.Get() : charPipeline_.Get());
+		else
+			list->SetPipelineState(alphaFrame ? alphaPipeline_.Get() : pipeline_.Get());
 		list->SetComputeRoot32BitConstants(0, kRootConstants, &a_input.constants, 0);
 		list->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
 		list->SetComputeRootDescriptorTable(2, descriptorHeap_->GetGPUDescriptorHandleForHeapStart());

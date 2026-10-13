@@ -46,6 +46,8 @@ namespace RayTracingCasterFilter
 	void Add(const RE::BSGeometry* a_geometry);
 	void Remove(const RE::BSGeometry* a_geometry);
 	void Clear();
+	/// (45i) Changes on every Clear(): holders of registrations (characters) register again.
+	[[nodiscard]] std::uint32_t Epoch();
 
 	[[nodiscard]] std::uint32_t RegisteredCount();
 	/// Passes skipped during the last completed frame, and during the frame in progress.
