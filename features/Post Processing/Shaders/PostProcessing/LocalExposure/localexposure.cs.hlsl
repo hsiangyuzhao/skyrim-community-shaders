@@ -52,6 +52,34 @@ Texture2D<float> TexBlurredLuminance : register(t3);
 SamplerState LinearSampler : register(s0);
 SamplerState MirrorSampler : register(s1);
 
+#if defined(FOLD_AUTO_EXPOSURE)
+// (44e) Histogram Auto Exposure's adapt pass folded in: its per-pixel exposure (and Purkinje shift)
+// is applied here on load instead of being written to a full-resolution copy first. Same math
+// (exposure.hlsli), same alpha (1) as the adapt pass wrote.
+#	include "PostProcessing/HistogramAutoExposure/exposure.hlsli"
+cbuffer AutoExposureFoldCB : register(b2)
+{
+	float2 AEAdaptArea;
+	float2 AEAdaptationRange;
+	float AEAdaptLerp;
+	float AEExposureCompensation;
+	float AEPurkinjeStartEV;
+	float AEPurkinjeMaxEV;
+	float AEPurkinjeStrength;
+};
+StructuredBuffer<float> AEAdaptation : register(t4);
+
+float4 LoadSceneColor(uint2 tid)
+{
+	return float4(AutoExposureMath::ExposeColor(TexColor[tid].rgb, AEAdaptation[0], AEExposureCompensation, AEAdaptationRange, AEPurkinjeStartEV, AEPurkinjeMaxEV, AEPurkinjeStrength), 1);
+}
+#else
+float4 LoadSceneColor(uint2 tid)
+{
+	return TexColor[tid];
+}
+#endif
+
 RWTexture2D<float> RWTexOutput : register(u0);
 RWTexture3D<float2> RWTexLuminanceGrid : register(u1);
 
@@ -65,7 +93,7 @@ float SceneLogLuminance(float3 color)
 	if (tid.x >= InputWidth || tid.y >= InputHeight)
 		return;
 
-	RWTexOutput[tid] = SceneLogLuminance(TexColor[tid].rgb);
+	RWTexOutput[tid] = SceneLogLuminance(LoadSceneColor(tid).rgb);
 }
 
 [numthreads(8, 8, 1)] void CSDownsampleLogLuminance(uint2 tid : SV_DispatchThreadID) {
@@ -216,7 +244,7 @@ RWTexture2D<float4> RWTexColorOutput : register(u0);
 	if (tid.x >= InputWidth || tid.y >= InputHeight)
 		return;
 
-	float4 sceneColor = TexColor[tid];
+	float4 sceneColor = LoadSceneColor(tid);
 
 	// Base layer (upstream CSResolveBaseLuminance)
 	float logLuminance = TexLogLuminance.Load(int3(tid, 0));

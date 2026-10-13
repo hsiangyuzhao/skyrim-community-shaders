@@ -30,6 +30,53 @@ struct PostProcessing : Feature
 		uint pad[3];
 	} settings;
 
+	/// (44e) Post-processing cost switches. Not part of Settings: that struct is the GPU's
+	/// postProcessingSettings. Each one off = the 44d path, picture unchanged either way.
+	struct OptSettings
+	{
+		bool FuseBloom = true;        ///< COD Bloom's composite added inside Color Grading (one full-screen pass less)
+		bool FoldExposure = true;     ///< Auto Exposure's adapt pass applied on load by Local Exposure
+		bool SingleFinalCopy = true;  ///< write only the buffer the game's final pass reads
+		bool SkipVanillaHDR = true;   ///< skip the game's own HDR downsample / adaptation / bloom when nothing uses them
+	} opt;
+
+	/// (44e) What the effects pass to the next one this frame (set by PreProcess around the draws).
+	struct Fused
+	{
+		// Auto Exposure -> Local Exposure
+		bool exposure = false;
+		ID3D11Buffer* aeCB = nullptr;
+		ID3D11ShaderResourceView* aeAdaptation = nullptr;
+		// COD Bloom -> Color Grading
+		bool bloom = false;
+		ID3D11ShaderResourceView* bloomMip1 = nullptr;
+		ID3D11SamplerState* bloomSampler = nullptr;
+		float bloomPx[2]{};
+		float bloomRadius = 1.0f;
+		float bloomMult = 0.0f;
+	} fused;
+	const char* fuseStatus = "Not run yet";
+	const char* foldStatus = "Not run yet";
+
+	/// (44e) Single final copy: the buffer PreProcess left the result in, and what the game's final
+	/// pass (ISHDR blend) was seen reading.
+	ID3D11Texture2D* lastWrittenMain = nullptr;
+	uint32_t blendReadMatches = 0;        ///< consecutive frames the blend read lastWrittenMain
+	uint64_t singleCopyBlockedUntil = 0;  ///< frame until which both buffers are written again
+	bool singleCopyUsed = false;
+	const char* singleCopyStatus = "Not run yet";
+	void OnBlendRendered();
+
+	/// (44e) Skipping the game's HDR downsample / adaptation / bloom.
+	uint64_t lastHDRConsumerFrame = 0;  ///< last frame a pass that reads them ran (HDR blur)
+	uint64_t vanillaHDRDecisionFrame = UINT64_MAX;
+	bool vanillaHDRSkip = false;
+	uint32_t vanillaHDRSkipped = 0;  ///< passes skipped this frame
+	uint32_t vanillaHDRSkippedLast = 0;
+	const char* vanillaHDRStatus = "Not run yet";
+	bool SkipVanillaHDRNow();
+	void InstallVanillaHDRHooks();
+
 	const std::string ppPresetPath = "Data\\SKSE\\Plugins\\CommunityShaders\\PostProcessing";
 
 	virtual inline std::string GetName() override { return "Post Processing"; }

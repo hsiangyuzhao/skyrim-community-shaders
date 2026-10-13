@@ -300,7 +300,7 @@ void LocalExposure::ReleaseResources()
 
 void LocalExposure::ClearShaderCache()
 {
-	for (auto shader : { &setupCS, &downsampleCS, &blurHorizontalCS, &blurVerticalCS, &gridCS, &applyCS })
+	for (auto shader : { &setupCS, &downsampleCS, &blurHorizontalCS, &blurVerticalCS, &gridCS, &applyCS, &setupFoldCS, &applyFoldCS })
 		*shader = nullptr;
 
 	CompileComputeShaders();
@@ -328,6 +328,17 @@ void LocalExposure::CompileComputeShaders()
 		if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), {}, "cs_5_0", info.entry)))
 			info.programPtr->attach(rawPtr);
 	}
+	// (44e) Auto Exposure folded in.
+	if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), { { "FOLD_AUTO_EXPOSURE", "" } }, "cs_5_0", "CSSetupLogLuminance")))
+		setupFoldCS.attach(rawPtr);
+	if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), { { "FOLD_AUTO_EXPOSURE", "" } }, "cs_5_0", "CSApplyLocalExposure")))
+		applyFoldCS.attach(rawPtr);
+}
+
+bool LocalExposure::CanFold() const
+{
+	return setupCS && downsampleCS && blurHorizontalCS && blurVerticalCS && gridCS && applyCS && setupFoldCS && applyFoldCS &&
+	       texOutput && texLogLuminance && numMips > 0;
 }
 
 void LocalExposure::Draw(TextureInfo& inout_tex)
@@ -396,6 +407,16 @@ void LocalExposure::Draw(TextureInfo& inout_tex)
 	ID3D11Buffer* cb = localExposureCB->CB();
 	context->CSSetConstantBuffers(1, 1, &cb);
 
+	// (44e) Auto Exposure folded in: its constants at b2 and its average at t4, for the whole effect.
+	auto& fused = globals::features::postProcessing.fused;
+	const bool fold = fused.exposure && setupFoldCS && applyFoldCS;
+	if (fold) {
+		ID3D11Buffer* aeCB = fused.aeCB;
+		context->CSSetConstantBuffers(2, 1, &aeCB);
+		ID3D11ShaderResourceView* aeSrv = fused.aeAdaptation;
+		context->CSSetShaderResources(4, 1, &aeSrv);
+	}
+
 	std::array<ID3D11SamplerState*, 2> samplers = { linearSampler.get(), mirrorSampler.get() };
 	context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
 
@@ -420,7 +441,7 @@ void LocalExposure::Draw(TextureInfo& inout_tex)
 		srvs[0] = inout_tex.srv;
 		uavs[0] = logLuminanceMipUAVs[0].get();
 		bind();
-		context->CSSetShader(setupCS.get(), nullptr, 0);
+		context->CSSetShader(fold ? setupFoldCS.get() : setupCS.get(), nullptr, 0);
 		context->Dispatch((fullW + 7) >> 3, (fullH + 7) >> 3, 1);
 		resetViews();
 	}
@@ -471,7 +492,7 @@ void LocalExposure::Draw(TextureInfo& inout_tex)
 		srvs[3] = texBlurredLuminance->srv.get();
 		uavs[0] = texOutput->uav.get();
 		bind();
-		context->CSSetShader(applyCS.get(), nullptr, 0);
+		context->CSSetShader(fold ? applyFoldCS.get() : applyCS.get(), nullptr, 0);
 		context->Dispatch((fullW + 7) >> 3, (fullH + 7) >> 3, 1);
 		resetViews();
 	}
@@ -479,6 +500,12 @@ void LocalExposure::Draw(TextureInfo& inout_tex)
 	context->CSSetShader(nullptr, nullptr, 0);
 	cb = nullptr;
 	context->CSSetConstantBuffers(1, 1, &cb);
+	if (fold) {
+		context->CSSetConstantBuffers(2, 1, &cb);
+		ID3D11ShaderResourceView* nullSrv = nullptr;
+		context->CSSetShaderResources(4, 1, &nullSrv);
+		fused.exposure = false;
+	}
 	samplers.fill(nullptr);
 	context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
 

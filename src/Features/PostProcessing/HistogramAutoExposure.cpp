@@ -2,6 +2,7 @@
 
 #include "State.h"
 #include "Util.h"
+#include "Utils/GpuTimers.h"
 
 #include "Features/PostProcessing.h"
 
@@ -305,6 +306,10 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
 	};
 
+	auto* timers = Util::GpuPassTimers::GetSingleton();
+	timers->End(Util::GpuBucket::PostProcessing);
+	timers->Begin(Util::GpuBucket::PPAutoExposure);
+
 	context->CSSetConstantBuffers(1, 1, &cb);
 	state->BeginPerfEvent("Histogram Auto Exposure");
 
@@ -342,6 +347,23 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 		state->EndPerfEvent();
 	}
 
+	// (44e) Folded: Local Exposure applies the same exposure when it reads the image.
+	lastFolded = foldIntoNext;
+	if (foldIntoNext) {
+		resetViews();
+		cb = nullptr;
+		context->CSSetConstantBuffers(1, 1, &cb);
+		context->CSSetShader(nullptr, nullptr, 0);
+		auto& fused = globals::features::postProcessing.fused;
+		fused.exposure = true;
+		fused.aeCB = autoExposureCB->CB();
+		fused.aeAdaptation = adaptationSB->SRV();
+		state->EndPerfEvent();
+		timers->End(Util::GpuBucket::PPAutoExposure);
+		timers->Begin(Util::GpuBucket::PostProcessing);
+		return;
+	}
+
 	// Adapt
 	{
 		resetViews();
@@ -369,4 +391,6 @@ void HistogramAutoExposure::Draw(TextureInfo& inout_tex)
 
 	inout_tex = { texAdapt->resource.get(), texAdapt->srv.get() };
 	state->EndPerfEvent();
+	timers->End(Util::GpuBucket::PPAutoExposure);
+	timers->Begin(Util::GpuBucket::PostProcessing);
 }

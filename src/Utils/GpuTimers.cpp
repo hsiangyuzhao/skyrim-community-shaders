@@ -106,6 +106,20 @@ namespace Util
 			{ "HDR Output",
 				"GPU time for native HDR output: turning the finished picture into HDR10 (and, with the HUD on its own layer, "
 				"putting the HUD and menus back on top at their own brightness). Only runs while Upscaling > HDR Output is on." },
+			{ "PP Auto Exposure",
+				"GPU time for Post Processing > Histogram Auto Exposure: the brightness histogram and, unless it is folded into Local Exposure, "
+				"the full-screen exposure pass. Not counted in the Post Processing row." },
+			{ "PP Bloom",
+				"GPU time for Post Processing > COD Bloom: the blur pyramid and, unless it is fused into Color Grading, the full-screen "
+				"composite. Not counted in the Post Processing row." },
+			{ "PP Color Grading",
+				"GPU time for Post Processing > Color Grading and Tone Mapping (with the bloom added in when fused). Not counted in the "
+				"Post Processing row." },
+			{ "PP Final Copy",
+				"GPU time for handing the finished picture back to the game (one or two full-screen copies)." },
+			{ "Vanilla HDR prep",
+				"GPU time of the game's own HDR downsample, eye adaptation and bloom. With Disable Vanilla Tonemapping on, nothing "
+				"shows them; Post Processing > Skip Vanilla HDR Passes skips them when nothing else needs them (the row then disappears)." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

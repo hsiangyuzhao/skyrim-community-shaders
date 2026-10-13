@@ -108,6 +108,11 @@ struct LocalExposure : public PostProcessFeature
 	winrt::com_ptr<ID3D11ComputeShader> blurVerticalCS = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> gridCS = nullptr;
 	winrt::com_ptr<ID3D11ComputeShader> applyCS = nullptr;
+	// (44e) FOLD_AUTO_EXPOSURE variants: the setup and apply passes expose the image on load.
+	winrt::com_ptr<ID3D11ComputeShader> setupFoldCS = nullptr;
+	winrt::com_ptr<ID3D11ComputeShader> applyFoldCS = nullptr;
+	/// (44e) Everything the folded Draw needs is there (it can never skip the exposure).
+	bool CanFold() const;
 
 	/// Whether the last Draw ran (for the Batch 38 table), and why not.
 	bool lastDrawRan = false;

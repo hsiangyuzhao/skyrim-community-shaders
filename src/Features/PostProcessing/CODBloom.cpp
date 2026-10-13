@@ -2,6 +2,8 @@
 
 #include "State.h"
 #include "Util.h"
+#include "Features/PostProcessing.h"
+#include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	CODBloom::Settings,
@@ -229,6 +231,10 @@ void CODBloom::Draw(TextureInfo& inout_tex)
 	auto state = globals::state;
 	auto context = globals::d3d::context;
 
+	auto* timers = Util::GpuPassTimers::GetSingleton();
+	timers->End(Util::GpuBucket::PostProcessing);
+	timers->Begin(Util::GpuBucket::PPBloom);
+
 	state->BeginPerfEvent("COD Bloom");
 
 	// update cb
@@ -342,6 +348,30 @@ void CODBloom::Draw(TextureInfo& inout_tex)
 		context->Dispatch(((mipWidth - 1) >> 3) + 1, ((mipHeight - 1) >> 3) + 1, 1);
 	}
 
+	// (44e) Fused: Color Grading adds mip 1, upsampled exactly as the composite below does it.
+	lastFused = fuseIntoNext;
+	if (fuseIntoNext) {
+		auto& fused = globals::features::postProcessing.fused;
+		fused.bloom = true;
+		fused.bloomMip1 = texBloomMipSRVs[1].get();
+		fused.bloomSampler = colorSampler.get();
+		fused.bloomPx[0] = 1.0f / static_cast<float>(texBloom->desc.Width);
+		fused.bloomPx[1] = 1.0f / static_cast<float>(texBloom->desc.Height);
+		fused.bloomRadius = settings.UpsampleRadius;
+		fused.bloomMult = settings.BlendFactor;
+
+		resetViews();
+		samplers.fill(nullptr);
+		cb = nullptr;
+		context->CSSetConstantBuffers(1, 1, &cb);
+		context->CSSetSamplers(0, (uint)samplers.size(), samplers.data());
+		context->CSSetShader(nullptr, nullptr, 0);
+		state->EndPerfEvent();
+		timers->End(Util::GpuBucket::PPBloom);
+		timers->Begin(Util::GpuBucket::PostProcessing);
+		return;
+	}
+
 	// composite
 	{
 		resetViews();
@@ -373,4 +403,6 @@ void CODBloom::Draw(TextureInfo& inout_tex)
 	inout_tex = { texBloom->resource.get(), texBloomMipSRVs[0].get() };
 
 	state->EndPerfEvent();
+	timers->End(Util::GpuBucket::PPBloom);
+	timers->Begin(Util::GpuBucket::PostProcessing);
 }

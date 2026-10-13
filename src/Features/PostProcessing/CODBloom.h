@@ -48,6 +48,11 @@ struct CODBloom : public PostProcessFeature
 	/// of the peeling rule is at the computation site in Draw.
 	int lastTopMip = (int)s_BloomMips - 1;
 
+	/// (44e) Set by PostProcessing for one Draw: Color Grading adds the bloom on load, so the full-
+	/// resolution composite pass is skipped and the image is handed on unchanged.
+	bool fuseIntoNext = false;
+	bool lastFused = false;
+
 	virtual void SetupResources() override;
 	virtual void SetupShaders() override;
 	virtual void ReleaseResources() override;

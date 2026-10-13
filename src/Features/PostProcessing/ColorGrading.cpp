@@ -2,6 +2,7 @@
 
 #include "State.h"
 #include "Util.h"
+#include "Utils/GpuTimers.h"
 
 #include "ColourSpace.h"
 #include "Features/PostProcessing.h"
@@ -588,6 +589,7 @@ void ColorGrading::SetupResources()
 	logger::debug("Creating buffers...");
 	{
 		colorCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<ColorCB>());
+		fusedBloomCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<FusedBloomCB>());
 	}
 
 	logger::debug("Creating 2D textures...");
@@ -681,6 +683,7 @@ void ColorGrading::SetupShaders()
 void ColorGrading::ReleaseResources()
 {
 	colorCB = nullptr;
+	fusedBloomCB = nullptr;
 	texColor = nullptr;
 	texLUT = nullptr;
 }
@@ -691,7 +694,9 @@ void ColorGrading::ClearShaderCache()
 		&colorgradingCS,
 		&lutgenCS,
 		&colorgradingHdrCS,
-		&lutgenHdrCS
+		&lutgenHdrCS,
+		&colorgradingFusedCS,
+		&colorgradingHdrFusedCS
 	};
 
 	for (auto shader : shaderPtrs)
@@ -723,6 +728,8 @@ void ColorGrading::CompileComputeShaders()
 			{ &colorgradingCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() } }, "CSColorGrading" },
 			{ &lutgenCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() } }, "CSLUTGen" }
 		};
+	// (44e) COD Bloom fused into the apply.
+	shaderInfos.push_back({ &colorgradingFusedCS, "colorgrading.cs.hlsl", { { "TONEMAP_FUNC", tonemappers[tonemapperType].func_name.data() }, { "BLOOM_FUSED", "" } }, "CSColorGrading" });
 
 	// (batch 43) The HDR variants only exist in a native-HDR session, so an SDR session compiles exactly
 	// what it did before.
@@ -732,6 +739,9 @@ void ColorGrading::CompileComputeShaders()
 			hdrDefines.push_back({ "TONEMAP_GT7", "" });  // (44a) GT7's Native form lives in ColorGrading()
 		shaderInfos.push_back({ &colorgradingHdrCS, "colorgrading.cs.hlsl", hdrDefines, "CSColorGrading" });
 		shaderInfos.push_back({ &lutgenHdrCS, "colorgrading.cs.hlsl", hdrDefines, "CSLUTGen" });
+		auto fusedDefines = hdrDefines;
+		fusedDefines.push_back({ "BLOOM_FUSED", "" });
+		shaderInfos.push_back({ &colorgradingHdrFusedCS, "colorgrading.cs.hlsl", fusedDefines, "CSColorGrading" });
 	}
 
 	for (auto& info : shaderInfos) {
@@ -750,6 +760,10 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 
 	if (recompileFlag)
 		ClearShaderCache();
+
+	auto* timers = Util::GpuPassTimers::GetSingleton();
+	timers->End(Util::GpuBucket::PostProcessing);
+	timers->Begin(Util::GpuBucket::PPColorGrading);
 
 	state->BeginPerfEvent("Color Grading and Tonemapping");
 
@@ -849,7 +863,7 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 	// BT.2020 output. Without the HDR_OUTPUT pair (not a 10-bit session, or it failed to compile) the
 	// frame is graded as SDR, which the HDR output then shows at paper white.
 	const auto levels = HDROutput::GetSceneLevels();
-	const bool hdrGrading = levels.hdr && colorgradingHdrCS && lutgenHdrCS;
+	const bool hdrGrading = HDRGradingThisFrame();
 	if (hdrGrading) {
 		const auto hdr = GetTonemapHDR(tonemapperName);
 		const bool native = hdr.mode == 1 && HasNativeHDR(tonemapperName);
@@ -913,9 +927,34 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 	uav = direct ? directOutput.uav : texColor->uav.get();
 	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 	context->CSSetShaderResources(0, 2, srvs.data());
-	context->CSSetShader(hdrGrading ? colorgradingHdrCS.get() : colorgradingCS.get(), nullptr, 0);
+	// (44e) COD Bloom fused in: its mip 1 at t2, its sampler at s1, radius and blend factor at b2.
+	auto& fused = pp.fused;
+	ID3D11ComputeShader* fusedShader = hdrGrading ? colorgradingHdrFusedCS.get() : colorgradingFusedCS.get();
+	const bool bloomFused = fused.bloom && fusedShader && fusedBloomCB;
+	if (bloomFused) {
+		fusedBloomCB->Update(FusedBloomCB{ { fused.bloomPx[0], fused.bloomPx[1] }, fused.bloomRadius, fused.bloomMult });
+		ID3D11Buffer* bcb = fusedBloomCB->CB();
+		context->CSSetConstantBuffers(2, 1, &bcb);
+		ID3D11ShaderResourceView* bloomSrv = fused.bloomMip1;
+		context->CSSetShaderResources(2, 1, &bloomSrv);
+		ID3D11SamplerState* bloomSampler = fused.bloomSampler;
+		context->CSSetSamplers(1, 1, &bloomSampler);
+		context->CSSetShader(fusedShader, nullptr, 0);
+	} else {
+		context->CSSetShader(hdrGrading ? colorgradingHdrCS.get() : colorgradingCS.get(), nullptr, 0);
+	}
 
 	context->Dispatch((texColor->desc.Width + 7) >> 3, (texColor->desc.Height + 7) >> 3, 1);
+
+	if (bloomFused) {
+		ID3D11Buffer* nullCb = nullptr;
+		context->CSSetConstantBuffers(2, 1, &nullCb);
+		ID3D11ShaderResourceView* nullSrv = nullptr;
+		context->CSSetShaderResources(2, 1, &nullSrv);
+		ID3D11SamplerState* nullSampler = nullptr;
+		context->CSSetSamplers(1, 1, &nullSampler);
+	}
+	fused.bloom = false;
 
 	// clean up
 	srvs.fill(nullptr);
@@ -943,6 +982,20 @@ void ColorGrading::Draw(TextureInfo& inout_tex)
 		inout_tex = { texColor->resource.get(), texColor->srv.get() };
 
 	state->EndPerfEvent();
+	timers->End(Util::GpuBucket::PPColorGrading);
+	timers->Begin(Util::GpuBucket::PostProcessing);
+}
+
+bool ColorGrading::HDRGradingThisFrame() const
+{
+	return HDROutput::GetSceneLevels().hdr && colorgradingHdrCS && lutgenHdrCS;
+}
+
+bool ColorGrading::CanFuseBloom() const
+{
+	if (!fusedBloomCB || !texColor || !texLUT)
+		return false;
+	return HDRGradingThisFrame() ? static_cast<bool>(colorgradingHdrFusedCS) : static_cast<bool>(colorgradingFusedCS);
 }
 
 void ColorGrading::OutputTextures()

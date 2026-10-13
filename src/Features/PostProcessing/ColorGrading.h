@@ -146,6 +146,19 @@ struct ColorGrading : public PostProcessFeature
     // tone-maps the frame. The SDR pair above is the pre-43 code.
     winrt::com_ptr<ID3D11ComputeShader> colorgradingHdrCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> lutgenHdrCS = nullptr;
+    // (44e) BLOOM_FUSED variants of the apply: COD Bloom's composite added on load.
+    winrt::com_ptr<ID3D11ComputeShader> colorgradingFusedCS = nullptr;
+    winrt::com_ptr<ID3D11ComputeShader> colorgradingHdrFusedCS = nullptr;
+    struct alignas(16) FusedBloomCB
+    {
+        float px[2];
+        float radius;
+        float mult;
+    };
+    std::unique_ptr<ConstantBuffer> fusedBloomCB = nullptr;
+    /// (44e) This frame's apply can add the bloom (the variant for the mode it will grade in exists).
+    bool CanFuseBloom() const;
+    bool HDRGradingThisFrame() const;
 
     winrt::com_ptr<ID3D11SamplerState> linearSampler = nullptr;
 

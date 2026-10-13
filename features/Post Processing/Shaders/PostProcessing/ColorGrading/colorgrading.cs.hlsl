@@ -14,6 +14,35 @@ Texture3D<float4> TexLUT : register(t1);
 
 SamplerState LinearSampler : register(s0);
 
+#if defined(BLOOM_FUSED)
+// (44e) COD Bloom's composite folded in: the bloom (its mip 1, upsampled with the same four taps,
+// sampler and radius) is added to the input here instead of in a separate full-resolution pass.
+cbuffer FusedBloomCB : register(b2)
+{
+	float2 BloomPxSize;  // 1 / the bloom's full-resolution size
+	float BloomRadius;   // Upsampling Radius
+	float BloomMult;     // Blend Factor
+};
+Texture2D<float4> TexBloomMip1 : register(t2);
+SamplerState BloomSampler : register(s1);
+
+float3 LoadInput(uint2 id)
+{
+	const float2 uv = (id + .5) * BloomPxSize;
+	const float2 radius = BloomPxSize * BloomRadius;
+	float4 bloom = 0;
+	[unroll] for (int x = -1; x <= 1; x += 2)
+		[unroll] for (int y = -1; y <= 1; y += 2)
+			bloom += 0.25 * TexBloomMip1.SampleLevel(BloomSampler, uv + float2(x, y) * 0.5 * radius, 0);
+	return TexColor[id].rgb + bloom.rgb * BloomMult;
+}
+#else
+float3 LoadInput(uint2 id)
+{
+	return TexColor[id].xyz;
+}
+#endif
+
 cbuffer ColorCB : register(b1) {
     float4 asccdl[3];
     float4 liftgammagain[3]; // lift，gamma，gain
@@ -1058,9 +1087,9 @@ float3 SanitizeHDRColor(float3 c, float lo)
 [numthreads(8, 8, 1)] void CSColorGrading(uint2 DTid : SV_DispatchThreadID) {
 	// Game cinematic
 #if defined(HDR_OUTPUT)
-	float3 color = pow(abs(SanitizeHDRColor(TexColor[DTid].xyz, -65504.0)), saturationHueInOutGamma.z) * cinematic.y;
+	float3 color = pow(abs(SanitizeHDRColor(LoadInput(DTid), -65504.0)), saturationHueInOutGamma.z) * cinematic.y;
 #else
-	float3 color = pow(abs(TexColor[DTid].xyz), saturationHueInOutGamma.z) * cinematic.y;
+	float3 color = pow(abs(LoadInput(DTid)), saturationHueInOutGamma.z) * cinematic.y;
 #endif
 	color = Saturation(color, cinematic.x);
 	color = LinearContrast(color, cinematic.z, 0.18);

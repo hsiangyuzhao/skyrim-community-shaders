@@ -10,10 +10,19 @@
 #include "Utils/GpuTimers.h"
 
 #include "Features/Upscaling.h"
+#include "Features/Upscaling/HDROutput.h"
+#include "ShaderCache.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PostProcessing::Settings,
 	DisableVanillaTonemapping)
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+	PostProcessing::OptSettings,
+	FuseBloom,
+	FoldExposure,
+	SingleFinalCopy,
+	SkipVanillaHDR)
 
 void PostProcessing::DrawSettings()
 {
@@ -71,6 +80,32 @@ void PostProcessing::DrawSettings()
 	ImGui::Checkbox("Disable Vanilla Tonemapping", (bool*)&settings.DisableVanillaTonemapping);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Skips Skyrim's own final image pass (tonemapping, vanilla bloom and colour grading), so only the effects below shape the look.");
+
+	// (44e) Cost switches: each saves a full-screen pass at output resolution; off = 44d.
+	if (ImGui::TreeNode("Performance (44e)")) {
+		ImGui::Checkbox("Fuse Bloom into Color Grading", &opt.FuseBloom);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("COD Bloom's last step (adding the glow to the picture) is done inside Color Grading's pass. Same picture, one full-screen pass less.\nNeeds COD Bloom directly followed by Color Grading.");
+		ImGui::SameLine();
+		ImGui::TextDisabled("%s", fuseStatus);
+		ImGui::Checkbox("Fold Auto Exposure into Local Exposure", &opt.FoldExposure);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Auto Exposure's brightness change is applied by Local Exposure as it reads the picture, instead of a separate full-screen pass.\nSame picture. Needs Local Exposure right after Auto Exposure.");
+		ImGui::SameLine();
+		ImGui::TextDisabled("%s", foldStatus);
+		ImGui::Checkbox("Single Final Copy", &opt.SingleFinalCopy);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Hand the finished picture back into only the buffer the game's final pass actually reads (watched every frame), not into both.\nIf the game ever reads the other one, both are written again for a while.");
+		ImGui::SameLine();
+		ImGui::TextDisabled("%s", singleCopyStatus);
+		ImGui::Checkbox("Skip Vanilla HDR Passes", &opt.SkipVanillaHDR);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("With Disable Vanilla Tonemapping on, the game's own brightness adaptation and bloom are computed but never shown.\nSkipped while nothing else needs them (no menu open, no blur or depth-of-field screen effect).");
+		ImGui::SameLine();
+		ImGui::TextDisabled("%s", vanillaHDRStatus);
+		ImGui::TextDisabled("Each has its own row in the performance overlay (PP Auto Exposure, PP Bloom, PP Color Grading, PP Final Copy, Vanilla HDR prep).");
+		ImGui::TreePop();
+	}
 
 	ImGui::Separator();
 
@@ -242,6 +277,8 @@ void PostProcessing::ProcessSettings(json& o_json)
 
 	if (o_json.contains("ppsettings"))
 		settings = o_json["ppsettings"];
+	if (o_json.contains("ppopt44e"))
+		opt = o_json["ppopt44e"];
 }
 
 void PostProcessing::SaveSettings(json& o_json)
@@ -258,6 +295,7 @@ void PostProcessing::SaveSettings(json& o_json)
 	}
 
 	o_json["ppsettings"] = settings;
+	o_json["ppopt44e"] = opt;
 }
 
 std::vector<std::string> PostProcessing::LoadPresets()
@@ -736,6 +774,46 @@ void PostProcessing::PreProcess()
 			chain.push_back(pipe.get());
 	}
 
+	// (44e) Folds and fusions between neighbours. Each only when the receiving effect is the very
+	// next one and is ready to do the extra work, so the picture never loses a step.
+	fused = {};
+	HistogramAutoExposure* foldingAE = nullptr;
+	CODBloom* fusingBloom = nullptr;
+	foldStatus = !opt.FoldExposure ? "Off" : "Auto Exposure is not followed by Local Exposure";
+	fuseStatus = !opt.FuseBloom ? "Off" : "COD Bloom is not followed by Color Grading";
+	for (size_t i = 0; i + 1 < chain.size(); ++i) {
+		if (opt.FoldExposure && !foldingAE) {
+			if (auto* ae = dynamic_cast<HistogramAutoExposure*>(chain[i])) {
+				if (auto* le = dynamic_cast<LocalExposure*>(chain[i + 1])) {
+					EnsureResources(le);
+					if (le->CanFold()) {
+						foldingAE = ae;
+						foldStatus = "On: Local Exposure applies the exposure";
+					} else {
+						foldStatus = "Local Exposure not ready";
+					}
+				}
+			}
+		}
+		if (opt.FuseBloom && !fusingBloom) {
+			if (auto* bloom = dynamic_cast<CODBloom*>(chain[i])) {
+				if (auto* cg = dynamic_cast<ColorGrading*>(chain[i + 1])) {
+					EnsureResources(cg);
+					if (cg->CanFuseBloom()) {
+						fusingBloom = bloom;
+						fuseStatus = "On: Color Grading adds the bloom";
+					} else {
+						fuseStatus = "Color Grading not ready";
+					}
+				}
+			}
+		}
+	}
+	if (foldingAE)
+		foldingAE->foldIntoNext = true;
+	if (fusingBloom)
+		fusingBloom->fuseIntoNext = true;
+
 	// (batch 37b, C-1) Direct output. The old write-back copied the last effect's texture into
 	// BOTH game buffers: two full-screen copies at output resolution every frame. When the last
 	// effect can store into the game buffer itself -- same format, same size as its own texture,
@@ -850,12 +928,34 @@ void PostProcessing::PreProcess()
 		directOutputStatus = directOutputUsed ? "On: one write-back copy instead of two" : "Effect did not take the game buffer";
 	}
 
+	// (44e) The folds are for this draw only.
+	if (foldingAE)
+		foldingAE->foldIntoNext = false;
+	if (fusingBloom)
+		fusingBloom->fuseIntoNext = false;
+	fused = {};
+
+	// (44e) Single final copy: once the game's final pass has been seen reading gameTexMain for a few
+	// frames in a row, the second buffer is no longer written. Any frame it reads the other one
+	// (OnBlendRendered) brings the second copy back for a while.
+	const uint64_t frame = globals::state ? globals::state->frameCount : 0;
+	const bool singleCopy = opt.SingleFinalCopy && blendReadMatches >= 3 && frame >= singleCopyBlockedUntil;
+	singleCopyUsed = singleCopy;
+	singleCopyStatus = !opt.SingleFinalCopy ? "Off" : singleCopy ? "On: one buffer written" :
+	                   frame < singleCopyBlockedUntil ? "Paused: the game read the other buffer" : "Waiting to see which buffer the game reads";
+	lastWrittenMain = gameTexMain.texture;
+
+	auto* timers = Util::GpuPassTimers::GetSingleton();
+	timers->End(Util::GpuBucket::PostProcessing);
+	timers->Begin(Util::GpuBucket::PPFinalCopy);
+
 	D3D11_TEXTURE2D_DESC desc;
 	lastTexColor.tex->GetDesc(&desc);
 	if (directOutputUsed) {
 		// (batch 37b, C-1) The image is already in gameTexMain; the second buffer gets the same
 		// rectangle the old full-texture copy wrote, from the same bits.
-		context->CopySubresourceRegion(gameTexMainAlt.texture, 0, 0, 0, 0, gameTexMain.texture, 0, &directBox);
+		if (!singleCopy)
+			context->CopySubresourceRegion(gameTexMainAlt.texture, 0, 0, 0, 0, gameTexMain.texture, 0, &directBox);
 	} else if (desc.Format == texCopy->desc.Format) {
 		// either MAIN_COPY or MAIN is used as input for HDR pass
 		// so we copy to both so whatever the game wants we're not failing it
@@ -866,7 +966,7 @@ void PostProcessing::PreProcess()
 		// leaves undefined. Skipping it is exactly the intended result, only defined.
 		if (lastTexColor.tex != gameTexMain.texture)
 			context->CopySubresourceRegion(gameTexMain.texture, 0, 0, 0, 0, lastTexColor.tex, 0, nullptr);
-		if (lastTexColor.tex != gameTexMainAlt.texture)
+		if (!singleCopy && lastTexColor.tex != gameTexMainAlt.texture)
 			context->CopySubresourceRegion(gameTexMainAlt.texture, 0, 0, 0, 0, lastTexColor.tex, 0, nullptr);
 	} else {
 		ID3D11ShaderResourceView* srv = lastTexColor.srv;
@@ -885,10 +985,11 @@ void PostProcessing::PreProcess()
 		context->CSSetShader(nullptr, nullptr, 0);
 
 		context->CopySubresourceRegion(gameTexMain.texture, 0, 0, 0, 0, texCopy->resource.get(), 0, nullptr);
-		context->CopySubresourceRegion(gameTexMainAlt.texture, 0, 0, 0, 0, texCopy->resource.get(), 0, nullptr);
+		if (!singleCopy)
+			context->CopySubresourceRegion(gameTexMainAlt.texture, 0, 0, 0, 0, texCopy->resource.get(), 0, nullptr);
 	}
 
-	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::PostProcessing);
+	timers->End(Util::GpuBucket::PPFinalCopy);
 
 	isrefraction = false;
 }
@@ -934,4 +1035,153 @@ void PostProcessing::PostPostLoad()
 	stl::write_vfunc<0x2, BSImagespaceShaderRefraction_SetupTechnique>(RE::VTABLE_BSImagespaceShaderRefraction[0]);
 	stl::write_vfunc<0x2, BSImagespaceShaderHDRTonemapBlendCinematic_SetupTechnique>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematic[0]);
 	stl::write_vfunc<0x2, BSImagespaceShaderHDRTonemapBlendCinematicFade_SetupTechnique>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematicFade[0]);
+	InstallVanillaHDRHooks();
+}
+// ---------------------------------------------------------------------------------------------
+// (44e) The game's final pass (ISHDR blend) and its HDR downsample / adaptation / bloom
+// ---------------------------------------------------------------------------------------------
+
+void PostProcessing::OnBlendRendered()
+{
+	if (!lastWrittenMain || !globals::state)
+		return;
+	// BlendTex (t1) is the scene the blend reads; the engine leaves it bound after the draw.
+	ID3D11ShaderResourceView* srv = nullptr;
+	globals::d3d::context->PSGetShaderResources(1, 1, &srv);
+	if (!srv)
+		return;
+	ID3D11Resource* read = nullptr;
+	srv->GetResource(&read);
+	srv->Release();
+	if (!read)
+		return;
+	const bool match = read == lastWrittenMain;
+	read->Release();
+	lastWrittenMain = nullptr;  // one observation per PreProcess
+	if (match) {
+		if (blendReadMatches < 1000000)
+			++blendReadMatches;
+		return;
+	}
+	blendReadMatches = 0;
+	if (singleCopyUsed) {
+		singleCopyBlockedUntil = globals::state->frameCount + 600;
+		static uint32_t logged = 0;
+		if (logged++ < 5)
+			logger::info("[Post Processing] The game's final pass read the other buffer; writing both again for 600 frames");
+	}
+}
+
+bool PostProcessing::SkipVanillaHDRNow()
+{
+	const uint64_t frame = globals::state ? globals::state->frameCount : 0;
+	if (vanillaHDRDecisionFrame == frame)
+		return vanillaHDRSkip;
+	vanillaHDRDecisionFrame = frame;
+	vanillaHDRSkippedLast = vanillaHDRSkipped;
+	vanillaHDRSkipped = 0;
+
+	vanillaHDRSkip = false;
+	auto* ui = globals::game::ui;
+	if (!opt.SkipVanillaHDR)
+		vanillaHDRStatus = "Off";
+	else if (!loaded || bypass || !settings.DisableVanillaTonemapping)
+		vanillaHDRStatus = "Needed: Disable Vanilla Tonemapping is off (or Bypass)";
+	else if (!globals::shaderCache || !globals::shaderCache->IsEnabled())
+		vanillaHDRStatus = "Needed: the game's own shaders are in use";
+	else if (globals::game::isVR)
+		vanillaHDRStatus = "Needed: VR";
+	else if (!ui || ui->GameIsPaused() || ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || ui->IsMenuOpen(RE::MapMenu::MENU_NAME))
+		vanillaHDRStatus = "Needed: a menu is open (its background blur may use them)";
+	else if (const auto& mod = imageSpaceManager->gameISData.modData.data;
+			 mod[RE::ImageSpaceModData::kBlurRadius] > 0.0f || mod[RE::ImageSpaceModData::kDOFStrength] > 0.0f ||
+			 mod[RE::ImageSpaceModData::kDoubleVisionStrength] > 0.0f || mod[RE::ImageSpaceModData::kRadialBlurStrength] > 0.0f)
+		vanillaHDRStatus = "Needed: a screen effect (blur, depth of field) is active";
+	else if (frame - lastHDRConsumerFrame < 120)
+		vanillaHDRStatus = "Needed: the game's HDR blur ran recently";
+	else {
+		vanillaHDRSkip = true;
+		vanillaHDRStatus = "Skipped: nothing uses them";
+	}
+	return vanillaHDRSkip;
+}
+
+namespace
+{
+	/// The game's HDR downsample / adaptation / bloom passes: skipped when nothing uses them, timed otherwise.
+	template <int N>
+	struct VanillaHDRPrepRender
+	{
+		static void thunk(void* a_shader, RE::BSTriShape* a_shape, RE::ImageSpaceEffectParam* a_param)
+		{
+			auto& pp = globals::features::postProcessing;
+			if (pp.SkipVanillaHDRNow()) {
+				++pp.vanillaHDRSkipped;
+				return;
+			}
+			auto* timers = Util::GpuPassTimers::GetSingleton();
+			timers->Begin(Util::GpuBucket::VanillaHDR);
+			func(a_shader, a_shape, a_param);
+			timers->End(Util::GpuBucket::VanillaHDR);
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+
+	/// Passes that read what the ones above produce (the HDR blur reads the adapted luminance).
+	template <int N>
+	struct VanillaHDRConsumerRender
+	{
+		static void thunk(void* a_shader, RE::BSTriShape* a_shape, RE::ImageSpaceEffectParam* a_param)
+		{
+			auto& pp = globals::features::postProcessing;
+			pp.lastHDRConsumerFrame = globals::state ? globals::state->frameCount : 0;
+			func(a_shader, a_shape, a_param);
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+
+	template <int N>
+	struct BlendRender
+	{
+		static void thunk(void* a_shader, RE::BSTriShape* a_shape, RE::ImageSpaceEffectParam* a_param)
+		{
+			func(a_shader, a_shape, a_param);
+			globals::features::postProcessing.OnBlendRendered();
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+}
+
+void PostProcessing::InstallVanillaHDRHooks()
+{
+	if (REL::Module::IsVR())
+		return;
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<0>>(RE::VTABLE_BSImagespaceShaderHDRDownSample16[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<1>>(RE::VTABLE_BSImagespaceShaderHDRDownSample4[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<2>>(RE::VTABLE_BSImagespaceShaderHDRDownSample16Lum[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<3>>(RE::VTABLE_BSImagespaceShaderHDRDownSample4RGB2Lum[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<4>>(RE::VTABLE_BSImagespaceShaderHDRDownSample4LumClamp[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<5>>(RE::VTABLE_BSImagespaceShaderHDRDownSample4LightAdapt[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<6>>(RE::VTABLE_BSImagespaceShaderHDRDownSample16LumClamp[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<7>>(RE::VTABLE_BSImagespaceShaderHDRDownSample16LightAdapt[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<8>>(RE::VTABLE_BSImagespaceShaderBrightPassBlur3[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<9>>(RE::VTABLE_BSImagespaceShaderBrightPassBlur5[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<10>>(RE::VTABLE_BSImagespaceShaderBrightPassBlur7[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<11>>(RE::VTABLE_BSImagespaceShaderBrightPassBlur9[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<12>>(RE::VTABLE_BSImagespaceShaderBrightPassBlur11[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<13>>(RE::VTABLE_BSImagespaceShaderBrightPassBlur13[3]);
+	stl::write_vfunc<0x1, VanillaHDRPrepRender<14>>(RE::VTABLE_BSImagespaceShaderBrightPassBlur15[3]);
+
+	stl::write_vfunc<0x1, VanillaHDRConsumerRender<0>>(RE::VTABLE_BSImagespaceShaderBlur3[3]);
+	stl::write_vfunc<0x1, VanillaHDRConsumerRender<1>>(RE::VTABLE_BSImagespaceShaderBlur5[3]);
+	stl::write_vfunc<0x1, VanillaHDRConsumerRender<2>>(RE::VTABLE_BSImagespaceShaderBlur7[3]);
+	stl::write_vfunc<0x1, VanillaHDRConsumerRender<3>>(RE::VTABLE_BSImagespaceShaderBlur9[3]);
+	stl::write_vfunc<0x1, VanillaHDRConsumerRender<4>>(RE::VTABLE_BSImagespaceShaderBlur11[3]);
+	stl::write_vfunc<0x1, VanillaHDRConsumerRender<5>>(RE::VTABLE_BSImagespaceShaderBlur13[3]);
+	stl::write_vfunc<0x1, VanillaHDRConsumerRender<6>>(RE::VTABLE_BSImagespaceShaderBlur15[3]);
+	stl::write_vfunc<0x1, VanillaHDRConsumerRender<7>>(RE::VTABLE_BSImagespaceShaderISIBLensFlares[3]);
+
+	stl::write_vfunc<0x1, BlendRender<0>>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematic[3]);
+	stl::write_vfunc<0x1, BlendRender<1>>(RE::VTABLE_BSImagespaceShaderHDRTonemapBlendCinematicFade[3]);
+	logger::info("[Post Processing] Hooked the game's HDR passes (44e)");
 }

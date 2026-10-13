@@ -63,6 +63,11 @@ struct HistogramAutoExposure : public PostProcessFeature
 	/// overrides. Local Exposure pivots around 0.18 x this, the middle grey this pass targets.
 	float lastExposureCompensation = 1.f;
 
+	/// (44e) Set by PostProcessing for one Draw: Local Exposure applies the exposure on load, so the
+	/// adapt pass (a full-resolution copy) is skipped and the image is handed on unchanged.
+	bool foldIntoNext = false;
+	bool lastFolded = false;
+
 	virtual void SetupResources() override;
 	virtual void SetupShaders() override;
 	virtual void ReleaseResources() override;

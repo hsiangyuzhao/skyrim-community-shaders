@@ -65,6 +65,13 @@ namespace Util
 		NeuralRenderingFinalize,
 		// (batch 43) Native HDR output: scene encode / SDR resolve at UI start + the final composite before Present.
 		HDROutput,
+		// (44e) Post-processing effects with their own rows (taken out of the Post Processing row), and the
+		// game's own HDR downsample / adaptation / bloom.
+		PPAutoExposure,
+		PPBloom,
+		PPColorGrading,
+		PPFinalCopy,
+		VanillaHDR,
 		Count
 	};
 
