@@ -26,8 +26,6 @@ struct ScreenSpacePointLightShadows : Feature
 		};
 	}
 
-	constexpr static size_t s_ShadowMips = 4;
-
 	struct Settings
 	{
 		uint Enable = true;
@@ -40,14 +38,8 @@ struct ScreenSpacePointLightShadows : Feature
 		float SoftShadowScale = 2.5f;
 	} settings;
 
-	struct alignas(16) SSPLSCB
-	{
-		uint MipLevel;
-		uint ResX;
-		uint ResY;
-		uint pad;
-	};
-
+	/// Mirrors SharedData::SSPLSSettings (package/Shaders/Common/SharedData.hlsli). Its size is pinned
+	/// by the FeatureData layout asserts in FeatureBuffer.cpp, so new switches travel as bits in Enable.
 	struct alignas(16) PerFrame
 	{
 		uint Enable;
@@ -60,38 +52,12 @@ struct ScreenSpacePointLightShadows : Feature
 		float SoftShadowScale;
 	};
 
-	winrt::com_ptr<ID3D11SamplerState> linearSampler = nullptr;
-
-	eastl::unique_ptr<Texture2D> depthTexture = nullptr;
-	eastl::unique_ptr<Texture2D> linearDepthTexture = nullptr;
-	eastl::unique_ptr<Texture2D> blurredLinearDepthTexture = nullptr;
-
-	std::array<winrt::com_ptr<ID3D11ShaderResourceView>, s_ShadowMips> depthSRVs = { nullptr };
-	std::array<winrt::com_ptr<ID3D11UnorderedAccessView>, s_ShadowMips> depthUAVs = { nullptr };
-	std::array<winrt::com_ptr<ID3D11ShaderResourceView>, s_ShadowMips> linearDepthSRVs = { nullptr };
-	std::array<winrt::com_ptr<ID3D11UnorderedAccessView>, s_ShadowMips> linearDepthUAVs = { nullptr };
-	std::array<winrt::com_ptr<ID3D11ShaderResourceView>, s_ShadowMips> blurredLinearDepthSRVs = { nullptr };
-	std::array<winrt::com_ptr<ID3D11UnorderedAccessView>, s_ShadowMips> blurredLinearDepthUAVs = { nullptr };
-
-	eastl::unique_ptr<ConstantBuffer> ssplsCB = nullptr;
-
-	winrt::com_ptr<ID3D11ComputeShader> createDepthCS = nullptr;
-	winrt::com_ptr<ID3D11ComputeShader> blurDepthCS = nullptr;
-	winrt::com_ptr<ID3D11ComputeShader> depthAwareBlurCS = nullptr;
-	winrt::com_ptr<ID3D11ComputeShader> depthAwareUpscaleCS = nullptr;
-
-	virtual void SetupResources() override;
+	// (45 SSPLS) The orphan PrepareDepth chain (depth copy + linear depth mips + blur, bound to
+	// t56/t57 that no shader read) and the never-dispatched depth-aware blur/upscale shaders were
+	// removed, together with the ClearShaderCache double Release (E6). The shadows themselves are
+	// traced inline in Lighting.hlsl / Water.hlsl, so their GPU cost sits in the engine's object rows.
 
 	virtual void DrawSettings() override;
-
-	virtual void ClearShaderCache() override;
-
-	virtual void Prepass() override;
-
-	void CompileComputeShaders();
-
-	void PrepareDepth();
-	void DrawShadows();
 
 	virtual void LoadSettings(json& o_json) override;
 	virtual void SaveSettings(json& o_json) override;

@@ -8,8 +8,6 @@
 
 namespace ScreenSpacePointLightShadows
 {
-	Texture2D<float4> LinearDepthTexture : register(t56);
-	Texture2D<float4> BlurredLinearDepthTexture : register(t57);
 
 	float Raymarch(SamplerState s, float3 viewPosition, float3 lightDirectionVS, uint steps, float step, float2 stepScale, float compareToleranceScale, float radius, float2x2 rotationMatrix, uint a_eyeIndex = 0)
 	{
