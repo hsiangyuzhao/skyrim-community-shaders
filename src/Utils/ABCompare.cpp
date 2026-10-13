@@ -12,6 +12,7 @@
 #include "State.h"
 #include "Utils/Batch39Engine.h"
 #include "Utils/FileSystem.h"
+#include "Utils/Nvapi.h"
 #include "Utils/UI.h"
 
 #include <algorithm>
@@ -124,6 +125,7 @@ namespace ABCompare
 			g["Advanced"] = {
 				{ "Shader Defines", state->shaderDefinesString },
 				{ "Engine", Batch39Engine::Save() },
+				{ "NVIDIA", Util::Nvapi::Save() },  // (45c) hot switches, so they compare live
 			};
 			g["General"] = { { "Enable Shaders", globals::shaderCache->IsEnabled() } };
 			json classes = json::object();
@@ -370,6 +372,8 @@ namespace ABCompare
 						}
 						if (adv.contains("Engine"))
 							Batch39Engine::Load(adv["Engine"]);
+						if (adv.contains("NVIDIA"))
+							Util::Nvapi::Load(adv["NVIDIA"]);
 					}
 					if (g.contains("General") && g["General"].is_object()) {
 						const json& gen = g["General"];

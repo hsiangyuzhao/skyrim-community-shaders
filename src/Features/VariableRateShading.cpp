@@ -5,10 +5,11 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/Nvapi.h"
 
 // NVAPI is only used for its types; every entry point is resolved at runtime through the
-// driver's nvapi_QueryInterface, so nothing is linked and a machine without an NVIDIA driver
-// simply never finds nvapi64.dll.
+// driver's nvapi_QueryInterface (Utils/Nvapi), so nothing is linked and a machine without an
+// NVIDIA driver simply never finds nvapi64.dll.
 #pragma warning(push, 0)
 #include <nvapi.h>
 #pragma warning(pop)
@@ -26,14 +27,11 @@ namespace
 	static_assert(NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH == NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT);
 
 	// Function ids from nvapi_interface.h (same vendored SDK as nvapi.h).
-	constexpr uint32_t kIdInitialize = 0x0150e828;
 	constexpr uint32_t kIdGetGraphicsCapabilities = 0x52b1499a;
 	constexpr uint32_t kIdSetViewportsPixelShadingRates = 0x34f7938f;
 	constexpr uint32_t kIdCreateShadingRateResourceView = 0x99ca2dff;
 	constexpr uint32_t kIdSetShadingRateResourceView = 0x1b0c2f83;
 
-	using QueryInterfaceFn = void*(__cdecl*)(uint32_t);
-	using InitializeFn = NvAPI_Status(__cdecl*)();
 	using GetCapsFn = NvAPI_Status(__cdecl*)(IUnknown*, NvU32, NV_D3D1x_GRAPHICS_CAPS*);
 	using SetRatesFn = NvAPI_Status(__cdecl*)(IUnknown*, NV_D3D11_VIEWPORTS_SHADING_RATE_DESC*);
 	using CreateViewFn = NvAPI_Status(__cdecl*)(ID3D11Device*, ID3D11Resource*, NV_D3D11_SHADING_RATE_RESOURCE_VIEW_DESC*, ID3D11NvShadingRateResourceView**);
@@ -49,33 +47,22 @@ namespace
 		SetViewFn setView = nullptr;
 	};
 
-	/// Loaded once per process. NvAPI_Initialize is reference counted, so it coexists with
-	/// Streamline and anything else in the process that also initialises NVAPI.
+	/// Resolved once per process through the shared loader (Utils/Nvapi, 45c), which owns
+	/// nvapi64.dll and the reference-counted NvAPI_Initialize.
 	const Nvapi& GetNvapi()
 	{
 		static const Nvapi nvapi = [] {
 			Nvapi result;
-			HMODULE module = LoadLibraryW(L"nvapi64.dll");
-			if (!module) {
-				result.error = "No NVIDIA driver interface (nvapi64.dll) found; VRS needs an NVIDIA RTX GPU.";
+			if (!Util::Nvapi::Loaded()) {
+				result.error = Util::Nvapi::LoadError() + " VRS needs an NVIDIA RTX GPU.";
 				return result;
 			}
-			auto queryInterface = reinterpret_cast<QueryInterfaceFn>(GetProcAddress(module, "nvapi_QueryInterface"));
-			if (!queryInterface) {
-				result.error = "nvapi64.dll has no nvapi_QueryInterface export.";
-				return result;
-			}
-			auto initialize = reinterpret_cast<InitializeFn>(queryInterface(kIdInitialize));
-			result.getCaps = reinterpret_cast<GetCapsFn>(queryInterface(kIdGetGraphicsCapabilities));
-			result.setRates = reinterpret_cast<SetRatesFn>(queryInterface(kIdSetViewportsPixelShadingRates));
-			result.createView = reinterpret_cast<CreateViewFn>(queryInterface(kIdCreateShadingRateResourceView));
-			result.setView = reinterpret_cast<SetViewFn>(queryInterface(kIdSetShadingRateResourceView));
-			if (!initialize || !result.getCaps || !result.setRates || !result.createView || !result.setView) {
+			result.getCaps = reinterpret_cast<GetCapsFn>(Util::Nvapi::QueryInterface(kIdGetGraphicsCapabilities));
+			result.setRates = reinterpret_cast<SetRatesFn>(Util::Nvapi::QueryInterface(kIdSetViewportsPixelShadingRates));
+			result.createView = reinterpret_cast<CreateViewFn>(Util::Nvapi::QueryInterface(kIdCreateShadingRateResourceView));
+			result.setView = reinterpret_cast<SetViewFn>(Util::Nvapi::QueryInterface(kIdSetShadingRateResourceView));
+			if (!result.getCaps || !result.setRates || !result.createView || !result.setView) {
 				result.error = "The NVIDIA driver does not expose the D3D11 VRS functions; update the driver.";
-				return result;
-			}
-			if (const NvAPI_Status status = initialize(); status != NVAPI_OK) {
-				result.error = std::format("NvAPI_Initialize failed ({}).", static_cast<int>(status));
 				return result;
 			}
 			result.ok = true;
