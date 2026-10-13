@@ -46,14 +46,13 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sunGlowIntensity,
 	sunGlowWidthDeg,
 	sunLook,
-	hideNewMoonDisc,
+	// (44h) removed hideNewMoonDisc/moonGlowFollowsMoon/moonPhysicalRadiance/moonGlowFade/
+	// skyTrueSunHeight (and moonsFadeInDaylight in Load/SaveSettings): now fixed (see
+	// UpdateEffective()); old keys are ignored on load. Code paths kept for a possible rollback
+	// (specs/physsky-rollback-candidates.md).
 	moonGlowStrength,
-	moonGlowFollowsMoon,
-	moonPhysicalRadiance,
 	moonRadianceCap,
-	moonGlowFade,
 	nightBaseLight,
-	skyTrueSunHeight,
 	twilightLength,
 	skyModel,
 	// (44h) removed fixSkyAlpha/fixTrLutEdge/fixApShadowDepth/fixReflectionSky/fixMultiScatter:
@@ -124,10 +123,9 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.cloudLighting = o_json.value("cloudLighting", defaults.cloudLighting);
 		settings.cloudSkyAmbient = o_json.value("cloudSkyAmbient", defaults.cloudSkyAmbient);
 		settings.cloudLightHeightKm = o_json.value("cloudLightHeightKm", defaults.cloudLightHeightKm);
-		settings.moonsFadeInDaylight = o_json.value("moonsFadeInDaylight", defaults.moonsFadeInDaylight);
+		// (44h) moonsFadeInDaylight no longer loaded: fixed on in UpdateEffective().
 		settings.moonDaylightFade = o_json.value("moonDaylightFade", defaults.moonDaylightFade);
 	}
-	settings.moonGlowFade = std::clamp(settings.moonGlowFade, 0, kMoonGlowFadeCount - 1);
 	settings.skyModel = std::clamp(settings.skyModel, 0, kSkyModelCount - 1);
 	settings.nightBaseLight = std::clamp(settings.nightBaseLight, 0.f, 1.f);
 	settings.twilightLength = std::clamp(settings.twilightLength, 1.f, 3.f);
@@ -273,7 +271,7 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["cloudLighting"] = settings.cloudLighting;
 	o_json["cloudSkyAmbient"] = settings.cloudSkyAmbient;
 	o_json["cloudLightHeightKm"] = settings.cloudLightHeightKm;
-	o_json["moonsFadeInDaylight"] = settings.moonsFadeInDaylight;
+	// (44h) moonsFadeInDaylight no longer saved: fixed on in UpdateEffective().
 	o_json["moonDaylightFade"] = settings.moonDaylightFade;
 }
 
@@ -540,49 +538,53 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::SameLine();
 		ImGui::TextDisabled("(%.2f deg across)", settings.sunDiskRadiusDeg * 2.f);
 
-		ImGui::SeparatorText("Procedural Sun");
-		ImGui::Checkbox("Align with Vanilla Sun", &settings.sunAlignToVanilla);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"Centres the disk (and the sky's glow around the sun) exactly where the game draws its sun.\n"
-				"Off: the old direction, which drifts 2-4 degrees off the game's sun as you climb.");
-		if (ImGui::Checkbox("Replace Vanilla Sun", &settings.sunReplaceVanilla))
-			settings.sunLook = kSunLookCustom;
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("The disk replaces the game's sun picture instead of being added next to it (no second sun).");
-		if (ImGui::Checkbox("Soft Edge", &settings.sunSoftEdge))
-			settings.sunLook = kSunLookCustom;
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Fades the rim of the disk so it does not shimmer with DLSS.");
-		if (ImGui::Checkbox("Physical Brightness", &settings.sunPhysicalRadiance))
-			settings.sunLook = kSunLookCustom;
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"Makes the disk as bright as a real sun for its size, limited by the cap below.\n"
-				"Anything far above a sunlit white wall already shows as pure white on screen; the extra\n"
-				"only matters for bloom (COD Bloom). Off: the old dim flat disk.");
-		if (settings.sunPhysicalRadiance) {
-			if (ImGui::SliderFloat("Brightness Cap", &settings.sunRadianceCap, 10.f, 62250.f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
+		// (44h) The procedural-sun options are hidden (not just disabled) while Procedural Sun is
+		// off; their values are still saved and loaded.
+		if (settings.proceduralSun) {
+			ImGui::SeparatorText("Procedural Sun");
+			ImGui::Checkbox("Align with Vanilla Sun", &settings.sunAlignToVanilla);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text(
+					"Centres the disk (and the sky's glow around the sun) exactly where the game draws its sun.\n"
+					"Off: the old direction, which drifts 2-4 degrees off the game's sun as you climb.");
+			if (ImGui::Checkbox("Replace Vanilla Sun", &settings.sunReplaceVanilla))
+				settings.sunLook = kSunLookCustom;
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("The disk replaces the game's sun picture instead of being added next to it (no second sun).");
+			if (ImGui::Checkbox("Soft Edge", &settings.sunSoftEdge))
+				settings.sunLook = kSunLookCustom;
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Fades the rim of the disk so it does not shimmer with DLSS.");
+			if (ImGui::Checkbox("Physical Brightness", &settings.sunPhysicalRadiance))
 				settings.sunLook = kSunLookCustom;
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text(
-					"Upper limit of the disk's brightness (1 = about a sunlit white wall). Only changes how\n"
-					"strongly COD Bloom spreads the sun; lower = less DLSS/frame-gen shimmer. Upstream 62250.");
+					"Makes the disk as bright as a real sun for its size, limited by the cap below.\n"
+					"Anything far above a sunlit white wall already shows as pure white on screen; the extra\n"
+					"only matters for bloom (COD Bloom). Off: the old dim flat disk.");
+			if (settings.sunPhysicalRadiance) {
+				if (ImGui::SliderFloat("Brightness Cap", &settings.sunRadianceCap, 10.f, 62250.f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
+					settings.sunLook = kSunLookCustom;
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text(
+						"Upper limit of the disk's brightness (1 = about a sunlit white wall). Only changes how\n"
+						"strongly COD Bloom spreads the sun; lower = less DLSS/frame-gen shimmer. Upstream 62250.");
+			}
+			if (ImGui::SliderFloat("Sun Glow", &settings.sunGlowIntensity, 0.f, 30.f, "%.1f", ImGuiSliderFlags_AlwaysClamp))
+				settings.sunLook = kSunLookCustom;
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text(
+					"A glow in the sky around the disk, coloured by the atmosphere like the disk.\n"
+					"This is what makes the sun read as blinding: the game has no bloom on it unless COD Bloom\n"
+					"is on. 1 = as bright as a sunlit white wall at the disk's edge. 0 = no glow.");
+			if (ImGui::SliderFloat("Sun Glow Width", &settings.sunGlowWidthDeg, 0.1f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
+				settings.sunLook = kSunLookCustom;
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How far the glow reaches from the disk's edge before fading (a faint wider tail follows).");
+			ImGui::Checkbox("Hide Vanilla Sun Glare", &settings.sunHideVanillaGlare);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Removes the game's large halo around the sun while the procedural sun is on.");
 		}
-		if (ImGui::SliderFloat("Sun Glow", &settings.sunGlowIntensity, 0.f, 30.f, "%.1f", ImGuiSliderFlags_AlwaysClamp))
-			settings.sunLook = kSunLookCustom;
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"A glow in the sky around the disk, coloured by the atmosphere like the disk.\n"
-				"This is what makes the sun read as blinding: the game has no bloom on it unless COD Bloom\n"
-				"is on. 1 = as bright as a sunlit white wall at the disk's edge. 0 = no glow.");
-		if (ImGui::SliderFloat("Sun Glow Width", &settings.sunGlowWidthDeg, 0.1f, 5.f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
-			settings.sunLook = kSunLookCustom;
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("How far the glow reaches from the disk's edge before fading (a faint wider tail follows).");
-		ImGui::Checkbox("Hide Vanilla Sun Glare", &settings.sunHideVanillaGlare);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Removes the game's large halo around the sun while the procedural sun is on.");
 		ImGui::PopID();
 	}
 
@@ -596,13 +598,7 @@ void PhysicalSky::SettingsCelestials()
 			"(before dawn, after dusk). It also tints distant haze, reflections and the sky's ambient light.\n"
 			"Fades out as the sun climbs from 6 degrees below the horizon to 4 above.\n"
 			"0 = off (exactly as before). Default 0.2.");
-	ImGui::Checkbox("Sky Uses True Sun Height", &settings.skyTrueSunHeight);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"The sky colours (dawn glow, dusk, haze) use where the sun really is. The game draws the sun disc\n"
-			"lower the higher you stand (1.5-6 degrees); that drawing offset stays on the disc and its glow.\n"
-			"Off: the sky uses the lowered sun too, so dawn comes later and dusk earlier, more so on mountains.\n"
-			"Only matters with Align with Vanilla Sun on.");
+	// (44h) removed "Sky Uses True Sun Height": now fixed on (UpdateEffective()).
 	ImGui::SliderFloat("Twilight Length", &settings.twilightLength, 1.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
@@ -636,57 +632,23 @@ void PhysicalSky::SettingsCelestials()
 			"Does not change the moonlight on the ground, characters or shadows (Light Color above).\n"
 			"1 = the moon light colour in full: with bright moonlight the glow is as bright as the discs,\n"
 			"which then look washed out. Default 0.2: the discs stand clearly out of their glow.");
-	ImGui::Checkbox("Moon Glow Follows Phase and Visibility", &settings.moonGlowFollowsMoon);
+	// (44h) removed "Moon Glow Follows Phase and Visibility" (fixed on), "Moon Glow Fades" (fixed
+	// At Horizon), "Moon Physical Brightness" and "Moons Fade in Daylight" (fixed on): see
+	// UpdateEffective(). Their sliders below are now always shown.
+	ImGui::SliderFloat("Moon Brightness Cap", &settings.moonRadianceCap, 1.f, 50.f, "%.1f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
-			"On (default): a new moon, or a moon the game has hidden or is fading out at the horizon, puts little or\n"
-			"no glow into the sky. Off: both moons always glow at full strength, wherever they are.");
-	if (settings.moonGlowFollowsMoon) {
-		static constexpr const char* fadeNames[kMoonGlowFadeCount] = { "With Disc (40d)", "At Horizon" };
-		ImGui::Combo("Moon Glow Fades", &settings.moonGlowFade, fadeNames, kMoonGlowFadeCount);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"When a setting moon's glow goes out.\n"
-				"At Horizon (default): as the moon itself reaches the horizon (from 3 degrees above to 2 below).\n"
-				"With Disc (40d): together with the game's moon disc, which the game fades out while the moon is\n"
-				"still 16-28 degrees up, so the sky went dark long before moonset.\n"
-				"Either way the glow is off when the weather hides the moons.");
-	}
-	ImGui::Checkbox("Moon Physical Brightness", &settings.moonPhysicalRadiance);
+			"The moon discs get brighter by their light colour divided by their size in the sky, up to this\n"
+			"multiple of the game's disc brightness. Now: Masser x%.1f, Secunda x%.1f.",
+			moonCbData.masserDiskScale, moonCbData.secundaDiskScale);
+	ImGui::SliderFloat("Daylight Fade Strength", &settings.moonDaylightFade, 0.f, 100.f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
-			"Like the sun's Physical Brightness: the moon discs get brighter by their light colour divided by their\n"
-			"size in the sky, up to the cap below. The phase picture and the fade at the horizon are kept.\n"
-			"Off (default): the game's own disc brightness.");
-	if (settings.moonPhysicalRadiance) {
-		ImGui::SliderFloat("Moon Brightness Cap", &settings.moonRadianceCap, 1.f, 50.f, "%.1f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Largest multiple of the game's disc brightness. Now: Masser x%.1f, Secunda x%.1f.", moonCbData.masserDiskScale, moonCbData.secundaDiskScale);
-	}
-	ImGui::Checkbox("Moons Fade in Daylight", &settings.moonsFadeInDaylight);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"A moon in the daytime sky is pale and washed out, because the bright sky lies in front of it.\n"
-			"The game draws the discs at the same strength by day and by night, and the physical sky by day is\n"
-			"much darker than the disc, so a moon at 10:00 stood out as clearly as at night.\n"
-			"On (default): the disc is drawn more see-through the brighter the sky is around it compared with\n"
-			"the disc. No change at night. Off: as before.");
-	if (settings.moonsFadeInDaylight) {
-		ImGui::SliderFloat("Daylight Fade Strength", &settings.moonDaylightFade, 0.f, 100.f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"Higher = paler moons by day. Default 20: at noon a moon keeps roughly 40%% of its contrast,\n"
-				"in the early morning about 60%%, in twilight almost all of it.");
-	}
+			"A moon in the daytime sky is pale, because the bright sky lies in front of it.\n"
+			"Higher = paler moons by day. Default 20: at noon a moon keeps roughly 40%% of its contrast,\n"
+			"in the early morning about 60%%, in twilight almost all of it. No change at night.");
 
-	ImGui::SeparatorText("New Moon");
-	ImGui::Checkbox("Hide New Moon Disc", &settings.hideNewMoonDisc);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"On a new moon the game draws Masser and Secunda as solid black discs over the stars\n"
-			"(its new-moon pictures are plain black). Both moons share one phase calendar, so both\n"
-			"turn black on the same nights. On: a new moon is not drawn at all, like the real sky.\n"
-			"Off: the game's black discs.");
+	// (44h) removed the "New Moon" section ("Hide New Moon Disc"): now fixed on (UpdateEffective()).
 }
 
 void PhysicalSky::SettingsAtmosphere()
@@ -1216,6 +1178,15 @@ void PhysicalSky::UpdateEffective()
 	effective.fixApShadowDepth = true;
 	effective.fixReflectionSky = true;
 	effective.fixMultiScatter = true;
+	// (44h) Celestials options removed from the menu and the JSON, pinned at the user's values the
+	// same way. Legacy (36f) below still sets them to their 36f values. Code paths kept for a
+	// possible rollback (specs/physsky-rollback-candidates.md).
+	effective.skyTrueSunHeight = true;
+	effective.moonGlowFollowsMoon = true;
+	effective.moonGlowFade = kMoonGlowFadeAtHorizon;
+	effective.moonPhysicalRadiance = true;
+	effective.moonsFadeInDaylight = true;
+	effective.hideNewMoonDisc = true;
 	if (!IsLegacy())
 		return;
 

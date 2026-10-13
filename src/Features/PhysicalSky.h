@@ -185,8 +185,12 @@ struct PhysicalSky final : public Feature
 		bool moonGlowFollowsMoon = true;
 		/// (40d) Moon disc brightness = moonlight / disc solid angle (like the sun's Physical
 		/// Brightness), capped at moonRadianceCap; the phase picture keeps its shading.
-		bool moonPhysicalRadiance = false;
-		float moonRadianceCap = 8.f;
+		/// (44h) skyTrueSunHeight, hideNewMoonDisc, moonGlowFollowsMoon, moonGlowFade,
+		/// moonPhysicalRadiance and moonsFadeInDaylight are no longer in the menu or the JSON:
+		/// UpdateEffective() pins them at these defaults outside Legacy (36f). Code paths kept for a
+		/// possible rollback (specs/physsky-rollback-candidates.md).
+		bool moonPhysicalRadiance = true;  // (44h) default false -> true (pinned)
+		float moonRadianceCap = 2.f;  // (44h) default 8 -> 2 (user's tuned value)
 		/// (41b, F2) What fades each moon's sky glow (with moonGlowFollowsMoon): MoonGlowFade.
 		int moonGlowFade = kMoonGlowFadeAtHorizon;
 
