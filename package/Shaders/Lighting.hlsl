@@ -2475,6 +2475,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		// never reaches a pixel shader, the engine strips it from pixel descriptors).
 		const bool snowOnActor = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsActorGeometry) != 0;
 
+		// (44h) Local accumulation amount: the global amount x the cold-region mask (FlagColdMap) x
+		// the fade towards the edge of the loaded cells, 0 on distant LOD (FlagNoLodSnow).
+#		if defined(LODLANDSCAPE) || defined(LODOBJECTS) || defined(LODOBJECTSHD)
+		const bool snowOnLod = true;
+#		else
+		const bool snowOnLod = false;
+#		endif
+		float snowAmountScale = 1.0;
+		[branch] if (snowFlags & (DynamicSnow::FlagAccumulation | DynamicSnow::FlagShowColdMap))
+			snowAmountScale = DynamicSnow::AmountScale(snowPositionWS.xy, snowOnLod);
+		const float snowAmount = SharedData::dynamicSnowSettings.Amount * snowAmountScale;
+
 		// (batch 39b) Authored snow the material path above does not report. 39a only had
 		// psout.Parameters.y, which exists only in SNOW permutations: True PBR terrain (every
 		// landscape with a PBR texture set, e.g. Vanaheimr Landscapes) has no SNOW permutation and
@@ -2509,11 +2521,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		}
 
 #		if defined(TREE_ANIM)
-		[branch] if ((snowFlags & DynamicSnow::FlagAccumulation) && (snowFlags & DynamicSnow::FlagTrees) && !snowOnActor)
+		[branch] if ((snowFlags & DynamicSnow::FlagAccumulation) && (snowFlags & DynamicSnow::FlagTrees) && !snowOnActor && snowAmount > 0.0)
 		{
-			float snowCoverage = DynamicSnow::GetTreeCoverage(snowPositionWS, snowGeometryNormal, uv);
+			float snowCoverage = DynamicSnow::GetTreeCoverage(snowPositionWS, snowGeometryNormal, uv, snowAmount);
 #		else
-		[branch] if ((snowFlags & DynamicSnow::FlagAccumulation) && (!snowOnActor || (snowFlags & DynamicSnow::FlagSnowOnCharacters)))
+		[branch] if ((snowFlags & DynamicSnow::FlagAccumulation) && (!snowOnActor || (snowFlags & DynamicSnow::FlagSnowOnCharacters)) && snowAmount > 0.0)
 		{
 			float snowCoverage;
 			[branch] if (snowOnActor)
@@ -2539,11 +2551,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				[branch] if (Permutation::ExtraShaderDescriptor & DynamicSnow::ExtraIsActorRigid)
 					snowBindNormal = snowGeometryNormal;
 				snowBindNormal = snowBindNormal * rsqrt(max(dot(snowBindNormal, snowBindNormal), 1e-8));
-				snowCoverage = frontFace ? DynamicSnow::GetActorCoverage(input.ModelPosition.xyz, snowBindNormal, length(input.WorldPosition.xyz)) : 0.0;
+				snowCoverage = frontFace ? DynamicSnow::GetActorCoverage(input.ModelPosition.xyz, snowBindNormal, length(input.WorldPosition.xyz), snowAmount) : 0.0;
 			}
 			else
 			{
-				snowCoverage = DynamicSnow::GetCoverage(snowPositionWS, worldNormal, snowGeometryNormal, 1.0, length(input.WorldPosition.xyz));
+				snowCoverage = DynamicSnow::GetCoverage(snowPositionWS, worldNormal, snowGeometryNormal, 1.0, length(input.WorldPosition.xyz), snowAmount);
 			}
 #		endif
 			[branch] if (snowCoverage > 0.0)
@@ -2590,6 +2602,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif
 			}
 		}
+
+		// (44h) Debug: where accumulation can build (blue) and where it cannot (red).
+		[branch] if ((snowFlags & DynamicSnow::FlagShowColdMap) && !snowOnActor)
+			baseColor.xyz = lerp(baseColor.xyz, DynamicSnow::ColdMapDebugColor(snowAmountScale), 0.6);
 
 #		if !defined(TREE_ANIM)
 		[branch] if ((snowFlags & DynamicSnow::FlagTrails) && !snowOnActor)

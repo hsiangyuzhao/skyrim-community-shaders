@@ -43,6 +43,69 @@ namespace DynamicSnow
 	// (44e) Flags bit: the trail map holds time-stamped texels (TrailTime.hlsli); the current tick is in pad0.
 	static const uint FlagTrailTimeStamps = 1 << 14;
 	uint TrailNowTick() { return uint(SharedData::dynamicSnowSettings.pad0); }
+	// (44h) Accumulation only where the region is a cold one: the amount is scaled by the cold-region
+	// mask (SnowColdMask, SharedData::dynamicSnowMapData).
+	static const uint FlagColdMap = 1 << 15;
+	// (44h) Distant LOD (LOD terrain, LOD objects, billboard trees) takes no accumulation, and the
+	// full-detail geometry's amount thins out to nothing towards the edge of the loaded cells.
+	static const uint FlagNoLodSnow = 1 << 16;
+	// (44h) Debug: tint surfaces by the local amount scale (red = no snow here, blue = full).
+	static const uint FlagShowColdMap = 1 << 17;
+
+#if defined(PSHADER)
+	// (44h) R8_UNORM over the worldspace, 1 = cold region. Bound by DynamicSnow::Prepass.
+	Texture2D<float> SnowColdMask : register(t102);
+#endif
+
+	// (44h) Bilinear cold-region mask at a world XY (manual, from four loads: no sampler slot needed).
+	// Outside the mask the edge texels repeat; the mask has a margin, so they hold the "no region" value.
+	float ColdMask(float2 positionXY)
+	{
+#if defined(PSHADER)
+		const SharedData::DynamicSnowMapData m = SharedData::dynamicSnowMapData;
+		float2 t = (positionXY - m.MaskOrigin) * m.MaskInvTexelSize - 0.5;
+		float2 tf = floor(t);
+		float2 f = t - tf;
+		int2 hi = int2(m.MaskSize) - 1;
+		int2 i0 = clamp(int2(tf), 0, hi);
+		int2 i1 = clamp(int2(tf) + 1, 0, hi);
+		float a = SnowColdMask.Load(int3(i0.x, i0.y, 0));
+		float b = SnowColdMask.Load(int3(i1.x, i0.y, 0));
+		float c = SnowColdMask.Load(int3(i0.x, i1.y, 0));
+		float d = SnowColdMask.Load(int3(i1.x, i1.y, 0));
+		return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+#else
+		return 1.0;
+#endif
+	}
+
+	/**
+	 * (44h) Local scale [0,1] of the global accumulation amount at a world XY.
+	 * @param lod the surface is distant LOD (LOD terrain / objects / billboard trees)
+	 * Neither FlagColdMap nor FlagNoLodSnow set: 1, the global amount everywhere (the 44g picture).
+	 */
+	float AmountScale(float2 positionXY, bool lod)
+	{
+		const uint flags = SharedData::dynamicSnowSettings.Flags;
+		float scale = 1.0;
+		[branch] if (flags & FlagNoLodSnow)
+		{
+			if (lod)
+				return 0.0;
+			const SharedData::DynamicSnowMapData m = SharedData::dynamicSnowMapData;
+			float2 d = abs(positionXY - m.LoadedCenter);
+			scale = 1.0 - smoothstep(m.FadeStart, m.FadeEnd, max(d.x, d.y));
+		}
+		[branch] if ((flags & FlagColdMap) && scale > 0.0)
+			scale *= ColdMask(positionXY);
+		return scale;
+	}
+
+	// (44h) FlagShowColdMap: red where no snow can build, blue where it builds fully.
+	float3 ColdMapDebugColor(float scale)
+	{
+		return lerp(float3(0.8, 0.08, 0.05), float3(0.05, 0.25, 0.9), saturate(scale));
+	}
 
 	// (40e) Mirrors CommonBufferData::SnowSmoothing / SteepCover (stored in pad1, see SharedData.hlsli).
 	float SnowSmoothing() { return SharedData::dynamicSnowSettings.pad1.x; }
@@ -81,7 +144,7 @@ namespace DynamicSnow
 	 * @param skyVisibility [0,1] how open the sky is straight above (0 = under a roof)
 	 * @param viewDistance distance to the camera, fades the fine noise octave out
 	 */
-	float GetCoverage(float3 positionWS, float3 normalWS, float3 geometryNormalWS, float skyVisibility, float viewDistance)
+	float GetCoverage(float3 positionWS, float3 normalWS, float3 geometryNormalWS, float skyVisibility, float viewDistance, float amount)
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
 		const bool slopeModel = (s.Flags & FlagCoverageSlope) != 0;
@@ -118,7 +181,7 @@ namespace DynamicSnow
 		// threshold sits above the largest possible h), amount 1 covers every surface above
 		// the normal threshold.
 		float h = slope * 0.7 + noise * 0.3;
-		float t = 1.1 - s.Amount * 1.2;
+		float t = 1.1 - amount * 1.2;
 		float coverage = smoothstep(t - 0.1, t + 0.1, h);
 
 		[branch] if (slopeModel)
@@ -145,7 +208,7 @@ namespace DynamicSnow
 	// on the same patch of cloth while the limbs move, and follows the mesh's curvature instead of
 	// its triangles. Softer than the ground: a gentle slope ramp, a wide noise ramp and a lower
 	// ceiling, so a shoulder gets a dusting that fades out rather than a hard white patch.
-	float GetActorCoverage(float3 positionMS, float3 normalMS, float viewDistance)
+	float GetActorCoverage(float3 positionMS, float3 normalMS, float viewDistance, float amount)
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
 		float slope = smoothstep(0.2, 0.95, normalMS.z);
@@ -158,7 +221,7 @@ namespace DynamicSnow
 		float noise = ValueNoise(p * (1.0 / 40.0)) * 0.65 + fine * 0.35;
 
 		float h = slope * 0.7 + noise * 0.3;
-		float t = 1.1 - s.Amount * 1.2;
+		float t = 1.1 - amount * 1.2;
 		float coverage = smoothstep(t - 0.25, t + 0.25, h) * slope;
 		return coverage * s.MaxCoverage * 0.8;
 	}
@@ -169,14 +232,14 @@ namespace DynamicSnow
 	// of the crown faces up), the fine breakup is in texture space and moves with the leaf, and
 	// the world-space noise is only the 300-unit octave, against which a sway of a few units is
 	// invisible. No front/back-face term either: a swaying card flips sides against the camera.
-	float GetTreeCoverage(float3 positionWS, float3 geometryNormalWS, float2 uv)
+	float GetTreeCoverage(float3 positionWS, float3 geometryNormalWS, float2 uv, float amount)
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
 		float slope = smoothstep(-0.1, 0.6, geometryNormalWS.z);
 		[branch] if (slope <= 0.0) return 0.0;
 		float noise = ValueNoise(positionWS.xy * (1.0 / 300.0)) * 0.6 + ValueNoise(uv * 6.0) * 0.4;
 		float h = slope * 0.7 + noise * 0.3;
-		float t = 1.1 - s.Amount * 1.2;
+		float t = 1.1 - amount * 1.2;
 		return smoothstep(t - 0.1, t + 0.1, h) * slope * s.TreeCoverage * s.MaxCoverage;
 	}
 
@@ -184,13 +247,13 @@ namespace DynamicSnow
 	// root is white with the ground around it), and dusts the up-facing upper part. tip = the
 	// vertex's wind weight (0 at the root, 1 at the tip in Skyrim grass meshes): a per-vertex
 	// constant, so the cover does not move with the wind.
-	float GetGrassCoverage(float3 positionWS, float tip, float upZ)
+	float GetGrassCoverage(float3 positionWS, float tip, float upZ, float amount)
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
-		float snowLine = s.Amount * 0.7;
+		float snowLine = amount * 0.7;
 		float buried = 1.0 - smoothstep(snowLine - 0.15, snowLine + 0.05, tip);
-		buried *= smoothstep(0.0, 0.15, s.Amount);
-		float dust = smoothstep(-0.6, 0.8, upZ) * smoothstep(0.0, 0.6, s.Amount) * 0.6;
+		buried *= smoothstep(0.0, 0.15, amount);
+		float dust = smoothstep(-0.6, 0.8, upZ) * smoothstep(0.0, 0.6, amount) * 0.6;
 		float noise = ValueNoise(positionWS.xy * (1.0 / 300.0));
 		return saturate(max(buried, dust) * lerp(0.75, 1.0, noise)) * s.GrassCoverage * s.MaxCoverage;
 	}
@@ -198,12 +261,12 @@ namespace DynamicSnow
 	// (batch 39c) Distant billboard trees (DistantTree.hlsl): a tint that matches the average
 	// of the near trees, whiter towards the top of the billboard. heightFraction is 0 at the
 	// billboard's base and 1 at its top; the breakup is in atlas space.
-	float GetLodTreeCoverage(float heightFraction, float2 uv)
+	float GetLodTreeCoverage(float heightFraction, float2 uv, float amount)
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
-		float amount = smoothstep(0.0, 1.0, s.Amount);
+		float a = smoothstep(0.0, 1.0, amount);
 		float noise = ValueNoise(uv * 48.0);
-		return amount * lerp(0.45, 1.0, heightFraction) * lerp(0.7, 1.0, noise) * s.LodTreeCoverage * s.MaxCoverage;
+		return a * lerp(0.45, 1.0, heightFraction) * lerp(0.7, 1.0, noise) * s.LodTreeCoverage * s.MaxCoverage;
 	}
 
 	// (batch 39b) Snow test from the colour alone: bright and close to grey-white. Only used on the

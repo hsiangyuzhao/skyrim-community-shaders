@@ -56,7 +56,8 @@ public:
 			"and people and creatures leave footprints in snow.",
 			{ "Snow builds up on upward-facing surfaces while it snows, not under roofs",
 				"Melts gradually after the snow stops",
-				"Snow on trees, bushes, grass and distant trees",
+				"Snow on trees, bushes and grass",
+				"Only in cold regions (from the regions' weather), never on distant LOD",
 				"Footprints and trails from the player and nearby actors, filling back in over time",
 				"Optional prints in mud and dirt" }
 		};
@@ -122,8 +123,15 @@ public:
 		float TreeCoverage = 0.8f;
 		bool SnowOnGrass = true;
 		float GrassCoverage = 0.9f;
-		bool SnowOnLodTrees = true;  ///< distant billboard trees
-		float LodTreeCoverage = 0.5f;
+		// (44h) "Snow on Distant Trees" / "Distant Tree Snow Amount" removed: distant LOD takes no
+		// accumulation under NoLodSnow, and the old LOD-tree tint (0.5) with it off. Old keys
+		// SnowOnLodTrees / LodTreeCoverage are ignored.
+		/// (44h) Accumulation only where the region is cold (the same snow share as Cold Region
+		/// Threshold, mapped over the whole worldspace). Off = the global amount everywhere.
+		bool ColdRegionsOnly = true;
+		/// (44h) LOD terrain, LOD objects and distant trees take no accumulation (their textures carry
+		/// snow already); near geometry thins out to none at the edge of the loaded cells.
+		bool NoLodSnow = true;
 		/// Ragdolls being dragged or sliding and loose objects moving through snow carve trenches
 		/// (Havok collision shapes, after community-shaders PR #2659).
 		bool BodyAndObjectTrails = true;
@@ -131,6 +139,7 @@ public:
 
 		// ---- Debug ----
 		bool OverrideAmount = false;
+		bool ShowColdMap = false;  ///< (44h) tint surfaces red (no snow) / blue (full snow)
 		float AmountOverride = 1.0f;
 	};
 
@@ -195,9 +204,35 @@ public:
 		// 1 << 13: (40e) rigid gear uses world up; free since 44f (permanent in the shader).
 		// (44e)
 		FlagTrailTimeStamps = 1 << 14,
+		// (44h)
+		FlagColdMap = 1 << 15,
+		FlagNoLodSnow = 1 << 16,
+		FlagShowColdMap = 1 << 17,
 	};
 
 	[[nodiscard]] CommonBufferData GetCommonBufferData();
+
+	/// (44h) Mirrors SharedData::DynamicSnowMapData (HLSL), appended at the very end of FeatureData.
+	struct alignas(16) MapCbData
+	{
+		float2 MaskOrigin;
+		float MaskInvTexelSize;
+		float pad0;
+
+		uint MaskSizeX;
+		uint MaskSizeY;
+		float2 LoadedCenter;
+
+		float FadeStart;
+		float FadeEnd;
+		float2 pad1;
+	};
+	STATIC_ASSERT_ALIGNAS_16(MapCbData);
+	static_assert(sizeof(MapCbData) == 48);
+
+	/// (44h) Cold-region mask placement and the near-snow fade. Updates the frame state itself, so it
+	/// does not depend on the order FeatureBuffer evaluates its arguments in.
+	[[nodiscard]] MapCbData GetMapBufferData();
 
 	/// Accumulation is wanted this frame (master && setting).
 	[[nodiscard]] bool AccumulationActive() const;
@@ -238,6 +273,19 @@ public:
 		uint32_t shapesLoaded = 0;       ///< print shapes found in the installed footprint mods
 		std::string shapeSource;         ///< where they came from
 		uint32_t bodyStamps = 0;         ///< trench stamps from bodies and objects last frame
+		// (44h) Cold-region map
+		bool coldMapValid = false;       ///< a mask is built and bound for this worldspace
+		std::string coldMapNote;         ///< why there is none, or where it came from
+		uint32_t coldMapRegions = 0;     ///< weather regions rasterised
+		uint32_t coldMapColdRegions = 0; ///< ... of which cold at the current threshold
+		float coldMapColdPercent = 0.0f; ///< share of the map's texels that are cold (before the blur)
+		uint32_t coldMapWidth = 0;
+		uint32_t coldMapHeight = 0;
+		float coldMapBuildMs = 0.0f;
+		float playerMask = 1.0f;         ///< mask value at the player
+		uint32_t gridsToLoad = 0;        ///< loaded cells per side (uGridsToLoad)
+		float fadeStart = 0.0f;          ///< near-snow fade, game units from the loaded area's centre
+		float fadeEnd = 0.0f;
 	} status;
 
 private:
@@ -393,4 +441,37 @@ private:
 	uint64_t snowNearbyFrame = 0;
 	uint32_t NowTick() const;
 	bool SnowNearby();
+
+	// (44h) Cold-region map. The share grid (highest snow share of the weather regions covering each
+	// texel, the climate's share where none does) is built once per worldspace; the mask (share >=
+	// threshold, blurred) is rebuilt from it whenever the threshold changes.
+	static constexpr uint32_t kColdMaskSlot = 102;    ///< PS register of the mask (t102)
+	static constexpr float kColdMapTexelUnits = 2048.0f;  ///< two texels per 4096-unit cell
+	static constexpr uint32_t kColdMapMaxSize = 512;
+	void UpdateColdMap();
+	void BuildColdShareGrid(RE::TESWorldSpace* a_worldSpace);
+	void BuildColdMask();
+	void ReleaseColdMap();
+	[[nodiscard]] float SampleColdMaskCPU(float a_x, float a_y) const;
+	void UpdateLoadedArea();
+
+	RE::TESWorldSpace* coldMapWorldSpace = nullptr;  ///< worldspace the share grid was built for
+	bool coldMapTried = false;                       ///< BuildColdShareGrid ran for coldMapWorldSpace
+	float coldMapThreshold = -1.0f;                  ///< threshold the mask was built with
+	std::vector<float> coldShare;                    ///< per texel snow share
+	std::vector<float> coldShareRegion;              ///< per weather region (for the cold count)
+	std::vector<float> coldMaskCPU;                  ///< the uploaded mask, for the status line
+	float coldClimateShare = -1.0f;                  ///< share where no weather region lies (-1 = none)
+	float coldShareBuildMs = 0.0f;
+	bool coldMapLogPending = false;                  ///< log the next mask build in full
+	uint32_t coldMapW = 0;
+	uint32_t coldMapH = 0;
+	float coldMapTexel = kColdMapTexelUnits;
+	float coldMapOriginX = 0.0f;
+	float coldMapOriginY = 0.0f;
+	winrt::com_ptr<ID3D11Texture2D> coldMaskTexture;
+	winrt::com_ptr<ID3D11ShaderResourceView> coldMaskSRV;
+	float loadedCenter[2]{};
+	float loadedFadeStart = 1e9f;
+	float loadedFadeEnd = 2e9f;
 };

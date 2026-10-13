@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <format>
 
@@ -40,11 +41,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	TreeCoverage,
 	SnowOnGrass,
 	GrassCoverage,
-	SnowOnLodTrees,
-	LodTreeCoverage,
+	ColdRegionsOnly,
+	NoLodSnow,
 	BodyAndObjectTrails,
 	TrailRim,
 	OverrideAmount,
+	ShowColdMap,
 	AmountOverride)
 
 namespace
@@ -242,6 +244,388 @@ void DynamicSnow::UpdateAccumulation()
 }
 
 // ---------------------------------------------------------------------------------------------
+// (44h) Cold-region map and the loaded area
+// ---------------------------------------------------------------------------------------------
+//
+// Skyrim has one weather per worldspace, so a snowstorm at High Hrothgar used to whiten the
+// whole visible map. The mask says, for every point of the worldspace, whether the region there
+// is a cold one, by the same rule IsColdRegion applies to the player's cell: the highest snow
+// share of the weather regions covering the point (a region's area is the polygons of its RPLD
+// point lists), or the worldspace climate's share where no weather region lies, against Cold
+// Region Threshold. Shaders multiply the global amount by it, so a warm region's surfaces stay
+// bare while the cold ones build up, and the border thins out through the coverage noise.
+
+namespace
+{
+	constexpr float kCellUnits = 4096.0f;
+
+	/// Highest snow share of a region's weather lists, or -1 if it has none.
+	float RegionSnowShare(RE::TESRegion* a_region)
+	{
+		float best = -1.0f;
+		if (!a_region || !a_region->dataList)
+			return best;
+		for (auto* data : a_region->dataList->regionDataList) {
+			if (!data || data->GetType() != RE::TESRegionData::Type::kWeather)
+				continue;
+			best = std::max(best, SnowShare(static_cast<RE::TESRegionDataWeather*>(data)->weatherTypes));
+		}
+		return best;
+	}
+
+	std::string FormName(RE::TESForm* a_form)
+	{
+		if (!a_form)
+			return "-";
+		const char* id = a_form->GetFormEditorID();
+		return (id && id[0]) ? std::string(id) : std::format("{:08X}", a_form->GetFormID());
+	}
+}
+
+void DynamicSnow::UpdateLoadedArea()
+{
+	auto* tes = RE::TES::GetSingleton();
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	if (!player)
+		return;
+
+	// Loaded cells per side: the live grid (it takes its size from uGridsToLoad), else the INI.
+	uint32_t grids = (tes && tes->gridCells) ? tes->gridCells->length : 0;
+	if (grids == 0 || grids > 63) {
+		auto* setting = RE::GetINISetting("uGridsToLoad:General");
+		grids = setting ? setting->GetUInt() : 0;
+	}
+	if (grids == 0 || grids > 63)
+		grids = 5;
+
+	// The grid is centred on TES's current grid cell; the player's own cell if that looks wrong
+	// (the player must always stand inside the loaded grid).
+	const auto pos = player->GetPosition();
+	const int px = static_cast<int>(std::floor(pos.x / kCellUnits));
+	const int py = static_cast<int>(std::floor(pos.y / kCellUnits));
+	int cx = px;
+	int cy = py;
+	if (tes) {
+		const int half = static_cast<int>(grids / 2);
+		if (std::abs(tes->currentGridX - px) <= half && std::abs(tes->currentGridY - py) <= half) {
+			cx = tes->currentGridX;
+			cy = tes->currentGridY;
+		}
+	}
+	loadedCenter[0] = (static_cast<float>(cx) + 0.5f) * kCellUnits;
+	loadedCenter[1] = (static_cast<float>(cy) + 0.5f) * kCellUnits;
+
+	// Near snow is full up to one cell short of the loaded area's edge and gone just inside it,
+	// where LOD terrain and LOD objects (no accumulation) take over.
+	const float halfExtent = static_cast<float>(grids) * kCellUnits * 0.5f;
+	loadedFadeEnd = std::max(halfExtent - 256.0f, 2048.0f);
+	loadedFadeStart = std::max(loadedFadeEnd - kCellUnits, 0.0f);
+	status.gridsToLoad = grids;
+	status.fadeStart = loadedFadeStart;
+	status.fadeEnd = loadedFadeEnd;
+}
+
+void DynamicSnow::ReleaseColdMap()
+{
+	if (coldMaskSRV && globals::d3d::context) {
+		ID3D11ShaderResourceView* nullSrv = nullptr;
+		globals::d3d::context->PSSetShaderResources(kColdMaskSlot, 1, &nullSrv);
+	}
+	coldMaskSRV = nullptr;
+	coldMaskTexture = nullptr;
+	status.coldMapValid = false;
+}
+
+void DynamicSnow::BuildColdShareGrid(RE::TESWorldSpace* a_worldSpace)
+{
+	const auto t0 = std::chrono::steady_clock::now();
+	ReleaseColdMap();
+	coldShare.clear();
+	coldShareRegion.clear();
+	coldMaskCPU.clear();
+	coldMapW = coldMapH = 0;
+	coldMapThreshold = -1.0f;
+	coldClimateShare = -1.0f;
+	status.coldMapRegions = 0;
+	status.coldMapColdRegions = 0;
+	status.coldMapColdPercent = 0.0f;
+	status.coldMapWidth = status.coldMapHeight = 0;
+	status.playerMask = 1.0f;
+
+	auto* dataHandler = RE::TESDataHandler::GetSingleton();
+	if (!a_worldSpace || !dataHandler) {
+		status.coldMapNote = "no worldspace data";
+		return;
+	}
+
+	struct Polygon
+	{
+		std::vector<RE::NiPoint2> points;
+		float minX, minY, maxX, maxY;
+		float share;
+	};
+	std::vector<Polygon> polygons;
+
+	auto gather = [&](RE::TESWorldSpace* a_ws) {
+		constexpr auto skipFlags = RE::TESRegion::RecordFlags::kBorderRegion | RE::TESRegion::RecordFlags::kDeleted | RE::TESRegion::RecordFlags::kIgnored;
+		for (auto* region : dataHandler->GetFormArray<RE::TESRegion>()) {
+			if (!region || region->worldSpace != a_ws || !region->pointLists || (region->formFlags & skipFlags))
+				continue;
+			const float share = RegionSnowShare(region);
+			if (share < 0.0f)
+				continue;  // not a weather region: it says nothing about cold
+			bool any = false;
+			for (auto* list : *region->pointLists) {
+				if (!list)
+					continue;
+				Polygon poly{};
+				for (auto* point : *list) {
+					if (point && std::isfinite(point->point.x) && std::isfinite(point->point.y))
+						poly.points.push_back(point->point);
+				}
+				if (poly.points.size() < 3)
+					continue;
+				poly.minX = poly.maxX = poly.points[0].x;
+				poly.minY = poly.maxY = poly.points[0].y;
+				for (const auto& p : poly.points) {
+					poly.minX = std::min(poly.minX, p.x);
+					poly.maxX = std::max(poly.maxX, p.x);
+					poly.minY = std::min(poly.minY, p.y);
+					poly.maxY = std::max(poly.maxY, p.y);
+				}
+				poly.share = share;
+				polygons.push_back(std::move(poly));
+				any = true;
+			}
+			if (any)
+				coldShareRegion.push_back(share);
+		}
+	};
+
+	gather(a_worldSpace);
+	std::string source = FormName(a_worldSpace);
+	if (polygons.empty() && a_worldSpace->parentWorld) {
+		// City worldspaces (Whiterun, Solitude...) share their parent's coordinates and weather.
+		gather(a_worldSpace->parentWorld);
+		source = std::format("{} (regions of {})", source, FormName(a_worldSpace->parentWorld));
+	}
+	if (polygons.empty()) {
+		status.coldMapNote = "no weather regions with an area here: snow everywhere (old behaviour)";
+		logger::info("[{}] Cold map for {}: no weather regions with an area; accumulation stays global", GetName(), source);
+		return;
+	}
+
+	// Where no weather region lies: the climate, as IsColdRegion does for such a cell.
+	RE::TESClimate* climate = a_worldSpace->climate;
+	if (!climate && a_worldSpace->parentWorld)
+		climate = a_worldSpace->parentWorld->climate;
+	coldClimateShare = climate ? SnowShare(climate->weatherList) : -1.0f;
+
+	// Bounds of all weather regions plus a two-cell margin, so the mask's edge texels (repeated
+	// outside it by the shader) are "no region".
+	float minX = polygons[0].minX, minY = polygons[0].minY, maxX = polygons[0].maxX, maxY = polygons[0].maxY;
+	for (const auto& poly : polygons) {
+		minX = std::min(minX, poly.minX);
+		minY = std::min(minY, poly.minY);
+		maxX = std::max(maxX, poly.maxX);
+		maxY = std::max(maxY, poly.maxY);
+	}
+	constexpr float margin = 2.0f * kCellUnits;
+	minX -= margin;
+	minY -= margin;
+	maxX += margin;
+	maxY += margin;
+	const float extent = std::max(maxX - minX, maxY - minY);
+	coldMapTexel = std::max(kColdMapTexelUnits, extent / static_cast<float>(kColdMapMaxSize));
+	coldMapW = std::clamp(static_cast<uint32_t>(std::ceil((maxX - minX) / coldMapTexel)), 4u, kColdMapMaxSize);
+	coldMapH = std::clamp(static_cast<uint32_t>(std::ceil((maxY - minY) / coldMapTexel)), 4u, kColdMapMaxSize);
+	coldMapOriginX = minX;
+	coldMapOriginY = minY;
+	coldShare.assign(static_cast<size_t>(coldMapW) * coldMapH, -1.0f);
+
+	// Scanline fill per polygon (even-odd), keeping the highest share where regions overlap.
+	std::vector<float> crossings;
+	for (const auto& poly : polygons) {
+		const int y0 = std::max(0, static_cast<int>(std::floor((poly.minY - coldMapOriginY) / coldMapTexel - 0.5f)));
+		const int y1 = std::min(static_cast<int>(coldMapH) - 1, static_cast<int>(std::ceil((poly.maxY - coldMapOriginY) / coldMapTexel - 0.5f)));
+		const size_t n = poly.points.size();
+		for (int j = y0; j <= y1; ++j) {
+			const float yc = coldMapOriginY + (static_cast<float>(j) + 0.5f) * coldMapTexel;
+			crossings.clear();
+			for (size_t k = 0; k < n; ++k) {
+				const auto& a = poly.points[k];
+				const auto& b = poly.points[(k + 1) % n];
+				if ((a.y <= yc) != (b.y <= yc))
+					crossings.push_back(a.x + (yc - a.y) * (b.x - a.x) / (b.y - a.y));
+			}
+			std::sort(crossings.begin(), crossings.end());
+			for (size_t k = 0; k + 1 < crossings.size(); k += 2) {
+				// Texels whose centre lies in [x0, x1).
+				const int i0 = std::max(0, static_cast<int>(std::ceil((crossings[k] - coldMapOriginX) / coldMapTexel - 0.5f)));
+				const int i1 = std::min(static_cast<int>(coldMapW) - 1, static_cast<int>(std::ceil((crossings[k + 1] - coldMapOriginX) / coldMapTexel - 0.5f)) - 1);
+				float* row = coldShare.data() + static_cast<size_t>(j) * coldMapW;
+				for (int i = i0; i <= i1; ++i)
+					row[i] = std::max(row[i], poly.share);
+			}
+		}
+	}
+
+	status.coldMapRegions = static_cast<uint32_t>(coldShareRegion.size());
+	status.coldMapWidth = coldMapW;
+	status.coldMapHeight = coldMapH;
+	status.coldMapNote = source;
+	coldShareBuildMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	coldMapLogPending = true;
+}
+
+void DynamicSnow::BuildColdMask()
+{
+	const auto t0 = std::chrono::steady_clock::now();
+	const float threshold = settings.ColdRegionSnowShare;
+	coldMapThreshold = threshold;
+	const size_t count = static_cast<size_t>(coldMapW) * coldMapH;
+	if (count == 0 || coldShare.size() != count)
+		return;
+
+	std::vector<float> mask(count);
+	size_t coldTexels = 0;
+	for (size_t k = 0; k < count; ++k) {
+		const float share = coldShare[k] >= 0.0f ? coldShare[k] : coldClimateShare;
+		const bool cold = share >= 0.0f && share >= threshold;
+		mask[k] = cold ? 1.0f : 0.0f;
+		coldTexels += cold;
+	}
+	uint32_t coldRegions = 0;
+	for (float share : coldShareRegion)
+		coldRegions += share >= threshold;
+
+	// Soft border: two passes of a separable 3x3 box (a tent about two texels, one cell, wide),
+	// and the shader reads it bilinearly.
+	std::vector<float> tmp(count);
+	const int w = static_cast<int>(coldMapW);
+	const int h = static_cast<int>(coldMapH);
+	for (int pass = 0; pass < 2; ++pass) {
+		for (int y = 0; y < h; ++y)
+			for (int x = 0; x < w; ++x)
+				tmp[y * w + x] = (mask[y * w + std::max(x - 1, 0)] + mask[y * w + x] + mask[y * w + std::min(x + 1, w - 1)]) * (1.0f / 3.0f);
+		for (int y = 0; y < h; ++y)
+			for (int x = 0; x < w; ++x)
+				mask[y * w + x] = (tmp[std::max(y - 1, 0) * w + x] + tmp[y * w + x] + tmp[std::min(y + 1, h - 1) * w + x]) * (1.0f / 3.0f);
+	}
+
+	std::vector<uint8_t> texels(count);
+	for (size_t k = 0; k < count; ++k)
+		texels[k] = static_cast<uint8_t>(std::lround(std::clamp(mask[k], 0.0f, 1.0f) * 255.0f));
+
+	ReleaseColdMap();
+	D3D11_TEXTURE2D_DESC desc{};
+	desc.Width = coldMapW;
+	desc.Height = coldMapH;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_R8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_IMMUTABLE;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA init{ texels.data(), coldMapW, 0 };
+	auto device = globals::d3d::device;
+	if (!device || FAILED(device->CreateTexture2D(&desc, &init, coldMaskTexture.put())) ||
+		FAILED(device->CreateShaderResourceView(coldMaskTexture.get(), nullptr, coldMaskSRV.put()))) {
+		logger::warn("[{}] Could not create the {}x{} cold-region map; accumulation stays global", GetName(), coldMapW, coldMapH);
+		ReleaseColdMap();
+		status.coldMapNote = "could not create the map texture: snow everywhere (old behaviour)";
+		coldShare.clear();
+		return;
+	}
+	Util::SetResourceName(coldMaskTexture.get(), "DynamicSnow::ColdRegionMask");
+
+	coldMaskCPU = std::move(mask);
+	status.coldMapValid = true;
+	status.coldMapColdRegions = coldRegions;
+	status.coldMapColdPercent = 100.0f * static_cast<float>(coldTexels) / static_cast<float>(count);
+	const float maskMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	status.coldMapBuildMs = (coldMapLogPending ? coldShareBuildMs : 0.0f) + maskMs;
+	if (coldMapLogPending) {
+		logger::info("[{}] Cold map for {}: {} weather regions, {} cold at threshold {:.2f}, {:.1f}% of the {}x{} map cold ({:.0f} units per texel), no-region share {:.2f}, built in {:.1f} ms",
+			GetName(), status.coldMapNote, status.coldMapRegions, coldRegions, threshold, status.coldMapColdPercent, coldMapW, coldMapH, coldMapTexel, coldClimateShare, status.coldMapBuildMs);
+		coldMapLogPending = false;
+	} else {
+		logger::debug("[{}] Cold map rebuilt at threshold {:.2f}: {} cold regions, {:.1f}% cold, {:.2f} ms", GetName(), threshold, coldRegions, status.coldMapColdPercent, maskMs);
+	}
+}
+
+float DynamicSnow::SampleColdMaskCPU(float a_x, float a_y) const
+{
+	if (coldMaskCPU.empty() || coldMapW == 0 || coldMapH == 0)
+		return 1.0f;
+	const float tx = (a_x - coldMapOriginX) / coldMapTexel - 0.5f;
+	const float ty = (a_y - coldMapOriginY) / coldMapTexel - 0.5f;
+	const float fx = std::floor(tx);
+	const float fy = std::floor(ty);
+	const int w = static_cast<int>(coldMapW);
+	const int h = static_cast<int>(coldMapH);
+	auto at = [&](int x, int y) {
+		return coldMaskCPU[static_cast<size_t>(std::clamp(y, 0, h - 1)) * coldMapW + static_cast<size_t>(std::clamp(x, 0, w - 1))];
+	};
+	const int x0 = static_cast<int>(fx);
+	const int y0 = static_cast<int>(fy);
+	const float ax = tx - fx;
+	const float ay = ty - fy;
+	const float top = std::lerp(at(x0, y0), at(x0 + 1, y0), ax);
+	const float bottom = std::lerp(at(x0, y0 + 1), at(x0 + 1, y0 + 1), ax);
+	return std::lerp(top, bottom, ay);
+}
+
+void DynamicSnow::UpdateColdMap()
+{
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	auto* worldSpace = player ? player->GetWorldspace() : nullptr;
+	if (!worldSpace)
+		return;
+	if (worldSpace != coldMapWorldSpace || !coldMapTried) {
+		coldMapWorldSpace = worldSpace;
+		coldMapTried = true;
+		try {
+			BuildColdShareGrid(worldSpace);
+		} catch (const std::exception& e) {
+			logger::warn("[{}] Cold map build failed ({}); accumulation stays global", GetName(), e.what());
+			ReleaseColdMap();
+			coldShare.clear();
+			status.coldMapNote = "build failed: snow everywhere (old behaviour)";
+		}
+	}
+	if (!coldShare.empty() && coldMapThreshold != settings.ColdRegionSnowShare) {
+		try {
+			BuildColdMask();
+		} catch (const std::exception& e) {
+			logger::warn("[{}] Cold mask build failed ({}); accumulation stays global", GetName(), e.what());
+			ReleaseColdMap();
+			coldShare.clear();
+			status.coldMapNote = "build failed: snow everywhere (old behaviour)";
+		}
+	}
+	if (status.coldMapValid) {
+		const auto pos = player->GetPosition();
+		status.playerMask = SampleColdMaskCPU(pos.x, pos.y);
+	}
+}
+
+DynamicSnow::MapCbData DynamicSnow::GetMapBufferData()
+{
+	UpdateFrameState();
+
+	MapCbData data{};
+	data.MaskOrigin = { coldMapOriginX, coldMapOriginY };
+	data.MaskInvTexelSize = 1.0f / std::max(coldMapTexel, 1.0f);
+	data.MaskSizeX = std::max(coldMapW, 1u);
+	data.MaskSizeY = std::max(coldMapH, 1u);
+	data.LoadedCenter = { loadedCenter[0], loadedCenter[1] };
+	data.FadeStart = loadedFadeStart;
+	data.FadeEnd = std::max(loadedFadeEnd, loadedFadeStart + 1.0f);
+	return data;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Per-frame state
 // ---------------------------------------------------------------------------------------------
 
@@ -265,6 +649,13 @@ void DynamicSnow::UpdateFrameState()
 
 	if (AccumulationActive())
 		UpdateAccumulation();
+
+	// (44h) Cold-region map (built per worldspace) and the loaded area around the player.
+	if (loaded && status.exterior && (AccumulationActive() || settings.ShowColdMap)) {
+		UpdateLoadedArea();
+		if (settings.ColdRegionsOnly)
+			UpdateColdMap();
+	}
 
 	trailsWanted = TrailsActive() && status.exterior;
 	if (!trailsWanted) {
@@ -315,8 +706,21 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 			data.Flags |= FlagTrees;
 		if (settings.SnowOnGrass)
 			data.Flags |= FlagGrass;
-		if (settings.SnowOnLodTrees)
+		// (44h) Distant trees only with "No Snow on Distant LOD" off (the old LOD-tree tint).
+		if (!settings.NoLodSnow)
 			data.Flags |= FlagLodTrees;
+	}
+
+	// (44h) Cold-region mask and the near/LOD split. Only alongside something that reads them, so a
+	// frame with nothing to draw still has Flags == 0 (Lighting.hlsl skips its whole snow block).
+	const bool showColdMap = settings.ShowColdMap && loaded && status.exterior;
+	if ((data.Flags & FlagAccumulation) || showColdMap) {
+		if (settings.ColdRegionsOnly && status.coldMapValid && coldMaskSRV)
+			data.Flags |= FlagColdMap;
+		if (settings.NoLodSnow)
+			data.Flags |= FlagNoLodSnow;
+		if (showColdMap)
+			data.Flags |= FlagShowColdMap;
 	}
 
 	// Prints are drawn only once the map holds this window's content (cleared at least once
@@ -356,7 +760,7 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 	data.SlopeFull = 0.55f;
 	data.TreeCoverage = std::clamp(settings.TreeCoverage, 0.0f, 1.0f);
 	data.GrassCoverage = std::clamp(settings.GrassCoverage, 0.0f, 1.0f);
-	data.LodTreeCoverage = std::clamp(settings.LodTreeCoverage, 0.0f, 1.0f);
+	data.LodTreeCoverage = 0.5f;  // (44h) the old slider's default, pinned
 	data.TrailRim = std::clamp(settings.TrailRim, 0.0f, 1.0f);
 	// (40e)
 	data.SnowSmoothing = 0.2f;
@@ -1360,6 +1764,10 @@ void DynamicSnow::Prepass()
 
 	ID3D11ShaderResourceView* srv = (trailsWanted && trailSRV) ? trailSRV.get() : nullptr;
 	context->PSSetShaderResources(kTrailSlot, 1, &srv);
+
+	// (44h) Cold-region mask, read under FlagColdMap only.
+	ID3D11ShaderResourceView* maskSrv = (settings.ColdRegionsOnly && status.coldMapValid) ? coldMaskSRV.get() : nullptr;
+	context->PSSetShaderResources(kColdMaskSlot, 1, &maskSrv);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1388,12 +1796,28 @@ void DynamicSnow::DrawSettings()
 				"- Snow weather, or any rain/snow in a cold region: also treats rain in a cold region as snow,\n"
 				"  for weather mods that rain in the north.");
 
-		ImGui::BeginDisabled(settings.Condition == static_cast<int>(SnowCondition::SnowWeather));
+		ImGui::Checkbox("Snow Only in Cold Regions", &settings.ColdRegionsOnly);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Skyrim has one weather for the whole map, so when it snows up north the snow used to build up\n"
+				"everywhere you can see, Whiterun's plains included.\n"
+				"On (default): snow only builds up in cold regions (see Cold Region Threshold), with a soft edge.\n"
+				"Off: the same amount everywhere (the old behaviour).");
+		ImGui::Checkbox("No Snow on Distant LOD", &settings.NoLodSnow);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"On (default): far-away terrain, buildings and trees (LOD) get no built-up snow; their own textures\n"
+				"already show snow where there should be some. Nearby snow thins out over the last cell before\n"
+				"the far-away terrain begins, so there is no line.\n"
+				"Off: far-away terrain and buildings take the snow too, and distant trees get a white tint (the old behaviour).");
+
+		ImGui::BeginDisabled(settings.Condition == static_cast<int>(SnowCondition::SnowWeather) && !settings.ColdRegionsOnly);
 		ImGui::SliderFloat("Cold Region Threshold", &settings.ColdRegionSnowShare, 0.05f, 0.9f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"A region counts as cold when at least this share of the weathers it can have are snow weathers\n"
-				"(read from the region's weather list, or the worldspace's climate where there is none).");
+				"(read from the region's weather list, or the worldspace's climate where there is none).\n"
+				"Used by Snow Only in Cold Regions and by the cold-region choices of When It Builds Up.");
 		ImGui::EndDisabled();
 
 		ImGui::SliderFloat("Accumulation Speed", &settings.AccumulationHours, 0.1f, 12.0f, "%.1f game hours to full", ImGuiSliderFlags_Logarithmic);
@@ -1435,14 +1859,7 @@ void DynamicSnow::DrawSettings()
 		ImGui::BeginDisabled(!settings.SnowOnGrass);
 		ImGui::SliderFloat("Grass Snow Amount", &settings.GrassCoverage, 0.0f, 1.0f, "%.2f");
 		ImGui::EndDisabled();
-		ImGui::Checkbox("Snow on Distant Trees", &settings.SnowOnLodTrees);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Far-away (LOD) trees get a matching white tint, whiter towards the top,\n"
-				"so near and far forests look alike.");
-		ImGui::BeginDisabled(!settings.SnowOnLodTrees);
-		ImGui::SliderFloat("Distant Tree Snow Amount", &settings.LodTreeCoverage, 0.0f, 1.0f, "%.2f");
-		ImGui::EndDisabled();
+		// (44h) "Snow on Distant Trees" and "Distant Tree Snow Amount" removed: see No Snow on Distant LOD.
 		ImGui::Checkbox("Snow on Characters", &settings.SnowOnCharacters);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
@@ -1467,6 +1884,18 @@ void DynamicSnow::DrawSettings()
 		ImGui::Text("Accumulated: %.0f%%   Snowfall: %.0f%%", status.amount * 100.0f, status.snowfall * 100.0f);
 		if (settings.Condition != static_cast<int>(SnowCondition::SnowWeather))
 			ImGui::Text("Region: %s (%s)", status.region.empty() ? "-" : status.region.c_str(), status.coldRegion ? "cold" : "not cold");
+		if (AccumulationActive() && status.exterior) {
+			if (!settings.ColdRegionsOnly)
+				ImGui::TextDisabled("Cold map: off (same amount everywhere)");
+			else if (status.coldMapValid)
+				ImGui::Text("Cold map: %u regions (%u cold), %.0f%% of the map cold, here %.0f%%",
+					status.coldMapRegions, status.coldMapColdRegions, status.coldMapColdPercent, status.playerMask * 100.0f);
+			else
+				ImGui::Text("Cold map: %s", status.coldMapNote.empty() ? "not built yet" : status.coldMapNote.c_str());
+			if (settings.NoLodSnow)
+				ImGui::TextDisabled("Near snow: %u x %u loaded cells, thins out %.0f..%.0f units from their centre",
+					status.gridsToLoad, status.gridsToLoad, status.fadeStart, status.fadeEnd);
+		}
 		ImGui::TreePop();
 	}
 
@@ -1559,6 +1988,13 @@ void DynamicSnow::DrawSettings()
 		ImGui::BeginDisabled(!settings.OverrideAmount);
 		ImGui::SliderFloat("Amount", &settings.AmountOverride, 0.0f, 1.0f, "%.2f");
 		ImGui::EndDisabled();
+		ImGui::Checkbox("Show Cold-Region Map", &settings.ShowColdMap);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Test only: tints the world blue where snow can build up fully and red where it cannot\n"
+				"(warm regions, distant LOD, the edge of the loaded area). Outdoors only.");
+		if (status.coldMapValid)
+			ImGui::TextDisabled("Map: %u x %u texels, %s, built in %.1f ms", status.coldMapWidth, status.coldMapHeight, status.coldMapNote.c_str(), status.coldMapBuildMs);
 		ImGui::TreePop();
 	}
 }

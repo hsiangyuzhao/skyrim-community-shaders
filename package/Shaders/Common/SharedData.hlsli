@@ -619,6 +619,21 @@ namespace SharedData
 		float3 pad0;
 	};
 
+	// (44h) Mirrors DynamicSnow::MapCbData, appended at the very end of FeatureData (offset 1856).
+	// The cold-region mask (DynamicSnow::FlagColdMap, texture t102) and the fade of near snow
+	// towards the edge of the loaded cells (DynamicSnow::FlagNoLodSnow).
+	struct DynamicSnowMapData
+	{
+		float2 MaskOrigin;        // world XY of the mask's corner (absolute game units)
+		float MaskInvTexelSize;   // mask texels per game unit
+		float pad0;
+		uint2 MaskSize;           // mask texels (width, height)
+		float2 LoadedCenter;      // world XY of the centre of the loaded cells
+		float FadeStart;          // Chebyshev XY distance from LoadedCenter where near snow starts to thin out
+		float FadeEnd;            // ... and where it is gone (just inside the loaded area's edge)
+		float2 pad1;
+	};
+
 	namespace PhysSkyCloudFlags
 	{
 		static const uint MultiLight = (1 << 0);        // clouds: sun + both moons + sky (0 = the 42a single-light code)
@@ -670,6 +685,7 @@ namespace SharedData
 		PhysSkyMoonData physSkyMoonData;
 		PhysSkyNightData physSkyNightData;
 		PhysSkyCloudData physSkyCloudData;
+		DynamicSnowMapData dynamicSnowMapData;
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);

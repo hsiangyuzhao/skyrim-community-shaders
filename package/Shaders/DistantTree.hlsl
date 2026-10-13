@@ -252,8 +252,14 @@ PS_OUTPUT main(PS_INPUT input)
 #		if defined(DYNAMIC_SNOW)
 	// (batch 39c) Snow on distant trees, matching the near trees' average cover (DynamicSnow::
 	// GetLodTreeCoverage). Only the colour changes; the alpha test above used the original alpha.
+	// (44h) FlagLodTrees is only set with "No Snow on Distant LOD" off; the cold-region mask still applies.
 	[branch] if (SharedData::dynamicSnowSettings.Flags & DynamicSnow::FlagLodTrees)
-		baseColor.xyz = lerp(baseColor.xyz, Color::ColorToLinear(SharedData::dynamicSnowSettings.SnowColor), DynamicSnow::GetLodTreeCoverage(input.SnowHeight, input.TexCoord.xy));
+	{
+		float lodTreeSnowAmount = SharedData::dynamicSnowSettings.Amount;
+		[branch] if (SharedData::dynamicSnowSettings.Flags & DynamicSnow::FlagColdMap)
+			lodTreeSnowAmount *= DynamicSnow::ColdMask(input.WorldPosition.xy + FrameBuffer::CameraPosAdjust[eyeIndex].xy);
+		baseColor.xyz = lerp(baseColor.xyz, Color::ColorToLinear(SharedData::dynamicSnowSettings.SnowColor), DynamicSnow::GetLodTreeCoverage(input.SnowHeight, input.TexCoord.xy, lodTreeSnowAmount));
+	}
 #		endif
 
 #		if defined(DEFERRED)
