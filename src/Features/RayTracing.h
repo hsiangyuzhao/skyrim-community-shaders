@@ -161,4 +161,6 @@ private:
 	float lastCpuMs = 0.0f;
 	TraceSample traceSample{};
 	std::uint32_t staleFrames = 0;  // frames combined with the previous trace (ring busy)
+	bool overVramBudget = false;
+	Status loggedStatus = Status::Off;
 };

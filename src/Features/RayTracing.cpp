@@ -35,6 +35,7 @@ namespace
 	constexpr std::uint32_t kBuildBudget = 131072;  // triangles of BLAS builds per frame (about one chunk)
 	constexpr float kHandOffBand = 2048.0f;       // half a cell: RT fades back to the cascades here
 	constexpr float kMaxRayLength = 16384.0f;
+	constexpr std::uint64_t kAccelerationBudgetBytes = 1200ull << 20;  // BLAS + scratch; spec target is 1.5 GB in total
 	constexpr std::uint32_t kFlagSkipShadowed = 1u, kFlagCoverage = 2u;  // TraceShadowsCS
 	constexpr std::uint32_t kFlagHandOffSSS = 1u, kFlagDebug = 2u;       // Common.hlsli
 
@@ -312,6 +313,14 @@ void RayTracing::Prepass()
 
 	lastCpuMs = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
 	const auto& stats = backend.GetStats();
+	if (status != loggedStatus) {
+		static constexpr const char* kNames[] = { "off", "unavailable", "failed", "paused", "loading the scene", "active" };
+		const auto& sc = scene.GetStats();
+		logger::info("[RayTracing] {}{}{} (cells {}, {:.2f} M triangles, {} BLAS, {:.0f} MB)", kNames[static_cast<int>(status)],
+			statusReason.empty() ? "" : ": ", statusReason, sc.cellsComplete, static_cast<double>(sc.triangles) / 1e6, stats.blasCount,
+			static_cast<double>(stats.blasBytes + stats.scratchBytes + stats.tlasBytes) / (1024.0 * 1024.0));
+		loggedStatus = status;
+	}
 	traceSample.cpuMs = lastCpuMs;
 	traceSample.gpuMs = activeThisFrame ? stats.lastGpuMs : -1.0f;
 	traceSample.builds = activeThisFrame ? stats.buildsLastFrame : 0;
@@ -353,7 +362,12 @@ void RayTracing::RunFrame()
 		return;
 	}
 
-	scene.Update(backend, kCaptureBudgetMs, globals::state->frameCount);
+	// VRAM guard: past the budget no new cells are captured (they keep their shadow-map shadows).
+	{
+		const auto& stats = backend.GetStats();
+		overVramBudget = stats.blasBytes + stats.scratchBytes > kAccelerationBudgetBytes;
+	}
+	scene.Update(backend, overVramBudget ? 0.0f : kCaptureBudgetMs, globals::state->frameCount);
 
 	const auto& fb = globals::game::frameBufferCached;
 	const float4 camera = fb.GetCameraPosAdjust(0);
@@ -661,6 +675,8 @@ void RayTracing::DrawSettings()
 		ImGui::Text("VRAM: %s total (BLAS %s, scratch %s, TLAS %s, uploads %s, textures %s)", Megabytes(vram).c_str(),
 			Megabytes(rt.blasBytes).c_str(), Megabytes(rt.scratchBytes).c_str(), Megabytes(rt.tlasBytes).c_str(),
 			Megabytes(rt.uploadBytes).c_str(), Megabytes(rt.sharedTextureBytes + d3d11Bytes).c_str());
+		if (overVramBudget)
+			ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "  Over the 1.2 GB scene budget: no further cells are captured.");
 		if (rt.compactedSavedBytes)
 			ImGui::Text("  Compaction saved %s so far", Megabytes(rt.compactedSavedBytes).c_str());
 		const float frameMs = Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracing);

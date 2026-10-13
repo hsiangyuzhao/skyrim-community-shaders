@@ -68,6 +68,17 @@ namespace RayTracingScene
 			}
 		}
 
+		/// Copies engine-owned mesh memory; false instead of a crash if a mod left a bad pointer.
+		bool SafeCopy(void* a_destination, const void* a_source, std::size_t a_bytes)
+		{
+			__try {
+				std::memcpy(a_destination, a_source, a_bytes);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
 		bool IsEditorMarker(RE::NiAVObject* a_root)
 		{
 			const auto* bsx = a_root->GetExtraData<RE::BSXFlags>("BSX");
@@ -169,15 +180,36 @@ namespace RayTracingScene
 		}
 		const std::uint32_t positionBytes = next - positionOffset;
 		const bool fullPrecision = positionBytes >= 12;
+		if (positionOffset + (fullPrecision ? 12u : 6u) > stride) {
+			++skipped.badData;
+			return false;
+		}
 		if (!fullPrecision && positionBytes < 6) {
 			++skipped.badData;
 			return false;
 		}
 
+		// The engine's CPU copy of the vertices, copied out first (bad pointers from mods are skipped).
+		static thread_local std::vector<std::uint8_t> vertexBytes;
+		static thread_local std::vector<std::uint16_t> indexCopy;
+		vertexBytes.resize(static_cast<std::size_t>(vertexCount) * stride);
+		if (!SafeCopy(vertexBytes.data(), rendererData->rawVertexData, vertexBytes.size())) {
+			++skipped.badData;
+			return false;
+		}
+
 		// Indices: the mesh's own, or the 16x16 quad grid every landscape quadrant uses.
-		const std::uint16_t* sourceIndices = rendererData->rawIndexData;
+		const std::uint16_t* sourceIndices = nullptr;
+		if (rendererData->rawIndexData && triangleCount > 0) {
+			indexCopy.resize(static_cast<std::size_t>(triangleCount) * 3);
+			if (!SafeCopy(indexCopy.data(), rendererData->rawIndexData, indexCopy.size() * sizeof(std::uint16_t))) {
+				++skipped.badData;
+				return false;
+			}
+			sourceIndices = indexCopy.data();
+		}
 		std::vector<std::uint32_t> generated;
-		if (!sourceIndices || triangleCount == 0) {
+		if (!sourceIndices) {
 			if (a_landscape && vertexCount == 289) {
 				generated.reserve(16 * 16 * 6);
 				for (std::uint32_t y = 0; y < 16; ++y) {
@@ -213,7 +245,7 @@ namespace RayTracingScene
 		const RE::NiTransform& world = a_shape->world;
 		chunk.positions.reserve(chunk.positions.size() + vertexCount * 3);
 		for (std::uint32_t i = 0; i < vertexCount; ++i) {
-			const std::uint8_t* vertex = rendererData->rawVertexData + static_cast<std::size_t>(i) * stride + positionOffset;
+			const std::uint8_t* vertex = vertexBytes.data() + static_cast<std::size_t>(i) * stride + positionOffset;
 			RE::NiPoint3 local;
 			if (fullPrecision) {
 				float p[3];
