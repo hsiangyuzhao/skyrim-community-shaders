@@ -23,7 +23,8 @@ cbuffer SnowTrailCB : register(b0)
 	uint DecayStep;  // DECAY: code units (of 32767) to remove
 	uint StampCount; // STAMP: number of valid stamps
 	uint ShapeCount; // STAMP: slices in StampShapes (0 = none loaded)
-	uint2 pad0;
+	uint NowTick;    // (44e) TIMESTAMP / SWEEP: the current trail clock tick (wraps at 1024)
+	uint pad0;
 };
 
 // Mirrors DynamicSnow::Stamp.
@@ -79,7 +80,27 @@ RWTexture2D<uint> TrailMap : register(u0);
 	TrailMap[id.xy] = code ? ((code << 16) | (v & 0xFFFF)) : 0;
 }
 
+#elif defined(SWEEP)
+
+#	include "DynamicSnow/TrailTime.hlsli"
+
+// (44e) Clears texels whose print has fully refilled, a band of rows per frame, so a stored stamp
+// time can never wrap around and come back to life. RectMin.y / RectSize.y: physical rows.
+[numthreads(64, 1, 1)] void main(uint3 id
+								 : SV_DispatchThreadID) {
+	if (id.x >= MapSize || id.y >= (uint)RectSize.y)
+		return;
+	uint2 p = uint2(id.x, ((uint)RectMin.y + id.y) & (MapSize - 1));
+	uint v = TrailMap[p];
+	if (v != 0 && TrailTime::Expired(v, NowTick))
+		TrailMap[p] = 0;
+}
+
 #elif defined(STAMP)
+
+#	if defined(TIMESTAMP)
+#		include "DynamicSnow/TrailTime.hlsli"
+#	endif
 
 uint EncodeHeight(float h)
 {
@@ -148,9 +169,27 @@ uint EncodeHeight(float h)
 			height *= st.Strength;
 			if (abs(height) < 1.0 / 32767.0)
 				continue;
+#if defined(TIMESTAMP)
+			// (44e) Code, stamp time and foot height in one texel; the deeper / higher print *as it
+			// is now* (refill applied) wins, so a fresh shallow print beats an old, mostly refilled one.
+			uint v = TrailTime::Pack(height, NowTick, st.Z16 >> 6);
+			uint2 p = uint2(int2(x, y) + Wrap) & (MapSize - 1);
+			uint prev = TrailMap[p];
+			[allow_uav_condition] for (uint attempt = 0; attempt < 8; ++attempt)
+			{
+				if (TrailTime::Rank(v, NowTick) <= TrailTime::Rank(prev, NowTick))
+					break;
+				uint orig;
+				InterlockedCompareExchange(TrailMap[p], prev, v, orig);
+				if (orig == prev)
+					break;
+				prev = orig;
+			}
+#else
 			uint v = (EncodeHeight(height) << 16) | (st.Z16 & 0xFFFF);
 			uint2 p = uint2(int2(x, y) + Wrap) & (MapSize - 1);
 			InterlockedMax(TrailMap[p], v);
+#endif
 		}
 	}
 }

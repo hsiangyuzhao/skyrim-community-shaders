@@ -9,6 +9,7 @@
 
 #include "Common/Random.hlsli"
 #include "Common/SharedData.hlsli"
+#include "DynamicSnow/TrailTime.hlsli"
 
 namespace DynamicSnow
 {
@@ -42,6 +43,9 @@ namespace DynamicSnow
 	// (set with IsActorGeometry when the geometry is not skinned). Kept here rather than in
 	// Permutation.hlsli, where a new constant reshuffles fxc's output for unrelated permutations.
 	static const uint ExtraIsActorRigid = 1 << 14;
+	// (44e) Flags bit: the trail map holds time-stamped texels (TrailTime.hlsli); the current tick is in pad0.
+	static const uint FlagTrailTimeStamps = 1 << 14;
+	uint TrailNowTick() { return uint(SharedData::dynamicSnowSettings.pad0); }
 
 	// (40e) Mirrors CommonBufferData::SnowSmoothing / SteepCover (stored in pad1, see SharedData.hlsli).
 	float SnowSmoothing() { return SharedData::dynamicSnowSettings.pad1.x; }
@@ -241,9 +245,22 @@ namespace DynamicSnow
 	float DecodeTrailTexel(uint v, float z)
 	{
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
-		uint code = v >> 16;
-		float strength = code >= 32768 ? float(code - 32768) * (1.0 / 32767.0) : -float(code) * (s.TrailRim / 32767.0);
-		float footZ = float(v & 0xFFFF) * (kTrailZWrap / 65535.0);
+		float strength;
+		float footZ;
+		[branch] if (s.Flags & FlagTrailTimeStamps)
+		{
+			// (44e) Refill computed here from the stamp's age: no decay pass.
+			bool dent;
+			const float rem = TrailTime::Remaining(v, TrailNowTick(), dent);
+			strength = dent ? rem : -rem * s.TrailRim;
+			footZ = TrailTime::FootZ(v);
+		}
+		else
+		{
+			uint code = v >> 16;
+			strength = code >= 32768 ? float(code - 32768) * (1.0 / 32767.0) : -float(code) * (s.TrailRim / 32767.0);
+			footZ = float(v & 0xFFFF) * (kTrailZWrap / 65535.0);
+		}
 		float dz = (frac((z - footZ) / kTrailZWrap + 0.5) - 0.5) * kTrailZWrap;
 		return strength * (1.0 - smoothstep(s.TrailZTolerance * 0.5, s.TrailZTolerance, abs(dz)));
 	}

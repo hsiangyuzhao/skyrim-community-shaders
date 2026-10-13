@@ -58,7 +58,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	RigidGearWorldUp,
 	OverrideAmount,
 	AmountOverride,
-	FlipPrintShapes)
+	FlipPrintShapes,
+	TrailTimeStamps,
+	TrailPauseWhenNoSnow)
 
 namespace
 {
@@ -261,6 +263,11 @@ void DynamicSnow::UpdateFrameState()
 		return;
 	++frameIndex;
 
+	// (44e) The refill clock: game-running seconds, as the 44d refill pass counted them. Advanced here,
+	// once per frame and before anything reads the tick, so the shaders and the stamps agree on "now".
+	if (globals::game::ui && !globals::game::ui->GameIsPaused())
+		trailClock += RE::GetSecondsSinceLastFrame();
+
 	UpdateFootprintsModState();
 	status.yieldingToMod = settings.YieldToFootprintsMod && footprintsModLoaded;
 
@@ -347,6 +354,10 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 			data.Flags |= FlagMudTrails;
 		if (settings.SmoothTrails)
 			data.Flags |= FlagSmoothTrails;
+		if (trailContentTimeStamped) {
+			data.Flags |= FlagTrailTimeStamps;
+			data.pad0 = static_cast<float>(NowTick());
+		}
 	}
 	// Authored-snow recognition matters to both halves: accumulation leaves authored snow as it
 	// is, and prints there are snow prints, not mud.
@@ -426,11 +437,17 @@ void DynamicSnow::CompileShaders()
 		decayCS = compile("DECAY");
 	if (!stampCS)
 		stampCS = compile("STAMP");
+	// (44e) Time-stamped trail map: stamps with a compare-exchange on the print as it is now, and the sweep.
+	if (!stampTimeCS)
+		stampTimeCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(
+			L"Data\\Shaders\\DynamicSnow\\SnowTrailsCS.hlsl", { { "STAMP", "" }, { "TIMESTAMP", "" } }, "cs_5_0"));
+	if (!sweepCS)
+		sweepCS = compile("SWEEP");
 }
 
 void DynamicSnow::ClearShaderCache()
 {
-	for (auto** cs : { &clearCS, &decayCS, &stampCS }) {
+	for (auto** cs : { &clearCS, &decayCS, &stampCS, &stampTimeCS, &sweepCS }) {
 		if (*cs) {
 			(*cs)->Release();
 			*cs = nullptr;
@@ -1210,7 +1227,33 @@ void DynamicSnow::UpdateTrailMap()
 	if (!player)
 		return;
 
-	GatherStamps(player->GetPosition());
+	// (44e) Encoding and refill clock. A change of either makes the stored texels meaningless: start over.
+	const float refill = std::max(settings.TrailRefillSeconds, 1.0f);
+	const bool timeStamped = settings.TrailTimeStamps && stampTimeCS && sweepCS;
+	if (timeStamped != trailContentTimeStamped || (timeStamped && refill != trailClockRefill))
+		trailContentValid = false;
+	trailContentTimeStamped = timeStamped;
+	trailClockRefill = refill;
+
+	// (44e) Upkeep pauses while no snow is near. The window still scrolls (its strips are cleared), so
+	// nothing stale can show up later; a pause longer than a full refill starts the map over.
+	const bool upkeep = !settings.TrailPauseWhenNoSnow || SnowNearby();
+	if (!upkeep) {
+		if (!trailMaintenancePaused) {
+			trailMaintenancePaused = true;
+			trailPausedAt = trailClock;
+		}
+	} else if (trailMaintenancePaused) {
+		trailMaintenancePaused = false;
+		if (trailClock - trailPausedAt > refill * 1.5)
+			trailContentValid = false;
+	}
+	status.trailUpkeep = !upkeep ? "paused (no snow near)" : timeStamped ? "time-stamped (no refill pass)" : "44d refill pass";
+
+	if (upkeep)
+		GatherStamps(player->GetPosition());
+	else
+		stamps.clear();
 
 	auto timers = Util::GpuPassTimers::GetSingleton();
 	timers->Begin(Util::GpuBucket::SnowTrails);
@@ -1220,6 +1263,7 @@ void DynamicSnow::UpdateTrailMap()
 	cb.Wrap[0] = static_cast<int>(windowOrigin[0] & mask);
 	cb.Wrap[1] = static_cast<int>(windowOrigin[1] & mask);
 	cb.MapSize = trailMapSize;
+	cb.pad[0] = NowTick();  // SnowTrailCB.NowTick
 
 	ID3D11UnorderedAccessView* uav = trailUAV.get();
 	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
@@ -1264,13 +1308,32 @@ void DynamicSnow::UpdateTrailMap()
 	// 2. Refill. Batched: a whole-map pass only once enough strength (about 0.1%) has built
 	//    up, i.e. a few times a second at the default refill time, not every frame. (39c) Depth
 	//    and rim are 15-bit codes now (SnowTrailsCS.hlsl).
-	if (!globals::game::ui->GameIsPaused())
-		decayAccumulator += RE::GetSecondsSinceLastFrame() / std::max(settings.TrailRefillSeconds, 1.0f) * 32767.0f;
-	if (decayAccumulator >= 32.0f) {
-		cb.DecayStep = static_cast<uint>(decayAccumulator);
-		decayAccumulator -= static_cast<float>(cb.DecayStep);
-		dispatch(decayCS, (trailMapSize + 7) / 8, (trailMapSize + 7) / 8);
-		cb.DecayStep = 0;
+	if (timeStamped) {
+		// (44e) No refill pass: the shaders compute it from each texel's age. A narrow band of rows
+		// per frame clears texels that have fully refilled, so the whole map is visited at least every
+		// half refill time and a 10-bit stamp time can never wrap (1024 ticks = 4 refill times).
+		decayAccumulator = 0.0f;
+		if (upkeep) {
+			const float dt = globals::game::ui->GameIsPaused() ? 0.0f : RE::GetSecondsSinceLastFrame();
+			const uint32_t rows = std::clamp(static_cast<uint32_t>(std::ceil(static_cast<float>(trailMapSize) * 2.0f * dt / refill)), 16u, trailMapSize);
+			cb.RectMin[0] = 0;
+			cb.RectMin[1] = static_cast<int>(sweepRow);
+			cb.RectSize[0] = static_cast<int>(trailMapSize);
+			cb.RectSize[1] = static_cast<int>(rows);
+			dispatch(sweepCS, (trailMapSize + 63) / 64, rows);
+			sweepRow = (sweepRow + rows) % trailMapSize;
+		}
+	} else {
+		if (!globals::game::ui->GameIsPaused())
+			decayAccumulator += RE::GetSecondsSinceLastFrame() / refill * 32767.0f;
+		if (upkeep && decayAccumulator >= 32.0f) {
+			cb.DecayStep = static_cast<uint>(std::min(decayAccumulator, 32767.0f));
+			decayAccumulator -= static_cast<float>(cb.DecayStep);
+			if (decayAccumulator > 32767.0f)
+				decayAccumulator = 0.0f;
+			dispatch(decayCS, (trailMapSize + 7) / 8, (trailMapSize + 7) / 8);
+			cb.DecayStep = 0;
+		}
 	}
 
 	// 3. Prints.
@@ -1286,7 +1349,7 @@ void DynamicSnow::UpdateTrailMap()
 			context->CSSetShaderResources(0, 2, srvs);
 			ID3D11SamplerState* sampler = shapeSampler.get();
 			context->CSSetSamplers(0, 1, &sampler);
-			dispatch(stampCS, cb.StampCount, 1);
+			dispatch(timeStamped ? stampTimeCS : stampCS, cb.StampCount, 1);
 			srvs[0] = srvs[1] = nullptr;
 			context->CSSetShaderResources(0, 2, srvs);
 			sampler = nullptr;
@@ -1301,6 +1364,36 @@ void DynamicSnow::UpdateTrailMap()
 	context->CSSetShader(nullptr, nullptr, 0);
 
 	timers->End(Util::GpuBucket::SnowTrails);
+}
+
+uint32_t DynamicSnow::NowTick() const
+{
+	const double tickSeconds = std::max(static_cast<double>(trailClockRefill), 1.0) / static_cast<double>(kTrailTicksPerRefill);
+	return static_cast<uint32_t>(static_cast<uint64_t>(trailClock / tickSeconds) & 1023u);
+}
+
+bool DynamicSnow::SnowNearby()
+{
+	// Cheap signals first; the ground under and around the player is checked twice a second.
+	if (settings.MudTrails || status.snowWeather || (settings.TrailsOnAccumulated && status.accumulationDrawn))
+		return snowNearby = true;
+	if (snowNearbyFrame != 0 && frameIndex - snowNearbyFrame < 30)
+		return snowNearby;
+	snowNearbyFrame = frameIndex;
+	snowNearby = false;
+	auto* tes = RE::TES::GetSingleton();
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	if (!tes || !player)
+		return snowNearby = true;  // cannot tell: keep the upkeep running
+	const auto pos = player->GetPosition();
+	constexpr float r = 1500.0f;
+	const RE::NiPoint3 points[] = { pos, { pos.x + r, pos.y, pos.z }, { pos.x - r, pos.y, pos.z }, { pos.x, pos.y + r, pos.z }, { pos.x, pos.y - r, pos.z } };
+	for (const auto& p : points) {
+		const auto material = tes->GetLandMaterialType(p);
+		if (material == RE::MATERIAL_ID::kSnow || material == RE::MATERIAL_ID::kSnowStairs || material == RE::MATERIAL_ID::kIce)
+			return snowNearby = true;
+	}
+	return snowNearby;
 }
 
 void DynamicSnow::Prepass()
@@ -1548,6 +1641,18 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextUnformatted(
 				"Detail of the footprint map around the player (always 58 m across). Changing it clears existing prints.\n"
 				"4096 gives the sharpest prints; it costs 64 MB of video memory and its refill pass touches 4x more memory.");
+		// (44e)
+		ImGui::Checkbox("Refill Without a Map Pass (44e)", &settings.TrailTimeStamps);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Each spot of the map remembers when it was stepped on, and the refill is worked out when it is drawn,\n"
+				"so the whole-map refill pass (a small regular spike, worst at 4096) is gone. Prints look and refill the same.\n"
+				"Off = the 44d refill pass, for comparison. Switching clears existing prints.");
+		ImGui::Checkbox("Pause When No Snow Is Near (44e)", &settings.TrailPauseWhenNoSnow);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"No print upkeep while the ground around you is not snow, there is no built-up snow and no snowfall\n"
+				"(mud prints keep it running). Turn off if prints go missing somewhere snowy.");
 		ImGui::EndDisabled();
 
 		ImGui::Spacing();
@@ -1571,6 +1676,8 @@ void DynamicSnow::DrawSettings()
 																			"starting");
 		if (status.trailsDrawn)
 			ImGui::Text("Actors tracked: %u   Prints this frame: %u (trenches %u)   Map: %u x %u", status.actorsTracked, status.stamps, status.bodyStamps, status.trailMapSize, status.trailMapSize);
+		if (status.exterior && TrailsActive())
+			ImGui::Text("Map upkeep: %s", status.trailUpkeep);
 		ImGui::TreePop();
 	}
 

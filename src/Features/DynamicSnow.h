@@ -134,6 +134,14 @@ public:
 		bool BodyAndObjectTrails = true;
 		float TrailRim = 0.35f;  ///< pushed-up rim around a print, relative to its depth
 
+		// ---- (44e) ----
+		/// Each texel remembers when it was printed and the refill is worked out when it is drawn: no
+		/// whole-map refill pass (the periodic spike at 4096). Off = the 44d refill pass, for A/B.
+		bool TrailTimeStamps = true;
+		/// Skip print upkeep (stamps, sweep) while no snow is near: no snowy ground around the player,
+		/// no built-up snow, no snowfall, mud prints off.
+		bool TrailPauseWhenNoSnow = true;
+
 		// ---- (40e) ----
 		/// Even Cover: how far snow flattens the material's relief (normal map, parallax self-shadow,
 		/// and how much less the texture's grooves hold). 0 = the relief shows fully, 1 = 39c (flat).
@@ -212,6 +220,8 @@ public:
 		FlagLodTrees = 1 << 12,
 		// (40e)
 		FlagActorRigidWorldUp = 1 << 13,
+		// (44e)
+		FlagTrailTimeStamps = 1 << 14,
 	};
 
 	[[nodiscard]] CommonBufferData GetCommonBufferData();
@@ -249,6 +259,7 @@ public:
 		uint32_t stamps = 0;             ///< prints stamped last frame
 		uint32_t actorsTracked = 0;      ///< actors whose feet were checked last frame
 		uint32_t trailMapSize = 0;
+		const char* trailUpkeep = "-";  ///< (44e) how the trail map is kept this frame
 		std::string region;  ///< name / EditorID of the region that decided "cold"
 		// (batch 39c)
 		uint32_t shapesLoaded = 0;       ///< print shapes found in the installed footprint mods
@@ -400,4 +411,18 @@ private:
 	ID3D11ComputeShader* clearCS = nullptr;
 	ID3D11ComputeShader* decayCS = nullptr;
 	ID3D11ComputeShader* stampCS = nullptr;
+	// (44e) Time-stamped trail map.
+	ID3D11ComputeShader* stampTimeCS = nullptr;
+	ID3D11ComputeShader* sweepCS = nullptr;
+	static constexpr uint32_t kTrailTicksPerRefill = 256;  ///< mirrors TrailTime::kTicksPerRefill
+	double trailClock = 0.0;              ///< game-running seconds (the refill clock)
+	float trailClockRefill = 0.0f;        ///< TrailRefillSeconds the ticks were defined with
+	bool trailContentTimeStamped = false; ///< the map content uses the time-stamped encoding
+	uint32_t sweepRow = 0;
+	bool trailMaintenancePaused = false;
+	double trailPausedAt = 0.0;
+	bool snowNearby = true;
+	uint64_t snowNearbyFrame = 0;
+	uint32_t NowTick() const;
+	bool SnowNearby();
 };
