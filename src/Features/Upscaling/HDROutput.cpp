@@ -86,7 +86,6 @@ namespace HDROutput
 		bool g_lastWanted = false;
 		HRESULT g_lastColorSpaceResult = S_OK;
 		std::string g_colorSpaceWhere = "not set";
-		uint g_colorSpaceChainLatched = 0;
 
 		// resources
 		std::unique_ptr<Texture2D> g_scene;
@@ -145,22 +144,6 @@ namespace HDROutput
 		std::string g_lastChainEndNote;     // the last "ended on another target" situation, for the status page
 		constexpr uint32_t kMaxChainLogLines = 40;
 
-		bool g_copyHooksInstalled = false;
-		std::array<ID3D11Resource*, 12> g_watchedCopyResources{};
-		struct CopyMismatch
-		{
-			int dst;
-			int src;
-			uint32_t dstFormat;
-			uint32_t srcFormat;
-			uint64_t count;
-			uint64_t lastFrame;
-		};
-		std::vector<CopyMismatch> g_copyMismatches;
-		uint64_t g_copyMismatchTotal = 0;
-		uint32_t g_copyLogLines = 0;
-		constexpr uint32_t kMaxCopyLogLines = 60;
-
 		DX12SwapChain& SwapChain()
 		{
 			return Upscaling::dx12SwapChain;
@@ -170,16 +153,6 @@ namespace HDROutput
 		{
 			auto* ui = globals::game::ui;
 			return ui && (ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
-		}
-
-		/// A menu that takes over the screen (pauses, or is an item / application / modal menu, or the map).
-		bool IsMenuScene()
-		{
-			auto* ui = globals::game::ui;
-			if (!ui)
-				return false;
-			return ui->GameIsPaused() || ui->IsApplicationMenuOpen() || ui->IsItemMenuOpen() || ui->IsModalMenuOpen() ||
-			       ui->IsMenuOpen(RE::MapMenu::MENU_NAME) || ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME);
 		}
 
 		float ResolvePeakNits()
@@ -326,10 +299,6 @@ namespace HDROutput
 		{
 			if (!g_outputActive || IsMainOrLoadingMenu())
 				return false;
-			// (43b) Menus: shown whole as SDR by default (no layer split, nothing for a menu's own
-			// background effects to lose); "Separate UI layer" keeps them like gameplay.
-			if (GetSettings().menuMode == 0 && IsMenuScene())
-				return false;
 			return true;
 		}
 
@@ -375,30 +344,13 @@ namespace HDROutput
 			IDXGISwapChain4* proxy = sc.swapChain;
 			IDXGISwapChain4* native = sc.GetNativeSwapChain();
 			const bool distinct = native && native != proxy;
-			HRESULT result = E_FAIL;
-			std::string where;
-			switch (g_colorSpaceChainLatched) {
-			case 1:
-				result = SetColorSpaceOn(native, distinct ? "native (below Streamline)" : "D3D12", a_hdr10);
-				where = distinct ? "native chain" : "swap chain";
-				break;
-			case 2:
-				{
-					const HRESULT a = SetColorSpaceOn(proxy, distinct ? "Streamline proxy" : "D3D12", a_hdr10);
-					const HRESULT b = distinct ? SetColorSpaceOn(native, "native (below Streamline)", a_hdr10) : a;
-					result = SUCCEEDED(a) || SUCCEEDED(b) ? S_OK : a;
-					where = distinct ? std::format("both (proxy 0x{:08X}, native 0x{:08X})", static_cast<uint32_t>(a), static_cast<uint32_t>(b)) : "swap chain";
-					break;
-				}
-			default:
-				result = SetColorSpaceOn(proxy, distinct ? "Streamline proxy" : "D3D12", a_hdr10);
-				where = distinct ? "Streamline proxy chain" : "swap chain";
-				if (FAILED(result) && distinct) {
-					logger::warn("[HDR] The Streamline proxy refused the colour space; trying the native chain");
-					result = SetColorSpaceOn(native, "native (below Streamline)", a_hdr10);
-					where = "native chain (proxy refused)";
-				}
-				break;
+			// (44g) Always the Streamline proxy, the native chain only if the proxy refuses.
+			HRESULT result = SetColorSpaceOn(proxy, distinct ? "Streamline proxy" : "D3D12", a_hdr10);
+			std::string where = distinct ? "Streamline proxy chain" : "swap chain";
+			if (FAILED(result) && distinct) {
+				logger::warn("[HDR] The Streamline proxy refused the colour space; trying the native chain");
+				result = SetColorSpaceOn(native, "native (below Streamline)", a_hdr10);
+				where = "native chain (proxy refused)";
 			}
 			g_lastColorSpaceResult = result;
 			g_colorSpaceWhere = std::format("{} -> {}", a_hdr10 ? "HDR10" : "sRGB", where);
@@ -619,131 +571,6 @@ namespace HDROutput
 			}
 			return name ? std::format("render target {} ({})", a_id, name) : std::format("render target {}", a_id);
 		}
-
-		/// The copy-compatibility group of a format (D3D11 copies need the same group). Formats not
-		/// listed are their own group.
-		uint32_t FormatGroup(DXGI_FORMAT a_format)
-		{
-			const auto f = static_cast<uint32_t>(a_format);
-			if (f >= 1 && f <= 4)
-				return 1;  // R32G32B32A32
-			if (f >= 9 && f <= 14)
-				return 9;  // R16G16B16A16
-			if (f >= 23 && f <= 25)
-				return 23;  // R10G10B10A2
-			if (f >= 27 && f <= 32)
-				return 27;  // R8G8B8A8
-			if (f >= 33 && f <= 38)
-				return 33;  // R16G16
-			if (f >= 39 && f <= 43)
-				return 39;  // R32
-			if (f >= 48 && f <= 52)
-				return 48;  // R8G8
-			if (f >= 53 && f <= 59)
-				return 53;  // R16
-			if (f >= 60 && f <= 64)
-				return 60;  // R8
-			if (f == 87 || f == 90 || f == 91)
-				return 90;  // B8G8R8A8
-			if (f == 88 || f == 92 || f == 93)
-				return 92;  // B8G8R8X8
-			return f;
-		}
-
-		void CheckCopy(ID3D11Resource* a_dst, ID3D11Resource* a_src, const char* a_api)
-		{
-			if (!a_dst || !a_src)
-				return;
-			bool watched = false;
-			for (auto* resource : g_watchedCopyResources) {
-				if (resource && (resource == a_dst || resource == a_src)) {
-					watched = true;
-					break;
-				}
-			}
-			if (!watched)
-				return;
-			D3D11_RESOURCE_DIMENSION dstType{}, srcType{};
-			a_dst->GetType(&dstType);
-			a_src->GetType(&srcType);
-			if (dstType != D3D11_RESOURCE_DIMENSION_TEXTURE2D || srcType != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-				return;
-			D3D11_TEXTURE2D_DESC dstDesc{}, srcDesc{};
-			static_cast<ID3D11Texture2D*>(a_dst)->GetDesc(&dstDesc);
-			static_cast<ID3D11Texture2D*>(a_src)->GetDesc(&srcDesc);
-			if (FormatGroup(dstDesc.Format) == FormatGroup(srcDesc.Format))
-				return;
-
-			++g_copyMismatchTotal;
-			const int dstId = IdentifyTexture(a_dst);
-			const int srcId = IdentifyTexture(a_src);
-			auto it = std::ranges::find_if(g_copyMismatches, [&](const CopyMismatch& m) { return m.dst == dstId && m.src == srcId; });
-			if (it == g_copyMismatches.end()) {
-				g_copyMismatches.push_back({ dstId, srcId, static_cast<uint32_t>(dstDesc.Format), static_cast<uint32_t>(srcDesc.Format), 0, 0 });
-				it = std::prev(g_copyMismatches.end());
-			}
-			// One line per occurrence: the first time, and again after two seconds or more without it.
-			const bool newOccurrence = it->count == 0 || g_frameCounter > it->lastFrame + 240;
-			++it->count;
-			it->lastFrame = g_frameCounter;
-			if (newOccurrence && g_copyLogLines < kMaxCopyLogLines) {
-				++g_copyLogLines;
-				logger::warn("[HDR] Mismatched {}: {} (format {}) -> {} (format {}); D3D11 drops this copy, the destination keeps old or black content (frame {}, {} so far)",
-					a_api, TargetName(srcId), static_cast<uint32_t>(srcDesc.Format), TargetName(dstId), static_cast<uint32_t>(dstDesc.Format), g_frameCounter, it->count);
-				if (g_copyLogLines == kMaxCopyLogLines)
-					logger::warn("[HDR] Further mismatched copies are only counted (HDR Output status page, F12 JSON)");
-			}
-		}
-
-		struct ID3D11DeviceContext_CopySubresourceRegion
-		{
-			static void WINAPI thunk(ID3D11DeviceContext* This, ID3D11Resource* a_dst, UINT a_dstSubresource, UINT a_dstX, UINT a_dstY, UINT a_dstZ,
-				ID3D11Resource* a_src, UINT a_srcSubresource, const D3D11_BOX* a_srcBox)
-			{
-				if (This == globals::d3d::context && g_settings.copyCheck)
-					CheckCopy(a_dst, a_src, "CopySubresourceRegion");
-				func(This, a_dst, a_dstSubresource, a_dstX, a_dstY, a_dstZ, a_src, a_srcSubresource, a_srcBox);
-			}
-			static inline REL::Relocation<decltype(thunk)> func;
-		};
-
-		struct ID3D11DeviceContext_CopyResource
-		{
-			static void WINAPI thunk(ID3D11DeviceContext* This, ID3D11Resource* a_dst, ID3D11Resource* a_src)
-			{
-				if (This == globals::d3d::context && g_settings.copyCheck)
-					CheckCopy(a_dst, a_src, "CopyResource");
-				func(This, a_dst, a_src);
-			}
-			static inline REL::Relocation<decltype(thunk)> func;
-		};
-
-		/// The resources whose copies are checked: every fp16-upgraded target, the scene, the UI layer and
-		/// the 10-bit back buffer.
-		void InstallCopyCheck()
-		{
-			g_watchedCopyResources.fill(nullptr);
-			size_t n = 0;
-			auto add = [&](ID3D11Resource* a_resource) {
-				if (a_resource && n < g_watchedCopyResources.size())
-					g_watchedCopyResources[n++] = a_resource;
-			};
-			const auto& targets = globals::game::renderer->GetRuntimeData().renderTargets;
-			for (const auto& saved : g_upgradedTargets)
-				add(targets[saved.target].texture);
-			if (g_scene)
-				add(g_scene->resource.get());
-			if (g_uiLayer)
-				add(g_uiLayer->resource.get());
-			if (auto* backBuffer = SwapChain().swapChainBufferWrapped.get())
-				add(backBuffer->resource11);
-
-			if (!g_copyHooksInstalled) {
-				stl::detour_vfunc<46, ID3D11DeviceContext_CopySubresourceRegion>(globals::d3d::context);
-				stl::detour_vfunc<47, ID3D11DeviceContext_CopyResource>(globals::d3d::context);
-				g_copyHooksInstalled = true;
-			}
-		}
 	}
 
 	// ---- settings, migration ---------------------------------------------------------------------
@@ -878,7 +705,6 @@ namespace HDROutput
 		auto& sc = SwapChain();
 		g_chainFormat = sc.swapChainDesc.Format;
 		g_session = g_chainFormat == DXGI_FORMAT_R10G10B10A2_UNORM;
-		g_colorSpaceChainLatched = std::min(GetSettings().colorSpaceChain, 2u);
 		if (g_tenBitWanted && !g_session)
 			NoteTenBitFailure("the 10-bit swap chain could not be created");
 		logger::info("[HDR] Swap chain format {} -> 10-bit session {} ({})", static_cast<uint32_t>(g_chainFormat),
@@ -928,7 +754,6 @@ namespace HDROutput
 		CreateUILayer(desc.Width, desc.Height);
 		EnsureCB();
 		UpgradeLDRRenderTargets();
-		InstallCopyCheck();  // (44d) after the upgrade: it watches the new fp16 textures
 
 		// (port of ba9b41e81 / f748118bb) New targets start black, not with whatever the memory held:
 		// the first frames (startup, main menu) can be shown before anything has drawn into them.
@@ -964,7 +789,7 @@ namespace HDROutput
 			return;
 		// (44a) HDR off: the lean path. The game draws into the 10-bit back buffer exactly as it
 		// would into an 8-bit one; nothing of ours runs this frame.
-		if (!g_outputActive && GetSettings().sdrPath == 0)
+		if (!g_outputActive)
 			return;
 
 		g_frame.sceneHDR = WantsSceneHDR();
@@ -1028,7 +853,7 @@ namespace HDROutput
 				pendingTarget = static_cast<int>(renderTargets[0]);
 			}
 			const bool chainToFramebuffer = a_target == static_cast<int>(RE::RENDER_TARGET::kFRAMEBUFFER);
-			const bool recover = chainToFramebuffer && g_settings.chainEndMode == 0;
+			const bool recover = chainToFramebuffer;
 			if (recover) {
 				confirmed = true;
 				++g_chainRecovered;
@@ -1155,8 +980,8 @@ namespace HDROutput
 		uint32_t width = 0, height = 0;
 		if (g_scene && a_bound == g_scene->resource.get()) {
 			a_linear = IsSceneHDRThisFrame();
-			if (a_linear && GetSettings().nisMode == 0)
-				return false;  // "Sharpening in HDR: Off"
+			if (a_linear)
+				return false;  // (44g) no sharpening in HDR for now; see specs/deferred-ideas.md (RCAS)
 			source = g_scene->srv.get();
 			g_nisTargetUAV = g_scene->uav.get();
 			width = g_scene->desc.Width;
@@ -1388,35 +1213,9 @@ namespace HDROutput
 			ImGui::TextColored({ 0.5f, 1.0f, 0.5f, 1.0f }, "HDR10 output active.");
 		}
 
-		// (44a) Display format (restart).
-		{
-			const char* formats[] = { "Auto (10-bit on an HDR display)", "8-bit (legacy, HDR needs a restart)" };
-			int format = s.displayFormat == 1 ? 1 : 0;
-			if (ImGui::Combo("Display Format (restart)", &format, formats, IM_ARRAYSIZE(formats)))
-				s.displayFormat = static_cast<uint>(format);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Auto: whenever Windows says the monitor can do HDR, the game's display chain is 10-bit (HDR10's format),");
-				ImGui::TextUnformatted("so HDR can be switched on and off at any time. With HDR off it looks the same as 8-bit, gradients slightly finer.");
-				ImGui::TextUnformatted("8-bit (legacy): the game's own format, as before 44a; HDR then takes a restart to turn on.");
-				ImGui::TextUnformatted("If the 10-bit chain or DLSS-G fails, the next start goes back to 8-bit by itself (shown below).");
-			}
-			ImGui::TextDisabled("This session: %s", g_tenBitDecision.c_str());
-			LoadFallbackMarker();
-			if (!g_tenBitFallbackReason.empty() && s.displayFormat == 0) {
-				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Auto fell back to 8-bit: %s", g_tenBitFallbackReason.c_str());
-				if (ImGui::SmallButton("Retry 10-bit (next start)"))
-					ClearFallbackMarker();
-			}
-		}
-
-		const char* sdrPaths[] = { "Lean (nothing extra runs)", "As 43b (fp16 scene + SDR copy)" };
-		int sdrPath = s.sdrPath == 1 ? 1 : 0;
-		if (ImGui::Combo("HDR Off Path", &sdrPath, sdrPaths, IM_ARRAYSIZE(sdrPaths)))
-			s.sdrPath = static_cast<uint>(sdrPath);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Only matters on the 10-bit display with HDR off. Lean: the game draws straight to the screen as in 8-bit.");
-			ImGui::TextUnformatted("As 43b: the frame goes through the HDR scene target and is copied out as SDR (the path you tested in 43b). For A/B only.");
-		}
+		LoadFallbackMarker();
+		if (!g_tenBitFallbackReason.empty() && s.displayFormat == 0)
+			ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Auto fell back to 8-bit: %s (Advanced below)", g_tenBitFallbackReason.c_str());
 
 		ImGui::BeginDisabled(!s.enabled);
 
@@ -1446,57 +1245,30 @@ namespace HDROutput
 			ImGui::TextUnformatted("A little under paper white is easier on the eyes and on an OLED. Menus, the main menu and loading screens use paper white.");
 		}
 
-		const char* menuModes[] = { "Show whole frame as SDR (safe)", "Separate UI layer, like gameplay" };
-		int menuMode = s.menuMode == 1 ? 1 : 0;
-		if (ImGui::Combo("Menus", &menuMode, menuModes, IM_ARRAYSIZE(menuModes)))
-			s.menuMode = static_cast<uint>(menuMode);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Inventory, map, pause and other full-screen menus. SDR: the frame behind the menu loses its highlights while");
-			ImGui::TextUnformatted("the menu is open, but nothing can go wrong with the menu itself. Separate: the world keeps its HDR highlights.");
-		}
-
-		const char* nisModes[] = { "Off", "Linear mode" };
-		int nisMode = s.nisMode == 1 ? 1 : 0;
-		if (ImGui::Combo("Sharpening in HDR", &nisMode, nisModes, IM_ARRAYSIZE(nisModes)))
-			s.nisMode = static_cast<uint>(nisMode);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("The DLSS Sharpness slider (NIS) while HDR is on. Off: no sharpening in HDR.");
-			ImGui::TextUnformatted("Linear mode: the picture is handed to NIS in linear light, NIS's own HDR mode. Menus (shown as SDR) always sharpen as before.");
-		}
-
-		const char* chains[] = { "Streamline proxy (native if refused)", "Native chain below Streamline", "Both" };
-		int chain = static_cast<int>(std::min(s.colorSpaceChain, 2u));
-		if (ImGui::Combo("Colour Space Set On (restart)", &chain, chains, IM_ARRAYSIZE(chains)))
-			s.colorSpaceChain = static_cast<uint>(chain);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Which swap chain is told the picture is HDR10. Under DLSS-G there are two: Streamline's and the real one below it.");
-			ImGui::TextUnformatted("Only change this if the picture looks washed out or too dark with HDR on. Takes effect after a restart.");
-		}
-		if (s.colorSpaceChain != g_colorSpaceChainLatched && g_session)
-			ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Restart to apply the colour-space choice.");
-
 		ImGui::EndDisabled();
-
-		// (44d) Water-surface fix and its diagnostics (also matter for "HDR Off Path: As 43b").
-		{
-			const char* chainEndModes[] = { "By the chain's target (44d fix)", "Last bound target only (44c)" };
-			int chainEndMode = s.chainEndMode == 1 ? 1 : 0;
-			if (ImGui::Combo("Chain End Check", &chainEndMode, chainEndModes, IM_ARRAYSIZE(chainEndModes)))
-				s.chainEndMode = static_cast<uint>(chainEndMode);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("The fix for the black picture with the camera exactly at the water surface (HDR on).");
-				ImGui::TextUnformatted("There the game's last image effect clears the underwater mask after drawing the picture, which 44c took for");
-				ImGui::TextUnformatted("\"the picture went somewhere else\" and showed black instead. 44c here brings the black back, for A/B only.");
-			}
-			ImGui::Checkbox("Log Mismatched Copies", &s.copyCheck);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Diagnostics only: writes a log line when the game copies between one of the HDR-upgraded");
-				ImGui::TextUnformatted("images and one of another format (such a copy silently does nothing). Changes nothing on screen.");
-			}
-		}
 
 		ImGui::Spacing();
 		ImGui::TextDisabled("Tone curve in HDR (Extend / Native, roll-off): Post Processing > Color Grading and Tone Mapping.");
+		ImGui::TextDisabled("DLSS sharpening is not applied while HDR is on.");
+
+		// (44g) Fixed now: lean path with HDR off, menus on their own UI layer, colour space on the
+		// Streamline proxy, the 44d water-surface fix, no sharpening in HDR, no copy-format logging.
+		if (ImGui::TreeNodeEx("Advanced")) {
+			const char* formats[] = { "Auto (10-bit on an HDR display)", "8-bit (legacy, HDR needs a restart)" };
+			int format = s.displayFormat == 1 ? 1 : 0;
+			if (ImGui::Combo("Display Format (restart)", &format, formats, IM_ARRAYSIZE(formats)))
+				s.displayFormat = static_cast<uint>(format);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Auto: whenever Windows says the monitor can do HDR, the game's display chain is 10-bit (HDR10's format),");
+				ImGui::TextUnformatted("so HDR can be switched on and off at any time. With HDR off it looks the same as 8-bit, gradients slightly finer.");
+				ImGui::TextUnformatted("8-bit (legacy): the game's own format, as before 44a; HDR then takes a restart to turn on.");
+				ImGui::TextUnformatted("If the 10-bit chain or DLSS-G fails, the next start goes back to 8-bit by itself.");
+			}
+			ImGui::TextDisabled("This session: %s", g_tenBitDecision.c_str());
+			if (!g_tenBitFallbackReason.empty() && s.displayFormat == 0 && ImGui::SmallButton("Retry 10-bit (next start)"))
+				ClearFallbackMarker();
+			ImGui::TreePop();
+		}
 
 		// (44a) Moved here from Upscaling: read-only display / swap-chain / HDR status.
 		DisplayHDRInfo::DrawSettings();
@@ -1517,10 +1289,6 @@ namespace HDROutput
 				g_redirectConfirmed, g_redirectUnconfirmed, g_chainRecovered, g_upgradedTargets.size());
 			if (!g_lastChainEndNote.empty())
 				ImGui::TextDisabled("Last chain end elsewhere: %s", g_lastChainEndNote.c_str());
-			if (g_copyMismatchTotal > 0)
-				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Mismatched-format copies seen: %llu (%zu kinds, see the log)", g_copyMismatchTotal, g_copyMismatches.size());
-			else
-				ImGui::TextDisabled("Mismatched-format copies seen: none%s", s.copyCheck ? "" : " (check off)");
 			if (g_dlssGRejectedHDR)
 				ImGui::TextColored({ 1.0f, 0.4f, 0.4f, 1.0f }, "DLSS-G rejected the HDR format (eFailHDRFormatNotSupported, status 0x%X)", g_lastDLSSGStatus);
 			else if (g_lastDLSSGStatus)
@@ -1544,7 +1312,6 @@ namespace HDROutput
 		j["display_format"] = s.displayFormat == 1 ? "8-bit legacy" : "auto";
 		j["format_decision"] = g_tenBitDecision;
 		j["format_fallback"] = g_tenBitFallbackReason;
-		j["sdr_path"] = s.sdrPath == 1 ? "43b" : "lean";
 		j["scene_bt2020_last"] = g_lastSceneBT2020;
 		j["active"] = IsOutputActive();
 		j["swap_chain_format"] = static_cast<uint32_t>(g_chainFormat);
@@ -1560,18 +1327,7 @@ namespace HDROutput
 			j["scene_confirmed_frames"] = g_redirectConfirmed;
 			j["scene_unconfirmed_frames"] = g_redirectUnconfirmed;
 			j["scene_recovered_frames"] = g_chainRecovered;
-			j["chain_end_mode"] = s.chainEndMode == 1 ? "44c" : "44d";
 			j["chain_end_last_note"] = g_lastChainEndNote;
-			j["copy_check"] = s.copyCheck;
-			j["copy_mismatch_total"] = g_copyMismatchTotal;
-			nlohmann::json mismatches = nlohmann::json::array();
-			for (const auto& m : g_copyMismatches)
-				mismatches.push_back({ { "src", TargetName(m.src) }, { "dst", TargetName(m.dst) }, { "src_format", m.srcFormat }, { "dst_format", m.dstFormat }, { "count", m.count } });
-			j["copy_mismatches"] = mismatches;
-			j["menu_mode"] = s.menuMode == 1 ? "separate" : "sdr";
-			j["nis_in_hdr"] = s.nisMode == 1 ? "linear" : "off";
-			j["color_space_chain_setting"] = s.colorSpaceChain;
-			j["color_space_chain_session"] = g_colorSpaceChainLatched;
 			j["dlssg_last_failure_status"] = g_lastDLSSGStatus;
 			j["dlssg_rejected_hdr_format"] = g_dlssGRejectedHDR;
 			j["gpu_ms"] = Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::HDROutput);
@@ -1583,7 +1339,7 @@ namespace HDROutput
 	{
 		if (a_key == "enabled" && !g_session)
 			return "needs a restart (8-bit display this session)";
-		if (a_key == "displayFormat" || a_key == "colorSpaceChain")
+		if (a_key == "displayFormat")
 			return "needs a restart";
 		return {};
 	}

@@ -38,9 +38,6 @@ namespace HDROutput
 		/// (44a, restart) 0 = Auto: 10-bit swap chain when Windows reports an HDR-capable display;
 		/// 1 = 8-bit (legacy): the game's own format, 10-bit only when HDR is saved on (43b).
 		uint displayFormat = 0;
-		/// (44a) HDR off in a 10-bit session: 0 = lean (the game draws straight into the back buffer,
-		/// nothing of ours runs), 1 = as 43b (fp16 scene target + SDR resolve).
-		uint sdrPath = 0;
 		/// 0 = auto (the display's reported maximum, 400-1000 nits, 450 if it reports nothing), 1 = manual.
 		uint peakMode = 0;
 		float peakNitsManual = 450.0f;
@@ -50,38 +47,20 @@ namespace HDROutput
 		float hudNits = 160.0f;
 		// (44f) The 43b "Fix Mod UI Transparency" (uiBlendFix) was removed: no visible effect for the
 		// user and its counter kept rising. The old key is ignored.
-		/// (43b) Paused menus: 0 = whole frame shown as SDR (safe), 1 = UI on its own layer like gameplay.
-		uint menuMode = 0;
-		/// (43c) NIS sharpening while HDR is on: 0 = off, 1 = linear mode.
-		uint nisMode = 0;
-		/// (43c, restart) Which swap chain gets SetColorSpace1: 0 = Streamline proxy (falls back to the
-		/// native one if it refuses), 1 = native chain below Streamline, 2 = both.
-		uint colorSpaceChain = 0;
-		/// (44d) How the end of the image-space chain is judged. 0 = by the chain's own target: when the
-		/// game drew the chain into the frame buffer (whose slot points at the fp16 scene), the scene is
-		/// there even if a last helper pass left another target bound (the depth-of-field effect clears the
-		/// underwater mask after it at the water surface). 1 = as 44c: only the target bound at the end
-		/// counts (the water-surface black screen).
-		uint chainEndMode = 0;
-		/// (44d) Watch CopyResource / CopySubresourceRegion for copies between an fp16-upgraded target (or
-		/// the 10-bit back buffer) and a target of another format, which D3D11 silently drops. Log only.
-		bool copyCheck = true;
+		// (44g) Removed after the user's review, now fixed; their old keys are ignored: sdrPath (lean),
+		// menuMode (menus on their own UI layer), nisMode (no sharpening in HDR; RCAS is in
+		// specs/deferred-ideas.md), colorSpaceChain (Streamline proxy, native if refused),
+		// chainEndMode (the 44d water-surface fix), copyCheck (the copy-format logging is gone).
 	};
 
 	NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 		Settings,
 		enabled,
 		displayFormat,
-		sdrPath,
 		peakMode,
 		peakNitsManual,
 		paperWhiteNits,
-		hudNits,
-		menuMode,
-		nisMode,
-		colorSpaceChain,
-		chainEndMode,
-		copyCheck)
+		hudNits)
 
 	/// (44a) The settings, owned by the "HDR Output" feature (HDROutputFeature) and stored here.
 	Settings& GetSettings();
