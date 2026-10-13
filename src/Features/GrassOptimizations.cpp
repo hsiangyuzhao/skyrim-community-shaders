@@ -1434,6 +1434,15 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 			++stats->indirectDraws;
 	};
 
+	// (45c) Why NvAPI_D3D11_MultiDrawIndexedInstancedIndirect is not used here: a multi-draw repeats one
+	// pipeline state with consecutive argument blocks. Across buckets the engine binds each bucket's own
+	// material (textures, material constants) in its per-shape setup right before this hook, so buckets
+	// cannot share a call. Within a bucket the up to three draws (full mesh, mid LOD, far LOD) each have
+	// their own vertex buffer, index buffer, per-instance vertex buffer and extras SRV (SV_InstanceID does
+	// not include StartInstanceLocation in D3D11, so even a merged instance buffer would need a per-draw
+	// base in the shader), and their args live in three separate buffers. Merging that would mean a shared
+	// mesh/instance pool for the whole grass store -- a rework for a CPU-only saving while the frame is
+	// GPU-bound. The entry point is resolved in Utils/Nvapi for later use.
 	issue(meshVB, meshStride, indexB, b->compactedBuf, b->extrasSRV, b->argsBuf);
 
 	std::array<const GrassMeshLibrary::LODMesh*, (size_t)GrassMeshLibrary::LODTier::kCount> lodMeshes{};
