@@ -634,7 +634,8 @@ namespace SharedData
 		float2 LoadedCenter;      // world XY of the centre of the loaded cells
 		float FadeStart;          // Chebyshev XY distance from LoadedCenter where near snow starts to thin out
 		float FadeEnd;            // ... and where it is gone (just inside the loaded area's edge)
-		float2 pad1;
+		float SnowLineStart;      // (44i) world height where the snow line starts to count (1e9 = off)
+		float SnowLineEnd;        // (44i) ... and where everything is cold
 	};
 
 	namespace PhysSkyCloudFlags

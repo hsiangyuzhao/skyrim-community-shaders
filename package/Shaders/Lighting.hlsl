@@ -2476,7 +2476,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		const bool snowOnActor = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsActorGeometry) != 0;
 
 		// (44h) Local accumulation amount: the global amount x the cold-region mask (FlagColdMap) x
-		// the fade towards the edge of the loaded cells, 0 on distant LOD (FlagNoLodSnow).
+		// the fade towards the edge of the loaded cells, 0 on distant LOD (FlagNoLodSnow). (44i) The mask
+		// includes the snow line (world height), so the absolute position goes in.
 #		if defined(LODLANDSCAPE) || defined(LODOBJECTS) || defined(LODOBJECTSHD)
 		const bool snowOnLod = true;
 #		else
@@ -2484,7 +2485,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif
 		float snowAmountScale = 1.0;
 		[branch] if (snowFlags & (DynamicSnow::FlagAccumulation | DynamicSnow::FlagShowColdMap))
-			snowAmountScale = DynamicSnow::AmountScale(snowPositionWS.xy, snowOnLod);
+			snowAmountScale = DynamicSnow::AmountScale(snowPositionWS, snowOnLod);
 		const float snowAmount = SharedData::dynamicSnowSettings.Amount * snowAmountScale;
 
 		// (batch 39b) Authored snow the material path above does not report. 39a only had

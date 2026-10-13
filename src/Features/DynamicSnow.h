@@ -3,7 +3,10 @@
 #include "Buffer.h"
 
 #include <array>
+#include <chrono>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 /**
  * @brief (batch 39, items 5 and 6) Dynamic snow: accumulation, and footprints / trails.
@@ -132,6 +135,15 @@ public:
 		/// (44h) LOD terrain, LOD objects and distant trees take no accumulation (their textures carry
 		/// snow already); near geometry thins out to none at the edge of the loaded cells.
 		bool NoLodSnow = true;
+		/// (44i) Snow line: above this world height (game units) everything counts as cold, whatever
+		/// the regions say (Snow Only in Cold Regions and the player's cold-region test). 0 = off.
+		/// Snow is full at the line and fades out over SnowLineFade below it.
+		float SnowLineHeight = 18000.0f;
+		float SnowLineFade = 4000.0f;
+		/// (44i) A weather also counts as snow when its precipitation particles are snow (particle
+		/// type, or a "snow" particle texture), not only when it carries the Snow classification.
+		/// Off = the 44h test (classification only).
+		bool ParticleSnowTest = false;
 		/// Ragdolls being dragged or sliding and loose objects moving through snow carve trenches
 		/// (Havok collision shapes, after community-shaders PR #2659).
 		bool BodyAndObjectTrails = true;
@@ -225,7 +237,10 @@ public:
 
 		float FadeStart;
 		float FadeEnd;
-		float2 pad1;
+		// (44i) Snow line: the cold mask is max(region mask, smoothstep(SnowLineStart, SnowLineEnd, z)).
+		// Off: both far above any terrain (1e9), so the smoothstep is 0.
+		float SnowLineStart;
+		float SnowLineEnd;
 	};
 	STATIC_ASSERT_ALIGNAS_16(MapCbData);
 	static_assert(sizeof(MapCbData) == 48);
@@ -286,6 +301,11 @@ public:
 		uint32_t gridsToLoad = 0;        ///< loaded cells per side (uGridsToLoad)
 		float fadeStart = 0.0f;          ///< near-snow fade, game units from the loaded area's centre
 		float fadeEnd = 0.0f;
+		// (44i) Snow line and region diagnostics
+		float playerZ = 0.0f;
+		float playerSnowLine = 0.0f;     ///< snow-line factor at the player (0..1)
+		bool aboveSnowLine = false;      ///< the player counts as cold through the snow line
+		std::vector<std::string> regionLines;  ///< regions at the player, their weathers, the map's value
 	} status;
 
 private:
@@ -454,6 +474,15 @@ private:
 	void ReleaseColdMap();
 	[[nodiscard]] float SampleColdMaskCPU(float a_x, float a_y) const;
 	void UpdateLoadedArea();
+	/// (44i) 0..1 snow-line factor at a world height (0 with the snow line off).
+	[[nodiscard]] float SnowLineFactor(float a_z) const;
+	/// (44i) Rebuilds status.regionLines for the player's position (menu and debug log).
+	void UpdateRegionDiagnostics();
+	RE::TESObjectCELL* diagCell = nullptr;          ///< cell the diagnostics were last built for
+	std::chrono::steady_clock::time_point diagTime{};  ///< real time of the last build
+	RE::TESObjectCELL* diagLogCell = nullptr;       ///< cell last logged (debug view on)
+	std::chrono::steady_clock::time_point diagLogTime{};
+	bool particleSnowTestBuilt = false;             ///< ParticleSnowTest the share grid was built with
 
 	RE::TESWorldSpace* coldMapWorldSpace = nullptr;  ///< worldspace the share grid was built for
 	bool coldMapTried = false;                       ///< BuildColdShareGrid ran for coldMapWorldSpace

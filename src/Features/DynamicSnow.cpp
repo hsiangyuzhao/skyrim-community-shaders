@@ -43,6 +43,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	GrassCoverage,
 	ColdRegionsOnly,
 	NoLodSnow,
+	SnowLineHeight,
+	SnowLineFade,
+	ParticleSnowTest,
 	BodyAndObjectTrails,
 	TrailRim,
 	OverrideAmount,
@@ -80,19 +83,85 @@ namespace
 		return 1.0f - linearstep(255.0f * fadeOut, 255.0f, progress);
 	}
 
-	bool IsSnowWeather(const RE::TESWeather* a_weather)
+	std::string ToLower(std::string_view a_text)
 	{
-		return a_weather && a_weather->data.flags.any(RE::TESWeather::WeatherDataFlag::kSnow);
+		std::string out(a_text);
+		std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		return out;
 	}
 
-	bool HasPrecipitation(const RE::TESWeather* a_weather)
+	/// (44i) Which test made a weather count as snow.
+	enum class SnowTest
+	{
+		None,
+		Flag,             ///< the weather's Snow classification (the only test before 44i)
+		ParticleType,     ///< its precipitation particles are of the snow type
+		ParticleTexture,  ///< its precipitation particle texture is named "snow"
+	};
+
+	const char* SnowTestName(SnowTest a_test)
+	{
+		switch (a_test) {
+		case SnowTest::Flag:
+			return "snow (classification)";
+		case SnowTest::ParticleType:
+			return "snow (particle type)";
+		case SnowTest::ParticleTexture:
+			return "snow (particle texture)";
+		default:
+			return "not snow";
+		}
+	}
+
+	/// (44i) Snow by the weather's precipitation particles (BGSShaderParticleGeometryData DATA: particle
+	/// type 1 = snow; or a particle texture whose path names snow).
+	SnowTest ParticleSnow(const RE::TESWeather* a_weather)
+	{
+		auto* particles = a_weather ? a_weather->precipitationData : nullptr;
+		if (!particles)
+			return SnowTest::None;
+		constexpr auto typeIndex = static_cast<uint32_t>(RE::BGSShaderParticleGeometryData::DataID::kParticleType);
+		constexpr auto snowType = static_cast<uint32_t>(RE::BGSShaderParticleGeometryData::ParticleType::kSnow);
+		const char* texture = nullptr;
+		if (REL::Module::IsVR()) {
+			auto& rd = particles->GetVRRuntimeData();
+			if (rd.data.size() > typeIndex && rd.data[typeIndex].value.i == snowType)
+				return SnowTest::ParticleType;
+			texture = rd.particleTexture.textureName.c_str();
+		} else {
+			auto& rd = particles->GetRuntimeData();
+			if (rd.data.size() > typeIndex && rd.data[typeIndex].i == snowType)
+				return SnowTest::ParticleType;
+			texture = rd.particleTexture.textureName.c_str();
+		}
+		if (texture && texture[0] && ToLower(texture).find("snow") != std::string::npos)
+			return SnowTest::ParticleTexture;
+		return SnowTest::None;
+	}
+
+	SnowTest ClassifySnow(const RE::TESWeather* a_weather, bool a_particles)
+	{
+		if (!a_weather)
+			return SnowTest::None;
+		if (a_weather->data.flags.any(RE::TESWeather::WeatherDataFlag::kSnow))
+			return SnowTest::Flag;
+		return a_particles ? ParticleSnow(a_weather) : SnowTest::None;
+	}
+
+	bool IsSnowWeather(const RE::TESWeather* a_weather, bool a_particles)
+	{
+		return ClassifySnow(a_weather, a_particles) != SnowTest::None;
+	}
+
+	bool HasPrecipitation(const RE::TESWeather* a_weather, bool a_particles)
 	{
 		return a_weather && a_weather->precipitationData &&
-		       a_weather->data.flags.any(RE::TESWeather::WeatherDataFlag::kRainy, RE::TESWeather::WeatherDataFlag::kSnow);
+		       (a_weather->data.flags.any(RE::TESWeather::WeatherDataFlag::kRainy, RE::TESWeather::WeatherDataFlag::kSnow) ||
+				   (a_particles && ParticleSnow(a_weather) != SnowTest::None));
 	}
 
 	/// Share (by chance) of snow weathers in a weather list, or -1 if the list is empty.
-	float SnowShare(RE::BSSimpleList<RE::WeatherType*>& a_list)
+	float SnowShare(RE::BSSimpleList<RE::WeatherType*>& a_list, bool a_particles)
 	{
 		float total = 0.0f;
 		float snow = 0.0f;
@@ -101,16 +170,27 @@ namespace
 				continue;
 			const float chance = static_cast<float>(type->chance);
 			total += chance;
-			if (IsSnowWeather(type->weather))
+			if (IsSnowWeather(type->weather, a_particles))
 				snow += chance;
 		}
 		return total > 0.0f ? snow / total : -1.0f;
 	}
 
-	std::string ToLower(std::string_view a_text)
+	/// (44i) "FormID plugin [EditorID]": the defining plugin, and the last one overriding it if different.
+	std::string FormLabel(const RE::TESForm* a_form)
 	{
-		std::string out(a_text);
-		std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (!a_form)
+			return "-";
+		std::string out = std::format("{:08X}", a_form->GetFormID());
+		auto* first = a_form->GetFile(0);
+		auto* last = a_form->GetFile(-1);
+		if (first)
+			out += std::format(" {}", first->GetFilename());
+		if (last && last != first)
+			out += std::format(" (last edit {})", last->GetFilename());
+		const char* id = a_form->GetFormEditorID();
+		if (id && id[0])
+			out += std::format(" [{}]", id);
 		return out;
 	}
 }
@@ -156,7 +236,7 @@ bool DynamicSnow::IsColdRegion(RE::TESObjectCELL* a_cell, RE::TESWorldSpace* a_w
 			for (auto* data : region->dataList->regionDataList) {
 				if (!data || data->GetType() != RE::TESRegionData::Type::kWeather)
 					continue;
-				const float share = SnowShare(static_cast<RE::TESRegionDataWeather*>(data)->weatherTypes);
+				const float share = SnowShare(static_cast<RE::TESRegionDataWeather*>(data)->weatherTypes, settings.ParticleSnowTest);
 				if (share > best) {
 					best = share;
 					const char* id = region->GetFormEditorID();
@@ -167,7 +247,7 @@ bool DynamicSnow::IsColdRegion(RE::TESObjectCELL* a_cell, RE::TESWorldSpace* a_w
 	}
 	// No region weather here: the worldspace's climate.
 	if (best < 0.0f && a_worldSpace && a_worldSpace->climate) {
-		best = SnowShare(a_worldSpace->climate->weatherList);
+		best = SnowShare(a_worldSpace->climate->weatherList, settings.ParticleSnowTest);
 		const char* id = a_worldSpace->climate->GetFormEditorID();
 		status.region = std::format("climate {}", (id && id[0]) ? std::string(id) : std::format("{:08X}", a_worldSpace->climate->GetFormID()));
 	}
@@ -202,14 +282,17 @@ void DynamicSnow::UpdateAccumulation()
 	const float fadeCurrent = PrecipitationFade(sky->currentWeather, pct, true);
 	const float fadeLast = PrecipitationFade(sky->lastWeather, pct, false);
 
-	const float snowFade = std::min(1.0f, (IsSnowWeather(sky->currentWeather) ? fadeCurrent : 0.0f) + (IsSnowWeather(sky->lastWeather) ? fadeLast : 0.0f));
-	const float precipFade = std::min(1.0f, (HasPrecipitation(sky->currentWeather) ? fadeCurrent : 0.0f) + (HasPrecipitation(sky->lastWeather) ? fadeLast : 0.0f));
+	const bool particles = settings.ParticleSnowTest;
+	const float snowFade = std::min(1.0f, (IsSnowWeather(sky->currentWeather, particles) ? fadeCurrent : 0.0f) + (IsSnowWeather(sky->lastWeather, particles) ? fadeLast : 0.0f));
+	const float precipFade = std::min(1.0f, (HasPrecipitation(sky->currentWeather, particles) ? fadeCurrent : 0.0f) + (HasPrecipitation(sky->lastWeather, particles) ? fadeLast : 0.0f));
 	status.snowWeather = snowFade > 0.0f;
 	status.precipitation = precipFade > 0.0f;
 
 	const auto condition = static_cast<SnowCondition>(std::clamp(settings.Condition, 0, static_cast<int>(SnowCondition::Count) - 1));
 	const bool needCold = condition != SnowCondition::SnowWeather;
-	status.coldRegion = needCold ? IsColdRegion(cell, player->GetWorldspace()) : false;
+	// (44i) Above the snow line (at least half way into its fade) the player counts as cold too.
+	status.aboveSnowLine = player && SnowLineFactor(player->GetPositionZ()) >= 0.5f;
+	status.coldRegion = needCold ? (IsColdRegion(cell, player->GetWorldspace()) || status.aboveSnowLine) : false;
 
 	float snowfall = 0.0f;
 	switch (condition) {
@@ -260,7 +343,7 @@ namespace
 	constexpr float kCellUnits = 4096.0f;
 
 	/// Highest snow share of a region's weather lists, or -1 if it has none.
-	float RegionSnowShare(RE::TESRegion* a_region)
+	float RegionSnowShare(RE::TESRegion* a_region, bool a_particles)
 	{
 		float best = -1.0f;
 		if (!a_region || !a_region->dataList)
@@ -268,7 +351,7 @@ namespace
 		for (auto* data : a_region->dataList->regionDataList) {
 			if (!data || data->GetType() != RE::TESRegionData::Type::kWeather)
 				continue;
-			best = std::max(best, SnowShare(static_cast<RE::TESRegionDataWeather*>(data)->weatherTypes));
+			best = std::max(best, SnowShare(static_cast<RE::TESRegionDataWeather*>(data)->weatherTypes, a_particles));
 		}
 		return best;
 	}
@@ -371,7 +454,7 @@ void DynamicSnow::BuildColdShareGrid(RE::TESWorldSpace* a_worldSpace)
 		for (auto* region : dataHandler->GetFormArray<RE::TESRegion>()) {
 			if (!region || region->worldSpace != a_ws || !region->pointLists || (region->formFlags & skipFlags))
 				continue;
-			const float share = RegionSnowShare(region);
+			const float share = RegionSnowShare(region, particleSnowTestBuilt);
 			if (share < 0.0f)
 				continue;  // not a weather region: it says nothing about cold
 			bool any = false;
@@ -419,7 +502,7 @@ void DynamicSnow::BuildColdShareGrid(RE::TESWorldSpace* a_worldSpace)
 	RE::TESClimate* climate = a_worldSpace->climate;
 	if (!climate && a_worldSpace->parentWorld)
 		climate = a_worldSpace->parentWorld->climate;
-	coldClimateShare = climate ? SnowShare(climate->weatherList) : -1.0f;
+	coldClimateShare = climate ? SnowShare(climate->weatherList, particleSnowTestBuilt) : -1.0f;
 
 	// Bounds of all weather regions plus a two-cell margin, so the mask's edge texels (repeated
 	// outside it by the shader) are "no region".
@@ -582,9 +665,11 @@ void DynamicSnow::UpdateColdMap()
 	auto* worldSpace = player ? player->GetWorldspace() : nullptr;
 	if (!worldSpace)
 		return;
-	if (worldSpace != coldMapWorldSpace || !coldMapTried) {
+	// (44i) Also rebuilt when the snow test changes (it changes every region's share).
+	if (worldSpace != coldMapWorldSpace || !coldMapTried || particleSnowTestBuilt != settings.ParticleSnowTest) {
 		coldMapWorldSpace = worldSpace;
 		coldMapTried = true;
+		particleSnowTestBuilt = settings.ParticleSnowTest;
 		try {
 			BuildColdShareGrid(worldSpace);
 		} catch (const std::exception& e) {
@@ -606,8 +691,213 @@ void DynamicSnow::UpdateColdMap()
 	}
 	if (status.coldMapValid) {
 		const auto pos = player->GetPosition();
-		status.playerMask = SampleColdMaskCPU(pos.x, pos.y);
+		// (44i) As the shader: the region mask or the snow line, whichever is higher.
+		status.playerMask = std::max(SampleColdMaskCPU(pos.x, pos.y), SnowLineFactor(pos.z));
 	}
+}
+
+namespace
+{
+	/// (44i) Even-odd point-in-polygon test on one RPLD point list.
+	bool PointInList(RE::TESRegionPointList* a_list, float a_x, float a_y)
+	{
+		if (!a_list)
+			return false;
+		std::vector<RE::NiPoint2> pts;
+		for (auto* point : *a_list) {
+			if (point && std::isfinite(point->point.x) && std::isfinite(point->point.y))
+				pts.push_back(point->point);
+		}
+		if (pts.size() < 3)
+			return false;
+		bool inside = false;
+		for (size_t i = 0, j = pts.size() - 1; i < pts.size(); j = i++) {
+			const auto& a = pts[i];
+			const auto& b = pts[j];
+			if ((a.y > a_y) != (b.y > a_y) && a_x < (b.x - a.x) * (a_y - a.y) / (b.y - a.y) + a.x)
+				inside = !inside;
+		}
+		return inside;
+	}
+
+	/// (44i) Number of usable polygons (3+ finite points) of a region.
+	uint32_t UsablePolygons(RE::TESRegion* a_region)
+	{
+		uint32_t count = 0;
+		if (!a_region || !a_region->pointLists)
+			return 0;
+		for (auto* list : *a_region->pointLists) {
+			if (!list)
+				continue;
+			uint32_t n = 0;
+			for (auto* point : *list)
+				n += (point && std::isfinite(point->point.x) && std::isfinite(point->point.y)) ? 1u : 0u;
+			count += n >= 3;
+		}
+		return count;
+	}
+
+	void AppendWeatherLines(std::vector<std::string>& a_lines, RE::BSSimpleList<RE::WeatherType*>& a_list, bool a_particles)
+	{
+		for (auto* type : a_list) {
+			if (!type || !type->weather)
+				continue;
+			auto* w = type->weather;
+			const auto test = ClassifySnow(w, a_particles);
+			// Without the particle test, still say when the particles alone would have counted.
+			std::string hint;
+			if (test == SnowTest::None && !a_particles) {
+				const auto p = ParticleSnow(w);
+				if (p != SnowTest::None)
+					hint = std::format(" (would count with Count Snow by Precipitation Particles: {})", SnowTestName(p));
+			}
+			std::string flags;
+			using F = RE::TESWeather::WeatherDataFlag;
+			if (w->data.flags.any(F::kPleasant))
+				flags += "pleasant ";
+			if (w->data.flags.any(F::kCloudy))
+				flags += "cloudy ";
+			if (w->data.flags.any(F::kRainy))
+				flags += "rainy ";
+			if (w->data.flags.any(F::kSnow))
+				flags += "snow ";
+			if (flags.empty())
+				flags = "none ";
+			flags.pop_back();
+			a_lines.push_back(std::format("      weather {}  chance {}{}  class: {}  -> {}{}",
+				FormLabel(w), type->chance, type->global ? " (global)" : "", flags, SnowTestName(test), hint));
+		}
+	}
+}
+
+void DynamicSnow::UpdateRegionDiagnostics()
+{
+	auto& lines = status.regionLines;
+	lines.clear();
+	diagTime = std::chrono::steady_clock::now();
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	auto* cell = player ? player->GetParentCell() : nullptr;
+	auto* worldSpace = player ? player->GetWorldspace() : nullptr;
+	auto* dataHandler = RE::TESDataHandler::GetSingleton();
+	diagCell = cell;
+	if (!player || !cell || !cell->IsExteriorCell() || !worldSpace || !dataHandler) {
+		lines.push_back("Not in an exterior worldspace.");
+		return;
+	}
+	const auto pos = player->GetPosition();
+	const bool particles = settings.ParticleSnowTest;
+	const float threshold = settings.ColdRegionSnowShare;
+
+	lines.push_back(std::format("Worldspace {}, position {:.0f}, {:.0f}, height {:.0f} ({:.0f} m)",
+		FormLabel(worldSpace), pos.x, pos.y, pos.z, pos.z * 0.01428f));
+	if (settings.SnowLineHeight > 0.0f)
+		lines.push_back(std::format("Snow line {:.0f} (fades in from {:.0f}): {:.0f}% here",
+			settings.SnowLineHeight, settings.SnowLineHeight - std::max(settings.SnowLineFade, 1.0f), SnowLineFactor(pos.z) * 100.0f));
+	else
+		lines.push_back("Snow line: off");
+
+	// Regions of the cell's own region list (what the game draws the weather from).
+	std::vector<RE::TESRegion*> cellRegions;
+	if (auto* list = cell->GetRegionList(false)) {
+		for (auto* region : *list)
+			if (region)
+				cellRegions.push_back(region);
+	}
+
+	uint32_t found = 0;
+	for (auto* region : dataHandler->GetFormArray<RE::TESRegion>()) {
+		if (!region)
+			continue;
+		const bool parent = worldSpace->parentWorld && region->worldSpace == worldSpace->parentWorld;
+		if (region->worldSpace != worldSpace && !parent)
+			continue;
+		bool inArea = false;
+		if (region->pointLists) {
+			for (auto* list : *region->pointLists) {
+				if (PointInList(list, pos.x, pos.y)) {
+					inArea = true;
+					break;
+				}
+			}
+		}
+		const bool inCell = std::find(cellRegions.begin(), cellRegions.end(), region) != cellRegions.end();
+		if (!inArea && !inCell)
+			continue;
+		++found;
+
+		// Same order as BuildColdShareGrid's checks.
+		bool hasWeatherData = false;
+		if (region->dataList) {
+			for (auto* data : region->dataList->regionDataList)
+				hasWeatherData |= data && data->GetType() == RE::TESRegionData::Type::kWeather;
+		}
+		const float share = RegionSnowShare(region, particles);
+		std::string state;
+		if (region->formFlags & RE::TESRegion::RecordFlags::kBorderRegion)
+			state = "skipped (border region)";
+		else if (region->formFlags & RE::TESRegion::RecordFlags::kDeleted)
+			state = "skipped (deleted)";
+		else if (region->formFlags & RE::TESRegion::RecordFlags::kIgnored)
+			state = "skipped (ignored)";
+		else if (!hasWeatherData)
+			state = "skipped (no weather data)";
+		else if (share < 0.0f)
+			state = "skipped (empty weather list)";
+		else if (UsablePolygons(region) == 0)
+			state = std::format("skipped (no area), snow share {:.2f}", share);
+		else
+			state = std::format("snow share {:.2f} -> {}", share, share >= threshold ? "COLD" : "not cold");
+		lines.push_back(std::format("Region {}{}{}{}: {}", FormLabel(region), inArea ? " [area]" : "", inCell ? " [cell list]" : "",
+			parent ? " [parent worldspace]" : "", state));
+		if (region->dataList) {
+			for (auto* data : region->dataList->regionDataList) {
+				if (data && data->GetType() == RE::TESRegionData::Type::kWeather)
+					AppendWeatherLines(lines, static_cast<RE::TESRegionDataWeather*>(data)->weatherTypes, particles);
+			}
+		}
+	}
+	if (found == 0)
+		lines.push_back("No region of this worldspace covers this point or is in this cell's region list.");
+
+	// The climate (where no weather region lies).
+	RE::TESClimate* climate = worldSpace->climate;
+	if (!climate && worldSpace->parentWorld)
+		climate = worldSpace->parentWorld->climate;
+	if (climate) {
+		const float share = SnowShare(climate->weatherList, particles);
+		lines.push_back(std::format("Climate {}: snow share {:.2f} -> {} (used where no weather region lies)", FormLabel(climate), share,
+			share >= 0.0f && share >= threshold ? "COLD" : "not cold"));
+		AppendWeatherLines(lines, climate->weatherList, particles);
+	} else {
+		lines.push_back("Climate: none");
+	}
+
+	// What the map holds here.
+	const float line = SnowLineFactor(pos.z);
+	if (!settings.ColdRegionsOnly) {
+		lines.push_back("Map here: Snow Only in Cold Regions is off (same amount everywhere)");
+	} else if (!status.coldMapValid || coldShare.empty() || coldMapW == 0 || coldMapH == 0) {
+		lines.push_back(std::format("Map here: no map ({})", status.coldMapNote.empty() ? "not built yet" : status.coldMapNote));
+	} else {
+		const int ix = std::clamp(static_cast<int>(std::floor((pos.x - coldMapOriginX) / coldMapTexel)), 0, static_cast<int>(coldMapW) - 1);
+		const int iy = std::clamp(static_cast<int>(std::floor((pos.y - coldMapOriginY) / coldMapTexel)), 0, static_cast<int>(coldMapH) - 1);
+		const float raw = coldShare[static_cast<size_t>(iy) * coldMapW + static_cast<size_t>(ix)];
+		const float mask = SampleColdMaskCPU(pos.x, pos.y);
+		const char* source = raw >= 0.0f ? "region" : "climate fallback";
+		const float share = raw >= 0.0f ? raw : coldClimateShare;
+		const char* decides = line > mask ? "snow line" : (raw >= 0.0f ? "region" : "climate fallback");
+		lines.push_back(std::format("Map here: {} share {:.2f} -> region mask {:.0f}%, snow line {:.0f}% -> {:.0f}% snow (decided by {})",
+			source, share, mask * 100.0f, line * 100.0f, std::max(mask, line) * 100.0f, decides));
+	}
+}
+
+float DynamicSnow::SnowLineFactor(float a_z) const
+{
+	if (settings.SnowLineHeight <= 0.0f)
+		return 0.0f;
+	const float fade = std::max(settings.SnowLineFade, 1.0f);
+	const float t = std::clamp((a_z - (settings.SnowLineHeight - fade)) / fade, 0.0f, 1.0f);
+	return t * t * (3.0f - 2.0f * t);
 }
 
 DynamicSnow::MapCbData DynamicSnow::GetMapBufferData()
@@ -622,6 +912,14 @@ DynamicSnow::MapCbData DynamicSnow::GetMapBufferData()
 	data.LoadedCenter = { loadedCenter[0], loadedCenter[1] };
 	data.FadeStart = loadedFadeStart;
 	data.FadeEnd = std::max(loadedFadeEnd, loadedFadeStart + 1.0f);
+	// (44i) Snow line (read with the cold mask only). Off: far above any terrain, so it adds nothing.
+	if (settings.SnowLineHeight > 0.0f) {
+		data.SnowLineEnd = settings.SnowLineHeight;
+		data.SnowLineStart = settings.SnowLineHeight - std::max(settings.SnowLineFade, 1.0f);
+	} else {
+		data.SnowLineStart = 1e9f;
+		data.SnowLineEnd = 2e9f;
+	}
 	return data;
 }
 
@@ -655,6 +953,22 @@ void DynamicSnow::UpdateFrameState()
 		UpdateLoadedArea();
 		if (settings.ColdRegionsOnly)
 			UpdateColdMap();
+	}
+
+	// (44i) With the debug map on, log the region diagnostics when the player's cell changes (at most
+	// every two seconds; a cell entered within that time is logged once the two seconds are up).
+	if (loaded && status.exterior && settings.ShowColdMap) {
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		auto* cell = player ? player->GetParentCell() : nullptr;
+		const auto now = std::chrono::steady_clock::now();
+		if (cell && cell != diagLogCell && now - diagLogTime >= std::chrono::seconds(2)) {
+			diagLogCell = cell;
+			diagLogTime = now;
+			UpdateRegionDiagnostics();
+			logger::info("[{}] Regions at the player (cell {:08X}):", GetName(), cell->GetFormID());
+			for (const auto& line : status.regionLines)
+				logger::info("[{}]   {}", GetName(), line);
+		}
 	}
 
 	trailsWanted = TrailsActive() && status.exterior;
@@ -1818,7 +2132,37 @@ void DynamicSnow::DrawSettings()
 				"A region counts as cold when at least this share of the weathers it can have are snow weathers\n"
 				"(read from the region's weather list, or the worldspace's climate where there is none).\n"
 				"Used by Snow Only in Cold Regions and by the cold-region choices of When It Builds Up.");
+
+		// (44i) Snow line and the looser snow test.
+		{
+			const std::string lineFormat = settings.SnowLineHeight > 0.0f ?
+			                                   std::format("%.0f units ({:.0f} m)", settings.SnowLineHeight * 0.01428f) :
+			                                   std::string("off");
+			ImGui::SliderFloat("Snow Line Height", &settings.SnowLineHeight, 0.0f, 40000.0f, lineFormat.c_str());
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted(
+					"Above this height everything counts as cold, whatever region it is in: mountain tops such as\n"
+					"High Hrothgar and the Throat of the World get snow even when their region is not a cold one.\n"
+					"0 = off. Your own height is shown below (\"Your height\"); Whiterun is about -3500, Riften about 9800.");
+			ImGui::BeginDisabled(settings.SnowLineHeight <= 0.0f);
+			const std::string fadeFormat = std::format("%.0f units ({:.0f} m)", settings.SnowLineFade * 0.01428f);
+			ImGui::SliderFloat("Snow Line Fade", &settings.SnowLineFade, 500.0f, 16000.0f, fadeFormat.c_str());
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("How far below the snow line the snow starts to appear (none there, full at the line).");
+			ImGui::EndDisabled();
+			settings.SnowLineHeight = std::max(settings.SnowLineHeight, 0.0f);
+			settings.SnowLineFade = std::max(settings.SnowLineFade, 1.0f);
+		}
 		ImGui::EndDisabled();
+		{
+			if (ImGui::Checkbox("Count Snow by Precipitation Particles", &settings.ParticleSnowTest))
+				coldCacheCell = nullptr;  // every region's share changes; the cold map rebuilds itself
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted(
+					"Off (default): a weather counts as snow only when it is classified as a snow weather.\n"
+					"On: also when its falling particles are snow (particle type or a snow particle texture),\n"
+					"for weather mods whose snowstorms are not classified as snow. Changes which regions are cold.");
+		}
 
 		ImGui::SliderFloat("Accumulation Speed", &settings.AccumulationHours, 0.1f, 12.0f, "%.1f game hours to full", ImGuiSliderFlags_Logarithmic);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -1883,7 +2227,8 @@ void DynamicSnow::DrawSettings()
 													   "no snow");
 		ImGui::Text("Accumulated: %.0f%%   Snowfall: %.0f%%", status.amount * 100.0f, status.snowfall * 100.0f);
 		if (settings.Condition != static_cast<int>(SnowCondition::SnowWeather))
-			ImGui::Text("Region: %s (%s)", status.region.empty() ? "-" : status.region.c_str(), status.coldRegion ? "cold" : "not cold");
+			ImGui::Text("Region: %s (%s)", status.region.empty() ? "-" : status.region.c_str(),
+				!status.coldRegion ? "not cold" : status.aboveSnowLine ? "cold: above the snow line" : "cold");
 		if (AccumulationActive() && status.exterior) {
 			if (!settings.ColdRegionsOnly)
 				ImGui::TextDisabled("Cold map: off (same amount everywhere)");
@@ -1895,6 +2240,23 @@ void DynamicSnow::DrawSettings()
 			if (settings.NoLodSnow)
 				ImGui::TextDisabled("Near snow: %u x %u loaded cells, thins out %.0f..%.0f units from their centre",
 					status.gridsToLoad, status.gridsToLoad, status.fadeStart, status.fadeEnd);
+		}
+		// (44i) Height readout for tuning the snow line, and what decides "cold" here.
+		if (auto* player = RE::PlayerCharacter::GetSingleton(); player && status.exterior) {
+			const float z = player->GetPositionZ();
+			if (settings.SnowLineHeight > 0.0f)
+				ImGui::Text("Your height: %.0f (%.0f m), snow line: %.0f (snow here %.0f%%)", z, z * 0.01428f, settings.SnowLineHeight, SnowLineFactor(z) * 100.0f);
+			else
+				ImGui::Text("Your height: %.0f (%.0f m), snow line: off", z, z * 0.01428f);
+			if (ImGui::TreeNodeEx("Regions Here (diagnostics)")) {
+				auto* cell = player->GetParentCell();
+				if (cell != diagCell || std::chrono::steady_clock::now() - diagTime >= std::chrono::seconds(1))
+					UpdateRegionDiagnostics();
+				for (const auto& line : status.regionLines)
+					ImGui::TextUnformatted(line.c_str());
+				ImGui::TextDisabled("With Show Cold-Region Map (Debug) on, this is also written to the log whenever you enter a new cell.");
+				ImGui::TreePop();
+			}
 		}
 		ImGui::TreePop();
 	}
@@ -2004,6 +2366,11 @@ void DynamicSnow::LoadSettings(json& o_json)
 	settings = o_json;
 	settings.Condition = std::clamp(settings.Condition, 0, static_cast<int>(SnowCondition::Count) - 1);
 	settings.TrailResolution = std::clamp(settings.TrailResolution, 0, 2);
+	if (!std::isfinite(settings.SnowLineHeight) || settings.SnowLineHeight < 0.0f)
+		settings.SnowLineHeight = 0.0f;
+	if (!std::isfinite(settings.SnowLineFade))
+		settings.SnowLineFade = 4000.0f;
+	settings.SnowLineFade = std::clamp(settings.SnowLineFade, 1.0f, 100000.0f);
 	coldCacheCell = nullptr;
 }
 

@@ -686,7 +686,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	{
 		float3 snowPositionWS = input.WorldPosition.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz;
 		// (44h) Local amount: cold-region mask and the fade towards the loaded cells' edge.
-		const float grassSnowAmount = SharedData::dynamicSnowSettings.Amount * DynamicSnow::AmountScale(snowPositionWS.xy, false);
+		const float grassSnowAmount = SharedData::dynamicSnowSettings.Amount * DynamicSnow::AmountScale(snowPositionWS, false);
 		[branch] if (grassSnowAmount > 0.0)
 			grassSnow = DynamicSnow::GetGrassCoverage(snowPositionWS, saturate(input.VertexNormal.w), normal.z, grassSnowAmount);
 #				if defined(SKYLIGHTING)

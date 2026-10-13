@@ -57,34 +57,42 @@ namespace DynamicSnow
 	Texture2D<float> SnowColdMask : register(t102);
 #endif
 
-	// (44h) Bilinear cold-region mask at a world XY (manual, from four loads: no sampler slot needed).
+	// (44h) Bilinear cold-region mask at a world position (manual, from four loads: no sampler slot needed).
 	// Outside the mask the edge texels repeat; the mask has a margin, so they hold the "no region" value.
-	float ColdMask(float2 positionXY)
+	// (44i) Above the snow line everything is cold: max(region mask, smoothstep(SnowLineStart, SnowLineEnd, z)).
+	// The snow line off puts both far above any terrain, so it adds nothing.
+	float ColdMask(float3 positionWS)
 	{
 #if defined(PSHADER)
 		const SharedData::DynamicSnowMapData m = SharedData::dynamicSnowMapData;
-		float2 t = (positionXY - m.MaskOrigin) * m.MaskInvTexelSize - 0.5;
-		float2 tf = floor(t);
-		float2 f = t - tf;
-		int2 hi = int2(m.MaskSize) - 1;
-		int2 i0 = clamp(int2(tf), 0, hi);
-		int2 i1 = clamp(int2(tf) + 1, 0, hi);
-		float a = SnowColdMask.Load(int3(i0.x, i0.y, 0));
-		float b = SnowColdMask.Load(int3(i1.x, i0.y, 0));
-		float c = SnowColdMask.Load(int3(i0.x, i1.y, 0));
-		float d = SnowColdMask.Load(int3(i1.x, i1.y, 0));
-		return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+		const float snowLine = smoothstep(m.SnowLineStart, m.SnowLineEnd, positionWS.z);
+		float mask = 1.0;
+		[branch] if (snowLine < 1.0)
+		{
+			float2 t = (positionWS.xy - m.MaskOrigin) * m.MaskInvTexelSize - 0.5;
+			float2 tf = floor(t);
+			float2 f = t - tf;
+			int2 hi = int2(m.MaskSize) - 1;
+			int2 i0 = clamp(int2(tf), 0, hi);
+			int2 i1 = clamp(int2(tf) + 1, 0, hi);
+			float a = SnowColdMask.Load(int3(i0.x, i0.y, 0));
+			float b = SnowColdMask.Load(int3(i1.x, i0.y, 0));
+			float c = SnowColdMask.Load(int3(i0.x, i1.y, 0));
+			float d = SnowColdMask.Load(int3(i1.x, i1.y, 0));
+			mask = lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+		}
+		return max(mask, snowLine);
 #else
 		return 1.0;
 #endif
 	}
 
 	/**
-	 * (44h) Local scale [0,1] of the global accumulation amount at a world XY.
+	 * (44h) Local scale [0,1] of the global accumulation amount at a world position (absolute).
 	 * @param lod the surface is distant LOD (LOD terrain / objects / billboard trees)
 	 * Neither FlagColdMap nor FlagNoLodSnow set: 1, the global amount everywhere (the 44g picture).
 	 */
-	float AmountScale(float2 positionXY, bool lod)
+	float AmountScale(float3 positionWS, bool lod)
 	{
 		const uint flags = SharedData::dynamicSnowSettings.Flags;
 		float scale = 1.0;
@@ -93,11 +101,11 @@ namespace DynamicSnow
 			if (lod)
 				return 0.0;
 			const SharedData::DynamicSnowMapData m = SharedData::dynamicSnowMapData;
-			float2 d = abs(positionXY - m.LoadedCenter);
+			float2 d = abs(positionWS.xy - m.LoadedCenter);
 			scale = 1.0 - smoothstep(m.FadeStart, m.FadeEnd, max(d.x, d.y));
 		}
 		[branch] if ((flags & FlagColdMap) && scale > 0.0)
-			scale *= ColdMask(positionXY);
+			scale *= ColdMask(positionWS);
 		return scale;
 	}
 

@@ -257,7 +257,7 @@ PS_OUTPUT main(PS_INPUT input)
 	{
 		float lodTreeSnowAmount = SharedData::dynamicSnowSettings.Amount;
 		[branch] if (SharedData::dynamicSnowSettings.Flags & DynamicSnow::FlagColdMap)
-			lodTreeSnowAmount *= DynamicSnow::ColdMask(input.WorldPosition.xy + FrameBuffer::CameraPosAdjust[eyeIndex].xy);
+			lodTreeSnowAmount *= DynamicSnow::ColdMask(input.WorldPosition.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz);
 		baseColor.xyz = lerp(baseColor.xyz, Color::ColorToLinear(SharedData::dynamicSnowSettings.SnowColor), DynamicSnow::GetLodTreeCoverage(input.SnowHeight, input.TexCoord.xy, lodTreeSnowAmount));
 	}
 #		endif
