@@ -36,6 +36,8 @@ struct ScreenSpacePointLightShadows : Feature
 		float MaxDistance = 2048.0f;
 		uint EnableSoftShadows = true;
 		float SoftShadowScale = 2.5f;
+		uint FixedMath = true;    ///< (45) step-count-independent thickness, self-hit guard, fractional soft shadows; false = legacy
+		uint StableNoise = true;  ///< (45) spatial IGN + per-frame R1 offset on the start jitter, half amplitude
 	} settings;
 
 	/// Mirrors SharedData::SSPLSSettings (package/Shaders/Common/SharedData.hlsli). Its size is pinned
