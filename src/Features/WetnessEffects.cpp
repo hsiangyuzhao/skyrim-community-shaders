@@ -364,7 +364,7 @@ void WetnessEffects::DrawSettings()
 		if (charWetOwnsAll || (charWetActive && charWet.IsOriginal())) {
 			ImGui::TextDisabled("Characters (skin, hair, gear): see the Character Wetness page (Characters).");
 			if (charWet.IsOriginal())
-				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Character Wetness Model is Original (pre-42c): the 42c character options are off.");
+				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Character Wetness Model is Legacy (pre-42c): the 42c character options are off.");
 			ImGui::TreePop();
 		} else {
 			if (charWetActive && !charWet.IsOriginal())

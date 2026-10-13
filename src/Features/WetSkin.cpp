@@ -103,6 +103,96 @@ namespace
 				ImGui::TextUnformatted(line);
 		}
 	}
+
+	// (44k) Look presets. Only the look parameters (sheen, patches, droplets, rivulets, hair and gear
+	// look); never the wetness sources, timers, the model, Extra Wetness, switches or drying multipliers.
+	// The preset in use is not saved: it is derived from the values ("Custom" when none matches).
+	template <class F>
+	void ForEachLookValue(WetSkin::Settings& a_s, F&& a_f)
+	{
+		for (float* v : { &a_s.RoughnessLow, &a_s.RoughnessFull, &a_s.FullWetnessStrength, &a_s.Darkening,
+				 &a_s.PatchContrast, &a_s.PatchSoftness,
+				 &a_s.DropletAmount, &a_s.DropletDensity, &a_s.DropletSize, &a_s.DropletSizeRandom, &a_s.FaceDroplets,
+				 &a_s.DropletNormal, &a_s.DropletRim, &a_s.DropletTrails, &a_s.RainDroplets,
+				 &a_s.StreakAmount, &a_s.StreakLength, &a_s.StreakWidth, &a_s.RivuletContrast2, &a_s.RivuletBetweenDulling, &a_s.FaceRivulets,
+				 &a_s.HairDarkening, &a_s.HairSharpness, &a_s.HairHighlightGain, &a_s.HairSecondaryLoss, &a_s.HairScatterLoss,
+				 &a_s.HairClumping, &a_s.HairClumpCount, &a_s.HairClumpShift, &a_s.HairGapDarkening,
+				 &a_s.GearSheen, &a_s.GearPatchContrast, &a_s.GearWicking,
+				 &a_s.LeatherDroplets, &a_s.LeatherRivulets, &a_s.MetalDroplets, &a_s.MetalRivulets })
+			a_f(*v);
+		// Gear classes: darkening, sheen, roughness floor (w = dry time is not a look value).
+		for (float4* c : { &a_s.GearCloth, &a_s.GearLeather, &a_s.GearMetal, &a_s.GearFur }) {
+			a_f(c->x);
+			a_f(c->y);
+			a_f(c->z);
+		}
+	}
+
+	WetSkin::Settings NaturalLook()
+	{
+		return {};  // the code defaults
+	}
+
+	WetSkin::Settings DrenchedLook()
+	{
+		WetSkin::Settings s{};
+		// Sheen: stronger and tighter (roughness stays >= 0.2: no mirror).
+		s.FullWetnessStrength = 2.2f;
+		s.RoughnessLow = 0.30f;
+		s.RoughnessFull = 0.20f;
+		s.Darkening = 0.9f;
+		// Patches: closer to an even soaked film.
+		s.PatchContrast = 0.2f;
+		// Droplets: more and larger.
+		s.DropletAmount = 1.0f;
+		s.DropletDensity = 0.6f;
+		s.DropletSize = 3.5f;
+		s.FaceDroplets = 0.6f;
+		s.DropletTrails = 0.7f;
+		s.RainDroplets = 0.6f;
+		// Rivulets: more visible.
+		s.StreakAmount = 0.8f;
+		s.StreakLength = 1.4f;
+		s.RivuletContrast2 = 0.7f;
+		s.RivuletBetweenDulling = 0.6f;
+		s.FaceRivulets = 1.0f;
+		// Hair: darker, tighter highlight, stronger clumps.
+		s.HairDarkening = 0.9f;
+		s.HairSharpness = 0.5f;
+		s.HairHighlightGain = 1.3f;
+		s.HairClumping = 0.85f;
+		s.HairGapDarkening = 0.45f;
+		// Gear: wetter-looking cloth and leather, more beads and trails.
+		s.GearSheen = 1.4f;
+		s.GearWicking = 6.0f;
+		s.GearCloth.x = 1.2f;
+		s.GearLeather.x = 0.7f;
+		s.GearLeather.y = 0.9f;
+		s.LeatherDroplets = 0.8f;
+		s.LeatherRivulets = 0.6f;
+		s.MetalRivulets = 0.8f;
+		return s;
+	}
+
+	bool LookMatches(const WetSkin::Settings& a_a, const WetSkin::Settings& a_b)
+	{
+		std::vector<float> va, vb;
+		ForEachLookValue(const_cast<WetSkin::Settings&>(a_a), [&](float& v) { va.push_back(v); });
+		ForEachLookValue(const_cast<WetSkin::Settings&>(a_b), [&](float& v) { vb.push_back(v); });
+		for (size_t i = 0; i < va.size(); ++i) {
+			if (std::abs(va[i] - vb[i]) > 1e-4f)
+				return false;
+		}
+		return true;
+	}
+
+	void ApplyLook(WetSkin::Settings& a_dst, const WetSkin::Settings& a_src)
+	{
+		std::vector<float> vals;
+		ForEachLookValue(const_cast<WetSkin::Settings&>(a_src), [&](float& v) { vals.push_back(v); });
+		size_t i = 0;
+		ForEachLookValue(a_dst, [&](float& v) { v = vals[i++]; });
+	}
 }
 
 void WetSkin::StashLegacySkinJson(const json& a_skin)
@@ -178,21 +268,43 @@ void WetSkin::DrawSettings()
 	if (!globals::features::wetnessEffects.loaded)
 		ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Hair and gear need Wetness Effects enabled (skin works without it).");
 
-	const char* models[] = { "New", "Original (pre-42c)" };
+	// (44k) Display names only: saved values stay 0 = New ("Advanced"), 1 = Original ("Legacy").
+	const char* models[] = { "Advanced", "Legacy" };
 	int model = IsOriginal() ? 1 : 0;
 	if (ImGui::Combo("Wetness Model", &model, models, IM_ARRAYSIZE(models)))
 		s.Model = static_cast<uint32_t>(model);
-	Tooltip({ "New: skin, hair and gear get wet together and dry at their own pace (cloth slowest). Soft sheen",
+	Tooltip({ "Advanced: skin, hair and gear get wet together and dry at their own pace (cloth slowest). Soft sheen",
 		"that gets strong when soaked (never a mirror), droplets, rivulets, darkening per material.",
-		"Original (pre-42c): every character exactly as before the wetness work (41b): skin, hair and gear.",
+		"Legacy (pre-42c): every character exactly as before the wetness work (41b): skin, hair and gear.",
 		"Only safety limits are kept." });
+
+	if (!IsOriginal()) {
+		// (44k) Look Preset: writes only the look values; "Custom" is shown (not selectable) when none matches.
+		const char* presets[] = { "Natural", "Drenched", "Custom" };
+		int current = LookMatches(s, NaturalLook()) ? 0 : LookMatches(s, DrenchedLook()) ? 1 : 2;
+		if (ImGui::BeginCombo("Look Preset", presets[current])) {
+			if (ImGui::Selectable("Natural", current == 0))
+				ApplyLook(s, NaturalLook());
+			Tooltip({ "Subtle, realistic wet skin, hair and gear (the default look)." });
+			if (ImGui::Selectable("Drenched", current == 1))
+				ApplyLook(s, DrenchedLook());
+			Tooltip({ "Clearly soaked, cinematic: stronger sheen, darker skin and hair, bigger droplets, more rivulets." });
+			ImGui::BeginDisabled();
+			ImGui::Selectable("Custom", current == 2);
+			ImGui::EndDisabled();
+			Tooltip({ "Shown when the look sliders below do not match a preset (you changed them by hand)." });
+			ImGui::EndCombo();
+		}
+		Tooltip({ "Sets only how wet characters look (sheen, patches, droplets, rivulets, hair and gear look).",
+			"Wetness sources, timers and Extra Wetness are not changed." });
+	}
 
 	ImGui::SliderFloat("Extra Wetness (manual)", &s.ExtraWetness, 0.0f, 2.0f, "%.2f");
 	Tooltip({ "Makes every character this wet (skin, hair and gear), on top of swimming, rain and sweat.",
-		"New uses 0-1 (1 = soaked); Original reads 0-2 as before (skin and hair only)." });
+		"Advanced uses 0-1 (1 = soaked); Legacy reads 0-2 as before (skin and hair only)." });
 
 	if (IsOriginal()) {
-		ImGui::SeparatorText("Original (pre-42c)");
+		ImGui::SeparatorText("Legacy (pre-42c)");
 		ImGui::SliderFloat("Wetness Film Strength", &s.FilmStrength, 0.0f, 3.0f, "%.2f");
 		Tooltip({ "Advanced Skin's water film, as before. Its energy is capped at 2 (no mirror-like reflections)." });
 		ImGui::SliderFloat("Wetness Perlin Noise Scale", &s.WetParams.x, 0.0f, 1024.0f, "%1.f");
@@ -216,7 +328,7 @@ void WetSkin::DrawSettings()
 	Tooltip({ "How wet sweat (low stamina, or Dynamic Wetness) makes skin. Hair and gear take their own share of it.",
 		"Thresholds are on the Advanced Skin page." });
 
-	if (ImGui::CollapsingHeader("Skin", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::CollapsingHeader("Skin")) {
 		ImGui::SeparatorText("Sheen");
 		ImGui::SliderFloat("Wet Look Strength at Full Wetness", &s.FullWetnessStrength, 0.0f, 2.5f, "%.2f");
 		Tooltip({ "How strong the water sheen is on soaked skin (gear uses it too). It grows faster than the wetness: barely there when damp,",
@@ -236,7 +348,7 @@ void WetSkin::DrawSettings()
 		ImGui::SliderFloat("Patch Scale", &s.WetParams.x, 1.0f, 1024.0f, "%1.f", ImGuiSliderFlags_Logarithmic);
 		ImGui::SliderFloat("Patch Lacunarity", &s.WetParams.y, 0.0f, 2.0f, "%.1f");
 		ImGui::SliderFloat("Patch Persistence", &s.WetParams.z, 0.0f, 20.0f, "%.2f");
-		Tooltip({ "The Perlin noise the patches come from (shared with the Original model and gear). Lacunarity 2 / Persistence 0.5 gives finer patches." });
+		Tooltip({ "The Perlin noise the patches come from (shared with the Legacy model and gear). Lacunarity 2 / Persistence 0.5 gives finer patches." });
 
 		ImGui::SeparatorText("Droplets");
 		ImGui::SliderFloat("Droplet Amount", &s.DropletAmount, 0.0f, 1.0f, "%.2f");
@@ -271,9 +383,9 @@ void WetSkin::DrawSettings()
 		Tooltip({ "How much rivulet the face gets compared with the body (1 = the same, as before 44e)." });
 	}
 
-	if (ImGui::CollapsingHeader("Hair", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::CollapsingHeader("Hair")) {
 		ImGui::Checkbox("Wet Hair", reinterpret_cast<bool*>(&s.HairEnabled));
-		Tooltip({ "Off: hair never gets wet (New model). Hair never gets a mirror-like water film either way:",
+		Tooltip({ "Off: hair never gets wet (Advanced model). Hair never gets a mirror-like water film either way:",
 			"its own highlight model gets wet, and what the reflections see of it stays as when dry." });
 		ImGui::BeginDisabled(!s.HairEnabled);
 		ImGui::SliderFloat("Hair Darkening", &s.HairDarkening, 0.0f, 1.5f, "%.2f");
@@ -301,9 +413,9 @@ void WetSkin::DrawSettings()
 		ImGui::EndDisabled();
 	}
 
-	if (ImGui::CollapsingHeader("Gear", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::CollapsingHeader("Gear")) {
 		ImGui::Checkbox("Wet Gear", reinterpret_cast<bool*>(&s.GearEnabled));
-		Tooltip({ "Off: armour, clothes and weapons never get wet (New model)." });
+		Tooltip({ "Off: armour, clothes and weapons never get wet (Advanced model)." });
 		ImGui::BeginDisabled(!s.GearEnabled);
 		const char* gearModels[] = { "New (per material)", "42c (as in 44b)" };
 		int gearModel = s.GearModel == 1 ? 1 : 0;
