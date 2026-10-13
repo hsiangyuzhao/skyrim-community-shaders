@@ -744,37 +744,35 @@ void Upscaling::DrawNeuralRenderingSettings()
 			if (ImGui::SliderInt("Style", &style, 0, 3, "%d", ImGuiSliderFlags_AlwaysClamp))
 				nr.style = static_cast<uint>(std::clamp(style, 0, 3));
 
-			ImGui::Checkbox("Auto Mask", &nr.useAutoMask);
-			ImGui::Checkbox("UI Correction", &nr.uiCorrection);
+			// (45a) Pinned in code, no longer shown (LoadSettings / PinNeuralRenderingOptions): Auto Mask
+			// on, UI Correction on, tuning at creation on, Allow with Frame Generation on, Log-Ratio
+			// residual, pad to the network grid, tone-matched 8-bit input, jitter-aware motion,
+			// Protect Sky off.
+			const bool hdrForcesBefore = HDROutput::IsOutputActive() || HDROutput::WillSceneBeHDR();
+			const bool before = nr.runBeforeUpscaling || hdrForcesBefore;
 
-			// (batch 38a) Placement, frame generation and cost.
-			ImGui::SeparatorText("Placement and cost");
-
-			ImGui::Checkbox("Allow with Frame Generation", &nr.allowWithFrameGeneration);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Lets Neural Rendering run while Frame Generation (DLSS-G, any multiplier) is on. It only processes the real frames; the generated ones are made from its result.");
-				ImGui::TextUnformatted("Off = Neural Rendering stops (and frees its video memory) whenever Frame Generation is on.");
-			}
-
-			ImGui::Checkbox("Run before upscaling", &nr.runBeforeUpscaling);
+			if (hdrForcesBefore)
+				ImGui::BeginDisabled();
+			ImGui::Checkbox(hdrForcesBefore ? "Run before upscaling (HDR: forced)" : "Run before upscaling", &nr.runBeforeUpscaling);
+			if (hdrForcesBefore)
+				ImGui::EndDisabled();
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("Off (default): runs on the finished image at screen resolution, just before the HUD.");
-				ImGui::TextUnformatted("On: runs on the internal resolution image (2560x1440 at Quality on a 4K screen) before DLSS upscales it, so it costs less. It sees the scene before colour grading; \"Tone-matched input\" below shows it the graded look instead.");
+				ImGui::TextUnformatted("On: runs on the internal resolution image (2560x1440 at Quality on a 4K screen) before DLSS upscales it, so it costs less. The model is shown the scene with the game's own exposure and colour grading applied.");
+				if (hdrForcesBefore)
+					ImGui::TextUnformatted("HDR output is on: always before upscaling (the after-upscaling model only knows SDR).");
 			}
-			// (batch 43)
-			if (HDROutput::IsOutputActive())
-				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "HDR output is on: Neural Rendering runs before upscaling with tone-matched input, whatever is set here (the after-upscaling model only knows SDR).");
 
 			// (batch 42a) 100 / 67 / 50 / 40, one value per placement (after upscaling defaults to 50).
 			{
 				const char* modelResolutions[] = { "100%", "67%", "50%", "40%" };
 				constexpr uint kModelPercents[] = { 100u, 67u, 50u, 40u };
-				uint& percent = nr.runBeforeUpscaling ? nr.modelResolutionPercent : nr.modelResolutionPercentAfter;
+				uint& percent = before ? nr.modelResolutionPercent : nr.modelResolutionPercentAfter;
 				int modelIndex = 0;
 				for (int i = 0; i < static_cast<int>(std::size(kModelPercents)); ++i)
 					if (percent == kModelPercents[i] || (percent == 75u && kModelPercents[i] == 67u))
 						modelIndex = i;
-				if (ImGui::Combo(nr.runBeforeUpscaling ? "Model Resolution (before upscaling)" : "Model Resolution (after upscaling)",
+				if (ImGui::Combo(before ? "Model Resolution (before upscaling)" : "Model Resolution (after upscaling)",
 						&modelIndex, modelResolutions, IM_ARRAYSIZE(modelResolutions)))
 					percent = kModelPercents[std::clamp(modelIndex, 0, static_cast<int>(std::size(kModelPercents)) - 1)];
 				if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -785,77 +783,15 @@ void Upscaling::DrawNeuralRenderingSettings()
 				}
 			}
 
-			{
-				const char* residualModes[] = { "Additive (41b)", "Log-Ratio Split" };
-				int residualIndex = static_cast<int>(std::min(nr.residualMode, 1u));
-				if (ImGui::Combo("Residual Mode", &residualIndex, residualModes, IM_ARRAYSIZE(residualModes)))
-					nr.residualMode = static_cast<uint>(residualIndex);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted("How the model's changes are scaled back up when Model Resolution is below 100% (no effect at 100%).");
-					ImGui::TextUnformatted("Additive (41b): the change is added as a difference. Can leave bright or dark fringes at contrasty edges.");
-					ImGui::TextUnformatted("Log-Ratio Split (default): the change is a brightness ratio, split in two: the broad lighting is spread smoothly (following depth and the full-size picture), the fine detail is only added where the small and full-size pictures agree.");
-				}
-			}
+			if (before)
+				ImGui::TextDisabled("Curve from: %s", NeuralRendering::ToneSourceText());
 
-			ImGui::Checkbox("Protect Sky (experimental)", &nr.protectSky);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Gives the model a mask of the sky (and so the moons), meant to keep it from restyling them. NVIDIA has not documented the mask, so whether it works, and which way round, is what this test finds out.");
-				ImGui::TextUnformatted("Turning it on or off restarts the model (a short hitch).");
-			}
-			if (nr.protectSky) {
-				const char* polarities[] = { "Sky = 0", "Sky = 1" };
-				int polarity = nr.maskSkyValue ? 1 : 0;
-				if (ImGui::Combo("Mask Value Polarity", &polarity, polarities, IM_ARRAYSIZE(polarities)))
-					nr.maskSkyValue = polarity ? 1u : 0u;
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::TextUnformatted("Which value marks the sky in the mask (the rest gets the other). If the sky changes more instead of less, or nothing changes, try the other one.");
-			}
-
-			ImGui::Checkbox("Pad to network grid", &nr.padToNetworkGrid);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Gives the AI model a picture whose size is a multiple of 8 (the edge repeated, then cut off again).");
-				ImGui::TextUnformatted("DLSS Balanced renders at 2227x1253, the only preset that is not such a size, and it came out in a different tone. On = every preset behaves the same.");
-			}
-
-			if (nr.runBeforeUpscaling) {
-				ImGui::Checkbox("Tone-matched input (before upscaling)", &nr.toneMatchedInput);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted("On: the model is shown the scene with the game's own exposure and colour grading / tone curve applied, i.e. close to what the finished image looks like. Its changes are converted back exactly.");
-					ImGui::TextUnformatted("Off: a darker and flatter picture (plain Reinhard wrap) the model tends to brighten and re-colour.");
-				}
-				if (nr.toneMatchedInput)
-					ImGui::TextDisabled("Curve from: %s", NeuralRendering::ToneSourceText());
-
-				const char* precisions[] = { "8-bit", "10-bit", "16-bit float" };
-				int precisionIndex = static_cast<int>(std::min(nr.inputPrecision, 2u));
-				if (ImGui::Combo("Input Precision (before upscaling)", &precisionIndex, precisions, IM_ARRAYSIZE(precisions)))
-					nr.inputPrecision = static_cast<uint>(precisionIndex);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted("Format of the picture handed to the model. Higher = finer steps in bright and dark areas.");
-					ImGui::TextUnformatted("Experimental: if the picture breaks or Neural Rendering stops (see the log), go back to 8-bit.");
-				}
-			}
-
-			float& toneStrength = nr.runBeforeUpscaling ? nr.tonePreservationBefore : nr.tonePreservationAfter;
-			ImGui::SliderFloat(nr.runBeforeUpscaling ? "Tone Preservation (before upscaling)" : "Tone Preservation (after upscaling)",
+			float& toneStrength = before ? nr.tonePreservationBefore : nr.tonePreservationAfter;
+			ImGui::SliderFloat(before ? "Tone Preservation (before upscaling)" : "Tone Preservation (after upscaling)",
 				&toneStrength, 0.f, 1.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("Keeps the overall brightness and colour of each area as it was, while keeping the model's local lighting and detail.");
 				ImGui::TextUnformatted("0 = the model's result as is. 1 = large-scale tone fully locked to the input. Separate values for before and after upscaling (defaults 0.5 and 0).");
-			}
-
-			ImGui::Checkbox("Apply tuning at creation", &nr.tuningAtCreate);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("The model only reads Intensity, the three strengths, Style, Auto Mask and UI Correction when it starts up, so without this the sliders never reach it.");
-				ImGui::TextUnformatted("On: they are given at start-up, and a change restarts the model about half a second after you stop moving the slider.");
-			}
-
-			if (nr.runBeforeUpscaling) {
-				ImGui::Checkbox("Jitter-Aware Motion (before upscaling)", &nr.jitterAwareMotion);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::TextUnformatted("Before upscaling the image still shakes by a fraction of a pixel every frame (DLSS needs that). On: the model is told about the shake, so it does not smear it away.");
-					ImGui::TextUnformatted("Compare on/off only if the image looks softer or shimmers with Run before upscaling on.");
-				}
 			}
 
 			{
@@ -908,11 +844,31 @@ void Upscaling::SaveSettings(json& o_json)
 	}
 }
 
+namespace
+{
+	// (45a) Neural Rendering options taken off the page and pinned. Their JSON keys still load (and
+	// are saved with these values); the code paths that read them are unchanged.
+	void PinNeuralRenderingOptions(Upscaling::NeuralRenderingSettings& a_nr)
+	{
+		a_nr.useAutoMask = true;
+		a_nr.uiCorrection = true;
+		a_nr.tuningAtCreate = true;  // so Intensity / strengths / Style actually reach the model
+		a_nr.allowWithFrameGeneration = true;  // T0: must coexist with frame generation
+		a_nr.residualMode = 1;  // Log-Ratio Split
+		a_nr.padToNetworkGrid = true;
+		a_nr.toneMatchedInput = true;
+		a_nr.inputPrecision = 0;  // 8-bit
+		a_nr.jitterAwareMotion = true;
+		a_nr.protectSky = false;
+	}
+}
+
 void Upscaling::LoadSettings(json& o_json)
 {
 	// (44a) HDR Output is its own feature now; 43b saved its settings here (hdrOutput).
 	HDROutput::StashLegacyUpscalingJson(o_json);
 	settings = o_json;
+	PinNeuralRenderingOptions(settings.neuralRendering);
 
 	// (45a) Sharpening method. A profile from before 45a has only sharpnessDLSS (NIS): 0 meant off,
 	// anything else NIS, which stays available as the legacy choice.
@@ -979,6 +935,7 @@ void Upscaling::LoadSettings(json& o_json)
 void Upscaling::RestoreDefaultSettings()
 {
 	settings = {};
+	PinNeuralRenderingOptions(settings.neuralRendering);
 }
 
 void Upscaling::DataLoaded()

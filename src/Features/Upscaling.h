@@ -133,7 +133,7 @@ public:
 		float skinStructureStrength = 0.9f;
 		uint style = 3;
 		bool useAutoMask = true;
-		bool uiCorrection = false;
+		bool uiCorrection = true;  // (45a) pinned on
 		// (batch 38a) The four below only act while Advanced > Batch 38 is on; off restores 37c.
 		// Run alongside frame generation (DLSS-G or FSR 3). 37c blocked the pass outright.
 		bool allowWithFrameGeneration = true;
