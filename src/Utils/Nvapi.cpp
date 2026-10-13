@@ -90,6 +90,8 @@ namespace Util::Nvapi
 		}
 
 		Settings settings;
+		/// Saved with the settings. 1 = 45d (master switch default off, see Load).
+		constexpr int kSettingsRevision = 1;
 
 		constexpr size_t kItemCount = static_cast<size_t>(Item::kCount);
 		/// Set by OnDeviceCreated (and DisableForSession); empty = available.
@@ -280,6 +282,7 @@ namespace Util::Nvapi
 	nlohmann::json Save()
 	{
 		return {
+			{ "Revision", kSettingsRevision },
 			{ "Enabled", settings.Enabled },
 			{ "WarpAtomics", settings.WarpAtomics },
 			{ "UavOverlap", settings.UavOverlap },
@@ -297,6 +300,15 @@ namespace Util::Nvapi
 				a_value = a_json[a_key].get<bool>();
 		};
 		read("Enabled", settings.Enabled);
+		// 45d: the master switch now defaults to off. Settings saved before that (no Revision, all
+		// from 45c with it on) are switched off once; from then on the saved choice is respected.
+		const bool current = a_json.contains("Revision") && a_json["Revision"].is_number_integer() &&
+		                     a_json["Revision"].get<int>() >= kSettingsRevision;
+		if (!current) {
+			if (settings.Enabled)
+				logger::info("[NVAPI] NVIDIA Driver Extensions switched off once (new default in 45d)");
+			settings.Enabled = false;
+		}
 		read("WarpAtomics", settings.WarpAtomics);
 		read("UavOverlap", settings.UavOverlap);
 		read("ShaderExtensions", settings.ShaderExtensions);

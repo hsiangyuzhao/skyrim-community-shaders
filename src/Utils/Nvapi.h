@@ -40,7 +40,7 @@ namespace Util::Nvapi
 
 	struct Settings
 	{
-		bool Enabled = true;  ///< "NVIDIA Driver Extensions" (master)
+		bool Enabled = false;  ///< "NVIDIA Driver Extensions" (master); off by default since 45d
 		bool WarpAtomics = true;
 		bool UavOverlap = true;
 		bool ShaderExtensions = true;
