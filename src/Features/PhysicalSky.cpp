@@ -56,11 +56,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	skyTrueSunHeight,
 	twilightLength,
 	skyModel,
-	fixSkyAlpha,
-	fixTrLutEdge,
-	fixApShadowDepth,
-	fixReflectionSky,
-	fixMultiScatter,
+	// (44h) removed fixSkyAlpha/fixTrLutEdge/fixApShadowDepth/fixReflectionSky/fixMultiScatter:
+	// now fixed on; old keys are ignored on load. Code paths kept for a possible rollback
+	// (specs/physsky-rollback-candidates.md).
 	adaptationStart,
 	adaptationEnd,
 	dayExposure,
@@ -756,32 +754,9 @@ void PhysicalSky::SettingsAtmosphere()
 				"On Earth, they are about 6360 km and 6420 km respectively.");
 	}
 
-	SettingsFixes();
-}
-
-void PhysicalSky::SettingsFixes()
-{
-	ImGui::SeparatorText("Fixes");
-	LegacyNote(IsLegacy());
-
-	ImGui::Checkbox("Opaque Sky", &settings.fixSkyAlpha);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Writes the physical sky fully opaque. Off: the vanilla sky dome's transparency near the\nhorizon lets what is behind it show through (possible seams or bands).");
-	ImGui::Checkbox("Transmittance Edge Fix", &settings.fixTrLutEdge);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Stops the sun-colour table from bleeding across its edge (odd colours at extreme angles,\npossibly a too-white sunset disk). Usually invisible.");
-	ImGui::Checkbox("Atmosphere Shadow Depth Fix", &settings.fixApShadowDepth);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("With DLSS Quality (not DLAA) the shadows inside distant haze and fog were offset from the\nmountains casting them. This reads the right depth. No change under DLAA.");
-	ImGui::Checkbox("Reflected Sky Fix", &settings.fixReflectionSky);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Removes random dark patches from the sky seen in reflections (environment cubemap).\nUses the cloud shadows there instead of the main view's haze shadow.");
-	ImGui::Checkbox("Multiple Scattering Fix (changes sky colour)", &settings.fixMultiScatter);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"The sky's multiple-scattering table only looked at half the sky. On: the full sky, as upstream.\n"
-			"Changes overall sky brightness and colour (usually the side away from the sun gets a little\n"
-			"brighter, the sun side a little darker). Off by default: compare and decide.");
+	// (44h) removed the "Fixes" section (Opaque Sky, Transmittance Edge Fix, Atmosphere Shadow
+	// Depth Fix, Reflected Sky Fix, Multiple Scattering Fix): now fixed on; code paths kept for a
+	// possible rollback (specs/physsky-rollback-candidates.md).
 }
 
 void PhysicalSky::SettingsClouds()
@@ -1232,6 +1207,15 @@ bool PhysicalSky::UseLegacyPaths() const
 void PhysicalSky::UpdateEffective()
 {
 	effective = settings;
+	// (44h) The five atmosphere fixes are no longer user settings: pinned on here so nothing that
+	// copies or loads `settings` can turn them off. Legacy (36f) below still sets them off (and
+	// UseLegacyPaths() skips the ext flags anyway). Code paths kept for a possible rollback
+	// (specs/physsky-rollback-candidates.md).
+	effective.fixSkyAlpha = true;
+	effective.fixTrLutEdge = true;
+	effective.fixApShadowDepth = true;
+	effective.fixReflectionSky = true;
+	effective.fixMultiScatter = true;
 	if (!IsLegacy())
 		return;
 
