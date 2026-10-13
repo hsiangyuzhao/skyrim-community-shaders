@@ -35,8 +35,8 @@
  *   billboard trees (DistantTree), each with its own switch and strength.
  * - Footprints: shaped prints from the installed footprint mods' height maps (loaded from the
  *   game's data at first use, never shipped), oriented by the foot, with a rim; the trail map
- *   stores signed height (dent / rim). With the Footprints mod loaded, snowy ground and mud are
- *   left to its decals by default. Ragdolls and loose objects carve trenches from their Havok
+ *   stores signed height (dent / rim). (44h) The Footprints mod is no longer deferred to.
+ *   Ragdolls and loose objects carve trenches from their Havok
  *   shapes (after community-shaders PR #2659).
 
  */
@@ -113,41 +113,21 @@ public:
 		float MudStrength = 0.6f;
 
 		// ---- (batch 39c) ----
-		/// Coverage from the geometry slope on a soft ramp (SlopeStart..SlopeFull); the normal map only
-		/// shapes partial cover, and full cover hides the material's relief. Off = 39b (NormalThreshold).
-		/// (44f) Turned on once for configurations saved before 44f (see LoadSettings).
-		bool SlopeCoverage = true;
-		float SlopeStart = 0.3f;   ///< up-facing (normal.z) where snow starts to hold, about 73 degrees
-		float SlopeFull = 0.55f;   ///< ... and where it holds fully, about 57 degrees
+		// (44h) Removed after the user's review, now fixed; their old keys are ignored: SlopeCoverage
+		// ("Even Cover on Roofs and Slopes", off: coverage is the 39b NormalThreshold rule) with
+		// SlopeStart / SlopeFull / SteepCover / SnowSmoothing, the one-time "EvenCoverOn44f" migration
+		// marker, YieldToFootprintsMod (off: our prints everywhere, Footprints.esp no longer looked up),
+		// TrailTimeStamps (on) and TrailPauseWhenNoSnow (on).
 		bool SnowOnTrees = true;   ///< animated trees, bushes, ferns (Lighting TREE_ANIM)
 		float TreeCoverage = 0.8f;
 		bool SnowOnGrass = true;
 		float GrassCoverage = 0.9f;
 		bool SnowOnLodTrees = true;  ///< distant billboard trees
 		float LodTreeCoverage = 0.5f;
-		/// With the Footprints mod (Footprints.esp) loaded: leave snowy ground and mud to its decals
-		/// and print only in built-up snow, so the two never double up.
-		bool YieldToFootprintsMod = true;
 		/// Ragdolls being dragged or sliding and loose objects moving through snow carve trenches
 		/// (Havok collision shapes, after community-shaders PR #2659).
 		bool BodyAndObjectTrails = true;
 		float TrailRim = 0.35f;  ///< pushed-up rim around a print, relative to its depth
-
-		// ---- (44e) ----
-		/// Each texel remembers when it was printed and the refill is worked out when it is drawn: no
-		/// whole-map refill pass (the periodic spike at 4096). Off = the 44d refill pass, for A/B.
-		bool TrailTimeStamps = true;
-		/// Skip print upkeep (stamps, sweep) while no snow is near: no snowy ground around the player,
-		/// no built-up snow, no snowfall, mud prints off.
-		bool TrailPauseWhenNoSnow = true;
-
-		// ---- (40e) ----
-		/// Even Cover: how far snow flattens the material's relief (normal map, parallax self-shadow,
-		/// and how much less the texture's grooves hold). 0 = the relief shows fully, 1 = 39c (flat).
-		float SnowSmoothing = 0.2f;
-		/// Even Cover: cover on roofs and slopes (steeper than about 37 degrees, rising to full by 23).
-		/// 1 = 39c (everything flatter than Full Cover From is fully white).
-		float SteepCover = 0.8f;
 
 		// ---- Debug ----
 		bool OverrideAmount = false;
@@ -257,8 +237,6 @@ public:
 		// (batch 39c)
 		uint32_t shapesLoaded = 0;       ///< print shapes found in the installed footprint mods
 		std::string shapeSource;         ///< where they came from
-		bool footprintsMod = false;      ///< Footprints.esp is loaded
-		bool yieldingToMod = false;      ///< our prints are limited to built-up snow this frame
 		uint32_t bodyStamps = 0;         ///< trench stamps from bodies and objects last frame
 	} status;
 
@@ -355,7 +333,6 @@ private:
 	void GatherBodyAndObjectStamps(const RE::NiPoint3& a_center, std::vector<RE::Actor*>& a_deadActors);
 	static PrintKind ClassifyRace(RE::Actor* a_actor, bool a_humanoid);
 	void LoadPrintShapes();
-	void UpdateFootprintsModState();
 	void UpdateTrailMap();
 	bool EnsureTrailResources();
 	void ReleaseTrailResources();
@@ -389,8 +366,6 @@ private:
 	uint32_t shapeCount = 0;
 	winrt::com_ptr<ID3D11ShaderResourceView> shapeSRV;
 	winrt::com_ptr<ID3D11SamplerState> shapeSampler;
-	bool footprintsModChecked = false;
-	bool footprintsModLoaded = false;
 	// (batch 39c) Body and object trails: last position per collision shape, key = formID << 16 | shape
 	std::unordered_map<uint64_t, RE::NiPoint3> bodyPrevPositions;
 	std::unordered_map<uint64_t, RE::NiPoint3> bodyCurPositions;

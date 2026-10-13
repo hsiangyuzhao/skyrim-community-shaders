@@ -36,29 +36,21 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	TrailRefillSeconds,
 	TrailDarken,
 	MudStrength,
-	SlopeCoverage,
-	SlopeStart,
-	SlopeFull,
 	SnowOnTrees,
 	TreeCoverage,
 	SnowOnGrass,
 	GrassCoverage,
 	SnowOnLodTrees,
 	LodTreeCoverage,
-	YieldToFootprintsMod,
 	BodyAndObjectTrails,
 	TrailRim,
-	SnowSmoothing,
-	SteepCover,
 	OverrideAmount,
-	AmountOverride,
-	TrailTimeStamps,
-	TrailPauseWhenNoSnow)
+	AmountOverride)
 
 namespace
 {
-	/// (44f) Present once Even Cover has been switched on for an older configuration.
-	constexpr const char* kEvenCoverMigrationKey = "EvenCoverOn44f";
+	// (44h) The 44f "EvenCoverOn44f" migration (Even Cover switched on once) is gone with Even Cover
+	// itself: coverage is always the NormalThreshold rule now, whatever the saved file says.
 
 	constexpr const char* kConditionNames[] = {
 		"Snow weather (any region)",
@@ -264,9 +256,6 @@ void DynamicSnow::UpdateFrameState()
 	if (globals::game::ui && !globals::game::ui->GameIsPaused())
 		trailClock += RE::GetSecondsSinceLastFrame();
 
-	UpdateFootprintsModState();
-	status.yieldingToMod = settings.YieldToFootprintsMod && footprintsModLoaded;
-
 	{
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		auto* cell = player ? player->GetParentCell() : nullptr;
@@ -321,9 +310,7 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 		data.Flags |= FlagAccumulation;
 		if (settings.SnowOnCharacters)
 			data.Flags |= FlagSnowOnCharacters;
-		// (batch 39c)
-		if (settings.SlopeCoverage)
-			data.Flags |= FlagCoverageSlope;
+		// (batch 39c) (44h) FlagCoverageSlope (Even Cover) is never set: NormalThreshold decides coverage.
 		if (settings.SnowOnTrees)
 			data.Flags |= FlagTrees;
 		if (settings.SnowOnGrass)
@@ -334,16 +321,14 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 
 	// Prints are drawn only once the map holds this window's content (cleared at least once
 	// by a Prepass); the first frame after enabling simply has none.
-	// (batch 39c) With the Footprints mod loaded, its decals own snowy ground and mud (it picks
-	// them from the ground's material); ours stay in built-up snow, so the two never double up.
-	const bool yielding = status.yieldingToMod;
+	// (44h) No longer limited to built-up snow when the Footprints mod is loaded.
 	if (trailsWanted && trailContentValid && trailSRV) {
 		data.Flags |= FlagTrails;
-		if (settings.TrailsOnSnow && !yielding)
+		if (settings.TrailsOnSnow)
 			data.Flags |= FlagTrailsOnSnow;
 		if (settings.TrailsOnAccumulated)
 			data.Flags |= FlagTrailsOnAccumulated;
-		if (settings.MudTrails && !yielding)
+		if (settings.MudTrails)
 			data.Flags |= FlagMudTrails;
 		if (trailContentTimeStamped) {
 			data.Flags |= FlagTrailTimeStamps;
@@ -365,16 +350,17 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 	data.TrailMudStrength = std::clamp(settings.MudStrength, 0.0f, 1.0f);
 	data.TrailEdgeFade = static_cast<float>(trailMapSize / 16);
 
-	// (batch 39c)
-	data.SlopeStart = std::clamp(settings.SlopeStart, 0.0f, 0.95f);
-	data.SlopeFull = std::clamp(settings.SlopeFull, data.SlopeStart + 0.02f, 1.0f);
+	// (batch 39c) (44h) SlopeStart / SlopeFull / SnowSmoothing / SteepCover are read only under
+	// FlagCoverageSlope, which is never set now; their old defaults are written so the layout stays.
+	data.SlopeStart = 0.3f;
+	data.SlopeFull = 0.55f;
 	data.TreeCoverage = std::clamp(settings.TreeCoverage, 0.0f, 1.0f);
 	data.GrassCoverage = std::clamp(settings.GrassCoverage, 0.0f, 1.0f);
 	data.LodTreeCoverage = std::clamp(settings.LodTreeCoverage, 0.0f, 1.0f);
 	data.TrailRim = std::clamp(settings.TrailRim, 0.0f, 1.0f);
 	// (40e)
-	data.SnowSmoothing = std::clamp(settings.SnowSmoothing, 0.0f, 1.0f);
-	data.SteepCover = std::clamp(settings.SteepCover, 0.0f, 1.0f);
+	data.SnowSmoothing = 0.2f;
+	data.SteepCover = 0.8f;
 
 	status.accumulationDrawn = (data.Flags & FlagAccumulation) != 0;
 	status.trailsDrawn = (data.Flags & FlagTrails) != 0;
@@ -656,19 +642,6 @@ namespace
 		}
 		return true;
 	}
-}
-
-void DynamicSnow::UpdateFootprintsModState()
-{
-	if (footprintsModChecked)
-		return;
-	auto* data = RE::TESDataHandler::GetSingleton();
-	if (!data)
-		return;
-	footprintsModChecked = true;
-	footprintsModLoaded = data->LookupLoadedModByName("Footprints.esp"sv) != nullptr || data->LookupLoadedLightModByName("Footprints.esp"sv) != nullptr;
-	status.footprintsMod = footprintsModLoaded;
-	logger::info("[{}] Footprints mod (Footprints.esp) {}", GetName(), footprintsModLoaded ? "loaded" : "not loaded");
 }
 
 DynamicSnow::PrintKind DynamicSnow::ClassifyRace(RE::Actor* a_actor, bool a_humanoid)
@@ -1207,8 +1180,10 @@ void DynamicSnow::UpdateTrailMap()
 		return;
 
 	// (44e) Encoding and refill clock. A change of either makes the stored texels meaningless: start over.
+	// (44h) Time stamps are always wanted; the 44d refill pass stays only as the fallback for when
+	// their compute shaders failed to compile.
 	const float refill = std::max(settings.TrailRefillSeconds, 1.0f);
-	const bool timeStamped = settings.TrailTimeStamps && stampTimeCS && sweepCS;
+	const bool timeStamped = stampTimeCS && sweepCS;
 	if (timeStamped != trailContentTimeStamped || (timeStamped && refill != trailClockRefill))
 		trailContentValid = false;
 	trailContentTimeStamped = timeStamped;
@@ -1216,7 +1191,7 @@ void DynamicSnow::UpdateTrailMap()
 
 	// (44e) Upkeep pauses while no snow is near. The window still scrolls (its strips are cleared), so
 	// nothing stale can show up later; a pause longer than a full refill starts the map over.
-	const bool upkeep = !settings.TrailPauseWhenNoSnow || SnowNearby();
+	const bool upkeep = SnowNearby();  // (44h) pausing is always on
 	if (!upkeep) {
 		if (!trailMaintenancePaused) {
 			trailMaintenancePaused = true;
@@ -1436,46 +1411,13 @@ void DynamicSnow::DrawSettings()
 		ImGui::SliderFloat("Max Coverage", &settings.MaxCoverage, 0.0f, 1.0f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted("How white a fully snowed-over surface gets. 1 = completely covered.");
-		ImGui::Checkbox("Even Cover on Roofs and Slopes", &settings.SlopeCoverage);
+		// (44h) "Even Cover on Roofs and Slopes" and its four sliders removed: always the Normal Threshold rule.
+		ImGui::SliderFloat("Normal Threshold", &settings.NormalThreshold, 0.0f, 0.95f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"On (default): how much snow a surface holds depends on its overall slope, with gentle fades,\n"
-				"so a lumpy thatch roof gets the same even cover as a flat one. Roofs and slopes get the\n"
-				"lighter Roof and Slope Cover, level ground full cover. The snow keeps the texture's bumps\n"
-				"(see Snow Smoothing).\n"
-				"Off: the older rule (a hard cut at Normal Threshold, half decided by the texture's bumps):\n"
-				"steep thatch roofs came out thin and streaky.");
-		if (settings.SlopeCoverage) {
-			auto degrees = [](float a_z) { return std::acos(std::clamp(a_z, 0.0f, 1.0f)) * 57.2958f; };
-			ImGui::SliderFloat("Snow Starts Holding At", &settings.SlopeStart, 0.0f, 0.9f, "%.2f");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Steepest surface that holds any snow: %.2f is about %.0f degrees from level.", settings.SlopeStart, degrees(settings.SlopeStart));
-			ImGui::SliderFloat("Full Cover From", &settings.SlopeFull, 0.05f, 1.0f, "%.2f");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text(
-					"Surfaces at least this flat get full cover: %.2f is about %.0f degrees from level.\n"
-					"Most roofs are 35-55 degrees.",
-					settings.SlopeFull, degrees(settings.SlopeFull));
-			settings.SlopeFull = std::max(settings.SlopeFull, settings.SlopeStart + 0.02f);
-			ImGui::SliderFloat("Roof and Slope Cover", &settings.SteepCover, 0.0f, 1.0f, "%.2f");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"How white roofs and slopes get (steeper than about 37 degrees; level ground is always full).\n"
-					"0.8 (default) is close to the older rule overall. 1 = 40d: every roof solid white.");
-			ImGui::SliderFloat("Snow Smoothing", &settings.SnowSmoothing, 0.0f, 1.0f, "%.2f");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"How much the snow evens out the texture's bumps (cobbles, planks, stones).\n"
-					"0.2 (default): the bumps, their shadows and the gaps between stones still show through.\n"
-					"0 = all of the relief shows. 1 = 40d: a flat white sheet.");
-		} else {
-			ImGui::SliderFloat("Normal Threshold", &settings.NormalThreshold, 0.0f, 0.95f, "%.2f");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text(
-					"How flat a surface must be to hold snow. %.2f is about %.0f degrees from level;\n"
-					"higher = only flatter surfaces get snow.",
-					settings.NormalThreshold, std::acos(std::clamp(settings.NormalThreshold, 0.0f, 1.0f)) * 57.2958f);
-		}
+			ImGui::Text(
+				"How flat a surface must be to hold snow. %.2f is about %.0f degrees from level;\n"
+				"higher = only flatter surfaces get snow.",
+				settings.NormalThreshold, std::acos(std::clamp(settings.NormalThreshold, 0.0f, 1.0f)) * 57.2958f);
 
 		ImGui::Checkbox("Snow on Trees and Bushes", &settings.SnowOnTrees);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -1561,57 +1503,40 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextDisabled("Print shapes: %u from %s", status.shapesLoaded, status.shapeSource.c_str());
 		else
 			ImGui::TextDisabled("Print shapes: no footprint textures found, oval prints");
-		ImGui::Checkbox("Leave Snowy Ground to the Footprints Mod", &settings.YieldToFootprintsMod);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Only matters when the Footprints mod (Footprints.esp) is loaded. It already puts its own prints on\n"
-				"snowy ground and mud, so on (default) ours are made only in built-up snow and the two never double up.\n"
-				"Off: ours everywhere set above as well - pick this if you switched the Footprints mod's prints off\n"
-				"in its MCM and want ours instead. Theirs are sharper close up; ours are real dents that fill back\n"
-				"in, work on built-up snow and for every nearby actor.");
-		ImGui::SameLine();
-		ImGui::TextDisabled(status.footprintsMod ? "(Footprints mod: loaded)" : "(Footprints mod: not loaded)");
+		// (44h) "Leave Snowy Ground to the Footprints Mod" removed: off, our prints go everywhere set above.
 		ImGui::Checkbox("Trenches from Bodies and Objects", &settings.BodyAndObjectTrails);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Bodies being dragged or sliding, and loose objects moving through snow, leave trenches\n"
 				"(from their collision shapes).");
-		ImGui::SliderFloat("Print Rim", &settings.TrailRim, 0.0f, 1.0f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("Height of the snow pushed up around a print, relative to its depth. 0 = no rim.");
 
-		ImGui::SliderFloat("Print Size", &settings.TrailSize, 0.5f, 2.0f, "%.2fx");
-		ImGui::SliderFloat("Print Depth", &settings.TrailDepth, 0.0f, 15.0f, "%.1f units");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("How deep a print looks (%.1f cm). Only shading: the ground itself does not move.",
-				settings.TrailDepth * 1.428f);
-		ImGui::SliderFloat("Refill Time", &settings.TrailRefillSeconds, 10.0f, 1200.0f, "%.0f s", ImGuiSliderFlags_Logarithmic);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("Real seconds for a print to fill back in completely.");
-		ImGui::SliderFloat("Darken", &settings.TrailDarken, 0.0f, 0.6f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("How much darker packed snow in a print is.");
-		ImGui::BeginDisabled(!settings.MudTrails);
-		ImGui::SliderFloat("Mud Strength", &settings.MudStrength, 0.0f, 1.0f, "%.2f");
-		ImGui::EndDisabled();
+		if (ImGui::TreeNodeEx("Print Look")) {
+			ImGui::SliderFloat("Print Rim", &settings.TrailRim, 0.0f, 1.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Height of the snow pushed up around a print, relative to its depth. 0 = no rim.");
+			ImGui::SliderFloat("Print Size", &settings.TrailSize, 0.5f, 2.0f, "%.2fx");
+			ImGui::SliderFloat("Print Depth", &settings.TrailDepth, 0.0f, 15.0f, "%.1f units");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How deep a print looks (%.1f cm). Only shading: the ground itself does not move.",
+					settings.TrailDepth * 1.428f);
+			ImGui::SliderFloat("Refill Time", &settings.TrailRefillSeconds, 10.0f, 1200.0f, "%.0f s", ImGuiSliderFlags_Logarithmic);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Real seconds for a print to fill back in completely.");
+			ImGui::SliderFloat("Darken", &settings.TrailDarken, 0.0f, 0.6f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("How much darker packed snow in a print is.");
+			ImGui::BeginDisabled(!settings.MudTrails);
+			ImGui::SliderFloat("Mud Strength", &settings.MudStrength, 0.0f, 1.0f, "%.2f");
+			ImGui::EndDisabled();
+			ImGui::TreePop();
+		}
 		const char* resolutions[] = { "1024 (4 units per texel, 4 MB)", "2048 (2 units per texel, 16 MB)", "4096 (1 unit per texel, 64 MB)" };
 		ImGui::Combo("Trail Map Detail", &settings.TrailResolution, resolutions, 3);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Detail of the footprint map around the player (always 58 m across). Changing it clears existing prints.\n"
 				"4096 gives the sharpest prints; it costs 64 MB of video memory and its refill pass touches 4x more memory.");
-		// (44e)
-		ImGui::Checkbox("Refill Without a Map Pass (44e)", &settings.TrailTimeStamps);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Each spot of the map remembers when it was stepped on, and the refill is worked out when it is drawn,\n"
-				"so the whole-map refill pass (a small regular spike, worst at 4096) is gone. Prints look and refill the same.\n"
-				"Off = the 44d refill pass, for comparison. Switching clears existing prints.");
-		ImGui::Checkbox("Pause When No Snow Is Near (44e)", &settings.TrailPauseWhenNoSnow);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"No print upkeep while the ground around you is not snow, there is no built-up snow and no snowfall\n"
-				"(mud prints keep it running). Turn off if prints go missing somewhere snowy.");
+		// (44h) "Refill Without a Map Pass (44e)" and "Pause When No Snow Is Near (44e)" removed: both always on.
 		ImGui::EndDisabled();
 
 		ImGui::Spacing();
@@ -1641,22 +1566,14 @@ void DynamicSnow::DrawSettings()
 void DynamicSnow::LoadSettings(json& o_json)
 {
 	settings = o_json;
-	// (44f) Even Cover was meant to be on (the default since 39c) but had been left off. Turn it on
-	// once for configurations saved before 44f; the marker is saved with the settings, so turning
-	// it off again afterwards sticks.
-	if (!o_json.contains(kEvenCoverMigrationKey))
-		settings.SlopeCoverage = true;
 	settings.Condition = std::clamp(settings.Condition, 0, static_cast<int>(SnowCondition::Count) - 1);
 	settings.TrailResolution = std::clamp(settings.TrailResolution, 0, 2);
-	settings.SlopeStart = std::clamp(settings.SlopeStart, 0.0f, 0.9f);
-	settings.SlopeFull = std::clamp(std::max(settings.SlopeFull, settings.SlopeStart + 0.02f), 0.05f, 1.0f);
 	coldCacheCell = nullptr;
 }
 
 void DynamicSnow::SaveSettings(json& o_json)
 {
 	o_json = settings;
-	o_json[kEvenCoverMigrationKey] = true;
 }
 
 void DynamicSnow::RestoreDefaultSettings()
