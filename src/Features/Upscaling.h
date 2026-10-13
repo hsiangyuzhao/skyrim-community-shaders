@@ -217,6 +217,13 @@ public:
 		// present 240. The value is therefore never divided by the multiplier here; only the
 		// "rendered" figure shown in the UI is. Measured at 2x only; >2x is still to be confirmed.
 		uint reflexFrameLimit = 0;
+		// (44f, A) Reflex latency markers where the work really is: SIMULATION_END and
+		// RENDERSUBMIT_START when the engine starts rendering the frame (Main::Update's render call,
+		// EngineTiming's probe), RENDERSUBMIT_END right before Present. Off = the 44e placement:
+		// SIMULATION_END after the whole Main::Update (which contains the render and Present), and the
+		// submit pair around the D3D12 copy only, so Reflex took the frame for CPU-bound and never
+		// slept. PRESENT_START / END stay around the real Present either way.
+		bool reflexMarkersAtRenderStart = false;
 
 		NeuralRenderingSettings neuralRendering;
 	};

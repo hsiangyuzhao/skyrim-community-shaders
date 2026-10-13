@@ -39,6 +39,7 @@
 #include "Utils/Game.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/EngineTiming.h"
 #include "Utils/FrameTrace.h"
 #include "Utils/Screenshot.h"
 #include "Utils/OcclusionDryRun.h"
@@ -4581,6 +4582,40 @@ void PerformanceOverlay::DrawCpuWaitSection()
 								   "a draw or a Map waits here, and that time shows up in whichever shader type happened to draw.");
 	}
 	ImGui::Text("Present wait %.2f ms | Reflex sleep %.2f ms", s.presentWaitMs, s.reflexSleepMs);
+	// (44f, A) Which Reflex marker placement runs, and what Reflex does with it.
+	{
+		const bool markers = globals::features::upscaling.settings.reflexMarkersAtRenderStart && Util::EngineTiming::ProbesInstalled();
+		const std::string latency = s.reflexLatencyMs > 0.0f ? std::format("{:.1f} ms", s.reflexLatencyMs) : std::string("n/a");
+		ImGui::Text("Reflex markers: %s | sleep %.2f ms | latency %s", markers ? "at render start (44f)" : "original", s.reflexSleepMs, latency.c_str());
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Upscaling > Latency (NVIDIA Reflex) > Reflex Markers at Render Start. Latency = Reflex's own report, game update start to GPU done\n"
+									   "(the monitor not included). With the markers at render start Reflex should sleep a few ms and the latency drop; F9 compares the two.");
+		}
+	}
+	// (44f, C) The engine's own CPU time, split (Util::EngineTiming).
+	if (s.engineValid) {
+		using Util::EngineTiming::Seg;
+		auto v = [&](Seg a_seg) { return s.engineMs[static_cast<int>(a_seg)]; };
+		auto p = [&](Seg a_seg) { return s.enginePeakMs[static_cast<int>(a_seg)]; };
+		ImGui::Text("Engine CPU, avg / peak ms:");
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("The main thread between two Presents, split by what the engine is doing. The parts add up to the frame time.\n"
+									   "Game update = AI, scripts, physics, animation and the rest of the game's own update. Render setup = rendering minus the\n"
+									   "named phases: finding what to draw (culling) and walking the scene. Peak = the highest frame, fading over about 2 s.\n"
+									   "The F7 trace has every frame, with the slowest engine step of each.");
+		}
+		ImGui::Text("  Game update %.1f / %.1f (input %.2f) | Render setup %.1f / %.1f", v(Seg::Logic), p(Seg::Logic), s.engineInputMs, v(Seg::RenderOther), p(Seg::RenderOther));
+		ImGui::Text("  Shadows %.1f / %.1f | Reflections %.1f / %.1f | World %.1f / %.1f", v(Seg::Shadows), p(Seg::Shadows), v(Seg::Reflections), p(Seg::Reflections), v(Seg::World), p(Seg::World));
+		ImGui::Text("  Image space %.1f | HUD & menus %.1f / %.1f | Our passes %.1f | Overlay %.1f", v(Seg::ImageSpace), v(Seg::UI), p(Seg::UI), v(Seg::OurPasses), v(Seg::Overlay));
+		ImGui::Text("  Present %.1f | After render %.1f | Outer loop %.1f | Reflex sleep %.1f", v(Seg::Present), v(Seg::Tail), v(Seg::Outer), v(Seg::Sleep));
+		if (s.engineTopCallMs > 0.0f)
+			ImGui::Text("  Last slow engine step (over 5 ms): #%u at +0x%X, %.1f ms", s.engineTopCallId, s.engineTopCallOffset, s.engineTopCallMs);
+		ImGui::Text("  Engine time step %.1f ms | device Create* calls %.2f ms", s.engineDtMs, s.createMs);
+	} else if (!Util::EngineTiming::ProbesInstalled()) {
+		ImGui::TextDisabled("Engine CPU split: SE 1.5.97 only");
+	}
 	ImGui::Text("Our per-draw hooks: %.2f ms = %.2f us/draw (%.0f draws, %.0f Lighting) | permutation CB %.2f ms", s.ownDrawHookMs + s.ownSetupGeometryMs,
 		s.ownPerDrawUs, s.draws, s.lightingDraws, s.permutationUploadMs);
 	if (ImGui::IsItemHovered()) {

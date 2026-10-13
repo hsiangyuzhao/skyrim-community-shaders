@@ -16,6 +16,7 @@
 #include "Utils/ABCompare.h"
 #include "Utils/Batch39Engine.h"
 #include "Utils/DenoiserTimers.h"
+#include "Utils/EngineTiming.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/OcclusionDryRun.h"
@@ -389,7 +390,12 @@ struct IDXGISwapChain_Present
 		Util::GpuFrameTimer::GetSingleton()->MarkPresentBegin();
 		Util::CpuPassTimers::GetSingleton()->BeginPresentWait();
 		const int64_t presentStart = Util::FrameTrace::Now();
-		HRESULT retval = func(This, SyncInterval, Flags);
+		HRESULT retval;
+		{
+			// (44f) Engine CPU split: the real Present is its own segment.
+			Util::EngineTiming::ScopedSeg presentSeg(Util::EngineTiming::Seg::Present);
+			retval = func(This, SyncInterval, Flags);
+		}
 		// (44e) Close this frame's CPU wait split / trace row (measurement only).
 		Util::FrameTrace::OnPresentEnd(presentStart, Util::GpuFrameTimer::GetSingleton()->CurrentFrameIndex());
 		Util::CpuPassTimers::GetSingleton()->EndPresentWait();
@@ -648,6 +654,8 @@ namespace Hooks
 			}
 
 			stl::detour_vfunc<23, ID3D11Device_CreateSamplerState>(globals::d3d::device);
+			// (44f) Device Create* timing for the frame trace (measurement only).
+			Util::EngineTiming::InstallDeviceHooks(globals::d3d::device);
 
 			globals::InstallD3DHooks(globals::d3d::context);
 			Util::FrameTrace::InstallContextHooks(globals::d3d::context);
@@ -937,6 +945,7 @@ namespace Hooks
 				{
 					const bool timed = Util::FrameTrace::Active();
 					const int64_t t0 = timed ? Util::FrameTrace::Now() : 0;
+					Util::EngineTiming::ScopedSeg sleepSeg(Util::EngineTiming::Seg::Sleep);
 					streamline.ReflexSleep();
 					if (timed)
 						Util::FrameTrace::OnReflexSleep(t0);
@@ -944,10 +953,15 @@ namespace Hooks
 				streamline.SetPCLMarker(sl::PCLMarker::eSimulationStart);
 			}
 			Util::FrameTrace::OnSimStart();
+			// (44f) Engine CPU split; also arms the (44f, A) Reflex markers at the render call.
+			Util::EngineTiming::OnUpdateBegin(frameTimingStarted);
 
 			func(a_this, a2);
 
-			if (frameTimingStarted) {
+			Util::EngineTiming::OnUpdateEnd();
+			// (44f, A) With "Reflex Markers at Render Start" SIMULATION_END already went out when the
+			// engine started rendering. Otherwise (switch off, or no render this update) the 44e place.
+			if (frameTimingStarted && !Util::EngineTiming::RenderStartMarked()) {
 				streamline.SetPCLMarker(sl::PCLMarker::eSimulationEnd);
 			}
 #ifdef TRACY_ENABLE
@@ -1143,6 +1157,8 @@ namespace Hooks
 		stl::write_thunk_call<CreateDepthStencil_Reflections>(REL::RelocationID(100458, 107175).address() + REL::Relocate(0xA59, 0xA59, 0xD13));
 
 		stl::write_thunk_call<Main_Update>(REL::RelocationID(35551, 36544).address() + REL::Relocate(0x11F, 0x160));
+		// (44f) Probes on the calls inside Main::Update (engine CPU split, Reflex render-start markers).
+		Util::EngineTiming::InstallUpdateProbes();
 
 		logger::info("Hooking BSImagespaceShader");
 		stl::detour_thunk<CSShadersSupport::BSImagespaceShader_DispatchComputeShader>(REL::RelocationID(100952, 107734));

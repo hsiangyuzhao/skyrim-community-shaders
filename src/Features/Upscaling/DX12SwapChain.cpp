@@ -1,4 +1,5 @@
 #include "DX12SwapChain.h"
+#include "Utils/EngineTiming.h"
 #include "Utils/FrameTrace.h"
 #include "Utils/Screenshot.h"
 
@@ -338,8 +339,11 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// than none: Reflex pairs submit and present against simulation to derive the latency it
 	// then paces from. PCL is pure measurement, so this costs nothing on the FSR path.
 	const bool markLatency = upscaling.streamline.pclFunctionsReady;
+	// (44f, A) With "Reflex Markers at Render Start", RENDERSUBMIT_START went out when the engine
+	// started rendering the frame; only RENDERSUBMIT_END is sent here, right before Present.
+	const bool submitStartedEarlier = Util::EngineTiming::RenderStartMarked();
 
-	if (markLatency)
+	if (markLatency && !submitStartedEarlier)
 		upscaling.streamline.SetPCLMarker(sl::PCLMarker::eRenderSubmitStart);
 
 	ID3D12CommandList* commandListsToExecute[] = { commandLists[frameIndex].get() };

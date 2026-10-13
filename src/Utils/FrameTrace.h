@@ -93,6 +93,18 @@ namespace Util::FrameTrace
 		float draws = 0.0f;           ///< draws seen by State::Draw
 		float lightingDraws = 0.0f;
 		float ownPerDrawUs = 0.0f;    ///< (own draw hook + own SetupGeometry) / draws
+		// (44f) Engine CPU split (Util::EngineTiming), smoothed and peak (decaying max).
+		bool engineValid = false;
+		float engineMs[13]{};
+		float enginePeakMs[13]{};
+		float engineInputMs = 0.0f;
+		uint32_t engineTopCallId = 0;     ///< slowest game-update call of the last frame over 5 ms
+		uint32_t engineTopCallOffset = 0;
+		float engineTopCallMs = 0.0f;
+		float engineDtMs = 0.0f;
+		float createMs = 0.0f;
+		// (44f, A) Reflex: newest reported latency (simulation start to GPU end), smoothed.
+		float reflexLatencyMs = -1.0f;
 	};
 	Smoothed GetSmoothed();
 

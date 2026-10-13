@@ -20,6 +20,7 @@
 
 #include "Features/ScreenSpaceRayTracing.h"
 #include "Features/SubsurfaceScattering.h"
+#include "Utils/EngineTiming.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/DisplayHDRInfo.h"
@@ -68,6 +69,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DLSSDPreset,
 	reflexMode,
 	reflexFrameLimit,
+	reflexMarkersAtRenderStart,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -721,6 +723,18 @@ void Upscaling::DrawSettings()
 				if (auto _tt = Util::HoverTooltipWrapper())
 					ImGui::TextUnformatted("DLSS-G needs Reflex, or input lag gets much worse. Your choice is kept and applies again once Frame Generation is off.");
 			}
+
+			// (44f, A)
+			ImGui::Checkbox("Reflex Markers at Render Start (44f)", &settings.reflexMarkersAtRenderStart);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Tells Reflex when the game really finishes its update and starts rendering, so Reflex can see the GPU is the limit and");
+				ImGui::TextUnformatted("let the CPU start the next frame later instead of waiting inside Present. Expected: 10-20 ms less input lag.");
+				ImGui::TextUnformatted("Risk: with less queued up, the game's own CPU hitches can show more. Off (default) = the old marker placement.");
+				if (!Util::EngineTiming::ProbesInstalled())
+					ImGui::TextUnformatted("Not available here: needs SE 1.5.97 (the probe in Main::Update is not installed).");
+			}
+			if (settings.reflexMarkersAtRenderStart && !Util::EngineTiming::ProbesInstalled())
+				ImGui::TextDisabled("(not available on this game version: old placement in use)");
 
 			int reflexFrameLimit = static_cast<int>(settings.reflexFrameLimit);
 			if (ImGui::SliderInt("Reflex Frame Limit", &reflexFrameLimit, 0, 240,

@@ -6,6 +6,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "Utils/Batch39Engine.h"
+#include "Utils/EngineTiming.h"
 #include "Utils/Game.h"
 #include "Utils/GpuTimers.h"
 
@@ -525,6 +526,8 @@ namespace Util
 
 	void GpuPhaseTimeline::Push(GpuScope a_scope)
 	{
+		// (44f) The engine CPU split follows the same scopes, whether or not this timeline records.
+		EngineTiming::OnPhasePush(static_cast<int>(a_scope));
 		if (!frameActive)
 			return;
 		if (depth >= kMaxDepth) {
@@ -538,6 +541,7 @@ namespace Util
 
 	void GpuPhaseTimeline::PushPhase(GpuScope a_scope, GpuPhase a_phase)
 	{
+		EngineTiming::OnPhasePush(static_cast<int>(a_scope));
 		if (!frameActive)
 			return;
 		if (depth >= kMaxDepth) {
@@ -576,6 +580,7 @@ namespace Util
 
 	void GpuPhaseTimeline::Pop(GpuScope a_scope)
 	{
+		EngineTiming::OnPhasePop(static_cast<int>(a_scope));
 		if (!frameActive)
 			return;
 		if (overflowDepth > 0) {

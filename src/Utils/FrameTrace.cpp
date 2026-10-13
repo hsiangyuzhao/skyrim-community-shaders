@@ -5,6 +5,7 @@
 #include "Menu.h"
 #include "State.h"
 #include "BuildLabel.h"
+#include "Utils/EngineTiming.h"
 
 #include <thread>
 
@@ -70,6 +71,7 @@ namespace Util::FrameTrace
 		int64_t g_lastPresentEnd = 0;
 
 		Smoothed g_smoothed;
+		uint32_t g_frameCounter = 0;
 
 		// ---- recorder ----
 		struct Row
@@ -100,6 +102,9 @@ namespace Util::FrameTrace
 			float gpuWorkMs = -1.0f;
 			float gpuElapsedMs = -1.0f;
 			uint32_t reflexFrame = UINT32_MAX;
+			// (44f) Engine CPU split, engine time step, device Create* calls.
+			EngineTiming::Frame engine;
+			bool reflexMarkersAtRenderStart = false;
 		};
 
 		struct ReflexTimes
@@ -146,6 +151,26 @@ namespace Util::FrameTrace
 			}
 		}
 
+		/// (44f, A) Newest complete Reflex report: simulation start to GPU end, for the overlay line.
+		void PollLatency()
+		{
+			auto& streamline = globals::features::upscaling.streamline;
+			if (!streamline.reflexFunctionsReady)
+				return;
+			sl::ReflexState state{};
+			if (!streamline.GetReflexState(state) || !state.latencyReportAvailable)
+				return;
+			const sl::ReflexReport* newest = nullptr;
+			for (const auto& r : state.frameReport)
+				if (r.simStartTime != 0 && r.gpuRenderEndTime > r.simStartTime && (!newest || r.frameID > newest->frameID))
+					newest = &r;
+			if (!newest)
+				return;
+			const float ms = static_cast<float>(static_cast<double>(newest->gpuRenderEndTime - newest->simStartTime) / 1000.0);
+			auto& s = g_smoothed.reflexLatencyMs;
+			s = s < 0.0f ? ms : s * 0.8f + ms * 0.2f;
+		}
+
 		void WriteCsv(std::vector<Row> a_rows, std::unordered_map<uint64_t, ReflexTimes> a_reflex)
 		{
 			try {
@@ -170,13 +195,31 @@ namespace Util::FrameTrace
 				out << "# cpu_busy = frame - present_wait - reflex_sleep (includes driver_*). gpu_* come from GPU timestamps (-1 = no sample).\n";
 				out << "# reflex_* in us relative to reflex_sim_start (-1 = no report). fg_presented = frames DLSS-G showed for this frame (0 = not generating).\n";
 				out << "# cpu_frame = simulation start (after Reflex sleep) to Present start: all CPU submission work, driver blocking included.\n";
+				out << "# eng_* (44f): the main thread from one Present end to the next, split into engine segments; they add up to frame_ms (-1 = probes not installed).\n";
+				out << "#   eng_logic = the game update (AI, scripts, physics, animation, ...); eng_top_call = Address Library ID@offset in Main::Update of its slowest call,\n";
+				out << "#   eng_calls_over_1ms = every such call over 1 ms (id@offset:ms;...). eng_render_other = rendering minus the named phases (culling, scene traversal).\n";
+				out << "# eng_dt_ms / eng_real_dt_ms = the engine's time step (BSTimer). dev_create_* = time inside D3D11 device Create* calls (main thread / others).\n";
+				out << "# reflex_markers = 1 when Reflex Markers at Render Start was on for that frame.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
 					   "first_seen_geometry,shader_miss_async,shader_miss_sync,cell_attach,cell_detach,cam_yaw_dps,cam_pitch_dps,player_speed,"
 					   "gpu_work_ms,gpu_elapsed_ms,fg_presented,grass_apply_ms,"
 					   "reflex_frame,reflex_sim_end,reflex_submit_start,reflex_submit_end,reflex_present_start,reflex_present_end,"
-					   "reflex_driver_start,reflex_driver_end,reflex_queue_start,reflex_queue_end,reflex_gpu_start,reflex_gpu_end,reflex_latency_ms\n";
+					   "reflex_driver_start,reflex_driver_end,reflex_queue_start,reflex_queue_end,reflex_gpu_start,reflex_gpu_end,reflex_latency_ms,"
+					   "reflex_markers";
+				for (int s = 0; s < static_cast<int>(EngineTiming::Seg::Count); ++s)
+					out << ",eng_" << EngineTiming::SegName(static_cast<EngineTiming::Seg>(s)) << "_ms";
+				out << ",eng_input_ms,eng_top_call,eng_top_call_ms,eng_calls_over_1ms,eng_dt_ms,eng_real_dt_ms,dev_create_ms,dev_creates,dev_create_other_ms,dev_creates_other\n";
+				auto engineColumns = [](const Row& a_row) {
+					const auto& e = a_row.engine;
+					std::string s = std::format(",{}", a_row.reflexMarkersAtRenderStart ? 1 : 0);
+					for (int i = 0; i < static_cast<int>(EngineTiming::Seg::Count); ++i)
+						s += e.valid ? std::format(",{:.3f}", e.ms[i]) : std::string(",-1");
+					s += e.valid ? std::format(",{:.3f},{}@{:X},{:.3f},{}", e.inputMs, e.topCallId, e.topCallOffset, e.topCallMs, e.callsOver1ms) : std::string(",-1,-1,-1,");
+					s += std::format(",{:.3f},{:.3f},{:.3f},{},{:.3f},{}\n", e.engineDtMs, e.engineRealDtMs, e.createMs, e.creates, e.createOtherMs, e.createsOther);
+					return s;
+				};
 				uint32_t index = 0;
 				for (const auto& r : a_rows) {
 					float driverTotal = 0.0f;
@@ -192,14 +235,15 @@ namespace Util::FrameTrace
 						r.gpuWorkMs, r.gpuElapsedMs, r.fgPresented, r.grassApplyMs);
 					auto it = r.reflexFrame != UINT32_MAX ? a_reflex.find(r.reflexFrame) : a_reflex.end();
 					if (it == a_reflex.end()) {
-						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1\n";
+						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r);
 						continue;
 					}
 					const auto& x = it->second;
 					auto rel = [&](uint64_t v) { return v >= x.simStart && v != 0 ? static_cast<int64_t>(v - x.simStart) : -1; };
-					out << std::format("{},{},{},{},{},{},{},{},{},{},{},{},{:.3f}\n", r.reflexFrame, rel(x.simEnd), rel(x.submitStart), rel(x.submitEnd), rel(x.presentStart),
+					out << std::format("{},{},{},{},{},{},{},{},{},{},{},{},{:.3f}", r.reflexFrame, rel(x.simEnd), rel(x.submitStart), rel(x.submitEnd), rel(x.presentStart),
 						rel(x.presentEnd), rel(x.driverStart), rel(x.driverEnd), rel(x.queueStart), rel(x.queueEnd), rel(x.gpuStart), rel(x.gpuEnd),
-						x.gpuEnd > x.simStart ? static_cast<double>(x.gpuEnd - x.simStart) / 1000.0 : -1.0);
+						x.gpuEnd > x.simStart ? static_cast<double>(x.gpuEnd - x.simStart) / 1000.0 : -1.0)
+						<< engineColumns(r);
 				}
 				out.close();
 				{
@@ -542,6 +586,9 @@ namespace Util::FrameTrace
 			}
 		}
 
+		// (44f) Close the engine CPU split for this frame (also resets it while inactive).
+		const auto engine = EngineTiming::TakeFrame(wasActive && g_recording);
+
 		if (wasActive && g_lastPresentEnd) {
 			const float frameMs = static_cast<float>(Ms(now - g_lastPresentEnd));
 			const float presentWait = static_cast<float>(Ms(now - a_presentStart));
@@ -626,7 +673,27 @@ namespace Util::FrameTrace
 				ema(s.draws, static_cast<float>(g_frame.draws));
 				ema(s.lightingDraws, static_cast<float>(g_frame.lightingDraws));
 				s.ownPerDrawUs = s.draws > 0.5f ? (s.ownDrawHookMs + s.ownSetupGeometryMs) * 1000.0f / s.draws : 0.0f;
+				// (44f) Engine CPU split: EMA, and a peak that decays over about two seconds.
+				s.engineValid = engine.valid;
+				if (engine.valid) {
+					static_assert(static_cast<int>(EngineTiming::Seg::Count) == 13);
+					for (int i = 0; i < static_cast<int>(EngineTiming::Seg::Count); ++i) {
+						ema(s.engineMs[i], engine.ms[i]);
+						s.enginePeakMs[i] = std::max(engine.ms[i], s.enginePeakMs[i] * 0.99f);
+					}
+					ema(s.engineInputMs, engine.inputMs);
+					if (engine.topCallMs > 5.0f) {
+						s.engineTopCallId = engine.topCallId;
+						s.engineTopCallOffset = engine.topCallOffset;
+						s.engineTopCallMs = engine.topCallMs;
+					}
+				}
+				if (engine.engineDtMs >= 0.0f)
+					ema(s.engineDtMs, engine.engineDtMs);
+				ema(s.createMs, engine.createMs);
 			}
+			if ((g_frameCounter++ & 15) == 0)
+				PollLatency();
 
 			if (g_recording) {
 				Row r = g_hasPendingRow ? g_pendingRow : Row{};
@@ -646,6 +713,8 @@ namespace Util::FrameTrace
 				r.grassApplyMs = g_frame.grassApplyMs;
 				r.gpuFrameIndex = a_gpuFrameIndex;
 				r.reflexFrame = globals::features::upscaling.streamline.frameTokenIndex;
+				r.engine = engine;
+				r.reflexMarkersAtRenderStart = globals::features::upscaling.settings.reflexMarkersAtRenderStart && EngineTiming::ProbesInstalled();
 				g_rows.push_back(r);
 				if ((++g_reflexPoll & 15) == 0)
 					PollReflex();
@@ -666,6 +735,8 @@ namespace Util::FrameTrace
 		if (g_recording || g_frequency == 0)
 			return;
 		g_rows.clear();
+		// (44f) "First seen" geometry counts from the start of every recording.
+		g_seenGeometry.clear();
 		g_rows.reserve(static_cast<size_t>(std::clamp(a_seconds, 1.0f, 600.0f) * 250.0f));
 		g_reflex.clear();
 		g_recordStart = Now();
@@ -721,6 +792,19 @@ namespace Util::FrameTrace
 		j["draws"] = s.draws;
 		j["lighting_draws"] = s.lightingDraws;
 		j["own_per_draw_us"] = s.ownPerDrawUs;
+		if (s.engineValid) {
+			nlohmann::json e;
+			for (int i = 0; i < static_cast<int>(EngineTiming::Seg::Count); ++i)
+				e[EngineTiming::SegName(static_cast<EngineTiming::Seg>(i))] = { { "ms", s.engineMs[i] }, { "peak_ms", s.enginePeakMs[i] } };
+			e["input_ms"] = s.engineInputMs;
+			e["last_slow_call"] = std::format("{}@{:X}", s.engineTopCallId, s.engineTopCallOffset);
+			e["last_slow_call_ms"] = s.engineTopCallMs;
+			j["engine_split"] = std::move(e);
+		}
+		j["engine_dt_ms"] = s.engineDtMs;
+		j["device_create_ms"] = s.createMs;
+		j["reflex_latency_ms"] = s.reflexLatencyMs;
+		j["reflex_markers_at_render_start"] = globals::features::upscaling.settings.reflexMarkersAtRenderStart;
 		return j;
 	}
 }
