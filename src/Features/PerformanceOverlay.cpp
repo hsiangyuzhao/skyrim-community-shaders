@@ -200,6 +200,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SectionShadows,
 	SectionCpuWait,
 	DriverWaitTiming,
+	EngineTimingProbes,
 	ScreenshotKey,
 	ScreenshotOnSave,
 	ScreenshotSaveHDR,
@@ -3762,6 +3763,14 @@ void PerformanceOverlay::DrawViewOptions()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted("Times every D3D11 draw, map and copy (two clock reads each) while the overlay is shown or a trace records,\n"
 								   "to show how long the CPU is stuck in the driver. Off = measured runs can be compared with unmeasured ones.");
+		// (44f)
+		ImGui::Checkbox("Engine Timing Probes (restart)", &settings.EngineTimingProbes);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Small hooks on the calls inside the game's main update, for the Engine CPU split and for Reflex Markers at Render Start.\n"
+								   "Takes effect after a restart. If the game crashes at startup, create an empty file EngineTimingOff.txt next to\n"
+								   "SettingsUser.json (SKSE\\Plugins\\CommunityShaders) to turn them off without the menu.");
+		ImGui::SameLine();
+		ImGui::TextDisabled("now: %s", Util::EngineTiming::ProbeStatus());
 		if (const auto f = Util::FrameTrace::LastFile(); !f.empty())
 			ImGui::TextDisabled("Last trace: %s", f.c_str());
 		if (const auto f = Util::Screenshot::LastFile(); !f.empty())
@@ -4584,9 +4593,13 @@ void PerformanceOverlay::DrawCpuWaitSection()
 	ImGui::Text("Present wait %.2f ms | Reflex sleep %.2f ms", s.presentWaitMs, s.reflexSleepMs);
 	// (44f, A) Which Reflex marker placement runs, and what Reflex does with it.
 	{
-		const bool markers = globals::features::upscaling.settings.reflexMarkersAtRenderStart && Util::EngineTiming::ProbesInstalled();
+		const bool wanted = globals::features::upscaling.settings.reflexMarkersAtRenderStart;
+		const bool markers = wanted && Util::EngineTiming::ProbesInstalled();
 		const std::string latency = s.reflexLatencyMs > 0.0f ? std::format("{:.1f} ms", s.reflexLatencyMs) : std::string("n/a");
-		ImGui::Text("Reflex markers: %s | sleep %.2f ms | latency %s", markers ? "at render start (44f)" : "original", s.reflexSleepMs, latency.c_str());
+		const std::string placement = markers ? std::string("at render start (44f)") :
+		                              wanted  ? std::format("original (probes {})", Util::EngineTiming::ProbeStatus()) :
+		                                        std::string("original");
+		ImGui::Text("Reflex markers: %s | sleep %.2f ms | latency %s", placement.c_str(), s.reflexSleepMs, latency.c_str());
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::TextUnformatted("Upscaling > Latency (NVIDIA Reflex) > Reflex Markers at Render Start. Latency = Reflex's own report, game update start to GPU done\n"
@@ -4614,7 +4627,7 @@ void PerformanceOverlay::DrawCpuWaitSection()
 			ImGui::Text("  Last slow engine step (over 5 ms): #%u at +0x%X, %.1f ms", s.engineTopCallId, s.engineTopCallOffset, s.engineTopCallMs);
 		ImGui::Text("  Engine time step %.1f ms | device Create* calls %.2f ms", s.engineDtMs, s.createMs);
 	} else if (!Util::EngineTiming::ProbesInstalled()) {
-		ImGui::TextDisabled("Engine CPU split: SE 1.5.97 only");
+		ImGui::TextDisabled("Engine CPU split: off, probes %s", Util::EngineTiming::ProbeStatus());
 	}
 	ImGui::Text("Our per-draw hooks: %.2f ms = %.2f us/draw (%.0f draws, %.0f Lighting) | permutation CB %.2f ms", s.ownDrawHookMs + s.ownSetupGeometryMs,
 		s.ownPerDrawUs, s.draws, s.lightingDraws, s.permutationUploadMs);

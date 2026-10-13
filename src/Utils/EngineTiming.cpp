@@ -6,7 +6,9 @@
 #include <format>
 #include <memory>
 
+#include "Features/PerformanceOverlay.h"
 #include "Features/Upscaling.h"
+#include "Utils/FileSystem.h"
 #include "Utils/FrameTrace.h"
 #include "Utils/GpuPhaseTimeline.h"
 
@@ -48,6 +50,8 @@ namespace Util::EngineTiming
 		constexpr uint32_t kInputOffset = 0x3C0;   // call 67315: BSInputDeviceManager::PollInputDevices
 		constexpr int kSegCount = static_cast<int>(Seg::Count);
 
+		const char* g_probeStatus = "not installed yet";
+		std::string g_rejectReason;
 		int g_renderIndex = -1;
 		int g_inputIndex = -1;
 		bool g_probes = false;
@@ -288,6 +292,7 @@ namespace Util::EngineTiming
 	}
 
 	bool ProbesInstalled() { return g_probes; }
+	const char* ProbeStatus() { return g_probeStatus; }
 
 	void InstallUpdateProbes()
 	{
@@ -296,7 +301,22 @@ namespace Util::EngineTiming
 		g_toMs = f.QuadPart ? 1000.0 / static_cast<double>(f.QuadPart) : 0.0;
 
 		if (!REL::Module::IsSE()) {
-			logger::info("[EngineTiming] Main::Update probes are for SE 1.5.97 only; engine split off");
+			g_probeStatus = "SE 1.5.97 only";
+			logger::info("[EngineTiming] Main::Update probes SKIPPED: SE 1.5.97 only; engine split and Reflex render-start markers off");
+			return;
+		}
+		// (44f) Escape hatches, read once here: the menu setting (needs a restart) and a file that
+		// works without the menu (e.g. when the game crashes before it can be opened).
+		std::error_code ec;
+		const auto killFile = Util::PathHelpers::GetSettingsUserPath().parent_path() / kKillSwitchFile;
+		if (std::filesystem::exists(killFile, ec)) {
+			g_probeStatus = "off (EngineTimingOff.txt)";
+			logger::info("[EngineTiming] Main::Update probes SKIPPED: {} exists; engine split and Reflex render-start markers off", killFile.string());
+			return;
+		}
+		if (!globals::features::performanceOverlay.settings.EngineTimingProbes) {
+			g_probeStatus = "off (setting)";
+			logger::info("[EngineTiming] Main::Update probes SKIPPED: Performance Overlay > Engine Timing Probes is off; engine split and Reflex render-start markers off");
 			return;
 		}
 		const uintptr_t base = REL::ID(kMainUpdateId).address();
@@ -309,7 +329,8 @@ namespace Util::EngineTiming
 		for (int i = 0; i < kSiteCount; ++i) {
 			const auto* p = reinterpret_cast<const uint8_t*>(base + kSites[i].offset);
 			if (p[0] != 0xE8) {
-				logger::warn("[EngineTiming] Main::Update+0x{:X} is not a call (0x{:02X}); engine split off", kSites[i].offset, p[0]);
+				g_probeStatus = "rejected (byte check)";
+				logger::warn("[EngineTiming] Main::Update probes REJECTED: +0x{:X} is not a call (0x{:02X}); nothing installed", kSites[i].offset, p[0]);
 				return;
 			}
 			int32_t rel = 0;
@@ -323,7 +344,8 @@ namespace Util::EngineTiming
 				g_inputIndex = i;
 		}
 		if (mismatched > 8) {
-			logger::warn("[EngineTiming] {} of {} Main::Update calls do not match SE 1.5.97; engine split off", mismatched, kSiteCount);
+			g_probeStatus = "rejected (byte check)";
+			logger::warn("[EngineTiming] Main::Update probes REJECTED: {} of {} calls do not match SE 1.5.97; nothing installed", mismatched, kSiteCount);
 			return;
 		}
 
@@ -345,7 +367,8 @@ namespace Util::EngineTiming
 				logger::warn("[EngineTiming] Main::Update+0x{:X} changed while installing", kSites[i].offset);
 		}
 		g_probes = true;
-		logger::info("[EngineTiming] {} Main::Update probes installed ({} calls already redirected by other plugins)", kSiteCount, mismatched);
+		g_probeStatus = "installed";
+		logger::info("[EngineTiming] Main::Update probes INSTALLED: {} call sites ({} already redirected by other plugins). To turn them off: Performance Overlay > Engine Timing Probes, or create {} next to SettingsUser.json", kSiteCount, mismatched, kKillSwitchFile);
 	}
 
 	void InstallDeviceHooks(ID3D11Device* a_device)

@@ -26,6 +26,10 @@ struct ID3D11Device;
  * Cost: one QPC read per probe and scope switch (about 120 a frame) while the overlay is on
  * screen or a trace is recording, a branch otherwise. SE 1.5.97 only; on any other runtime, or
  * if Main::Update does not look as expected, no probe is installed and the split is not shown.
+ *
+ * Escape hatches (both read once at startup, the probes are never installed later): Performance
+ * Overlay > Engine Timing Probes (restart), and a file EngineTimingOff.txt next to SettingsUser.json,
+ * which works even when the game cannot get as far as the menu.
  */
 namespace Util::EngineTiming
 {
@@ -56,6 +60,11 @@ namespace Util::EngineTiming
 	void InstallDeviceHooks(ID3D11Device* a_device);
 	/// True when the Main::Update probes are in place.
 	bool ProbesInstalled();
+	/// Why the probes are (not) in place, for the overlay and the Reflex menu: "installed",
+	/// "off (setting)", "off (EngineTimingOff.txt)", "rejected (...)", "SE 1.5.97 only".
+	const char* ProbeStatus();
+	/// Name of the kill-switch file, looked for next to SettingsUser.json.
+	inline constexpr const char* kKillSwitchFile = "EngineTimingOff.txt";
 
 	// ---- frame structure (Hooks.cpp) ----
 	/// Top of the Main_Update hook, after the Reflex sleep. a_frameToken: Streamline frame timing started this frame.

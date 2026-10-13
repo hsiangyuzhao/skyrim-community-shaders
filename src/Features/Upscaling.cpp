@@ -731,10 +731,10 @@ void Upscaling::DrawSettings()
 				ImGui::TextUnformatted("let the CPU start the next frame later instead of waiting inside Present. Expected: 10-20 ms less input lag.");
 				ImGui::TextUnformatted("Risk: with less queued up, the game's own CPU hitches can show more. Off (default) = the old marker placement.");
 				if (!Util::EngineTiming::ProbesInstalled())
-					ImGui::TextUnformatted("Not available here: needs SE 1.5.97 (the probe in Main::Update is not installed).");
+					ImGui::TextUnformatted("Needs the Engine Timing Probes (Performance Overlay settings, SE 1.5.97 only); without them the old placement is used.");
 			}
 			if (settings.reflexMarkersAtRenderStart && !Util::EngineTiming::ProbesInstalled())
-				ImGui::TextDisabled("(not available on this game version: old placement in use)");
+				ImGui::TextDisabled("(probes %s: old placement in use)", Util::EngineTiming::ProbeStatus());
 
 			int reflexFrameLimit = static_cast<int>(settings.reflexFrameLimit);
 			if (ImGui::SliderInt("Reflex Frame Limit", &reflexFrameLimit, 0, 240,

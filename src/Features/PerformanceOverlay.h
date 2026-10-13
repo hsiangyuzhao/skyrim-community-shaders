@@ -546,6 +546,9 @@ struct PerformanceOverlay : OverlayFeature
 		// (44e) CPU wait split, screenshot and frame trace.
 		bool SectionCpuWait = true;          // "CPU vs GPU (real frames)" section
 		bool DriverWaitTiming = true;        // time D3D11 calls (only while the overlay is shown or a trace records)
+		// (44f) Probes on the calls in Main::Update (engine CPU split, Reflex markers at render start).
+		// Read once at startup (restart to apply). EngineTimingOff.txt next to SettingsUser.json also turns them off.
+		bool EngineTimingProbes = true;
 		uint32_t ScreenshotKey = VK_F8;      // screenshot of the presented frame (incl. menu and overlay)
 		bool ScreenshotOnSave = true;        // F12 / Save frame also takes a screenshot with the same time stamp
 		bool ScreenshotSaveHDR = true;       // HDR frames: also save the untouched PQ image (16-bit PNG)
