@@ -116,6 +116,9 @@ namespace RayTracingScene
 		for (auto& cell : cells_)
 			Release(a_backend, *cell);
 		cells_.clear();
+		for (auto& cell : retiring_)
+			Release(a_backend, *cell);
+		retiring_.clear();
 		RayTracingCasterFilter::Clear();
 		cellsReady_ = 0;
 		validationCursor_ = 0;
@@ -531,12 +534,11 @@ namespace RayTracingScene
 					attached.push_back(cell);
 			}
 		}
-		std::erase_if(cells_, [&](std::unique_ptr<Cell>& a_cell) {
-			const bool inGrid = std::find(attached.begin(), attached.end(), a_cell->cell) != attached.end();
-			if (inGrid && Validate(*a_cell))
-				return false;
-			Release(a_backend, *a_cell);
-			return true;
+		// (45e) Retired, not released: still traced this frame (the shadow map may have left their
+		// casters out already), released in EndFrame.
+		RetireIf([&](const Cell& a_cell) {
+			const bool inGrid = std::find(attached.begin(), attached.end(), a_cell.cell) != attached.end();
+			return !(inGrid && Validate(a_cell));
 		});
 
 		// 2. Changes inside captured cells (landscape rebuilt, a captured reference got new 3D or
@@ -555,7 +557,7 @@ namespace RayTracingScene
 				for (const auto& cell : cells_) {
 					for (const auto& tracked : cell->tracked) {
 						const std::size_t g = index++;
-						if (cell->gathering || cell->dirty || (g + total - validationCursor_) % total >= window)
+						if (cell->gathering || cell->dirty || cell->replacing || (g + total - validationCursor_) % total >= window)
 							continue;
 						auto* ref = tracked.ref.get();
 						const bool disabled = ref->IsDisabled() || ref->IsDeleted();
@@ -567,13 +569,28 @@ namespace RayTracingScene
 			}
 			// Recaptured no more often than every kRecaptureFrames per cell: a cell whose 3D is still
 			// streaming in settles first instead of being rebuilt for every object that appears.
-			std::erase_if(cells_, [&](std::unique_ptr<Cell>& a_cell) {
-				if (!a_cell->dirty || a_frame - a_cell->completedFrame < kRecaptureFrames)
-					return false;
+			// (45e) The old capture stays live (traced, its casters left out of the shadow map) until
+			// the replacement's BLASes are all built; step 5 then retires it. Releasing it at once
+			// left a hole -- no ray-traced shadow and, where the filter had already dropped the
+			// casters, no shadow at all -- for the settle + capture + build time of the cell.
+			std::vector<std::unique_ptr<Cell>> replacements;
+			for (auto& cell : cells_) {
+				if (!cell->dirty || cell->replacing || a_frame - cell->completedFrame < kRecaptureFrames)
+					continue;
 				++stats_.recaptures;
-				Release(a_backend, *a_cell);
-				return true;
-			});
+				cell->dirty = false;
+				cell->replacing = true;
+				auto entry = std::make_unique<Cell>();
+				entry->cell = cell->cell;
+				entry->formID = cell->formID;
+				entry->x = cell->x;
+				entry->y = cell->y;
+				entry->seenFrame = a_frame - kSettleFrames;  // settled already: capture right away
+				entry->replaces = true;
+				replacements.push_back(std::move(entry));
+			}
+			for (auto& entry : replacements)
+				cells_.push_back(std::move(entry));
 		}
 
 		// 3. New cells (captured once they have been in the grid for kSettleFrames).
@@ -617,12 +634,36 @@ namespace RayTracingScene
 		}
 
 		// 5. Caster filter: a cell's shapes leave the cascades once all its BLASes are built.
+		// Registration happens here, before this frame's trace: a registered cell is built, so it is
+		// in this frame's TLAS and in every later one until EndFrame releases it.
 		cellsReady_ = 0;
-		stats_.cellsTracked = static_cast<std::uint32_t>(cells_.size());
+		stats_.cellsTracked = 0;
 		stats_.cellsComplete = stats_.cellsGathering = 0;
 		stats_.shapes = stats_.landQuads = 0;
 		stats_.triangles = 0;
+		std::vector<RE::TESObjectCELL*> replaced;
 		for (auto& cell : cells_) {
+			const bool built = !cell->gathering &&
+			                   std::all_of(cell->blas.begin(), cell->blas.end(), [&](auto a_handle) { return a_backend.IsBlasBuilt(a_handle); });
+			if (built && !cell->filterRegistered) {
+				for (const auto& geometry : cell->geometries)
+					RayTracingCasterFilter::Add(geometry.get());
+				cell->filterRegistered = true;
+			}
+			if (built && cell->replaces) {
+				cell->replaces = false;
+				replaced.push_back(cell->cell);
+			}
+		}
+		if (!replaced.empty()) {
+			RetireIf([&](const Cell& a_cell) {
+				return a_cell.replacing && std::find(replaced.begin(), replaced.end(), a_cell.cell) != replaced.end();
+			});
+		}
+		for (auto& cell : cells_) {
+			if (cell->replaces)
+				continue;  // counted once its old capture is gone
+			++stats_.cellsTracked;
 			stats_.shapes += cell->shapes;
 			stats_.landQuads += cell->landQuads;
 			stats_.triangles += cell->triangles;
@@ -631,17 +672,8 @@ namespace RayTracingScene
 				continue;
 			}
 			++stats_.cellsComplete;
-			const bool built = std::all_of(cell->blas.begin(), cell->blas.end(), [&](auto a_handle) { return a_backend.IsBlasBuilt(a_handle); });
-			if (!built)
-				continue;
-			++cellsReady_;
-			if (!cell->filterRegistered) {
-				for (const auto& geometry : cell->geometries) {
-					const auto& bound = geometry->worldBound;
-					RayTracingCasterFilter::Add(geometry.get(), bound.center.x, bound.center.y, bound.center.z, bound.radius);
-				}
-				cell->filterRegistered = true;
-			}
+			if (cell->filterRegistered)
+				++cellsReady_;
 		}
 
 		stats_.lastGatherMs = static_cast<float>(static_cast<double>(Qpc() - frameStart) * QpcMs());
@@ -651,25 +683,40 @@ namespace RayTracingScene
 	void Scene::CollectInstances(std::vector<RayTracingRT::Instance>& o_instances) const
 	{
 		o_instances.clear();
-		for (const auto& cell : cells_) {
-			const double x = static_cast<double>(cell->x) * kCellUnits;
-			const double y = static_cast<double>(cell->y) * kCellUnits;
-			for (const auto handle : cell->blas)
-				o_instances.push_back(RayTracingRT::Instance{ handle, x, y, 0.0 });
+		// Retiring captures too: they are traced this frame and released after it.
+		for (const auto* list : { &cells_, &retiring_ }) {
+			for (const auto& cell : *list) {
+				const double x = static_cast<double>(cell->x) * kCellUnits;
+				const double y = static_cast<double>(cell->y) * kCellUnits;
+				for (const auto handle : cell->blas)
+					o_instances.push_back(RayTracingRT::Instance{ handle, x, y, 0.0 });
+			}
 		}
 	}
 
-	bool Scene::GetLoadedRect(float o_rect[4]) const
+	void Scene::EndFrame(RayTracingRT::Backend& a_backend)
+	{
+		for (auto& cell : retiring_)
+			Release(a_backend, *cell);
+		retiring_.clear();
+	}
+
+	bool Scene::GetLoadedRect(float o_rect[4], bool a_includeRetiring) const
 	{
 		bool any = false;
 		std::int32_t minX = INT32_MAX, minY = INT32_MAX, maxX = INT32_MIN, maxY = INT32_MIN;
-		for (const auto& cell : cells_) {
-			minX = std::min(minX, cell->x);
-			minY = std::min(minY, cell->y);
-			maxX = std::max(maxX, cell->x);
-			maxY = std::max(maxY, cell->y);
-			any = true;
-		}
+		auto add = [&](const std::vector<std::unique_ptr<Cell>>& a_list) {
+			for (const auto& cell : a_list) {
+				minX = std::min(minX, cell->x);
+				minY = std::min(minY, cell->y);
+				maxX = std::max(maxX, cell->x);
+				maxY = std::max(maxY, cell->y);
+				any = true;
+			}
+		};
+		add(cells_);
+		if (a_includeRetiring)
+			add(retiring_);
 		if (!any)
 			return false;
 		o_rect[0] = static_cast<float>(minX) * kCellUnits;

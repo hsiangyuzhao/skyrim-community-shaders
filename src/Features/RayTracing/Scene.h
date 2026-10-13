@@ -21,6 +21,13 @@
  * state of a captured reference changes (a few hundred references are re-checked per frame),
  * and everything is dropped when a loading screen opens or the player is in an interior.
  *
+ * (45e) Nothing leaves the ray-traced scene in the middle of a frame. A re-captured cell keeps
+ * its old capture (BLASes, TLAS instances, caster-filter entries) until the new capture's BLASes
+ * are all built, and then swaps; cells leaving the grid (and replaced captures) are "retiring":
+ * they are still traced this frame and only released in EndFrame(), after the trace was
+ * submitted. So every caster the shadow map left out at the start of the frame is in that
+ * frame's TLAS.
+ *
  * Every captured geometry is held by an NiPointer while its cell is captured, so the caster
  * filter (CasterFilter.h) can never match a freed and reused address.
  *
@@ -77,7 +84,11 @@ namespace RayTracingScene
 		Scene(const Scene&) = delete;
 		Scene& operator=(const Scene&) = delete;
 		/// Process exit: the game's objects are not released (its memory manager may be gone already).
-		~Scene() { new std::vector<std::unique_ptr<Cell>>(std::move(cells_)); }
+		~Scene()
+		{
+			new std::vector<std::unique_ptr<Cell>>(std::move(cells_));
+			new std::vector<std::unique_ptr<Cell>>(std::move(retiring_));
+		}
 
 		/// Drops everything (BLASes are retired through the backend, filter entries removed).
 		void ReleaseAll(RayTracingRT::Backend& a_backend);
@@ -90,8 +101,12 @@ namespace RayTracingScene
 		/// TLAS instances of every chunk (the backend skips the ones not built yet).
 		void CollectInstances(std::vector<RayTracingRT::Instance>& o_instances) const;
 
-		/// World-space xy rect of the attached grid (min x, min y, max x, max y); false when none.
-		bool GetLoadedRect(float o_rect[4]) const;
+		/// After this frame's trace was submitted (or skipped): releases the retiring captures.
+		void EndFrame(RayTracingRT::Backend& a_backend);
+
+		/// World-space xy rect of the captured cells (min x, min y, max x, max y); false when none.
+		/// a_includeRetiring: also the cells still traced this frame but released at its end.
+		bool GetLoadedRect(float o_rect[4], bool a_includeRetiring) const;
 		/// True once at least one cell is captured with all its BLASes built.
 		[[nodiscard]] bool HasCoverage() const { return cellsReady_ > 0; }
 
@@ -125,6 +140,8 @@ namespace RayTracingScene
 			std::unique_ptr<RayTracingRT::ChunkGeometry> current;
 			std::vector<RayTracingRT::BlasHandle> blas;
 			bool filterRegistered = false;
+			bool replaces = false;   // (45e) a re-capture of a cell whose old capture is still live
+			bool replacing = false;  // (45e) an old capture waiting for its replacement
 			std::uint32_t shapes = 0;
 			std::uint32_t landQuads = 0;
 			std::uint64_t triangles = 0;
@@ -132,6 +149,20 @@ namespace RayTracingScene
 		};
 
 		void Release(RayTracingRT::Backend& a_backend, Cell& a_cell);
+		/// Moves the cells matching a_predicate out of cells_ into retiring_.
+		template <class Predicate>
+		void RetireIf(Predicate a_predicate)
+		{
+			std::vector<std::unique_ptr<Cell>> keep;
+			keep.reserve(cells_.size());
+			for (auto& cell : cells_) {
+				if (a_predicate(*cell))
+					retiring_.push_back(std::move(cell));
+				else
+					keep.push_back(std::move(cell));
+			}
+			cells_ = std::move(keep);
+		}
 		static const void* LandSignature(RE::TESObjectCELL* a_cell);
 		bool Validate(const Cell& a_cell) const;
 		/// Captures until the deadline; true when the cell is finished.
@@ -146,6 +177,7 @@ namespace RayTracingScene
 		void CloseChunk(RayTracingRT::Backend& a_backend, Cell& a_cell);
 
 		std::vector<std::unique_ptr<Cell>> cells_;
+		std::vector<std::unique_ptr<Cell>> retiring_;  // traced this frame, released in EndFrame
 		std::atomic<bool> flushRequested_{ false };
 		std::size_t validationCursor_ = 0;
 		std::uint32_t cellsReady_ = 0;

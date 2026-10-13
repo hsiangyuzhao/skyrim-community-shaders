@@ -265,8 +265,14 @@ void RayTracing::LatchFrame()
 	// Decided before the engine draws the sun cascades. The covered casters leave the cascades
 	// only while the trace ran last frame (so it is running), never while the disagreement view
 	// compares against a complete shadow map, and never with the A/B switch.
+	// (45e) Also only when this frame's trace is certain to run: a D3D12 command context is free
+	// now (it stays free until the trace is recorded), the scene has built cells, and the sky /
+	// exterior conditions RunFrame checks hold. Otherwise the shadow map keeps every caster and a
+	// frame that cannot trace falls back to it cleanly.
+	auto* sky = globals::game::sky;
 	const bool active = settings.Enabled && status == Status::Active && !settings.KeepCastersInShadowMap &&
-	                    debugView != DebugView::Disagreement && !Util::IsInterior();
+	                    debugView != DebugView::Disagreement && !Util::IsInterior() && sky && sky->mode.get() == RE::Sky::Mode::kFull &&
+	                    backend.HasFreeContext() && scene.HasCoverage();
 	RayTracingCasterFilter::Latch(active, filterRect);
 	filterLatched = RayTracingCasterFilter::IsLatched();
 }
@@ -274,7 +280,7 @@ void RayTracing::LatchFrame()
 bool RayTracing::ComputeRects(float o_traceRect[4], float o_coreRect[4], double a_camX, double a_camY)
 {
 	float world[4];
-	if (!scene.GetLoadedRect(world))
+	if (!scene.GetLoadedRect(world, true))
 		return false;
 	o_traceRect[0] = static_cast<float>(world[0] - a_camX);
 	o_traceRect[1] = static_cast<float>(world[1] - a_camY);
@@ -282,11 +288,20 @@ bool RayTracing::ComputeRects(float o_traceRect[4], float o_coreRect[4], double 
 	o_traceRect[3] = static_cast<float>(world[3] - a_camY);
 	// Casters fully inside this world rect leave the cascades (CasterFilter): it stops short of the
 	// hand-off band, so the band, where the shadow map still counts, keeps their shadow-map shadow.
+	// (45e) Without the retiring cells: the next frame's trace rect still holds every cell that is
+	// captured now (cells leave only through "retiring", which is traced for one more frame), so
+	// the cascades never leave out a caster the next trace would fade out in its band.
+	float core[4];
+	if (!scene.GetLoadedRect(core, false)) {
+		o_coreRect[0] = o_coreRect[1] = FLT_MAX;
+		o_coreRect[2] = o_coreRect[3] = -FLT_MAX;
+		return true;
+	}
 	const float inset = kHandOffBand + 256.0f;
-	o_coreRect[0] = world[0] + inset;
-	o_coreRect[1] = world[1] + inset;
-	o_coreRect[2] = world[2] - inset;
-	o_coreRect[3] = world[3] - inset;
+	o_coreRect[0] = core[0] + inset;
+	o_coreRect[1] = core[1] + inset;
+	o_coreRect[2] = core[2] - inset;
+	o_coreRect[3] = core[3] - inset;
 	return true;
 }
 
@@ -318,6 +333,9 @@ void RayTracing::Prepass()
 
 	try {
 		RunFrame();
+		// (45e) Captures that left the scene this frame go only now, after the trace was submitted.
+		if (backend.IsReady())
+			scene.EndFrame(backend);
 	} catch (const std::exception& e) {
 		Disable(Status::Failed, std::format("exception: {}", e.what()));
 	}
@@ -499,18 +517,18 @@ void RayTracing::RunFrame()
 		return;
 	}
 	if (!traced) {
-		// Every D3D12 context still busy: reuse the previous trace once rather than lose the
-		// static shadows the cascades no longer hold this frame.
-		if (staleFrames > 0 || frameIndex == 0) {
-			context->CSSetShader(nullptr, nullptr, 0);
-			++frameIndex;
-			return;
-		}
-		++staleFrames;
-	} else {
-		staleFrames = 0;
+		// (45e) No trace this frame: the engine's mask stays as it is. Never combine an older
+		// trace (it was made from another frame's depth and camera, which is what made the
+		// ray-traced shadow jump or vanish while moving). LatchFrame only lets the shadow map
+		// drop casters when a free context guaranteed this frame's trace, so this frame's shadow
+		// map is complete -- unless that guarantee was broken, which is counted.
+		if (filterLatched)
+			++latchedWithoutTrace;
+		context->CSSetShader(nullptr, nullptr, 0);
+		++frameIndex;
+		return;
 	}
-	if (!scene.HasCoverage()) {
+	if (!scene.HasCoverage() && !filterLatched) {
 		// The first BLASes are being built: leave the mask and Screen Space Shadows alone.
 		context->CSSetShader(nullptr, nullptr, 0);
 		status = Status::Waiting;
@@ -711,8 +729,9 @@ void RayTracing::DrawSettings()
 			scene.ResetPeaks();
 		ImGui::Text("Shadow map: %u casters handed to RT, %u draws left out last frame%s", RayTracingCasterFilter::RegisteredCount(),
 			RayTracingCasterFilter::SkippedLastFrame(), filterLatched ? "" : " (not active)");
-		if (rt.skippedFramesBusy || staleFrames)
-			ImGui::Text("Frames without a new trace (D3D12 busy): %u", rt.skippedFramesBusy);
+		if (rt.skippedFramesBusy || latchedWithoutTrace)
+			ImGui::Text("Frames without a trace (D3D12 busy): %u, of which with casters left out of the shadow map: %u (should be 0)",
+				rt.skippedFramesBusy, latchedWithoutTrace);
 		if (ImGui::TreeNodeEx("Skipped objects")) {
 			ImGui::Text("Characters %u, doors/activators/movable %u, trees/plants %u, items/markers %u, disabled/no 3D %u",
 				skip.actors, skip.movable, skip.foliage, skip.items, skip.disabled);

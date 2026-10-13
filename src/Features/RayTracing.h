@@ -162,7 +162,7 @@ private:
 	float filterRect[4]{};
 	float lastCpuMs = 0.0f;
 	TraceSample traceSample{};
-	std::uint32_t staleFrames = 0;  // frames combined with the previous trace (ring busy)
+	std::uint32_t latchedWithoutTrace = 0;  // (45e) frames whose shadow map left casters out but that could not trace (should stay 0)
 	bool overVramBudget = false;
 	Status loggedStatus = Status::Off;
 };

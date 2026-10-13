@@ -20,7 +20,7 @@ namespace RE
  *    hook brackets with SetInSunCascade(), and
  *  - when this frame's latch (Latch(), taken before the shadow maps are drawn) says the ray
  *    tracer will run this frame, and
- *  - for a geometry registered by the scene capture whose bound lies inside the filter rect
+ *  - for a geometry registered by the scene capture whose current world bound lies inside the filter rect
  *    (the ray-traced area minus the hand-off band, so the band keeps its shadow-map shadow).
  *
  * Render thread only. With Ray Tracing off nothing is registered and ShouldSkip() is one branch.
@@ -37,8 +37,11 @@ namespace RayTracingCasterFilter
 	/// The per-pass test (BSBatchRenderer::RenderPassImmediately hook).
 	[[nodiscard]] bool ShouldSkip(const RE::BSRenderPass* a_pass);
 
-	/// Registration of covered geometry (world-space bound sphere).
-	void Add(const RE::BSGeometry* a_geometry, float a_x, float a_y, float a_z, float a_radius);
+	/// Registration of covered geometry, counted (two captures may hold the same geometry while a
+	/// cell is re-captured). Callers guarantee that a registered geometry's triangles are in every
+	/// TLAS traced until its Remove(): registration follows the BLAS build, removal happens after
+	/// the frame's trace was submitted (45e).
+	void Add(const RE::BSGeometry* a_geometry);
 	void Remove(const RE::BSGeometry* a_geometry);
 	void Clear();
 

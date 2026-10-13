@@ -4,12 +4,8 @@ namespace RayTracingCasterFilter
 {
 	namespace
 	{
-		struct Bound
-		{
-			float x, y, z, r;
-		};
-
-		ankerl::unordered_dense::map<const RE::BSGeometry*, Bound> g_geometries;
+		// Geometry -> number of captures holding it (a cell and its replacement can overlap).
+		ankerl::unordered_dense::map<const RE::BSGeometry*, std::uint32_t> g_geometries;
 		bool g_latched = false;
 		bool g_inSunCascade = false;
 		float g_rect[4]{};
@@ -34,24 +30,30 @@ namespace RayTracingCasterFilter
 	{
 		if (!g_latched || !g_inSunCascade || !a_pass || !a_pass->geometry)
 			return false;
-		const auto it = g_geometries.find(a_pass->geometry);
-		if (it == g_geometries.end())
+		if (!g_geometries.contains(a_pass->geometry))
 			return false;
-		const Bound& b = it->second;
+		// (45e) The live bound: objects that move (doors, items) are tested where they are now.
 		// Whole bound inside the rect: its shadow on anything nearby is traced, not blended.
-		if (b.x - b.r < g_rect[0] || b.y - b.r < g_rect[1] || b.x + b.r > g_rect[2] || b.y + b.r > g_rect[3])
+		const auto& b = a_pass->geometry->worldBound;
+		if (b.center.x - b.radius < g_rect[0] || b.center.y - b.radius < g_rect[1] || b.center.x + b.radius > g_rect[2] ||
+			b.center.y + b.radius > g_rect[3])
 			return false;
 		++g_skipped;
 		return true;
 	}
 
-	void Add(const RE::BSGeometry* a_geometry, float a_x, float a_y, float a_z, float a_radius)
+	void Add(const RE::BSGeometry* a_geometry)
 	{
 		if (a_geometry)
-			g_geometries[a_geometry] = Bound{ a_x, a_y, a_z, a_radius };
+			++g_geometries[a_geometry];
 	}
 
-	void Remove(const RE::BSGeometry* a_geometry) { g_geometries.erase(a_geometry); }
+	void Remove(const RE::BSGeometry* a_geometry)
+	{
+		const auto it = g_geometries.find(a_geometry);
+		if (it != g_geometries.end() && --it->second == 0)
+			g_geometries.erase(it);
+	}
 
 	void Clear()
 	{

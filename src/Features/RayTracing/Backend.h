@@ -118,6 +118,20 @@ namespace RayTracingRT
 		/// Returns false when nothing was traced (busy ring or a failure; see LastError()).
 		bool ExecuteFrame(const FrameInput& a_input);
 
+		/// (45e) True when ExecuteFrame will find a free command context. Only the GPU completing
+		/// work can change the answer from false to true, never back, so a yes at the start of the
+		/// frame still holds when the frame's trace is recorded.
+		[[nodiscard]] bool HasFreeContext() const
+		{
+			if (!ready_ || failed_ || !fence_)
+				return false;
+			const std::uint64_t completed = fence_->GetCompletedValue();
+			for (const auto& context : contexts_)
+				if (context.fenceValue == 0 || context.fenceValue <= completed)
+					return true;
+			return false;
+		}
+
 		/// Frees retired resources the GPU is done with (also while nothing is traced).
 		void Tick()
 		{
