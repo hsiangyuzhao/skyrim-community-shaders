@@ -40,7 +40,7 @@ namespace Util
 		SkylightingHeightMap,    // Skylighting height-map geometry depth pass
 		SkylightingProbes,       // Skylighting probe volume update
 		TerrainBlending,         // Terrain Blending clear + blend CS + depth copy + blended passes
-		SSPLS,                   // Screen Space Point Light Shadows PrepareDepth chain
+		SSPLS,                   // (45) unused: the SSPLS PrepareDepth chain was removed (kept so later indices do not move)
 		PostProcessing,          // whole post-processing chain (pre-upscale and pre-tonemap legs)
 		SubsurfaceScattering,    // Separable / Burley SSS blur chain and composite
 		LightLimitFix,           // cluster building + light culling
@@ -75,6 +75,8 @@ namespace Util
 		RayTracing,
 		// (45c) Grass culling submission (every bucket's cull dispatch + LOD count copies), taken out of GrassOptimizations.
 		GrassCulling,
+		// (45 SSS) Screen Space Shadows (sun contact shadows): ray march + edge smoothing.
+		ScreenSpaceShadows,
 		Count
 	};
 

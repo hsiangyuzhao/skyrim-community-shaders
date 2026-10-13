@@ -1,6 +1,8 @@
 #include "ScreenSpaceShadows.h"
 
+#include "Features/TerrainBlending.h"
 #include "State.h"
+#include "Utils/GpuTimers.h"
 
 #pragma warning(push)
 #pragma warning(disable: 4838 4244)
@@ -15,7 +17,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SampleCount,
 	SurfaceThickness,
 	BilinearThreshold,
-	ShadowContrast)
+	ShadowContrast,
+	WorldSpaceThickness,
+	MinThickness,
+	ContactLength,
+	EdgeSmoothing)
 
 void ScreenSpaceShadows::DrawSettings()
 {
@@ -37,12 +43,28 @@ void ScreenSpaceShadows::DrawSettings()
 			ImGui::Text("Sharpens the fade into and out of shadow. Higher = harder, darker contact shadows.");
 
 		ImGui::Spacing();
+		ImGui::Checkbox("World-Space Thickness", (bool*)&bendSettings.WorldSpaceThickness);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Treats objects as at least Min Thickness deep, so long shadows come out solid instead of hollow, and fades shadows from casters farther than Contact Length. Off = the old behaviour.");
+		if (bendSettings.WorldSpaceThickness) {
+			ImGui::SliderFloat("Min Thickness", &bendSettings.MinThickness, 0.0f, 100.0f, "%.0f units");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How deep an object is assumed to be at least, in game units (70 = 1 m). Higher = fuller shadows, but more shadow leaking behind thin objects.");
+			ImGui::SliderFloat("Contact Length", &bendSettings.ContactLength, 30.0f, 1000.0f, "%.0f units");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Shadows from casters farther away than this (along the sun's direction) fade out. Lower = only short contact shadows; higher = longer ones, with more mistakes far away.");
+		}
+		ImGui::Checkbox("Edge Smoothing", (bool*)&bendSettings.EdgeSmoothing);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Softens the jagged, flickering 1-pixel edges of these shadows without blurring across object outlines. Uses only the current frame, so nothing smears. About 0.05-0.1 ms.");
+
+		ImGui::Spacing();
 		ImGui::Spacing();
 		ImGui::TreePop();
 	}
 }
 
-void ScreenSpaceShadows::ClearShaderCache()
+void ScreenSpaceShadows::ReleaseRaymarchShaders()
 {
 	if (raymarchCS) {
 		raymarchCS->Release();
@@ -54,59 +76,81 @@ void ScreenSpaceShadows::ClearShaderCache()
 	}
 }
 
-uint ScreenSpaceShadows::GetScaledSampleCount(bool a_dynamic)
+void ScreenSpaceShadows::ClearShaderCache()
 {
-	auto screenSize = globals::state->screenSize;
+	ReleaseRaymarchShaders();
+	if (edgeSmoothCS) {
+		edgeSmoothCS->Release();
+		edgeSmoothCS = nullptr;
+	}
+}
 
-	if (a_dynamic)
-		screenSize = Util::ConvertToDynamic(globals::state->screenSize);
+ID3D11ComputeShader* ScreenSpaceShadows::GetComputeEdgeSmooth()
+{
+	if (!edgeSmoothCS) {
+		std::vector<std::pair<const char*, const char*>> defines;
+		if (globals::features::terrainBlending.loaded)
+			defines.push_back({ "TERRAIN_BLENDING", "" });
+		edgeSmoothCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\EdgeSmoothCS.hlsl", defines, "cs_5_0");
+	}
+	return edgeSmoothCS;
+}
+
+uint ScreenSpaceShadows::GetScaledSampleCount()
+{
+	// (45 SSS, upstream c021f3e1d) Scale from the render (dynamic) size, not the output size. Before,
+	// the shader was compiled for the output size (240 samples at 4K) and cut back at run time to the
+	// render-size count (160 at 2560x1440) with a loop break -- same picture, more registers.
+	const float2 renderSize = Util::ConvertToDynamic(globals::state->screenSize);
 
 	// Scale sample count based on both dimensions relative to 1920x1080 reference
-
 	float2 referenceRes = { 1920.0f, 1080.0f };
 	float referenceArea = referenceRes.x * referenceRes.y;
-	float currentArea = screenSize.x * screenSize.y;
+	float currentArea = renderSize.x * renderSize.y;
 	float areaScale = std::sqrt(currentArea / referenceArea);
-	uint scaledSampleCount = static_cast<uint>(std::round(bendSettings.SampleCount * 60 * areaScale));
+	uint scaledSampleCount = static_cast<uint>(std::round(std::clamp(bendSettings.SampleCount, 1u, 4u) * 60 * areaScale));
 
-	return scaledSampleCount;
+	// Quantize to steps of 8 so small dynamic-resolution changes do not recompile the shader.
+	scaledSampleCount = ((scaledSampleCount + 7u) / 8u) * 8u;
+	return std::max(scaledSampleCount, 8u);
+}
+
+void ScreenSpaceShadows::CompileRaymarchShaders()
+{
+	const uint scaledSampleCount = GetScaledSampleCount();
+	if (scaledSampleCount != lastCompiledSampleCount) {
+		lastCompiledSampleCount = scaledSampleCount;
+		ReleaseRaymarchShaders();
+	}
+
+	if (raymarchCS && (raymarchRightCS || !globals::game::isVR))
+		return;
+
+	const auto sampleCount = std::format("{}", scaledSampleCount);
+	std::vector<std::pair<const char*, const char*>> defines{ { "SAMPLE_COUNT", sampleCount.c_str() } };
+	// (45 SSS, upstream) TerrainBlending swaps its R32_FLOAT blended depth into kPOST_ZPREPASS_COPY;
+	// the shader must then declare the depth as float, not unorm.
+	if (globals::features::terrainBlending.loaded)
+		defines.push_back({ "TERRAIN_BLENDING", "" });
+
+	if (!raymarchCS)
+		raymarchCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", defines, "cs_5_0");
+
+	if (globals::game::isVR && !raymarchRightCS) {
+		defines.push_back({ "RIGHT", "" });
+		raymarchRightCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", defines, "cs_5_0");
+	}
 }
 
 ID3D11ComputeShader* ScreenSpaceShadows::GetComputeRaymarch()
 {
-	static uint sampleCount = bendSettings.SampleCount;
-
-	if (sampleCount != bendSettings.SampleCount) {
-		sampleCount = bendSettings.SampleCount;
-		if (raymarchCS) {
-			raymarchCS->Release();
-			raymarchCS = nullptr;
-		}
-	}
-
-	if (!raymarchCS) {
-		uint scaledSampleCount = GetScaledSampleCount(false);
-		raymarchCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", { { "SAMPLE_COUNT", std::format("{}", scaledSampleCount).c_str() } }, "cs_5_0");
-	}
+	CompileRaymarchShaders();
 	return raymarchCS;
 }
 
 ID3D11ComputeShader* ScreenSpaceShadows::GetComputeRaymarchRight()
 {
-	static uint sampleCount = bendSettings.SampleCount;
-
-	if (sampleCount != bendSettings.SampleCount) {
-		sampleCount = bendSettings.SampleCount;
-		if (raymarchRightCS) {
-			raymarchRightCS->Release();
-			raymarchRightCS = nullptr;
-		}
-	}
-
-	if (!raymarchRightCS) {
-		uint scaledSampleCount = GetScaledSampleCount(false);
-		raymarchRightCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", { { "SAMPLE_COUNT", std::format("{}", scaledSampleCount).c_str() }, { "RIGHT", "" } }, "cs_5_0");
-	}
+	CompileRaymarchShaders();
 	return raymarchRightCS;
 }
 
@@ -149,7 +193,15 @@ void ScreenSpaceShadows::DrawShadows()
 	auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 	context->CSSetShaderResources(0, 1, &depth.depthSRV);
 
-	auto uav = screenSpaceShadowsTexture->uav.get();
+	// (45 SSS) With Edge Smoothing the ray march writes into rawShadowsTexture and the smoothing pass
+	// writes the final texture; otherwise the ray march writes the final texture directly.
+	ID3D11ComputeShader* smoothShader = (bendSettings.EdgeSmoothing && rawShadowsTexture && !globals::game::isVR) ? GetComputeEdgeSmooth() : nullptr;
+	if (smoothShader) {
+		float white[4] = { 1, 1, 1, 1 };
+		context->ClearUnorderedAccessViewFloat(rawShadowsTexture->uav.get(), white);
+	}
+
+	auto uav = smoothShader ? rawShadowsTexture->uav.get() : screenSpaceShadowsTexture->uav.get();
 	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 
 	context->CSSetSamplers(0, 1, &pointBorderSampler);
@@ -161,8 +213,38 @@ void ScreenSpaceShadows::DrawShadows()
 
 	float2 dynamicRes = { viewport->GetRuntimeData().dynamicResolutionWidthRatio, viewport->GetRuntimeData().dynamicResolutionHeightRatio };
 
-	uint dynamicSampleCount = GetScaledSampleCount(true);
-	uint dynamicReadCount = (dynamicSampleCount / 64 + 2);
+	// Data shared by every dispatch (and by the edge smoothing pass)
+	RaymarchCB common{};
+	common.FarDepthValue = 1.0f;
+	common.NearDepthValue = 0.0f;
+	common.DynamicRes = dynamicRes;
+	common.InvDepthTextureSize[0] = 1.0f / (float)viewportSize[0];
+	common.InvDepthTextureSize[1] = 1.0f / (float)viewportSize[1];
+	common.settings = bendSettings;
+	common.settings.SampleCount = std::clamp(bendSettings.SampleCount, 1u, 4u);
+	{
+		// (45 SSS) World-Space Thickness: linear depth, the sun in view space and the projection scale.
+		const float4 cameraData = Util::GetCameraData();
+		common.CameraData[0] = cameraData.x;
+		common.CameraData[1] = cameraData.y;
+		common.CameraData[2] = cameraData.z;
+		common.CameraData[3] = cameraData.w;
+
+		auto viewMat = globals::game::frameBufferCached.GetCameraView(0).Transpose();
+		auto sunVS = DirectX::SimpleMath::Vector4::Transform(lightProjection, viewMat);
+		float3 sunDirVS = { sunVS.x, sunVS.y, sunVS.z };
+		sunDirVS.Normalize();
+		common.SunDirVS[0] = sunDirVS.x;
+		common.SunDirVS[1] = sunDirVS.y;
+		common.SunDirVS[2] = sunDirVS.z;
+		common.SunDirVS[3] = 0.0f;
+
+		const auto& proj = globals::game::frameBufferCached.GetCameraProj(0);
+		common.ProjInfo[0] = proj._11 != 0.0f ? 1.0f / proj._11 : 1.0f;
+		common.ProjInfo[1] = proj._22 != 0.0f ? 1.0f / proj._22 : 1.0f;
+		common.ProjInfo[2] = (float)viewportSize[0];
+		common.ProjInfo[3] = (float)viewportSize[1];
+	}
 
 	// Shared dispatch logic for both VR and non-VR
 	auto DispatchEye = [&](const char* eyeName, ID3D11ComputeShader* shader, const float* lightProj,
@@ -187,7 +269,7 @@ void ScreenSpaceShadows::DrawShadows()
 
 			auto dispatchData = dispatchList.Dispatch[i];
 
-			RaymarchCB data{};
+			RaymarchCB data = common;
 			data.LightCoordinate[0] = dispatchList.LightCoordinate_Shader[0];
 			data.LightCoordinate[1] = dispatchList.LightCoordinate_Shader[1];
 			data.LightCoordinate[2] = dispatchList.LightCoordinate_Shader[2];
@@ -196,18 +278,8 @@ void ScreenSpaceShadows::DrawShadows()
 			data.WaveOffset[0] = dispatchData.WaveOffset_Shader[0];
 			data.WaveOffset[1] = dispatchData.WaveOffset_Shader[1];
 
-			data.FarDepthValue = 1.0f;
-			data.NearDepthValue = 0.0f;
-
-			data.DynamicRes = dynamicRes;
-
-			data.DynamicSampleCount = dynamicSampleCount;
-			data.DynamicReadCount = dynamicReadCount;
-
 			data.InvDepthTextureSize[0] = invTexSizeX;
 			data.InvDepthTextureSize[1] = invTexSizeY;
-
-			data.settings = bendSettings;
 
 			raymarchCB->Update(data);
 
@@ -232,11 +304,31 @@ void ScreenSpaceShadows::DrawShadows()
 		DispatchEye("Right Eye", GetComputeRaymarchRight(), lightProjectionRightF.data(), InvTexSizeX, InvTexSizeY);
 	}
 
-	ID3D11ShaderResourceView* views[1]{ nullptr };
-	context->CSSetShaderResources(0, 1, views);
-
 	ID3D11UnorderedAccessView* uavs[1]{ nullptr };
 	context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+
+	if (smoothShader) {
+		// (45 SSS) Edge Smoothing: 3x3 depth-aware blur, this frame's ray march only (no history).
+		TracyD3D11Zone(globals::state->tracyCtx, "SSS - Edge Smoothing");
+		if (globals::state->frameAnnotations)
+			globals::state->BeginPerfEvent("SSS - Edge Smoothing");
+
+		raymarchCB->Update(common);
+		ID3D11ShaderResourceView* smoothSrvs[2] = { depth.depthSRV, rawShadowsTexture->srv.get() };
+		context->CSSetShaderResources(0, 2, smoothSrvs);
+		auto finalUav = screenSpaceShadowsTexture->uav.get();
+		context->CSSetUnorderedAccessViews(0, 1, &finalUav, nullptr);
+		context->CSSetShader(smoothShader, nullptr, 0);
+		context->Dispatch(((uint)viewportSize[0] + 7) / 8, ((uint)viewportSize[1] + 7) / 8, 1);
+
+		context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+
+		if (globals::state->frameAnnotations)
+			globals::state->EndPerfEvent();
+	}
+
+	ID3D11ShaderResourceView* views[2]{ nullptr, nullptr };
+	context->CSSetShaderResources(0, 2, views);
 
 	context->CSSetShader(nullptr, nullptr, 0);
 
@@ -254,9 +346,14 @@ void ScreenSpaceShadows::Prepass()
 	float white[4] = { 1, 1, 1, 1 };
 	context->ClearUnorderedAccessViewFloat(screenSpaceShadowsTexture->uav.get(), white);
 
-	if (auto sky = globals::game::sky)
-		if (bendSettings.Enable && sky->mode.get() == RE::Sky::Mode::kFull)
+	if (auto sky = globals::game::sky) {
+		if (bendSettings.Enable && sky->mode.get() == RE::Sky::Mode::kFull) {
+			// (45 SSS) Own row in the Performance Overlay's GPU table (was folded into "Other").
+			Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::ScreenSpaceShadows);
 			DrawShadows();
+			Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::ScreenSpaceShadows);
+		}
+	}
 
 	auto view = screenSpaceShadowsTexture->srv.get();
 	context->PSSetShaderResources(45, 1, &view);
@@ -327,5 +424,10 @@ void ScreenSpaceShadows::SetupResources()
 		screenSpaceShadowsTexture = std::make_unique<Texture2D>(texDesc);
 		screenSpaceShadowsTexture->CreateSRV(srvDesc);
 		screenSpaceShadowsTexture->CreateUAV(uavDesc);
+
+		// (45 SSS) Edge Smoothing source. Same format; the final texture keeps its name, format and t45 slot.
+		rawShadowsTexture = std::make_unique<Texture2D>(texDesc);
+		rawShadowsTexture->CreateSRV(srvDesc);
+		rawShadowsTexture->CreateUAV(uavDesc);
 	}
 }

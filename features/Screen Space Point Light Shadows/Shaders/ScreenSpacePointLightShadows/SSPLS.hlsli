@@ -8,8 +8,6 @@
 
 namespace ScreenSpacePointLightShadows
 {
-	Texture2D<float4> LinearDepthTexture : register(t56);
-	Texture2D<float4> BlurredLinearDepthTexture : register(t57);
 
 	float Raymarch(SamplerState s, float3 viewPosition, float3 lightDirectionVS, uint steps, float step, float2 stepScale, float compareToleranceScale, float radius, float2x2 rotationMatrix, uint a_eyeIndex = 0)
 	{
@@ -81,48 +79,191 @@ namespace ScreenSpacePointLightShadows
 		return opacity;
 	}
 
-	float GetShadow(SamplerState s, float3 viewPosition, float noise2D, float3 lightDirectionVS, uint steps, float radius, uint a_eyeIndex = 0, bool isShadowCaster = false)
+	// (45 SSPLS) Switches packed into SSPLSSettings.Enable (the struct size is pinned by the
+	// FeatureData layout); C++ sends Enable = 0 when the feature is off, so `Enable != 0` still
+	// means "on" in Lighting.hlsl / Water.hlsl.
+	namespace SettingFlags
 	{
-		if (steps == 0)
-			return 1.0;
+		static const uint Enable = (1 << 0);
+		static const uint FixedMath = (1 << 1);
+		static const uint StableNoise = (1 << 2);
+	}
 
+	/// Legacy (pre-45) ray march setup. noiseOffset / noiseRotation are both the caller's noise when
+	/// Stable Noise is off, which keeps this path identical to the old one.
+	float GetShadowLegacy(SamplerState s, float3 viewPosition, float noiseOffset, float noiseRotation, float offsetAmplitude, float3 lightDirectionVS, uint steps, float radius, uint a_eyeIndex, bool isShadowCaster)
+	{
 		const float rayLength = SharedData::ssplsSettings.RayLength;
 		if (rayLength <= 0.0)
 			return 1.0;
 		lightDirectionVS *= rayLength;
 
 		// Offset with interleaved gradient noise
-		const float offset = noise2D - 0.5;
-		// const float noise = Random::InterleavedGradientNoise(normalize(viewPosition.xy) + offset);
+		const float offset = (noiseOffset - 0.5) * offsetAmplitude;
 		float2 rotation;
-		sincos(Math::TAU * noise2D, rotation.y, rotation.x);
+		sincos(Math::TAU * noiseRotation, rotation.y, rotation.x);
 		float2x2 rotationMatrix = float2x2(rotation.x, rotation.y, -rotation.y, rotation.x);
 
 		const float step = 1.0 / steps;
 
 		viewPosition += lightDirectionVS * offset * step;
 
-		const float startDepth = viewPosition.z;
-
 #if defined(SKIN) || defined(HAIR) || defined(EYE)
 		const float2 stepScale = float2(0.5, 1.5);
-		const float scaleMult = 0.75;
 		const float shadowCasterToleranceScale = SharedData::ssplsSettings.CompareToleranceScale;
 #else
 		const float2 stepScale = float2(0.75, 1.25);
-		const float scaleMult = 1.0;
 		const float shadowCasterToleranceScale = 0.4;
 #endif
 
 		const float compareToleranceScale = isShadowCaster ? shadowCasterToleranceScale : SharedData::ssplsSettings.CompareToleranceScale;
 
-		// Accumulate samples
-		float shadow = 1.0;
+		return Raymarch(s, viewPosition, lightDirectionVS, steps, step, stepScale, compareToleranceScale, radius, rotationMatrix, a_eyeIndex);
+	}
 
-		uint2 sampleCoord = SharedData::ConvertUVToSampleCoord(FrameBuffer::ViewToUV(viewPosition, true, a_eyeIndex), a_eyeIndex).xy;
+	/// (45 SSPLS) How much one depth comparison says "blocked": 0 in front of the scene surface,
+	/// ramping to 1 just behind it, back to 0 past the assumed thickness. Fractional so DLSS can
+	/// average the edges instead of seeing 0/1 speckle.
+	float HitAmount(float depthDelta, float thickness)
+	{
+		const float invRamp = 4.0 / thickness;
+		return saturate(depthDelta * invRamp) * saturate((thickness - depthDelta) * invRamp);
+	}
 
-		shadow = Raymarch(s, viewPosition, lightDirectionVS, steps, step, stepScale, compareToleranceScale, radius, rotationMatrix, a_eyeIndex);
-		return shadow;
+	/// (45 SSPLS) Fixed Math ray march.
+	/// - thickness in view units, independent of the step count: max(0.5 * z * CompareToleranceScale, |dz per step|)
+	///   (before: |light.z - pos.z| mixed a direction with a position and was divided by the step count)
+	/// - start lifted ~1 pixel footprint towards the light and the camera, hits within 2 px of the receiver skipped
+	///   (there is no geometric normal here without changing Lighting.hlsl, so the lift uses those two directions)
+	/// - soft shadows: 4 taps, radius from the penumbra (receiver - blocker) / (blocker - light), clamped to 8 px
+	/// - occlusion is accumulated as a fraction, casters near the end of the ray weigh less
+	/// - smooth fade towards the distance where the caller's step count drops to 0 (no step bands)
+	/// - lights with a shadow map only get contact-range shadows (no double darkening)
+	float GetShadowFixed(float3 viewPosition, float noiseOffset, float noiseRotation, float offsetAmplitude, float3 toLight, uint steps, float lightRadius, uint a_eyeIndex, bool isShadowCaster)
+	{
+		static const float kShadowCasterContactRange = 24.0;  // game units (~35 cm)
+		static const float2 kSoftTaps[4] = { float2(0.85, 0.15), float2(-0.15, 0.85), float2(-0.85, -0.15), float2(0.15, -0.85) };
+
+		const float rayLengthFraction = SharedData::ssplsSettings.RayLength;
+		const float distanceToLight = length(toLight);
+		if (rayLengthFraction <= 0.0 || distanceToLight < 1.0)
+			return 1.0;
+		const float3 lightDir = toLight / distanceToLight;
+
+		float rayLength = min(distanceToLight * rayLengthFraction, distanceToLight * 0.95);
+		if (isShadowCaster)
+			rayLength = min(rayLength, kShadowCasterContactRange);
+
+		const float2 renderSize = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy;
+		const float tanPerPixel = 2.0 / (abs(FrameBuffer::CameraProj[a_eyeIndex][1][1]) * renderSize.y);
+		const float receiverZ = viewPosition.z;
+		const float footprint = receiverZ * tanPerPixel;
+
+		const float3 toCamera = -normalize(viewPosition);
+		const float3 start = viewPosition + (lightDir * 1.5 + toCamera) * footprint;
+		const float2 receiverUV = FrameBuffer::ViewToUV(viewPosition, true, a_eyeIndex);
+
+		const float stepLength = rayLength / steps;
+		const float jitter = 0.5 + (noiseOffset - 0.5) * offsetAmplitude;
+		const float thicknessScale = 0.5 * SharedData::ssplsSettings.CompareToleranceScale;
+		const float stepDepth = abs(lightDir.z) * stepLength;
+		const float maxDistance = SharedData::ssplsSettings.MaxDistance;
+
+		const bool soft = SharedData::ssplsSettings.EnableSoftShadows && SharedData::ssplsSettings.SoftShadowScale > 0.0;
+		const float sourceSize = lightRadius * SharedData::ssplsSettings.SoftShadowScale * 0.01;
+		float2 rotation;
+		sincos(Math::TAU * noiseRotation, rotation.y, rotation.x);
+		const float2x2 rotationMatrix = float2x2(rotation.x, rotation.y, -rotation.y, rotation.x);
+
+		float occlusion = 0.0;
+
+		[loop] for (uint i = 0; i < steps; i++)
+		{
+			const float t = (i + jitter) * stepLength;
+			const float3 rayPosition = start + lightDir * t;
+			if (rayPosition.z <= 1.0)
+				break;
+
+			const float2 rayUV = FrameBuffer::ViewToUV(rayPosition, true, a_eyeIndex);
+			if (!(rayUV.x >= 0.0 && rayUV.x <= 1.0 && rayUV.y >= 0.0 && rayUV.y <= 1.0))
+				break;
+
+			// Still on the receiver's own pixels: anything found here is the surface itself.
+			const float2 pixelDelta = (rayUV - receiverUV) * renderSize;
+			if (dot(pixelDelta, pixelDelta) < 4.0)
+				continue;
+
+			const float sceneZ = SharedData::GetScreenDepth(rayUV, a_eyeIndex);
+			if (sceneZ < 16.5 || sceneZ > maxDistance)
+				break;
+
+			const float thickness = max(thicknessScale * rayPosition.z, stepDepth);
+			const float depthDelta = rayPosition.z - sceneZ;
+			float hit = HitAmount(depthDelta, thickness);
+
+			[branch] if (soft && depthDelta > -thickness && depthDelta < 3.0 * thickness)
+			{
+				// Penumbra width at the receiver = source size * (receiver - blocker) / (blocker - light).
+				const float blockerToLight = max(distanceToLight - t, 1.0);
+				const float penumbraPixels = min(sourceSize * t / blockerToLight / (rayPosition.z * tanPerPixel), 8.0);
+				if (penumbraPixels > 0.5) {
+					float taps = hit;
+					[unroll] for (uint j = 0; j < 4; j++)
+					{
+						const float2 tapUV = rayUV + mul(kSoftTaps[j], rotationMatrix) * penumbraPixels / renderSize;
+						taps += HitAmount(rayPosition.z - SharedData::GetScreenDepth(saturate(tapUV), a_eyeIndex), thickness);
+					}
+					hit = taps * 0.2;
+				}
+			}
+
+			const float endFade = 1.0 - smoothstep(0.5, 1.0, (i + jitter) / steps);
+			occlusion = max(occlusion, hit * endFade);
+			if (occlusion > 0.95)
+				break;
+		}
+
+		// The caller's step count reaches 0 at MaxDistance * (1 - 0.5 / StepLimit); fade out before it.
+		const float cutoff = maxDistance * (1.0 - 0.5 / max(SharedData::ssplsSettings.StepLimit, 1u));
+		const float distanceFade = 1.0 - smoothstep(0.7 * cutoff, 0.98 * cutoff, receiverZ);
+
+		return 1.0 - occlusion * distanceFade;
+	}
+
+	/// (45 SSPLS) Stable Noise: the spatial IGN pattern plus a per-frame R1 (golden ratio) offset on the
+	/// start jitter only; the soft-tap rotation keeps the spatial pattern. x = start jitter, y = rotation.
+	float2 GetStableNoise(float3 viewPosition, uint a_eyeIndex)
+	{
+		const float2 renderSize = SharedData::BufferDim.xy * FrameBuffer::DynamicResolutionParams1.xy;
+		const float2 pixel = floor(FrameBuffer::ViewToUV(viewPosition, true, a_eyeIndex) * renderSize);
+		const float spatial = Random::InterleavedGradientNoise(pixel);
+		// frac(FrameCount * golden ratio) in 32-bit fixed point (exact for any frame count).
+		const float r1 = (float)((SharedData::FrameCount * 2654435769u) >> 8) * (1.0 / 16777216.0);
+		return float2(frac(spatial + r1), spatial);
+	}
+
+	float GetShadow(SamplerState s, float3 viewPosition, float noise2D, float3 lightDirectionVS, uint steps, float radius, uint a_eyeIndex = 0, bool isShadowCaster = false)
+	{
+		if (steps == 0)
+			return 1.0;
+
+		const uint flags = SharedData::ssplsSettings.Enable;
+
+		float noiseOffset = noise2D;
+		float noiseRotation = noise2D;
+		float offsetAmplitude = 1.0;
+		[branch] if (flags & SettingFlags::StableNoise)
+		{
+			const float2 stable = GetStableNoise(viewPosition, a_eyeIndex);
+			noiseOffset = stable.x;
+			noiseRotation = stable.y;
+			offsetAmplitude = 0.5;
+		}
+
+		[branch] if (flags & SettingFlags::FixedMath)
+			return GetShadowFixed(viewPosition, noiseOffset, noiseRotation, offsetAmplitude, lightDirectionVS, steps, radius, a_eyeIndex, isShadowCaster);
+
+		return GetShadowLegacy(s, viewPosition, noiseOffset, noiseRotation, offsetAmplitude, lightDirectionVS, steps, radius, a_eyeIndex, isShadowCaster);
 	}
 }
 #endif  // SSPLS_COMMON

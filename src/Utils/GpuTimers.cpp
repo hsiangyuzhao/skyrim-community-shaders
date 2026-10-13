@@ -55,8 +55,8 @@ namespace Util
 			{ "Terrain Blending",
 				"GPU time for Terrain Blending. It has no on/off switch and still runs indoors." },
 			{ "SSPLS",
-				"GPU time for Screen Space Point Light Shadows' depth preparation. "
-				"Nothing currently uses its result, so this time is wasted." },
+				"(45) No longer measured: Screen Space Point Light Shadows had a depth preparation step nothing used; it was removed. "
+				"The shadows themselves are traced while objects are drawn, so their cost is in the engine's object rows." },
 			{ "Post Processing",
 				"GPU time for all post-processing effects combined. To see one effect's cost, turn effects off one at a time." },
 			{ "Subsurface Scattering",
@@ -123,6 +123,9 @@ namespace Util
 			{ "Grass Culling",
 				"GPU time for Grass Optimizations' per-instance culling: one compute pass per visible grass type deciding which grass "
 				"is drawn and at which detail level. Not counted in the Grass Optimizations row. Advanced > NVIDIA can speed it up." },
+			{ "Screen Space Shadows",
+				"GPU time for Screen Space Shadows (small sun shadows the shadow map misses): the ray march and, when on, "
+				"Edge Smoothing. Only runs outdoors with the full sky." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
@@ -715,7 +718,8 @@ namespace Util
 			{ "SubsurfaceScattering", "Subsurface Scattering",
 				"CPU time spent sending skin subsurface scattering work to the GPU." },
 			{ "ScreenSpacePointLightShadows", "SSPLS",
-				"CPU time spent sending Screen Space Point Light Shadows work to the GPU." },
+				"(45) Should be about zero: Screen Space Point Light Shadows has no separate pass any more. The shadows are traced while "
+				"objects are drawn, so their GPU cost is in the engine's object rows." },
 			{ "ScreenSpaceShadows", "Screen Space Shadows",
 				"CPU time spent sending screen space shadow work to the GPU." },
 			{ "TerrainShadows", "Terrain Shadows",
