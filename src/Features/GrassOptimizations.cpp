@@ -28,12 +28,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	MidLODPixelSize,
 	EnableFarLOD,
 	FarLODPixelSize,
-	MeshLODBandPixels,
-	DeferredCompaction,
-	UploadBudget,
-	UploadBudgetMB,
-	MaxGrowthsPerFrame,
-	GrowthHeadroom)
+	MeshLODBandPixels)
 
 namespace
 {
@@ -92,31 +87,6 @@ void GrassOptimizations::DrawSettings()
 			ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Unavailable: the culling shader failed to compile; grass is drawn by the game.");
 		else if (!shadersReady)
 			ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Compiling optimized grass shaders; grass is drawn by the game until they are ready.");
-	}
-
-	if (ImGui::TreeNode("Load Spikes (44e)")) {
-		ImGui::Checkbox("Deferred Compaction", &settings.DeferredCompaction);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text(
-				"On: when grass unloads, the gaps it leaves are tidied up later, one grass type per frame, only when needed.\n"
-				"Off (44d): every grass type touched is rebuilt in the same frame, which is the suspected periodic spike.\n"
-				"Same picture either way.");
-		}
-		ImGui::Checkbox("Upload Budget", &settings.UploadBudget);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text(
-				"Spreads newly loaded grass over several frames. Grass still waiting is drawn by the game meanwhile;\n"
-				"a type whose buffers must grow may appear a frame or two late (it fades in anyway). Off = no limit.");
-		}
-		if (settings.UploadBudget) {
-			ImGui::SliderFloat("Budget (MB per frame)", &settings.UploadBudgetMB, 0.25f, 64.0f, "%.2f MB", ImGuiSliderFlags_Logarithmic);
-			ImGui::SliderInt("Buffer Growths per Frame", &settings.MaxGrowthsPerFrame, 1, 16);
-		}
-		ImGui::Checkbox("Growth Headroom", &settings.GrowthHeadroom);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("When a grass type's buffers must grow, leave at least 25%% room, so the next cells fit without growing again. Uses more video memory.");
-		}
-		ImGui::TreePop();
 	}
 
 	ImGui::SeparatorText("Culling & LOD");
@@ -387,11 +357,7 @@ void GrassOptimizations::UpdateGrass()
 	maxGrassDistance = settings.RenderDistanceOverride > 0.0f ? settings.RenderDistanceOverride : vanillaMaxDistance;
 	maxDistSq = maxGrassDistance * maxGrassDistance;
 
-	bucketStore.BeginFrame({ settings.EnableMeshLOD, settings.EnableMidLOD, settings.EnableFarLOD, timeAccum,
-		settings.DeferredCompaction,
-		settings.UploadBudget ? static_cast<uint32_t>(std::clamp(settings.UploadBudgetMB, 0.25f, 256.0f) * 1048576.0f) : 0u,
-		settings.UploadBudget ? static_cast<uint32_t>(std::clamp(settings.MaxGrowthsPerFrame, 1, 64)) : 0u,
-		settings.GrowthHeadroom });
+	bucketStore.BeginFrame({ settings.EnableMeshLOD, settings.EnableMidLOD, settings.EnableFarLOD, timeAccum });
 
 	// Captures are folded in and uploaded whether or not the optimized path is on, so switching it on
 	// mid-session finds every loaded cell already bucketed. This only does work on frames where grass
@@ -1006,10 +972,10 @@ void GrassOptimizations::NoteApplyPending(float a_ms)
 	lastSpikeMB = mb;
 	lastSpikeTime = now;
 	++spikeCount;
-	logger::info("[GRASS OPTIMIZATIONS] Load spike {:.2f} ms: removed {} shapes, added {} (+{} waiting), compacted {} types ({} put off), rebuilt {}, grew {} ({} put off), "
-		"allocated {:.1f} MB, uploaded {:.1f} MB, GPU-copied {:.1f} MB [compaction {}]",
-		a_ms, a.removals, a.captures, a.capturesDeferred, a.compactions, a.compactionsDeferred, a.rebuilds, a.growths, a.growthsDeferred,
-		mb, static_cast<double>(a.uploadedBytes) / 1048576.0, static_cast<double>(a.copiedBytes) / 1048576.0, settings.DeferredCompaction ? "deferred" : "44d");
+	logger::info("[GRASS OPTIMIZATIONS] Load spike {:.2f} ms: removed {} shapes, added {}, compacted {} types ({} put off), rebuilt {}, grew {}, "
+		"allocated {:.1f} MB, uploaded {:.1f} MB, GPU-copied {:.1f} MB",
+		a_ms, a.removals, a.captures, a.compactions, a.compactionsDeferred, a.rebuilds, a.growths,
+		mb, static_cast<double>(a.uploadedBytes) / 1048576.0, static_cast<double>(a.copiedBytes) / 1048576.0);
 }
 
 void GrassOptimizations::DrawOverlayStats()

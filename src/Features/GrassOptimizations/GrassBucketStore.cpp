@@ -18,28 +18,6 @@ void GrassBucketStore::ApplyPending(ID3D11Device* device, ID3D11DeviceContext* c
 
 	ApplyRemovals(rems);
 
-	// (44e, fix B) Captures held back last frame go first, in their original order.
-	if (!deferredCaptures.empty()) {
-		for (auto& pc : caps)
-			deferredCaptures.push_back(std::move(pc));
-		caps.swap(deferredCaptures);
-		deferredCaptures.clear();
-	}
-	if (frameParams.uploadBudgetBytes && !caps.empty()) {
-		// At least one capture per frame, so a single huge one can never stall the queue.
-		uint64_t bytes = 0;
-		size_t keep = 0;
-		for (; keep < caps.size(); ++keep) {
-			const uint64_t b = (uint64_t)caps[keep].count * (kGrassStride + 4 * sizeof(float));
-			if (keep > 0 && bytes + b > frameParams.uploadBudgetBytes)
-				break;
-			bytes += b;
-		}
-		for (size_t i = keep; i < caps.size(); ++i)
-			deferredCaptures.push_back(std::move(caps[i]));
-		caps.resize(keep);
-		lastApply.capturesDeferred = (uint32_t)deferredCaptures.size();
-	}
 	lastApply.captures = (uint32_t)caps.size();
 
 	ApplyCaptures(caps);
@@ -110,9 +88,6 @@ void GrassBucketStore::ApplyRemovals(const std::vector<RE::BSMultiStreamInstance
 	const auto isDead = [](RE::BSMultiStreamInstanceTriShape* p) {
 		return std::binary_search(dead.begin(), dead.end(), p);
 	};
-
-	// (44e, fix B) A capture still waiting for upload budget must not outlive its shape.
-	std::erase_if(deferredCaptures, [&](const PendingCapture& pc) { return isDead(pc.shape); });
 
 	{
 		std::unique_lock lk(shapeBucketMutex);
@@ -236,92 +211,6 @@ void GrassBucketStore::ApplyCaptures(std::vector<PendingCapture>& captures)
 	}
 }
 
-bool GrassBucketStore::CompactBucket(GrassBucket& b, ID3D11Device* device, ID3D11DeviceContext* ctx)
-{
-	if (!b.instanceBuf || !b.originBuf || !b.capacityInstances)
-		return false;
-
-	const uint32_t surviving = (b.firstNewSlice == UINT32_MAX) ? (uint32_t)b.slices.size() : b.firstNewSlice;
-
-	// Split the survivors which have fragmented by removals into runs of still contiguous offsets, so they can be copied back into a new contiguous buffer.
-	struct Run
-	{
-		uint32_t oldFirst;
-		uint32_t newFirst;
-		uint32_t instances;
-	};
-	static thread_local std::vector<Run> runs;
-	runs.clear();
-
-	uint32_t newOffset = 0;
-	for (uint32_t i = 0; i < surviving; ++i) {
-		const BucketSlice& s = b.slices[i];
-		if (s.bufferOffset == UINT32_MAX || !s.count)
-			return false;  // never uploaded, so there is nothing resident to shift
-
-		if (!runs.empty() && s.bufferOffset == runs.back().oldFirst + runs.back().instances)
-			runs.back().instances += s.count;
-		else
-			runs.push_back({ s.bufferOffset, newOffset, s.count });
-
-		newOffset += s.count;
-	}
-
-	if (runs.empty())
-		return false;
-
-	// Only trailing slices went, so everything still resident is already where it belongs.
-	if (runs.size() == 1 && runs[0].oldFirst == 0)
-		return true;
-
-	// D3D11 doesn't allow overlapping copies within one resource, so shift the survivors into a new buffer and swap it in.
-	ID3D11Buffer* oldInstance = b.instanceBuf;
-	ID3D11Buffer* oldOrigin = b.originBuf;
-	ID3D11ShaderResourceView* oldInstanceSRV = b.instanceSRV;
-	ID3D11ShaderResourceView* oldOriginSRV = b.originSRV;
-	b.instanceBuf = nullptr;
-	b.originBuf = nullptr;
-	b.instanceSRV = nullptr;
-	b.originSRV = nullptr;
-
-	if (!CreateBucketSourceBuffers(b, b.capacityInstances, device)) {
-		auto rel = [](auto*& p) { if (p) { p->Release(); p = nullptr; } };
-		rel(b.instanceBuf);
-		rel(b.originBuf);
-		rel(b.instanceSRV);
-		rel(b.originSRV);
-		b.instanceBuf = oldInstance;
-		b.originBuf = oldOrigin;
-		b.instanceSRV = oldInstanceSRV;
-		b.originSRV = oldOriginSRV;
-		return false;  // offsets are untouched, so a CPU rebuild is still valid
-	}
-
-	constexpr UINT kRecordBytes = kGrassStride;
-	constexpr UINT kOriginBytes = 4 * (UINT)sizeof(float);
-	for (const Run& run : runs) {
-		const D3D11_BOX ibox{ run.oldFirst * kRecordBytes, 0, 0, (run.oldFirst + run.instances) * kRecordBytes, 1, 1 };
-		ctx->CopySubresourceRegion(b.instanceBuf, 0, run.newFirst * kRecordBytes, 0, 0, oldInstance, 0, &ibox);
-
-		const D3D11_BOX obox{ run.oldFirst * kOriginBytes, 0, 0, (run.oldFirst + run.instances) * kOriginBytes, 1, 1 };
-		ctx->CopySubresourceRegion(b.originBuf, 0, run.newFirst * kOriginBytes, 0, 0, oldOrigin, 0, &obox);
-	}
-
-	newOffset = 0;
-	for (uint32_t i = 0; i < surviving; ++i) {
-		b.slices[i].bufferOffset = newOffset;
-		newOffset += b.slices[i].count;
-	}
-
-	oldInstanceSRV->Release();
-	oldOriginSRV->Release();
-	oldInstance->Release();
-	oldOrigin->Release();
-	lastApply.allocatedBytes += (uint64_t)b.capacityInstances * (kRecordBytes + kOriginBytes);
-	lastApply.copiedBytes += (uint64_t)newOffset * (kRecordBytes + kOriginBytes);
-	return true;
-}
-
 bool GrassBucketStore::CompactBucketScratch(GrassBucket& b, ID3D11Device* device, ID3D11DeviceContext* ctx)
 {
 	if (!b.instanceBuf || !b.originBuf || !b.capacityInstances)
@@ -414,59 +303,38 @@ bool GrassBucketStore::CompactBucketScratch(GrassBucket& b, ID3D11Device* device
 
 void GrassBucketStore::UploadDirtyBuckets(ID3D11Device* device, ID3D11DeviceContext* ctx)
 {
-	const auto& fp = frameParams;
 	uint32_t gapCompactions = 0;
 
 	for (auto& [key, b] : buckets) {
 		if (b.needsCompact) {
-			if (!fp.deferredCompaction) {
-				// 44d: every touched type is rebuilt into new buffers right away.
+			// (44e, fix A) Gaps are harmless for culling and drawing (every slice keeps its own
+			// offset). Compact only when the new grass would not fit behind the last instance
+			// (urgent), or, one type per frame, when gaps take more than half the capacity.
+			const uint32_t surviving = (b.firstNewSlice == UINT32_MAX) ? (uint32_t)b.slices.size() : b.firstNewSlice;
+			uint32_t end = 0;
+			const bool resident = ResidentEnd(b, surviving, end);
+			const uint32_t newTail = (b.firstNewSlice == UINT32_MAX) ? 0u : InstancesFrom(b, b.firstNewSlice);
+			const uint32_t live = b.totalInstances >= newTail ? b.totalInstances - newTail : 0u;
+			const bool urgent = !resident || (newTail && (uint64_t)end + newTail > b.capacityInstances);
+			const bool gapsDue = end > live && (uint64_t)(end - live) * 2 > b.capacityInstances;
+			if (urgent || (gapsDue && gapCompactions == 0)) {
+				if (!urgent)
+					++gapCompactions;
 				b.needsCompact = false;
-				if (CompactBucket(b, device, ctx)) {
-					b.rebuildFromSlice = UINT32_MAX;  // survivors sit contiguously again
+				if (resident && CompactBucketScratch(b, device, ctx)) {
+					b.rebuildFromSlice = UINT32_MAX;
 					++lastApply.compactions;
 				} else {
 					b.dirty = true;
 				}
 			} else {
-				// (44e, fix A) Gaps are harmless for culling and drawing (every slice keeps its own
-				// offset). Compact only when the new grass would not fit behind the last instance
-				// (urgent), or, one type per frame, when gaps take more than half the capacity.
-				const uint32_t surviving = (b.firstNewSlice == UINT32_MAX) ? (uint32_t)b.slices.size() : b.firstNewSlice;
-				uint32_t end = 0;
-				const bool resident = ResidentEnd(b, surviving, end);
-				const uint32_t newTail = (b.firstNewSlice == UINT32_MAX) ? 0u : InstancesFrom(b, b.firstNewSlice);
-				const uint32_t live = b.totalInstances >= newTail ? b.totalInstances - newTail : 0u;
-				const bool urgent = !resident || (newTail && (uint64_t)end + newTail > b.capacityInstances);
-				const bool gapsDue = end > live && (uint64_t)(end - live) * 2 > b.capacityInstances;
-				if (urgent || (gapsDue && gapCompactions == 0)) {
-					if (!urgent)
-						++gapCompactions;
-					b.needsCompact = false;
-					if (resident && CompactBucketScratch(b, device, ctx)) {
-						b.rebuildFromSlice = UINT32_MAX;
-						++lastApply.compactions;
-					} else {
-						b.dirty = true;
-					}
-				} else {
-					++lastApply.compactionsDeferred;
-				}
+				++lastApply.compactionsDeferred;
 			}
 		}
 
 		const bool wantsUpload = b.dirty || b.firstNewSlice != UINT32_MAX;
 		if (!wantsUpload)
 			continue;
-
-		// (44e, fix B) Growth budget: a type that would reallocate this frame waits once the budget is used.
-		if (fp.maxGrowthsPerFrame) {
-			const bool grows = !b.instanceBuf || b.totalInstances > b.capacityInstances;
-			if (grows && lastApply.growths >= fp.maxGrowthsPerFrame) {
-				++lastApply.growthsDeferred;
-				continue;
-			}
-		}
 
 		if (b.dirty) {
 			RebuildBucket(b, device, ctx);
@@ -657,7 +525,7 @@ void GrassBucketStore::AppendNewSlices(GrassBucket& bucket, ID3D11DeviceContext*
 	}
 
 	uint32_t prefix = 0;
-	if (frameParams.deferredCompaction && bucket.needsCompact) {
+	if (bucket.needsCompact) {
 		// (44e, fix A) Gaps left by removals stay until compaction: append behind the last resident instance.
 		if (!ResidentEnd(bucket, bucket.firstNewSlice, prefix) ||
 			(uint64_t)prefix + InstancesFrom(bucket, bucket.firstNewSlice) > bucket.capacityInstances) {
@@ -736,9 +604,6 @@ bool GrassBucketStore::EnsureBucketCapacity(GrassBucket& b, uint32_t needed, ID3
 	uint32_t cap = b.capacityInstances ? b.capacityInstances : 4096;
 	while (cap < needed)
 		cap = std::min(cap * 2, kMaxBucketInstances);
-	// (44e, fix C) Room for the next cells too: at least 1.25x what is needed.
-	if (frameParams.growthHeadroom && (uint64_t)cap * 4 < (uint64_t)needed * 5)
-		cap = (uint32_t)std::min<uint64_t>((uint64_t)cap * 2, kMaxBucketInstances);
 	++lastApply.growths;
 
 	// Hold the old instance/origin buffers across the reallocation so the data up to preserve can be copied to the new buffers on the GPU.

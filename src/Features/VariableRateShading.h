@@ -14,9 +14,9 @@
  *   StartDeferred  -> BeginOpaquePass(): build this frame's rate image from last frame's
  *                     tile statistics (reprojected by motion), bind it.
  *   every draw     -> OnDraw(): per draw, pick the rate table (off / full / alpha-tested)
- *                     from the shader class, so only opaque, unblended Lighting / Grass /
- *                     DistantTree G-buffer draws are ever coarse-shaded. Landscape (the
- *                     multi-texture ground) is always full rate, see ClassifyDraw.
+ *                     from the shader class, so only unblended, non-cut-out Lighting /
+ *                     DistantTree G-buffer draws and grass are ever coarse-shaded. Landscape
+ *                     (the multi-texture ground) is always full rate, see ClassifyDraw.
  *   EndDeferred    -> EndOpaquePass(): VRS off and unbound before any of our compute work.
  *                  -> AnalyzeFrame(): after the deferred composite, measure this frame's lit
  *                     scene per tile for the next frame; optional debug tint.
@@ -39,32 +39,20 @@ struct VariableRateShading : Feature
 			"Lowers shading detail on flat, low-detail parts of the scene to save GPU time, which can make them slightly softer. "
 			"Needs an NVIDIA RTX 20-series or newer GPU; not available in VR.",
 			{ "Adapts to the picture: lowers detail only where the last frame looked flat",
-				"Optional mode that lowers detail towards the screen edges",
-				"Only solid objects are affected; the ground, shadows, UI and post-processing never are",
+				"Only solid objects and grass are affected; the ground, other cut-out objects, shadows, UI and post-processing never are",
 				"Debug overlay showing where detail is lowered" }
 		};
 	}
 
-	enum class Mode : uint32_t
-	{
-		Adaptive = 0,
-		Periphery = 1,
-		AdaptivePeriphery = 2,
-	};
-
 	struct Settings
 	{
 		bool Enabled = false;
-		uint32_t RateMode = static_cast<uint32_t>(Mode::Adaptive);
-		float Quality = 0.5f;             // 0..1, higher keeps more tiles at full rate
-		uint32_t CoarsestRate = 0;        // 0 = 2x2, 1 = 4x4
-		float MotionPixels = 8.0f;        // speed (px/frame) at which the threshold doubles, 0 = off
-		bool ProtectNormals = true;       // keep tiles with G-buffer normal detail at full rate
-		bool IncludeGrass = false;        // coarse-shade grass draws
-		bool IncludeAlphaTested = false;  // coarse-shade other alpha-tested draws (leaves, hair, LOD trees)
-		float PeripheryRadius = 0.8f;     // full-rate centre radius in half screen heights
+		float Quality = 0.5f;       // 0..1, higher keeps more tiles at full rate
+		float MotionPixels = 8.0f;  // speed (px/frame) at which the threshold doubles, 0 = off
 		bool DebugOverlay = false;
-		uint32_t CoarsenFrames = 8;  // consecutive frames a tile must qualify before it gets coarser, 0 = at once
+		// (44h) removed RateMode, CoarsestRate, ProtectNormals, IncludeGrass, IncludeAlphaTested, PeripheryRadius
+		// and CoarsenFrames, now fixed: Adaptive mode (screen-edge modes gone), coarsest rate 2x2, normal detail
+		// protected, grass included, other cut-out objects excluded (they left holes), coarsen delay 8 frames.
 	};
 
 	Settings settings;
@@ -125,7 +113,7 @@ private:
 	{
 		Off,
 		Full,         // opaque draws: the rate image as built
-		AlphaTested,  // cut-out draws: same image, capped at 2x2 so edges do not get 4 px steps
+		AlphaTested,  // cut-out grass: same image, capped at 2x2 so edges do not get 4 px steps
 	};
 
 	bool IsActive() const;

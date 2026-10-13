@@ -16,16 +16,9 @@
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	VariableRateShading::Settings,
 	Enabled,
-	RateMode,
 	Quality,
-	CoarsestRate,
 	MotionPixels,
-	ProtectNormals,
-	IncludeGrass,
-	IncludeAlphaTested,
-	PeripheryRadius,
-	DebugOverlay,
-	CoarsenFrames)
+	DebugOverlay)
 
 namespace
 {
@@ -150,7 +143,12 @@ namespace
 	constexpr float kNormalWeight = 0.5f;               // normal chord (~radians) to luminance-error units
 	constexpr float kEnvLuminance = 0.02f;              // keeps near-black tiles from reading as infinitely detailed
 	constexpr float kHysteresis = 0.8f;                 // must beat 80% of the threshold to get coarser than last frame
-	constexpr uint32_t kMaxCoarsenFrames = 30;
+
+	// (44h) Former settings, now fixed. RateCB keeps its layout (Common.hlsli is unchanged).
+	constexpr uint32_t kModeAdaptive = 0;      // VRS_MODE_ADAPTIVE; the screen-edge modes were removed
+	constexpr uint32_t kMaxRateLog2 = 1;       // coarsest rate 2x2
+	constexpr float kPeripheryRadius = 0.8f;   // unused by the adaptive mode, written as the old default
+	constexpr uint32_t kCoarsenFrames = 8;     // frames a tile must qualify before it gets coarser
 
 	uint32_t DivideRoundUp(uint32_t a_value, uint32_t a_divisor) { return (a_value + a_divisor - 1) / a_divisor; }
 
@@ -177,12 +175,8 @@ namespace
 void VariableRateShading::LoadSettings(json& o_json)
 {
 	settings = o_json;
-	settings.RateMode = std::min(settings.RateMode, static_cast<uint32_t>(Mode::AdaptivePeriphery));
-	settings.CoarsestRate = std::min(settings.CoarsestRate, 1u);
 	settings.Quality = std::clamp(settings.Quality, 0.0f, 1.0f);
 	settings.MotionPixels = std::clamp(settings.MotionPixels, 0.0f, 64.0f);
-	settings.PeripheryRadius = std::clamp(settings.PeripheryRadius, 0.1f, 2.0f);
-	settings.CoarsenFrames = std::min(settings.CoarsenFrames, kMaxCoarsenFrames);
 }
 
 void VariableRateShading::SaveSettings(json& o_json)
@@ -389,17 +383,17 @@ VariableRateShading::RateCB VariableRateShading::BuildConstants(bool a_historyVa
 	cb.RenderTiles[1] = std::min(DivideRoundUp(cb.RenderSize[1], kTileSize), imageTiles[1]);
 	cb.ImageTiles[0] = imageTiles[0];
 	cb.ImageTiles[1] = imageTiles[1];
-	cb.Mode = std::min(settings.RateMode, static_cast<uint32_t>(Mode::AdaptivePeriphery));
-	cb.MaxRateLog2 = settings.CoarsestRate ? 2 : 1;
+	cb.Mode = kModeAdaptive;
+	cb.MaxRateLog2 = kMaxRateLog2;
 	cb.Threshold = kThresholdAtLowestQuality * std::pow(kThresholdRange, std::clamp(settings.Quality, 0.0f, 1.0f));
 	cb.QuarterFactor = kQuarterFactor;
 	cb.MotionPixels = std::max(settings.MotionPixels, 0.0f);
-	cb.NormalWeight = settings.ProtectNormals ? kNormalWeight : 0.0f;
-	cb.PeripheryRadius = std::clamp(settings.PeripheryRadius, 0.1f, 2.0f);
+	cb.NormalWeight = kNormalWeight;  // (44h) normal detail always protected
+	cb.PeripheryRadius = kPeripheryRadius;
 	cb.EnvLuminance = kEnvLuminance;
 	cb.HistoryValid = a_historyValid ? 1u : 0u;
 	cb.Hysteresis = kHysteresis;
-	cb.CoarsenFrames = std::min(settings.CoarsenFrames, kMaxCoarsenFrames);
+	cb.CoarsenFrames = kCoarsenFrames;
 	// (44f) The 36d diagnostics (Coarse Ground, Full Detail Everywhere, Freeze Rates, Old Rate
 	// Analysis) were removed: the analysis is always rate-aware.
 	cb.RateAwareAnalysis = 1u;
@@ -515,24 +509,24 @@ VariableRateShading::Table VariableRateShading::ClassifyDraw() const
 			if (IsAlphaBlendedDraw())
 				return Table::Off;
 
-			// AdditionalAlphaMask is the 4x4 screen-door dither of a fading object; a coarse
-			// pixel would turn it into visible 2x2 blocks, so it counts as alpha-tested too.
-			// MultiIndexSparkle can discard (projected sparkle), so it is a cut-out as well.
+			// (44h) Cut-out draws (leaves, hair, fences) always stay at full rate: coarse shading
+			// left holes in them. AdditionalAlphaMask is the 4x4 screen-door dither of a fading
+			// object and MultiIndexSparkle can discard (projected sparkle), so both count as cut-outs.
 			constexpr uint32_t cutOut = static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::DoAlphaTest) |
 			                            static_cast<uint32_t>(SIE::ShaderCache::LightingShaderFlags::AdditionalAlphaMask);
 			if ((pixelDescriptor & cutOut) || technique == Technique::MultiIndexSparkle)
-				return settings.IncludeAlphaTested ? Table::AlphaTested : Table::Off;
+				return Table::Off;
 			return Table::Full;
 		}
 	case RE::BSShader::Type::Grass:
-		if (!settings.IncludeGrass || IsAlphaBlendedDraw())
+		// (44h) Grass is always included; cut-out grass is capped at 2x2.
+		if (IsAlphaBlendedDraw())
 			return Table::Off;
 		return (pixelDescriptor & static_cast<uint32_t>(SIE::ShaderCache::GrassShaderFlags::AlphaTest)) ? Table::AlphaTested : Table::Full;
 	case RE::BSShader::Type::DistantTree:
-		if (IsAlphaBlendedDraw())
+		// (44h) Cut-out LOD trees always stay at full rate, like other cut-outs.
+		if (IsAlphaBlendedDraw() || (pixelDescriptor & static_cast<uint32_t>(SIE::ShaderCache::DistantTreeShaderFlags::AlphaTest)))
 			return Table::Off;
-		if (pixelDescriptor & static_cast<uint32_t>(SIE::ShaderCache::DistantTreeShaderFlags::AlphaTest))
-			return settings.IncludeAlphaTested ? Table::AlphaTested : Table::Off;
 		return Table::Full;
 	default:
 		// Sky, water, effects, particles, utility (shadow / depth), image space, ...
@@ -605,10 +599,7 @@ void VariableRateShading::AnalyzeFrame()
 	if (!IsActive() || lastAnalysisFrame == frameIndex)
 		return;
 
-	const bool needAnalysis = settings.RateMode != static_cast<uint32_t>(Mode::Periphery);
 	const bool needDebug = settings.DebugOverlay && lastBoundFrame == frameIndex;
-	if (!needAnalysis && !needDebug)
-		return;
 
 	Util::CpuPassScope cpuTimer("VariableRateShading");
 	auto context = globals::d3d::context;
@@ -622,7 +613,7 @@ void VariableRateShading::AnalyzeFrame()
 
 	GpuTimerScope gpuTimer;
 
-	if (needAnalysis) {
+	{
 		auto shader = GetShader(analyzeCS, L"Data\\Shaders\\VariableRateShading\\AnalyzeCS.hlsl");
 		if (!shader)
 			return;
@@ -711,83 +702,19 @@ void VariableRateShading::DrawSettings()
 
 	ImGui::BeginDisabled(!settings.Enabled);
 
-	ImGui::SeparatorText("Where to save");
-
-	const char* modes[] = { "Adaptive (by content)", "Screen edges (fixed)", "Adaptive + screen edges" };
-	int mode = static_cast<int>(std::min(settings.RateMode, 2u));
-	if (ImGui::Combo("Mode", &mode, modes, IM_ARRAYSIZE(modes)))
-		settings.RateMode = static_cast<uint32_t>(mode);
+	// (44h) Mode, Protect Normal Detail, Coarsen Delay, Coarsest Rate, Include Grass and Include Other
+	// Cut-Out Objects were removed; see the fixed values in the anonymous namespace and ClassifyDraw.
+	Util::PercentageSlider("Quality", &settings.Quality, 0.0f, 100.0f, "%.0f %%");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Adaptive lowers detail only where last frame looked flat; Screen edges always lowers it towards the borders; the third does both.");
+		ImGui::Text("Higher keeps more of the screen at full detail (safer); lower saves more but can soften fine texture.");
 	}
 
-	if (settings.RateMode != static_cast<uint32_t>(Mode::Periphery)) {
-		Util::PercentageSlider("Quality", &settings.Quality, 0.0f, 100.0f, "%.0f %%");
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Higher keeps more of the screen at full detail (safer); lower saves more but can soften fine texture.");
-		}
-
-		ImGui::SliderFloat("Motion Boost", &settings.MotionPixels, 0.0f, 32.0f, settings.MotionPixels > 0.0f ? "%.0f px/frame" : "Off");
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Lets fast-moving parts of the screen drop more detail, since motion hides it. Lower values = stronger effect, more savings; 0 turns it off.");
-		}
-
-		ImGui::Checkbox("Protect Normal Detail", &settings.ProtectNormals);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Keeps bumpy surfaces at full detail so screen-space lighting (SSGI, SSRT) still sees their fine surface shape. Turning it off saves a bit more.");
-		}
-
-		int coarsenFrames = static_cast<int>(settings.CoarsenFrames);
-		if (ImGui::SliderInt("Coarsen Delay", &coarsenFrames, 0, static_cast<int>(kMaxCoarsenFrames), coarsenFrames > 0 ? "%d frames" : "Off"))
-			settings.CoarsenFrames = static_cast<uint32_t>(std::clamp(coarsenFrames, 0, static_cast<int>(kMaxCoarsenFrames)));
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("A block must look flat for this many frames in a row before its detail is lowered; raising detail is always immediate. Keeps flickering fire and moving shadows from switching blocks back and forth.");
-		}
-	}
-
-	if (settings.RateMode != static_cast<uint32_t>(Mode::Adaptive)) {
-		ImGui::SliderFloat("Full-Detail Centre Size", &settings.PeripheryRadius, 0.1f, 2.0f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Size of the circle in the middle of the screen that always stays at full detail. 1.0 reaches the top and bottom edges.");
-		}
-	}
-
-	const char* rates[] = { "2x2", "4x4" };
-	int coarsest = static_cast<int>(std::min(settings.CoarsestRate, 1u));
-	if (ImGui::Combo("Coarsest Rate", &coarsest, rates, IM_ARRAYSIZE(rates)))
-		settings.CoarsestRate = static_cast<uint32_t>(coarsest);
+	ImGui::SliderFloat("Motion Boost", &settings.MotionPixels, 0.0f, 32.0f, settings.MotionPixels > 0.0f ? "%.0f px/frame" : "Off");
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("The largest block of pixels that may share one shading result. 4x4 saves more but can look blocky.");
+		ImGui::Text("Lets fast-moving parts of the screen drop more detail, since motion hides it. Lower values = stronger effect, more savings; 0 turns it off.");
 	}
 
-	ImGui::SeparatorText("What to include");
-
-	ImGui::Checkbox("Include Grass", &settings.IncludeGrass);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Also lowers detail on grass, which saves the most in grassy areas but can make blade edges look blocky (capped at 2x2).");
-	}
-
-	ImGui::Checkbox("Include Other Cut-Out Objects", &settings.IncludeAlphaTested);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Also lowers detail on leaves, hair, fences and distant trees, whose cut-out edges can look blocky (capped at 2x2).");
-	}
-
-	ImGui::TextDisabled("Never affected: the ground, blended decals, shadows, sky, water, transparent effects, UI, post-processing.");
-
-	ImGui::SeparatorText("Debug");
-
-	ImGui::Checkbox("Show Shading Rate Overlay", &settings.DebugOverlay);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Tints each 16x16 block by how coarsely it is shaded, so you can see where detail is being saved.");
-	}
-	if (settings.DebugOverlay) {
-		const int legend[] = { 3, 1, 4, 7, 5, 8 };
-		for (int i = 0; i < IM_ARRAYSIZE(legend); i++) {
-			if (i > 0)
-				ImGui::SameLine();
-			ImGui::TextColored(kRateColours[legend[i]], "%s", kRateNames[legend[i]]);
-		}
-	}
+	ImGui::TextDisabled("Never affected: the ground, cut-out objects other than grass, blended decals, shadows, sky, water, transparent effects, UI, post-processing.");
 
 	if (IsActive() && hasRateCounts) {
 		uint32_t total = 0;
@@ -806,9 +733,25 @@ void VariableRateShading::DrawSettings()
 			}
 			ImGui::Text("Opaque pixel-shader work: about %.0f%% of full rate", 100.0f * work / total);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Counts screen tiles, not objects. Anything excluded (the ground, and grass or cut-outs when off) still runs at full detail, so the real saving is smaller.");
+				ImGui::Text("Counts screen tiles, not objects. Anything excluded (the ground, cut-out objects other than grass) still runs at full detail, so the real saving is smaller.");
 			}
 		}
+	}
+
+	if (ImGui::TreeNodeEx("Debug")) {
+		ImGui::Checkbox("Show Shading Rate Overlay", &settings.DebugOverlay);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Tints each 16x16 block by how coarsely it is shaded, so you can see where detail is being saved.");
+		}
+		if (settings.DebugOverlay) {
+			const int legend[] = { 3, 1, 4 };
+			for (int i = 0; i < IM_ARRAYSIZE(legend); i++) {
+				if (i > 0)
+					ImGui::SameLine();
+				ImGui::TextColored(kRateColours[legend[i]], "%s", kRateNames[legend[i]]);
+			}
+		}
+		ImGui::TreePop();
 	}
 
 	ImGui::EndDisabled();

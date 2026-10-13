@@ -62,13 +62,9 @@ public:
 		bool EnableFarLOD = true;
 		float FarLODPixelSize = 4.0f;
 		float MeshLODBandPixels = 3.0f;
-		// (44e) Spike fixes (see reviews/diag-grass-opt-frame-spikes-2026-10.md). A: gaps instead of rebuilding every
-		// grass type when a cell unloads. B: per-frame upload / growth budget. C: growth headroom.
-		bool DeferredCompaction = true;
-		bool UploadBudget = false;
-		float UploadBudgetMB = 8.0f;
-		int MaxGrowthsPerFrame = 4;
-		bool GrowthHeadroom = false;
+		// (44h) removed DeferredCompaction / UploadBudget / UploadBudgetMB / MaxGrowthsPerFrame / GrowthHeadroom
+		// (44e load-spike toggles, see reviews/diag-grass-opt-frame-spikes-2026-10.md), now fixed: deferred
+		// compaction on, no upload / growth budget, no growth headroom.
 	};
 
 	Settings settings;
