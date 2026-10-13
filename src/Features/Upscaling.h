@@ -4,6 +4,7 @@
 #include "Upscaling/DX12SwapChain.h"
 #include "Upscaling/FidelityFX.h"
 #include "Upscaling/HDROutput.h"
+#include "Upscaling/RCAS/RCAS.h"
 #include "Upscaling/Streamline.h"
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -54,6 +55,15 @@ public:
 	{
 		kFSR3FG = 0,
 		kDLSSG = 1,
+		kCount
+	};
+
+	// (45a) Settings::sharpeningMethodDLSS. Stored in SettingsUser.json; keep values stable.
+	enum class DLSSSharpening : uint
+	{
+		kOff = 0,
+		kRCAS = 1,  // after DLSS, on the linear scene; SDR and HDR
+		kNIS = 2,   // legacy NVIDIA NIS after post-processing; SDR frames only (A/B)
 		kCount
 	};
 
@@ -190,7 +200,13 @@ public:
 		bool frameGenerationAllowInMenus = false;
 		uint streamlineLogLevel = 0;  // 0=Off, 1=Default, 2=Verbose
 		float sharpnessFSR = 1.0f;
+		// NIS sharpness (legacy, SDR only); used while sharpeningMethodDLSS is kNIS.
 		float sharpnessDLSS = 0.1f;
+		// (45a) DLSS output sharpening: DLSSSharpening. A profile saved before 45a has no key;
+		// LoadSettings migrates it from sharpnessDLSS (0 -> Off, otherwise NIS).
+		uint sharpeningMethodDLSS = 0;
+		// (45a) RCAS strength 0..1, mapped like FSR's slider: con = exp2(2s - 2). 0 = off.
+		float sharpnessRCAS = 0.2f;
 		uint DLSSPreset = static_cast<uint>(DLSSModelPreset::kK);
 		bool enableDLSSRR = false;
 		// kD reproduces what was hardcoded before this setting existed, so an existing profile
@@ -340,6 +356,7 @@ public:
 	static inline Streamline streamline;
 	static inline FidelityFX fidelityFX;  // Only for frame generation
 	static inline DX12SwapChain dx12SwapChain;
+	static inline RCAS rcas;  // (45a) DLSS output sharpening, HDR-safe
 
 	winrt::com_ptr<ID3D11PixelShader> copyDepthToSharedBufferPS;
 

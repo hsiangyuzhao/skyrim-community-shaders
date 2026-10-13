@@ -63,6 +63,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	streamlineLogLevel,
 	sharpnessFSR,
 	sharpnessDLSS,
+	sharpeningMethodDLSS,
+	sharpnessRCAS,
 	DLSSPreset,
 	enableDLSSRR,
 	DLSSDPreset,
@@ -353,9 +355,33 @@ void Upscaling::DrawUpscalingSettings()
 
 void Upscaling::DrawSharpeningSettings()
 {
-	ImGui::SliderFloat("Sharpness", &settings.sharpnessDLSS, 0.0f, 1.0f, "%.1f");
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::TextUnformatted("Extra sharpening (NVIDIA NIS) after DLSS. 0 = off. Higher = crisper, but too high adds halos and shimmer.");
+	const char* methods[] = { "Off", "RCAS", "NIS (legacy, SDR only)" };
+	int methodIndex = static_cast<int>(std::min(settings.sharpeningMethodDLSS, static_cast<uint>(DLSSSharpening::kCount) - 1));
+	if (ImGui::Combo("Sharpening", &methodIndex, methods, IM_ARRAYSIZE(methods)))
+		settings.sharpeningMethodDLSS = static_cast<uint>(methodIndex);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted("Extra sharpening of the DLSS image. DLSS is already fairly sharp, so Off is a fine choice.");
+		ImGui::TextUnformatted("RCAS: AMD's sharpener, run right after DLSS on the scene itself; works with HDR on or off. Cheap (about 0.1 ms).");
+		ImGui::TextUnformatted("NIS: the old NVIDIA sharpener, kept for comparison. Does nothing while HDR output is on.");
+	}
+
+	const auto method = static_cast<DLSSSharpening>(methodIndex);
+	if (method == DLSSSharpening::kRCAS) {
+		ImGui::SliderFloat("Sharpening Strength", &settings.sharpnessRCAS, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("0 = off. Higher = crisper edges and fine detail; too high gives halos around edges and grain in noisy areas.");
+	} else if (method == DLSSSharpening::kNIS) {
+		const bool hdrOn = HDROutput::IsOutputActive();
+		if (hdrOn)
+			ImGui::BeginDisabled();
+		ImGui::SliderFloat("NIS Sharpness", &settings.sharpnessDLSS, 0.0f, 1.0f, "%.1f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("NVIDIA NIS after the colour grading. 0 = off. Higher = crisper, but too high adds halos and shimmer.");
+		if (hdrOn) {
+			ImGui::EndDisabled();
+			ImGui::TextDisabled("HDR output is on: NIS is skipped. Use RCAS for sharpening in HDR.");
+		}
+	}
 }
 
 void Upscaling::DrawFrameGenerationSettings()
@@ -887,6 +913,18 @@ void Upscaling::LoadSettings(json& o_json)
 	// (44a) HDR Output is its own feature now; 43b saved its settings here (hdrOutput).
 	HDROutput::StashLegacyUpscalingJson(o_json);
 	settings = o_json;
+
+	// (45a) Sharpening method. A profile from before 45a has only sharpnessDLSS (NIS): 0 meant off,
+	// anything else NIS, which stays available as the legacy choice.
+	if (!o_json.is_object() || !o_json.contains("sharpeningMethodDLSS")) {
+		settings.sharpeningMethodDLSS = static_cast<uint>(settings.sharpnessDLSS > 0.0f ? DLSSSharpening::kNIS : DLSSSharpening::kOff);
+		logger::info("[Upscaling] Sharpening migrated from sharpnessDLSS {:.2f}: {}", settings.sharpnessDLSS,
+			settings.sharpeningMethodDLSS ? "NIS (legacy)" : "Off");
+	} else if (settings.sharpeningMethodDLSS >= static_cast<uint>(DLSSSharpening::kCount)) {
+		logger::warn("[Upscaling] Loaded sharpeningMethodDLSS {} out of range, falling back to Off", settings.sharpeningMethodDLSS);
+		settings.sharpeningMethodDLSS = static_cast<uint>(DLSSSharpening::kOff);
+	}
+	settings.sharpnessRCAS = std::clamp(settings.sharpnessRCAS, 0.0f, 1.0f);
 
 	// Sanitize loaded settings to ensure enum indices are valid
 	constexpr auto enumCount = 4;  // UpscaleMethod has 4 values: kNONE, kTAA, kFSR, kDLSS
@@ -1449,6 +1487,7 @@ void Upscaling::ClearShaderCache()
 		encodeTexturesCS[i] = nullptr;  // com_ptr automatically releases
 	}
 
+	rcas.ClearShaderCache();
 	depthRefractionUpscalePS = nullptr;  // com_ptr automatically releases
 	underwaterMaskUpscalePS = nullptr;   // com_ptr automatically releases
 	upscaleVS = nullptr;                 // com_ptr automatically releases
@@ -2183,8 +2222,23 @@ void Upscaling::Upscale()
 			DX::ThrowIfFailed(dx12SwapChain.d3d11Context->Wait(dx12SwapChain.d3d11Fence.get(), fence));
 			dx12SwapChain.fenceValue++;
 
-			// Copy back to main buffer
-			context->CopyResource(main.texture, dx12SwapChain.outputColorBufferShared12->resource11);
+			// Back to the main buffer: (45a) through RCAS when it is the chosen sharpening (the
+			// linear scene, before post-processing and Neural Rendering after upscaling, so SDR and
+			// HDR share it), a plain copy otherwise or if RCAS could not run.
+			bool sharpened = false;
+			if (settings.sharpeningMethodDLSS == static_cast<uint>(DLSSSharpening::kRCAS) && settings.sharpnessRCAS > 0.0f && main.UAV) {
+				// FSR's slider-to-RCAS mapping (upstream 83635b4f8): con = exp2(2 * slider - 2).
+				const float rcasSharpness = exp2(2.0f * std::min(settings.sharpnessRCAS, 1.0f) - 2.0f);
+				D3D11_TEXTURE2D_DESC mainDesc{};
+				main.texture->GetDesc(&mainDesc);
+				D3D11_UNORDERED_ACCESS_VIEW_DESC mainUavDesc{};
+				main.UAV->GetDesc(&mainUavDesc);
+				// The shader writes a RWTexture2D; any other view shape (VR arrays) takes the copy.
+				if (mainUavDesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2D)
+					sharpened = rcas.ApplySharpen(dx12SwapChain.outputColorBufferShared12->srv, main.UAV, mainDesc.Width, mainDesc.Height, rcasSharpness);
+			}
+			if (!sharpened)
+				context->CopyResource(main.texture, dx12SwapChain.outputColorBufferShared12->resource11);
 		} else if (upscaleMethod == UpscaleMethod::kFSR) {
 			fidelityFX.Upscale(main.texture, reactiveMaskTexture->resource.get(), transparencyCompositionMaskTexture->resource.get(), motionVector.texture, settings.sharpnessFSR);
 		}
@@ -2320,7 +2374,8 @@ void Upscaling::UpscaleDepth()
 
 void Upscaling::ApplyNISSharpening()
 {
-	if (!streamline.featureNIS || settings.sharpnessDLSS <= 0.0f) {
+	// (45a) Legacy choice only; RCAS runs at the DLSS copy-back instead.
+	if (settings.sharpeningMethodDLSS != static_cast<uint>(DLSSSharpening::kNIS) || !streamline.featureNIS || settings.sharpnessDLSS <= 0.0f) {
 		return;
 	}
 

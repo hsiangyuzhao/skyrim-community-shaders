@@ -1249,7 +1249,7 @@ namespace HDROutput
 
 		ImGui::Spacing();
 		ImGui::TextDisabled("Tone curve in HDR (Extend / Native, roll-off): Post Processing > Color Grading and Tone Mapping.");
-		ImGui::TextDisabled("DLSS sharpening is not applied while HDR is on.");
+		ImGui::TextDisabled("Sharpening in HDR: Upscaling > Sharpening > RCAS (the legacy NIS choice is skipped while HDR is on).");
 
 		// (44g) Fixed now: lean path with HDR off, menus on their own UI layer, colour space on the
 		// Streamline proxy, the 44d water-surface fix, no sharpening in HDR, no copy-format logging.
