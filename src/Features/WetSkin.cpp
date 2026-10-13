@@ -64,7 +64,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	LeatherDroplets,
 	LeatherRivulets,
 	MetalDroplets,
-	MetalRivulets)
+	MetalRivulets,
+	DropletMinRoughness,
+	WetReflectionStrength)
 
 namespace
 {
@@ -243,7 +245,8 @@ WetSkin::GPUParams WetSkin::GetGPUParams() const
 	g.c[8] = classParams(s.GearLeather);
 	g.c[9] = classParams(s.GearMetal);
 	g.c[10] = classParams(s.GearFur);
-	g.c[11] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	// (45g) x Droplet Min Roughness (0 = 45f), y Wet Reflection Strength (1 = 45f).
+	g.c[11] = float4(std::clamp(s.DropletMinRoughness, 0.0f, 0.5f), std::clamp(s.WetReflectionStrength, 0.0f, 2.0f), 0.0f, 0.0f);
 	return g;
 }
 
@@ -338,6 +341,9 @@ void WetSkin::DrawSettings()
 		Tooltip({ "Lower = smaller, sharper highlights; higher = broader, softer sheen. Never below 0.2, so skin never turns into a mirror." });
 		ImGui::SliderFloat("Darkening", &s.Darkening, 0.0f, 2.0f, "%.2f");
 		Tooltip({ "How much darker (and a little more saturated) soaked skin gets. Follows the wet patches, no blotches." });
+		ImGui::SliderFloat("Wet Reflection Strength", &s.WetReflectionStrength, 0.0f, 2.0f, "%.2f");
+		Tooltip({ "How strongly wet skin reflects its surroundings (cubemap / screen-space reflections). 1 = 45f.",
+			"Lower it if a wet face still looks like a mirror." });
 
 		ImGui::SeparatorText("Wet patches");
 		ImGui::SliderFloat("Patch Contrast", &s.PatchContrast, 0.0f, 1.0f, "%.2f");
@@ -361,6 +367,9 @@ void WetSkin::DrawSettings()
 		ImGui::SliderFloat("Droplets on the Face", &s.FaceDroplets, 0.0f, 1.0f, "%.2f");
 		ImGui::SliderFloat("Droplet Normal Strength", &s.DropletNormal, 0.0f, 2.0f, "%.2f");
 		Tooltip({ "How round the beads look (their own little dome, inside the bead only). 0 = flat spots of shine." });
+		ImGui::SliderFloat("Droplet Min Roughness", &s.DropletMinRoughness, 0.0f, 0.5f, "%.2f");
+		Tooltip({ "How soft the bright point on each bead and trail is. Higher = a small soft glint instead of a",
+			"mirror-sharp dot. 0 = 45f (0.1 on beads, 0.15 on trails)." });
 		ImGui::SliderFloat("Droplet Edge", &s.DropletRim, 0.0f, 1.0f, "%.2f");
 		ImGui::SliderFloat("Droplet Trails", &s.DropletTrails, 0.0f, 1.0f, "%.2f");
 		Tooltip({ "A short wet trail running down from each bead." });

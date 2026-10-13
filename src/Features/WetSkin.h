@@ -94,6 +94,10 @@ struct WetSkin : Feature
 		float DropletRim = 0.25f;
 		float DropletTrails = 0.5f;
 		float RainDroplets = 0.4f;
+		// (45g) Floor on the bead / trail highlight roughness (0 = 45f: 0.1 / 0.15).
+		float DropletMinRoughness = 0.2f;
+		// (45g) x the wet skin film's reflection energy (1 = 45f).
+		float WetReflectionStrength = 1.0f;
 
 		// Rivulets (New)
 		float StreakAmount = 0.5f;

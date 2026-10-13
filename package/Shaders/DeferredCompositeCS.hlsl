@@ -114,6 +114,9 @@ cbuffer SSRTCompositeCB : register(b1)
 	uint SSRTSpecularCap;     // distance limit active on the specular chain
 	float SSRTCapStart;       // fade start, NRD viewZ units (game units)
 	float SSRTCapEnd;         // limit; at or beyond it the cubemap is used alone
+	// (45g) Row 1. Both 0 = 45f. Written from ScreenSpaceRayTracing "Occlude Cubemap Reflections".
+	uint SSRTCubemapSpecOcclusion;  // sky specular occlusion on the cubemap reflections below
+	uint SSRTFixViewDirection;      // SSGI specular AO gets surface->camera (was camera->surface)
 };
 
 // Same expression as SSRT_NRDViewZ (ssrt_common.hlsli) / prepareNRDGuides.cs.hlsl.
@@ -461,6 +464,28 @@ float SSRTCompositeViewZ(float screenDepth)
 		}
 #		endif
 
+#		if defined(SSRT)
+		// (45g) Sky specular occlusion, exactly as the SSRT specular fallback builds it
+		// (ssrt_raymarch.hlsl): the skylighting diffuse visibility of the surface (the same SH
+		// sampled along R, cosine lobe on the folded normal, fade-out, upward boost, mixDiffuse)
+		// turned into a specular occlusion with GetSpecularOcclusionFromAmbientOcclusion. It
+		// scales the sky weight below, so a covered spot falls back toward the sky-less cubemap
+		// and is darkened with it, where before only the coarse specular lobe visibility did.
+		// This block is what a pixel gets whenever SSRT specular returned nothing (specular off,
+		// a miss with its fallback off, beyond the distance limit), which is where the mirror-like
+		// wet faces came from. Same-frame quantities only; reinjection is not touched.
+		[branch] if (SSRTCubemapSpecOcclusion != 0) {
+			const float3 occlusionNormal = normalize(float3(normalWS.xy, max(1e-6, normalWS.z)));
+			float skyDiffuseVisibility = SphericalHarmonics::FuncProductIntegral(skylighting, SphericalHarmonics::EvaluateCosineLobe(occlusionNormal)) / Math::PI;
+			skyDiffuseVisibility = saturate(skyDiffuseVisibility);
+			skyDiffuseVisibility = lerp(1.0, skyDiffuseVisibility, Skylighting::getFadeOutFactor(positionMS.xyz));
+			skyDiffuseVisibility *= 1.0 + saturate(normalWS.z) * (1.0 - SharedData::skylightingSettings.MinDiffuseVisibility);
+			skyDiffuseVisibility = Skylighting::mixDiffuse(SharedData::skylightingSettings, skyDiffuseVisibility);
+			const float occlusionNdotV = saturate(dot(normalWS, -V));
+			skylightingSpecular *= Color::SpecularAOLagarde(occlusionNdotV, skyDiffuseVisibility, roughness);
+		}
+#		endif
+
 		float3 specularIrradianceReflections = 0.0;
 
 		if (skylightingSpecular > 0.0){
@@ -513,7 +538,14 @@ float SSRTCompositeViewZ(float screenDepth)
 #	if defined(SSGI)
 		float ssgiAo;
 		float3 ssgiIlSpecular;
-		SampleSSGISpecular(dispatchID.xy, specularLobe, ssgiAo, ssgiIlSpecular, normalWS, V, roughness);
+#		if defined(SSRT)
+		// (45g) V is camera->surface, so dot(N, V) <= 0 on every visible pixel and the Lagarde
+		// specular AO inside always saw NdotV = 0. -V is the surface->camera vector it expects.
+		const float3 ssgiSpecularView = SSRTFixViewDirection != 0 ? -V : V;
+#		else
+		const float3 ssgiSpecularView = V;
+#		endif
+		SampleSSGISpecular(dispatchID.xy, specularLobe, ssgiAo, ssgiIlSpecular, normalWS, ssgiSpecularView, roughness);
 
 		finalIrradiance = (finalIrradiance * ssgiAo);
 

@@ -3103,6 +3103,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	}
 	skinSurfaceProperties.RoughnessPrimary = min(1.0, skinSurfaceProperties.RoughnessPrimary + ExtraRoughness);
 	skinSurfaceProperties.RoughnessSecondary = min(1.0, skinSurfaceProperties.RoughnessSecondary + ExtraRoughness);
+	// (45g) Skin Min Roughness (sssParams.z, 0 = 45f): Primary Roughness - Specular Texture
+	// Multiplier x gloss reaches 0 on glossy spots of the specular map (next to the eyes), which
+	// gave a pinpoint direct highlight and a mirror-sharp reflection there.
+	const float skinMinRoughness = SharedData::skinData.sssParams.z;
+	skinSurfaceProperties.RoughnessPrimary = max(skinSurfaceProperties.RoughnessPrimary, skinMinRoughness);
+	skinSurfaceProperties.RoughnessSecondary = max(skinSurfaceProperties.RoughnessSecondary, skinMinRoughness);
 	skinSurfaceProperties.SecondarySpecIntensity = SharedData::skinData.skinParams2.x;
 	skinSurfaceProperties.Thickness = 1 - skinsk.x;
 	skinSurfaceProperties.SubsurfaceColor = skinsk.xyz;
@@ -3141,6 +3147,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		pbrGlossiness = lerp(1 - averageRoughness, 1 - skinWetFilmRoughness, saturate(skinWetResponse * Skin::wetSkinParams[1].w));
 	}
 	pbrGlossiness = min(pbrGlossiness, max(1 - averageRoughness, 0.8));  // dry skin keeps its own value
+	pbrGlossiness = min(pbrGlossiness, 1 - skinMinRoughness);            // (45g) dry or wet; 0 = 45f
 #	endif  // CS_SKIN
 
 	float porosity = 1.0;
@@ -4981,7 +4988,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	if (skinEnabled) {
 		psout.Reflectance = float4(indirectSpecularLobeWeight, psout.Diffuse.w);
 #			if defined(WETNESS_EFFECTS)
-		psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), skinWetNew ? pbrGlossiness : min(lerp(pbrGlossiness, max(pbrGlossiness, wetnessGlossinessSpecular), wetnessGlossinessSpecular), max(pbrGlossiness, 0.8)), psout.Diffuse.w);  // (44a) anti-mirror; New: rain is in pbrGlossiness
+		psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), skinWetNew ? pbrGlossiness : min(min(lerp(pbrGlossiness, max(pbrGlossiness, wetnessGlossinessSpecular), wetnessGlossinessSpecular), max(pbrGlossiness, 0.8)), 1 - skinMinRoughness), psout.Diffuse.w);  // (44a) anti-mirror; New: rain is in pbrGlossiness; (45g) Skin Min Roughness
 #			else
 		psout.NormalGlossiness = float4(GBuffer::EncodeNormal(screenSpaceNormal), pbrGlossiness, psout.Diffuse.w);
 #			endif

@@ -28,6 +28,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     BRDFBias,
     UseDynamicCubemapsAsFallback,
     UseDynamicCubemapsAsFallbackSpecular,
+    FallbackRoughnessMip,
+    CubemapSpecOcclusion,
     DiffuseSPP,
     DiffuseSamplingMode,
     EnableDiffuse,
@@ -85,6 +87,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     BRDFBias,
     UseDynamicCubemapsAsFallback,
     UseDynamicCubemapsAsFallbackSpecular,
+    FallbackRoughnessMip,
+    CubemapSpecOcclusion,
     DiffuseSPP,
     DiffuseSamplingMode,
     EnableDiffuse,
@@ -316,6 +320,19 @@ void ScreenSpaceRayTracing::DrawSettings()
     ImGui::Checkbox("Use Dynamic Cubemaps as Fallback for Specular", &settings.UseDynamicCubemapsAsFallbackSpecular);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("When ray marching misses, use dynamic cubemaps for reflections. Recommended for specular.");
+    ImGui::BeginDisabled(!settings.UseDynamicCubemapsAsFallbackSpecular);
+    ImGui::Checkbox("Fallback Blur Follows Roughness", &settings.FallbackRoughnessMip);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "The specular cubemap fallback is as blurry as the surface is rough (like the plain cubemap reflections). "
+            "Off = always the sharpest cubemap level (45f), which can look like a mirror on skin.");
+    ImGui::EndDisabled();
+    ImGui::Checkbox("Occlude Cubemap Reflections", &settings.CubemapSpecOcclusion);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Where SSRT specular gives nothing (specular off, a miss with no fallback, beyond the distance limit), "
+            "the cubemap reflection is darkened in covered spots like the fallback does, and the SSGI reflection "
+            "occlusion uses the right view direction. Off = 45f.");
     ImGui::SliderFloat("Cubemap Normalization", &settings.CubemapNormalization, 0.0f, 1.0f, "%.2f");
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Matches cubemap luminance with ambient color.");
@@ -2374,6 +2391,9 @@ void ScreenSpaceRayTracing::BindCompositeConstants()
         data.CapEnd = DistanceLimitUnits();
         data.CapStart = data.CapEnd * 0.8f;
     }
+    // (45g) Read only in the cubemap reflection block; independent of the specular chain.
+    data.CubemapSpecOcclusion = settings.CubemapSpecOcclusion ? 1u : 0u;
+    data.FixViewDirection = settings.CubemapSpecOcclusion ? 1u : 0u;
     compositeCB->Update(data);
     auto buffer = compositeCB->CB();
     globals::d3d::context->CSSetConstantBuffers(1, 1, &buffer);
@@ -2464,7 +2484,8 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         ssrCBData.Thickness = settings.Thickness;
         ssrCBData.NormalBias = settings.NormalBias;
         ssrCBData.BRDFBias = settings.BRDFBias;
-        ssrCBData.UseDynamicCubemapsAsFallback = (uint)settings.UseDynamicCubemapsAsFallbackSpecular && dynamicCubemaps.loaded;
+        // (45g) Bit 1: the fallback samples the roughness-matched cubemap mip (the shader gates on != 0).
+        ssrCBData.UseDynamicCubemapsAsFallback = (settings.UseDynamicCubemapsAsFallbackSpecular && dynamicCubemaps.loaded) ? (1u | (settings.FallbackRoughnessMip ? 2u : 0u)) : 0u;
         ssrCBData.OcclusionStrength = settings.OcclusionStrength;
         ssrCBData.CubemapNormalization = settings.CubemapNormalization;
         // (diagnostic T2) Applies to both passes: the specular and diffuse permutations

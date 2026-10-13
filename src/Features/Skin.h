@@ -71,6 +71,9 @@ struct Skin : Feature
 		float FuzzRoughness = 0.35f;
 		float FuzzF0 = 0.045f;
 		bool UseDynamicWetness = false;
+		// (45g) Lower bound on the skin roughness (both lobes, the reflections' G-buffer gloss and
+		// the wet film), dry or wet. 0 = 45f.
+		float SkinMinRoughness = 0.2f;
 		// (44a) Extra wetness, the Perlin wetness parameters, the film strength and the 43b
 		// coverage options moved to the Wet Skin page (WetSkin.h).
 	} settings;
