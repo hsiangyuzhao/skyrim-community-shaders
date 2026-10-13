@@ -140,6 +140,18 @@ RWStructuredBuffer<uint4> u_SharcVoxelDataBuffer : register(u3);
 RWStructuredBuffer<uint4> u_SharcVoxelDataBufferPrev : register(u4);
 #endif
 
+// (45c) Diagnostic permutation only (Advanced > NVIDIA > Timer heatmap): every thread adds the
+// nanoseconds it spent in main(), read from the GPU's global timer, to its thread group's cell, so the
+// cell holds the summed thread time of one 8x8 tile. C++ defines SSRT_NV_TIMER_HEATMAP only together
+// with NV_SHADER_EXTN, on the full-density diffuse permutation. Every other permutation is unchanged.
+#include "Common/NvShaderExtn.hlsli"
+#if defined(SSRT_NV_TIMER_HEATMAP) && defined(NV_SHADER_EXTN) && NV_SHADER_EXTN && !defined(SSRT_SPECULAR) && !SHARC_UPDATE
+#   define SSRT_HEATMAP 1
+RWTexture2D<uint> SSRTHeatmapOutput : register(u7);
+#else
+#   define SSRT_HEATMAP 0
+#endif
+
 cbuffer SSRTCB : register(b1)
 {
     uint MaxSteps;
@@ -875,6 +887,9 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
                                                 uint3 groupThreadID : SV_GroupThreadID,
                                                 uint3 DTid : SV_DispatchThreadID)
 {
+#if SSRT_HEATMAP
+    const uint heatmapStart = NvGetSpecial(NV_SPECIALOP_GLOBAL_TIMER_LO);
+#endif
     // (audit #7) The render extent, on every permutation -- the traversal grid, the
     // pyramid's valid area and the dispatch all agree on it. Matches the renderDim in
     // ssrt_preprocess_depth.hlsl and Util::ConvertToDynamic on the C++ side, so the
@@ -1744,5 +1759,11 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
         // left there. hitNormMean is the value the store always carried, hoisted above.
         SSRTDiffuseHitDistanceOutput[coords.xy] = hitNormMean;
     }
+#endif
+#if SSRT_HEATMAP
+    // Unsigned difference, so a wrap of the 32-bit low word between the two reads still gives the
+    // right duration (one wrap is ~4.3 s; a thread never runs that long).
+    const uint heatmapNs = NvGetSpecial(NV_SPECIALOP_GLOBAL_TIMER_LO) - heatmapStart;
+    InterlockedAdd(SSRTHeatmapOutput[groupID.xy], heatmapNs);
 #endif
 }

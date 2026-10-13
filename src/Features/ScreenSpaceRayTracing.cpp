@@ -14,6 +14,8 @@
 
 #include "Utils/DenoiserTimers.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/NvTimerHeatmap.h"
+#include "Utils/Nvapi.h"
 
 #ifdef ENABLE_SHARC
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -1791,6 +1793,8 @@ void ScreenSpaceRayTracing::ClearShaderCache()
 {
     static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
         &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &preblurCS, &temporalCS, &temporalDiagCS, &varianceCS, &spatialCS, &spatialSpecularCS,
+        // (45c) NVIDIA twins / diagnostic permutation
+        &varianceNvCS, &raymarchDiffuseHeatmapCS,
         // (batch 36f) packed-input composite twins (REBLUR's output decoded in the composite)
         &diffuseCompositePackedCS, &diffuseCompositeExternalConfPackedCS,
         // (batch 12) sparse sampling: the two ray-march permutations and their two resolve passes
@@ -1834,6 +1838,13 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
     const std::string DiffuseSPPStr = std::to_string(settings.DiffuseSPP);
 
     defines.push_back({ "DIFFUSE_SPP", DiffuseSPPStr.c_str() });
+
+    // (45c) Kept for the on-demand timer-heatmap twin of the diffuse ray march.
+    heatmapDefineStore.clear();
+    for (const auto& [name, value] : defines)
+        heatmapDefineStore.emplace_back(name, value ? value : "");
+    raymarchDiffuseHeatmapCS = nullptr;
+    raymarchDiffuseHeatmapFailed = false;
 
 #ifdef ENABLE_SHARC
     auto definesSharcUpdate = defines;
@@ -1920,6 +1931,9 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &temporalCS, "ssrt_temporal.hlsl", {} },
             { &temporalDiagCS, "ssrt_temporal.hlsl", definesDenoiserDiag },
             { &varianceCS, "ssrt_variance.hlsl", {} },
+            // (45c) The NVIDIA per-warp-vote twin (NvAny), only when the driver supports it; picked per frame by
+            // SelectVarianceShader so the switch never recompiles. Skipped below when the define list is empty.
+            { &varianceNvCS, "ssrt_variance.hlsl", Util::Nvapi::ShaderDefines(Util::Nvapi::Item::ShaderExtensions) },
             { &spatialCS, "ssrt_spatial.hlsl", definesWideKernel },
             { &spatialSpecularCS, "ssrt_spatial.hlsl", definesSpecular },
             // (batch 12) Sparse sampling. Both variants of both passes are always compiled, so
@@ -1937,6 +1951,19 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
 
     for (auto& info : shaderInfos) {
         auto path = std::filesystem::path("Data\\Shaders\\ScreenSpaceRayTracing") / info.filename;
+        // (45c) The NVIDIA twins: not built without driver support, and a failed build only costs the optimisation.
+        if (info.programPtr == &varianceNvCS) {
+            if (info.defines.empty())
+                continue;
+            try {
+                if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), info.defines, "cs_5_0")))
+                    info.programPtr->attach(rawPtr);
+            } catch (...) {
+            }
+            if (!*info.programPtr)
+                Util::Nvapi::DisableForSession(Util::Nvapi::Item::ShaderExtensions, "The SSRT variance shader with NVIDIA shader extensions failed to build");
+            continue;
+        }
         if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(path.c_str(), info.defines, "cs_5_0")))
             info.programPtr->attach(rawPtr);
     }
@@ -1945,6 +1972,34 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
     // Prepass can notice a setting change on any path -- UI, config load, RestoreDefaults --
     // rather than only on the one that remembered to raise recompileFlag.
     compiledDiffuseSPP = settings.DiffuseSPP;
+}
+
+ID3D11ComputeShader* ScreenSpaceRayTracing::GetDiffuseRaymarchHeatmapShader()
+{
+    // (45c) Diagnostic only: built the first time the Timer heatmap is wanted (a one-off hitch), never
+    // otherwise. Same axes as raymarchDiffuseCS plus NV_SHADER_EXTN and SSRT_NV_TIMER_HEATMAP.
+    if (raymarchDiffuseHeatmapCS || raymarchDiffuseHeatmapFailed)
+        return raymarchDiffuseHeatmapCS.get();
+    const auto nvDefines = Util::Nvapi::ShaderDefines(Util::Nvapi::Item::TimerHeatmap);
+    if (nvDefines.empty() || heatmapDefineStore.empty()) {
+        raymarchDiffuseHeatmapFailed = true;
+        return nullptr;
+    }
+    std::vector<std::pair<const char*, const char*>> defines;
+    for (const auto& [name, value] : heatmapDefineStore)
+        defines.push_back({ name.c_str(), value.c_str() });
+    defines.insert(defines.end(), nvDefines.begin(), nvDefines.end());
+    defines.push_back({ "SSRT_NV_TIMER_HEATMAP", "1" });
+    try {
+        if (auto rawPtr = reinterpret_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_raymarch.hlsl", defines, "cs_5_0")))
+            raymarchDiffuseHeatmapCS.attach(rawPtr);
+    } catch (...) {
+    }
+    if (!raymarchDiffuseHeatmapCS) {
+        raymarchDiffuseHeatmapFailed = true;
+        Util::Nvapi::DisableForSession(Util::Nvapi::Item::TimerHeatmap, "The SSRT heatmap shader failed to build");
+    }
+    return raymarchDiffuseHeatmapCS.get();
 }
 
 // (guard G8) The SVGF history is the only state in this feature that outlives a frame, and
@@ -2625,7 +2680,7 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
 
         context->CSSetShaderResources(0, 5, srvs.data());
         context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
-        context->CSSetShader(varianceCS.get(), nullptr, 0);
+        context->CSSetShader(SelectVarianceShader(), nullptr, 0);  // (45c) NvAny twin when on
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();
@@ -3203,12 +3258,30 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 
     // (batch 12) samplingMode is kSamplingFull whenever SHARC is on -- ResolveSamplingMode forces
     // it -- so the two selectors below cannot both fire.
-    context->CSSetShader(settings.EnableSharc ? raymarchDiffuseSharcCS.get() : SelectDiffuseRaymarchShader(samplingMode), nullptr, 0);
+    ID3D11ComputeShader* traceShader = settings.EnableSharc ? raymarchDiffuseSharcCS.get() : SelectDiffuseRaymarchShader(samplingMode);
 #else
-    context->CSSetShader(SelectDiffuseRaymarchShader(samplingMode), nullptr, 0);
+    ID3D11ComputeShader* traceShader = SelectDiffuseRaymarchShader(samplingMode);
 #endif
+    // (45c) Diagnostic timer heatmap: only on the full-density, non-SHARC permutation, swapped for its
+    // twin that also writes the per-tile cost at u7 (one cell per 8x8 group = per dispatched group).
+    ID3D11UnorderedAccessView* heatmapUAV = nullptr;
+    if (traceShader && traceShader == raymarchDiffuseCS.get() && Util::Nvapi::Use(Util::Nvapi::Item::TimerHeatmap)) {
+        if (auto* heatmapShader = GetDiffuseRaymarchHeatmapShader()) {
+            heatmapUAV = Util::NvTimerHeatmap::Begin(context, traceDispatchX, traceDispatchY, 64u * std::max(compiledDiffuseSPP, 1u));
+            if (heatmapUAV) {
+                traceShader = heatmapShader;
+                context->CSSetUnorderedAccessViews(7, 1, &heatmapUAV, nullptr);
+            }
+        }
+    }
+    context->CSSetShader(traceShader, nullptr, 0);
     context->Dispatch(traceDispatchX, traceDispatchY, 1);
     resetViews();
+    if (heatmapUAV) {
+        ID3D11UnorderedAccessView* nullHeatmapUAV = nullptr;
+        context->CSSetUnorderedAccessViews(7, 1, &nullHeatmapUAV, nullptr);
+        Util::NvTimerHeatmap::End(context);
+    }
 
     Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSRTTraceDiffuse);
 
@@ -3420,7 +3493,7 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
 
         context->CSSetShaderResources(0, 5, srvs.data());
         context->CSSetUnorderedAccessViews(0, 1, uavs.data(), nullptr);
-        context->CSSetShader(varianceCS.get(), nullptr, 0);
+        context->CSSetShader(SelectVarianceShader(), nullptr, 0);  // (45c) NvAny twin when on
 
         context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
         resetViews();

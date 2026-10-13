@@ -73,6 +73,8 @@ namespace Util
 		VanillaHDR,
 		// (45) Ray Tracing (prototype): depth copy, the wait for the D3D12 trace, and the shadow mask combine.
 		RayTracing,
+		// (45c) Grass culling submission (every bucket's cull dispatch + LOD count copies), taken out of GrassOptimizations.
+		GrassCulling,
 		Count
 	};
 

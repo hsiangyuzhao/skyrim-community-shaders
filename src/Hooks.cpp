@@ -19,6 +19,7 @@
 #include "Utils/EngineTiming.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/Nvapi.h"
 #include "Utils/OcclusionDryRun.h"
 
 #include "Features/GrassOptimizations.h"
@@ -430,6 +431,10 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
 		ppDevice,
 		pFeatureLevel,
 		ppImmediateContext);
+
+	// (45c) Before the engine or any feature creates a shader: sets the global NVIDIA shader-extension slot.
+	if (SUCCEEDED(ret) && ppDevice && *ppDevice)
+		Util::Nvapi::OnDeviceCreated(*ppDevice);
 
 	return ret;
 }

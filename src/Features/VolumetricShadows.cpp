@@ -6,6 +6,7 @@
 #include "State.h"
 #include "Util.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/Nvapi.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	VolumetricShadows::Settings,
@@ -223,14 +224,19 @@ void VolumetricShadows::OnShadowCapture(ID3D11ShaderResourceView* a_shadowMap)
 	const uint32_t groups = srcDesc.Width / 16;
 
 	ID3D11UnorderedAccessView* uav = vsmMipUAV[0].get();
-	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-	context->CSSetShader(downsampleMip0CS, nullptr, 0);
-	context->Dispatch(groups, groups, 1);
+	{
+		// (45c) Independent: mip 0 and mip 1 are different subresources of the VSM (one UAV each), and
+		// both passes only read the shadow cascades / god-ray maps.
+		Util::Nvapi::UavOverlapScope overlap(context);
+		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		context->CSSetShader(downsampleMip0CS, nullptr, 0);
+		context->Dispatch(groups, groups, 1);
 
-	uav = vsmMipUAV[1].get();
-	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-	context->CSSetShader(downsampleMip1CS, nullptr, 0);
-	context->Dispatch(groups, groups, 1);
+		uav = vsmMipUAV[1].get();
+		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		context->CSSetShader(downsampleMip1CS, nullptr, 0);
+		context->Dispatch(groups, groups, 1);
+	}
 
 	ID3D11ShaderResourceView* nullSrvs[2]{};
 	ID3D11UnorderedAccessView* nullUav = nullptr;
@@ -239,6 +245,32 @@ void VolumetricShadows::OnShadowCapture(ID3D11ShaderResourceView* a_shadowMap)
 
 	// 11-tap separable Gaussian, per mip: VSM -> temp (horizontal), temp -> VSM (vertical).
 	constexpr uint32_t kGroup = 128;
+	if (Util::Nvapi::Use(Util::Nvapi::Item::UavOverlap)) {
+		// (45c) Same four passes reordered H0 H1 | V0 V1, each pair in one overlap scope. Independent
+		// within a pair: H<mip> reads VSM mip <mip> and writes temp mip <mip>, V<mip> reads temp mip <mip>
+		// and writes VSM mip <mip>, so the two members of a pair touch disjoint subresources. Between the
+		// pairs normal synchronisation applies (each V needs its own H).
+		for (uint32_t pass = 0; pass < 2; ++pass) {
+			const bool vertical = pass == 1;
+			Util::Nvapi::UavOverlapScope overlap(context);
+			for (uint32_t mip = 0; mip < 2; ++mip) {
+				const uint32_t size = kVsmSize >> mip;
+				ID3D11ShaderResourceView* srv = vertical ? blurMipSRV[mip].get() : vsmMipSRV[mip].get();
+				uav = vertical ? vsmMipUAV[mip].get() : blurMipUAV[mip].get();
+				// Unbind first: the previous pair's output is this pair's input and vice versa.
+				context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+				context->CSSetShaderResources(0, 1, &srv);
+				context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+				context->CSSetShader(vertical ? blurVCS : blurHCS, nullptr, 0);
+				if (vertical)
+					context->Dispatch(size, (size + kGroup - 1) / kGroup, 1);
+				else
+					context->Dispatch((size + kGroup - 1) / kGroup, size, 1);
+			}
+		}
+		context->CSSetShaderResources(0, 1, nullSrvs);
+		context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+	} else  // without UAV overlap: the original order, H0 V0 H1 V1
 	for (uint32_t mip = 0; mip < 2; ++mip) {
 		const uint32_t size = kVsmSize >> mip;
 

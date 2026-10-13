@@ -3,6 +3,9 @@
 #include "Menu.h"
 #include "State.h"
 #include "Util.h"
+#include "Utils/Nvapi.h"
+
+#include <optional>
 
 #include <DDSTextureLoader.h>
 #include <DirectXTex.h>
@@ -635,6 +638,9 @@ void DoF::Draw(TextureInfo& inout_tex)
 		state->EndPerfEvent();
 	}
 
+	// (45c) Near Blur and Tent Filter in one NVIDIA UAV-overlap scope (opened after Far Blur, see below).
+	std::optional<Util::Nvapi::UavOverlapScope> nearTentOverlap;
+
 	// Blur
 	{
 		state->BeginPerfEvent("Pre Blur");
@@ -668,6 +674,10 @@ void DoF::Draw(TextureInfo& inout_tex)
 		resetViews();
 		state->EndPerfEvent();
 
+		// (45c) Independent: Near Blur writes only texNearBlurred and Tent Filter only texBlurredFiltered;
+		// both only read texFarBlurred (finished by the scope's opening wait) and inputs neither writes.
+		nearTentOverlap.emplace(context);
+
 		state->BeginPerfEvent("Near Blur");
 		srvs.at(0) = texFarBlurred->srv.get();
 		srvs.at(3) = texCoCTileNeighbor->srv.get();
@@ -700,6 +710,7 @@ void DoF::Draw(TextureInfo& inout_tex)
 		resetViews();
 		state->EndPerfEvent();
 	}
+	nearTentOverlap.reset();  // the Combiner reads both outputs
 
 	// Combiner
 	{

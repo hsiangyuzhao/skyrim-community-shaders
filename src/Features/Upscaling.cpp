@@ -22,6 +22,7 @@
 #include "Utils/EngineTiming.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/Nvapi.h"
 #include "Utils/DisplayHDRInfo.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -158,6 +159,9 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 				pFeatureLevel,
 				ppImmediateContext));
 
+			// (45c) Before the engine or any feature creates a shader: sets the global NVIDIA shader-extension slot.
+			Util::Nvapi::OnDeviceCreated(*ppDevice);
+
 			upscaling.SetProxyD3D11Device(*ppDevice);
 			upscaling.SetProxyD3D11DeviceContext(*ppImmediateContext);
 			upscaling.CreateProxySwapChain(pAdapter, *pSwapChainDesc);
@@ -204,6 +208,10 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 		ppDevice,
 		pFeatureLevel,
 		ppImmediateContext);
+
+	// (45c) Before the engine or any feature creates a shader: sets the global NVIDIA shader-extension slot.
+	if (SUCCEEDED(ret) && ppDevice && *ppDevice)
+		Util::Nvapi::OnDeviceCreated(*ppDevice);
 
 	// if (upscaling.IsBackendInitialized()) {
 	// 	upscaling.UpgradeBackendInterface((void**)&(*ppDevice));

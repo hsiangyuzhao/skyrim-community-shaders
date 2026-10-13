@@ -120,6 +120,9 @@ namespace Util
 			{ "Ray Tracing",
 				"GPU time of ray-traced sun shadows as the frame sees it: copying depth for the ray tracer, waiting for its D3D12 work "
 				"(building the scene and tracing), and merging the result into the shadow mask. The D3D12 part alone is on the Ray Tracing page." },
+			{ "Grass Culling",
+				"GPU time for Grass Optimizations' per-instance culling: one compute pass per visible grass type deciding which grass "
+				"is drawn and at which detail level. Not counted in the Grass Optimizations row. Advanced > NVIDIA can speed it up." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
@@ -737,6 +740,9 @@ namespace Util
 			{ "GrassOptimizations", "Grass Optimizations",
 				"CPU time for Grass Optimizations' per-frame work: sorting newly loaded grass and choosing what to draw. "
 				"Drawing the grass itself stays in the Grass row of the table above." },
+			{ "GrassCulling", "Grass Culling",
+				"(45c) CPU time for sending Grass Optimizations' culling work to the GPU: per-type constants, the visible-cell table "
+				"and one compute pass per visible grass type. Not counted in the Grass Optimizations row." },
 		};
 
 		const CpuBucketDoc* FindCpuDoc(std::string_view a_key)

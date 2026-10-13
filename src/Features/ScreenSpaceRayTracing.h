@@ -2,6 +2,7 @@
 #define ENABLE_SHARC
 
 #include "NRD.h"
+#include "Utils/Nvapi.h"
 
 struct ScreenSpaceRayTracing : Feature
 {
@@ -1831,6 +1832,22 @@ struct ScreenSpaceRayTracing : Feature
     /// than the whole denoiser failing -- the production permutation is the one gameplay uses.
     winrt::com_ptr<ID3D11ComputeShader> temporalDiagCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> varianceCS = nullptr;
+    /// @brief (45c) ssrt_variance.hlsl with NV_SHADER_EXTN: the group vote taken per warp with NvAny.
+    /// Built next to varianceCS only when the driver supports it; null otherwise.
+    winrt::com_ptr<ID3D11ComputeShader> varianceNvCS = nullptr;
+    /// @brief (45c) Diagnostic: the full-density diffuse ray march with the NVIDIA global-timer heatmap
+    /// (SSRT_NV_TIMER_HEATMAP). Compiled on first use while Advanced > NVIDIA > Timer heatmap is on.
+    winrt::com_ptr<ID3D11ComputeShader> raymarchDiffuseHeatmapCS = nullptr;
+    bool raymarchDiffuseHeatmapFailed = false;
+    /// The full-density diffuse permutation's defines as of the last CompileComputeShaders (nullptr values
+    /// stored as ""), so the heatmap twin is built from exactly the same axes.
+    std::vector<std::pair<std::string, std::string>> heatmapDefineStore;
+    /// @brief (45c) Builds raymarchDiffuseHeatmapCS on demand; null when unavailable.
+    ID3D11ComputeShader* GetDiffuseRaymarchHeatmapShader();
+    [[nodiscard]] ID3D11ComputeShader* SelectVarianceShader() const
+    {
+        return varianceNvCS && Util::Nvapi::Use(Util::Nvapi::Item::ShaderExtensions) ? varianceNvCS.get() : varianceCS.get();
+    }
     winrt::com_ptr<ID3D11ComputeShader> spatialCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialSpecularCS = nullptr;
     /// @brief (batch 12) The two sparse ray-march permutations and their two resolve passes.

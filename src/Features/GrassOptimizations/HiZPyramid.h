@@ -85,6 +85,9 @@ private:
 	// Latch failed compiles until ClearShaderCache() so the per-frame build doesn't retry and re-log.
 	bool baseCSFailed = false;
 	bool spdCSFailed = false;
+	// (45c) SPD with the NVIDIA warp-shuffle quad reduce (NV_SHADER_EXTN); null when unsupported or failed.
+	ID3D11ComputeShader* spdCSNv = nullptr;
+	bool spdCSNvFailed = false;
 
 	uint32_t width = 0;
 	uint32_t height = 0;
