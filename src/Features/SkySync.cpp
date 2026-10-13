@@ -9,14 +9,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	UseAlternateSunPath,
 	MoonLightSource,
 	SunPath,
-	CustomAngle,
-	MoonOrbit,
-	MasserNightPosition,
-	SecundaNightPosition,
-	NightArc,
-	KeepMoonPosition,
-	LightSourceModel,
-	BothMoonsLight)
+	CustomAngle)
+// (44h) removed MoonOrbit, MasserNightPosition, SecundaNightPosition, NightArc, KeepMoonPosition,
+// LightSourceModel, BothMoonsLight: pinned in Effective() (Stable orbit, discs kept, Combined, both
+// moons); the Night Sky sliders only applied to the Night Sky orbit. Old keys are ignored on load.
+// Code paths kept for a possible rollback (specs/physsky-rollback-candidates.md).
 
 void SkySync::DrawSettings()
 {
@@ -42,75 +39,25 @@ void SkySync::DrawSettings()
 
 	ImGui::SliderInt("Moon light source", &settings.MoonLightSource, 0, static_cast<uint8_t>(MoonLightSource::Count) - 1, MoonLightSourceNames[settings.MoonLightSource], ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Which moon lights the night. Brightest = whichever moon is brighter (recommended: when one moon\n"
-			"sets, the other takes over). Masser or Secunda: only that moon, so the night goes dark when it sets.");
+		ImGui::Text("Which moon casts the shadows at night (both moons still add their light). If the chosen moon is not up, the other one takes over.");
 
+	// (44h) removed "Light Source Model", "Both Moons Light the Scene", "Moon Orbit" (with the Night Sky
+	// sliders) and "Keep Moons Where the Game Puts Them": pinned in Effective(). Code paths kept for a
+	// possible rollback (specs/physsky-rollback-candidates.md).
 	if (globals::features::physicalSky.IsLegacy())
-		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Physical Sky's Sky Model is Legacy (36f): Light Source Model is Clock right now.");
-	if (ImGui::Combo("Light Source Model", &settings.LightSourceModel, LightSourceModelNames, static_cast<int>(LightSourceModel::Count)))
-		settings.LightSourceModel = std::clamp(settings.LightSourceModel, 0, static_cast<int32_t>(LightSourceModel::Count) - 1);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::TextUnformatted(
-			"How the one sun/moon light (the light that casts shadows) is chosen.\n"
-			"Combined (default): sun and moon light are added together, each by how high it really is in the\n"
-			"sky. The sun keeps a faint warm glow until a few degrees below the horizon, the moons come in as\n"
-			"they rise and fade as the sun comes up, so dawn and dusk have no dark gap. Shadows come from the\n"
-			"brightest body; when that changes, the light turns over (nearby) or dips for a few seconds and\n"
-			"comes back from the new side (far apart), instead of sweeping across the sky.\n"
-			"Clock (old): the sun from 6:30 to 19:30, a moon outside that, switched by the clock. Before\n"
-			"sunrise and after sunset there was a stretch with no light at all.");
-	if (settings.LightSourceModel == static_cast<int32_t>(LightSourceModel::Combined)) {
-		ImGui::Checkbox("Both Moons Light the Scene", &settings.BothMoonsLight);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"On: Masser and Secunda both add their light (each by its phase and height), so a night with\n"
-				"both moons up is brighter. Shadows still come from the moon picked above.\n"
-				"Off (default): only the moon picked by \"Moon light source\" lights the scene, as bright as before.");
-	}
-
-	if (globals::features::physicalSky.IsLegacy())
-		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Physical Sky's Sky Model is Legacy (36f): Moon Orbit is Vanilla and the discs\nare lowered by altitude right now, whatever is set below.");
-	ImGui::Combo("Moon Orbit", &settings.MoonOrbit, MoonOrbitNames, static_cast<int>(MoonOrbit::Count));
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::TextUnformatted(
-			"Where Masser and Secunda are in the sky.\n"
-			"Night Sky (default): both moons are up every night, Secunda a little ahead of Masser on the same path across the sky.\n"
-			"  They are up at dusk, cross the sky slowly through the night and set after dawn.\n"
-			"Stable: each moon follows the date and time at its own speed (Masser overhead at midnight).\n"
-			"  Secunda is faster and drifts a fifth of a turn a day, so it is up at night only about 2 nights in 5.\n"
-			"Vanilla: the game's own stepping. Changing the time throws Secunda to a new place each time.");
-	if (settings.MoonOrbit == static_cast<int32_t>(MoonOrbit::NightSky)) {
-		ImGui::SliderFloat("Masser Position", &settings.MasserNightPosition, -60.0f, 60.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Where Masser is along its path at the middle of the night, in degrees from its highest point.\n"
-				"Negative = towards the side it rises on. Default -15.");
-		ImGui::SliderFloat("Secunda Position", &settings.SecundaNightPosition, -60.0f, 60.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Same for Secunda. Default +15: about 25 degrees from Masser in the sky, close but not touching.\n"
-				"Both at the same number puts Secunda against Masser's lower edge, as the game often does.");
-		ImGui::SliderFloat("Movement Through the Night", &settings.NightArc, 0.0f, 140.0f, "%.0f degrees", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"How far the moons travel from dusk to dawn. 0 = they stand still all night.\n"
-				"Above about 80 with the default positions, a moon starts the night or ends it low and faint.");
-	}
-	if (!REL::Module::IsSE())
-		ImGui::TextDisabled("(Stable and Night Sky only work on Skyrim SE 1.5.97; Vanilla is used here)");
-
-	ImGui::Checkbox("Keep Moons Where the Game Puts Them", &settings.KeepMoonPosition);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::TextUnformatted(
-			"On (default): Sky Sync no longer lowers the moon discs by your altitude (1.5-4 degrees), as in current\n"
-			"upstream; Physical Sky's moon glow follows the disc's real position on screen. The moonlight direction is\n"
-			"unchanged. Off: the discs are lowered as before and the glow uses the un-lowered direction.");
+		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Physical Sky's Sky Model is Legacy (36f): moons and moonlight work as in 36f right now.");
 }
 
 SkySync::Settings SkySync::Effective() const
 {
 	Settings s = settings;
+	// (44h) No longer user settings: pinned here so every reader gets them (Combined light model, both
+	// moons in the sum, Stable orbit, discs left where the game puts them). Legacy (36f) below still
+	// sets its 36f values.
+	s.LightSourceModel = static_cast<int32_t>(LightSourceModel::Combined);
+	s.BothMoonsLight = true;
+	s.MoonOrbit = static_cast<int32_t>(MoonOrbit::Stable);
+	s.KeepMoonPosition = true;
 	if (globals::features::physicalSky.IsLegacy()) {
 		// 36f: the engine's own moon stepping, discs lowered by altitude (40d/40e options off).
 		s.MoonOrbit = static_cast<int32_t>(MoonOrbit::Vanilla);
@@ -280,7 +227,7 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 	// Which moons are in the sum.
 	const auto src = static_cast<MoonLightSource>(settings.MoonLightSource);
 	float share[3] = { 1.0f, 0.0f, 0.0f };
-	if (settings.BothMoonsLight) {
+	if (Effective().BothMoonsLight) {
 		share[masserIdx] = 1.0f;
 		share[secundaIdx] = 1.0f;
 	} else if (src == MoonLightSource::Masser) {
@@ -295,10 +242,22 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 	}
 
 	// Direction: the brightest body, among the moons only those "Moon light source" allows.
+	// (44h) With Masser or Secunda picked, the other moon may cast the shadows while the picked one has
+	// no light (below the horizon, gone, faded by day) and the other one is in the sum; as soon as the
+	// picked moon has light again it is the only moon allowed, and the hand-over below (turn, or fade
+	// out and back in) moves the light back to it smoothly.
+	auto moonAllowed = [&](const int i) {
+		if (src == MoonLightSource::Brightest)
+			return true;
+		const int picked = src == MoonLightSource::Masser ? masserIdx : secundaIdx;
+		if (i == picked)
+			return true;
+		return !(weight[picked] > 0.0f) && share[i] > 0.0f;
+	};
 	auto best = Caster::None;
 	float bestWeight = 0.0f;
 	for (int i = 0; i < 3; ++i) {
-		if ((i == masserIdx && src == MoonLightSource::Secunda) || (i == secundaIdx && src == MoonLightSource::Masser))
+		if (i != sunIdx && !moonAllowed(i))
 			continue;
 		if (weight[i] > bestWeight) {
 			bestWeight = weight[i];
@@ -308,7 +267,7 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 	// Hysteresis (D1): the body the light is heading to keeps it until another is clearly brighter.
 	if (const auto held = combinedHandover.target; held != Caster::None && best != held) {
 		const float heldWeight = weight[static_cast<int>(held)];
-		const bool heldAllowed = !((held == Caster::Masser && src == MoonLightSource::Secunda) || (held == Caster::Secunda && src == MoonLightSource::Masser));
+		const bool heldAllowed = held == Caster::Sun || moonAllowed(static_cast<int>(held));
 		if (heldAllowed && heldWeight > 0.0f && bestWeight < heldWeight * CombinedHandover::Hysteresis)
 			best = held;
 	}

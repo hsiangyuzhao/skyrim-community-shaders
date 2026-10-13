@@ -35,6 +35,9 @@ public:
 		int32_t MoonLightSource = 0;
 		int32_t SunPath = 0;
 		float CustomAngle = -35.0f;
+		// (44h) The fields below are no longer in the menu or the JSON: Effective() pins MoonOrbit =
+		// Stable, KeepMoonPosition = on, LightSourceModel = Combined, BothMoonsLight = on (Legacy (36f)
+		// still overrides). Kept for a possible rollback (specs/physsky-rollback-candidates.md).
 		/// (40e) Where the moons are placed (MoonOrbit values):
 		/// 0 Vanilla: the engine steps each orbit angle forward every frame (a backwards time change
 		///   counts as +24 h; Secunda, 20% faster than Masser, lands somewhere new on every skip).
