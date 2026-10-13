@@ -17,7 +17,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SampleCount,
 	SurfaceThickness,
 	BilinearThreshold,
-	ShadowContrast)
+	ShadowContrast,
+	WorldSpaceThickness,
+	MinThickness,
+	ContactLength,
+	EdgeSmoothing)
 
 void ScreenSpaceShadows::DrawSettings()
 {
@@ -37,6 +41,19 @@ void ScreenSpaceShadows::DrawSettings()
 		ImGui::SliderFloat("Shadow Contrast", &bendSettings.ShadowContrast, 0.0f, 4.0f);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Sharpens the fade into and out of shadow. Higher = harder, darker contact shadows.");
+
+		ImGui::Spacing();
+		ImGui::Checkbox("World-Space Thickness", (bool*)&bendSettings.WorldSpaceThickness);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Treats objects as at least Min Thickness deep, so long shadows come out solid instead of hollow, and fades shadows from casters farther than Contact Length. Off = the old behaviour.");
+		if (bendSettings.WorldSpaceThickness) {
+			ImGui::SliderFloat("Min Thickness", &bendSettings.MinThickness, 0.0f, 100.0f, "%.0f units");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How deep an object is assumed to be at least, in game units (70 = 1 m). Higher = fuller shadows, but more shadow leaking behind thin objects.");
+			ImGui::SliderFloat("Contact Length", &bendSettings.ContactLength, 30.0f, 1000.0f, "%.0f units");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Shadows from casters farther away than this (along the sun's direction) fade out. Lower = only short contact shadows; higher = longer ones, with more mistakes far away.");
+		}
 
 		ImGui::Spacing();
 		ImGui::Spacing();
@@ -165,6 +182,39 @@ void ScreenSpaceShadows::DrawShadows()
 
 	float2 dynamicRes = { viewport->GetRuntimeData().dynamicResolutionWidthRatio, viewport->GetRuntimeData().dynamicResolutionHeightRatio };
 
+	// Data shared by every dispatch (and by the edge smoothing pass)
+	RaymarchCB common{};
+	common.FarDepthValue = 1.0f;
+	common.NearDepthValue = 0.0f;
+	common.DynamicRes = dynamicRes;
+	common.InvDepthTextureSize[0] = 1.0f / (float)viewportSize[0];
+	common.InvDepthTextureSize[1] = 1.0f / (float)viewportSize[1];
+	common.settings = bendSettings;
+	common.settings.SampleCount = std::clamp(bendSettings.SampleCount, 1u, 4u);
+	{
+		// (45 SSS) World-Space Thickness: linear depth, the sun in view space and the projection scale.
+		const float4 cameraData = Util::GetCameraData();
+		common.CameraData[0] = cameraData.x;
+		common.CameraData[1] = cameraData.y;
+		common.CameraData[2] = cameraData.z;
+		common.CameraData[3] = cameraData.w;
+
+		auto viewMat = globals::game::frameBufferCached.GetCameraView(0).Transpose();
+		auto sunVS = DirectX::SimpleMath::Vector4::Transform(lightProjection, viewMat);
+		float3 sunDirVS = { sunVS.x, sunVS.y, sunVS.z };
+		sunDirVS.Normalize();
+		common.SunDirVS[0] = sunDirVS.x;
+		common.SunDirVS[1] = sunDirVS.y;
+		common.SunDirVS[2] = sunDirVS.z;
+		common.SunDirVS[3] = 0.0f;
+
+		const auto& proj = globals::game::frameBufferCached.GetCameraProj(0);
+		common.ProjInfo[0] = proj._11 != 0.0f ? 1.0f / proj._11 : 1.0f;
+		common.ProjInfo[1] = proj._22 != 0.0f ? 1.0f / proj._22 : 1.0f;
+		common.ProjInfo[2] = (float)viewportSize[0];
+		common.ProjInfo[3] = (float)viewportSize[1];
+	}
+
 	// Shared dispatch logic for both VR and non-VR
 	auto DispatchEye = [&](const char* eyeName, ID3D11ComputeShader* shader, const float* lightProj,
 						   float invTexSizeX, float invTexSizeY) {
@@ -188,7 +238,7 @@ void ScreenSpaceShadows::DrawShadows()
 
 			auto dispatchData = dispatchList.Dispatch[i];
 
-			RaymarchCB data{};
+			RaymarchCB data = common;
 			data.LightCoordinate[0] = dispatchList.LightCoordinate_Shader[0];
 			data.LightCoordinate[1] = dispatchList.LightCoordinate_Shader[1];
 			data.LightCoordinate[2] = dispatchList.LightCoordinate_Shader[2];
@@ -197,15 +247,8 @@ void ScreenSpaceShadows::DrawShadows()
 			data.WaveOffset[0] = dispatchData.WaveOffset_Shader[0];
 			data.WaveOffset[1] = dispatchData.WaveOffset_Shader[1];
 
-			data.FarDepthValue = 1.0f;
-			data.NearDepthValue = 0.0f;
-
-			data.DynamicRes = dynamicRes;
-
 			data.InvDepthTextureSize[0] = invTexSizeX;
 			data.InvDepthTextureSize[1] = invTexSizeY;
-
-			data.settings = bendSettings;
 
 			raymarchCB->Update(data);
 

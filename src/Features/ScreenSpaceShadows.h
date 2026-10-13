@@ -31,13 +31,19 @@ public:
 
 	struct BendSettings
 	{
-		float SurfaceThickness = 0.02f;
+		// (45 SSS) Code defaults 0.02 -> 0.01 and 1.0 -> 2.5 (Bend recommends contrast 2-4); saved values are kept.
+		float SurfaceThickness = 0.01f;
 		float BilinearThreshold = 0.02f;
-		float ShadowContrast = 1.0f;
+		float ShadowContrast = 2.5f;
 		uint Enable = 1;
 		uint SampleCount = 1;
+		uint WorldSpaceThickness = 1;  ///< (45 SSS) occluder window >= MinThickness units + contact-length fade; 0 = original Bend math
+		float MinThickness = 30.0f;    ///< (45 SSS) game units (70 units = 1 m)
+		float ContactLength = 150.0f;  ///< (45 SSS) game units along the light ray before casters start to fade
+		uint EdgeSmoothing = 1;        ///< (45 SSS) 3x3 depth-aware blur of the mask, per frame only
 		uint pad0[3];
 	};
+	static_assert(sizeof(BendSettings) == 48, "BendSettings must match ScreenSpaceShadows/RaymarchCB.hlsli");
 
 	BendSettings bendSettings;
 
@@ -62,9 +68,15 @@ public:
 		// render size, so the shader no longer needs a runtime loop limit.
 
 		BendSettings settings;
+
+		// (45 SSS) World-Space Thickness / Edge Smoothing data
+		float CameraData[4];  // far, near, far - near, far * near (Util::GetCameraData)
+		float SunDirVS[4];    // towards the sun, view space
+		float ProjInfo[4];    // 1 / P00, 1 / P11, render width, render height
 	};
 	STATIC_ASSERT_ALIGNAS_16(RaymarchCB);
 	static_assert(offsetof(RaymarchCB, settings) == 48, "RaymarchCB must match ScreenSpaceShadows/RaymarchCB.hlsli");
+	static_assert(offsetof(RaymarchCB, CameraData) == 96, "RaymarchCB must match ScreenSpaceShadows/RaymarchCB.hlsli");
 
 	ID3D11SamplerState* pointBorderSampler = nullptr;
 

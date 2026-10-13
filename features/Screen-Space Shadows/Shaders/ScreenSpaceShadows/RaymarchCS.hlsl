@@ -40,5 +40,12 @@ SamplerState PointBorderSampler : register(s0);        // A point sampler, with 
 
 	parameters.UsePrecisionOffset = true;
 
+	parameters.WorldSpaceThickness = WorldSpaceThickness != 0;
+	parameters.MinThickness = MinThickness;
+	parameters.ContactLength = ContactLength;
+	parameters.CameraData = CameraData;
+	parameters.SunDirVS = SunDirVS.xyz;
+	parameters.ProjInfo = ProjInfo.xy;
+
 	WriteScreenSpaceShadow(parameters, groupID, groupThreadID);
 }

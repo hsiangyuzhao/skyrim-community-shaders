@@ -61,6 +61,14 @@ struct DispatchParameters
 	// (45 SSS) SAMPLE_COUNT is compiled from the render (dynamic) resolution, so the per-dispatch
 	// DynamicSampleCount / DynamicReadCount loop breaks are gone (the read-loop one never fired).
 
+	// (45 SSS) World-Space Thickness toggle (false = the original Bend path, unchanged).
+	bool WorldSpaceThickness;
+	float MinThickness;   // minimum occluder depth window, game units
+	float ContactLength;  // casters farther than this along the light ray fade out over the next ContactLength
+	float4 CameraData;    // SharedData::CameraData layout (far, near, far - near, far * near)
+	float3 SunDirVS;      // direction towards the sun, view space, normalized
+	float2 ProjInfo;      // 1 / P00, 1 / P11 of the camera projection
+
 	bool IgnoreEdgePixels;  // If an edge is detected, the edge pixel will not contribute to the shadow.
 							// If a very flat surface is being lit and rendered at an grazing angles, the edge detect may incorrectly detect multiple 'edge' pixels along that flat surface.
 							// In these cases, the grazing angle of the light may subsequently produce aliasing artefacts in the shadow where these incorrect edges were detected.
@@ -101,6 +109,12 @@ struct DispatchParameters
 		DebugOutputEdgeMask = false;
 		DebugOutputThreadIndex = false;
 		DebugOutputWaveIndex = false;
+		WorldSpaceThickness = false;
+		MinThickness = 0;
+		ContactLength = 1e6;
+		CameraData = 0;
+		SunDirVS = float3(0, 0, 1);
+		ProjInfo = 1;
 	}
 
 	// Runtime data returned from BuildDispatchList():
@@ -235,7 +249,14 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 		// Interpolation should only occur on the minor axis of the ray - major axis coordinates should be at pixel centers
 		half2 read_xy = floor(pixel_xy);
 
-		read_xy *= inParameters.DynamicRes;
+		// (45 SSS) World-Space Thickness path also takes upstream's coordinate fix: apply DynamicRes
+		// after the half-pixel and neighbour offsets, so the bilinear neighbour is exactly one texel
+		// away (with DLSS at 67% it was 1.5 texels). Off = the old order, unchanged.
+		half2 coord_scale = inParameters.InvDepthTextureSize;
+		if (inParameters.WorldSpaceThickness)
+			coord_scale *= inParameters.DynamicRes;
+		else
+			read_xy *= inParameters.DynamicRes;
 
 #	if defined(VR)
 		read_xy *= half2(0.5, 1.0);
@@ -258,8 +279,8 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 
 		// HLSL enforces that a pixel offset is a compile-time constant, which isn't strictly required (and can sometimes be a bit faster)
 		// So this fallback will use a manual uv offset instead
-		half2 coord = read_xy * inParameters.InvDepthTextureSize;
-		half2 coord_with_offset = (read_xy + offset_xy) * inParameters.InvDepthTextureSize;
+		half2 coord = read_xy * coord_scale;
+		half2 coord_with_offset = (read_xy + offset_xy) * coord_scale;
 
 #	if defined(VR)
 #		if defined(RIGHT)
@@ -358,7 +379,28 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 	// Start by reading the next value
 	int sample_index = inGroupThreadID.x + 1;
 
-	half4 shadow_value = 1;
+	// (45 SSS) World-Space Thickness: the occluder window is at least MinThickness game units deep
+	// (SurfaceThickness alone is a fraction of the distance: 0.01 = ~2 units at 3 m, which made long
+	// shadows hollow), and casters farther than ContactLength along the light ray fade out over the
+	// next ContactLength (the ray is a fixed number of pixels, so far away it reached metres).
+	half surface_thickness = inParameters.SurfaceThickness;
+	float world_per_sample = 0;
+	[branch] if (inParameters.WorldSpaceThickness)
+	{
+		const float4 cam = inParameters.CameraData;
+		const float view_z = max(cam.w / (-sampling_depth[0] * cam.z + cam.x), 1.0);
+		// Window ~= SurfaceThickness * z game units (1 - depth ~= near / z), so this floors it.
+		surface_thickness = max(surface_thickness, inParameters.MinThickness / view_z);
+
+		// Game units travelled along the light ray per sample: screen motion of P + t*L is
+		// |L.xy - s * L.z| / z in tan units per unit t, with s this pixel's view ray (x/z, y/z).
+		const float2 ndc = float2(2.0 * (write_xy.x + 0.5) * inParameters.InvDepthTextureSize.x - 1.0, 1.0 - 2.0 * (write_xy.y + 0.5) * inParameters.InvDepthTextureSize.y);
+		const float2 s = ndc * inParameters.ProjInfo.xy;
+		const float screen_rate = length(inParameters.SunDirVS.xy - s * inParameters.SunDirVS.z);
+		const float tan_per_pixel = 2.0 * abs(inParameters.ProjInfo.y) * inParameters.InvDepthTextureSize.y;
+		const float pixels_per_sample = length((float2)xy_delta) / WAVE_SIZE;
+		world_per_sample = pixels_per_sample * view_z * tan_per_pixel / max(screen_rate, 1e-4);
+	}
 
 	// This is the inverse of how large the shadowing window is for the projected sample data.
 	// All values in the LDS sample list are scaled by 1.0 / sample_distance, such that all light directions become parallel.
@@ -366,27 +408,48 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 	// The 1.0 / inParameters.SurfaceThickness is to adjust user selected thickness. So a 0.5% thickness will scale depth values from [0,1] to [0,200]. The shadow window is always 1 wide.
 	// 1.0 / depth_thickness_scale[0] is because SurfaceThickness is percentage of remaining depth between the sample and the far clip - not a percentage of the full depth range.
 	// The min() function is to make sure the window is a minimum width when very close to the light. The +direction term will bias the result so the pixel at the very center of the light is either fully lit or shadowed
-	half depth_scale = min(sample_distance[0] + direction, 1.0 / inParameters.SurfaceThickness) * sample_distance[0] / depth_thickness_scale[0];
+	half depth_scale = min(sample_distance[0] + direction, 1.0 / surface_thickness) * sample_distance[0] / depth_thickness_scale[0];
 
 	start_depth = start_depth * depth_scale - z_sign;
 
-	[unroll] for (i = 0; i < SAMPLE_COUNT; i++)
-	{
-		half depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
-
-		// By using 4 values, the average shadow can be taken, which can help soften single-pixel shadows.
-		shadow_value[i & 3] = min(shadow_value[i & 3], depth_delta);
-	}
-
-	// Apply the contrast value.
-	// A value of 0 indicates a sample was exactly matched to the reference depth (and the result is fully shadowed)
-	// We want some boost to this range, so samples don't have to exactly match to produce a full shadow.
-	shadow_value = saturate(shadow_value * (inParameters.ShadowContrast) + (1 - inParameters.ShadowContrast));
-
 	half result = 0;
 
-	// Take the average of 4 samples, this is useful to reduces aliasing noise in the source depth, especially with long shadows.
-	result = dot(shadow_value, 0.25);
+	[branch] if (inParameters.WorldSpaceThickness)
+	{
+		// Same contrast curve as below, applied per sample so each sample can be faded by its
+		// distance along the ray: 1 - saturate(C * (1 - d)) == saturate(d * C + 1 - C), and min()
+		// of the visibility equals max() of the occlusion, so with no fade this matches the old path.
+		const float fade_rate = world_per_sample / max(inParameters.ContactLength, 1.0);
+		half4 occlusion = 0;
+		[unroll] for (i = 0; i < SAMPLE_COUNT; i++)
+		{
+			half depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
+			half sample_occlusion = saturate(inParameters.ShadowContrast * (1 - depth_delta));
+			half fade = saturate(2.0 - (i + 1) * fade_rate);
+			occlusion[i & 3] = max(occlusion[i & 3], sample_occlusion * fade);
+		}
+		result = 1 - dot(occlusion, 0.25);
+	}
+	else
+	{
+		half4 shadow_value = 1;
+
+		[unroll] for (i = 0; i < SAMPLE_COUNT; i++)
+		{
+			half depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
+
+			// By using 4 values, the average shadow can be taken, which can help soften single-pixel shadows.
+			shadow_value[i & 3] = min(shadow_value[i & 3], depth_delta);
+		}
+
+		// Apply the contrast value.
+		// A value of 0 indicates a sample was exactly matched to the reference depth (and the result is fully shadowed)
+		// We want some boost to this range, so samples don't have to exactly match to produce a full shadow.
+		shadow_value = saturate(shadow_value * (inParameters.ShadowContrast) + (1 - inParameters.ShadowContrast));
+
+		// Take the average of 4 samples, this is useful to reduces aliasing noise in the source depth, especially with long shadows.
+		result = dot(shadow_value, 0.25);
+	}
 
 	// Asking the GPU to write scattered single-byte pixels isn't great,
 	// But thankfully the latency is hidden by all the work we're doing...

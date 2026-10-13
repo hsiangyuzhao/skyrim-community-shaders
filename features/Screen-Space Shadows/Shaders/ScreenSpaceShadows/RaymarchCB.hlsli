@@ -1,7 +1,8 @@
 #ifndef SSS_RAYMARCH_CB
 #define SSS_RAYMARCH_CB
 
-// Mirrors ScreenSpaceShadows::RaymarchCB (src/Features/ScreenSpaceShadows.h).
+// Mirrors ScreenSpaceShadows::RaymarchCB (src/Features/ScreenSpaceShadows.h). Shared by the ray
+// march and the edge smoothing pass.
 cbuffer PerFrame : register(b1)
 {
 	// Runtime data returned from BuildDispatchList():
@@ -21,6 +22,17 @@ cbuffer PerFrame : register(b1)
 	float BilinearThreshold;
 	float ShadowContrast;
 	uint SettingsEnable;
+	uint SettingsSampleCount;
+	uint WorldSpaceThickness;
+	float MinThickness;
+	float ContactLength;
+	uint EdgeSmoothing;
+	uint3 SettingsPad;
+
+	// (45 SSS) World-space path data
+	float4 CameraData;  // far, near, far - near, far * near
+	float4 SunDirVS;    // xyz: towards the sun, view space
+	float4 ProjInfo;    // 1 / P00, 1 / P11, render width, render height
 };
 
 #endif  // SSS_RAYMARCH_CB
