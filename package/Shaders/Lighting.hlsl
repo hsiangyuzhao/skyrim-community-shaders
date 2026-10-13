@@ -2481,7 +2481,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		// psout.Parameters.y, which exists only in SNOW permutations: True PBR terrain (every
 		// landscape with a PBR texture set, e.g. Vanaheimr Landscapes) has no SNOW permutation and
 		// no per-layer snow constants, so High Hrothgar's snow counted as bare ground (mud).
-		[branch] if ((snowFlags & DynamicSnow::FlagLandSnowDetect) && !snowOnActor)
+		[branch] if (!snowOnActor)
 		{
 			float authoredSnow = 0.0;
 #		if defined(LANDSCAPE)
@@ -2507,10 +2507,6 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float projectedSnow = saturate(max(projectedMaterialWeight, projWeight));
 			authoredSnow = max(authoredSnow, projectedSnow * DynamicSnow::AlbedoSnowGuess(baseColor.xyz));
 #		endif
-#		if defined(LANDSCAPE)
-			if (snowFlags & DynamicSnow::FlagAlbedoSnowGuess)
-				authoredSnow = max(authoredSnow, DynamicSnow::AlbedoSnowGuess(baseColor.xyz));
-#		endif
 			snowExisting = max(snowExisting, saturate(authoredSnow));
 		}
 
@@ -2535,27 +2531,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			else
 				float3 snowBindNormal = input.SnowBindNormal;
 #			endif
-				[branch] if (snowFlags & DynamicSnow::FlagActorRigidWorldUp)
-				{
-					// (40e) Rigid gear (shield, weapon, quiver, helmet; IsActorRigid) has a model space of
-					// its own: a shield's face is "up" in it wherever it is worn, so a shield on the back
-					// turned fully white. Its slope comes from the world vertex normal instead: an upright
-					// actor only turns about Z, which leaves the up component of a normal unchanged, so
-					// this equals the normal in the actor's own frame (inverse yaw). The noise stays in
-					// model space and so stays on the gear. Back faces (the inside of a double-sided
-					// surface) take no snow, on skinned meshes too.
-					[branch] if (Permutation::ExtraShaderDescriptor & DynamicSnow::ExtraIsActorRigid)
-						snowBindNormal = snowGeometryNormal;
-					snowBindNormal = snowBindNormal * rsqrt(max(dot(snowBindNormal, snowBindNormal), 1e-8));
-					snowCoverage = frontFace ? DynamicSnow::GetActorCoverage(input.ModelPosition.xyz, snowBindNormal, length(input.WorldPosition.xyz)) : 0.0;
-				}
-				else
-				{
-					snowBindNormal = snowBindNormal * rsqrt(max(dot(snowBindNormal, snowBindNormal), 1e-8));
-					// Double-sided cloth seen from behind: the back side faces the other way.
-					snowBindNormal = frontFace ? snowBindNormal : -snowBindNormal;
-					snowCoverage = DynamicSnow::GetActorCoverage(input.ModelPosition.xyz, snowBindNormal, length(input.WorldPosition.xyz));
-				}
+				// (40e) Rigid gear (shield, weapon, quiver, helmet; IsActorRigid) has a model space of
+				// its own: a shield's face is "up" in it wherever it is worn, so a shield on the back
+				// turned fully white. Its slope comes from the world vertex normal instead: an upright
+				// actor only turns about Z, which leaves the up component of a normal unchanged, so
+				// this equals the normal in the actor's own frame (inverse yaw). The noise stays in
+				// model space and so stays on the gear. Back faces (the inside of a double-sided
+				// surface) take no snow, on skinned meshes too.
+				[branch] if (Permutation::ExtraShaderDescriptor & DynamicSnow::ExtraIsActorRigid)
+					snowBindNormal = snowGeometryNormal;
+				snowBindNormal = snowBindNormal * rsqrt(max(dot(snowBindNormal, snowBindNormal), 1e-8));
+				snowCoverage = frontFace ? DynamicSnow::GetActorCoverage(input.ModelPosition.xyz, snowBindNormal, length(input.WorldPosition.xyz)) : 0.0;
 			}
 			else
 			{

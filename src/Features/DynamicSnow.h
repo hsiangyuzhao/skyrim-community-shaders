@@ -99,9 +99,12 @@ public:
 		bool MudTrails = false;           ///< any other terrain, as mud/dirt
 		bool TrailsFromNPCs = true;       ///< nearby actors and creatures, not only the player
 		int TrailResolution = 1;          ///< 0 = 1024 texels (4 units each), 1 = 2048 (2 units each), 2 = 4096 (1 unit each)
-		bool SmoothTrails = true;         ///< (39b) bicubic reconstruction; off = 39a's bilinear (mosaic)
-		bool DetectAuthoredSnow = true;   ///< (39b) snow ground recognised from its land texture (PBR terrain too) and white directional snow
-		bool AlbedoSnowGuess = false;     ///< (39b) also bright grey-white terrain (last resort)
+		// (44f) Permanent: bicubic print reconstruction (39b), snowy ground recognised from its land
+		// texture / white directional snow (39b), shaped prints from installed footprint textures
+		// (39c, ovals when none are found), rigid gear taking its slope from world up (40e). Removed:
+		// "Also Guess From Colour" and the "Turn Footprint Shapes Around" debug option. Old keys
+		// SmoothTrails / DetectAuthoredSnow / AlbedoSnowGuess / UseModFootprintShapes /
+		// RigidGearWorldUp / FlipPrintShapes are ignored.
 		bool SnowOnCharacters = false;    ///< (39b) accumulated snow on actors and their gear
 		float TrailSize = 1.0f;
 		float TrailDepth = 5.0f;            ///< game units
@@ -121,9 +124,6 @@ public:
 		float GrassCoverage = 0.9f;
 		bool SnowOnLodTrees = true;  ///< distant billboard trees
 		float LodTreeCoverage = 0.5f;
-		/// Print shapes from the installed footprint mods' height maps (Realistic PBR Footprints _p,
-		/// Footprints _h), loaded from the game's data; procedural ovals when none are found.
-		bool UseModFootprintShapes = true;
 		/// With the Footprints mod (Footprints.esp) loaded: leave snowy ground and mud to its decals
 		/// and print only in built-up snow, so the two never double up.
 		bool YieldToFootprintsMod = true;
@@ -147,12 +147,8 @@ public:
 		/// Even Cover: cover on roofs and slopes (steeper than about 37 degrees, rising to full by 23).
 		/// 1 = 39c (everything flatter than Full Cover From is fully white).
 		float SteepCover = 0.8f;
-		/// Snow on Characters: rigid gear (shields, weapons, quivers, helmets) takes its slope from
-		/// world up instead of its own model space, and back faces get no snow. Off = 40d.
-		bool RigidGearWorldUp = true;
 
 		// ---- Debug ----
-		bool FlipPrintShapes = false;  ///< (39c) debug: installed print textures heel/toe reversed
 		bool OverrideAmount = false;
 		float AmountOverride = 1.0f;
 	};
@@ -207,17 +203,15 @@ public:
 		FlagTrailsOnSnow = 1 << 2,
 		FlagTrailsOnAccumulated = 1 << 3,
 		FlagMudTrails = 1 << 4,
-		FlagSmoothTrails = 1 << 5,
-		FlagLandSnowDetect = 1 << 6,
-		FlagAlbedoSnowGuess = 1 << 7,
+		// 1 << 5, 6, 7: (39b) smooth prints, snowy-ground recognition, colour guess; free since 44f
+		// (the first two are permanent in the shader, the third was removed).
 		FlagSnowOnCharacters = 1 << 8,
 		// (batch 39c)
 		FlagCoverageSlope = 1 << 9,
 		FlagTrees = 1 << 10,
 		FlagGrass = 1 << 11,
 		FlagLodTrees = 1 << 12,
-		// (40e)
-		FlagActorRigidWorldUp = 1 << 13,
+		// 1 << 13: (40e) rigid gear uses world up; free since 44f (permanent in the shader).
 		// (44e)
 		FlagTrailTimeStamps = 1 << 14,
 	};

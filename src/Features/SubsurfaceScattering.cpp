@@ -4,7 +4,6 @@
 #include "Features/TerrainBlending.h"
 #include "ShaderCache.h"
 #include "State.h"
-#include "Utils/Batch38.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SubsurfaceScattering::DiffusionProfile,
@@ -15,7 +14,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	EnableCharacterLighting,
 	CharacterLightingStrength,
 	SSMode,
-	Batch38Upgrade,
 	ScatterMode,
 	BaseProfile,
 	HumanProfile,
@@ -227,8 +225,6 @@ void SubsurfaceScattering::DrawSSS()
 
 	validMaterials = false;
 
-	const bool upgrade = UpgradeActive();
-	lastDrawUsedUpgrade = upgrade;
 	lastDrawTime = std::chrono::steady_clock::now();
 
 	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SubsurfaceScattering);
@@ -245,7 +241,6 @@ void SubsurfaceScattering::DrawSSS()
 
 		blurCBData.BurleySamples = settings.BurleySamples;
 		// (batch 38) Burley always takes the albedo out fully; the scatter mode is Separable's.
-		// The 37c shaders treat both fields as padding.
 		blurCBData.ScatterMode = (settings.SSMode == 0) ?
 		                             (uint)std::clamp(settings.ScatterMode, (int)kPreScatter, (int)kPreAndPostScatter) :
 		                             (uint)kPostScatter;
@@ -271,8 +266,6 @@ void SubsurfaceScattering::DrawSSS()
 		auto albedo = renderer->GetRuntimeData().renderTargets[ALBEDO];
 		auto normal = renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
 
-		ID3D11UnorderedAccessView* uav = blurHorizontalTemp->uav.get();
-
 		auto& terrainBlending = globals::features::terrainBlending;
 
 		ID3D11ShaderResourceView* views[5];
@@ -284,76 +277,8 @@ void SubsurfaceScattering::DrawSSS()
 
 		context->CSSetShaderResources(0, ARRAYSIZE(views), views);
 
-		if (upgrade) {
-			DrawSSSUpgrade(dispatchCount);
-		} else if (settings.SSMode == 0) {
-			context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-
-			// Horizontal pass to temporary texture
-			{
-				TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Horizontal");
-
-				auto shader = GetComputeShaderHorizontalBlur();
-				context->CSSetShader(shader, nullptr, 0);
-
-				context->Dispatch(dispatchCount.x, dispatchCount.y, 1);
-			}
-
-			uav = nullptr;
-			context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-
-			// Vertical pass to main texture
-			{
-				TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Vertical");
-
-				views[0] = blurHorizontalTemp->srv.get();
-				context->CSSetShaderResources(0, 1, views);
-
-				context->CopyResource(sssResult->resource.get(), main.texture);
-				ID3D11UnorderedAccessView* uavs[1] = { sssResult->uav.get() };
-				context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
-
-				auto shader = GetComputeShaderVerticalBlur();
-				context->CSSetShader(shader, nullptr, 0);
-
-				context->Dispatch(dispatchCount.x, dispatchCount.y, 1);
-			}
-		} else if (settings.SSMode == 1) {
-			// Burley pass to main texture
-			{
-				TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Burley");
-
-				uav = sssResult->uav.get();
-				context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-
-				auto shader = GetComputeShaderBurley();
-				context->CSSetShader(shader, nullptr, 0);
-
-				context->Dispatch(dispatchCount.x, dispatchCount.y, 1);
-			}
-		}
-
-		uav = nullptr;
-		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-
-		// Composite SSS result back to main render target. (batch 38) The upgrade writes MAIN and the
-		// DLSS-RR guide in its last pass, so it needs neither this pass nor the copy into sssResult.
-		if (!upgrade) {
-			TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering - Composite");
-
-			views[0] = sssResult->srv.get();
-			context->CSSetShaderResources(0, 1, views);
-
-			ID3D11UnorderedAccessView* uavs[2] = { main.UAV, sssGuide->uav.get() };
-			context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-			auto shader = GetComputeShaderComposite();
-			context->CSSetShader(shader, nullptr, 0);
-			context->Dispatch(dispatchCount.x, dispatchCount.y, 1);
-
-			uavs[0] = nullptr;
-			uavs[1] = nullptr;
-			context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-		}
+		// (44f) The upgrade is the only path: it writes MAIN and the DLSS-RR guide in its last pass.
+		DrawSSSUpgrade(dispatchCount);
 	}
 
 	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SubsurfaceScattering);
@@ -371,25 +296,10 @@ void SubsurfaceScattering::DrawSSS()
 	context->CSSetShader(shader, nullptr, 0);
 }
 
-bool SubsurfaceScattering::UpgradeActive() const
-{
-	return Batch38::IsOn() && settings.Batch38Upgrade;
-}
-
 void SubsurfaceScattering::DrawBatch38Settings()
 {
-	ImGui::Checkbox("SSS upgrade", &settings.Batch38Upgrade);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"On by default. Takes the skin colour out of the light before blurring and puts it back after, so the\n"
-			"scatter spreads light instead of smearing skin texture (pores, freckles, brows stay sharp). Also fixes skin\n"
-			"getting darker with Linear Lighting on, and makes the blur width the same in DLAA and DLSS Quality.\n"
-			"Off = the older skin scatter. Adds a pre-pass but drops the older full-screen copy and composite, so it should cost\n"
-			"about the same or less (compare Subsurface Scattering + SSS Pre-pass in the performance overlay).");
-
 	if (settings.SSMode == 0) {
-		ImGui::BeginDisabled(!UpgradeActive());
-		ImGui::Text("Albedo Handling (SSS upgrade)");
+		ImGui::Text("Albedo Handling");
 		ImGui::RadioButton("Pre-scatter", &settings.ScatterMode, kPreScatter);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Blur the lit colour directly. Blurs skin texture detail along with the light.");
@@ -401,7 +311,6 @@ void SubsurfaceScattering::DrawBatch38Settings()
 		ImGui::RadioButton("Pre and Post", &settings.ScatterMode, kPreAndPostScatter);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Half of the skin colour before the blur, half after (square root on each side). The default, a middle ground.");
-		ImGui::EndDisabled();
 	}
 	ImGui::Spacing();
 }
@@ -412,17 +321,6 @@ void SubsurfaceScattering::DrawSSSUpgrade(const Util::DispatchCount& a_dispatchC
 	auto renderer = globals::game::renderer;
 	auto main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 	auto* timers = Util::GpuPassTimers::GetSingleton();
-
-	// Allocated on first use (and again after a resolution change): 37c never needs it.
-	if (!diffuseNoAlbedoTex || diffuseNoAlbedoTex->desc.Width != sssResult->desc.Width || diffuseNoAlbedoTex->desc.Height != sssResult->desc.Height) {
-		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-		sssResult->srv->GetDesc(&srvDesc);
-		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
-		sssResult->uav->GetDesc(&uavDesc);
-		diffuseNoAlbedoTex = std::make_unique<Texture2D>(sssResult->desc);
-		diffuseNoAlbedoTex->CreateSRV(srvDesc);
-		diffuseNoAlbedoTex->CreateUAV(uavDesc);
-	}
 
 	ID3D11SamplerState* sampler = globals::deferred->pointSampler.get();
 	context->CSSetSamplers(0, 1, &sampler);
@@ -510,9 +408,9 @@ void SubsurfaceScattering::SetupResources()
 		blurHorizontalTemp->CreateSRV(srvDesc);
 		blurHorizontalTemp->CreateUAV(uavDesc);
 
-		sssResult = std::make_unique<Texture2D>(texDesc);
-		sssResult->CreateSRV(srvDesc);
-		sssResult->CreateUAV(uavDesc);
+		diffuseNoAlbedoTex = std::make_unique<Texture2D>(texDesc);
+		diffuseNoAlbedoTex->CreateSRV(srvDesc);
+		diffuseNoAlbedoTex->CreateUAV(uavDesc);
 
 		texDesc.Format = DXGI_FORMAT_R16_FLOAT;
 		srvDesc.Format = DXGI_FORMAT_R16_FLOAT;
@@ -560,22 +458,6 @@ void SubsurfaceScattering::SaveSettings(json& o_json)
 
 void SubsurfaceScattering::ClearShaderCache()
 {
-	if (horizontalSSBlur) {
-		horizontalSSBlur->Release();
-		horizontalSSBlur = nullptr;
-	}
-	if (verticalSSBlur) {
-		verticalSSBlur->Release();
-		verticalSSBlur = nullptr;
-	}
-	if (burleySS) {
-		burleySS->Release();
-		burleySS = nullptr;
-	}
-	if (compositeSSS) {
-		compositeSSS->Release();
-		compositeSSS = nullptr;
-	}
 	for (auto* shader : { &prepassSSV2, &horizontalSSBlurV2, &verticalSSBlurV2, &burleySSV2 }) {
 		if (*shader) {
 			(*shader)->Release();
@@ -618,42 +500,6 @@ ID3D11ComputeShader* SubsurfaceScattering::GetComputeShaderBurleyV2()
 		burleySSV2 = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\SubsurfaceScattering\\SeparableSSSV2CS.hlsl", { { "BURLEY", "" } }, "cs_5_0");
 	}
 	return burleySSV2;
-}
-
-ID3D11ComputeShader* SubsurfaceScattering::GetComputeShaderHorizontalBlur()
-{
-	if (!horizontalSSBlur) {
-		logger::debug("Compiling horizontalSSBlur");
-		horizontalSSBlur = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\SubsurfaceScattering\\SeparableSSSCS.hlsl", { { "HORIZONTAL", "" } }, "cs_5_0");
-	}
-	return horizontalSSBlur;
-}
-
-ID3D11ComputeShader* SubsurfaceScattering::GetComputeShaderVerticalBlur()
-{
-	if (!verticalSSBlur) {
-		logger::debug("Compiling verticalSSBlur");
-		verticalSSBlur = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\SubsurfaceScattering\\SeparableSSSCS.hlsl", {}, "cs_5_0");
-	}
-	return verticalSSBlur;
-}
-
-ID3D11ComputeShader* SubsurfaceScattering::GetComputeShaderBurley()
-{
-	if (!burleySS) {
-		logger::debug("Compiling burleySS");
-		burleySS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\SubsurfaceScattering\\SeparableSSSCS.hlsl", { { "BURLEY", "" } }, "cs_5_0");
-	}
-	return burleySS;
-}
-
-ID3D11ComputeShader* SubsurfaceScattering::GetComputeShaderComposite()
-{
-	if (!compositeSSS) {
-		logger::debug("Compiling compositeSSS");
-		compositeSSS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\SubsurfaceScattering\\SSSCompositeCS.hlsl", {}, "cs_5_0");
-	}
-	return compositeSSS;
 }
 
 void SubsurfaceScattering::DataLoaded()

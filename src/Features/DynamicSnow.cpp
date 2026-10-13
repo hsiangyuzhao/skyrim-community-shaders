@@ -30,9 +30,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	MudTrails,
 	TrailsFromNPCs,
 	TrailResolution,
-	SmoothTrails,
-	DetectAuthoredSnow,
-	AlbedoSnowGuess,
 	SnowOnCharacters,
 	TrailSize,
 	TrailDepth,
@@ -48,16 +45,13 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	GrassCoverage,
 	SnowOnLodTrees,
 	LodTreeCoverage,
-	UseModFootprintShapes,
 	YieldToFootprintsMod,
 	BodyAndObjectTrails,
 	TrailRim,
 	SnowSmoothing,
 	SteepCover,
-	RigidGearWorldUp,
 	OverrideAmount,
 	AmountOverride,
-	FlipPrintShapes,
 	TrailTimeStamps,
 	TrailPauseWhenNoSnow)
 
@@ -322,11 +316,8 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 	data.Amount = drawnAmount;
 	if (AccumulationActive() && status.exterior && drawnAmount > 0.0f) {
 		data.Flags |= FlagAccumulation;
-		if (settings.SnowOnCharacters) {
+		if (settings.SnowOnCharacters)
 			data.Flags |= FlagSnowOnCharacters;
-			if (settings.RigidGearWorldUp)
-				data.Flags |= FlagActorRigidWorldUp;
-		}
 		// (batch 39c)
 		if (settings.SlopeCoverage)
 			data.Flags |= FlagCoverageSlope;
@@ -351,19 +342,10 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 			data.Flags |= FlagTrailsOnAccumulated;
 		if (settings.MudTrails && !yielding)
 			data.Flags |= FlagMudTrails;
-		if (settings.SmoothTrails)
-			data.Flags |= FlagSmoothTrails;
 		if (trailContentTimeStamped) {
 			data.Flags |= FlagTrailTimeStamps;
 			data.pad0 = static_cast<float>(NowTick());
 		}
-	}
-	// Authored-snow recognition matters to both halves: accumulation leaves authored snow as it
-	// is, and prints there are snow prints, not mud.
-	if (data.Flags != 0 && settings.DetectAuthoredSnow) {
-		data.Flags |= FlagLandSnowDetect;
-		if (settings.AlbedoSnowGuess)
-			data.Flags |= FlagAlbedoSnowGuess;
 	}
 
 	data.TrailMapSize = trailMapSize ? trailMapSize : 1;
@@ -885,11 +867,6 @@ void DynamicSnow::AddStamp(float a_x, float a_y, float a_z, float a_dirX, float 
 	s.Strength = 1.0f;
 	s.End = s.Center;
 	s.Shape = a_shape;
-	if ((a_shape & 0xFFFF) < kShapeCapsule && settings.FlipPrintShapes) {
-		// Debug: heel and toe of the installed textures the other way round.
-		s.Axis = { -s.Axis.x, -s.Axis.y };
-		s.Shape ^= kShapeMirror;
-	}
 	s.Rim = 0.5f;  // shape-level rim; TrailRim scales every rim when the map is read
 
 	// Whole print inside the window, away from the faded edge.
@@ -1039,9 +1016,9 @@ void DynamicSnow::GatherStamps(const RE::NiPoint3& a_center)
 	if (!player)
 		return;
 
-	if (settings.UseModFootprintShapes && !shapesTried)
+	if (!shapesTried)
 		LoadPrintShapes();
-	const bool useShapes = settings.UseModFootprintShapes && shapeCount > 0;
+	const bool useShapes = shapeCount > 0;
 
 	std::vector<RE::Actor*> actors;
 	std::vector<RE::Actor*> dead;
@@ -1526,14 +1503,6 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextUnformatted(
 				"Off (default): people, creatures and everything they wear or carry stay free of built-up snow.\n"
 				"On: their upward-facing parts (shoulders, hoods) get snow like the ground does.");
-		ImGui::BeginDisabled(!settings.SnowOnCharacters);
-		ImGui::Checkbox("Shields and Weapons Use World Up", &settings.RigidGearWorldUp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"On (default): shields, weapons, quivers and helmets get snow only where they really face up\n"
-				"(a shield on the back gets a little on its top rim), and the inside of a surface never gets any.\n"
-				"Off: 40d, where a shield on the back could turn fully white because its own 'up' was used.");
-		ImGui::EndDisabled();
 
 		if (ImGui::TreeNodeEx("Snow Look")) {
 			ImGui::ColorEdit3("Snow Colour", &settings.SnowColor.x);
@@ -1581,21 +1550,14 @@ void DynamicSnow::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted("Off = only the player leaves prints.");
 
-		ImGui::Checkbox("Use Installed Footprint Textures", &settings.UseModFootprintShapes);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Shapes the prints like real boots and paws, read from the footprint textures of mods you have\n"
-				"installed (Realistic PBR Footprints, or Footprints itself): human, horse, wolf, bear, sabre cat,\n"
-				"deer, cow, giant, mammoth, troll, werewolf, skeever. Each print points the way the foot points\n"
-				"and has a small raised rim. Off, or no such mod installed: plain oval prints.");
-		if (settings.UseModFootprintShapes) {
-			if (!shapesTried)
-				ImGui::TextDisabled("  (loaded the first time prints are made)");
-			else if (status.shapesLoaded)
-				ImGui::TextDisabled("  %u shapes from %s", status.shapesLoaded, status.shapeSource.c_str());
-			else
-				ImGui::TextDisabled("  none found: oval prints");
-		}
+		// Prints are shaped from installed footprint textures (Realistic PBR Footprints, or Footprints
+		// itself); plain ovals when none are installed.
+		if (!shapesTried)
+			ImGui::TextDisabled("Print shapes: loaded the first time prints are made");
+		else if (status.shapesLoaded)
+			ImGui::TextDisabled("Print shapes: %u from %s", status.shapesLoaded, status.shapeSource.c_str());
+		else
+			ImGui::TextDisabled("Print shapes: no footprint textures found, oval prints");
 		ImGui::Checkbox("Leave Snowy Ground to the Footprints Mod", &settings.YieldToFootprintsMod);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
@@ -1629,11 +1591,6 @@ void DynamicSnow::DrawSettings()
 		ImGui::BeginDisabled(!settings.MudTrails);
 		ImGui::SliderFloat("Mud Strength", &settings.MudStrength, 0.0f, 1.0f, "%.2f");
 		ImGui::EndDisabled();
-		ImGui::Checkbox("Smooth Footprints", &settings.SmoothTrails);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Reads the footprint map with a smooth (bicubic) filter, so the print's edges and slopes are soft\n"
-				"instead of showing the map's square grid (the 'mosaic' look). Off = the plain blocky reading, for comparison.");
 		const char* resolutions[] = { "1024 (4 units per texel, 4 MB)", "2048 (2 units per texel, 16 MB)", "4096 (1 unit per texel, 64 MB)" };
 		ImGui::Combo("Trail Map Detail", &settings.TrailResolution, resolutions, 3);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -1652,21 +1609,6 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextUnformatted(
 				"No print upkeep while the ground around you is not snow, there is no built-up snow and no snowfall\n"
 				"(mud prints keep it running). Turn off if prints go missing somewhere snowy.");
-		ImGui::EndDisabled();
-
-		ImGui::Spacing();
-		ImGui::Checkbox("Recognise Snowy Ground", &settings.DetectAuthoredSnow);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Finds the snow that is already part of the map (e.g. High Hrothgar): ground whose land texture is marked as snow,\n"
-				"has a snow material, or has 'snow' in its file name, also with PBR terrain mods; and white directional snow on rocks.\n"
-				"Prints there are snow prints, and built-up snow leaves it as it is. Off = PBR terrain never counts as snow.");
-		ImGui::BeginDisabled(!settings.DetectAuthoredSnow);
-		ImGui::Checkbox("Also Guess From Colour (bright white ground)", &settings.AlbedoSnowGuess);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Last resort for land textures that carry no snow marking at all: bright, grey-white ground counts as snow.\n"
-				"Can also catch pale rock or sand.");
 		ImGui::EndDisabled();
 
 		ImGui::Spacing();
@@ -1689,11 +1631,6 @@ void DynamicSnow::DrawSettings()
 		ImGui::BeginDisabled(!settings.OverrideAmount);
 		ImGui::SliderFloat("Amount", &settings.AmountOverride, 0.0f, 1.0f, "%.2f");
 		ImGui::EndDisabled();
-		ImGui::Checkbox("Turn Footprint Shapes Around", &settings.FlipPrintShapes);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Check only: if the shaped prints point backwards (toe where the heel should be), tick this.\n"
-				"The installed textures carry no direction marker; the heel is assumed to be at the image's top.");
 		ImGui::TreePop();
 	}
 }

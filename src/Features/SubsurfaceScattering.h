@@ -31,9 +31,8 @@ public:
 		uint EnableCharacterLighting = false;
 		float CharacterLightingStrength = 1.0f;
 		int SSMode = 1;
-		/// (batch 38, item 3) Upgraded SSS: diffuse-extraction pre-pass, scatter modes, LL albedo
-		/// fix. ANDed with Batch38::IsOn(); off = the 37c shaders and passes.
-		bool Batch38Upgrade = true;
+		// (batch 38, item 3) The SSS upgrade (diffuse-extraction pre-pass, scatter modes, LL albedo
+		// fix) is the only path since 44f; the 37c shaders are gone. Old key Batch38Upgrade ignored.
 		/// (batch 38, item 3) Separable SSS only; Burley always takes the albedo out fully.
 		int ScatterMode = kPreAndPostScatter;
 		DiffusionProfile BaseProfile{ 0.5f, 1.0f, { 0.48f, 0.41f, 0.28f }, { 0.56f, 0.56f, 0.56f } };
@@ -76,25 +75,16 @@ public:
 	bool validMaterials = false;
 
 	std::unique_ptr<Texture2D> blurHorizontalTemp;
-	std::unique_ptr<Texture2D> sssResult;
 	std::unique_ptr<Texture2D> sssGuide;
-	/// (batch 38) Lit image with the albedo taken out (v2 pre-pass output). Allocated on first use.
+	/// (batch 38) Lit image with the albedo taken out (pre-pass output).
 	std::unique_ptr<Texture2D> diffuseNoAlbedoTex;
 
-	ID3D11ComputeShader* horizontalSSBlur = nullptr;
-	ID3D11ComputeShader* verticalSSBlur = nullptr;
-	ID3D11ComputeShader* burleySS = nullptr;
-	ID3D11ComputeShader* compositeSSS = nullptr;
-	// (batch 38) v2 shaders
+	// (batch 38) v2 shaders (the only ones since 44f)
 	ID3D11ComputeShader* prepassSSV2 = nullptr;
 	ID3D11ComputeShader* horizontalSSBlurV2 = nullptr;
 	ID3D11ComputeShader* verticalSSBlurV2 = nullptr;
 	ID3D11ComputeShader* burleySSV2 = nullptr;
 
-	/// @brief (batch 38) The SSS upgrade runs this frame (own switch AND the Batch 38 master).
-	bool UpgradeActive() const;
-	/// @brief (batch 38) Whether the last DrawSSS used the v2 path (for the Batch 38 table).
-	bool lastDrawUsedUpgrade = false;
 	/// @brief (batch 38) Whether DrawSSS ran at all in the last ~second (faces on screen).
 	std::chrono::steady_clock::time_point lastDrawTime{};
 	RE::BGSKeyword* isBeastRaceKeyword = nullptr;
@@ -136,10 +126,6 @@ public:
 	virtual void SaveSettings(json& o_json) override;
 
 	virtual void ClearShaderCache() override;
-	ID3D11ComputeShader* GetComputeShaderHorizontalBlur();
-	ID3D11ComputeShader* GetComputeShaderVerticalBlur();
-	ID3D11ComputeShader* GetComputeShaderBurley();
-	ID3D11ComputeShader* GetComputeShaderComposite();
 	ID3D11ComputeShader* GetComputeShaderPrepassV2();
 	ID3D11ComputeShader* GetComputeShaderHorizontalBlurV2();
 	ID3D11ComputeShader* GetComputeShaderVerticalBlurV2();
@@ -147,7 +133,7 @@ public:
 
 	/// @brief (batch 38) The upgraded chain: pre-pass, then Separable or Burley straight into MAIN (+ DLSS-RR guide).
 	void DrawSSSUpgrade(const Util::DispatchCount& a_dispatchCount);
-	/// @brief (batch 38) Settings UI of the upgrade (switch + Separable scatter mode).
+	/// @brief (batch 38) Settings UI of the upgrade (Separable scatter mode).
 	void DrawBatch38Settings();
 
 	virtual void DataLoaded() override;

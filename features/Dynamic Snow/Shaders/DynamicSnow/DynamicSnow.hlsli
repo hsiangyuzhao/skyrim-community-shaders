@@ -27,18 +27,15 @@ namespace DynamicSnow
 	static const uint FlagTrailsOnSnow = 1 << 2;      // prints on landscape snow and snow materials
 	static const uint FlagTrailsOnAccumulated = 1 << 3;  // prints on accumulated snow
 	static const uint FlagMudTrails = 1 << 4;         // prints on non-snow terrain
-	// (batch 39b)
-	static const uint FlagSmoothTrails = 1 << 5;        // bicubic trail reconstruction (39a: bilinear)
-	static const uint FlagLandSnowDetect = 1 << 6;      // authored snow recognised from the land texture / projected snow
-	static const uint FlagAlbedoSnowGuess = 1 << 7;     // bright, grey-white ground counts as snow too
+	// (batch 39b) 1 << 5, 6, 7 are free since 44f: bicubic prints and snowy-ground recognition are
+	// permanent, the colour guess was removed.
 	static const uint FlagSnowOnCharacters = 1 << 8;    // accumulated snow on actors and what they wear
 	// (batch 39c)
 	static const uint FlagCoverageSlope = 1 << 9;  // coverage from the geometry slope on a soft ramp (39b: normal threshold)
 	static const uint FlagTrees = 1 << 10;         // snow on animated trees and foliage (Lighting, TREE_ANIM)
 	static const uint FlagGrass = 1 << 11;         // snow on grass (RunGrass)
 	static const uint FlagLodTrees = 1 << 12;      // snow on distant billboard trees (DistantTree)
-	// (40e)
-	static const uint FlagActorRigidWorldUp = 1 << 13;  // rigid gear on actors: slope from world up; back faces get none
+	// (40e) 1 << 13 is free since 44f: rigid gear on actors always takes its slope from world up.
 	// (40e) Permutation::ExtraShaderDescriptor bit, mirrors State::ExtraShaderDescriptors::IsActorRigid
 	// (set with IsActorGeometry when the geometry is not skinned). Kept here rather than in
 	// Permutation.hlsli, where a new constant reshuffles fxc's output for unrelated permutations.
@@ -209,9 +206,9 @@ namespace DynamicSnow
 		return amount * lerp(0.45, 1.0, heightFraction) * lerp(0.7, 1.0, noise) * s.LodTreeCoverage * s.MaxCoverage;
 	}
 
-	// (batch 39b) Last-resort snow test from the colour alone (FlagAlbedoSnowGuess): bright and
-	// close to grey-white. Only used on terrain and on the projected (directional) layer of
-	// rocks and mountains, where white means snow far more often than not.
+	// (batch 39b) Snow test from the colour alone: bright and close to grey-white. Only used on the
+	// projected (directional) layer of rocks and mountains, where white means snow far more often
+	// than not.
 	float AlbedoSnowGuess(float3 color)
 	{
 		float mx = max(color.r, max(color.g, color.b));
@@ -263,41 +260,6 @@ namespace DynamicSnow
 		}
 		float dz = (frac((z - footZ) / kTrailZWrap + 0.5) - 0.5) * kTrailZWrap;
 		return strength * (1.0 - smoothstep(s.TrailZTolerance * 0.5, s.TrailZTolerance, abs(dz)));
-	}
-
-	TrailSample SampleTrailBilinear(float2 positionXY, float z)
-	{
-		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
-		TrailSample o;
-		o.pressed = 0;
-		o.gradient = 0;
-		o.any = false;
-
-		float2 t = (positionXY - s.TrailOrigin) / s.TrailTexelSize - 0.5;
-		float size = float(s.TrailMapSize);
-		// Fade out towards the window edge: the strip that scrolls in is cleared, so prints
-		// there would pop.
-		float2 edge = min(t + 0.5, size - (t + 0.5));
-		float fade = saturate((min(edge.x, edge.y) - 1.0) / max(s.TrailEdgeFade, 1.0));
-		[branch] if (fade <= 0.0) return o;
-
-		int2 i = int2(floor(t));
-		float2 f = t - floor(t);
-		uint r00 = LoadTrailTexel(i);
-		uint r10 = LoadTrailTexel(i + int2(1, 0));
-		uint r01 = LoadTrailTexel(i + int2(0, 1));
-		uint r11 = LoadTrailTexel(i + int2(1, 1));
-		o.any = (r00 | r10 | r01 | r11) >= 0x10000;
-		[branch] if (!o.any) return o;
-
-		float v00 = DecodeTrailTexel(r00, z);
-		float v10 = DecodeTrailTexel(r10, z);
-		float v01 = DecodeTrailTexel(r01, z);
-		float v11 = DecodeTrailTexel(r11, z);
-
-		o.pressed = lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y) * fade;
-		o.gradient = float2(lerp(v10 - v00, v11 - v01, f.y), lerp(v01 - v00, v11 - v10, f.x)) * (fade / s.TrailTexelSize);
-		return o;
 	}
 
 	// (batch 39b) Smooth reconstruction of the trail map. 39a read it bilinearly and took the
@@ -380,9 +342,8 @@ namespace DynamicSnow
 	 */
 	TrailSample SampleTrailAt(float2 positionXY, float z)
 	{
-		[branch] if (SharedData::dynamicSnowSettings.Flags & FlagSmoothTrails)
-			return SampleTrailBicubic(positionXY, z);
-		return SampleTrailBilinear(positionXY, z);
+		// (44f) Always bicubic (39b); the bilinear reading (39a's mosaic) is gone.
+		return SampleTrailBicubic(positionXY, z);
 	}
 
 	TrailSample SampleTrail(float3 positionWS, float3 viewDirectionWS)
