@@ -58,6 +58,8 @@ namespace RayTracingRT
 	{
 		BlasHandle blas;
 		double x, y, z;  // world translation of the BLAS origin
+		// (45e) Rotation * scale, row-major (row r = world axis r); identity for cell chunks.
+		float m[3][3] = { { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } };
 	};
 
 	struct FrameInput
@@ -148,6 +150,7 @@ namespace RayTracingRT
 	private:
 		static constexpr std::size_t kContexts = 8;
 		static constexpr std::uint32_t kPostbuildSlots = 1024;
+		static constexpr std::size_t kMaxBuildsPerFrame = 48;  // (45e) small object meshes arrive in bursts
 		// Both on D3D11's guaranteed-shareable list; the shaders' declared types follow these.
 		static constexpr DXGI_FORMAT kDepthMaskFormat = DXGI_FORMAT_R32_FLOAT;        // depth; negative = engine mask already 0
 		static constexpr DXGI_FORMAT kVisibilityFormat = DXGI_FORMAT_R8G8B8A8_UNORM;  // r visibility, g coverage

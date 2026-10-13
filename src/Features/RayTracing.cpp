@@ -616,8 +616,8 @@ void RayTracing::DrawSettings()
 	if (ImGui::TreeNodeEx("General", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Ray Tracing", &settings.Enabled);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: sun shadows of buildings, rocks, furniture and the ground inside the loaded area are ray traced.");
-			ImGui::Text("Characters, trees and grass keep their normal shadows. Screen Space Shadows are switched off where ray tracing is in charge.");
+			ImGui::Text("On: sun shadows of buildings, rocks, furniture, doors, items, tree trunks and the ground inside the loaded area are ray traced.");
+			ImGui::Text("Characters, leaves and grass keep their normal shadows. Screen Space Shadows are switched off where ray tracing is in charge.");
 			ImGui::Text("Off: the game's shadows exactly as before (nothing of this feature runs).");
 		}
 
@@ -709,6 +709,17 @@ void RayTracing::DrawSettings()
 			ImGui::Text("GPU: %s", backend.AdapterDescription().c_str());
 		ImGui::Text("Cells: %u captured, %u loading, %u recaptured (total)", sc.cellsComplete, sc.cellsGathering, sc.recaptures);
 		ImGui::Text("Scene: %u shapes, %u ground quads, %.2f M triangles", sc.shapes, sc.landQuads, static_cast<double>(sc.triangles) / 1e6);
+		{
+			const auto& ob = sc.objects;
+			ImGui::Text("Objects: %u now (captured so far: doors/activators/movable %u, items %u, trees/plants %u), %u shapes in the scene,",
+				ob.captured, ob.refs[0], ob.refs[1], ob.refs[2], ob.registeredShapes);
+			ImGui::Text("  %u distinct meshes (%.2f M triangles)%s", ob.meshes, static_cast<double>(ob.meshTriangles) / 1e6,
+				ob.overBudget ? std::format(", {} new meshes left out (VRAM budget)", ob.overBudget).c_str() : "");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Doors, activators, movable statics, lights, loose items and the opaque parts of trees and plants (trunks, branches).");
+				ImGui::Text("Each is traced where it is this frame. Leaves and other alpha-tested parts keep their shadow-map shadow.");
+			}
+		}
 		ImGui::Text("BLAS: %u built (%.2f M triangles), %u queued, %u instances, %llu builds total", rt.blasCount,
 			static_cast<double>(rt.blasTriangles) / 1e6, rt.blasQueued, rt.instancesLastFrame, static_cast<unsigned long long>(rt.buildsTotal));
 		const std::uint64_t vram = rt.blasBytes + rt.scratchBytes + rt.tlasBytes + rt.uploadBytes + rt.sharedTextureBytes + d3d11Bytes;
@@ -733,8 +744,8 @@ void RayTracing::DrawSettings()
 			ImGui::Text("Frames without a trace (D3D12 busy): %u, of which with casters left out of the shadow map: %u (should be 0)",
 				rt.skippedFramesBusy, latchedWithoutTrace);
 		if (ImGui::TreeNodeEx("Skipped objects")) {
-			ImGui::Text("Characters %u, doors/activators/movable %u, trees/plants %u, items/markers %u, disabled/no 3D %u",
-				skip.actors, skip.movable, skip.foliage, skip.items, skip.disabled);
+			ImGui::Text("Characters %u, markers/other %u, disabled/no 3D %u, tree-animated parts of static objects %u",
+				skip.actors, skip.markers, skip.disabled, skip.foliage);
 			ImGui::Text("Shapes: hidden %u, alpha-tested %u, alpha-blended %u, decals %u, skinned %u, no shadow %u",
 				skip.hidden, skip.alphaTested, skip.alphaBlended, skip.decals, skip.skinned, skip.noShadow);
 			ImGui::Text("Shapes: not Lighting shader %u, other geometry types %u, no CPU vertex copy %u, bad data %u",

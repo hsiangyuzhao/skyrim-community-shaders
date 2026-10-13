@@ -16,6 +16,15 @@
  * shadows and is neither alpha-tested, alpha-blended, skinned, a decal nor tree-animated.
  * Everything else is counted per reason (shown on the page) and keeps its shadow-map shadow.
  *
+ * (45e) Objects that can move or need their own placement -- doors, activators, movable statics
+ * and lights; loose items; trees and plants (only their opaque, non alpha-tested shapes: trunks
+ * and branches; leaf cards are alpha-tested and stay in the shadow map) -- are not baked into the
+ * cell chunks. Each distinct engine mesh gets one BLAS in its own space (shared by every copy),
+ * and each shape one TLAS instance carrying the shape's world transform of the frame, so a door
+ * that swings or an item that falls is traced where it is. They are found by a slow scan of the
+ * captured cells' references and dropped when their reference is disabled, gets new 3D or leaves
+ * the captured cells.
+ *
  * A new cell is captured once it has been in the grid for a moment (its 3D streams in first).
  * Cells are re-captured (at most every 1.5 s or so) when their landscape or the 3D / enabled
  * state of a captured reference changes (a few hundred references are re-checked per frame),
@@ -40,20 +49,38 @@ namespace RayTracingScene
 	struct SkipCounts
 	{
 		std::uint32_t actors = 0;          // NPCs and creatures (skinned, not in the prototype)
-		std::uint32_t movable = 0;         // doors, activators, movable statics, lights: they can move
-		std::uint32_t foliage = 0;         // trees, flora, tree-animated shapes
-		std::uint32_t items = 0;           // other reference types (items, markers, sounds, ...)
+		std::uint32_t markers = 0;         // markers, sounds, hazards and other reference types without a shadow
+		std::uint32_t foliage = 0;         // tree-animated shapes inside static objects
 		std::uint32_t disabled = 0;        // disabled / deleted references or no 3D
 		std::uint32_t hidden = 0;          // hidden nodes and editor markers
 		std::uint32_t otherGeometry = 0;   // particles, dynamic / multi-index / sub-index shapes
 		std::uint32_t notLighting = 0;     // effect, water, sky shaders
-		std::uint32_t alphaTested = 0;
+		std::uint32_t alphaTested = 0;     // includes the leaves of trees and plants
 		std::uint32_t alphaBlended = 0;
 		std::uint32_t decals = 0;
 		std::uint32_t skinned = 0;
 		std::uint32_t noShadow = 0;        // shape does not cast shadows in the game either
 		std::uint32_t noCpuData = 0;       // the engine kept no CPU copy of the vertices
 		std::uint32_t badData = 0;         // index out of range, unknown vertex layout
+	};
+
+	/// (45e) Objects with their own TLAS instances, moved every frame.
+	enum class ObjectKind : std::uint8_t
+	{
+		Movable,  // doors, activators, movable statics, lights
+		Item,     // loose items
+		Tree      // trees and plants: opaque (non alpha-tested) parts only
+	};
+
+	struct ObjectStats
+	{
+		std::uint32_t refs[3]{};            // captured references per ObjectKind (total since the last reset)
+		std::uint32_t captured = 0;         // references captured now
+		std::uint32_t shapes = 0;           // shapes captured (total since the last reset)
+		std::uint32_t registeredShapes = 0; // shapes now in the TLAS and out of the shadow map
+		std::uint32_t meshes = 0;           // distinct meshes (one BLAS each, shared by every copy)
+		std::uint64_t meshTriangles = 0;
+		std::uint32_t overBudget = 0;       // new meshes not captured (VRAM budget)
 	};
 
 	struct Stats
@@ -75,6 +102,7 @@ namespace RayTracingScene
 		std::uint32_t placementRejected = 0;  // fitted with neither: left out
 		std::uint32_t placementUnchecked = 0; // no usable world bound
 		std::uint32_t placementLogged = 0;
+		ObjectStats objects{};
 	};
 
 	class Scene
@@ -88,6 +116,9 @@ namespace RayTracingScene
 		{
 			new std::vector<std::unique_ptr<Cell>>(std::move(cells_));
 			new std::vector<std::unique_ptr<Cell>>(std::move(retiring_));
+			new std::vector<std::unique_ptr<ObjectRef>>(std::move(objects_));
+			new std::vector<std::unique_ptr<ObjectRef>>(std::move(retiringObjects_));
+			new std::vector<RE::NiPointer<RE::TESObjectREFR>>(std::move(scanList_));
 		}
 
 		/// Drops everything (BLASes are retired through the backend, filter entries removed).
@@ -176,8 +207,75 @@ namespace RayTracingScene
 			bool a_local);
 		void CloseChunk(RayTracingRT::Backend& a_backend, Cell& a_cell);
 
+		/// The engine's CPU copy of a shape's mesh, read and validated.
+		struct RawMesh
+		{
+			std::vector<std::uint8_t> vertexBytes;
+			std::vector<std::uint32_t> indices;
+			std::uint32_t vertexCount = 0;
+			std::uint32_t triangleCount = 0;
+			std::uint32_t stride = 0;
+			std::uint32_t positionOffset = 0;
+			bool fullPrecision = false;
+		};
+		bool ReadMesh(RE::BSTriShape* a_shape, bool a_landscape, RawMesh& o_mesh);
+		/// The shape if it may go into the scene (Lighting shader, opaque, casts shadows, ...); the
+		/// reason is counted otherwise.
+		RE::BSTriShape* CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim);
+
+		// (45e) Objects: one BLAS per distinct engine mesh (in the shape's own space), one TLAS
+		// instance per shape with the shape's world transform of the frame.
+		struct MeshKey
+		{
+			const void* data = nullptr;  // BSGraphics::TriShape, shared by every copy of a mesh
+			std::uint32_t vertices = 0;
+			std::uint32_t triangles = 0;
+			bool operator==(const MeshKey&) const = default;
+		};
+		struct MeshKeyHash
+		{
+			std::size_t operator()(const MeshKey& a_key) const noexcept
+			{
+				return std::hash<const void*>()(a_key.data) ^ (static_cast<std::size_t>(a_key.vertices) << 20) ^ a_key.triangles;
+			}
+		};
+		struct SharedMesh
+		{
+			RayTracingRT::BlasHandle blas = RayTracingRT::kInvalidBlas;
+			std::uint32_t users = 0;
+			std::uint32_t triangles = 0;
+		};
+		struct ObjectShape
+		{
+			RE::NiPointer<RE::BSGeometry> geometry;  // holds the mesh (the key) alive too
+			MeshKey key;
+			RayTracingRT::BlasHandle blas = RayTracingRT::kInvalidBlas;
+			bool registered = false;  // in the caster filter
+		};
+		struct ObjectRef
+		{
+			RE::NiPointer<RE::TESObjectREFR> ref;
+			const RE::NiAVObject* root = nullptr;
+			ObjectKind kind = ObjectKind::Movable;
+			std::vector<ObjectShape> shapes;
+		};
+
+		void UpdateObjects(RayTracingRT::Backend& a_backend, std::int64_t a_deadline, bool a_allowNewMeshes);
+		void CollectObjectShapes(RE::NiAVObject* a_object, bool a_allowTreeAnim, int a_depth, std::vector<RE::BSTriShape*>& o_shapes);
+		void CaptureObjectRef(RayTracingRT::Backend& a_backend, const RE::NiPointer<RE::TESObjectREFR>& a_ref, RE::NiAVObject* a_root,
+			ObjectKind a_kind, bool a_allowNewMeshes);
+		void ReleaseObject(RayTracingRT::Backend& a_backend, ObjectRef& a_object);
+		void AppendObjectInstances(const std::vector<std::unique_ptr<ObjectRef>>& a_objects, std::vector<RayTracingRT::Instance>& o_instances) const;
+
 		std::vector<std::unique_ptr<Cell>> cells_;
 		std::vector<std::unique_ptr<Cell>> retiring_;  // traced this frame, released in EndFrame
+		std::vector<std::unique_ptr<ObjectRef>> objects_;
+		std::vector<std::unique_ptr<ObjectRef>> retiringObjects_;  // traced this frame, released in EndFrame
+		ankerl::unordered_dense::set<const RE::TESObjectREFR*> objectIndex_;  // references in objects_
+		std::unordered_map<MeshKey, SharedMesh, MeshKeyHash> meshes_;
+		std::vector<RE::NiPointer<RE::TESObjectREFR>> scanList_;  // the cell being scanned for objects
+		std::size_t scanCursor_ = 0;
+		std::size_t scanCell_ = 0;
 		std::atomic<bool> flushRequested_{ false };
 		std::size_t validationCursor_ = 0;
 		std::uint32_t cellsReady_ = 0;

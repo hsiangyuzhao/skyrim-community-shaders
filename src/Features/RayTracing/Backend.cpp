@@ -636,39 +636,73 @@ namespace RayTracingRT
 	std::uint32_t Backend::BuildQueued(ID3D12GraphicsCommandList4* a_list, std::uint32_t a_budget)
 	{
 		std::uint32_t built = 0;
-		std::uint32_t triangles = 0;
 		std::vector<std::uint32_t> slots;
-		while (!buildQueue_.empty() && (built == 0 || triangles < a_budget)) {
-			const BlasHandle handle = buildQueue_.front();
-			auto& blas = blas_[handle];
-			if (blas.state != BlasState::Queued || !blas.geometry) {
-				buildQueue_.pop_front();
-				continue;
-			}
-			const ChunkGeometry& geometry = *blas.geometry;
 
-			// Geometry upload (freed once this submission completes).
-			const std::uint64_t vertexBytes = geometry.positions.size() * sizeof(float);
-			const std::uint64_t indexOffset = Align(vertexBytes, 256);
-			const std::uint64_t uploadBytes = indexOffset + geometry.indices.size() * sizeof(std::uint32_t);
-			auto upload = CreateBuffer(uploadBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
-			void* mapped = nullptr;
-			if (!upload || FAILED(upload->Map(0, nullptr, &mapped)) || !mapped) {
-				Fail("BLAS geometry upload", E_OUTOFMEMORY);
-				break;
+		// (45e) This frame's batch: up to the triangle budget and kMaxBuildsPerFrame builds (many
+		// small object meshes arrive at once), with ONE upload buffer for all of their geometry
+		// instead of a committed resource per build.
+		struct Pending
+		{
+			BlasHandle handle;
+			std::uint64_t vertexOffset;
+			std::uint64_t indexOffset;
+		};
+		std::vector<Pending> batch;
+		std::uint64_t uploadBytes = 0;
+		{
+			std::uint32_t batchTriangles = 0;
+			while (!buildQueue_.empty() && batch.size() < kMaxBuildsPerFrame && (batch.empty() || batchTriangles < a_budget)) {
+				const BlasHandle handle = buildQueue_.front();
+				buildQueue_.pop_front();
+				auto& blas = blas_[handle];
+				if (blas.state != BlasState::Queued || !blas.geometry)
+					continue;
+				const ChunkGeometry& geometry = *blas.geometry;
+				Pending entry{ handle, Align(uploadBytes, 256), 0 };
+				entry.indexOffset = Align(entry.vertexOffset + geometry.positions.size() * sizeof(float), 256);
+				uploadBytes = entry.indexOffset + geometry.indices.size() * sizeof(std::uint32_t);
+				batchTriangles += geometry.Triangles();
+				batch.push_back(entry);
 			}
-			std::memcpy(mapped, geometry.positions.data(), vertexBytes);
-			std::memcpy(static_cast<std::byte*>(mapped) + indexOffset, geometry.indices.data(), geometry.indices.size() * sizeof(std::uint32_t));
-			upload->Unmap(0, nullptr);
+		}
+		if (batch.empty())
+			return 0;
+		auto upload = CreateBuffer(uploadBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+		std::byte* mapped = nullptr;
+		if (!upload || FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))) || !mapped) {
+			for (auto it = batch.rbegin(); it != batch.rend(); ++it)
+				buildQueue_.push_front(it->handle);
+			Fail("BLAS geometry upload", E_OUTOFMEMORY);
+			return 0;
+		}
+		for (const auto& entry : batch) {
+			const ChunkGeometry& geometry = *blas_[entry.handle].geometry;
+			std::memcpy(mapped + entry.vertexOffset, geometry.positions.data(), geometry.positions.size() * sizeof(float));
+			std::memcpy(mapped + entry.indexOffset, geometry.indices.data(), geometry.indices.size() * sizeof(std::uint32_t));
+		}
+		upload->Unmap(0, nullptr);
+		upload->SetName(L"CS RayTracing BLAS upload");
+		// Freed once this submission completes.
+		Retire(upload, uploadBytes, &stats_.uploadBytes);
+		stats_.uploadBytes += uploadBytes;
+
+		for (std::size_t b = 0; b < batch.size(); ++b) {
+			const BlasHandle handle = batch[b].handle;
+			auto& blas = blas_[handle];
+			const ChunkGeometry& geometry = *blas.geometry;
+			auto requeueRest = [&]() {
+				for (std::size_t r = batch.size(); r-- > b;)
+					buildQueue_.push_front(batch[r].handle);
+			};
 
 			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc{};
 			geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
 			geometryDesc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-			geometryDesc.Triangles.VertexBuffer.StartAddress = upload->GetGPUVirtualAddress();
+			geometryDesc.Triangles.VertexBuffer.StartAddress = upload->GetGPUVirtualAddress() + batch[b].vertexOffset;
 			geometryDesc.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
 			geometryDesc.Triangles.VertexCount = geometry.Vertices();
 			geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-			geometryDesc.Triangles.IndexBuffer = upload->GetGPUVirtualAddress() + indexOffset;
+			geometryDesc.Triangles.IndexBuffer = upload->GetGPUVirtualAddress() + batch[b].indexOffset;
 			geometryDesc.Triangles.IndexCount = static_cast<UINT>(geometry.indices.size());
 			geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
 
@@ -683,18 +717,20 @@ namespace RayTracingRT
 			device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
 			if (info.ResultDataMaxSizeInBytes == 0) {
 				// Degenerate input: drop it rather than retry forever.
-				buildQueue_.pop_front();
 				blas.geometry.reset();
 				blas.state = BlasState::Ready;
 				stats_.blasQueued -= std::min<std::uint32_t>(stats_.blasQueued, 1);
 				++stats_.blasCount;
 				continue;
 			}
-			if (!EnsureScratch(info.ScratchDataSizeInBytes))
+			if (!EnsureScratch(info.ScratchDataSizeInBytes)) {
+				requeueRest();
 				break;
+			}
 			const std::uint64_t bytes = Align(info.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
 			auto resource = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
 			if (!resource) {
+				requeueRest();
 				Fail("BLAS buffer", E_OUTOFMEMORY);
 				break;
 			}
@@ -718,10 +754,6 @@ namespace RayTracingRT
 			buildDesc.ScratchAccelerationStructureData = scratch_->GetGPUVirtualAddress();
 			a_list->BuildRaytracingAccelerationStructure(&buildDesc, 1, &postbuild);
 
-			Retire(upload, uploadBytes, &stats_.uploadBytes);
-			stats_.uploadBytes += uploadBytes;
-
-			buildQueue_.pop_front();
 			blas.geometry.reset();
 			blas.resource = std::move(resource);
 			blas.bytes = bytes;
@@ -734,7 +766,6 @@ namespace RayTracingRT
 			stats_.blasQueued -= std::min<std::uint32_t>(stats_.blasQueued, 1);
 			++stats_.blasCount;
 			++stats_.buildsTotal;
-			triangles += blas.triangles;
 			++built;
 		}
 
@@ -817,7 +848,9 @@ namespace RayTracingRT
 			if ((blas.state != BlasState::Built && blas.state != BlasState::Ready) || !blas.resource)
 				continue;
 			D3D12_RAYTRACING_INSTANCE_DESC desc{};
-			desc.Transform[0][0] = desc.Transform[1][1] = desc.Transform[2][2] = 1.0f;
+			for (int r = 0; r < 3; ++r)
+				for (int c = 0; c < 3; ++c)
+					desc.Transform[r][c] = instance.m[r][c];
 			desc.Transform[0][3] = static_cast<float>(instance.x - a_input.cameraX);
 			desc.Transform[1][3] = static_cast<float>(instance.y - a_input.cameraY);
 			desc.Transform[2][3] = static_cast<float>(instance.z - a_input.cameraZ);
