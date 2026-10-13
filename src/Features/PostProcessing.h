@@ -30,15 +30,11 @@ struct PostProcessing : Feature
 		uint pad[3];
 	} settings;
 
-	/// (44e) Post-processing cost switches. Not part of Settings: that struct is the GPU's
-	/// postProcessingSettings. Each one off = the 44d path, picture unchanged either way.
-	struct OptSettings
-	{
-		bool FuseBloom = true;        ///< COD Bloom's composite added inside Color Grading (one full-screen pass less)
-		bool FoldExposure = true;     ///< Auto Exposure's adapt pass applied on load by Local Exposure
-		bool SingleFinalCopy = true;  ///< write only the buffer the game's final pass reads
-		bool SkipVanillaHDR = true;   ///< skip the game's own HDR downsample / adaptation / bloom when nothing uses them
-	} opt;
+	// (44h) Removed after the user's review, now fixed on; the old "ppopt44e" key is ignored:
+	// FuseBloom (COD Bloom's composite inside Color Grading), FoldExposure (Auto Exposure's adapt
+	// applied by Local Exposure), SingleFinalCopy (write only the buffer the final pass reads),
+	// SkipVanillaHDR (skip the game's HDR downsample / adaptation / bloom when nothing uses them).
+	// Each still falls back by itself when its runtime condition is not met.
 
 	/// (44e) What the effects pass to the next one this frame (set by PreProcess around the draws).
 	struct Fused
@@ -55,8 +51,6 @@ struct PostProcessing : Feature
 		float bloomRadius = 1.0f;
 		float bloomMult = 0.0f;
 	} fused;
-	const char* fuseStatus = "Not run yet";
-	const char* foldStatus = "Not run yet";
 
 	/// (44e) Single final copy: the buffer PreProcess left the result in, and what the game's final
 	/// pass (ISHDR blend) was seen reading.
@@ -64,7 +58,6 @@ struct PostProcessing : Feature
 	uint32_t blendReadMatches = 0;        ///< consecutive frames the blend read lastWrittenMain
 	uint64_t singleCopyBlockedUntil = 0;  ///< frame until which both buffers are written again
 	bool singleCopyUsed = false;
-	const char* singleCopyStatus = "Not run yet";
 	void OnBlendRendered();
 
 	/// (44e) Skipping the game's HDR downsample / adaptation / bloom.
@@ -73,7 +66,6 @@ struct PostProcessing : Feature
 	bool vanillaHDRSkip = false;
 	uint32_t vanillaHDRSkipped = 0;  ///< passes skipped this frame
 	uint32_t vanillaHDRSkippedLast = 0;
-	const char* vanillaHDRStatus = "Not run yet";
 	bool SkipVanillaHDRNow();
 	void InstallVanillaHDRHooks();
 

@@ -16,13 +16,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PostProcessing::Settings,
 	DisableVanillaTonemapping)
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-	PostProcessing::OptSettings,
-	FuseBloom,
-	FoldExposure,
-	SingleFinalCopy,
-	SkipVanillaHDR)
-
 void PostProcessing::DrawSettings()
 {
 	// 0 for list of feats
@@ -80,31 +73,8 @@ void PostProcessing::DrawSettings()
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Skips Skyrim's own final image pass (tonemapping, vanilla bloom and colour grading), so only the effects below shape the look.");
 
-	// (44e) Cost switches: each saves a full-screen pass at output resolution; off = 44d.
-	if (ImGui::TreeNode("Performance (44e)")) {
-		ImGui::Checkbox("Fuse Bloom into Color Grading", &opt.FuseBloom);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("COD Bloom's last step (adding the glow to the picture) is done inside Color Grading's pass. Same picture, one full-screen pass less.\nNeeds COD Bloom directly followed by Color Grading.");
-		ImGui::SameLine();
-		ImGui::TextDisabled("%s", fuseStatus);
-		ImGui::Checkbox("Fold Auto Exposure into Local Exposure", &opt.FoldExposure);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Auto Exposure's brightness change is applied by Local Exposure as it reads the picture, instead of a separate full-screen pass.\nSame picture. Needs Local Exposure right after Auto Exposure.");
-		ImGui::SameLine();
-		ImGui::TextDisabled("%s", foldStatus);
-		ImGui::Checkbox("Single Final Copy", &opt.SingleFinalCopy);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Hand the finished picture back into only the buffer the game's final pass actually reads (watched every frame), not into both.\nIf the game ever reads the other one, both are written again for a while.");
-		ImGui::SameLine();
-		ImGui::TextDisabled("%s", singleCopyStatus);
-		ImGui::Checkbox("Skip Vanilla HDR Passes", &opt.SkipVanillaHDR);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("With Disable Vanilla Tonemapping on, the game's own brightness adaptation and bloom are computed but never shown.\nSkipped while nothing else needs them (no menu open, no blur or depth-of-field screen effect).");
-		ImGui::SameLine();
-		ImGui::TextDisabled("%s", vanillaHDRStatus);
-		ImGui::TextDisabled("Each has its own row in the performance overlay (PP Auto Exposure, PP Bloom, PP Color Grading, PP Final Copy, Vanilla HDR prep).");
-		ImGui::TreePop();
-	}
+	// (44h) The "Performance (44e)" switches (Fuse Bloom into Color Grading, Fold Auto Exposure
+	// into Local Exposure, Single Final Copy, Skip Vanilla HDR Passes) were removed, now fixed on.
 
 	ImGui::Separator();
 
@@ -276,8 +246,7 @@ void PostProcessing::ProcessSettings(json& o_json)
 
 	if (o_json.contains("ppsettings"))
 		settings = o_json["ppsettings"];
-	if (o_json.contains("ppopt44e"))
-		opt = o_json["ppopt44e"];
+	// (44h) "ppopt44e" is no longer read: those switches are fixed on.
 }
 
 void PostProcessing::SaveSettings(json& o_json)
@@ -294,7 +263,6 @@ void PostProcessing::SaveSettings(json& o_json)
 	}
 
 	o_json["ppsettings"] = settings;
-	o_json["ppopt44e"] = opt;
 }
 
 std::vector<std::string> PostProcessing::LoadPresets()
@@ -778,32 +746,22 @@ void PostProcessing::PreProcess()
 	fused = {};
 	HistogramAutoExposure* foldingAE = nullptr;
 	CODBloom* fusingBloom = nullptr;
-	foldStatus = !opt.FoldExposure ? "Off" : "Auto Exposure is not followed by Local Exposure";
-	fuseStatus = !opt.FuseBloom ? "Off" : "COD Bloom is not followed by Color Grading";
 	for (size_t i = 0; i + 1 < chain.size(); ++i) {
-		if (opt.FoldExposure && !foldingAE) {
+		if (!foldingAE) {
 			if (auto* ae = dynamic_cast<HistogramAutoExposure*>(chain[i])) {
 				if (auto* le = dynamic_cast<LocalExposure*>(chain[i + 1])) {
 					EnsureResources(le);
-					if (le->CanFold()) {
+					if (le->CanFold())
 						foldingAE = ae;
-						foldStatus = "On: Local Exposure applies the exposure";
-					} else {
-						foldStatus = "Local Exposure not ready";
-					}
 				}
 			}
 		}
-		if (opt.FuseBloom && !fusingBloom) {
+		if (!fusingBloom) {
 			if (auto* bloom = dynamic_cast<CODBloom*>(chain[i])) {
 				if (auto* cg = dynamic_cast<ColorGrading*>(chain[i + 1])) {
 					EnsureResources(cg);
-					if (cg->CanFuseBloom()) {
+					if (cg->CanFuseBloom())
 						fusingBloom = bloom;
-						fuseStatus = "On: Color Grading adds the bloom";
-					} else {
-						fuseStatus = "Color Grading not ready";
-					}
 				}
 			}
 		}
@@ -936,10 +894,8 @@ void PostProcessing::PreProcess()
 	// frames in a row, the second buffer is no longer written. Any frame it reads the other one
 	// (OnBlendRendered) brings the second copy back for a while.
 	const uint64_t frame = globals::state ? globals::state->frameCount : 0;
-	const bool singleCopy = opt.SingleFinalCopy && blendReadMatches >= 3 && frame >= singleCopyBlockedUntil;
+	const bool singleCopy = blendReadMatches >= 3 && frame >= singleCopyBlockedUntil;
 	singleCopyUsed = singleCopy;
-	singleCopyStatus = !opt.SingleFinalCopy ? "Off" : singleCopy ? "On: one buffer written" :
-	                   frame < singleCopyBlockedUntil ? "Paused: the game read the other buffer" : "Waiting to see which buffer the game reads";
 	lastWrittenMain = gameTexMain.texture;
 
 	auto* timers = Util::GpuPassTimers::GetSingleton();
@@ -1078,28 +1034,26 @@ bool PostProcessing::SkipVanillaHDRNow()
 	vanillaHDRSkippedLast = vanillaHDRSkipped;
 	vanillaHDRSkipped = 0;
 
+	// Run them whenever anything may use them: vanilla tonemapping on (or Bypass), the game's own
+	// shaders, VR, a menu open (its background blur), a blur / depth-of-field screen effect, or
+	// the game's HDR blur having run recently.
 	vanillaHDRSkip = false;
 	auto* ui = globals::game::ui;
-	if (!opt.SkipVanillaHDR)
-		vanillaHDRStatus = "Off";
-	else if (!loaded || bypass || !settings.DisableVanillaTonemapping)
-		vanillaHDRStatus = "Needed: Disable Vanilla Tonemapping is off (or Bypass)";
-	else if (!globals::shaderCache || !globals::shaderCache->IsEnabled())
-		vanillaHDRStatus = "Needed: the game's own shaders are in use";
-	else if (globals::game::isVR)
-		vanillaHDRStatus = "Needed: VR";
-	else if (!ui || ui->GameIsPaused() || ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || ui->IsMenuOpen(RE::MapMenu::MENU_NAME))
-		vanillaHDRStatus = "Needed: a menu is open (its background blur may use them)";
-	else if (const auto& mod = imageSpaceManager->gameISData.modData.data;
-			 mod[RE::ImageSpaceModData::kBlurRadius] > 0.0f || mod[RE::ImageSpaceModData::kDOFStrength] > 0.0f ||
-			 mod[RE::ImageSpaceModData::kDoubleVisionStrength] > 0.0f || mod[RE::ImageSpaceModData::kRadialBlurStrength] > 0.0f)
-		vanillaHDRStatus = "Needed: a screen effect (blur, depth of field) is active";
-	else if (frame - lastHDRConsumerFrame < 120)
-		vanillaHDRStatus = "Needed: the game's HDR blur ran recently";
-	else {
-		vanillaHDRSkip = true;
-		vanillaHDRStatus = "Skipped: nothing uses them";
-	}
+	if (!loaded || bypass || !settings.DisableVanillaTonemapping)
+		return false;
+	if (!globals::shaderCache || !globals::shaderCache->IsEnabled())
+		return false;
+	if (globals::game::isVR)
+		return false;
+	if (!ui || ui->GameIsPaused() || ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || ui->IsMenuOpen(RE::MapMenu::MENU_NAME))
+		return false;
+	if (const auto& mod = imageSpaceManager->gameISData.modData.data;
+		mod[RE::ImageSpaceModData::kBlurRadius] > 0.0f || mod[RE::ImageSpaceModData::kDOFStrength] > 0.0f ||
+		mod[RE::ImageSpaceModData::kDoubleVisionStrength] > 0.0f || mod[RE::ImageSpaceModData::kRadialBlurStrength] > 0.0f)
+		return false;
+	if (frame - lastHDRConsumerFrame < 120)
+		return false;
+	vanillaHDRSkip = true;
 	return vanillaHDRSkip;
 }
 
