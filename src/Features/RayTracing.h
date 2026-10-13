@@ -70,6 +70,8 @@ public:
 		bool KeepScreenSpaceShadows = false;
 		// (45g) Large one-sided alpha-tested shapes with an edge-only cutout (roof tiles) are RT occluders.
 		bool CutoutAsOpaque = true;
+		// (45h) Alpha-tested shapes (leaves, bushes, banners, fences) traced with their cut-out.
+		bool AlphaCasters = false;
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted
@@ -141,6 +143,8 @@ private:
 	winrt::com_ptr<ID3D11ComputeShader> prepareCS;
 	winrt::com_ptr<ID3D11ComputeShader> combineCS;
 	winrt::com_ptr<ID3D11ComputeShader> overlayCS;
+	winrt::com_ptr<ID3D11ComputeShader> alphaMaskCS;  // (45h) 256x256 alpha copies
+	bool alphaMaskRgba = false;                        // the variant alphaMaskCS was compiled as
 	std::unique_ptr<ConstantBuffer> combineCB;
 	winrt::com_ptr<ID3D11Texture2D> maskTemp;  // the combined mask before it is copied over the engine's
 	winrt::com_ptr<ID3D11UnorderedAccessView> maskTempUAV;
@@ -168,4 +172,9 @@ private:
 	bool overVramBudget = false;
 	Status loggedStatus = Status::Off;
 	std::int64_t lastTlasLog = 0;  // (45f) QPC of the last TLAS summary in the log (0 = log on the next active frame)
+	// (45h) Alpha-tested casters: the switch as last seen (a change by the user clears an old fault)
+	// and why it was switched off automatically (shown on the page).
+	bool alphaRequested = false;
+	std::string alphaOffReason;
+	void UpdateAlphaCasters();
 };

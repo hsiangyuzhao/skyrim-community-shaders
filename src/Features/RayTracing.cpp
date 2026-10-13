@@ -2,6 +2,7 @@
 
 #include "Deferred.h"
 #include "Features/RayTracing/CasterFilter.h"
+#include "Features/RayTracing/TextureSharing.h"
 #include "Features/ScreenSpaceShadows.h"
 #include "State.h"
 #include "Utils/FrameTrace.h"
@@ -13,7 +14,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	QualityLevel,
 	KeepCastersInShadowMap,
 	KeepScreenSpaceShadows,
-	CutoutAsOpaque)
+	CutoutAsOpaque,
+	AlphaCasters)
 
 namespace
 {
@@ -39,6 +41,7 @@ namespace
 	constexpr std::uint64_t kAccelerationBudgetBytes = 1200ull << 20;  // BLAS + scratch; spec target is 1.5 GB in total
 	constexpr std::uint32_t kFlagSkipShadowed = 1u, kFlagCoverage = 2u;  // TraceShadowsCS
 	constexpr std::uint32_t kFlagHandOffSSS = 1u, kFlagDebug = 2u;       // Common.hlsli
+	constexpr std::uint32_t kAlphaCopiesPerFrame = 16;  // (45h) 256x256 alpha copies made per frame (5 small dispatches each)
 
 	struct LoadingMenuSink : RE::BSTEventSink<RE::MenuOpenCloseEvent>
 	{
@@ -87,6 +90,30 @@ void RayTracing::OnLoadingScreen()
 	scene.RequestFlush();
 }
 
+void RayTracing::UpdateAlphaCasters()
+{
+	// (45h) Turned on (again) by the user: an earlier automatic switch-off is forgotten.
+	if (settings.AlphaCasters && !alphaRequested) {
+		backend.ClearAlphaFault();
+		alphaOffReason.clear();
+	}
+	// Any failure of its D3D12 / D3D11 resources switches it off (the rest of Ray Tracing goes on).
+	if (settings.AlphaCasters && !backend.AlphaFault().empty()) {
+		alphaOffReason = backend.AlphaFault();
+		settings.AlphaCasters = false;
+		logger::warn("[RayTracing] Alpha-tested casters switched off: {}", alphaOffReason);
+	} else if (settings.AlphaCasters && backend.IsReady() && !backend.AlphaAvailable()) {
+		alphaOffReason = "the GPU driver did not accept the alpha-tested ray query shader";
+		settings.AlphaCasters = false;
+		logger::warn("[RayTracing] Alpha-tested casters switched off: {}", alphaOffReason);
+	}
+	alphaRequested = settings.AlphaCasters;
+	const bool alpha = settings.AlphaCasters && backend.AlphaAvailable();
+	scene.SetAlphaCasters(alpha);  // a change re-captures the scene
+	if (!alpha && backend.IsReady() && backend.AlphaIdle())
+		backend.ReleaseAlphaResources();
+}
+
 // ---------------------------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------------------------
@@ -95,6 +122,9 @@ void RayTracing::LoadSettings(json& o_json)
 {
 	settings = o_json;
 	settings.QualityLevel = std::clamp(settings.QualityLevel, 0, 2);
+	// (45h) Before the first save is loaded (no frame runs during loading screens): its textures are
+	// then created shareable when both switches are on.
+	RayTracingTextureSharing::SetEnabled(settings.Enabled && settings.AlphaCasters);
 }
 
 void RayTracing::SaveSettings(json& o_json)
@@ -133,6 +163,7 @@ void RayTracing::ClearShaderCache()
 	prepareCS = nullptr;
 	combineCS = nullptr;
 	overlayCS = nullptr;
+	alphaMaskCS = nullptr;
 }
 
 ID3D11ComputeShader* RayTracing::GetShader(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name)
@@ -313,6 +344,8 @@ void RayTracing::Prepass()
 	activeThisFrame = false;
 	combinedThisFrame = false;
 	const std::int64_t start = Qpc();
+	// (45h) Diffuse textures loaded from now on are created shareable only while both switches are on.
+	RayTracingTextureSharing::SetEnabled(settings.Enabled && settings.AlphaCasters);
 
 	if (!settings.Enabled) {
 		if (status != Status::Off) {
@@ -327,8 +360,11 @@ void RayTracing::Prepass()
 		}
 		// Switching back on is a fresh attempt (also after a failure), never a silent "Starting".
 		backendTried = false;
-		if (backend.IsReady())
+		if (backend.IsReady()) {
 			backend.Tick();
+			if (backend.AlphaIdle())
+				backend.ReleaseAlphaResources();  // (45h) once the GPU is done with the released scene
+		}
 		traceSample = {};
 		return;
 	}
@@ -366,6 +402,7 @@ void RayTracing::RunFrame()
 	if (!EnsureBackend())
 		return;
 	scene.SetCutoutAsOpaque(settings.CutoutAsOpaque);  // (45g) a change re-captures the scene
+	UpdateAlphaCasters();                              // (45h) likewise
 	if (status == Status::Off || status == Status::Unavailable)
 		status = Status::Waiting;
 
@@ -503,6 +540,28 @@ void RayTracing::RunFrame()
 	ID3D11Buffer* cbs[1] = { combineCB->CB() };
 	const UINT groupsX = (width + 7) / 8, groupsY = (height + 7) / 8;
 
+	// 0. (45h) Alpha copies of textures D3D12 cannot open (before the trace: the D3D12 queue waits for this).
+	if (settings.AlphaCasters && backend.AlphaAvailable()) {
+		const bool rgba = backend.AlphaCopiesRgba();
+		if (alphaMaskCS && alphaMaskRgba != rgba)
+			alphaMaskCS = nullptr;
+		if (!alphaMaskCS) {
+			std::vector<std::pair<const char*, const char*>> defines;
+			if (rgba)
+				defines.emplace_back("ALPHA_RGBA", "");
+			alphaMaskCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\RayTracing\\AlphaMaskCS.hlsl", defines, "cs_5_0")));
+			alphaMaskRgba = rgba;
+			if (!alphaMaskCS) {
+				// Without it the copies are never made: those shapes would only wait (they keep the shadow map).
+				alphaOffReason = "the alpha copy shader (AlphaMaskCS) did not compile";
+				logger::error("[RayTracing] Alpha-tested casters: {} -- switched off", alphaOffReason);
+				settings.AlphaCasters = false;
+			}
+		}
+		if (alphaMaskCS)
+			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
+	}
+
 	// 1. Depth + engine mask -> the tracer's shared texture.
 	{
 		ID3D11ShaderResourceView* srvs[2] = { depth.depthSRV, mask.SRV };
@@ -604,15 +663,15 @@ void RayTracing::RunFrame()
 			if (sc.missedByReason[r])
 				reasons += std::format("{}{} {}", reasons.empty() ? "" : ", ", RayTracingScene::kMissReasonNames[r], sc.missedByReason[r]);
 		}
-		logger::info("[RayTracing] TLAS: {} cell chunks, {} doors/activators/movable, {} items, {} trees/plants ({} instances not built yet); "
+		logger::info("[RayTracing] TLAS: {} cell chunks, {} doors/activators/movable, {} items, {} trees/plants, {} alpha-tested ({} instances not built yet); "
 					 "every instance mask 0x{:02X}, flags 0x{:X} (triangle cull disable, force opaque); self-check: {} of {} instances outside the "
 					 "engine's bounds (cell chunks {}, objects {}; {} in total); missed casters in this area {} ({}; {} re-checked later while pending, "
-					 "{} recaptures requested); alpha-tested shapes taken as opaque {}; persistent references taken: {} statics, {} objects",
+					 "{} recaptures requested); alpha-tested shapes taken as opaque {}, traced with their cut-out {}; persistent references taken: {} statics, {} objects",
 			check.written[RayTracingRT::kCategoryCell], check.written[RayTracingRT::kCategoryMovable], check.written[RayTracingRT::kCategoryItem],
-			check.written[RayTracingRT::kCategoryTree], notBuilt, RayTracingRT::Backend::kInstanceMask,
+			check.written[RayTracingRT::kCategoryTree], check.written[RayTracingRT::kCategoryAlpha], notBuilt, RayTracingRT::Backend::kInstanceMask,
 			static_cast<std::uint32_t>(RayTracingRT::Backend::kInstanceFlags), mismatched, check.checked, check.mismatched[RayTracingRT::kCategoryCell],
 			mismatched - check.mismatched[RayTracingRT::kCategoryCell], check.mismatchedTotal, sc.missedConfirmed, reasons.empty() ? "none" : reasons,
-			sc.missedPending, sc.missedRecaptures, sc.skipped.cutoutAsOpaque, sc.persistentRefs, sc.persistentObjects);
+			sc.missedPending, sc.missedRecaptures, sc.skipped.cutoutAsOpaque, sc.alpha.registered, sc.persistentRefs, sc.persistentObjects);
 	}
 }
 
@@ -664,6 +723,23 @@ void RayTracing::DrawSettings()
 		ImGui::Combo("Quality", &settings.QualityLevel, qualityNames, 3);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("%s", kQuality[settings.QualityLevel].tooltip);
+
+		// (45h)
+		ImGui::Checkbox("Alpha-tested casters (foliage)", &settings.AlphaCasters);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: leaves, bushes, banners, cloth awnings, fences and other cut-out shapes cast ray-traced sun shadows");
+			ImGui::Text("  that follow their cut-out (the holes between the leaves stay lit). Grass keeps its normal shadows.");
+			ImGui::Text("  Leaves are traced where the tree stands still: their sway in the wind is not followed.");
+			ImGui::Text("  Textures loaded while this is on are read by the ray tracer directly; others get a small 256x256 copy.");
+			ImGui::Text("  Most textures are loaded with the save, so a restart (or loading a save) after switching on gives the sharpest result.");
+			ImGui::Text("Off: these shapes keep their shadow-map shadow, exactly as before. Switching re-captures the scene.");
+		}
+		RayTracingTextureSharing::SetEnabled(settings.Enabled && settings.AlphaCasters);  // also from the main menu
+		if (!alphaOffReason.empty()) {
+			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
+			ImGui::TextWrapped("Alpha-tested casters were switched off automatically: %s", alphaOffReason.c_str());
+			ImGui::PopStyleColor();
+		}
 
 		const char* statusText = "Off";
 		ImVec4 color{ 0.7f, 0.7f, 0.7f, 1.0f };
@@ -767,12 +843,48 @@ void RayTracing::DrawSettings()
 				ob.overBudget ? std::format(", {} new meshes left out (VRAM budget)", ob.overBudget).c_str() : "");
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("Doors, activators, movable statics, lights, loose items and the opaque parts of trees and plants (trunks, branches).");
-				ImGui::Text("Each is traced where it is this frame. Leaves and other alpha-tested parts keep their shadow-map shadow.");
+				ImGui::Text("Each is traced where it is this frame. Leaves and other alpha-tested parts keep their shadow-map shadow");
+				ImGui::Text("  unless Alpha-tested casters is on.");
+			}
+		}
+		{
+			// (45h) Alpha-tested casters.
+			const auto& al = sc.alpha;
+			const auto& ab = backend.GetAlphaStats();
+			const auto share = RayTracingTextureSharing::GetCounts();
+			ImGui::Text("Alpha-tested: %u shapes traced with their cut-out (%u captured, %u meshes, %.2f M triangles, %u instances last frame)",
+				al.registered, al.captured, al.meshes, static_cast<double>(al.meshTriangles) / 1e6, ab.instancesLastFrame);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Captured shapes wait until their BLAS is built and their texture is ready; then they leave the shadow map.");
+				ImGui::Text("Cyan in BLAS Coverage = an alpha-tested surface the ray tracer sees with its cut-out.");
+			}
+			ImGui::Text("  Textures: %u shared at full resolution, %u as 256x256 copies (%u being made)%s", ab.texturesShared, ab.texturesFallback,
+				ab.texturesPending, ab.sharedPathOff ? " -- sharing gave up this session" : "");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Shared: the game's own texture, read directly (no copy, no extra VRAM). Copy: textures loaded before the switch");
+				ImGui::Text("  was on, or not shareable; a 256x256 alpha copy is made (slightly softer cut-out). A restart / load with the");
+				ImGui::Text("  switch on shares more of them.");
+				ImGui::Text("Not shareable %llu, D3D12 could not open %llu, bindless table full %llu.", static_cast<unsigned long long>(ab.notShareable),
+					static_cast<unsigned long long>(ab.openFailed), static_cast<unsigned long long>(ab.slotsFull));
+			}
+			ImGui::Text("  Texture loads made shareable: %llu of %llu diffuse loads (%llu refused by the driver%s)", static_cast<unsigned long long>(share.shared),
+				static_cast<unsigned long long>(share.diffuse), static_cast<unsigned long long>(share.refused), share.gaveUp ? ", gave up" : "");
+			ImGui::Text("  VRAM: texcoords %s of %s, copies %s, records %s; left to the shadow map: %u mesh, %u texture, %u buffer full",
+				Megabytes(ab.uvBytesUsed).c_str(), Megabytes(ab.uvBytes).c_str(), Megabytes(ab.layerBytes).c_str(), Megabytes(ab.infoBytes).c_str(),
+				al.failedMesh, al.failedTexture, al.failedRecord);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Texcoords: 24 bytes per alpha-tested triangle (one buffer of %s, allocated on first use). Copies: 256x256 alpha layers.",
+					Megabytes(64ull << 20).c_str());
+				ImGui::Text("Left to the shadow map (since start): mesh unreadable or too big, texture not registrable, texcoord buffer / copy layers / records full");
+				ImGui::Text("  (copy layers full %llu, texcoords full %llu, records full %llu).", static_cast<unsigned long long>(ab.layersFull),
+					static_cast<unsigned long long>(ab.uvFull), static_cast<unsigned long long>(ab.infosFull));
 			}
 		}
 		ImGui::Text("BLAS: %u built (%.2f M triangles), %u queued, %u instances, %llu builds total", rt.blasCount,
 			static_cast<double>(rt.blasTriangles) / 1e6, rt.blasQueued, rt.instancesLastFrame, static_cast<unsigned long long>(rt.buildsTotal));
-		const std::uint64_t vram = rt.blasBytes + rt.scratchBytes + rt.tlasBytes + rt.uploadBytes + rt.sharedTextureBytes + d3d11Bytes;
+		const auto& alphaBytes = backend.GetAlphaStats();
+		const std::uint64_t vram = rt.blasBytes + rt.scratchBytes + rt.tlasBytes + rt.uploadBytes + rt.sharedTextureBytes + d3d11Bytes +
+		                           alphaBytes.uvBytes + alphaBytes.layerBytes + alphaBytes.infoBytes;
 		ImGui::Text("VRAM: %s total (BLAS %s, scratch %s, TLAS %s, uploads %s, textures %s)", Megabytes(vram).c_str(),
 			Megabytes(rt.blasBytes).c_str(), Megabytes(rt.scratchBytes).c_str(), Megabytes(rt.tlasBytes).c_str(),
 			Megabytes(rt.uploadBytes).c_str(), Megabytes(rt.sharedTextureBytes + d3d11Bytes).c_str());
@@ -798,8 +910,9 @@ void RayTracing::DrawSettings()
 				mismatched += check.mismatched[c];
 				notBuilt += check.notBuilt[c];
 			}
-			ImGui::Text("TLAS: %u cell chunks, %u doors/activators, %u items, %u trees (%u not built yet)", check.written[RayTracingRT::kCategoryCell],
-				check.written[RayTracingRT::kCategoryMovable], check.written[RayTracingRT::kCategoryItem], check.written[RayTracingRT::kCategoryTree], notBuilt);
+			ImGui::Text("TLAS: %u cell chunks, %u doors/activators, %u items, %u trees, %u alpha-tested (%u not built yet)", check.written[RayTracingRT::kCategoryCell],
+				check.written[RayTracingRT::kCategoryMovable], check.written[RayTracingRT::kCategoryItem], check.written[RayTracingRT::kCategoryTree],
+				check.written[RayTracingRT::kCategoryAlpha], notBuilt);
 			const ImVec4 bad{ 1.0f, 0.5f, 0.3f, 1.0f }, good{ 0.6f, 0.9f, 0.6f, 1.0f };
 			ImGui::TextColored(mismatched ? bad : good, "Self-check: %u of %u instances outside the game's own bounds (%llu so far, should be 0)", mismatched,
 				check.checked, static_cast<unsigned long long>(check.mismatchedTotal));
@@ -835,6 +948,8 @@ void RayTracing::DrawSettings()
 			ImGui::Text("Shapes: camera-facing billboards %u, refraction (heat haze) %u, switched-off children %u; alpha-tested taken as opaque %u",
 				skip.billboard, skip.refraction, skip.switchedOff, skip.cutoutAsOpaque);
 			ImGui::Text("Statics with a Havok-driven part (hinged signs) traced as moving objects: %u", skip.physicsParts);
+			ImGui::Text("Alpha-tested traced with their cut-out %u, alpha-tested that could not be (small, no texture / texcoords, test) %u",
+				skip.alphaAnyHit, skip.alphaUnusable);
 			ImGui::Text("Placement check: %u shapes checked, %u fixed (other vertex format), %u left out (wrong place), %u without bound",
 				sc.placementChecked, sc.placementFixed, sc.placementRejected, sc.placementUnchecked);
 			if (auto _tt = Util::HoverTooltipWrapper())

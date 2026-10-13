@@ -22,6 +22,11 @@
  * edge-only cutout); shapes under camera-facing billboard nodes and refraction (heat haze) shapes
  * never go in; of a NiSwitchNode only the drawn child is captured; statics with a Havok-driven
  * part (a child node with its own collision: hinged signs) are traced as moving objects.
+ * (45h) With Alpha-tested casters on, alpha-tested shapes whose cut-out can be traced (diffuse
+ * texture, texcoords, a "greater" alpha test; tree-animated leaves too) get a non-opaque BLAS per
+ * mesh with their texcoords and an instance per shape with a record (texture, threshold) -- in
+ * cells and objects alike; they register with the caster filter once their BLAS is built and their
+ * texture ready. A shape whose cut-out cannot be traced falls back to the 45g rules. Off = 45g.
  *
  * (45e) Objects that can move or need their own placement -- doors, activators, movable statics
  * and lights; loose items; trees and plants (only their opaque, non alpha-tested shapes: trunks
@@ -62,6 +67,10 @@ namespace RayTracingScene
 	/// (0-255; roof tiles use 80, plank cut-outs 128) on a one-sided shape at least this large.
 	inline constexpr std::uint8_t kCutoutMaxThreshold = 128;
 	inline constexpr float kCutoutMinRadius = 128.0f;
+	/// (45h) Alpha-tested casters: shapes smaller than this keep their shadow-map shadow (tiny
+	/// cut-outs are many instances for little shadow), and one mesh's BLAS is capped.
+	inline constexpr float kAlphaMinRadius = 24.0f;
+	inline constexpr std::uint32_t kAlphaMaxTriangles = 131072;
 
 	struct SkipCounts
 	{
@@ -84,6 +93,20 @@ namespace RayTracingScene
 		std::uint32_t switchedOff = 0;     // (45g) inactive children of a NiSwitchNode (the game draws one child)
 		std::uint32_t cutoutAsOpaque = 0;  // (45g) alpha-tested shapes taken as opaque (CutoutAsOpaque), not a skip
 		std::uint32_t physicsParts = 0;    // (45g) statics with a Havok-driven part (swinging signs): own instances
+		std::uint32_t alphaAnyHit = 0;     // (45h) alpha-tested shapes traced with their cut-out, not a skip
+		std::uint32_t alphaUnusable = 0;   // (45h) alpha-tested, but no texture / texcoords / usable test: 45g rules
+	};
+
+	/// (45h) Alpha-tested casters traced with their cut-out (Alpha-tested casters switch).
+	struct AlphaSceneStats
+	{
+		std::uint32_t captured = 0;       // shapes held now (cells and objects)
+		std::uint32_t registered = 0;     // ... in the TLAS and out of the shadow map
+		std::uint32_t meshes = 0;         // distinct alpha meshes (one non-opaque BLAS each)
+		std::uint64_t meshTriangles = 0;
+		std::uint32_t failedMesh = 0;     // mesh unreadable, too big or no texcoords: 45g rules (total)
+		std::uint32_t failedTexture = 0;  // texture could not be registered: 45g rules (total)
+		std::uint32_t failedRecord = 0;   // texcoord buffer / record table full: 45g rules (total)
 	};
 
 	/// (45g) Why a missed caster (a big shape drawn into the sun cascades inside the traced area but
@@ -160,6 +183,7 @@ namespace RayTracingScene
 		std::uint32_t missedByReason[static_cast<int>(MissReason::Count)]{};
 		std::uint32_t missedPending = 0;           // re-armed: cell still capturing, BLAS building, ... (total)
 		std::uint32_t missedRecaptures = 0;        // recaptures the self-check requested (total)
+		AlphaSceneStats alpha{};                   // (45h)
 	};
 
 	class Scene
@@ -217,8 +241,53 @@ namespace RayTracingScene
 				RequestFlush();
 			}
 		}
+		/// (45h) Alpha-tested casters: alpha-tested shapes (leaves, banners, fences) are traced with
+		/// their cut-out (non-opaque BLAS, any-hit test). Off = exactly 45g. A change re-captures everything.
+		void SetAlphaCasters(bool a_enable)
+		{
+			if (a_enable != alphaCasters_) {
+				alphaCasters_ = a_enable;
+				RequestFlush();
+			}
+		}
 
 	private:
+		// (45e) Objects: one BLAS per distinct engine mesh (in the shape's own space), one TLAS
+		// instance per shape with the shape's world transform of the frame.
+		struct MeshKey
+		{
+			const void* data = nullptr;  // BSGraphics::TriShape, shared by every copy of a mesh
+			std::uint32_t vertices = 0;
+			std::uint32_t triangles = 0;
+			std::uint8_t kind = 0;       // (45h) 0 opaque, 1 alpha-tested, 2 alpha-tested with vertex alpha
+			bool operator==(const MeshKey&) const = default;
+		};
+		struct MeshKeyHash
+		{
+			std::size_t operator()(const MeshKey& a_key) const noexcept
+			{
+				return std::hash<const void*>()(a_key.data) ^ (static_cast<std::size_t>(a_key.vertices) << 20) ^ a_key.triangles ^
+				       (static_cast<std::size_t>(a_key.kind) << 40);
+			}
+		};
+		struct SharedMesh
+		{
+			RayTracingRT::BlasHandle blas = RayTracingRT::kInvalidBlas;
+			std::uint32_t users = 0;
+			std::uint32_t triangles = 0;
+		};
+		struct ObjectShape
+		{
+			RE::NiPointer<RE::BSGeometry> geometry;  // holds the mesh (the key) alive too
+			MeshKey key;
+			RayTracingRT::BlasHandle blas = RayTracingRT::kInvalidBlas;
+			bool registered = false;  // in the caster filter
+			// (45h) Alpha-tested: its texture and record (both released with the shape).
+			bool alpha = false;
+			RayTracingRT::AlphaTexture texture = RayTracingRT::kInvalidAlphaTexture;
+			std::uint32_t info = RayTracingRT::kInvalidAlphaInfo;
+		};
+
 		struct TrackedRef
 		{
 			RE::NiPointer<RE::TESObjectREFR> ref;
@@ -247,6 +316,8 @@ namespace RayTracingScene
 			// (45f) Per BLAS: the range of `geometries` it was made from (for the self-check).
 			std::vector<std::pair<std::uint32_t, std::uint32_t>> chunkGeometries;
 			std::uint32_t chunkStart = 0;  // first geometry of the chunk being filled
+			// (45h) Alpha-tested shapes of the cell: own BLAS per mesh and instance per shape (like objects).
+			std::vector<ObjectShape> alphaShapes;
 			bool filterRegistered = false;
 			bool replaces = false;   // (45e) a re-capture of a cell whose old capture is still live
 			bool replacing = false;  // (45e) an old capture waiting for its replacement
@@ -294,16 +365,39 @@ namespace RayTracingScene
 			std::uint32_t stride = 0;
 			std::uint32_t positionOffset = 0;
 			bool fullPrecision = false;
+			std::uint32_t uvOffset = UINT32_MAX;     // (45h) half2 texcoord 0, when the mesh has one
+			std::uint32_t colorOffset = UINT32_MAX;  // (45h) ubyte4 vertex colour, when the mesh has one
 		};
 		bool ReadMesh(RE::BSTriShape* a_shape, bool a_landscape, RawMesh& o_mesh);
 		/// The shape if it may go into the scene (Lighting shader, opaque, casts shadows, ...); the
 		/// reason is counted otherwise.
-		RE::BSTriShape* CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout);
+		RE::BSTriShape* CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, bool a_allowAlpha = false,
+			bool* o_alpha = nullptr);
 		/// (45f) CheckShape's verdict without counting: nullptr = accepted, else the reason.
 		/// (45g) a_allowCutout: alpha-tested shapes passing CutoutAsOpaque's criteria are accepted;
 		/// o_reason (optional) receives the reason's MissReason bucket.
+		/// (45h) a_allowAlpha: alpha-tested shapes whose cut-out can be traced (texture, texcoords,
+		/// a "greater" test) are accepted as alpha shapes (*o_alpha = true), tree-animated ones too.
 		static const char* ShapeRejectReason(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, SkipCounts* o_counts,
-			MissReason* o_reason = nullptr);
+			MissReason* o_reason = nullptr, bool a_allowAlpha = false, bool* o_alpha = nullptr);
+		/// (45h) The shape's cut-out as the ray tracer needs it: the game's diffuse texture, threshold,
+		/// material alpha and texcoord transform; false when it cannot be traced (SEH-guarded).
+		struct AlphaSource
+		{
+			ID3D11Texture2D* texture = nullptr;
+			ID3D11ShaderResourceView* view = nullptr;
+			RayTracingRT::AlphaMaterial material{};
+			bool vertexAlpha = false;  // the Lighting shader multiplies the vertex colour's alpha in
+		};
+		static bool GetAlphaSource(RE::BSGeometry* a_geometry, AlphaSource& o_source);
+		/// (45h) An alpha-tested shape as an object shape (shared non-opaque mesh BLAS, texture,
+		/// record); false = not possible (counted), the caller then applies the 45g rules.
+		bool CaptureAlphaShape(RayTracingRT::Backend& a_backend, RE::BSTriShape* a_shape, bool a_allowNewMeshes, ObjectShape& o_shape);
+		/// Releases an object / alpha shape: filter entry, mesh reference, texture and record.
+		void ReleaseShape(RayTracingRT::Backend& a_backend, ObjectShape& a_shape);
+		/// Appends the TLAS instance of an object / alpha shape (when it is drawn and, for alpha shapes, registered).
+		static void AppendShapeInstance(const ObjectShape& a_shape, RayTracingRT::InstanceCategory a_category, std::uint32_t a_refID, bool a_expected,
+			std::vector<RayTracingRT::Instance>& o_instances);
 		/// (45g) Statics with a Havok-driven part (a node below the root with its own collision
 		/// object: hinged signs and the like) move: they get per-frame object instances.
 		static bool HasPhysicsPart(RE::NiAVObject* a_object, int a_depth);
@@ -317,36 +411,7 @@ namespace RayTracingScene
 		/// for references of the persistent cell); nullptr when none.
 		[[nodiscard]] const Cell* CapturedCellOf(RE::TESObjectREFR* a_ref) const;
 
-		// (45e) Objects: one BLAS per distinct engine mesh (in the shape's own space), one TLAS
-		// instance per shape with the shape's world transform of the frame.
-		struct MeshKey
-		{
-			const void* data = nullptr;  // BSGraphics::TriShape, shared by every copy of a mesh
-			std::uint32_t vertices = 0;
-			std::uint32_t triangles = 0;
-			bool operator==(const MeshKey&) const = default;
-		};
-		struct MeshKeyHash
-		{
-			std::size_t operator()(const MeshKey& a_key) const noexcept
-			{
-				return std::hash<const void*>()(a_key.data) ^ (static_cast<std::size_t>(a_key.vertices) << 20) ^ a_key.triangles;
-			}
-		};
-		struct SharedMesh
-		{
-			RayTracingRT::BlasHandle blas = RayTracingRT::kInvalidBlas;
-			std::uint32_t users = 0;
-			std::uint32_t triangles = 0;
-		};
 		static constexpr std::uint32_t kMissedLogLimit = 32;
-		struct ObjectShape
-		{
-			RE::NiPointer<RE::BSGeometry> geometry;  // holds the mesh (the key) alive too
-			MeshKey key;
-			RayTracingRT::BlasHandle blas = RayTracingRT::kInvalidBlas;
-			bool registered = false;  // in the caster filter
-		};
 		struct ObjectRef
 		{
 			RE::NiPointer<RE::TESObjectREFR> ref;
@@ -356,7 +421,9 @@ namespace RayTracingScene
 		};
 
 		void UpdateObjects(RayTracingRT::Backend& a_backend, std::int64_t a_deadline, bool a_allowNewMeshes);
-		void CollectObjectShapes(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, int a_depth, std::vector<RE::BSTriShape*>& o_shapes);
+		/// o_shapes: each shape and whether it is taken as an alpha shape (45h).
+		void CollectObjectShapes(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, int a_depth,
+			std::vector<std::pair<RE::BSTriShape*, bool>>& o_shapes);
 		void CaptureObjectRef(RayTracingRT::Backend& a_backend, const RE::NiPointer<RE::TESObjectREFR>& a_ref, RE::NiAVObject* a_root,
 			ObjectKind a_kind, bool a_allowNewMeshes);
 		void ReleaseObject(RayTracingRT::Backend& a_backend, ObjectRef& a_object);
@@ -390,6 +457,7 @@ namespace RayTracingScene
 		std::int64_t missedWindowStart_ = 0;
 		std::uint32_t missedWindowCount_ = 0;
 		bool cutoutAsOpaque_ = true;
+		bool alphaCasters_ = false;  // (45h)
 		// (45g) Statics with a Havok-driven part (reference -> its 3D when judged): object path.
 		ankerl::unordered_dense::map<const RE::TESObjectREFR*, const RE::NiAVObject*> physicsRefs_;
 	};

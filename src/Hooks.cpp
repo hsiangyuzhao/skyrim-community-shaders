@@ -26,6 +26,7 @@
 #include "Features/InteriorSun.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LODBlending.h"
+#include "Features/RayTracing/TextureSharing.h"
 #include "Features/Skin.h"
 #include "Features/TerrainHelper.h"
 #include "Features/Upscaling.h"
@@ -640,6 +641,9 @@ namespace Hooks
 			stl::detour_vfunc<23, ID3D11Device_CreateSamplerState>(globals::d3d::device);
 			// (44f) Device Create* timing for the frame trace (measurement only).
 			Util::EngineTiming::InstallDeviceHooks(globals::d3d::device);
+			// (45h) Ray Tracing, Alpha-tested casters: diffuse textures loaded while the switch is on
+			// are created shareable with D3D12 (pass-through otherwise).
+			RayTracingTextureSharing::Install(globals::d3d::device);
 
 			globals::InstallD3DHooks(globals::d3d::context);
 			Util::FrameTrace::InstallContextHooks(globals::d3d::context);

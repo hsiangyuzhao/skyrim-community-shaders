@@ -10,6 +10,8 @@
 
 // Generated at build time from Shaders/TraceShadowsCS.hlsl by the Windows SDK's dxc (CMakeLists.txt).
 #include "RayTracing/TraceShadowsCS.dxil.h"
+// (45h) The same shader with RT_ALPHA: non-opaque (alpha-tested) triangles are tested against their cut-out.
+#include "RayTracing/TraceShadowsAlphaCS.dxil.h"
 
 namespace RayTracingRT
 {
@@ -188,7 +190,20 @@ namespace RayTracingRT
 		ranges[1].BaseShaderRegister = 0;
 		ranges[1].OffsetInDescriptorsFromTableStart = 1;
 
-		D3D12_ROOT_PARAMETER params[3]{};
+		// (45h) Alpha-tested casters (only the RT_ALPHA variant uses them): t2 per-shape records,
+		// t3 texcoords, t4 the 256x256 copy layers, t0 space1 the bindless game textures, s0.
+		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
+		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		alphaRanges[0].NumDescriptors = 1;
+		alphaRanges[0].BaseShaderRegister = 4;
+		alphaRanges[0].OffsetInDescriptorsFromTableStart = 0;
+		alphaRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		alphaRanges[1].NumDescriptors = kAlphaTextureSlots;
+		alphaRanges[1].BaseShaderRegister = 0;
+		alphaRanges[1].RegisterSpace = 1;
+		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
+
+		D3D12_ROOT_PARAMETER params[6]{};
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[0].Constants.ShaderRegister = 0;
 		params[0].Constants.Num32BitValues = kRootConstants;
@@ -200,10 +215,29 @@ namespace RayTracingRT
 		params[2].DescriptorTable.NumDescriptorRanges = 2;
 		params[2].DescriptorTable.pDescriptorRanges = ranges;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[3].Descriptor.ShaderRegister = 2;
+		params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[4].Descriptor.ShaderRegister = 3;
+		params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[5].DescriptorTable.NumDescriptorRanges = 2;
+		params[5].DescriptorTable.pDescriptorRanges = alphaRanges;
+		params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+		D3D12_STATIC_SAMPLER_DESC sampler{};
+		sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+		sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+		sampler.MaxLOD = D3D12_FLOAT32_MAX;
+		sampler.ShaderRegister = 0;
+		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
 		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-		rootDesc.NumParameters = 3;
+		rootDesc.NumParameters = 6;
 		rootDesc.pParameters = params;
+		rootDesc.NumStaticSamplers = 1;
+		rootDesc.pStaticSamplers = &sampler;
 		ComPtr<ID3DBlob> blob, error;
 		HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
 		if (FAILED(hr)) {
@@ -227,13 +261,43 @@ namespace RayTracingRT
 
 		D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
 		heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		heapDesc.NumDescriptors = 2;
+		heapDesc.NumDescriptors = kAlphaDescriptorBase + kAlphaTextureSlots;
 		heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		if (FAILED(hr = device_->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&descriptorHeap_)))) {
 			o_reason = std::format("CreateDescriptorHeap failed ({})", HrString(hr));
 			return false;
 		}
 		descriptorSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
+		{
+			auto cpu = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
+			cpu.ptr += static_cast<SIZE_T>(descriptorSize_) * (kAlphaDescriptorBase - 1);
+			D3D12_SHADER_RESOURCE_VIEW_DESC nullArray{};
+			nullArray.Format = DXGI_FORMAT_R8_UNORM;
+			nullArray.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+			nullArray.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			nullArray.Texture2DArray.MipLevels = 1;
+			nullArray.Texture2DArray.ArraySize = 1;
+			device_->CreateShaderResourceView(nullptr, &nullArray, cpu);
+			D3D12_SHADER_RESOURCE_VIEW_DESC nullTexture{};
+			nullTexture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			nullTexture.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			nullTexture.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			nullTexture.Texture2D.MipLevels = 1;
+			for (std::uint32_t slot = 0; slot < kAlphaTextureSlots; ++slot) {
+				cpu.ptr += descriptorSize_;
+				device_->CreateShaderResourceView(nullptr, &nullTexture, cpu);
+			}
+		}
+
+		// (45h) The alpha variant: not fatal when the driver refuses it (the switch then stays unavailable).
+		psoDesc.CS.pShaderBytecode = g_TraceShadowsAlphaCS;
+		psoDesc.CS.BytecodeLength = sizeof(g_TraceShadowsAlphaCS);
+		if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&alphaPipeline_)))) {
+			alphaPipeline_.Reset();
+			logger::warn("[RayTracing] The alpha-tested ray query shader was rejected by the driver ({}); Alpha-tested casters unavailable", HrString(hr));
+		}
 		return true;
 	}
 
@@ -254,6 +318,8 @@ namespace RayTracingRT
 		for (auto& context : contexts_) {
 			if (context.instanceBuffer && context.instanceMapped)
 				context.instanceBuffer->Unmap(0, nullptr);
+			if (context.alphaInfoBuffer && context.alphaInfoMapped)
+				context.alphaInfoBuffer->Unmap(0, nullptr);
 			context = {};
 		}
 		depthMask_ = {};
@@ -268,7 +334,38 @@ namespace RayTracingRT
 		timestampHeap_.Reset();
 		timestampReadback_.Reset();
 		descriptorHeap_.Reset();
+		alphaPipeline_.Reset();
 		pipeline_.Reset();
+		// (45h)
+		alphaTextures_.clear();
+		freeAlphaTextures_.clear();
+		alphaTextureIndex_.clear();
+		alphaCopyQueue_.clear();
+		freeAlphaSlots_.clear();
+		freeAlphaLayers_.clear();
+		nextAlphaSlot_ = nextAlphaLayer_ = 0;
+		retiredAlphaSlots_.clear();
+		retiredAlphaLayers_.clear();
+		retiredAlphaUv_.clear();
+		alphaInfos_.clear();
+		freeAlphaInfos_.clear();
+		alphaInfoLive_ = 0;
+		alphaInfoVersion_ = 1;
+		alphaUv_.Reset();
+		alphaUvFree_.clear();
+		alphaUvUsed_ = 0;
+		for (auto& uav : alphaLayerUavs_)
+			uav.Reset();
+		alphaLayers11_.Reset();
+		alphaLayers12_.Reset();
+		alphaCopyCB_.Reset();
+		alphaCopySampler_.Reset();
+		alphaLayerFormat_ = DXGI_FORMAT_UNKNOWN;
+		alphaLayerCount_ = 0;
+		alphaLayersFailed_ = false;
+		alphaSharedOpened_ = 0;
+		alphaFault_.clear();
+		alphaStats_ = {};
 		rootSignature_.Reset();
 		fence11_.Reset();
 		fence_.Reset();
@@ -304,7 +401,7 @@ namespace RayTracingRT
 		return resource;
 	}
 
-	bool Backend::CheckSharedFormat(DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store, const char* a_name)
+	bool Backend::CheckSharedFormat(DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store, const char* a_name, bool a_fatal)
 	{
 		// A D3D11 texture shared with D3D12 needs a format the driver marks as shareable: the
 		// two-channel formats (R32G32, R8G8, ...) are not on the guaranteed list and the driver
@@ -339,7 +436,12 @@ namespace RayTracingRT
 			static_cast<int>(a_format), support11, support11b.OutFormatSupport2, static_cast<std::uint32_t>(support12.Support1),
 			static_cast<std::uint32_t>(support12.Support2));
 		if (!missing.empty()) {
-			lastError_ = std::format("{}: the GPU / driver lacks {} ({})", a_name, missing, bits);
+			const std::string error = std::format("{}: the GPU / driver lacks {} ({})", a_name, missing, bits);
+			if (!a_fatal) {
+				logger::info("[RayTracing] {}", error);
+				return false;
+			}
+			lastError_ = error;
 			logger::error("[RayTracing] {}", lastError_);
 			failed_ = true;
 			return false;
@@ -456,6 +558,7 @@ namespace RayTracingRT
 				*a_entry.counter -= std::min(*a_entry.counter, a_entry.bytes);
 			return true;
 		});
+		CollectAlphaRetired(completed);
 	}
 
 	void Backend::CollectTimestamps(std::size_t a_index)
@@ -494,11 +597,20 @@ namespace RayTracingRT
 	{
 		if (!ready_ || !a_geometry || a_geometry->Triangles() == 0)
 			return kInvalidBlas;
+		// (45h) An alpha BLAS keeps its texcoords (3 corners per triangle) in the shared buffer.
+		std::uint32_t uvOffset = UINT32_MAX, uvCount = 0;
+		if (!a_geometry->Opaque()) {
+			uvCount = a_geometry->Triangles() * 3;
+			if (a_geometry->alphaUV.size() != static_cast<std::size_t>(uvCount) * 2 || !AlphaAvailable() || !AllocateAlphaUv(uvCount, uvOffset))
+				return kInvalidBlas;
+		}
 		const BlasHandle handle = AllocateHandle();
 		auto& blas = blas_[handle];
 		blas = {};
 		blas.state = BlasState::Queued;
 		blas.triangles = a_geometry->Triangles();
+		blas.uvOffset = uvOffset;
+		blas.uvCount = uvCount;
 		// (45f) Local box of the vertices the triangles use (for the TLAS self-check).
 		for (int a = 0; a < 3; ++a) {
 			blas.boundsMin[a] = FLT_MAX;
@@ -534,6 +646,8 @@ namespace RayTracingRT
 		}
 		if (blas.resource)
 			Retire(blas.resource, blas.bytes, &stats_.blasBytes);
+		if (blas.uvOffset != UINT32_MAX)
+			FreeAlphaUv(blas.uvOffset, blas.uvCount);
 		blas = {};
 		freeHandles_.push_back(a_handle);
 	}
@@ -662,6 +776,7 @@ namespace RayTracingRT
 			BlasHandle handle;
 			std::uint64_t vertexOffset;
 			std::uint64_t indexOffset;
+			std::uint64_t uvOffset;  // (45h) alpha texcoords in the upload buffer (alpha BLASes only)
 		};
 		std::vector<Pending> batch;
 		std::uint64_t uploadBytes = 0;
@@ -674,9 +789,13 @@ namespace RayTracingRT
 				if (blas.state != BlasState::Queued || !blas.geometry)
 					continue;
 				const ChunkGeometry& geometry = *blas.geometry;
-				Pending entry{ handle, Align(uploadBytes, 256), 0 };
+				Pending entry{ handle, Align(uploadBytes, 256), 0, 0 };
 				entry.indexOffset = Align(entry.vertexOffset + geometry.positions.size() * sizeof(float), 256);
 				uploadBytes = entry.indexOffset + geometry.indices.size() * sizeof(std::uint32_t);
+				if (!geometry.Opaque()) {
+					entry.uvOffset = Align(uploadBytes, 256);
+					uploadBytes = entry.uvOffset + geometry.alphaUV.size() * sizeof(std::uint32_t);
+				}
 				batchTriangles += geometry.Triangles();
 				batch.push_back(entry);
 			}
@@ -695,12 +814,34 @@ namespace RayTracingRT
 			const ChunkGeometry& geometry = *blas_[entry.handle].geometry;
 			std::memcpy(mapped + entry.vertexOffset, geometry.positions.data(), geometry.positions.size() * sizeof(float));
 			std::memcpy(mapped + entry.indexOffset, geometry.indices.data(), geometry.indices.size() * sizeof(std::uint32_t));
+			if (!geometry.Opaque())
+				std::memcpy(mapped + entry.uvOffset, geometry.alphaUV.data(), geometry.alphaUV.size() * sizeof(std::uint32_t));
 		}
 		upload->Unmap(0, nullptr);
 		upload->SetName(L"CS RayTracing BLAS upload");
 		// Freed once this submission completes.
 		Retire(upload, uploadBytes, &stats_.uploadBytes);
 		stats_.uploadBytes += uploadBytes;
+
+		// (45h) Texcoords of alpha BLASes into the shared buffer (a range per BLAS, fixed for its life).
+		{
+			bool any = false;
+			for (const auto& entry : batch)
+				any = any || (!blas_[entry.handle].geometry->Opaque() && blas_[entry.handle].uvOffset != UINT32_MAX);
+			if (any && alphaUv_) {
+				auto toCopy = Transition(alphaUv_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+				a_list->ResourceBarrier(1, &toCopy);
+				for (const auto& entry : batch) {
+					const auto& blas = blas_[entry.handle];
+					if (blas.geometry->Opaque() || blas.uvOffset == UINT32_MAX)
+						continue;
+					a_list->CopyBufferRegion(alphaUv_.Get(), static_cast<std::uint64_t>(blas.uvOffset) * 8, upload.Get(), entry.uvOffset,
+						static_cast<std::uint64_t>(blas.uvCount) * 8);
+				}
+				auto back = Transition(alphaUv_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+				a_list->ResourceBarrier(1, &back);
+			}
+		}
 
 		for (std::size_t b = 0; b < batch.size(); ++b) {
 			const BlasHandle handle = batch[b].handle;
@@ -713,7 +854,8 @@ namespace RayTracingRT
 
 			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc{};
 			geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-			geometryDesc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+			// (45h) Alpha-tested meshes are non-opaque: the trace tests each candidate against its cut-out.
+			geometryDesc.Flags = geometry.Opaque() ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
 			geometryDesc.Triangles.VertexBuffer.StartAddress = upload->GetGPUVirtualAddress() + batch[b].vertexOffset;
 			geometryDesc.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
 			geometryDesc.Triangles.VertexCount = geometry.Vertices();
@@ -934,6 +1076,7 @@ namespace RayTracingRT
 			for (auto& count : check_.mismatched)
 				count = 0;
 		}
+		std::uint32_t alphaInstances = 0;
 		for (const auto& instance : instances) {
 			const auto category = std::min<std::uint32_t>(instance.category, kInstanceCategories - 1);
 			if (instance.blas >= blas_.size()) {
@@ -942,6 +1085,12 @@ namespace RayTracingRT
 			}
 			const auto& blas = blas_[instance.blas];
 			if ((blas.state != BlasState::Built && blas.state != BlasState::Ready) || !blas.resource) {
+				++check_.notBuilt[category];
+				continue;
+			}
+			// (45h) Alpha-tested: only with the alpha pipeline and its buffers, and a live record.
+			const bool alpha = instance.alphaInfo != kInvalidAlphaInfo;
+			if (alpha && (!alphaPipeline_ || !alphaUv_ || instance.alphaInfo >= alphaInfos_.size() || instance.alphaInfo + 1 >= (1u << 24))) {
 				++check_.notBuilt[category];
 				continue;
 			}
@@ -954,6 +1103,12 @@ namespace RayTracingRT
 			desc.Transform[2][3] = static_cast<float>(instance.z - a_input.cameraZ);
 			desc.InstanceMask = kInstanceMask;
 			desc.Flags = kInstanceFlags;
+			if (alpha) {
+				// The shader finds the record through the instance ID (0 = opaque); no force-opaque flag.
+				desc.InstanceID = instance.alphaInfo + 1;
+				desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
+				++alphaInstances;
+			}
 			desc.AccelerationStructure = blas.resource->GetGPUVirtualAddress();
 			if (a_input.validate && instance.hasExpected)
 				CheckInstance(desc, instance, blas, a_input);
@@ -961,6 +1116,15 @@ namespace RayTracingRT
 			descs[instanceCount++] = desc;
 		}
 		stats_.instancesLastFrame = instanceCount;
+		// (45h) The alpha pipeline only on frames that hold alpha-tested instances (and their records
+		// are in this context's copy); every other frame runs exactly the opaque pipeline.
+		bool alphaFrame = alphaInstances > 0;
+		if (alphaFrame && !EnsureAlphaInfoBuffer(context)) {
+			// Nothing written above can be traced without its record: drop the frame's trace.
+			list->Close();
+			return false;
+		}
+		alphaStats_.instancesLastFrame = alphaInstances;
 
 		{
 			// Builds and compaction copies above must be finished before the TLAS reads them.
@@ -987,10 +1151,17 @@ namespace RayTracingRT
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
 		list->SetDescriptorHeaps(1, heaps);
 		list->SetComputeRootSignature(rootSignature_.Get());
-		list->SetPipelineState(pipeline_.Get());
+		list->SetPipelineState(alphaFrame ? alphaPipeline_.Get() : pipeline_.Get());
 		list->SetComputeRoot32BitConstants(0, kRootConstants, &a_input.constants, 0);
 		list->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
 		list->SetComputeRootDescriptorTable(2, descriptorHeap_->GetGPUDescriptorHandleForHeapStart());
+		if (alphaFrame) {
+			list->SetComputeRootShaderResourceView(3, context.alphaInfoBuffer->GetGPUVirtualAddress());
+			list->SetComputeRootShaderResourceView(4, alphaUv_->GetGPUVirtualAddress());
+			auto table = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
+			table.ptr += static_cast<UINT64>(descriptorSize_) * (kAlphaDescriptorBase - 1);
+			list->SetComputeRootDescriptorTable(5, table);
+		}
 		list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
 
 		D3D12_RESOURCE_BARRIER post[2] = {

@@ -195,7 +195,24 @@ add_custom_command(
     COMMENT "Compiling Ray Tracing DXIL (TraceShadowsCS, cs_6_5)"
     VERBATIM
 )
-target_sources("${PROJECT_NAME}" PRIVATE "${CS_RT_SHADER_HEADER}")
+# (45h) The same shader with RT_ALPHA: alpha-tested (non-opaque) casters tested against their cut-out.
+set(CS_RT_ALPHA_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/TraceShadowsAlphaCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_ALPHA_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -D
+        RT_ALPHA=1 -Fh "${CS_RT_ALPHA_SHADER_HEADER}" -Vn g_TraceShadowsAlphaCS
+        "${CS_RT_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (TraceShadowsCS with RT_ALPHA, cs_6_5)"
+    VERBATIM
+)
+target_sources(
+    "${PROJECT_NAME}"
+    PRIVATE "${CS_RT_SHADER_HEADER}" "${CS_RT_ALPHA_SHADER_HEADER}"
+)
 target_include_directories(
     "${PROJECT_NAME}"
     PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"

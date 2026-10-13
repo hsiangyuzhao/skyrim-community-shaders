@@ -10,6 +10,10 @@
 //
 // Positions are camera-relative (the game's CameraPosAdjust space): the TLAS is built with
 // instance translations relative to the same camera position, so all ray math stays near 0.
+//
+// (45h) Built twice: as is (every instance opaque; the pipeline of every frame without
+// alpha-tested instances, identical to 45g) and with RT_ALPHA (non-opaque alpha-tested instances
+// are tested against their cut-out, see AlphaBlocks).
 
 struct TraceConstants
 {
@@ -43,6 +47,128 @@ float InterleavedGradientNoise(float2 p, uint frame)
 	return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
 }
 
+#if defined(RT_ALPHA)
+// (45h) Alpha-tested casters (leaves, banners, fences): their instances are non-opaque, with the
+// instance ID = 1 + their record. A candidate triangle is kept when the alpha of its texture at
+// the hit (times material and vertex alpha) passes the shape's alpha test, as the game's own
+// Lighting shader decides it. Opaque instances (ID 0) never reach this code.
+static const uint kAlphaTextureSlots = 4096u;    // Backend::kAlphaTextureSlots
+static const uint kAlphaFallbackBit = 0x80000000u;
+static const uint kAlphaCandidateBudget = 32u;   // per ray; past it the ray counts as blocked (bounded cost)
+static const float kAlphaTextureWorld = 128.0;   // assumed world size of one texture repeat (mip estimate only)
+
+struct AlphaInfo
+{
+	uint UvBase;         // first corner of triangle 0 in AlphaUVs (3 per triangle)
+	uint Triangles;
+	uint Texture;        // bindless slot, or kAlphaFallbackBit | layer of AlphaLayers
+	uint Flags;
+	float Threshold;     // keep when alpha >= threshold
+	float AlphaScale;    // material alpha
+	float2 Pad;
+	float4 UvTransform;  // xy offset, zw scale (the material's texcoord offset / scale)
+};
+
+StructuredBuffer<AlphaInfo> AlphaInfos : register(t2);
+StructuredBuffer<uint2> AlphaUVs : register(t3);   // x = half2 texcoord, y = vertex alpha (float bits)
+Texture2DArray<float> AlphaLayers : register(t4);  // 256x256 alpha copies of textures D3D12 cannot open
+Texture2D<float4> AlphaTextures[kAlphaTextureSlots] : register(t0, space1);
+SamplerState AlphaSampler : register(s0);
+
+float2 UnpackTexcoord(uint packed)
+{
+	return f16tof32(uint2(packed & 0xFFFFu, packed >> 16));
+}
+
+// True when the candidate blocks the ray. footprint: world size the ray covers there (mip choice;
+// a coarser mip than the screen would pick keeps the texture reads cheap).
+bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
+{
+	if (instanceID == 0u)
+		return true;
+	const AlphaInfo info = AlphaInfos[instanceID - 1u];
+	if (primitive >= info.Triangles)
+		return true;
+	const uint base = info.UvBase + primitive * 3u;
+	const uint2 c0 = AlphaUVs[base];
+	const uint2 c1 = AlphaUVs[base + 1u];
+	const uint2 c2 = AlphaUVs[base + 2u];
+	const float w0 = 1.0 - bary.x - bary.y;
+	float2 uv = UnpackTexcoord(c0.x) * w0 + UnpackTexcoord(c1.x) * bary.x + UnpackTexcoord(c2.x) * bary.y;
+	const float vertexAlpha = asfloat(c0.y) * w0 + asfloat(c1.y) * bary.x + asfloat(c2.y) * bary.y;
+	uv = uv * info.UvTransform.zw + info.UvTransform.xy;
+	if (!all(isfinite(uv)))
+		return true;
+	// Never below 64 texels across: coarser mips average the cut-out away (alpha-test fade).
+	const float footprintUV = max(footprint, 1e-3) / kAlphaTextureWorld;
+	float alpha;
+	[branch] if (info.Texture & kAlphaFallbackBit)
+	{
+		const float lod = clamp(log2(256.0 * footprintUV) + 0.5, 0.0, 2.0);
+		alpha = AlphaLayers.SampleLevel(AlphaSampler, float3(uv, float(info.Texture & 0xFFFFu)), lod);
+	}
+	else
+	{
+		uint width, height, levels;
+		AlphaTextures[NonUniformResourceIndex(info.Texture)].GetDimensions(0u, width, height, levels);
+		const float size = float(max(width, height));
+		const float maxLod = clamp(log2(size / 64.0), 0.0, max(float(levels) - 1.0, 0.0));
+		const float lod = clamp(log2(size * footprintUV) + 0.5, 0.0, maxLod);
+		alpha = AlphaTextures[NonUniformResourceIndex(info.Texture)].SampleLevel(AlphaSampler, uv, lod).a;
+	}
+	return alpha * info.AlphaScale * vertexAlpha >= info.Threshold;
+}
+
+bool AnyHit(float3 origin, float3 direction, float tMax, float footprint)
+{
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = direction;
+	ray.TMin = 0.0;
+	ray.TMax = tMax;
+	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+	uint budget = kAlphaCandidateBudget;
+	while (q.Proceed()) {
+		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+			continue;
+		// Opaque triangles end the search on their own; a kept cut-out triangle ends it too.
+		if (budget == 0u || AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(),
+								footprint + q.CandidateTriangleRayT() * C.ToSun.w))
+			q.CommitNonOpaqueTriangleHit();
+		else
+			budget -= 1u;
+	}
+	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+
+bool ClosestHit(float3 origin, float3 direction, float tMax, float footprint, out float tHit, out bool alphaHit)
+{
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = direction;
+	ray.TMin = 0.0;
+	ray.TMax = tMax;
+	RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+	uint budget = kAlphaCandidateBudget;
+	while (q.Proceed()) {
+		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+			continue;
+		if (budget == 0u) {
+			q.CommitNonOpaqueTriangleHit();
+			q.Abort();
+			continue;
+		}
+		budget -= 1u;
+		if (AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint + q.CandidateTriangleRayT() * C.ToSun.w))
+			q.CommitNonOpaqueTriangleHit();
+	}
+	tHit = q.CommittedRayT();
+	alphaHit = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT && q.CommittedInstanceID() != 0u;
+	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+#else
 bool AnyHit(float3 origin, float3 direction, float tMax)
 {
 	RayDesc ray;
@@ -70,6 +196,7 @@ bool ClosestHit(float3 origin, float3 direction, float tMax, out float tHit)
 	tHit = q.CommittedRayT();
 	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
+#endif
 
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID)
 {
@@ -125,9 +252,17 @@ bool ClosestHit(float3 origin, float3 direction, float tMax, out float tHit)
 		const float reach = min(dist * 0.5, max(64.0, C.Bias.z * 16.0));
 		const float tolerance = min((bias * 2.0 + 2.0) / cosTheta, reach * 0.75);
 		float tHit;
+#if defined(RT_ALPHA)
+		// (45h) A match on an alpha-tested (cut-out traced) surface is its own class: 0.8.
+		bool alphaHit;
+		if (ClosestHit(P + V * reach, -V, reach * 2.0, dist * C.RenderSize.w * 1.2, tHit, alphaHit)) {
+			const float d = reach - tHit;  // > 0: the ray tracer's surface is behind the visible one
+			coverage = abs(d) <= tolerance ? (alphaHit ? 0.8 : 1.0) : (d > 0.0 ? 0.25 : 0.5);
+#else
 		if (ClosestHit(P + V * reach, -V, reach * 2.0, tHit)) {
 			const float d = reach - tHit;  // > 0: the ray tracer's surface is behind the visible one
 			coverage = abs(d) <= tolerance ? 1.0 : (d > 0.0 ? 0.25 : 0.5);
+#endif
 			hitDelta = saturate(0.5 - d / 512.0);
 		} else {
 			hitDelta = 0.0;  // with coverage 0: nothing within reach
@@ -159,7 +294,11 @@ bool ClosestHit(float3 origin, float3 direction, float tMax, out float tHit)
 		float s, c;
 		sincos(6.2831853 * u2, s, c);
 		const float3 dir = normalize(L + (T * c + B * s) * r);
+#if defined(RT_ALPHA)
+		hits += AnyHit(origin, dir, C.Params.w, dist * C.RenderSize.w * 1.2) ? 1u : 0u;
+#else
 		hits += AnyHit(origin, dir, C.Params.w) ? 1u : 0u;
+#endif
 	}
 
 	Output[p] = float4(1.0 - float(hits) / float(rays), coverage, hitDelta, 0.0);

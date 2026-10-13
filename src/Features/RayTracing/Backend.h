@@ -3,8 +3,10 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <d3d11_4.h>
@@ -36,12 +38,50 @@ namespace RayTracingRT
 	{
 		std::vector<float> positions;  // xyz
 		std::vector<std::uint32_t> indices;
+		/// (45h) Alpha-tested mesh: two uints per triangle corner, in index order (x = the vertex's
+		/// half2 texcoord as stored by the engine, y = its vertex alpha as float bits). Non-empty =
+		/// the BLAS geometry is non-opaque and its triangles are tested against their cut-out.
+		std::vector<std::uint32_t> alphaUV;
 		[[nodiscard]] std::uint32_t Triangles() const { return static_cast<std::uint32_t>(indices.size() / 3); }
 		[[nodiscard]] std::uint32_t Vertices() const { return static_cast<std::uint32_t>(positions.size() / 3); }
+		[[nodiscard]] bool Opaque() const { return alphaUV.empty(); }
 	};
 
 	using BlasHandle = std::uint32_t;
 	inline constexpr BlasHandle kInvalidBlas = UINT32_MAX;
+
+	// (45h) Alpha-tested casters: a texture registered for the any-hit test, and the per-shape
+	// record (texture, threshold, texcoord transform) the shader finds through the instance ID.
+	using AlphaTexture = std::uint32_t;
+	inline constexpr AlphaTexture kInvalidAlphaTexture = UINT32_MAX;
+	inline constexpr std::uint32_t kInvalidAlphaInfo = UINT32_MAX;
+
+	struct AlphaMaterial
+	{
+		float threshold = 0.5f;   // pass when alpha >= threshold (0-1)
+		float alphaScale = 1.0f;  // material alpha
+		float uvTransform[4] = { 0.0f, 0.0f, 1.0f, 1.0f };  // offset xy, scale zw
+	};
+
+	struct AlphaStats
+	{
+		std::uint32_t texturesShared = 0;    // full-resolution game textures read by D3D12 directly
+		std::uint32_t texturesFallback = 0;  // 256x256 alpha copies
+		std::uint32_t texturesPending = 0;   // alpha copies not made yet
+		std::uint64_t notShareable = 0;      // textures not created shareable (loaded before the switch, refused): copy instead
+		std::uint64_t openFailed = 0;        // D3D12 could not open a shared texture: copy instead
+		std::uint64_t slotsFull = 0;         // bindless table full: copy instead
+		std::uint64_t layersFull = 0;        // copy layers full: shape not ray traced
+		std::uint64_t uvFull = 0;            // texcoord buffer full: shape not ray traced
+		std::uint64_t infosFull = 0;
+		std::uint32_t infos = 0;             // live per-shape records
+		std::uint32_t instancesLastFrame = 0;
+		std::uint64_t uvBytesUsed = 0;
+		std::uint64_t uvBytes = 0;           // texcoord buffer (allocated on first use)
+		std::uint64_t layerBytes = 0;        // 256x256 copy layers (allocated on first use)
+		std::uint64_t infoBytes = 0;         // per-context upload copies of the records
+		bool sharedPathOff = false;          // D3D12 never opened one: only copies this session
+	};
 
 	struct TraceConstants
 	{
@@ -61,9 +101,11 @@ namespace RayTracingRT
 		kCategoryMovable,  // doors, activators, movable statics, lights
 		kCategoryItem,     // loose items
 		kCategoryTree,     // opaque parts of trees and plants
+		kCategoryAlpha,    // (45h) alpha-tested shapes traced with their cut-out (leaves, banners, fences)
 		kInstanceCategories
 	};
-	inline constexpr const char* kInstanceCategoryNames[kInstanceCategories] = { "cell chunk", "door/activator/movable", "item", "tree/plant" };
+	inline constexpr const char* kInstanceCategoryNames[kInstanceCategories] = { "cell chunk", "door/activator/movable", "item", "tree/plant",
+		"alpha-tested" };
 
 	struct Instance
 	{
@@ -79,6 +121,8 @@ namespace RayTracingRT
 		// (45g) For the self-check log: the owning reference and shape name (objects only).
 		std::uint32_t refID = 0;
 		const char* label = nullptr;
+		// (45h) Alpha-tested: the per-shape record (CreateAlphaInfo); the instance is non-opaque.
+		std::uint32_t alphaInfo = kInvalidAlphaInfo;
 	};
 
 	struct FrameInput
@@ -174,6 +218,29 @@ namespace RayTracingRT
 				CollectRetired();
 		}
 
+		// (45h) Alpha-tested casters. All of it is created on first use only (never with the switch off).
+		/// The alpha variant of the trace pipeline exists (the driver accepted it).
+		[[nodiscard]] bool AlphaAvailable() const { return ready_ && !failed_ && alphaPipeline_ && alphaFault_.empty(); }
+		/// Registers the texture a shape's cut-out comes from: the game's texture itself when it is
+		/// shareable, else a 256x256 alpha copy made on D3D11 (RecordAlphaCopies). Counted per user.
+		AlphaTexture AcquireAlphaTexture(ID3D11Texture2D* a_texture, ID3D11ShaderResourceView* a_view);
+		void ReleaseAlphaTexture(AlphaTexture a_texture);
+		[[nodiscard]] bool IsAlphaTextureReady(AlphaTexture a_texture) const;
+		/// The per-shape record; a_blas must be an alpha BLAS (CreateBlas with alphaUV).
+		std::uint32_t CreateAlphaInfo(BlasHandle a_blas, AlphaTexture a_texture, const AlphaMaterial& a_material);
+		void ReleaseAlphaInfo(std::uint32_t a_info);
+		/// D3D11, before ExecuteFrame: makes up to a_max pending alpha copies with a_shader (AlphaMaskCS).
+		void RecordAlphaCopies(ID3D11ComputeShader* a_shader, std::uint32_t a_max);
+		/// Nothing uses the alpha resources any more (switch off and the scene released).
+		[[nodiscard]] bool AlphaIdle() const { return alphaTextureIndex_.empty() && alphaInfoLive_ == 0 && alphaUvUsed_ == 0; }
+		void ReleaseAlphaResources();
+		/// Set when an alpha resource could not be created: the feature turns the switch off.
+		[[nodiscard]] const std::string& AlphaFault() const { return alphaFault_; }
+		void ClearAlphaFault() { alphaFault_.clear(); }
+		[[nodiscard]] const AlphaStats& GetAlphaStats() const { return alphaStats_; }
+		/// Format of the copy layers for AlphaMaskCS (R8_UNORM, or R8G8B8A8_UNORM where R8 is not shareable).
+		[[nodiscard]] bool AlphaCopiesRgba() const { return alphaLayerFormat_ == DXGI_FORMAT_R8G8B8A8_UNORM; }
+
 		/// True when the device was removed or a D3D12 call failed; the feature then turns itself off.
 		[[nodiscard]] bool HasFailed() const { return failed_; }
 		[[nodiscard]] const std::string& LastError() const { return lastError_; }
@@ -211,6 +278,11 @@ namespace RayTracingRT
 			std::uint32_t instanceCapacity = 0;
 			std::uint64_t fenceValue = 0;
 			bool timestampsPending = false;
+			// (45h) This context's copy of the alpha records (upload heap, persistently mapped).
+			ComPtr<ID3D12Resource> alphaInfoBuffer;
+			void* alphaInfoMapped = nullptr;
+			std::uint32_t alphaInfoCapacity = 0;
+			std::uint64_t alphaInfoVersion = 0;
 		};
 
 		enum class BlasState : std::uint8_t
@@ -231,7 +303,60 @@ namespace RayTracingRT
 			std::uint32_t postbuildSlot = UINT32_MAX;
 			std::uint64_t buildFence = 0;
 			float boundsMin[3]{}, boundsMax[3]{};  // (45f) local box of the vertices, for the self-check
+			// (45h) Alpha BLAS: its texcoords in the shared texcoord buffer (uint2 elements).
+			std::uint32_t uvOffset = UINT32_MAX;
+			std::uint32_t uvCount = 0;
 		};
+
+		// (45h) Alpha-tested casters.
+		static constexpr std::uint32_t kAlphaTextureSlots = 4096;        // bindless table (TraceShadowsCS kAlphaTextureSlots)
+		static constexpr std::uint32_t kAlphaDescriptorBase = 3;         // heap: depth SRV, visibility UAV, copy layers SRV, textures
+		static constexpr std::uint32_t kAlphaLayerSize = 256;
+		static constexpr std::uint32_t kAlphaLayerMips = 5;              // 256 .. 16
+		static constexpr std::uint32_t kAlphaMaxInfos = 65536;
+		static constexpr std::uint64_t kAlphaUvBytes = 64ull << 20;      // about 2.8 M alpha-tested triangles
+		static constexpr std::uint32_t kAlphaFallbackBit = 0x80000000u;  // record texture = copy layer (TraceShadowsCS)
+
+		struct AlphaInfoGpu
+		{
+			std::uint32_t uvBase;
+			std::uint32_t triangles;
+			std::uint32_t texture;  // bindless slot, or kAlphaFallbackBit | layer
+			std::uint32_t flags;
+			float threshold;
+			float alphaScale;
+			float pad[2];
+			float uvTransform[4];
+		};
+		static_assert(sizeof(AlphaInfoGpu) == 48);
+
+		struct AlphaTextureEntry
+		{
+			ComPtr<ID3D11Texture2D> texture11;        // held: the key can never be a reused address
+			ComPtr<ID3D11ShaderResourceView> view11;  // source of the copy until it is made
+			ComPtr<ID3D12Resource> resource12;        // shared path
+			std::uint32_t users = 0;
+			std::uint32_t gpuIndex = UINT32_MAX;
+			std::uint32_t sourceSize = 0;             // larger side of the game texture (copy mip choice)
+			bool live = false;
+			bool ready = false;
+		};
+
+		struct DeferredFree
+		{
+			std::uint64_t fence;
+			std::uint32_t value;
+			std::uint32_t count;  // texcoord ranges only
+		};
+
+		bool EnsureAlphaUv();
+		bool EnsureAlphaLayers();
+		bool AllocateAlphaUv(std::uint32_t a_count, std::uint32_t& o_offset);
+		void FreeAlphaUv(std::uint32_t a_offset, std::uint32_t a_count);
+		void SetAlphaFault(std::string a_reason);
+		void CollectAlphaRetired(std::uint64_t a_completed);
+		bool EnsureAlphaInfoBuffer(CommandContext& a_context);
+		void UpdateAlphaTextureStats();
 
 		struct Retired
 		{
@@ -246,7 +371,7 @@ namespace RayTracingRT
 		void CollectRetired();
 		void CollectTimestamps(std::size_t a_index);
 		ComPtr<ID3D12Resource> CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav);
-		bool CheckSharedFormat(DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store, const char* a_name);
+		bool CheckSharedFormat(DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store, const char* a_name, bool a_fatal = true);
 		bool CreateSharedTexture(std::uint32_t a_width, std::uint32_t a_height, DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store,
 			SharedTexture& o_texture, const char* a_name);
 		bool CreatePipeline(std::string& o_reason);
@@ -272,6 +397,7 @@ namespace RayTracingRT
 
 		ComPtr<ID3D12RootSignature> rootSignature_;
 		ComPtr<ID3D12PipelineState> pipeline_;
+		ComPtr<ID3D12PipelineState> alphaPipeline_;  // (45h) TraceShadowsCS with RT_ALPHA
 		ComPtr<ID3D12DescriptorHeap> descriptorHeap_;
 		UINT descriptorSize_ = 0;
 
@@ -297,6 +423,33 @@ namespace RayTracingRT
 		std::vector<BlasHandle> freeHandles_;
 		std::deque<BlasHandle> buildQueue_;
 		std::vector<Retired> retired_;
+
+		// (45h) Alpha-tested casters.
+		std::vector<AlphaTextureEntry> alphaTextures_;
+		std::vector<AlphaTexture> freeAlphaTextures_;
+		std::unordered_map<const ID3D11Texture2D*, AlphaTexture> alphaTextureIndex_;
+		std::deque<AlphaTexture> alphaCopyQueue_;
+		std::vector<std::uint32_t> freeAlphaSlots_, freeAlphaLayers_;
+		std::uint32_t nextAlphaSlot_ = 0, nextAlphaLayer_ = 0;  // never used so far
+		std::vector<DeferredFree> retiredAlphaSlots_, retiredAlphaLayers_, retiredAlphaUv_;
+		std::vector<AlphaInfoGpu> alphaInfos_;
+		std::vector<std::uint32_t> freeAlphaInfos_;
+		std::uint32_t alphaInfoLive_ = 0;
+		std::uint64_t alphaInfoVersion_ = 1;
+		ComPtr<ID3D12Resource> alphaUv_;
+		std::map<std::uint32_t, std::uint32_t> alphaUvFree_;  // offset -> count (uint2 elements)
+		std::uint64_t alphaUvUsed_ = 0;                        // elements allocated (including deferred frees)
+		ComPtr<ID3D11Texture2D> alphaLayers11_;
+		std::array<ComPtr<ID3D11UnorderedAccessView>, kAlphaLayerMips> alphaLayerUavs_;
+		ComPtr<ID3D12Resource> alphaLayers12_;
+		ComPtr<ID3D11Buffer> alphaCopyCB_;
+		ComPtr<ID3D11SamplerState> alphaCopySampler_;
+		DXGI_FORMAT alphaLayerFormat_ = DXGI_FORMAT_UNKNOWN;
+		std::uint32_t alphaLayerCount_ = 0;
+		bool alphaLayersFailed_ = false;
+		std::uint64_t alphaSharedOpened_ = 0;
+		std::string alphaFault_;
+		AlphaStats alphaStats_{};
 
 		HANDLE fenceEvent_ = nullptr;
 		Stats stats_{};
