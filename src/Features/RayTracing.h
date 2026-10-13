@@ -57,6 +57,7 @@ public:
 		Disagreement,
 		Coverage,
 		RawVisibility,
+		HitDepth,  // (45e) ray-traced first hit vs the game's depth
 		Count
 	};
 

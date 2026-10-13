@@ -5,8 +5,8 @@
 // device. Inputs are D3D11 textures shared with D3D12:
 //   t1 DepthMask (R32_FLOAT): |value| = the game's depth after the depth prepass (the value the
 //      engine's shadow mask pass read); negative where the engine's sun shadow mask is already 0.
-// Output u0 (R8G8B8A8_UNORM): .x = sun visibility (1 lit, 0 shadow), .y = 1 where the surface is in the
-// BLAS set (only computed for the coverage debug view).
+// Output u0 (R8G8B8A8_UNORM): .x = sun visibility (1 lit, 0 shadow); .y / .z = coverage class and
+// ray-traced-vs-game depth difference (only computed for the coverage debug views, see below).
 //
 // Positions are camera-relative (the game's CameraPosAdjust space): the TLAS is built with
 // instance translations relative to the same camera position, so all ray math stays near 0.
@@ -56,6 +56,21 @@ bool AnyHit(float3 origin, float3 direction, float tMax)
 	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
+bool ClosestHit(float3 origin, float3 direction, float tMax, out float tHit)
+{
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = direction;
+	ray.TMin = 0.0;
+	ray.TMax = tMax;
+	RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+	while (q.Proceed()) {
+	}
+	tHit = q.CommittedRayT();
+	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID)
 {
 	const int2 p = int2(dtid.xy);
@@ -94,14 +109,33 @@ bool AnyHit(float3 origin, float3 direction, float tMax)
 	const float bias = C.Bias.x + C.Bias.y * dist;
 	const float3 L = normalize(C.ToSun.xyz);
 
+	// (45e) Coverage = a primary ray along this pixel's view ray, compared with the game's depth.
+	// The segment starts `reach` in front of the visible surface (so first-person arms and the
+	// player, which are not in the scene, never block it) and ends `reach` behind it.
+	//   .y class: 0 nothing hit, 0.25 the ray tracer's first surface lies BEHIND the visible one
+	//             (the visible surface is not in the scene), 0.5 it lies IN FRONT of the visible one
+	//             (geometry the game does not draw there: misplaced or hidden), 1 match.
+	//   .z signed distance (ray tracer - game) mapped to [0, 1]: 0.5 + d / 512, 0.5 = match.
+	// The match tolerance grows at grazing angles: a surface seen edge-on moves a long way along
+	// the view ray for a tiny offset across it.
 	float coverage = 0.0;
+	float hitDelta = 0.5;
 	if (flags & kFlagCoverage) {
-		const float probe = bias * 4.0 + C.Bias.z;
-		coverage = AnyHit(P + V * probe, -V, probe * 2.0) ? 1.0 : 0.0;
+		const float cosTheta = max(abs(dot(N, V)), 0.05);
+		const float reach = min(dist * 0.5, max(64.0, C.Bias.z * 16.0));
+		const float tolerance = min((bias * 2.0 + 2.0) / cosTheta, reach * 0.75);
+		float tHit;
+		if (ClosestHit(P + V * reach, -V, reach * 2.0, tHit)) {
+			const float d = reach - tHit;  // > 0: the ray tracer's surface is behind the visible one
+			coverage = abs(d) <= tolerance ? 1.0 : (d > 0.0 ? 0.25 : 0.5);
+			hitDelta = saturate(0.5 - d / 512.0);
+		} else {
+			hitDelta = 0.0;  // with coverage 0: nothing within reach
+		}
 	}
 
 	if ((flags & kFlagSkipShadowed) && dm < 0.0) {
-		Output[p] = float4(0.0, coverage, 0.0, 0.0);
+		Output[p] = float4(0.0, coverage, hitDelta, 0.0);
 		return;
 	}
 
@@ -128,5 +162,5 @@ bool AnyHit(float3 origin, float3 direction, float tMax)
 		hits += AnyHit(origin, dir, C.Params.w) ? 1u : 0u;
 	}
 
-	Output[p] = float4(1.0 - float(hits) / float(rays), coverage, 0.0, 0.0);
+	Output[p] = float4(1.0 - float(hits) / float(rays), coverage, hitDelta, 0.0);
 }

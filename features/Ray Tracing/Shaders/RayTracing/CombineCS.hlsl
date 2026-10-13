@@ -94,8 +94,26 @@ RWTexture2D<unorm float4> DebugColor : register(u2);
 					debug = float4(0.1, 0.1, 0.1, 0.3);  // both shadow
 			}
 		} else if (view == kViewCoverage) {
-			if (w > 0.0)
-				debug = Visibility[p].y > 0.5 ? float4(0.1, 1.0, 0.2, 0.45) : float4(1.0, 0.1, 1.0, 0.45);
+			// (45e) Primary-ray test (TraceShadowsCS): green = the visible surface is in the ray-traced
+			// scene, magenta = it is not, orange = the scene has a surface in FRONT of the visible one
+			// (geometry in the wrong place, or something the game hides).
+			if (w > 0.0) {
+				const float c = Visibility[p].y;
+				debug = c > 0.75 ? float4(0.1, 1.0, 0.2, 0.45) : (c > 0.375 ? float4(1.0, 0.55, 0.0, 0.6) : float4(1.0, 0.1, 1.0, 0.45));
+			}
+		} else if (view == kViewHitDepth) {
+			// (45e) Ray-traced first hit minus the game's depth along the view ray: white = match,
+			// red = the ray tracer's surface is in front (full red at 256 units), blue = behind,
+			// black = nothing within reach.
+			if (w > 0.0) {
+				const float2 vis = Visibility[p].yz;
+				if (vis.x <= 0.0)
+					debug = float4(0.0, 0.0, 0.0, 0.7);
+				else {
+					const float d = (vis.y - 0.5) * 2.0;  // -1 .. 1 = -256 .. 256 units, > 0 in front
+					debug = d >= 0.0 ? float4(1.0, 1.0 - d, 1.0 - d, 0.7) : float4(1.0 + d, 1.0 + d, 1.0, 0.7);
+				}
+			}
 		} else if (view == kViewRaw) {
 			if (w > 0.0)
 				debug = float4(Visibility[p].xxx, 1.0);

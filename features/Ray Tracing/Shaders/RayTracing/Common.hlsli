@@ -17,6 +17,7 @@ static const uint kViewShadowSource = 1u;
 static const uint kViewDisagreement = 2u;
 static const uint kViewCoverage = 3u;
 static const uint kViewRaw = 4u;
+static const uint kViewHitDepth = 5u;  // (45e)
 
 float3 RTPosition(int2 p, float depth)
 {

@@ -121,9 +121,11 @@ namespace RayTracingScene
 		validationCursor_ = 0;
 		const auto recaptures = stats_.recaptures;
 		const auto maxGather = stats_.maxGatherMs;
+		const auto logged = stats_.placementLogged;
 		stats_ = {};
 		stats_.recaptures = recaptures;
 		stats_.maxGatherMs = maxGather;
+		stats_.placementLogged = logged;
 	}
 
 	bool Scene::Validate(const Cell& a_cell) const
@@ -141,6 +143,93 @@ namespace RayTracingScene
 		if (handle != RayTracingRT::kInvalidBlas)
 			a_cell.blas.push_back(handle);
 		a_cell.current.reset();
+	}
+
+	bool Scene::PlaceVertices(RE::BSGeometry* a_shape, const std::uint8_t* a_bytes, std::uint32_t a_count, std::uint32_t a_stride,
+		std::uint32_t a_positionOffset, bool a_fullPrecision, double a_originX, double a_originY, std::vector<float>& o_positions, bool a_local)
+	{
+		auto decode = [&](std::uint32_t a_index, bool a_full) -> RE::NiPoint3 {
+			const std::uint8_t* vertex = a_bytes + static_cast<std::size_t>(a_index) * a_stride + a_positionOffset;
+			if (a_full) {
+				float p[3];
+				std::memcpy(p, vertex, sizeof(p));
+				return { p[0], p[1], p[2] };
+			}
+			DirectX::PackedVector::HALF h[3];
+			std::memcpy(h, vertex, sizeof(h));
+			return { DirectX::PackedVector::XMConvertHalfToFloat(h[0]), DirectX::PackedVector::XMConvertHalfToFloat(h[1]),
+				DirectX::PackedVector::XMConvertHalfToFloat(h[2]) };
+		};
+		const RE::NiTransform& world = a_shape->world;
+		const auto& bound = a_shape->worldBound;
+
+		// (45e) Placement check: the shape's vertices, placed with its world transform, must lie in
+		// the bound sphere the engine itself computed for it (worldBound, used for its culling).
+		// Shapes that fail with the vertex format read from the descriptor are tried with the other
+		// position format; if neither fits they are left out (and keep their shadow-map shadow)
+		// instead of putting triangles in the wrong place.
+		auto maxDistance = [&](bool a_full) -> float {
+			float worst = 0.0f;
+			for (std::uint32_t i = 0; i < a_count; ++i) {
+				const RE::NiPoint3 p = world * decode(i, a_full);
+				const float dx = p.x - bound.center.x, dy = p.y - bound.center.y, dz = p.z - bound.center.z;
+				const float d2 = dx * dx + dy * dy + dz * dz;
+				if (!std::isfinite(d2))
+					return FLT_MAX;
+				worst = std::max(worst, d2);
+			}
+			return std::sqrt(worst);
+		};
+		const bool checkable = std::isfinite(bound.radius) && bound.radius > 0.0f && bound.radius < 1.0e6f &&
+		                       std::isfinite(bound.center.x) && std::isfinite(bound.center.y) && std::isfinite(bound.center.z);
+		const float limit = bound.radius * 1.5f + 32.0f;
+		bool full = a_fullPrecision;
+		if (checkable) {
+			++stats_.placementChecked;
+			const float primary = maxDistance(full);
+			if (primary > limit) {
+				const bool alternateFits = !full ? a_positionOffset + 12u <= a_stride : true;
+				const float alternate = alternateFits ? maxDistance(!full) : FLT_MAX;
+				if (alternate <= limit) {
+					full = !full;
+					++stats_.placementFixed;
+				} else {
+					++stats_.placementRejected;
+				}
+				if (stats_.placementLogged < 24) {
+					++stats_.placementLogged;
+					std::uint64_t descBits = 0;
+					if (auto* data = a_shape->GetGeometryRuntimeData().rendererData)
+						std::memcpy(&descBits, &data->vertexDesc, sizeof(descBits));
+					logger::warn("[RayTracing] Placement check: '{}' {} (desc 0x{:016X}, stride {}, position at {}, {} positions): "
+								 "bound centre ({:.0f}, {:.0f}, {:.0f}) radius {:.0f}, farthest vertex {:.0f} ({} {:.0f})",
+						a_shape->name.c_str(), alternate <= limit ? "fixed with the other position format" : "left out",
+						descBits, a_stride, a_positionOffset, a_fullPrecision ? "float" : "half", bound.center.x, bound.center.y,
+						bound.center.z, bound.radius, primary, a_fullPrecision ? "as half:" : "as float:", alternate);
+				}
+				if (alternate > limit)
+					return false;
+			}
+		} else {
+			++stats_.placementUnchecked;
+		}
+
+		o_positions.clear();
+		o_positions.reserve(static_cast<std::size_t>(a_count) * 3);
+		for (std::uint32_t i = 0; i < a_count; ++i) {
+			const RE::NiPoint3 local = decode(i, full);
+			if (a_local) {
+				o_positions.push_back(local.x);
+				o_positions.push_back(local.y);
+				o_positions.push_back(local.z);
+				continue;
+			}
+			const RE::NiPoint3 p = world * local;
+			o_positions.push_back(static_cast<float>(static_cast<double>(p.x) - a_originX));
+			o_positions.push_back(static_cast<float>(static_cast<double>(p.y) - a_originY));
+			o_positions.push_back(p.z);
+		}
+		return true;
 	}
 
 	bool Scene::AppendShape(Cell& a_cell, RE::BSTriShape* a_shape, bool a_landscape)
@@ -198,9 +287,12 @@ namespace RayTracingScene
 			return false;
 		}
 
-		// Indices: the mesh's own, or the 16x16 quad grid every landscape quadrant uses.
+		// Indices: the mesh's own, or the 16x16 quad grid every landscape quadrant uses. (45e) A
+		// landscape quadrant always gets the generated grid, whatever index data it carries: the
+		// game draws land with its own shared index buffer, and the quadrant's CPU index copy is not
+		// a plain triangle list of these 289 vertices (the upstream ray tracer ignores it as well).
 		const std::uint16_t* sourceIndices = nullptr;
-		if (rendererData->rawIndexData && triangleCount > 0) {
+		if (!(a_landscape && vertexCount == 289) && rendererData->rawIndexData && triangleCount > 0) {
 			indexCopy.resize(static_cast<std::size_t>(triangleCount) * 3);
 			if (!SafeCopy(indexCopy.data(), rendererData->rawIndexData, indexCopy.size() * sizeof(std::uint16_t))) {
 				++skipped.badData;
@@ -242,26 +334,10 @@ namespace RayTracingScene
 
 		const double originX = static_cast<double>(a_cell.x) * kCellUnits;
 		const double originY = static_cast<double>(a_cell.y) * kCellUnits;
-		const RE::NiTransform& world = a_shape->world;
-		chunk.positions.reserve(chunk.positions.size() + vertexCount * 3);
-		for (std::uint32_t i = 0; i < vertexCount; ++i) {
-			const std::uint8_t* vertex = vertexBytes.data() + static_cast<std::size_t>(i) * stride + positionOffset;
-			RE::NiPoint3 local;
-			if (fullPrecision) {
-				float p[3];
-				std::memcpy(p, vertex, sizeof(p));
-				local = { p[0], p[1], p[2] };
-			} else {
-				DirectX::PackedVector::HALF h[3];
-				std::memcpy(h, vertex, sizeof(h));
-				local = { DirectX::PackedVector::XMConvertHalfToFloat(h[0]), DirectX::PackedVector::XMConvertHalfToFloat(h[1]),
-					DirectX::PackedVector::XMConvertHalfToFloat(h[2]) };
-			}
-			const RE::NiPoint3 p = world * local;
-			chunk.positions.push_back(static_cast<float>(static_cast<double>(p.x) - originX));
-			chunk.positions.push_back(static_cast<float>(static_cast<double>(p.y) - originY));
-			chunk.positions.push_back(p.z);
-		}
+		static thread_local std::vector<float> placed;
+		if (!PlaceVertices(a_shape, vertexBytes.data(), vertexCount, stride, positionOffset, fullPrecision, originX, originY, placed, false))
+			return false;
+		chunk.positions.insert(chunk.positions.end(), placed.begin(), placed.end());
 		chunk.indices.reserve(chunk.indices.size() + triangleCount * 3);
 		if (!generated.empty()) {
 			for (const auto index : generated)

@@ -62,6 +62,12 @@ namespace RayTracingScene
 		float maxGatherMs = 0.0f;           // CPU, worst frame since the last reset of the stats
 		float lastCellMs = 0.0f;            // CPU, the whole capture of the last finished cell
 		SkipCounts skipped{};
+		// (45e) Placement check of captured shapes against the engine's own world bound.
+		std::uint32_t placementChecked = 0;
+		std::uint32_t placementFixed = 0;     // fitted only with the other position format (half / float)
+		std::uint32_t placementRejected = 0;  // fitted with neither: left out
+		std::uint32_t placementUnchecked = 0; // no usable world bound
+		std::uint32_t placementLogged = 0;
 	};
 
 	class Scene
@@ -132,6 +138,11 @@ namespace RayTracingScene
 		bool Gather(RayTracingRT::Backend& a_backend, Cell& a_cell, std::int64_t a_deadline);
 		void CaptureObject(Cell& a_cell, RE::NiAVObject* a_object, int a_depth);
 		bool AppendShape(Cell& a_cell, RE::BSTriShape* a_shape, bool a_landscape);
+		/// Decodes the positions (world minus the origin, or local with a_local) after checking
+		/// them against the shape's world bound; false = left out (counted in the stats).
+		bool PlaceVertices(RE::BSGeometry* a_shape, const std::uint8_t* a_bytes, std::uint32_t a_count, std::uint32_t a_stride,
+			std::uint32_t a_positionOffset, bool a_fullPrecision, double a_originX, double a_originY, std::vector<float>& o_positions,
+			bool a_local);
 		void CloseChunk(RayTracingRT::Backend& a_backend, Cell& a_cell);
 
 		std::vector<std::unique_ptr<Cell>> cells_;

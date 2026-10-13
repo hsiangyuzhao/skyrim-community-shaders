@@ -424,7 +424,7 @@ void RayTracing::RunFrame()
 	std::uint32_t traceFlags = 0;
 	if (debugView != DebugView::Disagreement && debugView != DebugView::RawVisibility)
 		traceFlags |= kFlagSkipShadowed;
-	if (debugView == DebugView::Coverage)
+	if (debugView == DebugView::Coverage || debugView == DebugView::HitDepth)
 		traceFlags |= kFlagCoverage;
 	input.constants.params[0] = static_cast<float>(preset.rays);
 	input.constants.params[1] = static_cast<float>(frameIndex % 1024);
@@ -658,7 +658,8 @@ void RayTracing::DrawSettings()
 	}
 
 	if (ImGui::TreeNodeEx("Debug")) {
-		const char* views[] = { "Off", "Shadow Source", "RT vs Shadow Map", "BLAS Coverage", "Raw RT Visibility" };
+		const char* views[] = { "Off", "Shadow Source", "RT vs Shadow Map", "BLAS Coverage", "Raw RT Visibility", "RT Hit vs Depth" };
+		static_assert(IM_ARRAYSIZE(views) == static_cast<int>(DebugView::Count));
 		int view = static_cast<int>(debugView);
 		if (ImGui::Combo("Debug View", &view, views, IM_ARRAYSIZE(views)))
 			debugView = static_cast<DebugView>(std::clamp(view, 0, static_cast<int>(DebugView::Count) - 1));
@@ -668,8 +669,11 @@ void RayTracing::DrawSettings()
 			ImGui::Text("  Terrain shadows are applied later by the lighting and are not shown.");
 			ImGui::Text("RT vs Shadow Map: inside the ray-traced area, red = only RT sees a shadow, blue = only the shadow map does.");
 			ImGui::Text("  While this view is on, the shadow map keeps every caster so the two can be compared.");
-			ImGui::Text("BLAS Coverage: green = the surface is in the ray-traced scene, magenta = it is not (character, tree, grass, skipped object).");
+			ImGui::Text("BLAS Coverage: green = the surface is in the ray-traced scene, magenta = it is not (character, tree, grass, skipped object),");
+			ImGui::Text("  orange = the ray-traced scene has a surface in front of what you see (geometry in the wrong place).");
 			ImGui::Text("Raw RT Visibility: the traced result before smoothing and merging.");
+			ImGui::Text("RT Hit vs Depth: white = the ray-traced surface sits exactly where the game draws it,");
+			ImGui::Text("  red = it is in front (full red = 256 units), blue = behind, black = nothing there.");
 		}
 		ImGui::Checkbox("Keep Static Casters in the Shadow Map", &settings.KeepCastersInShadowMap);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -716,6 +720,10 @@ void RayTracing::DrawSettings()
 				skip.hidden, skip.alphaTested, skip.alphaBlended, skip.decals, skip.skinned, skip.noShadow);
 			ImGui::Text("Shapes: not Lighting shader %u, other geometry types %u, no CPU vertex copy %u, bad data %u",
 				skip.notLighting, skip.otherGeometry, skip.noCpuData, skip.badData);
+			ImGui::Text("Placement check: %u shapes checked, %u fixed (other vertex format), %u left out (wrong place), %u without bound",
+				sc.placementChecked, sc.placementFixed, sc.placementRejected, sc.placementUnchecked);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Each captured shape must fit inside the bound sphere the game computed for it. Details of the first misfits are in the log.");
 			ImGui::TreePop();
 		}
 		ImGui::TreePop();
