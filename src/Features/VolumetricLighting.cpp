@@ -24,11 +24,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	InteriorQuality,
 	InteriorCustomSize,
 	WorldShadowPower,
-	DensityOnlyGamma,
-	DensityGammaReference,
-	DensityGammaNeverBrighten,
-	NightIntensity,
-	LinearizeColor);
+	NightIntensity);
 
 void VolumetricLighting::DrawSettings()
 {
@@ -63,25 +59,8 @@ void VolumetricLighting::DrawBatch37bSettings()
 			"0 = not at all (old behaviour). 0.5 = half strength (upstream, default). 1 = full.\n"
 			"Capped by Cloud Shadows' Opacity: clouds can never block more than that.");
 
-	ImGui::Checkbox("Gamma on Density Only", &settings.DensityOnlyGamma);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Linear Lighting's VL Gamma used to also boost the weather's shaft strength, so nights\n"
-			"(strength 3) and sunrise/sunset (4) came out far stronger than day (2).\n"
-			"On (default): the gamma only shapes the shafts; strength scales normally.\n"
-			"A clear day looks the same; nights ~2x weaker, sunrise/sunset ~4x weaker at VL Gamma 3.\n"
-			"Off: old behaviour. Needs Sky Sync.");
-	if (settings.DensityOnlyGamma) {
-		ImGui::SliderFloat("Reference Strength", &settings.DensityGammaReference, 0.5f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Weather shaft strength that looks exactly as before. 2 = vanilla clear day.");
-		ImGui::Checkbox("Never Brighten", &settings.DensityGammaNeverBrighten);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"On (default): this option only ever makes shafts weaker, never stronger.\n"
-				"Without it, weathers weaker than the reference strength (overcast, rain, fog)\n"
-				"would get ~1.3-1.8x brighter shafts than before. Off: plain remap.");
-	}
+	// (44h) "Gamma on Density Only", "Reference Strength" and "Never Brighten" removed, now
+	// fixed (on / 1.0 / on). See AdjustIntensity.
 
 	ImGui::SliderFloat("Night Strength", &settings.NightIntensity, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -90,13 +69,7 @@ void VolumetricLighting::DrawBatch37bSettings()
 			"1 = old behaviour. 0.5 = half (default). 0 = no moonlight shafts. Needs Sky Sync.\n"
 			"Does not change the moonlight itself.");
 
-	ImGui::Checkbox("Linearize Shaft Color", &settings.LinearizeColor);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Where Physical Sky does not set the light colour (worldspaces outside its list,\n"
-			"interiors with sun, Physical Sky off), converts the shaft colour the same way the\n"
-			"sunlight itself is converted. Dark (evening/night) shafts get dimmer there.\n"
-			"No effect where Physical Sky overrides the light colour. Needs Linear Lighting.");
+	// (44h) "Linearize Shaft Color" removed, now fixed on (CommonBufferData::LinearizeColor).
 }
 
 float VolumetricLighting::WorldShadowPowerActive() const
@@ -104,26 +77,16 @@ float VolumetricLighting::WorldShadowPowerActive() const
 	return std::clamp(settings.WorldShadowPower, 0.0f, 1.0f);
 }
 
-bool VolumetricLighting::DensityOnlyGammaActive() const
-{
-	return settings.DensityOnlyGamma;
-}
-
 float VolumetricLighting::NightIntensityActive() const
 {
 	return std::clamp(settings.NightIntensity, 0.0f, 1.0f);
-}
-
-bool VolumetricLighting::LinearizeColorActive() const
-{
-	return settings.LinearizeColor;
 }
 
 VolumetricLighting::CommonBufferData VolumetricLighting::GetCommonBufferData() const
 {
 	CommonBufferData data{};
 	data.WorldShadowPower = loaded ? WorldShadowPowerActive() : 0.0f;
-	data.LinearizeColor = loaded && LinearizeColorActive();
+	data.LinearizeColor = loaded;  // (44h) fixed on
 	return data;
 }
 
@@ -171,16 +134,17 @@ float VolumetricLighting::AdjustIntensity(float a_intensity, [[maybe_unused]] bo
 	// density only, intensity scales linearly, and at I = Iref (clear day, VOLI 2) nothing
 	// changes. Done on the CPU so no shader changes, and the temporal reprojection in
 	// ISApplyVolumetricLighting keeps seeing one consistent quantity.
-	if (DensityOnlyGammaActive() && intensity > 0.0f) {
+	// (44h) Always on, reference pinned to kDensityGammaReference, never-brighten always on.
+	if (intensity > 0.0f) {
 		const auto ll = globals::features::linearLighting.GetCommonBufferData();
 		const float gamma = ll.vlGamma;
 		if (ll.enableLinearLighting && gamma > 1e-3f) {
-			const float reference = std::max(settings.DensityGammaReference, 1e-3f);
+			const float reference = kDensityGammaReference;
 			const float remapped = reference * std::pow(intensity / reference, 1.0f / gamma);
 			// Never brighten: for I < Iref the remap raises the output ((I/Iref) > (I/Iref)^g),
 			// e.g. overcast ~1.3x, rain/fog ~1.8x at gamma 3. pow is monotonic, so min() on the
 			// input is min() on the result: only ever dim (nights, dawn/dusk), never brighten.
-			intensity = settings.DensityGammaNeverBrighten ? std::min(remapped, intensity) : remapped;
+			intensity = std::min(remapped, intensity);
 		}
 	}
 

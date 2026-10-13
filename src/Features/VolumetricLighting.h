@@ -23,18 +23,16 @@ public:
 		/// A1: exponent on the cloud x terrain shadow multiplied into every light-shaft voxel.
 		/// 0 = no occlusion (37a), 0.5 = upstream d22b87a87 (sqrt), 1 = full cloud shadow.
 		float WorldShadowPower = 0.5f;
-		/// A2: Linear Lighting's vlGamma acts on the shaft density only, not on the weather
-		/// intensity. Normalised at DensityGammaReference so that intensity looks unchanged.
-		bool DensityOnlyGamma = true;
-		float DensityGammaReference = 2.0f;
-		/// A2 sub-switch: clamp the remapped intensity to the original, so A2 only dims.
-		bool DensityGammaNeverBrighten = true;
+		// (44h) Removed after the user's review, now fixed; their old keys are ignored:
+		// DensityOnlyGamma (on), DensityGammaNeverBrighten (on), DensityGammaReference (1.0, the
+		// user's value; see kDensityGammaReference), LinearizeColor (on, always sent to the CB).
 		/// A3: extra multiplier on the shafts while a moon is the light source (Sky Sync).
 		float NightIntensity = 0.5f;
-		/// A4: when Physical Sky does not override the light colour, the shaft colour (a gamma
-		/// space weather colour) is linearised exactly like the scene's directional light.
-		bool LinearizeColor = true;
 	};
+
+	/// (44h) A2: Linear Lighting's vlGamma acts on the shaft density only, not on the weather
+	/// intensity, normalised at this reference strength and clamped so it only ever dims.
+	static constexpr float kDensityGammaReference = 1.0f;
 
 	/// (batch 37b) Mirrors SharedData::VolumetricLightingSettings (HLSL). Appended at the end
 	/// of FeatureData, so nothing before it moves.
@@ -47,9 +45,7 @@ public:
 
 	[[nodiscard]] CommonBufferData GetCommonBufferData() const;
 	[[nodiscard]] float WorldShadowPowerActive() const;
-	[[nodiscard]] bool DensityOnlyGammaActive() const;
 	[[nodiscard]] float NightIntensityActive() const;
-	[[nodiscard]] bool LinearizeColorActive() const;
 	/// (batch 37b) Re-binds what the generate CS needs for cloud/terrain occlusion
 	/// (t25 cloud cube, t60 terrain heights, b5/b6 shared CBs). Called from the dispatch hook.
 	void BindWorldShadowResources() const;
