@@ -6,7 +6,6 @@
 #include "JiayeStatement.h"
 #include "State.h"
 #include "Util.h"
-#include "Utils/Batch37b.h"
 #include "Utils/GpuTimers.h"
 
 #include "Features/Upscaling.h"
@@ -820,9 +819,7 @@ void PostProcessing::PreProcess()
 	// so the same shader stores the same bits -- it does, and only the copy into the other buffer
 	// remains, restricted to the same rectangle the old full-texture copy covered.
 	directOutputUsed = false;
-	if (!Batch37b::PostProcessDirectOutputActive())
-		directOutputStatus = "Off";
-	else if (chain.empty())
+	if (chain.empty())
 		directOutputStatus = "No effect running";
 	else
 		directOutputStatus = "Last effect cannot write into the game buffer";
@@ -833,7 +830,7 @@ void PostProcessing::PreProcess()
 		EnsureResources(pipe);
 
 		bool direct = false;
-		if (i + 1 == chain.size() && Batch37b::PostProcessDirectOutputActive()) {
+		if (i + 1 == chain.size()) {
 			ID3D11Texture2D* own = pipe->GetOwnOutputTexture();
 			if (own && gameTexMain.texture && gameTexMain.UAV && gameTexMainAlt.texture && own != gameTexMain.texture &&
 				lastTexColor.tex != gameTexMain.texture) {  // the effect must not read the buffer it writes

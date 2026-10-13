@@ -146,7 +146,7 @@ struct PhysicalSky final : public Feature
 		bool proceduralSun = true;
 		float sunDiskRad = DirectX::XMConvertToRadians(0.53f);  // 37a size (really a diameter)
 
-		// (batch 37b) Procedural sun v2. Each is ANDed with Batch37b::IsOn().
+		// (batch 37b) Procedural sun v2. Each follows its own setting (the old master switch is gone).
 		/// Disk centred where the vanilla sun is drawn (Sky Sync's apparent direction, dipped
 		/// with altitude, in the sky root's frame) instead of the raw sun direction. Also moves
 		/// the sky's sun glow and the scattering LUTs onto that direction.
@@ -220,7 +220,7 @@ struct PhysicalSky final : public Feature
 		/// (42b) How strongly: disc alpha x 1 / (1 + this x sky luminance / disc luminance).
 		float moonDaylightFade = 20.f;
 
-		// (batch 37b) Upstream correctness fixes, each ANDed with Batch37b::IsOn().
+		// (batch 37b) Upstream correctness fixes (the old master switch is gone).
 		bool fixSkyAlpha = true;  // 5846ad833: sky dome written opaque
 		bool fixApShadowDepth = true;  // 224312a11 (depth read only): AP shadow under dynamic resolution
 		bool fixReflectionSky = true;  // 23156dc5f: reflected sky takes cloud-cube shadow, not TexApShadow

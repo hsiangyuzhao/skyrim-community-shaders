@@ -5,7 +5,6 @@
 #include "Menu.h"
 #include "State.h"
 #include "Util.h"
-#include "Utils/Batch38.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -27,12 +26,12 @@ bool VolumetricShadows::HasShaderDefine(RE::BSShader::Type shaderType)
 
 bool VolumetricShadows::ParticleShadowsActive() const
 {
-	return loaded && Batch38::IsOn() && settings.ParticleShadows;
+	return loaded && settings.ParticleShadows;
 }
 
 bool VolumetricShadows::ForwardSoftShadowsActive() const
 {
-	return loaded && Batch38::IsOn() && settings.ForwardSoftShadows;
+	return loaded && settings.ForwardSoftShadows;
 }
 
 bool VolumetricShadows::WantsVsm() const

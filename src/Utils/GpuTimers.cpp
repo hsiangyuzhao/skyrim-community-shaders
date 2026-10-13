@@ -90,9 +90,6 @@ namespace Util
 				"GPU time for the coarse far grid of Volumetric Fog, the same four passes. No local lights out here." },
 			{ "Volumetric Shadows",
 				"GPU time for the small blurred sun shadow map that lets smoke and other effects darken in shadow." },
-			{ "Depth refresh",
-				"Only while LOD terrain skips the depth prepass (not used by default). Copies the finished depth (and folds it into "
-				"Terrain Blending's copy) so SSAO, SSRT, fog and water see what the prepass no longer drew." },
 			{ "Snow Footprints",
 				"GPU time for keeping the footprint map around the player up to date (Dynamic Snow): clearing the "
 				"strip that scrolls into view, filling old prints back in, and stamping this frame's footprints. Reading the "

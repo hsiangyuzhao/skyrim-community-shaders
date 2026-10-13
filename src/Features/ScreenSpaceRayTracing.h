@@ -2,7 +2,6 @@
 #define ENABLE_SHARC
 
 #include "NRD.h"
-#include "Utils/Batch36f.h"
 
 struct ScreenSpaceRayTracing : Feature
 {
@@ -454,23 +453,10 @@ struct ScreenSpaceRayTracing : Feature
         float ReblurHitDistA = 210.0f;
         float ReblurHitDistB = 0.1f;
         float ReblurHitDistC = 20.0f;
-        /// @brief (batch C1) REBLUR specular pre-pass, mirrored from the upstream SSR
-        /// integration: a small radius search used only to improve the virtual-motion
-        /// estimation, not to blur the signal (the second flag).
-        float SpecularPrepassBlurRadius = 50.0f;
-        bool UsePrepassOnlyForSpecularMotionEstimation = true;
-        /// @brief (batch 36f, item 1) Skip REBLUR's specular pre-pass: the specular instance
-        /// gets specularPrepassBlurRadius 0, so NRD drops the PrePass dispatch altogether (its
-        /// skipPrePass test in Reblur.cpp). Off = the two settings above, i.e. batch 34/36e.
-        /// The pre-pass was configured for motion estimation only, and the reflection signal fed
-        /// to it is already low-noise. Governed by the Batch 36f master switch.
-        bool ReblurSkipSpecularPrepass = true;
-        /// @brief (batch 36f, item 4) Leave REBLUR's output packed and let the two composites
-        /// (ssrt_diffuse_composite.hlsl for diffuse, DeferredCompositeCS.hlsl for specular)
-        /// decode it in registers, instead of running ssrt_nrd_unpack.hlsl once per chain. The
-        /// decode includes the RGBA16F round trip the unpack pass's store did, so the picture is
-        /// bit-identical. Governed by the Batch 36f master switch.
-        bool ReblurFoldUnpack = true;
+        // (batch 36f, items 1 and 4, permanent in 44f) REBLUR's specular pre-pass is skipped
+        // (specularPrepassBlurRadius 0) and its output stays packed for the two composites to
+        // decode. Old keys ReblurSkipSpecularPrepass / ReblurFoldUnpack / SpecularPrepassBlurRadius /
+        // UsePrepassOnlyForSpecularMotionEstimation are ignored.
         /// @brief (batch 36f, item 2) Distance limit: pixels farther than DistanceLimitMeters are
         /// neither traced nor denoised (NRD denoisingRange), and keep the game's own lighting --
         /// vanilla ambient for diffuse (confidence 0 under ambient reinjection), the cubemap for
@@ -1427,15 +1413,12 @@ struct ScreenSpaceRayTracing : Feature
     /// — and the chain's REBLUR reset stays pending. (S1.2: the old void signature let a
     /// skipped dispatch clear the reset flag and unpack whatever the output surface
     /// happened to hold, which on the first frame is uninitialised RGBA16F.)
-    /// (batch 36f) a_skipUnpack: leave the result packed (texNRDPackOutput on success,
-    /// texNRDPackInput on failure) for the caller's composite to decode; see
-    /// Settings::ReblurFoldUnpack.
-    [[nodiscard]] bool RunReblur(bool a_specular, bool a_skipUnpack = false);
+    /// (batch 36f, permanent in 44f) The result stays packed (texNRDPackOutput on success,
+    /// texNRDPackInput on failure) for the caller's composite to decode.
+    [[nodiscard]] bool RunReblur(bool a_specular);
 
-    /// @brief (batch 36f) Effective switches: own setting AND the Batch 36f master switch.
-    [[nodiscard]] bool SkipSpecularPrepassActive() const { return Batch36f::IsOn() && settings.ReblurSkipSpecularPrepass; }
-    [[nodiscard]] bool FoldUnpackActive() const { return Batch36f::IsOn() && settings.ReblurFoldUnpack; }
-    [[nodiscard]] bool DistanceLimitActive() const { return Batch36f::IsOn() && settings.DistanceLimit; }
+    /// @brief (batch 36f) Distance limit (a real option).
+    [[nodiscard]] bool DistanceLimitActive() const { return settings.DistanceLimit; }
     /// @brief (batch 36f) Whether the distance limit applies to this chain this frame. Diffuse
     /// needs ambient reinjection: without it the forward ambient is gone (AmbientMult) and a
     /// pixel past the limit would have no ambient at all.
@@ -1841,14 +1824,6 @@ struct ScreenSpaceRayTracing : Feature
     winrt::com_ptr<ID3D11ComputeShader> varianceCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialCS = nullptr;
     winrt::com_ptr<ID3D11ComputeShader> spatialSpecularCS = nullptr;
-    /// @brief (batch C1) The shared REBLUR back-end unpack. Failing to compile makes
-    /// ReblurReady() false for both chains, so the failure degrades to "no denoising" rather
-    /// than to a bad dispatch.
-    ///
-    /// (batch 11, item A) The two front-end pack permutations are gone: ssrt_raymarch.hlsl
-    /// writes the front-end layout itself when SSRTCB::NRDFrontEndPack is set, which removes a
-    /// full-screen pass per chain. See SSRTCB::NRDFrontEndPack and RunReblur.
-    winrt::com_ptr<ID3D11ComputeShader> nrdUnpackCS = nullptr;
     /// @brief (batch 12) The two sparse ray-march permutations and their two resolve passes.
     ///
     /// Permutations rather than runtime branches because sampling density changes the traversal's

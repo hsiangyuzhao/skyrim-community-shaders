@@ -14,9 +14,7 @@
  * Built from the shared capture in Deferred::CopyShadowData (the engine's shadow-mask draw),
  * which Volumetric Fog also reads. Unlike upstream we keep our own SharedShadowData (t19)
  * cascade matrices (VR-aware, camera-relative, per eye) rather than upstream's t98 buffer.
- *
- * Every switch is ANDed with Batch38::IsOn(); with the master off nothing is built and the
- * shaders take their 37c paths.
+
  */
 struct VolumetricShadows : Feature
 {

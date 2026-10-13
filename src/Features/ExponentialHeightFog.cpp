@@ -12,7 +12,6 @@
 #include "Menu.h"
 #include "State.h"
 #include "Util.h"
-#include "Utils/Batch38.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -75,7 +74,6 @@ namespace
     }
 
     constexpr const char* kVolumetricKey = "Volumetric Fog";
-    constexpr const char* kVolumetricKeyOld = "Volumetric Fog (Batch 38)";  // read only, migrated on the next save
 }
 
 void ExponentialHeightFog::RestoreDefaultSettings()
@@ -89,8 +87,6 @@ void ExponentialHeightFog::LoadSettings(json& o_json)
     settings = o_json;
     if (o_json.contains(kVolumetricKey) && o_json[kVolumetricKey].is_object())
         volumetric = o_json[kVolumetricKey];
-    else if (o_json.contains(kVolumetricKeyOld) && o_json[kVolumetricKeyOld].is_object())
-        volumetric = o_json[kVolumetricKeyOld];
 }
 
 void ExponentialHeightFog::SaveSettings(json& o_json)
@@ -101,16 +97,12 @@ void ExponentialHeightFog::SaveSettings(json& o_json)
 
 ExponentialHeightFog::Settings ExponentialHeightFog::GetCommonBufferData() const
 {
-    Settings data = settings;
-    // The second layer is a batch 38 addition: master off = the 37c single layer.
-    if (!Batch38::IsOn())
-        data.fogDensity2 = 0.0f;
-    return data;
+    return settings;
 }
 
 bool ExponentialHeightFog::VolumetricFogRequested() const
 {
-    return loaded && Batch38::IsOn() && volumetric.Enabled && settings.enabled;
+    return loaded && volumetric.Enabled && settings.enabled;
 }
 
 bool ExponentialHeightFog::VolumetricFogActive() const

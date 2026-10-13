@@ -12,7 +12,6 @@
 #include "Menu.h"
 #include "State.h"
 #include "Util.h"
-#include "Utils/Batch37b.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -1227,7 +1226,7 @@ void PhysicalSky::UpdateCloudData(float a_exposure, float a_sunElevation)
 
 bool PhysicalSky::UseLegacyPaths() const
 {
-	return !Batch37b::IsOn() || IsLegacy();
+	return IsLegacy();
 }
 
 void PhysicalSky::UpdateEffective()
@@ -1346,7 +1345,7 @@ void PhysicalSky::Reset()
 	// along the apparent direction -- dipped by atan(altitude / 325000), 1.5-4 degrees -- in the
 	// sky root's local frame, which Sky Sync rotates by the cell's north rotation. The raw
 	// direction used before sat that far off the quad: a second, clipped or missing disk.
-	if (Batch37b::IsOn() && s.sunAlignToVanilla) {
+	if (s.sunAlignToVanilla) {
 		RE::NiPoint3 apparent = skySync.directions[static_cast<int>(SkySync::Caster::Sun)];
 		RE::NiPoint3 trueDir = sunDir;
 		if (auto* sky = globals::game::sky; sky && sky->root) {

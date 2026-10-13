@@ -34,7 +34,6 @@ struct LocalExposure : public PostProcessFeature
 	}
 	virtual inline bool DisableInMainLoadingMenu() const override { return true; }
 	virtual bool SupportsVR() const override { return false; }
-	virtual bool RuntimeGateOpen() const override;
 
 	struct Settings
 	{

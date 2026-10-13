@@ -47,23 +47,13 @@ public:
 		float MaxZenith = 3.1415926f / 2.f;  // 90 deg
 		float MinDiffuseVisibility = 0.1f;
 		float MinSpecularVisibility = 0.1f;
-
-		// (batch 38, item 5) Upstream Skylighting fixes, one switch each, every one ANDed with
-		// Batch38::IsOn() (see the *Active() helpers). Off = the 37c code path.
-		bool FixRoofMarkers = true;          // ca63a41d5: meshes flagged "editor marker" (roof markers) occlude the sky
-		bool FixResetClearsProbes = true;    // 5b5361f53 (probe part): Rebuild / load screen resets probes to open sky
-		bool FixZenithClamp = true;          // bff82b03e: Max Zenith kept in 0..90 deg and finite
-		bool FixZenithRadius = true;         // 4b5b99783: sampling disc radius sin(zenith), not sqrt(sin(zenith))
-		bool FixFadeOutGridOffset = true;    // 4b5b99783: edge fade measured from the probe grid's centre
-		bool SkipOccludersBelowGrid = true;  // 816888f04: height map skips objects entirely below the probe grid
+		// (batch 38, item 5) The six upstream fixes are permanent since 44f: roof markers occlude
+		// (ca63a41d5), a reset clears the probes (5b5361f53), Max Zenith clamped (bff82b03e), sampling
+		// disc radius sin(zenith) and edge fade from the probe grid (4b5b99783), objects below the
+		// grid skipped in the height map (816888f04). Old Fix* / SkipOccludersBelowGrid keys ignored.
 	} settings;
 
-	bool RoofMarkersActive() const;
-	bool ResetClearsProbesActive() const;
-	bool FadeOutGridOffsetActive() const;
-	bool SkipOccludersBelowGridActive() const;
-	/// @brief (batch 38) Max Zenith as used for sampling: clamped to [0, 90 deg] and finite when
-	/// FixZenithClamp is active, the raw setting otherwise.
+	/// @brief (batch 38) Max Zenith as used for sampling: clamped to [0, 90 deg] and finite.
 	float EffectiveMaxZenith() const;
 	/// @brief (batch 38) Radius of the sky-direction sampling disc for a uniform u in [0,1).
 	float SampleDiscRadius(float a_u) const;
@@ -75,7 +65,7 @@ public:
 		float4 OcclusionDir;
 
 		float3 PosOffset;  // cell origin in camera model space
-		float FadeOutUsesGridOffset;  // (batch 38, 4b5b99783) 1 = getFadeOutFactor subtracts PosOffset; 0 = 37c (HLSL PosOffset.w)
+		float FadeOutUsesGridOffset;  // (batch 38, 4b5b99783) always 1 since 44f: getFadeOutFactor subtracts PosOffset (HLSL PosOffset.w)
 		uint ArrayOrigin[3];  // xyz: array origin, w: max accum frames
 		uint _pad1;
 		int ValidMargin[4];

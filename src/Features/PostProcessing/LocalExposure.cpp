@@ -4,7 +4,6 @@
 #include "Menu.h"
 #include "State.h"
 #include "Util.h"
-#include "Utils/Batch38.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/UI.h"
 
@@ -33,11 +32,6 @@ namespace
 			return nullptr;
 		return static_cast<HistogramAutoExposure*>(pipe.get());
 	}
-}
-
-bool LocalExposure::RuntimeGateOpen() const
-{
-	return Batch38::IsOn();
 }
 
 void LocalExposure::DrawSettings()

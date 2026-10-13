@@ -38,9 +38,7 @@
  *   stores signed height (dent / rim). With the Footprints mod loaded, snowy ground and mud are
  *   left to its decals by default. Ragdolls and loose objects carve trenches from their Havok
  *   shapes (after community-shaders PR #2659).
- *
- * Every switch is ANDed with Batch39::IsOn(); with the master off nothing is built or bound and
- * Lighting.hlsl skips the whole block (Flags == 0): the 38b path.
+
  */
 struct DynamicSnow : Feature
 {

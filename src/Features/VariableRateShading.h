@@ -69,18 +69,6 @@ struct VariableRateShading : Feature
 
 	Settings settings;
 
-	/// Runtime-only A/B switches for in-game diagnosis. Never saved, so a session always starts
-	/// with the fixed behaviour.
-	struct Diagnostics
-	{
-		bool CoarseTerrain = false;       // let landscape draws be coarse-shaded again (the 36a behaviour)
-		bool FullRateEverywhere = false;  // keep the whole VRS pipeline running but shade every draw at 1x1
-		bool FreezeRates = false;         // stop rebuilding the rate image; the last one stays in use
-		bool RateBlindAnalysis = false;   // measure coarse tiles as if they were full rate (the 36b analysis)
-	};
-
-	Diagnostics diagnostics;
-
 	/// Mirrors RateCB in VariableRateShading/Common.hlsli.
 	struct alignas(16) RateCB
 	{

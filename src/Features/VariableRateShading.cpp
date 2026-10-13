@@ -400,10 +400,11 @@ VariableRateShading::RateCB VariableRateShading::BuildConstants(bool a_historyVa
 	cb.HistoryValid = a_historyValid ? 1u : 0u;
 	cb.Hysteresis = kHysteresis;
 	cb.CoarsenFrames = std::min(settings.CoarsenFrames, kMaxCoarsenFrames);
-	cb.RateAwareAnalysis = diagnostics.RateBlindAnalysis ? 0u : 1u;
-	// What this frame's opaque draws were actually shaded at; Full Detail Everywhere shades
-	// every draw at 1x1 whatever the image says.
-	cb.AppliedRatesValid = (lastBoundFrame == frameIndex && !diagnostics.FullRateEverywhere) ? 1u : 0u;
+	// (44f) The 36d diagnostics (Coarse Ground, Full Detail Everywhere, Freeze Rates, Old Rate
+	// Analysis) were removed: the analysis is always rate-aware.
+	cb.RateAwareAnalysis = 1u;
+	// What this frame's opaque draws were actually shaded at.
+	cb.AppliedRatesValid = lastBoundFrame == frameIndex ? 1u : 0u;
 	return cb;
 }
 
@@ -416,8 +417,7 @@ void VariableRateShading::BeginOpaquePass()
 	Util::CpuPassScope cpuTimer("VariableRateShading");
 	auto context = globals::d3d::context;
 
-	// Freeze Rates keeps re-binding the last image without rebuilding it.
-	if (lastBuildFrame != frameIndex && !diagnostics.FreezeRates) {
+	if (lastBuildFrame != frameIndex) {
 		auto shader = GetShader(buildCS, L"Data\\Shaders\\VariableRateShading\\BuildRateImageCS.hlsl");
 		if (!shader)
 			return;
@@ -489,9 +489,6 @@ VariableRateShading::Table VariableRateShading::ClassifyDraw() const
 	if (state->permutationData.ExtraShaderDescriptor & static_cast<uint32_t>(State::ExtraShaderDescriptors::IsReflections))
 		return Table::Off;
 
-	if (diagnostics.FullRateEverywhere)
-		return Table::Off;
-
 	using Technique = SIE::ShaderCache::LightingShaderTechniques;
 	const uint32_t pixelDescriptor = state->currentPixelDescriptor;
 	switch (shader->shaderType.get()) {
@@ -511,7 +508,7 @@ VariableRateShading::Table VariableRateShading::ClassifyDraw() const
 			// weights renormalised, vertex colour divided by its own maximum); Lighting.hlsl
 			// reads those centroid-interpolated, which covers the other coarse-shaded draws.
 			if (technique == Technique::MTLand || technique == Technique::MTLandLODBlend)
-				return diagnostics.CoarseTerrain ? Table::Full : Table::Off;
+				return Table::Off;
 
 			// Anything blended writes a per-pixel alpha; one coarse alpha per block would
 			// cut or fade whole blocks (blended decals and the like).
@@ -812,28 +809,6 @@ void VariableRateShading::DrawSettings()
 				ImGui::Text("Counts screen tiles, not objects. Anything excluded (the ground, and grass or cut-outs when off) still runs at full detail, so the real saving is smaller.");
 			}
 		}
-	}
-
-	ImGui::SeparatorText("Diagnostics (not saved)");
-
-	ImGui::Checkbox("Diagnostic: Coarse Ground (old)", &diagnostics.CoarseTerrain);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Lets the ground drop detail again, like the previous build. Only for checking whether the pale blocks on distant ground come back; leave off for normal play.");
-	}
-
-	ImGui::Checkbox("Diagnostic: Full Detail Everywhere", &diagnostics.FullRateEverywhere);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Keeps all of VRS running but shades everything at full detail. If a problem stays with this on, VRS lowering detail is not what causes it.");
-	}
-
-	ImGui::Checkbox("Diagnostic: Freeze Rates", &diagnostics.FreezeRates);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Stops updating where detail is lowered; the current pattern stays. If flicker stops, it came from blocks switching detail; if it stays, from the lowered detail itself.");
-	}
-
-	ImGui::Checkbox("Diagnostic: Old Rate Analysis", &diagnostics.RateBlindAnalysis);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Measures blocks the way the previous build did, ignoring that some were already shaded coarsely. Only for checking whether the old flicker comes back.");
 	}
 
 	ImGui::EndDisabled();

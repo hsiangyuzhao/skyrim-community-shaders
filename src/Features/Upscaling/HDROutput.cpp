@@ -112,17 +112,6 @@ namespace HDROutput
 		D3D11_VIEWPORT g_savedImGuiViewport{};
 		bool g_imGuiRedirected = false;
 
-		// (43b) Third-party UI alpha-blend fix (upstream HDRDisplay's OMSetBlendState detour)
-		bool g_blendHookInstalled = false;
-		struct PatchedBlend
-		{
-			D3D11_BLEND_DESC original;
-			winrt::com_ptr<ID3D11BlendState> patched;  // null: no change needed
-		};
-		std::unordered_map<ID3D11BlendState*, PatchedBlend> g_patchedBlends;
-		std::unordered_map<ID3D11BlendState*, ID3D11BlendState*> g_patchedToOriginal;
-		uint64_t g_blendPatchCount = 0;
-
 		// (43c) DLSS-G
 		uint32_t g_lastDLSSGStatus = 0;
 		bool g_dlssGRejectedHDR = false;
@@ -487,88 +476,6 @@ namespace HDROutput
 			}
 		}
 
-		// ---- (43b) third-party UI alpha blending ------------------------------------------------------
-		//
-		// Ported from upstream HDRDisplay::GetPatchedAlphaBlendState and its OMSetBlendState detour. The UI
-		// layer is composited by its alpha. A mod that blends alpha as [SrcAlpha, InvSrcAlpha] or
-		// [InvSrcAlpha, Zero] (IED, for one) leaves alpha*(1-alpha) or less there, and its opaque panels
-		// then let most of the scene through. While the UI layer is the target, every blended state's
-		// alpha is rewritten to premultiplied [One, InvSrcAlpha, Add]; colour blending is untouched.
-		// Only the immediate context, only during the UI-capture window, and the patched state is swapped
-		// back for its original at the end of the window so the engine's state cache stays truthful.
-
-		ID3D11BlendState* GetPatchedAlphaBlendState(ID3D11BlendState* a_original)
-		{
-			D3D11_BLEND_DESC desc{};
-			a_original->GetDesc(&desc);
-			if (auto it = g_patchedBlends.find(a_original); it != g_patchedBlends.end()) {
-				if (std::memcmp(&it->second.original, &desc, sizeof(desc)) == 0)
-					return it->second.patched ? it->second.patched.get() : a_original;
-				// The address was released and reused for a different state.
-				if (it->second.patched)
-					g_patchedToOriginal.erase(it->second.patched.get());
-				g_patchedBlends.erase(it);
-			}
-
-			PatchedBlend entry{ desc, nullptr };
-			const int slots = desc.IndependentBlendEnable ? 8 : 1;
-			bool needsPatch = false;
-			for (int i = 0; i < slots; ++i) {
-				const auto& rt = desc.RenderTarget[i];
-				if (rt.BlendEnable && (rt.SrcBlendAlpha != D3D11_BLEND_ONE || rt.DestBlendAlpha != D3D11_BLEND_INV_SRC_ALPHA || rt.BlendOpAlpha != D3D11_BLEND_OP_ADD))
-					needsPatch = true;
-			}
-			if (needsPatch) {
-				D3D11_BLEND_DESC patchedDesc = desc;
-				for (int i = 0; i < slots; ++i) {
-					auto& rt = patchedDesc.RenderTarget[i];
-					if (rt.BlendEnable) {
-						rt.SrcBlendAlpha = D3D11_BLEND_ONE;
-						rt.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-						rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
-					}
-				}
-				if (FAILED(globals::d3d::device->CreateBlendState(&patchedDesc, entry.patched.put())))
-					entry.patched = nullptr;
-				if (entry.patched)
-					g_patchedToOriginal[entry.patched.get()] = a_original;
-			}
-			auto* result = entry.patched ? entry.patched.get() : a_original;
-			g_patchedBlends.emplace(a_original, std::move(entry));
-			return result;
-		}
-
-		struct ID3D11DeviceContext_OMSetBlendState
-		{
-			static void WINAPI thunk(ID3D11DeviceContext* This, ID3D11BlendState* a_blendState, const FLOAT a_blendFactor[4], UINT a_sampleMask)
-			{
-				if (a_blendState && This == globals::d3d::context && g_frame.uiRedirected && GetSettings().uiBlendFix) {
-					auto* patched = GetPatchedAlphaBlendState(a_blendState);
-					if (patched != a_blendState)
-						++g_blendPatchCount;
-					a_blendState = patched;
-				}
-				func(This, a_blendState, a_blendFactor, a_sampleMask);
-			}
-			static inline REL::Relocation<decltype(thunk)> func;
-		};
-
-		void RestoreUnpatchedBlendState()
-		{
-			if (!g_blendHookInstalled || g_patchedToOriginal.empty())
-				return;
-			auto* context = globals::d3d::context;
-			ID3D11BlendState* current = nullptr;
-			FLOAT factor[4]{};
-			UINT mask = 0;
-			context->OMGetBlendState(&current, factor, &mask);
-			if (!current)
-				return;
-			if (auto it = g_patchedToOriginal.find(current); it != g_patchedToOriginal.end())
-				ID3D11DeviceContext_OMSetBlendState::func(context, it->second, factor, mask);
-			current->Release();
-		}
-
 		void CreateUILayer(uint32_t a_width, uint32_t a_height)
 		{
 			D3D11_TEXTURE2D_DESC desc{};
@@ -602,7 +509,6 @@ namespace HDROutput
 			if (auto* original = g_savedUIFramebufferRTV ? g_savedUIFramebufferRTV : g_backBufferRTV)
 				fb.RTV = original;
 			g_savedUIFramebufferRTV = nullptr;
-			RestoreUnpatchedBlendState();
 			g_frame.uiRedirected = false;
 			globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
 		}
@@ -1023,11 +929,6 @@ namespace HDROutput
 		EnsureCB();
 		UpgradeLDRRenderTargets();
 		InstallCopyCheck();  // (44d) after the upgrade: it watches the new fp16 textures
-
-		if (!g_blendHookInstalled) {
-			stl::detour_vfunc<35, ID3D11DeviceContext_OMSetBlendState>(globals::d3d::context);
-			g_blendHookInstalled = true;
-		}
 
 		// (port of ba9b41e81 / f748118bb) New targets start black, not with whatever the memory held:
 		// the first frames (startup, main menu) can be shown before anything has drawn into them.
@@ -1554,12 +1455,6 @@ namespace HDROutput
 			ImGui::TextUnformatted("the menu is open, but nothing can go wrong with the menu itself. Separate: the world keeps its HDR highlights.");
 		}
 
-		ImGui::Checkbox("Fix Mod UI Transparency", &s.uiBlendFix);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Some mods' UI (IED, for one) writes transparency in a way that makes its panels see-through once the HUD is on its own layer.");
-			ImGui::TextUnformatted("This corrects it while the HUD is drawn. Only matters with HDR on.");
-		}
-
 		const char* nisModes[] = { "Off", "Linear mode" };
 		int nisMode = s.nisMode == 1 ? 1 : 0;
 		if (ImGui::Combo("Sharpening in HDR", &nisMode, nisModes, IM_ARRAYSIZE(nisModes)))
@@ -1626,7 +1521,6 @@ namespace HDROutput
 				ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Mismatched-format copies seen: %llu (%zu kinds, see the log)", g_copyMismatchTotal, g_copyMismatches.size());
 			else
 				ImGui::TextDisabled("Mismatched-format copies seen: none%s", s.copyCheck ? "" : " (check off)");
-			ImGui::Text("Mod UI transparency fixes: %llu (%zu blend states seen)", g_blendPatchCount, g_patchedBlends.size());
 			if (g_dlssGRejectedHDR)
 				ImGui::TextColored({ 1.0f, 0.4f, 0.4f, 1.0f }, "DLSS-G rejected the HDR format (eFailHDRFormatNotSupported, status 0x%X)", g_lastDLSSGStatus);
 			else if (g_lastDLSSGStatus)
@@ -1675,8 +1569,6 @@ namespace HDROutput
 				mismatches.push_back({ { "src", TargetName(m.src) }, { "dst", TargetName(m.dst) }, { "src_format", m.srcFormat }, { "dst_format", m.dstFormat }, { "count", m.count } });
 			j["copy_mismatches"] = mismatches;
 			j["menu_mode"] = s.menuMode == 1 ? "separate" : "sdr";
-			j["ui_blend_fix"] = s.uiBlendFix;
-			j["ui_blend_patches"] = g_blendPatchCount;
 			j["nis_in_hdr"] = s.nisMode == 1 ? "linear" : "off";
 			j["color_space_chain_setting"] = s.colorSpaceChain;
 			j["color_space_chain_session"] = g_colorSpaceChainLatched;

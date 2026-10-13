@@ -1,4 +1,4 @@
-// Batch 39, items 1-4: water reflection cubemap relief, depth prepass breakdown + slimming,
+// Batch 39, items 1-4: water reflection cubemap relief, depth prepass breakdown,
 // temporal LOD dither, texture clarity. See Batch39Engine.h for what the engine does and why
 // each switch is built the way it is.
 #include "Utils/Batch39Engine.h"
@@ -17,10 +17,8 @@
 
 #include "Deferred.h"
 #include "Features/DynamicCubemaps.h"
-#include "Features/TerrainBlending.h"
 #include "Globals.h"
 #include "Menu.h"
-#include "ShaderCache.h"
 #include "State.h"
 #include "Util.h"
 #include "Utils/GpuPhaseTimeline.h"
@@ -88,8 +86,6 @@ namespace Batch39Engine
 		EngineBool g_reflectLODObjects{ "bReflectLODObjects:Water" };
 		EngineBool g_reflectLODLand{ "bReflectLODLand:Water" };
 		EngineBool g_reflectSky{ "bReflectSky:Water" };
-		EngineBool g_lodZPrepass{ "bLodZPrepass:Display" };
-		EngineBool g_frontToBackPrepass{ "bEnableFrontToBackPrepass:Display" };
 		EngineBool g_stippleFade{ "bEnableStippleFade:Display" };
 
 		float ReadEngineFloat(const char* a_name, float a_fallback)
@@ -268,53 +264,6 @@ namespace Batch39Engine
 		const void* g_cubeLastCamera = nullptr;
 		uint64_t g_cubeTotalCalls = 0;
 
-		// ---------------------------------------------------------------------------------
-		// 2. Depth refresh after the opaque pass.
-		// ---------------------------------------------------------------------------------
-		ID3D11ComputeShader* g_depthRefreshCS = nullptr;
-		bool g_depthRefreshCSFailed = false;
-		uint32_t g_depthRefreshFrame = UINT32_MAX;
-		std::string g_depthRefreshPath = "-";
-
-		ID3D11ComputeShader* GetDepthRefreshCS()
-		{
-			if (!g_depthRefreshCS && !g_depthRefreshCSFailed) {
-				g_depthRefreshCS = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\Batch39DepthRefreshCS.hlsl", {}, "cs_5_0"));
-				if (!g_depthRefreshCS) {
-					g_depthRefreshCSFailed = true;
-					logger::error("[Engine] Batch39DepthRefreshCS.hlsl failed to compile; Terrain Blending's depth is not refreshed after the opaque pass");
-				}
-			}
-			return g_depthRefreshCS;
-		}
-
-		// Depth states for draws that skipped the prepass: the engine's state with the test
-		// relaxed to LESS_EQUAL and depth writes on (stencil kept).
-		std::unordered_map<ID3D11DepthStencilState*, winrt::com_ptr<ID3D11DepthStencilState>> g_depthWriteStates;
-		uint32_t g_depthOverridesThisFrame = 0, g_depthOverridesLast = 0;
-
-		ID3D11DepthStencilState* DepthWriteVariant(ID3D11DepthStencilState* a_state)
-		{
-			if (auto it = g_depthWriteStates.find(a_state); it != g_depthWriteStates.end())
-				return it->second.get();
-
-			winrt::com_ptr<ID3D11DepthStencilState> variant;
-			D3D11_DEPTH_STENCIL_DESC desc{};
-			a_state->GetDesc(&desc);
-			const bool alreadyWrites = desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL &&
-			                           (desc.DepthFunc == D3D11_COMPARISON_LESS_EQUAL || desc.DepthFunc == D3D11_COMPARISON_LESS);
-			if (desc.DepthEnable && !alreadyWrites) {
-				desc.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
-				desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-				if (FAILED(globals::d3d::device->CreateDepthStencilState(&desc, variant.put())))
-					variant = nullptr;
-			}
-			// Keyed by the engine's own (persistent) state object; a null value means "leave as is".
-			auto* raw = variant.get();
-			g_depthWriteStates.emplace(a_state, std::move(variant));
-			return raw;
-		}
-
 	}
 
 	// =====================================================================================
@@ -323,28 +272,15 @@ namespace Batch39Engine
 
 	NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 		Settings,
-		ReflThrottle,
-		ReflFacesPerUpdate,
-		ReflEveryNFrames,
-		ReflSkipLODTrees,
 		ReflSkipLODObjects,
 		ReflHandOffToDynamicCubemaps,
-		ReflHandOffKeepSky,
-		ReflHandOffFastCapture,
-		ReflHandOffCaptureWeight,
-		PrepassSkipLODLand,
-		PrepassFrontToBack,
-		TemporalLODDither,
-		MipBiasMaterials,
-		MipBiasSpecular,
-		Anisotropic16x)
+		ReflHandOffCaptureWeight)
 
 	void Load(const json& a_json)
 	{
-		// Only the three options left in the menu (Water > Water Effects > Reflection Cubemap) are
-		// read; every other field keeps its default, which is the frozen value (see
-		// specs/ui-cleanup-batch40d.md). Accepts both Advanced."Engine" and the old
-		// Advanced."Batch 39 Engine" object, which used the same key names.
+		// Only the three options left in the menu (Water > Water Effects > Reflection Cubemap).
+		// Every other batch 39 engine item is permanent (44f, specs/ui-cleanup-44f.md); old keys
+		// are ignored.
 		if (!a_json.is_object())
 			return;
 		if (a_json.contains("ReflSkipLODObjects") && a_json["ReflSkipLODObjects"].is_boolean())
@@ -370,31 +306,17 @@ namespace Batch39Engine
 
 	bool ReflHandOffActive()
 	{
-		return Batch39::IsOn() && settings.ReflHandOffToDynamicCubemaps && globals::features::dynamicCubemaps.loaded;
+		return settings.ReflHandOffToDynamicCubemaps && globals::features::dynamicCubemaps.loaded;
 	}
-	bool ReflThrottleActive() { return Batch39::IsOn() && settings.ReflThrottle && !ReflHandOffActive(); }
-	bool ReflHandOffKeepSkyActive() { return ReflHandOffActive() && settings.ReflHandOffKeepSky; }
-	bool ReflHandOffFastCaptureActive() { return ReflHandOffActive() && settings.ReflHandOffFastCapture; }
+	bool ReflHandOffFastCaptureActive() { return ReflHandOffActive(); }
 	float DynamicCubemapCaptureWeight() { return ReflHandOffFastCaptureActive() ? std::clamp(settings.ReflHandOffCaptureWeight, 0.25f, 1.0f) : 0.5f; }
-	bool ReflSkipLODTreesActive() { return Batch39::IsOn() && settings.ReflSkipLODTrees; }
-	bool ReflSkipLODObjectsActive() { return Batch39::IsOn() && settings.ReflSkipLODObjects; }
-	bool PrepassSkipLODLandActive() { return Batch39::IsOn() && settings.PrepassSkipLODLand; }
-	bool PrepassFrontToBackActive() { return Batch39::IsOn() && settings.PrepassFrontToBack; }
-	bool TemporalLODDitherActive() { return Batch39::IsOn() && settings.TemporalLODDither; }
-	bool MipBiasMaterialsActive() { return Batch39::IsOn() && settings.MipBiasMaterials; }
-	bool MipBiasSpecularActive() { return Batch39::IsOn() && settings.MipBiasSpecular; }
-	bool Anisotropic16xActive() { return Batch39::IsOn() && settings.Anisotropic16x && g_samplerHookInstalled; }
-	bool PrepassSlimmingActive() { return PrepassSkipLODLandActive(); }
+	bool ReflSkipLODObjectsActive() { return settings.ReflSkipLODObjects; }
 
 	uint32_t ShaderFlags()
 	{
-		uint32_t flags = 0;
-		if (TemporalLODDitherActive())
-			flags |= ShaderFlag::TemporalLODDither;
-		if (MipBiasMaterialsActive())
-			flags |= ShaderFlag::MipBiasMaterials;
-		if (MipBiasSpecularActive())
-			flags |= ShaderFlag::MipBiasSpecular;
+		// Temporal LOD dither and the mip bias on the remaining material and specular textures are
+		// permanent (44f); the shaders still read the bits.
+		uint32_t flags = ShaderFlag::TemporalLODDither | ShaderFlag::MipBiasMaterials | ShaderFlag::MipBiasSpecular;
 		if (ReflHandOffActive())
 			flags |= ShaderFlag::WaterDynamicCubemapOnly;
 		return flags;
@@ -493,16 +415,15 @@ namespace Batch39Engine
 	void OnFrameStart()
 	{
 		// Engine INI overrides: read by the engine every frame (see the header).
-		// (39b) Hand-off keeping the sky: the game's cubemap holds the sky alone.
-		const bool skyOnly = ReflHandOffKeepSkyActive();
-		g_reflectLODTrees.Apply(ReflSkipLODTreesActive() || skyOnly, false);
+		// LOD trees never go into the reflection (39b default, permanent since 44f). (39b) While
+		// handed off to Dynamic Cubemaps, the game's cubemap holds the sky alone.
+		const bool skyOnly = ReflHandOffActive();
+		g_reflectLODTrees.Apply(true, false);
 		g_reflectLODObjects.Apply(ReflSkipLODObjectsActive() || skyOnly, false);
 		g_reflectLODLand.Apply(skyOnly, false);
-		g_lodZPrepass.Apply(PrepassSkipLODLandActive(), false);
-		g_frontToBackPrepass.Apply(PrepassFrontToBackActive(), true);
 
-		// 16x AF: swap what is bound right now when the effective state flips.
-		const bool aniso = Anisotropic16xActive();
+		// 16x AF (permanent since 44f): swap what is bound right now once the hook exists.
+		const bool aniso = g_samplerHookInstalled;
 		if (aniso != g_anisoApplied) {
 			g_anisoApplied = aniso;
 			RebindPixelSamplers(aniso);
@@ -524,8 +445,6 @@ namespace Batch39Engine
 		g_cubeThis = {};
 		g_cubeLastCamera = nullptr;
 
-		g_depthOverridesLast = g_depthOverridesThisFrame;
-		g_depthOverridesThisFrame = 0;
 	}
 
 	// =====================================================================================
@@ -548,133 +467,29 @@ namespace Batch39Engine
 		if (mapMenu)
 			return a_faceMask;
 
-		// Dynamic Cubemaps takes over: the engine cubemap is not drawn. The calls still go
-		// through with no faces so the camera's scene list is cleared as usual. (39b) Unless it
-		// keeps the sky: then it draws the sky alone (OnFrameStart turns the LOD lists off), in
-		// the same round robin, for Dynamic Cubemaps to fill the directions it has not seen.
-		if (ReflHandOffActive() && !ReflHandOffKeepSkyActive())
-			return 0;
-
-		if (!(ReflThrottleActive() || ReflHandOffKeepSkyActive()) || !globals::state)
+		// (39b) While handed off to Dynamic Cubemaps the engine cubemap draws the sky alone
+		// (OnFrameStart turns the LOD lists off), in the same round robin, for Dynamic Cubemaps to
+		// fill the directions it has not seen.
+		if (!globals::state)
 			return a_faceMask;
 
 		// Our own round robin, independent of which faces the engine asked for: any face can be
 		// drawn from this frame's scene list. The first call of a frame (per camera) draws the
-		// faces; the engine's second call of the frame then only clears the scene list.
+		// faces; the engine's second call of the frame then only clears the scene list. One face
+		// per frame (39b default, permanent since 44f).
 		auto& cam = CameraSlot(a_camera);
 		const uint32_t frame = globals::state->frameCount;
 		if (cam.lastFrame == frame)
 			return 0;
 		cam.lastFrame = frame;
-		const uint32_t everyN = static_cast<uint32_t>(std::clamp(settings.ReflEveryNFrames, 1, 8));
-		if (frame % everyN != 0)
-			return 0;
-		const uint32_t faces = static_cast<uint32_t>(std::clamp(settings.ReflFacesPerUpdate, 1, 6));
-		int mask = 0;
-		for (uint32_t i = 0; i < faces; ++i)
-			mask |= 1 << ((cam.cursor + i) % 6);
-		cam.cursor = (cam.cursor + faces) % 6;
+		const int mask = 1 << cam.cursor;
+		cam.cursor = (cam.cursor + 1) % 6;
 		return mask;
 	}
 
 	void NoteCubemapCall(int, int a_drawnMask)
 	{
 		g_cubeThis.facesDrawn += std::popcount(static_cast<uint32_t>(a_drawnMask) & 0x3Fu);
-	}
-
-	// =====================================================================================
-	// 2. Depth prepass
-	// =====================================================================================
-
-	void OnDraw(RE::BSShader* a_shader, uint32_t, uint32_t a_pixelDescriptor)
-	{
-		if (!a_shader || !globals::deferred || !globals::deferred->deferredPass)
-			return;
-
-		bool needsDepthWrite = false;
-		if (a_shader->shaderType.get() == RE::BSShader::Type::Lighting && PrepassSkipLODLandActive()) {
-			using Tech = SIE::ShaderCache::LightingShaderTechniques;
-			const auto tech = static_cast<Tech>(0x3F & (a_pixelDescriptor >> 24));
-			needsDepthWrite = tech == Tech::LODLand || tech == Tech::LODLandNoise;
-		}
-		if (!needsDepthWrite)
-			return;
-
-		auto* context = globals::d3d::context;
-		winrt::com_ptr<ID3D11DepthStencilState> current;
-		UINT stencilRef = 0;
-		context->OMGetDepthStencilState(current.put(), &stencilRef);
-		if (!current)
-			return;
-		if (auto* variant = DepthWriteVariant(current.get())) {
-			context->OMSetDepthStencilState(variant, stencilRef);
-			// The engine re-applies its own depth state before its next draw.
-			globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_DEPTH_MODE);
-			++g_depthOverridesThisFrame;
-		}
-	}
-
-	void AfterOpaquePass()
-	{
-		if (!PrepassSlimmingActive())
-			return;
-
-		auto* renderer = globals::game::renderer;
-		auto* context = globals::d3d::context;
-		if (!renderer || !context)
-			return;
-
-		auto& mainDepth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
-		auto& zPrepassCopy = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
-		if (!mainDepth.texture || !zPrepassCopy.texture)
-			return;
-
-		auto* timers = Util::GpuPassTimers::GetSingleton();
-		timers->Begin(Util::GpuBucket::Batch39DepthRefresh);
-
-		// Everything after the opaque pass that reads "the prepass depth" (SSAO/SSGI, SSRT,
-		// screen-space shadows, SSS, fog, the deferred composite, water) sees the complete
-		// opaque depth again, including the geometry that skipped the prepass.
-		context->CopyResource(zPrepassCopy.texture, mainDepth.texture);
-		g_depthRefreshPath = "copy";
-
-		// With Terrain Blending, those readers get its blended copy instead (made right after
-		// the prepass): fold the finished depth into it. min() keeps its blended terrain.
-		auto& tb = globals::features::terrainBlending;
-		if (tb.loaded && tb.blendedDepthTexture && tb.blendedDepthTexture16 && tb.depthSRVBackup) {
-			if (auto* cs = GetDepthRefreshCS()) {
-				ID3D11ShaderResourceView* srv = tb.depthSRVBackup;
-				ID3D11UnorderedAccessView* uavs[2] = { tb.blendedDepthTexture->uav.get(), tb.blendedDepthTexture16->uav.get() };
-				context->CSSetShaderResources(0, 1, &srv);
-				context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-				context->CSSetShader(cs, nullptr, 0);
-				const auto dispatch = Util::GetScreenDispatchCount();
-				context->Dispatch(dispatch.x, dispatch.y, 1);
-
-				ID3D11ShaderResourceView* nullSrv = nullptr;
-				ID3D11UnorderedAccessView* nullUavs[2] = { nullptr, nullptr };
-				context->CSSetShaderResources(0, 1, &nullSrv);
-				context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
-				context->CSSetShader(nullptr, nullptr, 0);
-
-				// Writing it as a UAV unbinds it from the pixel shader slot State binds it to.
-				ID3D11ShaderResourceView* blended16 = tb.blendedDepthTexture16->srv.get();
-				context->PSSetShaderResources(17, 1, &blended16);
-				g_depthRefreshPath = "copy + Terrain Blending merge";
-			}
-		}
-
-		timers->End(Util::GpuBucket::Batch39DepthRefresh);
-		g_depthRefreshFrame = globals::state ? globals::state->frameCount : 0;
-	}
-
-	void ClearShaderCache()
-	{
-		if (g_depthRefreshCS) {
-			g_depthRefreshCS->Release();
-			g_depthRefreshCS = nullptr;
-		}
-		g_depthRefreshCSFailed = false;
 	}
 
 	// =====================================================================================
@@ -728,19 +543,10 @@ namespace Batch39Engine
 		json j;
 		j["settings"] = settings;
 		j["active"] = {
-			{ "refl_throttle", ReflThrottleActive() },
 			{ "refl_handoff_dynamic_cubemaps", ReflHandOffActive() },
-			{ "refl_skip_lod_trees", ReflSkipLODTreesActive() },
 			{ "refl_skip_lod_objects", ReflSkipLODObjectsActive() },
-			{ "refl_handoff_keep_sky", ReflHandOffKeepSkyActive() },
 			{ "refl_handoff_fast_capture", ReflHandOffFastCaptureActive() },
 			{ "dynamic_cubemaps_capture_weight", DynamicCubemapCaptureWeight() },
-			{ "prepass_skip_lod_land", PrepassSkipLODLandActive() },
-			{ "prepass_front_to_back", PrepassFrontToBackActive() },
-			{ "temporal_lod_dither", TemporalLODDitherActive() },
-			{ "mip_bias_materials", MipBiasMaterialsActive() },
-			{ "mip_bias_specular", MipBiasSpecularActive() },
-			{ "anisotropic_16x", Anisotropic16xActive() },
 			{ "shader_flags", ShaderFlags() },
 		};
 		j["hooks"] = { { "render_pass", g_passHookInstalled }, { "depth_prepass", g_depthHookInstalled }, { "ps_samplers", g_samplerHookInstalled } };
@@ -751,8 +557,6 @@ namespace Batch39Engine
 			{ "bReflectLODObjects:Water", { { "now", g_reflectLODObjects.Current() }, { "user", g_reflectLODObjects.UserValue() } } },
 			{ "bReflectLODLand:Water", { { "now", g_reflectLODLand.Current() }, { "user", g_reflectLODLand.UserValue() } } },
 			{ "bReflectSky:Water", g_reflectSky.Current() },
-			{ "bLodZPrepass:Display", { { "now", g_lodZPrepass.Current() }, { "user", g_lodZPrepass.UserValue() } } },
-			{ "bEnableFrontToBackPrepass:Display", { { "now", g_frontToBackPrepass.Current() }, { "user", g_frontToBackPrepass.UserValue() } } },
 			{ "bEnableStippleFade:Display", g_stippleFade.Current() },
 		};
 
@@ -792,8 +596,6 @@ namespace Batch39Engine
 						 } },
 			{ "opaque_grass", PhaseJson(Util::GpuPhase::OpaqueGrass) },
 			{ "opaque_distant", PhaseJson(Util::GpuPhase::OpaqueDistant) },
-			{ "depth_write_overrides_last_frame", g_depthOverridesLast },
-			{ "depth_refresh", { { "ran_last_frame", globals::state && g_depthRefreshFrame + 1 >= globals::state->frameCount }, { "path", g_depthRefreshPath } } },
 		};
 
 		json samplers = json::object();

@@ -55,7 +55,6 @@ namespace Util
 		VolumetricFogNear,       // (batch 38) volumetric fog near grid: conservative depth + medium + light scattering + integration
 		VolumetricFogFar,        // (batch 38) volumetric fog far grid, same four passes
 		VolumetricShadows,       // (batch 38) sun VSM for smoke and effects: downsample + 11x11 blur
-		Batch39DepthRefresh,     // (batch 39) depth copy / Terrain Blending merge after the opaque pass (prepass slimming only)
 		SnowTrails,              // (batch 39) Dynamic Snow footprint map: scroll clear + refill + prints
 		// (batch 42a) Neural Rendering split three ways on the D3D11 timeline (the Batch 38 path):
 		// NeuralRendering above keeps "prepare" (guides, colour copy, tone curve, downscale), these

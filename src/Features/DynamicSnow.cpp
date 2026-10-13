@@ -11,7 +11,6 @@
 #include "State.h"
 #include "Util.h"
 #include "Utils/ActorUtils.h"
-#include "Utils/Batch39.h"
 #include "Utils/GpuTimers.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -133,12 +132,12 @@ bool DynamicSnow::HasShaderDefine(RE::BSShader::Type shaderType)
 
 bool DynamicSnow::AccumulationActive() const
 {
-	return loaded && Batch39::IsOn() && settings.EnableAccumulation;
+	return loaded && settings.EnableAccumulation;
 }
 
 bool DynamicSnow::TrailsActive() const
 {
-	return loaded && Batch39::IsOn() && settings.EnableTrails &&
+	return loaded && settings.EnableTrails &&
 	       (settings.TrailsOnSnow || settings.TrailsOnAccumulated || settings.MudTrails);
 }
 

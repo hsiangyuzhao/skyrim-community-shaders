@@ -48,8 +48,8 @@ namespace HDROutput
 		float paperWhiteNits = 203.0f;
 		/// HUD and menu text brightness during gameplay (43b).
 		float hudNits = 160.0f;
-		/// (43b) Rewrite third-party UI alpha blending so their panels cover the scene in the HUD layer.
-		bool uiBlendFix = true;
+		// (44f) The 43b "Fix Mod UI Transparency" (uiBlendFix) was removed: no visible effect for the
+		// user and its counter kept rising. The old key is ignored.
 		/// (43b) Paused menus: 0 = whole frame shown as SDR (safe), 1 = UI on its own layer like gameplay.
 		uint menuMode = 0;
 		/// (43c) NIS sharpening while HDR is on: 0 = off, 1 = linear mode.
@@ -77,7 +77,6 @@ namespace HDROutput
 		peakNitsManual,
 		paperWhiteNits,
 		hudNits,
-		uiBlendFix,
 		menuMode,
 		nisMode,
 		colorSpaceChain,

@@ -47,10 +47,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurHitDistA,
     ReblurHitDistB,
     ReblurHitDistC,
-    SpecularPrepassBlurRadius,
-    UsePrepassOnlyForSpecularMotionEstimation,
-    ReblurSkipSpecularPrepass,
-    ReblurFoldUnpack,
     DistanceLimit,
     DistanceLimitMeters,
     EnablePreBlur,
@@ -108,10 +104,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ReblurHitDistA,
     ReblurHitDistB,
     ReblurHitDistC,
-    SpecularPrepassBlurRadius,
-    UsePrepassOnlyForSpecularMotionEstimation,
-    ReblurSkipSpecularPrepass,
-    ReblurFoldUnpack,
     DistanceLimit,
     DistanceLimitMeters,
     EnablePreBlur,
@@ -362,19 +354,6 @@ void ScreenSpaceRayTracing::DrawSettings()
 
         bool reblurChanged = false;
 
-        // (batch 36f) Cost switches. Both are runtime switches, on by default (the old master switch
-        // that could override them is frozen on).
-        ImGui::Checkbox("Skip Reflection Pre-pass", &settings.ReblurSkipSpecularPrepass);
-        if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Drops REBLUR's reflection pre-pass (~0.3 ms at 1440p). It was only used to track how reflections move, and our reflections are already clean. "
-                "Risk: a little more smearing in reflections during fast camera turns. On by default.");
-        ImGui::Checkbox("Fold Unpack Into Composite", &settings.ReblurFoldUnpack);
-        if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Converts REBLUR's output inside the final composite instead of in two extra full-screen passes (~0.15 ms). "
-                "The picture is identical either way; Off = two separate passes. On by default.");
-
         // (S1.1) The confidence input, off by default and labelled for what it is.
         if (ImGui::Checkbox("Feed Hit Coverage as History Confidence (experimental)", &settings.ReblurFeedHitCoverageConfidence))
             reblurChanged = true;
@@ -396,10 +375,6 @@ void ScreenSpaceRayTracing::DrawSettings()
         }
         if (ImGui::TreeNode("REBLUR Specular (advanced)")) {
             reblurChanged |= nrdSvc.DrawReblurSettings(settings.ReblurSpecular, true, "ssrt_reblur_specular");
-            reblurChanged |= ImGui::SliderFloat("Specular Pre-pass Radius", &settings.SpecularPrepassBlurRadius, 0.0f, 75.0f, "%.1f px");
-            if (auto _tt = Util::HoverTooltipWrapper())
-                ImGui::Text("Blur applied to reflections before REBLUR's frame averaging. Higher = less noisy but blurrier reflections; 0 = off.");
-            reblurChanged |= ImGui::Checkbox("Use Pre-pass Only for Motion Estimation", &settings.UsePrepassOnlyForSpecularMotionEstimation);
             ImGui::TreePop();
         }
         if (reblurChanged) {
@@ -837,7 +812,6 @@ void ScreenSpaceRayTracing::SanitizeSettings()
     settings.ReblurHitDistA = std::clamp(settings.ReblurHitDistA, 1.0f, 1000.0f);
     settings.ReblurHitDistB = std::clamp(settings.ReblurHitDistB, 0.0f, 1.0f);
     settings.ReblurHitDistC = std::clamp(settings.ReblurHitDistC, 1.0f, 40.0f);
-    settings.SpecularPrepassBlurRadius = std::clamp(settings.SpecularPrepassBlurRadius, 0.0f, 75.0f);
     // (batch 36f) Same range as the slider. Far below 20 m the limit would cut SSRT off at
     // arm's length; the 1000 m ceiling is far past where screen-space rays find anything.
     settings.DistanceLimitMeters = std::clamp(settings.DistanceLimitMeters, 20.0f, 1000.0f);
@@ -1606,10 +1580,12 @@ bool ScreenSpaceRayTracing::ReblurStaticallyAvailable(bool a_specular) const
 
     // (batch 11, item A) The front-end pack shaders are gone -- the ray march produces that
     // layout itself, and its own availability is already a precondition of the draw pass that
-    // can reach this path at all -- so the back-end unpack is the whole shader requirement now.
-    // It is chain-independent, hence no a_specular branch.
-    (void)a_specular;
-    return (bool)nrdUnpackCS;
+    // can reach this path at all. (44f) The separate unpack pass is gone too: the composites
+    // decode REBLUR's packed output themselves. The specular one is DeferredCompositeCS (always
+    // there); the diffuse one needs its two packed-input twins.
+    if (a_specular)
+        return true;
+    return diffuseCompositePackedCS && diffuseCompositeExternalConfPackedCS;
 }
 
 // (S1.3) Everything except this frame's guides. This is the predicate ResolveDenoisers uses,
@@ -1784,8 +1760,7 @@ void ScreenSpaceRayTracing::ClearShaderCache()
 {
     static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
         &raymarchSpecularCS, &raymarchDiffuseCS, &prepareColorCS, &preprocessDepthCS, &depthDownsampleCS, &diffuseCompositeCS, &preblurCS, &temporalCS, &temporalDiagCS, &varianceCS, &spatialCS, &spatialSpecularCS,
-        &nrdUnpackCS,
-        // (batch 36f) folded-unpack composite twins
+        // (batch 36f) packed-input composite twins (REBLUR's output decoded in the composite)
         &diffuseCompositePackedCS, &diffuseCompositeExternalConfPackedCS,
         // (batch 12) sparse sampling: the two ray-march permutations and their two resolve passes
         &raymarchDiffuseHalfResCS, &raymarchDiffuseCheckerCS, &sparseResolveHalfResCS, &sparseResolveCheckerCS,
@@ -1900,8 +1875,8 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             // above passes {} and this one has to match it entry for entry or the two would stop
             // being the same shader.
             { &diffuseCompositeExternalConfCS, "ssrt_diffuse_composite.hlsl", { { "SSRT_CONF_EXTERNAL_FILTER", "1" } } },
-            // (batch 36f) Settings::ReblurFoldUnpack: the same two composites reading REBLUR's packed
-            // output at t0 and decoding it in registers, in place of ssrt_nrd_unpack.hlsl.
+            // (batch 36f) The same two composites reading REBLUR's packed output at t0 and decoding it
+            // in registers (the separate ssrt_nrd_unpack.hlsl pass was removed in 44f).
             { &diffuseCompositePackedCS, "ssrt_diffuse_composite.hlsl", { { "SSRT_DIFFUSE_PACKED_INPUT", "1" } } },
             { &diffuseCompositeExternalConfPackedCS, "ssrt_diffuse_composite.hlsl", { { "SSRT_CONF_EXTERNAL_FILTER", "1" }, { "SSRT_DIFFUSE_PACKED_INPUT", "1" } } },
             // (batch 6) The spatial confidence filter. None of the three files reads any of the
@@ -1916,12 +1891,6 @@ void ScreenSpaceRayTracing::CompileComputeShaders()
             { &varianceCS, "ssrt_variance.hlsl", {} },
             { &spatialCS, "ssrt_spatial.hlsl", definesWideKernel },
             { &spatialSpecularCS, "ssrt_spatial.hlsl", definesSpecular },
-            // (batch C1) REBLUR back-end unpack. Deliberately not built on `defines`: the file
-            // reads none of DYNAMIC_CUBEMAPS / SSGI / SKYLIGHTING / DIFFUSE_SPP, and both chains
-            // share it, so it has no permutation axis at all.
-            // (batch 11, item A) The two front-end pack permutations that used to sit here are
-            // gone; ssrt_raymarch.hlsl produces that layout itself.
-            { &nrdUnpackCS, "ssrt_nrd_unpack.hlsl", {} },
             // (batch 12) Sparse sampling. Both variants of both passes are always compiled, so
             // Settings::DiffuseSamplingMode is a hot switch and never a recompile.
             { &raymarchDiffuseHalfResCS, "ssrt_raymarch.hlsl", definesSparseHalfRes },
@@ -2701,13 +2670,10 @@ void ScreenSpaceRayTracing::DrawSSRTSpecular()
         // (S1.2) A false return means the dispatch did not complete: texSSRColor still
         // holds this frame's raw ray march, which is the correct thing to publish and to
         // hand the composite. The reset stays pending inside RunReblur.
-        // (batch 36f, item 4) Folded unpack: DeferredCompositeCS decodes the packed surface.
-        const bool foldUnpack = FoldUnpackActive();
-        const bool dispatched = RunReblur(true, foldUnpack);
-        if (foldUnpack) {
-            specularCompositeSRV = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
-            specularCompositePacked = true;
-        }
+        // (batch 36f, item 4) DeferredCompositeCS decodes the packed surface (permanent in 44f).
+        const bool dispatched = RunReblur(true);
+        specularCompositeSRV = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
+        specularCompositePacked = true;
     }
 
     // output
@@ -2801,14 +2767,11 @@ void ScreenSpaceRayTracing::CopyHistoryGeometry()
 // function is now part of the ray march: texNRDPackInput arrives already carrying this frame's
 // radiance in NRD's IN_*_RADIANCE_HITDIST layout, because the caller bound it at u0 and set
 // SSRTCB::NRDFrontEndPack on the same condition that calls this function.
-bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
+bool ScreenSpaceRayTracing::RunReblur(bool a_specular)
 {
     auto context = globals::d3d::context;
     auto state = globals::state;
     auto& nrdSvc = globals::features::nrd;
-
-    const float2 size = Util::ConvertToDynamic(state->screenSize);
-    const float2 dispatchCount = { (size.x + 7) / 8, (size.y + 7) / 8 };
 
     state->BeginPerfEvent(a_specular ? "SSRT REBLUR Specular" : "SSRT REBLUR Diffuse");
     Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::SSRTReblur);
@@ -2819,18 +2782,8 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
     bool& resetFlag = a_specular ? resetReblurSpecular : resetReblurDiffuse;
     auto& texInput = texNRDPackInput;
     auto& texOutput = texNRDPackOutput;
-    auto& texRadiance = a_specular ? texSSRColor : texSSRTDiffuseColor;
 
-    std::array<ID3D11ShaderResourceView*, 4> srvs = { nullptr };
-    std::array<ID3D11UnorderedAccessView*, 1> uavs = { nullptr };
-    auto resetViews = [&]() {
-        srvs.fill(nullptr);
-        uavs.fill(nullptr);
-        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
-        context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-    };
-
-    // (S1.2) Set by the NRD dispatch below; gates the unpack and the reset-flag clear.
+    // (S1.2) Set by the NRD dispatch below; gates the reset-flag clear.
     bool dispatched = false;
 
     // (batch 11, item A) The front-end pack pass that used to stand here is gone. texInput
@@ -2878,16 +2831,10 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
         reblurNative.hitDistanceParameters.B = settings.ReblurHitDistB;
         reblurNative.hitDistanceParameters.C = settings.ReblurHitDistC;
         if (a_specular) {
-            // (batch 36f, item 1) Radius 0 makes NRD drop the PrePass dispatch (Reblur.cpp
-            // skipPrePass: diffuse radius is always 0 here and checkerboard is OFF). Off, or with
-            // the Batch 36f master switch off: the batch 34 / 36e values.
-            if (SkipSpecularPrepassActive()) {
-                reblurNative.specularPrepassBlurRadius = 0.0f;
-                reblurNative.usePrepassOnlyForSpecularMotionEstimation = false;
-            } else {
-                reblurNative.specularPrepassBlurRadius = std::max(settings.SpecularPrepassBlurRadius, 0.0f);
-                reblurNative.usePrepassOnlyForSpecularMotionEstimation = settings.UsePrepassOnlyForSpecularMotionEstimation;
-            }
+            // (batch 36f, item 1, permanent in 44f) Radius 0 makes NRD drop the PrePass dispatch
+            // (Reblur.cpp skipPrePass: diffuse radius is always 0 here and checkerboard is OFF).
+            reblurNative.specularPrepassBlurRadius = 0.0f;
+            reblurNative.usePrepassOnlyForSpecularMotionEstimation = false;
         }
         integration.SetDenoiserSettings(&reblurNative);
 
@@ -2917,39 +2864,12 @@ bool ScreenSpaceRayTracing::RunReblur(bool a_specular, bool a_skipUnpack)
     }
 
     // ---- back-end unpack ----
-    // (S1.2) The source depends on whether the dispatch completed. texOutput would otherwise hold
-    // either the previous frame's denoised result or, on the first frame, uninitialised RGBA16F --
-    // which includes every NaN and Inf bit pattern.
-    //
-    // (batch 11, item A) The unpack now runs on *both* paths, and that is what preserves S1.2's
-    // guarantee. Before this batch the failure path could simply skip the pass, because
-    // texRadiance still held the raw ray march; now the ray march wrote texInput instead, so
-    // skipping would hand the composites last frame's contents. Unpacking texInput is the honest
-    // recovery: it is this frame's own radiance, undenoised, and the YCoCg transform is its own
-    // exact inverse (Y = .25r+.5g+.25b, Co = .5(r-b), Cg = .5g-.25(r+b) reconstructs r, g, b
-    // algebraically), so what lands in texRadiance is the ray march's output to within fp
-    // rounding. .w carries the normalized hit distance rather than the confidence -- which is
-    // already true on the success path, and no consumer reads .w of either surface.
+    // (S1.2) The composites decode texOutput on success and texInput (this frame's own radiance,
+    // undenoised) on failure, never the previous frame's or uninitialised contents. The YCoCg
+    // transform is its own exact inverse, so the failure path shows the ray march's output.
     if (!dispatched)
         logger::warn("SSRT: REBLUR {} dispatch did not complete; publishing this frame's undenoised radiance",
             a_specular ? "specular" : "diffuse");
-
-    // (batch 36f, item 4) Folded unpack: the caller's composite decodes the packed surface itself
-    // (texOutput on success, texInput on failure -- the same choice as below).
-    if (!a_skipUnpack) {
-        srvs.at(0) = (dispatched ? texOutput : texInput)->srv.get();
-        uavs.at(0) = texRadiance->uav.get();
-
-        context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
-        context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
-        context->CSSetShader(nrdUnpackCS.get(), nullptr, 0);
-        {
-            Util::DenoiserTimerScope timing("SSRT", a_specular ? "Unpack specular" : "Unpack diffuse",
-                (uint)dispatchCount.x, (uint)dispatchCount.y, (uint)dispatchCount.x * 8u, (uint)dispatchCount.y * 8u);
-            context->Dispatch((uint)dispatchCount.x, (uint)dispatchCount.y, 1);
-        }
-        resetViews();
-    }
 
     // The NRD dispatch owns s0/s1 and b1 while it runs; restore what the surrounding
     // draw pass set up so anything dispatched after this (the diffuse composite, or a
@@ -3544,12 +3464,10 @@ void ScreenSpaceRayTracing::DrawSSRTDiffuse()
         // (S1.1) IN_DIFF_CONFIDENCE is no longer wired unconditionally — see
         // Settings::ReblurFeedHitCoverageConfidence.
         // (S1.2) A false return leaves texSSRTDiffuseColor holding the raw ray march.
-        // (batch 36f, item 4) Folded unpack: the packed-input composite twin decodes it, and
-        // only if that twin compiled (otherwise the separate unpack pass runs as before).
-        const bool foldUnpack = FoldUnpackActive() && diffuseCompositePackedCS && diffuseCompositeExternalConfPackedCS;
-        const bool dispatched = RunReblur(false, foldUnpack);
-        if (foldUnpack)
-            compositePackedSRV = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
+        // (batch 36f, item 4) The packed-input composite twin decodes it (permanent in 44f; REBLUR
+        // is only chosen when that twin compiled, see the readiness check).
+        const bool dispatched = RunReblur(false);
+        compositePackedSRV = (dispatched ? texNRDPackOutput : texNRDPackInput)->srv.get();
     }
 
     // (S2.5) Same as the specular twin: ssrt_temporal.hlsl at t0 plus the Buffer Viewer are

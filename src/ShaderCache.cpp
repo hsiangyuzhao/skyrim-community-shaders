@@ -8,7 +8,6 @@
 
 #include "Features/DynamicCubemaps.h"
 #include "Features/GrassOptimizations.h"
-#include "Utils/Batch39Engine.h"
 
 namespace SIE
 {
@@ -1912,7 +1911,6 @@ namespace SIE
 		}
 		compilationSet.Clear();
 		globals::deferred->ClearShaderCache();
-		Batch39Engine::ClearShaderCache();
 		for (auto* feature : Feature::GetFeatureList()) {
 			if (feature->loaded) {
 				feature->ClearShaderCache();

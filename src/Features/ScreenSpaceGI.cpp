@@ -426,7 +426,6 @@ void ScreenSpaceGI::DrawSettings()
 void ScreenSpaceGI::LoadSettings(json& o_json)
 {
 	settings = o_json;
-	// Its own key wins over the value migrated from the old Advanced."Batch 37b" object.
 	if (o_json.is_object() && o_json.contains("AoSparesDirect") && o_json["AoSparesDirect"].is_boolean())
 		Batch37b::settings.ssgiAoSparesDirect = o_json["AoSparesDirect"].get<bool>();
 
@@ -875,7 +874,7 @@ void ScreenSpaceGI::DrawSSGI()
 	uint inputGITexIdx = lastFrameGITexIdx;
 
 	// (batch 37b, C-2) IL off: the radiance copy + prefilter and the IL blur serve nothing.
-	const bool skipIlPasses = !compiledWithGI && Batch37b::SsgiSkipIlPassesActive();
+	const bool skipIlPasses = !compiledWithGI;
 	ilPassesSkipped = skipIlPasses;
 
 	//////////////////////////////////////////////////////

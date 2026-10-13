@@ -18,7 +18,6 @@
 #include "SettingsOverrideManager.h"
 #include "ShaderCache.h"
 #include "TruePBR.h"
-#include "Utils/Batch37b.h"
 #include "Utils/Batch39Engine.h"
 #include "Utils/FileSystem.h"
 #include "Utils/GpuPhaseTimeline.h"
@@ -42,10 +41,6 @@ void State::Draw()
 
 	// Per-draw shading-rate selection; a single branch unless the opaque pass has VRS bound.
 	globals::features::variableRateShading.OnDraw();
-
-	// (batch 39, item 2) Depth writes for geometry that skipped the depth prepass. A couple of
-	// branches unless a prepass slimming switch is on.
-	Batch39Engine::OnDraw(currentShader, currentVertexDescriptor, currentPixelDescriptor);
 
 	if (shaderCache->IsEnabled()) {
 		if (terrainBlending.loaded)
@@ -356,14 +351,8 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				shaderCache->SetFileWatcher(advanced["Use FileWatcher"]);
 			if (advanced["Frame Annotations"].is_boolean())
 				frameAnnotations = advanced["Frame Annotations"];
-			// Old per-batch objects: master switches and frozen items are ignored; the remaining
-			// options are migrated (their new home wins when both exist).
-			if (advanced.contains("Batch 37b"))
-				Batch37b::Load(advanced["Batch 37b"]);
 			if (advanced.contains("Engine"))
 				Batch39Engine::Load(advanced["Engine"]);
-			else if (advanced.contains("Batch 39 Engine"))
-				Batch39Engine::Load(advanced["Batch 39 Engine"]);
 			if (advanced.contains("Window Compatibility"))
 				WndProcPseudoHandleFix::Load(advanced["Window Compatibility"]);
 		}

@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <d3d11.h>
 
-#include "Utils/Batch39.h"
 
 namespace RE
 {
@@ -16,14 +15,14 @@ namespace RE
  * @brief Batch 39, items 1-4: engine-level changes that belong to no single feature.
  *
  *  1. Water reflection cubemap relief (BSCubeMapCamera::RenderCubemap, Deferred.cpp).
- *  2. Depth prepass breakdown and slimming switches.
+ *  2. Depth prepass breakdown (diagnostics only; the slimming switches were removed in 44f).
  *  3. Temporal LOD dither (the fade-in/out screen door re-thresholded every frame).
  *  4. Texture clarity: DLSS mip bias on the remaining material textures, optional 16x AF.
  *
- * The batch master switch is frozen on (Batch39::IsOn() is always true). Only three options are
- * left in the menu (Water > Water Effects > Reflection Cubemap) and saved, under Advanced."Engine";
- * every other setting keeps its default, the frozen value. The breakdowns (overlay rows, F12
- * JSON) are diagnostics.
+ * Only three options are left (Water > Water Effects > Reflection Cubemap), saved under
+ * Advanced."Engine". Everything else is permanent since 44f (specs/ui-cleanup-44f.md): one
+ * cubemap face per frame, no LOD trees in the reflection, temporal LOD dither, DLSS mip bias on
+ * every material texture, 16x anisotropy. The breakdowns (overlay rows, F12 JSON) are diagnostics.
  *
  * What the engine does (SkyrimSE.exe 1.5.97, read off the binary for batch 39):
  * - TESWaterReflections::Update (ID 31373) renders the water cubemap only through
@@ -51,36 +50,11 @@ namespace Batch39Engine
 {
 	struct Settings
 	{
-		// 1. Water reflection cubemap. (39b) Fewer faces and no LOD trees are on by default: the
-		// user measured a clear saving with no visible change in 39a. LOD objects stay off (they
-		// visibly carry distant mountains and buildings), the hand-off stays off (it lags).
-		bool ReflThrottle = true;                   ///< draw ReflFacesPerUpdate faces every ReflEveryNFrames frames
-		int ReflFacesPerUpdate = 1;                 ///< 1, 2, 3 or 6
-		int ReflEveryNFrames = 1;                   ///< 1..8
-		bool ReflSkipLODTrees = true;               ///< bReflectLODTrees = 0
+		// Water reflection cubemap. LOD objects stay in by default (they visibly carry distant
+		// mountains and buildings), the hand-off stays off (it lags).
 		bool ReflSkipLODObjects = false;            ///< bReflectLODObjects = 0
 		bool ReflHandOffToDynamicCubemaps = false;  ///< no engine cubemap; water uses Dynamic Cubemaps at every distance
-		/// (39b) While handed off, the game's cubemap still draws the sky alone (same round robin):
-		/// Dynamic Cubemaps fills the directions it never saw on screen from it, instead of from a
-		/// cubemap frozen at the moment of the hand-off.
-		bool ReflHandOffKeepSky = true;
-		/// (39b) While handed off, Dynamic Cubemaps refreshes its reflection capture every frame
-		/// (normally once every 6 frames) and blends less with the old capture.
-		bool ReflHandOffFastCapture = true;
-		float ReflHandOffCaptureWeight = 0.75f;  ///< share of a new capture (Dynamic Cubemaps: 0.5)
-
-		// 2. Depth prepass slimming. All off by default. (39b: "grass skips the prepass" removed,
-		// it cost about 4 ms; see the spec's 39a findings.)
-		bool PrepassSkipLODLand = false;  ///< bLodZPrepass = 0
-		bool PrepassFrontToBack = false;  ///< bEnableFrontToBackPrepass = 1
-
-		// 3. Temporal LOD dither.
-		bool TemporalLODDither = true;
-
-		// 4. Texture clarity.
-		bool MipBiasMaterials = true;  ///< DLSS mip bias on the remaining material textures
-		bool MipBiasSpecular = true;   ///< ... and on specular / gloss / environment-mask textures
-		bool Anisotropic16x = true;    ///< stop clamping requested 16x anisotropy to 8x
+		float ReflHandOffCaptureWeight = 0.75f;     ///< share of a new capture while handed off (Dynamic Cubemaps: 0.5)
 	};
 
 	inline Settings settings{};
@@ -88,25 +62,13 @@ namespace Batch39Engine
 	void Load(const json& a_json);
 	json Save();
 
-	// ---- effective state (setting && master && prerequisites) -----------------------------
-	bool ReflThrottleActive();
+	// ---- effective state -------------------------------------------------------------------
 	bool ReflHandOffActive();
-	/// @brief (39b) The game's cubemap keeps drawing the sky only while handed off.
-	bool ReflHandOffKeepSkyActive();
 	/// @brief (39b) Dynamic Cubemaps' reflection capture runs every frame while it feeds water.
 	bool ReflHandOffFastCaptureActive();
-	/// @brief (39b) Weight of a new Dynamic Cubemaps capture (0.5 unless the fast capture is on).
+	/// @brief (39b) Weight of a new Dynamic Cubemaps capture (0.5 unless handed off).
 	float DynamicCubemapCaptureWeight();
-	bool ReflSkipLODTreesActive();
 	bool ReflSkipLODObjectsActive();
-	bool PrepassSkipLODLandActive();
-	bool PrepassFrontToBackActive();
-	bool TemporalLODDitherActive();
-	bool MipBiasMaterialsActive();
-	bool MipBiasSpecularActive();
-	bool Anisotropic16xActive();
-	/// @brief Any switch that leaves geometry out of the prepass (needs the after-opaque depth refresh).
-	bool PrepassSlimmingActive();
 
 	/// @brief SharedData::Batch39Flags (bit layout mirrored in Common/SharedData.hlsli).
 	uint32_t ShaderFlags();
@@ -138,14 +100,6 @@ namespace Batch39Engine
 	/// @brief Bookkeeping after the call (faces actually drawn).
 	void NoteCubemapCall(int a_requestedMask, int a_drawnMask);
 
-	// ---- 2. depth prepass ------------------------------------------------------------------
-	/// @brief Right after the opaque pass: brings the post-prepass depth copies up to date when
-	/// a slimming switch kept geometry out of the prepass.
-	void AfterOpaquePass();
-	/// @brief Per draw (State::Draw), after the engine applied its state: depth writes for
-	/// geometry that skipped the prepass.
-	void OnDraw(RE::BSShader* a_shader, uint32_t a_vertexDescriptor, uint32_t a_pixelDescriptor);
-
 	// ---- 4. anisotropic filtering ----------------------------------------------------------
 	/// @brief Called by the CreateSamplerState hook after the (8x-clamped) sampler was created.
 	using CreateSamplerFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, D3D11_SAMPLER_DESC*, ID3D11SamplerState**);
@@ -157,7 +111,4 @@ namespace Batch39Engine
 
 	/// @brief Water > Water Effects > Reflection Cubemap: the options that stayed in the menu.
 	void DrawWaterReflectionSettings();
-
-	/// @brief Releases resources (shader cache clear / device reset).
-	void ClearShaderCache();
 }

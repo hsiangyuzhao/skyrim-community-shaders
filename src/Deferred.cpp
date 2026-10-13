@@ -716,10 +716,6 @@ void Deferred::EndDeferred()
 	{
 		Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOther);
 
-		// (batch 39, item 2) If a slimming switch kept geometry out of the depth prepass, bring
-		// the post-prepass depth copies up to date before anything below reads them.
-		Batch39Engine::AfterOpaquePass();
-
 		// (batch 37a) Occlusion dry run: max-reduce the finished opaque depth into its own Hi-Z
 		// and queue a readback. Writes only its own textures; a no-op unless the test is running.
 		Util::OcclusionDryRun::OnEndDeferred();
