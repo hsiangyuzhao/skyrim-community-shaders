@@ -75,6 +75,8 @@ namespace Util
 		RayTracing,
 		// (45c) Grass culling submission (every bucket's cull dispatch + LOD count copies), taken out of GrassOptimizations.
 		GrassCulling,
+		// (45 SSS) Screen Space Shadows (sun contact shadows): ray march + edge smoothing.
+		ScreenSpaceShadows,
 		Count
 	};
 

@@ -58,8 +58,8 @@ struct DispatchParameters
 
 	float2 DynamicRes;
 
-	uint DynamicSampleCount;
-	uint DynamicReadCount;
+	// (45 SSS) SAMPLE_COUNT is compiled from the render (dynamic) resolution, so the per-dispatch
+	// DynamicSampleCount / DynamicReadCount loop breaks are gone (the read-loop one never fired).
 
 	bool IgnoreEdgePixels;  // If an edge is detected, the edge pixel will not contribute to the shadow.
 							// If a very flat surface is being lit and rendered at an grazing angles, the edge detect may incorrectly detect multiple 'edge' pixels along that flat surface.
@@ -116,7 +116,13 @@ struct DispatchParameters
 								// If 'PointBorderSampler' is an Unnormalized sampler, then this value can be hard-coded to 1.
 								// The 'USE_HALF_PIXEL_OFFSET' macro might need to be defined if sampling at exact pixel coordinates isn't precise (e.g., if odd patterns appear in the shadow).
 
-	Texture2D<unorm half> DepthTexture;     // Depth Buffer Texture (rasterized non-linear depth)
+	// (45 SSS, upstream) TERRAIN_BLENDING ON -> TerrainBlending's blended depth (R32_FLOAT), which it
+	// swaps into kPOST_ZPREPASS_COPY; must not be declared unorm. OFF -> R24_UNORM_X8 game depth.
+#if defined(TERRAIN_BLENDING)
+	Texture2D<float> DepthTexture;  // Depth Buffer Texture (rasterized non-linear depth, R32_FLOAT)
+#else
+	Texture2D<unorm half> DepthTexture;  // Depth Buffer Texture (rasterized non-linear depth)
+#endif
 	RWTexture2D<unorm half> OutputTexture;  // Output screen-space shadow buffer (typically single-channel, 8bit)
 
 	SamplerState PointBorderSampler;  // A point sampler, with Wrap Mode set to Clamp-To-Border-Color (D3D12_TEXTURE_ADDRESS_MODE_BORDER), and Border Color set to "FarDepthValue" (typically zero), or some other far-depth value out of DepthBounds.
@@ -223,11 +229,8 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 
 	half2 write_xy = floor(pixel_xy);
 
-	[loop] for (i = 0; i < READ_COUNT; i++)
+	[unroll] for (i = 0; i < READ_COUNT; i++)
 	{
-		if (i == inParameters.DynamicSampleCount)
-			break;
-
 		// We sample depth twice per pixel per sample, and interpolate with an edge detect filter
 		// Interpolation should only occur on the minor axis of the ray - major axis coordinates should be at pixel centers
 		half2 read_xy = floor(pixel_xy);
@@ -308,11 +311,8 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 	}
 
 	// Write the shadow depths to LDS
-	[loop] for (i = 0; i < READ_COUNT; i++)
+	[unroll] for (i = 0; i < READ_COUNT; i++)
 	{
-		if (i == inParameters.DynamicSampleCount)
-			break;
-
 		// Perspective correct the shadowing depth, in this space, all light rays are parallel
 		half stored_depth = (shadowing_depth[i] - inParameters.LightCoordinate.z) / sample_distance[i];
 
@@ -370,11 +370,8 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 
 	start_depth = start_depth * depth_scale - z_sign;
 
-	for (i = 0; i < SAMPLE_COUNT; i++)
+	[unroll] for (i = 0; i < SAMPLE_COUNT; i++)
 	{
-		if (i == inParameters.DynamicSampleCount)
-			break;
-
 		half depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
 
 		// By using 4 values, the average shadow can be taken, which can help soften single-pixel shadows.

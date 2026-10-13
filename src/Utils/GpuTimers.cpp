@@ -123,6 +123,9 @@ namespace Util
 			{ "Grass Culling",
 				"GPU time for Grass Optimizations' per-instance culling: one compute pass per visible grass type deciding which grass "
 				"is drawn and at which detail level. Not counted in the Grass Optimizations row. Advanced > NVIDIA can speed it up." },
+			{ "Screen Space Shadows",
+				"GPU time for Screen Space Shadows (small sun shadows the shadow map misses): the ray march and, when on, "
+				"Edge Smoothing. Only runs outdoors with the full sky." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

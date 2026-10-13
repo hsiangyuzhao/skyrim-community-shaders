@@ -58,13 +58,13 @@ public:
 
 		float2 DynamicRes;
 
-		uint DynamicSampleCount;
-		uint DynamicReadCount;
-		float pad0[2];
+		// (45 SSS) DynamicSampleCount / DynamicReadCount removed: SAMPLE_COUNT is compiled from the
+		// render size, so the shader no longer needs a runtime loop limit.
 
 		BendSettings settings;
 	};
 	STATIC_ASSERT_ALIGNAS_16(RaymarchCB);
+	static_assert(offsetof(RaymarchCB, settings) == 48, "RaymarchCB must match ScreenSpaceShadows/RaymarchCB.hlsli");
 
 	ID3D11SamplerState* pointBorderSampler = nullptr;
 
@@ -79,7 +79,12 @@ public:
 	virtual void DrawSettings() override;
 
 	virtual void ClearShaderCache() override;
-	uint GetScaledSampleCount(bool a_dynamic);
+	/** @brief Ray sample count for the current render (dynamic) resolution, quantized to steps of 8. */
+	uint GetScaledSampleCount();
+	/// SAMPLE_COUNT the raymarch shaders were last compiled with (0 = none yet).
+	uint lastCompiledSampleCount = 0;
+	/** @brief (Re)compiles the raymarch shaders when the render-size sample count changed. */
+	void CompileRaymarchShaders();
 	ID3D11ComputeShader* GetComputeRaymarch();
 	ID3D11ComputeShader* GetComputeRaymarchRight();
 

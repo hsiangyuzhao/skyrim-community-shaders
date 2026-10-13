@@ -1,6 +1,8 @@
 #include "ScreenSpaceShadows.h"
 
+#include "Features/TerrainBlending.h"
 #include "State.h"
+#include "Utils/GpuTimers.h"
 
 #pragma warning(push)
 #pragma warning(disable: 4838 4244)
@@ -54,59 +56,61 @@ void ScreenSpaceShadows::ClearShaderCache()
 	}
 }
 
-uint ScreenSpaceShadows::GetScaledSampleCount(bool a_dynamic)
+uint ScreenSpaceShadows::GetScaledSampleCount()
 {
-	auto screenSize = globals::state->screenSize;
-
-	if (a_dynamic)
-		screenSize = Util::ConvertToDynamic(globals::state->screenSize);
+	// (45 SSS, upstream c021f3e1d) Scale from the render (dynamic) size, not the output size. Before,
+	// the shader was compiled for the output size (240 samples at 4K) and cut back at run time to the
+	// render-size count (160 at 2560x1440) with a loop break -- same picture, more registers.
+	const float2 renderSize = Util::ConvertToDynamic(globals::state->screenSize);
 
 	// Scale sample count based on both dimensions relative to 1920x1080 reference
-
 	float2 referenceRes = { 1920.0f, 1080.0f };
 	float referenceArea = referenceRes.x * referenceRes.y;
-	float currentArea = screenSize.x * screenSize.y;
+	float currentArea = renderSize.x * renderSize.y;
 	float areaScale = std::sqrt(currentArea / referenceArea);
-	uint scaledSampleCount = static_cast<uint>(std::round(bendSettings.SampleCount * 60 * areaScale));
+	uint scaledSampleCount = static_cast<uint>(std::round(std::clamp(bendSettings.SampleCount, 1u, 4u) * 60 * areaScale));
 
-	return scaledSampleCount;
+	// Quantize to steps of 8 so small dynamic-resolution changes do not recompile the shader.
+	scaledSampleCount = ((scaledSampleCount + 7u) / 8u) * 8u;
+	return std::max(scaledSampleCount, 8u);
+}
+
+void ScreenSpaceShadows::CompileRaymarchShaders()
+{
+	const uint scaledSampleCount = GetScaledSampleCount();
+	if (scaledSampleCount != lastCompiledSampleCount) {
+		lastCompiledSampleCount = scaledSampleCount;
+		ClearShaderCache();
+	}
+
+	if (raymarchCS && (raymarchRightCS || !globals::game::isVR))
+		return;
+
+	const auto sampleCount = std::format("{}", scaledSampleCount);
+	std::vector<std::pair<const char*, const char*>> defines{ { "SAMPLE_COUNT", sampleCount.c_str() } };
+	// (45 SSS, upstream) TerrainBlending swaps its R32_FLOAT blended depth into kPOST_ZPREPASS_COPY;
+	// the shader must then declare the depth as float, not unorm.
+	if (globals::features::terrainBlending.loaded)
+		defines.push_back({ "TERRAIN_BLENDING", "" });
+
+	if (!raymarchCS)
+		raymarchCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", defines, "cs_5_0");
+
+	if (globals::game::isVR && !raymarchRightCS) {
+		defines.push_back({ "RIGHT", "" });
+		raymarchRightCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", defines, "cs_5_0");
+	}
 }
 
 ID3D11ComputeShader* ScreenSpaceShadows::GetComputeRaymarch()
 {
-	static uint sampleCount = bendSettings.SampleCount;
-
-	if (sampleCount != bendSettings.SampleCount) {
-		sampleCount = bendSettings.SampleCount;
-		if (raymarchCS) {
-			raymarchCS->Release();
-			raymarchCS = nullptr;
-		}
-	}
-
-	if (!raymarchCS) {
-		uint scaledSampleCount = GetScaledSampleCount(false);
-		raymarchCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", { { "SAMPLE_COUNT", std::format("{}", scaledSampleCount).c_str() } }, "cs_5_0");
-	}
+	CompileRaymarchShaders();
 	return raymarchCS;
 }
 
 ID3D11ComputeShader* ScreenSpaceShadows::GetComputeRaymarchRight()
 {
-	static uint sampleCount = bendSettings.SampleCount;
-
-	if (sampleCount != bendSettings.SampleCount) {
-		sampleCount = bendSettings.SampleCount;
-		if (raymarchRightCS) {
-			raymarchRightCS->Release();
-			raymarchRightCS = nullptr;
-		}
-	}
-
-	if (!raymarchRightCS) {
-		uint scaledSampleCount = GetScaledSampleCount(false);
-		raymarchRightCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", { { "SAMPLE_COUNT", std::format("{}", scaledSampleCount).c_str() }, { "RIGHT", "" } }, "cs_5_0");
-	}
+	CompileRaymarchShaders();
 	return raymarchRightCS;
 }
 
@@ -161,9 +165,6 @@ void ScreenSpaceShadows::DrawShadows()
 
 	float2 dynamicRes = { viewport->GetRuntimeData().dynamicResolutionWidthRatio, viewport->GetRuntimeData().dynamicResolutionHeightRatio };
 
-	uint dynamicSampleCount = GetScaledSampleCount(true);
-	uint dynamicReadCount = (dynamicSampleCount / 64 + 2);
-
 	// Shared dispatch logic for both VR and non-VR
 	auto DispatchEye = [&](const char* eyeName, ID3D11ComputeShader* shader, const float* lightProj,
 						   float invTexSizeX, float invTexSizeY) {
@@ -200,9 +201,6 @@ void ScreenSpaceShadows::DrawShadows()
 			data.NearDepthValue = 0.0f;
 
 			data.DynamicRes = dynamicRes;
-
-			data.DynamicSampleCount = dynamicSampleCount;
-			data.DynamicReadCount = dynamicReadCount;
 
 			data.InvDepthTextureSize[0] = invTexSizeX;
 			data.InvDepthTextureSize[1] = invTexSizeY;
@@ -254,9 +252,14 @@ void ScreenSpaceShadows::Prepass()
 	float white[4] = { 1, 1, 1, 1 };
 	context->ClearUnorderedAccessViewFloat(screenSpaceShadowsTexture->uav.get(), white);
 
-	if (auto sky = globals::game::sky)
-		if (bendSettings.Enable && sky->mode.get() == RE::Sky::Mode::kFull)
+	if (auto sky = globals::game::sky) {
+		if (bendSettings.Enable && sky->mode.get() == RE::Sky::Mode::kFull) {
+			// (45 SSS) Own row in the Performance Overlay's GPU table (was folded into "Other").
+			Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::ScreenSpaceShadows);
 			DrawShadows();
+			Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::ScreenSpaceShadows);
+		}
+	}
 
 	auto view = screenSpaceShadowsTexture->srv.get();
 	context->PSSetShaderResources(45, 1, &view);
