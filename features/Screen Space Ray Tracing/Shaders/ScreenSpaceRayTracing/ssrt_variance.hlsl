@@ -1,4 +1,6 @@
 #include "ScreenSpaceRayTracing/ssrt_common.hlsli"
+// (45c) Per-warp vote via NvAny; only with NV_SHADER_EXTN (set by C++ when the driver supports it).
+#include "Common/NvShaderExtn.hlsli"
 
 Texture2D<float4> HistoryTexture : register(t0);
 Texture2D<float4> MomentsTexture : register(t1);
@@ -34,7 +36,14 @@ cbuffer DenoiserCB : register(b2)
 #define SSRT_VARIANCE_RADIUS 3
 #define SSRT_VARIANCE_TILE (8 + 2 * SSRT_VARIANCE_RADIUS)  // 14
 
+#if defined(NV_SHADER_EXTN) && NV_SHADER_EXTN
+// (45c) One vote per warp: the 8x8 group is two 32-lane warps (lanes follow the flattened thread
+// index). Every lane of a warp stores the same NvAny result, so the slot needs no initialisation and
+// no atomics, which saves the first barrier and the 64 groupshared atomics of the portable vote.
+groupshared uint g_ssrtRefineWarps[2];
+#else
 groupshared uint g_ssrtRefineLanes;
+#endif
 // View-space normal in .xyz, raw depth in .w. Neighbour roughness is not stored: the
 // original loop decoded it and never used it.
 groupshared float4 g_ssrtVarianceTile[SSRT_VARIANCE_TILE * SSRT_VARIANCE_TILE];
@@ -57,6 +66,15 @@ groupshared float4 g_ssrtVarianceTile[SSRT_VARIANCE_TILE * SSRT_VARIANCE_TILE];
     float history = (inBounds && !isFarPlane) ? MomentsTexture[DTid.xy].z : SSRT_FLOAT_MAX;
 
     // ---- (spec A3) refinement vote; no lane may leave before it completes ----
+#if defined(NV_SHADER_EXTN) && NV_SHADER_EXTN
+    const bool laneRefines = inBounds && !isFarPlane && history <= 2;
+    g_ssrtRefineWarps[(GTid.y * 8 + GTid.x) >> 5] = NvAny(laneRefines);
+    GroupMemoryBarrierWithGroupSync();
+
+    // The group answer is the OR of the two warp votes, i.e. "some lane refines", exactly what the
+    // portable counter below computes.
+    if ((g_ssrtRefineWarps[0] | g_ssrtRefineWarps[1]) != 0u) {
+#else
     if (all(GTid.xy == 0))
         g_ssrtRefineLanes = 0;
     GroupMemoryBarrierWithGroupSync();
@@ -70,6 +88,7 @@ groupshared float4 g_ssrtVarianceTile[SSRT_VARIANCE_TILE * SSRT_VARIANCE_TILE];
     // guards LDS *writes* only -- the barrier that publishes them stays unconditional,
     // which keeps it uniform across the group.
     if (g_ssrtRefineLanes != 0u) {
+#endif
         const int2 tileOrigin = int2(Gid.xy) * 8 - SSRT_VARIANCE_RADIUS;
         for (uint ty = GTid.y; ty < SSRT_VARIANCE_TILE; ty += 8) {
             for (uint tx = GTid.x; tx < SSRT_VARIANCE_TILE; tx += 8) {
