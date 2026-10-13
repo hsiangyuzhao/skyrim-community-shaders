@@ -65,6 +65,8 @@ namespace Util::FrameTrace
 	void OnFramesPresented(uint32_t a_count);
 	/// Grass Optimizations' unsmoothed load work this frame.
 	void OnGrassApply(float a_ms);
+	/// (45) Ray Tracing this frame: D3D12 GPU ms of the last completed submission, CPU ms, BLAS builds (-1 = off).
+	void OnRayTracing(float a_gpuMs, float a_cpuMs, uint32_t a_builds);
 	/// A raw GPU frame sample (GpuFrameTimer), for the row of that frame.
 	void OnGpuSample(uint64_t a_gpuFrameIndex, float a_workMs, float a_elapsedMs);
 

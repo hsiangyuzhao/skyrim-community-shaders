@@ -43,6 +43,7 @@ struct ExponentialHeightFog;
 struct VariableRateShading;
 struct VolumetricShadows;
 struct DynamicSnow;
+struct RayTracing;
 
 class State;
 class Deferred;
@@ -110,6 +111,7 @@ namespace globals
 		extern VariableRateShading variableRateShading;
 		extern VolumetricShadows volumetricShadows;
 		extern DynamicSnow dynamicSnow;
+		extern RayTracing rayTracing;  // (45) RT sun shadows prototype
 
 		namespace llf
 		{

@@ -4,6 +4,7 @@
 #include "Features/CloudShadows.h"
 #include "Features/DynamicCubemaps.h"
 #include "Features/DynamicSnow.h"
+#include "Features/RayTracing.h"
 #include "Features/ExponentialHeightFog.h"
 #include "Features/ExtendedMaterials.h"
 #include "Features/ExtendedTranslucency.h"
@@ -106,6 +107,7 @@ namespace globals
 		VariableRateShading variableRateShading{};
 		VolumetricShadows volumetricShadows{};
 		DynamicSnow dynamicSnow{};
+		RayTracing rayTracing{};
 
 		namespace llf
 		{

@@ -10,6 +10,7 @@
 #include "Features/IBL.h"
 #include "Features/NRD.h"
 #include "Features/PhysicalSky.h"
+#include "Features/RayTracing.h"
 #include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpaceRayTracing.h"
 #include "Features/Skylighting.h"
@@ -722,6 +723,10 @@ void Deferred::EndDeferred()
 
 		DeferredPasses();  // Perform deferred passes and composite forward buffers
 
+		// (45) Ray Tracing debug views over the lit opaque scene (no-op unless one is selected).
+		if (globals::features::rayTracing.loaded)
+			globals::features::rayTracing.DrawDebugOverlay();
+
 		// Measures the lit opaque scene for next frame's shading rates. Our work, so it stays
 		// in the CsOther scope; its dispatches are billed to "our timed passes" by GpuPassTimers.
 		globals::features::variableRateShading.AnalyzeFrame();
@@ -899,6 +904,11 @@ ID3D11ComputeShader* Deferred::GetComputeMainCompositeInterior()
 
 void Deferred::Hooks::Main_RenderShadowMaps::thunk()
 {
+	// (45) Before any shadow map is drawn: whether the sun cascades leave out the casters Ray
+	// Tracing covers this frame. Nothing is latched while Ray Tracing is off.
+	if (globals::features::rayTracing.loaded)
+		globals::features::rayTracing.LatchFrame();
+
 	// (batch 36) The engine's shadow map pass; the per-light hooks split it further.
 	{
 		Util::GpuPhaseScope gpuPhase(Util::GpuScope::ShadowMaps);

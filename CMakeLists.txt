@@ -152,6 +152,55 @@ target_link_libraries(
         ${DETOURS_LIBRARY}
 )
 
+# (45) Ray Tracing: the D3D12 ray query shader (cs_6_5) is compiled at build time with the
+# Windows SDK's own dxc.exe (its dxil.dll in the same folder signs the DXIL) and embedded in the
+# DLL, so nothing new is shipped and no shader compiler is needed at runtime. Only the Windows
+# SDK is searched; no DXC is downloaded.
+find_program(
+    CS_SDK_DXC
+    dxc
+    PATHS "$ENV{WindowsSdkVerBinPath}/x64"
+    NO_DEFAULT_PATH
+)
+if(NOT CS_SDK_DXC)
+    file(
+        GLOB _cs_sdk_dxcs
+        "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64/dxc.exe"
+    )
+    if(_cs_sdk_dxcs)
+        list(SORT _cs_sdk_dxcs COMPARE NATURAL ORDER DESCENDING)
+        list(GET _cs_sdk_dxcs 0 _cs_sdk_dxc)
+        set(CS_SDK_DXC "${_cs_sdk_dxc}" CACHE FILEPATH "Windows SDK dxc.exe" FORCE)
+    endif()
+endif()
+if(NOT CS_SDK_DXC)
+    message(
+        FATAL_ERROR
+        "Ray Tracing needs dxc.exe from the Windows 10/11 SDK (bin/<version>/x64)."
+    )
+endif()
+message("\tRay Tracing DXIL compiler: ${CS_SDK_DXC}")
+set(CS_RT_SHADER_SOURCE
+    "${CMAKE_SOURCE_DIR}/src/Features/RayTracing/Shaders/TraceShadowsCS.hlsl"
+)
+set(CS_RT_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/TraceShadowsCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -Fh
+        "${CS_RT_SHADER_HEADER}" -Vn g_TraceShadowsCS "${CS_RT_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (TraceShadowsCS, cs_6_5)"
+    VERBATIM
+)
+target_sources("${PROJECT_NAME}" PRIVATE "${CS_RT_SHADER_HEADER}")
+target_include_directories(
+    "${PROJECT_NAME}"
+    PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated"
+)
+
 # https://gitlab.kitware.com/cmake/cmake/-/issues/24922#note_1371990
 if(MSVC_VERSION GREATER_EQUAL 1936 AND MSVC_IDE) # 17.6+
     # When using /std:c++latest, "Build ISO C++23 Standard Library Modules" defaults to "Yes".

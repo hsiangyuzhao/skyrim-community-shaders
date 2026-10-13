@@ -117,6 +117,9 @@ namespace Util
 			{ "Vanilla HDR prep",
 				"GPU time of the game's own HDR downsample, eye adaptation and bloom. With Disable Vanilla Tonemapping on, nothing "
 				"shows them; Post Processing > Skip Vanilla HDR Passes skips them when nothing else needs them (the row then disappears)." },
+			{ "Ray Tracing",
+				"GPU time of ray-traced sun shadows as the frame sees it: copying depth for the ray tracer, waiting for its D3D12 work "
+				"(building the scene and tracing), and merging the result into the shadow mask. The D3D12 part alone is on the Ray Tracing page." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
@@ -716,6 +719,9 @@ namespace Util
 				"CPU time spent sending terrain shadow work to the GPU." },
 			{ "NRD", "NRD Guides",
 				"CPU time spent preparing the extra inputs the REBLUR denoiser needs." },
+			{ "RayTracing", "Ray Tracing",
+				"CPU time of ray-traced sun shadows: capturing newly loaded cells (spread over frames, about 1.5 ms at most), "
+				"the per-frame scene list, and recording the D3D12 work. Its GPU cost is in the Ray Tracing row of the GPU table." },
 			{ "Upscaling", "Upscaling",
 				"CPU time for the upscaler's per-frame bookkeeping. The upscaling itself is not included." },
 			{ "Deferred Composite", "Deferred Composite",

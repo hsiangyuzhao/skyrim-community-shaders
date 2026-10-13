@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 #include "Deferred.h"
+#include "Features/RayTracing/CasterFilter.h"
 #include "Features/DynamicCubemaps.h"
 #include "Globals.h"
 #include "Menu.h"
@@ -107,6 +108,10 @@ namespace Batch39Engine
 		{
 			static void thunk(RE::BSRenderPass* a_pass, uint32_t a_technique, bool a_alphaTest, uint32_t a_renderFlags)
 			{
+				// (45) Ray Tracing: a caster the ray tracer covers is not drawn into the sun cascades.
+				// One branch unless Ray Tracing latched this frame (CasterFilter.h).
+				if (RayTracingCasterFilter::ShouldSkip(a_pass))
+					return;
 				RE::BSRenderPass* previous = g_currentPass;
 				g_currentPass = a_pass;
 				func(a_pass, a_technique, a_alphaTest, a_renderFlags);

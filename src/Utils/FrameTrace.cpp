@@ -35,6 +35,9 @@ namespace Util::FrameTrace
 			uint32_t firstSeen = 0;
 			uint32_t fgPresented = 0;
 			float grassApplyMs = -1.0f;
+			float rtGpuMs = -1.0f;  // (45) Ray Tracing: D3D12 GPU ms (last completed), CPU ms, BLAS builds
+			float rtCpuMs = -1.0f;
+			uint32_t rtBuilds = 0;
 		};
 		FrameAcc g_frame;
 		int64_t g_simStart = 0;
@@ -98,6 +101,9 @@ namespace Util::FrameTrace
 			float playerSpeed = 0.0f;
 			uint32_t fgPresented = 0;
 			float grassApplyMs = -1.0f;
+			float rtGpuMs = -1.0f;
+			float rtCpuMs = -1.0f;
+			uint32_t rtBuilds = 0;
 			uint64_t gpuFrameIndex = 0;
 			float gpuWorkMs = -1.0f;
 			float gpuElapsedMs = -1.0f;
@@ -204,7 +210,7 @@ namespace Util::FrameTrace
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
 					   "first_seen_geometry,shader_miss_async,shader_miss_sync,cell_attach,cell_detach,cam_yaw_dps,cam_pitch_dps,player_speed,"
-					   "gpu_work_ms,gpu_elapsed_ms,fg_presented,grass_apply_ms,"
+					   "gpu_work_ms,gpu_elapsed_ms,fg_presented,grass_apply_ms,rt_gpu_ms,rt_cpu_ms,rt_blas_builds,"
 					   "reflex_frame,reflex_sim_end,reflex_submit_start,reflex_submit_end,reflex_present_start,reflex_present_end,"
 					   "reflex_driver_start,reflex_driver_end,reflex_queue_start,reflex_queue_end,reflex_gpu_start,reflex_gpu_end,reflex_latency_ms,"
 					   "reflex_markers";
@@ -227,12 +233,12 @@ namespace Util::FrameTrace
 						driverTotal += d;
 					const float busy = std::max(0.0f, r.frameMs - r.presentWaitMs - r.reflexSleepMs);
 					const float perDraw = r.draws ? (r.ownDrawHookMs + r.ownSetupGeometryMs) * 1000.0f / static_cast<float>(r.draws) : 0.0f;
-					out << std::format("{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{:.3f},{},{},{},{},{},{:.1f},{:.1f},{:.1f},{:.3f},{:.3f},{},{:.3f},",
+					out << std::format("{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{:.3f},{},{},{},{},{},{:.1f},{:.1f},{:.1f},{:.3f},{:.3f},{},{:.3f},{:.3f},{:.3f},{},",
 						index++, r.tMs, r.frameMs, r.cpuFrameMs, busy, r.presentWaitMs, r.reflexSleepMs,
 						r.driver[0], r.driver[1], r.driver[2], r.driver[3], r.driver[4], driverTotal,
 						r.ownDrawHookMs, r.ownSetupGeometryMs, r.permutationUploadMs, r.draws, r.lightingDraws, r.utilityDraws, perDraw,
 						r.firstSeen, r.shaderAsync, r.shaderSync, r.cellAttach, r.cellDetach, r.yawRate, r.pitchRate, r.playerSpeed,
-						r.gpuWorkMs, r.gpuElapsedMs, r.fgPresented, r.grassApplyMs);
+						r.gpuWorkMs, r.gpuElapsedMs, r.fgPresented, r.grassApplyMs, r.rtGpuMs, r.rtCpuMs, r.rtBuilds);
 					auto it = r.reflexFrame != UINT32_MAX ? a_reflex.find(r.reflexFrame) : a_reflex.end();
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r);
@@ -553,6 +559,12 @@ namespace Util::FrameTrace
 
 	void OnFramesPresented(uint32_t a_count) { g_frame.fgPresented = a_count; }
 	void OnGrassApply(float a_ms) { g_frame.grassApplyMs = a_ms; }
+	void OnRayTracing(float a_gpuMs, float a_cpuMs, uint32_t a_builds)
+	{
+		g_frame.rtGpuMs = a_gpuMs;
+		g_frame.rtCpuMs = a_cpuMs;
+		g_frame.rtBuilds = a_builds;
+	}
 
 	void OnGpuSample(uint64_t a_gpuFrameIndex, float a_workMs, float a_elapsedMs)
 	{
@@ -711,6 +723,9 @@ namespace Util::FrameTrace
 				r.lightingDraws = g_frame.lightingDraws;
 				r.fgPresented = g_frame.fgPresented;
 				r.grassApplyMs = g_frame.grassApplyMs;
+				r.rtGpuMs = g_frame.rtGpuMs;
+				r.rtCpuMs = g_frame.rtCpuMs;
+				r.rtBuilds = g_frame.rtBuilds;
 				r.gpuFrameIndex = a_gpuFrameIndex;
 				r.reflexFrame = globals::features::upscaling.streamline.frameTokenIndex;
 				r.engine = engine;

@@ -5,6 +5,7 @@
 #include "Features/CloudShadows.h"
 #include "Features/DynamicCubemaps.h"
 #include "Features/DynamicSnow.h"
+#include "Features/RayTracing.h"
 #include "Features/ExponentialHeightFog.h"
 #include "Features/ExtendedMaterials.h"
 #include "Features/ExtendedTranslucency.h"
@@ -227,6 +228,7 @@ const std::vector<Feature*>& Feature::GetFeatureList()
 		&globals::features::grassCollision,
 		&globals::features::grassOptimizations,
 		&globals::features::screenSpaceShadows,
+		&globals::features::rayTracing,  // (45) right after Screen Space Shadows: its Prepass edits that texture
 		&globals::features::extendedMaterials,
 		&globals::features::wetnessEffects,
 		&globals::features::lightLimitFix,

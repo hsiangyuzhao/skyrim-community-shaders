@@ -1,6 +1,7 @@
 #include "Utils/GpuPhaseTimeline.h"
 
 #include "Features/PerformanceOverlay.h"
+#include "Features/RayTracing/CasterFilter.h"
 #include "Globals.h"
 #include "Menu.h"
 #include "ShaderCache.h"
@@ -342,6 +343,12 @@ namespace Util
 		{
 			static void thunk(RE::BSShadowLight* a_light, RE::BSShadowLight::ShadowmapDescriptor* a_desc, uintptr_t a3, uintptr_t a4)
 			{
+				// (45) Ray Tracing keeps the casters it covers out of the sun cascades only (CasterFilter.h).
+				struct SunCascadeBracket
+				{
+					SunCascadeBracket() { RayTracingCasterFilter::SetInSunCascade(Kind == SliceKind::Sun); }
+					~SunCascadeBracket() { RayTracingCasterFilter::SetInSunCascade(false); }
+				} sunCascade;
 				auto* timeline = GpuPhaseTimeline::GetSingleton();
 				if (!timeline->IsRecording() || !a_desc) {
 					func(a_light, a_desc, a3, a4);
