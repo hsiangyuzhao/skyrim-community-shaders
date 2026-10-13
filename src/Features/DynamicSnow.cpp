@@ -2090,6 +2090,7 @@ void DynamicSnow::Prepass()
 
 void DynamicSnow::DrawSettings()
 {
+	// (44k) Main view: the everyday switches. The rest is under Advanced, status lines under Debug.
 	if (ImGui::TreeNodeEx("Snow Accumulation", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Enable Snow Accumulation", &settings.EnableAccumulation);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -2099,71 +2100,6 @@ void DynamicSnow::DrawSettings()
 				"Surfaces that are already snow (snowy ground textures, snow-covered rocks) are left as they are.");
 
 		ImGui::BeginDisabled(!settings.EnableAccumulation);
-		ImGui::Combo("When It Builds Up", &settings.Condition, kConditionNames, static_cast<int>(SnowCondition::Count));
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Which weather counts as snowing.\n"
-				"- Snow weather (any region): any weather marked as snow, wherever it happens. Weather mods that bring snow\n"
-				"  to the south (Whiterun, Riften) then whiten those regions too. Default.\n"
-				"- Snow weather in a cold region: as above, but only where the region normally gets snow\n"
-				"  (see Cold Region Threshold). Use this if snow in the south looks wrong to you.\n"
-				"- Snow weather, or any rain/snow in a cold region: also treats rain in a cold region as snow,\n"
-				"  for weather mods that rain in the north.");
-
-		ImGui::Checkbox("Snow Only in Cold Regions", &settings.ColdRegionsOnly);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"Skyrim has one weather for the whole map, so when it snows up north the snow used to build up\n"
-				"everywhere you can see, Whiterun's plains included.\n"
-				"On (default): snow only builds up in cold regions (see Cold Region Threshold), with a soft edge.\n"
-				"Off: the same amount everywhere (the old behaviour).");
-		ImGui::Checkbox("No Snow on Distant LOD", &settings.NoLodSnow);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"On (default): far-away terrain, buildings and trees (LOD) get no built-up snow; their own textures\n"
-				"already show snow where there should be some. Nearby snow thins out over the last cell before\n"
-				"the far-away terrain begins, so there is no line.\n"
-				"Off: far-away terrain and buildings take the snow too, and distant trees get a white tint (the old behaviour).");
-
-		ImGui::BeginDisabled(settings.Condition == static_cast<int>(SnowCondition::SnowWeather) && !settings.ColdRegionsOnly);
-		ImGui::SliderFloat("Cold Region Threshold", &settings.ColdRegionSnowShare, 0.05f, 0.9f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"A region counts as cold when at least this share of the weathers it can have are snow weathers\n"
-				"(read from the region's weather list, or the worldspace's climate where there is none).\n"
-				"Used by Snow Only in Cold Regions and by the cold-region choices of When It Builds Up.");
-
-		// (44i) Snow line and the looser snow test.
-		{
-			const std::string lineFormat = settings.SnowLineHeight > 0.0f ?
-			                                   std::format("%.0f units ({:.0f} m)", settings.SnowLineHeight * 0.01428f) :
-			                                   std::string("off");
-			ImGui::SliderFloat("Snow Line Height", &settings.SnowLineHeight, 0.0f, 40000.0f, lineFormat.c_str());
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"Above this height everything counts as cold, whatever region it is in: mountain tops such as\n"
-					"High Hrothgar and the Throat of the World get snow even when their region is not a cold one.\n"
-					"0 = off. Your own height is shown below (\"Your height\"); Whiterun is about -3500, Riften about 9800.");
-			ImGui::BeginDisabled(settings.SnowLineHeight <= 0.0f);
-			const std::string fadeFormat = std::format("%.0f units ({:.0f} m)", settings.SnowLineFade * 0.01428f);
-			ImGui::SliderFloat("Snow Line Fade", &settings.SnowLineFade, 500.0f, 16000.0f, fadeFormat.c_str());
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("How far below the snow line the snow starts to appear (none there, full at the line).");
-			ImGui::EndDisabled();
-			settings.SnowLineHeight = std::max(settings.SnowLineHeight, 0.0f);
-			settings.SnowLineFade = std::max(settings.SnowLineFade, 1.0f);
-		}
-		ImGui::EndDisabled();
-		{
-			if (ImGui::Checkbox("Count Snow by Precipitation Particles", &settings.ParticleSnowTest))
-				coldCacheCell = nullptr;  // every region's share changes; the cold map rebuilds itself
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"Off (default): a weather counts as snow only when it is classified as a snow weather.\n"
-					"On: also when its falling particles are snow (particle type or a snow particle texture),\n"
-					"for weather mods whose snowstorms are not classified as snow. Changes which regions are cold.");
-		}
-
 		ImGui::SliderFloat("Accumulation Speed", &settings.AccumulationHours, 0.1f, 12.0f, "%.1f game hours to full", ImGuiSliderFlags_Logarithmic);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			auto* calendar = RE::Calendar::GetSingleton();
@@ -2209,55 +2145,7 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextUnformatted(
 				"Off (default): people, creatures and everything they wear or carry stay free of built-up snow.\n"
 				"On: their upward-facing parts (shoulders, hoods) get snow like the ground does.");
-
-		if (ImGui::TreeNodeEx("Snow Look")) {
-			ImGui::ColorEdit3("Snow Colour", &settings.SnowColor.x);
-			ImGui::SliderFloat("Snow Roughness", &settings.SnowRoughness, 0.3f, 1.0f, "%.2f");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("Snow never makes a surface shinier than it was; this only roughens shiny surfaces under snow.");
-			ImGui::TreePop();
-		}
 		ImGui::EndDisabled();
-
-		ImGui::Spacing();
-		ImGui::Text("Now: %s", !AccumulationActive() ? "off" :
-							   !status.exterior      ? "indoors (kept as it was)" :
-							   status.snowing        ? "snowing, building up" :
-							   status.amount > 0.0f  ? "melting" :
-													   "no snow");
-		ImGui::Text("Accumulated: %.0f%%   Snowfall: %.0f%%", status.amount * 100.0f, status.snowfall * 100.0f);
-		if (settings.Condition != static_cast<int>(SnowCondition::SnowWeather))
-			ImGui::Text("Region: %s (%s)", status.region.empty() ? "-" : status.region.c_str(),
-				!status.coldRegion ? "not cold" : status.aboveSnowLine ? "cold: above the snow line" : "cold");
-		if (AccumulationActive() && status.exterior) {
-			if (!settings.ColdRegionsOnly)
-				ImGui::TextDisabled("Cold map: off (same amount everywhere)");
-			else if (status.coldMapValid)
-				ImGui::Text("Cold map: %u regions (%u cold), %.0f%% of the map cold, here %.0f%%",
-					status.coldMapRegions, status.coldMapColdRegions, status.coldMapColdPercent, status.playerMask * 100.0f);
-			else
-				ImGui::Text("Cold map: %s", status.coldMapNote.empty() ? "not built yet" : status.coldMapNote.c_str());
-			if (settings.NoLodSnow)
-				ImGui::TextDisabled("Near snow: %u x %u loaded cells, thins out %.0f..%.0f units from their centre",
-					status.gridsToLoad, status.gridsToLoad, status.fadeStart, status.fadeEnd);
-		}
-		// (44i) Height readout for tuning the snow line, and what decides "cold" here.
-		if (auto* player = RE::PlayerCharacter::GetSingleton(); player && status.exterior) {
-			const float z = player->GetPositionZ();
-			if (settings.SnowLineHeight > 0.0f)
-				ImGui::Text("Your height: %.0f (%.0f m), snow line: %.0f (snow here %.0f%%)", z, z * 0.01428f, settings.SnowLineHeight, SnowLineFactor(z) * 100.0f);
-			else
-				ImGui::Text("Your height: %.0f (%.0f m), snow line: off", z, z * 0.01428f);
-			if (ImGui::TreeNodeEx("Regions Here (diagnostics)")) {
-				auto* cell = player->GetParentCell();
-				if (cell != diagCell || std::chrono::steady_clock::now() - diagTime >= std::chrono::seconds(1))
-					UpdateRegionDiagnostics();
-				for (const auto& line : status.regionLines)
-					ImGui::TextUnformatted(line.c_str());
-				ImGui::TextDisabled("With Show Cold-Region Map (Debug) on, this is also written to the log whenever you enter a new cell.");
-				ImGui::TreePop();
-			}
-		}
 		ImGui::TreePop();
 	}
 
@@ -2300,7 +2188,89 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextUnformatted(
 				"Bodies being dragged or sliding, and loose objects moving through snow, leave trenches\n"
 				"(from their collision shapes).");
+		ImGui::EndDisabled();
+		ImGui::TreePop();
+	}
 
+	ImGui::Spacing();
+
+	if (ImGui::TreeNodeEx("Advanced")) {
+		ImGui::BeginDisabled(!settings.EnableAccumulation);
+		ImGui::Combo("When It Builds Up", &settings.Condition, kConditionNames, static_cast<int>(SnowCondition::Count));
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Which weather counts as snowing.\n"
+				"- Snow weather (any region): any weather marked as snow, wherever it happens. Weather mods that bring snow\n"
+				"  to the south (Whiterun, Riften) then whiten those regions too. Default.\n"
+				"- Snow weather in a cold region: as above, but only where the region normally gets snow\n"
+				"  (see Cold Region Threshold). Use this if snow in the south looks wrong to you.\n"
+				"- Snow weather, or any rain/snow in a cold region: also treats rain in a cold region as snow,\n"
+				"  for weather mods that rain in the north.");
+
+		ImGui::Checkbox("Snow Only in Cold Regions", &settings.ColdRegionsOnly);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"Skyrim has one weather for the whole map, so when it snows up north the snow used to build up\n"
+				"everywhere you can see, Whiterun's plains included.\n"
+				"On (default): snow only builds up in cold regions (see Cold Region Threshold), with a soft edge.\n"
+				"Off: the same amount everywhere (the old behaviour).");
+		ImGui::Checkbox("No Snow on Distant LOD", &settings.NoLodSnow);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"On (default): far-away terrain, buildings and trees (LOD) get no built-up snow; their own textures\n"
+				"already show snow where there should be some. Nearby snow thins out over the last cell before\n"
+				"the far-away terrain begins, so there is no line.\n"
+				"Off: far-away terrain and buildings take the snow too, and distant trees get a white tint (the old behaviour).");
+
+		ImGui::BeginDisabled(settings.Condition == static_cast<int>(SnowCondition::SnowWeather) && !settings.ColdRegionsOnly);
+		ImGui::SliderFloat("Cold Region Threshold", &settings.ColdRegionSnowShare, 0.05f, 0.9f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"A region counts as cold when at least this share of the weathers it can have are snow weathers\n"
+				"(read from the region's weather list, or the worldspace's climate where there is none).\n"
+				"Used by Snow Only in Cold Regions and by the cold-region choices of When It Builds Up.");
+
+		// (44i) Snow line and the looser snow test.
+		{
+			const std::string lineFormat = settings.SnowLineHeight > 0.0f ?
+			                                   std::format("%.0f units ({:.0f} m)", settings.SnowLineHeight * 0.01428f) :
+			                                   std::string("off");
+			ImGui::SliderFloat("Snow Line Height", &settings.SnowLineHeight, 0.0f, 40000.0f, lineFormat.c_str());
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted(
+					"Above this height everything counts as cold, whatever region it is in: mountain tops such as\n"
+					"High Hrothgar and the Throat of the World get snow even when their region is not a cold one.\n"
+					"0 = off. Your own height is shown under Debug (\"Your height\"); Whiterun is about -3500, Riften about 9800.");
+			ImGui::BeginDisabled(settings.SnowLineHeight <= 0.0f);
+			const std::string fadeFormat = std::format("%.0f units ({:.0f} m)", settings.SnowLineFade * 0.01428f);
+			ImGui::SliderFloat("Snow Line Fade", &settings.SnowLineFade, 500.0f, 16000.0f, fadeFormat.c_str());
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("How far below the snow line the snow starts to appear (none there, full at the line).");
+			ImGui::EndDisabled();
+			settings.SnowLineHeight = std::max(settings.SnowLineHeight, 0.0f);
+			settings.SnowLineFade = std::max(settings.SnowLineFade, 1.0f);
+		}
+		ImGui::EndDisabled();
+		{
+			if (ImGui::Checkbox("Count Snow by Precipitation Particles", &settings.ParticleSnowTest))
+				coldCacheCell = nullptr;  // every region's share changes; the cold map rebuilds itself
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted(
+					"Off (default): a weather counts as snow only when it is classified as a snow weather.\n"
+					"On: also when its falling particles are snow (particle type or a snow particle texture),\n"
+					"for weather mods whose snowstorms are not classified as snow. Changes which regions are cold.");
+		}
+
+		if (ImGui::TreeNodeEx("Snow Look")) {
+			ImGui::ColorEdit3("Snow Colour", &settings.SnowColor.x);
+			ImGui::SliderFloat("Snow Roughness", &settings.SnowRoughness, 0.3f, 1.0f, "%.2f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Snow never makes a surface shinier than it was; this only roughens shiny surfaces under snow.");
+			ImGui::TreePop();
+		}
+		ImGui::EndDisabled();
+
+		ImGui::BeginDisabled(!settings.EnableTrails);
 		if (ImGui::TreeNodeEx("Print Look")) {
 			ImGui::SliderFloat("Print Rim", &settings.TrailRim, 0.0f, 1.0f, "%.2f");
 			if (auto _tt = Util::HoverTooltipWrapper())
@@ -2329,15 +2299,6 @@ void DynamicSnow::DrawSettings()
 				"4096 gives the sharpest prints; it costs 64 MB of video memory and its refill pass touches 4x more memory.");
 		// (44h) "Refill Without a Map Pass (44e)" and "Pause When No Snow Is Near (44e)" removed: both always on.
 		ImGui::EndDisabled();
-
-		ImGui::Spacing();
-		ImGui::Text("Now: %s", !TrailsActive() ? "off" : !status.exterior ? "indoors" :
-													 status.trailsDrawn   ? "on" :
-																			"starting");
-		if (status.trailsDrawn)
-			ImGui::Text("Actors tracked: %u   Prints this frame: %u (trenches %u)   Map: %u x %u", status.actorsTracked, status.stamps, status.bodyStamps, status.trailMapSize, status.trailMapSize);
-		if (status.exterior && TrailsActive())
-			ImGui::Text("Map upkeep: %s", status.trailUpkeep);
 		ImGui::TreePop();
 	}
 
@@ -2357,6 +2318,56 @@ void DynamicSnow::DrawSettings()
 				"(warm regions, distant LOD, the edge of the loaded area). Outdoors only.");
 		if (status.coldMapValid)
 			ImGui::TextDisabled("Map: %u x %u texels, %s, built in %.1f ms", status.coldMapWidth, status.coldMapHeight, status.coldMapNote.c_str(), status.coldMapBuildMs);
+
+		// (44k) Status lines, moved here from the main view.
+		ImGui::SeparatorText("Snow Accumulation");
+		ImGui::Text("Now: %s", !AccumulationActive() ? "off" :
+							   !status.exterior      ? "indoors (kept as it was)" :
+							   status.snowing        ? "snowing, building up" :
+							   status.amount > 0.0f  ? "melting" :
+													   "no snow");
+		ImGui::Text("Accumulated: %.0f%%   Snowfall: %.0f%%", status.amount * 100.0f, status.snowfall * 100.0f);
+		if (settings.Condition != static_cast<int>(SnowCondition::SnowWeather))
+			ImGui::Text("Region: %s (%s)", status.region.empty() ? "-" : status.region.c_str(),
+				!status.coldRegion ? "not cold" : status.aboveSnowLine ? "cold: above the snow line" : "cold");
+		if (AccumulationActive() && status.exterior) {
+			if (!settings.ColdRegionsOnly)
+				ImGui::TextDisabled("Cold map: off (same amount everywhere)");
+			else if (status.coldMapValid)
+				ImGui::Text("Cold map: %u regions (%u cold), %.0f%% of the map cold, here %.0f%%",
+					status.coldMapRegions, status.coldMapColdRegions, status.coldMapColdPercent, status.playerMask * 100.0f);
+			else
+				ImGui::Text("Cold map: %s", status.coldMapNote.empty() ? "not built yet" : status.coldMapNote.c_str());
+			if (settings.NoLodSnow)
+				ImGui::TextDisabled("Near snow: %u x %u loaded cells, thins out %.0f..%.0f units from their centre",
+					status.gridsToLoad, status.gridsToLoad, status.fadeStart, status.fadeEnd);
+		}
+		// (44i) Height readout for tuning the snow line, and what decides "cold" here.
+		if (auto* player = RE::PlayerCharacter::GetSingleton(); player && status.exterior) {
+			const float z = player->GetPositionZ();
+			if (settings.SnowLineHeight > 0.0f)
+				ImGui::Text("Your height: %.0f (%.0f m), snow line: %.0f (snow here %.0f%%)", z, z * 0.01428f, settings.SnowLineHeight, SnowLineFactor(z) * 100.0f);
+			else
+				ImGui::Text("Your height: %.0f (%.0f m), snow line: off", z, z * 0.01428f);
+			if (ImGui::TreeNodeEx("Regions Here (diagnostics)")) {
+				auto* cell = player->GetParentCell();
+				if (cell != diagCell || std::chrono::steady_clock::now() - diagTime >= std::chrono::seconds(1))
+					UpdateRegionDiagnostics();
+				for (const auto& line : status.regionLines)
+					ImGui::TextUnformatted(line.c_str());
+				ImGui::TextDisabled("With Show Cold-Region Map on, this is also written to the log whenever you enter a new cell.");
+				ImGui::TreePop();
+			}
+		}
+
+		ImGui::SeparatorText("Footprints");
+		ImGui::Text("Now: %s", !TrailsActive() ? "off" : !status.exterior ? "indoors" :
+													 status.trailsDrawn   ? "on" :
+																			"starting");
+		if (status.trailsDrawn)
+			ImGui::Text("Actors tracked: %u   Prints this frame: %u (trenches %u)   Map: %u x %u", status.actorsTracked, status.stamps, status.bodyStamps, status.trailMapSize, status.trailMapSize);
+		if (status.exterior && TrailsActive())
+			ImGui::Text("Map upkeep: %s", status.trailUpkeep);
 		ImGui::TreePop();
 	}
 }
