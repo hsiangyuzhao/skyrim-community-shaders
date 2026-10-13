@@ -1,4 +1,6 @@
 #include "DX12SwapChain.h"
+#include "Utils/FrameTrace.h"
+#include "Utils/Screenshot.h"
 
 #include <FidelityFX/api/include/dx12/ffx_api_dx12.hpp>
 #include <dxgi1_6.h>
@@ -264,6 +266,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// (batch 43) Native HDR: the last D3D11 work of the frame, after every Present hook has drawn.
 	// Returns the HDR10 image to show instead of the back buffer, or nullptr.
 	ID3D12Resource* hdrSource = HDROutput::CompositeForPresent();
+	// (44e) Screenshot: exactly the image copied to the swap chain below (HDR10 when hdrSource is set).
+	if (auto* finalImage = hdrSource ? (hdrOutputWrapped ? hdrOutputWrapped->resource11 : nullptr) : (swapChainBufferWrapped ? swapChainBufferWrapped->resource11 : nullptr))
+		Util::Screenshot::OnFinalImage(finalImage, hdrSource != nullptr);
 
 	// Wait for D3D11 to finish
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
@@ -376,6 +381,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			sl::DLSSGState dlssGState{};
 			const bool dlssGStateValid = upscaling.streamline.GetDLSSGState(dlssGState);
 			if (dlssGStateValid) {
+				Util::FrameTrace::OnFramesPresented(dlssGState.numFramesActuallyPresented);
 				// Presented frames since the previous query == presented frames for this
 				// rendered frame, because this is the only per-Present query. Feed the
 				// Performance Overlay a smoothed cadence so it can report a measured

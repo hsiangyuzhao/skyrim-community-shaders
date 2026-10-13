@@ -5,6 +5,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/FrameTrace.h"
 #include "Utils/WinApi.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -987,6 +988,7 @@ void GrassOptimizations::CollectDrawnInstanceCounts(ID3D11DeviceContext* ctx)
 void GrassOptimizations::NoteApplyPending(float a_ms)
 {
 	lastApplyPendingMs = a_ms;
+	Util::FrameTrace::OnGrassApply(a_ms);
 	const auto now = std::chrono::steady_clock::now();
 	if (now - applyPeakWindowStart > std::chrono::seconds(10)) {
 		applyPeakMs = applyPeakWindowMs;

@@ -315,6 +315,9 @@ namespace Util
 
 		Report Get() const;
 
+		/// @brief (44e) Index of the frame whose markers MarkPresentBegin last issued (for the frame trace).
+		uint64_t CurrentFrameIndex() const { return frameIndex; }
+
 		/// @brief Releases every query and clears all state. Called automatically on a
 		///        device change, like GpuPassTimers::Reset().
 		void Reset();

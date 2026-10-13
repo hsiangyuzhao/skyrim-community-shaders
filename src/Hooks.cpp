@@ -9,6 +9,8 @@
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "Utils/FrameTrace.h"
+#include "Utils/Screenshot.h"
 #include "TruePBR.h"
 #include "Util.h"
 #include "Utils/ABCompare.h"
@@ -236,6 +238,22 @@ namespace LightingExtensions
 		static void thunk(RE::BSShader* shader, RE::BSRenderPass* pass, uint32_t renderFlags)
 		{
 			func(shader, pass, renderFlags);
+			const bool timed = Util::FrameTrace::Active();
+			const int64_t t0 = timed ? Util::FrameTrace::Now() : 0;
+			const double d0 = timed ? Util::FrameTrace::DriverMsSoFar() : 0.0;
+			struct Done
+			{
+				bool on;
+				int64_t t;
+				double d;
+				~Done()
+				{
+					if (on)
+						Util::FrameTrace::AddOwnSetupGeometry(t, d);
+				}
+			} done{ timed, t0, d0 };
+			if (timed)
+				Util::FrameTrace::OnLightingGeometry(pass->geometry);
 
 			auto state = globals::state;
 
@@ -332,6 +350,9 @@ struct IDXGISwapChain_Present
 			menu->DrawOverlay();
 			HDROutput::EndImGui();
 		}
+		// (44e) Screenshot of the presented frame (D3D11 swap chain path; the D3D12 path captures after its HDR composite).
+		Util::Screenshot::Poll();
+		Util::Screenshot::OnD3D11Present(This);
 		// Close the GPU frame timeline right before the real Present and open the next one
 		// right after it, so its chain spans exactly the frame's own rendering.
 		auto* gpuTimeline = Util::GpuPhaseTimeline::GetSingleton();
@@ -367,7 +388,10 @@ struct IDXGISwapChain_Present
 		// nested. Also a no-op unless the overlay's pass table is on screen.
 		Util::GpuFrameTimer::GetSingleton()->MarkPresentBegin();
 		Util::CpuPassTimers::GetSingleton()->BeginPresentWait();
+		const int64_t presentStart = Util::FrameTrace::Now();
 		HRESULT retval = func(This, SyncInterval, Flags);
+		// (44e) Close this frame's CPU wait split / trace row (measurement only).
+		Util::FrameTrace::OnPresentEnd(presentStart, Util::GpuFrameTimer::GetSingleton()->CurrentFrameIndex());
 		Util::CpuPassTimers::GetSingleton()->EndPresentWait();
 		Util::GpuFrameTimer::GetSingleton()->MarkPresentEnd();
 		gpuTimeline->BeginFrame();
@@ -428,7 +452,16 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
 void Hooks::BSGraphics_SetDirtyStates::thunk(bool isCompute)
 {
 	func(isCompute);
-	globals::state->Draw();
+	// (44e) Our per-draw work, timed without the D3D11 time inside it (measurement only).
+	if (Util::FrameTrace::Active()) {
+		const int64_t t0 = Util::FrameTrace::Now();
+		const double d0 = Util::FrameTrace::DriverMsSoFar();
+		globals::state->Draw();
+		auto* shader = globals::state->currentShader;
+		Util::FrameTrace::AddOwnDrawHook(t0, d0, shader ? static_cast<int>(shader->shaderType.get()) : -1);
+	} else {
+		globals::state->Draw();
+	}
 }
 
 struct ID3D11Device_CreateVertexShader
@@ -617,6 +650,7 @@ namespace Hooks
 			stl::detour_vfunc<23, ID3D11Device_CreateSamplerState>(globals::d3d::device);
 
 			globals::InstallD3DHooks(globals::d3d::context);
+			Util::FrameTrace::InstallContextHooks(globals::d3d::context);
 			Batch39Engine::InstallContextHooks(globals::d3d::context);
 
 			globals::menu->Init();
@@ -900,9 +934,16 @@ namespace Hooks
 				// Before the sleep, so a mode or cap changed in the menu takes effect on the
 				// very frame it is paced by rather than one frame late.
 				upscaling.ApplyReflexSettings();
-				streamline.ReflexSleep();
+				{
+					const bool timed = Util::FrameTrace::Active();
+					const int64_t t0 = timed ? Util::FrameTrace::Now() : 0;
+					streamline.ReflexSleep();
+					if (timed)
+						Util::FrameTrace::OnReflexSleep(t0);
+				}
 				streamline.SetPCLMarker(sl::PCLMarker::eSimulationStart);
 			}
+			Util::FrameTrace::OnSimStart();
 
 			func(a_this, a2);
 

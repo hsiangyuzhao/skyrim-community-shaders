@@ -39,6 +39,8 @@
 #include "Utils/Game.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/FrameTrace.h"
+#include "Utils/Screenshot.h"
 #include "Utils/OcclusionDryRun.h"
 #include "Utils/UI.h"
 #include <nlohmann/json.hpp>
@@ -194,7 +196,14 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SectionVram,
 	SectionView,
 	SectionOcclusion,
-	SectionShadows)
+	SectionShadows,
+	SectionCpuWait,
+	DriverWaitTiming,
+	ScreenshotKey,
+	ScreenshotOnSave,
+	ScreenshotSaveHDR,
+	TraceKey,
+	TraceSeconds)
 
 static const std::unordered_map<RE::BSShader::Type, std::string> kShaderTypeTooltips = {
 	{ RE::BSShader::Type::Grass, "Draw calls using the Grass shader. Typically many, but each is usually cheap.\nWith Grass Optimizations on, each grass type is drawn in one call, so this count is much lower; its section below the GPU tables shows the real grass counts." },
@@ -542,6 +551,12 @@ void PerformanceOverlay::DrawOverlay()
 	if (this->settings.ShowFPS && Section("Frame rate & graphs", this->settings.SectionFrame)) {
 		DrawFPS();
 	}
+
+	// (44e) Real-frame CPU vs GPU, and where the CPU waits. Measurement only.
+	if (Section("CPU vs GPU (real frames)", this->settings.SectionCpuWait,
+			"CPU frame = game update start (after the Reflex sleep) to Present: everything the CPU does for one real frame, "
+			"including time stuck inside D3D11 calls. GPU frame = the GPU work for that frame. Plus where the CPU waits."))
+		DrawCpuWaitSection();
 
 	// Show Draw Calls if enabled
 	if (this->settings.ShowDrawCalls) {
@@ -3696,6 +3711,63 @@ void PerformanceOverlay::DrawViewOptions()
 			"CommunityShaders.log this often. Freeze always writes a full snapshot regardless.");
 	}
 
+	// (44e) Screenshot, frame trace, driver wait timing.
+	if (ImGui::TreeNodeEx("Screenshot and frame trace (44e)", ImGuiTreeNodeFlags_DefaultOpen)) {
+		const auto keyRow = [](const char* a_label, uint32_t& a_key, bool& a_capturing, const char* a_tooltip) {
+			ImGui::PushID(a_label);
+			ImGui::TextUnformatted(a_label);
+			ImGui::SameLine();
+			const auto& palette = Menu::GetSingleton()->GetTheme().StatusPalette;
+			if (a_capturing) {
+				ImGui::TextColored(palette.CurrentHotkey, "press a key... (Esc = keep)");
+			} else {
+				ImGui::TextColored(palette.CurrentHotkey, "%s", a_key ? Util::Input::KeyIdToString(a_key) : "none");
+				ImGui::SameLine();
+				if (ImGui::SmallButton("Change"))
+					a_capturing = true;
+				ImGui::SameLine();
+				if (ImGui::SmallButton("None"))
+					a_key = 0;
+			}
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted(a_tooltip);
+			ImGui::PopID();
+		};
+		keyRow("Screenshot key:", settings.ScreenshotKey, capturingScreenshotKey,
+			"Saves exactly what is on screen, CS menu and overlay included, to\n"
+			"Documents/My Games/Skyrim Special Edition/SKSE/CommunityShaders/Screenshots. HDR is tone-mapped to SDR for the PNG.");
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Take one"))
+			Util::Screenshot::Request();
+		ImGui::Checkbox("Screenshot with every saved frame (F12)", &settings.ScreenshotOnSave);
+		ImGui::Checkbox("HDR: also save the HDR10 image (16-bit PNG)", &settings.ScreenshotSaveHDR);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("The untouched picture sent to the display (PQ, BT.2020). Image viewers show it washed out; it is for analysis.");
+
+		keyRow("Frame trace key:", settings.TraceKey, capturingTraceKey,
+			"Records every real frame for the set number of seconds and writes a CSV next to the perf JSONs\n"
+			"(CPU and GPU frame time, where the CPU waited, DLSS-G frames shown, Reflex latency, grass loading, camera turn rate).");
+		ImGui::SameLine();
+		if (Util::FrameTrace::IsRecording()) {
+			if (ImGui::SmallButton("Stop"))
+				Util::FrameTrace::StopRecording();
+			ImGui::SameLine();
+			ImGui::Text("%.0f s left", Util::FrameTrace::RecordingSecondsLeft());
+		} else if (ImGui::SmallButton("Record")) {
+			Util::FrameTrace::StartRecording(settings.TraceSeconds);
+		}
+		ImGui::SliderFloat("Trace length", &settings.TraceSeconds, 5.0f, 120.0f, "%.0f s");
+		ImGui::Checkbox("Driver wait timing", &settings.DriverWaitTiming);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Times every D3D11 draw, map and copy (two clock reads each) while the overlay is shown or a trace records,\n"
+								   "to show how long the CPU is stuck in the driver. Off = measured runs can be compared with unmeasured ones.");
+		if (const auto f = Util::FrameTrace::LastFile(); !f.empty())
+			ImGui::TextDisabled("Last trace: %s", f.c_str());
+		if (const auto f = Util::Screenshot::LastFile(); !f.empty())
+			ImGui::TextDisabled("Last screenshot: %s", f.c_str());
+		ImGui::TreePop();
+	}
+
 	ImGui::TextUnformatted("Freeze key:");
 	ImGui::SameLine();
 	if (capturingFreezeKey) {
@@ -4403,6 +4475,15 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 
 	// ---- (batch 39, items 1-4) reflection cubemap + depth prepass breakdowns, switches ----
 	j["engine"] = Batch39Engine::DiagnosticsJson();
+	// ---- (44e) real-frame CPU vs GPU, and where the CPU waits ----
+	{
+		auto split = Util::FrameTrace::ToJson();
+		const auto st = Util::FrameTrace::GetSeriesStats(10.0f);
+		split["window_10s"] = { { "frames", st.frames }, { "cpu_frame_avg_ms", st.cpuAvg }, { "cpu_frame_1pct_ms", st.cpuLow1 }, { "cpu_frame_max_ms", st.cpuMax },
+			{ "gpu_frames", st.gpuFrames }, { "gpu_frame_avg_ms", st.gpuAvg }, { "gpu_frame_1pct_ms", st.gpuLow1 }, { "gpu_frame_max_ms", st.gpuMax },
+			{ "cpu_limited_pct", st.cpuLimitedPct } };
+		j["cpu_wait_split"] = std::move(split);
+	}
 	return j;
 }
 
@@ -4425,6 +4506,9 @@ void PerformanceOverlay::SaveFrameJson(const PerfView::ViewConfig& a_cfg)
 		std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
 		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
 		const std::string name = std::format("perf-{}-{:03}.json", stamp, ms);
+		// (44e) The same moment as a screenshot (menu and overlay included), same time stamp.
+		if (settings.ScreenshotOnSave)
+			Util::Screenshot::Request(std::format("perf-{}-{:03}", stamp, ms));
 		path /= name;
 
 		const nlohmann::json j = BuildFrameJson(a_cfg);
@@ -4442,4 +4526,72 @@ void PerformanceOverlay::SaveFrameJson(const PerfView::ViewConfig& a_cfg)
 		logger::error("[PerfSnapshot] Saving frame JSON failed: {}", e.what());
 		FlashMessage(std::string("Save failed: ") + e.what(), true);
 	}
+}
+
+// (44e) Real-frame CPU vs GPU series and where the CPU waits. Measurement only: nothing here feeds
+// the bottleneck label above.
+void PerformanceOverlay::DrawCpuWaitSection()
+{
+	if (!settings.DriverWaitTiming) {
+		ImGui::TextDisabled("Off (Performance Overlay settings > Driver wait timing).");
+		return;
+	}
+	const auto st = Util::FrameTrace::GetSeriesStats(10.0f);
+	static std::vector<float> cpu, gpu;
+	Util::FrameTrace::GetSeries(cpu, gpu, 300);
+	for (auto& g : gpu)
+		g = std::max(g, 0.0f);
+	float top = 16.7f;
+	for (float v : cpu)
+		top = std::max(top, v);
+	for (float v : gpu)
+		top = std::max(top, v);
+	top = std::min(top * 1.1f, 100.0f);
+	const float w = ImGui::GetWindowWidth() * 0.9f;
+	const float h = 40.0f * settings.TextSize;
+	if (!cpu.empty()) {
+		ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(1.0f, 0.6f, 0.2f, 1.0f));
+		const std::string cpuText = std::format("CPU frame {:.1f} ms", cpu.back());
+		ImGui::PlotLines("##cpuframe", cpu.data(), static_cast<int>(cpu.size()), 0, cpuText.c_str(), 0.0f, top, ImVec2(w, h));
+		ImGui::PopStyleColor();
+		ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.3f, 0.7f, 1.0f, 1.0f));
+		const std::string gpuText = st.gpuFrames ? std::format("GPU frame {:.1f} ms", gpu.back()) : std::string("GPU frame: needs Show Draw Calls");
+		ImGui::PlotLines("##gpuframe", gpu.data(), static_cast<int>(gpu.size()), 0, gpuText.c_str(), 0.0f, top, ImVec2(w, h));
+		ImGui::PopStyleColor();
+	}
+	ImGui::Text("Last 10 s  CPU frame: avg %.1f / 1%% low %.1f / max %.1f ms", st.cpuAvg, st.cpuLow1, st.cpuMax);
+	if (st.gpuFrames)
+		ImGui::Text("           GPU frame: avg %.1f / 1%% low %.1f / max %.1f ms", st.gpuAvg, st.gpuLow1, st.gpuMax);
+	if (st.gpuFrames)
+		ImGui::Text("Frames where the CPU took longer than the GPU: %.0f%%", st.cpuLimitedPct);
+	if (ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("A frame counts as CPU-limited when its CPU frame (which includes time stuck in the driver) is longer than its GPU work.\n"
+								   "Shown for information; the CPU / GPU split label above is unchanged.");
+	}
+
+	const auto s = Util::FrameTrace::GetSmoothed();
+	if (!s.valid)
+		return;
+	ImGui::Text("Blocked inside D3D11 calls: %.2f ms (draws %.2f, map %.2f, upload/copy %.2f, dispatch %.2f, flush %.2f)", s.driverTotalMs,
+		s.driverMs[0], s.driverMs[1], s.driverMs[2], s.driverMs[3], s.driverMs[4]);
+	if (ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("CPU time spent inside D3D11 calls on the main context. When the GPU is the limit and the driver's queue is full,\n"
+								   "a draw or a Map waits here, and that time shows up in whichever shader type happened to draw.");
+	}
+	ImGui::Text("Present wait %.2f ms | Reflex sleep %.2f ms", s.presentWaitMs, s.reflexSleepMs);
+	ImGui::Text("Our per-draw hooks: %.2f ms = %.2f us/draw (%.0f draws, %.0f Lighting) | permutation CB %.2f ms", s.ownDrawHookMs + s.ownSetupGeometryMs,
+		s.ownPerDrawUs, s.draws, s.lightingDraws, s.permutationUploadMs);
+	if (ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Community Shaders' own work in the per-draw hooks (state setup and the Lighting geometry hook), without the D3D11 time inside.\n"
+								   "The permutation constant-buffer upload is shown with its D3D11 time.");
+	}
+	if (Util::FrameTrace::IsRecording())
+		ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Recording frame trace: %.0f s left", Util::FrameTrace::RecordingSecondsLeft());
+	else if (const auto f = Util::FrameTrace::LastFile(); !f.empty())
+		ImGui::TextDisabled("Last trace: %s", f.c_str());
+	if (const auto f = Util::Screenshot::LastFile(); !f.empty())
+		ImGui::TextDisabled("Last screenshot: %s", f.c_str());
 }

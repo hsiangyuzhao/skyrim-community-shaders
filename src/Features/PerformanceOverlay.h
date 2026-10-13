@@ -329,6 +329,8 @@ struct PerformanceOverlay : OverlayFeature
 	bool IsFrozen() const { return view.frozen; }
 	/// @brief Writes every table, as currently displayed, to CommunityShaders.log.
 	void WriteSnapshotToLog(const PerfView::ViewConfig& a_cfg);
+	/// (44e) CPU vs GPU series and the CPU wait split.
+	void DrawCpuWaitSection();
 	/// @brief (batch 37a) Everything the overlay shows for this (or the frozen) frame, as one JSON document.
 	nlohmann::json BuildFrameJson(const PerfView::ViewConfig& a_cfg);
 	/// @brief (batch 37a) Writes BuildFrameJson to SKSE/CommunityShaders/Perf/perf-<time>.json; sets the panel message.
@@ -348,6 +350,8 @@ struct PerformanceOverlay : OverlayFeature
 
 	/// Set while the menu is waiting for the next key press to become the Freeze key.
 	bool capturingFreezeKey = false;
+	bool capturingScreenshotKey = false;  // (44e)
+	bool capturingTraceKey = false;       // (44e)
 	DrawCallLegends BuildDrawCallLegends(const Menu::ThemeSettings& theme, bool anyTestData) const;
 	std::vector<ColumnConfig> BuildDrawCallTableColumns(const Menu::ThemeSettings& theme, const DrawCallLegends& legends, bool anyTestData);
 
@@ -538,6 +542,15 @@ struct PerformanceOverlay : OverlayFeature
 		bool SectionView = false;
 		bool SectionOcclusion = false;  // (batch 37a) "Occlusion (dry run)"
 		bool SectionShadows = false;    // (batch 37a) "Shadow maps"
+
+		// (44e) CPU wait split, screenshot and frame trace.
+		bool SectionCpuWait = true;          // "CPU vs GPU (real frames)" section
+		bool DriverWaitTiming = true;        // time D3D11 calls (only while the overlay is shown or a trace records)
+		uint32_t ScreenshotKey = VK_F8;      // screenshot of the presented frame (incl. menu and overlay)
+		bool ScreenshotOnSave = true;        // F12 / Save frame also takes a screenshot with the same time stamp
+		bool ScreenshotSaveHDR = true;       // HDR frames: also save the untouched PQ image (16-bit PNG)
+		uint32_t TraceKey = VK_F7;           // start / stop a frame-time trace
+		float TraceSeconds = 20.0f;
 	};
 	Settings settings;
 

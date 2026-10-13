@@ -23,6 +23,7 @@
 #include "Utils/FileSystem.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/FrameTrace.h"
 
 void State::Draw()
 {
@@ -62,7 +63,11 @@ void State::Draw()
 		truePBR->SetShaderResouces(context);
 
 		if (permutationData != permutationDataPrevious) {
+			const bool timed = Util::FrameTrace::Active();
+			const int64_t t0 = timed ? Util::FrameTrace::Now() : 0;
 			permutationCB->Update(permutationData);
+			if (timed)
+				Util::FrameTrace::AddPermutationUpload(t0);
 			permutationDataPrevious = permutationData;
 		}
 

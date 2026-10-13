@@ -36,6 +36,8 @@
 #include "TruePBR.h"
 #include "Util.h"
 #include "Utils/ABCompare.h"
+#include "Utils/FrameTrace.h"
+#include "Utils/Screenshot.h"
 #include "Utils/UI.h"
 
 #include "Features/PerformanceOverlay.h"
@@ -704,6 +706,9 @@ void Menu::ProcessInputEventQueue()
 					{ &globals::features::performanceOverlay.settings.FreezeKey, &globals::features::performanceOverlay.capturingFreezeKey, [](uint32_t key) { globals::features::performanceOverlay.settings.FreezeKey = key; globals::features::performanceOverlay.capturingFreezeKey = false; } },
 					// (41a) A/B Compare switch key, set from the A/B strip at the top of the menu. Esc cancels.
 					{ &settings.ABCompareKey, &ABCompare::capturingKey, [this](uint32_t key) { if (key != VK_ESCAPE) settings.ABCompareKey = key; ABCompare::capturingKey = false; } },
+					// (44e) Screenshot and frame-trace keys, set from the Performance Overlay page. Esc cancels.
+					{ &globals::features::performanceOverlay.settings.ScreenshotKey, &globals::features::performanceOverlay.capturingScreenshotKey, [](uint32_t key) { if (key != VK_ESCAPE) globals::features::performanceOverlay.settings.ScreenshotKey = key; globals::features::performanceOverlay.capturingScreenshotKey = false; } },
+					{ &globals::features::performanceOverlay.settings.TraceKey, &globals::features::performanceOverlay.capturingTraceKey, [](uint32_t key) { if (key != VK_ESCAPE) globals::features::performanceOverlay.settings.TraceKey = key; globals::features::performanceOverlay.capturingTraceKey = false; } },
 				};
 				bool handled = false;
 				for (auto& h : hotkeyActions) {
@@ -740,6 +745,20 @@ void Menu::ProcessInputEventQueue()
 							 auto& overlay = globals::features::performanceOverlay;
 							 if (overlay.loaded && overlay.settings.FreezeKey != 0)
 								 overlay.ToggleFreeze();
+						 } },
+						// (44e) Screenshot of the presented frame; frame-time trace.
+						{ globals::features::performanceOverlay.settings.ScreenshotKey, []() {
+							 if (globals::features::performanceOverlay.loaded && globals::features::performanceOverlay.settings.ScreenshotKey != 0)
+								 Util::Screenshot::Request();
+						 } },
+						{ globals::features::performanceOverlay.settings.TraceKey, []() {
+							 auto& overlay = globals::features::performanceOverlay;
+							 if (overlay.loaded && overlay.settings.TraceKey != 0) {
+								 if (Util::FrameTrace::IsRecording())
+									 Util::FrameTrace::StopRecording();
+								 else
+									 Util::FrameTrace::StartRecording(overlay.settings.TraceSeconds);
+							 }
 						 } },
 						// (41a) A/B Compare: queue a switch to the other slot (applied at the next Present).
 						{ settings.ABCompareKey, []() {

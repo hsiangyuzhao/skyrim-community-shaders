@@ -3,6 +3,7 @@
 #include <d3dcompiler.h>
 
 #include "Deferred.h"
+#include "Utils/FrameTrace.h"
 #include "State.h"
 
 #include "Features/DynamicCubemaps.h"
@@ -1756,6 +1757,7 @@ namespace SIE
 			}
 		}
 
+		Util::FrameTrace::OnShaderMiss(IsAsync());
 		if (IsAsync()) {
 			compilationSet.Add({ ShaderClass::Vertex, shader, descriptor });
 		} else {
@@ -1804,6 +1806,7 @@ namespace SIE
 			}
 		}
 
+		Util::FrameTrace::OnShaderMiss(IsAsync());
 		if (IsAsync()) {
 			compilationSet.Add({ ShaderClass::Pixel, shader, descriptor });
 		} else {
@@ -1848,6 +1851,7 @@ namespace SIE
 			}
 		}
 
+		Util::FrameTrace::OnShaderMiss(IsAsync());
 		if (IsAsync()) {
 			compilationSet.Add({ ShaderClass::Compute, shader, descriptor });
 		} else {

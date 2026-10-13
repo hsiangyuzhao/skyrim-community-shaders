@@ -5,6 +5,7 @@
 #include "Menu.h"
 #include "State.h"
 #include "Utils/GpuPhaseTimeline.h"
+#include "Utils/FrameTrace.h"
 
 namespace Util
 {
@@ -119,6 +120,9 @@ namespace Util
 			auto& overlay = globals::features::performanceOverlay;
 			// globals::state is required because the frame counter both timers key their
 			// per-frame bookkeeping on lives there.
+			// (44e) A frame trace keeps the timers on while it records (GPU frame time per frame).
+			if (globals::state && overlay.loaded && Util::FrameTrace::IsRecording())
+				return true;
 			return globals::state && globals::menu && globals::menu->overlayVisible &&
 			       overlay.loaded && overlay.IsOverlayVisible() &&
 			       overlay.settings.ShowDrawCalls;
@@ -530,6 +534,7 @@ namespace Util
 				const double workMs = static_cast<double>(beginTicks - previous.endTicks) * toMs;
 
 				if (elapsedMs >= kMinPlausibleMs && elapsedMs <= kMaxPlausibleMs) {
+					Util::FrameTrace::OnGpuSample(slot.frameIndex, static_cast<float>(workMs), static_cast<float>(elapsedMs));
 					smoothedFrameElapsedMs = smoothedFrameElapsedMs * kSmoothingOld + static_cast<float>(elapsedMs) * kSmoothingNew;
 					smoothedPresentSpanMs = smoothedPresentSpanMs * kSmoothingOld + static_cast<float>(presentMs) * kSmoothingNew;
 					smoothedWorkSpanMs = smoothedWorkSpanMs * kSmoothingOld + static_cast<float>(workMs) * kSmoothingNew;
