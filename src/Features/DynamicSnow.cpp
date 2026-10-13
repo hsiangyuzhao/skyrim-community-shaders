@@ -57,6 +57,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 
 namespace
 {
+	/// (44f) Present once Even Cover has been switched on for an older configuration.
+	constexpr const char* kEvenCoverMigrationKey = "EvenCoverOn44f";
+
 	constexpr const char* kConditionNames[] = {
 		"Snow weather (any region)",
 		"Snow weather in a cold region",
@@ -1638,6 +1641,11 @@ void DynamicSnow::DrawSettings()
 void DynamicSnow::LoadSettings(json& o_json)
 {
 	settings = o_json;
+	// (44f) Even Cover was meant to be on (the default since 39c) but had been left off. Turn it on
+	// once for configurations saved before 44f; the marker is saved with the settings, so turning
+	// it off again afterwards sticks.
+	if (!o_json.contains(kEvenCoverMigrationKey))
+		settings.SlopeCoverage = true;
 	settings.Condition = std::clamp(settings.Condition, 0, static_cast<int>(SnowCondition::Count) - 1);
 	settings.TrailResolution = std::clamp(settings.TrailResolution, 0, 2);
 	settings.SlopeStart = std::clamp(settings.SlopeStart, 0.0f, 0.9f);
@@ -1648,6 +1656,7 @@ void DynamicSnow::LoadSettings(json& o_json)
 void DynamicSnow::SaveSettings(json& o_json)
 {
 	o_json = settings;
+	o_json[kEvenCoverMigrationKey] = true;
 }
 
 void DynamicSnow::RestoreDefaultSettings()

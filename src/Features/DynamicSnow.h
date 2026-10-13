@@ -115,6 +115,7 @@ public:
 		// ---- (batch 39c) ----
 		/// Coverage from the geometry slope on a soft ramp (SlopeStart..SlopeFull); the normal map only
 		/// shapes partial cover, and full cover hides the material's relief. Off = 39b (NormalThreshold).
+		/// (44f) Turned on once for configurations saved before 44f (see LoadSettings).
 		bool SlopeCoverage = true;
 		float SlopeStart = 0.3f;   ///< up-facing (normal.z) where snow starts to hold, about 73 degrees
 		float SlopeFull = 0.55f;   ///< ... and where it holds fully, about 57 degrees
