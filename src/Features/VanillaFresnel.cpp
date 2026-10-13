@@ -19,21 +19,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ComplexMaterialF0Multiplier,
     EyeRoughness,
     EnvMaskStrength,
-    EyeDirectRoughness,
-    EyeDirectSpecularMode,
     EyeSoftLightingScale,
     ShadowSoftLighting)
-
-namespace
-{
-	// (batch 15) Labels for VanillaFresnel::EyeDirectSpecular, in enum order.
-	constexpr std::array EyeDirectSpecularModeNames{
-		"Vanilla Phong (matches Dec-2025)",
-		"GGX, gated by gloss + mask",
-		"GGX, raw (current)"
-	};
-	static_assert(EyeDirectSpecularModeNames.size() == static_cast<std::size_t>(VanillaFresnel::EyeDirectSpecular::Total));
-}
+// (44h) Removed from JSON after the user's review, now fixed; their old keys are ignored:
+// EyeDirectSpecularMode (pinned to Vanilla Phong), EyeDirectRoughness (only used by the GGX
+// modes; pinned to its old default 0.1). Both stay in Settings for the cbuffer layout.
 
 namespace
 {
@@ -113,9 +103,16 @@ void VanillaFresnel::PostPostLoad()
 	logger::info("[VanillaFresnel] Installed hooks - BSLightingShader_SetupGeometry");
 }
 
+void VanillaFresnel::PinEyeDirectSpecular()
+{
+	settings.EyeDirectSpecularMode = static_cast<uint>(EyeDirectSpecular::VanillaPhong);
+	settings.EyeDirectRoughness = 0.1f;
+}
+
 void VanillaFresnel::RestoreDefaultSettings()
 {
 	settings = {};
+	PinEyeDirectSpecular();
 }
 
 void VanillaFresnel::LoadSettings(json& o_json)
@@ -136,15 +133,8 @@ void VanillaFresnel::LoadSettings(json& o_json)
                      "phong specular cannot consume correctly.");
     }
 
-    // (batch 15) A hand-edited or older json can hold anything here; an out-of-range value
-    // would index past the label array in DrawSettings and would fall through every branch in
-    // Lighting.hlsl, silently landing on GGXRaw. Clamp to the safe default instead.
-    if (settings.EyeDirectSpecularMode >= static_cast<uint>(EyeDirectSpecular::Total)) {
-        logger::warn("[VanillaFresnel] Eye Direct Specular Mode was {}, which is not a valid mode; "
-                     "resetting to Vanilla Phong.",
-            settings.EyeDirectSpecularMode);
-        settings.EyeDirectSpecularMode = static_cast<uint>(EyeDirectSpecular::VanillaPhong);
-    }
+    // (44h) No longer user settings; write the fixed values the shader reads.
+    PinEyeDirectSpecular();
 
     // (batch 17) Same reasoning as the clamp above: this one is multiplied straight into a
     // light term, so a hand-edited 50 would not fail, it would just make eyes glow far worse
@@ -217,30 +207,8 @@ void VanillaFresnel::DrawSettings()
             "How blurry the room/sky reflection in eyes is (not the sun or torch highlight). Needs Enable Eye Special Handling.\n"
             "0.10 = mirror-sharp (old behaviour, can look like chrome); 1.00 = one flat average colour. Roughness Multiplier does not affect it.");
 
-    // (batch 15) The switch, not another number. See the long note on
-    // Settings::EyeDirectSpecularMode for why four previous attempts at the glowing eye all
-    // moved a roughness and none of them helped.
-    {
-        int mode = static_cast<int>(settings.EyeDirectSpecularMode);
-        if (ImGui::Combo("Eye Direct Specular Mode", &mode, EyeDirectSpecularModeNames.data(),
-                static_cast<int>(EyeDirectSpecularModeNames.size()))) {
-            settings.EyeDirectSpecularMode = static_cast<uint>(std::clamp(mode, 0,
-                static_cast<int>(EyeDirectSpecularModeNames.size()) - 1));
-        }
-    }
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "Which highlight style eyes get from the sun and torches. Needs Enable Eye Special Handling.\n"
-            "Vanilla Phong: Skyrim's original highlight, the known-good default. GGX gated: modern highlight held back by the eye texture, untested.\n"
-            "GGX raw: modern highlight with nothing holding it back, kept for comparison (can make eyes glow).");
-
-    ImGui::BeginDisabled(settings.EyeDirectSpecularMode == static_cast<uint>(EyeDirectSpecular::VanillaPhong));
-    ImGui::SliderFloat("Eye Direct Light Roughness", &settings.EyeDirectRoughness, 0.04f, 1.0f, "%.2f");
-    ImGui::EndDisabled();
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text(
-            "How wide the sun/torch highlight on eyes is in the GGX modes (greyed out in Vanilla Phong). Needs Enable Eye Special Handling.\n"
-            "0.10 = small sharp glint (realistic); higher = softer, wider highlight with the same total brightness.");
+    // (44h) "Eye Direct Specular Mode" and "Eye Direct Light Roughness" removed after the
+    // user's review; eye direct highlights are fixed to Vanilla Phong (see PinEyeDirectSpecular).
 
     // (batch 17) The one that actually matches the reported symptom. See the long note on
     // Settings::EyeSoftLightingScale for why five previous attempts at the eye all looked at

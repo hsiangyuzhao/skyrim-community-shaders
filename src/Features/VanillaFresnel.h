@@ -32,6 +32,8 @@ struct VanillaFresnel : public Feature
 	virtual void LoadSettings(json& o_json) override;
 	virtual void SaveSettings(json& o_json) override;
 	virtual void DrawSettings() override;
+	// (44h) Writes the fixed EyeDirectSpecularMode / EyeDirectRoughness into the cbuffer copy.
+	void PinEyeDirectSpecular();
 
 	// (batch 15) Values for Settings::EyeDirectSpecularMode. Kept as a plain uint in the
 	// struct so the cbuffer layout stays a flat run of 4-byte slots; this enum only names the
@@ -107,6 +109,10 @@ struct VanillaFresnel : public Feature
         // is too high; the direct lobe never needed that compensation and is physically right at
         // a cornea's 0.1. Default 0.1 therefore restores the pre-batch-10b direct-light look
         // while leaving the environment blur where batch 10b put it.
+        //
+        // (44h) Removed from the UI and JSON after the user's review, now fixed: 0.1 (its old
+        // default; only read by the GGX modes, which are no longer reachable). The slot stays
+        // because this struct is the cbuffer layout; C++ writes the value.
         float EyeDirectRoughness = 0.1f;
         // (batch 15) Which lighting model the *direct* highlight on an eye uses. This is the
         // fifth attempt at "eyes glow in side-on sunlight" and the first one that touches the
@@ -129,6 +135,9 @@ struct VanillaFresnel : public Feature
         // 0 = VanillaPhong, 1 = GGXGated, 2 = GGXRaw; see the EyeDirectSpecular enum above.
         // Default 0 reproduces the December-2025 baseline (bedec8379), which is the only
         // configuration with a known-correct reference.
+        //
+        // (44h) Removed from the UI and JSON after the user's review, now fixed: VanillaPhong.
+        // The old key is ignored on load; the slot stays for the cbuffer layout.
         uint EyeDirectSpecularMode = 0;
         // (batch 17) How much of the vanilla *soft lighting* term an eye keeps. This is the
         // sixth attempt at "eyes glow in side-on sunlight" and the first one that stops
