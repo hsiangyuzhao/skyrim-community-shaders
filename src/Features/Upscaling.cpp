@@ -546,6 +546,7 @@ void Upscaling::DrawSettings()
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::TextUnformatted("Shuts Neural Rendering down and restarts it on the next frame. Use after replacing the DLL or after a failure.");
 		}
+		ImGui::TreePop();
 	}
 
 	if (!globals::game::isVR) {
