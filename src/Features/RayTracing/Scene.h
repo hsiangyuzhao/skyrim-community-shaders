@@ -11,9 +11,10 @@
  * BLASes of up to kChunkTriangles each, positions relative to the cell's south-west corner, so a
  * cell needs exactly one TLAS instance per chunk with an identity rotation.
  *
- * What goes in: references whose base is a Static, Furniture or Container, and the cell's four
- * landscape quadrants -- only BSTriShape geometry drawn with the Lighting shader that casts
- * shadows and is neither alpha-tested, alpha-blended, skinned, a decal nor tree-animated.
+ * What goes in: references whose base is a Static, Furniture or Container -- the cell's own and
+ * (45f) the persistent ones standing in its square -- only BSTriShape geometry drawn with the
+ * Lighting shader that casts shadows and is neither alpha-tested, alpha-blended, skinned, a decal
+ * nor tree-animated. (45f) Landscape is not captured (kCaptureLandscape): it only receives.
  * Everything else is counted per reason (shown on the page) and keeps its shadow-map shadow.
  *
  * (45e) Objects that can move or need their own placement -- doors, activators, movable statics
@@ -45,6 +46,12 @@
 namespace RayTracingScene
 {
 	inline constexpr float kCellUnits = 4096.0f;
+	/// (45f) Landscape is not an RT occluder (user decision): it stays a shadow receiver and keeps
+	/// casting through the shadow map / Terrain Shadows. The capture path stays behind this switch.
+	inline constexpr bool kCaptureLandscape = false;
+	/// (45f) References held by the worldspace's persistent cell (not by the grid cell they stand
+	/// in) are captured with the grid cell whose square they stand in.
+	inline constexpr bool kCapturePersistent = true;
 
 	struct SkipCounts
 	{
@@ -103,6 +110,13 @@ namespace RayTracingScene
 		std::uint32_t placementUnchecked = 0; // no usable world bound
 		std::uint32_t placementLogged = 0;
 		ObjectStats objects{};
+		// (45f) References of the captured cells' squares that live in the worldspace's persistent cell.
+		std::uint32_t persistentRefs = 0;     // found while capturing cells (total since the last reset)
+		std::uint32_t persistentObjects = 0;  // found by the object scan
+		// (45f) Missed casters described in the log (CasterFilter self-check).
+		std::uint32_t missedDescribed = 0;
+		std::uint32_t missedCapturable = 0;  // the shape itself is fine: its reference was not captured
+		std::uint32_t missedRejected = 0;    // the shape was rejected (reason in the log)
 	};
 
 	class Scene
@@ -129,8 +143,13 @@ namespace RayTracingScene
 		/// Per frame: grid diff, re-validation, a_budgetMs of capture, BLAS creation, filter registration.
 		void Update(RayTracingRT::Backend& a_backend, float a_budgetMs, std::uint32_t a_frame);
 
-		/// TLAS instances of every chunk (the backend skips the ones not built yet).
-		void CollectInstances(std::vector<RayTracingRT::Instance>& o_instances) const;
+		/// TLAS instances of every chunk (the backend skips the ones not built yet). a_expected
+		/// (45f): also fill each instance's box of the engine's live bounds for the self-check.
+		void CollectInstances(std::vector<RayTracingRT::Instance>& o_instances, bool a_expected) const;
+
+		/// (45f) Logs why big casters the shadow map drew inside the traced area are not in the
+		/// scene (CasterFilter::TakeMissed); a few per frame, the first kMissedLogLimit in total.
+		void DescribeMissedCasters();
 
 		/// After this frame's trace was submitted (or skipped): releases the retiring captures.
 		void EndFrame(RayTracingRT::Backend& a_backend);
@@ -170,6 +189,9 @@ namespace RayTracingScene
 			std::vector<RE::NiPointer<RE::BSGeometry>> geometries;
 			std::unique_ptr<RayTracingRT::ChunkGeometry> current;
 			std::vector<RayTracingRT::BlasHandle> blas;
+			// (45f) Per BLAS: the range of `geometries` it was made from (for the self-check).
+			std::vector<std::pair<std::uint32_t, std::uint32_t>> chunkGeometries;
+			std::uint32_t chunkStart = 0;  // first geometry of the chunk being filled
 			bool filterRegistered = false;
 			bool replaces = false;   // (45e) a re-capture of a cell whose old capture is still live
 			bool replacing = false;  // (45e) an old capture waiting for its replacement
@@ -222,6 +244,14 @@ namespace RayTracingScene
 		/// The shape if it may go into the scene (Lighting shader, opaque, casts shadows, ...); the
 		/// reason is counted otherwise.
 		RE::BSTriShape* CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim);
+		/// (45f) CheckShape's verdict without counting: nullptr = accepted, else the reason.
+		static const char* ShapeRejectReason(RE::NiAVObject* a_object, bool a_allowTreeAnim, SkipCounts* o_counts);
+		/// (45f) The grid cell's references plus the persistent-cell references standing in its square.
+		void CollectCellRefs(RE::TESObjectCELL* a_cell, std::int32_t a_x, std::int32_t a_y, std::vector<RE::NiPointer<RE::TESObjectREFR>>& o_refs,
+			std::uint32_t* o_persistent) const;
+		/// (45f) The captured cell whose square holds the reference (its parent cell, or by position
+		/// for references of the persistent cell); nullptr when none.
+		[[nodiscard]] const Cell* CapturedCellOf(RE::TESObjectREFR* a_ref) const;
 
 		// (45e) Objects: one BLAS per distinct engine mesh (in the shape's own space), one TLAS
 		// instance per shape with the shape's world transform of the frame.
@@ -245,6 +275,7 @@ namespace RayTracingScene
 			std::uint32_t users = 0;
 			std::uint32_t triangles = 0;
 		};
+		static constexpr std::uint32_t kMissedLogLimit = 32;
 		struct ObjectShape
 		{
 			RE::NiPointer<RE::BSGeometry> geometry;  // holds the mesh (the key) alive too
@@ -265,7 +296,8 @@ namespace RayTracingScene
 		void CaptureObjectRef(RayTracingRT::Backend& a_backend, const RE::NiPointer<RE::TESObjectREFR>& a_ref, RE::NiAVObject* a_root,
 			ObjectKind a_kind, bool a_allowNewMeshes);
 		void ReleaseObject(RayTracingRT::Backend& a_backend, ObjectRef& a_object);
-		void AppendObjectInstances(const std::vector<std::unique_ptr<ObjectRef>>& a_objects, std::vector<RayTracingRT::Instance>& o_instances) const;
+		void AppendObjectInstances(const std::vector<std::unique_ptr<ObjectRef>>& a_objects, std::vector<RayTracingRT::Instance>& o_instances,
+			bool a_expected) const;
 
 		std::vector<std::unique_ptr<Cell>> cells_;
 		std::vector<std::unique_ptr<Cell>> retiring_;  // traced this frame, released in EndFrame
@@ -282,5 +314,6 @@ namespace RayTracingScene
 		Stats stats_{};
 		RayTracingRT::Backend* gatherBackend_ = nullptr;
 		std::uint32_t currentFrame_ = 0;
+		std::uint32_t missedRejectedLogged_ = 0;  // (45f) rejected-shape misses described in the log
 	};
 }

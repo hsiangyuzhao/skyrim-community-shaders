@@ -54,12 +54,28 @@ namespace RayTracingRT
 	};
 	static_assert(sizeof(TraceConstants) == 36 * 4);
 
+	/// (45f) What a TLAS instance holds, for the per-category counts and the self-check.
+	enum InstanceCategory : std::uint8_t
+	{
+		kCategoryCell,     // a chunk of a captured cell (static / furniture / container references)
+		kCategoryMovable,  // doors, activators, movable statics, lights
+		kCategoryItem,     // loose items
+		kCategoryTree,     // opaque parts of trees and plants
+		kInstanceCategories
+	};
+	inline constexpr const char* kInstanceCategoryNames[kInstanceCategories] = { "cell chunk", "door/activator/movable", "item", "tree/plant" };
+
 	struct Instance
 	{
 		BlasHandle blas;
 		double x, y, z;  // world translation of the BLAS origin
 		// (45e) Rotation * scale, row-major (row r = world axis r); identity for cell chunks.
 		float m[3][3] = { { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } };
+		InstanceCategory category = kCategoryCell;
+		// (45f) Self-check: the world box the engine's own bounds give for this instance's shapes
+		// (live worldBound spheres). The instance as written into the TLAS must lie inside it.
+		bool hasExpected = false;
+		double expectMin[3]{}, expectMax[3]{};
 	};
 
 	struct FrameInput
@@ -70,6 +86,18 @@ namespace RayTracingRT
 		double cameraX = 0.0, cameraY = 0.0, cameraZ = 0.0;
 		const std::vector<Instance>* instances = nullptr;
 		std::uint32_t buildTriangleBudget = 0;
+		bool validate = false;  // (45f) run the TLAS self-check on this frame's instances
+	};
+
+	/// (45f) TLAS contents and the placement self-check.
+	struct TlasCheck
+	{
+		std::uint32_t written[kInstanceCategories]{};   // instances written into this frame's TLAS
+		std::uint32_t notBuilt[kInstanceCategories]{};  // instances skipped: BLAS not built yet
+		std::uint32_t checked = 0;                      // instances compared with the engine's bounds (last check)
+		std::uint32_t mismatched[kInstanceCategories]{};  // ... and found outside them (last check)
+		std::uint64_t mismatchedTotal = 0;
+		std::uint32_t logged = 0;
 	};
 
 	struct Stats
@@ -145,6 +173,12 @@ namespace RayTracingRT
 		[[nodiscard]] bool HasFailed() const { return failed_; }
 		[[nodiscard]] const std::string& LastError() const { return lastError_; }
 		[[nodiscard]] const Stats& GetStats() const { return stats_; }
+		[[nodiscard]] const TlasCheck& GetTlasCheck() const { return check_; }
+		void ResetTlasCheck() { check_ = {}; }
+		/// D3D12 instance mask and flags every TLAS instance is written with (for the log).
+		static constexpr std::uint32_t kInstanceMask = 0xFF;
+		static constexpr D3D12_RAYTRACING_INSTANCE_FLAGS kInstanceFlags =
+			D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
 		[[nodiscard]] std::string AdapterDescription() const { return adapterDescription_; }
 
 	private:
@@ -191,6 +225,7 @@ namespace RayTracingRT
 			std::uint32_t triangles = 0;
 			std::uint32_t postbuildSlot = UINT32_MAX;
 			std::uint64_t buildFence = 0;
+			float boundsMin[3]{}, boundsMax[3]{};  // (45f) local box of the vertices, for the self-check
 		};
 
 		struct Retired
@@ -217,6 +252,7 @@ namespace RayTracingRT
 		void ProcessCompaction(ID3D12GraphicsCommandList4* a_list, std::uint64_t a_completed);
 		std::uint32_t BuildQueued(ID3D12GraphicsCommandList4* a_list, std::uint32_t a_budget);
 		BlasHandle AllocateHandle();
+		void CheckInstance(const D3D12_RAYTRACING_INSTANCE_DESC& a_desc, const Instance& a_instance, const Blas& a_blas, const FrameInput& a_input);
 
 		ComPtr<ID3D11Device5> device11_;
 		ComPtr<ID3D11DeviceContext4> context11_;
@@ -259,6 +295,7 @@ namespace RayTracingRT
 
 		HANDLE fenceEvent_ = nullptr;
 		Stats stats_{};
+		TlasCheck check_{};
 		std::string lastError_;
 		std::string adapterDescription_;
 		bool ready_ = false;

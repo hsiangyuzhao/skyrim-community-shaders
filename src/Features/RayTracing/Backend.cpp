@@ -282,6 +282,7 @@ namespace RayTracingRT
 		fenceValue_ = lastSubmitted_ = 0;
 		cursor_ = 0;
 		stats_ = {};
+		check_ = {};
 	}
 
 	ComPtr<ID3D12Resource> Backend::CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav)
@@ -498,6 +499,21 @@ namespace RayTracingRT
 		blas = {};
 		blas.state = BlasState::Queued;
 		blas.triangles = a_geometry->Triangles();
+		// (45f) Local box of the vertices the triangles use (for the TLAS self-check).
+		for (int a = 0; a < 3; ++a) {
+			blas.boundsMin[a] = FLT_MAX;
+			blas.boundsMax[a] = -FLT_MAX;
+		}
+		const auto& positions = a_geometry->positions;
+		for (const auto index : a_geometry->indices) {
+			const std::size_t v = static_cast<std::size_t>(index) * 3;
+			if (v + 2 >= positions.size())
+				continue;
+			for (int a = 0; a < 3; ++a) {
+				blas.boundsMin[a] = std::min(blas.boundsMin[a], positions[v + a]);
+				blas.boundsMax[a] = std::max(blas.boundsMax[a], positions[v + a]);
+			}
+		}
 		blas.geometry = std::move(a_geometry);
 		buildQueue_.push_back(handle);
 		++stats_.blasQueued;
@@ -780,6 +796,60 @@ namespace RayTracingRT
 		return built;
 	}
 
+	void Backend::CheckInstance(const D3D12_RAYTRACING_INSTANCE_DESC& a_desc, const Instance& a_instance, const Blas& a_blas, const FrameInput& a_input)
+	{
+		// (45f) The instance exactly as the GPU will see it (camera-relative transform as written,
+		// local box of the BLAS vertices), back in world units, against the box of the engine's
+		// own live bound spheres of the shapes it was made from. Every vertex lies inside its
+		// shape's bound sphere, so a correct instance can never stick out of that box.
+		++check_.checked;
+		const double camera[3] = { a_input.cameraX, a_input.cameraY, a_input.cameraZ };
+		double worldMin[3] = { DBL_MAX, DBL_MAX, DBL_MAX }, worldMax[3] = { -DBL_MAX, -DBL_MAX, -DBL_MAX };
+		const bool empty = a_blas.boundsMin[0] > a_blas.boundsMax[0];
+		if (!empty) {
+			for (int corner = 0; corner < 8; ++corner) {
+				const float local[3] = { (corner & 1) ? a_blas.boundsMax[0] : a_blas.boundsMin[0], (corner & 2) ? a_blas.boundsMax[1] : a_blas.boundsMin[1],
+					(corner & 4) ? a_blas.boundsMax[2] : a_blas.boundsMin[2] };
+				for (int r = 0; r < 3; ++r) {
+					const double p = static_cast<double>(a_desc.Transform[r][0]) * local[0] + static_cast<double>(a_desc.Transform[r][1]) * local[1] +
+					                 static_cast<double>(a_desc.Transform[r][2]) * local[2] + static_cast<double>(a_desc.Transform[r][3]) + camera[r];
+					worldMin[r] = std::min(worldMin[r], p);
+					worldMax[r] = std::max(worldMax[r], p);
+				}
+			}
+		}
+		double worst = 0.0;
+		for (int a = 0; a < 3; ++a) {
+			if (empty)
+				break;
+			worst = std::max(worst, a_instance.expectMin[a] - worldMin[a]);
+			worst = std::max(worst, worldMax[a] - a_instance.expectMax[a]);
+		}
+		const double extent = std::max({ a_instance.expectMax[0] - a_instance.expectMin[0], a_instance.expectMax[1] - a_instance.expectMin[1],
+			a_instance.expectMax[2] - a_instance.expectMin[2] });
+		const double margin = 64.0 + extent * 0.05;
+		if (!empty && worst <= margin)
+			return;
+		const auto category = std::min<std::uint32_t>(a_instance.category, kInstanceCategories - 1);
+		++check_.mismatched[category];
+		++check_.mismatchedTotal;
+		if (check_.logged >= 16)
+			return;
+		++check_.logged;
+		if (empty) {
+			logger::warn("[RayTracing] TLAS self-check: {} instance (BLAS {}, {} triangles) has no vertices in use", kInstanceCategoryNames[category],
+				a_instance.blas, a_blas.triangles);
+			return;
+		}
+		logger::warn("[RayTracing] TLAS self-check: {} instance (BLAS {}, {} triangles) spans ({:.0f}, {:.0f}, {:.0f}) .. ({:.0f}, {:.0f}, {:.0f}) "
+					 "in the world, the engine's bounds of its shapes span ({:.0f}, {:.0f}, {:.0f}) .. ({:.0f}, {:.0f}, {:.0f}): sticks out by {:.0f} units "
+					 "(camera ({:.0f}, {:.0f}, {:.0f}), mask 0x{:02X}, flags 0x{:X})",
+			kInstanceCategoryNames[category], a_instance.blas, a_blas.triangles, worldMin[0], worldMin[1], worldMin[2], worldMax[0], worldMax[1],
+			worldMax[2], a_instance.expectMin[0], a_instance.expectMin[1], a_instance.expectMin[2], a_instance.expectMax[0], a_instance.expectMax[1],
+			a_instance.expectMax[2], worst, camera[0], camera[1], camera[2], static_cast<std::uint32_t>(a_desc.InstanceMask),
+			static_cast<std::uint32_t>(a_desc.Flags));
+	}
+
 	bool Backend::ExecuteFrame(const FrameInput& a_input)
 	{
 		if (!ready_ || failed_)
@@ -841,12 +911,26 @@ namespace RayTracingRT
 			return false;
 		}
 		auto* descs = static_cast<D3D12_RAYTRACING_INSTANCE_DESC*>(context.instanceMapped);
+		for (auto& count : check_.written)
+			count = 0;
+		for (auto& count : check_.notBuilt)
+			count = 0;
+		if (a_input.validate) {
+			check_.checked = 0;
+			for (auto& count : check_.mismatched)
+				count = 0;
+		}
 		for (const auto& instance : instances) {
-			if (instance.blas >= blas_.size())
+			const auto category = std::min<std::uint32_t>(instance.category, kInstanceCategories - 1);
+			if (instance.blas >= blas_.size()) {
+				++check_.notBuilt[category];
 				continue;
+			}
 			const auto& blas = blas_[instance.blas];
-			if ((blas.state != BlasState::Built && blas.state != BlasState::Ready) || !blas.resource)
+			if ((blas.state != BlasState::Built && blas.state != BlasState::Ready) || !blas.resource) {
+				++check_.notBuilt[category];
 				continue;
+			}
 			D3D12_RAYTRACING_INSTANCE_DESC desc{};
 			for (int r = 0; r < 3; ++r)
 				for (int c = 0; c < 3; ++c)
@@ -854,9 +938,12 @@ namespace RayTracingRT
 			desc.Transform[0][3] = static_cast<float>(instance.x - a_input.cameraX);
 			desc.Transform[1][3] = static_cast<float>(instance.y - a_input.cameraY);
 			desc.Transform[2][3] = static_cast<float>(instance.z - a_input.cameraZ);
-			desc.InstanceMask = 0xFF;
-			desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+			desc.InstanceMask = kInstanceMask;
+			desc.Flags = kInstanceFlags;
 			desc.AccelerationStructure = blas.resource->GetGPUVirtualAddress();
+			if (a_input.validate && instance.hasExpected)
+				CheckInstance(desc, instance, blas, a_input);
+			++check_.written[category];
 			descs[instanceCount++] = desc;
 		}
 		stats_.instancesLastFrame = instanceCount;

@@ -273,7 +273,9 @@ void RayTracing::LatchFrame()
 	const bool active = settings.Enabled && status == Status::Active && !settings.KeepCastersInShadowMap &&
 	                    debugView != DebugView::Disagreement && !Util::IsInterior() && sky && sky->mode.get() == RE::Sky::Mode::kFull &&
 	                    backend.HasFreeContext() && scene.HasCoverage();
-	RayTracingCasterFilter::Latch(active, filterRect);
+	// (45f) Watch for big casters the scene lacks while Ray Tracing runs (also when nothing is left out).
+	const bool watch = settings.Enabled && status == Status::Active;
+	RayTracingCasterFilter::Latch(active, filterRect, watch);
 	filterLatched = RayTracingCasterFilter::IsLatched();
 }
 
@@ -319,6 +321,7 @@ void RayTracing::Prepass()
 				scene.ReleaseAll(backend);
 			status = Status::Off;
 			statusReason.clear();
+			lastTlasLog = 0;
 			logger::info("[RayTracing] Switched off");
 		}
 		// Switching back on is a fresh attempt (also after a failure), never a silent "Starting".
@@ -409,7 +412,10 @@ void RayTracing::RunFrame()
 		return;
 	}
 	std::copy_n(coreRect, 4, filterRect);
-	scene.CollectInstances(instances);
+	// (45f) TLAS self-check twice a second or so; missed casters noted by the shadow map are described.
+	const bool validate = frameIndex % 30 == 0;
+	scene.CollectInstances(instances, validate);
+	scene.DescribeMissedCasters();
 
 	const float2 renderSize = Util::ConvertToDynamic(globals::state->screenSize);
 	const std::uint32_t width = std::min<std::uint32_t>(static_cast<std::uint32_t>(renderSize.x), desc.Width);
@@ -463,6 +469,7 @@ void RayTracing::RunFrame()
 	input.cameraZ = camZ;
 	input.instances = &instances;
 	input.buildTriangleBudget = kBuildBudget;
+	input.validate = validate;
 
 	auto* context = globals::d3d::context;
 	auto* screenSpaceShadows = &globals::features::screenSpaceShadows;
@@ -577,6 +584,29 @@ void RayTracing::RunFrame()
 	status = Status::Active;
 	statusReason.clear();
 	++frameIndex;
+
+	// (45f) What the TLAS holds, in the log: on the first active frame and then every 30 s.
+	const std::int64_t now = Qpc();
+	if (lastTlasLog == 0 || static_cast<double>(now - lastTlasLog) * QpcMs() > 30000.0) {
+		lastTlasLog = now;
+		const auto& check = backend.GetTlasCheck();
+		const auto& sc = scene.GetStats();
+		std::uint32_t notBuilt = 0;
+		for (const auto count : check.notBuilt)
+			notBuilt += count;
+		std::uint32_t mismatched = 0;
+		for (const auto count : check.mismatched)
+			mismatched += count;
+		logger::info("[RayTracing] TLAS: {} cell chunks, {} doors/activators/movable, {} items, {} trees/plants ({} instances not built yet); "
+					 "every instance mask 0x{:02X}, flags 0x{:X} (triangle cull disable, force opaque); self-check: {} of {} instances outside the "
+					 "engine's bounds (cell chunks {}, objects {}; {} in total); missed casters {} ({} with an acceptable shape, {} with a rejected shape); "
+					 "persistent references taken: {} statics, {} objects",
+			check.written[RayTracingRT::kCategoryCell], check.written[RayTracingRT::kCategoryMovable], check.written[RayTracingRT::kCategoryItem],
+			check.written[RayTracingRT::kCategoryTree], notBuilt, RayTracingRT::Backend::kInstanceMask,
+			static_cast<std::uint32_t>(RayTracingRT::Backend::kInstanceFlags), mismatched, check.checked, check.mismatched[RayTracingRT::kCategoryCell],
+			mismatched - check.mismatched[RayTracingRT::kCategoryCell], check.mismatchedTotal, RayTracingCasterFilter::MissedCount(), sc.missedCapturable,
+			sc.missedRejected, sc.persistentRefs, sc.persistentObjects);
+	}
 }
 
 void RayTracing::DrawDebugOverlay()
@@ -616,8 +646,9 @@ void RayTracing::DrawSettings()
 	if (ImGui::TreeNodeEx("General", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Ray Tracing", &settings.Enabled);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: sun shadows of buildings, rocks, furniture, doors, items, tree trunks and the ground inside the loaded area are ray traced.");
-			ImGui::Text("Characters, leaves and grass keep their normal shadows. Screen Space Shadows are switched off where ray tracing is in charge.");
+			ImGui::Text("On: sun shadows of buildings, rocks, furniture, doors, items and tree trunks inside the loaded area are ray traced.");
+			ImGui::Text("Characters, leaves, grass and the terrain itself (hills) keep their normal shadows; the ground still receives traced shadows.");
+			ImGui::Text("Screen Space Shadows are switched off where ray tracing is in charge.");
 			ImGui::Text("Off: the game's shadows exactly as before (nothing of this feature runs).");
 		}
 
@@ -682,12 +713,13 @@ void RayTracing::DrawSettings()
 		if (ImGui::Combo("Debug View", &view, views, IM_ARRAYSIZE(views)))
 			debugView = static_cast<DebugView>(std::clamp(view, 0, static_cast<int>(DebugView::Count) - 1));
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Shadow Source: red = ray-traced shadow, blue = shadow-map shadow (characters, trees, grass), green = lit,");
+			ImGui::Text("Shadow Source: red = ray-traced shadow, blue = shadow-map shadow (characters, trees, grass, terrain), green = lit,");
+			ImGui::Text("  orange = Screen Space Shadows had a contact shadow here that the hand-off removed,");
 			ImGui::Text("  grey = outside the ray-traced area (cascades and terrain shadows, unchanged), yellow = hand-off band.");
 			ImGui::Text("  Terrain shadows are applied later by the lighting and are not shown.");
 			ImGui::Text("RT vs Shadow Map: inside the ray-traced area, red = only RT sees a shadow, blue = only the shadow map does.");
 			ImGui::Text("  While this view is on, the shadow map keeps every caster so the two can be compared.");
-			ImGui::Text("BLAS Coverage: green = the surface is in the ray-traced scene, magenta = it is not (character, tree, grass, skipped object),");
+			ImGui::Text("BLAS Coverage: green = the surface is in the ray-traced scene, magenta = it is not (character, leaves, grass, terrain, skipped object),");
 			ImGui::Text("  orange = the ray-traced scene has a surface in front of what you see (geometry in the wrong place).");
 			ImGui::Text("Raw RT Visibility: the traced result before smoothing and merging.");
 			ImGui::Text("RT Hit vs Depth: white = the ray-traced surface sits exactly where the game draws it,");
@@ -708,7 +740,10 @@ void RayTracing::DrawSettings()
 		if (!backend.AdapterDescription().empty())
 			ImGui::Text("GPU: %s", backend.AdapterDescription().c_str());
 		ImGui::Text("Cells: %u captured, %u loading, %u recaptured (total)", sc.cellsComplete, sc.cellsGathering, sc.recaptures);
-		ImGui::Text("Scene: %u shapes, %u ground quads, %.2f M triangles", sc.shapes, sc.landQuads, static_cast<double>(sc.triangles) / 1e6);
+		ImGui::Text("Scene: %u shapes, %.2f M triangles (persistent references taken: %u statics, %u objects)", sc.shapes,
+			static_cast<double>(sc.triangles) / 1e6, sc.persistentRefs, sc.persistentObjects);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Persistent references are kept by the worldspace, not by the cell they stand in; they are taken with that cell.");
 		{
 			const auto& ob = sc.objects;
 			ImGui::Text("Objects: %u now (captured so far: doors/activators/movable %u, items %u, trees/plants %u), %u shapes in the scene,",
@@ -740,6 +775,29 @@ void RayTracing::DrawSettings()
 			scene.ResetPeaks();
 		ImGui::Text("Shadow map: %u casters handed to RT, %u draws left out last frame%s", RayTracingCasterFilter::RegisteredCount(),
 			RayTracingCasterFilter::SkippedLastFrame(), filterLatched ? "" : " (not active)");
+		{
+			// (45f) Self-checks.
+			const auto& check = backend.GetTlasCheck();
+			std::uint32_t mismatched = 0, notBuilt = 0;
+			for (int c = 0; c < RayTracingRT::kInstanceCategories; ++c) {
+				mismatched += check.mismatched[c];
+				notBuilt += check.notBuilt[c];
+			}
+			ImGui::Text("TLAS: %u cell chunks, %u doors/activators, %u items, %u trees (%u not built yet)", check.written[RayTracingRT::kCategoryCell],
+				check.written[RayTracingRT::kCategoryMovable], check.written[RayTracingRT::kCategoryItem], check.written[RayTracingRT::kCategoryTree], notBuilt);
+			const ImVec4 bad{ 1.0f, 0.5f, 0.3f, 1.0f }, good{ 0.6f, 0.9f, 0.6f, 1.0f };
+			ImGui::TextColored(mismatched ? bad : good, "Self-check: %u of %u instances outside the game's own bounds (%llu so far, should be 0)", mismatched,
+				check.checked, static_cast<unsigned long long>(check.mismatchedTotal));
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Each ray-traced instance, exactly as handed to the GPU, must lie inside the bounds the game computed for its shapes. Details in the log.");
+			const std::uint32_t missed = RayTracingCasterFilter::MissedCount();
+			ImGui::TextColored(missed ? bad : good, "Missed casters: %u big objects cast a shadow-map shadow inside the traced area but are not in the scene", missed);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Shapes with a bound radius of %.0f units or more drawn into the sun shadow map inside the traced area.", RayTracingCasterFilter::kMissedMinRadius);
+				ImGui::Text("The first %u are described in the log (shape, reference, cell, and why they were not captured).", 32u);
+				ImGui::Text("So far: %u with a shape the ray tracer accepts, %u with a shape it rejects (alpha-tested, ...).", sc.missedCapturable, sc.missedRejected);
+			}
+		}
 		if (rt.skippedFramesBusy || latchedWithoutTrace)
 			ImGui::Text("Frames without a trace (D3D12 busy): %u, of which with casters left out of the shadow map: %u (should be 0)",
 				rt.skippedFramesBusy, latchedWithoutTrace);

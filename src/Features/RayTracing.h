@@ -165,4 +165,5 @@ private:
 	std::uint32_t latchedWithoutTrace = 0;  // (45e) frames whose shadow map left casters out but that could not trace (should stay 0)
 	bool overVramBudget = false;
 	Status loggedStatus = Status::Off;
+	std::int64_t lastTlasLog = 0;  // (45f) QPC of the last TLAS summary in the log (0 = log on the next active frame)
 };

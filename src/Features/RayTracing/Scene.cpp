@@ -81,6 +81,8 @@ namespace RayTracingScene
 			}
 		}
 
+		bool LandscapeCaptured() { return kCaptureLandscape; }
+
 		ObjectKind ToObjectKind(RefKind a_kind)
 		{
 			return a_kind == RefKind::Item ? ObjectKind::Item : (a_kind == RefKind::Tree ? ObjectKind::Tree : ObjectKind::Movable);
@@ -118,6 +120,8 @@ namespace RayTracingScene
 		for (const auto handle : a_cell.blas)
 			a_backend.ReleaseBlas(handle);
 		a_cell.blas.clear();
+		a_cell.chunkGeometries.clear();
+		a_cell.chunkStart = 0;
 		if (a_cell.filterRegistered) {
 			for (const auto& geometry : a_cell.geometries)
 				RayTracingCasterFilter::Remove(geometry.get());
@@ -154,10 +158,16 @@ namespace RayTracingScene
 		const auto recaptures = stats_.recaptures;
 		const auto maxGather = stats_.maxGatherMs;
 		const auto logged = stats_.placementLogged;
+		const auto missedDescribed = stats_.missedDescribed, missedCapturable = stats_.missedCapturable, missedRejected = stats_.missedRejected;
 		stats_ = {};
 		stats_.recaptures = recaptures;
 		stats_.maxGatherMs = maxGather;
 		stats_.placementLogged = logged;
+		stats_.missedDescribed = missedDescribed;
+		stats_.missedCapturable = missedCapturable;
+		stats_.missedRejected = missedRejected;
+		// A new area: its misses are counted afresh (the log limit above stays).
+		RayTracingCasterFilter::ResetMissed();
 	}
 
 	bool Scene::Validate(const Cell& a_cell) const
@@ -172,8 +182,12 @@ namespace RayTracingScene
 		if (!a_cell.current || a_cell.current->Triangles() == 0)
 			return;
 		const auto handle = a_backend.CreateBlas(std::move(a_cell.current));
-		if (handle != RayTracingRT::kInvalidBlas)
+		const auto end = static_cast<std::uint32_t>(a_cell.geometries.size());
+		if (handle != RayTracingRT::kInvalidBlas) {
 			a_cell.blas.push_back(handle);
+			a_cell.chunkGeometries.emplace_back(a_cell.chunkStart, end);
+		}
+		a_cell.chunkStart = end;
 		a_cell.current.reset();
 	}
 
@@ -393,60 +407,69 @@ namespace RayTracingScene
 		return true;
 	}
 
-	RE::BSTriShape* Scene::CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim)
+	const char* Scene::ShapeRejectReason(RE::NiAVObject* a_object, bool a_allowTreeAnim, SkipCounts* o_counts)
 	{
-		auto& skipped = stats_.skipped;
+		SkipCounts ignored;
+		auto& skipped = o_counts ? *o_counts : ignored;
 		auto* geometry = a_object->AsGeometry();
 		if (!geometry)
-			return nullptr;
+			return "not geometry";
 		if (geometry->GetType().get() != RE::BSGeometry::Type::kTriShape) {
 			++skipped.otherGeometry;
-			return nullptr;
+			return "not a plain BSTriShape";
 		}
 		const auto& runtime = geometry->GetGeometryRuntimeData();
 		auto* lighting = netimmerse_cast<RE::BSLightingShaderProperty*>(runtime.properties[RE::BSGeometry::States::kEffect].get());
 		if (!lighting) {
 			++skipped.notLighting;
-			return nullptr;
+			return "not drawn with the Lighting shader";
 		}
 		using F = RE::BSShaderProperty::EShaderPropertyFlag;
 		const auto& flags = lighting->flags;
 		if (flags.any(F::kSkinned) || runtime.skinInstance) {
 			++skipped.skinned;
-			return nullptr;
+			return "skinned";
 		}
 		if (flags.any(F::kDecal, F::kDynamicDecal)) {
 			++skipped.decals;
-			return nullptr;
+			return "decal";
 		}
 		// Tree-animated (wind) shapes: only in trees / plants, whose opaque trunk and branch shapes
 		// are separate from the alpha-tested leaf cards (those are rejected just below).
 		if (flags.any(F::kTreeAnim) && !a_allowTreeAnim) {
 			++skipped.foliage;
-			return nullptr;
+			return "tree-animated";
 		}
 		if (flags.any(F::kLODObjects, F::kLODLandscape)) {
 			++skipped.otherGeometry;
-			return nullptr;
+			return "LOD shader flag";
 		}
 		if (flags.none(F::kCastShadows)) {
 			++skipped.noShadow;
-			return nullptr;
+			return "does not cast shadows";
 		}
 		if (auto* alpha = netimmerse_cast<RE::NiAlphaProperty*>(runtime.properties[RE::BSGeometry::States::kProperty].get())) {
 			if (alpha->GetAlphaTesting()) {
 				++skipped.alphaTested;
-				return nullptr;
+				return "alpha-tested";
 			}
 			if (alpha->GetAlphaBlending()) {
 				++skipped.alphaBlended;
-				return nullptr;
+				return "alpha-blended";
 			}
 		}
-		auto* shape = geometry->AsTriShape();
-		if (!shape)
+		if (!geometry->AsTriShape()) {
 			++skipped.otherGeometry;
-		return shape;
+			return "not a BSTriShape";
+		}
+		return nullptr;
+	}
+
+	RE::BSTriShape* Scene::CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim)
+	{
+		if (!a_object->AsGeometry() || ShapeRejectReason(a_object, a_allowTreeAnim, &stats_.skipped))
+			return nullptr;
+		return a_object->AsGeometry()->AsTriShape();
 	}
 
 	void Scene::CaptureObject(Cell& a_cell, RE::NiAVObject* a_object, int a_depth)
@@ -563,8 +586,9 @@ namespace RayTracingScene
 			keep.reserve(objects_.size());
 			for (auto& object : objects_) {
 				auto* ref = object->ref.get();
-				auto* cell = ref->GetParentCell();
-				const bool inScene = cell && std::any_of(cells_.begin(), cells_.end(), [&](const std::unique_ptr<Cell>& a_cell) { return a_cell->cell == cell; });
+				// (45f) Persistent references (doors, ...) belong to the worldspace's persistent
+				// cell: they are in the scene while the cell of their square is captured.
+				const bool inScene = CapturedCellOf(ref) != nullptr;
 				const bool valid = inScene && !ref->IsDisabled() && !ref->IsDeleted() && ref->Get3D() == object->root;
 				if (valid) {
 					keep.push_back(std::move(object));
@@ -596,12 +620,7 @@ namespace RayTracingScene
 				}
 				if (!next)
 					break;
-				auto& data = next->cell->GetRuntimeData();
-				RE::BSSpinLockGuard lock(data.spinLock);
-				scanList_.reserve(data.references.size());
-				for (const auto& ref : data.references)
-					if (ref)
-						scanList_.push_back(ref);
+				CollectCellRefs(next->cell, next->x, next->y, scanList_, nullptr);
 				if (scanList_.empty())
 					break;
 			}
@@ -619,6 +638,9 @@ namespace RayTracingScene
 			if (!root || IsEditorMarker(root))
 				continue;
 			CaptureObjectRef(a_backend, refPtr, root, ToObjectKind(kind), a_allowNewMeshes);
+			auto* parent = ref->GetParentCell();
+			if (!parent || std::none_of(cells_.begin(), cells_.end(), [&](const std::unique_ptr<Cell>& a_cell) { return a_cell->cell == parent; }))
+				++stats_.persistentObjects;
 		}
 
 		// 3. Registration with the caster filter once a shape's BLAS is built (it is then in this
@@ -638,7 +660,8 @@ namespace RayTracingScene
 		stats_.objects.captured = static_cast<std::uint32_t>(objects_.size());
 	}
 
-	void Scene::AppendObjectInstances(const std::vector<std::unique_ptr<ObjectRef>>& a_objects, std::vector<RayTracingRT::Instance>& o_instances) const
+	void Scene::AppendObjectInstances(const std::vector<std::unique_ptr<ObjectRef>>& a_objects, std::vector<RayTracingRT::Instance>& o_instances,
+		bool a_expected) const
 	{
 		for (const auto& object : a_objects) {
 			for (const auto& shape : object->shapes) {
@@ -652,6 +675,19 @@ namespace RayTracingScene
 				for (int r = 0; r < 3; ++r)
 					for (int c = 0; c < 3; ++c)
 						instance.m[r][c] = world.rotate.entry[r][c] * world.scale;
+				instance.category = object->kind == ObjectKind::Item ? RayTracingRT::kCategoryItem :
+				                    (object->kind == ObjectKind::Tree ? RayTracingRT::kCategoryTree : RayTracingRT::kCategoryMovable);
+				if (a_expected) {
+					const auto& b = geometry->worldBound;
+					if (std::isfinite(b.radius) && b.radius > 0.0f) {
+						instance.hasExpected = true;
+						const float center[3] = { b.center.x, b.center.y, b.center.z };
+						for (int a = 0; a < 3; ++a) {
+							instance.expectMin[a] = static_cast<double>(center[a]) - b.radius;
+							instance.expectMax[a] = static_cast<double>(center[a]) + b.radius;
+						}
+					}
+				}
 				o_instances.push_back(instance);
 			}
 		}
@@ -665,12 +701,9 @@ namespace RayTracingScene
 
 		if (!a_cell.snapshotTaken) {
 			a_cell.snapshotTaken = true;
-			auto& data = a_cell.cell->GetRuntimeData();
-			RE::BSSpinLockGuard lock(data.spinLock);
-			a_cell.pending.reserve(data.references.size());
-			for (const auto& ref : data.references)
-				if (ref)
-					a_cell.pending.push_back(ref);
+			CollectCellRefs(a_cell.cell, a_cell.x, a_cell.y, a_cell.pending, &stats_.persistentRefs);
+			if constexpr (!kCaptureLandscape)
+				a_cell.landDone = true;  // (45f) landscape only receives (kCaptureLandscape)
 		}
 
 		while (a_cell.cursor < a_cell.pending.size()) {
@@ -775,7 +808,7 @@ namespace RayTracingScene
 			std::size_t total = 0;
 			for (const auto& cell : cells_) {
 				total += cell->tracked.size();
-				if (!cell->gathering && LandSignature(cell->cell) != cell->landSignature)
+				if (LandscapeCaptured() && !cell->gathering && LandSignature(cell->cell) != cell->landSignature)
 					cell->dirty = true;
 			}
 			if (total > 0) {
@@ -911,7 +944,7 @@ namespace RayTracingScene
 		stats_.maxGatherMs = std::max(stats_.maxGatherMs, stats_.lastGatherMs);
 	}
 
-	void Scene::CollectInstances(std::vector<RayTracingRT::Instance>& o_instances) const
+	void Scene::CollectInstances(std::vector<RayTracingRT::Instance>& o_instances, bool a_expected) const
 	{
 		o_instances.clear();
 		// Retiring captures too: they are traced this frame and released after it.
@@ -919,12 +952,180 @@ namespace RayTracingScene
 			for (const auto& cell : *list) {
 				const double x = static_cast<double>(cell->x) * kCellUnits;
 				const double y = static_cast<double>(cell->y) * kCellUnits;
-				for (const auto handle : cell->blas)
-					o_instances.push_back(RayTracingRT::Instance{ handle, x, y, 0.0 });
+				for (std::size_t i = 0; i < cell->blas.size(); ++i) {
+					RayTracingRT::Instance instance{ cell->blas[i], x, y, 0.0 };
+					instance.category = RayTracingRT::kCategoryCell;
+					if (a_expected && i < cell->chunkGeometries.size()) {
+						// (45f) The box of the live bound spheres of the shapes baked into this chunk.
+						const auto [first, end] = cell->chunkGeometries[i];
+						for (int a = 0; a < 3; ++a) {
+							instance.expectMin[a] = DBL_MAX;
+							instance.expectMax[a] = -DBL_MAX;
+						}
+						for (std::uint32_t g = first; g < end && g < cell->geometries.size(); ++g) {
+							const auto& b = cell->geometries[g]->worldBound;
+							if (!std::isfinite(b.radius) || b.radius <= 0.0f)
+								continue;
+							const float center[3] = { b.center.x, b.center.y, b.center.z };
+							for (int a = 0; a < 3; ++a) {
+								instance.expectMin[a] = std::min(instance.expectMin[a], static_cast<double>(center[a]) - b.radius);
+								instance.expectMax[a] = std::max(instance.expectMax[a], static_cast<double>(center[a]) + b.radius);
+							}
+							instance.hasExpected = true;
+						}
+					}
+					o_instances.push_back(instance);
+				}
 			}
 		}
-		AppendObjectInstances(objects_, o_instances);
-		AppendObjectInstances(retiringObjects_, o_instances);
+		AppendObjectInstances(objects_, o_instances, a_expected);
+		AppendObjectInstances(retiringObjects_, o_instances, a_expected);
+	}
+
+	void Scene::CollectCellRefs(RE::TESObjectCELL* a_cell, std::int32_t a_x, std::int32_t a_y, std::vector<RE::NiPointer<RE::TESObjectREFR>>& o_refs,
+		std::uint32_t* o_persistent) const
+	{
+		const std::size_t start = o_refs.size();
+		{
+			auto& data = a_cell->GetRuntimeData();
+			RE::BSSpinLockGuard lock(data.spinLock);
+			o_refs.reserve(o_refs.size() + data.references.size());
+			for (const auto& ref : data.references)
+				if (ref)
+					o_refs.push_back(ref);
+		}
+		if constexpr (!kCapturePersistent)
+			return;
+		// (45f) Persistent references of an exterior worldspace are held by its persistent ("sky")
+		// cell, not by the grid cell they stand in (CommonLib's TES::ForEachReferenceInRange walks
+		// both for that reason). They are taken with the grid cell whose square holds them.
+		auto* tes = RE::TES::GetSingleton();
+		auto* worldSpace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+		auto* sky = worldSpace ? worldSpace->GetSkyCell() : nullptr;
+		if (!sky || sky == a_cell)
+			return;
+		ankerl::unordered_dense::set<const RE::TESObjectREFR*> own;
+		own.reserve(o_refs.size() - start);
+		for (std::size_t i = start; i < o_refs.size(); ++i)
+			own.insert(o_refs[i].get());
+		const double minX = static_cast<double>(a_x) * kCellUnits, minY = static_cast<double>(a_y) * kCellUnits;
+		auto& data = sky->GetRuntimeData();
+		RE::BSSpinLockGuard lock(data.spinLock);
+		for (const auto& ref : data.references) {
+			if (!ref || own.contains(ref.get()))
+				continue;
+			const auto position = ref->GetPosition();
+			const double px = position.x, py = position.y;
+			if (px < minX || px >= minX + kCellUnits || py < minY || py >= minY + kCellUnits)
+				continue;
+			o_refs.push_back(ref);
+			if (o_persistent)
+				++*o_persistent;
+		}
+	}
+
+	const Scene::Cell* Scene::CapturedCellOf(RE::TESObjectREFR* a_ref) const
+	{
+		if (auto* parent = a_ref->GetParentCell()) {
+			for (const auto& cell : cells_)
+				if (cell->cell == parent)
+					return cell.get();
+		}
+		if constexpr (!kCapturePersistent)
+			return nullptr;
+		const auto position = a_ref->GetPosition();
+		const auto cx = static_cast<std::int32_t>(std::floor(position.x / kCellUnits));
+		const auto cy = static_cast<std::int32_t>(std::floor(position.y / kCellUnits));
+		auto* tes = RE::TES::GetSingleton();
+		auto* worldSpace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+		auto* sky = worldSpace ? worldSpace->GetSkyCell() : nullptr;
+		if (!sky || a_ref->GetParentCell() != sky)
+			return nullptr;
+		for (const auto& cell : cells_)
+			if (cell->x == cx && cell->y == cy)
+				return cell.get();
+		return nullptr;
+	}
+
+	void Scene::DescribeMissedCasters()
+	{
+		auto missed = RayTracingCasterFilter::TakeMissed();
+		if (missed.empty())
+			return;
+		auto* tes = RE::TES::GetSingleton();
+		auto* worldSpace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+		auto* sky = worldSpace ? worldSpace->GetSkyCell() : nullptr;
+		for (const auto& pointer : missed) {
+			auto* geometry = pointer.get();
+			if (!geometry)
+				continue;
+			// The reference that owns the shape: the nearest ancestor carrying it as user data.
+			RE::TESObjectREFR* ref = nullptr;
+			RE::NiAVObject* root = nullptr;
+			int depth = 0;
+			for (RE::NiAVObject* node = geometry; node && depth < 64; node = node->parent, ++depth) {
+				if (auto* owner = node->GetUserData()) {
+					ref = owner;
+					root = node;
+					break;
+				}
+			}
+			const RefKind kind = ref ? Classify(ref) : RefKind::Other;
+			const bool objectKind = kind == RefKind::Movable || kind == RefKind::Item || kind == RefKind::Tree;
+			const char* reason = ShapeRejectReason(geometry, kind == RefKind::Tree, nullptr);
+			if (reason)
+				++stats_.missedRejected;
+			else
+				++stats_.missedCapturable;
+			// The log is for the surprises: an acceptable shape the scene lacks. Rejected shapes
+			// (leaves, grass, characters, ...) are expected and only a few of them are described.
+			if (stats_.missedDescribed >= kMissedLogLimit || (reason && (missedRejectedLogged_ >= 4 || !ref)))
+				continue;
+			if (reason)
+				++missedRejectedLogged_;
+			++stats_.missedDescribed;
+			const auto& b = geometry->worldBound;
+			if (!ref) {
+				logger::warn("[RayTracing] Missed caster: '{}' (radius {:.0f} at {:.0f}, {:.0f}, {:.0f}) is drawn into the sun shadow map inside the ray-traced "
+							 "area but is not in the scene; shape: {}; no owning reference found (not part of a placed object)",
+					geometry->name.c_str(), b.radius, b.center.x, b.center.y, b.center.z, reason ? reason : "accepted");
+				continue;
+			}
+			auto* base = ref->GetBaseObject();
+			auto* parent = ref->GetParentCell();
+			const bool parentCaptured = parent && std::any_of(cells_.begin(), cells_.end(), [&](const std::unique_ptr<Cell>& a_cell) { return a_cell->cell == parent; });
+			const Cell* square = CapturedCellOf(ref);
+			bool tracked = false, trackedSameRoot = false;
+			for (const auto* list : { &cells_, &retiring_ }) {
+				for (const auto& cell : *list) {
+					for (const auto& entry : cell->tracked) {
+						if (entry.ref.get() == ref) {
+							tracked = true;
+							trackedSameRoot = trackedSameRoot || entry.root == ref->Get3D();
+						}
+					}
+				}
+			}
+			const bool captured = std::any_of(cells_.begin(), cells_.end(), [&](const std::unique_ptr<Cell>& a_cell) {
+				return std::any_of(a_cell->geometries.begin(), a_cell->geometries.end(), [&](const RE::NiPointer<RE::BSGeometry>& a_g) { return a_g.get() == geometry; });
+			});
+			const char* kindName = kind == RefKind::Capture ? "baked into cell chunks" :
+			                       kind == RefKind::Actor   ? "character (not traced)" :
+			                       objectKind               ? "own instance (object)" :
+			                                                  "not a traced reference type";
+			logger::warn("[RayTracing] Missed caster: '{}' (radius {:.0f} at {:.0f}, {:.0f}, {:.0f}) is drawn into the sun shadow map inside the ray-traced "
+						 "area but is not in the scene; shape: {}; reference {:08X} base {:08X} ({}, {}){}{}, 3D root {}; parent cell {:08X} ({}); "
+						 "square's cell {}; {}",
+				geometry->name.c_str(), b.radius, b.center.x, b.center.y, b.center.z, reason ? reason : "accepted", ref->GetFormID(),
+				base ? base->GetFormID() : 0u, base ? RE::FormTypeToString(base->GetFormType()) : std::string_view("no base"), kindName,
+				ref->IsPersistent() ? ", persistent" : "", ref->IsDisabled() ? ", disabled" : "",
+				ref->Get3D() == root ? "is the reference's 3D" : (ref->Get3D() ? "differs from the reference's 3D" : "but the reference has no 3D"),
+				parent ? parent->GetFormID() : 0u, parent == sky && sky ? "the worldspace's persistent cell" : (parentCaptured ? "captured" : "not captured"),
+				square ? std::format("{},{} captured{}", square->x, square->y, square->gathering ? " (still capturing)" : "") : std::string("not captured"),
+				captured ? "the shape IS in a cell chunk (its BLAS may not be built yet)" :
+				           (tracked ? (trackedSameRoot ? "the reference was captured, this shape was not" : "the reference was captured with older 3D") :
+				                      (objectIndex_.contains(ref) ? "the reference is a captured object" : "the reference was never captured")));
+		}
 	}
 
 	void Scene::EndFrame(RayTracingRT::Backend& a_backend)

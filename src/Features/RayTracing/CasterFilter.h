@@ -28,7 +28,9 @@ namespace RE
 namespace RayTracingCasterFilter
 {
 	/// Called once per frame before the engine draws any shadow map.
-	void Latch(bool a_active, const float a_rectMinMax[4]);
+	/// a_watch (45f): Ray Tracing is running; big casters drawn into the sun cascades inside the
+	/// rect that are NOT registered are noted (TakeMissed) so the scene can say why it lacks them.
+	void Latch(bool a_active, const float a_rectMinMax[4], bool a_watch);
 	[[nodiscard]] bool IsLatched();
 
 	/// Bracket of the sun-cascade RenderShadowmap call (GpuPhaseTimeline hook).
@@ -48,4 +50,12 @@ namespace RayTracingCasterFilter
 	[[nodiscard]] std::uint32_t RegisteredCount();
 	/// Passes skipped during the last completed frame, and during the frame in progress.
 	[[nodiscard]] std::uint32_t SkippedLastFrame();
+
+	/// (45f) Self-check: distinct big geometries (bound radius >= kMissedMinRadius, whole bound
+	/// inside the rect) the engine drew into the sun cascades while they were not in the ray
+	/// tracer's scene. TakeMissed() hands over the ones not yet described (a few per frame).
+	inline constexpr float kMissedMinRadius = 256.0f;
+	[[nodiscard]] std::uint32_t MissedCount();
+	[[nodiscard]] std::vector<RE::NiPointer<RE::BSGeometry>> TakeMissed();
+	void ResetMissed();
 }
