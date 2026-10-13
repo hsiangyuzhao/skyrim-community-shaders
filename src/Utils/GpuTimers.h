@@ -71,6 +71,8 @@ namespace Util
 		PPColorGrading,
 		PPFinalCopy,
 		VanillaHDR,
+		// (45c) Grass culling submission (every bucket's cull dispatch + LOD count copies), taken out of GrassOptimizations.
+		GrassCulling,
 		Count
 	};
 

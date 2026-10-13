@@ -117,6 +117,9 @@ namespace Util
 			{ "Vanilla HDR prep",
 				"GPU time of the game's own HDR downsample, eye adaptation and bloom. With Disable Vanilla Tonemapping on, nothing "
 				"shows them; Post Processing > Skip Vanilla HDR Passes skips them when nothing else needs them (the row then disappears)." },
+			{ "Grass Culling",
+				"GPU time for Grass Optimizations' per-instance culling: one compute pass per visible grass type deciding which grass "
+				"is drawn and at which detail level. Not counted in the Grass Optimizations row. Advanced > NVIDIA can speed it up." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
@@ -731,6 +734,9 @@ namespace Util
 			{ "GrassOptimizations", "Grass Optimizations",
 				"CPU time for Grass Optimizations' per-frame work: sorting newly loaded grass and choosing what to draw. "
 				"Drawing the grass itself stays in the Grass row of the table above." },
+			{ "GrassCulling", "Grass Culling",
+				"(45c) CPU time for sending Grass Optimizations' culling work to the GPU: per-type constants, the visible-cell table "
+				"and one compute pass per visible grass type. Not counted in the Grass Optimizations row." },
 		};
 
 		const CpuBucketDoc* FindCpuDoc(std::string_view a_key)
