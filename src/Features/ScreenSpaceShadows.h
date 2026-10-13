@@ -83,14 +83,18 @@ public:
 	std::unique_ptr<ConstantBuffer> raymarchCB;
 	ID3D11ComputeShader* raymarchCS = nullptr;
 	ID3D11ComputeShader* raymarchRightCS = nullptr;
+	ID3D11ComputeShader* edgeSmoothCS = nullptr;  ///< (45 SSS) Edge Smoothing
 
 	std::unique_ptr<Texture2D> screenSpaceShadowsTexture;
+	/// (45 SSS) Ray march output before Edge Smoothing (same format as screenSpaceShadowsTexture).
+	std::unique_ptr<Texture2D> rawShadowsTexture;
 
 	virtual void SetupResources() override;
 
 	virtual void DrawSettings() override;
 
 	virtual void ClearShaderCache() override;
+	void ReleaseRaymarchShaders();
 	/** @brief Ray sample count for the current render (dynamic) resolution, quantized to steps of 8. */
 	uint GetScaledSampleCount();
 	/// SAMPLE_COUNT the raymarch shaders were last compiled with (0 = none yet).
@@ -99,6 +103,7 @@ public:
 	void CompileRaymarchShaders();
 	ID3D11ComputeShader* GetComputeRaymarch();
 	ID3D11ComputeShader* GetComputeRaymarchRight();
+	ID3D11ComputeShader* GetComputeEdgeSmooth();
 
 	virtual void Prepass() override;
 

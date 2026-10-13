@@ -54,6 +54,9 @@ void ScreenSpaceShadows::DrawSettings()
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("Shadows from casters farther away than this (along the sun's direction) fade out. Lower = only short contact shadows; higher = longer ones, with more mistakes far away.");
 		}
+		ImGui::Checkbox("Edge Smoothing", (bool*)&bendSettings.EdgeSmoothing);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Softens the jagged, flickering 1-pixel edges of these shadows without blurring across object outlines. Uses only the current frame, so nothing smears. About 0.05-0.1 ms.");
 
 		ImGui::Spacing();
 		ImGui::Spacing();
@@ -61,7 +64,7 @@ void ScreenSpaceShadows::DrawSettings()
 	}
 }
 
-void ScreenSpaceShadows::ClearShaderCache()
+void ScreenSpaceShadows::ReleaseRaymarchShaders()
 {
 	if (raymarchCS) {
 		raymarchCS->Release();
@@ -71,6 +74,26 @@ void ScreenSpaceShadows::ClearShaderCache()
 		raymarchRightCS->Release();
 		raymarchRightCS = nullptr;
 	}
+}
+
+void ScreenSpaceShadows::ClearShaderCache()
+{
+	ReleaseRaymarchShaders();
+	if (edgeSmoothCS) {
+		edgeSmoothCS->Release();
+		edgeSmoothCS = nullptr;
+	}
+}
+
+ID3D11ComputeShader* ScreenSpaceShadows::GetComputeEdgeSmooth()
+{
+	if (!edgeSmoothCS) {
+		std::vector<std::pair<const char*, const char*>> defines;
+		if (globals::features::terrainBlending.loaded)
+			defines.push_back({ "TERRAIN_BLENDING", "" });
+		edgeSmoothCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\EdgeSmoothCS.hlsl", defines, "cs_5_0");
+	}
+	return edgeSmoothCS;
 }
 
 uint ScreenSpaceShadows::GetScaledSampleCount()
@@ -97,7 +120,7 @@ void ScreenSpaceShadows::CompileRaymarchShaders()
 	const uint scaledSampleCount = GetScaledSampleCount();
 	if (scaledSampleCount != lastCompiledSampleCount) {
 		lastCompiledSampleCount = scaledSampleCount;
-		ClearShaderCache();
+		ReleaseRaymarchShaders();
 	}
 
 	if (raymarchCS && (raymarchRightCS || !globals::game::isVR))
@@ -170,7 +193,15 @@ void ScreenSpaceShadows::DrawShadows()
 	auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 	context->CSSetShaderResources(0, 1, &depth.depthSRV);
 
-	auto uav = screenSpaceShadowsTexture->uav.get();
+	// (45 SSS) With Edge Smoothing the ray march writes into rawShadowsTexture and the smoothing pass
+	// writes the final texture; otherwise the ray march writes the final texture directly.
+	ID3D11ComputeShader* smoothShader = (bendSettings.EdgeSmoothing && rawShadowsTexture && !globals::game::isVR) ? GetComputeEdgeSmooth() : nullptr;
+	if (smoothShader) {
+		float white[4] = { 1, 1, 1, 1 };
+		context->ClearUnorderedAccessViewFloat(rawShadowsTexture->uav.get(), white);
+	}
+
+	auto uav = smoothShader ? rawShadowsTexture->uav.get() : screenSpaceShadowsTexture->uav.get();
 	context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 
 	context->CSSetSamplers(0, 1, &pointBorderSampler);
@@ -273,11 +304,31 @@ void ScreenSpaceShadows::DrawShadows()
 		DispatchEye("Right Eye", GetComputeRaymarchRight(), lightProjectionRightF.data(), InvTexSizeX, InvTexSizeY);
 	}
 
-	ID3D11ShaderResourceView* views[1]{ nullptr };
-	context->CSSetShaderResources(0, 1, views);
-
 	ID3D11UnorderedAccessView* uavs[1]{ nullptr };
 	context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+
+	if (smoothShader) {
+		// (45 SSS) Edge Smoothing: 3x3 depth-aware blur, this frame's ray march only (no history).
+		TracyD3D11Zone(globals::state->tracyCtx, "SSS - Edge Smoothing");
+		if (globals::state->frameAnnotations)
+			globals::state->BeginPerfEvent("SSS - Edge Smoothing");
+
+		raymarchCB->Update(common);
+		ID3D11ShaderResourceView* smoothSrvs[2] = { depth.depthSRV, rawShadowsTexture->srv.get() };
+		context->CSSetShaderResources(0, 2, smoothSrvs);
+		auto finalUav = screenSpaceShadowsTexture->uav.get();
+		context->CSSetUnorderedAccessViews(0, 1, &finalUav, nullptr);
+		context->CSSetShader(smoothShader, nullptr, 0);
+		context->Dispatch(((uint)viewportSize[0] + 7) / 8, ((uint)viewportSize[1] + 7) / 8, 1);
+
+		context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+
+		if (globals::state->frameAnnotations)
+			globals::state->EndPerfEvent();
+	}
+
+	ID3D11ShaderResourceView* views[2]{ nullptr, nullptr };
+	context->CSSetShaderResources(0, 2, views);
 
 	context->CSSetShader(nullptr, nullptr, 0);
 
@@ -373,5 +424,10 @@ void ScreenSpaceShadows::SetupResources()
 		screenSpaceShadowsTexture = std::make_unique<Texture2D>(texDesc);
 		screenSpaceShadowsTexture->CreateSRV(srvDesc);
 		screenSpaceShadowsTexture->CreateUAV(uavDesc);
+
+		// (45 SSS) Edge Smoothing source. Same format; the final texture keeps its name, format and t45 slot.
+		rawShadowsTexture = std::make_unique<Texture2D>(texDesc);
+		rawShadowsTexture->CreateSRV(srvDesc);
+		rawShadowsTexture->CreateUAV(uavDesc);
 	}
 }
