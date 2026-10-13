@@ -1987,13 +1987,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// Grass LOD billboards are back-lit, and of the 553 Lighting permutations observed in a
 	// real playthrough only 88 carry that flag -- the other 465 stay byte-identical.
 	//
-	// Gamma with no brightness multiplier, unlike the two branches above, because this value
-	// also lands in the deferred albedo (outputAlbedo = baseColor * vertexColor further down),
-	// which screen-space GI reads back as a reflectance. pow() cannot lift a value above 1, so
-	// no setting of this slider can push albedo past the point where indirect light would be
-	// gaining energy on every bounce.
+	// (44h) Gamma, then a brightness multiplier, in the same order as the LOD object branch above.
+	// The value also lands in the deferred albedo that screen-space GI reads back, so brightness
+	// above 1 can push that albedo past 1, exactly as LOD Object Brightness already can.
 	if (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsLODGrass) {
-		baseColor.xyz = pow(abs(baseColor.xyz), SharedData::lodBlendingSettings.LODGrassGamma);
+		baseColor.xyz = pow(abs(baseColor.xyz), SharedData::lodBlendingSettings.LODGrassGamma) * SharedData::lodBlendingSettings.LODGrassBrightness;
 	}
 #		endif
 #	endif  // LOD_BLENDING

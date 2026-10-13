@@ -31,30 +31,19 @@ struct LODBlending : Feature
 		// (batch 19) Claims the struct's spare float, so the shared feature buffer layout is
 		// byte-for-byte unchanged and the pinned offsets in FeatureBuffer.cpp still hold.
 		float LODGrassGamma = 1;
+		// (44h) New 16-byte row; mirrors SharedData::LODBlendingSettings. Everything after LOD
+		// Blending in FeatureData moved 16 bytes (see the offsets pinned in FeatureBuffer.cpp).
+		float LODGrassBrightness = 1;
+		float pad0[3] = { 0, 0, 0 };
 	};
+	static_assert(sizeof(Settings) == 48);
 
 	Settings settings;
 
-	// (batch 19) Grass LOD has no LOD macro, so it is identified per draw in Hooks.cpp instead.
-	// Two judgements, because the primary one rests on a naming convention:
-	//   - name: shape name is exactly "grasspassthru" (every grass-LOD vertex in the measured
-	//     object LOD sits under that one name, no variants)
-	//   - fallback: no user data (merged LOD has no TESObjectREFR, placed foliage does) and the
-	//     material is back-lit -- independent of any generator's naming
-	//
-	// They are not symmetric: a shape named grasspassthru is necessarily merged and back-lit, so
-	// the name set is a subset of the fallback set. In-game draw counts for the two came out
-	// equal, and a subset of equal size is the same set -- so on the measured content the two
-	// agree exactly, which is what rules out the fallback over-reaching into placed back-lit
-	// foliage. That is why the counters they were measured with are gone again.
-	enum class GrassDetection : uint
-	{
-		Name = 0,
-		NoUserDataAndBackLit,
-		Total
-	};
-
-	GrassDetection grassDetection = GrassDetection::Name;
+	// (batch 19) Grass LOD has no LOD macro, so it is identified per draw in Hooks.cpp instead,
+	// by its shape name being exactly "grasspassthru".
+	// (44h) The "Grass LOD Detection" option (and its "no user data and back-lit" fallback) was
+	// removed, pinned to the shape name (the user's setting); the old GrassDetection key is ignored.
 
 	virtual void DrawSettings() override;
 

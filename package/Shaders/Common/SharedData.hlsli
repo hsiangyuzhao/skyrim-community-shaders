@@ -201,6 +201,9 @@ namespace SharedData
 		float LODObjectGamma;
 		float LODObjectSnowGamma;
 		float LODGrassGamma;
+		// (44h) New row: everything after this struct in FeatureData moved 16 bytes.
+		float LODGrassBrightness;
+		float3 pad0;
 	};
 
 	struct HairSpecularSettings

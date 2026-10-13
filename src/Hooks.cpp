@@ -217,22 +217,8 @@ namespace LightingExtensions
 					   return static_cast<char>(std::tolower(static_cast<unsigned char>(a_lhs))) == a_rhs;
 				   });
 	}
-
-	// Independent of any LOD generator's naming: merged LOD geometry has no object reference
-	// behind it, where foliage actually placed in the world does, and grass LOD billboards are
-	// back-lit. Near-field back-lit plants share the exact same shader permutation as grass LOD
-	// -- that is why the shader-side flags cannot be used to tell them apart, and why the user
-	// data is the part that carries the distinction.
-	bool IsGrassLODNoUserDataAndBackLit(const RE::BSRenderPass* a_pass)
-	{
-		if (a_pass->geometry->GetUserData())
-			return false;
-
-		const auto* shaderProperty = static_cast<RE::BSShaderProperty*>(
-			a_pass->geometry->GetGeometryRuntimeData().properties[1].get());
-		return shaderProperty &&
-		       shaderProperty->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kBackLighting);
-	}
+	// (44h) The "no user data and back-lit" fallback detection was removed with the
+	// "Grass LOD Detection" option: grass LOD is recognised by its shape name only.
 
 	struct BSLightingShader_SetupGeometry
 	{
@@ -281,14 +267,7 @@ namespace LightingExtensions
 
 			state->permutationData.ExtraShaderDescriptor &= ~static_cast<uint32_t>(State::ExtraShaderDescriptors::IsLODGrass);
 
-			// Only the armed judgement is evaluated. Both ran while their per-frame draw counts
-			// were being compared in the UI; those counts came out equal, and since the name set
-			// is a subset of the fallback set by construction, equal size means the same set.
-			const bool isGrassLOD =
-				globals::features::lodBlending.grassDetection == LODBlending::GrassDetection::Name ?
-					IsGrassLODName(pass->geometry->name.c_str()) :
-					IsGrassLODNoUserDataAndBackLit(pass);
-			if (isGrassLOD)
+			if (IsGrassLODName(pass->geometry->name.c_str()))
 				state->permutationData.ExtraShaderDescriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsLODGrass);
 		}
 		static inline REL::Relocation<decltype(thunk)> func;

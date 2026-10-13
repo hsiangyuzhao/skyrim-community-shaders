@@ -125,30 +125,30 @@ namespace
 		SettingsOf<decltype(globals::features::physicalSky.cloudCbData)> physicalSkyCloud;
 	};
 
-	static_assert(offsetof(FeatureDataLayoutMirror, vanillaFresnel) == 1040,
+	static_assert(offsetof(FeatureDataLayoutMirror, vanillaFresnel) == 1056,
 		"SharedData::vanillaFresnelSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, physicalSky) == 1120,
+	static_assert(offsetof(FeatureDataLayoutMirror, physicalSky) == 1136,
 		"SharedData::physSkyData moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, screenSpaceRayTracing) == 1376,
+	static_assert(offsetof(FeatureDataLayoutMirror, screenSpaceRayTracing) == 1392,
 		"SharedData::ssrtSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, exponentialHeightFog) == 1408,
+	static_assert(offsetof(FeatureDataLayoutMirror, exponentialHeightFog) == 1424,
 		"SharedData::exponentialHeightFogSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, volumetricLighting) == 1472,
+	static_assert(offsetof(FeatureDataLayoutMirror, volumetricLighting) == 1488,
 		"(batch 37b) SharedData::volumetricLightingSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyExt) == 1488,
+	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyExt) == 1504,
 		"(batch 37b) SharedData::physSkyExtData moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, volumetricFog) == 1504,
+	static_assert(offsetof(FeatureDataLayoutMirror, volumetricFog) == 1520,
 		"(batch 38) SharedData::volumetricFogSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, volumetricShadows) == 1568,
+	static_assert(offsetof(FeatureDataLayoutMirror, volumetricShadows) == 1584,
 		"(batch 38) SharedData::volumetricShadowsSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, dynamicSnow) == 1584,
+	static_assert(offsetof(FeatureDataLayoutMirror, dynamicSnow) == 1600,
 		"(batch 39) SharedData::dynamicSnowSettings moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyMoon) == 1696,
+	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyMoon) == 1712,
 		"(40d) SharedData::physSkyMoonData moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyNight) == 1712,
+	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyNight) == 1728,
 		"(41b) SharedData::physSkyNightData moved; update the HLSL mirror and this offset together.");
-	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyCloud) == 1776,
+	static_assert(offsetof(FeatureDataLayoutMirror, physicalSkyCloud) == 1792,
 		"(42b) SharedData::physSkyCloudData moved; update the HLSL mirror and this offset together.");
-	static_assert(sizeof(FeatureDataLayoutMirror) == 1840,  // (42c) + WetnessEffects 32; (42b) + PhysSkyCloudData 64; (41b) + PhysSkyNightData 64; (40d) + PhysSkyMoonData 16; (batch 39c) DynamicSnow 80 -> 112
+	static_assert(sizeof(FeatureDataLayoutMirror) == 1856,  // (44h) + LODBlending 16 (32 -> 48, every offset above +16); (42c) + WetnessEffects 32; (42b) + PhysSkyCloudData 64; (41b) + PhysSkyNightData 64; (40d) + PhysSkyMoonData 16; (batch 39c) DynamicSnow 80 -> 112
 		"FeatureData's total size changed; check every offset above against fxc's reflection listing.");
 }
