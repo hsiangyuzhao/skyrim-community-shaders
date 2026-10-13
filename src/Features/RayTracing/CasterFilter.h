@@ -57,5 +57,8 @@ namespace RayTracingCasterFilter
 	inline constexpr float kMissedMinRadius = 256.0f;
 	[[nodiscard]] std::uint32_t MissedCount();
 	[[nodiscard]] std::vector<RE::NiPointer<RE::BSGeometry>> TakeMissed();
+	/// (45g) The scene could not judge this miss yet (its cell is still being captured, its BLAS is
+	/// being built, ...): the geometry is noted again the next time it is drawn into the cascades.
+	void ForgetMissed(const RE::BSGeometry* a_geometry);
 	void ResetMissed();
 }

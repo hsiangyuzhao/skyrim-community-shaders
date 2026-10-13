@@ -104,6 +104,11 @@ namespace RayTracingCasterFilter
 		return out;
 	}
 
+	void ForgetMissed(const RE::BSGeometry* a_geometry)
+	{
+		g_missed.erase(a_geometry);
+	}
+
 	void ResetMissed()
 	{
 		g_missed.clear();

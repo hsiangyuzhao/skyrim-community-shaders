@@ -76,6 +76,9 @@ namespace RayTracingRT
 		// (live worldBound spheres). The instance as written into the TLAS must lie inside it.
 		bool hasExpected = false;
 		double expectMin[3]{}, expectMax[3]{};
+		// (45g) For the self-check log: the owning reference and shape name (objects only).
+		std::uint32_t refID = 0;
+		const char* label = nullptr;
 	};
 
 	struct FrameInput
@@ -98,6 +101,8 @@ namespace RayTracingRT
 		std::uint32_t mismatched[kInstanceCategories]{};  // ... and found outside them (last check)
 		std::uint64_t mismatchedTotal = 0;
 		std::uint32_t logged = 0;
+		// (45g) Each misfit (reference + BLAS) is logged again at most every 30 s, 200 lines in total.
+		std::unordered_map<std::uint64_t, std::int64_t> lastLogged;
 	};
 
 	struct Stats

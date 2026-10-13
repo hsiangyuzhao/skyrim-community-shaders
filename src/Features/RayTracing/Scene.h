@@ -2,6 +2,8 @@
 
 #include "Backend.h"
 
+#include <deque>
+
 /**
  * @brief (45, RT prototype) Scene-graph capture of the loaded exterior cells.
  *
@@ -16,6 +18,10 @@
  * Lighting shader that casts shadows and is neither alpha-tested, alpha-blended, skinned, a decal
  * nor tree-animated. (45f) Landscape is not captured (kCaptureLandscape): it only receives.
  * Everything else is counted per reason (shown on the page) and keeps its shadow-map shadow.
+ * (45g) Alpha-tested shapes are taken as opaque when CutoutAsOpaque allows it (large, one-sided,
+ * edge-only cutout); shapes under camera-facing billboard nodes and refraction (heat haze) shapes
+ * never go in; of a NiSwitchNode only the drawn child is captured; statics with a Havok-driven
+ * part (a child node with its own collision: hinged signs) are traced as moving objects.
  *
  * (45e) Objects that can move or need their own placement -- doors, activators, movable statics
  * and lights; loose items; trees and plants (only their opaque, non alpha-tested shapes: trunks
@@ -52,6 +58,10 @@ namespace RayTracingScene
 	/// (45f) References held by the worldspace's persistent cell (not by the grid cell they stand
 	/// in) are captured with the grid cell whose square they stand in.
 	inline constexpr bool kCapturePersistent = true;
+	/// (45g) CutoutAsOpaque criteria: alpha test "greater (or equal) than" at most this threshold
+	/// (0-255; roof tiles use 80, plank cut-outs 128) on a one-sided shape at least this large.
+	inline constexpr std::uint8_t kCutoutMaxThreshold = 128;
+	inline constexpr float kCutoutMinRadius = 128.0f;
 
 	struct SkipCounts
 	{
@@ -69,7 +79,35 @@ namespace RayTracingScene
 		std::uint32_t noShadow = 0;        // shape does not cast shadows in the game either
 		std::uint32_t noCpuData = 0;       // the engine kept no CPU copy of the vertices
 		std::uint32_t badData = 0;         // index out of range, unknown vertex layout
+		std::uint32_t billboard = 0;       // (45g) under a camera-facing NiBillboardNode (fire haze planes, glows)
+		std::uint32_t refraction = 0;      // (45g) refraction shader (heat haze): invisible distortion
+		std::uint32_t switchedOff = 0;     // (45g) inactive children of a NiSwitchNode (the game draws one child)
+		std::uint32_t cutoutAsOpaque = 0;  // (45g) alpha-tested shapes taken as opaque (CutoutAsOpaque), not a skip
+		std::uint32_t physicsParts = 0;    // (45g) statics with a Havok-driven part (swinging signs): own instances
 	};
+
+	/// (45g) Why a missed caster (a big shape drawn into the sun cascades inside the traced area but
+	/// absent from the scene) is missing; counted once per distinct shape after it was judged final.
+	enum class MissReason : std::uint8_t
+	{
+		NeverCaptured,        // its reference was never captured (not in its cell's reference list when captured)
+		ShapeSkipped,         // its reference was captured, this shape was not (hidden then, no CPU copy, placement, ...)
+		RootMismatch,         // captured with older 3D (a recapture is requested)
+		PersistentUnmatched,  // a persistent reference whose square has no captured cell
+		AlphaTested,
+		Decal,
+		Skinned,
+		NotLighting,
+		Billboard,
+		Character,
+		NoOwner,              // not part of a placed reference
+		Other,                // other shape rules (no shadow flag, geometry type, LOD flag, refraction, ...)
+		Count
+	};
+	inline constexpr const char* kMissReasonNames[] = { "never captured", "captured but shape skipped", "3D root mismatch",
+		"persistent, no captured square", "alpha-tested", "decal", "skinned", "not Lighting shader", "billboard", "character",
+		"no owning reference", "other shape rule" };
+	static_assert(std::size(kMissReasonNames) == static_cast<std::size_t>(MissReason::Count));
 
 	/// (45e) Objects with their own TLAS instances, moved every frame.
 	enum class ObjectKind : std::uint8_t
@@ -114,9 +152,14 @@ namespace RayTracingScene
 		std::uint32_t persistentRefs = 0;     // found while capturing cells (total since the last reset)
 		std::uint32_t persistentObjects = 0;  // found by the object scan
 		// (45f) Missed casters described in the log (CasterFilter self-check).
-		std::uint32_t missedDescribed = 0;
+		std::uint32_t missedDescribed = 0;   // lines written to the log this session
 		std::uint32_t missedCapturable = 0;  // the shape itself is fine: its reference was not captured
 		std::uint32_t missedRejected = 0;    // the shape was rejected (reason in the log)
+		// (45g) Judged misses in the current area (distinct shapes; reset with the scene), by reason.
+		std::uint32_t missedConfirmed = 0;
+		std::uint32_t missedByReason[static_cast<int>(MissReason::Count)]{};
+		std::uint32_t missedPending = 0;           // re-armed: cell still capturing, BLAS building, ... (total)
+		std::uint32_t missedRecaptures = 0;        // recaptures the self-check requested (total)
 	};
 
 	class Scene
@@ -148,7 +191,9 @@ namespace RayTracingScene
 		void CollectInstances(std::vector<RayTracingRT::Instance>& o_instances, bool a_expected) const;
 
 		/// (45f) Logs why big casters the shadow map drew inside the traced area are not in the
-		/// scene (CasterFilter::TakeMissed); a few per frame, the first kMissedLogLimit in total.
+		/// scene (CasterFilter::TakeMissed). (45g) Misses whose cell is still being captured or whose
+		/// BLAS is being built are re-armed instead of counted; judged ones are counted per
+		/// MissReason and each distinct reference + shape is logged once (rate-limited, capped).
 		void DescribeMissedCasters();
 
 		/// After this frame's trace was submitted (or skipped): releases the retiring captures.
@@ -162,6 +207,16 @@ namespace RayTracingScene
 
 		[[nodiscard]] const Stats& GetStats() const { return stats_; }
 		void ResetPeaks() { stats_.maxGatherMs = 0.0f; }
+
+		/// (45g) Debug switch: large static alpha-tested shapes with an edge-only cutout (roof tiles)
+		/// are taken as opaque occluders. A change re-captures everything.
+		void SetCutoutAsOpaque(bool a_enable)
+		{
+			if (a_enable != cutoutAsOpaque_) {
+				cutoutAsOpaque_ = a_enable;
+				RequestFlush();
+			}
+		}
 
 	private:
 		struct TrackedRef
@@ -243,9 +298,18 @@ namespace RayTracingScene
 		bool ReadMesh(RE::BSTriShape* a_shape, bool a_landscape, RawMesh& o_mesh);
 		/// The shape if it may go into the scene (Lighting shader, opaque, casts shadows, ...); the
 		/// reason is counted otherwise.
-		RE::BSTriShape* CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim);
+		RE::BSTriShape* CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout);
 		/// (45f) CheckShape's verdict without counting: nullptr = accepted, else the reason.
-		static const char* ShapeRejectReason(RE::NiAVObject* a_object, bool a_allowTreeAnim, SkipCounts* o_counts);
+		/// (45g) a_allowCutout: alpha-tested shapes passing CutoutAsOpaque's criteria are accepted;
+		/// o_reason (optional) receives the reason's MissReason bucket.
+		static const char* ShapeRejectReason(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, SkipCounts* o_counts,
+			MissReason* o_reason = nullptr);
+		/// (45g) Statics with a Havok-driven part (a node below the root with its own collision
+		/// object: hinged signs and the like) move: they get per-frame object instances.
+		static bool HasPhysicsPart(RE::NiAVObject* a_object, int a_depth);
+		/// (45g) Children of a node that the game draws (NiSwitchNode: the active one only); false
+		/// for camera-facing billboard nodes (their transform follows the main camera).
+		bool VisitChildren(RE::NiNode* a_node);
 		/// (45f) The grid cell's references plus the persistent-cell references standing in its square.
 		void CollectCellRefs(RE::TESObjectCELL* a_cell, std::int32_t a_x, std::int32_t a_y, std::vector<RE::NiPointer<RE::TESObjectREFR>>& o_refs,
 			std::uint32_t* o_persistent) const;
@@ -292,7 +356,7 @@ namespace RayTracingScene
 		};
 
 		void UpdateObjects(RayTracingRT::Backend& a_backend, std::int64_t a_deadline, bool a_allowNewMeshes);
-		void CollectObjectShapes(RE::NiAVObject* a_object, bool a_allowTreeAnim, int a_depth, std::vector<RE::BSTriShape*>& o_shapes);
+		void CollectObjectShapes(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, int a_depth, std::vector<RE::BSTriShape*>& o_shapes);
 		void CaptureObjectRef(RayTracingRT::Backend& a_backend, const RE::NiPointer<RE::TESObjectREFR>& a_ref, RE::NiAVObject* a_root,
 			ObjectKind a_kind, bool a_allowNewMeshes);
 		void ReleaseObject(RayTracingRT::Backend& a_backend, ObjectRef& a_object);
@@ -315,5 +379,18 @@ namespace RayTracingScene
 		RayTracingRT::Backend* gatherBackend_ = nullptr;
 		std::uint32_t currentFrame_ = 0;
 		std::uint32_t missedRejectedLogged_ = 0;  // (45f) rejected-shape misses described in the log
+		// (45g) Missed-caster bookkeeping.
+		static constexpr std::uint32_t kMissedLogCap = 200;      // log lines per session
+		static constexpr std::uint32_t kMissedLogBurst = 8;      // new lines per window
+		static constexpr double kMissedLogWindowMs = 10000.0;
+		ankerl::unordered_dense::set<const RE::BSGeometry*> missedJudged_;  // judged in this area (counted once)
+		ankerl::unordered_dense::set<std::uint64_t> missedLogged_;          // reference + shape name, whole session
+		ankerl::unordered_dense::set<const RE::TESObjectREFR*> recaptureAsked_;  // never-captured refs given one recapture
+		std::deque<std::string> missedBacklog_;  // judged misses waiting for the log's rate limit
+		std::int64_t missedWindowStart_ = 0;
+		std::uint32_t missedWindowCount_ = 0;
+		bool cutoutAsOpaque_ = true;
+		// (45g) Statics with a Havok-driven part (reference -> its 3D when judged): object path.
+		ankerl::unordered_dense::map<const RE::TESObjectREFR*, const RE::NiAVObject*> physicsRefs_;
 	};
 }

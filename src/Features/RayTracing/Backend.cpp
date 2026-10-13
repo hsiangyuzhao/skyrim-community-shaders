@@ -833,21 +833,35 @@ namespace RayTracingRT
 		const auto category = std::min<std::uint32_t>(a_instance.category, kInstanceCategories - 1);
 		++check_.mismatched[category];
 		++check_.mismatchedTotal;
-		if (check_.logged >= 16)
+		// (45g) Logged again every 30 s per reference + BLAS (an animated or camera-dependent
+		// transform then shows as a drifting box), 200 lines in total.
+		if (check_.logged >= 200)
 			return;
+		{
+			LARGE_INTEGER now, frequency;
+			QueryPerformanceCounter(&now);
+			QueryPerformanceFrequency(&frequency);
+			const std::uint64_t key = (static_cast<std::uint64_t>(a_instance.refID) << 32) ^ a_instance.blas;
+			const auto it = check_.lastLogged.find(key);
+			if (it != check_.lastLogged.end() && now.QuadPart - it->second < frequency.QuadPart * 30)
+				return;
+			check_.lastLogged[key] = now.QuadPart;
+		}
 		++check_.logged;
 		if (empty) {
 			logger::warn("[RayTracing] TLAS self-check: {} instance (BLAS {}, {} triangles) has no vertices in use", kInstanceCategoryNames[category],
 				a_instance.blas, a_blas.triangles);
 			return;
 		}
-		logger::warn("[RayTracing] TLAS self-check: {} instance (BLAS {}, {} triangles) spans ({:.0f}, {:.0f}, {:.0f}) .. ({:.0f}, {:.0f}, {:.0f}) "
-					 "in the world, the engine's bounds of its shapes span ({:.0f}, {:.0f}, {:.0f}) .. ({:.0f}, {:.0f}, {:.0f}): sticks out by {:.0f} units "
-					 "(camera ({:.0f}, {:.0f}, {:.0f}), mask 0x{:02X}, flags 0x{:X})",
-			kInstanceCategoryNames[category], a_instance.blas, a_blas.triangles, worldMin[0], worldMin[1], worldMin[2], worldMax[0], worldMax[1],
-			worldMax[2], a_instance.expectMin[0], a_instance.expectMin[1], a_instance.expectMin[2], a_instance.expectMax[0], a_instance.expectMax[1],
-			a_instance.expectMax[2], worst, camera[0], camera[1], camera[2], static_cast<std::uint32_t>(a_desc.InstanceMask),
-			static_cast<std::uint32_t>(a_desc.Flags));
+		logger::warn("[RayTracing] TLAS self-check: {} instance (BLAS {}, {} triangles{}) spans ({:.0f}, {:.0f}, {:.0f}) .. ({:.0f}, {:.0f}, {:.0f}) "
+					 "in the world (size {:.0f} x {:.0f} x {:.0f}, origin ({:.1f}, {:.1f}, {:.1f})), the engine's bounds of its shapes span ({:.0f}, {:.0f}, {:.0f}) .. "
+					 "({:.0f}, {:.0f}, {:.0f}): sticks out by {:.0f} units (camera ({:.0f}, {:.0f}, {:.0f}), mask 0x{:02X}, flags 0x{:X})",
+			kInstanceCategoryNames[category], a_instance.blas, a_blas.triangles,
+			a_instance.refID ? std::format(", reference {:08X} shape '{}'", a_instance.refID, a_instance.label ? a_instance.label : "") : std::string(),
+			worldMin[0], worldMin[1], worldMin[2], worldMax[0], worldMax[1], worldMax[2], worldMax[0] - worldMin[0], worldMax[1] - worldMin[1],
+			worldMax[2] - worldMin[2], a_instance.x, a_instance.y, a_instance.z, a_instance.expectMin[0], a_instance.expectMin[1], a_instance.expectMin[2],
+			a_instance.expectMax[0], a_instance.expectMax[1], a_instance.expectMax[2], worst, camera[0], camera[1], camera[2],
+			static_cast<std::uint32_t>(a_desc.InstanceMask), static_cast<std::uint32_t>(a_desc.Flags));
 	}
 
 	bool Backend::ExecuteFrame(const FrameInput& a_input)

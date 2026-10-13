@@ -68,6 +68,8 @@ public:
 		// Debug A/B switches (persisted so a test survives a restart).
 		bool KeepCastersInShadowMap = false;
 		bool KeepScreenSpaceShadows = false;
+		// (45g) Large one-sided alpha-tested shapes with an edge-only cutout (roof tiles) are RT occluders.
+		bool CutoutAsOpaque = true;
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted

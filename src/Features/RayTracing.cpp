@@ -12,7 +12,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Enabled,
 	QualityLevel,
 	KeepCastersInShadowMap,
-	KeepScreenSpaceShadows)
+	KeepScreenSpaceShadows,
+	CutoutAsOpaque)
 
 namespace
 {
@@ -364,6 +365,7 @@ void RayTracing::RunFrame()
 {
 	if (!EnsureBackend())
 		return;
+	scene.SetCutoutAsOpaque(settings.CutoutAsOpaque);  // (45g) a change re-captures the scene
 	if (status == Status::Off || status == Status::Unavailable)
 		status = Status::Waiting;
 
@@ -597,15 +599,20 @@ void RayTracing::RunFrame()
 		std::uint32_t mismatched = 0;
 		for (const auto count : check.mismatched)
 			mismatched += count;
+		std::string reasons;
+		for (int r = 0; r < static_cast<int>(RayTracingScene::MissReason::Count); ++r) {
+			if (sc.missedByReason[r])
+				reasons += std::format("{}{} {}", reasons.empty() ? "" : ", ", RayTracingScene::kMissReasonNames[r], sc.missedByReason[r]);
+		}
 		logger::info("[RayTracing] TLAS: {} cell chunks, {} doors/activators/movable, {} items, {} trees/plants ({} instances not built yet); "
 					 "every instance mask 0x{:02X}, flags 0x{:X} (triangle cull disable, force opaque); self-check: {} of {} instances outside the "
-					 "engine's bounds (cell chunks {}, objects {}; {} in total); missed casters {} ({} with an acceptable shape, {} with a rejected shape); "
-					 "persistent references taken: {} statics, {} objects",
+					 "engine's bounds (cell chunks {}, objects {}; {} in total); missed casters in this area {} ({}; {} re-checked later while pending, "
+					 "{} recaptures requested); alpha-tested shapes taken as opaque {}; persistent references taken: {} statics, {} objects",
 			check.written[RayTracingRT::kCategoryCell], check.written[RayTracingRT::kCategoryMovable], check.written[RayTracingRT::kCategoryItem],
 			check.written[RayTracingRT::kCategoryTree], notBuilt, RayTracingRT::Backend::kInstanceMask,
 			static_cast<std::uint32_t>(RayTracingRT::Backend::kInstanceFlags), mismatched, check.checked, check.mismatched[RayTracingRT::kCategoryCell],
-			mismatched - check.mismatched[RayTracingRT::kCategoryCell], check.mismatchedTotal, RayTracingCasterFilter::MissedCount(), sc.missedCapturable,
-			sc.missedRejected, sc.persistentRefs, sc.persistentObjects);
+			mismatched - check.mismatched[RayTracingRT::kCategoryCell], check.mismatchedTotal, sc.missedConfirmed, reasons.empty() ? "none" : reasons,
+			sc.missedPending, sc.missedRecaptures, sc.skipped.cutoutAsOpaque, sc.persistentRefs, sc.persistentObjects);
 	}
 }
 
@@ -720,7 +727,9 @@ void RayTracing::DrawSettings()
 			ImGui::Text("RT vs Shadow Map: inside the ray-traced area, red = only RT sees a shadow, blue = only the shadow map does.");
 			ImGui::Text("  While this view is on, the shadow map keeps every caster so the two can be compared.");
 			ImGui::Text("BLAS Coverage: green = the surface is in the ray-traced scene, magenta = it is not (character, leaves, grass, terrain, skipped object),");
-			ImGui::Text("  orange = the ray-traced scene has a surface in front of what you see (geometry in the wrong place).");
+			ImGui::Text("  yellow/orange = the ray-traced scene has a surface up to a few metres IN FRONT of the depth the game wrote here:");
+			ImGui::Text("  something the game does not draw (faded out, switched off), a part that moved since capture, or a surface");
+			ImGui::Text("  missing from the depth buffer (seen through alpha-tested cut-outs). Small yellow seams along edges are harmless.");
 			ImGui::Text("Raw RT Visibility: the traced result before smoothing and merging.");
 			ImGui::Text("RT Hit vs Depth: white = the ray-traced surface sits exactly where the game draws it,");
 			ImGui::Text("  red = it is in front (full red = 256 units), blue = behind, black = nothing there.");
@@ -728,6 +737,12 @@ void RayTracing::DrawSettings()
 		ImGui::Checkbox("Keep Static Casters in the Shadow Map", &settings.KeepCastersInShadowMap);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("A/B: normally objects the ray tracer covers are left out of the sun shadow map. On = they stay (the darker of both wins).");
+		ImGui::Checkbox("Treat Mostly-Opaque Alpha-Tested Shapes as Opaque", &settings.CutoutAsOpaque);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: big one-sided shapes whose cut-out only trims their edges (roof tiles, plank ends, stall canopies) block the sun");
+			ImGui::Text("  in the ray tracer as if solid. Two-sided cut-outs (banners, leaves, fences with holes) and small shapes stay out.");
+			ImGui::Text("Off: every alpha-tested shape keeps its shadow-map shadow (magenta in BLAS Coverage). Switching re-captures the scene.");
+		}
 		ImGui::Checkbox("Keep Screen Space Shadows", &settings.KeepScreenSpaceShadows);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("A/B: normally Screen Space Shadows (sun contact shadows) are switched off where ray tracing is in charge.");
@@ -790,13 +805,22 @@ void RayTracing::DrawSettings()
 				check.checked, static_cast<unsigned long long>(check.mismatchedTotal));
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("Each ray-traced instance, exactly as handed to the GPU, must lie inside the bounds the game computed for its shapes. Details in the log.");
-			const std::uint32_t missed = RayTracingCasterFilter::MissedCount();
-			ImGui::TextColored(missed ? bad : good, "Missed casters: %u big objects cast a shadow-map shadow inside the traced area but are not in the scene", missed);
+			const std::uint32_t missed = sc.missedConfirmed;
+			ImGui::TextColored(missed ? bad : good, "Missed casters: %u big shapes cast a shadow-map shadow inside the traced area but are not in the scene", missed);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("Shapes with a bound radius of %.0f units or more drawn into the sun shadow map inside the traced area.", RayTracingCasterFilter::kMissedMinRadius);
-				ImGui::Text("The first %u are described in the log (shape, reference, cell, and why they were not captured).", 32u);
-				ImGui::Text("So far: %u with a shape the ray tracer accepts, %u with a shape it rejects (alpha-tested, ...).", sc.missedCapturable, sc.missedRejected);
+				ImGui::Text("Counted once each, only after their cell finished capturing and their BLAS was built (%u were re-checked later).", sc.missedPending);
+				ImGui::Text("Each distinct one is described in the log (8 per 10 s, 200 per session; characters and tree leaves are not).");
+				ImGui::Text("A reference its cell did not have when captured gets one recapture first (%u requested so far).", sc.missedRecaptures);
 			}
+			// (45g) Why, by reason (this area).
+			std::string reasons;
+			for (int r = 0; r < static_cast<int>(RayTracingScene::MissReason::Count); ++r) {
+				if (sc.missedByReason[r])
+					reasons += std::format("{}{} {}", reasons.empty() ? "" : ", ", RayTracingScene::kMissReasonNames[r], sc.missedByReason[r]);
+			}
+			if (!reasons.empty())
+				ImGui::TextWrapped("  By reason: %s", reasons.c_str());
 		}
 		if (rt.skippedFramesBusy || latchedWithoutTrace)
 			ImGui::Text("Frames without a trace (D3D12 busy): %u, of which with casters left out of the shadow map: %u (should be 0)",
@@ -808,6 +832,9 @@ void RayTracing::DrawSettings()
 				skip.hidden, skip.alphaTested, skip.alphaBlended, skip.decals, skip.skinned, skip.noShadow);
 			ImGui::Text("Shapes: not Lighting shader %u, other geometry types %u, no CPU vertex copy %u, bad data %u",
 				skip.notLighting, skip.otherGeometry, skip.noCpuData, skip.badData);
+			ImGui::Text("Shapes: camera-facing billboards %u, refraction (heat haze) %u, switched-off children %u; alpha-tested taken as opaque %u",
+				skip.billboard, skip.refraction, skip.switchedOff, skip.cutoutAsOpaque);
+			ImGui::Text("Statics with a Havok-driven part (hinged signs) traced as moving objects: %u", skip.physicsParts);
 			ImGui::Text("Placement check: %u shapes checked, %u fixed (other vertex format), %u left out (wrong place), %u without bound",
 				sc.placementChecked, sc.placementFixed, sc.placementRejected, sc.placementUnchecked);
 			if (auto _tt = Util::HoverTooltipWrapper())

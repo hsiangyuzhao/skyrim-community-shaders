@@ -159,6 +159,7 @@ namespace RayTracingScene
 		const auto maxGather = stats_.maxGatherMs;
 		const auto logged = stats_.placementLogged;
 		const auto missedDescribed = stats_.missedDescribed, missedCapturable = stats_.missedCapturable, missedRejected = stats_.missedRejected;
+		const auto missedPending = stats_.missedPending, missedRecaptures = stats_.missedRecaptures;
 		stats_ = {};
 		stats_.recaptures = recaptures;
 		stats_.maxGatherMs = maxGather;
@@ -166,8 +167,13 @@ namespace RayTracingScene
 		stats_.missedDescribed = missedDescribed;
 		stats_.missedCapturable = missedCapturable;
 		stats_.missedRejected = missedRejected;
-		// A new area: its misses are counted afresh (the log limit above stays).
+		stats_.missedPending = missedPending;
+		stats_.missedRecaptures = missedRecaptures;
+		// A new area: its misses are counted afresh (the log's dedup and cap stay for the session).
 		RayTracingCasterFilter::ResetMissed();
+		missedJudged_.clear();
+		recaptureAsked_.clear();
+		physicsRefs_.clear();
 	}
 
 	bool Scene::Validate(const Cell& a_cell) const
@@ -407,31 +413,53 @@ namespace RayTracingScene
 		return true;
 	}
 
-	const char* Scene::ShapeRejectReason(RE::NiAVObject* a_object, bool a_allowTreeAnim, SkipCounts* o_counts)
+	const char* Scene::ShapeRejectReason(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, SkipCounts* o_counts,
+		MissReason* o_reason)
 	{
 		SkipCounts ignored;
+		MissReason ignoredReason;
 		auto& skipped = o_counts ? *o_counts : ignored;
+		auto& reason = o_reason ? *o_reason : ignoredReason;
+		reason = MissReason::Other;
 		auto* geometry = a_object->AsGeometry();
 		if (!geometry)
 			return "not geometry";
 		if (geometry->GetType().get() != RE::BSGeometry::Type::kTriShape) {
 			++skipped.otherGeometry;
-			return "not a plain BSTriShape";
+			switch (geometry->GetType().get()) {
+			case RE::BSGeometry::Type::kDynamicTriShape:
+				return "not a plain BSTriShape (BSDynamicTriShape)";
+			case RE::BSGeometry::Type::kMeshLODTriShape:
+				return "not a plain BSTriShape (BSMeshLODTriShape)";
+			case RE::BSGeometry::Type::kMultiIndexTriShape:
+			case RE::BSGeometry::Type::kLODMultiIndexTriShape:
+				return "not a plain BSTriShape (multi-index, snow)";
+			case RE::BSGeometry::Type::kSubIndexTriShape:
+				return "not a plain BSTriShape (sub-index)";
+			case RE::BSGeometry::Type::kParticles:
+			case RE::BSGeometry::Type::kStripParticles:
+				return "not a plain BSTriShape (particles)";
+			default:
+				return "not a plain BSTriShape";
+			}
 		}
 		const auto& runtime = geometry->GetGeometryRuntimeData();
 		auto* lighting = netimmerse_cast<RE::BSLightingShaderProperty*>(runtime.properties[RE::BSGeometry::States::kEffect].get());
 		if (!lighting) {
 			++skipped.notLighting;
+			reason = MissReason::NotLighting;
 			return "not drawn with the Lighting shader";
 		}
 		using F = RE::BSShaderProperty::EShaderPropertyFlag;
 		const auto& flags = lighting->flags;
 		if (flags.any(F::kSkinned) || runtime.skinInstance) {
 			++skipped.skinned;
+			reason = MissReason::Skinned;
 			return "skinned";
 		}
 		if (flags.any(F::kDecal, F::kDynamicDecal)) {
 			++skipped.decals;
+			reason = MissReason::Decal;
 			return "decal";
 		}
 		// Tree-animated (wind) shapes: only in trees / plants, whose opaque trunk and branch shapes
@@ -448,12 +476,42 @@ namespace RayTracingScene
 			++skipped.noShadow;
 			return "does not cast shadows";
 		}
+		// (45g) Heat-haze planes of fires (refraction, usually under a billboard node): invisible.
+		if (flags.any(F::kRefraction)) {
+			++skipped.refraction;
+			return "refraction (heat haze)";
+		}
+		// (45g) A shape under a camera-facing billboard turns towards the MAIN camera every frame:
+		// its ray-traced shadow would move with the view. The shadow map renders it facing the
+		// light, so it keeps its shadow-map shadow.
+		for (auto* parent = geometry->parent; parent; parent = parent->parent) {
+			if (netimmerse_cast<RE::NiBillboardNode*>(parent)) {
+				++skipped.billboard;
+				reason = MissReason::Billboard;
+				return "under a camera-facing billboard node";
+			}
+		}
 		if (auto* alpha = netimmerse_cast<RE::NiAlphaProperty*>(runtime.properties[RE::BSGeometry::States::kProperty].get())) {
 			if (alpha->GetAlphaTesting()) {
-				++skipped.alphaTested;
-				return "alpha-tested";
-			}
-			if (alpha->GetAlphaBlending()) {
+				// (45g) CutoutAsOpaque: an alpha test that only trims edges (roof tiles, plank ends):
+				// one-sided (cloth banners, leaves and fences with holes are two-sided), a large
+				// shape, a "keep alpha above a low threshold" test and no blending on top.
+				const auto test = static_cast<RE::NiAlphaProperty::TestFunction>((alpha->alphaFlags >> 10) & 7);
+				const bool edgeOnly = (test == RE::NiAlphaProperty::TestFunction::kGreater || test == RE::NiAlphaProperty::TestFunction::kGreaterEqual) &&
+				                      alpha->alphaThreshold <= kCutoutMaxThreshold && !alpha->GetAlphaBlending() && flags.none(F::kTwoSided, F::kTreeAnim) &&
+				                      std::isfinite(geometry->worldBound.radius) && geometry->worldBound.radius >= kCutoutMinRadius;
+				if (a_allowCutout && edgeOnly) {
+					++skipped.cutoutAsOpaque;
+				} else {
+					++skipped.alphaTested;
+					reason = MissReason::AlphaTested;
+					if (!a_allowCutout)
+						return edgeOnly ? "alpha-tested (edge-only cutout; Treat Mostly-Opaque Alpha-Tested Shapes as Opaque is off)" : "alpha-tested";
+					return flags.any(F::kTwoSided) ? "alpha-tested (two-sided)" :
+					       !(geometry->worldBound.radius >= kCutoutMinRadius) ? "alpha-tested (small)" :
+					                                                          "alpha-tested (threshold / test function)";
+				}
+			} else if (alpha->GetAlphaBlending()) {
 				++skipped.alphaBlended;
 				return "alpha-blended";
 			}
@@ -465,11 +523,45 @@ namespace RayTracingScene
 		return nullptr;
 	}
 
-	RE::BSTriShape* Scene::CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim)
+	RE::BSTriShape* Scene::CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout)
 	{
-		if (!a_object->AsGeometry() || ShapeRejectReason(a_object, a_allowTreeAnim, &stats_.skipped))
+		if (!a_object->AsGeometry() || ShapeRejectReason(a_object, a_allowTreeAnim, a_allowCutout, &stats_.skipped))
 			return nullptr;
 		return a_object->AsGeometry()->AsTriShape();
+	}
+
+	bool Scene::HasPhysicsPart(RE::NiAVObject* a_object, int a_depth)
+	{
+		auto* node = a_object ? a_object->AsNode() : nullptr;
+		if (!node || a_depth > 16)
+			return false;
+		if (a_depth > 0 && node->collisionObject)
+			return true;
+		for (auto& child : node->GetChildren())
+			if (HasPhysicsPart(child.get(), a_depth + 1))
+				return true;
+		return false;
+	}
+
+	bool Scene::VisitChildren(RE::NiNode* a_node)
+	{
+		if (netimmerse_cast<RE::NiBillboardNode*>(a_node)) {
+			++stats_.skipped.billboard;
+			return false;
+		}
+		return true;
+	}
+
+	namespace
+	{
+		/// (45g) The child of a NiSwitchNode the game draws; -1 = draw all (not a switch node / unknown).
+		std::int32_t ActiveSwitchChild(RE::NiNode* a_node)
+		{
+			if (!netimmerse_cast<RE::NiSwitchNode*>(a_node))
+				return -1;
+			// NiSwitchNode::index (0x12C SE/AE, 0x154 VR): CommonLib's member offset is not valid in the multi-runtime build.
+			return REL::RelocateMember<std::int32_t>(a_node, 0x12C, 0x154);
+		}
 	}
 
 	void Scene::CaptureObject(Cell& a_cell, RE::NiAVObject* a_object, int a_depth)
@@ -481,11 +573,21 @@ namespace RayTracingScene
 			return;
 		}
 		if (auto* node = a_object->AsNode()) {
-			for (auto& child : node->GetChildren())
+			if (!VisitChildren(node))
+				return;
+			const std::int32_t active = ActiveSwitchChild(node);
+			std::int32_t index = 0;
+			for (auto& child : node->GetChildren()) {
+				if (active >= 0 && index++ != active) {
+					if (child)
+						++stats_.skipped.switchedOff;
+					continue;
+				}
 				CaptureObject(a_cell, child.get(), a_depth + 1);
+			}
 			return;
 		}
-		if (auto* shape = CheckShape(a_object, false))
+		if (auto* shape = CheckShape(a_object, false, cutoutAsOpaque_))
 			AppendShape(a_cell, shape, false);
 	}
 
@@ -493,7 +595,7 @@ namespace RayTracingScene
 	// (45e) Objects: doors / activators / movable statics, items, opaque parts of trees and plants.
 	// ---------------------------------------------------------------------------------------------
 
-	void Scene::CollectObjectShapes(RE::NiAVObject* a_object, bool a_allowTreeAnim, int a_depth, std::vector<RE::BSTriShape*>& o_shapes)
+	void Scene::CollectObjectShapes(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, int a_depth, std::vector<RE::BSTriShape*>& o_shapes)
 	{
 		if (!a_object || a_depth > 64)
 			return;
@@ -502,11 +604,15 @@ namespace RayTracingScene
 			return;
 		}
 		if (auto* node = a_object->AsNode()) {
+			// (45g) Billboards turn towards the main camera (the fire's heat-haze plane gave a
+			// ray-traced shadow that moved with the view).
+			if (!VisitChildren(node))
+				return;
 			for (auto& child : node->GetChildren())
-				CollectObjectShapes(child.get(), a_allowTreeAnim, a_depth + 1, o_shapes);
+				CollectObjectShapes(child.get(), a_allowTreeAnim, a_allowCutout, a_depth + 1, o_shapes);
 			return;
 		}
-		if (auto* shape = CheckShape(a_object, a_allowTreeAnim))
+		if (auto* shape = CheckShape(a_object, a_allowTreeAnim, a_allowCutout))
 			o_shapes.push_back(shape);
 	}
 
@@ -520,7 +626,7 @@ namespace RayTracingScene
 
 		static thread_local std::vector<RE::BSTriShape*> shapes;
 		shapes.clear();
-		CollectObjectShapes(a_root, a_kind == ObjectKind::Tree, 0, shapes);
+		CollectObjectShapes(a_root, a_kind == ObjectKind::Tree, a_kind != ObjectKind::Tree && cutoutAsOpaque_, 0, shapes);
 
 		static thread_local RawMesh mesh;
 		static thread_local std::vector<float> local;
@@ -589,7 +695,12 @@ namespace RayTracingScene
 				// (45f) Persistent references (doors, ...) belong to the worldspace's persistent
 				// cell: they are in the scene while the cell of their square is captured.
 				const bool inScene = CapturedCellOf(ref) != nullptr;
-				const bool valid = inScene && !ref->IsDisabled() && !ref->IsDeleted() && ref->Get3D() == object->root;
+				bool valid = inScene && !ref->IsDisabled() && !ref->IsDeleted() && ref->Get3D() == object->root;
+				if (valid && Classify(ref) == RefKind::Capture) {
+					// (45g) A static with a Havok-driven part: only while its cell's capture says so.
+					const auto it = physicsRefs_.find(ref);
+					valid = it != physicsRefs_.end() && it->second == object->root;
+				}
 				if (valid) {
 					keep.push_back(std::move(object));
 				} else {
@@ -629,7 +740,14 @@ namespace RayTracingScene
 			auto* ref = refPtr.get();
 			if (!ref || objectIndex_.contains(ref))
 				continue;
-			const RefKind kind = Classify(ref);
+			RefKind kind = Classify(ref);
+			if (kind == RefKind::Capture) {
+				// (45g) A static with a Havok-driven part, judged while its cell was captured.
+				const auto it = physicsRefs_.find(ref);
+				if (it == physicsRefs_.end() || it->second != ref->Get3D())
+					continue;
+				kind = RefKind::Movable;
+			}
 			if (kind != RefKind::Movable && kind != RefKind::Item && kind != RefKind::Tree)
 				continue;
 			if (ref->IsDisabled() || ref->IsDeleted())
@@ -678,6 +796,8 @@ namespace RayTracingScene
 				instance.category = object->kind == ObjectKind::Item ? RayTracingRT::kCategoryItem :
 				                    (object->kind == ObjectKind::Tree ? RayTracingRT::kCategoryTree : RayTracingRT::kCategoryMovable);
 				if (a_expected) {
+					instance.refID = object->ref->GetFormID();
+					instance.label = geometry->name.c_str();
 					const auto& b = geometry->worldBound;
 					if (std::isfinite(b.radius) && b.radius > 0.0f) {
 						instance.hasExpected = true;
@@ -739,6 +859,14 @@ namespace RayTracingScene
 				++skipped.hidden;
 				continue;
 			}
+			// (45g) Hinged signs and other statics with a Havok-driven part move: the object scan
+			// gives them per-frame instances instead of baking them where they were at capture.
+			if (HasPhysicsPart(root, 0)) {
+				physicsRefs_[ref] = root;
+				++skipped.physicsParts;
+				continue;
+			}
+			physicsRefs_.erase(ref);
 			CaptureObject(a_cell, root, 0);
 		}
 
@@ -1047,85 +1175,200 @@ namespace RayTracingScene
 		return nullptr;
 	}
 
+	namespace
+	{
+		/// (45g) This node's own userData. CommonLib's NiAVObject::GetUserData() falls back to the
+		/// parents, so the 45f walk stopped at the shape itself ("3D root differs" on every line).
+		RE::TESObjectREFR* OwnUserData(RE::NiAVObject* a_node)
+		{
+			return REL::RelocateMember<RE::TESObjectREFR*>(a_node, 0x0F8, 0x110);
+		}
+
+		std::uint64_t MissKey(RE::FormID a_ref, std::string_view a_shape)
+		{
+			return (static_cast<std::uint64_t>(a_ref) << 32) ^ static_cast<std::uint64_t>(std::hash<std::string_view>()(a_shape) & 0xFFFFFFFFu);
+		}
+	}
+
 	void Scene::DescribeMissedCasters()
 	{
+		const std::int64_t now = Qpc();
+		auto flushLog = [&] {
+			if (static_cast<double>(now - missedWindowStart_) * QpcMs() > kMissedLogWindowMs) {
+				missedWindowStart_ = now;
+				missedWindowCount_ = 0;
+			}
+			while (!missedBacklog_.empty() && missedWindowCount_ < kMissedLogBurst && stats_.missedDescribed < kMissedLogCap) {
+				logger::warn("{}", missedBacklog_.front());
+				missedBacklog_.pop_front();
+				++missedWindowCount_;
+				if (++stats_.missedDescribed == kMissedLogCap)
+					logger::warn("[RayTracing] Missed caster: {} described, no further ones are logged this session (the page keeps counting)", kMissedLogCap);
+			}
+		};
+
 		auto missed = RayTracingCasterFilter::TakeMissed();
-		if (missed.empty())
+		if (missed.empty()) {
+			flushLog();
 			return;
+		}
 		auto* tes = RE::TES::GetSingleton();
 		auto* worldSpace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
 		auto* sky = worldSpace ? worldSpace->GetSkyCell() : nullptr;
+		auto requestRecapture = [&](const Cell* a_cell) {
+			for (auto& cell : cells_) {
+				if (cell.get() == a_cell && !cell->dirty) {
+					cell->dirty = true;
+					++stats_.missedRecaptures;
+				}
+			}
+		};
+
 		for (const auto& pointer : missed) {
 			auto* geometry = pointer.get();
-			if (!geometry)
+			if (!geometry || missedJudged_.contains(geometry))
 				continue;
-			// The reference that owns the shape: the nearest ancestor carrying it as user data.
+			// The reference that owns the shape: the nearest node carrying it as its own user data.
 			RE::TESObjectREFR* ref = nullptr;
 			RE::NiAVObject* root = nullptr;
 			int depth = 0;
 			for (RE::NiAVObject* node = geometry; node && depth < 64; node = node->parent, ++depth) {
-				if (auto* owner = node->GetUserData()) {
+				if (auto* owner = OwnUserData(node)) {
 					ref = owner;
 					root = node;
 					break;
 				}
 			}
 			const RefKind kind = ref ? Classify(ref) : RefKind::Other;
-			const bool objectKind = kind == RefKind::Movable || kind == RefKind::Item || kind == RefKind::Tree;
-			const char* reason = ShapeRejectReason(geometry, kind == RefKind::Tree, nullptr);
-			if (reason)
-				++stats_.missedRejected;
-			else
-				++stats_.missedCapturable;
-			// The log is for the surprises: an acceptable shape the scene lacks. Rejected shapes
-			// (leaves, grass, characters, ...) are expected and only a few of them are described.
-			if (stats_.missedDescribed >= kMissedLogLimit || (reason && (missedRejectedLogged_ >= 4 || !ref)))
-				continue;
-			if (reason)
-				++missedRejectedLogged_;
-			++stats_.missedDescribed;
-			const auto& b = geometry->worldBound;
-			if (!ref) {
-				logger::warn("[RayTracing] Missed caster: '{}' (radius {:.0f} at {:.0f}, {:.0f}, {:.0f}) is drawn into the sun shadow map inside the ray-traced "
-							 "area but is not in the scene; shape: {}; no owning reference found (not part of a placed object)",
-					geometry->name.c_str(), b.radius, b.center.x, b.center.y, b.center.z, reason ? reason : "accepted");
-				continue;
+			bool physics = false;
+			if (kind == RefKind::Capture) {
+				const auto it = physicsRefs_.find(ref);
+				physics = it != physicsRefs_.end() && it->second == ref->Get3D();
 			}
-			auto* base = ref->GetBaseObject();
-			auto* parent = ref->GetParentCell();
-			const bool parentCaptured = parent && std::any_of(cells_.begin(), cells_.end(), [&](const std::unique_ptr<Cell>& a_cell) { return a_cell->cell == parent; });
-			const Cell* square = CapturedCellOf(ref);
-			bool tracked = false, trackedSameRoot = false;
-			for (const auto* list : { &cells_, &retiring_ }) {
-				for (const auto& cell : *list) {
-					for (const auto& entry : cell->tracked) {
-						if (entry.ref.get() == ref) {
-							tracked = true;
-							trackedSameRoot = trackedSameRoot || entry.root == ref->Get3D();
+			const bool objectKind = kind == RefKind::Movable || kind == RefKind::Item || kind == RefKind::Tree || physics;
+			MissReason bucket = MissReason::Other;
+			const char* shapeReason = ShapeRejectReason(geometry, kind == RefKind::Tree, kind != RefKind::Tree && cutoutAsOpaque_, nullptr, &bucket);
+			auto* parent = ref ? ref->GetParentCell() : nullptr;
+			const bool persistentCell = parent && parent == sky;
+			const Cell* square = ref ? CapturedCellOf(ref) : nullptr;
+
+			bool pending = false;
+			std::string verdict;
+			if (!ref) {
+				if (!shapeReason)
+					bucket = MissReason::NoOwner;
+				verdict = "no owning reference found (not part of a placed object)";
+			} else if (kind == RefKind::Actor) {
+				bucket = MissReason::Character;
+				verdict = "character (not traced)";
+			} else if (shapeReason) {
+				verdict = std::format("shape rejected: {}", shapeReason);
+			} else if (kind == RefKind::Other) {
+				bucket = MissReason::Other;
+				verdict = "a reference type that is not traced (markers, hazards, ...)";
+			} else if (!square) {
+				bucket = persistentCell ? MissReason::PersistentUnmatched : MissReason::NeverCaptured;
+				verdict = persistentCell ? "persistent reference whose square has no captured cell" : "its cell is not captured";
+			} else if (square->gathering || square->dirty || square->replacing ||
+					   std::any_of(cells_.begin(), cells_.end(), [&](const std::unique_ptr<Cell>& a_cell) { return a_cell->cell == square->cell && a_cell->replaces; })) {
+				pending = true;  // its cell is being (re)captured
+			} else {
+				// In a cell chunk already (its BLAS still building, or it moved out of its old bound)?
+				bool inChunk = false;
+				for (const auto* list : { &cells_, &retiring_ })
+					for (const auto& cell : *list)
+						for (const auto& g : cell->geometries)
+							inChunk = inChunk || g.get() == geometry;
+				if (inChunk) {
+					pending = true;
+				} else if (objectKind) {
+					if (objectIndex_.contains(ref)) {
+						const ObjectRef* entry = nullptr;
+						for (const auto& object : objects_)
+							if (object->ref.get() == ref)
+								entry = object.get();
+						bool hasShape = false;
+						if (entry)
+							for (const auto& s : entry->shapes)
+								hasShape = hasShape || s.geometry.get() == geometry;
+						if (!entry || entry->root != ref->Get3D() || hasShape) {
+							pending = true;  // re-validated next frame, or its BLAS is being built
+						} else {
+							bucket = MissReason::ShapeSkipped;
+							auto* data = geometry->GetGeometryRuntimeData().rendererData;
+							verdict = !data || !data->rawVertexData ? "the object was captured, this shape was not: no CPU vertex copy" :
+							                                          "the object was captured, this shape was not (hidden then, VRAM budget or placement check)";
 						}
+					} else if (currentFrame_ - square->completedFrame < 600) {
+						pending = true;  // the object scan has not reached it yet
+					} else {
+						bucket = MissReason::NeverCaptured;
+						verdict = "the object scan never took the reference";
+					}
+				} else {
+					bool tracked = false, trackedSameRoot = false;
+					for (const auto* list : { &cells_, &retiring_ })
+						for (const auto& cell : *list)
+							for (const auto& entry : cell->tracked)
+								if (entry.ref.get() == ref) {
+									tracked = true;
+									trackedSameRoot = trackedSameRoot || entry.root == ref->Get3D();
+								}
+					if (tracked && trackedSameRoot) {
+						bucket = MissReason::ShapeSkipped;
+						auto* data = geometry->GetGeometryRuntimeData().rendererData;
+						verdict = !data || !data->rawVertexData ? "the reference was captured, this shape was not: no CPU vertex copy" :
+						          (root != ref->Get3D())        ? "the reference was captured, this shape hangs under other 3D than the reference's" :
+						                                          "the reference was captured, this shape was not (hidden or switched off then, or placement check)";
+					} else if (tracked) {
+						bucket = MissReason::RootMismatch;
+						verdict = "the reference was captured with older 3D: recapture requested";
+						requestRecapture(square);
+					} else if (recaptureAsked_.insert(ref).second) {
+						// Not in its cell's reference list when the cell was captured (added later):
+						// one recapture of the cell; judged only if that does not take it either.
+						requestRecapture(square);
+						pending = true;
+					} else {
+						bucket = persistentCell ? MissReason::PersistentUnmatched : MissReason::NeverCaptured;
+						verdict = "the reference was never captured, not even by a recapture of its cell";
 					}
 				}
 			}
-			const bool captured = std::any_of(cells_.begin(), cells_.end(), [&](const std::unique_ptr<Cell>& a_cell) {
-				return std::any_of(a_cell->geometries.begin(), a_cell->geometries.end(), [&](const RE::NiPointer<RE::BSGeometry>& a_g) { return a_g.get() == geometry; });
-			});
-			const char* kindName = kind == RefKind::Capture ? "baked into cell chunks" :
-			                       kind == RefKind::Actor   ? "character (not traced)" :
-			                       objectKind               ? "own instance (object)" :
-			                                                  "not a traced reference type";
-			logger::warn("[RayTracing] Missed caster: '{}' (radius {:.0f} at {:.0f}, {:.0f}, {:.0f}) is drawn into the sun shadow map inside the ray-traced "
-						 "area but is not in the scene; shape: {}; reference {:08X} base {:08X} ({}, {}){}{}, 3D root {}; parent cell {:08X} ({}); "
-						 "square's cell {}; {}",
-				geometry->name.c_str(), b.radius, b.center.x, b.center.y, b.center.z, reason ? reason : "accepted", ref->GetFormID(),
-				base ? base->GetFormID() : 0u, base ? RE::FormTypeToString(base->GetFormType()) : std::string_view("no base"), kindName,
-				ref->IsPersistent() ? ", persistent" : "", ref->IsDisabled() ? ", disabled" : "",
-				ref->Get3D() == root ? "is the reference's 3D" : (ref->Get3D() ? "differs from the reference's 3D" : "but the reference has no 3D"),
-				parent ? parent->GetFormID() : 0u, parent == sky && sky ? "the worldspace's persistent cell" : (parentCaptured ? "captured" : "not captured"),
-				square ? std::format("{},{} captured{}", square->x, square->y, square->gathering ? " (still capturing)" : "") : std::string("not captured"),
-				captured ? "the shape IS in a cell chunk (its BLAS may not be built yet)" :
-				           (tracked ? (trackedSameRoot ? "the reference was captured, this shape was not" : "the reference was captured with older 3D") :
-				                      (objectIndex_.contains(ref) ? "the reference is a captured object" : "the reference was never captured")));
+
+			if (pending) {
+				RayTracingCasterFilter::ForgetMissed(geometry);
+				++stats_.missedPending;
+				continue;
+			}
+			missedJudged_.insert(geometry);
+			++stats_.missedConfirmed;
+			++stats_.missedByReason[static_cast<int>(bucket)];
+			if (shapeReason)
+				++stats_.missedRejected;
+			else
+				++stats_.missedCapturable;
+
+			// The log: every distinct reference + shape once per session, except characters and the
+			// leaves of trees (expected), rate-limited through a short backlog.
+			if (bucket == MissReason::Character || (kind == RefKind::Tree && shapeReason) || stats_.missedDescribed >= kMissedLogCap)
+				continue;
+			const std::string_view shapeName = geometry->name.c_str() ? std::string_view(geometry->name.c_str()) : std::string_view();
+			if (missedBacklog_.size() >= 64 || !missedLogged_.insert(MissKey(ref ? ref->GetFormID() : 0, shapeName)).second)
+				continue;
+			const auto& b = geometry->worldBound;
+			auto* base = ref ? ref->GetBaseObject() : nullptr;
+			const bool parentCaptured = parent && std::any_of(cells_.begin(), cells_.end(), [&](const std::unique_ptr<Cell>& a_cell) { return a_cell->cell == parent; });
+			missedBacklog_.push_back(std::format(
+				"[RayTracing] Missed caster [{}]: '{}' (radius {:.0f} at {:.0f}, {:.0f}, {:.0f}); {}; reference {:08X} base {:08X} ({}{}{}){}; parent cell {:08X} ({}); square {}",
+				kMissReasonNames[static_cast<int>(bucket)], shapeName, b.radius, b.center.x, b.center.y, b.center.z, verdict, ref ? ref->GetFormID() : 0u,
+				base ? base->GetFormID() : 0u, base ? RE::FormTypeToString(base->GetFormType()) : std::string_view("no base"),
+				physics ? ", Havok-driven part" : "", ref && ref->IsPersistent() ? ", persistent" : "",
+				ref && root && root != ref->Get3D() ? ", shape not under the reference's current 3D" : "", parent ? parent->GetFormID() : 0u,
+				persistentCell ? "the worldspace's persistent cell" : (parentCaptured ? "captured" : "not captured"),
+				square ? std::format("{},{} captured", square->x, square->y) : std::string("not captured")));
 		}
+		flushLog();
 	}
 
 	void Scene::EndFrame(RayTracingRT::Backend& a_backend)
