@@ -183,13 +183,15 @@ void MenuHeaderRenderer::RenderHeader(bool isDocked, bool showLogo, bool canShow
 				if (shaderCache->IsDiskCache()) {
 					shaderCache->DeleteDiskCache();
 				}
+				shaderCache->ClearContentStore();  // (44j) a full reset includes the content store
 			}
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text(
-					"Clears the shader cache and disk cache (if enabled). "
+					"Clears the shader cache and disk cache (if enabled), including the shader content store. "
 					"The Shader Cache is the collection of compiled shaders which replace the vanilla shaders at runtime. "
 					"The Disk Cache is a collection of compiled shaders on disk. "
-					"Clearing will mean that shaders are recompiled only when the game re-encounters them. ");
+					"Clearing will mean that shaders are recompiled only when the game re-encounters them. "
+					"Not needed after installing a new package: changed shaders are detected automatically. ");
 			}
 
 			// Error message toggle if needed
@@ -264,16 +266,20 @@ std::vector<MenuHeaderRenderer::ActionIcon> MenuHeaderRenderer::BuildActionIcons
 		auto shaderCache = globals::shaderCache;
 		actionIcons.push_back({ uiIcons.clearCache.texture,
 			"Clear Shader Cache\n\n"
-			"Clears the shader cache and disk cache (if enabled).\n"
+			"Clears the shader cache and disk cache (if enabled),\n"
+			"including the shader content store.\n"
 			"The Shader Cache is the collection of compiled shaders which replace\n"
 			"the vanilla shaders at runtime. The Disk Cache is a collection of\n"
 			"compiled shaders on disk. Clearing will mean that shaders are\n"
-			"recompiled only when the game re-encounters them.",
+			"recompiled only when the game re-encounters them.\n"
+			"Not needed after installing a new package: changed shaders are\n"
+			"detected automatically.",
 			[shaderCache]() {
 				shaderCache->Clear();
 				if (shaderCache->IsDiskCache()) {
 					shaderCache->DeleteDiskCache();
 				}
+				shaderCache->ClearContentStore();  // (44j) a full reset includes the content store
 			} });
 	}
 

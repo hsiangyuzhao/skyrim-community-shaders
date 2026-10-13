@@ -175,6 +175,16 @@ public:
 
 	bool frameAnnotations = false;
 
+	// (44j, upstream #2840) Keep compiled shaders in Data/ShaderCache/ContentStore, keyed by their
+	// preprocessed source and compile inputs, so a cache invalidation restores unchanged shaders
+	// instead of recompiling them. On by default in this fork (upstream: off).
+	// Atomic: written from the UI thread, read from compilation pool workers.
+	std::atomic_bool enableContentStore{ true };
+	/// Size limit of the content store in MB; least recently used blobs beyond it are evicted.
+	std::atomic<uint32_t> contentStoreMaxMB{ 4096 };
+	static constexpr uint32_t kContentStoreMinMB = 512;
+	static constexpr uint32_t kContentStoreMaxMB = 32768;
+
 	uint lastVertexDescriptor = 0;
 	uint lastPixelDescriptor = 0;
 	uint modifiedVertexDescriptor = 0;

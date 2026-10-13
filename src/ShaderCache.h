@@ -2,8 +2,15 @@
 
 #include <BS_thread_pool.hpp>
 #include <efsw/efsw.hpp>
+#include <d3dcommon.h>
+#include <thread>
+#include <winrt/base.h>
 
-static constexpr REL::Version SHADER_CACHE_VERSION = { 0, 0, 0, 73 };
+// (44j) 74: cache format change (content store, SKIP_VALIDATION, source fingerprint in Info.ini).
+// Shader source edits no longer need a bump: Info.ini carries a fingerprint of Data/Shaders, and a
+// mismatch drops the per-descriptor cache while the content store restores unchanged shaders.
+// Still bump this when C++ changes how a descriptor maps to defines (GetShaderDefines etc.).
+static constexpr REL::Version SHADER_CACHE_VERSION = { 0, 0, 0, 74 };
 
 using namespace std::chrono;
 
@@ -266,7 +273,11 @@ namespace SIE
 		std::atomic<uint64_t> completedTasks = 0;
 		std::atomic<uint64_t> totalTasks = 0;
 		std::atomic<uint64_t> failedTasks = 0;
-		std::atomic<uint64_t> cacheHitTasks = 0;  // number of compiles of a previously seen shader combo
+		std::atomic<uint64_t> cacheHitTasks = 0;         // number of compiles of a previously seen shader combo
+		std::atomic<uint64_t> diskHitTasks = 0;          // (44j) resolved from the per-descriptor disk cache
+		std::atomic<uint64_t> compiledTasks = 0;         // (44j) actually ran the compiler
+		std::atomic<uint64_t> contentStoreHitTasks = 0;  // (44j) restored from the persistent content store
+		std::atomic<uint64_t> contentDedupeTasks = 0;    // (44j) shared an identical compile from this session
 		std::mutex compilationMutex;
 
 	private:
@@ -282,6 +293,15 @@ namespace SIE
 		ShaderCompilationTask::Status status;
 		system_clock::time_point compileTime = system_clock::now();
 	};
+
+	namespace SShaderCache
+	{
+		/** @brief Reads a cached blob, deleting the file and returning null when it is unreadable or not intact DXBC. */
+		winrt::com_ptr<ID3DBlob> ReadIntactBlob(const std::wstring& diskPath);
+
+		/** @brief Writes through a unique sibling temp file and a rename, so a crash mid-write cannot leave a torn blob at diskPath. */
+		bool WriteBlobAtomic(const std::wstring& diskPath, ID3DBlob* blob);
+	}
 
 	class UpdateListener;
 
@@ -336,9 +356,47 @@ namespace SIE
 
 		bool IsDiskCache() const;
 		void SetDiskCache(bool value);
-		void DeleteDiskCache();
+		/**
+		 * @brief Deletes the on-disk shader cache directory.
+		 * @param a_keepContentStore Keep the persistent content store, whose blobs stay valid because they are keyed by their own inputs.
+		 */
+		void DeleteDiskCache(bool a_keepContentStore = false);
+		/** @brief Validates the disk cache (version, features, shader source fingerprint) and writes Info.ini at once, so an interrupted first compile keeps its progress. */
 		void ValidateDiskCache();
 		void WriteDiskCacheInfo();
+
+		/** @brief (44j) Deletes every blob in the persistent content store, whether or not the setting is on. */
+		void ClearContentStore();
+		/** @brief (44j) Applies the store size limit now, evicting least recently used blobs if it was lowered. */
+		void ApplyContentStoreLimit();
+		/** @brief (44j) Where the persistent content store lives and how much it holds. */
+		struct ContentStoreUsage
+		{
+			std::string path;  ///< Absolute, UTF-8
+			uint64_t blobs = 0;
+			uint64_t bytes = 0;
+			uint64_t maxBytes = 0;
+		};
+		/** @brief (44j) Measures the content store on disk; walks the directory, so call it off the frame. */
+		ContentStoreUsage GetContentStoreUsage();
+		uint64_t GetContentStoreHitTasks();
+		void IncContentStoreHitTasks();
+		void IncContentDedupeTasks();
+		void IncDiskHitTasks();
+		void IncCompiledTasks();
+
+		/** @brief (44j) Default compile threads: all logical cores minus 2 (minus 1 on <= 8 threads). */
+		static int32_t GetDefaultCompilationThreadCount()
+		{
+			const auto threadCount = static_cast<int32_t>(std::thread::hardware_concurrency());
+			return std::max(threadCount - (threadCount <= 8 ? 1 : 2), 1);
+		}
+		/** @brief The default before 44j, max(hw-4, hw*3/4); a saved value equal to it is treated as "never changed". */
+		static int32_t GetLegacyDefaultCompilationThreadCount()
+		{
+			const auto threadCount = static_cast<int32_t>(std::thread::hardware_concurrency());
+			return std::max({ threadCount - 4, threadCount * 3 / 4, 1 });
+		}
 		bool UseFileWatcher() const;
 		void SetFileWatcher(bool value);
 
@@ -436,9 +494,12 @@ namespace SIE
 		void InsertModifiedShaderMap(const std::string& a_shader, std::chrono::time_point<std::chrono::system_clock> a_time);
 		std::chrono::time_point<std::chrono::system_clock> GetModifiedShaderMapTime(const std::string& a_shader);
 
-		int32_t compilationThreadCount = std::max({ static_cast<int32_t>(std::thread::hardware_concurrency()) - 4, static_cast<int32_t>(std::thread::hardware_concurrency()) * 3 / 4, 1 });
+		// (44j) The management loop runs on its own thread (managementJthread), so every pool slot up to
+		// compilationThreadCount is a compile. The pool keeps one thread per logical core (the slider maximum).
+		int32_t compilationThreadCount = GetDefaultCompilationThreadCount();
 		int32_t backgroundCompilationThreadCount = std::max(static_cast<int32_t>(std::thread::hardware_concurrency()) / 2, 1);
 		BS::thread_pool compilationPool{};
+		std::jthread managementJthread;  // (44j) dedicated thread for ManageCompilationSet (not a pool slot)
 		bool backgroundCompilation = false;
 		bool menuLoaded = false;
 
@@ -703,6 +764,10 @@ namespace SIE
 		bool isDump = false;
 		bool hideError = false;
 		bool useFileWatcher = false;
+
+		/** @brief (44j) SHA-256 of every .hlsl/.hlsli under Data/Shaders (path + contents); computed once by ValidateDiskCache. */
+		std::string sourceFingerprint;
+		static std::string ComputeShaderSourceFingerprint();
 
 		std::stop_source ssource;
 		std::mutex vertexShadersMutex;

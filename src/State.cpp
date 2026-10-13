@@ -343,8 +343,17 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				logLevel = magic_enum::enum_cast<spdlog::level::level_enum>(advanced["Log Level"].get<int>()).value_or(spdlog::level::info);
 			if (advanced["Shader Defines"].is_string())
 				SetDefines(advanced["Shader Defines"]);
-			if (advanced["Compiler Threads"].is_number_integer())
+			if (advanced["Compiler Threads"].is_number_integer()) {
 				shaderCache->compilationThreadCount = std::clamp(advanced["Compiler Threads"].get<int32_t>(), 1, static_cast<int32_t>(std::thread::hardware_concurrency()));
+				// (44j) Settings saved before 44j store the old default (max(hw-4, hw*3/4)) even when the user never
+				// touched the slider; move those to the new default (hw-2). A value saved from 44j on is kept as is.
+				if (!advanced.contains("Compiler Threads Rev") && shaderCache->compilationThreadCount == SIE::ShaderCache::GetLegacyDefaultCompilationThreadCount())
+					shaderCache->compilationThreadCount = SIE::ShaderCache::GetDefaultCompilationThreadCount();
+			}
+			if (advanced.contains("Content Store") && advanced["Content Store"].is_boolean())
+				enableContentStore.store(advanced["Content Store"].get<bool>(), std::memory_order_relaxed);
+			if (advanced.contains("Content Store Max MB") && advanced["Content Store Max MB"].is_number_unsigned())
+				contentStoreMaxMB.store(static_cast<uint32_t>(std::clamp<uint64_t>(advanced["Content Store Max MB"].get<uint64_t>(), kContentStoreMinMB, kContentStoreMaxMB)), std::memory_order_relaxed);
 			if (advanced["Background Compiler Threads"].is_number_integer())
 				shaderCache->backgroundCompilationThreadCount = std::clamp(advanced["Background Compiler Threads"].get<int32_t>(), 1, static_cast<int32_t>(std::thread::hardware_concurrency()));
 			if (advanced["Use FileWatcher"].is_boolean())
@@ -494,7 +503,10 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Log Level"] = logLevel;
 	advanced["Shader Defines"] = shaderDefinesString;
 	advanced["Compiler Threads"] = shaderCache->compilationThreadCount;
+	advanced["Compiler Threads Rev"] = 2;  // (44j) marks the value as chosen under the hw-2 default
 	advanced["Background Compiler Threads"] = shaderCache->backgroundCompilationThreadCount;
+	advanced["Content Store"] = enableContentStore.load(std::memory_order_relaxed);
+	advanced["Content Store Max MB"] = contentStoreMaxMB.load(std::memory_order_relaxed);
 	advanced["Use FileWatcher"] = shaderCache->UseFileWatcher();
 	advanced["Frame Annotations"] = frameAnnotations;
 	advanced["Engine"] = Batch39Engine::Save();

@@ -147,6 +147,7 @@ target_link_libraries(
         Streamline
         NRD
         d3d12.lib
+        bcrypt.lib
         Microsoft::DirectX-Headers
         ${DETOURS_LIBRARY}
 )

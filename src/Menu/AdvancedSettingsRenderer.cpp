@@ -21,6 +21,74 @@
 #include "Utils/Format.h"
 #include "Utils/UI.h"
 
+#include <future>
+
+namespace
+{
+	constexpr double kStoreUsageRefreshSeconds = 5.0;
+	constexpr double kBytesPerMB = 1024.0 * 1024.0;
+
+	/// (44j, upstream #2840) Content store toggle, location, size, limit and a button to empty it.
+	void DrawContentStoreSettings(SIE::ShaderCache* a_cache)
+	{
+		bool contentStore = globals::state->enableContentStore.load(std::memory_order_relaxed);
+		if (ImGui::Checkbox("Shader Content Store", &contentStore))
+			globals::state->enableContentStore.store(contentStore, std::memory_order_relaxed);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"Keeps every compiled shader keyed by its preprocessed source and compiler flags. "
+				"When a new package or a feature change invalidates the shader cache, shaders whose code did not "
+				"change are restored instead of recompiled, so the startup compile takes about a minute instead of ~15.\n"
+				"Costs one preprocess per shader and disk space in Data/ShaderCache/ContentStore, trimmed to the "
+				"least recently used. Turn off only to rule it out when a shader looks wrong. Takes effect for shaders compiled from now on.");
+		}
+
+		// Measuring walks the whole store, so it runs on a worker every few seconds instead of in the frame.
+		static SIE::ShaderCache::ContentStoreUsage usage;
+		static std::future<SIE::ShaderCache::ContentStoreUsage> pendingUsage;
+		static double lastRefresh = -kStoreUsageRefreshSeconds;
+		const double now = ImGui::GetTime();
+		if (pendingUsage.valid() && pendingUsage.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+			usage = pendingUsage.get();
+		if (!pendingUsage.valid() && now - lastRefresh >= kStoreUsageRefreshSeconds) {
+			pendingUsage = std::async(std::launch::async, [a_cache] { return a_cache->GetContentStoreUsage(); });
+			lastRefresh = now;
+		}
+		if (!contentStore && usage.blobs == 0)
+			return;
+
+		ImGui::Indent();
+		ImGui::TextDisabled("Location: %s", usage.path.c_str());
+		ImGui::TextDisabled("Stored: %llu shaders, %.0f MB (limit %.0f MB)", static_cast<unsigned long long>(usage.blobs),
+			static_cast<double>(usage.bytes) / kBytesPerMB, static_cast<double>(usage.maxBytes) / kBytesPerMB);
+		if (contentStore)
+			ImGui::TextDisabled("Restored this session: %llu", static_cast<unsigned long long>(a_cache->GetContentStoreHitTasks()));
+
+		auto limitMB = static_cast<int>(globals::state->contentStoreMaxMB.load(std::memory_order_relaxed));
+		if (ImGui::SliderInt("Store Size Limit", &limitMB, static_cast<int>(State::kContentStoreMinMB), static_cast<int>(State::kContentStoreMaxMB), "%d MB", ImGuiSliderFlags_AlwaysClamp))
+			globals::state->contentStoreMaxMB.store(static_cast<uint32_t>(limitMB), std::memory_order_relaxed);
+		if (ImGui::IsItemDeactivatedAfterEdit()) {
+			a_cache->ApplyContentStoreLimit();
+			lastRefresh = -kStoreUsageRefreshSeconds;
+		}
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"Least recently used shaders are deleted once the store exceeds this. "
+				"A full build stores about 190 MB, so the default keeps many packages' worth.");
+		}
+		if (ImGui::Button("Clear Store")) {
+			a_cache->ClearContentStore();
+			lastRefresh = -kStoreUsageRefreshSeconds;
+		}
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text(
+				"Deletes every stored shader. Use this if a shader looks wrong after being restored; "
+				"the next compile rebuilds the store. Shaders already in the shader cache are kept.");
+		}
+		ImGui::Unindent();
+	}
+}
+
 void AdvancedSettingsRenderer::RenderAdvancedSettings(
 	const std::function<void()>& drawTruePBRSettings,
 	const std::function<void()>& drawDisableAtBootSettings)
@@ -140,6 +208,8 @@ void AdvancedSettingsRenderer::RenderLoggingSection()
 			"This is activated if the startup compilation is skipped. "
 			"The more threads the faster compilation will finish but may make the system unresponsive. ");
 	}
+
+	DrawContentStoreSettings(shaderCache);
 
 	// A/B Testing settings
 	auto* abTestingManager = ABTestingManager::GetSingleton();
