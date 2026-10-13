@@ -9,10 +9,31 @@
 #include "State.h"
 #include "ThemeManager.h"
 #include "Util.h"
+#include "Features/Upscaling.h"
 #include "Utils/ABCompare.h"
 
 namespace
 {
+	/// (44f) "Restore Saved Settings": reloads SettingsUser.json, but frame generation stays as it is
+	/// right now. FG is a per-session choice the user flips while testing (FG off traces); a reload --
+	/// on purpose or from a stray click on the docked title-bar icon (12:22:54 in the 44e traces) --
+	/// silently turned DLSS-G back on at the saved 3x and spoiled the comparison.
+	void RestoreSavedSettings(const char* a_source)
+	{
+		auto& upscaling = globals::features::upscaling.settings;
+		const auto fgMode = upscaling.frameGenerationMode;
+		const auto fgMultiplier = upscaling.frameGenerationMultiplier;
+		logger::info("[Menu] Restore Saved Settings ({}): reloading the saved settings; frame generation kept as it is now ({}, {}x)",
+			a_source, fgMode ? "on" : "off", fgMultiplier);
+		globals::state->Load();
+		if (upscaling.frameGenerationMode != fgMode || upscaling.frameGenerationMultiplier != fgMultiplier)
+			logger::info("[Menu] Restore Saved Settings: saved frame generation ({}, {}x) not applied",
+				upscaling.frameGenerationMode ? "on" : "off", upscaling.frameGenerationMultiplier);
+		upscaling.frameGenerationMode = fgMode;
+		upscaling.frameGenerationMultiplier = fgMultiplier;
+		ABCompare::OnSettingsReloaded();
+	}
+
 	class RoleFontGuard
 	{
 	public:
@@ -152,10 +173,8 @@ void MenuHeaderRenderer::RenderHeader(bool isDocked, bool showLogo, bool canShow
 
 			// Restore Saved Settings Button
 			ImGui::TableNextColumn();
-			if (ImGui::Button("Restore Saved Settings", { -1, 0 })) {
-				globals::state->Load();
-				ABCompare::OnSettingsReloaded();
-			}
+			if (ImGui::Button("Restore Saved Settings", { -1, 0 }))
+				RestoreSavedSettings("button");
 
 			// Clear Shader Cache Button
 			ImGui::TableNextColumn();
@@ -238,11 +257,8 @@ std::vector<MenuHeaderRenderer::ActionIcon> MenuHeaderRenderer::BuildActionIcons
 	}
 	if (uiIcons.loadSettings.texture) {
 		actionIcons.push_back({ uiIcons.loadSettings.texture,
-			"Restore Saved Settings",
-			[]() {
-				globals::state->Load();
-				ABCompare::OnSettingsReloaded();
-			} });
+			"Restore Saved Settings\n\nReloads the saved settings. Frame generation stays as it is now.",
+			[]() { RestoreSavedSettings("icon"); } });
 	}
 	if (uiIcons.clearCache.texture) {
 		auto shaderCache = globals::shaderCache;
@@ -296,6 +312,13 @@ void MenuHeaderRenderer::RenderDockedIcons(const std::vector<ActionIcon>& action
 	float iconX = windowPos.x + windowSize.x - rightMargin;
 	float iconY = windowPos.y + (titleBarHeight - iconSize) * 0.5f;
 
+	// (44f) The icons are drawn on the foreground list, outside ImGui's item system, so the hit test
+	// is ours: only count the mouse while this window really is the one under it (not a popup, a
+	// combo list, the overlay or another window drawn over the title bar). A raw rectangle test let a
+	// click meant for something on top reach "Restore Saved Settings".
+	const bool windowUnderMouse = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows | ImGuiHoveredFlags_DockHierarchy) && !ImGui::IsAnyItemActive() &&
+	                              !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+
 	// Draw icons from right to left
 	for (auto it = actionIcons.rbegin(); it != actionIcons.rend(); ++it) {
 		iconX -= iconSize + iconSpacing;
@@ -311,7 +334,7 @@ void MenuHeaderRenderer::RenderDockedIcons(const std::vector<ActionIcon>& action
 
 		// Check mouse interaction against full area
 		ImVec2 mousePos = ImGui::GetMousePos();
-		bool isHovered = mousePos.x >= interactionMin.x && mousePos.x <= interactionMax.x &&
+		bool isHovered = windowUnderMouse && mousePos.x >= interactionMin.x && mousePos.x <= interactionMax.x &&
 		                 mousePos.y >= interactionMin.y && mousePos.y <= interactionMax.y;
 
 		// Draw icon with hover effect, using reduced area to minimize padding
