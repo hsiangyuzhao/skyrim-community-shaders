@@ -10,6 +10,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "Utils/FrameTrace.h"
+#include "Utils/LatencyPacer.h"
 #include "Utils/Screenshot.h"
 #include "TruePBR.h"
 #include "Util.h"
@@ -926,6 +927,16 @@ namespace Hooks
 			// only place a frame cap can be imposed without adding queue latency behind it.
 			const bool useStreamlineFrameTiming = streamline.reflexFunctionsReady && streamline.pclFunctionsReady;
 			const bool frameTimingStarted = useStreamlineFrameTiming && streamline.BeginFrameToken();
+			{
+				// (45m) GPU-aware frame-start pacing, at the same point as the Reflex sleep (before input
+				// is sampled). Reflex cannot see the D3D11 work, so on its own it never sleeps here.
+				const bool timed = Util::FrameTrace::Active();
+				const int64_t t0 = timed ? Util::FrameTrace::Now() : 0;
+				Util::EngineTiming::ScopedSeg sleepSeg(Util::EngineTiming::Seg::Sleep);
+				Util::LatencyPacer::PaceFrameStart(upscaling.IsLatencyPacerEnabled(), upscaling.settings.reflexPacerMarginMs);
+				if (timed)
+					Util::FrameTrace::OnPacerSleep(t0);
+			}
 			if (frameTimingStarted) {
 				// Before the sleep, so a mode or cap changed in the menu takes effect on the
 				// very frame it is paced by rather than one frame late.
@@ -934,12 +945,13 @@ namespace Hooks
 					const bool timed = Util::FrameTrace::Active();
 					const int64_t t0 = timed ? Util::FrameTrace::Now() : 0;
 					Util::EngineTiming::ScopedSeg sleepSeg(Util::EngineTiming::Seg::Sleep);
-					streamline.ReflexSleep();
+					streamline.lastReflexSleepOk = streamline.ReflexSleep();
 					if (timed)
 						Util::FrameTrace::OnReflexSleep(t0);
 				}
 				streamline.SetPCLMarker(sl::PCLMarker::eSimulationStart);
 			}
+			Util::LatencyPacer::OnSimulationStart();
 			Util::FrameTrace::OnSimStart();
 			// (44f) Engine CPU split; also arms the (44f, A) Reflex markers at the render call.
 			Util::EngineTiming::OnUpdateBegin(frameTimingStarted);

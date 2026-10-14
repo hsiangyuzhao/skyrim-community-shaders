@@ -8,6 +8,7 @@
 #include "BuildLabel.h"
 #include "Utils/EngineTiming.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/LatencyPacer.h"
 
 #include <intrin.h>
 #include <thread>
@@ -32,6 +33,7 @@ namespace Util::FrameTrace
 			double ownSetupGeometry = 0.0;
 			double permutationUpload = 0.0;
 			double reflexSleep = 0.0;
+			double pacerSleep = 0.0;  // (45m) frame-start pacer (predictive sleep + hard bound)
 			uint32_t draws = 0;
 			uint32_t lightingDraws = 0;
 			uint32_t utilityDraws = 0;
@@ -93,6 +95,7 @@ namespace Util::FrameTrace
 			float frameMs = 0.0f;
 			float presentWaitMs = 0.0f;
 			float reflexSleepMs = 0.0f;
+			float pacerSleepMs = 0.0f;  // (45m)
 			float driver[kCalls]{};
 			float ownDrawHookMs = 0.0f;
 			float ownSetupGeometryMs = 0.0f;
@@ -127,16 +130,24 @@ namespace Util::FrameTrace
 			// (44f) Engine CPU split, engine time step, device Create* calls.
 			EngineTiming::Frame engine;
 			bool reflexMarkersAtRenderStart = false;
+			// (45m) Reflex / pacer state for this frame.
+			LatencyPacer::FrameInfo pacer{};
+			bool reflexSleepOk = false;
+			int lowLatencyAvailable = -1;
+			int reflexModeApplied = -1;
+			int reflexLimitApplied = -1;
+			bool latencyFix = false;
 		};
 
 		struct ReflexTimes
 		{
 			uint64_t simStart, simEnd, submitStart, submitEnd, presentStart, presentEnd, driverStart, driverEnd, queueStart, queueEnd, gpuStart, gpuEnd;
+			uint32_t gpuActiveUs, gpuFrameUs;  // (45m) what the driver counts as GPU work for the frame
 		};
 
 		bool g_recording = false;
 		// (45j) Taken when a recording starts (the CSV is written on another thread).
-		std::string g_headerLocation, g_headerRayTracing, g_headerTag;
+		std::string g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency;
 		int64_t g_recordStart = 0;
 		int64_t g_recordEnd = 0;
 		std::vector<Row> g_rows;
@@ -171,7 +182,8 @@ namespace Util::FrameTrace
 				if (r.simStartTime == 0)
 					continue;
 				g_reflex[r.frameID] = { r.simStartTime, r.simEndTime, r.renderSubmitStartTime, r.renderSubmitEndTime, r.presentStartTime, r.presentEndTime,
-					r.driverStartTime, r.driverEndTime, r.osRenderQueueStartTime, r.osRenderQueueEndTime, r.gpuRenderStartTime, r.gpuRenderEndTime };
+					r.driverStartTime, r.driverEndTime, r.osRenderQueueStartTime, r.osRenderQueueEndTime, r.gpuRenderStartTime, r.gpuRenderEndTime,
+					r.gpuActiveRenderTimeUs, r.gpuFrameTimeUs };
 			}
 		}
 
@@ -195,7 +207,8 @@ namespace Util::FrameTrace
 			s = s < 0.0f ? ms : s * 0.8f + ms * 0.2f;
 		}
 
-		void WriteCsv(std::vector<Row> a_rows, std::unordered_map<uint64_t, ReflexTimes> a_reflex, std::string a_location, std::string a_rayTracing, std::string a_tag)
+		void WriteCsv(std::vector<Row> a_rows, std::unordered_map<uint64_t, ReflexTimes> a_reflex, std::string a_location, std::string a_rayTracing, std::string a_tag,
+			std::string a_latency)
 		{
 			try {
 				auto dir = logger::log_directory();
@@ -224,6 +237,12 @@ namespace Util::FrameTrace
 				out << "#   eng_calls_over_1ms = every such call over 1 ms (id@offset:ms;...). eng_render_other = rendering minus the named phases (culling, scene traversal).\n";
 				out << "# eng_dt_ms / eng_real_dt_ms = the engine's time step (BSTimer). dev_create_* = time inside D3D11 device Create* calls (main thread / others).\n";
 				out << "# reflex_markers = 1 when Reflex Markers at Render Start was on for that frame.\n";
+				out << "# (45m) reflex_gpu_active_ms / reflex_gpu_frame_ms = GPU time the driver counts for the frame (Reflex sees only the D3D12 interop device).\n";
+				out << "#   reflex_sleep_ok = slReflexSleep succeeded; reflex_lowlat = lowLatencyAvailable (slReflexGetState, -1 = not queried); reflex_mode / reflex_limit_fps = applied.\n";
+				out << "#   latency_fix = 45m Reflex fix on; pacer_* = frame-start pacer: on, sleep (predictive), cap_wait (hard bound: frame before the previous one),\n";
+				out << "#   in_flight = frames the GPU had not finished at frame start, pred = predicted ms until the previous frame finishes, lead = CPU ms reserved (p75),\n";
+				out << "#   gpu_period = median ms between GPU frame completions. pacer_sleep_ms = the whole pacer wait (both parts); cpu_busy also excludes it.\n";
+				out << "# (45m) latency at start: " << a_latency << "\n";
 				out << "# (45j) location at start: " << a_location << "\n";
 				out << "# (45j) ray tracing at start: " << a_rayTracing << "\n";
 				out << "# (45j) rt_* = Ray Tracing CPU split (ms, -1 = not run): scene update (grid diff, cell capture, filter registration, objects of which new\n";
@@ -245,8 +264,9 @@ namespace Util::FrameTrace
 					   "first_seen_geometry,shader_miss_async,shader_miss_sync,cell_attach,cell_detach,cam_yaw_dps,cam_pitch_dps,player_speed,"
 					   "gpu_work_ms,gpu_elapsed_ms,fg_presented,grass_apply_ms,rt_gpu_ms,rt_cpu_ms,rt_blas_builds,"
 					   "reflex_frame,reflex_sim_end,reflex_submit_start,reflex_submit_end,reflex_present_start,reflex_present_end,"
-					   "reflex_driver_start,reflex_driver_end,reflex_queue_start,reflex_queue_end,reflex_gpu_start,reflex_gpu_end,reflex_latency_ms,"
-					   "reflex_markers";
+					   "reflex_driver_start,reflex_driver_end,reflex_queue_start,reflex_queue_end,reflex_gpu_start,reflex_gpu_end,reflex_latency_ms,reflex_gpu_active_ms,reflex_gpu_frame_ms,"
+					   "reflex_markers,reflex_sleep_ok,reflex_lowlat,reflex_mode,reflex_limit_fps,latency_fix,pacer_on,pacer_sleep_ms,pacer_cap_wait_ms,pacer_in_flight,"
+					   "pacer_pred_ms,pacer_lead_ms,pacer_gpu_period_ms";
 				for (int s = 0; s < static_cast<int>(EngineTiming::Seg::Count); ++s)
 					out << ",eng_" << EngineTiming::SegName(static_cast<EngineTiming::Seg>(s)) << "_ms";
 				out << ",eng_input_ms,eng_top_call,eng_top_call_ms,eng_calls_over_1ms,eng_dt_ms,eng_real_dt_ms,dev_create_ms,dev_creates,dev_create_other_ms,dev_creates_other";
@@ -278,7 +298,10 @@ namespace Util::FrameTrace
 				};
 				auto engineColumns = [](const Row& a_row) {
 					const auto& e = a_row.engine;
-					std::string s = std::format(",{}", a_row.reflexMarkersAtRenderStart ? 1 : 0);
+					const auto& p = a_row.pacer;
+					std::string s = std::format(",{},{},{},{},{},{},{},{:.3f},{:.3f},{},{:.3f},{:.3f},{:.3f}", a_row.reflexMarkersAtRenderStart ? 1 : 0, a_row.reflexSleepOk ? 1 : 0,
+						a_row.lowLatencyAvailable, a_row.reflexModeApplied, a_row.reflexLimitApplied, a_row.latencyFix ? 1 : 0, p.enabled ? 1 : 0, a_row.pacerSleepMs, p.capWaitMs,
+						p.inFlight, p.predictedMs, p.leadMs, p.gpuPeriodMs);
 					for (int i = 0; i < static_cast<int>(EngineTiming::Seg::Count); ++i)
 						s += e.valid ? std::format(",{:.3f}", e.ms[i]) : std::string(",-1");
 					s += e.valid ? std::format(",{:.3f},{}@{:X},{:.3f},{}", e.inputMs, e.topCallId, e.topCallOffset, e.topCallMs, e.callsOver1ms) : std::string(",-1,-1,-1,");
@@ -290,7 +313,7 @@ namespace Util::FrameTrace
 					float driverTotal = 0.0f;
 					for (float d : r.driver)
 						driverTotal += d;
-					const float busy = std::max(0.0f, r.frameMs - r.presentWaitMs - r.reflexSleepMs);
+					const float busy = std::max(0.0f, r.frameMs - r.presentWaitMs - r.reflexSleepMs - r.pacerSleepMs);
 					const float perDraw = r.draws ? (r.ownDrawHookMs + r.ownSetupGeometryMs) * 1000.0f / static_cast<float>(r.draws) : 0.0f;
 					out << std::format("{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{:.3f},{},{},{},{},{},{:.1f},{:.1f},{:.1f},{:.3f},{:.3f},{},{:.3f},{:.3f},{:.3f},{},",
 						index++, r.tMs, r.frameMs, r.cpuFrameMs, busy, r.presentWaitMs, r.reflexSleepMs,
@@ -300,14 +323,14 @@ namespace Util::FrameTrace
 						r.gpuWorkMs, r.gpuElapsedMs, r.fgPresented, r.grassApplyMs, r.rtGpuMs, r.rtCpuMs, r.rtBuilds);
 					auto it = r.reflexFrame != UINT32_MAX ? a_reflex.find(r.reflexFrame) : a_reflex.end();
 					if (it == a_reflex.end()) {
-						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extraColumns(r);
+						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extraColumns(r);
 						continue;
 					}
 					const auto& x = it->second;
 					auto rel = [&](uint64_t v) { return v >= x.simStart && v != 0 ? static_cast<int64_t>(v - x.simStart) : -1; };
-					out << std::format("{},{},{},{},{},{},{},{},{},{},{},{},{:.3f}", r.reflexFrame, rel(x.simEnd), rel(x.submitStart), rel(x.submitEnd), rel(x.presentStart),
+					out << std::format("{},{},{},{},{},{},{},{},{},{},{},{},{:.3f},{:.3f},{:.3f}", r.reflexFrame, rel(x.simEnd), rel(x.submitStart), rel(x.submitEnd), rel(x.presentStart),
 						rel(x.presentEnd), rel(x.driverStart), rel(x.driverEnd), rel(x.queueStart), rel(x.queueEnd), rel(x.gpuStart), rel(x.gpuEnd),
-						x.gpuEnd > x.simStart ? static_cast<double>(x.gpuEnd - x.simStart) / 1000.0 : -1.0)
+						x.gpuEnd > x.simStart ? static_cast<double>(x.gpuEnd - x.simStart) / 1000.0 : -1.0, x.gpuActiveUs / 1000.0, x.gpuFrameUs / 1000.0)
 						<< engineColumns(r) << extraColumns(r);
 				}
 				out.close();
@@ -664,6 +687,12 @@ namespace Util::FrameTrace
 			g_frame.permutationUpload += Ms(Now() - a_start);
 	}
 
+	void OnPacerSleep(int64_t a_start)
+	{
+		if (g_active)
+			g_frame.pacerSleep += Ms(Now() - a_start);
+	}
+
 	void OnReflexSleep(int64_t a_start)
 	{
 		if (g_active)
@@ -803,7 +832,7 @@ namespace Util::FrameTrace
 			// simulation marker this frame, from the previous Present's end minus the sleep.
 			float cpuFrameMs = (g_simStart > g_lastPresentEnd && g_simStart < a_presentStart) ?
 			                       static_cast<float>(Ms(a_presentStart - g_simStart)) :
-			                       std::max(0.0f, static_cast<float>(Ms(a_presentStart - g_lastPresentEnd) - g_frame.reflexSleep));
+			                       std::max(0.0f, static_cast<float>(Ms(a_presentStart - g_lastPresentEnd) - g_frame.reflexSleep - g_frame.pacerSleep));
 
 			// Camera turn rate and player speed, per real frame.
 			float yawRate = 0.0f, pitchRate = 0.0f, speed = 0.0f;
@@ -909,6 +938,7 @@ namespace Util::FrameTrace
 				r.frameMs = frameMs;
 				r.presentWaitMs = presentWait;
 				r.reflexSleepMs = static_cast<float>(g_frame.reflexSleep);
+				r.pacerSleepMs = static_cast<float>(g_frame.pacerSleep);
 				for (int i = 0; i < kCalls; ++i)
 					r.driver[i] = static_cast<float>(g_frame.driver[i]);
 				r.ownDrawHookMs = static_cast<float>(g_frame.ownDrawHook);
@@ -945,7 +975,16 @@ namespace Util::FrameTrace
 				r.gpuFrameIndex = a_gpuFrameIndex;
 				r.reflexFrame = globals::features::upscaling.streamline.frameTokenIndex;
 				r.engine = engine;
-				r.reflexMarkersAtRenderStart = globals::features::upscaling.settings.reflexMarkersAtRenderStart && EngineTiming::ProbesInstalled();
+				r.reflexMarkersAtRenderStart = globals::features::upscaling.WantsReflexMarkersAtRenderStart() && EngineTiming::ProbesInstalled();
+				{
+					auto& up = globals::features::upscaling;
+					r.pacer = LatencyPacer::Last();
+					r.reflexSleepOk = up.streamline.lastReflexSleepOk;
+					r.lowLatencyAvailable = up.streamline.lastLowLatencyAvailable;
+					r.reflexModeApplied = up.GetReflexModeApplied() == UINT_MAX ? -1 : static_cast<int>(up.GetReflexModeApplied());
+					r.reflexLimitApplied = up.GetReflexFrameLimitApplied() == UINT_MAX ? -1 : static_cast<int>(up.GetReflexFrameLimitApplied());
+					r.latencyFix = up.settings.reflexLatencyFix;
+				}
 				// (45j) A spike frame names its suspects in the log (at most one line a second).
 				if (frameMs > 1.5f * g_smoothed.frameMs + 5.0f) {
 					static int64_t lastSpikeLog = 0;
@@ -991,6 +1030,7 @@ namespace Util::FrameTrace
 				location.weather.empty() ? "-" : location.weather, location.hour);
 			g_headerTag = LocationTag(location);
 			g_headerRayTracing = std::format("{}; build {}", globals::features::rayTracing.DescribeForProfile(), BuildLabel::kBuild);
+			g_headerLatency = globals::features::upscaling.DescribeLatencyForTrace();
 		}
 		logger::info("[FrameTrace] Recording {:.0f} s", a_seconds);
 	}
@@ -1001,7 +1041,7 @@ namespace Util::FrameTrace
 			return;
 		g_recording = false;
 		PollReflex();
-		std::thread(WriteCsv, std::move(g_rows), std::move(g_reflex), g_headerLocation, g_headerRayTracing, g_headerTag).detach();
+		std::thread(WriteCsv, std::move(g_rows), std::move(g_reflex), g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency).detach();
 		g_rows = {};
 		g_reflex = {};
 	}
@@ -1054,7 +1094,11 @@ namespace Util::FrameTrace
 		j["engine_dt_ms"] = s.engineDtMs;
 		j["device_create_ms"] = s.createMs;
 		j["reflex_latency_ms"] = s.reflexLatencyMs;
-		j["reflex_markers_at_render_start"] = globals::features::upscaling.settings.reflexMarkersAtRenderStart;
+		j["reflex_markers_at_render_start"] = globals::features::upscaling.WantsReflexMarkersAtRenderStart();
+		j["reflex_latency_fix"] = globals::features::upscaling.settings.reflexLatencyFix;
+		j["pacer_enabled"] = globals::features::upscaling.IsLatencyPacerEnabled();
+		j["pacer_in_flight_now"] = LatencyPacer::Last().inFlight;
+		j["pacer_gpu_period_ms"] = LatencyPacer::Last().gpuPeriodMs;
 		return j;
 	}
 }

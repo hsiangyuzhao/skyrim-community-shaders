@@ -61,7 +61,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SplitSubmit,
 	CharacterRayCulling,
 	BlockerAtEdges,
-	DistanceFalloff)
+	DistanceFalloff,
+	NpcAlternateFrameSkinning)
 
 namespace
 {
@@ -1263,12 +1264,14 @@ void RayTracing::RunFrame()
 	scene.CollectInstances(instances, validate);
 	scene.DescribeMissedCasters();
 	// (45i) Characters in the traced area: capture, bone matrices, draws (none with the switch off).
-	// (45l) Other actors at reduced quality: skinned every other frame.
+	// (45l) Other actors at reduced quality (45m: skinned every frame unless the Debug switch asks for 45l).
 	const std::int64_t charactersStart = Qpc();
 	skinDraws.clear();
 	skinBones.clear();
 	if (settings.Characters && backend.SkinAvailable()) {
-		characters.SetNpcReduced(quality.npcReduced);
+		// (45m) Other actors are skinned and refit every frame again (the 45l alternate frames lagged visibly);
+		// reduced quality now only lowers their ray work. The 45l path stays as a Debug switch.
+		characters.SetNpcReduced(quality.npcReduced && settings.NpcAlternateFrameSkinning);
 		float world[4];
 		if (scene.GetLoadedRect(world, false))
 			characters.Update(backend, globals::state->frameCount, world);
@@ -1866,8 +1869,8 @@ void RayTracing::DrawSettings()
 			const char* npcModes[] = { "Full", "Reduced" };
 			ImGui::Combo("Other Characters", &settings.CustomNpcQuality, npcModes, 2);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("The player always gets full quality. Reduced: other characters are re-posed every other frame (their shadow");
-				ImGui::Text("  follows one frame later on the frame in between) and get no extra edge rays.");
+				ImGui::Text("The player always gets full quality. Reduced: other characters get no extra edge rays.");
+				ImGui::Text("  They are re-posed every frame like the player (45m; the 45l every-other-frame mode is under Debug).");
 			}
 			ImGui::SliderFloat("Denoiser Radius", &settings.CustomDenoiseRadius, 2.0f, 32.0f, "%.0f px");
 			ImGui::SliderInt("Denoiser Taps per Side", &settings.CustomDenoiseTaps, 1, 8);
@@ -2168,6 +2171,11 @@ void RayTracing::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("On: the game's GPU queue waits for the ray-traced shadows only after every other feature's preparation passes,");
 			ImGui::Text("  so that work runs while the trace runs. Off = 45k (it waited right after the trace was sent). Trace: rt_sync_gpu_ms.");
+		}
+		ImGui::Checkbox("Other Characters Skinned Every Other Frame (45l)", &settings.NpcAlternateFrameSkinning);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On = 45l: with other characters at reduced quality, their skinning and BLAS refit run every other frame (one frame late).");
+			ImGui::Text("  Off (default, 45m): every frame, like the player; reduced quality then only means fewer rays for them.");
 		}
 		ImGui::Checkbox("Split D3D12 Submission", &settings.SplitSubmit);
 		if (auto _tt = Util::HoverTooltipWrapper())

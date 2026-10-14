@@ -1,0 +1,52 @@
+#pragma once
+
+#include <cstdint>
+
+struct ID3D12Fence;
+
+/**
+ * @brief (45m) GPU-aware frame-start pacing for the D3D11 -> D3D12 interop path.
+ *
+ * Why it exists: Skyrim renders on the D3D11 device, but Reflex (Streamline) is attached to the
+ * D3D12 interop device that only copies, upscales and presents. The driver's Reflex sleep cannot
+ * see the D3D11 work, so it takes every frame for CPU-bound and never sleeps; and with no D3D11
+ * Present nothing else bounds how far the CPU runs ahead of the GPU. The CPU then waits inside
+ * Present (DLSS-G) or keeps queuing (menus, no frame generation) and input lag grows by whole frames.
+ *
+ * What it does: every Present signals a per-frame "GPU finished this frame" fence value (the
+ * D3D12 queue signal that the next frame's D3D11 work already waits on). A waiter thread notes when
+ * each one completes. At frame start -- the Reflex sleep point in Main::Update, before input is
+ * sampled -- the pacer predicts when the GPU will finish the previous frame and sleeps until the
+ * CPU work of the new frame (measured) would end right then. A hard bound then waits for the frame
+ * before that, so at most one finished-on-CPU frame is ever queued. Measurement always runs (for
+ * the trace); sleeping only when switched on.
+ */
+namespace Util::LatencyPacer
+{
+	struct FrameInfo
+	{
+		bool enabled = false;      ///< pacing was switched on for this frame
+		bool tracking = false;     ///< the interop fence is being followed
+		float sleepMs = 0.0f;      ///< predictive sleep taken
+		float capWaitMs = 0.0f;    ///< hard-bound wait taken (frame before the previous one)
+		int inFlight = -1;         ///< frames submitted but not finished by the GPU at frame start
+		float predictedMs = -1.0f; ///< predicted time until the previous frame finishes (at frame start)
+		float leadMs = -1.0f;      ///< CPU time the pacer reserves (frame start to D3D11 submit, p75)
+		float gpuPeriodMs = -1.0f; ///< median interval between GPU frame completions
+	};
+
+	/// Main thread, in Main::Update before the Reflex sleep. Sleeps only when a_enabled.
+	void PaceFrameStart(bool a_enabled, float a_marginMs);
+
+	/// Main thread, right after PaceFrameStart and the Reflex sleep: the frame's CPU work starts now.
+	void OnSimulationStart();
+
+	/// DX12SwapChain::Present, when the frame's D3D11 work has been handed to the GPU.
+	void OnD3D11Submitted();
+
+	/// DX12SwapChain::Present, after the per-frame D3D12 queue signal.
+	void OnFrameEndSignaled(ID3D12Fence* a_fence, uint64_t a_value);
+
+	/// Info for the frame that is being built now (valid from PaceFrameStart to the next one).
+	const FrameInfo& Last();
+}

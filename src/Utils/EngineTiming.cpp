@@ -166,7 +166,7 @@ namespace Util::EngineTiming
 			if (!g_frameToken)
 				return;
 			auto& upscaling = globals::features::upscaling;
-			if (!upscaling.settings.reflexMarkersAtRenderStart || !upscaling.streamline.pclFunctionsReady)
+			if (!upscaling.WantsReflexMarkersAtRenderStart() || !upscaling.streamline.pclFunctionsReady)
 				return;
 			upscaling.streamline.SetPCLMarker(sl::PCLMarker::eSimulationEnd);
 			upscaling.streamline.SetPCLMarker(sl::PCLMarker::eRenderSubmitStart);

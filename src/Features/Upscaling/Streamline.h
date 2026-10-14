@@ -57,6 +57,11 @@ public:
 	bool pclFunctionsReady = false;
 	bool reflexSleepFailureLogged = false;
 	bool pclMarkerFailureLogged = false;
+	// (45m) For the trace: did this frame's slReflexSleep succeed, and what slReflexGetState last
+	// reported (-1 = not queried yet).
+	bool lastReflexSleepOk = false;
+	int lastLowLatencyAvailable = -1;
+	int lastLatencyReportAvailable = -1;
 	uint32_t dlssGConfiguredInputWidth = 0;
 	uint32_t dlssGConfiguredInputHeight = 0;
 	uint32_t dlssGConfiguredOutputWidth = 0;

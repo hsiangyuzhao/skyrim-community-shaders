@@ -59,6 +59,8 @@ namespace Util::FrameTrace
 	void AddOwnSetupGeometry(int64_t a_start, double a_driverAtStart);
 	void AddPermutationUpload(int64_t a_start);
 	void OnReflexSleep(int64_t a_start);
+	/// (45m) Main::Update: the frame-start pacer's wait (LatencyPacer), before the Reflex sleep.
+	void OnPacerSleep(int64_t a_start);
 	/// Bottom of the Present hook: closes this frame's row. a_presentStart: QPC before the real Present.
 	void OnPresentEnd(int64_t a_presentStart, uint64_t a_gpuFrameIndex);
 	/// DLSS-G's frames presented for this real frame (DX12SwapChain::Present).

@@ -171,6 +171,8 @@ public:
 		bool CharacterRayCulling = true;  // character ray only where it can meet a character
 		bool BlockerAtEdges = true;       // closest-hit blocker distance only at shadow edges
 		bool DistanceFalloff = true;      // the tiers' distance fall-off
+		// (45m) Debug: other actors at reduced quality skinned / refit every other frame (45l). Off = every frame.
+		bool NpcAlternateFrameSkinning = false;
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted

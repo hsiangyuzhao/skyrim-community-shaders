@@ -238,6 +238,19 @@ public:
 		// submit pair around the D3D12 copy only, so Reflex took the frame for CPU-bound and never
 		// slept. PRESENT_START / END stay around the real Present either way.
 		bool reflexMarkersAtRenderStart = false;
+		// (45m) Reflex fix. Reflex is attached to the D3D12 interop device and cannot see the D3D11
+		// rendering, so its sleep never fires and the CPU queues up to two frames ahead (see
+		// reviews/diag-reflex-2026-10.md). On: markers at the render call (as the 44f switch), the
+		// GPU-aware frame-start pacer below, the automatic cap, and no legacy spin limiter while
+		// Reflex is available. Off = 45l behaviour, for A/B.
+		bool reflexLatencyFix = true;
+		// Sub-switch: sleep at frame start until the CPU work would end as the GPU frees up, and
+		// never start a frame while the one before the previous is still on the GPU.
+		bool reflexGpuPacer = true;
+		// Extra CPU time the pacer keeps in hand (ms). More = safer for frame rate, less = lower lag.
+		float reflexPacerMarginMs = 1.0f;
+		// Sub-switch: with Reflex Frame Limit Off, cap at refresh - refresh^2/3600 (224 at 240 Hz).
+		bool reflexAutoCap = true;
 
 		NeuralRenderingSettings neuralRendering;
 	};
@@ -388,6 +401,17 @@ public:
 	///
 	/// @return false only when Streamline rejected the options, or Reflex is unavailable.
 	bool ApplyReflexSettings(bool a_force = false);
+
+	/// @brief (45m) Frame-start pacing on (Reflex fix and its pacer switched on, not VR).
+	bool IsLatencyPacerEnabled() const;
+	/// @brief (45m) Latency markers at the engine's render call (44f switch, or the 45m fix).
+	bool WantsReflexMarkersAtRenderStart() const;
+	/// @brief (45m) The Reflex cap actually sent: the user's, or the automatic one when that is Off.
+	uint GetEffectiveReflexFrameLimit() const;
+	uint GetReflexModeApplied() const { return reflexModeApplied; }
+	uint GetReflexFrameLimitApplied() const { return reflexFrameLimitApplied; }
+	/// @brief (45m) One line for the frame-trace header: every Reflex and pacing setting in effect.
+	std::string DescribeLatencyForTrace();
 
 	static double GetRefreshRate(HWND a_window);
 

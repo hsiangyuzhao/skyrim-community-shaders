@@ -1,6 +1,7 @@
 #include "DX12SwapChain.h"
 #include "Utils/EngineTiming.h"
 #include "Utils/FrameTrace.h"
+#include "Utils/LatencyPacer.h"
 #include "Utils/Screenshot.h"
 
 #include <FidelityFX/api/include/dx12/ffx_api_dx12.hpp>
@@ -272,6 +273,8 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		Util::Screenshot::OnFinalImage(finalImage, hdrSource != nullptr);
 
 	// Wait for D3D11 to finish
+	// (45m) The frame's D3D11 work is all handed over here: the end of the CPU span the pacer reserves.
+	Util::LatencyPacer::OnD3D11Submitted();
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
 	fenceValue++;
@@ -426,6 +429,8 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// Wait for D3D12 to finish
 	DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), fenceValue));
 	DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), fenceValue));
+	// (45m) The next frame's D3D11 work cannot start on the GPU before this value: the pacer follows it.
+	Util::LatencyPacer::OnFrameEndSignaled(d3d12Fence.get(), fenceValue);
 	fenceValue++;
 
 	// Update the frame index

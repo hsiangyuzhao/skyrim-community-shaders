@@ -1018,6 +1018,8 @@ bool Streamline::GetReflexState(sl::ReflexState& a_state)
 		logger::error("[Streamline] Could not query Reflex state ({})", magic_enum::enum_name(result));
 		return false;
 	}
+	lastLowLatencyAvailable = a_state.lowLatencyAvailable ? 1 : 0;
+	lastLatencyReportAvailable = a_state.latencyReportAvailable ? 1 : 0;
 	return true;
 }
 

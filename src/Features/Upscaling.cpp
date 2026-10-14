@@ -22,6 +22,7 @@
 #include "Utils/EngineTiming.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/LatencyPacer.h"
 #include "Utils/Nvapi.h"
 #include "Utils/DisplayHDRInfo.h"
 
@@ -72,6 +73,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexMode,
 	reflexFrameLimit,
 	reflexMarkersAtRenderStart,
+	reflexLatencyFix,
+	reflexGpuPacer,
+	reflexPacerMarginMs,
+	reflexAutoCap,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -568,10 +573,45 @@ void Upscaling::DrawLatencySettings()
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::TextUnformatted("FPS cap on frames shown, including generated ones: 120 at 2x renders 60 real frames (40 at 3x, 30 at 4x). 0 = no cap.");
 		ImGui::TextUnformatted("Best cap for VRR/G-Sync, with the least added lag. Keep it below the monitor's max refresh, and low enough to hold steady.");
-		ImGui::TextUnformatted("Keep it at or below about 180 fps: above that, latency explodes and the menu mouse becomes unusable (known issue).");
+		ImGui::TextUnformatted("Without the Reflex Fix below, keep it at or below about 180 fps: above that, latency explodes and the menu mouse becomes unusable.");
+		ImGui::TextUnformatted("With the fix on, Off means an automatic cap just under the refresh rate (224 at 240 Hz).");
+	}
+
+	// (45m) Reflex Fix.
+	ImGui::Checkbox("Reflex Fix (45m)", &settings.reflexLatencyFix);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted("Reflex is attached to the D3D12 presenting device and cannot see the game's D3D11 rendering, so it never held the CPU back:");
+		ImGui::TextUnformatted("the game ran up to two frames ahead of the graphics card, which is where the extra input lag came from.");
+		ImGui::TextUnformatted("On: latency markers where the frame really starts rendering, a frame-start pacer that follows the graphics card itself,");
+		ImGui::TextUnformatted("an automatic cap when the Frame Limit is Off, and no legacy spin limiter after Present. Off = the 45l behaviour, for A/B.");
+	}
+	if (settings.reflexLatencyFix) {
+		ImGui::Indent();
+		ImGui::Checkbox("Frame-start pacer", &settings.reflexGpuPacer);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Waits before the game reads input until the graphics card is about to need the next frame, and never lets the CPU get");
+			ImGui::TextUnformatted("more than one frame ahead. Lower lag, same frame rate. The game's own CPU hitches may show a little more.");
+		}
+		if (settings.reflexGpuPacer) {
+			ImGui::SliderFloat("Pacer safety margin", &settings.reflexPacerMarginMs, -2.0f, 8.0f, "%.1f ms", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Extra CPU time kept in hand. Raise it if the frame rate drops with the pacer on; lower it for a little less lag.");
+		}
+		ImGui::Checkbox("Automatic cap when Frame Limit is Off", &settings.reflexAutoCap);
+		const auto& pacer = Util::LatencyPacer::Last();
+		if (pacer.tracking)
+			ImGui::TextDisabled("Pacer: %d frame(s) on the GPU at frame start, GPU period %.1f ms, CPU reserve %.1f ms, slept %.1f ms (+%.1f ms bound)",
+				pacer.inFlight, pacer.gpuPeriodMs, pacer.leadMs, pacer.sleepMs, pacer.capWaitMs);
+		else
+			ImGui::TextDisabled("Pacer: waiting for the D3D12 swap chain");
+		ImGui::Unindent();
 	}
 
 	ImGui::Text("Display reports %.0f Hz", refreshRate);
+	if (settings.reflexFrameLimit == 0 && GetEffectiveReflexFrameLimit() > 0) {
+		ImGui::SameLine();
+		ImGui::Text("- automatic cap %u fps (Reflex Fix)", GetEffectiveReflexFrameLimit());
+	}
 	if (settings.reflexFrameLimit > 0) {
 		if (IsFrameGenerationRequestedNow()) {
 			const uint multiplier = GetFrameGenerationAppliedMultiplier();
@@ -617,7 +657,13 @@ void Upscaling::DrawAdvancedSettings()
 	if (!globals::game::isVR) {
 		// (44f, A)
 		if (streamline.featureReflex) {
-			ImGui::Checkbox("Reflex Markers at Render Start (44f)", &settings.reflexMarkersAtRenderStart);
+			if (settings.reflexLatencyFix)
+				ImGui::BeginDisabled();
+			bool markersShown = WantsReflexMarkersAtRenderStart();
+			if (ImGui::Checkbox("Reflex Markers at Render Start (44f, included in Reflex Fix)", &markersShown) && !settings.reflexLatencyFix)
+				settings.reflexMarkersAtRenderStart = markersShown;
+			if (settings.reflexLatencyFix)
+				ImGui::EndDisabled();
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("Tells Reflex when the game really finishes its update and starts rendering, so Reflex can see the GPU is the limit and");
 				ImGui::TextUnformatted("let the CPU start the next frame later instead of waiting inside Present. Expected: 10-20 ms less input lag.");
@@ -625,7 +671,7 @@ void Upscaling::DrawAdvancedSettings()
 				if (!Util::EngineTiming::ProbesInstalled())
 					ImGui::TextUnformatted("Needs the Engine Timing Probes (Performance Overlay settings, SE 1.5.97 only); without them the old placement is used.");
 			}
-			if (settings.reflexMarkersAtRenderStart && !Util::EngineTiming::ProbesInstalled())
+			if (WantsReflexMarkersAtRenderStart() && !Util::EngineTiming::ProbesInstalled())
 				ImGui::TextDisabled("(probes %s: old placement in use)", Util::EngineTiming::ProbeStatus());
 		}
 
@@ -893,6 +939,7 @@ void Upscaling::LoadSettings(json& o_json)
 		settings.sharpeningMethodDLSS = static_cast<uint>(DLSSSharpening::kOff);
 	}
 	settings.sharpnessRCAS = std::clamp(settings.sharpnessRCAS, 0.0f, 1.0f);
+	settings.reflexPacerMarginMs = std::isfinite(settings.reflexPacerMarginMs) ? std::clamp(settings.reflexPacerMarginMs, -2.0f, 8.0f) : 1.0f;
 
 	// Sanitize loaded settings to ensure enum indices are valid
 	constexpr auto enumCount = 4;  // UpscaleMethod has 4 values: kNONE, kTAA, kFSR, kDLSS
@@ -1620,7 +1667,7 @@ bool Upscaling::ApplyReflexSettings(bool a_force)
 	if (IsFrameGenerationRequestedNow() && mode == static_cast<uint>(sl::ReflexMode::eOff))
 		mode = static_cast<uint>(sl::ReflexMode::eLowLatency);
 
-	const uint frameLimit = settings.reflexFrameLimit;
+	const uint frameLimit = GetEffectiveReflexFrameLimit();
 	if (!a_force && mode == reflexModeApplied && frameLimit == reflexFrameLimitApplied)
 		return true;
 
@@ -1652,6 +1699,50 @@ bool Upscaling::ApplyReflexSettings(bool a_force)
 	return true;
 }
 
+bool Upscaling::IsLatencyPacerEnabled() const
+{
+	return !REL::Module::IsVR() && settings.reflexLatencyFix && settings.reflexGpuPacer;
+}
+
+bool Upscaling::WantsReflexMarkersAtRenderStart() const
+{
+	return settings.reflexMarkersAtRenderStart || settings.reflexLatencyFix;
+}
+
+uint Upscaling::GetEffectiveReflexFrameLimit() const
+{
+	if (settings.reflexFrameLimit > 0 || !settings.reflexLatencyFix || !settings.reflexAutoCap || refreshRate < 30.0)
+		return settings.reflexFrameLimit;
+	// (45m) NVIDIA's own VRR cap rule (refresh - refresh^2/3600): 224 at 240 Hz, 138 at 144 Hz. It is
+	// a presented-frame cap like the slider, so with frame generation running it almost never binds;
+	// in menus (generation off) it keeps the frame rate inside the VRR window.
+	const double cap = refreshRate - refreshRate * refreshRate / 3600.0;
+	return static_cast<uint>(std::max(cap, 30.0));
+}
+
+std::string Upscaling::DescribeLatencyForTrace()
+{
+	sl::ReflexState state{};
+	const bool stateOk = streamline.GetReflexState(state);
+	const uint modeApplied = reflexModeApplied;
+	static constexpr const char* kModes[] = { "Off", "On", "On+Boost" };
+	auto modeName = [](uint m) { return m < 3 ? kModes[m] : "not applied"; };
+	return std::format(
+		"Reflex available {}, functions ready {}, PCL ready {}; mode set {} / applied {}; frame limit set {} / effective {} / applied {} fps (presented); "
+		"latency fix {}, pacer {} (margin {:.1f} ms), auto cap {}, markers at render start {} (probes {}); lowLatencyAvailable {}, latencyReportAvailable {}; "
+		"frame generation requested {} at {}x; legacy limiter {} (syncInterval 0 path{}); refresh {:.0f} Hz",
+		streamline.featureReflex ? "yes" : "no", streamline.reflexFunctionsReady ? "yes" : "no", streamline.pclFunctionsReady ? "yes" : "no",
+		modeName(std::min(settings.reflexMode, 2u)), modeName(modeApplied), settings.reflexFrameLimit, GetEffectiveReflexFrameLimit(),
+		reflexFrameLimitApplied == UINT_MAX ? -1 : static_cast<int>(reflexFrameLimitApplied),
+		settings.reflexLatencyFix ? "on" : "off", IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs,
+		settings.reflexLatencyFix && settings.reflexAutoCap ? "on" : "off", WantsReflexMarkersAtRenderStart() ? "on" : "off",
+		Util::EngineTiming::ProbesInstalled() ? "installed" : Util::EngineTiming::ProbeStatus(),
+		stateOk ? (state.lowLatencyAvailable ? "yes" : "no") : "?", stateOk ? (state.latencyReportAvailable ? "yes" : "no") : "?",
+		IsFrameGenerationRequestedNow() ? "yes" : "no", GetFrameGenerationAppliedMultiplier(),
+		settings.frameLimitMode ? "on" : "off", settings.reflexLatencyFix && streamline.reflexFunctionsReady ? ", skipped by the 45m fix" : "",
+		refreshRate);
+}
+
 void Upscaling::TimerSleepQPC(int64_t targetQPC)
 {
 	LARGE_INTEGER currentQPC;
@@ -1677,7 +1768,11 @@ void Upscaling::FrameLimiter()
 			WaitForSingleObject(waitableObject, INFINITE);
 		}
 
-		if (settings.frameLimitMode) {
+		// (45m) The spin below runs after Present, the one place a wait only adds queue latency.
+		// With the Reflex fix on and Reflex available, Reflex's cap (or the automatic one) and the
+		// frame-start pacer do this job before input is sampled instead.
+		const bool reflexOwnsPacing = settings.reflexLatencyFix && streamline.reflexFunctionsReady;
+		if (settings.frameLimitMode && !reflexOwnsPacing) {
 			// Fall back to the original timing method
 			// Use integer arithmetic for more precise timing
 			const bool generatingNow = IsFrameGenerationRequestedNow() &&
