@@ -101,6 +101,8 @@ namespace RayTracingCharacters
 		void Update(RayTracingRT::Backend& a_backend, const float a_rect[4]);
 		/// This frame's draws (retiring ones too) and their bone matrices.
 		void CollectDraws(std::vector<RayTracingRT::SkinDraw>& o_draws, std::vector<float>& o_bones) const;
+		/// (46e) The characters of the last CollectDraws: reference -> key (SkinDraw::owner, 1..), sorted by pointer.
+		[[nodiscard]] const std::vector<std::pair<const void*, std::uint32_t>>& Owners() const { return owners_; }
 		/// After this frame's trace was submitted (or skipped): releases the retiring shapes.
 		void EndFrame(RayTracingRT::Backend& a_backend);
 		void ReleaseAll(RayTracingRT::Backend& a_backend);
@@ -164,6 +166,7 @@ namespace RayTracingCharacters
 
 		std::vector<std::unique_ptr<Actor>> actors_;
 		std::vector<std::unique_ptr<Actor>> retiring_;  // traced this frame, released in EndFrame
+		mutable std::vector<std::pair<const void*, std::uint32_t>> owners_;  // (46e) CollectDraws
 		std::atomic<bool> flushRequested_{ false };
 		bool physics_ = false;
 		bool hair_ = false;               // (45j)

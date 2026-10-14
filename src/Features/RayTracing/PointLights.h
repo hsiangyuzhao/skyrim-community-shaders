@@ -56,7 +56,8 @@ namespace RayTracingPointLights
 		float posRadius[4];  // camera-relative position, radius (attenuation range)
 		float atten[4];      // inverse radius, ISL fade zone, ISL size bias, intensity (brightest channel x fade)
 		float spot[4];       // (46c) spot: direction (light to surface), tan of the larger half width; unused for points
-		std::uint32_t info[4];  // flags, ray end clearance (float bits), (46c) spot falloff exponent (float bits), reserved
+		std::uint32_t info[4];  // flags, ray end clearance (float bits), (46c) spot falloff exponent (float bits),
+		                        // (46e) owner key: the character whose TLAS instances its rays ignore (0 = none)
 	};
 	static_assert(sizeof(GpuSource) == 64);
 
@@ -70,6 +71,7 @@ namespace RayTracingPointLights
 		std::uint32_t source = 0;     // source slot + 1
 		bool spot = false;
 		float pos[3]{};               // camera-relative position of the light
+		double world[3]{};            // (46e) world position (the next frame's fallback cone of a skipped shadow map)
 		float dir[3]{}, right[3]{}, up[3]{};  // spot axes (world)
 		float semiWidth = 1.0f, semiHeight = 1.0f, falloff = 1.0f;  // spot: tan of the half widths, mask falloff exponent
 	};
@@ -97,6 +99,9 @@ namespace RayTracingPointLights
 		bool player = true;
 		bool effects = true;
 		float ownClearance = 8.0f;  // their ray end clearance: no fixture of theirs is in the scene (the torch is the player's, excluded)
+		// (46e) The characters in this frame's TLAS (owner reference -> key, sorted by pointer, Characters::Owners): a light
+		// carried by one of them (a torch in an NPC's hand) does not test that character's own body and gear.
+		const std::vector<std::pair<const void*, std::uint32_t>>* owners = nullptr;
 	};
 
 	struct Stats
@@ -119,6 +124,7 @@ namespace RayTracingPointLights
 		std::uint32_t forcedMissing = 0; // (46c) ... of which got no source (their mask channel gets the fallback)
 		std::uint32_t player = 0;        // (46d) the player's own lights among the sources
 		std::uint32_t effects = 0;       // (46d) spell / effect lights among the sources
+		std::uint32_t carried = 0;       // (46e) sources carried by a traced character (its own body is not tested)
 		float cpuMs = 0.0f;
 	};
 	inline constexpr const char* kRejectNames[8] = { "faded (lodDimmer)", "radius", "intensity", "distance", "outside traced area", "category",

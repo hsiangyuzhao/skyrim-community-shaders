@@ -1693,6 +1693,8 @@ namespace RayTracingRT
 			desc.Transform[1][3] = static_cast<float>(draw.y - a_input.cameraY);
 			desc.Transform[2][3] = static_cast<float>(draw.z - a_input.cameraZ);
 			desc.InstanceMask = draw.npc ? kNpcMask : kCharacterMask;
+			// (46e) Inline ray queries have no hit groups: the field carries the character's key (TracePointLightsCS).
+			desc.InstanceContributionToHitGroupIndex = draw.owner & 0xFFFFFFu;
 			desc.Flags = kInstanceFlags;
 			if (alpha) {
 				desc.InstanceID = draw.alphaInfo + 1;

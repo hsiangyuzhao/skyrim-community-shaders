@@ -28,6 +28,7 @@ namespace RayTracingPointLights
 		struct LightRead
 		{
 			RE::NiLight* niLight = nullptr;
+			const void* owner = nullptr;  // (46e) the light's reference (GetUserData: its own, or a parent node's)
 			float pos[3]{};
 			float color[3]{};
 			float fade = 0.0f;  // with lodDimmer, as LLF uploads it
@@ -101,6 +102,7 @@ namespace RayTracingPointLights
 			if (!niLight || niLight->GetFlags().any(RE::NiAVObject::Flag::kHidden))
 				return;
 			o.niLight = niLight;
+			o.owner = niLight->GetUserData();
 			LightLimitFix::LightData d{};
 			LightLimitFix::FillLightData(a_light, niLight, d);
 			o.color[0] = d.color.x;
@@ -187,6 +189,7 @@ namespace RayTracingPointLights
 			bool spot;   // (46c) a spot shadow light (own group, its cone)
 			bool beam;   // (46c) a window beam
 			std::uint8_t kind;  // (46d) 0 world light, 1 the player's, 2 spell / effect
+			std::uint32_t owner;  // (46e) key of the traced character carrying it (0 = none)
 		};
 
 		struct Group
@@ -200,6 +203,7 @@ namespace RayTracingPointLights
 			bool native = false;
 			bool spot = false;  // (46c) never merged with anything
 			std::uint8_t kind = 0;  // (46d) merged only with lights of the same kind
+			std::uint32_t owner = 0;  // (46e) merged only with lights of the same carrier (or none)
 			std::uint32_t first = 0;  // first member in the member list
 			std::uint32_t slot = UINT32_MAX;
 		};
@@ -316,6 +320,12 @@ namespace RayTracingPointLights
 				++stats_.byReason[kRejectUnused];
 				continue;
 			}
+			// (46e) Engine data that is not a number (a broken light) never reaches the ranking: NaN breaks std::sort.
+			if (!std::isfinite(r.pos[0]) || !std::isfinite(r.pos[1]) || !std::isfinite(r.pos[2]) || !std::isfinite(r.radius) || !std::isfinite(r.fade) ||
+				!std::isfinite(r.lodDimmer) || !std::isfinite(r.color[0]) || !std::isfinite(r.color[1]) || !std::isfinite(r.color[2])) {
+				++stats_.readErrors;
+				continue;
+			}
 			++stats_.used;
 			// (46c) An engine shadow light whose shadow map was not drawn this frame: always a source (no other rule).
 			const bool forced = a_config.forced && r.shadow &&
@@ -429,6 +439,15 @@ namespace RayTracingPointLights
 			c.spot = spot;
 			c.beam = beam;
 			c.kind = (forced || beam) ? 0 : (category == C::Player ? 1 : (category == C::Effect ? 2 : 0));
+			// (46e) Carried by a traced character (an NPC's torch): its rays do not test that character (the player's own
+			// lights skip the player's body through kSourceNoPlayer already).
+			c.owner = 0;
+			if (a_config.owners && r.owner && c.kind != 1) {
+				const auto it = std::lower_bound(a_config.owners->begin(), a_config.owners->end(), r.owner,
+					[](const auto& a_entry, const void* a_key) { return a_entry.first < a_key; });
+				if (it != a_config.owners->end() && it->first == r.owner)
+					c.owner = it->second;
+			}
 			candidates.push_back(c);
 			stats_.native += native ? 1 : 0;
 			stats_.forced += forced ? 1 : 0;
@@ -446,7 +465,7 @@ namespace RayTracingPointLights
 			// (46c) Spot lights keep a source of their own (their cone and direction are theirs).
 			for (std::uint32_t g = 0; g < groups.size() && !c.spot; ++g) {
 				const auto& group = groups[g];
-				if (group.spot || group.kind != c.kind)
+				if (group.spot || group.kind != c.kind || group.owner != c.owner)
 					continue;
 				const double ex = group.pos[0] - c.pos[0], ey = group.pos[1] - c.pos[1], ez = group.pos[2] - c.pos[2];
 				if (ex * ex + ey * ey + ez * ez <= mergeSq) {
@@ -465,6 +484,7 @@ namespace RayTracingPointLights
 				group.native = c.native;
 				group.spot = c.spot;
 				group.kind = c.kind;
+				group.owner = c.owner;
 				groups.push_back(group);
 				memberGroup[i] = static_cast<std::uint32_t>(groups.size() - 1);
 			} else {
@@ -600,6 +620,8 @@ namespace RayTracingPointLights
 			}
 			std::memcpy(&clearanceBits, &clearance, sizeof(clearanceBits));
 			out.info[1] = clearanceBits;
+			out.info[3] = group.owner & 0xFFFFFFu;  // (46e) TracePointLightsCS: instances of this character are not tested
+			stats_.carried += group.owner ? 1 : 0;
 			scan = std::max(scan, group.slot + 1);
 			++stats_.sources;
 		}
@@ -621,8 +643,10 @@ namespace RayTracingPointLights
 				e.channel = c.read.shadowIndex;
 				e.source = groups[g].slot + 1;
 				e.spot = c.spot;
-				for (int k = 0; k < 3; ++k)
+				for (int k = 0; k < 3; ++k) {
 					e.pos[k] = static_cast<float>(c.pos[k] - a_camera[k]);
+					e.world[k] = c.pos[k];
+				}
 				std::copy_n(c.read.dir, 3, e.dir);
 				std::copy_n(c.read.right, 3, e.right);
 				std::copy_n(c.read.up, 3, e.up);

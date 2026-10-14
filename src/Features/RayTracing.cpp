@@ -541,7 +541,15 @@ bool RayTracing::SkipShadowMap(RE::BSShadowLight* a_light)
 	const std::uint32_t channel = ReadShadowChannel(a_light);
 	if (channel > 3)
 		return false;
-	skippedMaps.push_back({ a_light, channel });
+	SkippedMap skipped{ a_light, channel };
+	// (46e) Its cone from last frame's trace (the fallback, should this frame's RT result be missing).
+	const auto it = std::lower_bound(skipEntries.begin(), skipEntries.end(), static_cast<const RE::BSLight*>(a_light),
+		[](const RayTracingPointLights::MaskEntry& a_entry, const RE::BSLight* a_key) { return a_entry.light < a_key; });
+	if (it != skipEntries.end() && it->light == a_light) {
+		skipped.hasEntry = true;
+		skipped.entry = *it;
+	}
+	skippedMaps.push_back(skipped);
 	skippedLights.insert(std::upper_bound(skippedLights.begin(), skippedLights.end(), static_cast<const RE::BSLight*>(a_light)), a_light);
 	++skippedTotal;
 	return true;
@@ -605,7 +613,7 @@ void RayTracing::Disable(Status a_status, std::string a_reason)
 	interiorThisFrame = false;
 	interiorTracedLastFrame = false;
 	skipLatched = false;
-	skipCandidates.clear();
+	skipCandidates.clear(); skipEntries.clear();
 	RayTracingCasterFilter::Clear();
 	characters.ReleaseAll(backend);  // (45i) (a backend that is gone ignores the handles)
 	scene.ReleaseAll(backend);
@@ -1077,6 +1085,7 @@ void RayTracing::Prepass()
 	interiorThisFrame = false;
 	interiorTracedLastFrame = false;  // set again by this frame's interior trace (FinishFrame)
 	skipCandidates.clear();           // likewise (the lights it handled: next frame's shadow maps may skip them)
+	skipEntries.clear();              // (46e) their cones (copied into skippedMaps by SkipShadowMap already)
 	pointMaskDone = false;
 	maskChannelsWritten = 0;
 	skippedLastFrame = static_cast<std::uint32_t>(skippedMaps.size());
@@ -1335,6 +1344,7 @@ void RayTracing::PublishCpuSplit()
 		// (46c)
 		detail.rtInterior = interiorThisFrame ? (pointThisFrame ? 2 : 1) : 0;
 		detail.plBeams = pointThisFrame ? ps.beams : 0;
+		detail.plCarried = pointThisFrame ? ps.carried : 0;  // (46e)
 		detail.smSkipped = static_cast<std::uint32_t>(skippedMaps.size());
 		detail.maskChannels = maskChannelsWritten;
 		detail.interiorShapes = scene.GetStats().interior ? scene.GetStats().interiorShapes : 0;
@@ -1868,9 +1878,13 @@ void RayTracing::FinishFrame()
 		WritePointMask(pointThisFrame && pointDenoised);
 		interiorTracedLastFrame = pointThisFrame && pointDenoised;
 		if (interiorTracedLastFrame) {
-			for (const auto& entry : pointSelector.MaskEntries())
+			for (const auto& entry : pointSelector.MaskEntries()) {
 				skipCandidates.push_back(entry.light);
+				skipEntries.push_back(entry);
+			}
 			std::sort(skipCandidates.begin(), skipCandidates.end());
+			std::sort(skipEntries.begin(), skipEntries.end(),
+				[](const RayTracingPointLights::MaskEntry& a, const RayTracingPointLights::MaskEntry& b) { return a.light < b.light; });
 		}
 		std::copy_n(pending.viewProj, 16, prevViewProj);
 		std::copy_n(pending.viewProjUnjittered, 16, prevViewProjUnjittered);
@@ -2180,6 +2194,8 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	config.player = settings.PointLightsPlayer;
 	config.effects = settings.PointLightsEffects;
 	config.forced = a_interior && !skippedLights.empty() ? &skippedLights : nullptr;
+	// (46e) The characters in this frame's TLAS: a light one of them carries skips that character's body.
+	config.owners = (a_input.skinDraws && !a_input.skinDraws->empty()) ? &characters.Owners() : nullptr;
 	const double camera[3] = { a_camX, a_camY, a_camZ };
 	const float worldRect[4] = { static_cast<float>(a_traceRect[0] + a_camX), static_cast<float>(a_traceRect[1] + a_camY),
 		static_cast<float>(a_traceRect[2] + a_camX), static_cast<float>(a_traceRect[3] + a_camY) };
@@ -2315,7 +2331,7 @@ void RayTracing::SwitchOffInteriors(std::string a_reason)
 	pointThisFrame = false;
 	pointHistoryValid = false;
 	interiorTracedLastFrame = false;
-	skipCandidates.clear();
+	skipCandidates.clear(); skipEntries.clear();
 	UnbindPointLights();
 	if (status == Status::Active && Util::IsInterior()) {
 		status = Status::Inactive;
@@ -2617,8 +2633,27 @@ void RayTracing::WritePointMask(bool a_traced)
 			ch.Flags[0] |= kMaskWrite | (e.spot ? kMaskSpot : 0u);
 		}
 	}
-	for (const auto& skipped : skippedMaps)
-		cb.Channels[std::min<std::uint32_t>(skipped.channel, 3)].Flags[0] |= kMaskWrite | kMaskSkipped;
+	const float4 cameraNow = globals::game::frameBufferCached.GetCameraPosAdjust(0);
+	for (const auto& skipped : skippedMaps) {
+		auto& ch = cb.Channels[std::min<std::uint32_t>(skipped.channel, 3)];
+		// (46e) No traced entry for this channel this frame: its cone from last frame's (else a skipped spot light, a
+		// window beam, would light the whole screen for this frame).
+		if (!(ch.Flags[0] & kMaskWrite) && skipped.hasEntry) {
+			const auto& e = skipped.entry;
+			ch.Pos[0] = static_cast<float>(e.world[0] - cameraNow.x);
+			ch.Pos[1] = static_cast<float>(e.world[1] - cameraNow.y);
+			ch.Pos[2] = static_cast<float>(e.world[2] - cameraNow.z);
+			ch.Pos[3] = 0.0f;  // no traced result
+			std::copy_n(e.dir, 3, ch.Dir);
+			ch.Dir[3] = e.falloff;
+			std::copy_n(e.right, 3, ch.Right);
+			ch.Right[3] = e.semiWidth;
+			std::copy_n(e.up, 3, ch.Up);
+			ch.Up[3] = e.semiHeight;
+			ch.Flags[0] |= e.spot ? kMaskSpot : 0u;
+		}
+		ch.Flags[0] |= kMaskWrite | kMaskSkipped;
+	}
 	for (const auto& ch : cb.Channels)
 		written += (ch.Flags[0] & kMaskWrite) ? 1 : 0;
 	if (!skippedMaps.empty() && !rt)
@@ -3048,8 +3083,8 @@ void RayTracing::DrawSettings()
 		if (settings.PointLights && settings.Enabled) {
 			ImGui::Text("This frame: %u lights traced (K %u) of %u candidates (%u merged, %u over the cap, %u engine shadow lights); %u lights in use",
 				pointThisFrame ? ps.sources : 0u, pointThisFrame ? pointK : 0u, ps.candidates, ps.merged, ps.capped, ps.native, ps.used);
-			ImGui::Text("  of which the player's own lights %u, spell / effect lights %u; plants / cut-outs tested %s", pointThisFrame ? ps.player : 0u,
-				pointThisFrame ? ps.effects : 0u, backend.PointAlphaLastFrame() ? "yes" : "no");
+			ImGui::Text("  of which the player's own lights %u, spell / effect lights %u, carried by other characters %u; plants / cut-outs tested %s",
+				pointThisFrame ? ps.player : 0u, pointThisFrame ? ps.effects : 0u, pointThisFrame ? ps.carried : 0u, backend.PointAlphaLastFrame() ? "yes" : "no");
 			ImGui::Text("Cost: trace %.2f ms GPU, %s rays per frame; denoiser %.2f ms GPU; selection %.3f ms CPU",
 				std::max(rt.lastPointGpuMs, 0.0f), rt.pointRaysPerFrame >= 0 ? std::format("{:.2f} M", static_cast<double>(rt.pointRaysPerFrame) / 1e6).c_str() : "?",
 				std::max(Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingPointDenoise), 0.0f), pointCpuMs);

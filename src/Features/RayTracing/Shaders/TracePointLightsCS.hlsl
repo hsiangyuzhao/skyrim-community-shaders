@@ -49,7 +49,7 @@ struct PLSource
 	float4 PosRadius;  // camera-relative position, radius
 	float4 Atten;      // inverse radius, ISL fade zone, ISL size bias, intensity
 	float4 Spot;       // (46c) spot: direction (light to surface, world axes), tan of the larger half width
-	uint4 Info;        // flags, clearance (float bits), (46c) spot falloff exponent (float bits), reserved
+	uint4 Info;        // flags, clearance (float bits), (46c) spot falloff exponent (float bits), (46e) carrier key (0 = none)
 };
 
 ConstantBuffer<PLConstants> C : register(b0);
@@ -231,6 +231,46 @@ bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, float
 	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
+// (46e) The character ray of a light a character carries (an NPC's torch): that character's instances (their
+// InstanceContributionToHitGroupIndex = its key, Backend) are not tested. Every candidate comes back (forced
+// non-opaque); the opaque instances (ID 0) block as usual, the alpha-tested ones are tested against their cut-out
+// (RT_ALPHA) or ignored (without it they are culled in Blocked() too).
+bool BlockedExcept(float3 origin, float3 dir, float tMax, uint mask, float tMin, float footprint, uint owner, out float tHit)
+{
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = dir;
+	ray.TMin = tMin;
+	ray.TMax = tMax;
+	RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
+#if defined(RT_ALPHA)
+	uint budget = kAlphaCandidateBudget;
+#endif
+	while (q.Proceed()) {
+		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+			continue;
+		if (q.CandidateInstanceContributionToHitGroupIndex() == owner)
+			continue;
+		const uint id = q.CandidateInstanceID();
+		bool blocks = id == 0u;
+#if defined(RT_ALPHA)
+		if (!blocks) {
+			if (budget == 0u || AlphaBlocks(id, q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint))
+				blocks = true;
+			else
+				budget -= 1u;
+		}
+#endif
+		if (blocks) {
+			q.CommitNonOpaqueTriangleHit();
+			q.Abort();
+		}
+	}
+	tHit = q.CommittedRayT();
+	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+
 // Does the segment origin -> origin + dir * tMax pass the sphere?
 bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 {
@@ -405,7 +445,12 @@ groupshared uint gsMask[2];
 			if (flags & kFlagCharCull)
 				test = (!ownLight && SphereOnSegment(origin, dir, tMax, C.Spheres[0])) || SphereOnSegment(origin, dir, tMax, C.Spheres[1]);
 			if (test) {
-				blocked = Blocked(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, tHit);
+				// (46e) A light carried by a traced character (Info.w = its key): that character's body is not tested.
+				const uint owner = src.Info.w & 0xFFFFFFu;
+				if (owner != 0u)
+					blocked = BlockedExcept(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, owner, tHit);
+				else
+					blocked = Blocked(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, tHit);
 				rays += 1u;
 			}
 		}

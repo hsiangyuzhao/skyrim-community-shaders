@@ -116,6 +116,7 @@ namespace RayTracingRT
 		std::uint32_t boneOffset = 0;
 		std::uint32_t alphaInfo = UINT32_MAX;  // alpha-tested parts: the record (CreateSkinAlphaInfo)
 		bool npc = false;    // (45l) not the player: instance mask kNpcMask
+		std::uint32_t owner = 0;  // (46e) the character's key (InstanceContributionToHitGroupIndex, 24 bits): point lights it carries skip it
 		bool reuse = false;  // (45l) not skinned / refit this frame: last frame's BLAS (x / y / z = the origin it was skinned at)
 	};
 

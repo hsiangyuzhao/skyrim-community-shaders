@@ -102,6 +102,7 @@ namespace Util::FrameTrace
 		// left out this frame; shadow mask channels written by RT; interior shapes captured.
 		int rtInterior = 0;
 		uint32_t plBeams = 0, smSkipped = 0, maskChannels = 0, interiorShapes = 0;
+		uint32_t plCarried = 0;  // (46e) sources carried by a traced character (its own body not tested)
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

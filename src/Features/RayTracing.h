@@ -498,7 +498,12 @@ private:
 	{
 		const RE::BSLight* light;
 		std::uint32_t channel;
+		// (46e) The light as last frame's trace had it (its spot cone): the fallback without this frame's RT result is
+		// the cone, not the whole screen lit.
+		bool hasEntry = false;
+		RayTracingPointLights::MaskEntry entry{};
 	};
+	std::vector<RayTracingPointLights::MaskEntry> skipEntries;  // (46e) last frame's mask entries, sorted by light
 	std::vector<SkippedMap> skippedMaps;            // this frame
 	std::vector<const RE::BSLight*> skippedLights;  // this frame, sorted (the selection's forced sources)
 	std::uint32_t skippedLastFrame = 0;

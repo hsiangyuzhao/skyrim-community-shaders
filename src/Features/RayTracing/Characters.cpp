@@ -1079,7 +1079,8 @@ namespace RayTracingCharacters
 	{
 		o_draws.clear();
 		o_bones.clear();
-		auto add = [&](const Shape& a_shape, bool a_npc) {
+		owners_.clear();
+		auto add = [&](const Shape& a_shape, bool a_npc, std::uint32_t a_owner) {
 			if (a_shape.handle == RayTracingRT::kInvalidSkin || a_shape.matrices.empty() || a_shape.matrices.size() != a_shape.bones.size() * 12)
 				return;
 			if (!a_shape.drawable || (a_shape.alpha && a_shape.info == RayTracingRT::kInvalidAlphaInfo))
@@ -1092,6 +1093,7 @@ namespace RayTracingCharacters
 			draw.boneOffset = static_cast<std::uint32_t>(o_bones.size() / 12);
 			draw.alphaInfo = a_shape.alpha ? a_shape.info : RayTracingRT::kInvalidAlphaInfo;
 			draw.npc = a_npc;
+			draw.owner = a_owner;
 			draw.reuse = a_shape.reuse;  // (45l) last frame's BLAS: no bones uploaded
 			if (!draw.reuse)
 				o_bones.insert(o_bones.end(), a_shape.matrices.begin(), a_shape.matrices.end());
@@ -1099,11 +1101,24 @@ namespace RayTracingCharacters
 		};
 		for (const auto* list : { &actors_, &retiring_ }) {
 			for (const auto& actor : *list) {
+				// (46e) One key per reference (an actor with a new 3D may also be retiring with its old one).
+				const void* ref = actor->ref.get();
+				std::uint32_t owner = 0;
+				if (ref) {
+					for (const auto& [known, key] : owners_)
+						if (known == ref)
+							owner = key;
+					if (owner == 0) {
+						owner = static_cast<std::uint32_t>(owners_.size()) + 1;
+						owners_.emplace_back(ref, owner);
+					}
+				}
 				for (const auto* shapes : { &actor->shapes, &actor->retiringShapes })
 					for (const auto& shape : *shapes)
-						add(*shape, !actor->player);
+						add(*shape, !actor->player, owner);
 			}
 		}
+		std::sort(owners_.begin(), owners_.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
 	}
 }
 

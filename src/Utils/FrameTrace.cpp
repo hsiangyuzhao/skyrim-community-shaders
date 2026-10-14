@@ -2,6 +2,8 @@
 
 #include "Features/PerformanceOverlay.h"
 #include "Features/RayTracing.h"
+#include "Features/ScreenSpaceGI.h"
+#include "Features/ScreenSpaceRayTracing.h"
 #include "Features/Upscaling.h"
 #include "Menu.h"
 #include "State.h"
@@ -139,6 +141,9 @@ namespace Util::FrameTrace
 			int reflexModeApplied = -1;
 			int reflexLimitApplied = -1;
 			bool latencyFix = false;
+			// (46e) Screen-space GI / reflections per pass (last GPU samples, -1 = the pass is off): SSRT REBLUR,
+			// SSRT diffuse trace, SSRT specular trace, SSGI, SSGI contact AO.
+			float ssPassMs[5]{ -1.0f, -1.0f, -1.0f, -1.0f, -1.0f };
 		};
 
 		struct ReflexTimes
@@ -150,6 +155,7 @@ namespace Util::FrameTrace
 		bool g_recording = false;
 		// (45j) Taken when a recording starts (the CSV is written on another thread).
 		std::string g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency;
+		std::string g_headerRendering;  // (46e) upscaler, resolutions, SSRT / SSGI
 		int64_t g_recordStart = 0;
 		int64_t g_recordEnd = 0;
 		std::vector<Row> g_rows;
@@ -209,8 +215,70 @@ namespace Util::FrameTrace
 			s = s < 0.0f ? ms : s * 0.8f + ms * 0.2f;
 		}
 
+		/// (46e) The upscaler, render / output size and the screen-space GI / reflection setup, for the trace header.
+		std::string DescribeRendering()
+		{
+			std::string text;
+			auto& up = globals::features::upscaling;
+			static constexpr const char* kMethods[] = { "none", "TAA", "FSR", "DLSS" };
+			static constexpr const char* kQuality[] = { "Native AA (DLAA)", "Quality", "Balanced", "Performance", "Ultra Performance" };
+			if (up.loaded) {
+				const auto method = static_cast<std::uint32_t>(up.GetUpscaleMethod());
+				const auto quality = up.settings.qualityMode;
+				text = std::format("upscaler {} {}, DLSS preset {}, ray reconstruction {} (preset {}), sharpening {:.2f}", method < 4 ? kMethods[method] : "?",
+					quality < 5 ? kQuality[quality] : "?", up.settings.DLSSPreset, up.settings.enableDLSSRR ? "on" : "off", up.settings.DLSSDPreset,
+					up.settings.sharpnessRCAS);
+			} else {
+				text = "upscaler not loaded";
+			}
+			if (globals::state) {
+				const float2 output = globals::state->screenSize;
+				const float2 render = Util::ConvertToDynamic(output, true);
+				text += std::format("; render {}x{}, output {}x{}", static_cast<int>(std::floor(render.x)), static_cast<int>(std::floor(render.y)),
+					static_cast<int>(output.x), static_cast<int>(output.y));
+			}
+			static constexpr const char* kDenoisers[] = { "off", "SVGF", "REBLUR" };
+			const auto& ssrt = globals::features::screenSpaceRayTracing;
+			if (ssrt.loaded) {
+				const auto& s = ssrt.settings;
+				const auto dn = [](std::uint32_t a_value) { return a_value < 3 ? kDenoisers[a_value] : "?"; };
+				text += std::format("; SSRT {} (diffuse {}, specular {}, denoiser asked {}, in effect diffuse {} / specular {}, diffuse sampling {}, SPP {})",
+					(s.EnableDiffuse || s.EnableSpecular) ? "on" : "off", s.EnableDiffuse ? "on" : "off", s.EnableSpecular ? "on" : "off", dn(s.DenoiserMethod),
+					dn(ssrt.EffectiveDenoiser(false)), dn(ssrt.EffectiveDenoiser(true)), s.DiffuseSamplingMode, s.DiffuseSPP);
+			} else {
+				text += "; SSRT not loaded";
+			}
+			const auto& ssgi = globals::features::screenSpaceGI;
+			if (ssgi.loaded) {
+				const auto& s = ssgi.settings;
+				text += std::format("; SSGI {} (AO {}, GI {}, contact AO {})", s.Enabled ? "on" : "off", s.Enabled ? "on" : "off", s.Enabled && s.EnableGI ? "on" : "off",
+					s.Enabled && s.EnableContactAo && ssgi.contactAoActive ? "on" : "off");
+			} else {
+				text += "; SSGI not loaded";
+			}
+			return text;
+		}
+
+		/// (46e) Per-pass GPU samples of SSRT / SSGI for this row (-1 when the pass is off).
+		void SampleScreenSpacePasses(Row& a_row)
+		{
+			auto* timers = Util::GpuPassTimers::GetSingleton();
+			const auto& ssrt = globals::features::screenSpaceRayTracing;
+			const auto& ssgi = globals::features::screenSpaceGI;
+			const auto sample = [&](bool a_on, Util::GpuBucket a_bucket) { return a_on ? timers->LastSampleMs(a_bucket) : -1.0f; };
+			const bool diffuse = ssrt.loaded && ssrt.settings.EnableDiffuse;
+			const bool specular = ssrt.loaded && ssrt.settings.EnableSpecular;
+			const bool reblur = (diffuse && ssrt.EffectiveDenoiser(false) == ScreenSpaceRayTracing::kDenoiserREBLUR) ||
+			                    (specular && ssrt.EffectiveDenoiser(true) == ScreenSpaceRayTracing::kDenoiserREBLUR);
+			a_row.ssPassMs[0] = sample(reblur, Util::GpuBucket::SSRTReblur);
+			a_row.ssPassMs[1] = sample(diffuse, Util::GpuBucket::SSRTTraceDiffuse);
+			a_row.ssPassMs[2] = sample(specular, Util::GpuBucket::SSRTTraceSpecular);
+			a_row.ssPassMs[3] = sample(ssgi.loaded && ssgi.settings.Enabled, Util::GpuBucket::SSGI);
+			a_row.ssPassMs[4] = sample(ssgi.loaded && ssgi.settings.Enabled && ssgi.settings.EnableContactAo && ssgi.contactAoActive, Util::GpuBucket::SSGIContactAO);
+		}
+
 		void WriteCsv(std::vector<Row> a_rows, std::unordered_map<uint64_t, ReflexTimes> a_reflex, std::string a_location, std::string a_rayTracing, std::string a_tag,
-			std::string a_latency)
+			std::string a_latency, std::string a_rendering)
 		{
 			try {
 				auto dir = logger::log_directory();
@@ -247,6 +315,7 @@ namespace Util::FrameTrace
 				out << "# (45m) latency at start: " << a_latency << "\n";
 				out << "# (45j) location at start: " << a_location << "\n";
 				out << "# (45j) ray tracing at start: " << a_rayTracing << "\n";
+				out << "# (46e) rendering at start: " << a_rendering << "\n";
 				out << "# (45j) rt_* = Ray Tracing CPU split (ms, -1 = not run): scene update (grid diff, cell capture, filter registration, objects of which new\n";
 				out << "#   captures), TLAS instances, missed-caster check, characters, D3D12 record+submit (of which BLAS creation, skinning), D3D11 passes,\n";
 				out << "#   end of frame, engine references dropped; counts: recaptures, objects captured, misses examined, references waiting, TLAS instances,\n";
@@ -274,6 +343,8 @@ namespace Util::FrameTrace
 				out << "#   GPU ms of the point-light trace (D3D12 queue, inside rt_gpu_ms) and of its denoiser (D3D11), CPU ms of the light selection.\n";
 				out << "# (46c) rt_interior = 0 outdoors / off, 1 indoors capturing, 2 indoors traced; rt_pl_beams = window beams traced; rt_sm_skipped =\n";
 				out << "#   engine shadow maps left out (Stop Engine Shadow Maps); rt_mask_channels = shadow mask channels written by RT; rt_interior_shapes = captured.\n";
+				out << "# (46e) ssrt_reblur / ssrt_trace_diffuse / ssrt_trace_specular / ssgi / ssgi_contact_ao _gpu_ms = last GPU sample of that pass\n";
+				out << "#   (a few frames old; -1 = the pass is off); rt_pl_carried = point-light sources carried by a traced character (its body skipped).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -295,6 +366,7 @@ namespace Util::FrameTrace
 				       "rt_skin_draws,rt_skin_reused,rt_early,rt_early_ms,rt_x_retire_ms,rt_retired_n,rt_worker_release_ms,rt_queue_gap_gpu_ms,rt_still_reused,"
 				       "pacer_in_flight_after,lights_total,lights_shadow,lights_fill_est,lights_player,lights_max_cluster,lights_over4_share,llf_gpu_ms,"
 				       "rt_pl_k,rt_pl_sources,rt_pl_candidates,rt_pl_rays,rt_pl_gpu_ms,rt_pl_denoise_gpu_ms,rt_pl_cpu_ms,rt_interior,rt_pl_beams,rt_sm_skipped,rt_mask_channels,rt_interior_shapes,"
+				       "ssrt_reblur_gpu_ms,ssrt_trace_diffuse_gpu_ms,ssrt_trace_specular_gpu_ms,ssgi_gpu_ms,ssgi_contact_ao_gpu_ms,rt_pl_carried,"
 				       "cpu_top_features\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
@@ -322,6 +394,9 @@ namespace Util::FrameTrace
 					s += std::format(",{},{},{},{},{:.3f},{:.3f},{:.3f}", t.plK, t.plSources, t.plCandidates, t.plRays, t.plGpuMs, t.plDenoiseGpuMs, t.plCpuMs);
 						// (46c)
 						s += std::format(",{},{},{},{},{}", t.rtInterior, t.plBeams, t.smSkipped, t.maskChannels, t.interiorShapes);
+					// (46e)
+					s += std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{}", a_row.ssPassMs[0], a_row.ssPassMs[1], a_row.ssPassMs[2], a_row.ssPassMs[3],
+						a_row.ssPassMs[4], t.plCarried);
 					s += "," + a_row.cpuTop + "\n";
 					return s;
 				};
@@ -983,6 +1058,7 @@ namespace Util::FrameTrace
 				r.rtBuilds = g_frame.rtBuilds;
 				r.rt = g_frame.rt;
 				r.lights = g_frame.lights;
+				SampleScreenSpacePasses(r);  // (46e)
 				r.cpuTop = Util::CpuPassTimers::GetSingleton()->TopOfCurrentFrame(3);
 				r.mapCalls = g_frame.mapCalls;
 				r.mapSlow = g_frame.mapSlow;
@@ -1062,6 +1138,7 @@ namespace Util::FrameTrace
 			g_headerTag = LocationTag(location);
 			g_headerRayTracing = std::format("{}; build {}", globals::features::rayTracing.DescribeForProfile(), BuildLabel::kBuild);
 			g_headerLatency = globals::features::upscaling.DescribeLatencyForTrace();
+			g_headerRendering = DescribeRendering();  // (46e)
 		}
 		logger::info("[FrameTrace] Recording {:.0f} s", a_seconds);
 	}
@@ -1072,7 +1149,7 @@ namespace Util::FrameTrace
 			return;
 		g_recording = false;
 		PollReflex();
-		std::thread(WriteCsv, std::move(g_rows), std::move(g_reflex), g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency).detach();
+		std::thread(WriteCsv, std::move(g_rows), std::move(g_reflex), g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency, g_headerRendering).detach();
 		g_rows = {};
 		g_reflex = {};
 	}

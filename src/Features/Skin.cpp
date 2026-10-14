@@ -319,6 +319,19 @@ namespace
 		return std::isfinite(a_z) && a_z > -1e7f && a_z < 1e7f;
 	}
 
+	/// (46e) The pick under the world's read lock, released by a termination handler: a fault inside the pick
+	/// (caught by PickUpSafe) must not leave the lock held (a C++ guard is not unwound by SEH under /EHsc, and a
+	/// read lock never released would hang the next physics write for good).
+	__declspec(noinline) void PickLocked(RE::bhkWorld* a_world, RE::bhkPickData* a_pick)
+	{
+		a_world->worldLock.LockForRead();
+		__try {
+			a_world->PickObject(*a_pick);
+		} __finally {
+			a_world->worldLock.UnlockForRead();
+		}
+	}
+
 	/// The upward line-of-sight pick (SEH: the Havok world is engine memory).
 	__declspec(noinline) void PickUpUnsafe(RE::bhkWorld* a_world, const RE::NiPoint3* a_from, const RE::NiPoint3* a_to, bool* o_hit)
 	{
@@ -327,10 +340,7 @@ namespace
 		pick.rayInput.from = RE::hkVector4(a_from->x * scale, a_from->y * scale, a_from->z * scale, 0.0f);
 		pick.rayInput.to = RE::hkVector4(a_to->x * scale, a_to->y * scale, a_to->z * scale, 0.0f);
 		pick.rayInput.filterInfo.filter = static_cast<std::uint32_t>(RE::COL_LAYER::kLOS);
-		{
-			RE::BSReadLockGuard lock(a_world->worldLock);
-			a_world->PickObject(pick);
-		}
+		PickLocked(a_world, &pick);
 		*o_hit = pick.rayOutput.HasHit();
 	}
 
