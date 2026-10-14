@@ -19,7 +19,11 @@ namespace Util::LightCensus
 	namespace
 	{
 		// ---- tuning --------------------------------------------------------------------------------
-		constexpr float kFillRadius = 512.0f;           ///< a placed light without a mesh this big and without shadows = fill
+		// (46a) No radius rule for fill lights any more: True Light's campfire ISL lights are ~540 units.
+		constexpr float kWindowBeamRadius = 10000.0f;   ///< (46a) a window spot this big = sun beam (Window Shadows Ultimate)
+		constexpr float kWindowGlowRadius = 128.0f;     ///< (46a) a window light this small = the glow of a lit pane
+		constexpr float kStableIdLocalGrid = 16.0f;     ///< (46a) local offset grid of the stable ID (flicker moves lights)
+		constexpr double kStaleSampleMs = 1000.0;       ///< (46a) an engine-pass GPU sample older than this is not used
 		constexpr float kFixtureNearDistance = 200.0f;  ///< a placed light this close to a candle / torch / ... mesh belongs to it
 		constexpr float kFixtureScanRadius = 8192.0f;   ///< references searched for fixture meshes around the player
 		constexpr std::size_t kMaxFixtureRefs = 8192;
@@ -52,6 +56,8 @@ namespace Util::LightCensus
 			float rawDiffuse[3]{}, rawRadius = 0, rawFade = 0;
 			// as LLF uploads it (ISL applied)
 			float color[3]{}, radius = 0, fade = 0;
+			// (46a) Brightest channel x fade before and after lodDimmer (the distance / room fade).
+			float intensityBeforeFade = 0, intensityAfterFade = 0;
 			uint32_t llfFlags = 0;
 			bool isl = false, islLinear = false, islInitialised = false, islDisabled = false;
 			float islSize = 0, islCutoff = 0;
@@ -466,30 +472,88 @@ namespace Util::LightCensus
 			}
 		}
 
-		/// Per-frame trace classification: bit 0 = player light, bit 1 = fill estimate. No strings, no allocation.
-		int CheapClassify(RE::BSLight* a_light, const RE::TESObjectREFR* a_player, float a_radius, bool a_shadow)
+		/// (46a) Fill light by name: the LIGH editor ID says omni / ambient / fill / bounce, or a plugin it comes
+		/// from is an "ambient" one (True Light - Shadows and Ambient). Never by radius. Lower-case inputs.
+		bool FillByName(const std::string& a_lighEdidLower, const std::string& a_pluginsLower)
+		{
+			return a_lighEdidLower.find("omni") != std::string::npos || !FindWord(a_lighEdidLower, kFillWords).empty() ||
+			       a_pluginsLower.find("ambient") != std::string::npos;
+		}
+
+		/// (46a) Case-insensitive "marker" in a model path, without allocating.
+		bool IsMarkerPath(const char* a_path)
+		{
+			static constexpr char kWord[] = "marker";
+			for (const char* p = a_path; p && *p; ++p) {
+				int i = 0;
+				while (kWord[i] && p[i] && std::tolower(static_cast<unsigned char>(p[i])) == kWord[i])
+					++i;
+				if (!kWord[i])
+					return true;
+			}
+			return false;
+		}
+
+		struct CheapInfo
+		{
+			bool player = false;
+			bool placedNoMesh = false;  ///< a placed LIGH reference whose light object has no mesh (or a marker)
+			RE::TESObjectREFR* ref = nullptr;
+			RE::TESForm* ligh = nullptr;
+			RE::FormID refId = 0;
+		};
+
+		/// Per-frame trace: who owns a light. No strings, no allocation.
+		bool CheapRead(RE::BSLight* a_light, const RE::TESObjectREFR* a_player, CheapInfo* o_info)
 		{
 			__try {
 				auto* niLight = a_light ? a_light->light.get() : nullptr;
 				if (!niLight)
-					return 0;
+					return false;
 				RE::TESObjectREFR* ref = niLight->GetUserData();
-				if (ref && ref == a_player)
-					return 1;
-				if (ref && !a_shadow && a_radius >= kFillRadius) {
-					auto* base = ref->GetBaseObject();
-					if (base && base->GetFormType() == RE::FormType::Light) {
-						const char* model = static_cast<RE::TESObjectLIGH*>(base)->GetModel();
-						if (!model || !*model)
-							return 2;
-					}
+				if (!ref)
+					return true;
+				if (ref == a_player) {
+					o_info->player = true;
+					return true;
 				}
-				return 0;
+				auto* base = ref->GetBaseObject();
+				if (base && base->GetFormType() == RE::FormType::Light) {
+					const char* model = static_cast<RE::TESObjectLIGH*>(base)->GetModel();
+					o_info->placedNoMesh = !model || !*model || IsMarkerPath(model);
+					o_info->ref = ref;
+					o_info->ligh = base;
+					o_info->refId = ref->GetFormID();
+				}
+				return true;
 			} __except (EXCEPTION_EXECUTE_HANDLER) {
-				return 0;
+				return false;
 			}
 		}
 
+		/// (46a) Fill-by-name per placed reference, cached (render thread; names are read once per reference).
+		std::unordered_map<RE::FormID, bool> g_fillByRef;
+
+		/// Per-frame trace classification: bit 0 = player light, bit 1 = fill estimate (the census rule:
+		/// placed, no mesh, no shadow, named / from a plugin like a fill light; 46a: not by radius).
+		int CheapClassify(RE::BSLight* a_light, const RE::TESObjectREFR* a_player, bool a_shadow)
+		{
+			CheapInfo info;
+			if (!CheapRead(a_light, a_player, &info))
+				return 0;
+			if (info.player)
+				return 1;
+			if (a_shadow || !info.placedNoMesh || !info.refId)
+				return 0;
+			auto it = g_fillByRef.find(info.refId);
+			if (it == g_fillByRef.end()) {
+				if (g_fillByRef.size() > 16384)
+					g_fillByRef.clear();
+				const std::string plugins = Lower(PluginOf(info.ligh) + "/" + PluginOf(info.ref) + "/" + LastPluginOf(info.ref));
+				it = g_fillByRef.emplace(info.refId, FillByName(Lower(EdidOf(info.ligh)), plugins)).first;
+			}
+			return it->second ? 2 : 0;
+		}
 		void Classify(LightRecord& r, const std::vector<FixtureRef>& a_fixtures)
 		{
 			auto because = [&](std::string a_reason) { r.reasons.push_back(std::move(a_reason)); };
@@ -538,13 +602,38 @@ namespace Util::LightCensus
 			}
 
 			if (auto w = FindWord(idsLower + "/" + chainLower, kWindowWords); !w.empty()) {
-				r.category = "window";
-				because(std::format("name contains '{}'", w));
+				// (46a) Three different lights: the sun beam through the window (Window Shadows Ultimate's
+				// shadowed spot), the glow of a lit pane seen from outside, and the light a window spreads indoors.
+				const bool spot = r.kind == "spot" || r.kind == "shadow-spot";
+				if (spot && r.radius > kWindowBeamRadius) {
+					r.category = "window-beam";
+					because(std::format("name contains '{}', spot light, radius {:.0f} > {:.0f}", w, r.radius, kWindowBeamRadius));
+				} else if (r.radius < kWindowGlowRadius) {
+					r.category = "window-glow";
+					because(std::format("name contains '{}', radius {:.0f} < {:.0f}", w, r.radius, kWindowGlowRadius));
+				} else {
+					r.category = "window-fill";
+					because(std::format("name contains '{}', radius {:.0f}", w, r.radius));
+				}
 				return;
 			}
 
 			if (r.baseIsLight) {
 				// A placed light (LIGH reference): vanilla, True Light, Window Shadows ...
+				// (46a) No mesh and named like a fill light (LIGH editor ID omni / ambient / fill, or an "ambient"
+				// plugin): fill, before the nearby-fixture test (True Light's DwarvenOmniLight went either way by it).
+				// Shadow-casting ones stand in for a fixture's shadow.
+				const bool noMesh = r.lighModel.empty() || Lower(r.lighModel).find("marker") != std::string::npos;
+				if (noMesh && FillByName(Lower(r.lighEdid), Lower(r.lighPlugin + "/" + r.refPlugin + "/" + r.refLastPlugin))) {
+					if (r.shadow) {
+						r.category = "fixture-shadow";
+						because("placed shadow-casting light without a mesh, named / from a plugin like a fill light: a fixture's shadow stand-in");
+					} else {
+						r.category = "fill";
+						because("placed light without a mesh, LIGH editor ID or plugin names it a fill / omni / ambient light");
+					}
+					return;
+				}
 				if (auto w = FindWord(idsLower, kFillWords); !w.empty()) {
 					r.category = "fill";
 					because(std::format("editor ID contains '{}'", w));
@@ -581,12 +670,7 @@ namespace Util::LightCensus
 					because(std::format("{:.0f} units from a '{}' mesh ({})", best, nearest->word, nearest->label));
 					return;
 				}
-				if (!r.shadow && r.radius >= kFillRadius) {
-					r.category = "fill";
-					because(std::format("placed light without a mesh, radius {:.0f} >= {:.0f}, no shadow{}", r.radius, kFillRadius,
-						nearest ? std::format(", nearest fixture {:.0f} units away", best) : std::string(", no fixture mesh nearby")));
-					return;
-				}
+				// (46a) No "radius >= 512 = fill" rule: True Light's campfires are ~540 units.
 				r.category = "standalone";
 				because(std::format("placed light without a mesh, radius {:.0f}{}", r.radius,
 					nearest ? std::format(", nearest fixture {:.0f} units away", best) : std::string(", no fixture mesh nearby")));
@@ -623,9 +707,14 @@ namespace Util::LightCensus
 			h = Fnv(h, &r.lighId, sizeof(r.lighId));
 			for (const auto& n : r.chain)
 				h = Fnv(h, n.data(), n.size() + 1);
-			const int32_t local[3] = { static_cast<int32_t>(std::lround(r.local[0])), static_cast<int32_t>(std::lround(r.local[1])),
-				static_cast<int32_t>(std::lround(r.local[2])) };
-			h = Fnv(h, local, sizeof(local));
+			// (46a) Flickering lights move (Light Placer / True Light flicker animates the node): Light Placer
+			// lights leave the local offset out (their node name and owner identify them), the rest use it on a
+			// 16-unit grid. 45o hashed the offset rounded to 1 unit: 33 of 49 Whiterun fires did not match.
+			if (!r.lightPlacer) {
+				const int32_t local[3] = { static_cast<int32_t>(std::lround(r.local[0] / kStableIdLocalGrid)),
+					static_cast<int32_t>(std::lround(r.local[1] / kStableIdLocalGrid)), static_cast<int32_t>(std::lround(r.local[2] / kStableIdLocalGrid)) };
+				h = Fnv(h, local, sizeof(local));
+			}
 			// Without an owner the world position (64-unit grid) tells same-named effect lights apart; player lights move.
 			if (!r.refId && !r.isPlayer) {
 				const int32_t grid[3] = { static_cast<int32_t>(std::floor(r.pos[0] / 64.0f)), static_cast<int32_t>(std::floor(r.pos[1] / 64.0f)),
@@ -644,8 +733,8 @@ namespace Util::LightCensus
 				return "hidden";
 			case DropReason::InactiveShadow:
 				return "inactive-shadow-slot";
-			case DropReason::ZeroIntensity:
-				return "zero-intensity";
+			case DropReason::FadedOut:
+				return "faded out (lodDimmer 0)";
 			case DropReason::OverLimit:
 				return "over-1024-limit";
 			default:
@@ -796,14 +885,24 @@ namespace Util::LightCensus
 
 			const auto& report = Util::GpuPhaseTimeline::GetSingleton()->Get();
 			auto ms = [&](Util::GpuPhase p) { return report.ms[static_cast<size_t>(p)]; };
+			// (46a) The timeline keeps its last sample after the overlay closes: a value from minutes ago is
+			// not this scene's. Age in ms (-1 = never measured); older than kStaleSampleMs = -1 everywhere.
+			double ageMs = -1.0;
+			if (report.hasSample && report.sampleTick != 0) {
+				const auto nowTick = std::chrono::steady_clock::now().time_since_epoch().count();
+				ageMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::duration(nowTick - report.sampleTick)).count();
+			}
+			const bool fresh = ageMs >= 0.0 && ageMs <= kStaleSampleMs;
 			j["engineShadows"] = {
-				{ "measured", report.hasSample },
-				{ "localLightShadowMapsMs", report.hasSample ? ms(Util::GpuPhase::ShadowLocalLights) : -1.0f },
-				{ "sunCascadesMs", report.hasSample ? ms(Util::GpuPhase::ShadowSun1) + ms(Util::GpuPhase::ShadowSun2) + ms(Util::GpuPhase::ShadowSun3) : -1.0f },
-				{ "focusShadowsMs", report.hasSample ? ms(Util::GpuPhase::ShadowFocus) : -1.0f },
-				{ "shadowMaskMs", report.hasSample ? ms(Util::GpuPhase::ShadowMask) : -1.0f },
-				{ "localShadowMapsRendered", report.shadow.valid ? static_cast<int>(report.shadow.localShadowMaps) : -1 },
-				{ "note", "measured only while the Performance Overlay's Engine passes (GPU) table is on screen" },
+				{ "measured", fresh },
+				{ "sampleAgeMs", ageMs >= 0.0 ? std::round(ageMs) : -1.0 },
+				{ "localLightShadowMapsMs", fresh ? ms(Util::GpuPhase::ShadowLocalLights) : -1.0f },
+				{ "sunCascadesMs", fresh ? ms(Util::GpuPhase::ShadowSun1) + ms(Util::GpuPhase::ShadowSun2) + ms(Util::GpuPhase::ShadowSun3) : -1.0f },
+				{ "focusShadowsMs", fresh ? ms(Util::GpuPhase::ShadowFocus) : -1.0f },
+				{ "shadowMaskMs", fresh ? ms(Util::GpuPhase::ShadowMask) : -1.0f },
+				{ "localShadowMapsRendered", fresh && report.shadow.valid ? static_cast<int>(report.shadow.localShadowMaps) : -1 },
+				{ "note", "measured only while the Performance Overlay's Engine passes (GPU) table is on screen; -1 = not measured or the "
+						  "last sample is older than 1 s (sampleAgeMs)" },
 			};
 			j["activeShadowLights"] = a_shadowLights;
 			const auto smoothed = FrameTrace::GetSmoothed();
@@ -821,7 +920,7 @@ namespace Util::LightCensus
 				j["duplicateOf"] = r.duplicate;
 			j["bufferIndex"] = r.bufferIndex;
 			if (r.dropped != DropReason::None)
-				j["skipped"] = DropName(r.dropped);
+				j["skipped"] = (r.dropped == DropReason::FadedOut && r.lodDimmer > 1e-4f) ? "zero colour or radius" : DropName(r.dropped);
 			j["category"] = r.category;
 			j["why"] = r.reasons;
 			j["kind"] = r.kind;
@@ -836,7 +935,10 @@ namespace Util::LightCensus
 			j["radius"] = r.radius;
 			j["color"] = { r.color[0], r.color[1], r.color[2] };
 			j["fade"] = r.fade;
-			j["intensity"] = std::max({ r.color[0], r.color[1], r.color[2] }) * r.fade;
+			// (46a) After the distance / room fade (lodDimmer), as the light is drawn, and before it (what the
+			// light would give at full strength). 45o wrote the pre-fade value for skipped lights.
+			j["intensity"] = r.intensityAfterFade;
+			j["intensityBeforeFade"] = r.intensityBeforeFade;
 			j["raw"] = { { "diffuse", { r.rawDiffuse[0], r.rawDiffuse[1], r.rawDiffuse[2] } }, { "radius", r.rawRadius }, { "fade", r.rawFade },
 				{ "luminance", r.luminance }, { "lodDimmer", r.lodDimmer } };
 			if (r.islInitialised)
@@ -1095,7 +1197,7 @@ namespace Util::LightCensus
 			try {
 				auto& c = *a_capture;
 				nlohmann::json root;
-				root["format"] = "cs-light-census-1";
+				root["format"] = "cs-light-census-2";  // (46a) window split, fill rule, faded-out, sample age, ID grid
 				root["scene"] = std::move(c.scene);
 				root["cost"] = std::move(c.cost);
 				root["distribution"] = std::move(c.distribution);
@@ -1127,9 +1229,13 @@ namespace Util::LightCensus
 					{ "player", "attached to the player (Quick Light, magic hand light, carried torch)" },
 					{ "actor", "attached to another actor (NPC torch, creature, NPC spell)" },
 					{ "fixture", "belongs to a visible light source: candle, torch, brazier, lantern, fire ... (mesh word, glowing shape, or a placed light within 200 units of such a mesh)" },
-					{ "fill", "placed light without a mesh and without shadows, radius >= 512 or 'fill/ambient' in its name: lights the room, no visible source" },
-					{ "window", "name says window / sunbeam / shaft (Window Shadows Ultimate and similar)" },
-					{ "standalone", "placed light without a mesh nearby and smaller than a fill light" },
+					{ "fill", "placed light without a mesh whose LIGH editor ID says omni / ambient / fill / bounce or that comes from an 'ambient' plugin "
+							  "(never by radius): lights the room, no visible source" },
+					{ "fixture-shadow", "like fill, but shadow-casting: stands in for a fixture's shadow (True Light - Shadows and Ambient)" },
+					{ "window-beam", "window light (name says window / sunbeam / shaft), spot with radius > 10000: the sun beam through a window (Window Shadows Ultimate)" },
+					{ "window-glow", "window light with radius < 128: the glow of a lit pane seen from outside" },
+					{ "window-fill", "other window lights: the light a window spreads into a room" },
+					{ "standalone", "placed light without a mesh nearby and not named like a fill light" },
 					{ "mesh-attached", "inside some model (Light Placer or a NIF light) with no fixture evidence" },
 					{ "effect", "no owning reference, or owned by a projectile / explosion / hazard: magic and effects" },
 				};
@@ -1278,7 +1384,7 @@ namespace Util::LightCensus
 			for (std::uint32_t i = 0; i < a_uploaded && i < a_used.size(); ++i) {
 				const bool shadow = data[i].lightFlags.any(LightLimitFix::LightFlags::Shadow);
 				s.shadow += shadow ? 1 : 0;
-				const int c = CheapClassify(a_used[i], player, data[i].radius, shadow);
+				const int c = CheapClassify(a_used[i], player, shadow);
 				s.player += (c & 1) ? 1 : 0;
 				s.fill += (c & 2) ? 1 : 0;
 			}
@@ -1321,12 +1427,18 @@ namespace Util::LightCensus
 				r.radius = d.radius;
 				r.fade = d.fade;
 				r.llfFlags = d.lightFlags.underlying();
+				// LLF's fade already carries lodDimmer.
+				r.intensityAfterFade = std::max({ r.color[0], r.color[1], r.color[2] }) * r.fade;
+				r.intensityBeforeFade = r.lodDimmer > 1e-4f ? r.intensityAfterFade / r.lodDimmer : r.intensityAfterFade;
 			} else {
 				r.color[0] = r.rawDiffuse[0];
 				r.color[1] = r.rawDiffuse[1];
 				r.color[2] = r.rawDiffuse[2];
 				r.radius = r.rawRadius;
 				r.fade = r.rawFade;
+				// Raw engine values (ISL not applied): before the fade, then x lodDimmer as LLF would.
+				r.intensityBeforeFade = std::max({ r.color[0], r.color[1], r.color[2] }) * r.fade;
+				r.intensityAfterFade = r.intensityBeforeFade * r.lodDimmer;
 			}
 			Classify(r, fixtures);
 			r.stableId = StableId(r);

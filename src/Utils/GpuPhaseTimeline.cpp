@@ -843,6 +843,7 @@ namespace Util
 			report.totalMs = reseed ? total : report.totalMs * kSmoothingOld + total * kSmoothingNew;
 			report.timestampsPerFrame = reseed ? stamps : report.timestampsPerFrame * kSmoothingOld + stamps * kSmoothingNew;
 			report.hasSample = true;
+			report.sampleTick = std::chrono::steady_clock::now().time_since_epoch().count();
 			reseed = false;
 		}
 	}

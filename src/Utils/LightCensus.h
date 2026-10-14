@@ -48,7 +48,7 @@ namespace Util::LightCensus
 		NoNiLight,
 		Hidden,
 		InactiveShadow,  ///< shadow light without a shadow-map slot this frame (index 255)
-		ZeroIntensity,   ///< colour * fade or radius ~0
+		FadedOut,        ///< colour * fade or radius ~0: almost always lodDimmer 0 (faded by distance / room); (46a) was ZeroIntensity
 		OverLimit,       ///< beyond LLF's 1024-light buffer
 	};
 

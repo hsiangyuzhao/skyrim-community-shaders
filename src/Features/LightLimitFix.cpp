@@ -474,7 +474,7 @@ void LightLimitFix::UpdateLights()
 							if (census)
 								censusUsed.push_back(bsLight);
 						} else {
-							censusDrop(bsLight, Util::LightCensus::DropReason::ZeroIntensity);
+							censusDrop(bsLight, Util::LightCensus::DropReason::FadedOut);
 						}
 					} else {
 						censusDrop(bsLight, Util::LightCensus::DropReason::InactiveShadow);

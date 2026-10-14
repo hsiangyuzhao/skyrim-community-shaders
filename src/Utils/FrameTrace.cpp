@@ -266,7 +266,8 @@ namespace Util::FrameTrace
 				out << "#   (> 0: the builds were done before the game's depth copy was ready); rt_still_reused = character shapes with unchanged bones (not skinned);\n";
 				out << "#   pacer_in_flight_after = frames still on the GPU after the pacer's sleep and bound (pacer_in_flight is counted before the sleep).\n";
 				out << "# (45o) lights_* = Light Limit Fix this frame: lights in its buffer, of which shadow-casting, fill-light estimate (placed light without a\n";
-				out << "#   mesh, radius >= 512, no shadow), attached to the player; lights_max_cluster / lights_over4_share = most lights in one cluster and the share\n";
+				out << "#   mesh, no shadow, LIGH editor ID with omni/ambient/fill or a plugin named *ambient*; 46a: never by radius), attached to the player;\n";
+				out << "#   lights_max_cluster / lights_over4_share = most lights in one cluster and the share\n";
 				out << "#   of screen tiles whose busiest cluster has more than 4 (from a GPU read-back 2-4 frames old); llf_gpu_ms = LLF build + culling (last sample).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"

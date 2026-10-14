@@ -218,6 +218,8 @@ namespace Util
 			std::array<float, static_cast<size_t>(GpuPhase::Count)> lastDraws{};
 			std::array<float, static_cast<size_t>(GpuPhase::Count)> lastCpuMs{};
 			ShadowInfo shadow;  ///< last recorded frame
+			/// (46a) steady_clock tick (time_since_epoch().count()) of the last GPU sample taken in; 0 = none.
+			int64_t sampleTick = 0;
 		};
 
 		const Report& Get() const { return report; }
