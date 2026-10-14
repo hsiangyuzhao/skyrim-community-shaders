@@ -64,7 +64,13 @@ namespace RayTracingRT
 	}
 
 	// Process exit: no GPU wait (the GPU work of a closing game does not matter any more).
-	Backend::~Backend() { Shutdown(false); }
+	// (45n) The release thread is gone at process exit (and may have died holding its lock): not joined.
+	Backend::~Backend()
+	{
+		if (releaseThread_.joinable())
+			releaseThread_.detach();
+		Shutdown(false);
+	}
 
 	bool Backend::Fail(const std::string& a_operation, HRESULT a_result)
 	{
@@ -352,6 +358,11 @@ namespace RayTracingRT
 				WaitForSingleObject(fenceEvent_, 2000);
 		}
 		ready_ = false;
+		// (45n) Whatever the release thread still holds goes first (it never touches anything else of ours).
+		StopReleaseThread();
+		prepared_ = false;
+		preparedContext_ = 0;
+		retireAhead_ = 1;
 		if (postbuildReadback_ && postbuildMapped_)
 			postbuildReadback_->Unmap(0, nullptr);
 		postbuildMapped_ = nullptr;
@@ -603,22 +614,83 @@ namespace RayTracingRT
 		// The next value anyone signals: the done value of the list being recorded, or the next
 		// frame's D3D11 signal, which the D3D11 queue only reaches after waiting for every
 		// D3D12 submission so far. Either way everything that may use the object is finished.
-		retired_.push_back(Retired{ fenceValue_ + 1, std::move(a_object), a_bytes, a_counter });
+		// (45n) RetireValue: +2 while builds / skinning go out without the D3D11 ready signal behind them.
+		retired_.push_back(Retired{ RetireValue(), std::move(a_object), a_bytes, a_counter });
 	}
 
 	void Backend::CollectRetired()
 	{
 		if (!fence_)
 			return;
+		const std::int64_t start = QpcNow();
 		const std::uint64_t completed = fence_->GetCompletedValue();
+		// (45n) Release Thread: the objects are only moved out here; their (costly) final Release runs on the
+		// worker. The D3D12 device is free-threaded and nothing else of ours references a retired object.
+		std::vector<ComPtr<ID3D12Pageable>> handOff;
+		std::uint32_t count = 0;
 		std::erase_if(retired_, [&](Retired& a_entry) {
 			if (a_entry.fence > completed)
 				return false;
 			if (a_entry.counter)
 				*a_entry.counter -= std::min(*a_entry.counter, a_entry.bytes);
+			++count;
+			if (releaseOnWorker_ && a_entry.object)
+				handOff.push_back(std::move(a_entry.object));
 			return true;
 		});
+		if (!handOff.empty()) {
+			{
+				std::scoped_lock lock(releaseMutex_);
+				if (!releaseThread_.joinable()) {
+					releaseStop_ = false;
+					releaseThread_ = std::thread([this] { ReleaseThreadMain(); });
+				}
+				for (auto& object : handOff)
+					releaseQueue_.push_back(std::move(object));
+			}
+			releaseCv_.notify_one();
+		}
 		CollectAlphaRetired(completed);
+		stats_.retiredLastCollect = count;
+		stats_.retireLastMs = static_cast<float>(QpcToMs(QpcNow() - start));
+	}
+
+	void Backend::ReleaseThreadMain()
+	{
+		SetThreadDescription(GetCurrentThread(), L"CS RayTracing release");
+		std::vector<ComPtr<ID3D12Pageable>> batch;
+		for (;;) {
+			{
+				std::unique_lock lock(releaseMutex_);
+				releaseCv_.wait(lock, [this] { return releaseStop_ || !releaseQueue_.empty(); });
+				batch.swap(releaseQueue_);
+				if (batch.empty() && releaseStop_)
+					return;
+			}
+			const std::int64_t start = QpcNow();
+			const auto n = batch.size();
+			batch.clear();  // the final Release of each object
+			workerReleaseMs_.store(static_cast<float>(QpcToMs(QpcNow() - start)), std::memory_order_relaxed);
+			workerReleased_.fetch_add(n, std::memory_order_relaxed);
+		}
+	}
+
+	void Backend::StopReleaseThread()
+	{
+		if (!releaseThread_.joinable()) {
+			releaseQueue_.clear();
+			return;
+		}
+		{
+			std::scoped_lock lock(releaseMutex_);
+			releaseStop_ = true;
+		}
+		releaseCv_.notify_one();
+		if (releaseThread_.joinable())
+			releaseThread_.join();  // drains the queue first
+		std::scoped_lock lock(releaseMutex_);
+		releaseQueue_.clear();
+		releaseStop_ = false;
 	}
 
 	void Backend::CollectTimestamps(std::size_t a_index)
@@ -644,6 +716,8 @@ namespace RayTracingRT
 		stats_.lastPrepGpuMs = static_cast<float>(static_cast<double>(prepEnd - prepBegin) * toMs);
 		stats_.lastTraceGpuMs = static_cast<float>(static_cast<double>(end - begin) * toMs);
 		stats_.lastGpuMs = stats_.lastPrepGpuMs + stats_.lastTraceGpuMs;
+		// (45n) Our queue idle between the builds / skinning and the trace (waiting for the game's depth copy).
+		stats_.lastQueueGapMs = begin >= prepEnd ? static_cast<float>(static_cast<double>(begin - prepEnd) * toMs) : 0.0f;
 		stats_.smoothedGpuMs = stats_.smoothedGpuMs > 0.0f ? stats_.smoothedGpuMs * 0.95f + stats_.lastGpuMs * 0.05f : stats_.lastGpuMs;
 	}
 
@@ -1095,14 +1169,36 @@ namespace RayTracingRT
 		};
 		CollectRetired();
 		const std::uint64_t completed = fence_->GetCompletedValue();
+		// (45n) Early Prep: the builds and skinning of this frame are already on the GPU, recorded on the
+		// context PrepareFrame kept; only the TLAS and the trace are recorded here.
+		const bool early = prepared_;
+		split.early = early;
+		split.retire = stats_.retireLastMs;
+		split.retiredCount = stats_.retiredLastCollect;
+		// While this frame records (and, with Early Prep, since PrepareFrame) retired objects wait for the
+		// trace's done value. Back to the ready value once the frame is submitted or dropped.
+		struct AheadReset
+		{
+			Backend* backend;
+			~AheadReset()
+			{
+				if (!backend->prepared_)
+					backend->retireAhead_ = 1;
+			}
+		} aheadReset{ this };
+		retireAhead_ = 2;
 
 		// A free command context, without waiting on the CPU.
 		std::size_t index = kContexts;
-		for (std::size_t offset = 0; offset < kContexts; ++offset) {
-			const std::size_t candidate = (cursor_ + offset) % kContexts;
-			if (contexts_[candidate].fenceValue == 0 || contexts_[candidate].fenceValue <= completed) {
-				index = candidate;
-				break;
+		if (early) {
+			index = preparedContext_;
+		} else {
+			for (std::size_t offset = 0; offset < kContexts; ++offset) {
+				const std::size_t candidate = (cursor_ + offset) % kContexts;
+				if (contexts_[candidate].fenceValue == 0 || contexts_[candidate].fenceValue <= completed) {
+					index = candidate;
+					break;
+				}
 			}
 		}
 		for (std::size_t i = 0; i < kContexts; ++i)
@@ -1113,7 +1209,8 @@ namespace RayTracingRT
 			return false;
 		}
 		auto& context = contexts_[index];
-		cursor_ = (index + 1) % kContexts;
+		if (!early)
+			cursor_ = (index + 1) % kContexts;
 		lap(split.collect);
 
 		static const std::vector<Instance> kNoInstances;
@@ -1123,37 +1220,48 @@ namespace RayTracingRT
 		// splitSubmit the builds, skinning and the TLAS go out at once (they read nothing D3D11 writes)
 		// and only the trace list waits for D3D11's depth copy, so the D3D11 queue later waits for the
 		// trace alone instead of everything (GPU-side ordering only; the CPU never waits).
+		// (45n) Early Prep: the allocator holds the prep list (in flight): not reset; the list is reset
+		// for the TLAS alone (a list may be reset once it was submitted).
 		HRESULT hr;
-		if (FAILED(hr = context.allocator->Reset()))
+		if (!early && FAILED(hr = context.allocator->Reset()))
 			return Fail("command allocator Reset", hr);
 		auto* list = context.list.Get();
 		if (FAILED(hr = list->Reset(context.allocator.Get(), nullptr)))
 			return Fail("command list Reset", hr);
 		lap(split.reset);
 		const UINT queryBase = static_cast<UINT>(index * 4);
-		if (timestampHeap_)
-			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
-
-		const std::int64_t buildStart = QpcNow();
-		const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
-		ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame);
-		const std::uint32_t builtNow = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds);
-		stats_.buildsLastFrame = builtNow;
-		const std::int64_t buildEnd = QpcNow();
 
 		// (45i) Skinned characters: uploads, skinning, BLAS builds / refits (none without draws).
 		static const std::vector<SkinDraw> kNoSkinDraws;
 		const std::vector<SkinDraw>& skinDraws = a_input.skinDraws && SkinAvailable() ? *a_input.skinDraws : kNoSkinDraws;
-		skinReady_.assign(skinDraws.size(), 0);
-		skinRecorded_ = false;
-		if (!skinDraws.empty() || !skinUploadQueue_.empty())
-			RecordSkinning(list, context, a_input, skinReady_);
-		const std::int64_t skinEnd = QpcNow();
-		stats_.cpuBuildMs = static_cast<float>(QpcToMs(buildEnd - buildStart));
-		stats_.cpuSkinMs = static_cast<float>(QpcToMs(skinEnd - buildEnd));
-		if (failed_) {
-			list->Close();
-			return false;
+		if (early) {
+			// skinReady_ is PrepareFrame's, for the same draws.
+			if (skinReady_.size() != skinDraws.size()) {
+				list->Close();
+				return false;
+			}
+		} else {
+			if (timestampHeap_)
+				list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
+
+			const std::int64_t buildStart = QpcNow();
+			const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
+			ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame);
+			const std::uint32_t builtNow = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds);
+			stats_.buildsLastFrame = builtNow;
+			const std::int64_t buildEnd = QpcNow();
+
+			skinReady_.assign(skinDraws.size(), 0);
+			skinRecorded_ = false;
+			if (!skinDraws.empty() || !skinUploadQueue_.empty())
+				RecordSkinning(list, context, a_input, skinReady_);
+			const std::int64_t skinEnd = QpcNow();
+			stats_.cpuBuildMs = static_cast<float>(QpcToMs(buildEnd - buildStart));
+			stats_.cpuSkinMs = static_cast<float>(QpcToMs(skinEnd - buildEnd));
+			if (failed_) {
+				list->Close();
+				return false;
+			}
 		}
 		mark = QpcNow();
 
@@ -1225,6 +1333,11 @@ namespace RayTracingRT
 				continue;
 			}
 			const auto& draw = skinDraws[d];
+			// (45n) With Early Prep a shape may have been released since it was skinned (switch change).
+			if (draw.shape >= skins_.size() || !skins_[draw.shape].live || !skins_[draw.shape].blas) {
+				++check_.notBuilt[kCategoryCharacter];
+				continue;
+			}
 			const auto& skin = skins_[draw.shape];
 			const bool alpha = skin.uvOffset != UINT32_MAX;
 			if (alpha && (!charAlphaPipeline_ || !alphaPipeline_ || !alphaUv_ || draw.alphaInfo >= alphaInfos_.size() || draw.alphaInfo + 1 >= (1u << 24))) {
@@ -1258,7 +1371,7 @@ namespace RayTracingRT
 		if (alphaFrame && !EnsureAlphaInfoBuffer(context)) {
 			// (45i) Character uploads / builds recorded in this list must run (later refits rely on
 			// them): a list that cannot be submitted takes the whole feature down instead.
-			if (skinRecorded_)
+			if (skinRecorded_ && !early)
 				return Fail("alpha record buffer (with character work recorded)", E_OUTOFMEMORY);
 			// Nothing written above can be traced without its record: drop the frame's trace.
 			list->Close();
@@ -1285,12 +1398,13 @@ namespace RayTracingRT
 			auto barrier = UavBarrier(tlas_.Get());
 			list->ResourceBarrier(1, &barrier);
 		}
-		if (timestampHeap_)
+		// (45n) Early Prep: prep begin / end were written by PrepareFrame (the TLAS list is not timed).
+		if (timestampHeap_ && !early)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
 
 		// The trace: in its own list behind the wait (split), or appended to the same one (45k).
 		ID3D12GraphicsCommandList4* traceList = list;
-		if (a_input.splitSubmit) {
+		if (a_input.splitSubmit || early) {
 			if (FAILED(hr = list->Close()))
 				return Fail("command list Close", hr);
 			ID3D12CommandList* prepLists[] = { list };
@@ -1371,6 +1485,7 @@ namespace RayTracingRT
 		lap(split.signal12);
 		context.fenceValue = doneValue;
 		lastSubmitted_ = doneValue;
+		prepared_ = false;  // (45n) the kept context now has its done value
 		for (auto& blas : blas_)
 			if (blas.state == BlasState::Built && blas.buildFence == 0)
 				blas.buildFence = doneValue;
@@ -1383,8 +1498,111 @@ namespace RayTracingRT
 		}
 		lap(split.wait11);
 		stats_.split = split;
-		stats_.cpuRecordMs = static_cast<float>(QpcToMs(QpcNow() - cpuStart)) - stats_.cpuBuildMs - stats_.cpuSkinMs;
+		stats_.cpuRecordMs = static_cast<float>(QpcToMs(QpcNow() - cpuStart)) - (early ? 0.0f : stats_.cpuBuildMs + stats_.cpuSkinMs);
 		return true;
+	}
+
+	bool Backend::PrepareFrame(const FrameInput& a_input)
+	{
+		// (45n) Early Prep. Same work and order as the first half of ExecuteFrame (split submission), only
+		// earlier in the frame: the D3D12 queue gets the builds and skinning while the game's queue still
+		// draws the shadow maps, so by the time the depth copy is ready only the TLAS and the trace remain.
+		// The context stays reserved (fenceValue UINT64_MAX: never "free") until ExecuteFrame or
+		// AbandonPrepared gives it a real done value. No fence value is signalled here: the shared fence is
+		// only ever signalled in increasing order (D3D11 ready, then D3D12 done behind a wait for it).
+		if (!ready_ || failed_ || prepared_)
+			return false;
+		const HRESULT removed = device_->GetDeviceRemovedReason();
+		if (FAILED(removed))
+			return Fail("D3D12 device", removed);
+		const std::int64_t cpuStart = QpcNow();
+		CollectRetired();
+		const std::uint64_t completed = fence_->GetCompletedValue();
+		std::size_t index = kContexts;
+		for (std::size_t offset = 0; offset < kContexts; ++offset) {
+			const std::size_t candidate = (cursor_ + offset) % kContexts;
+			if (contexts_[candidate].fenceValue == 0 || contexts_[candidate].fenceValue <= completed) {
+				index = candidate;
+				break;
+			}
+		}
+		for (std::size_t i = 0; i < kContexts; ++i)
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed)
+				CollectTimestamps(i);
+		if (index == kContexts)
+			return false;
+		auto& context = contexts_[index];
+		HRESULT hr;
+		if (FAILED(hr = context.allocator->Reset()))
+			return Fail("command allocator Reset", hr);
+		auto* list = context.list.Get();
+		if (FAILED(hr = list->Reset(context.allocator.Get(), nullptr)))
+			return Fail("command list Reset", hr);
+		cursor_ = (index + 1) % kContexts;
+		context.fenceValue = UINT64_MAX;
+		context.timestampsPending = false;
+		prepared_ = true;
+		preparedContext_ = index;
+		retireAhead_ = 2;  // everything retired from now until the trace waits for its done value
+
+		const UINT queryBase = static_cast<UINT>(index * 4);
+		if (timestampHeap_)
+			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
+		const std::int64_t buildStart = QpcNow();
+		const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
+		ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame);
+		stats_.buildsLastFrame = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds);
+		const std::int64_t buildEnd = QpcNow();
+		static const std::vector<SkinDraw> kNoSkinDraws;
+		const std::vector<SkinDraw>& skinDraws = a_input.skinDraws && SkinAvailable() ? *a_input.skinDraws : kNoSkinDraws;
+		skinReady_.assign(skinDraws.size(), 0);
+		skinRecorded_ = false;
+		if (!skinDraws.empty() || !skinUploadQueue_.empty())
+			RecordSkinning(list, context, a_input, skinReady_);
+		const std::int64_t skinEnd = QpcNow();
+		stats_.cpuBuildMs = static_cast<float>(QpcToMs(buildEnd - buildStart));
+		stats_.cpuSkinMs = static_cast<float>(QpcToMs(skinEnd - buildEnd));
+		if (failed_) {
+			list->Close();
+			return false;  // the feature turns itself off (Shutdown drops the reservation)
+		}
+		{
+			// Builds and compaction copies are complete before anything later on the queue reads them.
+			auto barrier = UavBarrier();
+			list->ResourceBarrier(1, &barrier);
+		}
+		if (timestampHeap_)
+			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
+		if (FAILED(hr = list->Close()))
+			return Fail("command list Close", hr);
+		ID3D12CommandList* lists[] = { list };
+		queue_->ExecuteCommandLists(1, lists);
+		stats_.earlyCpuMs = static_cast<float>(QpcToMs(QpcNow() - cpuStart));
+		return true;
+	}
+
+	void Backend::AbandonPrepared()
+	{
+		if (!prepared_)
+			return;
+		prepared_ = false;
+		retireAhead_ = 1;
+		if (!ready_ || failed_ || !queue_ || !fence_)
+			return;
+		// Two values at once: everything retired since PrepareFrame waits for "+2" (RetireValue). Only the
+		// D3D12 queue signals here, behind the prep list; no D3D11 signal with a lower value is outstanding
+		// (every earlier ready value was waited for by an earlier trace before its done value).
+		fenceValue_ += 2;
+		const HRESULT hr = queue_->Signal(fence_.Get(), fenceValue_);
+		if (FAILED(hr)) {
+			Fail("D3D12 queue Signal (abandoned frame)", hr);
+			return;
+		}
+		contexts_[preparedContext_].fenceValue = fenceValue_;
+		lastSubmitted_ = fenceValue_;
+		for (auto& blas : blas_)
+			if (blas.state == BlasState::Built && blas.buildFence == 0)
+				blas.buildFence = fenceValue_;
 	}
 
 	float Backend::WaitForTrace()

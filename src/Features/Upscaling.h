@@ -251,6 +251,9 @@ public:
 		float reflexPacerMarginMs = 1.0f;
 		// Sub-switch: with Reflex Frame Limit Off, cap at refresh - refresh^2/3600 (224 at 240 Hz).
 		bool reflexAutoCap = true;
+		// (45n) Sub-switch: while frame generation is not running (menus), the automatic cap is 90 % of the
+		// refresh rate (216 at 240 Hz) instead of 224. Off = 45m.
+		bool reflexAutoCapLower = true;
 
 		NeuralRenderingSettings neuralRendering;
 	};

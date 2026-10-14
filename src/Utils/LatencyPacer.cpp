@@ -203,6 +203,16 @@ namespace Util::LatencyPacer
 				}
 			}
 		}
+		// (45n) In flight once the frame really starts. inFlight is taken before the sleep: with the sleep sized
+		// to end as the previous frame finishes, "2 before the sleep" is the intended state, not a queue.
+		if (fence) {
+			const uint64_t completed = fence->GetCompletedValue();
+			std::scoped_lock lk(g_mutex);
+			int after = 0;
+			for (const uint64_t value : g_pending)
+				after += value > completed ? 1 : 0;
+			info.inFlightAfter = after;
+		}
 		g_last = info;
 	}
 

@@ -33,6 +33,7 @@ namespace Util::LatencyPacer
 		float predictedMs = -1.0f; ///< predicted time until the previous frame finishes (at frame start)
 		float leadMs = -1.0f;      ///< CPU time the pacer reserves (frame start to D3D11 submit, p75)
 		float gpuPeriodMs = -1.0f; ///< median interval between GPU frame completions
+		int inFlightAfter = -1;    ///< (45n) frames not finished by the GPU when the frame's CPU work starts (after the sleep / bound)
 	};
 
 	/// Main thread, in Main::Update before the Reflex sleep. Sleeps only when a_enabled.

@@ -85,6 +85,12 @@ namespace Util::FrameTrace
 		float tileGpuMs = -1, filterGpuMs = -1, sigmaGpuMs = -1, combineGpuMs = -1, syncGpuMs = -1, prepGpuMs = -1, traceGpuMs = -1;
 		int quality = -1, denoiserEffective = -1;
 		uint32_t skinDraws = 0, skinReused = 0;
+		// (45n) Early Prep used this frame, its frame-start CPU ms; render-thread ms / count of the last retired-object
+		// collect (inside rt_x_collect); the release thread's last batch ms; our queue idle before the trace (GPU ms);
+		// character shapes reused because their bones did not change.
+		int early = 0;
+		float earlyMs = -1, retireMs = -1, workerReleaseMs = -1, queueGapGpuMs = -1;
+		uint32_t retiredCount = 0, stillReused = 0;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

@@ -113,6 +113,10 @@ namespace RayTracingCharacters
 		/// the player, and one sphere around every other actor. For the trace's character-ray culling.
 		void GetBounds(const double a_camera[3], float o_player[4], float o_others[4]) const;
 		void ResetPeaks() { stats_.maxMs = 0.0f; }
+		/// (45n) Still poses: a shape whose bone matrices are bit-identical to the ones it was last skinned
+		/// with keeps its skinned BLAS (no upload, skinning or refit).
+		void SetStillPoseReuse(bool a_reuse) { stillPoseReuse_ = a_reuse; }
+		[[nodiscard]] std::uint32_t StillReusedLastFrame() const { return stillReused_; }
 
 	private:
 		struct Bone
@@ -171,6 +175,9 @@ namespace RayTracingCharacters
 		bool alpha_ = false;
 		bool keepInShadowMap_ = false;
 		bool npcReduced_ = false;  // (45l)
+		// (45n)
+		bool stillPoseReuse_ = true;
+		std::uint32_t stillReused_ = 0;
 		std::uint32_t filterEpoch_ = 0;
 		std::uint32_t loggedPlacement_ = 0;
 		std::uint32_t loggedOther_ = 0;

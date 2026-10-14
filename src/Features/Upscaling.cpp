@@ -77,6 +77,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexGpuPacer,
 	reflexPacerMarginMs,
 	reflexAutoCap,
+	reflexAutoCapLower,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -598,10 +599,19 @@ void Upscaling::DrawLatencySettings()
 				ImGui::TextUnformatted("Extra CPU time kept in hand. Raise it if the frame rate drops with the pacer on; lower it for a little less lag.");
 		}
 		ImGui::Checkbox("Automatic cap when Frame Limit is Off", &settings.reflexAutoCap);
+		if (settings.reflexAutoCap) {
+			ImGui::Indent();
+			ImGui::Checkbox("Lower automatic cap without frame generation (45n)", &settings.reflexAutoCapLower);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("While frame generation is not running (menus), cap at 90 % of the refresh rate (216 at 240 Hz) instead of 224:");
+				ImGui::TextUnformatted("at 224 the graphics card is just barely the limit and a frame of lag builds up. Off = 45m. Your own Frame Limit always wins.");
+			}
+			ImGui::Unindent();
+		}
 		const auto& pacer = Util::LatencyPacer::Last();
 		if (pacer.tracking)
-			ImGui::TextDisabled("Pacer: %d frame(s) on the GPU at frame start, GPU period %.1f ms, CPU reserve %.1f ms, slept %.1f ms (+%.1f ms bound)",
-				pacer.inFlight, pacer.gpuPeriodMs, pacer.leadMs, pacer.sleepMs, pacer.capWaitMs);
+			ImGui::TextDisabled("Pacer: %d frame(s) on the GPU at frame start (%d after the wait), GPU period %.1f ms, CPU reserve %.1f ms, slept %.1f ms (+%.1f ms bound)",
+				pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.sleepMs, pacer.capWaitMs);
 		else
 			ImGui::TextDisabled("Pacer: waiting for the D3D12 swap chain");
 		ImGui::Unindent();
@@ -1716,7 +1726,12 @@ uint Upscaling::GetEffectiveReflexFrameLimit() const
 	// (45m) NVIDIA's own VRR cap rule (refresh - refresh^2/3600): 224 at 240 Hz, 138 at 144 Hz. It is
 	// a presented-frame cap like the slider, so with frame generation running it almost never binds;
 	// in menus (generation off) it keeps the frame rate inside the VRR window.
-	const double cap = refreshRate - refreshRate * refreshRate / 3600.0;
+	double cap = refreshRate - refreshRate * refreshRate / 3600.0;
+	// (45n) Without frame generation running (menus, generation off) the game itself reaches the cap, and at
+	// 224 of 240 Hz the graphics card is barely the limit: a frame of queue builds up (1-2 ms of lag). 90 % of
+	// the refresh rate (216 at 240 Hz, 129 at 144 Hz) keeps it clearly CPU-capped. Generating: unchanged.
+	if (settings.reflexAutoCapLower && !IsFrameGenerationActive())
+		cap = std::min(cap, std::floor(refreshRate * 0.9));
 	return static_cast<uint>(std::max(cap, 30.0));
 }
 

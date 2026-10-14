@@ -132,7 +132,7 @@ namespace RayTracingRT
 	void Backend::FreeAlphaUv(std::uint32_t a_offset, std::uint32_t a_count)
 	{
 		if (a_count)
-			retiredAlphaUv_.push_back(DeferredFree{ fenceValue_ + 1, a_offset, a_count });
+			retiredAlphaUv_.push_back(DeferredFree{ RetireValue(), a_offset, a_count });
 	}
 
 	void Backend::CollectAlphaRetired(std::uint64_t a_completed)
@@ -408,9 +408,9 @@ namespace RayTracingRT
 		alphaTextureIndex_.erase(entry.texture11.Get());
 		if (entry.resource12) {
 			Retire(entry.resource12, 0, nullptr);
-			retiredAlphaSlots_.push_back(DeferredFree{ fenceValue_ + 1, entry.gpuIndex, 0 });
+			retiredAlphaSlots_.push_back(DeferredFree{ RetireValue(), entry.gpuIndex, 0 });
 		} else if (entry.gpuIndex != UINT32_MAX) {
-			retiredAlphaLayers_.push_back(DeferredFree{ fenceValue_ + 1, entry.gpuIndex & ~kAlphaFallbackBit, 0 });
+			retiredAlphaLayers_.push_back(DeferredFree{ RetireValue(), entry.gpuIndex & ~kAlphaFallbackBit, 0 });
 			std::erase(alphaCopyQueue_, a_texture);
 		}
 		entry = {};

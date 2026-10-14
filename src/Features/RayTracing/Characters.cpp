@@ -1025,6 +1025,7 @@ namespace RayTracingCharacters
 		// (45l) Other actors at reduced quality: every other frame (staggered per actor) their shapes keep last
 		// frame's skinned BLAS (no bone read, no skinning, no refit; traced where they were skinned).
 		std::uint32_t actorIndex = 0;
+		stillReused_ = 0;
 		for (auto& actor : actors_) {
 			const auto translate = actor->root->world.translate;
 			const double origin[3] = { translate.x, translate.y, translate.z };
@@ -1035,8 +1036,18 @@ namespace RayTracingCharacters
 					continue;
 				static thread_local std::vector<float> fresh;
 				if (ReadBones(*shape, origin, fresh)) {
+					// (45n) Still pose: bit-identical to the matrices of last frame's draw (drawable then, so
+					// skinned with them or itself reused from identical ones): last frame's skinned BLAS is
+					// exact. The matrices are relative to the origin, which still moves the instance.
+					const bool still = stillPoseReuse_ && shape->drawable && !shape->matrices.empty() && fresh.size() == shape->matrices.size() &&
+					                   std::memcmp(fresh.data(), shape->matrices.data(), fresh.size() * sizeof(float)) == 0 &&
+					                   a_backend.IsSkinShapeReady(shape->handle);
 					shape->matrices.swap(fresh);
 					std::copy_n(origin, 3, shape->origin);
+					if (still) {
+						shape->reuse = true;
+						++stillReused_;
+					}
 				}
 			}
 		}

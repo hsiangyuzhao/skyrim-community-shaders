@@ -173,6 +173,10 @@ public:
 		bool DistanceFalloff = true;      // the tiers' distance fall-off
 		// (45m) Debug: other actors at reduced quality skinned / refit every other frame (45l). Off = every frame.
 		bool NpcAlternateFrameSkinning = false;
+		// (45n) Debug A/B of the spike and sync changes (each off = 45m).
+		bool ReleaseThread = true;    // retired D3D12 objects released on a worker thread (the rt_x_collect spikes)
+		bool EarlyPrep = true;        // builds / skinning recorded and submitted at the frame start (before the shadow maps)
+		bool ReuseStillPoses = true;  // a character shape with bit-identical bones keeps last frame's skinned BLAS
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted
@@ -351,6 +355,12 @@ private:
 	PendingFrame pending;
 	void FinishFrame();
 	void ReportFrame();
+	/// (45n) Early Prep (LatchFrame): characters and this frame's builds / skinning on the D3D12 queue.
+	void RunEarlyPrep();
+	bool earlyThisFrame = false;       // PrepareFrame succeeded this frame
+	bool charactersUpdatedEarly = false;  // characters.Update / CollectDraws already ran this frame
+	float earlyCpuMs = 0.0f;           // CPU of RunEarlyPrep this frame
+	float earlyCharactersMs = 0.0f;
 	std::int64_t frameStart = 0;
 	float prepassCpuMs = 0.0f;
 	QualityParams lastQuality{};

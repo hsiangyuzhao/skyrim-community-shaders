@@ -258,6 +258,11 @@ namespace Util::FrameTrace
 				out << "#   rt_denoise_gpu_ms = tiles + filter + SIGMA; rt_tile/filter/sigma/combine_gpu_ms per pass; rt_sync_gpu_ms = the game queue standing still at the wait\n";
 				out << "#   for the trace; rt_prep_gpu_ms / rt_trace_gpu_ms = D3D12 builds+skinning+TLAS / the trace dispatch (rt_gpu_ms = their sum); rt_skin_draws / _reused =\n";
 				out << "#   character shapes traced / of which with last frame's skinning (other actors at reduced quality).\n";
+				out << "# (45n) rt_early = builds / skinning went out at the frame start (Early Prep; rt_exec_build/skin are then that part), rt_early_ms = its CPU;\n";
+				out << "#   rt_x_retire_ms / rt_retired_n = retired D3D12 objects collected this frame (inside rt_x_collect; with Release Thread on only handed over),\n";
+				out << "#   rt_worker_release_ms = the release thread's last batch; rt_queue_gap_gpu_ms = our D3D12 queue idle between builds/skinning and the trace\n";
+				out << "#   (> 0: the builds were done before the game's depth copy was ready); rt_still_reused = character shapes with unchanged bones (not skinned);\n";
+				out << "#   pacer_in_flight_after = frames still on the GPU after the pacer's sleep and bound (pacer_in_flight is counted before the sleep).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -276,7 +281,8 @@ namespace Util::FrameTrace
 				       "pos_x,pos_y,pos_z,weather,game_hour,rt_denoiser,rt_phase,rt_x_collect_ms,rt_x_signal11_ms,rt_x_flush11_ms,rt_x_wait12_ms,rt_x_reset_ms,"
 				       "rt_x_tlas_ms,rt_x_alpha_ms,rt_x_record_ms,rt_x_execute_ms,rt_x_signal12_ms,rt_x_wait11_ms,rt_denoise_gpu_ms,sss_gpu_ms,"
 				       "rt_quality,rt_denoiser_eff,rt_tile_gpu_ms,rt_filter_gpu_ms,rt_sigma_gpu_ms,rt_combine_gpu_ms,rt_sync_gpu_ms,rt_prep_gpu_ms,rt_trace_gpu_ms,"
-				       "rt_skin_draws,rt_skin_reused,cpu_top_features\n";
+				       "rt_skin_draws,rt_skin_reused,rt_early,rt_early_ms,rt_x_retire_ms,rt_retired_n,rt_worker_release_ms,rt_queue_gap_gpu_ms,rt_still_reused,"
+				       "pacer_in_flight_after,cpu_top_features\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -293,6 +299,9 @@ namespace Util::FrameTrace
 						t.xFlush11, t.xWait12, t.xReset, t.xTlas, t.xAlpha, t.xRecord, t.xExecute, t.xSignal12, t.xWait11, t.denoiseGpuMs, t.sssGpuMs);
 					s += std::format(",{},{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{}", t.quality, t.denoiserEffective, t.tileGpuMs, t.filterGpuMs, t.sigmaGpuMs,
 						t.combineGpuMs, t.syncGpuMs, t.prepGpuMs, t.traceGpuMs, t.skinDraws, t.skinReused);
+					// (45n)
+					s += std::format(",{},{:.3f},{:.3f},{},{:.3f},{:.3f},{},{}", t.early, t.earlyMs, t.retireMs, t.retiredCount, t.workerReleaseMs, t.queueGapGpuMs,
+						t.stillReused, a_row.pacer.inFlightAfter);
 					s += "," + a_row.cpuTop + "\n";
 					return s;
 				};

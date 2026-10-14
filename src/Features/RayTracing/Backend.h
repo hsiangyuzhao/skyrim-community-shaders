@@ -1,11 +1,15 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -223,6 +227,11 @@ namespace RayTracingRT
 		float signal12 = 0;   // ID3D12CommandQueue::Signal (done)
 		float wait11 = 0;     // ID3D11DeviceContext4::Wait (done)
 		bool flushSkipped = false;
+		// (45n) Inside collect: the retired objects the GPU is done with (released here, or only handed to the
+		// release thread), and how many there were.
+		float retire = 0;
+		std::uint32_t retiredCount = 0;
+		bool early = false;  // (45n) builds / skinning were recorded and submitted at the frame start (PrepareFrame)
 	};
 
 	/// (45f) TLAS contents and the placement self-check.
@@ -258,6 +267,12 @@ namespace RayTracingRT
 		float smoothedGpuMs = 0.0f;
 		float lastPrepGpuMs = -1.0f;          // (45l) of which builds, skinning, TLAS (the part that does not wait for D3D11)
 		float lastTraceGpuMs = -1.0f;         // (45l) of which the trace dispatch
+		// (45n) Our queue standing idle between the end of the builds / skinning and the start of the trace: it
+		// was waiting for the game's depth copy (> 0 = the builds were not what the game queue waited for).
+		float lastQueueGapMs = -1.0f;
+		float earlyCpuMs = 0.0f;              // (45n) CPU of the last PrepareFrame (frame start)
+		std::uint32_t retiredLastCollect = 0; // (45n) objects released (or handed to the release thread) by the last collect
+		float retireLastMs = 0.0f;            // (45n) render-thread ms of that
 		// (45j) CPU of the last ExecuteFrame, split: BLAS / compaction resource creation and uploads,
 		// character uploads / skinning records, everything else (TLAS instances, record, submit).
 		float cpuBuildMs = 0.0f;
@@ -294,6 +309,21 @@ namespace RayTracingRT
 		/// Records and submits this frame's D3D12 work between two GPU-side fence waits.
 		/// Returns false when nothing was traced (busy ring or a failure; see LastError()).
 		bool ExecuteFrame(const FrameInput& a_input);
+		/// (45n) Early Prep: at the start of the frame (before the shadow maps) records and submits this frame's
+		/// BLAS builds, compactions, character uploads and skinning (a_input.skinDraws / skinBones / build budget)
+		/// on a command context it keeps for the frame; the next ExecuteFrame then records only the TLAS and the
+		/// trace on it. Nothing waits (CPU or GPU). False = nothing submitted (ExecuteFrame then does everything).
+		bool PrepareFrame(const FrameInput& a_input);
+		/// (45n) A frame prepared by PrepareFrame that will not trace: the context is released with a D3D12
+		/// signal (no D3D11 involvement). No-op when nothing is prepared.
+		void AbandonPrepared();
+		[[nodiscard]] bool HasPrepared() const { return prepared_; }
+		/// (45n) Release Thread: retired D3D12 objects the GPU is done with are released on a worker thread
+		/// (freeing committed resources costs about 0.5 ms per character shape on the render thread).
+		void SetReleaseOnWorker(bool a_worker) { releaseOnWorker_ = a_worker; }
+		/// (45n) Worker: ms of the last batch released and objects released since start.
+		[[nodiscard]] float LastWorkerReleaseMs() const { return workerReleaseMs_.load(std::memory_order_relaxed); }
+		[[nodiscard]] std::uint64_t WorkerReleased() const { return workerReleased_.load(std::memory_order_relaxed); }
 		/// (45l) With FrameInput::deferWait: the D3D11 queue waits (on the GPU) for the last trace now.
 		/// No-op when nothing is pending. Returns the CPU ms of the call.
 		float WaitForTrace();
@@ -557,7 +587,14 @@ namespace RayTracingRT
 		};
 
 		bool Fail(const std::string& a_operation, HRESULT a_result);
+		/// The fence value after which an object retired now is no longer used by the GPU. (45n) While builds /
+		/// skinning are recorded or in flight without the D3D11 ready signal behind them (split submission, Early
+		/// Prep) that is the trace's done value (+2), not the D3D11 ready value (+1): the ready value is signalled
+		/// by the game's queue, which is not ordered after our builds.
+		[[nodiscard]] std::uint64_t RetireValue() const { return fenceValue_ + retireAhead_; }
 		void Retire(ComPtr<ID3D12Pageable> a_object, std::uint64_t a_bytes, std::uint64_t* a_counter);
+		void StopReleaseThread();
+		void ReleaseThreadMain();
 		void CollectRetired();
 		void CollectTimestamps(std::size_t a_index);
 		ComPtr<ID3D12Resource> CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav);
@@ -657,6 +694,20 @@ namespace RayTracingRT
 		std::vector<std::uint8_t> skinReady_;  // per draw, this frame
 		bool skinRecorded_ = false;            // uploads or builds recorded in this frame's list
 		std::uint64_t pendingWait_ = 0;        // (45l) done value the D3D11 queue still has to wait for (deferred wait)
+		// (45n) Early Prep: the context PrepareFrame recorded on (reserved: fenceValue UINT64_MAX until the trace
+		// or AbandonPrepared gives it its real done value).
+		bool prepared_ = false;
+		std::size_t preparedContext_ = 0;
+		std::uint64_t retireAhead_ = 1;
+		// (45n) Release thread.
+		bool releaseOnWorker_ = true;
+		std::thread releaseThread_;
+		std::mutex releaseMutex_;
+		std::condition_variable releaseCv_;
+		std::vector<ComPtr<ID3D12Pageable>> releaseQueue_;
+		bool releaseStop_ = false;
+		std::atomic<float> workerReleaseMs_{ 0.0f };
+		std::atomic<std::uint64_t> workerReleased_{ 0 };
 
 		HANDLE fenceEvent_ = nullptr;
 		Stats stats_{};

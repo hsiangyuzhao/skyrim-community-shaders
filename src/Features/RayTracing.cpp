@@ -62,7 +62,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	CharacterRayCulling,
 	BlockerAtEdges,
 	DistanceFalloff,
-	NpcAlternateFrameSkinning)
+	NpcAlternateFrameSkinning,
+	ReleaseThread,
+	EarlyPrep,
+	ReuseStillPoses)
 
 namespace
 {
@@ -924,6 +927,54 @@ void RayTracing::LatchFrame()
 	const bool watch = settings.Enabled && status == Status::Active;
 	RayTracingCasterFilter::Latch(active, filterRect, watch);
 	filterLatched = RayTracingCasterFilter::IsLatched();
+	RunEarlyPrep();
+}
+
+void RayTracing::RunEarlyPrep()
+{
+	// (45n) Early Prep: this frame's characters (bones, captures) and the D3D12 builds / skinning go out now,
+	// before the game draws its shadow maps, instead of after the depth prepass. Same frame, same data (the
+	// game's update is finished; rendering does not move bones), so nothing becomes stale; only the TLAS and
+	// the trace are left for Prepass. Nothing waits. Off, or whenever a condition fails = the 45m order.
+	earlyThisFrame = false;
+	charactersUpdatedEarly = false;
+	earlyCpuMs = 0.0f;
+	earlyCharactersMs = 0.0f;
+	if (backend.IsReady() && backend.HasPrepared())
+		backend.AbandonPrepared();  // a frame that never reached its Prepass
+	if (backend.IsReady())
+		backend.SetReleaseOnWorker(settings.ReleaseThread);
+	auto* sky = globals::game::sky;
+	if (!settings.Enabled || !settings.EarlyPrep || !settings.SplitSubmit || status != Status::Active || phase != Phase::Play || loadingOpen.load() ||
+		!backend.IsReady() || Util::IsInterior() || !sky || sky->mode.get() != RE::Sky::Mode::kFull || !backend.HasFreeContext())
+		return;
+	const std::int64_t start = Qpc();
+	try {
+		skinDraws.clear();
+		skinBones.clear();
+		if (settings.Characters && backend.SkinAvailable()) {
+			const QualityParams quality = ResolveQuality();
+			characters.SetNpcReduced(quality.npcReduced && settings.NpcAlternateFrameSkinning);
+			characters.SetStillPoseReuse(settings.ReuseStillPoses);
+			float world[4];
+			if (scene.GetLoadedRect(world, false))
+				characters.Update(backend, globals::state->frameCount, world);
+			characters.CollectDraws(skinDraws, skinBones);
+			charactersUpdatedEarly = true;
+		}
+		earlyCharactersMs = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+		RayTracingRT::FrameInput input;
+		input.buildTriangleBudget = kBuildBudget;
+		input.skinDraws = &skinDraws;
+		input.skinBones = &skinBones;
+		input.splitSubmit = true;
+		earlyThisFrame = backend.PrepareFrame(input);
+		if (!earlyThisFrame && backend.HasFailed())
+			Disable(Status::Failed, backend.LastError());
+	} catch (const std::exception& e) {
+		Disable(Status::Failed, std::format("exception: {}", e.what()));
+	}
+	earlyCpuMs = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
 }
 
 bool RayTracing::ComputeRects(float o_traceRect[4], float o_coreRect[4], double a_camX, double a_camY)
@@ -960,6 +1011,19 @@ void RayTracing::Prepass()
 	combinedThisFrame = false;
 	pending.active = false;
 	frameStart = Qpc();
+	// (45n) Whatever path this Prepass takes: an Early Prep context that the trace did not use is released
+	// (D3D12 signal only), and the frame-start flags end with this frame.
+	struct EarlyPrepEnd
+	{
+		RayTracing* rt;
+		~EarlyPrepEnd()
+		{
+			if (rt->backend.IsReady() && rt->backend.HasPrepared())
+				rt->backend.AbandonPrepared();
+			rt->earlyThisFrame = false;
+			rt->charactersUpdatedEarly = false;
+		}
+	} earlyPrepEnd{ this };
 	// (45h) Diffuse textures loaded from now on are created shareable only while both switches are on.
 	RayTracingTextureSharing::SetEnabled(settings.Enabled && settings.ShareGameTextures && (settings.Foliage != 0 || settings.Cutouts));
 
@@ -1074,6 +1138,7 @@ void RayTracing::ReportFrame()
 			static_cast<double>(stats.blasBytes + stats.scratchBytes + stats.tlasBytes) / (1024.0 * 1024.0));
 		loggedStatus = status;
 	}
+	lastCpuMs += earlyCpuMs;  // (45n) the frame-start part (Early Prep) belongs to this frame too
 	traceSample.cpuMs = lastCpuMs;
 	traceSample.gpuMs = activeThisFrame ? stats.lastGpuMs : -1.0f;
 	traceSample.builds = activeThisFrame ? stats.buildsLastFrame : 0;
@@ -1164,6 +1229,14 @@ void RayTracing::PublishCpuSplit()
 		detail.denoiserEffective = static_cast<int>(lastEffectiveDenoiser);
 		detail.skinDraws = backend.GetSkinStats().drawsLastFrame;
 		detail.skinReused = backend.GetSkinStats().reusedLastFrame;
+		// (45n)
+		detail.early = activeThisFrame && stats.split.early ? 1 : 0;
+		detail.earlyMs = earlyCpuMs;
+		detail.retireMs = stats.retireLastMs;
+		detail.retiredCount = stats.retiredLastCollect;
+		detail.workerReleaseMs = backend.LastWorkerReleaseMs();
+		detail.queueGapGpuMs = activeThisFrame ? stats.lastQueueGapMs : -1.0f;
+		detail.stillReused = characters.StillReusedLastFrame();
 	}
 	detail.sssGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::ScreenSpaceShadows);
 	// (45k) A slow D3D12 record + submit names its slowest call in the log (at most every 2 s).
@@ -1173,7 +1246,8 @@ void RayTracing::PublishCpuSplit()
 		if (static_cast<double>(now - lastSpikeLog) * QpcMs() > 2000.0) {
 			lastSpikeLog = now;
 			const auto& x = stats.split;
-			const std::pair<const char*, float> parts[] = { { "context choice", x.collect }, { "D3D11 Signal", x.signal11 }, { "D3D11 Flush", x.flush11 },
+			// (45n) "collect" = releasing retired D3D12 objects (x.retire of it) + the context choice (never waits).
+			const std::pair<const char*, float> parts[] = { { "collect (retired objects + context choice)", x.collect }, { "D3D11 Signal", x.signal11 }, { "D3D11 Flush", x.flush11 },
 				{ "D3D12 queue Wait", x.wait12 }, { "allocator/list Reset", x.reset }, { "BLAS creation", stats.cpuBuildMs }, { "characters", stats.cpuSkinMs },
 				{ "TLAS instances", x.tlas }, { "alpha records", x.alpha }, { "recording", x.record }, { "ExecuteCommandLists", x.execute },
 				{ "D3D12 Signal", x.signal12 }, { "D3D11 Wait", x.wait11 } };
@@ -1182,8 +1256,9 @@ void RayTracing::PublishCpuSplit()
 				if (part.second > worst->second)
 					worst = &part;
 			logger::info("[RayTracing] D3D12 record + submit took {:.1f} ms; slowest: {} {:.1f} ms (Signal11 {:.2f}, Flush11 {:.2f}, Wait12 {:.2f}, Execute {:.2f}, "
-						 "Signal12 {:.2f}, Wait11 {:.2f}, builds {:.2f}, characters {:.2f})",
-				cpuLast.execute, worst->first, worst->second, x.signal11, x.flush11, x.wait12, x.execute, x.signal12, x.wait11, stats.cpuBuildMs, stats.cpuSkinMs);
+						 "Signal12 {:.2f}, Wait11 {:.2f}, builds {:.2f}, characters {:.2f}; retired objects {} in {:.2f} ms, release thread {}, early prep {})",
+				cpuLast.execute, worst->first, worst->second, x.signal11, x.flush11, x.wait12, x.execute, x.signal12, x.wait11, stats.cpuBuildMs, stats.cpuSkinMs,
+				x.retiredCount, x.retire, settings.ReleaseThread ? "on" : "off", x.early ? "yes" : "no");
 		}
 	}
 	Util::FrameTrace::OnRayTracingDetail(detail);
@@ -1196,6 +1271,7 @@ void RayTracing::RunFrame()
 	// (45l) A deferred D3D11 wait that was never issued (a frame without FinishPrepass): before this
 	// frame's depth copy overwrites what the last trace read.
 	backend.WaitForTrace();
+	backend.SetReleaseOnWorker(settings.ReleaseThread);  // (45n)
 	UpdateAlphaCasters();  // (45h, 45j) per-kind choices: a change re-captures the scene
 	UpdateCharacters();                                // (45i)
 	if (status == Status::Off || status == Status::Unavailable)
@@ -1266,19 +1342,31 @@ void RayTracing::RunFrame()
 	// (45i) Characters in the traced area: capture, bone matrices, draws (none with the switch off).
 	// (45l) Other actors at reduced quality (45m: skinned every frame unless the Debug switch asks for 45l).
 	const std::int64_t charactersStart = Qpc();
-	skinDraws.clear();
-	skinBones.clear();
-	if (settings.Characters && backend.SkinAvailable()) {
-		// (45m) Other actors are skinned and refit every frame again (the 45l alternate frames lagged visibly);
-		// reduced quality now only lowers their ray work. The 45l path stays as a Debug switch.
-		characters.SetNpcReduced(quality.npcReduced && settings.NpcAlternateFrameSkinning);
-		float world[4];
-		if (scene.GetLoadedRect(world, false))
-			characters.Update(backend, globals::state->frameCount, world);
-		// Every captured (and retiring) shape is traced, also on a frame without an update.
-		characters.CollectDraws(skinDraws, skinBones);
+	const bool charactersWanted = settings.Characters && backend.SkinAvailable();
+	if (charactersUpdatedEarly && charactersWanted) {
+		// (45n) Early Prep: already done at the frame start (skinDraws / skinBones are that frame's).
+		cpuLast.characters = earlyCharactersMs;
+	} else {
+		if (backend.HasPrepared() && (charactersWanted || charactersUpdatedEarly)) {
+			// Prepared without these draws (should not happen): the trace must not pair other ready flags.
+			backend.AbandonPrepared();
+			earlyThisFrame = false;
+		}
+		skinDraws.clear();
+		skinBones.clear();
+		if (settings.Characters && backend.SkinAvailable()) {
+			// (45m) Other actors are skinned and refit every frame again (the 45l alternate frames lagged visibly);
+			// reduced quality now only lowers their ray work. The 45l path stays as a Debug switch.
+			characters.SetNpcReduced(quality.npcReduced && settings.NpcAlternateFrameSkinning);
+			characters.SetStillPoseReuse(settings.ReuseStillPoses);
+			float world[4];
+			if (scene.GetLoadedRect(world, false))
+				characters.Update(backend, globals::state->frameCount, world);
+			// Every captured (and retiring) shape is traced, also on a frame without an update.
+			characters.CollectDraws(skinDraws, skinBones);
+		}
+		cpuLast.characters = static_cast<float>(static_cast<double>(Qpc() - charactersStart) * QpcMs());
 	}
-	cpuLast.characters = static_cast<float>(static_cast<double>(Qpc() - charactersStart) * QpcMs());
 
 	const float2 renderSize = Util::ConvertToDynamic(globals::state->screenSize);
 	const std::uint32_t width = std::min<std::uint32_t>(static_cast<std::uint32_t>(renderSize.x), desc.Width);
@@ -2177,6 +2265,21 @@ void RayTracing::DrawSettings()
 			ImGui::Text("On = 45l: with other characters at reduced quality, their skinning and BLAS refit run every other frame (one frame late).");
 			ImGui::Text("  Off (default, 45m): every frame, like the player; reduced quality then only means fewer rays for them.");
 		}
+		// (45n) Spike and sync A/B (each off = 45m).
+		ImGui::Checkbox("Release Thread (45n)", &settings.ReleaseThread);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: GPU memory the ray tracer no longer needs is freed on a background thread. Freeing it on the render thread cost");
+			ImGui::Text("  about 0.5 ms per character part: 10-27 ms hitches whenever people walked out of range. Trace: rt_x_retire_ms, rt_x_collect_ms.");
+		}
+		ImGui::Checkbox("Early Prep (45n)", &settings.EarlyPrep);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: the BLAS builds and character skinning of the frame are sent at the very start of the frame (before the shadow maps)");
+			ImGui::Text("  instead of after the depth pass, so only the trace itself is left when the game's queue waits for it. Same frame, same data.");
+			ImGui::Text("  Needs Split D3D12 Submission. Trace: rt_early, rt_sync_gpu_ms, rt_queue_gap_gpu_ms.");
+		}
+		ImGui::Checkbox("Reuse Still Character Poses (45n)", &settings.ReuseStillPoses);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("On: a character part whose bones did not move at all since the last frame keeps its skinned shape (no GPU skinning). Trace: rt_still_reused.");
 		ImGui::Checkbox("Split D3D12 Submission", &settings.SplitSubmit);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("On: BLAS builds, character skinning and the TLAS start at once; only the trace waits for the game's depth. Off = 45k.");
@@ -2436,11 +2539,12 @@ std::string RayTracing::DescribeForProfile() const
 	// (45l) What the tier sets, the denoiser in effect and the A/B switches.
 	text += std::format(", denoiser in effect {}{}, rays {}+{}, sun cone {:.2f}, pattern {} far {}, fall-off {:.0f}-{:.0f}, other characters {}, denoise radius {:.0f} "
 						"taps {} {} far scale {:.2f}, history {:.0f} clamp {:.2f}, SIGMA stabilisation {}, late sync {}, split submit {}, character ray culling {}, "
-						"blocker at edges {}, distance fall-off {}",
+						"blocker at edges {}, distance fall-off {}, release thread {}, early prep {}, still poses {}",
 		kDenoisers[static_cast<int>(EffectiveDenoiser())], UpscalingRRActive() ? " (Upscaling RR on)" : "", q.baseRays, q.extraRays, q.coneDegrees,
 		kPatternNames[std::min(q.tracePattern, 2u)], kPatternNames[std::min(q.farPattern, 2u)], q.falloffStart, q.falloffEnd, q.npcReduced ? "reduced" : "full",
 		q.denoiseRadius, q.denoiseTaps, q.denoiseHalf ? "half res" : "full res", q.farDenoiseScale, q.history, q.clampSigma, settings.SigmaStabilizedFrames,
-		onOff(settings.LateSync), onOff(settings.SplitSubmit), onOff(settings.CharacterRayCulling), onOff(settings.BlockerAtEdges), onOff(settings.DistanceFalloff));
+		onOff(settings.LateSync), onOff(settings.SplitSubmit), onOff(settings.CharacterRayCulling), onOff(settings.BlockerAtEdges), onOff(settings.DistanceFalloff),
+		onOff(settings.ReleaseThread), onOff(settings.EarlyPrep), onOff(settings.ReuseStillPoses));
 	return text;
 }
 
@@ -2475,6 +2579,9 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["character_ray_culling"] = settings.CharacterRayCulling;
 	j["blocker_at_edges"] = settings.BlockerAtEdges;
 	j["distance_falloff"] = settings.DistanceFalloff;
+	j["release_thread"] = settings.ReleaseThread;  // (45n)
+	j["early_prep"] = settings.EarlyPrep;
+	j["reuse_still_poses"] = settings.ReuseStillPoses;
 	{
 		auto* timers = Util::GpuPassTimers::GetSingleton();
 		j["gpu_pass_ms"] = { { "tiles", timers->SmoothedMs(Util::GpuBucket::RayTracingDenoise) }, { "filter", timers->SmoothedMs(Util::GpuBucket::RayTracingDenoiseFilter) },
