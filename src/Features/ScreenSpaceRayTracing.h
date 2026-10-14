@@ -166,15 +166,6 @@ struct ScreenSpaceRayTracing : Feature
         float BRDFBias = 0.25f;
         bool UseDynamicCubemapsAsFallback = true;
         bool UseDynamicCubemapsAsFallbackSpecular = true;
-        /// @brief (45g) The specular cubemap fallback samples the cubemap mip that matches the
-        /// surface roughness (roughness x 7, like DeferredCompositeCS) instead of mip 0 always.
-        /// Off = 45f. Travels as bit 1 of SSRTCB::UseDynamicCubemapsAsFallback (specular pass).
-        bool FallbackRoughnessMip = true;
-        /// @brief (45g) DeferredCompositeCS cubemap reflections (used wherever SSRT specular gave
-        /// nothing: specular off, a miss with the fallback off, past the distance limit) get the
-        /// same sky occlusion the SSRT fallback applies, and the SSGI specular AO there gets the
-        /// right view direction. Off = 45f. Travels in CompositeCB.
-        bool CubemapSpecOcclusion = true;
         uint DiffuseSPP = 2;
         /// @brief (batch 12) How densely the diffuse ray march samples the screen; one of
         /// SamplingModeValue. Defaults to kSamplingFull, so the current look stays the default
@@ -1037,13 +1028,8 @@ struct ScreenSpaceRayTracing : Feature
         uint SpecularCap = 0;
         float CapStart = 0.0f;
         float CapEnd = 0.0f;
-        // --- row 1 (45g) ---
-        uint CubemapSpecOcclusion = 0;  // sky specular occlusion on the cubemap reflections
-        uint FixViewDirection = 0;      // SSGI specular AO gets surface->camera, not camera->surface
-        uint pad0 = 0;
-        uint pad1 = 0;
     };
-    static_assert(sizeof(CompositeCB) == 32);
+    static_assert(sizeof(CompositeCB) == 16);
 
     /// @brief Mirrored by the `DenoiserCB` declaration in ssrt_spatial.hlsl. Whole float4
     /// rows exactly, so no member straddles a 16-byte boundary and the HLSL packing rules

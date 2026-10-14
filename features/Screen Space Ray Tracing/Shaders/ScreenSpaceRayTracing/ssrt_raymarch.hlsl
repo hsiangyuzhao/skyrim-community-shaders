@@ -1337,12 +1337,10 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
 #if defined(DYNAMIC_CUBEMAPS) && !SHARC_UPDATE
         if (UseDynamicCubemapsAsFallback != 0 && (confidence < 0.999f))
         {
-#   if defined(SSRT_SPECULAR)
-            // (45g) Bit 1: the cubemap mip follows the roughness (x 7, as DeferredCompositeCS);
-            // clear = mip 0 always (45f), which made rough skin read as a mirror.
-            const float sampleMip = (UseDynamicCubemapsAsFallback & 2u) != 0 ? roughness * 7.0 : 0.0;
+#   if defined(SSRT_SPECULAR)            
+            const uint sampleMip = 0;
 #   else
-            const float sampleMip = 2.0;
+            const uint sampleMip = 2;
 #   endif
             float directionalAmbientLuminance = Color::RGBToLuminance(max(0.0, mul(SharedData::DirectionalAmbient, float4(world_space_reflected_direction, 1.0)))) * Color::ReflectionNormalisationScale;
             float envLuminance;

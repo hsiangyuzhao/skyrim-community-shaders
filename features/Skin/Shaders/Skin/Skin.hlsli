@@ -92,8 +92,7 @@ namespace Skin
 	//   [5] x gear sweat share, y item keyword trust (0 = pixels only), z leather droplets, w leather rivulets
 	//   [6] x metal droplets, y metal rivulets, z unused, w unused
 	//   [7..10] cloth, leather, metal, fur: x darkening, y sheen, z roughness floor, w dry-time multiplier
-	//   [11] (45g) x skin droplet / rivulet highlight min roughness (0 = 45f: 0.1 / 0.15), y wet skin
-	//        reflection strength (x WetIndirectEnergy, 1 = 45f), z w unused
+	//   [11] unused
 
 	/// Class weights: x cloth, y leather, z metal (x + y + z = 1), w fur / other (blends the result
 	/// toward the fur parameters). m0: metal evidence (TruePBR metallic, env mask); g0: gloss;
@@ -766,12 +765,9 @@ namespace Skin
 		skin.WetFilmEnergy = max(energy, 0.0);
 		const float trailMask = 0.6 * saturate(streak) * response;
 		skin.WetDropletMask = max(dropMask, trailMask);
-		// (45g) Droplet Min Roughness (wetCharParams[11].x, 0 = 45f): 0.1 / 0.15 made pin-point,
-		// mirror-bright dots on the face.
-		skin.WetDropletRoughness = max(dropMask >= trailMask ? 0.1 : 0.15, wetCharParams[11].x);
+		skin.WetDropletRoughness = dropMask >= trailMask ? 0.1 : 0.15;
 		skin.WetIndirectRoughness = roughness;
-		// (45g) Wet Skin Reflection Strength (wetCharParams[11].y, 1 = 45f).
-		skin.WetIndirectEnergy = saturate((response * strength * 0.6 * between + 0.5 * streak * response) * wetCharParams[11].y);
+		skin.WetIndirectEnergy = saturate(response * strength * 0.6 * between + 0.5 * streak * response);
 	}
 #endif
 

@@ -37,8 +37,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	FuzzStrength,
 	FuzzRoughness,
 	FuzzF0,
-	UseDynamicWetness,
-	SkinMinRoughness);
+	UseDynamicWetness);
 
 void Skin::DrawSettings()
 {
@@ -62,12 +61,6 @@ void Skin::DrawSettings()
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("Multiplier for specular map");
 		ImGui::BulletText("A multiplier for the vanilla specular map, applied to the first layer's roughness");
-	}
-
-	ImGui::SliderFloat("Skin Min Roughness", &settings.SkinMinRoughness, 0.0f, 0.5f, "%.2f");
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Skin is never smoother than this, dry or wet (direct highlights and reflections).");
-		ImGui::BulletText("Stops glossy spots (e.g. next to the eyes) from turning into a mirror. 0 = off (45f).");
 	}
 
 	ImGui::SliderFloat("Secondary Specular Strength", &settings.SecondarySpecularStrength, 0.0f, 1.0f, "%.2f");
@@ -290,8 +283,7 @@ Skin::SkinData Skin::GetCommonBufferData()
 	const auto& wet = globals::features::wetSkin.settings;
 	data.skinParams2 = float4(settings.SecondarySpecularStrength, std::clamp(wet.ExtraWetness, 0.0f, 2.0f), settings.F0, settings.BaseColorMultiplier);
 	data.skinDetailParams = float4(settings.SkinDetailTiling, settings.BodyTilingMultiplier, settings.SkinDetailStrength, float(settings.EnableSkinDetail && settings.EnableSkin));
-	// (45g) z: Skin Min Roughness (was unused, 0).
-	data.sssParams = float4(settings.Translucency, settings.sssWidth, std::clamp(settings.SkinMinRoughness, 0.0f, 0.5f), float(settings.UseSSS));
+	data.sssParams = float4(settings.Translucency, settings.sssWidth, 0.0f, float(settings.UseSSS));
 	data.fuzzParams = float4(settings.FuzzStrength, settings.FuzzRoughness, settings.FuzzF0, settings.ExtraEdgeRoughness);
 	data.physicalParams = float4(settings.PhysicalMainRoughnessMultiplier, settings.PhysicalSecondRoughnessMultiplier, settings.PhysicalSpecularStrength, std::clamp(wet.FilmStrength, 0.0f, 3.0f));
 	data.wetParams = wet.WetParams;
