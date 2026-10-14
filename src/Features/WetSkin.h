@@ -164,4 +164,24 @@ struct WetSkin : Feature
 	/// they load; taken when "Wet Skin" has no settings of its own yet.
 	static void StashLegacySkinJson(const json& a_skin);
 	static void StashLegacyWetnessJson(const json& a_wetness);
+
+	/// (46a) User presets: every Character Wetness setting, one JSON file per preset in
+	/// kPresetDirectory (after PostProcessing's SavePresetTo). No presets ship with the plugin.
+	static constexpr const char* kPresetDirectory = "Data\\SKSE\\Plugins\\CommunityShaders\\CharacterWetness";
+	std::vector<std::string> ListPresets() const;
+	bool SavePreset(const std::string& a_name);
+	bool LoadPreset(const std::string& a_name);
+	bool RenamePreset(const std::string& a_from, const std::string& a_to);
+	bool DeletePreset(const std::string& a_name);
+	/// A usable preset name (no path characters, not empty, at most 64 bytes) or empty.
+	static std::string SanitizePresetName(const std::string& a_name);
+
+private:
+	void DrawPresets();
+	std::vector<std::string> presetNames;
+	int presetIndex = -1;
+	bool presetsListed = false;
+	std::string presetNewName;
+	std::string presetRenameTo;
+	std::string presetStatus;
 };

@@ -3,6 +3,9 @@
 #include "Features/Skin.h"
 #include "Features/WetnessEffects.h"
 #include "Util.h"
+#include "imgui_stdlib.h"
+
+#include <fstream>
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	WetSkin::Settings,
@@ -104,95 +107,7 @@ namespace
 		}
 	}
 
-	// (44k) Look presets. Only the look parameters (sheen, patches, droplets, rivulets, hair and gear
-	// look); never the wetness sources, timers, the model, Extra Wetness, switches or drying multipliers.
-	// The preset in use is not saved: it is derived from the values ("Custom" when none matches).
-	template <class F>
-	void ForEachLookValue(WetSkin::Settings& a_s, F&& a_f)
-	{
-		for (float* v : { &a_s.RoughnessLow, &a_s.RoughnessFull, &a_s.FullWetnessStrength, &a_s.Darkening,
-				 &a_s.PatchContrast, &a_s.PatchSoftness,
-				 &a_s.DropletAmount, &a_s.DropletDensity, &a_s.DropletSize, &a_s.DropletSizeRandom, &a_s.FaceDroplets,
-				 &a_s.DropletNormal, &a_s.DropletRim, &a_s.DropletTrails, &a_s.RainDroplets,
-				 &a_s.StreakAmount, &a_s.StreakLength, &a_s.StreakWidth, &a_s.RivuletContrast2, &a_s.RivuletBetweenDulling, &a_s.FaceRivulets,
-				 &a_s.HairDarkening, &a_s.HairSharpness, &a_s.HairHighlightGain, &a_s.HairSecondaryLoss, &a_s.HairScatterLoss,
-				 &a_s.HairClumping, &a_s.HairClumpCount, &a_s.HairClumpShift, &a_s.HairGapDarkening,
-				 &a_s.GearSheen, &a_s.GearPatchContrast, &a_s.GearWicking,
-				 &a_s.LeatherDroplets, &a_s.LeatherRivulets, &a_s.MetalDroplets, &a_s.MetalRivulets })
-			a_f(*v);
-		// Gear classes: darkening, sheen, roughness floor (w = dry time is not a look value).
-		for (float4* c : { &a_s.GearCloth, &a_s.GearLeather, &a_s.GearMetal, &a_s.GearFur }) {
-			a_f(c->x);
-			a_f(c->y);
-			a_f(c->z);
-		}
-	}
-
-	WetSkin::Settings NaturalLook()
-	{
-		return {};  // the code defaults
-	}
-
-	WetSkin::Settings DrenchedLook()
-	{
-		WetSkin::Settings s{};
-		// Sheen: stronger and tighter (roughness stays >= 0.2: no mirror).
-		s.FullWetnessStrength = 2.2f;
-		s.RoughnessLow = 0.30f;
-		s.RoughnessFull = 0.20f;
-		s.Darkening = 0.9f;
-		// Patches: closer to an even soaked film.
-		s.PatchContrast = 0.2f;
-		// Droplets: more and larger.
-		s.DropletAmount = 1.0f;
-		s.DropletDensity = 0.6f;
-		s.DropletSize = 3.5f;
-		s.FaceDroplets = 0.6f;
-		s.DropletTrails = 0.7f;
-		s.RainDroplets = 0.6f;
-		// Rivulets: more visible.
-		s.StreakAmount = 0.8f;
-		s.StreakLength = 1.4f;
-		s.RivuletContrast2 = 0.7f;
-		s.RivuletBetweenDulling = 0.6f;
-		s.FaceRivulets = 1.0f;
-		// Hair: darker, tighter highlight, stronger clumps.
-		s.HairDarkening = 0.9f;
-		s.HairSharpness = 0.5f;
-		s.HairHighlightGain = 1.3f;
-		s.HairClumping = 0.85f;
-		s.HairGapDarkening = 0.45f;
-		// Gear: wetter-looking cloth and leather, more beads and trails.
-		s.GearSheen = 1.4f;
-		s.GearWicking = 6.0f;
-		s.GearCloth.x = 1.2f;
-		s.GearLeather.x = 0.7f;
-		s.GearLeather.y = 0.9f;
-		s.LeatherDroplets = 0.8f;
-		s.LeatherRivulets = 0.6f;
-		s.MetalRivulets = 0.8f;
-		return s;
-	}
-
-	bool LookMatches(const WetSkin::Settings& a_a, const WetSkin::Settings& a_b)
-	{
-		std::vector<float> va, vb;
-		ForEachLookValue(const_cast<WetSkin::Settings&>(a_a), [&](float& v) { va.push_back(v); });
-		ForEachLookValue(const_cast<WetSkin::Settings&>(a_b), [&](float& v) { vb.push_back(v); });
-		for (size_t i = 0; i < va.size(); ++i) {
-			if (std::abs(va[i] - vb[i]) > 1e-4f)
-				return false;
-		}
-		return true;
-	}
-
-	void ApplyLook(WetSkin::Settings& a_dst, const WetSkin::Settings& a_src)
-	{
-		std::vector<float> vals;
-		ForEachLookValue(const_cast<WetSkin::Settings&>(a_src), [&](float& v) { vals.push_back(v); });
-		size_t i = 0;
-		ForEachLookValue(a_dst, [&](float& v) { v = vals[i++]; });
-	}
+	// (46a) The built-in look presets (44k Natural / Drenched) were removed; presets are the user's own files.
 }
 
 void WetSkin::StashLegacySkinJson(const json& a_skin)
@@ -278,26 +193,8 @@ void WetSkin::DrawSettings()
 		"Legacy (pre-42c): every character exactly as before the wetness work (41b): skin, hair and gear.",
 		"Only safety limits are kept." });
 
-	if (!IsOriginal()) {
-		// (44k) Look Preset: writes only the look values; "Custom" is shown (not selectable) when none matches.
-		const char* presets[] = { "Natural", "Drenched", "Custom" };
-		int current = LookMatches(s, NaturalLook()) ? 0 : LookMatches(s, DrenchedLook()) ? 1 : 2;
-		if (ImGui::BeginCombo("Look Preset", presets[current])) {
-			if (ImGui::Selectable("Natural", current == 0))
-				ApplyLook(s, NaturalLook());
-			Tooltip({ "Subtle, realistic wet skin, hair and gear (the default look)." });
-			if (ImGui::Selectable("Drenched", current == 1))
-				ApplyLook(s, DrenchedLook());
-			Tooltip({ "Clearly soaked, cinematic: stronger sheen, darker skin and hair, bigger droplets, more rivulets." });
-			ImGui::BeginDisabled();
-			ImGui::Selectable("Custom", current == 2);
-			ImGui::EndDisabled();
-			Tooltip({ "Shown when the look sliders below do not match a preset (you changed them by hand)." });
-			ImGui::EndCombo();
-		}
-		Tooltip({ "Sets only how wet characters look (sheen, patches, droplets, rivulets, hair and gear look).",
-			"Wetness sources, timers and Extra Wetness are not changed." });
-	}
+	// (46a) User presets (the built-in Natural / Drenched looks were removed).
+	DrawPresets();
 
 	ImGui::SliderFloat("Extra Wetness (manual)", &s.ExtraWetness, 0.0f, 2.0f, "%.2f");
 	Tooltip({ "Makes every character this wet (skin, hair and gear), on top of swimming, rain and sweat.",
@@ -532,4 +429,262 @@ void WetSkin::DataLoaded()
 {
 	g_legacySkinPending = false;
 	g_legacyWetnessPending = false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// (46a) User presets
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+	std::filesystem::path Utf8Path(const std::string& a_text)
+	{
+		return std::filesystem::path(std::u8string(a_text.begin(), a_text.end()));
+	}
+
+	std::string PathUtf8(const std::filesystem::path& a_path)
+	{
+		const auto text = a_path.u8string();
+		return std::string(text.begin(), text.end());
+	}
+
+	std::filesystem::path PresetFile(const std::string& a_name)
+	{
+		return Utf8Path(WetSkin::kPresetDirectory) / Utf8Path(a_name + ".json");
+	}
+}
+
+std::string WetSkin::SanitizePresetName(const std::string& a_name)
+{
+	std::string out;
+	for (const char ch : a_name) {
+		const auto c = static_cast<unsigned char>(ch);
+		if (c < 32 || std::string_view("\\/:*?\"<>|").find(ch) != std::string_view::npos)
+			continue;
+		out.push_back(ch);
+	}
+	// No leading / trailing spaces or dots (Windows drops trailing ones), nothing like "..".
+	while (!out.empty() && (out.back() == ' ' || out.back() == '.'))
+		out.pop_back();
+	size_t start = 0;
+	while (start < out.size() && (out[start] == ' ' || out[start] == '.'))
+		++start;
+	out = out.substr(start);
+	if (out.size() > 64) {
+		out.resize(64);
+		// Do not cut a UTF-8 character in half.
+		while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80)
+			out.pop_back();
+		if (!out.empty() && (static_cast<unsigned char>(out.back()) & 0x80))
+			out.pop_back();
+	}
+	return out;
+}
+
+std::vector<std::string> WetSkin::ListPresets() const
+{
+	std::vector<std::string> names;
+	std::error_code ec;
+	const auto dir = Utf8Path(kPresetDirectory);
+	if (!std::filesystem::is_directory(dir, ec))
+		return names;
+	for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+		if (entry.is_regular_file(ec) && entry.path().extension() == ".json")
+			names.push_back(PathUtf8(entry.path().stem()));
+	}
+	std::sort(names.begin(), names.end());
+	return names;
+}
+
+bool WetSkin::SavePreset(const std::string& a_name)
+{
+	const std::string name = SanitizePresetName(a_name);
+	if (name.empty())
+		return false;
+	std::error_code ec;
+	std::filesystem::create_directories(Utf8Path(kPresetDirectory), ec);
+	if (ec) {
+		logger::warn("[Character Wetness] Could not create the preset folder {}: {}", kPresetDirectory, ec.message());
+		return false;
+	}
+	json j;
+	j["preset_name"] = name;
+	j["settings"] = settings;
+	try {
+		std::ofstream o{ PresetFile(name) };
+		if (!o)
+			return false;
+		o << std::setw(4) << j;
+		logger::info("[Character Wetness] Saved preset \"{}\"", name);
+		return static_cast<bool>(o);
+	} catch (const std::exception& e) {
+		logger::warn("[Character Wetness] Could not save preset \"{}\": {}", name, e.what());
+		return false;
+	}
+}
+
+bool WetSkin::LoadPreset(const std::string& a_name)
+{
+	json j;
+	try {
+		std::ifstream i{ PresetFile(a_name) };
+		if (!i)
+			return false;
+		i >> j;
+	} catch (const std::exception& e) {
+		logger::warn("[Character Wetness] Could not read preset \"{}\": {}", a_name, e.what());
+		return false;
+	}
+	const json& values = (j.is_object() && j.contains("settings")) ? j["settings"] : j;
+	if (!values.is_object())
+		return false;
+	// Laid over the current values: a preset saved by an older build leaves newer options as they are.
+	try {
+		json merged = settings;
+		merged.update(values);
+		settings = merged.get<Settings>();
+	} catch (const std::exception& e) {
+		logger::warn("[Character Wetness] Preset \"{}\" is not valid: {}", a_name, e.what());
+		return false;
+	}
+	logger::info("[Character Wetness] Loaded preset \"{}\"", a_name);
+	return true;
+}
+
+bool WetSkin::RenamePreset(const std::string& a_from, const std::string& a_to)
+{
+	const std::string to = SanitizePresetName(a_to);
+	if (to.empty() || to == a_from)
+		return false;
+	std::error_code ec;
+	if (std::filesystem::exists(PresetFile(to), ec))
+		return false;
+	std::filesystem::rename(PresetFile(a_from), PresetFile(to), ec);
+	if (ec) {
+		logger::warn("[Character Wetness] Could not rename preset \"{}\": {}", a_from, ec.message());
+		return false;
+	}
+	// Keep the name stored inside the file in step.
+	try {
+		json j;
+		{
+			std::ifstream i{ PresetFile(to) };
+			i >> j;
+		}
+		if (j.is_object()) {
+			j["preset_name"] = to;
+			std::ofstream o{ PresetFile(to) };
+			o << std::setw(4) << j;
+		}
+	} catch (...) {
+	}
+	return true;
+}
+
+bool WetSkin::DeletePreset(const std::string& a_name)
+{
+	std::error_code ec;
+	const bool removed = std::filesystem::remove(PresetFile(a_name), ec);
+	if (ec)
+		logger::warn("[Character Wetness] Could not delete preset \"{}\": {}", a_name, ec.message());
+	return removed && !ec;
+}
+
+void WetSkin::DrawPresets()
+{
+	if (!ImGui::TreeNodeEx("Presets", ImGuiTreeNodeFlags_DefaultOpen))
+		return;
+	if (!presetsListed) {
+		presetNames = ListPresets();
+		presetsListed = true;
+	}
+	if (presetIndex >= static_cast<int>(presetNames.size()))
+		presetIndex = -1;
+	const bool selected = presetIndex >= 0;
+	const std::string current = selected ? presetNames[presetIndex] : std::string(presetNames.empty() ? "(no presets saved yet)" : "(choose a preset)");
+
+	if (ImGui::BeginCombo("Preset", current.c_str())) {
+		presetNames = ListPresets();
+		for (int i = 0; i < static_cast<int>(presetNames.size()); ++i) {
+			if (ImGui::Selectable(presetNames[i].c_str(), presetIndex == i)) {
+				presetIndex = i;
+				presetRenameTo = presetNames[i];
+			}
+		}
+		ImGui::EndCombo();
+	}
+	Tooltip({ "Your own saved Character Wetness settings (every option on this page).",
+		"Files are kept in Data\\SKSE\\Plugins\\CommunityShaders\\CharacterWetness." });
+
+	ImGui::BeginDisabled(!selected);
+	if (ImGui::Button("Load")) {
+		const std::string name = presetNames[presetIndex];
+		presetStatus = LoadPreset(name) ? std::format("Loaded \"{}\".", name) : std::format("Could not load \"{}\".", name);
+	}
+	Tooltip({ "Replace the settings on this page with the chosen preset." });
+	ImGui::SameLine();
+	if (ImGui::Button("Overwrite")) {
+		const std::string name = presetNames[presetIndex];
+		presetStatus = SavePreset(name) ? std::format("Saved the current settings into \"{}\".", name) : std::format("Could not save \"{}\".", name);
+	}
+	Tooltip({ "Save the current settings into the chosen preset (replaces what it held)." });
+	ImGui::SameLine();
+	if (ImGui::Button("Delete"))
+		ImGui::OpenPopup("Delete Character Wetness Preset");
+	Tooltip({ "Delete the chosen preset file (asks first)." });
+	if (ImGui::BeginPopup("Delete Character Wetness Preset")) {
+		ImGui::Text("Delete \"%s\"?", selected ? presetNames[presetIndex].c_str() : "");
+		if (ImGui::Button("Yes, delete") && selected) {
+			const std::string name = presetNames[presetIndex];
+			presetStatus = DeletePreset(name) ? std::format("Deleted \"{}\".", name) : std::format("Could not delete \"{}\".", name);
+			presetNames = ListPresets();
+			presetIndex = -1;
+			ImGui::CloseCurrentPopup();
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Cancel"))
+			ImGui::CloseCurrentPopup();
+		ImGui::EndPopup();
+	}
+	ImGui::InputText("##RenameTo", &presetRenameTo);
+	ImGui::SameLine();
+	if (ImGui::Button("Rename") && selected) {
+		const std::string from = presetNames[presetIndex];
+		const std::string to = SanitizePresetName(presetRenameTo);
+		if (RenamePreset(from, to)) {
+			presetStatus = std::format("Renamed \"{}\" to \"{}\".", from, to);
+			presetNames = ListPresets();
+			const auto it = std::find(presetNames.begin(), presetNames.end(), to);
+			presetIndex = it != presetNames.end() ? static_cast<int>(it - presetNames.begin()) : -1;
+		} else {
+			presetStatus = to.empty() ? std::string("Enter a new name first.") : std::format("Could not rename to \"{}\" (the name may be in use).", to);
+		}
+	}
+	Tooltip({ "Give the chosen preset the name typed on the left." });
+	ImGui::EndDisabled();
+
+	ImGui::InputText("##NewPresetName", &presetNewName);
+	ImGui::SameLine();
+	if (ImGui::Button("Save as New Preset")) {
+		const std::string name = SanitizePresetName(presetNewName);
+		std::error_code ec;
+		if (name.empty()) {
+			presetStatus = "Enter a name first.";
+		} else if (std::filesystem::exists(PresetFile(name), ec)) {
+			presetStatus = std::format("\"{}\" already exists: choose it and use Overwrite.", name);
+		} else if (SavePreset(name)) {
+			presetStatus = std::format("Saved \"{}\".", name);
+			presetNames = ListPresets();
+			const auto it = std::find(presetNames.begin(), presetNames.end(), name);
+			presetIndex = it != presetNames.end() ? static_cast<int>(it - presetNames.begin()) : -1;
+			presetRenameTo = name;
+			presetNewName.clear();
+		} else {
+			presetStatus = std::format("Could not save \"{}\".", name);
+		}
+	}
+	Tooltip({ "Save every setting on this page as a new preset under the name typed on the left." });
+	if (!presetStatus.empty())
+		ImGui::TextDisabled("%s", presetStatus.c_str());
+	ImGui::TreePop();
 }
