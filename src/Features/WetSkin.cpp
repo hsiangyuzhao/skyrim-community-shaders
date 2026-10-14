@@ -67,7 +67,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	LeatherDroplets,
 	LeatherRivulets,
 	MetalDroplets,
-	MetalRivulets)
+	MetalRivulets,
+	TranslucentUnderWater,
+	UnderWaterTint)
 
 namespace
 {
@@ -360,6 +362,23 @@ void WetSkin::DrawSettings()
 		ImGui::EndDisabled();
 		ImGui::EndDisabled();
 	}
+
+	// (46a) See-through clothes in water.
+	ImGui::SeparatorText("See-through clothes in water");
+	ImGui::Checkbox("Show see-through clothes below the water surface (experimental)", &s.TranslucentUnderWater);
+	Tooltip({ "Sheer or see-through clothing (stockings, veils) of a character standing in water used to disappear below the",
+		"surface and near it: the game draws it after the water, and the water hides it.",
+		"On: it is drawn against the scene as it was before the water, and its part below the surface is tinted and faded",
+		"like seen through water. Only for characters in water, seen from above the surface. Off (default): as the game does it.",
+		"Needs Advanced Skin enabled." });
+	ImGui::BeginDisabled(!s.TranslucentUnderWater);
+	ImGui::SliderFloat("Under-Water Tint", &s.UnderWaterTint, 0.0f, 1.0f, "%.2f");
+	Tooltip({ "How much the part below the surface is tinted and faded (0 = shown as above the water)." });
+	{
+		const auto& status = globals::features::skin.waterDepthStatus;
+		ImGui::TextDisabled("Last frame: %u draws shown through the water, %u skipped (%s)", status.swapped, status.skipped, status.note ? status.note : "-");
+	}
+	ImGui::EndDisabled();
 }
 
 void WetSkin::LoadSettings(json& o_json)

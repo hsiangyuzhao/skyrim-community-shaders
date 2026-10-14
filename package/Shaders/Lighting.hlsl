@@ -4953,6 +4953,22 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	psout.Diffuse.xyz = color.xyz;
 #	endif  // defined(LIGHT_LIMIT_FIX)
 
+#	if defined(CS_SKIN) && !defined(DEFERRED)
+	// (46a) See-through clothes of a character in water (Character Wetness > See-through clothes in
+	// water): this draw is tested against the depth from before the water, so its part below the surface
+	// is drawn over the water; tint and fade it as if seen through the water.
+	[branch] if (Skin::waterPerGeometry.y > 0.5)
+	{
+		const float underWaterDepth = Skin::waterPerGeometry.x - (input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z);
+		[branch] if (underWaterDepth > 0.0)
+		{
+			const float underWater = saturate(underWaterDepth / 48.0) * saturate(Skin::waterPerGeometry.z);
+			psout.Diffuse.xyz *= lerp(float3(1.0, 1.0, 1.0), float3(0.45, 0.62, 0.66), underWater);
+			psout.Diffuse.w *= 1.0 - 0.65 * underWater;
+		}
+	}
+#	endif
+
 	psout.MotionVectors.xy = screenMotionVector.xy;
 	psout.MotionVectors.zw = float2(0, psout.Diffuse.w);
 

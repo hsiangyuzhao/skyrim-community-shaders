@@ -100,7 +100,43 @@ struct Skin : Feature
 		// amount), y amount on the part that was under water, z height of that part above the feet
 		// (0 = none), w the feet's world Z.
 		float4 snowPerGeometry;
+		// (46a) See-through clothes in water: x water surface world Z, y 1 = this draw tests against the
+		// pre-water depth (tint below x), z tint strength, w 0.
+		float4 waterPerGeometry;
 	};
+
+	/// (46a) See-through (alpha-blended) clothes of characters in water (Character Wetness > See-through
+	/// clothes in water). Their draws come after the water, whose depth hid everything below the surface.
+	/// At the first water draw after the opaque pass the main depth is copied (GPU copy, our own texture);
+	/// a flagged draw gets that copy bound as its depth target right after the engine applied its states
+	/// (State::Draw), and the engine's exact binding is put back in Lighting RestoreGeometry, before the
+	/// engine issues anything else, so its cached render-target state stays true.
+	void OnDrawStatesApplied(ID3D11DeviceContext* a_context);
+	void RestoreWaterDepth(ID3D11DeviceContext* a_context);
+	void OnEndDeferred();
+	/// waterPerGeometry for this geometry, and waterDepthPending set, when it is a flagged draw.
+	float4 GetWaterDepthParams(RE::BSGeometry* a_geometry);
+	void CopyPreWaterDepth(ID3D11DeviceContext* a_context, ID3D11DepthStencilView* a_boundDSV);
+	void ReleaseSavedTargets();
+	struct WaterDepthStatus
+	{
+		uint32_t swapped = 0;   // flagged draws drawn against the pre-water depth (last frame)
+		uint32_t skipped = 0;   // flagged draws left alone (unexpected targets)
+		const char* note = nullptr;
+	} waterDepthStatus;
+	bool waterDepthPending = false;  // the current Lighting pass is a flagged draw
+	bool waterDepthSwapped = false;  // our depth is bound right now
+	std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> savedRTVs{};
+	ID3D11DepthStencilView* savedDSV = nullptr;
+	UINT savedRTVCount = 0;
+	winrt::com_ptr<ID3D11Texture2D> preWaterDepth;
+	winrt::com_ptr<ID3D11DepthStencilView> preWaterDSV;
+	D3D11_TEXTURE2D_DESC preWaterDesc{};
+	DXGI_FORMAT preWaterDSVFormat = DXGI_FORMAT_UNKNOWN;
+	uint32_t preWaterDepthFrame = UINT32_MAX;  // frame the copy was taken in
+	uint32_t endDeferredFrame = UINT32_MAX;
+	uint32_t waterStatusFrame = UINT32_MAX;
+	WaterDepthStatus waterStatusCounting;
 
 	/// (46a) Per-character snow (Dynamic Snow > Snow builds up per character). Game hours, like the
 	/// global amount, so waiting and sleeping count.
@@ -214,9 +250,17 @@ struct Skin : Feature
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
 
+		/// (46a) Puts the engine's render targets back after a see-through-clothes-in-water draw.
+		struct BSLightingShader_RestoreGeometry
+		{
+			static void thunk(RE::BSShader* This, RE::BSRenderPass* Pass, uint32_t RenderFlags);
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+
 		static void Install()
 		{
 			stl::write_vfunc<0x6, BSLightingShader_SetupGeometry>(RE::VTABLE_BSLightingShader[0]);
+			stl::write_vfunc<0x7, BSLightingShader_RestoreGeometry>(RE::VTABLE_BSLightingShader[0]);
 			logger::info("[Advanced Skin] Installed hooks");
 			return;
 		}

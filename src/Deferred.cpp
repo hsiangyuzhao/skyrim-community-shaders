@@ -13,6 +13,7 @@
 #include "Features/RayTracing.h"
 #include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpaceRayTracing.h"
+#include "Features/Skin.h"
 #include "Features/Skylighting.h"
 #include "Features/SubsurfaceScattering.h"
 #include "Features/TerrainBlending.h"
@@ -741,6 +742,10 @@ void Deferred::EndDeferred()
 	stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);  // Run OMSetRenderTargets again
 
 	deferredPass = false;
+
+	// (46a) The opaque pass is over: the next water draw marks the depth "before the water".
+	if (globals::features::skin.loaded)
+		globals::features::skin.OnEndDeferred();
 
 	ResetBlendStates();
 }

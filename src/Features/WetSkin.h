@@ -138,6 +138,12 @@ struct WetSkin : Feature
 		float LeatherRivulets = 0.4f;
 		float MetalDroplets = 1.0f;
 		float MetalRivulets = 0.6f;
+		// (46a) See-through (alpha-blended) clothes of a character standing in water vanished below the
+		// surface: they are drawn after the water, whose depth hides them. On: those draws test against the
+		// depth from before the water (Skin::OnDrawStatesApplied), and their part below the surface is
+		// tinted and faded by UnderWaterTint. Off = the game's behaviour.
+		bool TranslucentUnderWater = false;
+		float UnderWaterTint = 0.6f;
 	} settings;
 
 	/// What the shader reads (Skin.hlsli wetSkinParams[6]).

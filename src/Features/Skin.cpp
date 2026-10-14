@@ -920,6 +920,13 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 		}
 		// (46a) This character's own snow (x < 0: none kept, the shader uses the global amount).
 		perGeometryData.snowPerGeometry = lastWetState ? lastWetState->snowGPU : float4(-1.0f, 0.0f, 0.0f, 0.0f);
+		// (46a) See-through clothes of a character in water, drawn after the water this frame.
+		perGeometryData.waterPerGeometry = float4(0.0f, 0.0f, 0.0f, 0.0f);
+		if (waterDepthSwapped)
+			RestoreWaterDepth(context);  // a RestoreGeometry went missing: never carry our depth into another pass
+		waterDepthPending = false;
+		if (lastWetState && wetSkin.settings.TranslucentUnderWater && preWaterDSV && preWaterDepthFrame == globals::state->frameCount)
+			perGeometryData.waterPerGeometry = GetWaterDepthParams(geometry);
 
 		if (!perGeometryValid || std::memcmp(currentPerGeometry.data(), &perGeometryData, sizeof(PerGeometryData)) != 0) {
 			std::memcpy(currentPerGeometry.data(), &perGeometryData, sizeof(PerGeometryData));
@@ -931,6 +938,205 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 		ID3D11Buffer* buffer = { PerGeometryCB->CB() };
 		context->PSSetConstantBuffers(7, 1, &buffer);
 	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// (46a) See-through clothes in water
+// ---------------------------------------------------------------------------------------------
+
+void Skin::OnEndDeferred()
+{
+	endDeferredFrame = globals::state->frameCount;
+}
+
+float4 Skin::GetWaterDepthParams(RE::BSGeometry* a_geometry)
+{
+	auto userData = a_geometry->GetUserData();
+	auto actor = userData ? userData->As<RE::Character>() : nullptr;
+	if (!actor || !actor->IsInWater())
+		return float4(0.0f, 0.0f, 0.0f, 0.0f);
+	// Alpha-blended geometry only (as Extended Translucency tells it: a blending alpha property, or a
+	// material alpha below 1, which the engine draws blended).
+	const auto& runtime = a_geometry->GetGeometryRuntimeData();
+	auto& property0 = runtime.properties[RE::BSGeometry::States::kProperty];
+	auto& property1 = runtime.properties[RE::BSGeometry::States::kEffect];
+	auto alphaProperty = property0 && property0->GetRTTI() == globals::rtti::NiAlphaPropertyRTTI.get() ? static_cast<RE::NiAlphaProperty*>(property0.get()) : nullptr;
+	auto lightProperty = property1 && property1->GetRTTI() == globals::rtti::BSLightingShaderPropertyRTTI.get() ? static_cast<RE::BSLightingShaderProperty*>(property1.get()) : nullptr;
+	if (!(lightProperty && lightProperty->alpha < 0.999f) && (!alphaProperty || !alphaProperty->GetAlphaBlending()))
+		return float4(0.0f, 0.0f, 0.0f, 0.0f);
+	const float waterZ = GetWaterHeight(actor->AsReference(), actor->GetPosition());
+	if (!std::isfinite(waterZ) || waterZ <= -1e6f)
+		return float4(0.0f, 0.0f, 0.0f, 0.0f);
+	// Seen from below the surface the water is not in front of the clothes: nothing to do.
+	const auto eye = globals::game::frameBufferCached.GetCameraPosAdjust(0);
+	if (eye.z <= waterZ + 1.0f)
+		return float4(0.0f, 0.0f, 0.0f, 0.0f);
+	waterDepthPending = true;
+	return float4(waterZ, 1.0f, std::clamp(globals::features::wetSkin.settings.UnderWaterTint, 0.0f, 1.0f), 0.0f);
+}
+
+void Skin::CopyPreWaterDepth(ID3D11DeviceContext* a_context, ID3D11DepthStencilView* a_boundDSV)
+{
+	auto& main = globals::game::renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
+	if (!main.texture || !a_boundDSV)
+		return;
+	{
+		winrt::com_ptr<ID3D11Resource> bound;
+		a_boundDSV->GetResource(bound.put());
+		if (bound.get() != main.texture) {
+			waterStatusCounting.note = "the water is not drawn into the main depth";
+			return;
+		}
+	}
+	D3D11_TEXTURE2D_DESC desc{};
+	main.texture->GetDesc(&desc);
+	D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
+	a_boundDSV->GetDesc(&dsvDesc);
+	if (desc.SampleDesc.Count != 1 || dsvDesc.ViewDimension != D3D11_DSV_DIMENSION_TEXTURE2D) {
+		waterStatusCounting.note = "multisampled or unusual depth";
+		return;
+	}
+	if (!preWaterDepth || desc.Width != preWaterDesc.Width || desc.Height != preWaterDesc.Height || desc.Format != preWaterDesc.Format ||
+		desc.BindFlags != preWaterDesc.BindFlags || dsvDesc.Format != preWaterDSVFormat) {
+		preWaterDepth = nullptr;
+		preWaterDSV = nullptr;
+		D3D11_TEXTURE2D_DESC copyDesc = desc;
+		copyDesc.Usage = D3D11_USAGE_DEFAULT;
+		copyDesc.CPUAccessFlags = 0;
+		copyDesc.MiscFlags = 0;
+		D3D11_DEPTH_STENCIL_VIEW_DESC viewDesc{};
+		viewDesc.Format = dsvDesc.Format;
+		viewDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+		viewDesc.Flags = 0;
+		viewDesc.Texture2D.MipSlice = 0;
+		auto device = globals::d3d::device;
+		if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, preWaterDepth.put())) ||
+			FAILED(device->CreateDepthStencilView(preWaterDepth.get(), &viewDesc, preWaterDSV.put()))) {
+			preWaterDepth = nullptr;
+			preWaterDSV = nullptr;
+			waterStatusCounting.note = "could not create the depth copy";
+			logger::warn("[Advanced Skin] See-through clothes in water: could not create the depth copy ({}x{}, format {})", desc.Width, desc.Height, static_cast<int>(desc.Format));
+			return;
+		}
+		preWaterDesc = desc;
+		preWaterDSVFormat = dsvDesc.Format;
+	}
+	// GPU copy in command order: the depth as it is right before the first water draw.
+	a_context->CopyResource(preWaterDepth.get(), main.texture);
+	preWaterDepthFrame = globals::state->frameCount;
+}
+
+void Skin::ReleaseSavedTargets()
+{
+	for (auto& rtv : savedRTVs) {
+		if (rtv)
+			rtv->Release();
+		rtv = nullptr;
+	}
+	if (savedDSV)
+		savedDSV->Release();
+	savedDSV = nullptr;
+	savedRTVCount = 0;
+}
+
+void Skin::OnDrawStatesApplied(ID3D11DeviceContext* a_context)
+{
+	if (!settings.EnableSkin)
+		return;
+	const bool wanted = globals::features::wetSkin.settings.TranslucentUnderWater;
+	if (!wanted && !waterDepthSwapped) {
+		if (preWaterDepth) {
+			preWaterDepth = nullptr;
+			preWaterDSV = nullptr;
+			preWaterDepthFrame = UINT32_MAX;
+		}
+		return;
+	}
+	auto* shader = globals::state->currentShader;
+	const uint32_t frame = globals::state->frameCount;
+	if (waterStatusFrame != frame) {
+		waterDepthStatus = waterStatusCounting;
+		waterStatusCounting = {};
+		waterStatusFrame = frame;
+	}
+	const bool lighting = shader && shader->shaderType.get() == RE::BSShader::Type::Lighting;
+	if (waterDepthSwapped && !(lighting && waterDepthPending)) {
+		// Our depth outlived its pass (no RestoreGeometry): put the engine's back before this draw.
+		RestoreWaterDepth(a_context);
+	}
+	if (!wanted || !shader)
+		return;
+
+	if (shader->shaderType.get() == RE::BSShader::Type::Water) {
+		// The first water draw after this frame's opaque pass: keep the depth from before it.
+		if (preWaterDepthFrame != frame && endDeferredFrame == frame) {
+			ID3D11DepthStencilView* dsv = nullptr;
+			a_context->OMGetRenderTargets(0, nullptr, &dsv);
+			CopyPreWaterDepth(a_context, dsv);
+			if (dsv)
+				dsv->Release();
+		}
+		return;
+	}
+	if (!lighting || !waterDepthPending)
+		return;
+
+	std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> rtvs{};
+	ID3D11DepthStencilView* dsv = nullptr;
+	a_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs.data(), &dsv);
+	const auto releaseQueried = [&] {
+		for (auto* rtv : rtvs)
+			if (rtv)
+				rtv->Release();
+		if (dsv)
+			dsv->Release();
+	};
+	if (dsv && dsv == preWaterDSV.get()) {
+		releaseQueried();  // already ours (another draw of the same pass)
+		return;
+	}
+	// Only the main scene's depth, at the size of our copy.
+	bool usable = false;
+	if (dsv && preWaterDSV) {
+		winrt::com_ptr<ID3D11Resource> bound;
+		dsv->GetResource(bound.put());
+		usable = bound.get() == globals::game::renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN].texture;
+	}
+	if (!usable) {
+		releaseQueried();
+		++waterStatusCounting.skipped;
+		waterStatusCounting.note = "drawn into another target";
+		waterDepthPending = false;
+		return;
+	}
+	if (waterDepthSwapped)
+		ReleaseSavedTargets();  // the engine re-applied its targets inside the pass; keep the newest
+	UINT count = 0;
+	for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+		if (rtvs[i])
+			count = i + 1;
+	savedRTVs = rtvs;  // the references from OMGetRenderTargets are kept until the restore
+	savedDSV = dsv;
+	savedRTVCount = count;
+	a_context->OMSetRenderTargetsAndUnorderedAccessViews(count, rtvs.data(), preWaterDSV.get(), 0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
+	waterDepthSwapped = true;
+	++waterStatusCounting.swapped;
+}
+
+void Skin::RestoreWaterDepth(ID3D11DeviceContext* a_context)
+{
+	waterDepthPending = false;
+	if (!waterDepthSwapped)
+		return;
+	waterDepthSwapped = false;
+	ID3D11DepthStencilView* dsv = nullptr;
+	a_context->OMGetRenderTargets(0, nullptr, &dsv);
+	// Only if ours is still bound: anything else is the engine's own newer binding.
+	if (dsv == preWaterDSV.get())
+		a_context->OMSetRenderTargetsAndUnorderedAccessViews(savedRTVCount, savedRTVs.data(), savedDSV, 0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
+	if (dsv)
+		dsv->Release();
+	ReleaseSavedTargets();
 }
 
 void Skin::SetShaderResouces(ID3D11DeviceContext* a_context)
@@ -947,4 +1153,13 @@ void Skin::Hooks::BSLightingShader_SetupGeometry::thunk(RE::BSShader* This, RE::
 	auto& skin = globals::features::skin;
 	skin.BSLightingShader_SetupGeometry(Pass);
 	return func(This, Pass, RenderFlags);
+}
+
+void Skin::Hooks::BSLightingShader_RestoreGeometry::thunk(RE::BSShader* This, RE::BSRenderPass* Pass, uint32_t RenderFlags)
+{
+	// (46a) Right after the draw: the engine's own render targets back before it issues anything else.
+	auto& skin = globals::features::skin;
+	if (skin.waterDepthSwapped || skin.waterDepthPending)
+		skin.RestoreWaterDepth(globals::d3d::context);
+	func(This, Pass, RenderFlags);
 }

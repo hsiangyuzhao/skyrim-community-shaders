@@ -36,6 +36,9 @@ namespace Skin
 		// amount), y = amount on the part that was under water, z = height of that part above the
 		// feet (0 = none), w = the feet's world Z. Read only under DynamicSnow::FlagCharacterSnowState.
 		float4 snowPerGeometry;
+		// (46a) See-through clothes in water: x = water surface world Z, y = 1 when this draw is tested
+		// against the depth from before the water (its part below x is tinted), z = tint strength.
+		float4 waterPerGeometry;
 	};
 
 	/// (46a) This character's snow amount at a world height (absolute Z), or a_global when the

@@ -52,8 +52,11 @@ void State::Draw()
 		if (terrainHelper.loaded)
 			terrainHelper.SetShaderResouces(context);
 
-		if (skin.loaded)
+		if (skin.loaded) {
 			skin.SetShaderResouces(context);
+			// (46a) See-through clothes in water: depth copy before the water, depth swap for flagged draws.
+			skin.OnDrawStatesApplied(context);
+		}
 
 		truePBR->SetShaderResouces(context);
 
