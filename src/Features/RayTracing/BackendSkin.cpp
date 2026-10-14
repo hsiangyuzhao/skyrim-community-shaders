@@ -14,6 +14,7 @@
 
 #include "Utils/D3D.h"
 
+#include <algorithm>
 #include <bit>
 
 // Generated at build time from Shaders/SkinCharactersCS.hlsl by the Windows SDK's dxc (CMakeLists.txt).
@@ -191,10 +192,11 @@ namespace RayTracingRT
 			std::erase(skinUploadQueue_, a_shape);
 			skinStats_.pending = static_cast<std::uint32_t>(skinUploadQueue_.size());
 		}
-		for (ComPtr<ID3D12Resource>* resource : { std::addressof(shape.rest), std::addressof(shape.index), std::addressof(shape.output), std::addressof(shape.blas) }) {
-			if (*resource)
-				Retire(*resource, 0, nullptr);
-		}
+		// (46g) Pool ranges, back once every submission that may use them completed.
+		skinStaticPool_.Free(shape.rest, RetireValue());
+		skinStaticPool_.Free(shape.index, RetireValue());
+		skinOutputPool_.Free(shape.output, RetireValue());
+		asPool_.Free(shape.blas, RetireValue());
 		if (shape.uvOffset != UINT32_MAX)
 			FreeAlphaUv(shape.uvOffset, shape.uvCount);
 		skinStats_.bytes -= std::min(skinStats_.bytes, shape.Bytes());
@@ -247,131 +249,126 @@ namespace RayTracingRT
 			logger::info("[RayTracing] Characters: buffers released");
 	}
 
-	void Backend::UploadSkinShapes(ID3D12GraphicsCommandList4* a_list)
+	void Backend::UploadSkinShapes(ID3D12GraphicsCommandList4* a_list, float a_cpuMs)
 	{
 		if (skinUploadQueue_.empty())
 			return;
-		// This frame's batch, with one upload buffer for all of it.
+		// (46g) Each shape takes four pool ranges (rest + index, skinned vertices, BLAS) and one upload range: no
+		// resource creation on the render thread (four committed resources per shape were the 40-125 ms frames after
+		// a transition, with the old "at least one shape" rule). A CPU budget bounds the copies; a shape whose ranges
+		// do not fit waits at the front of the queue for the pools' next block.
+		LARGE_INTEGER frequency, start;
+		QueryPerformanceFrequency(&frequency);
+		QueryPerformanceCounter(&start);
+		const auto deadline = start.QuadPart + static_cast<std::int64_t>(static_cast<double>(frequency.QuadPart) * a_cpuMs / 1000.0);
 		struct Pending
 		{
 			SkinHandle handle;
-			std::uint64_t restOffset, indexOffset, uvOffset;
+			ArenaAlloc upload;
+			std::uint64_t indexOffset, uvOffset;  // inside the upload range
 		};
 		std::vector<Pending> batch;
-		std::uint64_t uploadBytes = 0;
 		std::uint32_t batchVertices = 0;
 		while (!skinUploadQueue_.empty() && batch.size() < kSkinUploadsPerFrame && (batch.empty() || batchVertices < kSkinUploadVerticesPerFrame)) {
+			if (!batch.empty()) {
+				LARGE_INTEGER now;
+				QueryPerformanceCounter(&now);
+				if (now.QuadPart > deadline)
+					break;
+			}
 			const SkinHandle handle = skinUploadQueue_.front();
-			skinUploadQueue_.pop_front();
-			if (handle >= skins_.size() || !skins_[handle].live || skins_[handle].uploaded || !skins_[handle].geometry)
+			if (handle >= skins_.size() || !skins_[handle].live || skins_[handle].uploaded || !skins_[handle].geometry) {
+				skinUploadQueue_.pop_front();
 				continue;
-			const auto& geometry = *skins_[handle].geometry;
-			Pending entry{ handle, AlignUp(uploadBytes, 256), 0, 0 };
-			entry.indexOffset = AlignUp(entry.restOffset + geometry.vertices.size() * sizeof(SkinVertex), 256);
-			uploadBytes = entry.indexOffset + geometry.indices.size() * sizeof(std::uint32_t);
+			}
+			auto& shape = skins_[handle];
+			const auto& geometry = *shape.geometry;
+			Pending entry{ handle, {}, 0, 0 };
+			entry.indexOffset = AlignUp(geometry.vertices.size() * sizeof(SkinVertex), 256);
+			std::uint64_t uploadBytes = entry.indexOffset + geometry.indices.size() * sizeof(std::uint32_t);
 			if (!geometry.Opaque()) {
 				entry.uvOffset = AlignUp(uploadBytes, 256);
 				uploadBytes = entry.uvOffset + geometry.alphaUV.size() * sizeof(std::uint32_t);
 			}
+			ArenaAlloc rest, index, output, blas;
+			const bool ok = skinStaticPool_.Allocate(shape.restBytes, rest) && skinStaticPool_.Allocate(shape.indexBytes, index) &&
+			                skinOutputPool_.Allocate(shape.outputBytes, output) && asPool_.Allocate(shape.blasBytes, blas) &&
+			                uploadPool_.Allocate(uploadBytes, entry.upload);
+			if (!ok) {
+				// Nothing recorded with them: back at once.
+				skinStaticPool_.Free(rest, 0);
+				skinStaticPool_.Free(index, 0);
+				skinOutputPool_.Free(output, 0);
+				asPool_.Free(blas, 0);
+				uploadPool_.Free(entry.upload, 0);
+				++stats_.pools.allocFailsLastFrame;
+				for (auto* pool : { &skinStaticPool_, &skinOutputPool_, &asPool_, &uploadPool_ }) {
+					if (pool->failed) {
+						SetSkinFault(std::format("could not grow the {} pool for a skinned shape ({} vertices, {} triangles, {:.1f} MB)", pool->label,
+							shape.vertices, shape.triangles, static_cast<double>(shape.Bytes()) / (1024.0 * 1024.0)));
+						break;
+					}
+				}
+				break;
+			}
+			std::byte* mapped = uploadPool_.Mapped(entry.upload);
+			std::memcpy(mapped, geometry.vertices.data(), geometry.vertices.size() * sizeof(SkinVertex));
+			std::memcpy(mapped + entry.indexOffset, geometry.indices.data(), geometry.indices.size() * sizeof(std::uint32_t));
+			if (!geometry.Opaque())
+				std::memcpy(mapped + entry.uvOffset, geometry.alphaUV.data(), geometry.alphaUV.size() * sizeof(std::uint32_t));
+			shape.rest = rest;
+			shape.index = index;
+			shape.output = output;
+			shape.blas = blas;
+			skinUploadQueue_.pop_front();
 			batchVertices += geometry.Vertices();
 			batch.push_back(entry);
 		}
 		skinStats_.pending = static_cast<std::uint32_t>(skinUploadQueue_.size());
 		if (batch.empty())
 			return;
-		auto requeue = [&](std::size_t a_from) {
-			for (std::size_t i = batch.size(); i-- > a_from;)
-				skinUploadQueue_.push_front(batch[i].handle);
-			skinStats_.pending = static_cast<std::uint32_t>(skinUploadQueue_.size());
-		};
 
-		auto upload = CreateBuffer(uploadBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
-		std::byte* mapped = nullptr;
-		if (!upload || FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))) || !mapped) {
-			requeue(0);
-			SetSkinFault(std::format("could not create a {:.1f} MB upload buffer", static_cast<double>(uploadBytes) / (1024.0 * 1024.0)));
-			return;
-		}
+		// The copies: every touched vertex-pool block to copy dest, the copies, back to shader resource.
+		std::vector<std::uint32_t> blocks;
 		for (const auto& entry : batch) {
-			const auto& geometry = *skins_[entry.handle].geometry;
-			std::memcpy(mapped + entry.restOffset, geometry.vertices.data(), geometry.vertices.size() * sizeof(SkinVertex));
-			std::memcpy(mapped + entry.indexOffset, geometry.indices.data(), geometry.indices.size() * sizeof(std::uint32_t));
-			if (!geometry.Opaque())
-				std::memcpy(mapped + entry.uvOffset, geometry.alphaUV.data(), geometry.alphaUV.size() * sizeof(std::uint32_t));
+			blocks.push_back(skins_[entry.handle].rest.block);
+			blocks.push_back(skins_[entry.handle].index.block);
 		}
-		upload->Unmap(0, nullptr);
-		upload->SetName(L"CS RayTracing character upload");
-		Retire(upload, uploadBytes, &stats_.uploadBytes);
-		stats_.uploadBytes += uploadBytes;
-
-		std::vector<D3D12_RESOURCE_BARRIER> barriers;
-		barriers.reserve(batch.size() * 2);
+		std::sort(blocks.begin(), blocks.end());
+		blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+		TransitionBlocks(a_list, skinStaticPool_, blocks, D3D12_RESOURCE_STATE_COPY_DEST);
 		bool anyUv = false;
-		// (45k) Four committed resources per shape are created here on the render thread (the 5-9 ms
-		// rt_exec_skin_ms frames when characters came into range): past the CPU budget the rest of the
-		// batch waits for the next frame (at least one shape per frame).
-		LARGE_INTEGER frequency, start;
-		QueryPerformanceFrequency(&frequency);
-		QueryPerformanceCounter(&start);
-		const auto deadline = start.QuadPart + static_cast<std::int64_t>(static_cast<double>(frequency.QuadPart) * kSkinUploadBudgetMs / 1000.0);
-		for (std::size_t b = 0; b < batch.size(); ++b) {
-			if (b > 0) {
-				LARGE_INTEGER now;
-				QueryPerformanceCounter(&now);
-				if (now.QuadPart > deadline) {
-					requeue(b);
-					batch.resize(b);
-					break;
-				}
-			}
-			auto& shape = skins_[batch[b].handle];
-			shape.rest = CreateBuffer(shape.restBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, false);
-			shape.index = CreateBuffer(shape.indexBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, false);
-			shape.output = CreateBuffer(shape.outputBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-			shape.blas = CreateBuffer(shape.blasBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
-			if (!shape.rest || !shape.index || !shape.output || !shape.blas) {
-				// Nothing recorded for this one yet: its partial buffers can go at once.
-				shape.rest.Reset();
-				shape.index.Reset();
-				shape.output.Reset();
-				shape.blas.Reset();
-				requeue(b);
-				SetSkinFault(std::format("could not create the buffers of a skinned shape ({} vertices, {} triangles, {:.1f} MB)", shape.vertices,
-					shape.triangles, static_cast<double>(shape.Bytes()) / (1024.0 * 1024.0)));
-				break;
-			}
-			shape.rest->SetName(L"CS RayTracing character rest vertices");
-			shape.index->SetName(L"CS RayTracing character indices");
-			shape.output->SetName(L"CS RayTracing character skinned vertices");
-			shape.blas->SetName(L"CS RayTracing character BLAS");
+		for (const auto& entry : batch) {
+			auto& shape = skins_[entry.handle];
 			const auto& geometry = *shape.geometry;
-			skinRecorded_ = true;
-			a_list->CopyBufferRegion(shape.rest.Get(), 0, upload.Get(), batch[b].restOffset, geometry.vertices.size() * sizeof(SkinVertex));
-			a_list->CopyBufferRegion(shape.index.Get(), 0, upload.Get(), batch[b].indexOffset, geometry.indices.size() * sizeof(std::uint32_t));
-			barriers.push_back(SkinTransition(shape.rest.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
-			barriers.push_back(SkinTransition(shape.index.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+			ID3D12Resource* upload = uploadPool_.Resource(entry.upload);
+			a_list->CopyBufferRegion(skinStaticPool_.Resource(shape.rest), shape.rest.offset, upload, entry.upload.offset,
+				geometry.vertices.size() * sizeof(SkinVertex));
+			a_list->CopyBufferRegion(skinStaticPool_.Resource(shape.index), shape.index.offset, upload, entry.upload.offset + entry.indexOffset,
+				geometry.indices.size() * sizeof(std::uint32_t));
 			anyUv = anyUv || (!geometry.Opaque() && shape.uvOffset != UINT32_MAX);
-			shape.uploaded = true;
-			shape.outputInUav = true;
 		}
+		TransitionBlocks(a_list, skinStaticPool_, blocks, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		if (anyUv && alphaUv_) {
 			auto toCopy = SkinTransition(alphaUv_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
 			a_list->ResourceBarrier(1, &toCopy);
 			for (const auto& entry : batch) {
 				const auto& shape = skins_[entry.handle];
-				if (!shape.uploaded || !shape.geometry || shape.geometry->Opaque() || shape.uvOffset == UINT32_MAX)
+				if (shape.geometry->Opaque() || shape.uvOffset == UINT32_MAX)
 					continue;
-				a_list->CopyBufferRegion(alphaUv_.Get(), static_cast<std::uint64_t>(shape.uvOffset) * 8, upload.Get(), entry.uvOffset,
-					static_cast<std::uint64_t>(shape.uvCount) * 8);
+				a_list->CopyBufferRegion(alphaUv_.Get(), static_cast<std::uint64_t>(shape.uvOffset) * 8, uploadPool_.Resource(entry.upload),
+					entry.upload.offset + entry.uvOffset, static_cast<std::uint64_t>(shape.uvCount) * 8);
 			}
-			barriers.push_back(SkinTransition(alphaUv_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+			auto back = SkinTransition(alphaUv_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			a_list->ResourceBarrier(1, &back);
 		}
-		if (!barriers.empty())
-			a_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+		skinRecorded_ = true;
 		for (const auto& entry : batch) {
 			auto& shape = skins_[entry.handle];
-			if (shape.uploaded)
-				shape.geometry.reset();
+			uploadPool_.Free(entry.upload, RetireValue());  // read by this submission only
+			shape.uploaded = true;
+			shape.geometry.reset();
+			++skinUploadsTotal_;
 		}
 	}
 
@@ -380,7 +377,7 @@ namespace RayTracingRT
 	{
 		skinStats_.refitsLastFrame = skinStats_.buildsLastFrame = skinStats_.notReadyLastFrame = skinStats_.reusedLastFrame = 0;
 		skinStats_.verticesLastFrame = 0;
-		UploadSkinShapes(a_list);
+		UploadSkinShapes(a_list, a_input.skinUploadCpuMs > 0.0f ? a_input.skinUploadCpuMs : kPlaySkinUploadCpuMs);
 		if (!skinFault_.empty() || failed_ || !a_input.skinDraws || a_input.skinDraws->empty())
 			return;
 		const auto& draws = *a_input.skinDraws;
@@ -498,16 +495,15 @@ namespace RayTracingRT
 		}
 
 		skinRecorded_ = true;
-		// Skinning.
-		std::vector<D3D12_RESOURCE_BARRIER> barriers;
-		barriers.reserve(ops.size());
-		for (const auto& op : ops) {
-			auto& shape = skins_[draws[op.draw].shape];
-			if (!shape.outputInUav)
-				barriers.push_back(SkinTransition(shape.output.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
-		}
-		if (!barriers.empty())
-			a_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+		// Skinning. (46g) The skinned-vertex pool blocks these shapes live in go to UAV as a whole (the other shapes in
+		// them are not read meanwhile: a BLAS holds its own copy of the vertices).
+		std::vector<std::uint32_t> outputBlocks;
+		outputBlocks.reserve(ops.size());
+		for (const auto& op : ops)
+			outputBlocks.push_back(skins_[draws[op.draw].shape].output.block);
+		std::sort(outputBlocks.begin(), outputBlocks.end());
+		outputBlocks.erase(std::unique(outputBlocks.begin(), outputBlocks.end()), outputBlocks.end());
+		TransitionBlocks(a_list, skinOutputPool_, outputBlocks, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		a_list->SetComputeRootSignature(skinRootSignature_.Get());
 		a_list->SetPipelineState(skinPipeline_.Get());
 		const D3D12_GPU_VIRTUAL_ADDRESS bones = a_context.boneBuffer->GetGPUVirtualAddress();
@@ -516,18 +512,12 @@ namespace RayTracingRT
 			const auto& shape = skins_[draw.shape];
 			const std::uint32_t constants[4] = { shape.vertices, draw.boneOffset, shape.boneCount, 0 };
 			a_list->SetComputeRoot32BitConstants(0, 4, constants, 0);
-			a_list->SetComputeRootShaderResourceView(1, shape.rest->GetGPUVirtualAddress());
+			a_list->SetComputeRootShaderResourceView(1, skinStaticPool_.Address(shape.rest));
 			a_list->SetComputeRootShaderResourceView(2, bones);
-			a_list->SetComputeRootUnorderedAccessView(3, shape.output->GetGPUVirtualAddress());
+			a_list->SetComputeRootUnorderedAccessView(3, skinOutputPool_.Address(shape.output));
 			a_list->Dispatch((shape.vertices + kSkinGroupSize - 1) / kSkinGroupSize, 1, 1);
 		}
-		barriers.clear();
-		for (const auto& op : ops) {
-			auto& shape = skins_[draws[op.draw].shape];
-			barriers.push_back(SkinTransition(shape.output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
-			shape.outputInUav = false;
-		}
-		a_list->ResourceBarrier(static_cast<UINT>(barriers.size()), barriers.data());
+		TransitionBlocks(a_list, skinOutputPool_, outputBlocks, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
 		// BLAS builds and in-place refits.
 		const D3D12_GPU_VIRTUAL_ADDRESS scratch = skinScratch_->GetGPUVirtualAddress();
@@ -536,11 +526,11 @@ namespace RayTracingRT
 			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc{};
 			geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
 			geometryDesc.Flags = shape.uvOffset == UINT32_MAX ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
-			geometryDesc.Triangles.VertexBuffer.StartAddress = shape.output->GetGPUVirtualAddress();
+			geometryDesc.Triangles.VertexBuffer.StartAddress = skinOutputPool_.Address(shape.output);
 			geometryDesc.Triangles.VertexBuffer.StrideInBytes = kSkinOutputStride;
 			geometryDesc.Triangles.VertexCount = shape.vertices;
 			geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-			geometryDesc.Triangles.IndexBuffer = shape.index->GetGPUVirtualAddress();
+			geometryDesc.Triangles.IndexBuffer = skinStaticPool_.Address(shape.index);
 			geometryDesc.Triangles.IndexCount = shape.triangles * 3;
 			geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc{};
@@ -549,7 +539,7 @@ namespace RayTracingRT
 			buildDesc.Inputs.NumDescs = 1;
 			buildDesc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
 			buildDesc.Inputs.pGeometryDescs = &geometryDesc;
-			buildDesc.DestAccelerationStructureData = shape.blas->GetGPUVirtualAddress();
+			buildDesc.DestAccelerationStructureData = asPool_.Address(shape.blas);
 			buildDesc.ScratchAccelerationStructureData = scratch + op.scratchOffset;
 			if (!op.build) {
 				buildDesc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;

@@ -119,7 +119,13 @@ namespace
 	// (45k) Loading screens: capture / build budgets (frame time does not matter there), warm-up after them.
 	constexpr float kLoadingCaptureBudgetMs = 8.0f;
 	constexpr std::uint32_t kLoadingBuildTriangles = 1u << 20;  // per submission (TDR-safe: about 8 frames' worth of normal builds)
-	constexpr std::uint32_t kLoadingMaxBuilds = 64;
+	constexpr std::uint32_t kLoadingMaxBuilds = 128;  // (46g) 64 -> 128 (a CPU budget per frame now; 8 contexts x 128 stay within the postbuild slots)
+	// (46g) Transition budgets: render-thread ms per frame. Loading / black screen: nothing visible; WarmUp: visible, not handed off.
+	constexpr float kLoadingBuildCpuMs = 12.0f, kBlackBuildCpuMs = 10.0f, kWarmUpBuildCpuMs = 3.0f;
+	constexpr float kBlackCaptureBudgetMs = 8.0f, kWarmUpCaptureBudgetMs = 3.0f;
+	constexpr float kBlackSkinUploadCpuMs = 6.0f;
+	constexpr double kBlackMaxMs = 4000.0;  // a Fader Menu open longer than this after a loading screen is not the black screen
+	constexpr double kLateHoldMs = 4000.0;  // items not ready at the hand-off wait at most this long for the late batch
 	constexpr double kWarmUpTimeoutMs = 5000.0;
 	constexpr double kFadeInMs = 500.0;
 	constexpr std::uint32_t kAlphaCopiesPerFrame = 16;  // (45h) 256x256 alpha copies made per frame (5 small dispatches each)
@@ -134,6 +140,9 @@ namespace
 			// (45k) Also when it closes: the warm-up starts.
 			if (a_event && a_event->menuName == RE::LoadingMenu::MENU_NAME)
 				globals::features::rayTracing.OnLoadingScreen(a_event->opening);
+			// (46g) The black screen after a loading screen (the fade back in).
+			if (a_event && a_event->menuName == RE::FaderMenu::MENU_NAME)
+				globals::features::rayTracing.OnFader(a_event->opening);
 			return RE::BSEventNotifyControl::kContinue;
 		}
 	};
@@ -250,57 +259,202 @@ void RayTracing::OnLoadingScreen(bool a_open)
 
 void RayTracing::UpdatePhase()
 {
-	// (45k) Render thread, once per frame: Play -> Loading (menu open) -> WarmUp (closed, the near scene
-	// still being captured / built: the shadow map keeps every caster) -> Play (RT fades in).
+	// (45k) Render thread, once per frame. (46g) Loading (menu open: capture / build the destination, nothing traced)
+	// -> Black (closed, the Fader Menu still open: nothing visible, large budgets) -> WarmUp (visible, not ready yet)
+	// -> the hand-off: every ready cell / object switches from the shadow map to RT at once, one global fade (in the
+	// black screen when the scene is ready by then) -> Play. Items not ready at the hand-off wait for one late batch.
 	const bool open = loadingOpen.load();
 	const bool closed = loadingClosed.exchange(false);
 	const auto& sc = scene.GetStats();
 	const auto& stats = backend.GetStats();
+	const std::int64_t now = Qpc();
+	auto beginTransition = [&]() {
+		handedOff = false;
+		lateHold = false;
+		inTransition = true;
+		fade = 0.0f;
+		scene.SetHold(true);
+		for (auto& entry : transitionLog)
+			entry = {};
+		transitionLogSlot = -1;
+		handOffSummary.clear();
+	};
 	if (open && phase != Phase::Loading) {
+		if (transitionLogSlot >= 0)
+			TransitionLogFlush();  // a transition interrupted by the next one
 		phase = Phase::Loading;
 		loadShapesAtOpen = sc.shapes;
 		loadBuildsAtOpen = static_cast<std::uint32_t>(stats.buildsTotal);
-		fade = 0.0f;
+		beginTransition();
+		scene.SetTransition(true);  // the cells attached now (the place being left) are not captured again
 	}
 	if (!open && (closed || phase == Phase::Loading)) {
-		phase = Phase::WarmUp;
-		warmUpStart = Qpc();
+		if (!inTransition)
+			beginTransition();
+		phase = faderOpen.load() ? Phase::Black : Phase::WarmUp;
+		scene.SetTransition(false);
+		warmUpStart = now;
 		loadShapesAtClose = sc.shapes;
 		loadBuildsAtClose = static_cast<std::uint32_t>(stats.buildsTotal);
 		fade = 0.0f;
 	}
-	if (phase == Phase::WarmUp) {
-		const double elapsed = static_cast<double>(Qpc() - warmUpStart) * QpcMs();
+	const double sinceClose = static_cast<double>(now - warmUpStart) * QpcMs();
+	if (phase == Phase::Black && (!faderOpen.load() || sinceClose > kBlackMaxMs))
+		phase = Phase::WarmUp;
+	blackScreen = inTransition && !open && phase != Phase::Loading && faderOpen.load() && sinceClose <= kBlackMaxMs;
+
+	if ((phase == Phase::Black || phase == Phase::WarmUp) && !handedOff) {
 		// (46d) Indoors the scene must be the interior's: behind a door's loading screen the old exterior is still
-		// captured (the interior cell is only known once it closes), and its coverage ended the warm-up at once.
+		// captured (the interior cell is only known once it closes).
 		const bool sceneMatches = !(Util::IsInterior() && InteriorWanted() && RE::TES::GetSingleton() && RE::TES::GetSingleton()->interiorCell) || sc.interior;
-		const bool ready = sceneMatches && scene.HasCoverage() && sc.cellsGathering == 0 && backend.QueuedBuilds() == 0 && status == Status::Active;
-		if (ready || elapsed > kWarmUpTimeoutMs) {
+		const bool ready = sceneMatches && sc.cellsTracked > 0 && sc.cellsGathering == 0 && backend.QueuedBuilds() == 0 &&
+		                   backend.PendingSkinUploads() == 0 && backend.IsReady();
+		if (ready || sinceClose > kWarmUpTimeoutMs) {
+			const bool inBlack = phase == Phase::Black;
+			HandOffNow(ready ? (inBlack ? "in the black screen" : "visible") : (inBlack ? "in the black screen, timed out" : "visible, timed out"));
 			phase = Phase::Play;
-			lastTimeToReadyMs = static_cast<float>(elapsed);
-			lastLoadingSummary = std::format("behind the loading screen {} shapes captured, {} BLAS built; after it {} shapes, {} BLAS; ready {:.0f} ms after it closed{}",
+			lastTimeToReadyMs = static_cast<float>(sinceClose);
+			lastLoadingSummary = std::format("behind the loading screen {} shapes captured, {} BLAS built; after it {} shapes, {} BLAS; {}",
 				loadShapesAtClose > loadShapesAtOpen ? loadShapesAtClose - loadShapesAtOpen : 0u,
 				loadBuildsAtClose > loadBuildsAtOpen ? loadBuildsAtClose - loadBuildsAtOpen : 0u, sc.shapes > loadShapesAtClose ? sc.shapes - loadShapesAtClose : 0u,
-				static_cast<std::uint32_t>(stats.buildsTotal) > loadBuildsAtClose ? static_cast<std::uint32_t>(stats.buildsTotal) - loadBuildsAtClose : 0u, elapsed,
-				ready ? "" : " (timed out)");
+				static_cast<std::uint32_t>(stats.buildsTotal) > loadBuildsAtClose ? static_cast<std::uint32_t>(stats.buildsTotal) - loadBuildsAtClose : 0u,
+				handOffSummary);
 			logger::info("[RayTracing] Loading screen: {}", lastLoadingSummary);
 		}
 	}
-	if (phase == Phase::Play && fade < 1.0f) {
-		const double elapsed = static_cast<double>(Qpc() - warmUpStart) * QpcMs();
-		fade = static_cast<float>(std::clamp(elapsed / kFadeInMs, 0.0, 1.0));
-	} else if (phase == Phase::WarmUp) {
-		// While the shadow map still holds every caster, RT adds its shadows already (min of both), faded in.
-		const double elapsed = static_cast<double>(Qpc() - warmUpStart) * QpcMs();
-		fade = static_cast<float>(std::clamp(elapsed / kFadeInMs, 0.0, 1.0));
+	// (46g) The late batch: everything that became ready since the hand-off, switched at once (never one by one),
+	// when the queue has drained or kLateHoldMs after the hand-off. From then on cells hand off as they complete.
+	if (handedOff && lateHold) {
+		const bool drained = sc.cellsGathering == 0 && backend.QueuedBuilds() == 0;
+		const auto held = scene.HeldCounts(backend);
+		if (drained || now >= lateHoldUntil || (held.shown == 0 && held.pending == 0)) {
+			const auto counts = scene.HandOff(backend);
+			lateHold = false;
+			scene.SetHold(false);
+			inTransition = false;
+			logger::info("[RayTracing] Late batch {:.0f} ms after the hand-off: {} items switched to RT at once, {} still not ready (they follow as they complete)",
+				static_cast<double>(now - handOffQpc) * QpcMs(), counts.shown, counts.pending);
+			handOffSummary += std::format("; late batch +{:.0f} ms: {} items, {} left", static_cast<double>(now - handOffQpc) * QpcMs(), counts.shown, counts.pending);
+		}
 	}
+	fade = handedOff ? static_cast<float>(std::clamp(static_cast<double>(now - handOffQpc) * QpcMs() / kFadeInMs, 0.0, 1.0)) : 0.0f;
+}
+
+void RayTracing::HandOffNow(const char* a_when)
+{
+	const auto& sc = scene.GetStats();
+	const std::int64_t now = Qpc();
+	const auto counts = scene.HandOff(backend);
+	handedOff = true;
+	handOffQpc = now;
+	handOffThisFrame = true;
+	lateHold = true;
+	lateHoldUntil = now + static_cast<std::int64_t>(kLateHoldMs / std::max(QpcMs(), 1e-9));
+	handOffSummary = std::format("hand-off {:.0f} ms after the loading screen closed ({}): {} items switched to RT at once, {} pending ({} BLAS queued, "
+								 "{} cells capturing, {} character shapes waiting)",
+		static_cast<double>(now - warmUpStart) * QpcMs(), a_when, counts.shown, counts.pending, backend.QueuedBuilds(), sc.cellsGathering,
+		backend.PendingSkinUploads());
+	logger::info("[RayTracing] {}", handOffSummary);
+}
+
+void RayTracing::TransitionFrame()
+{
+	// (46g) Behind the loading screen, in the black screen after it, or visible but not handed off yet: the destination
+	// is captured and built (large budgets while nothing is visible), its characters prepared and uploaded, the pools /
+	// scratch / TLAS / per-context buffers grown ahead. Nothing is traced (the shadow map has every caster); the render
+	// thread never waits on the GPU.
+	const std::int64_t start = Qpc();
+	backend.WaitForTrace();
+	backend.WaitForAO();  // (46f)
+	const bool visible = phase == Phase::WarmUp;
+	const float capture = phase == Phase::Loading ? kLoadingCaptureBudgetMs : (visible ? kWarmUpCaptureBudgetMs : kBlackCaptureBudgetMs);
+	{
+		const auto& stats = backend.GetStats();
+		overVramBudget = stats.blasBytes + stats.scratchBytes > kAccelerationBudgetBytes;
+	}
+	scene.Update(backend, overVramBudget ? 0.0f : capture, globals::state->frameCount);
+	const std::int64_t charactersStart = Qpc();
+	if (settings.Characters && backend.SkinAvailable()) {
+		float world[4];
+		if (scene.GetLoadedRect(world, true))
+			characters.Update(backend, world, visible ? 2.0 : static_cast<double>(capture), visible ? 12u : 64u);
+	}
+	cpuLast.characters = static_cast<float>(static_cast<double>(Qpc() - charactersStart) * QpcMs());
+	if (!visible)
+		backend.Prewarm(4.0f, settings.Characters);
+	backend.BuildOnly(visible ? kBuildBudget * 2 : kLoadingBuildTriangles, visible ? 64u : kLoadingMaxBuilds,
+		phase == Phase::Loading ? kLoadingBuildCpuMs : (visible ? kWarmUpBuildCpuMs : kBlackBuildCpuMs));
+	backend.Tick();
+	cpuLast.scene = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+}
+
+void RayTracing::TransitionLogFrame(float a_rtCpuMs)
+{
+	// (46g) Per-phase work of a transition, logged in one line once the first 3 s after the hand-off are over.
+	const std::int64_t now = Qpc();
+	int slot = -1;
+	if (inTransition || (handedOff && static_cast<double>(now - handOffQpc) * QpcMs() < 3000.0 && transitionLogSlot >= 0)) {
+		if (phase == Phase::Loading)
+			slot = 0;
+		else if (phase == Phase::Black)
+			slot = 1;
+		else if (phase == Phase::WarmUp)
+			slot = 2;
+		else if (handedOff && static_cast<double>(now - handOffQpc) * QpcMs() < 3000.0)
+			slot = 3;
+	}
+	if (slot < 0) {
+		if (transitionLogSlot >= 0)
+			TransitionLogFlush();
+		return;
+	}
+	const auto& stats = backend.GetStats();
+	auto& entry = transitionLog[slot];
+	if (!entry.seen) {
+		entry.seen = true;
+		entry.wallStartQpc = static_cast<double>(now);
+		entry.buildsAtStart = stats.buildsTotal;
+		entry.uploadsAtStart = backend.SkinUploadsTotal();
+		entry.poolBlocksSync = stats.pools.syncBlocksTotal;
+		entry.poolBlocksAsync = stats.pools.asyncBlocksTotal;
+	}
+	++entry.frames;
+	entry.rtCpuMs += std::max(a_rtCpuMs, 0.0f);
+	entry.wallEndQpc = static_cast<double>(now);
+	entry.buildsAtEnd = stats.buildsTotal;
+	entry.uploadsAtEnd = backend.SkinUploadsTotal();
+	entry.shapesAtEnd = scene.GetStats().shapes;
+	transitionLogSlot = slot;
+}
+
+void RayTracing::TransitionLogFlush()
+{
+	static constexpr const char* kNames[4] = { "loading screen", "black screen", "visible before the hand-off", "first 3 s after the hand-off" };
+	const auto& stats = backend.GetStats();
+	std::string line;
+	for (int i = 0; i < 4; ++i) {
+		const auto& e = transitionLog[i];
+		if (!e.seen) {
+			line += std::format("{}{}: none", line.empty() ? "" : "; ", kNames[i]);
+			continue;
+		}
+		line += std::format("{}{}: {} frames, {:.0f} ms, RT CPU {:.0f} ms, {} BLAS built, {} character shapes uploaded, scene {} shapes", line.empty() ? "" : "; ",
+			kNames[i], e.frames, (e.wallEndQpc - e.wallStartQpc) * QpcMs(), e.rtCpuMs, e.buildsAtEnd - e.buildsAtStart, e.uploadsAtEnd - e.uploadsAtStart,
+			e.shapesAtEnd);
+	}
+	logger::info("[RayTracing] Transition work: {}; pools {:.0f} MB reserved ({} blocks made behind loading / black screens, {} on the pool thread); {}",
+		line, static_cast<double>(stats.pools.reservedBytes) / (1024.0 * 1024.0), stats.pools.syncBlocksTotal, stats.pools.asyncBlocksTotal,
+		handOffSummary.empty() ? std::string("no hand-off") : handOffSummary);
+	for (auto& entry : transitionLog)
+		entry = {};
+	transitionLogSlot = -1;
 }
 
 bool RayTracing::ClaimScreenSpaceShadows()
 {
 	// (45k) Decided before Ray Tracing's own Prepass (Screen Space Shadows runs first in the list).
 	sssClaimed = false;
-	if (!settings.Enabled || status != Status::Active || !typedUavLoadR8 || Util::IsInterior() || phase == Phase::Loading)
+	if (!settings.Enabled || status != Status::Active || !typedUavLoadR8 || Util::IsInterior() || phase == Phase::Loading || !handedOff)
 		return false;
 	sssClaimed = true;
 	return true;
@@ -1036,6 +1190,10 @@ void RayTracing::RunEarlyPrep()
 	charactersUpdatedEarly = false;
 	earlyCpuMs = 0.0f;
 	earlyCharactersMs = 0.0f;
+	if (backend.IsReady() && beginFrameIndex != globals::state->frameCount) {
+		beginFrameIndex = globals::state->frameCount;
+		backend.BeginFrame();  // (46g) per-frame pool / Early Prep counters
+	}
 	if (backend.IsReady() && backend.HasPrepared())
 		backend.AbandonPrepared();  // a frame that never reached its Prepass
 	auto* sky = globals::game::sky;
@@ -1049,7 +1207,7 @@ void RayTracing::RunEarlyPrep()
 		if (settings.Characters && backend.SkinAvailable()) {
 			float world[4];
 			if (scene.GetLoadedRect(world, false))
-				characters.Update(backend, world);
+				characters.Update(backend, world, blackScreen ? 6.0 : 1.0, blackScreen ? 32u : 6u);
 			characters.CollectDraws(skinDraws, skinBones);
 			charactersUpdatedEarly = true;
 		}
@@ -1058,6 +1216,9 @@ void RayTracing::RunEarlyPrep()
 		input.buildTriangleBudget = kBuildBudget;
 		input.skinDraws = &skinDraws;
 		input.skinBones = &skinBones;
+		// (46g) Leftovers in the black screen get the larger budgets (nothing visible yet).
+		input.buildCpuMs = blackScreen ? kBlackBuildCpuMs : 0.0f;
+		input.skinUploadCpuMs = blackScreen ? kBlackSkinUploadCpuMs : 0.0f;
 		earlyThisFrame = backend.PrepareFrame(input);
 		if (!earlyThisFrame && backend.HasFailed())
 			Disable(Status::Failed, backend.LastError());
@@ -1156,6 +1317,13 @@ void RayTracing::Prepass()
 		sssClaimed = false;
 		phase = Phase::Play;
 		fade = 1.0f;
+		// (46g) No transition hold while off (the scene is released anyway).
+		handedOff = true;
+		inTransition = false;
+		lateHold = false;
+		blackScreen = false;
+		scene.SetHold(false);
+		scene.SetTransition(false);
 		if (backend.IsReady()) {
 			backend.WaitForTrace();  // (45l) a deferred wait left over (GPU-side only)
 			backend.WaitForAO();     // (46f) likewise the second fence
@@ -1200,20 +1368,21 @@ void RayTracing::Prepass()
 		return;
 	}
 
+	if (backend.IsReady() && beginFrameIndex != globals::state->frameCount) {
+		beginFrameIndex = globals::state->frameCount;  // (46g) no Early Prep call this frame (loading screens)
+		backend.BeginFrame();
+	}
 	cpuLast = {};
 	UpdatePhase();
+	// (46g) Pools grow on the render thread only while nothing is visible.
+	if (backend.IsReady())
+		backend.SetTransition(phase == Phase::Loading || phase == Phase::Black || blackScreen);
 	scene.SetInteriorEnabled(InteriorWanted());  // (46c) also behind loading screens: an interior is captured there
 	try {
-		if (phase == Phase::Loading && backend.IsReady()) {
-			// (45k) Behind the loading screen: capture and build with a large budget, trace nothing. The
-			// render thread never waits on the GPU; one build submission per frame, capped.
-			const std::int64_t loadStart = Qpc();
-			backend.WaitForTrace();
-			backend.WaitForAO();  // (46f)
-			scene.Update(backend, overVramBudget ? 0.0f : kLoadingCaptureBudgetMs, globals::state->frameCount);
-			backend.BuildOnly(kLoadingBuildTriangles, kLoadingMaxBuilds);
-			backend.Tick();
-			cpuLast.scene = static_cast<float>(static_cast<double>(Qpc() - loadStart) * QpcMs());
+		if ((phase == Phase::Loading || phase == Phase::Black || (phase == Phase::WarmUp && !handedOff)) && backend.IsReady()) {
+			// (45k) Behind the loading screen: capture and build with a large budget, trace nothing. (46g) Also the black
+			// screen after it and the visible frames before the hand-off (TransitionFrame).
+			TransitionFrame();
 		} else {
 			RunFrame();
 		}
@@ -1273,6 +1442,7 @@ void RayTracing::ReportFrame()
 		loggedStatus = status;
 	}
 	lastCpuMs += earlyCpuMs;  // (45n) the frame-start part (Early Prep) belongs to this frame too
+	TransitionLogFrame(lastCpuMs);  // (46g)
 	traceSample.cpuMs = lastCpuMs;
 	traceSample.gpuMs = activeThisFrame ? stats.lastGpuMs : -1.0f;
 	traceSample.builds = activeThisFrame ? stats.buildsLastFrame : 0;
@@ -1396,6 +1566,34 @@ void RayTracing::PublishCpuSplit()
 		detail.rtaoFilterGpuMs = aoComposedLastFrame ? std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAO), 0.0f) : -1.0f;
 		detail.rtaoSyncGpuMs = aoComposedLastFrame ? std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAOSync), 0.0f) : -1.0f;
 		detail.rtaoRays = aoTraced ? stats.aoRaysPerFrame : 0;
+		// (46g) Transitions, Early Prep split, pools.
+		detail.black = blackScreen ? 1 : 0;
+		detail.handOff = handOffThisFrame ? 1 : 0;
+		detail.sinceCloseMs = inTransition || fade < 1.0f ? static_cast<float>(static_cast<double>(Qpc() - warmUpStart) * QpcMs()) : -1.0f;
+		if (scene.Held()) {
+			const auto held = scene.HeldCounts(backend);
+			detail.heldReady = static_cast<int>(held.shown);
+			detail.heldPending = static_cast<int>(held.pending);
+		}
+		const auto& e = stats.prep;
+		detail.eCollect = e.collect;
+		detail.eTimestamps = e.timestamps;
+		detail.eReset = e.reset;
+		detail.eBuild = e.build;
+		detail.eSkin = e.skin;
+		detail.eClose = e.close;
+		detail.eExecute = e.execute;
+		if (activeThisFrame) {
+			detail.xTimestamps = stats.split.timestamps;
+			detail.xEnsure = stats.split.ensure;
+			detail.xPublish = stats.split.publish;
+			detail.xAo = stats.split.ao;
+		}
+		detail.poolMs = stats.pools.pumpMsLastFrame;
+		detail.poolSyncBlocks = stats.pools.syncBlocksLastFrame;
+		detail.poolMb = static_cast<float>(static_cast<double>(stats.pools.reservedBytes) / (1024.0 * 1024.0));
+		detail.poolAllocFails = stats.pools.allocFailsLastFrame;
+		detail.poolWorkerMs = stats.pools.workerLastMs;
 	}
 	detail.sssGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::ScreenSpaceShadows);
 	// (45k) A slow D3D12 record + submit names its slowest call in the log (at most every 2 s).
@@ -1421,6 +1619,7 @@ void RayTracing::PublishCpuSplit()
 		}
 	}
 	Util::FrameTrace::OnRayTracingDetail(detail);
+	handOffThisFrame = false;
 }
 
 void RayTracing::RunFrame()
@@ -1483,7 +1682,7 @@ void RayTracing::RunFrame()
 		const auto& stats = backend.GetStats();
 		overVramBudget = stats.blasBytes + stats.scratchBytes > kAccelerationBudgetBytes;
 	}
-	scene.Update(backend, overVramBudget ? 0.0f : kCaptureBudgetMs, globals::state->frameCount);
+	scene.Update(backend, overVramBudget ? 0.0f : (blackScreen ? kBlackCaptureBudgetMs : kCaptureBudgetMs), globals::state->frameCount);
 
 	const auto& fb = globals::game::frameBufferCached;
 	const float4 camera = fb.GetCameraPosAdjust(0);
@@ -1528,7 +1727,7 @@ void RayTracing::RunFrame()
 		if (settings.Characters && backend.SkinAvailable()) {
 			float world[4];
 			if (scene.GetLoadedRect(world, false))
-				characters.Update(backend, world);
+				characters.Update(backend, world, blackScreen ? 6.0 : 1.0, blackScreen ? 32u : 6u);
 			// Every captured (and retiring) shape is traced, also on a frame without an update.
 			characters.CollectDraws(skinDraws, skinBones);
 		}
@@ -1646,6 +1845,8 @@ void RayTracing::RunFrame()
 	input.buildTriangleBudget = kBuildBudget;
 	input.validate = validate;
 	input.skinDraws = &skinDraws;  // (45i) empty: the 45h pipelines run
+	input.buildCpuMs = blackScreen ? kBlackBuildCpuMs : 0.0f;  // (46g)
+	input.skinUploadCpuMs = blackScreen ? kBlackSkinUploadCpuMs : 0.0f;
 	input.skinBones = &skinBones;
 	input.deferWait = true;  // (45l) FinishFrame waits (after the other features' prepasses)
 	// (46b) Point-light shadows: this frame's sources, traced right after the sun in the same submission.
@@ -2736,7 +2937,7 @@ void RayTracing::RunInteriorFrame()
 		const auto& stats = backend.GetStats();
 		overVramBudget = stats.blasBytes + stats.scratchBytes > kAccelerationBudgetBytes;
 	}
-	scene.Update(backend, overVramBudget ? 0.0f : kCaptureBudgetMs, globals::state->frameCount);
+	scene.Update(backend, overVramBudget ? 0.0f : (blackScreen ? kBlackCaptureBudgetMs : kCaptureBudgetMs), globals::state->frameCount);
 
 	const auto& fb = globals::game::frameBufferCached;
 	const float4 camera = fb.GetCameraPosAdjust(0);
@@ -2747,7 +2948,7 @@ void RayTracing::RunInteriorFrame()
 		// queue even before any cell is covered, but indoors nothing is traced until the interior is covered,
 		// so without this its queued builds never ran (46c: "capturing the interior" for ever). Our own queue,
 		// nothing waits on the CPU; a larger cap while warming up after the loading screen.
-		backend.BuildOnly(phase == Phase::WarmUp ? kLoadingBuildTriangles : kBuildBudget * 2, phase == Phase::WarmUp ? kLoadingMaxBuilds : 16);
+		backend.BuildOnly(blackScreen ? kLoadingBuildTriangles : kBuildBudget * 2, blackScreen ? kLoadingMaxBuilds : 64u, blackScreen ? kBlackBuildCpuMs : 2.0f);
 		backend.Tick();
 		status = Status::Waiting;
 		statusReason = "capturing the interior";
@@ -2767,7 +2968,7 @@ void RayTracing::RunInteriorFrame()
 	skinDraws.clear();
 	skinBones.clear();
 	if (settings.Characters && backend.SkinAvailable()) {
-		characters.Update(backend, world);
+		characters.Update(backend, world, blackScreen ? 6.0 : 1.0, blackScreen ? 32u : 6u);
 		characters.CollectDraws(skinDraws, skinBones);
 	}
 	cpuLast.characters = static_cast<float>(static_cast<double>(Qpc() - charactersStart) * QpcMs());
@@ -2802,6 +3003,8 @@ void RayTracing::RunInteriorFrame()
 	input.skinBones = &skinBones;
 	input.deferWait = true;
 	input.sun = false;
+	input.buildCpuMs = blackScreen ? kBlackBuildCpuMs : 0.0f;  // (46g)
+	input.skinUploadCpuMs = blackScreen ? kBlackSkinUploadCpuMs : 0.0f;
 	{
 		const std::int64_t pointStart = Qpc();
 		try {
@@ -2815,7 +3018,7 @@ void RayTracing::RunInteriorFrame()
 	}
 	if (!input.pointLights) {
 		// Nothing to trace (no shadow-casting light in view): the queued builds go on, nothing waits.
-		backend.BuildOnly(kBuildBudget, 16);
+		backend.BuildOnly(kBuildBudget, 64u, blackScreen ? kBlackBuildCpuMs : 2.0f);
 		backend.Tick();
 		status = Status::Active;
 		statusReason = "interior, no shadow-casting light in view";
@@ -3069,15 +3272,73 @@ void RayTracing::WritePointMask(bool a_traced)
 
 void RayTracing::DrawSettings()
 {
-	if (ImGui::TreeNodeEx("General", ImGuiTreeNodeFlags_DefaultOpen)) {
-		ImGui::Checkbox("Ray Tracing", &settings.Enabled);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: sun shadows of buildings, rocks, furniture, doors, items and characters inside the loaded area are ray traced.");
-			ImGui::Text("Trees, leaves, hair (unless changed under Advanced), grass and the terrain itself (hills) keep their normal shadows; the ground still receives traced shadows.");
-			ImGui::Text("Screen Space Shadows are switched off where ray tracing is in charge.");
-			ImGui::Text("Off: the game's shadows exactly as before (nothing of this feature runs).");
-		}
+	// (46g) The "Ray Tracing" entry: the master switch, the status and the diagnostics. Sun Shadows, Point Light Shadows and
+	// Ambient Occlusion have their own entries in the Ray Tracing category (each shows the switch and the status on top).
+	DrawMasterHeader();
+	DrawDiagnostics();
+}
 
+void RayTracing::DrawMasterHeader()
+{
+	ImGui::Checkbox("Ray Tracing", &settings.Enabled);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::Text("On: sun shadows of buildings, rocks, furniture, doors, items and characters inside the loaded area are ray traced.");
+		ImGui::Text("Trees, leaves, hair (unless changed under Advanced), grass and the terrain itself (hills) keep their normal shadows; the ground still receives traced shadows.");
+		ImGui::Text("Screen Space Shadows are switched off where ray tracing is in charge.");
+		ImGui::Text("Off: the game's shadows exactly as before (nothing of this feature runs).");
+	}
+	const char* statusText = "Off";
+	ImVec4 color{ 0.7f, 0.7f, 0.7f, 1.0f };
+	switch (status) {
+	case Status::Off:
+		statusText = settings.Enabled ? "Starting" : "Off";
+		break;
+	case Status::Unavailable:
+		statusText = "Off, could not start (the game's shadows are used)";
+		color = { 1.0f, 0.4f, 0.3f, 1.0f };
+		break;
+	case Status::Failed:
+		statusText = "Off, stopped after an error (the game's shadows are used)";
+		color = { 1.0f, 0.4f, 0.3f, 1.0f };
+		break;
+	case Status::Inactive:
+		statusText = "Paused";
+		break;
+	case Status::Waiting:
+		statusText = "Loading the scene";
+		color = { 1.0f, 0.85f, 0.3f, 1.0f };
+		break;
+	case Status::Active:
+		statusText = "Active";
+		color = { 0.4f, 1.0f, 0.4f, 1.0f };
+		break;
+	}
+	ImGui::TextColored(color, "Status: %s", statusText);
+	if (!statusReason.empty()) {
+		if (status == Status::Unavailable || status == Status::Failed) {
+			// The reason is the whole point here (and can be long): its own wrapped line.
+			ImGui::PushStyleColor(ImGuiCol_Text, color);
+			ImGui::TextWrapped("Reason: %s", statusReason.c_str());
+			ImGui::PopStyleColor();
+		} else {
+			ImGui::SameLine();
+			ImGui::TextDisabled("(%s)", statusReason.c_str());
+		}
+	}
+	if (status == Status::Unavailable || status == Status::Failed) {
+		if (ImGui::Button("Try Again")) {
+			backendTried = false;
+			status = Status::Off;
+			statusReason.clear();
+		}
+	}
+	ImGui::Separator();
+}
+
+void RayTracing::DrawSunPage()
+{
+	DrawMasterHeader();
+	if (ImGui::TreeNodeEx("Sun Shadows", ImGuiTreeNodeFlags_DefaultOpen)) {
 		// (45l) Five tiers + Custom; picking Custom starts from the tier that was selected.
 		settings.QualityLevel = std::clamp(settings.QualityLevel, 0, static_cast<int>(Quality::Count) - 1);
 		{
@@ -3256,55 +3517,13 @@ void RayTracing::DrawSettings()
 			ImGui::TextWrapped("Characters was switched off automatically: %s", charactersOffReason.c_str());
 			ImGui::PopStyleColor();
 		}
-
-		const char* statusText = "Off";
-		ImVec4 color{ 0.7f, 0.7f, 0.7f, 1.0f };
-		switch (status) {
-		case Status::Off:
-			statusText = settings.Enabled ? "Starting" : "Off";
-			break;
-		case Status::Unavailable:
-			statusText = "Off, could not start (the game's shadows are used)";
-			color = { 1.0f, 0.4f, 0.3f, 1.0f };
-			break;
-		case Status::Failed:
-			statusText = "Off, stopped after an error (the game's shadows are used)";
-			color = { 1.0f, 0.4f, 0.3f, 1.0f };
-			break;
-		case Status::Inactive:
-			statusText = "Paused";
-			break;
-		case Status::Waiting:
-			statusText = "Loading the scene";
-			color = { 1.0f, 0.85f, 0.3f, 1.0f };
-			break;
-		case Status::Active:
-			statusText = "Active";
-			color = { 0.4f, 1.0f, 0.4f, 1.0f };
-			break;
-		}
-		ImGui::TextColored(color, "Status: %s", statusText);
-		if (!statusReason.empty()) {
-			if (status == Status::Unavailable || status == Status::Failed) {
-				// The reason is the whole point here (and can be long): its own wrapped line.
-				ImGui::PushStyleColor(ImGuiCol_Text, color);
-				ImGui::TextWrapped("Reason: %s", statusReason.c_str());
-				ImGui::PopStyleColor();
-			} else {
-				ImGui::SameLine();
-				ImGui::TextDisabled("(%s)", statusReason.c_str());
-			}
-		}
-		if (status == Status::Unavailable || status == Status::Failed) {
-			if (ImGui::Button("Try Again")) {
-				backendTried = false;
-				status = Status::Off;
-				statusReason.clear();
-			}
-		}
 		ImGui::TreePop();
 	}
+}
 
+void RayTracing::DrawPointLightPage()
+{
+	DrawMasterHeader();
 	// (46b) Point-light shadows.
 	if (ImGui::TreeNodeEx("Point Lights", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Ray-Traced Point-Light Shadows", &settings.PointLights);
@@ -3463,7 +3682,11 @@ void RayTracing::DrawSettings()
 		}
 		ImGui::TreePop();
 	}
+}
 
+void RayTracing::DrawAOPage()
+{
+	DrawMasterHeader();
 	// (46f) Ray-traced ambient occlusion.
 	if (ImGui::TreeNodeEx("Ambient Occlusion", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("RT Ambient Occlusion", &settings.AO);
@@ -3539,8 +3762,11 @@ void RayTracing::DrawSettings()
 		}
 		ImGui::TreePop();
 	}
+}
 
-	if (ImGui::TreeNodeEx("Debug")) {
+void RayTracing::DrawDiagnostics()
+{
+	if (ImGui::TreeNodeEx("Debug", ImGuiTreeNodeFlags_DefaultOpen)) {
 		const char* views[] = { "Off", "Shadow Source", "RT vs Shadow Map", "BLAS Coverage", "Raw RT Visibility", "RT Hit vs Depth", "Penumbra Radius",
 			"History Length", "Adaptive Rays", "SSS: RT Casters", "Distance Quality", "Character Rays", "Point Lights: Candidates", "Point Lights: Traced Lights",
 			"Point Lights: Raw Rays", "Point Lights: Denoised" };
@@ -3631,6 +3857,13 @@ void RayTracing::DrawSettings()
 		if (ImGui::TreeNodeEx("Details")) {
 			if (!lastLoadingSummary.empty())
 				ImGui::TextWrapped("Last loading screen: %s", lastLoadingSummary.c_str());
+			{
+				// (46g) GPU pools.
+				const auto& pools = backend.GetStats().pools;
+				ImGui::Text("  Pools: %s reserved in %u blocks, %s in use; blocks made behind loading / black screens %llu, on the pool thread %llu, released %llu",
+					Megabytes(pools.reservedBytes).c_str(), pools.blocks, Megabytes(pools.usedBytes).c_str(), static_cast<unsigned long long>(pools.syncBlocksTotal),
+					static_cast<unsigned long long>(pools.asyncBlocksTotal), static_cast<unsigned long long>(pools.blocksReleased));
+			}
 			if (!backend.AdapterDescription().empty())
 				ImGui::Text("GPU: %s", backend.AdapterDescription().c_str());
 			ImGui::Text("Cells: %u captured, %u loading, %u recaptured (total)", sc.cellsComplete, sc.cellsGathering, sc.recaptures);

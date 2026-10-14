@@ -10,6 +10,7 @@
 #include "FeatureIssues.h"
 #include "Fonts.h"
 #include "Globals.h"
+#include "Features/RayTracing.h"
 #include "Menu.h"
 #include "Menu/HomePageRenderer.h"
 #include "Menu/ThemeManager.h"
@@ -118,7 +119,7 @@ std::vector<FeatureListRenderer::MenuFuncInfo> FeatureListRenderer::BuildMenuLis
 	}
 
 	// Define category order
-	std::vector<std::string> categoryOrder = { "Display", "Debug", "Characters", "Grass", "Lighting", "Materials", "Post-Processing", "Sky", "Landscape & Textures", "Water", "Other" };
+	std::vector<std::string> categoryOrder = { "Display", "Debug", "Characters", "Grass", "Lighting", "Ray Tracing", "Materials", "Post-Processing", "Sky", "Landscape & Textures", "Water", "Other" };
 	// Add categorized features to menu with collapsible headers
 	for (const std::string& category : categoryOrder) {
 		if (categorizedFeatures.find(category) != categorizedFeatures.end() && !categorizedFeatures[category].empty()) {
@@ -133,6 +134,12 @@ std::vector<FeatureListRenderer::MenuFuncInfo> FeatureListRenderer::BuildMenuLis
 			// Add features only if category is expanded
 			if (categoryExpansionStates[category]) {
 				std::ranges::copy(categorizedFeatures[category], std::back_inserter(menuList));
+				// (46g) Ray Tracing: its feature entry (master switch, status, diagnostics) and one entry per part.
+				if (category == "Ray Tracing") {
+					menuList.push_back(BuiltInMenu{ "Sun Shadows", []() { globals::features::rayTracing.DrawSunPage(); } });
+					menuList.push_back(BuiltInMenu{ "Point Light Shadows", []() { globals::features::rayTracing.DrawPointLightPage(); } });
+					menuList.push_back(BuiltInMenu{ "Ambient Occlusion", []() { globals::features::rayTracing.DrawAOPage(); } });
+				}
 			}
 		}
 	}

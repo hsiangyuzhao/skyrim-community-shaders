@@ -98,7 +98,8 @@ namespace RayTracingCharacters
 		/// Drops everything on the next Update (loading screens, from any thread).
 		void RequestFlush() { flushRequested_.store(true); }
 		/// a_rect: world xy min / max of the traced area (actors outside are not taken).
-		void Update(RayTracingRT::Backend& a_backend, const float a_rect[4]);
+		/// (46g) a_budgetMs / a_maxCaptures: new shapes read this frame (larger behind loading / black screens).
+		void Update(RayTracingRT::Backend& a_backend, const float a_rect[4], double a_budgetMs = 1.0, std::uint32_t a_maxCaptures = 6);
 		/// This frame's draws (retiring ones too) and their bone matrices.
 		void CollectDraws(std::vector<RayTracingRT::SkinDraw>& o_draws, std::vector<float>& o_bones) const;
 		/// (46e) The characters of the last CollectDraws: reference -> key (SkinDraw::owner, 1..), sorted by pointer.

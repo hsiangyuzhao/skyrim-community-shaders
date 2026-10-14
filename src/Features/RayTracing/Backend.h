@@ -140,6 +140,42 @@ namespace RayTracingRT
 		std::uint64_t refused = 0;            // shapes refused: too big / bad data
 	};
 
+	/// (46g) A range carved out of one of the backend's GPU pools (GpuArena): no D3D12 resource of its own.
+	struct ArenaAlloc
+	{
+		std::uint32_t block = UINT32_MAX;
+		std::uint64_t offset = 0;
+		std::uint64_t size = 0;
+		[[nodiscard]] bool Valid() const { return block != UINT32_MAX; }
+	};
+
+	/// (46g) Where the CPU of the last PrepareFrame (Early Prep) went (ms; -1 = not run).
+	struct PrepSplit
+	{
+		float collect = -1;     // retired objects + pools (deferred frees, adopted blocks) + context choice
+		float timestamps = -1;  // read-back of completed contexts' GPU timestamps / counters
+		float reset = -1;       // command allocator + list Reset
+		float build = -1;       // BLAS builds / compactions recorded
+		float skin = -1;        // character uploads / skinning recorded
+		float close = -1;       // barriers, timestamps, list Close
+		float execute = -1;     // ExecuteCommandLists
+	};
+
+	/// (46g) The GPU pools: bytes reserved (the large buffers) and in use (allocations, frees not yet retired included).
+	struct PoolStats
+	{
+		std::uint64_t reservedBytes = 0;
+		std::uint64_t usedBytes = 0;
+		std::uint32_t blocks = 0;
+		std::uint32_t syncBlocksLastFrame = 0;   // created on the render thread this frame (loading screens / black screen only)
+		std::uint64_t syncBlocksTotal = 0;
+		std::uint64_t asyncBlocksTotal = 0;      // created on the pool thread
+		std::uint64_t blocksReleased = 0;
+		float pumpMsLastFrame = 0.0f;            // render-thread ms of the pool upkeep this frame (sync creations included)
+		float workerLastMs = 0.0f;               // the pool thread's last block creation
+		std::uint32_t allocFailsLastFrame = 0;   // allocations that had to wait for a new block
+	};
+
 	struct TraceConstants
 	{
 		float invViewProj[16];
@@ -244,6 +280,8 @@ namespace RayTracingRT
 		const std::vector<SkinDraw>* skinDraws = nullptr;
 		const std::vector<float>* skinBones = nullptr;
 		std::uint32_t maxBuilds = 0;  // (45k) BLAS builds / compactions this frame (0 = the default cap)
+		float buildCpuMs = 0.0f;      // (46g) render-thread CPU for BLAS builds / compactions this frame (0 = the play default)
+		float skinUploadCpuMs = 0.0f; // (46g) render-thread CPU for new character shapes this frame (0 = the play default)
 		// (45l) The D3D11 queue's wait for the trace is left to WaitForTrace() (called right before the
 		// first D3D11 pass that reads the result); false = waited at the end of ExecuteFrame (45k).
 		bool deferWait = false;
@@ -276,6 +314,12 @@ namespace RayTracingRT
 		float retire = 0;
 		std::uint32_t retiredCount = 0;
 		bool early = false;  // (45n) builds / skinning were recorded and submitted at the frame start (PrepareFrame)
+		// (46g) Taken out of collect / tlas / record (they no longer include these): GPU timestamp read-back, TLAS /
+		// instance buffer growth, descriptor publish, the RTAO list.
+		float timestamps = 0;
+		float ensure = 0;
+		float publish = 0;
+		float ao = 0;
 	};
 
 	/// (45f) TLAS contents and the placement self-check.
@@ -324,6 +368,8 @@ namespace RayTracingRT
 		float cpuRecordMs = 0.0f;
 		ExecuteSplit split{};  // (45k)
 		std::uint32_t loadingBuilds = 0;  // (45k) BLAS builds submitted by BuildOnly (loading screens) since start
+		PrepSplit prep{};                 // (46g) the last PrepareFrame, call by call
+		PoolStats pools{};                // (46g)
 		// (46b) Point-light trace: GPU ms of its dispatch (inside lastTraceGpuMs no more: lastTraceGpuMs is the sun's),
 		// rays traced per frame (counter read back with the timestamps; -1 = not known), last frame traced or not.
 		float lastPointGpuMs = -1.0f;
@@ -334,6 +380,68 @@ namespace RayTracingRT
 		std::int64_t aoRaysPerFrame = -1;
 		bool aoTracedLastFrame = false;
 		bool aoAlphaLastFrame = false;
+	};
+
+	/// (46g) GPU memory carved out of a few large committed buffers ("blocks"), so a BLAS or a character shape
+	/// costs no D3D12 resource creation on the render thread (CreateCommittedResource made resident and zeroed its
+	/// memory synchronously: 15-125 ms frames right after a cell transition). Ranges are freed behind a fence value
+	/// (the same rule as Backend::Retire). Blocks are created ahead of need: on the pool thread while playing, on the
+	/// render thread only behind a loading / black screen. Render thread only (except the creation itself).
+	struct GpuArena
+	{
+		struct Block
+		{
+			ComPtr<ID3D12Resource> resource;
+			std::byte* mapped = nullptr;   // upload pools: persistently mapped
+			D3D12_GPU_VIRTUAL_ADDRESS va = 0;
+			std::uint64_t size = 0;
+			std::uint64_t used = 0;        // allocated, deferred frees included
+			D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;  // whole-buffer state (pools that transition)
+			std::map<std::uint64_t, std::uint64_t> free;  // offset -> size
+			bool live = false;
+		};
+		struct Deferred
+		{
+			std::uint64_t fence;
+			ArenaAlloc alloc;
+			std::uint64_t* counter;  // stat to subtract alloc.size from once it is really free (may be null)
+			std::uint64_t bytes;
+		};
+
+		const wchar_t* name = L"";
+		const char* label = "";  // for the log
+		D3D12_HEAP_TYPE heap = D3D12_HEAP_TYPE_DEFAULT;
+		D3D12_RESOURCE_STATES createState = D3D12_RESOURCE_STATE_COMMON;
+		bool uav = false;
+		std::uint64_t blockBytes = 0;        // usual block size (a larger request gets a block of its own size)
+		std::uint64_t alignment = 256;
+		std::uint64_t headroom = 0;          // free bytes kept ready while playing (grown on the pool thread)
+		std::uint64_t transitionHeadroom = 0;  // ... behind loading / black screens (grown on the render thread)
+		std::uint64_t maxBytes = 0;          // hard cap of the reserved total
+
+		std::vector<Block> blocks;           // a released block's slot stays (dead) until reused
+		std::vector<Deferred> deferred;
+		std::uint64_t reserved = 0;
+		std::uint64_t used = 0;
+		std::uint64_t wantBytes = 0;         // an allocation that did not fit: the next block must hold it
+		bool requestInFlight = false;
+		bool failed = false;                 // a block could not be created (the owner decides what goes off)
+
+		bool Allocate(std::uint64_t a_bytes, ArenaAlloc& o_alloc);
+		void Free(const ArenaAlloc& a_alloc, std::uint64_t a_fence, std::uint64_t* a_counter = nullptr, std::uint64_t a_bytes = 0);
+		void Collect(std::uint64_t a_completed);
+		void Adopt(ComPtr<ID3D12Resource> a_resource, std::byte* a_mapped, std::uint64_t a_size);
+		[[nodiscard]] std::uint64_t FreeBytes() const { return reserved > used ? reserved - used : 0; }
+		[[nodiscard]] D3D12_GPU_VIRTUAL_ADDRESS Address(const ArenaAlloc& a_alloc) const { return blocks[a_alloc.block].va + a_alloc.offset; }
+		[[nodiscard]] ID3D12Resource* Resource(const ArenaAlloc& a_alloc) const { return blocks[a_alloc.block].resource.Get(); }
+		[[nodiscard]] std::byte* Mapped(const ArenaAlloc& a_alloc) const { return blocks[a_alloc.block].mapped + a_alloc.offset; }
+		void Reset()
+		{
+			blocks.clear();
+			deferred.clear();
+			reserved = used = wantBytes = 0;
+			requestInFlight = failed = false;
+		}
 	};
 
 	class Backend
@@ -382,8 +490,28 @@ namespace RayTracingRT
 		[[nodiscard]] bool TraceWaitPending() const { return pendingWait_ != 0; }
 		/// (45k) Loading screens: BLAS builds and compactions only (no trace, no D3D11 interop), with a
 		/// larger cap. Never waits; false when no command context is free or nothing is queued.
-		bool BuildOnly(std::uint32_t a_triangleBudget, std::uint32_t a_maxBuilds);
+		/// (46g) a_cpuMs: render-thread budget for the builds / compactions / character uploads of this submission.
+		bool BuildOnly(std::uint32_t a_triangleBudget, std::uint32_t a_maxBuilds, float a_cpuMs = 2.0f);
 		[[nodiscard]] std::uint32_t QueuedBuilds() const { return static_cast<std::uint32_t>(buildQueue_.size()); }
+		/// (46g) Character shapes created but not uploaded yet.
+		[[nodiscard]] std::uint32_t PendingSkinUploads() const { return static_cast<std::uint32_t>(skinUploadQueue_.size()); }
+		/// (46g) Behind a loading screen or the black screen after it: the pools grow to their larger headroom on the
+		/// render thread (nothing is visible), scratch / TLAS / per-context buffers are sized ahead (Prewarm).
+		void SetTransition(bool a_transition) { transition_ = a_transition; }
+		/// (46g) Start of a frame: the per-frame pool counters start from zero.
+		void BeginFrame()
+		{
+			stats_.pools.syncBlocksLastFrame = 0;
+			stats_.pools.allocFailsLastFrame = 0;
+			stats_.pools.pumpMsLastFrame = 0.0f;
+			stats_.prep = {};
+		}
+		[[nodiscard]] bool InTransition() const { return transition_; }
+		/// (46g) Grows what a destination's first frames would otherwise create on the render thread: pool headroom,
+		/// the shared scratch buffers, the TLAS and the free contexts' instance / bone buffers. Bounded by a_cpuMs.
+		void Prewarm(float a_cpuMs, bool a_characters);
+		/// (46g) Character uploads made since start (for the per-phase transition log).
+		[[nodiscard]] std::uint64_t SkinUploadsTotal() const { return skinUploadsTotal_; }
 
 		/// (45e) True when ExecuteFrame will find a free command context. Only the GPU completing
 		/// work can change the answer from false to true, never back, so a yes at the start of the
@@ -515,12 +643,16 @@ namespace RayTracingRT
 
 	private:
 		static constexpr std::size_t kContexts = 8;
-		static constexpr std::uint32_t kPostbuildSlots = 1024;
-		// (45e) small object meshes arrive in bursts. (45j) 48 -> 16: every build creates a committed
-		// resource on the render thread (and its compaction a second one later); bursts of them were
-		// CPU spikes of several ms.
-		static constexpr std::size_t kMaxBuildsPerFrame = 16;
-		static constexpr std::uint32_t kMaxCompactionsPerFrame = 16;  // (45j) the rest wait for the next frame
+		// (46g) 1024 -> 16384: with loading-screen batches a slot could be reused before its BLAS read it (an owner
+		// check now drops the compaction of such a BLAS instead of reading another build's size).
+		static constexpr std::uint32_t kPostbuildSlots = 16384;
+		// (45e) small object meshes arrive in bursts. (45j) 48 -> 16: every build created a committed
+		// resource on the render thread. (46g) Pools: no creation per build any more; a CPU-time budget per frame
+		// (FrameInput::buildCpuMs, kPlayBuildCpuMs) bounds the work, this count only bounds one submission.
+		static constexpr std::size_t kMaxBuildsPerFrame = 64;
+		static constexpr std::uint32_t kMaxCompactionsPerFrame = 64;  // (45j) the rest wait for the next frame
+		static constexpr float kPlayBuildCpuMs = 2.0f;                // (46g) BLAS builds + compactions per frame while playing
+		static constexpr float kPlaySkinUploadCpuMs = 1.0f;           // (46g) new character shapes per frame while playing
 		// Both on D3D11's guaranteed-shareable list; the shaders' declared types follow these.
 		static constexpr DXGI_FORMAT kDepthMaskFormat = DXGI_FORMAT_R32_FLOAT;        // depth; negative = engine mask already 0
 		static constexpr DXGI_FORMAT kVisibilityFormat = DXGI_FORMAT_R8G8B8A8_UNORM;  // r visibility, g coverage
@@ -585,7 +717,7 @@ namespace RayTracingRT
 		{
 			BlasState state = BlasState::Free;
 			std::unique_ptr<ChunkGeometry> geometry;
-			ComPtr<ID3D12Resource> resource;
+			ArenaAlloc alloc;  // (46g) in asPool_ (was a committed resource per BLAS)
 			std::uint64_t bytes = 0;
 			std::uint32_t triangles = 0;
 			std::uint32_t postbuildSlot = UINT32_MAX;
@@ -649,8 +781,7 @@ namespace RayTracingRT
 		static constexpr std::uint32_t kSkinMaxVertices = 65536;          // per shape (16-bit indices in the game's data)
 		static constexpr std::uint32_t kSkinMaxTriangles = 131072;        // per shape
 		static constexpr std::uint32_t kSkinMaxBones = 256;               // per shape (8-bit bone indices)
-		static constexpr std::uint32_t kSkinUploadsPerFrame = 4;          // new shapes made per frame (45k: 8 -> 4, plus a CPU budget)
-		static constexpr double kSkinUploadBudgetMs = 1.0;                // (45k) buffer creation per frame (at least one shape)
+		static constexpr std::uint32_t kSkinUploadsPerFrame = 64;         // new shapes made per submission (46g: pools, a CPU budget bounds it)
 		static constexpr std::uint32_t kSkinUploadVerticesPerFrame = 400000;
 		static constexpr std::uint32_t kSkinBuildsPerFrame = 8;           // first builds per frame (refits are never capped)
 		static constexpr std::uint32_t kSkinRebuildsPerFrame = 2;         // periodic rebuilds per frame
@@ -662,9 +793,10 @@ namespace RayTracingRT
 			bool live = false;
 			bool uploaded = false;  // buffers created and filled
 			bool built = false;     // BLAS built at least once
-			bool outputInUav = true;
 			std::unique_ptr<SkinGeometry> geometry;  // until uploaded
-			ComPtr<ID3D12Resource> rest, index, output, blas;
+			// (46g) Pool ranges (were four committed resources per shape): rest + index in skinStaticPool_, the skinned
+			// vertices in skinOutputPool_, the BLAS in asPool_.
+			ArenaAlloc rest, index, output, blas;
 			std::uint64_t restBytes = 0, indexBytes = 0, outputBytes = 0, blasBytes = 0;
 			std::uint64_t buildScratch = 0, updateScratch = 0;
 			std::uint32_t vertices = 0, triangles = 0, boneCount = 0;
@@ -676,7 +808,7 @@ namespace RayTracingRT
 
 		bool CreateSkinPipelines();
 		void SetSkinFault(std::string a_reason);
-		void UploadSkinShapes(ID3D12GraphicsCommandList4* a_list);
+		void UploadSkinShapes(ID3D12GraphicsCommandList4* a_list, float a_cpuMs);
 		/// Skins this frame's draws, builds / refits their BLASes; o_ready[i] = draw i can be traced.
 		void RecordSkinning(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, const FrameInput& a_input,
 			std::vector<std::uint8_t>& o_ready);
@@ -710,8 +842,47 @@ namespace RayTracingRT
 		bool EnsureScratch(std::uint64_t a_bytes);
 		bool EnsureTlas(std::uint32_t a_instances);
 		bool EnsureInstanceBuffer(CommandContext& a_context, std::uint32_t a_instances);
-		void ProcessCompaction(ID3D12GraphicsCommandList4* a_list, std::uint64_t a_completed, std::uint32_t a_max);
-		std::uint32_t BuildQueued(ID3D12GraphicsCommandList4* a_list, std::uint32_t a_budget, std::size_t a_maxBuilds);
+		void ProcessCompaction(ID3D12GraphicsCommandList4* a_list, std::uint64_t a_completed, std::uint32_t a_max, std::int64_t a_deadline);
+		std::uint32_t BuildQueued(ID3D12GraphicsCommandList4* a_list, std::uint32_t a_budget, std::size_t a_maxBuilds, std::int64_t a_deadline);
+
+		// (46g) GPU pools.
+		GpuArena asPool_;           // BLAS results, compacted copies, character BLASes (acceleration-structure state, never transitioned)
+		GpuArena uploadPool_;       // geometry uploads (upload heap, mapped), freed behind the submission's fence
+		GpuArena skinStaticPool_;   // character rest vertices + indices (copy dest -> non-pixel SRV per block)
+		GpuArena skinOutputPool_;   // character skinned vertices (UAV <-> non-pixel SRV per block)
+		bool transition_ = false;
+		std::uint64_t skinUploadsTotal_ = 0;
+		std::vector<std::uint64_t> postbuildOwner_;  // per slot: (handle + 1) of the BLAS that owns it, 0 = none
+		std::array<GpuArena*, 4> Pools() { return { &asPool_, &uploadPool_, &skinStaticPool_, &skinOutputPool_ }; }
+		void InitPools();
+		/// Deferred frees, finished pool-thread blocks, growth requests (sync behind loading / black screens), empty
+		/// blocks released. Every frame from CollectRetired.
+		void PumpPools();
+		ComPtr<ID3D12Resource> CreatePoolBuffer(const GpuArena& a_pool, std::uint64_t a_bytes, std::byte** o_mapped);
+		/// Records whole-block transitions of every block in a_blocks of a_pool to a_state.
+		void TransitionBlocks(ID3D12GraphicsCommandList4* a_list, GpuArena& a_pool, const std::vector<std::uint32_t>& a_blocks, D3D12_RESOURCE_STATES a_state);
+		void StopPoolThread();
+		void PoolThreadMain();
+		struct PoolRequest
+		{
+			std::uint32_t pool;
+			std::uint64_t bytes;
+		};
+		struct PoolResult
+		{
+			std::uint32_t pool;
+			std::uint64_t bytes;
+			ComPtr<ID3D12Resource> resource;
+			std::byte* mapped;
+		};
+		std::thread poolThread_;
+		std::mutex poolMutex_;
+		std::condition_variable poolCv_;
+		std::vector<PoolRequest> poolRequests_;
+		std::vector<PoolResult> poolResults_;
+		bool poolStop_ = false;
+		std::atomic<float> poolWorkerMs_{ 0.0f };
+		std::atomic<bool> notZeroed_{ true };  // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED accepted (cleared on its first refusal)
 		BlasHandle AllocateHandle();
 		void CheckInstance(const D3D12_RAYTRACING_INSTANCE_DESC& a_desc, const Instance& a_instance, const Blas& a_blas, const FrameInput& a_input);
 

@@ -348,6 +348,15 @@ namespace Util::FrameTrace
 				out << "# (46f) rtao_gpu_ms = RTAO rays on the D3D12 queue (own list after the sun trace, -1 = not traced); rtao_filter_gpu_ms = its D3D11 filter +\n";
 				out << "#   history + composite; rtao_sync_gpu_ms = the game queue standing still at the wait for its second fence (right before the AO is used);\n";
 				out << "#   rtao_rays = RTAO rays per frame (read back a few frames late, -1 = not known, 0 = not traced). RTAO settings: see the ray tracing line.\n";
+				out << "# (46g) rt_phase also 3 = black screen before the hand-off. rt_black = the black screen after a loading screen (Fader Menu open);\n";
+				out << "#   rt_since_close_ms = ms since the loading screen closed (-1 = no transition); rt_handoff = 1 on the frame every ready cell / object switched\n";
+				out << "#   from the shadow map to RT (one global switch per transition); rt_held_ready / rt_held_pending = items held back then (-1 = no hold).\n";
+				out << "#   rt_e_* = Early Prep (PrepareFrame) call by call: retired objects + pools + context choice, GPU timestamp read-back, allocator/list Reset,\n";
+				out << "#   BLAS builds, character uploads + skinning, barriers + Close, ExecuteCommandLists (with the characters they add up to rt_early_ms).\n";
+				out << "#   rt_x_timestamps / ensure / publish / ao = taken out of rt_x_collect / tlas / record: timestamp read-back, TLAS + instance buffer growth,\n";
+				out << "#   descriptor publish, the RTAO list (rt_x_execute now also holds the first ExecuteCommandLists).\n";
+				out << "#   rt_pool_ms = render-thread pool upkeep (deferred frees, finished blocks, growth); rt_pool_sync_blocks = blocks created on the render\n";
+				out << "#   thread (loading / black screen only); rt_pool_mb = MB reserved; rt_pool_waits = allocations waiting for a new block; rt_pool_worker_ms = last block on the pool thread.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -371,6 +380,9 @@ namespace Util::FrameTrace
 				       "rt_pl_k,rt_pl_sources,rt_pl_candidates,rt_pl_rays,rt_pl_gpu_ms,rt_pl_denoise_gpu_ms,rt_pl_cpu_ms,rt_interior,rt_pl_beams,rt_sm_skipped,rt_mask_channels,rt_interior_shapes,"
 				       "ssrt_reblur_gpu_ms,ssrt_trace_diffuse_gpu_ms,ssrt_trace_specular_gpu_ms,ssgi_gpu_ms,ssgi_contact_ao_gpu_ms,rt_pl_carried,"
 				       "rtao_gpu_ms,rtao_filter_gpu_ms,rtao_sync_gpu_ms,rtao_rays,"
+				       "rt_black,rt_since_close_ms,rt_handoff,rt_held_ready,rt_held_pending,rt_e_collect_ms,rt_e_timestamps_ms,rt_e_reset_ms,rt_e_build_ms,rt_e_skin_ms,"
+				       "rt_e_close_ms,rt_e_execute_ms,rt_x_timestamps_ms,rt_x_ensure_ms,rt_x_publish_ms,rt_x_ao_ms,rt_pool_ms,rt_pool_sync_blocks,rt_pool_mb,rt_pool_waits,"
+				       "rt_pool_worker_ms,"
 				       "cpu_top_features\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
@@ -403,6 +415,11 @@ namespace Util::FrameTrace
 						a_row.ssPassMs[4], t.plCarried);
 					// (46f)
 					s += std::format(",{:.3f},{:.3f},{:.3f},{}", t.rtaoGpuMs, t.rtaoFilterGpuMs, t.rtaoSyncGpuMs, t.rtaoRays);
+					// (46g)
+					s += std::format(",{},{:.1f},{},{},{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}", t.black, t.sinceCloseMs, t.handOff, t.heldReady, t.heldPending,
+						t.eCollect, t.eTimestamps, t.eReset, t.eBuild, t.eSkin, t.eClose, t.eExecute);
+					s += std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{:.1f},{},{:.3f}", t.xTimestamps, t.xEnsure, t.xPublish, t.xAo, t.poolMs, t.poolSyncBlocks,
+						t.poolMb, t.poolAllocFails, t.poolWorkerMs);
 					s += "," + a_row.cpuTop + "\n";
 					return s;
 				};

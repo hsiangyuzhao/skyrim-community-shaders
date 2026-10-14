@@ -107,6 +107,17 @@ namespace Util::FrameTrace
 		// rays per frame (read back a few frames late; -1 = not known, 0 = not traced).
 		float rtaoGpuMs = -1.0f, rtaoFilterGpuMs = -1.0f, rtaoSyncGpuMs = -1.0f;
 		int64_t rtaoRays = 0;
+		// (46g) Transitions and the pools: black screen (Fader Menu after a loading screen), ms since the loading screen closed
+		// (-1 = no transition), hand-off this frame, items held back (ready / not ready); Early Prep call by call; the
+		// parts taken out of rt_x_collect / tlas / record; pool upkeep ms, blocks made on the render thread, MB reserved,
+		// allocations that waited for a block, the pool thread's last block ms.
+		int black = 0, handOff = 0;
+		float sinceCloseMs = -1.0f;
+		int heldReady = -1, heldPending = -1;
+		float eCollect = -1, eTimestamps = -1, eReset = -1, eBuild = -1, eSkin = -1, eClose = -1, eExecute = -1;
+		float xTimestamps = -1, xEnsure = -1, xPublish = -1, xAo = -1;
+		float poolMs = -1, poolMb = -1, poolWorkerMs = -1;
+		uint32_t poolSyncBlocks = 0, poolAllocFails = 0;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

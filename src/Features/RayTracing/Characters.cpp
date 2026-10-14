@@ -12,8 +12,6 @@ namespace RayTracingCharacters
 	namespace
 	{
 		constexpr std::uint32_t kMaxNodesPerActor = 4096;
-		constexpr std::uint32_t kCapturesPerFrame = 6;     // new shapes read per frame
-		constexpr double kCaptureBudgetMs = 1.0;           // CPU for new shapes per frame (at least one)
 		constexpr std::uint32_t kMaxPartitions = 64;
 		constexpr std::uint32_t kPlacementSamples = 64;
 		constexpr std::uint32_t kLogLimit = 16;
@@ -884,7 +882,7 @@ namespace RayTracingCharacters
 		return shape;
 	}
 
-	void Characters::Update(RayTracingRT::Backend& a_backend, const float a_rect[4])
+	void Characters::Update(RayTracingRT::Backend& a_backend, const float a_rect[4], double a_budgetMs, std::uint32_t a_maxCaptures)
 	{
 		const std::int64_t start = Qpc();
 		if (flushRequested_.exchange(false))
@@ -960,7 +958,7 @@ namespace RayTracingCharacters
 		}
 
 		// 3. Shapes: new ones captured (within the budget), changed / gone ones retire.
-		const std::int64_t deadline = start + static_cast<std::int64_t>(kCaptureBudgetMs / std::max(QpcMs(), 1e-9));
+		const std::int64_t deadline = start + static_cast<std::int64_t>(a_budgetMs / std::max(QpcMs(), 1e-9));
 		std::uint32_t captures = 0;
 		static thread_local std::vector<Found> found;
 		for (auto& actor : actors_) {
@@ -990,7 +988,7 @@ namespace RayTracingCharacters
 					actor->refused.insert(entry.signature);
 					continue;
 				}
-				if (captures >= kCapturesPerFrame || (captures > 0 && Qpc() >= deadline))
+				if (captures >= a_maxCaptures || (captures > 0 && Qpc() >= deadline))
 					break;
 				++captures;
 				auto shape = Capture(a_backend, *actor, entry.geometry, entry.signature);

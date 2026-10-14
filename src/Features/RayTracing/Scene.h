@@ -285,6 +285,32 @@ namespace RayTracingScene
 		/// True once at least one cell is captured with all its BLASes built.
 		[[nodiscard]] bool HasCoverage() const { return cellsReady_ > 0; }
 
+		/// (46g) Hand-off hold (cell transitions): while held, a cell / object / cut-out whose BLAS is ready is neither
+		/// traced nor taken out of the cascades -- it waits for HandOff(), which switches every ready item at once (one
+		/// global switch per transition instead of objects popping from the shadow map to RT one by one). Off: an item
+		/// is handed off as soon as it is ready (a whole cell at once), as while walking outdoors.
+		void SetHold(bool a_hold) { hold_ = a_hold; }
+		[[nodiscard]] bool Held() const { return hold_; }
+		struct HandOffCounts
+		{
+			std::uint32_t shown = 0;    // items switched now
+			std::uint32_t pending = 0;  // captured items not ready yet (BLAS / texture), or cells still being captured
+		};
+		/// Every ready item is handed off now (registered with the caster filter on the next Update).
+		HandOffCounts HandOff(const RayTracingRT::Backend& a_backend);
+		/// Items held back now: ready ones and not ready ones.
+		[[nodiscard]] HandOffCounts HeldCounts(const RayTracingRT::Backend& a_backend) const;
+		/// (46g) Cell transitions: on the next flush the cells attached then (the place being left) are remembered and
+		/// not captured again while a_on (behind the loading screen the old grid is still attached); new cells settle
+		/// faster. Off forgets them.
+		void SetTransition(bool a_on)
+		{
+			transition_ = a_on;
+			if (!a_on)
+				departing_.clear();
+		}
+		[[nodiscard]] std::uint32_t DepartingSkipped() const { return departingSkipped_; }
+
 		/// (46c) Interiors: whether the player's interior cell may be captured (Ray Tracing's point lights indoors).
 		/// Off: Update drops an interior capture (and never starts one), as before 46c.
 		void SetInteriorEnabled(bool a_enabled) { interiorEnabled_ = a_enabled; }
@@ -347,6 +373,7 @@ namespace RayTracingScene
 			RayTracingRT::BlasHandle blas = RayTracingRT::kInvalidBlas;
 			bool registered = false;  // in the caster filter
 			bool ready = false;       // (45j) BLAS (and texture) ready: in the TLAS
+			bool shown = false;       // (46g) handed off: in the TLAS and (unless Foliage Both) out of the cascades
 			bool foliage = false;     // (45j) a vegetation cut-out (Foliage setting)
 			// (45h) Alpha-tested: its texture and record (both released with the shape).
 			bool alpha = false;
@@ -387,6 +414,7 @@ namespace RayTracingScene
 			const RE::NiAVObject* resumeRoot = nullptr;
 			// (45h) Alpha-tested shapes of the cell: own BLAS per mesh and instance per shape (like objects).
 			std::vector<ObjectShape> alphaShapes;
+			bool shown = false;  // (46g) handed off: its chunks are traced (all built), its shapes leave the cascades
 			bool filterRegistered = false;
 			bool replaces = false;   // (45e) a re-capture of a cell whose old capture is still live
 			bool replacing = false;  // (45e) an old capture waiting for its replacement
@@ -554,6 +582,12 @@ namespace RayTracingScene
 		std::size_t scanCursor_ = 0;
 		std::size_t scanCell_ = 0;
 		std::atomic<bool> flushRequested_{ false };
+		// (46g) Hand-off hold and the cells of the place being left.
+		bool hold_ = false;
+		bool transition_ = false;
+		bool departingPending_ = false;  // the next Update takes the attached cells as departing (after a flush)
+		std::vector<const RE::TESObjectCELL*> departing_;
+		std::uint32_t departingSkipped_ = 0;
 		std::size_t validationCursor_ = 0;
 		std::uint32_t cellsReady_ = 0;
 		Stats stats_{};

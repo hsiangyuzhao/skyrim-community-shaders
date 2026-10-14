@@ -32,7 +32,7 @@ struct RayTracing : Feature
 public:
 	virtual inline std::string GetName() override { return "Ray Tracing"; }
 	virtual inline std::string GetShortName() override { return "RayTracing"; }
-	virtual inline std::string_view GetCategory() const override { return "Lighting"; }
+	virtual inline std::string_view GetCategory() const override { return "Ray Tracing"; }  // (46g) its own category
 	virtual inline bool SupportsVR() override { return false; }
 	/// (46b) Lighting / Water read the ray-traced point-light shadows (RayTracing/PointLightShadows.hlsli); inert per light
 	/// unless Light Limit Fix tags it (Light::rtShadow), so the old path is taken whenever nothing is traced.
@@ -185,6 +185,12 @@ public:
 	};
 
 	virtual void DrawSettings() override;
+	// (46g) The Ray Tracing category: the feature entry (master switch, status, diagnostics) and three more entries.
+	void DrawMasterHeader();
+	void DrawSunPage();
+	void DrawPointLightPage();
+	void DrawAOPage();
+	void DrawDiagnostics();
 	virtual void LoadSettings(json& o_json) override;
 	virtual void SaveSettings(json& o_json) override;
 	virtual void RestoreDefaultSettings() override;
@@ -206,6 +212,8 @@ public:
 	/// A loading screen opened (any thread): every captured cell is dropped on the next frame.
 	/// (45k) a_open false: it closed (the warm-up starts).
 	void OnLoadingScreen(bool a_open);
+	/// (46g) Fader Menu open / closed (the black screen after a loading screen), from the UI thread.
+	void OnFader(bool a_open) { faderOpen.store(a_open); }
 	/// (45k) Screen Space Shadows Prepass: true = Ray Tracing draws them this frame (non-RT casters only,
 	/// after its trace, with its caster mask); it then always calls ScreenSpaceShadows::DrawDeferred once.
 	bool ClaimScreenSpaceShadows();
@@ -377,11 +385,15 @@ private:
 	// (45k) Loading screens and the warm-up after them.
 	std::atomic<bool> loadingOpen{ false };
 	std::atomic<bool> loadingClosed{ false };  // set by the menu event, consumed on the render thread
+	// (46g) Black: the loading screen closed, the screen is still black (Fader Menu open). Nothing visible: large
+	// budgets, the hand-off and the first traced frames (denoiser history) happen here when the scene is ready.
+	// WarmUp: visible, not handed off yet (moderate budgets). Play: handed off (the fade may still run).
 	enum class Phase
 	{
 		Play,
 		Loading,
-		WarmUp
+		WarmUp,
+		Black
 	};
 	Phase phase = Phase::Play;
 	std::int64_t warmUpStart = 0;      // QPC when the loading screen closed
@@ -390,6 +402,37 @@ private:
 	float lastTimeToReadyMs = -1.0f;
 	std::string lastLoadingSummary;
 	void UpdatePhase();
+	// (46g) Transitions: the Fader Menu (black screen after a loading screen), the one global hand-off, the late batch.
+	std::atomic<bool> faderOpen{ false };
+	bool blackScreen = false;          // this frame: after a loading screen, the Fader Menu still open (F7 rt_black)
+	bool inTransition = false;         // from the loading screen opening until the late batch is handed off
+	bool handedOff = true;
+	std::int64_t handOffQpc = 0;
+	bool lateHold = false;             // after the hand-off: items not ready then wait for one late batch
+	std::int64_t lateHoldUntil = 0;
+	void HandOffNow(const char* a_when);
+	/// (46g) Loading / black screen, or visible before the hand-off: capture, builds, character uploads, pool growth; no trace.
+	void TransitionFrame();
+	struct TransitionPhaseLog
+	{
+		std::uint32_t frames = 0;
+		double wallStartQpc = 0.0, wallEndQpc = 0.0;
+		double rtCpuMs = 0.0;
+		std::uint64_t buildsAtStart = 0, buildsAtEnd = 0;
+		std::uint64_t uploadsAtStart = 0, uploadsAtEnd = 0;
+		std::uint64_t poolBlocksSync = 0, poolBlocksAsync = 0;
+		std::uint32_t shapesAtEnd = 0;
+		bool seen = false;
+	};
+	// [0] loading screen, [1] black screen, [2] visible before the hand-off, [3] the first 3 s after the hand-off.
+	std::array<TransitionPhaseLog, 4> transitionLog{};
+	int transitionLogSlot = -1;
+	std::int64_t transitionLogEndQpc = 0;
+	std::string handOffSummary;
+	void TransitionLogFrame(float a_rtCpuMs);
+	void TransitionLogFlush();
+	std::uint32_t beginFrameIndex = UINT32_MAX;  // (46g) frame of the last Backend::BeginFrame
+	bool handOffThisFrame = false;               // (46g) F7 rt_handoff
 	/// Off, Penumbra, DLSS RR or SIGMA; anything else (the removed Temporal = 1) reads as Penumbra.
 	[[nodiscard]] static int ValidDenoiser(int a_value)
 	{

@@ -68,6 +68,17 @@ namespace RayTracingRT
 			}();
 			return static_cast<double>(a_ticks) * toMs;
 		}
+
+		// (46g) A CPU budget in QPC ticks.
+		std::int64_t MsToQpc(double a_ms)
+		{
+			static const double perMs = [] {
+				LARGE_INTEGER f;
+				QueryPerformanceFrequency(&f);
+				return static_cast<double>(f.QuadPart) / 1000.0;
+			}();
+			return static_cast<std::int64_t>(a_ms * perMs);
+		}
 	}
 
 	// Process exit: no GPU wait (the GPU work of a closing game does not matter any more).
@@ -76,6 +87,8 @@ namespace RayTracingRT
 	{
 		if (releaseThread_.joinable())
 			releaseThread_.detach();
+		if (poolThread_.joinable())
+			poolThread_.detach();  // (46g) likewise
 		Shutdown(false);
 	}
 
@@ -213,6 +226,7 @@ namespace RayTracingRT
 				return fail("could not map the BLAS compaction readback buffer");
 			postbuildMapped_ = static_cast<const std::uint64_t*>(mapped);
 		}
+		InitPools();  // (46g)
 
 		std::string pipelineReason;
 		if (!CreatePipeline(pipelineReason))
@@ -948,6 +962,11 @@ namespace RayTracingRT
 		ready_ = false;
 		// (45n) Whatever the release thread still holds goes first (it never touches anything else of ours).
 		StopReleaseThread();
+		StopPoolThread();  // (46g) before the device goes
+		for (auto* pool : Pools())
+			pool->Reset();
+		postbuildOwner_.clear();
+		transition_ = false;
 		prepared_ = false;
 		preparedContext_ = 0;
 		retireAhead_ = 1;
@@ -1307,6 +1326,7 @@ namespace RayTracingRT
 		CollectAlphaRetired(completed);
 		stats_.retiredLastCollect = count;
 		stats_.retireLastMs = static_cast<float>(QpcToMs(QpcNow() - start));
+		PumpPools();  // (46g) deferred pool frees, finished blocks, growth
 	}
 
 	void Backend::ReleaseThreadMain()
@@ -1496,8 +1516,10 @@ namespace RayTracingRT
 			stats_.blasTriangles -= std::min<std::uint64_t>(stats_.blasTriangles, blas.triangles);
 			stats_.blasCount -= std::min<std::uint32_t>(stats_.blasCount, 1);
 		}
-		if (blas.resource)
-			Retire(blas.resource, blas.bytes, &stats_.blasBytes);
+		if (blas.alloc.Valid())
+			asPool_.Free(blas.alloc, RetireValue(), &stats_.blasBytes, blas.bytes);
+		if (blas.postbuildSlot < kPostbuildSlots && blas.postbuildSlot < postbuildOwner_.size())
+			postbuildOwner_[blas.postbuildSlot] = 0;
 		if (blas.uvOffset != UINT32_MAX)
 			FreeAlphaUv(blas.uvOffset, blas.uvCount);
 		blas = {};
@@ -1583,36 +1605,43 @@ namespace RayTracingRT
 		return true;
 	}
 
-	void Backend::ProcessCompaction(ID3D12GraphicsCommandList4* a_list, std::uint64_t a_completed, std::uint32_t a_max)
+	void Backend::ProcessCompaction(ID3D12GraphicsCommandList4* a_list, std::uint64_t a_completed, std::uint32_t a_max, std::int64_t a_deadline)
 	{
 		stats_.compactionsLastFrame = 0;
 		std::uint32_t created = 0;
-		for (auto& blas : blas_) {
+		for (std::size_t h = 0; h < blas_.size(); ++h) {
+			auto& blas = blas_[h];
 			if (blas.state != BlasState::Built || blas.buildFence == 0 || blas.buildFence > a_completed)
 				continue;
-			// (45j) A bounded number of new buffers per frame; the rest stay usable (Built) until a later frame.
-			if (created >= a_max)
+			// (45j) A bounded number per frame; the rest stay usable (Built) until a later frame. (46g) And a CPU budget.
+			if (created >= a_max || (created > 0 && QpcNow() >= a_deadline))
 				break;
-			const std::uint64_t compactedSize = blas.postbuildSlot < kPostbuildSlots ? postbuildMapped_[blas.postbuildSlot] : 0;
+			// (46g) The slot may have been taken by a newer build since (owner check): no compaction then.
+			const bool slotOwned = blas.postbuildSlot < kPostbuildSlots && blas.postbuildSlot < postbuildOwner_.size() &&
+			                       postbuildOwner_[blas.postbuildSlot] == static_cast<std::uint64_t>(h) + 1;
+			const std::uint64_t compactedSize = slotOwned ? postbuildMapped_[blas.postbuildSlot] : 0;
+			if (slotOwned)
+				postbuildOwner_[blas.postbuildSlot] = 0;
 			blas.postbuildSlot = UINT32_MAX;
 			const std::uint64_t bytes = Align(compactedSize, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
-			// Not worth a second buffer when it saves under 10 %.
+			// Not worth a second range when it saves under 10 %.
 			if (compactedSize == 0 || bytes * 10 >= blas.bytes * 9) {
 				blas.state = BlasState::Ready;
 				continue;
 			}
-			++created;
-			auto compacted = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
-			if (!compacted) {
+			ArenaAlloc compacted;
+			if (!asPool_.Allocate(bytes, compacted)) {
+				// (46g) The pool grows (next frames); this BLAS stays usable uncompacted.
+				++stats_.pools.allocFailsLastFrame;
 				blas.state = BlasState::Ready;
 				continue;
 			}
-			compacted->SetName(L"CS RayTracing BLAS (compacted)");
-			a_list->CopyRaytracingAccelerationStructure(compacted->GetGPUVirtualAddress(), blas.resource->GetGPUVirtualAddress(),
+			++created;
+			a_list->CopyRaytracingAccelerationStructure(asPool_.Address(compacted), asPool_.Address(blas.alloc),
 				D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
 			stats_.compactedSavedBytes += blas.bytes - bytes;
-			Retire(blas.resource, blas.bytes, &stats_.blasBytes);
-			blas.resource = std::move(compacted);
+			asPool_.Free(blas.alloc, RetireValue(), &stats_.blasBytes, blas.bytes);
+			blas.alloc = compacted;
 			blas.bytes = bytes;
 			stats_.blasBytes += bytes;
 			blas.state = BlasState::Ready;
@@ -1620,65 +1649,104 @@ namespace RayTracingRT
 		}
 	}
 
-	std::uint32_t Backend::BuildQueued(ID3D12GraphicsCommandList4* a_list, std::uint32_t a_budget, std::size_t a_maxBuilds)
+	std::uint32_t Backend::BuildQueued(ID3D12GraphicsCommandList4* a_list, std::uint32_t a_budget, std::size_t a_maxBuilds, std::int64_t a_deadline)
 	{
 		std::uint32_t built = 0;
 		std::vector<std::uint32_t> slots;
+		if (!buildQueue_.empty() && (asPool_.failed || uploadPool_.failed)) {
+			// Out of video memory for a new block: as when a BLAS buffer could not be created before 46g.
+			Fail(asPool_.failed ? "BLAS pool block" : "upload pool block", E_OUTOFMEMORY);
+			return 0;
+		}
 
-		// (45e) This frame's batch: up to the triangle budget and kMaxBuildsPerFrame builds (many
-		// small object meshes arrive at once), with ONE upload buffer for all of their geometry
-		// instead of a committed resource per build.
+		// (45e) This frame's batch: up to the triangle budget (one submission stays TDR-safe) and a_maxBuilds builds.
+		// (46g) Each BLAS is a range of asPool_ and its geometry a range of uploadPool_ (no resource creation): the
+		// render-thread cost is the size query and the copy, bounded by a_deadline. A BLAS whose range does not fit
+		// waits in the queue for the pool's next block.
 		struct Pending
 		{
 			BlasHandle handle;
-			std::uint64_t vertexOffset;
+			ArenaAlloc result;
+			ArenaAlloc upload;
+			std::uint64_t vertexOffset;  // inside the upload range
 			std::uint64_t indexOffset;
-			std::uint64_t uvOffset;  // (45h) alpha texcoords in the upload buffer (alpha BLASes only)
+			std::uint64_t uvOffset;  // (45h) alpha texcoords (alpha BLASes only)
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info;
 		};
 		std::vector<Pending> batch;
-		std::uint64_t uploadBytes = 0;
-		{
-			std::uint32_t batchTriangles = 0;
-			while (!buildQueue_.empty() && batch.size() < a_maxBuilds && (batch.empty() || batchTriangles < a_budget)) {
-				const BlasHandle handle = buildQueue_.front();
+		std::uint32_t batchTriangles = 0;
+		std::uint64_t scratchNeed = 0;
+		while (!buildQueue_.empty() && batch.size() < a_maxBuilds && (batch.empty() || (batchTriangles < a_budget && QpcNow() < a_deadline))) {
+			const BlasHandle handle = buildQueue_.front();
+			auto& blas = blas_[handle];
+			if (blas.state != BlasState::Queued || !blas.geometry) {
 				buildQueue_.pop_front();
-				auto& blas = blas_[handle];
-				if (blas.state != BlasState::Queued || !blas.geometry)
-					continue;
-				const ChunkGeometry& geometry = *blas.geometry;
-				Pending entry{ handle, Align(uploadBytes, 256), 0, 0 };
-				entry.indexOffset = Align(entry.vertexOffset + geometry.positions.size() * sizeof(float), 256);
-				uploadBytes = entry.indexOffset + geometry.indices.size() * sizeof(std::uint32_t);
-				if (!geometry.Opaque()) {
-					entry.uvOffset = Align(uploadBytes, 256);
-					uploadBytes = entry.uvOffset + geometry.alphaUV.size() * sizeof(std::uint32_t);
-				}
-				batchTriangles += geometry.Triangles();
-				batch.push_back(entry);
+				continue;
 			}
-		}
-		if (batch.empty())
-			return 0;
-		auto upload = CreateBuffer(uploadBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
-		std::byte* mapped = nullptr;
-		if (!upload || FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))) || !mapped) {
-			for (auto it = batch.rbegin(); it != batch.rend(); ++it)
-				buildQueue_.push_front(it->handle);
-			Fail("BLAS geometry upload", E_OUTOFMEMORY);
-			return 0;
-		}
-		for (const auto& entry : batch) {
-			const ChunkGeometry& geometry = *blas_[entry.handle].geometry;
-			std::memcpy(mapped + entry.vertexOffset, geometry.positions.data(), geometry.positions.size() * sizeof(float));
+			const ChunkGeometry& geometry = *blas.geometry;
+			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc{};
+			geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+			geometryDesc.Flags = geometry.Opaque() ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+			geometryDesc.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
+			geometryDesc.Triangles.VertexCount = geometry.Vertices();
+			geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+			geometryDesc.Triangles.IndexCount = static_cast<UINT>(geometry.indices.size());
+			geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+			inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+			inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
+			inputs.NumDescs = 1;
+			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+			inputs.pGeometryDescs = &geometryDesc;
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+			device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+			if (info.ResultDataMaxSizeInBytes == 0) {
+				// Degenerate input: drop it rather than retry forever.
+				buildQueue_.pop_front();
+				blas.geometry.reset();
+				blas.state = BlasState::Ready;
+				stats_.blasQueued -= std::min<std::uint32_t>(stats_.blasQueued, 1);
+				++stats_.blasCount;
+				continue;
+			}
+			Pending entry{ handle, {}, {}, 0, 0, 0, info };
+			if (!asPool_.Allocate(info.ResultDataMaxSizeInBytes, entry.result)) {
+				++stats_.pools.allocFailsLastFrame;
+				break;
+			}
+			entry.indexOffset = Align(geometry.positions.size() * sizeof(float), 256);
+			std::uint64_t uploadBytes = entry.indexOffset + geometry.indices.size() * sizeof(std::uint32_t);
+			if (!geometry.Opaque()) {
+				entry.uvOffset = Align(uploadBytes, 256);
+				uploadBytes = entry.uvOffset + geometry.alphaUV.size() * sizeof(std::uint32_t);
+			}
+			if (!uploadPool_.Allocate(uploadBytes, entry.upload)) {
+				asPool_.Free(entry.result, 0);  // never used
+				++stats_.pools.allocFailsLastFrame;
+				break;
+			}
+			std::byte* mapped = uploadPool_.Mapped(entry.upload);
+			std::memcpy(mapped, geometry.positions.data(), geometry.positions.size() * sizeof(float));
 			std::memcpy(mapped + entry.indexOffset, geometry.indices.data(), geometry.indices.size() * sizeof(std::uint32_t));
 			if (!geometry.Opaque())
 				std::memcpy(mapped + entry.uvOffset, geometry.alphaUV.data(), geometry.alphaUV.size() * sizeof(std::uint32_t));
+			scratchNeed = std::max(scratchNeed, info.ScratchDataSizeInBytes);
+			batchTriangles += geometry.Triangles();
+			buildQueue_.pop_front();
+			batch.push_back(entry);
 		}
-		upload->Unmap(0, nullptr);
-		upload->SetName(L"CS RayTracing BLAS upload");
+		if (batch.empty())
+			return 0;
 		// Freed once this submission completes.
-		Retire(upload, uploadBytes, &stats_.uploadBytes);
-		stats_.uploadBytes += uploadBytes;
+		for (const auto& entry : batch)
+			uploadPool_.Free(entry.upload, RetireValue());
+		if (!EnsureScratch(scratchNeed)) {
+			for (auto it = batch.rbegin(); it != batch.rend(); ++it) {
+				asPool_.Free(it->result, 0);
+				buildQueue_.push_front(it->handle);
+			}
+			return 0;
+		}
 
 		// (45h) Texcoords of alpha BLASes into the shared buffer (a range per BLAS, fixed for its life).
 		{
@@ -1692,64 +1760,37 @@ namespace RayTracingRT
 					const auto& blas = blas_[entry.handle];
 					if (blas.geometry->Opaque() || blas.uvOffset == UINT32_MAX)
 						continue;
-					a_list->CopyBufferRegion(alphaUv_.Get(), static_cast<std::uint64_t>(blas.uvOffset) * 8, upload.Get(), entry.uvOffset,
-						static_cast<std::uint64_t>(blas.uvCount) * 8);
+					a_list->CopyBufferRegion(alphaUv_.Get(), static_cast<std::uint64_t>(blas.uvOffset) * 8, uploadPool_.Resource(entry.upload),
+						entry.upload.offset + entry.uvOffset, static_cast<std::uint64_t>(blas.uvCount) * 8);
 				}
 				auto back = Transition(alphaUv_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 				a_list->ResourceBarrier(1, &back);
 			}
 		}
 
-		for (std::size_t b = 0; b < batch.size(); ++b) {
-			const BlasHandle handle = batch[b].handle;
-			auto& blas = blas_[handle];
+		for (const auto& entry : batch) {
+			auto& blas = blas_[entry.handle];
 			const ChunkGeometry& geometry = *blas.geometry;
-			auto requeueRest = [&]() {
-				for (std::size_t r = batch.size(); r-- > b;)
-					buildQueue_.push_front(batch[r].handle);
-			};
+			const D3D12_GPU_VIRTUAL_ADDRESS upload = uploadPool_.Address(entry.upload);
 
 			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc{};
 			geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
 			// (45h) Alpha-tested meshes are non-opaque: the trace tests each candidate against its cut-out.
 			geometryDesc.Flags = geometry.Opaque() ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
-			geometryDesc.Triangles.VertexBuffer.StartAddress = upload->GetGPUVirtualAddress() + batch[b].vertexOffset;
+			geometryDesc.Triangles.VertexBuffer.StartAddress = upload;
 			geometryDesc.Triangles.VertexBuffer.StrideInBytes = sizeof(float) * 3;
 			geometryDesc.Triangles.VertexCount = geometry.Vertices();
 			geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-			geometryDesc.Triangles.IndexBuffer = upload->GetGPUVirtualAddress() + batch[b].indexOffset;
+			geometryDesc.Triangles.IndexBuffer = upload + entry.indexOffset;
 			geometryDesc.Triangles.IndexCount = static_cast<UINT>(geometry.indices.size());
 			geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
 
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
 			inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-			inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
-			               D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
+			inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
 			inputs.NumDescs = 1;
 			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
 			inputs.pGeometryDescs = &geometryDesc;
-			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
-			device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
-			if (info.ResultDataMaxSizeInBytes == 0) {
-				// Degenerate input: drop it rather than retry forever.
-				blas.geometry.reset();
-				blas.state = BlasState::Ready;
-				stats_.blasQueued -= std::min<std::uint32_t>(stats_.blasQueued, 1);
-				++stats_.blasCount;
-				continue;
-			}
-			if (!EnsureScratch(info.ScratchDataSizeInBytes)) {
-				requeueRest();
-				break;
-			}
-			const std::uint64_t bytes = Align(info.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
-			auto resource = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
-			if (!resource) {
-				requeueRest();
-				Fail("BLAS buffer", E_OUTOFMEMORY);
-				break;
-			}
-			resource->SetName(L"CS RayTracing BLAS");
 
 			if (built > 0) {
 				// The builds share one scratch buffer.
@@ -1759,18 +1800,25 @@ namespace RayTracingRT
 
 			const std::uint32_t slot = postbuildCursor_;
 			postbuildCursor_ = (postbuildCursor_ + 1) % kPostbuildSlots;
+			// (46g) A BLAS still waiting for its compaction size in this slot loses its compaction (never reads another's).
+			if (slot < postbuildOwner_.size()) {
+				if (const std::uint64_t owner = postbuildOwner_[slot]; owner != 0 && owner - 1 < blas_.size() && blas_[owner - 1].postbuildSlot == slot)
+					blas_[owner - 1].postbuildSlot = UINT32_MAX;
+				postbuildOwner_[slot] = static_cast<std::uint64_t>(entry.handle) + 1;
+			}
 			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC postbuild{};
 			postbuild.InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE;
 			postbuild.DestBuffer = postbuild_->GetGPUVirtualAddress() + sizeof(std::uint64_t) * slot;
 
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc{};
 			buildDesc.Inputs = inputs;
-			buildDesc.DestAccelerationStructureData = resource->GetGPUVirtualAddress();
+			buildDesc.DestAccelerationStructureData = asPool_.Address(entry.result);
 			buildDesc.ScratchAccelerationStructureData = scratch_->GetGPUVirtualAddress();
 			a_list->BuildRaytracingAccelerationStructure(&buildDesc, 1, &postbuild);
 
+			const std::uint64_t bytes = entry.result.size;
 			blas.geometry.reset();
-			blas.resource = std::move(resource);
+			blas.alloc = entry.result;
 			blas.bytes = bytes;
 			blas.state = BlasState::Built;
 			blas.postbuildSlot = slot;
@@ -1915,9 +1963,11 @@ namespace RayTracingRT
 				}
 			}
 		}
+		lap(split.collect);
 		for (std::size_t i = 0; i < kContexts; ++i)
 			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted)
 				CollectTimestamps(i);
+		lap(split.timestamps);  // (46g)
 		if (index == kContexts) {
 			++stats_.skippedFramesBusy;
 			return false;
@@ -1960,8 +2010,9 @@ namespace RayTracingRT
 
 			const std::int64_t buildStart = QpcNow();
 			const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
-			ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame);
-			const std::uint32_t builtNow = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds);
+			const std::int64_t buildDeadline = buildStart + MsToQpc(a_input.buildCpuMs > 0.0f ? a_input.buildCpuMs : kPlayBuildCpuMs);  // (46g)
+			ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame, buildDeadline);
+			const std::uint32_t builtNow = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds, buildDeadline);
 			stats_.buildsLastFrame = builtNow;
 			const std::int64_t buildEnd = QpcNow();
 
@@ -1986,6 +2037,7 @@ namespace RayTracingRT
 			list->Close();
 			return false;
 		}
+		lap(split.ensure);  // (46g)
 		auto* descs = static_cast<D3D12_RAYTRACING_INSTANCE_DESC*>(context.instanceMapped);
 		for (auto& count : check_.written)
 			count = 0;
@@ -2004,7 +2056,7 @@ namespace RayTracingRT
 				continue;
 			}
 			const auto& blas = blas_[instance.blas];
-			if ((blas.state != BlasState::Built && blas.state != BlasState::Ready) || !blas.resource) {
+			if ((blas.state != BlasState::Built && blas.state != BlasState::Ready) || !blas.alloc.Valid()) {
 				++check_.notBuilt[category];
 				continue;
 			}
@@ -2029,7 +2081,7 @@ namespace RayTracingRT
 				desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
 				++alphaInstances;
 			}
-			desc.AccelerationStructure = blas.resource->GetGPUVirtualAddress();
+			desc.AccelerationStructure = asPool_.Address(blas.alloc);
 			if (a_input.validate && instance.hasExpected)
 				CheckInstance(desc, instance, blas, a_input);
 			++check_.written[category];
@@ -2048,7 +2100,7 @@ namespace RayTracingRT
 			}
 			const auto& draw = skinDraws[d];
 			// (45n) With Early Prep a shape may have been released since it was skinned (switch change).
-			if (draw.shape >= skins_.size() || !skins_[draw.shape].live || !skins_[draw.shape].blas) {
+			if (draw.shape >= skins_.size() || !skins_[draw.shape].live || !skins_[draw.shape].blas.Valid()) {
 				++check_.notBuilt[kCategoryCharacter];
 				continue;
 			}
@@ -2072,7 +2124,7 @@ namespace RayTracingRT
 				desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
 				++alphaInstances;
 			}
-			desc.AccelerationStructure = skin.blas->GetGPUVirtualAddress();
+			desc.AccelerationStructure = asPool_.Address(skin.blas);
 			++check_.written[kCategoryCharacter];
 			descs[instanceCount++] = desc;
 			++characterInstances;
@@ -2121,10 +2173,13 @@ namespace RayTracingRT
 		// The trace: in its own list behind the wait.
 		if (FAILED(hr = list->Close()))
 			return Fail("command list Close", hr);
+		lap(split.record);
 		{
+			// (46g) This first ExecuteCommandLists (builds / TLAS) counts as execute too (it was inside record before).
 			ID3D12CommandList* prepLists[] = { list };
 			queue_->ExecuteCommandLists(1, prepLists);
 		}
+		lap(split.execute);
 		ID3D12GraphicsCommandList4* traceList = context.traceList.Get();
 		if (FAILED(hr = traceList->Reset(context.allocator.Get(), nullptr)))
 			return Fail("trace command list Reset", hr);
@@ -2146,10 +2201,12 @@ namespace RayTracingRT
 		};
 		traceList->ResourceBarrier(pointFrame ? 4 : 2, pre);
 
+		lap(split.record);
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
 		traceList->SetDescriptorHeaps(1, heaps);
 		// (46f) This context's copy of the run-time descriptors (sun, point and RTAO tables).
 		const D3D12_GPU_DESCRIPTOR_HANDLE block = PublishDescriptors(index);
+		lap(split.publish);  // (46g)
 		if (a_input.sun) {
 			traceList->SetComputeRootSignature(rootSignature_.Get());
 			// (45i) The character variants only on frames with character instances: every other frame
@@ -2198,12 +2255,13 @@ namespace RayTracingRT
 		}
 		if (FAILED(hr = traceList->Close()))
 			return Fail("command list Close", hr);
+		lap(split.record);
 		// (46f) RTAO: its own list on this context (recorded now, submitted right behind the trace).
 		const bool aoFrame = a_input.ao && RecordAOTrace(context, index, a_input, alphaFrame, Offset(block, kDynAO, descriptorSize_));
 		if (failed_)
 			return false;
 		stats_.aoTracedLastFrame = aoFrame;
-		lap(split.record);
+		lap(split.ao);  // (46g)
 
 		// (46f) A second-fence wait never issued last frame (the AO was not used): the D3D11 queue takes it before this
 		// ready signal, so every value of the shared fence still orders after all earlier D3D12 work (Retire relies on it).
@@ -2273,12 +2331,26 @@ namespace RayTracingRT
 		// The context stays reserved (fenceValue UINT64_MAX: never "free") until ExecuteFrame or
 		// AbandonPrepared gives it a real done value. No fence value is signalled here: the shared fence is
 		// only ever signalled in increasing order (D3D11 ready, then D3D12 done behind a wait for it).
+		// (46g) Every step is timed on its own (stats_.prep, F7 rt_e_*).
 		if (!ready_ || failed_ || prepared_)
 			return false;
 		const HRESULT removed = device_->GetDeviceRemovedReason();
 		if (FAILED(removed))
 			return Fail("D3D12 device", removed);
 		const std::int64_t cpuStart = QpcNow();
+		PrepSplit split{};
+		std::int64_t mark = cpuStart;
+		auto lap = [&](float& a_field) {
+			const std::int64_t now = QpcNow();
+			a_field = std::max(a_field, 0.0f) + static_cast<float>(QpcToMs(now - mark));
+			mark = now;
+		};
+		struct SplitStore
+		{
+			Backend* backend;
+			PrepSplit* split;
+			~SplitStore() { backend->stats_.prep = *split; }
+		} splitStore{ this, &split };
 		CollectRetired();
 		const std::uint64_t completed = fence_->GetCompletedValue();
 		const std::uint64_t aoCompleted = AOCompleted();  // (46f)
@@ -2290,9 +2362,11 @@ namespace RayTracingRT
 				break;
 			}
 		}
+		lap(split.collect);
 		for (std::size_t i = 0; i < kContexts; ++i)
 			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted)
 				CollectTimestamps(i);
+		lap(split.timestamps);
 		if (index == kContexts)
 			return false;
 		auto& context = contexts_[index];
@@ -2308,15 +2382,19 @@ namespace RayTracingRT
 		prepared_ = true;
 		preparedContext_ = index;
 		retireAhead_ = 2;  // everything retired from now until the trace waits for its done value
+		lap(split.reset);
 
 		const UINT queryBase = static_cast<UINT>(index * 4);
 		if (timestampHeap_)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
 		const std::int64_t buildStart = QpcNow();
 		const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
-		ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame);
-		stats_.buildsLastFrame = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds);
+		const std::int64_t buildDeadline = buildStart + MsToQpc(a_input.buildCpuMs > 0.0f ? a_input.buildCpuMs : kPlayBuildCpuMs);
+		ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame, buildDeadline);
+		stats_.buildsLastFrame = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds, buildDeadline);
 		const std::int64_t buildEnd = QpcNow();
+		mark = buildEnd;
+		split.build = static_cast<float>(QpcToMs(buildEnd - buildStart));
 		static const std::vector<SkinDraw> kNoSkinDraws;
 		const std::vector<SkinDraw>& skinDraws = a_input.skinDraws && SkinAvailable() ? *a_input.skinDraws : kNoSkinDraws;
 		skinReady_.assign(skinDraws.size(), 0);
@@ -2324,8 +2402,10 @@ namespace RayTracingRT
 		if (!skinDraws.empty() || !skinUploadQueue_.empty())
 			RecordSkinning(list, context, a_input, skinReady_);
 		const std::int64_t skinEnd = QpcNow();
-		stats_.cpuBuildMs = static_cast<float>(QpcToMs(buildEnd - buildStart));
-		stats_.cpuSkinMs = static_cast<float>(QpcToMs(skinEnd - buildEnd));
+		split.skin = static_cast<float>(QpcToMs(skinEnd - buildEnd));
+		mark = skinEnd;
+		stats_.cpuBuildMs = split.build;
+		stats_.cpuSkinMs = split.skin;
 		if (failed_) {
 			list->Close();
 			return false;  // the feature turns itself off (Shutdown drops the reservation)
@@ -2339,8 +2419,10 @@ namespace RayTracingRT
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
 		if (FAILED(hr = list->Close()))
 			return Fail("command list Close", hr);
+		lap(split.close);
 		ID3D12CommandList* lists[] = { list };
 		queue_->ExecuteCommandLists(1, lists);
+		lap(split.execute);
 		stats_.earlyCpuMs = static_cast<float>(QpcToMs(QpcNow() - cpuStart));
 		return true;
 	}
@@ -2384,7 +2466,7 @@ namespace RayTracingRT
 		return ms;
 	}
 
-	bool Backend::BuildOnly(std::uint32_t a_triangleBudget, std::uint32_t a_maxBuilds)
+	bool Backend::BuildOnly(std::uint32_t a_triangleBudget, std::uint32_t a_maxBuilds, float a_cpuMs)
 	{
 		// (45k) Loading screens: the queued BLAS builds (and due compactions) go out on our own queue
 		// with a larger cap; nothing D3D11 is involved (no shared texture, no fence wait on either
@@ -2404,7 +2486,9 @@ namespace RayTracingRT
 				break;
 			}
 		}
-		if (buildQueue_.empty() && !compactionDue)
+		// (46g) Character shapes created behind a loading / black screen are uploaded here too (no draws needed).
+		const bool uploadsDue = !skinUploadQueue_.empty() && SkinAvailable();
+		if (buildQueue_.empty() && !compactionDue && !uploadsDue)
 			return false;
 		std::size_t index = kContexts;
 		for (std::size_t offset = 0; offset < kContexts; ++offset) {
@@ -2427,9 +2511,20 @@ namespace RayTracingRT
 		auto* list = context.list.Get();
 		if (FAILED(hr = list->Reset(context.allocator.Get(), nullptr)))
 			return Fail("command list Reset", hr);
-		ProcessCompaction(list, completed, a_maxBuilds);
-		const std::uint32_t built = BuildQueued(list, a_triangleBudget, a_maxBuilds);
+		const std::int64_t buildStart = QpcNow();
+		const std::int64_t deadline = buildStart + MsToQpc(a_cpuMs);
+		ProcessCompaction(list, completed, a_maxBuilds, deadline);
+		const std::uint32_t built = BuildQueued(list, a_triangleBudget, a_maxBuilds, deadline);
 		stats_.loadingBuilds += built;
+		const std::int64_t buildEnd = QpcNow();
+		stats_.cpuBuildMs = static_cast<float>(QpcToMs(buildEnd - buildStart));
+		if (uploadsDue) {
+			UploadSkinShapes(list, std::max(a_cpuMs * 0.5f, 1.0f));
+			// Builds / copies done before anything later on the queue reads them.
+			auto barrier = UavBarrier();
+			list->ResourceBarrier(1, &barrier);
+		}
+		stats_.cpuSkinMs = static_cast<float>(QpcToMs(QpcNow() - buildEnd));
 		if (FAILED(hr = list->Close()))
 			return Fail("command list Close", hr);
 		if (failed_)

@@ -1042,6 +1042,7 @@ namespace RayTracingScene
 		a_shape.info = RayTracingRT::kInvalidAlphaInfo;
 		a_shape.texture = RayTracingRT::kInvalidAlphaTexture;
 		a_shape.ready = false;
+		a_shape.shown = false;
 		// (45j) The engine object is dropped later, a bounded number per frame (DrainGraves).
 		if (a_shape.geometry)
 			geometryGrave_.push_back(std::move(a_shape.geometry));
@@ -1054,8 +1055,8 @@ namespace RayTracingScene
 		// Not drawn by the game either: detached from the scene graph or hidden.
 		if (!geometry->parent || geometry->GetFlags().any(RE::NiAVObject::Flag::kHidden))
 			return;
-		// (45h) An alpha shape only once its BLAS and texture are ready.
-		if (a_shape.alpha && !a_shape.ready)
+		// (45h) An alpha shape only once its BLAS and texture are ready. (46g) Any shape only once handed off.
+		if (!a_shape.shown || (a_shape.alpha && !a_shape.ready))
 			return;
 		// This frame's transform: doors swing, items fall, activators animate.
 		const RE::NiTransform& world = geometry->world;
@@ -1285,8 +1286,10 @@ namespace RayTracingScene
 			for (auto& shape : object->shapes) {
 				if (!shape.ready && a_backend.IsBlasBuilt(shape.blas) && (!shape.alpha || a_backend.IsAlphaTextureReady(shape.texture)))
 					shape.ready = true;
+				if (shape.ready && !shape.shown && !hold_)
+					shape.shown = true;  // (46g) else at HandOff
 				// (45j) Foliage "Both": traced, and still drawn into the cascades (the darker of both wins).
-				if (shape.ready && !shape.registered && !(shape.foliage && config_.foliage == FoliageMode::Both)) {
+				if (shape.shown && !shape.registered && !(shape.foliage && config_.foliage == FoliageMode::Both)) {
 					RayTracingCasterFilter::Add(shape.geometry.get());
 					shape.registered = true;
 				}
@@ -1435,6 +1438,11 @@ namespace RayTracingScene
 		currentFrame_ = a_frame;
 		if (flushRequested_.exchange(false)) {
 			ReleaseAll(a_backend);
+			// (46g) Behind a loading screen the place being left is still attached: not captured again.
+			if (transition_) {
+				departingPending_ = true;
+				departingSkipped_ = 0;
+			}
 		}
 
 		auto* tes = RE::TES::GetSingleton();
@@ -1474,6 +1482,10 @@ namespace RayTracingScene
 						attached.push_back(cell);
 				}
 			}
+		}
+		if (departingPending_) {
+			departingPending_ = false;
+			departing_.assign(attached.begin(), attached.end());
 		}
 		// (45e) Retired, not released: still traced this frame (the shadow map may have left their
 		// casters out already), released in EndFrame.
@@ -1538,6 +1550,10 @@ namespace RayTracingScene
 
 		// 3. New cells (captured once they have been in the grid for kSettleFrames).
 		for (auto* cell : attached) {
+			if (transition_ && std::find(departing_.begin(), departing_.end(), cell) != departing_.end()) {
+				++departingSkipped_;
+				continue;
+			}
 			const bool known = std::any_of(cells_.begin(), cells_.end(), [&](const std::unique_ptr<Cell>& a_cell) { return a_cell->cell == cell; });
 			if (known)
 				continue;
@@ -1575,7 +1591,8 @@ namespace RayTracingScene
 			Cell* nearest = nullptr;
 			float best = FLT_MAX;
 			for (auto& cell : cells_) {
-				if (!cell->gathering || a_frame - cell->seenFrame < kSettleFrames)
+				// (46g) While a transition holds the hand-off the destination is loaded already: a short settle.
+				if (!cell->gathering || a_frame - cell->seenFrame < (hold_ ? 3u : kSettleFrames))
 					continue;
 				const float dx = (static_cast<float>(cell->x) + 0.5f) * kCellUnits - eye.x;
 				const float dy = (static_cast<float>(cell->y) + 0.5f) * kCellUnits - eye.y;
@@ -1605,7 +1622,9 @@ namespace RayTracingScene
 		for (auto& cell : cells_) {
 			const bool built = !cell->gathering &&
 			                   std::all_of(cell->blas.begin(), cell->blas.end(), [&](auto a_handle) { return a_backend.IsBlasBuilt(a_handle); });
-			if (built && !cell->filterRegistered) {
+			if (built && !cell->shown && !hold_)
+				cell->shown = true;  // (46g) else at HandOff
+			if (built && cell->shown && !cell->filterRegistered) {
 				for (const auto& geometry : cell->geometries)
 					RayTracingCasterFilter::Add(geometry.get());
 				cell->filterRegistered = true;
@@ -1618,7 +1637,9 @@ namespace RayTracingScene
 			for (auto& shape : cell->alphaShapes) {
 				if (!shape.ready && a_backend.IsBlasBuilt(shape.blas) && a_backend.IsAlphaTextureReady(shape.texture))
 					shape.ready = true;
-				if (shape.ready && !shape.registered && !(shape.foliage && config_.foliage == FoliageMode::Both)) {
+				if (shape.ready && !shape.shown && !hold_)
+					shape.shown = true;  // (46g) else at HandOff
+				if (shape.shown && !shape.registered && !(shape.foliage && config_.foliage == FoliageMode::Both)) {
 					RayTracingCasterFilter::Add(shape.geometry.get());
 					shape.registered = true;
 				}
@@ -1699,7 +1720,8 @@ namespace RayTracingScene
 			for (const auto& cell : *list) {
 				const double x = static_cast<double>(cell->x) * kCellUnits;
 				const double y = static_cast<double>(cell->y) * kCellUnits;
-				for (std::size_t i = 0; i < cell->blas.size(); ++i) {
+				// (46g) A cell's chunks only once the whole cell is handed off (never chunk by chunk).
+				for (std::size_t i = 0; cell->shown && i < cell->blas.size(); ++i) {
 					RayTracingRT::Instance instance{ cell->blas[i], x, y, 0.0 };
 					instance.category = RayTracingRT::kCategoryCell;
 					if (a_expected && i < cell->chunkGeometries.size()) {
@@ -2111,5 +2133,66 @@ namespace RayTracingScene
 		o_rect[2] = static_cast<float>(maxX + 1) * kCellUnits;
 		o_rect[3] = static_cast<float>(maxY + 1) * kCellUnits;
 		return true;
+	}
+
+	Scene::HandOffCounts Scene::HeldCounts(const RayTracingRT::Backend& a_backend) const
+	{
+		HandOffCounts counts;  // shown = ready but held
+		for (const auto& cell : cells_) {
+			if (!cell->shown) {
+				const bool built = !cell->gathering &&
+				                   std::all_of(cell->blas.begin(), cell->blas.end(), [&](auto a_handle) { return a_backend.IsBlasBuilt(a_handle); });
+				++(built ? counts.shown : counts.pending);
+			}
+			for (const auto& shape : cell->alphaShapes)
+				if (!shape.shown)
+					++(shape.ready ? counts.shown : counts.pending);
+		}
+		for (const auto& object : objects_)
+			for (const auto& shape : object->shapes)
+				if (!shape.shown)
+					++(shape.ready ? counts.shown : counts.pending);
+		return counts;
+	}
+
+	Scene::HandOffCounts Scene::HandOff(const RayTracingRT::Backend& a_backend)
+	{
+		// (46g) Every ready item at once; the caster filter takes them on the next Update (before that frame's trace).
+		HandOffCounts counts;
+		for (auto& cell : cells_) {
+			if (!cell->shown) {
+				const bool built = !cell->gathering &&
+				                   std::all_of(cell->blas.begin(), cell->blas.end(), [&](auto a_handle) { return a_backend.IsBlasBuilt(a_handle); });
+				if (built) {
+					cell->shown = true;
+					++counts.shown;
+				} else {
+					++counts.pending;
+				}
+			}
+			for (auto& shape : cell->alphaShapes) {
+				if (shape.shown)
+					continue;
+				if (shape.ready) {
+					shape.shown = true;
+					++counts.shown;
+				} else {
+					++counts.pending;
+				}
+			}
+		}
+		for (auto& object : objects_) {
+			for (auto& shape : object->shapes) {
+				if (shape.shown)
+					continue;
+				if (shape.ready) {
+					shape.shown = true;
+					++counts.shown;
+				} else {
+					++counts.pending;
+				}
+			}
+		}
+		return counts;
 	}
 }
