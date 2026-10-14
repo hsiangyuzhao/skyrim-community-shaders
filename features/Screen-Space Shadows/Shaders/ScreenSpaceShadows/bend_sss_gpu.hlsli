@@ -389,8 +389,10 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 	{
 		const float4 cam = inParameters.CameraData;
 		const float view_z = max(cam.w / (-sampling_depth[0] * cam.z + cam.x), 1.0);
-		// Window ~= SurfaceThickness * z game units (1 - depth ~= near / z), so this floors it.
-		surface_thickness = max(surface_thickness, inParameters.MinThickness / view_z);
+		// Bend's window is 2 x SurfaceThickness x z game units deep (1 - depth ~= near / z), so
+		// 0.5 x MinThickness / z puts its far edge at MinThickness units behind the surface.
+		// Only the far edge uses this; the near edge keeps SurfaceThickness (see below).
+		surface_thickness = max(surface_thickness, 0.5 * inParameters.MinThickness / view_z);
 
 		// Game units travelled along the light ray per sample: screen motion of P + t*L is
 		// |L.xy - s * L.z| / z in tan units per unit t, with s this pixel's view ray (x/z, y/z).
@@ -408,7 +410,10 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 	// The 1.0 / inParameters.SurfaceThickness is to adjust user selected thickness. So a 0.5% thickness will scale depth values from [0,1] to [0,200]. The shadow window is always 1 wide.
 	// 1.0 / depth_thickness_scale[0] is because SurfaceThickness is percentage of remaining depth between the sample and the far clip - not a percentage of the full depth range.
 	// The min() function is to make sure the window is a minimum width when very close to the light. The +direction term will bias the result so the pixel at the very center of the light is either fully lit or shadowed
-	half depth_scale = min(sample_distance[0] + direction, 1.0 / surface_thickness) * sample_distance[0] / depth_thickness_scale[0];
+	half depth_scale = min(sample_distance[0] + direction, 1.0 / inParameters.SurfaceThickness) * sample_distance[0] / depth_thickness_scale[0];
+
+	// (45 SSS) Perspective-corrected start depth before the window scaling (World-Space Thickness path).
+	const half start_depth_raw = start_depth;
 
 	start_depth = start_depth * depth_scale - z_sign;
 
@@ -416,15 +421,23 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 
 	[branch] if (inParameters.WorldSpaceThickness)
 	{
-		// Same contrast curve as below, applied per sample so each sample can be faded by its
-		// distance along the ray: 1 - saturate(C * (1 - d)) == saturate(d * C + 1 - C), and min()
-		// of the visibility equals max() of the occlusion, so with no fade this matches the old path.
+		// Bend's test |x - 1| < 1, x = how far the occluder is in front of the light ray in window
+		// units, is a window CENTRED one unit in front of the ray: occlusion = saturate(C * min(x, 2 - x)).
+		// Widening the whole window (the first 45 version) also moved its near edge: a caster needed to be
+		// ~0.2 x window (12 units with Min Thickness 30) in front of the ray to shadow fully, so the shadow
+		// came from a copy of the caster pushed back along the VIEW ray -- offset in the camera's
+		// direction, not the sun's. Here the near edge keeps SurfaceThickness (depth_scale) and only the
+		// far edge widens (far_scale), so the shadow stays where it was and just gets deeper casters.
+		// With far_scale == depth_scale this is exactly the else-branch below; the contrast is applied
+		// per sample (max of occlusion == min of visibility) so each sample can be faded by its
+		// distance along the ray.
+		const half far_scale = min(sample_distance[0] + direction, 1.0 / surface_thickness) * sample_distance[0] / depth_thickness_scale[0];
 		const float fade_rate = world_per_sample / max(inParameters.ContactLength, 1.0);
 		half4 occlusion = 0;
 		[unroll] for (i = 0; i < SAMPLE_COUNT; i++)
 		{
-			half depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
-			half sample_occlusion = saturate(inParameters.ShadowContrast * (1 - depth_delta));
+			half in_front = z_sign * (start_depth_raw - DepthData[sample_index + i]);
+			half sample_occlusion = saturate(inParameters.ShadowContrast * min(in_front * depth_scale, 2.0 - in_front * far_scale));
 			half fade = saturate(2.0 - (i + 1) * fade_rate);
 			occlusion[i & 3] = max(occlusion[i & 3], sample_occlusion * fade);
 		}
