@@ -153,6 +153,29 @@ namespace RayTracingRT
 	};
 	static_assert(sizeof(TraceConstants) == 52 * 4);
 
+	/// (46b) Point-light shadow trace constants (TracePointLightsCS PLConstants).
+	struct PointTraceConstants
+	{
+		float invViewProj[16];
+		float renderSize[4];  // w, h, 1/w, 1/h
+		float rect[4];        // camera-relative xy min / max
+		float params[4];      // sources to scan, frame, flags (bit pattern), K
+		float bias[4];        // constant, per unit distance, character ray TMin, emitter radius
+		float extra[4];       // least traced share, least absolute contribution, least share of the sun light at a sunlit pixel, unused
+		float spheres[8];     // character bounds, as TraceConstants::spheres
+		float sun[4];         // to the sun (world axes), its strength (brightest channel; 0 = no sun gate)
+	};
+	static_assert(sizeof(PointTraceConstants) == 48 * 4);
+
+	/// (46b) This frame's point-light trace (FrameInput::pointLights; null = none, the 45 frame exactly).
+	struct PointLightInput
+	{
+		PointTraceConstants constants{};
+		const void* sources = nullptr;  // RayTracingPointLights::GpuSource[kMaxSources]
+		std::uint32_t sourceBytes = 0;  // of the whole array
+		std::uint32_t scan = 0;         // slots to scan (> 0)
+	};
+
 	/// (45f) What a TLAS instance holds, for the per-category counts and the self-check.
 	enum InstanceCategory : std::uint8_t
 	{
@@ -201,6 +224,8 @@ namespace RayTracingRT
 		// (45l) The D3D11 queue's wait for the trace is left to WaitForTrace() (called right before the
 		// first D3D11 pass that reads the result); false = waited at the end of ExecuteFrame (45k).
 		bool deferWait = false;
+		// (46b) Point-light shadows traced right after the sun, same list and TLAS (null = none).
+		const PointLightInput* pointLights = nullptr;
 	};
 
 	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
@@ -272,6 +297,11 @@ namespace RayTracingRT
 		float cpuRecordMs = 0.0f;
 		ExecuteSplit split{};  // (45k)
 		std::uint32_t loadingBuilds = 0;  // (45k) BLAS builds submitted by BuildOnly (loading screens) since start
+		// (46b) Point-light trace: GPU ms of its dispatch (inside lastTraceGpuMs no more: lastTraceGpuMs is the sun's),
+		// rays traced per frame (counter read back with the timestamps; -1 = not known), last frame traced or not.
+		float lastPointGpuMs = -1.0f;
+		std::int64_t pointRaysPerFrame = -1;
+		bool pointTracedLastFrame = false;
 	};
 
 	class Backend
@@ -399,6 +429,20 @@ namespace RayTracingRT
 		/// VRAM for skinned characters (buffers + BLASes); shapes past it keep their shadow-map shadow.
 		static constexpr std::uint64_t kSkinBudgetBytes = 512ull << 20;
 
+		// (46b) Point-light shadows. Their textures / buffers are created on first use only.
+		/// The point-light trace pipeline exists (the driver accepted it) and nothing of it failed.
+		[[nodiscard]] bool PointAvailable() const { return ready_ && !failed_ && pointPipeline_ && pointFault_.empty(); }
+		/// Shared textures (sized like the shadow mask) for the point-light trace. False = not available
+		/// (PointFault() says why; the rest of Ray Tracing goes on).
+		bool EnsurePointTextures(std::uint32_t a_width, std::uint32_t a_height);
+		/// Retires the point-light textures and buffers (switch off).
+		void ReleasePointResources();
+		[[nodiscard]] ID3D11ShaderResourceView* PointVisibilitySRV() const { return pointVis_.srv11.Get(); }
+		[[nodiscard]] ID3D11ShaderResourceView* PointSourcesSRV() const { return pointIdx_.srv11.Get(); }
+		[[nodiscard]] const std::string& PointFault() const { return pointFault_; }
+		void ClearPointFault() { pointFault_.clear(); }
+		[[nodiscard]] std::uint64_t PointBytes() const { return pointBytes_; }
+
 		/// True when the device was removed or a D3D12 call failed; the feature then turns itself off.
 		[[nodiscard]] bool HasFailed() const { return failed_; }
 		[[nodiscard]] const std::string& LastError() const { return lastError_; }
@@ -454,6 +498,13 @@ namespace RayTracingRT
 			ComPtr<ID3D12Resource> boneBuffer;
 			void* boneMapped = nullptr;
 			std::uint64_t boneCapacity = 0;  // bytes
+			// (46b) This context's point-light sources (upload heap, persistently mapped) and whether its
+			// submission traced them (timestamps / ray counter to read back).
+			ComPtr<ID3D12Resource> pointBuffer;
+			void* pointMapped = nullptr;
+			std::uint32_t pointCapacity = 0;  // bytes
+			bool pointPending = false;
+			std::uint64_t pointFrame = 0;     // pointFrame_ when it was submitted
 		};
 
 		enum class BlasState : std::uint8_t
@@ -587,7 +638,7 @@ namespace RayTracingRT
 		ComPtr<ID3D12Resource> CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav);
 		bool CheckSharedFormat(DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store, const char* a_name, bool a_fatal = true);
 		bool CreateSharedTexture(std::uint32_t a_width, std::uint32_t a_height, DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store,
-			SharedTexture& o_texture, const char* a_name);
+			SharedTexture& o_texture, const char* a_name, bool a_fatal = true);
 		bool CreatePipeline(std::string& o_reason);
 		void WriteDescriptors();
 		bool EnsureScratch(std::uint64_t a_bytes);
@@ -693,6 +744,29 @@ namespace RayTracingRT
 		bool releaseStop_ = false;
 		std::atomic<float> workerReleaseMs_{ 0.0f };
 		std::atomic<std::uint64_t> workerReleased_{ 0 };
+
+		// (46b) Point-light shadows.
+		static constexpr DXGI_FORMAT kPointFormat = DXGI_FORMAT_R8G8B8A8_UNORM;  // PLVis / PLIdx (TracePointLightsCS)
+		static constexpr std::uint32_t kPointDescriptorBase = kAlphaDescriptorBase + kAlphaTextureSlots;  // depth SRV, sun visibility SRV, PLVis UAV, PLIdx UAV
+		static constexpr std::uint32_t kPointDescriptors = 4;
+		ComPtr<ID3D12RootSignature> pointRootSignature_;
+		ComPtr<ID3D12PipelineState> pointPipeline_;
+		SharedTexture pointVis_, pointIdx_;
+		std::uint32_t pointWidth_ = 0, pointHeight_ = 0;
+		ComPtr<ID3D12Resource> pointCounter_;          // default heap, UAV: rays traced (monotonic, wraps)
+		ComPtr<ID3D12Resource> pointCounterReadback_;  // per context one uint32 copy of it
+		const std::uint32_t* pointCounterMapped_ = nullptr;
+		std::uint32_t pointCounterLast_ = 0;
+		std::uint64_t pointCounterLastFrame_ = 0;
+		bool pointCounterValid_ = false;
+		std::uint64_t pointFrame_ = 0;                 // point-light frames submitted
+		std::uint64_t pointBytes_ = 0;
+		std::string pointFault_;
+		bool CreatePointPipeline();
+		void SetPointFault(std::string a_reason);
+		bool EnsurePointBuffer(CommandContext& a_context, std::uint32_t a_bytes);
+		void WritePointDescriptors();
+		void RecordPointTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input);
 
 		HANDLE fenceEvent_ = nullptr;
 		Stats stats_{};

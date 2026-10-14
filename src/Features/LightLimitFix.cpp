@@ -1,6 +1,7 @@
 #include "LightLimitFix.h"
 #include "InverseSquareLighting.h"
 #include "LinearLighting.h"
+#include "RayTracing.h"
 
 #include "Shadercache.h"
 #include "State.h"
@@ -259,6 +260,7 @@ void LightLimitFix::BSLightingShader_SetupGeometry_GeometrySetupConstantPointLig
 			light.shadowMaskIndex = shadowLightIndex;
 			light.lightFlags.set(LightFlags::Shadow);
 		}
+		light.rtShadow = globals::features::rayTracing.PointLightTag(bsLight);  // (46b) strict (interior) lights: 0 until 46c
 
 		strictLightDataTemp.StrictLights[i] = light;
 	}
@@ -300,6 +302,33 @@ void LightLimitFix::BSLightingShader_SetupGeometry_After(RE::BSRenderPass*)
 	if (frameChecker.IsNewFrame()) {
 		ID3D11Buffer* buffer = { strictLightDataCB->CB() };
 		context->PSSetConstantBuffers(3, 1, &buffer);
+	}
+}
+
+void LightLimitFix::FillLightData(RE::BSLight* a_bsLight, RE::NiLight* a_niLight, LightData& o_light)
+{
+	// (46b) Factored out of UpdateLights (unchanged): Ray Tracing's point-light selection uses the same numbers.
+	auto& isl = globals::features::inverseSquareLighting;
+	auto& runtimeData = a_niLight->GetLightRuntimeData();
+
+	o_light.color = { runtimeData.diffuse.red, runtimeData.diffuse.green, runtimeData.diffuse.blue };
+	o_light.lightFlags = std::bit_cast<LightFlags>(runtimeData.ambient.red);
+
+	if (isl.loaded) {
+		isl.ProcessLight(o_light, a_bsLight, a_niLight);
+	} else {
+		o_light.radius = runtimeData.radius.x;
+		// light.color *= runtimeData.fade;
+		o_light.fade = runtimeData.fade;
+	}
+
+	o_light.fade *= a_bsLight->lodDimmer;
+
+	if (a_bsLight->IsShadowLight()) {
+		auto* shadowLight = static_cast<RE::BSShadowLight*>(a_bsLight);
+		GET_INSTANCE_MEMBER(shadowLightIndex, shadowLight);
+		o_light.shadowMaskIndex = shadowLightIndex;
+		o_light.lightFlags.set(LightFlags::Shadow);
 	}
 }
 
@@ -384,7 +413,6 @@ namespace RE
 void LightLimitFix::UpdateLights()
 {
 	auto smState = globals::game::smState;
-	auto& isl = globals::features::inverseSquareLighting;
 
 	auto shadowSceneNode = smState->shadowSceneNode[0];
 
@@ -422,6 +450,7 @@ void LightLimitFix::UpdateLights()
 			censusDropped.emplace_back(a_light, a_reason);
 	};
 
+	auto& rayTracing = globals::features::rayTracing;
 	auto addLight = [&](const RE::NiPointer<RE::BSLight>& e) {
 		if (auto bsLight = e.get()) {
 			if (auto niLight = bsLight->light.get(); !niLight) {
@@ -430,21 +459,8 @@ void LightLimitFix::UpdateLights()
 				censusDrop(bsLight, Util::LightCensus::DropReason::Hidden);
 			} else {
 				{
-					auto& runtimeData = niLight->GetLightRuntimeData();
-
 					LightData light{};
-					light.color = { runtimeData.diffuse.red, runtimeData.diffuse.green, runtimeData.diffuse.blue };
-					light.lightFlags = std::bit_cast<LightFlags>(runtimeData.ambient.red);
-
-					if (isl.loaded) {
-						isl.ProcessLight(light, bsLight, niLight);
-					} else {
-						light.radius = runtimeData.radius.x;
-						// light.color *= runtimeData.fade;
-						light.fade = runtimeData.fade;
-					}
-
-					light.fade *= bsLight->lodDimmer;
+					FillLightData(bsLight, niLight, light);
 
 					if (!IsGlobalLight(bsLight)) {
 						// List of BSMultiBoundRooms affected by a light
@@ -458,16 +474,10 @@ void LightLimitFix::UpdateLights()
 						light.lightFlags.set(LightFlags::PortalStrict);
 					}
 
-					if (bsLight->IsShadowLight()) {
-						auto* shadowLight = static_cast<RE::BSShadowLight*>(bsLight);
-						GET_INSTANCE_MEMBER(shadowLightIndex, shadowLight);
-						light.shadowMaskIndex = shadowLightIndex;
-						light.lightFlags.set(LightFlags::Shadow);
-					}
-
 					// Check for inactive shadow light
 					if (light.shadowMaskIndex != 255) {
 						SetLightPosition(light, niLight->world.translate);
+						light.rtShadow = rayTracing.PointLightTag(bsLight);  // (46b) 0 unless this frame's trace has a shadow source for it
 
 						if ((light.color.x + light.color.y + light.color.z) * light.fade > 1e-4 && light.radius > 1e-4) {
 							lightsData.push_back(light);

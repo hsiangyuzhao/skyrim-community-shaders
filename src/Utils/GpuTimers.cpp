@@ -138,6 +138,9 @@ namespace Util
 			{ "RT Wait for Trace",
 				"How long the game's GPU queue stood still waiting for the ray-traced shadows (on the GPU; the CPU does not wait). "
 				"Ideally about 0: the other features' work runs while the trace runs." },
+			{ "RT Point Lights: Denoiser",
+				"GPU time of cleaning up the ray-traced point-light shadows (per light: blur along soft edges, history). The point-light "
+				"trace itself runs on the ray tracer's own queue (Ray Tracing page, F7 column rt_pl_gpu_ms)." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

@@ -91,6 +91,13 @@ namespace Util::FrameTrace
 		int early = 0;
 		float earlyMs = -1, retireMs = -1, workerReleaseMs = -1, queueGapGpuMs = -1;
 		uint32_t retiredCount = 0, stillReused = 0;
+		// (46b) Point-light shadows: K (0 = off / not traced), sources traced, candidates after the rules (before merging and the
+		// cap), rays per frame (counter read back a few frames late, -1 = not known), GPU ms of the trace (D3D12) and of the
+		// denoiser (D3D11), CPU ms of the selection.
+		int plK = 0;
+		uint32_t plSources = 0, plCandidates = 0;
+		int64_t plRays = -1;
+		float plGpuMs = -1, plDenoiseGpuMs = -1, plCpuMs = -1;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

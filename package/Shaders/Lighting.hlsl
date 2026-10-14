@@ -1079,6 +1079,10 @@ float3 GetWetFilmSpecular(float3 N, float3 V, float3 L, float3 lightColor, float
 #		include "ScreenSpacePointLightShadows/SSPLS.hlsli"
 #	endif
 
+#	if defined(RT_POINT_SHADOWS) && defined(LIGHT_LIMIT_FIX)
+#		include "RayTracing/PointLightShadows.hlsli"
+#	endif
+
 #	if defined(PHYSICAL_SKY)
 #		include "PhysicalSky/Common.hlsli"
 #	endif
@@ -4020,12 +4024,26 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float lightShadow = 1.0;
 
 		float shadowComponent = 1.0;
+#			if defined(RT_POINT_SHADOWS)
+		// (46b) Ray-traced visibility of this light at this pixel (false: the old path below, unchanged).
+		float rtVisibility = 1.0;
+		const bool rtShadow = RTPointShadows::Get(light.rtShadow, input.Position.xy, screenUV, viewPosition.z, eyeIndex, rtVisibility);
+#			else
+		const bool rtShadow = false;
+		const float rtVisibility = 1.0;
+#			endif
+		bool rtApplied = false;
 		if (Permutation::PixelShaderDescriptor & Permutation::LightingFlags::DefShadow) {
 			if (light.lightFlags & LightLimitFix::LightFlags::Shadow) {
-				shadowComponent = shadowColor[light.shadowLightIndex];
+				// (46b) An engine shadow-map light with a ray-traced source: the traced visibility instead of its shadow map.
+				shadowComponent = rtShadow ? rtVisibility : shadowColor[light.shadowLightIndex];
 				lightShadow *= shadowComponent;
+				rtApplied = rtShadow;
 			}
 		}
+		// (46b) Every other case: the traced visibility replaces Screen Space Point Light Shadows (below).
+		if (rtShadow && !rtApplied)
+			lightShadow *= rtVisibility;
 
 		float3 normalizedLightDirection = normalize(lightDirection);
 		float lightAngle = dot(worldNormal.xyz, normalizedLightDirection.xyz);
@@ -4036,11 +4054,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			SharedData::ssplsSettings.Enable && inWorld &&
 			!(light.lightFlags & LightLimitFix::LightFlags::Simple) &&
 			shadowComponent != 0.0 &&
-			lightAngle > 0.0)
+			lightAngle > 0.0
+#				if defined(RT_POINT_SHADOWS)
+			&& (!rtShadow || (light.rtShadow & RTPointShadows::kKeepSSPLS))
+#				endif
+		)
 		{
 			float3 lightDirectionVS = FrameBuffer::WorldToView(light.positionWS[eyeIndex].xyz, true, eyeIndex) - viewPosition.xyz;
 			float SSPLSShadow = lerp(1.0, ScreenSpacePointLightShadows::GetShadow(LinearSampler, viewPosition, screenNoise, lightDirectionVS, ssplsSteps, light.radius, eyeIndex, light.lightFlags & LightLimitFix::LightFlags::Shadow), SharedData::ssplsSettings.Strength);
-			lightShadow *= SSPLSShadow;
+			// (46b) Kept beside a ray-traced shadow: the darker of both (a shadow both see is not doubled).
+			lightShadow = rtShadow ? min(lightShadow, SSPLSShadow) : lightShadow * SSPLSShadow;
 		}
 #			endif
 

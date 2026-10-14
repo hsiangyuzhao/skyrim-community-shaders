@@ -82,4 +82,43 @@ namespace Util::LightCensus
 
 	/// The "Diagnostics" node contents (Light Limit Fix page). a_key / a_capturingKey: the hotkey setting.
 	void DrawSettings(std::uint32_t& a_key, bool& a_capturingKey);
+
+	// ---- (46b) shared per-frame classifier ------------------------------------------------------------
+
+	/// The census categories (the same decision as a capture's "category" field).
+	enum class Category : std::uint8_t
+	{
+		Unknown = 0,
+		Player,
+		Actor,
+		Effect,
+		WindowBeam,     ///< Window Shadows Ultimate's shadowed sun spot through a window
+		WindowGlow,     ///< the glow of a lit pane seen from outside
+		WindowFill,     ///< the light a window spreads indoors
+		FixtureShadow,  ///< placed shadow-casting light without a mesh: a fixture's shadow stand-in
+		Fill,
+		Fixture,
+		Standalone,
+		MeshAttached,
+		Count
+	};
+	const char* CategoryName(Category a_category);
+
+	/**
+	 * (46b) The census classifier for every frame (RT point-light shadows): one census-style read of the
+	 * light's engine data (owner, LIGH, node chain, glowing neighbours; SEH-protected) the first time a light
+	 * is asked for, cached per light (validated by its NiLight and owner on every lookup). Window lights are
+	 * re-split by the current radius on each call. The nearby-fixture scan of a capture is not run: a placed
+	 * light without a mesh that is not named like a fill light comes out as Standalone (a capture may call it
+	 * Fixture); both are lit fixtures for the shadow selection.
+	 *
+	 * Render thread only. a_budget: new lights that may be read this call (decremented); a light that is not
+	 * cached and finds no budget returns false (asked again next frame).
+	 */
+	bool ClassifyCached(RE::BSLight* a_light, float a_radius, std::uint32_t a_frame, std::uint32_t& a_budget, Category& o_category);
+	/// Drops cache entries not asked for since a_maxAge frames (call once per frame; cheap when nothing is old).
+	void TrimClassifierCache(std::uint32_t a_frame, std::uint32_t a_maxAge);
+	/// Lights in the cache, and lights read so far (for the page).
+	std::uint32_t ClassifierCacheSize();
+	std::uint64_t ClassifierReads();
 }

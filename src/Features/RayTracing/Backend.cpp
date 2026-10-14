@@ -15,6 +15,8 @@
 // (45i) With RT_CHARACTERS (and RT_ALPHA): skinned characters traced by a second, character-only ray.
 #include "RayTracing/TraceShadowsCharAlphaCS.dxil.h"
 #include "RayTracing/TraceShadowsCharCS.dxil.h"
+// (46b) Point-light shadows (TracePointLightsCS).
+#include "RayTracing/TracePointLightsCS.dxil.h"
 
 namespace RayTracingRT
 {
@@ -176,9 +178,9 @@ namespace RayTracingRT
 		{
 			D3D12_QUERY_HEAP_DESC heapDesc{};
 			heapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-			heapDesc.Count = static_cast<UINT>(kContexts * 4);  // (45l) per context: prep begin / end, trace begin / end
+			heapDesc.Count = static_cast<UINT>(kContexts * 6);  // (45l) per context: prep begin / end, trace begin / end; (46b) + point lights begin / end after them
 			UINT64 frequency = 0;
-			timestampReadback_ = CreateBuffer(sizeof(std::uint64_t) * kContexts * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+			timestampReadback_ = CreateBuffer(sizeof(std::uint64_t) * kContexts * 6, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
 			if (FAILED(device_->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(&timestampHeap_))) || !timestampReadback_ ||
 				FAILED(queue_->GetTimestampFrequency(&frequency)) || frequency == 0) {
 				timestampHeap_.Reset();
@@ -294,7 +296,7 @@ namespace RayTracingRT
 
 		D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
 		heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		heapDesc.NumDescriptors = kAlphaDescriptorBase + kAlphaTextureSlots;
+		heapDesc.NumDescriptors = kPointDescriptorBase + kPointDescriptors;  // (46b) + the point-light trace table
 		heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		if (FAILED(hr = device_->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&descriptorHeap_)))) {
 			o_reason = std::format("CreateDescriptorHeap failed ({})", HrString(hr));
@@ -348,7 +350,241 @@ namespace RayTracingRT
 		}
 		if (charPipeline_ && !CreateSkinPipelines())
 			charPipeline_.Reset();
+		// (46b) The point-light trace: not fatal either (point-light shadows then stay unavailable).
+		if (!CreatePointPipeline())
+			pointPipeline_.Reset();
 		return true;
+	}
+
+	bool Backend::CreatePointPipeline()
+	{
+		// Its own root signature: constants b0, TLAS t0, table (depth t1, sun visibility t2, PLVis u0, PLIdx u1), sources t3, ray counter u2.
+		D3D12_DESCRIPTOR_RANGE ranges[2]{};
+		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[0].NumDescriptors = 2;
+		ranges[0].BaseShaderRegister = 1;
+		ranges[0].OffsetInDescriptorsFromTableStart = 0;
+		ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		ranges[1].NumDescriptors = 2;
+		ranges[1].BaseShaderRegister = 0;
+		ranges[1].OffsetInDescriptorsFromTableStart = 2;
+		D3D12_ROOT_PARAMETER params[5]{};
+		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		params[0].Constants.ShaderRegister = 0;
+		params[0].Constants.Num32BitValues = sizeof(PointTraceConstants) / 4;
+		params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[1].Descriptor.ShaderRegister = 0;
+		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[2].DescriptorTable.NumDescriptorRanges = 2;
+		params[2].DescriptorTable.pDescriptorRanges = ranges;
+		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[3].Descriptor.ShaderRegister = 3;
+		params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+		params[4].Descriptor.ShaderRegister = 2;
+		params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+		rootDesc.NumParameters = 5;
+		rootDesc.pParameters = params;
+		ComPtr<ID3DBlob> blob, error;
+		HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
+		if (FAILED(hr) || FAILED(hr = device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&pointRootSignature_)))) {
+			logger::warn("[RayTracing] Point-light root signature failed ({}); point-light shadows unavailable", HrString(hr));
+			pointRootSignature_.Reset();
+			return false;
+		}
+		D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+		psoDesc.pRootSignature = pointRootSignature_.Get();
+		psoDesc.CS.pShaderBytecode = g_TracePointLightsCS;
+		psoDesc.CS.BytecodeLength = sizeof(g_TracePointLightsCS);
+		if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pointPipeline_)))) {
+			logger::warn("[RayTracing] The point-light ray query shader was rejected by the driver ({}); point-light shadows unavailable", HrString(hr));
+			pointPipeline_.Reset();
+			pointRootSignature_.Reset();
+			return false;
+		}
+		// Null views until the textures exist.
+		auto cpu = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
+		cpu.ptr += static_cast<SIZE_T>(descriptorSize_) * kPointDescriptorBase;
+		D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
+		nullSrv.Format = kDepthMaskFormat;
+		nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		nullSrv.Texture2D.MipLevels = 1;
+		device_->CreateShaderResourceView(nullptr, &nullSrv, cpu);
+		cpu.ptr += descriptorSize_;
+		nullSrv.Format = kVisibilityFormat;
+		device_->CreateShaderResourceView(nullptr, &nullSrv, cpu);
+		D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
+		nullUav.Format = kPointFormat;
+		nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		for (int i = 0; i < 2; ++i) {
+			cpu.ptr += descriptorSize_;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, cpu);
+		}
+		return true;
+	}
+
+	void Backend::SetPointFault(std::string a_reason)
+	{
+		if (pointFault_.empty()) {
+			pointFault_ = std::move(a_reason);
+			logger::warn("[RayTracing] Point-light shadows: {}", pointFault_);
+		}
+	}
+
+	bool Backend::EnsurePointTextures(std::uint32_t a_width, std::uint32_t a_height)
+	{
+		if (!PointAvailable() || !depthMask_.resource12)
+			return false;
+		if (a_width == pointWidth_ && a_height == pointHeight_ && pointVis_.resource12 && pointIdx_.resource12 && pointCounter_ && pointCounterMapped_)
+			return true;
+		ReleasePointResources();
+		if (!CreateSharedTexture(a_width, a_height, kPointFormat, false, true, pointVis_, "RayTracing PointVisibility", false) ||
+			!CreateSharedTexture(a_width, a_height, kPointFormat, false, true, pointIdx_, "RayTracing PointSources", false)) {
+			pointVis_ = {};
+			pointIdx_ = {};
+			SetPointFault("could not create its shared textures (see the log)");
+			return false;
+		}
+		pointCounter_ = CreateBuffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+		pointCounterReadback_ = CreateBuffer(sizeof(std::uint32_t) * kContexts, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+		void* mapped = nullptr;
+		if (!pointCounter_ || !pointCounterReadback_ || FAILED(pointCounterReadback_->Map(0, nullptr, &mapped)) || !mapped) {
+			pointVis_ = {};
+			pointIdx_ = {};
+			pointCounter_.Reset();
+			pointCounterReadback_.Reset();
+			SetPointFault("could not create its ray counter");
+			return false;
+		}
+		pointCounterMapped_ = static_cast<const std::uint32_t*>(mapped);
+		pointCounterValid_ = false;
+		pointWidth_ = a_width;
+		pointHeight_ = a_height;
+		pointBytes_ = static_cast<std::uint64_t>(a_width) * a_height * 8;
+		WritePointDescriptors();
+		logger::info("[RayTracing] Point-light textures {}x{}", a_width, a_height);
+		return true;
+	}
+
+	void Backend::ReleasePointResources()
+	{
+		// A submission in flight may still use them: D3D12 keeps them until it is done.
+		if (pointVis_.resource12)
+			Retire(pointVis_.resource12, 0, nullptr);
+		if (pointIdx_.resource12)
+			Retire(pointIdx_.resource12, 0, nullptr);
+		if (pointCounterReadback_ && pointCounterMapped_)
+			pointCounterReadback_->Unmap(0, nullptr);
+		pointCounterMapped_ = nullptr;
+		if (pointCounter_)
+			Retire(pointCounter_, 0, nullptr);
+		if (pointCounterReadback_)
+			Retire(pointCounterReadback_, 0, nullptr);
+		pointCounter_.Reset();
+		pointCounterReadback_.Reset();
+		pointVis_ = {};
+		pointIdx_ = {};
+		pointWidth_ = pointHeight_ = 0;
+		pointBytes_ = 0;
+		pointCounterValid_ = false;
+		for (auto& context : contexts_)
+			context.pointPending = false;
+		stats_.pointRaysPerFrame = -1;
+		stats_.lastPointGpuMs = -1.0f;
+		if (descriptorHeap_ && pointPipeline_) {
+			// Back to null views.
+			auto cpu = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
+			cpu.ptr += static_cast<SIZE_T>(descriptorSize_) * (kPointDescriptorBase + 2);
+			D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
+			nullUav.Format = kPointFormat;
+			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, cpu);
+			cpu.ptr += descriptorSize_;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, cpu);
+		}
+	}
+
+	void Backend::WritePointDescriptors()
+	{
+		if (!descriptorHeap_ || !pointPipeline_)
+			return;
+		auto cpu = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
+		cpu.ptr += static_cast<SIZE_T>(descriptorSize_) * kPointDescriptorBase;
+		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = kDepthMaskFormat;
+		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srvDesc.Texture2D.MipLevels = 1;
+		device_->CreateShaderResourceView(depthMask_.resource12.Get(), &srvDesc, cpu);
+		cpu.ptr += descriptorSize_;
+		srvDesc.Format = kVisibilityFormat;
+		device_->CreateShaderResourceView(visibility_.resource12.Get(), &srvDesc, cpu);  // the sun trace (the sun gate)
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		uavDesc.Format = kPointFormat;
+		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		cpu.ptr += descriptorSize_;
+		device_->CreateUnorderedAccessView(pointVis_.resource12.Get(), nullptr, &uavDesc, cpu);
+		cpu.ptr += descriptorSize_;
+		device_->CreateUnorderedAccessView(pointIdx_.resource12.Get(), nullptr, &uavDesc, cpu);
+	}
+
+	bool Backend::EnsurePointBuffer(CommandContext& a_context, std::uint32_t a_bytes)
+	{
+		if (a_context.pointBuffer && a_context.pointMapped && a_context.pointCapacity >= a_bytes)
+			return true;
+		if (a_context.pointBuffer) {
+			if (a_context.pointMapped)
+				a_context.pointBuffer->Unmap(0, nullptr);
+			Retire(a_context.pointBuffer, 0, nullptr);
+		}
+		a_context.pointBuffer.Reset();
+		a_context.pointMapped = nullptr;
+		a_context.pointCapacity = 0;
+		auto buffer = CreateBuffer(a_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+		void* mapped = nullptr;
+		if (!buffer || FAILED(buffer->Map(0, nullptr, &mapped)) || !mapped)
+			return false;
+		a_context.pointBuffer = buffer;
+		a_context.pointMapped = mapped;
+		a_context.pointCapacity = a_bytes;
+		return true;
+	}
+
+	void Backend::RecordPointTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input)
+	{
+		// (46b) After the sun trace, in the same list: depth stays readable, the point textures are in UAV state
+		// (the caller's barriers). The sources were copied into this context's upload buffer.
+		const auto& pl = *a_input.pointLights;
+		const UINT queryBase = static_cast<UINT>(kContexts * 4 + a_index * 2);
+		if (timestampHeap_)
+			a_list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
+		a_list->SetComputeRootSignature(pointRootSignature_.Get());
+		a_list->SetPipelineState(pointPipeline_.Get());
+		a_list->SetComputeRoot32BitConstants(0, sizeof(PointTraceConstants) / 4, &pl.constants, 0);
+		a_list->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
+		auto table = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
+		table.ptr += static_cast<UINT64>(descriptorSize_) * kPointDescriptorBase;
+		a_list->SetComputeRootDescriptorTable(2, table);
+		a_list->SetComputeRootShaderResourceView(3, a_context.pointBuffer->GetGPUVirtualAddress());
+		a_list->SetComputeRootUnorderedAccessView(4, pointCounter_->GetGPUVirtualAddress());
+		a_list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
+		if (timestampHeap_)
+			a_list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
+		// The ray counter's value after this frame, into this context's read-back slot.
+		D3D12_RESOURCE_BARRIER toCopy = Transition(pointCounter_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		a_list->ResourceBarrier(1, &toCopy);
+		a_list->CopyBufferRegion(pointCounterReadback_.Get(), sizeof(std::uint32_t) * a_index, pointCounter_.Get(), 0, sizeof(std::uint32_t));
+		D3D12_RESOURCE_BARRIER toUav = Transition(pointCounter_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		a_list->ResourceBarrier(1, &toUav);
+		if (timestampHeap_ && timestampReadback_)
+			a_list->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase, 2, timestampReadback_.Get(), sizeof(std::uint64_t) * queryBase);
+		a_context.pointPending = true;
+		a_context.pointFrame = ++pointFrame_;
 	}
 
 	void Backend::Shutdown(bool a_waitForGpu)
@@ -377,8 +613,25 @@ namespace RayTracingRT
 				context.alphaInfoBuffer->Unmap(0, nullptr);
 			if (context.boneBuffer && context.boneMapped)
 				context.boneBuffer->Unmap(0, nullptr);
+			if (context.pointBuffer && context.pointMapped)
+				context.pointBuffer->Unmap(0, nullptr);
 			context = {};
 		}
+		// (46b)
+		if (pointCounterReadback_ && pointCounterMapped_)
+			pointCounterReadback_->Unmap(0, nullptr);
+		pointCounterMapped_ = nullptr;
+		pointCounter_.Reset();
+		pointCounterReadback_.Reset();
+		pointVis_ = {};
+		pointIdx_ = {};
+		pointWidth_ = pointHeight_ = 0;
+		pointBytes_ = 0;
+		pointCounterValid_ = false;
+		pointFrame_ = 0;
+		pointFault_.clear();
+		pointPipeline_.Reset();
+		pointRootSignature_.Reset();
 		depthMask_ = {};
 		visibility_ = {};
 		textureWidth_ = textureHeight_ = 0;
@@ -519,10 +772,17 @@ namespace RayTracingRT
 	}
 
 	bool Backend::CreateSharedTexture(std::uint32_t a_width, std::uint32_t a_height, DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store,
-		SharedTexture& o_texture, const char* a_name)
+		SharedTexture& o_texture, const char* a_name, bool a_fatal)
 	{
-		if (!CheckSharedFormat(a_format, a_d3d11Store, a_d3d12Store, a_name))
+		if (!CheckSharedFormat(a_format, a_d3d11Store, a_d3d12Store, a_name, a_fatal))
 			return false;
+		// (46b) Not fatal (point lights): a failure is logged and only that part goes off.
+		auto fail = [&](const std::string& a_operation, HRESULT a_result) {
+			if (a_fatal)
+				return this->Fail(a_operation, a_result);
+			logger::warn("[RayTracing] {} failed ({})", a_operation, HrString(a_result));
+			return false;
+		};
 		// Same creation path as Neural Rendering's D3D12Interop (proven in game): D3D11 creates the
 		// texture with an NT handle, D3D12 opens it (state COMMON, no simultaneous access).
 		D3D11_TEXTURE2D_DESC desc{};
@@ -539,21 +799,21 @@ namespace RayTracingRT
 		const std::string what = std::format("{} ({}x{}, format {})", a_name, a_width, a_height, static_cast<int>(a_format));
 		HRESULT hr = device11_->CreateTexture2D(&desc, nullptr, &texture.resource11);
 		if (FAILED(hr))
-			return Fail(std::format("CreateTexture2D (shared) {}", what), hr);
+			return fail(std::format("CreateTexture2D (shared) {}", what), hr);
 		Util::SetResourceName(texture.resource11.Get(), a_name);
 		if (FAILED(hr = device11_->CreateShaderResourceView(texture.resource11.Get(), nullptr, &texture.srv11)) ||
 			FAILED(hr = device11_->CreateUnorderedAccessView(texture.resource11.Get(), nullptr, &texture.uav11)))
-			return Fail(std::format("shared texture views {}", what), hr);
+			return fail(std::format("shared texture views {}", what), hr);
 		ComPtr<IDXGIResource1> dxgiResource;
 		if (FAILED(hr = texture.resource11.As(&dxgiResource)))
-			return Fail("IDXGIResource1", hr);
+			return fail("IDXGIResource1", hr);
 		HANDLE handle = nullptr;
 		if (FAILED(hr = dxgiResource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle)))
-			return Fail(std::format("CreateSharedHandle {}", what), hr);
+			return fail(std::format("CreateSharedHandle {}", what), hr);
 		hr = device_->OpenSharedHandle(handle, IID_PPV_ARGS(&texture.resource12));
 		CloseHandle(handle);
 		if (FAILED(hr))
-			return Fail(std::format("OpenSharedHandle {}", what), hr);
+			return fail(std::format("OpenSharedHandle {}", what), hr);
 		o_texture = std::move(texture);
 		return true;
 	}
@@ -584,6 +844,8 @@ namespace RayTracingRT
 		textureHeight_ = a_height;
 		stats_.sharedTextureBytes = static_cast<std::uint64_t>(a_width) * a_height * (4 + 4);
 		WriteDescriptors();
+		if (pointVis_.resource12)
+			WritePointDescriptors();  // (46b) the depth SRV of its table
 		logger::info("[RayTracing] Shared textures {}x{}", a_width, a_height);
 		return true;
 	}
@@ -693,9 +955,40 @@ namespace RayTracingRT
 	void Backend::CollectTimestamps(std::size_t a_index)
 	{
 		auto& context = contexts_[a_index];
+		// (46b) The point-light trace of this submission: its ray counter (rays per frame since the last read)
+		// and its two timestamps (read below with the others).
+		const bool pointPending = context.pointPending;
+		context.pointPending = false;
+		if (pointPending && pointCounterMapped_) {
+			const std::uint32_t value = pointCounterMapped_[a_index];
+			if (pointCounterValid_ && context.pointFrame > pointCounterLastFrame_)
+				stats_.pointRaysPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(value - pointCounterLast_) / (context.pointFrame - pointCounterLastFrame_));
+			if (!pointCounterValid_ || context.pointFrame > pointCounterLastFrame_) {
+				pointCounterLast_ = value;
+				pointCounterLastFrame_ = context.pointFrame;
+				pointCounterValid_ = true;
+			}
+		}
 		if (!context.timestampsPending || !timestampReadback_ || timestampFrequency_ == 0)
 			return;
 		context.timestampsPending = false;
+		float pointMs = 0.0f;
+		if (pointPending) {
+			const SIZE_T pointOffset = sizeof(std::uint64_t) * (kContexts * 4 + a_index * 2);
+			D3D12_RANGE pointRange{ pointOffset, pointOffset + sizeof(std::uint64_t) * 2 };
+			void* pointMapped = nullptr;
+			if (SUCCEEDED(timestampReadback_->Map(0, &pointRange, &pointMapped)) && pointMapped) {
+				const auto* t = reinterpret_cast<const std::uint64_t*>(static_cast<const std::byte*>(pointMapped) + pointOffset);
+				const std::uint64_t pb = t[0], pe = t[1];
+				D3D12_RANGE none{ 0, 0 };
+				timestampReadback_->Unmap(0, &none);
+				if (pe >= pb)
+					pointMs = static_cast<float>(static_cast<double>(pe - pb) * 1000.0 / static_cast<double>(timestampFrequency_));
+			}
+			stats_.lastPointGpuMs = pointMs;
+		} else {
+			stats_.lastPointGpuMs = -1.0f;
+		}
 		// (45l) Four per context: the prep submission (builds, skinning, TLAS) and the trace. Their sum is the
 		// GPU work of our queue; the gap between them (the wait for the D3D11 depth copy) is not counted.
 		const SIZE_T offset = sizeof(std::uint64_t) * 4 * a_index;
@@ -711,8 +1004,9 @@ namespace RayTracingRT
 			return;
 		const double toMs = 1000.0 / static_cast<double>(timestampFrequency_);
 		stats_.lastPrepGpuMs = static_cast<float>(static_cast<double>(prepEnd - prepBegin) * toMs);
-		stats_.lastTraceGpuMs = static_cast<float>(static_cast<double>(end - begin) * toMs);
-		stats_.lastGpuMs = stats_.lastPrepGpuMs + stats_.lastTraceGpuMs;
+		// (46b) The trace interval holds the point-light dispatch: the sun's part alone, the point lights on their own.
+		stats_.lastTraceGpuMs = std::max(static_cast<float>(static_cast<double>(end - begin) * toMs) - pointMs, 0.0f);
+		stats_.lastGpuMs = stats_.lastPrepGpuMs + stats_.lastTraceGpuMs + pointMs;
 		// (45n) Our queue idle between the builds / skinning and the trace (waiting for the game's depth copy).
 		stats_.lastQueueGapMs = begin >= prepEnd ? static_cast<float>(static_cast<double>(begin - prepEnd) * toMs) : 0.0f;
 		stats_.smoothedGpuMs = stats_.smoothedGpuMs > 0.0f ? stats_.smoothedGpuMs * 0.95f + stats_.lastGpuMs * 0.05f : stats_.lastGpuMs;
@@ -1412,11 +1706,20 @@ namespace RayTracingRT
 		if (timestampHeap_)
 			traceList->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 2);
 
-		D3D12_RESOURCE_BARRIER pre[2] = {
+		// (46b) Point lights this frame: textures, counter and this context's copy of the sources.
+		const bool pointFrame = a_input.pointLights && a_input.pointLights->scan > 0 && a_input.pointLights->sources && PointAvailable() && pointVis_.resource12 &&
+		                        pointIdx_.resource12 && pointCounter_ && pointCounterMapped_ && EnsurePointBuffer(context, a_input.pointLights->sourceBytes);
+		if (pointFrame)
+			std::memcpy(context.pointMapped, a_input.pointLights->sources, a_input.pointLights->sourceBytes);
+		stats_.pointTracedLastFrame = pointFrame;
+
+		D3D12_RESOURCE_BARRIER pre[4] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
 			Transition(visibility_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+			Transition(pointVis_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+			Transition(pointIdx_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
 		};
-		traceList->ResourceBarrier(2, pre);
+		traceList->ResourceBarrier(pointFrame ? 4 : 2, pre);
 
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
 		traceList->SetDescriptorHeaps(1, heaps);
@@ -1439,12 +1742,21 @@ namespace RayTracingRT
 			traceList->SetComputeRootDescriptorTable(5, table);
 		}
 		traceList->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
+		if (pointFrame) {
+			// (46b) The point lights read the sun's result (sunlit pixels skip weak point lights).
+			D3D12_RESOURCE_BARRIER toRead = Transition(visibility_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+			traceList->ResourceBarrier(1, &toRead);
+			RecordPointTrace(traceList, context, index, a_input);
+		}
 
-		D3D12_RESOURCE_BARRIER post[2] = {
+		D3D12_RESOURCE_BARRIER post[4] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-			Transition(visibility_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+			Transition(visibility_.resource12.Get(), pointFrame ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+				D3D12_RESOURCE_STATE_COMMON),
+			Transition(pointVis_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+			Transition(pointIdx_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
 		};
-		traceList->ResourceBarrier(2, post);
+		traceList->ResourceBarrier(pointFrame ? 4 : 2, post);
 
 		if (timestampHeap_ && timestampReadback_) {
 			traceList->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 3);

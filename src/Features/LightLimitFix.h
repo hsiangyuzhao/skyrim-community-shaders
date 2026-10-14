@@ -59,10 +59,11 @@ public:
 		uint128_t roomFlags = uint32_t(0);
 		stl::enumeration<LightFlags> lightFlags;
 		uint32_t shadowMaskIndex = 0;
-		uint pad0;
+		uint32_t rtShadow = 0;  ///< (46b) Ray Tracing point-light shadow tag (RayTracing::PointLightTag; 0 = none); was pad0
 		uint pad1;
 	};
 	STATIC_ASSERT_ALIGNAS_16(LightData);
+	static_assert(sizeof(LightData) == 96);  // LightLimitFix/Common.hlsli Light
 
 	struct ClusterAABB
 	{
@@ -162,6 +163,9 @@ public:
 	virtual void ClearShaderCache() override;
 
 	float CalculateLightDistance(float3 a_lightPosition, float a_radius);
+	/// (46b) The light as LLF uploads it, without position and rooms: colour, flags, ISL radius / fade, lodDimmer,
+	/// shadow-map slot. Shared with Ray Tracing's point-light selection (the same numbers for the same light).
+	static void FillLightData(RE::BSLight* a_bsLight, RE::NiLight* a_niLight, LightData& o_light);
 	void SetLightPosition(LightLimitFix::LightData& a_light, RE::NiPoint3 a_initialPosition, bool a_cached = true);
 	void UpdateLights();
 	void UpdateStructure();

@@ -1,0 +1,292 @@
+// (46b) Ray-traced point-light shadows, inline RayQuery (DXR 1.1), cs_6_5.
+//
+// Runs on Ray Tracing's own D3D12 queue right after the sun trace, in the same command list and against
+// the same TLAS (compiled at build time like TraceShadowsCS, see CMakeLists.txt). Per 8x8 group the
+// shadow sources (RayTracing/PointLights.h, at most 64, one bit each) whose sphere reaches the group's
+// surfaces are found first; per pixel the K sources that light it most (attenuation x N.L x intensity,
+// as Lighting.hlsl attenuates them) are picked and one ray is traced toward a point on each source's
+// small emitter sphere (soft edges, cleaned by PointDenoiseCS). Sources under Extra.x of the pixel's
+// total point light are not traced.
+//
+// Inputs: t0 TLAS, t1 DepthMask (|value| = depth after the prepass, see PrepareCS), t2 this frame's sun trace, t3 the sources.
+// Sun gate: at a sunlit pixel a point light under Extra.z of the sun's light there is not traced (its shadow would not
+// show): in daylight only the surroundings of strong fixtures are traced.
+// Outputs (R8G8B8A8_UNORM, shared with D3D11), per slot s = 0..3 (slots past K are empty):
+//   PLVis[s]: 1 = lit; < 1 = blocked, the value is sqrt(blocker distance / light distance) * 254/255
+//             (the denoiser's penumbra width);
+//   PLIdx[s]: byte = source slot + 1 (0 = empty slot), bit 7 of byte s = bit s of the pixel's candidate
+//             count (0..15, the debug view).
+// Positions are camera-relative (the TLAS is built around the same camera position).
+//
+// Rays: the scene (instance mask 0x01, every opaque instance) and, when characters are in the TLAS, a
+// second ray against them (masks 0x06, TMin = Bias.z against their own coarse polygons, as the sun's).
+// Non-opaque (alpha-tested) instances are culled: leaves and cut-outs cast no point-light shadow in 46b.
+// The ray ends the source's clearance short of the light: the light's own fixture (lantern frame,
+// brazier bowl, the torch in a hand) does not shadow it.
+
+struct PLConstants
+{
+	row_major float4x4 InvViewProj;  // FrameBuffer::CameraViewProjInverse (jittered, as the shadow mask used)
+	float4 RenderSize;               // xy render size, zw 1 / size
+	float4 Rect;                     // camera-relative xy min / max of the traced area
+	float4 Params;                   // x sources to scan, y frame, z flags (asuint), w K (1..4)
+	float4 Bias;                     // x constant ray offset, y per unit of distance, z character ray TMin, w emitter radius
+	float4 Extra;                    // x least share of the pixel's point light that is traced, y least absolute contribution,
+	                                 // z least share of the sun's light at a sunlit pixel (the sun gate)
+	float4 Spheres[2];               // character bounds (camera-relative xyz, radius; 0 = none): [0] the player, [1] the others
+	float4 Sun;                      // xyz to the sun (world axes), w its strength (brightest channel; 0 = no sun gate)
+};
+
+struct PLSource
+{
+	float4 PosRadius;  // camera-relative position, radius
+	float4 Atten;      // inverse radius, ISL fade zone, ISL size bias, intensity
+	float4 Spot;       // (46c) direction, cos(outer half angle)
+	uint4 Info;        // flags, clearance (float bits), reserved x2
+};
+
+ConstantBuffer<PLConstants> C : register(b0);
+RaytracingAccelerationStructure Scene : register(t0);
+Texture2D<float> DepthMask : register(t1);
+Texture2D<unorm float4> SunVisibility : register(t2);  // this frame's sun trace (.x: 1 lit, 0 shadow)
+StructuredBuffer<PLSource> Sources : register(t3);
+RWTexture2D<unorm float4> PLVis : register(u0);
+RWTexture2D<unorm float4> PLIdx : register(u1);
+RWByteAddressBuffer RayCounter : register(u2);  // rays traced (monotonic, read back for the F7 trace)
+
+static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
+static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
+static const uint kFlagCharCull = 4u;     // the character ray only where the segment passes a character's bounds
+static const uint kSourceISL = 1u;
+static const uint kSceneMask = 0x01u;
+static const uint kCharacterMasks = 0x06u;
+static const float kFirstPersonNear = 96.0;
+static const float kScaledUnitsSq = 0.8 * 70.0 * 70.0;  // InverseSquareLighting SCALED_UNITS_SQ
+
+float3 PositionAt(int2 p, float depth)
+{
+	float2 uv = (float2(p) + 0.5) * C.RenderSize.zw;
+	float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+	float4 pos = mul(C.InvViewProj, clip);
+	return pos.xyz / pos.w;
+}
+
+float InterleavedGradientNoise(float2 p, uint frame)
+{
+	p += float(frame % 64u) * 5.588238;
+	return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+// Lighting.hlsl's attenuation (InverseSquareLighting::GetAttenuation, or 1 - (d / r)^2).
+float Attenuation(PLSource s, float d)
+{
+	if (d >= s.PosRadius.w)
+		return 0.0;
+	[branch] if (s.Info.x & kSourceISL)
+	{
+		const float t = saturate((s.PosRadius.w - d) * s.Atten.y);
+		return kScaledUnitsSq / (d * d + s.Atten.z) * t * t * (3.0 - 2.0 * t);
+	}
+	const float f = d * s.Atten.x;
+	return 1.0 - f * f;
+}
+
+bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, out float tHit)
+{
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = dir;
+	ray.TMin = tMin;
+	ray.TMax = tMax;
+	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_CULL_NON_OPAQUE> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
+	q.Proceed();
+	tHit = q.CommittedRayT();
+	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+
+// Does the segment origin -> origin + dir * tMax pass the sphere?
+bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
+{
+	if (sphere.w <= 0.0)
+		return false;
+	const float3 oc = sphere.xyz - origin;
+	const float along = clamp(dot(oc, dir), 0.0, tMax);
+	const float3 closest = origin + dir * along - sphere.xyz;
+	return dot(closest, closest) <= sphere.w * sphere.w;
+}
+
+groupshared float3 gsMin[64];
+groupshared float3 gsMax[64];
+groupshared uint gsMask[2];
+
+[numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+	// No early return before the barriers: every thread reaches them.
+	const int2 p = int2(dtid.xy);
+	const uint flags = asuint(C.Params.z);
+	const uint scan = min(uint(C.Params.x), 64u);
+	const uint K = clamp(uint(C.Params.w), 1u, 4u);
+	const bool inside = all(float2(p) < C.RenderSize.xy);
+	const float depth = inside ? abs(DepthMask[p]) : 0.0;
+	bool valid = inside && depth < 0.999999 && depth > 0.0;
+	float3 P = 0.0;
+	if (valid) {
+		P = PositionAt(p, depth);
+		valid = !(P.x < C.Rect.x || P.y < C.Rect.y || P.x > C.Rect.z || P.y > C.Rect.w);
+	}
+
+	// The group's box, then the sources whose sphere reaches it.
+	gsMin[gi] = valid ? P : float3(1e30, 1e30, 1e30);
+	gsMax[gi] = valid ? P : float3(-1e30, -1e30, -1e30);
+	if (gi < 2u)
+		gsMask[gi] = 0u;
+	GroupMemoryBarrierWithGroupSync();
+	[unroll] for (uint s = 32u; s > 0u; s >>= 1u)
+	{
+		if (gi < s) {
+			gsMin[gi] = min(gsMin[gi], gsMin[gi + s]);
+			gsMax[gi] = max(gsMax[gi], gsMax[gi + s]);
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if (gi < scan && gsMin[0].x <= gsMax[0].x) {
+		const PLSource src = Sources[gi];
+		const float3 c = clamp(src.PosRadius.xyz, gsMin[0], gsMax[0]);
+		const float3 e = c - src.PosRadius.xyz;
+		if (src.Atten.w > 0.0 && dot(e, e) < src.PosRadius.w * src.PosRadius.w)
+			InterlockedOr(gsMask[gi >> 5], 1u << (gi & 31u));
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (!inside)
+		return;
+	const uint2 mask = uint2(gsMask[0], gsMask[1]);
+	if (!valid || all(mask == 0u)) {
+		PLVis[p] = 1.0;
+		PLIdx[p] = 0.0;
+		return;
+	}
+
+	// Normal from depth: per axis the neighbour with the smaller depth step (as the sun trace).
+	const int2 maxP = int2(C.RenderSize.xy) - 1;
+	const int2 pl = int2(max(p.x - 1, 0), p.y), pr = int2(min(p.x + 1, maxP.x), p.y);
+	const int2 pu = int2(p.x, max(p.y - 1, 0)), pd = int2(p.x, min(p.y + 1, maxP.y));
+	const float dl = abs(DepthMask[pl]), dr = abs(DepthMask[pr]), du = abs(DepthMask[pu]), dd = abs(DepthMask[pd]);
+	const float3 dx = abs(dl - depth) < abs(dr - depth) ? P - PositionAt(pl, dl) : PositionAt(pr, dr) - P;
+	const float3 dy = abs(du - depth) < abs(dd - depth) ? P - PositionAt(pu, du) : PositionAt(pd, dd) - P;
+	const float dist = length(P);
+	const float3 V = dist > 0.0 ? -P / dist : float3(0, 0, 1);
+	float3 N = cross(dy, dx);
+	const float nLen = length(N);
+	N = nLen > 1e-12 ? N / nLen : V;
+	if (dot(N, V) < 0.0)
+		N = -N;
+
+	// Top K by contribution.
+	float best[4] = { 0.0, 0.0, 0.0, 0.0 };
+	uint bestIdx[4] = { 0u, 0u, 0u, 0u };
+	float total = 0.0;
+	uint count = 0u;
+	[loop] for (uint word = 0u; word < 2u; ++word)
+	{
+		uint bits = mask[word];
+		[loop] while (bits != 0u)
+		{
+			const uint bit = firstbitlow(bits);
+			bits &= bits - 1u;
+			const uint i = word * 32u + bit;
+			const PLSource src = Sources[i];
+			const float3 toLight = src.PosRadius.xyz - P;
+			const float d = length(toLight);
+			const float ndl = d > 1e-3 ? dot(N, toLight / d) : 0.0;
+			if (ndl <= 0.0)
+				continue;
+			const float contribution = src.Atten.w * Attenuation(src, d) * ndl;
+			if (contribution <= 0.0)
+				continue;
+			total += contribution;
+			count += 1u;
+			// Insert into the sorted top K.
+			float v = contribution;
+			uint vi = i + 1u;
+			[unroll] for (uint k = 0u; k < 4u; ++k)
+			{
+				if (k < K && v > best[k]) {
+					const float tv = best[k];
+					const uint ti = bestIdx[k];
+					best[k] = v;
+					bestIdx[k] = vi;
+					v = tv;
+					vi = ti;
+				}
+			}
+		}
+	}
+
+	const float bias = C.Bias.x + C.Bias.y * dist;
+	const float3 origin = P + N * bias;
+	const float n0 = InterleavedGradientNoise(float2(p), uint(C.Params.y));
+	const float n1 = InterleavedGradientNoise(float2(p.yx) + float2(29.0, 61.0), uint(C.Params.y) * 7u + 3u);
+	const bool characters = (flags & kFlagCharacters) && !((flags & kFlagFirstPerson) && dist < kFirstPersonNear);
+	float threshold = max(total * C.Extra.x, C.Extra.y);
+	// The sun gate (outside the traced area the sun trace wrote 1: lit).
+	[branch] if (C.Sun.w > 0.0)
+	{
+		const float sunTerm = C.Sun.w * saturate(dot(N, C.Sun.xyz)) * SunVisibility[p].x;
+		threshold = max(threshold, sunTerm * C.Extra.z);
+	}
+	float4 vis = 1.0;
+	uint rays = 0u;
+	uint4 idx = 0u;
+	[unroll] for (uint k = 0u; k < 4u; ++k)
+	{
+		if (bestIdx[k] == 0u || best[k] < threshold)
+			continue;
+		const PLSource src = Sources[bestIdx[k] - 1u];
+		// A point on the emitter's disc facing the surface (R2 step per slot: the slots decorrelate).
+		const float3 L0 = src.PosRadius.xyz - origin;
+		const float len0 = length(L0);
+		const float3 Ln = L0 / max(len0, 1e-3);
+		const float3 helper = abs(Ln.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+		const float3 T = normalize(cross(helper, Ln));
+		const float3 B = cross(Ln, T);
+		const float u1 = frac(n0 + float(k) * 0.7548776662);
+		const float u2 = frac(n1 + float(k) * 0.5698402910);
+		float sn, cs;
+		sincos(6.2831853 * u2, sn, cs);
+		const float3 target = src.PosRadius.xyz + (T * cs + B * sn) * (sqrt(u1) * C.Bias.w);
+		const float3 L = target - origin;
+		const float len = length(L);
+		const float3 dir = L / max(len, 1e-3);
+		const float tMax = len - asfloat(src.Info.y);
+		idx[k] = bestIdx[k];
+		if (tMax <= 1.0)
+			continue;  // the surface is inside the clearance: lit
+		float tHit;
+		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, tHit);
+		rays += 1u;
+		if (!blocked && characters) {
+			bool test = true;
+			if (flags & kFlagCharCull)
+				test = SphereOnSegment(origin, dir, tMax, C.Spheres[0]) || SphereOnSegment(origin, dir, tMax, C.Spheres[1]);
+			if (test) {
+				blocked = Blocked(origin, dir, tMax, kCharacterMasks, C.Bias.z, tHit);
+				rays += 1u;
+			}
+		}
+		if (blocked)
+			vis[k] = min(sqrt(saturate(tHit / max(len, 1.0))), 1.0) * (254.0 / 255.0);
+	}
+	count = min(count, 15u);
+	[unroll] for (uint b = 0u; b < 4u; ++b)
+		idx[b] |= ((count >> b) & 1u) << 7;
+	PLVis[p] = vis;
+	PLIdx[p] = float4(idx) / 255.0;
+	// One atomic per wave (the lanes that returned early traced nothing).
+	const uint waveRays = WaveActiveSum(rays);
+	if (WaveIsFirstLane() && waveRays > 0u) {
+		uint previous;
+		RayCounter.InterlockedAdd(0, waveRays, previous);
+	}
+}

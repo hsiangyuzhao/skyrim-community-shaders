@@ -700,6 +700,55 @@ namespace Util::LightCensus
 			because("inside the model of " + (r.baseEdid.empty() ? r.baseType : r.baseEdid) + ", no fixture word or glowing shape found");
 		}
 
+		// ---- (46b) shared per-frame classifier -------------------------------------------------------
+
+		Category CategoryFromName(const std::string& a_name)
+		{
+			static const std::pair<std::string_view, Category> kNames[] = { { "player", Category::Player }, { "actor", Category::Actor },
+				{ "effect", Category::Effect }, { "window-beam", Category::WindowBeam }, { "window-glow", Category::WindowGlow },
+				{ "window-fill", Category::WindowFill }, { "fixture-shadow", Category::FixtureShadow }, { "fill", Category::Fill },
+				{ "fixture", Category::Fixture }, { "standalone", Category::Standalone }, { "mesh-attached", Category::MeshAttached } };
+			for (const auto& [name, category] : kNames)
+				if (a_name == name)
+					return category;
+			return Category::Unknown;
+		}
+
+		struct ClassEntry
+		{
+			RE::NiLight* niLight = nullptr;      ///< validation: the same BSLight address with another NiLight is another light
+			RE::TESObjectREFR* owner = nullptr;  ///< ... or another owner
+			Category category = Category::Unknown;
+			bool window = false;                 ///< a window light: re-split by the radius on every call
+			bool spot = false;
+			std::uint32_t lastFrame = 0;
+		};
+		std::unordered_map<const RE::BSLight*, ClassEntry> g_classCache;
+		std::uint64_t g_classReads = 0;
+		std::uint32_t g_classLastTrim = 0;
+
+		/// The light's NiLight and owner (validation of a cache entry), SEH-protected.
+		bool ReadIdentity(RE::BSLight* a_light, RE::NiLight** o_niLight, RE::TESObjectREFR** o_owner)
+		{
+			__try {
+				auto* niLight = a_light ? a_light->light.get() : nullptr;
+				*o_niLight = niLight;
+				*o_owner = niLight ? niLight->GetUserData() : nullptr;
+				return niLight != nullptr;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		Category SplitWindow(bool a_spot, float a_radius)
+		{
+			if (a_spot && a_radius > kWindowBeamRadius)
+				return Category::WindowBeam;
+			if (a_radius < kWindowGlowRadius)
+				return Category::WindowGlow;
+			return Category::WindowFill;
+		}
+
 		uint64_t StableId(const LightRecord& r)
 		{
 			uint64_t h = 14695981039346656037ull;
@@ -1362,6 +1411,71 @@ namespace Util::LightCensus
 		std::scoped_lock lk(g_statusMutex);
 		return g_status;
 	}
+
+	const char* CategoryName(Category a_category)
+	{
+		static constexpr const char* kNames[] = { "unknown", "player", "actor", "effect", "window-beam", "window-glow", "window-fill", "fixture-shadow",
+			"fill", "fixture", "standalone", "mesh-attached" };
+		static_assert(std::size(kNames) == static_cast<std::size_t>(Category::Count));
+		const auto i = static_cast<std::size_t>(a_category);
+		return i < std::size(kNames) ? kNames[i] : "unknown";
+	}
+
+	bool ClassifyCached(RE::BSLight* a_light, float a_radius, std::uint32_t a_frame, std::uint32_t& a_budget, Category& o_category)
+	{
+		o_category = Category::Unknown;
+		RE::NiLight* niLight = nullptr;
+		RE::TESObjectREFR* owner = nullptr;
+		if (!a_light || !ReadIdentity(a_light, &niLight, &owner))
+			return false;
+		if (auto it = g_classCache.find(a_light); it != g_classCache.end() && it->second.niLight == niLight && it->second.owner == owner) {
+			auto& e = it->second;
+			e.lastFrame = a_frame;
+			o_category = e.window ? SplitWindow(e.spot, a_radius) : e.category;
+			return true;
+		}
+		if (a_budget == 0)
+			return false;
+		--a_budget;
+		++g_classReads;
+		// The capture's own read and decision (without its nearby-fixture scan).
+		LightRecord r;
+		FillContext ctx;
+		ctx.player = RE::PlayerCharacter::GetSingleton();
+		if (ctx.player) {
+			ctx.player3D[0] = ctx.player->Get3D(false);
+			ctx.player3D[1] = ctx.player->Get3D(true);
+		}
+		const auto eye = globals::game::frameBufferCached.GetCameraPosAdjust(0);
+		ctx.camera = { eye.x, eye.y, eye.z };
+		if (!FillRecordSafe(a_light, &r, &ctx))
+			r.readError = true;
+		r.radius = a_radius;
+		static const std::vector<FixtureRef> kNoFixtures;
+		Classify(r, kNoFixtures);
+		ClassEntry e;
+		e.niLight = niLight;
+		e.owner = owner;
+		e.category = CategoryFromName(r.category);
+		e.window = e.category == Category::WindowBeam || e.category == Category::WindowGlow || e.category == Category::WindowFill;
+		e.spot = r.kind == "spot" || r.kind == "shadow-spot";
+		e.lastFrame = a_frame;
+		g_classCache[a_light] = e;
+		o_category = e.window ? SplitWindow(e.spot, a_radius) : e.category;
+		return true;
+	}
+
+	void TrimClassifierCache(std::uint32_t a_frame, std::uint32_t a_maxAge)
+	{
+		// Every 64 frames is enough: the entries are small and validated on every lookup.
+		if (a_frame - g_classLastTrim < 64u && g_classCache.size() < 8192)
+			return;
+		g_classLastTrim = a_frame;
+		std::erase_if(g_classCache, [&](const auto& a_entry) { return a_frame - a_entry.second.lastFrame > a_maxAge; });
+	}
+
+	std::uint32_t ClassifierCacheSize() { return static_cast<std::uint32_t>(g_classCache.size()); }
+	std::uint64_t ClassifierReads() { return g_classReads; }
 
 	bool WantsSources()
 	{

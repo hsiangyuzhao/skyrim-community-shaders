@@ -7,6 +7,7 @@
 #include "State.h"
 #include "Utils/FrameTrace.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/LightCensus.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	RayTracing::Settings,
@@ -38,7 +39,15 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	CustomHistory,
 	CustomDenoiseHalf,
 	CustomFarDenoiseScale,
-	SigmaStabilizedFrames)
+	SigmaStabilizedFrames,
+	PointLights,
+	PointLightsPerPixel,
+	PointLightsMaxSources,
+	PointLightsDistance,
+	PointLightsNative,
+	PointLightsKeepSSPLS,
+	PointLightsSize,
+	PointLightsClearance)
 
 namespace
 {
@@ -117,6 +126,16 @@ namespace
 	LoadingMenuSink g_loadingSink;
 
 	std::string Megabytes(std::uint64_t a_bytes) { return std::format("{:.1f} MB", static_cast<double>(a_bytes) / (1024.0 * 1024.0)); }
+
+	// (46b) Point-light shadows.
+	int ValidPointK(int a_value) { return a_value >= 4 ? 4 : (a_value >= 2 ? 2 : 1); }
+	constexpr float kPointMinShare = 0.02f;          // a light under 2 % of the pixel's point light is not traced
+	constexpr float kPointMinContribution = 1e-3f;   // nor one that hardly lights it at all
+	constexpr float kPointHistoryWeight = 0.25f;     // this frame's weight in the denoiser's history blend
+	constexpr float kPointMaxFilterRadius = 12.0f;   // px
+	constexpr float kPointSunShare = 0.05f;          // at a sunlit pixel a point light under 5 % of the sun's light there is not traced
+	constexpr std::uint32_t kPointFlagCharacters = 1u, kPointFlagFirstPerson = 2u, kPointFlagCharCull = 4u;  // TracePointLightsCS
+	constexpr std::uint32_t kPointDenoiseHistory = 1u, kPointDenoiseDebug = 2u;                             // PointDenoiseCS
 
 	struct GpuBucketScope
 	{
@@ -426,6 +445,12 @@ void RayTracing::LoadSettings(json& o_json)
 	settings.SigmaStabilizedFrames = std::clamp(settings.SigmaStabilizedFrames, 0, 5);
 	settings.Foliage = std::clamp(settings.Foliage, 0, 2);
 	settings.RtContactScale = std::isfinite(settings.RtContactScale) ? std::clamp(settings.RtContactScale, 0.0f, 32.0f) : 8.0f;
+	// (46b)
+	settings.PointLightsPerPixel = ValidPointK(settings.PointLightsPerPixel);
+	settings.PointLightsMaxSources = std::clamp(settings.PointLightsMaxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources));
+	settings.PointLightsDistance = std::isfinite(settings.PointLightsDistance) ? std::clamp(settings.PointLightsDistance, 512.0f, 8192.0f) : 4000.0f;
+	settings.PointLightsSize = std::isfinite(settings.PointLightsSize) ? std::clamp(settings.PointLightsSize, 0.0f, 32.0f) : 6.0f;
+	settings.PointLightsClearance = std::isfinite(settings.PointLightsClearance) ? std::clamp(settings.PointLightsClearance, 0.0f, 128.0f) : 32.0f;
 }
 
 void RayTracing::SaveSettings(json& o_json)
@@ -452,6 +477,7 @@ void RayTracing::DataLoaded()
 void RayTracing::SetupResources()
 {
 	combineCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<CombineCB>());
+	pointDenoiseCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PointDenoiseCB>());  // (46b)
 
 	// Screen Space Shadows hand-off reads its R8 texture through a UAV.
 	D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support{ DXGI_FORMAT_R8_UNORM, 0 };
@@ -471,6 +497,7 @@ void RayTracing::ClearShaderCache()
 	denoiseHalfHCS = nullptr;
 	denoiseHalfVCS = nullptr;
 	sigmaPrepCS = nullptr;
+	pointDenoiseCS = nullptr;  // (46b)
 }
 
 ID3D11ComputeShader* RayTracing::GetShader(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name)
@@ -494,6 +521,11 @@ void RayTracing::Disable(Status a_status, std::string a_reason)
 	lastFailureReason = statusReason;
 	activeThisFrame = false;
 	pending.active = false;  // (45l)
+	// (46b) No point-light tags, nothing bound for the pixel shaders.
+	pointSelector.Clear();
+	pointThisFrame = false;
+	pointHistoryValid = false;
+	UnbindPointLights();
 	RayTracingCasterFilter::Clear();
 	characters.ReleaseAll(backend);  // (45i) (a backend that is gone ignores the handles)
 	scene.ReleaseAll(backend);
@@ -545,6 +577,7 @@ void RayTracing::ReleaseD3D11Resources()
 	debugColorSRV = nullptr;
 	ReleaseDenoiser();
 	ReleaseSigma();
+	ReleasePointDenoiser();  // (46b)
 	prevCameraValid = false;
 	maskDesc = {};
 	d3d11Bytes = 0;
@@ -850,6 +883,9 @@ void RayTracing::LatchFrame()
 	// now (it stays free until the trace is recorded), the scene has built cells, and the sky /
 	// exterior conditions RunFrame checks hold. Otherwise the shadow map keeps every caster and a
 	// frame that cannot trace falls back to it cleanly.
+	// (46b) Until this frame's trace: no point-light result for the pixel shaders (passes before the prepass, e.g.
+	// reflections, see last frame's Light Limit Fix tags; with t40 / t41 null they take the old path).
+	UnbindPointLights();
 	auto* sky = globals::game::sky;
 	// (45k) Not during a loading screen or the warm-up after it (nor while the RT result still fades in).
 	const bool active = settings.Enabled && status == Status::Active && phase == Phase::Play && fade >= 1.0f &&
@@ -938,6 +974,15 @@ void RayTracing::Prepass()
 	combinedThisFrame = false;
 	pending.active = false;
 	frameStart = Qpc();
+	// (46b) Point lights: nothing published until this frame's trace is submitted; the history only follows
+	// a frame that was denoised.
+	pointSelector.Publish(false);
+	pointThisFrame = false;
+	pointK = 0;
+	pointCpuMs = 0.0f;
+	pointHistoryValid = pointHistoryValid && pointDenoised;
+	pointDenoised = false;
+	UnbindPointLights();
 	// (45n) Whatever path this Prepass takes: an Early Prep context that the trace did not use is released
 	// (D3D12 signal only), and the frame-start flags end with this frame.
 	struct EarlyPrepEnd
@@ -962,6 +1007,11 @@ void RayTracing::Prepass()
 			backend.WaitForTrace();  // (45l) a deferred wait left over (GPU-side only)
 		if (status != Status::Off) {
 			// Switched off: the scene goes (BLASes retire on the GPU's schedule); the device stays.
+			// (46b) The point lights' textures too.
+			pointSelector.Clear();
+			ReleasePointDenoiser();
+			if (backend.IsReady())
+				backend.ReleasePointResources();
 			RayTracingCasterFilter::Clear();
 			characters.ReleaseAll(backend);  // (45i)
 			if (backend.IsReady())
@@ -1159,6 +1209,15 @@ void RayTracing::PublishCpuSplit()
 		detail.workerReleaseMs = backend.LastWorkerReleaseMs();
 		detail.queueGapGpuMs = activeThisFrame ? stats.lastQueueGapMs : -1.0f;
 		detail.stillReused = characters.StillReusedLastFrame();
+		// (46b) Point-light shadows.
+		const auto& ps = pointSelector.GetStats();
+		detail.plK = pointThisFrame ? static_cast<int>(pointK) : 0;
+		detail.plSources = pointThisFrame ? ps.sources : 0;
+		detail.plCandidates = ps.candidates;
+		detail.plRays = stats.pointRaysPerFrame;
+		detail.plGpuMs = stats.lastPointGpuMs;
+		detail.plDenoiseGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingPointDenoise);
+		detail.plCpuMs = settings.PointLights ? pointCpuMs : -1.0f;
 	}
 	detail.sssGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::ScreenSpaceShadows);
 	// (45k) A slow D3D12 record + submit names its slowest call in the log (at most every 2 s).
@@ -1195,6 +1254,7 @@ void RayTracing::RunFrame()
 	backend.WaitForTrace();
 	UpdateAlphaCasters();  // (45h, 45j) per-kind choices: a change re-captures the scene
 	UpdateCharacters();                                // (45i)
+	UpdatePointLights();                               // (46b)
 	if (status == Status::Off || status == Status::Unavailable)
 		status = Status::Waiting;
 
@@ -1301,6 +1361,14 @@ void RayTracing::RunFrame()
 	auto direction = sunLight->GetWorldDirection();
 	float3 toSun = { -direction.x, -direction.y, -direction.z };
 	toSun.Normalize();
+	// (46b) The sun's (or the moon's) brightness, for the point lights' sun gate.
+	float sunStrength = 0.0f;
+	{
+		const auto& sunData = sunLight->GetLightRuntimeData();
+		sunStrength = std::max({ sunData.diffuse.red, sunData.diffuse.green, sunData.diffuse.blue });
+		if (!std::isfinite(sunStrength) || sunStrength < 0.0f)
+			sunStrength = 0.0f;
+	}
 
 	const auto& invViewProj = fb.GetCameraViewProjInverse(0);
 	static_assert(sizeof(invViewProj) == sizeof(float) * 16);
@@ -1389,6 +1457,18 @@ void RayTracing::RunFrame()
 	input.skinDraws = &skinDraws;  // (45i) empty: the 45h pipelines run
 	input.skinBones = &skinBones;
 	input.deferWait = true;  // (45l) FinishFrame waits (after the other features' prepasses)
+	// (46b) Point-light shadows: this frame's sources, traced right after the sun in the same submission.
+	{
+		const std::int64_t pointStart = Qpc();
+		try {
+			if (!PreparePointLights(input, traceRect, camX, camY, camZ, sunStrength))
+				input.pointLights = nullptr;
+		} catch (const std::exception& e) {
+			input.pointLights = nullptr;
+			SwitchOffPointLights(std::format("exception in the light selection: {}", e.what()));
+		}
+		pointCpuMs = static_cast<float>(static_cast<double>(Qpc() - pointStart) * QpcMs());
+	}
 
 	auto* context = globals::d3d::context;
 	auto* screenSpaceShadows = &globals::features::screenSpaceShadows;
@@ -1541,6 +1621,12 @@ void RayTracing::RunFrame()
 		++frameIndex;
 		return;
 	}
+
+	// (46b) The point lights went out with it: Light Limit Fix (next in the prepass list) may tag its lights.
+	pointThisFrame = input.pointLights != nullptr && backend.GetStats().pointTracedLastFrame;
+	pointSelector.Publish(pointThisFrame);
+	if (!pointThisFrame)
+		pointK = 0;
 
 	// (45l) The D3D11 side of this frame: FinishFrame (now, or after the other prepasses with Late Sync).
 	pending.active = true;
@@ -1768,6 +1854,14 @@ void RayTracing::FinishFrame()
 		context->CopySubresourceRegion(mask.texture, 0, 0, 0, 0, maskTemp.get(), 0, &box);
 	}
 	timers->End(Util::GpuBucket::RayTracingCombine);
+	// 5. (46b) Point-light shadows: denoise, then bind them for the pixel shaders.
+	if (pointThisFrame) {
+		try {
+			FinishPointLights();
+		} catch (const std::exception& e) {
+			SwitchOffPointLights(std::format("exception in the denoiser: {}", e.what()));
+		}
+	}
 	// This frame's camera is the history's next time.
 	std::copy_n(pending.viewProj, 16, prevViewProj);
 	std::copy_n(pending.viewProjUnjittered, 16, prevViewProjUnjittered);
@@ -1805,6 +1899,204 @@ void RayTracing::DrawDebugOverlay()
 	context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
 	context->CSSetConstantBuffers(0, 1, nullCb);
 	context->CSSetShader(nullptr, nullptr, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// (46b) Point-light shadows
+// ---------------------------------------------------------------------------------------------
+
+void RayTracing::SwitchOffPointLights(std::string a_reason)
+{
+	// Only the point lights: the sun keeps going. The page shows why; ticking the box again retries.
+	pointOffReason = std::move(a_reason);
+	settings.PointLights = false;
+	pointSelector.Clear();
+	pointThisFrame = false;
+	pointHistoryValid = false;
+	UnbindPointLights();
+	logger::warn("[RayTracing] Point-light shadows switched off: {}", pointOffReason);
+}
+
+void RayTracing::UpdatePointLights()
+{
+	// Turned on (again) by the user: an earlier automatic switch-off is forgotten.
+	if (settings.PointLights && !pointRequested) {
+		backend.ClearPointFault();
+		pointOffReason.clear();
+	}
+	if (settings.PointLights && !backend.PointFault().empty())
+		SwitchOffPointLights(backend.PointFault());
+	else if (settings.PointLights && backend.IsReady() && !backend.PointAvailable())
+		SwitchOffPointLights("the GPU driver did not accept the point-light ray query shader");
+	pointRequested = settings.PointLights;
+	if (!settings.PointLights) {
+		pointSelector.Clear();
+		if (pointVis[0].texture)
+			ReleasePointDenoiser();
+		if (backend.IsReady() && backend.PointBytes())
+			backend.ReleasePointResources();
+	}
+}
+
+void RayTracing::UnbindPointLights()
+{
+	if (!pointBound)
+		return;
+	ID3D11ShaderResourceView* nulls[2]{};
+	globals::d3d::context->PSSetShaderResources(40, 2, nulls);
+	pointBound = false;
+}
+
+void RayTracing::ReleasePointDenoiser()
+{
+	UnbindPointLights();
+	for (auto* t : { &pointVis[0], &pointVis[1], &pointIdx[0], &pointIdx[1], &pointDist[0], &pointDist[1] })
+		*t = {};
+	pointHistoryValid = false;
+	d3d11Bytes -= std::min(d3d11Bytes, pointD3D11Bytes);
+	pointD3D11Bytes = 0;
+}
+
+bool RayTracing::EnsurePointDenoiser(std::uint32_t a_width, std::uint32_t a_height)
+{
+	if (pointVis[0].texture && pointVis[1].texture && pointIdx[0].texture && pointIdx[1].texture && pointDist[0].texture && pointDist[1].texture) {
+		D3D11_TEXTURE2D_DESC d{};
+		pointVis[0].texture->GetDesc(&d);
+		if (d.Width == a_width && d.Height == a_height)
+			return true;
+	}
+	ReleasePointDenoiser();
+	bool ok = true;
+	for (int i = 0; i < 2 && ok; ++i) {
+		ok = CreateDenoiseTexture(this, pointVis[i].texture, pointVis[i].srv, pointVis[i].uav, a_width, a_height, DXGI_FORMAT_R8G8B8A8_UNORM, "RayTracing PointVis") &&
+		     CreateDenoiseTexture(this, pointIdx[i].texture, pointIdx[i].srv, pointIdx[i].uav, a_width, a_height, DXGI_FORMAT_R8G8B8A8_UNORM, "RayTracing PointIdx") &&
+		     CreateDenoiseTexture(this, pointDist[i].texture, pointDist[i].srv, pointDist[i].uav, a_width, a_height, DXGI_FORMAT_R16_FLOAT, "RayTracing PointDist");
+	}
+	if (!ok) {
+		ReleasePointDenoiser();
+		SwitchOffPointLights("could not create the denoiser textures");
+		return false;
+	}
+	pointD3D11Bytes = static_cast<std::uint64_t>(a_width) * a_height * 2 * (4 + 4 + 2);
+	d3d11Bytes += pointD3D11Bytes;
+	pointHistoryValid = false;
+	pointWrite = 0;
+	return true;
+}
+
+bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const float a_traceRect[4], double a_camX, double a_camY, double a_camZ, float a_sunStrength)
+{
+	pointK = 0;
+	if (!settings.PointLights || !backend.PointAvailable() || !maskTemp)
+		return false;
+	if (!backend.EnsurePointTextures(maskDesc.Width, maskDesc.Height)) {
+		if (!backend.PointFault().empty())
+			SwitchOffPointLights(backend.PointFault());
+		return false;
+	}
+	if (!EnsurePointDenoiser(maskDesc.Width, maskDesc.Height))
+		return false;
+
+	RayTracingPointLights::Config config;
+	config.native = settings.PointLightsNative;
+	config.keepSSPLS = settings.PointLightsKeepSSPLS;
+	config.split = pointSplit;
+	config.maxSources = static_cast<std::uint32_t>(std::clamp(settings.PointLightsMaxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources)));
+	config.maxDistance = settings.PointLightsDistance;
+	config.clearance = settings.PointLightsClearance;
+	const double camera[3] = { a_camX, a_camY, a_camZ };
+	const float worldRect[4] = { static_cast<float>(a_traceRect[0] + a_camX), static_cast<float>(a_traceRect[1] + a_camY),
+		static_cast<float>(a_traceRect[2] + a_camX), static_cast<float>(a_traceRect[3] + a_camY) };
+	const auto& viewProj = globals::game::frameBufferCached.GetCameraViewProj(0);
+	static_assert(sizeof(viewProj) == sizeof(float) * 16);
+	float viewProjF[16];
+	std::memcpy(viewProjF, &viewProj, sizeof(viewProjF));
+	const std::uint32_t scan = pointSelector.Select(config, camera, viewProjF, worldRect, globals::state->frameCount, pointSources.data());
+	if (scan == 0)
+		return false;
+
+	const std::uint32_t K = static_cast<std::uint32_t>(ValidPointK(settings.PointLightsPerPixel));
+	auto& c = pointInput.constants;
+	std::memcpy(c.invViewProj, a_input.constants.invViewProj, sizeof(c.invViewProj));
+	std::copy_n(a_input.constants.renderSize, 4, c.renderSize);
+	std::copy_n(a_traceRect, 4, c.rect);
+	std::uint32_t flags = 0;
+	if (a_input.skinDraws && !a_input.skinDraws->empty()) {
+		flags |= kPointFlagCharacters | kPointFlagCharCull;
+		if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); playerCamera && playerCamera->IsInFirstPerson())
+			flags |= kPointFlagFirstPerson;
+	}
+	c.params[0] = static_cast<float>(scan);
+	c.params[1] = static_cast<float>(frameIndex % 1024);
+	std::memcpy(&c.params[2], &flags, sizeof(float));
+	c.params[3] = static_cast<float>(K);
+	c.bias[0] = kRayBiasConstant;
+	c.bias[1] = kRayBiasPerUnit;
+	c.bias[2] = kCharacterSelfShadowOffset;
+	c.bias[3] = settings.PointLightsSize;
+	c.extra[0] = kPointMinShare;
+	c.extra[1] = kPointMinContribution;
+	c.extra[2] = kPointSunShare;
+	c.extra[3] = 0.0f;
+	std::copy_n(a_input.constants.spheres, 8, c.spheres);
+	std::copy_n(a_input.constants.toSun, 3, c.sun);
+	c.sun[3] = a_sunStrength;
+	pointInput.sources = pointSources.data();
+	pointInput.sourceBytes = static_cast<std::uint32_t>(sizeof(pointSources));
+	pointInput.scan = scan;
+	a_input.pointLights = &pointInput;
+	pointK = K;
+	return true;
+}
+
+void RayTracing::FinishPointLights()
+{
+	auto* shader = GetShader(pointDenoiseCS, L"Data\\Shaders\\RayTracing\\PointDenoiseCS.hlsl", "PointDenoiseCS");
+	if (!shader) {
+		SwitchOffPointLights("the point-light denoiser (PointDenoiseCS) did not compile");
+		return;
+	}
+	if (!pointVis[0].texture || !backend.PointVisibilitySRV() || !backend.PointSourcesSRV())
+		return;
+	auto* context = globals::d3d::context;
+	auto* timers = Util::GpuPassTimers::GetSingleton();
+	const std::uint32_t write = pointWrite, read = pointWrite ^ 1u;
+	const bool plDebug = debugView >= DebugView::PLCandidates && debugView <= DebugView::PLDenoised && debugColorUAV;
+	PointDenoiseCB cb{};
+	cb.Params[0] = settings.PointLightsSize;
+	cb.Params[1] = kPointHistoryWeight;
+	const std::uint32_t flags = (pointHistoryValid && prevCameraValid ? kPointDenoiseHistory : 0u) | (plDebug ? kPointDenoiseDebug : 0u);
+	std::memcpy(&cb.Params[2], &flags, sizeof(float));
+	cb.Params[3] = kPointMaxFilterRadius;
+	cb.Extra[0] = static_cast<float>(pointK);
+	pointDenoiseCB->Update(cb);
+
+	timers->Begin(Util::GpuBucket::RayTracingPointDenoise);
+	ID3D11Buffer* cbs[2] = { combineCB->CB(), pointDenoiseCB->CB() };
+	ID3D11ShaderResourceView* srvs[6] = { backend.PointVisibilitySRV(), backend.PointSourcesSRV(), backend.DepthMaskSRV(), pointVis[read].srv.get(),
+		pointIdx[read].srv.get(), pointDist[read].srv.get() };
+	ID3D11UnorderedAccessView* uavs[4] = { pointVis[write].uav.get(), pointIdx[write].uav.get(), pointDist[write].uav.get(), plDebug ? debugColorUAV.get() : nullptr };
+	context->CSSetConstantBuffers(0, 2, cbs);
+	context->CSSetShaderResources(0, 6, srvs);
+	context->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+	context->CSSetShader(shader, nullptr, 0);
+	context->Dispatch((pending.width + 7) / 8, (pending.height + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullSrvs[6]{};
+	ID3D11UnorderedAccessView* nullUavs[4]{};
+	ID3D11Buffer* nullCbs[2]{};
+	context->CSSetShaderResources(0, 6, nullSrvs);
+	context->CSSetUnorderedAccessViews(0, 4, nullUavs, nullptr);
+	context->CSSetConstantBuffers(0, 2, nullCbs);
+	context->CSSetShader(nullptr, nullptr, 0);
+	timers->End(Util::GpuBucket::RayTracingPointDenoise);
+
+	// For the pixel shaders of this frame (RayTracing/PointLightShadows.hlsli).
+	ID3D11ShaderResourceView* views[2] = { pointVis[write].srv.get(), pointIdx[write].srv.get() };
+	context->PSSetShaderResources(40, 2, views);
+	pointBound = true;
+	pointWrite ^= 1u;
+	pointHistoryValid = true;
+	pointDenoised = true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2049,9 +2341,86 @@ void RayTracing::DrawSettings()
 		ImGui::TreePop();
 	}
 
+	// (46b) Point-light shadows.
+	if (ImGui::TreeNodeEx("Point Lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::Checkbox("Ray-Traced Point-Light Shadows", &settings.PointLights);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Braziers, campfires, torches, candles, lanterns and the like cast ray-traced shadows (outdoors, inside the traced area).");
+			ImGui::Text("  Window lights, fill lights, magic / effect lights and the player's own light are left as they are.");
+			ImGui::Text("  For those lights Screen Space Point Light Shadows are replaced (where a pixel has its ray-traced result).");
+			ImGui::Text("Off: point lights exactly as before. Needs Ray Tracing on. Interiors follow in a later package.");
+		}
+		if (!settings.PointLights)
+			ImGui::BeginDisabled();
+		{
+			static constexpr int kKs[3] = { 1, 2, 4 };
+			const char* kNames[3] = { "1", "2", "4" };
+			int index = settings.PointLightsPerPixel >= 4 ? 2 : (settings.PointLightsPerPixel >= 2 ? 1 : 0);
+			if (ImGui::Combo("Lights per Pixel", &index, kNames, 3))
+				settings.PointLightsPerPixel = kKs[std::clamp(index, 0, 2)];
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("How many of the lights that light a pixel most are traced there (one ray each). Default 2.");
+				ImGui::Text("  Weaker lights at that pixel keep their old shadows. More = slower.");
+			}
+		}
+		ImGui::SliderInt("Max Lights", &settings.PointLightsMaxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources));
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Shadow-casting lights per frame at most (the ones that matter most on screen). Lights within 64 units count as one.");
+		ImGui::SliderFloat("Max Distance", &settings.PointLightsDistance, 512.0f, 8192.0f, "%.0f units");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Lights farther from the camera keep their old shadows. 70 units = 1 m. Default 4000 (about 57 m).");
+		ImGui::Checkbox("Native Shadow Lights Use RT Shadows", &settings.PointLightsNative);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("The game's own shadow-casting lights (fireplaces, some campfires): their ray-traced shadow replaces the game's");
+			ImGui::Text("  shadow map in the lighting (default on). Off: they keep the game's shadow map.");
+			ImGui::Text("Not yet: stopping the game from drawing their shadow maps (saves time mostly indoors) comes with the interiors package.");
+		}
+		ImGui::Checkbox("Keep Screen-Space Contact Shadows", &settings.PointLightsKeepSSPLS);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Off (default): Screen Space Point Light Shadows are skipped for ray-traced lights.");
+			ImGui::Text("  On: they stay on as well; the darker of both counts (small contact shadows of grass and leaves the ray tracer does not see).");
+		}
+		ImGui::SliderFloat("Light Size", &settings.PointLightsSize, 0.0f, 32.0f, "%.1f units");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Radius of the flame the rays aim at: larger = softer shadow edges (a little grainier before the clean-up). 0 = hard edges.");
+		ImGui::SliderFloat("Fixture Clearance", &settings.PointLightsClearance, 0.0f, 128.0f, "%.0f units");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Rays stop this far before the light, so the lamp, brazier bowl or torch holding it does not shadow its own light.");
+			ImGui::Text("  Too small: a dark ring or a black patch around a lamp. Too large: objects right next to a light cast nothing.");
+		}
+		if (!settings.PointLights)
+			ImGui::EndDisabled();
+		if (!pointOffReason.empty()) {
+			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
+			ImGui::TextWrapped("Point-light shadows were switched off automatically: %s", pointOffReason.c_str());
+			ImGui::PopStyleColor();
+		}
+		const auto& ps = pointSelector.GetStats();
+		const auto& rt = backend.GetStats();
+		if (settings.PointLights && settings.Enabled) {
+			ImGui::Text("This frame: %u lights traced (K %u) of %u candidates (%u merged, %u over the cap, %u engine shadow lights); %u lights in use",
+				pointThisFrame ? ps.sources : 0u, pointThisFrame ? pointK : 0u, ps.candidates, ps.merged, ps.capped, ps.native, ps.used);
+			ImGui::Text("Cost: trace %.2f ms GPU, %s rays per frame; denoiser %.2f ms GPU; selection %.3f ms CPU",
+				std::max(rt.lastPointGpuMs, 0.0f), rt.pointRaysPerFrame >= 0 ? std::format("{:.2f} M", static_cast<double>(rt.pointRaysPerFrame) / 1e6).c_str() : "?",
+				std::max(Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingPointDenoise), 0.0f), pointCpuMs);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("GPU times are the last samples (the denoiser's only while the Performance Overlay or an F7 trace runs).");
+				std::string reasons;
+				for (int i = 0; i < 8; ++i)
+					if (ps.byReason[i])
+						reasons += std::format("{}{} {}", reasons.empty() ? "" : ", ", RayTracingPointLights::kRejectNames[i], ps.byReason[i]);
+				ImGui::Text("Left out this frame: %s", reasons.empty() ? "none" : reasons.c_str());
+				ImGui::Text("Not classified yet (asked again next frame): %u; classifier cache %u lights, %llu read so far; new slots this frame %u",
+					ps.pending, Util::LightCensus::ClassifierCacheSize(), static_cast<unsigned long long>(Util::LightCensus::ClassifierReads()), ps.slotChanges);
+			}
+		}
+		ImGui::TreePop();
+	}
+
 	if (ImGui::TreeNodeEx("Debug")) {
 		const char* views[] = { "Off", "Shadow Source", "RT vs Shadow Map", "BLAS Coverage", "Raw RT Visibility", "RT Hit vs Depth", "Penumbra Radius",
-			"History Length", "Adaptive Rays", "SSS: RT Casters", "Distance Quality", "Character Rays" };
+			"History Length", "Adaptive Rays", "SSS: RT Casters", "Distance Quality", "Character Rays", "Point Lights: Candidates", "Point Lights: Traced Lights",
+			"Point Lights: Raw Rays", "Point Lights: Denoised" };
 		static_assert(IM_ARRAYSIZE(views) == static_cast<int>(DebugView::Count));
 		int view = static_cast<int>(debugView);
 		if (ImGui::Combo("Debug View", &view, views, IM_ARRAYSIZE(views)))
@@ -2078,7 +2447,14 @@ void RayTracing::DrawSettings()
 			ImGui::Text("Distance Quality: green = full quality, towards red = fewer extra rays and a smaller blur with distance,");
 			ImGui::Text("  blue = pixels not traced this frame (checkerboard / half pattern), filled from their neighbours.");
 			ImGui::Text("Character Rays: cyan = the extra ray against characters ran here, purple = a character shadows it.");
+			ImGui::Text("Point Lights: Candidates: shadow-casting lights that reach the pixel (its lit side): green 1, yellow 2, orange 3-4, red 5+.");
+			ImGui::Text("Point Lights: Traced Lights: a colour per light; stripes = a second (third, fourth) light traced there too.");
+			ImGui::Text("Point Lights: Raw Rays / Denoised: the point-light shadows before / after the clean-up (white = lit).");
 		}
+		// (46b) A/B: ray-traced point-light shadows on the left half, the old ones on the right.
+		ImGui::Checkbox("Point Lights: Split Screen (RT left, old right)", &pointSplit);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Left half of the screen: ray-traced point-light shadows; right half: Screen Space Point Light Shadows / shadow maps as before.");
 
 		const auto& rt = backend.GetStats();
 		const auto& sc = scene.GetStats();
@@ -2290,6 +2666,11 @@ std::string RayTracing::DescribeForProfile() const
 		kDenoisers[static_cast<int>(EffectiveDenoiser())], UpscalingRRActive() ? " (Upscaling RR on)" : "", q.baseRays, q.extraRays, q.coneDegrees,
 		kPatternNames[std::min(q.tracePattern, 2u)], kPatternNames[std::min(q.farPattern, 2u)], q.falloffStart, q.falloffEnd, q.npcReduced ? "reduced" : "full",
 		q.denoiseRadius, q.denoiseTaps, q.denoiseHalf ? "half res" : "full res", q.farDenoiseScale, q.history, q.clampSigma, settings.SigmaStabilizedFrames);
+	// (46b)
+	text += std::format(", point lights {} (K {}, max {}, distance {:.0f}, native shadow lights {}, keep SSPLS {}, size {:.1f}, clearance {:.0f}{}{})",
+		settings.PointLights ? "on" : "off", ValidPointK(settings.PointLightsPerPixel), settings.PointLightsMaxSources, settings.PointLightsDistance,
+		settings.PointLightsNative ? "RT" : "shadow map", settings.PointLightsKeepSSPLS ? "yes" : "no", settings.PointLightsSize, settings.PointLightsClearance,
+		pointSplit ? ", split screen" : "", pointOffReason.empty() ? "" : ", switched off: " + pointOffReason);
 	return text;
 }
 
@@ -2332,5 +2713,15 @@ nlohmann::json RayTracing::DescribeJson() const
 		{ "instances", cpuWorst.instances }, { "missed", cpuWorst.missed }, { "execute", cpuWorst.execute }, { "d3d11", cpuWorst.d3d11 },
 		{ "end_frame", cpuWorst.endFrame } };
 	j["tlas_instances"] = stats.instancesLastFrame;
+	// (46b)
+	{
+		const auto& ps = pointSelector.GetStats();
+		j["point_lights"] = { { "enabled", settings.PointLights }, { "k", ValidPointK(settings.PointLightsPerPixel) }, { "max_sources", settings.PointLightsMaxSources },
+			{ "distance", settings.PointLightsDistance }, { "native", settings.PointLightsNative }, { "keep_sspls", settings.PointLightsKeepSSPLS },
+			{ "size", settings.PointLightsSize }, { "clearance", settings.PointLightsClearance }, { "traced", pointThisFrame }, { "sources", ps.sources },
+			{ "candidates", ps.candidates }, { "merged", ps.merged }, { "capped", ps.capped }, { "native_lights", ps.native }, { "gpu_ms", stats.lastPointGpuMs },
+			{ "rays_per_frame", stats.pointRaysPerFrame }, { "denoise_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingPointDenoise) },
+			{ "cpu_ms", pointCpuMs }, { "off_reason", pointOffReason } };
+	}
 	return j;
 }

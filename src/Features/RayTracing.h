@@ -6,6 +6,7 @@
 #include "Features/NRDReblurIntegration.h"
 #include "Features/RayTracing/Backend.h"
 #include "Features/RayTracing/Characters.h"
+#include "Features/RayTracing/PointLights.h"
 #include "Features/RayTracing/Scene.h"
 
 /**
@@ -33,6 +34,10 @@ public:
 	virtual inline std::string GetShortName() override { return "RayTracing"; }
 	virtual inline std::string_view GetCategory() const override { return "Lighting"; }
 	virtual inline bool SupportsVR() override { return false; }
+	/// (46b) Lighting / Water read the ray-traced point-light shadows (RayTracing/PointLightShadows.hlsli); inert per light
+	/// unless Light Limit Fix tags it (Light::rtShadow), so the old path is taken whenever nothing is traced.
+	virtual inline std::string_view GetShaderDefineName() override { return "RT_POINT_SHADOWS"; }
+	virtual bool HasShaderDefine(RE::BSShader::Type a_type) override { return a_type == RE::BSShader::Type::Lighting || a_type == RE::BSShader::Type::Water; }
 
 	virtual std::pair<std::string, std::vector<std::string>> GetFeatureSummary() override
 	{
@@ -71,6 +76,11 @@ public:
 		RtCasterMask,    // (45k) Screen Space Shadows "non-RT casters only": traced casters
 		DistanceQuality, // (45l) fall-off and pattern-filled pixels
 		CharacterRays,   // (45l) where the character ray ran
+		// (46b) Point-light shadows (PointDenoiseCS writes them; the sun views above stay as they are).
+		PLCandidates,    // shadow-casting lights that reach the pixel
+		PLSources,       // which source each slot traces (colour per source)
+		PLRaw,           // this frame's rays (all traced lights multiplied)
+		PLDenoised,      // after the denoiser
 		Count
 	};
 
@@ -119,6 +129,15 @@ public:
 		float CustomFarDenoiseScale = 0.75f;
 		// NRD SIGMA: frames of its temporal stabilisation (0 = none: least lag on moving shadows).
 		int SigmaStabilizedFrames = 4;
+		// (46b) Point-light shadows (Ray Tracing page, Point Lights).
+		bool PointLights = true;
+		int PointLightsPerPixel = 2;         // K: 1, 2 or 4 lights traced per pixel
+		int PointLightsMaxSources = 64;
+		float PointLightsDistance = 4000.0f;  // light centre to camera (units)
+		bool PointLightsNative = true;       // the engine's shadow-map lights use RT shadows (instead of their shadow map)
+		bool PointLightsKeepSSPLS = false;   // Screen Space Point Light Shadows stay on as contact shadows for RT lights
+		float PointLightsSize = 6.0f;        // emitter radius (soft edges)
+		float PointLightsClearance = 32.0f;  // the ray stops this far before the light (its own fixture casts nothing)
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted
@@ -156,6 +175,10 @@ public:
 	/// (45l) Deferred::PrepassPasses, after every feature's Prepass: the D3D11 side of this frame's trace
 	/// (wait, Screen Space Shadows, denoiser, combine) when Late Sync deferred it. No-op otherwise.
 	void FinishPrepass();
+
+	/// (46b) Light Limit Fix, for each light it uploads: the ray-traced shadow tag (LightData::rtShadow), 0 unless
+	/// this frame's trace has a shadow source for the light.
+	[[nodiscard]] std::uint32_t PointLightTag(const RE::BSLight* a_light) const { return pointSelector.TagFor(a_light); }
 
 	/// True when this frame's shadow mask is (being) ray traced.
 	[[nodiscard]] bool IsActiveThisFrame() const { return activeThisFrame; }
@@ -372,4 +395,41 @@ private:
 	bool charactersRequested = false;
 	std::string charactersOffReason;
 	void UpdateCharacters();
+
+	// (46b) Point-light shadows.
+	struct alignas(16) PointDenoiseCB
+	{
+		float Params[4];  // emitter radius, this frame's weight in the history, flags (bits), max filter radius (px)
+		float Extra[4];   // K, unused x3
+	};
+	STATIC_ASSERT_ALIGNAS_16(PointDenoiseCB);
+	RayTracingPointLights::Selector pointSelector;
+	std::array<RayTracingPointLights::GpuSource, RayTracingPointLights::kMaxSources> pointSources{};
+	RayTracingRT::PointLightInput pointInput{};
+	bool pointThisFrame = false;      // the point-light trace was submitted with this frame's trace
+	bool pointSplit = false;          // debug A/B: RT point-light shadows on the left half only (not persisted)
+	bool pointRequested = false;
+	std::string pointOffReason;       // why they were switched off automatically
+	std::uint32_t pointK = 0;         // K of this frame's trace (0 = none)
+	float pointCpuMs = 0.0f;
+	// Denoiser outputs (also the history, ping-pong): visibility per slot, sources per slot, distance.
+	DenoiseTexture pointVis[2], pointIdx[2], pointDist[2];
+	std::uint32_t pointWrite = 0;
+	bool pointHistoryValid = false;
+	bool pointDenoised = false;       // FinishPointLights ran this frame (the history is next frame's)
+	bool pointBound = false;          // t40 / t41 of the pixel shaders hold pointVis / pointIdx
+	std::uint64_t pointD3D11Bytes = 0;
+	std::unique_ptr<ConstantBuffer> pointDenoiseCB;
+	winrt::com_ptr<ID3D11ComputeShader> pointDenoiseCS;
+	/// Turns the point lights off (not the rest of Ray Tracing) with a reason for the page.
+	void SwitchOffPointLights(std::string a_reason);
+	void UpdatePointLights();
+	bool EnsurePointDenoiser(std::uint32_t a_width, std::uint32_t a_height);
+	void ReleasePointDenoiser();
+	/// Selection + this frame's trace input (RunFrame, before the trace is recorded). False = no point lights this frame.
+	bool PreparePointLights(RayTracingRT::FrameInput& a_input, const float a_traceRect[4], double a_camX, double a_camY, double a_camZ, float a_sunStrength);
+	/// After the combine (FinishFrame): the denoiser, then the result bound for the pixel shaders.
+	void FinishPointLights();
+	/// Pixel shader slots t40 / t41 back to null (before any pass writes those textures, and when nothing was traced).
+	void UnbindPointLights();
 };

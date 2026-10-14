@@ -84,6 +84,8 @@ namespace Util
 		RayTracingSigma,
 		RayTracingCombine,
 		RayTracingSync,
+		// (46b) Ray-traced point-light shadows: their denoiser (the trace itself is on the D3D12 queue, inside RT Wait for Trace).
+		RayTracingPointDenoise,
 		Count
 	};
 

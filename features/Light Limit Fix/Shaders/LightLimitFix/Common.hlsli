@@ -44,7 +44,7 @@ struct Light
 	uint4 roomFlags;
 	uint lightFlags;
 	uint shadowLightIndex;
-	uint pad0;
+	uint rtShadow;  // (46b) Ray Tracing point-light shadow tag (RayTracing/PointLightShadows.hlsli; 0 = none), was pad0
 	uint pad1;
 };
 

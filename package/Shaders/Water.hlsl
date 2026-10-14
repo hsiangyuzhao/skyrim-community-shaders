@@ -978,6 +978,10 @@ float3 GetSunColor(float3 normal, float3 viewDirection)
 #			include "ScreenSpacePointLightShadows/SSPLS.hlsli"
 #		endif
 
+#		if defined(RT_POINT_SHADOWS) && defined(LIGHT_LIMIT_FIX)
+#			include "RayTracing/PointLightShadows.hlsli"
+#		endif
+
 PS_OUTPUT main(PS_INPUT input)
 {
 	PS_OUTPUT psout;
@@ -1110,6 +1114,18 @@ PS_OUTPUT main(PS_INPUT input)
 			const bool isPointLightLinear = light.lightFlags & LightLimitFix::LightFlags::Linear;
 			float3 lightColor = Color::PointLight(light.color.xyz, isPointLightLinear) * pow(HdotN, FresnelRI.z) * light.fade;
 
+#					if defined(RT_POINT_SHADOWS)
+			// (46b) Ray-traced visibility: only where this fragment is the traced surface (water itself is drawn
+			// after the depth prepass, so in practice its point lights keep the old path below).
+			float rtVisibility = 1.0;
+			const bool rtShadow = !FrameBuffer::FrameParams.z && RTPointShadows::Get(light.rtShadow, input.HPosition.xy, screenUV, viewPosition.z, eyeIndex, rtVisibility);
+			if (rtShadow)
+				lightColor *= rtVisibility;
+#					else
+			const bool rtShadow = false;
+			const float rtVisibility = 1.0;
+#					endif
+
 #					if defined(SSPLS)
 			float lightAngle = dot(normal.xyz, normalizedLightDirection.xyz);
 			uint ssplsSteps = round(SharedData::ssplsSettings.StepLimit * (1.0 - saturate(viewPosition.z / SharedData::ssplsSettings.MaxDistance)));
@@ -1117,11 +1133,16 @@ PS_OUTPUT main(PS_INPUT input)
 				!FrameBuffer::FrameParams.z &&
 				SharedData::ssplsSettings.Enable &&
 				!(light.lightFlags & LightLimitFix::LightFlags::Simple) &&
-				lightAngle > 0.0)
+				lightAngle > 0.0
+#						if defined(RT_POINT_SHADOWS)
+				&& (!rtShadow || (light.rtShadow & RTPointShadows::kKeepSSPLS))
+#						endif
+			)
 			{
 				float3 lightDirectionVS = FrameBuffer::WorldToView(light.positionWS[eyeIndex].xyz, true, eyeIndex) - viewPosition.xyz;
 				float SSPLSShadow = lerp(1.0, ScreenSpacePointLightShadows::GetShadow(LinearSampler, viewPosition, screenNoise, lightDirectionVS, ssplsSteps, light.radius, eyeIndex, light.lightFlags & LightLimitFix::LightFlags::Shadow), SharedData::ssplsSettings.Strength);
-				lightColor *= SSPLSShadow;
+				// (46b) Beside a ray-traced shadow: the darker of both.
+				lightColor *= rtShadow ? min(SSPLSShadow / max(rtVisibility, 1e-4), 1.0) : SSPLSShadow;
 			}
 #					endif
 
