@@ -107,6 +107,7 @@ namespace Util::FrameTrace
 		// rays per frame (read back a few frames late; -1 = not known, 0 = not traced).
 		float rtaoGpuMs = -1.0f, rtaoFilterGpuMs = -1.0f, rtaoSyncGpuMs = -1.0f;
 		int64_t rtaoRays = 0;
+		int rtaoIndoors = -1, rtaoMode = -1;  // (46h) this frame's RTAO: 1 indoors / 0 outdoors, its mode (0 keep contact AO, 1 darker); -1 = not traced
 		// (46g) Transitions and the pools: black screen (Fader Menu after a loading screen), ms since the loading screen closed
 		// (-1 = no transition), hand-off this frame, items held back (ready / not ready); Early Prep call by call; the
 		// parts taken out of rt_x_collect / tlas / record; pool upkeep ms, blocks made on the render thread, MB reserved,

@@ -154,13 +154,18 @@ public:
 		// engine's shadow map culls it from the light), 2 cull the ones facing away.
 		int PointLightsBeamCull = 1;
 		bool PointLightsBeamGuard = true;  // (46g) a beam that is almost fully blocked keeps the engine's shadow map
-		// (46f) Ray-traced ambient occlusion (Ray Tracing page, Ambient Occlusion). Exteriors only for now.
+		// (46f) Ray-traced ambient occlusion (Ray Tracing page, Ambient Occlusion). (46h) Indoors too: AOInteriors.
 		bool AO = false;
 		int AOMode = 0;                // AOMode: 0 RTAO (keeps SSGI contact AO, darker of both), 1 darker of RTAO and SSGI AO
 		float AORayLength = 100.0f;    // units (70 = 1 m): 35 - 210
 		float AOStrength = 1.0f;
 		bool AOTemporal = true;        // clamped history after the spatial filter
-		float AODistance = 4000.0f;    // from the camera: RTAO fades back to SSGI AO over the last quarter of it
+		float AODistance = 4000.0f;    // from the camera: RTAO fades back to SSGI AO over the last quarter of it (outdoors)
+		// (46h) RTAO indoors (the interior frame; the whole interior is in the TLAS). Only with RTAO on (itself default off), so
+		// nothing changes until the user ticks RT Ambient Occlusion; then indoors follows this box (on). No distance fade indoors:
+		// the RT weight is 1 everywhere inside the interior's box.
+		bool AOInteriors = true;
+		int AOModeInterior = 0;        // AOModeKind (indoors)
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -368,6 +373,7 @@ private:
 		std::uint32_t width = 0, height = 0;
 		bool writeSSS = false, debug = false, penumbra = false, spatial = false, half = false, sigma = false, sssNonRT = false;
 		bool interior = false;  // (46c) point lights only: no sun combine
+		bool traceSync = true;  // (46h) FinishFrame waits for the trace (false: an interior frame with RTAO only; the AO wait covers it)
 		float biasConstant = 0.0f, biasPerUnit = 0.0f;
 		float toSun[3]{};
 		double camera[3]{};
@@ -556,8 +562,10 @@ private:
 	};
 	STATIC_ASSERT_ALIGNAS_16(PointMaskCB);
 	static constexpr std::uint32_t kMaskWrite = 1u, kMaskSpot = 2u, kMaskSkipped = 4u;  // PointMaskCS
-	/// Indoors this frame (an interior cell, Ray Tracing and its point lights on): RunInteriorFrame instead of the sun.
+	/// Indoors this frame (an interior cell, Ray Tracing and its point lights or (46h) RTAO indoors on): RunInteriorFrame instead of the sun.
 	[[nodiscard]] bool InteriorWanted() const;
+	/// (46h) RTAO indoors wanted (RTAO on, Indoors Too, its shader available, Screen Space GI on as its consumer).
+	[[nodiscard]] bool AOInteriorWanted() const;
 	void RunInteriorFrame();
 	/// Switches the interior part off (not the rest of Ray Tracing) with a reason for the page.
 	void SwitchOffInteriors(std::string a_reason);
@@ -619,8 +627,18 @@ private:
 	/// Switches RTAO off for this session (not the setting) with a reason for the page; the rest of Ray Tracing goes on.
 	void SwitchOffAO(std::string a_reason);
 	void UpdateAO();
-	/// RunFrame (exteriors), before the trace is recorded: this frame's RTAO input. False = no RTAO this frame.
-	bool PrepareAO(RayTracingRT::FrameInput& a_input, const float a_traceRect[4]);
+	/// RunFrame / (46h) RunInteriorFrame, before the trace is recorded: this frame's RTAO input. False = no RTAO this frame.
+	/// a_interior: the RT weight is 1 everywhere inside the interior's box (no distance fade).
+	bool PrepareAO(RayTracingRT::FrameInput& a_input, const float a_traceRect[4], bool a_interior = false);
+	[[nodiscard]] bool AOInteriorsOn() const { return AOOn() && settings.AOInteriors && !interiorAutoOff; }
+	bool aoInteriorThisFrame = false;  // (46h) this frame's RTAO is the interior one (its mode: AOModeInterior)
+	bool aoInteriorRequested = false;  // (46h) AOInteriors as last seen (ticking it again retries an interior switch-off)
+	int aoModeThisFrame = -1;          // (46h) F7 rtao_mode: the mode of this frame's RTAO (-1 = not traced)
+	// (46h) RTAO fade-in whenever it starts after a gap (entering an interior whose capture finished after the hand-off fade, RTAO
+	// switched on, Screen Space GI back on): never a pop from SSGI's AO to RTAO, also outside the transition's own fade.
+	std::uint32_t aoLastCompositeFrame = UINT32_MAX;
+	std::int64_t aoRampStart = 0;
+	float aoRamp = 0.0f;
 	bool EnsureAOFilter(std::uint32_t a_width, std::uint32_t a_height);
 	void ReleaseAOFilter();
 	RayTracingRT::AOInput aoInput{};

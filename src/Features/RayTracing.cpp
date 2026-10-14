@@ -64,7 +64,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	AORayLength,
 	AOStrength,
 	AOTemporal,
-	AODistance)
+	AODistance,
+	AOInteriors,
+	AOModeInterior)
 
 namespace
 {
@@ -170,6 +172,8 @@ namespace
 	constexpr float kAOHistoryWeight = 0.2f;    // this frame's weight in the clamped history blend
 	constexpr float kAOClampSlack = 0.08f;      // the history may stray this far outside this frame's filtered 3x3 range
 	constexpr std::uint32_t kAOTraceCharacters = 1u, kAOTraceFirstPerson = 2u;  // TraceAOCS
+	constexpr std::uint32_t kAOGapFrames = 30;  // (46h) RTAO not mixed in for more than this many frames: it fades in again
+	constexpr double kAOFadeInMs = 400.0;
 
 	// (46c) BSShadowFrustumLight / BSShadowParabolicLight::RenderShadowmaps (vfunc 0x0A): Ray Tracing may skip the shadow
 	// maps of lights it fully handles this frame (Point Lights > Stop Engine Shadow Maps, interiors only).
@@ -722,6 +726,7 @@ void RayTracing::LoadSettings(json& o_json)
 	settings.AORayLength = std::isfinite(settings.AORayLength) ? std::clamp(settings.AORayLength, kAORayLengthMin, kAORayLengthMax) : 100.0f;
 	settings.AOStrength = std::isfinite(settings.AOStrength) ? std::clamp(settings.AOStrength, 0.0f, 2.0f) : 1.0f;
 	settings.AODistance = std::isfinite(settings.AODistance) ? std::clamp(settings.AODistance, 1000.0f, 8192.0f) : 4000.0f;
+	settings.AOModeInterior = std::clamp(settings.AOModeInterior, 0, static_cast<int>(AOModeKind::Count) - 1);  // (46h)
 }
 
 void RayTracing::SaveSettings(json& o_json)
@@ -1336,6 +1341,8 @@ void RayTracing::Prepass()
 	skippedLastFrame = static_cast<std::uint32_t>(skippedMaps.size());
 	// (46f) RTAO: nothing for the AO consumers until this frame's trace carries it.
 	aoThisFrame = false;
+	aoInteriorThisFrame = false;  // (46h)
+	aoModeThisFrame = -1;
 	aoComposedLastFrame = aoComposited;  // the F7 row is written before this frame's AO pass (ReportFrame)
 	aoComposited = false;
 	aoDebugDrawn = false;
@@ -1576,7 +1583,7 @@ void RayTracing::PublishCpuSplit()
 		detail.filterGpuMs = passMs(combined && pending.spatial, Util::GpuBucket::RayTracingDenoiseFilter);
 		detail.sigmaGpuMs = passMs(combined && pending.sigma, Util::GpuBucket::RayTracingSigma);
 		detail.combineGpuMs = passMs(combined && !pending.interior, Util::GpuBucket::RayTracingCombine);
-		detail.syncGpuMs = passMs(combined, Util::GpuBucket::RayTracingSync);
+		detail.syncGpuMs = passMs(combined && pending.traceSync, Util::GpuBucket::RayTracingSync);  // (46h) RTAO-only interior frames: no rt_sync
 		float denoise = -1.0f;
 		for (const float part : { detail.tileGpuMs, detail.filterGpuMs, detail.sigmaGpuMs })
 			if (part >= 0.0f)
@@ -1608,7 +1615,8 @@ void RayTracing::PublishCpuSplit()
 		detail.plRays = pointThisFrame ? stats.pointRaysPerFrame : 0u;
 		detail.plCpuMs = PointLightsOn() ? pointCpuMs : -1.0f;
 		// (46c)
-		detail.rtInterior = interiorThisFrame ? (pointThisFrame ? 2 : 1) : 0;
+		// (46h) 2 = indoors traced: point lights and / or RTAO.
+		detail.rtInterior = interiorThisFrame ? ((pointThisFrame || (aoThisFrame && aoInteriorThisFrame)) ? 2 : 1) : 0;
 		detail.plBeams = pointThisFrame ? ps.beams : 0;
 		detail.plCarried = pointThisFrame ? ps.carried : 0;  // (46e)
 		detail.smSkipped = static_cast<std::uint32_t>(skippedMaps.size());
@@ -1620,6 +1628,9 @@ void RayTracing::PublishCpuSplit()
 		detail.rtaoFilterGpuMs = aoComposedLastFrame ? std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAO), 0.0f) : -1.0f;
 		detail.rtaoSyncGpuMs = aoComposedLastFrame ? std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAOSync), 0.0f) : -1.0f;
 		detail.rtaoRays = aoTraced ? stats.aoRaysPerFrame : 0;
+		// (46h) Where this frame's RTAO was traced and its mode (-1 = not traced this frame).
+		detail.rtaoIndoors = aoTraced && aoThisFrame ? (aoInteriorThisFrame ? 1 : 0) : -1;
+		detail.rtaoMode = aoTraced && aoThisFrame ? aoModeThisFrame : -1;
 		// (46g) Transitions, Early Prep split, pools.
 		detail.black = blackScreen ? 1 : 0;
 		detail.handOff = handOffThisFrame ? 1 : 0;
@@ -2089,6 +2100,7 @@ void RayTracing::RunFrame()
 
 	// (46f) RTAO went out right behind it (second fence): DrawAmbientOcclusion uses it after Screen Space GI.
 	aoThisFrame = input.ao != nullptr && backend.GetStats().aoTracedLastFrame;
+	aoModeThisFrame = aoThisFrame ? std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1) : -1;  // (46h)
 	if (!aoThisFrame)
 		aoHistoryValid = false;
 	// (46b) The point lights went out with it: Light Limit Fix (next in the prepass list) may tag its lights.
@@ -2100,6 +2112,7 @@ void RayTracing::RunFrame()
 	// (45l) The D3D11 side of this frame: FinishFrame (now, or after the other prepasses with Late Sync).
 	pending.active = true;
 	pending.interior = false;
+	pending.traceSync = true;
 	std::memcpy(pending.cbBytes.data(), &cb, sizeof(cb));
 	pending.combineFlags = combineFlags;
 	pending.width = width;
@@ -2184,9 +2197,13 @@ void RayTracing::FinishFrame()
 	const UINT groupsX = (width + 7) / 8, groupsY = (height + 7) / 8;
 
 	// 1. The D3D11 queue waits for the trace (on the GPU). Timed: the GPU stall it causes.
-	timers->Begin(Util::GpuBucket::RayTracingSync);
-	backend.WaitForTrace();
-	timers->End(Util::GpuBucket::RayTracingSync);
+	// (46h) Not on an interior frame that traced RTAO only: nothing here reads the trace then, and the AO list behind it on
+	// the same queue signals the second fence after it, so DrawAmbientOcclusion's wait covers it (rt_sync is not extended).
+	if (pending.traceSync) {
+		timers->Begin(Util::GpuBucket::RayTracingSync);
+		backend.WaitForTrace();
+		timers->End(Util::GpuBucket::RayTracingSync);
+	}
 	if (backend.HasFailed() || !mask.texture || !mask.SRV || !maskTemp) {
 		if (backend.HasFailed())
 			Disable(Status::Failed, backend.LastError());
@@ -2684,6 +2701,13 @@ void RayTracing::UpdateAO()
 	else if (AOOn() && backend.IsReady() && !backend.AOAvailable())
 		SwitchOffAO("the GPU driver did not accept the RTAO ray query shader");
 	aoRequested = settings.AO;
+	// (46h) RTAO indoors ticked (again) by the user, or its Retry Indoors: an earlier automatic switch-off of the interior part
+	// (shared with the point lights' interiors: one interior capture) is forgotten.
+	if (settings.AO && settings.AOInteriors && !aoInteriorRequested) {
+		interiorOffReason.clear();
+		interiorAutoOff = false;
+	}
+	aoInteriorRequested = settings.AO && settings.AOInteriors;
 	if (!AOOn()) {
 		aoHistoryValid = false;
 		if (aoOut.texture)
@@ -2749,9 +2773,11 @@ bool RayTracing::EnsureAOFilter(std::uint32_t a_width, std::uint32_t a_height)
 	return true;
 }
 
-bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_traceRect[4])
+bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_traceRect[4], bool a_interior)
 {
 	if (!AOOn() || !backend.AOAvailable())
+		return false;
+	if (a_interior && !AOInteriorsOn())  // (46h)
 		return false;
 	// Only with a consumer: Screen Space GI's AO is what RTAO replaces / joins (its composite reads it).
 	const auto& ssgi = globals::features::screenSpaceGI;
@@ -2782,6 +2808,24 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 	const float distance = std::clamp(settings.AODistance, 1000.0f, 8192.0f);
 	c.fade[0] = distance * kAOFadeStartShare;
 	c.fade[1] = distance;
+	if (a_interior) {
+		// (46h) Indoors the whole interior is in the TLAS (no terrain / grass / LOD to hand back to SSGI): no distance fade.
+		// The weight starts to fall only beyond the camera's farthest corner of the interior's box, so it is 1 for every
+		// surface inside it (the trace's rect test still leaves whatever lies outside the box to SSGI's AO).
+		const auto& sc = scene.GetStats();
+		const float4 camera = globals::game::frameBufferCached.GetCameraPosAdjust(0);
+		const float cam[3] = { camera.x, camera.y, camera.z };
+		float farthest = 0.0f;
+		for (int axis = 0; axis < 3; ++axis) {
+			const float d = std::max(std::abs(sc.interiorBounds[axis] - cam[axis]), std::abs(sc.interiorBounds[axis + 3] - cam[axis]));
+			farthest += d * d;
+		}
+		farthest = std::sqrt(farthest);
+		if (!std::isfinite(farthest) || farthest < 1.0f)
+			farthest = 65536.0f;  // no box yet: no fade within any interior
+		c.fade[0] = farthest + 64.0f;
+		c.fade[1] = farthest + 1024.0f;
+	}
 	c.fade[2] = kRayBiasConstant;
 	c.fade[3] = kRayBiasPerUnit;
 	c.extra[0] = kCharacterSelfShadowOffset;
@@ -2811,6 +2855,9 @@ void RayTracing::DrawAmbientOcclusion()
 	timers->Begin(Util::GpuBucket::RayTracingAOSync);
 	backend.WaitForAO();
 	timers->End(Util::GpuBucket::RayTracingAOSync);
+	// (46h) An interior frame with RTAO only left the trace's wait for here: the trace list ran before the AO list on the
+	// same queue, so its fence value is reached by now (no stall); taken so it does not wait for the next frame.
+	backend.WaitForTrace();
 	if (backend.HasFailed()) {
 		Disable(Status::Failed, backend.LastError());
 		return;
@@ -2845,13 +2892,22 @@ void RayTracing::DrawAmbientOcclusion()
 	AOCompositeCB cb{};
 	cb.Size[0] = width;
 	cb.Size[1] = height;
-	cb.Size[2] = (contact ? kAOFlagContact : 0u) | (settings.AOMode == static_cast<int>(AOModeKind::Darker) ? kAOFlagDarker : 0u) |
+	// (46h) The mode of this frame's trace: AOMode outdoors, AOModeInterior indoors.
+	cb.Size[2] = (contact ? kAOFlagContact : 0u) | (aoModeThisFrame == static_cast<int>(AOModeKind::Darker) ? kAOFlagDarker : 0u) |
 	             (historyValid ? kAOFlagHistory : 0u) | (aoDebugView == AODebugView::Split ? kAOFlagSplit : 0u);
 	cb.Size[3] = debugOverlay ? static_cast<std::uint32_t>(aoDebugView) : 0u;
 	cb.Params[0] = std::clamp(settings.AOStrength, 0.0f, 2.0f);
 	cb.Params[1] = kAOHistoryWeight;
 	cb.Params[2] = kAOClampSlack;
-	cb.Params[3] = fade;
+	{
+		// (46h) The RT weight: the transition's fade (one global hand-off) times RTAO's own fade-in after a gap.
+		const std::uint32_t now = globals::state->frameCount;
+		if (aoLastCompositeFrame == UINT32_MAX || now - aoLastCompositeFrame > kAOGapFrames)
+			aoRampStart = Qpc();
+		aoLastCompositeFrame = now;
+		aoRamp = static_cast<float>(std::clamp(static_cast<double>(Qpc() - aoRampStart) * QpcMs() / kAOFadeInMs, 0.0, 1.0));
+	}
+	cb.Params[3] = fade * aoRamp;
 	aoCB->Update(cb);
 
 	ID3D11ShaderResourceView* nullSrvs[6]{};
@@ -2945,7 +3001,16 @@ void RayTracing::DrawAmbientOcclusion()
 
 bool RayTracing::InteriorWanted() const
 {
-	return settings.Enabled && PointLightsOn() && InteriorsOn() && backend.IsReady() && backend.PointAvailable();
+	if (!settings.Enabled || !backend.IsReady())
+		return false;
+	// (46h) The interior is captured for its point lights, or for RTAO indoors (or both: one capture, one trace).
+	return (PointLightsOn() && InteriorsOn() && backend.PointAvailable()) || AOInteriorWanted();
+}
+
+bool RayTracing::AOInteriorWanted() const
+{
+	const auto& ssgi = globals::features::screenSpaceGI;
+	return settings.Enabled && AOInteriorsOn() && backend.IsReady() && backend.AOAvailable() && ssgi.loaded && ssgi.settings.Enabled;
 }
 
 void RayTracing::SwitchOffInteriors(std::string a_reason)
@@ -3076,7 +3141,8 @@ void RayTracing::RunInteriorFrame()
 	input.sun = false;
 	input.buildCpuMs = blackScreen ? kBlackBuildCpuMs : 0.0f;  // (46g)
 	input.skinUploadCpuMs = blackScreen ? kBlackSkinUploadCpuMs : 0.0f;
-	{
+	// (46h) The point lights only with their own Indoors Too (the interior may be captured for RTAO alone).
+	if (PointLightsOn() && InteriorsOn()) {
 		const std::int64_t pointStart = Qpc();
 		try {
 			if (!PreparePointLights(input, traceRect, camX, camY, camZ, 0.0f, true))
@@ -3087,8 +3153,21 @@ void RayTracing::RunInteriorFrame()
 		}
 		pointCpuMs = static_cast<float>(static_cast<double>(Qpc() - pointStart) * QpcMs());
 	}
-	if (!input.pointLights) {
-		// Nothing to trace (no shadow-casting light in view): the queued builds go on, nothing waits.
+	// (46h) RTAO indoors: its own list right behind the point lights, its own fence (as outdoors). Traced whether or not a
+	// light is in view (else the AO would switch between RT and SSGI as lights come and go).
+	{
+		const std::int64_t aoStart = Qpc();
+		try {
+			if (!PrepareAO(input, traceRect, true))
+				input.ao = nullptr;
+		} catch (const std::exception& e) {
+			input.ao = nullptr;
+			SwitchOffAO(std::format("exception: {}", e.what()));
+		}
+		aoCpuMs = static_cast<float>(static_cast<double>(Qpc() - aoStart) * QpcMs());
+	}
+	if (!input.pointLights && !input.ao) {
+		// Nothing to trace (no shadow-casting light in view, no RTAO): the queued builds go on, nothing waits.
 		backend.BuildOnly(kBuildBudget, 64u, blackScreen ? kBlackBuildCpuMs : 2.0f);
 		backend.Tick();
 		status = Status::Active;
@@ -3167,13 +3246,20 @@ void RayTracing::RunInteriorFrame()
 		++frameIndex;
 		return;
 	}
-	pointThisFrame = backend.GetStats().pointTracedLastFrame;
+	pointThisFrame = input.pointLights != nullptr && backend.GetStats().pointTracedLastFrame;
 	pointSelector.Publish(pointThisFrame);
 	if (!pointThisFrame)
 		pointK = 0;
+	// (46h) RTAO went out right behind it (second fence): DrawAmbientOcclusion uses it after Screen Space GI.
+	aoThisFrame = input.ao != nullptr && backend.GetStats().aoTracedLastFrame;
+	aoInteriorThisFrame = aoThisFrame;
+	aoModeThisFrame = aoThisFrame ? std::clamp(settings.AOModeInterior, 0, static_cast<int>(AOModeKind::Count) - 1) : -1;
+	if (!aoThisFrame)
+		aoHistoryValid = false;
 
 	pending.active = true;
 	pending.interior = true;
+	pending.traceSync = pointThisFrame;  // (46h) RTAO only: no rt_sync (DrawAmbientOcclusion's wait covers the trace)
 	std::memcpy(pending.cbBytes.data(), &cb, sizeof(cb));
 	pending.combineFlags = 0;
 	pending.width = width;
@@ -3188,7 +3274,7 @@ void RayTracing::RunInteriorFrame()
 
 	activeThisFrame = true;
 	status = Status::Active;
-	statusReason = "interior: point lights";
+	statusReason = pointThisFrame ? (aoThisFrame ? "interior: point lights + RTAO" : "interior: point lights") : (aoThisFrame ? "interior: RTAO" : "interior");
 	++frameIndex;
 	if (interiorReadyPending) {
 		interiorReadyPending = false;
@@ -3354,7 +3440,8 @@ void RayTracing::DrawMasterHeader()
 	ImGui::Checkbox("Ray Tracing", &settings.Enabled);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::Text("On: sun shadows of buildings, rocks, furniture, doors, items and characters inside the loaded area are ray traced.");
-		ImGui::Text("Trees, leaves, hair (unless changed under Advanced), grass and the terrain itself (hills) keep their normal shadows; the ground still receives traced shadows.");
+		ImGui::Text("Trees, leaves, hair (unless changed under Sun Shadows > Advanced), grass and the terrain itself (hills) keep their normal shadows;");
+		ImGui::Text("  the ground still receives traced shadows.");
 		ImGui::Text("Screen Space Shadows are switched off where ray tracing is in charge.");
 		ImGui::Text("Off: the game's shadows exactly as before (nothing of this feature runs).");
 	}
@@ -3662,7 +3749,7 @@ void RayTracing::DrawPointLightPage()
 		ImGui::Checkbox("Plants and Cut-Outs Block Point Lights Outdoors", &settings.PointLightsAlphaOutdoors);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("On (default): at night leaves, bushes and cut-out shapes (fences, nets) cast shadows from torches and campfires,");
-			ImGui::Text("  for the kinds Ray Tracing traces with their cut-out (Foliage / Cut-outs on the Advanced menu). A little slower.");
+			ImGui::Text("  for the kinds Ray Tracing traces with their cut-out (Foliage / Cut-outs under Sun Shadows > Advanced). A little slower.");
 			ImGui::Text("Off: outdoors only solid shapes block point lights (46c).");
 		}
 		// (46c) Interiors.
@@ -3671,7 +3758,7 @@ void RayTracing::DrawPointLightPage()
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("On (default): inside houses, inns, castles and dungeons the room itself (walls, furniture, clutter, people) is captured");
 			ImGui::Text("  when you come in (behind the loading screen) and the lights cast ray-traced shadows there too. There is no sun indoors.");
-			ImGui::Text("Off: indoors everything is exactly as before.");
+			ImGui::Text("Off: indoors the lights' shadows are exactly as before (RT Ambient Occlusion has its own Indoors Too).");
 		}
 		if (!settings.PointLightsInteriors)
 			ImGui::BeginDisabled();
@@ -3784,9 +3871,9 @@ void RayTracing::DrawAOPage()
 	if (ImGui::TreeNodeEx("Ambient Occlusion", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("RT Ambient Occlusion", &settings.AO);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Ray-traced ambient occlusion (outdoors, inside the traced area): the soft darkening in corners, under ledges");
-			ImGui::Text("  and around objects comes from short rays against the ray-traced scene, so it no longer disappears when");
-			ImGui::Text("  whatever casts it leaves the screen. Farther away it fades back to Screen Space GI's AO.");
+			ImGui::Text("Ray-traced ambient occlusion (outdoors inside the traced area, and indoors with Indoors Too): the soft darkening in");
+			ImGui::Text("  corners, under ledges and around objects comes from short rays against the ray-traced scene, so it no longer");
+			ImGui::Text("  disappears when whatever casts it leaves the screen. Outdoors, farther away it fades back to Screen Space GI's AO.");
 			ImGui::Text("Terrain and grass are not in the ray-traced scene: their darkening still comes from Screen Space GI.");
 			ImGui::Text("Off (default): ambient occlusion exactly as before (Screen Space GI). Needs Ray Tracing and Screen Space GI on.");
 		}
@@ -3797,6 +3884,7 @@ void RayTracing::DrawAOPage()
 			settings.AOMode = std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1);
 			ImGui::Combo("Mode", &settings.AOMode, modes, IM_ARRAYSIZE(modes));
 			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Outdoors (indoors has its own Mode Indoors below).");
 				ImGui::Text("RTAO (default): ray-traced AO replaces Screen Space GI's AO; SSGI's small contact AO (cm-scale creases) is kept");
 				ImGui::Text("  and both darken together.");
 				ImGui::Text("Darker of RTAO and SSGI AO: per pixel the darker of the two (fullest darkening; SSGI's AO is never lost).");
@@ -3814,8 +3902,41 @@ void RayTracing::DrawAOPage()
 			ImGui::Text("  so moving objects leave no dark trail). Off: this frame's blurred rays only (a little grainier).");
 		}
 		ImGui::SliderFloat("Max Distance", &settings.AODistance, 1000.0f, 8192.0f, "%.0f units");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("RTAO fades back to Screen Space GI's AO over the last quarter of this distance. Default 4000 (about 57 m). Shorter = cheaper.");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Outdoors: RTAO fades back to Screen Space GI's AO over the last quarter of this distance. Default 4000 (about 57 m).");
+			ImGui::Text("  Shorter = cheaper. Indoors there is no fade: the whole interior is traced (it is small and all of it is in the scene).");
+		}
+		// (46h) Interiors.
+		ImGui::SeparatorText("Interiors");
+		ImGui::Checkbox("Indoors Too##AO", &settings.AOInteriors);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default, takes effect only with RT Ambient Occlusion on): inside houses, inns, castles and dungeons the room");
+			ImGui::Text("  itself (walls, furniture, clutter, people) is captured when you come in (behind the loading screen), and the AO");
+			ImGui::Text("  there is ray traced too, everywhere in the interior. It switches on together with everything else after the");
+			ImGui::Text("  loading screen (one fade, no piece-by-piece change).");
+			ImGui::Text("Off: indoors the AO is Screen Space GI's, exactly as before.");
+		}
+		if (!settings.AOInteriors)
+			ImGui::BeginDisabled();
+		{
+			const char* modes[] = { "RTAO + SSGI contact AO", "Darker of both" };
+			settings.AOModeInterior = std::clamp(settings.AOModeInterior, 0, static_cast<int>(AOModeKind::Count) - 1);
+			ImGui::Combo("Mode Indoors", &settings.AOModeInterior, modes, IM_ARRAYSIZE(modes));
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("RTAO + SSGI contact AO (default): indoors the ray-traced AO replaces Screen Space GI's AO; SSGI's small contact AO");
+				ImGui::Text("  (cm-scale creases) is kept and both darken together.");
+				ImGui::Text("Darker of both: per pixel the darker of RTAO and SSGI's whole AO.");
+			}
+		}
+		if (!settings.AOInteriors)
+			ImGui::EndDisabled();
+		if (!interiorOffReason.empty()) {
+			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
+			ImGui::TextWrapped("Indoors was switched off automatically: %s", interiorOffReason.c_str());
+			ImGui::PopStyleColor();
+			if (interiorAutoOff && ImGui::SmallButton("Retry Indoors##AO"))
+				aoInteriorRequested = false;
+		}
 		{
 			const char* views[] = { "Off", "Raw RTAO", "Filtered RTAO", "RTAO vs SSGI (split)" };
 			int view = static_cast<int>(aoDebugView);
@@ -3841,8 +3962,16 @@ void RayTracing::DrawAOPage()
 			const auto& ssgi = globals::features::screenSpaceGI;
 			if (!ssgi.loaded || !ssgi.settings.Enabled)
 				ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Screen Space GI is off: RTAO needs it (it replaces / joins its AO).");
-			else if (Util::IsInterior())
-				ImGui::TextDisabled("Indoors: not traced (exteriors only for now).");
+			else if (Util::IsInterior()) {
+				// (46h)
+				const auto& sc = scene.GetStats();
+				if (!AOInteriorsOn())
+					ImGui::TextDisabled("Indoors: not traced (Indoors Too is off).");
+				else
+					ImGui::Text("Indoors: %s, %u shapes; mode %s; fade-in %.0f %%", sc.interior ? (scene.HasCoverage() ? "interior captured" : "capturing the interior") : "interior not captured",
+						sc.interiorShapes, settings.AOModeInterior == static_cast<int>(AOModeKind::Darker) ? "darker of both" : "RTAO + SSGI contact AO",
+						static_cast<double>(fade * aoRamp) * 100.0);
+			}
 			const auto& rt = backend.GetStats();
 			auto* timers = Util::GpuPassTimers::GetSingleton();
 			ImGui::Text("This frame: %s; rays %.2f ms GPU (%s per frame), filter %.2f ms, game queue waiting %.2f ms; leaves / cut-outs tested %s",
@@ -4137,6 +4266,10 @@ std::string RayTracing::DescribeForProfile() const
 	text += std::format(", RTAO {} (mode {}, ray length {:.0f}, strength {:.2f}, temporal {}, max distance {:.0f}, debug view {}{})", settings.AO ? "on" : "off",
 		kAOModes[std::clamp(settings.AOMode, 0, 1)], settings.AORayLength, settings.AOStrength, settings.AOTemporal ? "on" : "off", settings.AODistance,
 		kAOViews[std::clamp(static_cast<int>(aoDebugView), 0, 3)], aoOffReason.empty() ? "" : ", switched off: " + aoOffReason);
+	// (46h)
+	static constexpr const char* kAOModesInterior[] = { "RTAO + SSGI contact AO", "darker of both" };
+	text += std::format(", RTAO indoors {} (mode {}, no distance fade: the interior's box{})", settings.AO && settings.AOInteriors ? "on" : "off",
+		kAOModesInterior[std::clamp(settings.AOModeInterior, 0, 1)], AOInteriorWanted() ? "" : (settings.AO && settings.AOInteriors ? ", not available now" : ""));
 	return text;
 }
 
@@ -4204,6 +4337,8 @@ nlohmann::json RayTracing::DescribeJson() const
 		{ "temporal", settings.AOTemporal }, { "max_distance", settings.AODistance }, { "debug_view", static_cast<int>(aoDebugView) },
 		{ "composited", aoComposited }, { "gpu_ms", stats.lastAOGpuMs }, { "rays_per_frame", stats.aoRaysPerFrame },
 		{ "filter_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingAO) },
-		{ "sync_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingAOSync) }, { "off_reason", aoOffReason } };
+		{ "sync_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingAOSync) }, { "off_reason", aoOffReason },
+		{ "interiors", settings.AOInteriors }, { "mode_interior", settings.AOModeInterior }, { "interior_wanted", AOInteriorWanted() },
+		{ "indoors_this_frame", aoInteriorThisFrame }, { "fade_in", aoRamp } };  // (46h)
 	return j;
 }

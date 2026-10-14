@@ -2284,6 +2284,14 @@ namespace RayTracingRT
 			if (FAILED(hr = context11_->Wait(aoFence11_.Get(), aoValue)))
 				return Fail("D3D11 Wait (RTAO)", hr);
 		}
+		// (46h) Likewise a trace wait never issued (an interior frame with RTAO only leaves it to the AO pass; the callers take it
+		// before the next trace, this is the guard): the D3D11 ready signal below must follow the last D3D12 done value.
+		if (pendingWait_ != 0) {
+			const std::uint64_t traceValue = pendingWait_;
+			pendingWait_ = 0;
+			if (FAILED(hr = context11_->Wait(fence11_.Get(), traceValue)))
+				return Fail("D3D11 Wait", hr);
+		}
 
 		// GPU-side ordering only: the trace waits for everything D3D11 recorded so far (the depth /
 		// mask copy, the alpha copies); the D3D11 queue later waits for the trace.

@@ -1971,7 +1971,7 @@ namespace RayTracingScene
 				verdict = "character (not traced)";
 			} else if (byChoice && !shapeReason) {
 				bucket = MissReason::ByChoice;
-				verdict = "left to the shadow map by the Advanced settings";
+				verdict = "left to the shadow map by Sun Shadows > Advanced";
 			} else if (shapeReason) {
 				verdict = std::format("shape rejected: {}", shapeReason);
 			} else if (kind == RefKind::Other) {

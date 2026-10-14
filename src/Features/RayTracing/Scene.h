@@ -173,7 +173,7 @@ namespace RayTracingScene
 	};
 	inline constexpr const char* kMissReasonNames[] = { "never captured", "captured but shape skipped", "3D root mismatch",
 		"persistent, no captured square", "alpha-tested", "decal", "skinned", "not Lighting shader", "billboard", "character",
-		"no owning reference", "left to the shadow map (Advanced)", "other shape rule" };
+		"no owning reference", "left to the shadow map (Sun Shadows > Advanced)", "other shape rule" };
 	static_assert(std::size(kMissReasonNames) == static_cast<std::size_t>(MissReason::Count));
 
 	/// (45e) Objects with their own TLAS instances, moved every frame.
