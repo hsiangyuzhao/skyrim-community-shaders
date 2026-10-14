@@ -146,6 +146,13 @@ namespace RayTracingRT
 			if (FAILED(list.As(&context.list)))
 				return fail("ID3D12GraphicsCommandList4 not available");
 			context.list->Close();
+			// (45l) The trace's own list (same allocator, recorded after the first one is closed).
+			ComPtr<ID3D12GraphicsCommandList> traceList;
+			if (FAILED(hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, context.allocator.Get(), nullptr, IID_PPV_ARGS(&traceList))))
+				return fail(std::format("CreateCommandList failed ({})", HrString(hr)));
+			if (FAILED(traceList.As(&context.traceList)))
+				return fail("ID3D12GraphicsCommandList4 not available");
+			context.traceList->Close();
 		}
 
 		if (FAILED(hr = device_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence_))))
@@ -163,9 +170,9 @@ namespace RayTracingRT
 		{
 			D3D12_QUERY_HEAP_DESC heapDesc{};
 			heapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-			heapDesc.Count = static_cast<UINT>(kContexts * 2);
+			heapDesc.Count = static_cast<UINT>(kContexts * 4);  // (45l) per context: prep begin / end, trace begin / end
 			UINT64 frequency = 0;
-			timestampReadback_ = CreateBuffer(sizeof(std::uint64_t) * kContexts * 2, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+			timestampReadback_ = CreateBuffer(sizeof(std::uint64_t) * kContexts * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
 			if (FAILED(device_->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(&timestampHeap_))) || !timestampReadback_ ||
 				FAILED(queue_->GetTimestampFrequency(&frequency)) || frequency == 0) {
 				timestampHeap_.Reset();
@@ -620,18 +627,23 @@ namespace RayTracingRT
 		if (!context.timestampsPending || !timestampReadback_ || timestampFrequency_ == 0)
 			return;
 		context.timestampsPending = false;
-		const SIZE_T offset = sizeof(std::uint64_t) * 2 * a_index;
-		D3D12_RANGE range{ offset, offset + sizeof(std::uint64_t) * 2 };
+		// (45l) Four per context: the prep submission (builds, skinning, TLAS) and the trace. Their sum is the
+		// GPU work of our queue; the gap between them (the wait for the D3D11 depth copy) is not counted.
+		const SIZE_T offset = sizeof(std::uint64_t) * 4 * a_index;
+		D3D12_RANGE range{ offset, offset + sizeof(std::uint64_t) * 4 };
 		void* mapped = nullptr;
 		if (FAILED(timestampReadback_->Map(0, &range, &mapped)) || !mapped)
 			return;
 		const auto* ticks = reinterpret_cast<const std::uint64_t*>(static_cast<const std::byte*>(mapped) + offset);
-		const std::uint64_t begin = ticks[0], end = ticks[1];
+		const std::uint64_t prepBegin = ticks[0], prepEnd = ticks[1], begin = ticks[2], end = ticks[3];
 		D3D12_RANGE written{ 0, 0 };
 		timestampReadback_->Unmap(0, &written);
-		if (end <= begin)
+		if (end <= begin || prepEnd < prepBegin)
 			return;
-		stats_.lastGpuMs = static_cast<float>(static_cast<double>(end - begin) * 1000.0 / static_cast<double>(timestampFrequency_));
+		const double toMs = 1000.0 / static_cast<double>(timestampFrequency_);
+		stats_.lastPrepGpuMs = static_cast<float>(static_cast<double>(prepEnd - prepBegin) * toMs);
+		stats_.lastTraceGpuMs = static_cast<float>(static_cast<double>(end - begin) * toMs);
+		stats_.lastGpuMs = stats_.lastPrepGpuMs + stats_.lastTraceGpuMs;
 		stats_.smoothedGpuMs = stats_.smoothedGpuMs > 0.0f ? stats_.smoothedGpuMs * 0.95f + stats_.lastGpuMs * 0.05f : stats_.lastGpuMs;
 	}
 
@@ -1107,31 +1119,20 @@ namespace RayTracingRT
 		static const std::vector<Instance> kNoInstances;
 		const std::vector<Instance>& instances = a_input.instances ? *a_input.instances : kNoInstances;
 
-		// GPU-side ordering only: the D3D12 queue waits for everything D3D11 recorded so far
-		// (the depth / mask copy), the D3D11 queue later waits for the trace.
-		const std::uint64_t readyValue = ++fenceValue_;
-		HRESULT hr = context11_->Signal(fence11_.Get(), readyValue);
-		if (FAILED(hr))
-			return Fail("D3D11 Signal", hr);
-		lap(split.signal11);
-		// (45k) The Signal submits the D3D11 work recorded so far by itself; the extra Flush of 45j
-		// is a switch (Debug: Flush D3D11 Before the Trace) so a trace can tell whether it blocks.
-		if (explicitFlush_)
-			context11_->Flush();
-		else
-			split.flushSkipped = true;
-		lap(split.flush11);
-		if (FAILED(hr = queue_->Wait(fence_.Get(), readyValue)))
-			return Fail("D3D12 queue Wait", hr);
-		lap(split.wait12);
+		// (45l) Recording first; the D3D11 ready Signal and the D3D12 queue Wait come after it. With
+		// splitSubmit the builds, skinning and the TLAS go out at once (they read nothing D3D11 writes)
+		// and only the trace list waits for D3D11's depth copy, so the D3D11 queue later waits for the
+		// trace alone instead of everything (GPU-side ordering only; the CPU never waits).
+		HRESULT hr;
 		if (FAILED(hr = context.allocator->Reset()))
 			return Fail("command allocator Reset", hr);
 		auto* list = context.list.Get();
 		if (FAILED(hr = list->Reset(context.allocator.Get(), nullptr)))
 			return Fail("command list Reset", hr);
 		lap(split.reset);
+		const UINT queryBase = static_cast<UINT>(index * 4);
 		if (timestampHeap_)
-			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(index * 2));
+			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
 
 		const std::int64_t buildStart = QpcNow();
 		const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
@@ -1213,7 +1214,8 @@ namespace RayTracingRT
 			descs[instanceCount++] = desc;
 		}
 		// (45i) Skinned characters: identity rotation (the skinning put the vertices in world axes),
-		// translated to their origin, instance mask kCharacterMask only (the scene ray skips them).
+		// translated to their origin, instance mask kCharacterMask (the player) or kNpcMask (45l, the
+		// other actors): the scene ray skips them.
 		std::uint32_t characterInstances = 0;
 		// A frame with alpha-tested scene instances needs the character + alpha variant.
 		const bool charactersTraceable = charPipeline_ && (alphaInstances == 0 || charAlphaPipeline_);
@@ -1234,7 +1236,7 @@ namespace RayTracingRT
 			desc.Transform[0][3] = static_cast<float>(draw.x - a_input.cameraX);
 			desc.Transform[1][3] = static_cast<float>(draw.y - a_input.cameraY);
 			desc.Transform[2][3] = static_cast<float>(draw.z - a_input.cameraZ);
-			desc.InstanceMask = kCharacterMask;
+			desc.InstanceMask = draw.npc ? kNpcMask : kCharacterMask;
 			desc.Flags = kInstanceFlags;
 			if (alpha) {
 				desc.InstanceID = draw.alphaInfo + 1;
@@ -1279,52 +1281,88 @@ namespace RayTracingRT
 		tlasDesc.DestAccelerationStructureData = tlas_->GetGPUVirtualAddress();
 		tlasDesc.ScratchAccelerationStructureData = scratch_->GetGPUVirtualAddress();
 		list->BuildRaytracingAccelerationStructure(&tlasDesc, 0, nullptr);
+		{
+			auto barrier = UavBarrier(tlas_.Get());
+			list->ResourceBarrier(1, &barrier);
+		}
+		if (timestampHeap_)
+			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
 
-		D3D12_RESOURCE_BARRIER pre[3] = {
-			UavBarrier(tlas_.Get()),
+		// The trace: in its own list behind the wait (split), or appended to the same one (45k).
+		ID3D12GraphicsCommandList4* traceList = list;
+		if (a_input.splitSubmit) {
+			if (FAILED(hr = list->Close()))
+				return Fail("command list Close", hr);
+			ID3D12CommandList* prepLists[] = { list };
+			queue_->ExecuteCommandLists(1, prepLists);
+			traceList = context.traceList.Get();
+			if (FAILED(hr = traceList->Reset(context.allocator.Get(), nullptr)))
+				return Fail("trace command list Reset", hr);
+		}
+		if (timestampHeap_)
+			traceList->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 2);
+
+		D3D12_RESOURCE_BARRIER pre[2] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
 			Transition(visibility_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
 		};
-		list->ResourceBarrier(3, pre);
+		traceList->ResourceBarrier(2, pre);
 
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
-		list->SetDescriptorHeaps(1, heaps);
-		list->SetComputeRootSignature(rootSignature_.Get());
+		traceList->SetDescriptorHeaps(1, heaps);
+		traceList->SetComputeRootSignature(rootSignature_.Get());
 		// (45i) The character variants only on frames with character instances: every other frame
 		// runs exactly the 45h pipelines.
 		const bool characterFrame = characterInstances > 0;
 		if (characterFrame)
-			list->SetPipelineState(alphaFrame ? charAlphaPipeline_.Get() : charPipeline_.Get());
+			traceList->SetPipelineState(alphaFrame ? charAlphaPipeline_.Get() : charPipeline_.Get());
 		else
-			list->SetPipelineState(alphaFrame ? alphaPipeline_.Get() : pipeline_.Get());
-		list->SetComputeRoot32BitConstants(0, kRootConstants, &a_input.constants, 0);
-		list->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
-		list->SetComputeRootDescriptorTable(2, descriptorHeap_->GetGPUDescriptorHandleForHeapStart());
+			traceList->SetPipelineState(alphaFrame ? alphaPipeline_.Get() : pipeline_.Get());
+		traceList->SetComputeRoot32BitConstants(0, kRootConstants, &a_input.constants, 0);
+		traceList->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
+		traceList->SetComputeRootDescriptorTable(2, descriptorHeap_->GetGPUDescriptorHandleForHeapStart());
 		if (alphaFrame) {
-			list->SetComputeRootShaderResourceView(3, context.alphaInfoBuffer->GetGPUVirtualAddress());
-			list->SetComputeRootShaderResourceView(4, alphaUv_->GetGPUVirtualAddress());
+			traceList->SetComputeRootShaderResourceView(3, context.alphaInfoBuffer->GetGPUVirtualAddress());
+			traceList->SetComputeRootShaderResourceView(4, alphaUv_->GetGPUVirtualAddress());
 			auto table = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
 			table.ptr += static_cast<UINT64>(descriptorSize_) * (kAlphaDescriptorBase - 1);
-			list->SetComputeRootDescriptorTable(5, table);
+			traceList->SetComputeRootDescriptorTable(5, table);
 		}
-		list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
+		traceList->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
 
 		D3D12_RESOURCE_BARRIER post[2] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
 			Transition(visibility_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
 		};
-		list->ResourceBarrier(2, post);
+		traceList->ResourceBarrier(2, post);
 
 		if (timestampHeap_ && timestampReadback_) {
-			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(index * 2 + 1));
-			list->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(index * 2), 2,
-				timestampReadback_.Get(), sizeof(std::uint64_t) * 2 * index);
+			traceList->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 3);
+			traceList->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase, 4, timestampReadback_.Get(),
+				sizeof(std::uint64_t) * 4 * index);
 			context.timestampsPending = true;
 		}
-		if (FAILED(hr = list->Close()))
+		if (FAILED(hr = traceList->Close()))
 			return Fail("command list Close", hr);
 		lap(split.record);
-		ID3D12CommandList* lists[] = { list };
+
+		// GPU-side ordering only: the trace waits for everything D3D11 recorded so far (the depth /
+		// mask copy, the alpha copies); the D3D11 queue later waits for the trace.
+		const std::uint64_t readyValue = ++fenceValue_;
+		if (FAILED(hr = context11_->Signal(fence11_.Get(), readyValue)))
+			return Fail("D3D11 Signal", hr);
+		lap(split.signal11);
+		// (45k) The Signal submits the D3D11 work recorded so far by itself; the extra Flush of 45j
+		// is a switch (Debug: Flush D3D11 Before the Trace) so a trace can tell whether it blocks.
+		if (explicitFlush_)
+			context11_->Flush();
+		else
+			split.flushSkipped = true;
+		lap(split.flush11);
+		if (FAILED(hr = queue_->Wait(fence_.Get(), readyValue)))
+			return Fail("D3D12 queue Wait", hr);
+		lap(split.wait12);
+		ID3D12CommandList* lists[] = { traceList };
 		queue_->ExecuteCommandLists(1, lists);
 		lap(split.execute);
 		const std::uint64_t doneValue = ++fenceValue_;
@@ -1336,12 +1374,32 @@ namespace RayTracingRT
 		for (auto& blas : blas_)
 			if (blas.state == BlasState::Built && blas.buildFence == 0)
 				blas.buildFence = doneValue;
-		if (FAILED(hr = context11_->Wait(fence11_.Get(), doneValue)))
-			return Fail("D3D11 Wait", hr);
+		if (a_input.deferWait) {
+			pendingWait_ = doneValue;
+		} else {
+			pendingWait_ = 0;
+			if (FAILED(hr = context11_->Wait(fence11_.Get(), doneValue)))
+				return Fail("D3D11 Wait", hr);
+		}
 		lap(split.wait11);
 		stats_.split = split;
 		stats_.cpuRecordMs = static_cast<float>(QpcToMs(QpcNow() - cpuStart)) - stats_.cpuBuildMs - stats_.cpuSkinMs;
 		return true;
+	}
+
+	float Backend::WaitForTrace()
+	{
+		// (45l) The deferred D3D11 wait (GPU-side): right before the first D3D11 pass that reads the trace.
+		if (pendingWait_ == 0 || !context11_ || !fence11_)
+			return 0.0f;
+		const std::int64_t start = QpcNow();
+		const std::uint64_t value = pendingWait_;
+		pendingWait_ = 0;
+		if (FAILED(context11_->Wait(fence11_.Get(), value)))
+			Fail("D3D11 Wait", E_FAIL);
+		const float ms = static_cast<float>(QpcToMs(QpcNow() - start));
+		stats_.split.wait11 += ms;
+		return ms;
 	}
 
 	bool Backend::BuildOnly(std::uint32_t a_triangleBudget, std::uint32_t a_maxBuilds)

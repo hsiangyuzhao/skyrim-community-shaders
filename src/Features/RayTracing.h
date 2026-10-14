@@ -3,6 +3,7 @@
 #include "Buffer.h"
 #include "Feature.h"
 
+#include "Features/NRDReblurIntegration.h"
 #include "Features/RayTracing/Backend.h"
 #include "Features/RayTracing/Characters.h"
 #include "Features/RayTracing/Scene.h"
@@ -44,11 +45,17 @@ public:
 		};
 	}
 
+	/// (45l) Five tiers + Custom. Saved 45k values 0 / 1 / 2 (Low / Medium / High) migrate to Medium / High / Ultra
+	/// (the same settings under the new names).
 	enum class Quality : int
 	{
-		Low = 0,
-		Medium = 1,
-		High = 2
+		VeryLow = 0,
+		Low = 1,
+		Medium = 2,  // = 45k Low
+		High = 3,    // = 45k Medium
+		Ultra = 4,   // = 45k High
+		Custom = 5,
+		Count
 	};
 
 	enum class DebugView : int
@@ -63,6 +70,8 @@ public:
 		HistoryLength,   // (45k) Denoiser Penumbra: history length
 		AdaptiveRays,    // (45k) pixels with adaptive extra rays
 		RtCasterMask,    // (45k) Screen Space Shadows "non-RT casters only": traced casters
+		DistanceQuality, // (45l) fall-off and pattern-filled pixels
+		CharacterRays,   // (45l) where the character ray ran
 		Count
 	};
 
@@ -70,7 +79,7 @@ public:
 	enum class SSSMode : int
 	{
 		Combine = 0,  // kept; merged with the mask as min() (grass, leaves, characters keep their contact shadows)
-		HandOff = 1,  // faded out (45i): the ray tracer alone (grass loses its contact shadows)
+		HandOff = 1,  // (45i-45k) removed in 45l: migrated to NonRT with contact length 0 (kept as a value only)
 		Keep = 2,     // kept and multiplied as with Ray Tracing off (shared shadows get darker twice)
 		NonRT = 3     // (45k, default) every caster the ray tracer does not see keeps its contact shadow; traced
 		              // casters only within a short contact range (the gap the ray start offset leaves); merged as min()
@@ -84,6 +93,7 @@ public:
 		Temporal = 1,  // the 45j "Temporal smoothing" path exactly
 		Penumbra = 2,  // (45k, default) penumbra-aware spatial filter + clamped temporal + adaptive rays
 		DLSSRR = 3,    // nothing of ours: raw animated noise for DLSS Ray Reconstruction
+		Sigma = 4,     // (45l) NVIDIA NRD SIGMA shadow denoiser
 		Count
 	};
 
@@ -98,7 +108,7 @@ public:
 	struct Settings
 	{
 		bool Enabled = false;
-		int QualityLevel = static_cast<int>(Quality::Medium);
+		int QualityLevel = static_cast<int>(Quality::Medium);  // (45l) Medium = 45k Low
 		// Debug A/B switches (persisted so a test survives a restart).
 		bool KeepCastersInShadowMap = false;
 		bool KeepScreenSpaceShadows = false;  // (45i key, read once by the 45j migration: true = SSS mode Keep)
@@ -112,7 +122,7 @@ public:
 		bool KeepCharactersInShadowMap = false;  // debug A/B
 		float CharacterSelfShadowOffset = 6.0f;  // debug: hits on characters nearer than this are ignored (units)
 		// (45j) Ray Tracing > Advanced.
-		int SettingsVersion = 3;  // 45j migration marker (absent in older JSON); 3 = 45k (SSS mode "non-RT casters only")
+		int SettingsVersion = 4;  // 45j migration marker (absent in older JSON); 3 = 45k (SSS mode "non-RT casters only"); 4 = 45l (tiers, hand-off)
 		bool Buildings = true;
 		bool Objects = true;
 		bool Trees = false;
@@ -138,6 +148,29 @@ public:
 		// moved the GPU wait from Present into a Map, the only always-on difference from 45d being the
 		// thousands of shareable textures; under test as a suspect.
 		bool ShareGameTextures = false;
+		// (45l) Quality "Custom" (Advanced): what the tiers set.
+		int CustomBaseRays = 1;
+		int CustomExtraRays = 1;
+		float CustomSunCone = 0.27f;        // degrees, half angle
+		float CustomFalloffStart = 4096.0f; // units
+		float CustomFalloffEnd = 12288.0f;
+		int CustomFarQuality = 0;           // beyond the fall-off end: 0 full, 1 checkerboard, 2 half
+		int CustomTraceResolution = 0;      // everywhere: 0 full, 1 checkerboard, 2 half
+		int CustomNpcQuality = 1;           // 0 full, 1 reduced
+		float CustomDenoiseRadius = 16.0f;  // px
+		int CustomDenoiseTaps = 4;          // per side
+		float CustomDenoiseClamp = 1.5f;    // history clamp, sigmas
+		int CustomHistory = 12;             // frames
+		bool CustomDenoiseHalf = true;
+		float CustomFarDenoiseScale = 0.75f;
+		// (45l) NRD SIGMA: frames of its temporal stabilisation (0 = none: least lag on moving shadows).
+		int SigmaStabilizedFrames = 4;
+		// (45l) Debug A/B of the cost and sync changes (each off = 45k).
+		bool LateSync = true;             // D3D11 waits for the trace after the other features' prepasses
+		bool SplitSubmit = true;          // builds / skinning / TLAS do not wait for D3D11
+		bool CharacterRayCulling = true;  // character ray only where it can meet a character
+		bool BlockerAtEdges = true;       // closest-hit blocker distance only at shadow edges
+		bool DistanceFalloff = true;      // the tiers' distance fall-off
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted
@@ -172,6 +205,9 @@ public:
 	/// (45k) Screen Space Shadows Prepass: true = Ray Tracing draws them this frame (non-RT casters only,
 	/// after its trace, with its caster mask); it then always calls ScreenSpaceShadows::DrawDeferred once.
 	bool ClaimScreenSpaceShadows();
+	/// (45l) Deferred::PrepassPasses, after every feature's Prepass: the D3D11 side of this frame's trace
+	/// (wait, Screen Space Shadows, denoiser, combine) when Late Sync deferred it. No-op otherwise.
+	void FinishPrepass();
 
 	/// True when this frame's shadow mask is (being) ray traced.
 	[[nodiscard]] bool IsActiveThisFrame() const { return activeThisFrame; }
@@ -200,9 +236,37 @@ private:
 		float PrevViewProj[16];  // (45j) last combined frame's CameraViewProj
 		float CameraDelta[4];    // (45j) camera position now minus then
 		float Denoise[4];        // (45k) tan(cone), max radius px, max history, clamp sigmas
-		float Extra[4];          // (45k) fade-in, blocker range, unused
+		float Extra[4];          // (45k) fade-in, blocker range, unused, (45l) max filter taps per side
+		float Falloff[4];        // (45l) fall-off start, end, filter radius scale beyond the end, far pattern
+		float ViewProjUnjittered[16];      // (45l) SIGMA motion vectors
+		float PrevViewProjUnjittered[16];  // (45l)
+		float CameraData[4];     // (45l) SIGMA viewZ (Util::GetCameraData)
+		float SunDirection[4];   // (45l) to the sun, tan(cone)
 	};
 	STATIC_ASSERT_ALIGNAS_16(CombineCB);
+
+	/// (45l) What a quality tier (or Custom) sets.
+	struct QualityParams
+	{
+		std::uint32_t baseRays = 1, extraRays = 1;
+		float coneDegrees = 0.27f;
+		std::uint32_t smallFilterRadius = 1;    // the 45j filter (Off, Temporal)
+		std::uint32_t tracePattern = 0, farPattern = 0;  // 0 full, 1 checkerboard, 2 half
+		float falloffStart = 0.0f, falloffEnd = 0.0f;  // end <= start: no fall-off
+		bool npcReduced = false;
+		float denoiseRadius = 16.0f;
+		std::uint32_t denoiseTaps = 6;
+		bool denoiseHalf = false;
+		float farDenoiseScale = 1.0f;
+		float history = 12.0f;
+		float clampSigma = 1.5f;
+	};
+	QualityParams ResolveQuality() const;
+	void CopyTierToCustom(int a_tier);
+	/// (45l) Upscaling's Ray Reconstruction is running (DLSS, RR switched on and available).
+	static bool UpscalingRRActive();
+	/// (45l) The denoiser in effect: DLSS RR whenever Upscaling's Ray Reconstruction runs, else the chosen one.
+	[[nodiscard]] DenoiserMode EffectiveDenoiser() const;
 
 	bool EnsureBackend();
 	bool EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc);
@@ -232,15 +296,12 @@ private:
 	winrt::com_ptr<ID3D11Texture2D> debugColor;  // debug view colour + opacity (RGBA8), written by CombineCS
 	winrt::com_ptr<ID3D11UnorderedAccessView> debugColorUAV;
 	winrt::com_ptr<ID3D11ShaderResourceView> debugColorSRV;
-	// (45j) Temporal: ping-pong history (r visibility, g distance), last camera.
-	winrt::com_ptr<ID3D11Texture2D> history[2];
-	winrt::com_ptr<ID3D11ShaderResourceView> historySRV[2];
-	winrt::com_ptr<ID3D11UnorderedAccessView> historyUAV[2];
-	std::uint32_t historyIndex = 0;
-	bool historyValid = false;
+	// Last combined frame's camera (history reprojection). (45l) The 45j history textures are gone: Temporal
+	// uses the Penumbra history (History4) now.
 	float prevViewProj[16]{};
+	float prevViewProjUnjittered[16]{};  // (45l) SIGMA motion vectors
 	double prevCamera[3]{};
-	bool EnsureHistory();
+	bool prevCameraValid = false;
 	// (45k) Denoiser Penumbra: tiles (RGBA16F, 1/8 size), horizontal and final filter (RG16F), history ping-pong (RGBA16F).
 	struct DenoiseTexture
 	{
@@ -248,13 +309,50 @@ private:
 		winrt::com_ptr<ID3D11ShaderResourceView> srv;
 		winrt::com_ptr<ID3D11UnorderedAccessView> uav;
 	};
-	DenoiseTexture denoiseTiles, denoiseH, denoiseOut, history4[2];
+	// (45l) denoiseHalfIn: the half-resolution filter input (RG16F); denoiseH / denoiseOut are half size when denoiseIsHalf.
+	DenoiseTexture denoiseTiles, denoiseH, denoiseOut, denoiseHalfIn, history4[2];
+	bool denoiseIsHalf = false;
 	std::uint32_t history4Index = 0;
 	bool history4Valid = false;
 	std::uint64_t denoiseBytes = 0;
-	bool EnsureDenoiser();
+	bool EnsureDenoiser(bool a_half);
 	void ReleaseDenoiser();
-	winrt::com_ptr<ID3D11ComputeShader> denoiseTileCS, denoiseHCS, denoiseVCS;
+	winrt::com_ptr<ID3D11ComputeShader> denoiseTileCS, denoiseHCS, denoiseVCS, denoiseHalfHCS, denoiseHalfVCS;
+	// (45l) Denoiser NRD SIGMA: its own NRD instance (not the SSRT ones) and its inputs / output.
+	std::unique_ptr<NRDReblurIntegration> sigma;
+	DenoiseTexture sigmaViewZ, sigmaNormal, sigmaMotion, sigmaPenumbra, sigmaOut;
+	winrt::com_ptr<ID3D11ComputeShader> sigmaPrepCS;
+	std::uint64_t sigmaBytes = 0;
+	std::uint32_t sigmaFrame = 0;
+	bool sigmaHistoryValid = false;
+	std::string sigmaFault;
+	float sigmaPrevWorldToView[16]{}, sigmaPrevProj[16]{};
+	float sigmaPrevJitter[2]{};
+	std::uint16_t sigmaPrevRect[2]{};
+	bool EnsureSigma();
+	void ReleaseSigma();
+	bool RunSigma(const float a_toSun[3]);
+	// (45l) The second half of a traced frame (the D3D11 wait for the trace, Screen Space Shadows, the
+	// denoiser, the combine), run right after the trace (Late Sync off) or after every other prepass.
+	struct PendingFrame
+	{
+		bool active = false;
+		std::array<std::uint8_t, sizeof(CombineCB)> cbBytes{};  // the frame's CombineCB (bytes: no alignment padding here)
+		std::uint32_t combineFlags = 0;
+		std::uint32_t width = 0, height = 0;
+		bool writeSSS = false, debug = false, penumbra = false, spatial = false, half = false, sigma = false, sssNonRT = false;
+		float biasConstant = 0.0f, biasPerUnit = 0.0f;
+		float toSun[3]{};
+		double camera[3]{};
+		float viewProj[16]{}, viewProjUnjittered[16]{};
+	};
+	PendingFrame pending;
+	void FinishFrame();
+	void ReportFrame();
+	std::int64_t frameStart = 0;
+	float prepassCpuMs = 0.0f;
+	QualityParams lastQuality{};
+	DenoiserMode lastEffectiveDenoiser = DenoiserMode::Off;
 	// (45k) Screen Space Shadows drawn by us this frame (non-RT casters only).
 	bool sssClaimed = false;
 	// (45k) Loading screens and the warm-up after them.

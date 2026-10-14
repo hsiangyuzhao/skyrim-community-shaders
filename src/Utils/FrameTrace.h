@@ -78,6 +78,11 @@ namespace Util::FrameTrace
 		float xCollect = -1, xSignal11 = -1, xFlush11 = -1, xWait12 = -1, xReset = -1, xTlas = -1, xAlpha = -1, xRecord = -1, xExecute = -1, xSignal12 = -1, xWait11 = -1;
 		int denoiser = -1, phase = 0;
 		float denoiseGpuMs = -1, sssGpuMs = -1;
+		// (45l) GPU per pass (last samples, a few frames old; -1 = not run): tiles, H+V filter, SIGMA (prep + NRD), combine,
+		// the D3D11 stall at the wait for the trace; on the D3D12 queue builds/skinning/TLAS and the trace itself.
+		float tileGpuMs = -1, filterGpuMs = -1, sigmaGpuMs = -1, combineGpuMs = -1, syncGpuMs = -1, prepGpuMs = -1, traceGpuMs = -1;
+		int quality = -1, denoiserEffective = -1;
+		uint32_t skinDraws = 0, skinReused = 0;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

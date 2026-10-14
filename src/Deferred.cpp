@@ -415,6 +415,12 @@ void Deferred::PrepassPasses()
 			feature->Prepass();
 		}
 	}
+	// (45l) Ray Tracing's D3D11 side (the GPU wait for its trace, Screen Space Shadows, denoiser, shadow mask
+	// merge) after every other prepass, so their GPU work overlaps the trace. Before the opaque pass reads the mask.
+	if (auto& rayTracing = globals::features::rayTracing; rayTracing.loaded) {
+		Util::CpuPassScope timer(CpuTimerKey(&rayTracing));
+		rayTracing.FinishPrepass();
+	}
 }
 
 void Deferred::StartDeferred()

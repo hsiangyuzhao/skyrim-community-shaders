@@ -107,6 +107,11 @@ namespace RayTracingCharacters
 		void ReleaseAll(RayTracingRT::Backend& a_backend);
 		[[nodiscard]] bool Empty() const { return actors_.empty() && retiring_.empty(); }
 		[[nodiscard]] const Stats& GetStats() const { return stats_; }
+		/// (45l) Other actors (not the player) at reduced quality: skinned and refit every other frame.
+		void SetNpcReduced(bool a_reduced) { npcReduced_ = a_reduced; }
+		/// (45l) Bounding spheres of the traced characters, camera-relative xyz + radius (radius 0 = none):
+		/// the player, and one sphere around every other actor. For the trace's character-ray culling.
+		void GetBounds(const double a_camera[3], float o_player[4], float o_others[4]) const;
 		void ResetPeaks() { stats_.maxMs = 0.0f; }
 
 	private:
@@ -129,6 +134,7 @@ namespace RayTracingCharacters
 			std::uint32_t info = RayTracingRT::kInvalidAlphaInfo;
 			bool registered = false;
 			bool drawable = false;          // in the TLAS (an alpha part only once its texture is ready)
+			bool reuse = false;             // (45l) this frame: last frame's skinned BLAS (other actors, reduced quality)
 			std::uint32_t vertices = 0;
 			std::vector<float> matrices;    // last bone matrices (12 floats each), relative to origin
 			double origin[3]{};
@@ -164,6 +170,7 @@ namespace RayTracingCharacters
 		bool firstPersonPlayer_ = false;  // (45j)
 		bool alpha_ = false;
 		bool keepInShadowMap_ = false;
+		bool npcReduced_ = false;  // (45l)
 		std::uint32_t filterEpoch_ = 0;
 		std::uint32_t loggedPlacement_ = 0;
 		std::uint32_t loggedOther_ = 0;

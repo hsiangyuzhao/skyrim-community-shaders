@@ -4,6 +4,7 @@
 #include "Features/RayTracing/CasterFilter.h"
 #include "Features/RayTracing/TextureSharing.h"
 #include "Features/ScreenSpaceShadows.h"
+#include "Features/Upscaling.h"
 #include "State.h"
 #include "Utils/FrameTrace.h"
 #include "Utils/GpuTimers.h"
@@ -40,25 +41,64 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	WarmUp,
 	StableNormals,
 	FineAlphaMips,
-	ShareGameTextures)
+	ShareGameTextures,
+	CustomBaseRays,
+	CustomExtraRays,
+	CustomSunCone,
+	CustomFalloffStart,
+	CustomFalloffEnd,
+	CustomFarQuality,
+	CustomTraceResolution,
+	CustomNpcQuality,
+	CustomDenoiseRadius,
+	CustomDenoiseTaps,
+	CustomDenoiseClamp,
+	CustomHistory,
+	CustomDenoiseHalf,
+	CustomFarDenoiseScale,
+	SigmaStabilizedFrames,
+	LateSync,
+	SplitSubmit,
+	CharacterRayCulling,
+	BlockerAtEdges,
+	DistanceFalloff)
 
 namespace
 {
-	struct QualityPreset
+	// (45l) Quality tiers. Medium / High / Ultra are 45k's Low / Medium / High (rays, sun cone, small
+	// filter) plus the 45l cost cuts; Very Low and Low are new and cheaper.
+	struct QualityTier
 	{
 		const char* name;
-		std::uint32_t rays;
+		std::uint32_t baseRays, extraRays;
 		float coneDegrees;  // half angle; the sun disc is about 0.27
-		std::uint32_t filterRadius;
-		std::uint32_t extraRays;  // (45k) adaptive extra rays at shadow edges
+		std::uint32_t smallFilterRadius;
+		std::uint32_t tracePattern, farPattern;  // 0 full, 1 checkerboard, 2 half (one pixel of each 2x2)
+		float falloffStart, falloffEnd;          // units (70 per metre); end <= start: none
+		bool npcReduced;
+		float denoiseRadius;
+		std::uint32_t denoiseTaps;
+		bool denoiseHalf;
+		float farDenoiseScale;
 		const char* tooltip;
 	};
 
-	constexpr QualityPreset kQuality[3] = {
-		{ "Low", 1, 0.27f, 1, 1, "1 ray per pixel (+1 at shadow edges with adaptive rays), sharp sun (the real sun disc), light 3x3 smoothing. Cheapest." },
-		{ "Medium", 1, 0.5f, 2, 3, "1 ray per pixel (+3 at shadow edges with adaptive rays), slightly softer edges, 5x5 smoothing." },
-		{ "High", 2, 0.5f, 2, 4, "2 rays per pixel (+4 at shadow edges with adaptive rays), slightly softer edges, 5x5 smoothing. Cleanest." },
+	constexpr QualityTier kTiers[5] = {
+		{ "Very Low", 1, 0, 0.27f, 1, 1, 2, 1024.0f, 4096.0f, true, 8.0f, 3, true, 0.5f,
+			"Half the pixels traced each frame (checkerboard), a quarter beyond 60 m; no extra rays; other characters at reduced quality; "
+			"half-resolution denoiser. Cheapest." },
+		{ "Low", 1, 0, 0.27f, 1, 0, 1, 2048.0f, 6144.0f, true, 12.0f, 4, true, 0.5f,
+			"1 ray per pixel, checkerboard beyond 90 m; no extra rays; other characters at reduced quality; half-resolution denoiser." },
+		{ "Medium", 1, 1, 0.27f, 1, 0, 0, 4096.0f, 12288.0f, true, 16.0f, 4, true, 0.75f,
+			"45k's Low: 1 ray per pixel (+1 at shadow edges, fading out between 60 and 175 m), the real sun disc; other characters at "
+			"reduced quality; half-resolution denoiser." },
+		{ "High", 1, 3, 0.5f, 2, 0, 0, 6144.0f, 16384.0f, false, 16.0f, 6, false, 1.0f,
+			"45k's Medium: 1 ray per pixel (+3 at shadow edges, fading out between 90 and 230 m), slightly softer edges; full-resolution denoiser." },
+		{ "Ultra", 2, 4, 0.5f, 2, 0, 0, 0.0f, 0.0f, false, 16.0f, 6, false, 1.0f,
+			"45k's High: 2 rays per pixel (+4 at shadow edges, no fall-off), slightly softer edges; full-resolution denoiser. Cleanest." },
 	};
+	constexpr const char* kQualityNames[6] = { "Very Low", "Low", "Medium", "High", "Ultra", "Custom" };
+	constexpr const char* kPatternNames[3] = { "Full", "Checkerboard", "Half" };
 
 	constexpr float kCaptureBudgetMs = 1.0f;      // CPU per frame for capturing new cells (45j: 1.5 -> 1.0, resumable per shape)
 	constexpr std::uint32_t kBuildBudget = 131072;  // triangles of BLAS builds per frame (about one chunk)
@@ -67,16 +107,15 @@ namespace
 	constexpr std::uint64_t kAccelerationBudgetBytes = 1200ull << 20;  // BLAS + scratch; spec target is 1.5 GB in total
 	constexpr std::uint32_t kFlagSkipShadowed = 1u, kFlagCoverage = 2u, kFlagFirstPerson = 4u;  // TraceShadowsCS
 	constexpr std::uint32_t kFlagWorldNoise = 8u, kFlagStableNormal = 16u, kFlagAlphaFootprint = 32u;  // TraceShadowsCS (45j)
-	constexpr std::uint32_t kFlagHandOffSSS = 1u, kFlagDebug = 2u;  // Common.hlsli
-	constexpr std::uint32_t kFlagCombineSSS = 4u, kFlagKeepSSSUnderFoliage = 8u, kFlagTemporal = 16u, kFlagHistoryValid = 32u,
-							kFlagTraceSkipped = 64u;  // Common.hlsli (45j)
-	constexpr float kTemporalBlend = 0.2f;  // (45j) weight of the new frame in the history blend
+	constexpr std::uint32_t kFlagDebug = 2u;  // Common.hlsli
+	constexpr std::uint32_t kFlagCombineSSS = 4u, kFlagHistoryValid = 32u, kFlagTraceSkipped = 64u;  // Common.hlsli (45j)
 	// (45k) Denoiser and the trace flags it needs.
 	constexpr std::uint32_t kFlagR2Noise = 64u, kFlagAdaptive = 128u, kFlagBlockerDist = 256u, kFlagRtSurface = 512u;  // TraceShadowsCS
 	constexpr std::uint32_t kFlagPenumbra = 128u, kFlagCombineBlockerDist = 256u;                                       // Common.hlsli
-	constexpr float kDenoiseMaxRadius = 16.0f;  // px at render resolution
-	constexpr float kDenoiseMaxHistory = 12.0f; // frames
-	constexpr float kDenoiseClampSigma = 1.5f;
+	// (45l) Cost switches of the trace and the denoiser stages.
+	constexpr std::uint32_t kFlagBlockerEdges = 1024u, kFlagCharCull = 2048u, kFlagFalloff = 4096u;  // TraceShadowsCS
+	constexpr std::uint32_t kPatternNpcReduced = 16u;                                                  // TraceShadowsCS Extra.w
+	constexpr std::uint32_t kFlagSpatial = 512u, kFlagDenoiseHalf = 1024u, kFlagSigma = 2048u, kFlagFalloffDenoise = 4096u;  // Common.hlsli
 	constexpr float kBlockerRange = 4096.0f;    // TraceShadowsCS kBlockerRange
 	// (45k) Loading screens: capture / build budgets (frame time does not matter there), warm-up after them.
 	constexpr float kLoadingCaptureBudgetMs = 8.0f;
@@ -286,6 +325,90 @@ void RayTracing::UpdateCharacters()
 		settings.FirstPersonPlayer);
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// (45l) Quality tiers, denoiser in effect
+// ---------------------------------------------------------------------------------------------
+
+RayTracing::QualityParams RayTracing::ResolveQuality() const
+{
+	QualityParams q;
+	const int level = std::clamp(settings.QualityLevel, 0, static_cast<int>(Quality::Count) - 1);
+	if (level == static_cast<int>(Quality::Custom)) {
+		q.baseRays = static_cast<std::uint32_t>(std::clamp(settings.CustomBaseRays, 1, 4));
+		q.extraRays = static_cast<std::uint32_t>(std::clamp(settings.CustomExtraRays, 0, 8));
+		q.coneDegrees = settings.CustomSunCone;
+		q.smallFilterRadius = settings.CustomSunCone > 0.4f ? 2u : 1u;
+		q.tracePattern = static_cast<std::uint32_t>(std::clamp(settings.CustomTraceResolution, 0, 2));
+		q.farPattern = static_cast<std::uint32_t>(std::clamp(settings.CustomFarQuality, 0, 2));
+		q.falloffStart = settings.CustomFalloffStart;
+		q.falloffEnd = settings.CustomFalloffEnd;
+		q.npcReduced = settings.CustomNpcQuality == 1;
+		q.denoiseRadius = settings.CustomDenoiseRadius;
+		q.denoiseTaps = static_cast<std::uint32_t>(std::clamp(settings.CustomDenoiseTaps, 1, 8));
+		q.denoiseHalf = settings.CustomDenoiseHalf;
+		q.farDenoiseScale = settings.CustomFarDenoiseScale;
+		q.history = static_cast<float>(std::clamp(settings.CustomHistory, 1, 32));
+		q.clampSigma = settings.CustomDenoiseClamp;
+	} else {
+		const auto& t = kTiers[level];
+		q.baseRays = t.baseRays;
+		q.extraRays = t.extraRays;
+		q.coneDegrees = t.coneDegrees;
+		q.smallFilterRadius = t.smallFilterRadius;
+		q.tracePattern = t.tracePattern;
+		q.farPattern = t.farPattern;
+		q.falloffStart = t.falloffStart;
+		q.falloffEnd = t.falloffEnd;
+		q.npcReduced = t.npcReduced;
+		q.denoiseRadius = t.denoiseRadius;
+		q.denoiseTaps = t.denoiseTaps;
+		q.denoiseHalf = t.denoiseHalf;
+		q.farDenoiseScale = t.farDenoiseScale;
+	}
+	// Debug A/B: no distance fall-off at all (the far pattern goes with it).
+	if (!settings.DistanceFalloff) {
+		q.falloffStart = q.falloffEnd = 0.0f;
+		q.farPattern = 0;
+	}
+	return q;
+}
+
+void RayTracing::CopyTierToCustom(int a_tier)
+{
+	const auto& t = kTiers[std::clamp(a_tier, 0, 4)];
+	settings.CustomBaseRays = static_cast<int>(t.baseRays);
+	settings.CustomExtraRays = static_cast<int>(t.extraRays);
+	settings.CustomSunCone = t.coneDegrees;
+	settings.CustomTraceResolution = static_cast<int>(t.tracePattern);
+	settings.CustomFarQuality = static_cast<int>(t.farPattern);
+	settings.CustomFalloffStart = t.falloffStart;
+	settings.CustomFalloffEnd = t.falloffEnd;
+	settings.CustomNpcQuality = t.npcReduced ? 1 : 0;
+	settings.CustomDenoiseRadius = t.denoiseRadius;
+	settings.CustomDenoiseTaps = static_cast<int>(t.denoiseTaps);
+	settings.CustomDenoiseHalf = t.denoiseHalf;
+	settings.CustomFarDenoiseScale = t.farDenoiseScale;
+	settings.CustomHistory = 12;
+	settings.CustomDenoiseClamp = 1.5f;
+}
+
+bool RayTracing::UpscalingRRActive()
+{
+	auto& upscaling = globals::features::upscaling;
+	return upscaling.loaded && upscaling.settings.enableDLSSRR && Upscaling::streamline.featureDLSS_RR &&
+	       upscaling.GetUpscaleMethod() == Upscaling::UpscaleMethod::kDLSS;
+}
+
+RayTracing::DenoiserMode RayTracing::EffectiveDenoiser() const
+{
+	// (45l) Ray Reconstruction cleans the whole image, shadows included, but only raw per-frame noise:
+	// whenever it runs, the shadows take the DLSS RR route whatever the dropdown says.
+	if (UpscalingRRActive())
+		return DenoiserMode::DLSSRR;
+	return CurrentDenoiser();
+}
+
 // ---------------------------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------------------------
@@ -293,7 +416,6 @@ void RayTracing::UpdateCharacters()
 void RayTracing::LoadSettings(json& o_json)
 {
 	settings = o_json;
-	settings.QualityLevel = std::clamp(settings.QualityLevel, 0, 2);
 	settings.CharacterSelfShadowOffset = std::isfinite(settings.CharacterSelfShadowOffset) ? std::clamp(settings.CharacterSelfShadowOffset, 0.0f, 32.0f) : 6.0f;
 	// (45j) Once, from a 45d-45i save: the per-kind choices start at their new defaults (foliage and
 	// trees in the shadow map, buildings / objects / characters / physics parts ray traced, hair in
@@ -323,6 +445,37 @@ void RayTracing::LoadSettings(json& o_json)
 		logger::info("[RayTracing] Settings from before 45k: Screen Space Shadows mode {}, Denoiser Penumbra", settings.ScreenSpaceShadows);
 		settings.SettingsVersion = 3;
 	}
+	// (45l) Once, from a save before 45l: the tiers moved up by two names (45k Low / Medium / High = Medium / High /
+	// Ultra, the same settings); Screen Space Shadows "Hand off" becomes "Non-RT casters only" with contact length 0.
+	if (!o_json.is_object() || o_json.value("SettingsVersion", 0) < 4) {
+		const int oldQuality = settings.QualityLevel;
+		if (o_json.is_object() && o_json.contains("QualityLevel"))
+			settings.QualityLevel = std::clamp(oldQuality, 0, 2) + 2;
+		if (settings.ScreenSpaceShadows == static_cast<int>(SSSMode::HandOff)) {
+			settings.ScreenSpaceShadows = static_cast<int>(SSSMode::NonRT);
+			settings.RtContactScale = 0.0f;
+		}
+		logger::info("[RayTracing] Settings from before 45l: quality {} -> {} ({}), Screen Space Shadows mode {}", oldQuality, settings.QualityLevel,
+			kQualityNames[std::clamp(settings.QualityLevel, 0, 5)], settings.ScreenSpaceShadows);
+		settings.SettingsVersion = 4;
+	}
+	settings.QualityLevel = std::clamp(settings.QualityLevel, 0, static_cast<int>(Quality::Count) - 1);
+	if (settings.ScreenSpaceShadows == static_cast<int>(SSSMode::HandOff))
+		settings.ScreenSpaceShadows = static_cast<int>(SSSMode::NonRT);
+	settings.CustomBaseRays = std::clamp(settings.CustomBaseRays, 1, 4);
+	settings.CustomExtraRays = std::clamp(settings.CustomExtraRays, 0, 8);
+	settings.CustomSunCone = std::isfinite(settings.CustomSunCone) ? std::clamp(settings.CustomSunCone, 0.1f, 2.0f) : 0.27f;
+	settings.CustomFalloffStart = std::isfinite(settings.CustomFalloffStart) ? std::clamp(settings.CustomFalloffStart, 0.0f, 32768.0f) : 4096.0f;
+	settings.CustomFalloffEnd = std::isfinite(settings.CustomFalloffEnd) ? std::clamp(settings.CustomFalloffEnd, 0.0f, 65536.0f) : 12288.0f;
+	settings.CustomFarQuality = std::clamp(settings.CustomFarQuality, 0, 2);
+	settings.CustomTraceResolution = std::clamp(settings.CustomTraceResolution, 0, 2);
+	settings.CustomNpcQuality = std::clamp(settings.CustomNpcQuality, 0, 1);
+	settings.CustomDenoiseRadius = std::isfinite(settings.CustomDenoiseRadius) ? std::clamp(settings.CustomDenoiseRadius, 2.0f, 32.0f) : 16.0f;
+	settings.CustomDenoiseTaps = std::clamp(settings.CustomDenoiseTaps, 1, 8);
+	settings.CustomDenoiseClamp = std::isfinite(settings.CustomDenoiseClamp) ? std::clamp(settings.CustomDenoiseClamp, 0.5f, 4.0f) : 1.5f;
+	settings.CustomHistory = std::clamp(settings.CustomHistory, 1, 32);
+	settings.CustomFarDenoiseScale = std::isfinite(settings.CustomFarDenoiseScale) ? std::clamp(settings.CustomFarDenoiseScale, 0.0f, 1.0f) : 0.75f;
+	settings.SigmaStabilizedFrames = std::clamp(settings.SigmaStabilizedFrames, 0, 5);
 	settings.Foliage = std::clamp(settings.Foliage, 0, 2);
 	settings.ScreenSpaceShadows = std::clamp(settings.ScreenSpaceShadows, 0, 3);
 	settings.Denoiser = std::clamp(settings.Denoiser, 0, static_cast<int>(DenoiserMode::Count) - 1);
@@ -379,6 +532,9 @@ void RayTracing::ClearShaderCache()
 	denoiseTileCS = nullptr;
 	denoiseHCS = nullptr;
 	denoiseVCS = nullptr;
+	denoiseHalfHCS = nullptr;
+	denoiseHalfVCS = nullptr;
+	sigmaPrepCS = nullptr;
 }
 
 ID3D11ComputeShader* RayTracing::GetShader(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name)
@@ -401,6 +557,7 @@ void RayTracing::Disable(Status a_status, std::string a_reason)
 	statusReason = a_reason.empty() ? std::string("unknown error (see the log)") : std::move(a_reason);
 	lastFailureReason = statusReason;
 	activeThisFrame = false;
+	pending.active = false;  // (45l)
 	RayTracingCasterFilter::Clear();
 	characters.ReleaseAll(backend);  // (45i) (a backend that is gone ignores the handles)
 	scene.ReleaseAll(backend);
@@ -450,63 +607,80 @@ void RayTracing::ReleaseD3D11Resources()
 	debugColor = nullptr;
 	debugColorUAV = nullptr;
 	debugColorSRV = nullptr;
-	for (int i = 0; i < 2; ++i) {
-		history[i] = nullptr;
-		historySRV[i] = nullptr;
-		historyUAV[i] = nullptr;
-	}
-	historyValid = false;
 	ReleaseDenoiser();
+	ReleaseSigma();
+	prevCameraValid = false;
 	maskDesc = {};
 	d3d11Bytes = 0;
 }
 
 void RayTracing::ReleaseDenoiser()
 {
-	for (auto* t : { &denoiseTiles, &denoiseH, &denoiseOut, &history4[0], &history4[1] })
+	for (auto* t : { &denoiseTiles, &denoiseH, &denoiseOut, &denoiseHalfIn, &history4[0], &history4[1] })
 		*t = {};
 	history4Valid = false;
 	d3d11Bytes -= std::min(d3d11Bytes, denoiseBytes);
 	denoiseBytes = 0;
 }
 
-bool RayTracing::EnsureDenoiser()
+namespace
 {
-	// (45k) Denoiser Penumbra: created on first use (render-target size of the shadow mask).
-	if (denoiseTiles.texture && denoiseH.texture && denoiseOut.texture && history4[0].texture && history4[1].texture)
+	bool CreateDenoiseTexture(RayTracing* a_self, winrt::com_ptr<ID3D11Texture2D>& o_texture, winrt::com_ptr<ID3D11ShaderResourceView>& o_srv,
+		winrt::com_ptr<ID3D11UnorderedAccessView>& o_uav, std::uint32_t a_width, std::uint32_t a_height, DXGI_FORMAT a_format, const char* a_name)
+	{
+		(void)a_self;
+		D3D11_TEXTURE2D_DESC d{};
+		d.Width = std::max(a_width, 1u);
+		d.Height = std::max(a_height, 1u);
+		d.MipLevels = 1;
+		d.ArraySize = 1;
+		d.Format = a_format;
+		d.SampleDesc = { 1, 0 };
+		d.Usage = D3D11_USAGE_DEFAULT;
+		d.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+		auto* device = globals::d3d::device;
+		if (FAILED(device->CreateTexture2D(&d, nullptr, o_texture.put())) || FAILED(device->CreateShaderResourceView(o_texture.get(), nullptr, o_srv.put())) ||
+			FAILED(device->CreateUnorderedAccessView(o_texture.get(), nullptr, o_uav.put())))
+			return false;
+		Util::SetResourceName(o_texture.get(), a_name);
+		return true;
+	}
+}
+
+bool RayTracing::EnsureDenoiser(bool a_half)
+{
+	// (45k) Denoiser Penumbra / (45l) Temporal: created on first use (render-target size of the shadow
+	// mask). (45l) The filter textures are half size with a half-resolution filter.
+	if (denoiseTiles.texture && denoiseH.texture && denoiseOut.texture && history4[0].texture && history4[1].texture && denoiseIsHalf == a_half &&
+		(!a_half || denoiseHalfIn.texture))
 		return true;
 	if (!maskTemp)
 		return false;
 	D3D11_TEXTURE2D_DESC desc{};
 	maskTemp->GetDesc(&desc);
-	desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-	auto* device = globals::d3d::device;
+	ReleaseDenoiser();
 	auto create = [&](DenoiseTexture& o_texture, std::uint32_t a_width, std::uint32_t a_height, DXGI_FORMAT a_format, std::uint32_t a_bytesPerPixel,
 					  const char* a_name) {
-		D3D11_TEXTURE2D_DESC d = desc;
-		d.Width = a_width;
-		d.Height = a_height;
-		d.Format = a_format;
-		if (FAILED(device->CreateTexture2D(&d, nullptr, o_texture.texture.put())) ||
-			FAILED(device->CreateShaderResourceView(o_texture.texture.get(), nullptr, o_texture.srv.put())) ||
-			FAILED(device->CreateUnorderedAccessView(o_texture.texture.get(), nullptr, o_texture.uav.put())))
+		if (!CreateDenoiseTexture(this, o_texture.texture, o_texture.srv, o_texture.uav, a_width, a_height, a_format, a_name))
 			return false;
-		Util::SetResourceName(o_texture.texture.get(), a_name);
 		denoiseBytes += static_cast<std::uint64_t>(a_width) * a_height * a_bytesPerPixel;
 		return true;
 	};
-	ReleaseDenoiser();
-	const bool ok = create(denoiseTiles, (desc.Width + 7) / 8, (desc.Height + 7) / 8, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "RayTracing DenoiseTiles") &&
-	                create(denoiseH, desc.Width, desc.Height, DXGI_FORMAT_R16G16_FLOAT, 4, "RayTracing DenoiseH") &&
-	                create(denoiseOut, desc.Width, desc.Height, DXGI_FORMAT_R16G16_FLOAT, 4, "RayTracing Denoised") &&
-	                create(history4[0], desc.Width, desc.Height, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "RayTracing History4") &&
-	                create(history4[1], desc.Width, desc.Height, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "RayTracing History4");
+	const std::uint32_t fw = a_half ? (desc.Width + 1) / 2 : desc.Width, fh = a_half ? (desc.Height + 1) / 2 : desc.Height;
+	bool ok = create(denoiseTiles, (desc.Width + 7) / 8, (desc.Height + 7) / 8, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "RayTracing DenoiseTiles") &&
+	          create(denoiseH, fw, fh, DXGI_FORMAT_R16G16_FLOAT, 4, "RayTracing DenoiseH") &&
+	          create(denoiseOut, fw, fh, DXGI_FORMAT_R16G16_FLOAT, 4, "RayTracing Denoised") &&
+	          create(history4[0], desc.Width, desc.Height, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "RayTracing History4") &&
+	          create(history4[1], desc.Width, desc.Height, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "RayTracing History4");
+	if (ok && a_half)
+		ok = create(denoiseHalfIn, fw, fh, DXGI_FORMAT_R16G16_FLOAT, 4, "RayTracing DenoiseHalfIn");
 	if (!ok) {
 		ReleaseDenoiser();
-		logger::warn("[RayTracing] Denoiser Penumbra: could not create its textures; Denoiser set to Off");
+		logger::warn("[RayTracing] Denoiser: could not create its textures; Denoiser set to Off");
 		settings.Denoiser = static_cast<int>(DenoiserMode::Off);
 		return false;
 	}
+	denoiseIsHalf = a_half;
 	d3d11Bytes += denoiseBytes;
 	history4Valid = false;
 	return true;
@@ -516,13 +690,165 @@ ID3D11ComputeShader* RayTracing::GetShaderDefined(winrt::com_ptr<ID3D11ComputeSh
 {
 	if (!a_shader) {
 		std::vector<std::pair<const char*, const char*>> defines;
-		if (a_define)
-			defines.emplace_back(a_define, "");
+		if (a_define) {
+			// (45l) Several defines separated by ','.
+			static thread_local std::vector<std::string> parts;
+			parts.clear();
+			std::string all = a_define;
+			for (std::size_t start = 0; start <= all.size();) {
+				const std::size_t comma = all.find(',', start);
+				const std::size_t end = comma == std::string::npos ? all.size() : comma;
+				if (end > start)
+					parts.push_back(all.substr(start, end - start));
+				start = end + 1;
+			}
+			for (const auto& part : parts)
+				defines.emplace_back(part.c_str(), "");
+		}
 		a_shader.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(a_path, defines, "cs_5_0")));
 		if (!a_shader)
 			logger::error("[RayTracing] Could not compile {}", a_name);
 	}
 	return a_shader.get();
+}
+
+void RayTracing::ReleaseSigma()
+{
+	sigma.reset();
+	for (auto* t : { &sigmaViewZ, &sigmaNormal, &sigmaMotion, &sigmaPenumbra, &sigmaOut })
+		*t = {};
+	d3d11Bytes -= std::min(d3d11Bytes, sigmaBytes);
+	sigmaBytes = 0;
+	sigmaHistoryValid = false;
+}
+
+bool RayTracing::EnsureSigma()
+{
+	// (45l) Denoiser NRD SIGMA: its own NRD instance (SIGMA_SHADOW, identifier 45) and its inputs at the
+	// size of the shadow mask; the render rect is passed every frame.
+	if (sigma && sigma->IsValid() && sigmaOut.texture)
+		return true;
+	if (!maskTemp || !sigmaFault.empty())
+		return false;
+	D3D11_TEXTURE2D_DESC desc{};
+	maskTemp->GetDesc(&desc);
+	ReleaseSigma();
+	try {
+		auto create = [&](DenoiseTexture& o_texture, DXGI_FORMAT a_format, std::uint32_t a_bytesPerPixel, const char* a_name) {
+			if (!CreateDenoiseTexture(this, o_texture.texture, o_texture.srv, o_texture.uav, desc.Width, desc.Height, a_format, a_name))
+				return false;
+			sigmaBytes += static_cast<std::uint64_t>(desc.Width) * desc.Height * a_bytesPerPixel;
+			return true;
+		};
+		const bool ok = create(sigmaViewZ, DXGI_FORMAT_R32_FLOAT, 4, "RayTracing SIGMA ViewZ") &&
+		                create(sigmaNormal, DXGI_FORMAT_R10G10B10A2_UNORM, 4, "RayTracing SIGMA NormalRoughness") &&
+		                create(sigmaMotion, DXGI_FORMAT_R16G16_FLOAT, 4, "RayTracing SIGMA Motion") &&
+		                create(sigmaPenumbra, DXGI_FORMAT_R16_FLOAT, 2, "RayTracing SIGMA Penumbra") &&
+		                create(sigmaOut, DXGI_FORMAT_R8_UNORM, 1, "RayTracing SIGMA Shadow");
+		if (!ok)
+			throw std::runtime_error("could not create its textures");
+		sigma = std::make_unique<NRDReblurIntegration>();
+		if (!sigma->Init(desc.Width, desc.Height, nrd::Denoiser::SIGMA_SHADOW, 45))
+			throw std::runtime_error("NRD did not create the SIGMA instance");
+		sigma->SetTimingGroup("NRD SIGMA (RT shadows)");
+	} catch (const std::exception& e) {
+		sigmaFault = e.what();
+		logger::warn("[RayTracing] NRD SIGMA: {}; Denoiser set to Penumbra", sigmaFault);
+		ReleaseSigma();
+		settings.Denoiser = static_cast<int>(DenoiserMode::Penumbra);
+		return false;
+	}
+	d3d11Bytes += sigmaBytes;
+	sigmaHistoryValid = false;
+	logger::info("[RayTracing] NRD SIGMA ready ({}x{}, {})", desc.Width, desc.Height, Megabytes(sigmaBytes));
+	return true;
+}
+
+bool RayTracing::RunSigma(const float a_toSun[3])
+{
+	// (45l) Prepare SIGMA's inputs from the trace and the depth, then its dispatches. CommonSettings are
+	// our own (not the NRD service's: its per-frame cache feeds the SSRT instances' history): matrices as
+	// the NRD service builds them, jitter from Upscaling, frameIndex +1 per SIGMA frame only (hard constraint
+	// #4; timeDeltaBetweenFrames is left to NRD).
+	auto* prep = GetShader(sigmaPrepCS, L"Data\\Shaders\\RayTracing\\SigmaPrepCS.hlsl", "SigmaPrepCS");
+	if (!prep || !sigma)
+		return false;
+	auto* context = globals::d3d::context;
+	const std::uint32_t width = pending.width, height = pending.height;
+	{
+		ID3D11Buffer* cbs[1] = { combineCB->CB() };
+		ID3D11ShaderResourceView* srvs[2] = { backend.VisibilitySRV(), backend.DepthMaskSRV() };
+		ID3D11UnorderedAccessView* uavs[4] = { sigmaViewZ.uav.get(), sigmaNormal.uav.get(), sigmaMotion.uav.get(), sigmaPenumbra.uav.get() };
+		context->CSSetConstantBuffers(0, 1, cbs);
+		context->CSSetShaderResources(0, 2, srvs);
+		context->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+		context->CSSetShader(prep, nullptr, 0);
+		context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+		ID3D11ShaderResourceView* nullSrvs[2]{};
+		ID3D11UnorderedAccessView* nullUavs[4]{};
+		context->CSSetShaderResources(0, 2, nullSrvs);
+		context->CSSetUnorderedAccessViews(0, 4, nullUavs, nullptr);
+	}
+
+	D3D11_TEXTURE2D_DESC desc{};
+	sigmaOut.texture->GetDesc(&desc);
+	nrd::CommonSettings common{};
+	const auto& fb = globals::game::frameBufferCached;
+	const Matrix viewMat = fb.GetCameraView().Transpose();
+	const Matrix projMat = fb.GetCameraProj().Transpose();
+	const float3 cameraWorldPos = float3(fb.GetCameraPosAdjust());
+	const DirectX::XMMATRIX translationMat = DirectX::XMMatrixTranslation(-cameraWorldPos.x, -cameraWorldPos.y, -cameraWorldPos.z);
+	const Matrix worldToView = DirectX::XMMatrixMultiply(translationMat, viewMat);
+	std::memcpy(common.viewToClipMatrix, &projMat, sizeof(float) * 16);
+	std::memcpy(common.worldToViewMatrix, &worldToView, sizeof(float) * 16);
+	const bool restart = !sigmaHistoryValid;
+	std::memcpy(common.viewToClipMatrixPrev, restart ? static_cast<const void*>(&projMat) : sigmaPrevProj, sizeof(float) * 16);
+	std::memcpy(common.worldToViewMatrixPrev, restart ? static_cast<const void*>(&worldToView) : sigmaPrevWorldToView, sizeof(float) * 16);
+	const auto jitter = globals::features::upscaling.jitter;
+	common.cameraJitter[0] = jitter.x;
+	common.cameraJitter[1] = jitter.y;
+	common.cameraJitterPrev[0] = restart ? jitter.x : sigmaPrevJitter[0];
+	common.cameraJitterPrev[1] = restart ? jitter.y : sigmaPrevJitter[1];
+	common.motionVectorScale[0] = 1.0f;
+	common.motionVectorScale[1] = 1.0f;
+	common.motionVectorScale[2] = 0.0f;
+	common.isMotionVectorInWorldSpace = false;
+	common.resourceSize[0] = common.resourceSizePrev[0] = static_cast<std::uint16_t>(desc.Width);
+	common.resourceSize[1] = common.resourceSizePrev[1] = static_cast<std::uint16_t>(desc.Height);
+	common.rectSize[0] = static_cast<std::uint16_t>(width);
+	common.rectSize[1] = static_cast<std::uint16_t>(height);
+	common.rectSizePrev[0] = restart ? common.rectSize[0] : sigmaPrevRect[0];
+	common.rectSizePrev[1] = restart ? common.rectSize[1] : sigmaPrevRect[1];
+	common.frameIndex = sigmaFrame++;
+	common.denoisingRange = 1e6f;
+	common.accumulationMode = restart ? nrd::AccumulationMode::CLEAR_AND_RESTART : nrd::AccumulationMode::CONTINUE;
+	sigma->SetCommonSettings(common);
+
+	nrd::SigmaSettings sigmaSettings{};
+	sigmaSettings.lightDirection[0] = a_toSun[0];
+	sigmaSettings.lightDirection[1] = a_toSun[1];
+	sigmaSettings.lightDirection[2] = a_toSun[2];
+	sigmaSettings.planeDistanceSensitivity = 0.02f;
+	sigmaSettings.maxStabilizedFrameNum = static_cast<std::uint32_t>(std::clamp(settings.SigmaStabilizedFrames, 0, 5));
+	sigma->SetDenoiserSettings(&sigmaSettings);
+
+	sigma->SetNamedSRV(nrd::ResourceType::IN_VIEWZ, sigmaViewZ.srv.get());
+	sigma->SetNamedSRV(nrd::ResourceType::IN_NORMAL_ROUGHNESS, sigmaNormal.srv.get());
+	sigma->SetNamedSRV(nrd::ResourceType::IN_MV, sigmaMotion.srv.get());
+	sigma->SetNamedSRV(nrd::ResourceType::IN_PENUMBRA, sigmaPenumbra.srv.get());
+	sigma->SetNamedSRV(nrd::ResourceType::OUT_SHADOW_TRANSLUCENCY, sigmaOut.srv.get());  // its history
+	sigma->SetNamedUAV(nrd::ResourceType::OUT_SHADOW_TRANSLUCENCY, sigmaOut.uav.get());
+	const bool ok = sigma->Dispatch();
+	ID3D11Buffer* cbs[1] = { combineCB->CB() };
+	context->CSSetConstantBuffers(0, 1, cbs);  // NRD bound its own
+	std::memcpy(sigmaPrevProj, &projMat, sizeof(sigmaPrevProj));
+	std::memcpy(sigmaPrevWorldToView, &worldToView, sizeof(sigmaPrevWorldToView));
+	sigmaPrevJitter[0] = jitter.x;
+	sigmaPrevJitter[1] = jitter.y;
+	sigmaPrevRect[0] = common.rectSize[0];
+	sigmaPrevRect[1] = common.rectSize[1];
+	sigmaHistoryValid = ok;
+	return ok;
 }
 
 bool RayTracing::EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc)
@@ -572,37 +898,6 @@ bool RayTracing::EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc)
 
 	maskDesc = a_maskDesc;
 	d3d11Bytes = static_cast<std::uint64_t>(desc.Width) * desc.Height * (4 + 4);
-	return true;
-}
-
-bool RayTracing::EnsureHistory()
-{
-	// (45j) Temporal: two R16G16_FLOAT textures (visibility, distance), created on first use.
-	if (history[0] && history[1])
-		return true;
-	if (!maskTemp)
-		return false;
-	D3D11_TEXTURE2D_DESC desc{};
-	maskTemp->GetDesc(&desc);
-	desc.Format = DXGI_FORMAT_R16G16_FLOAT;
-	desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-	auto* device = globals::d3d::device;
-	for (int i = 0; i < 2; ++i) {
-		if (FAILED(device->CreateTexture2D(&desc, nullptr, history[i].put())) || FAILED(device->CreateShaderResourceView(history[i].get(), nullptr, historySRV[i].put())) ||
-			FAILED(device->CreateUnorderedAccessView(history[i].get(), nullptr, historyUAV[i].put()))) {
-			for (int k = 0; k < 2; ++k) {
-				history[k] = nullptr;
-				historySRV[k] = nullptr;
-				historyUAV[k] = nullptr;
-			}
-			logger::warn("[RayTracing] Temporal: could not create the history textures; switched off");
-			settings.Denoiser = static_cast<int>(DenoiserMode::Off);
-			return false;
-		}
-		Util::SetResourceName(history[i].get(), "RayTracing History");
-	}
-	d3d11Bytes += static_cast<std::uint64_t>(desc.Width) * desc.Height * 4 * 2;
-	historyValid = false;
 	return true;
 }
 
@@ -662,7 +957,8 @@ void RayTracing::Prepass()
 {
 	activeThisFrame = false;
 	combinedThisFrame = false;
-	const std::int64_t start = Qpc();
+	pending.active = false;
+	frameStart = Qpc();
 	// (45h) Diffuse textures loaded from now on are created shareable only while both switches are on.
 	RayTracingTextureSharing::SetEnabled(settings.Enabled && settings.ShareGameTextures && (settings.Foliage != 0 || settings.Cutouts));
 
@@ -672,6 +968,8 @@ void RayTracing::Prepass()
 		sssClaimed = false;
 		phase = Phase::Play;
 		fade = 1.0f;
+		if (backend.IsReady())
+			backend.WaitForTrace();  // (45l) a deferred wait left over (GPU-side only)
 		if (status != Status::Off) {
 			// Switched off: the scene goes (BLASes retire on the GPU's schedule); the device stays.
 			RayTracingCasterFilter::Clear();
@@ -711,6 +1009,7 @@ void RayTracing::Prepass()
 			// (45k) Behind the loading screen: capture and build with a large budget, trace nothing. The
 			// render thread never waits on the GPU; one build submission per frame, capped.
 			const std::int64_t loadStart = Qpc();
+			backend.WaitForTrace();
 			scene.Update(backend, overVramBudget ? 0.0f : kLoadingCaptureBudgetMs, globals::state->frameCount);
 			backend.BuildOnly(kLoadingBuildTriangles, kLoadingMaxBuilds);
 			backend.Tick();
@@ -725,16 +1024,46 @@ void RayTracing::Prepass()
 			characters.EndFrame(backend);  // (45i)
 			cpuLast.endFrame = static_cast<float>(static_cast<double>(Qpc() - endStart) * QpcMs());
 		}
+		// (45l) Late Sync off: the D3D11 side of the trace right away (45k's order).
+		if (pending.active && !settings.LateSync)
+			FinishFrame();
 	} catch (const std::exception& e) {
 		Disable(Status::Failed, std::format("exception: {}", e.what()));
+	}
+	if (pending.active) {
+		// (45l) Late Sync: the rest after every other feature's prepass (FinishPrepass).
+		prepassCpuMs = static_cast<float>(static_cast<double>(Qpc() - frameStart) * QpcMs());
+		return;
 	}
 	// (45k) Screen Space Shadows claimed but not drawn by the trace (nothing traced this frame): the
 	// normal ray march, without the caster mask.
 	if (sssClaimed)
 		globals::features::screenSpaceShadows.DrawDeferred(nullptr, 0.0f, 0.0f, 0.0f);
 	sssClaimed = false;
+	lastCpuMs = static_cast<float>(static_cast<double>(Qpc() - frameStart) * QpcMs());
+	ReportFrame();
+}
 
-	lastCpuMs = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+void RayTracing::FinishPrepass()
+{
+	if (!pending.active)
+		return;
+	const std::int64_t start = Qpc();
+	try {
+		FinishFrame();
+	} catch (const std::exception& e) {
+		Disable(Status::Failed, std::format("exception: {}", e.what()));
+	}
+	if (sssClaimed)
+		globals::features::screenSpaceShadows.DrawDeferred(nullptr, 0.0f, 0.0f, 0.0f);
+	sssClaimed = false;
+	// The CPU of this frame: Prepass plus this second half (the other features' prepasses in between are theirs).
+	lastCpuMs = prepassCpuMs + static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+	ReportFrame();
+}
+
+void RayTracing::ReportFrame()
+{
 	const auto& stats = backend.GetStats();
 	if (status != loggedStatus) {
 		static constexpr const char* kNames[] = { "off", "unavailable", "failed", "paused", "loading the scene", "active" };
@@ -814,7 +1143,26 @@ void RayTracing::PublishCpuSplit()
 		}
 		detail.denoiser = settings.Denoiser;
 		detail.phase = static_cast<int>(phase);
-		detail.denoiseGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingDenoise);
+		// (45l) Per pass.
+		auto* timers = Util::GpuPassTimers::GetSingleton();
+		detail.tileGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingDenoise);
+		detail.filterGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingDenoiseFilter);
+		detail.sigmaGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingSigma);
+		detail.combineGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingCombine);
+		detail.syncGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingSync);
+		float denoise = -1.0f;
+		for (const float part : { detail.tileGpuMs, detail.filterGpuMs, detail.sigmaGpuMs })
+			if (part >= 0.0f)
+				denoise = std::max(denoise, 0.0f) + part;
+		detail.denoiseGpuMs = denoise;
+		if (activeThisFrame) {
+			detail.prepGpuMs = stats.lastPrepGpuMs;
+			detail.traceGpuMs = stats.lastTraceGpuMs;
+		}
+		detail.quality = settings.QualityLevel;
+		detail.denoiserEffective = static_cast<int>(lastEffectiveDenoiser);
+		detail.skinDraws = backend.GetSkinStats().drawsLastFrame;
+		detail.skinReused = backend.GetSkinStats().reusedLastFrame;
 	}
 	detail.sssGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::ScreenSpaceShadows);
 	// (45k) A slow D3D12 record + submit names its slowest call in the log (at most every 2 s).
@@ -844,6 +1192,9 @@ void RayTracing::RunFrame()
 {
 	if (!EnsureBackend())
 		return;
+	// (45l) A deferred D3D11 wait that was never issued (a frame without FinishPrepass): before this
+	// frame's depth copy overwrites what the last trace read.
+	backend.WaitForTrace();
 	UpdateAlphaCasters();  // (45h, 45j) per-kind choices: a change re-captures the scene
 	UpdateCharacters();                                // (45i)
 	if (status == Status::Off || status == Status::Unavailable)
@@ -896,15 +1247,28 @@ void RayTracing::RunFrame()
 		return;
 	}
 	std::copy_n(coreRect, 4, filterRect);
+	// (45l) Quality tier (or Custom) and the denoiser in effect (DLSS RR whenever Upscaling's RR runs).
+	const QualityParams quality = ResolveQuality();
+	lastQuality = quality;
+	const DenoiserMode denoiser = EffectiveDenoiser();
+	lastEffectiveDenoiser = denoiser;
+	const bool penumbra = denoiser == DenoiserMode::Penumbra;
+	const bool temporalMode = denoiser == DenoiserMode::Temporal;
+	const bool rrMode = denoiser == DenoiserMode::DLSSRR;
+	bool sigmaMode = denoiser == DenoiserMode::Sigma;
+	if (sigmaMode && !EnsureSigma())
+		sigmaMode = false;
 	// (45f) TLAS self-check twice a second or so; missed casters noted by the shadow map are described.
 	const bool validate = frameIndex % 30 == 0;
 	scene.CollectInstances(instances, validate);
 	scene.DescribeMissedCasters();
 	// (45i) Characters in the traced area: capture, bone matrices, draws (none with the switch off).
+	// (45l) Other actors at reduced quality: skinned every other frame.
 	const std::int64_t charactersStart = Qpc();
 	skinDraws.clear();
 	skinBones.clear();
 	if (settings.Characters && backend.SkinAvailable()) {
+		characters.SetNpcReduced(quality.npcReduced);
 		float world[4];
 		if (scene.GetLoadedRect(world, false))
 			characters.Update(backend, globals::state->frameCount, world);
@@ -931,7 +1295,6 @@ void RayTracing::RunFrame()
 	float3 toSun = { -direction.x, -direction.y, -direction.z };
 	toSun.Normalize();
 
-	const auto& preset = kQuality[std::clamp(settings.QualityLevel, 0, 2)];
 	const auto& invViewProj = fb.GetCameraViewProjInverse(0);
 	static_assert(sizeof(invViewProj) == sizeof(float) * 16);
 
@@ -940,7 +1303,7 @@ void RayTracing::RunFrame()
 	input.constants.toSun[0] = toSun.x;
 	input.constants.toSun[1] = toSun.y;
 	input.constants.toSun[2] = toSun.z;
-	input.constants.toSun[3] = std::tan(preset.coneDegrees * 3.14159265f / 180.0f);
+	input.constants.toSun[3] = std::tan(quality.coneDegrees * 3.14159265f / 180.0f);
 	std::uint32_t traceFlags = 0;
 	if (debugView != DebugView::Disagreement && debugView != DebugView::RawVisibility)
 		traceFlags |= kFlagSkipShadowed;
@@ -949,34 +1312,54 @@ void RayTracing::RunFrame()
 	// (45i) First person: no character ray for the arms / weapon (inside the third-person body).
 	if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); !skinDraws.empty() && playerCamera && playerCamera->IsInFirstPerson())
 		traceFlags |= kFlagFirstPerson;
-	// (45k) Denoiser mode and what it picks for Noise / Adaptive Rays (Auto).
-	const DenoiserMode denoiser = CurrentDenoiser();
-	const bool penumbra = denoiser == DenoiserMode::Penumbra;
-	const bool rrMode = denoiser == DenoiserMode::DLSSRR;
-	bool worldNoise = settings.Noise == static_cast<int>(AutoMode::Auto) ? !(penumbra || rrMode) : settings.Noise == static_cast<int>(AutoMode::First);
-	if (rrMode)
-		worldNoise = false;  // DLSS RR needs fresh noise every real frame
-	const bool adaptive = settings.AdaptiveRays == static_cast<int>(AutoMode::Auto) ? (penumbra || rrMode) : settings.AdaptiveRays == static_cast<int>(AutoMode::First);
-	// (45j) Runtime switches of the trace (each off = 45i).
+	// (45k, 45l) Noise / Adaptive Rays, Auto: world-locked noise and no extra rays only with Off; animated noise
+	// (R2-stepped) and extra rays with every denoiser that averages frames. DLSS RR and SIGMA need fresh noise
+	// every real frame; SIGMA takes one ray per pixel (its input is one shadow ray's penumbra).
+	bool worldNoise = settings.Noise == static_cast<int>(AutoMode::Auto) ? denoiser == DenoiserMode::Off : settings.Noise == static_cast<int>(AutoMode::First);
+	if (rrMode || sigmaMode)
+		worldNoise = false;
+	bool adaptive = settings.AdaptiveRays == static_cast<int>(AutoMode::Auto) ? denoiser != DenoiserMode::Off : settings.AdaptiveRays == static_cast<int>(AutoMode::First);
+	std::uint32_t baseRays = quality.baseRays, tracePattern = quality.tracePattern, farPattern = quality.farPattern;
+	if (sigmaMode) {
+		adaptive = false;
+		baseRays = 1;
+		tracePattern = farPattern = 0;
+	}
 	if (worldNoise)
 		traceFlags |= kFlagWorldNoise;
-	else if (penumbra || rrMode)
-		traceFlags |= kFlagR2Noise;  // (45k) decorrelated animated rays; Off / Temporal keep the 45j pattern
+	else
+		traceFlags |= kFlagR2Noise;  // (45k) decorrelated animated rays
 	if (settings.StableNormals)
 		traceFlags |= kFlagStableNormal;
 	if (settings.FineAlphaMips)
 		traceFlags |= kFlagAlphaFootprint;
-	if (adaptive && preset.extraRays > 0)
+	if (adaptive && quality.extraRays > 0)
 		traceFlags |= kFlagAdaptive;
-	const bool blockerDist = penumbra && !(traceFlags & kFlagCoverage);
+	const bool blockerDist = (penumbra || sigmaMode) && !(traceFlags & kFlagCoverage);
 	if (blockerDist)
 		traceFlags |= kFlagBlockerDist;
+	// (45l) Closest hit only at the edges (Penumbra with extra rays); SIGMA keeps it on the first ray everywhere.
+	if (blockerDist && penumbra && settings.BlockerAtEdges && (traceFlags & kFlagAdaptive))
+		traceFlags |= kFlagBlockerEdges;
+	const bool falloff = quality.falloffEnd > quality.falloffStart;
+	if (falloff)
+		traceFlags |= kFlagFalloff;
+	// (45l) The character ray only where the sun ray passes a character's bounds.
+	if (settings.CharacterRayCulling && !skinDraws.empty()) {
+		const double cam[3] = { camX, camY, camZ };
+		characters.GetBounds(cam, &input.constants.spheres[0], &input.constants.spheres[4]);
+		traceFlags |= kFlagCharCull;
+	}
 	// (45k) Screen Space Shadows "non-RT casters only": the trace marks the surfaces that are traced casters.
 	const bool sssNonRT = sssClaimed;
 	if (sssNonRT)
 		traceFlags |= kFlagRtSurface;
-	input.constants.extra[0] = (traceFlags & kFlagAdaptive) ? static_cast<float>(preset.extraRays) : 0.0f;
-	input.constants.params[0] = static_cast<float>(preset.rays);
+	input.constants.extra[0] = (traceFlags & kFlagAdaptive) ? static_cast<float>(quality.extraRays) : 0.0f;
+	input.constants.extra[1] = quality.falloffStart;
+	input.constants.extra[2] = quality.falloffEnd;
+	const std::uint32_t patternBits = (tracePattern & 3u) | ((farPattern & 3u) << 2) | (quality.npcReduced ? kPatternNpcReduced : 0u);
+	std::memcpy(&input.constants.extra[3], &patternBits, sizeof(float));
+	input.constants.params[0] = static_cast<float>(baseRays);
 	input.constants.params[1] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&input.constants.params[2], &traceFlags, sizeof(float));
 	input.constants.params[3] = kMaxRayLength;
@@ -1004,23 +1387,23 @@ void RayTracing::RunFrame()
 	input.validate = validate;
 	input.skinDraws = &skinDraws;  // (45i) empty: the 45h pipelines run
 	input.skinBones = &skinBones;
+	input.splitSubmit = settings.SplitSubmit;  // (45l)
+	input.deferWait = true;                    // (45l) FinishFrame waits (right away without Late Sync)
 
 	auto* context = globals::d3d::context;
 	auto* screenSpaceShadows = &globals::features::screenSpaceShadows;
-	// (45j) Screen Space Shadows inside the traced area: combined with min() (default), handed off (45i) or kept.
+	// (45j) Screen Space Shadows inside the traced area: combined with min() or kept. (45l) Hand off is gone.
 	const bool sssAvailable = typedUavLoadR8 && screenSpaceShadows->loaded && screenSpaceShadows->bendSettings.Enable && screenSpaceShadows->screenSpaceShadowsTexture;
 	const auto sssMode = static_cast<SSSMode>(std::clamp(settings.ScreenSpaceShadows, 0, 3));
-	const bool handOffSSS = sssAvailable && sssMode == SSSMode::HandOff;
 	// (45k) Non-RT casters only: the texture then holds only non-traced casters (and traced ones within
 	// their contact range): merged with min() like Combine, so shared shadows are not darkened twice.
 	const bool combineSSS = sssAvailable && (sssMode == SSSMode::Combine || sssMode == SSSMode::NonRT);
-	const bool writeSSS = handOffSSS || combineSSS;
-	const bool temporal = denoiser == DenoiserMode::Temporal && EnsureHistory();
-	if (!temporal)
-		historyValid = false;
-	const bool penumbraReady = penumbra && EnsureDenoiser();
-	if (!penumbraReady)
+	// (45l) Temporal uses Penumbra's clamped history (History4); Penumbra adds its spatial filter.
+	const bool historyStage = (penumbra || temporalMode) && EnsureDenoiser(quality.denoiseHalf && penumbra);
+	if (!historyStage)
 		history4Valid = false;
+	if (!sigmaMode)
+		sigmaHistoryValid = false;
 	const bool debug = debugView != DebugView::Off;
 
 	CombineCB cb{};
@@ -1028,28 +1411,48 @@ void RayTracing::RunFrame()
 	std::copy_n(traceRect, 4, cb.Rect);
 	cb.Band[0] = kHandOffBand;
 	// (45k) DLSS RR: no filter of ours at all (radius 0 = the pixel itself).
-	cb.Band[1] = rrMode ? 0.0f : static_cast<float>(preset.filterRadius);
-	std::uint32_t combineFlags = (handOffSSS ? kFlagHandOffSSS : 0u) | (debug ? kFlagDebug : 0u) | (combineSSS ? kFlagCombineSSS : 0u) |
-	                             (handOffSSS && settings.KeepSSSUnderFoliage ? kFlagKeepSSSUnderFoliage : 0u) |
-	                             ((traceFlags & kFlagSkipShadowed) ? kFlagTraceSkipped : 0u) | (blockerDist ? kFlagCombineBlockerDist : 0u);
-	if (temporal || penumbraReady) {
+	cb.Band[1] = (rrMode || sigmaMode) ? 0.0f : static_cast<float>(quality.smallFilterRadius);
+	std::uint32_t combineFlags = (debug ? kFlagDebug : 0u) | (combineSSS ? kFlagCombineSSS : 0u) | ((traceFlags & kFlagSkipShadowed) ? kFlagTraceSkipped : 0u) |
+	                             (blockerDist ? kFlagCombineBlockerDist : 0u);
+	if (historyStage) {
+		combineFlags |= kFlagPenumbra | (history4Valid && prevCameraValid ? kFlagHistoryValid : 0u);
+		if (penumbra)
+			combineFlags |= kFlagSpatial | (quality.denoiseHalf ? kFlagDenoiseHalf : 0u) | (falloff ? kFlagFalloffDenoise : 0u);
+	}
+	if (sigmaMode)
+		combineFlags |= kFlagSigma;
+	const auto& viewProjUnjittered = fb.GetCameraViewProjUnjittered(0);
+	std::memcpy(cb.ViewProjUnjittered, &viewProjUnjittered, sizeof(cb.ViewProjUnjittered));
+	if (prevCameraValid) {
 		std::copy_n(prevViewProj, 16, cb.PrevViewProj);
+		std::copy_n(prevViewProjUnjittered, 16, cb.PrevViewProjUnjittered);
 		cb.CameraDelta[0] = static_cast<float>(camX - prevCamera[0]);
 		cb.CameraDelta[1] = static_cast<float>(camY - prevCamera[1]);
 		cb.CameraDelta[2] = static_cast<float>(camZ - prevCamera[2]);
+	} else {
+		std::memcpy(cb.PrevViewProj, &fb.GetCameraViewProj(0), sizeof(cb.PrevViewProj));
+		std::memcpy(cb.PrevViewProjUnjittered, &viewProjUnjittered, sizeof(cb.PrevViewProjUnjittered));
 	}
-	if (temporal) {
-		combineFlags |= kFlagTemporal | (historyValid ? kFlagHistoryValid : 0u);
-		cb.Band[3] = kTemporalBlend;
-	}
-	if (penumbraReady)
-		combineFlags |= kFlagPenumbra | (history4Valid ? kFlagHistoryValid : 0u);
 	cb.Denoise[0] = input.constants.toSun[3];
-	cb.Denoise[1] = kDenoiseMaxRadius;
-	cb.Denoise[2] = kDenoiseMaxHistory;
-	cb.Denoise[3] = kDenoiseClampSigma;
+	cb.Denoise[1] = quality.denoiseRadius;
+	cb.Denoise[2] = quality.history;
+	cb.Denoise[3] = quality.clampSigma;
 	cb.Extra[0] = fade;
 	cb.Extra[1] = kBlockerRange;
+	cb.Extra[3] = static_cast<float>(quality.denoiseTaps);
+	cb.Falloff[0] = falloff ? quality.falloffStart : 0.0f;
+	cb.Falloff[1] = falloff ? quality.falloffEnd : 0.0f;
+	cb.Falloff[2] = quality.farDenoiseScale;
+	cb.Falloff[3] = static_cast<float>(farPattern);
+	const float4 cameraData = Util::GetCameraData();
+	cb.CameraData[0] = cameraData.x;
+	cb.CameraData[1] = cameraData.y;
+	cb.CameraData[2] = cameraData.z;
+	cb.CameraData[3] = cameraData.w;
+	cb.SunDirection[0] = toSun.x;
+	cb.SunDirection[1] = toSun.y;
+	cb.SunDirection[2] = toSun.z;
+	cb.SunDirection[3] = input.constants.toSun[3];
 	std::memcpy(&cb.Band[2], &combineFlags, sizeof(float));
 	cb.Size[0] = width;
 	cb.Size[1] = height;
@@ -1105,9 +1508,11 @@ void RayTracing::RunFrame()
 		ID3D11UnorderedAccessView* nullUavs[1]{};
 		context->CSSetShaderResources(0, 2, nullSrvs);
 		context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+		context->CSSetShader(nullptr, nullptr, 0);
 	}
 
-	// 2. D3D12: BLAS builds, TLAS, trace (GPU-side fence waits on both sides).
+	// 2. D3D12: builds, skinning and the TLAS (not waiting for D3D11), then the trace (waiting for the
+	// depth copy above, GPU-side). The D3D11 queue waits for the trace in FinishFrame.
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
 	backend.SetExplicitFlush(settings.FlushBeforeTrace);  // (45k)
@@ -1115,7 +1520,6 @@ void RayTracing::RunFrame()
 	const std::int64_t executeEnd = Qpc();
 	cpuLast.execute = static_cast<float>(static_cast<double>(executeEnd - executeStart) * QpcMs());
 	if (!traced && backend.HasFailed()) {
-		context->CSSetShader(nullptr, nullptr, 0);
 		Disable(Status::Failed, backend.LastError());
 		return;
 	}
@@ -1127,143 +1531,47 @@ void RayTracing::RunFrame()
 		// map is complete -- unless that guarantee was broken, which is counted.
 		if (filterLatched)
 			++latchedWithoutTrace;
-		historyValid = false;
 		history4Valid = false;
-		context->CSSetShader(nullptr, nullptr, 0);
+		sigmaHistoryValid = false;
 		++frameIndex;
 		return;
 	}
 	if (!scene.HasCoverage() && !filterLatched) {
 		// The first BLASes are being built: leave the mask and Screen Space Shadows alone.
-		context->CSSetShader(nullptr, nullptr, 0);
+		backend.WaitForTrace();
 		status = Status::Waiting;
 		statusReason = "building the scene";
-		historyValid = false;
 		history4Valid = false;
+		sigmaHistoryValid = false;
 		++frameIndex;
 		return;
 	}
 
-	// 2b. (45k) Screen Space Shadows "non-RT casters only", now that the trace marked the traced casters
-	// (the D3D11 queue already waits for the trace on the GPU; nothing waits on the CPU).
-	if (sssNonRT && sssClaimed) {
-		gpuTimer.Pause();
-		screenSpaceShadows->DrawDeferred(backend.VisibilitySRV(), settings.RtContactScale, biasConstant, biasPerUnit);
-		sssClaimed = false;
-		gpuTimer.Resume();
-	}
-
-	// 2c. (45k) Denoiser Penumbra: tiles, then the horizontal and vertical penumbra filter of this frame.
-	if (penumbraReady) {
-		auto* tileShader = GetShader(denoiseTileCS, L"Data\\Shaders\\RayTracing\\DenoiseTileCS.hlsl", "DenoiseTileCS");
-		auto* hShader = GetShaderDefined(denoiseHCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS", nullptr);
-		auto* vShader = GetShaderDefined(denoiseVCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS (vertical)", "DENOISE_VERTICAL");
-		if (!tileShader || !hShader || !vShader) {
-			logger::warn("[RayTracing] Denoiser Penumbra: a shader did not compile; Denoiser set to Off");
-			settings.Denoiser = static_cast<int>(DenoiserMode::Off);
-			history4Valid = false;
-			combineFlags &= ~(kFlagPenumbra | kFlagHistoryValid);
-			std::memcpy(&cb.Band[2], &combineFlags, sizeof(float));
-			combineCB->Update(cb);
-		} else {
-			gpuTimer.Pause();
-			Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::RayTracingDenoise);
-			context->CSSetConstantBuffers(0, 1, cbs);
-			ID3D11ShaderResourceView* nullSrvs[3]{};
-			ID3D11UnorderedAccessView* nullUav[1]{};
-			{
-				ID3D11ShaderResourceView* srvs[2] = { backend.VisibilitySRV(), backend.DepthMaskSRV() };
-				ID3D11UnorderedAccessView* uav = denoiseTiles.uav.get();
-				context->CSSetShaderResources(0, 2, srvs);
-				context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-				context->CSSetShader(tileShader, nullptr, 0);
-				context->Dispatch(groupsX, groupsY, 1);
-				context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
-			}
-			{
-				ID3D11ShaderResourceView* srvs[3] = { backend.VisibilitySRV(), backend.DepthMaskSRV(), denoiseTiles.srv.get() };
-				ID3D11UnorderedAccessView* uav = denoiseH.uav.get();
-				context->CSSetShaderResources(0, 3, srvs);
-				context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-				context->CSSetShader(hShader, nullptr, 0);
-				context->Dispatch(groupsX, groupsY, 1);
-				context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
-				context->CSSetShaderResources(0, 3, nullSrvs);
-			}
-			{
-				ID3D11ShaderResourceView* srvs[3] = { denoiseH.srv.get(), backend.DepthMaskSRV(), denoiseTiles.srv.get() };
-				ID3D11UnorderedAccessView* uav = denoiseOut.uav.get();
-				context->CSSetShaderResources(0, 3, srvs);
-				context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-				context->CSSetShader(vShader, nullptr, 0);
-				context->Dispatch(groupsX, groupsY, 1);
-				context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
-				context->CSSetShaderResources(0, 3, nullSrvs);
-			}
-			Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::RayTracingDenoise);
-			gpuTimer.Resume();
-		}
-	}
-	const bool penumbraActive = (combineFlags & kFlagPenumbra) != 0u;
-
-	// 3. Merge into the engine's mask, fade Screen Space Shadows inside the traced area.
-	{
-		const std::uint32_t readHistory = historyIndex, writeHistory = historyIndex ^ 1u;
-		const std::uint32_t read4 = history4Index, write4 = history4Index ^ 1u;
-		ID3D11ShaderResourceView* srvs[6] = { mask.SRV, backend.VisibilitySRV(), backend.DepthMaskSRV(), temporal ? historySRV[readHistory].get() : nullptr,
-			penumbraActive ? denoiseOut.srv.get() : nullptr, penumbraActive ? history4[read4].srv.get() : nullptr };
-		ID3D11UnorderedAccessView* uavs[5] = {
-			maskTempUAV.get(),
-			writeSSS ? screenSpaceShadows->screenSpaceShadowsTexture->uav.get() : nullptr,
-			debug ? debugColorUAV.get() : nullptr,
-			temporal ? historyUAV[writeHistory].get() : nullptr,
-			penumbraActive ? history4[write4].uav.get() : nullptr
-		};
-		// Screen Space Shadows bound its texture to PS t45 in its own Prepass; a UAV write needs it unbound.
-		ID3D11ShaderResourceView* nullPs[1]{};
-		if (writeSSS)
-			context->PSSetShaderResources(45, 1, nullPs);
-		context->CSSetConstantBuffers(0, 1, cbs);
-		context->CSSetShaderResources(0, 6, srvs);
-		context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
-		context->CSSetShader(combine, nullptr, 0);
-		context->Dispatch(groupsX, groupsY, 1);
-		ID3D11ShaderResourceView* nullSrvs[6]{};
-		ID3D11UnorderedAccessView* nullUavs[5]{};
-		context->CSSetShaderResources(0, 6, nullSrvs);
-		context->CSSetUnorderedAccessViews(0, 5, nullUavs, nullptr);
-		if (penumbraActive) {
-			history4Index = write4;
-			history4Valid = true;
-		}
-		context->CSSetShader(nullptr, nullptr, 0);
-		ID3D11Buffer* nullCb[1]{};
-		context->CSSetConstantBuffers(0, 1, nullCb);
-		if (writeSSS) {
-			ID3D11ShaderResourceView* sssView = screenSpaceShadows->screenSpaceShadowsTexture->srv.get();
-			context->PSSetShaderResources(45, 1, &sssView);
-		}
-		// Only the render area was written; the rest of the work texture is never read.
-		D3D11_BOX box{ 0, 0, 0, width, height, 1 };
-		context->CopySubresourceRegion(mask.texture, 0, 0, 0, 0, maskTemp.get(), 0, &box);
-		if (temporal) {
-			// (45j) This frame becomes the history of the next one.
-			historyIndex = writeHistory;
-			historyValid = true;
-		}
-		if (temporal || penumbraActive) {
-			std::memcpy(prevViewProj, &fb.GetCameraViewProj(0), sizeof(prevViewProj));
-			prevCamera[0] = camX;
-			prevCamera[1] = camY;
-			prevCamera[2] = camZ;
-		}
-	}
-	cpuLast.d3d11 += static_cast<float>(static_cast<double>(Qpc() - executeEnd) * QpcMs());
+	// (45l) The D3D11 side of this frame: FinishFrame (now, or after the other prepasses with Late Sync).
+	pending.active = true;
+	std::memcpy(pending.cbBytes.data(), &cb, sizeof(cb));
+	pending.combineFlags = combineFlags;
+	pending.width = width;
+	pending.height = height;
+	pending.writeSSS = combineSSS;
+	pending.debug = debug;
+	pending.penumbra = historyStage;
+	pending.spatial = historyStage && penumbra;
+	pending.half = pending.spatial && quality.denoiseHalf;
+	pending.sigma = sigmaMode;
+	pending.sssNonRT = sssNonRT;
+	pending.biasConstant = biasConstant;
+	pending.biasPerUnit = biasPerUnit;
+	pending.toSun[0] = toSun.x;
+	pending.toSun[1] = toSun.y;
+	pending.toSun[2] = toSun.z;
+	pending.camera[0] = camX;
+	pending.camera[1] = camY;
+	pending.camera[2] = camZ;
+	std::memcpy(pending.viewProj, &fb.GetCameraViewProj(0), sizeof(pending.viewProj));
+	std::memcpy(pending.viewProjUnjittered, &viewProjUnjittered, sizeof(pending.viewProjUnjittered));
 
 	activeThisFrame = true;
-	combinedThisFrame = true;
-	if (debug)
-		lastOverlayFrame = frameIndex;
 	status = Status::Active;
 	statusReason.clear();
 	++frameIndex;
@@ -1299,14 +1607,181 @@ void RayTracing::RunFrame()
 			const auto& ch = characters.GetStats();
 			const auto& sk = backend.GetSkinStats();
 			logger::info("[RayTracing] Characters: {} actors ({} in range), {} of {} shapes traced ({} skinned, {} rigid, {} physics, {} alpha-tested), "
-						 "{} in the TLAS, {:.2f} M vertices skinned, {} refits / {} builds last frame, {:.0f} MB; left to the shadow map: physics off {}, "
+						 "{} in the TLAS, {:.2f} M vertices skinned, {} refits / {} builds / {} reused last frame, {:.0f} MB; left to the shadow map: physics off {}, "
 						 "alpha off {}, alpha failed {}, shader {}, type {}, no CPU data {}, bad data {}, placement {}, budget/size {}; bone indices palette {}, global {}",
 				ch.actors, ch.inRange, ch.registered, ch.shapes, ch.skinnedShapes, ch.rigidShapes, ch.physicsShapes, ch.alphaShapes, sk.drawsLastFrame,
-				static_cast<double>(sk.verticesLastFrame) / 1e6, sk.refitsLastFrame, sk.buildsLastFrame,
+				static_cast<double>(sk.verticesLastFrame) / 1e6, sk.refitsLastFrame, sk.buildsLastFrame, sk.reusedLastFrame,
 				static_cast<double>(sk.bytes + sk.scratchBytes + sk.boneBytes) / (1024.0 * 1024.0), ch.skipPhysicsOff, ch.skipAlphaOff, ch.skipAlphaFailed,
 				ch.skipShader, ch.skipGeometryType, ch.skipNoCpuData, ch.skipBadData, ch.skipPlacement, ch.skipBackend, ch.paletteMode, ch.globalMode);
 		}
 	}
+}
+
+void RayTracing::FinishFrame()
+{
+	// (45l) The D3D11 side of a traced frame. GPU-side ordering only: nothing here waits on the CPU.
+	if (!pending.active)
+		return;
+	pending.active = false;
+	const std::int64_t start = Qpc();
+	auto* context = globals::d3d::context;
+	auto* timers = Util::GpuPassTimers::GetSingleton();
+	auto* renderer = globals::game::renderer;
+	auto& mask = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kSHADOW_MASK];
+	auto* screenSpaceShadows = &globals::features::screenSpaceShadows;
+	const std::uint32_t width = pending.width, height = pending.height;
+	const UINT groupsX = (width + 7) / 8, groupsY = (height + 7) / 8;
+
+	// 1. The D3D11 queue waits for the trace (on the GPU). Timed: the GPU stall it causes.
+	timers->Begin(Util::GpuBucket::RayTracingSync);
+	backend.WaitForTrace();
+	timers->End(Util::GpuBucket::RayTracingSync);
+	if (backend.HasFailed() || !mask.texture || !mask.SRV || !maskTemp) {
+		if (backend.HasFailed())
+			Disable(Status::Failed, backend.LastError());
+		history4Valid = false;
+		sigmaHistoryValid = false;
+		return;
+	}
+	CombineCB cb;
+	std::memcpy(&cb, pending.cbBytes.data(), sizeof(cb));
+	std::uint32_t combineFlags = pending.combineFlags;
+	auto setFlags = [&]() {
+		std::memcpy(&cb.Band[2], &combineFlags, sizeof(float));
+		combineCB->Update(cb);
+	};
+	ID3D11Buffer* cbs[1] = { combineCB->CB() };
+
+	// 2. (45k) Screen Space Shadows "non-RT casters only", now that the trace marked the traced casters.
+	if (pending.sssNonRT && sssClaimed) {
+		screenSpaceShadows->DrawDeferred(backend.VisibilitySRV(), settings.RtContactScale, pending.biasConstant, pending.biasPerUnit);
+		sssClaimed = false;
+	}
+
+	// 3. (45k) Denoiser Penumbra: tiles, then the horizontal and vertical penumbra filter of this frame
+	// ((45l) at half resolution with the half input the tile pass writes).
+	if (pending.spatial) {
+		auto* tileShader = GetShader(denoiseTileCS, L"Data\\Shaders\\RayTracing\\DenoiseTileCS.hlsl", "DenoiseTileCS");
+		auto* hShader = pending.half ? GetShaderDefined(denoiseHalfHCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS (half)", "DENOISE_HALF") :
+		                               GetShaderDefined(denoiseHCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS", nullptr);
+		auto* vShader = pending.half ? GetShaderDefined(denoiseHalfVCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS (half, vertical)", "DENOISE_HALF,DENOISE_VERTICAL") :
+		                               GetShaderDefined(denoiseVCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS (vertical)", "DENOISE_VERTICAL");
+		if (!tileShader || !hShader || !vShader) {
+			logger::warn("[RayTracing] Denoiser Penumbra: a shader did not compile; Denoiser set to Off");
+			settings.Denoiser = static_cast<int>(DenoiserMode::Off);
+			history4Valid = false;
+			combineFlags &= ~(kFlagPenumbra | kFlagHistoryValid | kFlagSpatial | kFlagDenoiseHalf);
+			pending.penumbra = false;
+			setFlags();
+		} else {
+			context->CSSetConstantBuffers(0, 1, cbs);
+			ID3D11ShaderResourceView* nullSrvs[3]{};
+			ID3D11UnorderedAccessView* nullUavs[2]{};
+			timers->Begin(Util::GpuBucket::RayTracingDenoise);
+			{
+				ID3D11ShaderResourceView* srvs[2] = { backend.VisibilitySRV(), backend.DepthMaskSRV() };
+				ID3D11UnorderedAccessView* uavs[2] = { denoiseTiles.uav.get(), pending.half ? denoiseHalfIn.uav.get() : nullptr };
+				context->CSSetShaderResources(0, 2, srvs);
+				context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+				context->CSSetShader(tileShader, nullptr, 0);
+				context->Dispatch(groupsX, groupsY, 1);
+				context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+			}
+			timers->End(Util::GpuBucket::RayTracingDenoise);
+			timers->Begin(Util::GpuBucket::RayTracingDenoiseFilter);
+			const UINT fx = pending.half ? ((width + 1) / 2 + 7) / 8 : groupsX, fy = pending.half ? ((height + 1) / 2 + 7) / 8 : groupsY;
+			{
+				ID3D11ShaderResourceView* srvs[3] = { pending.half ? denoiseHalfIn.srv.get() : backend.VisibilitySRV(), backend.DepthMaskSRV(), denoiseTiles.srv.get() };
+				ID3D11UnorderedAccessView* uav = denoiseH.uav.get();
+				context->CSSetShaderResources(0, 3, srvs);
+				context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+				context->CSSetShader(hShader, nullptr, 0);
+				context->Dispatch(fx, fy, 1);
+				context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+				context->CSSetShaderResources(0, 3, nullSrvs);
+			}
+			{
+				ID3D11ShaderResourceView* srvs[3] = { denoiseH.srv.get(), backend.DepthMaskSRV(), denoiseTiles.srv.get() };
+				ID3D11UnorderedAccessView* uav = denoiseOut.uav.get();
+				context->CSSetShaderResources(0, 3, srvs);
+				context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+				context->CSSetShader(vShader, nullptr, 0);
+				context->Dispatch(fx, fy, 1);
+				context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+				context->CSSetShaderResources(0, 3, nullSrvs);
+			}
+			timers->End(Util::GpuBucket::RayTracingDenoiseFilter);
+		}
+	}
+
+	// 3b. (45l) Denoiser NRD SIGMA.
+	if (pending.sigma) {
+		timers->Begin(Util::GpuBucket::RayTracingSigma);
+		const bool ok = RunSigma(pending.toSun);
+		timers->End(Util::GpuBucket::RayTracingSigma);
+		if (!ok) {
+			// This frame: the small filter instead; the history restarts.
+			combineFlags &= ~kFlagSigma;
+			cb.Band[1] = static_cast<float>(lastQuality.smallFilterRadius);
+			setFlags();
+		}
+	}
+	const bool penumbraActive = (combineFlags & kFlagPenumbra) != 0u;
+	const bool sigmaActive = (combineFlags & kFlagSigma) != 0u;
+
+	// 4. Merge into the engine's mask, Screen Space Shadows inside the traced area.
+	timers->Begin(Util::GpuBucket::RayTracingCombine);
+	{
+		auto* combine = GetShader(combineCS, L"Data\\Shaders\\RayTracing\\CombineCS.hlsl", "CombineCS");
+		const std::uint32_t read4 = history4Index, write4 = history4Index ^ 1u;
+		const bool writeSSS = pending.writeSSS;
+		ID3D11ShaderResourceView* srvs[6] = { mask.SRV, backend.VisibilitySRV(), backend.DepthMaskSRV(), sigmaActive ? sigmaOut.srv.get() : nullptr,
+			(combineFlags & kFlagSpatial) ? denoiseOut.srv.get() : nullptr, penumbraActive ? history4[read4].srv.get() : nullptr };
+		ID3D11UnorderedAccessView* uavs[5] = {
+			maskTempUAV.get(),
+			writeSSS ? screenSpaceShadows->screenSpaceShadowsTexture->uav.get() : nullptr,
+			pending.debug ? debugColorUAV.get() : nullptr,
+			nullptr,
+			penumbraActive ? history4[write4].uav.get() : nullptr
+		};
+		// Screen Space Shadows bound its texture to PS t45 in its own Prepass; a UAV write needs it unbound.
+		ID3D11ShaderResourceView* nullPs[1]{};
+		if (writeSSS)
+			context->PSSetShaderResources(45, 1, nullPs);
+		context->CSSetConstantBuffers(0, 1, cbs);
+		context->CSSetShaderResources(0, 6, srvs);
+		context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
+		context->CSSetShader(combine, nullptr, 0);
+		context->Dispatch(groupsX, groupsY, 1);
+		ID3D11ShaderResourceView* nullSrvs[6]{};
+		ID3D11UnorderedAccessView* nullUavs[5]{};
+		context->CSSetShaderResources(0, 6, nullSrvs);
+		context->CSSetUnorderedAccessViews(0, 5, nullUavs, nullptr);
+		if (penumbraActive) {
+			history4Index = write4;
+			history4Valid = true;
+		}
+		context->CSSetShader(nullptr, nullptr, 0);
+		ID3D11Buffer* nullCb[1]{};
+		context->CSSetConstantBuffers(0, 1, nullCb);
+		if (writeSSS) {
+			ID3D11ShaderResourceView* sssView = screenSpaceShadows->screenSpaceShadowsTexture->srv.get();
+			context->PSSetShaderResources(45, 1, &sssView);
+		}
+		// Only the render area was written; the rest of the work texture is never read.
+		D3D11_BOX box{ 0, 0, 0, width, height, 1 };
+		context->CopySubresourceRegion(mask.texture, 0, 0, 0, 0, maskTemp.get(), 0, &box);
+	}
+	timers->End(Util::GpuBucket::RayTracingCombine);
+	// This frame's camera is the history's next time.
+	std::copy_n(pending.viewProj, 16, prevViewProj);
+	std::copy_n(pending.viewProjUnjittered, 16, prevViewProjUnjittered);
+	std::copy_n(pending.camera, 3, prevCamera);
+	prevCameraValid = true;
+	combinedThisFrame = true;
+	if (pending.debug)
+		lastOverlayFrame = frameIndex - 1;
+	cpuLast.d3d11 += static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
 }
 
 void RayTracing::DrawDebugOverlay()
@@ -1352,11 +1827,57 @@ void RayTracing::DrawSettings()
 			ImGui::Text("Off: the game's shadows exactly as before (nothing of this feature runs).");
 		}
 
-		const char* qualityNames[3] = { kQuality[0].name, kQuality[1].name, kQuality[2].name };
-		settings.QualityLevel = std::clamp(settings.QualityLevel, 0, 2);
-		ImGui::Combo("Quality", &settings.QualityLevel, qualityNames, 3);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("%s", kQuality[settings.QualityLevel].tooltip);
+		// (45l) Five tiers + Custom; picking Custom starts from the tier that was selected.
+		settings.QualityLevel = std::clamp(settings.QualityLevel, 0, static_cast<int>(Quality::Count) - 1);
+		{
+			const int before = settings.QualityLevel;
+			if (ImGui::Combo("Quality", &settings.QualityLevel, kQualityNames, IM_ARRAYSIZE(kQualityNames)) &&
+				settings.QualityLevel == static_cast<int>(Quality::Custom) && before != static_cast<int>(Quality::Custom))
+				CopyTierToCustom(before);
+		}
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			if (settings.QualityLevel < static_cast<int>(Quality::Custom))
+				ImGui::Text("%s", kTiers[settings.QualityLevel].tooltip);
+			else
+				ImGui::Text("Custom: the values under Custom Quality below (started from the tier you had picked).");
+			ImGui::Text("Medium / High / Ultra are 45k's Low / Medium / High under new names (a 45k Low save now reads Medium).");
+		}
+		if (settings.QualityLevel == static_cast<int>(Quality::Custom) && ImGui::TreeNodeEx("Custom Quality", ImGuiTreeNodeFlags_DefaultOpen)) {
+			ImGui::SliderInt("Rays per Pixel", &settings.CustomBaseRays, 1, 4);
+			ImGui::SliderInt("Extra Rays at Shadow Edges", &settings.CustomExtraRays, 0, 8);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Adaptive rays: only where a shadow edge is. 0 = none.");
+			ImGui::SliderFloat("Sun Softness", &settings.CustomSunCone, 0.1f, 2.0f, "%.2f deg");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Half angle of the sun disc the rays aim at: 0.27 = the real sun (sharp), larger = softer, wider shadow edges.");
+			ImGui::Combo("Trace Resolution", &settings.CustomTraceResolution, kPatternNames, 3);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Full: every pixel traced every frame. Checkerboard: half of them, alternating each frame. Half: one pixel of each 2x2, rotating.");
+				ImGui::Text("  The others are filled from their traced neighbours (and the denoiser's history averages the frames).");
+			}
+			ImGui::SliderFloat("Fall-off Start", &settings.CustomFalloffStart, 0.0f, 16384.0f, "%.0f units");
+			ImGui::SliderFloat("Fall-off End", &settings.CustomFalloffEnd, 0.0f, 32768.0f, "%.0f units");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("From the start to the end distance the extra rays fade out and the denoiser blur shrinks to Far Blur Scale;");
+				ImGui::Text("  beyond the end: 1 ray per pixel and the Far Quality pattern. 70 units = 1 m. End at or below the start = no fall-off.");
+			}
+			ImGui::Combo("Far Quality", &settings.CustomFarQuality, kPatternNames, 3);
+			ImGui::SliderFloat("Far Blur Scale", &settings.CustomFarDenoiseScale, 0.0f, 1.0f, "%.2f");
+			const char* npcModes[] = { "Full", "Reduced" };
+			ImGui::Combo("Other Characters", &settings.CustomNpcQuality, npcModes, 2);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("The player always gets full quality. Reduced: other characters are re-posed every other frame (their shadow");
+				ImGui::Text("  follows one frame later on the frame in between) and get no extra edge rays.");
+			}
+			ImGui::SliderFloat("Denoiser Radius", &settings.CustomDenoiseRadius, 2.0f, 32.0f, "%.0f px");
+			ImGui::SliderInt("Denoiser Taps per Side", &settings.CustomDenoiseTaps, 1, 8);
+			ImGui::Checkbox("Denoiser at Half Resolution", &settings.CustomDenoiseHalf);
+			ImGui::SliderInt("History Length", &settings.CustomHistory, 1, 32, "%d frames");
+			ImGui::SliderFloat("History Clamp", &settings.CustomDenoiseClamp, 0.5f, 4.0f, "%.2f sigma");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How far the history may differ from this frame's neighbourhood: smaller = less ghosting, more grain.");
+			ImGui::TreePop();
+		}
 
 		// (45j) Advanced: per kind of object, ray traced or the shadow map + screen-space shadows.
 		if (ImGui::TreeNodeEx("Advanced")) {
@@ -1413,25 +1934,23 @@ void RayTracing::DrawSettings()
 			}
 			ImGui::Separator();
 			{
-				const char* sssModes[] = { "Combine (min)", "Hand off (45i)", "Keep (multiply)", "Non-RT casters only" };
-				settings.ScreenSpaceShadows = std::clamp(settings.ScreenSpaceShadows, 0, 3);
-				ImGui::Combo("Screen-space shadows", &settings.ScreenSpaceShadows, sssModes, 4);
+				// (45l) Hand off (45i) is gone: "Non-RT casters only" with contact length 0 is what it was meant to be
+				// (no screen-space shadow from ray-traced casters, every other caster keeps its own).
+				static constexpr SSSMode kSssOrder[] = { SSSMode::NonRT, SSSMode::Combine, SSSMode::Keep };
+				const char* sssModes[] = { "Non-RT casters only", "Combine (min)", "Keep (multiply)" };
+				int sssIndex = 0;
+				for (int i = 0; i < 3; ++i)
+					if (settings.ScreenSpaceShadows == static_cast<int>(kSssOrder[i]))
+						sssIndex = i;
+				if (ImGui::Combo("Screen-space shadows", &sssIndex, sssModes, 3))
+					settings.ScreenSpaceShadows = static_cast<int>(kSssOrder[std::clamp(sssIndex, 0, 2)]);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::Text("Screen Space Shadows (small contact shadows) inside the ray-traced area:");
 					ImGui::Text("  Non-RT casters only (default): everything the ray tracer does not see (grass, distant trees, shadow-map kinds)");
 					ImGui::Text("    keeps its contact shadows; ray-traced casters only fill the few units right at their base that the");
-					ImGui::Text("    ray tracer cannot resolve (RT Caster Contact Length), so thin posts and trims are not fattened.");
+					ImGui::Text("    ray tracer cannot resolve (RT Caster Contact Length; 0 = none at all, what 45k's Hand off was meant to be).");
 					ImGui::Text("  Combine: kept; where they and the ray tracer agree the shadow is not darkened twice.");
-					ImGui::Text("    Grass, leaves and characters left to the shadow map keep their contact shadows.");
-					ImGui::Text("  Hand off: switched off (45i). Grass loses its contact shadows.");
 					ImGui::Text("  Keep: kept and multiplied as with Ray Tracing off (shared shadows get a little darker).");
-				}
-				if (settings.ScreenSpaceShadows == static_cast<int>(SSSMode::HandOff)) {
-					ImGui::Indent();
-					ImGui::Checkbox("Keep them under leaves", &settings.KeepSSSUnderFoliage);
-					if (auto _tt = Util::HoverTooltipWrapper())
-						ImGui::Text("Hand off: not where a sun ray passed ray-traced leaves (the traced leaf shadow can be thinner).");
-					ImGui::Unindent();
 				}
 				if (settings.ScreenSpaceShadows == static_cast<int>(SSSMode::NonRT)) {
 					ImGui::Indent();
@@ -1449,38 +1968,76 @@ void RayTracing::DrawSettings()
 
 		// (45k) Denoiser: one dropdown to compare quality and cost in one session.
 		{
-			const char* denoisers[] = { "Off", "Temporal (45j)", "Penumbra (45k)", "DLSS RR" };
+			const char* denoisers[] = { "Off", "Temporal", "Penumbra", "DLSS RR", "NRD SIGMA" };
 			static_assert(IM_ARRAYSIZE(denoisers) == static_cast<int>(DenoiserMode::Count));
 			settings.Denoiser = std::clamp(settings.Denoiser, 0, static_cast<int>(DenoiserMode::Count) - 1);
-			ImGui::Combo("Denoiser", &settings.Denoiser, denoisers, IM_ARRAYSIZE(denoisers));
+			const bool rrActive = UpscalingRRActive();
+			if (ImGui::Combo("Denoiser", &settings.Denoiser, denoisers, IM_ARRAYSIZE(denoisers)) && settings.Denoiser == static_cast<int>(DenoiserMode::DLSSRR)) {
+				// (45l) DLSS RR here switches Ray Reconstruction on in Upscaling (the same setting as its checkbox; Upscaling
+				// rebuilds its resources on its next frame). Switching away never turns it off.
+				auto& upscaling = globals::features::upscaling;
+				if (upscaling.loaded && Upscaling::streamline.featureDLSS_RR && !upscaling.settings.enableDLSSRR) {
+					upscaling.settings.enableDLSSRR = true;
+					logger::info("[RayTracing] Denoiser DLSS RR: Ray Reconstruction switched on in Upscaling");
+				}
+			}
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("How the grainy soft edges of the traced shadows are cleaned up (cost: F7 trace column rt_denoise_gpu_ms).");
-				ImGui::Text("  Off: only the small blur of 45j.");
-				ImGui::Text("  Temporal (45j): 45j's 'Temporal smoothing' exactly (blend with the last frames).");
+				ImGui::Text("How the grainy soft edges of the traced shadows are cleaned up (cost: F7 trace columns rt_*_gpu_ms).");
+				ImGui::Text("  Off: only a small blur.");
+				ImGui::Text("  Temporal: the small blur, then the last ~12 frames blended (Penumbra's history, without its edge blur). Cheap.");
 				ImGui::Text("  Penumbra (default): blurs each soft edge as wide as it really is (wide under tall trees, none at");
 				ImGui::Text("    contact shadows), then blends the last ~12 frames; extra rays only at shadow edges.");
 				ImGui::Text("  DLSS RR: no cleanup of ours; fresh noise every frame for DLSS Ray Reconstruction to clean up.");
-				ImGui::Text("    Needs Ray Reconstruction switched on in Upscaling (DLSS); otherwise the shadows stay grainy.");
+				ImGui::Text("    Picking it switches Ray Reconstruction on in Upscaling. While Ray Reconstruction is on, the shadows always");
+				ImGui::Text("    take this route, whatever is picked here (RR cleans only raw noise).");
+				ImGui::Text("  NRD SIGMA: NVIDIA's shadow denoiser (one ray per pixel, its own blur and history).");
+			}
+			auto& upscaling = globals::features::upscaling;
+			if (rrActive && settings.Denoiser != static_cast<int>(DenoiserMode::DLSSRR)) {
+				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 0.5f, 0.85f, 1.0f, 1.0f });
+				ImGui::TextWrapped("Following Upscaling: Ray Reconstruction is on, so the shadows use the DLSS RR route (%s applies again when RR is off).",
+					denoisers[settings.Denoiser]);
+				ImGui::PopStyleColor();
+			} else if (settings.Denoiser == static_cast<int>(DenoiserMode::DLSSRR) && !rrActive) {
+				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.85f, 0.3f, 1.0f });
+				if (!upscaling.loaded || !Upscaling::streamline.featureDLSS_RR)
+					ImGui::TextWrapped("Ray Reconstruction is not available on this setup: the shadows stay grainy. Pick another denoiser.");
+				else
+					ImGui::TextWrapped("Ray Reconstruction is switched on but not running: set Upscaling to DLSS. Until then the shadows stay grainy.");
+				ImGui::PopStyleColor();
+			}
+			if (settings.Denoiser == static_cast<int>(DenoiserMode::Sigma)) {
+				ImGui::Indent();
+				ImGui::SliderInt("SIGMA Stabilisation", &settings.SigmaStabilizedFrames, 0, 5, "%d frames");
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Frames SIGMA's last stage averages. More = calmer shadows, but shadows of moving characters trail a little.");
+					ImGui::Text("  0 = no trailing at all (a little more flicker).");
+				}
+				if (!sigmaFault.empty())
+					ImGui::TextColored({ 1.0f, 0.4f, 0.3f, 1.0f }, "SIGMA could not start: %s", sigmaFault.c_str());
+				ImGui::Unindent();
 			}
 			const char* noiseModes[] = { "Auto", "World-locked", "Animated" };
 			const char* adaptiveModes[] = { "Auto", "On", "Off" };
 			ImGui::Indent();
 			settings.Noise = std::clamp(settings.Noise, 0, 2);
-			if (CurrentDenoiser() == DenoiserMode::DLSSRR)
+			const DenoiserMode effective = EffectiveDenoiser();
+			const bool noiseFixed = effective == DenoiserMode::DLSSRR || effective == DenoiserMode::Sigma;
+			if (noiseFixed)
 				ImGui::BeginDisabled();
 			ImGui::Combo("Noise", &settings.Noise, noiseModes, 3);
-			if (CurrentDenoiser() == DenoiserMode::DLSSRR)
+			if (noiseFixed)
 				ImGui::EndDisabled();
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Auto: Animated with Penumbra and DLSS RR (they average it over frames), World-locked with Off / Temporal (45j).");
-				ImGui::Text("World-locked: each spot of the world keeps its rays while the camera moves (frozen grain).");
-				ImGui::Text("Animated: new rays every frame (the history averages them). DLSS RR always uses Animated.");
+				ImGui::Text("Auto: Animated with every denoiser that averages frames, World-locked with Off.");
+				ImGui::Text("World-locked: each spot of the world keeps its rays while the camera moves (frozen grain; nothing for a history to average).");
+				ImGui::Text("Animated: new rays every frame (the history averages them). DLSS RR and NRD SIGMA always use Animated.");
 			}
 			settings.AdaptiveRays = std::clamp(settings.AdaptiveRays, 0, 2);
 			ImGui::Combo("Adaptive Rays", &settings.AdaptiveRays, adaptiveModes, 3);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Extra rays only where a shadow edge is (Quality: Low +1, Medium +3, High +4); deep shadow and open light keep one.");
-				ImGui::Text("Auto: on with Penumbra and DLSS RR, off with Off / Temporal (45j).");
+				ImGui::Text("Extra rays only where a shadow edge is (by quality: Very Low / Low none, Medium +1, High +3, Ultra +4).");
+				ImGui::Text("Auto: on with every denoiser but Off. NRD SIGMA always traces one ray per pixel.");
 			}
 			ImGui::Unindent();
 		}
@@ -1546,14 +2103,13 @@ void RayTracing::DrawSettings()
 
 	if (ImGui::TreeNodeEx("Debug")) {
 		const char* views[] = { "Off", "Shadow Source", "RT vs Shadow Map", "BLAS Coverage", "Raw RT Visibility", "RT Hit vs Depth", "Penumbra Radius",
-			"History Length", "Adaptive Rays", "SSS: RT Casters" };
+			"History Length", "Adaptive Rays", "SSS: RT Casters", "Distance Quality", "Character Rays" };
 		static_assert(IM_ARRAYSIZE(views) == static_cast<int>(DebugView::Count));
 		int view = static_cast<int>(debugView);
 		if (ImGui::Combo("Debug View", &view, views, IM_ARRAYSIZE(views)))
 			debugView = static_cast<DebugView>(std::clamp(view, 0, static_cast<int>(DebugView::Count) - 1));
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Shadow Source: red = ray-traced shadow, blue = shadow-map shadow (characters, trees, grass, terrain), green = lit,");
-			ImGui::Text("  orange = Screen Space Shadows had a contact shadow here that the hand-off removed,");
 			ImGui::Text("  grey = outside the ray-traced area (cascades and terrain shadows, unchanged), yellow = hand-off band.");
 			ImGui::Text("  Terrain shadows are applied later by the lighting and are not shown.");
 			ImGui::Text("RT vs Shadow Map: inside the ray-traced area, red = only RT sees a shadow, blue = only the shadow map does.");
@@ -1571,6 +2127,9 @@ void RayTracing::DrawSettings()
 			ImGui::Text("Adaptive Rays: magenta = extra rays were traced here (shadow edges).");
 			ImGui::Text("SSS: RT Casters (Screen-space shadows: Non-RT casters only): yellow = a ray-traced caster; its screen-space");
 			ImGui::Text("  contact shadow is limited to the contact length.");
+			ImGui::Text("Distance Quality (45l): green = full quality, towards red = fewer extra rays and a smaller blur with distance,");
+			ImGui::Text("  blue = pixels not traced this frame (checkerboard / half pattern), filled from their neighbours.");
+			ImGui::Text("Character Rays (45l): cyan = the extra ray against characters ran here, purple = a character shadows it.");
 		}
 		ImGui::Checkbox("Keep Static Casters in the Shadow Map", &settings.KeepCastersInShadowMap);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -1604,6 +2163,28 @@ void RayTracing::DrawSettings()
 			ImGui::Text("45j flushed the game's D3D11 queue explicitly before every trace. Off (default): the fence Signal alone submits it.");
 			ImGui::Text("  A/B for the D3D12 record + submit spikes: the F7 trace columns rt_x_* show which call waits.");
 		}
+		// (45l) Cost and sync A/B (each off = 45k).
+		ImGui::Checkbox("Late Sync", &settings.LateSync);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: the game's GPU queue waits for the ray-traced shadows only after every other feature's preparation passes,");
+			ImGui::Text("  so that work runs while the trace runs. Off = 45k (it waited right after the trace was sent). Trace: rt_sync_gpu_ms.");
+		}
+		ImGui::Checkbox("Split D3D12 Submission", &settings.SplitSubmit);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("On: BLAS builds, character skinning and the TLAS start at once; only the trace waits for the game's depth. Off = 45k.");
+		ImGui::Checkbox("Character Ray Culling", &settings.CharacterRayCulling);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: the extra ray against characters is only traced where the sun ray passes near a character (debug view Character Rays).");
+			ImGui::Text("  Off = 45k: traced for every pixel while any character is traced.");
+		}
+		ImGui::Checkbox("Blocker Distance at Edges Only", &settings.BlockerAtEdges);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Penumbra: the costly 'nearest blocker' search (for the blur width) only at shadow edges, with the first extra ray.");
+			ImGui::Text("  Off = 45k: on every pixel's first ray.");
+		}
+		ImGui::Checkbox("Distance Fall-off", &settings.DistanceFalloff);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("On: the quality tier's fall-off with distance (fewer edge rays, smaller blur, the far pattern). Off: full quality at any distance.");
 		ImGui::Checkbox("Build Behind Loading Screens", &settings.LoadingBoost);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("On: while a loading screen is up, cells are captured and built with a large budget (nothing is traced there).");
@@ -1730,6 +2311,20 @@ void RayTracing::DrawSettings()
 		const float frameMs = Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracing);
 		ImGui::Text("GPU: %.2f ms on the RT queue (builds + trace)%s", rt.smoothedGpuMs,
 			frameMs > 0.0f ? std::format(", {:.2f} ms in the frame (Performance Overlay row)", frameMs).c_str() : "");
+		{
+			// (45l) Last samples per pass (the GPU timers run while the overlay table or an F7 trace is on).
+			auto* timers = Util::GpuPassTimers::GetSingleton();
+			auto ms = [&](Util::GpuBucket a_bucket) { return std::max(timers->LastSampleMs(a_bucket), 0.0f); };
+			ImGui::Text("  last frame: builds/skinning/TLAS %.2f, trace %.2f; denoiser tiles %.2f, filter %.2f, SIGMA %.2f; combine %.2f; game queue waiting %.2f ms",
+				std::max(rt.lastPrepGpuMs, 0.0f), std::max(rt.lastTraceGpuMs, 0.0f), ms(Util::GpuBucket::RayTracingDenoise), ms(Util::GpuBucket::RayTracingDenoiseFilter),
+				ms(Util::GpuBucket::RayTracingSigma), ms(Util::GpuBucket::RayTracingCombine), ms(Util::GpuBucket::RayTracingSync));
+			static constexpr const char* kDenoiserNames[] = { "Off", "Temporal", "Penumbra", "DLSS RR", "NRD SIGMA" };
+			const auto& q = lastQuality;
+			ImGui::Text("  in effect: denoiser %s, %u+%u rays, pattern %s / far %s, fall-off %.0f-%.0f, other characters %s (%u of %u shapes re-used)",
+				kDenoiserNames[static_cast<int>(lastEffectiveDenoiser)], q.baseRays, q.extraRays, kPatternNames[std::min(q.tracePattern, 2u)],
+				kPatternNames[std::min(q.farPattern, 2u)], q.falloffStart, q.falloffEnd, q.npcReduced ? "reduced" : "full", backend.GetSkinStats().reusedLastFrame,
+				backend.GetSkinStats().drawsLastFrame);
+		}
 		ImGui::Text("CPU: %.2f ms this frame, capture %.2f ms (worst %.2f ms, last cell %.1f ms in total)", lastCpuMs, sc.lastGatherMs,
 			sc.maxGatherMs, sc.lastCellMs);
 		ImGui::SameLine();
@@ -1818,16 +2413,27 @@ std::string RayTracing::DescribeForProfile() const
 	static constexpr const char* kStatus[] = { "off", "unavailable", "failed", "paused", "loading", "active" };
 	static constexpr const char* kFoliage[] = { "shadow map", "ray traced", "both" };
 	static constexpr const char* kSSS[] = { "combine", "hand off", "keep", "non-RT casters only" };
-	static constexpr const char* kDenoisers[] = { "off", "temporal (45j)", "penumbra", "DLSS RR" };
+	static constexpr const char* kDenoisers[] = { "off", "temporal", "penumbra", "DLSS RR", "NRD SIGMA" };
 	static constexpr const char* kAuto[3][3] = { { "auto", "world-locked", "animated" }, { "auto", "on", "off" }, { "", "", "" } };
 	auto mode = [](bool a_rt) { return a_rt ? "RT" : "SM"; };
-	return std::format("RT {} ({}), quality {}, buildings {}, objects {}, trees {}, foliage {}, cut-outs {}, characters {}, physics parts {}, hair {}, "
-					   "first-person player {}, SSS {} (contact {:.1f}), denoiser {}, noise {}, adaptive rays {}, ray offset {:.2f}, D3D11 flush {}, loading build {}, warm-up {}",
-		settings.Enabled ? "on" : "off", kStatus[static_cast<int>(status)], kQuality[std::clamp(settings.QualityLevel, 0, 2)].name, mode(settings.Buildings),
+	auto onOff = [](bool a_on) { return a_on ? "on" : "off"; };
+	const QualityParams q = ResolveQuality();
+	std::string text = std::format("RT {} ({}), quality {}, buildings {}, objects {}, trees {}, foliage {}, cut-outs {}, characters {}, physics parts {}, hair {}, "
+								   "first-person player {}, SSS {} (contact {:.1f}), denoiser {}, noise {}, adaptive rays {}, ray offset {:.2f}, D3D11 flush {}, loading build {}, warm-up {}",
+		settings.Enabled ? "on" : "off", kStatus[static_cast<int>(status)], kQualityNames[std::clamp(settings.QualityLevel, 0, 5)], mode(settings.Buildings),
 		mode(settings.Objects), mode(settings.Trees), kFoliage[std::clamp(settings.Foliage, 0, 2)], mode(settings.Cutouts), mode(settings.Characters),
 		mode(settings.PhysicsParts), mode(settings.Hair), settings.FirstPersonPlayer ? "RT" : "SM", kSSS[std::clamp(settings.ScreenSpaceShadows, 0, 3)],
 		settings.RtContactScale, kDenoisers[static_cast<int>(CurrentDenoiser())], kAuto[0][std::clamp(settings.Noise, 0, 2)], kAuto[1][std::clamp(settings.AdaptiveRays, 0, 2)],
-		settings.RayOffsetScale, settings.FlushBeforeTrace ? "on" : "off", settings.LoadingBoost ? "on" : "off", settings.WarmUp ? "on" : "off");
+		settings.RayOffsetScale, onOff(settings.FlushBeforeTrace), onOff(settings.LoadingBoost), onOff(settings.WarmUp));
+	// (45l) What the tier sets, the denoiser in effect and the A/B switches.
+	text += std::format(", denoiser in effect {}{}, rays {}+{}, sun cone {:.2f}, pattern {} far {}, fall-off {:.0f}-{:.0f}, other characters {}, denoise radius {:.0f} "
+						"taps {} {} far scale {:.2f}, history {:.0f} clamp {:.2f}, SIGMA stabilisation {}, late sync {}, split submit {}, character ray culling {}, "
+						"blocker at edges {}, distance fall-off {}",
+		kDenoisers[static_cast<int>(EffectiveDenoiser())], UpscalingRRActive() ? " (Upscaling RR on)" : "", q.baseRays, q.extraRays, q.coneDegrees,
+		kPatternNames[std::min(q.tracePattern, 2u)], kPatternNames[std::min(q.farPattern, 2u)], q.falloffStart, q.falloffEnd, q.npcReduced ? "reduced" : "full",
+		q.denoiseRadius, q.denoiseTaps, q.denoiseHalf ? "half res" : "full res", q.farDenoiseScale, q.history, q.clampSigma, settings.SigmaStabilizedFrames,
+		onOff(settings.LateSync), onOff(settings.SplitSubmit), onOff(settings.CharacterRayCulling), onOff(settings.BlockerAtEdges), onOff(settings.DistanceFalloff));
+	return text;
 }
 
 nlohmann::json RayTracing::DescribeJson() const
@@ -1853,7 +2459,23 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["rt_contact_scale"] = settings.RtContactScale;
 	j["ray_offset_scale"] = settings.RayOffsetScale;
 	j["flush_before_trace"] = settings.FlushBeforeTrace;
-	j["denoise_gpu_ms"] = Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingDenoise);
+	j["denoiser_effective"] = static_cast<int>(EffectiveDenoiser());
+	j["upscaling_rr_active"] = UpscalingRRActive();
+	j["sigma_stabilized_frames"] = settings.SigmaStabilizedFrames;
+	j["late_sync"] = settings.LateSync;
+	j["split_submit"] = settings.SplitSubmit;
+	j["character_ray_culling"] = settings.CharacterRayCulling;
+	j["blocker_at_edges"] = settings.BlockerAtEdges;
+	j["distance_falloff"] = settings.DistanceFalloff;
+	{
+		auto* timers = Util::GpuPassTimers::GetSingleton();
+		j["gpu_pass_ms"] = { { "tiles", timers->SmoothedMs(Util::GpuBucket::RayTracingDenoise) }, { "filter", timers->SmoothedMs(Util::GpuBucket::RayTracingDenoiseFilter) },
+			{ "sigma", timers->SmoothedMs(Util::GpuBucket::RayTracingSigma) }, { "combine", timers->SmoothedMs(Util::GpuBucket::RayTracingCombine) },
+			{ "sync", timers->SmoothedMs(Util::GpuBucket::RayTracingSync) } };
+	}
+	j["denoise_gpu_ms"] = Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingDenoise) +
+	                      Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingDenoiseFilter) +
+	                      Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingSigma);
 	const auto& stats = backend.GetStats();
 	j["gpu_ms_smoothed"] = stats.smoothedGpuMs;
 	j["cpu_ms"] = { { "total", cpuSmoothed.total }, { "scene", cpuSmoothed.scene }, { "characters", cpuSmoothed.characters },

@@ -235,6 +235,10 @@ namespace Util::FrameTrace
 				out << "#   rt_x_* = D3D12 record + submit call by call: context choice, D3D11 Signal, D3D11 Flush, D3D12 queue Wait, allocator/list Reset,\n";
 				out << "#   TLAS instances, alpha records, recording, ExecuteCommandLists, D3D12 Signal, D3D11 Wait (with rt_exec_build/skin they add up to rt_exec).\n";
 				out << "#   rt_denoise_gpu_ms / sss_gpu_ms = last GPU sample of the denoiser passes / Screen Space Shadows (a few frames old).\n";
+				out << "# (45l) rt_denoiser also 4 = NRD SIGMA; rt_denoiser_eff = the one in effect (3 whenever Upscaling's Ray Reconstruction runs); rt_quality 0-4 = Very Low..Ultra, 5 Custom.\n";
+				out << "#   rt_denoise_gpu_ms = tiles + filter + SIGMA; rt_tile/filter/sigma/combine_gpu_ms per pass; rt_sync_gpu_ms = the game queue standing still at the wait\n";
+				out << "#   for the trace; rt_prep_gpu_ms / rt_trace_gpu_ms = D3D12 builds+skinning+TLAS / the trace dispatch (rt_gpu_ms = their sum); rt_skin_draws / _reused =\n";
+				out << "#   character shapes traced / of which with last frame's skinning (other actors at reduced quality).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -250,7 +254,9 @@ namespace Util::FrameTrace
 				       "rt_exec_build_ms,rt_exec_skin_ms,rt_d3d11_ms,rt_endframe_ms,rt_release_ms,rt_recaptures,rt_objects_new,rt_missed_n,rt_release_pending,"
 				       "rt_tlas_instances,rt_cells_gathering,map_calls,map_slow,map_worst_ms,map_worst_res,map_worst_caller,loc_world,loc_cell,loc_interior,"
 				       "pos_x,pos_y,pos_z,weather,game_hour,rt_denoiser,rt_phase,rt_x_collect_ms,rt_x_signal11_ms,rt_x_flush11_ms,rt_x_wait12_ms,rt_x_reset_ms,"
-				       "rt_x_tlas_ms,rt_x_alpha_ms,rt_x_record_ms,rt_x_execute_ms,rt_x_signal12_ms,rt_x_wait11_ms,rt_denoise_gpu_ms,sss_gpu_ms,cpu_top_features\n";
+				       "rt_x_tlas_ms,rt_x_alpha_ms,rt_x_record_ms,rt_x_execute_ms,rt_x_signal12_ms,rt_x_wait11_ms,rt_denoise_gpu_ms,sss_gpu_ms,"
+				       "rt_quality,rt_denoiser_eff,rt_tile_gpu_ms,rt_filter_gpu_ms,rt_sigma_gpu_ms,rt_combine_gpu_ms,rt_sync_gpu_ms,rt_prep_gpu_ms,rt_trace_gpu_ms,"
+				       "rt_skin_draws,rt_skin_reused,cpu_top_features\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -265,6 +271,8 @@ namespace Util::FrameTrace
 					}
 					s += std::format(",{},{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}", t.denoiser, t.phase, t.xCollect, t.xSignal11,
 						t.xFlush11, t.xWait12, t.xReset, t.xTlas, t.xAlpha, t.xRecord, t.xExecute, t.xSignal12, t.xWait11, t.denoiseGpuMs, t.sssGpuMs);
+					s += std::format(",{},{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{}", t.quality, t.denoiserEffective, t.tileGpuMs, t.filterGpuMs, t.sigmaGpuMs,
+						t.combineGpuMs, t.syncGpuMs, t.prepGpuMs, t.traceGpuMs, t.skinDraws, t.skinReused);
 					s += "," + a_row.cpuTop + "\n";
 					return s;
 				};

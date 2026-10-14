@@ -378,15 +378,32 @@ namespace RayTracingRT
 	void Backend::RecordSkinning(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, const FrameInput& a_input,
 		std::vector<std::uint8_t>& o_ready)
 	{
-		skinStats_.refitsLastFrame = skinStats_.buildsLastFrame = skinStats_.notReadyLastFrame = 0;
+		skinStats_.refitsLastFrame = skinStats_.buildsLastFrame = skinStats_.notReadyLastFrame = skinStats_.reusedLastFrame = 0;
 		skinStats_.verticesLastFrame = 0;
 		UploadSkinShapes(a_list);
 		if (!skinFault_.empty() || failed_ || !a_input.skinDraws || a_input.skinDraws->empty())
 			return;
 		const auto& draws = *a_input.skinDraws;
+		// (45l) Draws that reuse last frame's skinned BLAS (other actors on their off frame, Characters
+		// "reduced"): nothing to record, traced as built.
+		std::size_t reused = 0;
+		for (std::size_t d = 0; d < draws.size(); ++d) {
+			const auto& draw = draws[d];
+			if (!draw.reuse)
+				continue;
+			if (draw.shape < skins_.size() && skins_[draw.shape].live && skins_[draw.shape].uploaded && skins_[draw.shape].built) {
+				o_ready[d] = 1;
+				++reused;
+			} else {
+				++skinStats_.notReadyLastFrame;
+			}
+		}
+		skinStats_.reusedLastFrame = static_cast<std::uint32_t>(reused);
+		if (reused == draws.size())
+			return;
 		const std::uint64_t boneFloats = a_input.skinBones ? a_input.skinBones->size() : 0;
 		if (boneFloats == 0 || boneFloats > kSkinMaxBoneFloats || boneFloats % 12 != 0) {
-			skinStats_.notReadyLastFrame = static_cast<std::uint32_t>(draws.size());
+			skinStats_.notReadyLastFrame = static_cast<std::uint32_t>(draws.size() - reused);
 			return;
 		}
 		const std::uint64_t submission = fenceValue_ + 1;  // this frame's done value: unique per recorded frame
@@ -403,6 +420,8 @@ namespace RayTracingRT
 		std::uint64_t scratchTotal = 0;
 		for (std::size_t d = 0; d < draws.size(); ++d) {
 			const auto& draw = draws[d];
+			if (draw.reuse)
+				continue;
 			if (draw.shape >= skins_.size() || !skins_[draw.shape].live || !skins_[draw.shape].uploaded) {
 				++skinStats_.notReadyLastFrame;
 				continue;

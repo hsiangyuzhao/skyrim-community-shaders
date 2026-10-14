@@ -126,9 +126,18 @@ namespace Util
 			{ "Screen Space Shadows",
 				"GPU time for Screen Space Shadows (small sun shadows the shadow map misses): the ray march and, when on, "
 				"Edge Smoothing. Only runs outdoors with the full sky." },
-			{ "RT Shadow Denoiser",
-				"(45k) GPU time of the Ray Tracing shadow denoiser (Denoiser: Penumbra): the tile pass and the two blur passes that follow the "
-				"width of each soft shadow edge. Its history blend runs inside the Ray Tracing row." },
+			{ "RT Denoiser: Tiles",
+				"(45k, 45l) GPU time of the Ray Tracing shadow denoiser's tile pass (Denoiser: Penumbra): blocker distance and the shadow range "
+				"per 8x8 tile (and the half-resolution input of the filter)." },
+			{ "RT Denoiser: Filter",
+				"(45l) GPU time of the two blur passes that follow the width of each soft shadow edge (Denoiser: Penumbra)." },
+			{ "RT Denoiser: NRD SIGMA",
+				"(45l) GPU time of NVIDIA's SIGMA shadow denoiser (Denoiser: NRD SIGMA): its input preparation and every SIGMA pass." },
+			{ "RT Combine",
+				"(45l) GPU time of merging the ray-traced shadow into the game's shadow mask, including the history blend of Penumbra / Temporal." },
+			{ "RT Wait for Trace",
+				"(45l) How long the game's GPU queue stood still waiting for the ray-traced shadows (on the GPU; the CPU does not wait). "
+				"Ideally about 0: the other features' work runs while the trace runs (Debug: Late Sync)." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

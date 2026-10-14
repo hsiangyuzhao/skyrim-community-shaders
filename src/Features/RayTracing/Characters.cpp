@@ -903,7 +903,6 @@ namespace RayTracingCharacters
 
 	void Characters::Update(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, const float a_rect[4])
 	{
-		(void)a_frame;
 		const std::int64_t start = Qpc();
 		if (flushRequested_.exchange(false))
 			ReleaseAll(a_backend);
@@ -1023,10 +1022,17 @@ namespace RayTracingCharacters
 		}
 
 		// 4. This frame's bone matrices; a bone that cannot be read keeps the last ones.
+		// (45l) Other actors at reduced quality: every other frame (staggered per actor) their shapes keep last
+		// frame's skinned BLAS (no bone read, no skinning, no refit; traced where they were skinned).
+		std::uint32_t actorIndex = 0;
 		for (auto& actor : actors_) {
 			const auto translate = actor->root->world.translate;
 			const double origin[3] = { translate.x, translate.y, translate.z };
+			const bool offFrame = npcReduced_ && !actor->player && ((a_frame + actorIndex++) & 1u) != 0u;
 			for (auto& shape : actor->shapes) {
+				shape->reuse = offFrame && !shape->matrices.empty() && a_backend.IsSkinShapeReady(shape->handle);
+				if (shape->reuse)
+					continue;
 				static thread_local std::vector<float> fresh;
 				if (ReadBones(*shape, origin, fresh)) {
 					shape->matrices.swap(fresh);
@@ -1085,7 +1091,7 @@ namespace RayTracingCharacters
 	{
 		o_draws.clear();
 		o_bones.clear();
-		auto add = [&](const Shape& a_shape) {
+		auto add = [&](const Shape& a_shape, bool a_npc) {
 			if (a_shape.handle == RayTracingRT::kInvalidSkin || a_shape.matrices.empty() || a_shape.matrices.size() != a_shape.bones.size() * 12)
 				return;
 			if (!a_shape.drawable || (a_shape.alpha && a_shape.info == RayTracingRT::kInvalidAlphaInfo))
@@ -1097,15 +1103,91 @@ namespace RayTracingCharacters
 			draw.z = a_shape.origin[2];
 			draw.boneOffset = static_cast<std::uint32_t>(o_bones.size() / 12);
 			draw.alphaInfo = a_shape.alpha ? a_shape.info : RayTracingRT::kInvalidAlphaInfo;
-			o_bones.insert(o_bones.end(), a_shape.matrices.begin(), a_shape.matrices.end());
+			draw.npc = a_npc;
+			draw.reuse = a_shape.reuse;  // (45l) last frame's BLAS: no bones uploaded
+			if (!draw.reuse)
+				o_bones.insert(o_bones.end(), a_shape.matrices.begin(), a_shape.matrices.end());
 			o_draws.push_back(draw);
 		};
 		for (const auto* list : { &actors_, &retiring_ }) {
 			for (const auto& actor : *list) {
 				for (const auto* shapes : { &actor->shapes, &actor->retiringShapes })
 					for (const auto& shape : *shapes)
-						add(*shape);
+						add(*shape, !actor->player);
 			}
+		}
+	}
+}
+
+namespace RayTracingCharacters
+{
+	void Characters::GetBounds(const double a_camera[3], float o_player[4], float o_others[4]) const
+	{
+		// (45l) The engine's world bound of each actor's 3D, with a margin (weapons, hair, a pose that
+		// is a frame ahead of the bound); the other actors are merged into one sphere.
+		constexpr float kMargin = 96.0f;
+		constexpr float kFallbackRadius = 160.0f;
+		std::fill_n(o_player, 4, 0.0f);
+		std::fill_n(o_others, 4, 0.0f);
+		bool haveOthers = false;
+		double oc[3]{};
+		double orad = 0.0;
+		for (const auto* list : { &actors_, &retiring_ }) {
+			for (const auto& actor : *list) {
+				if (!actor || !actor->root)
+					continue;
+				const auto& bound = actor->root->worldBound;
+				const auto& translate = actor->root->world.translate;
+				double c[3];
+				double r;
+				if (std::isfinite(bound.radius) && bound.radius > 1.0f && bound.radius < 4096.0f) {
+					c[0] = bound.center.x;
+					c[1] = bound.center.y;
+					c[2] = bound.center.z;
+					r = bound.radius + kMargin;
+				} else {
+					c[0] = translate.x;
+					c[1] = translate.y;
+					c[2] = translate.z + 64.0;
+					r = kFallbackRadius;
+				}
+				if (!std::isfinite(c[0]) || !std::isfinite(c[1]) || !std::isfinite(c[2]))
+					continue;
+				if (actor->player) {
+					o_player[0] = static_cast<float>(c[0] - a_camera[0]);
+					o_player[1] = static_cast<float>(c[1] - a_camera[1]);
+					o_player[2] = static_cast<float>(c[2] - a_camera[2]);
+					o_player[3] = static_cast<float>(std::max(r, static_cast<double>(o_player[3])));
+					continue;
+				}
+				if (!haveOthers) {
+					std::copy_n(c, 3, oc);
+					orad = r;
+					haveOthers = true;
+					continue;
+				}
+				// Smallest sphere holding both.
+				const double d[3] = { c[0] - oc[0], c[1] - oc[1], c[2] - oc[2] };
+				const double dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+				if (dist + r <= orad)
+					continue;
+				if (dist + orad <= r) {
+					std::copy_n(c, 3, oc);
+					orad = r;
+					continue;
+				}
+				const double newRadius = 0.5 * (dist + orad + r);
+				const double k = (newRadius - orad) / std::max(dist, 1e-6);
+				for (int i = 0; i < 3; ++i)
+					oc[i] += d[i] * k;
+				orad = newRadius;
+			}
+		}
+		if (haveOthers) {
+			o_others[0] = static_cast<float>(oc[0] - a_camera[0]);
+			o_others[1] = static_cast<float>(oc[1] - a_camera[1]);
+			o_others[2] = static_cast<float>(oc[2] - a_camera[2]);
+			o_others[3] = static_cast<float>(orad);
 		}
 	}
 }

@@ -116,6 +116,8 @@ namespace RayTracingRT
 		double x = 0.0, y = 0.0, z = 0.0;
 		std::uint32_t boneOffset = 0;
 		std::uint32_t alphaInfo = UINT32_MAX;  // alpha-tested parts: the record (CreateSkinAlphaInfo)
+		bool npc = false;    // (45l) not the player: instance mask kNpcMask
+		bool reuse = false;  // (45l) not skinned / refit this frame: last frame's BLAS (x / y / z = the origin it was skinned at)
 	};
 
 	struct SkinStats
@@ -129,6 +131,7 @@ namespace RayTracingRT
 		std::uint32_t refitsLastFrame = 0;
 		std::uint32_t buildsLastFrame = 0;    // first builds and periodic rebuilds
 		std::uint32_t notReadyLastFrame = 0;  // draws not traced (not uploaded / built yet, build cap)
+		std::uint32_t reusedLastFrame = 0;    // (45l) draws traced with last frame's skinning (other actors, reduced quality)
 		std::uint64_t buildsTotal = 0;
 		std::uint64_t bytes = 0;              // rest, index and vertex buffers + BLASes (live shapes)
 		std::uint64_t scratchBytes = 0;
@@ -146,9 +149,10 @@ namespace RayTracingRT
 		float rect[4];       // camera-relative xy min / max
 		float bias[4];       // constant, per unit distance, coverage probe
 		float world[4];      // (45j) camera world position (world-locked noise)
-		float extra[4];      // (45k) x adaptive extra rays
+		float extra[4];      // (45k) x adaptive extra rays; (45l) y / z distance fall-off start / end (units), w pattern bits
+		float spheres[8];    // (45l) character bounds, camera-relative xyz + radius: [0..3] player, [4..7] the other actors (r 0 = none)
 	};
-	static_assert(sizeof(TraceConstants) == 44 * 4);
+	static_assert(sizeof(TraceConstants) == 52 * 4);
 
 	/// (45f) What a TLAS instance holds, for the per-category counts and the self-check.
 	enum InstanceCategory : std::uint8_t
@@ -195,6 +199,12 @@ namespace RayTracingRT
 		const std::vector<SkinDraw>* skinDraws = nullptr;
 		const std::vector<float>* skinBones = nullptr;
 		std::uint32_t maxBuilds = 0;  // (45k) BLAS builds / compactions this frame (0 = the default cap)
+		// (45l) Builds, skinning and the TLAS in their own submission that does not wait for D3D11
+		// (only the trace does); false = one list behind the D3D11 wait (45k).
+		bool splitSubmit = true;
+		// (45l) The D3D11 queue's wait for the trace is left to WaitForTrace() (called right before the
+		// first D3D11 pass that reads the result); false = waited at the end of ExecuteFrame (45k).
+		bool deferWait = false;
 	};
 
 	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
@@ -246,6 +256,8 @@ namespace RayTracingRT
 		std::uint32_t skippedFramesBusy = 0;  // every command context still in flight
 		float lastGpuMs = 0.0f;               // trace + builds on our queue, from D3D12 timestamps
 		float smoothedGpuMs = 0.0f;
+		float lastPrepGpuMs = -1.0f;          // (45l) of which builds, skinning, TLAS (the part that does not wait for D3D11)
+		float lastTraceGpuMs = -1.0f;         // (45l) of which the trace dispatch
 		// (45j) CPU of the last ExecuteFrame, split: BLAS / compaction resource creation and uploads,
 		// character uploads / skinning records, everything else (TLAS instances, record, submit).
 		float cpuBuildMs = 0.0f;
@@ -282,6 +294,10 @@ namespace RayTracingRT
 		/// Records and submits this frame's D3D12 work between two GPU-side fence waits.
 		/// Returns false when nothing was traced (busy ring or a failure; see LastError()).
 		bool ExecuteFrame(const FrameInput& a_input);
+		/// (45l) With FrameInput::deferWait: the D3D11 queue waits (on the GPU) for the last trace now.
+		/// No-op when nothing is pending. Returns the CPU ms of the call.
+		float WaitForTrace();
+		[[nodiscard]] bool TraceWaitPending() const { return pendingWait_ != 0; }
 		/// (45k) Loading screens: BLAS builds and compactions only (no trace, no D3D11 interop), with a
 		/// larger cap. Never waits; false when no command context is free or nothing is queued.
 		bool BuildOnly(std::uint32_t a_triangleBudget, std::uint32_t a_maxBuilds);
@@ -360,6 +376,8 @@ namespace RayTracingRT
 		[[nodiscard]] const SkinStats& GetSkinStats() const { return skinStats_; }
 		/// Instance mask of character instances (TraceShadowsCS kCharacterMask); every other instance is 0xFF.
 		static constexpr std::uint32_t kCharacterMask = 0x02;
+		/// (45l) Instance mask of the other actors' parts (TraceShadowsCS kNpcMask): the player keeps kCharacterMask.
+		static constexpr std::uint32_t kNpcMask = 0x04;
 		/// VRAM for skinned characters (buffers + BLASes); shapes past it keep their shadow-map shadow.
 		static constexpr std::uint64_t kSkinBudgetBytes = 512ull << 20;
 
@@ -403,6 +421,7 @@ namespace RayTracingRT
 		{
 			ComPtr<ID3D12CommandAllocator> allocator;
 			ComPtr<ID3D12GraphicsCommandList4> list;
+			ComPtr<ID3D12GraphicsCommandList4> traceList;  // (45l) the trace alone, behind the D3D11 wait (same allocator)
 			ComPtr<ID3D12Resource> instanceBuffer;  // upload heap, persistently mapped
 			void* instanceMapped = nullptr;
 			std::uint32_t instanceCapacity = 0;
@@ -637,6 +656,7 @@ namespace RayTracingRT
 		SkinStats skinStats_{};
 		std::vector<std::uint8_t> skinReady_;  // per draw, this frame
 		bool skinRecorded_ = false;            // uploads or builds recorded in this frame's list
+		std::uint64_t pendingWait_ = 0;        // (45l) done value the D3D11 queue still has to wait for (deferred wait)
 
 		HANDLE fenceEvent_ = nullptr;
 		Stats stats_{};

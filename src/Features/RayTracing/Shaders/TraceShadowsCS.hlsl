@@ -32,7 +32,8 @@ struct TraceConstants
 	float4 Rect;                     // camera-relative xy min / max of the traced area
 	float4 Bias;                     // x constant bias, y bias per unit of distance, z coverage probe length
 	float4 World;                    // (45j) xyz camera world position (world-locked noise), w unused
-	float4 Extra;                    // (45k) x adaptive extra rays, yzw unused
+	float4 Extra;                    // (45k) x adaptive extra rays; (45l) y / z distance fall-off start / end, w pattern bits (asuint)
+	float4 Spheres[2];               // (45l) character bounds (camera-relative xyz, radius; 0 = none): [0] the player, [1] the other actors
 };
 
 ConstantBuffer<TraceConstants> C : register(b0);
@@ -51,16 +52,26 @@ static const uint kFlagR2Noise = 64u;          // animated noise: per-pixel IGN 
 static const uint kFlagAdaptive = 128u;        // extra rays (Extra.x) where the pixel's rays disagree or a neighbour differs
 static const uint kFlagBlockerDist = 256u;     // Output.z = blocker distance (first ray closest hit) instead of hitDelta
 static const uint kFlagRtSurface = 512u;       // Output.w bit kOutRtSurface: the visible surface belongs to a traced caster
+// (45l) Cost switches (RayTracing.cpp); each one off = the 45k behaviour.
+static const uint kFlagBlockerEdges = 1024u;   // blocker distance from a closest hit only at shadow edges (first extra ray); elsewhere any-hit t
+static const uint kFlagCharCull = 2048u;       // the character ray only where the sun ray passes a character's bounding sphere
+static const uint kFlagFalloff = 4096u;        // fewer rays and a coarser pattern with distance (Extra.yzw)
+static const uint kPatternFull = 0u, kPatternChecker = 1u, kPatternHalf = 2u;
+static const uint kPatternNpcReduced = 16u;    // Extra.w bit: no adaptive extra character rays against other actors
 // Output.w (45j): bit flags as unorm8 (value / 255).
 static const uint kOutAlphaCandidate = 1u;     // a sun ray met an alpha-tested (cut-out) candidate
 static const uint kOutCharacter = 2u;          // a sun ray was blocked by a character
 static const uint kOutRtSurface = 4u;          // (45k) the visible surface is a ray-traced caster (Screen Space Shadows mask)
 static const uint kOutExtraRays = 8u;          // (45k) adaptive extra rays were traced here
+static const uint kOutCharRay = 16u;            // (45l) the character ray was traced here (debug view Character Rays)
+static const uint kOutFilled = 32u;             // (45l) not traced this frame (pattern): filled from its neighbours
 static const float kBlockerRange = 4096.0;     // (45k) Output.z = sqrt(t / range), 0 = no blocker
 #if defined(RT_CHARACTERS)
 static const uint kFlagFirstPerson = 4u;             // (45i) player in first person: no character ray for near pixels
 static const uint kSceneMask = 0x01u;                // every instance but characters
-static const uint kCharacterMask = 0x02u;            // characters only (Backend::kCharacterMask)
+static const uint kCharacterMask = 0x02u;            // the player (Backend::kCharacterMask)
+static const uint kNpcMask = 0x04u;                  // (45l) the other actors (Backend::kNpcMask)
+static const uint kAllCharacters = 0x06u;
 static const float kFirstPersonNear = 96.0;
 #	define RT_SCENE_MASK kSceneMask
 #else
@@ -272,7 +283,7 @@ bool ClosestHit(float3 origin, float3 direction, float tMax, uint mask, out floa
 // (45i) The character ray: characters only, hits nearer than tMin ignored (self-shadow acne).
 #	if defined(RT_ALPHA)
 // Alpha-tested character parts (hair) are non-opaque: tested against their cut-out like AnyHit.
-bool CharacterAnyHit(float3 origin, float3 direction, float tMin, float tMax, float footprint, out float tHit)
+bool CharacterAnyHit(float3 origin, float3 direction, float tMin, float tMax, float footprint, uint mask, out float tHit)
 {
 	RayDesc ray;
 	ray.Origin = origin;
@@ -280,7 +291,7 @@ bool CharacterAnyHit(float3 origin, float3 direction, float tMin, float tMax, fl
 	ray.TMin = tMin;
 	ray.TMax = tMax;
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-	q.TraceRayInline(Scene, RAY_FLAG_NONE, kCharacterMask, ray);
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
 	uint budget = kAlphaCandidateBudget;
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
@@ -295,7 +306,7 @@ bool CharacterAnyHit(float3 origin, float3 direction, float tMin, float tMax, fl
 	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 #	else
-bool CharacterAnyHit(float3 origin, float3 direction, float tMin, float tMax, float footprint, out float tHit)
+bool CharacterAnyHit(float3 origin, float3 direction, float tMin, float tMax, float footprint, uint mask, out float tHit)
 {
 	RayDesc ray;
 	ray.Origin = origin;
@@ -303,7 +314,7 @@ bool CharacterAnyHit(float3 origin, float3 direction, float tMin, float tMax, fl
 	ray.TMin = tMin;
 	ray.TMax = tMax;
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
-	q.TraceRayInline(Scene, RAY_FLAG_NONE, kCharacterMask, ray);
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
 	q.Proceed();
 	tHit = q.CommittedRayT();
 	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
@@ -319,7 +330,7 @@ bool CharacterClosestHit(float3 origin, float3 direction, float tMax, out float 
 	ray.TMin = 0.0;
 	ray.TMax = tMax;
 	RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
-	q.TraceRayInline(Scene, RAY_FLAG_NONE, kCharacterMask, ray);
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, kAllCharacters, ray);
 	while (q.Proceed()) {
 	}
 	tHit = q.CommittedRayT();
@@ -360,8 +371,9 @@ float3 SunRay(float3 L, float3 T, float3 B, float n0, float n1, uint i, bool r2)
 }
 
 // (45k) One sun ray: blocked or not, and the blocker's distance. closest: the nearest blocker
-// along the ray (the first ray when the denoiser needs the penumbra width), else any blocker.
-bool SunRayBlocked(float3 origin, float3 dir, float footprint, bool characterRay, bool closest, inout uint outFlags, out float tHit)
+// along the ray (where the denoiser needs the penumbra width), else any blocker.
+// (45l) charMask: which characters the character ray tests (0 = none: no character ray).
+bool SunRayBlocked(float3 origin, float3 dir, float footprint, uint charMask, bool closest, inout uint outFlags, out float tHit)
 {
 	tHit = 0.0;
 	bool blocked;
@@ -382,12 +394,40 @@ bool SunRayBlocked(float3 origin, float3 dir, float footprint, bool characterRay
 		blocked = AnyHit(origin, dir, C.Params.w, tHit);
 #endif
 #if defined(RT_CHARACTERS)
-	if (!blocked && characterRay) {
-		blocked = CharacterAnyHit(origin, dir, C.Bias.w, C.Params.w, footprint, tHit);
+	if (!blocked && charMask != 0u) {
+		blocked = CharacterAnyHit(origin, dir, C.Bias.w, C.Params.w, footprint, charMask, tHit);
 		outFlags |= blocked ? kOutCharacter : 0u;
 	}
 #endif
 	return blocked;
+}
+
+#if defined(RT_CHARACTERS)
+// (45l, kFlagCharCull) Does the sun ray from origin pass a character's bounding sphere (the cone
+// widens it by tan * distance)? The character ray is skipped otherwise.
+bool SphereOnRay(float3 origin, float3 L, float4 sphere)
+{
+	if (sphere.w <= 0.0)
+		return false;
+	const float3 oc = sphere.xyz - origin;
+	const float along = dot(oc, L);
+	const float radius = sphere.w + max(along, 0.0) * C.ToSun.w;
+	if (along < -radius)
+		return false;
+	return dot(oc, oc) - along * along <= radius * radius;
+}
+#endif
+
+// (45l) Is this pixel traced this frame? Checkerboard: every other pixel, alternating per frame;
+// half: one pixel of each 2x2, rotating per frame. The others are filled from their traced
+// neighbours in the group (after the second barrier).
+bool PatternActive(int2 p, uint frame, uint pattern)
+{
+	if (pattern == kPatternChecker)
+		return ((uint(p.x) + uint(p.y) + frame) & 1u) == 0u;
+	if (pattern == kPatternHalf)
+		return ((uint(p.x) & 1u) + (uint(p.y) & 1u) * 2u) == (frame & 3u);
+	return true;
 }
 
 // (45k) Per group: each pixel's class after its first rays (adaptive rays) and whether its
@@ -395,12 +435,16 @@ bool SunRayBlocked(float3 origin, float3 dir, float footprint, bool characterRay
 static const uint kClassNone = 0u, kClassLit = 1u, kClassShadow = 2u, kClassMixed = 3u, kClassRtSurface = 4u;
 groupshared uint gsClass[64];
 groupshared float gsDist[64];
+// (45l) The traced result per pixel (-1 = not traced this frame) and its blocker distance, for the pattern fill.
+groupshared float gsVis[64];
+groupshared float gsT[64];
 
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
 {
-	// (45k) No early return before the group barrier below: every thread reaches it.
+	// (45k) No early return before the group barriers below: every thread reaches them.
 	const int2 p = int2(dtid.xy);
 	const uint flags = asuint(C.Params.z);
+	const uint frame = uint(C.Params.y);
 	const bool inside = all(float2(p) < C.RenderSize.xy);
 	const float dm = inside ? DepthMask[p] : 0.0;
 	const float depth = abs(dm);
@@ -419,13 +463,21 @@ groupshared float gsDist[64];
 	bool rtSurface = false;
 	bool traced = false;
 	bool skipped = false;
+	bool filled = false;  // (45l) not traced this frame (pattern): filled from its neighbours
+	float filledVis = 1.0;
 	uint hits = 0u, rays = 0u, outFlags = 0u;
 	float tBlocker = 0.0;
+	float tSumAny = 0.0;
+	uint tCountAny = 0u;
 	float3 origin = 0.0, L = 0.0, T = 0.0, B = 0.0;
 	float n0 = 0.0, n1 = 0.0, footprint0 = 0.0;
-	bool characterRay = false;
+	uint charMask = 0u;
+	uint extraRaysPx = uint(C.Extra.x);
 	const bool r2 = (flags & kFlagR2Noise) != 0u;
-	const bool wantBlocker = (flags & kFlagBlockerDist) != 0u && (flags & kFlagCoverage) == 0u;
+	const bool blockerDist = (flags & kFlagBlockerDist) != 0u && (flags & kFlagCoverage) == 0u;
+	// (45l) Blocker distance: closest hit on the first ray everywhere (45k), or only at the edges.
+	const bool closestFirst = blockerDist && (flags & kFlagBlockerEdges) == 0u;
+	const uint patternBits = asuint(C.Extra.w);
 
 	[branch] if (valid)
 	{
@@ -498,12 +550,28 @@ groupshared float gsDist[64];
 #endif
 		}
 
+		// (45l) Distance fall-off: the extra rays fade out between the fall-off start and end, beyond
+		// the end one base ray and the far pattern.
+		uint baseRays = max(uint(C.Params.x), 1u);
+		uint pattern = patternBits & 3u;
+		if (flags & kFlagFalloff) {
+			const float fall = saturate((dist - C.Extra.y) / max(C.Extra.z - C.Extra.y, 1.0));
+			extraRaysPx = uint(floor(float(extraRaysPx) * (1.0 - fall) + 0.5));
+			if (fall >= 1.0) {
+				baseRays = 1u;
+				pattern = max(pattern, (patternBits >> 2) & 3u);
+			}
+		}
+		const bool active = PatternActive(p, frame, pattern);
+
 		// (45k) Screen Space Shadows "non-RT casters only": is this surface a traced caster?
-		if (flags & kFlagRtSurface)
+		// (45l) Pixels not traced this frame take it from their neighbours (the dilation below).
+		if ((flags & kFlagRtSurface) && active)
 			rtSurface = SurfaceProbe(P, V, N, dist);
 
 		skipped = (flags & kFlagSkipShadowed) && dm < 0.0;
-		[branch] if (!skipped)
+		filled = !skipped && !active;
+		[branch] if (!skipped && active)
 		{
 			traced = true;
 			origin = P + N * bias + L * (bias * 0.5);
@@ -512,7 +580,6 @@ groupshared float gsDist[64];
 			const float3 helper = abs(L.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
 			T = normalize(cross(helper, L));
 			B = cross(L, T);
-			const uint frame = uint(C.Params.y);
 			if (flags & kFlagWorldNoise) {
 				const float2 n = WorldNoise(P, dist);
 				n0 = n.x;
@@ -527,30 +594,27 @@ groupshared float gsDist[64];
 				n1 = InterleavedGradientNoise(float2(p.yx) + 17.0, frame + 7u);
 			}
 #if defined(RT_CHARACTERS)
-			characterRay = !((flags & kFlagFirstPerson) && dist < kFirstPersonNear);
+			if (!((flags & kFlagFirstPerson) && dist < kFirstPersonNear)) {
+				charMask = kAllCharacters;
+				// (45l) Only where the sun ray passes a character at all.
+				if (flags & kFlagCharCull)
+					charMask = (SphereOnRay(origin, L, C.Spheres[0]) ? kCharacterMask : 0u) | (SphereOnRay(origin, L, C.Spheres[1]) ? kNpcMask : 0u);
+			}
 #endif
-			const uint baseRays = max(uint(C.Params.x), 1u);
-			uint tCount = 0u;
-			float tSum = 0.0;
 			[loop] for (uint i = 0; i < baseRays; ++i)
 			{
 				float tHit;
-				const bool blocked = SunRayBlocked(origin, SunRay(L, T, B, n0, n1, i, r2), footprint0, characterRay, wantBlocker && i == 0u, outFlags, tHit);
+				const bool blocked = SunRayBlocked(origin, SunRay(L, T, B, n0, n1, i, r2), footprint0, charMask, closestFirst && i == 0u, outFlags, tHit);
 				if (blocked) {
 					hits += 1u;
 					// The first ray's blocker is the nearest one (closest hit): it alone sets the distance.
-					if (i == 0u && wantBlocker) {
+					if (i == 0u && closestFirst)
 						tBlocker = tHit;
-						tCount = 1000u;
-					} else if (tCount < 1000u) {
-						tSum += tHit;
-						tCount += 1u;
-					}
+					tSumAny += tHit;
+					tCountAny += 1u;
 				}
 			}
 			rays = baseRays;
-			if (tCount > 0u && tCount < 1000u)
-				tBlocker = tSum / float(tCount);
 		}
 	}
 
@@ -562,8 +626,7 @@ groupshared float gsDist[64];
 	gsDist[gi] = dist;
 	GroupMemoryBarrierWithGroupSync();
 
-	const uint extraRays = uint(C.Extra.x);
-	[branch] if (traced && (flags & kFlagAdaptive) && extraRays > 0u)
+	[branch] if (traced && (flags & kFlagAdaptive) && extraRaysPx > 0u)
 	{
 		// Extra rays only where the first rays disagree or a traced neighbour (in this group) differs:
 		// shadow edges and penumbrae. Deep shadow and open light keep their first rays.
@@ -581,24 +644,95 @@ groupshared float gsDist[64];
 		}
 		[branch] if (edge)
 		{
-			float tSum = 0.0;
-			uint tCount = 0u;
-			[loop] for (uint e = 0; e < extraRays; ++e)
+			// (45l) Other actors at reduced quality: the extra rays test the player only.
+			const uint extraMask = (patternBits & kPatternNpcReduced) ? (charMask & 0x02u) : charMask;
+			// (45l, kFlagBlockerEdges) The first extra ray finds the nearest blocker: the penumbra width
+			// is only needed at edges, so the closest-hit traversal runs only here.
+			const bool closestExtra = blockerDist && (flags & kFlagBlockerEdges) != 0u;
+			float tClosest = 0.0;
+			[loop] for (uint e = 0; e < extraRaysPx; ++e)
 			{
 				float tHit;
-				const bool blocked = SunRayBlocked(origin, SunRay(L, T, B, n0, n1, rays + e, r2), footprint0, characterRay, false, outFlags, tHit);
+				const bool blocked = SunRayBlocked(origin, SunRay(L, T, B, n0, n1, rays + e, r2), footprint0, extraMask, closestExtra && e == 0u, outFlags, tHit);
 				if (blocked) {
 					hits += 1u;
-					tSum += tHit;
-					tCount += 1u;
+					tSumAny += tHit;
+					tCountAny += 1u;
+					if (closestExtra && e == 0u)
+						tClosest = tHit;
 				}
 			}
-			rays += extraRays;
+			rays += extraRaysPx;
 			outFlags |= kOutExtraRays;
-			// No blocker distance from the first rays yet: the extra rays' average.
-			if (tBlocker <= 0.0 && tCount > 0u)
-				tBlocker = tSum / float(tCount);
+			if (tClosest > 0.0)
+				tBlocker = tClosest;
 		}
+	}
+	// No closest-hit blocker distance: the average of the any-hit distances.
+	if (tBlocker <= 0.0 && tCountAny > 0u)
+		tBlocker = tSumAny / float(tCountAny);
+
+	// (45l) Second exchange: this frame's traced results, for the pixels the pattern left out.
+	gsVis[gi] = traced ? 1.0 - float(hits) / float(max(rays, 1u)) : -1.0;
+	gsT[gi] = tBlocker;
+	GroupMemoryBarrierWithGroupSync();
+	[branch] if (filled)
+	{
+		// Distance-weighted average of the traced pixels around it in the group (3x3, then 5x5).
+		float sum = 0.0, weights = 0.0, tSum = 0.0, tWeights = 0.0;
+		const float tol = dist * 0.03 + 4.0;
+		for (int ring = 1; ring <= 2; ++ring)
+		{
+			if (weights > 0.0)
+				break;
+			for (int oy = -ring; oy <= ring; ++oy) {
+				for (int ox = -ring; ox <= ring; ++ox) {
+					const int2 g = int2(gtid.xy) + int2(ox, oy);
+					if (any(g < 0) || any(g >= 8))
+						continue;
+					const uint k = g.y * 8 + g.x;
+					const float v = gsVis[k];
+					if (v < 0.0)
+						continue;
+					const float w = exp(-abs(gsDist[k] - dist) / tol) / float(abs(ox) + abs(oy));
+					sum += v * w;
+					weights += w;
+					if (gsT[k] > 0.0) {
+						tSum += gsT[k] * w;
+						tWeights += w;
+					}
+				}
+			}
+		}
+		[branch] if (weights > 1e-3)
+		{
+			hits = 0u;
+			rays = 1u;
+			tBlocker = tWeights > 0.0 ? tSum / tWeights : 0.0;
+		}
+		else
+		{
+			// No traced neighbour at a similar distance (thin geometry, group corner): trace it after all.
+			filled = false;
+			traced = true;
+			origin = P + N * (C.Bias.x + C.Bias.y * dist) + L * ((C.Bias.x + C.Bias.y * dist) * 0.5);
+			const float3 helper = abs(L.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+			T = normalize(cross(helper, L));
+			B = cross(L, T);
+			n0 = InterleavedGradientNoise(float2(p), frame);
+			n1 = InterleavedGradientNoise(float2(p.yx) + float2(29.0, 61.0), frame * 7u + 3u);
+#if defined(RT_CHARACTERS)
+			if (!((flags & kFlagFirstPerson) && dist < kFirstPersonNear))
+				charMask = kAllCharacters;
+#endif
+			float tHit;
+			const bool blocked = SunRayBlocked(origin, SunRay(L, T, B, n0, n1, 0u, r2), footprint0, charMask, false, outFlags, tHit);
+			hits = blocked ? 1u : 0u;
+			rays = 1u;
+			tBlocker = blocked ? tHit : 0.0;
+		}
+		if (filled)
+			filledVis = sum / weights;
 	}
 
 	// (45k) Mask dilation by one pixel inside the group: a silhouette pixel the probe missed (thin
@@ -622,17 +756,19 @@ groupshared float gsDist[64];
 	if (!inside)
 		return;
 	outFlags |= rtSurface ? kOutRtSurface : 0u;
+	outFlags |= (charMask != 0u ? kOutCharRay : 0u) | (filled ? kOutFilled : 0u);
 	if (!valid) {
 		Output[p] = float4(1.0, 0.0, 0.0, 0.0);
 		return;
 	}
-	if (!traced) {
+	if (!traced && !filled) {
 		// Engine mask already 0 (skipped): min() keeps it.
 		Output[p] = float4(0.0, coverage, hitDelta, float(outFlags) / 255.0);
 		return;
 	}
 	float z = hitDelta;
-	if (wantBlocker)
+	if (blockerDist)
 		z = tBlocker > 0.0 ? max(sqrt(saturate(tBlocker / kBlockerRange)), 1.0 / 255.0) : 0.0;
-	Output[p] = float4(1.0 - float(hits) / float(rays), coverage, z, float(outFlags) / 255.0);
+	const float visibility = filled ? filledVis : 1.0 - float(hits) / float(rays);
+	Output[p] = float4(visibility, coverage, z, float(outFlags) / 255.0);
 }

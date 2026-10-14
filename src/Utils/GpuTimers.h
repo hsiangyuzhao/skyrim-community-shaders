@@ -78,7 +78,12 @@ namespace Util
 		// (45 SSS) Screen Space Shadows (sun contact shadows): ray march + edge smoothing.
 		ScreenSpaceShadows,
 		// (45k) Ray Tracing shadow denoiser (Penumbra): tile classification + the two spatial passes.
+		// (45l) Now the tile pass only; the filter, SIGMA, the combine and the wait for the trace have their own rows.
 		RayTracingDenoise,
+		RayTracingDenoiseFilter,
+		RayTracingSigma,
+		RayTracingCombine,
+		RayTracingSync,
 		Count
 	};
 
