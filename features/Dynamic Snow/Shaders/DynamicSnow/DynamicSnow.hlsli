@@ -51,6 +51,8 @@ namespace DynamicSnow
 	static const uint FlagNoLodSnow = 1 << 16;
 	// (44h) Debug: tint surfaces by the local amount scale (red = no snow here, blue = full).
 	static const uint FlagShowColdMap = 1 << 17;
+	// (46a) Characters take their own amount from Advanced Skin's b7 (Skin::snowPerGeometry).
+	static const uint FlagCharacterSnowState = 1 << 18;
 
 #if defined(PSHADER)
 	// (44h) R8_UNORM over the worldspace, 1 = cold region. Bound by DynamicSnow::Prepass.

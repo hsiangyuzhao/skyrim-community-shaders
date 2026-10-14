@@ -7,6 +7,7 @@
 #include "Menu.h"
 #include "ShaderCache.h"
 #include "State.h"
+#include "Features/DynamicSnow.h"
 #include "Features/WetSkin.h"
 
 #include "DynamicWetness_PublicAPI.h"
@@ -268,6 +269,73 @@ void Skin::Prepass()
 		ID3D11ShaderResourceView* srv = texSkinDetail->srv.get();
 		context->PSSetShaderResources(72, 1, &srv);
 	}
+
+	// (46a) The player's snow is advanced every frame, drawn or not (first person, interiors), so
+	// going indoors always clears it and stepping out starts it from nothing.
+	if (globals::features::dynamicSnow.CharacterSnowStateActive()) {
+		if (auto* player = RE::PlayerCharacter::GetSingleton(); player && player->Is3DLoaded()) {
+			const bool inWater = player->IsInWater();
+			const float positionZ = player->GetPositionZ();
+			const float depth = inWater ? std::max(0.0f, GetWaterHeight(player->AsReference(), player->GetPosition()) - positionZ) : 0.0f;
+			playerSnowGPU = UpdateActorSnow(playerSnow, player, inWater, depth, positionZ);
+		}
+	} else {
+		playerSnow = {};
+		playerSnowGPU = float4(-1.0f, 0.0f, 0.0f, 0.0f);
+	}
+}
+
+float4 Skin::UpdateActorSnow(ActorSnow& a_snow, RE::Actor* a_actor, bool a_inWater, float a_depth, float a_positionZ)
+{
+	const auto& snow = globals::features::dynamicSnow;
+	auto* calendar = RE::Calendar::GetSingleton();
+	const double now = calendar ? static_cast<double>(calendar->GetDaysPassed()) * 24.0 : 0.0;
+	auto* cell = a_actor->GetParentCell();
+	const bool exterior = cell && cell->IsExteriorCell() && snow.status.exterior;
+	const float cap = snow.DrawnAmount();
+
+	if (!exterior) {
+		// Indoors: no snow, and back outside it starts from nothing.
+		a_snow.amount = 0.0f;
+		a_snow.washed = 0.0f;
+		a_snow.washDepth = 0.0f;
+		a_snow.hours = now;
+		return float4(0.0f, 0.0f, 0.0f, a_positionZ);
+	}
+	if (a_snow.hours < 0.0) {
+		// First seen outdoors (a load, a character walking into view, the switch turned on): assume they
+		// have been out as long as the ground has.
+		a_snow.amount = cap;
+		a_snow.washed = cap;
+		a_snow.washDepth = 0.0f;
+	} else {
+		// Same rates as the global amount; a step back in time (an earlier save) is no step.
+		const float hours = static_cast<float>(std::clamp(now - a_snow.hours, 0.0, 1e4));
+		const auto& s = snow.settings;
+		const float delta = snow.status.snowing ? hours * snow.status.snowfall / std::max(s.AccumulationHours, 0.01f) :
+		                                          -hours / std::max(s.MeltHours, 0.01f);
+		a_snow.amount = std::clamp(a_snow.amount + delta, 0.0f, cap);
+		a_snow.washed = std::clamp(a_snow.washed + delta, 0.0f, a_snow.amount);
+		// The debug override shows its amount at once.
+		if (s.OverrideAmount)
+			a_snow.amount = cap;
+	}
+	a_snow.hours = now;
+
+	if (snow.settings.CharacterSnowWaterWash) {
+		if (a_inWater && a_depth > 0.0f) {
+			a_snow.washDepth = std::max(a_snow.washDepth, a_depth);
+			a_snow.washed = 0.0f;
+		} else if (a_snow.washDepth > 0.0f && a_snow.washed >= a_snow.amount - 1e-3f) {
+			// Built back up to the rest of the body: one amount again.
+			a_snow.washDepth = 0.0f;
+		}
+	} else {
+		a_snow.washDepth = 0.0f;
+	}
+	if (a_snow.washDepth <= 0.0f)
+		a_snow.washed = a_snow.amount;
+	return float4(a_snow.amount, a_snow.washed, a_snow.washDepth, a_positionZ);
 }
 
 void Skin::PostPostLoad()
@@ -398,6 +466,14 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 	const bool inWater = actor->IsInWater();
 	const float positionZ = actor->GetPositionZ();
 	const float depth = inWater ? std::max(0.0f, GetWaterHeight(actor->AsReference(), actor->GetPosition()) - positionZ) : 0.0f;
+
+	// (46a) Per-character snow (Dynamic Snow). The player's is advanced in Prepass every frame.
+	if (globals::features::dynamicSnow.CharacterSnowStateActive()) {
+		state.snowGPU = actor->IsPlayerRef() ? playerSnowGPU : UpdateActorSnow(state.snow, actor, inWater, depth, positionZ);
+	} else {
+		state.snow = {};
+		state.snowGPU = float4(-1.0f, 0.0f, 0.0f, 0.0f);
+	}
 
 	// (44a) Wet Skin New model: in the water = 1; out of it, held for HoldTime, then drying off over
 	// DryTime (smooth). The deepest submersion is kept until the character is dry, so a character
@@ -842,6 +918,8 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 			if (auto actor = userData ? userData->As<RE::Character>() : nullptr)
 				perGeometryData.wetCharPerGeometry.y = static_cast<float>(GetItemClassPrior(actor, *lastWetState, geometry, globals::state->frameCount));
 		}
+		// (46a) This character's own snow (x < 0: none kept, the shader uses the global amount).
+		perGeometryData.snowPerGeometry = lastWetState ? lastWetState->snowGPU : float4(-1.0f, 0.0f, 0.0f, 0.0f);
 
 		if (!perGeometryValid || std::memcmp(currentPerGeometry.data(), &perGeometryData, sizeof(PerGeometryData)) != 0) {
 			std::memcpy(currentPerGeometry.data(), &perGeometryData, sizeof(PerGeometryData));

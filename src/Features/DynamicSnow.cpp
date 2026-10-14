@@ -8,6 +8,7 @@
 #include <cmath>
 #include <format>
 
+#include "Features/Skin.h"
 #include "Menu.h"
 #include "State.h"
 #include "Util.h"
@@ -32,6 +33,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	TrailsFromNPCs,
 	TrailResolution,
 	SnowOnCharacters,
+	CharacterSnowBuildUp,
+	CharacterSnowWaterWash,
 	TrailSize,
 	TrailDepth,
 	TrailRefillSeconds,
@@ -204,6 +207,12 @@ bool DynamicSnow::HasShaderDefine(RE::BSShader::Type shaderType)
 bool DynamicSnow::AccumulationActive() const
 {
 	return loaded && settings.EnableAccumulation;
+}
+
+bool DynamicSnow::CharacterSnowStateActive() const
+{
+	const auto& skin = globals::features::skin;
+	return AccumulationActive() && settings.SnowOnCharacters && settings.CharacterSnowBuildUp && skin.loaded && skin.settings.EnableSkin;
 }
 
 bool DynamicSnow::TrailsActive() const
@@ -1013,8 +1022,12 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 	data.Amount = drawnAmount;
 	if (AccumulationActive() && status.exterior && drawnAmount > 0.0f) {
 		data.Flags |= FlagAccumulation;
-		if (settings.SnowOnCharacters)
+		if (settings.SnowOnCharacters) {
 			data.Flags |= FlagSnowOnCharacters;
+			// (46a) Characters take their own amount from Advanced Skin's b7 (Skin::GetWetness).
+			if (CharacterSnowStateActive())
+				data.Flags |= FlagCharacterSnowState;
+		}
 		// (batch 39c) (44h) FlagCoverageSlope (Even Cover) is never set: NormalThreshold decides coverage.
 		if (settings.SnowOnTrees)
 			data.Flags |= FlagTrees;
@@ -2145,6 +2158,29 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextUnformatted(
 				"Off (default): people, creatures and everything they wear or carry stay free of built-up snow.\n"
 				"On: their upward-facing parts (shoulders, hoods) get snow like the ground does.");
+		// (46a) Per-character snow.
+		ImGui::BeginDisabled(!settings.SnowOnCharacters);
+		ImGui::Indent();
+		ImGui::Checkbox("Snow builds up per character (resets indoors)", &settings.CharacterSnowBuildUp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"On (default): every character keeps their own snow. Indoors it is gone; back outside it starts\n"
+				"from nothing and builds up again while it snows (as fast as the ground, never more than the ground has),\n"
+				"and melts when the snow stops.\n"
+				"Off: every character shows the same snow as the ground, and it comes back at once when you step outside.\n"
+				"Needs Advanced Skin (enabled); without it the Off behaviour is used.");
+		ImGui::BeginDisabled(!settings.CharacterSnowBuildUp);
+		ImGui::Checkbox("Water washes off character snow", &settings.CharacterSnowWaterWash);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"On (default): the part of a character that went under water loses its snow; after leaving the water\n"
+				"it builds up again from nothing.\n"
+				"Off: water does not touch character snow.");
+		ImGui::EndDisabled();
+		if (settings.CharacterSnowBuildUp && !(globals::features::skin.loaded && globals::features::skin.settings.EnableSkin))
+			ImGui::TextDisabled("Advanced Skin is off: characters show the ground's snow.");
+		ImGui::Unindent();
+		ImGui::EndDisabled();
 		ImGui::EndDisabled();
 		ImGui::TreePop();
 	}

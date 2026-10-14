@@ -2,6 +2,7 @@
 
 #include "Buffer.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <string>
@@ -110,6 +111,13 @@ public:
 		// SmoothTrails / DetectAuthoredSnow / AlbedoSnowGuess / UseModFootprintShapes /
 		// RigidGearWorldUp / FlipPrintShapes are ignored.
 		bool SnowOnCharacters = false;    ///< (39b) accumulated snow on actors and their gear
+		/// (46a) Each character keeps its own snow (Advanced Skin's per-character state): none indoors,
+		/// builds up from nothing outdoors while it snows (never above the global amount), melts otherwise.
+		/// Off = the 45o behaviour (every character shows the global amount).
+		bool CharacterSnowBuildUp = true;
+		/// (46a) The part of a character that was under water loses its snow and builds it up again
+		/// after leaving the water (needs CharacterSnowBuildUp).
+		bool CharacterSnowWaterWash = true;
 		float TrailSize = 1.0f;
 		float TrailDepth = 5.0f;            ///< game units
 		float TrailRefillSeconds = 180.0f;  ///< real seconds for a full print to fill back in
@@ -220,6 +228,8 @@ public:
 		FlagColdMap = 1 << 15,
 		FlagNoLodSnow = 1 << 16,
 		FlagShowColdMap = 1 << 17,
+		// (46a) Characters read their own snow amount from Advanced Skin's per-geometry buffer (b7).
+		FlagCharacterSnowState = 1 << 18,
 	};
 
 	[[nodiscard]] CommonBufferData GetCommonBufferData();
@@ -253,6 +263,13 @@ public:
 	[[nodiscard]] bool AccumulationActive() const;
 	/// Trails are wanted this frame (master && setting).
 	[[nodiscard]] bool TrailsActive() const;
+
+	/// (46a) Per-character snow is in use this frame: accumulation and Snow on Characters on, the
+	/// build-up switch on, and Advanced Skin loaded and enabled (it owns the per-character state and b7).
+	[[nodiscard]] bool CharacterSnowStateActive() const;
+	/// (46a) The amount drawn this frame (the accumulated amount, or the debug override): the cap of
+	/// every character's own snow.
+	[[nodiscard]] float DrawnAmount() const { return settings.OverrideAmount ? std::clamp(settings.AmountOverride, 0.0f, 1.0f) : amount; }
 
 	virtual void Prepass() override;
 	virtual void DrawSettings() override;

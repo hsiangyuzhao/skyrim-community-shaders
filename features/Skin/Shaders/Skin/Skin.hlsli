@@ -32,7 +32,24 @@ namespace Skin
 		float4 wetCharPerGeometry;
 		// (44c) Character Wetness: hair and gear settings (WetSkin::GPUParams::c, layout there).
 		float4 wetCharParams[12];
+		// (46a) Dynamic Snow, per character: x = own snow amount (< 0: none kept, use the global
+		// amount), y = amount on the part that was under water, z = height of that part above the
+		// feet (0 = none), w = the feet's world Z. Read only under DynamicSnow::FlagCharacterSnowState.
+		float4 snowPerGeometry;
 	};
+
+	/// (46a) This character's snow amount at a world height (absolute Z), or a_global when the
+	/// character has none kept. The washed part (below the water line) has its own amount, with a
+	/// 3-unit soft edge.
+	float CharacterSnowAmount(float worldZ, float a_global)
+	{
+		const float4 s = snowPerGeometry;
+		[branch] if (s.x < 0.0)
+			return a_global;
+		[branch] if (s.z > 0.0)
+			return lerp(s.y, s.x, smoothstep(s.z - 3.0, s.z + 3.0, worldZ - s.w));
+		return s.x;
+	}
 
 	// (44a) Wet Skin model: New (1) or Original (0).
 	bool WetSkinNewModel()

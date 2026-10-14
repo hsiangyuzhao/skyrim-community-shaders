@@ -96,7 +96,25 @@ struct Skin : Feature
 		// geometry (0 unknown, 1 cloth, 2 leather, 3 metal, 4 fur), z in water, w 0.
 		float4 wetCharPerGeometry;
 		float4 wetCharParams[12];  // WetSkin::GPUParams::c
+		// (46a) Dynamic Snow, per character: x own snow amount (< 0 = none kept, use the global
+		// amount), y amount on the part that was under water, z height of that part above the feet
+		// (0 = none), w the feet's world Z.
+		float4 snowPerGeometry;
 	};
+
+	/// (46a) Per-character snow (Dynamic Snow > Snow builds up per character). Game hours, like the
+	/// global amount, so waiting and sleeping count.
+	struct ActorSnow
+	{
+		double hours = -1.0;     // calendar hours at the last update (< 0 = never updated)
+		float amount = 0.0f;     // own snow, 0..the global amount
+		float washed = 0.0f;     // snow on the part that was under water (builds up again from 0)
+		float washDepth = 0.0f;  // height above the feet the water reached (0 = nothing washed)
+	};
+	/// (46a) Advances one character's snow and returns its snowPerGeometry.
+	float4 UpdateActorSnow(ActorSnow& a_snow, RE::Actor* a_actor, bool a_inWater, float a_depth, float a_positionZ);
+	ActorSnow playerSnow;                       // the player's, advanced every frame in Prepass
+	float4 playerSnowGPU = { -1.0f, 0.0f, 0.0f, 0.0f };
 
 	/// (44b) Per character (form ID), computed once per frame and shared by every geometry of that
 	/// character: skin, hair and gear read the same wetness and drying timers.
@@ -111,6 +129,8 @@ struct Skin : Feature
 		float4 skin{};            // skinPerGeometry
 		float4 wetSkin{};         // wetSkinPerGeometry
 		float4 wetChar{};         // (44c) wetCharPerGeometry without the per-geometry prior
+		ActorSnow snow;           // (46a) this character's own snow (NPCs; the player uses playerSnow)
+		float4 snowGPU = { -1.0f, 0.0f, 0.0f, 0.0f };  // (46a) snowPerGeometry
 		// (44f) Item class prior per geometry of this character, from the worn items' keywords.
 		std::unordered_map<const RE::BSGeometry*, uint8_t> itemClass;
 		uint32_t itemClassFrame = 0;

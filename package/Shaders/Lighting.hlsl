@@ -2486,7 +2486,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float snowAmountScale = 1.0;
 		[branch] if (snowFlags & (DynamicSnow::FlagAccumulation | DynamicSnow::FlagShowColdMap))
 			snowAmountScale = DynamicSnow::AmountScale(snowPositionWS, snowOnLod);
-		const float snowAmount = SharedData::dynamicSnowSettings.Amount * snowAmountScale;
+		float snowAmount = SharedData::dynamicSnowSettings.Amount * snowAmountScale;
+#		if defined(CS_SKIN)
+		// (46a) Characters keep their own snow (none indoors, building up again outside, washed off
+		// below the water line): Advanced Skin's per-character state in b7.
+		[branch] if (snowOnActor && (snowFlags & DynamicSnow::FlagCharacterSnowState))
+			snowAmount = Skin::CharacterSnowAmount(snowPositionWS.z, SharedData::dynamicSnowSettings.Amount) * snowAmountScale;
+#		endif
 
 		// (batch 39b) Authored snow the material path above does not report. 39a only had
 		// psout.Parameters.y, which exists only in SNOW permutations: True PBR terrain (every
