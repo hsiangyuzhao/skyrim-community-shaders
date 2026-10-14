@@ -231,6 +231,10 @@ namespace Util::FrameTrace
 				out << "#   end of frame, engine references dropped; counts: recaptures, objects captured, misses examined, references waiting, TLAS instances,\n";
 				out << "#   cells being captured. map_* = Map calls this frame, those over 0.5 ms, the slowest (ms, resource, caller module+offset).\n";
 				out << "#   loc_* / pos_* / weather / game_hour = where the player was on that frame.\n";
+				out << "# (45k) rt_denoiser = shadow denoiser (0 off, 1 temporal 45j, 2 penumbra, 3 DLSS RR); rt_phase = 0 play, 1 loading screen, 2 warm-up after it.\n";
+				out << "#   rt_x_* = D3D12 record + submit call by call: context choice, D3D11 Signal, D3D11 Flush, D3D12 queue Wait, allocator/list Reset,\n";
+				out << "#   TLAS instances, alpha records, recording, ExecuteCommandLists, D3D12 Signal, D3D11 Wait (with rt_exec_build/skin they add up to rt_exec).\n";
+				out << "#   rt_denoise_gpu_ms / sss_gpu_ms = last GPU sample of the denoiser passes / Screen Space Shadows (a few frames old).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -245,7 +249,8 @@ namespace Util::FrameTrace
 				out << ",rt_scene_ms,rt_grid_ms,rt_gather_ms,rt_register_ms,rt_objects_ms,rt_object_capture_ms,rt_instances_ms,rt_missed_ms,rt_chars_ms,rt_exec_ms,"
 				       "rt_exec_build_ms,rt_exec_skin_ms,rt_d3d11_ms,rt_endframe_ms,rt_release_ms,rt_recaptures,rt_objects_new,rt_missed_n,rt_release_pending,"
 				       "rt_tlas_instances,rt_cells_gathering,map_calls,map_slow,map_worst_ms,map_worst_res,map_worst_caller,loc_world,loc_cell,loc_interior,"
-				       "pos_x,pos_y,pos_z,weather,game_hour,cpu_top_features\n";
+				       "pos_x,pos_y,pos_z,weather,game_hour,rt_denoiser,rt_phase,rt_x_collect_ms,rt_x_signal11_ms,rt_x_flush11_ms,rt_x_wait12_ms,rt_x_reset_ms,"
+				       "rt_x_tlas_ms,rt_x_alpha_ms,rt_x_record_ms,rt_x_execute_ms,rt_x_signal12_ms,rt_x_wait11_ms,rt_denoise_gpu_ms,sss_gpu_ms,cpu_top_features\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -258,6 +263,8 @@ namespace Util::FrameTrace
 					} else {
 						s += ",,,,,,,,";
 					}
+					s += std::format(",{},{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}", t.denoiser, t.phase, t.xCollect, t.xSignal11,
+						t.xFlush11, t.xWait12, t.xReset, t.xTlas, t.xAlpha, t.xRecord, t.xExecute, t.xSignal12, t.xWait11, t.denoiseGpuMs, t.sssGpuMs);
 					s += "," + a_row.cpuTop + "\n";
 					return s;
 				};

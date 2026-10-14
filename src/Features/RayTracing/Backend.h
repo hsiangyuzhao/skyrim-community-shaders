@@ -146,8 +146,9 @@ namespace RayTracingRT
 		float rect[4];       // camera-relative xy min / max
 		float bias[4];       // constant, per unit distance, coverage probe
 		float world[4];      // (45j) camera world position (world-locked noise)
+		float extra[4];      // (45k) x adaptive extra rays
 	};
-	static_assert(sizeof(TraceConstants) == 40 * 4);
+	static_assert(sizeof(TraceConstants) == 44 * 4);
 
 	/// (45f) What a TLAS instance holds, for the per-category counts and the self-check.
 	enum InstanceCategory : std::uint8_t
@@ -193,6 +194,25 @@ namespace RayTracingRT
 		// (45i) Skinned characters (null / empty = none: the 45h pipelines run).
 		const std::vector<SkinDraw>* skinDraws = nullptr;
 		const std::vector<float>* skinBones = nullptr;
+		std::uint32_t maxBuilds = 0;  // (45k) BLAS builds / compactions this frame (0 = the default cap)
+	};
+
+	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
+	/// is cpuRecordMs + cpuBuildMs + cpuSkinMs; a GPU-progress wait shows up in exactly one of them.
+	struct ExecuteSplit
+	{
+		float collect = 0;    // retired resources, timestamps, context choice
+		float signal11 = 0;   // ID3D11DeviceContext4::Signal (ready)
+		float flush11 = 0;    // ID3D11DeviceContext::Flush
+		float wait12 = 0;     // ID3D12CommandQueue::Wait (ready)
+		float reset = 0;      // command allocator + list Reset
+		float tlas = 0;       // TLAS instance descriptions (incl. instance buffer)
+		float alpha = 0;      // alpha record copy
+		float record = 0;     // TLAS build, barriers, dispatch, close
+		float execute = 0;    // ExecuteCommandLists
+		float signal12 = 0;   // ID3D12CommandQueue::Signal (done)
+		float wait11 = 0;     // ID3D11DeviceContext4::Wait (done)
+		bool flushSkipped = false;
 	};
 
 	/// (45f) TLAS contents and the placement self-check.
@@ -231,6 +251,8 @@ namespace RayTracingRT
 		float cpuBuildMs = 0.0f;
 		float cpuSkinMs = 0.0f;
 		float cpuRecordMs = 0.0f;
+		ExecuteSplit split{};  // (45k)
+		std::uint32_t loadingBuilds = 0;  // (45k) BLAS builds submitted by BuildOnly (loading screens) since start
 	};
 
 	class Backend
@@ -260,6 +282,12 @@ namespace RayTracingRT
 		/// Records and submits this frame's D3D12 work between two GPU-side fence waits.
 		/// Returns false when nothing was traced (busy ring or a failure; see LastError()).
 		bool ExecuteFrame(const FrameInput& a_input);
+		/// (45k) Loading screens: BLAS builds and compactions only (no trace, no D3D11 interop), with a
+		/// larger cap. Never waits; false when no command context is free or nothing is queued.
+		bool BuildOnly(std::uint32_t a_triangleBudget, std::uint32_t a_maxBuilds);
+		/// (45k) Explicit D3D11 Flush after the ready Signal (45j: always). Off = the Signal alone.
+		void SetExplicitFlush(bool a_flush) { explicitFlush_ = a_flush; }
+		[[nodiscard]] std::uint32_t QueuedBuilds() const { return static_cast<std::uint32_t>(buildQueue_.size()); }
 
 		/// (45e) True when ExecuteFrame will find a free command context. Only the GPU completing
 		/// work can change the answer from false to true, never back, so a yes at the start of the
@@ -468,7 +496,8 @@ namespace RayTracingRT
 		static constexpr std::uint32_t kSkinMaxVertices = 65536;          // per shape (16-bit indices in the game's data)
 		static constexpr std::uint32_t kSkinMaxTriangles = 131072;        // per shape
 		static constexpr std::uint32_t kSkinMaxBones = 256;               // per shape (8-bit bone indices)
-		static constexpr std::uint32_t kSkinUploadsPerFrame = 8;          // new shapes made per frame
+		static constexpr std::uint32_t kSkinUploadsPerFrame = 4;          // new shapes made per frame (45k: 8 -> 4, plus a CPU budget)
+		static constexpr double kSkinUploadBudgetMs = 1.0;                // (45k) buffer creation per frame (at least one shape)
 		static constexpr std::uint32_t kSkinUploadVerticesPerFrame = 400000;
 		static constexpr std::uint32_t kSkinBuildsPerFrame = 8;           // first builds per frame (refits are never capped)
 		static constexpr std::uint32_t kSkinRebuildsPerFrame = 2;         // periodic rebuilds per frame
@@ -521,8 +550,8 @@ namespace RayTracingRT
 		bool EnsureScratch(std::uint64_t a_bytes);
 		bool EnsureTlas(std::uint32_t a_instances);
 		bool EnsureInstanceBuffer(CommandContext& a_context, std::uint32_t a_instances);
-		void ProcessCompaction(ID3D12GraphicsCommandList4* a_list, std::uint64_t a_completed);
-		std::uint32_t BuildQueued(ID3D12GraphicsCommandList4* a_list, std::uint32_t a_budget);
+		void ProcessCompaction(ID3D12GraphicsCommandList4* a_list, std::uint64_t a_completed, std::uint32_t a_max);
+		std::uint32_t BuildQueued(ID3D12GraphicsCommandList4* a_list, std::uint32_t a_budget, std::size_t a_maxBuilds);
 		BlasHandle AllocateHandle();
 		void CheckInstance(const D3D12_RAYTRACING_INSTANCE_DESC& a_desc, const Instance& a_instance, const Blas& a_blas, const FrameInput& a_input);
 
@@ -616,5 +645,6 @@ namespace RayTracingRT
 		std::string adapterDescription_;
 		bool ready_ = false;
 		bool failed_ = false;
+		bool explicitFlush_ = true;  // (45k)
 	};
 }

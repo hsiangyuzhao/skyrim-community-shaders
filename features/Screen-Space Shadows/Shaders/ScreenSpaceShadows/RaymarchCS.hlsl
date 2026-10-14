@@ -1,5 +1,10 @@
 #include "Common/SharedData.hlsli"
 
+#if defined(RT_CASTER_MASK)
+// (45k) Ray Tracing visibility texture: alpha bit 4 = the visible surface is a ray-traced caster.
+Texture2D<unorm float4> RTCasterMask : register(t1);
+#endif
+
 #include "ScreenSpaceShadows/bend_sss_gpu.hlsli"
 
 // (45 SSS, upstream) Match bend_sss_gpu.hlsli's DepthTexture type.
@@ -46,6 +51,8 @@ SamplerState PointBorderSampler : register(s0);        // A point sampler, with 
 	parameters.CameraData = CameraData;
 	parameters.SunDirVS = SunDirVS.xyz;
 	parameters.ProjInfo = ProjInfo.xy;
+	parameters.RtContactScale = RtContactScale;
+	parameters.RtBias = float2(RtBiasConstant, RtBiasPerUnit);
 
 	WriteScreenSpaceShadow(parameters, groupID, groupThreadID);
 }

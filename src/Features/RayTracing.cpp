@@ -30,8 +30,14 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	FirstPersonPlayer,
 	ScreenSpaceShadows,
 	KeepSSSUnderFoliage,
-	WorldLockedNoise,
-	Temporal,
+	Denoiser,
+	Noise,
+	AdaptiveRays,
+	RtContactScale,
+	RayOffsetScale,
+	FlushBeforeTrace,
+	LoadingBoost,
+	WarmUp,
 	StableNormals,
 	FineAlphaMips,
 	ShareGameTextures)
@@ -44,13 +50,14 @@ namespace
 		std::uint32_t rays;
 		float coneDegrees;  // half angle; the sun disc is about 0.27
 		std::uint32_t filterRadius;
+		std::uint32_t extraRays;  // (45k) adaptive extra rays at shadow edges
 		const char* tooltip;
 	};
 
 	constexpr QualityPreset kQuality[3] = {
-		{ "Low", 1, 0.27f, 1, "1 ray per pixel, sharp sun (the real sun disc), light 3x3 smoothing. Cheapest." },
-		{ "Medium", 1, 0.5f, 2, "1 ray per pixel, slightly softer edges, 5x5 smoothing." },
-		{ "High", 2, 0.5f, 2, "2 rays per pixel, slightly softer edges, 5x5 smoothing. Cleanest, about twice the tracing cost." },
+		{ "Low", 1, 0.27f, 1, 1, "1 ray per pixel (+1 at shadow edges with adaptive rays), sharp sun (the real sun disc), light 3x3 smoothing. Cheapest." },
+		{ "Medium", 1, 0.5f, 2, 3, "1 ray per pixel (+3 at shadow edges with adaptive rays), slightly softer edges, 5x5 smoothing." },
+		{ "High", 2, 0.5f, 2, 4, "2 rays per pixel (+4 at shadow edges with adaptive rays), slightly softer edges, 5x5 smoothing. Cleanest." },
 	};
 
 	constexpr float kCaptureBudgetMs = 1.0f;      // CPU per frame for capturing new cells (45j: 1.5 -> 1.0, resumable per shape)
@@ -64,6 +71,19 @@ namespace
 	constexpr std::uint32_t kFlagCombineSSS = 4u, kFlagKeepSSSUnderFoliage = 8u, kFlagTemporal = 16u, kFlagHistoryValid = 32u,
 							kFlagTraceSkipped = 64u;  // Common.hlsli (45j)
 	constexpr float kTemporalBlend = 0.2f;  // (45j) weight of the new frame in the history blend
+	// (45k) Denoiser and the trace flags it needs.
+	constexpr std::uint32_t kFlagR2Noise = 64u, kFlagAdaptive = 128u, kFlagBlockerDist = 256u, kFlagRtSurface = 512u;  // TraceShadowsCS
+	constexpr std::uint32_t kFlagPenumbra = 128u, kFlagCombineBlockerDist = 256u;                                       // Common.hlsli
+	constexpr float kDenoiseMaxRadius = 16.0f;  // px at render resolution
+	constexpr float kDenoiseMaxHistory = 12.0f; // frames
+	constexpr float kDenoiseClampSigma = 1.5f;
+	constexpr float kBlockerRange = 4096.0f;    // TraceShadowsCS kBlockerRange
+	// (45k) Loading screens: capture / build budgets (frame time does not matter there), warm-up after them.
+	constexpr float kLoadingCaptureBudgetMs = 8.0f;
+	constexpr std::uint32_t kLoadingBuildTriangles = 1u << 20;  // per submission (TDR-safe: about 8 frames' worth of normal builds)
+	constexpr std::uint32_t kLoadingMaxBuilds = 64;
+	constexpr double kWarmUpTimeoutMs = 5000.0;
+	constexpr double kFadeInMs = 500.0;
 	constexpr std::uint32_t kAlphaCopiesPerFrame = 16;  // (45h) 256x256 alpha copies made per frame (5 small dispatches each)
 
 	struct LoadingMenuSink : RE::BSTEventSink<RE::MenuOpenCloseEvent>
@@ -71,8 +91,9 @@ namespace
 		RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
 		{
 			// Load game, fast travel, door into another worldspace: every captured cell is stale.
-			if (a_event && a_event->opening && a_event->menuName == RE::LoadingMenu::MENU_NAME)
-				globals::features::rayTracing.OnLoadingScreen();
+			// (45k) Also when it closes: the warm-up starts.
+			if (a_event && a_event->menuName == RE::LoadingMenu::MENU_NAME)
+				globals::features::rayTracing.OnLoadingScreen(a_event->opening);
 			return RE::BSEventNotifyControl::kContinue;
 		}
 	};
@@ -84,10 +105,28 @@ namespace
 	{
 		explicit GpuBucketScope(Util::GpuBucket a_bucket) :
 			bucket(a_bucket) { Util::GpuPassTimers::GetSingleton()->Begin(bucket); }
-		~GpuBucketScope() { Util::GpuPassTimers::GetSingleton()->End(bucket); }
+		~GpuBucketScope()
+		{
+			if (open)
+				Util::GpuPassTimers::GetSingleton()->End(bucket);
+		}
 		GpuBucketScope(const GpuBucketScope&) = delete;
 		GpuBucketScope& operator=(const GpuBucketScope&) = delete;
+		// (45k) Another timed pass in between (GPU timer intervals cannot nest).
+		void Pause()
+		{
+			if (open)
+				Util::GpuPassTimers::GetSingleton()->End(bucket);
+			open = false;
+		}
+		void Resume()
+		{
+			if (!open)
+				Util::GpuPassTimers::GetSingleton()->Begin(bucket);
+			open = true;
+		}
 		Util::GpuBucket bucket;
+		bool open = true;
 	};
 
 	std::int64_t Qpc()
@@ -108,10 +147,72 @@ namespace
 	}
 }
 
-void RayTracing::OnLoadingScreen()
+void RayTracing::OnLoadingScreen(bool a_open)
 {
-	scene.RequestFlush();
-	characters.RequestFlush();  // (45i)
+	if (a_open) {
+		scene.RequestFlush();
+		characters.RequestFlush();  // (45i)
+		loadingOpen.store(true);
+	} else {
+		loadingOpen.store(false);
+		loadingClosed.store(true);
+	}
+}
+
+void RayTracing::UpdatePhase()
+{
+	// (45k) Render thread, once per frame: Play -> Loading (menu open) -> WarmUp (closed, the near scene
+	// still being captured / built: the shadow map keeps every caster) -> Play (RT fades in).
+	const bool open = loadingOpen.load();
+	const bool closed = loadingClosed.exchange(false);
+	const auto& sc = scene.GetStats();
+	const auto& stats = backend.GetStats();
+	if (open && phase != Phase::Loading) {
+		phase = Phase::Loading;
+		loadShapesAtOpen = sc.shapes;
+		loadBuildsAtOpen = static_cast<std::uint32_t>(stats.buildsTotal);
+		fade = 0.0f;
+	}
+	if (!open && (closed || phase == Phase::Loading)) {
+		phase = settings.WarmUp ? Phase::WarmUp : Phase::Play;
+		warmUpStart = Qpc();
+		loadShapesAtClose = sc.shapes;
+		loadBuildsAtClose = static_cast<std::uint32_t>(stats.buildsTotal);
+		fade = settings.WarmUp ? 0.0f : 1.0f;
+	}
+	if (phase == Phase::WarmUp) {
+		const double elapsed = static_cast<double>(Qpc() - warmUpStart) * QpcMs();
+		const bool ready = scene.HasCoverage() && sc.cellsGathering == 0 && backend.QueuedBuilds() == 0 && status == Status::Active;
+		if (ready || elapsed > kWarmUpTimeoutMs || !settings.WarmUp) {
+			phase = Phase::Play;
+			lastTimeToReadyMs = static_cast<float>(elapsed);
+			lastLoadingSummary = std::format("behind the loading screen {} shapes captured, {} BLAS built; after it {} shapes, {} BLAS; ready {:.0f} ms after it closed{}",
+				loadShapesAtClose > loadShapesAtOpen ? loadShapesAtClose - loadShapesAtOpen : 0u,
+				loadBuildsAtClose > loadBuildsAtOpen ? loadBuildsAtClose - loadBuildsAtOpen : 0u, sc.shapes > loadShapesAtClose ? sc.shapes - loadShapesAtClose : 0u,
+				static_cast<std::uint32_t>(stats.buildsTotal) > loadBuildsAtClose ? static_cast<std::uint32_t>(stats.buildsTotal) - loadBuildsAtClose : 0u, elapsed,
+				ready ? "" : " (timed out)");
+			logger::info("[RayTracing] Loading screen: {}", lastLoadingSummary);
+		}
+	}
+	if (phase == Phase::Play && fade < 1.0f) {
+		const double elapsed = static_cast<double>(Qpc() - warmUpStart) * QpcMs();
+		fade = static_cast<float>(std::clamp(elapsed / kFadeInMs, 0.0, 1.0));
+	} else if (phase == Phase::WarmUp) {
+		// While the shadow map still holds every caster, RT adds its shadows already (min of both), faded in.
+		const double elapsed = static_cast<double>(Qpc() - warmUpStart) * QpcMs();
+		fade = static_cast<float>(std::clamp(elapsed / kFadeInMs, 0.0, 1.0));
+	}
+}
+
+bool RayTracing::ClaimScreenSpaceShadows()
+{
+	// (45k) Decided before Ray Tracing's own Prepass (Screen Space Shadows runs first in the list).
+	sssClaimed = false;
+	if (!settings.Enabled || status != Status::Active || static_cast<SSSMode>(settings.ScreenSpaceShadows) != SSSMode::NonRT || !typedUavLoadR8 ||
+		Util::IsInterior() || phase == Phase::Loading)
+		return false;
+	sssClaimed = true;
+	return true;
 }
 
 void RayTracing::UpdateAlphaCasters()
@@ -214,8 +315,21 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.ScreenSpaceShadows = static_cast<int>(settings.KeepScreenSpaceShadows ? SSSMode::Keep : SSSMode::Combine);
 		settings.SettingsVersion = 2;
 	}
+	// (45k) Once, from a save before 45k: Screen Space Shadows Combine becomes "non-RT casters only" (the new
+	// default); Denoiser / Noise / Adaptive Rays start at their defaults (Penumbra, Auto, Auto).
+	if (!o_json.is_object() || o_json.value("SettingsVersion", 0) < 3) {
+		if (settings.ScreenSpaceShadows == static_cast<int>(SSSMode::Combine))
+			settings.ScreenSpaceShadows = static_cast<int>(SSSMode::NonRT);
+		logger::info("[RayTracing] Settings from before 45k: Screen Space Shadows mode {}, Denoiser Penumbra", settings.ScreenSpaceShadows);
+		settings.SettingsVersion = 3;
+	}
 	settings.Foliage = std::clamp(settings.Foliage, 0, 2);
-	settings.ScreenSpaceShadows = std::clamp(settings.ScreenSpaceShadows, 0, 2);
+	settings.ScreenSpaceShadows = std::clamp(settings.ScreenSpaceShadows, 0, 3);
+	settings.Denoiser = std::clamp(settings.Denoiser, 0, static_cast<int>(DenoiserMode::Count) - 1);
+	settings.Noise = std::clamp(settings.Noise, 0, 2);
+	settings.AdaptiveRays = std::clamp(settings.AdaptiveRays, 0, 2);
+	settings.RtContactScale = std::isfinite(settings.RtContactScale) ? std::clamp(settings.RtContactScale, 0.0f, 32.0f) : 8.0f;
+	settings.RayOffsetScale = std::isfinite(settings.RayOffsetScale) ? std::clamp(settings.RayOffsetScale, 0.25f, 2.0f) : 1.0f;
 	settings.AlphaCasters = settings.Foliage != 0 || settings.Cutouts;  // written back for older builds only
 	settings.KeepScreenSpaceShadows = settings.ScreenSpaceShadows == static_cast<int>(SSSMode::Keep);
 	// (45h) Before the first save is loaded (no frame runs during loading screens): its textures are
@@ -262,6 +376,9 @@ void RayTracing::ClearShaderCache()
 	combineCS = nullptr;
 	overlayCS = nullptr;
 	alphaMaskCS = nullptr;
+	denoiseTileCS = nullptr;
+	denoiseHCS = nullptr;
+	denoiseVCS = nullptr;
 }
 
 ID3D11ComputeShader* RayTracing::GetShader(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name)
@@ -339,8 +456,73 @@ void RayTracing::ReleaseD3D11Resources()
 		historyUAV[i] = nullptr;
 	}
 	historyValid = false;
+	ReleaseDenoiser();
 	maskDesc = {};
 	d3d11Bytes = 0;
+}
+
+void RayTracing::ReleaseDenoiser()
+{
+	for (auto* t : { &denoiseTiles, &denoiseH, &denoiseOut, &history4[0], &history4[1] })
+		*t = {};
+	history4Valid = false;
+	d3d11Bytes -= std::min(d3d11Bytes, denoiseBytes);
+	denoiseBytes = 0;
+}
+
+bool RayTracing::EnsureDenoiser()
+{
+	// (45k) Denoiser Penumbra: created on first use (render-target size of the shadow mask).
+	if (denoiseTiles.texture && denoiseH.texture && denoiseOut.texture && history4[0].texture && history4[1].texture)
+		return true;
+	if (!maskTemp)
+		return false;
+	D3D11_TEXTURE2D_DESC desc{};
+	maskTemp->GetDesc(&desc);
+	desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+	auto* device = globals::d3d::device;
+	auto create = [&](DenoiseTexture& o_texture, std::uint32_t a_width, std::uint32_t a_height, DXGI_FORMAT a_format, std::uint32_t a_bytesPerPixel,
+					  const char* a_name) {
+		D3D11_TEXTURE2D_DESC d = desc;
+		d.Width = a_width;
+		d.Height = a_height;
+		d.Format = a_format;
+		if (FAILED(device->CreateTexture2D(&d, nullptr, o_texture.texture.put())) ||
+			FAILED(device->CreateShaderResourceView(o_texture.texture.get(), nullptr, o_texture.srv.put())) ||
+			FAILED(device->CreateUnorderedAccessView(o_texture.texture.get(), nullptr, o_texture.uav.put())))
+			return false;
+		Util::SetResourceName(o_texture.texture.get(), a_name);
+		denoiseBytes += static_cast<std::uint64_t>(a_width) * a_height * a_bytesPerPixel;
+		return true;
+	};
+	ReleaseDenoiser();
+	const bool ok = create(denoiseTiles, (desc.Width + 7) / 8, (desc.Height + 7) / 8, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "RayTracing DenoiseTiles") &&
+	                create(denoiseH, desc.Width, desc.Height, DXGI_FORMAT_R16G16_FLOAT, 4, "RayTracing DenoiseH") &&
+	                create(denoiseOut, desc.Width, desc.Height, DXGI_FORMAT_R16G16_FLOAT, 4, "RayTracing Denoised") &&
+	                create(history4[0], desc.Width, desc.Height, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "RayTracing History4") &&
+	                create(history4[1], desc.Width, desc.Height, DXGI_FORMAT_R16G16B16A16_FLOAT, 8, "RayTracing History4");
+	if (!ok) {
+		ReleaseDenoiser();
+		logger::warn("[RayTracing] Denoiser Penumbra: could not create its textures; Denoiser set to Off");
+		settings.Denoiser = static_cast<int>(DenoiserMode::Off);
+		return false;
+	}
+	d3d11Bytes += denoiseBytes;
+	history4Valid = false;
+	return true;
+}
+
+ID3D11ComputeShader* RayTracing::GetShaderDefined(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name, const char* a_define)
+{
+	if (!a_shader) {
+		std::vector<std::pair<const char*, const char*>> defines;
+		if (a_define)
+			defines.emplace_back(a_define, "");
+		a_shader.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(a_path, defines, "cs_5_0")));
+		if (!a_shader)
+			logger::error("[RayTracing] Could not compile {}", a_name);
+	}
+	return a_shader.get();
 }
 
 bool RayTracing::EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc)
@@ -414,7 +596,7 @@ bool RayTracing::EnsureHistory()
 				historyUAV[k] = nullptr;
 			}
 			logger::warn("[RayTracing] Temporal: could not create the history textures; switched off");
-			settings.Temporal = false;
+			settings.Denoiser = static_cast<int>(DenoiserMode::Off);
 			return false;
 		}
 		Util::SetResourceName(history[i].get(), "RayTracing History");
@@ -438,7 +620,8 @@ void RayTracing::LatchFrame()
 	// exterior conditions RunFrame checks hold. Otherwise the shadow map keeps every caster and a
 	// frame that cannot trace falls back to it cleanly.
 	auto* sky = globals::game::sky;
-	const bool active = settings.Enabled && status == Status::Active && !settings.KeepCastersInShadowMap &&
+	// (45k) Not during a loading screen or the warm-up after it (nor while the RT result still fades in).
+	const bool active = settings.Enabled && status == Status::Active && !settings.KeepCastersInShadowMap && phase == Phase::Play && fade >= 1.0f &&
 	                    debugView != DebugView::Disagreement && !Util::IsInterior() && sky && sky->mode.get() == RE::Sky::Mode::kFull &&
 	                    backend.HasFreeContext() && scene.HasCoverage();
 	// (45f) Watch for big casters the scene lacks while Ray Tracing runs (also when nothing is left out).
@@ -484,6 +667,11 @@ void RayTracing::Prepass()
 	RayTracingTextureSharing::SetEnabled(settings.Enabled && settings.ShareGameTextures && (settings.Foliage != 0 || settings.Cutouts));
 
 	if (!settings.Enabled) {
+		if (sssClaimed)
+			globals::features::screenSpaceShadows.DrawDeferred(nullptr, 0.0f, 0.0f, 0.0f);
+		sssClaimed = false;
+		phase = Phase::Play;
+		fade = 1.0f;
 		if (status != Status::Off) {
 			// Switched off: the scene goes (BLASes retire on the GPU's schedule); the device stays.
 			RayTracingCasterFilter::Clear();
@@ -510,12 +698,26 @@ void RayTracing::Prepass()
 	}
 	if (status == Status::Unavailable || status == Status::Failed) {
 		scene.Housekeeping();
+		if (sssClaimed)
+			globals::features::screenSpaceShadows.DrawDeferred(nullptr, 0.0f, 0.0f, 0.0f);
+		sssClaimed = false;
 		return;
 	}
 
 	cpuLast = {};
+	UpdatePhase();
 	try {
-		RunFrame();
+		if (phase == Phase::Loading && settings.LoadingBoost && backend.IsReady()) {
+			// (45k) Behind the loading screen: capture and build with a large budget, trace nothing. The
+			// render thread never waits on the GPU; one build submission per frame, capped.
+			const std::int64_t loadStart = Qpc();
+			scene.Update(backend, overVramBudget ? 0.0f : kLoadingCaptureBudgetMs, globals::state->frameCount);
+			backend.BuildOnly(kLoadingBuildTriangles, kLoadingMaxBuilds);
+			backend.Tick();
+			cpuLast.scene = static_cast<float>(static_cast<double>(Qpc() - loadStart) * QpcMs());
+		} else {
+			RunFrame();
+		}
 		// (45e) Captures that left the scene this frame go only now, after the trace was submitted.
 		if (backend.IsReady()) {
 			const std::int64_t endStart = Qpc();
@@ -526,6 +728,11 @@ void RayTracing::Prepass()
 	} catch (const std::exception& e) {
 		Disable(Status::Failed, std::format("exception: {}", e.what()));
 	}
+	// (45k) Screen Space Shadows claimed but not drawn by the trace (nothing traced this frame): the
+	// normal ray march, without the caster mask.
+	if (sssClaimed)
+		globals::features::screenSpaceShadows.DrawDeferred(nullptr, 0.0f, 0.0f, 0.0f);
+	sssClaimed = false;
 
 	lastCpuMs = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
 	const auto& stats = backend.GetStats();
@@ -590,6 +797,45 @@ void RayTracing::PublishCpuSplit()
 		detail.releasePending = times.releasePending;
 		detail.tlasInstances = activeThisFrame ? stats.instancesLastFrame : 0;
 		detail.cellsGathering = scene.GetStats().cellsGathering;
+		// (45k)
+		if (activeThisFrame) {
+			const auto& x = stats.split;
+			detail.xCollect = x.collect;
+			detail.xSignal11 = x.signal11;
+			detail.xFlush11 = x.flush11;
+			detail.xWait12 = x.wait12;
+			detail.xReset = x.reset;
+			detail.xTlas = x.tlas;
+			detail.xAlpha = x.alpha;
+			detail.xRecord = x.record;
+			detail.xExecute = x.execute;
+			detail.xSignal12 = x.signal12;
+			detail.xWait11 = x.wait11;
+		}
+		detail.denoiser = settings.Denoiser;
+		detail.phase = static_cast<int>(phase);
+		detail.denoiseGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingDenoise);
+	}
+	detail.sssGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::ScreenSpaceShadows);
+	// (45k) A slow D3D12 record + submit names its slowest call in the log (at most every 2 s).
+	if (activeThisFrame && cpuLast.execute > 4.0f) {
+		static std::int64_t lastSpikeLog = 0;
+		const std::int64_t now = Qpc();
+		if (static_cast<double>(now - lastSpikeLog) * QpcMs() > 2000.0) {
+			lastSpikeLog = now;
+			const auto& x = stats.split;
+			const std::pair<const char*, float> parts[] = { { "context choice", x.collect }, { "D3D11 Signal", x.signal11 }, { "D3D11 Flush", x.flush11 },
+				{ "D3D12 queue Wait", x.wait12 }, { "allocator/list Reset", x.reset }, { "BLAS creation", stats.cpuBuildMs }, { "characters", stats.cpuSkinMs },
+				{ "TLAS instances", x.tlas }, { "alpha records", x.alpha }, { "recording", x.record }, { "ExecuteCommandLists", x.execute },
+				{ "D3D12 Signal", x.signal12 }, { "D3D11 Wait", x.wait11 } };
+			const auto* worst = &parts[0];
+			for (const auto& part : parts)
+				if (part.second > worst->second)
+					worst = &part;
+			logger::info("[RayTracing] D3D12 record + submit took {:.1f} ms; slowest: {} {:.1f} ms (Signal11 {:.2f}, Flush11 {:.2f}, Wait12 {:.2f}, Execute {:.2f}, "
+						 "Signal12 {:.2f}, Wait11 {:.2f}, builds {:.2f}, characters {:.2f})",
+				cpuLast.execute, worst->first, worst->second, x.signal11, x.flush11, x.wait12, x.execute, x.signal12, x.wait11, stats.cpuBuildMs, stats.cpuSkinMs);
+		}
 	}
 	Util::FrameTrace::OnRayTracingDetail(detail);
 }
@@ -703,13 +949,33 @@ void RayTracing::RunFrame()
 	// (45i) First person: no character ray for the arms / weapon (inside the third-person body).
 	if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); !skinDraws.empty() && playerCamera && playerCamera->IsInFirstPerson())
 		traceFlags |= kFlagFirstPerson;
+	// (45k) Denoiser mode and what it picks for Noise / Adaptive Rays (Auto).
+	const DenoiserMode denoiser = CurrentDenoiser();
+	const bool penumbra = denoiser == DenoiserMode::Penumbra;
+	const bool rrMode = denoiser == DenoiserMode::DLSSRR;
+	bool worldNoise = settings.Noise == static_cast<int>(AutoMode::Auto) ? !(penumbra || rrMode) : settings.Noise == static_cast<int>(AutoMode::First);
+	if (rrMode)
+		worldNoise = false;  // DLSS RR needs fresh noise every real frame
+	const bool adaptive = settings.AdaptiveRays == static_cast<int>(AutoMode::Auto) ? (penumbra || rrMode) : settings.AdaptiveRays == static_cast<int>(AutoMode::First);
 	// (45j) Runtime switches of the trace (each off = 45i).
-	if (settings.WorldLockedNoise)
+	if (worldNoise)
 		traceFlags |= kFlagWorldNoise;
+	else if (penumbra || rrMode)
+		traceFlags |= kFlagR2Noise;  // (45k) decorrelated animated rays; Off / Temporal keep the 45j pattern
 	if (settings.StableNormals)
 		traceFlags |= kFlagStableNormal;
 	if (settings.FineAlphaMips)
 		traceFlags |= kFlagAlphaFootprint;
+	if (adaptive && preset.extraRays > 0)
+		traceFlags |= kFlagAdaptive;
+	const bool blockerDist = penumbra && !(traceFlags & kFlagCoverage);
+	if (blockerDist)
+		traceFlags |= kFlagBlockerDist;
+	// (45k) Screen Space Shadows "non-RT casters only": the trace marks the surfaces that are traced casters.
+	const bool sssNonRT = sssClaimed;
+	if (sssNonRT)
+		traceFlags |= kFlagRtSurface;
+	input.constants.extra[0] = (traceFlags & kFlagAdaptive) ? static_cast<float>(preset.extraRays) : 0.0f;
 	input.constants.params[0] = static_cast<float>(preset.rays);
 	input.constants.params[1] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&input.constants.params[2], &traceFlags, sizeof(float));
@@ -719,8 +985,10 @@ void RayTracing::RunFrame()
 	input.constants.renderSize[2] = 1.0f / static_cast<float>(width);
 	input.constants.renderSize[3] = 1.0f / static_cast<float>(height);
 	std::copy_n(traceRect, 4, input.constants.rect);
-	input.constants.bias[0] = 2.0f;
-	input.constants.bias[1] = 0.0015f;
+	// (45k) Debug: Ray Start Offset scales the 45j bias (2 units + 0.0015 per unit of distance).
+	const float biasConstant = 2.0f * settings.RayOffsetScale, biasPerUnit = 0.0015f * settings.RayOffsetScale;
+	input.constants.bias[0] = biasConstant;
+	input.constants.bias[1] = biasPerUnit;
 	input.constants.bias[2] = 8.0f;
 	input.constants.bias[3] = skinDraws.empty() ? 0.0f : settings.CharacterSelfShadowOffset;  // (45i) character ray TMin (character variants only)
 	input.constants.world[0] = static_cast<float>(camX);  // (45j) world-locked noise
@@ -741,31 +1009,47 @@ void RayTracing::RunFrame()
 	auto* screenSpaceShadows = &globals::features::screenSpaceShadows;
 	// (45j) Screen Space Shadows inside the traced area: combined with min() (default), handed off (45i) or kept.
 	const bool sssAvailable = typedUavLoadR8 && screenSpaceShadows->loaded && screenSpaceShadows->bendSettings.Enable && screenSpaceShadows->screenSpaceShadowsTexture;
-	const auto sssMode = static_cast<SSSMode>(std::clamp(settings.ScreenSpaceShadows, 0, 2));
+	const auto sssMode = static_cast<SSSMode>(std::clamp(settings.ScreenSpaceShadows, 0, 3));
 	const bool handOffSSS = sssAvailable && sssMode == SSSMode::HandOff;
-	const bool combineSSS = sssAvailable && sssMode == SSSMode::Combine;
+	// (45k) Non-RT casters only: the texture then holds only non-traced casters (and traced ones within
+	// their contact range): merged with min() like Combine, so shared shadows are not darkened twice.
+	const bool combineSSS = sssAvailable && (sssMode == SSSMode::Combine || sssMode == SSSMode::NonRT);
 	const bool writeSSS = handOffSSS || combineSSS;
-	const bool temporal = settings.Temporal && EnsureHistory();
+	const bool temporal = denoiser == DenoiserMode::Temporal && EnsureHistory();
 	if (!temporal)
 		historyValid = false;
+	const bool penumbraReady = penumbra && EnsureDenoiser();
+	if (!penumbraReady)
+		history4Valid = false;
 	const bool debug = debugView != DebugView::Off;
 
 	CombineCB cb{};
 	std::memcpy(cb.InvViewProj, &invViewProj, sizeof(cb.InvViewProj));
 	std::copy_n(traceRect, 4, cb.Rect);
 	cb.Band[0] = kHandOffBand;
-	cb.Band[1] = static_cast<float>(preset.filterRadius);
+	// (45k) DLSS RR: no filter of ours at all (radius 0 = the pixel itself).
+	cb.Band[1] = rrMode ? 0.0f : static_cast<float>(preset.filterRadius);
 	std::uint32_t combineFlags = (handOffSSS ? kFlagHandOffSSS : 0u) | (debug ? kFlagDebug : 0u) | (combineSSS ? kFlagCombineSSS : 0u) |
 	                             (handOffSSS && settings.KeepSSSUnderFoliage ? kFlagKeepSSSUnderFoliage : 0u) |
-	                             ((traceFlags & kFlagSkipShadowed) ? kFlagTraceSkipped : 0u);
-	if (temporal) {
-		combineFlags |= kFlagTemporal | (historyValid ? kFlagHistoryValid : 0u);
-		cb.Band[3] = kTemporalBlend;
+	                             ((traceFlags & kFlagSkipShadowed) ? kFlagTraceSkipped : 0u) | (blockerDist ? kFlagCombineBlockerDist : 0u);
+	if (temporal || penumbraReady) {
 		std::copy_n(prevViewProj, 16, cb.PrevViewProj);
 		cb.CameraDelta[0] = static_cast<float>(camX - prevCamera[0]);
 		cb.CameraDelta[1] = static_cast<float>(camY - prevCamera[1]);
 		cb.CameraDelta[2] = static_cast<float>(camZ - prevCamera[2]);
 	}
+	if (temporal) {
+		combineFlags |= kFlagTemporal | (historyValid ? kFlagHistoryValid : 0u);
+		cb.Band[3] = kTemporalBlend;
+	}
+	if (penumbraReady)
+		combineFlags |= kFlagPenumbra | (history4Valid ? kFlagHistoryValid : 0u);
+	cb.Denoise[0] = input.constants.toSun[3];
+	cb.Denoise[1] = kDenoiseMaxRadius;
+	cb.Denoise[2] = kDenoiseMaxHistory;
+	cb.Denoise[3] = kDenoiseClampSigma;
+	cb.Extra[0] = fade;
+	cb.Extra[1] = kBlockerRange;
 	std::memcpy(&cb.Band[2], &combineFlags, sizeof(float));
 	cb.Size[0] = width;
 	cb.Size[1] = height;
@@ -826,6 +1110,7 @@ void RayTracing::RunFrame()
 	// 2. D3D12: BLAS builds, TLAS, trace (GPU-side fence waits on both sides).
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
+	backend.SetExplicitFlush(settings.FlushBeforeTrace);  // (45k)
 	const bool traced = backend.ExecuteFrame(input);
 	const std::int64_t executeEnd = Qpc();
 	cpuLast.execute = static_cast<float>(static_cast<double>(executeEnd - executeStart) * QpcMs());
@@ -843,6 +1128,7 @@ void RayTracing::RunFrame()
 		if (filterLatched)
 			++latchedWithoutTrace;
 		historyValid = false;
+		history4Valid = false;
 		context->CSSetShader(nullptr, nullptr, 0);
 		++frameIndex;
 		return;
@@ -853,33 +1139,103 @@ void RayTracing::RunFrame()
 		status = Status::Waiting;
 		statusReason = "building the scene";
 		historyValid = false;
+		history4Valid = false;
 		++frameIndex;
 		return;
 	}
 
+	// 2b. (45k) Screen Space Shadows "non-RT casters only", now that the trace marked the traced casters
+	// (the D3D11 queue already waits for the trace on the GPU; nothing waits on the CPU).
+	if (sssNonRT && sssClaimed) {
+		gpuTimer.Pause();
+		screenSpaceShadows->DrawDeferred(backend.VisibilitySRV(), settings.RtContactScale, biasConstant, biasPerUnit);
+		sssClaimed = false;
+		gpuTimer.Resume();
+	}
+
+	// 2c. (45k) Denoiser Penumbra: tiles, then the horizontal and vertical penumbra filter of this frame.
+	if (penumbraReady) {
+		auto* tileShader = GetShader(denoiseTileCS, L"Data\\Shaders\\RayTracing\\DenoiseTileCS.hlsl", "DenoiseTileCS");
+		auto* hShader = GetShaderDefined(denoiseHCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS", nullptr);
+		auto* vShader = GetShaderDefined(denoiseVCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS (vertical)", "DENOISE_VERTICAL");
+		if (!tileShader || !hShader || !vShader) {
+			logger::warn("[RayTracing] Denoiser Penumbra: a shader did not compile; Denoiser set to Off");
+			settings.Denoiser = static_cast<int>(DenoiserMode::Off);
+			history4Valid = false;
+			combineFlags &= ~(kFlagPenumbra | kFlagHistoryValid);
+			std::memcpy(&cb.Band[2], &combineFlags, sizeof(float));
+			combineCB->Update(cb);
+		} else {
+			gpuTimer.Pause();
+			Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::RayTracingDenoise);
+			context->CSSetConstantBuffers(0, 1, cbs);
+			ID3D11ShaderResourceView* nullSrvs[3]{};
+			ID3D11UnorderedAccessView* nullUav[1]{};
+			{
+				ID3D11ShaderResourceView* srvs[2] = { backend.VisibilitySRV(), backend.DepthMaskSRV() };
+				ID3D11UnorderedAccessView* uav = denoiseTiles.uav.get();
+				context->CSSetShaderResources(0, 2, srvs);
+				context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+				context->CSSetShader(tileShader, nullptr, 0);
+				context->Dispatch(groupsX, groupsY, 1);
+				context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+			}
+			{
+				ID3D11ShaderResourceView* srvs[3] = { backend.VisibilitySRV(), backend.DepthMaskSRV(), denoiseTiles.srv.get() };
+				ID3D11UnorderedAccessView* uav = denoiseH.uav.get();
+				context->CSSetShaderResources(0, 3, srvs);
+				context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+				context->CSSetShader(hShader, nullptr, 0);
+				context->Dispatch(groupsX, groupsY, 1);
+				context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+				context->CSSetShaderResources(0, 3, nullSrvs);
+			}
+			{
+				ID3D11ShaderResourceView* srvs[3] = { denoiseH.srv.get(), backend.DepthMaskSRV(), denoiseTiles.srv.get() };
+				ID3D11UnorderedAccessView* uav = denoiseOut.uav.get();
+				context->CSSetShaderResources(0, 3, srvs);
+				context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+				context->CSSetShader(vShader, nullptr, 0);
+				context->Dispatch(groupsX, groupsY, 1);
+				context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+				context->CSSetShaderResources(0, 3, nullSrvs);
+			}
+			Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::RayTracingDenoise);
+			gpuTimer.Resume();
+		}
+	}
+	const bool penumbraActive = (combineFlags & kFlagPenumbra) != 0u;
+
 	// 3. Merge into the engine's mask, fade Screen Space Shadows inside the traced area.
 	{
 		const std::uint32_t readHistory = historyIndex, writeHistory = historyIndex ^ 1u;
-		ID3D11ShaderResourceView* srvs[4] = { mask.SRV, backend.VisibilitySRV(), backend.DepthMaskSRV(), temporal ? historySRV[readHistory].get() : nullptr };
-		ID3D11UnorderedAccessView* uavs[4] = {
+		const std::uint32_t read4 = history4Index, write4 = history4Index ^ 1u;
+		ID3D11ShaderResourceView* srvs[6] = { mask.SRV, backend.VisibilitySRV(), backend.DepthMaskSRV(), temporal ? historySRV[readHistory].get() : nullptr,
+			penumbraActive ? denoiseOut.srv.get() : nullptr, penumbraActive ? history4[read4].srv.get() : nullptr };
+		ID3D11UnorderedAccessView* uavs[5] = {
 			maskTempUAV.get(),
 			writeSSS ? screenSpaceShadows->screenSpaceShadowsTexture->uav.get() : nullptr,
 			debug ? debugColorUAV.get() : nullptr,
-			temporal ? historyUAV[writeHistory].get() : nullptr
+			temporal ? historyUAV[writeHistory].get() : nullptr,
+			penumbraActive ? history4[write4].uav.get() : nullptr
 		};
 		// Screen Space Shadows bound its texture to PS t45 in its own Prepass; a UAV write needs it unbound.
 		ID3D11ShaderResourceView* nullPs[1]{};
 		if (writeSSS)
 			context->PSSetShaderResources(45, 1, nullPs);
 		context->CSSetConstantBuffers(0, 1, cbs);
-		context->CSSetShaderResources(0, 4, srvs);
-		context->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+		context->CSSetShaderResources(0, 6, srvs);
+		context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
 		context->CSSetShader(combine, nullptr, 0);
 		context->Dispatch(groupsX, groupsY, 1);
-		ID3D11ShaderResourceView* nullSrvs[4]{};
-		ID3D11UnorderedAccessView* nullUavs[4]{};
-		context->CSSetShaderResources(0, 4, nullSrvs);
-		context->CSSetUnorderedAccessViews(0, 4, nullUavs, nullptr);
+		ID3D11ShaderResourceView* nullSrvs[6]{};
+		ID3D11UnorderedAccessView* nullUavs[5]{};
+		context->CSSetShaderResources(0, 6, nullSrvs);
+		context->CSSetUnorderedAccessViews(0, 5, nullUavs, nullptr);
+		if (penumbraActive) {
+			history4Index = write4;
+			history4Valid = true;
+		}
 		context->CSSetShader(nullptr, nullptr, 0);
 		ID3D11Buffer* nullCb[1]{};
 		context->CSSetConstantBuffers(0, 1, nullCb);
@@ -894,6 +1250,8 @@ void RayTracing::RunFrame()
 			// (45j) This frame becomes the history of the next one.
 			historyIndex = writeHistory;
 			historyValid = true;
+		}
+		if (temporal || penumbraActive) {
 			std::memcpy(prevViewProj, &fb.GetCameraViewProj(0), sizeof(prevViewProj));
 			prevCamera[0] = camX;
 			prevCamera[1] = camY;
@@ -1055,12 +1413,15 @@ void RayTracing::DrawSettings()
 			}
 			ImGui::Separator();
 			{
-				const char* sssModes[] = { "Combine (min)", "Hand off (45i)", "Keep (multiply)" };
-				settings.ScreenSpaceShadows = std::clamp(settings.ScreenSpaceShadows, 0, 2);
-				ImGui::Combo("Screen-space shadows", &settings.ScreenSpaceShadows, sssModes, 3);
+				const char* sssModes[] = { "Combine (min)", "Hand off (45i)", "Keep (multiply)", "Non-RT casters only" };
+				settings.ScreenSpaceShadows = std::clamp(settings.ScreenSpaceShadows, 0, 3);
+				ImGui::Combo("Screen-space shadows", &settings.ScreenSpaceShadows, sssModes, 4);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::Text("Screen Space Shadows (small contact shadows) inside the ray-traced area:");
-					ImGui::Text("  Combine (default): kept; where they and the ray tracer agree the shadow is not darkened twice.");
+					ImGui::Text("  Non-RT casters only (default): everything the ray tracer does not see (grass, distant trees, shadow-map kinds)");
+					ImGui::Text("    keeps its contact shadows; ray-traced casters only fill the few units right at their base that the");
+					ImGui::Text("    ray tracer cannot resolve (RT Caster Contact Length), so thin posts and trims are not fattened.");
+					ImGui::Text("  Combine: kept; where they and the ray tracer agree the shadow is not darkened twice.");
 					ImGui::Text("    Grass, leaves and characters left to the shadow map keep their contact shadows.");
 					ImGui::Text("  Hand off: switched off (45i). Grass loses its contact shadows.");
 					ImGui::Text("  Keep: kept and multiplied as with Ray Tracing off (shared shadows get a little darker).");
@@ -1072,19 +1433,56 @@ void RayTracing::DrawSettings()
 						ImGui::Text("Hand off: not where a sun ray passed ray-traced leaves (the traced leaf shadow can be thinner).");
 					ImGui::Unindent();
 				}
-			}
-			ImGui::Checkbox("World-locked noise", &settings.WorldLockedNoise);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): each spot of the world keeps its own ray directions while the camera moves (no crawling ripples).");
-				ImGui::Text("Off: the 45i pattern, new every frame.");
-			}
-			ImGui::Checkbox("Temporal smoothing", &settings.Temporal);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On: the traced shadow is blended with the last frames (about 0.1 ms). Smoother soft edges; best with");
-				ImGui::Text("  World-locked noise off. History is dropped where the depth does not match, and leans on the new frame");
-				ImGui::Text("  where a character casts the shadow. Off (default): every frame on its own.");
+				if (settings.ScreenSpaceShadows == static_cast<int>(SSSMode::NonRT)) {
+					ImGui::Indent();
+					ImGui::SliderFloat("RT Caster Contact Length", &settings.RtContactScale, 0.0f, 32.0f, "%.1f x ray offset");
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("How far (along the sun ray) a ray-traced object may still cast a screen-space contact shadow, in multiples of");
+						ImGui::Text("  the ray tracer's start offset (2 units + 0.15 %% of the distance). Default 8 = about 16 units near the camera.");
+						ImGui::Text("  0 = ray-traced objects cast no screen-space shadow at all. Larger = softer bases, but thin posts get fatter again.");
+					}
+					ImGui::Unindent();
+				}
 			}
 			ImGui::TreePop();
+		}
+
+		// (45k) Denoiser: one dropdown to compare quality and cost in one session.
+		{
+			const char* denoisers[] = { "Off", "Temporal (45j)", "Penumbra (45k)", "DLSS RR" };
+			static_assert(IM_ARRAYSIZE(denoisers) == static_cast<int>(DenoiserMode::Count));
+			settings.Denoiser = std::clamp(settings.Denoiser, 0, static_cast<int>(DenoiserMode::Count) - 1);
+			ImGui::Combo("Denoiser", &settings.Denoiser, denoisers, IM_ARRAYSIZE(denoisers));
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("How the grainy soft edges of the traced shadows are cleaned up (cost: F7 trace column rt_denoise_gpu_ms).");
+				ImGui::Text("  Off: only the small blur of 45j.");
+				ImGui::Text("  Temporal (45j): 45j's 'Temporal smoothing' exactly (blend with the last frames).");
+				ImGui::Text("  Penumbra (default): blurs each soft edge as wide as it really is (wide under tall trees, none at");
+				ImGui::Text("    contact shadows), then blends the last ~12 frames; extra rays only at shadow edges.");
+				ImGui::Text("  DLSS RR: no cleanup of ours; fresh noise every frame for DLSS Ray Reconstruction to clean up.");
+				ImGui::Text("    Needs Ray Reconstruction switched on in Upscaling (DLSS); otherwise the shadows stay grainy.");
+			}
+			const char* noiseModes[] = { "Auto", "World-locked", "Animated" };
+			const char* adaptiveModes[] = { "Auto", "On", "Off" };
+			ImGui::Indent();
+			settings.Noise = std::clamp(settings.Noise, 0, 2);
+			if (CurrentDenoiser() == DenoiserMode::DLSSRR)
+				ImGui::BeginDisabled();
+			ImGui::Combo("Noise", &settings.Noise, noiseModes, 3);
+			if (CurrentDenoiser() == DenoiserMode::DLSSRR)
+				ImGui::EndDisabled();
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Auto: Animated with Penumbra and DLSS RR (they average it over frames), World-locked with Off / Temporal (45j).");
+				ImGui::Text("World-locked: each spot of the world keeps its rays while the camera moves (frozen grain).");
+				ImGui::Text("Animated: new rays every frame (the history averages them). DLSS RR always uses Animated.");
+			}
+			settings.AdaptiveRays = std::clamp(settings.AdaptiveRays, 0, 2);
+			ImGui::Combo("Adaptive Rays", &settings.AdaptiveRays, adaptiveModes, 3);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Extra rays only where a shadow edge is (Quality: Low +1, Medium +3, High +4); deep shadow and open light keep one.");
+				ImGui::Text("Auto: on with Penumbra and DLSS RR, off with Off / Temporal (45j).");
+			}
+			ImGui::Unindent();
 		}
 		RayTracingTextureSharing::SetEnabled(settings.Enabled && settings.ShareGameTextures && (settings.Foliage != 0 || settings.Cutouts));  // also from the main menu
 		if (!alphaOffReason.empty()) {
@@ -1147,7 +1545,8 @@ void RayTracing::DrawSettings()
 	}
 
 	if (ImGui::TreeNodeEx("Debug")) {
-		const char* views[] = { "Off", "Shadow Source", "RT vs Shadow Map", "BLAS Coverage", "Raw RT Visibility", "RT Hit vs Depth" };
+		const char* views[] = { "Off", "Shadow Source", "RT vs Shadow Map", "BLAS Coverage", "Raw RT Visibility", "RT Hit vs Depth", "Penumbra Radius",
+			"History Length", "Adaptive Rays", "SSS: RT Casters" };
 		static_assert(IM_ARRAYSIZE(views) == static_cast<int>(DebugView::Count));
 		int view = static_cast<int>(debugView);
 		if (ImGui::Combo("Debug View", &view, views, IM_ARRAYSIZE(views)))
@@ -1167,6 +1566,11 @@ void RayTracing::DrawSettings()
 			ImGui::Text("Raw RT Visibility: the traced result before smoothing and merging.");
 			ImGui::Text("RT Hit vs Depth: white = the ray-traced surface sits exactly where the game draws it,");
 			ImGui::Text("  red = it is in front (full red = 256 units), blue = behind, black = nothing there.");
+			ImGui::Text("Penumbra Radius (Denoiser Penumbra): blur width per pixel, clear = none (sharp), blue = small, red = 16 px.");
+			ImGui::Text("History Length (Denoiser Penumbra): red = this frame only (new, uncovered or fast camera), green = 12 frames.");
+			ImGui::Text("Adaptive Rays: magenta = extra rays were traced here (shadow edges).");
+			ImGui::Text("SSS: RT Casters (Screen-space shadows: Non-RT casters only): yellow = a ray-traced caster; its screen-space");
+			ImGui::Text("  contact shadow is limited to the contact length.");
 		}
 		ImGui::Checkbox("Keep Static Casters in the Shadow Map", &settings.KeepCastersInShadowMap);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -1189,6 +1593,27 @@ void RayTracing::DrawSettings()
 			ImGui::Text("  (shadow 'acne' on the body where it turns away from the sun), smaller = tighter contact shadows (feet, arms).");
 		}
 		// (45j)
+		// (45k)
+		ImGui::SliderFloat("Ray Start Offset", &settings.RayOffsetScale, 0.25f, 2.0f, "%.2f x");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Sun rays start this far off the surface: 1.0 = 2 units + 0.15 %% of the distance (45j). Smaller = contact shadows");
+			ImGui::Text("  reach closer to the caster's base (low curbs, steps), but flat ground may start to show speckles (shadow acne).");
+		}
+		ImGui::Checkbox("Flush D3D11 Before the Trace", &settings.FlushBeforeTrace);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("45j flushed the game's D3D11 queue explicitly before every trace. Off (default): the fence Signal alone submits it.");
+			ImGui::Text("  A/B for the D3D12 record + submit spikes: the F7 trace columns rt_x_* show which call waits.");
+		}
+		ImGui::Checkbox("Build Behind Loading Screens", &settings.LoadingBoost);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("On: while a loading screen is up, cells are captured and built with a large budget (nothing is traced there).");
+		ImGui::Checkbox("Warm-Up After Loading Screens", &settings.WarmUp);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: after a loading screen the shadow map keeps every caster until the nearby scene is built (5 s at most),");
+			ImGui::Text("  and the ray-traced shadows fade in over half a second. Off: as 45j.");
+		}
+		if (!lastLoadingSummary.empty())
+			ImGui::TextWrapped("Last loading screen: %s", lastLoadingSummary.c_str());
 		ImGui::Checkbox("Stable Normals at Depth Edges", &settings.StableNormals);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("On: thin edges (leaves, blades, branch silhouettes) use the view direction as normal instead of a depth normal that flips every frame.");
@@ -1392,14 +1817,17 @@ std::string RayTracing::DescribeForProfile() const
 		return "not loaded";
 	static constexpr const char* kStatus[] = { "off", "unavailable", "failed", "paused", "loading", "active" };
 	static constexpr const char* kFoliage[] = { "shadow map", "ray traced", "both" };
-	static constexpr const char* kSSS[] = { "combine", "hand off", "keep" };
+	static constexpr const char* kSSS[] = { "combine", "hand off", "keep", "non-RT casters only" };
+	static constexpr const char* kDenoisers[] = { "off", "temporal (45j)", "penumbra", "DLSS RR" };
+	static constexpr const char* kAuto[3][3] = { { "auto", "world-locked", "animated" }, { "auto", "on", "off" }, { "", "", "" } };
 	auto mode = [](bool a_rt) { return a_rt ? "RT" : "SM"; };
 	return std::format("RT {} ({}), quality {}, buildings {}, objects {}, trees {}, foliage {}, cut-outs {}, characters {}, physics parts {}, hair {}, "
-					   "first-person player {}, SSS {}, noise {}, temporal {}",
+					   "first-person player {}, SSS {} (contact {:.1f}), denoiser {}, noise {}, adaptive rays {}, ray offset {:.2f}, D3D11 flush {}, loading build {}, warm-up {}",
 		settings.Enabled ? "on" : "off", kStatus[static_cast<int>(status)], kQuality[std::clamp(settings.QualityLevel, 0, 2)].name, mode(settings.Buildings),
 		mode(settings.Objects), mode(settings.Trees), kFoliage[std::clamp(settings.Foliage, 0, 2)], mode(settings.Cutouts), mode(settings.Characters),
-		mode(settings.PhysicsParts), mode(settings.Hair), settings.FirstPersonPlayer ? "RT" : "SM", kSSS[std::clamp(settings.ScreenSpaceShadows, 0, 2)],
-		settings.WorldLockedNoise ? "world-locked" : "animated", settings.Temporal ? "on" : "off");
+		mode(settings.PhysicsParts), mode(settings.Hair), settings.FirstPersonPlayer ? "RT" : "SM", kSSS[std::clamp(settings.ScreenSpaceShadows, 0, 3)],
+		settings.RtContactScale, kDenoisers[static_cast<int>(CurrentDenoiser())], kAuto[0][std::clamp(settings.Noise, 0, 2)], kAuto[1][std::clamp(settings.AdaptiveRays, 0, 2)],
+		settings.RayOffsetScale, settings.FlushBeforeTrace ? "on" : "off", settings.LoadingBoost ? "on" : "off", settings.WarmUp ? "on" : "off");
 }
 
 nlohmann::json RayTracing::DescribeJson() const
@@ -1419,8 +1847,13 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["hair_rt"] = settings.Hair;
 	j["first_person_player_rt"] = settings.FirstPersonPlayer;
 	j["screen_space_shadows_mode"] = settings.ScreenSpaceShadows;
-	j["world_locked_noise"] = settings.WorldLockedNoise;
-	j["temporal"] = settings.Temporal;
+	j["denoiser"] = settings.Denoiser;
+	j["noise"] = settings.Noise;
+	j["adaptive_rays"] = settings.AdaptiveRays;
+	j["rt_contact_scale"] = settings.RtContactScale;
+	j["ray_offset_scale"] = settings.RayOffsetScale;
+	j["flush_before_trace"] = settings.FlushBeforeTrace;
+	j["denoise_gpu_ms"] = Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingDenoise);
 	const auto& stats = backend.GetStats();
 	j["gpu_ms_smoothed"] = stats.smoothedGpuMs;
 	j["cpu_ms"] = { { "total", cpuSmoothed.total }, { "scene", cpuSmoothed.scene }, { "characters", cpuSmoothed.characters },

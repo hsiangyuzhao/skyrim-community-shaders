@@ -307,7 +307,23 @@ namespace RayTracingRT
 		std::vector<D3D12_RESOURCE_BARRIER> barriers;
 		barriers.reserve(batch.size() * 2);
 		bool anyUv = false;
+		// (45k) Four committed resources per shape are created here on the render thread (the 5-9 ms
+		// rt_exec_skin_ms frames when characters came into range): past the CPU budget the rest of the
+		// batch waits for the next frame (at least one shape per frame).
+		LARGE_INTEGER frequency, start;
+		QueryPerformanceFrequency(&frequency);
+		QueryPerformanceCounter(&start);
+		const auto deadline = start.QuadPart + static_cast<std::int64_t>(static_cast<double>(frequency.QuadPart) * kSkinUploadBudgetMs / 1000.0);
 		for (std::size_t b = 0; b < batch.size(); ++b) {
+			if (b > 0) {
+				LARGE_INTEGER now;
+				QueryPerformanceCounter(&now);
+				if (now.QuadPart > deadline) {
+					requeue(b);
+					batch.resize(b);
+					break;
+				}
+			}
 			auto& shape = skins_[batch[b].handle];
 			shape.rest = CreateBuffer(shape.restBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, false);
 			shape.index = CreateBuffer(shape.indexBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, false);

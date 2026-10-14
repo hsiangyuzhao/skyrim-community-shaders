@@ -77,6 +77,8 @@ namespace Util
 		GrassCulling,
 		// (45 SSS) Screen Space Shadows (sun contact shadows): ray march + edge smoothing.
 		ScreenSpaceShadows,
+		// (45k) Ray Tracing shadow denoiser (Penumbra): tile classification + the two spatial passes.
+		RayTracingDenoise,
 		Count
 	};
 
@@ -138,6 +140,8 @@ namespace Util
 		/// @brief (batch 42a) A bucket's smoothed GPU time, or 0 while it has no recent sample (the
 		/// overlay's table is hidden, or its passes stopped). For the F12 JSON and the feature menus.
 		float SmoothedMs(GpuBucket a_bucket) const;
+		/// (45k) The bucket's last collected sample (ms, a few frames old); -1 without a recent one. For the F7 trace.
+		float LastSampleMs(GpuBucket a_bucket) const;
 
 		/**
 		 * @brief Releases every query and clears all smoothing/pending state.
@@ -209,6 +213,7 @@ namespace Util
 			// table showing a permanent 0 ms, which reads as a broken measurement. No
 			// sample means no row.
 			bool hasSample = false;
+			float lastSampleMs = -1.0f;  // (45k)
 		};
 
 		enum class SlotStatus

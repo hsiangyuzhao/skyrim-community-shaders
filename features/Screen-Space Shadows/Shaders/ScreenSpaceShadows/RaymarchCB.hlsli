@@ -27,7 +27,11 @@ cbuffer PerFrame : register(b1)
 	float MinThickness;
 	float ContactLength;
 	uint EdgeSmoothing;
-	uint3 SettingsPad;
+	// (45k) Ray Tracing "non-RT casters only" (RT_CASTER_MASK variant): occluders that are ray-traced
+	// casters shadow only within RtContactScale x the ray tracer's start offset (bias) along the light ray.
+	float RtContactScale;
+	float RtBiasConstant;
+	float RtBiasPerUnit;
 
 	// (45 SSS) World-space path data
 	float4 CameraData;  // far, near, far - near, far * near

@@ -41,7 +41,11 @@ public:
 		float MinThickness = 30.0f;    ///< (45 SSS) game units (70 units = 1 m)
 		float ContactLength = 150.0f;  ///< (45 SSS) game units along the light ray before casters start to fade
 		uint EdgeSmoothing = 1;        ///< (45 SSS) 3x3 depth-aware blur of the mask, per frame only
-		uint pad0[3];
+		// (45k) Set per frame by Ray Tracing ("non-RT casters only"), not saved: contact range of
+		// ray-traced occluders in multiples of the ray tracer's start offset (constant + per unit).
+		float RtContactScale = 0.0f;
+		float RtBiasConstant = 0.0f;
+		float RtBiasPerUnit = 0.0f;
 	};
 	static_assert(sizeof(BendSettings) == 48, "BendSettings must match ScreenSpaceShadows/RaymarchCB.hlsli");
 
@@ -84,6 +88,7 @@ public:
 	ID3D11ComputeShader* raymarchCS = nullptr;
 	ID3D11ComputeShader* raymarchRightCS = nullptr;
 	ID3D11ComputeShader* edgeSmoothCS = nullptr;  ///< (45 SSS) Edge Smoothing
+	ID3D11ComputeShader* raymarchMaskCS = nullptr;  ///< (45k) RT_CASTER_MASK variant (Ray Tracing "non-RT casters only")
 
 	std::unique_ptr<Texture2D> screenSpaceShadowsTexture;
 	/// (45 SSS) Ray march output before Edge Smoothing (same format as screenSpaceShadowsTexture).
@@ -110,7 +115,12 @@ public:
 	virtual void LoadSettings(json& o_json) override;
 	virtual void SaveSettings(json& o_json) override;
 
-	void DrawShadows();
+	/// (45k) a_rtMask: Ray Tracing's visibility texture (alpha bit 4 = ray-traced caster); null = the normal ray march.
+	void DrawShadows(ID3D11ShaderResourceView* a_rtMask = nullptr);
+	/// (45k) Ray Tracing draws the shadows itself this frame (after its trace, with the caster mask).
+	/// Set in Prepass when Ray Tracing claims them; DrawDeferred must then be called once.
+	bool deferredThisFrame = false;
+	void DrawDeferred(ID3D11ShaderResourceView* a_rtMask, float a_contactScale, float a_biasConstant, float a_biasPerUnit);
 
 	virtual void RestoreDefaultSettings() override;
 

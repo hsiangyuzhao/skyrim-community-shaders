@@ -59,6 +59,10 @@ public:
 		Coverage,
 		RawVisibility,
 		HitDepth,  // (45e) ray-traced first hit vs the game's depth
+		PenumbraRadius,  // (45k) Denoiser Penumbra: filter radius
+		HistoryLength,   // (45k) Denoiser Penumbra: history length
+		AdaptiveRays,    // (45k) pixels with adaptive extra rays
+		RtCasterMask,    // (45k) Screen Space Shadows "non-RT casters only": traced casters
 		Count
 	};
 
@@ -67,7 +71,28 @@ public:
 	{
 		Combine = 0,  // kept; merged with the mask as min() (grass, leaves, characters keep their contact shadows)
 		HandOff = 1,  // faded out (45i): the ray tracer alone (grass loses its contact shadows)
-		Keep = 2      // kept and multiplied as with Ray Tracing off (shared shadows get darker twice)
+		Keep = 2,     // kept and multiplied as with Ray Tracing off (shared shadows get darker twice)
+		NonRT = 3     // (45k, default) every caster the ray tracer does not see keeps its contact shadow; traced
+		              // casters only within a short contact range (the gap the ray start offset leaves); merged as min()
+	};
+
+	/// (45k) Shadow denoiser. Stored as an int: keep the values; 4 and 5 are reserved for NRD SIGMA
+	/// (45l) and AMD FidelityFX Shadows Denoiser.
+	enum class DenoiserMode : int
+	{
+		Off = 0,       // 45j without Temporal: the small Combine blur only
+		Temporal = 1,  // the 45j "Temporal smoothing" path exactly
+		Penumbra = 2,  // (45k, default) penumbra-aware spatial filter + clamped temporal + adaptive rays
+		DLSSRR = 3,    // nothing of ours: raw animated noise for DLSS Ray Reconstruction
+		Count
+	};
+
+	/// (45k) Noise / adaptive rays: Auto = what the denoiser mode wants.
+	enum class AutoMode : int
+	{
+		Auto = 0,
+		First = 1,   // Noise: world-locked; adaptive rays: on
+		Second = 2   // Noise: animated; adaptive rays: off
 	};
 
 	struct Settings
@@ -87,7 +112,7 @@ public:
 		bool KeepCharactersInShadowMap = false;  // debug A/B
 		float CharacterSelfShadowOffset = 6.0f;  // debug: hits on characters nearer than this are ignored (units)
 		// (45j) Ray Tracing > Advanced.
-		int SettingsVersion = 2;  // 45j migration marker (absent in older JSON)
+		int SettingsVersion = 3;  // 45j migration marker (absent in older JSON); 3 = 45k (SSS mode "non-RT casters only")
 		bool Buildings = true;
 		bool Objects = true;
 		bool Trees = false;
@@ -95,10 +120,17 @@ public:
 		bool Cutouts = false;      // fences, banners, grilles: traced with their cut-out
 		bool Hair = false;
 		bool FirstPersonPlayer = false;  // the player stays traced in first person
-		int ScreenSpaceShadows = static_cast<int>(SSSMode::Combine);
+		int ScreenSpaceShadows = static_cast<int>(SSSMode::NonRT);
 		bool KeepSSSUnderFoliage = true;  // hand-off mode: not under leaves
-		bool WorldLockedNoise = true;
-		bool Temporal = false;
+		// (45k) Denoiser / Noise (Auto, World-locked, Animated) / Adaptive Rays (Auto, On, Off).
+		int Denoiser = static_cast<int>(DenoiserMode::Penumbra);
+		int Noise = 0;
+		int AdaptiveRays = 0;
+		float RtContactScale = 8.0f;    // (45k) SSS "non-RT casters only": contact range of traced casters, x the ray start offset
+		float RayOffsetScale = 1.0f;    // (45k) debug: the ray start offset (bias) x this
+		bool FlushBeforeTrace = false;  // (45k) debug: 45j flushed D3D11 explicitly after the ready Signal
+		bool LoadingBoost = true;       // (45k) capture and build with a large budget behind loading screens
+		bool WarmUp = true;             // (45k) after a loading screen: shadow map kept until the near scene is built, RT fades in
 		bool StableNormals = true;
 		bool FineAlphaMips = true;
 		// (45j) Game textures created shareable for ray-traced cut-outs (off: 256x256 copies only). Off by
@@ -135,7 +167,11 @@ public:
 	/// Deferred::EndDeferred, after the deferred composite: the debug views (no-op when off).
 	void DrawDebugOverlay();
 	/// A loading screen opened (any thread): every captured cell is dropped on the next frame.
-	void OnLoadingScreen();
+	/// (45k) a_open false: it closed (the warm-up starts).
+	void OnLoadingScreen(bool a_open);
+	/// (45k) Screen Space Shadows Prepass: true = Ray Tracing draws them this frame (non-RT casters only,
+	/// after its trace, with its caster mask); it then always calls ScreenSpaceShadows::DrawDeferred once.
+	bool ClaimScreenSpaceShadows();
 
 	/// True when this frame's shadow mask is (being) ray traced.
 	[[nodiscard]] bool IsActiveThisFrame() const { return activeThisFrame; }
@@ -163,6 +199,8 @@ private:
 		std::uint32_t Size[4];  // render width, height, debug view, frame
 		float PrevViewProj[16];  // (45j) last combined frame's CameraViewProj
 		float CameraDelta[4];    // (45j) camera position now minus then
+		float Denoise[4];        // (45k) tan(cone), max radius px, max history, clamp sigmas
+		float Extra[4];          // (45k) fade-in, blocker range, unused
 	};
 	STATIC_ASSERT_ALIGNAS_16(CombineCB);
 
@@ -186,6 +224,7 @@ private:
 	winrt::com_ptr<ID3D11ComputeShader> combineCS;
 	winrt::com_ptr<ID3D11ComputeShader> overlayCS;
 	winrt::com_ptr<ID3D11ComputeShader> alphaMaskCS;  // (45h) 256x256 alpha copies
+	ID3D11ComputeShader* GetShaderDefined(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name, const char* a_define);
 	bool alphaMaskRgba = false;                        // the variant alphaMaskCS was compiled as
 	std::unique_ptr<ConstantBuffer> combineCB;
 	winrt::com_ptr<ID3D11Texture2D> maskTemp;  // the combined mask before it is copied over the engine's
@@ -202,6 +241,39 @@ private:
 	float prevViewProj[16]{};
 	double prevCamera[3]{};
 	bool EnsureHistory();
+	// (45k) Denoiser Penumbra: tiles (RGBA16F, 1/8 size), horizontal and final filter (RG16F), history ping-pong (RGBA16F).
+	struct DenoiseTexture
+	{
+		winrt::com_ptr<ID3D11Texture2D> texture;
+		winrt::com_ptr<ID3D11ShaderResourceView> srv;
+		winrt::com_ptr<ID3D11UnorderedAccessView> uav;
+	};
+	DenoiseTexture denoiseTiles, denoiseH, denoiseOut, history4[2];
+	std::uint32_t history4Index = 0;
+	bool history4Valid = false;
+	std::uint64_t denoiseBytes = 0;
+	bool EnsureDenoiser();
+	void ReleaseDenoiser();
+	winrt::com_ptr<ID3D11ComputeShader> denoiseTileCS, denoiseHCS, denoiseVCS;
+	// (45k) Screen Space Shadows drawn by us this frame (non-RT casters only).
+	bool sssClaimed = false;
+	// (45k) Loading screens and the warm-up after them.
+	std::atomic<bool> loadingOpen{ false };
+	std::atomic<bool> loadingClosed{ false };  // set by the menu event, consumed on the render thread
+	enum class Phase
+	{
+		Play,
+		Loading,
+		WarmUp
+	};
+	Phase phase = Phase::Play;
+	std::int64_t warmUpStart = 0;      // QPC when the loading screen closed
+	float fade = 1.0f;                 // RT result fade-in after a loading screen
+	std::uint32_t loadShapesAtOpen = 0, loadShapesAtClose = 0, loadBuildsAtOpen = 0, loadBuildsAtClose = 0;
+	float lastTimeToReadyMs = -1.0f;
+	std::string lastLoadingSummary;
+	void UpdatePhase();
+	[[nodiscard]] DenoiserMode CurrentDenoiser() const { return static_cast<DenoiserMode>(std::clamp(settings.Denoiser, 0, static_cast<int>(DenoiserMode::Count) - 1)); }
 	// (45j) CPU split of the last frame (also in the F7 trace), smoothed and worst for the page.
 	struct CpuSplit
 	{

@@ -68,6 +68,8 @@ struct DispatchParameters
 	float4 CameraData;    // SharedData::CameraData layout (far, near, far - near, far * near)
 	float3 SunDirVS;      // direction towards the sun, view space, normalized
 	float2 ProjInfo;      // 1 / P00, 1 / P11 of the camera projection
+	float RtContactScale;  // (45k) RT_CASTER_MASK: contact range of ray-traced occluders, in multiples of the ray tracer's bias
+	float2 RtBias;         // (45k) the ray tracer's bias: constant, per unit of distance
 
 	bool IgnoreEdgePixels;  // If an edge is detected, the edge pixel will not contribute to the shadow.
 							// If a very flat surface is being lit and rendered at an grazing angles, the edge detect may incorrectly detect multiple 'edge' pixels along that flat surface.
@@ -115,6 +117,8 @@ struct DispatchParameters
 		CameraData = 0;
 		SunDirVS = float3(0, 0, 1);
 		ProjInfo = 1;
+		RtContactScale = 0;
+		RtBias = 0;
 	}
 
 	// Runtime data returned from BuildDispatchList():
@@ -210,6 +214,24 @@ static void ComputeWavefrontExtents(DispatchParameters inParameters, int3 inGrou
 // Common shared data
 groupshared half DepthData[READ_COUNT * WAVE_SIZE];
 
+#	if defined(RT_CASTER_MASK)
+// (45k) Ray Tracing "non-RT casters only": RTCasterMask (the ray tracer's visibility texture,
+// declared by RaymarchCS before this include) has bit 4 of its alpha set where the visible surface
+// is a ray-traced caster. Such occluder samples shadow only within a short contact range (the gap
+// the ray tracer's start offset leaves); farther along the light ray only the ray tracer shadows.
+groupshared uint RtCasterData[READ_COUNT * WAVE_SIZE];
+
+bool IsRtCaster(half2 uv)
+{
+	uint w, h;
+	RTCasterMask.GetDimensions(w, h);
+	const int2 texel = int2(floor(float2(uv) * float2(w, h)));
+	if (any(texel < 0) || texel.x >= int(w) || texel.y >= int(h))
+		return false;
+	return (uint(RTCasterMask.Load(int3(texel, 0)).w * 255.0 + 0.5) & 4u) != 0u;
+}
+#	endif
+
 // Generate the shadow
 //	Call this function from a compute shader with thread dimensions: numthreads[WAVE_SIZE, 1, 1]
 //
@@ -229,6 +251,9 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 	half shadowing_depth[READ_COUNT];
 	half depth_thickness_scale[READ_COUNT];
 	half sample_distance[READ_COUNT];
+#	if defined(RT_CASTER_MASK)
+	bool rt_caster[READ_COUNT];
+#	endif
 
 	const half direction = -inParameters.LightCoordinate.w;
 	const half z_sign = inParameters.NearDepthValue > inParameters.FarDepthValue ? -1 : +1;
@@ -323,6 +348,10 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 
 		// Shadows cast from this depth
 		shadowing_depth[i] = use_point_filter ? edge_depth : shadow_depth;
+#	if defined(RT_CASTER_MASK)
+		// Both taps of the sample: a traced caster's silhouette pixel the mask missed still counts.
+		rt_caster[i] = IsRtCaster(coord) || IsRtCaster(coord_with_offset);
+#	endif
 
 		// Store for later
 		sample_distance[i] = pixel_distance + (WAVE_SIZE * i) * direction;
@@ -346,6 +375,9 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 		// Store the depth values in groupshared
 		int idx = (i * WAVE_SIZE) + inGroupThreadID.x;
 		DepthData[idx] = stored_depth;
+#	if defined(RT_CASTER_MASK)
+		RtCasterData[idx] = rt_caster[i] ? 1u : 0u;
+#	endif
 	}
 
 	// Sync wavefronts now groupshared DepthData is written
@@ -385,14 +417,19 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 	// next ContactLength (the ray is a fixed number of pixels, so far away it reached metres).
 	half surface_thickness = inParameters.SurfaceThickness;
 	float world_per_sample = 0;
+	float rt_contact = 0;  // (45k) RT_CASTER_MASK: contact range of ray-traced occluders, game units
+#	if !defined(RT_CASTER_MASK)  // (45k) with the mask: always (rt_contact needs view_z)
 	[branch] if (inParameters.WorldSpaceThickness)
+#	endif
 	{
 		const float4 cam = inParameters.CameraData;
 		const float view_z = max(cam.w / (-sampling_depth[0] * cam.z + cam.x), 1.0);
 		// Bend's window is 2 x SurfaceThickness x z game units deep (1 - depth ~= near / z), so
 		// 0.5 x MinThickness / z puts its far edge at MinThickness units behind the surface.
 		// Only the far edge uses this; the near edge keeps SurfaceThickness (see below).
-		surface_thickness = max(surface_thickness, 0.5 * inParameters.MinThickness / view_z);
+		if (inParameters.WorldSpaceThickness)
+			surface_thickness = max(surface_thickness, 0.5 * inParameters.MinThickness / view_z);
+		rt_contact = inParameters.RtContactScale * (inParameters.RtBias.x + inParameters.RtBias.y * view_z);
 
 		// Game units travelled along the light ray per sample: screen motion of P + t*L is
 		// |L.xy - s * L.z| / z in tan units per unit t, with s this pixel's view ray (x/z, y/z).
@@ -439,6 +476,11 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 			half in_front = z_sign * (start_depth_raw - DepthData[sample_index + i]);
 			half sample_occlusion = saturate(inParameters.ShadowContrast * min(in_front * depth_scale, 2.0 - in_front * far_scale));
 			half fade = saturate(2.0 - (i + 1) * fade_rate);
+#	if defined(RT_CASTER_MASK)
+			// (45k) A ray-traced occluder: only its contact part (fades out over the next rt_contact).
+			if (RtCasterData[sample_index + i])
+				fade *= saturate(2.0 - (i + 1) * world_per_sample / max(rt_contact, 0.01));
+#	endif
 			occlusion[i & 3] = max(occlusion[i & 3], sample_occlusion * fade);
 		}
 		result = 1 - dot(occlusion, 0.25);
@@ -450,6 +492,11 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 		[unroll] for (i = 0; i < SAMPLE_COUNT; i++)
 		{
 			half depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
+#	if defined(RT_CASTER_MASK)
+			// (45k) A ray-traced occluder beyond its contact range casts nothing here.
+			if (RtCasterData[sample_index + i] && (i + 1) * world_per_sample > rt_contact)
+				depth_delta = 1;
+#	endif
 
 			// By using 4 values, the average shadow can be taken, which can help soften single-pixel shadows.
 			shadow_value[i & 3] = min(shadow_value[i & 3], depth_delta);

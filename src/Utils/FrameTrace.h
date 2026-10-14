@@ -73,6 +73,11 @@ namespace Util::FrameTrace
 		float scene = -1, gridDiff = -1, gather = -1, registration = -1, objects = -1, objectCapture = -1, instances = -1, missed = -1;
 		float characters = -1, execute = -1, executeBuild = -1, executeSkin = -1, d3d11 = -1, endFrame = -1, release = -1;
 		uint32_t recaptures = 0, objectsCaptured = 0, missedJudged = 0, releasePending = 0, tlasInstances = 0, cellsGathering = 0;
+		// (45k) D3D12 record + submit, call by call (Backend::ExecuteSplit; -1 = not run), denoiser mode,
+		// phase (0 play, 1 loading screen, 2 warm-up after it), last GPU samples of the denoiser and Screen Space Shadows.
+		float xCollect = -1, xSignal11 = -1, xFlush11 = -1, xWait12 = -1, xReset = -1, xTlas = -1, xAlpha = -1, xRecord = -1, xExecute = -1, xSignal12 = -1, xWait11 = -1;
+		int denoiser = -1, phase = 0;
+		float denoiseGpuMs = -1, sssGpuMs = -1;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

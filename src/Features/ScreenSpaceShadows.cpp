@@ -1,5 +1,6 @@
 #include "ScreenSpaceShadows.h"
 
+#include "Features/RayTracing.h"
 #include "Features/TerrainBlending.h"
 #include "State.h"
 #include "Utils/GpuTimers.h"
@@ -10,6 +11,11 @@
 #pragma warning(pop)
 
 using RE::RENDER_TARGETS;
+
+namespace
+{
+	bool g_maskCompileFailed = false;  // (45k) the RT_CASTER_MASK variant did not compile: not retried every frame
+}
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ScreenSpaceShadows::BendSettings,
@@ -74,6 +80,11 @@ void ScreenSpaceShadows::ReleaseRaymarchShaders()
 		raymarchRightCS->Release();
 		raymarchRightCS = nullptr;
 	}
+	if (raymarchMaskCS) {
+		raymarchMaskCS->Release();
+		raymarchMaskCS = nullptr;
+	}
+	g_maskCompileFailed = false;
 }
 
 void ScreenSpaceShadows::ClearShaderCache()
@@ -123,7 +134,7 @@ void ScreenSpaceShadows::CompileRaymarchShaders()
 		ReleaseRaymarchShaders();
 	}
 
-	if (raymarchCS && (raymarchRightCS || !globals::game::isVR))
+	if (raymarchCS && (raymarchRightCS || !globals::game::isVR) && (raymarchMaskCS || g_maskCompileFailed || !deferredThisFrame))
 		return;
 
 	const auto sampleCount = std::format("{}", scaledSampleCount);
@@ -135,6 +146,14 @@ void ScreenSpaceShadows::CompileRaymarchShaders()
 
 	if (!raymarchCS)
 		raymarchCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", defines, "cs_5_0");
+
+	// (45k) Ray Tracing "non-RT casters only": compiled on first use only.
+	if (deferredThisFrame && !raymarchMaskCS && !globals::game::isVR) {
+		auto maskDefines = defines;
+		maskDefines.push_back({ "RT_CASTER_MASK", "" });
+		raymarchMaskCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\ScreenSpaceShadows\\RaymarchCS.hlsl", maskDefines, "cs_5_0");
+		g_maskCompileFailed = raymarchMaskCS == nullptr;
+	}
 
 	if (globals::game::isVR && !raymarchRightCS) {
 		defines.push_back({ "RIGHT", "" });
@@ -154,7 +173,7 @@ ID3D11ComputeShader* ScreenSpaceShadows::GetComputeRaymarchRight()
 	return raymarchRightCS;
 }
 
-void ScreenSpaceShadows::DrawShadows()
+void ScreenSpaceShadows::DrawShadows(ID3D11ShaderResourceView* a_rtMask)
 {
 	ZoneScoped;
 	auto state = globals::state;
@@ -192,6 +211,14 @@ void ScreenSpaceShadows::DrawShadows()
 	// Setup common render state
 	auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
 	context->CSSetShaderResources(0, 1, &depth.depthSRV);
+	// (45k) Ray Tracing "non-RT casters only": its caster mask at t1 and the RT_CASTER_MASK variant.
+	ID3D11ComputeShader* maskShader = nullptr;
+	if (a_rtMask && !globals::game::isVR) {
+		CompileRaymarchShaders();
+		maskShader = raymarchMaskCS;
+		if (maskShader)
+			context->CSSetShaderResources(1, 1, &a_rtMask);
+	}
 
 	// (45 SSS) With Edge Smoothing the ray march writes into rawShadowsTexture and the smoothing pass
 	// writes the final texture; otherwise the ray march writes the final texture directly.
@@ -295,7 +322,7 @@ void ScreenSpaceShadows::DrawShadows()
 	float InvTexSizeY = 1.0f / (float)viewportSize[1];
 
 	if (!globals::game::isVR) {
-		DispatchEye(nullptr, GetComputeRaymarch(), lightProjectionF.data(), InvTexSizeX, InvTexSizeY);
+		DispatchEye(nullptr, maskShader ? maskShader : GetComputeRaymarch(), lightProjectionF.data(), InvTexSizeX, InvTexSizeY);
 	} else {
 		DispatchEye("Left Eye", GetComputeRaymarch(), lightProjectionF.data(), InvTexSizeX, InvTexSizeY);
 
@@ -346,8 +373,14 @@ void ScreenSpaceShadows::Prepass()
 	float white[4] = { 1, 1, 1, 1 };
 	context->ClearUnorderedAccessViewFloat(screenSpaceShadowsTexture->uav.get(), white);
 
+	deferredThisFrame = false;
 	if (auto sky = globals::game::sky) {
-		if (bendSettings.Enable && sky->mode.get() == RE::Sky::Mode::kFull) {
+		if (bendSettings.Enable && sky->mode.get() == RE::Sky::Mode::kFull && !globals::game::isVR &&
+			globals::features::rayTracing.loaded && globals::features::rayTracing.ClaimScreenSpaceShadows()) {
+			// (45k) Ray Tracing "non-RT casters only": drawn by Ray Tracing after its trace (DrawDeferred),
+			// with its caster mask; it always draws them this frame, traced or not.
+			deferredThisFrame = true;
+		} else if (bendSettings.Enable && sky->mode.get() == RE::Sky::Mode::kFull) {
 			// (45 SSS) Own row in the Performance Overlay's GPU table (was folded into "Other").
 			Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::ScreenSpaceShadows);
 			DrawShadows();
@@ -355,6 +388,27 @@ void ScreenSpaceShadows::Prepass()
 		}
 	}
 
+	auto view = screenSpaceShadowsTexture->srv.get();
+	context->PSSetShaderResources(45, 1, &view);
+}
+
+void ScreenSpaceShadows::DrawDeferred(ID3D11ShaderResourceView* a_rtMask, float a_contactScale, float a_biasConstant, float a_biasPerUnit)
+{
+	if (!deferredThisFrame)
+		return;
+	deferredThisFrame = a_rtMask != nullptr;  // CompileRaymarchShaders builds the mask variant only when it is used
+	auto context = globals::d3d::context;
+	// The texture is bound to PS t45 (Prepass); a UAV write needs it unbound.
+	ID3D11ShaderResourceView* nullPs[1]{};
+	context->PSSetShaderResources(45, 1, nullPs);
+	bendSettings.RtContactScale = a_contactScale;
+	bendSettings.RtBiasConstant = a_biasConstant;
+	bendSettings.RtBiasPerUnit = a_biasPerUnit;
+	Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::ScreenSpaceShadows);
+	DrawShadows(a_rtMask);
+	Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::ScreenSpaceShadows);
+	bendSettings.RtContactScale = 0.0f;
+	deferredThisFrame = false;
 	auto view = screenSpaceShadowsTexture->srv.get();
 	context->PSSetShaderResources(45, 1, &view);
 }

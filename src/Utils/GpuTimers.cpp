@@ -126,6 +126,9 @@ namespace Util
 			{ "Screen Space Shadows",
 				"GPU time for Screen Space Shadows (small sun shadows the shadow map misses): the ray march and, when on, "
 				"Edge Smoothing. Only runs outdoors with the full sky." },
+			{ "RT Shadow Denoiser",
+				"(45k) GPU time of the Ray Tracing shadow denoiser (Denoiser: Penumbra): the tile pass and the two blur passes that follow the "
+				"width of each soft shadow edge. Its history blend runs inside the Ray Tracing row." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
@@ -278,6 +281,7 @@ namespace Util
 				case SlotStatus::Ready:
 					bucket.smoothedMs = bucket.smoothedMs * kSmoothingOld + sampleMs * kSmoothingNew;
 					bucket.lastSampleIntervals = slot.used;
+					bucket.lastSampleMs = sampleMs;
 					bucket.hasSample = true;
 					slot.pending = false;
 					slot.used = 0;
@@ -412,6 +416,17 @@ namespace Util
 			a_callback(BucketReport{ kBucketInfo[i].label, kRowIdBase + i, bucket.smoothedMs,
 				bucket.lastSampleIntervals, kBucketInfo[i].tooltip });
 		}
+	}
+
+	float GpuPassTimers::LastSampleMs(GpuBucket a_bucket) const
+	{
+		const int index = static_cast<int>(a_bucket);
+		if (index < 0 || index >= static_cast<int>(GpuBucket::Count))
+			return -1.0f;
+		const auto& bucket = buckets[index];
+		if (!bucket.everActive || !bucket.hasSample || frameIndex - bucket.lastActiveFrame > 8)
+			return -1.0f;
+		return bucket.lastSampleMs;
 	}
 
 	float GpuPassTimers::SmoothedMs(GpuBucket a_bucket) const

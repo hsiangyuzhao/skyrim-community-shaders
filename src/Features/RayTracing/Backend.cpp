@@ -784,7 +784,7 @@ namespace RayTracingRT
 		return true;
 	}
 
-	void Backend::ProcessCompaction(ID3D12GraphicsCommandList4* a_list, std::uint64_t a_completed)
+	void Backend::ProcessCompaction(ID3D12GraphicsCommandList4* a_list, std::uint64_t a_completed, std::uint32_t a_max)
 	{
 		stats_.compactionsLastFrame = 0;
 		std::uint32_t created = 0;
@@ -792,7 +792,7 @@ namespace RayTracingRT
 			if (blas.state != BlasState::Built || blas.buildFence == 0 || blas.buildFence > a_completed)
 				continue;
 			// (45j) A bounded number of new buffers per frame; the rest stay usable (Built) until a later frame.
-			if (created >= kMaxCompactionsPerFrame)
+			if (created >= a_max)
 				break;
 			const std::uint64_t compactedSize = blas.postbuildSlot < kPostbuildSlots ? postbuildMapped_[blas.postbuildSlot] : 0;
 			blas.postbuildSlot = UINT32_MAX;
@@ -821,7 +821,7 @@ namespace RayTracingRT
 		}
 	}
 
-	std::uint32_t Backend::BuildQueued(ID3D12GraphicsCommandList4* a_list, std::uint32_t a_budget)
+	std::uint32_t Backend::BuildQueued(ID3D12GraphicsCommandList4* a_list, std::uint32_t a_budget, std::size_t a_maxBuilds)
 	{
 		std::uint32_t built = 0;
 		std::vector<std::uint32_t> slots;
@@ -840,7 +840,7 @@ namespace RayTracingRT
 		std::uint64_t uploadBytes = 0;
 		{
 			std::uint32_t batchTriangles = 0;
-			while (!buildQueue_.empty() && batch.size() < kMaxBuildsPerFrame && (batch.empty() || batchTriangles < a_budget)) {
+			while (!buildQueue_.empty() && batch.size() < a_maxBuilds && (batch.empty() || batchTriangles < a_budget)) {
 				const BlasHandle handle = buildQueue_.front();
 				buildQueue_.pop_front();
 				auto& blas = blas_[handle];
@@ -1073,6 +1073,14 @@ namespace RayTracingRT
 			return Fail("D3D12 device", removed);
 
 		const std::int64_t cpuStart = QpcNow();
+		// (45k) Every call that can wait for the GPU is timed on its own (stats_.split, F7 trace).
+		ExecuteSplit split{};
+		std::int64_t mark = cpuStart;
+		auto lap = [&](float& a_field) {
+			const std::int64_t now = QpcNow();
+			a_field += static_cast<float>(QpcToMs(now - mark));
+			mark = now;
+		};
 		CollectRetired();
 		const std::uint64_t completed = fence_->GetCompletedValue();
 
@@ -1094,6 +1102,7 @@ namespace RayTracingRT
 		}
 		auto& context = contexts_[index];
 		cursor_ = (index + 1) % kContexts;
+		lap(split.collect);
 
 		static const std::vector<Instance> kNoInstances;
 		const std::vector<Instance>& instances = a_input.instances ? *a_input.instances : kNoInstances;
@@ -1104,20 +1113,30 @@ namespace RayTracingRT
 		HRESULT hr = context11_->Signal(fence11_.Get(), readyValue);
 		if (FAILED(hr))
 			return Fail("D3D11 Signal", hr);
-		context11_->Flush();
+		lap(split.signal11);
+		// (45k) The Signal submits the D3D11 work recorded so far by itself; the extra Flush of 45j
+		// is a switch (Debug: Flush D3D11 Before the Trace) so a trace can tell whether it blocks.
+		if (explicitFlush_)
+			context11_->Flush();
+		else
+			split.flushSkipped = true;
+		lap(split.flush11);
 		if (FAILED(hr = queue_->Wait(fence_.Get(), readyValue)))
 			return Fail("D3D12 queue Wait", hr);
+		lap(split.wait12);
 		if (FAILED(hr = context.allocator->Reset()))
 			return Fail("command allocator Reset", hr);
 		auto* list = context.list.Get();
 		if (FAILED(hr = list->Reset(context.allocator.Get(), nullptr)))
 			return Fail("command list Reset", hr);
+		lap(split.reset);
 		if (timestampHeap_)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(index * 2));
 
 		const std::int64_t buildStart = QpcNow();
-		ProcessCompaction(list, completed);
-		const std::uint32_t builtNow = BuildQueued(list, a_input.buildTriangleBudget);
+		const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
+		ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame);
+		const std::uint32_t builtNow = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds);
 		stats_.buildsLastFrame = builtNow;
 		const std::int64_t buildEnd = QpcNow();
 
@@ -1135,6 +1154,7 @@ namespace RayTracingRT
 			list->Close();
 			return false;
 		}
+		mark = QpcNow();
 
 		// TLAS over every built BLAS that has an instance this frame.
 		std::uint32_t instanceCount = 0;
@@ -1229,6 +1249,7 @@ namespace RayTracingRT
 		skinStats_.drawsLastFrame = characterInstances;
 
 		stats_.instancesLastFrame = instanceCount;
+		lap(split.tlas);
 		// (45h) The alpha pipeline only on frames that hold alpha-tested instances (and their records
 		// are in this context's copy); every other frame runs exactly the opaque pipeline.
 		bool alphaFrame = alphaInstances > 0;
@@ -1242,6 +1263,7 @@ namespace RayTracingRT
 			return false;
 		}
 		alphaStats_.instancesLastFrame = alphaInstances;
+		lap(split.alpha);
 
 		{
 			// Builds and compaction copies above must be finished before the TLAS reads them.
@@ -1301,11 +1323,14 @@ namespace RayTracingRT
 		}
 		if (FAILED(hr = list->Close()))
 			return Fail("command list Close", hr);
+		lap(split.record);
 		ID3D12CommandList* lists[] = { list };
 		queue_->ExecuteCommandLists(1, lists);
+		lap(split.execute);
 		const std::uint64_t doneValue = ++fenceValue_;
 		if (FAILED(hr = queue_->Signal(fence_.Get(), doneValue)))
 			return Fail("D3D12 queue Signal", hr);
+		lap(split.signal12);
 		context.fenceValue = doneValue;
 		lastSubmitted_ = doneValue;
 		for (auto& blas : blas_)
@@ -1313,7 +1338,72 @@ namespace RayTracingRT
 				blas.buildFence = doneValue;
 		if (FAILED(hr = context11_->Wait(fence11_.Get(), doneValue)))
 			return Fail("D3D11 Wait", hr);
+		lap(split.wait11);
+		stats_.split = split;
 		stats_.cpuRecordMs = static_cast<float>(QpcToMs(QpcNow() - cpuStart)) - stats_.cpuBuildMs - stats_.cpuSkinMs;
+		return true;
+	}
+
+	bool Backend::BuildOnly(std::uint32_t a_triangleBudget, std::uint32_t a_maxBuilds)
+	{
+		// (45k) Loading screens: the queued BLAS builds (and due compactions) go out on our own queue
+		// with a larger cap; nothing D3D11 is involved (no shared texture, no fence wait on either
+		// side), and nothing waits on the CPU. The usual per-submission cap keeps it TDR-safe.
+		if (!ready_ || failed_)
+			return false;
+		const HRESULT removed = device_->GetDeviceRemovedReason();
+		if (FAILED(removed))
+			return Fail("D3D12 device", removed);
+		CollectRetired();
+		const std::uint64_t completed = fence_->GetCompletedValue();
+		bool compactionDue = false;
+		for (const auto& blas : blas_) {
+			if (blas.state == BlasState::Built && blas.buildFence != 0 && blas.buildFence <= completed) {
+				compactionDue = true;
+				break;
+			}
+		}
+		if (buildQueue_.empty() && !compactionDue)
+			return false;
+		std::size_t index = kContexts;
+		for (std::size_t offset = 0; offset < kContexts; ++offset) {
+			const std::size_t candidate = (cursor_ + offset) % kContexts;
+			if (contexts_[candidate].fenceValue == 0 || contexts_[candidate].fenceValue <= completed) {
+				index = candidate;
+				break;
+			}
+		}
+		if (index == kContexts)
+			return false;
+		for (std::size_t i = 0; i < kContexts; ++i)
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed)
+				CollectTimestamps(i);
+		auto& context = contexts_[index];
+		cursor_ = (index + 1) % kContexts;
+		HRESULT hr;
+		if (FAILED(hr = context.allocator->Reset()))
+			return Fail("command allocator Reset", hr);
+		auto* list = context.list.Get();
+		if (FAILED(hr = list->Reset(context.allocator.Get(), nullptr)))
+			return Fail("command list Reset", hr);
+		ProcessCompaction(list, completed, a_maxBuilds);
+		const std::uint32_t built = BuildQueued(list, a_triangleBudget, a_maxBuilds);
+		stats_.loadingBuilds += built;
+		if (FAILED(hr = list->Close()))
+			return Fail("command list Close", hr);
+		if (failed_)
+			return false;
+		ID3D12CommandList* lists[] = { list };
+		queue_->ExecuteCommandLists(1, lists);
+		const std::uint64_t doneValue = ++fenceValue_;
+		if (FAILED(hr = queue_->Signal(fence_.Get(), doneValue)))
+			return Fail("D3D12 queue Signal", hr);
+		context.fenceValue = doneValue;
+		context.timestampsPending = false;
+		lastSubmitted_ = doneValue;
+		for (auto& blas : blas_)
+			if (blas.state == BlasState::Built && blas.buildFence == 0)
+				blas.buildFence = doneValue;
 		return true;
 	}
 }
