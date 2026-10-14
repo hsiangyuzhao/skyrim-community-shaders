@@ -530,8 +530,8 @@ namespace RayTracingRT
 			SetPointFault("could not create its shared textures (see the log)");
 			return false;
 		}
-		pointCounter_ = CreateBuffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-		pointCounterReadback_ = CreateBuffer(sizeof(std::uint32_t) * kContexts, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+		pointCounter_ = CreateBuffer(kPointCounterWords * sizeof(std::uint32_t), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+		pointCounterReadback_ = CreateBuffer(sizeof(std::uint32_t) * kPointCounterWords * kContexts, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
 		void* mapped = nullptr;
 		if (!pointCounter_ || !pointCounterReadback_ || FAILED(pointCounterReadback_->Map(0, nullptr, &mapped)) || !mapped) {
 			pointVis_ = {};
@@ -660,7 +660,8 @@ namespace RayTracingRT
 		// The ray counter's value after this frame, into this context's read-back slot.
 		D3D12_RESOURCE_BARRIER toCopy = Transition(pointCounter_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		a_list->ResourceBarrier(1, &toCopy);
-		a_list->CopyBufferRegion(pointCounterReadback_.Get(), sizeof(std::uint32_t) * a_index, pointCounter_.Get(), 0, sizeof(std::uint32_t));
+		a_list->CopyBufferRegion(pointCounterReadback_.Get(), sizeof(std::uint32_t) * kPointCounterWords * a_index, pointCounter_.Get(), 0,
+			sizeof(std::uint32_t) * kPointCounterWords);  // (46g) rays, top-K churn, per-slot beam pixels
 		D3D12_RESOURCE_BARRIER toUav = Transition(pointCounter_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 		a_list->ResourceBarrier(1, &toUav);
 		if (timestampHeap_ && timestampReadback_)
@@ -1375,11 +1376,23 @@ namespace RayTracingRT
 		const bool pointPending = context.pointPending;
 		context.pointPending = false;
 		if (pointPending && pointCounterMapped_) {
-			const std::uint32_t value = pointCounterMapped_[a_index];
-			if (pointCounterValid_ && context.pointFrame > pointCounterLastFrame_)
-				stats_.pointRaysPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(value - pointCounterLast_) / (context.pointFrame - pointCounterLastFrame_));
+			const std::uint32_t* words = pointCounterMapped_ + static_cast<std::size_t>(kPointCounterWords) * a_index;
+			const std::uint32_t value = words[0];
+			if (pointCounterValid_ && context.pointFrame > pointCounterLastFrame_) {
+				const auto frames = static_cast<std::uint32_t>(context.pointFrame - pointCounterLastFrame_);
+				stats_.pointRaysPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(value - pointCounterLast_) / frames);
+				// (46g) Top-K churn and the window beams' sampled pixels (traced / blocked), per frame.
+				stats_.pointChurnPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[1] - pointCounterWords_[1]) / frames);
+				for (std::uint32_t slot = 0; slot < kPointBeamSlots; ++slot) {
+					const std::uint32_t w = kPointBeamBase + slot * 2;
+					stats_.beamTraced[slot] = static_cast<std::uint32_t>(words[w] - pointCounterWords_[w]) / frames;
+					stats_.beamBlocked[slot] = static_cast<std::uint32_t>(words[w + 1] - pointCounterWords_[w + 1]) / frames;
+				}
+				++stats_.beamSamples;
+			}
 			if (!pointCounterValid_ || context.pointFrame > pointCounterLastFrame_) {
 				pointCounterLast_ = value;
+				std::copy_n(words, kPointCounterWords, pointCounterWords_.begin());
 				pointCounterLastFrame_ = context.pointFrame;
 				pointCounterValid_ = true;
 			}
@@ -2074,7 +2087,7 @@ namespace RayTracingRT
 			desc.Transform[1][3] = static_cast<float>(instance.y - a_input.cameraY);
 			desc.Transform[2][3] = static_cast<float>(instance.z - a_input.cameraZ);
 			desc.InstanceMask = kInstanceMask;
-			desc.Flags = kInstanceFlags;
+			desc.Flags = instance.twoSided ? kInstanceFlags : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;  // (46g)
 			if (alpha) {
 				// The shader finds the record through the instance ID (0 = opaque); no force-opaque flag.
 				desc.InstanceID = instance.alphaInfo + 1;

@@ -118,6 +118,10 @@ namespace Util::FrameTrace
 		float xTimestamps = -1, xEnsure = -1, xPublish = -1, xAo = -1;
 		float poolMs = -1, poolMb = -1, poolWorkerMs = -1;
 		uint32_t poolSyncBlocks = 0, poolAllocFails = 0;
+		// (46g) Point-light selection: slot changes, lights merged, rejected by radius / by intensity, kept by the hysteresis,
+		// pixels whose top-K source set changed (GPU, a few frames late; -1 = not known), window beams found implausible.
+		uint32_t plSlotChanges = 0, plMerged = 0, plRejRadius = 0, plRejIntensity = 0, plKept = 0, plBeamsExcluded = 0;
+		int64_t plChurn = -1;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

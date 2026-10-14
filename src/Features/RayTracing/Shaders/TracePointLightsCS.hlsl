@@ -64,6 +64,12 @@ RWByteAddressBuffer RayCounter : register(u2);  // rays traced (monotonic, read 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
 static const uint kFlagCharCull = 4u;     // the character ray only where the segment passes a character's bounds
+static const uint kFlagSticky = 8u;          // (46g) last frame's sources of the pixel rank x kStickyBonus and pass at half the share cut
+static const uint kFlagBeamCullFront = 16u;  // (46g) window beam rays cull triangles facing the ray start (the room shell from inside)
+static const uint kFlagBeamCullBack = 32u;   // (46g) ... or the ones facing away
+static const float kStickyBonus = 1.5;
+static const uint kChurnWord = 1u;           // (46g) RayCounter words: [1] pixels whose source set changed
+static const uint kBeamWordBase = 64u;       // ... from 64: per slot, sampled beam cone pixels traced / blocked
 static const uint kSourceISL = 1u;
 static const uint kSourceSpot = 8u;   // (46c) RayTracingPointLights::kSourceSpot
 static const uint kSourceBeam = 16u;  // (46c) RayTracingPointLights::kSourceBeam
@@ -203,7 +209,7 @@ float ExitDistance(float3 origin, float3 dir)
 	return max(tExit, 0.0) + C.Bounds.z;
 }
 
-bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, float footprint, out float tHit)
+bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, float footprint, uint rayFlags, out float tHit)
 {
 	RayDesc ray;
 	ray.Origin = origin;
@@ -212,7 +218,7 @@ bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, float
 	ray.TMax = tMax;
 #if defined(RT_ALPHA)
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
+	q.TraceRayInline(Scene, rayFlags, mask, ray);
 	uint budget = kAlphaCandidateBudget;
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
@@ -224,7 +230,7 @@ bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, float
 	}
 #else
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_CULL_NON_OPAQUE> q;
-	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
+	q.TraceRayInline(Scene, rayFlags, mask, ray);
 	q.Proceed();
 #endif
 	tHit = q.CommittedRayT();
@@ -327,10 +333,18 @@ groupshared uint gsMask[2];
 
 	if (!inside)
 		return;
+	// (46g) Last frame's sources of this pixel (read before it is overwritten): stickiness and the churn count.
+	const uint4 prevIdx = uint4(PLIdx[p] * 255.0 + 0.5) & 0x7Fu;
+	const bool sticky = (flags & kFlagSticky) != 0u;
 	const uint2 mask = uint2(gsMask[0], gsMask[1]);
 	if (!valid || all(mask == 0u)) {
 		PLVis[p] = 1.0;
 		PLIdx[p] = 0.0;
+		const uint emptied = WaveActiveCountBits(any(prevIdx != 0u));
+		if (WaveIsFirstLane() && emptied > 0u) {
+			uint previousChurn;
+			RayCounter.InterlockedAdd(kChurnWord * 4u, emptied, previousChurn);
+		}
 		return;
 	}
 
@@ -350,7 +364,8 @@ groupshared uint gsMask[2];
 		N = -N;
 
 	// Top K by contribution.
-	float best[4] = { 0.0, 0.0, 0.0, 0.0 };
+	float best[4] = { 0.0, 0.0, 0.0, 0.0 };      // ranking value (x kStickyBonus for last frame's sources)
+	float bestC[4] = { 0.0, 0.0, 0.0, 0.0 };     // (46g) the contribution itself
 	uint bestIdx[4] = { 0u, 0u, 0u, 0u };
 	float total = 0.0;
 	uint count = 0u;
@@ -375,17 +390,22 @@ groupshared uint gsMask[2];
 				continue;
 			total += contribution;
 			count += 1u;
-			// Insert into the sorted top K.
-			float v = contribution;
+			// Insert into the sorted top K. (46g) Last frame's sources of the pixel rank higher (stable selection).
+			const bool wasThere = sticky && any(prevIdx == (i + 1u));
+			float v = contribution * (wasThere ? kStickyBonus : 1.0);
+			float vc = contribution;
 			uint vi = i + 1u;
 			[unroll] for (uint k = 0u; k < 4u; ++k)
 			{
 				if (k < K && v > best[k]) {
 					const float tv = best[k];
+					const float tc = bestC[k];
 					const uint ti = bestIdx[k];
 					best[k] = v;
+					bestC[k] = vc;
 					bestIdx[k] = vi;
 					v = tv;
+					vc = tc;
 					vi = ti;
 				}
 			}
@@ -398,18 +418,22 @@ groupshared uint gsMask[2];
 	const float n1 = InterleavedGradientNoise(float2(p.yx) + float2(29.0, 61.0), uint(C.Params.y) * 7u + 3u);
 	const bool characters = (flags & kFlagCharacters) && !((flags & kFlagFirstPerson) && dist < kFirstPersonNear);
 	float threshold = max(total * C.Extra.x, C.Extra.y);
+	float stickyThreshold = max(total * C.Extra.x * 0.5, C.Extra.y);  // (46g) last frame's sources: half the share cut
 	// The sun gate (outside the traced area the sun trace wrote 1: lit).
 	[branch] if (C.Sun.w > 0.0)
 	{
 		const float sunTerm = C.Sun.w * saturate(dot(N, C.Sun.xyz)) * SunVisibility[p].x;
 		threshold = max(threshold, sunTerm * C.Extra.z);
+		stickyThreshold = max(stickyThreshold, sunTerm * C.Extra.z);
 	}
+	const uint beamCull = (flags & kFlagBeamCullFront) ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : ((flags & kFlagBeamCullBack) ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : RAY_FLAG_NONE);
+	const bool beamSample = ((p.x & 3) | (p.y & 3)) == 0;  // (46g) 1 of 16 pixels feeds the beam counters
 	float4 vis = 1.0;
 	uint rays = 0u;
 	uint4 idx = 0u;
 	[unroll] for (uint k = 0u; k < 4u; ++k)
 	{
-		if (bestIdx[k] == 0u || best[k] < threshold)
+		if (bestIdx[k] == 0u || bestC[k] < ((sticky && any(prevIdx == bestIdx[k])) ? stickyThreshold : threshold))
 			continue;
 		const PLSource src = Sources[bestIdx[k] - 1u];
 		// A point on the emitter's disc facing the surface (R2 step per slot: the slots decorrelate).
@@ -436,7 +460,8 @@ groupshared uint gsMask[2];
 			continue;  // the surface is inside the clearance: lit
 		float tHit;
 		const float footprint = dist * 2.0 * C.RenderSize.w;  // about a pixel's size there (alpha mip choice)
-		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, tHit);
+		const bool isBeam = (src.Info.x & kSourceBeam) != 0u;
+		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, isBeam ? beamCull : RAY_FLAG_NONE, tHit);
 		rays += 1u;
 		if (!blocked && characters) {
 			// (46d) The player's own light: the player's body (torch, arm, torso) is not tested, only the other actors.
@@ -450,12 +475,30 @@ groupshared uint gsMask[2];
 				if (owner != 0u)
 					blocked = BlockedExcept(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, owner, tHit);
 				else
-					blocked = Blocked(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, tHit);
+					blocked = Blocked(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, RAY_FLAG_NONE, tHit);
 				rays += 1u;
 			}
 		}
 		if (blocked)
 			vis[k] = min(sqrt(saturate(tHit / max(len, 1.0))), 1.0) * (254.0 / 255.0);
+		if (isBeam && beamSample) {
+			const uint word = kBeamWordBase + (bestIdx[k] - 1u) * 2u;
+			uint previousBeam;
+			RayCounter.InterlockedAdd(word * 4u, 1u, previousBeam);
+			if (blocked)
+				RayCounter.InterlockedAdd((word + 1u) * 4u, 1u, previousBeam);
+		}
+	}
+	// (46g) Churn: the pixel's source set (order aside) differs from last frame's.
+	bool changed = false;
+	[unroll] for (uint a = 0u; a < 4u; ++a)
+	{
+		changed = changed || (idx[a] != 0u && !any(prevIdx == idx[a])) || (prevIdx[a] != 0u && !any(idx == prevIdx[a]));
+	}
+	const uint churned = WaveActiveCountBits(changed);
+	if (WaveIsFirstLane() && churned > 0u) {
+		uint previousChurn;
+		RayCounter.InterlockedAdd(kChurnWord * 4u, churned, previousChurn);
 	}
 	count = min(count, 15u);
 	[unroll] for (uint b = 0u; b < 4u; ++b)

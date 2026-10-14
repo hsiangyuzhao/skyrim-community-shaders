@@ -265,6 +265,10 @@ namespace RayTracingRT
 		const char* label = nullptr;
 		// (45h) Alpha-tested: the per-shape record (CreateAlphaInfo); the instance is non-opaque.
 		std::uint32_t alphaInfo = kInvalidAlphaInfo;
+		// (46g) Drawn two-sided by the engine (or unknown): keeps TRIANGLE_CULL_DISABLE. Others are one-sided so that the window
+		// beam rays (which may cull, Point Light Shadows > Window Beam Culling) pass the room's own shell from inside;
+		// the sun, point-light and RTAO rays cull nothing (their results do not change).
+		bool twoSided = true;
 	};
 
 	struct FrameInput
@@ -375,6 +379,11 @@ namespace RayTracingRT
 		float lastPointGpuMs = -1.0f;
 		std::int64_t pointRaysPerFrame = -1;
 		bool pointTracedLastFrame = false;
+		// (46g) Point lights: pixels whose top-K source set changed per frame (-1 = not known); window beams per slot: sampled cone
+		// pixels traced / blocked per frame (1 of 16 pixels), beamSamples counts the read-backs.
+		std::int64_t pointChurnPerFrame = -1;
+		std::array<std::uint32_t, 64> beamTraced{}, beamBlocked{};
+		std::uint64_t beamSamples = 0;
 		// (46f) RTAO: GPU ms of its dispatch (not inside lastGpuMs' trace), rays per frame (read back late; -1 = not known), last frame traced or not.
 		float lastAOGpuMs = -1.0f;
 		std::int64_t aoRaysPerFrame = -1;
@@ -996,6 +1005,10 @@ namespace RayTracingRT
 		ComPtr<ID3D12Resource> pointCounterReadback_;  // per context one uint32 copy of it
 		const std::uint32_t* pointCounterMapped_ = nullptr;
 		std::uint32_t pointCounterLast_ = 0;
+		// (46g) Counter words (TracePointLightsCS RayCounter): [0] rays, [1] pixels whose top-K source set changed, from
+		// kPointBeamBase per slot: sampled cone pixels traced / blocked of a window beam. The whole block is read back per context.
+		static constexpr std::uint32_t kPointCounterWords = 256, kPointBeamBase = 64, kPointBeamSlots = 64;
+		std::array<std::uint32_t, kPointCounterWords> pointCounterWords_{};
 		std::uint64_t pointCounterLastFrame_ = 0;
 		bool pointCounterValid_ = false;
 		std::uint64_t pointFrame_ = 0;                 // point-light frames submitted

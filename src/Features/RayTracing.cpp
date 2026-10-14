@@ -56,6 +56,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PointLightsPlayer,
 	PointLightsEffects,
 	PointLightsAlphaOutdoors,
+	PointLightsStable,
+	PointLightsBeamCull,
+	PointLightsBeamGuard,
 	AO,
 	AOMode,
 	AORayLength,
@@ -158,6 +161,7 @@ namespace
 	constexpr float kPointMaxFilterRadius = 12.0f;   // px
 	constexpr float kPointSunShare = 0.05f;          // at a sunlit pixel a point light under 5 % of the sun's light there is not traced
 	constexpr std::uint32_t kPointFlagCharacters = 1u, kPointFlagFirstPerson = 2u, kPointFlagCharCull = 4u;  // TracePointLightsCS
+	constexpr std::uint32_t kPointFlagSticky = 8u, kPointFlagBeamCullFront = 16u, kPointFlagBeamCullBack = 32u;  // (46g) TracePointLightsCS
 	constexpr std::uint32_t kPointDenoiseHistory = 1u, kPointDenoiseDebug = 2u;                             // PointDenoiseCS
 	constexpr float kBeamRayMargin = 64.0f;  // (46c) a window beam's ray goes this far past the interior's box
 	// (46f) RTAO.
@@ -273,6 +277,8 @@ void RayTracing::UpdatePhase()
 		lateHold = false;
 		inTransition = true;
 		fade = 0.0f;
+		beamGuards.clear();  // light pointers of the place left behind
+		excludedBeams.clear();
 		scene.SetHold(true);
 		for (auto& entry : transitionLog)
 			entry = {};
@@ -448,6 +454,54 @@ void RayTracing::TransitionLogFlush()
 	for (auto& entry : transitionLog)
 		entry = {};
 	transitionLogSlot = -1;
+}
+
+void RayTracing::UpdateBeamGuard()
+{
+	// (46g) Window beams whose traced cone is (almost) fully blocked are not believed: with the room's own shell in the way
+	// the beam's patch would vanish. 30 read-backs over 97 % (with enough sampled pixels) -> no source for 600 frames (the
+	// engine's shadow map stays for that beam), then it is tried again.
+	const auto& stats = backend.GetStats();
+	const std::uint32_t frame = globals::state->frameCount;
+	if (stats.beamSamples != beamSamplesSeen) {
+		beamSamplesSeen = stats.beamSamples;
+		for (std::uint32_t slot = 0; slot < lastSlotBeams.size(); ++slot) {
+			const auto* light = lastSlotBeams[slot];
+			if (!light)
+				continue;
+			const std::uint32_t traced = stats.beamTraced[slot], blocked = stats.beamBlocked[slot];
+			if (traced < 64)
+				continue;  // too little of the cone on screen to judge
+			auto& guard = beamGuards[light];
+			if (guard.implausible)
+				continue;
+			guard.over = static_cast<double>(blocked) > 0.97 * static_cast<double>(traced) ? guard.over + 1 : 0;
+			if (guard.over >= 30) {
+				guard.implausible = true;
+				guard.until = frame + 600;
+				++beamsImplausible;
+				logger::info("[RayTracing] Window beam {} looks implausible ({} of {} sampled cone pixels blocked): the engine's shadow map is kept for it "
+							 "for 600 frames (Point Light Shadows > Window Beam Guard)",
+					static_cast<const void*>(light), blocked, traced);
+			}
+		}
+	}
+	excludedBeams.clear();
+	for (auto it = beamGuards.begin(); it != beamGuards.end();) {
+		auto& guard = it->second;
+		if (guard.implausible && frame - guard.until < 0x80000000u) {
+			// Retry: believed again until the counters say otherwise.
+			guard.implausible = false;
+			guard.over = 0;
+		}
+		if (guard.implausible)
+			excludedBeams.push_back(it->first);
+		if (!guard.implausible && guard.over == 0 && beamGuards.size() > 256)
+			it = beamGuards.erase(it);
+		else
+			++it;
+	}
+	std::sort(excludedBeams.begin(), excludedBeams.end());
 }
 
 bool RayTracing::ClaimScreenSpaceShadows()
@@ -1594,6 +1648,13 @@ void RayTracing::PublishCpuSplit()
 		detail.poolMb = static_cast<float>(static_cast<double>(stats.pools.reservedBytes) / (1024.0 * 1024.0));
 		detail.poolAllocFails = stats.pools.allocFailsLastFrame;
 		detail.poolWorkerMs = stats.pools.workerLastMs;
+		detail.plSlotChanges = ps.slotChanges;
+		detail.plMerged = ps.merged;
+		detail.plRejRadius = ps.byReason[1];
+		detail.plRejIntensity = ps.byReason[2];
+		detail.plKept = ps.kept;
+		detail.plChurn = pointThisFrame ? stats.pointChurnPerFrame : -1;
+		detail.plBeamsExcluded = static_cast<std::uint32_t>(excludedBeams.size());
 	}
 	detail.sssGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::ScreenSpaceShadows);
 	// (45k) A slow D3D12 record + submit names its slowest call in the log (at most every 2 s).
@@ -2467,6 +2528,9 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	// (46d) The player's lights (never shadowed by the player's own body) and ownerless spell / effect lights.
 	config.player = settings.PointLightsPlayer;
 	config.effects = settings.PointLightsEffects;
+	config.stable = settings.PointLightsStable;  // (46g)
+	UpdateBeamGuard();
+	config.excludedBeams = settings.PointLightsBeamGuard && !excludedBeams.empty() ? &excludedBeams : nullptr;
 	config.forced = a_interior && !skippedLights.empty() ? &skippedLights : nullptr;
 	// (46e) The characters in this frame's TLAS: a light one of them carries skips that character's body.
 	config.owners = (a_input.skinDraws && !a_input.skinDraws->empty()) ? &characters.Owners() : nullptr;
@@ -2478,6 +2542,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	float viewProjF[16];
 	std::memcpy(viewProjF, &viewProj, sizeof(viewProjF));
 	const std::uint32_t scan = pointSelector.Select(config, camera, viewProjF, worldRect, globals::state->frameCount, pointSources.data());
+	lastSlotBeams = pointSelector.SlotBeams();  // (46g) the beam guard reads the counters of these slots a few frames later
 	if (scan == 0)
 		return false;
 
@@ -2492,6 +2557,12 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); playerCamera && playerCamera->IsInFirstPerson())
 			flags |= kPointFlagFirstPerson;
 	}
+	if (settings.PointLightsStable)
+		flags |= kPointFlagSticky;  // (46g)
+	if (settings.PointLightsBeamCull == 1)
+		flags |= kPointFlagBeamCullFront;
+	else if (settings.PointLightsBeamCull == 2)
+		flags |= kPointFlagBeamCullBack;
 	c.params[0] = static_cast<float>(scan);
 	c.params[1] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[2], &flags, sizeof(float));
@@ -3558,6 +3629,12 @@ void RayTracing::DrawPointLightPage()
 			ImGui::Text("  shadow map in the lighting (default on). Off: they keep the game's shadow map.");
 			ImGui::Text("  Outdoors spot lights keep the game's shadow map; indoors their cone is taken from the game.");
 		}
+		ImGui::Checkbox("Stable Light Selection", &settings.PointLightsStable);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): flickering candles and lights whose range changes do not make an area jump between the ray-traced");
+			ImGui::Text("  shadow and the old one: their brightness and range are smoothed for the choice, a light keeps its place a little");
+			ImGui::Text("  longer, and each pixel prefers the lights it traced last frame. Off: the 46f choice, frame by frame.");
+		}
 		ImGui::Checkbox("Keep Screen-Space Contact Shadows", &settings.PointLightsKeepSSPLS);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Off (default): Screen Space Point Light Shadows are skipped for ray-traced lights.");
@@ -3611,6 +3688,22 @@ void RayTracing::DrawPointLightPage()
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Window Shadows Ultimate's beams of sunlight through the windows (and the game's other spot lights indoors):");
 			ImGui::Text("  their shadow is ray traced, the window frames give the pattern on the floor. Off: they keep the game's shadow maps.");
+		}
+		// (46g) Beam rays and the room's shell.
+		{
+			const char* cullModes[] = { "None (46f)", "Faces Toward the Room", "Faces Away" };
+			settings.PointLightsBeamCull = std::clamp(settings.PointLightsBeamCull, 0, 2);
+			ImGui::Combo("Window Beam Culling", &settings.PointLightsBeamCull, cullModes, 3);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Which wall faces a window beam's rays ignore. The game draws a beam's shadow map from outside and skips the walls'");
+				ImGui::Text("  back faces, so the beam passes the room's own shell. \"Faces Toward the Room\" (default) does the same for the rays.");
+				ImGui::Text("  If the beam's patch on the floor is still missing, try \"Faces Away\". Sun, point-light and AO rays never cull.");
+			}
+			ImGui::Checkbox("Window Beam Guard", &settings.PointLightsBeamGuard);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("A beam whose whole cone comes out blocked (the patch would vanish) keeps the game's shadow map for a while,");
+				ImGui::Text("  then it is tried again. %u beams were caught so far.", beamsImplausible);
+			}
 		}
 		ImGui::Checkbox("Stop Engine Shadow Maps for RT Lights", &settings.PointLightsSkipShadowMaps);
 		if (auto _tt = Util::HoverTooltipWrapper()) {

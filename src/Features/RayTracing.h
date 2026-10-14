@@ -148,6 +148,12 @@ public:
 		bool PointLightsPlayer = true;          // the player's own lights (torch in hand, Quick Light, light spells) cast RT shadows (not of the player)
 		bool PointLightsEffects = true;         // spell / effect lights without an owner (Magelight, projectiles) cast RT shadows
 		bool PointLightsAlphaOutdoors = true;   // outdoors too, leaves / bushes / cut-outs (as the per-kind menu traces them) block point lights
+		// (46g) Stable light selection: smoothed intensity / radius, hysteresis at the cuts, stable merging, per-pixel stickiness.
+		bool PointLightsStable = true;
+		// (46g) Window beam rays: 0 cull nothing (46f), 1 cull triangles facing the ray start (the room shell seen from inside, as the
+		// engine's shadow map culls it from the light), 2 cull the ones facing away.
+		int PointLightsBeamCull = 1;
+		bool PointLightsBeamGuard = true;  // (46g) a beam that is almost fully blocked keeps the engine's shadow map
 		// (46f) Ray-traced ambient occlusion (Ray Tracing page, Ambient Occlusion). Exteriors only for now.
 		bool AO = false;
 		int AOMode = 0;                // AOMode: 0 RTAO (keeps SSGI contact AO, darker of both), 1 darker of RTAO and SSGI AO
@@ -433,6 +439,20 @@ private:
 	void TransitionLogFlush();
 	std::uint32_t beginFrameIndex = UINT32_MAX;  // (46g) frame of the last Backend::BeginFrame
 	bool handOffThisFrame = false;               // (46g) F7 rt_handoff
+	// (46g) Window beam guard: a beam whose sampled cone pixels are almost all blocked for 30 read-backs is implausible (the room's
+	// shell in the way): it gets no source for 600 frames, the engine's shadow map stays for it; then it is tried again.
+	struct BeamGuard
+	{
+		std::uint32_t over = 0;
+		bool implausible = false;
+		std::uint32_t until = 0;
+	};
+	std::unordered_map<const RE::BSLight*, BeamGuard> beamGuards;
+	std::vector<const RE::BSLight*> excludedBeams;
+	std::uint64_t beamSamplesSeen = 0;
+	std::array<const RE::BSLight*, 64> lastSlotBeams{};
+	std::uint32_t beamsImplausible = 0;
+	void UpdateBeamGuard();
 	/// Off, Penumbra, DLSS RR or SIGMA; anything else (the removed Temporal = 1) reads as Penumbra.
 	[[nodiscard]] static int ValidDenoiser(int a_value)
 	{

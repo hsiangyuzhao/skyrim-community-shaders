@@ -215,9 +215,9 @@ namespace RayTracingPointLights
 			if (logged.size() >= 32 || std::find(logged.begin(), logged.end(), a_light) != logged.end())
 				return;
 			logged.push_back(a_light);
-			logger::info("[RayTracing] Spot shadow light {}{}: radius {:.0f}, direction ({:.3f} {:.3f} {:.3f}), half widths tan {:.3f} x {:.3f} ({:.1f} x {:.1f} deg), "
+			logger::info("[RayTracing] Spot shadow light {}{}: position ({:.0f} {:.0f} {:.0f}), radius {:.0f}, direction ({:.3f} {:.3f} {:.3f}), half widths tan {:.3f} x {:.3f} ({:.1f} x {:.1f} deg), "
 						 "falloff {:.2f}, from {}{}",
-				static_cast<const void*>(a_light), a_beam ? " (window beam)" : "", a_read.radius, a_read.dir[0], a_read.dir[1], a_read.dir[2], a_read.semiWidth,
+				static_cast<const void*>(a_light), a_beam ? " (window beam)" : "", a_read.pos[0], a_read.pos[1], a_read.pos[2], a_read.radius, a_read.dir[0], a_read.dir[1], a_read.dir[2], a_read.semiWidth,
 				a_read.semiHeight, std::atan(a_read.semiWidth) * 57.29578f, std::atan(a_read.semiHeight) * 57.29578f, a_read.falloff,
 				a_read.spotFromCamera ? "its shadow-map camera" : "the light's axes", a_read.spotValid ? "" : " -- invalid, left to the engine");
 		}
@@ -244,8 +244,10 @@ namespace RayTracingPointLights
 	{
 		slots_ = {};
 		motion_.fill(255);
+		slotBeams_.fill(nullptr);
 		tags_.clear();
 		maskEntries_.clear();
+		history_.clear();  // (46g)
 		published_ = false;
 	}
 
@@ -355,19 +357,46 @@ namespace RayTracingPointLights
 					++stats_.byReason[kRejectCategory];
 					continue;
 				}
+				if (a_config.excludedBeams && std::binary_search(a_config.excludedBeams->begin(), a_config.excludedBeams->end(), static_cast<const RE::BSLight*>(light))) {
+					++stats_.byReason[kRejectCategory];  // (46g) implausible: the engine's shadow map stays
+					continue;
+				}
 			}
+			// (46g) Stable selection: the smoothed intensity / radius decide (flickering candles, Inverse Square Lighting's radius
+			// following the fade), with hysteresis for a light that was tagged last frame.
+			const float rawIntensity = std::max({ r.color[0], r.color[1], r.color[2] }) * r.fade;
+			float smoothIntensity = rawIntensity;
+			bool wasTagged = false;
+			if (a_config.stable && !beam) {
+				auto& h = history_[light];
+				if (h.frame == 0 || a_frame - h.frame > 30u) {
+					h.intensity = rawIntensity;
+					h.radius = r.radius;
+					h.tagged = false;
+				} else if (h.frame != a_frame) {
+					h.intensity += (rawIntensity - h.intensity) * 0.1f;
+					h.radius = std::max(r.radius, h.radius * 0.98f);
+				}
+				wasTagged = h.tagged && a_frame - h.frame <= 2u;
+				h.frame = a_frame;
+				h.tagged = false;
+				smoothIntensity = h.intensity;
+				r.radius = h.radius;
+				r.invRadius = 1.0f / std::max(r.radius, 1.0f);
+			}
+			const float cutScale = wasTagged ? 0.8f : 1.0f;
 			const bool limits = !forced && !beam;
 			if (limits && r.lodDimmer < a_config.minLodDimmer) {
 				++stats_.byReason[kRejectFaded];
 				continue;
 			}
-			if (limits && (r.radius < a_config.minRadius || r.radius > a_config.maxRadius)) {
+			if (limits && (r.radius < a_config.minRadius * cutScale || r.radius > a_config.maxRadius)) {
 				++stats_.byReason[kRejectRadius];
 				continue;
 			}
-			const float intensity = std::max({ r.color[0], r.color[1], r.color[2] }) * r.fade;
+			const float intensity = smoothIntensity;
 			const float intensityBeforeFade = r.lodDimmer > 1e-4f ? intensity / r.lodDimmer : intensity;
-			if (!forced && intensityBeforeFade < a_config.minIntensity) {
+			if (!forced && intensityBeforeFade < a_config.minIntensity * cutScale) {
 				++stats_.byReason[kRejectIntensity];
 				continue;
 			}
@@ -448,6 +477,8 @@ namespace RayTracingPointLights
 				if (it != a_config.owners->end() && it->first == r.owner)
 					c.owner = it->second;
 			}
+			if (wasTagged && (r.radius < a_config.minRadius || intensityBeforeFade < a_config.minIntensity))
+				++stats_.kept;
 			candidates.push_back(c);
 			stats_.native += native ? 1 : 0;
 			stats_.forced += forced ? 1 : 0;
@@ -456,7 +487,9 @@ namespace RayTracingPointLights
 		Util::LightCensus::TrimClassifierCache(a_frame, 600);
 
 		// Merge: brightest first; a light within the merge distance of a group's centre joins it.
-		std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.intensity > b.intensity; });
+		std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+			return a.intensity > b.intensity || (a.intensity == b.intensity && a.light < b.light);  // (46g) a stable seed order
+		});
 		const double mergeSq = static_cast<double>(a_config.mergeDistance) * a_config.mergeDistance;
 		memberGroup.assign(candidates.size(), UINT32_MAX);
 		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
@@ -574,6 +607,7 @@ namespace RayTracingPointLights
 		}
 
 		// GPU records and tags.
+		slotBeams_.fill(nullptr);  // (46g)
 		std::uint32_t scan = 0;
 		const std::uint32_t tagFlags = (a_config.keepSSPLS ? kTagKeepSSPLS : 0u) | (a_config.split ? kTagSplit : 0u);
 		std::uint32_t clearanceBits;
@@ -614,6 +648,8 @@ namespace RayTracingPointLights
 				out.spot[3] = std::max(s.read.semiWidth, s.read.semiHeight);
 				std::memcpy(&out.info[2], &s.read.falloff, sizeof(float));
 				if (s.beam)
+					slotBeams_[group.slot] = s.light;  // (46g)
+				if (s.beam)
 					clearance = 0.0f;  // the light is outside the interior: nothing of its own is in the way
 				++stats_.spots;
 				stats_.beams += s.beam ? 1 : 0;
@@ -630,6 +666,10 @@ namespace RayTracingPointLights
 			const std::uint32_t g = memberGroup[i];
 			if (g == UINT32_MAX || groups[g].slot == UINT32_MAX)
 				continue;
+			if (a_config.stable) {
+				if (const auto it = history_.find(candidates[i].light); it != history_.end())
+					it->second.tagged = true;  // (46g) hysteresis next frame
+			}
 			const auto& c = candidates[i];
 			// (46c) Spot lights are not tagged: Lighting reads their shadow mask channel, which Ray Tracing writes (with the cone).
 			if (!c.spot) {
@@ -657,6 +697,9 @@ namespace RayTracingPointLights
 			}
 		}
 		std::sort(tags_.begin(), tags_.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+		// (46g) Lights not seen for a while leave the history.
+		if (a_frame % 300u == 0u)
+			std::erase_if(history_, [&](const auto& a_entry) { return a_frame - a_entry.second.frame > 600u; });
 		if (a_config.forced) {
 			for (const auto* light : *a_config.forced)
 				if (std::none_of(maskEntries_.begin(), maskEntries_.end(), [&](const MaskEntry& a_entry) { return a_entry.light == light; }))

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace RE
@@ -102,6 +103,12 @@ namespace RayTracingPointLights
 		// (46e) The characters in this frame's TLAS (owner reference -> key, sorted by pointer, Characters::Owners): a light
 		// carried by one of them (a torch in an NPC's hand) does not test that character's own body and gear.
 		const std::vector<std::pair<const void*, std::uint32_t>>* owners = nullptr;
+		// (46g) Stable selection: per light a smoothed intensity (EMA 0.1 per frame) and radius (rises at once, shrinks 2 % per
+		// frame) drive the rules, the merge and the GPU source; a light tagged last frame stays while it is above 80 % of the cuts.
+		bool stable = true;
+		// (46g) Window beams found implausible (almost every traced pixel of their cone blocked): no source, the engine's shadow
+		// map stays for them (sorted by pointer; null = none).
+		const std::vector<const RE::BSLight*>* excludedBeams = nullptr;
 	};
 
 	struct Stats
@@ -125,6 +132,7 @@ namespace RayTracingPointLights
 		std::uint32_t player = 0;        // (46d) the player's own lights among the sources
 		std::uint32_t effects = 0;       // (46d) spell / effect lights among the sources
 		std::uint32_t carried = 0;       // (46e) sources carried by a traced character (its own body is not tested)
+		std::uint32_t kept = 0;          // (46g) lights kept by the hysteresis (below the cut, tagged last frame)
 		float cpuMs = 0.0f;
 	};
 	inline constexpr const char* kRejectNames[8] = { "faded (lodDimmer)", "radius", "intensity", "distance", "outside traced area", "category",
@@ -152,6 +160,8 @@ namespace RayTracingPointLights
 		/// (46d) Per slot, how much of the denoiser's history to drop this frame (0 = keep it, 255 = none: a new source
 		/// in the slot, or a source that moved a long way since last frame -- a carried torch, a flying spell).
 		[[nodiscard]] const std::array<std::uint8_t, kMaxSources>& SlotMotion() const { return motion_; }
+		/// (46g) Per slot: the window beam light it holds this frame (null = none / not a beam).
+		[[nodiscard]] const std::array<const RE::BSLight*, kMaxSources>& SlotBeams() const { return slotBeams_; }
 
 	private:
 		std::vector<MaskEntry> maskEntries_;
@@ -164,7 +174,17 @@ namespace RayTracingPointLights
 		};
 		std::array<Slot, kMaxSources> slots_{};
 		std::array<std::uint8_t, kMaxSources> motion_{};
+		std::array<const RE::BSLight*, kMaxSources> slotBeams_{};  // (46g)
 		std::vector<std::pair<const RE::BSLight*, std::uint32_t>> tags_;  // sorted by pointer
+		// (46g) Per light: smoothed intensity / radius, the last frame it was seen and whether it was tagged then.
+		struct History
+		{
+			float intensity = 0.0f;
+			float radius = 0.0f;
+			std::uint32_t frame = 0;
+			bool tagged = false;
+		};
+		std::unordered_map<const RE::BSLight*, History> history_;
 		bool published_ = false;
 		Stats stats_{};
 	};

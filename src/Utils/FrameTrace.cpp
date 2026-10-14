@@ -357,6 +357,8 @@ namespace Util::FrameTrace
 				out << "#   descriptor publish, the RTAO list (rt_x_execute now also holds the first ExecuteCommandLists).\n";
 				out << "#   rt_pool_ms = render-thread pool upkeep (deferred frees, finished blocks, growth); rt_pool_sync_blocks = blocks created on the render\n";
 				out << "#   thread (loading / black screen only); rt_pool_mb = MB reserved; rt_pool_waits = allocations waiting for a new block; rt_pool_worker_ms = last block on the pool thread.\n";
+				out << "#   rt_pl_slot_changes / merged / rej_radius / rej_intensity / kept = point-light selection this frame (kept = held by the hysteresis);\n";
+				out << "#   rt_pl_churn = pixels whose traced light set changed (GPU, a few frames late, -1 = not known); rt_pl_beams_excluded = implausible window beams.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -382,7 +384,7 @@ namespace Util::FrameTrace
 				       "rtao_gpu_ms,rtao_filter_gpu_ms,rtao_sync_gpu_ms,rtao_rays,"
 				       "rt_black,rt_since_close_ms,rt_handoff,rt_held_ready,rt_held_pending,rt_e_collect_ms,rt_e_timestamps_ms,rt_e_reset_ms,rt_e_build_ms,rt_e_skin_ms,"
 				       "rt_e_close_ms,rt_e_execute_ms,rt_x_timestamps_ms,rt_x_ensure_ms,rt_x_publish_ms,rt_x_ao_ms,rt_pool_ms,rt_pool_sync_blocks,rt_pool_mb,rt_pool_waits,"
-				       "rt_pool_worker_ms,"
+				       "rt_pool_worker_ms,rt_pl_slot_changes,rt_pl_merged,rt_pl_rej_radius,rt_pl_rej_intensity,rt_pl_kept,rt_pl_churn,rt_pl_beams_excluded,"
 				       "cpu_top_features\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
@@ -420,6 +422,7 @@ namespace Util::FrameTrace
 						t.eCollect, t.eTimestamps, t.eReset, t.eBuild, t.eSkin, t.eClose, t.eExecute);
 					s += std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{:.1f},{},{:.3f}", t.xTimestamps, t.xEnsure, t.xPublish, t.xAo, t.poolMs, t.poolSyncBlocks,
 						t.poolMb, t.poolAllocFails, t.poolWorkerMs);
+					s += std::format(",{},{},{},{},{},{},{}", t.plSlotChanges, t.plMerged, t.plRejRadius, t.plRejIntensity, t.plKept, t.plChurn, t.plBeamsExcluded);
 					s += "," + a_row.cpuTop + "\n";
 					return s;
 				};

@@ -174,6 +174,15 @@ namespace RayTracingScene
 		return text.starts_with("textures\\masks\\") || text.find("\\textures\\masks\\") != std::string_view::npos || text.starts_with("masks\\");
 	}
 
+	bool Scene::IsTwoSided(const RE::BSGeometry* a_geometry)
+	{
+		if (!a_geometry)
+			return true;
+		const auto& runtime = const_cast<RE::BSGeometry*>(a_geometry)->GetGeometryRuntimeData();
+		auto* lighting = netimmerse_cast<RE::BSLightingShaderProperty*>(runtime.properties[RE::BSGeometry::States::kEffect].get());
+		return !lighting || lighting->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kTwoSided);
+	}
+
 	bool Scene::IsVegetation(RE::BSGeometry* a_geometry)
 	{
 		if (!a_geometry)
@@ -362,6 +371,10 @@ namespace RayTracingScene
 		if (handle != RayTracingRT::kInvalidBlas) {
 			a_cell.blas.push_back(handle);
 			a_cell.chunkGeometries.emplace_back(a_cell.chunkStart, end);
+			bool twoSided = false;  // (46g)
+			for (std::uint32_t g = a_cell.chunkStart; g < end && g < a_cell.geometries.size() && !twoSided; ++g)
+				twoSided = IsTwoSided(a_cell.geometries[g].get());
+			a_cell.chunkTwoSided.push_back(twoSided ? 1 : 0);
 		}
 		a_cell.chunkStart = end;
 		a_cell.current.reset();
@@ -1065,6 +1078,7 @@ namespace RayTracingScene
 			for (int c = 0; c < 3; ++c)
 				instance.m[r][c] = world.rotate.entry[r][c] * world.scale;
 		instance.category = a_shape.alpha ? RayTracingRT::kCategoryAlpha : a_category;
+		instance.twoSided = a_shape.alpha || a_shape.twoSided;  // (46g)
 		if (a_shape.alpha)
 			instance.alphaInfo = a_shape.info;
 		if (a_expected) {
@@ -1171,6 +1185,7 @@ namespace RayTracingScene
 			objectShape.geometry = RE::NiPointer<RE::BSGeometry>(shape);
 			objectShape.key = key;
 			objectShape.blas = it->second.blas;
+			objectShape.twoSided = IsTwoSided(shape);  // (46g)
 			entry->shapes.push_back(std::move(objectShape));
 		}
 
@@ -1724,6 +1739,7 @@ namespace RayTracingScene
 				for (std::size_t i = 0; cell->shown && i < cell->blas.size(); ++i) {
 					RayTracingRT::Instance instance{ cell->blas[i], x, y, 0.0 };
 					instance.category = RayTracingRT::kCategoryCell;
+					instance.twoSided = i >= cell->chunkTwoSided.size() || cell->chunkTwoSided[i] != 0;  // (46g)
 					if (a_expected && i < cell->chunkGeometries.size()) {
 						// (45f) The box of the live bound spheres of the shapes baked into this chunk.
 						const auto [first, end] = cell->chunkGeometries[i];

@@ -374,6 +374,7 @@ namespace RayTracingScene
 			bool registered = false;  // in the caster filter
 			bool ready = false;       // (45j) BLAS (and texture) ready: in the TLAS
 			bool shown = false;       // (46g) handed off: in the TLAS and (unless Foliage Both) out of the cascades
+			bool twoSided = false;    // (46g) drawn two-sided by the engine: its instance keeps triangle-cull-disable (beam rays cull)
 			bool foliage = false;     // (45j) a vegetation cut-out (Foliage setting)
 			// (45h) Alpha-tested: its texture and record (both released with the shape).
 			bool alpha = false;
@@ -408,6 +409,7 @@ namespace RayTracingScene
 			std::vector<RayTracingRT::BlasHandle> blas;
 			// (45f) Per BLAS: the range of `geometries` it was made from (for the self-check).
 			std::vector<std::pair<std::uint32_t, std::uint32_t>> chunkGeometries;
+			std::vector<std::uint8_t> chunkTwoSided;  // (46g) per BLAS: a two-sided shape is in it (keeps triangle-cull-disable)
 			std::uint32_t chunkStart = 0;  // first geometry of the chunk being filled
 			// (45j) Resumable capture: shapes of pending[cursor] already taken, and its 3D then.
 			std::uint32_t shapeSkip = 0;
@@ -511,6 +513,8 @@ namespace RayTracingScene
 		/// reference, or a plant word in its texture, its name or its model path. Such shapes are never
 		/// taken as opaque occluders (their cut-out is real), and they follow the Foliage setting.
 		static bool IsVegetation(RE::BSGeometry* a_geometry);
+		/// (46g) The engine draws it two-sided (BSLightingShaderProperty kTwoSided).
+		static bool IsTwoSided(const RE::BSGeometry* a_geometry);
 		[[nodiscard]] std::uint8_t AlphaKinds() const
 		{
 			return static_cast<std::uint8_t>((config_.foliage != FoliageMode::ShadowMap ? kAlphaFoliage : 0) | (config_.cutouts ? kAlphaCutouts : 0) |
