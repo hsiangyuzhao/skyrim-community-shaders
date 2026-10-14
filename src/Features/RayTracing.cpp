@@ -4127,6 +4127,10 @@ std::string RayTracing::DescribeForProfile() const
 	// (46d)
 	text += std::format(", player lights {}, spell / effect lights {}, plants block point lights outdoors {}", settings.PointLightsPlayer ? "on" : "off",
 		settings.PointLightsEffects ? "on" : "off", settings.PointLightsAlphaOutdoors ? "on" : "off");
+	// (46g)
+	static constexpr const char* kBeamCull[] = { "none", "faces toward the room", "faces away" };
+	text += std::format(", stable light selection {}, window beam culling {}, beam guard {}", settings.PointLightsStable ? "on" : "off",
+		kBeamCull[std::clamp(settings.PointLightsBeamCull, 0, 2)], settings.PointLightsBeamGuard ? "on" : "off");
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
 	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split" };
