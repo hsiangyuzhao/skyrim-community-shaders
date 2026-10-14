@@ -94,12 +94,10 @@ public:
 	//   ePresetF = 6 through ePresetO = 15   all "Reverts to default"
 	// and the programming guide states ePresetA through ePresetC are no longer available.
 	//
-	// Only kD and kF are offered in the UI. The NVIDIA App's Ray Reconstruction dropdown exposes
-	// nothing but Recommended and Preset F, which is the only signal available from outside
-	// NVIDIA about which models are worth running -- E in particular is exposed nowhere, and
-	// the header calling it "latest" says nothing about its cost. kDefault and kE keep their
-	// values so a saved profile is never silently remapped onto a different model; LoadSettings
-	// coerces them to kD.
+	// kD, kE and kF are offered in the UI (45k: E added on user request, so it can be compared
+	// in game; the NVIDIA App itself only exposes Recommended and F, and the header calling E
+	// "latest" says nothing about its cost). kDefault keeps its value so a saved profile is never
+	// silently remapped onto a different model; LoadSettings coerces it to kD.
 	//
 	// F is the DLSS 4.5 model. It is official as of the DLSS 310.9.1 / Streamline 2.14.1 SDKs
 	// shipped here: their sl_dlss_d.h calls ePresetF "Latest and default transformer model",

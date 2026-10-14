@@ -1306,8 +1306,8 @@ void Streamline::SetDLSSRROptions()
 	// This runs every frame, so log only on change. It is the only place the requested model is
 	// observable: the weights live in nvngx_dlssd.dll, and asking for a preset that DLL has no
 	// weights for falls back to its default without reporting anything. Read this line together
-	// with the "nvngx_dlssd.dll version" line Streamline logs at startup -- Preset F needs
-	// 310.7.12 or newer, and the shipped 310.7.0 predates it.
+	// with the "nvngx_dlssd.dll version" line Streamline logs at startup. The shipped DLL is
+	// 310.9.1, which has the weights for presets D, E and F.
 	static uint loggedPreset = static_cast<uint>(DLSSDModelPreset::kCount);
 	if (loggedPreset != globals::features::upscaling.settings.DLSSDPreset) {
 		loggedPreset = globals::features::upscaling.settings.DLSSDPreset;

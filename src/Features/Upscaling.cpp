@@ -338,20 +338,24 @@ void Upscaling::DrawUpscalingSettings()
 				if (auto _tt = Util::HoverTooltipWrapper())
 					ImGui::TextUnformatted("Swaps regular DLSS for Ray Reconstruction (RR), which also cleans up noisy reflections and lighting. Costs more GPU time than regular DLSS.");
 				if (settings.enableDLSSRR) {
-					// Only D and F are offered. The NVIDIA App's Ray Reconstruction dropdown exposes
-					// nothing but Recommended and Preset F, which is the only signal available from
-					// outside NVIDIA about which models are worth running at all.
+					// (45k) D, E and F are offered; the combo index maps onto the stable enum values.
 					const char* dlssdPresets[] = {
 						"D (previous default)",
+						"E (latest transformer, DoF guide)",
 						"F (DLSS 4.5, NVIDIA's current default)"
 					};
-					int dlssdPresetIndex = settings.DLSSDPreset == static_cast<uint>(DLSSDModelPreset::kF) ? 1 : 0;
+					static constexpr DLSSDModelPreset kDlssdChoices[] = { DLSSDModelPreset::kD, DLSSDModelPreset::kE, DLSSDModelPreset::kF };
+					int dlssdPresetIndex = 0;
+					for (int c = 0; c < 3; ++c) {
+						if (settings.DLSSDPreset == static_cast<uint>(kDlssdChoices[c]))
+							dlssdPresetIndex = c;
+					}
 					if (ImGui::Combo("DLSS RR Model Preset", &dlssdPresetIndex, dlssdPresets, IM_ARRAYSIZE(dlssdPresets)))
-						settings.DLSSDPreset = static_cast<uint>(dlssdPresetIndex == 1 ? DLSSDModelPreset::kF : DLSSDModelPreset::kD);
+						settings.DLSSDPreset = static_cast<uint>(kDlssdChoices[std::clamp(dlssdPresetIndex, 0, 2)]);
 
 					if (auto _tt = Util::HoverTooltipWrapper()) {
 						ImGui::TextUnformatted("Which Ray Reconstruction AI model to use. Switches instantly, so you can compare.");
-						ImGui::TextUnformatted("F = newest model and NVIDIA's default. D = the older model this mod used before.");
+						ImGui::TextUnformatted("F = newest model and NVIDIA's default. E = the transformer model the SDK calls latest (DoF guide). D = the older model this mod used before.");
 					}
 				}
 			}
@@ -921,11 +925,11 @@ void Upscaling::LoadSettings(json& o_json)
 		logger::warn("[Upscaling] Loaded DLSSPreset {} out of range, falling back to K ({})", settings.DLSSPreset, fallback);
 		settings.DLSSPreset = fallback;
 	}
-	// D and F are the only selectable Ray Reconstruction models. The enum keeps its original
-	// values so a saved profile is never silently remapped onto a different model; anything
-	// that is no longer offered is coerced to D, which is what the RR path ran hardcoded
-	// before the setting existed.
-	if (settings.DLSSDPreset != static_cast<uint>(DLSSDModelPreset::kD) &&
+	// D, E and F are the selectable Ray Reconstruction models (45k: E added). The enum keeps its
+	// original values so a saved profile is never silently remapped onto a different model;
+	// kDefault (not offered) is coerced to D, which is what the RR path ran hardcoded before
+	// the setting existed.
+	if (settings.DLSSDPreset != static_cast<uint>(DLSSDModelPreset::kD) && settings.DLSSDPreset != static_cast<uint>(DLSSDModelPreset::kE) &&
 		settings.DLSSDPreset != static_cast<uint>(DLSSDModelPreset::kF)) {
 		const auto fallback = static_cast<uint>(DLSSDModelPreset::kD);
 		logger::warn("[Upscaling] Loaded DLSSDPreset {} is not a selectable model, falling back to D ({})", settings.DLSSDPreset, fallback);
