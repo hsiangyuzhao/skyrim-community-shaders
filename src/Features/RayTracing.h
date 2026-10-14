@@ -46,6 +46,7 @@ public:
 			{ "One switch: on = ray-traced sun shadows, off = the game's shadows exactly",
 				"Static objects and landscape of the loaded cells",
 				"Characters, trees and grass keep their shadow-map shadows",
+				"Ray-traced point-light shadows outdoors and indoors (incl. window light beams)",
 				"Debug views: shadow source, RT vs shadow map, coverage" }
 		};
 	}
@@ -138,6 +139,11 @@ public:
 		bool PointLightsKeepSSPLS = false;   // Screen Space Point Light Shadows stay on as contact shadows for RT lights
 		float PointLightsSize = 6.0f;        // emitter radius (soft edges)
 		float PointLightsClearance = 32.0f;  // the ray stops this far before the light (its own fixture casts nothing)
+		// (46c) Interiors: the interior cell is captured and its point lights (and window beams) traced; no sun trace.
+		bool PointLightsInteriors = true;
+		int PointLightsPerPixelInterior = 4;    // K indoors: 1, 2 or 4
+		bool PointLightsWindowBeams = true;     // Window Shadows Ultimate's window beams traced (their shadow mask channel written)
+		bool PointLightsSkipShadowMaps = false; // the engine does not draw shadow maps for lights fully handled by RT (interiors)
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted
@@ -159,7 +165,12 @@ public:
 	virtual void SetupResources() override;
 	virtual void ClearShaderCache() override;
 	virtual void DataLoaded() override;
+	virtual void PostPostLoad() override;
 	virtual void Prepass() override;
+
+	/// (46c) The engine is about to draw this spot / omni light's shadow maps (BSShadowLight::RenderShadowmaps hook):
+	/// true = skip them (the light is fully handled by RT this frame and its mask channel will be written by RT).
+	bool SkipShadowMap(RE::BSShadowLight* a_light);
 
 	/// Deferred::Hooks::Main_RenderShadowMaps, before the engine draws any shadow map: decides
 	/// whether this frame's sun cascades leave out the covered casters.
@@ -312,6 +323,7 @@ private:
 		std::uint32_t combineFlags = 0;
 		std::uint32_t width = 0, height = 0;
 		bool writeSSS = false, debug = false, penumbra = false, spatial = false, half = false, sigma = false, sssNonRT = false;
+		bool interior = false;  // (46c) point lights only: no sun combine
 		float biasConstant = 0.0f, biasPerUnit = 0.0f;
 		float toSun[3]{};
 		double camera[3]{};
@@ -427,9 +439,61 @@ private:
 	bool EnsurePointDenoiser(std::uint32_t a_width, std::uint32_t a_height);
 	void ReleasePointDenoiser();
 	/// Selection + this frame's trace input (RunFrame, before the trace is recorded). False = no point lights this frame.
-	bool PreparePointLights(RayTracingRT::FrameInput& a_input, const float a_traceRect[4], double a_camX, double a_camY, double a_camZ, float a_sunStrength);
+	/// (46c) a_interior: K indoors, spot lights / window beams / forced sources, interior bounds for the beams' rays.
+	bool PreparePointLights(RayTracingRT::FrameInput& a_input, const float a_traceRect[4], double a_camX, double a_camY, double a_camZ, float a_sunStrength,
+		bool a_interior = false);
 	/// After the combine (FinishFrame): the denoiser, then the result bound for the pixel shaders.
 	void FinishPointLights();
 	/// Pixel shader slots t40 / t41 back to null (before any pass writes those textures, and when nothing was traced).
 	void UnbindPointLights();
+
+	// (46c) Interiors: the interior cell's capture, its point lights and window beams, and the engine's shadow maps.
+	struct alignas(16) PointMaskCB
+	{
+		struct Channel
+		{
+			float Pos[4];    // camera-relative light position, w source slot + 1 (0 = no traced result)
+			float Dir[4];    // spot direction, w falloff exponent
+			float Right[4];  // w tan half width
+			float Up[4];     // w tan half height
+			std::uint32_t Flags[4];  // x: kMask* bits
+		};
+		Channel Channels[4];
+	};
+	STATIC_ASSERT_ALIGNAS_16(PointMaskCB);
+	static constexpr std::uint32_t kMaskWrite = 1u, kMaskSpot = 2u, kMaskSkipped = 4u;  // PointMaskCS
+	/// Indoors this frame (an interior cell, Ray Tracing and its point lights on): RunInteriorFrame instead of the sun.
+	[[nodiscard]] bool InteriorWanted() const;
+	void RunInteriorFrame();
+	/// Switches the interior part off (not the rest of Ray Tracing) with a reason for the page.
+	void SwitchOffInteriors(std::string a_reason);
+	/// After the point-light denoiser (or without a trace: a_traced false): writes the shadow mask channels of the
+	/// engine shadow lights with a source (and of every light whose shadow map was not drawn).
+	void WritePointMask(bool a_traced);
+	std::unique_ptr<ConstantBuffer> pointMaskCB;
+	winrt::com_ptr<ID3D11ComputeShader> pointMaskCS;
+	bool interiorThisFrame = false;      // this frame's trace is an interior one
+	bool interiorTracedLastFrame = false;
+	bool interiorRequested = false;
+	std::string interiorOffReason;
+	const RE::TESObjectCELL* interiorCell = nullptr;  // the interior seen last (entry time)
+	std::int64_t interiorEntryQpc = 0;
+	float interiorReadyMs = -1.0f;       // from entering (or the loading screen closing) to the first traced frame
+	bool interiorReadyPending = false;
+	std::uint32_t maskChannelsWritten = 0;  // last frame
+	bool pointMaskDone = false;             // WritePointMask ran this frame
+	// Engine shadow maps left out (PointLightsSkipShadowMaps).
+	bool skipLatched = false;
+	std::vector<const RE::BSLight*> skipCandidates;  // last frame's engine shadow lights with a source (sorted)
+	struct SkippedMap
+	{
+		const RE::BSLight* light;
+		std::uint32_t channel;
+	};
+	std::vector<SkippedMap> skippedMaps;            // this frame
+	std::vector<const RE::BSLight*> skippedLights;  // this frame, sorted (the selection's forced sources)
+	std::uint32_t skippedLastFrame = 0;
+	std::uint64_t skippedTotal = 0;
+	std::uint64_t skipFallbackFrames = 0;           // frames whose skipped maps got only the fallback (no trace)
+	bool hooksInstalled = false;
 };

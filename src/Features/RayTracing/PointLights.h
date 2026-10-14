@@ -44,17 +44,32 @@ namespace RayTracingPointLights
 	// GpuSource::info[0] bits (TracePointLightsCS).
 	inline constexpr std::uint32_t kSourceISL = 1u;     // inverse-square attenuation (InverseSquareLighting)
 	inline constexpr std::uint32_t kSourceNative = 4u;  // holds an engine shadow-map light
-	inline constexpr std::uint32_t kSourceSpot = 8u;    // (46c) spot: spot[] = direction, cos(outer half angle)
+	inline constexpr std::uint32_t kSourceSpot = 8u;    // (46c) spot: spot[] = direction, tan of the larger half width; info[2] = falloff
+	inline constexpr std::uint32_t kSourceBeam = 16u;   // (46c) window beam: no attenuation in the ranking, ray ends at the interior's bounds
 
 	/// One shadow source as the trace reads it (StructuredBuffer, 64 bytes).
 	struct GpuSource
 	{
 		float posRadius[4];  // camera-relative position, radius (attenuation range)
 		float atten[4];      // inverse radius, ISL fade zone, ISL size bias, intensity (brightest channel x fade)
-		float spot[4];       // (46c) direction, cos(outer half angle); unused for points
-		std::uint32_t info[4];  // flags, ray end clearance (float bits), (46c) reserved x2
+		float spot[4];       // (46c) spot: direction (light to surface), tan of the larger half width; unused for points
+		std::uint32_t info[4];  // flags, ray end clearance (float bits), (46c) spot falloff exponent (float bits), reserved
 	};
 	static_assert(sizeof(GpuSource) == 64);
+
+	/// (46c) An engine shadow-map light with a source this frame (interiors): Ray Tracing writes its shadow mask
+	/// channel (RayTracing/PointMaskCS.hlsl) -- the traced visibility times the spot's cone where the pixel traced
+	/// the source; else the engine's value (or, when its shadow map was not drawn, the cone / 1).
+	struct MaskEntry
+	{
+		const RE::BSLight* light = nullptr;
+		std::uint32_t channel = 0;    // shadow mask channel (BSShadowLight::shadowLightIndex)
+		std::uint32_t source = 0;     // source slot + 1
+		bool spot = false;
+		float pos[3]{};               // camera-relative position of the light
+		float dir[3]{}, right[3]{}, up[3]{};  // spot axes (world)
+		float semiWidth = 1.0f, semiHeight = 1.0f, falloff = 1.0f;  // spot: tan of the half widths, mask falloff exponent
+	};
 
 	struct Config
 	{
@@ -69,6 +84,12 @@ namespace RayTracingPointLights
 		float minLodDimmer = 0.3f;
 		float clearance = 32.0f;      // ray end short of the light (its own fixture must not shadow it)
 		std::uint32_t classifyBudget = 6;   // new lights read by the classifier per frame (about 20-50 us each)
+		// (46c) Interiors: the engine's spot shadow lights take part (with their cone), and Window Shadows Ultimate's
+		// window beams when beams is on (no radius / distance / area limits: their light stands far outside).
+		bool interior = false;
+		bool beams = true;
+		// (46c) Engine shadow lights whose shadow map was not drawn this frame: always a source (sorted by pointer).
+		const std::vector<const RE::BSLight*>* forced = nullptr;
 	};
 
 	struct Stats
@@ -84,6 +105,11 @@ namespace RayTracingPointLights
 		std::uint32_t readErrors = 0;
 		std::uint32_t slotChanges = 0;   // sources that took a new slot this frame
 		std::uint32_t byReason[8]{};     // rejected: lodDimmer, radius, intensity, distance, outside, category, frustum, other
+		std::uint32_t beams = 0;         // (46c) window beams among the sources
+		std::uint32_t spots = 0;         // (46c) spot shadow lights among the sources (beams included)
+		std::uint32_t spotsInvalid = 0;  // (46c) spot shadow lights left to the engine: their cone could not be read
+		std::uint32_t forced = 0;        // (46c) lights whose shadow map was not drawn (always sources)
+		std::uint32_t forcedMissing = 0; // (46c) ... of which got no source (their mask channel gets the fallback)
 		float cpuMs = 0.0f;
 	};
 	inline constexpr const char* kRejectNames[8] = { "faded (lodDimmer)", "radius", "intensity", "distance", "outside traced area", "category",
@@ -106,8 +132,11 @@ namespace RayTracingPointLights
 		/// Forget every slot (feature off, loading screen, error).
 		void Clear();
 		[[nodiscard]] const Stats& GetStats() const { return stats_; }
+		/// (46c) This frame's engine shadow lights with a source (interiors only; empty outdoors).
+		[[nodiscard]] const std::vector<MaskEntry>& MaskEntries() const { return maskEntries_; }
 
 	private:
+		std::vector<MaskEntry> maskEntries_;
 		struct Slot
 		{
 			bool live = false;

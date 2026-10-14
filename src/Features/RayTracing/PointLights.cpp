@@ -38,7 +38,62 @@ namespace RayTracingPointLights
 			bool shadow = false;
 			bool directional = false;
 			bool used = false;  // LLF uploads it
+			// (46c) Spot shadow lights: the cone of their shadow map (the engine's spot mask: 1 - r^falloff, r = the
+			// projected distance from the axis, 1 at the frustum's half width).
+			bool spot = false;
+			bool spotValid = false;
+			bool spotFromCamera = false;
+			float dir[3]{}, right[3]{}, up[3]{};
+			float semiWidth = 0.0f, semiHeight = 0.0f, falloff = 1.0f;
 		};
+
+		bool Normalize3(float (&v)[3])
+		{
+			const float len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+			if (!std::isfinite(len) || len < 1e-4f)
+				return false;
+			for (auto& c : v)
+				c /= len;
+			return true;
+		}
+
+		/// (46c) The cone of a spot shadow light (BSShadowFrustumLight). Preferred: the camera its shadow map was
+		/// rendered with (axes: Gamebryo's x forward, y up, z right; frustum extents at unit distance); otherwise
+		/// the light's own axes and BSShadowFrustumLight's semi width / height. Falloff: BSShadowFrustumLight::falloff
+		/// (0x568, VR 0x5C8), 1 when unusable. SE/AE layout only (Ray Tracing is not available in VR).
+		void ReadSpotUnsafe(RE::BSShadowLight* a_light, RE::NiLight* a_niLight, LightRead& o)
+		{
+			const RE::NiMatrix3* rotate = &a_niLight->world.rotate;
+			float semiW = REL::RelocateMember<float>(a_light, 0x560, 0x5C0);
+			float semiH = REL::RelocateMember<float>(a_light, 0x564, 0x5C4);
+			const float falloff = REL::RelocateMember<float>(a_light, 0x568, 0x5C8);
+			if (!REL::Module::IsVR()) {
+				auto& descriptors = a_light->GetRuntimeData().shadowmapDescriptors;
+				if (!descriptors.empty()) {
+					if (auto* camera = descriptors[0].camera.get()) {
+						const auto& frustum = camera->GetRuntimeData2().viewFrustum;
+						const float w = std::max(std::abs(frustum.fLeft), std::abs(frustum.fRight));
+						const float h = std::max(std::abs(frustum.fTop), std::abs(frustum.fBottom));
+						if (!frustum.bOrtho && std::isfinite(w) && std::isfinite(h) && w > 0.01f && h > 0.01f && w < 50.0f && h < 50.0f) {
+							semiW = w;
+							semiH = h;
+							rotate = &camera->world.rotate;
+							o.spotFromCamera = true;
+						}
+					}
+				}
+			}
+			for (int r = 0; r < 3; ++r) {
+				o.dir[r] = rotate->entry[r][0];
+				o.up[r] = rotate->entry[r][1];
+				o.right[r] = rotate->entry[r][2];
+			}
+			o.semiWidth = semiW;
+			o.semiHeight = semiH;
+			o.falloff = (std::isfinite(falloff) && falloff > 0.0f && falloff <= 64.0f) ? falloff : 1.0f;
+			o.spotValid = std::isfinite(semiW) && std::isfinite(semiH) && semiW > 0.01f && semiH > 0.01f && semiW < 50.0f && semiH < 50.0f &&
+			              Normalize3(o.dir) && Normalize3(o.up) && Normalize3(o.right);
+		}
 
 		__declspec(noinline) void ReadLightUnsafe(RE::BSLight* a_light, LightRead& o)
 		{
@@ -60,8 +115,13 @@ namespace RayTracingPointLights
 			o.shadowIndex = d.shadowMaskIndex;
 			o.lodDimmer = a_light->lodDimmer;
 			o.shadow = a_light->IsShadowLight();
-			if (o.shadow)
-				o.directional = static_cast<RE::BSShadowLight*>(a_light)->IsDirectionalLight();
+			if (o.shadow) {
+				auto* shadowLight = static_cast<RE::BSShadowLight*>(a_light);
+				o.directional = shadowLight->IsDirectionalLight();
+				o.spot = !o.directional && shadowLight->IsSpotLight();
+				if (o.spot)
+					ReadSpotUnsafe(shadowLight, niLight, o);
+			}
 			const auto& p = niLight->world.translate;
 			o.pos[0] = p.x;
 			o.pos[1] = p.y;
@@ -124,6 +184,8 @@ namespace RayTracingPointLights
 			float intensity;  // brightest channel x fade (with lodDimmer)
 			float score;
 			bool native;
+			bool spot;   // (46c) a spot shadow light (own group, its cone)
+			bool beam;   // (46c) a window beam
 		};
 
 		struct Group
@@ -135,9 +197,24 @@ namespace RayTracingPointLights
 			float score = 0.0f;
 			const Candidate* strongest = nullptr;
 			bool native = false;
+			bool spot = false;  // (46c) never merged with anything
 			std::uint32_t first = 0;  // first member in the member list
 			std::uint32_t slot = UINT32_MAX;
 		};
+
+		/// (46c) Spot parameters logged once per light (the first 32): the cone has to match the engine's.
+		void LogSpot(const RE::BSLight* a_light, const LightRead& a_read, bool a_beam)
+		{
+			static std::vector<const RE::BSLight*> logged;
+			if (logged.size() >= 32 || std::find(logged.begin(), logged.end(), a_light) != logged.end())
+				return;
+			logged.push_back(a_light);
+			logger::info("[RayTracing] Spot shadow light {}{}: radius {:.0f}, direction ({:.3f} {:.3f} {:.3f}), half widths tan {:.3f} x {:.3f} ({:.1f} x {:.1f} deg), "
+						 "falloff {:.2f}, from {}{}",
+				static_cast<const void*>(a_light), a_beam ? " (window beam)" : "", a_read.radius, a_read.dir[0], a_read.dir[1], a_read.dir[2], a_read.semiWidth,
+				a_read.semiHeight, std::atan(a_read.semiWidth) * 57.29578f, std::atan(a_read.semiHeight) * 57.29578f, a_read.falloff,
+				a_read.spotFromCamera ? "its shadow-map camera" : "the light's axes", a_read.spotValid ? "" : " -- invalid, left to the engine");
+		}
 
 		std::int64_t Qpc()
 		{
@@ -161,6 +238,7 @@ namespace RayTracingPointLights
 	{
 		slots_ = {};
 		tags_.clear();
+		maskEntries_.clear();
 		published_ = false;
 	}
 
@@ -178,6 +256,7 @@ namespace RayTracingPointLights
 		const std::int64_t start = Qpc();
 		published_ = false;
 		tags_.clear();
+		maskEntries_.clear();
 		stats_ = {};
 		std::fill_n(o_sources, kMaxSources, GpuSource{});
 
@@ -235,32 +314,62 @@ namespace RayTracingPointLights
 				continue;
 			}
 			++stats_.used;
-			if (r.lodDimmer < a_config.minLodDimmer) {
+			// (46c) An engine shadow light whose shadow map was not drawn this frame: always a source (no other rule).
+			const bool forced = a_config.forced && r.shadow &&
+			                    std::binary_search(a_config.forced->begin(), a_config.forced->end(), static_cast<const RE::BSLight*>(light));
+			// (46c) Spot shadow lights: only indoors and only with a readable cone (outdoors they keep the engine's).
+			const bool spot = r.shadow && r.spot;
+			if (spot && a_config.interior)
+				LogSpot(light, r, r.radius > 10000.0f);
+			if (spot && (!a_config.interior || !r.spotValid)) {
+				stats_.spotsInvalid += a_config.interior ? 1 : 0;
+				++stats_.byReason[kRejectCategory];
+				continue;
+			}
+			// (46c) Window beams (Window Shadows Ultimate): huge spots outside the windows. Classified first: the
+			// radius / distance / area rules below do not apply to them.
+			Util::LightCensus::Category category = Util::LightCensus::Category::Unknown;
+			bool classified = false;
+			bool beam = false;
+			if (spot && r.radius > a_config.maxRadius) {
+				if (!Util::LightCensus::ClassifyCached(light, r.radius, a_frame, classifyBudget, category)) {
+					++stats_.pending;
+					continue;
+				}
+				classified = true;
+				beam = category == Util::LightCensus::Category::WindowBeam;
+				if (!beam || !a_config.beams) {
+					++stats_.byReason[kRejectCategory];
+					continue;
+				}
+			}
+			const bool limits = !forced && !beam;
+			if (limits && r.lodDimmer < a_config.minLodDimmer) {
 				++stats_.byReason[kRejectFaded];
 				continue;
 			}
-			if (r.radius < a_config.minRadius || r.radius > a_config.maxRadius) {
+			if (limits && (r.radius < a_config.minRadius || r.radius > a_config.maxRadius)) {
 				++stats_.byReason[kRejectRadius];
 				continue;
 			}
 			const float intensity = std::max({ r.color[0], r.color[1], r.color[2] }) * r.fade;
 			const float intensityBeforeFade = r.lodDimmer > 1e-4f ? intensity / r.lodDimmer : intensity;
-			if (intensityBeforeFade < a_config.minIntensity) {
+			if (!forced && intensityBeforeFade < a_config.minIntensity) {
 				++stats_.byReason[kRejectIntensity];
 				continue;
 			}
 			const double dx = r.pos[0] - a_camera[0], dy = r.pos[1] - a_camera[1], dz = r.pos[2] - a_camera[2];
 			const double distSq = dx * dx + dy * dy + dz * dz;
-			if (distSq > maxDistSq) {
+			if (limits && distSq > maxDistSq) {
 				++stats_.byReason[kRejectDistance];
 				continue;
 			}
-			if (r.pos[0] < a_rect[0] || r.pos[1] < a_rect[1] || r.pos[0] > a_rect[2] || r.pos[1] > a_rect[3]) {
+			if (limits && (r.pos[0] < a_rect[0] || r.pos[1] < a_rect[1] || r.pos[0] > a_rect[2] || r.pos[1] > a_rect[3])) {
 				++stats_.byReason[kRejectOutside];
 				continue;
 			}
 			// Off screen: its whole sphere outside one of the side / near planes.
-			{
+			if (limits) {
 				bool outside = false;
 				for (const auto& p : planes) {
 					const float d = p[0] * static_cast<float>(dx) + p[1] * static_cast<float>(dy) + p[2] * static_cast<float>(dz) + p[3];
@@ -278,14 +387,18 @@ namespace RayTracingPointLights
 			// the filters above leave only lit fixtures near the camera).
 			const bool native = r.shadow;
 			bool include = false;
-			Util::LightCensus::Category category = Util::LightCensus::Category::Unknown;
-			if (!Util::LightCensus::ClassifyCached(light, r.radius, a_frame, classifyBudget, category)) {
-				++stats_.pending;
-				continue;
+			if (!classified && !Util::LightCensus::ClassifyCached(light, r.radius, a_frame, classifyBudget, category)) {
+				if (!forced) {
+					++stats_.pending;
+					continue;
+				}
+				category = Util::LightCensus::Category::Unknown;
 			}
 			using C = Util::LightCensus::Category;
 			const bool window = category == C::WindowBeam || category == C::WindowGlow || category == C::WindowFill;
-			if (native)
+			if (forced || beam)
+				include = true;
+			else if (native)
 				include = a_config.native && !window && category != C::Player && category != C::Effect;  // omni / hemi / spot shadow lights
 			else
 				include = IncludedCategory(category);
@@ -304,9 +417,14 @@ namespace RayTracingPointLights
 			const float dist = static_cast<float>(std::sqrt(distSq));
 			const float cover = r.radius / std::max(dist, 1.0f);
 			c.score = intensity * std::min(cover * cover, 4.0f);
+			if (forced)
+				c.score = FLT_MAX;  // never capped
 			c.native = native;
+			c.spot = spot;
+			c.beam = beam;
 			candidates.push_back(c);
 			stats_.native += native ? 1 : 0;
+			stats_.forced += forced ? 1 : 0;
 		}
 		stats_.candidates = static_cast<std::uint32_t>(candidates.size());
 		Util::LightCensus::TrimClassifierCache(a_frame, 600);
@@ -318,8 +436,11 @@ namespace RayTracingPointLights
 		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
 			const auto& c = candidates[i];
 			std::uint32_t found = UINT32_MAX;
-			for (std::uint32_t g = 0; g < groups.size(); ++g) {
+			// (46c) Spot lights keep a source of their own (their cone and direction are theirs).
+			for (std::uint32_t g = 0; g < groups.size() && !c.spot; ++g) {
 				const auto& group = groups[g];
+				if (group.spot)
+					continue;
 				const double ex = group.pos[0] - c.pos[0], ey = group.pos[1] - c.pos[1], ez = group.pos[2] - c.pos[2];
 				if (ex * ex + ey * ey + ez * ez <= mergeSq) {
 					found = g;
@@ -335,6 +456,7 @@ namespace RayTracingPointLights
 				group.score = c.score;
 				group.strongest = &c;
 				group.native = c.native;
+				group.spot = c.spot;
 				groups.push_back(group);
 				memberGroup[i] = static_cast<std::uint32_t>(groups.size() - 1);
 			} else {
@@ -441,7 +563,18 @@ namespace RayTracingPointLights
 			out.atten[3] = group.intensity;
 			const bool isl = (s.read.flags & static_cast<std::uint32_t>(LightLimitFix::LightFlags::InverseSquare)) != 0;
 			out.info[0] = (isl ? kSourceISL : 0u) | (group.native ? kSourceNative : 0u);
-			const float clearance = std::min(a_config.clearance, group.radius * 0.5f);
+			float clearance = std::min(a_config.clearance, group.radius * 0.5f);
+			if (group.spot) {
+				// (46c) Spot: its cone (the trace takes the larger half width: the engine's mask is 0 beyond it).
+				out.info[0] |= kSourceSpot | (s.beam ? kSourceBeam : 0u);
+				std::copy_n(s.read.dir, 3, out.spot);
+				out.spot[3] = std::max(s.read.semiWidth, s.read.semiHeight);
+				std::memcpy(&out.info[2], &s.read.falloff, sizeof(float));
+				if (s.beam)
+					clearance = 0.0f;  // the light is outside the interior: nothing of its own is in the way
+				++stats_.spots;
+				stats_.beams += s.beam ? 1 : 0;
+			}
 			std::memcpy(&clearanceBits, &clearance, sizeof(clearanceBits));
 			out.info[1] = clearanceBits;
 			scan = std::max(scan, group.slot + 1);
@@ -452,10 +585,36 @@ namespace RayTracingPointLights
 			const std::uint32_t g = memberGroup[i];
 			if (g == UINT32_MAX || groups[g].slot == UINT32_MAX)
 				continue;
-			const std::uint32_t tag = ((groups[g].slot + 1) & kTagSourceMask) | (candidates[i].native ? kTagNative : 0u) | tagFlags;
-			tags_.emplace_back(candidates[i].light, tag);
+			const auto& c = candidates[i];
+			// (46c) Spot lights are not tagged: Lighting reads their shadow mask channel, which Ray Tracing writes (with the cone).
+			if (!c.spot) {
+				const std::uint32_t tag = ((groups[g].slot + 1) & kTagSourceMask) | (c.native ? kTagNative : 0u) | tagFlags;
+				tags_.emplace_back(c.light, tag);
+			}
+			// (46c) Interiors: every engine shadow light with a source gets its mask channel written.
+			if (a_config.interior && c.native && c.read.shadowIndex < 4) {
+				MaskEntry e;
+				e.light = c.light;
+				e.channel = c.read.shadowIndex;
+				e.source = groups[g].slot + 1;
+				e.spot = c.spot;
+				for (int k = 0; k < 3; ++k)
+					e.pos[k] = static_cast<float>(c.pos[k] - a_camera[k]);
+				std::copy_n(c.read.dir, 3, e.dir);
+				std::copy_n(c.read.right, 3, e.right);
+				std::copy_n(c.read.up, 3, e.up);
+				e.semiWidth = c.read.semiWidth;
+				e.semiHeight = c.read.semiHeight;
+				e.falloff = c.read.falloff;
+				maskEntries_.push_back(e);
+			}
 		}
 		std::sort(tags_.begin(), tags_.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+		if (a_config.forced) {
+			for (const auto* light : *a_config.forced)
+				if (std::none_of(maskEntries_.begin(), maskEntries_.end(), [&](const MaskEntry& a_entry) { return a_entry.light == light; }))
+					++stats_.forcedMissing;
+		}
 		stats_.cpuMs = static_cast<float>(QpcToMs(Qpc() - start));
 		return scan;
 	}

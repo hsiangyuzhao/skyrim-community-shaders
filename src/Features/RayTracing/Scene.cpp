@@ -159,6 +159,21 @@ namespace RayTracingScene
 		}
 	}
 
+	bool Scene::IsWindowMask(RE::BSGeometry* a_geometry)
+	{
+		if (!a_geometry)
+			return false;
+		const auto& runtime = a_geometry->GetGeometryRuntimeData();
+		auto* lighting = netimmerse_cast<RE::BSLightingShaderProperty*>(runtime.properties[RE::BSGeometry::States::kEffect].get());
+		char path[512];
+		if (!lighting || !ReadDiffusePath(lighting, path))
+			return false;
+		for (char* c = path; *c; ++c)
+			*c = *c == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
+		const std::string_view text(path);
+		return text.starts_with("textures\\masks\\") || text.find("\\textures\\masks\\") != std::string_view::npos || text.starts_with("masks\\");
+	}
+
 	bool Scene::IsVegetation(RE::BSGeometry* a_geometry)
 	{
 		if (!a_geometry)
@@ -561,6 +576,8 @@ namespace RayTracingScene
 		a_cell.geometries.emplace_back(a_shape);
 		IndexGeometry(a_shape, true);
 		a_cell.triangles += mesh.triangleCount;
+		if (a_cell.interior)
+			a_cell.AddBounds(a_shape->worldBound);  // (46c)
 		if (a_landscape)
 			++a_cell.landQuads;
 		else
@@ -705,7 +722,9 @@ namespace RayTracingScene
 			vegetation = IsVegetation(geometry);
 			if (o_foliage)
 				*o_foliage = vegetation;
-			if (a_alphaKinds & (vegetation ? kAlphaFoliage : kAlphaCutouts)) {
+			// (46c) Interiors: Window Shadows Ultimate's window masks always with their cut-out (the window pattern).
+			const bool windowMask = !vegetation && (a_alphaKinds & kAlphaMasks) && IsWindowMask(geometry);
+			if ((a_alphaKinds & (vegetation ? kAlphaFoliage : kAlphaCutouts)) || windowMask) {
 				AlphaSource source;
 				anyHit = std::isfinite(geometry->worldBound.radius) && geometry->worldBound.radius >= kAlphaMinRadius &&
 				         GetAlphaSource(geometry, source);
@@ -888,6 +907,11 @@ namespace RayTracingScene
 					IndexGeometry(shape, true);
 					a_cell.alphaShapes.push_back(std::move(alphaShape));
 					++a_cell.shapes;
+					if (a_cell.interior) {
+						a_cell.AddBounds(shape->worldBound);  // (46c)
+						if (IsWindowMask(shape))
+							++stats_.windowMasks;
+					}
 					return;
 				}
 				// Its cut-out cannot be traced: the 45g rules decide (opaque edge-only cut-out, or left out).
@@ -1282,6 +1306,7 @@ namespace RayTracingScene
 	bool Scene::Gather(RayTracingRT::Backend& a_backend, Cell& a_cell, std::int64_t a_deadline)
 	{
 		gatherBackend_ = &a_backend;
+		gatherInterior_ = a_cell.interior;  // (46c) window masks with their cut-out (AlphaKinds)
 		const std::int64_t start = Qpc();
 		auto& skipped = stats_.skipped;
 
@@ -1402,8 +1427,12 @@ namespace RayTracingScene
 		}
 
 		auto* tes = RE::TES::GetSingleton();
-		if (!tes || tes->interiorCell || !tes->gridCells || tes->gridCells->length == 0 || tes->gridCells->length > 63) {
-			if (!cells_.empty())
+		// (46c) Interiors: the player's interior cell is the one "grid cell" (when Ray Tracing's point lights want it).
+		auto* interior = tes ? tes->interiorCell : nullptr;
+		const bool interiorWanted = interior && interiorEnabled_;
+		if (!tes || (interior && !interiorWanted) ||
+			(!interior && (!tes->gridCells || tes->gridCells->length == 0 || tes->gridCells->length > 63))) {
+			if (!cells_.empty() || !objects_.empty())
 				ReleaseAll(a_backend);
 			stats_.lastGatherMs = 0.0f;
 			times_.update = 0.0f;
@@ -1411,14 +1440,19 @@ namespace RayTracingScene
 		}
 
 		// 1. Grid diff: cells that left the grid (or are no longer the same attached cell) go now.
-		auto* grid = tes->gridCells;
 		std::vector<RE::TESObjectCELL*> attached;
-		attached.reserve(static_cast<std::size_t>(grid->length) * grid->length);
-		for (std::uint32_t gx = 0; gx < grid->length; ++gx) {
-			for (std::uint32_t gy = 0; gy < grid->length; ++gy) {
-				auto* cell = grid->GetCell(gx, gy);
-				if (cell && cell->IsAttached() && cell->IsExteriorCell() && cell->GetCoordinates())
-					attached.push_back(cell);
+		if (interiorWanted) {
+			if (interior->IsAttached() && interior->IsInteriorCell())
+				attached.push_back(interior);
+		} else {
+			auto* grid = tes->gridCells;
+			attached.reserve(static_cast<std::size_t>(grid->length) * grid->length);
+			for (std::uint32_t gx = 0; gx < grid->length; ++gx) {
+				for (std::uint32_t gy = 0; gy < grid->length; ++gy) {
+					auto* cell = grid->GetCell(gx, gy);
+					if (cell && cell->IsAttached() && cell->IsExteriorCell() && cell->GetCoordinates())
+						attached.push_back(cell);
+				}
 			}
 		}
 		// (45e) Retired, not released: still traced this frame (the shadow map may have left their
@@ -1473,6 +1507,7 @@ namespace RayTracingScene
 				entry->formID = cell->formID;
 				entry->x = cell->x;
 				entry->y = cell->y;
+				entry->interior = cell->interior;  // (46c)
 				entry->seenFrame = a_frame - kSettleFrames;  // settled already: capture right away
 				entry->replaces = true;
 				replacements.push_back(std::move(entry));
@@ -1489,9 +1524,22 @@ namespace RayTracingScene
 			auto entry = std::make_unique<Cell>();
 			entry->cell = cell;
 			entry->formID = cell->GetFormID();
-			entry->x = cell->GetCoordinates()->cellX;
-			entry->y = cell->GetCoordinates()->cellY;
-			entry->seenFrame = a_frame;
+			if (cell->IsInteriorCell()) {
+				// (46c) Chunk origin: the 4096 square the player stands in (positions stay small floats).
+				entry->interior = true;
+				RE::NiPoint3 at{};
+				if (auto* player = RE::PlayerCharacter::GetSingleton())
+					at = player->GetPosition();
+				entry->x = std::isfinite(at.x) ? static_cast<std::int32_t>(std::floor(at.x / kCellUnits)) : 0;
+				entry->y = std::isfinite(at.y) ? static_cast<std::int32_t>(std::floor(at.y / kCellUnits)) : 0;
+				// A shorter settle (an interior arrives behind a loading screen); references whose 3D comes later
+				// make the cell dirty and it is captured again (as outdoors).
+				entry->seenFrame = a_frame - kSettleFrames + 10;
+			} else {
+				entry->x = cell->GetCoordinates()->cellX;
+				entry->y = cell->GetCoordinates()->cellY;
+				entry->seenFrame = a_frame;
+			}
 			cells_.push_back(std::move(entry));
 		}
 
@@ -1561,9 +1609,26 @@ namespace RayTracingScene
 				return a_cell.replacing && std::find(replaced.begin(), replaced.end(), a_cell.cell) != replaced.end();
 			});
 		}
+		stats_.interior = false;
+		stats_.interiorShapes = 0;
+		stats_.interiorTriangles = 0;
+		stats_.interiorGatherMs = 0.0f;
 		for (auto& cell : cells_) {
 			if (cell->replaces)
 				continue;  // counted once its old capture is gone
+			if (cell->interior) {
+				// (46c)
+				stats_.interior = true;
+				stats_.interiorShapes += cell->shapes;
+				stats_.interiorTriangles += cell->triangles;
+				stats_.interiorGatherMs += static_cast<float>(cell->gatherMs);
+				if (cell->hasBounds) {
+					for (int a = 0; a < 3; ++a) {
+						stats_.interiorBounds[a] = static_cast<float>(cell->boundsMin[a]);
+						stats_.interiorBounds[3 + a] = static_cast<float>(cell->boundsMax[a]);
+					}
+				}
+			}
 			++stats_.cellsTracked;
 			stats_.shapes += cell->shapes;
 			stats_.landQuads += cell->landQuads;
@@ -1695,6 +1760,9 @@ namespace RayTracingScene
 					o_refs.push_back(ref);
 		}
 		if constexpr (!kCapturePersistent)
+			return;
+		// (46c) An interior holds all of its references itself (the worldspace pointer may still name the last exterior).
+		if (a_cell->IsInteriorCell())
 			return;
 		// (45f) Persistent references of an exterior worldspace are held by its persistent ("sky")
 		// cell, not by the grid cell they stand in (CommonLib's TES::ForEachReferenceInRange walks
@@ -1960,12 +2028,52 @@ namespace RayTracingScene
 		DrainGraves(0.3);
 	}
 
+	bool Scene::GetInteriorBounds(double o_min[3], double o_max[3]) const
+	{
+		// (46c) The box of every interior capture traced this frame (a recapture and the one it replaces alike).
+		constexpr double kMargin = 256.0;
+		bool any = false;
+		for (const auto* list : { &cells_, &retiring_ }) {
+			for (const auto& cell : *list) {
+				if (!cell->interior || !cell->hasBounds)
+					continue;
+				for (int a = 0; a < 3; ++a) {
+					o_min[a] = any ? std::min(o_min[a], cell->boundsMin[a] - kMargin) : cell->boundsMin[a] - kMargin;
+					o_max[a] = any ? std::max(o_max[a], cell->boundsMax[a] + kMargin) : cell->boundsMax[a] + kMargin;
+				}
+				any = true;
+			}
+		}
+		return any;
+	}
+
 	bool Scene::GetLoadedRect(float o_rect[4], bool a_includeRetiring) const
 	{
+		// (46c) An interior: the box of what was captured (or, before anything is, a wide square around its origin).
+		for (const auto& cell : cells_) {
+			if (!cell->interior)
+				continue;
+			double lo[3], hi[3];
+			if (GetInteriorBounds(lo, hi)) {
+				o_rect[0] = static_cast<float>(lo[0]);
+				o_rect[1] = static_cast<float>(lo[1]);
+				o_rect[2] = static_cast<float>(hi[0]);
+				o_rect[3] = static_cast<float>(hi[1]);
+			} else {
+				constexpr float kReach = 65536.0f;
+				o_rect[0] = static_cast<float>(cell->x) * kCellUnits - kReach;
+				o_rect[1] = static_cast<float>(cell->y) * kCellUnits - kReach;
+				o_rect[2] = static_cast<float>(cell->x + 1) * kCellUnits + kReach;
+				o_rect[3] = static_cast<float>(cell->y + 1) * kCellUnits + kReach;
+			}
+			return true;
+		}
 		bool any = false;
 		std::int32_t minX = INT32_MAX, minY = INT32_MAX, maxX = INT32_MIN, maxY = INT32_MIN;
 		auto add = [&](const std::vector<std::unique_ptr<Cell>>& a_list) {
 			for (const auto& cell : a_list) {
+				if (cell->interior)
+					continue;  // (46c) an interior that is leaving
 				minX = std::min(minX, cell->x);
 				minY = std::min(minY, cell->y);
 				maxX = std::max(maxX, cell->x);

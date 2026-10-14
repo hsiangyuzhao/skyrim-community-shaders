@@ -272,6 +272,8 @@ namespace Util::FrameTrace
 				out << "# (46b) rt_pl_* = ray-traced point-light shadows: K (lights traced per pixel, 0 = not traced this frame), shadow sources traced,\n";
 				out << "#   candidate lights after the rules (before merging / the cap), rays per frame (read back a few frames late, -1 = not known),\n";
 				out << "#   GPU ms of the point-light trace (D3D12 queue, inside rt_gpu_ms) and of its denoiser (D3D11), CPU ms of the light selection.\n";
+				out << "# (46c) rt_interior = 0 outdoors / off, 1 indoors capturing, 2 indoors traced; rt_pl_beams = window beams traced; rt_sm_skipped =\n";
+				out << "#   engine shadow maps left out (Stop Engine Shadow Maps); rt_mask_channels = shadow mask channels written by RT; rt_interior_shapes = captured.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -292,7 +294,7 @@ namespace Util::FrameTrace
 				       "rt_quality,rt_denoiser_eff,rt_tile_gpu_ms,rt_filter_gpu_ms,rt_sigma_gpu_ms,rt_combine_gpu_ms,rt_sync_gpu_ms,rt_prep_gpu_ms,rt_trace_gpu_ms,"
 				       "rt_skin_draws,rt_skin_reused,rt_early,rt_early_ms,rt_x_retire_ms,rt_retired_n,rt_worker_release_ms,rt_queue_gap_gpu_ms,rt_still_reused,"
 				       "pacer_in_flight_after,lights_total,lights_shadow,lights_fill_est,lights_player,lights_max_cluster,lights_over4_share,llf_gpu_ms,"
-				       "rt_pl_k,rt_pl_sources,rt_pl_candidates,rt_pl_rays,rt_pl_gpu_ms,rt_pl_denoise_gpu_ms,rt_pl_cpu_ms,"
+				       "rt_pl_k,rt_pl_sources,rt_pl_candidates,rt_pl_rays,rt_pl_gpu_ms,rt_pl_denoise_gpu_ms,rt_pl_cpu_ms,rt_interior,rt_pl_beams,rt_sm_skipped,rt_mask_channels,rt_interior_shapes,"
 				       "cpu_top_features\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
@@ -318,6 +320,8 @@ namespace Util::FrameTrace
 					s += std::format(",{},{},{},{},{},{:.4f},{:.3f}", l.total, l.shadow, l.fill, l.player, l.maxCluster, l.over4Share, l.llfGpuMs);
 					// (46b)
 					s += std::format(",{},{},{},{},{:.3f},{:.3f},{:.3f}", t.plK, t.plSources, t.plCandidates, t.plRays, t.plGpuMs, t.plDenoiseGpuMs, t.plCpuMs);
+						// (46c)
+						s += std::format(",{},{},{},{},{}", t.rtInterior, t.plBeams, t.smSkipped, t.maskChannels, t.interiorShapes);
 					s += "," + a_row.cpuTop + "\n";
 					return s;
 				};

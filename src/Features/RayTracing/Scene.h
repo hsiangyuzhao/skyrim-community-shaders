@@ -127,6 +127,9 @@ namespace RayTracingScene
 		FoliageMode foliage = FoliageMode::ShadowMap;  // vegetation cut-outs (leaves, bushes)
 		bool cutouts = false;         // other cut-outs (fences, banners, grilles) traced with their cut-out
 		bool cutoutAsOpaque = true;   // (45g) large one-sided edge-only cut-outs (roof tiles) as opaque
+		// (46c) Interiors: Window Shadows Ultimate's window masks (alpha-tested shapes with a textures\masks\ texture: the
+		// window pattern of its beams) traced with their cut-out whatever the Cut-outs setting (needs the alpha pipeline).
+		bool windowMasks = false;
 		bool operator==(const SceneConfig&) const = default;
 	};
 
@@ -225,6 +228,13 @@ namespace RayTracingScene
 		std::uint32_t missedPending = 0;           // re-armed: cell still capturing, BLAS building, ... (total)
 		std::uint32_t missedRecaptures = 0;        // recaptures the self-check requested (total)
 		AlphaSceneStats alpha{};                   // (45h)
+		// (46c) The captured interior cell (Ray Tracing's point lights indoors).
+		bool interior = false;                     // an interior cell is captured / being captured
+		std::uint32_t interiorShapes = 0;          // its shapes (statics, furniture, alpha-tested) captured so far
+		std::uint64_t interiorTriangles = 0;
+		std::uint32_t windowMasks = 0;             // Window Shadows Ultimate mask shapes traced with their cut-out (total)
+		float interiorGatherMs = 0.0f;             // CPU of its capture in total
+		float interiorBounds[6]{};                 // world min xyz, max xyz of what was captured
 	};
 
 	class Scene
@@ -275,6 +285,14 @@ namespace RayTracingScene
 		/// True once at least one cell is captured with all its BLASes built.
 		[[nodiscard]] bool HasCoverage() const { return cellsReady_ > 0; }
 
+		/// (46c) Interiors: whether the player's interior cell may be captured (Ray Tracing's point lights indoors).
+		/// Off: Update drops an interior capture (and never starts one), as before 46c.
+		void SetInteriorEnabled(bool a_enabled) { interiorEnabled_ = a_enabled; }
+		[[nodiscard]] bool InteriorEnabled() const { return interiorEnabled_; }
+		/// (46c) The world box of the captured interior (min xyz, max xyz, with a margin); false when no interior is captured
+		/// or nothing of it yet.
+		bool GetInteriorBounds(double o_min[3], double o_max[3]) const;
+
 		[[nodiscard]] const Stats& GetStats() const { return stats_; }
 		void ResetPeaks() { stats_.maxGatherMs = 0.0f; }
 
@@ -289,7 +307,11 @@ namespace RayTracingScene
 		}
 		[[nodiscard]] const SceneConfig& GetConfig() const { return config_; }
 		/// (45j) Alpha-tested shapes may be traced with their cut-out (some category asks for it).
-		[[nodiscard]] bool AlphaWanted() const { return config_.foliage != FoliageMode::ShadowMap || config_.cutouts; }
+		/// (46c) Also the window masks of a captured interior.
+		[[nodiscard]] bool AlphaWanted() const
+		{
+			return config_.foliage != FoliageMode::ShadowMap || config_.cutouts || (config_.windowMasks && interiorEnabled_ && stats_.interior);
+		}
 		/// (45j) CPU split of the last Update / CollectInstances / DescribeMissedCasters / EndFrame.
 		[[nodiscard]] const FrameTimes& GetFrameTimes() const { return times_; }
 
@@ -372,6 +394,23 @@ namespace RayTracingScene
 			std::uint32_t landQuads = 0;
 			std::uint64_t triangles = 0;
 			double gatherMs = 0.0;
+			// (46c) An interior cell: x / y are only the origin of its chunks (the 4096 square the player entered in);
+			// its extent is the box of what was captured.
+			bool interior = false;
+			bool hasBounds = false;
+			double boundsMin[3]{}, boundsMax[3]{};
+			void AddBounds(const RE::NiBound& a_bound)
+			{
+				if (!std::isfinite(a_bound.radius) || a_bound.radius <= 0.0f || a_bound.radius > 100000.0f || !std::isfinite(a_bound.center.x) ||
+					!std::isfinite(a_bound.center.y) || !std::isfinite(a_bound.center.z))
+					return;
+				const double c[3] = { a_bound.center.x, a_bound.center.y, a_bound.center.z };
+				for (int a = 0; a < 3; ++a) {
+					boundsMin[a] = hasBounds ? std::min(boundsMin[a], c[a] - a_bound.radius) : c[a] - a_bound.radius;
+					boundsMax[a] = hasBounds ? std::max(boundsMax[a], c[a] + a_bound.radius) : c[a] + a_bound.radius;
+				}
+				hasBounds = true;
+			}
 		};
 
 		void Release(RayTracingRT::Backend& a_backend, Cell& a_cell);
@@ -435,14 +474,20 @@ namespace RayTracingScene
 		static const char* ShapeRejectReason(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, SkipCounts* o_counts,
 			MissReason* o_reason = nullptr, std::uint8_t a_alphaKinds = 0, bool* o_alpha = nullptr, bool* o_foliage = nullptr);
 		static constexpr std::uint8_t kAlphaFoliage = 1, kAlphaCutouts = 2;
+		static constexpr std::uint8_t kAlphaMasks = 4;  // (46c) Window Shadows Ultimate window masks (interiors)
+		/// (46c) A Window Shadows Ultimate window mask: its diffuse texture is under textures\masks\.
+		static bool IsWindowMask(RE::BSGeometry* a_geometry);
 		/// (45j) Vegetation (leaves, bushes, plants): tree-animated, owned by a tree / flora / grass
 		/// reference, or a plant word in its texture, its name or its model path. Such shapes are never
 		/// taken as opaque occluders (their cut-out is real), and they follow the Foliage setting.
 		static bool IsVegetation(RE::BSGeometry* a_geometry);
 		[[nodiscard]] std::uint8_t AlphaKinds() const
 		{
-			return static_cast<std::uint8_t>((config_.foliage != FoliageMode::ShadowMap ? kAlphaFoliage : 0) | (config_.cutouts ? kAlphaCutouts : 0));
+			return static_cast<std::uint8_t>((config_.foliage != FoliageMode::ShadowMap ? kAlphaFoliage : 0) | (config_.cutouts ? kAlphaCutouts : 0) |
+											 (config_.windowMasks && gatherInterior_ ? kAlphaMasks : 0));
 		}
+		bool gatherInterior_ = false;  // (46c) the cell being captured is an interior
+		bool interiorEnabled_ = false;  // (46c)
 		/// (45h) The shape's cut-out as the ray tracer needs it: the game's diffuse texture, threshold,
 		/// material alpha and texcoord transform; false when it cannot be traced (SEH-guarded).
 		struct AlphaSource

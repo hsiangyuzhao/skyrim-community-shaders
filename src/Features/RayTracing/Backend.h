@@ -164,8 +164,9 @@ namespace RayTracingRT
 		float extra[4];       // least traced share, least absolute contribution, least share of the sun light at a sunlit pixel, unused
 		float spheres[8];     // character bounds, as TraceConstants::spheres
 		float sun[4];         // to the sun (world axes), its strength (brightest channel; 0 = no sun gate)
+		float bounds[4];      // (46c) interior: camera-relative z min / max of the captured interior (with rect = its xy), z ray margin, w unused
 	};
-	static_assert(sizeof(PointTraceConstants) == 48 * 4);
+	static_assert(sizeof(PointTraceConstants) == 52 * 4);
 
 	/// (46b) This frame's point-light trace (FrameInput::pointLights; null = none, the 45 frame exactly).
 	struct PointLightInput
@@ -174,6 +175,7 @@ namespace RayTracingRT
 		const void* sources = nullptr;  // RayTracingPointLights::GpuSource[kMaxSources]
 		std::uint32_t sourceBytes = 0;  // of the whole array
 		std::uint32_t scan = 0;         // slots to scan (> 0)
+		bool alpha = false;             // (46c) alpha-tested instances (window masks) are tested against their cut-out (interiors)
 	};
 
 	/// (45f) What a TLAS instance holds, for the per-category counts and the self-check.
@@ -226,6 +228,8 @@ namespace RayTracingRT
 		bool deferWait = false;
 		// (46b) Point-light shadows traced right after the sun, same list and TLAS (null = none).
 		const PointLightInput* pointLights = nullptr;
+		// (46c) false = no sun trace (interiors): only the point lights are traced against the TLAS.
+		bool sun = true;
 	};
 
 	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
@@ -432,6 +436,10 @@ namespace RayTracingRT
 		// (46b) Point-light shadows. Their textures / buffers are created on first use only.
 		/// The point-light trace pipeline exists (the driver accepted it) and nothing of it failed.
 		[[nodiscard]] bool PointAvailable() const { return ready_ && !failed_ && pointPipeline_ && pointFault_.empty(); }
+		/// (46c) The point-light trace's alpha-tested variant (cut-outs such as Window Shadows Ultimate's window masks) exists.
+		[[nodiscard]] bool PointAlphaAvailable() const { return PointAvailable() && pointAlphaPipeline_ && AlphaAvailable(); }
+		/// (46c) The last point-light trace used the alpha-tested variant.
+		[[nodiscard]] bool PointAlphaLastFrame() const { return pointAlphaLastFrame_; }
 		/// Shared textures (sized like the shadow mask) for the point-light trace. False = not available
 		/// (PointFault() says why; the rest of Ray Tracing goes on).
 		bool EnsurePointTextures(std::uint32_t a_width, std::uint32_t a_height);
@@ -751,6 +759,8 @@ namespace RayTracingRT
 		static constexpr std::uint32_t kPointDescriptors = 4;
 		ComPtr<ID3D12RootSignature> pointRootSignature_;
 		ComPtr<ID3D12PipelineState> pointPipeline_;
+		ComPtr<ID3D12PipelineState> pointAlphaPipeline_;  // (46c) TracePointLightsCS with RT_ALPHA
+		bool pointAlphaLastFrame_ = false;
 		SharedTexture pointVis_, pointIdx_;
 		std::uint32_t pointWidth_ = 0, pointHeight_ = 0;
 		ComPtr<ID3D12Resource> pointCounter_;          // default heap, UAV: rays traced (monotonic, wraps)
@@ -766,7 +776,7 @@ namespace RayTracingRT
 		void SetPointFault(std::string a_reason);
 		bool EnsurePointBuffer(CommandContext& a_context, std::uint32_t a_bytes);
 		void WritePointDescriptors();
-		void RecordPointTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input);
+		void RecordPointTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame);
 
 		HANDLE fenceEvent_ = nullptr;
 		Stats stats_{};

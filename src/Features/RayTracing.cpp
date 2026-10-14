@@ -47,7 +47,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PointLightsNative,
 	PointLightsKeepSSPLS,
 	PointLightsSize,
-	PointLightsClearance)
+	PointLightsClearance,
+	PointLightsInteriors,
+	PointLightsPerPixelInterior,
+	PointLightsWindowBeams,
+	PointLightsSkipShadowMaps)
 
 namespace
 {
@@ -136,6 +140,39 @@ namespace
 	constexpr float kPointSunShare = 0.05f;          // at a sunlit pixel a point light under 5 % of the sun's light there is not traced
 	constexpr std::uint32_t kPointFlagCharacters = 1u, kPointFlagFirstPerson = 2u, kPointFlagCharCull = 4u;  // TracePointLightsCS
 	constexpr std::uint32_t kPointDenoiseHistory = 1u, kPointDenoiseDebug = 2u;                             // PointDenoiseCS
+	constexpr float kBeamRayMargin = 64.0f;  // (46c) a window beam's ray goes this far past the interior's box
+
+	// (46c) BSShadowFrustumLight / BSShadowParabolicLight::RenderShadowmaps (vfunc 0x0A): Ray Tracing may skip the shadow
+	// maps of lights it fully handles this frame (Point Lights > Stop Engine Shadow Maps, interiors only).
+	struct FrustumLightRenderShadowmaps
+	{
+		static void thunk(RE::BSShadowLight* a_light, void* a2)
+		{
+			if (globals::features::rayTracing.loaded && globals::features::rayTracing.SkipShadowMap(a_light))
+				return;
+			func(a_light, a2);
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+	/// The shadow mask channel of a shadow light (UINT32_MAX when unreadable).
+	std::uint32_t ReadShadowChannel(RE::BSShadowLight* a_light)
+	{
+		__try {
+			return a_light->GetRuntimeData().shadowLightIndex;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return UINT32_MAX;
+		}
+	}
+	struct ParabolicLightRenderShadowmaps
+	{
+		static void thunk(RE::BSShadowLight* a_light, void* a2)
+		{
+			if (globals::features::rayTracing.loaded && globals::features::rayTracing.SkipShadowMap(a_light))
+				return;
+			func(a_light, a2);
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
 
 	struct GpuBucketScope
 	{
@@ -287,6 +324,8 @@ RayTracingScene::SceneConfig RayTracing::SceneConfigFromSettings() const
 	config.foliage = alpha ? static_cast<RayTracingScene::FoliageMode>(std::clamp(settings.Foliage, 0, 2)) : RayTracingScene::FoliageMode::ShadowMap;
 	config.cutouts = alpha && settings.Cutouts;
 	config.cutoutAsOpaque = true;
+	// (46c) Window Shadows Ultimate's window masks indoors: with the alpha-tested point-light trace only.
+	config.windowMasks = alpha && backend.PointAlphaAvailable() && settings.PointLights && settings.PointLightsInteriors;
 	return config;
 }
 
@@ -474,10 +513,39 @@ void RayTracing::DataLoaded()
 	}
 }
 
+void RayTracing::PostPostLoad()
+{
+	// (46c) Inert unless Stop Engine Shadow Maps is on indoors (SkipShadowMap answers false otherwise). SE / AE only
+	// (Ray Tracing does not run in VR).
+	if (hooksInstalled || REL::Module::IsVR())
+		return;
+	stl::write_vfunc<0xA, FrustumLightRenderShadowmaps>(RE::VTABLE_BSShadowFrustumLight[0]);
+	stl::write_vfunc<0xA, ParabolicLightRenderShadowmaps>(RE::VTABLE_BSShadowParabolicLight[0]);
+	hooksInstalled = true;
+	logger::info("[RayTracing] Hooked the spot / omni shadow map rendering (used only with Stop Engine Shadow Maps)");
+}
+
+bool RayTracing::SkipShadowMap(RE::BSShadowLight* a_light)
+{
+	// Render thread, while the engine draws its shadow maps (after LatchFrame decided this frame).
+	if (!skipLatched || !a_light || skippedMaps.size() >= 4)
+		return false;
+	if (!std::binary_search(skipCandidates.begin(), skipCandidates.end(), static_cast<const RE::BSLight*>(a_light)))
+		return false;
+	const std::uint32_t channel = ReadShadowChannel(a_light);
+	if (channel > 3)
+		return false;
+	skippedMaps.push_back({ a_light, channel });
+	skippedLights.insert(std::upper_bound(skippedLights.begin(), skippedLights.end(), static_cast<const RE::BSLight*>(a_light)), a_light);
+	++skippedTotal;
+	return true;
+}
+
 void RayTracing::SetupResources()
 {
 	combineCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<CombineCB>());
 	pointDenoiseCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PointDenoiseCB>());  // (46b)
+	pointMaskCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PointMaskCB>());        // (46c)
 
 	// Screen Space Shadows hand-off reads its R8 texture through a UAV.
 	D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support{ DXGI_FORMAT_R8_UNORM, 0 };
@@ -498,6 +566,7 @@ void RayTracing::ClearShaderCache()
 	denoiseHalfVCS = nullptr;
 	sigmaPrepCS = nullptr;
 	pointDenoiseCS = nullptr;  // (46b)
+	pointMaskCS = nullptr;     // (46c)
 }
 
 ID3D11ComputeShader* RayTracing::GetShader(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name)
@@ -526,6 +595,11 @@ void RayTracing::Disable(Status a_status, std::string a_reason)
 	pointThisFrame = false;
 	pointHistoryValid = false;
 	UnbindPointLights();
+	// (46c) Nothing indoors either: the engine draws every shadow map again from the next frame on.
+	interiorThisFrame = false;
+	interiorTracedLastFrame = false;
+	skipLatched = false;
+	skipCandidates.clear();
 	RayTracingCasterFilter::Clear();
 	characters.ReleaseAll(backend);  // (45i) (a backend that is gone ignores the handles)
 	scene.ReleaseAll(backend);
@@ -886,6 +960,15 @@ void RayTracing::LatchFrame()
 	// (46b) Until this frame's trace: no point-light result for the pixel shaders (passes before the prepass, e.g.
 	// reflections, see last frame's Light Limit Fix tags; with t40 / t41 null they take the old path).
 	UnbindPointLights();
+	// (46c) Stop Engine Shadow Maps (interiors): the spot / omni shadow lights RT handled last frame are not drawn
+	// into shadow maps this frame -- only when this frame's interior trace is as certain as the sun's is below (a
+	// free D3D12 context, the interior captured, last frame traced indoors). Their mask channels are written by RT
+	// after the trace (or with the fallback, should it not run after all).
+	skippedMaps.clear();
+	skippedLights.clear();
+	skipLatched = settings.Enabled && settings.PointLights && settings.PointLightsInteriors && settings.PointLightsNative &&
+	              settings.PointLightsSkipShadowMaps && hooksInstalled && status == Status::Active && phase == Phase::Play && !loadingOpen.load() &&
+	              interiorTracedLastFrame && Util::IsInterior() && backend.HasFreeContext() && scene.HasCoverage() && !skipCandidates.empty();
 	auto* sky = globals::game::sky;
 	// (45k) Not during a loading screen or the warm-up after it (nor while the RT result still fades in).
 	const bool active = settings.Enabled && status == Status::Active && phase == Phase::Play && fade >= 1.0f &&
@@ -983,6 +1066,14 @@ void RayTracing::Prepass()
 	pointHistoryValid = pointHistoryValid && pointDenoised;
 	pointDenoised = false;
 	UnbindPointLights();
+	// (46c) This frame's shadow maps are drawn: the latch ends here (skippedMaps stays for this frame's mask write).
+	skipLatched = false;
+	interiorThisFrame = false;
+	interiorTracedLastFrame = false;  // set again by this frame's interior trace (FinishFrame)
+	skipCandidates.clear();           // likewise (the lights it handled: next frame's shadow maps may skip them)
+	pointMaskDone = false;
+	maskChannelsWritten = 0;
+	skippedLastFrame = static_cast<std::uint32_t>(skippedMaps.size());
 	// (45n) Whatever path this Prepass takes: an Early Prep context that the trace did not use is released
 	// (D3D12 signal only), and the frame-start flags end with this frame.
 	struct EarlyPrepEnd
@@ -996,6 +1087,17 @@ void RayTracing::Prepass()
 			rt->charactersUpdatedEarly = false;
 		}
 	} earlyPrepEnd{ this };
+	// (46c) A light whose shadow map was left out this frame always gets its mask channel written: by this frame's
+	// trace, or (no trace after all: error, switch-off) with the unshadowed fallback -- never the stale shadow map.
+	struct SkippedMapsEnd
+	{
+		RayTracing* rt;
+		~SkippedMapsEnd()
+		{
+			if (!rt->pending.active && !rt->skippedMaps.empty() && !rt->pointMaskDone)
+				rt->WritePointMask(false);
+		}
+	} skippedMapsEnd{ this };
 
 	if (!settings.Enabled) {
 		if (sssClaimed)
@@ -1044,6 +1146,7 @@ void RayTracing::Prepass()
 
 	cpuLast = {};
 	UpdatePhase();
+	scene.SetInteriorEnabled(InteriorWanted());  // (46c) also behind loading screens: an interior is captured there
 	try {
 		if (phase == Phase::Loading && backend.IsReady()) {
 			// (45k) Behind the loading screen: capture and build with a large budget, trace nothing. The
@@ -1091,6 +1194,8 @@ void RayTracing::FinishPrepass()
 	} catch (const std::exception& e) {
 		Disable(Status::Failed, std::format("exception: {}", e.what()));
 	}
+	if (!skippedMaps.empty() && !pointMaskDone)
+		WritePointMask(false);  // (46c) see Prepass
 	if (sssClaimed)
 		globals::features::screenSpaceShadows.DrawDeferred(nullptr, 0.0f, 0.0f, 0.0f);
 	sssClaimed = false;
@@ -1218,6 +1323,12 @@ void RayTracing::PublishCpuSplit()
 		detail.plGpuMs = stats.lastPointGpuMs;
 		detail.plDenoiseGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingPointDenoise);
 		detail.plCpuMs = settings.PointLights ? pointCpuMs : -1.0f;
+		// (46c)
+		detail.rtInterior = interiorThisFrame ? (pointThisFrame ? 2 : 1) : 0;
+		detail.plBeams = pointThisFrame ? ps.beams : 0;
+		detail.smSkipped = static_cast<std::uint32_t>(skippedMaps.size());
+		detail.maskChannels = maskChannelsWritten;
+		detail.interiorShapes = scene.GetStats().interior ? scene.GetStats().interiorShapes : 0;
 	}
 	detail.sssGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::ScreenSpaceShadows);
 	// (45k) A slow D3D12 record + submit names its slowest call in the log (at most every 2 s).
@@ -1259,6 +1370,17 @@ void RayTracing::RunFrame()
 		status = Status::Waiting;
 
 	auto* sky = globals::game::sky;
+	// (46c) Indoors with the point lights on: the interior's own frame (no sun).
+	scene.SetInteriorEnabled(InteriorWanted());
+	if (Util::IsInterior() && InteriorWanted()) {
+		try {
+			RunInteriorFrame();
+		} catch (const std::exception& e) {
+			pending.active = false;
+			SwitchOffInteriors(std::format("exception: {}", e.what()));
+		}
+		return;
+	}
 	if (Util::IsInterior() || !sky || sky->mode.get() != RE::Sky::Mode::kFull) {
 		status = Status::Inactive;
 		statusReason = Util::IsInterior() ? "interior" : "no sky";
@@ -1630,6 +1752,7 @@ void RayTracing::RunFrame()
 
 	// (45l) The D3D11 side of this frame: FinishFrame (now, or after the other prepasses with Late Sync).
 	pending.active = true;
+	pending.interior = false;
 	std::memcpy(pending.cbBytes.data(), &cb, sizeof(cb));
 	pending.combineFlags = combineFlags;
 	pending.width = width;
@@ -1722,6 +1845,32 @@ void RayTracing::FinishFrame()
 			Disable(Status::Failed, backend.LastError());
 		history4Valid = false;
 		sigmaHistoryValid = false;
+		return;
+	}
+	if (pending.interior) {
+		// (46c) Indoors: the point lights only (denoiser, pixel shader binding), then the engine shadow lights' mask channels.
+		if (pointThisFrame) {
+			try {
+				FinishPointLights();
+			} catch (const std::exception& e) {
+				SwitchOffPointLights(std::format("exception in the denoiser: {}", e.what()));
+			}
+		}
+		WritePointMask(pointThisFrame && pointDenoised);
+		interiorTracedLastFrame = pointThisFrame && pointDenoised;
+		if (interiorTracedLastFrame) {
+			for (const auto& entry : pointSelector.MaskEntries())
+				skipCandidates.push_back(entry.light);
+			std::sort(skipCandidates.begin(), skipCandidates.end());
+		}
+		std::copy_n(pending.viewProj, 16, prevViewProj);
+		std::copy_n(pending.viewProjUnjittered, 16, prevViewProjUnjittered);
+		std::copy_n(pending.camera, 3, prevCamera);
+		prevCameraValid = true;
+		combinedThisFrame = true;
+		if (pending.debug)
+			lastOverlayFrame = frameIndex - 1;
+		cpuLast.d3d11 += static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
 		return;
 	}
 	CombineCB cb;
@@ -1877,6 +2026,9 @@ void RayTracing::DrawDebugOverlay()
 {
 	if (!settings.Enabled || debugView == DebugView::Off || !combinedThisFrame || lastOverlayFrame + 1 != frameIndex)
 		return;
+	// (46c) Indoors only the point-light views have content (nothing of the sun was traced or combined).
+	if (interiorThisFrame && (debugView < DebugView::PLCandidates || !pointDenoised))
+		return;
 	auto* overlay = GetShader(overlayCS, L"Data\\Shaders\\RayTracing\\OverlayCS.hlsl", "OverlayCS");
 	auto* renderer = globals::game::renderer;
 	const auto& main = renderer->GetRuntimeData().renderTargets[globals::deferred->forwardRenderTargets[0]];
@@ -1929,6 +2081,10 @@ void RayTracing::UpdatePointLights()
 	else if (settings.PointLights && backend.IsReady() && !backend.PointAvailable())
 		SwitchOffPointLights("the GPU driver did not accept the point-light ray query shader");
 	pointRequested = settings.PointLights;
+	// (46c) Interiors switched on (again) by the user: an earlier automatic switch-off is forgotten.
+	if (settings.PointLightsInteriors && !interiorRequested)
+		interiorOffReason.clear();
+	interiorRequested = settings.PointLightsInteriors;
 	if (!settings.PointLights) {
 		pointSelector.Clear();
 		if (pointVis[0].texture)
@@ -1984,17 +2140,21 @@ bool RayTracing::EnsurePointDenoiser(std::uint32_t a_width, std::uint32_t a_heig
 	return true;
 }
 
-bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const float a_traceRect[4], double a_camX, double a_camY, double a_camZ, float a_sunStrength)
+bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const float a_traceRect[4], double a_camX, double a_camY, double a_camZ, float a_sunStrength,
+	bool a_interior)
 {
 	pointK = 0;
 	if (!settings.PointLights || !backend.PointAvailable() || !maskTemp)
 		return false;
-	if (!backend.EnsurePointTextures(maskDesc.Width, maskDesc.Height)) {
+	// (46c) Sized to the render area (2560x1440 behind DLSS Quality at 4K), not to the shadow mask (the output size): the
+	// trace and the pixel shaders only ever address the render area. Recreated when the render size changes.
+	const std::uint32_t width = std::max(a_input.renderWidth, 1u), height = std::max(a_input.renderHeight, 1u);
+	if (!backend.EnsurePointTextures(width, height)) {
 		if (!backend.PointFault().empty())
 			SwitchOffPointLights(backend.PointFault());
 		return false;
 	}
-	if (!EnsurePointDenoiser(maskDesc.Width, maskDesc.Height))
+	if (!EnsurePointDenoiser(width, height))
 		return false;
 
 	RayTracingPointLights::Config config;
@@ -2004,6 +2164,10 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	config.maxSources = static_cast<std::uint32_t>(std::clamp(settings.PointLightsMaxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources)));
 	config.maxDistance = settings.PointLightsDistance;
 	config.clearance = settings.PointLightsClearance;
+	// (46c) Indoors: spot shadow lights, window beams, the lights whose shadow map was left out this frame.
+	config.interior = a_interior;
+	config.beams = settings.PointLightsWindowBeams;
+	config.forced = a_interior && !skippedLights.empty() ? &skippedLights : nullptr;
 	const double camera[3] = { a_camX, a_camY, a_camZ };
 	const float worldRect[4] = { static_cast<float>(a_traceRect[0] + a_camX), static_cast<float>(a_traceRect[1] + a_camY),
 		static_cast<float>(a_traceRect[2] + a_camX), static_cast<float>(a_traceRect[3] + a_camY) };
@@ -2015,7 +2179,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	if (scan == 0)
 		return false;
 
-	const std::uint32_t K = static_cast<std::uint32_t>(ValidPointK(settings.PointLightsPerPixel));
+	const std::uint32_t K = static_cast<std::uint32_t>(ValidPointK(a_interior ? settings.PointLightsPerPixelInterior : settings.PointLightsPerPixel));
 	auto& c = pointInput.constants;
 	std::memcpy(c.invViewProj, a_input.constants.invViewProj, sizeof(c.invViewProj));
 	std::copy_n(a_input.constants.renderSize, 4, c.renderSize);
@@ -2041,9 +2205,22 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	std::copy_n(a_input.constants.spheres, 8, c.spheres);
 	std::copy_n(a_input.constants.toSun, 3, c.sun);
 	c.sun[3] = a_sunStrength;
+	// (46c) The interior's box (z; the rect is its xy): window beams' rays end where they leave it.
+	c.bounds[0] = -1e9f;
+	c.bounds[1] = 1e9f;
+	c.bounds[2] = kBeamRayMargin;
+	c.bounds[3] = 0.0f;
+	if (a_interior) {
+		double lo[3], hi[3];
+		if (scene.GetInteriorBounds(lo, hi)) {
+			c.bounds[0] = static_cast<float>(lo[2] - a_camZ);
+			c.bounds[1] = static_cast<float>(hi[2] - a_camZ);
+		}
+	}
 	pointInput.sources = pointSources.data();
 	pointInput.sourceBytes = static_cast<std::uint32_t>(sizeof(pointSources));
 	pointInput.scan = scan;
+	pointInput.alpha = a_interior && backend.PointAlphaAvailable();
 	a_input.pointLights = &pointInput;
 	pointK = K;
 	return true;
@@ -2097,6 +2274,345 @@ void RayTracing::FinishPointLights()
 	pointWrite ^= 1u;
 	pointHistoryValid = true;
 	pointDenoised = true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// (46c) Interiors
+// ---------------------------------------------------------------------------------------------
+
+bool RayTracing::InteriorWanted() const
+{
+	return settings.Enabled && settings.PointLights && settings.PointLightsInteriors && backend.IsReady() && backend.PointAvailable();
+}
+
+void RayTracing::SwitchOffInteriors(std::string a_reason)
+{
+	// Only the interior part: outdoors goes on. The page shows why; ticking the box again retries.
+	interiorOffReason = std::move(a_reason);
+	settings.PointLightsInteriors = false;
+	interiorRequested = false;
+	scene.SetInteriorEnabled(false);  // the next Update drops the interior capture
+	pointSelector.Clear();
+	pointThisFrame = false;
+	pointHistoryValid = false;
+	interiorTracedLastFrame = false;
+	skipCandidates.clear();
+	UnbindPointLights();
+	if (status == Status::Active && Util::IsInterior()) {
+		status = Status::Inactive;
+		statusReason = "interior";
+	}
+	logger::warn("[RayTracing] Interiors switched off: {}", interiorOffReason);
+}
+
+void RayTracing::RunInteriorFrame()
+{
+	// Indoors: no sun. The interior cell is captured (Scene, interior mode) and only the point lights are traced,
+	// then denoised and their engine shadow lights' mask channels written (FinishFrame, pending.interior).
+	interiorThisFrame = true;
+	auto* renderer = globals::game::renderer;
+	auto& mask = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kSHADOW_MASK];
+	auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+	if (!mask.texture || !mask.SRV || !depth.depthSRV) {
+		status = Status::Inactive;
+		statusReason = "shadow mask not available";
+		return;
+	}
+	D3D11_TEXTURE2D_DESC desc{};
+	mask.texture->GetDesc(&desc);
+	if (!EnsureD3D11Resources(desc))
+		return;
+	std::string reason;
+	if (!backend.EnsureTextures(desc.Width, desc.Height, reason)) {
+		Disable(Status::Failed, reason);
+		return;
+	}
+
+	// Entry time (the cell, or the loading screen closing after it): to the first traced frame.
+	auto* tes = RE::TES::GetSingleton();
+	const RE::TESObjectCELL* cell = tes ? tes->interiorCell : nullptr;
+	if (cell != interiorCell) {
+		interiorCell = cell;
+		interiorEntryQpc = Qpc();
+		interiorReadyPending = true;
+	}
+	if (phase == Phase::WarmUp && warmUpStart > interiorEntryQpc)
+		interiorEntryQpc = warmUpStart;
+
+	{
+		const auto& stats = backend.GetStats();
+		overVramBudget = stats.blasBytes + stats.scratchBytes > kAccelerationBudgetBytes;
+	}
+	scene.Update(backend, overVramBudget ? 0.0f : kCaptureBudgetMs, globals::state->frameCount);
+
+	const auto& fb = globals::game::frameBufferCached;
+	const float4 camera = fb.GetCameraPosAdjust(0);
+	const double camX = camera.x, camY = camera.y, camZ = camera.z;
+	float world[4];
+	if (!scene.HasCoverage() || !scene.GetLoadedRect(world, true)) {
+		status = Status::Waiting;
+		statusReason = "capturing the interior";
+		backend.Tick();
+		return;
+	}
+	const float traceRect[4] = { static_cast<float>(world[0] - camX), static_cast<float>(world[1] - camY), static_cast<float>(world[2] - camX),
+		static_cast<float>(world[3] - camY) };
+	const bool validate = frameIndex % 30 == 0;
+	scene.CollectInstances(instances, validate);
+
+	// Characters (as outdoors, within the interior's box).
+	const std::int64_t charactersStart = Qpc();
+	if (backend.HasPrepared())
+		backend.AbandonPrepared();
+	skinDraws.clear();
+	skinBones.clear();
+	if (settings.Characters && backend.SkinAvailable()) {
+		characters.Update(backend, world);
+		characters.CollectDraws(skinDraws, skinBones);
+	}
+	cpuLast.characters = static_cast<float>(static_cast<double>(Qpc() - charactersStart) * QpcMs());
+
+	const float2 renderSize = Util::ConvertToDynamic(globals::state->screenSize);
+	const std::uint32_t width = std::min<std::uint32_t>(static_cast<std::uint32_t>(renderSize.x), desc.Width);
+	const std::uint32_t height = std::min<std::uint32_t>(static_cast<std::uint32_t>(renderSize.y), desc.Height);
+	if (width == 0 || height == 0)
+		return;
+
+	const auto& invViewProj = fb.GetCameraViewProjInverse(0);
+	RayTracingRT::FrameInput input;
+	std::memcpy(input.constants.invViewProj, &invViewProj, sizeof(input.constants.invViewProj));
+	input.constants.renderSize[0] = static_cast<float>(width);
+	input.constants.renderSize[1] = static_cast<float>(height);
+	input.constants.renderSize[2] = 1.0f / static_cast<float>(width);
+	input.constants.renderSize[3] = 1.0f / static_cast<float>(height);
+	std::copy_n(traceRect, 4, input.constants.rect);
+	if (!skinDraws.empty()) {
+		const double cam[3] = { camX, camY, camZ };
+		characters.GetBounds(cam, &input.constants.spheres[0], &input.constants.spheres[4]);
+	}
+	input.renderWidth = width;
+	input.renderHeight = height;
+	input.cameraX = camX;
+	input.cameraY = camY;
+	input.cameraZ = camZ;
+	input.instances = &instances;
+	input.buildTriangleBudget = kBuildBudget;
+	input.validate = validate;
+	input.skinDraws = &skinDraws;
+	input.skinBones = &skinBones;
+	input.deferWait = true;
+	input.sun = false;
+	{
+		const std::int64_t pointStart = Qpc();
+		try {
+			if (!PreparePointLights(input, traceRect, camX, camY, camZ, 0.0f, true))
+				input.pointLights = nullptr;
+		} catch (const std::exception& e) {
+			input.pointLights = nullptr;
+			SwitchOffPointLights(std::format("exception in the light selection: {}", e.what()));
+		}
+		pointCpuMs = static_cast<float>(static_cast<double>(Qpc() - pointStart) * QpcMs());
+	}
+	if (!input.pointLights) {
+		// Nothing to trace (no shadow-casting light in view): the queued builds go on, nothing waits.
+		backend.BuildOnly(kBuildBudget, 16);
+		backend.Tick();
+		status = Status::Active;
+		statusReason = "interior, no shadow-casting light in view";
+		++frameIndex;
+		return;
+	}
+
+	// The constants PrepareCS and the point-light denoiser read (Common.hlsli).
+	CombineCB cb{};
+	std::memcpy(cb.InvViewProj, &invViewProj, sizeof(cb.InvViewProj));
+	std::copy_n(traceRect, 4, cb.Rect);
+	if (prevCameraValid) {
+		std::copy_n(prevViewProj, 16, cb.PrevViewProj);
+		cb.CameraDelta[0] = static_cast<float>(camX - prevCamera[0]);
+		cb.CameraDelta[1] = static_cast<float>(camY - prevCamera[1]);
+		cb.CameraDelta[2] = static_cast<float>(camZ - prevCamera[2]);
+	} else {
+		std::memcpy(cb.PrevViewProj, &fb.GetCameraViewProj(0), sizeof(cb.PrevViewProj));
+	}
+	const bool debug = debugView >= DebugView::PLCandidates && debugView <= DebugView::PLDenoised;
+	cb.Size[0] = width;
+	cb.Size[1] = height;
+	cb.Size[2] = static_cast<std::uint32_t>(debugView);
+	cb.Size[3] = frameIndex;
+	combineCB->Update(cb);
+
+	auto* prepare = GetShader(prepareCS, L"Data\\Shaders\\RayTracing\\PrepareCS.hlsl", "PrepareCS");
+	if (!prepare) {
+		Disable(Status::Failed, "a Ray Tracing shader did not compile (see the log)");
+		return;
+	}
+	GpuBucketScope gpuTimer(Util::GpuBucket::RayTracing);
+	auto* context = globals::d3d::context;
+	const std::int64_t d3d11Start = Qpc();
+	// Alpha copies (window masks) before the trace: the D3D12 queue waits for this.
+	if (scene.AlphaWanted() && backend.AlphaAvailable()) {
+		const bool rgba = backend.AlphaCopiesRgba();
+		if (alphaMaskCS && alphaMaskRgba != rgba)
+			alphaMaskCS = nullptr;
+		if (!alphaMaskCS) {
+			std::vector<std::pair<const char*, const char*>> defines;
+			if (rgba)
+				defines.emplace_back("ALPHA_RGBA", "");
+			alphaMaskCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\RayTracing\\AlphaMaskCS.hlsl", defines, "cs_5_0")));
+			alphaMaskRgba = rgba;
+		}
+		if (alphaMaskCS)
+			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
+	}
+	{
+		ID3D11Buffer* cbs[1] = { combineCB->CB() };
+		ID3D11ShaderResourceView* srvs[2] = { depth.depthSRV, mask.SRV };
+		ID3D11UnorderedAccessView* uavs[1] = { backend.DepthMaskUAV() };
+		context->CSSetConstantBuffers(0, 1, cbs);
+		context->CSSetShaderResources(0, 2, srvs);
+		context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+		context->CSSetShader(prepare, nullptr, 0);
+		context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+		ID3D11ShaderResourceView* nullSrvs[2]{};
+		ID3D11UnorderedAccessView* nullUavs[1]{};
+		context->CSSetShaderResources(0, 2, nullSrvs);
+		context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+		context->CSSetShader(nullptr, nullptr, 0);
+	}
+	const std::int64_t executeStart = Qpc();
+	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
+	const bool traced = backend.ExecuteFrame(input);
+	cpuLast.execute = static_cast<float>(static_cast<double>(Qpc() - executeStart) * QpcMs());
+	if (!traced && backend.HasFailed()) {
+		Disable(Status::Failed, backend.LastError());
+		return;
+	}
+	if (!traced) {
+		pointHistoryValid = false;
+		++frameIndex;
+		return;
+	}
+	pointThisFrame = backend.GetStats().pointTracedLastFrame;
+	pointSelector.Publish(pointThisFrame);
+	if (!pointThisFrame)
+		pointK = 0;
+
+	pending.active = true;
+	pending.interior = true;
+	std::memcpy(pending.cbBytes.data(), &cb, sizeof(cb));
+	pending.combineFlags = 0;
+	pending.width = width;
+	pending.height = height;
+	pending.writeSSS = pending.penumbra = pending.spatial = pending.half = pending.sigma = pending.sssNonRT = false;
+	pending.debug = debug;
+	pending.camera[0] = camX;
+	pending.camera[1] = camY;
+	pending.camera[2] = camZ;
+	std::memcpy(pending.viewProj, &fb.GetCameraViewProj(0), sizeof(pending.viewProj));
+	std::memcpy(pending.viewProjUnjittered, &fb.GetCameraViewProjUnjittered(0), sizeof(pending.viewProjUnjittered));
+
+	activeThisFrame = true;
+	status = Status::Active;
+	statusReason = "interior: point lights";
+	++frameIndex;
+	if (interiorReadyPending) {
+		interiorReadyPending = false;
+		interiorReadyMs = static_cast<float>(static_cast<double>(Qpc() - interiorEntryQpc) * QpcMs());
+		const auto& sc = scene.GetStats();
+		const auto& st = backend.GetStats();
+		logger::info("[RayTracing] Interior ready {:.0f} ms after entering: {} shapes, {:.2f} M triangles, {} BLAS, {:.0f} MB, capture {:.1f} ms CPU, {} window masks; "
+					 "box {:.0f} x {:.0f} x {:.0f}",
+			interiorReadyMs, sc.interiorShapes, static_cast<double>(sc.interiorTriangles) / 1e6, st.blasCount,
+			static_cast<double>(st.blasBytes + st.scratchBytes + st.tlasBytes) / (1024.0 * 1024.0), sc.interiorGatherMs, sc.windowMasks,
+			sc.interiorBounds[3] - sc.interiorBounds[0], sc.interiorBounds[4] - sc.interiorBounds[1], sc.interiorBounds[5] - sc.interiorBounds[2]);
+	}
+}
+
+void RayTracing::WritePointMask(bool a_traced)
+{
+	pointMaskDone = true;
+	auto* renderer = globals::game::renderer;
+	auto& mask = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kSHADOW_MASK];
+	auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+	if (!mask.texture || !mask.SRV || !depth.depthSRV || !pointMaskCB || !combineCB)
+		return;
+	D3D11_TEXTURE2D_DESC desc{};
+	mask.texture->GetDesc(&desc);
+	if (!maskTemp || desc.Width != maskDesc.Width || desc.Height != maskDesc.Height || desc.Format != maskDesc.Format) {
+		if (!EnsureD3D11Resources(desc))
+			return;
+	}
+	const bool rt = a_traced && pointThisFrame && pointDenoised && pointVis[0].texture;
+	PointMaskCB cb{};
+	std::uint32_t written = 0;
+	if (rt) {
+		for (const auto& e : pointSelector.MaskEntries()) {
+			auto& ch = cb.Channels[std::min<std::uint32_t>(e.channel, 3)];
+			std::copy_n(e.pos, 3, ch.Pos);
+			ch.Pos[3] = static_cast<float>(e.source);
+			std::copy_n(e.dir, 3, ch.Dir);
+			ch.Dir[3] = e.falloff;
+			std::copy_n(e.right, 3, ch.Right);
+			ch.Right[3] = e.semiWidth;
+			std::copy_n(e.up, 3, ch.Up);
+			ch.Up[3] = e.semiHeight;
+			ch.Flags[0] |= kMaskWrite | (e.spot ? kMaskSpot : 0u);
+		}
+	}
+	for (const auto& skipped : skippedMaps)
+		cb.Channels[std::min<std::uint32_t>(skipped.channel, 3)].Flags[0] |= kMaskWrite | kMaskSkipped;
+	for (const auto& ch : cb.Channels)
+		written += (ch.Flags[0] & kMaskWrite) ? 1 : 0;
+	if (!skippedMaps.empty() && !rt)
+		++skipFallbackFrames;
+	if (written == 0)
+		return;
+	auto* shader = GetShader(pointMaskCS, L"Data\\Shaders\\RayTracing\\PointMaskCS.hlsl", "PointMaskCS");
+	if (!shader) {
+		if (!skippedMaps.empty())
+			logger::error("[RayTracing] PointMaskCS did not compile: the shadow maps left out this frame cannot be replaced");
+		settings.PointLightsSkipShadowMaps = false;
+		SwitchOffInteriors("the shadow mask shader (PointMaskCS) did not compile");
+		return;
+	}
+	pointMaskCB->Update(cb);
+
+	// This frame's camera and render size (also when nothing was traced).
+	const float2 renderSize = Util::ConvertToDynamic(globals::state->screenSize);
+	const std::uint32_t width = std::min<std::uint32_t>(static_cast<std::uint32_t>(renderSize.x), desc.Width);
+	const std::uint32_t height = std::min<std::uint32_t>(static_cast<std::uint32_t>(renderSize.y), desc.Height);
+	if (width == 0 || height == 0)
+		return;
+	{
+		CombineCB c{};
+		std::memcpy(c.InvViewProj, &globals::game::frameBufferCached.GetCameraViewProjInverse(0), sizeof(c.InvViewProj));
+		c.Size[0] = width;
+		c.Size[1] = height;
+		c.Size[2] = static_cast<std::uint32_t>(debugView);
+		c.Size[3] = frameIndex;
+		combineCB->Update(c);
+	}
+	auto* context = globals::d3d::context;
+	const std::uint32_t latest = pointWrite ^ 1u;  // FinishPointLights flipped it after writing
+	ID3D11Buffer* cbs[2] = { combineCB->CB(), pointMaskCB->CB() };
+	ID3D11ShaderResourceView* srvs[4] = { mask.SRV, depth.depthSRV, rt ? pointVis[latest].srv.get() : nullptr, rt ? pointIdx[latest].srv.get() : nullptr };
+	ID3D11UnorderedAccessView* uavs[1] = { maskTempUAV.get() };
+	context->CSSetConstantBuffers(0, 2, cbs);
+	context->CSSetShaderResources(0, 4, srvs);
+	context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+	context->CSSetShader(shader, nullptr, 0);
+	context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullSrvs[4]{};
+	ID3D11UnorderedAccessView* nullUavs[1]{};
+	ID3D11Buffer* nullCbs[2]{};
+	context->CSSetShaderResources(0, 4, nullSrvs);
+	context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+	context->CSSetConstantBuffers(0, 2, nullCbs);
+	context->CSSetShader(nullptr, nullptr, 0);
+	D3D11_BOX box{ 0, 0, 0, width, height, 1 };
+	context->CopySubresourceRegion(mask.texture, 0, 0, 0, 0, maskTemp.get(), 0, &box);
+	maskChannelsWritten = written;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2345,10 +2861,10 @@ void RayTracing::DrawSettings()
 	if (ImGui::TreeNodeEx("Point Lights", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Ray-Traced Point-Light Shadows", &settings.PointLights);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Braziers, campfires, torches, candles, lanterns and the like cast ray-traced shadows (outdoors, inside the traced area).");
-			ImGui::Text("  Window lights, fill lights, magic / effect lights and the player's own light are left as they are.");
+			ImGui::Text("Braziers, campfires, torches, candles, lanterns and the like cast ray-traced shadows (outdoors inside the traced area, and indoors).");
+			ImGui::Text("  Window fill / glow lights, fill lights, magic / effect lights and the player's own light are left as they are.");
 			ImGui::Text("  For those lights Screen Space Point Light Shadows are replaced (where a pixel has its ray-traced result).");
-			ImGui::Text("Off: point lights exactly as before. Needs Ray Tracing on. Interiors follow in a later package.");
+			ImGui::Text("Off: point lights exactly as before. Needs Ray Tracing on.");
 		}
 		if (!settings.PointLights)
 			ImGui::BeginDisabled();
@@ -2373,7 +2889,7 @@ void RayTracing::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("The game's own shadow-casting lights (fireplaces, some campfires): their ray-traced shadow replaces the game's");
 			ImGui::Text("  shadow map in the lighting (default on). Off: they keep the game's shadow map.");
-			ImGui::Text("Not yet: stopping the game from drawing their shadow maps (saves time mostly indoors) comes with the interiors package.");
+			ImGui::Text("  Outdoors spot lights keep the game's shadow map; indoors their cone is taken from the game.");
 		}
 		ImGui::Checkbox("Keep Screen-Space Contact Shadows", &settings.PointLightsKeepSSPLS);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -2387,6 +2903,64 @@ void RayTracing::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Rays stop this far before the light, so the lamp, brazier bowl or torch holding it does not shadow its own light.");
 			ImGui::Text("  Too small: a dark ring or a black patch around a lamp. Too large: objects right next to a light cast nothing.");
+		}
+		// (46c) Interiors.
+		ImGui::SeparatorText("Interiors");
+		ImGui::Checkbox("Indoors Too", &settings.PointLightsInteriors);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): inside houses, inns, castles and dungeons the room itself (walls, furniture, clutter, people) is captured");
+			ImGui::Text("  when you come in (behind the loading screen) and the lights cast ray-traced shadows there too. There is no sun indoors.");
+			ImGui::Text("Off: indoors everything is exactly as before.");
+		}
+		if (!settings.PointLightsInteriors)
+			ImGui::BeginDisabled();
+		{
+			static constexpr int kKs[3] = { 1, 2, 4 };
+			const char* kNames[3] = { "1", "2", "4" };
+			int index = settings.PointLightsPerPixelInterior >= 4 ? 2 : (settings.PointLightsPerPixelInterior >= 2 ? 1 : 0);
+			if (ImGui::Combo("Lights per Pixel Indoors", &index, kNames, 3))
+				settings.PointLightsPerPixelInterior = kKs[std::clamp(index, 0, 2)];
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Indoors many lights overlap; 4 (default) catches nearly all of the light. 2 or 1 = cheaper.");
+		}
+		ImGui::Checkbox("Window Light Beams", &settings.PointLightsWindowBeams);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Window Shadows Ultimate's beams of sunlight through the windows (and the game's other spot lights indoors):");
+			ImGui::Text("  their shadow is ray traced, the window frames give the pattern on the floor. Off: they keep the game's shadow maps.");
+		}
+		ImGui::Checkbox("Stop Engine Shadow Maps for RT Lights", &settings.PointLightsSkipShadowMaps);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Off (default): the game still draws its shadow maps for the lights ray tracing handles (wasted work, but a safe fallback).");
+			ImGui::Text("On: indoors the game skips them (saves about 0.7-1.2 ms); ray tracing fills in their shadows. Whenever the ray-traced");
+			ImGui::Text("  result might be missing in a frame, the game draws them as usual.");
+		}
+		if (!settings.PointLightsInteriors)
+			ImGui::EndDisabled();
+		if (!interiorOffReason.empty()) {
+			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
+			ImGui::TextWrapped("Indoors was switched off automatically: %s", interiorOffReason.c_str());
+			ImGui::PopStyleColor();
+		}
+		if (settings.PointLights && settings.PointLightsInteriors && settings.Enabled && Util::IsInterior()) {
+			const auto& sc = scene.GetStats();
+			const auto& st = backend.GetStats();
+			const auto& ps = pointSelector.GetStats();
+			ImGui::Text("Interior: %s, %u shapes, %.2f M triangles, %u BLAS (%s), capture %.1f ms CPU in total", sc.interior ? (scene.HasCoverage() ? "captured" : "capturing") : "not captured",
+				sc.interiorShapes, static_cast<double>(sc.interiorTriangles) / 1e6, st.blasCount, Megabytes(st.blasBytes + st.scratchBytes + st.tlasBytes).c_str(),
+				sc.interiorGatherMs);
+			ImGui::Text("  Ready %s after entering; window masks %u; window beams %u, spot lights %u traced; mask channels written %u",
+				interiorReadyMs >= 0.0f ? std::format("{:.0f} ms", interiorReadyMs).c_str() : "-", sc.windowMasks, pointThisFrame ? ps.beams : 0u,
+				pointThisFrame ? ps.spots : 0u, maskChannelsWritten);
+			ImGui::Text("  Engine shadow maps left out: %u this frame (%llu so far, %llu frames with the fallback only)%s", skippedLastFrame,
+				static_cast<unsigned long long>(skippedTotal), static_cast<unsigned long long>(skipFallbackFrames),
+				ps.spotsInvalid ? std::format("; {} spot lights left to the game (cone unreadable)", ps.spotsInvalid).c_str() : "");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Window masks: Window Shadows Ultimate's window shapes traced with their cut-out (needs the alpha-tested trace).");
+				ImGui::Text("Mask channels: the game's shadow lights whose shadow (the shadow mask) ray tracing writes this frame.");
+				ImGui::Text("Fallback: a light whose shadow map was left out but whose ray-traced result was missing gets no shadow that frame (should stay 0).");
+				ImGui::Text("Box: %.0f x %.0f x %.0f units", sc.interiorBounds[3] - sc.interiorBounds[0], sc.interiorBounds[4] - sc.interiorBounds[1],
+					sc.interiorBounds[5] - sc.interiorBounds[2]);
+			}
 		}
 		if (!settings.PointLights)
 			ImGui::EndDisabled();
@@ -2671,6 +3245,10 @@ std::string RayTracing::DescribeForProfile() const
 		settings.PointLights ? "on" : "off", ValidPointK(settings.PointLightsPerPixel), settings.PointLightsMaxSources, settings.PointLightsDistance,
 		settings.PointLightsNative ? "RT" : "shadow map", settings.PointLightsKeepSSPLS ? "yes" : "no", settings.PointLightsSize, settings.PointLightsClearance,
 		pointSplit ? ", split screen" : "", pointOffReason.empty() ? "" : ", switched off: " + pointOffReason);
+	// (46c)
+	text += std::format(", indoors {} (K {}, window beams {}, stop engine shadow maps {}{})", settings.PointLightsInteriors ? "on" : "off",
+		ValidPointK(settings.PointLightsPerPixelInterior), settings.PointLightsWindowBeams ? "on" : "off", settings.PointLightsSkipShadowMaps ? "on" : "off",
+		interiorOffReason.empty() ? "" : ", switched off: " + interiorOffReason);
 	return text;
 }
 
@@ -2722,6 +3300,14 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "candidates", ps.candidates }, { "merged", ps.merged }, { "capped", ps.capped }, { "native_lights", ps.native }, { "gpu_ms", stats.lastPointGpuMs },
 			{ "rays_per_frame", stats.pointRaysPerFrame }, { "denoise_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingPointDenoise) },
 			{ "cpu_ms", pointCpuMs }, { "off_reason", pointOffReason } };
+		// (46c)
+		const auto& sc = scene.GetStats();
+		j["interior"] = { { "enabled", settings.PointLightsInteriors }, { "k", ValidPointK(settings.PointLightsPerPixelInterior) },
+			{ "window_beams", settings.PointLightsWindowBeams }, { "skip_shadow_maps", settings.PointLightsSkipShadowMaps }, { "this_frame", interiorThisFrame },
+			{ "captured", sc.interior }, { "shapes", sc.interiorShapes }, { "triangles", sc.interiorTriangles }, { "capture_cpu_ms", sc.interiorGatherMs },
+			{ "window_masks", sc.windowMasks }, { "ready_ms", interiorReadyMs }, { "beams", ps.beams }, { "spots", ps.spots }, { "spots_invalid", ps.spotsInvalid },
+			{ "mask_channels", maskChannelsWritten }, { "shadow_maps_skipped", skippedLastFrame }, { "shadow_maps_skipped_total", skippedTotal },
+			{ "fallback_frames", skipFallbackFrames }, { "off_reason", interiorOffReason } };
 	}
 	return j;
 }

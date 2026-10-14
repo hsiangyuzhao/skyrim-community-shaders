@@ -98,6 +98,10 @@ namespace Util::FrameTrace
 		uint32_t plSources = 0, plCandidates = 0;
 		int64_t plRays = -1;
 		float plGpuMs = -1, plDenoiseGpuMs = -1, plCpuMs = -1;
+		// (46c) Interiors: 0 outdoors / off, 1 indoors capturing, 2 indoors traced; window beams traced; engine shadow maps
+		// left out this frame; shadow mask channels written by RT; interior shapes captured.
+		int rtInterior = 0;
+		uint32_t plBeams = 0, smSkipped = 0, maskChannels = 0, interiorShapes = 0;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

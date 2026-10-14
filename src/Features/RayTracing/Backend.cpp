@@ -17,6 +17,8 @@
 #include "RayTracing/TraceShadowsCharCS.dxil.h"
 // (46b) Point-light shadows (TracePointLightsCS).
 #include "RayTracing/TracePointLightsCS.dxil.h"
+// (46c) The same with RT_ALPHA: alpha-tested instances (Window Shadows Ultimate's window masks) tested against their cut-out.
+#include "RayTracing/TracePointLightsAlphaCS.dxil.h"
 
 namespace RayTracingRT
 {
@@ -358,7 +360,9 @@ namespace RayTracingRT
 
 	bool Backend::CreatePointPipeline()
 	{
-		// Its own root signature: constants b0, TLAS t0, table (depth t1, sun visibility t2, PLVis u0, PLIdx u1), sources t3, ray counter u2.
+		// Its own root signature: constants b0, TLAS t0, table (depth t1, sun visibility t2, PLVis u0, PLIdx u1), sources t3, ray counter u2;
+		// (46c) the alpha-tested variant also: records t4, texcoords t5, table (copy layers t6, bindless game textures t0 space1), s0.
+		// 52 + 2 + 1 + 2 + 2 + 2 + 2 + 1 = 64 DWORDs (the limit).
 		D3D12_DESCRIPTOR_RANGE ranges[2]{};
 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		ranges[0].NumDescriptors = 2;
@@ -368,7 +372,17 @@ namespace RayTracingRT
 		ranges[1].NumDescriptors = 2;
 		ranges[1].BaseShaderRegister = 0;
 		ranges[1].OffsetInDescriptorsFromTableStart = 2;
-		D3D12_ROOT_PARAMETER params[5]{};
+		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
+		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		alphaRanges[0].NumDescriptors = 1;
+		alphaRanges[0].BaseShaderRegister = 6;
+		alphaRanges[0].OffsetInDescriptorsFromTableStart = 0;
+		alphaRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		alphaRanges[1].NumDescriptors = kAlphaTextureSlots;
+		alphaRanges[1].BaseShaderRegister = 0;
+		alphaRanges[1].RegisterSpace = 1;
+		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
+		D3D12_ROOT_PARAMETER params[8]{};
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
 		params[0].Constants.ShaderRegister = 0;
 		params[0].Constants.Num32BitValues = sizeof(PointTraceConstants) / 4;
@@ -386,9 +400,27 @@ namespace RayTracingRT
 		params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
 		params[4].Descriptor.ShaderRegister = 2;
 		params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[5].Descriptor.ShaderRegister = 4;
+		params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[6].Descriptor.ShaderRegister = 5;
+		params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[7].DescriptorTable.NumDescriptorRanges = 2;
+		params[7].DescriptorTable.pDescriptorRanges = alphaRanges;
+		params[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		D3D12_STATIC_SAMPLER_DESC sampler{};
+		sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+		sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+		sampler.MaxLOD = D3D12_FLOAT32_MAX;
+		sampler.ShaderRegister = 0;
+		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-		rootDesc.NumParameters = 5;
+		rootDesc.NumParameters = 8;
 		rootDesc.pParameters = params;
+		rootDesc.NumStaticSamplers = 1;
+		rootDesc.pStaticSamplers = &sampler;
 		ComPtr<ID3DBlob> blob, error;
 		HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
 		if (FAILED(hr) || FAILED(hr = device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&pointRootSignature_)))) {
@@ -405,6 +437,13 @@ namespace RayTracingRT
 			pointPipeline_.Reset();
 			pointRootSignature_.Reset();
 			return false;
+		}
+		// (46c) The alpha-tested variant: not fatal (window masks are then left out of the interior scene).
+		psoDesc.CS.pShaderBytecode = g_TracePointLightsAlphaCS;
+		psoDesc.CS.BytecodeLength = sizeof(g_TracePointLightsAlphaCS);
+		if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pointAlphaPipeline_)))) {
+			logger::warn("[RayTracing] The alpha-tested point-light ray query shader was rejected by the driver ({}); window masks unavailable", HrString(hr));
+			pointAlphaPipeline_.Reset();
 		}
 		// Null views until the textures exist.
 		auto cpu = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
@@ -555,7 +594,7 @@ namespace RayTracingRT
 		return true;
 	}
 
-	void Backend::RecordPointTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input)
+	void Backend::RecordPointTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame)
 	{
 		// (46b) After the sun trace, in the same list: depth stays readable, the point textures are in UAV state
 		// (the caller's barriers). The sources were copied into this context's upload buffer.
@@ -563,8 +602,12 @@ namespace RayTracingRT
 		const UINT queryBase = static_cast<UINT>(kContexts * 4 + a_index * 2);
 		if (timestampHeap_)
 			a_list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
+		// (46c) The alpha-tested variant only when asked (interiors), the frame holds alpha-tested instances and their
+		// records are in this context's copy (a_alphaFrame); every other frame runs exactly the 46b shader (cut-outs culled).
+		const bool alpha = pl.alpha && a_alphaFrame && pointAlphaPipeline_ && alphaUv_ && a_context.alphaInfoBuffer;
+		pointAlphaLastFrame_ = alpha;
 		a_list->SetComputeRootSignature(pointRootSignature_.Get());
-		a_list->SetPipelineState(pointPipeline_.Get());
+		a_list->SetPipelineState(alpha ? pointAlphaPipeline_.Get() : pointPipeline_.Get());
 		a_list->SetComputeRoot32BitConstants(0, sizeof(PointTraceConstants) / 4, &pl.constants, 0);
 		a_list->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
 		auto table = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
@@ -572,6 +615,13 @@ namespace RayTracingRT
 		a_list->SetComputeRootDescriptorTable(2, table);
 		a_list->SetComputeRootShaderResourceView(3, a_context.pointBuffer->GetGPUVirtualAddress());
 		a_list->SetComputeRootUnorderedAccessView(4, pointCounter_->GetGPUVirtualAddress());
+		if (alpha) {
+			a_list->SetComputeRootShaderResourceView(5, a_context.alphaInfoBuffer->GetGPUVirtualAddress());
+			a_list->SetComputeRootShaderResourceView(6, alphaUv_->GetGPUVirtualAddress());
+			auto alphaTable = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
+			alphaTable.ptr += static_cast<UINT64>(descriptorSize_) * (kAlphaDescriptorBase - 1);
+			a_list->SetComputeRootDescriptorTable(7, alphaTable);
+		}
 		a_list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
 		if (timestampHeap_)
 			a_list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
@@ -631,6 +681,8 @@ namespace RayTracingRT
 		pointFrame_ = 0;
 		pointFault_.clear();
 		pointPipeline_.Reset();
+		pointAlphaPipeline_.Reset();
+		pointAlphaLastFrame_ = false;
 		pointRootSignature_.Reset();
 		depthMask_ = {};
 		visibility_ = {};
@@ -1723,30 +1775,35 @@ namespace RayTracingRT
 
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
 		traceList->SetDescriptorHeaps(1, heaps);
-		traceList->SetComputeRootSignature(rootSignature_.Get());
-		// (45i) The character variants only on frames with character instances: every other frame
-		// runs exactly the 45h pipelines.
-		const bool characterFrame = characterInstances > 0;
-		if (characterFrame)
-			traceList->SetPipelineState(alphaFrame ? charAlphaPipeline_.Get() : charPipeline_.Get());
-		else
-			traceList->SetPipelineState(alphaFrame ? alphaPipeline_.Get() : pipeline_.Get());
-		traceList->SetComputeRoot32BitConstants(0, kRootConstants, &a_input.constants, 0);
-		traceList->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
-		traceList->SetComputeRootDescriptorTable(2, descriptorHeap_->GetGPUDescriptorHandleForHeapStart());
-		if (alphaFrame) {
-			traceList->SetComputeRootShaderResourceView(3, context.alphaInfoBuffer->GetGPUVirtualAddress());
-			traceList->SetComputeRootShaderResourceView(4, alphaUv_->GetGPUVirtualAddress());
-			auto table = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
-			table.ptr += static_cast<UINT64>(descriptorSize_) * (kAlphaDescriptorBase - 1);
-			traceList->SetComputeRootDescriptorTable(5, table);
+		if (a_input.sun) {
+			traceList->SetComputeRootSignature(rootSignature_.Get());
+			// (45i) The character variants only on frames with character instances: every other frame
+			// runs exactly the 45h pipelines.
+			const bool characterFrame = characterInstances > 0;
+			if (characterFrame)
+				traceList->SetPipelineState(alphaFrame ? charAlphaPipeline_.Get() : charPipeline_.Get());
+			else
+				traceList->SetPipelineState(alphaFrame ? alphaPipeline_.Get() : pipeline_.Get());
+			traceList->SetComputeRoot32BitConstants(0, kRootConstants, &a_input.constants, 0);
+			traceList->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
+			traceList->SetComputeRootDescriptorTable(2, descriptorHeap_->GetGPUDescriptorHandleForHeapStart());
+			if (alphaFrame) {
+				traceList->SetComputeRootShaderResourceView(3, context.alphaInfoBuffer->GetGPUVirtualAddress());
+				traceList->SetComputeRootShaderResourceView(4, alphaUv_->GetGPUVirtualAddress());
+				auto table = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
+				table.ptr += static_cast<UINT64>(descriptorSize_) * (kAlphaDescriptorBase - 1);
+				traceList->SetComputeRootDescriptorTable(5, table);
+			}
+			traceList->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
 		}
-		traceList->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
 		if (pointFrame) {
 			// (46b) The point lights read the sun's result (sunlit pixels skip weak point lights).
+			// (46c) Without a sun trace (interiors) the texture is only transitioned; the shader does not read it (no sun gate).
 			D3D12_RESOURCE_BARRIER toRead = Transition(visibility_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 			traceList->ResourceBarrier(1, &toRead);
-			RecordPointTrace(traceList, context, index, a_input);
+			RecordPointTrace(traceList, context, index, a_input, alphaFrame);
+		} else {
+			pointAlphaLastFrame_ = false;
 		}
 
 		D3D12_RESOURCE_BARRIER post[4] = {

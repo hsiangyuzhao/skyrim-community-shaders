@@ -269,10 +269,25 @@ add_custom_command(
     COMMENT "Compiling Ray Tracing DXIL (TracePointLightsCS, cs_6_5)"
     VERBATIM
 )
+# (46c) The same with RT_ALPHA: alpha-tested instances (window masks) tested against their cut-out.
+set(CS_RT_POINT_ALPHA_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/TracePointLightsAlphaCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_POINT_ALPHA_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -D
+        RT_ALPHA=1 -Fh "${CS_RT_POINT_ALPHA_SHADER_HEADER}" -Vn
+        g_TracePointLightsAlphaCS "${CS_RT_POINT_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_POINT_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (TracePointLightsCS with RT_ALPHA, cs_6_5)"
+    VERBATIM
+)
 target_sources(
     "${PROJECT_NAME}"
     PRIVATE
         "${CS_RT_POINT_SHADER_HEADER}"
+        "${CS_RT_POINT_ALPHA_SHADER_HEADER}"
         "${CS_RT_SHADER_HEADER}"
         "${CS_RT_ALPHA_SHADER_HEADER}"
         "${CS_RT_CHAR_SHADER_HEADER}"

@@ -21,8 +21,14 @@
 // Rays: the scene (instance mask 0x01, every opaque instance) and, when characters are in the TLAS, a
 // second ray against them (masks 0x06, TMin = Bias.z against their own coarse polygons, as the sun's).
 // Non-opaque (alpha-tested) instances are culled: leaves and cut-outs cast no point-light shadow in 46b.
+// (46c) With RT_ALPHA (interiors) they are tested against their cut-out instead (Window Shadows Ultimate's
+// window masks: the window pattern of its beams), at most kAlphaCandidateBudget candidates per ray.
 // The ray ends the source's clearance short of the light: the light's own fixture (lantern frame,
 // brazier bowl, the torch in a hand) does not shadow it.
+// (46c) Spot sources (the engine's spot shadow lights indoors): only surfaces inside the cone are candidates,
+// weighted like the engine's spot mask (1 - (tan angle / tan half width)^falloff). Window beams (Window Shadows
+// Ultimate's huge spots far outside the windows): no attenuation in the ranking, no clearance, and the ray stops
+// where it leaves the captured interior (Rect xy, Bounds z): nothing beyond it is in the scene.
 
 struct PLConstants
 {
@@ -35,14 +41,15 @@ struct PLConstants
 	                                 // z least share of the sun's light at a sunlit pixel (the sun gate)
 	float4 Spheres[2];               // character bounds (camera-relative xyz, radius; 0 = none): [0] the player, [1] the others
 	float4 Sun;                      // xyz to the sun (world axes), w its strength (brightest channel; 0 = no sun gate)
+	float4 Bounds;                   // (46c) x / y camera-relative z min / max of the interior, z ray margin past it, w unused
 };
 
 struct PLSource
 {
 	float4 PosRadius;  // camera-relative position, radius
 	float4 Atten;      // inverse radius, ISL fade zone, ISL size bias, intensity
-	float4 Spot;       // (46c) direction, cos(outer half angle)
-	uint4 Info;        // flags, clearance (float bits), reserved x2
+	float4 Spot;       // (46c) spot: direction (light to surface, world axes), tan of the larger half width
+	uint4 Info;        // flags, clearance (float bits), (46c) spot falloff exponent (float bits), reserved
 };
 
 ConstantBuffer<PLConstants> C : register(b0);
@@ -58,10 +65,80 @@ static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the cha
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
 static const uint kFlagCharCull = 4u;     // the character ray only where the segment passes a character's bounds
 static const uint kSourceISL = 1u;
+static const uint kSourceSpot = 8u;   // (46c) RayTracingPointLights::kSourceSpot
+static const uint kSourceBeam = 16u;  // (46c) RayTracingPointLights::kSourceBeam
 static const uint kSceneMask = 0x01u;
 static const uint kCharacterMasks = 0x06u;
 static const float kFirstPersonNear = 96.0;
 static const float kScaledUnitsSq = 0.8 * 70.0 * 70.0;  // InverseSquareLighting SCALED_UNITS_SQ
+
+#if defined(RT_ALPHA)
+// (46c) Alpha-tested instances (instance ID = 1 + record), as TraceShadowsCS RT_ALPHA: a candidate blocks when the
+// alpha of its texture at the hit passes the shape's test.
+static const uint kAlphaTextureSlots = 4096u;   // Backend::kAlphaTextureSlots
+static const uint kAlphaFallbackBit = 0x80000000u;
+static const uint kAlphaCandidateBudget = 24u;  // per ray; past it the ray counts as blocked (bounded cost)
+static const float kAlphaTextureWorld = 128.0;  // assumed world size of one texture repeat (mip estimate only)
+
+struct AlphaInfo
+{
+	uint UvBase;
+	uint Triangles;
+	uint Texture;  // bindless slot, or kAlphaFallbackBit | layer of AlphaLayers
+	uint Flags;
+	float Threshold;
+	float AlphaScale;
+	float2 Pad;
+	float4 UvTransform;
+};
+
+StructuredBuffer<AlphaInfo> AlphaInfos : register(t4);
+StructuredBuffer<uint2> AlphaUVs : register(t5);
+Texture2DArray<float> AlphaLayers : register(t6);
+Texture2D<float4> AlphaTextures[kAlphaTextureSlots] : register(t0, space1);
+SamplerState AlphaSampler : register(s0);
+
+float2 UnpackTexcoord(uint packed)
+{
+	return f16tof32(uint2(packed & 0xFFFFu, packed >> 16));
+}
+
+bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
+{
+	if (instanceID == 0u)
+		return true;
+	const AlphaInfo info = AlphaInfos[instanceID - 1u];
+	if (primitive >= info.Triangles)
+		return true;
+	const uint base = info.UvBase + primitive * 3u;
+	const uint2 c0 = AlphaUVs[base];
+	const uint2 c1 = AlphaUVs[base + 1u];
+	const uint2 c2 = AlphaUVs[base + 2u];
+	const float w0 = 1.0 - bary.x - bary.y;
+	float2 uv = UnpackTexcoord(c0.x) * w0 + UnpackTexcoord(c1.x) * bary.x + UnpackTexcoord(c2.x) * bary.y;
+	const float vertexAlpha = asfloat(c0.y) * w0 + asfloat(c1.y) * bary.x + asfloat(c2.y) * bary.y;
+	uv = uv * info.UvTransform.zw + info.UvTransform.xy;
+	if (!all(isfinite(uv)))
+		return true;
+	const float footprintUV = max(footprint, 1e-3) / kAlphaTextureWorld;
+	float alpha;
+	[branch] if (info.Texture & kAlphaFallbackBit)
+	{
+		alpha = AlphaLayers.SampleLevel(AlphaSampler, float3(uv, float(info.Texture & 0xFFFFu)), 0.0);
+	}
+	else
+	{
+		uint width, height, levels;
+		AlphaTextures[NonUniformResourceIndex(info.Texture)].GetDimensions(0u, width, height, levels);
+		const float size = float(max(width, height));
+		// Never below 256 texels across (coarser mips average a window's lattice away).
+		const float maxLod = clamp(log2(size / 256.0), 0.0, max(float(levels) - 1.0, 0.0));
+		const float lod = clamp(log2(size * footprintUV) + 0.5, 0.0, maxLod);
+		alpha = AlphaTextures[NonUniformResourceIndex(info.Texture)].SampleLevel(AlphaSampler, uv, lod).a;
+	}
+	return alpha * info.AlphaScale * vertexAlpha >= info.Threshold;
+}
+#endif
 
 float3 PositionAt(int2 p, float depth)
 {
@@ -91,16 +168,63 @@ float Attenuation(PLSource s, float d)
 	return 1.0 - f * f;
 }
 
-bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, out float tHit)
+// (46c) Spot sources: the share of the light the engine's spot mask lets through at P (0 outside the cone).
+float SpotFactor(PLSource s, float3 P)
+{
+	[branch] if (!(s.Info.x & kSourceSpot))
+		return 1.0;
+	const float3 v = P - s.PosRadius.xyz;
+	const float len = length(v);
+	const float c = len > 1e-3 ? dot(v / len, s.Spot.xyz) : 0.0;
+	if (c <= 1e-4)
+		return 0.0;
+	const float tanAngle = sqrt(saturate(1.0 - c * c)) / c;
+	const float r = tanAngle / max(s.Spot.w, 1e-4);
+	if (r >= 1.0)
+		return 0.0;
+	return saturate(1.0 - pow(max(r, 1e-6), max(asfloat(s.Info.z), 0.01)));
+}
+
+// (46c) Distance along dir from origin to where the ray leaves the interior box (Rect xy, Bounds xy as z).
+float ExitDistance(float3 origin, float3 dir)
+{
+	const float3 lo = float3(C.Rect.x, C.Rect.y, C.Bounds.x);
+	const float3 hi = float3(C.Rect.z, C.Rect.w, C.Bounds.y);
+	float tExit = 1e30;
+	[unroll] for (uint a = 0u; a < 3u; ++a)
+	{
+		if (dir[a] > 1e-6)
+			tExit = min(tExit, (hi[a] - origin[a]) / dir[a]);
+		else if (dir[a] < -1e-6)
+			tExit = min(tExit, (lo[a] - origin[a]) / dir[a]);
+	}
+	return max(tExit, 0.0) + C.Bounds.z;
+}
+
+bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, float footprint, out float tHit)
 {
 	RayDesc ray;
 	ray.Origin = origin;
 	ray.Direction = dir;
 	ray.TMin = tMin;
 	ray.TMax = tMax;
+#if defined(RT_ALPHA)
+	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
+	uint budget = kAlphaCandidateBudget;
+	while (q.Proceed()) {
+		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+			continue;
+		if (budget == 0u || AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint))
+			q.CommitNonOpaqueTriangleHit();
+		else
+			budget -= 1u;
+	}
+#else
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_CULL_NON_OPAQUE> q;
 	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
 	q.Proceed();
+#endif
 	tHit = q.CommittedRayT();
 	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
@@ -202,7 +326,9 @@ groupshared uint gsMask[2];
 			const float ndl = d > 1e-3 ? dot(N, toLight / d) : 0.0;
 			if (ndl <= 0.0)
 				continue;
-			const float contribution = src.Atten.w * Attenuation(src, d) * ndl;
+			// (46c) Window beams: the sun through a window, no fall-off with distance; spots: inside their cone only.
+			const float atten = (src.Info.x & kSourceBeam) ? 1.0 : Attenuation(src, d);
+			const float contribution = src.Atten.w * atten * ndl * SpotFactor(src, P);
 			if (contribution <= 0.0)
 				continue;
 			total += contribution;
@@ -259,19 +385,23 @@ groupshared uint gsMask[2];
 		const float3 L = target - origin;
 		const float len = length(L);
 		const float3 dir = L / max(len, 1e-3);
-		const float tMax = len - asfloat(src.Info.y);
+		float tMax = len - asfloat(src.Info.y);
+		// (46c) A window beam's light is far outside: the ray ends where it leaves the captured interior.
+		if (src.Info.x & kSourceBeam)
+			tMax = min(tMax, ExitDistance(origin, dir));
 		idx[k] = bestIdx[k];
 		if (tMax <= 1.0)
 			continue;  // the surface is inside the clearance: lit
 		float tHit;
-		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, tHit);
+		const float footprint = dist * 2.0 * C.RenderSize.w;  // about a pixel's size there (alpha mip choice)
+		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, tHit);
 		rays += 1u;
 		if (!blocked && characters) {
 			bool test = true;
 			if (flags & kFlagCharCull)
 				test = SphereOnSegment(origin, dir, tMax, C.Spheres[0]) || SphereOnSegment(origin, dir, tMax, C.Spheres[1]);
 			if (test) {
-				blocked = Blocked(origin, dir, tMax, kCharacterMasks, C.Bias.z, tHit);
+				blocked = Blocked(origin, dir, tMax, kCharacterMasks, C.Bias.z, footprint, tHit);
 				rays += 1u;
 			}
 		}
