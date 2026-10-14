@@ -45,15 +45,14 @@ public:
 		};
 	}
 
-	/// (45l) Five tiers + Custom. Saved 45k values 0 / 1 / 2 (Low / Medium / High) migrate to Medium / High / Ultra
-	/// (the same settings under the new names).
+	/// Five tiers + Custom.
 	enum class Quality : int
 	{
 		VeryLow = 0,
 		Low = 1,
-		Medium = 2,  // = 45k Low
-		High = 3,    // = 45k Medium
-		Ultra = 4,   // = 45k High
+		Medium = 2,
+		High = 3,
+		Ultra = 4,
 		Custom = 5,
 		Count
 	};
@@ -75,54 +74,25 @@ public:
 		Count
 	};
 
-	/// (45j) Screen Space Shadows inside the ray-traced area.
-	enum class SSSMode : int
-	{
-		Combine = 0,  // kept; merged with the mask as min() (grass, leaves, characters keep their contact shadows)
-		HandOff = 1,  // (45i-45k) removed in 45l: migrated to NonRT with contact length 0 (kept as a value only)
-		Keep = 2,     // kept and multiplied as with Ray Tracing off (shared shadows get darker twice)
-		NonRT = 3     // (45k, default) every caster the ray tracer does not see keeps its contact shadow; traced
-		              // casters only within a short contact range (the gap the ray start offset leaves); merged as min()
-	};
-
-	/// (45k) Shadow denoiser. Stored as an int: keep the values; 4 and 5 are reserved for NRD SIGMA
-	/// (45l) and AMD FidelityFX Shadows Denoiser.
+	/// (45k) Shadow denoiser. Stored as an int; the values are kept (1 was Temporal, removed in 45o:
+	/// a saved 1 loads as Penumbra).
 	enum class DenoiserMode : int
 	{
-		Off = 0,       // 45j without Temporal: the small Combine blur only
-		Temporal = 1,  // the 45j "Temporal smoothing" path exactly
-		Penumbra = 2,  // (45k, default) penumbra-aware spatial filter + clamped temporal + adaptive rays
+		Off = 0,       // the small Combine blur only
+		Penumbra = 2,  // (default) penumbra-aware spatial filter + clamped temporal + adaptive rays
 		DLSSRR = 3,    // nothing of ours: raw animated noise for DLSS Ray Reconstruction
-		Sigma = 4,     // (45l) NVIDIA NRD SIGMA shadow denoiser
+		Sigma = 4,     // NVIDIA NRD SIGMA shadow denoiser
 		Count
-	};
-
-	/// (45k) Noise / adaptive rays: Auto = what the denoiser mode wants.
-	enum class AutoMode : int
-	{
-		Auto = 0,
-		First = 1,   // Noise: world-locked; adaptive rays: on
-		Second = 2   // Noise: animated; adaptive rays: off
 	};
 
 	struct Settings
 	{
 		bool Enabled = false;
-		int QualityLevel = static_cast<int>(Quality::Medium);  // (45l) Medium = 45k Low
-		// Debug A/B switches (persisted so a test survives a restart).
-		bool KeepCastersInShadowMap = false;
-		bool KeepScreenSpaceShadows = false;  // (45i key, read once by the 45j migration: true = SSS mode Keep)
-		// (45g) Large one-sided alpha-tested shapes with an edge-only cutout (roof tiles) are RT occluders.
-		bool CutoutAsOpaque = true;
-		// (45h key) Alpha-tested casters: read once by the 45j migration (now Foliage / Cut-outs).
-		bool AlphaCasters = false;
-		// (45i, 45j) Per kind of object: ray traced (true) or the shadow map + screen-space shadows.
+		int QualityLevel = static_cast<int>(Quality::Medium);
+		// Per kind of object: ray traced (true) or the shadow map + screen-space shadows.
 		bool Characters = true;
 		bool PhysicsParts = true;  // HDT-SMP / HDT-PE parts other than hair (capes, skirts)
-		bool KeepCharactersInShadowMap = false;  // debug A/B
-		float CharacterSelfShadowOffset = 6.0f;  // debug: hits on characters nearer than this are ignored (units)
-		// (45j) Ray Tracing > Advanced.
-		int SettingsVersion = 4;  // 45j migration marker (absent in older JSON); 3 = 45k (SSS mode "non-RT casters only"); 4 = 45l (tiers, hand-off)
+		int SettingsVersion = 5;   // 5 = 45o (debug switches hard-wired; no migrations before it)
 		bool Buildings = true;
 		bool Objects = true;
 		bool Trees = false;
@@ -130,25 +100,9 @@ public:
 		bool Cutouts = false;      // fences, banners, grilles: traced with their cut-out
 		bool Hair = false;
 		bool FirstPersonPlayer = false;  // the player stays traced in first person
-		int ScreenSpaceShadows = static_cast<int>(SSSMode::NonRT);
-		bool KeepSSSUnderFoliage = true;  // hand-off mode: not under leaves
-		// (45k) Denoiser / Noise (Auto, World-locked, Animated) / Adaptive Rays (Auto, On, Off).
 		int Denoiser = static_cast<int>(DenoiserMode::Penumbra);
-		int Noise = 0;
-		int AdaptiveRays = 0;
-		float RtContactScale = 8.0f;    // (45k) SSS "non-RT casters only": contact range of traced casters, x the ray start offset
-		float RayOffsetScale = 1.0f;    // (45k) debug: the ray start offset (bias) x this
-		bool FlushBeforeTrace = false;  // (45k) debug: 45j flushed D3D11 explicitly after the ready Signal
-		bool LoadingBoost = true;       // (45k) capture and build with a large budget behind loading screens
-		bool WarmUp = true;             // (45k) after a loading screen: shadow map kept until the near scene is built, RT fades in
-		bool StableNormals = true;
-		bool FineAlphaMips = true;
-		// (45j) Game textures created shareable for ray-traced cut-outs (off: 256x256 copies only). Off by
-		// default: every 45i trace (Ray Tracing on or off, in sessions started with Alpha-tested casters on)
-		// moved the GPU wait from Present into a Map, the only always-on difference from 45d being the
-		// thousands of shareable textures; under test as a suspect.
-		bool ShareGameTextures = false;
-		// (45l) Quality "Custom" (Advanced): what the tiers set.
+		float RtContactScale = 8.0f;  // Screen Space Shadows: contact range of traced casters, x the ray start offset
+		// Quality "Custom": what the tiers set.
 		int CustomBaseRays = 1;
 		int CustomExtraRays = 1;
 		float CustomSunCone = 0.27f;        // degrees, half angle
@@ -163,20 +117,8 @@ public:
 		int CustomHistory = 12;             // frames
 		bool CustomDenoiseHalf = true;
 		float CustomFarDenoiseScale = 0.75f;
-		// (45l) NRD SIGMA: frames of its temporal stabilisation (0 = none: least lag on moving shadows).
+		// NRD SIGMA: frames of its temporal stabilisation (0 = none: least lag on moving shadows).
 		int SigmaStabilizedFrames = 4;
-		// (45l) Debug A/B of the cost and sync changes (each off = 45k).
-		bool LateSync = true;             // D3D11 waits for the trace after the other features' prepasses
-		bool SplitSubmit = true;          // builds / skinning / TLAS do not wait for D3D11
-		bool CharacterRayCulling = true;  // character ray only where it can meet a character
-		bool BlockerAtEdges = true;       // closest-hit blocker distance only at shadow edges
-		bool DistanceFalloff = true;      // the tiers' distance fall-off
-		// (45m) Debug: other actors at reduced quality skinned / refit every other frame (45l). Off = every frame.
-		bool NpcAlternateFrameSkinning = false;
-		// (45n) Debug A/B of the spike and sync changes (each off = 45m).
-		bool ReleaseThread = true;    // retired D3D12 objects released on a worker thread (the rt_x_collect spikes)
-		bool EarlyPrep = true;        // builds / skinning recorded and submitted at the frame start (before the shadow maps)
-		bool ReuseStillPoses = true;  // a character shape with bit-identical bones keeps last frame's skinned BLAS
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted
@@ -256,7 +198,7 @@ private:
 	{
 		std::uint32_t baseRays = 1, extraRays = 1;
 		float coneDegrees = 0.27f;
-		std::uint32_t smallFilterRadius = 1;    // the 45j filter (Off, Temporal)
+		std::uint32_t smallFilterRadius = 1;    // the small Combine filter (Off)
 		std::uint32_t tracePattern = 0, farPattern = 0;  // 0 full, 1 checkerboard, 2 half
 		float falloffStart = 0.0f, falloffEnd = 0.0f;  // end <= start: no fall-off
 		bool npcReduced = false;
@@ -383,7 +325,15 @@ private:
 	float lastTimeToReadyMs = -1.0f;
 	std::string lastLoadingSummary;
 	void UpdatePhase();
-	[[nodiscard]] DenoiserMode CurrentDenoiser() const { return static_cast<DenoiserMode>(std::clamp(settings.Denoiser, 0, static_cast<int>(DenoiserMode::Count) - 1)); }
+	/// Off, Penumbra, DLSS RR or SIGMA; anything else (the removed Temporal = 1) reads as Penumbra.
+	[[nodiscard]] static int ValidDenoiser(int a_value)
+	{
+		return (a_value == 0 || (a_value >= 2 && a_value < static_cast<int>(DenoiserMode::Count))) ? a_value : static_cast<int>(DenoiserMode::Penumbra);
+	}
+	[[nodiscard]] DenoiserMode CurrentDenoiser() const { return static_cast<DenoiserMode>(ValidDenoiser(settings.Denoiser)); }
+	/// (45o) Picking a denoiser in the dropdown: DLSS RR switches Upscaling's Ray Reconstruction on, any other
+	/// one switches it off while it is on (the same setting as Upscaling's checkbox).
+	void OnDenoiserPicked();
 	// (45j) CPU split of the last frame (also in the F7 trace), smoothed and worst for the page.
 	struct CpuSplit
 	{

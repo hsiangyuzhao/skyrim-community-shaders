@@ -17,7 +17,6 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "TruePBR.h"
-#include "Utils/Nvapi.h"
 #include "Util.h"
 #include "Utils/Format.h"
 #include "Utils/UI.h"
@@ -118,15 +117,6 @@ void AdvancedSettingsRenderer::RenderAdvancedSettings(
 		if (MenuFonts::BeginTabItemWithFont("Logging", Menu::FontRole::Subheading)) {
 			if (ImGui::BeginChild("##LoggingContent", ImVec2(0, 0), false)) {
 				RenderLoggingSection();
-			}
-			ImGui::EndChild();
-			ImGui::EndTabItem();
-		}
-
-		// (45c) NVIDIA Driver Extensions Tab
-		if (MenuFonts::BeginTabItemWithFont("NVIDIA", Menu::FontRole::Subheading)) {
-			if (ImGui::BeginChild("##NvidiaContent", ImVec2(0, 0), false)) {
-				Util::Nvapi::DrawSettings();
 			}
 			ImGui::EndChild();
 			ImGui::EndTabItem();

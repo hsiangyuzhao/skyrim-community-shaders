@@ -74,9 +74,6 @@ public:
 	winrt::com_ptr<ID3D12CommandAllocator> dlssCommandAllocator[2];
 	winrt::com_ptr<ID3D12GraphicsCommandList4> dlssCommandList[2];
 
-	winrt::com_ptr<ID3D12CommandAllocator> nisSharpenerCommandAllocator[2];
-	winrt::com_ptr<ID3D12GraphicsCommandList4> nisSharpenerCommandList[2];
-
 	IDXGISwapChain4* swapChain = nullptr;
 	// slGetNativeInterface returns an AddRef'd pointer. Keep it owned for
 	// non-intercepted DXGI calls while Present/GetBuffer/back-buffer-index use
@@ -109,9 +106,6 @@ public:
 	std::unique_ptr<WrappedResource> specHitDistanceShared12;
 	std::unique_ptr<WrappedResource> colorBeforeTransparencySnapshot;
 	std::unique_ptr<WrappedResource> sssGuide;
-
-	std::unique_ptr<WrappedResource> nisSharpenerInputShared12;
-	std::unique_ptr<WrappedResource> nisSharpenerOutputShared12;
 
 	winrt::com_ptr<ID3D11Device5> d3d11Device;
 	winrt::com_ptr<ID3D11DeviceContext4> d3d11Context;

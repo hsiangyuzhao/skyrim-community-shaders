@@ -2,7 +2,6 @@
 
 #include "Deferred.h"
 #include "Features/RayTracing/CasterFilter.h"
-#include "Features/RayTracing/TextureSharing.h"
 #include "Features/ScreenSpaceShadows.h"
 #include "Features/Upscaling.h"
 #include "State.h"
@@ -13,14 +12,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	RayTracing::Settings,
 	Enabled,
 	QualityLevel,
-	KeepCastersInShadowMap,
-	KeepScreenSpaceShadows,
-	CutoutAsOpaque,
-	AlphaCasters,
 	Characters,
 	PhysicsParts,
-	KeepCharactersInShadowMap,
-	CharacterSelfShadowOffset,
 	SettingsVersion,
 	Buildings,
 	Objects,
@@ -29,19 +22,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	Cutouts,
 	Hair,
 	FirstPersonPlayer,
-	ScreenSpaceShadows,
-	KeepSSSUnderFoliage,
 	Denoiser,
-	Noise,
-	AdaptiveRays,
 	RtContactScale,
-	RayOffsetScale,
-	FlushBeforeTrace,
-	LoadingBoost,
-	WarmUp,
-	StableNormals,
-	FineAlphaMips,
-	ShareGameTextures,
 	CustomBaseRays,
 	CustomExtraRays,
 	CustomSunCone,
@@ -56,21 +38,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	CustomHistory,
 	CustomDenoiseHalf,
 	CustomFarDenoiseScale,
-	SigmaStabilizedFrames,
-	LateSync,
-	SplitSubmit,
-	CharacterRayCulling,
-	BlockerAtEdges,
-	DistanceFalloff,
-	NpcAlternateFrameSkinning,
-	ReleaseThread,
-	EarlyPrep,
-	ReuseStillPoses)
+	SigmaStabilizedFrames)
 
 namespace
 {
-	// (45l) Quality tiers. Medium / High / Ultra are 45k's Low / Medium / High (rays, sun cone, small
-	// filter) plus the 45l cost cuts; Very Low and Low are new and cheaper.
+	// Quality tiers (rays, sun cone, small filter, distance fall-off, denoiser size).
 	struct QualityTier
 	{
 		const char* name;
@@ -94,12 +66,12 @@ namespace
 		{ "Low", 1, 0, 0.27f, 1, 0, 1, 2048.0f, 6144.0f, true, 12.0f, 4, true, 0.5f,
 			"1 ray per pixel, checkerboard beyond 90 m; no extra rays; other characters at reduced quality; half-resolution denoiser." },
 		{ "Medium", 1, 1, 0.27f, 1, 0, 0, 4096.0f, 12288.0f, true, 16.0f, 4, true, 0.75f,
-			"45k's Low: 1 ray per pixel (+1 at shadow edges, fading out between 60 and 175 m), the real sun disc; other characters at "
+			"1 ray per pixel (+1 at shadow edges, fading out between 60 and 175 m), the real sun disc; other characters at "
 			"reduced quality; half-resolution denoiser." },
 		{ "High", 1, 3, 0.5f, 2, 0, 0, 6144.0f, 16384.0f, false, 16.0f, 6, false, 1.0f,
-			"45k's Medium: 1 ray per pixel (+3 at shadow edges, fading out between 90 and 230 m), slightly softer edges; full-resolution denoiser." },
+			"1 ray per pixel (+3 at shadow edges, fading out between 90 and 230 m), slightly softer edges; full-resolution denoiser." },
 		{ "Ultra", 2, 4, 0.5f, 2, 0, 0, 0.0f, 0.0f, false, 16.0f, 6, false, 1.0f,
-			"45k's High: 2 rays per pixel (+4 at shadow edges, no fall-off), slightly softer edges; full-resolution denoiser. Cleanest." },
+			"2 rays per pixel (+4 at shadow edges, no fall-off), slightly softer edges; full-resolution denoiser. Cleanest." },
 	};
 	constexpr const char* kQualityNames[6] = { "Very Low", "Low", "Medium", "High", "Ultra", "Custom" };
 	constexpr const char* kPatternNames[3] = { "Full", "Checkerboard", "Half" };
@@ -128,6 +100,8 @@ namespace
 	constexpr double kWarmUpTimeoutMs = 5000.0;
 	constexpr double kFadeInMs = 500.0;
 	constexpr std::uint32_t kAlphaCopiesPerFrame = 16;  // (45h) 256x256 alpha copies made per frame (5 small dispatches each)
+	constexpr float kCharacterSelfShadowOffset = 6.0f;  // hits on characters nearer than this along the sun ray are ignored (units)
+	constexpr float kRayBiasConstant = 2.0f, kRayBiasPerUnit = 0.0015f;  // the ray start offset: 2 units + 0.15 % of the distance
 
 	struct LoadingMenuSink : RE::BSTEventSink<RE::MenuOpenCloseEvent>
 	{
@@ -217,16 +191,16 @@ void RayTracing::UpdatePhase()
 		fade = 0.0f;
 	}
 	if (!open && (closed || phase == Phase::Loading)) {
-		phase = settings.WarmUp ? Phase::WarmUp : Phase::Play;
+		phase = Phase::WarmUp;
 		warmUpStart = Qpc();
 		loadShapesAtClose = sc.shapes;
 		loadBuildsAtClose = static_cast<std::uint32_t>(stats.buildsTotal);
-		fade = settings.WarmUp ? 0.0f : 1.0f;
+		fade = 0.0f;
 	}
 	if (phase == Phase::WarmUp) {
 		const double elapsed = static_cast<double>(Qpc() - warmUpStart) * QpcMs();
 		const bool ready = scene.HasCoverage() && sc.cellsGathering == 0 && backend.QueuedBuilds() == 0 && status == Status::Active;
-		if (ready || elapsed > kWarmUpTimeoutMs || !settings.WarmUp) {
+		if (ready || elapsed > kWarmUpTimeoutMs) {
 			phase = Phase::Play;
 			lastTimeToReadyMs = static_cast<float>(elapsed);
 			lastLoadingSummary = std::format("behind the loading screen {} shapes captured, {} BLAS built; after it {} shapes, {} BLAS; ready {:.0f} ms after it closed{}",
@@ -251,8 +225,7 @@ bool RayTracing::ClaimScreenSpaceShadows()
 {
 	// (45k) Decided before Ray Tracing's own Prepass (Screen Space Shadows runs first in the list).
 	sssClaimed = false;
-	if (!settings.Enabled || status != Status::Active || static_cast<SSSMode>(settings.ScreenSpaceShadows) != SSSMode::NonRT || !typedUavLoadR8 ||
-		Util::IsInterior() || phase == Phase::Loading)
+	if (!settings.Enabled || status != Status::Active || !typedUavLoadR8 || Util::IsInterior() || phase == Phase::Loading)
 		return false;
 	sssClaimed = true;
 	return true;
@@ -294,7 +267,7 @@ RayTracingScene::SceneConfig RayTracing::SceneConfigFromSettings() const
 	const bool alpha = backend.AlphaAvailable();
 	config.foliage = alpha ? static_cast<RayTracingScene::FoliageMode>(std::clamp(settings.Foliage, 0, 2)) : RayTracingScene::FoliageMode::ShadowMap;
 	config.cutouts = alpha && settings.Cutouts;
-	config.cutoutAsOpaque = settings.CutoutAsOpaque;
+	config.cutoutAsOpaque = true;
 	return config;
 }
 
@@ -325,8 +298,7 @@ void RayTracing::UpdateCharacters()
 	}
 	// (45j) Alpha-tested parts (fur trims, cut-out cloth; hair when Hair is ray traced) whenever the
 	// alpha pipeline exists; a change of the first three re-captures the characters.
-	characters.Configure(settings.PhysicsParts, settings.Hair, backend.SkinAlphaAvailable(), settings.KeepCharactersInShadowMap,
-		settings.FirstPersonPlayer);
+	characters.Configure(settings.PhysicsParts, settings.Hair, backend.SkinAlphaAvailable(), settings.FirstPersonPlayer);
 }
 
 
@@ -370,11 +342,6 @@ RayTracing::QualityParams RayTracing::ResolveQuality() const
 		q.denoiseHalf = t.denoiseHalf;
 		q.farDenoiseScale = t.farDenoiseScale;
 	}
-	// Debug A/B: no distance fall-off at all (the far pattern goes with it).
-	if (!settings.DistanceFalloff) {
-		q.falloffStart = q.falloffEnd = 0.0f;
-		q.farPattern = 0;
-	}
 	return q;
 }
 
@@ -406,11 +373,28 @@ bool RayTracing::UpscalingRRActive()
 
 RayTracing::DenoiserMode RayTracing::EffectiveDenoiser() const
 {
-	// (45l) Ray Reconstruction cleans the whole image, shadows included, but only raw per-frame noise:
+	// Ray Reconstruction cleans the whole image, shadows included, but only raw per-frame noise:
 	// whenever it runs, the shadows take the DLSS RR route whatever the dropdown says.
 	if (UpscalingRRActive())
 		return DenoiserMode::DLSSRR;
 	return CurrentDenoiser();
+}
+
+void RayTracing::OnDenoiserPicked()
+{
+	// The same setting as Upscaling's "Ray Reconstruction" checkbox (Upscaling rebuilds its resources on its next frame).
+	auto& upscaling = globals::features::upscaling;
+	if (!upscaling.loaded)
+		return;
+	if (CurrentDenoiser() == DenoiserMode::DLSSRR) {
+		if (Upscaling::streamline.featureDLSS_RR && !upscaling.settings.enableDLSSRR) {
+			upscaling.settings.enableDLSSRR = true;
+			logger::info("[RayTracing] Denoiser DLSS RR: Ray Reconstruction switched on in Upscaling");
+		}
+	} else if (upscaling.settings.enableDLSSRR) {
+		upscaling.settings.enableDLSSRR = false;
+		logger::info("[RayTracing] Denoiser changed away from DLSS RR: Ray Reconstruction switched off in Upscaling");
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -419,53 +403,13 @@ RayTracing::DenoiserMode RayTracing::EffectiveDenoiser() const
 
 void RayTracing::LoadSettings(json& o_json)
 {
+	// Missing keys keep their defaults; keys of removed switches are ignored (and dropped on the next save).
 	settings = o_json;
-	settings.CharacterSelfShadowOffset = std::isfinite(settings.CharacterSelfShadowOffset) ? std::clamp(settings.CharacterSelfShadowOffset, 0.0f, 32.0f) : 6.0f;
-	// (45j) Once, from a 45d-45i save: the per-kind choices start at their new defaults (foliage and
-	// trees in the shadow map, buildings / objects / characters / physics parts ray traced, hair in
-	// the shadow map); the old switches are only logged. "Keep Screen Space Shadows" maps to Keep.
-	if (!o_json.is_object() || !o_json.contains("SettingsVersion")) {
-		logger::info("[RayTracing] Settings from before 45j: Alpha-tested casters {}, Characters {}, Physics parts {}, Keep Screen Space Shadows {} -> "
-					 "new defaults per kind (foliage and trees: shadow map; buildings, objects, characters, physics parts: ray traced; hair: shadow map)",
-			settings.AlphaCasters, o_json.is_object() && o_json.value("Characters", false), o_json.is_object() && o_json.value("PhysicsParts", false),
-			settings.KeepScreenSpaceShadows);
-		const Settings defaults{};
-		settings.Buildings = defaults.Buildings;
-		settings.Objects = defaults.Objects;
-		settings.Trees = defaults.Trees;
-		settings.Foliage = defaults.Foliage;
-		settings.Cutouts = defaults.Cutouts;
-		settings.Characters = defaults.Characters;
-		settings.PhysicsParts = defaults.PhysicsParts;
-		settings.Hair = defaults.Hair;
-		settings.ScreenSpaceShadows = static_cast<int>(settings.KeepScreenSpaceShadows ? SSSMode::Keep : SSSMode::Combine);
-		settings.SettingsVersion = 2;
-	}
-	// (45k) Once, from a save before 45k: Screen Space Shadows Combine becomes "non-RT casters only" (the new
-	// default); Denoiser / Noise / Adaptive Rays start at their defaults (Penumbra, Auto, Auto).
-	if (!o_json.is_object() || o_json.value("SettingsVersion", 0) < 3) {
-		if (settings.ScreenSpaceShadows == static_cast<int>(SSSMode::Combine))
-			settings.ScreenSpaceShadows = static_cast<int>(SSSMode::NonRT);
-		logger::info("[RayTracing] Settings from before 45k: Screen Space Shadows mode {}, Denoiser Penumbra", settings.ScreenSpaceShadows);
-		settings.SettingsVersion = 3;
-	}
-	// (45l) Once, from a save before 45l: the tiers moved up by two names (45k Low / Medium / High = Medium / High /
-	// Ultra, the same settings); Screen Space Shadows "Hand off" becomes "Non-RT casters only" with contact length 0.
-	if (!o_json.is_object() || o_json.value("SettingsVersion", 0) < 4) {
-		const int oldQuality = settings.QualityLevel;
-		if (o_json.is_object() && o_json.contains("QualityLevel"))
-			settings.QualityLevel = std::clamp(oldQuality, 0, 2) + 2;
-		if (settings.ScreenSpaceShadows == static_cast<int>(SSSMode::HandOff)) {
-			settings.ScreenSpaceShadows = static_cast<int>(SSSMode::NonRT);
-			settings.RtContactScale = 0.0f;
-		}
-		logger::info("[RayTracing] Settings from before 45l: quality {} -> {} ({}), Screen Space Shadows mode {}", oldQuality, settings.QualityLevel,
-			kQualityNames[std::clamp(settings.QualityLevel, 0, 5)], settings.ScreenSpaceShadows);
-		settings.SettingsVersion = 4;
-	}
+	if (settings.Denoiser == 1)
+		logger::info("[RayTracing] Denoiser Temporal was removed: Penumbra");
+	settings.Denoiser = ValidDenoiser(settings.Denoiser);
+	settings.SettingsVersion = Settings{}.SettingsVersion;
 	settings.QualityLevel = std::clamp(settings.QualityLevel, 0, static_cast<int>(Quality::Count) - 1);
-	if (settings.ScreenSpaceShadows == static_cast<int>(SSSMode::HandOff))
-		settings.ScreenSpaceShadows = static_cast<int>(SSSMode::NonRT);
 	settings.CustomBaseRays = std::clamp(settings.CustomBaseRays, 1, 4);
 	settings.CustomExtraRays = std::clamp(settings.CustomExtraRays, 0, 8);
 	settings.CustomSunCone = std::isfinite(settings.CustomSunCone) ? std::clamp(settings.CustomSunCone, 0.1f, 2.0f) : 0.27f;
@@ -481,23 +425,11 @@ void RayTracing::LoadSettings(json& o_json)
 	settings.CustomFarDenoiseScale = std::isfinite(settings.CustomFarDenoiseScale) ? std::clamp(settings.CustomFarDenoiseScale, 0.0f, 1.0f) : 0.75f;
 	settings.SigmaStabilizedFrames = std::clamp(settings.SigmaStabilizedFrames, 0, 5);
 	settings.Foliage = std::clamp(settings.Foliage, 0, 2);
-	settings.ScreenSpaceShadows = std::clamp(settings.ScreenSpaceShadows, 0, 3);
-	settings.Denoiser = std::clamp(settings.Denoiser, 0, static_cast<int>(DenoiserMode::Count) - 1);
-	settings.Noise = std::clamp(settings.Noise, 0, 2);
-	settings.AdaptiveRays = std::clamp(settings.AdaptiveRays, 0, 2);
 	settings.RtContactScale = std::isfinite(settings.RtContactScale) ? std::clamp(settings.RtContactScale, 0.0f, 32.0f) : 8.0f;
-	settings.RayOffsetScale = std::isfinite(settings.RayOffsetScale) ? std::clamp(settings.RayOffsetScale, 0.25f, 2.0f) : 1.0f;
-	settings.AlphaCasters = settings.Foliage != 0 || settings.Cutouts;  // written back for older builds only
-	settings.KeepScreenSpaceShadows = settings.ScreenSpaceShadows == static_cast<int>(SSSMode::Keep);
-	// (45h) Before the first save is loaded (no frame runs during loading screens): its textures are
-	// then created shareable when ray-traced foliage / cut-outs are on.
-	RayTracingTextureSharing::SetEnabled(settings.Enabled && settings.ShareGameTextures && (settings.Foliage != 0 || settings.Cutouts));
 }
 
 void RayTracing::SaveSettings(json& o_json)
 {
-	settings.AlphaCasters = settings.Foliage != 0 || settings.Cutouts;
-	settings.KeepScreenSpaceShadows = settings.ScreenSpaceShadows == static_cast<int>(SSSMode::Keep);
 	o_json = settings;
 }
 
@@ -653,7 +585,7 @@ namespace
 
 bool RayTracing::EnsureDenoiser(bool a_half)
 {
-	// (45k) Denoiser Penumbra / (45l) Temporal: created on first use (render-target size of the shadow
+	// (45k) Denoiser Penumbra: created on first use (render-target size of the shadow
 	// mask). (45l) The filter textures are half size with a half-resolution filter.
 	if (denoiseTiles.texture && denoiseH.texture && denoiseOut.texture && history4[0].texture && history4[1].texture && denoiseIsHalf == a_half &&
 		(!a_half || denoiseHalfIn.texture))
@@ -912,15 +844,15 @@ bool RayTracing::EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc)
 void RayTracing::LatchFrame()
 {
 	// Decided before the engine draws the sun cascades. The covered casters leave the cascades
-	// only while the trace ran last frame (so it is running), never while the disagreement view
-	// compares against a complete shadow map, and never with the A/B switch.
+	// only while the trace ran last frame (so it is running), and never while the disagreement view
+	// compares against a complete shadow map.
 	// (45e) Also only when this frame's trace is certain to run: a D3D12 command context is free
 	// now (it stays free until the trace is recorded), the scene has built cells, and the sky /
 	// exterior conditions RunFrame checks hold. Otherwise the shadow map keeps every caster and a
 	// frame that cannot trace falls back to it cleanly.
 	auto* sky = globals::game::sky;
 	// (45k) Not during a loading screen or the warm-up after it (nor while the RT result still fades in).
-	const bool active = settings.Enabled && status == Status::Active && !settings.KeepCastersInShadowMap && phase == Phase::Play && fade >= 1.0f &&
+	const bool active = settings.Enabled && status == Status::Active && phase == Phase::Play && fade >= 1.0f &&
 	                    debugView != DebugView::Disagreement && !Util::IsInterior() && sky && sky->mode.get() == RE::Sky::Mode::kFull &&
 	                    backend.HasFreeContext() && scene.HasCoverage();
 	// (45f) Watch for big casters the scene lacks while Ray Tracing runs (also when nothing is left out).
@@ -935,17 +867,16 @@ void RayTracing::RunEarlyPrep()
 	// (45n) Early Prep: this frame's characters (bones, captures) and the D3D12 builds / skinning go out now,
 	// before the game draws its shadow maps, instead of after the depth prepass. Same frame, same data (the
 	// game's update is finished; rendering does not move bones), so nothing becomes stale; only the TLAS and
-	// the trace are left for Prepass. Nothing waits. Off, or whenever a condition fails = the 45m order.
+	// the trace are left for Prepass. Nothing waits. Whenever a condition fails (loading screens, the warm-up after
+	// them, no exterior sky) Prepass does all of it later in the frame (the fallback).
 	earlyThisFrame = false;
 	charactersUpdatedEarly = false;
 	earlyCpuMs = 0.0f;
 	earlyCharactersMs = 0.0f;
 	if (backend.IsReady() && backend.HasPrepared())
 		backend.AbandonPrepared();  // a frame that never reached its Prepass
-	if (backend.IsReady())
-		backend.SetReleaseOnWorker(settings.ReleaseThread);
 	auto* sky = globals::game::sky;
-	if (!settings.Enabled || !settings.EarlyPrep || !settings.SplitSubmit || status != Status::Active || phase != Phase::Play || loadingOpen.load() ||
+	if (!settings.Enabled || status != Status::Active || phase != Phase::Play || loadingOpen.load() ||
 		!backend.IsReady() || Util::IsInterior() || !sky || sky->mode.get() != RE::Sky::Mode::kFull || !backend.HasFreeContext())
 		return;
 	const std::int64_t start = Qpc();
@@ -953,12 +884,9 @@ void RayTracing::RunEarlyPrep()
 		skinDraws.clear();
 		skinBones.clear();
 		if (settings.Characters && backend.SkinAvailable()) {
-			const QualityParams quality = ResolveQuality();
-			characters.SetNpcReduced(quality.npcReduced && settings.NpcAlternateFrameSkinning);
-			characters.SetStillPoseReuse(settings.ReuseStillPoses);
 			float world[4];
 			if (scene.GetLoadedRect(world, false))
-				characters.Update(backend, globals::state->frameCount, world);
+				characters.Update(backend, world);
 			characters.CollectDraws(skinDraws, skinBones);
 			charactersUpdatedEarly = true;
 		}
@@ -967,7 +895,6 @@ void RayTracing::RunEarlyPrep()
 		input.buildTriangleBudget = kBuildBudget;
 		input.skinDraws = &skinDraws;
 		input.skinBones = &skinBones;
-		input.splitSubmit = true;
 		earlyThisFrame = backend.PrepareFrame(input);
 		if (!earlyThisFrame && backend.HasFailed())
 			Disable(Status::Failed, backend.LastError());
@@ -1024,8 +951,6 @@ void RayTracing::Prepass()
 			rt->charactersUpdatedEarly = false;
 		}
 	} earlyPrepEnd{ this };
-	// (45h) Diffuse textures loaded from now on are created shareable only while both switches are on.
-	RayTracingTextureSharing::SetEnabled(settings.Enabled && settings.ShareGameTextures && (settings.Foliage != 0 || settings.Cutouts));
 
 	if (!settings.Enabled) {
 		if (sssClaimed)
@@ -1070,7 +995,7 @@ void RayTracing::Prepass()
 	cpuLast = {};
 	UpdatePhase();
 	try {
-		if (phase == Phase::Loading && settings.LoadingBoost && backend.IsReady()) {
+		if (phase == Phase::Loading && backend.IsReady()) {
 			// (45k) Behind the loading screen: capture and build with a large budget, trace nothing. The
 			// render thread never waits on the GPU; one build submission per frame, capped.
 			const std::int64_t loadStart = Qpc();
@@ -1089,14 +1014,11 @@ void RayTracing::Prepass()
 			characters.EndFrame(backend);  // (45i)
 			cpuLast.endFrame = static_cast<float>(static_cast<double>(Qpc() - endStart) * QpcMs());
 		}
-		// (45l) Late Sync off: the D3D11 side of the trace right away (45k's order).
-		if (pending.active && !settings.LateSync)
-			FinishFrame();
 	} catch (const std::exception& e) {
 		Disable(Status::Failed, std::format("exception: {}", e.what()));
 	}
 	if (pending.active) {
-		// (45l) Late Sync: the rest after every other feature's prepass (FinishPrepass).
+		// (45l) The rest after every other feature's prepass (FinishPrepass).
 		prepassCpuMs = static_cast<float>(static_cast<double>(Qpc() - frameStart) * QpcMs());
 		return;
 	}
@@ -1256,9 +1178,9 @@ void RayTracing::PublishCpuSplit()
 				if (part.second > worst->second)
 					worst = &part;
 			logger::info("[RayTracing] D3D12 record + submit took {:.1f} ms; slowest: {} {:.1f} ms (Signal11 {:.2f}, Flush11 {:.2f}, Wait12 {:.2f}, Execute {:.2f}, "
-						 "Signal12 {:.2f}, Wait11 {:.2f}, builds {:.2f}, characters {:.2f}; retired objects {} in {:.2f} ms, release thread {}, early prep {})",
+						 "Signal12 {:.2f}, Wait11 {:.2f}, builds {:.2f}, characters {:.2f}; retired objects {} in {:.2f} ms, early prep {})",
 				cpuLast.execute, worst->first, worst->second, x.signal11, x.flush11, x.wait12, x.execute, x.signal12, x.wait11, stats.cpuBuildMs, stats.cpuSkinMs,
-				x.retiredCount, x.retire, settings.ReleaseThread ? "on" : "off", x.early ? "yes" : "no");
+				x.retiredCount, x.retire, x.early ? "yes" : "no");
 		}
 	}
 	Util::FrameTrace::OnRayTracingDetail(detail);
@@ -1271,7 +1193,6 @@ void RayTracing::RunFrame()
 	// (45l) A deferred D3D11 wait that was never issued (a frame without FinishPrepass): before this
 	// frame's depth copy overwrites what the last trace read.
 	backend.WaitForTrace();
-	backend.SetReleaseOnWorker(settings.ReleaseThread);  // (45n)
 	UpdateAlphaCasters();  // (45h, 45j) per-kind choices: a change re-captures the scene
 	UpdateCharacters();                                // (45i)
 	if (status == Status::Off || status == Status::Unavailable)
@@ -1330,7 +1251,6 @@ void RayTracing::RunFrame()
 	const DenoiserMode denoiser = EffectiveDenoiser();
 	lastEffectiveDenoiser = denoiser;
 	const bool penumbra = denoiser == DenoiserMode::Penumbra;
-	const bool temporalMode = denoiser == DenoiserMode::Temporal;
 	const bool rrMode = denoiser == DenoiserMode::DLSSRR;
 	bool sigmaMode = denoiser == DenoiserMode::Sigma;
 	if (sigmaMode && !EnsureSigma())
@@ -1340,7 +1260,7 @@ void RayTracing::RunFrame()
 	scene.CollectInstances(instances, validate);
 	scene.DescribeMissedCasters();
 	// (45i) Characters in the traced area: capture, bone matrices, draws (none with the switch off).
-	// (45l) Other actors at reduced quality (45m: skinned every frame unless the Debug switch asks for 45l).
+	// Other actors at reduced quality only get fewer rays (they are skinned every frame like the player).
 	const std::int64_t charactersStart = Qpc();
 	const bool charactersWanted = settings.Characters && backend.SkinAvailable();
 	if (charactersUpdatedEarly && charactersWanted) {
@@ -1355,13 +1275,9 @@ void RayTracing::RunFrame()
 		skinDraws.clear();
 		skinBones.clear();
 		if (settings.Characters && backend.SkinAvailable()) {
-			// (45m) Other actors are skinned and refit every frame again (the 45l alternate frames lagged visibly);
-			// reduced quality now only lowers their ray work. The 45l path stays as a Debug switch.
-			characters.SetNpcReduced(quality.npcReduced && settings.NpcAlternateFrameSkinning);
-			characters.SetStillPoseReuse(settings.ReuseStillPoses);
 			float world[4];
 			if (scene.GetLoadedRect(world, false))
-				characters.Update(backend, globals::state->frameCount, world);
+				characters.Update(backend, world);
 			// Every captured (and retiring) shape is traced, also on a frame without an update.
 			characters.CollectDraws(skinDraws, skinBones);
 		}
@@ -1403,13 +1319,11 @@ void RayTracing::RunFrame()
 	// (45i) First person: no character ray for the arms / weapon (inside the third-person body).
 	if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); !skinDraws.empty() && playerCamera && playerCamera->IsInFirstPerson())
 		traceFlags |= kFlagFirstPerson;
-	// (45k, 45l) Noise / Adaptive Rays, Auto: world-locked noise and no extra rays only with Off; animated noise
-	// (R2-stepped) and extra rays with every denoiser that averages frames. DLSS RR and SIGMA need fresh noise
-	// every real frame; SIGMA takes one ray per pixel (its input is one shadow ray's penumbra).
-	bool worldNoise = settings.Noise == static_cast<int>(AutoMode::Auto) ? denoiser == DenoiserMode::Off : settings.Noise == static_cast<int>(AutoMode::First);
-	if (rrMode || sigmaMode)
-		worldNoise = false;
-	bool adaptive = settings.AdaptiveRays == static_cast<int>(AutoMode::Auto) ? denoiser != DenoiserMode::Off : settings.AdaptiveRays == static_cast<int>(AutoMode::First);
+	// Noise / adaptive rays: world-locked noise and no extra rays only with Off; animated noise (R2-stepped) and
+	// extra rays with every denoiser that averages frames. DLSS RR and SIGMA need fresh noise every real frame;
+	// SIGMA takes one ray per pixel (its input is one shadow ray's penumbra).
+	const bool worldNoise = denoiser == DenoiserMode::Off;
+	bool adaptive = denoiser != DenoiserMode::Off;
 	std::uint32_t baseRays = quality.baseRays, tracePattern = quality.tracePattern, farPattern = quality.farPattern;
 	if (sigmaMode) {
 		adaptive = false;
@@ -1420,23 +1334,20 @@ void RayTracing::RunFrame()
 		traceFlags |= kFlagWorldNoise;
 	else
 		traceFlags |= kFlagR2Noise;  // (45k) decorrelated animated rays
-	if (settings.StableNormals)
-		traceFlags |= kFlagStableNormal;
-	if (settings.FineAlphaMips)
-		traceFlags |= kFlagAlphaFootprint;
+	traceFlags |= kFlagStableNormal | kFlagAlphaFootprint;
 	if (adaptive && quality.extraRays > 0)
 		traceFlags |= kFlagAdaptive;
 	const bool blockerDist = (penumbra || sigmaMode) && !(traceFlags & kFlagCoverage);
 	if (blockerDist)
 		traceFlags |= kFlagBlockerDist;
 	// (45l) Closest hit only at the edges (Penumbra with extra rays); SIGMA keeps it on the first ray everywhere.
-	if (blockerDist && penumbra && settings.BlockerAtEdges && (traceFlags & kFlagAdaptive))
+	if (blockerDist && penumbra && (traceFlags & kFlagAdaptive))
 		traceFlags |= kFlagBlockerEdges;
 	const bool falloff = quality.falloffEnd > quality.falloffStart;
 	if (falloff)
 		traceFlags |= kFlagFalloff;
 	// (45l) The character ray only where the sun ray passes a character's bounds.
-	if (settings.CharacterRayCulling && !skinDraws.empty()) {
+	if (!skinDraws.empty()) {
 		const double cam[3] = { camX, camY, camZ };
 		characters.GetBounds(cam, &input.constants.spheres[0], &input.constants.spheres[4]);
 		traceFlags |= kFlagCharCull;
@@ -1459,12 +1370,11 @@ void RayTracing::RunFrame()
 	input.constants.renderSize[2] = 1.0f / static_cast<float>(width);
 	input.constants.renderSize[3] = 1.0f / static_cast<float>(height);
 	std::copy_n(traceRect, 4, input.constants.rect);
-	// (45k) Debug: Ray Start Offset scales the 45j bias (2 units + 0.0015 per unit of distance).
-	const float biasConstant = 2.0f * settings.RayOffsetScale, biasPerUnit = 0.0015f * settings.RayOffsetScale;
+	const float biasConstant = kRayBiasConstant, biasPerUnit = kRayBiasPerUnit;
 	input.constants.bias[0] = biasConstant;
 	input.constants.bias[1] = biasPerUnit;
 	input.constants.bias[2] = 8.0f;
-	input.constants.bias[3] = skinDraws.empty() ? 0.0f : settings.CharacterSelfShadowOffset;  // (45i) character ray TMin (character variants only)
+	input.constants.bias[3] = skinDraws.empty() ? 0.0f : kCharacterSelfShadowOffset;  // (45i) character ray TMin (character variants only)
 	input.constants.world[0] = static_cast<float>(camX);  // (45j) world-locked noise
 	input.constants.world[1] = static_cast<float>(camY);
 	input.constants.world[2] = static_cast<float>(camZ);
@@ -1478,19 +1388,16 @@ void RayTracing::RunFrame()
 	input.validate = validate;
 	input.skinDraws = &skinDraws;  // (45i) empty: the 45h pipelines run
 	input.skinBones = &skinBones;
-	input.splitSubmit = settings.SplitSubmit;  // (45l)
-	input.deferWait = true;                    // (45l) FinishFrame waits (right away without Late Sync)
+	input.deferWait = true;  // (45l) FinishFrame waits (after the other features' prepasses)
 
 	auto* context = globals::d3d::context;
 	auto* screenSpaceShadows = &globals::features::screenSpaceShadows;
-	// (45j) Screen Space Shadows inside the traced area: combined with min() or kept. (45l) Hand off is gone.
-	const bool sssAvailable = typedUavLoadR8 && screenSpaceShadows->loaded && screenSpaceShadows->bendSettings.Enable && screenSpaceShadows->screenSpaceShadowsTexture;
-	const auto sssMode = static_cast<SSSMode>(std::clamp(settings.ScreenSpaceShadows, 0, 3));
-	// (45k) Non-RT casters only: the texture then holds only non-traced casters (and traced ones within
-	// their contact range): merged with min() like Combine, so shared shadows are not darkened twice.
-	const bool combineSSS = sssAvailable && (sssMode == SSSMode::Combine || sssMode == SSSMode::NonRT);
-	// (45l) Temporal uses Penumbra's clamped history (History4); Penumbra adds its spatial filter.
-	const bool historyStage = (penumbra || temporalMode) && EnsureDenoiser(quality.denoiseHalf && penumbra);
+	// Screen Space Shadows inside the traced area ("non-RT casters only"): the texture holds only non-traced
+	// casters (and traced ones within their contact range), merged with the mask as min() so shared shadows
+	// are not darkened twice.
+	const bool combineSSS = typedUavLoadR8 && screenSpaceShadows->loaded && screenSpaceShadows->bendSettings.Enable && screenSpaceShadows->screenSpaceShadowsTexture;
+	// Penumbra: spatial filter + clamped history (History4).
+	const bool historyStage = penumbra && EnsureDenoiser(quality.denoiseHalf);
 	if (!historyStage)
 		history4Valid = false;
 	if (!sigmaMode)
@@ -1505,11 +1412,9 @@ void RayTracing::RunFrame()
 	cb.Band[1] = (rrMode || sigmaMode) ? 0.0f : static_cast<float>(quality.smallFilterRadius);
 	std::uint32_t combineFlags = (debug ? kFlagDebug : 0u) | (combineSSS ? kFlagCombineSSS : 0u) | ((traceFlags & kFlagSkipShadowed) ? kFlagTraceSkipped : 0u) |
 	                             (blockerDist ? kFlagCombineBlockerDist : 0u);
-	if (historyStage) {
-		combineFlags |= kFlagPenumbra | (history4Valid && prevCameraValid ? kFlagHistoryValid : 0u);
-		if (penumbra)
-			combineFlags |= kFlagSpatial | (quality.denoiseHalf ? kFlagDenoiseHalf : 0u) | (falloff ? kFlagFalloffDenoise : 0u);
-	}
+	if (historyStage)
+		combineFlags |= kFlagPenumbra | (history4Valid && prevCameraValid ? kFlagHistoryValid : 0u) | kFlagSpatial |
+		                (quality.denoiseHalf ? kFlagDenoiseHalf : 0u) | (falloff ? kFlagFalloffDenoise : 0u);
 	if (sigmaMode)
 		combineFlags |= kFlagSigma;
 	const auto& viewProjUnjittered = fb.GetCameraViewProjUnjittered(0);
@@ -1606,7 +1511,6 @@ void RayTracing::RunFrame()
 	// depth copy above, GPU-side). The D3D11 queue waits for the trace in FinishFrame.
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
-	backend.SetExplicitFlush(settings.FlushBeforeTrace);  // (45k)
 	const bool traced = backend.ExecuteFrame(input);
 	const std::int64_t executeEnd = Qpc();
 	cpuLast.execute = static_cast<float>(static_cast<double>(executeEnd - executeStart) * QpcMs());
@@ -1647,7 +1551,7 @@ void RayTracing::RunFrame()
 	pending.writeSSS = combineSSS;
 	pending.debug = debug;
 	pending.penumbra = historyStage;
-	pending.spatial = historyStage && penumbra;
+	pending.spatial = historyStage;
 	pending.half = pending.spatial && quality.denoiseHalf;
 	pending.sigma = sigmaMode;
 	pending.sssNonRT = sssNonRT;
@@ -1931,7 +1835,6 @@ void RayTracing::DrawSettings()
 				ImGui::Text("%s", kTiers[settings.QualityLevel].tooltip);
 			else
 				ImGui::Text("Custom: the values under Custom Quality below (started from the tier you had picked).");
-			ImGui::Text("Medium / High / Ultra are 45k's Low / Medium / High under new names (a 45k Low save now reads Medium).");
 		}
 		if (settings.QualityLevel == static_cast<int>(Quality::Custom) && ImGui::TreeNodeEx("Custom Quality", ImGuiTreeNodeFlags_DefaultOpen)) {
 			ImGui::SliderInt("Rays per Pixel", &settings.CustomBaseRays, 1, 4);
@@ -1958,7 +1861,7 @@ void RayTracing::DrawSettings()
 			ImGui::Combo("Other Characters", &settings.CustomNpcQuality, npcModes, 2);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("The player always gets full quality. Reduced: other characters get no extra edge rays.");
-				ImGui::Text("  They are re-posed every frame like the player (45m; the 45l every-other-frame mode is under Debug).");
+				ImGui::Text("  They are re-posed every frame like the player.");
 			}
 			ImGui::SliderFloat("Denoiser Radius", &settings.CustomDenoiseRadius, 2.0f, 32.0f, "%.0f px");
 			ImGui::SliderInt("Denoiser Taps per Side", &settings.CustomDenoiseTaps, 1, 8);
@@ -1986,7 +1889,7 @@ void RayTracing::DrawSettings()
 				}
 			};
 			row("Buildings", settings.Buildings, "Statics, furniture, containers, rocks, walls (default: Ray traced).",
-				"Also the big roof tiles and plank edges taken as solid (Debug: Treat Mostly-Opaque ...).");
+				"Also big one-sided shapes whose cut-out only trims their edges (roof tiles, plank ends), taken as solid.");
 			row("Objects", settings.Objects, "Doors, activators, movable objects, lights and loose items (default: Ray traced).", nullptr);
 			row("Trees", settings.Trees, "Trunks and branches of trees and plants (default: Shadow map).",
 				"Their leaves are Foliage.");
@@ -1999,7 +1902,7 @@ void RayTracing::DrawSettings()
 					ImGui::Text("  Shadow map: the leaves keep the game's shadows and their screen-space contact shadows (they sway with the wind).");
 					ImGui::Text("  Ray traced: traced with their cut-out instead (sharper, but they do not sway in the shadow).");
 					ImGui::Text("  Both: traced AND kept in the shadow map; the darker of both wins (fullest shadow).");
-					ImGui::Text("  Ray traced / Both: cut-outs are read from 256x256 copies (Debug: Share Game Textures for full resolution).");
+					ImGui::Text("  Ray traced / Both: cut-outs are read from 256x256 copies of the textures.");
 				}
 			}
 			row("Cut-outs", settings.Cutouts, "Fences, grilles, banners and other non-plant cut-outs (default: Shadow map).",
@@ -2024,70 +1927,46 @@ void RayTracing::DrawSettings()
 				ImGui::Unindent();
 			}
 			ImGui::Separator();
-			{
-				// (45l) Hand off (45i) is gone: "Non-RT casters only" with contact length 0 is what it was meant to be
-				// (no screen-space shadow from ray-traced casters, every other caster keeps its own).
-				static constexpr SSSMode kSssOrder[] = { SSSMode::NonRT, SSSMode::Combine, SSSMode::Keep };
-				const char* sssModes[] = { "Non-RT casters only", "Combine (min)", "Keep (multiply)" };
-				int sssIndex = 0;
-				for (int i = 0; i < 3; ++i)
-					if (settings.ScreenSpaceShadows == static_cast<int>(kSssOrder[i]))
-						sssIndex = i;
-				if (ImGui::Combo("Screen-space shadows", &sssIndex, sssModes, 3))
-					settings.ScreenSpaceShadows = static_cast<int>(kSssOrder[std::clamp(sssIndex, 0, 2)]);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Screen Space Shadows (small contact shadows) inside the ray-traced area:");
-					ImGui::Text("  Non-RT casters only (default): everything the ray tracer does not see (grass, distant trees, shadow-map kinds)");
-					ImGui::Text("    keeps its contact shadows; ray-traced casters only fill the few units right at their base that the");
-					ImGui::Text("    ray tracer cannot resolve (RT Caster Contact Length; 0 = none at all, what 45k's Hand off was meant to be).");
-					ImGui::Text("  Combine: kept; where they and the ray tracer agree the shadow is not darkened twice.");
-					ImGui::Text("  Keep: kept and multiplied as with Ray Tracing off (shared shadows get a little darker).");
-				}
-				if (settings.ScreenSpaceShadows == static_cast<int>(SSSMode::NonRT)) {
-					ImGui::Indent();
-					ImGui::SliderFloat("RT Caster Contact Length", &settings.RtContactScale, 0.0f, 32.0f, "%.1f x ray offset");
-					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("How far (along the sun ray) a ray-traced object may still cast a screen-space contact shadow, in multiples of");
-						ImGui::Text("  the ray tracer's start offset (2 units + 0.15 %% of the distance). Default 8 = about 16 units near the camera.");
-						ImGui::Text("  0 = ray-traced objects cast no screen-space shadow at all. Larger = softer bases, but thin posts get fatter again.");
-					}
-					ImGui::Unindent();
-				}
+			ImGui::SliderFloat("RT Caster Contact Length", &settings.RtContactScale, 0.0f, 32.0f, "%.1f x ray offset");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Screen Space Shadows inside the ray-traced area: everything the ray tracer does not see (grass, distant trees,");
+				ImGui::Text("  shadow-map kinds) keeps its small contact shadows; ray-traced objects only fill the few units right at their base");
+				ImGui::Text("  that the ray tracer cannot resolve.");
+				ImGui::Text("This sets how far (along the sun ray) a ray-traced object may still cast a screen-space contact shadow, in multiples");
+				ImGui::Text("  of the ray tracer's start offset (2 units + 0.15 %% of the distance). Default 8 = about 16 units near the camera.");
+				ImGui::Text("  0 = ray-traced objects cast no screen-space shadow at all. Larger = softer bases, but thin posts get fatter again.");
 			}
 			ImGui::TreePop();
 		}
 
-		// (45k) Denoiser: one dropdown to compare quality and cost in one session.
+		// Denoiser: Off / Penumbra / DLSS RR / NRD SIGMA (stored values 0 / 2 / 3 / 4).
 		{
-			const char* denoisers[] = { "Off", "Temporal", "Penumbra", "DLSS RR", "NRD SIGMA" };
-			static_assert(IM_ARRAYSIZE(denoisers) == static_cast<int>(DenoiserMode::Count));
-			settings.Denoiser = std::clamp(settings.Denoiser, 0, static_cast<int>(DenoiserMode::Count) - 1);
+			static constexpr DenoiserMode kOrder[] = { DenoiserMode::Off, DenoiserMode::Penumbra, DenoiserMode::DLSSRR, DenoiserMode::Sigma };
+			const char* denoisers[] = { "Off", "Penumbra", "DLSS RR", "NRD SIGMA" };
+			settings.Denoiser = ValidDenoiser(settings.Denoiser);
+			int denoiserIndex = 1;
+			for (int i = 0; i < IM_ARRAYSIZE(kOrder); ++i)
+				if (settings.Denoiser == static_cast<int>(kOrder[i]))
+					denoiserIndex = i;
 			const bool rrActive = UpscalingRRActive();
-			if (ImGui::Combo("Denoiser", &settings.Denoiser, denoisers, IM_ARRAYSIZE(denoisers)) && settings.Denoiser == static_cast<int>(DenoiserMode::DLSSRR)) {
-				// (45l) DLSS RR here switches Ray Reconstruction on in Upscaling (the same setting as its checkbox; Upscaling
-				// rebuilds its resources on its next frame). Switching away never turns it off.
-				auto& upscaling = globals::features::upscaling;
-				if (upscaling.loaded && Upscaling::streamline.featureDLSS_RR && !upscaling.settings.enableDLSSRR) {
-					upscaling.settings.enableDLSSRR = true;
-					logger::info("[RayTracing] Denoiser DLSS RR: Ray Reconstruction switched on in Upscaling");
-				}
+			if (ImGui::Combo("Denoiser", &denoiserIndex, denoisers, IM_ARRAYSIZE(denoisers))) {
+				settings.Denoiser = static_cast<int>(kOrder[std::clamp(denoiserIndex, 0, IM_ARRAYSIZE(kOrder) - 1)]);
+				OnDenoiserPicked();
 			}
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("How the grainy soft edges of the traced shadows are cleaned up (cost: F7 trace columns rt_*_gpu_ms).");
 				ImGui::Text("  Off: only a small blur.");
-				ImGui::Text("  Temporal: the small blur, then the last ~12 frames blended (Penumbra's history, without its edge blur). Cheap.");
 				ImGui::Text("  Penumbra (default): blurs each soft edge as wide as it really is (wide under tall trees, none at");
 				ImGui::Text("    contact shadows), then blends the last ~12 frames; extra rays only at shadow edges.");
 				ImGui::Text("  DLSS RR: no cleanup of ours; fresh noise every frame for DLSS Ray Reconstruction to clean up.");
-				ImGui::Text("    Picking it switches Ray Reconstruction on in Upscaling. While Ray Reconstruction is on, the shadows always");
-				ImGui::Text("    take this route, whatever is picked here (RR cleans only raw noise).");
+				ImGui::Text("    Picking it switches Ray Reconstruction on in Upscaling; picking any other one switches it off there.");
+				ImGui::Text("    While Ray Reconstruction is on in Upscaling, the shadows always take this route (RR cleans only raw noise).");
 				ImGui::Text("  NRD SIGMA: NVIDIA's shadow denoiser (one ray per pixel, its own blur and history).");
 			}
 			auto& upscaling = globals::features::upscaling;
 			if (rrActive && settings.Denoiser != static_cast<int>(DenoiserMode::DLSSRR)) {
 				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 0.5f, 0.85f, 1.0f, 1.0f });
-				ImGui::TextWrapped("Following Upscaling: Ray Reconstruction is on, so the shadows use the DLSS RR route (%s applies again when RR is off).",
-					denoisers[settings.Denoiser]);
+				ImGui::TextWrapped("Following Upscaling: Ray Reconstruction is on, so the shadows use the DLSS RR route.");
 				ImGui::PopStyleColor();
 			} else if (settings.Denoiser == static_cast<int>(DenoiserMode::DLSSRR) && !rrActive) {
 				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.85f, 0.3f, 1.0f });
@@ -2108,31 +1987,9 @@ void RayTracing::DrawSettings()
 					ImGui::TextColored({ 1.0f, 0.4f, 0.3f, 1.0f }, "SIGMA could not start: %s", sigmaFault.c_str());
 				ImGui::Unindent();
 			}
-			const char* noiseModes[] = { "Auto", "World-locked", "Animated" };
-			const char* adaptiveModes[] = { "Auto", "On", "Off" };
-			ImGui::Indent();
-			settings.Noise = std::clamp(settings.Noise, 0, 2);
-			const DenoiserMode effective = EffectiveDenoiser();
-			const bool noiseFixed = effective == DenoiserMode::DLSSRR || effective == DenoiserMode::Sigma;
-			if (noiseFixed)
-				ImGui::BeginDisabled();
-			ImGui::Combo("Noise", &settings.Noise, noiseModes, 3);
-			if (noiseFixed)
-				ImGui::EndDisabled();
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Auto: Animated with every denoiser that averages frames, World-locked with Off.");
-				ImGui::Text("World-locked: each spot of the world keeps its rays while the camera moves (frozen grain; nothing for a history to average).");
-				ImGui::Text("Animated: new rays every frame (the history averages them). DLSS RR and NRD SIGMA always use Animated.");
-			}
-			settings.AdaptiveRays = std::clamp(settings.AdaptiveRays, 0, 2);
-			ImGui::Combo("Adaptive Rays", &settings.AdaptiveRays, adaptiveModes, 3);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Extra rays only where a shadow edge is (by quality: Very Low / Low none, Medium +1, High +3, Ultra +4).");
-				ImGui::Text("Auto: on with every denoiser but Off. NRD SIGMA always traces one ray per pixel.");
-			}
-			ImGui::Unindent();
 		}
-		RayTracingTextureSharing::SetEnabled(settings.Enabled && settings.ShareGameTextures && (settings.Foliage != 0 || settings.Cutouts));  // also from the main menu
+		if (!typedUavLoadR8)
+			ImGui::TextDisabled("This GPU cannot rewrite Screen Space Shadows; they are kept as with Ray Tracing off.");
 		if (!alphaOffReason.empty()) {
 			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
 			ImGui::TextWrapped("Ray-traced foliage / cut-outs were switched off automatically: %s", alphaOffReason.c_str());
@@ -2218,224 +2075,27 @@ void RayTracing::DrawSettings()
 			ImGui::Text("Adaptive Rays: magenta = extra rays were traced here (shadow edges).");
 			ImGui::Text("SSS: RT Casters (Screen-space shadows: Non-RT casters only): yellow = a ray-traced caster; its screen-space");
 			ImGui::Text("  contact shadow is limited to the contact length.");
-			ImGui::Text("Distance Quality (45l): green = full quality, towards red = fewer extra rays and a smaller blur with distance,");
+			ImGui::Text("Distance Quality: green = full quality, towards red = fewer extra rays and a smaller blur with distance,");
 			ImGui::Text("  blue = pixels not traced this frame (checkerboard / half pattern), filled from their neighbours.");
-			ImGui::Text("Character Rays (45l): cyan = the extra ray against characters ran here, purple = a character shadows it.");
+			ImGui::Text("Character Rays: cyan = the extra ray against characters ran here, purple = a character shadows it.");
 		}
-		ImGui::Checkbox("Keep Static Casters in the Shadow Map", &settings.KeepCastersInShadowMap);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("A/B: normally objects the ray tracer covers are left out of the sun shadow map. On = they stay (the darker of both wins).");
-		ImGui::Checkbox("Treat Mostly-Opaque Alpha-Tested Shapes as Opaque", &settings.CutoutAsOpaque);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: big one-sided shapes whose cut-out only trims their edges (roof tiles, plank ends, stall canopies) block the sun");
-			ImGui::Text("  in the ray tracer as if solid. Two-sided cut-outs (banners, leaves, fences with holes) and small shapes stay out.");
-			ImGui::Text("Off: every alpha-tested shape keeps its shadow-map shadow (magenta in BLAS Coverage). Switching re-captures the scene.");
-		}
-		// (45i)
-		ImGui::Checkbox("Keep Characters in the Shadow Map", &settings.KeepCharactersInShadowMap);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("A/B: normally a ray-traced character part is left out of the sun shadow map.");
-			ImGui::Text("On = it stays there too (the darker of both wins): a safety net if a character shadow goes missing.");
-		}
-		ImGui::SliderFloat("Character Self-Shadow Offset", &settings.CharacterSelfShadowOffset, 0.0f, 16.0f, "%.1f units");
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Character surfaces nearer than this along a sun ray are ignored. Larger = less blocky self-shadowing");
-			ImGui::Text("  (shadow 'acne' on the body where it turns away from the sun), smaller = tighter contact shadows (feet, arms).");
-		}
-		// (45j)
-		// (45k)
-		ImGui::SliderFloat("Ray Start Offset", &settings.RayOffsetScale, 0.25f, 2.0f, "%.2f x");
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Sun rays start this far off the surface: 1.0 = 2 units + 0.15 %% of the distance (45j). Smaller = contact shadows");
-			ImGui::Text("  reach closer to the caster's base (low curbs, steps), but flat ground may start to show speckles (shadow acne).");
-		}
-		ImGui::Checkbox("Flush D3D11 Before the Trace", &settings.FlushBeforeTrace);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("45j flushed the game's D3D11 queue explicitly before every trace. Off (default): the fence Signal alone submits it.");
-			ImGui::Text("  A/B for the D3D12 record + submit spikes: the F7 trace columns rt_x_* show which call waits.");
-		}
-		// (45l) Cost and sync A/B (each off = 45k).
-		ImGui::Checkbox("Late Sync", &settings.LateSync);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: the game's GPU queue waits for the ray-traced shadows only after every other feature's preparation passes,");
-			ImGui::Text("  so that work runs while the trace runs. Off = 45k (it waited right after the trace was sent). Trace: rt_sync_gpu_ms.");
-		}
-		ImGui::Checkbox("Other Characters Skinned Every Other Frame (45l)", &settings.NpcAlternateFrameSkinning);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On = 45l: with other characters at reduced quality, their skinning and BLAS refit run every other frame (one frame late).");
-			ImGui::Text("  Off (default, 45m): every frame, like the player; reduced quality then only means fewer rays for them.");
-		}
-		// (45n) Spike and sync A/B (each off = 45m).
-		ImGui::Checkbox("Release Thread (45n)", &settings.ReleaseThread);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: GPU memory the ray tracer no longer needs is freed on a background thread. Freeing it on the render thread cost");
-			ImGui::Text("  about 0.5 ms per character part: 10-27 ms hitches whenever people walked out of range. Trace: rt_x_retire_ms, rt_x_collect_ms.");
-		}
-		ImGui::Checkbox("Early Prep (45n)", &settings.EarlyPrep);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: the BLAS builds and character skinning of the frame are sent at the very start of the frame (before the shadow maps)");
-			ImGui::Text("  instead of after the depth pass, so only the trace itself is left when the game's queue waits for it. Same frame, same data.");
-			ImGui::Text("  Needs Split D3D12 Submission. Trace: rt_early, rt_sync_gpu_ms, rt_queue_gap_gpu_ms.");
-		}
-		ImGui::Checkbox("Reuse Still Character Poses (45n)", &settings.ReuseStillPoses);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("On: a character part whose bones did not move at all since the last frame keeps its skinned shape (no GPU skinning). Trace: rt_still_reused.");
-		ImGui::Checkbox("Split D3D12 Submission", &settings.SplitSubmit);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("On: BLAS builds, character skinning and the TLAS start at once; only the trace waits for the game's depth. Off = 45k.");
-		ImGui::Checkbox("Character Ray Culling", &settings.CharacterRayCulling);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: the extra ray against characters is only traced where the sun ray passes near a character (debug view Character Rays).");
-			ImGui::Text("  Off = 45k: traced for every pixel while any character is traced.");
-		}
-		ImGui::Checkbox("Blocker Distance at Edges Only", &settings.BlockerAtEdges);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Penumbra: the costly 'nearest blocker' search (for the blur width) only at shadow edges, with the first extra ray.");
-			ImGui::Text("  Off = 45k: on every pixel's first ray.");
-		}
-		ImGui::Checkbox("Distance Fall-off", &settings.DistanceFalloff);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("On: the quality tier's fall-off with distance (fewer edge rays, smaller blur, the far pattern). Off: full quality at any distance.");
-		ImGui::Checkbox("Build Behind Loading Screens", &settings.LoadingBoost);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("On: while a loading screen is up, cells are captured and built with a large budget (nothing is traced there).");
-		ImGui::Checkbox("Warm-Up After Loading Screens", &settings.WarmUp);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: after a loading screen the shadow map keeps every caster until the nearby scene is built (5 s at most),");
-			ImGui::Text("  and the ray-traced shadows fade in over half a second. Off: as 45j.");
-		}
-		if (!lastLoadingSummary.empty())
-			ImGui::TextWrapped("Last loading screen: %s", lastLoadingSummary.c_str());
-		ImGui::Checkbox("Stable Normals at Depth Edges", &settings.StableNormals);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("On: thin edges (leaves, blades, branch silhouettes) use the view direction as normal instead of a depth normal that flips every frame.");
-		ImGui::Checkbox("Fine Cut-out Mips", &settings.FineAlphaMips);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: ray-traced cut-outs are read at a detail that depends only on the distance to the hit (not on the camera),");
-			ImGui::Text("  never below 256 texels, with the alpha threshold eased slightly at coarser mips (fuller leaf shadows). Off = 45i.");
-		}
-		ImGui::Checkbox("Share Game Textures with the Ray Tracer", &settings.ShareGameTextures);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Ray-traced foliage / cut-outs: textures loaded while this is on are created shareable and read at full resolution.");
-			ImGui::Text("  Off (default): every cut-out is read from a 256x256 copy (slightly softer edges).");
-			ImGui::Text("  Suspect of the 45i frame-pacing change (the GPU wait moving from Present into a Map); test it with an F7 trace.");
-			ImGui::Text("  Takes effect for textures loaded afterwards (restart or load a save).");
-		}
-		if (!typedUavLoadR8)
-			ImGui::TextDisabled("This GPU cannot rewrite Screen Space Shadows; they are kept as with Ray Tracing off.");
 
 		const auto& rt = backend.GetStats();
 		const auto& sc = scene.GetStats();
 		const auto& skip = sc.skipped;
-		if (!backend.AdapterDescription().empty())
-			ImGui::Text("GPU: %s", backend.AdapterDescription().c_str());
-		ImGui::Text("Cells: %u captured, %u loading, %u recaptured (total)", sc.cellsComplete, sc.cellsGathering, sc.recaptures);
-		ImGui::Text("Scene: %u shapes, %.2f M triangles (persistent references taken: %u statics, %u objects)", sc.shapes,
-			static_cast<double>(sc.triangles) / 1e6, sc.persistentRefs, sc.persistentObjects);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Persistent references are kept by the worldspace, not by the cell they stand in; they are taken with that cell.");
-		{
-			const auto& ob = sc.objects;
-			ImGui::Text("Objects: %u now (captured so far: doors/activators/movable %u, items %u, trees/plants %u), %u shapes in the scene,",
-				ob.captured, ob.refs[0], ob.refs[1], ob.refs[2], ob.registeredShapes);
-			ImGui::Text("  %u distinct meshes (%.2f M triangles)%s", ob.meshes, static_cast<double>(ob.meshTriangles) / 1e6,
-				ob.overBudget ? std::format(", {} new meshes left out (VRAM budget)", ob.overBudget).c_str() : "");
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Doors, activators, movable statics, lights, loose items and the opaque parts of trees and plants (trunks, branches).");
-				ImGui::Text("Each is traced where it is this frame. Leaves and other alpha-tested parts keep their shadow-map shadow");
-				ImGui::Text("  unless Alpha-tested casters is on.");
-			}
-		}
-		{
-			// (45h) Alpha-tested casters.
-			const auto& al = sc.alpha;
-			const auto& ab = backend.GetAlphaStats();
-			const auto share = RayTracingTextureSharing::GetCounts();
-			ImGui::Text("Alpha-tested: %u shapes traced with their cut-out (%u captured, %u meshes, %.2f M triangles, %u instances last frame)",
-				al.registered, al.captured, al.meshes, static_cast<double>(al.meshTriangles) / 1e6, ab.instancesLastFrame);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Captured shapes wait until their BLAS is built and their texture is ready; then they leave the shadow map.");
-				ImGui::Text("Cyan in BLAS Coverage = an alpha-tested surface the ray tracer sees with its cut-out.");
-			}
-			ImGui::Text("  Textures: %u shared at full resolution, %u as 256x256 copies (%u being made)%s", ab.texturesShared, ab.texturesFallback,
-				ab.texturesPending, ab.sharedPathOff ? " -- sharing gave up this session" : "");
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Shared: the game's own texture, read directly (no copy, no extra VRAM). Copy: textures loaded before the switch");
-				ImGui::Text("  was on, or not shareable; a 256x256 alpha copy is made (slightly softer cut-out). A restart / load with the");
-				ImGui::Text("  switch on shares more of them.");
-				ImGui::Text("Not shareable %llu, D3D12 could not open %llu, bindless table full %llu.", static_cast<unsigned long long>(ab.notShareable),
-					static_cast<unsigned long long>(ab.openFailed), static_cast<unsigned long long>(ab.slotsFull));
-			}
-			ImGui::Text("  Texture loads made shareable: %llu of %llu diffuse loads (%llu refused by the driver%s)", static_cast<unsigned long long>(share.shared),
-				static_cast<unsigned long long>(share.diffuse), static_cast<unsigned long long>(share.refused), share.gaveUp ? ", gave up" : "");
-			ImGui::Text("  VRAM: texcoords %s of %s, copies %s, records %s; left to the shadow map: %u mesh, %u texture, %u buffer full",
-				Megabytes(ab.uvBytesUsed).c_str(), Megabytes(ab.uvBytes).c_str(), Megabytes(ab.layerBytes).c_str(), Megabytes(ab.infoBytes).c_str(),
-				al.failedMesh, al.failedTexture, al.failedRecord);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Texcoords: 24 bytes per alpha-tested triangle (one buffer of %s, allocated on first use). Copies: 256x256 alpha layers.",
-					Megabytes(64ull << 20).c_str());
-				ImGui::Text("Left to the shadow map (since start): mesh unreadable or too big, texture not registrable, texcoord buffer / copy layers / records full");
-				ImGui::Text("  (copy layers full %llu, texcoords full %llu, records full %llu).", static_cast<unsigned long long>(ab.layersFull),
-					static_cast<unsigned long long>(ab.uvFull), static_cast<unsigned long long>(ab.infosFull));
-			}
-		}
-		{
-			// (45i) Characters.
-			const auto& ch = characters.GetStats();
-			const auto& sk = backend.GetSkinStats();
-			ImGui::Text("Characters: %u actors (%u in range), %u shapes traced of %u captured (%u skinned, %u rigid, %u physics, %u hair, %u alpha-tested)",
-				ch.actors, ch.inRange, ch.registered, ch.shapes, ch.skinnedShapes, ch.rigidShapes, ch.physicsShapes, ch.hairShapes, ch.alphaShapes);
-			ImGui::Text("  Hair recognised (since capture): %u by the hair tint material, %u by name / texture; left to the shadow map (Hair off) %u",
-				ch.hairByTint, ch.hairByName, ch.skipHairOff);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Traced = in the TLAS and left out of the shadow map. Rigid = weapons, shields, quivers (one bone: the shape itself).");
-				ImGui::Text("Purple in BLAS Coverage = a character surface the ray tracer sees.");
-			}
-			ImGui::Text("  Skinned %.2f M vertices last frame, %u in the TLAS; refits %u, builds %u (%llu total), %u not ready; %u waiting for upload",
-				static_cast<double>(sk.verticesLastFrame) / 1e6, sk.drawsLastFrame, sk.refitsLastFrame, sk.buildsLastFrame,
-				static_cast<unsigned long long>(sk.buildsTotal), sk.notReadyLastFrame, sk.pending);
-			ImGui::Text("  VRAM: %s (of %s budget), scratch %s, bones %s; CPU %.2f ms (worst %.2f ms)", Megabytes(sk.bytes).c_str(),
-				Megabytes(RayTracingRT::Backend::kSkinBudgetBytes).c_str(), Megabytes(sk.scratchBytes).c_str(), Megabytes(sk.boneBytes).c_str(), ch.lastMs, ch.maxMs);
-			ImGui::Text("  Left to the shadow map: physics off %u, alpha off %u, alpha failed %u, shader %u, type %u, no CPU data %u, bad data %u,",
-				ch.skipPhysicsOff, ch.skipAlphaOff, ch.skipAlphaFailed, ch.skipShader, ch.skipGeometryType, ch.skipNoCpuData, ch.skipBadData);
-			ImGui::Text("    placement %u, budget/size %u (VRAM %llu), shape cap %u; bone indices: palette %u, global %u; faces (morphs at capture) %u",
-				ch.skipPlacement, ch.skipBackend, static_cast<unsigned long long>(sk.overBudget), ch.skipShapeCap, ch.paletteMode, ch.globalMode,
-				ch.dynamicShapes);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Each distinct shape is counted once. Placement: its skinned vertices did not fit the game's own bounds (details in the log).");
-				ImGui::Text("Shader: decals, effect shaders, alpha-blended only, does not cast shadows. Changes (equip, dismember) so far: %u.", ch.retiredShapes);
-			}
-		}
-		ImGui::Text("BLAS: %u built (%.2f M triangles), %u queued, %u instances, %llu builds total", rt.blasCount,
-			static_cast<double>(rt.blasTriangles) / 1e6, rt.blasQueued, rt.instancesLastFrame, static_cast<unsigned long long>(rt.buildsTotal));
 		const auto& alphaBytes = backend.GetAlphaStats();
 		const std::uint64_t vram = rt.blasBytes + rt.scratchBytes + rt.tlasBytes + rt.uploadBytes + rt.sharedTextureBytes + d3d11Bytes +
 		                           alphaBytes.uvBytes + alphaBytes.layerBytes + alphaBytes.infoBytes +
-		                           backend.GetSkinStats().bytes + backend.GetSkinStats().scratchBytes + backend.GetSkinStats().boneBytes;  // (45i)
-		ImGui::Text("VRAM: %s total (BLAS %s, scratch %s, TLAS %s, uploads %s, textures %s)", Megabytes(vram).c_str(),
-			Megabytes(rt.blasBytes).c_str(), Megabytes(rt.scratchBytes).c_str(), Megabytes(rt.tlasBytes).c_str(),
-			Megabytes(rt.uploadBytes).c_str(), Megabytes(rt.sharedTextureBytes + d3d11Bytes).c_str());
-		if (overVramBudget)
-			ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "  Over the 1.2 GB scene budget: no further cells are captured.");
-		if (rt.compactedSavedBytes)
-			ImGui::Text("  Compaction saved %s so far", Megabytes(rt.compactedSavedBytes).c_str());
+		                           backend.GetSkinStats().bytes + backend.GetSkinStats().scratchBytes + backend.GetSkinStats().boneBytes;
+		const auto& check = backend.GetTlasCheck();
+		std::uint32_t mismatched = 0, notBuilt = 0;
+		for (int c = 0; c < RayTracingRT::kInstanceCategories; ++c) {
+			mismatched += check.mismatched[c];
+			notBuilt += check.notBuilt[c];
+		}
 		const float frameMs = Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracing);
 		ImGui::Text("GPU: %.2f ms on the RT queue (builds + trace)%s", rt.smoothedGpuMs,
 			frameMs > 0.0f ? std::format(", {:.2f} ms in the frame (Performance Overlay row)", frameMs).c_str() : "");
-		{
-			// (45l) Last samples per pass (the GPU timers run while the overlay table or an F7 trace is on).
-			auto* timers = Util::GpuPassTimers::GetSingleton();
-			auto ms = [&](Util::GpuBucket a_bucket) { return std::max(timers->LastSampleMs(a_bucket), 0.0f); };
-			ImGui::Text("  last frame: builds/skinning/TLAS %.2f, trace %.2f; denoiser tiles %.2f, filter %.2f, SIGMA %.2f; combine %.2f; game queue waiting %.2f ms",
-				std::max(rt.lastPrepGpuMs, 0.0f), std::max(rt.lastTraceGpuMs, 0.0f), ms(Util::GpuBucket::RayTracingDenoise), ms(Util::GpuBucket::RayTracingDenoiseFilter),
-				ms(Util::GpuBucket::RayTracingSigma), ms(Util::GpuBucket::RayTracingCombine), ms(Util::GpuBucket::RayTracingSync));
-			static constexpr const char* kDenoiserNames[] = { "Off", "Temporal", "Penumbra", "DLSS RR", "NRD SIGMA" };
-			const auto& q = lastQuality;
-			ImGui::Text("  in effect: denoiser %s, %u+%u rays, pattern %s / far %s, fall-off %.0f-%.0f, other characters %s (%u of %u shapes re-used)",
-				kDenoiserNames[static_cast<int>(lastEffectiveDenoiser)], q.baseRays, q.extraRays, kPatternNames[std::min(q.tracePattern, 2u)],
-				kPatternNames[std::min(q.farPattern, 2u)], q.falloffStart, q.falloffEnd, q.npcReduced ? "reduced" : "full", backend.GetSkinStats().reusedLastFrame,
-				backend.GetSkinStats().drawsLastFrame);
-		}
 		ImGui::Text("CPU: %.2f ms this frame, capture %.2f ms (worst %.2f ms, last cell %.1f ms in total)", lastCpuMs, sc.lastGatherMs,
 			sc.maxGatherMs, sc.lastCellMs);
 		ImGui::SameLine();
@@ -2444,69 +2104,161 @@ void RayTracing::DrawSettings()
 			characters.ResetPeaks();
 			cpuWorst = {};
 		}
-		{
-			// (45j) Where the CPU goes (average / worst since reset); every frame of it is in the F7 trace (rt_* columns).
-			const auto& a = cpuSmoothed;
-			const auto& w = cpuWorst;
-			ImGui::Text("  avg / worst ms: scene %.2f / %.1f, characters %.2f / %.1f, instances %.2f / %.1f, missed casters %.2f / %.1f", a.scene, w.scene,
-				a.characters, w.characters, a.instances, w.instances, a.missed, w.missed);
-			ImGui::Text("  D3D12 record + submit %.2f / %.1f, D3D11 passes %.2f / %.1f, end of frame %.2f / %.1f; engine objects waiting to be dropped %u",
-				a.execute, w.execute, a.d3d11, w.d3d11, a.endFrame, w.endFrame, scene.GetFrameTimes().releasePending);
+		ImGui::Text("VRAM: %s total", Megabytes(vram).c_str());
+		if (overVramBudget)
+			ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "  Over the 1.2 GB scene budget: no further cells are captured.");
+		const ImVec4 bad{ 1.0f, 0.5f, 0.3f, 1.0f }, good{ 0.6f, 0.9f, 0.6f, 1.0f };
+		ImGui::TextColored(mismatched ? bad : good, "Self-check: %u of %u instances outside the game's own bounds (%llu so far, should be 0)", mismatched,
+			check.checked, static_cast<unsigned long long>(check.mismatchedTotal));
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Each ray-traced instance, exactly as handed to the GPU, must lie inside the bounds the game computed for its shapes. Details in the log.");
+		ImGui::TextColored(sc.missedConfirmed ? bad : good, "Missed casters: %u big shapes cast a shadow-map shadow inside the traced area but are not in the scene",
+			sc.missedConfirmed);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Shapes with a bound radius of %.0f units or more drawn into the sun shadow map inside the traced area.", RayTracingCasterFilter::kMissedMinRadius);
+			ImGui::Text("Counted once each, only after their cell finished capturing and their BLAS was built (%u were re-checked later).", sc.missedPending);
+			ImGui::Text("Each distinct one is described in the log (8 per 10 s, 200 per session; characters and tree leaves are not).");
+			ImGui::Text("A reference its cell did not have when captured gets one recapture first (%u requested so far).", sc.missedRecaptures);
 		}
-		ImGui::Text("Shadow map: %u casters handed to RT, %u draws left out last frame%s", RayTracingCasterFilter::RegisteredCount(),
-			RayTracingCasterFilter::SkippedLastFrame(), filterLatched ? "" : " (not active)");
 		{
-			// (45f) Self-checks.
-			const auto& check = backend.GetTlasCheck();
-			std::uint32_t mismatched = 0, notBuilt = 0;
-			for (int c = 0; c < RayTracingRT::kInstanceCategories; ++c) {
-				mismatched += check.mismatched[c];
-				notBuilt += check.notBuilt[c];
+			static constexpr const char* kDenoiserNames[] = { "Off", "Penumbra", "Penumbra", "DLSS RR", "NRD SIGMA" };
+			const auto& q = lastQuality;
+			ImGui::Text("In effect: denoiser %s, %u+%u rays, pattern %s / far %s, fall-off %.0f-%.0f, other characters %s (%u of %u shapes re-used)",
+				kDenoiserNames[static_cast<int>(lastEffectiveDenoiser)], q.baseRays, q.extraRays, kPatternNames[std::min(q.tracePattern, 2u)],
+				kPatternNames[std::min(q.farPattern, 2u)], q.falloffStart, q.falloffEnd, q.npcReduced ? "reduced" : "full", backend.GetSkinStats().reusedLastFrame,
+				backend.GetSkinStats().drawsLastFrame);
+		}
+
+		if (ImGui::TreeNodeEx("Details")) {
+			if (!lastLoadingSummary.empty())
+				ImGui::TextWrapped("Last loading screen: %s", lastLoadingSummary.c_str());
+			if (!backend.AdapterDescription().empty())
+				ImGui::Text("GPU: %s", backend.AdapterDescription().c_str());
+			ImGui::Text("Cells: %u captured, %u loading, %u recaptured (total)", sc.cellsComplete, sc.cellsGathering, sc.recaptures);
+			ImGui::Text("Scene: %u shapes, %.2f M triangles (persistent references taken: %u statics, %u objects)", sc.shapes,
+				static_cast<double>(sc.triangles) / 1e6, sc.persistentRefs, sc.persistentObjects);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Persistent references are kept by the worldspace, not by the cell they stand in; they are taken with that cell.");
+			{
+				const auto& ob = sc.objects;
+				ImGui::Text("Objects: %u now (captured so far: doors/activators/movable %u, items %u, trees/plants %u), %u shapes in the scene,",
+					ob.captured, ob.refs[0], ob.refs[1], ob.refs[2], ob.registeredShapes);
+				ImGui::Text("  %u distinct meshes (%.2f M triangles)%s", ob.meshes, static_cast<double>(ob.meshTriangles) / 1e6,
+					ob.overBudget ? std::format(", {} new meshes left out (VRAM budget)", ob.overBudget).c_str() : "");
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Doors, activators, movable statics, lights, loose items and the opaque parts of trees and plants (trunks, branches).");
+					ImGui::Text("Each is traced where it is this frame. Leaves and other alpha-tested parts keep their shadow-map shadow");
+					ImGui::Text("  unless Alpha-tested casters is on.");
+				}
 			}
+			{
+				// (45h) Alpha-tested casters.
+				const auto& al = sc.alpha;
+				const auto& ab = backend.GetAlphaStats();
+				ImGui::Text("Alpha-tested: %u shapes traced with their cut-out (%u captured, %u meshes, %.2f M triangles, %u instances last frame)",
+					al.registered, al.captured, al.meshes, static_cast<double>(al.meshTriangles) / 1e6, ab.instancesLastFrame);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Captured shapes wait until their BLAS is built and their texture is ready; then they leave the shadow map.");
+					ImGui::Text("Cyan in BLAS Coverage = an alpha-tested surface the ray tracer sees with its cut-out.");
+				}
+				ImGui::Text("  Textures: %u as 256x256 alpha copies (%u being made)", ab.texturesFallback, ab.texturesPending);
+				ImGui::Text("  VRAM: texcoords %s of %s, copies %s, records %s; left to the shadow map: %u mesh, %u texture, %u buffer full",
+					Megabytes(ab.uvBytesUsed).c_str(), Megabytes(ab.uvBytes).c_str(), Megabytes(ab.layerBytes).c_str(), Megabytes(ab.infoBytes).c_str(),
+					al.failedMesh, al.failedTexture, al.failedRecord);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Texcoords: 24 bytes per alpha-tested triangle (one buffer of %s, allocated on first use). Copies: 256x256 alpha layers.",
+						Megabytes(64ull << 20).c_str());
+					ImGui::Text("Left to the shadow map (since start): mesh unreadable or too big, texture not registrable, texcoord buffer / copy layers / records full");
+					ImGui::Text("  (copy layers full %llu, texcoords full %llu, records full %llu).", static_cast<unsigned long long>(ab.layersFull),
+						static_cast<unsigned long long>(ab.uvFull), static_cast<unsigned long long>(ab.infosFull));
+				}
+			}
+			{
+				// (45i) Characters.
+				const auto& ch = characters.GetStats();
+				const auto& sk = backend.GetSkinStats();
+				ImGui::Text("Characters: %u actors (%u in range), %u shapes traced of %u captured (%u skinned, %u rigid, %u physics, %u hair, %u alpha-tested)",
+					ch.actors, ch.inRange, ch.registered, ch.shapes, ch.skinnedShapes, ch.rigidShapes, ch.physicsShapes, ch.hairShapes, ch.alphaShapes);
+				ImGui::Text("  Hair recognised (since capture): %u by the hair tint material, %u by name / texture; left to the shadow map (Hair off) %u",
+					ch.hairByTint, ch.hairByName, ch.skipHairOff);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Traced = in the TLAS and left out of the shadow map. Rigid = weapons, shields, quivers (one bone: the shape itself).");
+					ImGui::Text("Purple in BLAS Coverage = a character surface the ray tracer sees.");
+				}
+				ImGui::Text("  Skinned %.2f M vertices last frame, %u in the TLAS; refits %u, builds %u (%llu total), %u not ready; %u waiting for upload",
+					static_cast<double>(sk.verticesLastFrame) / 1e6, sk.drawsLastFrame, sk.refitsLastFrame, sk.buildsLastFrame,
+					static_cast<unsigned long long>(sk.buildsTotal), sk.notReadyLastFrame, sk.pending);
+				ImGui::Text("  VRAM: %s (of %s budget), scratch %s, bones %s; CPU %.2f ms (worst %.2f ms)", Megabytes(sk.bytes).c_str(),
+					Megabytes(RayTracingRT::Backend::kSkinBudgetBytes).c_str(), Megabytes(sk.scratchBytes).c_str(), Megabytes(sk.boneBytes).c_str(), ch.lastMs, ch.maxMs);
+				ImGui::Text("  Left to the shadow map: physics off %u, alpha off %u, alpha failed %u, shader %u, type %u, no CPU data %u, bad data %u,",
+					ch.skipPhysicsOff, ch.skipAlphaOff, ch.skipAlphaFailed, ch.skipShader, ch.skipGeometryType, ch.skipNoCpuData, ch.skipBadData);
+				ImGui::Text("    placement %u, budget/size %u (VRAM %llu), shape cap %u; bone indices: palette %u, global %u; faces (morphs at capture) %u",
+					ch.skipPlacement, ch.skipBackend, static_cast<unsigned long long>(sk.overBudget), ch.skipShapeCap, ch.paletteMode, ch.globalMode,
+					ch.dynamicShapes);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Each distinct shape is counted once. Placement: its skinned vertices did not fit the game's own bounds (details in the log).");
+					ImGui::Text("Shader: decals, effect shaders, alpha-blended only, does not cast shadows. Changes (equip, dismember) so far: %u.", ch.retiredShapes);
+				}
+			}
+			ImGui::Text("BLAS: %u built (%.2f M triangles), %u queued, %u instances, %llu builds total", rt.blasCount,
+				static_cast<double>(rt.blasTriangles) / 1e6, rt.blasQueued, rt.instancesLastFrame, static_cast<unsigned long long>(rt.buildsTotal));
+			ImGui::Text("VRAM: BLAS %s, scratch %s, TLAS %s, uploads %s, textures %s", Megabytes(rt.blasBytes).c_str(), Megabytes(rt.scratchBytes).c_str(),
+				Megabytes(rt.tlasBytes).c_str(), Megabytes(rt.uploadBytes).c_str(), Megabytes(rt.sharedTextureBytes + d3d11Bytes).c_str());
+			if (rt.compactedSavedBytes)
+				ImGui::Text("  Compaction saved %s so far", Megabytes(rt.compactedSavedBytes).c_str());
+			{
+				// Last samples per pass (the GPU timers run while the overlay table or an F7 trace is on).
+				auto* timers = Util::GpuPassTimers::GetSingleton();
+				auto ms = [&](Util::GpuBucket a_bucket) { return std::max(timers->LastSampleMs(a_bucket), 0.0f); };
+				ImGui::Text("GPU last frame: builds/skinning/TLAS %.2f, trace %.2f; denoiser tiles %.2f, filter %.2f, SIGMA %.2f; combine %.2f; game queue waiting %.2f ms",
+					std::max(rt.lastPrepGpuMs, 0.0f), std::max(rt.lastTraceGpuMs, 0.0f), ms(Util::GpuBucket::RayTracingDenoise), ms(Util::GpuBucket::RayTracingDenoiseFilter),
+					ms(Util::GpuBucket::RayTracingSigma), ms(Util::GpuBucket::RayTracingCombine), ms(Util::GpuBucket::RayTracingSync));
+			}
+			{
+				// (45j) Where the CPU goes (average / worst since reset); every frame of it is in the F7 trace (rt_* columns).
+				const auto& a = cpuSmoothed;
+				const auto& w = cpuWorst;
+				ImGui::Text("  avg / worst ms: scene %.2f / %.1f, characters %.2f / %.1f, instances %.2f / %.1f, missed casters %.2f / %.1f", a.scene, w.scene,
+					a.characters, w.characters, a.instances, w.instances, a.missed, w.missed);
+				ImGui::Text("  D3D12 record + submit %.2f / %.1f, D3D11 passes %.2f / %.1f, end of frame %.2f / %.1f; engine objects waiting to be dropped %u",
+					a.execute, w.execute, a.d3d11, w.d3d11, a.endFrame, w.endFrame, scene.GetFrameTimes().releasePending);
+			}
+			ImGui::Text("Shadow map: %u casters handed to RT, %u draws left out last frame%s", RayTracingCasterFilter::RegisteredCount(),
+				RayTracingCasterFilter::SkippedLastFrame(), filterLatched ? "" : " (not active)");
 			ImGui::Text("TLAS: %u cell chunks, %u doors/activators, %u items, %u trees, %u alpha-tested, %u character parts (%u not built yet)",
 				check.written[RayTracingRT::kCategoryCell], check.written[RayTracingRT::kCategoryMovable], check.written[RayTracingRT::kCategoryItem],
 				check.written[RayTracingRT::kCategoryTree], check.written[RayTracingRT::kCategoryAlpha], check.written[RayTracingRT::kCategoryCharacter], notBuilt);
-			const ImVec4 bad{ 1.0f, 0.5f, 0.3f, 1.0f }, good{ 0.6f, 0.9f, 0.6f, 1.0f };
-			ImGui::TextColored(mismatched ? bad : good, "Self-check: %u of %u instances outside the game's own bounds (%llu so far, should be 0)", mismatched,
-				check.checked, static_cast<unsigned long long>(check.mismatchedTotal));
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Each ray-traced instance, exactly as handed to the GPU, must lie inside the bounds the game computed for its shapes. Details in the log.");
-			const std::uint32_t missed = sc.missedConfirmed;
-			ImGui::TextColored(missed ? bad : good, "Missed casters: %u big shapes cast a shadow-map shadow inside the traced area but are not in the scene", missed);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Shapes with a bound radius of %.0f units or more drawn into the sun shadow map inside the traced area.", RayTracingCasterFilter::kMissedMinRadius);
-				ImGui::Text("Counted once each, only after their cell finished capturing and their BLAS was built (%u were re-checked later).", sc.missedPending);
-				ImGui::Text("Each distinct one is described in the log (8 per 10 s, 200 per session; characters and tree leaves are not).");
-				ImGui::Text("A reference its cell did not have when captured gets one recapture first (%u requested so far).", sc.missedRecaptures);
+			{
+				// (45g) Why, by reason (this area).
+				std::string reasons;
+				for (int r = 0; r < static_cast<int>(RayTracingScene::MissReason::Count); ++r) {
+					if (sc.missedByReason[r])
+						reasons += std::format("{}{} {}", reasons.empty() ? "" : ", ", RayTracingScene::kMissReasonNames[r], sc.missedByReason[r]);
+				}
+				if (!reasons.empty())
+					ImGui::TextWrapped("  By reason: %s", reasons.c_str());
 			}
-			// (45g) Why, by reason (this area).
-			std::string reasons;
-			for (int r = 0; r < static_cast<int>(RayTracingScene::MissReason::Count); ++r) {
-				if (sc.missedByReason[r])
-					reasons += std::format("{}{} {}", reasons.empty() ? "" : ", ", RayTracingScene::kMissReasonNames[r], sc.missedByReason[r]);
+			if (rt.skippedFramesBusy || latchedWithoutTrace)
+				ImGui::Text("Frames without a trace (D3D12 busy): %u, of which with casters left out of the shadow map: %u (should be 0)",
+					rt.skippedFramesBusy, latchedWithoutTrace);
+			if (ImGui::TreeNodeEx("Skipped objects")) {
+				ImGui::Text("Characters %u, markers/other %u, disabled/no 3D %u, tree-animated parts of static objects %u",
+					skip.actors, skip.markers, skip.disabled, skip.foliage);
+				ImGui::Text("Shapes: hidden %u, alpha-tested %u, alpha-blended %u, decals %u, skinned %u, no shadow %u",
+					skip.hidden, skip.alphaTested, skip.alphaBlended, skip.decals, skip.skinned, skip.noShadow);
+				ImGui::Text("Shapes: not Lighting shader %u, other geometry types %u, no CPU vertex copy %u, bad data %u",
+					skip.notLighting, skip.otherGeometry, skip.noCpuData, skip.badData);
+				ImGui::Text("Shapes: camera-facing billboards %u, refraction (heat haze) %u, switched-off children %u; alpha-tested taken as opaque %u",
+					skip.billboard, skip.refraction, skip.switchedOff, skip.cutoutAsOpaque);
+				ImGui::Text("Statics with a Havok-driven part (hinged signs) traced as moving objects: %u", skip.physicsParts);
+				ImGui::Text("Alpha-tested traced with their cut-out %u, alpha-tested that could not be (small, no texture / texcoords, test) %u",
+					skip.alphaAnyHit, skip.alphaUnusable);
+				ImGui::Text("Placement check: %u shapes checked, %u fixed (other vertex format), %u left out (wrong place), %u without bound",
+					sc.placementChecked, sc.placementFixed, sc.placementRejected, sc.placementUnchecked);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("Each captured shape must fit inside the bound sphere the game computed for it. Details of the first misfits are in the log.");
+				ImGui::TreePop();
 			}
-			if (!reasons.empty())
-				ImGui::TextWrapped("  By reason: %s", reasons.c_str());
-		}
-		if (rt.skippedFramesBusy || latchedWithoutTrace)
-			ImGui::Text("Frames without a trace (D3D12 busy): %u, of which with casters left out of the shadow map: %u (should be 0)",
-				rt.skippedFramesBusy, latchedWithoutTrace);
-		if (ImGui::TreeNodeEx("Skipped objects")) {
-			ImGui::Text("Characters %u, markers/other %u, disabled/no 3D %u, tree-animated parts of static objects %u",
-				skip.actors, skip.markers, skip.disabled, skip.foliage);
-			ImGui::Text("Shapes: hidden %u, alpha-tested %u, alpha-blended %u, decals %u, skinned %u, no shadow %u",
-				skip.hidden, skip.alphaTested, skip.alphaBlended, skip.decals, skip.skinned, skip.noShadow);
-			ImGui::Text("Shapes: not Lighting shader %u, other geometry types %u, no CPU vertex copy %u, bad data %u",
-				skip.notLighting, skip.otherGeometry, skip.noCpuData, skip.badData);
-			ImGui::Text("Shapes: camera-facing billboards %u, refraction (heat haze) %u, switched-off children %u; alpha-tested taken as opaque %u",
-				skip.billboard, skip.refraction, skip.switchedOff, skip.cutoutAsOpaque);
-			ImGui::Text("Statics with a Havok-driven part (hinged signs) traced as moving objects: %u", skip.physicsParts);
-			ImGui::Text("Alpha-tested traced with their cut-out %u, alpha-tested that could not be (small, no texture / texcoords, test) %u",
-				skip.alphaAnyHit, skip.alphaUnusable);
-			ImGui::Text("Placement check: %u shapes checked, %u fixed (other vertex format), %u left out (wrong place), %u without bound",
-				sc.placementChecked, sc.placementFixed, sc.placementRejected, sc.placementUnchecked);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Each captured shape must fit inside the bound sphere the game computed for it. Details of the first misfits are in the log.");
 			ImGui::TreePop();
 		}
 		ImGui::TreePop();
@@ -2523,28 +2275,21 @@ std::string RayTracing::DescribeForProfile() const
 		return "not loaded";
 	static constexpr const char* kStatus[] = { "off", "unavailable", "failed", "paused", "loading", "active" };
 	static constexpr const char* kFoliage[] = { "shadow map", "ray traced", "both" };
-	static constexpr const char* kSSS[] = { "combine", "hand off", "keep", "non-RT casters only" };
-	static constexpr const char* kDenoisers[] = { "off", "temporal", "penumbra", "DLSS RR", "NRD SIGMA" };
-	static constexpr const char* kAuto[3][3] = { { "auto", "world-locked", "animated" }, { "auto", "on", "off" }, { "", "", "" } };
+	static constexpr const char* kDenoisers[] = { "off", "penumbra", "penumbra", "DLSS RR", "NRD SIGMA" };
 	auto mode = [](bool a_rt) { return a_rt ? "RT" : "SM"; };
-	auto onOff = [](bool a_on) { return a_on ? "on" : "off"; };
 	const QualityParams q = ResolveQuality();
 	std::string text = std::format("RT {} ({}), quality {}, buildings {}, objects {}, trees {}, foliage {}, cut-outs {}, characters {}, physics parts {}, hair {}, "
-								   "first-person player {}, SSS {} (contact {:.1f}), denoiser {}, noise {}, adaptive rays {}, ray offset {:.2f}, D3D11 flush {}, loading build {}, warm-up {}",
+								   "first-person player {}, SSS contact {:.1f}, denoiser {}",
 		settings.Enabled ? "on" : "off", kStatus[static_cast<int>(status)], kQualityNames[std::clamp(settings.QualityLevel, 0, 5)], mode(settings.Buildings),
 		mode(settings.Objects), mode(settings.Trees), kFoliage[std::clamp(settings.Foliage, 0, 2)], mode(settings.Cutouts), mode(settings.Characters),
-		mode(settings.PhysicsParts), mode(settings.Hair), settings.FirstPersonPlayer ? "RT" : "SM", kSSS[std::clamp(settings.ScreenSpaceShadows, 0, 3)],
-		settings.RtContactScale, kDenoisers[static_cast<int>(CurrentDenoiser())], kAuto[0][std::clamp(settings.Noise, 0, 2)], kAuto[1][std::clamp(settings.AdaptiveRays, 0, 2)],
-		settings.RayOffsetScale, onOff(settings.FlushBeforeTrace), onOff(settings.LoadingBoost), onOff(settings.WarmUp));
-	// (45l) What the tier sets, the denoiser in effect and the A/B switches.
+		mode(settings.PhysicsParts), mode(settings.Hair), settings.FirstPersonPlayer ? "RT" : "SM", settings.RtContactScale,
+		kDenoisers[static_cast<int>(CurrentDenoiser())]);
+	// What the tier sets and the denoiser in effect.
 	text += std::format(", denoiser in effect {}{}, rays {}+{}, sun cone {:.2f}, pattern {} far {}, fall-off {:.0f}-{:.0f}, other characters {}, denoise radius {:.0f} "
-						"taps {} {} far scale {:.2f}, history {:.0f} clamp {:.2f}, SIGMA stabilisation {}, late sync {}, split submit {}, character ray culling {}, "
-						"blocker at edges {}, distance fall-off {}, release thread {}, early prep {}, still poses {}",
+						"taps {} {} far scale {:.2f}, history {:.0f} clamp {:.2f}, SIGMA stabilisation {}",
 		kDenoisers[static_cast<int>(EffectiveDenoiser())], UpscalingRRActive() ? " (Upscaling RR on)" : "", q.baseRays, q.extraRays, q.coneDegrees,
 		kPatternNames[std::min(q.tracePattern, 2u)], kPatternNames[std::min(q.farPattern, 2u)], q.falloffStart, q.falloffEnd, q.npcReduced ? "reduced" : "full",
-		q.denoiseRadius, q.denoiseTaps, q.denoiseHalf ? "half res" : "full res", q.farDenoiseScale, q.history, q.clampSigma, settings.SigmaStabilizedFrames,
-		onOff(settings.LateSync), onOff(settings.SplitSubmit), onOff(settings.CharacterRayCulling), onOff(settings.BlockerAtEdges), onOff(settings.DistanceFalloff),
-		onOff(settings.ReleaseThread), onOff(settings.EarlyPrep), onOff(settings.ReuseStillPoses));
+		q.denoiseRadius, q.denoiseTaps, q.denoiseHalf ? "half res" : "full res", q.farDenoiseScale, q.history, q.clampSigma, settings.SigmaStabilizedFrames);
 	return text;
 }
 
@@ -2564,24 +2309,11 @@ nlohmann::json RayTracing::DescribeJson() const
 	j["physics_parts_rt"] = settings.PhysicsParts;
 	j["hair_rt"] = settings.Hair;
 	j["first_person_player_rt"] = settings.FirstPersonPlayer;
-	j["screen_space_shadows_mode"] = settings.ScreenSpaceShadows;
 	j["denoiser"] = settings.Denoiser;
-	j["noise"] = settings.Noise;
-	j["adaptive_rays"] = settings.AdaptiveRays;
 	j["rt_contact_scale"] = settings.RtContactScale;
-	j["ray_offset_scale"] = settings.RayOffsetScale;
-	j["flush_before_trace"] = settings.FlushBeforeTrace;
 	j["denoiser_effective"] = static_cast<int>(EffectiveDenoiser());
 	j["upscaling_rr_active"] = UpscalingRRActive();
 	j["sigma_stabilized_frames"] = settings.SigmaStabilizedFrames;
-	j["late_sync"] = settings.LateSync;
-	j["split_submit"] = settings.SplitSubmit;
-	j["character_ray_culling"] = settings.CharacterRayCulling;
-	j["blocker_at_edges"] = settings.BlockerAtEdges;
-	j["distance_falloff"] = settings.DistanceFalloff;
-	j["release_thread"] = settings.ReleaseThread;  // (45n)
-	j["early_prep"] = settings.EarlyPrep;
-	j["reuse_still_poses"] = settings.ReuseStillPoses;
 	{
 		auto* timers = Util::GpuPassTimers::GetSingleton();
 		j["gpu_pass_ms"] = { { "tiles", timers->SmoothedMs(Util::GpuBucket::RayTracingDenoise) }, { "filter", timers->SmoothedMs(Util::GpuBucket::RayTracingDenoiseFilter) },

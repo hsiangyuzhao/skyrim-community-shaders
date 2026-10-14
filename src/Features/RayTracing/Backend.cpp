@@ -398,10 +398,8 @@ namespace RayTracingRT
 		freeAlphaTextures_.clear();
 		alphaTextureIndex_.clear();
 		alphaCopyQueue_.clear();
-		freeAlphaSlots_.clear();
 		freeAlphaLayers_.clear();
-		nextAlphaSlot_ = nextAlphaLayer_ = 0;
-		retiredAlphaSlots_.clear();
+		nextAlphaLayer_ = 0;
 		retiredAlphaLayers_.clear();
 		retiredAlphaUv_.clear();
 		alphaInfos_.clear();
@@ -420,7 +418,6 @@ namespace RayTracingRT
 		alphaLayerFormat_ = DXGI_FORMAT_UNKNOWN;
 		alphaLayerCount_ = 0;
 		alphaLayersFailed_ = false;
-		alphaSharedOpened_ = 0;
 		alphaFault_.clear();
 		alphaStats_ = {};
 		// (45i)
@@ -634,7 +631,7 @@ namespace RayTracingRT
 			if (a_entry.counter)
 				*a_entry.counter -= std::min(*a_entry.counter, a_entry.bytes);
 			++count;
-			if (releaseOnWorker_ && a_entry.object)
+			if (a_entry.object)
 				handOff.push_back(std::move(a_entry.object));
 			return true;
 		});
@@ -1216,8 +1213,8 @@ namespace RayTracingRT
 		static const std::vector<Instance> kNoInstances;
 		const std::vector<Instance>& instances = a_input.instances ? *a_input.instances : kNoInstances;
 
-		// (45l) Recording first; the D3D11 ready Signal and the D3D12 queue Wait come after it. With
-		// splitSubmit the builds, skinning and the TLAS go out at once (they read nothing D3D11 writes)
+		// (45l) Recording first; the D3D11 ready Signal and the D3D12 queue Wait come after it. The
+		// builds, skinning and the TLAS go out at once (they read nothing D3D11 writes)
 		// and only the trace list waits for D3D11's depth copy, so the D3D11 queue later waits for the
 		// trace alone instead of everything (GPU-side ordering only; the CPU never waits).
 		// (45n) Early Prep: the allocator holds the prep list (in flight): not reset; the list is reset
@@ -1402,17 +1399,16 @@ namespace RayTracingRT
 		if (timestampHeap_ && !early)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
 
-		// The trace: in its own list behind the wait (split), or appended to the same one (45k).
-		ID3D12GraphicsCommandList4* traceList = list;
-		if (a_input.splitSubmit || early) {
-			if (FAILED(hr = list->Close()))
-				return Fail("command list Close", hr);
+		// The trace: in its own list behind the wait.
+		if (FAILED(hr = list->Close()))
+			return Fail("command list Close", hr);
+		{
 			ID3D12CommandList* prepLists[] = { list };
 			queue_->ExecuteCommandLists(1, prepLists);
-			traceList = context.traceList.Get();
-			if (FAILED(hr = traceList->Reset(context.allocator.Get(), nullptr)))
-				return Fail("trace command list Reset", hr);
 		}
+		ID3D12GraphicsCommandList4* traceList = context.traceList.Get();
+		if (FAILED(hr = traceList->Reset(context.allocator.Get(), nullptr)))
+			return Fail("trace command list Reset", hr);
 		if (timestampHeap_)
 			traceList->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 2);
 
@@ -1466,12 +1462,8 @@ namespace RayTracingRT
 		if (FAILED(hr = context11_->Signal(fence11_.Get(), readyValue)))
 			return Fail("D3D11 Signal", hr);
 		lap(split.signal11);
-		// (45k) The Signal submits the D3D11 work recorded so far by itself; the extra Flush of 45j
-		// is a switch (Debug: Flush D3D11 Before the Trace) so a trace can tell whether it blocks.
-		if (explicitFlush_)
-			context11_->Flush();
-		else
-			split.flushSkipped = true;
+		// (45k) The Signal submits the D3D11 work recorded so far by itself (no explicit Flush).
+		split.flushSkipped = true;
 		lap(split.flush11);
 		if (FAILED(hr = queue_->Wait(fence_.Get(), readyValue)))
 			return Fail("D3D12 queue Wait", hr);

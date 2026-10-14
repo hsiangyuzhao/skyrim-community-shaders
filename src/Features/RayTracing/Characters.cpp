@@ -277,7 +277,7 @@ namespace RayTracingCharacters
 		new std::vector<std::unique_ptr<Actor>>(std::move(retiring_));
 	}
 
-	void Characters::Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_keepInShadowMap, bool a_firstPersonPlayer)
+	void Characters::Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer)
 	{
 		if (a_physics != physics_ || a_hair != hair_ || a_alpha != alpha_)
 			RequestFlush();
@@ -285,23 +285,6 @@ namespace RayTracingCharacters
 		hair_ = a_hair;
 		alpha_ = a_alpha;
 		firstPersonPlayer_ = a_firstPersonPlayer;
-		if (a_keepInShadowMap != keepInShadowMap_) {
-			keepInShadowMap_ = a_keepInShadowMap;
-			if (keepInShadowMap_) {
-				// Back into the cascades from the next frame (still traced: the darker of both wins).
-				for (auto* list : { &actors_, &retiring_ }) {
-					for (auto& actor : *list) {
-						for (auto* shapes : { &actor->shapes, &actor->retiringShapes }) {
-							for (auto& shape : *shapes) {
-								if (shape->registered)
-									RayTracingCasterFilter::Remove(shape->geometry.get());
-								shape->registered = false;
-							}
-						}
-					}
-				}
-			}
-		}
 	}
 
 	void Characters::ReleaseShape(RayTracingRT::Backend& a_backend, Shape& a_shape)
@@ -901,7 +884,7 @@ namespace RayTracingCharacters
 		return shape;
 	}
 
-	void Characters::Update(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, const float a_rect[4])
+	void Characters::Update(RayTracingRT::Backend& a_backend, const float a_rect[4])
 	{
 		const std::int64_t start = Qpc();
 		if (flushRequested_.exchange(false))
@@ -1022,24 +1005,18 @@ namespace RayTracingCharacters
 		}
 
 		// 4. This frame's bone matrices; a bone that cannot be read keeps the last ones.
-		// (45l) Other actors at reduced quality: every other frame (staggered per actor) their shapes keep last
-		// frame's skinned BLAS (no bone read, no skinning, no refit; traced where they were skinned).
-		std::uint32_t actorIndex = 0;
 		stillReused_ = 0;
 		for (auto& actor : actors_) {
 			const auto translate = actor->root->world.translate;
 			const double origin[3] = { translate.x, translate.y, translate.z };
-			const bool offFrame = npcReduced_ && !actor->player && ((a_frame + actorIndex++) & 1u) != 0u;
 			for (auto& shape : actor->shapes) {
-				shape->reuse = offFrame && !shape->matrices.empty() && a_backend.IsSkinShapeReady(shape->handle);
-				if (shape->reuse)
-					continue;
+				shape->reuse = false;
 				static thread_local std::vector<float> fresh;
 				if (ReadBones(*shape, origin, fresh)) {
 					// (45n) Still pose: bit-identical to the matrices of last frame's draw (drawable then, so
 					// skinned with them or itself reused from identical ones): last frame's skinned BLAS is
 					// exact. The matrices are relative to the origin, which still moves the instance.
-					const bool still = stillPoseReuse_ && shape->drawable && !shape->matrices.empty() && fresh.size() == shape->matrices.size() &&
+					const bool still = shape->drawable && !shape->matrices.empty() && fresh.size() == shape->matrices.size() &&
 					                   std::memcmp(fresh.data(), shape->matrices.data(), fresh.size() * sizeof(float)) == 0 &&
 					                   a_backend.IsSkinShapeReady(shape->handle);
 					shape->matrices.swap(fresh);
@@ -1078,7 +1055,7 @@ namespace RayTracingCharacters
 						shape->drawable = false;
 					}
 				} else {
-					if (!shape->registered && !keepInShadowMap_ && a_backend.IsSkinShapeReady(shape->handle) &&
+					if (!shape->registered && a_backend.IsSkinShapeReady(shape->handle) &&
 						(!shape->alpha || a_backend.IsAlphaTextureReady(shape->texture))) {
 						RayTracingCasterFilter::Add(shape->geometry.get());
 						shape->registered = true;

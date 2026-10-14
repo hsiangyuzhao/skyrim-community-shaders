@@ -178,17 +178,12 @@ public:
 	/** @brief Binds a bucket's resources and dispatches the instance culling compute shader. */
 	void CullBucket(GrassBucket& b, ID3D11DeviceContext* ctx);
 
-	/** @brief (45c) Clears a bucket's draw-argument and LOD counters before its cull dispatch. */
+	/** @brief Clears a bucket's draw-argument and LOD counters before its cull dispatch. */
 	void ClearBucketCounters(GrassBucket& b, ID3D11DeviceContext* ctx);
-	/** @brief (45c) Binds a bucket's UAVs/SRVs/constants and issues its cull dispatch (no clear, no unbind). */
+	/** @brief Binds a bucket's UAVs/SRVs/constants and issues its cull dispatch (no clear, no unbind). */
 	void DispatchBucket(GrassBucket& b, ID3D11DeviceContext* ctx);
-	/** @brief (45c) Copies a bucket's LOD counts into the LOD draw arguments. Its UAVs must be unbound. */
+	/** @brief Copies a bucket's LOD counts into the LOD draw arguments. Its UAVs must be unbound. */
 	void CopyBucketLODCounts(GrassBucket& b, ID3D11DeviceContext* ctx);
-	/**
-	 * @brief (45c) Every visible bucket's cull as clear all -> one UAV-overlap scope {dispatch all} -> copy all.
-	 * Used while NVIDIA UAV overlap is on; the per-bucket loop (CullBucket) is kept unchanged otherwise.
-	 */
-	void CullBucketsBatched(ID3D11DeviceContext* ctx);
 
 	/** @brief Grows the slotted per-bucket constant buffer to hold at least `slots` entries. */
 	bool EnsureCullBucketCapacity(uint32_t slots, ID3D11Device* device);
@@ -240,10 +235,6 @@ public:
 	// Set on a failed GetCullCS() compile so the per-frame caller doesn't retry the compile and
 	// re-log the failure every frame; cleared by ClearShaderCache() to allow a retry.
 	bool cullCSFailed = false;
-	// (45c) The same shader with the NVIDIA warp-aggregated append (NV_SHADER_EXTN). Compiled next to
-	// cullCS whenever the driver supports it, so the Warp atomics switch never recompiles; null otherwise.
-	ID3D11ComputeShader* cullCSNv = nullptr;
-	bool cullCSNvFailed = false;
 
 	std::unique_ptr<ConstantBuffer> cullParamsCB;
 	// Slotted per-bucket constants bound via CSSetConstantBuffers1: one 256-byte slot per visible

@@ -4602,10 +4602,10 @@ void PerformanceOverlay::DrawCpuWaitSection()
 	ImGui::Text("Present wait %.2f ms | Reflex sleep %.2f ms", s.presentWaitMs, s.reflexSleepMs);
 	// (44f, A) Which Reflex marker placement runs, and what Reflex does with it.
 	{
-		const bool wanted = globals::features::upscaling.settings.reflexMarkersAtRenderStart;
+		const bool wanted = globals::features::upscaling.WantsReflexMarkersAtRenderStart();
 		const bool markers = wanted && Util::EngineTiming::ProbesInstalled();
 		const std::string latency = s.reflexLatencyMs > 0.0f ? std::format("{:.1f} ms", s.reflexLatencyMs) : std::string("n/a");
-		const std::string placement = markers ? std::string("at render start (44f)") :
+		const std::string placement = markers ? std::string("at render start") :
 		                              wanted  ? std::format("original (probes {})", Util::EngineTiming::ProbeStatus()) :
 		                                        std::string("original");
 		ImGui::Text("Reflex markers: %s | sleep %.2f ms | latency %s", placement.c_str(), s.reflexSleepMs, latency.c_str());

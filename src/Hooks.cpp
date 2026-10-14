@@ -20,14 +20,12 @@
 #include "Utils/EngineTiming.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
-#include "Utils/Nvapi.h"
 #include "Utils/OcclusionDryRun.h"
 
 #include "Features/GrassOptimizations.h"
 #include "Features/InteriorSun.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LODBlending.h"
-#include "Features/RayTracing/TextureSharing.h"
 #include "Features/Skin.h"
 #include "Features/TerrainHelper.h"
 #include "Features/Upscaling.h"
@@ -434,10 +432,6 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChain(
 		pFeatureLevel,
 		ppImmediateContext);
 
-	// (45c) Before the engine or any feature creates a shader: sets the global NVIDIA shader-extension slot.
-	if (SUCCEEDED(ret) && ppDevice && *ppDevice)
-		Util::Nvapi::OnDeviceCreated(*ppDevice);
-
 	return ret;
 }
 
@@ -642,9 +636,6 @@ namespace Hooks
 			stl::detour_vfunc<23, ID3D11Device_CreateSamplerState>(globals::d3d::device);
 			// (44f) Device Create* timing for the frame trace (measurement only).
 			Util::EngineTiming::InstallDeviceHooks(globals::d3d::device);
-			// (45h) Ray Tracing, Alpha-tested casters: diffuse textures loaded while the switch is on
-			// are created shareable with D3D12 (pass-through otherwise).
-			RayTracingTextureSharing::Install(globals::d3d::device);
 
 			globals::InstallD3DHooks(globals::d3d::context);
 			Util::FrameTrace::InstallContextHooks(globals::d3d::context);

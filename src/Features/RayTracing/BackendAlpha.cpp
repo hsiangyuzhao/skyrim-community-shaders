@@ -1,10 +1,8 @@
 // (45h) Alpha-tested casters on the ray tracer's D3D12 side: the textures their cut-outs come
 // from, their texcoords and the per-shape records the alpha variant of TraceShadowsCS reads.
 //
-// Textures: a game texture created shareable (TextureSharing.h) is opened on D3D12 and sampled at
-// full resolution through a bindless table (no copy, no VRAM). Any other one gets a 256x256 alpha
-// copy (5 mips) in a texture array shared from D3D11, made by AlphaMaskCS on D3D11 before the
-// frame's trace (the D3D12 queue waits for D3D11 on the GPU, so the trace sees it).
+// Textures: every cut-out texture gets a 256x256 alpha copy (5 mips) in a texture array shared from
+// D3D11, made by AlphaMaskCS on D3D11 before the frame's trace (the D3D12 queue waits for D3D11 on the GPU, so the trace sees it).
 // Texcoords: one buffer, a range per alpha BLAS (3 corners per triangle, uint2 each).
 // Records: a CPU table; each command context keeps its own upload copy, rewritten when the table
 // changed, so a record can be reused at once without touching a submission in flight.
@@ -24,41 +22,6 @@ namespace RayTracingRT
 	namespace
 	{
 		std::string Hr(HRESULT a_hr) { return std::format("0x{:08X}", static_cast<std::uint32_t>(a_hr)); }
-
-		/// Formats a game texture may be sampled as on D3D12 (typeless and video formats are not).
-		bool SampleableFormat(DXGI_FORMAT a_format)
-		{
-			switch (a_format) {
-			case DXGI_FORMAT_BC1_UNORM:
-			case DXGI_FORMAT_BC1_UNORM_SRGB:
-			case DXGI_FORMAT_BC2_UNORM:
-			case DXGI_FORMAT_BC2_UNORM_SRGB:
-			case DXGI_FORMAT_BC3_UNORM:
-			case DXGI_FORMAT_BC3_UNORM_SRGB:
-			case DXGI_FORMAT_BC4_UNORM:
-			case DXGI_FORMAT_BC5_UNORM:
-			case DXGI_FORMAT_BC7_UNORM:
-			case DXGI_FORMAT_BC7_UNORM_SRGB:
-			case DXGI_FORMAT_R8G8B8A8_UNORM:
-			case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-			case DXGI_FORMAT_B8G8R8A8_UNORM:
-			case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-			case DXGI_FORMAT_B8G8R8X8_UNORM:
-			case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
-			case DXGI_FORMAT_R8_UNORM:
-			case DXGI_FORMAT_A8_UNORM:
-			case DXGI_FORMAT_R8G8_UNORM:
-			case DXGI_FORMAT_R16G16B16A16_FLOAT:
-			case DXGI_FORMAT_R16G16B16A16_UNORM:
-			case DXGI_FORMAT_R10G10B10A2_UNORM:
-			case DXGI_FORMAT_B5G6R5_UNORM:
-			case DXGI_FORMAT_B5G5R5A1_UNORM:
-			case DXGI_FORMAT_B4G4R4A4_UNORM:
-				return true;
-			default:
-				return false;
-			}
-		}
 	}
 
 	void Backend::SetAlphaFault(std::string a_reason)
@@ -71,14 +34,11 @@ namespace RayTracingRT
 
 	void Backend::UpdateAlphaTextureStats()
 	{
-		alphaStats_.texturesShared = alphaStats_.texturesFallback = alphaStats_.texturesPending = 0;
+		alphaStats_.texturesFallback = alphaStats_.texturesPending = 0;
 		for (const auto& entry : alphaTextures_) {
 			if (!entry.live)
 				continue;
-			if (entry.resource12)
-				++alphaStats_.texturesShared;
-			else
-				++alphaStats_.texturesFallback;
+			++alphaStats_.texturesFallback;
 			if (!entry.ready)
 				++alphaStats_.texturesPending;
 		}
@@ -137,12 +97,6 @@ namespace RayTracingRT
 
 	void Backend::CollectAlphaRetired(std::uint64_t a_completed)
 	{
-		std::erase_if(retiredAlphaSlots_, [&](const DeferredFree& a_entry) {
-			if (a_entry.fence > a_completed)
-				return false;
-			freeAlphaSlots_.push_back(a_entry.value);
-			return true;
-		});
 		std::erase_if(retiredAlphaLayers_, [&](const DeferredFree& a_entry) {
 			if (a_entry.fence > a_completed)
 				return false;
@@ -303,81 +257,23 @@ namespace RayTracingRT
 		entry.texture11 = a_texture;
 		entry.sourceSize = std::max(desc.Width, desc.Height);
 
-		// 1. The game's texture itself (created shareable while the switch was on).
-		bool shared = false;
-		if (!alphaStats_.sharedPathOff && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED) && !(desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE)) {
-			ComPtr<IDXGIResource> dxgiResource;
-			HANDLE handle = nullptr;
-			if (SUCCEEDED(a_texture->QueryInterface(IID_PPV_ARGS(&dxgiResource))) && SUCCEEDED(dxgiResource->GetSharedHandle(&handle)) && handle) {
-				// A legacy (non-NT) handle, as upstream uses it: it is not closed.
-				ComPtr<ID3D12Resource> resource;
-				const HRESULT hr = device_->OpenSharedHandle(handle, IID_PPV_ARGS(&resource));
-				if (SUCCEEDED(hr) && resource) {
-					const auto rd = resource->GetDesc();
-					if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.DepthOrArraySize == 1 && SampleableFormat(rd.Format)) {
-						std::uint32_t slot = UINT32_MAX;
-						if (!freeAlphaSlots_.empty()) {
-							slot = freeAlphaSlots_.back();
-							freeAlphaSlots_.pop_back();
-						} else if (nextAlphaSlot_ < kAlphaTextureSlots) {
-							slot = nextAlphaSlot_++;
-						}
-						if (slot == UINT32_MAX) {
-							++alphaStats_.slotsFull;
-						} else {
-							auto cpu = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
-							cpu.ptr += static_cast<SIZE_T>(descriptorSize_) * (kAlphaDescriptorBase + slot);
-							D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-							srvDesc.Format = rd.Format;
-							srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-							srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-							srvDesc.Texture2D.MipLevels = rd.MipLevels;
-							device_->CreateShaderResourceView(resource.Get(), &srvDesc, cpu);
-							entry.resource12 = std::move(resource);
-							entry.gpuIndex = slot;
-							entry.ready = true;
-							shared = true;
-							++alphaSharedOpened_;
-						}
-					} else {
-						++alphaStats_.notShareable;
-					}
-				} else {
-					++alphaStats_.openFailed;
-					if (alphaStats_.openFailed <= 4)
-						logger::warn("[RayTracing] Alpha-tested casters: D3D12 could not open a shared game texture ({}x{}, format {}): {}", desc.Width,
-							desc.Height, static_cast<int>(desc.Format), Hr(hr));
-					if (alphaSharedOpened_ == 0 && alphaStats_.openFailed >= 32) {
-						alphaStats_.sharedPathOff = true;
-						logger::warn("[RayTracing] Alpha-tested casters: no shared texture could be opened; 256x256 copies only this session");
-					}
-				}
-			} else {
-				++alphaStats_.notShareable;
-			}
-		} else {
-			++alphaStats_.notShareable;
+		// A 256x256 alpha copy, made on D3D11 by RecordAlphaCopies.
+		if (!EnsureAlphaLayers())
+			return kInvalidAlphaTexture;
+		std::uint32_t layer = UINT32_MAX;
+		if (!freeAlphaLayers_.empty()) {
+			layer = freeAlphaLayers_.back();
+			freeAlphaLayers_.pop_back();
+		} else if (nextAlphaLayer_ < alphaLayerCount_) {
+			layer = nextAlphaLayer_++;
 		}
-
-		// 2. Otherwise a 256x256 alpha copy, made on D3D11 by RecordAlphaCopies.
-		if (!shared) {
-			if (!EnsureAlphaLayers())
-				return kInvalidAlphaTexture;
-			std::uint32_t layer = UINT32_MAX;
-			if (!freeAlphaLayers_.empty()) {
-				layer = freeAlphaLayers_.back();
-				freeAlphaLayers_.pop_back();
-			} else if (nextAlphaLayer_ < alphaLayerCount_) {
-				layer = nextAlphaLayer_++;
-			}
-			if (layer == UINT32_MAX) {
-				++alphaStats_.layersFull;
-				return kInvalidAlphaTexture;
-			}
-			entry.view11 = a_view;
-			entry.gpuIndex = kAlphaFallbackBit | layer;
-			entry.ready = false;
+		if (layer == UINT32_MAX) {
+			++alphaStats_.layersFull;
+			return kInvalidAlphaTexture;
 		}
+		entry.view11 = a_view;
+		entry.gpuIndex = kAlphaFallbackBit | layer;
+		entry.ready = false;
 
 		entry.live = true;
 		entry.users = 1;
@@ -406,10 +302,7 @@ namespace RayTracingRT
 		if (--entry.users > 0)
 			return;
 		alphaTextureIndex_.erase(entry.texture11.Get());
-		if (entry.resource12) {
-			Retire(entry.resource12, 0, nullptr);
-			retiredAlphaSlots_.push_back(DeferredFree{ RetireValue(), entry.gpuIndex, 0 });
-		} else if (entry.gpuIndex != UINT32_MAX) {
+		if (entry.gpuIndex != UINT32_MAX) {
 			retiredAlphaLayers_.push_back(DeferredFree{ RetireValue(), entry.gpuIndex & ~kAlphaFallbackBit, 0 });
 			std::erase(alphaCopyQueue_, a_texture);
 		}

@@ -6,7 +6,6 @@
 #include "State.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/FrameTrace.h"
-#include "Utils/Nvapi.h"
 #include "Utils/WinApi.h"
 
 #include <optional>
@@ -327,7 +326,7 @@ bool GrassOptimizations::OptimizedShadersReady()
 
 void GrassOptimizations::UpdateGrass()
 {
-	// (45c) Optional so the culling submission below can get its own rows (timers do not nest).
+	// Optional so the culling submission below can get its own rows (timers do not nest).
 	std::optional<Util::CpuPassScope> cpuScope(std::in_place, "GrassOptimizations");
 	std::optional<GpuTimerScope> gpuScope(std::in_place);
 
@@ -492,7 +491,7 @@ void GrassOptimizations::UpdateGrass()
 		++visibleBuckets;
 	}
 
-	// (45c) The cull submission (constants, slice table, every bucket's dispatch and LOD copies) has its own
+	// The cull submission (constants, slice table, every bucket's dispatch and LOD copies) has its own
 	// "Grass Culling" CPU and GPU rows; the Grass Optimizations rows keep everything else.
 	cpuScope.reset();
 	gpuScope.reset();
@@ -701,16 +700,11 @@ void GrassOptimizations::UploadCullState(ID3D11Device* device, ID3D11DeviceConte
 			b.cullVisible = false;
 	}
 
-	// (45c) Warp atomics: the NV_SHADER_EXTN twin when it compiled and the switch is on.
-	ctx->CSSetShader(cullCSNv && Util::Nvapi::Use(Util::Nvapi::Item::WarpAtomics) ? cullCSNv : cullCS, nullptr, 0);
+	ctx->CSSetShader(cullCS, nullptr, 0);
 
-	if (Util::Nvapi::Use(Util::Nvapi::Item::UavOverlap)) {
-		CullBucketsBatched(ctx);
-	} else {
-		for (auto& [key, b] : bucketStore.buckets)
-			if (b.cullVisible)
-				CullBucket(b, ctx);
-	}
+	for (auto& [key, b] : bucketStore.buckets)
+		if (b.cullVisible)
+			CullBucket(b, ctx);
 
 	ID3D11UnorderedAccessView* nullUAVs[4 + 2 * (size_t)GrassMeshLibrary::LODTier::kCount] = {};
 	ctx->CSSetUnorderedAccessViews(0, (UINT)std::size(nullUAVs), nullUAVs, nullptr);
@@ -796,10 +790,6 @@ void GrassOptimizations::ClearShaderCache()
 		cullCS->Release();
 	cullCS = nullptr;
 	cullCSFailed = false;
-	if (cullCSNv)
-		cullCSNv->Release();
-	cullCSNv = nullptr;
-	cullCSNvFailed = false;
 	hiZ.ClearShaderCache();
 }
 
@@ -810,24 +800,6 @@ ID3D11ComputeShader* GrassOptimizations::GetCullCS()
 		if (!cullCS) {
 			cullCSFailed = true;
 			logger::error("[GRASS OPTIMIZATIONS] cull CS load failed — optimized path disabled");
-		}
-	}
-	// (45c) The warp-atomics twin, only when the driver supports the opcodes. A failure only costs the
-	// optimisation: the portable cullCS above stays in use.
-	if (cullCS && !cullCSNv && !cullCSNvFailed) {
-		const auto nvDefines = Util::Nvapi::ShaderDefines(Util::Nvapi::Item::WarpAtomics);
-		if (nvDefines.empty()) {
-			cullCSNvFailed = true;
-		} else {
-			try {
-				cullCSNv = static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\GrassCullingCS.hlsl", nvDefines, "cs_5_0"));
-			} catch (...) {
-				cullCSNv = nullptr;
-			}
-			if (!cullCSNv) {
-				cullCSNvFailed = true;
-				Util::Nvapi::DisableForSession(Util::Nvapi::Item::WarpAtomics, "The grass culling shader with NVIDIA warp atomics failed to build");
-			}
 		}
 	}
 	return cullCS;
@@ -859,31 +831,6 @@ void GrassOptimizations::ClearBucketCounters(GrassBucket& b, ID3D11DeviceContext
 	const UINT zeros[4] = { 0, 0, 0, 0 };
 	ctx->ClearUnorderedAccessViewUint(b.argsUAV, zeros);
 	ctx->ClearUnorderedAccessViewUint(b.lodCounterUAV, zeros);
-}
-
-void GrassOptimizations::CullBucketsBatched(ID3D11DeviceContext* ctx)
-{
-	for (auto& [key, b] : bucketStore.buckets)
-		if (b.cullVisible && b.cullSlot != UINT32_MAX)
-			ClearBucketCounters(b, ctx);
-
-	{
-		// Independent by construction: every bucket writes only its own buffers (compacted / extras /
-		// args / LOD counter / LOD bins are created per bucket in GrassBucketStore), and all of them only
-		// read the shared instance, origin, Hi-Z and slice-table inputs. The scope's opening wait covers
-		// the clears above and the Hi-Z build.
-		Util::Nvapi::UavOverlapScope overlap(ctx);
-		for (auto& [key, b] : bucketStore.buckets)
-			if (b.cullVisible && b.cullSlot != UINT32_MAX)
-				DispatchBucket(b, ctx);
-	}
-
-	// The LOD counter UAVs must be unbound before their values can be copied into the draw arguments.
-	ID3D11UnorderedAccessView* nullUAVs[4 + 2 * (size_t)GrassMeshLibrary::LODTier::kCount] = {};
-	ctx->CSSetUnorderedAccessViews(0, (UINT)std::size(nullUAVs), nullUAVs, nullptr);
-	for (auto& [key, b] : bucketStore.buckets)
-		if (b.cullVisible && b.cullSlot != UINT32_MAX)
-			CopyBucketLODCounts(b, ctx);
 }
 
 void GrassOptimizations::DispatchBucket(GrassBucket& b, ID3D11DeviceContext* ctx)
@@ -1434,15 +1381,6 @@ void GrassOptimizations::Hooks::DrawInstanceTriShape::thunk(RE::BSRenderPass* pa
 			++stats->indirectDraws;
 	};
 
-	// (45c) Why NvAPI_D3D11_MultiDrawIndexedInstancedIndirect is not used here: a multi-draw repeats one
-	// pipeline state with consecutive argument blocks. Across buckets the engine binds each bucket's own
-	// material (textures, material constants) in its per-shape setup right before this hook, so buckets
-	// cannot share a call. Within a bucket the up to three draws (full mesh, mid LOD, far LOD) each have
-	// their own vertex buffer, index buffer, per-instance vertex buffer and extras SRV (SV_InstanceID does
-	// not include StartInstanceLocation in D3D11, so even a merged instance buffer would need a per-draw
-	// base in the shader), and their args live in three separate buffers. Merging that would mean a shared
-	// mesh/instance pool for the whole grass store -- a rework for a CPU-only saving while the frame is
-	// GPU-bound. The entry point is resolved in Utils/Nvapi for later use.
 	issue(meshVB, meshStride, indexB, b->compactedBuf, b->extrasSRV, b->argsBuf);
 
 	std::array<const GrassMeshLibrary::LODMesh*, (size_t)GrassMeshLibrary::LODTier::kCount> lodMeshes{};

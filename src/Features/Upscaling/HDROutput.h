@@ -113,7 +113,7 @@ namespace HDROutput
 	/// (44a) Color Grading wrote this frame's scene in BT.2020 (HDR variant): the output passes then
 	/// leave the scene's primaries alone and convert only the UI / overlays.
 	void NoteSceneBT2020();
-	/// True when this frame's scene is being produced for HDR (DLSS 5, NIS decide from it).
+	/// True when this frame's scene is being produced for HDR (DLSS 5 decides from it).
 	bool IsSceneHDRThisFrame();
 	/// True while HDR10 is what the swap chain shows (colour space applied).
 	bool IsOutputActive();
@@ -130,13 +130,6 @@ namespace HDROutput
 	/// (43c) Whether this frame's scene will be produced for HDR; usable before Main_PostProcessing
 	/// has started (DLSS 5's placement decision).
 	bool WillSceneBeHDR();
-
-	/// (43c) NIS in an HDR session. The image is the fp16 scene target: copy it into the sharpener's
-	/// input (display gamma for SDR frames; display-linear for HDR frames in "Linear" mode). False =
-	/// do not sharpen this frame. a_linear tells the caller which NIS HDR mode to use.
-	bool PrepareNISInput(ID3D11Resource* a_bound, ID3D11UnorderedAccessView* a_nisInput, bool& a_linear);
-	/// (43c) The sharpener's output back into the fp16 scene target.
-	void FinishNIS(ID3D11ShaderResourceView* a_nisOutput, bool a_linear);
 
 	/// (43c) DLSS-G status bits from a failed state query, for the HDR status lines.
 	void NoteDLSSGStatus(uint32_t a_status);

@@ -69,12 +69,8 @@ namespace RayTracingRT
 
 	struct AlphaStats
 	{
-		std::uint32_t texturesShared = 0;    // full-resolution game textures read by D3D12 directly
 		std::uint32_t texturesFallback = 0;  // 256x256 alpha copies
 		std::uint32_t texturesPending = 0;   // alpha copies not made yet
-		std::uint64_t notShareable = 0;      // textures not created shareable (loaded before the switch, refused): copy instead
-		std::uint64_t openFailed = 0;        // D3D12 could not open a shared texture: copy instead
-		std::uint64_t slotsFull = 0;         // bindless table full: copy instead
 		std::uint64_t layersFull = 0;        // copy layers full: shape not ray traced
 		std::uint64_t uvFull = 0;            // texcoord buffer full: shape not ray traced
 		std::uint64_t infosFull = 0;
@@ -84,7 +80,6 @@ namespace RayTracingRT
 		std::uint64_t uvBytes = 0;           // texcoord buffer (allocated on first use)
 		std::uint64_t layerBytes = 0;        // 256x256 copy layers (allocated on first use)
 		std::uint64_t infoBytes = 0;         // per-context upload copies of the records
-		bool sharedPathOff = false;          // D3D12 never opened one: only copies this session
 	};
 
 	// (45i) Skinned characters: a shape's vertices in the mesh's own space with their bone indices
@@ -203,9 +198,6 @@ namespace RayTracingRT
 		const std::vector<SkinDraw>* skinDraws = nullptr;
 		const std::vector<float>* skinBones = nullptr;
 		std::uint32_t maxBuilds = 0;  // (45k) BLAS builds / compactions this frame (0 = the default cap)
-		// (45l) Builds, skinning and the TLAS in their own submission that does not wait for D3D11
-		// (only the trace does); false = one list behind the D3D11 wait (45k).
-		bool splitSubmit = true;
 		// (45l) The D3D11 queue's wait for the trace is left to WaitForTrace() (called right before the
 		// first D3D11 pass that reads the result); false = waited at the end of ExecuteFrame (45k).
 		bool deferWait = false;
@@ -318,10 +310,8 @@ namespace RayTracingRT
 		/// signal (no D3D11 involvement). No-op when nothing is prepared.
 		void AbandonPrepared();
 		[[nodiscard]] bool HasPrepared() const { return prepared_; }
-		/// (45n) Release Thread: retired D3D12 objects the GPU is done with are released on a worker thread
-		/// (freeing committed resources costs about 0.5 ms per character shape on the render thread).
-		void SetReleaseOnWorker(bool a_worker) { releaseOnWorker_ = a_worker; }
-		/// (45n) Worker: ms of the last batch released and objects released since start.
+		/// (45n) Retired D3D12 objects the GPU is done with are released on a worker thread (freeing committed
+		/// resources costs about 0.5 ms per character shape on the render thread). Worker: ms of the last batch released and objects released since start.
 		[[nodiscard]] float LastWorkerReleaseMs() const { return workerReleaseMs_.load(std::memory_order_relaxed); }
 		[[nodiscard]] std::uint64_t WorkerReleased() const { return workerReleased_.load(std::memory_order_relaxed); }
 		/// (45l) With FrameInput::deferWait: the D3D11 queue waits (on the GPU) for the last trace now.
@@ -331,8 +321,6 @@ namespace RayTracingRT
 		/// (45k) Loading screens: BLAS builds and compactions only (no trace, no D3D11 interop), with a
 		/// larger cap. Never waits; false when no command context is free or nothing is queued.
 		bool BuildOnly(std::uint32_t a_triangleBudget, std::uint32_t a_maxBuilds);
-		/// (45k) Explicit D3D11 Flush after the ready Signal (45j: always). Off = the Signal alone.
-		void SetExplicitFlush(bool a_flush) { explicitFlush_ = a_flush; }
 		[[nodiscard]] std::uint32_t QueuedBuilds() const { return static_cast<std::uint32_t>(buildQueue_.size()); }
 
 		/// (45e) True when ExecuteFrame will find a free command context. Only the GPU completing
@@ -517,7 +505,6 @@ namespace RayTracingRT
 		{
 			ComPtr<ID3D11Texture2D> texture11;        // held: the key can never be a reused address
 			ComPtr<ID3D11ShaderResourceView> view11;  // source of the copy until it is made
-			ComPtr<ID3D12Resource> resource12;        // shared path
 			std::uint32_t users = 0;
 			std::uint32_t gpuIndex = UINT32_MAX;
 			std::uint32_t sourceSize = 0;             // larger side of the game texture (copy mip choice)
@@ -656,9 +643,9 @@ namespace RayTracingRT
 		std::vector<AlphaTexture> freeAlphaTextures_;
 		std::unordered_map<const ID3D11Texture2D*, AlphaTexture> alphaTextureIndex_;
 		std::deque<AlphaTexture> alphaCopyQueue_;
-		std::vector<std::uint32_t> freeAlphaSlots_, freeAlphaLayers_;
-		std::uint32_t nextAlphaSlot_ = 0, nextAlphaLayer_ = 0;  // never used so far
-		std::vector<DeferredFree> retiredAlphaSlots_, retiredAlphaLayers_, retiredAlphaUv_;
+		std::vector<std::uint32_t> freeAlphaLayers_;
+		std::uint32_t nextAlphaLayer_ = 0;  // never used so far
+		std::vector<DeferredFree> retiredAlphaLayers_, retiredAlphaUv_;
 		std::vector<AlphaInfoGpu> alphaInfos_;
 		std::vector<std::uint32_t> freeAlphaInfos_;
 		std::uint32_t alphaInfoLive_ = 0;
@@ -674,7 +661,6 @@ namespace RayTracingRT
 		DXGI_FORMAT alphaLayerFormat_ = DXGI_FORMAT_UNKNOWN;
 		std::uint32_t alphaLayerCount_ = 0;
 		bool alphaLayersFailed_ = false;
-		std::uint64_t alphaSharedOpened_ = 0;
 		std::string alphaFault_;
 		AlphaStats alphaStats_{};
 
@@ -700,7 +686,6 @@ namespace RayTracingRT
 		std::size_t preparedContext_ = 0;
 		std::uint64_t retireAhead_ = 1;
 		// (45n) Release thread.
-		bool releaseOnWorker_ = true;
 		std::thread releaseThread_;
 		std::mutex releaseMutex_;
 		std::condition_variable releaseCv_;
@@ -716,6 +701,5 @@ namespace RayTracingRT
 		std::string adapterDescription_;
 		bool ready_ = false;
 		bool failed_ = false;
-		bool explicitFlush_ = true;  // (45k)
 	};
 }

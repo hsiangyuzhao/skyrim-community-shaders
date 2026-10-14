@@ -12,9 +12,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	CompareToleranceScale,
 	MaxDistance,
 	EnableSoftShadows,
-	SoftShadowScale,
-	FixedMath,
-	StableNoise)
+	SoftShadowScale)
 
 void ScreenSpacePointLightShadows::DrawSettings()
 {
@@ -47,14 +45,6 @@ void ScreenSpacePointLightShadows::DrawSettings()
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("How soft the edges get with Enable Soft Shadows. Higher = softer.");
 
-	ImGui::Spacing();
-	ImGui::Checkbox("Fixed Math", (bool*)&settings.FixedMath);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Corrected shadow search: more steps only make shadows more accurate instead of changing their shape, no speckles on the surface itself, smoother soft edges, smooth fade with distance, and lights that already cast real shadows only add short contact shadows. Off = the old behaviour.");
-	ImGui::Checkbox("Stable Noise", (bool*)&settings.StableNoise);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text("Calmer, finer grain that changes a little every frame, so DLSS can smooth it out. Off = the old 16-frame noise pattern.");
-
 	JiayeStatement::GetSingleton()->DrawJSInfo();
 }
 
@@ -76,8 +66,8 @@ void ScreenSpacePointLightShadows::SaveSettings(json& o_json)
 ScreenSpacePointLightShadows::PerFrame ScreenSpacePointLightShadows::GetCommonBufferData()
 {
 	PerFrame data = {
-		// (45) FixedMath / StableNoise travel as bits of Enable (see SSPLS.hlsli SettingFlags); 0 = off.
-		.Enable = settings.Enable ? (1u | (settings.FixedMath ? 2u : 0u) | (settings.StableNoise ? 4u : 0u)) : 0u,
+		// (45) Fixed Math / Stable Noise travel as bits of Enable (see SSPLS.hlsli SettingFlags); (45o) always on.
+		.Enable = settings.Enable ? (1u | 2u | 4u) : 0u,
 		.Strength = settings.Strength,
 		.StepLimit = settings.StepLimit,
 		.RayLength = settings.RayLength,

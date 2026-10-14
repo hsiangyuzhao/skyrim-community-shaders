@@ -26,8 +26,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ShadowContrast,
 	WorldSpaceThickness,
 	MinThickness,
-	ContactLength,
-	EdgeSmoothing)
+	ContactLength)
 
 void ScreenSpaceShadows::DrawSettings()
 {
@@ -60,9 +59,6 @@ void ScreenSpaceShadows::DrawSettings()
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("Shadows from casters farther away than this (along the sun's direction) fade out. Lower = only short contact shadows; higher = longer ones, with more mistakes far away.");
 		}
-		ImGui::Checkbox("Edge Smoothing", (bool*)&bendSettings.EdgeSmoothing);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Softens the jagged, flickering 1-pixel edges of these shadows without blurring across object outlines. Uses only the current frame, so nothing smears. About 0.05-0.1 ms.");
 
 		ImGui::Spacing();
 		ImGui::Spacing();
@@ -413,14 +409,31 @@ void ScreenSpaceShadows::DrawDeferred(ID3D11ShaderResourceView* a_rtMask, float 
 	context->PSSetShaderResources(45, 1, &view);
 }
 
+namespace
+{
+	// (45o) Settings version (JSON only; BendSettings is the shader's constant buffer). 2 = 45o.
+	constexpr int kSettingsVersion = 2;
+}
+
 void ScreenSpaceShadows::LoadSettings(json& o_json)
 {
 	bendSettings = o_json;
+	bendSettings.EdgeSmoothing = 1;  // (45o) always on
+	// (45o) Once: Shadow Contrast and Surface Thickness take the current defaults (2.5 / 0.01); the rest stays.
+	const int savedVersion = o_json.is_object() && o_json.contains("SettingsVersion") && o_json["SettingsVersion"].is_number_integer() ? o_json["SettingsVersion"].get<int>() : 1;
+	if (o_json.is_object() && !o_json.empty() && savedVersion < kSettingsVersion) {
+		const BendSettings defaults{};
+		logger::info("[ScreenSpaceShadows] Settings from before 45o: Shadow Contrast {:.2f} -> {:.2f}, Surface Thickness {:.3f} -> {:.3f}",
+			bendSettings.ShadowContrast, defaults.ShadowContrast, bendSettings.SurfaceThickness, defaults.SurfaceThickness);
+		bendSettings.ShadowContrast = defaults.ShadowContrast;
+		bendSettings.SurfaceThickness = defaults.SurfaceThickness;
+	}
 }
 
 void ScreenSpaceShadows::SaveSettings(json& o_json)
 {
 	o_json = bendSettings;
+	o_json["SettingsVersion"] = kSettingsVersion;
 }
 
 void ScreenSpaceShadows::RestoreDefaultSettings()

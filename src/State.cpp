@@ -22,7 +22,6 @@
 #include "Utils/FileSystem.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
-#include "Utils/Nvapi.h"
 #include "Utils/FrameTrace.h"
 
 void State::Draw()
@@ -365,8 +364,6 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				Batch39Engine::Load(advanced["Engine"]);
 			if (advanced.contains("Window Compatibility"))
 				WndProcPseudoHandleFix::Load(advanced["Window Compatibility"]);
-			if (advanced.contains("NVIDIA"))  // (45c) NVIDIA Driver Extensions
-				Util::Nvapi::Load(advanced["NVIDIA"]);
 		}
 
 		if (settings["General"].is_object()) {
@@ -514,7 +511,6 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Frame Annotations"] = frameAnnotations;
 	advanced["Engine"] = Batch39Engine::Save();
 	advanced["Window Compatibility"] = WndProcPseudoHandleFix::Save();
-	advanced["NVIDIA"] = Util::Nvapi::Save();  // (45c) NVIDIA Driver Extensions
 	settings["Advanced"] = advanced;
 
 	json general;

@@ -64,9 +64,6 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter)
 		DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, dlssCommandAllocator[i].get(), nullptr, IID_PPV_ARGS(&dlssCommandList[i])));
 		dlssCommandList[i]->Close();
 
-		DX::ThrowIfFailed(d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&nisSharpenerCommandAllocator[i])));
-		DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, nisSharpenerCommandAllocator[i].get(), nullptr, IID_PPV_ARGS(&nisSharpenerCommandList[i])));
-		nisSharpenerCommandList[i]->Close();
 	}
 }
 
@@ -882,8 +879,6 @@ void DX12SwapChain::CreateSharedResources()
 	inputColorBufferShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 	outputColorBufferShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 	packedNormalShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-	nisSharpenerInputShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-	nisSharpenerOutputShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 	colorBeforeTransparencySnapshot = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
 	texDesc.Format = DXGI_FORMAT_R32_FLOAT;

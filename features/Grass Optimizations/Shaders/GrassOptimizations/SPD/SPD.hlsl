@@ -26,16 +26,6 @@
 #define SPD_MAX_MIPS 6
 #endif
 
-// (45c) Upstream's wave-operation path (ffx_spd.h without FFX_SPD_NO_WAVE_OPERATIONS), with the quad
-// exchange done by NVIDIA warp shuffles because cs_5_0 has no wave intrinsics. Only with NV_SHADER_EXTN,
-// which C++ sets when the driver supports the shuffle; otherwise the LDS path below, unchanged.
-#include "Common/NvShaderExtn.hlsli"
-#if defined(NV_SHADER_EXTN) && NV_SHADER_EXTN
-#	define SPD_NV_WAVE 1
-#else
-#	define SPD_NV_WAVE 0
-#endif
-
 globallycoherent RWTexture2D<float> SpdMip1 : register(u0);
 globallycoherent RWTexture2D<float> SpdMip2 : register(u1);
 globallycoherent RWTexture2D<float> SpdMip3 : register(u2);
@@ -127,19 +117,6 @@ float SpdReduce4(float a, float b, float c, float d)
     return max(max(a, b), max(c, d));
 }
 
-#if SPD_NV_WAVE
-// The 2x2 quad is four consecutive lanes (ffxRemapForWaveReduction lays them out that way), so
-// lanes ^1, ^2 and ^3 are its other three members -- the same values upstream reads with
-// WaveReadLaneAt(v, quad | 1/2/3).
-float SpdReduceQuad(float v)
-{
-    const float v1 = asfloat(NvShflXor(asint(v), 1));
-    const float v2 = asfloat(NvShflXor(asint(v), 2));
-    const float v3 = asfloat(NvShflXor(asint(v), 3));
-    return SpdReduce4(v, v1, v2, v3);
-}
-#endif
-
 void SpdStoreIntermediate(uint x, uint y, float value)
 {
     spdIntermediate[x][y] = value;
@@ -222,27 +199,6 @@ void SpdDownsampleMips_0_1(uint x, uint y, uint2 workGroupID, uint localInvocati
     if (mip <= 1)
         return;
 
-#if SPD_NV_WAVE
-    v[0] = SpdReduceQuad(v[0]);
-    v[1] = SpdReduceQuad(v[1]);
-    v[2] = SpdReduceQuad(v[2]);
-    v[3] = SpdReduceQuad(v[3]);
-
-    if ((localInvocationIndex % 4) == 0)
-    {
-        SpdStore(int2(workGroupID.xy * 16) + int2(x / 2, y / 2), v[0], 1);
-        SpdStoreIntermediate(x / 2, y / 2, v[0]);
-
-        SpdStore(int2(workGroupID.xy * 16) + int2(x / 2 + 8, y / 2), v[1], 1);
-        SpdStoreIntermediate(x / 2 + 8, y / 2, v[1]);
-
-        SpdStore(int2(workGroupID.xy * 16) + int2(x / 2, y / 2 + 8), v[2], 1);
-        SpdStoreIntermediate(x / 2, y / 2 + 8, v[2]);
-
-        SpdStore(int2(workGroupID.xy * 16) + int2(x / 2 + 8, y / 2 + 8), v[3], 1);
-        SpdStoreIntermediate(x / 2 + 8, y / 2 + 8, v[3]);
-    }
-#else
     for (uint i = 0; i < 4; i++)
     {
         SpdStoreIntermediate(x, y, v[i]);
@@ -262,21 +218,10 @@ void SpdDownsampleMips_0_1(uint x, uint y, uint2 workGroupID, uint localInvocati
         SpdStoreIntermediate(x + 0, y + 8, v[2]);
         SpdStoreIntermediate(x + 8, y + 8, v[3]);
     }
-#endif
 }
 
 void SpdDownsampleMip_2(uint x, uint y, uint2 workGroupID, uint localInvocationIndex, uint mip)
 {
-#if SPD_NV_WAVE
-    float v = SpdLoadIntermediate(x, y);
-    v = SpdReduceQuad(v);
-    // quad index 0 stores result
-    if (localInvocationIndex % 4 == 0)
-    {
-        SpdStore(int2(workGroupID.xy * 8) + int2(x / 2, y / 2), v, mip);
-        SpdStoreIntermediate(x + (y / 2) % 2, y, v);
-    }
-#else
  if (localInvocationIndex < 64)
     {
         float v = SpdReduceIntermediate(uint2(x * 2 + 0, y * 2 + 0), uint2(x * 2 + 1, y * 2 + 0), uint2(x * 2 + 0, y * 2 + 1), uint2(x * 2 + 1, y * 2 + 1));
@@ -284,24 +229,10 @@ void SpdDownsampleMip_2(uint x, uint y, uint2 workGroupID, uint localInvocationI
         // store to LDS, try to reduce bank conflicts
         SpdStoreIntermediate(x * 2 + y % 2, y * 2, v);
     }
-#endif
 }
 
 void SpdDownsampleMip_3(uint x, uint y, uint2 workGroupID, uint localInvocationIndex, uint mip)
 {
-#if SPD_NV_WAVE
-    if (localInvocationIndex < 64)
-    {
-        float v = SpdLoadIntermediate(x * 2 + y % 2, y * 2);
-        v = SpdReduceQuad(v);
-        // quad index 0 stores result
-        if (localInvocationIndex % 4 == 0)
-        {
-            SpdStore(int2(workGroupID.xy * 4) + int2(x / 2, y / 2), v, mip);
-            SpdStoreIntermediate(x * 2 + y / 2, y * 2, v);
-        }
-    }
-#else
     if (localInvocationIndex < 16)
     {
         float v = SpdReduceIntermediate(uint2(x * 4 + 0 + 0, y * 4 + 0), uint2(x * 4 + 2 + 0, y * 4 + 0), uint2(x * 4 + 0 + 1, y * 4 + 2), uint2(x * 4 + 2 + 1, y * 4 + 2));
@@ -310,24 +241,10 @@ void SpdDownsampleMip_3(uint x, uint y, uint2 workGroupID, uint localInvocationI
 
         SpdStoreIntermediate(x * 4 + y, y * 4, v);
     }
-#endif
 }
 
 void SpdDownsampleMip_4(uint x, uint y, uint2 workGroupID, uint localInvocationIndex, uint mip)
 {
-#if SPD_NV_WAVE
-    if (localInvocationIndex < 16)
-    {
-        float v = SpdLoadIntermediate(x * 4 + y, y * 4);
-        v = SpdReduceQuad(v);
-        // quad index 0 stores result
-        if (localInvocationIndex % 4 == 0)
-        {
-            SpdStore(int2(workGroupID.xy * 2) + int2(x / 2, y / 2), v, mip);
-            SpdStoreIntermediate(x / 2 + y, 0, v);
-        }
-    }
-#else
     if (localInvocationIndex < 4)
     {
         float v = SpdReduceIntermediate(uint2(x * 8 + 0 + 0 + y * 2, y * 8 + 0),
@@ -337,29 +254,15 @@ void SpdDownsampleMip_4(uint x, uint y, uint2 workGroupID, uint localInvocationI
         SpdStore(int2(workGroupID.xy * 2) + int2(x, y), v, mip);
         SpdStoreIntermediate(x + y * 2, 0, v);
     }
-#endif
 }
 
 void SpdDownsampleMip_5(uint2 workGroupID, uint localInvocationIndex, uint mip)
 {
-#if SPD_NV_WAVE
-    if (localInvocationIndex < 4)
-    {
-        float v = SpdLoadIntermediate(localInvocationIndex, 0);
-        v = SpdReduceQuad(v);
-        // quad index 0 stores result
-        if (localInvocationIndex % 4 == 0)
-        {
-            SpdStore(int2(workGroupID.xy), v, mip);
-        }
-    }
-#else
     if (localInvocationIndex < 1)
     {
         float v = SpdReduceIntermediate(uint2(0, 0), uint2(1, 0), uint2(2, 0), uint2(3, 0));
         SpdStore(int2(workGroupID.xy), v, mip);
     }
-#endif
 }
 
 #if SPD_MAX_MIPS > 6

@@ -1,8 +1,6 @@
 #include "Common/FrameBuffer.hlsli"
 #include "Common/Math.hlsli"
 #include "Common/Random.hlsli"
-// (45c) Warp-aggregated append; only with NV_SHADER_EXTN (set by C++ when the driver supports it).
-#include "Common/NvShaderExtn.hlsli"
 
 cbuffer CullParams : register(b0)
 {
@@ -282,56 +280,6 @@ float WindScalar(float basis, float timer)
     const float4 e1Tier = float4(e1.xyz, e1.w + 4.0 * (float)tier);
 
     uint slot;
-#if defined(NV_SHADER_EXTN) && NV_SHADER_EXTN
-    // (45c) One counter update per warp and tier instead of one per surviving instance. Every lane
-    // still running takes part in the three ballots (lanes culled above have returned and are simply
-    // not in any mask); each tier's lowest lane reserves the whole run, the others read its base back
-    // with a shuffle and add their rank among the tier's lanes below them. Slots stay dense and
-    // unique, only their order within a warp differs from the per-thread atomics below.
-    {
-        const uint lane = (uint)NvGetLaneId();
-        const uint farMask = NvBallot(tier == 2);
-        const uint midMask = NvBallot(tier == 1);
-        const uint mainMask = NvBallot(tier == 0);
-        const uint tierMask = tier == 2 ? farMask : (tier == 1 ? midMask : mainMask);
-        const uint leader = firstbitlow(tierMask);
-        uint base = 0;
-        if (lane == leader)
-        {
-            if (tier == 2)
-                LODCounters.InterlockedAdd(FarLODCountOffset, countbits(tierMask), base);
-            else if (tier == 1)
-                LODCounters.InterlockedAdd(MiddleLODCountOffset, countbits(tierMask), base);
-            else
-                Counter.InterlockedAdd(0, countbits(tierMask), base);
-        }
-        // Outside the branch so every active lane executes the shuffle.
-        base = (uint)NvShfl((int)base, leader);
-        const uint below = lane == 0 ? 0u : (tierMask & (0xFFFFFFFFu >> (32u - lane)));
-        slot = base + countbits(below);
-    }
-    if (tier == 2)
-    {
-        FarLODCompacted.Store4(slot * 32, raw0);
-        FarLODCompacted.Store4(slot * 32 + 16, raw1);
-        FarLODExtras[slot * 2 + 0] = e0;
-        FarLODExtras[slot * 2 + 1] = e1Tier;
-    }
-    else if (tier == 1)
-    {
-        MidLODCompacted.Store4(slot * 32, raw0);
-        MidLODCompacted.Store4(slot * 32 + 16, raw1);
-        MidLODExtras[slot * 2 + 0] = e0;
-        MidLODExtras[slot * 2 + 1] = e1Tier;
-    }
-    else
-    {
-        Compacted.Store4(slot * 32, raw0);
-        Compacted.Store4(slot * 32 + 16, raw1);
-        Extras[slot * 2 + 0] = e0;
-        Extras[slot * 2 + 1] = e1;
-    }
-#else
     if (tier == 2)
     {
         LODCounters.InterlockedAdd(FarLODCountOffset, 1, slot);
@@ -356,5 +304,4 @@ float WindScalar(float basis, float timer)
         Extras[slot * 2 + 0] = e0;
         Extras[slot * 2 + 1] = e1;
     }
-#endif
 }

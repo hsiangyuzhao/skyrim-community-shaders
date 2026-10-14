@@ -274,7 +274,7 @@ void Streamline::LoadInterposer()
 
 	sl::Preferences pref;
 	const bool isVR = REL::Module::IsVR();
-	std::vector<sl::Feature> featuresToLoad = { sl::kFeatureDLSS, sl::kFeatureDLSS_RR, sl::kFeatureNIS };
+	std::vector<sl::Feature> featuresToLoad = { sl::kFeatureDLSS, sl::kFeatureDLSS_RR };
 	if (!isVR) {
 		// Reflex and PCL are not DLSS-G's; they were only ever loaded alongside it. They
 		// reduce latency on their own, and Reflex's frame limiter in particular is the only
@@ -396,7 +396,6 @@ void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
 	logger::info("[Streamline] Checking features");
 	featureDLSS = false;
 	featureDLSS_RR = false;
-	featureNIS = false;
 	featureDLSS_G = false;
 	featureReflex = false;
 	featurePCL = false;
@@ -450,7 +449,6 @@ void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
 
 	checkFeature(sl::kFeatureDLSS, "DLSS", true, featureDLSS);
 	checkFeature(sl::kFeatureDLSS_RR, "DLSS RR", true, featureDLSS_RR);
-	checkFeature(sl::kFeatureNIS, "NIS", true, featureNIS);
 
 	const bool isVR = REL::Module::IsVR();
 	const bool requestDLSSG = !isVR && dlssGBackendSelectedAtBoot;
@@ -462,7 +460,6 @@ void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
 
 	logger::info("[Streamline] DLSS {} available", featureDLSS ? "is" : "is not");
 	logger::info("[Streamline] DLSS RR {} available", featureDLSS_RR ? "is" : "is not");
-	logger::info("[Streamline] NIS {} available", featureNIS ? "is" : "is not");
 	logger::info("[Streamline] DLSS-G {} available", featureDLSS_G ? "is" : "is not");
 	logger::info("[Streamline] Reflex {} available", featureReflex ? "is" : "is not");
 	logger::info("[Streamline] PCL {} available", featurePCL ? "is" : "is not");
@@ -498,11 +495,6 @@ void Streamline::PostDevice()
 		load(sl::kFeatureDLSS_RR, "slDLSSDGetOptimalSettings", slDLSSDGetOptimalSettings);
 		load(sl::kFeatureDLSS_RR, "slDLSSDGetState", slDLSSDGetState);
 		load(sl::kFeatureDLSS_RR, "slDLSSDSetOptions", slDLSSDSetOptions);
-	}
-
-	if (featureNIS) {
-		load(sl::kFeatureNIS, "slNISSetOptions", slNISSetOptions);
-		load(sl::kFeatureNIS, "slNISGetState", slNISGetState);
 	}
 
 	if (featureDLSS_G) {
@@ -1532,45 +1524,4 @@ void Streamline::DestroyDLSSRRResources(bool modeSwitch)
 		slDLSSDSetOptions(viewport, dlssdOptions);
 	}
 	slFreeResources(sl::kFeatureDLSS_RR, viewport);
-}
-
-void Streamline::ApplyNISSharpening(ID3D12Resource* a_inputColorTexture, ID3D12Resource* a_outputTexture, float sharpness, ID3D12GraphicsCommandList* a_commandList, bool a_linearHDR)
-{
-	if (!featureNIS) {
-		return;
-	}
-
-	CheckFrameConstants();
-
-	sl::NISOptions nisOptions{};
-	nisOptions.mode = sl::NISMode::eSharpen;
-	nisOptions.sharpness = std::clamp(sharpness, 0.0f, 1.0f);
-	nisOptions.hdrMode = a_linearHDR ? sl::NISHDR::eLinear : sl::NISHDR::eNone;
-
-	if (SL_FAILED(result, slNISSetOptions(viewport, nisOptions))) {
-		logger::error("[Streamline] Could not set NIS options");
-		return;
-	}
-
-	auto state = globals::state;
-	sl::Extent fullExtent{ 0, 0, (uint)state->screenSize.x, (uint)state->screenSize.y };
-
-	sl::Resource colorIn = { sl::ResourceType::eTex2d, a_inputColorTexture, 0 };
-	sl::Resource colorOut = { sl::ResourceType::eTex2d, a_outputTexture, 0 };
-
-	sl::ResourceTag colorInTag = sl::ResourceTag{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &fullExtent };
-	sl::ResourceTag colorOutTag = sl::ResourceTag{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &fullExtent };
-
-	sl::ResourceTag resourceTags[] = { colorInTag, colorOutTag };
-
-	if (SL_FAILED(result, SetTagsForCurrentFrame(resourceTags, _countof(resourceTags), a_commandList))) {
-		logger::error("[Streamline] Failed to set NIS resource tags ({})", magic_enum::enum_name(result));
-		return;
-	}
-
-	sl::ViewportHandle view(viewport);
-	const sl::BaseStructure* inputs[] = { &view };
-	if (SL_FAILED(result, slEvaluateFeature(sl::kFeatureNIS, *frameToken, inputs, _countof(inputs), a_commandList))) {
-		logger::error("[Streamline] Failed to evaluate NIS feature");
-	}
 }

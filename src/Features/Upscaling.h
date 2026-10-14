@@ -58,15 +58,6 @@ public:
 		kCount
 	};
 
-	// (45a) Settings::sharpeningMethodDLSS. Stored in SettingsUser.json; keep values stable.
-	enum class DLSSSharpening : uint
-	{
-		kOff = 0,
-		kRCAS = 1,  // after DLSS, on the linear scene; SDR and HDR
-		kNIS = 2,   // legacy NVIDIA NIS after post-processing; SDR frames only (A/B)
-		kCount
-	};
-
 	// Stored in SettingsUser.json. Keep existing values stable and append new ones.
 	enum class DLSSModelPreset : uint
 	{
@@ -184,7 +175,6 @@ public:
 		uint upscaleMethod = (uint)UpscaleMethod::kDLSS;
 		uint upscaleMethodNoDLSS = (uint)UpscaleMethod::kFSR;
 		uint qualityMode = 1;  // Default to Quality (1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance, 0=Native AA)
-		uint frameLimitMode = 1;
 		uint frameGenerationMode = 1;
 		uint frameGenerationBackend = static_cast<uint>(FrameGenerationBackend::kFSR3FG);
 		uint frameGenerationForceEnable = 0;
@@ -198,12 +188,8 @@ public:
 		bool frameGenerationAllowInMenus = false;
 		uint streamlineLogLevel = 0;  // 0=Off, 1=Default, 2=Verbose
 		float sharpnessFSR = 1.0f;
-		// NIS sharpness (legacy, SDR only); used while sharpeningMethodDLSS is kNIS.
-		float sharpnessDLSS = 0.1f;
-		// (45a) DLSS output sharpening: DLSSSharpening. A profile saved before 45a has no key;
-		// LoadSettings migrates it from sharpnessDLSS (0 -> Off, otherwise NIS).
-		uint sharpeningMethodDLSS = 0;
-		// (45a) RCAS strength 0..1, mapped like FSR's slider: con = exp2(2s - 2). 0 = off.
+		// DLSS output sharpening (RCAS) strength 0..1, mapped like FSR's slider: con = exp2(2s - 2). 0 = off.
+		// (45o) The Off / RCAS / NIS choice and NIS are gone; LoadSettings migrates a profile that has them.
 		float sharpnessRCAS = 0.2f;
 		uint DLSSPreset = static_cast<uint>(DLSSModelPreset::kK);
 		bool enableDLSSRR = false;
@@ -230,30 +216,15 @@ public:
 		// fgMultiplier of NvAPI_D3D_SetReflexSync), so a cap of 240 at 4x should render 60 and
 		// present 240. The value is therefore never divided by the multiplier here; only the
 		// "rendered" figure shown in the UI is. Measured at 2x only; >2x is still to be confirmed.
+		//
+		// (45o) The single frame-rate cap. 0 = the automatic cap (GetEffectiveReflexFrameLimit). Without
+		// Reflex the spin limiter after Present keeps the same cap (FrameLimiter), never both at once.
 		uint reflexFrameLimit = 0;
-		// (44f, A) Reflex latency markers where the work really is: SIMULATION_END and
-		// RENDERSUBMIT_START when the engine starts rendering the frame (Main::Update's render call,
-		// EngineTiming's probe), RENDERSUBMIT_END right before Present. Off = the 44e placement:
-		// SIMULATION_END after the whole Main::Update (which contains the render and Present), and the
-		// submit pair around the D3D12 copy only, so Reflex took the frame for CPU-bound and never
-		// slept. PRESENT_START / END stay around the real Present either way.
-		bool reflexMarkersAtRenderStart = false;
-		// (45m) Reflex fix. Reflex is attached to the D3D12 interop device and cannot see the D3D11
-		// rendering, so its sleep never fires and the CPU queues up to two frames ahead (see
-		// reviews/diag-reflex-2026-10.md). On: markers at the render call (as the 44f switch), the
-		// GPU-aware frame-start pacer below, the automatic cap, and no legacy spin limiter while
-		// Reflex is available. Off = 45l behaviour, for A/B.
-		bool reflexLatencyFix = true;
-		// Sub-switch: sleep at frame start until the CPU work would end as the GPU frees up, and
-		// never start a frame while the one before the previous is still on the GPU.
-		bool reflexGpuPacer = true;
+		// (45m, hard-wired in 45o) Reflex is attached to the D3D12 interop device and cannot see the D3D11
+		// rendering (reviews/diag-reflex-2026-10.md): latency markers sit at the engine's render call (old
+		// placement only when the engine probes are missing) and the GPU-aware frame-start pacer runs.
 		// Extra CPU time the pacer keeps in hand (ms). More = safer for frame rate, less = lower lag.
 		float reflexPacerMarginMs = 1.0f;
-		// Sub-switch: with Reflex Frame Limit Off, cap at refresh - refresh^2/3600 (224 at 240 Hz).
-		bool reflexAutoCap = true;
-		// (45n) Sub-switch: while frame generation is not running (menus), the automatic cap is 90 % of the
-		// refresh rate (216 at 240 Hz) instead of 224. Off = 45m.
-		bool reflexAutoCapLower = true;
 
 		NeuralRenderingSettings neuralRendering;
 	};
@@ -387,8 +358,6 @@ public:
 	void PerformUpscaling();
 	void UpscaleDepth();
 
-	void ApplyNISSharpening();
-
 	void SnapshotBeforeTransparency();
 
 	static void TimerSleepQPC(int64_t targetQPC);
@@ -405,11 +374,11 @@ public:
 	/// @return false only when Streamline rejected the options, or Reflex is unavailable.
 	bool ApplyReflexSettings(bool a_force = false);
 
-	/// @brief (45m) Frame-start pacing on (Reflex fix and its pacer switched on, not VR).
+	/// @brief Frame-start pacing on (always, except VR).
 	bool IsLatencyPacerEnabled() const;
-	/// @brief (45m) Latency markers at the engine's render call (44f switch, or the 45m fix).
+	/// @brief Latency markers at the engine's render call (always; EngineTiming falls back without its probes).
 	bool WantsReflexMarkersAtRenderStart() const;
-	/// @brief (45m) The Reflex cap actually sent: the user's, or the automatic one when that is Off.
+	/// @brief The cap actually used: the user's, or the automatic one when that is Off.
 	uint GetEffectiveReflexFrameLimit() const;
 	uint GetReflexModeApplied() const { return reflexModeApplied; }
 	uint GetReflexFrameLimitApplied() const { return reflexFrameLimitApplied; }

@@ -37,10 +37,10 @@ public:
 		float ShadowContrast = 2.5f;
 		uint Enable = 1;
 		uint SampleCount = 1;
-		uint WorldSpaceThickness = 1;  ///< (45 SSS) occluder window >= MinThickness units + contact-length fade; 0 = original Bend math
+		uint WorldSpaceThickness = 0;  ///< (45 SSS, 45o default off) occluder window >= MinThickness units + contact-length fade; 0 = original Bend math
 		float MinThickness = 30.0f;    ///< (45 SSS) game units (70 units = 1 m)
 		float ContactLength = 150.0f;  ///< (45 SSS) game units along the light ray before casters start to fade
-		uint EdgeSmoothing = 1;        ///< (45 SSS) 3x3 depth-aware blur of the mask, per frame only
+		uint EdgeSmoothing = 1;        ///< (45 SSS) 3x3 depth-aware blur of the mask, per frame only; (45o) always on, not saved
 		// (45k) Set per frame by Ray Tracing ("non-RT casters only"), not saved: contact range of
 		// ray-traced occluders in multiples of the ray tracer's start offset (constant + per unit).
 		float RtContactScale = 0.0f;

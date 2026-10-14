@@ -15,7 +15,6 @@
 #include "Util.h"
 #include "Utils/ABCompare.h"
 #include "Utils/DisplayHDRInfo.h"
-#include "Utils/NvTimerHeatmap.h"
 
 #include "Features/PerformanceOverlay.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
@@ -69,7 +68,6 @@ void OverlayRenderer::RenderOverlay(
 	RenderFeatureOverlays();
 	HandleABTesting();
 	ABCompare::DrawIndicator();
-	Util::NvTimerHeatmap::DrawOverlay();  // (45c) diagnostic, only while Advanced > NVIDIA > Timer heatmap is on
 	FinalizeImGuiFrame();
 }
 
@@ -94,7 +92,6 @@ bool OverlayRenderer::ShouldSkipRendering()
 			 (failed && !hide) ||
 			 globals::features::performanceOverlay.settings.ShowInOverlay ||
 			 ABCompare::WantsOverlayFrame() ||
-			 Util::NvTimerHeatmap::WantsOverlayFrame() ||
 			 renderDoc->IsAvailable());
 }
 

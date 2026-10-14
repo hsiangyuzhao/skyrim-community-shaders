@@ -16,7 +16,6 @@
 #include <sl_dlss_g.h>
 #include <sl_dlss_d.h>
 #include <sl_matrix_helpers.h>
-#include <sl_nis.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
 #include <sl_version.h>
@@ -38,7 +37,6 @@ public:
 
 	bool featureDLSS = false;
 	bool featureDLSS_RR = false;
-	bool featureNIS = false;
 	bool featureDLSS_G = false;
 	bool featureReflex = false;
 	bool featurePCL = false;
@@ -132,10 +130,6 @@ public:
 	PFun_slDLSSDGetOptimalSettings* slDLSSDGetOptimalSettings{};
 	PFun_slDLSSDGetState* slDLSSDGetState{};
 	PFun_slDLSSDSetOptions* slDLSSDSetOptions{};
-
-	// NIS specific functions
-	PFun_slNISSetOptions* slNISSetOptions{};
-	PFun_slNISGetState* slNISGetState{};
 
 	Util::FrameChecker frameChecker;
 	sl::FrameToken* frameToken = nullptr;
@@ -280,9 +274,6 @@ public:
 
 	void DestroyDLSSResources(bool modeSwitch = false);
 	void DestroyDLSSRRResources(bool modeSwitch = false);
-
-	/// (batch 43) a_linearHDR: NIS HDR mode eLinear (native HDR output, "Sharpening in HDR: Linear mode").
-	void ApplyNISSharpening(ID3D12Resource* a_inputColorTexture, ID3D12Resource* a_outputTexture, float sharpness, ID3D12GraphicsCommandList* a_commandList, bool a_linearHDR = false);
 
 private:
 	void FallbackDLSSG(const char* a_reason, sl::Result a_result, sl::DLSSGStatus a_status);

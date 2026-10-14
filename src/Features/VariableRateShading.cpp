@@ -47,7 +47,7 @@ namespace
 		SetViewFn setView = nullptr;
 	};
 
-	/// Resolved once per process through the shared loader (Utils/Nvapi, 45c), which owns
+	/// Resolved once per process through the shared loader (Utils/Nvapi), which owns
 	/// nvapi64.dll and the reference-counted NvAPI_Initialize.
 	const Nvapi& GetNvapi()
 	{

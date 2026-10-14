@@ -122,22 +122,22 @@ namespace Util
 				"(building the scene and tracing), and merging the result into the shadow mask. The D3D12 part alone is on the Ray Tracing page." },
 			{ "Grass Culling",
 				"GPU time for Grass Optimizations' per-instance culling: one compute pass per visible grass type deciding which grass "
-				"is drawn and at which detail level. Not counted in the Grass Optimizations row. Advanced > NVIDIA can speed it up." },
+				"is drawn and at which detail level. Not counted in the Grass Optimizations row." },
 			{ "Screen Space Shadows",
 				"GPU time for Screen Space Shadows (small sun shadows the shadow map misses): the ray march and, when on, "
 				"Edge Smoothing. Only runs outdoors with the full sky." },
 			{ "RT Denoiser: Tiles",
-				"(45k, 45l) GPU time of the Ray Tracing shadow denoiser's tile pass (Denoiser: Penumbra): blocker distance and the shadow range "
+				"GPU time of the Ray Tracing shadow denoiser's tile pass (Denoiser: Penumbra): blocker distance and the shadow range "
 				"per 8x8 tile (and the half-resolution input of the filter)." },
 			{ "RT Denoiser: Filter",
-				"(45l) GPU time of the two blur passes that follow the width of each soft shadow edge (Denoiser: Penumbra)." },
+				"GPU time of the two blur passes that follow the width of each soft shadow edge (Denoiser: Penumbra)." },
 			{ "RT Denoiser: NRD SIGMA",
-				"(45l) GPU time of NVIDIA's SIGMA shadow denoiser (Denoiser: NRD SIGMA): its input preparation and every SIGMA pass." },
+				"GPU time of NVIDIA's SIGMA shadow denoiser (Denoiser: NRD SIGMA): its input preparation and every SIGMA pass." },
 			{ "RT Combine",
-				"(45l) GPU time of merging the ray-traced shadow into the game's shadow mask, including the history blend of Penumbra / Temporal." },
+				"GPU time of merging the ray-traced shadow into the game's shadow mask, including the history blend of Penumbra." },
 			{ "RT Wait for Trace",
-				"(45l) How long the game's GPU queue stood still waiting for the ray-traced shadows (on the GPU; the CPU does not wait). "
-				"Ideally about 0: the other features' work runs while the trace runs (Debug: Late Sync)." },
+				"How long the game's GPU queue stood still waiting for the ray-traced shadows (on the GPU; the CPU does not wait). "
+				"Ideally about 0: the other features' work runs while the trace runs." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),
@@ -769,7 +769,7 @@ namespace Util
 				"CPU time for Grass Optimizations' per-frame work: sorting newly loaded grass and choosing what to draw. "
 				"Drawing the grass itself stays in the Grass row of the table above." },
 			{ "GrassCulling", "Grass Culling",
-				"(45c) CPU time for sending Grass Optimizations' culling work to the GPU: per-type constants, the visible-cell table "
+				"CPU time for sending Grass Optimizations' culling work to the GPU: per-type constants, the visible-cell table "
 				"and one compute pass per visible grass type. Not counted in the Grass Optimizations row." },
 		};
 

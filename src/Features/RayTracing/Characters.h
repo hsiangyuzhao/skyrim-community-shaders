@@ -92,14 +92,13 @@ namespace RayTracingCharacters
 
 		/// a_physics: HDT-SMP / HDT-PE parts (capes, skirts); a_hair (45j): hair, split from the physics
 		/// parts; a_alpha: alpha-tested parts with their cut-out (the alpha pipeline exists);
-		/// a_keepInShadowMap: never leave the cascades; a_firstPersonPlayer (45j): the player is traced
-		/// in first person too (off: in first person it stays in the shadow map). A change of the first
-		/// three drops everything (next Update).
-		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_keepInShadowMap, bool a_firstPersonPlayer);
+		/// a_firstPersonPlayer (45j): the player is traced in first person too (off: in first person it stays
+		/// in the shadow map). A change of the first three drops everything (next Update).
+		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer);
 		/// Drops everything on the next Update (loading screens, from any thread).
 		void RequestFlush() { flushRequested_.store(true); }
 		/// a_rect: world xy min / max of the traced area (actors outside are not taken).
-		void Update(RayTracingRT::Backend& a_backend, std::uint32_t a_frame, const float a_rect[4]);
+		void Update(RayTracingRT::Backend& a_backend, const float a_rect[4]);
 		/// This frame's draws (retiring ones too) and their bone matrices.
 		void CollectDraws(std::vector<RayTracingRT::SkinDraw>& o_draws, std::vector<float>& o_bones) const;
 		/// After this frame's trace was submitted (or skipped): releases the retiring shapes.
@@ -107,15 +106,12 @@ namespace RayTracingCharacters
 		void ReleaseAll(RayTracingRT::Backend& a_backend);
 		[[nodiscard]] bool Empty() const { return actors_.empty() && retiring_.empty(); }
 		[[nodiscard]] const Stats& GetStats() const { return stats_; }
-		/// (45l) Other actors (not the player) at reduced quality: skinned and refit every other frame.
-		void SetNpcReduced(bool a_reduced) { npcReduced_ = a_reduced; }
 		/// (45l) Bounding spheres of the traced characters, camera-relative xyz + radius (radius 0 = none):
 		/// the player, and one sphere around every other actor. For the trace's character-ray culling.
 		void GetBounds(const double a_camera[3], float o_player[4], float o_others[4]) const;
 		void ResetPeaks() { stats_.maxMs = 0.0f; }
 		/// (45n) Still poses: a shape whose bone matrices are bit-identical to the ones it was last skinned
-		/// with keeps its skinned BLAS (no upload, skinning or refit).
-		void SetStillPoseReuse(bool a_reuse) { stillPoseReuse_ = a_reuse; }
+		/// with keeps its skinned BLAS (no upload, skinning or refit). Count of last frame:
 		[[nodiscard]] std::uint32_t StillReusedLastFrame() const { return stillReused_; }
 
 	private:
@@ -138,7 +134,7 @@ namespace RayTracingCharacters
 			std::uint32_t info = RayTracingRT::kInvalidAlphaInfo;
 			bool registered = false;
 			bool drawable = false;          // in the TLAS (an alpha part only once its texture is ready)
-			bool reuse = false;             // (45l) this frame: last frame's skinned BLAS (other actors, reduced quality)
+			bool reuse = false;             // this frame: last frame's skinned BLAS (still pose)
 			std::uint32_t vertices = 0;
 			std::vector<float> matrices;    // last bone matrices (12 floats each), relative to origin
 			double origin[3]{};
@@ -173,11 +169,7 @@ namespace RayTracingCharacters
 		bool hair_ = false;               // (45j)
 		bool firstPersonPlayer_ = false;  // (45j)
 		bool alpha_ = false;
-		bool keepInShadowMap_ = false;
-		bool npcReduced_ = false;  // (45l)
-		// (45n)
-		bool stillPoseReuse_ = true;
-		std::uint32_t stillReused_ = 0;
+		std::uint32_t stillReused_ = 0;  // (45n)
 		std::uint32_t filterEpoch_ = 0;
 		std::uint32_t loggedPlacement_ = 0;
 		std::uint32_t loggedOther_ = 0;

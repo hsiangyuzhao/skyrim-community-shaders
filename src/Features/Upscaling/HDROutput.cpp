@@ -96,8 +96,6 @@ namespace HDROutput
 		winrt::com_ptr<ID3D11ComputeShader> g_encodeCS;
 		winrt::com_ptr<ID3D11ComputeShader> g_resolveCS;
 		winrt::com_ptr<ID3D11ComputeShader> g_compositeCS;
-		winrt::com_ptr<ID3D11ComputeShader> g_nisDecodeCS;  // (43c)
-		winrt::com_ptr<ID3D11ComputeShader> g_nisEncodeCS;
 		std::vector<SavedRenderTarget> g_upgradedTargets;
 
 		// frame
@@ -126,7 +124,6 @@ namespace HDROutput
 		bool g_tenBitFallbackLoaded = false;
 		bool g_sceneBT2020 = false;          // this frame: Color Grading wrote the scene in BT.2020
 		bool g_lastSceneBT2020 = false;      // the previous frame's value (status / F12)
-		ID3D11UnorderedAccessView* g_nisTargetUAV = nullptr;  // where FinishNIS writes back
 
 		// diagnostics
 		uint64_t g_redirectConfirmed = 0;
@@ -777,8 +774,6 @@ namespace HDROutput
 		g_encodeCS = nullptr;
 		g_resolveCS = nullptr;
 		g_compositeCS = nullptr;
-		g_nisDecodeCS = nullptr;
-		g_nisEncodeCS = nullptr;
 	}
 
 	// ---- per frame ---------------------------------------------------------------------------------------
@@ -968,65 +963,6 @@ namespace HDROutput
 	bool WillSceneBeHDR()
 	{
 		return g_session && g_scene && WantsSceneHDR();
-	}
-
-	bool PrepareNISInput(ID3D11Resource* a_bound, ID3D11UnorderedAccessView* a_nisInput, bool& a_linear)
-	{
-		a_linear = false;
-		g_nisTargetUAV = nullptr;
-		if (!g_session || !a_nisInput || !a_bound)
-			return false;
-		ID3D11ShaderResourceView* source = nullptr;
-		uint32_t width = 0, height = 0;
-		if (g_scene && a_bound == g_scene->resource.get()) {
-			a_linear = IsSceneHDRThisFrame();
-			if (a_linear)
-				return false;  // (44g) no sharpening in HDR for now; see specs/deferred-ideas.md (RCAS)
-			source = g_scene->srv.get();
-			g_nisTargetUAV = g_scene->uav.get();
-			width = g_scene->desc.Width;
-			height = g_scene->desc.Height;
-		} else if (auto* backBuffer = SwapChain().swapChainBufferWrapped.get(); backBuffer && a_bound == backBuffer->resource11 && backBuffer->srv && backBuffer->uav) {
-			// (44a) Lean SDR path: the image is the 10-bit back buffer itself (not copyable into the
-			// R11G11B10 sharpener input); plain SDR copy in and out.
-			source = backBuffer->srv;
-			g_nisTargetUAV = backBuffer->uav;
-			width = SwapChain().swapChainDesc.Width;
-			height = SwapChain().swapChainDesc.Height;
-		} else {
-			return false;
-		}
-		auto* shader = a_linear ? GetShader(g_nisDecodeCS, "NIS_DECODE", "CSGammaToLinear") : GetShader(g_resolveCS, "RESOLVE_SDR", "CSResolveSDR");
-		if (!shader || !EnsureCB()) {
-			g_nisTargetUAV = nullptr;
-			return false;
-		}
-		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::HDROutput);
-		Dispatch(shader, { source }, a_nisInput, width, height, MakeCB(ResolveLevels(), true));
-		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::HDROutput);
-		return true;
-	}
-
-	void FinishNIS(ID3D11ShaderResourceView* a_nisOutput, bool a_linear)
-	{
-		auto* target = g_nisTargetUAV;
-		g_nisTargetUAV = nullptr;
-		if (!target || !a_nisOutput)
-			return;
-		auto* shader = a_linear ? GetShader(g_nisEncodeCS, "NIS_ENCODE", "CSLinearToGamma") : GetShader(g_resolveCS, "RESOLVE_SDR", "CSResolveSDR");
-		if (!shader || !EnsureCB())
-			return;
-		ID3D11Resource* resource = nullptr;
-		target->GetResource(&resource);
-		D3D11_TEXTURE2D_DESC desc{};
-		if (resource) {
-			static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
-			resource->Release();
-		}
-		Util::GpuPassTimers::GetSingleton()->Begin(Util::GpuBucket::HDROutput);
-		Dispatch(shader, { a_nisOutput }, target, desc.Width, desc.Height, MakeCB(ResolveLevels(), true));
-		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::HDROutput);
-		globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
 	}
 
 	void NoteDLSSGStatus(uint32_t a_status)
@@ -1249,7 +1185,7 @@ namespace HDROutput
 
 		ImGui::Spacing();
 		ImGui::TextDisabled("Tone curve in HDR (Extend / Native, roll-off): Post Processing > Color Grading and Tone Mapping.");
-		ImGui::TextDisabled("Sharpening in HDR: Upscaling > Sharpening > RCAS (the legacy NIS choice is skipped while HDR is on).");
+		ImGui::TextDisabled("Sharpening in HDR: Upscaling > Sharpening (RCAS, works with HDR on or off).");
 
 		// (44g) Fixed now: lean path with HDR off, menus on their own UI layer, colour space on the
 		// Streamline proxy, the 44d water-surface fix, no sharpening in HDR, no copy-format logging.

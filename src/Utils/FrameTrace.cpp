@@ -1003,7 +1003,7 @@ namespace Util::FrameTrace
 					r.lowLatencyAvailable = up.streamline.lastLowLatencyAvailable;
 					r.reflexModeApplied = up.GetReflexModeApplied() == UINT_MAX ? -1 : static_cast<int>(up.GetReflexModeApplied());
 					r.reflexLimitApplied = up.GetReflexFrameLimitApplied() == UINT_MAX ? -1 : static_cast<int>(up.GetReflexFrameLimitApplied());
-					r.latencyFix = up.settings.reflexLatencyFix;
+					r.latencyFix = true;  // (45o) hard-wired on
 				}
 				// (45j) A spike frame names its suspects in the log (at most one line a second).
 				if (frameMs > 1.5f * g_smoothed.frameMs + 5.0f) {
@@ -1115,7 +1115,7 @@ namespace Util::FrameTrace
 		j["device_create_ms"] = s.createMs;
 		j["reflex_latency_ms"] = s.reflexLatencyMs;
 		j["reflex_markers_at_render_start"] = globals::features::upscaling.WantsReflexMarkersAtRenderStart();
-		j["reflex_latency_fix"] = globals::features::upscaling.settings.reflexLatencyFix;
+		j["reflex_latency_fix"] = true;  // (45o) hard-wired on
 		j["pacer_enabled"] = globals::features::upscaling.IsLatencyPacerEnabled();
 		j["pacer_in_flight_now"] = LatencyPacer::Last().inFlight;
 		j["pacer_gpu_period_ms"] = LatencyPacer::Last().gpuPeriodMs;

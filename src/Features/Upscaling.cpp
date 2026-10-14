@@ -23,7 +23,6 @@
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/LatencyPacer.h"
-#include "Utils/Nvapi.h"
 #include "Utils/DisplayHDRInfo.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -56,7 +55,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	upscaleMethod,
 	upscaleMethodNoDLSS,
 	qualityMode,
-	frameLimitMode,
 	frameGenerationMode,
 	frameGenerationBackend,
 	frameGenerationForceEnable,
@@ -64,20 +62,13 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	frameGenerationAllowInMenus,
 	streamlineLogLevel,
 	sharpnessFSR,
-	sharpnessDLSS,
-	sharpeningMethodDLSS,
 	sharpnessRCAS,
 	DLSSPreset,
 	enableDLSSRR,
 	DLSSDPreset,
 	reflexMode,
 	reflexFrameLimit,
-	reflexMarkersAtRenderStart,
-	reflexLatencyFix,
-	reflexGpuPacer,
 	reflexPacerMarginMs,
-	reflexAutoCap,
-	reflexAutoCapLower,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -165,9 +156,6 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 				pFeatureLevel,
 				ppImmediateContext));
 
-			// (45c) Before the engine or any feature creates a shader: sets the global NVIDIA shader-extension slot.
-			Util::Nvapi::OnDeviceCreated(*ppDevice);
-
 			upscaling.SetProxyD3D11Device(*ppDevice);
 			upscaling.SetProxyD3D11DeviceContext(*ppImmediateContext);
 			upscaling.CreateProxySwapChain(pAdapter, *pSwapChainDesc);
@@ -214,10 +202,6 @@ HRESULT WINAPI hk_D3D11CreateDeviceAndSwapChainUpscaling(
 		ppDevice,
 		pFeatureLevel,
 		ppImmediateContext);
-
-	// (45c) Before the engine or any feature creates a shader: sets the global NVIDIA shader-extension slot.
-	if (SUCCEEDED(ret) && ppDevice && *ppDevice)
-		Util::Nvapi::OnDeviceCreated(*ppDevice);
 
 	// if (upscaling.IsBackendInitialized()) {
 	// 	upscaling.UpgradeBackendInterface((void**)&(*ppDevice));
@@ -373,32 +357,10 @@ void Upscaling::DrawUpscalingSettings()
 
 void Upscaling::DrawSharpeningSettings()
 {
-	const char* methods[] = { "Off", "RCAS", "NIS (legacy, SDR only)" };
-	int methodIndex = static_cast<int>(std::min(settings.sharpeningMethodDLSS, static_cast<uint>(DLSSSharpening::kCount) - 1));
-	if (ImGui::Combo("Sharpening", &methodIndex, methods, IM_ARRAYSIZE(methods)))
-		settings.sharpeningMethodDLSS = static_cast<uint>(methodIndex);
+	ImGui::SliderFloat("Sharpening", &settings.sharpnessRCAS, 0.0f, 1.0f, settings.sharpnessRCAS > 0.0f ? "%.2f" : "Off", ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::TextUnformatted("Extra sharpening of the DLSS image. DLSS is already fairly sharp, so Off is a fine choice.");
-		ImGui::TextUnformatted("RCAS: AMD's sharpener, run right after DLSS on the scene itself; works with HDR on or off. Cheap (about 0.1 ms).");
-		ImGui::TextUnformatted("NIS: the old NVIDIA sharpener, kept for comparison. Does nothing while HDR output is on.");
-	}
-
-	const auto method = static_cast<DLSSSharpening>(methodIndex);
-	if (method == DLSSSharpening::kRCAS) {
-		ImGui::SliderFloat("Sharpening Strength", &settings.sharpnessRCAS, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("0 = off. Higher = crisper edges and fine detail; too high gives halos around edges and grain in noisy areas.");
-	} else if (method == DLSSSharpening::kNIS) {
-		const bool hdrOn = HDROutput::IsOutputActive();
-		if (hdrOn)
-			ImGui::BeginDisabled();
-		ImGui::SliderFloat("NIS Sharpness", &settings.sharpnessDLSS, 0.0f, 1.0f, "%.1f");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("NVIDIA NIS after the colour grading. 0 = off. Higher = crisper, but too high adds halos and shimmer.");
-		if (hdrOn) {
-			ImGui::EndDisabled();
-			ImGui::TextDisabled("HDR output is on: NIS is skipped. Use RCAS for sharpening in HDR.");
-		}
+		ImGui::TextUnformatted("Extra sharpening of the DLSS image (AMD RCAS, run right after DLSS on the scene itself; works with HDR on or off, about 0.1 ms).");
+		ImGui::TextUnformatted("0 = off. Higher = crisper edges and fine detail; too high gives halos around edges and grain in noisy areas.");
 	}
 }
 
@@ -546,6 +508,12 @@ void Upscaling::DrawLatencySettings()
 		ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
 		ImGui::Text("Reflex is not available through Streamline on this system.");
 		ImGui::PopStyleColor();
+		// The frame-rate cap still applies (kept by a timer after each frame, VSync off only).
+		int frameLimit = static_cast<int>(settings.reflexFrameLimit);
+		if (ImGui::SliderInt("Frame Limit", &frameLimit, 0, 240, frameLimit > 0 ? "%d presented fps" : "Off (automatic cap)", ImGuiSliderFlags_AlwaysClamp))
+			settings.reflexFrameLimit = static_cast<uint>(std::max(frameLimit, 0));
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Without Reflex this cap is kept by a simple timer after each frame (VSync off only). Off = just under the refresh rate.");
 		ImGui::TreePop();
 		return;
 	}
@@ -569,58 +537,19 @@ void Upscaling::DrawLatencySettings()
 
 	int reflexFrameLimit = static_cast<int>(settings.reflexFrameLimit);
 	if (ImGui::SliderInt("Reflex Frame Limit", &reflexFrameLimit, 0, 240,
-			reflexFrameLimit > 0 ? "%d presented fps" : "Off", ImGuiSliderFlags_AlwaysClamp))
+			reflexFrameLimit > 0 ? "%d presented fps" : "Off (automatic cap)", ImGuiSliderFlags_AlwaysClamp))
 		settings.reflexFrameLimit = static_cast<uint>(std::max(reflexFrameLimit, 0));
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::TextUnformatted("FPS cap on frames shown, including generated ones: 120 at 2x renders 60 real frames (40 at 3x, 30 at 4x). 0 = no cap.");
+		ImGui::TextUnformatted("The one frame-rate cap. It counts frames shown, including generated ones: 120 at 2x renders 60 real frames (40 at 3x, 30 at 4x).");
 		ImGui::TextUnformatted("Best cap for VRR/G-Sync, with the least added lag. Keep it below the monitor's max refresh, and low enough to hold steady.");
-		ImGui::TextUnformatted("Without the Reflex Fix below, keep it at or below about 180 fps: above that, latency explodes and the menu mouse becomes unusable.");
-		ImGui::TextUnformatted("With the fix on, Off means an automatic cap just under the refresh rate (224 at 240 Hz).");
-	}
-
-	// (45m) Reflex Fix.
-	ImGui::Checkbox("Reflex Fix (45m)", &settings.reflexLatencyFix);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::TextUnformatted("Reflex is attached to the D3D12 presenting device and cannot see the game's D3D11 rendering, so it never held the CPU back:");
-		ImGui::TextUnformatted("the game ran up to two frames ahead of the graphics card, which is where the extra input lag came from.");
-		ImGui::TextUnformatted("On: latency markers where the frame really starts rendering, a frame-start pacer that follows the graphics card itself,");
-		ImGui::TextUnformatted("an automatic cap when the Frame Limit is Off, and no legacy spin limiter after Present. Off = the 45l behaviour, for A/B.");
-	}
-	if (settings.reflexLatencyFix) {
-		ImGui::Indent();
-		ImGui::Checkbox("Frame-start pacer", &settings.reflexGpuPacer);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Waits before the game reads input until the graphics card is about to need the next frame, and never lets the CPU get");
-			ImGui::TextUnformatted("more than one frame ahead. Lower lag, same frame rate. The game's own CPU hitches may show a little more.");
-		}
-		if (settings.reflexGpuPacer) {
-			ImGui::SliderFloat("Pacer safety margin", &settings.reflexPacerMarginMs, -2.0f, 8.0f, "%.1f ms", ImGuiSliderFlags_AlwaysClamp);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("Extra CPU time kept in hand. Raise it if the frame rate drops with the pacer on; lower it for a little less lag.");
-		}
-		ImGui::Checkbox("Automatic cap when Frame Limit is Off", &settings.reflexAutoCap);
-		if (settings.reflexAutoCap) {
-			ImGui::Indent();
-			ImGui::Checkbox("Lower automatic cap without frame generation (45n)", &settings.reflexAutoCapLower);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("While frame generation is not running (menus), cap at 90 % of the refresh rate (216 at 240 Hz) instead of 224:");
-				ImGui::TextUnformatted("at 224 the graphics card is just barely the limit and a frame of lag builds up. Off = 45m. Your own Frame Limit always wins.");
-			}
-			ImGui::Unindent();
-		}
-		const auto& pacer = Util::LatencyPacer::Last();
-		if (pacer.tracking)
-			ImGui::TextDisabled("Pacer: %d frame(s) on the GPU at frame start (%d after the wait), GPU period %.1f ms, CPU reserve %.1f ms, slept %.1f ms (+%.1f ms bound)",
-				pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.sleepMs, pacer.capWaitMs);
-		else
-			ImGui::TextDisabled("Pacer: waiting for the D3D12 swap chain");
-		ImGui::Unindent();
+		ImGui::TextUnformatted("Off = automatic cap just under the refresh rate: 224 at 240 Hz while frame generation runs, 216 without it (menus).");
+		ImGui::TextUnformatted("Without Reflex (not an NVIDIA card) the same cap is kept by a simple timer after each frame instead (VSync off only).");
 	}
 
 	ImGui::Text("Display reports %.0f Hz", refreshRate);
 	if (settings.reflexFrameLimit == 0 && GetEffectiveReflexFrameLimit() > 0) {
 		ImGui::SameLine();
-		ImGui::Text("- automatic cap %u fps (Reflex Fix)", GetEffectiveReflexFrameLimit());
+		ImGui::Text("- automatic cap %u fps", GetEffectiveReflexFrameLimit());
 	}
 	if (settings.reflexFrameLimit > 0) {
 		if (IsFrameGenerationRequestedNow()) {
@@ -664,40 +593,23 @@ void Upscaling::DrawAdvancedSettings()
 	if (!ImGui::TreeNodeEx("Advanced / Diagnostics"))
 		return;
 
-	if (!globals::game::isVR) {
-		// (44f, A)
-		if (streamline.featureReflex) {
-			if (settings.reflexLatencyFix)
-				ImGui::BeginDisabled();
-			bool markersShown = WantsReflexMarkersAtRenderStart();
-			if (ImGui::Checkbox("Reflex Markers at Render Start (44f, included in Reflex Fix)", &markersShown) && !settings.reflexLatencyFix)
-				settings.reflexMarkersAtRenderStart = markersShown;
-			if (settings.reflexLatencyFix)
-				ImGui::EndDisabled();
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::TextUnformatted("Tells Reflex when the game really finishes its update and starts rendering, so Reflex can see the GPU is the limit and");
-				ImGui::TextUnformatted("let the CPU start the next frame later instead of waiting inside Present. Expected: 10-20 ms less input lag.");
-				ImGui::TextUnformatted("Risk: with less queued up, the game's own CPU hitches can show more. Off (default) = the old marker placement.");
-				if (!Util::EngineTiming::ProbesInstalled())
-					ImGui::TextUnformatted("Needs the Engine Timing Probes (Performance Overlay settings, SE 1.5.97 only); without them the old placement is used.");
-			}
-			if (WantsReflexMarkersAtRenderStart() && !Util::EngineTiming::ProbesInstalled())
-				ImGui::TextDisabled("(probes %s: old placement in use)", Util::EngineTiming::ProbeStatus());
-		}
-
-		if (!d3d12SwapChainActive)
-			ImGui::BeginDisabled();
-
-		bool legacyFrameLimit = settings.frameLimitMode != 0;
-		if (ImGui::Checkbox("Legacy Frame Limiter (VSync off only)", &legacyFrameLimit))
-			settings.frameLimitMode = legacyFrameLimit ? 1u : 0u;
+	if (!globals::game::isVR && streamline.featureReflex) {
+		// Frame-start pacer (always on with Reflex): its safety margin and its last frame.
+		ImGui::SliderFloat("Pacer safety margin", &settings.reflexPacerMarginMs, -2.0f, 8.0f, "%.1f ms", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Caps FPS to the monitor's refresh rate. Does nothing while VSync is on (e.g. set by SSE Display Tweaks).");
-			ImGui::TextUnformatted("Adds more input lag than the Reflex Frame Limit, and stacks with it; with a VRR/G-Sync monitor use that one instead.");
+			ImGui::TextUnformatted("The frame-start pacer waits before the game reads input until the graphics card is about to need the next frame,");
+			ImGui::TextUnformatted("and never lets the CPU get more than one frame ahead. This is the extra CPU time it keeps in hand:");
+			ImGui::TextUnformatted("raise it if the frame rate drops; lower it for a little less lag.");
 		}
-
-		if (!d3d12SwapChainActive)
-			ImGui::EndDisabled();
+		const auto& pacer = Util::LatencyPacer::Last();
+		if (pacer.tracking)
+			ImGui::TextDisabled("Pacer: %d frame(s) on the GPU at frame start (%d after the wait), GPU period %.1f ms, CPU reserve %.1f ms, slept %.1f ms (+%.1f ms bound)",
+				pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.sleepMs, pacer.capWaitMs);
+		else
+			ImGui::TextDisabled("Pacer: waiting for the D3D12 swap chain");
+		if (!Util::EngineTiming::ProbesInstalled())
+			ImGui::TextDisabled("Reflex markers: engine probes %s, the old marker placement is used", Util::EngineTiming::ProbeStatus());
+		ImGui::Separator();
 	}
 
 	// Streamline log level selection
@@ -938,17 +850,24 @@ void Upscaling::LoadSettings(json& o_json)
 	settings = o_json;
 	PinNeuralRenderingOptions(settings.neuralRendering);
 
-	// (45a) Sharpening method. A profile from before 45a has only sharpnessDLSS (NIS): 0 meant off,
-	// anything else NIS, which stays available as the legacy choice.
-	if (!o_json.is_object() || !o_json.contains("sharpeningMethodDLSS")) {
-		settings.sharpeningMethodDLSS = static_cast<uint>(settings.sharpnessDLSS > 0.0f ? DLSSSharpening::kNIS : DLSSSharpening::kOff);
-		logger::info("[Upscaling] Sharpening migrated from sharpnessDLSS {:.2f}: {}", settings.sharpnessDLSS,
-			settings.sharpeningMethodDLSS ? "NIS (legacy)" : "Off");
-	} else if (settings.sharpeningMethodDLSS >= static_cast<uint>(DLSSSharpening::kCount)) {
-		logger::warn("[Upscaling] Loaded sharpeningMethodDLSS {} out of range, falling back to Off", settings.sharpeningMethodDLSS);
-		settings.sharpeningMethodDLSS = static_cast<uint>(DLSSSharpening::kOff);
+	// (45o) Sharpening is one RCAS strength (0 = off). Once, from a profile that still has the old method
+	// (45a-45n: 0 Off, 1 RCAS, 2 NIS) or only the NIS strength (before 45a: 0 = off, else NIS): Off -> 0,
+	// RCAS -> its strength, NIS -> RCAS at the default strength. Those keys are dropped on the next save.
+	if (o_json.is_object() && (o_json.contains("sharpeningMethodDLSS") || o_json.contains("sharpnessDLSS"))) {
+		uint method = 0;
+		if (o_json.contains("sharpeningMethodDLSS") && o_json["sharpeningMethodDLSS"].is_number_unsigned())
+			method = o_json["sharpeningMethodDLSS"].get<uint>();
+		else if (!o_json.contains("sharpeningMethodDLSS") && o_json["sharpnessDLSS"].is_number() && o_json["sharpnessDLSS"].get<float>() > 0.0f)
+			method = 2;
+		if (method == 0)
+			settings.sharpnessRCAS = 0.0f;
+		else if (method != 1)
+			settings.sharpnessRCAS = Settings{}.sharpnessRCAS;
+		logger::info("[Upscaling] Sharpening method {} migrated: RCAS strength {:.2f}", method, settings.sharpnessRCAS);
 	}
-	settings.sharpnessRCAS = std::clamp(settings.sharpnessRCAS, 0.0f, 1.0f);
+	settings.sharpnessRCAS = std::isfinite(settings.sharpnessRCAS) ? std::clamp(settings.sharpnessRCAS, 0.0f, 1.0f) : Settings{}.sharpnessRCAS;
+	if (o_json.is_object() && o_json.contains("frameLimitMode"))
+		logger::info("[Upscaling] Legacy Frame Limiter setting dropped: the Reflex Frame Limit ({}) is the only cap (0 = automatic)", settings.reflexFrameLimit);
 	settings.reflexPacerMarginMs = std::isfinite(settings.reflexPacerMarginMs) ? std::clamp(settings.reflexPacerMarginMs, -2.0f, 8.0f) : 1.0f;
 
 	// Sanitize loaded settings to ensure enum indices are valid
@@ -1711,17 +1630,17 @@ bool Upscaling::ApplyReflexSettings(bool a_force)
 
 bool Upscaling::IsLatencyPacerEnabled() const
 {
-	return !REL::Module::IsVR() && settings.reflexLatencyFix && settings.reflexGpuPacer;
+	return !REL::Module::IsVR();
 }
 
 bool Upscaling::WantsReflexMarkersAtRenderStart() const
 {
-	return settings.reflexMarkersAtRenderStart || settings.reflexLatencyFix;
+	return true;
 }
 
 uint Upscaling::GetEffectiveReflexFrameLimit() const
 {
-	if (settings.reflexFrameLimit > 0 || !settings.reflexLatencyFix || !settings.reflexAutoCap || refreshRate < 30.0)
+	if (settings.reflexFrameLimit > 0 || refreshRate < 30.0)
 		return settings.reflexFrameLimit;
 	// (45m) NVIDIA's own VRR cap rule (refresh - refresh^2/3600): 224 at 240 Hz, 138 at 144 Hz. It is
 	// a presented-frame cap like the slider, so with frame generation running it almost never binds;
@@ -1730,7 +1649,7 @@ uint Upscaling::GetEffectiveReflexFrameLimit() const
 	// (45n) Without frame generation running (menus, generation off) the game itself reaches the cap, and at
 	// 224 of 240 Hz the graphics card is barely the limit: a frame of queue builds up (1-2 ms of lag). 90 % of
 	// the refresh rate (216 at 240 Hz, 129 at 144 Hz) keeps it clearly CPU-capped. Generating: unchanged.
-	if (settings.reflexAutoCapLower && !IsFrameGenerationActive())
+	if (!IsFrameGenerationActive())
 		cap = std::min(cap, std::floor(refreshRate * 0.9));
 	return static_cast<uint>(std::max(cap, 30.0));
 }
@@ -1744,17 +1663,15 @@ std::string Upscaling::DescribeLatencyForTrace()
 	auto modeName = [](uint m) { return m < 3 ? kModes[m] : "not applied"; };
 	return std::format(
 		"Reflex available {}, functions ready {}, PCL ready {}; mode set {} / applied {}; frame limit set {} / effective {} / applied {} fps (presented); "
-		"latency fix {}, pacer {} (margin {:.1f} ms), auto cap {}, markers at render start {} (probes {}); lowLatencyAvailable {}, latencyReportAvailable {}; "
-		"frame generation requested {} at {}x; legacy limiter {} (syncInterval 0 path{}); refresh {:.0f} Hz",
+		"pacer {} (margin {:.1f} ms), markers at render start {} (probes {}); lowLatencyAvailable {}, latencyReportAvailable {}; "
+		"frame generation requested {} at {}x; spin limiter {} (fallback without Reflex, syncInterval 0 path); refresh {:.0f} Hz",
 		streamline.featureReflex ? "yes" : "no", streamline.reflexFunctionsReady ? "yes" : "no", streamline.pclFunctionsReady ? "yes" : "no",
 		modeName(std::min(settings.reflexMode, 2u)), modeName(modeApplied), settings.reflexFrameLimit, GetEffectiveReflexFrameLimit(),
 		reflexFrameLimitApplied == UINT_MAX ? -1 : static_cast<int>(reflexFrameLimitApplied),
-		settings.reflexLatencyFix ? "on" : "off", IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs,
-		settings.reflexLatencyFix && settings.reflexAutoCap ? "on" : "off", WantsReflexMarkersAtRenderStart() ? "on" : "off",
+		IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs, WantsReflexMarkersAtRenderStart() ? "on" : "off",
 		Util::EngineTiming::ProbesInstalled() ? "installed" : Util::EngineTiming::ProbeStatus(),
 		stateOk ? (state.lowLatencyAvailable ? "yes" : "no") : "?", stateOk ? (state.latencyReportAvailable ? "yes" : "no") : "?",
-		IsFrameGenerationRequestedNow() ? "yes" : "no", GetFrameGenerationAppliedMultiplier(),
-		settings.frameLimitMode ? "on" : "off", settings.reflexLatencyFix && streamline.reflexFunctionsReady ? ", skipped by the 45m fix" : "",
+		IsFrameGenerationRequestedNow() ? "yes" : "no", GetFrameGenerationAppliedMultiplier(), streamline.reflexFunctionsReady ? "off" : "on",
 		refreshRate);
 }
 
@@ -1783,19 +1700,18 @@ void Upscaling::FrameLimiter()
 			WaitForSingleObject(waitableObject, INFINITE);
 		}
 
-		// (45m) The spin below runs after Present, the one place a wait only adds queue latency.
-		// With the Reflex fix on and Reflex available, Reflex's cap (or the automatic one) and the
-		// frame-start pacer do this job before input is sampled instead.
-		const bool reflexOwnsPacing = settings.reflexLatencyFix && streamline.reflexFunctionsReady;
-		if (settings.frameLimitMode && !reflexOwnsPacing) {
-			// Fall back to the original timing method
+		// (45o) One cap only. With Reflex available, Reflex keeps it (and the frame-start pacer paces) before
+		// input is sampled. Without Reflex (not an NVIDIA card) this spin after Present keeps the same cap
+		// (GetEffectiveReflexFrameLimit: the user's Frame Limit, or the automatic one); never both at once.
+		const uint cap = streamline.reflexFunctionsReady ? 0u : GetEffectiveReflexFrameLimit();
+		if (cap > 0) {
 			// Use integer arithmetic for more precise timing
 			const bool generatingNow = IsFrameGenerationRequestedNow() &&
 			                           (!globals::game::ui->GameIsPaused() || IsFrameGenerationAllowedWhilePaused());
-			// Rendered frames are paced to the refresh rate divided by the multiplier the backend
-			// is running (no longer a fixed half), so presented frames still land at the refresh rate.
+			// The cap counts presented frames: rendered frames are paced to it divided by the multiplier
+			// the backend is running.
 			const double presentMultiplier = generatingNow ? static_cast<double>(GetFrameGenerationAppliedMultiplier()) : 1.0;
-			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (refreshRate / presentMultiplier));
+			int64_t targetFrameTimeNS = int64_t(1000000000.0 / (static_cast<double>(cap) / presentMultiplier));
 			int64_t targetFrameTicks = (targetFrameTimeNS * qpf.QuadPart) / 1000000000LL;
 
 			static LARGE_INTEGER lastFrame = {};
@@ -2301,11 +2217,11 @@ void Upscaling::Upscale()
 			DX::ThrowIfFailed(dx12SwapChain.d3d11Context->Wait(dx12SwapChain.d3d11Fence.get(), fence));
 			dx12SwapChain.fenceValue++;
 
-			// Back to the main buffer: (45a) through RCAS when it is the chosen sharpening (the
-			// linear scene, before post-processing and Neural Rendering after upscaling, so SDR and
-			// HDR share it), a plain copy otherwise or if RCAS could not run.
+			// Back to the main buffer: (45a) through RCAS when Sharpening is above 0 (the linear scene,
+			// before post-processing and Neural Rendering after upscaling, so SDR and HDR share it), a
+			// plain copy at 0 or if RCAS could not run.
 			bool sharpened = false;
-			if (settings.sharpeningMethodDLSS == static_cast<uint>(DLSSSharpening::kRCAS) && settings.sharpnessRCAS > 0.0f && main.UAV) {
+			if (settings.sharpnessRCAS > 0.0f && main.UAV) {
 				// FSR's slider-to-RCAS mapping (upstream 83635b4f8): con = exp2(2 * slider - 2).
 				const float rcasSharpness = exp2(2.0f * std::min(settings.sharpnessRCAS, 1.0f) - 2.0f);
 				D3D11_TEXTURE2D_DESC mainDesc{};
@@ -2451,86 +2367,6 @@ void Upscaling::UpscaleDepth()
 	}
 }
 
-void Upscaling::ApplyNISSharpening()
-{
-	// (45a) Legacy choice only; RCAS runs at the DLSS copy-back instead.
-	if (settings.sharpeningMethodDLSS != static_cast<uint>(DLSSSharpening::kNIS) || !streamline.featureNIS || settings.sharpnessDLSS <= 0.0f) {
-		return;
-	}
-
-	// (batch 43) In a native-HDR session the image here is the fp16 scene target, which the R11G11B10
-	// sharpener textures cannot be copied from: compute passes move it in and out instead (in linear
-	// light for an HDR frame with "Sharpening in HDR: Linear mode", where NIS runs its own HDR mode).
-	const bool hdrSession = HDROutput::IsSession();
-
-	auto context = globals::d3d::context;
-
-	ID3D11RenderTargetView* renderTarget = nullptr;
-	context->OMGetRenderTargets(1, &renderTarget, nullptr);
-
-	if (!renderTarget)
-		return;
-
-	winrt::com_ptr<ID3D11Resource> mainResource;
-	renderTarget->GetResource(mainResource.put());
-
-	context->OMSetRenderTargets(0, nullptr, nullptr);  // Unbind all bound render targets
-
-	bool linearHDR = false;
-	if (hdrSession) {
-		if (!HDROutput::PrepareNISInput(mainResource.get(), dx12SwapChain.nisSharpenerInputShared12->uav, linearHDR)) {
-			globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
-			if (renderTarget)
-				renderTarget->Release();
-			return;
-		}
-	} else {
-		context->CopyResource(dx12SwapChain.nisSharpenerInputShared12->resource11, mainResource.get());
-	}
-
-	// Wait for D3D11 to finish
-	auto fence = dx12SwapChain.fenceValue;
-	DX::ThrowIfFailed(context->QueryInterface(IID_PPV_ARGS(dx12SwapChain.d3d11Context.put())));
-	logger::trace("Signaling shared fence {} before NIS sharpening", fence);
-	DX::ThrowIfFailed(dx12SwapChain.d3d11Context->Signal(dx12SwapChain.d3d11Fence.get(), fence));
-	logger::trace("Waiting for shared fence {} before NIS sharpening", fence);
-	DX::ThrowIfFailed(dx12SwapChain.commandQueue->Wait(dx12SwapChain.d3d12Fence.get(), fence));
-	dx12SwapChain.fenceValue++;
-
-	auto frameIndex = dx12SwapChain.frameIndex;
-
-	// Reset command allocator and list
-	DX::ThrowIfFailed(dx12SwapChain.nisSharpenerCommandAllocator[frameIndex]->Reset());
-	DX::ThrowIfFailed(dx12SwapChain.nisSharpenerCommandList[frameIndex]->Reset(dx12SwapChain.nisSharpenerCommandAllocator[frameIndex].get(), nullptr));
-
-	streamline.ApplyNISSharpening(dx12SwapChain.nisSharpenerInputShared12->resource.get(), dx12SwapChain.nisSharpenerOutputShared12->resource.get(), settings.sharpnessDLSS, dx12SwapChain.nisSharpenerCommandList[frameIndex].get(), linearHDR);
-
-	// Close and execute command list
-	DX::ThrowIfFailed(dx12SwapChain.nisSharpenerCommandList[frameIndex]->Close());
-
-	ID3D12CommandList* commandLists[] = { dx12SwapChain.nisSharpenerCommandList[frameIndex].get() };
-	dx12SwapChain.commandQueue->ExecuteCommandLists(1, commandLists);
-
-	// Wait for D3D12 to finish
-	fence = dx12SwapChain.fenceValue;
-	logger::trace("Signaling shared fence {} after NIS sharpening", fence);
-	DX::ThrowIfFailed(dx12SwapChain.commandQueue->Signal(dx12SwapChain.d3d12Fence.get(), fence));
-	logger::trace("Waiting for shared fence {} after NIS sharpening", fence);
-	DX::ThrowIfFailed(dx12SwapChain.d3d11Context->Wait(dx12SwapChain.d3d11Fence.get(), fence));
-	dx12SwapChain.fenceValue++;
-
-	// Copy back to main buffer
-	if (hdrSession)
-		HDROutput::FinishNIS(dx12SwapChain.nisSharpenerOutputShared12->srv, linearHDR);
-	else
-		context->CopyResource(mainResource.get(), dx12SwapChain.nisSharpenerOutputShared12->resource11);
-
-	globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);  // Run OMSetRenderTargets again
-
-	if (renderTarget)
-		renderTarget->Release();
-}
-
 void Upscaling::SnapshotBeforeTransparency()
 {
 	if (!d3d12SwapChainActive)
@@ -2614,16 +2450,10 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 		DX::ThrowIfFailed(dx12SwapChain.commandQueue->Wait(dx12SwapChain.upscalingFence.get(), dx12SwapChain.upscalingFenceValue));
 	}
 
-	// (batch 26b) Neural Rendering runs before the sharpener, not after. Both take the scene
-	// from the currently bound render target, and ApplyNISSharpening leaves targets unbound --
-	// so after it there is nothing to read. It also early-returns when sharpening is off, which
-	// would have made the binding's presence depend on an unrelated setting. Running the network
-	// on the unsharpened image and sharpening its output is the right order anyway.
+	// (batch 26b) Neural Rendering takes the scene from the currently bound render target.
+	// (45o) DLSS sharpening (RCAS) runs at the DLSS copy-back, before this.
 	if (!globals::game::isVR)
 		NeuralRendering::ApplyLdr();
-
-	if (upscaleMethod == UpscaleMethod::kDLSS)
-		upscaling.ApplyNISSharpening();
 
 	if (upscaling.d3d12SwapChainActive) {
 		dx12SwapChain.upscalingFenceValue++;

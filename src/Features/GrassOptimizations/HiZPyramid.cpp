@@ -2,7 +2,6 @@
 
 #include "Features/TerrainBlending.h"
 #include "Features/Upscaling.h"
-#include "Utils/Nvapi.h"
 
 void HiZPyramid::SetupResources()
 {
@@ -19,10 +18,6 @@ void HiZPyramid::ClearShaderCache()
 	spdCS = nullptr;
 	baseCSFailed = false;
 	spdCSFailed = false;
-	if (spdCSNv)
-		spdCSNv->Release();
-	spdCSNv = nullptr;
-	spdCSNvFailed = false;
 }
 
 ID3D11ShaderResourceView* HiZPyramid::GetSourceDepthSRV()
@@ -188,24 +183,6 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 			logger::error("[GRASS OPTIMIZATIONS] SPD load failed — large instances will not be occlusion culled");
 		}
 	}
-	// (45c) Its NVIDIA warp-shuffle twin, compiled next to it so the switch never recompiles.
-	if (spdCS && !spdCSNv && !spdCSNvFailed) {
-		const auto nvDefines = Util::Nvapi::ShaderDefines(Util::Nvapi::Item::ShaderExtensions);
-		if (nvDefines.empty()) {
-			spdCSNvFailed = true;
-		} else {
-			try {
-				spdCSNv = static_cast<ID3D11ComputeShader*>(
-					Util::CompileShader(L"Data\\Shaders\\GrassOptimizations\\SPD\\SPD.hlsl", nvDefines, "cs_5_0"));
-			} catch (...) {
-				spdCSNv = nullptr;
-			}
-			if (!spdCSNv) {
-				spdCSNvFailed = true;
-				logger::warn("[GRASS OPTIMIZATIONS] SPD with NVIDIA shader extensions failed to build; using the portable one");
-			}
-		}
-	}
 
 	// Threads past the rendered sub-rect read beyond it, so the base pass's out-of-bounds guard writes 1.0 there and neither the padding nor the unrendered margin can cull.
 	paramsCB->Update(BaseParams{ srcW, srcH, padW, padH });
@@ -256,7 +233,7 @@ bool HiZPyramid::Build(ID3D11Device* device, ID3D11DeviceContext* ctx)
 			spdUAVs[i] = mipUAVs[i + 1].get();
 		ID3D11ShaderResourceView* spdSourceSRV = mip0SRV.get();
 
-		ctx->CSSetShader(spdCSNv && Util::Nvapi::Use(Util::Nvapi::Item::ShaderExtensions) ? spdCSNv : spdCS, nullptr, 0);
+		ctx->CSSetShader(spdCS, nullptr, 0);
 		ctx->CSSetShaderResources(0, 1, &spdSourceSRV);
 		ctx->CSSetUnorderedAccessViews(0, 6, spdUAVs, nullptr);
 		ctx->Dispatch(groupsX, groupsY, 1);
