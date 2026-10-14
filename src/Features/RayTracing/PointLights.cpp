@@ -186,6 +186,7 @@ namespace RayTracingPointLights
 			bool native;
 			bool spot;   // (46c) a spot shadow light (own group, its cone)
 			bool beam;   // (46c) a window beam
+			std::uint8_t kind;  // (46d) 0 world light, 1 the player's, 2 spell / effect
 		};
 
 		struct Group
@@ -198,6 +199,7 @@ namespace RayTracingPointLights
 			const Candidate* strongest = nullptr;
 			bool native = false;
 			bool spot = false;  // (46c) never merged with anything
+			std::uint8_t kind = 0;  // (46d) merged only with lights of the same kind
 			std::uint32_t first = 0;  // first member in the member list
 			std::uint32_t slot = UINT32_MAX;
 		};
@@ -237,6 +239,7 @@ namespace RayTracingPointLights
 	void Selector::Clear()
 	{
 		slots_ = {};
+		motion_.fill(255);
 		tags_.clear();
 		maskEntries_.clear();
 		published_ = false;
@@ -396,12 +399,15 @@ namespace RayTracingPointLights
 			}
 			using C = Util::LightCensus::Category;
 			const bool window = category == C::WindowBeam || category == C::WindowGlow || category == C::WindowFill;
+			// (46d) The player's own lights and ownerless spell / effect lights, each with its switch.
+			const bool own = category == C::Player || category == C::Effect;
+			const bool ownWanted = category == C::Player ? a_config.player : (category == C::Effect ? a_config.effects : false);
 			if (forced || beam)
 				include = true;
 			else if (native)
-				include = a_config.native && !window && category != C::Player && category != C::Effect;  // omni / hemi / spot shadow lights
+				include = a_config.native && !window && (!own || ownWanted);  // omni / hemi / spot shadow lights
 			else
-				include = IncludedCategory(category);
+				include = own ? ownWanted : IncludedCategory(category);
 			if (!include) {
 				++stats_.byReason[kRejectCategory];
 				continue;
@@ -422,6 +428,7 @@ namespace RayTracingPointLights
 			c.native = native;
 			c.spot = spot;
 			c.beam = beam;
+			c.kind = (forced || beam) ? 0 : (category == C::Player ? 1 : (category == C::Effect ? 2 : 0));
 			candidates.push_back(c);
 			stats_.native += native ? 1 : 0;
 			stats_.forced += forced ? 1 : 0;
@@ -439,7 +446,7 @@ namespace RayTracingPointLights
 			// (46c) Spot lights keep a source of their own (their cone and direction are theirs).
 			for (std::uint32_t g = 0; g < groups.size() && !c.spot; ++g) {
 				const auto& group = groups[g];
-				if (group.spot)
+				if (group.spot || group.kind != c.kind)
 					continue;
 				const double ex = group.pos[0] - c.pos[0], ey = group.pos[1] - c.pos[1], ez = group.pos[2] - c.pos[2];
 				if (ex * ex + ey * ey + ez * ez <= mergeSq) {
@@ -457,6 +464,7 @@ namespace RayTracingPointLights
 				group.strongest = &c;
 				group.native = c.native;
 				group.spot = c.spot;
+				group.kind = c.kind;
 				groups.push_back(group);
 				memberGroup[i] = static_cast<std::uint32_t>(groups.size() - 1);
 			} else {
@@ -489,13 +497,16 @@ namespace RayTracingPointLights
 		// Slots: a source keeps the slot of last frame's source nearest to it (within the merge distance);
 		// new ones take a slot freed at least two frames ago when there is one (the denoiser's history of the
 		// old source is gone by then).
+		// (46d) Only a slot of the same kind (a carried torch never takes over a lantern's history), and the distance the
+		// source moved since last frame goes to the denoiser (SlotMotion): a moving light drops its history in proportion.
 		std::array<bool, kMaxSources> taken{};
+		motion_.fill(255);
 		for (const std::uint32_t g : order) {
 			auto& group = groups[g];
 			double best = mergeSq;
 			std::uint32_t bestSlot = UINT32_MAX;
 			for (std::uint32_t s = 0; s < kMaxSources; ++s) {
-				if (!slots_[s].live || taken[s])
+				if (!slots_[s].live || taken[s] || slots_[s].kind != group.kind)
 					continue;
 				const double ex = slots_[s].pos[0] - group.pos[0], ey = slots_[s].pos[1] - group.pos[1], ez = slots_[s].pos[2] - group.pos[2];
 				const double d = ex * ex + ey * ey + ez * ez;
@@ -507,6 +518,8 @@ namespace RayTracingPointLights
 			if (bestSlot != UINT32_MAX) {
 				group.slot = bestSlot;
 				taken[bestSlot] = true;
+				const double moved = std::sqrt(best);
+				motion_[bestSlot] = static_cast<std::uint8_t>(std::clamp(moved / kMotionFullUnits * 255.0, 0.0, 255.0));
 			}
 		}
 		// Last frame's slots that found no source are free from now on.
@@ -551,6 +564,7 @@ namespace RayTracingPointLights
 			auto& slot = slots_[group.slot];
 			slot.live = true;
 			std::copy_n(group.pos, 3, slot.pos);
+			slot.kind = group.kind;
 			const auto& s = *group.strongest;
 			auto& out = o_sources[group.slot];
 			out.posRadius[0] = static_cast<float>(group.pos[0] - a_camera[0]);
@@ -564,6 +578,15 @@ namespace RayTracingPointLights
 			const bool isl = (s.read.flags & static_cast<std::uint32_t>(LightLimitFix::LightFlags::InverseSquare)) != 0;
 			out.info[0] = (isl ? kSourceISL : 0u) | (group.native ? kSourceNative : 0u);
 			float clearance = std::min(a_config.clearance, group.radius * 0.5f);
+			if (group.kind != 0) {
+				// (46d) The player's lights: the player's body is not tested (the torch, the arm, the torso); their own
+				// fixture is part of the player (excluded) or does not exist (spells): a small clearance only.
+				if (group.kind == 1)
+					out.info[0] |= kSourceNoPlayer;
+				clearance = std::min(a_config.ownClearance, group.radius * 0.5f);
+				stats_.player += group.kind == 1 ? 1 : 0;
+				stats_.effects += group.kind == 2 ? 1 : 0;
+			}
 			if (group.spot) {
 				// (46c) Spot: its cone (the trace takes the larger half width: the engine's mask is 0 beyond it).
 				out.info[0] |= kSourceSpot | (s.beam ? kSourceBeam : 0u);

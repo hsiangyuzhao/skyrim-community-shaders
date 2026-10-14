@@ -34,6 +34,8 @@ namespace RayTracingPointLights
 {
 	inline constexpr std::uint32_t kMaxSources = 64;     // slots (TracePointLightsCS: one bit each in a uint2 mask)
 	inline constexpr std::uint32_t kMaxSlotsPerPixel = 4;
+	/// (46d) A source that moved this far (world units) since last frame drops all of its denoiser history.
+	inline constexpr double kMotionFullUnits = 24.0;
 
 	// LightLimitFix::LightData::rtShadow (RayTracing/PointLightShadows.hlsli).
 	inline constexpr std::uint32_t kTagSourceMask = 0x7Fu;  // source slot + 1 (0 = none)
@@ -46,6 +48,7 @@ namespace RayTracingPointLights
 	inline constexpr std::uint32_t kSourceNative = 4u;  // holds an engine shadow-map light
 	inline constexpr std::uint32_t kSourceSpot = 8u;    // (46c) spot: spot[] = direction, tan of the larger half width; info[2] = falloff
 	inline constexpr std::uint32_t kSourceBeam = 16u;   // (46c) window beam: no attenuation in the ranking, ray ends at the interior's bounds
+	inline constexpr std::uint32_t kSourceNoPlayer = 32u;  // (46d) the player's own light: the player's body is not tested (character mask 0x04 only)
 
 	/// One shadow source as the trace reads it (StructuredBuffer, 64 bytes).
 	struct GpuSource
@@ -90,6 +93,10 @@ namespace RayTracingPointLights
 		bool beams = true;
 		// (46c) Engine shadow lights whose shadow map was not drawn this frame: always a source (sorted by pointer).
 		const std::vector<const RE::BSLight*>* forced = nullptr;
+		// (46d) The player's own lights (census "player") and ownerless spell / effect lights (census "effect").
+		bool player = true;
+		bool effects = true;
+		float ownClearance = 8.0f;  // their ray end clearance: no fixture of theirs is in the scene (the torch is the player's, excluded)
 	};
 
 	struct Stats
@@ -110,6 +117,8 @@ namespace RayTracingPointLights
 		std::uint32_t spotsInvalid = 0;  // (46c) spot shadow lights left to the engine: their cone could not be read
 		std::uint32_t forced = 0;        // (46c) lights whose shadow map was not drawn (always sources)
 		std::uint32_t forcedMissing = 0; // (46c) ... of which got no source (their mask channel gets the fallback)
+		std::uint32_t player = 0;        // (46d) the player's own lights among the sources
+		std::uint32_t effects = 0;       // (46d) spell / effect lights among the sources
 		float cpuMs = 0.0f;
 	};
 	inline constexpr const char* kRejectNames[8] = { "faded (lodDimmer)", "radius", "intensity", "distance", "outside traced area", "category",
@@ -134,6 +143,9 @@ namespace RayTracingPointLights
 		[[nodiscard]] const Stats& GetStats() const { return stats_; }
 		/// (46c) This frame's engine shadow lights with a source (interiors only; empty outdoors).
 		[[nodiscard]] const std::vector<MaskEntry>& MaskEntries() const { return maskEntries_; }
+		/// (46d) Per slot, how much of the denoiser's history to drop this frame (0 = keep it, 255 = none: a new source
+		/// in the slot, or a source that moved a long way since last frame -- a carried torch, a flying spell).
+		[[nodiscard]] const std::array<std::uint8_t, kMaxSources>& SlotMotion() const { return motion_; }
 
 	private:
 		std::vector<MaskEntry> maskEntries_;
@@ -142,8 +154,10 @@ namespace RayTracingPointLights
 			bool live = false;
 			double pos[3]{};
 			std::uint32_t freedFrame = 0;
+			std::uint8_t kind = 0;  // (46d) 0 world light, 1 the player's, 2 spell / effect: a slot keeps its kind
 		};
 		std::array<Slot, kMaxSources> slots_{};
+		std::array<std::uint8_t, kMaxSources> motion_{};
 		std::vector<std::pair<const RE::BSLight*, std::uint32_t>> tags_;  // sorted by pointer
 		bool published_ = false;
 		Stats stats_{};

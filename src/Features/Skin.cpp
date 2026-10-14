@@ -274,10 +274,8 @@ void Skin::Prepass()
 	// going indoors always clears it and stepping out starts it from nothing.
 	if (globals::features::dynamicSnow.CharacterSnowStateActive()) {
 		if (auto* player = RE::PlayerCharacter::GetSingleton(); player && player->Is3DLoaded()) {
-			const bool inWater = player->IsInWater();
-			const float positionZ = player->GetPositionZ();
-			const float depth = inWater ? std::max(0.0f, GetWaterHeight(player->AsReference(), player->GetPosition()) - positionZ) : 0.0f;
-			playerSnowGPU = UpdateActorSnow(playerSnow, player, inWater, depth, positionZ);
+			playerWater = SampleWater(player);
+			playerSnowGPU = UpdateActorSnow(playerSnow, player, playerWater);
 		}
 	} else {
 		playerSnow = {};
@@ -285,7 +283,159 @@ void Skin::Prepass()
 	}
 }
 
-float4 Skin::UpdateActorSnow(ActorSnow& a_snow, RE::Actor* a_actor, bool a_inWater, float a_depth, float a_positionZ)
+void Skin::OnGameLoaded()
+{
+	// (46d) A loaded save: nobody keeps the snow (or the water line) of the game played before it.
+	playerSnow = {};
+	playerSnowGPU = float4(-1.0f, 0.0f, 0.0f, 0.0f);
+	playerWater = {};
+	for (auto& [id, state] : actorWetStates) {
+		state.snow = {};
+		state.snowGPU = float4(-1.0f, 0.0f, 0.0f, 0.0f);
+	}
+}
+
+namespace
+{
+	std::int64_t SkinQpc()
+	{
+		LARGE_INTEGER t;
+		QueryPerformanceCounter(&t);
+		return t.QuadPart;
+	}
+
+	double SkinQpcMs()
+	{
+		static const double toMs = [] {
+			LARGE_INTEGER f;
+			QueryPerformanceFrequency(&f);
+			return f.QuadPart > 0 ? 1000.0 / static_cast<double>(f.QuadPart) : 0.0;
+		}();
+		return toMs;
+	}
+
+	bool FiniteHeight(float a_z)
+	{
+		return std::isfinite(a_z) && a_z > -1e7f && a_z < 1e7f;
+	}
+
+	/// The upward line-of-sight pick (SEH: the Havok world is engine memory).
+	__declspec(noinline) void PickUpUnsafe(RE::bhkWorld* a_world, const RE::NiPoint3* a_from, const RE::NiPoint3* a_to, bool* o_hit)
+	{
+		RE::bhkPickData pick;
+		const float scale = RE::bhkWorld::GetWorldScale();
+		pick.rayInput.from = RE::hkVector4(a_from->x * scale, a_from->y * scale, a_from->z * scale, 0.0f);
+		pick.rayInput.to = RE::hkVector4(a_to->x * scale, a_to->y * scale, a_to->z * scale, 0.0f);
+		pick.rayInput.filterInfo.filter = static_cast<std::uint32_t>(RE::COL_LAYER::kLOS);
+		{
+			RE::BSReadLockGuard lock(a_world->worldLock);
+			a_world->PickObject(pick);
+		}
+		*o_hit = pick.rayOutput.HasHit();
+	}
+
+	bool PickUpSafe(RE::bhkWorld* a_world, const RE::NiPoint3* a_from, const RE::NiPoint3* a_to, bool* o_hit)
+	{
+		__try {
+			// No waiting on the render thread: while the physics holds the world for writing, the test is skipped
+			// (the last answer stays; asked again next frame). BSReadWriteLock: writer thread, then the lock word.
+			const auto* lockWords = reinterpret_cast<const volatile std::uint32_t*>(&a_world->worldLock);
+			if (lockWords[1] & RE::BSReadWriteLock::kLockWrite)
+				return false;
+			PickUpUnsafe(a_world, a_from, a_to, o_hit);
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+}
+
+float Skin::GetWaterObjectHeight(const RE::NiPoint3& a_pos)
+{
+	// By PO3 (Splashes of Skyrim): the flat water object whose bounds hold the position.
+	// https://github.com/powerof3/Splashes-of-Skyrim/blob/master/src/Manager.cpp
+	if (const auto waterManager = RE::TESWaterSystem::GetSingleton()) {
+		for (const auto& waterObject : waterManager->waterObjects) {
+			if (!waterObject)
+				continue;
+			for (const auto& bound : waterObject->multiBounds) {
+				if (!bound)
+					continue;
+				if (auto size{ bound->size }; size.z <= 10.0f) {  // avoid sloped water
+					const auto center{ bound->center };
+					const auto boundMin = center - size;
+					const auto boundMax = center + size;
+					if (!(a_pos.x < boundMin.x || a_pos.x > boundMax.x || a_pos.y < boundMin.y || a_pos.y > boundMax.y))
+						return center.z;
+				}
+			}
+		}
+	}
+	return -1e30f;
+}
+
+Skin::WaterSample Skin::SampleWater(RE::Actor* a_actor)
+{
+	WaterSample w;
+	if (!a_actor)
+		return w;
+	const auto position = a_actor->GetPosition();
+	w.feetZ = position.z;
+	if (auto* loaded = a_actor->loadedData; loaded && FiniteHeight(loaded->relevantWaterHeight))
+		w.relevant = loaded->relevantWaterHeight;
+	if (auto* cell = a_actor->GetParentCell()) {
+		const float h = cell->GetExteriorWaterHeight();
+		if (FiniteHeight(h))
+			w.cellDefault = h;
+	}
+	if (w.relevant <= -1e29f) {
+		const float h = GetWaterObjectHeight(position);
+		if (FiniteHeight(h))
+			w.multibound = h;
+	}
+	w.surfaceZ = w.relevant > -1e29f ? w.relevant : w.multibound;
+	if (w.surfaceZ <= -1e29f)
+		return w;
+	w.rawDepth = w.surfaceZ - w.feetZ;
+	if (w.rawDepth <= 0.0f)
+		return w;
+	w.inWater = true;
+	if (auto* state = a_actor->AsActorState())
+		w.swimming = state->IsSwimming();
+	// Plausibility: a wading character is at most 0.6 of its height deep, a swimming one about its height.
+	const float height = std::max(a_actor->GetHeight(), 32.0f);
+	const float limit = w.swimming ? height : 0.6f * height;
+	w.clamped = w.rawDepth > limit;
+	w.depth = std::min(w.rawDepth, limit);
+	return w;
+}
+
+bool Skin::IsSheltered(RE::Actor* a_actor, ActorSnow& a_snow, double a_intervalMs)
+{
+	const std::int64_t now = SkinQpc();
+	if (a_snow.shelterQpc != 0 && static_cast<double>(now - a_snow.shelterQpc) * SkinQpcMs() < a_intervalMs)
+		return a_snow.sheltered;
+	a_snow.shelterQpc = now;
+	auto* cell = a_actor ? a_actor->GetParentCell() : nullptr;
+	auto* world = cell ? cell->GetbhkWorld() : nullptr;
+	if (!world) {
+		a_snow.sheltered = false;
+		return false;
+	}
+	// From just above the head straight up: a roof, eaves, an overhang or a bridge.
+	const auto position = a_actor->GetPosition();
+	const float top = position.z + std::max(a_actor->GetHeight(), 32.0f) + 16.0f;
+	const RE::NiPoint3 from{ position.x, position.y, top };
+	const RE::NiPoint3 to{ position.x, position.y, top + 3000.0f };
+	bool hit = false;
+	if (PickUpSafe(world, &from, &to, &hit))
+		a_snow.sheltered = hit;
+	else
+		a_snow.shelterQpc = 0;  // not tested (physics busy, or a fault): the last answer, asked again next frame
+	return a_snow.sheltered;
+}
+
+float4 Skin::UpdateActorSnow(ActorSnow& a_snow, RE::Actor* a_actor, const WaterSample& a_water)
 {
 	const auto& snow = globals::features::dynamicSnow;
 	auto* calendar = RE::Calendar::GetSingleton();
@@ -293,49 +443,66 @@ float4 Skin::UpdateActorSnow(ActorSnow& a_snow, RE::Actor* a_actor, bool a_inWat
 	auto* cell = a_actor->GetParentCell();
 	const bool exterior = cell && cell->IsExteriorCell() && snow.status.exterior;
 	const float cap = snow.DrawnAmount();
+	const float feetZ = a_water.feetZ;
 
 	if (!exterior) {
 		// Indoors: no snow, and back outside it starts from nothing.
 		a_snow.amount = 0.0f;
 		a_snow.washed = 0.0f;
 		a_snow.washDepth = 0.0f;
+		a_snow.sheltered = false;
+		a_snow.shelterQpc = 0;
 		a_snow.hours = now;
-		return float4(0.0f, 0.0f, 0.0f, a_positionZ);
+		return float4(0.0f, 0.0f, 0.0f, feetZ);
 	}
+	const auto& s = snow.settings;
+	// (46d) Under a roof: no build-up (the snow already there stays, melting as usual when it does not snow).
+	const bool sheltered = s.CharacterSnowRoofs && IsSheltered(a_actor, a_snow, a_actor->IsPlayerRef() ? 250.0 : 1000.0 + static_cast<double>(a_actor->GetFormID() % 97));
 	if (a_snow.hours < 0.0) {
 		// First seen outdoors (a load, a character walking into view, the switch turned on): assume they
-		// have been out as long as the ground has.
-		a_snow.amount = cap;
-		a_snow.washed = cap;
+		// have been out as long as the ground has (none under a roof).
+		a_snow.amount = sheltered ? 0.0f : cap;
+		a_snow.washed = a_snow.amount;
 		a_snow.washDepth = 0.0f;
 	} else {
 		// Same rates as the global amount; a step back in time (an earlier save) is no step.
 		const float hours = static_cast<float>(std::clamp(now - a_snow.hours, 0.0, 1e4));
-		const auto& s = snow.settings;
-		const float delta = snow.status.snowing ? hours * snow.status.snowfall / std::max(s.AccumulationHours, 0.01f) :
-		                                          -hours / std::max(s.MeltHours, 0.01f);
+		const float buildRate = 1.0f / std::max(s.AccumulationHours, 0.01f);
+		float delta = snow.status.snowing ? hours * snow.status.snowfall * buildRate : -hours / std::max(s.MeltHours, 0.01f);
+		if (sheltered)
+			delta = std::min(delta, 0.0f);
 		a_snow.amount = std::clamp(a_snow.amount + delta, 0.0f, cap);
-		a_snow.washed = std::clamp(a_snow.washed + delta, 0.0f, a_snow.amount);
 		// The debug override shows its amount at once.
 		if (s.OverrideAmount)
 			a_snow.amount = cap;
+		// (46d) The washed part builds up again at the build-up rate whenever snow builds up (or the override is
+		// on: it shows the build-up), else it melts with the rest; never above the body's amount.
+		float washedDelta = delta;
+		if (!sheltered && s.OverrideAmount)
+			washedDelta = hours * buildRate;
+		a_snow.washed = std::clamp(a_snow.washed + washedDelta, 0.0f, a_snow.amount);
 	}
 	a_snow.hours = now;
 
-	if (snow.settings.CharacterSnowWaterWash) {
-		if (a_inWater && a_depth > 0.0f) {
-			a_snow.washDepth = std::max(a_snow.washDepth, a_depth);
+	// (46d) In the water: the part below the current local surface has no snow (the line follows the surface);
+	// the deepest validated line is kept for after leaving, until the washed part has built up again.
+	float washLine = 0.0f;
+	if (s.CharacterSnowWaterWash) {
+		if (a_water.inWater && a_water.depth > 0.0f) {
+			a_snow.washDepth = std::max(a_snow.washDepth, a_water.depth);
 			a_snow.washed = 0.0f;
-		} else if (a_snow.washDepth > 0.0f && a_snow.washed >= a_snow.amount - 1e-3f) {
-			// Built back up to the rest of the body: one amount again.
-			a_snow.washDepth = 0.0f;
+			washLine = a_water.depth;
+		} else {
+			if (a_snow.washDepth > 0.0f && a_snow.washed >= a_snow.amount - 1e-3f)
+				a_snow.washDepth = 0.0f;  // built back up to the rest of the body: one amount again
+			washLine = a_snow.washDepth;
 		}
 	} else {
 		a_snow.washDepth = 0.0f;
 	}
-	if (a_snow.washDepth <= 0.0f)
+	if (washLine <= 0.0f && a_snow.washDepth <= 0.0f)
 		a_snow.washed = a_snow.amount;
-	return float4(a_snow.amount, a_snow.washed, a_snow.washDepth, a_positionZ);
+	return float4(a_snow.amount, a_snow.washed, washLine, feetZ);
 }
 
 void Skin::PostPostLoad()
@@ -373,46 +540,6 @@ void Skin::SaveSettings(json& o_json)
 void Skin::RestoreDefaultSettings()
 {
 	settings = {};
-}
-
-// By PO3
-// https://github.com/powerof3/Splashes-of-Skyrim/blob/master/src/Manager.cpp
-float Skin::GetWaterHeight(const RE::TESObjectREFR* a_ref, const RE::NiPoint3& a_pos)
-{
-	float waterHeight = -RE::NI_INFINITY;
-
-	if (const auto waterManager = RE::TESWaterSystem::GetSingleton()) {
-		waterHeight = a_ref->GetWaterHeight();
-
-		if (waterHeight != -RE::NI_INFINITY) {
-			return waterHeight;
-		}
-
-		const auto get_nearest_water_object_height = [&]() {
-			for (const auto& waterObject : waterManager->waterObjects) {
-				if (waterObject) {
-					for (const auto& bound : waterObject->multiBounds) {
-						if (bound) {
-							if (auto size{ bound->size }; size.z <= 10.0f) {  //avoid sloped water
-								auto       center{ bound->center };
-								const auto boundMin = center - size;
-								const auto boundMax = center + size;
-								if (!(a_pos.x < boundMin.x || a_pos.x > boundMax.x || a_pos.y < boundMin.y || a_pos.y > boundMax.y)) {
-									return center.z;
-								}
-							}
-						}
-					}
-				}
-			}
-
-			return -RE::NI_INFINITY;
-		};
-
-		waterHeight = get_nearest_water_object_height();
-	}
-
-	return waterHeight;
 }
 
 void Skin::PruneActorWetStates(uint32_t a_frame)
@@ -463,13 +590,15 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 	state.clock = wetClock;
 	state.frame = frame;
 
-	const bool inWater = actor->IsInWater();
-	const float positionZ = actor->GetPositionZ();
-	const float depth = inWater ? std::max(0.0f, GetWaterHeight(actor->AsReference(), actor->GetPosition()) - positionZ) : 0.0f;
+	// (46d) The local water surface (never the cell's default water plane), shared with the snow.
+	const WaterSample water = SampleWater(actor);
+	const bool inWater = water.inWater;
+	const float positionZ = water.feetZ;
+	const float depth = water.depth;
 
 	// (46a) Per-character snow (Dynamic Snow). The player's is advanced in Prepass every frame.
 	if (globals::features::dynamicSnow.CharacterSnowStateActive()) {
-		state.snowGPU = actor->IsPlayerRef() ? playerSnowGPU : UpdateActorSnow(state.snow, actor, inWater, depth, positionZ);
+		state.snowGPU = actor->IsPlayerRef() ? playerSnowGPU : UpdateActorSnow(state.snow, actor, water);
 	} else {
 		state.snow = {};
 		state.snowGPU = float4(-1.0f, 0.0f, 0.0f, 0.0f);
@@ -953,7 +1082,7 @@ float4 Skin::GetWaterDepthParams(RE::BSGeometry* a_geometry)
 {
 	auto userData = a_geometry->GetUserData();
 	auto actor = userData ? userData->As<RE::Character>() : nullptr;
-	if (!actor || !actor->IsInWater())
+	if (!actor)
 		return float4(0.0f, 0.0f, 0.0f, 0.0f);
 	// Alpha-blended geometry only (as Extended Translucency tells it: a blending alpha property, or a
 	// material alpha below 1, which the engine draws blended).
@@ -964,9 +1093,11 @@ float4 Skin::GetWaterDepthParams(RE::BSGeometry* a_geometry)
 	auto lightProperty = property1 && property1->GetRTTI() == globals::rtti::BSLightingShaderPropertyRTTI.get() ? static_cast<RE::BSLightingShaderProperty*>(property1.get()) : nullptr;
 	if (!(lightProperty && lightProperty->alpha < 0.999f) && (!alphaProperty || !alphaProperty->GetAlphaBlending()))
 		return float4(0.0f, 0.0f, 0.0f, 0.0f);
-	const float waterZ = GetWaterHeight(actor->AsReference(), actor->GetPosition());
-	if (!std::isfinite(waterZ) || waterZ <= -1e6f)
+	// (46d) The local water surface (as the wetness and the snow), not the cell's default water plane.
+	const WaterSample water = SampleWater(actor);
+	if (!water.inWater)
 		return float4(0.0f, 0.0f, 0.0f, 0.0f);
+	const float waterZ = water.surfaceZ;
 	// Seen from below the surface the water is not in front of the clothes: nothing to do.
 	const auto eye = globals::game::frameBufferCached.GetCameraPosAdjust(0);
 	if (eye.z <= waterZ + 1.0f)

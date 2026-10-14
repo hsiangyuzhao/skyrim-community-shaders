@@ -20,6 +20,7 @@ cbuffer PointDenoiseCB : register(b1)
 {
 	float4 PLParams;  // x emitter radius, y this frame's weight in the history blend, z flags (asuint), w max filter radius (px)
 	float4 PLExtra;   // x K, yzw unused
+	uint4 PLMotion[4];  // (46d) per source slot one byte (slot s: byte s % 4 of uint s / 4): history dropped this frame, 0 keep .. 255 none
 };
 
 Texture2D<unorm float4> PLVis : register(t0);
@@ -78,6 +79,14 @@ bool Match(uint4 a_ids, float4 a_vis, uint a_id, out float o_raw)
 		return true;
 	}
 	return false;
+}
+
+// (46d) How much of a source's history is dropped this frame (0 keep .. 1 none): a new or moving source.
+float HistoryDrop(uint a_id)
+{
+	const uint s = a_id - 1u;
+	const uint word = PLMotion[s >> 4u][(s >> 2u) & 3u];
+	return float((word >> ((s & 3u) * 8u)) & 0xFFu) / 255.0;
 }
 
 float Lit(float a_raw)
@@ -238,7 +247,8 @@ float Lit(float a_raw)
 				{
 					if (ids[s] != 0u && hw[s] >= 0.05) {
 						const float lo3 = (lo[s] <= 1.0 ? lo[s] : spatial[s]) - 0.1, hi3 = (hi[s] >= 0.0 ? hi[s] : spatial[s]) + 0.1;
-						result[s] = lerp(clamp(hv[s] / hw[s], lo3, hi3), spatial[s], PLParams.y);
+						// (46d) A moving source (a carried torch) keeps less history: its shadows move with it, nothing smears.
+						result[s] = lerp(clamp(hv[s] / hw[s], lo3, hi3), spatial[s], lerp(PLParams.y, 1.0, HistoryDrop(ids[s])));
 					}
 				}
 			}

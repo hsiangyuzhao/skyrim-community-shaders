@@ -430,6 +430,8 @@ namespace RayTracingScene
 		}
 		static const void* LandSignature(RE::TESObjectCELL* a_cell);
 		bool Validate(const Cell& a_cell) const;
+		/// (46d) An interior cell is loaded: attached, or the player stands in it with its 3D loaded.
+		static bool InteriorLoaded(const RE::TESObjectCELL* a_cell);
 		/// Captures until the deadline; true when the cell is finished.
 		bool Gather(RayTracingRT::Backend& a_backend, Cell& a_cell, std::int64_t a_deadline);
 		void CaptureObject(Cell& a_cell, RE::NiAVObject* a_object, int a_depth);

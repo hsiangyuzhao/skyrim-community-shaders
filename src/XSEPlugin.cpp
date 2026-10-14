@@ -1,5 +1,6 @@
 #include "Deferred.h"
 #include "EngineFixes/WndProcPseudoHandleFix.h"
+#include "Features/Skin.h"
 #include "Features/Upscaling.h"
 #include "FrameAnnotations.h"
 #include "Globals.h"
@@ -102,6 +103,14 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 					shaderCache->StartFileWatcher();
 			}
 
+			break;
+		}
+	case SKSE::MessagingInterface::kPostLoadGame:
+	case SKSE::MessagingInterface::kNewGame:
+		{
+			// (46d) Per-character snow (Advanced Skin) starts afresh with the loaded game.
+			if (errors.empty() && globals::features::skin.loaded)
+				globals::features::skin.OnGameLoaded();
 			break;
 		}
 	case SKSE::MessagingInterface::kDataLoaded:

@@ -146,10 +146,37 @@ struct Skin : Feature
 		float amount = 0.0f;     // own snow, 0..the global amount
 		float washed = 0.0f;     // snow on the part that was under water (builds up again from 0)
 		float washDepth = 0.0f;  // height above the feet the water reached (0 = nothing washed)
+		// (46d) Roofs stop build-up: an upward Havok ray from the head, throttled (player 0.25 s, others 1 s).
+		bool sheltered = false;
+		std::int64_t shelterQpc = 0;  // QPC of the last test (0 = never)
 	};
+	/// (46d) The water at a character: the local surface only (Havok's relevant water height when it has
+	/// one, else the flat water object whose bounds hold the character), never the cell's default water
+	/// plane (TESObjectREFR::GetWaterHeight falls back to it: in streams and dips below that plane the
+	/// whole body counted as under water). Shared by Wet Skin, Character Wetness and the snow.
+	struct WaterSample
+	{
+		float relevant = -1e30f;     // loadedData->relevantWaterHeight (-1e30 = none)
+		float cellDefault = -1e30f;  // the cell's default water plane (diagnostics only)
+		float multibound = -1e30f;   // the flat water object under the character (-1e30 = none)
+		float surfaceZ = -1e30f;     // the surface used (-1e30 = no water)
+		float feetZ = 0.0f;
+		float depth = 0.0f;     // surface above the feet, clamped to a plausible depth (0 = not in water)
+		float rawDepth = 0.0f;  // before the clamp
+		bool inWater = false;
+		bool swimming = false;
+		bool clamped = false;
+	};
+	static WaterSample SampleWater(RE::Actor* a_actor);
 	/// (46a) Advances one character's snow and returns its snowPerGeometry.
-	float4 UpdateActorSnow(ActorSnow& a_snow, RE::Actor* a_actor, bool a_inWater, float a_depth, float a_positionZ);
-	ActorSnow playerSnow;                       // the player's, advanced every frame in Prepass
+	float4 UpdateActorSnow(ActorSnow& a_snow, RE::Actor* a_actor, const WaterSample& a_water);
+	/// (46d) Whether something is above the character's head (roof, eaves, overhang), tested at most every
+	/// a_intervalMs (the last answer in between).
+	static bool IsSheltered(RE::Actor* a_actor, ActorSnow& a_snow, double a_intervalMs);
+	/// (46d) A save was loaded / a new game started: every character's snow starts afresh.
+	void OnGameLoaded();
+	WaterSample playerWater;  // (46d) the player's last sample (Dynamic Snow status line)
+	ActorSnow playerSnow;     // the player's, advanced every frame in Prepass
 	float4 playerSnowGPU = { -1.0f, 0.0f, 0.0f, 0.0f };
 
 	/// (44b) Per character (form ID), computed once per frame and shared by every geometry of that
@@ -234,7 +261,7 @@ struct Skin : Feature
 	std::unordered_map<uint32_t, ExtraTextures> skinExtraTextures;
 
 	SkinData GetCommonBufferData();
-	float GetWaterHeight(const RE::TESObjectREFR* a_ref, const RE::NiPoint3& a_pos);
+	static float GetWaterObjectHeight(const RE::NiPoint3& a_pos);
 	float4 GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_wetChar);
 
 	void SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, RE::BSTextureSet* inTextureSet, uint32_t i_hashKey);

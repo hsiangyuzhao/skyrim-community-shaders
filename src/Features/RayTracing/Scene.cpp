@@ -339,7 +339,18 @@ namespace RayTracingScene
 	{
 		// Still the same attached exterior cell. (Reference counts are not compared: characters walking
 		// between cells change them all the time; captured references are re-checked one by one instead.)
-		return a_cell.cell && a_cell.cell->GetFormID() == a_cell.formID && a_cell.cell->IsAttached();
+		if (!a_cell.cell || a_cell.cell->GetFormID() != a_cell.formID)
+			return false;
+		return a_cell.interior ? InteriorLoaded(a_cell.cell) : a_cell.cell->IsAttached();
+	}
+
+	bool Scene::InteriorLoaded(const RE::TESObjectCELL* a_cell)
+	{
+		// (46d) The interior the player stands in counts as loaded even if its state is not "attached" (yet).
+		if (a_cell->IsAttached())
+			return true;
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		return player && player->GetParentCell() == a_cell && player->Is3DLoaded();
 	}
 
 	void Scene::CloseChunk(RayTracingRT::Backend& a_backend, Cell& a_cell)
@@ -1429,6 +1440,15 @@ namespace RayTracingScene
 		auto* tes = RE::TES::GetSingleton();
 		// (46c) Interiors: the player's interior cell is the one "grid cell" (when Ray Tracing's point lights want it).
 		auto* interior = tes ? tes->interiorCell : nullptr;
+		// (46d) Behind a door's loading screen the player is already in the interior while TES still lists the old
+		// exterior grid: the interior is taken from the player then (captured once loaded), the exterior is not
+		// captured again for nothing (46c spent the loading screen re-capturing the street it was leaving).
+		if (!interior) {
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			auto* parent = player ? player->GetParentCell() : nullptr;
+			if (parent && parent->IsInteriorCell())
+				interior = parent;
+		}
 		const bool interiorWanted = interior && interiorEnabled_;
 		if (!tes || (interior && !interiorWanted) ||
 			(!interior && (!tes->gridCells || tes->gridCells->length == 0 || tes->gridCells->length > 63))) {
@@ -1442,7 +1462,7 @@ namespace RayTracingScene
 		// 1. Grid diff: cells that left the grid (or are no longer the same attached cell) go now.
 		std::vector<RE::TESObjectCELL*> attached;
 		if (interiorWanted) {
-			if (interior->IsAttached() && interior->IsInteriorCell())
+			if (interior->IsInteriorCell() && InteriorLoaded(interior))
 				attached.push_back(interior);
 		} else {
 			auto* grid = tes->gridCells;

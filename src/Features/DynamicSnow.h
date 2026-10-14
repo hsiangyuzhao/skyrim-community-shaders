@@ -118,6 +118,9 @@ public:
 		/// (46a) The part of a character that was under water loses its snow and builds it up again
 		/// after leaving the water (needs CharacterSnowBuildUp).
 		bool CharacterSnowWaterWash = true;
+		/// (46d) Under a roof (a ray straight up from the head) a character's snow does not build up; what is on
+		/// them stays. The shader then skips its per-pixel sky test for characters (it erased their snow under eaves).
+		bool CharacterSnowRoofs = true;
 		float TrailSize = 1.0f;
 		float TrailDepth = 5.0f;            ///< game units
 		float TrailRefillSeconds = 180.0f;  ///< real seconds for a full print to fill back in
@@ -230,6 +233,8 @@ public:
 		FlagShowColdMap = 1 << 17,
 		// (46a) Characters read their own snow amount from Advanced Skin's per-geometry buffer (b7).
 		FlagCharacterSnowState = 1 << 18,
+		// (46d) Characters: the CPU roof test replaces the per-pixel sky test.
+		FlagCharacterRoofs = 1 << 19,
 	};
 
 	[[nodiscard]] CommonBufferData GetCommonBufferData();

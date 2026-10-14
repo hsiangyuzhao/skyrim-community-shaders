@@ -144,6 +144,10 @@ public:
 		int PointLightsPerPixelInterior = 4;    // K indoors: 1, 2 or 4
 		bool PointLightsWindowBeams = true;     // Window Shadows Ultimate's window beams traced (their shadow mask channel written)
 		bool PointLightsSkipShadowMaps = false; // the engine does not draw shadow maps for lights fully handled by RT (interiors)
+		// (46d)
+		bool PointLightsPlayer = true;          // the player's own lights (torch in hand, Quick Light, light spells) cast RT shadows (not of the player)
+		bool PointLightsEffects = true;         // spell / effect lights without an owner (Magelight, projectiles) cast RT shadows
+		bool PointLightsAlphaOutdoors = true;   // outdoors too, leaves / bushes / cut-outs (as the per-kind menu traces them) block point lights
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted
@@ -413,6 +417,7 @@ private:
 	{
 		float Params[4];  // emitter radius, this frame's weight in the history, flags (bits), max filter radius (px)
 		float Extra[4];   // K, unused x3
+		std::uint32_t Motion[16];  // (46d) per source slot one byte: history dropped this frame (0 keep .. 255 none), 4 slots per uint
 	};
 	STATIC_ASSERT_ALIGNAS_16(PointDenoiseCB);
 	RayTracingPointLights::Selector pointSelector;
@@ -480,6 +485,10 @@ private:
 	std::int64_t interiorEntryQpc = 0;
 	float interiorReadyMs = -1.0f;       // from entering (or the loading screen closing) to the first traced frame
 	bool interiorReadyPending = false;
+	// (46d) Interior capture progress in the log (every 2 s while capturing) and one line when the scene is ready.
+	void LogInteriorProgress(bool a_covered);
+	bool interiorSceneLogPending = false;
+	std::int64_t interiorProgressQpc = 0;
 	std::uint32_t maskChannelsWritten = 0;  // last frame
 	bool pointMaskDone = false;             // WritePointMask ran this frame
 	// Engine shadow maps left out (PointLightsSkipShadowMaps).

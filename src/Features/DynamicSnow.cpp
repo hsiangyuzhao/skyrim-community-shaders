@@ -35,6 +35,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SnowOnCharacters,
 	CharacterSnowBuildUp,
 	CharacterSnowWaterWash,
+	CharacterSnowRoofs,
 	TrailSize,
 	TrailDepth,
 	TrailRefillSeconds,
@@ -1025,8 +1026,12 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 		if (settings.SnowOnCharacters) {
 			data.Flags |= FlagSnowOnCharacters;
 			// (46a) Characters take their own amount from Advanced Skin's b7 (Skin::GetWetness).
-			if (CharacterSnowStateActive())
+			if (CharacterSnowStateActive()) {
 				data.Flags |= FlagCharacterSnowState;
+				// (46d) Roofs: the per-character state (no build-up under a roof) instead of the per-pixel sky test.
+				if (settings.CharacterSnowRoofs)
+					data.Flags |= FlagCharacterRoofs;
+			}
 		}
 		// (batch 39c) (44h) FlagCoverageSlope (Even Cover) is never set: NormalThreshold decides coverage.
 		if (settings.SnowOnTrees)
@@ -2176,7 +2181,25 @@ void DynamicSnow::DrawSettings()
 				"On (default): the part of a character that went under water loses its snow; after leaving the water\n"
 				"it builds up again from nothing.\n"
 				"Off: water does not touch character snow.");
+		// (46d)
+		ImGui::Checkbox("Roofs stop build-up (snow stays)", &settings.CharacterSnowRoofs);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"On (default): under a roof, eaves or an overhang a character's snow stops building up; what is already\n"
+				"on them stays (and melts as usual when it stops snowing). Checked with a ray straight up from the head.\n"
+				"Off: the 46a behaviour (snow fades per pixel under anything that blocks the sky, so it vanishes under eaves).");
 		ImGui::EndDisabled();
+		// (46d) Diagnostics: the player's water and snow state.
+		if (settings.CharacterSnowBuildUp && globals::features::skin.loaded) {
+			const auto& w = globals::features::skin.playerWater;
+			const auto& ps = globals::features::skin.playerSnow;
+			auto z = [](float a_z) { return a_z > -1e29f ? std::format("{:.0f}", a_z) : std::string("none"); };
+			ImGui::TextDisabled("Player water: local %s (Havok %s, water object %s, cell default %s), feet %.0f, depth %.0f%s%s",
+				z(w.surfaceZ).c_str(), z(w.relevant).c_str(), z(w.multibound).c_str(), z(w.cellDefault).c_str(), w.feetZ, w.depth,
+				w.clamped ? std::format(" (clamped from {:.0f})", w.rawDepth).c_str() : "", w.swimming ? ", swimming" : "");
+			ImGui::TextDisabled("Player snow: %.2f, washed part %.2f below %.0f units, %s", ps.amount, ps.washed, ps.washDepth,
+				ps.sheltered ? "under a roof" : "open sky");
+		}
 		if (settings.CharacterSnowBuildUp && !(globals::features::skin.loaded && globals::features::skin.settings.EnableSkin))
 			ImGui::TextDisabled("Advanced Skin is off: characters show the ground's snow.");
 		ImGui::Unindent();

@@ -51,7 +51,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PointLightsInteriors,
 	PointLightsPerPixelInterior,
 	PointLightsWindowBeams,
-	PointLightsSkipShadowMaps)
+	PointLightsSkipShadowMaps,
+	PointLightsPlayer,
+	PointLightsEffects,
+	PointLightsAlphaOutdoors)
 
 namespace
 {
@@ -255,7 +258,10 @@ void RayTracing::UpdatePhase()
 	}
 	if (phase == Phase::WarmUp) {
 		const double elapsed = static_cast<double>(Qpc() - warmUpStart) * QpcMs();
-		const bool ready = scene.HasCoverage() && sc.cellsGathering == 0 && backend.QueuedBuilds() == 0 && status == Status::Active;
+		// (46d) Indoors the scene must be the interior's: behind a door's loading screen the old exterior is still
+		// captured (the interior cell is only known once it closes), and its coverage ended the warm-up at once.
+		const bool sceneMatches = !(Util::IsInterior() && InteriorWanted() && RE::TES::GetSingleton() && RE::TES::GetSingleton()->interiorCell) || sc.interior;
+		const bool ready = sceneMatches && scene.HasCoverage() && sc.cellsGathering == 0 && backend.QueuedBuilds() == 0 && status == Status::Active;
 		if (ready || elapsed > kWarmUpTimeoutMs) {
 			phase = Phase::Play;
 			lastTimeToReadyMs = static_cast<float>(elapsed);
@@ -1288,11 +1294,14 @@ void RayTracing::PublishCpuSplit()
 		detail.phase = static_cast<int>(phase);
 		// (45l) Per pass.
 		auto* timers = Util::GpuPassTimers::GetSingleton();
-		detail.tileGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingDenoise);
-		detail.filterGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingDenoiseFilter);
-		detail.sigmaGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingSigma);
-		detail.combineGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingCombine);
-		detail.syncGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingSync);
+		// (46d) A pass that did not run this frame reports 0, not the last sample it left (stale for as long as it is off).
+		const bool combined = activeThisFrame && combinedThisFrame;
+		auto passMs = [&](bool a_ran, Util::GpuBucket a_bucket) { return a_ran ? timers->LastSampleMs(a_bucket) : 0.0f; };
+		detail.tileGpuMs = passMs(combined && pending.spatial, Util::GpuBucket::RayTracingDenoise);
+		detail.filterGpuMs = passMs(combined && pending.spatial, Util::GpuBucket::RayTracingDenoiseFilter);
+		detail.sigmaGpuMs = passMs(combined && pending.sigma, Util::GpuBucket::RayTracingSigma);
+		detail.combineGpuMs = passMs(combined && !pending.interior, Util::GpuBucket::RayTracingCombine);
+		detail.syncGpuMs = passMs(combined, Util::GpuBucket::RayTracingSync);
 		float denoise = -1.0f;
 		for (const float part : { detail.tileGpuMs, detail.filterGpuMs, detail.sigmaGpuMs })
 			if (part >= 0.0f)
@@ -1319,9 +1328,9 @@ void RayTracing::PublishCpuSplit()
 		detail.plK = pointThisFrame ? static_cast<int>(pointK) : 0;
 		detail.plSources = pointThisFrame ? ps.sources : 0;
 		detail.plCandidates = ps.candidates;
-		detail.plRays = stats.pointRaysPerFrame;
-		detail.plGpuMs = stats.lastPointGpuMs;
-		detail.plDenoiseGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingPointDenoise);
+		detail.plGpuMs = pointThisFrame ? stats.lastPointGpuMs : 0.0f;
+		detail.plDenoiseGpuMs = passMs(pointThisFrame && pointDenoised, Util::GpuBucket::RayTracingPointDenoise);
+		detail.plRays = pointThisFrame ? stats.pointRaysPerFrame : 0u;
 		detail.plCpuMs = settings.PointLights ? pointCpuMs : -1.0f;
 		// (46c)
 		detail.rtInterior = interiorThisFrame ? (pointThisFrame ? 2 : 1) : 0;
@@ -2167,6 +2176,9 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	// (46c) Indoors: spot shadow lights, window beams, the lights whose shadow map was left out this frame.
 	config.interior = a_interior;
 	config.beams = settings.PointLightsWindowBeams;
+	// (46d) The player's lights (never shadowed by the player's own body) and ownerless spell / effect lights.
+	config.player = settings.PointLightsPlayer;
+	config.effects = settings.PointLightsEffects;
 	config.forced = a_interior && !skippedLights.empty() ? &skippedLights : nullptr;
 	const double camera[3] = { a_camX, a_camY, a_camZ };
 	const float worldRect[4] = { static_cast<float>(a_traceRect[0] + a_camX), static_cast<float>(a_traceRect[1] + a_camY),
@@ -2220,7 +2232,8 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	pointInput.sources = pointSources.data();
 	pointInput.sourceBytes = static_cast<std::uint32_t>(sizeof(pointSources));
 	pointInput.scan = scan;
-	pointInput.alpha = a_interior && backend.PointAlphaAvailable();
+	// (46d) Outdoors too (leaves, bushes, cut-outs as the per-kind menu traces them), with the switch.
+	pointInput.alpha = (a_interior || settings.PointLightsAlphaOutdoors) && backend.PointAlphaAvailable();
 	a_input.pointLights = &pointInput;
 	pointK = K;
 	return true;
@@ -2246,6 +2259,12 @@ void RayTracing::FinishPointLights()
 	std::memcpy(&cb.Params[2], &flags, sizeof(float));
 	cb.Params[3] = kPointMaxFilterRadius;
 	cb.Extra[0] = static_cast<float>(pointK);
+	{
+		// (46d) Moving / new sources: their history is dropped in proportion (slot s in byte s % 4 of Motion[s / 4]).
+		const auto& motion = pointSelector.SlotMotion();
+		for (std::uint32_t s = 0; s < RayTracingPointLights::kMaxSources; ++s)
+			cb.Motion[s / 4] |= static_cast<std::uint32_t>(motion[s]) << ((s % 4) * 8);
+	}
 	pointDenoiseCB->Update(cb);
 
 	timers->Begin(Util::GpuBucket::RayTracingPointDenoise);
@@ -2335,6 +2354,8 @@ void RayTracing::RunInteriorFrame()
 		interiorCell = cell;
 		interiorEntryQpc = Qpc();
 		interiorReadyPending = true;
+		interiorSceneLogPending = true;
+		interiorProgressQpc = Qpc();
 	}
 	if (phase == Phase::WarmUp && warmUpStart > interiorEntryQpc)
 		interiorEntryQpc = warmUpStart;
@@ -2350,11 +2371,18 @@ void RayTracing::RunInteriorFrame()
 	const double camX = camera.x, camY = camera.y, camZ = camera.z;
 	float world[4];
 	if (!scene.HasCoverage() || !scene.GetLoadedRect(world, true)) {
+		// (46d) The interior's BLASes are built here: outdoors the trace submission (ExecuteFrame) builds the
+		// queue even before any cell is covered, but indoors nothing is traced until the interior is covered,
+		// so without this its queued builds never ran (46c: "capturing the interior" for ever). Our own queue,
+		// nothing waits on the CPU; a larger cap while warming up after the loading screen.
+		backend.BuildOnly(phase == Phase::WarmUp ? kLoadingBuildTriangles : kBuildBudget * 2, phase == Phase::WarmUp ? kLoadingMaxBuilds : 16);
+		backend.Tick();
 		status = Status::Waiting;
 		statusReason = "capturing the interior";
-		backend.Tick();
+		LogInteriorProgress(false);
 		return;
 	}
+	LogInteriorProgress(true);
 	const float traceRect[4] = { static_cast<float>(world[0] - camX), static_cast<float>(world[1] - camY), static_cast<float>(world[2] - camX),
 		static_cast<float>(world[3] - camY) };
 	const bool validate = frameIndex % 30 == 0;
@@ -2527,6 +2555,35 @@ void RayTracing::RunInteriorFrame()
 			static_cast<double>(st.blasBytes + st.scratchBytes + st.tlasBytes) / (1024.0 * 1024.0), sc.interiorGatherMs, sc.windowMasks,
 			sc.interiorBounds[3] - sc.interiorBounds[0], sc.interiorBounds[4] - sc.interiorBounds[1], sc.interiorBounds[5] - sc.interiorBounds[2]);
 	}
+}
+
+void RayTracing::LogInteriorProgress(bool a_covered)
+{
+	// (46d) The interior's capture in the log: every 2 s until it is covered, then one "ready" line.
+	const auto& sc = scene.GetStats();
+	const auto& st = backend.GetStats();
+	if (a_covered) {
+		if (!interiorSceneLogPending)
+			return;
+		interiorSceneLogPending = false;
+		logger::info("[RayTracing] Interior scene ready {:.0f} ms after entering: {} shapes, {:.2f} M triangles, {} BLAS built ({} queued), {:.0f} MB, "
+					 "box {:.0f} x {:.0f} x {:.0f}",
+			static_cast<double>(Qpc() - interiorEntryQpc) * QpcMs(), sc.interiorShapes, static_cast<double>(sc.interiorTriangles) / 1e6, st.blasCount,
+			st.blasQueued, static_cast<double>(st.blasBytes + st.scratchBytes + st.tlasBytes) / (1024.0 * 1024.0), sc.interiorBounds[3] - sc.interiorBounds[0],
+			sc.interiorBounds[4] - sc.interiorBounds[1], sc.interiorBounds[5] - sc.interiorBounds[2]);
+		return;
+	}
+	const std::int64_t now = Qpc();
+	if (static_cast<double>(now - interiorProgressQpc) * QpcMs() < 2000.0)
+		return;
+	interiorProgressQpc = now;
+	auto* tes = RE::TES::GetSingleton();
+	const auto* cell = tes ? tes->interiorCell : nullptr;
+	logger::info("[RayTracing] Interior capture: {:.0f} ms after entering; cell {} ({}), scene interior {}, cells {} ({} gathering, {} complete), {} shapes, "
+				 "{} BLAS built, {} queued, phase {}",
+		static_cast<double>(now - interiorEntryQpc) * QpcMs(), cell ? std::format("{:08X}", cell->GetFormID()) : std::string("none"),
+		cell ? (cell->IsAttached() ? "attached" : "not attached") : "-", scene.InteriorEnabled() ? "on" : "off", sc.cellsTracked, sc.cellsGathering,
+		sc.cellsComplete, sc.interiorShapes, st.blasCount, st.blasQueued, static_cast<int>(phase));
 }
 
 void RayTracing::WritePointMask(bool a_traced)
@@ -2862,7 +2919,7 @@ void RayTracing::DrawSettings()
 		ImGui::Checkbox("Ray-Traced Point-Light Shadows", &settings.PointLights);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Braziers, campfires, torches, candles, lanterns and the like cast ray-traced shadows (outdoors inside the traced area, and indoors).");
-			ImGui::Text("  Window fill / glow lights, fill lights, magic / effect lights and the player's own light are left as they are.");
+			ImGui::Text("  Window fill / glow lights and fill lights are left as they are; the player's and spell lights have switches below.");
 			ImGui::Text("  For those lights Screen Space Point Light Shadows are replaced (where a pixel has its ray-traced result).");
 			ImGui::Text("Off: point lights exactly as before. Needs Ray Tracing on.");
 		}
@@ -2903,6 +2960,23 @@ void RayTracing::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Rays stop this far before the light, so the lamp, brazier bowl or torch holding it does not shadow its own light.");
 			ImGui::Text("  Too small: a dark ring or a black patch around a lamp. Too large: objects right next to a light cast nothing.");
+		}
+		// (46d)
+		ImGui::Checkbox("Player Lights Cast RT Shadows", &settings.PointLightsPlayer);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): the torch in your hand, Quick Light's light and light spells on you cast ray-traced shadows.");
+			ImGui::Text("  Your own body never blocks them (else your arm would shadow everything). Off: as before (old shadows).");
+		}
+		ImGui::Checkbox("Spell / Effect Lights Cast RT Shadows", &settings.PointLightsEffects);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): lights of spells and effects that belong to nobody (Magelight on a wall, fire bolts in flight)");
+			ImGui::Text("  cast ray-traced shadows. Off: as before.");
+		}
+		ImGui::Checkbox("Plants and Cut-Outs Block Point Lights Outdoors", &settings.PointLightsAlphaOutdoors);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): at night leaves, bushes and cut-out shapes (fences, nets) cast shadows from torches and campfires,");
+			ImGui::Text("  for the kinds Ray Tracing traces with their cut-out (Foliage / Cut-outs on the Advanced menu). A little slower.");
+			ImGui::Text("Off: outdoors only solid shapes block point lights (46c).");
 		}
 		// (46c) Interiors.
 		ImGui::SeparatorText("Interiors");
@@ -2974,6 +3048,8 @@ void RayTracing::DrawSettings()
 		if (settings.PointLights && settings.Enabled) {
 			ImGui::Text("This frame: %u lights traced (K %u) of %u candidates (%u merged, %u over the cap, %u engine shadow lights); %u lights in use",
 				pointThisFrame ? ps.sources : 0u, pointThisFrame ? pointK : 0u, ps.candidates, ps.merged, ps.capped, ps.native, ps.used);
+			ImGui::Text("  of which the player's own lights %u, spell / effect lights %u; plants / cut-outs tested %s", pointThisFrame ? ps.player : 0u,
+				pointThisFrame ? ps.effects : 0u, backend.PointAlphaLastFrame() ? "yes" : "no");
 			ImGui::Text("Cost: trace %.2f ms GPU, %s rays per frame; denoiser %.2f ms GPU; selection %.3f ms CPU",
 				std::max(rt.lastPointGpuMs, 0.0f), rt.pointRaysPerFrame >= 0 ? std::format("{:.2f} M", static_cast<double>(rt.pointRaysPerFrame) / 1e6).c_str() : "?",
 				std::max(Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingPointDenoise), 0.0f), pointCpuMs);
@@ -3249,6 +3325,9 @@ std::string RayTracing::DescribeForProfile() const
 	text += std::format(", indoors {} (K {}, window beams {}, stop engine shadow maps {}{})", settings.PointLightsInteriors ? "on" : "off",
 		ValidPointK(settings.PointLightsPerPixelInterior), settings.PointLightsWindowBeams ? "on" : "off", settings.PointLightsSkipShadowMaps ? "on" : "off",
 		interiorOffReason.empty() ? "" : ", switched off: " + interiorOffReason);
+	// (46d)
+	text += std::format(", player lights {}, spell / effect lights {}, plants block point lights outdoors {}", settings.PointLightsPlayer ? "on" : "off",
+		settings.PointLightsEffects ? "on" : "off", settings.PointLightsAlphaOutdoors ? "on" : "off");
 	return text;
 }
 
@@ -3299,7 +3378,9 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "size", settings.PointLightsSize }, { "clearance", settings.PointLightsClearance }, { "traced", pointThisFrame }, { "sources", ps.sources },
 			{ "candidates", ps.candidates }, { "merged", ps.merged }, { "capped", ps.capped }, { "native_lights", ps.native }, { "gpu_ms", stats.lastPointGpuMs },
 			{ "rays_per_frame", stats.pointRaysPerFrame }, { "denoise_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingPointDenoise) },
-			{ "cpu_ms", pointCpuMs }, { "off_reason", pointOffReason } };
+			{ "cpu_ms", pointCpuMs }, { "off_reason", pointOffReason }, { "player", settings.PointLightsPlayer }, { "effects", settings.PointLightsEffects },
+			{ "alpha_outdoors", settings.PointLightsAlphaOutdoors }, { "player_sources", ps.player }, { "effect_sources", ps.effects },
+			{ "alpha_last_frame", backend.PointAlphaLastFrame() } };
 		// (46c)
 		const auto& sc = scene.GetStats();
 		j["interior"] = { { "enabled", settings.PointLightsInteriors }, { "k", ValidPointK(settings.PointLightsPerPixelInterior) },

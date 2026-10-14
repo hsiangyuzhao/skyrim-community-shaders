@@ -67,8 +67,10 @@ static const uint kFlagCharCull = 4u;     // the character ray only where the se
 static const uint kSourceISL = 1u;
 static const uint kSourceSpot = 8u;   // (46c) RayTracingPointLights::kSourceSpot
 static const uint kSourceBeam = 16u;  // (46c) RayTracingPointLights::kSourceBeam
+static const uint kSourceNoPlayer = 32u;  // (46d) RayTracingPointLights::kSourceNoPlayer: the player's own light
 static const uint kSceneMask = 0x01u;
 static const uint kCharacterMasks = 0x06u;
+static const uint kNpcMask = 0x04u;  // (46d) the other actors only (Backend::kNpcMask): rays of the player's own lights
 static const float kFirstPersonNear = 96.0;
 static const float kScaledUnitsSq = 0.8 * 70.0 * 70.0;  // InverseSquareLighting SCALED_UNITS_SQ
 
@@ -397,11 +399,13 @@ groupshared uint gsMask[2];
 		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, tHit);
 		rays += 1u;
 		if (!blocked && characters) {
+			// (46d) The player's own light: the player's body (torch, arm, torso) is not tested, only the other actors.
+			const bool ownLight = (src.Info.x & kSourceNoPlayer) != 0u;
 			bool test = true;
 			if (flags & kFlagCharCull)
-				test = SphereOnSegment(origin, dir, tMax, C.Spheres[0]) || SphereOnSegment(origin, dir, tMax, C.Spheres[1]);
+				test = (!ownLight && SphereOnSegment(origin, dir, tMax, C.Spheres[0])) || SphereOnSegment(origin, dir, tMax, C.Spheres[1]);
 			if (test) {
-				blocked = Blocked(origin, dir, tMax, kCharacterMasks, C.Bias.z, footprint, tHit);
+				blocked = Blocked(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, tHit);
 				rays += 1u;
 			}
 		}

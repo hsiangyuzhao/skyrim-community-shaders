@@ -53,6 +53,8 @@ namespace DynamicSnow
 	static const uint FlagShowColdMap = 1 << 17;
 	// (46a) Characters take their own amount from Advanced Skin's b7 (Skin::snowPerGeometry).
 	static const uint FlagCharacterSnowState = 1 << 18;
+	// (46d) Characters: the CPU roof test (no build-up under a roof) replaces the per-pixel sky test.
+	static const uint FlagCharacterRoofs = 1 << 19;
 
 #if defined(PSHADER)
 	// (44h) R8_UNORM over the worldspace, 1 = cold region. Bound by DynamicSnow::Prepass.

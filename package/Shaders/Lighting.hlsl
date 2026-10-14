@@ -2580,8 +2580,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			else
 				float3 snowPositionMS = input.WorldPosition.xyz;
 #			endif
-				sh2 snowSkySH = Skylighting::sampleNoBias(SharedData::skylightingSettings, Skylighting::SkylightingProbeArray, snowPositionMS + snowGeometryNormal * Skylighting::CELL_SIZE);
-				snowCoverage *= pow(saturate(SphericalHarmonics::Unproject(snowSkySH, float3(0, 0, 1))), 2);
+				// (46d) Characters whose snow the CPU keeps with its roof test: no per-pixel sky test (it erased
+				// their snow under eaves; under a roof their snow now just stops building up).
+#			if defined(CS_SKIN)
+				const bool snowRoofsByCpu = snowOnActor && (snowFlags & DynamicSnow::FlagCharacterRoofs);
+#			else
+				const bool snowRoofsByCpu = false;
+#			endif
+				[branch] if (!snowRoofsByCpu)
+				{
+					sh2 snowSkySH = Skylighting::sampleNoBias(SharedData::skylightingSettings, Skylighting::SkylightingProbeArray, snowPositionMS + snowGeometryNormal * Skylighting::CELL_SIZE);
+					snowCoverage *= pow(saturate(SphericalHarmonics::Unproject(snowSkySH, float3(0, 0, 1))), 2);
+				}
 #		endif
 				// The material's own snow stays as it is; only the rest of the surface is covered.
 				dynamicSnowCoverage = snowCoverage * (1.0 - snowExisting);
