@@ -67,6 +67,27 @@ namespace Util::FrameTrace
 	void OnGrassApply(float a_ms);
 	/// (45) Ray Tracing this frame: D3D12 GPU ms of the last completed submission, CPU ms, BLAS builds (-1 = off).
 	void OnRayTracing(float a_gpuMs, float a_cpuMs, uint32_t a_builds);
+	/// (45j) Ray Tracing's CPU split this frame (ms; -1 = not run) and its counters.
+	struct RayTracingDetail
+	{
+		float scene = -1, gridDiff = -1, gather = -1, registration = -1, objects = -1, objectCapture = -1, instances = -1, missed = -1;
+		float characters = -1, execute = -1, executeBuild = -1, executeSkin = -1, d3d11 = -1, endFrame = -1, release = -1;
+		uint32_t recaptures = 0, objectsCaptured = 0, missedJudged = 0, releasePending = 0, tlasInstances = 0, cellsGathering = 0;
+	};
+	void OnRayTracingDetail(const RayTracingDetail& a_detail);
+
+	/// (45j) Where the player is, for profiles: worldspace and cell (editor ID, else name, else form
+	/// ID), interior, position (rounded), weather, game hour.
+	struct Location
+	{
+		std::string world, cell, weather;
+		bool interior = false;
+		int x = 0, y = 0, z = 0;
+		float hour = -1.0f;
+	};
+	Location CurrentLocation();
+	/// A short file-name-safe tag of a location (worldspace or interior cell).
+	std::string LocationTag(const Location& a_location);
 	/// A raw GPU frame sample (GpuFrameTimer), for the row of that frame.
 	void OnGpuSample(uint64_t a_gpuFrameIndex, float a_workMs, float a_elapsedMs);
 

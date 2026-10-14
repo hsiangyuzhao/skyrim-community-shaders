@@ -22,6 +22,7 @@
 #include "Features/PerformanceOverlay/ABTesting/ABTestAggregator.h"
 #include "Features/GrassOptimizations.h"
 #include "Features/NRD.h"
+#include "Features/RayTracing.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
 #include "Features/Upscaling.h"
 #include "Features/Upscaling/NeuralRendering/Integration.h"
@@ -4230,7 +4231,15 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 				loc["worldspace_form_id"] = std::format("{:08X}", ws->GetFormID());
 			}
 		}
+		{
+			// (45j) Weather and game hour; the Ray Tracing switches and CPU split.
+			const auto where = Util::FrameTrace::CurrentLocation();
+			loc["weather"] = where.weather;
+			loc["game_hour"] = where.hour;
+			loc["tag"] = Util::FrameTrace::LocationTag(where);
+		}
 		m["location"] = std::move(loc);
+		m["ray_tracing"] = globals::features::rayTracing.DescribeJson();
 
 		m["resolution"] = { { "render", { view.renderWidth, view.renderHeight } }, { "output", { view.outputWidth, view.outputHeight } } };
 		auto& up = globals::features::upscaling;

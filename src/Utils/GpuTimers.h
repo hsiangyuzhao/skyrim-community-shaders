@@ -463,6 +463,10 @@ namespace Util
 		 */
 		float GetFrameAccountedMs();
 
+		/// @brief (45j) The a_count costliest buckets of the frame in progress (or the last completed
+		/// one), "key:ms;..." over 0.3 ms, for the F7 trace; empty while nothing is timed.
+		std::string TopOfCurrentFrame(int a_count) const;
+
 		/// @brief Smoothed CPU time blocked in Present (GPU wait / vsync / frame limiter).
 		float GetPresentWaitMs();
 
@@ -494,6 +498,7 @@ namespace Util
 			const char* tooltip = nullptr;
 			double frameMs = 0.0;
 			int frameCalls = 0;
+			double lastFrameMs = 0.0;  // (45j) the last completed frame, unsmoothed
 			float smoothedMs = 0.0f;
 			int lastFrameCalls = 0;
 			uint64_t lastActiveFrame = 0;

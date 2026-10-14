@@ -771,7 +771,7 @@ namespace Util
 
 	bool CpuPassTimers::WantsTimings() const
 	{
-		return TableIsOnScreen();
+		return TableIsOnScreen() || Util::FrameTrace::IsRecording();  // (45j) the F7 trace names the costliest features per frame
 	}
 
 	int64_t CpuPassTimers::Now() const
@@ -809,6 +809,7 @@ namespace Util
 			bucket.smoothedMs = bucket.smoothedMs * kSmoothingOld +
 			                    static_cast<float>(bucket.frameMs) * kSmoothingNew;
 			bucket.lastFrameCalls = bucket.frameCalls;
+			bucket.lastFrameMs = bucket.frameMs;
 			bucket.frameMs = 0.0;
 			bucket.frameCalls = 0;
 		}
@@ -991,4 +992,27 @@ namespace Util
 		openDepth = 0;
 	}
 
+}
+
+namespace Util
+{
+	std::string CpuPassTimers::TopOfCurrentFrame(int a_count) const
+	{
+		// (45j) Which of our features took the CPU on a spike frame (F7 trace column).
+		std::vector<std::pair<double, const Bucket*>> sorted;
+		// The frame in progress, or (once the next one started) the last completed one.
+		bool current = false;
+		for (const auto& bucket : buckets)
+			current = current || (bucket.inUse && bucket.frameMs > 0.0);
+		for (const auto& bucket : buckets) {
+			const double ms = current ? bucket.frameMs : bucket.lastFrameMs;
+			if (bucket.inUse && ms > 0.3)
+				sorted.emplace_back(ms, &bucket);
+		}
+		std::sort(sorted.begin(), sorted.end(), [](const auto& a_lhs, const auto& a_rhs) { return a_lhs.first > a_rhs.first; });
+		std::string out;
+		for (int i = 0; i < a_count && i < static_cast<int>(sorted.size()); ++i)
+			out += std::format("{}{}:{:.2f}", out.empty() ? "" : ";", sorted[i].second->key, sorted[i].first);
+		return out;
+	}
 }

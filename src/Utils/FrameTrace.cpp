@@ -1,12 +1,15 @@
 #include "Utils/FrameTrace.h"
 
 #include "Features/PerformanceOverlay.h"
+#include "Features/RayTracing.h"
 #include "Features/Upscaling.h"
 #include "Menu.h"
 #include "State.h"
 #include "BuildLabel.h"
 #include "Utils/EngineTiming.h"
+#include "Utils/GpuTimers.h"
 
+#include <intrin.h>
 #include <thread>
 
 namespace Util::FrameTrace
@@ -38,6 +41,13 @@ namespace Util::FrameTrace
 			float rtGpuMs = -1.0f;  // (45) Ray Tracing: D3D12 GPU ms (last completed), CPU ms, BLAS builds
 			float rtCpuMs = -1.0f;
 			uint32_t rtBuilds = 0;
+			RayTracingDetail rt{};  // (45j)
+			// (45j) Map attribution: calls, slow calls (> 0.5 ms), the slowest one's resource and caller.
+			uint32_t mapCalls = 0;
+			uint32_t mapSlow = 0;
+			double mapWorstMs = 0.0;
+			const void* mapWorstCaller = nullptr;
+			char mapWorstResource[96]{};
 		};
 		FrameAcc g_frame;
 		int64_t g_simStart = 0;
@@ -104,6 +114,12 @@ namespace Util::FrameTrace
 			float rtGpuMs = -1.0f;
 			float rtCpuMs = -1.0f;
 			uint32_t rtBuilds = 0;
+			RayTracingDetail rt{};  // (45j)
+			uint32_t mapCalls = 0, mapSlow = 0;
+			float mapWorstMs = 0.0f;
+			std::string mapWorstResource, mapWorstCaller;
+			std::shared_ptr<const Location> location;  // (45j) shared while it does not change
+			std::string cpuTop;  // (45j) our costliest CPU features this frame
 			uint64_t gpuFrameIndex = 0;
 			float gpuWorkMs = -1.0f;
 			float gpuElapsedMs = -1.0f;
@@ -119,6 +135,8 @@ namespace Util::FrameTrace
 		};
 
 		bool g_recording = false;
+		// (45j) Taken when a recording starts (the CSV is written on another thread).
+		std::string g_headerLocation, g_headerRayTracing, g_headerTag;
 		int64_t g_recordStart = 0;
 		int64_t g_recordEnd = 0;
 		std::vector<Row> g_rows;
@@ -177,7 +195,7 @@ namespace Util::FrameTrace
 			s = s < 0.0f ? ms : s * 0.8f + ms * 0.2f;
 		}
 
-		void WriteCsv(std::vector<Row> a_rows, std::unordered_map<uint64_t, ReflexTimes> a_reflex)
+		void WriteCsv(std::vector<Row> a_rows, std::unordered_map<uint64_t, ReflexTimes> a_reflex, std::string a_location, std::string a_rayTracing, std::string a_tag)
 		{
 			try {
 				auto dir = logger::log_directory();
@@ -191,7 +209,7 @@ namespace Util::FrameTrace
 				localtime_s(&local, &t);
 				char stamp[32];
 				std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
-				const std::string name = std::format("trace-{}.csv", stamp);
+				const std::string name = a_tag.empty() ? std::format("trace-{}.csv", stamp) : std::format("trace-{}-{}.csv", stamp, a_tag);
 				path /= name;
 
 				std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -206,6 +224,13 @@ namespace Util::FrameTrace
 				out << "#   eng_calls_over_1ms = every such call over 1 ms (id@offset:ms;...). eng_render_other = rendering minus the named phases (culling, scene traversal).\n";
 				out << "# eng_dt_ms / eng_real_dt_ms = the engine's time step (BSTimer). dev_create_* = time inside D3D11 device Create* calls (main thread / others).\n";
 				out << "# reflex_markers = 1 when Reflex Markers at Render Start was on for that frame.\n";
+				out << "# (45j) location at start: " << a_location << "\n";
+				out << "# (45j) ray tracing at start: " << a_rayTracing << "\n";
+				out << "# (45j) rt_* = Ray Tracing CPU split (ms, -1 = not run): scene update (grid diff, cell capture, filter registration, objects of which new\n";
+				out << "#   captures), TLAS instances, missed-caster check, characters, D3D12 record+submit (of which BLAS creation, skinning), D3D11 passes,\n";
+				out << "#   end of frame, engine references dropped; counts: recaptures, objects captured, misses examined, references waiting, TLAS instances,\n";
+				out << "#   cells being captured. map_* = Map calls this frame, those over 0.5 ms, the slowest (ms, resource, caller module+offset).\n";
+				out << "#   loc_* / pos_* / weather / game_hour = where the player was on that frame.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -216,14 +241,33 @@ namespace Util::FrameTrace
 					   "reflex_markers";
 				for (int s = 0; s < static_cast<int>(EngineTiming::Seg::Count); ++s)
 					out << ",eng_" << EngineTiming::SegName(static_cast<EngineTiming::Seg>(s)) << "_ms";
-				out << ",eng_input_ms,eng_top_call,eng_top_call_ms,eng_calls_over_1ms,eng_dt_ms,eng_real_dt_ms,dev_create_ms,dev_creates,dev_create_other_ms,dev_creates_other\n";
+				out << ",eng_input_ms,eng_top_call,eng_top_call_ms,eng_calls_over_1ms,eng_dt_ms,eng_real_dt_ms,dev_create_ms,dev_creates,dev_create_other_ms,dev_creates_other";
+				out << ",rt_scene_ms,rt_grid_ms,rt_gather_ms,rt_register_ms,rt_objects_ms,rt_object_capture_ms,rt_instances_ms,rt_missed_ms,rt_chars_ms,rt_exec_ms,"
+				       "rt_exec_build_ms,rt_exec_skin_ms,rt_d3d11_ms,rt_endframe_ms,rt_release_ms,rt_recaptures,rt_objects_new,rt_missed_n,rt_release_pending,"
+				       "rt_tlas_instances,rt_cells_gathering,map_calls,map_slow,map_worst_ms,map_worst_res,map_worst_caller,loc_world,loc_cell,loc_interior,"
+				       "pos_x,pos_y,pos_z,weather,game_hour,cpu_top_features\n";
+				auto extraColumns = [](const Row& a_row) {
+					const auto& t = a_row.rt;
+					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
+						t.gridDiff, t.gather, t.registration, t.objects, t.objectCapture, t.instances, t.missed, t.characters, t.execute, t.executeBuild, t.executeSkin,
+						t.d3d11, t.endFrame, t.release, t.recaptures, t.objectsCaptured, t.missedJudged, t.releasePending, t.tlasInstances, t.cellsGathering);
+					s += std::format(",{},{},{:.3f},{},{}", a_row.mapCalls, a_row.mapSlow, a_row.mapWorstMs, a_row.mapWorstResource, a_row.mapWorstCaller);
+					if (a_row.location) {
+						const auto& l = *a_row.location;
+						s += std::format(",{},{},{},{},{},{},{},{:.2f}", l.world, l.cell, l.interior ? 1 : 0, l.x, l.y, l.z, l.weather, l.hour);
+					} else {
+						s += ",,,,,,,,";
+					}
+					s += "," + a_row.cpuTop + "\n";
+					return s;
+				};
 				auto engineColumns = [](const Row& a_row) {
 					const auto& e = a_row.engine;
 					std::string s = std::format(",{}", a_row.reflexMarkersAtRenderStart ? 1 : 0);
 					for (int i = 0; i < static_cast<int>(EngineTiming::Seg::Count); ++i)
 						s += e.valid ? std::format(",{:.3f}", e.ms[i]) : std::string(",-1");
 					s += e.valid ? std::format(",{:.3f},{}@{:X},{:.3f},{}", e.inputMs, e.topCallId, e.topCallOffset, e.topCallMs, e.callsOver1ms) : std::string(",-1,-1,-1,");
-					s += std::format(",{:.3f},{:.3f},{:.3f},{},{:.3f},{}\n", e.engineDtMs, e.engineRealDtMs, e.createMs, e.creates, e.createOtherMs, e.createsOther);
+					s += std::format(",{:.3f},{:.3f},{:.3f},{},{:.3f},{}", e.engineDtMs, e.engineRealDtMs, e.createMs, e.creates, e.createOtherMs, e.createsOther);
 					return s;
 				};
 				uint32_t index = 0;
@@ -241,7 +285,7 @@ namespace Util::FrameTrace
 						r.gpuWorkMs, r.gpuElapsedMs, r.fgPresented, r.grassApplyMs, r.rtGpuMs, r.rtCpuMs, r.rtBuilds);
 					auto it = r.reflexFrame != UINT32_MAX ? a_reflex.find(r.reflexFrame) : a_reflex.end();
 					if (it == a_reflex.end()) {
-						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r);
+						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extraColumns(r);
 						continue;
 					}
 					const auto& x = it->second;
@@ -249,7 +293,7 @@ namespace Util::FrameTrace
 					out << std::format("{},{},{},{},{},{},{},{},{},{},{},{},{:.3f}", r.reflexFrame, rel(x.simEnd), rel(x.submitStart), rel(x.submitEnd), rel(x.presentStart),
 						rel(x.presentEnd), rel(x.driverStart), rel(x.driverEnd), rel(x.queueStart), rel(x.queueEnd), rel(x.gpuStart), rel(x.gpuEnd),
 						x.gpuEnd > x.simStart ? static_cast<double>(x.gpuEnd - x.simStart) / 1000.0 : -1.0)
-						<< engineColumns(r);
+						<< engineColumns(r) << extraColumns(r);
 				}
 				out.close();
 				{
@@ -302,12 +346,66 @@ namespace Util::FrameTrace
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
+		/// (45j) Remembers the slowest Map of the frame: what was mapped, how, and by whom.
+		void NoteMap(ID3D11Resource* a_resource, D3D11_MAP a_type, UINT a_flags, double a_ms, const void* a_caller)
+		{
+			++g_frame.mapCalls;
+			if (a_ms > 0.5)
+				++g_frame.mapSlow;
+			if (a_ms <= g_frame.mapWorstMs || a_ms < 0.1)
+				return;
+			g_frame.mapWorstMs = a_ms;
+			g_frame.mapWorstCaller = a_caller;
+			static constexpr const char* kTypes[] = { "?", "read", "write", "read-write", "write-discard", "write-no-overwrite" };
+			const char* type = static_cast<unsigned>(a_type) < 6 ? kTypes[a_type] : "?";
+			const char* noWait = (a_flags & D3D11_MAP_FLAG_DO_NOT_WAIT) ? " no-wait" : "";
+			D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+			if (a_resource)
+				a_resource->GetType(&dimension);
+			if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+				D3D11_BUFFER_DESC d{};
+				static_cast<ID3D11Buffer*>(a_resource)->GetDesc(&d);
+				std::snprintf(g_frame.mapWorstResource, sizeof(g_frame.mapWorstResource), "buffer %u B usage %u bind 0x%X %s%s", d.ByteWidth,
+					static_cast<unsigned>(d.Usage), d.BindFlags, type, noWait);
+			} else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+				D3D11_TEXTURE2D_DESC d{};
+				static_cast<ID3D11Texture2D*>(a_resource)->GetDesc(&d);
+				std::snprintf(g_frame.mapWorstResource, sizeof(g_frame.mapWorstResource), "tex2d %ux%u fmt %u usage %u misc 0x%X %s%s", d.Width, d.Height,
+					static_cast<unsigned>(d.Format), static_cast<unsigned>(d.Usage), d.MiscFlags, type, noWait);
+			} else {
+				std::snprintf(g_frame.mapWorstResource, sizeof(g_frame.mapWorstResource), "resource dim %d %s", static_cast<int>(dimension), type);
+			}
+		}
+
+		/// Module + offset of a code address ("SkyrimSE.exe+1A2B3C").
+		std::string DescribeAddress(const void* a_address)
+		{
+			if (!a_address)
+				return {};
+			HMODULE module = nullptr;
+			if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(a_address), &module) ||
+				!module)
+				return std::format("{:X}", reinterpret_cast<std::uintptr_t>(a_address));
+			char path[MAX_PATH]{};
+			GetModuleFileNameA(module, path, MAX_PATH);
+			const char* slash = std::strrchr(path, '\\');
+			return std::format("{}+{:X}", slash ? slash + 1 : path, reinterpret_cast<std::uintptr_t>(a_address) - reinterpret_cast<std::uintptr_t>(module));
+		}
+
 		struct Map
 		{
 			static HRESULT thunk(ID3D11DeviceContext* This, ID3D11Resource* r, UINT s, D3D11_MAP m, UINT f, D3D11_MAPPED_SUBRESOURCE* o)
 			{
-				Timed<DriverCall::Map> t(This);
-				return func(This, r, s, m, f, o);
+				if (!g_active || This != globals::d3d::context)
+					return func(This, r, s, m, f, o);
+				const int64_t start = Now();
+				HRESULT hr;
+				{
+					Timed<DriverCall::Map> t(This);
+					hr = func(This, r, s, m, f, o);
+				}
+				NoteMap(r, m, f, Ms(Now() - start), _ReturnAddress());
+				return hr;
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
@@ -566,6 +664,88 @@ namespace Util::FrameTrace
 		g_frame.rtBuilds = a_builds;
 	}
 
+	void OnRayTracingDetail(const RayTracingDetail& a_detail) { g_frame.rt = a_detail; }
+
+	namespace
+	{
+		std::string FormName(RE::TESForm* a_form)
+		{
+			if (!a_form)
+				return {};
+			const char* edid = a_form->GetFormEditorID();
+			if (edid && *edid)
+				return edid;
+			const char* name = a_form->GetName();
+			if (name && *name)
+				return name;
+			return std::format("{:08X}", a_form->GetFormID());
+		}
+
+		/// CSV-safe: no commas, quotes or line breaks.
+		std::string CsvSafe(std::string a_text)
+		{
+			for (char& c : a_text)
+				if (c == ',' || c == '"' || c == '\n' || c == '\r')
+					c = ';';
+			return a_text;
+		}
+	}
+
+	Location CurrentLocation()
+	{
+		Location location;
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player)
+			return location;
+		const auto position = player->GetPosition();
+		location.x = static_cast<int>(std::lround(position.x));
+		location.y = static_cast<int>(std::lround(position.y));
+		location.z = static_cast<int>(std::lround(position.z));
+		// Names only change with the cell / worldspace / weather: cached by pointer.
+		static const void* lastCell = nullptr;
+		static const void* lastWorld = nullptr;
+		static const void* lastWeather = nullptr;
+		static std::string cellName, worldName, weatherName;
+		static bool interior = false;
+		auto* cell = player->GetParentCell();
+		if (cell != lastCell) {
+			lastCell = cell;
+			cellName = CsvSafe(FormName(cell));
+			interior = cell && cell->IsInteriorCell();
+		}
+		auto* world = player->GetWorldspace();
+		if (world != lastWorld) {
+			lastWorld = world;
+			worldName = CsvSafe(FormName(world));
+		}
+		auto* sky = RE::Sky::GetSingleton();
+		auto* weather = sky ? sky->currentWeather : nullptr;
+		if (weather != lastWeather) {
+			lastWeather = weather;
+			weatherName = CsvSafe(FormName(weather));
+		}
+		location.cell = cellName;
+		location.world = worldName;
+		location.weather = weatherName;
+		location.interior = interior;
+		if (auto* calendar = RE::Calendar::GetSingleton())
+			location.hour = calendar->GetHour();
+		return location;
+	}
+
+	std::string LocationTag(const Location& a_location)
+	{
+		const std::string& source = a_location.interior || a_location.world.empty() ? a_location.cell : a_location.world;
+		std::string tag;
+		for (const char c : source) {
+			if (std::isalnum(static_cast<unsigned char>(c)))
+				tag += c;
+			if (tag.size() >= 24)
+				break;
+		}
+		return tag;
+	}
+
 	void OnGpuSample(uint64_t a_gpuFrameIndex, float a_workMs, float a_elapsedMs)
 	{
 		for (size_t i = 0; i < std::min<size_t>(g_histCount, 16); ++i) {
@@ -726,10 +906,42 @@ namespace Util::FrameTrace
 				r.rtGpuMs = g_frame.rtGpuMs;
 				r.rtCpuMs = g_frame.rtCpuMs;
 				r.rtBuilds = g_frame.rtBuilds;
+				r.rt = g_frame.rt;
+				r.cpuTop = Util::CpuPassTimers::GetSingleton()->TopOfCurrentFrame(3);
+				r.mapCalls = g_frame.mapCalls;
+				r.mapSlow = g_frame.mapSlow;
+				r.mapWorstMs = static_cast<float>(g_frame.mapWorstMs);
+				if (g_frame.mapWorstMs > 0.0) {
+					r.mapWorstResource = g_frame.mapWorstResource;
+					for (char& c : r.mapWorstResource)
+						if (c == ',')
+							c = ';';
+					r.mapWorstCaller = DescribeAddress(g_frame.mapWorstCaller);
+				}
+				{
+					// (45j) Where the player is, shared between rows while nothing changes.
+					static std::shared_ptr<const Location> last;
+					auto here = CurrentLocation();
+					if (!last || last->world != here.world || last->cell != here.cell || last->weather != here.weather || last->x != here.x ||
+						last->y != here.y || last->z != here.z || std::abs(last->hour - here.hour) > 0.01f)
+						last = std::make_shared<const Location>(std::move(here));
+					r.location = last;
+				}
 				r.gpuFrameIndex = a_gpuFrameIndex;
 				r.reflexFrame = globals::features::upscaling.streamline.frameTokenIndex;
 				r.engine = engine;
 				r.reflexMarkersAtRenderStart = globals::features::upscaling.settings.reflexMarkersAtRenderStart && EngineTiming::ProbesInstalled();
+				// (45j) A spike frame names its suspects in the log (at most one line a second).
+				if (frameMs > 1.5f * g_smoothed.frameMs + 5.0f) {
+					static int64_t lastSpikeLog = 0;
+					if (Ms(now - lastSpikeLog) > 1000.0) {
+						lastSpikeLog = now;
+						logger::info("[FrameTrace] Spike {:.1f} ms (avg {:.1f}): our CPU features [{}], RT CPU {:.2f} ms (scene {:.2f}, chars {:.2f}, exec {:.2f}), "
+									 "slowest Map {:.2f} ms ({} from {}), engine CS passes {:.2f} ms, device creates on other threads {:.2f} ms",
+							frameMs, g_smoothed.frameMs, r.cpuTop, r.rtCpuMs, r.rt.scene, r.rt.characters, r.rt.execute, r.mapWorstMs, r.mapWorstResource,
+							r.mapWorstCaller, engine.valid ? engine.ms[static_cast<int>(EngineTiming::Seg::OurPasses)] : -1.0f, engine.createOtherMs);
+					}
+				}
 				g_rows.push_back(r);
 				if ((++g_reflexPoll & 15) == 0)
 					PollReflex();
@@ -757,6 +969,14 @@ namespace Util::FrameTrace
 		g_recordStart = Now();
 		g_recordEnd = g_recordStart + static_cast<int64_t>(static_cast<double>(std::clamp(a_seconds, 1.0f, 600.0f)) * static_cast<double>(g_frequency));
 		g_recording = true;
+		{
+			const auto location = CurrentLocation();
+			g_headerLocation = std::format("world {}, cell {}, {}, position {} {} {}, weather {}, game hour {:.2f}", location.world.empty() ? "-" : location.world,
+				location.cell.empty() ? "-" : location.cell, location.interior ? "interior" : "exterior", location.x, location.y, location.z,
+				location.weather.empty() ? "-" : location.weather, location.hour);
+			g_headerTag = LocationTag(location);
+			g_headerRayTracing = std::format("{}; build {}", globals::features::rayTracing.DescribeForProfile(), BuildLabel::kBuild);
+		}
 		logger::info("[FrameTrace] Recording {:.0f} s", a_seconds);
 	}
 
@@ -766,7 +986,7 @@ namespace Util::FrameTrace
 			return;
 		g_recording = false;
 		PollReflex();
-		std::thread(WriteCsv, std::move(g_rows), std::move(g_reflex)).detach();
+		std::thread(WriteCsv, std::move(g_rows), std::move(g_reflex), g_headerLocation, g_headerRayTracing, g_headerTag).detach();
 		g_rows = {};
 		g_reflex = {};
 	}
