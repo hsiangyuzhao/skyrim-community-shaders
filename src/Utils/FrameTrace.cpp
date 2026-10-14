@@ -44,6 +44,7 @@ namespace Util::FrameTrace
 			float rtCpuMs = -1.0f;
 			uint32_t rtBuilds = 0;
 			RayTracingDetail rt{};  // (45j)
+			LightStats lights{};    // (45o)
 			// (45j) Map attribution: calls, slow calls (> 0.5 ms), the slowest one's resource and caller.
 			uint32_t mapCalls = 0;
 			uint32_t mapSlow = 0;
@@ -118,6 +119,7 @@ namespace Util::FrameTrace
 			float rtCpuMs = -1.0f;
 			uint32_t rtBuilds = 0;
 			RayTracingDetail rt{};  // (45j)
+			LightStats lights{};    // (45o)
 			uint32_t mapCalls = 0, mapSlow = 0;
 			float mapWorstMs = 0.0f;
 			std::string mapWorstResource, mapWorstCaller;
@@ -263,6 +265,9 @@ namespace Util::FrameTrace
 				out << "#   rt_worker_release_ms = the release thread's last batch; rt_queue_gap_gpu_ms = our D3D12 queue idle between builds/skinning and the trace\n";
 				out << "#   (> 0: the builds were done before the game's depth copy was ready); rt_still_reused = character shapes with unchanged bones (not skinned);\n";
 				out << "#   pacer_in_flight_after = frames still on the GPU after the pacer's sleep and bound (pacer_in_flight is counted before the sleep).\n";
+				out << "# (45o) lights_* = Light Limit Fix this frame: lights in its buffer, of which shadow-casting, fill-light estimate (placed light without a\n";
+				out << "#   mesh, radius >= 512, no shadow), attached to the player; lights_max_cluster / lights_over4_share = most lights in one cluster and the share\n";
+				out << "#   of screen tiles whose busiest cluster has more than 4 (from a GPU read-back 2-4 frames old); llf_gpu_ms = LLF build + culling (last sample).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -282,7 +287,8 @@ namespace Util::FrameTrace
 				       "rt_x_tlas_ms,rt_x_alpha_ms,rt_x_record_ms,rt_x_execute_ms,rt_x_signal12_ms,rt_x_wait11_ms,rt_denoise_gpu_ms,sss_gpu_ms,"
 				       "rt_quality,rt_denoiser_eff,rt_tile_gpu_ms,rt_filter_gpu_ms,rt_sigma_gpu_ms,rt_combine_gpu_ms,rt_sync_gpu_ms,rt_prep_gpu_ms,rt_trace_gpu_ms,"
 				       "rt_skin_draws,rt_skin_reused,rt_early,rt_early_ms,rt_x_retire_ms,rt_retired_n,rt_worker_release_ms,rt_queue_gap_gpu_ms,rt_still_reused,"
-				       "pacer_in_flight_after,cpu_top_features\n";
+				       "pacer_in_flight_after,lights_total,lights_shadow,lights_fill_est,lights_player,lights_max_cluster,lights_over4_share,llf_gpu_ms,"
+				       "cpu_top_features\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -302,6 +308,9 @@ namespace Util::FrameTrace
 					// (45n)
 					s += std::format(",{},{:.3f},{:.3f},{},{:.3f},{:.3f},{},{}", t.early, t.earlyMs, t.retireMs, t.retiredCount, t.workerReleaseMs, t.queueGapGpuMs,
 						t.stillReused, a_row.pacer.inFlightAfter);
+					// (45o)
+					const auto& l = a_row.lights;
+					s += std::format(",{},{},{},{},{},{:.4f},{:.3f}", l.total, l.shadow, l.fill, l.player, l.maxCluster, l.over4Share, l.llfGpuMs);
 					s += "," + a_row.cpuTop + "\n";
 					return s;
 				};
@@ -718,6 +727,7 @@ namespace Util::FrameTrace
 	}
 
 	void OnRayTracingDetail(const RayTracingDetail& a_detail) { g_frame.rt = a_detail; }
+	void OnLights(const LightStats& a_stats) { g_frame.lights = a_stats; }
 
 	namespace
 	{
@@ -961,6 +971,7 @@ namespace Util::FrameTrace
 				r.rtCpuMs = g_frame.rtCpuMs;
 				r.rtBuilds = g_frame.rtBuilds;
 				r.rt = g_frame.rt;
+				r.lights = g_frame.lights;
 				r.cpuTop = Util::CpuPassTimers::GetSingleton()->TopOfCurrentFrame(3);
 				r.mapCalls = g_frame.mapCalls;
 				r.mapSlow = g_frame.mapSlow;

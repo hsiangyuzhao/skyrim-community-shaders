@@ -94,6 +94,19 @@ namespace Util::FrameTrace
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 
+	/// (45o) Light Census per-frame numbers (only filled while a trace records; -1 = not known).
+	struct LightStats
+	{
+		int total = -1;       ///< lights in LLF's buffer
+		int shadow = -1;      ///< of which shadow-casting
+		int fill = -1;        ///< fill-light estimate: placed light without a mesh, radius >= 512, no shadow
+		int player = -1;      ///< attached to the player
+		int maxCluster = -1;  ///< most lights in one cluster (from a read-back a few frames old)
+		float over4Share = -1.0f;  ///< share of screen tiles whose busiest cluster has > 4 lights (same read-back)
+		float llfGpuMs = -1.0f;    ///< LLF cluster build + culling, last GPU sample
+	};
+	void OnLights(const LightStats& a_stats);
+
 	/// (45j) Where the player is, for profiles: worldspace and cell (editor ID, else name, else form
 	/// ID), interior, position (rounded), weather, game hour.
 	struct Location

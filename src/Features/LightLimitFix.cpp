@@ -5,6 +5,8 @@
 #include "Shadercache.h"
 #include "State.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/FrameTrace.h"
+#include "Utils/LightCensus.h"
 
 static constexpr uint CLUSTER_MAX_LIGHTS = 128;
 static constexpr uint MAX_LIGHTS = 1024;
@@ -12,7 +14,8 @@ static constexpr uint MAX_LIGHTS = 1024;
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	LightLimitFix::Settings,
 	EnableContactShadows,
-	LightsVisualisationMode)
+	LightsVisualisationMode,
+	LightCensusKey)
 
 void LightLimitFix::DrawSettings()
 {
@@ -51,6 +54,12 @@ void LightLimitFix::DrawSettings()
 			previousEnableLightsVisualisation = currentEnableLightsVisualisation;
 		}
 
+		ImGui::TreePop();
+	}
+
+	// (45o) Light Census: one-shot JSON of every light in use (for designing RT point-light shadows).
+	if (ImGui::TreeNode("Diagnostics")) {
+		Util::LightCensus::DrawSettings(settings.LightCensusKey, capturingLightCensusKey);
 		ImGui::TreePop();
 	}
 }
@@ -404,10 +413,23 @@ void LightLimitFix::UpdateLights()
 		light.roomFlags.SetBit(roomIndex, 1);
 	};
 
+	// (45o) Light Census: the light behind every buffer entry, and the skipped ones (only while capturing / tracing).
+	const bool census = Util::LightCensus::WantsSources();
+	std::vector<RE::BSLight*> censusUsed;
+	std::vector<std::pair<RE::BSLight*, Util::LightCensus::DropReason>> censusDropped;
+	auto censusDrop = [&](RE::BSLight* a_light, Util::LightCensus::DropReason a_reason) {
+		if (census)
+			censusDropped.emplace_back(a_light, a_reason);
+	};
+
 	auto addLight = [&](const RE::NiPointer<RE::BSLight>& e) {
 		if (auto bsLight = e.get()) {
-			if (auto niLight = bsLight->light.get()) {
-				if (IsValidLight(bsLight)) {
+			if (auto niLight = bsLight->light.get(); !niLight) {
+				censusDrop(bsLight, Util::LightCensus::DropReason::NoNiLight);
+			} else if (!IsValidLight(bsLight)) {
+				censusDrop(bsLight, Util::LightCensus::DropReason::Hidden);
+			} else {
+				{
 					auto& runtimeData = niLight->GetLightRuntimeData();
 
 					LightData light{};
@@ -449,7 +471,13 @@ void LightLimitFix::UpdateLights()
 
 						if ((light.color.x + light.color.y + light.color.z) * light.fade > 1e-4 && light.radius > 1e-4) {
 							lightsData.push_back(light);
+							if (census)
+								censusUsed.push_back(bsLight);
+						} else {
+							censusDrop(bsLight, Util::LightCensus::DropReason::ZeroIntensity);
 						}
+					} else {
+						censusDrop(bsLight, Util::LightCensus::DropReason::InactiveShadow);
 					}
 				}
 			}
@@ -466,6 +494,9 @@ void LightLimitFix::UpdateLights()
 	auto context = globals::d3d::context;
 
 	lightCount = std::min((uint)lightsData.size(), MAX_LIGHTS);
+
+	if (census)
+		Util::LightCensus::OnLightsGathered(censusUsed, censusDropped, lightsData.data(), sizeof(LightData), lightCount);
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	DX::ThrowIfFailed(context->Map(lights->resource.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
@@ -548,6 +579,20 @@ void LightLimitFix::UpdateStructure()
 
 	ID3D11UnorderedAccessView* null_uavs[3] = { nullptr };
 	context->CSSetUnorderedAccessViews(0, 3, null_uavs, nullptr);
+
+	// (45o) Light Census: copies the cluster grid for a capture or the F7 trace (does nothing otherwise).
+	if (Util::LightCensus::Busy() || Util::FrameTrace::IsRecording() || censusRingActive) {
+		Util::LightCensus::ClusterInputs inputs;
+		inputs.grid = lightGrid->resource.get();
+		inputs.indexList = lightIndexList->resource.get();
+		inputs.counter = lightIndexCounter->resource.get();
+		std::copy(clusterSize, clusterSize + 3, inputs.clusterSize);
+		inputs.renderWidth = renderSize.x;
+		inputs.renderHeight = renderSize.y;
+		inputs.lightCount = lightCount;
+		Util::LightCensus::OnClustersCulled(inputs);
+		censusRingActive = Util::FrameTrace::IsRecording();
+	}
 }
 
 void LightLimitFix::Hooks::BSLightingShader_SetupGeometry::thunk(RE::BSShader* This, RE::BSRenderPass* Pass, uint32_t RenderFlags)

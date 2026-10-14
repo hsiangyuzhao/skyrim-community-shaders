@@ -176,7 +176,11 @@ public:
 		bool EnableContactShadows = false;
 		bool EnableLightsVisualisation = false;
 		uint LightsVisualisationMode = 0;
+		uint32_t LightCensusKey = VK_F6;  ///< (45o) Diagnostics > Light Census capture key; 0 = none
 	};
+
+	bool capturingLightCensusKey = false;  ///< (45o) the menu is waiting for the new census key
+	bool censusRingActive = false;         ///< (45o) the census trace ring holds staging buffers (released the frame after a trace)
 
 	uint clusterSize[3] = { 16 };
 

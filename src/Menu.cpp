@@ -37,9 +37,11 @@
 #include "Util.h"
 #include "Utils/ABCompare.h"
 #include "Utils/FrameTrace.h"
+#include "Utils/LightCensus.h"
 #include "Utils/Screenshot.h"
 #include "Utils/UI.h"
 
+#include "Features/LightLimitFix.h"
 #include "Features/PerformanceOverlay.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTestAggregator.h"
 #include "Features/PerformanceOverlay/ABTesting/ABTesting.h"
@@ -709,6 +711,8 @@ void Menu::ProcessInputEventQueue()
 					// (44e) Screenshot and frame-trace keys, set from the Performance Overlay page. Esc cancels.
 					{ &globals::features::performanceOverlay.settings.ScreenshotKey, &globals::features::performanceOverlay.capturingScreenshotKey, [](uint32_t key) { if (key != VK_ESCAPE) globals::features::performanceOverlay.settings.ScreenshotKey = key; globals::features::performanceOverlay.capturingScreenshotKey = false; } },
 					{ &globals::features::performanceOverlay.settings.TraceKey, &globals::features::performanceOverlay.capturingTraceKey, [](uint32_t key) { if (key != VK_ESCAPE) globals::features::performanceOverlay.settings.TraceKey = key; globals::features::performanceOverlay.capturingTraceKey = false; } },
+					// (45o) Light Census capture key, set from Light Limit Fix > Diagnostics. Esc cancels.
+					{ &globals::features::lightLimitFix.settings.LightCensusKey, &globals::features::lightLimitFix.capturingLightCensusKey, [](uint32_t key) { if (key != VK_ESCAPE) globals::features::lightLimitFix.settings.LightCensusKey = key; globals::features::lightLimitFix.capturingLightCensusKey = false; } },
 				};
 				bool handled = false;
 				for (auto& h : hotkeyActions) {
@@ -759,6 +763,11 @@ void Menu::ProcessInputEventQueue()
 								 else
 									 Util::FrameTrace::StartRecording(overlay.settings.TraceSeconds);
 							 }
+						 } },
+						// (45o) Light Census snapshot.
+						{ globals::features::lightLimitFix.settings.LightCensusKey, []() {
+							 if (globals::features::lightLimitFix.loaded && globals::features::lightLimitFix.settings.LightCensusKey != 0)
+								 Util::LightCensus::RequestCapture();
 						 } },
 						// (41a) A/B Compare: queue a switch to the other slot (applied at the next Present).
 						{ settings.ABCompareKey, []() {
