@@ -44,6 +44,23 @@ namespace RayTracingRT
 		}
 
 		std::uint64_t Align(std::uint64_t a_value, std::uint64_t a_alignment) { return (a_value + a_alignment - 1) & ~(a_alignment - 1); }
+
+		std::int64_t QpcNow()
+		{
+			LARGE_INTEGER t;
+			QueryPerformanceCounter(&t);
+			return t.QuadPart;
+		}
+
+		double QpcToMs(std::int64_t a_ticks)
+		{
+			static const double toMs = [] {
+				LARGE_INTEGER f;
+				QueryPerformanceFrequency(&f);
+				return f.QuadPart > 0 ? 1000.0 / static_cast<double>(f.QuadPart) : 0.0;
+			}();
+			return static_cast<double>(a_ticks) * toMs;
+		}
 	}
 
 	// Process exit: no GPU wait (the GPU work of a closing game does not matter any more).
@@ -770,9 +787,13 @@ namespace RayTracingRT
 	void Backend::ProcessCompaction(ID3D12GraphicsCommandList4* a_list, std::uint64_t a_completed)
 	{
 		stats_.compactionsLastFrame = 0;
+		std::uint32_t created = 0;
 		for (auto& blas : blas_) {
 			if (blas.state != BlasState::Built || blas.buildFence == 0 || blas.buildFence > a_completed)
 				continue;
+			// (45j) A bounded number of new buffers per frame; the rest stay usable (Built) until a later frame.
+			if (created >= kMaxCompactionsPerFrame)
+				break;
 			const std::uint64_t compactedSize = blas.postbuildSlot < kPostbuildSlots ? postbuildMapped_[blas.postbuildSlot] : 0;
 			blas.postbuildSlot = UINT32_MAX;
 			const std::uint64_t bytes = Align(compactedSize, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
@@ -781,6 +802,7 @@ namespace RayTracingRT
 				blas.state = BlasState::Ready;
 				continue;
 			}
+			++created;
 			auto compacted = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
 			if (!compacted) {
 				blas.state = BlasState::Ready;
@@ -1050,6 +1072,7 @@ namespace RayTracingRT
 		if (FAILED(removed))
 			return Fail("D3D12 device", removed);
 
+		const std::int64_t cpuStart = QpcNow();
 		CollectRetired();
 		const std::uint64_t completed = fence_->GetCompletedValue();
 
@@ -1092,9 +1115,11 @@ namespace RayTracingRT
 		if (timestampHeap_)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(index * 2));
 
+		const std::int64_t buildStart = QpcNow();
 		ProcessCompaction(list, completed);
 		const std::uint32_t builtNow = BuildQueued(list, a_input.buildTriangleBudget);
 		stats_.buildsLastFrame = builtNow;
+		const std::int64_t buildEnd = QpcNow();
 
 		// (45i) Skinned characters: uploads, skinning, BLAS builds / refits (none without draws).
 		static const std::vector<SkinDraw> kNoSkinDraws;
@@ -1103,6 +1128,9 @@ namespace RayTracingRT
 		skinRecorded_ = false;
 		if (!skinDraws.empty() || !skinUploadQueue_.empty())
 			RecordSkinning(list, context, a_input, skinReady_);
+		const std::int64_t skinEnd = QpcNow();
+		stats_.cpuBuildMs = static_cast<float>(QpcToMs(buildEnd - buildStart));
+		stats_.cpuSkinMs = static_cast<float>(QpcToMs(skinEnd - buildEnd));
 		if (failed_) {
 			list->Close();
 			return false;
@@ -1285,6 +1313,7 @@ namespace RayTracingRT
 				blas.buildFence = doneValue;
 		if (FAILED(hr = context11_->Wait(fence11_.Get(), doneValue)))
 			return Fail("D3D11 Wait", hr);
+		stats_.cpuRecordMs = static_cast<float>(QpcToMs(QpcNow() - cpuStart)) - stats_.cpuBuildMs - stats_.cpuSkinMs;
 		return true;
 	}
 }

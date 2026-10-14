@@ -61,6 +61,10 @@ namespace RayTracingCharacters
 		std::uint32_t retiredShapes = 0;   // total: equip / dismember / unload changes
 		// Left to the shadow map (totals since the scene was dropped; each distinct shape once).
 		std::uint32_t skipPhysicsOff = 0;  // physics part with the switch off
+		std::uint32_t skipHairOff = 0;     // (45j) hair with Hair on Shadow map
+		std::uint32_t hairByTint = 0;      // (45j) hair recognised by its material (hair tint), by its name / texture, by HDT data
+		std::uint32_t hairByName = 0;
+		std::uint32_t hairShapes = 0;      // (45j) hair shapes traced now
 		std::uint32_t skipAlphaOff = 0;    // alpha-tested part without Alpha-tested casters
 		std::uint32_t skipAlphaFailed = 0; // alpha-tested part whose texture / record failed
 		std::uint32_t skipShader = 0;      // decal, effect shader, alpha-blended, no shadow, refraction
@@ -86,10 +90,12 @@ namespace RayTracingCharacters
 		/// Process exit: the game's objects are not released (its memory manager may be gone already).
 		~Characters();
 
-		/// a_physics: HDT / hair parts; a_alpha: alpha-tested parts with their cut-out (needs the
-		/// Alpha-tested casters switch); a_keepInShadowMap: never leave the cascades. A change of
-		/// the first two drops everything (next Update).
-		void Configure(bool a_physics, bool a_alpha, bool a_keepInShadowMap);
+		/// a_physics: HDT-SMP / HDT-PE parts (capes, skirts); a_hair (45j): hair, split from the physics
+		/// parts; a_alpha: alpha-tested parts with their cut-out (the alpha pipeline exists);
+		/// a_keepInShadowMap: never leave the cascades; a_firstPersonPlayer (45j): the player is traced
+		/// in first person too (off: in first person it stays in the shadow map). A change of the first
+		/// three drops everything (next Update).
+		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_keepInShadowMap, bool a_firstPersonPlayer);
 		/// Drops everything on the next Update (loading screens, from any thread).
 		void RequestFlush() { flushRequested_.store(true); }
 		/// a_rect: world xy min / max of the traced area (actors outside are not taken).
@@ -117,6 +123,7 @@ namespace RayTracingCharacters
 			RayTracingRT::SkinHandle handle = RayTracingRT::kInvalidSkin;
 			std::vector<Bone> bones;
 			bool physics = false;
+			bool hair = false;  // (45j)
 			bool alpha = false;
 			RayTracingRT::AlphaTexture texture = RayTracingRT::kInvalidAlphaTexture;
 			std::uint32_t info = RayTracingRT::kInvalidAlphaInfo;
@@ -153,6 +160,8 @@ namespace RayTracingCharacters
 		std::vector<std::unique_ptr<Actor>> retiring_;  // traced this frame, released in EndFrame
 		std::atomic<bool> flushRequested_{ false };
 		bool physics_ = false;
+		bool hair_ = false;               // (45j)
+		bool firstPersonPlayer_ = false;  // (45j)
 		bool alpha_ = false;
 		bool keepInShadowMap_ = false;
 		std::uint32_t filterEpoch_ = 0;

@@ -3,14 +3,21 @@
 
 cbuffer RayTracingCB : register(b0)
 {
-	row_major float4x4 InvViewProj;  // FrameBuffer::CameraViewProjInverse of the main view
-	float4 Rect;                     // camera-relative xy min / max of the ray-traced area
-	float4 Band;                     // x hand-off band width, y filter radius (px), z flags, w unused
-	uint4 Size;                      // render width, height, debug view, frame
+	row_major float4x4 InvViewProj;   // FrameBuffer::CameraViewProjInverse of the main view
+	float4 Rect;                      // camera-relative xy min / max of the ray-traced area
+	float4 Band;                      // x hand-off band width, y filter radius (px), z flags, w temporal blend (new frame weight)
+	uint4 Size;                       // render width, height, debug view, frame
+	row_major float4x4 PrevViewProj;  // (45j) last combined frame's CameraViewProj (camera-relative to its own camera)
+	float4 CameraDelta;               // (45j) xyz camera position now minus then, w unused
 };
 
-static const uint kFlagHandOffSSS = 1u;  // Screen Space Shadows off inside the traced area
-static const uint kFlagDebug = 2u;       // write the debug colour texture
+static const uint kFlagHandOffSSS = 1u;          // Screen Space Shadows faded out inside the traced area (45i)
+static const uint kFlagDebug = 2u;               // write the debug colour texture
+static const uint kFlagCombineSSS = 4u;          // (45j) Screen Space Shadows kept, merged with the mask as min() instead of a product
+static const uint kFlagKeepSSSUnderFoliage = 8u; // (45j) hand-off: not where a sun ray met a cut-out (leaves)
+static const uint kFlagTemporal = 16u;           // (45j) history blend of the traced visibility
+static const uint kFlagHistoryValid = 32u;       // (45j) the history textures hold the last frame
+static const uint kFlagTraceSkipped = 64u;       // (45j) pixels with a negative DepthMask were not traced (their 0 is a placeholder)
 
 static const uint kViewOff = 0u;
 static const uint kViewShadowSource = 1u;
@@ -18,6 +25,10 @@ static const uint kViewDisagreement = 2u;
 static const uint kViewCoverage = 3u;
 static const uint kViewRaw = 4u;
 static const uint kViewHitDepth = 5u;  // (45e)
+
+// Visibility.w bit flags (TraceShadowsCS, 45j)
+static const uint kOutAlphaCandidate = 1u;
+static const uint kOutCharacter = 2u;
 
 float3 RTPosition(int2 p, float depth)
 {

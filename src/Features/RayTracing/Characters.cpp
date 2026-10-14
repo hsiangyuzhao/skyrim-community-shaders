@@ -152,11 +152,9 @@ namespace RayTracingCharacters
 			return false;
 		}
 
-		/// HDT-SMP / HDT-PE parts (their 3D carries the HDT extra data) and hair.
+		/// HDT-SMP / HDT-PE parts (their 3D carries the HDT extra data).
 		bool IsPhysicsPart(RE::BSGeometry* a_geometry, RE::NiAVObject* a_root)
 		{
-			if (ContainsHair(a_geometry->name.c_str()))
-				return true;
 			int depth = 0;
 			for (RE::NiAVObject* node = a_geometry; node && depth < 64; node = node->parent, ++depth) {
 				if (HasHdtData(node))
@@ -165,6 +163,38 @@ namespace RayTracingCharacters
 					break;
 			}
 			return false;
+		}
+
+		/// (45j) How a shape was recognised as hair: 0 = not hair, 1 = its material is the hair tint
+		/// material (what the game's and Community Shaders' hair shading key on), 2 = "hair" in its name
+		/// or in its diffuse texture path (wigs, hair added as armour without the hair tint material).
+		int HairKind(RE::BSGeometry* a_geometry, RE::BSLightingShaderProperty* a_lighting)
+		{
+			if (a_lighting) {
+				__try {
+					auto* material = a_lighting->material;
+					if (material && material->GetFeature() == RE::BSShaderMaterial::Feature::kHairTint)
+						return 1;
+				} __except (EXCEPTION_EXECUTE_HANDLER) {
+				}
+			}
+			if (ContainsHair(a_geometry->name.c_str()))
+				return 2;
+			if (a_lighting) {
+				char path[512]{};
+				__try {
+					auto* material = static_cast<RE::BSLightingShaderMaterialBase*>(a_lighting->material);
+					RE::NiSourceTexture* source = material ? material->diffuseTexture.get() : nullptr;
+					const char* name = source ? source->name.c_str() : nullptr;
+					if (name)
+						strncpy_s(path, name, _TRUNCATE);
+				} __except (EXCEPTION_EXECUTE_HANDLER) {
+					path[0] = 0;
+				}
+				if (ContainsHair(path))
+					return 2;
+			}
+			return 0;
 		}
 
 		struct RawAlpha
@@ -247,12 +277,14 @@ namespace RayTracingCharacters
 		new std::vector<std::unique_ptr<Actor>>(std::move(retiring_));
 	}
 
-	void Characters::Configure(bool a_physics, bool a_alpha, bool a_keepInShadowMap)
+	void Characters::Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_keepInShadowMap, bool a_firstPersonPlayer)
 	{
-		if (a_physics != physics_ || a_alpha != alpha_)
+		if (a_physics != physics_ || a_hair != hair_ || a_alpha != alpha_)
 			RequestFlush();
 		physics_ = a_physics;
+		hair_ = a_hair;
 		alpha_ = a_alpha;
+		firstPersonPlayer_ = a_firstPersonPlayer;
 		if (a_keepInShadowMap != keepInShadowMap_) {
 			keepInShadowMap_ = a_keepInShadowMap;
 			if (keepInShadowMap_) {
@@ -402,11 +434,21 @@ namespace RayTracingCharacters
 			++stats_.skipShader;
 			return nullptr;
 		}
-		const bool physics = IsPhysicsPart(a_geometry, a_actor.root.get());
+		// (45j) Hair is its own category (its cards are not a solid surface: the hair shader's own
+		// shadowing looks better), the other physics parts (capes, skirts) another one.
+		const int hairKind = HairKind(a_geometry, lighting);
+		const bool hair = hairKind != 0;
+		const bool physics = !hair && IsPhysicsPart(a_geometry, a_actor.root.get());
+		if (hair && !hair_) {
+			++stats_.skipHairOff;
+			return nullptr;
+		}
 		if (physics && !physics_) {
 			++stats_.skipPhysicsOff;
 			return nullptr;
 		}
+		if (hair)
+			++(hairKind == 1 ? stats_.hairByTint : stats_.hairByName);
 		if (alphaTested && (!alpha_ || !a_backend.SkinAlphaAvailable())) {
 			++stats_.skipAlphaOff;
 			return nullptr;
@@ -416,6 +458,7 @@ namespace RayTracingCharacters
 		shape->geometry = RE::NiPointer<RE::BSGeometry>(a_geometry);
 		shape->signature = a_signature;
 		shape->physics = physics;
+		shape->hair = hair;
 
 		// --- Vertex data: the skin partition's (skinned) or the shape's own CPU copy (rigid).
 		auto* skin = runtime.skinInstance.get();
@@ -996,12 +1039,19 @@ namespace RayTracingCharacters
 		stats_.actors = static_cast<std::uint32_t>(actors_.size());
 		stats_.shapes = stats_.registered = stats_.skinnedShapes = stats_.rigidShapes = stats_.physicsShapes = stats_.alphaShapes = 0;
 		stats_.vertices = 0;
+		stats_.hairShapes = 0;
+		// (45j) In first person (weapons drawn especially) camera mods hide or fold the third-person
+		// arms outside the shadow pass: the traced player then lost its arms. By default the player
+		// stays in the shadow map in first person (still traced on the frame it switches).
+		auto* playerCamera = RE::PlayerCamera::GetSingleton();
+		const bool firstPerson = playerCamera && playerCamera->IsInFirstPerson();
 		for (auto& actor : actors_) {
 			// A skeleton that is not where its actor is (not animated: stale) is not traced: its
 			// shapes go back to the shadow map (still traced this frame if they had left it).
 			const auto position = actor->ref->GetPosition();
 			const auto translate = actor->root->world.translate;
-			const bool stale = !(position.GetSquaredDistance(translate) <= kStaleDistance * kStaleDistance);
+			const bool stale = !(position.GetSquaredDistance(translate) <= kStaleDistance * kStaleDistance) ||
+			                   (actor->player && firstPerson && !firstPersonPlayer_);
 			for (auto& shape : actor->shapes) {
 				if (stale) {
 					if (shape->registered) {
@@ -1022,6 +1072,7 @@ namespace RayTracingCharacters
 				stats_.registered += shape->registered ? 1 : 0;
 				++(shape->skin ? stats_.skinnedShapes : stats_.rigidShapes);
 				stats_.physicsShapes += shape->physics ? 1 : 0;
+				stats_.hairShapes += shape->hair ? 1 : 0;
 				stats_.alphaShapes += shape->alpha ? 1 : 0;
 				stats_.vertices += shape->vertices;
 			}

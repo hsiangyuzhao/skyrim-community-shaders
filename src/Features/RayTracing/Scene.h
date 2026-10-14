@@ -109,6 +109,46 @@ namespace RayTracingScene
 		std::uint32_t failedRecord = 0;   // texcoord buffer / record table full: 45g rules (total)
 	};
 
+	/// (45j) Foliage (leaves, bushes, plants with a cut-out): kept in the shadow map (and its
+	/// screen-space contact shadows), ray traced with the cut-out instead, or both (min of the two).
+	enum class FoliageMode : int
+	{
+		ShadowMap = 0,
+		RayTraced = 1,
+		Both = 2
+	};
+
+	/// (45j) Per kind of object: ray traced (true) or left to the shadow map + screen-space shadows.
+	struct SceneConfig
+	{
+		bool buildings = true;        // statics, furniture, containers baked into the cell chunks (incl. edge-only cut-outs taken as opaque)
+		bool objects = true;          // doors, activators, movable statics, lights, loose items
+		bool trees = false;           // opaque parts of trees and plants (trunks, branches)
+		FoliageMode foliage = FoliageMode::ShadowMap;  // vegetation cut-outs (leaves, bushes)
+		bool cutouts = false;         // other cut-outs (fences, banners, grilles) traced with their cut-out
+		bool cutoutAsOpaque = true;   // (45g) large one-sided edge-only cut-outs (roof tiles) as opaque
+		bool operator==(const SceneConfig&) const = default;
+	};
+
+	/// (45j) CPU of the scene's per-frame work (ms), for the page and the F7 trace.
+	struct FrameTimes
+	{
+		float update = 0.0f;        // whole Update
+		float gridDiff = 0.0f;      // grid diff, re-validation of captured references, new cells
+		float gather = 0.0f;        // cell capture (budgeted)
+		float registration = 0.0f;  // caster filter registration of built cells / shapes
+		float objects = 0.0f;       // object validation + scan (doors, items, trees)
+		float objectCapture = 0.0f; // ... of which new objects captured
+		float instances = 0.0f;     // CollectInstances
+		float missed = 0.0f;        // DescribeMissedCasters
+		float endFrame = 0.0f;      // EndFrame (retiring captures released)
+		float release = 0.0f;       // engine references dropped (deferred, bounded)
+		std::uint32_t recaptures = 0;      // cell recaptures started this frame
+		std::uint32_t objectsCaptured = 0; // object references captured this frame
+		std::uint32_t missedJudged = 0;    // missed casters examined this frame
+		std::uint32_t releasePending = 0;  // engine references still waiting to be dropped
+	};
+
 	/// (45g) Why a missed caster (a big shape drawn into the sun cascades inside the traced area but
 	/// absent from the scene) is missing; counted once per distinct shape after it was judged final.
 	enum class MissReason : std::uint8_t
@@ -124,12 +164,13 @@ namespace RayTracingScene
 		Billboard,
 		Character,
 		NoOwner,              // not part of a placed reference
+		ByChoice,             // (45j) its kind is left to the shadow map (Ray Tracing > Advanced)
 		Other,                // other shape rules (no shadow flag, geometry type, LOD flag, refraction, ...)
 		Count
 	};
 	inline constexpr const char* kMissReasonNames[] = { "never captured", "captured but shape skipped", "3D root mismatch",
 		"persistent, no captured square", "alpha-tested", "decal", "skinned", "not Lighting shader", "billboard", "character",
-		"no owning reference", "other shape rule" };
+		"no owning reference", "left to the shadow map (Advanced)", "other shape rule" };
 	static_assert(std::size(kMissReasonNames) == static_cast<std::size_t>(MissReason::Count));
 
 	/// (45e) Objects with their own TLAS instances, moved every frame.
@@ -200,6 +241,9 @@ namespace RayTracingScene
 			new std::vector<std::unique_ptr<ObjectRef>>(std::move(objects_));
 			new std::vector<std::unique_ptr<ObjectRef>>(std::move(retiringObjects_));
 			new std::vector<RE::NiPointer<RE::TESObjectREFR>>(std::move(scanList_));
+			new std::vector<RE::NiPointer<RE::BSGeometry>>(std::move(geometryGrave_));
+			new std::vector<RE::NiPointer<RE::TESObjectREFR>>(std::move(refGrave_));
+			new PersistentIndex(std::move(persistent_));
 		}
 
 		/// Drops everything (BLASes are retired through the backend, filter entries removed).
@@ -222,6 +266,8 @@ namespace RayTracingScene
 
 		/// After this frame's trace was submitted (or skipped): releases the retiring captures.
 		void EndFrame(RayTracingRT::Backend& a_backend);
+		/// (45j) Drops a bounded number of held engine objects (also while Ray Tracing is off or failed).
+		void Housekeeping() { DrainGraves(0.3); }
 
 		/// World-space xy rect of the captured cells (min x, min y, max x, max y); false when none.
 		/// a_includeRetiring: also the cells still traced this frame but released at its end.
@@ -232,24 +278,20 @@ namespace RayTracingScene
 		[[nodiscard]] const Stats& GetStats() const { return stats_; }
 		void ResetPeaks() { stats_.maxGatherMs = 0.0f; }
 
-		/// (45g) Debug switch: large static alpha-tested shapes with an edge-only cutout (roof tiles)
-		/// are taken as opaque occluders. A change re-captures everything.
-		void SetCutoutAsOpaque(bool a_enable)
+		/// (45j) What goes into the ray-traced scene, per kind of object (Ray Tracing > Advanced). A
+		/// change re-captures everything (bounded per frame like any capture).
+		void Configure(const SceneConfig& a_config)
 		{
-			if (a_enable != cutoutAsOpaque_) {
-				cutoutAsOpaque_ = a_enable;
+			if (!(a_config == config_)) {
+				config_ = a_config;
 				RequestFlush();
 			}
 		}
-		/// (45h) Alpha-tested casters: alpha-tested shapes (leaves, banners, fences) are traced with
-		/// their cut-out (non-opaque BLAS, any-hit test). Off = exactly 45g. A change re-captures everything.
-		void SetAlphaCasters(bool a_enable)
-		{
-			if (a_enable != alphaCasters_) {
-				alphaCasters_ = a_enable;
-				RequestFlush();
-			}
-		}
+		[[nodiscard]] const SceneConfig& GetConfig() const { return config_; }
+		/// (45j) Alpha-tested shapes may be traced with their cut-out (some category asks for it).
+		[[nodiscard]] bool AlphaWanted() const { return config_.foliage != FoliageMode::ShadowMap || config_.cutouts; }
+		/// (45j) CPU split of the last Update / CollectInstances / DescribeMissedCasters / EndFrame.
+		[[nodiscard]] const FrameTimes& GetFrameTimes() const { return times_; }
 
 	private:
 		// (45e) Objects: one BLAS per distinct engine mesh (in the shape's own space), one TLAS
@@ -282,6 +324,8 @@ namespace RayTracingScene
 			MeshKey key;
 			RayTracingRT::BlasHandle blas = RayTracingRT::kInvalidBlas;
 			bool registered = false;  // in the caster filter
+			bool ready = false;       // (45j) BLAS (and texture) ready: in the TLAS
+			bool foliage = false;     // (45j) a vegetation cut-out (Foliage setting)
 			// (45h) Alpha-tested: its texture and record (both released with the shape).
 			bool alpha = false;
 			RayTracingRT::AlphaTexture texture = RayTracingRT::kInvalidAlphaTexture;
@@ -316,6 +360,9 @@ namespace RayTracingScene
 			// (45f) Per BLAS: the range of `geometries` it was made from (for the self-check).
 			std::vector<std::pair<std::uint32_t, std::uint32_t>> chunkGeometries;
 			std::uint32_t chunkStart = 0;  // first geometry of the chunk being filled
+			// (45j) Resumable capture: shapes of pending[cursor] already taken, and its 3D then.
+			std::uint32_t shapeSkip = 0;
+			const RE::NiAVObject* resumeRoot = nullptr;
 			// (45h) Alpha-tested shapes of the cell: own BLAS per mesh and instance per shape (like objects).
 			std::vector<ObjectShape> alphaShapes;
 			bool filterRegistered = false;
@@ -347,6 +394,12 @@ namespace RayTracingScene
 		/// Captures until the deadline; true when the cell is finished.
 		bool Gather(RayTracingRT::Backend& a_backend, Cell& a_cell, std::int64_t a_deadline);
 		void CaptureObject(Cell& a_cell, RE::NiAVObject* a_object, int a_depth);
+		/// (45j) Captures a reference, or the part of it that fits before a_deadline (at least one
+		/// shape); false = not finished, resumed from the next shape on the next frame.
+		bool CaptureResumable(Cell& a_cell, RE::NiAVObject* a_root, std::int64_t a_deadline);
+		std::uint32_t leafIndex_ = 0, leafSkip_ = 0;
+		bool gatherAborted_ = false;
+		std::int64_t gatherDeadline_ = 0;
 		bool AppendShape(Cell& a_cell, RE::BSTriShape* a_shape, bool a_landscape);
 		/// Decodes the positions (world minus the origin, or local with a_local) after checking
 		/// them against the shape's world bound; false = left out (counted in the stats).
@@ -371,15 +424,25 @@ namespace RayTracingScene
 		bool ReadMesh(RE::BSTriShape* a_shape, bool a_landscape, RawMesh& o_mesh);
 		/// The shape if it may go into the scene (Lighting shader, opaque, casts shadows, ...); the
 		/// reason is counted otherwise.
-		RE::BSTriShape* CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, bool a_allowAlpha = false,
-			bool* o_alpha = nullptr);
+		RE::BSTriShape* CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, std::uint8_t a_alphaKinds = 0,
+			bool* o_alpha = nullptr, bool* o_foliage = nullptr);
 		/// (45f) CheckShape's verdict without counting: nullptr = accepted, else the reason.
 		/// (45g) a_allowCutout: alpha-tested shapes passing CutoutAsOpaque's criteria are accepted;
 		/// o_reason (optional) receives the reason's MissReason bucket.
-		/// (45h) a_allowAlpha: alpha-tested shapes whose cut-out can be traced (texture, texcoords,
-		/// a "greater" test) are accepted as alpha shapes (*o_alpha = true), tree-animated ones too.
+		/// (45h) a_alphaKinds (45j: kAlphaFoliage / kAlphaCutouts): alpha-tested shapes whose cut-out can
+		/// be traced (texture, texcoords, a "greater" test) are accepted as alpha shapes (*o_alpha = true),
+		/// tree-animated ones too; *o_foliage tells vegetation (leaves, bushes) from other cut-outs.
 		static const char* ShapeRejectReason(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, SkipCounts* o_counts,
-			MissReason* o_reason = nullptr, bool a_allowAlpha = false, bool* o_alpha = nullptr);
+			MissReason* o_reason = nullptr, std::uint8_t a_alphaKinds = 0, bool* o_alpha = nullptr, bool* o_foliage = nullptr);
+		static constexpr std::uint8_t kAlphaFoliage = 1, kAlphaCutouts = 2;
+		/// (45j) Vegetation (leaves, bushes, plants): tree-animated, owned by a tree / flora / grass
+		/// reference, or a plant word in its texture, its name or its model path. Such shapes are never
+		/// taken as opaque occluders (their cut-out is real), and they follow the Foliage setting.
+		static bool IsVegetation(RE::BSGeometry* a_geometry);
+		[[nodiscard]] std::uint8_t AlphaKinds() const
+		{
+			return static_cast<std::uint8_t>((config_.foliage != FoliageMode::ShadowMap ? kAlphaFoliage : 0) | (config_.cutouts ? kAlphaCutouts : 0));
+		}
 		/// (45h) The shape's cut-out as the ray tracer needs it: the game's diffuse texture, threshold,
 		/// material alpha and texcoord transform; false when it cannot be traced (SEH-guarded).
 		struct AlphaSource
@@ -421,9 +484,13 @@ namespace RayTracingScene
 		};
 
 		void UpdateObjects(RayTracingRT::Backend& a_backend, std::int64_t a_deadline, bool a_allowNewMeshes);
-		/// o_shapes: each shape and whether it is taken as an alpha shape (45h).
-		void CollectObjectShapes(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, int a_depth,
-			std::vector<std::pair<RE::BSTriShape*, bool>>& o_shapes);
+		struct ObjectCandidate
+		{
+			RE::BSTriShape* shape;
+			bool alpha;    // taken as an alpha shape (45h)
+			bool foliage;  // a vegetation cut-out (45j)
+		};
+		void CollectObjectShapes(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, int a_depth, std::vector<ObjectCandidate>& o_shapes);
 		void CaptureObjectRef(RayTracingRT::Backend& a_backend, const RE::NiPointer<RE::TESObjectREFR>& a_ref, RE::NiAVObject* a_root,
 			ObjectKind a_kind, bool a_allowNewMeshes);
 		void ReleaseObject(RayTracingRT::Backend& a_backend, ObjectRef& a_object);
@@ -434,7 +501,7 @@ namespace RayTracingScene
 		std::vector<std::unique_ptr<Cell>> retiring_;  // traced this frame, released in EndFrame
 		std::vector<std::unique_ptr<ObjectRef>> objects_;
 		std::vector<std::unique_ptr<ObjectRef>> retiringObjects_;  // traced this frame, released in EndFrame
-		ankerl::unordered_dense::set<const RE::TESObjectREFR*> objectIndex_;  // references in objects_
+		ankerl::unordered_dense::map<const RE::TESObjectREFR*, ObjectRef*> objectIndex_;  // references in objects_
 		std::unordered_map<MeshKey, SharedMesh, MeshKeyHash> meshes_;
 		std::vector<RE::NiPointer<RE::TESObjectREFR>> scanList_;  // the cell being scanned for objects
 		std::size_t scanCursor_ = 0;
@@ -456,8 +523,34 @@ namespace RayTracingScene
 		std::deque<std::string> missedBacklog_;  // judged misses waiting for the log's rate limit
 		std::int64_t missedWindowStart_ = 0;
 		std::uint32_t missedWindowCount_ = 0;
-		bool cutoutAsOpaque_ = true;
-		bool alphaCasters_ = false;  // (45h)
+		SceneConfig config_{};  // (45j)
+		mutable FrameTimes times_{};  // (45j)
+		// (45j) Indices for the missed-caster diagnosis (no linear walks over every captured shape).
+		ankerl::unordered_dense::map<const RE::BSGeometry*, std::uint32_t> capturedGeometries_;
+		struct TrackedEntry
+		{
+			std::uint32_t count = 0;
+			const RE::NiAVObject* root = nullptr;  // of the latest capture
+		};
+		ankerl::unordered_dense::map<const RE::TESObjectREFR*, TrackedEntry> trackedRefs_;
+		void IndexGeometry(const RE::BSGeometry* a_geometry, bool a_add);
+		// (45j) Persistent references of the worldspace by cell square, rebuilt only when the
+		// persistent cell changes (the object scan used to walk all of them for every cell it scanned).
+		struct PersistentIndex
+		{
+			const RE::TESObjectCELL* sky = nullptr;
+			std::size_t references = SIZE_MAX;
+			std::uint32_t builtFrame = 0;
+			ankerl::unordered_dense::map<std::uint64_t, std::vector<RE::NiPointer<RE::TESObjectREFR>>> bySquare;
+		};
+		mutable PersistentIndex persistent_;
+		void RefreshPersistent(bool a_force) const;
+		// (45j) Engine objects whose last holder may be us: dropped a bounded number per frame (a
+		// whole cell at once ran thousands of engine destructors on the render thread).
+		std::vector<RE::NiPointer<RE::BSGeometry>> geometryGrave_;
+		std::vector<RE::NiPointer<RE::TESObjectREFR>> refGrave_;
+		void Bury(Cell& a_cell);
+		void DrainGraves(double a_budgetMs);
 		// (45g) Statics with a Havok-driven part (reference -> its 3D when judged): object path.
 		ankerl::unordered_dense::map<const RE::TESObjectREFR*, const RE::NiAVObject*> physicsRefs_;
 	};

@@ -145,8 +145,9 @@ namespace RayTracingRT
 		float renderSize[4]; // w, h, 1/w, 1/h
 		float rect[4];       // camera-relative xy min / max
 		float bias[4];       // constant, per unit distance, coverage probe
+		float world[4];      // (45j) camera world position (world-locked noise)
 	};
-	static_assert(sizeof(TraceConstants) == 36 * 4);
+	static_assert(sizeof(TraceConstants) == 40 * 4);
 
 	/// (45f) What a TLAS instance holds, for the per-category counts and the self-check.
 	enum InstanceCategory : std::uint8_t
@@ -225,6 +226,11 @@ namespace RayTracingRT
 		std::uint32_t skippedFramesBusy = 0;  // every command context still in flight
 		float lastGpuMs = 0.0f;               // trace + builds on our queue, from D3D12 timestamps
 		float smoothedGpuMs = 0.0f;
+		// (45j) CPU of the last ExecuteFrame, split: BLAS / compaction resource creation and uploads,
+		// character uploads / skinning records, everything else (TLAS instances, record, submit).
+		float cpuBuildMs = 0.0f;
+		float cpuSkinMs = 0.0f;
+		float cpuRecordMs = 0.0f;
 	};
 
 	class Backend
@@ -335,8 +341,12 @@ namespace RayTracingRT
 		[[nodiscard]] const Stats& GetStats() const { return stats_; }
 		[[nodiscard]] const TlasCheck& GetTlasCheck() const { return check_; }
 		void ResetTlasCheck() { check_ = {}; }
-		/// D3D12 instance mask and flags every TLAS instance is written with (for the log).
-		static constexpr std::uint32_t kInstanceMask = 0xFF;
+		/// D3D12 instance mask of every scene (non-character) instance, and the flags of opaque ones.
+		/// (45j) 0x01, not 0xFF: 0xFF contained kCharacterMask, so the character ray (mask 0x02) of
+		/// the RT_CHARACTERS variants walked the whole static scene a second time per pixel (and the
+		/// coverage view marked every static surface as a character). The scene ray's mask
+		/// (0xFF without characters, 0x01 with them) still takes every scene instance.
+		static constexpr std::uint32_t kInstanceMask = 0x01;
 		static constexpr D3D12_RAYTRACING_INSTANCE_FLAGS kInstanceFlags =
 			D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
 		[[nodiscard]] std::string AdapterDescription() const { return adapterDescription_; }
@@ -344,7 +354,11 @@ namespace RayTracingRT
 	private:
 		static constexpr std::size_t kContexts = 8;
 		static constexpr std::uint32_t kPostbuildSlots = 1024;
-		static constexpr std::size_t kMaxBuildsPerFrame = 48;  // (45e) small object meshes arrive in bursts
+		// (45e) small object meshes arrive in bursts. (45j) 48 -> 16: every build creates a committed
+		// resource on the render thread (and its compaction a second one later); bursts of them were
+		// CPU spikes of several ms.
+		static constexpr std::size_t kMaxBuildsPerFrame = 16;
+		static constexpr std::uint32_t kMaxCompactionsPerFrame = 16;  // (45j) the rest wait for the next frame
 		// Both on D3D11's guaranteed-shareable list; the shaders' declared types follow these.
 		static constexpr DXGI_FORMAT kDepthMaskFormat = DXGI_FORMAT_R32_FLOAT;        // depth; negative = engine mask already 0
 		static constexpr DXGI_FORMAT kVisibilityFormat = DXGI_FORMAT_R8G8B8A8_UNORM;  // r visibility, g coverage

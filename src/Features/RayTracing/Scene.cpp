@@ -105,6 +105,86 @@ namespace RayTracingScene
 			const auto* bsx = a_root->GetExtraData<RE::BSXFlags>("BSX");
 			return bsx && (static_cast<std::int32_t>(bsx->value) & static_cast<std::int32_t>(RE::BSXFlags::Flag::kEditorMarker));
 		}
+
+		/// (45g) This node's own userData (CommonLib's GetUserData() falls back to the parents).
+		RE::TESObjectREFR* NodeOwner(RE::NiAVObject* a_node)
+		{
+			return REL::RelocateMember<RE::TESObjectREFR*>(a_node, 0x0F8, 0x110);
+		}
+
+		/// (45j) A plant word in a texture path, shape name or model path (case-insensitive).
+		bool HasVegetationWord(const char* a_text)
+		{
+			if (!a_text || !*a_text)
+				return false;
+			static constexpr std::string_view kWords[] = { "plant", "tree", "bush", "shrub", "fern", "leaf", "leaves", "ivy", "vine", "flower", "grass",
+				"hedge", "branch", "foliage", "moss", "reed", "weed", "thistle", "sapling", "bramble", "juniper", "lavender", "heather", "cattail",
+				"creeper", "frond", "twig", "nirnroot", "deathbell", "mountainflower", "snowberr", "blisterwort", "canis", "elves ear", "tundra" };
+			char lower[512];
+			std::size_t n = 0;
+			for (; a_text[n] && n + 1 < sizeof(lower); ++n)
+				lower[n] = static_cast<char>(std::tolower(static_cast<unsigned char>(a_text[n])));
+			const std::string_view text(lower, n);
+			for (const auto word : kWords) {
+				for (std::size_t at = text.find(word); at != std::string_view::npos; at = text.find(word, at + 1)) {
+					// "street", "ravine": not plants.
+					if (word == "tree" && at > 0 && text[at - 1] == 's')
+						continue;
+					if (word == "vine" && at > 0 && text[at - 1] == 'a')
+						continue;
+					return true;
+				}
+			}
+			return false;
+		}
+
+		/// The diffuse texture path of a Lighting-shader shape (SEH: a mod can leave it dangling).
+		bool ReadDiffusePath(RE::BSLightingShaderProperty* a_lighting, char (&o_path)[512])
+		{
+			o_path[0] = 0;
+			__try {
+				auto* material = static_cast<RE::BSLightingShaderMaterialBase*>(a_lighting->material);
+				if (!material)
+					return false;
+				RE::NiSourceTexture* source = material->diffuseTexture.get();
+				const char* name = source ? source->name.c_str() : nullptr;
+				if (!name)
+					return false;
+				strncpy_s(o_path, name, _TRUNCATE);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				o_path[0] = 0;
+				return false;
+			}
+		}
+	}
+
+	bool Scene::IsVegetation(RE::BSGeometry* a_geometry)
+	{
+		if (!a_geometry)
+			return false;
+		const auto& runtime = a_geometry->GetGeometryRuntimeData();
+		auto* lighting = netimmerse_cast<RE::BSLightingShaderProperty*>(runtime.properties[RE::BSGeometry::States::kEffect].get());
+		if (lighting && lighting->flags.any(RE::BSShaderProperty::EShaderPropertyFlag::kTreeAnim))
+			return true;
+		// The owning reference: trees, flora and grass are plants whatever their textures say.
+		int depth = 0;
+		for (RE::NiAVObject* node = a_geometry; node && depth < 64; node = node->parent, ++depth) {
+			if (auto* owner = NodeOwner(node)) {
+				if (auto* base = owner->GetBaseObject()) {
+					const auto type = base->GetFormType();
+					if (type == RE::FormType::Tree || type == RE::FormType::Flora || type == RE::FormType::Grass)
+						return true;
+					if (auto* model = base->As<RE::TESModel>(); model && HasVegetationWord(model->GetModel()))
+						return true;
+				}
+				break;
+			}
+		}
+		if (HasVegetationWord(a_geometry->name.c_str()))
+			return true;
+		char path[512];
+		return lighting && ReadDiffusePath(lighting, path) && HasVegetationWord(path);
 	}
 
 	const void* Scene::LandSignature(RE::TESObjectCELL* a_cell)
@@ -114,6 +194,56 @@ namespace RayTracingScene
 			return nullptr;
 		// The quadrant meshes change identity whenever the land 3D is rebuilt.
 		return land->loadedData->geom[0].get();
+	}
+
+	void Scene::IndexGeometry(const RE::BSGeometry* a_geometry, bool a_add)
+	{
+		if (!a_geometry)
+			return;
+		if (a_add) {
+			++capturedGeometries_[a_geometry];
+			return;
+		}
+		const auto it = capturedGeometries_.find(a_geometry);
+		if (it != capturedGeometries_.end() && --it->second == 0)
+			capturedGeometries_.erase(it);
+	}
+
+	void Scene::Bury(Cell& a_cell)
+	{
+		// (45j) The engine objects this capture held: dropped a bounded number per frame.
+		for (auto& geometry : a_cell.geometries) {
+			IndexGeometry(geometry.get(), false);
+			if (geometry)
+				geometryGrave_.push_back(std::move(geometry));
+		}
+		for (auto& tracked : a_cell.tracked) {
+			const auto it = trackedRefs_.find(tracked.ref.get());
+			if (it != trackedRefs_.end() && --it->second.count == 0)
+				trackedRefs_.erase(it);
+			if (tracked.ref)
+				refGrave_.push_back(std::move(tracked.ref));
+		}
+		for (auto& ref : a_cell.pending)
+			if (ref)
+				refGrave_.push_back(std::move(ref));
+	}
+
+	void Scene::DrainGraves(double a_budgetMs)
+	{
+		// At least a few hundred per frame (most drops are plain reference count decrements), more
+		// while the budget lasts. Leftovers wait for the next frame.
+		const std::int64_t start = Qpc();
+		const std::int64_t deadline = start + static_cast<std::int64_t>(a_budgetMs / std::max(QpcMs(), 1e-9));
+		std::size_t dropped = 0;
+		while ((!geometryGrave_.empty() || !refGrave_.empty()) && (dropped < 256 || Qpc() < deadline)) {
+			for (int i = 0; i < 64 && !geometryGrave_.empty(); ++i, ++dropped)
+				geometryGrave_.pop_back();
+			for (int i = 0; i < 64 && !refGrave_.empty(); ++i, ++dropped)
+				refGrave_.pop_back();
+		}
+		times_.release = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+		times_.releasePending = static_cast<std::uint32_t>(geometryGrave_.size() + refGrave_.size());
 	}
 
 	void Scene::Release(RayTracingRT::Backend& a_backend, Cell& a_cell)
@@ -128,9 +258,12 @@ namespace RayTracingScene
 				RayTracingCasterFilter::Remove(geometry.get());
 			a_cell.filterRegistered = false;
 		}
-		for (auto& shape : a_cell.alphaShapes)  // (45h)
+		for (auto& shape : a_cell.alphaShapes) {  // (45h)
+			IndexGeometry(shape.geometry.get(), false);
 			ReleaseShape(a_backend, shape);
+		}
 		a_cell.alphaShapes.clear();
+		Bury(a_cell);
 		a_cell.geometries.clear();
 		a_cell.tracked.clear();
 		a_cell.pending.clear();
@@ -151,6 +284,9 @@ namespace RayTracingScene
 			list->clear();
 		}
 		objectIndex_.clear();
+		capturedGeometries_.clear();
+		trackedRefs_.clear();
+		persistent_ = {};
 		for (auto& [key, mesh] : meshes_)  // every user released above; anything left is a bookkeeping slip
 			a_backend.ReleaseBlas(mesh.blas);
 		meshes_.clear();
@@ -423,6 +559,7 @@ namespace RayTracingScene
 			chunk.indices.push_back(base + index);
 
 		a_cell.geometries.emplace_back(a_shape);
+		IndexGeometry(a_shape, true);
 		a_cell.triangles += mesh.triangleCount;
 		if (a_landscape)
 			++a_cell.landQuads;
@@ -504,7 +641,7 @@ namespace RayTracingScene
 	}
 
 	const char* Scene::ShapeRejectReason(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, SkipCounts* o_counts,
-		MissReason* o_reason, bool a_allowAlpha, bool* o_alpha)
+		MissReason* o_reason, std::uint8_t a_alphaKinds, bool* o_alpha, bool* o_foliage)
 	{
 		SkipCounts ignored;
 		MissReason ignoredReason;
@@ -513,6 +650,8 @@ namespace RayTracingScene
 		reason = MissReason::Other;
 		if (o_alpha)
 			*o_alpha = false;
+		if (o_foliage)
+			*o_foliage = false;
 		auto* geometry = a_object->AsGeometry();
 		if (!geometry)
 			return "not geometry";
@@ -557,10 +696,16 @@ namespace RayTracingScene
 		// (45h) Alpha-tested casters: a large enough alpha-tested shape whose cut-out can be traced
 		// (diffuse texture, texcoords, a "greater" test) goes in as a non-opaque shape. Tree-animated
 		// ones too (leaves; their wind sway is not followed). The other rules below still apply.
+		// (45j) Vegetation (leaves, bushes) follows the Foliage setting, other cut-outs (fences,
+		// banners) the Cut-outs setting; vegetation is never taken as an opaque occluder.
 		bool anyHit = false;
-		if (a_allowAlpha) {
-			auto* alphaProperty = netimmerse_cast<RE::NiAlphaProperty*>(runtime.properties[RE::BSGeometry::States::kProperty].get());
-			if (alphaProperty && alphaProperty->GetAlphaTesting()) {
+		bool vegetation = false;
+		auto* alphaTestProperty = netimmerse_cast<RE::NiAlphaProperty*>(runtime.properties[RE::BSGeometry::States::kProperty].get());
+		if (alphaTestProperty && alphaTestProperty->GetAlphaTesting()) {
+			vegetation = IsVegetation(geometry);
+			if (o_foliage)
+				*o_foliage = vegetation;
+			if (a_alphaKinds & (vegetation ? kAlphaFoliage : kAlphaCutouts)) {
 				AlphaSource source;
 				anyHit = std::isfinite(geometry->worldBound.radius) && geometry->worldBound.radius >= kAlphaMinRadius &&
 				         GetAlphaSource(geometry, source);
@@ -601,7 +746,7 @@ namespace RayTracingScene
 				if (o_alpha)
 					*o_alpha = true;
 			} else if (alpha->GetAlphaTesting()) {
-				if (a_allowAlpha)
+				if (a_alphaKinds & (vegetation ? kAlphaFoliage : kAlphaCutouts))
 					++skipped.alphaUnusable;
 				// (45g) CutoutAsOpaque: an alpha test that only trims edges (roof tiles, plank ends):
 				// one-sided (cloth banners, leaves and fences with holes are two-sided), a large
@@ -609,12 +754,15 @@ namespace RayTracingScene
 				const auto test = static_cast<RE::NiAlphaProperty::TestFunction>((alpha->alphaFlags >> 10) & 7);
 				const bool edgeOnly = (test == RE::NiAlphaProperty::TestFunction::kGreater || test == RE::NiAlphaProperty::TestFunction::kGreaterEqual) &&
 				                      alpha->alphaThreshold <= kCutoutMaxThreshold && !alpha->GetAlphaBlending() && flags.none(F::kTwoSided, F::kTreeAnim) &&
+				                      !vegetation &&
 				                      std::isfinite(geometry->worldBound.radius) && geometry->worldBound.radius >= kCutoutMinRadius;
 				if (a_allowCutout && edgeOnly) {
 					++skipped.cutoutAsOpaque;
 				} else {
 					++skipped.alphaTested;
 					reason = MissReason::AlphaTested;
+					if (vegetation)
+						return "alpha-tested (vegetation: leaves, bushes; follows the Foliage setting)";
 					if (!a_allowCutout)
 						return edgeOnly ? "alpha-tested (edge-only cutout; Treat Mostly-Opaque Alpha-Tested Shapes as Opaque is off)" : "alpha-tested";
 					return flags.any(F::kTwoSided) ? "alpha-tested (two-sided)" :
@@ -633,11 +781,14 @@ namespace RayTracingScene
 		return nullptr;
 	}
 
-	RE::BSTriShape* Scene::CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, bool a_allowAlpha, bool* o_alpha)
+	RE::BSTriShape* Scene::CheckShape(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, std::uint8_t a_alphaKinds, bool* o_alpha,
+		bool* o_foliage)
 	{
 		if (o_alpha)
 			*o_alpha = false;
-		if (!a_object->AsGeometry() || ShapeRejectReason(a_object, a_allowTreeAnim, a_allowCutout, &stats_.skipped, nullptr, a_allowAlpha, o_alpha))
+		if (o_foliage)
+			*o_foliage = false;
+		if (!a_object->AsGeometry() || ShapeRejectReason(a_object, a_allowTreeAnim, a_allowCutout, &stats_.skipped, nullptr, a_alphaKinds, o_alpha, o_foliage))
 			return nullptr;
 		return a_object->AsGeometry()->AsTriShape();
 	}
@@ -676,9 +827,27 @@ namespace RayTracingScene
 		}
 	}
 
+	bool Scene::CaptureResumable(Cell& a_cell, RE::NiAVObject* a_root, std::int64_t a_deadline)
+	{
+		leafIndex_ = 0;
+		leafSkip_ = a_cell.shapeSkip;
+		gatherAborted_ = false;
+		gatherDeadline_ = a_deadline;
+		CaptureObject(a_cell, a_root, 0);
+		if (gatherAborted_) {
+			gatherAborted_ = false;
+			a_cell.shapeSkip = leafIndex_;
+			a_cell.resumeRoot = a_root;
+			return false;
+		}
+		a_cell.shapeSkip = 0;
+		a_cell.resumeRoot = nullptr;
+		return true;
+	}
+
 	void Scene::CaptureObject(Cell& a_cell, RE::NiAVObject* a_object, int a_depth)
 	{
-		if (!a_object || a_depth > 64)
+		if (!a_object || a_depth > 64 || gatherAborted_)
 			return;
 		if (a_object->GetFlags().any(RE::NiAVObject::Flag::kHidden)) {
 			++stats_.skipped.hidden;
@@ -699,20 +868,35 @@ namespace RayTracingScene
 			}
 			return;
 		}
-		bool alpha = false;
-		if (auto* shape = CheckShape(a_object, false, cutoutAsOpaque_, alphaCasters_, &alpha)) {
+		// (45j) Resumable capture: shapes before the resume point were taken last frame; past the
+		// deadline (after at least one shape) the rest waits for the next frame.
+		const std::uint32_t leaf = leafIndex_++;
+		if (leaf < leafSkip_)
+			return;
+		if (leaf > leafSkip_ && Qpc() >= gatherDeadline_) {
+			gatherAborted_ = true;
+			leafIndex_ = leaf;
+			return;
+		}
+		bool alpha = false, foliage = false;
+		if (auto* shape = CheckShape(a_object, false, config_.cutoutAsOpaque, AlphaKinds(), &alpha, &foliage)) {
 			if (alpha) {
 				// (45h) Its own non-opaque BLAS (shared per mesh) and instance, like an object.
 				ObjectShape alphaShape;
 				if (gatherBackend_ && CaptureAlphaShape(*gatherBackend_, shape, true, alphaShape)) {
+					alphaShape.foliage = foliage;
+					IndexGeometry(shape, true);
 					a_cell.alphaShapes.push_back(std::move(alphaShape));
 					++a_cell.shapes;
 					return;
 				}
 				// Its cut-out cannot be traced: the 45g rules decide (opaque edge-only cut-out, or left out).
-				if (ShapeRejectReason(shape, false, cutoutAsOpaque_, nullptr))
+				if (ShapeRejectReason(shape, false, config_.cutoutAsOpaque, nullptr))
 					return;
 			}
+			// (45j) Buildings (opaque statics, edge-only cut-outs) only when that category is ray traced.
+			if (!config_.buildings)
+				return;
 			AppendShape(a_cell, shape, false);
 		}
 	}
@@ -822,6 +1006,10 @@ namespace RayTracingScene
 			a_backend.ReleaseAlphaTexture(a_shape.texture);
 		a_shape.info = RayTracingRT::kInvalidAlphaInfo;
 		a_shape.texture = RayTracingRT::kInvalidAlphaTexture;
+		a_shape.ready = false;
+		// (45j) The engine object is dropped later, a bounded number per frame (DrainGraves).
+		if (a_shape.geometry)
+			geometryGrave_.push_back(std::move(a_shape.geometry));
 	}
 
 	void Scene::AppendShapeInstance(const ObjectShape& a_shape, RayTracingRT::InstanceCategory a_category, std::uint32_t a_refID, bool a_expected,
@@ -831,8 +1019,8 @@ namespace RayTracingScene
 		// Not drawn by the game either: detached from the scene graph or hidden.
 		if (!geometry->parent || geometry->GetFlags().any(RE::NiAVObject::Flag::kHidden))
 			return;
-		// (45h) An alpha shape only once its BLAS and texture are ready (= registered).
-		if (a_shape.alpha && !a_shape.registered)
+		// (45h) An alpha shape only once its BLAS and texture are ready.
+		if (a_shape.alpha && !a_shape.ready)
 			return;
 		// This frame's transform: doors swing, items fall, activators animate.
 		const RE::NiTransform& world = geometry->world;
@@ -863,8 +1051,7 @@ namespace RayTracingScene
 	// (45e) Objects: doors / activators / movable statics, items, opaque parts of trees and plants.
 	// ---------------------------------------------------------------------------------------------
 
-	void Scene::CollectObjectShapes(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, int a_depth,
-		std::vector<std::pair<RE::BSTriShape*, bool>>& o_shapes)
+	void Scene::CollectObjectShapes(RE::NiAVObject* a_object, bool a_allowTreeAnim, bool a_allowCutout, int a_depth, std::vector<ObjectCandidate>& o_shapes)
 	{
 		if (!a_object || a_depth > 64)
 			return;
@@ -881,9 +1068,9 @@ namespace RayTracingScene
 				CollectObjectShapes(child.get(), a_allowTreeAnim, a_allowCutout, a_depth + 1, o_shapes);
 			return;
 		}
-		bool alpha = false;
-		if (auto* shape = CheckShape(a_object, a_allowTreeAnim, a_allowCutout, alphaCasters_, &alpha))
-			o_shapes.emplace_back(shape, alpha);
+		bool alpha = false, foliage = false;
+		if (auto* shape = CheckShape(a_object, a_allowTreeAnim, a_allowCutout, AlphaKinds(), &alpha, &foliage))
+			o_shapes.push_back(ObjectCandidate{ shape, alpha, foliage });
 	}
 
 	void Scene::CaptureObjectRef(RayTracingRT::Backend& a_backend, const RE::NiPointer<RE::TESObjectREFR>& a_ref, RE::NiAVObject* a_root,
@@ -894,25 +1081,30 @@ namespace RayTracingScene
 		entry->root = a_root;
 		entry->kind = a_kind;
 
-		static thread_local std::vector<std::pair<RE::BSTriShape*, bool>> shapes;
+		static thread_local std::vector<ObjectCandidate> shapes;
 		shapes.clear();
 		const bool allowTreeAnim = a_kind == ObjectKind::Tree;
-		const bool allowCutout = a_kind != ObjectKind::Tree && cutoutAsOpaque_;
+		const bool allowCutout = a_kind != ObjectKind::Tree && config_.cutoutAsOpaque;
+		// (45j) Opaque shapes by category: tree trunks only with Trees, doors / items only with Objects.
+		const bool opaqueWanted = a_kind == ObjectKind::Tree ? config_.trees : config_.objects;
 		CollectObjectShapes(a_root, allowTreeAnim, allowCutout, 0, shapes);
 
 		static thread_local RawMesh mesh;
 		static thread_local std::vector<float> local;
-		for (const auto& [shape, alpha] : shapes) {
+		for (const auto& [shape, alpha, foliage] : shapes) {
 			if (alpha) {
 				// (45h) Traced with its cut-out; if that is not possible the 45g rules decide.
 				ObjectShape alphaShape;
 				if (CaptureAlphaShape(a_backend, shape, a_allowNewMeshes, alphaShape)) {
+					alphaShape.foliage = foliage;
 					entry->shapes.push_back(std::move(alphaShape));
 					continue;
 				}
 				if (ShapeRejectReason(shape, allowTreeAnim, allowCutout, nullptr))
 					continue;
 			}
+			if (!opaqueWanted)
+				continue;
 			auto* data = shape->GetGeometryRuntimeData().rendererData;
 			const auto& counts = shape->GetTrishapeRuntimeData();
 			const MeshKey key{ data, counts.vertexCount, counts.triangleCount };
@@ -948,7 +1140,7 @@ namespace RayTracingScene
 
 		++stats_.objects.refs[static_cast<int>(a_kind)];
 		stats_.objects.shapes += static_cast<std::uint32_t>(entry->shapes.size());
-		objectIndex_.insert(a_ref.get());
+		objectIndex_[a_ref.get()] = entry.get();
 		objects_.push_back(std::move(entry));
 	}
 
@@ -957,6 +1149,8 @@ namespace RayTracingScene
 		for (auto& shape : a_object.shapes)
 			ReleaseShape(a_backend, shape);
 		a_object.shapes.clear();
+		if (a_object.ref)
+			refGrave_.push_back(std::move(a_object.ref));
 	}
 
 	void Scene::UpdateObjects(RayTracingRT::Backend& a_backend, std::int64_t a_deadline, bool a_allowNewMeshes)
@@ -991,7 +1185,9 @@ namespace RayTracingScene
 		// 2. Scan the captured cells' references (one cell after the other, a slice per frame) for
 		//    objects not captured yet: the first capture of a cell, items dropped later, objects
 		//    whose 3D changed.
-		constexpr std::size_t kScanPerFrame = 512;
+		// (45j) 512 -> 128 references per frame: the scan never stops (items dropped later are found by
+		// it), so its cost is paid every frame.
+		constexpr std::size_t kScanPerFrame = 128;
 		std::size_t scanned = 0;
 		while (scanned < kScanPerFrame && Qpc() < a_deadline) {
 			if (scanCursor_ >= scanList_.size()) {
@@ -1027,12 +1223,20 @@ namespace RayTracingScene
 			}
 			if (kind != RefKind::Movable && kind != RefKind::Item && kind != RefKind::Tree)
 				continue;
+			// (45j) Categories: doors / items with Objects, trees with Trees or ray-traced Foliage,
+			// statics with a Havok-driven part with Buildings.
+			if (kind == RefKind::Tree ? !(config_.trees || config_.foliage != FoliageMode::ShadowMap) :
+			                            (Classify(ref) == RefKind::Capture ? !config_.buildings : !config_.objects))
+				continue;
 			if (ref->IsDisabled() || ref->IsDeleted())
 				continue;
 			auto* root = ref->Get3D();
 			if (!root || IsEditorMarker(root))
 				continue;
+			const std::int64_t captureStart = Qpc();
 			CaptureObjectRef(a_backend, refPtr, root, ToObjectKind(kind), a_allowNewMeshes);
+			times_.objectCapture += static_cast<float>(static_cast<double>(Qpc() - captureStart) * QpcMs());
+			++times_.objectsCaptured;
 			auto* parent = ref->GetParentCell();
 			if (!parent || std::none_of(cells_.begin(), cells_.end(), [&](const std::unique_ptr<Cell>& a_cell) { return a_cell->cell == parent; }))
 				++stats_.persistentObjects;
@@ -1044,7 +1248,10 @@ namespace RayTracingScene
 		stats_.objects.registeredShapes = 0;
 		for (auto& object : objects_) {
 			for (auto& shape : object->shapes) {
-				if (!shape.registered && a_backend.IsBlasBuilt(shape.blas) && (!shape.alpha || a_backend.IsAlphaTextureReady(shape.texture))) {
+				if (!shape.ready && a_backend.IsBlasBuilt(shape.blas) && (!shape.alpha || a_backend.IsAlphaTextureReady(shape.texture)))
+					shape.ready = true;
+				// (45j) Foliage "Both": traced, and still drawn into the cascades (the darker of both wins).
+				if (shape.ready && !shape.registered && !(shape.foliage && config_.foliage == FoliageMode::Both)) {
 					RayTracingCasterFilter::Add(shape.geometry.get());
 					shape.registered = true;
 				}
@@ -1088,8 +1295,24 @@ namespace RayTracingScene
 		while (a_cell.cursor < a_cell.pending.size()) {
 			if (Qpc() >= a_deadline)
 				break;
-			auto& refPtr = a_cell.pending[a_cell.cursor++];
+			auto& refPtr = a_cell.pending[a_cell.cursor];
 			auto* ref = refPtr.get();
+			// (45j) A reference whose capture ran out of time last frame resumes at its next shape.
+			if (a_cell.shapeSkip > 0) {
+				auto* root = ref ? ref->Get3D() : nullptr;
+				if (!root || root != a_cell.resumeRoot) {
+					// Its 3D changed meanwhile: the tracked entry triggers a recapture of the cell.
+					a_cell.shapeSkip = 0;
+					a_cell.resumeRoot = nullptr;
+					++a_cell.cursor;
+					continue;
+				}
+				if (!CaptureResumable(a_cell, root, a_deadline))
+					break;
+				++a_cell.cursor;
+				continue;
+			}
+			++a_cell.cursor;
 			if (!ref)
 				continue;
 			switch (Classify(ref)) {
@@ -1110,6 +1333,11 @@ namespace RayTracingScene
 			auto* root = ref->Get3D();
 			// Tracked either way: a reference that gets its 3D or is enabled later triggers a recapture.
 			a_cell.tracked.push_back(TrackedRef{ refPtr, root, disabled });
+			{
+				auto& entry = trackedRefs_[ref];  // (45j) missed-caster index
+				++entry.count;
+				entry.root = root;
+			}
 			if (disabled || !root) {
 				++skipped.disabled;
 				continue;
@@ -1126,7 +1354,13 @@ namespace RayTracingScene
 				continue;
 			}
 			physicsRefs_.erase(ref);
-			CaptureObject(a_cell, root, 0);
+			// (45j) Nothing of a static is wanted when Buildings and every cut-out kind are off.
+			if (!config_.buildings && AlphaKinds() == 0)
+				continue;
+			if (!CaptureResumable(a_cell, root, a_deadline)) {
+				--a_cell.cursor;  // resumed next frame at the shape that did not fit
+				break;
+			}
 		}
 
 		if (a_cell.cursor >= a_cell.pending.size() && !a_cell.landDone && Qpc() < a_deadline) {
@@ -1158,6 +1392,10 @@ namespace RayTracingScene
 	void Scene::Update(RayTracingRT::Backend& a_backend, float a_budgetMs, std::uint32_t a_frame)
 	{
 		const std::int64_t frameStart = Qpc();
+		times_.objectCapture = 0.0f;
+		times_.objectsCaptured = 0;
+		times_.recaptures = 0;
+		times_.gridDiff = times_.gather = times_.registration = times_.objects = 0.0f;
 		currentFrame_ = a_frame;
 		if (flushRequested_.exchange(false)) {
 			ReleaseAll(a_backend);
@@ -1168,6 +1406,7 @@ namespace RayTracingScene
 			if (!cells_.empty())
 				ReleaseAll(a_backend);
 			stats_.lastGatherMs = 0.0f;
+			times_.update = 0.0f;
 			return;
 		}
 
@@ -1226,6 +1465,7 @@ namespace RayTracingScene
 				if (!cell->dirty || cell->replacing || a_frame - cell->completedFrame < kRecaptureFrames)
 					continue;
 				++stats_.recaptures;
+				++times_.recaptures;
 				cell->dirty = false;
 				cell->replacing = true;
 				auto entry = std::make_unique<Cell>();
@@ -1255,6 +1495,8 @@ namespace RayTracingScene
 			cells_.push_back(std::move(entry));
 		}
 
+		const std::int64_t gatherStart = Qpc();
+		times_.gridDiff = static_cast<float>(static_cast<double>(gatherStart - frameStart) * QpcMs());
 		// 4. Capture, nearest cells first, within the budget.
 		RE::NiPoint3 eye{};
 		if (auto* camera = RE::Main::WorldRootCamera())
@@ -1281,6 +1523,8 @@ namespace RayTracingScene
 				break;
 		}
 
+		const std::int64_t registrationStart = Qpc();
+		times_.gather = static_cast<float>(static_cast<double>(registrationStart - gatherStart) * QpcMs());
 		// 5. Caster filter: a cell's shapes leave the cascades once all its BLASes are built.
 		// Registration happens here, before this frame's trace: a registered cell is built, so it is
 		// in this frame's TLAS and in every later one until EndFrame releases it.
@@ -1304,7 +1548,9 @@ namespace RayTracingScene
 			}
 			// (45h) The cell's alpha shapes, each once its BLAS and texture are ready (then traced).
 			for (auto& shape : cell->alphaShapes) {
-				if (!shape.registered && a_backend.IsBlasBuilt(shape.blas) && a_backend.IsAlphaTextureReady(shape.texture)) {
+				if (!shape.ready && a_backend.IsBlasBuilt(shape.blas) && a_backend.IsAlphaTextureReady(shape.texture))
+					shape.ready = true;
+				if (shape.ready && !shape.registered && !(shape.foliage && config_.foliage == FoliageMode::Both)) {
 					RayTracingCasterFilter::Add(shape.geometry.get());
 					shape.registered = true;
 				}
@@ -1331,15 +1577,18 @@ namespace RayTracingScene
 				++cellsReady_;
 		}
 
+		const std::int64_t objectsStart = Qpc();
+		times_.registration = static_cast<float>(static_cast<double>(objectsStart - registrationStart) * QpcMs());
 		// 6. (45e) Objects with their own instances (doors, items, trees): validation, scan, filter.
 		UpdateObjects(a_backend, deadline, a_budgetMs > 0.0f);
+		times_.objects = static_cast<float>(static_cast<double>(Qpc() - objectsStart) * QpcMs());
 
 		// (45h) Alpha shapes held / traced now.
 		stats_.alpha.captured = stats_.alpha.registered = 0;
 		for (const auto& cell : cells_) {
 			for (const auto& shape : cell->alphaShapes) {
 				++stats_.alpha.captured;
-				stats_.alpha.registered += shape.registered ? 1 : 0;
+				stats_.alpha.registered += shape.ready ? 1 : 0;
 			}
 		}
 		for (const auto& object : objects_) {
@@ -1347,16 +1596,18 @@ namespace RayTracingScene
 				if (!shape.alpha)
 					continue;
 				++stats_.alpha.captured;
-				stats_.alpha.registered += shape.registered ? 1 : 0;
+				stats_.alpha.registered += shape.ready ? 1 : 0;
 			}
 		}
 
 		stats_.lastGatherMs = static_cast<float>(static_cast<double>(Qpc() - frameStart) * QpcMs());
+		times_.update = stats_.lastGatherMs;
 		stats_.maxGatherMs = std::max(stats_.maxGatherMs, stats_.lastGatherMs);
 	}
 
 	void Scene::CollectInstances(std::vector<RayTracingRT::Instance>& o_instances, bool a_expected) const
 	{
+		const std::int64_t start = Qpc();
 		o_instances.clear();
 		// Retiring captures too: they are traced this frame and released after it.
 		for (const auto* list : { &cells_, &retiring_ }) {
@@ -1394,12 +1645,47 @@ namespace RayTracingScene
 		}
 		AppendObjectInstances(objects_, o_instances, a_expected);
 		AppendObjectInstances(retiringObjects_, o_instances, a_expected);
+		times_.instances = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+	}
+
+	void Scene::RefreshPersistent(bool a_force) const
+	{
+		auto* tes = RE::TES::GetSingleton();
+		auto* worldSpace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
+		auto* sky = worldSpace ? worldSpace->GetSkyCell() : nullptr;
+		if (!sky) {
+			persistent_ = {};
+			return;
+		}
+		auto& data = sky->GetRuntimeData();
+		const std::size_t count = data.references.size();
+		// Rebuilt when the persistent cell is another one, or its reference list changed (at most
+		// every 4 s for the object scan; a cell capture asks with a_force).
+		if (persistent_.sky == sky && persistent_.references == count)
+			return;
+		if (persistent_.sky == sky && !a_force && currentFrame_ - persistent_.builtFrame < 240)
+			return;
+		persistent_.sky = sky;
+		persistent_.references = count;
+		persistent_.builtFrame = currentFrame_;
+		persistent_.bySquare.clear();
+		RE::BSSpinLockGuard lock(data.spinLock);
+		for (const auto& ref : data.references) {
+			if (!ref)
+				continue;
+			const auto position = ref->GetPosition();
+			if (!std::isfinite(position.x) || !std::isfinite(position.y))
+				continue;
+			const auto x = static_cast<std::int32_t>(std::floor(position.x / kCellUnits));
+			const auto y = static_cast<std::int32_t>(std::floor(position.y / kCellUnits));
+			const std::uint64_t key = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32) | static_cast<std::uint32_t>(y);
+			persistent_.bySquare[key].push_back(ref);
+		}
 	}
 
 	void Scene::CollectCellRefs(RE::TESObjectCELL* a_cell, std::int32_t a_x, std::int32_t a_y, std::vector<RE::NiPointer<RE::TESObjectREFR>>& o_refs,
 		std::uint32_t* o_persistent) const
 	{
-		const std::size_t start = o_refs.size();
 		{
 			auto& data = a_cell->GetRuntimeData();
 			RE::BSSpinLockGuard lock(data.spinLock);
@@ -1413,25 +1699,15 @@ namespace RayTracingScene
 		// (45f) Persistent references of an exterior worldspace are held by its persistent ("sky")
 		// cell, not by the grid cell they stand in (CommonLib's TES::ForEachReferenceInRange walks
 		// both for that reason). They are taken with the grid cell whose square holds them.
-		auto* tes = RE::TES::GetSingleton();
-		auto* worldSpace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
-		auto* sky = worldSpace ? worldSpace->GetSkyCell() : nullptr;
-		if (!sky || sky == a_cell)
+		// (45j) From an index by square (a cell capture refreshes it, the object scan reuses it).
+		RefreshPersistent(o_persistent != nullptr);
+		if (!persistent_.sky || persistent_.sky == a_cell)
 			return;
-		ankerl::unordered_dense::set<const RE::TESObjectREFR*> own;
-		own.reserve(o_refs.size() - start);
-		for (std::size_t i = start; i < o_refs.size(); ++i)
-			own.insert(o_refs[i].get());
-		const double minX = static_cast<double>(a_x) * kCellUnits, minY = static_cast<double>(a_y) * kCellUnits;
-		auto& data = sky->GetRuntimeData();
-		RE::BSSpinLockGuard lock(data.spinLock);
-		for (const auto& ref : data.references) {
-			if (!ref || own.contains(ref.get()))
-				continue;
-			const auto position = ref->GetPosition();
-			const double px = position.x, py = position.y;
-			if (px < minX || px >= minX + kCellUnits || py < minY || py >= minY + kCellUnits)
-				continue;
+		const std::uint64_t key = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(a_x)) << 32) | static_cast<std::uint32_t>(a_y);
+		const auto it = persistent_.bySquare.find(key);
+		if (it == persistent_.bySquare.end())
+			return;
+		for (const auto& ref : it->second) {
 			o_refs.push_back(ref);
 			if (o_persistent)
 				++*o_persistent;
@@ -1479,6 +1755,13 @@ namespace RayTracingScene
 	void Scene::DescribeMissedCasters()
 	{
 		const std::int64_t now = Qpc();
+		struct ScopeTimer
+		{
+			float& out;
+			std::int64_t start;
+			~ScopeTimer() { out = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs()); }
+		} scopeTimer{ times_.missed, now };
+		times_.missedJudged = 0;
 		auto flushLog = [&] {
 			if (static_cast<double>(now - missedWindowStart_) * QpcMs() > kMissedLogWindowMs) {
 				missedWindowStart_ = now;
@@ -1510,10 +1793,20 @@ namespace RayTracingScene
 			}
 		};
 
+		constexpr std::uint32_t kMissedPerFrame = 8;
+		const std::int64_t deadline = now + static_cast<std::int64_t>(0.25 / std::max(QpcMs(), 1e-9));
+		std::uint32_t examined = 0;
 		for (const auto& pointer : missed) {
 			auto* geometry = pointer.get();
 			if (!geometry || missedJudged_.contains(geometry))
 				continue;
+			// (45j) A few per frame: the rest are noted again the next time they are drawn.
+			if (examined >= kMissedPerFrame || (examined > 0 && Qpc() >= deadline)) {
+				RayTracingCasterFilter::ForgetMissed(geometry);
+				continue;
+			}
+			++examined;
+			++times_.missedJudged;
 			// The reference that owns the shape: the nearest node carrying it as its own user data.
 			RE::TESObjectREFR* ref = nullptr;
 			RE::NiAVObject* root = nullptr;
@@ -1533,7 +1826,10 @@ namespace RayTracingScene
 			}
 			const bool objectKind = kind == RefKind::Movable || kind == RefKind::Item || kind == RefKind::Tree || physics;
 			MissReason bucket = MissReason::Other;
-			const char* shapeReason = ShapeRejectReason(geometry, kind == RefKind::Tree, kind != RefKind::Tree && cutoutAsOpaque_, nullptr, &bucket, alphaCasters_);
+			const char* shapeReason = ShapeRejectReason(geometry, kind == RefKind::Tree, kind != RefKind::Tree && config_.cutoutAsOpaque, nullptr, &bucket, AlphaKinds());
+			// (45j) Kinds left to the shadow map on purpose (Ray Tracing > Advanced).
+			const bool byChoice = (kind == RefKind::Tree && !config_.trees) || ((kind == RefKind::Movable || kind == RefKind::Item) && !config_.objects) ||
+			                      ((kind == RefKind::Capture || physics) && !config_.buildings);
 			auto* parent = ref ? ref->GetParentCell() : nullptr;
 			const bool persistentCell = parent && parent == sky;
 			const Cell* square = ref ? CapturedCellOf(ref) : nullptr;
@@ -1547,6 +1843,9 @@ namespace RayTracingScene
 			} else if (kind == RefKind::Actor) {
 				bucket = MissReason::Character;
 				verdict = "character (not traced)";
+			} else if (byChoice && !shapeReason) {
+				bucket = MissReason::ByChoice;
+				verdict = "left to the shadow map by the Advanced settings";
 			} else if (shapeReason) {
 				verdict = std::format("shape rejected: {}", shapeReason);
 			} else if (kind == RefKind::Other) {
@@ -1560,23 +1859,14 @@ namespace RayTracingScene
 				pending = true;  // its cell is being (re)captured
 			} else {
 				// In a cell chunk already (its BLAS still building, or it moved out of its old bound)?
-				bool inChunk = false;
-				for (const auto* list : { &cells_, &retiring_ }) {
-					for (const auto& cell : *list) {
-						for (const auto& g : cell->geometries)
-							inChunk = inChunk || g.get() == geometry;
-						for (const auto& s : cell->alphaShapes)  // (45h) texture copy or BLAS still pending
-							inChunk = inChunk || s.geometry.get() == geometry;
-					}
-				}
+				// (45h) An alpha shape whose texture copy or BLAS is still pending counts too.
+				// (45j) Looked up in an index instead of walking every captured shape.
+				const bool inChunk = capturedGeometries_.contains(geometry);
 				if (inChunk) {
 					pending = true;
 				} else if (objectKind) {
-					if (objectIndex_.contains(ref)) {
-						const ObjectRef* entry = nullptr;
-						for (const auto& object : objects_)
-							if (object->ref.get() == ref)
-								entry = object.get();
+					if (const auto found = objectIndex_.find(ref); found != objectIndex_.end()) {
+						const ObjectRef* entry = found->second;
 						bool hasShape = false;
 						if (entry)
 							for (const auto& s : entry->shapes)
@@ -1596,14 +1886,9 @@ namespace RayTracingScene
 						verdict = "the object scan never took the reference";
 					}
 				} else {
-					bool tracked = false, trackedSameRoot = false;
-					for (const auto* list : { &cells_, &retiring_ })
-						for (const auto& cell : *list)
-							for (const auto& entry : cell->tracked)
-								if (entry.ref.get() == ref) {
-									tracked = true;
-									trackedSameRoot = trackedSameRoot || entry.root == ref->Get3D();
-								}
+					const auto trackedIt = trackedRefs_.find(ref);
+					const bool tracked = trackedIt != trackedRefs_.end();
+					const bool trackedSameRoot = tracked && trackedIt->second.root == ref->Get3D();
 					if (tracked && trackedSameRoot) {
 						bucket = MissReason::ShapeSkipped;
 						auto* data = geometry->GetGeometryRuntimeData().rendererData;
@@ -1632,7 +1917,8 @@ namespace RayTracingScene
 				continue;
 			}
 			missedJudged_.insert(geometry);
-			++stats_.missedConfirmed;
+			if (bucket != MissReason::ByChoice)
+				++stats_.missedConfirmed;
 			++stats_.missedByReason[static_cast<int>(bucket)];
 			if (shapeReason)
 				++stats_.missedRejected;
@@ -1641,7 +1927,7 @@ namespace RayTracingScene
 
 			// The log: every distinct reference + shape once per session, except characters and the
 			// leaves of trees (expected), rate-limited through a short backlog.
-			if (bucket == MissReason::Character || (kind == RefKind::Tree && shapeReason) || stats_.missedDescribed >= kMissedLogCap)
+			if (bucket == MissReason::Character || bucket == MissReason::ByChoice || bucket == MissReason::AlphaTested || (kind == RefKind::Tree && shapeReason) || stats_.missedDescribed >= kMissedLogCap)
 				continue;
 			const std::string_view shapeName = geometry->name.c_str() ? std::string_view(geometry->name.c_str()) : std::string_view();
 			if (missedBacklog_.size() >= 64 || !missedLogged_.insert(MissKey(ref ? ref->GetFormID() : 0, shapeName)).second)
@@ -1663,12 +1949,15 @@ namespace RayTracingScene
 
 	void Scene::EndFrame(RayTracingRT::Backend& a_backend)
 	{
+		const std::int64_t start = Qpc();
 		for (auto& cell : retiring_)
 			Release(a_backend, *cell);
 		retiring_.clear();
 		for (auto& object : retiringObjects_)
 			ReleaseObject(a_backend, *object);
 		retiringObjects_.clear();
+		times_.endFrame = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+		DrainGraves(0.3);
 	}
 
 	bool Scene::GetLoadedRect(float o_rect[4], bool a_includeRetiring) const

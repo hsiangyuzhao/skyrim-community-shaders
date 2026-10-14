@@ -31,6 +31,7 @@ struct TraceConstants
 	float4 RenderSize;               // xy render size in pixels, zw 1/size
 	float4 Rect;                     // camera-relative xy min / max of the traced area
 	float4 Bias;                     // x constant bias, y bias per unit of distance, z coverage probe length
+	float4 World;                    // (45j) xyz camera world position (world-locked noise), w unused
 };
 
 ConstantBuffer<TraceConstants> C : register(b0);
@@ -40,6 +41,13 @@ RWTexture2D<unorm float4> Output : register(u0);
 
 static const uint kFlagSkipShadowed = 1u;  // engine mask already 0: min() keeps 0, skip the rays
 static const uint kFlagCoverage = 2u;      // also probe whether the surface itself is ray-traceable
+// (45j) Runtime switches (RayTracing.cpp); each one off = the 45i behaviour.
+static const uint kFlagWorldNoise = 8u;        // ray jitter seeded by the world position (stable while the camera moves)
+static const uint kFlagStableNormal = 16u;     // depth-edge pixels use the view direction as normal
+static const uint kFlagAlphaFootprint = 32u;   // alpha mip from the hit distance only (camera independent), finer mips
+// Output.w (45j): bit flags as unorm8 (value / 255).
+static const uint kOutAlphaCandidate = 1u;     // a sun ray met an alpha-tested (cut-out) candidate
+static const uint kOutCharacter = 2u;          // a sun ray was blocked by a character
 #if defined(RT_CHARACTERS)
 static const uint kFlagFirstPerson = 4u;             // (45i) player in first person: no character ray for near pixels
 static const uint kSceneMask = 0x01u;                // every instance but characters
@@ -62,6 +70,32 @@ float InterleavedGradientNoise(float2 p, uint frame)
 {
 	p += float(frame % 64u) * 5.588238;
 	return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+// (45j) World-locked jitter: a hash of the world position snapped to a cell about one pixel wide
+// (power-of-two cell sizes, so the pattern only changes where the distance crosses a band). The
+// same surface point keeps its rays while the camera moves: no crawling noise for the upscaler.
+uint HashUint(uint x)
+{
+	x ^= x >> 16;
+	x *= 0x7feb352du;
+	x ^= x >> 15;
+	x *= 0x846ca68bu;
+	x ^= x >> 16;
+	return x;
+}
+
+float2 WorldNoise(float3 P, float dist)
+{
+	const float footprint = max(dist * C.RenderSize.w * 1.2, 0.25);
+	const float band = ceil(log2(footprint));
+	const float cell = exp2(band);
+	const float3 world = P + C.World.xyz;
+	const int3 q = int3(floor(world / cell));
+	uint h = HashUint(asuint(q.x) ^ HashUint(asuint(q.y) ^ HashUint(asuint(q.z) ^ asuint(int(band) + 64))));
+	const float a = float(h & 0xFFFFu) / 65536.0;
+	const float b = float(h >> 16) / 65536.0;
+	return float2(a, b);
 }
 
 #if defined(RT_ALPHA)
@@ -117,11 +151,16 @@ bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
 	if (!all(isfinite(uv)))
 		return true;
 	// Never below 64 texels across: coarser mips average the cut-out away (alpha-test fade).
+	// (45j, kFlagAlphaFootprint) Never below 256 texels, the 256x256 copies always at their top
+	// mip, and the threshold eased a little with the mip so thin leaves keep their coverage.
+	const bool fineMips = (asuint(C.Params.z) & kFlagAlphaFootprint) != 0u;
+	const float minTexels = fineMips ? 256.0 : 64.0;
 	const float footprintUV = max(footprint, 1e-3) / kAlphaTextureWorld;
 	float alpha;
+	float lod;
 	[branch] if (info.Texture & kAlphaFallbackBit)
 	{
-		const float lod = clamp(log2(256.0 * footprintUV) + 0.5, 0.0, 2.0);
+		lod = fineMips ? 0.0 : clamp(log2(256.0 * footprintUV) + 0.5, 0.0, 2.0);
 		alpha = AlphaLayers.SampleLevel(AlphaSampler, float3(uv, float(info.Texture & 0xFFFFu)), lod);
 	}
 	else
@@ -129,14 +168,15 @@ bool AlphaBlocks(uint instanceID, uint primitive, float2 bary, float footprint)
 		uint width, height, levels;
 		AlphaTextures[NonUniformResourceIndex(info.Texture)].GetDimensions(0u, width, height, levels);
 		const float size = float(max(width, height));
-		const float maxLod = clamp(log2(size / 64.0), 0.0, max(float(levels) - 1.0, 0.0));
-		const float lod = clamp(log2(size * footprintUV) + 0.5, 0.0, maxLod);
+		const float maxLod = clamp(log2(size / minTexels), 0.0, max(float(levels) - 1.0, 0.0));
+		lod = clamp(log2(size * footprintUV) + 0.5, 0.0, maxLod);
 		alpha = AlphaTextures[NonUniformResourceIndex(info.Texture)].SampleLevel(AlphaSampler, uv, lod).a;
 	}
-	return alpha * info.AlphaScale * vertexAlpha >= info.Threshold;
+	const float threshold = fineMips ? info.Threshold * saturate(1.0 - 0.06 * lod) : info.Threshold;
+	return alpha * info.AlphaScale * vertexAlpha >= threshold;
 }
 
-bool AnyHit(float3 origin, float3 direction, float tMax, float footprint)
+bool AnyHit(float3 origin, float3 direction, float tMax, float footprint, inout uint outFlags)
 {
 	RayDesc ray;
 	ray.Origin = origin;
@@ -149,6 +189,7 @@ bool AnyHit(float3 origin, float3 direction, float tMax, float footprint)
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
 			continue;
+		outFlags |= kOutAlphaCandidate;
 		// Opaque triangles end the search on their own; a kept cut-out triangle ends it too.
 		if (budget == 0u || AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(),
 								footprint + q.CandidateTriangleRayT() * C.ToSun.w))
@@ -297,8 +338,9 @@ bool CharacterClosestHit(float3 origin, float3 direction, float tMax, out float 
 	const int2 pl = int2(max(p.x - 1, 0), p.y), pr = int2(min(p.x + 1, maxP.x), p.y);
 	const int2 pu = int2(p.x, max(p.y - 1, 0)), pd = int2(p.x, min(p.y + 1, maxP.y));
 	const float dl = abs(DepthMask[pl]), dr = abs(DepthMask[pr]), du = abs(DepthMask[pu]), dd = abs(DepthMask[pd]);
-	const float3 dx = abs(dl - depth) < abs(dr - depth) ? P - PositionAt(pl, dl) : PositionAt(pr, dr) - P;
-	const float3 dy = abs(du - depth) < abs(dd - depth) ? P - PositionAt(pu, du) : PositionAt(pd, dd) - P;
+	const float3 Pl = PositionAt(pl, dl), Pr = PositionAt(pr, dr), Pu = PositionAt(pu, du), Pd = PositionAt(pd, dd);
+	const float3 dx = abs(dl - depth) < abs(dr - depth) ? P - Pl : Pr - P;
+	const float3 dy = abs(du - depth) < abs(dd - depth) ? P - Pu : Pd - P;
 	float3 N = cross(dy, dx);
 	const float nLen = length(N);
 	const float dist = length(P);
@@ -306,9 +348,22 @@ bool CharacterClosestHit(float3 origin, float3 direction, float tMax, out float 
 	N = nLen > 1e-12 ? N / nLen : V;
 	if (dot(N, V) < 0.0)
 		N = -N;
+	// (45j, kFlagStableNormal) A pixel whose neighbours on one axis BOTH jump in distance (a thin
+	// leaf, a blade, the silhouette of a branch) has no usable depth normal: the one picked flips
+	// with the jitter from frame to frame. The view direction is used there instead.
+	if (flags & kFlagStableNormal) {
+		const float tol = dist * 0.02 + 4.0;
+		const bool edgeX = abs(length(Pl) - dist) > tol && abs(length(Pr) - dist) > tol;
+		const bool edgeY = abs(length(Pu) - dist) > tol && abs(length(Pd) - dist) > tol;
+		if (edgeX || edgeY)
+			N = V;
+	}
 
 	const float bias = C.Bias.x + C.Bias.y * dist;
 	const float3 L = normalize(C.ToSun.xyz);
+	// (45j, kFlagAlphaFootprint) The cut-out mip depends on the hit distance only, not on how far
+	// the receiving pixel is from the camera.
+	const float footprint0 = (flags & kFlagAlphaFootprint) ? 0.5 : dist * C.RenderSize.w * 1.2;
 
 	// (45e) Coverage = a primary ray along this pixel's view ray, compared with the game's depth.
 	// The segment starts `reach` in front of the visible surface (so first-person arms and the
@@ -356,19 +411,28 @@ bool CharacterClosestHit(float3 origin, float3 direction, float tMax, out float 
 
 	const float3 origin = P + N * bias + L * (bias * 0.5);
 
-	// Cone around the light direction (sun disc softness), jittered per pixel and per frame.
+	// Cone around the light direction (sun disc softness), jittered per pixel (and per frame, or
+	// per world position with kFlagWorldNoise).
 	const float3 helper = abs(L.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
 	const float3 T = normalize(cross(helper, L));
 	const float3 B = cross(L, T);
 	const uint rays = max(uint(C.Params.x), 1u);
 	const uint frame = uint(C.Params.y);
-	const float n0 = InterleavedGradientNoise(float2(p), frame);
-	const float n1 = InterleavedGradientNoise(float2(p.yx) + 17.0, frame + 7u);
+	float n0, n1;
+	if (flags & kFlagWorldNoise) {
+		const float2 n = WorldNoise(P, dist);
+		n0 = n.x;
+		n1 = n.y;
+	} else {
+		n0 = InterleavedGradientNoise(float2(p), frame);
+		n1 = InterleavedGradientNoise(float2(p.yx) + 17.0, frame + 7u);
+	}
 #if defined(RT_CHARACTERS)
 	const bool characterRay = !((flags & kFlagFirstPerson) && dist < kFirstPersonNear);
 #endif
 
 	uint hits = 0;
+	uint outFlags = 0u;
 	[loop] for (uint i = 0; i < rays; ++i)
 	{
 		const float u1 = frac(n0 + float(i) * 0.6180340);
@@ -379,19 +443,21 @@ bool CharacterClosestHit(float3 origin, float3 direction, float tMax, out float 
 		const float3 dir = normalize(L + (T * c + B * s) * r);
 #if defined(RT_CHARACTERS)
 #	if defined(RT_ALPHA)
-		bool blocked = AnyHit(origin, dir, C.Params.w, dist * C.RenderSize.w * 1.2);
+		bool blocked = AnyHit(origin, dir, C.Params.w, footprint0, outFlags);
 #	else
 		bool blocked = AnyHit(origin, dir, C.Params.w);
 #	endif
-		if (!blocked && characterRay)
-			blocked = CharacterAnyHit(origin, dir, C.Bias.w, C.Params.w, dist * C.RenderSize.w * 1.2);
+		if (!blocked && characterRay) {
+			blocked = CharacterAnyHit(origin, dir, C.Bias.w, C.Params.w, footprint0);
+			outFlags |= blocked ? kOutCharacter : 0u;
+		}
 		hits += blocked ? 1u : 0u;
 #elif defined(RT_ALPHA)
-		hits += AnyHit(origin, dir, C.Params.w, dist * C.RenderSize.w * 1.2) ? 1u : 0u;
+		hits += AnyHit(origin, dir, C.Params.w, footprint0, outFlags) ? 1u : 0u;
 #else
 		hits += AnyHit(origin, dir, C.Params.w) ? 1u : 0u;
 #endif
 	}
 
-	Output[p] = float4(1.0 - float(hits) / float(rays), coverage, hitDelta, 0.0);
+	Output[p] = float4(1.0 - float(hits) / float(rays), coverage, hitDelta, float(outFlags) / 255.0);
 }

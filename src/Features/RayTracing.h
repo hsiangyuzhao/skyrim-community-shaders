@@ -62,22 +62,50 @@ public:
 		Count
 	};
 
+	/// (45j) Screen Space Shadows inside the ray-traced area.
+	enum class SSSMode : int
+	{
+		Combine = 0,  // kept; merged with the mask as min() (grass, leaves, characters keep their contact shadows)
+		HandOff = 1,  // faded out (45i): the ray tracer alone (grass loses its contact shadows)
+		Keep = 2      // kept and multiplied as with Ray Tracing off (shared shadows get darker twice)
+	};
+
 	struct Settings
 	{
 		bool Enabled = false;
 		int QualityLevel = static_cast<int>(Quality::Medium);
 		// Debug A/B switches (persisted so a test survives a restart).
 		bool KeepCastersInShadowMap = false;
-		bool KeepScreenSpaceShadows = false;
+		bool KeepScreenSpaceShadows = false;  // (45i key, read once by the 45j migration: true = SSS mode Keep)
 		// (45g) Large one-sided alpha-tested shapes with an edge-only cutout (roof tiles) are RT occluders.
 		bool CutoutAsOpaque = true;
-		// (45h) Alpha-tested shapes (leaves, bushes, banners, fences) traced with their cut-out.
+		// (45h key) Alpha-tested casters: read once by the 45j migration (now Foliage / Cut-outs).
 		bool AlphaCasters = false;
-		// (45i) Characters (skinned bodies, clothes, armour, weapons) and their physics parts (HDT-SMP, hair).
-		bool Characters = false;
-		bool PhysicsParts = false;
+		// (45i, 45j) Per kind of object: ray traced (true) or the shadow map + screen-space shadows.
+		bool Characters = true;
+		bool PhysicsParts = true;  // HDT-SMP / HDT-PE parts other than hair (capes, skirts)
 		bool KeepCharactersInShadowMap = false;  // debug A/B
 		float CharacterSelfShadowOffset = 6.0f;  // debug: hits on characters nearer than this are ignored (units)
+		// (45j) Ray Tracing > Advanced.
+		int SettingsVersion = 2;  // 45j migration marker (absent in older JSON)
+		bool Buildings = true;
+		bool Objects = true;
+		bool Trees = false;
+		int Foliage = 0;           // RayTracingScene::FoliageMode
+		bool Cutouts = false;      // fences, banners, grilles: traced with their cut-out
+		bool Hair = false;
+		bool FirstPersonPlayer = false;  // the player stays traced in first person
+		int ScreenSpaceShadows = static_cast<int>(SSSMode::Combine);
+		bool KeepSSSUnderFoliage = true;  // hand-off mode: not under leaves
+		bool WorldLockedNoise = true;
+		bool Temporal = false;
+		bool StableNormals = true;
+		bool FineAlphaMips = true;
+		// (45j) Game textures created shareable for ray-traced cut-outs (off: 256x256 copies only). Off by
+		// default: every 45i trace (Ray Tracing on or off, in sessions started with Alpha-tested casters on)
+		// moved the GPU wait from Present into a Map, the only always-on difference from 45d being the
+		// thousands of shareable textures; under test as a suspect.
+		bool ShareGameTextures = false;
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted
@@ -122,14 +150,19 @@ public:
 		std::uint32_t instances = 0;
 	};
 	[[nodiscard]] TraceSample GetTraceSample() const { return traceSample; }
+	/// (45j) One line of the switches that matter for a profile (trace / F12 JSON headers).
+	std::string DescribeForProfile() const;
+	nlohmann::json DescribeJson() const;
 
 private:
 	struct alignas(16) CombineCB
 	{
 		float InvViewProj[16];
 		float Rect[4];       // camera-relative xy min / max of the ray-traced area
-		float Band[4];       // x hand-off band width, y filter radius (px), z flags (bits), w unused
+		float Band[4];       // x hand-off band width, y filter radius (px), z flags (bits), w temporal blend
 		std::uint32_t Size[4];  // render width, height, debug view, frame
+		float PrevViewProj[16];  // (45j) last combined frame's CameraViewProj
+		float CameraDelta[4];    // (45j) camera position now minus then
 	};
 	STATIC_ASSERT_ALIGNAS_16(CombineCB);
 
@@ -160,6 +193,23 @@ private:
 	winrt::com_ptr<ID3D11Texture2D> debugColor;  // debug view colour + opacity (RGBA8), written by CombineCS
 	winrt::com_ptr<ID3D11UnorderedAccessView> debugColorUAV;
 	winrt::com_ptr<ID3D11ShaderResourceView> debugColorSRV;
+	// (45j) Temporal: ping-pong history (r visibility, g distance), last camera.
+	winrt::com_ptr<ID3D11Texture2D> history[2];
+	winrt::com_ptr<ID3D11ShaderResourceView> historySRV[2];
+	winrt::com_ptr<ID3D11UnorderedAccessView> historyUAV[2];
+	std::uint32_t historyIndex = 0;
+	bool historyValid = false;
+	float prevViewProj[16]{};
+	double prevCamera[3]{};
+	bool EnsureHistory();
+	// (45j) CPU split of the last frame (also in the F7 trace), smoothed and worst for the page.
+	struct CpuSplit
+	{
+		float total = 0, scene = 0, characters = 0, instances = 0, missed = 0, execute = 0, d3d11 = 0, endFrame = 0;
+	};
+	CpuSplit cpuLast{}, cpuSmoothed{}, cpuWorst{};
+	void PublishCpuSplit();
+	RayTracingScene::SceneConfig SceneConfigFromSettings() const;
 	D3D11_TEXTURE2D_DESC maskDesc{};
 	std::uint64_t d3d11Bytes = 0;
 	bool typedUavLoadR8 = false;
@@ -181,8 +231,8 @@ private:
 	bool overVramBudget = false;
 	Status loggedStatus = Status::Off;
 	std::int64_t lastTlasLog = 0;  // (45f) QPC of the last TLAS summary in the log (0 = log on the next active frame)
-	// (45h) Alpha-tested casters: the switch as last seen (a change by the user clears an old fault)
-	// and why it was switched off automatically (shown on the page).
+	// (45h) Alpha-tested casters (45j: Foliage / Cut-outs): as last seen (a change by the user clears an
+	// old fault) and why they were switched off automatically (shown on the page).
 	bool alphaRequested = false;
 	std::string alphaOffReason;
 	void UpdateAlphaCasters();
