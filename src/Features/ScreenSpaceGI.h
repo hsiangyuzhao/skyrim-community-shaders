@@ -203,11 +203,23 @@ public:
 	// the signal is format-bounded to [0, 1] and nothing downstream needs a finiteness test.
 	eastl::unique_ptr<Texture2D> texContactAo[2] = { nullptr };
 
+	/// @brief (46f) Ray Tracing's RTAO composite for this frame (occlusion, same layout as texAo), or null.
+	///
+	/// Cleared at the top of DrawSSGI; set by RayTracing::DrawAmbientOcclusion right after it. While null
+	/// every consumer reads SSGI's own AO exactly as before.
+	ID3D11ShaderResourceView* aoOverride = nullptr;
+	/// @brief (46f) This frame's DrawSSGI ran its passes (enabled, shaders good).
+	bool ranThisFrame = false;
+	/// @brief (46f) This frame's accumulated contact AO visibility (R8, full render extent), or null when the pass did not run.
+	ID3D11ShaderResourceView* contactAoThisFrame = nullptr;
+	/// @brief (46f) SSGI's own AO output this frame (before any RTAO override).
+	ID3D11ShaderResourceView* GetOwnAoSRV() const { return texAo[outputAoIdx] ? texAo[outputAoIdx]->srv.get() : nullptr; }
+
 	inline auto GetOutputTextures()
 	{
 		return (loaded && settings.Enabled) ?
 		           std::make_tuple(
-					   texAo[outputAoIdx]->srv.get(),
+					   aoOverride ? aoOverride : texAo[outputAoIdx]->srv.get(),
 					   texIlY[outputIlIdx]->srv.get(),
 					   texIlCoCg[outputIlIdx]->srv.get(),
 					   texGiSpecular[outputSpecularIdx]->srv.get()) :

@@ -86,6 +86,9 @@ namespace Util
 		RayTracingSync,
 		// (46b) Ray-traced point-light shadows: their denoiser (the trace itself is on the D3D12 queue, inside RT Wait for Trace).
 		RayTracingPointDenoise,
+		// (46f) RTAO: the D3D11 filter (1/4-resolution bilateral + clamped history) and composite; the wait for its second fence.
+		RayTracingAO,
+		RayTracingAOSync,
 		Count
 	};
 

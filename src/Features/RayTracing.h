@@ -148,6 +148,28 @@ public:
 		bool PointLightsPlayer = true;          // the player's own lights (torch in hand, Quick Light, light spells) cast RT shadows (not of the player)
 		bool PointLightsEffects = true;         // spell / effect lights without an owner (Magelight, projectiles) cast RT shadows
 		bool PointLightsAlphaOutdoors = true;   // outdoors too, leaves / bushes / cut-outs (as the per-kind menu traces them) block point lights
+		// (46f) Ray-traced ambient occlusion (Ray Tracing page, Ambient Occlusion). Exteriors only for now.
+		bool AO = false;
+		int AOMode = 0;                // AOMode: 0 RTAO (keeps SSGI contact AO, darker of both), 1 darker of RTAO and SSGI AO
+		float AORayLength = 100.0f;    // units (70 = 1 m): 35 - 210
+		float AOStrength = 1.0f;
+		bool AOTemporal = true;        // clamped history after the spatial filter
+		float AODistance = 4000.0f;    // from the camera: RTAO fades back to SSGI AO over the last quarter of it
+	};
+	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
+	enum class AOModeKind : int
+	{
+		KeepContact = 0,  // RTAO replaces SSGI's AO; SSGI's contact AO kept (both multiplied: the darker of the two terms)
+		Darker = 1,       // the darker of RTAO and SSGI's whole AO
+		Count
+	};
+	enum class AODebugView : int
+	{
+		Off = 0,
+		Raw,       // this frame's rays (white open, black blocked)
+		Filtered,  // after the filter (and history)
+		Split,     // left half RTAO, right half SSGI AO (as before)
+		Count
 	};
 	Settings settings;
 	DebugView debugView = DebugView::Off;  // not persisted
@@ -190,6 +212,10 @@ public:
 	/// (45l) Deferred::PrepassPasses, after every feature's Prepass: the D3D11 side of this frame's trace
 	/// (wait, Screen Space Shadows, denoiser, combine) when Late Sync deferred it. No-op otherwise.
 	void FinishPrepass();
+	/// (46f) Deferred::DeferredPasses, right after Screen Space GI: the D3D11 queue waits for the RTAO trace (second fence),
+	/// then its 1/4-resolution bilateral filter, the clamped history and the mix with SSGI's AO (ScreenSpaceGI::aoOverride).
+	/// No-op unless this frame traced RTAO.
+	void DrawAmbientOcclusion();
 
 	/// (46b) Light Limit Fix, for each light it uploads: the ray-traced shadow tag (LightData::rtShadow), 0 unless
 	/// this frame's trace has a shadow source for the light.
@@ -510,4 +536,47 @@ private:
 	std::uint64_t skippedTotal = 0;
 	std::uint64_t skipFallbackFrames = 0;           // frames whose skipped maps got only the fallback (no trace)
 	bool hooksInstalled = false;
+
+	// (46f) Automatic switch-offs are a runtime state, not the saved setting: the user's choice stays on and is retried
+	// next session (or with Retry / ticking the box off and on).
+	bool pointAutoOff = false;
+	bool interiorAutoOff = false;
+	[[nodiscard]] bool PointLightsOn() const { return settings.PointLights && !pointAutoOff; }
+	[[nodiscard]] bool InteriorsOn() const { return settings.PointLightsInteriors && !interiorAutoOff; }
+
+	// (46f) RTAO.
+	struct alignas(16) AOCompositeCB
+	{
+		std::uint32_t Size[4];  // render width, height, flags, debug view
+		float Params[4];        // strength, this frame's weight in the history, history clamp slack, RT fade-in
+	};
+	STATIC_ASSERT_ALIGNAS_16(AOCompositeCB);
+	static constexpr std::uint32_t kAOFlagContact = 1u, kAOFlagDarker = 2u, kAOFlagHistory = 4u, kAOFlagSplit = 8u;  // RTAO*CS.hlsl
+	[[nodiscard]] bool AOOn() const { return settings.AO && !aoAutoOff; }
+	/// Switches RTAO off for this session (not the setting) with a reason for the page; the rest of Ray Tracing goes on.
+	void SwitchOffAO(std::string a_reason);
+	void UpdateAO();
+	/// RunFrame (exteriors), before the trace is recorded: this frame's RTAO input. False = no RTAO this frame.
+	bool PrepareAO(RayTracingRT::FrameInput& a_input, const float a_traceRect[4]);
+	bool EnsureAOFilter(std::uint32_t a_width, std::uint32_t a_height);
+	void ReleaseAOFilter();
+	RayTracingRT::AOInput aoInput{};
+	bool aoAutoOff = false;
+	bool aoRequested = false;
+	std::string aoOffReason;
+	AODebugView aoDebugView = AODebugView::Off;  // not persisted
+	bool aoThisFrame = false;      // this frame's trace carried RTAO (DrawAmbientOcclusion consumes it)
+	bool aoComposited = false;     // DrawAmbientOcclusion mixed it into the AO this frame
+	bool aoComposedLastFrame = false;
+	bool aoDebugDrawn = false;     // its debug view wrote debugColor this frame (the overlay draws it)
+	std::uint32_t aoWidth = 0, aoHeight = 0;
+	DenoiseTexture aoLo, aoLoBlur, aoLoDepth, aoLoNormal, aoFiltered, aoHistory[2], aoOut;
+	std::uint32_t aoHistoryIndex = 0;
+	bool aoHistoryValid = false;
+	std::uint32_t aoHistoryFrame = 0;  // State::frameCount when the history was written (valid for the next frame only)
+	std::uint64_t aoD3D11Bytes = 0;
+	std::unique_ptr<ConstantBuffer> aoCB;
+	winrt::com_ptr<ID3D11ComputeShader> aoDownCS, aoBlurHCS, aoBlurVCS, aoUpCS, aoTemporalCS, aoCompositeCS;
+	winrt::com_ptr<ID3D11SamplerState> aoLinearSampler;
+	float aoCpuMs = 0.0f;
 };

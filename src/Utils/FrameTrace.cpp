@@ -345,6 +345,9 @@ namespace Util::FrameTrace
 				out << "#   engine shadow maps left out (Stop Engine Shadow Maps); rt_mask_channels = shadow mask channels written by RT; rt_interior_shapes = captured.\n";
 				out << "# (46e) ssrt_reblur / ssrt_trace_diffuse / ssrt_trace_specular / ssgi / ssgi_contact_ao _gpu_ms = last GPU sample of that pass\n";
 				out << "#   (a few frames old; -1 = the pass is off); rt_pl_carried = point-light sources carried by a traced character (its body skipped).\n";
+				out << "# (46f) rtao_gpu_ms = RTAO rays on the D3D12 queue (own list after the sun trace, -1 = not traced); rtao_filter_gpu_ms = its D3D11 filter +\n";
+				out << "#   history + composite; rtao_sync_gpu_ms = the game queue standing still at the wait for its second fence (right before the AO is used);\n";
+				out << "#   rtao_rays = RTAO rays per frame (read back a few frames late, -1 = not known, 0 = not traced). RTAO settings: see the ray tracing line.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -367,6 +370,7 @@ namespace Util::FrameTrace
 				       "pacer_in_flight_after,lights_total,lights_shadow,lights_fill_est,lights_player,lights_max_cluster,lights_over4_share,llf_gpu_ms,"
 				       "rt_pl_k,rt_pl_sources,rt_pl_candidates,rt_pl_rays,rt_pl_gpu_ms,rt_pl_denoise_gpu_ms,rt_pl_cpu_ms,rt_interior,rt_pl_beams,rt_sm_skipped,rt_mask_channels,rt_interior_shapes,"
 				       "ssrt_reblur_gpu_ms,ssrt_trace_diffuse_gpu_ms,ssrt_trace_specular_gpu_ms,ssgi_gpu_ms,ssgi_contact_ao_gpu_ms,rt_pl_carried,"
+				       "rtao_gpu_ms,rtao_filter_gpu_ms,rtao_sync_gpu_ms,rtao_rays,"
 				       "cpu_top_features\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
@@ -397,6 +401,8 @@ namespace Util::FrameTrace
 					// (46e)
 					s += std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{}", a_row.ssPassMs[0], a_row.ssPassMs[1], a_row.ssPassMs[2], a_row.ssPassMs[3],
 						a_row.ssPassMs[4], t.plCarried);
+					// (46f)
+					s += std::format(",{:.3f},{:.3f},{:.3f},{}", t.rtaoGpuMs, t.rtaoFilterGpuMs, t.rtaoSyncGpuMs, t.rtaoRays);
 					s += "," + a_row.cpuTop + "\n";
 					return s;
 				};

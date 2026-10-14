@@ -261,7 +261,10 @@ struct Skin : Feature
 	std::unordered_map<uint32_t, ExtraTextures> skinExtraTextures;
 
 	SkinData GetCommonBufferData();
-	static float GetWaterObjectHeight(const RE::NiPoint3& a_pos);
+	/// (46f) The flat water object whose bounds hold the position in XY and whose surface is above the feet by at most
+	/// a_maxDepth (the nearest such surface); -1e30 = none. A pool below a bridge or the water of a waterfall basin far
+	/// above / below no longer counts.
+	static float GetWaterObjectHeight(const RE::NiPoint3& a_pos, float a_maxDepth);
 	float4 GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_wetChar);
 
 	void SetupExtraTexture(RE::BSLightingShaderMaterialBase const* material, RE::BSTextureSet* inTextureSet, uint32_t i_hashKey);

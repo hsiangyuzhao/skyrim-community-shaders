@@ -169,6 +169,26 @@ namespace RayTracingRT
 	};
 	static_assert(sizeof(PointTraceConstants) == 52 * 4);
 
+	/// (46f) RTAO trace constants (TraceAOCS AOConstants).
+	struct AOTraceConstants
+	{
+		float invViewProj[16];
+		float renderSize[4];  // w, h, 1/w, 1/h
+		float rect[4];        // camera-relative xy min / max
+		float params[4];      // frame, flags (bit pattern), ray length (units), unused
+		float fade[4];        // weight falls from x to 0 at y (units from the camera), z constant ray offset, w per unit of distance
+		float extra[4];       // character ray TMin, unused x3
+		float spheres[8];     // character bounds, as TraceConstants::spheres
+	};
+	static_assert(sizeof(AOTraceConstants) == 44 * 4);
+
+	/// (46f) This frame's RTAO trace (FrameInput::ao; null = none): its own list after the sun trace, its own fence.
+	struct AOInput
+	{
+		AOTraceConstants constants{};
+		bool alpha = false;  // alpha-tested instances tested against their cut-out (else culled)
+	};
+
 	/// (46b) This frame's point-light trace (FrameInput::pointLights; null = none, the 45 frame exactly).
 	struct PointLightInput
 	{
@@ -231,6 +251,8 @@ namespace RayTracingRT
 		const PointLightInput* pointLights = nullptr;
 		// (46c) false = no sun trace (interiors): only the point lights are traced against the TLAS.
 		bool sun = true;
+		// (46f) RTAO: recorded in its own list, submitted after the trace list, signalling the second fence (null = none).
+		const AOInput* ao = nullptr;
 	};
 
 	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
@@ -307,6 +329,11 @@ namespace RayTracingRT
 		float lastPointGpuMs = -1.0f;
 		std::int64_t pointRaysPerFrame = -1;
 		bool pointTracedLastFrame = false;
+		// (46f) RTAO: GPU ms of its dispatch (not inside lastGpuMs' trace), rays per frame (read back late; -1 = not known), last frame traced or not.
+		float lastAOGpuMs = -1.0f;
+		std::int64_t aoRaysPerFrame = -1;
+		bool aoTracedLastFrame = false;
+		bool aoAlphaLastFrame = false;
 	};
 
 	class Backend
@@ -366,8 +393,9 @@ namespace RayTracingRT
 			if (!ready_ || failed_ || !fence_)
 				return false;
 			const std::uint64_t completed = fence_->GetCompletedValue();
+			const std::uint64_t aoCompleted = AOCompleted();
 			for (const auto& context : contexts_)
-				if (context.fenceValue == 0 || context.fenceValue <= completed)
+				if (ContextFree(context, completed, aoCompleted))
 					return true;
 			return false;
 		}
@@ -452,6 +480,23 @@ namespace RayTracingRT
 		void ClearPointFault() { pointFault_.clear(); }
 		[[nodiscard]] std::uint64_t PointBytes() const { return pointBytes_; }
 
+		// (46f) RTAO. Its pipeline is created with the others; its texture, ray counter and second fence on first use only.
+		[[nodiscard]] bool AOAvailable() const { return ready_ && !failed_ && aoPipeline_ && aoFault_.empty(); }
+		/// The alpha-tested variant (traced leaves / cut-outs tested against their cut-out) exists.
+		[[nodiscard]] bool AOAlphaAvailable() const { return AOAvailable() && aoAlphaPipeline_ && AlphaAvailable(); }
+		/// The shared RTAO texture (render size), its ray counter and the second fence. False = not available (AOFault() says why).
+		bool EnsureAOTextures(std::uint32_t a_width, std::uint32_t a_height);
+		/// Retires the RTAO texture and counter (switch off). The second fence stays.
+		void ReleaseAOResources();
+		[[nodiscard]] ID3D11ShaderResourceView* AORawSRV() const { return aoRaw_.srv11.Get(); }
+		[[nodiscard]] const std::string& AOFault() const { return aoFault_; }
+		void ClearAOFault() { aoFault_.clear(); }
+		[[nodiscard]] std::uint64_t AOBytes() const { return aoBytes_; }
+		/// The D3D11 queue waits (on the GPU) for the last RTAO trace (its second fence). No-op when nothing is pending.
+		/// Right before the first D3D11 pass that reads it; never before the opaque pass. Returns the CPU ms of the call.
+		float WaitForAO();
+		[[nodiscard]] bool AOWaitPending() const { return pendingAOWait_ != 0; }
+
 		/// True when the device was removed or a D3D12 call failed; the feature then turns itself off.
 		[[nodiscard]] bool HasFailed() const { return failed_; }
 		[[nodiscard]] const std::string& LastError() const { return lastError_; }
@@ -514,7 +559,19 @@ namespace RayTracingRT
 			std::uint32_t pointCapacity = 0;  // bytes
 			bool pointPending = false;
 			std::uint64_t pointFrame = 0;     // pointFrame_ when it was submitted
+			// (46f) RTAO: its own list (same allocator, recorded after the trace list), the second fence's value its
+			// submission signalled (0 = none: the context is free once fenceValue completed), read-back pending.
+			ComPtr<ID3D12GraphicsCommandList4> aoList;
+			std::uint64_t aoFenceValue = 0;
+			bool aoPending = false;
+			std::uint64_t aoFrame = 0;
 		};
+		/// (46f) A context may be reused once its submission (and its RTAO list, behind the second fence) completed.
+		static bool ContextFree(const CommandContext& a_context, std::uint64_t a_completed, std::uint64_t a_aoCompleted)
+		{
+			return (a_context.fenceValue == 0 || a_context.fenceValue <= a_completed) && a_context.aoFenceValue <= a_aoCompleted;
+		}
+		[[nodiscard]] std::uint64_t AOCompleted() const { return aoFence_ ? aoFence_->GetCompletedValue() : UINT64_MAX; }
 
 		enum class BlasState : std::uint8_t
 		{
@@ -777,7 +834,54 @@ namespace RayTracingRT
 		void SetPointFault(std::string a_reason);
 		bool EnsurePointBuffer(CommandContext& a_context, std::uint32_t a_bytes);
 		void WritePointDescriptors();
-		void RecordPointTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame);
+		void RecordPointTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame,
+			D3D12_GPU_DESCRIPTOR_HANDLE a_table);
+
+		// (46f) Descriptors that change at run time (texture (re)creation) are written into a CPU-only staging heap and
+		// copied into the recording context's own block of the shader-visible heap: a rewrite can never touch a
+		// descriptor a submission still in flight reads (each block is only reused once its context completed).
+		// Block layout: sun table (depth SRV, visibility UAV), point table (depth SRV, sun visibility SRV, PLVis UAV,
+		// PLIdx UAV), RTAO table (depth SRV, AO UAV).
+		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynamicDescriptors = 8;
+		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
+		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
+		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;
+		/// Copies the staging descriptors into context a_index's block; returns the block's GPU handle.
+		D3D12_GPU_DESCRIPTOR_HANDLE PublishDescriptors(std::size_t a_index);
+		[[nodiscard]] static D3D12_GPU_DESCRIPTOR_HANDLE Offset(D3D12_GPU_DESCRIPTOR_HANDLE a_handle, std::uint32_t a_slots, UINT a_size)
+		{
+			a_handle.ptr += static_cast<UINT64>(a_size) * a_slots;
+			return a_handle;
+		}
+
+		// (46f) RTAO.
+		static constexpr DXGI_FORMAT kAOFormat = DXGI_FORMAT_R8G8B8A8_UNORM;  // TraceAOCS AOOut
+		ComPtr<ID3D12RootSignature> aoRootSignature_;
+		ComPtr<ID3D12PipelineState> aoPipeline_;
+		ComPtr<ID3D12PipelineState> aoAlphaPipeline_;
+		SharedTexture aoRaw_;
+		std::uint32_t aoWidth_ = 0, aoHeight_ = 0;
+		ComPtr<ID3D12Resource> aoCounter_;          // default heap, UAV: rays traced (monotonic, wraps)
+		ComPtr<ID3D12Resource> aoCounterReadback_;  // per context one uint32 copy of it
+		const std::uint32_t* aoCounterMapped_ = nullptr;
+		std::uint32_t aoCounterLast_ = 0;
+		std::uint64_t aoCounterLastFrame_ = 0;
+		bool aoCounterValid_ = false;
+		std::uint64_t aoFrame_ = 0;
+		std::uint64_t aoBytes_ = 0;
+		std::string aoFault_;
+		// The second fence: only the D3D12 queue signals it (after the RTAO list); the D3D11 queue waits for it right
+		// before the AO is used. Never part of the trace's ready / done pair (rt_sync is unchanged).
+		ComPtr<ID3D12Fence> aoFence_;
+		ComPtr<ID3D11Fence> aoFence11_;
+		std::uint64_t aoFenceValue_ = 0;
+		std::uint64_t pendingAOWait_ = 0;
+		bool CreateAOPipeline();
+		void SetAOFault(std::string a_reason);
+		void WriteAODescriptors();
+		/// After the trace list was closed: records (and closes) the RTAO list on the same context (allocator). ExecuteFrame
+		/// submits it right behind the trace and signals the second fence. False = nothing recorded (failed_ on a D3D12 error).
+		bool RecordAOTrace(CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame, D3D12_GPU_DESCRIPTOR_HANDLE a_table);
 
 		HANDLE fenceEvent_ = nullptr;
 		Stats stats_{};

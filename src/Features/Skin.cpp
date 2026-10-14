@@ -360,10 +360,13 @@ namespace
 	}
 }
 
-float Skin::GetWaterObjectHeight(const RE::NiPoint3& a_pos)
+float Skin::GetWaterObjectHeight(const RE::NiPoint3& a_pos, float a_maxDepth)
 {
 	// By PO3 (Splashes of Skyrim): the flat water object whose bounds hold the position.
 	// https://github.com/powerof3/Splashes-of-Skyrim/blob/master/src/Manager.cpp
+	// (46f) Only a surface above the feet and at most a_maxDepth above them (the nearest such one): standing under a
+	// bridge's / a waterfall basin's water, or on a ledge above a pool, the XY bounds alone matched.
+	float best = -1e30f;
 	if (const auto waterManager = RE::TESWaterSystem::GetSingleton()) {
 		for (const auto& waterObject : waterManager->waterObjects) {
 			if (!waterObject)
@@ -375,13 +378,37 @@ float Skin::GetWaterObjectHeight(const RE::NiPoint3& a_pos)
 					const auto center{ bound->center };
 					const auto boundMin = center - size;
 					const auto boundMax = center + size;
-					if (!(a_pos.x < boundMin.x || a_pos.x > boundMax.x || a_pos.y < boundMin.y || a_pos.y > boundMax.y))
-						return center.z;
+					if (a_pos.x < boundMin.x || a_pos.x > boundMax.x || a_pos.y < boundMin.y || a_pos.y > boundMax.y)
+						continue;
+					const float depth = center.z - a_pos.z;
+					if (depth <= 0.0f || depth > a_maxDepth)
+						continue;
+					if (best <= -1e29f || center.z < best)
+						best = center.z;
 				}
 			}
 		}
 	}
-	return -1e30f;
+	return best;
+}
+
+namespace
+{
+	/// (46f) Per character: the last flat-water-object answer (the search walks every water object of the loaded
+	/// area, and SampleWater runs per character and per alpha-blended geometry each frame). Asked again only once
+	/// the character moved or after a while; the Havok height (relevantWaterHeight) is never cached.
+	struct WaterObjectCacheEntry
+	{
+		float x = 0.0f, y = 0.0f, z = 0.0f;
+		float height = -1e30f;
+		std::int64_t qpc = 0;
+	};
+	constexpr float kWaterCacheMove = 16.0f;        // units moved (any axis) before the search runs again
+	constexpr double kWaterCacheMaxAgeMs = 500.0;   // and at least this often while standing
+	constexpr double kWaterCachePruneMs = 10000.0;  // entries unused this long are dropped
+	constexpr std::size_t kWaterCachePruneSize = 256;
+	std::mutex g_waterCacheMutex;
+	std::unordered_map<RE::FormID, WaterObjectCacheEntry> g_waterCache;
 }
 
 Skin::WaterSample Skin::SampleWater(RE::Actor* a_actor)
@@ -399,8 +426,31 @@ Skin::WaterSample Skin::SampleWater(RE::Actor* a_actor)
 			w.cellDefault = h;
 	}
 	if (w.relevant <= -1e29f) {
-		const float h = GetWaterObjectHeight(position);
-		if (FiniteHeight(h))
+		// (46f) Deeper than the character is tall (plus a margin) is not "standing in it"; cached per character.
+		const float maxDepth = std::max(a_actor->GetHeight(), 32.0f) + 64.0f;
+		const std::int64_t now = SkinQpc();
+		float h = -1e30f;
+		{
+			std::scoped_lock lock(g_waterCacheMutex);
+			auto& entry = g_waterCache[a_actor->GetFormID()];
+			const bool moved = std::abs(position.x - entry.x) > kWaterCacheMove || std::abs(position.y - entry.y) > kWaterCacheMove ||
+			                   std::abs(position.z - entry.z) > kWaterCacheMove;
+			if (entry.qpc == 0 || moved || static_cast<double>(now - entry.qpc) * SkinQpcMs() > kWaterCacheMaxAgeMs) {
+				entry.height = GetWaterObjectHeight(position, maxDepth);
+				entry.x = position.x;
+				entry.y = position.y;
+				entry.z = position.z;
+				entry.qpc = now;
+			}
+			h = entry.height;
+			// Within the move tolerance the cached surface may be just past the depth limit / below the feet: checked again below.
+			if (g_waterCache.size() > kWaterCachePruneSize) {
+				std::erase_if(g_waterCache, [&](const auto& a_pair) {
+					return static_cast<double>(now - a_pair.second.qpc) * SkinQpcMs() > kWaterCachePruneMs;
+				});
+			}
+		}
+		if (FiniteHeight(h) && h - position.z <= maxDepth)
 			w.multibound = h;
 	}
 	w.surfaceZ = w.relevant > -1e29f ? w.relevant : w.multibound;

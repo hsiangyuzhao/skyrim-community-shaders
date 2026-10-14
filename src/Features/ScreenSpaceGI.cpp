@@ -855,6 +855,11 @@ void ScreenSpaceGI::DrawSSGI()
 	if (recompileFlag)
 		ClearShaderCache();
 
+	// (46f) Ray Tracing's RTAO override is per frame: set again (after this function) only when its composite runs.
+	aoOverride = nullptr;
+	ranThisFrame = false;
+	contactAoThisFrame = nullptr;
+
 	if (!(settings.Enabled && ShadersOK())) {
 		ilPassesSkipped = false;
 		FLOAT clr[4] = { 0.f, 0.f, 0.f, 0.f };
@@ -1139,6 +1144,9 @@ void ScreenSpaceGI::DrawSSGI()
 	outputAoIdx = aoOutIdx;
 	outputIlIdx = inputGITexIdx;
 	outputSpecularIdx = inputAoTexIdx;
+	// (46f) For Ray Tracing's RTAO composite (RTAO keeps the contact AO).
+	ranThisFrame = true;
+	contactAoThisFrame = contactAoActive ? texContactAo[contactIdx]->srv.get() : nullptr;
 
 	// cleanup
 	resetViews();

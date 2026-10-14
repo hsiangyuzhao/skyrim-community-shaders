@@ -2,6 +2,7 @@
 
 #include "Deferred.h"
 #include "Features/RayTracing/CasterFilter.h"
+#include "Features/ScreenSpaceGI.h"
 #include "Features/ScreenSpaceShadows.h"
 #include "Features/Upscaling.h"
 #include "State.h"
@@ -54,7 +55,13 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PointLightsSkipShadowMaps,
 	PointLightsPlayer,
 	PointLightsEffects,
-	PointLightsAlphaOutdoors)
+	PointLightsAlphaOutdoors,
+	AO,
+	AOMode,
+	AORayLength,
+	AOStrength,
+	AOTemporal,
+	AODistance)
 
 namespace
 {
@@ -144,6 +151,12 @@ namespace
 	constexpr std::uint32_t kPointFlagCharacters = 1u, kPointFlagFirstPerson = 2u, kPointFlagCharCull = 4u;  // TracePointLightsCS
 	constexpr std::uint32_t kPointDenoiseHistory = 1u, kPointDenoiseDebug = 2u;                             // PointDenoiseCS
 	constexpr float kBeamRayMargin = 64.0f;  // (46c) a window beam's ray goes this far past the interior's box
+	// (46f) RTAO.
+	constexpr float kAORayLengthMin = 35.0f, kAORayLengthMax = 210.0f;  // 0.5 - 3 m
+	constexpr float kAOFadeStartShare = 0.75f;  // the RT weight falls from 75 % of the distance to 0 at it (back to SSGI AO)
+	constexpr float kAOHistoryWeight = 0.2f;    // this frame's weight in the clamped history blend
+	constexpr float kAOClampSlack = 0.08f;      // the history may stray this far outside this frame's filtered 3x3 range
+	constexpr std::uint32_t kAOTraceCharacters = 1u, kAOTraceFirstPerson = 2u;  // TraceAOCS
 
 	// (46c) BSShadowFrustumLight / BSShadowParabolicLight::RenderShadowmaps (vfunc 0x0A): Ray Tracing may skip the shadow
 	// maps of lights it fully handles this frame (Point Lights > Stop Engine Shadow Maps, interiors only).
@@ -331,7 +344,7 @@ RayTracingScene::SceneConfig RayTracing::SceneConfigFromSettings() const
 	config.cutouts = alpha && settings.Cutouts;
 	config.cutoutAsOpaque = true;
 	// (46c) Window Shadows Ultimate's window masks indoors: with the alpha-tested point-light trace only.
-	config.windowMasks = alpha && backend.PointAlphaAvailable() && settings.PointLights && settings.PointLightsInteriors;
+	config.windowMasks = alpha && backend.PointAlphaAvailable() && PointLightsOn() && InteriorsOn();
 	return config;
 }
 
@@ -496,6 +509,11 @@ void RayTracing::LoadSettings(json& o_json)
 	settings.PointLightsDistance = std::isfinite(settings.PointLightsDistance) ? std::clamp(settings.PointLightsDistance, 512.0f, 8192.0f) : 4000.0f;
 	settings.PointLightsSize = std::isfinite(settings.PointLightsSize) ? std::clamp(settings.PointLightsSize, 0.0f, 32.0f) : 6.0f;
 	settings.PointLightsClearance = std::isfinite(settings.PointLightsClearance) ? std::clamp(settings.PointLightsClearance, 0.0f, 128.0f) : 32.0f;
+	// (46f)
+	settings.AOMode = std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1);
+	settings.AORayLength = std::isfinite(settings.AORayLength) ? std::clamp(settings.AORayLength, kAORayLengthMin, kAORayLengthMax) : 100.0f;
+	settings.AOStrength = std::isfinite(settings.AOStrength) ? std::clamp(settings.AOStrength, 0.0f, 2.0f) : 1.0f;
+	settings.AODistance = std::isfinite(settings.AODistance) ? std::clamp(settings.AODistance, 1000.0f, 8192.0f) : 4000.0f;
 }
 
 void RayTracing::SaveSettings(json& o_json)
@@ -507,6 +525,7 @@ void RayTracing::RestoreDefaultSettings()
 {
 	settings = {};
 	debugView = DebugView::Off;
+	aoDebugView = AODebugView::Off;
 }
 
 void RayTracing::DataLoaded()
@@ -560,6 +579,7 @@ void RayTracing::SetupResources()
 	combineCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<CombineCB>());
 	pointDenoiseCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PointDenoiseCB>());  // (46b)
 	pointMaskCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<PointMaskCB>());        // (46c)
+	aoCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<AOCompositeCB>());            // (46f)
 
 	// Screen Space Shadows hand-off reads its R8 texture through a UAV.
 	D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support{ DXGI_FORMAT_R8_UNORM, 0 };
@@ -581,6 +601,13 @@ void RayTracing::ClearShaderCache()
 	sigmaPrepCS = nullptr;
 	pointDenoiseCS = nullptr;  // (46b)
 	pointMaskCS = nullptr;     // (46c)
+	// (46f)
+	aoDownCS = nullptr;
+	aoBlurHCS = nullptr;
+	aoBlurVCS = nullptr;
+	aoUpCS = nullptr;
+	aoTemporalCS = nullptr;
+	aoCompositeCS = nullptr;
 }
 
 ID3D11ComputeShader* RayTracing::GetShader(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name)
@@ -614,6 +641,8 @@ void RayTracing::Disable(Status a_status, std::string a_reason)
 	interiorTracedLastFrame = false;
 	skipLatched = false;
 	skipCandidates.clear(); skipEntries.clear();
+	aoThisFrame = false;  // (46f) SSGI's own AO from the next frame on
+	aoHistoryValid = false;
 	RayTracingCasterFilter::Clear();
 	characters.ReleaseAll(backend);  // (45i) (a backend that is gone ignores the handles)
 	scene.ReleaseAll(backend);
@@ -666,6 +695,7 @@ void RayTracing::ReleaseD3D11Resources()
 	ReleaseDenoiser();
 	ReleaseSigma();
 	ReleasePointDenoiser();  // (46b)
+	ReleaseAOFilter();       // (46f)
 	prevCameraValid = false;
 	maskDesc = {};
 	d3d11Bytes = 0;
@@ -980,7 +1010,7 @@ void RayTracing::LatchFrame()
 	// after the trace (or with the fallback, should it not run after all).
 	skippedMaps.clear();
 	skippedLights.clear();
-	skipLatched = settings.Enabled && settings.PointLights && settings.PointLightsInteriors && settings.PointLightsNative &&
+	skipLatched = settings.Enabled && PointLightsOn() && InteriorsOn() && settings.PointLightsNative &&
 	              settings.PointLightsSkipShadowMaps && hooksInstalled && status == Status::Active && phase == Phase::Play && !loadingOpen.load() &&
 	              interiorTracedLastFrame && Util::IsInterior() && backend.HasFreeContext() && scene.HasCoverage() && !skipCandidates.empty();
 	auto* sky = globals::game::sky;
@@ -1089,6 +1119,12 @@ void RayTracing::Prepass()
 	pointMaskDone = false;
 	maskChannelsWritten = 0;
 	skippedLastFrame = static_cast<std::uint32_t>(skippedMaps.size());
+	// (46f) RTAO: nothing for the AO consumers until this frame's trace carries it.
+	aoThisFrame = false;
+	aoComposedLastFrame = aoComposited;  // the F7 row is written before this frame's AO pass (ReportFrame)
+	aoComposited = false;
+	aoDebugDrawn = false;
+	aoCpuMs = 0.0f;
 	// (45n) Whatever path this Prepass takes: an Early Prep context that the trace did not use is released
 	// (D3D12 signal only), and the frame-start flags end with this frame.
 	struct EarlyPrepEnd
@@ -1120,15 +1156,20 @@ void RayTracing::Prepass()
 		sssClaimed = false;
 		phase = Phase::Play;
 		fade = 1.0f;
-		if (backend.IsReady())
+		if (backend.IsReady()) {
 			backend.WaitForTrace();  // (45l) a deferred wait left over (GPU-side only)
+			backend.WaitForAO();     // (46f) likewise the second fence
+		}
 		if (status != Status::Off) {
 			// Switched off: the scene goes (BLASes retire on the GPU's schedule); the device stays.
-			// (46b) The point lights' textures too.
+			// (46b) The point lights' textures too. (46f) And RTAO's.
 			pointSelector.Clear();
 			ReleasePointDenoiser();
-			if (backend.IsReady())
+			ReleaseAOFilter();
+			if (backend.IsReady()) {
 				backend.ReleasePointResources();
+				backend.ReleaseAOResources();
+			}
 			RayTracingCasterFilter::Clear();
 			characters.ReleaseAll(backend);  // (45i)
 			if (backend.IsReady())
@@ -1168,6 +1209,7 @@ void RayTracing::Prepass()
 			// render thread never waits on the GPU; one build submission per frame, capped.
 			const std::int64_t loadStart = Qpc();
 			backend.WaitForTrace();
+			backend.WaitForAO();  // (46f)
 			scene.Update(backend, overVramBudget ? 0.0f : kLoadingCaptureBudgetMs, globals::state->frameCount);
 			backend.BuildOnly(kLoadingBuildTriangles, kLoadingMaxBuilds);
 			backend.Tick();
@@ -1340,7 +1382,7 @@ void RayTracing::PublishCpuSplit()
 		detail.plGpuMs = pointThisFrame ? stats.lastPointGpuMs : 0.0f;
 		detail.plDenoiseGpuMs = passMs(pointThisFrame && pointDenoised, Util::GpuBucket::RayTracingPointDenoise);
 		detail.plRays = pointThisFrame ? stats.pointRaysPerFrame : 0u;
-		detail.plCpuMs = settings.PointLights ? pointCpuMs : -1.0f;
+		detail.plCpuMs = PointLightsOn() ? pointCpuMs : -1.0f;
 		// (46c)
 		detail.rtInterior = interiorThisFrame ? (pointThisFrame ? 2 : 1) : 0;
 		detail.plBeams = pointThisFrame ? ps.beams : 0;
@@ -1348,6 +1390,12 @@ void RayTracing::PublishCpuSplit()
 		detail.smSkipped = static_cast<std::uint32_t>(skippedMaps.size());
 		detail.maskChannels = maskChannelsWritten;
 		detail.interiorShapes = scene.GetStats().interior ? scene.GetStats().interiorShapes : 0;
+		// (46f) RTAO (-1 = not run this frame).
+		const bool aoTraced = activeThisFrame && stats.aoTracedLastFrame && AOOn();
+		detail.rtaoGpuMs = aoTraced ? stats.lastAOGpuMs : -1.0f;
+		detail.rtaoFilterGpuMs = aoComposedLastFrame ? std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAO), 0.0f) : -1.0f;
+		detail.rtaoSyncGpuMs = aoComposedLastFrame ? std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAOSync), 0.0f) : -1.0f;
+		detail.rtaoRays = aoTraced ? stats.aoRaysPerFrame : 0;
 	}
 	detail.sssGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::ScreenSpaceShadows);
 	// (45k) A slow D3D12 record + submit names its slowest call in the log (at most every 2 s).
@@ -1380,11 +1428,13 @@ void RayTracing::RunFrame()
 	if (!EnsureBackend())
 		return;
 	// (45l) A deferred D3D11 wait that was never issued (a frame without FinishPrepass): before this
-	// frame's depth copy overwrites what the last trace read.
+	// frame's depth copy overwrites what the last trace read. (46f) Likewise RTAO's (it reads the same depth copy).
 	backend.WaitForTrace();
+	backend.WaitForAO();
 	UpdateAlphaCasters();  // (45h, 45j) per-kind choices: a change re-captures the scene
 	UpdateCharacters();                                // (45i)
 	UpdatePointLights();                               // (46b)
+	UpdateAO();                                        // (46f)
 	if (status == Status::Off || status == Status::Unavailable)
 		status = Status::Waiting;
 
@@ -1610,6 +1660,18 @@ void RayTracing::RunFrame()
 		}
 		pointCpuMs = static_cast<float>(static_cast<double>(Qpc() - pointStart) * QpcMs());
 	}
+	// (46f) RTAO: its own list right behind the trace, its own fence (the D3D11 queue waits for it in DrawAmbientOcclusion).
+	{
+		const std::int64_t aoStart = Qpc();
+		try {
+			if (!PrepareAO(input, traceRect))
+				input.ao = nullptr;
+		} catch (const std::exception& e) {
+			input.ao = nullptr;
+			SwitchOffAO(std::format("exception: {}", e.what()));
+		}
+		aoCpuMs = static_cast<float>(static_cast<double>(Qpc() - aoStart) * QpcMs());
+	}
 
 	auto* context = globals::d3d::context;
 	auto* screenSpaceShadows = &globals::features::screenSpaceShadows;
@@ -1763,6 +1825,10 @@ void RayTracing::RunFrame()
 		return;
 	}
 
+	// (46f) RTAO went out right behind it (second fence): DrawAmbientOcclusion uses it after Screen Space GI.
+	aoThisFrame = input.ao != nullptr && backend.GetStats().aoTracedLastFrame;
+	if (!aoThisFrame)
+		aoHistoryValid = false;
 	// (46b) The point lights went out with it: Light Limit Fix (next in the prepass list) may tag its lights.
 	pointThisFrame = input.pointLights != nullptr && backend.GetStats().pointTracedLastFrame;
 	pointSelector.Publish(pointThisFrame);
@@ -2047,11 +2113,14 @@ void RayTracing::FinishFrame()
 
 void RayTracing::DrawDebugOverlay()
 {
-	if (!settings.Enabled || debugView == DebugView::Off || !combinedThisFrame || lastOverlayFrame + 1 != frameIndex)
-		return;
-	// (46c) Indoors only the point-light views have content (nothing of the sun was traced or combined).
-	if (interiorThisFrame && (debugView < DebugView::PLCandidates || !pointDenoised))
-		return;
+	// (46f) RTAO's views (Raw / Filtered / the split line) wrote debugColor this frame, whatever the shadow view.
+	if (!(settings.Enabled && aoDebugDrawn)) {
+		if (!settings.Enabled || debugView == DebugView::Off || !combinedThisFrame || lastOverlayFrame + 1 != frameIndex)
+			return;
+		// (46c) Indoors only the point-light views have content (nothing of the sun was traced or combined).
+		if (interiorThisFrame && (debugView < DebugView::PLCandidates || !pointDenoised))
+			return;
+	}
 	auto* overlay = GetShader(overlayCS, L"Data\\Shaders\\RayTracing\\OverlayCS.hlsl", "OverlayCS");
 	auto* renderer = globals::game::renderer;
 	const auto& main = renderer->GetRuntimeData().renderTargets[globals::deferred->forwardRenderTargets[0]];
@@ -2082,9 +2151,10 @@ void RayTracing::DrawDebugOverlay()
 
 void RayTracing::SwitchOffPointLights(std::string a_reason)
 {
-	// Only the point lights: the sun keeps going. The page shows why; ticking the box again retries.
+	// Only the point lights: the sun keeps going. The page shows why; Retry (or ticking the box off and on) retries.
+	// (46f) A runtime state, not the setting: a later save keeps the user's choice, and the next session tries again.
 	pointOffReason = std::move(a_reason);
-	settings.PointLights = false;
+	pointAutoOff = true;
 	pointSelector.Clear();
 	pointThisFrame = false;
 	pointHistoryValid = false;
@@ -2094,21 +2164,24 @@ void RayTracing::SwitchOffPointLights(std::string a_reason)
 
 void RayTracing::UpdatePointLights()
 {
-	// Turned on (again) by the user: an earlier automatic switch-off is forgotten.
+	// Turned on (again) by the user (or Retry): an earlier automatic switch-off is forgotten.
 	if (settings.PointLights && !pointRequested) {
 		backend.ClearPointFault();
 		pointOffReason.clear();
+		pointAutoOff = false;
 	}
-	if (settings.PointLights && !backend.PointFault().empty())
+	if (PointLightsOn() && !backend.PointFault().empty())
 		SwitchOffPointLights(backend.PointFault());
-	else if (settings.PointLights && backend.IsReady() && !backend.PointAvailable())
+	else if (PointLightsOn() && backend.IsReady() && !backend.PointAvailable())
 		SwitchOffPointLights("the GPU driver did not accept the point-light ray query shader");
 	pointRequested = settings.PointLights;
 	// (46c) Interiors switched on (again) by the user: an earlier automatic switch-off is forgotten.
-	if (settings.PointLightsInteriors && !interiorRequested)
+	if (settings.PointLightsInteriors && !interiorRequested) {
 		interiorOffReason.clear();
+		interiorAutoOff = false;
+	}
 	interiorRequested = settings.PointLightsInteriors;
-	if (!settings.PointLights) {
+	if (!PointLightsOn()) {
 		pointSelector.Clear();
 		if (pointVis[0].texture)
 			ReleasePointDenoiser();
@@ -2167,7 +2240,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	bool a_interior)
 {
 	pointK = 0;
-	if (!settings.PointLights || !backend.PointAvailable() || !maskTemp)
+	if (!PointLightsOn() || !backend.PointAvailable() || !maskTemp)
 		return false;
 	// (46c) Sized to the render area (2560x1440 behind DLSS Quality at 4K), not to the shadow mask (the output size): the
 	// trace and the pixel shaders only ever address the render area. Recreated when the render size changes.
@@ -2312,20 +2385,303 @@ void RayTracing::FinishPointLights()
 }
 
 // ---------------------------------------------------------------------------------------------
+// (46f) Ray-traced ambient occlusion (RTAO)
+// ---------------------------------------------------------------------------------------------
+
+void RayTracing::SwitchOffAO(std::string a_reason)
+{
+	// Only RTAO: the sun and the point lights keep going. A runtime state (the saved setting stays on and is retried
+	// next session); the page shows why, Retry (or ticking the box off and on) tries again now.
+	aoOffReason = std::move(a_reason);
+	aoAutoOff = true;
+	aoThisFrame = false;
+	aoHistoryValid = false;
+	logger::warn("[RayTracing] Ray-traced ambient occlusion switched off: {}", aoOffReason);
+}
+
+void RayTracing::UpdateAO()
+{
+	// Turned on (again) by the user (or Retry): an earlier automatic switch-off is forgotten.
+	if (settings.AO && !aoRequested) {
+		backend.ClearAOFault();
+		aoOffReason.clear();
+		aoAutoOff = false;
+	}
+	if (AOOn() && !backend.AOFault().empty())
+		SwitchOffAO(backend.AOFault());
+	else if (AOOn() && backend.IsReady() && !backend.AOAvailable())
+		SwitchOffAO("the GPU driver did not accept the RTAO ray query shader");
+	aoRequested = settings.AO;
+	if (!AOOn()) {
+		aoHistoryValid = false;
+		if (aoOut.texture)
+			ReleaseAOFilter();
+		if (backend.IsReady() && backend.AOBytes())
+			backend.ReleaseAOResources();
+	}
+}
+
+void RayTracing::ReleaseAOFilter()
+{
+	for (auto* t : { &aoLo, &aoLoBlur, &aoLoDepth, &aoLoNormal, &aoFiltered, &aoHistory[0], &aoHistory[1], &aoOut })
+		*t = {};
+	aoWidth = aoHeight = 0;
+	aoHistoryValid = false;
+	d3d11Bytes -= std::min(d3d11Bytes, aoD3D11Bytes);
+	aoD3D11Bytes = 0;
+}
+
+bool RayTracing::EnsureAOFilter(std::uint32_t a_width, std::uint32_t a_height)
+{
+	// Render-sized (the render area at the origin, as every consumer of SSGI's AO addresses it); the filter's
+	// quarter-resolution grid is half width, half height (the SSRT confidence filter's).
+	if (aoOut.texture && aoWidth == a_width && aoHeight == a_height)
+		return true;
+	ReleaseAOFilter();
+	const std::uint32_t lw = (a_width + 1) / 2, lh = (a_height + 1) / 2;
+	std::uint64_t bytes = 0;
+	auto create = [&](DenoiseTexture& o_texture, std::uint32_t a_w, std::uint32_t a_h, DXGI_FORMAT a_format, std::uint32_t a_bytesPerPixel, const char* a_name) {
+		if (!CreateDenoiseTexture(this, o_texture.texture, o_texture.srv, o_texture.uav, a_w, a_h, a_format, a_name))
+			return false;
+		bytes += static_cast<std::uint64_t>(a_w) * a_h * a_bytesPerPixel;
+		return true;
+	};
+	const bool ok = create(aoLo, lw, lh, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Lo") && create(aoLoBlur, lw, lh, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO LoBlur") &&
+	                create(aoLoDepth, lw, lh, DXGI_FORMAT_R32_FLOAT, 4, "RayTracing RTAO LoDepth") &&
+	                create(aoLoNormal, lw, lh, DXGI_FORMAT_R8G8B8A8_SNORM, 4, "RayTracing RTAO LoNormal") &&
+	                create(aoFiltered, a_width, a_height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Filtered") &&
+	                create(aoHistory[0], a_width, a_height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO History") &&
+	                create(aoHistory[1], a_width, a_height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO History") &&
+	                create(aoOut, a_width, a_height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Out");
+	if (!ok) {
+		ReleaseAOFilter();
+		SwitchOffAO("could not create its filter textures");
+		return false;
+	}
+	if (!aoLinearSampler) {
+		D3D11_SAMPLER_DESC sd{};
+		sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.MaxLOD = D3D11_FLOAT32_MAX;
+		if (FAILED(globals::d3d::device->CreateSamplerState(&sd, aoLinearSampler.put()))) {
+			ReleaseAOFilter();
+			SwitchOffAO("could not create its sampler");
+			return false;
+		}
+	}
+	aoWidth = a_width;
+	aoHeight = a_height;
+	aoD3D11Bytes = bytes;
+	d3d11Bytes += aoD3D11Bytes;
+	aoHistoryValid = false;
+	return true;
+}
+
+bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_traceRect[4])
+{
+	if (!AOOn() || !backend.AOAvailable())
+		return false;
+	// Only with a consumer: Screen Space GI's AO is what RTAO replaces / joins (its composite reads it).
+	const auto& ssgi = globals::features::screenSpaceGI;
+	if (!ssgi.loaded || !ssgi.settings.Enabled)
+		return false;
+	const std::uint32_t width = std::max(a_input.renderWidth, 1u), height = std::max(a_input.renderHeight, 1u);
+	if (!backend.EnsureAOTextures(width, height)) {
+		if (!backend.AOFault().empty())
+			SwitchOffAO(backend.AOFault());
+		return false;
+	}
+	if (!EnsureAOFilter(width, height))
+		return false;
+	auto& c = aoInput.constants;
+	std::memcpy(c.invViewProj, a_input.constants.invViewProj, sizeof(c.invViewProj));
+	std::copy_n(a_input.constants.renderSize, 4, c.renderSize);
+	std::copy_n(a_traceRect, 4, c.rect);
+	std::uint32_t flags = 0;
+	if (!skinDraws.empty()) {
+		flags |= kAOTraceCharacters;
+		if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); playerCamera && playerCamera->IsInFirstPerson())
+			flags |= kAOTraceFirstPerson;
+	}
+	c.params[0] = static_cast<float>(frameIndex % 1024);
+	std::memcpy(&c.params[1], &flags, sizeof(float));
+	c.params[2] = std::clamp(settings.AORayLength, kAORayLengthMin, kAORayLengthMax);
+	c.params[3] = 0.0f;
+	const float distance = std::clamp(settings.AODistance, 1000.0f, 8192.0f);
+	c.fade[0] = distance * kAOFadeStartShare;
+	c.fade[1] = distance;
+	c.fade[2] = kRayBiasConstant;
+	c.fade[3] = kRayBiasPerUnit;
+	c.extra[0] = kCharacterSelfShadowOffset;
+	c.extra[1] = c.extra[2] = c.extra[3] = 0.0f;
+	std::copy_n(a_input.constants.spheres, 8, c.spheres);
+	// Leaves / cut-outs the per-kind menu traces block AO rays with their cut-out (bounded candidates per ray).
+	aoInput.alpha = backend.AOAlphaAvailable();
+	a_input.ao = &aoInput;
+	return true;
+}
+
+void RayTracing::DrawAmbientOcclusion()
+{
+	if (!aoThisFrame)
+		return;
+	aoThisFrame = false;
+	auto& ssgi = globals::features::screenSpaceGI;
+	// SSGI did not run this frame (switched off since the trace, shaders recompiling): its own (cleared) AO stays; the
+	// pending second-fence wait is taken before the next trace (Backend::ExecuteFrame / RunFrame).
+	if (!ssgi.loaded || !ssgi.settings.Enabled || !ssgi.ranThisFrame || !ssgi.GetOwnAoSRV() || !aoOut.texture || !backend.AORawSRV())
+		return;
+	const std::int64_t start = Qpc();
+	auto* context = globals::d3d::context;
+	auto* timers = Util::GpuPassTimers::GetSingleton();
+
+	// 1. The D3D11 queue waits for the RTAO trace (second fence, on the GPU). Timed: the stall it causes.
+	timers->Begin(Util::GpuBucket::RayTracingAOSync);
+	backend.WaitForAO();
+	timers->End(Util::GpuBucket::RayTracingAOSync);
+	if (backend.HasFailed()) {
+		Disable(Status::Failed, backend.LastError());
+		return;
+	}
+
+	auto* down = GetShader(aoDownCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_downsample.hlsl", "ssrt_conf_downsample (RTAO)");
+	auto* blurH = GetShader(aoBlurHCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_blur.hlsl", "ssrt_conf_blur (RTAO)");
+	auto* blurV = GetShaderDefined(aoBlurVCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_blur.hlsl", "ssrt_conf_blur vertical (RTAO)", "SSRT_CONF_BLUR_VERTICAL");
+	auto* up = GetShader(aoUpCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_upsample.hlsl", "ssrt_conf_upsample (RTAO)");
+	auto* temporal = GetShader(aoTemporalCS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS");
+	auto* composite = GetShader(aoCompositeCS, L"Data\\Shaders\\RayTracing\\RTAOCompositeCS.hlsl", "RTAOCompositeCS");
+	if (!down || !blurH || !blurV || !up || !temporal || !composite) {
+		SwitchOffAO("a filter shader did not compile (see the log)");
+		return;
+	}
+
+	auto* renderer = globals::game::renderer;
+	auto depth = renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+	auto& normal = renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
+	auto& motion = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR];
+	if (!depth.depthSRV || !normal.SRV || !motion.SRV)
+		return;
+
+	const std::uint32_t width = aoWidth, height = aoHeight;
+	const UINT groupsX = (width + 7) / 8, groupsY = (height + 7) / 8;
+	const UINT loX = ((width + 1) / 2 + 7) / 8, loY = ((height + 1) / 2 + 7) / 8;
+	const bool historyValid = settings.AOTemporal && aoHistoryValid && aoHistoryFrame + 1 == globals::state->frameCount;
+	const std::uint32_t read = aoHistoryIndex, write = aoHistoryIndex ^ 1u;
+	ID3D11ShaderResourceView* contact = ssgi.contactAoThisFrame;
+	const bool debugOverlay = (aoDebugView == AODebugView::Raw || aoDebugView == AODebugView::Filtered || aoDebugView == AODebugView::Split) && debugColorUAV;
+
+	AOCompositeCB cb{};
+	cb.Size[0] = width;
+	cb.Size[1] = height;
+	cb.Size[2] = (contact ? kAOFlagContact : 0u) | (settings.AOMode == static_cast<int>(AOModeKind::Darker) ? kAOFlagDarker : 0u) |
+	             (historyValid ? kAOFlagHistory : 0u) | (aoDebugView == AODebugView::Split ? kAOFlagSplit : 0u);
+	cb.Size[3] = debugOverlay ? static_cast<std::uint32_t>(aoDebugView) : 0u;
+	cb.Params[0] = std::clamp(settings.AOStrength, 0.0f, 2.0f);
+	cb.Params[1] = kAOHistoryWeight;
+	cb.Params[2] = kAOClampSlack;
+	cb.Params[3] = fade;
+	aoCB->Update(cb);
+
+	ID3D11ShaderResourceView* nullSrvs[6]{};
+	ID3D11UnorderedAccessView* nullUavs[3]{};
+	auto clear = [&]() {
+		context->CSSetShaderResources(0, 6, nullSrvs);
+		context->CSSetUnorderedAccessViews(0, 3, nullUavs, nullptr);
+	};
+	clear();
+	timers->Begin(Util::GpuBucket::RayTracingAO);
+	// 2. The 1/4-resolution bilateral filter of this frame's rays (the SSRT confidence filter's passes, unchanged):
+	//    depth- and normal-aware 2x2 average, separable 15-tap joint bilateral blur, joint bilateral upsample.
+	//    Spatial, same frame: nothing of NRD, no history (hard constraint #3).
+	{
+		ID3D11ShaderResourceView* srvs[3] = { backend.AORawSRV(), depth.depthSRV, normal.SRV };
+		ID3D11UnorderedAccessView* uavs[3] = { aoLo.uav.get(), aoLoDepth.uav.get(), aoLoNormal.uav.get() };
+		context->CSSetShaderResources(0, 3, srvs);
+		context->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+		context->CSSetShader(down, nullptr, 0);
+		context->Dispatch(loX, loY, 1);
+		clear();
+	}
+	auto blurPass = [&](ID3D11ComputeShader* a_shader, DenoiseTexture& a_source, DenoiseTexture& a_target) {
+		ID3D11ShaderResourceView* srvs[4] = { a_source.srv.get(), aoLoDepth.srv.get(), nullptr, aoLoNormal.srv.get() };
+		ID3D11UnorderedAccessView* uav = a_target.uav.get();
+		context->CSSetShaderResources(0, 4, srvs);
+		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		context->CSSetShader(a_shader, nullptr, 0);
+		context->Dispatch(loX, loY, 1);
+		clear();
+	};
+	blurPass(blurH, aoLo, aoLoBlur);
+	blurPass(blurV, aoLoBlur, aoLo);
+	{
+		ID3D11ShaderResourceView* srvs[6] = { backend.AORawSRV(), depth.depthSRV, normal.SRV, aoLo.srv.get(), aoLoDepth.srv.get(), aoLoNormal.srv.get() };
+		ID3D11UnorderedAccessView* uav = aoFiltered.uav.get();
+		context->CSSetShaderResources(0, 6, srvs);
+		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		context->CSSetShader(up, nullptr, 0);
+		context->Dispatch(groupsX, groupsY, 1);
+		clear();
+	}
+	// 3. Optional: the clamped history (after the spatial filter; the history is held inside this frame's filtered
+	//    3x3 range plus a small slack). Temporal off: the filtered result is used as it is.
+	DenoiseTexture* blended = &aoFiltered;
+	ID3D11Buffer* cbs[1] = { aoCB->CB() };
+	context->CSSetConstantBuffers(0, 1, cbs);
+	if (settings.AOTemporal) {
+		ID3D11ShaderResourceView* srvs[3] = { aoFiltered.srv.get(), aoHistory[read].srv.get(), motion.SRV };
+		ID3D11UnorderedAccessView* uav = aoHistory[write].uav.get();
+		ID3D11SamplerState* sampler = aoLinearSampler.get();
+		context->CSSetSamplers(0, 1, &sampler);
+		context->CSSetShaderResources(0, 3, srvs);
+		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		context->CSSetShader(temporal, nullptr, 0);
+		context->Dispatch(groupsX, groupsY, 1);
+		clear();
+		ID3D11SamplerState* nullSampler = nullptr;
+		context->CSSetSamplers(0, 1, &nullSampler);
+		blended = &aoHistory[write];
+		aoHistoryIndex = write;
+		aoHistoryValid = true;
+		aoHistoryFrame = globals::state->frameCount;
+	} else {
+		aoHistoryValid = false;
+	}
+	// 4. The mix with SSGI's AO into the texture its consumers read (DeferredComposite, SSRT) for this frame.
+	{
+		ID3D11ShaderResourceView* srvs[4] = { blended->srv.get(), backend.AORawSRV(), ssgi.GetOwnAoSRV(), contact };
+		ID3D11UnorderedAccessView* uavs[2] = { aoOut.uav.get(), debugOverlay ? debugColorUAV.get() : nullptr };
+		context->CSSetShaderResources(0, 4, srvs);
+		context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+		context->CSSetShader(composite, nullptr, 0);
+		context->Dispatch(groupsX, groupsY, 1);
+		clear();
+	}
+	timers->End(Util::GpuBucket::RayTracingAO);
+	ID3D11Buffer* nullCb[1]{};
+	context->CSSetConstantBuffers(0, 1, nullCb);
+	context->CSSetShader(nullptr, nullptr, 0);
+
+	ssgi.aoOverride = aoOut.srv.get();
+	aoComposited = true;
+	aoDebugDrawn = debugOverlay;
+	aoCpuMs += static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+}
+
+// ---------------------------------------------------------------------------------------------
 // (46c) Interiors
 // ---------------------------------------------------------------------------------------------
 
 bool RayTracing::InteriorWanted() const
 {
-	return settings.Enabled && settings.PointLights && settings.PointLightsInteriors && backend.IsReady() && backend.PointAvailable();
+	return settings.Enabled && PointLightsOn() && InteriorsOn() && backend.IsReady() && backend.PointAvailable();
 }
 
 void RayTracing::SwitchOffInteriors(std::string a_reason)
 {
 	// Only the interior part: outdoors goes on. The page shows why; ticking the box again retries.
+	// (46f) A runtime state, not the setting (the saved choice stays on and is tried again next session).
 	interiorOffReason = std::move(a_reason);
-	settings.PointLightsInteriors = false;
-	interiorRequested = false;
+	interiorAutoOff = true;
 	scene.SetInteriorEnabled(false);  // the next Update drops the interior capture
 	pointSelector.Clear();
 	pointThisFrame = false;
@@ -3049,8 +3405,11 @@ void RayTracing::DrawSettings()
 			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
 			ImGui::TextWrapped("Indoors was switched off automatically: %s", interiorOffReason.c_str());
 			ImGui::PopStyleColor();
+			// (46f) The saved setting stays on (the next session tries again); Retry tries now.
+			if (interiorAutoOff && ImGui::SmallButton("Retry Indoors"))
+				interiorRequested = false;
 		}
-		if (settings.PointLights && settings.PointLightsInteriors && settings.Enabled && Util::IsInterior()) {
+		if (PointLightsOn() && InteriorsOn() && settings.Enabled && Util::IsInterior()) {
 			const auto& sc = scene.GetStats();
 			const auto& st = backend.GetStats();
 			const auto& ps = pointSelector.GetStats();
@@ -3077,10 +3436,13 @@ void RayTracing::DrawSettings()
 			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
 			ImGui::TextWrapped("Point-light shadows were switched off automatically: %s", pointOffReason.c_str());
 			ImGui::PopStyleColor();
+			// (46f) The saved setting stays on (the next session tries again); Retry tries now.
+			if (pointAutoOff && ImGui::SmallButton("Retry Point Lights"))
+				pointRequested = false;
 		}
 		const auto& ps = pointSelector.GetStats();
 		const auto& rt = backend.GetStats();
-		if (settings.PointLights && settings.Enabled) {
+		if (PointLightsOn() && settings.Enabled) {
 			ImGui::Text("This frame: %u lights traced (K %u) of %u candidates (%u merged, %u over the cap, %u engine shadow lights); %u lights in use",
 				pointThisFrame ? ps.sources : 0u, pointThisFrame ? pointK : 0u, ps.candidates, ps.merged, ps.capped, ps.native, ps.used);
 			ImGui::Text("  of which the player's own lights %u, spell / effect lights %u, carried by other characters %u; plants / cut-outs tested %s",
@@ -3098,6 +3460,82 @@ void RayTracing::DrawSettings()
 				ImGui::Text("Not classified yet (asked again next frame): %u; classifier cache %u lights, %llu read so far; new slots this frame %u",
 					ps.pending, Util::LightCensus::ClassifierCacheSize(), static_cast<unsigned long long>(Util::LightCensus::ClassifierReads()), ps.slotChanges);
 			}
+		}
+		ImGui::TreePop();
+	}
+
+	// (46f) Ray-traced ambient occlusion.
+	if (ImGui::TreeNodeEx("Ambient Occlusion", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::Checkbox("RT Ambient Occlusion", &settings.AO);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Ray-traced ambient occlusion (outdoors, inside the traced area): the soft darkening in corners, under ledges");
+			ImGui::Text("  and around objects comes from short rays against the ray-traced scene, so it no longer disappears when");
+			ImGui::Text("  whatever casts it leaves the screen. Farther away it fades back to Screen Space GI's AO.");
+			ImGui::Text("Terrain and grass are not in the ray-traced scene: their darkening still comes from Screen Space GI.");
+			ImGui::Text("Off (default): ambient occlusion exactly as before (Screen Space GI). Needs Ray Tracing and Screen Space GI on.");
+		}
+		if (!settings.AO)
+			ImGui::BeginDisabled();
+		{
+			const char* modes[] = { "RTAO (keeps SSGI contact AO)", "Darker of RTAO and SSGI AO" };
+			settings.AOMode = std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1);
+			ImGui::Combo("Mode", &settings.AOMode, modes, IM_ARRAYSIZE(modes));
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("RTAO (default): ray-traced AO replaces Screen Space GI's AO; SSGI's small contact AO (cm-scale creases) is kept");
+				ImGui::Text("  and both darken together.");
+				ImGui::Text("Darker of RTAO and SSGI AO: per pixel the darker of the two (fullest darkening; SSGI's AO is never lost).");
+			}
+		}
+		ImGui::SliderFloat("Ray Length", &settings.AORayLength, kAORayLengthMin, kAORayLengthMax, "%.0f units");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("How far an object may be and still darken a surface. 70 units = 1 m. Default 100 (about 1.4 m). Longer = wider, darker AO.");
+		ImGui::SliderFloat("Strength", &settings.AOStrength, 0.0f, 2.0f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("1 = as traced. Lower = lighter, higher = darker.");
+		ImGui::Checkbox("Temporal", &settings.AOTemporal);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): after the edge-aware blur the last frames are blended in (held close to this frame's own values,");
+			ImGui::Text("  so moving objects leave no dark trail). Off: this frame's blurred rays only (a little grainier).");
+		}
+		ImGui::SliderFloat("Max Distance", &settings.AODistance, 1000.0f, 8192.0f, "%.0f units");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("RTAO fades back to Screen Space GI's AO over the last quarter of this distance. Default 4000 (about 57 m). Shorter = cheaper.");
+		{
+			const char* views[] = { "Off", "Raw RTAO", "Filtered RTAO", "RTAO vs SSGI (split)" };
+			int view = static_cast<int>(aoDebugView);
+			if (ImGui::Combo("AO Debug View", &view, views, IM_ARRAYSIZE(views)))
+				aoDebugView = static_cast<AODebugView>(std::clamp(view, 0, static_cast<int>(AODebugView::Count) - 1));
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Raw RTAO: this frame's rays (white = open, black = blocked); blue tint = not traced (SSGI's AO there).");
+				ImGui::Text("Filtered RTAO: after the blur (and the history), as it enters the mix.");
+				ImGui::Text("RTAO vs SSGI (split): the real picture; left half with RTAO, right half with Screen Space GI's AO as before.");
+				ImGui::Text("Not saved.");
+			}
+		}
+		if (!settings.AO)
+			ImGui::EndDisabled();
+		if (!aoOffReason.empty()) {
+			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
+			ImGui::TextWrapped("RT ambient occlusion was switched off automatically: %s", aoOffReason.c_str());
+			ImGui::PopStyleColor();
+			if (aoAutoOff && ImGui::SmallButton("Retry RT Ambient Occlusion"))
+				aoRequested = false;
+		}
+		if (AOOn() && settings.Enabled) {
+			const auto& ssgi = globals::features::screenSpaceGI;
+			if (!ssgi.loaded || !ssgi.settings.Enabled)
+				ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Screen Space GI is off: RTAO needs it (it replaces / joins its AO).");
+			else if (Util::IsInterior())
+				ImGui::TextDisabled("Indoors: not traced (exteriors only for now).");
+			const auto& rt = backend.GetStats();
+			auto* timers = Util::GpuPassTimers::GetSingleton();
+			ImGui::Text("This frame: %s; rays %.2f ms GPU (%s per frame), filter %.2f ms, game queue waiting %.2f ms; leaves / cut-outs tested %s",
+				aoComposited ? "mixed in" : "not used", std::max(rt.lastAOGpuMs, 0.0f),
+				rt.aoRaysPerFrame >= 0 ? std::format("{:.2f} M", static_cast<double>(rt.aoRaysPerFrame) / 1e6).c_str() : "?",
+				std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAO), 0.0f), std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAOSync), 0.0f),
+				rt.aoAlphaLastFrame ? "yes" : "no");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("GPU times are the last samples (the D3D11 ones only while the Performance Overlay or an F7 trace runs).");
 		}
 		ImGui::TreePop();
 	}
@@ -3363,6 +3801,12 @@ std::string RayTracing::DescribeForProfile() const
 	// (46d)
 	text += std::format(", player lights {}, spell / effect lights {}, plants block point lights outdoors {}", settings.PointLightsPlayer ? "on" : "off",
 		settings.PointLightsEffects ? "on" : "off", settings.PointLightsAlphaOutdoors ? "on" : "off");
+	// (46f)
+	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
+	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split" };
+	text += std::format(", RTAO {} (mode {}, ray length {:.0f}, strength {:.2f}, temporal {}, max distance {:.0f}, debug view {}{})", settings.AO ? "on" : "off",
+		kAOModes[std::clamp(settings.AOMode, 0, 1)], settings.AORayLength, settings.AOStrength, settings.AOTemporal ? "on" : "off", settings.AODistance,
+		kAOViews[std::clamp(static_cast<int>(aoDebugView), 0, 3)], aoOffReason.empty() ? "" : ", switched off: " + aoOffReason);
 	return text;
 }
 
@@ -3425,5 +3869,11 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "mask_channels", maskChannelsWritten }, { "shadow_maps_skipped", skippedLastFrame }, { "shadow_maps_skipped_total", skippedTotal },
 			{ "fallback_frames", skipFallbackFrames }, { "off_reason", interiorOffReason } };
 	}
+	// (46f)
+	j["rtao"] = { { "enabled", settings.AO }, { "mode", settings.AOMode }, { "ray_length", settings.AORayLength }, { "strength", settings.AOStrength },
+		{ "temporal", settings.AOTemporal }, { "max_distance", settings.AODistance }, { "debug_view", static_cast<int>(aoDebugView) },
+		{ "composited", aoComposited }, { "gpu_ms", stats.lastAOGpuMs }, { "rays_per_frame", stats.aoRaysPerFrame },
+		{ "filter_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingAO) },
+		{ "sync_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingAOSync) }, { "off_reason", aoOffReason } };
 	return j;
 }

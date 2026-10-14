@@ -19,6 +19,9 @@
 #include "RayTracing/TracePointLightsCS.dxil.h"
 // (46c) The same with RT_ALPHA: alpha-tested instances (Window Shadows Ultimate's window masks) tested against their cut-out.
 #include "RayTracing/TracePointLightsAlphaCS.dxil.h"
+// (46f) RTAO (TraceAOCS) and its alpha-tested variant.
+#include "RayTracing/TraceAOAlphaCS.dxil.h"
+#include "RayTracing/TraceAOCS.dxil.h"
 
 namespace RayTracingRT
 {
@@ -163,6 +166,13 @@ namespace RayTracingRT
 			if (FAILED(traceList.As(&context.traceList)))
 				return fail("ID3D12GraphicsCommandList4 not available");
 			context.traceList->Close();
+			// (46f) RTAO's own list (same allocator, recorded after the trace list is closed).
+			ComPtr<ID3D12GraphicsCommandList> aoList;
+			if (FAILED(hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, context.allocator.Get(), nullptr, IID_PPV_ARGS(&aoList))))
+				return fail(std::format("CreateCommandList failed ({})", HrString(hr)));
+			if (FAILED(aoList.As(&context.aoList)))
+				return fail("ID3D12GraphicsCommandList4 not available");
+			context.aoList->Close();
 		}
 
 		if (FAILED(hr = device_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence_))))
@@ -180,9 +190,9 @@ namespace RayTracingRT
 		{
 			D3D12_QUERY_HEAP_DESC heapDesc{};
 			heapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-			heapDesc.Count = static_cast<UINT>(kContexts * 6);  // (45l) per context: prep begin / end, trace begin / end; (46b) + point lights begin / end after them
+			heapDesc.Count = static_cast<UINT>(kContexts * 8);  // (45l) per context: prep begin / end, trace begin / end; (46b) + point lights begin / end after them; (46f) + RTAO
 			UINT64 frequency = 0;
-			timestampReadback_ = CreateBuffer(sizeof(std::uint64_t) * kContexts * 6, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+			timestampReadback_ = CreateBuffer(sizeof(std::uint64_t) * kContexts * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
 			if (FAILED(device_->CreateQueryHeap(&heapDesc, IID_PPV_ARGS(&timestampHeap_))) || !timestampReadback_ ||
 				FAILED(queue_->GetTimestampFrequency(&frequency)) || frequency == 0) {
 				timestampHeap_.Reset();
@@ -298,13 +308,45 @@ namespace RayTracingRT
 
 		D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
 		heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-		heapDesc.NumDescriptors = kPointDescriptorBase + kPointDescriptors;  // (46b) + the point-light trace table
+		// (46f) + one block of the run-time descriptors per command context (PublishDescriptors).
+		heapDesc.NumDescriptors = kDynamicBase + static_cast<UINT>(kContexts) * kDynamicDescriptors;
 		heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		if (FAILED(hr = device_->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&descriptorHeap_)))) {
 			o_reason = std::format("CreateDescriptorHeap failed ({})", HrString(hr));
 			return false;
 		}
 		descriptorSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		// (46f) The CPU-only staging heap the run-time descriptors are written to (null views until their textures exist).
+		{
+			D3D12_DESCRIPTOR_HEAP_DESC stagingDesc{};
+			stagingDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+			stagingDesc.NumDescriptors = kDynamicDescriptors;
+			stagingDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+			if (FAILED(hr = device_->CreateDescriptorHeap(&stagingDesc, IID_PPV_ARGS(&stagingHeap_)))) {
+				o_reason = std::format("CreateDescriptorHeap (staging) failed ({})", HrString(hr));
+				return false;
+			}
+			D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
+			nullSrv.Format = kDepthMaskFormat;
+			nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			nullSrv.Texture2D.MipLevels = 1;
+			D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
+			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynSun));
+			nullUav.Format = kVisibilityFormat;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynSun + 1));
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynPoint));
+			nullSrv.Format = kVisibilityFormat;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynPoint + 1));
+			nullUav.Format = kPointFormat;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynPoint + 2));
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynPoint + 3));
+			nullSrv.Format = kDepthMaskFormat;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAO));
+			nullUav.Format = kAOFormat;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynAO + 1));
+		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
 		{
@@ -355,6 +397,9 @@ namespace RayTracingRT
 		// (46b) The point-light trace: not fatal either (point-light shadows then stay unavailable).
 		if (!CreatePointPipeline())
 			pointPipeline_.Reset();
+		// (46f) RTAO: not fatal either (RTAO then stays unavailable).
+		if (!CreateAOPipeline())
+			aoPipeline_.Reset();
 		return true;
 	}
 
@@ -445,25 +490,7 @@ namespace RayTracingRT
 			logger::warn("[RayTracing] The alpha-tested point-light ray query shader was rejected by the driver ({}); window masks unavailable", HrString(hr));
 			pointAlphaPipeline_.Reset();
 		}
-		// Null views until the textures exist.
-		auto cpu = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
-		cpu.ptr += static_cast<SIZE_T>(descriptorSize_) * kPointDescriptorBase;
-		D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
-		nullSrv.Format = kDepthMaskFormat;
-		nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-		nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-		nullSrv.Texture2D.MipLevels = 1;
-		device_->CreateShaderResourceView(nullptr, &nullSrv, cpu);
-		cpu.ptr += descriptorSize_;
-		nullSrv.Format = kVisibilityFormat;
-		device_->CreateShaderResourceView(nullptr, &nullSrv, cpu);
-		D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
-		nullUav.Format = kPointFormat;
-		nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-		for (int i = 0; i < 2; ++i) {
-			cpu.ptr += descriptorSize_;
-			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, cpu);
-		}
+		// (46f) Its table's null views were written into the staging heap (CreatePipeline) until the textures exist.
 		return true;
 	}
 
@@ -535,41 +562,33 @@ namespace RayTracingRT
 			context.pointPending = false;
 		stats_.pointRaysPerFrame = -1;
 		stats_.lastPointGpuMs = -1.0f;
-		if (descriptorHeap_ && pointPipeline_) {
-			// Back to null views.
-			auto cpu = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
-			cpu.ptr += static_cast<SIZE_T>(descriptorSize_) * (kPointDescriptorBase + 2);
+		if (stagingHeap_ && device_) {
+			// Back to null views (staging: the blocks of submissions in flight keep what they were recorded with).
 			D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
 			nullUav.Format = kPointFormat;
 			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, cpu);
-			cpu.ptr += descriptorSize_;
-			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, cpu);
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynPoint + 2));
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynPoint + 3));
 		}
 	}
 
 	void Backend::WritePointDescriptors()
 	{
-		if (!descriptorHeap_ || !pointPipeline_)
+		if (!stagingHeap_ || !pointPipeline_)
 			return;
-		auto cpu = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
-		cpu.ptr += static_cast<SIZE_T>(descriptorSize_) * kPointDescriptorBase;
 		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
 		srvDesc.Format = kDepthMaskFormat;
 		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srvDesc.Texture2D.MipLevels = 1;
-		device_->CreateShaderResourceView(depthMask_.resource12.Get(), &srvDesc, cpu);
-		cpu.ptr += descriptorSize_;
+		device_->CreateShaderResourceView(depthMask_.resource12.Get(), &srvDesc, StagingCpu(kDynPoint));
 		srvDesc.Format = kVisibilityFormat;
-		device_->CreateShaderResourceView(visibility_.resource12.Get(), &srvDesc, cpu);  // the sun trace (the sun gate)
+		device_->CreateShaderResourceView(visibility_.resource12.Get(), &srvDesc, StagingCpu(kDynPoint + 1));  // the sun trace (the sun gate)
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
 		uavDesc.Format = kPointFormat;
 		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-		cpu.ptr += descriptorSize_;
-		device_->CreateUnorderedAccessView(pointVis_.resource12.Get(), nullptr, &uavDesc, cpu);
-		cpu.ptr += descriptorSize_;
-		device_->CreateUnorderedAccessView(pointIdx_.resource12.Get(), nullptr, &uavDesc, cpu);
+		device_->CreateUnorderedAccessView(pointVis_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynPoint + 2));
+		device_->CreateUnorderedAccessView(pointIdx_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynPoint + 3));
 	}
 
 	bool Backend::EnsurePointBuffer(CommandContext& a_context, std::uint32_t a_bytes)
@@ -594,7 +613,8 @@ namespace RayTracingRT
 		return true;
 	}
 
-	void Backend::RecordPointTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame)
+	void Backend::RecordPointTrace(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame,
+		D3D12_GPU_DESCRIPTOR_HANDLE a_table)
 	{
 		// (46b) After the sun trace, in the same list: depth stays readable, the point textures are in UAV state
 		// (the caller's barriers). The sources were copied into this context's upload buffer.
@@ -610,9 +630,7 @@ namespace RayTracingRT
 		a_list->SetPipelineState(alpha ? pointAlphaPipeline_.Get() : pointPipeline_.Get());
 		a_list->SetComputeRoot32BitConstants(0, sizeof(PointTraceConstants) / 4, &pl.constants, 0);
 		a_list->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
-		auto table = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
-		table.ptr += static_cast<UINT64>(descriptorSize_) * kPointDescriptorBase;
-		a_list->SetComputeRootDescriptorTable(2, table);
+		a_list->SetComputeRootDescriptorTable(2, a_table);  // (46f) this context's copy of the point table
 		a_list->SetComputeRootShaderResourceView(3, a_context.pointBuffer->GetGPUVirtualAddress());
 		a_list->SetComputeRootUnorderedAccessView(4, pointCounter_->GetGPUVirtualAddress());
 		if (alpha) {
@@ -637,10 +655,294 @@ namespace RayTracingRT
 		a_context.pointFrame = ++pointFrame_;
 	}
 
+	// ---------------------------------------------------------------------------------------------
+	// (46f) RTAO
+	// ---------------------------------------------------------------------------------------------
+
+	bool Backend::CreateAOPipeline()
+	{
+		// Its own root signature: constants b0, TLAS t0, table (depth t1, AO u0), ray counter u1;
+		// the alpha-tested variant also: records t2, texcoords t3, table (copy layers t4, bindless game textures t0 space1), s0.
+		// 44 + 2 + 1 + 2 + 2 + 2 + 1 = 54 DWORDs.
+		D3D12_DESCRIPTOR_RANGE ranges[2]{};
+		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[0].NumDescriptors = 1;
+		ranges[0].BaseShaderRegister = 1;
+		ranges[0].OffsetInDescriptorsFromTableStart = 0;
+		ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		ranges[1].NumDescriptors = 1;
+		ranges[1].BaseShaderRegister = 0;
+		ranges[1].OffsetInDescriptorsFromTableStart = 1;
+		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
+		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		alphaRanges[0].NumDescriptors = 1;
+		alphaRanges[0].BaseShaderRegister = 4;
+		alphaRanges[0].OffsetInDescriptorsFromTableStart = 0;
+		alphaRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		alphaRanges[1].NumDescriptors = kAlphaTextureSlots;
+		alphaRanges[1].BaseShaderRegister = 0;
+		alphaRanges[1].RegisterSpace = 1;
+		alphaRanges[1].OffsetInDescriptorsFromTableStart = 1;
+		D3D12_ROOT_PARAMETER params[7]{};
+		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		params[0].Constants.ShaderRegister = 0;
+		params[0].Constants.Num32BitValues = sizeof(AOTraceConstants) / 4;
+		params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[1].Descriptor.ShaderRegister = 0;
+		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[2].DescriptorTable.NumDescriptorRanges = 2;
+		params[2].DescriptorTable.pDescriptorRanges = ranges;
+		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+		params[3].Descriptor.ShaderRegister = 1;
+		params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[4].Descriptor.ShaderRegister = 2;
+		params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+		params[5].Descriptor.ShaderRegister = 3;
+		params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[6].DescriptorTable.NumDescriptorRanges = 2;
+		params[6].DescriptorTable.pDescriptorRanges = alphaRanges;
+		params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		D3D12_STATIC_SAMPLER_DESC sampler{};
+		sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+		sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+		sampler.MaxLOD = D3D12_FLOAT32_MAX;
+		sampler.ShaderRegister = 0;
+		sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+		rootDesc.NumParameters = 7;
+		rootDesc.pParameters = params;
+		rootDesc.NumStaticSamplers = 1;
+		rootDesc.pStaticSamplers = &sampler;
+		ComPtr<ID3DBlob> blob, error;
+		HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
+		if (FAILED(hr) || FAILED(hr = device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&aoRootSignature_)))) {
+			logger::warn("[RayTracing] RTAO root signature failed ({}); ray-traced ambient occlusion unavailable", HrString(hr));
+			aoRootSignature_.Reset();
+			return false;
+		}
+		D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+		psoDesc.pRootSignature = aoRootSignature_.Get();
+		psoDesc.CS.pShaderBytecode = g_TraceAOCS;
+		psoDesc.CS.BytecodeLength = sizeof(g_TraceAOCS);
+		if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&aoPipeline_)))) {
+			logger::warn("[RayTracing] The RTAO ray query shader was rejected by the driver ({}); ray-traced ambient occlusion unavailable", HrString(hr));
+			aoPipeline_.Reset();
+			aoRootSignature_.Reset();
+			return false;
+		}
+		psoDesc.CS.pShaderBytecode = g_TraceAOAlphaCS;
+		psoDesc.CS.BytecodeLength = sizeof(g_TraceAOAlphaCS);
+		if (FAILED(hr = device_->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&aoAlphaPipeline_)))) {
+			logger::warn("[RayTracing] The alpha-tested RTAO ray query shader was rejected by the driver ({}); RTAO ignores cut-outs", HrString(hr));
+			aoAlphaPipeline_.Reset();
+		}
+		return true;
+	}
+
+	void Backend::SetAOFault(std::string a_reason)
+	{
+		if (aoFault_.empty()) {
+			aoFault_ = std::move(a_reason);
+			logger::warn("[RayTracing] RTAO: {}", aoFault_);
+		}
+	}
+
+	bool Backend::EnsureAOTextures(std::uint32_t a_width, std::uint32_t a_height)
+	{
+		if (!AOAvailable() || !depthMask_.resource12)
+			return false;
+		HRESULT hr;
+		if (!aoFence_ || !aoFence11_) {
+			// The second fence: shared like the first (D3D12 signals, D3D11 waits on the GPU).
+			aoFence_.Reset();
+			aoFence11_.Reset();
+			if (FAILED(hr = device_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&aoFence_)))) {
+				aoFence_.Reset();
+				SetAOFault(std::format("could not create its fence ({})", HrString(hr)));
+				return false;
+			}
+			HANDLE shared = nullptr;
+			if (FAILED(hr = device_->CreateSharedHandle(aoFence_.Get(), nullptr, GENERIC_ALL, nullptr, &shared))) {
+				aoFence_.Reset();
+				SetAOFault(std::format("could not share its fence ({})", HrString(hr)));
+				return false;
+			}
+			hr = device11_->OpenSharedFence(shared, IID_PPV_ARGS(&aoFence11_));
+			CloseHandle(shared);
+			if (FAILED(hr)) {
+				aoFence_.Reset();
+				aoFence11_.Reset();
+				SetAOFault(std::format("D3D11 could not open its fence ({})", HrString(hr)));
+				return false;
+			}
+			aoFenceValue_ = 0;
+			pendingAOWait_ = 0;
+		}
+		if (a_width == aoWidth_ && a_height == aoHeight_ && aoRaw_.resource12 && aoCounter_ && aoCounterMapped_)
+			return true;
+		ReleaseAOResources();
+		if (!CreateSharedTexture(a_width, a_height, kAOFormat, false, true, aoRaw_, "RayTracing RTAO", false)) {
+			aoRaw_ = {};
+			SetAOFault("could not create its shared texture (see the log)");
+			return false;
+		}
+		aoCounter_ = CreateBuffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+		aoCounterReadback_ = CreateBuffer(sizeof(std::uint32_t) * kContexts, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+		void* mapped = nullptr;
+		if (!aoCounter_ || !aoCounterReadback_ || FAILED(aoCounterReadback_->Map(0, nullptr, &mapped)) || !mapped) {
+			aoRaw_ = {};
+			aoCounter_.Reset();
+			aoCounterReadback_.Reset();
+			SetAOFault("could not create its ray counter");
+			return false;
+		}
+		aoCounterMapped_ = static_cast<const std::uint32_t*>(mapped);
+		aoCounterValid_ = false;
+		aoWidth_ = a_width;
+		aoHeight_ = a_height;
+		aoBytes_ = static_cast<std::uint64_t>(a_width) * a_height * 4;
+		WriteAODescriptors();
+		logger::info("[RayTracing] RTAO texture {}x{}", a_width, a_height);
+		return true;
+	}
+
+	void Backend::ReleaseAOResources()
+	{
+		// A submission in flight may still use them: D3D12 keeps them until it is done (Retire).
+		if (aoRaw_.resource12)
+			Retire(aoRaw_.resource12, 0, nullptr);
+		if (aoCounterReadback_ && aoCounterMapped_)
+			aoCounterReadback_->Unmap(0, nullptr);
+		aoCounterMapped_ = nullptr;
+		if (aoCounter_)
+			Retire(aoCounter_, 0, nullptr);
+		if (aoCounterReadback_)
+			Retire(aoCounterReadback_, 0, nullptr);
+		aoCounter_.Reset();
+		aoCounterReadback_.Reset();
+		aoRaw_ = {};
+		aoWidth_ = aoHeight_ = 0;
+		aoBytes_ = 0;
+		aoCounterValid_ = false;
+		for (auto& context : contexts_)
+			context.aoPending = false;
+		stats_.aoRaysPerFrame = -1;
+		stats_.lastAOGpuMs = -1.0f;
+		stats_.aoTracedLastFrame = false;
+		if (stagingHeap_ && device_) {
+			D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
+			nullUav.Format = kAOFormat;
+			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynAO + 1));
+		}
+	}
+
+	void Backend::WriteAODescriptors()
+	{
+		if (!stagingHeap_ || !aoPipeline_)
+			return;
+		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = kDepthMaskFormat;
+		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srvDesc.Texture2D.MipLevels = 1;
+		device_->CreateShaderResourceView(depthMask_.resource12.Get(), &srvDesc, StagingCpu(kDynAO));
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		uavDesc.Format = kAOFormat;
+		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		device_->CreateUnorderedAccessView(aoRaw_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynAO + 1));
+	}
+
+	bool Backend::RecordAOTrace(CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame, D3D12_GPU_DESCRIPTOR_HANDLE a_table)
+	{
+		if (!a_input.ao || !AOAvailable() || !aoRaw_.resource12 || !aoCounter_ || !aoCounterMapped_ || !aoFence_ || !aoFence11_ || !a_context.aoList ||
+			!depthMask_.resource12 || !tlas_)
+			return false;
+		// Same allocator as the prep and trace lists (both closed by now); reset with it once the context is reused.
+		auto* list = a_context.aoList.Get();
+		HRESULT hr;
+		if (FAILED(hr = list->Reset(a_context.allocator.Get(), nullptr))) {
+			Fail("RTAO command list Reset", hr);
+			return false;
+		}
+		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
+		list->SetDescriptorHeaps(1, heaps);
+		D3D12_RESOURCE_BARRIER pre[2] = {
+			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+			Transition(aoRaw_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+		};
+		list->ResourceBarrier(2, pre);
+		const UINT queryBase = static_cast<UINT>(kContexts * 6 + a_index * 2);
+		if (timestampHeap_)
+			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
+		// The alpha-tested variant only when asked, the frame holds alpha-tested instances and their records are in this
+		// context's copy; otherwise the cut-outs are culled (as the point lights' 46b shader).
+		const bool alpha = a_input.ao->alpha && a_alphaFrame && aoAlphaPipeline_ && alphaUv_ && a_context.alphaInfoBuffer;
+		stats_.aoAlphaLastFrame = alpha;
+		list->SetComputeRootSignature(aoRootSignature_.Get());
+		list->SetPipelineState(alpha ? aoAlphaPipeline_.Get() : aoPipeline_.Get());
+		list->SetComputeRoot32BitConstants(0, sizeof(AOTraceConstants) / 4, &a_input.ao->constants, 0);
+		list->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
+		list->SetComputeRootDescriptorTable(2, a_table);
+		list->SetComputeRootUnorderedAccessView(3, aoCounter_->GetGPUVirtualAddress());
+		if (alpha) {
+			list->SetComputeRootShaderResourceView(4, a_context.alphaInfoBuffer->GetGPUVirtualAddress());
+			list->SetComputeRootShaderResourceView(5, alphaUv_->GetGPUVirtualAddress());
+			auto alphaTable = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
+			alphaTable.ptr += static_cast<UINT64>(descriptorSize_) * (kAlphaDescriptorBase - 1);
+			list->SetComputeRootDescriptorTable(6, alphaTable);
+		}
+		list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
+		if (timestampHeap_)
+			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
+		D3D12_RESOURCE_BARRIER post[2] = {
+			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+			Transition(aoRaw_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+		};
+		list->ResourceBarrier(2, post);
+		// The ray counter's value after this frame, into this context's read-back slot.
+		D3D12_RESOURCE_BARRIER toCopy = Transition(aoCounter_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		list->ResourceBarrier(1, &toCopy);
+		list->CopyBufferRegion(aoCounterReadback_.Get(), sizeof(std::uint32_t) * a_index, aoCounter_.Get(), 0, sizeof(std::uint32_t));
+		D3D12_RESOURCE_BARRIER toUav = Transition(aoCounter_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+		list->ResourceBarrier(1, &toUav);
+		if (timestampHeap_ && timestampReadback_)
+			list->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase, 2, timestampReadback_.Get(), sizeof(std::uint64_t) * queryBase);
+		if (FAILED(hr = list->Close())) {
+			Fail("RTAO command list Close", hr);
+			return false;
+		}
+		return true;
+	}
+
+	float Backend::WaitForAO()
+	{
+		// (46f) The second fence (GPU-side): right before the first D3D11 pass that reads the RTAO result.
+		if (pendingAOWait_ == 0 || !context11_ || !aoFence11_)
+			return 0.0f;
+		const std::int64_t start = QpcNow();
+		const std::uint64_t value = pendingAOWait_;
+		pendingAOWait_ = 0;
+		if (FAILED(context11_->Wait(aoFence11_.Get(), value)))
+			Fail("D3D11 Wait (RTAO)", E_FAIL);
+		return static_cast<float>(QpcToMs(QpcNow() - start));
+	}
+
 	void Backend::Shutdown(bool a_waitForGpu)
 	{
 		if (a_waitForGpu && fence_ && fenceEvent_ && lastSubmitted_ && fence_->GetCompletedValue() < lastSubmitted_) {
 			if (SUCCEEDED(fence_->SetEventOnCompletion(lastSubmitted_, fenceEvent_)))
+				WaitForSingleObject(fenceEvent_, 2000);
+		}
+		// (46f) The last RTAO list (behind the second fence) too.
+		if (a_waitForGpu && aoFence_ && fenceEvent_ && aoFenceValue_ && aoFence_->GetCompletedValue() < aoFenceValue_) {
+			if (SUCCEEDED(aoFence_->SetEventOnCompletion(aoFenceValue_, fenceEvent_)))
 				WaitForSingleObject(fenceEvent_, 2000);
 		}
 		ready_ = false;
@@ -684,6 +986,26 @@ namespace RayTracingRT
 		pointAlphaPipeline_.Reset();
 		pointAlphaLastFrame_ = false;
 		pointRootSignature_.Reset();
+		// (46f)
+		if (aoCounterReadback_ && aoCounterMapped_)
+			aoCounterReadback_->Unmap(0, nullptr);
+		aoCounterMapped_ = nullptr;
+		aoCounter_.Reset();
+		aoCounterReadback_.Reset();
+		aoRaw_ = {};
+		aoWidth_ = aoHeight_ = 0;
+		aoBytes_ = 0;
+		aoCounterValid_ = false;
+		aoFrame_ = 0;
+		aoFault_.clear();
+		aoPipeline_.Reset();
+		aoAlphaPipeline_.Reset();
+		aoRootSignature_.Reset();
+		aoFence11_.Reset();
+		aoFence_.Reset();
+		aoFenceValue_ = 0;
+		pendingAOWait_ = 0;
+		stagingHeap_.Reset();
 		depthMask_ = {};
 		visibility_ = {};
 		textureWidth_ = textureHeight_ = 0;
@@ -898,24 +1220,45 @@ namespace RayTracingRT
 		WriteDescriptors();
 		if (pointVis_.resource12)
 			WritePointDescriptors();  // (46b) the depth SRV of its table
+		if (aoRaw_.resource12)
+			WriteAODescriptors();  // (46f) likewise
 		logger::info("[RayTracing] Shared textures {}x{}", a_width, a_height);
 		return true;
 	}
 
 	void Backend::WriteDescriptors()
 	{
-		auto cpu = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
+		// (46f) Into the staging heap; each submission records with its own copy (PublishDescriptors).
 		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
 		srvDesc.Format = kDepthMaskFormat;
 		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srvDesc.Texture2D.MipLevels = 1;
-		device_->CreateShaderResourceView(depthMask_.resource12.Get(), &srvDesc, cpu);
-		cpu.ptr += descriptorSize_;
+		device_->CreateShaderResourceView(depthMask_.resource12.Get(), &srvDesc, StagingCpu(kDynSun));
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
 		uavDesc.Format = kVisibilityFormat;
 		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-		device_->CreateUnorderedAccessView(visibility_.resource12.Get(), nullptr, &uavDesc, cpu);
+		device_->CreateUnorderedAccessView(visibility_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynSun + 1));
+	}
+
+	D3D12_CPU_DESCRIPTOR_HANDLE Backend::StagingCpu(std::uint32_t a_slot) const
+	{
+		auto cpu = stagingHeap_->GetCPUDescriptorHandleForHeapStart();
+		cpu.ptr += static_cast<SIZE_T>(descriptorSize_) * a_slot;
+		return cpu;
+	}
+
+	D3D12_GPU_DESCRIPTOR_HANDLE Backend::PublishDescriptors(std::size_t a_index)
+	{
+		// (46f) The context's block is used only by its own submissions, and a context is recorded only once its last
+		// submission (and RTAO list) completed: this copy never rewrites a descriptor the GPU may still read.
+		const UINT block = kDynamicBase + static_cast<UINT>(a_index) * kDynamicDescriptors;
+		auto dst = descriptorHeap_->GetCPUDescriptorHandleForHeapStart();
+		dst.ptr += static_cast<SIZE_T>(descriptorSize_) * block;
+		device_->CopyDescriptorsSimple(kDynamicDescriptors, dst, stagingHeap_->GetCPUDescriptorHandleForHeapStart(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		auto gpu = descriptorHeap_->GetGPUDescriptorHandleForHeapStart();
+		gpu.ptr += static_cast<UINT64>(descriptorSize_) * block;
+		return gpu;
 	}
 
 	void Backend::Retire(ComPtr<ID3D12Pageable> a_object, std::uint64_t a_bytes, std::uint64_t* a_counter)
@@ -1019,6 +1362,33 @@ namespace RayTracingRT
 				pointCounterLast_ = value;
 				pointCounterLastFrame_ = context.pointFrame;
 				pointCounterValid_ = true;
+			}
+		}
+		// (46f) This submission's RTAO list: its ray counter and its two timestamps (own pair, after the point lights').
+		if (context.aoPending) {
+			context.aoPending = false;
+			if (aoCounterMapped_) {
+				const std::uint32_t value = aoCounterMapped_[a_index];
+				if (aoCounterValid_ && context.aoFrame > aoCounterLastFrame_)
+					stats_.aoRaysPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(value - aoCounterLast_) / (context.aoFrame - aoCounterLastFrame_));
+				if (!aoCounterValid_ || context.aoFrame > aoCounterLastFrame_) {
+					aoCounterLast_ = value;
+					aoCounterLastFrame_ = context.aoFrame;
+					aoCounterValid_ = true;
+				}
+			}
+			if (timestampReadback_ && timestampFrequency_ != 0) {
+				const SIZE_T aoOffset = sizeof(std::uint64_t) * (kContexts * 6 + a_index * 2);
+				D3D12_RANGE aoRange{ aoOffset, aoOffset + sizeof(std::uint64_t) * 2 };
+				void* aoMapped = nullptr;
+				if (SUCCEEDED(timestampReadback_->Map(0, &aoRange, &aoMapped)) && aoMapped) {
+					const auto* t = reinterpret_cast<const std::uint64_t*>(static_cast<const std::byte*>(aoMapped) + aoOffset);
+					const std::uint64_t ab = t[0], ae = t[1];
+					D3D12_RANGE none{ 0, 0 };
+					timestampReadback_->Unmap(0, &none);
+					if (ae >= ab)
+						stats_.lastAOGpuMs = static_cast<float>(static_cast<double>(ae - ab) * 1000.0 / static_cast<double>(timestampFrequency_));
+				}
 			}
 		}
 		if (!context.timestampsPending || !timestampReadback_ || timestampFrequency_ == 0)
@@ -1512,6 +1882,7 @@ namespace RayTracingRT
 		};
 		CollectRetired();
 		const std::uint64_t completed = fence_->GetCompletedValue();
+		const std::uint64_t aoCompleted = AOCompleted();  // (46f)
 		// (45n) Early Prep: the builds and skinning of this frame are already on the GPU, recorded on the
 		// context PrepareFrame kept; only the TLAS and the trace are recorded here.
 		const bool early = prepared_;
@@ -1538,14 +1909,14 @@ namespace RayTracingRT
 		} else {
 			for (std::size_t offset = 0; offset < kContexts; ++offset) {
 				const std::size_t candidate = (cursor_ + offset) % kContexts;
-				if (contexts_[candidate].fenceValue == 0 || contexts_[candidate].fenceValue <= completed) {
+				if (ContextFree(contexts_[candidate], completed, aoCompleted)) {
 					index = candidate;
 					break;
 				}
 			}
 		}
 		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed)
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted)
 				CollectTimestamps(i);
 		if (index == kContexts) {
 			++stats_.skippedFramesBusy;
@@ -1777,6 +2148,8 @@ namespace RayTracingRT
 
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
 		traceList->SetDescriptorHeaps(1, heaps);
+		// (46f) This context's copy of the run-time descriptors (sun, point and RTAO tables).
+		const D3D12_GPU_DESCRIPTOR_HANDLE block = PublishDescriptors(index);
 		if (a_input.sun) {
 			traceList->SetComputeRootSignature(rootSignature_.Get());
 			// (45i) The character variants only on frames with character instances: every other frame
@@ -1788,7 +2161,7 @@ namespace RayTracingRT
 				traceList->SetPipelineState(alphaFrame ? alphaPipeline_.Get() : pipeline_.Get());
 			traceList->SetComputeRoot32BitConstants(0, kRootConstants, &a_input.constants, 0);
 			traceList->SetComputeRootShaderResourceView(1, tlas_->GetGPUVirtualAddress());
-			traceList->SetComputeRootDescriptorTable(2, descriptorHeap_->GetGPUDescriptorHandleForHeapStart());
+			traceList->SetComputeRootDescriptorTable(2, Offset(block, kDynSun, descriptorSize_));
 			if (alphaFrame) {
 				traceList->SetComputeRootShaderResourceView(3, context.alphaInfoBuffer->GetGPUVirtualAddress());
 				traceList->SetComputeRootShaderResourceView(4, alphaUv_->GetGPUVirtualAddress());
@@ -1803,7 +2176,7 @@ namespace RayTracingRT
 			// (46c) Without a sun trace (interiors) the texture is only transitioned; the shader does not read it (no sun gate).
 			D3D12_RESOURCE_BARRIER toRead = Transition(visibility_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 			traceList->ResourceBarrier(1, &toRead);
-			RecordPointTrace(traceList, context, index, a_input, alphaFrame);
+			RecordPointTrace(traceList, context, index, a_input, alphaFrame, Offset(block, kDynPoint, descriptorSize_));
 		} else {
 			pointAlphaLastFrame_ = false;
 		}
@@ -1825,7 +2198,21 @@ namespace RayTracingRT
 		}
 		if (FAILED(hr = traceList->Close()))
 			return Fail("command list Close", hr);
+		// (46f) RTAO: its own list on this context (recorded now, submitted right behind the trace).
+		const bool aoFrame = a_input.ao && RecordAOTrace(context, index, a_input, alphaFrame, Offset(block, kDynAO, descriptorSize_));
+		if (failed_)
+			return false;
+		stats_.aoTracedLastFrame = aoFrame;
 		lap(split.record);
+
+		// (46f) A second-fence wait never issued last frame (the AO was not used): the D3D11 queue takes it before this
+		// ready signal, so every value of the shared fence still orders after all earlier D3D12 work (Retire relies on it).
+		if (pendingAOWait_ != 0) {
+			const std::uint64_t aoValue = pendingAOWait_;
+			pendingAOWait_ = 0;
+			if (FAILED(hr = context11_->Wait(aoFence11_.Get(), aoValue)))
+				return Fail("D3D11 Wait (RTAO)", hr);
+		}
 
 		// GPU-side ordering only: the trace waits for everything D3D11 recorded so far (the depth /
 		// mask copy, the alpha copies); the D3D11 queue later waits for the trace.
@@ -1849,6 +2236,19 @@ namespace RayTracingRT
 		context.fenceValue = doneValue;
 		lastSubmitted_ = doneValue;
 		prepared_ = false;  // (45n) the kept context now has its done value
+		// (46f) RTAO right behind the trace, signalling the second fence (the D3D11 queue waits for it only right
+		// before the AO is used: WaitForAO). Not part of doneValue: rt_sync waits for the sun / point lights alone.
+		if (aoFrame) {
+			ID3D12CommandList* aoLists[] = { context.aoList.Get() };
+			queue_->ExecuteCommandLists(1, aoLists);
+			const std::uint64_t aoValue = ++aoFenceValue_;
+			if (FAILED(hr = queue_->Signal(aoFence_.Get(), aoValue)))
+				return Fail("D3D12 queue Signal (RTAO)", hr);
+			context.aoFenceValue = aoValue;
+			context.aoPending = true;
+			context.aoFrame = ++aoFrame_;
+			pendingAOWait_ = aoValue;
+		}
 		for (auto& blas : blas_)
 			if (blas.state == BlasState::Built && blas.buildFence == 0)
 				blas.buildFence = doneValue;
@@ -1881,16 +2281,17 @@ namespace RayTracingRT
 		const std::int64_t cpuStart = QpcNow();
 		CollectRetired();
 		const std::uint64_t completed = fence_->GetCompletedValue();
+		const std::uint64_t aoCompleted = AOCompleted();  // (46f)
 		std::size_t index = kContexts;
 		for (std::size_t offset = 0; offset < kContexts; ++offset) {
 			const std::size_t candidate = (cursor_ + offset) % kContexts;
-			if (contexts_[candidate].fenceValue == 0 || contexts_[candidate].fenceValue <= completed) {
+			if (ContextFree(contexts_[candidate], completed, aoCompleted)) {
 				index = candidate;
 				break;
 			}
 		}
 		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed)
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted)
 				CollectTimestamps(i);
 		if (index == kContexts)
 			return false;
@@ -1995,6 +2396,7 @@ namespace RayTracingRT
 			return Fail("D3D12 device", removed);
 		CollectRetired();
 		const std::uint64_t completed = fence_->GetCompletedValue();
+		const std::uint64_t aoCompleted = AOCompleted();  // (46f)
 		bool compactionDue = false;
 		for (const auto& blas : blas_) {
 			if (blas.state == BlasState::Built && blas.buildFence != 0 && blas.buildFence <= completed) {
@@ -2007,7 +2409,7 @@ namespace RayTracingRT
 		std::size_t index = kContexts;
 		for (std::size_t offset = 0; offset < kContexts; ++offset) {
 			const std::size_t candidate = (cursor_ + offset) % kContexts;
-			if (contexts_[candidate].fenceValue == 0 || contexts_[candidate].fenceValue <= completed) {
+			if (ContextFree(contexts_[candidate], completed, aoCompleted)) {
 				index = candidate;
 				break;
 			}
@@ -2015,7 +2417,7 @@ namespace RayTracingRT
 		if (index == kContexts)
 			return false;
 		for (std::size_t i = 0; i < kContexts; ++i)
-			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed)
+			if (contexts_[i].fenceValue != 0 && contexts_[i].fenceValue <= completed && contexts_[i].aoFenceValue <= aoCompleted)
 				CollectTimestamps(i);
 		auto& context = contexts_[index];
 		cursor_ = (index + 1) % kContexts;

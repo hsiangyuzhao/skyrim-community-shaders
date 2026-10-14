@@ -103,6 +103,10 @@ namespace Util::FrameTrace
 		int rtInterior = 0;
 		uint32_t plBeams = 0, smSkipped = 0, maskChannels = 0, interiorShapes = 0;
 		uint32_t plCarried = 0;  // (46e) sources carried by a traced character (its own body not tested)
+		// (46f) RTAO: D3D12 GPU ms of its rays, D3D11 filter + composite, the game queue's wait for its second fence (-1 = not run),
+		// rays per frame (read back a few frames late; -1 = not known, 0 = not traced).
+		float rtaoGpuMs = -1.0f, rtaoFilterGpuMs = -1.0f, rtaoSyncGpuMs = -1.0f;
+		int64_t rtaoRays = 0;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

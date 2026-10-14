@@ -141,6 +141,12 @@ namespace Util
 			{ "RT Point Lights: Denoiser",
 				"GPU time of cleaning up the ray-traced point-light shadows (per light: blur along soft edges, history). The point-light "
 				"trace itself runs on the ray tracer's own queue (Ray Tracing page, F7 column rt_pl_gpu_ms)." },
+			{ "RT Ambient Occlusion: Filter",
+				"GPU time of cleaning up the ray-traced ambient occlusion (quarter-resolution edge-aware blur, history blend) and mixing it "
+				"with Screen Space GI's AO. The rays themselves run on the ray tracer's own queue (F7 column rtao_gpu_ms)." },
+			{ "RT Ambient Occlusion: Wait",
+				"How long the game's GPU queue stood still waiting for the ray-traced ambient occlusion, right before it is used "
+				"(on the GPU; the CPU does not wait). Ideally about 0." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

@@ -283,9 +283,40 @@ add_custom_command(
     COMMENT "Compiling Ray Tracing DXIL (TracePointLightsCS with RT_ALPHA, cs_6_5)"
     VERBATIM
 )
+# (46f) RTAO: short cosine-weighted occlusion rays, its own list after the sun trace (second fence).
+set(CS_RT_AO_SHADER_SOURCE
+    "${CMAKE_SOURCE_DIR}/src/Features/RayTracing/Shaders/TraceAOCS.hlsl"
+)
+set(CS_RT_AO_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/TraceAOCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_AO_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -Fh
+        "${CS_RT_AO_SHADER_HEADER}" -Vn g_TraceAOCS "${CS_RT_AO_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_AO_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (TraceAOCS, cs_6_5)"
+    VERBATIM
+)
+set(CS_RT_AO_ALPHA_SHADER_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/RayTracing/TraceAOAlphaCS.dxil.h"
+)
+add_custom_command(
+    OUTPUT "${CS_RT_AO_ALPHA_SHADER_HEADER}"
+    COMMAND
+        "${CS_SDK_DXC}" -nologo -T cs_6_5 -E main -O3 -WX -Qstrip_reflect -D
+        RT_ALPHA=1 -Fh "${CS_RT_AO_ALPHA_SHADER_HEADER}" -Vn g_TraceAOAlphaCS
+        "${CS_RT_AO_SHADER_SOURCE}"
+    DEPENDS "${CS_RT_AO_SHADER_SOURCE}"
+    COMMENT "Compiling Ray Tracing DXIL (TraceAOCS with RT_ALPHA, cs_6_5)"
+    VERBATIM
+)
 target_sources(
     "${PROJECT_NAME}"
     PRIVATE
+        "${CS_RT_AO_SHADER_HEADER}"
+        "${CS_RT_AO_ALPHA_SHADER_HEADER}"
         "${CS_RT_POINT_SHADER_HEADER}"
         "${CS_RT_POINT_ALPHA_SHADER_HEADER}"
         "${CS_RT_SHADER_HEADER}"

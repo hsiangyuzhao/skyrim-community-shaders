@@ -559,6 +559,12 @@ void Deferred::DeferredPasses()
 		Util::CpuPassScope timer("ScreenSpaceGI");
 		ssgi.DrawSSGI();
 	}
+	// (46f) Ray-traced AO (Ray Tracing > Ambient Occlusion): the D3D11 queue waits for its second fence here, right
+	// before its first consumer, then its filter and the mix with SSGI's AO (ssgi.aoOverride). Nothing without it.
+	if (auto& rayTracing = globals::features::rayTracing; rayTracing.loaded) {
+		Util::CpuPassScope timer("Ray Tracing AO");
+		rayTracing.DrawAmbientOcclusion();
+	}
 	auto [ssgi_ao, ssgi_y, ssgi_cocg, ssgi_gi_spec] = ssgi.GetOutputTextures();
 	bool ssgi_hq_spec = ssgi.settings.EnableExperimentalSpecularGI;
 
