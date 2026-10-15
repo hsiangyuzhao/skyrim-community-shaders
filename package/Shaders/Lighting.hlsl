@@ -1075,12 +1075,13 @@ float3 GetWetFilmSpecular(float3 N, float3 V, float3 L, float3 lightColor, float
 #		include "Skin/Skin.hlsli"
 #	endif
 
-#	if defined(SSPLS)
-#		include "ScreenSpacePointLightShadows/SSPLS.hlsli"
-#	endif
-
+// (46y) The point-light trace first: SSPLS.hlsli reads its traced-caster mark (Screen-Space Shadows for Non-RT Casters).
 #	if defined(RT_POINT_SHADOWS) && defined(LIGHT_LIMIT_FIX)
 #		include "RayTracing/PointLightShadows.hlsli"
+#	endif
+
+#	if defined(SSPLS)
+#		include "ScreenSpacePointLightShadows/SSPLS.hlsli"
 #	endif
 
 #	if defined(PHYSICAL_SKY)
@@ -4022,6 +4023,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #		else
 
+#			if defined(SSPLS)
+	// (46y) Debug view SSPLS Coverage: per pixel the point light reaching it, by kind of shadow (x RT only, y RT + screen-space for
+	// non-RT casters, z not ray traced: screen-space and / or shadow map, w no shadow), weighted by each light's brightness here.
+	const bool ssplsCoverageView = (SharedData::ssplsSettings.Enable & ScreenSpacePointLightShadows::SettingFlags::CoverageView) != 0;
+	float4 ssplsCoverage = 0.0;
+#			endif
 	uint numClusteredLights = 0;
 	uint totalLightCount = LightLimitFix::NumStrictLights;
 	uint clusterIndex = 0;
@@ -4090,20 +4097,37 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #			if defined(SSPLS)
 		uint ssplsSteps = round(SharedData::ssplsSettings.StepLimit * (1.0 - saturate(viewPosition.z / SharedData::ssplsSettings.MaxDistance)));
-		[branch] if (
-			SharedData::ssplsSettings.Enable && inWorld &&
-			!(light.lightFlags & LightLimitFix::LightFlags::Simple) &&
-			shadowComponent != 0.0 &&
-			lightAngle > 0.0
+		// (46y) Screen-Space Shadows for Non-RT Casters (the light's tag): beside RT, only occluders the ray tracer does not see.
 #				if defined(RT_POINT_SHADOWS)
-			&& (!rtShadow || (light.rtShadow & RTPointShadows::kKeepSSPLS))
+		const bool ssplsNonRT = rtShadow && (light.rtShadow & RTPointShadows::kSSPLSNonRT) != 0;
+		const bool ssplsBesideRT = ssplsNonRT || (light.rtShadow & RTPointShadows::kKeepSSPLS) != 0;
+#				else
+		const bool ssplsNonRT = false;
+		const bool ssplsBesideRT = false;
 #				endif
-		)
+		const bool ssplsRun = SharedData::ssplsSettings.Enable && inWorld &&
+		                      !(light.lightFlags & LightLimitFix::LightFlags::Simple) &&
+		                      shadowComponent != 0.0 &&
+		                      lightAngle > 0.0 &&
+		                      (!rtShadow || ssplsBesideRT);
+		[branch] if (ssplsRun)
 		{
 			float3 lightDirectionVS = FrameBuffer::WorldToView(light.positionWS[eyeIndex].xyz, true, eyeIndex) - viewPosition.xyz;
-			float SSPLSShadow = lerp(1.0, ScreenSpacePointLightShadows::GetShadow(LinearSampler, viewPosition, screenNoise, lightDirectionVS, ssplsSteps, light.radius, eyeIndex, light.lightFlags & LightLimitFix::LightFlags::Shadow), SharedData::ssplsSettings.Strength);
+			// (46y) Contact length for traced occluders: the tag's eighths x the trace's start offset (RayTracing.cpp kRayBiasConstant
+			// + kRayBiasPerUnit x the distance to the camera). -1: every occluder counts.
+			const float ssplsRtContact = ssplsNonRT ? float((light.rtShadow >> 16) & 0xFFu) * 0.125 * (2.0 + 0.0015 * length(viewPosition.xyz)) : -1.0;
+			float SSPLSShadow = lerp(1.0, ScreenSpacePointLightShadows::GetShadow(LinearSampler, viewPosition, screenNoise, lightDirectionVS, ssplsSteps, light.radius, eyeIndex, light.lightFlags & LightLimitFix::LightFlags::Shadow, ssplsRtContact), SharedData::ssplsSettings.Strength);
 			// (46b) Kept beside a ray-traced shadow: the darker of both (a shadow both see is not doubled).
 			lightShadow = rtShadow ? min(lightShadow, SSPLSShadow) : lightShadow * SSPLSShadow;
+		}
+		[branch] if (ssplsCoverageView)
+		{
+			const float coverageWeight = Color::RGBToLuminance(max(lightColor, 0.0)) * saturate(lightAngle);
+			const bool shadowMap = (Permutation::PixelShaderDescriptor & Permutation::LightingFlags::DefShadow) && (light.lightFlags & LightLimitFix::LightFlags::Shadow) && !rtApplied;
+			if (rtShadow)
+				ssplsCoverage += ssplsRun ? float4(0.0, coverageWeight, 0.0, 0.0) : float4(coverageWeight, 0.0, 0.0, 0.0);
+			else
+				ssplsCoverage += (ssplsRun || shadowMap) ? float4(0.0, 0.0, coverageWeight, 0.0) : float4(0.0, 0.0, 0.0, coverageWeight);
 		}
 #			endif
 
@@ -4992,6 +5016,23 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		const float3 classTint = lerp(gearClass.x * float3(1.0, 0.15, 0.1) + gearClass.y * float3(1.0, 0.8, 0.1) + gearClass.z * float3(0.15, 0.4, 1.0), float3(0.2, 0.9, 0.2), gearClass.w);
 #		endif
 		color.xyz = classTint * (0.3 + 0.7 * saturate(Color::RGBToLuminance(baseColor.xyz) * 2.0));
+		outputAlbedo = 0.0;
+		specularColor = 0.0;
+	}
+#	endif
+
+#	if defined(SSPLS) && defined(LIGHT_LIMIT_FIX) && !defined(LOD)
+	// (46y) Debug view SSPLS Coverage (Ray Tracing > Diagnostics): green = ray traced only, cyan = ray traced + screen-space for the
+	// non-RT casters, orange = not ray traced (screen-space and / or shadow map), red = no shadow, dark grey = no point light.
+	[branch] if (ssplsCoverageView)
+	{
+		const float coverageTotal = dot(ssplsCoverage, 1.0.xxxx);
+		const float3 coverageTint = coverageTotal > 1e-5 ?
+		                                (ssplsCoverage.x * float3(0.1, 0.9, 0.2) + ssplsCoverage.y * float3(0.1, 0.8, 0.9) + ssplsCoverage.z * float3(1.0, 0.5, 0.05) +
+		                                    ssplsCoverage.w * float3(0.9, 0.05, 0.05)) /
+		                                    coverageTotal :
+		                                float3(0.06, 0.06, 0.06);
+		color.xyz = coverageTint * (0.3 + 0.7 * saturate(Color::RGBToLuminance(baseColor.xyz) * 2.0));
 		outputAlbedo = 0.0;
 		specularColor = 0.0;
 	}

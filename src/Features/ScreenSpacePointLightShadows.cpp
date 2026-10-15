@@ -1,6 +1,7 @@
 #include "ScreenSpacePointLightShadows.h"
 
 #include "JiayeStatement.h"
+#include "RayTracing.h"
 #include "Util.h"
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -67,7 +68,8 @@ ScreenSpacePointLightShadows::PerFrame ScreenSpacePointLightShadows::GetCommonBu
 {
 	PerFrame data = {
 		// (45) Fixed Math / Stable Noise travel as bits of Enable (see SSPLS.hlsli SettingFlags); (45o) always on.
-		.Enable = settings.Enable ? (1u | 2u | 4u) : 0u,
+		// (46y) bit 3: Ray Tracing debug view SSPLS Coverage (drawn by Lighting.hlsl; only while SSPLS is on).
+		.Enable = settings.Enable ? (1u | 2u | 4u | (globals::features::rayTracing.SSPLSCoverageView() ? 8u : 0u)) : 0u,
 		.Strength = settings.Strength,
 		.StepLimit = settings.StepLimit,
 		.RayLength = settings.RayLength,

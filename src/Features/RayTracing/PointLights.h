@@ -43,6 +43,11 @@ namespace RayTracingPointLights
 	inline constexpr std::uint32_t kTagNative = 1u << 8;    // the engine's shadow-map light: RT replaces its shadow map
 	inline constexpr std::uint32_t kTagKeepSSPLS = 1u << 9; // keep Screen Space Point Light Shadows as contact shadows (min with RT)
 	inline constexpr std::uint32_t kTagSplit = 1u << 10;    // debug A/B: RT on the left half of the screen only
+	// (46y) Screen-Space Shadows for Non-RT Casters: Screen Space Point Light Shadows run beside RT for this light, but an occluder
+	// sample that is a ray-traced caster (TracePointLightsCS marks those pixels) shadows only within the contact length; bits 16-23
+	// = that length in eighths of the ray tracer's start offset (RT Caster Contact Length x 8).
+	inline constexpr std::uint32_t kTagSSPLSNonRT = 1u << 11;
+	inline constexpr std::uint32_t kTagContactShift = 16u;
 
 	// GpuSource::info[0] bits (TracePointLightsCS).
 	inline constexpr std::uint32_t kSourceISL = 1u;     // inverse-square attenuation (InverseSquareLighting)
@@ -107,6 +112,8 @@ namespace RayTracingPointLights
 	{
 		bool native = true;         // include the engine's shadow-map lights (RT replaces their shadow map in Lighting)
 		bool keepSSPLS = false;     // tag: keep SSPLS as contact shadows for RT lights
+		bool ssplsNonRT = false;    // (46y) tag: SSPLS beside RT for occluders the ray tracer does not see (wins over keepSSPLS)
+		float ssplsContact = 8.0f;  // (46y) their contact length for traced occluders, x the ray start offset (0 - 31.875)
 		bool split = false;         // tag: debug split screen
 		std::uint32_t maxSources = 64;
 		float maxDistance = 4000.0f;  // light centre to camera

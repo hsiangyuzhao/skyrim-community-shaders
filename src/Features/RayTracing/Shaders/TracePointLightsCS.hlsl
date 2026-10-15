@@ -15,7 +15,8 @@
 //   PLVis[s]: 1 = lit; < 1 = blocked, the value is sqrt(blocker distance / light distance) * 254/255
 //             (the denoiser's penumbra width);
 //   PLIdx[s]: byte = source slot + 1 (0 = empty slot), bit 7 of byte s = bit s of the pixel's candidate
-//             count (0..15, the debug view).
+//             count (0..15, the debug view). (46y) The count has 3 bits (bytes 0-2, 0..7); bit 7 of byte 3 = the visible
+//             surface is a ray-traced caster (kFlagRtSurface; Screen-Space Shadows for Non-RT Casters, SSPLS.hlsli).
 // Positions are camera-relative (the TLAS is built around the same camera position).
 //
 // Rays: the scene (instance mask 0x01, every opaque instance) and, when characters are in the TLAS, a
@@ -72,6 +73,7 @@ static const uint kFlagCharCull = 4u;     // the character ray only where the se
 static const uint kFlagSticky = 8u;          // (46g) last frame's sources of the pixel rank x kStickyBonus and pass at half the share cut
 static const uint kFlagBeamCullFront = 16u;  // (46g) window beam rays cull triangles facing the ray start (the room shell from inside)
 static const uint kFlagBeamCullBack = 32u;   // (46g) ... or the ones facing away
+static const uint kFlagRtSurface = 64u;      // (46y) probe whether the visible surface is a traced caster (PLIdx.w bit 7)
 static const float kStickyBonus = 1.5;
 static const uint kChurnWord = 1u;           // (46g) RayCounter words: [1] pixels whose source set changed
 static const uint kBeamWordBase = 64u;       // ... from 64: per slot, sampled beam cone pixels traced / blocked
@@ -290,6 +292,28 @@ bool BlockedExcept(float3 origin, float3 dir, float tMax, uint mask, float tMin,
 	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
+// (46y, kFlagRtSurface) Is the visible surface at P part of the ray-traced scene, as the point-light rays see it? A short segment
+// through P along the view ray, any hit (TraceShadowsCS SurfaceProbe; tight, so grass on traced ground is not the ground). Without
+// RT_ALPHA the alpha-tested instances are culled, as in Blocked(): they block no point light, so they are not traced casters.
+bool SurfaceProbe(float3 P, float3 V, float3 N, float dist)
+{
+	const float cosTheta = max(abs(dot(N, V)), 0.25);
+	const float tolerance = min(clamp(1.5 + dist * 0.002, 1.5, 24.0) / cosTheta, 48.0);
+	RayDesc ray;
+	ray.Origin = P + V * tolerance;
+	ray.Direction = -V;
+	ray.TMin = 0.0;
+	ray.TMax = tolerance * 2.0;
+#if defined(RT_ALPHA)
+	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
+#else
+	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_CULL_NON_OPAQUE> q;
+#endif
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+	q.Proceed();
+	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+}
+
 // Does the segment origin -> origin + dir * tMax pass the sphere?
 bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 {
@@ -375,6 +399,12 @@ groupshared uint gsMask[2];
 	N = nLen > 1e-12 ? N / nLen : V;
 	if (dot(N, V) < 0.0)
 		N = -N;
+	// (46y) Is this surface a traced caster (an occluder for other pixels' Screen Space Point Light Shadows)?
+	bool rtSurface = false;
+	[branch] if (flags & kFlagRtSurface)
+	{
+		rtSurface = SurfaceProbe(P, V, N, dist);
+	}
 
 	// Top K by contribution.
 	float best[4] = { 0.0, 0.0, 0.0, 0.0 };      // ranking value (x kStickyBonus for last frame's sources)
@@ -451,7 +481,7 @@ groupshared uint gsMask[2];
 	const uint beamCull = (flags & kFlagBeamCullFront) ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : ((flags & kFlagBeamCullBack) ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : RAY_FLAG_NONE);
 	const bool beamSample = ((p.x & 3) | (p.y & 3)) == 0;  // (46g) 1 of 16 pixels feeds the beam counters
 	float4 vis = 1.0;
-	uint rays = 0u;
+	uint rays = (flags & kFlagRtSurface) ? 1u : 0u;  // (46y) the surface probe above
 	uint4 idx = 0u;
 	[unroll] for (uint k = 0u; k < 4u; ++k)
 	{
@@ -532,9 +562,11 @@ groupshared uint gsMask[2];
 		uint previousChurn;
 		RayCounter.InterlockedAdd(kChurnWord * 4u, churned, previousChurn);
 	}
-	count = min(count, 15u);
-	[unroll] for (uint b = 0u; b < 4u; ++b)
+	count = min(count, 7u);  // (46y) 3 bits; byte 3's bit 7 is the traced-caster mark
+	[unroll] for (uint b = 0u; b < 3u; ++b)
 		idx[b] |= ((count >> b) & 1u) << 7;
+	if (rtSurface)
+		idx[3] |= 0x80u;
 	PLVis[p] = vis;
 	PLIdx[p] = float4(idx) / 255.0;
 	// One atomic per wave (the lanes that returned early traced nothing).

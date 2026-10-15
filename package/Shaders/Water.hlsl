@@ -974,12 +974,13 @@ float3 GetSunColor(float3 normal, float3 viewDirection)
 #			include "IBL/IBL.hlsli"
 #		endif
 
-#		if defined(SSPLS)
-#			include "ScreenSpacePointLightShadows/SSPLS.hlsli"
-#		endif
-
+// (46y) The point-light trace first: SSPLS.hlsli reads its traced-caster mark (Screen-Space Shadows for Non-RT Casters).
 #		if defined(RT_POINT_SHADOWS) && defined(LIGHT_LIMIT_FIX)
 #			include "RayTracing/PointLightShadows.hlsli"
+#		endif
+
+#		if defined(SSPLS)
+#			include "ScreenSpacePointLightShadows/SSPLS.hlsli"
 #		endif
 
 PS_OUTPUT main(PS_INPUT input)
@@ -1135,12 +1136,18 @@ PS_OUTPUT main(PS_INPUT input)
 				!(light.lightFlags & LightLimitFix::LightFlags::Simple) &&
 				lightAngle > 0.0
 #						if defined(RT_POINT_SHADOWS)
-				&& (!rtShadow || (light.rtShadow & RTPointShadows::kKeepSSPLS))
+				&& (!rtShadow || (light.rtShadow & (RTPointShadows::kKeepSSPLS | RTPointShadows::kSSPLSNonRT)))
 #						endif
 			)
 			{
 				float3 lightDirectionVS = FrameBuffer::WorldToView(light.positionWS[eyeIndex].xyz, true, eyeIndex) - viewPosition.xyz;
-				float SSPLSShadow = lerp(1.0, ScreenSpacePointLightShadows::GetShadow(LinearSampler, viewPosition, screenNoise, lightDirectionVS, ssplsSteps, light.radius, eyeIndex, light.lightFlags & LightLimitFix::LightFlags::Shadow), SharedData::ssplsSettings.Strength);
+				// (46y) Non-RT casters (the light's tag): traced occluders only within the contact length (see Lighting.hlsl).
+#						if defined(RT_POINT_SHADOWS)
+				const float ssplsRtContact = (rtShadow && (light.rtShadow & RTPointShadows::kSSPLSNonRT)) ? float((light.rtShadow >> 16) & 0xFFu) * 0.125 * (2.0 + 0.0015 * length(viewPosition.xyz)) : -1.0;
+#						else
+				const float ssplsRtContact = -1.0;
+#						endif
+				float SSPLSShadow = lerp(1.0, ScreenSpacePointLightShadows::GetShadow(LinearSampler, viewPosition, screenNoise, lightDirectionVS, ssplsSteps, light.radius, eyeIndex, light.lightFlags & LightLimitFix::LightFlags::Shadow, ssplsRtContact), SharedData::ssplsSettings.Strength);
 				// (46b) Beside a ray-traced shadow: the darker of both.
 				lightColor *= rtShadow ? min(SSPLSShadow / max(rtVisibility, 1e-4), 1.0) : SSPLSShadow;
 			}

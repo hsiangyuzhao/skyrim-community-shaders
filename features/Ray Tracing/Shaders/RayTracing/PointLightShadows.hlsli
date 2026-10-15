@@ -25,6 +25,9 @@ namespace RTPointShadows
 	static const uint kNative = 1u << 8;     // an engine shadow-map light: RT replaces its shadow map
 	static const uint kKeepSSPLS = 1u << 9;  // Screen Space Point Light Shadows stay on as contact shadows (min with RT)
 	static const uint kSplit = 1u << 10;     // debug A/B: RT on the left half of the screen only
+	// (46y) Screen-Space Shadows for Non-RT Casters: SSPLS beside RT, an occluder that is a traced caster (Sources.w bit 7 at its
+	// pixel, TracePointLightsCS) counts only within the contact length; bits 16-23 = that length in eighths of the trace's start offset.
+	static const uint kSSPLSNonRT = 1u << 11;
 
 	/// True when this pixel has a ray-traced visibility for the light with this tag (o_visibility, 0..1).
 	/// a_position: SV_Position.xy (render-target pixel); a_screenUV: the shader's screen UV; a_viewDepth:

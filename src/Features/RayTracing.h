@@ -82,6 +82,7 @@ public:
 		PLSources,       // which source each slot traces (colour per source)
 		PLRaw,           // this frame's rays (all traced lights multiplied)
 		PLDenoised,      // after the denoiser
+		PLSsplsCoverage, // (46y) drawn by Lighting.hlsl: per pixel, which shadows its point lights get (RT, SSPLS, both)
 		Count
 	};
 
@@ -237,6 +238,16 @@ public:
 		bool AONormalGuided = true;
 		bool AOFullResFilter = false;
 		int AOAlphaBudget = 0;
+		// (46y) Outside the settings macro too. Screen-Space Shadows for Non-RT Casters (Point Light Shadows): for ray-traced lights
+		// Screen Space Point Light Shadows run as well, but only occluders the ray tracer does not see shadow (grass, terrain, LOD,
+		// decals; traced casters only within PointLightsSSPLSContact x the ray start offset). Off = 46x (Keep Screen-Space Contact
+		// Shadows decides). RTAO Single Long Ray: the long direction is one closest-hit ray classified by its hit distance (same
+		// near / far result as the two segments; off = 46x). RTAO Half-Resolution Broad Term: the far part is traced on a checkerboard
+		// that alternates every frame (the filter fills the other half from the neighbours; off = 46x, default off).
+		bool PointLightsSSPLSNonRT = true;
+		float PointLightsSSPLSContact = 8.0f;
+		bool AOSingleRay = true;
+		bool AOHalfResFar = false;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -323,6 +334,8 @@ public:
 	/// (46b) Light Limit Fix, for each light it uploads: the ray-traced shadow tag (LightData::rtShadow), 0 unless
 	/// this frame's trace has a shadow source for the light.
 	[[nodiscard]] std::uint32_t PointLightTag(const RE::BSLight* a_light) const { return pointSelector.TagFor(a_light); }
+	/// (46y) Debug view SSPLS Coverage: Screen Space Point Light Shadows asks Lighting.hlsl to draw it (SSPLS.hlsli CoverageView).
+	[[nodiscard]] bool SSPLSCoverageView() const { return debugView == DebugView::PLSsplsCoverage; }
 	/// (46x) Light Census: this frame's 46x class of a light (RayTracingPointLights::Decision | why << 8; 0 = none). Render thread.
 	[[nodiscard]] std::uint16_t PointLightDecision(const RE::BSLight* a_light) const { return pointSelector.DecisionFor(a_light); }
 	/// (46x) Light Census: this frame's point-light selection counts (fill classes, portals).

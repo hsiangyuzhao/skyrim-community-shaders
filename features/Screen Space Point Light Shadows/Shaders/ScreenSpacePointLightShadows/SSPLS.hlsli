@@ -8,8 +8,30 @@
 
 namespace ScreenSpacePointLightShadows
 {
+	/// (46y) Screen-Space Shadows for Non-RT Casters: is the visible surface at this screen UV a ray-traced caster? The point-light
+	/// trace marks it in bit 7 of the 4th byte of its per-pixel source ids (RayTracing/PointLightShadows.hlsli Sources, included
+	/// before this file). False where nothing was traced (outside its area, no light near) and without Ray Tracing.
+	bool IsRtCaster(float2 a_uv, uint a_eyeIndex)
+	{
+#if defined(RT_POINT_LIGHT_SHADOWS_HLSLI)
+		const int3 texel = SharedData::ConvertUVToSampleCoord(saturate(a_uv), a_eyeIndex);
+		return (uint(RTPointShadows::Sources.Load(texel).w * 255.0 + 0.5) & 0x80u) != 0u;
+#else
+		return false;
+#endif
+	}
 
-	float Raymarch(SamplerState s, float3 viewPosition, float3 lightDirectionVS, uint steps, float step, float2 stepScale, float compareToleranceScale, float radius, float2x2 rotationMatrix, uint a_eyeIndex = 0)
+	/// (46y) a_rtContact < 0: every occluder counts (as before). Else an occluder sample that is a ray-traced caster counts only
+	/// within a_rtContact view units of the start (the ray tracer handles it farther along the ray).
+	bool IgnoreOccluder(float a_rtContact, float a_travelled, float2 a_uv, uint a_eyeIndex)
+	{
+		bool ignore = false;
+		[branch] if (a_rtContact >= 0.0 && a_travelled > a_rtContact)
+			ignore = IsRtCaster(a_uv, a_eyeIndex);
+		return ignore;
+	}
+
+	float Raymarch(SamplerState s, float3 viewPosition, float3 lightDirectionVS, uint steps, float step, float2 stepScale, float compareToleranceScale, float radius, float2x2 rotationMatrix, uint a_eyeIndex = 0, float a_rtContact = -1.0)
 	{
 		float opacity = 1.0;
 		radius *= SharedData::ssplsSettings.SoftShadowScale * 0.0001;
@@ -38,10 +60,12 @@ namespace ScreenSpacePointLightShadows
 			float depthDelta = viewPosition.z - rayDepth;
 			const float distanceScale = 1 - rayDepth / SharedData::ssplsSettings.MaxDistance;
 			if (rayDepth != startPosition.z) {
+				// (46y) Non-RT casters: a traced occluder past the contact length is the ray tracer's.
+				const float travelled = length(viewPosition - startPosition);
 				[branch] if (i == 0 || !SharedData::ssplsSettings.EnableSoftShadows)
 				{
 					bool hit = abs(depthDelta - compareTolerance) < compareTolerance;
-					if (hit) {
+					if (hit && !IgnoreOccluder(a_rtContact, travelled, rayUV, a_eyeIndex)) {
 						return 0.0;
 					}
 				}
@@ -52,7 +76,7 @@ namespace ScreenSpacePointLightShadows
 					float sampleOpacity = 1.0;
 					bool hit = (depthDelta > 0.5 * compareTolerance) && (depthDelta < compareTolerance * 1.5);
 					bool possibleHit = (depthDelta + compareTolerance > 0.0) && (depthDelta < compareTolerance * 3.0);
-					if (hit) {
+					if (hit && !IgnoreOccluder(a_rtContact, travelled, rayUV, a_eyeIndex)) {
 						return 0.0;
 					}
 					if (possibleHit)
@@ -64,7 +88,7 @@ namespace ScreenSpacePointLightShadows
 
 							float sampleDepthDelta = viewPosition.z - sampleDepth;
 							bool hit = abs(sampleDepthDelta - compareTolerance) < compareTolerance;
-							if (hit) {
+							if (hit && !IgnoreOccluder(a_rtContact, travelled, sampleUV, a_eyeIndex)) {
 								sampleOpacity -= 1.0 / sampleTimes;
 							}
 						}
@@ -87,11 +111,12 @@ namespace ScreenSpacePointLightShadows
 		static const uint Enable = (1 << 0);
 		static const uint FixedMath = (1 << 1);
 		static const uint StableNoise = (1 << 2);
+		static const uint CoverageView = (1 << 3);  // (46y) Ray Tracing debug view SSPLS Coverage, drawn by Lighting.hlsl
 	}
 
 	/// Legacy (pre-45) ray march setup. noiseOffset / noiseRotation are both the caller's noise when
 	/// Stable Noise is off, which keeps this path identical to the old one.
-	float GetShadowLegacy(SamplerState s, float3 viewPosition, float noiseOffset, float noiseRotation, float offsetAmplitude, float3 lightDirectionVS, uint steps, float radius, uint a_eyeIndex, bool isShadowCaster)
+	float GetShadowLegacy(SamplerState s, float3 viewPosition, float noiseOffset, float noiseRotation, float offsetAmplitude, float3 lightDirectionVS, uint steps, float radius, uint a_eyeIndex, bool isShadowCaster, float a_rtContact)
 	{
 		const float rayLength = SharedData::ssplsSettings.RayLength;
 		if (rayLength <= 0.0)
@@ -118,7 +143,7 @@ namespace ScreenSpacePointLightShadows
 
 		const float compareToleranceScale = isShadowCaster ? shadowCasterToleranceScale : SharedData::ssplsSettings.CompareToleranceScale;
 
-		return Raymarch(s, viewPosition, lightDirectionVS, steps, step, stepScale, compareToleranceScale, radius, rotationMatrix, a_eyeIndex);
+		return Raymarch(s, viewPosition, lightDirectionVS, steps, step, stepScale, compareToleranceScale, radius, rotationMatrix, a_eyeIndex, a_rtContact);
 	}
 
 	/// (45 SSPLS) How much one depth comparison says "blocked": 0 in front of the scene surface,
@@ -139,7 +164,9 @@ namespace ScreenSpacePointLightShadows
 	/// - occlusion is accumulated as a fraction, casters near the end of the ray weigh less
 	/// - smooth fade towards the distance where the caller's step count drops to 0 (no step bands)
 	/// - lights with a shadow map only get contact-range shadows (no double darkening)
-	float GetShadowFixed(float3 viewPosition, float noiseOffset, float noiseRotation, float offsetAmplitude, float3 toLight, uint steps, float lightRadius, uint a_eyeIndex, bool isShadowCaster)
+	/// - (46y) a_rtContact >= 0 (Screen-Space Shadows for Non-RT Casters): an occluder sample that is a ray-traced caster counts
+	///   only within a_rtContact units along the ray; the ray tracer has the rest
+	float GetShadowFixed(float3 viewPosition, float noiseOffset, float noiseRotation, float offsetAmplitude, float3 toLight, uint steps, float lightRadius, uint a_eyeIndex, bool isShadowCaster, float a_rtContact)
 	{
 		static const float kShadowCasterContactRange = 24.0;  // game units (~35 cm)
 		static const float2 kSoftTaps[4] = { float2(0.85, 0.15), float2(-0.15, 0.85), float2(-0.85, -0.15), float2(0.15, -0.85) };
@@ -200,6 +227,13 @@ namespace ScreenSpacePointLightShadows
 			const float thickness = max(thicknessScale * rayPosition.z, stepDepth);
 			const float depthDelta = rayPosition.z - sceneZ;
 			float hit = HitAmount(depthDelta, thickness);
+			// (46y) Non-RT casters: past the contact length a traced occluder is the ray tracer's (its soft taps too).
+			const bool rtFilter = a_rtContact >= 0.0 && t > a_rtContact;
+			[branch] if (rtFilter && hit > 0.0)
+			{
+				if (IsRtCaster(rayUV, a_eyeIndex))
+					hit = 0.0;
+			}
 
 			[branch] if (soft && depthDelta > -thickness && depthDelta < 3.0 * thickness)
 			{
@@ -211,7 +245,13 @@ namespace ScreenSpacePointLightShadows
 					[unroll] for (uint j = 0; j < 4; j++)
 					{
 						const float2 tapUV = rayUV + mul(kSoftTaps[j], rotationMatrix) * penumbraPixels / renderSize;
-						taps += HitAmount(rayPosition.z - SharedData::GetScreenDepth(saturate(tapUV), a_eyeIndex), thickness);
+						float tap = HitAmount(rayPosition.z - SharedData::GetScreenDepth(saturate(tapUV), a_eyeIndex), thickness);
+						[branch] if (rtFilter && tap > 0.0)
+						{
+							if (IsRtCaster(tapUV, a_eyeIndex))
+								tap = 0.0;
+						}
+						taps += tap;
 					}
 					hit = taps * 0.2;
 				}
@@ -242,7 +282,8 @@ namespace ScreenSpacePointLightShadows
 		return float2(frac(spatial + r1), spatial);
 	}
 
-	float GetShadow(SamplerState s, float3 viewPosition, float noise2D, float3 lightDirectionVS, uint steps, float radius, uint a_eyeIndex = 0, bool isShadowCaster = false)
+	/// (46y) a_rtContact: see GetShadowFixed (< 0 = every occluder counts, as before).
+	float GetShadow(SamplerState s, float3 viewPosition, float noise2D, float3 lightDirectionVS, uint steps, float radius, uint a_eyeIndex = 0, bool isShadowCaster = false, float a_rtContact = -1.0)
 	{
 		if (steps == 0)
 			return 1.0;
@@ -261,9 +302,9 @@ namespace ScreenSpacePointLightShadows
 		}
 
 		[branch] if (flags & SettingFlags::FixedMath)
-			return GetShadowFixed(viewPosition, noiseOffset, noiseRotation, offsetAmplitude, lightDirectionVS, steps, radius, a_eyeIndex, isShadowCaster);
+			return GetShadowFixed(viewPosition, noiseOffset, noiseRotation, offsetAmplitude, lightDirectionVS, steps, radius, a_eyeIndex, isShadowCaster, a_rtContact);
 
-		return GetShadowLegacy(s, viewPosition, noiseOffset, noiseRotation, offsetAmplitude, lightDirectionVS, steps, radius, a_eyeIndex, isShadowCaster);
+		return GetShadowLegacy(s, viewPosition, noiseOffset, noiseRotation, offsetAmplitude, lightDirectionVS, steps, radius, a_eyeIndex, isShadowCaster, a_rtContact);
 	}
 }
 #endif  // SSPLS_COMMON

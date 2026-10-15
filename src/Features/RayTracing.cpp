@@ -3,6 +3,7 @@
 #include "Deferred.h"
 #include "Features/RayTracing/CasterFilter.h"
 #include "Features/ScreenSpaceGI.h"
+#include "Features/ScreenSpacePointLightShadows.h"
 #include "Features/ScreenSpaceShadows.h"
 #include "Features/Upscaling.h"
 #include "State.h"
@@ -218,6 +219,7 @@ namespace
 	constexpr float kPointSunShare = 0.05f;          // at a sunlit pixel a point light under 5 % of the sun's light there is not traced
 	constexpr std::uint32_t kPointFlagCharacters = 1u, kPointFlagFirstPerson = 2u, kPointFlagCharCull = 4u;  // TracePointLightsCS
 	constexpr std::uint32_t kPointFlagSticky = 8u, kPointFlagBeamCullFront = 16u, kPointFlagBeamCullBack = 32u;  // (46g) TracePointLightsCS
+	constexpr std::uint32_t kPointFlagRtSurface = 64u;  // (46y) TracePointLightsCS: mark traced-caster surfaces for SSPLS
 	constexpr std::uint32_t kPointDenoiseHistory = 1u, kPointDenoiseDebug = 2u;                             // PointDenoiseCS
 	constexpr float kBeamRayMargin = 64.0f;  // (46c) a window beam's ray goes this far past the interior's box
 	// (46f) RTAO.
@@ -1208,6 +1210,11 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AONormalGuided = read("AONormalGuided", defaults.AONormalGuided);
 		settings.AOFullResFilter = read("AOFullResFilter", defaults.AOFullResFilter);
 		settings.AOAlphaBudget = read("AOAlphaBudget", defaults.AOAlphaBudget);
+		// (46y)
+		settings.PointLightsSSPLSNonRT = read("PointLightsSSPLSNonRT", defaults.PointLightsSSPLSNonRT);
+		settings.PointLightsSSPLSContact = read("PointLightsSSPLSContact", defaults.PointLightsSSPLSContact);
+		settings.AOSingleRay = read("AOSingleRay", defaults.AOSingleRay);
+		settings.AOHalfResFar = read("AOHalfResFar", defaults.AOHalfResFar);
 	}
 	// (46o) Window Beam Guard: off once for settings saved before 46o (its rule misfired on beams that mostly hit walls).
 	if (loadedVersion < 6 && settings.PointLightsBeamGuard) {
@@ -1253,6 +1260,7 @@ void RayTracing::LoadSettings(json& o_json)
 	settings.AODetailLength = std::isfinite(settings.AODetailLength) ? std::clamp(settings.AODetailLength, kAODetailLengthMin, kAODetailLengthMax) : 20.0f;
 	settings.AODetailRays = std::clamp(settings.AODetailRays, 1, kAODetailRaysMax);
 	settings.AOAlphaBudget = std::clamp(settings.AOAlphaBudget, 0, 2);
+	settings.PointLightsSSPLSContact = std::isfinite(settings.PointLightsSSPLSContact) ? std::clamp(settings.PointLightsSSPLSContact, 0.0f, 31.875f) : 8.0f;  // (46y)
 	// (46k)
 	settings.LoadingPumpMs = std::isfinite(settings.LoadingPumpMs) ? std::clamp(settings.LoadingPumpMs, 2.0f, 32.0f) : 8.0f;
 	settings.BlackWindowMs = std::isfinite(settings.BlackWindowMs) ? std::clamp(settings.BlackWindowMs, 0.0f, 2000.0f) : 200.0f;
@@ -1292,6 +1300,10 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AONormalGuided"] = settings.AONormalGuided;
 	o_json["AOFullResFilter"] = settings.AOFullResFilter;
 	o_json["AOAlphaBudget"] = settings.AOAlphaBudget;
+	o_json["PointLightsSSPLSNonRT"] = settings.PointLightsSSPLSNonRT;  // (46y)
+	o_json["PointLightsSSPLSContact"] = settings.PointLightsSSPLSContact;
+	o_json["AOSingleRay"] = settings.AOSingleRay;
+	o_json["AOHalfResFar"] = settings.AOHalfResFar;
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -3500,6 +3512,8 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	RayTracingPointLights::Config config;
 	config.native = settings.PointLightsNative;
 	config.keepSSPLS = settings.PointLightsKeepSSPLS;
+	config.ssplsNonRT = settings.PointLightsSSPLSNonRT;  // (46y)
+	config.ssplsContact = settings.PointLightsSSPLSContact;
 	config.split = pointSplit;
 	config.maxSources = static_cast<std::uint32_t>(std::clamp(settings.PointLightsMaxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources)));
 	config.maxDistance = settings.PointLightsDistance;
@@ -3571,6 +3585,9 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	}
 	if (settings.PointLightsStable)
 		flags |= kPointFlagSticky;  // (46g)
+	// (46y) Screen-Space Shadows for Non-RT Casters: the trace marks the pixels whose surface is a traced caster (PLIdx.w bit 7).
+	if (settings.PointLightsSSPLSNonRT && globals::features::screenSpacePointLightShadows.loaded && globals::features::screenSpacePointLightShadows.settings.Enable)
+		flags |= kPointFlagRtSurface;
 	const int beamCull = EffectiveBeamCull();  // (46n)
 	if (beamCull == 1)
 		flags |= kPointFlagBeamCullFront;
@@ -4996,11 +5013,26 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("Off: 46w (e.g. Fort Dawnguard's roof light kept the game's shadow map).");
 			}
 			Util::LightCensus::SetWiderWindowBeams(settings.PointLightsWiderBeams);
+			// (46y)
+			ImGui::Checkbox("Screen-Space Shadows for Non-RT Casters", &settings.PointLightsSSPLSNonRT);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): for ray-traced lights Screen Space Point Light Shadows run as well, but only for what the ray tracer");
+				ImGui::Text("  cannot see (grass, terrain, LOD, decals): an occluder that is ray traced shadows there only within the contact length");
+				ImGui::Text("  below, so nothing is shadowed twice. Like Screen Space Shadows does for the sun. Replaces the box below while on.");
+				ImGui::Text("Off: the box below decides (46x).");
+			}
+			ImGui::BeginDisabled(!settings.PointLightsSSPLSNonRT);
+			ImGui::SliderFloat("Non-RT Casters: RT Caster Contact Length", &settings.PointLightsSSPLSContact, 0.0f, 31.875f, "%.1f x ray offset");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How close to the surface a ray-traced occluder still casts a screen-space contact shadow (the ray tracer starts a little off the surface).");
+			ImGui::EndDisabled();
+			ImGui::BeginDisabled(settings.PointLightsSSPLSNonRT);
 			ImGui::Checkbox("Keep Screen-Space Contact Shadows", &settings.PointLightsKeepSSPLS);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("Off (default): Screen Space Point Light Shadows are skipped for ray-traced lights.");
 				ImGui::Text("  On: they stay on as well; the darker of both counts (small contact shadows of grass and leaves the ray tracer does not see).");
 			}
+			ImGui::EndDisabled();
 			ImGui::SliderFloat("Fixture Clearance", &settings.PointLightsClearance, 0.0f, 128.0f, "%.0f units");
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("Rays stop this far before the light, so the lamp, brazier bowl or torch holding it does not shadow its own light.");
@@ -5529,7 +5561,7 @@ void RayTracing::DrawDiagnostics()
 	if (ImGui::TreeNodeEx("Diagnostics")) {
 		const char* views[] = { "Off", "Shadow Source", "RT vs Shadow Map", "BLAS Coverage", "Raw RT Visibility", "RT Hit vs Depth", "Penumbra Radius",
 			"History Length", "Adaptive Rays", "SSS: RT Casters", "Distance Quality", "Character Rays", "Point Lights: Candidates", "Point Lights: Traced Lights",
-			"Point Lights: Raw Rays", "Point Lights: Denoised" };
+			"Point Lights: Raw Rays", "Point Lights: Denoised", "Point Lights: SSPLS Coverage" };
 		static_assert(IM_ARRAYSIZE(views) == static_cast<int>(DebugView::Count));
 		int view = static_cast<int>(debugView);
 		if (ImGui::Combo("Debug View", &view, views, IM_ARRAYSIZE(views)))
@@ -5560,6 +5592,10 @@ void RayTracing::DrawDiagnostics()
 			ImGui::Text("Point Lights: Candidates: shadow-casting lights that reach the pixel (its lit side): green 1, yellow 2, orange 3-4, red 5+.");
 			ImGui::Text("Point Lights: Traced Lights: a colour per light; stripes = a second (third, fourth) light traced there too.");
 			ImGui::Text("Point Lights: Raw Rays / Denoised: the point-light shadows before / after the clean-up (white = lit).");
+			ImGui::Text("Point Lights: SSPLS Coverage (needs Screen Space Point Light Shadows on): what shadows the point lights at each pixel get,");
+			ImGui::Text("  mixed by how bright each light is there: green = ray traced only, cyan = ray traced + screen-space for the non-RT casters,");
+			ImGui::Text("  orange = screen-space only (the light is not traced here: not a source, more lights than traced per pixel, outside the");
+			ImGui::Text("  traced area), red = no shadow at all. Dark grey = no point light.");
 		}
 		if (!lastEventsSummary.empty())
 			ImGui::TextWrapped("Last transition: %s", lastEventsSummary.c_str());
@@ -5806,6 +5842,9 @@ std::string RayTracing::DescribeForProfile() const
 		settings.AODetail ? "on" : "off", settings.AODetailStrength, settings.AODetailLength, settings.AODetailRays, settings.AONormalGuided ? "on" : "off",
 		settings.AOFullResFilter ? "on" : "off", kAOBudget[std::clamp(settings.AOAlphaBudget, 0, 2)],
 		aoExtrasFault.empty() ? "" : ", detail / full-res filter switched off: " + aoExtrasFault);
+	// (46y)
+	text += std::format(", RTAO single long ray {}, half-resolution broad term {}, point lights: screen-space shadows for non-RT casters {} (contact {:.1f})",
+		settings.AOSingleRay ? "on" : "off", settings.AOHalfResFar ? "on" : "off", settings.PointLightsSSPLSNonRT ? "on" : "off", settings.PointLightsSSPLSContact);
 	// (46h)
 	static constexpr const char* kAOModesInterior[] = { "RTAO + SSGI contact AO", "darker of both" };
 	text += std::format(", RTAO indoors {} (mode {}, no distance fade: the interior's box{})", settings.AO && settings.AOInteriors ? "on" : "off",
@@ -5908,6 +5947,7 @@ nlohmann::json RayTracing::DescribeJson() const
 		const auto& ps = pointSelector.GetStats();
 		j["point_lights"] = { { "enabled", settings.PointLights }, { "k", ValidPointK(settings.PointLightsPerPixel) }, { "max_sources", settings.PointLightsMaxSources },
 			{ "distance", settings.PointLightsDistance }, { "native", settings.PointLightsNative }, { "keep_sspls", settings.PointLightsKeepSSPLS },
+			{ "sspls_non_rt", settings.PointLightsSSPLSNonRT }, { "sspls_contact", settings.PointLightsSSPLSContact },  // (46y)
 			{ "size", settings.PointLightsSize }, { "clearance", settings.PointLightsClearance }, { "traced", pointThisFrame }, { "sources", ps.sources },
 			{ "candidates", ps.candidates }, { "merged", ps.merged }, { "capped", ps.capped }, { "native_lights", ps.native }, { "gpu_ms", stats.lastPointGpuMs },
 			{ "rays_per_frame", stats.pointRaysPerFrame }, { "denoise_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingPointDenoise) },

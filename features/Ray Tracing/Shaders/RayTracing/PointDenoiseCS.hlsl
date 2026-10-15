@@ -308,7 +308,8 @@ bool SoftBeam(uint a_id)
 		if (view == kViewPLCandidates) {
 			// Shadow sources that reach this pixel (its lit side), before the top K and the share cut.
 			const uint4 bytes = uint4(idxRaw * 255.0 + 0.5);
-			const uint n = ((bytes.x >> 7) & 1u) | (((bytes.y >> 7) & 1u) << 1) | (((bytes.z >> 7) & 1u) << 2) | (((bytes.w >> 7) & 1u) << 3);
+			// (46y) 3 bits (0..7); byte 3's bit 7 is the traced-caster mark (Screen-Space Shadows for Non-RT Casters).
+			const uint n = ((bytes.x >> 7) & 1u) | (((bytes.y >> 7) & 1u) << 1) | (((bytes.z >> 7) & 1u) << 2);
 			if (n == 1u)
 				debug = float4(0.1, 1.0, 0.2, 0.45);
 			else if (n == 2u)
