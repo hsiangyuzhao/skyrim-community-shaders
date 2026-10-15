@@ -135,12 +135,24 @@ namespace Util::EngineTiming
 	/// Interned pass name of a GPU bucket ("g.<bucket>"), or empty while it has not run.
 	std::string_view GpuPassName(int a_bucket);
 
+	/// (46q) Util::FrameTrace's VRAM scope stack (declared here to keep this header light).
+	void PushVramScope(std::string_view a_key);
+	void PopVramScope();
+
 	/// RAII pass for our work that has no CpuPassScope (attribution only, no overlay row). The key must outlive the scope.
 	struct PassScope
 	{
 		explicit PassScope(std::string_view a_key) :
-			key(a_key) { PassBegin(key); }
-		~PassScope() { PassEnd(key); }
+			key(a_key)
+		{
+			PassBegin(key);
+			PushVramScope(key);  // (46q) VRAM per feature (always, not only while timing)
+		}
+		~PassScope()
+		{
+			PassEnd(key);
+			PopVramScope();
+		}
 		PassScope(const PassScope&) = delete;
 		PassScope& operator=(const PassScope&) = delete;
 

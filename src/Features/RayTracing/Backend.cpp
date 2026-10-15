@@ -89,6 +89,10 @@ namespace RayTracingRT
 			releaseThread_.detach();
 		if (poolThread_.joinable())
 			poolThread_.detach();  // (46g) likewise
+		if (submitThread_.joinable())
+			submitThread_.detach();  // (46q) likewise
+		submitStaged_.clear();
+		submitOn_ = false;
 		Shutdown(false);
 	}
 
@@ -969,6 +973,19 @@ namespace RayTracingRT
 
 	void Backend::Shutdown(bool a_waitForGpu)
 	{
+		// (46q) Everything handed to the submit thread goes out first (its lists and fences are released below).
+		if (queue_)
+			StopSubmitThread();
+		else {
+			submitStaged_.clear();
+			submitOn_ = false;
+		}
+		{
+			std::scoped_lock lock(submitMutex_);
+			submitError_ = S_OK;
+			submitErrorWhat_.clear();
+		}
+		d3d12OnlySignal_ = d3d11WaitedFor_ = 0;
 		if (a_waitForGpu && fence_ && fenceEvent_ && lastSubmitted_ && fence_->GetCompletedValue() < lastSubmitted_) {
 			if (SUCCEEDED(fence_->SetEventOnCompletion(lastSubmitted_, fenceEvent_)))
 				WaitForSingleObject(fenceEvent_, 2000);
@@ -1576,6 +1593,7 @@ namespace RayTracingRT
 		const double toMs = 1000.0 / static_cast<double>(timestampFrequency_);
 		stats_.lastPrepGpuMs = static_cast<float>(static_cast<double>(prepEnd - prepBegin) * toMs);
 		stats_.lastPrepWork = context.work;  // (46p)
+		LearnBuildCost(stats_.lastPrepGpuMs, context.work);  // (46q)
 		// (46b) The trace interval holds the point-light dispatch: the sun's part alone, the point lights on their own.
 		// (46m) Split Trace Sync: the interval ended with the sun already.
 		stats_.lastTraceGpuMs = std::max(static_cast<float>(static_cast<double>(end - begin) * toMs) - (context.splitTrace ? 0.0f : pointMs), 0.0f);
@@ -2086,6 +2104,16 @@ namespace RayTracingRT
 		const HRESULT removed = device_->GetDeviceRemovedReason();
 		if (FAILED(removed))
 			return Fail("D3D12 device", removed);
+		// (46q) Submit on a Worker Thread: a call the thread made failed; the mode (not while a prepared frame is open); the
+		// calls staged below go to the thread once, on every way out.
+		if (CheckSubmitError())
+			return false;
+		ApplySubmitMode();
+		struct KickOnExit
+		{
+			Backend* backend;
+			~KickOnExit() { backend->KickSubmits(); }
+		} kickOnExit{ this };
 
 		const std::int64_t cpuStart = QpcNow();
 		// (45k) Every call that can wait for the GPU is timed on its own (stats_.split, F7 trace).
@@ -2157,7 +2185,9 @@ namespace RayTracingRT
 		HRESULT hr;
 		if (!early && FAILED(hr = context.allocator->Reset()))
 			return Fail("command allocator Reset", hr);
-		auto* list = context.list.Get();
+		// (46q) Early Prep on the submit thread: the prep list may not have been executed yet (and has its own allocator):
+		// the TLAS goes in its own list on the main allocator.
+		auto* list = (early && submitOn_ && context.tlasList) ? context.tlasList.Get() : context.list.Get();
 		if (FAILED(hr = list->Reset(context.allocator.Get(), nullptr)))
 			return Fail("command list Reset", hr);
 		lap(split.reset);
@@ -2181,7 +2211,10 @@ namespace RayTracingRT
 			const std::int64_t buildDeadline = buildStart + MsToQpc(a_input.buildCpuMs > 0.0f ? a_input.buildCpuMs : kPlayBuildCpuMs);  // (46g)
 			recWork_ = {};  // (46p)
 			ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame, buildDeadline);
-			const std::uint32_t builtNow = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds, buildDeadline);
+			const std::uint32_t builtNow =
+				BuildQueued(list, a_input.buildCpuMs > 0.0f ? a_input.buildTriangleBudget : StaticTriangleBudget(a_input.buildTriangleBudget), maxBuilds, buildDeadline);  // (46q)
+			frameTrisUsed_ = recWork_.buildTriangles;
+			budget_.staticDeferred = static_cast<std::uint32_t>(buildQueue_.size());
 			stats_.buildsLastFrame = builtNow;
 			const std::int64_t buildEnd = QpcNow();
 
@@ -2193,7 +2226,7 @@ namespace RayTracingRT
 				RecordSkinning(list, context, a_input, skinReady_);
 				NoteSkinWork(uploadsBefore);  // (46p)
 			} else if (!skinGroups_.empty())
-				ReleaseSkinGroups();  // (46m) no character drawn
+				ReleaseUnseenSkinGroups();  // (46m) no character drawn; (46q) with the budget on, after a grace period
 			const std::int64_t skinEnd = QpcNow();
 			stats_.cpuBuildMs = static_cast<float>(QpcToMs(buildEnd - buildStart));
 			stats_.cpuSkinMs = static_cast<float>(QpcToMs(skinEnd - buildEnd));
@@ -2377,7 +2410,7 @@ namespace RayTracingRT
 		{
 			// (46g) This first ExecuteCommandLists (builds / TLAS) counts as execute too (it was inside record before).
 			ID3D12CommandList* prepLists[] = { list };
-			queue_->ExecuteCommandLists(1, prepLists);
+			QueueExecute(prepLists[0]);  // (46q) right away, or staged for the submit thread
 		}
 		lap(split.execute);
 		ID3D12GraphicsCommandList4* traceList = context.traceList.Get();
@@ -2519,10 +2552,18 @@ namespace RayTracingRT
 			pendingWait_ = 0;
 			if (FAILED(hr = context11_->Wait(fence11_.Get(), traceValue)))
 				return Fail("D3D11 Wait", hr);
+			d3d11WaitedFor_ = std::max(d3d11WaitedFor_, traceValue);
 		}
 
 		// GPU-side ordering only: the trace waits for everything D3D11 recorded so far (the depth /
 		// mask copy, the alpha copies); the D3D11 queue later waits for the trace.
+		// (46q) With the submit thread our queue may signal a build-only / abandoned value after this ready value reaches the
+		// GPU: the D3D11 queue first waits for it (GPU-side), so the shared fence never goes backwards.
+		if (submitOn_ && d3d12OnlySignal_ > d3d11WaitedFor_) {
+			if (FAILED(hr = context11_->Wait(fence11_.Get(), d3d12OnlySignal_)))
+				return Fail("D3D11 Wait (build-only value)", hr);
+			d3d11WaitedFor_ = d3d12OnlySignal_;
+		}
 		const std::uint64_t readyValue = ++fenceValue_;
 		if (FAILED(hr = context11_->Signal(fence11_.Get(), readyValue)))
 			return Fail("D3D11 Signal", hr);
@@ -2530,24 +2571,22 @@ namespace RayTracingRT
 		// (45k) The Signal submits the D3D11 work recorded so far by itself (no explicit Flush).
 		split.flushSkipped = true;
 		lap(split.flush11);
-		if (FAILED(hr = queue_->Wait(fence_.Get(), readyValue)))
+		if (FAILED(hr = QueueWait(fence_.Get(), readyValue, "D3D12 queue Wait")))
 			return Fail("D3D12 queue Wait", hr);
 		lap(split.wait12);
-		ID3D12CommandList* lists[] = { traceList };
-		queue_->ExecuteCommandLists(1, lists);
+		QueueExecute(traceList);
 		pendingSunWait_ = 0;
 		if (splitSun) {
 			// (46m) The sun fence between the sun and the point lights (only our queue signals it, in increasing order).
 			const std::uint64_t sunValue = ++sunFenceValue_;
-			if (FAILED(hr = queue_->Signal(sunFence_.Get(), sunValue)))
+			if (FAILED(hr = QueueSignal(sunFence_.Get(), sunValue, "D3D12 queue Signal (sun)")))
 				return Fail("D3D12 queue Signal (sun)", hr);
-			ID3D12CommandList* pointLists[] = { context.pointList.Get() };
-			queue_->ExecuteCommandLists(1, pointLists);
+			QueueExecute(context.pointList.Get());
 			pendingSunWait_ = sunValue;
 		}
 		lap(split.execute);
 		const std::uint64_t doneValue = ++fenceValue_;
-		if (FAILED(hr = queue_->Signal(fence_.Get(), doneValue)))
+		if (FAILED(hr = QueueSignal(fence_.Get(), doneValue, "D3D12 queue Signal")))
 			return Fail("D3D12 queue Signal", hr);
 		lap(split.signal12);
 		context.fenceValue = doneValue;
@@ -2556,10 +2595,9 @@ namespace RayTracingRT
 		// (46f) RTAO right behind the trace, signalling the second fence (the D3D11 queue waits for it only right
 		// before the AO is used: WaitForAO). Not part of doneValue: rt_sync waits for the sun / point lights alone.
 		if (aoFrame) {
-			ID3D12CommandList* aoLists[] = { context.aoList.Get() };
-			queue_->ExecuteCommandLists(1, aoLists);
+			QueueExecute(context.aoList.Get());
 			const std::uint64_t aoValue = ++aoFenceValue_;
-			if (FAILED(hr = queue_->Signal(aoFence_.Get(), aoValue)))
+			if (FAILED(hr = QueueSignal(aoFence_.Get(), aoValue, "D3D12 queue Signal (RTAO)")))
 				return Fail("D3D12 queue Signal (RTAO)", hr);
 			context.aoFenceValue = aoValue;
 			context.aoPending = true;
@@ -2576,6 +2614,7 @@ namespace RayTracingRT
 			pendingSunWait_ = 0;
 			if (FAILED(hr = context11_->Wait(fence11_.Get(), doneValue)))
 				return Fail("D3D11 Wait", hr);
+			d3d11WaitedFor_ = std::max(d3d11WaitedFor_, doneValue);
 		}
 		lap(split.wait11);
 		stats_.split = split;
@@ -2597,6 +2636,14 @@ namespace RayTracingRT
 		const HRESULT removed = device_->GetDeviceRemovedReason();
 		if (FAILED(removed))
 			return Fail("D3D12 device", removed);
+		if (CheckSubmitError())  // (46q)
+			return false;
+		ApplySubmitMode();
+		struct KickOnExit
+		{
+			Backend* backend;
+			~KickOnExit() { backend->KickSubmits(); }
+		} kickOnExit{ this };
 		const std::int64_t cpuStart = QpcNow();
 		PrepSplit split{};
 		std::int64_t mark = cpuStart;
@@ -2633,8 +2680,15 @@ namespace RayTracingRT
 		HRESULT hr;
 		if (FAILED(hr = context.allocator->Reset()))
 			return Fail("command allocator Reset", hr);
+		// (46q) Submit on a Worker Thread: the prep list records into the context's second allocator (the render thread records
+		// the TLAS / trace lists into the first one while the submit thread may still be executing this list).
+		const bool worker = submitOn_ && EnsureWorkerLists(context);
+		if (submitOn_ && !worker)
+			return false;  // ExecuteFrame does all of it later in the frame
+		if (worker && FAILED(hr = context.prepAllocator->Reset()))
+			return Fail("command allocator Reset (prep)", hr);
 		auto* list = context.list.Get();
-		if (FAILED(hr = list->Reset(context.allocator.Get(), nullptr)))
+		if (FAILED(hr = list->Reset(worker ? context.prepAllocator.Get() : context.allocator.Get(), nullptr)))
 			return Fail("command list Reset", hr);
 		cursor_ = (index + 1) % kContexts;
 		context.fenceValue = UINT64_MAX;
@@ -2652,7 +2706,10 @@ namespace RayTracingRT
 		const std::int64_t buildDeadline = buildStart + MsToQpc(a_input.buildCpuMs > 0.0f ? a_input.buildCpuMs : kPlayBuildCpuMs);
 		recWork_ = {};  // (46p)
 		ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame, buildDeadline);
-		stats_.buildsLastFrame = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds, buildDeadline);
+		stats_.buildsLastFrame =
+			BuildQueued(list, a_input.buildCpuMs > 0.0f ? a_input.buildTriangleBudget : StaticTriangleBudget(a_input.buildTriangleBudget), maxBuilds, buildDeadline);  // (46q)
+		frameTrisUsed_ = recWork_.buildTriangles;
+		budget_.staticDeferred = static_cast<std::uint32_t>(buildQueue_.size());
 		const std::int64_t buildEnd = QpcNow();
 		mark = buildEnd;
 		split.build = static_cast<float>(QpcToMs(buildEnd - buildStart));
@@ -2666,7 +2723,7 @@ namespace RayTracingRT
 			RecordSkinning(list, context, a_input, skinReady_);
 			NoteSkinWork(uploadsBefore);  // (46p)
 		} else if (!skinGroups_.empty())
-			ReleaseSkinGroups();  // (46m) no character drawn
+			ReleaseUnseenSkinGroups();  // (46m) no character drawn; (46q) with the budget on, after a grace period
 		const std::int64_t skinEnd = QpcNow();
 		split.skin = static_cast<float>(QpcToMs(skinEnd - buildEnd));
 		mark = skinEnd;
@@ -2686,8 +2743,7 @@ namespace RayTracingRT
 		if (FAILED(hr = list->Close()))
 			return Fail("command list Close", hr);
 		lap(split.close);
-		ID3D12CommandList* lists[] = { list };
-		queue_->ExecuteCommandLists(1, lists);
+		QueueExecute(list);  // (46q) right away, or handed to the submit thread on the way out
 		lap(split.execute);
 		stats_.earlyCpuMs = static_cast<float>(QpcToMs(QpcNow() - cpuStart));
 		return true;
@@ -2705,11 +2761,13 @@ namespace RayTracingRT
 		// D3D12 queue signals here, behind the prep list; no D3D11 signal with a lower value is outstanding
 		// (every earlier ready value was waited for by an earlier trace before its done value).
 		fenceValue_ += 2;
-		const HRESULT hr = queue_->Signal(fence_.Get(), fenceValue_);
+		const HRESULT hr = QueueSignal(fence_.Get(), fenceValue_, "D3D12 queue Signal (abandoned frame)");  // (46q)
+		KickSubmits();
 		if (FAILED(hr)) {
 			Fail("D3D12 queue Signal (abandoned frame)", hr);
 			return;
 		}
+		d3d12OnlySignal_ = fenceValue_;
 		contexts_[preparedContext_].fenceValue = fenceValue_;
 		lastSubmitted_ = fenceValue_;
 		for (auto& blas : blas_)
@@ -2729,6 +2787,7 @@ namespace RayTracingRT
 		pendingWait_ = 0;
 		if (FAILED(context11_->Wait(fence11_.Get(), value)))
 			Fail("D3D11 Wait", E_FAIL);
+		d3d11WaitedFor_ = std::max(d3d11WaitedFor_, value);  // (46q)
 		const float ms = static_cast<float>(QpcToMs(QpcNow() - start));
 		stats_.split.wait11 += ms;
 		return ms;
@@ -2796,6 +2855,14 @@ namespace RayTracingRT
 		const HRESULT removed = device_->GetDeviceRemovedReason();
 		if (FAILED(removed))
 			return Fail("D3D12 device", removed);
+		if (CheckSubmitError())  // (46q)
+			return false;
+		ApplySubmitMode();
+		struct KickOnExit
+		{
+			Backend* backend;
+			~KickOnExit() { backend->KickSubmits(); }
+		} kickOnExit{ this };
 		CollectRetired();
 		const std::uint64_t completed = fence_->GetCompletedValue();
 		const std::uint64_t aoCompleted = AOCompleted();  // (46f)
@@ -2849,11 +2916,13 @@ namespace RayTracingRT
 			return Fail("command list Close", hr);
 		if (failed_)
 			return false;
-		ID3D12CommandList* lists[] = { list };
-		queue_->ExecuteCommandLists(1, lists);
+		QueueExecute(list);  // (46q)
 		const std::uint64_t doneValue = ++fenceValue_;
-		if (FAILED(hr = queue_->Signal(fence_.Get(), doneValue)))
+		hr = QueueSignal(fence_.Get(), doneValue, "D3D12 queue Signal (build only)");
+		KickSubmits();
+		if (FAILED(hr))
 			return Fail("D3D12 queue Signal", hr);
+		d3d12OnlySignal_ = doneValue;
 		context.fenceValue = doneValue;
 		context.timestampsPending = false;
 		lastSubmitted_ = doneValue;
@@ -2861,5 +2930,306 @@ namespace RayTracingRT
 			if (blas.state == BlasState::Built && blas.buildFence == 0)
 				blas.buildFence = doneValue;
 		return true;
+	}
+
+	// ---- (46q) RT: Submit on a Worker Thread -------------------------------------------------------------------------
+
+	HRESULT Backend::QueueExecute(ID3D12CommandList* a_list)
+	{
+		if (!submitOn_) {
+			queue_->ExecuteCommandLists(1, &a_list);
+			return S_OK;
+		}
+		submitStaged_.push_back(SubmitOp{ SubmitOp::Kind::Execute, a_list, nullptr, 0, "D3D12 ExecuteCommandLists" });
+		return S_OK;
+	}
+
+	HRESULT Backend::QueueSignal(ID3D12Fence* a_fence, std::uint64_t a_value, const char* a_what)
+	{
+		if (!submitOn_)
+			return queue_->Signal(a_fence, a_value);
+		submitStaged_.push_back(SubmitOp{ SubmitOp::Kind::Signal, nullptr, a_fence, a_value, a_what });
+		return S_OK;
+	}
+
+	HRESULT Backend::QueueWait(ID3D12Fence* a_fence, std::uint64_t a_value, const char* a_what)
+	{
+		if (!submitOn_)
+			return queue_->Wait(a_fence, a_value);
+		submitStaged_.push_back(SubmitOp{ SubmitOp::Kind::Wait, nullptr, a_fence, a_value, a_what });
+		return S_OK;
+	}
+
+	void Backend::KickSubmits()
+	{
+		if (submitStaged_.empty())
+			return;
+		if (!submitThread_.joinable() || !queue_) {
+			// No thread (cannot happen while submitOn_): the calls go out right here, in order.
+			for (const auto& op : submitStaged_) {
+				if (!queue_)
+					break;
+				HRESULT hr = S_OK;
+				switch (op.kind) {
+				case SubmitOp::Kind::Execute:
+					{
+						ID3D12CommandList* lists[] = { op.list };
+						queue_->ExecuteCommandLists(1, lists);
+						break;
+					}
+				case SubmitOp::Kind::Signal:
+					hr = queue_->Signal(op.fence, op.value);
+					break;
+				case SubmitOp::Kind::Wait:
+					hr = queue_->Wait(op.fence, op.value);
+					break;
+				}
+				if (FAILED(hr)) {
+					std::scoped_lock lock(submitMutex_);
+					if (SUCCEEDED(submitError_)) {
+						submitError_ = hr;
+						submitErrorWhat_ = op.what;
+					}
+				}
+			}
+			submitStaged_.clear();
+			return;
+		}
+		SubmitBatch batch;
+		batch.ops.swap(submitStaged_);
+		batch.kickQpc = QpcNow();
+		{
+			std::scoped_lock lock(submitMutex_);
+			submitQueue_.push_back(std::move(batch));
+		}
+		submitCv_.notify_one();
+	}
+
+	void Backend::DrainSubmits()
+	{
+		KickSubmits();
+		if (!submitThread_.joinable())
+			return;
+		std::unique_lock lock(submitMutex_);
+		submitIdleCv_.wait(lock, [this] { return submitQueue_.empty() && !submitBusy_; });
+	}
+
+	void Backend::StopSubmitThread()
+	{
+		if (!submitThread_.joinable()) {
+			KickSubmits();  // runs them right here (no thread)
+			submitOn_ = false;
+			return;
+		}
+		KickSubmits();
+		{
+			std::scoped_lock lock(submitMutex_);
+			submitStop_ = true;
+		}
+		submitCv_.notify_all();
+		submitThread_.join();  // the thread executes everything handed over before it ends
+		std::scoped_lock lock(submitMutex_);
+		submitStop_ = false;
+		submitBusy_ = false;
+		submitQueue_.clear();
+		submitOn_ = false;
+	}
+
+	void Backend::SubmitThreadMain()
+	{
+		SetThreadDescription(GetCurrentThread(), L"CS RT Submit");
+		// Mostly asleep; when the render thread hands a batch over it should go out at once (the game's queue waits for it).
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+		std::unique_lock lock(submitMutex_);
+		for (;;) {
+			submitCv_.wait(lock, [this] { return submitStop_ || !submitQueue_.empty(); });
+			if (submitQueue_.empty()) {
+				if (submitStop_)
+					break;
+				continue;
+			}
+			SubmitBatch batch = std::move(submitQueue_.front());
+			submitQueue_.pop_front();
+			submitBusy_ = true;
+			ID3D12CommandQueue* queue = queue_.Get();  // released only after this thread is joined (Shutdown)
+			lock.unlock();
+			const std::int64_t start = QpcNow();
+			float maxCall = 0.0f;
+			HRESULT error = S_OK;
+			const char* errorWhat = "";
+			for (const auto& op : batch.ops) {
+				if (!queue)
+					break;
+				const std::int64_t callStart = QpcNow();
+				HRESULT hr = S_OK;
+				switch (op.kind) {
+				case SubmitOp::Kind::Execute:
+					{
+						ID3D12CommandList* lists[] = { op.list };
+						queue->ExecuteCommandLists(1, lists);
+						break;
+					}
+				case SubmitOp::Kind::Signal:
+					hr = queue->Signal(op.fence, op.value);
+					break;
+				case SubmitOp::Kind::Wait:
+					hr = queue->Wait(op.fence, op.value);
+					break;
+				}
+				maxCall = std::max(maxCall, static_cast<float>(QpcToMs(QpcNow() - callStart)));
+				if (FAILED(hr) && SUCCEEDED(error)) {
+					error = hr;
+					errorWhat = op.what;
+				}
+			}
+			const std::int64_t end = QpcNow();
+			lock.lock();
+			submitBusy_ = false;
+			auto& s = submitSample_;
+			++s.batches;
+			const float batchMs = static_cast<float>(QpcToMs(end - start));
+			const float lagMs = static_cast<float>(QpcToMs(start - batch.kickQpc));
+			s.maxBatchMs = std::max(s.maxBatchMs, batchMs);
+			s.lastLagMs = lagMs;
+			s.maxLagMs = std::max(s.maxLagMs, lagMs);
+			s.maxCallMs = std::max(s.maxCallMs, maxCall);
+			if (FAILED(error) && SUCCEEDED(submitError_)) {
+				submitError_ = error;
+				submitErrorWhat_ = errorWhat;
+			}
+			if (submitQueue_.empty())
+				submitIdleCv_.notify_all();
+		}
+		submitIdleCv_.notify_all();
+	}
+
+	void Backend::ApplySubmitMode()
+	{
+		if (prepared_ || submitWanted_ == submitOn_)
+			return;
+		if (!submitWanted_) {
+			DrainSubmits();  // everything handed over goes out before calls are made right away again
+			submitOn_ = false;
+			logger::info("[RayTracing] Submit on a Worker Thread: off");
+			return;
+		}
+		if (submitThreadFailed_ || !queue_)
+			return;
+		if (!submitThread_.joinable()) {
+			try {
+				submitThread_ = std::thread(&Backend::SubmitThreadMain, this);
+			} catch (const std::exception& e) {
+				submitThreadFailed_ = true;
+				logger::warn("[RayTracing] Submit on a Worker Thread unavailable: could not start the thread ({}); calls stay on the render thread", e.what());
+				return;
+			}
+		}
+		submitOn_ = true;
+		logger::info("[RayTracing] Submit on a Worker Thread: on");
+	}
+
+	bool Backend::CheckSubmitError()
+	{
+		HRESULT hr = S_OK;
+		std::string what;
+		{
+			std::scoped_lock lock(submitMutex_);
+			if (SUCCEEDED(submitError_))
+				return false;
+			hr = submitError_;
+			what = submitErrorWhat_;
+			submitError_ = S_OK;
+		}
+		Fail(std::format("{} (submit thread)", what), hr);
+		return true;
+	}
+
+	bool Backend::EnsureWorkerLists(CommandContext& a_context)
+	{
+		if (a_context.prepAllocator && a_context.tlasList)
+			return true;
+		if (!device_)
+			return false;
+		ComPtr<ID3D12CommandAllocator> allocator;
+		ComPtr<ID3D12GraphicsCommandList> list;
+		ComPtr<ID3D12GraphicsCommandList4> list4;
+		if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+			FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a_context.allocator.Get(), nullptr, IID_PPV_ARGS(&list))) ||
+			FAILED(list.As(&list4))) {
+			logger::warn("[RayTracing] Submit on a Worker Thread: could not create a command list; Early Prep is skipped on that context");
+			return false;
+		}
+		list4->Close();
+		a_context.prepAllocator = allocator;
+		a_context.tlasList = list4;
+		return true;
+	}
+
+	Backend::SubmitSample Backend::TakeSubmitSample()
+	{
+		std::scoped_lock lock(submitMutex_);
+		SubmitSample s = submitSample_;
+		submitSample_ = {};
+		return s;
+	}
+
+	// ---- (46q) RT: Budget Builds by GPU Time ------------------------------------------------------------------------
+
+	std::uint32_t Backend::StaticTriangleBudget(std::uint32_t a_default)
+	{
+		if (!budgetOn_) {
+			budget_.triBudget = 0;
+			return a_default;
+		}
+		constexpr double kDefaultMsPerTri = 8.0e-6;  // 8 ms per million: about 1 ms for the 46p default batch
+		constexpr double kMinTriangles = 16384.0;     // always some progress
+		const double perTri = msPerTriEma_ > 0.0 ? msPerTriEma_ : kDefaultMsPerTri;
+		const double upper = std::max(static_cast<double>(a_default), kMinTriangles);
+		const double triangles = std::clamp(static_cast<double>(std::max(budgetGpuMs_, 0.1f)) / perTri, kMinTriangles, upper);
+		budget_.triBudget = static_cast<std::uint32_t>(triangles);
+		return budget_.triBudget;
+	}
+
+	void Backend::LearnBuildCost(float a_prepMs, const Util::FrameTrace::RtPrepWork& a_work)
+	{
+		if (!a_work.valid || a_prepMs < 0.0f)
+			return;
+		const std::uint64_t triangles = a_work.buildTriangles + a_work.groupTriangles;
+		if (triangles == 0 && a_work.compactions == 0) {
+			prepBaseEma_ = prepBaseEma_ < 0.0 ? a_prepMs : prepBaseEma_ * 0.9 + a_prepMs * 0.1;
+		} else if (triangles >= 4096 && prepBaseEma_ >= 0.0) {
+			double sample = std::max(static_cast<double>(a_prepMs) - prepBaseEma_, 0.0) / static_cast<double>(triangles);
+			sample = std::clamp(sample, 5.0e-7, 2.0e-4);
+			if (msPerTriEma_ > 0.0)
+				sample = std::clamp(sample, msPerTriEma_ * 0.25, msPerTriEma_ * 4.0);  // one paging-slowed frame does not set it
+			msPerTriEma_ = msPerTriEma_ < 0.0 ? sample : msPerTriEma_ * 0.75 + sample * 0.25;
+		}
+		budget_.msPerMillionTris = msPerTriEma_ > 0.0 ? static_cast<float>(msPerTriEma_ * 1.0e6) : -1.0f;
+		budget_.prepBaseMs = static_cast<float>(prepBaseEma_);
+	}
+
+	void Backend::ReleaseUnseenSkinGroups()
+	{
+		if (!budgetOn_) {
+			ReleaseSkinGroups();
+			return;
+		}
+		skinGroupFrame_.clear();
+		const std::int64_t now = QpcNow();
+		const std::int64_t grace = MsToQpc(std::max(groupGraceMs_, 0.0f));
+		std::uint32_t kept = 0;
+		for (std::size_t g = 0; g < skinGroups_.size();) {
+			auto& group = skinGroups_[g];
+			group.seen = false;
+			if (group.lastSeenQpc != 0 && now - group.lastSeenQpc < grace) {
+				++kept;
+				++g;
+				continue;
+			}
+			ReleaseSkinGroup(group);
+			skinGroups_[g] = std::move(skinGroups_.back());
+			skinGroups_.pop_back();
+		}
+		budget_.groupsKept = kept;
 	}
 }

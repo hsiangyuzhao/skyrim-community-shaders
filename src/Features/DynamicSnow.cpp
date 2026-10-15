@@ -31,6 +31,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	TrailsOnAccumulated,
 	MudTrails,
 	TrailsFromNPCs,
+	BackgroundShapeLoad,
 	TrailResolution,
 	SnowOnCharacters,
 	CharacterSnowBuildUp,
@@ -1394,20 +1395,14 @@ DynamicSnow::PrintKind DynamicSnow::ClassifyRace(RE::Actor* a_actor, bool a_huma
 	return a_humanoid ? PrintKind::Human : PrintKind::None;
 }
 
-void DynamicSnow::LoadPrintShapes()
+std::unique_ptr<DynamicSnow::PrintShapeData> DynamicSnow::DecodePrintShapes()
 {
-	shapesTried = true;
-	shapeSRV = nullptr;
-	shapeCount = 0;
-	for (auto& s : shapeSlots)
-		s = {};
-	status.shapesLoaded = 0;
-	status.shapeSource.clear();
-
+	// (46q) Files, decoding and the mip chains: no D3D and no member state, so it may run on a background thread
+	// (Background Shape Load). The engine's resource streams are read from its own loader threads as well.
+	auto data = std::make_unique<PrintShapeData>();
 	std::vector<std::vector<float>> slices;
 	std::vector<uint8_t> file;
 	std::vector<float> shape;
-	bool anyPbr = false, anyClassic = false;
 	for (int k = 0; k < static_cast<int>(PrintKind::Count); ++k) {
 		for (int f = 0; f < 4; ++f) {
 			const char* name = kPrintKinds[k].files[f];
@@ -1418,47 +1413,63 @@ void DynamicSnow::LoadPrintShapes()
 			const std::string classic = std::format("textures\\actors\\footprints\\footprints{}_h.dds", name);
 			bool ok = false;
 			if (ReadGameFile(pbr, file) && DecodeShape(file, shape)) {
-				ok = anyPbr = true;
+				ok = data->anyPbr = true;
 			} else if (ReadGameFile(classic, file) && DecodeShape(file, shape)) {
-				ok = anyClassic = true;
+				ok = data->anyClassic = true;
 			}
 			if (!ok)
 				continue;
-			shapeSlots[k].slot[f] = static_cast<int>(slices.size());
+			data->slots[k].slot[f] = static_cast<int>(slices.size());
 			slices.push_back(shape);
 		}
 	}
-	if (slices.empty()) {
-		logger::info("[{}] No footprint textures found (Footprints / Realistic PBR Footprints); using the built-in oval prints", GetName());
-		return;
-	}
+	data->slices = static_cast<uint32_t>(slices.size());
+	if (slices.empty())
+		return data;
 
 	// Mip chain per slice, box filtered (the trail map is coarser than the shapes at 1024).
 	uint32_t mips = 1;
 	while ((kShapeSize >> mips) >= 4)
 		++mips;
-	std::vector<std::vector<float>> levels;
-	std::vector<D3D11_SUBRESOURCE_DATA> init;
-	levels.reserve(slices.size() * mips);
+	data->mips = mips;
+	data->levels.reserve(slices.size() * mips);
 	for (auto& slice : slices) {
 		size_t size = kShapeSize;
-		levels.push_back(slice);
+		data->levels.push_back(slice);
 		for (uint32_t m = 1; m < mips; ++m) {
-			const auto& prev = levels.back();
+			const auto& prev = data->levels.back();
 			const size_t half = size / 2;
 			std::vector<float> next(half * half);
 			for (size_t y = 0; y < half; ++y)
 				for (size_t x = 0; x < half; ++x)
 					next[y * half + x] = 0.25f * (prev[(2 * y) * size + 2 * x] + prev[(2 * y) * size + 2 * x + 1] + prev[(2 * y + 1) * size + 2 * x] + prev[(2 * y + 1) * size + 2 * x + 1]);
-			levels.push_back(std::move(next));
+			data->levels.push_back(std::move(next));
 			size = half;
 		}
 	}
-	init.resize(levels.size());
-	for (size_t s = 0; s < slices.size(); ++s) {
+	return data;
+}
+
+void DynamicSnow::ApplyPrintShapes(std::unique_ptr<PrintShapeData> a_data)
+{
+	shapesTried = true;
+	shapeSRV = nullptr;
+	shapeCount = 0;
+	for (auto& s : shapeSlots)
+		s = {};
+	status.shapesLoaded = 0;
+	status.shapeSource.clear();
+	shapeState = 3;
+	if (!a_data || a_data->slices == 0 || a_data->levels.size() != static_cast<size_t>(a_data->slices) * a_data->mips) {
+		logger::info("[{}] No footprint textures found (Footprints / Realistic PBR Footprints); using the built-in oval prints", GetName());
+		return;
+	}
+	const uint32_t mips = a_data->mips;
+	std::vector<D3D11_SUBRESOURCE_DATA> init(a_data->levels.size());
+	for (size_t s = 0; s < a_data->slices; ++s) {
 		for (uint32_t m = 0; m < mips; ++m) {
 			auto& d = init[s * mips + m];
-			d.pSysMem = levels[s * mips + m].data();
+			d.pSysMem = a_data->levels[s * mips + m].data();
 			d.SysMemPitch = static_cast<UINT>((kShapeSize >> m) * sizeof(float));
 		}
 	}
@@ -1467,19 +1478,17 @@ void DynamicSnow::LoadPrintShapes()
 	desc.Width = static_cast<UINT>(kShapeSize);
 	desc.Height = static_cast<UINT>(kShapeSize);
 	desc.MipLevels = mips;
-	desc.ArraySize = static_cast<UINT>(slices.size());
+	desc.ArraySize = a_data->slices;
 	desc.Format = DXGI_FORMAT_R32_FLOAT;
 	desc.SampleDesc.Count = 1;
 	desc.Usage = D3D11_USAGE_IMMUTABLE;
 	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 	winrt::com_ptr<ID3D11Texture2D> texture;
 	auto device = globals::d3d::device;
-	if (FAILED(device->CreateTexture2D(&desc, init.data(), texture.put())) ||
+	if (!device || FAILED(device->CreateTexture2D(&desc, init.data(), texture.put())) ||
 		FAILED(device->CreateShaderResourceView(texture.get(), nullptr, shapeSRV.put()))) {
 		logger::warn("[{}] Could not create the footprint shape atlas; using the built-in oval prints", GetName());
 		shapeSRV = nullptr;
-		for (auto& s : shapeSlots)
-			s = {};
 		return;
 	}
 	Util::SetResourceName(texture.get(), "DynamicSnow::PrintShapes");
@@ -1490,10 +1499,60 @@ void DynamicSnow::LoadPrintShapes()
 		sd.MaxLOD = D3D11_FLOAT32_MAX;
 		device->CreateSamplerState(&sd, shapeSampler.put());
 	}
-	shapeCount = static_cast<uint32_t>(slices.size());
+	shapeSlots = a_data->slots;
+	shapeCount = a_data->slices;
+	shapeState = 2;
 	status.shapesLoaded = shapeCount;
-	status.shapeSource = anyPbr && anyClassic ? "Realistic PBR Footprints + Footprints" : anyPbr ? "Realistic PBR Footprints" : "Footprints";
+	status.shapeSource = a_data->anyPbr && a_data->anyClassic ? "Realistic PBR Footprints + Footprints" : a_data->anyPbr ? "Realistic PBR Footprints" : "Footprints";
 	logger::info("[{}] Loaded {} footprint shapes from {}", GetName(), shapeCount, status.shapeSource);
+}
+
+void DynamicSnow::LoadPrintShapes()
+{
+	// 46p: everything on the render thread, on first use.
+	std::unique_ptr<PrintShapeData> data;
+	try {
+		data = DecodePrintShapes();
+	} catch (const std::exception& e) {
+		logger::warn("[{}] Footprint shapes could not be read ({}); using the built-in oval prints", GetName(), e.what());
+	}
+	ApplyPrintShapes(std::move(data));
+}
+
+void DynamicSnow::PollPrintShapes()
+{
+	// (46q) Background Shape Load: the decode runs on its own thread; the render thread only creates the atlas from the result.
+	if (shapesTried)
+		return;
+	if (!settings.BackgroundShapeLoad && !shapeFuture.valid()) {
+		LoadPrintShapes();
+		return;
+	}
+	if (!shapeFuture.valid()) {
+		try {
+			shapeFuture = std::async(std::launch::async, []() -> std::unique_ptr<PrintShapeData> {
+				try {
+					return DecodePrintShapes();
+				} catch (...) {
+					return nullptr;
+				}
+			});
+			shapeState = 1;
+		} catch (const std::exception& e) {
+			logger::warn("[{}] Background footprint shape load could not start ({}); loading now", GetName(), e.what());
+			LoadPrintShapes();
+		}
+		return;
+	}
+	if (shapeFuture.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+		return;
+	std::unique_ptr<PrintShapeData> data;
+	try {
+		data = shapeFuture.get();
+	} catch (...) {
+		data = nullptr;
+	}
+	ApplyPrintShapes(std::move(data));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1728,8 +1787,13 @@ void DynamicSnow::GatherStamps(const RE::NiPoint3& a_center)
 	if (!player)
 		return;
 
-	if (!shapesTried)
-		LoadPrintShapes();
+	{
+		// (46q) Footprint shapes: on first use (Background Shape Load: started now, applied once ready; ovals meanwhile).
+		const auto shapesStart = std::chrono::steady_clock::now();
+		if (!shapesTried)
+			PollPrintShapes();
+		Util::FrameTrace::On46qSnow(std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - shapesStart).count(), shapeState);
+	}
 	const bool useShapes = shapeCount > 0;
 
 	std::vector<RE::Actor*> actors;
@@ -2235,8 +2299,13 @@ void DynamicSnow::DrawSettings()
 
 		// Prints are shaped from installed footprint textures (Realistic PBR Footprints, or Footprints
 		// itself); plain ovals when none are installed.
+		ImGui::Checkbox("Load Footprint Shapes in the Background", &settings.BackgroundShapeLoad);  // (46q)
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"On: the footprint shapes are prepared on a helper thread the first time prints are made (plain ovals for the\n"
+				"fraction of a second until they are ready), instead of one 20-30 ms hitch. Off: as 46p. F7: snow_shapes_ms.");
 		if (!shapesTried)
-			ImGui::TextDisabled("Print shapes: loaded the first time prints are made");
+			ImGui::TextDisabled(shapeFuture.valid() ? "Print shapes: loading in the background" : "Print shapes: loaded the first time prints are made");
 		else if (status.shapesLoaded)
 			ImGui::TextDisabled("Print shapes: %u from %s", status.shapesLoaded, status.shapeSource.c_str());
 		else

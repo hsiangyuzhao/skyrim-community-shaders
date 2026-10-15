@@ -1179,6 +1179,13 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointLightsBeamSoftness = read("PointLightsBeamSoftness", defaults.PointLightsBeamSoftness);  // (46o)
 		settings.ParallelBlasBuilds = read("ParallelBlasBuilds", defaults.ParallelBlasBuilds);  // (46p)
 		settings.HighPriorityQueue = read("HighPriorityQueue", defaults.HighPriorityQueue);
+		settings.SubmitWorker = read("SubmitWorker", defaults.SubmitWorker);  // (46q)
+		settings.BuildGpuBudget = read("BuildGpuBudget", defaults.BuildGpuBudget);
+		settings.BuildGpuBudgetMs = std::clamp(read("BuildGpuBudgetMs", defaults.BuildGpuBudgetMs), 0.25f, 4.0f);
+		settings.GroupBuildsPerFrame = std::clamp(read("GroupBuildsPerFrame", defaults.GroupBuildsPerFrame), 1, 16);
+		settings.GroupGraceMs = std::clamp(read("GroupGraceMs", defaults.GroupGraceMs), 0.0f, 10000.0f);
+		settings.CarrierShadows = read("CarrierShadows", defaults.CarrierShadows);
+		settings.CarrierClearance = std::clamp(read("CarrierClearance", defaults.CarrierClearance), 0.0f, 64.0f);
 	}
 	// (46o) Window Beam Guard: off once for settings saved before 46o (its rule misfired on beams that mostly hit walls).
 	if (loadedVersion < 6 && settings.PointLightsBeamGuard) {
@@ -1235,6 +1242,13 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointLightsBeamSoftness"] = settings.PointLightsBeamSoftness;  // (46o)
 	o_json["ParallelBlasBuilds"] = settings.ParallelBlasBuilds;  // (46p)
 	o_json["HighPriorityQueue"] = settings.HighPriorityQueue;
+	o_json["SubmitWorker"] = settings.SubmitWorker;  // (46q)
+	o_json["BuildGpuBudget"] = settings.BuildGpuBudget;
+	o_json["BuildGpuBudgetMs"] = settings.BuildGpuBudgetMs;
+	o_json["GroupBuildsPerFrame"] = settings.GroupBuildsPerFrame;
+	o_json["GroupGraceMs"] = settings.GroupGraceMs;
+	o_json["CarrierShadows"] = settings.CarrierShadows;
+	o_json["CarrierClearance"] = settings.CarrierClearance;
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -1777,6 +1791,8 @@ void RayTracing::RunEarlyPrep()
 	// (46p) Per-frame backend switches: Parallel BLAS Builds, Keep Our GPU Memory Resident (Upscaling > Save GPU Memory).
 	if (backend.IsReady()) {
 		backend.SetParallelBuilds(settings.ParallelBlasBuilds);
+		backend.SetSubmitWorker(settings.SubmitWorker);  // (46q)
+		backend.SetBuildBudget(settings.BuildGpuBudget, settings.BuildGpuBudgetMs, static_cast<std::uint32_t>(settings.GroupBuildsPerFrame), settings.GroupGraceMs);
 		backend.SetResidencyHigh(globals::features::upscaling.settings.keepGpuMemoryResident);
 	}
 	earlyThisFrame = false;
@@ -2113,6 +2129,8 @@ void RayTracing::LoadingPump()
 	// (46p) Per-frame backend switches: Parallel BLAS Builds, Keep Our GPU Memory Resident (Upscaling > Save GPU Memory).
 	if (backend.IsReady()) {
 		backend.SetParallelBuilds(settings.ParallelBlasBuilds);
+		backend.SetSubmitWorker(settings.SubmitWorker);  // (46q)
+		backend.SetBuildBudget(settings.BuildGpuBudget, settings.BuildGpuBudgetMs, static_cast<std::uint32_t>(settings.GroupBuildsPerFrame), settings.GroupGraceMs);
 		backend.SetResidencyHigh(globals::features::upscaling.settings.keepGpuMemoryResident);
 	}
 	earlyThisFrame = false;
@@ -2459,6 +2477,26 @@ void RayTracing::PublishCpuSplit()
 		}
 	}
 	Util::FrameTrace::OnRayTracingDetail(detail);
+	{
+		// (46q) Submit on a Worker Thread / Budget Builds by GPU Time.
+		Util::FrameTrace::Q46 q{};
+		if (backend.IsReady()) {
+			const auto sub = backend.TakeSubmitSample();
+			q.subOn = backend.SubmitWorkerInEffect() ? 1 : 0;
+			q.subBatches = sub.batches;
+			q.subMaxBatchMs = sub.maxBatchMs;
+			q.subMaxLagMs = sub.maxLagMs;
+			q.subMaxCallMs = sub.maxCallMs;
+			const auto& bud = backend.GetBudgetSample();
+			q.budOn = settings.BuildGpuBudget ? 1 : 0;
+			q.budMsPerMtri = bud.msPerMillionTris;
+			q.budTris = bud.triBudget;
+			q.budStaticQueued = bud.staticDeferred;
+			q.budGroupsDeferred = bud.groupsDeferred;
+			q.budGroupsKept = bud.groupsKept;
+		}
+		Util::FrameTrace::On46qRt(q);
+	}
 	handOffThisFrame = false;
 }
 
@@ -4936,6 +4974,25 @@ void RayTracing::DrawDiagnostics()
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Experiment, off by default: ray tracing's own GPU queue asks for high priority, which may shorten the long waits for it");
 			ImGui::Text("  when the card is busy. Takes effect after restarting the game. In effect now: %s.", backend.QueuePriorityHigh() ? "high" : "normal");
+		}
+		ImGui::Checkbox("RT: Submit on a Worker Thread", &settings.SubmitWorker);  // (46q)
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: handing ray tracing's work to the graphics card is done by a helper thread, so the game's main thread no longer");
+			ImGui::Text("  stalls there when Windows is busy moving video memory (the 10-15 ms hitches in rt_x_execute). Same order, same picture.");
+			ImGui::Text("  Off: on the main thread, as 46p. In effect now: %s. F7: rt_sub_* columns.", backend.SubmitWorkerInEffect() ? "on" : "off");
+		}
+		ImGui::Checkbox("RT: Budget Builds by GPU Time", &settings.BuildGpuBudget);  // (46q)
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: new ray-tracing shapes (scenery and whole characters) are built a few per frame within a graphics-card time budget");
+			ImGui::Text("  measured from earlier builds, and a character that leaves view for a moment keeps its shape for a short grace period");
+			ImGui::Text("  (no rebuild when it comes back). Off: as 46p. F7: rt_bud_* columns.");
+		}
+		if (settings.BuildGpuBudget) {
+			ImGui::SliderFloat("Build Budget (GPU ms per frame)", &settings.BuildGpuBudgetMs, 0.25f, 4.0f, "%.2f");
+			ImGui::SliderInt("Character Builds per Frame", &settings.GroupBuildsPerFrame, 1, 16);
+			ImGui::SliderFloat("Character Keep Time (ms)", &settings.GroupGraceMs, 0.0f, 10000.0f, "%.0f");
+			const auto& bud = backend.GetBudgetSample();
+			ImGui::Text("Measured: %.1f GPU ms per million triangles, prep base %.2f ms, budget %u triangles", bud.msPerMillionTris, bud.prepBaseMs, bud.triBudget);
 		}
 
 		const auto& rt = backend.GetStats();

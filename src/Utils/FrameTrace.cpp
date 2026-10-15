@@ -67,6 +67,7 @@ namespace Util::FrameTrace
 		};
 		static_assert(static_cast<int>(Split::Count) == 16);
 		FrameAcc g_frame;
+		Q46 g_q46{};  // (46q) the latest state of the 46q switches (snow ms: this frame)
 		std::atomic<uint32_t> g_vramWarn{ 0 };  // (46o) M3: Streamline eWarnOutOfVRAM since the last row
 
 		// (46o) M3: video memory of the D3D11 adapter (and of the D3D12 device's, if it is another one), MB.
@@ -152,6 +153,11 @@ namespace Util::FrameTrace
 		std::deque<FeatureVram>& g_featureVram = *new std::deque<FeatureVram>();
 		std::set<std::string, std::less<>>& g_scopeNames = *new std::set<std::string, std::less<>>();
 		thread_local std::string_view t_vramScope;
+		// (46q) The pass scopes open on this thread (CpuPassScope / EngineTiming::PassScope push their key whether or not timing runs):
+		// a creation outside a Setup scope is billed to the innermost one.
+		constexpr int kScopeStack = 16;
+		thread_local std::array<std::string_view, kScopeStack> t_scopeStack{};
+		thread_local int t_scopeDepth = 0;
 
 		FeatureVram* FeatureEntry(std::string_view a_name)
 		{
@@ -198,12 +204,54 @@ namespace Util::FrameTrace
 
 			bool counted = false;
 
+			/// (46q) Bills the bytes to another feature (a resource named after its feature, created where no scope was open).
+			void Rebill(FeatureVram* a_to)
+			{
+				if (!counted || !a_to || a_to == feature)
+					return;
+				if (feature)
+					feature->live.fetch_sub(static_cast<int64_t>(bytes), std::memory_order_relaxed);
+				a_to->live.fetch_add(static_cast<int64_t>(bytes), std::memory_order_relaxed);
+				feature = a_to;
+			}
+			[[nodiscard]] FeatureVram* Feature() const { return feature; }
+
 		private:
 			std::atomic<ULONG> refs{ 1 };
 			int owner;
 			uint64_t bytes;
 			FeatureVram* feature;
 		};
+
+		/// (46q) A pass key as a feature name: "g.SSRTReblur" -> "SSRTReblur", "Upscaling.Streamline" -> "Upscaling".
+		std::string_view FeatureNameOfKey(std::string_view a_key)
+		{
+			if (a_key.starts_with("g."))
+				a_key.remove_prefix(2);
+			const size_t dot = a_key.find('.');
+			return dot == std::string_view::npos ? a_key : a_key.substr(0, dot);
+		}
+
+		constexpr std::string_view kVramNoScope = "other (no scope open)";
+
+		/// (46q) "name=MB;..." alive per feature of ours (1 MB or more), largest first: the per-frame F7 column.
+		std::string VramByFeatureColumn()
+		{
+			std::vector<std::pair<int64_t, std::string_view>> rows;
+			{
+				std::scoped_lock lock(g_featureMutex);
+				for (const auto& entry : g_featureVram) {
+					const int64_t live = entry.live.load(std::memory_order_relaxed);
+					if (live >= (1ll << 20))
+						rows.emplace_back(live, entry.name);
+				}
+			}
+			std::sort(rows.begin(), rows.end(), [](const auto& a_l, const auto& a_r) { return a_l.first > a_r.first; });
+			std::string text;
+			for (const auto& [live, name] : rows)
+				text += std::format("{}{}={:.0f}", text.empty() ? "" : ";", name, static_cast<double>(live) / (1024.0 * 1024.0));
+			return text;
+		}
 
 		template <class T>
 		void TagObject(T* a_object, VramOwner a_owner, uint64_t a_bytes, FeatureVram* a_feature = nullptr)
@@ -444,6 +492,8 @@ namespace Util::FrameTrace
 			float gpuSegTotalMs = -1.0f;
 			int gpuSegStamps = -1;
 			float postGpuMs = -1.0f;  // (46p) our post-processing chain, last GPU sample (GpuPassTimers PostProcessing)
+			Q46 q46{};             // (46q)
+			std::string vramByFeature;  // (46q) "name=MB;..." alive per feature of ours (1 MB or more)
 		};
 
 		struct ReflexTimes
@@ -887,6 +937,18 @@ namespace Util::FrameTrace
 				out << "#   rt_pw_sample_age = trace submissions between that one and this frame's: rt_prep_gpu_ms, rt_trace_gpu_ms, rt_queue_gap_gpu_ms,\n";
 				out << "#   rt_pl_gpu_ms and rtao_gpu_ms on this row belong to the frame that many rows up (rt_sync_* / rt_denoise_* are D3D11 samples, 1-4 frames).\n";
 				out << "#   post_gpu_ms = our post-processing chain (last GPU sample, a few frames old). The F7 header's render size is now the upscaler's.\n";
+				out << "# (46q) rt_sub_* = RT: Submit on a Worker Thread: in effect (1 / 0, -1 = RT not ready), batches the submit thread ran since the\n";
+				out << "#   last row, the longest batch (ms inside ExecuteCommandLists / Signal / Wait: the block that used to be rt_x_execute on the\n";
+				out << "#   main thread), the longest wait from hand-over to its start, the longest single call (-1 = none). With it on rt_x_execute /\n";
+				out << "#   rt_x_signal12 / rt_x_wait12 / rt_e_execute are only the hand-over (staging); rt_x_signal11 stays (D3D11 immediate context).\n";
+				out << "#   rt_bud_* = RT: Budget Builds by GPU Time: on, measured GPU ms per million BLAS triangles (EMA from rt_prep_gpu_ms minus the\n";
+				out << "#   prep base of frames without builds), this frame's static triangle budget (0 = not budgeted), static builds still queued,\n";
+				out << "#   merged character builds put off (cap / budget), merged character BLASes kept without a draw (grace period).\n";
+				out << "#   snow_shapes_ms = Dynamic Snow footprint shapes: main-thread ms this frame; snow_shapes_state 0 not loaded, 1 loading in\n";
+				out << "#   the background, 2 ready, 3 none found / failed. rr_b / rr_c = Size Buffers to Render Resolution / SSRT+SSGI at render\n";
+				out << "#   resolution in effect (1 / 0, -1 = n/a), rr_width / rr_height = the size those buffers are allocated at (0 = output size).\n";
+				out << "#   vram_by_feature = our video memory alive per feature (MB, >= 1): billed to the Setup scope, else the innermost pass scope\n";
+				out << "#   open on the creating thread, else the feature its resource name starts with; 'other (no scope open)' = none of these.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -938,7 +1000,10 @@ namespace Util::FrameTrace
 				out << ",gpu_seg_other_ms,gpu_seg_total_ms,gpu_seg_stamps"
 					   ",rt_pw_valid,rt_pw_early,rt_pw_builds,rt_pw_builds_alpha,rt_pw_build_tris,rt_pw_build_mb,rt_pw_compactions,rt_pw_compact_mb,"
 					   "rt_pw_skin_uploads,rt_pw_skin_builds,rt_pw_skin_refits,rt_pw_group_builds,rt_pw_group_tris,rt_pw_group_refits,rt_pw_skin_dispatches,"
-					   "rt_pw_skin_verts,rt_pw_tlas_instances,rt_pw_pool_blocks,rt_pw_pool_released,rt_pw_sample_age,post_gpu_ms\n";
+					   "rt_pw_skin_verts,rt_pw_tlas_instances,rt_pw_pool_blocks,rt_pw_pool_released,rt_pw_sample_age,post_gpu_ms,"
+					   "rt_sub_on,rt_sub_batches,rt_sub_max_batch_ms,rt_sub_max_lag_ms,rt_sub_max_call_ms,rt_bud_on,rt_bud_ms_per_mtri,rt_bud_tris,"
+					   "rt_bud_static_queued,rt_bud_groups_deferred,rt_bud_groups_kept,snow_shapes_ms,snow_shapes_state,rr_b,rr_c,rr_width,rr_height,"
+					   "vram_by_feature\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1046,7 +1111,12 @@ namespace Util::FrameTrace
 							static_cast<double>(w.buildBytes) * kMb, w.compactions, static_cast<double>(w.compactBytes) * kMb, w.skinUploads, w.skinBuilds, w.skinRefits,
 							w.groupBuilds, w.groupTriangles, w.groupRefits, w.skinDispatches, w.skinVertices, w.tlasInstances, w.poolBlocks, w.poolReleased);
 						s.pop_back();  // the line end, after the two below
-						s += std::format(",{},{:.3f}\n", w.sampleAge, a_row.postGpuMs);
+						s += std::format(",{},{:.3f}", w.sampleAge, a_row.postGpuMs);
+						// (46q)
+						const auto& q = a_row.q46;
+						s += std::format(",{},{},{:.3f},{:.3f},{:.3f},{},{:.2f},{},{},{},{},{:.3f},{},{},{},{},{},{}\n", q.subOn, q.subBatches, q.subMaxBatchMs, q.subMaxLagMs,
+							q.subMaxCallMs, q.budOn, q.budMsPerMtri, q.budTris, q.budStaticQueued, q.budGroupsDeferred, q.budGroupsKept, q.snowShapesMs, q.snowShapesState,
+							q.rrB, q.rrC, q.rrWidth, q.rrHeight, a_row.vramByFeature);
 					}
 					return s;
 				};
@@ -1864,6 +1934,33 @@ namespace Util::FrameTrace
 	}
 
 	void OnRayTracingDetail(const RayTracingDetail& a_detail) { g_frame.rt = a_detail; }
+	// (46q)
+	void On46qRt(const Q46& a_rt)
+	{
+		g_q46.subOn = a_rt.subOn;
+		g_q46.subBatches = a_rt.subBatches;
+		g_q46.subMaxBatchMs = a_rt.subMaxBatchMs;
+		g_q46.subMaxLagMs = a_rt.subMaxLagMs;
+		g_q46.subMaxCallMs = a_rt.subMaxCallMs;
+		g_q46.budOn = a_rt.budOn;
+		g_q46.budMsPerMtri = a_rt.budMsPerMtri;
+		g_q46.budTris = a_rt.budTris;
+		g_q46.budStaticQueued = a_rt.budStaticQueued;
+		g_q46.budGroupsDeferred = a_rt.budGroupsDeferred;
+		g_q46.budGroupsKept = a_rt.budGroupsKept;
+	}
+	void On46qSnow(float a_ms, int a_state)
+	{
+		g_q46.snowShapesMs += a_ms;
+		g_q46.snowShapesState = a_state;
+	}
+	void On46qRenderRes(int a_b, int a_c, uint32_t a_width, uint32_t a_height)
+	{
+		g_q46.rrB = a_b;
+		g_q46.rrC = a_c;
+		g_q46.rrWidth = a_width;
+		g_q46.rrHeight = a_height;
+	}
 	void OnLights(const LightStats& a_stats) { g_frame.lights = a_stats; }
 
 	namespace
@@ -2149,6 +2246,9 @@ namespace Util::FrameTrace
 				r.lights = g_frame.lights;
 				SampleScreenSpacePasses(r);  // (46e)
 				r.postGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::PostProcessing);  // (46p)
+				r.q46 = g_q46;  // (46q)
+				g_q46.snowShapesMs = 0.0f;
+				r.vramByFeature = VramByFeatureColumn();
 				r.cpuTop = Util::CpuPassTimers::GetSingleton()->TopOfCurrentFrame(3);
 				r.world = std::move(world);
 				r.driverMiscMs = static_cast<float>(g_frame.driverMisc);
@@ -2441,6 +2541,43 @@ namespace Util::FrameTrace
 		t_vramScope = *it;
 	}
 
+	void PushVramScope(std::string_view a_key)
+	{
+		if (t_scopeDepth < kScopeStack)
+			t_scopeStack[t_scopeDepth] = a_key;
+		++t_scopeDepth;
+	}
+
+	void PopVramScope()
+	{
+		if (t_scopeDepth > 0)
+			--t_scopeDepth;
+	}
+
+	void OnResourceNamed(ID3D11DeviceChild* a_resource, std::string_view a_name)
+	{
+		// (46q) A resource of ours billed to no feature, named "Feature::thing" / "Feature thing": billed to that feature.
+		if (!a_resource || a_name.empty())
+			return;
+		IUnknown* tagUnknown = nullptr;
+		UINT size = sizeof(tagUnknown);
+		if (FAILED(a_resource->GetPrivateData(kVramTagGuid, &size, &tagUnknown)) || !tagUnknown)
+			return;
+		auto* tag = static_cast<VramTag*>(tagUnknown);  // only VramTag is ever stored under kVramTagGuid
+		const FeatureVram* current = tag->Feature();
+		if (current && current->name != kVramNoScope) {
+			tagUnknown->Release();
+			return;
+		}
+		size_t end = a_name.find("::");
+		if (end == std::string_view::npos)
+			end = a_name.find(' ');
+		const std::string_view feature = end == std::string_view::npos ? a_name : a_name.substr(0, end);
+		if (!feature.empty() && feature.size() < 48)
+			tag->Rebill(FeatureEntry(feature));
+		tagUnknown->Release();
+	}
+
 	std::string DescribeOurVramByFeature()
 	{
 		std::vector<std::pair<int64_t, std::string>> rows;
@@ -2483,10 +2620,13 @@ namespace Util::FrameTrace
 		// (46p) Ours: billed to the feature setting up (scope), else the pass open on the main thread, else "other".
 		FeatureVram* feature = nullptr;
 		if (owner == VramOwner::D3D11Ours || owner == VramOwner::D3D11Shared) {
+			// (46q) Setup scope, else the innermost pass scope open on this thread (always tracked), else the timed pass.
 			std::string_view name = t_vramScope;
+			if (name.empty() && t_scopeDepth > 0)
+				name = FeatureNameOfKey(t_scopeStack[std::min(t_scopeDepth, kScopeStack) - 1]);
 			if (name.empty())
-				name = EngineTiming::CurrentPassName();
-			feature = FeatureEntry(name.empty() ? std::string_view("other (lazy, no pass open)") : name);
+				name = FeatureNameOfKey(EngineTiming::CurrentPassName());
+			feature = FeatureEntry(name.empty() ? kVramNoScope : name);
 		}
 		TagObject(a_resource, owner, a_bytes, feature);
 		// (46p) Keep Our GPU Memory Resident: our render targets / UAVs (histories, interop, work textures) are evicted last.

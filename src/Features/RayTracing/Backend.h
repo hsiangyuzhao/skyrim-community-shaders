@@ -583,6 +583,43 @@ namespace RayTracingRT
 		/// recreated on the next switch-on. The pools already give their empty blocks back (OnSwitchedOff).
 		void ReleaseIdleResources();
 
+		/// (46q) RT: Submit on a Worker Thread. On: every call on our D3D12 queue (ExecuteCommandLists, Signal, Wait) is handed,
+		/// in order, to a submit thread at the end of each recording step; the render thread only records and does the D3D11
+		/// side (Signal / Wait). Off: called right away (46p). Takes effect at the next recording step that has no prepared frame.
+		void SetSubmitWorker(bool a_on) { submitWanted_ = a_on; }
+		[[nodiscard]] bool SubmitWorkerInEffect() const { return submitOn_; }
+		/// (46q) The submit thread since the last call: batches handed over, longest batch (ms in D3D12 calls), the latest
+		/// batch's wait to start (ms from hand-over), the longest single call (ms); -1 = none.
+		struct SubmitSample
+		{
+			std::uint32_t batches = 0;
+			float maxBatchMs = -1.0f;
+			float lastLagMs = -1.0f;
+			float maxLagMs = -1.0f;
+			float maxCallMs = -1.0f;
+		};
+		SubmitSample TakeSubmitSample();
+		/// (46q) RT: Budget Builds by GPU Time. On: the static BLAS builds and merged-character builds of a frame are bounded by
+		/// a GPU-time budget (ms, from the measured GPU ms per triangle), merged-character builds by a count too, and a merged
+		/// character BLAS not drawn on a frame is kept for a grace period before it goes. Off: 46p (triangles / CPU / count only).
+		void SetBuildBudget(bool a_on, float a_gpuMs, std::uint32_t a_groupBuildsPerFrame, float a_graceMs)
+		{
+			budgetOn_ = a_on;
+			budgetGpuMs_ = a_gpuMs;
+			groupBuildCap_ = a_groupBuildsPerFrame;
+			groupGraceMs_ = a_graceMs;
+		}
+		struct BudgetSample
+		{
+			float msPerMillionTris = -1.0f;   // EMA of the measured GPU ms per million triangles built (-1 = no sample yet)
+			float prepBaseMs = -1.0f;         // EMA of the prep GPU ms on frames without builds
+			std::uint32_t triBudget = 0;      // this frame's static triangle budget (0 = not budgeted)
+			std::uint32_t groupsDeferred = 0; // merged-character builds put off this frame (cap / budget)
+			std::uint32_t groupsKept = 0;     // merged-character BLASes alive without a draw this frame (grace)
+			std::uint32_t staticDeferred = 0; // static builds the budget stopped short of this frame (still queued)
+		};
+		[[nodiscard]] const BudgetSample& GetBudgetSample() const { return budget_; }
+
 		/// (45e) True when ExecuteFrame will find a free command context. Only the GPU completing
 		/// work can change the answer from false to true, never back, so a yes at the start of the
 		/// frame still holds when the frame's trace is recorded.
@@ -740,6 +777,11 @@ namespace RayTracingRT
 			ComPtr<ID3D12CommandAllocator> allocator;
 			ComPtr<ID3D12GraphicsCommandList4> list;
 			ComPtr<ID3D12GraphicsCommandList4> traceList;  // (45l) the trace alone, behind the D3D11 wait (same allocator)
+			// (46q) Submit on a Worker Thread: Early Prep records into its own allocator (the submit thread may still be
+			// executing that list while the render thread records the TLAS / trace lists), and the TLAS then goes in its
+			// own list (the prep list may not be reset before the submit thread has executed it). Created on first use.
+			ComPtr<ID3D12CommandAllocator> prepAllocator;
+			ComPtr<ID3D12GraphicsCommandList4> tlasList;
 			ComPtr<ID3D12Resource> instanceBuffer;  // upload heap, persistently mapped
 			void* instanceMapped = nullptr;
 			std::uint32_t instanceCapacity = 0;
@@ -900,6 +942,7 @@ namespace RayTracingRT
 			bool built = false;
 			bool seen = false;  // drawn this frame (unseen groups are released)
 			std::uint32_t refits = 0;
+			std::int64_t lastSeenQpc = 0;  // (46q) the grace period of Budget Builds by GPU Time
 		};
 		struct SkinGroupInstance
 		{
@@ -955,6 +998,76 @@ namespace RayTracingRT
 		/// (46p) Sets a_objects' residency priority to the current one (HIGH / NORMAL); null entries are skipped.
 		void ApplyResidency(ID3D12Pageable* const* a_objects, std::size_t a_count);
 		void ApplyResidency(ID3D12Pageable* a_object) { ApplyResidency(&a_object, 1); }
+		// (46q) RT: Submit on a Worker Thread. Calls on queue_ go through these: right away (off) or staged and handed to the
+		// submit thread in order at KickSubmits() (on). A recording step stages its calls and kicks once at its end, so the
+		// submit thread never executes a list whose allocator the render thread is still recording into.
+		struct SubmitOp
+		{
+			enum class Kind : std::uint8_t
+			{
+				Execute,
+				Signal,
+				Wait
+			};
+			Kind kind = Kind::Execute;
+			ID3D12CommandList* list = nullptr;  // owned by a command context (kept until Shutdown, which drains first)
+			ID3D12Fence* fence = nullptr;       // owned by the backend
+			std::uint64_t value = 0;
+			const char* what = "";
+		};
+		struct SubmitBatch
+		{
+			std::vector<SubmitOp> ops;
+			std::int64_t kickQpc = 0;
+		};
+		HRESULT QueueExecute(ID3D12CommandList* a_list);
+		HRESULT QueueSignal(ID3D12Fence* a_fence, std::uint64_t a_value, const char* a_what);
+		HRESULT QueueWait(ID3D12Fence* a_fence, std::uint64_t a_value, const char* a_what);
+		void KickSubmits();
+		/// Hands over what is staged and waits until the submit thread executed all of it (mode switch, shutdown).
+		void DrainSubmits();
+		void StopSubmitThread();
+		void SubmitThreadMain();
+		/// Applies submitWanted_ when no prepared frame is open (draining first when switching off). False = keep the mode.
+		void ApplySubmitMode();
+		/// A D3D12 call the submit thread made failed: Fail() with it (render thread). True = failed.
+		bool CheckSubmitError();
+		/// The prep allocator / TLAS list of a context (Submit on a Worker Thread); false = could not be created.
+		bool EnsureWorkerLists(CommandContext& a_context);
+		bool submitWanted_ = false;
+		bool submitOn_ = false;
+		bool submitThreadFailed_ = false;
+		std::vector<SubmitOp> submitStaged_;
+		std::mutex submitMutex_;
+		std::condition_variable submitCv_;
+		std::condition_variable submitIdleCv_;
+		std::deque<SubmitBatch> submitQueue_;
+		bool submitStop_ = false;
+		bool submitBusy_ = false;
+		std::thread submitThread_;
+		HRESULT submitError_ = S_OK;  // under submitMutex_
+		std::string submitErrorWhat_;
+		SubmitSample submitSample_{};  // under submitMutex_
+		// (46q) The highest value only our queue signalled on the shared fence without a D3D11 ready value before it
+		// (BuildOnly, AbandonPrepared), and the highest value the D3D11 queue waited for: with the submit thread the
+		// D3D11 queue first waits for the former before its next ready signal, so the fence never goes backwards.
+		std::uint64_t d3d12OnlySignal_ = 0;
+		std::uint64_t d3d11WaitedFor_ = 0;
+		// (46q) RT: Budget Builds by GPU Time.
+		bool budgetOn_ = false;
+		float budgetGpuMs_ = 1.0f;
+		std::uint32_t groupBuildCap_ = 3;
+		float groupGraceMs_ = 2000.0f;
+		BudgetSample budget_{};
+		double msPerTriEma_ = -1.0;  // GPU ms per triangle built (static + merged-character builds)
+		double prepBaseEma_ = -1.0;  // prep GPU ms on submissions without builds
+		std::uint64_t frameTrisUsed_ = 0;  // triangles built in the submission being recorded (static then merged)
+		/// The static triangle budget of this frame (budget on) or a_default.
+		std::uint32_t StaticTriangleBudget(std::uint32_t a_default);
+		/// Feeds the cost model with a completed submission's prep GPU ms and its work.
+		void LearnBuildCost(float a_prepMs, const Util::FrameTrace::RtPrepWork& a_work);
+		/// Releases merged-character BLASes not drawn for longer than the grace period (all of them with the budget off).
+		void ReleaseUnseenSkinGroups();
 		// (46p) The prep work being recorded (stored into the context with its timestamps); pool block totals at the last store.
 		Util::FrameTrace::RtPrepWork recWork_{};
 		std::uint64_t workBlocksSeen_ = 0;

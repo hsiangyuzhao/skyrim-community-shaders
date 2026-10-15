@@ -1001,6 +1001,9 @@ namespace Util::EngineTiming
 
 	uint64_t FrameId() { return g_frameId; }
 
+	void PushVramScope(std::string_view a_key) { FrameTrace::PushVramScope(a_key); }  // (46q)
+	void PopVramScope() { FrameTrace::PopVramScope(); }
+
 	std::string_view CurrentPassName()
 	{
 		if (!OnMainThread() || g_passDepth <= 0)

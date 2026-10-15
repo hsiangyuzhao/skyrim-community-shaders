@@ -170,6 +170,35 @@ namespace Util::FrameTrace
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 
+	// ---- (46q) columns of the 46q switches (-1 = not run / not known) -----------------------------------------------
+	struct Q46
+	{
+		// RT: Submit on a Worker Thread: in effect, batches the thread ran since the last frame, the longest (ms in D3D12 calls),
+		// the longest wait from hand-over to start (ms), the longest single call (ms).
+		int subOn = -1;
+		uint32_t subBatches = 0;
+		float subMaxBatchMs = -1.0f, subMaxLagMs = -1.0f, subMaxCallMs = -1.0f;
+		// RT: Budget Builds by GPU Time: on, measured GPU ms per million triangles, this frame's static triangle budget, static
+		// builds still queued, merged-character builds put off, merged BLASes kept without a draw.
+		int budOn = -1;
+		float budMsPerMtri = -1.0f;
+		uint32_t budTris = 0, budStaticQueued = 0, budGroupsDeferred = 0, budGroupsKept = 0;
+		// Dynamic Snow footprint shapes: main-thread ms spent on them this frame, state (0 not loaded, 1 loading in the
+		// background, 2 ready, 3 none found / failed).
+		float snowShapesMs = 0.0f;
+		int snowShapesState = -1;
+		// Render-resolution sizing: Size Buffers to Render Resolution / SSRT+SSGI at render resolution in effect (1 / 0), the
+		// allocation size used (0 = output size).
+		int rrB = -1, rrC = -1;
+		uint32_t rrWidth = 0, rrHeight = 0;
+	};
+	/// The RT part (Ray Tracing, once a frame).
+	void On46qRt(const Q46& a_rt);
+	/// Dynamic Snow's footprint shapes (main-thread ms added up over the frame).
+	void On46qSnow(float a_ms, int a_state);
+	/// Render-resolution sizing state (Upscaling, once a frame).
+	void On46qRenderRes(int a_b, int a_c, uint32_t a_width, uint32_t a_height);
+
 	/// (45o) Light Census per-frame numbers (only filled while a trace records; -1 = not known).
 	struct LightStats
 	{
@@ -332,6 +361,12 @@ namespace Util::FrameTrace
 	/// (46p) Our creations on this thread are billed to feature a_name until cleared (empty). Without a scope: the pass open on
 	/// the main thread (while the overlay / a trace runs), else "other".
 	void SetVramScope(std::string_view a_name);
+	/// (46q) Pass scopes (CpuPassScope, EngineTiming::PassScope) push their key on this thread whether or not timing runs: a creation
+	/// outside a Setup scope is billed to the innermost one. The key must outlive the scope.
+	void PushVramScope(std::string_view a_key);
+	void PopVramScope();
+	/// (46q) Util::SetResourceName: a resource of ours billed to no feature is billed to the one its name starts with ("Feature::x").
+	void OnResourceNamed(ID3D11DeviceChild* a_resource, std::string_view a_name);
 	/// (46p) "name MB, ..." alive per feature of ours (largest first), for the trace header.
 	std::string DescribeOurVramByFeature();
 

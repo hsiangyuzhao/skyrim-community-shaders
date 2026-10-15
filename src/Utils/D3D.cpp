@@ -4,6 +4,7 @@
 #include "State.h"
 #include "Utils/ContentHash.h"
 #include "Utils/EngineTiming.h"
+#include "Utils/FrameTrace.h"
 #include "Utils/Format.h"
 
 #include <d3dcompiler.h>
@@ -91,6 +92,8 @@ namespace Util
 		va_end(va);
 
 		Resource->SetPrivateData(WKPDID_D3DDebugObjectNameT, len, buffer);
+		if (len > 0)
+			Util::FrameTrace::OnResourceNamed(Resource, std::string_view(buffer, static_cast<size_t>(len)));  // (46q) VRAM per feature
 	}
 
 	struct CustomInclude : public ID3DInclude

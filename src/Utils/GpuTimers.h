@@ -6,6 +6,7 @@
 #include <string_view>
 #include <winrt/base.h>
 
+#include "Utils/FrameTrace.h"
 #include "Utils/Game.h"
 
 namespace Util
@@ -554,9 +555,13 @@ namespace Util
 		explicit CpuPassScope(std::string_view a_key) :
 			key(a_key)
 		{
+			Util::FrameTrace::PushVramScope(key);  // (46q) VRAM per feature
 			CpuPassTimers::GetSingleton()->Begin(key);
 		}
-		~CpuPassScope() { CpuPassTimers::GetSingleton()->End(key); }
+		~CpuPassScope() {
+			CpuPassTimers::GetSingleton()->End(key);
+			Util::FrameTrace::PopVramScope();
+		}
 
 		CpuPassScope(const CpuPassScope&) = delete;
 		CpuPassScope& operator=(const CpuPassScope&) = delete;

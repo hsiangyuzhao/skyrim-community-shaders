@@ -193,6 +193,19 @@ public:
 		// slice each, one barrier at the end); the RT queue at high priority (an experiment, from the next start-up).
 		bool ParallelBlasBuilds = true;
 		bool HighPriorityQueue = false;
+		// (46q) Outside the settings macro too. Submit on a Worker Thread: our D3D12 queue calls (ExecuteCommandLists / Signal /
+		// Wait) go out on a submit thread (off = 46p, on the render thread). Budget Builds by GPU Time: static + merged-character
+		// BLAS builds per frame within BuildGpuBudgetMs of measured GPU time, at most GroupBuildsPerFrame merged builds, and a
+		// merged character BLAS not drawn kept GroupGraceMs (off = 46p). Carrier Casts Shadows: a light carried by a traced
+		// character is blocked by the carrier's own body except within CarrierClearance units of the light (off = 46p: the
+		// carrier never blocks its own light).
+		bool SubmitWorker = true;
+		bool BuildGpuBudget = true;
+		float BuildGpuBudgetMs = 1.0f;
+		int GroupBuildsPerFrame = 3;
+		float GroupGraceMs = 2000.0f;
+		bool CarrierShadows = true;
+		float CarrierClearance = 28.0f;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int

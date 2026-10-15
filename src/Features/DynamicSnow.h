@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <future>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -103,6 +105,9 @@ public:
 		bool TrailsOnAccumulated = true;  ///< item 5's accumulated snow
 		bool MudTrails = false;           ///< any other terrain, as mud/dirt
 		bool TrailsFromNPCs = true;       ///< nearby actors and creatures, not only the player
+		/// (46q) The footprint shapes (31 textures read, decoded and filtered once per session, 19-29 ms) are prepared on a
+		/// background thread; oval prints until they are ready. Off = 46p (all of it on the render thread on first use).
+		bool BackgroundShapeLoad = true;
 		int TrailResolution = 1;          ///< 0 = 1024 texels (4 units each), 1 = 2048 (2 units each), 2 = 4096 (1 unit each)
 		// (44f) Permanent: bicubic print reconstruction (39b), snowy ground recognised from its land
 		// texture / white directional snow (39b), shaped prints from installed footprint textures
@@ -423,6 +428,20 @@ private:
 	void GatherBodyAndObjectStamps(const RE::NiPoint3& a_center, std::vector<RE::Actor*>& a_deadActors);
 	static PrintKind ClassifyRace(RE::Actor* a_actor, bool a_humanoid);
 	void LoadPrintShapes();
+	/// (46q) What LoadPrintShapes reads and computes (no D3D, no member state): safe on a background thread.
+	struct PrintShapeData
+	{
+		std::array<ShapeSlots, static_cast<size_t>(PrintKind::Count)> slots{};
+		std::vector<std::vector<float>> levels;  ///< per slice, per mip
+		uint32_t slices = 0;
+		uint32_t mips = 0;
+		bool anyPbr = false, anyClassic = false;
+	};
+	static std::unique_ptr<PrintShapeData> DecodePrintShapes();
+	/// The atlas from decoded shapes (render thread).
+	void ApplyPrintShapes(std::unique_ptr<PrintShapeData> a_data);
+	/// (46q) First use: starts the background load, or applies its result once ready (Background Shape Load).
+	void PollPrintShapes();
 	void UpdateTrailMap();
 	bool EnsureTrailResources();
 	void ReleaseTrailResources();
@@ -452,6 +471,8 @@ private:
 
 	// (batch 39c) Print shapes and the Footprints mod
 	bool shapesTried = false;  ///< LoadPrintShapes ran (it runs once, in game, on first use)
+	std::future<std::unique_ptr<PrintShapeData>> shapeFuture;  ///< (46q) the background load in flight
+	int shapeState = 0;  ///< (46q) F7 snow_shapes_state: 0 not loaded, 1 loading, 2 ready, 3 none / failed
 	std::array<ShapeSlots, static_cast<size_t>(PrintKind::Count)> shapeSlots{};
 	uint32_t shapeCount = 0;
 	winrt::com_ptr<ID3D11ShaderResourceView> shapeSRV;
