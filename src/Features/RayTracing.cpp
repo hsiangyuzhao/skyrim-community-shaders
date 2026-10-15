@@ -3391,6 +3391,12 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	config.forced = a_interior && !skippedLights.empty() ? &skippedLights : nullptr;
 	// (46e) The characters in this frame's TLAS: a light one of them carries skips that character's body.
 	config.owners = (a_input.skinDraws && !a_input.skinDraws->empty()) ? &characters.Owners() : nullptr;
+	// (46q) Carrier Casts Shadows: the player in third person is its own lights' carrier too (first person: as 46p, the player's
+	// body is never tested against its own lights; the first-person arm would cover most of the view).
+	{
+		auto* playerCamera = RE::PlayerCamera::GetSingleton();
+		config.playerCarrier = settings.CarrierShadows && playerCamera && !playerCamera->IsInFirstPerson();
+	}
 	const double camera[3] = { a_camX, a_camY, a_camZ };
 	const float worldRect[4] = { static_cast<float>(a_traceRect[0] + a_camX), static_cast<float>(a_traceRect[1] + a_camY),
 		static_cast<float>(a_traceRect[2] + a_camX), static_cast<float>(a_traceRect[3] + a_camY) };
@@ -3432,7 +3438,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	c.extra[0] = kPointMinShare;
 	c.extra[1] = kPointMinContribution;
 	c.extra[2] = kPointSunShare;
-	c.extra[3] = 0.0f;
+	c.extra[3] = settings.CarrierShadows ? std::clamp(settings.CarrierClearance, 0.0f, 64.0f) : -1.0f;  // (46q) < 0: as 46p
 	std::copy_n(a_input.constants.spheres, 8, c.spheres);
 	std::copy_n(a_input.constants.toSun, 3, c.sun);
 	c.sun[3] = a_sunStrength;
@@ -4605,6 +4611,18 @@ void RayTracing::DrawPointLightPage()
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("On (default): the torch in your hand, Quick Light's light and light spells on you cast ray-traced shadows.");
 			ImGui::Text("  Your own body never blocks them (else your arm would shadow everything). Off: as before (old shadows).");
+		}
+		ImGui::Checkbox("Carrier Casts Shadows from Its Own Light", &settings.CarrierShadows);  // (46q)
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): someone holding a torch (an NPC, or you in third person) casts a body shadow from it on the ground and");
+			ImGui::Text("  walls behind them; only the part of the body near the flame (the hand and forearm, Carrier Clearance) is ignored.");
+			ImGui::Text("  First person keeps the old rule (your body never blocks your own light). Off: as 46p (the carrier never blocks it).");
+		}
+		if (settings.CarrierShadows) {
+			ImGui::SliderFloat("Carrier Clearance (units)", &settings.CarrierClearance, 0.0f, 64.0f, "%.0f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Body parts closer than this to the light do not block it (70 units = 1 m). NPC lights also stop %.0f units before the flame.",
+					settings.PointLightsClearance);
 		}
 		ImGui::Checkbox("Spell / Effect Lights Cast RT Shadows", &settings.PointLightsEffects);
 		if (auto _tt = Util::HoverTooltipWrapper()) {

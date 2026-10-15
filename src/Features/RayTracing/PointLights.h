@@ -103,6 +103,9 @@ namespace RayTracingPointLights
 		// (46e) The characters in this frame's TLAS (owner reference -> key, sorted by pointer, Characters::Owners): a light
 		// carried by one of them (a torch in an NPC's hand) does not test that character's own body and gear.
 		const std::vector<std::pair<const void*, std::uint32_t>>* owners = nullptr;
+		// (46q) Carrier Casts Shadows from Its Own Light, third person: the player's own lights take the player's key as their carrier
+		// (the body blocks except near the light, TracePointLightsCS) instead of skipping the player (kSourceNoPlayer).
+		bool playerCarrier = false;
 		// (46g) Stable selection: per light a smoothed intensity (EMA 0.1 per frame) and radius (rises at once, shrinks 2 % per
 		// frame) drive the rules, the merge and the GPU source; a light tagged last frame stays while it is above 80 % of the cuts.
 		bool stable = true;

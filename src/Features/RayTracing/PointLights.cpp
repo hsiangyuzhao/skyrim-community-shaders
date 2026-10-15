@@ -476,6 +476,14 @@ namespace RayTracingPointLights
 					[](const auto& a_entry, const void* a_key) { return a_entry.first < a_key; });
 				if (it != a_config.owners->end() && it->first == r.owner)
 					c.owner = it->second;
+			} else if (a_config.owners && c.kind == 1 && a_config.playerCarrier) {
+				// (46q) The player's own light in third person: the player is its carrier (by the player reference; a light whose
+				// reference is another node of the player is still the player's). Not traced: as 46p (kSourceNoPlayer).
+				const void* player = RE::PlayerCharacter::GetSingleton();
+				const auto it = std::lower_bound(a_config.owners->begin(), a_config.owners->end(), player,
+					[](const auto& a_entry, const void* a_key) { return a_entry.first < a_key; });
+				if (player && it != a_config.owners->end() && it->first == player)
+					c.owner = it->second;
 			}
 			if (wasTagged && (r.radius < a_config.minRadius || intensityBeforeFade < a_config.minIntensity))
 				++stats_.kept;
@@ -635,7 +643,7 @@ namespace RayTracingPointLights
 			if (group.kind != 0) {
 				// (46d) The player's lights: the player's body is not tested (the torch, the arm, the torso); their own
 				// fixture is part of the player (excluded) or does not exist (spells): a small clearance only.
-				if (group.kind == 1)
+				if (group.kind == 1 && group.owner == 0)  // (46q) with a carrier key the body blocks except near the light
 					out.info[0] |= kSourceNoPlayer;
 				clearance = std::min(a_config.ownClearance, group.radius * 0.5f);
 				stats_.player += group.kind == 1 ? 1 : 0;

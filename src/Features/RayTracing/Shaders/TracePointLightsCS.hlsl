@@ -38,7 +38,8 @@ struct PLConstants
 	float4 Params;                   // x sources to scan, y frame, z flags (asuint), w K (1..4)
 	float4 Bias;                     // x constant ray offset, y per unit of distance, z character ray TMin, w emitter radius
 	float4 Extra;                    // x least share of the pixel's point light that is traced, y least absolute contribution,
-	                                 // z least share of the sun's light at a sunlit pixel (the sun gate)
+	                                 // z least share of the sun's light at a sunlit pixel (the sun gate), (46q) w carrier clearance
+	                                 // (units; < 0 = 46p: a carried light never tests its carrier)
 	float4 Spheres[2];               // character bounds (camera-relative xyz, radius; 0 = none): [0] the player, [1] the others
 	float4 Sun;                      // xyz to the sun (world axes), w its strength (brightest channel; 0 = no sun gate)
 	float4 Bounds;                   // (46c) x / y camera-relative z min / max of the interior, z ray margin past it,
@@ -245,7 +246,9 @@ bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, float
 // InstanceContributionToHitGroupIndex = its key, Backend) are not tested. Every candidate comes back (forced
 // non-opaque); the opaque instances (ID 0) block as usual, the alpha-tested ones are tested against their cut-out
 // (RT_ALPHA) or ignored (without it they are culled in Blocked() too).
-bool BlockedExcept(float3 origin, float3 dir, float tMax, uint mask, float tMin, float footprint, uint owner, out float tHit)
+// (46q) ownerTMax >= 0 (Carrier Casts Shadows from Its Own Light): the carrier's own instances do block, but only where the ray
+// meets them before ownerTMax (farther than the carrier clearance from the light): the hand and arm holding the torch do not.
+bool BlockedExcept(float3 origin, float3 dir, float tMax, uint mask, float tMin, float footprint, uint owner, float ownerTMax, out float tHit)
 {
 	RayDesc ray;
 	ray.Origin = origin;
@@ -260,7 +263,7 @@ bool BlockedExcept(float3 origin, float3 dir, float tMax, uint mask, float tMin,
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
 			continue;
-		if (q.CandidateInstanceContributionToHitGroupIndex() == owner)
+		if (q.CandidateInstanceContributionToHitGroupIndex() == owner && (ownerTMax < 0.0 || q.CandidateTriangleRayT() >= ownerTMax))
 			continue;
 		const uint id = q.CandidateInstanceID();
 		bool blocks = id == 0u;
@@ -479,8 +482,10 @@ groupshared uint gsMask[2];
 			if (test) {
 				// (46e) A light carried by a traced character (Info.w = its key): that character's body is not tested.
 				const uint owner = src.Info.w & 0xFFFFFFu;
+				// (46q) Carrier Casts Shadows (Extra.w >= 0): its body blocks except within the carrier clearance of the light.
+				const float ownerTMax = C.Extra.w >= 0.0 ? max(len - C.Extra.w, 0.0) : -1.0;
 				if (owner != 0u)
-					blocked = BlockedExcept(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, owner, tHit);
+					blocked = BlockedExcept(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, owner, ownerTMax, tHit);
 				else
 					blocked = Blocked(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, RAY_FLAG_NONE, tHit);
 				rays += 1u;
