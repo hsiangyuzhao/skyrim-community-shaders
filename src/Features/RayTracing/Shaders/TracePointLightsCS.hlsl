@@ -41,7 +41,8 @@ struct PLConstants
 	                                 // z least share of the sun's light at a sunlit pixel (the sun gate)
 	float4 Spheres[2];               // character bounds (camera-relative xyz, radius; 0 = none): [0] the player, [1] the others
 	float4 Sun;                      // xyz to the sun (world axes), w its strength (brightest channel; 0 = no sun gate)
-	float4 Bounds;                   // (46c) x / y camera-relative z min / max of the interior, z ray margin past it, w unused
+	float4 Bounds;                   // (46c) x / y camera-relative z min / max of the interior, z ray margin past it,
+	                                 // (46o) w tan of the window beams' angular size (half angle; 0 = 46n: the emitter sphere)
 };
 
 struct PLSource
@@ -79,6 +80,9 @@ static const uint kCharacterMasks = 0x06u;
 static const uint kNpcMask = 0x04u;  // (46d) the other actors only (Backend::kNpcMask): rays of the player's own lights
 static const float kFirstPersonNear = 96.0;
 static const float kScaledUnitsSq = 0.8 * 70.0 * 70.0;  // InverseSquareLighting SCALED_UNITS_SQ
+// (46o) Soft window beams: their blocked samples encode sqrt(blocker distance / kBeamBlockerRange) instead of the ratio to the
+// (far away) light; PointDenoiseCS turns it into the penumbra width blocker distance x tan(angle). Same constant there.
+static const float kBeamBlockerRange = 2048.0;
 
 #if defined(RT_ALPHA)
 // (46c) Alpha-tested instances (instance ID = 1 + record), as TraceShadowsCS RT_ALPHA: a candidate blocks when the
@@ -436,6 +440,9 @@ groupshared uint gsMask[2];
 		if (bestIdx[k] == 0u || bestC[k] < ((sticky && any(prevIdx == bestIdx[k])) ? stickyThreshold : threshold))
 			continue;
 		const PLSource src = Sources[bestIdx[k] - 1u];
+		const bool isBeam = (src.Info.x & kSourceBeam) != 0u;
+		// (46o) A soft window beam: the disc subtends the beam's angular size seen from the surface (like the sun's cone).
+		const bool softBeam = isBeam && C.Bounds.w > 0.0;
 		// A point on the emitter's disc facing the surface (R2 step per slot: the slots decorrelate).
 		const float3 L0 = src.PosRadius.xyz - origin;
 		const float len0 = length(L0);
@@ -447,7 +454,8 @@ groupshared uint gsMask[2];
 		const float u2 = frac(n1 + float(k) * 0.5698402910);
 		float sn, cs;
 		sincos(6.2831853 * u2, sn, cs);
-		const float3 target = src.PosRadius.xyz + (T * cs + B * sn) * (sqrt(u1) * C.Bias.w);
+		const float emitter = softBeam ? len0 * C.Bounds.w : C.Bias.w;
+		const float3 target = src.PosRadius.xyz + (T * cs + B * sn) * (sqrt(u1) * emitter);
 		const float3 L = target - origin;
 		const float len = length(L);
 		const float3 dir = L / max(len, 1e-3);
@@ -460,7 +468,6 @@ groupshared uint gsMask[2];
 			continue;  // the surface is inside the clearance: lit
 		float tHit;
 		const float footprint = dist * 2.0 * C.RenderSize.w;  // about a pixel's size there (alpha mip choice)
-		const bool isBeam = (src.Info.x & kSourceBeam) != 0u;
 		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, isBeam ? beamCull : RAY_FLAG_NONE, tHit);
 		rays += 1u;
 		if (!blocked && characters) {
@@ -480,7 +487,7 @@ groupshared uint gsMask[2];
 			}
 		}
 		if (blocked)
-			vis[k] = min(sqrt(saturate(tHit / max(len, 1.0))), 1.0) * (254.0 / 255.0);
+			vis[k] = min(sqrt(saturate(tHit / (softBeam ? kBeamBlockerRange : max(len, 1.0)))), 1.0) * (254.0 / 255.0);
 		if (isBeam && beamSample) {
 			const uint word = kBeamWordBase + (bestIdx[k] - 1u) * 2u;
 			uint previousBeam;

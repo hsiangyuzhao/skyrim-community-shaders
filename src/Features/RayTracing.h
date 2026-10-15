@@ -103,7 +103,7 @@ public:
 		// Per kind of object: ray traced (true) or the shadow map + screen-space shadows.
 		bool Characters = true;
 		bool PhysicsParts = true;  // HDT-SMP / HDT-PE parts other than hair (capes, skirts)
-		int SettingsVersion = 5;   // 5 = 45o (debug switches hard-wired; no migrations before it)
+		int SettingsVersion = 6;   // 5 = 45o (debug switches hard-wired; no migrations before it); 6 = 46o (Window Beam Guard off once)
 		bool Buildings = true;
 		bool Objects = true;
 		bool Trees = false;
@@ -153,7 +153,13 @@ public:
 		// (46g) Window beam rays: 0 cull nothing (46f), 1 cull triangles facing the ray start (the room shell seen from inside, as the
 		// engine's shadow map culls it from the light), 2 cull the ones facing away.
 		int PointLightsBeamCull = 1;
-		bool PointLightsBeamGuard = true;  // (46g) a beam that is almost fully blocked keeps the engine's shadow map
+		// (46g) a beam that is almost fully blocked keeps the engine's shadow map. (46o) Off by default (and switched off once for saved
+		// settings older than 6): its 97 % rule misfired on beams whose cone mostly hits walls (one normally ~94 %) and flickered.
+		bool PointLightsBeamGuard = false;
+		// (46o) Window beams' angular size (degrees, half angle, like the sun's cone): their rays are jittered inside it and the point-light
+		// denoiser filters their shadow edges by blocker distance x tan(angle). 0 = 46n (the emitter sphere, nearly hard and unfiltered).
+		// Outside the settings macro (it takes at most 64 members): read / written in Load / SaveSettings.
+		float PointLightsBeamSoftness = 0.5f;
 		// (46f) Ray-traced ambient occlusion (Ray Tracing page, Ambient Occlusion). (46h) Indoors too: AOInteriors.
 		bool AO = false;
 		int AOMode = 0;                // AOMode: 0 RTAO (keeps SSGI contact AO, darker of both), 1 darker of RTAO and SSGI AO
@@ -622,7 +628,7 @@ private:
 	struct alignas(16) PointDenoiseCB
 	{
 		float Params[4];  // emitter radius, this frame's weight in the history, flags (bits), max filter radius (px)
-		float Extra[4];   // K, unused x3
+		float Extra[4];   // K, (46o) window-beam source slots (bits 0-31, 32-63 as uint bits), tan of the beam softness (0 = 46n)
 		std::uint32_t Motion[16];  // (46d) per source slot one byte: history dropped this frame (0 keep .. 255 none), 4 slots per uint
 	};
 	STATIC_ASSERT_ALIGNAS_16(PointDenoiseCB);
@@ -634,6 +640,8 @@ private:
 	bool pointRequested = false;
 	std::string pointOffReason;       // why they were switched off automatically
 	std::uint32_t pointK = 0;         // K of this frame's trace (0 = none)
+	std::uint64_t pointBeamMask = 0;  // (46o) source slots of this frame's trace that are window beams
+	float pointBeamTan = 0.0f;        // (46o) tan of the window-beam softness this frame (0 = 46n)
 	float pointCpuMs = 0.0f;
 	// Denoiser outputs (also the history, ping-pong): visibility per slot, sources per slot, distance.
 	DenoiseTexture pointVis[2], pointIdx[2], pointDist[2];

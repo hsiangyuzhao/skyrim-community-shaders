@@ -1156,6 +1156,9 @@ void RayTracing::OnDenoiserPicked()
 void RayTracing::LoadSettings(json& o_json)
 {
 	// Missing keys keep their defaults; keys of removed switches are ignored (and dropped on the next save).
+	int loadedVersion = 0;  // (46o)
+	if (const auto it = o_json.find("SettingsVersion"); it != o_json.end() && it->is_number_integer())
+		loadedVersion = it->get<int>();
 	settings = o_json;
 	// (46n) Outside the macro (it takes at most 64 members).
 	{
@@ -1173,6 +1176,12 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PrepareOnCellEvents = read("PrepareOnCellEvents", defaults.PrepareOnCellEvents);
 		settings.CellEventMs = read("CellEventMs", defaults.CellEventMs);
 		settings.FadeInBudgets = read("FadeInBudgets", defaults.FadeInBudgets);
+		settings.PointLightsBeamSoftness = read("PointLightsBeamSoftness", defaults.PointLightsBeamSoftness);  // (46o)
+	}
+	// (46o) Window Beam Guard: off once for settings saved before 46o (its rule misfired on beams that mostly hit walls).
+	if (loadedVersion < 6 && settings.PointLightsBeamGuard) {
+		settings.PointLightsBeamGuard = false;
+		logger::info("[RayTracing] Window Beam Guard switched off (46o default; tick it again in Point Light Shadows if wanted)");
 	}
 	if (settings.Denoiser == 1)
 		logger::info("[RayTracing] Denoiser Temporal was removed: Penumbra");
@@ -1211,6 +1220,7 @@ void RayTracing::LoadSettings(json& o_json)
 	settings.LoadingPumpMs = std::isfinite(settings.LoadingPumpMs) ? std::clamp(settings.LoadingPumpMs, 2.0f, 32.0f) : 8.0f;
 	settings.BlackWindowMs = std::isfinite(settings.BlackWindowMs) ? std::clamp(settings.BlackWindowMs, 0.0f, 2000.0f) : 200.0f;
 	settings.CellEventMs = std::isfinite(settings.CellEventMs) ? std::clamp(settings.CellEventMs, 2.0f, 50.0f) : 12.0f;  // (46n)
+	settings.PointLightsBeamSoftness = std::isfinite(settings.PointLightsBeamSoftness) ? std::clamp(settings.PointLightsBeamSoftness, 0.0f, 3.0f) : 0.5f;  // (46o)
 }
 
 void RayTracing::SaveSettings(json& o_json)
@@ -1220,6 +1230,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PrepareOnCellEvents"] = settings.PrepareOnCellEvents;
 	o_json["CellEventMs"] = settings.CellEventMs;
 	o_json["FadeInBudgets"] = settings.FadeInBudgets;
+	o_json["PointLightsBeamSoftness"] = settings.PointLightsBeamSoftness;  // (46o)
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -3329,7 +3340,15 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	c.bounds[0] = -1e9f;
 	c.bounds[1] = 1e9f;
 	c.bounds[2] = kBeamRayMargin;
-	c.bounds[3] = 0.0f;
+	// (46o) Window beams' angular size: their rays are jittered inside this cone (tan of the half angle; 0 = 46n).
+	pointBeamTan = settings.PointLightsWindowBeams && settings.PointLightsBeamSoftness > 0.0f ?
+	                   std::tan(std::clamp(settings.PointLightsBeamSoftness, 0.0f, 3.0f) * 0.017453293f) :
+	                   0.0f;
+	c.bounds[3] = pointBeamTan;
+	pointBeamMask = 0;
+	for (std::uint32_t s = 0; s < scan && s < 64; ++s)
+		if (pointSources[s].info[0] & RayTracingPointLights::kSourceBeam)
+			pointBeamMask |= 1ull << s;
 	if (a_interior) {
 		double lo[3], hi[3];
 		if (scene.GetInteriorBounds(lo, hi)) {
@@ -3367,6 +3386,13 @@ void RayTracing::FinishPointLights()
 	std::memcpy(&cb.Params[2], &flags, sizeof(float));
 	cb.Params[3] = kPointMaxFilterRadius;
 	cb.Extra[0] = static_cast<float>(pointK);
+	{
+		// (46o) Which source slots are window beams, and their softness: their penumbra width is blocker distance x tan(angle).
+		const std::uint32_t lo = static_cast<std::uint32_t>(pointBeamMask), hi = static_cast<std::uint32_t>(pointBeamMask >> 32);
+		std::memcpy(&cb.Extra[1], &lo, sizeof(float));
+		std::memcpy(&cb.Extra[2], &hi, sizeof(float));
+		cb.Extra[3] = pointBeamMask ? pointBeamTan : 0.0f;
+	}
 	{
 		// (46d) Moving / new sources: their history is dropped in proportion (slot s in byte s % 4 of Motion[s / 4]).
 		const auto& motion = pointSelector.SlotMotion();
@@ -4534,7 +4560,15 @@ void RayTracing::DrawPointLightPage()
 			ImGui::Checkbox("Window Beam Guard", &settings.PointLightsBeamGuard);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("A beam whose whole cone comes out blocked (the patch would vanish) keeps the game's shadow map for a while,");
-				ImGui::Text("  then it is tried again. %u beams were caught so far.", beamsImplausible);
+				ImGui::Text("  then it is tried again. %u beams were caught so far. Off by default since 46o: it also caught normal beams", beamsImplausible);
+				ImGui::Text("  whose cone mostly hits walls, and the switch back and forth flickered.");
+			}
+			// (46o)
+			ImGui::SliderFloat("Window Beam Softness", &settings.PointLightsBeamSoftness, 0.0f, 3.0f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("How wide the sun looks through the window (degrees, like the sun's own size): soft edges on the beam's window pattern,");
+				ImGui::Text("  growing with the distance to the window frame, and the grain on moving characters is filtered away.");
+				ImGui::Text("  0 = as 46n (hard, grainy pattern).");
 			}
 		}
 		ImGui::Checkbox("Stop Engine Shadow Maps for RT Lights", &settings.PointLightsSkipShadowMaps);
@@ -5067,8 +5101,8 @@ std::string RayTracing::DescribeForProfile() const
 		settings.PointLightsEffects ? "on" : "off", settings.PointLightsAlphaOutdoors ? "on" : "off");
 	// (46g)
 	static constexpr const char* kBeamCull[] = { "none", "faces toward the room", "faces away" };
-	text += std::format(", stable light selection {}, window beam culling {}, beam guard {}", settings.PointLightsStable ? "on" : "off",
-		kBeamCull[EffectiveBeamCull()], settings.PointLightsBeamGuard ? "on" : "off");
+	text += std::format(", stable light selection {}, window beam culling {}, beam guard {}, (46o) window beam softness {:.2f} deg", settings.PointLightsStable ? "on" : "off",
+		kBeamCull[EffectiveBeamCull()], settings.PointLightsBeamGuard ? "on" : "off", settings.PointLightsBeamSoftness);
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
 	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split" };

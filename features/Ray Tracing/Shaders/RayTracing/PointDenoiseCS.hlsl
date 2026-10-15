@@ -19,7 +19,7 @@
 cbuffer PointDenoiseCB : register(b1)
 {
 	float4 PLParams;  // x emitter radius, y this frame's weight in the history blend, z flags (asuint), w max filter radius (px)
-	float4 PLExtra;   // x K, yzw unused
+	float4 PLExtra;   // x K, (46o) y / z window-beam source slots 0-31 / 32-63 (uint bits), w tan of the beams' angular size (0 = 46n)
 	uint4 PLMotion[4];  // (46d) per source slot one byte (slot s: byte s % 4 of uint s / 4): history dropped this frame, 0 keep .. 255 none
 };
 
@@ -37,6 +37,9 @@ RWTexture2D<unorm float4> DebugColor : register(u3);
 
 static const uint kPLFlagHistory = 1u;  // the history textures hold last frame
 static const uint kPLFlagDebug = 2u;
+// (46o) Soft window beams (TracePointLightsCS, same constant): a blocked sample is sqrt(blocker distance / kBeamBlockerRange).
+static const float kBeamBlockerRange = 2048.0;
+static const float kBeamNoHistoryRadiusPx = 4.0;  // a beam slot without usable history (moving character) is filtered at least this wide
 
 // Point-light debug views (RayTracing::DebugView, after the sun's).
 static const uint kViewPLCandidates = 12u;
@@ -92,6 +95,16 @@ float HistoryDrop(uint a_id)
 float Lit(float a_raw)
 {
 	return a_raw >= 0.999 ? 1.0 : 0.0;
+}
+
+// (46o) Is this source (id = slot + 1) a soft window beam this frame?
+bool SoftBeam(uint a_id)
+{
+	if (a_id == 0u || PLExtra.w <= 0.0)
+		return false;
+	const uint s = a_id - 1u;
+	const uint word = s < 32u ? asuint(PLExtra.y) : asuint(PLExtra.z);
+	return ((word >> (s & 31u)) & 1u) != 0u;
 }
 
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID) {
@@ -163,15 +176,63 @@ float Lit(float a_raw)
 			}
 		}
 
+		// 3a. (46o) The history taps first (read only; blended in after the spatial pass as before), so that a soft beam slot
+		// without usable history (a moving character: rejected by distance) gets a wide spatial filter instead of 1 spp grain.
+		float4 hv = 0.0, hw = 0.0;
+		[branch] if (flags & kPLFlagHistory)
+		{
+			const float4 prevClip = mul(PrevViewProj, float4(P + CameraDelta.xyz, 1.0));
+			const float2 prevUv = prevClip.w > 1e-4 ? float2(prevClip.x / prevClip.w * 0.5 + 0.5, 0.5 - prevClip.y / prevClip.w * 0.5) : float2(-1.0, -1.0);
+			[branch] if (all(prevUv >= 0.0) && all(prevUv < 1.0))
+			{
+				const float2 prevPos = prevUv * float2(Size.xy) - 0.5;
+				const int2 base = int2(floor(prevPos));
+				const float2 f = prevPos - float2(base);
+				const float expected = length(P + CameraDelta.xyz);
+				const float tolerance = expected * 0.02 + 8.0;
+				[unroll] for (int t = 0; t < 4; ++t)
+				{
+					const int2 o = int2(t & 1, t >> 1);
+					const int2 q = clamp(base + o, int2(0, 0), maxP);
+					const float hd = HistDist[q];
+					const float bw = (o.x ? f.x : 1.0 - f.x) * (o.y ? f.y : 1.0 - f.y);
+					[branch] if (hd > 0.0 && abs(hd - expected) <= tolerance && bw > 0.0)
+					{
+						const uint4 hid = Ids(HistIdx[q]);
+						const float4 hvis = HistVis[q];
+						[unroll] for (uint s = 0u; s < 4u; ++s)
+						{
+							float h;
+							if (Match(hid, hvis, ids[s], h)) {
+								hv[s] += h * bw;
+								hw[s] += bw;
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// 2. Penumbra-wide pass for the slots whose neighbourhood disagrees.
 		float4 radiusPx = 0.0;
 		float4 spatial = 1.0;
 		[unroll] for (uint s = 0u; s < 4u; ++s)
 		{
 			if (ids[s] != 0u && hi[s] > lo[s]) {
-				const float q = qCount[s] > 0.0 ? clamp(qSum[s] / qCount[s], 0.0, 0.95) : 0.25;
-				const float width = 2.0 * PLParams.x * q / (1.0 - q);
-				radiusPx[s] = clamp(0.5 * width / footprint, 1.0, PLParams.w);
+				[branch] if (SoftBeam(ids[s]))
+				{
+					// (46o) A window beam: the light is far away, the penumbra is blocker distance x 2 tan(half angle).
+					const float qb = qCount[s] > 0.0 ? saturate(qSum[s] / qCount[s]) : 0.25;
+					radiusPx[s] = clamp(qb * kBeamBlockerRange * PLExtra.w / footprint, 1.0, PLParams.w);
+					if (hw[s] < 0.05)
+						radiusPx[s] = max(radiusPx[s], min(kBeamNoHistoryRadiusPx, PLParams.w));
+				}
+				else
+				{
+					const float q = qCount[s] > 0.0 ? clamp(qSum[s] / qCount[s], 0.0, 0.95) : 0.25;
+					const float width = 2.0 * PLParams.x * q / (1.0 - q);
+					radiusPx[s] = clamp(0.5 * width / footprint, 1.0, PLParams.w);
+				}
 			}
 			spatial[s] = weights[s] > 0.0 ? sum[s] / weights[s] : Lit(raw[s]);
 		}
@@ -209,48 +270,14 @@ float Lit(float a_raw)
 					spatial[s] = wsum[s] / wwt[s];
 		}
 
-		// 3. History.
+		// 3b. History blend (taps read in 3a; hw = 0 without usable history).
 		result = spatial;
-		[branch] if (flags & kPLFlagHistory)
+		[unroll] for (uint sh = 0u; sh < 4u; ++sh)
 		{
-			const float4 prevClip = mul(PrevViewProj, float4(P + CameraDelta.xyz, 1.0));
-			const float2 prevUv = prevClip.w > 1e-4 ? float2(prevClip.x / prevClip.w * 0.5 + 0.5, 0.5 - prevClip.y / prevClip.w * 0.5) : float2(-1.0, -1.0);
-			[branch] if (all(prevUv >= 0.0) && all(prevUv < 1.0))
-			{
-				const float2 prevPos = prevUv * float2(Size.xy) - 0.5;
-				const int2 base = int2(floor(prevPos));
-				const float2 f = prevPos - float2(base);
-				const float expected = length(P + CameraDelta.xyz);
-				const float tolerance = expected * 0.02 + 8.0;
-				float4 hv = 0.0, hw = 0.0;
-				[unroll] for (int t = 0; t < 4; ++t)
-				{
-					const int2 o = int2(t & 1, t >> 1);
-					const int2 q = clamp(base + o, int2(0, 0), maxP);
-					const float hd = HistDist[q];
-					const float bw = (o.x ? f.x : 1.0 - f.x) * (o.y ? f.y : 1.0 - f.y);
-					[branch] if (hd > 0.0 && abs(hd - expected) <= tolerance && bw > 0.0)
-					{
-						const uint4 hid = Ids(HistIdx[q]);
-						const float4 hvis = HistVis[q];
-						[unroll] for (uint s = 0u; s < 4u; ++s)
-						{
-							float h;
-							if (Match(hid, hvis, ids[s], h)) {
-								hv[s] += h * bw;
-								hw[s] += bw;
-							}
-						}
-					}
-				}
-				[unroll] for (uint s = 0u; s < 4u; ++s)
-				{
-					if (ids[s] != 0u && hw[s] >= 0.05) {
-						const float lo3 = (lo[s] <= 1.0 ? lo[s] : spatial[s]) - 0.1, hi3 = (hi[s] >= 0.0 ? hi[s] : spatial[s]) + 0.1;
-						// (46d) A moving source (a carried torch) keeps less history: its shadows move with it, nothing smears.
-						result[s] = lerp(clamp(hv[s] / hw[s], lo3, hi3), spatial[s], lerp(PLParams.y, 1.0, HistoryDrop(ids[s])));
-					}
-				}
+			if (ids[sh] != 0u && hw[sh] >= 0.05) {
+				const float lo3 = (lo[sh] <= 1.0 ? lo[sh] : spatial[sh]) - 0.1, hi3 = (hi[sh] >= 0.0 ? hi[sh] : spatial[sh]) + 0.1;
+				// (46d) A moving source (a carried torch) keeps less history: its shadows move with it, nothing smears.
+				result[sh] = lerp(clamp(hv[sh] / hw[sh], lo3, hi3), spatial[sh], lerp(PLParams.y, 1.0, HistoryDrop(ids[sh])));
 			}
 		}
 		[unroll] for (uint e = 0u; e < 4u; ++e)
