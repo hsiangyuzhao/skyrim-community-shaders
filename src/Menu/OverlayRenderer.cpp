@@ -231,7 +231,10 @@ void OverlayRenderer::FinalizeImGuiFrame()
 {
 	ImGui::Render();
 
-	ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+	// (46n) Nothing to draw (menu and overlays closed): no draw at all. The DX11 backend otherwise maps its whole vertex and index
+	// buffers with WRITE_DISCARD every frame (sized for the largest frame ever drawn, ~800 KB after the overlay was open once).
+	if (auto* drawData = ImGui::GetDrawData(); drawData && drawData->TotalVtxCount > 0)
+		ImGui_ImplDX11_RenderDrawData(drawData);
 
 	if (globals::features::vr.IsOpenVRCompatible()) {
 		globals::features::vr.SubmitOverlayFrame();

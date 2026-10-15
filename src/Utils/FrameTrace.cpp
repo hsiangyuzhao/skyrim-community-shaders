@@ -549,6 +549,8 @@ namespace Util::FrameTrace
 				out << "#   frame's GPU time of the bucket, '-' = no GPU timer). pass_block = name:<kind><ms>x<calls> for blocking calls on the main thread\n";
 				out << "#   inside the pass: m Map/Unmap, u Copy*/UpdateSubresource, f Flush, q GetData/Clear*/mips/resolve, d Draw/Dispatch, c device Create*,\n";
 				out << "#   s CompileShader (disk cache or compile; its own Create is also in c).\n";
+				out << "# (46n) pacer_d3d11_wait_ms = the previous frame's main-thread time inside D3D11 calls of 0.5 ms or more (Map / Flush / GetData:\n";
+				out << "#   waits for the GPU), left out of pacer_lead_ms; pacer_learned_ms = the frame-start sleep learned from them (in pacer_sleep_ms).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -584,7 +586,7 @@ namespace Util::FrameTrace
 				       "wt_miss_ms,wt_misses,wt_skin_actors,wt_skin_ms,wt_shelter_picks,wt_shelter_ms,wt_water_searches,wt_water_ms,wt_creates,"
 				       "wt_create_ms,wt_tex_creates,wt_view_creates,wt_passes,wt_techniques,wt_materials,wt_setups,wt_groups,wt_stamps,wt_top3,"
 				       "wt_places_over_1ms,driver_misc_ms,driver_misc_calls,map_other_ms,map_other_calls,"
-				       "cpu_top_features,pass_since_load,pass_sum_ms,pass_untimed_ms,pass_split,pass_block\n";
+				       "cpu_top_features,pass_since_load,pass_sum_ms,pass_untimed_ms,pass_split,pass_block,pacer_d3d11_wait_ms,pacer_learned_ms\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -645,8 +647,10 @@ namespace Util::FrameTrace
 					}
 					s += "," + a_row.cpuTop;
 					// (46n) cs_passes split.
-					s += std::format(",{},{:.3f},{:.3f},{},{}\n", a_row.passSinceLoad, a_row.engine.passSumMs, a_row.engine.passUntimedMs, FormatPassSplit(a_row),
+					s += std::format(",{},{:.3f},{:.3f},{},{}", a_row.passSinceLoad, a_row.engine.passSumMs, a_row.engine.passUntimedMs, FormatPassSplit(a_row),
 						FormatPassBlock(a_row));
+					// (46n) The pacer: the previous frame's wait inside D3D11, the learned frame-start sleep.
+					s += std::format(",{:.3f},{:.3f}\n", a_row.pacer.stallMs, a_row.pacer.correctionMs);
 					return s;
 				};
 				auto engineColumns = [](const Row& a_row) {
@@ -754,7 +758,12 @@ namespace Util::FrameTrace
 			static HRESULT thunk(ID3D11DeviceContext* This, ID3D11Asynchronous* a, void* d, UINT s, UINT f)
 			{
 				TimedMisc t(This);
-				return func(This, a, d, s, f);
+				if (This != globals::d3d::context)
+					return func(This, a, d, s, f);
+				const uint64_t t0 = __rdtsc();  // (46n) for the pacer
+				const HRESULT hr = func(This, a, d, s, f);
+				LatencyPacer::AddD3D11WaitTsc(__rdtsc() - t0);
+				return hr;
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
@@ -881,8 +890,15 @@ namespace Util::FrameTrace
 		{
 			static HRESULT thunk(ID3D11DeviceContext* This, ID3D11Resource* r, UINT s, D3D11_MAP m, UINT f, D3D11_MAPPED_SUBRESOURCE* o)
 			{
-				if (!g_active)
-					return func(This, r, s, m, f, o);
+				if (!g_active) {
+					if (This != globals::d3d::context)
+						return func(This, r, s, m, f, o);
+					// (46n) The pacer learns waits for the GPU inside the frame (two TSC reads per call).
+					const uint64_t t0 = __rdtsc();
+					const HRESULT waitHr = func(This, r, s, m, f, o);
+					LatencyPacer::AddD3D11WaitTsc(__rdtsc() - t0);
+					return waitHr;
+				}
 				if (This != globals::d3d::context) {
 					// (46l) Map on another context (deferred contexts, other threads): counted and timed apart.
 					const int64_t otherStart = Now();
@@ -897,7 +913,9 @@ namespace Util::FrameTrace
 					Timed<DriverCall::Map> t(This);
 					hr = func(This, r, s, m, f, o);
 				}
-				NoteMap(r, m, f, Ms(Now() - start), _ReturnAddress());
+				const double mapMs = Ms(Now() - start);
+				NoteMap(r, m, f, mapMs, _ReturnAddress());
+				LatencyPacer::AddD3D11WaitMs(mapMs);  // (46n)
 				return hr;
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
@@ -997,7 +1015,10 @@ namespace Util::FrameTrace
 			static void thunk(ID3D11DeviceContext* This)
 			{
 				Timed<DriverCall::Flush> t(This);
+				const uint64_t t0 = __rdtsc();  // (46n) for the pacer
 				func(This);
+				if (This == globals::d3d::context)
+					LatencyPacer::AddD3D11WaitTsc(__rdtsc() - t0);
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
 		};

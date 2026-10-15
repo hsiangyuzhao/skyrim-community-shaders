@@ -929,7 +929,7 @@ namespace Hooks
 				const bool timed = Util::FrameTrace::Active();
 				const int64_t t0 = timed ? Util::FrameTrace::Now() : 0;
 				Util::EngineTiming::ScopedSeg sleepSeg(Util::EngineTiming::Seg::Sleep);
-				Util::LatencyPacer::PaceFrameStart(upscaling.IsLatencyPacerEnabled(), upscaling.settings.reflexPacerMarginMs);
+				Util::LatencyPacer::PaceFrameStart(upscaling.IsLatencyPacerEnabled(), upscaling.settings.reflexPacerMarginMs, upscaling.settings.reflexPacerStallFeedback);
 				if (timed)
 					Util::FrameTrace::OnPacerSleep(t0);
 			}

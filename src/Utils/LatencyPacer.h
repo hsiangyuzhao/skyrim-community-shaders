@@ -34,10 +34,17 @@ namespace Util::LatencyPacer
 		float leadMs = -1.0f;      ///< CPU time the pacer reserves (frame start to D3D11 submit, p75)
 		float gpuPeriodMs = -1.0f; ///< median interval between GPU frame completions
 		int inFlightAfter = -1;    ///< (45n) frames not finished by the GPU when the frame's CPU work starts (after the sleep / bound)
+		float stallMs = 0.0f;      ///< (46n) the previous frame's CPU time blocked inside D3D11 waiting for the GPU (calls of 0.5 ms or more)
+		float correctionMs = 0.0f; ///< (46n) learned extra sleep that moves such waits to the frame start (stall feedback)
 	};
 
 	/// Main thread, in Main::Update before the Reflex sleep. Sleeps only when a_enabled.
-	void PaceFrameStart(bool a_enabled, float a_marginMs);
+	void PaceFrameStart(bool a_enabled, float a_marginMs, bool a_stallFeedback = true);
+
+	/// (46n) Main thread, any D3D11 call on the immediate context that can wait for the GPU (Map, Flush, GetData): its duration
+	/// in TSC ticks (__rdtsc) or ms. Only calls of 0.5 ms or more count. Not counted in the CPU time the pacer reserves.
+	void AddD3D11WaitTsc(uint64_t a_ticks);
+	void AddD3D11WaitMs(double a_ms);
 
 	/// Main thread, right after PaceFrameStart and the Reflex sleep: the frame's CPU work starts now.
 	void OnSimulationStart();

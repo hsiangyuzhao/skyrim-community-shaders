@@ -225,6 +225,9 @@ public:
 		// placement only when the engine probes are missing) and the GPU-aware frame-start pacer runs.
 		// Extra CPU time the pacer keeps in hand (ms). More = safer for frame rate, less = lower lag.
 		float reflexPacerMarginMs = 1.0f;
+		// (46n) Time the frame spent blocked inside D3D11 waiting for the GPU (Map / Flush / GetData) moves to the frame-start
+		// sleep (learned over a few frames), and is not counted as CPU work the pacer must keep in hand.
+		bool reflexPacerStallFeedback = true;
 
 		NeuralRenderingSettings neuralRendering;
 	};

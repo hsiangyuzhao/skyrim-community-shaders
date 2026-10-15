@@ -69,6 +69,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexMode,
 	reflexFrameLimit,
 	reflexPacerMarginMs,
+	reflexPacerStallFeedback,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -601,10 +602,16 @@ void Upscaling::DrawAdvancedSettings()
 			ImGui::TextUnformatted("and never lets the CPU get more than one frame ahead. This is the extra CPU time it keeps in hand:");
 			ImGui::TextUnformatted("raise it if the frame rate drops; lower it for a little less lag.");
 		}
+		ImGui::Checkbox("Pacer: Move GPU Waits to Frame Start", &settings.reflexPacerStallFeedback);  // (46n)
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("When the game stops in the middle of a frame to wait for the graphics card (seen as one slow 'Map' every frame),");
+			ImGui::TextUnformatted("the pacer learns that wait and takes it at the start of the frame instead, before input is read. Off: as 46m.");
+		}
 		const auto& pacer = Util::LatencyPacer::Last();
 		if (pacer.tracking)
-			ImGui::TextDisabled("Pacer: %d frame(s) on the GPU at frame start (%d after the wait), GPU period %.1f ms, CPU reserve %.1f ms, slept %.1f ms (+%.1f ms bound)",
-				pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.sleepMs, pacer.capWaitMs);
+			ImGui::TextDisabled("Pacer: %d frame(s) on the GPU at frame start (%d after the wait), GPU period %.1f ms, CPU reserve %.1f ms, slept %.1f ms (+%.1f ms bound), "
+								"waited inside D3D11 %.1f ms (learned %.1f ms)",
+				pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.sleepMs, pacer.capWaitMs, pacer.stallMs, pacer.correctionMs);
 		else
 			ImGui::TextDisabled("Pacer: waiting for the D3D12 swap chain");
 		if (!Util::EngineTiming::ProbesInstalled())
@@ -1663,12 +1670,12 @@ std::string Upscaling::DescribeLatencyForTrace()
 	auto modeName = [](uint m) { return m < 3 ? kModes[m] : "not applied"; };
 	return std::format(
 		"Reflex available {}, functions ready {}, PCL ready {}; mode set {} / applied {}; frame limit set {} / effective {} / applied {} fps (presented); "
-		"pacer {} (margin {:.1f} ms), markers at render start {} (probes {}); lowLatencyAvailable {}, latencyReportAvailable {}; "
+		"pacer {} (margin {:.1f} ms, GPU waits moved to frame start {}), markers at render start {} (probes {}); lowLatencyAvailable {}, latencyReportAvailable {}; "
 		"frame generation requested {} at {}x; spin limiter {} (fallback without Reflex, syncInterval 0 path); refresh {:.0f} Hz",
 		streamline.featureReflex ? "yes" : "no", streamline.reflexFunctionsReady ? "yes" : "no", streamline.pclFunctionsReady ? "yes" : "no",
 		modeName(std::min(settings.reflexMode, 2u)), modeName(modeApplied), settings.reflexFrameLimit, GetEffectiveReflexFrameLimit(),
 		reflexFrameLimitApplied == UINT_MAX ? -1 : static_cast<int>(reflexFrameLimitApplied),
-		IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs, WantsReflexMarkersAtRenderStart() ? "on" : "off",
+		IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs, settings.reflexPacerStallFeedback ? "on" : "off", WantsReflexMarkersAtRenderStart() ? "on" : "off",
 		Util::EngineTiming::ProbesInstalled() ? "installed" : Util::EngineTiming::ProbeStatus(),
 		stateOk ? (state.lowLatencyAvailable ? "yes" : "no") : "?", stateOk ? (state.latencyReportAvailable ? "yes" : "no") : "?",
 		IsFrameGenerationRequestedNow() ? "yes" : "no", GetFrameGenerationAppliedMultiplier(), streamline.reflexFunctionsReady ? "off" : "on",
