@@ -1,20 +1,21 @@
 // (46f) Ray-traced ambient occlusion: the optional history blend, AFTER the spatial filter (hard constraint #3:
-// the AO multiplies the ambient light, so it comes from this frame's rays through the 1/4-resolution bilateral
-// filter; a history may only refine that, clamped to this frame's filtered neighbourhood -- never a per-pixel
-// average of unfiltered values, never anything of NRD).
+// the AO multiplies the ambient light, so it comes from this frame's rays through a spatial bilateral filter; a
+// history may only refine that, clamped to this frame's filtered neighbourhood -- never a per-pixel average of
+// unfiltered values, never anything of NRD).
 //
 // Current: this frame's filtered visibility (full render size). History: last frame's output of this pass,
 // reprojected with the game's motion vectors (render-extent screen space, as Screen Space GI's contact AO).
 // The history is clamped into the min / max of the current 3x3 neighbourhood (plus a small slack) before the
 // blend, so a moving occluder leaves no dark trail beyond one frame's filtered range.
+// (46t) The same pass for the detail term (RTAO_DETAIL_HISTORY: its own history, its own flag).
 
-cbuffer RTAOCB : register(b0)
-{
-	uint4 Size;     // render width, height, flags, debug view
-	float4 Params;  // x strength, y this frame's weight in the history, z history clamp slack, w RT fade-in (0..1)
-};
+#include "RayTracing/RTAOCommon.hlsli"
 
-static const uint kFlagHistory = 4u;
+#if defined(RTAO_DETAIL_HISTORY)
+static const uint kHistoryFlag = kFlagDetailHistory;
+#else
+static const uint kHistoryFlag = kFlagHistory;
+#endif
 
 Texture2D<unorm float> Current : register(t0);
 Texture2D<unorm float> History : register(t1);
@@ -40,7 +41,7 @@ RWTexture2D<unorm float> Output : register(u0);
 		}
 	}
 	float result = current;
-	[branch] if (Size.z & kFlagHistory)
+	[branch] if (Size.z & kHistoryFlag)
 	{
 		const float2 uv = (float2(p) + 0.5) / float2(Size.xy);
 		const float2 prevUv = uv + MotionVectors[p];

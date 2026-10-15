@@ -15,11 +15,26 @@
 //   r = this frame's ray: 1 = open, 0 = blocked (1 where not traced)
 //   g = weight of the ray-traced result (1 inside the traced area and nearer than Fade.x, to 0 at Fade.y; 0 = not traced)
 //   b = the hit distance / ray length where blocked (1 = open; debug)
+//   a = unused (1)
+//
+// (46t) Two scales (kFlagDetail; off = the 46s output above, exactly). Detail length D = Extra.y (< ray length L).
+//   The long direction is traced in two segments: [0, D] (the near part) and, only where that is open, [D, L] (the
+//   far part, a conditional sample: "is the far range open, given the near range is"). Extra.z more directions are
+//   traced over [0, D] only. Then
+//     r = the far sample (1 open, 0 blocked; 1 where it was not traced)
+//     b = the far sample's weight: the near segment of the long direction (1 open, 0 blocked: no far sample here)
+//     a = near visibility: the open share of the 1 + Extra.z near segments
+//   The D3D11 side filters r weighted by b (a ratio estimator of the conditional far visibility) and a on its own, and
+//   multiplies them: V = V(near) x V(far | near open). An occluder is counted once: by the near term if it is closer
+//   than D along that direction, by the far term otherwise. (A single long ray with TMin = D would count a direction
+//   blocked near AND far twice -- in crevices and next to walls the long ray passes through the near wall and hits the
+//   same mesh's other side -- darkening exactly the places the detail term is for.)
 //
 // Rays: the scene (instance mask 0x01) and, when characters are in the TLAS, a second ray against them (0x06, TMin =
 // Extra.x against their own coarse polygons) where the segment passes a character's bounds. Without RT_ALPHA the
 // alpha-tested instances (traced leaves / cut-outs) are culled; with it they are tested against their cut-out, at
-// most kAlphaCandidateBudget candidates per ray (past it the ray counts as blocked: bounded cost).
+// most kAlphaCandidateBudget candidates per ray (past it the ray counts as blocked: bounded cost). (46t) AO Alpha
+// Budget: past the budget the ray may instead count as half open (kFlagAlphaHalf) or open (kFlagAlphaOpen).
 
 struct AOConstants
 {
@@ -28,7 +43,7 @@ struct AOConstants
 	float4 Rect;                     // camera-relative xy min / max of the traced area
 	float4 Params;                   // x frame, y flags (asuint), z ray length (units), w unused
 	float4 Fade;                     // x / y distance where the weight starts to fall / reaches 0, z constant ray offset, w per unit of distance
-	float4 Extra;                    // x character ray TMin, yzw unused
+	float4 Extra;                    // x character ray TMin, (46t) y detail length (units, < Params.z), z detail directions (extra), w unused
 	float4 Spheres[2];               // character bounds (camera-relative xyz, radius; 0 = none): [0] the player, [1] the others
 };
 
@@ -40,6 +55,10 @@ RWByteAddressBuffer RayCounter : register(u1);  // rays traced (monotonic, read 
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
+static const uint kFlagDetail = 4u;       // (46t) two scales (see the top)
+static const uint kFlagAlphaHalf = 8u;    // (46t) past the alpha candidate budget: half open
+static const uint kFlagAlphaOpen = 16u;   // (46t) past the alpha candidate budget: open
+static const uint kMaxDetailRays = 4u;
 static const uint kSceneMask = 0x01u;
 static const uint kCharacterMasks = 0x06u;
 static const float kFirstPersonNear = 96.0;
@@ -123,8 +142,13 @@ float InterleavedGradientNoise(float2 p, uint frame)
 	return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
 }
 
-bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, float footprint, out float tHit)
+// One ray against the scene (or the characters: a_mask), any hit ends it. 1 = open, 0 = blocked; (46t) past the alpha
+// candidate budget 0 (46s), 0.5 (kFlagAlphaHalf) or 1 (kFlagAlphaOpen). tHit = where it was blocked (else TMax).
+float Visibility(float3 origin, float3 dir, float tMin, float tMax, uint mask, float footprint, uint flags, out float tHit)
 {
+	tHit = tMax;
+	if (!(tMin < tMax))
+		return 1.0;
 	RayDesc ray;
 	ray.Origin = origin;
 	ray.Direction = dir;
@@ -134,21 +158,39 @@ bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, float
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
 	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
 	uint budget = kAlphaCandidateBudget;
+	bool exceeded = false;
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
 			continue;
-		if (budget == 0u || AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint))
+		if (budget == 0u) {
+			// Past the budget: blocked (46s), or (46t) stop here and count the ray as half open / open.
+			if (flags & (kFlagAlphaHalf | kFlagAlphaOpen)) {
+				exceeded = true;
+				q.Abort();
+			} else {
+				q.CommitNonOpaqueTriangleHit();
+			}
+		} else if (AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
 			q.CommitNonOpaqueTriangleHit();
-		else
+		} else {
 			budget -= 1u;
+		}
 	}
+	if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+		tHit = q.CommittedRayT();
+		return 0.0;
+	}
+	return exceeded ? ((flags & kFlagAlphaOpen) ? 1.0 : 0.5) : 1.0;
 #else
 	RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_CULL_NON_OPAQUE> q;
 	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
 	q.Proceed();
+	if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+		tHit = q.CommittedRayT();
+		return 0.0;
+	}
+	return 1.0;
 #endif
-	tHit = q.CommittedRayT();
-	return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
 // Does the segment origin -> origin + dir * tMax pass the sphere?
@@ -162,6 +204,35 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 	return dot(closest, closest) <= sphere.w * sphere.w;
 }
 
+
+// One segment [tMin, tMax] of a direction: the scene, then (still open and passing a character's bounds) the characters
+// (their ray starts at least Extra.x along). The darker of the two; tHit = where it was blocked. Counts its rays.
+float Segment(float3 origin, float3 dir, float tMin, float tMax, float footprint, uint flags, bool characters, inout uint rays, out float tHit)
+{
+	float v = Visibility(origin, dir, tMin, tMax, kSceneMask, footprint, flags, tHit);
+	rays += 1u;
+	[branch] if (v > 0.0 && characters && (SphereOnSegment(origin, dir, tMax, C.Spheres[0]) || SphereOnSegment(origin, dir, tMax, C.Spheres[1])))
+	{
+		float tCharacter;
+		const float vc = Visibility(origin, dir, max(tMin, C.Extra.x), tMax, kCharacterMasks, footprint, flags, tCharacter);
+		rays += 1u;
+		if (vc < v) {
+			v = vc;
+			tHit = tCharacter;
+		}
+	}
+	return v;
+}
+
+// Cosine-weighted direction in the hemisphere around N (T, B: its tangent frame) from two uniform numbers.
+float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
+{
+	const float r = sqrt(u.x);
+	float sn, cs;
+	sincos(6.2831853 * u.y, sn, cs);
+	return normalize(T * (r * cs) + B * (r * sn) + N * sqrt(saturate(1.0 - u.x)));
+}
+
 [numthreads(8, 8, 1)] void main(uint3 dtid : SV_DispatchThreadID)
 {
 	const int2 p = int2(dtid.xy);
@@ -170,7 +241,7 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 	const uint flags = asuint(C.Params.y);
 	const float depth = abs(DepthMask[p]);
 	uint rays = 0u;
-	float4 result = float4(1.0, 0.0, 1.0, 0.0);
+	float4 result = float4(1.0, 0.0, 1.0, 1.0);
 	[branch] if (depth < 0.999999 && depth > 0.0)
 	{
 		const float3 P = PositionAt(p, depth);
@@ -197,27 +268,45 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 			const uint frame = uint(C.Params.x);
 			const float u1 = InterleavedGradientNoise(float2(p), frame);
 			const float u2 = frac(InterleavedGradientNoise(float2(p.yx) + float2(29.0, 61.0), frame * 7u + 3u) + float(frame % 64u) * 0.6180339887);
-			const float r = sqrt(u1);
-			float sn, cs;
-			sincos(6.2831853 * u2, sn, cs);
 			const float3 helper = abs(N.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
 			const float3 T = normalize(cross(helper, N));
 			const float3 B = cross(N, T);
-			const float3 dir = normalize(T * (r * cs) + B * (r * sn) + N * sqrt(saturate(1.0 - u1)));
+			const float3 dir = CosineDirection(float2(u1, u2), T, B, N);
 
 			const float rayLength = C.Params.z;
 			const float bias = C.Fade.z + C.Fade.w * dist;
 			const float3 origin = P + N * bias;
 			const float footprint = dist * 2.0 * C.RenderSize.w;  // about a pixel's size there (alpha mip choice)
-			float tHit = rayLength;
-			bool blocked = Blocked(origin, dir, rayLength, kSceneMask, 0.0, footprint, tHit);
-			rays += 1u;
 			const bool characters = (flags & kFlagCharacters) && !((flags & kFlagFirstPerson) && dist < kFirstPersonNear);
-			if (!blocked && characters && (SphereOnSegment(origin, dir, rayLength, C.Spheres[0]) || SphereOnSegment(origin, dir, rayLength, C.Spheres[1]))) {
-				blocked = Blocked(origin, dir, rayLength, kCharacterMasks, C.Extra.x, footprint, tHit);
-				rays += 1u;
+			[branch] if (flags & kFlagDetail)
+			{
+				// (46t) Two scales: the long direction's near and (where that is open) far segment, more near-only directions.
+				const float shortLength = clamp(C.Extra.y, 1.0, rayLength);
+				float tNear;
+				const float near0 = Segment(origin, dir, 0.0, shortLength, footprint, flags, characters, rays, tNear);
+				float far = 1.0;
+				[branch] if (near0 > 0.0 && shortLength < rayLength)
+				{
+					float tFar;
+					far = Segment(origin, dir, shortLength, rayLength, footprint, flags, characters, rays, tFar);
+				}
+				float nearSum = near0;
+				const uint extra = min(uint(C.Extra.z), kMaxDetailRays);
+				[loop] for (uint i = 1u; i <= extra; ++i)
+				{
+					// Offsets of the R2 sequence: the extra directions stay well spread around the first one.
+					const float2 u = frac(float2(u1, u2) + float(i) * float2(0.7548776662, 0.5698402910));
+					float tExtra;
+					nearSum += Segment(origin, CosineDirection(u, T, B, N), 0.0, shortLength, footprint, flags, characters, rays, tExtra);
+				}
+				result = float4(far, weight, near0, nearSum / float(extra + 1u));
 			}
-			result = float4(blocked ? 0.0 : 1.0, weight, blocked ? saturate(tHit / max(rayLength, 1.0)) : 1.0, 0.0);
+			else
+			{
+				float tHit;
+				const float v = Segment(origin, dir, 0.0, rayLength, footprint, flags, characters, rays, tHit);
+				result = float4(v, weight, v < 1.0 ? saturate(tHit / max(rayLength, 1.0)) : 1.0, 1.0);
+			}
 		}
 	}
 	AOOut[p] = result;

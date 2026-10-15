@@ -138,6 +138,10 @@ namespace Util::FrameTrace
 		float rtaoGpuMs = -1.0f, rtaoFilterGpuMs = -1.0f, rtaoSyncGpuMs = -1.0f;
 		int64_t rtaoRays = 0;
 		int rtaoIndoors = -1, rtaoMode = -1;  // (46h) this frame's RTAO: 1 indoors / 0 outdoors, its mode (0 keep contact AO, 1 darker); -1 = not traced
+		// (46t) The last RTAO composite (-1 = none): filter 0 quarter (46s) / 1 quarter (46t) / 2 full resolution; near rays per pixel (0 =
+		// fine detail off); the near / far split (units); normal-guided (1 / 0); alpha budget mode (0 blocked, 1 half open, 2 open).
+		int rtaoFilter = -1, rtaoDetailRays = -1, rtaoNormalGuided = -1, rtaoAlphaBudget = -1;
+		float rtaoDetailLength = -1.0f;
 		// (46g) Transitions and the pools: black screen (Fader Menu after a loading screen), ms since the loading screen closed
 		// (-1 = no transition), hand-off this frame, items held back (ready / not ready); Early Prep call by call; the
 		// parts taken out of rt_x_collect / tlas / record; pool upkeep ms, blocks made on the render thread, MB reserved,

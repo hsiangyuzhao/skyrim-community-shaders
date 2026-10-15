@@ -230,7 +230,7 @@ namespace RayTracingRT
 		float rect[4];        // camera-relative xy min / max
 		float params[4];      // frame, flags (bit pattern), ray length (units), unused
 		float fade[4];        // weight falls from x to 0 at y (units from the camera), z constant ray offset, w per unit of distance
-		float extra[4];       // character ray TMin, unused x3
+		float extra[4];       // character ray TMin, (46t) detail length (units), near-only directions besides the long one, unused
 		float spheres[8];     // character bounds, as TraceConstants::spheres
 	};
 	static_assert(sizeof(AOTraceConstants) == 44 * 4);

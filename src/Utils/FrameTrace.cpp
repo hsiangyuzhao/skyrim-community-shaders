@@ -949,6 +949,11 @@ namespace Util::FrameTrace
 				out << "#   resolution in effect (1 / 0, -1 = n/a), rr_width / rr_height = the size those buffers are allocated at (0 = output size).\n";
 				out << "#   vram_by_feature = our video memory alive per feature (MB, >= 1): billed to the Setup scope, else the innermost pass scope\n";
 				out << "#   open on the creating thread, else the feature its resource name starts with; 'other (no scope open)' = none of these.\n";
+				out << "# (46t) rtao_filter = the last RTAO composite's filter: 0 quarter resolution (46s), 1 quarter resolution with the far samples'\n";
+				out << "#   weights and / or normal-guided taps, 2 full resolution (-1 = none); rtao_detail_rays = near (fine detail) rays per pixel\n";
+				out << "#   (0 = Fine Detail off); rtao_detail_len = the near / far split (units); rtao_normal_guided 1 / 0; rtao_alpha_budget = an AO\n";
+				out << "#   ray past 8 alpha candidates counts as 0 blocked (46s), 1 half open, 2 open. rtao_gpu_ms holds the near rays too (same\n";
+				out << "#   dispatch), rtao_filter_gpu_ms the detail filter and its history; rtao_rays counts every segment traced.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -1003,7 +1008,7 @@ namespace Util::FrameTrace
 					   "rt_pw_skin_verts,rt_pw_tlas_instances,rt_pw_pool_blocks,rt_pw_pool_released,rt_pw_sample_age,post_gpu_ms,"
 					   "rt_sub_on,rt_sub_batches,rt_sub_max_batch_ms,rt_sub_max_lag_ms,rt_sub_max_call_ms,rt_bud_on,rt_bud_ms_per_mtri,rt_bud_tris,"
 					   "rt_bud_static_queued,rt_bud_groups_deferred,rt_bud_groups_kept,snow_shapes_ms,snow_shapes_state,rr_b,rr_c,rr_width,rr_height,"
-					   "vram_by_feature\n";
+					   "vram_by_feature,rtao_filter,rtao_detail_rays,rtao_detail_len,rtao_normal_guided,rtao_alpha_budget\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1117,6 +1122,9 @@ namespace Util::FrameTrace
 						s += std::format(",{},{},{:.3f},{:.3f},{:.3f},{},{:.2f},{},{},{},{},{:.3f},{},{},{},{},{},{}\n", q.subOn, q.subBatches, q.subMaxBatchMs, q.subMaxLagMs,
 							q.subMaxCallMs, q.budOn, q.budMsPerMtri, q.budTris, q.budStaticQueued, q.budGroupsDeferred, q.budGroupsKept, q.snowShapesMs, q.snowShapesState,
 							q.rrB, q.rrC, q.rrWidth, q.rrHeight, a_row.vramByFeature);
+						// (46t) RTAO filter (after vram_by_feature, the old last column)
+						s.pop_back();
+						s += std::format(",{},{},{:.0f},{},{}\n", t.rtaoFilter, t.rtaoDetailRays, t.rtaoDetailLength, t.rtaoNormalGuided, t.rtaoAlphaBudget);
 					}
 					return s;
 				};

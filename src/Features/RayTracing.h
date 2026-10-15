@@ -213,6 +213,19 @@ public:
 		bool PointLightsSteady = true;
 		bool PointLightsMergeHysteresis = true;
 		int PointLightsMeshless = 1;
+		// (46t) RTAO, outside the settings macro too. Two scales (AODetail): the long ray split at AODetailLength (its far part
+		// counted only where the near part is open) plus near-only rays (AODetailRays near rays per pixel in all, the long ray's near part included), the near visibility filtered at full
+		// resolution and multiplied in with AODetailStrength (AOStrength is then the far / large-scale term's). AONormalGuided: the
+		// filters weight taps by the G-buffer normal (not only the 45 degree gate). AOFullResFilter: the large-scale term filtered at
+		// full render resolution instead of 1/4. AOAlphaBudget: an AO ray past the alpha candidate budget counts as 0 blocked (46s),
+		// 1 half open, 2 open. All off / 0: 46s.
+		bool AODetail = true;
+		float AODetailStrength = 1.0f;
+		float AODetailLength = 20.0f;  // units: 8 - 48 (at most half the Ray Length)
+		int AODetailRays = 2;          // near rays per pixel, the long ray's near part included: 1 - 4
+		bool AONormalGuided = true;
+		bool AOFullResFilter = false;
+		int AOAlphaBudget = 0;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -227,6 +240,9 @@ public:
 		Raw,       // this frame's rays (white open, black blocked)
 		Filtered,  // after the filter (and history)
 		Split,     // left half RTAO, right half SSGI AO (as before)
+		RawDetail,       // (46t) this frame's near rays (open share)
+		FilteredDetail,  // (46t) the detail term after its filter (and history)
+		Final,           // (46t) 1 - the final AO the lighting gets
 		Count
 	};
 	Settings settings;
@@ -771,9 +787,12 @@ private:
 	{
 		std::uint32_t Size[4];  // render width, height, flags, debug view
 		float Params[4];        // strength, this frame's weight in the history, history clamp slack, RT fade-in
+		float Detail[4];        // (46t) detail strength, normal weight power (0 = the 45 degree gate only), unused x2
+		float Camera[4];        // (46t) the game's CameraData (linear depth in RTAOFilterCS)
 	};
 	STATIC_ASSERT_ALIGNAS_16(AOCompositeCB);
-	static constexpr std::uint32_t kAOFlagContact = 1u, kAOFlagDarker = 2u, kAOFlagHistory = 4u, kAOFlagSplit = 8u;  // RTAO*CS.hlsl
+	static constexpr std::uint32_t kAOFlagContact = 1u, kAOFlagDarker = 2u, kAOFlagHistory = 4u, kAOFlagSplit = 8u;  // RTAO*CS.hlsl (RTAOCommon.hlsli)
+	static constexpr std::uint32_t kAOFlagDetail = 16u, kAOFlagValidity = 32u, kAOFlagDetailHistory = 64u;                         // (46t)
 	[[nodiscard]] bool AOOn() const { return settings.AO && !aoAutoOff; }
 	/// Switches RTAO off for this session (not the setting) with a reason for the page; the rest of Ray Tracing goes on.
 	void SwitchOffAO(std::string a_reason);
@@ -811,4 +830,35 @@ private:
 	winrt::com_ptr<ID3D11ComputeShader> aoDownCS, aoBlurHCS, aoBlurVCS, aoUpCS, aoTemporalCS, aoCompositeCS;
 	winrt::com_ptr<ID3D11SamplerState> aoLinearSampler;
 	float aoCpuMs = 0.0f;
+	// (46t) Two scales, normal-guided and full-resolution filtering (RTAOFilterCS). The extra textures are made only when a
+	// switch needs them (EnsureAOExtras: created into locals, kept only when all succeed); failing that, this session falls
+	// back to the 46s filter (aoExtrasFault) -- RTAO and the rest of Ray Tracing go on.
+	bool EnsureAOExtras(bool a_quarter, bool a_full, bool a_detail);
+	void ReleaseAOExtras();
+	struct AOTraceShape
+	{
+		bool detail = false;     // the trace carried the two scales (TraceAOCS .b / .a)
+		int detailRays = 0;      // near rays per pixel
+		float detailLength = 0;  // the near / far split (units)
+		int alphaBudget = 0;     // AOAlphaBudget in effect
+	};
+	AOTraceShape aoShapeThisFrame{};  // what PrepareAO put into this frame's trace (DrawAmbientOcclusion filters accordingly)
+	DenoiseTexture aoLoW, aoLoWBlur;                            // quarter resolution (value, weight), R8G8
+	DenoiseTexture aoFullTemp;                                  // full resolution (value, weight) between the separable passes
+	DenoiseTexture aoDetailFiltered, aoDetailHistory[2];        // the detail term
+	std::uint32_t aoExtrasWidth = 0, aoExtrasHeight = 0;
+	std::uint64_t aoExtrasBytes = 0;
+	std::string aoExtrasFault;
+	std::uint32_t aoDetailHistoryIndex = 0;
+	bool aoDetailHistoryValid = false;
+	std::uint32_t aoDetailHistoryFrame = 0;
+	winrt::com_ptr<ID3D11ComputeShader> aoFDownCS, aoFBlurHCS, aoFBlurVCS, aoFUpCS, aoFFullHCS, aoFFullVCS, aoFDetailCS, aoDetailTemporalCS;
+	// F7 (the last composite): filter path -1 none, 0 quarter (46s), 1 quarter (46t), 2 full resolution; its switches.
+	int aoLastFilter = -1;
+	int aoLastDetailRays = -1;
+	float aoLastDetailLength = -1.0f;
+	int aoLastNormalGuided = -1;
+	int aoLastAlphaBudget = -1;
+	/// The RTAO filter and mix (DrawAmbientOcclusion, inside its try / catch).
+	void DrawAmbientOcclusionImpl();
 };

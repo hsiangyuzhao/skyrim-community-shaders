@@ -228,6 +228,11 @@ namespace
 	constexpr std::uint32_t kAOTraceCharacters = 1u, kAOTraceFirstPerson = 2u;  // TraceAOCS
 	constexpr std::uint32_t kAOGapFrames = 30;  // (46h) RTAO not mixed in for more than this many frames: it fades in again
 	constexpr double kAOFadeInMs = 400.0;
+	// (46t) Two scales and the RTAO filters.
+	constexpr float kAODetailLengthMin = 8.0f, kAODetailLengthMax = 48.0f;
+	constexpr int kAODetailRaysMax = 4;
+	constexpr float kAONormalPower = 8.0f;  // Normal-Guided: tap weight dot(N, N_tap)^8 (0.6 at 20 degrees, 0.06 at the 45 degree gate)
+	constexpr std::uint32_t kAOTraceDetail = 4u, kAOTraceAlphaHalf = 8u, kAOTraceAlphaOpen = 16u;  // TraceAOCS
 
 	// (46c) BSShadowFrustumLight / BSShadowParabolicLight::RenderShadowmaps (vfunc 0x0A): Ray Tracing may skip the shadow
 	// maps of lights it fully handles this frame (Point Lights > Stop Engine Shadow Maps, interiors only).
@@ -1190,6 +1195,14 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointLightsSteady = read("PointLightsSteady", defaults.PointLightsSteady);  // (46s)
 		settings.PointLightsMergeHysteresis = read("PointLightsMergeHysteresis", defaults.PointLightsMergeHysteresis);
 		settings.PointLightsMeshless = std::clamp(read("PointLightsMeshless", defaults.PointLightsMeshless), 0, 2);
+		// (46t) RTAO
+		settings.AODetail = read("AODetail", defaults.AODetail);
+		settings.AODetailStrength = read("AODetailStrength", defaults.AODetailStrength);
+		settings.AODetailLength = read("AODetailLength", defaults.AODetailLength);
+		settings.AODetailRays = read("AODetailRays", defaults.AODetailRays);
+		settings.AONormalGuided = read("AONormalGuided", defaults.AONormalGuided);
+		settings.AOFullResFilter = read("AOFullResFilter", defaults.AOFullResFilter);
+		settings.AOAlphaBudget = read("AOAlphaBudget", defaults.AOAlphaBudget);
 	}
 	// (46o) Window Beam Guard: off once for settings saved before 46o (its rule misfired on beams that mostly hit walls).
 	if (loadedVersion < 6 && settings.PointLightsBeamGuard) {
@@ -1229,6 +1242,11 @@ void RayTracing::LoadSettings(json& o_json)
 	settings.AOStrength = std::isfinite(settings.AOStrength) ? std::clamp(settings.AOStrength, 0.0f, 2.0f) : 1.0f;
 	settings.AODistance = std::isfinite(settings.AODistance) ? std::clamp(settings.AODistance, 1000.0f, 8192.0f) : 4000.0f;
 	settings.AOModeInterior = std::clamp(settings.AOModeInterior, 0, static_cast<int>(AOModeKind::Count) - 1);  // (46h)
+	// (46t)
+	settings.AODetailStrength = std::isfinite(settings.AODetailStrength) ? std::clamp(settings.AODetailStrength, 0.0f, 2.0f) : 1.0f;
+	settings.AODetailLength = std::isfinite(settings.AODetailLength) ? std::clamp(settings.AODetailLength, kAODetailLengthMin, kAODetailLengthMax) : 20.0f;
+	settings.AODetailRays = std::clamp(settings.AODetailRays, 1, kAODetailRaysMax);
+	settings.AOAlphaBudget = std::clamp(settings.AOAlphaBudget, 0, 2);
 	// (46k)
 	settings.LoadingPumpMs = std::isfinite(settings.LoadingPumpMs) ? std::clamp(settings.LoadingPumpMs, 2.0f, 32.0f) : 8.0f;
 	settings.BlackWindowMs = std::isfinite(settings.BlackWindowMs) ? std::clamp(settings.BlackWindowMs, 0.0f, 2000.0f) : 200.0f;
@@ -1256,6 +1274,13 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointLightsSteady"] = settings.PointLightsSteady;  // (46s)
 	o_json["PointLightsMergeHysteresis"] = settings.PointLightsMergeHysteresis;
 	o_json["PointLightsMeshless"] = settings.PointLightsMeshless;
+	o_json["AODetail"] = settings.AODetail;  // (46t)
+	o_json["AODetailStrength"] = settings.AODetailStrength;
+	o_json["AODetailLength"] = settings.AODetailLength;
+	o_json["AODetailRays"] = settings.AODetailRays;
+	o_json["AONormalGuided"] = settings.AONormalGuided;
+	o_json["AOFullResFilter"] = settings.AOFullResFilter;
+	o_json["AOAlphaBudget"] = settings.AOAlphaBudget;
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -1350,6 +1375,9 @@ void RayTracing::ClearShaderCache()
 	aoUpCS = nullptr;
 	aoTemporalCS = nullptr;
 	aoCompositeCS = nullptr;
+	// (46t)
+	for (auto* shader : { &aoFDownCS, &aoFBlurHCS, &aoFBlurVCS, &aoFUpCS, &aoFFullHCS, &aoFFullVCS, &aoFDetailCS, &aoDetailTemporalCS })
+		*shader = nullptr;
 }
 
 void RayTracing::PrecompileShaders()
@@ -1369,6 +1397,25 @@ void RayTracing::PrecompileShaders()
 	if (settings.PointLights) {
 		GetShader(pointDenoiseCS, L"Data\\Shaders\\RayTracing\\PointDenoiseCS.hlsl", "PointDenoiseCS");
 		GetShader(pointMaskCS, L"Data\\Shaders\\RayTracing\\PointMaskCS.hlsl", "PointMaskCS");
+	}
+	if (settings.AO) {
+		// (46t) The RTAO filter of the current switches (the others compile when first switched on).
+		const wchar_t* kFilter = L"Data\\Shaders\\RayTracing\\RTAOFilterCS.hlsl";
+		GetShader(aoTemporalCS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS");
+		GetShader(aoCompositeCS, L"Data\\Shaders\\RayTracing\\RTAOCompositeCS.hlsl", "RTAOCompositeCS");
+		if (settings.AOFullResFilter) {
+			GetShaderDefined(aoFFullHCS, kFilter, "RTAOFilterCS (full, horizontal)", "RTAO_FULL");
+			GetShaderDefined(aoFFullVCS, kFilter, "RTAOFilterCS (full, vertical)", "RTAO_FULL,RTAO_VERTICAL");
+		} else if (settings.AODetail || settings.AONormalGuided) {
+			GetShaderDefined(aoFDownCS, kFilter, "RTAOFilterCS (down)", "RTAO_DOWN");
+			GetShaderDefined(aoFBlurHCS, kFilter, "RTAOFilterCS (blur)", "RTAO_BLUR");
+			GetShaderDefined(aoFBlurVCS, kFilter, "RTAOFilterCS (blur, vertical)", "RTAO_BLUR,RTAO_VERTICAL");
+			GetShaderDefined(aoFUpCS, kFilter, "RTAOFilterCS (up)", "RTAO_UP");
+		}
+		if (settings.AODetail) {
+			GetShaderDefined(aoFDetailCS, kFilter, "RTAOFilterCS (detail)", "RTAO_DETAIL");
+			GetShaderDefined(aoDetailTemporalCS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (detail)", "RTAO_DETAIL_HISTORY");
+		}
 	}
 }
 
@@ -1405,6 +1452,7 @@ void RayTracing::Disable(Status a_status, std::string a_reason)
 	skipCandidates.clear(); skipEntries.clear();
 	aoThisFrame = false;  // (46f) SSGI's own AO from the next frame on
 	aoHistoryValid = false;
+	aoDetailHistoryValid = false;  // (46t)
 	RayTracingCasterFilter::Clear();
 	characters.ReleaseAll(backend);  // (45i) (a backend that is gone ignores the handles)
 	scene.ReleaseAll(backend);
@@ -2438,6 +2486,12 @@ void RayTracing::PublishCpuSplit()
 		// (46h) Where this frame's RTAO was traced and its mode (-1 = not traced this frame).
 		detail.rtaoIndoors = aoTraced && aoThisFrame ? (aoInteriorThisFrame ? 1 : 0) : -1;
 		detail.rtaoMode = aoTraced && aoThisFrame ? aoModeThisFrame : -1;
+		// (46t) The last composite's filter (the F7 row is written before this frame's AO pass, as rtao_filter_gpu_ms).
+		detail.rtaoFilter = aoComposedLastFrame ? aoLastFilter : -1;
+		detail.rtaoDetailRays = aoComposedLastFrame ? aoLastDetailRays : -1;
+		detail.rtaoDetailLength = aoComposedLastFrame ? aoLastDetailLength : -1.0f;
+		detail.rtaoNormalGuided = aoComposedLastFrame ? aoLastNormalGuided : -1;
+		detail.rtaoAlphaBudget = aoComposedLastFrame ? aoLastAlphaBudget : -1;
 		// (46g) Transitions, Early Prep split, pools.
 		detail.black = blackScreen ? 1 : 0;
 		detail.pump = pumpThisFrame ? 1 : 0;  // (46k)
@@ -3623,6 +3677,7 @@ void RayTracing::UpdateAO()
 	if (settings.AO && !aoRequested) {
 		backend.ClearAOFault();
 		aoOffReason.clear();
+		aoExtrasFault.clear();  // (46t)
 		aoAutoOff = false;
 	}
 	if (AOOn() && !backend.AOFault().empty())
@@ -3654,6 +3709,79 @@ void RayTracing::ReleaseAOFilter()
 	aoHistoryValid = false;
 	d3d11Bytes -= std::min(d3d11Bytes, aoD3D11Bytes);
 	aoD3D11Bytes = 0;
+	ReleaseAOExtras();  // (46t)
+}
+
+void RayTracing::ReleaseAOExtras()
+{
+	for (auto* t : { &aoLoW, &aoLoWBlur, &aoFullTemp, &aoDetailFiltered, &aoDetailHistory[0], &aoDetailHistory[1] })
+		*t = {};
+	aoExtrasWidth = aoExtrasHeight = 0;
+	aoDetailHistoryValid = false;
+	d3d11Bytes -= std::min(d3d11Bytes, aoExtrasBytes);
+	aoExtrasBytes = 0;
+}
+
+bool RayTracing::EnsureAOExtras(bool a_quarter, bool a_full, bool a_detail)
+{
+	// (46t) Optional: on failure this session keeps the 46s filter (aoExtrasFault), RTAO itself goes on. Each group of
+	// textures is created into locals and kept only when the whole group succeeded.
+	if (!aoExtrasFault.empty())
+		return false;
+	const std::uint32_t width = aoWidth, height = aoHeight;
+	if (!width || !height)
+		return false;
+	if (aoExtrasWidth != width || aoExtrasHeight != height) {
+		ReleaseAOExtras();
+		aoExtrasWidth = width;
+		aoExtrasHeight = height;
+	}
+	const std::uint32_t lw = (width + 1) / 2, lh = (height + 1) / 2;
+	std::uint64_t bytes = 0;
+	bool ok = true;
+	auto create = [&](DenoiseTexture& o_texture, std::uint32_t a_w, std::uint32_t a_h, DXGI_FORMAT a_format, std::uint32_t a_bytesPerPixel, const char* a_name) {
+		if (!ok || !CreateDenoiseTexture(this, o_texture.texture, o_texture.srv, o_texture.uav, a_w, a_h, a_format, a_name)) {
+			ok = false;
+			return;
+		}
+		bytes += static_cast<std::uint64_t>(a_w) * a_h * a_bytesPerPixel;
+	};
+	if (a_quarter && !aoLoW.texture) {
+		DenoiseTexture lo, loBlur;
+		create(lo, lw, lh, DXGI_FORMAT_R8G8_UNORM, 2, "RayTracing RTAO LoW");
+		create(loBlur, lw, lh, DXGI_FORMAT_R8G8_UNORM, 2, "RayTracing RTAO LoWBlur");
+		if (ok) {
+			aoLoW = std::move(lo);
+			aoLoWBlur = std::move(loBlur);
+		}
+	}
+	if (ok && a_full && !aoFullTemp.texture) {
+		DenoiseTexture temp;
+		create(temp, width, height, DXGI_FORMAT_R8G8_UNORM, 2, "RayTracing RTAO FullTemp");
+		if (ok)
+			aoFullTemp = std::move(temp);
+	}
+	if (ok && a_detail && !aoDetailFiltered.texture) {
+		DenoiseTexture filtered, history0, history1;
+		create(filtered, width, height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Detail");
+		create(history0, width, height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Detail History");
+		create(history1, width, height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Detail History");
+		if (ok) {
+			aoDetailFiltered = std::move(filtered);
+			aoDetailHistory[0] = std::move(history0);
+			aoDetailHistory[1] = std::move(history1);
+			aoDetailHistoryValid = false;
+		}
+	}
+	aoExtrasBytes += bytes;
+	d3d11Bytes += bytes;
+	if (!ok) {
+		ReleaseAOExtras();
+		aoExtrasFault = "could not create the textures of its detail / full-resolution filter (the 46s filter is used)";
+		logger::warn("[RayTracing] RTAO: {}", aoExtrasFault);
+		return false;
+	}
+	return true;
 }
 
 bool RayTracing::EnsureAOFilter(std::uint32_t a_width, std::uint32_t a_height)
@@ -3730,9 +3858,22 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 		if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); playerCamera && playerCamera->IsInFirstPerson())
 			flags |= kAOTraceFirstPerson;
 	}
+	const float rayLength = std::clamp(settings.AORayLength, kAORayLengthMin, kAORayLengthMax);
+	// (46t) Two scales: the near / far split at the Detail Ray Length (at most half the Ray Length, so the far part keeps a
+	// range of its own). Only when its textures exist (else this session stays with the 46s single ray and filter).
+	AOTraceShape shape{};
+	shape.alphaBudget = std::clamp(settings.AOAlphaBudget, 0, 2);
+	shape.detail = settings.AODetail && EnsureAOExtras(!settings.AOFullResFilter, settings.AOFullResFilter, true);
+	if (shape.detail) {
+		shape.detailRays = std::clamp(settings.AODetailRays, 1, kAODetailRaysMax);
+		shape.detailLength = std::min(std::clamp(settings.AODetailLength, kAODetailLengthMin, kAODetailLengthMax), rayLength * 0.5f);
+		flags |= kAOTraceDetail;
+	}
+	flags |= shape.alphaBudget == 1 ? kAOTraceAlphaHalf : (shape.alphaBudget == 2 ? kAOTraceAlphaOpen : 0u);
+	aoShapeThisFrame = shape;
 	c.params[0] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[1], &flags, sizeof(float));
-	c.params[2] = std::clamp(settings.AORayLength, kAORayLengthMin, kAORayLengthMax);
+	c.params[2] = rayLength;
 	c.params[3] = 0.0f;
 	const float distance = std::clamp(settings.AODistance, 1000.0f, 8192.0f);
 	c.fade[0] = distance * kAOFadeStartShare;
@@ -3758,7 +3899,9 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 	c.fade[2] = kRayBiasConstant;
 	c.fade[3] = kRayBiasPerUnit;
 	c.extra[0] = kCharacterSelfShadowOffset;
-	c.extra[1] = c.extra[2] = c.extra[3] = 0.0f;
+	c.extra[1] = shape.detail ? shape.detailLength : 0.0f;                         // (46t)
+	c.extra[2] = shape.detail ? static_cast<float>(shape.detailRays - 1) : 0.0f;  // (46t) near-only directions besides the long one
+	c.extra[3] = 0.0f;
 	std::copy_n(a_input.constants.spheres, 8, c.spheres);
 	// Leaves / cut-outs the per-kind menu traces block AO rays with their cut-out (bounded candidates per ray).
 	aoInput.alpha = backend.AOAlphaAvailable();
@@ -3767,6 +3910,18 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 }
 
 void RayTracing::DrawAmbientOcclusion()
+{
+	// (46t) A render hook: nothing may escape it. On an exception only RTAO goes off (SSGI's own AO is used).
+	try {
+		DrawAmbientOcclusionImpl();
+	} catch (const std::exception& e) {
+		SwitchOffAO(std::format("its filter failed ({})", e.what()));
+	} catch (...) {
+		SwitchOffAO("its filter failed (unknown error)");
+	}
+}
+
+void RayTracing::DrawAmbientOcclusionImpl()
 {
 	if (!aoThisFrame)
 		return;
@@ -3792,13 +3947,9 @@ void RayTracing::DrawAmbientOcclusion()
 		return;
 	}
 
-	auto* down = GetShader(aoDownCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_downsample.hlsl", "ssrt_conf_downsample (RTAO)");
-	auto* blurH = GetShader(aoBlurHCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_blur.hlsl", "ssrt_conf_blur (RTAO)");
-	auto* blurV = GetShaderDefined(aoBlurVCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_blur.hlsl", "ssrt_conf_blur vertical (RTAO)", "SSRT_CONF_BLUR_VERTICAL");
-	auto* up = GetShader(aoUpCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_upsample.hlsl", "ssrt_conf_upsample (RTAO)");
 	auto* temporal = GetShader(aoTemporalCS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS");
 	auto* composite = GetShader(aoCompositeCS, L"Data\\Shaders\\RayTracing\\RTAOCompositeCS.hlsl", "RTAOCompositeCS");
-	if (!down || !blurH || !blurV || !up || !temporal || !composite) {
+	if (!temporal || !composite) {
 		SwitchOffAO("a filter shader did not compile (see the log)");
 		return;
 	}
@@ -3810,20 +3961,63 @@ void RayTracing::DrawAmbientOcclusion()
 	if (!depth.depthSRV || !normal.SRV || !motion.SRV)
 		return;
 
+	// (46t) The filter path: the 46s one (the SSRT confidence filter's passes) with every 46t switch off, else RTAOFilterCS
+	// (two scales when the trace carried them, normal-guided weights, quarter or full resolution).
+	const AOTraceShape shape = aoShapeThisFrame;
+	const bool detail = shape.detail && aoDetailFiltered.texture && aoDetailHistory[0].texture && aoDetailHistory[1].texture;
+	const bool fullRes = settings.AOFullResFilter && EnsureAOExtras(false, true, false) && aoFullTemp.texture;
+	const bool ownFilter = shape.detail || settings.AONormalGuided || fullRes;
+	const bool quarterOwn = ownFilter && !fullRes && EnsureAOExtras(true, false, false) && aoLoW.texture && aoLoWBlur.texture;
+	const bool useOwn = fullRes || quarterOwn;  // false: the 46s filter (also the fallback when the extra textures failed)
+	if (shape.detail && (!detail || !useOwn)) {
+		// The trace carried two scales (its .r is the far term only) but their filter textures are gone: no RTAO this frame,
+		// the next trace goes back to the single ray (aoExtrasFault).
+		return;
+	}
+
+	ID3D11ComputeShader *down = nullptr, *blurH = nullptr, *blurV = nullptr, *up = nullptr, *fullH = nullptr, *fullV = nullptr;
+	ID3D11ComputeShader *detailCS = nullptr, *detailTemporal = nullptr;
+	const wchar_t* kFilter = L"Data\\Shaders\\RayTracing\\RTAOFilterCS.hlsl";
+	if (!useOwn) {
+		down = GetShader(aoDownCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_downsample.hlsl", "ssrt_conf_downsample (RTAO)");
+		blurH = GetShader(aoBlurHCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_blur.hlsl", "ssrt_conf_blur (RTAO)");
+		blurV = GetShaderDefined(aoBlurVCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_blur.hlsl", "ssrt_conf_blur vertical (RTAO)", "SSRT_CONF_BLUR_VERTICAL");
+		up = GetShader(aoUpCS, L"Data\\Shaders\\ScreenSpaceRayTracing\\ssrt_conf_upsample.hlsl", "ssrt_conf_upsample (RTAO)");
+	} else if (fullRes) {
+		fullH = GetShaderDefined(aoFFullHCS, kFilter, "RTAOFilterCS (full, horizontal)", "RTAO_FULL");
+		fullV = GetShaderDefined(aoFFullVCS, kFilter, "RTAOFilterCS (full, vertical)", "RTAO_FULL,RTAO_VERTICAL");
+	} else {
+		down = GetShaderDefined(aoFDownCS, kFilter, "RTAOFilterCS (down)", "RTAO_DOWN");
+		blurH = GetShaderDefined(aoFBlurHCS, kFilter, "RTAOFilterCS (blur)", "RTAO_BLUR");
+		blurV = GetShaderDefined(aoFBlurVCS, kFilter, "RTAOFilterCS (blur, vertical)", "RTAO_BLUR,RTAO_VERTICAL");
+		up = GetShaderDefined(aoFUpCS, kFilter, "RTAOFilterCS (up)", "RTAO_UP");
+	}
+	if (detail) {
+		detailCS = GetShaderDefined(aoFDetailCS, kFilter, "RTAOFilterCS (detail)", "RTAO_DETAIL");
+		detailTemporal = GetShaderDefined(aoDetailTemporalCS, L"Data\\Shaders\\RayTracing\\RTAOTemporalCS.hlsl", "RTAOTemporalCS (detail)", "RTAO_DETAIL_HISTORY");
+	}
+	if ((fullRes && (!fullH || !fullV)) || (!fullRes && (!down || !blurH || !blurV || !up)) || (detail && (!detailCS || !detailTemporal))) {
+		SwitchOffAO("a filter shader did not compile (see the log)");
+		return;
+	}
+
 	const std::uint32_t width = aoWidth, height = aoHeight;
 	const UINT groupsX = (width + 7) / 8, groupsY = (height + 7) / 8;
 	const UINT loX = ((width + 1) / 2 + 7) / 8, loY = ((height + 1) / 2 + 7) / 8;
 	const bool historyValid = settings.AOTemporal && aoHistoryValid && aoHistoryFrame + 1 == globals::state->frameCount;
+	const bool detailHistoryValid = detail && settings.AOTemporal && aoDetailHistoryValid && aoDetailHistoryFrame + 1 == globals::state->frameCount;
 	const std::uint32_t read = aoHistoryIndex, write = aoHistoryIndex ^ 1u;
+	const std::uint32_t detailRead = aoDetailHistoryIndex, detailWrite = aoDetailHistoryIndex ^ 1u;
 	ID3D11ShaderResourceView* contact = ssgi.contactAoThisFrame;
-	const bool debugOverlay = (aoDebugView == AODebugView::Raw || aoDebugView == AODebugView::Filtered || aoDebugView == AODebugView::Split) && debugColorUAV;
+	const bool debugOverlay = aoDebugView != AODebugView::Off && debugColorUAV;
 
 	AOCompositeCB cb{};
 	cb.Size[0] = width;
 	cb.Size[1] = height;
 	// (46h) The mode of this frame's trace: AOMode outdoors, AOModeInterior indoors.
 	cb.Size[2] = (contact ? kAOFlagContact : 0u) | (aoModeThisFrame == static_cast<int>(AOModeKind::Darker) ? kAOFlagDarker : 0u) |
-	             (historyValid ? kAOFlagHistory : 0u) | (aoDebugView == AODebugView::Split ? kAOFlagSplit : 0u);
+	             (historyValid ? kAOFlagHistory : 0u) | (aoDebugView == AODebugView::Split ? kAOFlagSplit : 0u) |
+	             (detail ? (kAOFlagDetail | kAOFlagValidity) : 0u) | (detailHistoryValid ? kAOFlagDetailHistory : 0u);
 	cb.Size[3] = debugOverlay ? static_cast<std::uint32_t>(aoDebugView) : 0u;
 	cb.Params[0] = std::clamp(settings.AOStrength, 0.0f, 2.0f);
 	cb.Params[1] = kAOHistoryWeight;
@@ -3837,6 +4031,15 @@ void RayTracing::DrawAmbientOcclusion()
 		aoRamp = static_cast<float>(std::clamp(static_cast<double>(Qpc() - aoRampStart) * QpcMs() / kAOFadeInMs, 0.0, 1.0));
 	}
 	cb.Params[3] = fade * aoRamp;
+	cb.Detail[0] = std::clamp(settings.AODetailStrength, 0.0f, 2.0f);
+	cb.Detail[1] = settings.AONormalGuided ? kAONormalPower : 0.0f;
+	{
+		const float4 cameraData = Util::GetCameraData();
+		cb.Camera[0] = cameraData.x;
+		cb.Camera[1] = cameraData.y;
+		cb.Camera[2] = cameraData.z;
+		cb.Camera[3] = cameraData.w;
+	}
 	aoCB->Update(cb);
 
 	ID3D11ShaderResourceView* nullSrvs[6]{};
@@ -3845,57 +4048,49 @@ void RayTracing::DrawAmbientOcclusion()
 		context->CSSetShaderResources(0, 6, nullSrvs);
 		context->CSSetUnorderedAccessViews(0, 3, nullUavs, nullptr);
 	};
-	clear();
-	timers->Begin(Util::GpuBucket::RayTracingAO);
-	// 2. The 1/4-resolution bilateral filter of this frame's rays (the SSRT confidence filter's passes, unchanged):
-	//    depth- and normal-aware 2x2 average, separable 15-tap joint bilateral blur, joint bilateral upsample.
-	//    Spatial, same frame: nothing of NRD, no history (hard constraint #3).
-	{
-		ID3D11ShaderResourceView* srvs[3] = { backend.AORawSRV(), depth.depthSRV, normal.SRV };
-		ID3D11UnorderedAccessView* uavs[3] = { aoLo.uav.get(), aoLoDepth.uav.get(), aoLoNormal.uav.get() };
-		context->CSSetShaderResources(0, 3, srvs);
-		context->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
-		context->CSSetShader(down, nullptr, 0);
-		context->Dispatch(loX, loY, 1);
-		clear();
-	}
-	auto blurPass = [&](ID3D11ComputeShader* a_shader, DenoiseTexture& a_source, DenoiseTexture& a_target) {
-		ID3D11ShaderResourceView* srvs[4] = { a_source.srv.get(), aoLoDepth.srv.get(), nullptr, aoLoNormal.srv.get() };
-		ID3D11UnorderedAccessView* uav = a_target.uav.get();
-		context->CSSetShaderResources(0, 4, srvs);
-		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+	auto dispatch = [&](ID3D11ComputeShader* a_shader, std::initializer_list<ID3D11ShaderResourceView*> a_srvs,
+						std::initializer_list<ID3D11UnorderedAccessView*> a_uavs, UINT a_x, UINT a_y) {
+		context->CSSetShaderResources(0, static_cast<UINT>(a_srvs.size()), a_srvs.begin());
+		context->CSSetUnorderedAccessViews(0, static_cast<UINT>(a_uavs.size()), a_uavs.begin(), nullptr);
 		context->CSSetShader(a_shader, nullptr, 0);
-		context->Dispatch(loX, loY, 1);
+		context->Dispatch(a_x, a_y, 1);
 		clear();
 	};
-	blurPass(blurH, aoLo, aoLoBlur);
-	blurPass(blurV, aoLoBlur, aoLo);
-	{
-		ID3D11ShaderResourceView* srvs[6] = { backend.AORawSRV(), depth.depthSRV, normal.SRV, aoLo.srv.get(), aoLoDepth.srv.get(), aoLoNormal.srv.get() };
-		ID3D11UnorderedAccessView* uav = aoFiltered.uav.get();
-		context->CSSetShaderResources(0, 6, srvs);
-		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-		context->CSSetShader(up, nullptr, 0);
-		context->Dispatch(groupsX, groupsY, 1);
-		clear();
+	clear();
+	timers->Begin(Util::GpuBucket::RayTracingAO);
+	if (!useOwn) {
+		// 2. (46s) The 1/4-resolution bilateral filter of this frame's rays (the SSRT confidence filter's passes, unchanged):
+		//    depth- and normal-aware 2x2 average, separable 15-tap joint bilateral blur, joint bilateral upsample.
+		//    Spatial, same frame: nothing of NRD, no history (hard constraint #3).
+		dispatch(down, { backend.AORawSRV(), depth.depthSRV, normal.SRV }, { aoLo.uav.get(), aoLoDepth.uav.get(), aoLoNormal.uav.get() }, loX, loY);
+		dispatch(blurH, { aoLo.srv.get(), aoLoDepth.srv.get(), nullptr, aoLoNormal.srv.get() }, { aoLoBlur.uav.get() }, loX, loY);
+		dispatch(blurV, { aoLoBlur.srv.get(), aoLoDepth.srv.get(), nullptr, aoLoNormal.srv.get() }, { aoLo.uav.get() }, loX, loY);
+		dispatch(up, { backend.AORawSRV(), depth.depthSRV, normal.SRV, aoLo.srv.get(), aoLoDepth.srv.get(), aoLoNormal.srv.get() }, { aoFiltered.uav.get() },
+			groupsX, groupsY);
+	}
+	ID3D11Buffer* cbs[1] = { aoCB->CB() };
+	context->CSSetConstantBuffers(0, 1, cbs);
+	if (useOwn && fullRes) {
+		// 2. (46t) Full render resolution: a separable 21-tap edge-aware filter (plane-predicted depth, normal), with two
+		//    scales weighted by the far samples' weights.
+		dispatch(fullH, { backend.AORawSRV(), depth.depthSRV, normal.SRV }, { aoFullTemp.uav.get() }, groupsX, groupsY);
+		dispatch(fullV, { nullptr, depth.depthSRV, normal.SRV, nullptr, nullptr, aoFullTemp.srv.get() }, { aoFiltered.uav.get() }, groupsX, groupsY);
+	} else if (useOwn) {
+		// 2. (46t) The quarter-resolution chain with the far samples' weights (two scales) and / or normal-guided taps.
+		dispatch(down, { backend.AORawSRV(), depth.depthSRV, normal.SRV }, { aoLoW.uav.get(), aoLoDepth.uav.get(), aoLoNormal.uav.get() }, loX, loY);
+		dispatch(blurH, { nullptr, nullptr, nullptr, aoLoDepth.srv.get(), aoLoNormal.srv.get(), aoLoW.srv.get() }, { aoLoWBlur.uav.get() }, loX, loY);
+		dispatch(blurV, { nullptr, nullptr, nullptr, aoLoDepth.srv.get(), aoLoNormal.srv.get(), aoLoWBlur.srv.get() }, { aoLoW.uav.get() }, loX, loY);
+		dispatch(up, { backend.AORawSRV(), depth.depthSRV, normal.SRV, aoLoDepth.srv.get(), aoLoNormal.srv.get(), aoLoW.srv.get() }, { aoFiltered.uav.get() },
+			groupsX, groupsY);
 	}
 	// 3. Optional: the clamped history (after the spatial filter; the history is held inside this frame's filtered
 	//    3x3 range plus a small slack). Temporal off: the filtered result is used as it is.
 	DenoiseTexture* blended = &aoFiltered;
-	ID3D11Buffer* cbs[1] = { aoCB->CB() };
-	context->CSSetConstantBuffers(0, 1, cbs);
+	DenoiseTexture* detailBlended = detail ? &aoDetailFiltered : nullptr;
+	ID3D11SamplerState* sampler = aoLinearSampler.get();
+	context->CSSetSamplers(0, 1, &sampler);
 	if (settings.AOTemporal) {
-		ID3D11ShaderResourceView* srvs[3] = { aoFiltered.srv.get(), aoHistory[read].srv.get(), motion.SRV };
-		ID3D11UnorderedAccessView* uav = aoHistory[write].uav.get();
-		ID3D11SamplerState* sampler = aoLinearSampler.get();
-		context->CSSetSamplers(0, 1, &sampler);
-		context->CSSetShaderResources(0, 3, srvs);
-		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-		context->CSSetShader(temporal, nullptr, 0);
-		context->Dispatch(groupsX, groupsY, 1);
-		clear();
-		ID3D11SamplerState* nullSampler = nullptr;
-		context->CSSetSamplers(0, 1, &nullSampler);
+		dispatch(temporal, { aoFiltered.srv.get(), aoHistory[read].srv.get(), motion.SRV }, { aoHistory[write].uav.get() }, groupsX, groupsY);
 		blended = &aoHistory[write];
 		aoHistoryIndex = write;
 		aoHistoryValid = true;
@@ -3903,16 +4098,27 @@ void RayTracing::DrawAmbientOcclusion()
 	} else {
 		aoHistoryValid = false;
 	}
-	// 4. The mix with SSGI's AO into the texture its consumers read (DeferredComposite, SSRT) for this frame.
-	{
-		ID3D11ShaderResourceView* srvs[4] = { blended->srv.get(), backend.AORawSRV(), ssgi.GetOwnAoSRV(), contact };
-		ID3D11UnorderedAccessView* uavs[2] = { aoOut.uav.get(), debugOverlay ? debugColorUAV.get() : nullptr };
-		context->CSSetShaderResources(0, 4, srvs);
-		context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-		context->CSSetShader(composite, nullptr, 0);
-		context->Dispatch(groupsX, groupsY, 1);
-		clear();
+	if (detail) {
+		// (46t) The detail term: this frame's near rays, 5x5 edge-aware at full resolution, then its own clamped history.
+		dispatch(detailCS, { backend.AORawSRV(), depth.depthSRV, normal.SRV }, { aoDetailFiltered.uav.get() }, groupsX, groupsY);
+		if (settings.AOTemporal) {
+			dispatch(detailTemporal, { aoDetailFiltered.srv.get(), aoDetailHistory[detailRead].srv.get(), motion.SRV },
+				{ aoDetailHistory[detailWrite].uav.get() }, groupsX, groupsY);
+			detailBlended = &aoDetailHistory[detailWrite];
+			aoDetailHistoryIndex = detailWrite;
+			aoDetailHistoryValid = true;
+			aoDetailHistoryFrame = globals::state->frameCount;
+		} else {
+			aoDetailHistoryValid = false;
+		}
+	} else {
+		aoDetailHistoryValid = false;
 	}
+	ID3D11SamplerState* nullSampler = nullptr;
+	context->CSSetSamplers(0, 1, &nullSampler);
+	// 4. The mix with SSGI's AO into the texture its consumers read (DeferredComposite, SSRT) for this frame.
+	dispatch(composite, { blended->srv.get(), backend.AORawSRV(), ssgi.GetOwnAoSRV(), contact, detailBlended ? detailBlended->srv.get() : nullptr },
+		{ aoOut.uav.get(), debugOverlay ? debugColorUAV.get() : nullptr }, groupsX, groupsY);
 	timers->End(Util::GpuBucket::RayTracingAO);
 	ID3D11Buffer* nullCb[1]{};
 	context->CSSetConstantBuffers(0, 1, nullCb);
@@ -3921,6 +4127,12 @@ void RayTracing::DrawAmbientOcclusion()
 	ssgi.aoOverride = aoOut.srv.get();
 	aoComposited = true;
 	aoDebugDrawn = debugOverlay;
+	// (46t) F7: what this composite used.
+	aoLastFilter = !useOwn ? 0 : (fullRes ? 2 : 1);
+	aoLastDetailRays = detail ? shape.detailRays : 0;
+	aoLastDetailLength = detail ? shape.detailLength : 0.0f;
+	aoLastNormalGuided = useOwn && settings.AONormalGuided ? 1 : 0;
+	aoLastAlphaBudget = shape.alphaBudget;
 	aoCpuMs += static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
 }
 
@@ -4902,11 +5114,28 @@ void RayTracing::DrawAOPage()
 		}
 		ImGui::BeginDisabled(!settings.AO);
 		ImGui::SliderFloat("Strength", &settings.AOStrength, 0.0f, 2.0f, "%.2f");
-		if (auto _tt = Util::HoverTooltipWrapper())
+		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("1 = as traced. Lower = lighter, higher = darker.");
+			ImGui::Text("With Fine Detail on (Advanced > A-B switches, default on): the broad darkening only (under roofs, along walls, around");
+			ImGui::Text("  large objects); the small creases have their own Detail Strength.");
+		}
+		ImGui::BeginDisabled(!settings.AODetail);
+		ImGui::SliderFloat("Detail Strength", &settings.AODetailStrength, 0.0f, 2.0f, "%.2f");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("The fine darkening right next to surfaces: stone joints, where a door frame meets the wall, between ivy layers,");
+			ImGui::Text("  under small objects. 1 (default) = as traced; higher = deeper creases without darkening whole areas.");
+		}
+		ImGui::EndDisabled();
 		ImGui::SliderFloat("Ray Length", &settings.AORayLength, kAORayLengthMin, kAORayLengthMax, "%.0f units");
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("How far an object may be and still darken a surface. 70 units = 1 m. Default 100 (about 1.4 m). Longer = wider, darker AO.");
+		ImGui::BeginDisabled(!settings.AODetail);
+		ImGui::SliderFloat("Detail Ray Length", &settings.AODetailLength, kAODetailLengthMin, kAODetailLengthMax, "%.0f units");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("How close an object has to be to count as fine detail (Detail Strength); farther ones count for Strength.");
+			ImGui::Text("  Default 20 (about 28 cm). At most half the Ray Length.");
+		}
+		ImGui::EndDisabled();
 		ImGui::Checkbox("Indoors Too##AO", &settings.AOInteriors);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("On (default): inside houses, inns, castles and dungeons the room itself (walls, furniture, clutter, people) is captured");
@@ -4948,6 +5177,13 @@ void RayTracing::DrawAOPage()
 				ImGui::Text("On (default): after the edge-aware blur the last frames are blended in (held close to this frame's own values,");
 				ImGui::Text("  so moving objects leave no dark trail). Off: this frame's blurred rays only (a little grainier).");
 			}
+			ImGui::BeginDisabled(!settings.AODetail);
+			ImGui::SliderInt("Detail Rays", &settings.AODetailRays, 1, kAODetailRaysMax);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Short rays per pixel for the fine detail (the long ray's first part is one of them). Default 2.");
+				ImGui::Text("  More = smoother creases, costs more GPU time (about +20 %% of the RTAO rays' time per ray).");
+			}
+			ImGui::EndDisabled();
 			ImGui::SliderFloat("Max Distance", &settings.AODistance, 1000.0f, 8192.0f, "%.0f units");
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("Outdoors: RTAO fades back to Screen Space GI's AO over the last quarter of this distance. Default 4000 (about 57 m).");
@@ -4969,10 +5205,56 @@ void RayTracing::DrawAOPage()
 			ImGui::TreePop();
 		}
 
+		// (46t) A/B switches (saved settings; the defaults are the tested ones). All off / Blocked = 46s.
+		{
+			bool reset = false;
+			if (Util::BeginABSwitchGroup(nullptr, reset)) {
+				if (reset) {
+					const Settings d{};
+					settings.AODetail = d.AODetail;
+					settings.AONormalGuided = d.AONormalGuided;
+					settings.AOFullResFilter = d.AOFullResFilter;
+					settings.AOAlphaBudget = d.AOAlphaBudget;
+				}
+				ImGui::BeginDisabled(!settings.AO);
+				ImGui::Checkbox("Fine Detail (two scales)", &settings.AODetail);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On (default): short extra rays find the small creases (stone joints, door frame and wall, ivy layers) and keep");
+					ImGui::Text("  them sharp (lightly blurred at full resolution); the long ray only adds the broad darkening beyond them, so");
+					ImGui::Text("  nothing is darkened twice. Strength and Detail Strength set the two separately.");
+					ImGui::Text("Off: one long ray per pixel, blurred at quarter resolution (as before: small creases mostly blur away).");
+				}
+				ImGui::Checkbox("Normal-Guided Filter", &settings.AONormalGuided);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On (default): the blur follows the surface direction too (the detailed normal of the material), so the two");
+					ImGui::Text("  sides of a crease or a frame and its wall are not averaged together. Off: only a coarse 45 degree test (as before).");
+				}
+				ImGui::Checkbox("Full-Resolution Filter", &settings.AOFullResFilter);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Off (default): the broad AO is blurred at quarter resolution (wide, smooth, cheap).");
+					ImGui::Text("On: blurred at full render resolution with a smaller reach (sharper edges, a little grainier, a bit more GPU time).");
+				}
+				{
+					const char* kBudget[] = { "Blocked (as before)", "Half Open", "Open" };
+					settings.AOAlphaBudget = std::clamp(settings.AOAlphaBudget, 0, 2);
+					ImGui::Combo("Dense Leaves (alpha budget)", &settings.AOAlphaBudget, kBudget, IM_ARRAYSIZE(kBudget));
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("An AO ray stops checking leaf / cut-out textures after 8 see-through spots (bounded cost). Then it counts as:");
+						ImGui::Text("  Blocked (default, as before): dense ivy / bushes may come out too dark.");
+						ImGui::Text("  Half Open: half darkened. Open: not darkened (dense foliage may come out too light).");
+					}
+				}
+				ImGui::EndDisabled();
+				if (!aoExtrasFault.empty())
+					RtErrorLine("Fine Detail / Full-Resolution Filter were switched off automatically", aoExtrasFault);
+				ImGui::TreePop();
+			}
+		}
+
 		if (ImGui::TreeNodeEx("Diagnostics")) {
 			ImGui::BeginDisabled(!settings.AO);
 			{
-				const char* views[] = { "Off", "Raw RTAO", "Filtered RTAO", "RTAO vs SSGI (split)" };
+				const char* views[] = { "Off", "Raw RTAO (broad)", "Filtered RTAO (broad)", "RTAO vs SSGI (split)", "Raw Detail", "Filtered Detail", "Final AO" };
 				int view = static_cast<int>(aoDebugView);
 				if (ImGui::Combo("AO Debug View", &view, views, IM_ARRAYSIZE(views)))
 					aoDebugView = static_cast<AODebugView>(std::clamp(view, 0, static_cast<int>(AODebugView::Count) - 1));
@@ -4980,6 +5262,9 @@ void RayTracing::DrawAOPage()
 					ImGui::Text("Raw RTAO: this frame's rays (white = open, black = blocked); blue tint = not traced (SSGI's AO there).");
 					ImGui::Text("Filtered RTAO: after the blur (and the history), as it enters the mix.");
 					ImGui::Text("RTAO vs SSGI (split): the real picture; left half with RTAO, right half with Screen Space GI's AO as before.");
+					ImGui::Text("With Fine Detail: Raw RTAO shows the long rays' far part (orange = its near part was blocked: the detail term");
+					ImGui::Text("  covers that direction); Raw / Filtered Detail = the short rays (open share) and their filtered result;");
+					ImGui::Text("  Final AO = what the lighting gets (white = no darkening).");
 					ImGui::Text("Not saved.");
 				}
 			}
@@ -5003,6 +5288,11 @@ void RayTracing::DrawAOPage()
 					rt.aoAlphaLastFrame ? "yes" : "no");
 				if (auto _tt = Util::HoverTooltipWrapper())
 					ImGui::Text("GPU times are the last samples (the D3D11 ones only while the Performance Overlay or an F7 trace runs).");
+				// (46t)
+				static constexpr const char* kFilters[] = { "quarter resolution (46s)", "quarter resolution", "full resolution" };
+				const std::string detailText = aoLastDetailRays > 0 ? std::format("{} rays x {:.0f} units", aoLastDetailRays, aoLastDetailLength) : std::string("off");
+				ImGui::Text("Filter: %s, normal-guided %s; fine detail %s", aoLastFilter >= 0 ? kFilters[std::clamp(aoLastFilter, 0, 2)] : "-",
+					aoLastNormalGuided > 0 ? "on" : "off", detailText.c_str());
 			} else {
 				ImGui::TextDisabled("Not tracing ambient occlusion right now.");
 			}
@@ -5413,10 +5703,17 @@ std::string RayTracing::DescribeForProfile() const
 		kBeamCull[EffectiveBeamCull()], settings.PointLightsBeamGuard ? "on" : "off", settings.PointLightsBeamSoftness);
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
-	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split" };
+	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final" };
 	text += std::format(", RTAO {} (mode {}, ray length {:.0f}, strength {:.2f}, temporal {}, max distance {:.0f}, debug view {}{})", settings.AO ? "on" : "off",
 		kAOModes[std::clamp(settings.AOMode, 0, 1)], settings.AORayLength, settings.AOStrength, settings.AOTemporal ? "on" : "off", settings.AODistance,
-		kAOViews[std::clamp(static_cast<int>(aoDebugView), 0, 3)], aoOffReason.empty() ? "" : ", switched off: " + aoOffReason);
+		kAOViews[std::clamp(static_cast<int>(aoDebugView), 0, 6)], aoOffReason.empty() ? "" : ", switched off: " + aoOffReason);
+	// (46t)
+	static constexpr const char* kAOBudget[] = { "blocked", "half open", "open" };
+	text += std::format(", RTAO fine detail {} (detail strength {:.2f}, detail ray length {:.0f}, detail rays {}), normal-guided filter {}, full-resolution filter {}, "
+						"dense leaves past the alpha budget {}{}",
+		settings.AODetail ? "on" : "off", settings.AODetailStrength, settings.AODetailLength, settings.AODetailRays, settings.AONormalGuided ? "on" : "off",
+		settings.AOFullResFilter ? "on" : "off", kAOBudget[std::clamp(settings.AOAlphaBudget, 0, 2)],
+		aoExtrasFault.empty() ? "" : ", detail / full-res filter switched off: " + aoExtrasFault);
 	// (46h)
 	static constexpr const char* kAOModesInterior[] = { "RTAO + SSGI contact AO", "darker of both" };
 	text += std::format(", RTAO indoors {} (mode {}, no distance fade: the interior's box{})", settings.AO && settings.AOInteriors ? "on" : "off",
