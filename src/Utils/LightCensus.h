@@ -124,7 +124,22 @@ namespace Util::LightCensus
 		bool visibleFixture = false;
 		bool lightPlacer = false;
 		char label[40]{};  ///< LIGH (else base) editor ID, for the diagnostics
+		// (46x) Fill lights and window spots, for the shadow selection's fill classes.
+		bool negative = false;         ///< the LIGH is a negative light (flag 0x4)
+		bool fillPluginOnly = false;   ///< category Fill only through an "ambient" plugin: the LIGH editor ID has no fill / omni word
+		bool fillFixtureWord = false;  ///< the LIGH editor ID names a fire, candle, torch, brazier, hearth ... (kFixtureWords)
+		bool fillDirectName = false;   ///< the LIGH editor ID says sun / shaft / beam / ray, and not bounce / amb
+		bool wsu = false;              ///< the reference or its LIGH comes from Window Shadows Ultimate (or its Supplement)
 	};
+
+	/// (46x) Wider Window Beam Detection: a window spot shadow light over kWindowBeamRadiusWide units is a window beam (46w:
+	/// over 10000), and a spot shadow light from Window Shadows Ultimate / its Supplement counts as a window light by its plugin
+	/// for that rule too. Set by Ray Tracing every frame (its Point Light Shadows switch); captures follow it.
+	inline constexpr float kWindowBeamRadiusWide = 4096.0f;
+	void SetWiderWindowBeams(bool a_on);
+	[[nodiscard]] bool WiderWindowBeams();
+	/// The window-beam radius threshold in effect (10000, or kWindowBeamRadiusWide with the wider rule).
+	[[nodiscard]] float WindowBeamRadius();
 
 	/**
 	 * (46b) The census classifier for every frame (RT point-light shadows): one census-style read of the

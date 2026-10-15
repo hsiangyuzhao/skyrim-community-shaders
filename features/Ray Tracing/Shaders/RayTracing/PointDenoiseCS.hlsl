@@ -21,6 +21,7 @@ cbuffer PointDenoiseCB : register(b1)
 	float4 PLParams;  // x emitter radius, y this frame's weight in the history blend, z flags (asuint), w max filter radius (px)
 	float4 PLExtra;   // x K, (46o) y / z window-beam source slots 0-31 / 32-63 (uint bits), w tan of the beams' angular size (0 = 46n)
 	uint4 PLMotion[4];  // (46d) per source slot one byte (slot s: byte s % 4 of uint s / 4): history dropped this frame, 0 keep .. 255 none
+	uint4 PLEmitter;  // (46x) x / y source slots 0-31 / 32-63 with their own emitter radius (uint bits), z that radius (float bits)
 };
 
 Texture2D<unorm float4> PLVis : register(t0);
@@ -95,6 +96,16 @@ float HistoryDrop(uint a_id)
 float Lit(float a_raw)
 {
 	return a_raw >= 0.999 ? 1.0 : 0.0;
+}
+
+// (46x) Does this source (id = slot + 1) have its own emitter radius (a direct fill without a window spot)?
+bool BigEmitter(uint a_id)
+{
+	if (a_id == 0u)
+		return false;
+	const uint s = a_id - 1u;
+	const uint word = s < 32u ? PLEmitter.x : PLEmitter.y;
+	return ((word >> (s & 31u)) & 1u) != 0u;
 }
 
 // (46o) Is this source (id = slot + 1) a soft window beam this frame?
@@ -230,7 +241,8 @@ bool SoftBeam(uint a_id)
 				else
 				{
 					const float q = qCount[s] > 0.0 ? clamp(qSum[s] / qCount[s], 0.0, 0.95) : 0.25;
-					const float width = 2.0 * PLParams.x * q / (1.0 - q);
+					const float emitter = BigEmitter(ids[s]) ? asfloat(PLEmitter.z) : PLParams.x;  // (46x)
+					const float width = 2.0 * emitter * q / (1.0 - q);
 					radiusPx[s] = clamp(0.5 * width / footprint, 1.0, PLParams.w);
 				}
 			}

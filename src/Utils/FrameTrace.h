@@ -156,6 +156,9 @@ namespace Util::FrameTrace
 		// (46g) Point-light selection: slot changes, lights merged, rejected by radius / by intensity, kept by the hysteresis,
 		// pixels whose top-K source set changed (GPU, a few frames late; -1 = not known), window beams found implausible.
 		uint32_t plSlotChanges = 0, plMerged = 0, plRejRadius = 0, plRejIntensity = 0, plKept = 0, plBeamsExcluded = 0;
+		// (46x) Point-light selection: direct fills traced, fills left untraced, portal-strict lights behind portals / of which dropped, ranked
+		// only inside their rooms' box (-1 = not traced this frame).
+		int plFillDirect = -1, plFillAmbient = -1, plPortalAway = -1, plPortalDropped = -1, plPortalBoxed = -1;
 		int64_t plChurn = -1;
 		// (46k) This frame's RT work came from the loading pump (a loading-screen frame, no world render), its CPU ms (-1 = not run).
 		int pump = 0;

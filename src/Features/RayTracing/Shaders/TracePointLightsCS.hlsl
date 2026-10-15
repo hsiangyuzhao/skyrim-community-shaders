@@ -29,6 +29,9 @@
 // weighted like the engine's spot mask (1 - (tan angle / tan half width)^falloff). Window beams (Window Shadows
 // Ultimate's huge spots far outside the windows): no attenuation in the ranking, no clearance, and the ray stops
 // where it leaves the captured interior (Rect xy, Bounds z): nothing beyond it is in the scene.
+// (46x) Direct fill lights (the floor patch of a light shaft): ranked as the point light they are, but aimed at the window
+// spot above them (kSourceAim: rays like a window beam's), or with their own emitter radius (kSourceEmitter). Room-bound
+// lights (kSourceRoomBox) are not ranked at pixels outside their rooms' box.
 
 struct PLConstants
 {
@@ -76,6 +79,9 @@ static const uint kSourceISL = 1u;
 static const uint kSourceSpot = 8u;   // (46c) RayTracingPointLights::kSourceSpot
 static const uint kSourceBeam = 16u;  // (46c) RayTracingPointLights::kSourceBeam
 static const uint kSourceNoPlayer = 32u;  // (46d) RayTracingPointLights::kSourceNoPlayer: the player's own light
+static const uint kSourceAim = 64u;        // (46x) RayTracingPointLights::kSourceAim: Spot.xyz = the ray target (a window spot), beam-like rays
+static const uint kSourceEmitter = 128u;   // (46x) Spot.w = this source's emitter radius
+static const uint kSourceRoomBox = 256u;   // (46x) Spot.xyz (uint bits) = its rooms' box, half floats: pixels outside do not rank it
 static const uint kSceneMask = 0x01u;
 static const uint kCharacterMasks = 0x06u;
 static const uint kNpcMask = 0x04u;  // (46d) the other actors only (Backend::kNpcMask): rays of the player's own lights
@@ -385,6 +391,15 @@ groupshared uint gsMask[2];
 			bits &= bits - 1u;
 			const uint i = word * 32u + bit;
 			const PLSource src = Sources[i];
+			// (46x) A room-bound light (Light Limit Fix lights only the geometry of its rooms): not ranked outside its rooms' box.
+			[branch] if (src.Info.x & kSourceRoomBox)
+			{
+				const uint3 b = asuint(src.Spot.xyz);
+				const float3 lo = float3(f16tof32(b.x), f16tof32(b.x >> 16), f16tof32(b.y));
+				const float3 hi = float3(f16tof32(b.y >> 16), f16tof32(b.z), f16tof32(b.z >> 16));
+				if (any(P < lo) || any(P > hi))
+					continue;
+			}
 			const float3 toLight = src.PosRadius.xyz - P;
 			const float d = length(toLight);
 			const float ndl = d > 1e-3 ? dot(N, toLight / d) : 0.0;
@@ -444,10 +459,14 @@ groupshared uint gsMask[2];
 			continue;
 		const PLSource src = Sources[bestIdx[k] - 1u];
 		const bool isBeam = (src.Info.x & kSourceBeam) != 0u;
+		// (46x) A direct fill aimed at its window spot: its rays go to the spot like the beam's (it is the beam's floor patch).
+		const bool isAim = (src.Info.x & kSourceAim) != 0u;
+		const bool beamLike = isBeam || isAim;
 		// (46o) A soft window beam: the disc subtends the beam's angular size seen from the surface (like the sun's cone).
-		const bool softBeam = isBeam && C.Bounds.w > 0.0;
+		const bool softBeam = beamLike && C.Bounds.w > 0.0;
+		const float3 rayTarget = isAim ? src.Spot.xyz : src.PosRadius.xyz;
 		// A point on the emitter's disc facing the surface (R2 step per slot: the slots decorrelate).
-		const float3 L0 = src.PosRadius.xyz - origin;
+		const float3 L0 = rayTarget - origin;
 		const float len0 = length(L0);
 		const float3 Ln = L0 / max(len0, 1e-3);
 		const float3 helper = abs(Ln.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
@@ -457,21 +476,22 @@ groupshared uint gsMask[2];
 		const float u2 = frac(n1 + float(k) * 0.5698402910);
 		float sn, cs;
 		sincos(6.2831853 * u2, sn, cs);
-		const float emitter = softBeam ? len0 * C.Bounds.w : C.Bias.w;
-		const float3 target = src.PosRadius.xyz + (T * cs + B * sn) * (sqrt(u1) * emitter);
+		// (46x) A direct fill without a window spot: its own (larger) emitter.
+		const float emitter = softBeam ? len0 * C.Bounds.w : (((src.Info.x & kSourceEmitter) && !isAim) ? src.Spot.w : C.Bias.w);
+		const float3 target = rayTarget + (T * cs + B * sn) * (sqrt(u1) * emitter);
 		const float3 L = target - origin;
 		const float len = length(L);
 		const float3 dir = L / max(len, 1e-3);
 		float tMax = len - asfloat(src.Info.y);
-		// (46c) A window beam's light is far outside: the ray ends where it leaves the captured interior.
-		if (src.Info.x & kSourceBeam)
+		// (46c) A window beam's light is far outside: the ray ends where it leaves the captured interior. (46x) So does an aimed fill's.
+		if (beamLike)
 			tMax = min(tMax, ExitDistance(origin, dir));
 		idx[k] = bestIdx[k];
 		if (tMax <= 1.0)
 			continue;  // the surface is inside the clearance: lit
 		float tHit;
 		const float footprint = dist * 2.0 * C.RenderSize.w;  // about a pixel's size there (alpha mip choice)
-		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, isBeam ? beamCull : RAY_FLAG_NONE, tHit);
+		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, beamLike ? beamCull : RAY_FLAG_NONE, tHit);
 		rays += 1u;
 		if (!blocked && characters) {
 			// (46d) The player's own light: the player's body (torch, arm, torso) is not tested, only the other actors.

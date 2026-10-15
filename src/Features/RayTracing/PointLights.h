@@ -50,6 +50,32 @@ namespace RayTracingPointLights
 	inline constexpr std::uint32_t kSourceSpot = 8u;    // (46c) spot: spot[] = direction, tan of the larger half width; info[2] = falloff
 	inline constexpr std::uint32_t kSourceBeam = 16u;   // (46c) window beam: no attenuation in the ranking, ray ends at the interior's bounds
 	inline constexpr std::uint32_t kSourceNoPlayer = 32u;  // (46d) the player's own light: the player's body is not tested (character mask 0x04 only)
+	// (46x) A direct fill light (the floor patch of a light shaft) paired with the window spot shadow light above it: spot[0..2] = the
+	// ray target (the spot's camera-relative position); its rays go there like a window beam's (no clearance, they end where they
+	// leave the interior, the beam culling, the beam softness). Ranked by its own attenuation (it lights the floor patch).
+	inline constexpr std::uint32_t kSourceAim = 64u;
+	// (46x) spot[3] = this source's emitter radius (a direct fill without a window spot: a larger, softer light).
+	inline constexpr std::uint32_t kSourceEmitter = 128u;
+	// (46x) Portal-strict light with rooms: spot[0..2] (uint bits) = its rooms' box, camera-relative, as half floats (lo.x | lo.y << 16,
+	// lo.z | hi.x << 16, hi.y | hi.z << 16): pixels outside it do not rank it (Light Limit Fix does not light them with it).
+	inline constexpr std::uint32_t kSourceRoomBox = 256u;
+
+	/// (46x) What the selection decided for a light of the 46x classes this frame (Light Census "rtClass" / "rtWhy").
+	enum class Decision : std::uint8_t
+	{
+		None = 0,
+		Negative,         // why: 0 LIGH flag, 1 negative colour, 2 negative fade
+		FillAmbient,      // why: 0 not direct light by name / place, 1 too dim (< 1.0 before the fade), 2 tinted, 3 Trace Direct Fill Lights off
+		FillDirectAimed,  // why: 0 named like direct light, 1 on the axis of a window spot shadow light, 2 both
+		FillDirectPoint,  // why: 0 named like direct light, no window spot above it
+		FillFixture,      // why: 0 named like a fire / candle / torch ..., 1 within 128 units of a fixture light
+		WiderBeam,        // why: 0 window spot with radius 4096 - 10000 (or a Window Shadows Ultimate spot by its plugin)
+		PortalBoxed,      // why: 0 its rooms hold the camera, 1 behind a portal (its rooms do not hold the camera)
+		PortalDropped,    // why: 0 behind a portal, its rooms' box off screen, 1 behind a portal (per-pixel room box off)
+		Count
+	};
+	const char* DecisionName(Decision a_decision);
+	const char* DecisionWhy(Decision a_decision, std::uint8_t a_why);
 
 	/// One shadow source as the trace reads it (StructuredBuffer, 64 bytes).
 	struct GpuSource
@@ -127,6 +153,22 @@ namespace RayTracingPointLights
 		float snapDistance = 320.0f;
 		// (46s) Diagnostics: the sources whose range covers this point (world; the player's chest). Not used when null.
 		const double* reachPoint = nullptr;
+		// (46x) Fill lights (placed, no mesh, named / from a plugin like fill lights; 46w: never traced). Trace Direct Fill Lights: a fill
+		// named like direct light (sun / shaft / beam / ray) or lying on the axis of a window spot shadow light (within 128 units
+		// horizontally, the spot above it), at least 1.0 before the fade and near-neutral (max / min channel <= 1.3), is traced: aimed
+		// at that spot (kSourceAim), or without one as a soft point light of emitter radius directEmitter. Plugin-only fills (an
+		// "ambient" plugin made them fills) named like a fire / candle / torch, or within 128 units of a fixture light, are fixtures
+		// (the meshless rules: Snap / Own / Skip).
+		bool directFills = true;
+		float directEmitter = 24.0f;
+		bool pluginFillFixtures = true;
+		// (46x) The window-beam radius in effect (LightCensus::WindowBeamRadius(): 4096 with Wider Window Beam Detection, else 10000).
+		float beamRadius = 10000.0f;
+		// (46x) Skip Lights Behind Portals (interiors with room bounds): a portal-strict light none of whose rooms (or portals) holds the
+		// camera takes no source when roomBoxes is off, or when its rooms' box is off screen; with roomBoxes every portal-strict light with
+		// readable rooms is ranked only at pixels inside its rooms' box (kSourceRoomBox). The camera in no known room: nothing changes.
+		bool portals = true;
+		bool roomBoxes = true;
 	};
 	inline constexpr std::uint32_t kMeshlessOwn = 0, kMeshlessSnap = 1, kMeshlessSkip = 2;
 
@@ -173,6 +215,22 @@ namespace RayTracingPointLights
 		std::uint32_t snapped = 0;       // (46s) meshless lights tagged to a visible fixture's source
 		std::uint32_t meshlessOwn = 0;   // (46s) meshless lights with a source of their own (Own, or Snap with no fixture in range)
 		std::uint32_t meshlessSkipped = 0;  // (46s) meshless lights left without a source (Skip)
+		// (46x) Fill lights and negative lights (at the category rule: past the radius / intensity / distance / area rules).
+		std::uint32_t negative = 0;         // negative lights (never traced)
+		std::uint32_t fillAmbient = 0;      // fill lights left untraced
+		std::uint32_t fillDirectAimed = 0;  // direct fills traced toward their window spot
+		std::uint32_t fillDirectPoint = 0;  // direct fills traced as a soft point light
+		std::uint32_t fillFixture = 0;      // plugin-only fills taken as fixtures
+		std::uint32_t beamsWider = 0;       // window beams by the wider rule only (radius 4096 - 10000)
+		// (46x) Portals (indoors): candidates that are portal-strict with readable rooms; of which none of whose rooms holds the camera;
+		// dropped; ranked only inside their rooms' box; rooms unreadable / not around the light (left as 46w). cameraInRoom: false = the
+		// camera is in none of the rooms seen (portal rules not applied this frame).
+		std::uint32_t portalStrict = 0;
+		std::uint32_t portalAway = 0;
+		std::uint32_t portalDropped = 0;
+		std::uint32_t portalBoxed = 0;
+		std::uint32_t portalBadRooms = 0;
+		bool cameraInRoom = false;
 		float cpuMs = 0.0f;
 	};
 	inline constexpr const char* kRejectNames[8] = { "faded (lodDimmer)", "radius", "intensity", "distance", "outside traced area", "category",
@@ -209,7 +267,12 @@ namespace RayTracingPointLights
 		{
 			history_.clear();
 			reach_.clear();
+			decisions_.clear();
 		}
+		/// (46x) This frame's decision for a light of the 46x classes (Decision | why << 8; 0 = none). Render thread.
+		[[nodiscard]] std::uint16_t DecisionFor(const RE::BSLight* a_light) const;
+		/// (46x) Slots of this frame's sources with their own emitter radius (kSourceEmitter), for the denoiser.
+		[[nodiscard]] std::uint64_t EmitterSlots() const { return emitterSlots_; }
 
 	private:
 		std::vector<MaskEntry> maskEntries_;
@@ -244,9 +307,14 @@ namespace RayTracingPointLights
 			// (46s) Snap: the visible fixture its tag went to last time (kept while in range).
 			const RE::BSLight* anchor = nullptr;
 			std::uint32_t anchorFrame = 0;
+			// (46x) A direct fill's window spot (world position; kept 120 frames while the spot is not in this frame's lights).
+			double aim[3]{};
+			std::uint32_t aimFrame = 0;
 		};
 		std::unordered_map<const RE::BSLight*, History> history_;
 		std::vector<Reach> reach_;  // (46s)
+		std::vector<std::pair<const RE::BSLight*, std::uint16_t>> decisions_;  // (46x) sorted by pointer
+		std::uint64_t emitterSlots_ = 0;                                        // (46x)
 		bool published_ = false;
 		Stats stats_{};
 	};

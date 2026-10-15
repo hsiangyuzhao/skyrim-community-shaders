@@ -1195,6 +1195,11 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointLightsSteady = read("PointLightsSteady", defaults.PointLightsSteady);  // (46s)
 		settings.PointLightsMergeHysteresis = read("PointLightsMergeHysteresis", defaults.PointLightsMergeHysteresis);
 		settings.PointLightsMeshless = std::clamp(read("PointLightsMeshless", defaults.PointLightsMeshless), 0, 2);
+		settings.PointLightsDirectFills = read("PointLightsDirectFills", defaults.PointLightsDirectFills);  // (46x)
+		settings.PointLightsWiderBeams = read("PointLightsWiderBeams", defaults.PointLightsWiderBeams);
+		settings.PointLightsPortals = read("PointLightsPortals", defaults.PointLightsPortals);
+		settings.PointLightsRoomBoxes = read("PointLightsRoomBoxes", defaults.PointLightsRoomBoxes);
+		settings.PointLightsPluginFillFixtures = read("PointLightsPluginFillFixtures", defaults.PointLightsPluginFillFixtures);
 		// (46t) RTAO
 		settings.AODetail = read("AODetail", defaults.AODetail);
 		settings.AODetailStrength = read("AODetailStrength", defaults.AODetailStrength);
@@ -1213,6 +1218,7 @@ void RayTracing::LoadSettings(json& o_json)
 		logger::info("[RayTracing] Denoiser Temporal was removed: Penumbra");
 	settings.Denoiser = ValidDenoiser(settings.Denoiser);
 	settings.SettingsVersion = Settings{}.SettingsVersion;
+	Util::LightCensus::SetWiderWindowBeams(settings.PointLightsWiderBeams);  // (46x) captures follow it from the start
 	settings.QualityLevel = std::clamp(settings.QualityLevel, 0, static_cast<int>(Quality::Count) - 1);
 	settings.CustomBaseRays = std::clamp(settings.CustomBaseRays, 1, 4);
 	settings.CustomExtraRays = std::clamp(settings.CustomExtraRays, 0, 8);
@@ -1274,6 +1280,11 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointLightsSteady"] = settings.PointLightsSteady;  // (46s)
 	o_json["PointLightsMergeHysteresis"] = settings.PointLightsMergeHysteresis;
 	o_json["PointLightsMeshless"] = settings.PointLightsMeshless;
+	o_json["PointLightsDirectFills"] = settings.PointLightsDirectFills;  // (46x)
+	o_json["PointLightsWiderBeams"] = settings.PointLightsWiderBeams;
+	o_json["PointLightsPortals"] = settings.PointLightsPortals;
+	o_json["PointLightsRoomBoxes"] = settings.PointLightsRoomBoxes;
+	o_json["PointLightsPluginFillFixtures"] = settings.PointLightsPluginFillFixtures;
 	o_json["AODetail"] = settings.AODetail;  // (46t)
 	o_json["AODetailStrength"] = settings.AODetailStrength;
 	o_json["AODetailLength"] = settings.AODetailLength;
@@ -2529,6 +2540,13 @@ void RayTracing::PublishCpuSplit()
 		detail.plKept = ps.kept;
 		detail.plChurn = pointThisFrame ? stats.pointChurnPerFrame : -1;
 		detail.plBeamsExcluded = static_cast<std::uint32_t>(excludedBeams.size());
+		if (pointThisFrame) {  // (46x)
+			detail.plFillDirect = static_cast<int>(ps.fillDirectAimed + ps.fillDirectPoint);
+			detail.plFillAmbient = static_cast<int>(ps.fillAmbient);
+			detail.plPortalAway = static_cast<int>(ps.portalAway);
+			detail.plPortalDropped = static_cast<int>(ps.portalDropped);
+			detail.plPortalBoxed = static_cast<int>(ps.portalBoxed);
+		}
 		// (46m) Characters step by step (this frame's Update / CollectDraws), merged BLASes, the split sync.
 		if (activeThisFrame && settings.Characters && cpuLast.characters >= 0.0f) {
 			const auto& ch = characters.GetStats();
@@ -3497,6 +3515,14 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	config.steady = settings.PointLightsSteady;
 	config.mergeHysteresis = settings.PointLightsMergeHysteresis;
 	config.meshless = static_cast<std::uint32_t>(std::clamp(settings.PointLightsMeshless, 0, 2));
+	// (46x) Fill classes, the window-beam rule, portals.
+	config.directFills = settings.PointLightsDirectFills;
+	config.directEmitter = std::min(std::max(settings.PointLightsSize, 0.0f) * 4.0f, 64.0f);
+	config.pluginFillFixtures = settings.PointLightsPluginFillFixtures;
+	Util::LightCensus::SetWiderWindowBeams(settings.PointLightsWiderBeams);
+	config.beamRadius = Util::LightCensus::WindowBeamRadius();
+	config.portals = settings.PointLightsPortals;
+	config.roomBoxes = settings.PointLightsRoomBoxes;
 	double reachPoint[3]{};
 	if (auto* player = RE::PlayerCharacter::GetSingleton()) {
 		const auto p = player->GetPosition();
@@ -3527,6 +3553,8 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	std::memcpy(viewProjF, &viewProj, sizeof(viewProjF));
 	const std::uint32_t scan = pointSelector.Select(config, camera, viewProjF, worldRect, globals::state->frameCount, pointSources.data());
 	lastSlotBeams = pointSelector.SlotBeams();  // (46g) the beam guard reads the counters of these slots a few frames later
+	pointEmitterMask = pointSelector.EmitterSlots();  // (46x)
+	pointEmitterRadius = config.directEmitter;
 	if (scan == 0)
 		return false;
 
@@ -3574,7 +3602,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	c.bounds[3] = pointBeamTan;
 	pointBeamMask = 0;
 	for (std::uint32_t s = 0; s < scan && s < 64; ++s)
-		if (pointSources[s].info[0] & RayTracingPointLights::kSourceBeam)
+		if (pointSources[s].info[0] & (RayTracingPointLights::kSourceBeam | RayTracingPointLights::kSourceAim))  // (46x) aimed direct fills: beam-like rays
 			pointBeamMask |= 1ull << s;
 	if (a_interior) {
 		double lo[3], hi[3];
@@ -3619,6 +3647,12 @@ void RayTracing::FinishPointLights()
 		std::memcpy(&cb.Extra[1], &lo, sizeof(float));
 		std::memcpy(&cb.Extra[2], &hi, sizeof(float));
 		cb.Extra[3] = pointBeamMask ? pointBeamTan : 0.0f;
+	}
+	{
+		// (46x) Direct fills without a window spot: their own (larger) emitter radius sets their penumbra width.
+		cb.Emitter[0] = static_cast<std::uint32_t>(pointEmitterMask);
+		cb.Emitter[1] = static_cast<std::uint32_t>(pointEmitterMask >> 32);
+		std::memcpy(&cb.Emitter[2], &pointEmitterRadius, sizeof(float));
 	}
 	{
 		// (46d) Moving / new sources: their history is dropped in proportion (slot s in byte s % 4 of Motion[s / 4]).
@@ -4946,6 +4980,22 @@ void RayTracing::DrawPointLightPage()
 					ImGui::Text("  Skip: it casts no ray-traced shadow (the old screen-space shadow, if any).");
 				}
 			}
+			// (46x)
+			ImGui::Checkbox("Trace Direct Fill Lights (sun shafts)", &settings.PointLightsDirectFills);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): some invisible \"fill\" lights are really the bright patch of a light shaft on the floor (a sun spot under");
+				ImGui::Text("  a roof opening, e.g. Fort Dawnguard). Those (named sun / shaft / beam / ray, or right under a window spot light; bright");
+				ImGui::Text("  and white) cast ray-traced shadows, aimed at the window light above them like the sun. The tinted ambient / bounce");
+				ImGui::Text("  fills that only brighten a room (Dwemer ruins' teal lights) stay as they are.");
+				ImGui::Text("Off: no fill light casts ray-traced shadows (46w).");
+			}
+			ImGui::Checkbox("Wider Window Beam Detection", &settings.PointLightsWiderBeams);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): Window Shadows Ultimate's window light spots with a range over 4096 units count as window beams (ray traced");
+				ImGui::Text("  with Window Light Beams), not only the ones over 10000; its spots from its own plugins count even when not named \"window\".");
+				ImGui::Text("Off: 46w (e.g. Fort Dawnguard's roof light kept the game's shadow map).");
+			}
+			Util::LightCensus::SetWiderWindowBeams(settings.PointLightsWiderBeams);
 			ImGui::Checkbox("Keep Screen-Space Contact Shadows", &settings.PointLightsKeepSSPLS);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("Off (default): Screen Space Point Light Shadows are skipped for ray-traced lights.");
@@ -4983,6 +5033,14 @@ void RayTracing::DrawPointLightPage()
 				if (auto _tt = Util::HoverTooltipWrapper())
 					ImGui::Text("Indoors many lights overlap; 4 (default) catches nearly all of the light. 2 or 1 = cheaper.");
 			}
+			// (46x)
+			ImGui::Checkbox("Skip Lights Behind Portals", &settings.PointLightsPortals);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): in interiors split into rooms (Dragonsreach, Dwemer ruins; not small houses or inns without room bounds)");
+				ImGui::Text("  a light that only lights its own rooms no longer takes one of a pixel's traced lights outside those rooms, and one");
+				ImGui::Text("  in another room that is entirely off screen is not traced at all. More of the lights you see get ray-traced shadows.");
+				ImGui::Text("Off: 46w.");
+			}
 			ImGui::EndDisabled();
 			ImGui::EndDisabled();
 			ImGui::TreePop();
@@ -4996,7 +5054,24 @@ void RayTracing::DrawPointLightPage()
 				settings.PointLightsBeamGuard = d.PointLightsBeamGuard;
 				settings.PointLightsSkipShadowMaps = d.PointLightsSkipShadowMaps;
 				settings.PointLightsBeamCull = d.PointLightsBeamCull;
+				settings.PointLightsRoomBoxes = d.PointLightsRoomBoxes;  // (46x)
+				settings.PointLightsPluginFillFixtures = d.PointLightsPluginFillFixtures;
 			}
+			// (46x)
+			ImGui::BeginDisabled(!settings.PointLights);
+			ImGui::Checkbox("Plugin-Only Fills Near Fires Are Fixtures", &settings.PointLightsPluginFillFixtures);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): a light counted as \"fill\" only because True Light's ambient plugin edited it, but named like a fire / candle /");
+				ImGui::Text("  torch or within 128 units of a fire, is that fire's light (Meshless Lights Near Fires decides its shadow). Off: 46w.");
+			}
+			ImGui::BeginDisabled(!settings.PointLightsInteriors || !settings.PointLightsPortals);
+			ImGui::Checkbox("Per-Pixel Room Box", &settings.PointLightsRoomBoxes);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("With Skip Lights Behind Portals. On (default): a room-bound light is ranked only at pixels inside its rooms' box; one behind");
+				ImGui::Text("  a portal still casts shadows where its rooms are on screen. Off: every light behind a portal is simply not traced.");
+			}
+			ImGui::EndDisabled();
+			ImGui::EndDisabled();
 			ImGui::BeginDisabled(!settings.PointLights || !settings.PointLightsInteriors);
 			ImGui::Checkbox("Window Beam Guard", &settings.PointLightsBeamGuard);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -5072,6 +5147,23 @@ void RayTracing::DrawPointLightPage()
 				// (46s)
 				ImGui::Text("Steady positions: %u at the rest point, %u averaged; merge kept %u; meshless lights: %u snapped, %u own, %u skipped",
 					ps.steadyParent, ps.steadyAverage, ps.mergeKept, ps.snapped, ps.meshlessOwn, ps.meshlessSkipped);
+				// (46x)
+				ImGui::Text("Fill lights: %u direct traced (%u aimed at a window spot, %u soft point), %u taken as fixtures, %u left untraced; "
+							"negative lights %u; beams by the wider rule %u",
+					ps.fillDirectAimed + ps.fillDirectPoint, ps.fillDirectAimed, ps.fillDirectPoint, ps.fillFixture, ps.fillAmbient, ps.negative, ps.beamsWider);
+				if (Util::IsInterior()) {
+					if (!settings.PointLightsPortals)
+						ImGui::Text("Portals: off");
+					else if (!ps.cameraInRoom)
+						ImGui::Text("Portals: no room bounds around the camera (nothing changed this frame)");
+					else
+						ImGui::Text("Portals: %u room-bound lights, %u behind portals (%u not traced), %u limited to their rooms' box; %u rooms unreadable (left as 46w)",
+							ps.portalStrict, ps.portalAway, ps.portalDropped, ps.portalBoxed, ps.portalBadRooms);
+				}
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Counted among the lights that passed the distance / radius / brightness rules. An F6 census lists each light's class");
+					ImGui::Text("  (rtClass / rtWhy in the file).");
+				}
 				const auto& reach = pointSelector.Reaching();
 				if (!pointThisFrame || reach.empty()) {
 					ImGui::Text("Lights reaching the player: none traced");
@@ -5741,7 +5833,20 @@ std::string RayTracing::DescribeForProfile() const
 	static constexpr const char* kMeshless[3] = { "own", "snap", "skip" };
 	text += std::format(", steady flickering lights {}, merge hysteresis {}, meshless lights near fires {}", settings.PointLightsSteady ? "on" : "off",
 		settings.PointLightsMergeHysteresis ? "on" : "off", kMeshless[std::clamp(settings.PointLightsMeshless, 0, 2)]);
+	// (46x)
+	text += std::format(", direct fill lights {}, wider window beams {}, skip lights behind portals {} (room box {}), plugin-only fills near fires {}",
+		settings.PointLightsDirectFills ? "on" : "off", settings.PointLightsWiderBeams ? "on" : "off", settings.PointLightsPortals ? "on" : "off",
+		settings.PointLightsRoomBoxes ? "on" : "off", settings.PointLightsPluginFillFixtures ? "fixtures" : "fills");
 	return text;
+}
+
+nlohmann::json RayTracing::PointSelectionJson() const
+{
+	const auto& ps = pointSelector.GetStats();
+	return { { "traced", pointThisFrame }, { "sources", ps.sources }, { "candidates", ps.candidates }, { "fillDirectAimed", ps.fillDirectAimed },
+		{ "fillDirectPoint", ps.fillDirectPoint }, { "fillFixture", ps.fillFixture }, { "fillAmbient", ps.fillAmbient }, { "negative", ps.negative },
+		{ "beamsWider", ps.beamsWider }, { "portalCameraInRoom", ps.cameraInRoom }, { "portalStrict", ps.portalStrict }, { "portalAway", ps.portalAway },
+		{ "portalDropped", ps.portalDropped }, { "portalBoxed", ps.portalBoxed }, { "portalBadRooms", ps.portalBadRooms } };
 }
 
 nlohmann::json RayTracing::PointSourcesReachingPlayerJson() const

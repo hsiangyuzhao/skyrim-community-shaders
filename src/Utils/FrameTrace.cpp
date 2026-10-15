@@ -983,6 +983,8 @@ namespace Util::FrameTrace
 				out << "#   generated ones before it are shown; frame generation's own GPU work not included); refresh_hz = display refresh; queue =\n";
 				out << "#   present to scan-out start, VRR assumed: 0 while the shown rate is below the refresh, else half a refresh; pcl_est = the sum.\n";
 				out << "#   -1 = no Reflex report for the row.\n";
+				out << "# (46x) rt_pl_fill_direct / fill_ambient = fill lights traced as direct light / left untraced; rt_pl_portal_away / dropped /\n";
+				out << "#   boxed = room-bound lights behind a portal / of which not traced / ranked only inside their rooms' box (-1 = no point-light trace).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -1038,7 +1040,8 @@ namespace Util::FrameTrace
 					   "rt_sub_on,rt_sub_batches,rt_sub_max_batch_ms,rt_sub_max_lag_ms,rt_sub_max_call_ms,rt_bud_on,rt_bud_ms_per_mtri,rt_bud_tris,"
 					   "rt_bud_static_queued,rt_bud_groups_deferred,rt_bud_groups_kept,snow_shapes_ms,snow_shapes_state,rr_b,rr_c,rr_width,rr_height,"
 					   "vram_by_feature,rtao_filter,rtao_detail_rays,rtao_detail_len,rtao_normal_guided,rtao_alpha_budget,"
-					   "pcl_est_input_ms,pcl_est_input_measured,pcl_est_render_ms,pcl_est_fg_mult,pcl_est_fg_hold_ms,pcl_est_refresh_hz,pcl_est_queue_ms,pcl_est_ms\n";
+					   "pcl_est_input_ms,pcl_est_input_measured,pcl_est_render_ms,pcl_est_fg_mult,pcl_est_fg_hold_ms,pcl_est_refresh_hz,pcl_est_queue_ms,pcl_est_ms,"
+					   "rt_pl_fill_direct,rt_pl_fill_ambient,rt_pl_portal_away,rt_pl_portal_dropped,rt_pl_portal_boxed\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1198,6 +1201,10 @@ namespace Util::FrameTrace
 					if (!extra.empty() && extra.back() == '\n')
 						extra.pop_back();
 					extra += pclColumns(it == a_reflex.end() ? nullptr : &it->second);
+					// (46x) Point-light classes, after pcl_est_ms (the old last column).
+					if (!extra.empty() && extra.back() == '\n')
+						extra.pop_back();
+					extra += std::format(",{},{},{},{},{}\n", r.rt.plFillDirect, r.rt.plFillAmbient, r.rt.plPortalAway, r.rt.plPortalDropped, r.rt.plPortalBoxed);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;

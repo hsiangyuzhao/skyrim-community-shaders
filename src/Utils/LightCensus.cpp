@@ -37,6 +37,16 @@ namespace Util::LightCensus
 			"hearth", "fire", "flame", "lamp", "forge", "smelter", "embers", "cookpot" };
 		constexpr std::string_view kFillWords[] = { "fill", "ambient", "ambi", "bounce" };
 		constexpr std::string_view kWindowWords[] = { "window", "sunbeam", "shaft", "godray", "lightray", "lightbeam" };
+		// (46x) A fill light named like direct light: a sun patch / shaft on the floor (True Light's FarmInteriorSunLight01).
+		constexpr std::string_view kDirectFillWords[] = { "sun", "shaft", "beam", "godray", "lightray" };
+
+		/// (46x) Wider Window Beam Detection (Ray Tracing's switch, set every frame).
+		std::atomic<bool> g_widerBeams{ false };
+
+		float BeamRadiusFor(bool a_wider)
+		{
+			return a_wider ? kWindowBeamRadiusWide : kWindowBeamRadius;
+		}
 
 		// ---- records ---------------------------------------------------------------------------------
 		struct LightRecord
@@ -95,6 +105,7 @@ namespace Util::LightCensus
 			uint64_t pixelHits = 0;
 
 			uint32_t rtTag = 0;  ///< (46s) Ray Tracing's point-light shadow tag this frame (source slot + 1 in the low bits; 0 = none)
+			std::uint16_t rtDecision = 0;  ///< (46x) Ray Tracing's decision for the new light classes (RayTracingPointLights::Decision | why << 8)
 		};
 
 		struct FixtureRef
@@ -526,6 +537,24 @@ namespace Util::LightCensus
 			       a_pluginsLower.find("ambient") != std::string::npos;
 		}
 
+		/// (46x) Window Shadows Ultimate / its Supplement among the (lower-case) plugins.
+		bool IsWsuPlugin(const std::string& a_pluginsLower)
+		{
+			return a_pluginsLower.find("window shadows ultimate") != std::string::npos || a_pluginsLower.find("wsu") != std::string::npos;
+		}
+
+		/// (46x) A LIGH editor ID that names direct light (sun / shaft / beam / ray) and not a bounce / ambient light.
+		bool FillDirectByName(const std::string& a_edid)
+		{
+			const auto lower = Lower(a_edid);
+			if (lower.empty() || lower.find("bounce") != std::string::npos || lower.find("amb") != std::string::npos)
+				return false;
+			if (!FindWord(lower, kDirectFillWords).empty())
+				return true;
+			// "Ray" as a word of its own in the CamelCase editor ID (not the "ray" of "Gray" / "Array").
+			return a_edid.find("Ray") != std::string::npos || lower.starts_with("ray");
+		}
+
 		/// (46a) Case-insensitive "marker" in a model path, without allocating.
 		bool IsMarkerPath(const char* a_path)
 		{
@@ -600,7 +629,8 @@ namespace Util::LightCensus
 			}
 			return it->second ? 2 : 0;
 		}
-		void Classify(LightRecord& r, const std::vector<FixtureRef>& a_fixtures)
+		/// a_wider: (46x) Wider Window Beam Detection (window beams over 4096 units, Window Shadows Ultimate's spots by their plugin).
+		void Classify(LightRecord& r, const std::vector<FixtureRef>& a_fixtures, bool a_wider)
 		{
 			auto because = [&](std::string a_reason) { r.reasons.push_back(std::move(a_reason)); };
 			if (r.readError) {
@@ -647,19 +677,26 @@ namespace Util::LightCensus
 				return;
 			}
 
-			if (auto w = FindWord(idsLower + "/" + chainLower, kWindowWords); !w.empty()) {
+			const bool spotKind = r.kind == "spot" || r.kind == "shadow-spot";
+			const float beamRadius = BeamRadiusFor(a_wider);
+			auto windowWord = FindWord(idsLower + "/" + chainLower, kWindowWords);
+			// (46x) Wider Window Beam Detection: a big spot shadow light of Window Shadows Ultimate is its window beam whatever its name.
+			if (windowWord.empty() && a_wider && r.shadow && spotKind && r.radius > beamRadius &&
+				IsWsuPlugin(Lower(r.lighPlugin + "/" + r.refPlugin + "/" + r.refLastPlugin)))
+				windowWord = "window (by its Window Shadows Ultimate plugin)";
+			if (!windowWord.empty()) {
 				// (46a) Three different lights: the sun beam through the window (Window Shadows Ultimate's
 				// shadowed spot), the glow of a lit pane seen from outside, and the light a window spreads indoors.
-				const bool spot = r.kind == "spot" || r.kind == "shadow-spot";
-				if (spot && r.radius > kWindowBeamRadius) {
+				const bool spot = spotKind;
+				if (spot && r.radius > beamRadius) {
 					r.category = "window-beam";
-					because(std::format("name contains '{}', spot light, radius {:.0f} > {:.0f}", w, r.radius, kWindowBeamRadius));
+					because(std::format("name contains '{}', spot light, radius {:.0f} > {:.0f}", windowWord, r.radius, beamRadius));
 				} else if (r.radius < kWindowGlowRadius) {
 					r.category = "window-glow";
-					because(std::format("name contains '{}', radius {:.0f} < {:.0f}", w, r.radius, kWindowGlowRadius));
+					because(std::format("name contains '{}', radius {:.0f} < {:.0f}", windowWord, r.radius, kWindowGlowRadius));
 				} else {
 					r.category = "window-fill";
-					because(std::format("name contains '{}', radius {:.0f}", w, r.radius));
+					because(std::format("name contains '{}', radius {:.0f}", windowWord, r.radius));
 				}
 				return;
 			}
@@ -771,6 +808,7 @@ namespace Util::LightCensus
 			Category category = Category::Unknown;
 			bool window = false;                 ///< a window light: re-split by the radius on every call
 			bool spot = false;
+			bool wsuSpot = false;                ///< (46x) a spot shadow light of Window Shadows Ultimate not named like a window
 			std::uint32_t lastFrame = 0;
 			Traits traits;                       ///< (46s)
 		};
@@ -793,7 +831,7 @@ namespace Util::LightCensus
 
 		Category SplitWindow(bool a_spot, float a_radius)
 		{
-			if (a_spot && a_radius > kWindowBeamRadius)
+			if (a_spot && a_radius > BeamRadiusFor(g_widerBeams.load(std::memory_order_relaxed)))
 				return Category::WindowBeam;
 			if (a_radius < kWindowGlowRadius)
 				return Category::WindowGlow;
@@ -970,8 +1008,10 @@ namespace Util::LightCensus
 				auto& rt = globals::features::rayTracing;
 				cs["rayTracing"] = { { "loaded", rt.loaded }, { "enabled", rt.settings.Enabled }, { "profile", rt.loaded ? rt.DescribeForProfile() : std::string() } };
 				// (46s) The ray-traced point-light shadow sources whose range covers the player this frame.
-				if (rt.loaded)
+				if (rt.loaded) {
 					cs["rayTracing"]["pointSourcesReachingPlayer"] = rt.PointSourcesReachingPlayerJson();
+					cs["rayTracing"]["pointSelection"] = rt.PointSelectionJson();  // (46x)
+				}
 			}
 			return j;
 		}
@@ -1071,6 +1111,12 @@ namespace Util::LightCensus
 			// (46s) The ray-traced shadow source this light uses (its slot; lights sharing a slot share one shadow).
 			if (r.rtTag & RayTracingPointLights::kTagSourceMask)
 				j["rtSource"] = static_cast<int>((r.rtTag & RayTracingPointLights::kTagSourceMask) - 1);
+			// (46x) The shadow selection's class for fill lights, negative lights, window beams by the wider rule and lights behind
+			// portals (absent = none of these, or the light was left out by an earlier rule: distance, radius, intensity ...).
+			if (const auto d = static_cast<RayTracingPointLights::Decision>(r.rtDecision & 0xFFu); d != RayTracingPointLights::Decision::None) {
+				j["rtClass"] = RayTracingPointLights::DecisionName(d);
+				j["rtWhy"] = RayTracingPointLights::DecisionWhy(d, static_cast<std::uint8_t>(r.rtDecision >> 8));
+			}
 			if (r.emissiveNearby)
 				j["glowingShape"] = r.emissiveShape;
 			if (!r.nearFixture.empty())
@@ -1339,12 +1385,25 @@ namespace Util::LightCensus
 					{ "fill", "placed light without a mesh whose LIGH editor ID says omni / ambient / fill / bounce or that comes from an 'ambient' plugin "
 							  "(never by radius): lights the room, no visible source" },
 					{ "fixture-shadow", "like fill, but shadow-casting: stands in for a fixture's shadow (True Light - Shadows and Ambient)" },
-					{ "window-beam", "window light (name says window / sunbeam / shaft), spot with radius > 10000: the sun beam through a window (Window Shadows Ultimate)" },
+					{ "window-beam", WiderWindowBeams() ?
+										 "window light (name says window / sunbeam / shaft, or a Window Shadows Ultimate spot shadow light), spot with radius > 4096 (46x Wider Window Beam Detection): the sun beam through a window" :
+										 "window light (name says window / sunbeam / shaft), spot with radius > 10000: the sun beam through a window (Window Shadows Ultimate)" },
 					{ "window-glow", "window light with radius < 128: the glow of a lit pane seen from outside" },
 					{ "window-fill", "other window lights: the light a window spreads into a room" },
 					{ "standalone", "placed light without a mesh nearby and not named like a fill light" },
 					{ "mesh-attached", "inside some model (Light Placer or a NIF light) with no fixture evidence" },
 					{ "effect", "no owning reference, or owned by a projectile / explosion / hazard: magic and effects" },
+				};
+				// (46x) The per-light "rtClass" / "rtWhy" fields (Ray Tracing's point-light shadow selection this frame).
+				root["rtClasses"] = {
+					{ "negative", "a negative light (LIGH flag, negative colour or fade): never traced" },
+					{ "fill-ambient", "a fill light that stays untraced (bounce / omni / ambient light, or too dim / tinted for direct light)" },
+					{ "fill-direct-aimed", "a fill light that is the floor patch of a light shaft: traced, its rays aimed at the window spot shadow light above it" },
+					{ "fill-direct-point", "a fill light named like direct light (sun / shaft / beam / ray) with no window spot above: traced as a soft point light" },
+					{ "fill-fixture", "a fill only by its 'ambient' plugin, named like a fire / candle / torch or next to a fixture light: traced as that fixture's" },
+					{ "window-beam-wider", "a window beam only by 46x Wider Window Beam Detection (radius 4096-10000, or a Window Shadows Ultimate spot by its plugin)" },
+					{ "portal-boxed", "portal-strict light with rooms: traced only at pixels inside its rooms' box (Skip Lights Behind Portals)" },
+					{ "portal-dropped", "portal-strict light whose rooms do not hold the camera: no shadow source this frame (Skip Lights Behind Portals)" },
 				};
 				auto& lights = root["lights"];
 				lights = nlohmann::json::array();
@@ -1488,10 +1547,19 @@ namespace Util::LightCensus
 		RE::TESObjectREFR* owner = nullptr;
 		if (!a_light || !ReadIdentity(a_light, &niLight, &owner))
 			return false;
+		// (46x) Window lights re-split by the radius (and the beam rule in effect); Window Shadows Ultimate's other spot shadow lights
+		// are beams over 4096 units with the wider rule. The cached decision is the one without it (46w), so switching it off is exact.
+		const auto categoryOf = [a_radius](const ClassEntry& a_entry) {
+			if (a_entry.window)
+				return SplitWindow(a_entry.spot, a_radius);
+			if (a_entry.wsuSpot && g_widerBeams.load(std::memory_order_relaxed) && a_radius > kWindowBeamRadiusWide)
+				return Category::WindowBeam;
+			return a_entry.category;
+		};
 		if (auto it = g_classCache.find(a_light); it != g_classCache.end() && it->second.niLight == niLight && it->second.owner == owner) {
 			auto& e = it->second;
 			e.lastFrame = a_frame;
-			o_category = e.window ? SplitWindow(e.spot, a_radius) : e.category;
+			o_category = categoryOf(e);
 			if (o_traits)
 				*o_traits = e.traits;
 			return true;
@@ -1514,13 +1582,15 @@ namespace Util::LightCensus
 			r.readError = true;
 		r.radius = a_radius;
 		static const std::vector<FixtureRef> kNoFixtures;
-		Classify(r, kNoFixtures);
+		Classify(r, kNoFixtures, false);  // (46x) the 46w decision; the wider beam rule is applied per call (categoryOf)
 		ClassEntry e;
 		e.niLight = niLight;
 		e.owner = owner;
 		e.category = CategoryFromName(r.category);
 		e.window = e.category == Category::WindowBeam || e.category == Category::WindowGlow || e.category == Category::WindowFill;
 		e.spot = r.kind == "spot" || r.kind == "shadow-spot";
+		const std::string pluginsLower = Lower(r.lighPlugin + "/" + r.refPlugin + "/" + r.refLastPlugin);
+		e.wsuSpot = !r.readError && !e.window && e.spot && r.shadow && IsWsuPlugin(pluginsLower);
 		e.lastFrame = a_frame;
 		// (46s) What the shadow selection needs beyond the category.
 		{
@@ -1541,9 +1611,19 @@ namespace Util::LightCensus
 			const std::size_t n = std::min(name.size(), sizeof(t.label) - 1);
 			std::memcpy(t.label, name.data(), n);
 			t.label[n] = '\0';
+			// (46x) Fill classes: negative lights, fills that only an "ambient" plugin made fills, fixture / direct-light names.
+			t.negative = !r.readError && r.lighId && (r.lighFlags & 0x4u) != 0;
+			t.wsu = !r.readError && IsWsuPlugin(pluginsLower);
+			if (!r.readError && e.category == Category::Fill) {
+				const auto edidLower = Lower(r.lighEdid);
+				const bool edidFill = edidLower.find("omni") != std::string::npos || !FindWord(edidLower, kFillWords).empty();
+				t.fillPluginOnly = r.baseIsLight && lighNoMesh && !edidFill && pluginsLower.find("ambient") != std::string::npos;
+				t.fillFixtureWord = !FindWord(edidLower, kFixtureWords).empty();
+				t.fillDirectName = FillDirectByName(r.lighEdid);
+			}
 		}
 		g_classCache[a_light] = e;
-		o_category = e.window ? SplitWindow(e.spot, a_radius) : e.category;
+		o_category = categoryOf(e);
 		if (o_traits)
 			*o_traits = e.traits;
 		return true;
@@ -1560,6 +1640,10 @@ namespace Util::LightCensus
 
 	std::uint32_t ClassifierCacheSize() { return static_cast<std::uint32_t>(g_classCache.size()); }
 	std::uint64_t ClassifierReads() { return g_classReads; }
+
+	void SetWiderWindowBeams(bool a_on) { g_widerBeams.store(a_on, std::memory_order_relaxed); }
+	bool WiderWindowBeams() { return g_widerBeams.load(std::memory_order_relaxed); }
+	float WindowBeamRadius() { return BeamRadiusFor(WiderWindowBeams()); }
 
 	bool WantsSources()
 	{
@@ -1638,10 +1722,12 @@ namespace Util::LightCensus
 				r.intensityBeforeFade = std::max({ r.color[0], r.color[1], r.color[2] }) * r.fade;
 				r.intensityAfterFade = r.intensityBeforeFade * r.lodDimmer;
 			}
-			Classify(r, fixtures);
+			Classify(r, fixtures, WiderWindowBeams());
 			r.stableId = StableId(r);
-			if (a_light && globals::features::rayTracing.loaded)
-				r.rtTag = globals::features::rayTracing.PointLightTag(a_light);  // (46s)
+			if (a_light && globals::features::rayTracing.loaded) {
+				r.rtTag = globals::features::rayTracing.PointLightTag(a_light);            // (46s)
+				r.rtDecision = globals::features::rayTracing.PointLightDecision(a_light);  // (46x)
+			}
 			c.lights.push_back(std::move(r));
 		};
 		for (std::size_t i = 0; i < a_used.size(); ++i) {

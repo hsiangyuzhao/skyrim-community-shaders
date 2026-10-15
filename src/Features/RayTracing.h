@@ -213,6 +213,17 @@ public:
 		bool PointLightsSteady = true;
 		bool PointLightsMergeHysteresis = true;
 		int PointLightsMeshless = 1;
+		// (46x) Outside the settings macro too; all off = 46w. Trace Direct Fill Lights: a fill light that is direct light (named sun /
+		// shaft / beam / ray, or under a window spot shadow light; bright, near-neutral) is traced, aimed at the window spot above it.
+		// Wider Window Beam Detection: window spots over 4096 units (and Window Shadows Ultimate's spots by their plugin) are beams.
+		// Skip Lights Behind Portals: indoors with room bounds, a portal-strict light is ranked only inside its rooms' box, and one
+		// behind a portal whose rooms are off screen takes no source. A/B: Per-Pixel Room Box (off: every light behind a portal is
+		// dropped), Plugin-Only Fills Near Fires Are Fixtures.
+		bool PointLightsDirectFills = true;
+		bool PointLightsWiderBeams = true;
+		bool PointLightsPortals = true;
+		bool PointLightsRoomBoxes = true;
+		bool PointLightsPluginFillFixtures = true;
 		// (46t) RTAO, outside the settings macro too. Two scales (AODetail): the long ray split at AODetailLength (its far part
 		// counted only where the near part is open) plus near-only rays (AODetailRays near rays per pixel in all, the long ray's near part included), the near visibility filtered at full
 		// resolution and multiplied in with AODetailStrength (AOStrength is then the far / large-scale term's). AONormalGuided: the
@@ -312,6 +323,10 @@ public:
 	/// (46b) Light Limit Fix, for each light it uploads: the ray-traced shadow tag (LightData::rtShadow), 0 unless
 	/// this frame's trace has a shadow source for the light.
 	[[nodiscard]] std::uint32_t PointLightTag(const RE::BSLight* a_light) const { return pointSelector.TagFor(a_light); }
+	/// (46x) Light Census: this frame's 46x class of a light (RayTracingPointLights::Decision | why << 8; 0 = none). Render thread.
+	[[nodiscard]] std::uint16_t PointLightDecision(const RE::BSLight* a_light) const { return pointSelector.DecisionFor(a_light); }
+	/// (46x) Light Census: this frame's point-light selection counts (fill classes, portals).
+	nlohmann::json PointSelectionJson() const;
 	/// (46s) Light Census: this frame's point-light shadow sources whose range covers the player (render thread).
 	nlohmann::json PointSourcesReachingPlayerJson() const;
 
@@ -678,6 +693,8 @@ private:
 		float Params[4];  // emitter radius, this frame's weight in the history, flags (bits), max filter radius (px)
 		float Extra[4];   // K, (46o) window-beam source slots (bits 0-31, 32-63 as uint bits), tan of the beam softness (0 = 46n)
 		std::uint32_t Motion[16];  // (46d) per source slot one byte: history dropped this frame (0 keep .. 255 none), 4 slots per uint
+		// (46x) Source slots with their own emitter radius (bits 0-31, 32-63; direct fills without a window spot), that radius, unused.
+		std::uint32_t Emitter[4];
 	};
 	STATIC_ASSERT_ALIGNAS_16(PointDenoiseCB);
 	RayTracingPointLights::Selector pointSelector;
@@ -690,6 +707,8 @@ private:
 	std::uint32_t pointK = 0;         // K of this frame's trace (0 = none)
 	std::uint64_t pointBeamMask = 0;  // (46o) source slots of this frame's trace that are window beams
 	float pointBeamTan = 0.0f;        // (46o) tan of the window-beam softness this frame (0 = 46n)
+	std::uint64_t pointEmitterMask = 0;  // (46x) source slots with their own emitter radius (direct fills without a window spot)
+	float pointEmitterRadius = 0.0f;     // (46x) ... that radius
 	float pointCpuMs = 0.0f;
 	// Denoiser outputs (also the history, ping-pong): visibility per slot, sources per slot, distance.
 	DenoiseTexture pointVis[2], pointIdx[2], pointDist[2];
