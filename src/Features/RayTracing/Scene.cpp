@@ -279,7 +279,7 @@ namespace RayTracingScene
 			a_backend.ReleaseBlas(handle);
 		a_cell.blas.clear();
 		a_cell.chunkGeometries.clear();
-		a_cell.chunkStart = 0;
+		a_cell.chunkTwoSided.clear();
 		if (a_cell.filterRegistered) {
 			for (const auto& geometry : a_cell.geometries)
 				RayTracingCasterFilter::Remove(geometry.get());
@@ -294,7 +294,10 @@ namespace RayTracingScene
 		a_cell.geometries.clear();
 		a_cell.tracked.clear();
 		a_cell.pending.clear();
-		a_cell.current.reset();
+		for (int side = 0; side < 2; ++side) {  // (46n)
+			a_cell.current[side].reset();
+			a_cell.currentGeometries[side].clear();
+		}
 	}
 
 	void Scene::ReleaseAll(RayTracingRT::Backend& a_backend)
@@ -422,22 +425,26 @@ namespace RayTracingScene
 		return player && player->GetParentCell() == a_cell && player->Is3DLoaded();
 	}
 
-	void Scene::CloseChunk(RayTracingRT::Backend& a_backend, Cell& a_cell)
+	void Scene::CloseChunk(RayTracingRT::Backend& a_backend, Cell& a_cell, int a_side)
 	{
-		if (!a_cell.current || a_cell.current->Triangles() == 0)
+		// (46n) One side's chunk: one-sided shapes (a_side 0) and two-sided ones (1) never share a BLAS. 46g marked a whole chunk
+		// two-sided (triangle-cull-disable) if any shape in it was, which switched the face culling of the window-beam rays off
+		// for the one-sided glass pane Window Shadows Ultimate puts in front of its window mask: every beam was fully blocked.
+		auto& current = a_cell.current[a_side];
+		auto& shapes = a_cell.currentGeometries[a_side];
+		if (!current || current->Triangles() == 0) {
+			current.reset();
+			shapes.clear();
 			return;
-		const auto handle = a_backend.CreateBlas(std::move(a_cell.current));
-		const auto end = static_cast<std::uint32_t>(a_cell.geometries.size());
+		}
+		const auto handle = a_backend.CreateBlas(std::move(current));
 		if (handle != RayTracingRT::kInvalidBlas) {
 			a_cell.blas.push_back(handle);
-			a_cell.chunkGeometries.emplace_back(a_cell.chunkStart, end);
-			bool twoSided = false;  // (46g)
-			for (std::uint32_t g = a_cell.chunkStart; g < end && g < a_cell.geometries.size() && !twoSided; ++g)
-				twoSided = IsTwoSided(a_cell.geometries[g].get());
-			a_cell.chunkTwoSided.push_back(twoSided ? 1 : 0);
+			a_cell.chunkGeometries.push_back(std::move(shapes));
+			a_cell.chunkTwoSided.push_back(a_side == 1 ? 1 : 0);
 		}
-		a_cell.chunkStart = end;
-		a_cell.current.reset();
+		shapes.clear();
+		current.reset();
 	}
 
 	bool Scene::PlaceVertices(RE::BSGeometry* a_shape, const std::uint8_t* a_bytes, std::uint32_t a_count, std::uint32_t a_stride,
@@ -648,15 +655,17 @@ namespace RayTracingScene
 				originY, placed, false))
 			return false;
 
-		if (!a_cell.current)
-			a_cell.current = std::make_unique<RayTracingRT::ChunkGeometry>();
-		auto& chunk = *a_cell.current;
+		const int side = (!a_landscape && IsTwoSided(a_shape)) ? 1 : 0;  // (46n) one-sided and two-sided shapes in separate chunks
+		if (!a_cell.current[side])
+			a_cell.current[side] = std::make_unique<RayTracingRT::ChunkGeometry>();
+		auto& chunk = *a_cell.current[side];
 		const std::uint32_t base = chunk.Vertices();
 		chunk.positions.insert(chunk.positions.end(), placed.begin(), placed.end());
 		chunk.indices.reserve(chunk.indices.size() + mesh.indices.size());
 		for (const auto index : mesh.indices)
 			chunk.indices.push_back(base + index);
 
+		a_cell.currentGeometries[side].push_back(static_cast<std::uint32_t>(a_cell.geometries.size()));
 		a_cell.geometries.emplace_back(a_shape);
 		IndexGeometry(a_shape, true);
 		a_cell.triangles += mesh.triangleCount;
@@ -668,7 +677,7 @@ namespace RayTracingScene
 			++a_cell.shapes;
 
 		if (chunk.Triangles() >= kChunkTriangles && gatherBackend_)
-			CloseChunk(*gatherBackend_, a_cell);
+			CloseChunk(*gatherBackend_, a_cell, side);
 		return true;
 	}
 
@@ -1494,7 +1503,8 @@ namespace RayTracingScene
 		if (a_cell.cursor < a_cell.pending.size() || !a_cell.landDone)
 			return false;
 
-		CloseChunk(a_backend, a_cell);
+		CloseChunk(a_backend, a_cell, 0);
+		CloseChunk(a_backend, a_cell, 1);  // (46n)
 		a_cell.pending.clear();
 		a_cell.pending.shrink_to_fit();
 		a_cell.gathering = false;
@@ -1844,12 +1854,13 @@ namespace RayTracingScene
 					instance.twoSided = i >= cell->chunkTwoSided.size() || cell->chunkTwoSided[i] != 0;  // (46g)
 					if (a_expected && i < cell->chunkGeometries.size()) {
 						// (45f) The box of the live bound spheres of the shapes baked into this chunk.
-						const auto [first, end] = cell->chunkGeometries[i];
 						for (int a = 0; a < 3; ++a) {
 							instance.expectMin[a] = DBL_MAX;
 							instance.expectMax[a] = -DBL_MAX;
 						}
-						for (std::uint32_t g = first; g < end && g < cell->geometries.size(); ++g) {
+						for (const std::uint32_t g : cell->chunkGeometries[i]) {
+							if (g >= cell->geometries.size())
+								continue;
 							const auto& b = cell->geometries[g]->worldBound;
 							if (!std::isfinite(b.radius) || b.radius <= 0.0f)
 								continue;

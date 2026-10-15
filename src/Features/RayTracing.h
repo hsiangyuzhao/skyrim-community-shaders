@@ -554,7 +554,18 @@ private:
 	std::uint64_t beamSamplesSeen = 0;
 	std::array<const RE::BSLight*, 64> lastSlotBeams{};
 	std::uint32_t beamsImplausible = 0;
+	// (46n) One line per interior after its warm-up: how much of each window beam's sampled cone was blocked (with the 46n chunk split
+	// expected well below 100 %). Collected from read-back 60 to 300 frames after "Interior ready".
+	struct BeamShare
+	{
+		std::uint64_t traced = 0, blocked = 0;
+	};
+	std::unordered_map<const RE::BSLight*, BeamShare> beamShares;
+	std::uint32_t beamShareFrom = 0, beamShareUntil = 0;
+	bool beamSharePending = false;
 	void UpdateBeamGuard();
+	/// (46n) Window Beam Culling in effect: "Faces Toward the Room" (1) unless developer mode picks another (debug: they block).
+	[[nodiscard]] int EffectiveBeamCull() const;
 	/// Off, Penumbra, DLSS RR or SIGMA; anything else (the removed Temporal = 1) reads as Penumbra.
 	[[nodiscard]] static int ValidDenoiser(int a_value)
 	{

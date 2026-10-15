@@ -911,6 +911,11 @@ void RayTracing::UpdateBeamGuard()
 			if (!light)
 				continue;
 			const std::uint32_t traced = stats.beamTraced[slot], blocked = stats.beamBlocked[slot];
+			if (beamSharePending && frame - beamShareFrom < 0x80000000u) {  // (46n) the warm-up report
+				auto& share = beamShares[light];
+				share.traced += traced;
+				share.blocked += blocked;
+			}
 			if (traced < 64)
 				continue;  // too little of the cone on screen to judge
 			auto& guard = beamGuards[light];
@@ -943,6 +948,25 @@ void RayTracing::UpdateBeamGuard()
 			++it;
 	}
 	std::sort(excludedBeams.begin(), excludedBeams.end());
+	// (46n) After the warm-up of an interior: the blocked share of every beam that was sampled, once.
+	if (beamSharePending && frame - beamShareUntil < 0x80000000u) {
+		beamSharePending = false;
+		std::vector<std::pair<const RE::BSLight*, BeamShare>> list(beamShares.begin(), beamShares.end());
+		std::sort(list.begin(), list.end(), [](const auto& a_l, const auto& a_r) { return a_l.second.traced > a_r.second.traced; });
+		std::string text;
+		std::uint64_t traced = 0, blocked = 0;
+		for (const auto& [light, share] : list) {
+			traced += share.traced;
+			blocked += share.blocked;
+			if (text.size() < 1200)
+				text += std::format("{}{}: {:.0f} % of {}", text.empty() ? "" : ", ", static_cast<const void*>(light),
+					share.traced ? 100.0 * static_cast<double>(share.blocked) / static_cast<double>(share.traced) : 0.0, share.traced);
+		}
+		logger::info("[RayTracing] Window beams after the warm-up (Window Beam Culling mode {}): {} beams sampled, {:.0f} % of all sampled cone pixels blocked{}{}",
+			EffectiveBeamCull(), list.size(), traced ? 100.0 * static_cast<double>(blocked) / static_cast<double>(traced) : 0.0,
+			text.empty() ? "" : "; per beam: ", text);
+		beamShares.clear();
+	}
 }
 
 bool RayTracing::ClaimScreenSpaceShadows()
@@ -3281,9 +3305,10 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	}
 	if (settings.PointLightsStable)
 		flags |= kPointFlagSticky;  // (46g)
-	if (settings.PointLightsBeamCull == 1)
+	const int beamCull = EffectiveBeamCull();  // (46n)
+	if (beamCull == 1)
 		flags |= kPointFlagBeamCullFront;
-	else if (settings.PointLightsBeamCull == 2)
+	else if (beamCull == 2)
 		flags |= kPointFlagBeamCullBack;
 	c.params[0] = static_cast<float>(scan);
 	c.params[1] = static_cast<float>(frameIndex % 1024);
@@ -3987,11 +4012,19 @@ void RayTracing::RunInteriorFrame()
 		interiorReadyMs = static_cast<float>(static_cast<double>(Qpc() - interiorEntryQpc) * QpcMs());
 		const auto& sc = scene.GetStats();
 		const auto& st = backend.GetStats();
+		std::uint32_t oneSided = 0, twoSided = 0;  // (46n)
+		scene.CountChunkSides(oneSided, twoSided, true);
 		logger::info("[RayTracing] Interior ready {:.0f} ms after entering: {} shapes, {:.2f} M triangles, {} BLAS, {:.0f} MB, capture {:.1f} ms CPU, {} window masks; "
-					 "box {:.0f} x {:.0f} x {:.0f}",
+					 "box {:.0f} x {:.0f} x {:.0f}; cell chunks {} one-sided, {} two-sided (never mixed since 46n)",
 			interiorReadyMs, sc.interiorShapes, static_cast<double>(sc.interiorTriangles) / 1e6, st.blasCount,
 			static_cast<double>(st.blasBytes + st.scratchBytes + st.tlasBytes) / (1024.0 * 1024.0), sc.interiorGatherMs, sc.windowMasks,
-			sc.interiorBounds[3] - sc.interiorBounds[0], sc.interiorBounds[4] - sc.interiorBounds[1], sc.interiorBounds[5] - sc.interiorBounds[2]);
+			sc.interiorBounds[3] - sc.interiorBounds[0], sc.interiorBounds[4] - sc.interiorBounds[1], sc.interiorBounds[5] - sc.interiorBounds[2], oneSided,
+			twoSided);
+		// (46n) The beams' blocked share, read back from 60 to 300 frames from now.
+		beamShares.clear();
+		beamShareFrom = globals::state->frameCount + 60;
+		beamShareUntil = globals::state->frameCount + 300;
+		beamSharePending = true;
 	}
 }
 
@@ -4484,13 +4517,19 @@ void RayTracing::DrawPointLightPage()
 		}
 		// (46g) Beam rays and the room's shell.
 		{
-			const char* cullModes[] = { "None (46f)", "Faces Toward the Room", "Faces Away" };
-			settings.PointLightsBeamCull = std::clamp(settings.PointLightsBeamCull, 0, 2);
-			ImGui::Combo("Window Beam Culling", &settings.PointLightsBeamCull, cullModes, 3);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Which wall faces a window beam's rays ignore. The game draws a beam's shadow map from outside and skips the walls'");
-				ImGui::Text("  back faces, so the beam passes the room's own shell. \"Faces Toward the Room\" (default) does the same for the rays.");
-				ImGui::Text("  If the beam's patch on the floor is still missing, try \"Faces Away\". Sun, point-light and AO rays never cull.");
+			// (46n) "Faces Toward the Room" always; the other two block the beams by design (Window Shadows Ultimate's one-sided glass
+			// pane in front of its window mask): only for debugging, in developer mode.
+			if (globals::state->IsDeveloperMode()) {
+				const char* cullModes[] = { "None (46f, debug: blocks)", "Faces Toward the Room", "Faces Away (debug: blocks)" };
+				settings.PointLightsBeamCull = std::clamp(settings.PointLightsBeamCull, 0, 2);
+				ImGui::Combo("Window Beam Culling (debug)", &settings.PointLightsBeamCull, cullModes, 3);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Which wall faces a window beam's rays ignore. The game draws a beam's shadow map from outside and skips back faces,");
+					ImGui::Text("  so the beam passes the room's shell and Window Shadows Ultimate's one-sided glass pane. \"Faces Toward the Room\" does");
+					ImGui::Text("  the same for the rays. \"None\" and \"Faces Away\" block the beam on that pane by design (debug only).");
+				}
+			} else {
+				ImGui::TextDisabled("Window Beam Culling: Faces Toward the Room (as the game's beam shadow maps)");
 			}
 			ImGui::Checkbox("Window Beam Guard", &settings.PointLightsBeamGuard);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -5029,7 +5068,7 @@ std::string RayTracing::DescribeForProfile() const
 	// (46g)
 	static constexpr const char* kBeamCull[] = { "none", "faces toward the room", "faces away" };
 	text += std::format(", stable light selection {}, window beam culling {}, beam guard {}", settings.PointLightsStable ? "on" : "off",
-		kBeamCull[std::clamp(settings.PointLightsBeamCull, 0, 2)], settings.PointLightsBeamGuard ? "on" : "off");
+		kBeamCull[EffectiveBeamCull()], settings.PointLightsBeamGuard ? "on" : "off");
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
 	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split" };
@@ -5122,4 +5161,10 @@ nlohmann::json RayTracing::DescribeJson() const
 		{ "interiors", settings.AOInteriors }, { "mode_interior", settings.AOModeInterior }, { "interior_wanted", AOInteriorWanted() },
 		{ "indoors_this_frame", aoInteriorThisFrame }, { "fade_in", aoRamp } };  // (46h)
 	return j;
+}
+
+int RayTracing::EffectiveBeamCull() const
+{
+	// (46n) The other modes block Window Shadows Ultimate's beams on its one-sided glass pane by design: debug only.
+	return globals::state && globals::state->IsDeveloperMode() ? std::clamp(settings.PointLightsBeamCull, 0, 2) : 1;
 }

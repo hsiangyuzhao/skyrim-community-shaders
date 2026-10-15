@@ -356,6 +356,17 @@ namespace RayTracingScene
 		[[nodiscard]] const LoadGateStats& GetLoadGateStats() const { return gateStats_; }
 		/// (46k) The point (world xy) lies inside a captured cell's square (exteriors) / the captured interior's box.
 		[[nodiscard]] bool Covers(float a_x, float a_y) const;
+		/// (46n) Cell chunks (BLAS) of the captured scene: one-sided / two-sided (they are never mixed); a_interiorOnly: interior captures only.
+		void CountChunkSides(std::uint32_t& o_oneSided, std::uint32_t& o_twoSided, bool a_interiorOnly) const
+		{
+			o_oneSided = o_twoSided = 0;
+			for (const auto& cell : cells_) {
+				if (a_interiorOnly && !cell->interior)
+					continue;
+				for (const auto twoSided : cell->chunkTwoSided)
+					++(twoSided ? o_twoSided : o_oneSided);
+			}
+		}
 
 		/// (46c) Interiors: whether the player's interior cell may be captured (Ray Tracing's point lights indoors).
 		/// Off: Update drops an interior capture (and never starts one), as before 46c.
@@ -451,12 +462,14 @@ namespace RayTracingScene
 			std::vector<RE::NiPointer<RE::TESObjectREFR>> pending;
 			std::vector<TrackedRef> tracked;
 			std::vector<RE::NiPointer<RE::BSGeometry>> geometries;
-			std::unique_ptr<RayTracingRT::ChunkGeometry> current;
+			// (46n) Chunks being filled: [0] one-sided shapes (and landscape), [1] two-sided shapes. A BLAS never mixes them, so
+			// a one-sided window pane (Window Shadows Ultimate) keeps its face culling for the window-beam rays.
+			std::unique_ptr<RayTracingRT::ChunkGeometry> current[2];
+			std::vector<std::uint32_t> currentGeometries[2];  // indices into `geometries` of the shapes in current[side]
 			std::vector<RayTracingRT::BlasHandle> blas;
-			// (45f) Per BLAS: the range of `geometries` it was made from (for the self-check).
-			std::vector<std::pair<std::uint32_t, std::uint32_t>> chunkGeometries;
-			std::vector<std::uint8_t> chunkTwoSided;  // (46g) per BLAS: a two-sided shape is in it (keeps triangle-cull-disable)
-			std::uint32_t chunkStart = 0;  // first geometry of the chunk being filled
+			// (45f) Per BLAS: the shapes (indices into `geometries`) it was made from (for the self-check).
+			std::vector<std::vector<std::uint32_t>> chunkGeometries;
+			std::vector<std::uint8_t> chunkTwoSided;  // (46g) per BLAS: two-sided shapes (keeps triangle-cull-disable); (46n) never mixed
 			// (45j) Resumable capture: shapes of pending[cursor] already taken, and its 3D then.
 			std::uint32_t shapeSkip = 0;
 			const RE::NiAVObject* resumeRoot = nullptr;
@@ -523,7 +536,7 @@ namespace RayTracingScene
 		bool PlaceVertices(RE::BSGeometry* a_shape, const std::uint8_t* a_bytes, std::uint32_t a_count, std::uint32_t a_stride,
 			std::uint32_t a_positionOffset, bool a_fullPrecision, double a_originX, double a_originY, std::vector<float>& o_positions,
 			bool a_local);
-		void CloseChunk(RayTracingRT::Backend& a_backend, Cell& a_cell);
+		void CloseChunk(RayTracingRT::Backend& a_backend, Cell& a_cell, int a_side);
 
 		/// The engine's CPU copy of a shape's mesh, read and validated.
 		struct RawMesh
