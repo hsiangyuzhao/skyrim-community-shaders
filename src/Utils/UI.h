@@ -287,6 +287,15 @@ namespace Util
 	bool DrawCategoryHeader(const char* categoryName, bool& isExpanded, int categoryCount);
 
 	/**
+	 * A collapsed-by-default tree node for diagnostic / A-B test switches: "Diagnostics / A-B switches
+	 * (leave at defaults)", a short note and a "Reset these to defaults" button.
+	 * @param a_title What the switches are about (shown in the label, also the ID), or nullptr for a page's only group.
+	 * @param o_reset Set to true on the frame the reset button was pressed (the caller resets its switches).
+	 * @return true while the node is open; the caller then draws its switches and calls ImGui::TreePop().
+	 */
+	bool BeginABSwitchGroup(const char* a_title, bool& o_reset);
+
+	/**
 	 * Draws a custom styled section header with lines extending from both sides
 	 * @param sectionName The name of the section to display
 	 * @param useWhiteText Whether to use white text (for differentiation)

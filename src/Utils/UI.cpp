@@ -196,7 +196,7 @@ namespace Util
 		logger::info("InitializeMenuIcons: Loading icons from base path: {}", basePath);
 
 		// Initialize all texture pointers to nullptr for safe cleanup
-		std::array<ID3D11ShaderResourceView**, 16> texturePointers = {
+		std::array<ID3D11ShaderResourceView**, 17> texturePointers = {
 			&menu->uiIcons.saveSettings.texture,
 			&menu->uiIcons.loadSettings.texture,
 			&menu->uiIcons.clearCache.texture,
@@ -212,7 +212,8 @@ namespace Util
 			&menu->uiIcons.water.texture,
 			&menu->uiIcons.debug.texture,
 			&menu->uiIcons.materials.texture,
-			&menu->uiIcons.postProcessing.texture
+			&menu->uiIcons.postProcessing.texture,
+			&menu->uiIcons.rayTracing.texture
 		};
 
 		// Safely release existing textures
@@ -270,7 +271,8 @@ namespace Util
 			{ "water.png", &menu->uiIcons.water.texture, menu->uiIcons.water.size },
 			{ "debug.png", &menu->uiIcons.debug.texture, menu->uiIcons.debug.size },
 			{ "materials.png", &menu->uiIcons.materials.texture, menu->uiIcons.materials.size },
-			{ "post-processing.png", &menu->uiIcons.postProcessing.texture, menu->uiIcons.postProcessing.size }
+			{ "post-processing.png", &menu->uiIcons.postProcessing.texture, menu->uiIcons.postProcessing.size },
+			{ "ray-tracing.png", &menu->uiIcons.rayTracing.texture, menu->uiIcons.rayTracing.size }
 		};
 
 		for (const auto& icon : categoryIcons) {
@@ -278,7 +280,7 @@ namespace Util
 			loadIcon(path, icon.texture, icon.size);
 		}
 
-		logger::info("InitializeMenuIcons: Loaded {}/16 icons successfully", iconsLoaded);
+		logger::info("InitializeMenuIcons: Loaded {}/17 icons successfully", iconsLoaded);
 
 		return anyIconLoaded;
 	}
@@ -428,6 +430,8 @@ namespace Util
 			categoryIcon = menu.materials.texture;
 		} else if (strcmp(categoryName, "Post-Processing") == 0) {
 			categoryIcon = menu.postProcessing.texture;
+		} else if (strcmp(categoryName, "Ray Tracing") == 0) {
+			categoryIcon = menu.rayTracing.texture;
 		}
 
 		// Add categoryCount to categoryName
@@ -522,6 +526,24 @@ namespace Util
 		// Move cursor to next line
 		ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + textSize.y + 8.0f));
 		return clicked;
+	}
+
+	bool BeginABSwitchGroup(const char* a_title, bool& o_reset)
+	{
+		o_reset = false;
+		const std::string strId = std::string("##abgroup_") + (a_title ? a_title : "");
+		const bool open = a_title ? ImGui::TreeNodeEx(strId.c_str(), ImGuiTreeNodeFlags_None, "Diagnostics / A-B switches: %s (leave at defaults)", a_title) :
+		                            ImGui::TreeNodeEx(strId.c_str(), ImGuiTreeNodeFlags_None, "Diagnostics / A-B switches (leave at defaults)");
+		if (auto _tt = HoverTooltipWrapper())
+			ImGui::TextUnformatted("Switches kept for testing and comparisons. Their defaults are the tested settings: leave them there.");
+		if (!open)
+			return false;
+		ImGui::PushStyleColor(ImGuiCol_Text, Util::Colors::GetWarning());
+		ImGui::TextUnformatted("For testing only: leave these at their defaults.");
+		ImGui::PopStyleColor();
+		ImGui::SameLine();
+		o_reset = ImGui::SmallButton("Reset these to defaults");
+		return true;
 	}
 
 	bool DrawSectionHeader(const char* sectionName, bool useWhiteText, bool isCollapsible, bool* isExpanded)

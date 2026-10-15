@@ -4346,12 +4346,26 @@ void RayTracing::WritePointMask(bool a_traced)
 // Page
 // ---------------------------------------------------------------------------------------------
 
+namespace
+{
+	/// Red wrapped line: an automatic switch-off or a failure, with its reason.
+	void RtErrorLine(const char* a_what, const std::string& a_reason)
+	{
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
+		ImGui::TextWrapped("%s: %s", a_what, a_reason.c_str());
+		ImGui::PopStyleColor();
+	}
+}
+
 void RayTracing::DrawSettings()
 {
-	// (46g) The "Ray Tracing" entry: the master switch, the status and the diagnostics. Sun Shadows, Point Light Shadows and
-	// Ambient Occlusion have their own entries in the Ray Tracing category (each shows the switch and the status on top).
+	// (46r) The "Ray Tracing" entry: the master switch and status, a one-line summary, Advanced (loading screens), the A/B
+	// switches and the diagnostics. Sun Shadows, Point Light Shadows and Ambient Occlusion have their own entries in the
+	// Ray Tracing category (each shows the switch and the status on top).
+	ImGui::PushID("rtMainPage");  // tree-node open states of its own (other pages also have Advanced / Diagnostics)
 	DrawMasterHeader();
 	DrawDiagnostics();
+	ImGui::PopID();
 }
 
 void RayTracing::DrawMasterHeader()
@@ -4414,9 +4428,10 @@ void RayTracing::DrawMasterHeader()
 
 void RayTracing::DrawSunPage()
 {
+	ImGui::PushID("rtSunPage");
 	DrawMasterHeader();
 	if (ImGui::TreeNodeEx("Sun Shadows", ImGuiTreeNodeFlags_DefaultOpen)) {
-		// (45l) Five tiers + Custom; picking Custom starts from the tier that was selected.
+		// Five tiers + Custom; picking Custom starts from the tier that was selected.
 		settings.QualityLevel = std::clamp(settings.QualityLevel, 0, static_cast<int>(Quality::Count) - 1);
 		{
 			const int before = settings.QualityLevel;
@@ -4431,13 +4446,13 @@ void RayTracing::DrawSunPage()
 				ImGui::Text("Custom: the values under Custom Quality below (started from the tier you had picked).");
 		}
 		if (settings.QualityLevel == static_cast<int>(Quality::Custom) && ImGui::TreeNodeEx("Custom Quality", ImGuiTreeNodeFlags_DefaultOpen)) {
+			ImGui::SliderFloat("Sun Softness", &settings.CustomSunCone, 0.1f, 2.0f, "%.2f deg");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("How big the sun looks to the shadows: 0.27 = the real sun (sharp edges), larger = softer, wider shadow edges.");
 			ImGui::SliderInt("Rays per Pixel", &settings.CustomBaseRays, 1, 4);
 			ImGui::SliderInt("Extra Rays at Shadow Edges", &settings.CustomExtraRays, 0, 8);
 			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Adaptive rays: only where a shadow edge is. 0 = none.");
-			ImGui::SliderFloat("Sun Softness", &settings.CustomSunCone, 0.1f, 2.0f, "%.2f deg");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Half angle of the sun disc the rays aim at: 0.27 = the real sun (sharp), larger = softer, wider shadow edges.");
+				ImGui::Text("Extra rays only where a shadow edge is (cleaner soft edges). 0 = none.");
 			ImGui::Combo("Trace Resolution", &settings.CustomTraceResolution, kPatternNames, 3);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("Full: every pixel traced every frame. Checkerboard: half of them, alternating each frame. Half: one pixel of each 2x2, rotating.");
@@ -4453,10 +4468,8 @@ void RayTracing::DrawSunPage()
 			ImGui::SliderFloat("Far Blur Scale", &settings.CustomFarDenoiseScale, 0.0f, 1.0f, "%.2f");
 			const char* npcModes[] = { "Full", "Reduced" };
 			ImGui::Combo("Other Characters", &settings.CustomNpcQuality, npcModes, 2);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
+			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("The player always gets full quality. Reduced: other characters get no extra edge rays.");
-				ImGui::Text("  They are re-posed every frame like the player.");
-			}
 			ImGui::SliderFloat("Denoiser Radius", &settings.CustomDenoiseRadius, 2.0f, 32.0f, "%.0f px");
 			ImGui::SliderInt("Denoiser Taps per Side", &settings.CustomDenoiseTaps, 1, 8);
 			ImGui::Checkbox("Denoiser at Half Resolution", &settings.CustomDenoiseHalf);
@@ -4464,72 +4477,6 @@ void RayTracing::DrawSunPage()
 			ImGui::SliderFloat("History Clamp", &settings.CustomDenoiseClamp, 0.5f, 4.0f, "%.2f sigma");
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("How far the history may differ from this frame's neighbourhood: smaller = less ghosting, more grain.");
-			ImGui::TreePop();
-		}
-
-		// (45j) Advanced: per kind of object, ray traced or the shadow map + screen-space shadows.
-		if (ImGui::TreeNodeEx("Advanced")) {
-			ImGui::TextWrapped("What the ray tracer takes over, per kind of object. \"Shadow map\" = the game's own shadows and Screen Space "
-							   "Shadows, exactly as with Ray Tracing off. Changing a row re-captures the scene over the next frames.");
-			const char* twoModes[] = { "Shadow map", "Ray traced" };
-			auto row = [&](const char* a_label, bool& a_value, const char* a_tip1, const char* a_tip2) {
-				int value = a_value ? 1 : 0;
-				if (ImGui::Combo(a_label, &value, twoModes, 2))
-					a_value = value == 1;
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("%s", a_tip1);
-					if (a_tip2)
-						ImGui::Text("%s", a_tip2);
-				}
-			};
-			row("Buildings", settings.Buildings, "Statics, furniture, containers, rocks, walls (default: Ray traced).",
-				"Also big one-sided shapes whose cut-out only trims their edges (roof tiles, plank ends), taken as solid.");
-			row("Objects", settings.Objects, "Doors, activators, movable objects, lights and loose items (default: Ray traced).", nullptr);
-			row("Trees", settings.Trees, "Trunks and branches of trees and plants (default: Shadow map).",
-				"Their leaves are Foliage.");
-			{
-				const char* foliageModes[] = { "Shadow map", "Ray traced", "Both" };
-				settings.Foliage = std::clamp(settings.Foliage, 0, 2);
-				ImGui::Combo("Foliage", &settings.Foliage, foliageModes, 3);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Leaves, bushes and plants with a cut-out (default: Shadow map).");
-					ImGui::Text("  Shadow map: the leaves keep the game's shadows and their screen-space contact shadows (they sway with the wind).");
-					ImGui::Text("  Ray traced: traced with their cut-out instead (sharper, but they do not sway in the shadow).");
-					ImGui::Text("  Both: traced AND kept in the shadow map; the darker of both wins (fullest shadow).");
-					ImGui::Text("  Ray traced / Both: cut-outs are read from 256x256 copies of the textures.");
-				}
-			}
-			row("Cut-outs", settings.Cutouts, "Fences, grilles, banners and other non-plant cut-outs (default: Shadow map).",
-				"Ray traced: traced with their cut-out (the holes stay lit).");
-			row("Characters", settings.Characters, "The player and nearby NPCs and creatures: body, clothes, armour, weapons (default: Ray traced).",
-				"Up to 16 characters within 40 m inside the ray-traced area, posed every frame.");
-			{
-				ImGui::Indent();
-				if (!settings.Characters)
-					ImGui::BeginDisabled();
-				row("Physics parts", settings.PhysicsParts, "Capes, skirts and other HDT-SMP / HDT-PE parts, not hair (default: Ray traced).", nullptr);
-				row("Hair", settings.Hair, "Hair and wigs (default: Shadow map: the hair shader's own shadowing looks better than solid cards).",
-					"Recognised by the hair tint material, or 'hair' in the shape or texture name.");
-				ImGui::Checkbox("Player in first person", &settings.FirstPersonPlayer);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Off (default): in first person the player keeps the shadow-map shadow.");
-					ImGui::Text("  Camera mods hide or fold the third-person arms outside the shadow pass (weapons drawn), so a traced");
-					ImGui::Text("  player shadow lost its arms. On: the player is ray traced in first person too.");
-				}
-				if (!settings.Characters)
-					ImGui::EndDisabled();
-				ImGui::Unindent();
-			}
-			ImGui::Separator();
-			ImGui::SliderFloat("RT Caster Contact Length", &settings.RtContactScale, 0.0f, 32.0f, "%.1f x ray offset");
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Screen Space Shadows inside the ray-traced area: everything the ray tracer does not see (grass, distant trees,");
-				ImGui::Text("  shadow-map kinds) keeps its small contact shadows; ray-traced objects only fill the few units right at their base");
-				ImGui::Text("  that the ray tracer cannot resolve.");
-				ImGui::Text("This sets how far (along the sun ray) a ray-traced object may still cast a screen-space contact shadow, in multiples");
-				ImGui::Text("  of the ray tracer's start offset (2 units + 0.15 %% of the distance). Default 8 = about 16 units near the camera.");
-				ImGui::Text("  0 = ray-traced objects cast no screen-space shadow at all. Larger = softer bases, but thin posts get fatter again.");
-			}
 			ImGui::TreePop();
 		}
 
@@ -4548,13 +4495,13 @@ void RayTracing::DrawSunPage()
 				OnDenoiserPicked();
 			}
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("How the grainy soft edges of the traced shadows are cleaned up (cost: F7 trace columns rt_*_gpu_ms).");
+				ImGui::Text("How the grainy soft edges of the traced shadows are cleaned up.");
 				ImGui::Text("  Off: only a small blur.");
 				ImGui::Text("  Penumbra (default): blurs each soft edge as wide as it really is (wide under tall trees, none at");
 				ImGui::Text("    contact shadows), then blends the last ~12 frames; extra rays only at shadow edges.");
-				ImGui::Text("  DLSS RR: no cleanup of ours; fresh noise every frame for DLSS Ray Reconstruction to clean up.");
+				ImGui::Text("  DLSS RR: no cleanup of ours; DLSS Ray Reconstruction cleans up the raw noise.");
 				ImGui::Text("    Picking it switches Ray Reconstruction on in Upscaling; picking any other one switches it off there.");
-				ImGui::Text("    While Ray Reconstruction is on in Upscaling, the shadows always take this route (RR cleans only raw noise).");
+				ImGui::Text("    While Ray Reconstruction is on in Upscaling, the shadows always take this route.");
 				ImGui::Text("  NRD SIGMA: NVIDIA's shadow denoiser (one ray per pixel, its own blur and history).");
 			}
 			auto& upscaling = globals::features::upscaling;
@@ -4584,235 +4531,300 @@ void RayTracing::DrawSunPage()
 		}
 		if (!typedUavLoadR8)
 			ImGui::TextDisabled("This GPU cannot rewrite Screen Space Shadows; they are kept as with Ray Tracing off.");
-		if (!alphaOffReason.empty()) {
-			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
-			ImGui::TextWrapped("Ray-traced foliage / cut-outs were switched off automatically: %s", alphaOffReason.c_str());
-			ImGui::PopStyleColor();
-		}
-		if (!charactersOffReason.empty()) {
-			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
-			ImGui::TextWrapped("Characters was switched off automatically: %s", charactersOffReason.c_str());
-			ImGui::PopStyleColor();
+		if (!alphaOffReason.empty())
+			RtErrorLine("Ray-traced foliage / cut-outs were switched off automatically", alphaOffReason);
+		if (!charactersOffReason.empty())
+			RtErrorLine("Characters was switched off automatically", charactersOffReason);
+
+		// Advanced: per kind of object, ray traced or the shadow map + screen-space shadows.
+		if (ImGui::TreeNodeEx("Advanced")) {
+			ImGui::TextWrapped("What the ray tracer takes over, per kind of object. \"Shadow map\" = the game's own shadows and Screen Space "
+							   "Shadows, exactly as with Ray Tracing off. Changing a row re-captures the scene over the next frames.");
+			const char* twoModes[] = { "Shadow map", "Ray traced" };
+			auto row = [&](const char* a_label, bool& a_value, const char* a_tip1, const char* a_tip2) {
+				int value = a_value ? 1 : 0;
+				if (ImGui::Combo(a_label, &value, twoModes, 2))
+					a_value = value == 1;
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("%s", a_tip1);
+					if (a_tip2)
+						ImGui::Text("%s", a_tip2);
+				}
+			};
+			row("Buildings", settings.Buildings, "Statics, furniture, containers, rocks, walls (default: Ray traced).",
+				"Also big one-sided shapes whose cut-out only trims their edges (roof tiles, plank ends), taken as solid.");
+			row("Objects", settings.Objects, "Doors, activators, movable objects, lights and loose items (default: Ray traced).", nullptr);
+			row("Trees", settings.Trees, "Trunks and branches of trees and plants (default: Shadow map).",
+				"Their leaves are Foliage.");
+			{
+				const char* foliageModes[] = { "Shadow map", "Ray traced", "Both" };
+				settings.Foliage = std::clamp(settings.Foliage, 0, 2);
+				ImGui::Combo("Foliage", &settings.Foliage, foliageModes, 3);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Leaves, bushes and plants with a cut-out (default: Shadow map).");
+					ImGui::Text("  Shadow map: the leaves keep the game's shadows and their screen-space contact shadows (they sway with the wind).");
+					ImGui::Text("  Ray traced: traced with their cut-out instead (sharper, but they do not sway in the shadow).");
+					ImGui::Text("  Both: traced AND kept in the shadow map; the darker of both wins (fullest shadow).");
+				}
+			}
+			row("Cut-outs", settings.Cutouts, "Fences, grilles, banners and other non-plant cut-outs (default: Shadow map).",
+				"Ray traced: traced with their cut-out (the holes stay lit).");
+			row("Characters", settings.Characters, "The player and nearby NPCs and creatures: body, clothes, armour, weapons (default: Ray traced).",
+				"Up to 16 characters within 40 m inside the ray-traced area, posed every frame.");
+			{
+				ImGui::Indent();
+				ImGui::BeginDisabled(!settings.Characters);
+				row("Physics parts", settings.PhysicsParts, "Capes, skirts and other HDT-SMP / HDT-PE parts, not hair (default: Ray traced).", nullptr);
+				row("Hair", settings.Hair, "Hair and wigs (default: Shadow map: the hair shader's own shadowing looks better than solid cards).", nullptr);
+				ImGui::Checkbox("Player in first person", &settings.FirstPersonPlayer);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Off (default): in first person the player keeps the shadow-map shadow (camera mods can hide the arms");
+					ImGui::Text("  from a traced shadow). On: the player is ray traced in first person too.");
+				}
+				ImGui::EndDisabled();
+				ImGui::Unindent();
+			}
+			ImGui::Separator();
+			ImGui::SliderFloat("RT Caster Contact Length", &settings.RtContactScale, 0.0f, 32.0f, "%.1f x ray offset");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("How far (along the sun ray) a ray-traced object may still cast a small screen-space contact shadow at its base,");
+				ImGui::Text("  where the ray tracer cannot resolve it. Default 8 = about 16 units near the camera. 0 = none.");
+				ImGui::Text("  Larger = softer bases, but thin posts get fatter. Everything the ray tracer does not see keeps its contact shadows.");
+			}
+			ImGui::TreePop();
 		}
 		ImGui::TreePop();
 	}
+	ImGui::PopID();
 }
 
 void RayTracing::DrawPointLightPage()
 {
+	ImGui::PushID("rtPointPage");
 	DrawMasterHeader();
-	// (46b) Point-light shadows.
 	if (ImGui::TreeNodeEx("Point Lights", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Ray-Traced Point-Light Shadows", &settings.PointLights);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Braziers, campfires, torches, candles, lanterns and the like cast ray-traced shadows (outdoors inside the traced area, and indoors).");
-			ImGui::Text("  Window fill / glow lights and fill lights are left as they are; the player's and spell lights have switches below.");
-			ImGui::Text("  For those lights Screen Space Point Light Shadows are replaced (where a pixel has its ray-traced result).");
+			ImGui::Text("  Window fill / glow lights and fill lights are left as they are.");
 			ImGui::Text("Off: point lights exactly as before. Needs Ray Tracing on.");
 		}
-		if (!settings.PointLights)
-			ImGui::BeginDisabled();
-		{
-			static constexpr int kKs[3] = { 1, 2, 4 };
-			const char* kNames[3] = { "1", "2", "4" };
-			int index = settings.PointLightsPerPixel >= 4 ? 2 : (settings.PointLightsPerPixel >= 2 ? 1 : 0);
-			if (ImGui::Combo("Lights per Pixel", &index, kNames, 3))
-				settings.PointLightsPerPixel = kKs[std::clamp(index, 0, 2)];
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("How many of the lights that light a pixel most are traced there (one ray each). Default 2.");
-				ImGui::Text("  Weaker lights at that pixel keep their old shadows. More = slower.");
-			}
-		}
-		ImGui::SliderInt("Max Lights", &settings.PointLightsMaxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources));
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Shadow-casting lights per frame at most (the ones that matter most on screen). Lights within 64 units count as one.");
-		ImGui::SliderFloat("Max Distance", &settings.PointLightsDistance, 512.0f, 8192.0f, "%.0f units");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Lights farther from the camera keep their old shadows. 70 units = 1 m. Default 4000 (about 57 m).");
-		ImGui::Checkbox("Native Shadow Lights Use RT Shadows", &settings.PointLightsNative);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("The game's own shadow-casting lights (fireplaces, some campfires): their ray-traced shadow replaces the game's");
-			ImGui::Text("  shadow map in the lighting (default on). Off: they keep the game's shadow map.");
-			ImGui::Text("  Outdoors spot lights keep the game's shadow map; indoors their cone is taken from the game.");
-		}
-		ImGui::Checkbox("Stable Light Selection", &settings.PointLightsStable);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): flickering candles and lights whose range changes do not make an area jump between the ray-traced");
-			ImGui::Text("  shadow and the old one: their brightness and range are smoothed for the choice, a light keeps its place a little");
-			ImGui::Text("  longer, and each pixel prefers the lights it traced last frame. Off: the 46f choice, frame by frame.");
-		}
-		ImGui::Checkbox("Keep Screen-Space Contact Shadows", &settings.PointLightsKeepSSPLS);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Off (default): Screen Space Point Light Shadows are skipped for ray-traced lights.");
-			ImGui::Text("  On: they stay on as well; the darker of both counts (small contact shadows of grass and leaves the ray tracer does not see).");
-		}
+		ImGui::BeginDisabled(!settings.PointLights);
 		ImGui::SliderFloat("Light Size", &settings.PointLightsSize, 0.0f, 32.0f, "%.1f units");
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Radius of the flame the rays aim at: larger = softer shadow edges (a little grainier before the clean-up). 0 = hard edges.");
-		ImGui::SliderFloat("Fixture Clearance", &settings.PointLightsClearance, 0.0f, 128.0f, "%.0f units");
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Rays stop this far before the light, so the lamp, brazier bowl or torch holding it does not shadow its own light.");
-			ImGui::Text("  Too small: a dark ring or a black patch around a lamp. Too large: objects right next to a light cast nothing.");
-		}
-		// (46d)
 		ImGui::Checkbox("Player Lights Cast RT Shadows", &settings.PointLightsPlayer);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("On (default): the torch in your hand, Quick Light's light and light spells on you cast ray-traced shadows.");
-			ImGui::Text("  Your own body never blocks them (else your arm would shadow everything). Off: as before (old shadows).");
+			ImGui::Text("  Off: they keep the old shadows.");
 		}
-		ImGui::Checkbox("Carrier Casts Shadows from Its Own Light", &settings.CarrierShadows);  // (46q)
+		ImGui::Checkbox("Carrier Casts Shadows from Its Own Light", &settings.CarrierShadows);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("On (default): someone holding a torch (an NPC, or you in third person) casts a body shadow from it on the ground and");
-			ImGui::Text("  walls behind them; only the part of the body near the flame (the hand and forearm, Carrier Clearance) is ignored.");
-			ImGui::Text("  First person keeps the old rule (your body never blocks your own light). Off: as 46p (the carrier never blocks it).");
+			ImGui::Text("  walls behind them; only the hand and forearm near the flame are ignored (Advanced > Carrier Clearance).");
+			ImGui::Text("  In first person your body never blocks your own light. Off: the carrier never blocks its own light.");
 		}
-		if (settings.CarrierShadows) {
-			ImGui::SliderFloat("Carrier Clearance (units)", &settings.CarrierClearance, 0.0f, 64.0f, "%.0f");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Body parts closer than this to the light do not block it (70 units = 1 m). NPC lights also stop %.0f units before the flame.",
-					settings.PointLightsClearance);
-		}
-		ImGui::Checkbox("Spell / Effect Lights Cast RT Shadows", &settings.PointLightsEffects);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): lights of spells and effects that belong to nobody (Magelight on a wall, fire bolts in flight)");
-			ImGui::Text("  cast ray-traced shadows. Off: as before.");
-		}
-		ImGui::Checkbox("Plants and Cut-Outs Block Point Lights Outdoors", &settings.PointLightsAlphaOutdoors);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): at night leaves, bushes and cut-out shapes (fences, nets) cast shadows from torches and campfires,");
-			ImGui::Text("  for the kinds Ray Tracing traces with their cut-out (Foliage / Cut-outs under Sun Shadows > Advanced). A little slower.");
-			ImGui::Text("Off: outdoors only solid shapes block point lights (46c).");
-		}
-		// (46c) Interiors.
-		ImGui::SeparatorText("Interiors");
+
+		ImGui::SeparatorText("Indoors");
 		ImGui::Checkbox("Indoors Too", &settings.PointLightsInteriors);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("On (default): inside houses, inns, castles and dungeons the room itself (walls, furniture, clutter, people) is captured");
-			ImGui::Text("  when you come in (behind the loading screen) and the lights cast ray-traced shadows there too. There is no sun indoors.");
+			ImGui::Text("  when you come in (behind the loading screen) and the lights cast ray-traced shadows there too.");
 			ImGui::Text("Off: indoors the lights' shadows are exactly as before (RT Ambient Occlusion has its own Indoors Too).");
 		}
-		if (!settings.PointLightsInteriors)
-			ImGui::BeginDisabled();
-		{
-			static constexpr int kKs[3] = { 1, 2, 4 };
-			const char* kNames[3] = { "1", "2", "4" };
-			int index = settings.PointLightsPerPixelInterior >= 4 ? 2 : (settings.PointLightsPerPixelInterior >= 2 ? 1 : 0);
-			if (ImGui::Combo("Lights per Pixel Indoors", &index, kNames, 3))
-				settings.PointLightsPerPixelInterior = kKs[std::clamp(index, 0, 2)];
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Indoors many lights overlap; 4 (default) catches nearly all of the light. 2 or 1 = cheaper.");
-		}
+		ImGui::BeginDisabled(!settings.PointLightsInteriors);
 		ImGui::Checkbox("Window Light Beams", &settings.PointLightsWindowBeams);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("Window Shadows Ultimate's beams of sunlight through the windows (and the game's other spot lights indoors):");
 			ImGui::Text("  their shadow is ray traced, the window frames give the pattern on the floor. Off: they keep the game's shadow maps.");
 		}
-		// (46g) Beam rays and the room's shell.
-		{
-			// (46n) "Faces Toward the Room" always; the other two block the beams by design (Window Shadows Ultimate's one-sided glass
-			// pane in front of its window mask): only for debugging, in developer mode.
-			if (globals::state->IsDeveloperMode()) {
-				const char* cullModes[] = { "None (46f, debug: blocks)", "Faces Toward the Room", "Faces Away (debug: blocks)" };
-				settings.PointLightsBeamCull = std::clamp(settings.PointLightsBeamCull, 0, 2);
-				ImGui::Combo("Window Beam Culling (debug)", &settings.PointLightsBeamCull, cullModes, 3);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Which wall faces a window beam's rays ignore. The game draws a beam's shadow map from outside and skips back faces,");
-					ImGui::Text("  so the beam passes the room's shell and Window Shadows Ultimate's one-sided glass pane. \"Faces Toward the Room\" does");
-					ImGui::Text("  the same for the rays. \"None\" and \"Faces Away\" block the beam on that pane by design (debug only).");
-				}
-			} else {
-				ImGui::TextDisabled("Window Beam Culling: Faces Toward the Room (as the game's beam shadow maps)");
-			}
-			ImGui::Checkbox("Window Beam Guard", &settings.PointLightsBeamGuard);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("A beam whose whole cone comes out blocked (the patch would vanish) keeps the game's shadow map for a while,");
-				ImGui::Text("  then it is tried again. %u beams were caught so far. Off by default since 46o: it also caught normal beams", beamsImplausible);
-				ImGui::Text("  whose cone mostly hits walls, and the switch back and forth flickered.");
-			}
-			// (46o)
-			ImGui::SliderFloat("Window Beam Softness", &settings.PointLightsBeamSoftness, 0.0f, 3.0f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("How wide the sun looks through the window (degrees, like the sun's own size): soft edges on the beam's window pattern,");
-				ImGui::Text("  growing with the distance to the window frame, and the grain on moving characters is filtered away.");
-				ImGui::Text("  0 = as 46n (hard, grainy pattern).");
-			}
-		}
-		ImGui::Checkbox("Stop Engine Shadow Maps for RT Lights", &settings.PointLightsSkipShadowMaps);
+		ImGui::SliderFloat("Window Beam Softness", &settings.PointLightsBeamSoftness, 0.0f, 3.0f, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Off (default): the game still draws its shadow maps for the lights ray tracing handles (wasted work, but a safe fallback).");
-			ImGui::Text("On: indoors the game skips them (saves about 0.7-1.2 ms); ray tracing fills in their shadows. Whenever the ray-traced");
-			ImGui::Text("  result might be missing in a frame, the game draws them as usual.");
+			ImGui::Text("How wide the sun looks through the window (degrees, like the sun's own size): soft edges on the beam's window pattern,");
+			ImGui::Text("  growing with the distance to the window frame. 0 = hard, grainy pattern.");
 		}
-		if (!settings.PointLightsInteriors)
-			ImGui::EndDisabled();
+		ImGui::EndDisabled();
 		if (!interiorOffReason.empty()) {
-			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
-			ImGui::TextWrapped("Indoors was switched off automatically: %s", interiorOffReason.c_str());
-			ImGui::PopStyleColor();
-			// (46f) The saved setting stays on (the next session tries again); Retry tries now.
+			RtErrorLine("Indoors was switched off automatically", interiorOffReason);
+			// The saved setting stays on (the next session tries again); Retry tries now.
 			if (interiorAutoOff && ImGui::SmallButton("Retry Indoors"))
 				interiorRequested = false;
 		}
-		if (PointLightsOn() && InteriorsOn() && settings.Enabled && Util::IsInterior()) {
-			const auto& sc = scene.GetStats();
-			const auto& st = backend.GetStats();
-			const auto& ps = pointSelector.GetStats();
-			ImGui::Text("Interior: %s, %u shapes, %.2f M triangles, %u BLAS (%s), capture %.1f ms CPU in total", sc.interior ? (scene.HasCoverage() ? "captured" : "capturing") : "not captured",
-				sc.interiorShapes, static_cast<double>(sc.interiorTriangles) / 1e6, st.blasCount, Megabytes(st.blasBytes + st.scratchBytes + st.tlasBytes).c_str(),
-				sc.interiorGatherMs);
-			ImGui::Text("  Ready %s after entering; window masks %u; window beams %u, spot lights %u traced; mask channels written %u",
-				interiorReadyMs >= 0.0f ? std::format("{:.0f} ms", interiorReadyMs).c_str() : "-", sc.windowMasks, pointThisFrame ? ps.beams : 0u,
-				pointThisFrame ? ps.spots : 0u, maskChannelsWritten);
-			ImGui::Text("  Engine shadow maps left out: %u this frame (%llu so far, %llu frames with the fallback only)%s", skippedLastFrame,
-				static_cast<unsigned long long>(skippedTotal), static_cast<unsigned long long>(skipFallbackFrames),
-				ps.spotsInvalid ? std::format("; {} spot lights left to the game (cone unreadable)", ps.spotsInvalid).c_str() : "");
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Window masks: Window Shadows Ultimate's window shapes traced with their cut-out (needs the alpha-tested trace).");
-				ImGui::Text("Mask channels: the game's shadow lights whose shadow (the shadow mask) ray tracing writes this frame.");
-				ImGui::Text("Fallback: a light whose shadow map was left out but whose ray-traced result was missing gets no shadow that frame (should stay 0).");
-				ImGui::Text("Box: %.0f x %.0f x %.0f units", sc.interiorBounds[3] - sc.interiorBounds[0], sc.interiorBounds[4] - sc.interiorBounds[1],
-					sc.interiorBounds[5] - sc.interiorBounds[2]);
-			}
-		}
-		if (!settings.PointLights)
-			ImGui::EndDisabled();
+		ImGui::EndDisabled();
 		if (!pointOffReason.empty()) {
-			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
-			ImGui::TextWrapped("Point-light shadows were switched off automatically: %s", pointOffReason.c_str());
-			ImGui::PopStyleColor();
-			// (46f) The saved setting stays on (the next session tries again); Retry tries now.
+			RtErrorLine("Point-light shadows were switched off automatically", pointOffReason);
+			// The saved setting stays on (the next session tries again); Retry tries now.
 			if (pointAutoOff && ImGui::SmallButton("Retry Point Lights"))
 				pointRequested = false;
 		}
-		const auto& ps = pointSelector.GetStats();
-		const auto& rt = backend.GetStats();
-		if (PointLightsOn() && settings.Enabled) {
-			ImGui::Text("This frame: %u lights traced (K %u) of %u candidates (%u merged, %u over the cap, %u engine shadow lights); %u lights in use",
-				pointThisFrame ? ps.sources : 0u, pointThisFrame ? pointK : 0u, ps.candidates, ps.merged, ps.capped, ps.native, ps.used);
-			ImGui::Text("  of which the player's own lights %u, spell / effect lights %u, carried by other characters %u; plants / cut-outs tested %s",
-				pointThisFrame ? ps.player : 0u, pointThisFrame ? ps.effects : 0u, pointThisFrame ? ps.carried : 0u, backend.PointAlphaLastFrame() ? "yes" : "no");
-			ImGui::Text("Cost: trace %.2f ms GPU, %s rays per frame; denoiser %.2f ms GPU; selection %.3f ms CPU",
-				std::max(rt.lastPointGpuMs, 0.0f), rt.pointRaysPerFrame >= 0 ? std::format("{:.2f} M", static_cast<double>(rt.pointRaysPerFrame) / 1e6).c_str() : "?",
-				std::max(Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingPointDenoise), 0.0f), pointCpuMs);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("GPU times are the last samples (the denoiser's only while the Performance Overlay or an F7 trace runs).");
-				std::string reasons;
-				for (int i = 0; i < 8; ++i)
-					if (ps.byReason[i])
-						reasons += std::format("{}{} {}", reasons.empty() ? "" : ", ", RayTracingPointLights::kRejectNames[i], ps.byReason[i]);
-				ImGui::Text("Left out this frame: %s", reasons.empty() ? "none" : reasons.c_str());
-				ImGui::Text("Not classified yet (asked again next frame): %u; classifier cache %u lights, %llu read so far; new slots this frame %u",
-					ps.pending, Util::LightCensus::ClassifierCacheSize(), static_cast<unsigned long long>(Util::LightCensus::ClassifierReads()), ps.slotChanges);
+
+		if (ImGui::TreeNodeEx("Advanced")) {
+			ImGui::BeginDisabled(!settings.PointLights);
+			{
+				static constexpr int kKs[3] = { 1, 2, 4 };
+				const char* kNames[3] = { "1", "2", "4" };
+				int index = settings.PointLightsPerPixel >= 4 ? 2 : (settings.PointLightsPerPixel >= 2 ? 1 : 0);
+				if (ImGui::Combo("Lights per Pixel", &index, kNames, 3))
+					settings.PointLightsPerPixel = kKs[std::clamp(index, 0, 2)];
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("How many of the lights that light a pixel most are traced there (one ray each). Default 2.");
+					ImGui::Text("  Weaker lights at that pixel keep their old shadows. More = slower.");
+				}
 			}
+			ImGui::SliderInt("Max Lights", &settings.PointLightsMaxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources));
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Shadow-casting lights per frame at most (the ones that matter most on screen). Lights within 64 units count as one.");
+			ImGui::SliderFloat("Max Distance", &settings.PointLightsDistance, 512.0f, 8192.0f, "%.0f units");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Lights farther from the camera keep their old shadows. 70 units = 1 m. Default 4000 (about 57 m).");
+			ImGui::Checkbox("Native Shadow Lights Use RT Shadows", &settings.PointLightsNative);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("The game's own shadow-casting lights (fireplaces, some campfires): their ray-traced shadow replaces the game's");
+				ImGui::Text("  shadow map in the lighting (default on). Off: they keep the game's shadow map.");
+				ImGui::Text("  Outdoors spot lights keep the game's shadow map; indoors their cone is taken from the game.");
+			}
+			ImGui::Checkbox("Stable Light Selection", &settings.PointLightsStable);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): flickering candles and lights whose range changes do not make an area jump between the ray-traced");
+				ImGui::Text("  shadow and the old one. Off: the lights are picked again every frame.");
+			}
+			ImGui::Checkbox("Keep Screen-Space Contact Shadows", &settings.PointLightsKeepSSPLS);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Off (default): Screen Space Point Light Shadows are skipped for ray-traced lights.");
+				ImGui::Text("  On: they stay on as well; the darker of both counts (small contact shadows of grass and leaves the ray tracer does not see).");
+			}
+			ImGui::SliderFloat("Fixture Clearance", &settings.PointLightsClearance, 0.0f, 128.0f, "%.0f units");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Rays stop this far before the light, so the lamp, brazier bowl or torch holding it does not shadow its own light.");
+				ImGui::Text("  Too small: a dark ring or a black patch around a lamp. Too large: objects right next to a light cast nothing.");
+			}
+			ImGui::BeginDisabled(!settings.CarrierShadows);
+			ImGui::SliderFloat("Carrier Clearance (units)", &settings.CarrierClearance, 0.0f, 64.0f, "%.0f");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Body parts closer than this to a carried light do not block it (70 units = 1 m). NPC lights also stop %.0f units before the flame.",
+					settings.PointLightsClearance);
+			ImGui::EndDisabled();
+			ImGui::Checkbox("Spell / Effect Lights Cast RT Shadows", &settings.PointLightsEffects);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): lights of spells and effects that belong to nobody (Magelight on a wall, fire bolts in flight)");
+				ImGui::Text("  cast ray-traced shadows. Off: they keep the old shadows.");
+			}
+			ImGui::Checkbox("Plants and Cut-Outs Block Point Lights Outdoors", &settings.PointLightsAlphaOutdoors);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): at night leaves, bushes and cut-out shapes (fences, nets) cast shadows from torches and campfires,");
+				ImGui::Text("  for the kinds traced with their cut-out (Foliage / Cut-outs under Sun Shadows > Advanced). A little slower.");
+				ImGui::Text("Off: outdoors only solid shapes block point lights.");
+			}
+			ImGui::BeginDisabled(!settings.PointLightsInteriors);
+			{
+				static constexpr int kKs[3] = { 1, 2, 4 };
+				const char* kNames[3] = { "1", "2", "4" };
+				int index = settings.PointLightsPerPixelInterior >= 4 ? 2 : (settings.PointLightsPerPixelInterior >= 2 ? 1 : 0);
+				if (ImGui::Combo("Lights per Pixel Indoors", &index, kNames, 3))
+					settings.PointLightsPerPixelInterior = kKs[std::clamp(index, 0, 2)];
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("Indoors many lights overlap; 4 (default) catches nearly all of the light. 2 or 1 = cheaper.");
+			}
+			ImGui::EndDisabled();
+			ImGui::EndDisabled();
+			ImGui::TreePop();
+		}
+
+		// A/B switches (saved settings; the defaults are the tested ones).
+		bool reset = false;
+		if (Util::BeginABSwitchGroup(nullptr, reset)) {
+			if (reset) {
+				const Settings d{};
+				settings.PointLightsBeamGuard = d.PointLightsBeamGuard;
+				settings.PointLightsSkipShadowMaps = d.PointLightsSkipShadowMaps;
+				settings.PointLightsBeamCull = d.PointLightsBeamCull;
+			}
+			ImGui::BeginDisabled(!settings.PointLights || !settings.PointLightsInteriors);
+			ImGui::Checkbox("Window Beam Guard", &settings.PointLightsBeamGuard);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Off (default). On: a window beam whose whole cone comes out blocked keeps the game's shadow map for a while,");
+				ImGui::Text("  then it is tried again. It also catches normal beams whose cone mostly hits walls, which flickers.");
+				ImGui::Text("  %u beams caught so far.", beamsImplausible);
+			}
+			ImGui::Checkbox("Stop Engine Shadow Maps for RT Lights", &settings.PointLightsSkipShadowMaps);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Off (default): the game still draws its shadow maps for the lights ray tracing handles (wasted work, but a safe fallback).");
+				ImGui::Text("On: indoors the game skips them (saves about 0.7-1.2 ms); ray tracing fills in their shadows. Whenever the ray-traced");
+				ImGui::Text("  result might be missing in a frame, the game draws them as usual.");
+			}
+			// The other two modes block Window Shadows Ultimate's beams on its one-sided glass pane by design: developer mode only.
+			if (globals::state->IsDeveloperMode()) {
+				const char* cullModes[] = { "None (debug: blocks the beams)", "Faces Toward the Room", "Faces Away (debug: blocks the beams)" };
+				settings.PointLightsBeamCull = std::clamp(settings.PointLightsBeamCull, 0, 2);
+				ImGui::Combo("Window Beam Culling (debug)", &settings.PointLightsBeamCull, cullModes, 3);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Which wall faces a window beam's rays ignore. \"Faces Toward the Room\" (default) lets the beam pass the room's shell");
+					ImGui::Text("  and Window Shadows Ultimate's one-sided glass pane, as the game's beam shadow maps do. The other two block the beam.");
+				}
+			}
+			ImGui::EndDisabled();
+			ImGui::TreePop();
+		}
+
+		if (ImGui::TreeNodeEx("Diagnostics")) {
+			ImGui::Checkbox("Split Screen (RT left, old right)", &pointSplit);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Left half of the screen: ray-traced point-light shadows; right half: Screen Space Point Light Shadows / shadow maps as before. Not saved.");
+			if (PointLightsOn() && InteriorsOn() && settings.Enabled && Util::IsInterior()) {
+				const auto& sc = scene.GetStats();
+				const auto& st = backend.GetStats();
+				const auto& ps = pointSelector.GetStats();
+				ImGui::Text("Interior: %s, %u shapes, %.2f M triangles, %u BLAS (%s), capture %.1f ms CPU in total", sc.interior ? (scene.HasCoverage() ? "captured" : "capturing") : "not captured",
+					sc.interiorShapes, static_cast<double>(sc.interiorTriangles) / 1e6, st.blasCount, Megabytes(st.blasBytes + st.scratchBytes + st.tlasBytes).c_str(),
+					sc.interiorGatherMs);
+				ImGui::Text("  Ready %s after entering; window masks %u; window beams %u, spot lights %u traced; mask channels written %u",
+					interiorReadyMs >= 0.0f ? std::format("{:.0f} ms", interiorReadyMs).c_str() : "-", sc.windowMasks, pointThisFrame ? ps.beams : 0u,
+					pointThisFrame ? ps.spots : 0u, maskChannelsWritten);
+				ImGui::Text("  Engine shadow maps left out: %u this frame (%llu so far, %llu frames with the fallback only)%s", skippedLastFrame,
+					static_cast<unsigned long long>(skippedTotal), static_cast<unsigned long long>(skipFallbackFrames),
+					ps.spotsInvalid ? std::format("; {} spot lights left to the game (cone unreadable)", ps.spotsInvalid).c_str() : "");
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Window masks: Window Shadows Ultimate's window shapes traced with their cut-out (needs the alpha-tested trace).");
+					ImGui::Text("Mask channels: the game's shadow lights whose shadow (the shadow mask) ray tracing writes this frame.");
+					ImGui::Text("Fallback: a light whose shadow map was left out but whose ray-traced result was missing gets no shadow that frame (should stay 0).");
+					ImGui::Text("Box: %.0f x %.0f x %.0f units", sc.interiorBounds[3] - sc.interiorBounds[0], sc.interiorBounds[4] - sc.interiorBounds[1],
+						sc.interiorBounds[5] - sc.interiorBounds[2]);
+				}
+			}
+			if (PointLightsOn() && settings.Enabled) {
+				const auto& ps = pointSelector.GetStats();
+				const auto& rt = backend.GetStats();
+				ImGui::Text("This frame: %u lights traced (K %u) of %u candidates (%u merged, %u over the cap, %u engine shadow lights); %u lights in use",
+					pointThisFrame ? ps.sources : 0u, pointThisFrame ? pointK : 0u, ps.candidates, ps.merged, ps.capped, ps.native, ps.used);
+				ImGui::Text("  of which the player's own lights %u, spell / effect lights %u, carried by other characters %u; plants / cut-outs tested %s",
+					pointThisFrame ? ps.player : 0u, pointThisFrame ? ps.effects : 0u, pointThisFrame ? ps.carried : 0u, backend.PointAlphaLastFrame() ? "yes" : "no");
+				ImGui::Text("Cost: trace %.2f ms GPU, %s rays per frame; denoiser %.2f ms GPU; selection %.3f ms CPU",
+					std::max(rt.lastPointGpuMs, 0.0f), rt.pointRaysPerFrame >= 0 ? std::format("{:.2f} M", static_cast<double>(rt.pointRaysPerFrame) / 1e6).c_str() : "?",
+					std::max(Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::RayTracingPointDenoise), 0.0f), pointCpuMs);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("GPU times are the last samples (the denoiser's only while the Performance Overlay or an F7 trace runs).");
+					std::string reasons;
+					for (int i = 0; i < 8; ++i)
+						if (ps.byReason[i])
+							reasons += std::format("{}{} {}", reasons.empty() ? "" : ", ", RayTracingPointLights::kRejectNames[i], ps.byReason[i]);
+					ImGui::Text("Left out this frame: %s", reasons.empty() ? "none" : reasons.c_str());
+					ImGui::Text("Not classified yet (asked again next frame): %u; classifier cache %u lights, %llu read so far; new slots this frame %u",
+						ps.pending, Util::LightCensus::ClassifierCacheSize(), static_cast<unsigned long long>(Util::LightCensus::ClassifierReads()), ps.slotChanges);
+				}
+			} else {
+				ImGui::TextDisabled("Not tracing point lights right now.");
+			}
+			ImGui::TreePop();
 		}
 		ImGui::TreePop();
 	}
+	ImGui::PopID();
 }
 
 void RayTracing::DrawAOPage()
 {
+	ImGui::PushID("rtAOPage");
 	DrawMasterHeader();
-	// (46f) Ray-traced ambient occlusion.
 	if (ImGui::TreeNodeEx("Ambient Occlusion", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("RT Ambient Occlusion", &settings.AO);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -4822,84 +4834,27 @@ void RayTracing::DrawAOPage()
 			ImGui::Text("Terrain and grass are not in the ray-traced scene: their darkening still comes from Screen Space GI.");
 			ImGui::Text("Off (default): ambient occlusion exactly as before (Screen Space GI). Needs Ray Tracing and Screen Space GI on.");
 		}
-		if (!settings.AO)
-			ImGui::BeginDisabled();
-		{
-			const char* modes[] = { "RTAO (keeps SSGI contact AO)", "Darker of RTAO and SSGI AO" };
-			settings.AOMode = std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1);
-			ImGui::Combo("Mode", &settings.AOMode, modes, IM_ARRAYSIZE(modes));
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Outdoors (indoors has its own Mode Indoors below).");
-				ImGui::Text("RTAO (default): ray-traced AO replaces Screen Space GI's AO; SSGI's small contact AO (cm-scale creases) is kept");
-				ImGui::Text("  and both darken together.");
-				ImGui::Text("Darker of RTAO and SSGI AO: per pixel the darker of the two (fullest darkening; SSGI's AO is never lost).");
-			}
-		}
-		ImGui::SliderFloat("Ray Length", &settings.AORayLength, kAORayLengthMin, kAORayLengthMax, "%.0f units");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("How far an object may be and still darken a surface. 70 units = 1 m. Default 100 (about 1.4 m). Longer = wider, darker AO.");
+		ImGui::BeginDisabled(!settings.AO);
 		ImGui::SliderFloat("Strength", &settings.AOStrength, 0.0f, 2.0f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("1 = as traced. Lower = lighter, higher = darker.");
-		ImGui::Checkbox("Temporal", &settings.AOTemporal);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): after the edge-aware blur the last frames are blended in (held close to this frame's own values,");
-			ImGui::Text("  so moving objects leave no dark trail). Off: this frame's blurred rays only (a little grainier).");
-		}
-		ImGui::SliderFloat("Max Distance", &settings.AODistance, 1000.0f, 8192.0f, "%.0f units");
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Outdoors: RTAO fades back to Screen Space GI's AO over the last quarter of this distance. Default 4000 (about 57 m).");
-			ImGui::Text("  Shorter = cheaper. Indoors there is no fade: the whole interior is traced (it is small and all of it is in the scene).");
-		}
-		// (46h) Interiors.
-		ImGui::SeparatorText("Interiors");
+		ImGui::SliderFloat("Ray Length", &settings.AORayLength, kAORayLengthMin, kAORayLengthMax, "%.0f units");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("How far an object may be and still darken a surface. 70 units = 1 m. Default 100 (about 1.4 m). Longer = wider, darker AO.");
 		ImGui::Checkbox("Indoors Too##AO", &settings.AOInteriors);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default, takes effect only with RT Ambient Occlusion on): inside houses, inns, castles and dungeons the room");
-			ImGui::Text("  itself (walls, furniture, clutter, people) is captured when you come in (behind the loading screen), and the AO");
-			ImGui::Text("  there is ray traced too, everywhere in the interior. It switches on together with everything else after the");
-			ImGui::Text("  loading screen (one fade, no piece-by-piece change).");
+			ImGui::Text("On (default): inside houses, inns, castles and dungeons the room itself (walls, furniture, clutter, people) is captured");
+			ImGui::Text("  when you come in (behind the loading screen), and the AO there is ray traced too, everywhere in the interior.");
 			ImGui::Text("Off: indoors the AO is Screen Space GI's, exactly as before.");
 		}
-		if (!settings.AOInteriors)
-			ImGui::BeginDisabled();
-		{
-			const char* modes[] = { "RTAO + SSGI contact AO", "Darker of both" };
-			settings.AOModeInterior = std::clamp(settings.AOModeInterior, 0, static_cast<int>(AOModeKind::Count) - 1);
-			ImGui::Combo("Mode Indoors", &settings.AOModeInterior, modes, IM_ARRAYSIZE(modes));
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("RTAO + SSGI contact AO (default): indoors the ray-traced AO replaces Screen Space GI's AO; SSGI's small contact AO");
-				ImGui::Text("  (cm-scale creases) is kept and both darken together.");
-				ImGui::Text("Darker of both: per pixel the darker of RTAO and SSGI's whole AO.");
-			}
-		}
-		if (!settings.AOInteriors)
-			ImGui::EndDisabled();
 		if (!interiorOffReason.empty()) {
-			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
-			ImGui::TextWrapped("Indoors was switched off automatically: %s", interiorOffReason.c_str());
-			ImGui::PopStyleColor();
+			RtErrorLine("Indoors was switched off automatically", interiorOffReason);
 			if (interiorAutoOff && ImGui::SmallButton("Retry Indoors##AO"))
 				aoInteriorRequested = false;
 		}
-		{
-			const char* views[] = { "Off", "Raw RTAO", "Filtered RTAO", "RTAO vs SSGI (split)" };
-			int view = static_cast<int>(aoDebugView);
-			if (ImGui::Combo("AO Debug View", &view, views, IM_ARRAYSIZE(views)))
-				aoDebugView = static_cast<AODebugView>(std::clamp(view, 0, static_cast<int>(AODebugView::Count) - 1));
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Raw RTAO: this frame's rays (white = open, black = blocked); blue tint = not traced (SSGI's AO there).");
-				ImGui::Text("Filtered RTAO: after the blur (and the history), as it enters the mix.");
-				ImGui::Text("RTAO vs SSGI (split): the real picture; left half with RTAO, right half with Screen Space GI's AO as before.");
-				ImGui::Text("Not saved.");
-			}
-		}
-		if (!settings.AO)
-			ImGui::EndDisabled();
+		ImGui::EndDisabled();
 		if (!aoOffReason.empty()) {
-			ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{ 1.0f, 0.4f, 0.3f, 1.0f });
-			ImGui::TextWrapped("RT ambient occlusion was switched off automatically: %s", aoOffReason.c_str());
-			ImGui::PopStyleColor();
+			RtErrorLine("RT ambient occlusion was switched off automatically", aoOffReason);
 			if (aoAutoOff && ImGui::SmallButton("Retry RT Ambient Occlusion"))
 				aoRequested = false;
 		}
@@ -4907,33 +4862,223 @@ void RayTracing::DrawAOPage()
 			const auto& ssgi = globals::features::screenSpaceGI;
 			if (!ssgi.loaded || !ssgi.settings.Enabled)
 				ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Screen Space GI is off: RTAO needs it (it replaces / joins its AO).");
-			else if (Util::IsInterior()) {
-				// (46h)
-				const auto& sc = scene.GetStats();
-				if (!AOInteriorsOn())
-					ImGui::TextDisabled("Indoors: not traced (Indoors Too is off).");
-				else
-					ImGui::Text("Indoors: %s, %u shapes; mode %s; fade-in %.0f %%", sc.interior ? (scene.HasCoverage() ? "interior captured" : "capturing the interior") : "interior not captured",
-						sc.interiorShapes, settings.AOModeInterior == static_cast<int>(AOModeKind::Darker) ? "darker of both" : "RTAO + SSGI contact AO",
-						static_cast<double>(fade * aoRamp) * 100.0);
+		}
+
+		if (ImGui::TreeNodeEx("Advanced")) {
+			ImGui::BeginDisabled(!settings.AO);
+			{
+				const char* modes[] = { "RTAO (keeps SSGI contact AO)", "Darker of RTAO and SSGI AO" };
+				settings.AOMode = std::clamp(settings.AOMode, 0, static_cast<int>(AOModeKind::Count) - 1);
+				ImGui::Combo("Mode", &settings.AOMode, modes, IM_ARRAYSIZE(modes));
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Outdoors (indoors has its own Mode Indoors below).");
+					ImGui::Text("RTAO (default): ray-traced AO replaces Screen Space GI's AO; SSGI's small contact AO (cm-scale creases) is kept");
+					ImGui::Text("  and both darken together.");
+					ImGui::Text("Darker of RTAO and SSGI AO: per pixel the darker of the two (fullest darkening; SSGI's AO is never lost).");
+				}
 			}
-			const auto& rt = backend.GetStats();
-			auto* timers = Util::GpuPassTimers::GetSingleton();
-			ImGui::Text("This frame: %s; rays %.2f ms GPU (%s per frame), filter %.2f ms, game queue waiting %.2f ms; leaves / cut-outs tested %s",
-				aoComposited ? "mixed in" : "not used", std::max(rt.lastAOGpuMs, 0.0f),
-				rt.aoRaysPerFrame >= 0 ? std::format("{:.2f} M", static_cast<double>(rt.aoRaysPerFrame) / 1e6).c_str() : "?",
-				std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAO), 0.0f), std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAOSync), 0.0f),
-				rt.aoAlphaLastFrame ? "yes" : "no");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("GPU times are the last samples (the D3D11 ones only while the Performance Overlay or an F7 trace runs).");
+			ImGui::Checkbox("Temporal", &settings.AOTemporal);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): after the edge-aware blur the last frames are blended in (held close to this frame's own values,");
+				ImGui::Text("  so moving objects leave no dark trail). Off: this frame's blurred rays only (a little grainier).");
+			}
+			ImGui::SliderFloat("Max Distance", &settings.AODistance, 1000.0f, 8192.0f, "%.0f units");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Outdoors: RTAO fades back to Screen Space GI's AO over the last quarter of this distance. Default 4000 (about 57 m).");
+				ImGui::Text("  Shorter = cheaper. Indoors there is no fade: the whole interior is traced.");
+			}
+			ImGui::BeginDisabled(!settings.AOInteriors);
+			{
+				const char* modes[] = { "RTAO + SSGI contact AO", "Darker of both" };
+				settings.AOModeInterior = std::clamp(settings.AOModeInterior, 0, static_cast<int>(AOModeKind::Count) - 1);
+				ImGui::Combo("Mode Indoors", &settings.AOModeInterior, modes, IM_ARRAYSIZE(modes));
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("RTAO + SSGI contact AO (default): indoors the ray-traced AO replaces Screen Space GI's AO; SSGI's small contact AO");
+					ImGui::Text("  (cm-scale creases) is kept and both darken together.");
+					ImGui::Text("Darker of both: per pixel the darker of RTAO and SSGI's whole AO.");
+				}
+			}
+			ImGui::EndDisabled();
+			ImGui::EndDisabled();
+			ImGui::TreePop();
+		}
+
+		if (ImGui::TreeNodeEx("Diagnostics")) {
+			ImGui::BeginDisabled(!settings.AO);
+			{
+				const char* views[] = { "Off", "Raw RTAO", "Filtered RTAO", "RTAO vs SSGI (split)" };
+				int view = static_cast<int>(aoDebugView);
+				if (ImGui::Combo("AO Debug View", &view, views, IM_ARRAYSIZE(views)))
+					aoDebugView = static_cast<AODebugView>(std::clamp(view, 0, static_cast<int>(AODebugView::Count) - 1));
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Raw RTAO: this frame's rays (white = open, black = blocked); blue tint = not traced (SSGI's AO there).");
+					ImGui::Text("Filtered RTAO: after the blur (and the history), as it enters the mix.");
+					ImGui::Text("RTAO vs SSGI (split): the real picture; left half with RTAO, right half with Screen Space GI's AO as before.");
+					ImGui::Text("Not saved.");
+				}
+			}
+			ImGui::EndDisabled();
+			if (AOOn() && settings.Enabled) {
+				if (Util::IsInterior()) {
+					const auto& sc = scene.GetStats();
+					if (!AOInteriorsOn())
+						ImGui::TextDisabled("Indoors: not traced (Indoors Too is off).");
+					else
+						ImGui::Text("Indoors: %s, %u shapes; mode %s; fade-in %.0f %%", sc.interior ? (scene.HasCoverage() ? "interior captured" : "capturing the interior") : "interior not captured",
+							sc.interiorShapes, settings.AOModeInterior == static_cast<int>(AOModeKind::Darker) ? "darker of both" : "RTAO + SSGI contact AO",
+							static_cast<double>(fade * aoRamp) * 100.0);
+				}
+				const auto& rt = backend.GetStats();
+				auto* timers = Util::GpuPassTimers::GetSingleton();
+				ImGui::Text("This frame: %s; rays %.2f ms GPU (%s per frame), filter %.2f ms, game queue waiting %.2f ms; leaves / cut-outs tested %s",
+					aoComposited ? "mixed in" : "not used", std::max(rt.lastAOGpuMs, 0.0f),
+					rt.aoRaysPerFrame >= 0 ? std::format("{:.2f} M", static_cast<double>(rt.aoRaysPerFrame) / 1e6).c_str() : "?",
+					std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAO), 0.0f), std::max(timers->LastSampleMs(Util::GpuBucket::RayTracingAOSync), 0.0f),
+					rt.aoAlphaLastFrame ? "yes" : "no");
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("GPU times are the last samples (the D3D11 ones only while the Performance Overlay or an F7 trace runs).");
+			} else {
+				ImGui::TextDisabled("Not tracing ambient occlusion right now.");
+			}
+			ImGui::TreePop();
 		}
 		ImGui::TreePop();
 	}
+	ImGui::PopID();
 }
 
 void RayTracing::DrawDiagnostics()
 {
-	if (ImGui::TreeNodeEx("Debug", ImGuiTreeNodeFlags_DefaultOpen)) {
+	const auto& rt = backend.GetStats();
+	const auto& alphaBytes = backend.GetAlphaStats();
+	const std::uint64_t vram = rt.blasBytes + rt.scratchBytes + rt.tlasBytes + rt.uploadBytes + rt.sharedTextureBytes + d3d11Bytes +
+	                           alphaBytes.uvBytes + alphaBytes.layerBytes + alphaBytes.infoBytes +
+	                           backend.GetSkinStats().bytes + backend.GetSkinStats().scratchBytes + backend.GetSkinStats().boneBytes;
+
+	// Summary for players: where the settings are, what is on, what it costs.
+	ImGui::TextWrapped("The settings are on the Sun Shadows, Point Light Shadows and Ambient Occlusion pages (below this one in the list).");
+	if (settings.Enabled) {
+		ImGui::Text("In use: sun shadows (%s), point-light shadows %s, ambient occlusion %s", kQualityNames[std::clamp(settings.QualityLevel, 0, 5)],
+			settings.PointLights ? "on" : "off", settings.AO ? "on" : "off");
+		if (status == Status::Active || status == Status::Inactive || status == Status::Waiting)
+			ImGui::Text("Cost: %.1f ms on the graphics card, %s of video memory", rt.smoothedGpuMs, Megabytes(vram).c_str());
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Graphics-card time of the ray-tracing work (scene updates and tracing, smoothed) and the video memory it holds.");
+		if (overVramBudget)
+			ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Over the 1.2 GB scene budget: no further cells are captured.");
+	}
+
+	// Advanced: the loading-screen preparation.
+	if (ImGui::TreeNodeEx("Advanced")) {
+		ImGui::SeparatorText("Loading screens");
+		ImGui::Checkbox("Prepare Behind Loading Screens", &settings.LoadingPump);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): while a loading screen is up, the place you arrive at is captured and built for ray tracing as its cells");
+			ImGui::Text("  finish loading, so the first frames you see do not have to do it. Off: everything starts when the world is drawn again.");
+		}
+		ImGui::BeginDisabled(!settings.LoadingPump);
+		ImGui::SliderFloat("Loading Screen Work (ms per frame)", &settings.LoadingPumpMs, 2.0f, 32.0f, "%.0f ms");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("CPU time Ray Tracing may use per loading-screen frame. More: ready sooner, but the game's own loading gets less time.");
+		ImGui::SliderFloat("Black Screen Window (ms)", &settings.BlackWindowMs, 0.0f, 2000.0f, "%.0f ms");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("How long after the loading screen the picture still counts as black (large budgets; the switch to RT happens here).");
+			ImGui::Text("After it only the small per-frame budgets of normal play are used.");
+		}
+		ImGui::Checkbox("Prepare On Cell Load", &settings.PrepareOnCellEvents);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): each cell of the place you arrive at is captured and built for ray tracing the moment it finishes loading,");
+			ImGui::Text("  behind the loading screen. Off: only the per-frame work above.");
+		}
+		ImGui::BeginDisabled(!settings.PrepareOnCellEvents);
+		ImGui::SliderFloat("Work per Loaded Cell (ms)", &settings.CellEventMs, 2.0f, 50.0f, "%.0f ms");
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("CPU time per loaded cell. The loading screen gets longer by about this much per cell (about 25 cells per fast travel).");
+		ImGui::EndDisabled();
+		ImGui::Checkbox("Use the Fade-In", &settings.FadeInBudgets);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): while the picture fades in after a loading screen (about 3 s), the first second still works as hard as the");
+			ImGui::Text("  black screen, then less and less. Off: small budgets as soon as the black window is over.");
+		}
+		ImGui::EndDisabled();
+		ImGui::TreePop();
+	}
+
+	// A/B switches (saved settings; the defaults are the tested ones). Same picture either way.
+	bool reset = false;
+	if (Util::BeginABSwitchGroup(nullptr, reset)) {
+		if (reset) {
+			const Settings d{};
+			settings.CharactersParallel = d.CharactersParallel;
+			settings.CharactersScanCache = d.CharactersScanCache;
+			settings.CharactersMerge = d.CharactersMerge;
+			settings.SplitTraceSync = d.SplitTraceSync;
+			settings.ParallelBlasBuilds = d.ParallelBlasBuilds;
+			settings.HighPriorityQueue = d.HighPriorityQueue;
+			settings.SubmitWorker = d.SubmitWorker;
+			settings.BuildGpuBudget = d.BuildGpuBudget;
+			settings.BuildGpuBudgetMs = d.BuildGpuBudgetMs;
+			settings.GroupBuildsPerFrame = d.GroupBuildsPerFrame;
+			settings.GroupGraceMs = d.GroupGraceMs;
+		}
+		ImGui::Checkbox("Parallel Character Reads", &settings.CharactersParallel);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): the characters' bone positions and parts are read on a few helper threads (the frame waits for them");
+			ImGui::Text("  at the same point). Off: all on the render thread. F7: rt_ch_reads_ms, rt_ch_lanes.");
+		}
+		ImGui::Checkbox("Character Scan Cache", &settings.CharactersScanCache);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): a character's whole 3D is searched for parts only when it may have changed (equipping, a new character)");
+			ImGui::Text("  and every 8 frames; in between only its known parts are checked. Off: searched every frame. F7: rt_ch_rescans.");
+		}
+		ImGui::Checkbox("Merge Character Parts", &settings.CharactersMerge);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): each character's solid parts (body, clothes, armour, weapons) are one ray-tracing object: one update per");
+			ImGui::Text("  character per frame instead of one per part. Hair and cut-out parts stay separate. Off: one object per part.");
+			ImGui::Text("  Changing it rebuilds the characters (a moment). F7: rt_skin_groups, rt_prep_gpu_ms, rt_e_skin_ms.");
+		}
+		ImGui::Checkbox("Split Trace Sync", &settings.SplitTraceSync);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default, with point-light shadows traced): the game's GPU queue waits only for the sun's shadow before merging it,");
+			ImGui::Text("  and for the point lights only right before their clean-up. Off: one wait for both.");
+			ImGui::Text("  F7: rt_sync_sun_gpu_ms, rt_sync_pl_gpu_ms (rt_sync_gpu_ms = both).");
+		}
+		ImGui::Checkbox("Parallel BLAS Builds", &settings.ParallelBlasBuilds);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): the scenery shapes that enter in one frame are built side by side on the graphics card (at most 64 MB");
+			ImGui::Text("  of scratch memory together). Shorter hitches when new cells or objects arrive. Off: one by one.");
+			ImGui::Text("  F7: rt_prep_gpu_ms with rt_pw_builds.");
+		}
+		ImGui::Checkbox("RT Queue High Priority (restart)", &settings.HighPriorityQueue);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Experiment, off by default: ray tracing's own GPU queue asks for high priority, which may shorten the long waits for it");
+			ImGui::Text("  when the card is busy. Takes effect after restarting the game. In effect now: %s.", backend.QueuePriorityHigh() ? "high" : "normal");
+		}
+		ImGui::Checkbox("RT: Submit on a Worker Thread", &settings.SubmitWorker);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): handing ray tracing's work to the graphics card is done by a helper thread, so the game's main thread");
+			ImGui::Text("  does not stall there when Windows is busy moving video memory. Same order, same picture. Off: on the main thread.");
+			ImGui::Text("  In effect now: %s. F7: rt_sub_* columns.", backend.SubmitWorkerInEffect() ? "on" : "off");
+		}
+		ImGui::Checkbox("RT: Budget Builds by GPU Time", &settings.BuildGpuBudget);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): new ray-tracing shapes (scenery and whole characters) are built a few per frame within a graphics-card");
+			ImGui::Text("  time budget, and a character that leaves view for a moment keeps its shape for a short while (no rebuild when it");
+			ImGui::Text("  comes back). Off: built as they come. F7: rt_bud_* columns.");
+		}
+		if (settings.BuildGpuBudget) {
+			ImGui::Indent();
+			ImGui::SliderFloat("Build Budget (GPU ms per frame)", &settings.BuildGpuBudgetMs, 0.25f, 4.0f, "%.2f");
+			ImGui::SliderInt("Character Builds per Frame", &settings.GroupBuildsPerFrame, 1, 16);
+			ImGui::SliderFloat("Character Keep Time (ms)", &settings.GroupGraceMs, 0.0f, 10000.0f, "%.0f");
+			const auto& bud = backend.GetBudgetSample();
+			ImGui::TextDisabled("Measured: %.1f GPU ms per million triangles, prep base %.2f ms, budget %u triangles", bud.msPerMillionTris, bud.prepBaseMs, bud.triBudget);
+			ImGui::Unindent();
+		}
+		ImGui::TreePop();
+	}
+
+	if (ImGui::TreeNodeEx("Diagnostics")) {
 		const char* views[] = { "Off", "Shadow Source", "RT vs Shadow Map", "BLAS Coverage", "Raw RT Visibility", "RT Hit vs Depth", "Penumbra Radius",
 			"History Length", "Adaptive Rays", "SSS: RT Casters", "Distance Quality", "Character Rays", "Point Lights: Candidates", "Point Lights: Traced Lights",
 			"Point Lights: Raw Rays", "Point Lights: Denoised" };
@@ -4942,6 +5087,7 @@ void RayTracing::DrawDiagnostics()
 		if (ImGui::Combo("Debug View", &view, views, IM_ARRAYSIZE(views)))
 			debugView = static_cast<DebugView>(std::clamp(view, 0, static_cast<int>(DebugView::Count) - 1));
 		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Not saved.");
 			ImGui::Text("Shadow Source: red = ray-traced shadow, blue = shadow-map shadow (characters, trees, grass, terrain), green = lit,");
 			ImGui::Text("  grey = outside the ray-traced area (cascades and terrain shadows, unchanged), yellow = hand-off band.");
 			ImGui::Text("  Terrain shadows are applied later by the lighting and are not shown.");
@@ -4967,107 +5113,11 @@ void RayTracing::DrawDiagnostics()
 			ImGui::Text("Point Lights: Traced Lights: a colour per light; stripes = a second (third, fourth) light traced there too.");
 			ImGui::Text("Point Lights: Raw Rays / Denoised: the point-light shadows before / after the clean-up (white = lit).");
 		}
-		// (46b) A/B: ray-traced point-light shadows on the left half, the old ones on the right.
-		ImGui::Checkbox("Point Lights: Split Screen (RT left, old right)", &pointSplit);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Left half of the screen: ray-traced point-light shadows; right half: Screen Space Point Light Shadows / shadow maps as before.");
-
-		// (46k) Transitions (loading screens, doors, fast travel).
-		ImGui::Checkbox("Prepare Behind Loading Screens", &settings.LoadingPump);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: while a loading screen is up, the place you arrive at is captured and built for ray tracing as its cells finish loading,");
-			ImGui::Text("  so the first frames you see do not have to do it. Off: as 46i (everything starts when the world is drawn again).");
-		}
-		if (settings.LoadingPump) {
-			ImGui::SliderFloat("Loading Screen Work (ms per frame)", &settings.LoadingPumpMs, 2.0f, 32.0f, "%.0f ms");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("CPU time Ray Tracing may use per loading-screen frame. More: ready sooner, but the game's own loading gets less time.");
-			ImGui::SliderFloat("Black Screen Window (ms)", &settings.BlackWindowMs, 0.0f, 2000.0f, "%.0f ms");
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("How long after the loading screen the picture still counts as black (large budgets, the switch to RT happens here).");
-				ImGui::Text("After it only the small per-frame budgets of normal play are used. 46i used up to 4 s, into the visible fade-in.");
-			}
-			// (46n)
-			ImGui::Checkbox("Prepare On Cell Load", &settings.PrepareOnCellEvents);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On: each cell of the place you arrive at is captured and built for ray tracing the moment it finishes loading, behind");
-				ImGui::Text("  the loading screen (the loading screen itself runs on another thread, so nothing else can work there). Off: as 46m.");
-			}
-			if (settings.PrepareOnCellEvents) {
-				ImGui::SliderFloat("Work per Loaded Cell (ms)", &settings.CellEventMs, 2.0f, 50.0f, "%.0f ms");
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text("CPU time per loaded cell. The loading screen gets longer by about this much per cell (about 25 cells per fast travel).");
-			}
-			ImGui::Checkbox("Use the Fade-In", &settings.FadeInBudgets);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On: while the picture fades in after a loading screen (about 3 s), the first second still works as hard as the black");
-				ImGui::Text("  screen, then less and less. Off: as 46m (small budgets as soon as the black window is over).");
-			}
-		}
 		if (!lastEventsSummary.empty())
 			ImGui::TextWrapped("Last transition: %s", lastEventsSummary.c_str());
 
-		// (46m) Cost switches, each for an A/B (on = 46m, off = as 46l). Same picture either way.
-		ImGui::Checkbox("Parallel Character Reads", &settings.CharactersParallel);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: the characters' bone positions and parts are read on a few helper threads at the same moment of the frame as before");
-			ImGui::Text("  (the frame waits for them right there). Off: all on the render thread, as 46l. F7: rt_ch_reads_ms, rt_ch_lanes.");
-		}
-		ImGui::Checkbox("Character Scan Cache", &settings.CharactersScanCache);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: a character's whole 3D is searched for parts only when it may have changed (equipping, a new character) and every 8 frames;");
-			ImGui::Text("  in between only its known parts are checked (still attached, not hidden). Off: searched every frame, as 46l. F7: rt_ch_rescans.");
-		}
-		ImGui::Checkbox("Merge Character Parts", &settings.CharactersMerge);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: each character's solid parts (body, clothes, armour, weapons) are one ray-tracing object: one update per character per");
-			ImGui::Text("  frame instead of one per part (less GPU and CPU in crowds). Hair and cut-out parts stay separate. Off: one object per part, as 46l.");
-			ImGui::Text("  Changing it rebuilds the characters (a moment). F7: rt_skin_groups, rt_prep_gpu_ms, rt_e_skin_ms.");
-		}
-		ImGui::Checkbox("Split Trace Sync", &settings.SplitTraceSync);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (with point-light shadows traced): the game's GPU queue waits only for the sun's shadow before merging it, and for the point");
-			ImGui::Text("  lights only right before their clean-up, so that work overlaps them. Off: one wait for both, as 46l.");
-			ImGui::Text("  F7: rt_sync_sun_gpu_ms, rt_sync_pl_gpu_ms (rt_sync_gpu_ms = both).");
-		}
-		ImGui::Checkbox("Parallel BLAS Builds", &settings.ParallelBlasBuilds);  // (46p)
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: the scenery shapes that enter in one frame are built side by side on the graphics card (each its own scratch");
-			ImGui::Text("  memory, at most 64 MB together) instead of one after the other. Shorter hitches when new cells or objects arrive.");
-			ImGui::Text("  Off: one by one, as 46o. F7: rt_prep_gpu_ms with rt_pw_builds.");
-		}
-		ImGui::Checkbox("RT Queue High Priority (restart)", &settings.HighPriorityQueue);  // (46p)
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Experiment, off by default: ray tracing's own GPU queue asks for high priority, which may shorten the long waits for it");
-			ImGui::Text("  when the card is busy. Takes effect after restarting the game. In effect now: %s.", backend.QueuePriorityHigh() ? "high" : "normal");
-		}
-		ImGui::Checkbox("RT: Submit on a Worker Thread", &settings.SubmitWorker);  // (46q)
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: handing ray tracing's work to the graphics card is done by a helper thread, so the game's main thread no longer");
-			ImGui::Text("  stalls there when Windows is busy moving video memory (the 10-15 ms hitches in rt_x_execute). Same order, same picture.");
-			ImGui::Text("  Off: on the main thread, as 46p. In effect now: %s. F7: rt_sub_* columns.", backend.SubmitWorkerInEffect() ? "on" : "off");
-		}
-		ImGui::Checkbox("RT: Budget Builds by GPU Time", &settings.BuildGpuBudget);  // (46q)
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On: new ray-tracing shapes (scenery and whole characters) are built a few per frame within a graphics-card time budget");
-			ImGui::Text("  measured from earlier builds, and a character that leaves view for a moment keeps its shape for a short grace period");
-			ImGui::Text("  (no rebuild when it comes back). Off: as 46p. F7: rt_bud_* columns.");
-		}
-		if (settings.BuildGpuBudget) {
-			ImGui::SliderFloat("Build Budget (GPU ms per frame)", &settings.BuildGpuBudgetMs, 0.25f, 4.0f, "%.2f");
-			ImGui::SliderInt("Character Builds per Frame", &settings.GroupBuildsPerFrame, 1, 16);
-			ImGui::SliderFloat("Character Keep Time (ms)", &settings.GroupGraceMs, 0.0f, 10000.0f, "%.0f");
-			const auto& bud = backend.GetBudgetSample();
-			ImGui::Text("Measured: %.1f GPU ms per million triangles, prep base %.2f ms, budget %u triangles", bud.msPerMillionTris, bud.prepBaseMs, bud.triBudget);
-		}
-
-		const auto& rt = backend.GetStats();
 		const auto& sc = scene.GetStats();
 		const auto& skip = sc.skipped;
-		const auto& alphaBytes = backend.GetAlphaStats();
-		const std::uint64_t vram = rt.blasBytes + rt.scratchBytes + rt.tlasBytes + rt.uploadBytes + rt.sharedTextureBytes + d3d11Bytes +
-		                           alphaBytes.uvBytes + alphaBytes.layerBytes + alphaBytes.infoBytes +
-		                           backend.GetSkinStats().bytes + backend.GetSkinStats().scratchBytes + backend.GetSkinStats().boneBytes;
 		const auto& check = backend.GetTlasCheck();
 		std::uint32_t mismatched = 0, notBuilt = 0;
 		for (int c = 0; c < RayTracingRT::kInstanceCategories; ++c) {
@@ -5086,8 +5136,6 @@ void RayTracing::DrawDiagnostics()
 			cpuWorst = {};
 		}
 		ImGui::Text("VRAM: %s total", Megabytes(vram).c_str());
-		if (overVramBudget)
-			ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "  Over the 1.2 GB scene budget: no further cells are captured.");
 		const ImVec4 bad{ 1.0f, 0.5f, 0.3f, 1.0f }, good{ 0.6f, 0.9f, 0.6f, 1.0f };
 		ImGui::TextColored(mismatched ? bad : good, "Self-check: %u of %u instances outside the game's own bounds (%llu so far, should be 0)", mismatched,
 			check.checked, static_cast<unsigned long long>(check.mismatchedTotal));
@@ -5114,8 +5162,7 @@ void RayTracing::DrawDiagnostics()
 			if (!lastLoadingSummary.empty())
 				ImGui::TextWrapped("Last loading screen: %s", lastLoadingSummary.c_str());
 			{
-				// (46g) GPU pools.
-				const auto& pools = backend.GetStats().pools;
+				const auto& pools = rt.pools;
 				ImGui::Text("  Pools: %s reserved in %u blocks, %s in use; blocks made behind loading / black screens %llu, on the pool thread %llu, released %llu",
 					Megabytes(pools.reservedBytes).c_str(), pools.blocks, Megabytes(pools.usedBytes).c_str(), static_cast<unsigned long long>(pools.syncBlocksTotal),
 					static_cast<unsigned long long>(pools.asyncBlocksTotal), static_cast<unsigned long long>(pools.blocksReleased));
@@ -5136,13 +5183,13 @@ void RayTracing::DrawDiagnostics()
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					ImGui::Text("Doors, activators, movable statics, lights, loose items and the opaque parts of trees and plants (trunks, branches).");
 					ImGui::Text("Each is traced where it is this frame. Leaves and other alpha-tested parts keep their shadow-map shadow");
-					ImGui::Text("  unless Alpha-tested casters is on.");
+					ImGui::Text("  unless Foliage / Cut-outs are ray traced.");
 				}
 			}
 			{
-				// (45h) Alpha-tested casters.
+				// Alpha-tested casters.
 				const auto& al = sc.alpha;
-				const auto& ab = backend.GetAlphaStats();
+				const auto& ab = alphaBytes;
 				ImGui::Text("Alpha-tested: %u shapes traced with their cut-out (%u captured, %u meshes, %.2f M triangles, %u instances last frame)",
 					al.registered, al.captured, al.meshes, static_cast<double>(al.meshTriangles) / 1e6, ab.instancesLastFrame);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -5162,7 +5209,7 @@ void RayTracing::DrawDiagnostics()
 				}
 			}
 			{
-				// (45i) Characters.
+				// Characters.
 				const auto& ch = characters.GetStats();
 				const auto& sk = backend.GetSkinStats();
 				ImGui::Text("Characters: %u actors (%u in range), %u shapes traced of %u captured (%u skinned, %u rigid, %u physics, %u hair, %u alpha-tested)",
@@ -5178,7 +5225,6 @@ void RayTracing::DrawDiagnostics()
 					static_cast<unsigned long long>(sk.buildsTotal), sk.notReadyLastFrame, sk.pending);
 				ImGui::Text("  VRAM: %s (of %s budget), scratch %s, bones %s; CPU %.2f ms (worst %.2f ms)", Megabytes(sk.bytes).c_str(),
 					Megabytes(RayTracingRT::Backend::kSkinBudgetBytes).c_str(), Megabytes(sk.scratchBytes).c_str(), Megabytes(sk.boneBytes).c_str(), ch.lastMs, ch.maxMs);
-				// (46m)
 				ImGui::Text("  CPU ms: actors %.2f, reads %.2f (%u lanes, %u bones, %u full scans), captures %.2f, still check %.2f, filter %.2f, draw list %.2f",
 					ch.candidatesMs, ch.readsMs, ch.lanes, ch.bonesRead, ch.rescans, ch.captureMs, ch.commitMs, ch.filterMs, characters.LastCollectMs());
 				ImGui::Text("  Merged: %u characters (%u parts), %u built, %u refit, %u kept; %u TLAS instances, %u skinning dispatches", sk.groupsLastFrame,
@@ -5208,7 +5254,7 @@ void RayTracing::DrawDiagnostics()
 					ms(Util::GpuBucket::RayTracingSigma), ms(Util::GpuBucket::RayTracingCombine), ms(Util::GpuBucket::RayTracingSync));
 			}
 			{
-				// (45j) Where the CPU goes (average / worst since reset); every frame of it is in the F7 trace (rt_* columns).
+				// Where the CPU goes (average / worst since reset); every frame of it is in the F7 trace (rt_* columns).
 				const auto& a = cpuSmoothed;
 				const auto& w = cpuWorst;
 				ImGui::Text("  avg / worst ms: scene %.2f / %.1f, characters %.2f / %.1f, instances %.2f / %.1f, missed casters %.2f / %.1f", a.scene, w.scene,
@@ -5222,7 +5268,7 @@ void RayTracing::DrawDiagnostics()
 				check.written[RayTracingRT::kCategoryCell], check.written[RayTracingRT::kCategoryMovable], check.written[RayTracingRT::kCategoryItem],
 				check.written[RayTracingRT::kCategoryTree], check.written[RayTracingRT::kCategoryAlpha], check.written[RayTracingRT::kCategoryCharacter], notBuilt);
 			{
-				// (45g) Why, by reason (this area).
+				// Missed casters by reason (this area).
 				std::string reasons;
 				for (int r = 0; r < static_cast<int>(RayTracingScene::MissReason::Count); ++r) {
 					if (sc.missedByReason[r])

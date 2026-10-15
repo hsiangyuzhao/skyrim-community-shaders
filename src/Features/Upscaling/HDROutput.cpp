@@ -1197,7 +1197,7 @@ namespace HDROutput
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::TextUnformatted("Auto: whenever Windows says the monitor can do HDR, the game's display chain is 10-bit (HDR10's format),");
 				ImGui::TextUnformatted("so HDR can be switched on and off at any time. With HDR off it looks the same as 8-bit, gradients slightly finer.");
-				ImGui::TextUnformatted("8-bit (legacy): the game's own format, as before 44a; HDR then takes a restart to turn on.");
+				ImGui::TextUnformatted("8-bit (legacy): the game's own format; HDR then takes a restart to turn on.");
 				ImGui::TextUnformatted("If the 10-bit chain or DLSS-G fails, the next start goes back to 8-bit by itself.");
 			}
 			ImGui::TextDisabled("This session: %s", g_tenBitDecision.c_str());

@@ -607,113 +607,18 @@ void Upscaling::DrawLatencySettings()
 
 void Upscaling::DrawAdvancedSettings()
 {
-	if (!ImGui::TreeNodeEx("Advanced / Diagnostics"))
+	if (!ImGui::TreeNodeEx("Advanced"))
 		return;
 
 	if (!globals::game::isVR && streamline.featureReflex) {
-		// Frame-start pacer (always on with Reflex): its safety margin and its last frame.
+		// Frame-start pacer (always on with Reflex): its safety margin.
 		ImGui::SliderFloat("Pacer safety margin", &settings.reflexPacerMarginMs, -2.0f, 8.0f, "%.1f ms", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::TextUnformatted("The frame-start pacer waits before the game reads input until the graphics card is about to need the next frame,");
 			ImGui::TextUnformatted("and never lets the CPU get more than one frame ahead. This is the extra CPU time it keeps in hand:");
 			ImGui::TextUnformatted("raise it if the frame rate drops; lower it for a little less lag.");
 		}
-		ImGui::Checkbox("Pacer: Move GPU Waits to Frame Start", &settings.reflexPacerStallFeedback);  // (46n)
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("When the game stops in the middle of a frame to wait for the graphics card (seen as one slow 'Map' every frame),");
-			ImGui::TextUnformatted("the pacer learns that wait and takes it at the start of the frame instead, before input is read. Off: as 46m.");
-		}
-		ImGui::Checkbox("Pacer: Count Hidden GPU Waits", &settings.reflexPacerHiddenWaits);  // (46o) F1a
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("The game often waits for the graphics card inside ordinary drawing calls in the middle of the frame, not only in 'Map'.");
-			ImGui::TextUnformatted("On: that waiting (measured as wall time minus the main thread's real CPU time) is not counted as CPU work, and is");
-			ImGui::TextUnformatted("moved to the frame start like the 'Map' waits. Fixes the pacer locking out (uneven long/short frames). Off: as 46n.");
-		}
-		ImGui::Checkbox("Pacer: Unlock Backstop", &settings.reflexPacerBackstop);  // (46o) F1b
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Safety net: if the pacer has not slept for 30 frames while the graphics card is behind, it trims its CPU reserve");
-			ImGui::TextUnformatted("0.5 ms per frame until it sleeps again, and hands it back at once if frames get slower. Off: as 46n.");
-		}
-		ImGui::Checkbox("Pacer: Never Over-Sleep", &settings.reflexPacerNoOverSleep);  // (46p)
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("The pacer's learned extra sleep may move a wait to the frame start, but never past the moment the graphics card");
-			ImGui::TextUnformatted("finishes the previous frame (that would only leave the card idle). Learned sleep that got cut, or frames slower than");
-			ImGui::TextUnformatted("the card, make it shrink fast; a frame right after one very slow GPU frame teaches it nothing. Off: as 46o.");
-		}
-		ImGui::Checkbox("Pacer: Smooth GPU Phase", &settings.reflexPacerSmoothPhase);  // (46p)
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Predicts when the graphics card finishes a frame from the last several finishes instead of only the last one,");
-			ImGui::TextUnformatted("so the pacer's sleep jitters less from frame to frame. Off: as 46o.");
-		}
-		const auto& pacer = Util::LatencyPacer::Last();
-		if (pacer.tracking)
-			ImGui::TextDisabled("Pacer: %d frame(s) on the GPU at frame start (%d after the wait), GPU period %.1f ms, CPU reserve %.1f ms (backstop -%.1f), slept %.1f ms "
-								"(+%.1f ms bound, cut %.1f ms), waited inside D3D11 %.1f ms, hidden wait %.1f ms (learned %.1f ms, fast decay %.1f)",
-				pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.backstopMs, pacer.sleepMs, pacer.capWaitMs, pacer.overSleepCutMs,
-				pacer.stallMs, pacer.hiddenWaitMs, pacer.correctionMs, pacer.decayMs);
-		else
-			ImGui::TextDisabled("Pacer: waiting for the D3D12 swap chain");
-		if (!Util::EngineTiming::ProbesInstalled())
-			ImGui::TextDisabled("Reflex markers: engine probes %s, the old marker placement is used", Util::EngineTiming::ProbeStatus());
-		ImGui::Separator();
 	}
-
-	// (46p) GPU memory and copies. Each switch off = 46o.
-	if (ImGui::TreeNodeEx("Save GPU Memory", ImGuiTreeNodeFlags_DefaultOpen)) {
-		ImGui::Checkbox("Keep Our GPU Memory Resident", &settings.keepGpuMemoryResident);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("When video memory runs full, Windows moves memory out to system RAM; whatever the card then needs from there is");
-			ImGui::TextUnformatted("read slowly (8-10x slower ray-tracing prep and denoising seen in Solitude). On: our ray-tracing memory and our");
-			ImGui::TextUnformatted("work / history textures are the last to be moved (game textures go first). Ray tracing: at once; the rest: for");
-			ImGui::TextUnformatted("textures made after switching (restart for all of them).");
-		}
-		ImGui::Checkbox("Ray Reconstruction Textures Only With RR", &settings.saveVramRROnly);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("Six 4K hand-over textures only DLSS Ray Reconstruction reads (about 250 MB) exist only while RR is on, and are not copied every frame.");
-		ImGui::Checkbox("SSGI Light Textures Only With GI", &settings.saveVramSsgi);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("With SSGI's Indirect Lighting and specular GI both off, their textures (about 390 MB at 4K) are not kept. AO is unchanged.");
-		ImGui::Checkbox("Free Ray Tracing Memory When Off", &settings.saveVramFreeRtWhenOff);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("Ray tracing switched off gives back its textures and buffers; the shadow denoiser not in use gives back its own.");
-		ImGui::Checkbox("Free Frame Generation Memory When Off", &settings.saveVramFreeFgWhenOff);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Experiment, off by default: frame generation switched off in this menu gives back DLSS-G's memory (about 700 MB");
-			ImGui::TextUnformatted("at 4K); switching it on again makes it anew (a short hitch). Pause menus and the map are not affected.");
-		}
-		ImGui::Checkbox("Upscaler Masks Only For FSR", &settings.saveVramUpscalerMasks);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("Two 4K mask textures only FSR reads are not kept with DLSS (DLSS has its own copies).");
-		ImGui::Checkbox("NRD Denoisers Share Scratch Textures", &settings.saveVramNrdShared);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("The NRD denoisers (SSRT REBLUR diffuse / specular, RT SIGMA) share their scratch textures (about 90 MB). Takes effect when they are next made (restart).");
-		ImGui::Checkbox("Copy Only the Rendered Area", &settings.copyRenderedAreaOnly);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("The per-frame hand-over copies to DLSS (colour, motion, depth, RR inputs) copy only the part of the picture that is");
-			ImGui::TextUnformatted("rendered (a quarter of 4K with DLSS Performance) instead of the whole 4K texture. Depth buffers cannot be copied");
-			ImGui::TextUnformatted("in part (a D3D11 rule) and stay whole.");
-		}
-		ImGui::Checkbox("Size Buffers to Render Resolution", &settings.renderResBuffers);  // (46q)
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Ray tracing's shadow work textures and its denoisers, and Subsurface Scattering's textures, are made at the size the");
-			ImGui::TextUnformatted("game really renders (1920x1080 with DLSS Performance at 4K) instead of 4K. Same picture. Changing the DLSS quality");
-			ImGui::TextUnformatted("mode or this box re-makes them on the spot (their history restarts once). Off: 4K, as 46p.");
-		}
-		ImGui::Checkbox("SSRT/SSGI Buffers at Render Resolution", &settings.renderResSsrt);  // (46q)
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Screen Space Ray Tracing's textures, its REBLUR denoisers and NRD's guides at the render size, and SSRT's textures");
-			ImGui::TextUnformatted("only while SSRT is on. Same picture; a quality-mode change restarts their history once (a few frames of noise).");
-			ImGui::TextUnformatted("Off: 4K and always allocated, as 46p. (SSGI's own textures stay 4K for now.)");
-			const auto [w, h] = GetRenderAllocSize(true);
-			ImGui::Text("Now allocated at %ux%u.", w, h);
-		}
-		ImGui::Checkbox("Precompile Lazy Shaders", &settings.precompileLazyShaders);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("Shaders first needed right after a loading screen (deferred composite, screen-space shadows) are prepared during the first loading screen.");
-		ImGui::TextDisabled("Our D3D11 textures / buffers alive: %.0f MB", static_cast<double>(Util::FrameTrace::OurD3D11LiveBytes()) / (1024.0 * 1024.0));
-		ImGui::TreePop();
-	}
-	ImGui::Separator();
 
 	// Streamline log level selection
 	const char* logLevels[] = { "Off", "Default", "Verbose" };
@@ -725,39 +630,167 @@ void Upscaling::DrawAdvancedSettings()
 		ImGui::TextUnformatted("How much the NVIDIA Streamline backend writes to its log. Useful for debugging DLSS/DLSS-G issues.");
 		ImGui::TextUnformatted("Takes effect after a restart.");
 	}
-	ImGui::Separator();
-	// FidelityFX section
-	if (ImGui::Selectable("AMD FidelityFX DLLs (click to open folder)")) {
-		ShellExecuteW(nullptr, L"open", FidelityFX::PluginDir, nullptr, nullptr, SW_SHOWNORMAL);
-	}
-	std::vector<std::string> headers = { "DLL Name", "Version" };
-	std::vector<std::vector<std::string>> ffRows;
-	for (const auto& [name, dllVersion] : FidelityFX::dllVersions)
-		ffRows.push_back({ name, dllVersion });
-	std::vector<Util::TableSortFunc> ffSorters = { nullptr, Util::VersionSortComparator };
-	Util::ShowSortedStringTableStrings(
-		"ffx_dll_versions",
-		headers,
-		ffRows,
-		0,
-		true,
-		ffSorters);
 
-	// Streamline section
-	if (ImGui::Selectable("NVIDIA Streamline DLLs (click to open folder)")) {
-		ShellExecuteW(nullptr, L"open", Streamline::PluginDir, nullptr, nullptr, SW_SHOWNORMAL);
+	// (46r) The frame-pacing and memory switches: kept for A/B tests, defaults are the tested ones.
+	if (!globals::game::isVR && streamline.featureReflex) {
+		bool reset = false;
+		if (Util::BeginABSwitchGroup("Frame pacing", reset)) {
+			if (reset) {
+				const Settings d{};
+				settings.reflexPacerStallFeedback = d.reflexPacerStallFeedback;
+				settings.reflexPacerHiddenWaits = d.reflexPacerHiddenWaits;
+				settings.reflexPacerBackstop = d.reflexPacerBackstop;
+				settings.reflexPacerNoOverSleep = d.reflexPacerNoOverSleep;
+				settings.reflexPacerSmoothPhase = d.reflexPacerSmoothPhase;
+			}
+			ImGui::Checkbox("Pacer: Move GPU Waits to Frame Start", &settings.reflexPacerStallFeedback);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("On (default): when the game stops in the middle of a frame to wait for the graphics card (one slow 'Map' every");
+				ImGui::TextUnformatted("frame), the pacer learns that wait and takes it at the start of the frame instead, before input is read.");
+			}
+			ImGui::Checkbox("Pacer: Count Hidden GPU Waits", &settings.reflexPacerHiddenWaits);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("On (default): waiting for the graphics card inside ordinary drawing calls (wall time minus the main thread's real");
+				ImGui::TextUnformatted("CPU time) is not counted as CPU work and is moved to the frame start like the 'Map' waits. Prevents uneven");
+				ImGui::TextUnformatted("long / short frames.");
+			}
+			ImGui::Checkbox("Pacer: Unlock Backstop", &settings.reflexPacerBackstop);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("On (default), a safety net: if the pacer has not slept for 30 frames while the graphics card is behind, it trims its");
+				ImGui::TextUnformatted("CPU reserve 0.5 ms per frame until it sleeps again, and hands it back at once if frames get slower.");
+			}
+			ImGui::Checkbox("Pacer: Never Over-Sleep", &settings.reflexPacerNoOverSleep);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("On (default): the pacer's learned extra sleep never runs past the moment the graphics card finishes the previous");
+				ImGui::TextUnformatted("frame (that would only leave the card idle), and shrinks fast when it was cut or frames are slower than the card.");
+			}
+			ImGui::Checkbox("Pacer: Smooth GPU Phase", &settings.reflexPacerSmoothPhase);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Off (default). On: predicts when the graphics card finishes a frame from the last several finishes instead of");
+				ImGui::TextUnformatted("only the last one, so the pacer's sleep jitters less from frame to frame.");
+			}
+			ImGui::TreePop();
+		}
 	}
-	std::vector<std::vector<std::string>> slRows;
-	for (const auto& [name, dllVersion] : Streamline::dllVersions)
-		slRows.push_back({ name, dllVersion });
-	std::vector<Util::TableSortFunc> slSorters = { nullptr, Util::VersionSortComparator };
-	Util::ShowSortedStringTableStrings(
-		"sl_dll_versions",
-		headers,
-		slRows,
-		0,
-		true,
-		slSorters);
+
+	{
+		bool reset = false;
+		if (Util::BeginABSwitchGroup("Save GPU Memory", reset)) {
+			if (reset) {
+				const Settings d{};
+				settings.keepGpuMemoryResident = d.keepGpuMemoryResident;
+				settings.saveVramRROnly = d.saveVramRROnly;
+				settings.saveVramSsgi = d.saveVramSsgi;
+				settings.saveVramFreeRtWhenOff = d.saveVramFreeRtWhenOff;
+				settings.saveVramFreeFgWhenOff = d.saveVramFreeFgWhenOff;
+				settings.saveVramUpscalerMasks = d.saveVramUpscalerMasks;
+				settings.saveVramNrdShared = d.saveVramNrdShared;
+				settings.copyRenderedAreaOnly = d.copyRenderedAreaOnly;
+				settings.renderResBuffers = d.renderResBuffers;
+				settings.renderResSsrt = d.renderResSsrt;
+				settings.precompileLazyShaders = d.precompileLazyShaders;
+			}
+			ImGui::Checkbox("Keep Our GPU Memory Resident", &settings.keepGpuMemoryResident);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("When video memory runs full, Windows moves memory out to system RAM, and whatever the card then needs from there");
+				ImGui::TextUnformatted("is read slowly. On (default): our ray-tracing memory and our work / history textures are the last to be moved");
+				ImGui::TextUnformatted("(game textures go first). Ray tracing: at once; the rest: for textures made after switching (restart for all).");
+			}
+			ImGui::Checkbox("Ray Reconstruction Textures Only With RR", &settings.saveVramRROnly);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("On (default): six 4K hand-over textures only DLSS Ray Reconstruction reads (about 250 MB) exist only while RR is on.");
+			ImGui::Checkbox("SSGI Light Textures Only With GI", &settings.saveVramSsgi);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("On (default): with SSGI's Indirect Lighting and specular GI both off, their textures (about 390 MB at 4K) are not kept. AO is unchanged.");
+			ImGui::Checkbox("Free Ray Tracing Memory When Off", &settings.saveVramFreeRtWhenOff);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("On (default): ray tracing switched off gives back its textures and buffers; the shadow denoiser not in use gives back its own.");
+			ImGui::Checkbox("Free Frame Generation Memory When Off", &settings.saveVramFreeFgWhenOff);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("Experiment, off by default: frame generation switched off in this menu gives back DLSS-G's memory (about 700 MB");
+				ImGui::TextUnformatted("at 4K); switching it on again makes it anew (a short hitch). Pause menus and the map are not affected.");
+			}
+			ImGui::Checkbox("Upscaler Masks Only For FSR", &settings.saveVramUpscalerMasks);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("On (default): two 4K mask textures only FSR reads are not kept with DLSS (DLSS has its own copies).");
+			ImGui::Checkbox("NRD Denoisers Share Scratch Textures", &settings.saveVramNrdShared);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("On (default): the NRD denoisers (SSRT REBLUR diffuse / specular, RT SIGMA) share their scratch textures (about 90 MB). Restart to apply.");
+			ImGui::Checkbox("Copy Only the Rendered Area", &settings.copyRenderedAreaOnly);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("On (default): the per-frame hand-over copies to DLSS (colour, motion, depth, RR inputs) copy only the part of the");
+				ImGui::TextUnformatted("picture that is rendered instead of the whole 4K texture. Depth buffers are always copied whole (a D3D11 rule).");
+			}
+			ImGui::Checkbox("Size Buffers to Render Resolution", &settings.renderResBuffers);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("On (default): ray tracing's shadow work textures and denoisers, and Subsurface Scattering's textures, are made at the");
+				ImGui::TextUnformatted("size the game really renders instead of 4K. Same picture. Changing the DLSS quality mode or this box re-makes them");
+				ImGui::TextUnformatted("on the spot (their history restarts once). Off: always 4K.");
+			}
+			ImGui::Checkbox("SSRT/SSGI Buffers at Render Resolution", &settings.renderResSsrt);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::TextUnformatted("On (default): Screen Space Ray Tracing's textures, its REBLUR denoisers and NRD's guides at the render size, and");
+				ImGui::TextUnformatted("SSRT's textures only while SSRT is on. Same picture; a quality-mode change restarts their history once.");
+				ImGui::TextUnformatted("Off: 4K and always allocated. (SSGI's own textures stay 4K.)");
+				const auto [w, h] = GetRenderAllocSize(true);
+				ImGui::Text("Now allocated at %ux%u.", w, h);
+			}
+			ImGui::Checkbox("Precompile Lazy Shaders", &settings.precompileLazyShaders);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("On (default): shaders first needed right after a loading screen (deferred composite, screen-space shadows) are prepared during the first loading screen.");
+			ImGui::TreePop();
+		}
+	}
+
+	if (ImGui::TreeNodeEx("Diagnostics")) {
+		if (!globals::game::isVR && streamline.featureReflex) {
+			const auto& pacer = Util::LatencyPacer::Last();
+			if (pacer.tracking)
+				ImGui::TextWrapped("Pacer: %d frame(s) on the GPU at frame start (%d after the wait), GPU period %.1f ms, CPU reserve %.1f ms (backstop -%.1f), slept %.1f ms "
+								   "(+%.1f ms bound, cut %.1f ms), waited inside D3D11 %.1f ms, hidden wait %.1f ms (learned %.1f ms, fast decay %.1f)",
+					pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.backstopMs, pacer.sleepMs, pacer.capWaitMs, pacer.overSleepCutMs,
+					pacer.stallMs, pacer.hiddenWaitMs, pacer.correctionMs, pacer.decayMs);
+			else
+				ImGui::TextDisabled("Pacer: waiting for the D3D12 swap chain");
+			if (!Util::EngineTiming::ProbesInstalled())
+				ImGui::TextDisabled("Reflex markers: engine probes %s, the old marker placement is used", Util::EngineTiming::ProbeStatus());
+		}
+		ImGui::Text("Our D3D11 textures / buffers alive: %.0f MB", static_cast<double>(Util::FrameTrace::OurD3D11LiveBytes()) / (1024.0 * 1024.0));
+		ImGui::Separator();
+		// FidelityFX section
+		if (ImGui::Selectable("AMD FidelityFX DLLs (click to open folder)")) {
+			ShellExecuteW(nullptr, L"open", FidelityFX::PluginDir, nullptr, nullptr, SW_SHOWNORMAL);
+		}
+		std::vector<std::string> headers = { "DLL Name", "Version" };
+		std::vector<std::vector<std::string>> ffRows;
+		for (const auto& [name, dllVersion] : FidelityFX::dllVersions)
+			ffRows.push_back({ name, dllVersion });
+		std::vector<Util::TableSortFunc> ffSorters = { nullptr, Util::VersionSortComparator };
+		Util::ShowSortedStringTableStrings(
+			"ffx_dll_versions",
+			headers,
+			ffRows,
+			0,
+			true,
+			ffSorters);
+
+		// Streamline section
+		if (ImGui::Selectable("NVIDIA Streamline DLLs (click to open folder)")) {
+			ShellExecuteW(nullptr, L"open", Streamline::PluginDir, nullptr, nullptr, SW_SHOWNORMAL);
+		}
+		std::vector<std::vector<std::string>> slRows;
+		for (const auto& [name, dllVersion] : Streamline::dllVersions)
+			slRows.push_back({ name, dllVersion });
+		std::vector<Util::TableSortFunc> slSorters = { nullptr, Util::VersionSortComparator };
+		Util::ShowSortedStringTableStrings(
+			"sl_dll_versions",
+			headers,
+			slRows,
+			0,
+			true,
+			slSorters);
+		ImGui::TreePop();
+	}
 
 	ImGui::TreePop();
 }

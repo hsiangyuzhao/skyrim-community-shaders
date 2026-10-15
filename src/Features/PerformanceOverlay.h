@@ -6,6 +6,8 @@
 #include "PerformanceOverlay/StableTable.h"
 #include "Utils/PerfUtils.h"
 #include <nlohmann/json.hpp>
+#include <d3d11.h>               // FrameTrace.h names ID3D11DeviceContext
+#include "Utils/FrameTrace.h"  // (46r) SeriesStats / Smoothed copies kept while frozen
 #include <algorithm>
 #include <optional>
 #include <span>
@@ -314,8 +316,15 @@ struct PerformanceOverlay : OverlayFeature
 	PerfView::ViewConfig MakeViewConfig() const;
 	/// @brief Feeds this frame's readings into every table's display state (skipped while frozen).
 	void UpdateViews(double a_now, const DrawCallRowSets& a_rowSets, const PerfView::ViewConfig& a_cfg);
-	/// @brief Always-visible two-line summary: FPS, frame time, our GPU total, bottleneck.
+	/// @brief Always-visible plain-words summary: FPS, frame time, smoothness, CPU vs GPU, latency,
+	///        VRAM, ray tracing and the most expensive GPU work. Display only: reads what the
+	///        tables and timers already collect, never turns on any measurement of its own.
 	void DrawCompactSummary(const PerfView::ViewConfig& a_cfg);
+	/// @brief The five most expensive GPU passes / engine stages, from the tables' display state.
+	void DrawTopGpuPasses(const PerfView::ViewConfig& a_cfg);
+	/// @brief Local video memory in use and the budget, queried at most once per overlay frame
+	///        (shared by the summary and the VRAM details). False when not available.
+	bool GetVramInfo(uint64_t& o_usage, uint64_t& o_budget);
 	/// @brief Sort / smoothing / Top N / Peak / Freeze controls. Shared by the menu page and the overlay.
 	void DrawViewOptions();
 	/// @brief (batch 36e) Per-dispatch timing of the SSRT denoiser chain (Util::DenoiserTimers).
@@ -529,22 +538,28 @@ struct PerformanceOverlay : OverlayFeature
 		uint32_t FreezeKey = VK_F11;    // freeze / unfreeze every number (also logs a snapshot)
 		int DenoiserLogInterval = 0;    // seconds between denoiser log lines, 0 = off
 
-		// Collapsible sections; open state is part of the saved settings.
-		bool SectionFrame = true;
+		// Collapsible "Details: ..." sections; open state is part of the saved settings.
+		// (46r) All collapsed by default: the plain-words summary on top is the default view.
+		bool SectionFrame = false;
 		bool SectionBottleneck = false;
-		bool SectionShaderTypes = true;
+		bool SectionShaderTypes = false;
 		bool SectionCsCpu = false;
-		bool SectionGpuPasses = true;
+		bool SectionGpuPasses = false;
 		bool SectionEngine = false;
 		bool SectionDenoiser = false;
 		bool SectionGrass = false;
-		bool SectionVram = true;
+		bool SectionVram = false;
 		bool SectionView = false;
 		bool SectionOcclusion = false;  // (batch 37a) "Occlusion (dry run)"
 		bool SectionShadows = false;    // (batch 37a) "Shadow maps"
 
+		// (46r) UI layout only. A saved file without this key (or below the current value) gets every
+		// Section* flag collapsed once on load; see LoadSettings.
+		static constexpr int kOverlayLayoutVersion = 2;
+		int OverlayLayoutVersion = kOverlayLayoutVersion;
+
 		// (44e) CPU wait split, screenshot and frame trace.
-		bool SectionCpuWait = true;          // "CPU vs GPU (real frames)" section
+		bool SectionCpuWait = false;         // "CPU vs GPU (real frames)" section
 		bool DriverWaitTiming = true;        // time D3D11 calls (only while the overlay is shown or a trace records)
 		// (44f) Probes on the calls in Main::Update (engine CPU split, Reflex markers at render start).
 		// Read once at startup (restart to apply). EngineTimingOff.txt next to SettingsUser.json also turns them off.
@@ -585,6 +600,14 @@ struct PerformanceOverlay : OverlayFeature
 		// Copies taken at the moment of freezing, so the FPS block and graphs freeze too.
 		std::optional<State> frozenState;
 		FrameStats frozenStats{};
+		// (46r) Real-frame CPU vs GPU and the Reflex readings, held with the rest while frozen.
+		Util::FrameTrace::SeriesStats frozenSeries{};
+		Util::FrameTrace::Smoothed frozenSmoothed{};
+		// (46r) Video memory, queried once per overlay frame (ImGui frame count) and shared.
+		int vramFrame = -1;
+		bool vramValid = false;
+		uint64_t vramUsage = 0;
+		uint64_t vramBudget = 0;
 		// Render / output resolution at the last update, for the denoiser table header.
 		uint32_t renderWidth = 0, renderHeight = 0, outputWidth = 0, outputHeight = 0;
 	};

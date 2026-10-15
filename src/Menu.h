@@ -205,6 +205,7 @@ public:
 		UIIcon debug;
 		UIIcon materials;
 		UIIcon postProcessing;
+		UIIcon rayTracing;
 	} uiIcons;
 
 	struct ThemeSettings

@@ -2015,7 +2015,7 @@ void DynamicSnow::UpdateTrailMap()
 		if (trailClock - trailPausedAt > refill * 1.5)
 			trailContentValid = false;
 	}
-	status.trailUpkeep = !upkeep ? "paused (no snow near)" : timeStamped ? "time-stamped (no refill pass)" : "44d refill pass";
+	status.trailUpkeep = !upkeep ? "paused (no snow near)" : timeStamped ? "time-stamped (no refill pass)" : "refill pass";
 
 	if (upkeep)
 		GatherStamps(player->GetPosition());
@@ -2264,10 +2264,10 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextUnformatted(
 				"On (default): under a roof, eaves or an overhang a character's snow stops building up; what is already\n"
 				"on them stays (and melts as usual when it stops snowing). Checked with a ray straight up from the head.\n"
-				"Off: the 46a behaviour (snow fades per pixel under anything that blocks the sky, so it vanishes under eaves).");
+				"Off: snow fades per pixel under anything that blocks the sky (it vanishes under eaves).");
 		ImGui::EndDisabled();
-		// (46d) Diagnostics: the player's water and snow state.
-		if (settings.CharacterSnowBuildUp && globals::features::skin.loaded) {
+		// (46d) Diagnostics: the player's water and snow state. (46r) In a collapsed node.
+		if (settings.CharacterSnowBuildUp && globals::features::skin.loaded && ImGui::TreeNodeEx("Player snow readout (diagnostics)")) {
 			const auto& w = globals::features::skin.playerWater;
 			const auto& ps = globals::features::skin.playerSnow;
 			auto z = [](float a_z) { return a_z > -1e29f ? std::format("{:.0f}", a_z) : std::string("none"); };
@@ -2276,6 +2276,7 @@ void DynamicSnow::DrawSettings()
 				w.clamped ? std::format(" (clamped from {:.0f})", w.rawDepth).c_str() : "", w.swimming ? ", swimming" : "");
 			ImGui::TextDisabled("Player snow: %.2f, washed part %.2f below %.0f units, %s", ps.amount, ps.washed, ps.washDepth,
 				ps.sheltered ? "under a roof" : "open sky");
+			ImGui::TreePop();
 		}
 		if (settings.CharacterSnowBuildUp && !(globals::features::skin.loaded && globals::features::skin.settings.EnableSkin))
 			ImGui::TextDisabled("Advanced Skin is off: characters show the ground's snow.");
@@ -2311,18 +2312,7 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextUnformatted("Off = only the player leaves prints.");
 
 		// Prints are shaped from installed footprint textures (Realistic PBR Footprints, or Footprints
-		// itself); plain ovals when none are installed.
-		ImGui::Checkbox("Load Footprint Shapes in the Background", &settings.BackgroundShapeLoad);  // (46q)
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"On: the footprint shapes are prepared on a helper thread the first time prints are made (plain ovals for the\n"
-				"fraction of a second until they are ready), instead of one 20-30 ms hitch. Off: as 46p. F7: snow_shapes_ms.");
-		if (!shapesTried)
-			ImGui::TextDisabled(shapeFuture.valid() ? "Print shapes: loading in the background" : "Print shapes: loaded the first time prints are made");
-		else if (status.shapesLoaded)
-			ImGui::TextDisabled("Print shapes: %u from %s", status.shapesLoaded, status.shapeSource.c_str());
-		else
-			ImGui::TextDisabled("Print shapes: no footprint textures found, oval prints");
+		// itself); plain ovals when none are installed. (46r) Background Shape Load and the shape status: under Debug.
 		// (44h) "Leave Snowy Ground to the Footprints Mod" removed: off, our prints go everywhere set above.
 		ImGui::Checkbox("Trenches from Bodies and Objects", &settings.BodyAndObjectTrails);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -2502,6 +2492,12 @@ void DynamicSnow::DrawSettings()
 		}
 
 		ImGui::SeparatorText("Footprints");
+		if (!shapesTried)
+			ImGui::TextDisabled(shapeFuture.valid() ? "Print shapes: loading in the background" : "Print shapes: loaded the first time prints are made");
+		else if (status.shapesLoaded)
+			ImGui::TextDisabled("Print shapes: %u from %s", status.shapesLoaded, status.shapeSource.c_str());
+		else
+			ImGui::TextDisabled("Print shapes: no footprint textures found, oval prints");
 		ImGui::Text("Now: %s", !TrailsActive() ? "off" : !status.exterior ? "indoors" :
 													 status.trailsDrawn   ? "on" :
 																			"starting");
@@ -2509,6 +2505,19 @@ void DynamicSnow::DrawSettings()
 			ImGui::Text("Actors tracked: %u   Prints this frame: %u (trenches %u)   Map: %u x %u", status.actorsTracked, status.stamps, status.bodyStamps, status.trailMapSize, status.trailMapSize);
 		if (status.exterior && TrailsActive())
 			ImGui::Text("Map upkeep: %s", status.trailUpkeep);
+
+		// (46r) A/B switches (saved; the defaults are the tested ones).
+		bool reset = false;
+		if (Util::BeginABSwitchGroup(nullptr, reset)) {
+			if (reset)
+				settings.BackgroundShapeLoad = Settings{}.BackgroundShapeLoad;
+			ImGui::Checkbox("Load Footprint Shapes in the Background", &settings.BackgroundShapeLoad);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted(
+					"On (default): the footprint shapes are prepared on a helper thread the first time prints are made (plain ovals\n"
+					"for the fraction of a second until they are ready), instead of one 20-30 ms hitch. Off: loaded at once. F7: snow_shapes_ms.");
+			ImGui::TreePop();
+		}
 		ImGui::TreePop();
 	}
 }

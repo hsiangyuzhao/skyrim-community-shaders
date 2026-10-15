@@ -48,6 +48,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <ctime>
@@ -200,6 +201,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SectionOcclusion,
 	SectionShadows,
 	SectionCpuWait,
+	OverlayLayoutVersion,
 	DriverWaitTiming,
 	EngineTimingProbes,
 	StallSampler,
@@ -221,6 +223,144 @@ static const std::unordered_map<RE::BSShader::Type, std::string> kShaderTypeTool
 	{ RE::BSShader::Type::BloodSplatter, "Draw calls for blood splatter effects." },
 	{ RE::BSShader::Type::ImageSpace, "Draw calls for image space post-processing effects." }
 };
+
+namespace
+{
+	/// (46r) Plain names for the rows of the GPU passes table (row id = GpuPassTimers::kRowIdBase +
+	/// bucket). Display only: the log, the F12 JSON and the F7 trace keep the timers' own labels.
+	/// nullptr = keep the timer's own label.
+	const char* FriendlyGpuPassName(int a_rowId)
+	{
+		const int index = a_rowId - Util::GpuPassTimers::kRowIdBase;
+		if (index < 0 || index >= static_cast<int>(Util::GpuBucket::Count))
+			return nullptr;
+		using B = Util::GpuBucket;
+		switch (static_cast<B>(index)) {
+		case B::SSRTDepthPyramid:
+			return "Screen-space ray tracing (SSRT): depth prep";
+		case B::SSRTTraceDiffuse:
+			return "SSRT: bounce-light rays";
+		case B::SSRTSparseResolve:
+			return "SSRT: filling in skipped pixels";
+		case B::SSRTTraceSpecular:
+			return "SSRT: reflection rays";
+		case B::SSRTComposite:
+			return "SSRT: blending into the picture";
+		case B::SSRTSvgf:
+			return "SSRT denoiser (SVGF)";
+		case B::SSRTReblur:
+			return "SSRT denoiser (REBLUR)";
+		case B::SSRTConfidenceFilter:
+			return "SSRT confidence filter";
+		case B::NRDGuides:
+			return "SSRT denoiser inputs (NRD guides)";
+		case B::SSGI:
+			return "Screen Space GI";
+		case B::SSGIContactAO:
+			return "Screen Space GI: contact AO";
+		case B::PhysicalSkyShadowAccum:
+			return "Physical Sky: shadows in the air";
+		case B::PhysicalSkyLuts:
+			return "Physical Sky: lookup tables";
+		case B::SkylightingHeightMap:
+			return "Skylighting: height map";
+		case B::SkylightingProbes:
+			return "Skylighting: light probes";
+		case B::PostProcessing:
+			return "Post-processing (Community Shaders)";
+		case B::SubsurfaceScattering:
+			return "Skin subsurface scattering";
+		case B::SubsurfaceScatteringPrepass:
+			return "Skin subsurface scattering: pre-pass";
+		case B::LightLimitFix:
+			return "Light Limit Fix (sorting lights)";
+		case B::VolumetricLighting:
+			return "Volumetric lighting (light shafts)";
+		case B::DynamicCubemaps:
+			return "Dynamic cubemap reflections";
+		case B::GrassOptimizations:
+			return "Grass loading (Grass Optimizations)";
+		case B::GrassCulling:
+			return "Grass culling (Grass Optimizations)";
+		case B::VariableRateShading:
+			return "Variable Rate Shading";
+		case B::NeuralRendering:
+			return "DLSS 5 Neural Rendering: prepare";
+		case B::NeuralRenderingModel:
+			return "DLSS 5 Neural Rendering: model";
+		case B::NeuralRenderingFinalize:
+			return "DLSS 5 Neural Rendering: finish";
+		case B::LocalExposure:
+			return "Local exposure";
+		case B::VolumetricFogNear:
+			return "Volumetric fog (near)";
+		case B::VolumetricFogFar:
+			return "Volumetric fog (far)";
+		case B::VolumetricShadows:
+			return "Shadows for smoke and effects";
+		case B::SnowTrails:
+			return "Snow footprints";
+		case B::HDROutput:
+			return "HDR output";
+		case B::PPAutoExposure:
+			return "Auto exposure";
+		case B::PPBloom:
+			return "Bloom";
+		case B::PPColorGrading:
+			return "Color grading & tone mapping";
+		case B::PPFinalCopy:
+			return "Final picture copy";
+		case B::VanillaHDR:
+			return "Game's own HDR / bloom prep";
+		case B::RayTracing:
+			return "Ray-traced shadows";
+		case B::ScreenSpaceShadows:
+			return "Screen-space contact shadows";
+		case B::RayTracingDenoise:
+			return "Ray-traced shadows: denoiser tiles";
+		case B::RayTracingDenoiseFilter:
+			return "Ray-traced shadows: denoiser blur";
+		case B::RayTracingSigma:
+			return "Ray-traced shadows: SIGMA denoiser";
+		case B::RayTracingCombine:
+			return "Ray-traced shadows: merge into shadows";
+		case B::RayTracingSync:
+			return "Ray-traced shadows: waiting for the trace";
+		case B::RayTracingPointDenoise:
+			return "Ray-traced lamp shadows: denoiser";
+		case B::RayTracingSyncPoint:
+			return "Ray-traced lamp shadows: waiting for the trace";
+		case B::RayTracingAO:
+			return "Ray-traced AO: filter";
+		case B::RayTracingAOSync:
+			return "Ray-traced AO: waiting for the trace";
+		default:
+			return nullptr;
+		}
+	}
+
+	/// (46r) The GPU passes buckets that belong to Ray Tracing (sun shadows, lamp shadows, AO).
+	constexpr Util::GpuBucket kRayTracingBuckets[] = {
+		Util::GpuBucket::RayTracing,
+		Util::GpuBucket::RayTracingDenoise,
+		Util::GpuBucket::RayTracingDenoiseFilter,
+		Util::GpuBucket::RayTracingSigma,
+		Util::GpuBucket::RayTracingCombine,
+		Util::GpuBucket::RayTracingSync,
+		Util::GpuBucket::RayTracingPointDenoise,
+		Util::GpuBucket::RayTracingAO,
+		Util::GpuBucket::RayTracingAOSync,
+		Util::GpuBucket::RayTracingSyncPoint,
+	};
+
+	/// A table label without the ':' the tables append.
+	std::string_view WithoutColon(std::string_view a_label)
+	{
+		if (!a_label.empty() && a_label.back() == ':')
+			a_label.remove_suffix(1);
+		return a_label;
+	}
+}
 // ============================================================================
 // VIRTUAL OVERRIDES (Feature.h interface)
 // ============================================================================
@@ -263,9 +403,12 @@ void PerformanceOverlay::DrawSettings()
 		ImGui::Separator();
 
 		ImGui::Checkbox("Show FPS Counter", &this->settings.ShowFPS);
-		ImGui::Checkbox("Show Draw Calls", &this->settings.ShowDrawCalls);
+		ImGui::Checkbox("Measure time per effect (detail tables)", &this->settings.ShowDrawCalls);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::TextUnformatted("Shows the detailed performance tables: bottleneck summary, CPU time per shader type and per Community Shaders feature, and GPU time per effect and per engine stage.");
+			ImGui::TextUnformatted(
+				"While the overlay is on screen, times every effect and engine stage on the GPU and the CPU.\n"
+				"Feeds the \"Most expensive on the GPU\" list, the ray tracing cost and the detail tables.\n"
+				"Costs a little GPU time for the timers; nothing while the overlay is hidden.");
 		}
 		ImGui::Checkbox("Show VRAM Usage", &this->settings.ShowVRAM);
 
@@ -307,7 +450,7 @@ void PerformanceOverlay::DrawSettings()
 		ImGui::Spacing();
 
 		// (batch 36e) How the tables are smoothed, ordered and trimmed. The same controls are
-		// in the overlay's own "View options" section.
+		// in the overlay's own "Overlay options" section.
 		ImGui::TextUnformatted("Readability");
 		ImGui::Separator();
 		DrawViewOptions();
@@ -352,6 +495,28 @@ void PerformanceOverlay::LoadSettings(json& j)
 	this->settings.SmoothingWindow = std::clamp(this->settings.SmoothingWindow, 0.1f, 5.0f);
 	this->settings.TopN = std::clamp(this->settings.TopN, 0, 64);
 	this->settings.DenoiserLogInterval = std::clamp(this->settings.DenoiserLogInterval, 0, 600);
+	// (46r) UI layout only: the overlay now opens on a plain-words summary with every "Details"
+	// section collapsed. A file saved before that (no OverlayLayoutVersion key, which the macro
+	// would otherwise fill with the current default) gets its sections collapsed once; after that
+	// the user's own open/closed choices are kept. Nothing measured or saved depends on this.
+	const bool hasLayoutVersion = j.is_object() && j.contains("OverlayLayoutVersion");
+	if (!hasLayoutVersion || this->settings.OverlayLayoutVersion < Settings::kOverlayLayoutVersion) {
+		auto& s = this->settings;
+		s.SectionFrame = false;
+		s.SectionBottleneck = false;
+		s.SectionShaderTypes = false;
+		s.SectionCsCpu = false;
+		s.SectionGpuPasses = false;
+		s.SectionEngine = false;
+		s.SectionDenoiser = false;
+		s.SectionGrass = false;
+		s.SectionVram = false;
+		s.SectionView = false;
+		s.SectionOcclusion = false;
+		s.SectionShadows = false;
+		s.SectionCpuWait = false;
+		s.OverlayLayoutVersion = Settings::kOverlayLayoutVersion;
+	}
 	if (j.is_object() && j.contains("OcclusionDryRun"))
 		Util::OcclusionDryRun::Load(j["OcclusionDryRun"]);
 	// Ensure history buffers match loaded size
@@ -545,51 +710,62 @@ void PerformanceOverlay::DrawOverlay()
 	// (41a) Which A/B Compare slot is showing (nothing until a slot has been stored).
 	ABCompare::DrawOverlayHeaderLine();
 
-	// Always on top, never collapsible: the four numbers that answer "how is it going".
+	// Always on top, never collapsible: the plain-words summary that answers "how is it going".
 	DrawCompactSummary(viewCfg);
 
-	if (Section("View options", this->settings.SectionView, "Sorting, smoothing, Top N, Peak column and Freeze."))
+	// (46r) Everything below is the old debug view, unchanged in content, as collapsed "Details"
+	// sections. Collapsing a section only hides it: the timers run on "Measure time per effect"
+	// (ShowDrawCalls) and the overlay being on screen, except the SSRT denoiser per pass, which
+	// is measured only while its own section is open (as before).
+	ImGui::Spacing();
+	if (Section("Overlay options##PerfSecView", this->settings.SectionView, "Sorting, smoothing, Top N, Peak column, Freeze, screenshot and frame trace keys."))
 		DrawViewOptions();
 
-	// Show FPS counter if enabled
-	if (this->settings.ShowFPS && Section("Frame rate & graphs", this->settings.SectionFrame)) {
+	if (this->settings.ShowFPS && Section("Details: Frame rate & graphs##PerfSecFrame", this->settings.SectionFrame,
+									  "Frame rate, average and 1% low over 10 s, frame generation, and the frame-time graphs.")) {
 		DrawFPS();
 	}
 
 	// (44e) Real-frame CPU vs GPU, and where the CPU waits. Measurement only.
-	if (Section("CPU vs GPU (real frames)", this->settings.SectionCpuWait,
+	if (Section("Details: CPU vs GPU (real frames, ms)##PerfSecCpuWait", this->settings.SectionCpuWait,
 			"CPU frame = game update start (after the Reflex sleep) to Present: everything the CPU does for one real frame, "
 			"including time stuck inside D3D11 calls. GPU frame = the GPU work for that frame. Plus where the CPU waits."))
 		DrawCpuWaitSection();
 
-	// Show Draw Calls if enabled
 	if (this->settings.ShowDrawCalls) {
-		if (Section("CPU / GPU split", this->settings.SectionBottleneck))
+		if (Section("Details: CPU busy vs waiting (ms)##PerfSecBottleneck", this->settings.SectionBottleneck,
+				"How much of each frame the CPU works and how long it waits for the frame to be shown, plus the GPU time split."))
 			DrawBottleneckSummary();
-		if (Section("Shader types (CPU)", this->settings.SectionShaderTypes))
+		if (Section("Details: Shader types (CPU time, ms)##PerfSecShaderTypes", this->settings.SectionShaderTypes,
+				"CPU time the game spends drawing each kind of object, plus Community Shaders, the Present wait and the engine's own work."))
 			DrawDrawCallsTable(rowSets.cpuRows, rowSets.summaryRows);
-		if (Section("Community Shaders (CPU submit)", this->settings.SectionCsCpu))
+		if (Section("Details: Community Shaders CPU submit (ms)##PerfSecCsCpu", this->settings.SectionCsCpu,
+				"CPU time Community Shaders spends preparing each effect and sending it to the GPU."))
 			DrawOurCpuPassTable(rowSets.ourCpuRows);
-		if (Section("GPU passes", this->settings.SectionGpuPasses))
+		if (Section("Details: GPU time per effect (ms)##PerfSecGpuPasses", this->settings.SectionGpuPasses,
+				"GPU time of each Community Shaders effect, and how the whole GPU frame adds up."))
 			DrawGpuPassTable(rowSets.gpuRows);
-		if (Section("Engine passes (GPU)", this->settings.SectionEngine))
+		if (Section("Details: GPU time per engine stage (ms)##PerfSecEngine", this->settings.SectionEngine,
+				"The whole GPU frame split into the game's rendering stages (shadows, scene, water, sky, post-processing...)."))
 			DrawEngineGpuTable();
-		if (Section("Shadow maps", this->settings.SectionShadows,
+		if (Section("Details: Shadow maps##PerfSecShadows", this->settings.SectionShadows,
 				"How the sun shadow is set up this frame: cascade count and distances, character and lamp shadow maps. "
-				"Their cost is in the Shadows rows of \"Engine passes\"."))
+				"Their cost is in the Shadows rows of \"GPU time per engine stage\"."))
 			DrawShadowInfo();
-		if (Section("Occlusion (dry run)", this->settings.SectionOcclusion,
+		if (Section("Details: Occlusion dry run (counting only)##PerfSecOcclusion", this->settings.SectionOcclusion,
 				"How many objects an occlusion cull could skip here. Counting only: nothing is ever hidden."))
 			Util::OcclusionDryRun::DrawPanel(menu->IsEnabled);
-		if (Section("Denoiser breakdown", this->settings.SectionDenoiser,
+		if (Section("Details: SSRT denoiser per pass (ms)##PerfSecDenoiser", this->settings.SectionDenoiser,
 				"Every pass of the SSRT denoiser chain, timed on its own. Only measured while this section is open."))
 			DrawDenoiserTable(viewCfg);
-		if (globals::features::grassOptimizations.loaded && Section("Grass Optimizations", this->settings.SectionGrass))
+		if (globals::features::grassOptimizations.loaded && Section("Details: Grass optimisation counters##PerfSecGrass", this->settings.SectionGrass,
+																 "Grass Optimizations' own counters (how much grass is loaded, culled and drawn)."))
 			globals::features::grassOptimizations.DrawOverlayStats();
 	}
 
 	// VRAM & GPU Usage
-	if (this->settings.ShowVRAM && menu->GetDXGIAdapter3() && Section("VRAM", this->settings.SectionVram)) {
+	if (this->settings.ShowVRAM && menu->GetDXGIAdapter3() && Section("Details: VRAM##PerfSecVram", this->settings.SectionVram,
+																	 "Video memory in use and the budget Windows gives the game.")) {
 		DrawVRAM();
 	}
 
@@ -796,21 +972,37 @@ void PerformanceOverlay::DrawFPS()
 	}
 }
 
+bool PerformanceOverlay::GetVramInfo(uint64_t& o_usage, uint64_t& o_budget)
+{
+	// (46r) One DXGI query per overlay frame, shared by the summary and the VRAM details.
+	const int frame = ImGui::GetFrameCount();
+	if (view.vramFrame != frame) {
+		view.vramFrame = frame;
+		view.vramValid = false;
+		auto* menu = Menu::GetSingleton();
+		winrt::com_ptr<IDXGIAdapter3> dxgiAdapter3 = menu ? menu->GetDXGIAdapter3() : winrt::com_ptr<IDXGIAdapter3>{};
+		if (dxgiAdapter3) {
+			DXGI_QUERY_VIDEO_MEMORY_INFO videoMemoryInfo{};
+			const HRESULT hr = dxgiAdapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &videoMemoryInfo);
+			// Only valid if the call succeeded and Budget is not zero
+			if (SUCCEEDED(hr) && videoMemoryInfo.Budget > 0) {
+				view.vramValid = true;
+				view.vramUsage = videoMemoryInfo.CurrentUsage;
+				view.vramBudget = videoMemoryInfo.Budget;
+			}
+		}
+	}
+	o_usage = view.vramUsage;
+	o_budget = view.vramBudget;
+	return view.vramValid;
+}
+
 void PerformanceOverlay::DrawVRAM()
 {
-	auto menu = Menu::GetSingleton();
-	if (!menu)
-		return;
-	auto dxgiAdapter3 = menu->GetDXGIAdapter3();
-	if (!dxgiAdapter3)
-		return;
-	DXGI_QUERY_VIDEO_MEMORY_INFO videoMemoryInfo{};
-	HRESULT hr = dxgiAdapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &videoMemoryInfo);
-
-	// Only proceed if the call succeeded and Budget is not zero
-	if (SUCCEEDED(hr) && videoMemoryInfo.Budget > 0) {
-		float currentGpuUsage = videoMemoryInfo.CurrentUsage / (1024.f * 1024.f * 1024.f);
-		float totalGpuMemory = videoMemoryInfo.Budget / (1024.f * 1024.f * 1024.f);
+	uint64_t usageBytes = 0, budgetBytes = 0;
+	if (GetVramInfo(usageBytes, budgetBytes)) {
+		float currentGpuUsage = usageBytes / (1024.f * 1024.f * 1024.f);
+		float totalGpuMemory = budgetBytes / (1024.f * 1024.f * 1024.f);
 		float percent = currentGpuUsage / totalGpuMemory;
 
 		// Center the VRAM text
@@ -1697,7 +1889,14 @@ void PerformanceOverlay::DrawGpuPassTable(const std::vector<DrawCallRow>& gpuRow
 	float totalMs = 0.0f;
 	overlay.view.shaderFooter.DisplayValue(magic_enum::enum_integer(SpecialShaderType::Total), cfg, totalMs);
 
-	const auto mainView = MaterializeRows(overlay.view.gpuPasses, overlay.view.gpuPasses.DisplayOrder(cfg), cfg, totalMs, false);
+	auto mainView = MaterializeRows(overlay.view.gpuPasses, overlay.view.gpuPasses.DisplayOrder(cfg), cfg, totalMs, false);
+	// (46r) Plain names on screen; the timer's own name stays in the tooltip (and in the log / JSON).
+	for (auto& row : mainView) {
+		if (const char* friendly = FriendlyGpuPassName(row.shaderType)) {
+			row.tooltip = std::format("({})\n{}", WithoutColon(row.label), row.tooltip);
+			row.label = std::string(friendly) + ":";
+		}
+	}
 	PerfView::ViewConfig footerCfg = cfg;
 	footerCfg.sort = PerfView::SortMode::Fixed;
 	footerCfg.topN = 0;
@@ -1808,7 +2007,7 @@ namespace
 			{ "Community Shaders", "Our own GPU work, listed so the table adds up to the whole frame.",
 				{
 					{ P::CsPasses, "Timed passes",
-						"Our passes from the GPU Passes table above.\n"
+						"Our passes from \"Details: GPU time per effect\".\n"
 						"Should be close to its \"Measured GPU\" line." },
 					{ P::CsOther, "Other CS work",
 						"Our work without a GPU Passes row:\n"
@@ -1977,7 +2176,11 @@ namespace
 		kSummaryGpuUntracked,
 		kSummaryGpuGap,
 		kSummaryFrame,  // the overlay's own Present-to-Present frame time
-		kSummaryPostFgFrame
+		kSummaryPostFgFrame,
+		// (46r) Display only (not in the log snapshot or the F12 JSON): Ray Tracing's GPU time on the
+		// game's queue (sum of its GPU passes rows) and its own D3D12 queue (last trace sample).
+		kSummaryRtMain,
+		kSummaryRtAsync
 	};
 
 	/// CPU-bound / GPU-bound verdict from the share of the frame the CPU spends in Present.
@@ -2647,7 +2850,7 @@ PerformanceOverlay::DrawCallRowSets PerformanceOverlay::BuildDrawCallRows() cons
 		"CS features (CPU):", magic_enum::enum_integer(SpecialShaderType::OurCpu), kDrawCallsNotApplicable,
 		ourCpuTotal, Util::CalculatePercentage(ourCpuTotal, smoothedFrameTime), 0.0f,
 		std::string("CPU time Community Shaders itself spends preparing work for the GPU. "
-					"Broken down per feature in the \"Community Shaders (CPU submit)\" table below; "
+					"Broken down per feature in \"Details: Community Shaders CPU submit\"; "
 					"it is not counted again in the shader rows above, so the table still adds up."),
 		true, std::nullopt, std::nullopt
 	};
@@ -3290,6 +3493,8 @@ void PerformanceOverlay::ToggleFreeze()
 		view.frozenAt = NowSeconds();
 		view.frozenState = state;
 		view.frozenStats = ComputeFrameStats();
+		view.frozenSeries = Util::FrameTrace::GetSeriesStats(10.0f);  // (46r) summary's CPU vs GPU
+		view.frozenSmoothed = Util::FrameTrace::GetSmoothed();         // (46r) summary's Reflex readings
 		view.pendingSnapshot = true;  // written on the next overlay frame, once tables are drawn
 		view.pendingJsonSave = true;  // (batch 37a) and the same frame as a JSON file
 	} else {
@@ -3358,7 +3563,7 @@ void PerformanceOverlay::UpdateViews(double a_now, const DrawCallRowSets& a_rowS
 								"(shadows, scenery, water, its post-processing) and DLSS/FSR upscaling. "
 								"Frame generation is not here; it is in \"Gap\".\n\n"
 								"Large here and small in \"Measured GPU\" means Community Shaders is not what is "
-								"costing you the frame. The \"Engine passes (GPU)\" section breaks this down by stage."),
+								"costing you the frame. \"Details: GPU time per engine stage\" breaks this down by stage."),
 					true, std::nullopt, std::nullopt },
 				untrackedMs, 1 });
 			footer.push_back(DcIn{ kGpuGapRowId,
@@ -3549,6 +3754,19 @@ void PerformanceOverlay::UpdateViews(double a_now, const DrawCallRowSets& a_rowS
 			in.push_back(SIn{ kSummaryFrame, 0, state.frameTimeMs, 0 });
 		if (state.isFrameGenerationActive && state.postFGFrameTimeMs > 0.0f)
 			in.push_back(SIn{ kSummaryPostFgFrame, 0, state.postFGFrameTimeMs, 0 });
+		// (46r) Ray Tracing's cost for the summary, from readings that already exist: its GPU passes
+		// buckets (0 while the timers are off or it did not run) and its own last D3D12 trace sample.
+		if (const auto& rt = globals::features::rayTracing; rt.loaded && rt.settings.Enabled) {
+			const auto* gpuTimers = Util::GpuPassTimers::GetSingleton();
+			float rtMainMs = 0.0f;
+			for (const auto bucket : kRayTracingBuckets)
+				rtMainMs += gpuTimers->SmoothedMs(bucket);
+			if (rtMainMs > 0.0f)
+				in.push_back(SIn{ kSummaryRtMain, 0, rtMainMs, 0 });
+			const auto sample = rt.GetTraceSample();
+			if (sample.gpuMs >= 0.0f)
+				in.push_back(SIn{ kSummaryRtAsync, 0, sample.gpuMs, 0 });
+		}
 		view.summary.Update(a_now, std::move(in), a_cfg);
 	}
 }
@@ -3582,54 +3800,273 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 		ImGui::TextColored(blinkOff ? ImVec4(color.x, color.y, color.z, 0.35f) : color, "%s", view.message.c_str());
 	}
 
-	float frameMs = 0.0f;
-	if (value(kSummaryFrame, frameMs) && frameMs > 0.0f)
-		ImGui::Text("%s %.1f (%.2f ms)", state.isFrameGenerationActive ? "Raw FPS" : "FPS", 1000.0f / frameMs, frameMs);
-	else
-		ImGui::TextDisabled("FPS: collecting...");
-	if (ImGui::IsItemHovered()) {
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Frame rate before frame generation, %s.",
-				a_cfg.showLive ? "live" : std::format("averaged over {:.2f} s", a_cfg.windowSeconds).c_str());
-		}
-	}
-	float postFgMs = 0.0f;
-	if (value(kSummaryPostFgFrame, postFgMs) && postFgMs > 0.0f) {
-		ImGui::SameLine(0.0f, 16.0f);
-		ImGui::Text("Post-FG %.1f", 1000.0f / postFgMs);
-	}
-	if (view.frozen) {
-		ImGui::SameLine(0.0f, 16.0f);
-		ImGui::TextColored(theme.StatusPalette.Warning, "FROZEN");
+	// (46r) Plain-words summary. Display only: every number is one the overlay already collects
+	// (view.summary, the frame clock, the F7 series, the DXGI budget, Ray Tracing's own sample).
+	// While frozen, everything comes from the copies taken at the moment of freezing (VRAM stays live).
+	const State& st = (view.frozen && view.frozenState) ? *view.frozenState : state;
+	const FrameStats stats = view.frozen ? view.frozenStats : ComputeFrameStats();
+	const Util::FrameTrace::SeriesStats series = view.frozen ? view.frozenSeries : Util::FrameTrace::GetSeriesStats(10.0f);
+	const Util::FrameTrace::Smoothed traceSmoothed = view.frozen ? view.frozenSmoothed : Util::FrameTrace::GetSmoothed();
+
+	const auto tooltip = [](const char* a_text) {
 		if (ImGui::IsItemHovered()) {
 			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text(
-					"All numbers are held. Press %s again (or the Unfreeze button) to resume. "
-					"A snapshot was written to CommunityShaders.log and a JSON file to SKSE/CommunityShaders/Perf.",
-					Util::Input::KeyIdToString(settings.FreezeKey));
+				ImGui::TextUnformatted(a_text);
 		}
+	};
+	// One row of the summary table: the label (with its tooltip), then the value cell is current.
+	const auto row = [&tooltip](const char* a_label, const char* a_tooltip) {
+		ImGui::TableNextRow();
+		ImGui::TableNextColumn();
+		ImGui::TextUnformatted(a_label);
+		tooltip(a_tooltip);
+		ImGui::TableNextColumn();
+	};
+	// Fixed widths (from the font size), never "fill": the window may auto-size to its content.
+	const float barWidth = ImGui::GetTextLineHeight() * 16.0f;
+
+	if (ImGui::BeginTable("##PerfSummary", 2, ImGuiTableFlags_SizingStretchProp)) {
+		ImGui::TableSetupColumn("##what", ImGuiTableColumnFlags_WidthFixed, ImGui::GetTextLineHeight() * 6.5f);
+		ImGui::TableSetupColumn("##value", ImGuiTableColumnFlags_WidthStretch);
+
+		// ---- FPS: rendered, and shown after frame generation ----
+		row("FPS", "Frames per second.\nRendered = frames the game draws itself.\nShown = frames that reach the screen once frame generation adds its own.");
+		float frameMs = 0.0f, postFgMs = 0.0f;
+		const bool hasFrame = value(kSummaryFrame, frameMs) && frameMs > 0.0f;
+		const bool hasPostFg = value(kSummaryPostFgFrame, postFgMs) && postFgMs > 0.0f;
+		if (!hasFrame)
+			ImGui::TextDisabled("measuring...");
+		else if (hasPostFg)
+			ImGui::Text("%.0f rendered / %.0f shown%s", 1000.0f / frameMs, 1000.0f / postFgMs, st.postFGIsMeasured ? "" : " (est.)");
+		else
+			ImGui::Text("%.0f", 1000.0f / frameMs);
+		if (ImGui::IsItemHovered()) {
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				if (a_cfg.showLive)
+					ImGui::TextUnformatted("Live reading (Overlay options > Numbers shown).");
+				else
+					ImGui::Text("Averaged over %.2f s.", a_cfg.windowSeconds);
+				if (hasPostFg) {
+					if (st.postFGIsMeasured)
+						ImGui::Text("Frame generation: %ux, measured %.2f shown frames per rendered frame.", st.appliedFGMultiplier, st.postFGMultiplier);
+					else
+						ImGui::Text("Frame generation: estimated as %.0fx (this kind of frame generation does not report what it shows).", st.postFGMultiplier);
+				}
+			}
+		}
+		if (view.frozen) {
+			ImGui::SameLine(0.0f, 16.0f);
+			ImGui::TextColored(theme.StatusPalette.Warning, "FROZEN");
+			if (ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text(
+						"All numbers are held. Press %s again (or the Unfreeze button) to resume. "
+						"A snapshot was written to CommunityShaders.log and a JSON file to SKSE/CommunityShaders/Perf.",
+						Util::Input::KeyIdToString(settings.FreezeKey));
+			}
+		}
+
+		// ---- Frame time, with a small graph of the recent frames ----
+		row("Frame time", "How long one rendered frame takes, in milliseconds. Lower is better; 16.7 ms = 60 FPS.\n"
+						  "The graph shows each recent frame: a tall spike is a stutter.");
+		if (hasFrame)
+			ImGui::Text("%.1f ms", frameMs);
+		else
+			ImGui::TextDisabled("-");
+		if (settings.ShowPreFGFrameTimeGraph && st.frameTimeHistory.GetValidCount() > 1) {
+			ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.0f, 1.0f, 0.0f, 1.0f));
+			ImGui::PlotLines("##SummaryFrametime",
+				st.frameTimeHistory.GetData().data(),
+				static_cast<int>(st.frameTimeHistory.GetData().size()),
+				static_cast<int>(st.frameTimeHistory.GetHeadIdx()),
+				nullptr,
+				st.smoothedMinFrameTime, st.smoothedMaxFrameTime,
+				ImVec2(barWidth, 24.0f * settings.TextSize));
+			ImGui::PopStyleColor();
+			tooltip("Each recent rendered frame, oldest on the left. Flat = smooth; spikes = stutters.");
+		}
+
+		// ---- Smoothness: 1% low / p99 over the stats window ----
+		row("1% low", "Smoothness over the last 10 seconds.\n"
+					  "1% low = the frame rate that 99% of frames beat (the slowest 1% of frames are at least this slow).\n"
+					  "Far below the average = noticeable stutter.");
+		if (stats.valid) {
+			ImGui::Text("%.0f FPS (p99 %.1f ms)  |  average %.0f FPS", Util::CalcFPS(stats.percentile99Ms), stats.percentile99Ms, Util::CalcFPS(stats.averageMs));
+			if (ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("Over the last %.1f s (%d rendered frames). Frames over %.0f ms (loading screens, alt-tab) are left out.",
+						stats.seconds, stats.frames, Settings::kStatsMaxSampleMs);
+			}
+		} else {
+			ImGui::TextDisabled("measuring...");
+		}
+
+		// ---- CPU vs GPU, and which one sets the pace ----
+		row("CPU vs GPU", "Average time per rendered frame over the last 10 s.\n"
+						  "CPU = from the start of the game's update to handing the frame over (includes time stuck in the graphics driver).\n"
+						  "GPU = the graphics card's work on that frame.\n"
+						  "Whichever is slower more often limits the frame rate. With a frame-rate cap both have spare time;\n"
+						  "the label then says which one is closer to the limit.");
+		{
+			float cpuShownMs = series.frames > 0 ? series.cpuAvg : -1.0f;
+			float gpuShownMs = series.gpuFrames > 0 ? series.gpuAvg : -1.0f;
+			ImVec4 verdictColor = theme.StatusPalette.Disable;
+			const char* verdictText = "measuring...";
+			if (series.frames > 0 && series.gpuFrames > 0) {
+				// Same per-frame comparison as "Frames where the CPU took longer than the GPU" in the details.
+				if (series.cpuLimitedPct >= 60.0f) {
+					verdictText = "CPU-limited";
+					verdictColor = theme.StatusPalette.Error;
+				} else if (series.cpuLimitedPct <= 40.0f) {
+					verdictText = "GPU-limited";
+					verdictColor = theme.StatusPalette.Warning;
+				} else {
+					verdictText = "CPU and GPU about even";
+					verdictColor = theme.StatusPalette.SuccessColor;
+				}
+			} else if (settings.ShowDrawCalls) {
+				// No per-frame series (Driver wait timing off): the older reading from how long the CPU
+				// waits for each frame. Reflex moves that wait into its own sleep, so it is counted too.
+				float cpuFrameMs = 0.0f, waitMs = 0.0f;
+				value(kSummaryCpuFrame, cpuFrameMs);
+				value(kSummaryPresentWait, waitMs);
+				if (traceSmoothed.valid)
+					waitMs += traceSmoothed.reflexSleepMs;
+				const auto verdict = BottleneckVerdict(theme, cpuFrameMs, waitMs);
+				const std::string_view v = verdict.first;
+				verdictText = v.starts_with("GPU") ? "GPU-limited (or capped)" : v.starts_with("CPU") ? "CPU-limited" : v == "balanced" ? "CPU and GPU about even" : "measuring...";
+				verdictColor = verdict.second;
+				if (cpuShownMs < 0.0f && cpuFrameMs > 0.0f)
+					cpuShownMs = std::max(0.0f, cpuFrameMs - waitMs);
+				float gpuOursMs = 0.0f, gpuUntrackedMs = 0.0f;
+				if (gpuShownMs < 0.0f && value(kSummaryGpuOurs, gpuOursMs) && value(kSummaryGpuUntracked, gpuUntrackedMs))
+					gpuShownMs = gpuOursMs + gpuUntrackedMs;
+			}
+			ImGui::BeginGroup();
+			if (cpuShownMs >= 0.0f)
+				ImGui::Text("CPU %.1f ms", cpuShownMs);
+			else
+				ImGui::TextDisabled("CPU -");
+			ImGui::SameLine(0.0f, 12.0f);
+			if (gpuShownMs >= 0.0f)
+				ImGui::Text("GPU %.1f ms", gpuShownMs);
+			else
+				ImGui::TextDisabled("GPU -");
+			ImGui::SameLine(0.0f, 12.0f);
+			ImGui::TextColored(verdictColor, "%s", verdictText);
+			ImGui::EndGroup();
+			if (ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					if (series.frames > 0 && series.gpuFrames > 0)
+						ImGui::Text("Over the last 10 s the CPU took longer than the GPU in %.0f%% of the frames.", series.cpuLimitedPct);
+					else if (!settings.DriverWaitTiming)
+						ImGui::TextUnformatted("Rough reading only (from how long the CPU waits each frame). The per-frame CPU and GPU times need\n"
+											   "Driver wait timing on (Overlay options > Screenshot and frame trace > Diagnostics).");
+					else if (!settings.ShowDrawCalls)
+						ImGui::TextUnformatted("The GPU frame time needs \"Measure time per effect\" on (Performance Overlay settings).");
+					else
+						ImGui::TextUnformatted("Collecting frames...");
+				}
+			}
+		}
+
+		// ---- Latency (NVIDIA Reflex's own report) ----
+		row("Latency", "How long from the game reading your input to the frame being finished on the GPU,\n"
+					   "as NVIDIA Reflex measures it (the monitor itself not included). Lower feels more responsive.");
+		if (traceSmoothed.reflexLatencyMs > 0.0f) {
+			ImGui::Text("%.1f ms", traceSmoothed.reflexLatencyMs);
+		} else {
+			ImGui::TextDisabled("n/a");
+			tooltip("Not reported: needs NVIDIA Reflex on (Upscaling > Latency) and Driver wait timing on\n"
+					"(Overlay options > Screenshot and frame trace > Diagnostics).");
+		}
+
+		// ---- VRAM used / budget ----
+		if (settings.ShowVRAM) {
+			row("VRAM", "Video memory in use and the budget Windows gives the game.\n"
+						"Near the budget (orange) textures may start to swap and stutter; over it (red) they will.");
+			uint64_t usageBytes = 0, budgetBytes = 0;
+			if (GetVramInfo(usageBytes, budgetBytes)) {
+				constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+				const double fraction = static_cast<double>(usageBytes) / static_cast<double>(budgetBytes);
+				const ImVec4* barColor = fraction > 1.0 ? &theme.StatusPalette.Error : (fraction >= 0.9 ? &theme.StatusPalette.Warning : nullptr);
+				const std::string text = std::format("{:.1f} / {:.1f} GB ({:.0f}%)", usageBytes / kGiB, budgetBytes / kGiB, fraction * 100.0);
+				if (barColor)
+					ImGui::PushStyleColor(ImGuiCol_PlotHistogram, *barColor);
+				ImGui::ProgressBar(static_cast<float>(std::min(fraction, 1.0)), ImVec2(barWidth, 0.0f), text.c_str());
+				if (barColor)
+					ImGui::PopStyleColor();
+				if (ImGui::IsItemHovered()) {
+					if (auto _tt = Util::HoverTooltipWrapper()) {
+						ImGui::Text("In use %.2f GB of a %.2f GB budget.", usageBytes / kGiB, budgetBytes / kGiB);
+						ImGui::Text("Community Shaders' own textures and buffers: about %.0f MB.",
+							static_cast<double>(Util::FrameTrace::OurD3D11LiveBytes()) / (1024.0 * 1024.0));
+					}
+				}
+			} else {
+				ImGui::TextDisabled("not available");
+			}
+		}
+
+		// ---- Ray tracing: on / off and what it costs ----
+		row("Ray tracing", "Ray-traced shadows (and lamp shadows / AO when on).\n"
+						   "Cost: GPU time on the game's own GPU queue, plus the ray tracing itself, which runs on its own GPU queue\n"
+						   "alongside the rest of the frame (so it does not simply add to the frame time).");
+		{
+			const auto& rt = globals::features::rayTracing;
+			if (!rt.loaded) {
+				ImGui::TextDisabled("not installed");
+			} else if (!rt.settings.Enabled) {
+				ImGui::TextDisabled("off");
+			} else {
+				switch (rt.GetStatus()) {
+				case RayTracing::Status::Active:
+					ImGui::TextColored(theme.StatusPalette.SuccessColor, "on");
+					break;
+				case RayTracing::Status::Inactive:
+					ImGui::TextUnformatted("on, idle here");
+					tooltip("Nothing is traced right now: an interior without sky, or a loading screen.");
+					break;
+				case RayTracing::Status::Waiting:
+					ImGui::TextUnformatted("on, preparing the scene");
+					break;
+				case RayTracing::Status::Unavailable:
+					ImGui::TextColored(theme.StatusPalette.Error, "unavailable");
+					tooltip("Ray tracing could not start. The reason is on the Ray Tracing page.");
+					break;
+				case RayTracing::Status::Failed:
+					ImGui::TextColored(theme.StatusPalette.Error, "failed");
+					tooltip("Ray tracing stopped after an error. The reason is on the Ray Tracing page.");
+					break;
+				default:
+					ImGui::TextDisabled("off");
+					break;
+				}
+				float rtMainMs = 0.0f, rtAsyncMs = 0.0f;
+				const bool hasMain = value(kSummaryRtMain, rtMainMs);
+				const bool hasAsync = value(kSummaryRtAsync, rtAsyncMs);
+				if (hasMain || hasAsync) {
+					std::string cost;
+					if (hasMain)
+						cost = std::format("{:.1f} ms game GPU queue", rtMainMs);
+					if (hasAsync)
+						cost += std::format("{}{:.1f} ms RT queue", cost.empty() ? "" : " + ", rtAsyncMs);
+					ImGui::SameLine(0.0f, 12.0f);
+					ImGui::Text("%s", cost.c_str());
+					tooltip("Game GPU queue = Ray Tracing's rows in \"Details: GPU time per effect\" added up (denoiser, merge, waits).\n"
+							"RT queue = the scene update and the ray tracing on the ray tracer's own GPU queue (last frame measured).");
+				} else if (!settings.ShowDrawCalls) {
+					ImGui::SameLine(0.0f, 12.0f);
+					ImGui::TextDisabled("(cost: turn on \"Measure time per effect\")");
+				}
+			}
+		}
+
+		ImGui::EndTable();
 	}
 
-	if (settings.ShowDrawCalls) {
-		float gpuOursMs = 0.0f, cpuFrameMs = 0.0f, waitMs = 0.0f;
-		value(kSummaryGpuOurs, gpuOursMs);
-		value(kSummaryCpuFrame, cpuFrameMs);
-		value(kSummaryPresentWait, waitMs);
-		ImGui::Text("GPU (ours) %.2f ms", gpuOursMs);
-		if (ImGui::IsItemHovered()) {
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("GPU time of Community Shaders' own effects (the GPU passes rows added up).");
-		}
-		ImGui::SameLine(0.0f, 16.0f);
-		const auto verdict = BottleneckVerdict(theme, cpuFrameMs, waitMs);
-		ImGui::TextUnformatted("Bottleneck:");
-		ImGui::SameLine();
-		ImGui::TextColored(verdict.second, "%s", verdict.first);
-		if (ImGui::IsItemHovered()) {
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted("From how long the CPU waits for each frame to be shown. Details in \"CPU / GPU split\".");
-		}
-	}
+	// ---- The five biggest GPU costs ----
+	DrawTopGpuPasses(a_cfg);
 
 	// Only clickable while the CS menu is open (the overlay ignores the mouse otherwise); the
 	// hotkey works any time.
@@ -3650,6 +4087,184 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::TextUnformatted("Writes every table, as shown right now, to CommunityShaders.log without freezing.");
 		}
+	}
+}
+
+namespace
+{
+	/// (46r) Engine stages offered to the summary's top-5 list as one row per group (their parts are
+	/// only interesting in the details). nullptr: the group's rows are offered one by one instead.
+	const char* EngineGroupTopName(const EnginePhaseGroup& a_group)
+	{
+		if (!a_group.label || a_group.rows.empty())
+			return nullptr;
+		switch (a_group.rows.front().phase) {
+		case Util::GpuPhase::ShadowGodRay1:
+			return "Shadow maps (game, all)";
+		case Util::GpuPhase::DepthTerrain:
+			return "Depth prepass (game)";
+		case Util::GpuPhase::ReflLODLand:
+			return "Water reflection cubemap (game)";
+		default:
+			return nullptr;
+		}
+	}
+
+	/// (46r) Plain name of an engine stage offered on its own; nullptr = not offered (Untracked, and
+	/// our timed passes, which are listed per effect instead).
+	const char* EngineStageTopName(Util::GpuPhase a_phase)
+	{
+		using P = Util::GpuPhase;
+		switch (a_phase) {
+		case P::WaterPrep:
+			return "Water prep (game)";
+		case P::OpaqueTerrain:
+			return "Scene: terrain";
+		case P::OpaqueObjects:
+			return "Scene: objects";
+		case P::OpaqueCharacters:
+			return "Scene: characters";
+		case P::OpaqueTrees:
+			return "Scene: trees";
+		case P::OpaqueGrass:
+			return "Scene: grass";
+		case P::OpaqueDistant:
+			return "Scene: distant LOD";
+		case P::OpaqueOther:
+			return "Scene: other solid objects";
+		case P::Sky:
+			return "Sky (game)";
+		case P::Water:
+			return "Water (game)";
+		case P::Transparent:
+			return "Transparent & effects (game)";
+		case P::WorldOther:
+			return "Other world drawing (game)";
+		case P::FirstPerson:
+			return "First-person hands & weapon";
+		case P::Imagespace:
+			return "Post-processing (game)";
+		case P::UI:
+			return "HUD & menus";
+		case P::CsOther:
+			return "Community Shaders: lighting composite & setup";
+		case P::CsUpscaling:
+			return "Upscaling (DLSS / FSR)";
+		case P::CsOverlay:
+			return "This overlay & the CS menu";
+		default:
+			return nullptr;
+		}
+	}
+}
+
+void PerformanceOverlay::DrawTopGpuPasses(const PerfView::ViewConfig& a_cfg)
+{
+	// (46r) Display only: picks from the rows the GPU effect table and the engine stage table already
+	// hold (Util::GpuPassTimers / Util::GpuPhaseTimeline, both running while the overlay is on screen
+	// with "Measure time per effect" on). No timer of its own.
+	ImGui::TextUnformatted("Most expensive on the GPU");
+	if (ImGui::IsItemHovered()) {
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted(
+				"The five biggest GPU costs right now, per rendered frame: Community Shaders effects and the game's own\n"
+				"rendering stages, without double counting. % = share of the whole GPU frame.\n"
+				"Everything is in \"Details: GPU time per effect\" and \"Details: GPU time per engine stage\".");
+	}
+	if (!settings.ShowDrawCalls) {
+		ImGui::SameLine(0.0f, 12.0f);
+		ImGui::TextDisabled("not measured (turn on \"Measure time per effect\")");
+		return;
+	}
+
+	struct Entry
+	{
+		float ms = 0.0f;
+		std::string_view name;
+		const DrawCallRow* row = nullptr;
+	};
+	std::array<Entry, 5> top{};
+	int count = 0;
+	const auto offer = [&top, &count](float a_ms, std::string_view a_name, const DrawCallRow* a_row) {
+		if (a_ms < 0.01f)
+			return;
+		const int capacity = static_cast<int>(top.size());
+		int pos = count;
+		while (pos > 0 && top[pos - 1].ms < a_ms)
+			--pos;
+		if (pos >= capacity)
+			return;
+		for (int i = std::min(count, capacity - 1); i > pos; --i)
+			top[i] = top[i - 1];
+		top[pos] = Entry{ a_ms, a_name, a_row };
+		count = std::min(count + 1, capacity);
+	};
+
+	// Community Shaders' own effects.
+	PerfView::ViewConfig allRows = a_cfg;
+	allRows.topN = 0;
+	for (int id : view.gpuPasses.DisplayOrder(allRows)) {
+		const DrawCallRow* row = view.gpuPasses.GetRow(id);
+		float ms = 0.0f;
+		if (!row || !view.gpuPasses.DisplayValue(id, a_cfg, ms))
+			continue;
+		const char* friendly = FriendlyGpuPassName(id);
+		offer(ms, friendly ? std::string_view(friendly) : WithoutColon(row->label), row);
+	}
+
+	// The game's own stages (exclusive slices of the GPU frame, so no overlap with the effects above).
+	const auto& layout = EnginePhaseLayout();
+	for (size_t g = 0; g < layout.size(); ++g) {
+		const auto& group = layout[g];
+		if (const char* groupName = EngineGroupTopName(group)) {
+			const int id = kEngineGroupRowIdBase + static_cast<int>(g);
+			float ms = 0.0f;
+			if (view.engine.DisplayValue(id, a_cfg, ms))
+				offer(ms, groupName, view.engine.GetRow(id));
+			continue;
+		}
+		for (const auto& stage : group.rows) {
+			const char* name = EngineStageTopName(stage.phase);
+			if (!name)
+				continue;
+			const int id = static_cast<int>(stage.phase);
+			float ms = 0.0f;
+			if (view.engine.DisplayValue(id, a_cfg, ms))
+				offer(ms, name, view.engine.GetRow(id));
+		}
+	}
+
+	if (count == 0) {
+		ImGui::SameLine(0.0f, 12.0f);
+		ImGui::TextDisabled("measuring...");
+		return;
+	}
+
+	float gpuFrameMs = 0.0f;
+	const bool hasGpuFrame = view.engine.DisplayValue(kEngineTotalRowId, a_cfg, gpuFrameMs) && gpuFrameMs > 0.0f;
+	if (ImGui::BeginTable("##PerfTopGpu", 2, ImGuiTableFlags_SizingStretchProp)) {
+		ImGui::TableSetupColumn("##name", ImGuiTableColumnFlags_WidthStretch);
+		ImGui::TableSetupColumn("##ms", ImGuiTableColumnFlags_WidthFixed, ImGui::GetTextLineHeight() * 7.0f);
+		for (int i = 0; i < count; ++i) {
+			const Entry& e = top[i];
+			ImGui::TableNextRow();
+			ImGui::TableNextColumn();
+			ImGui::Text("%d. %.*s", i + 1, static_cast<int>(e.name.size()), e.name.data());
+			if (e.row && ImGui::IsItemHovered()) {
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					const std::string_view raw = WithoutColon(e.row->label);
+					ImGui::TextDisabled("(%.*s)", static_cast<int>(raw.size()), raw.data());
+					if (!e.row->tooltip.empty())
+						ImGui::TextUnformatted(e.row->tooltip.c_str());
+				}
+			}
+			ImGui::TableNextColumn();
+			if (hasGpuFrame)
+				ImGui::Text("%.1f ms (%.0f%%)", e.ms, e.ms / gpuFrameMs * 100.0f);
+			else
+				ImGui::Text("%.1f ms", e.ms);
+		}
+		ImGui::EndTable();
 	}
 }
 
@@ -3711,12 +4326,12 @@ void PerformanceOverlay::DrawViewOptions()
 		settings.DenoiserLogInterval = kLogChoices[logIdx];
 	if (auto _tt = Util::HoverTooltipWrapper()) {
 		ImGui::TextUnformatted(
-			"While the \"Denoiser breakdown\" section is open, also write one line of its smoothed numbers to "
+			"While the \"SSRT denoiser per pass\" section is open, also write one line of its smoothed numbers to "
 			"CommunityShaders.log this often. Freeze always writes a full snapshot regardless.");
 	}
 
 	// (44e) Screenshot, frame trace, driver wait timing.
-	if (ImGui::TreeNodeEx("Screenshot and frame trace (44e)", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::TreeNodeEx("Screenshot and frame trace", ImGuiTreeNodeFlags_DefaultOpen)) {
 		const auto keyRow = [](const char* a_label, uint32_t& a_key, bool& a_capturing, const char* a_tooltip) {
 			ImGui::PushID(a_label);
 			ImGui::TextUnformatted(a_label);
@@ -3761,23 +4376,37 @@ void PerformanceOverlay::DrawViewOptions()
 			Util::FrameTrace::StartRecording(settings.TraceSeconds);
 		}
 		ImGui::SliderFloat("Trace length", &settings.TraceSeconds, 5.0f, 120.0f, "%.0f s");
-		ImGui::Checkbox("Driver wait timing", &settings.DriverWaitTiming);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("Times every D3D11 draw, map and copy (two clock reads each) while the overlay is shown or a trace records,\n"
-								   "to show how long the CPU is stuck in the driver. Off = measured runs can be compared with unmeasured ones.");
-		// (44f)
-		ImGui::Checkbox("Engine Timing Probes (restart)", &settings.EngineTimingProbes);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("Small hooks on the calls inside the game's main update, for the Engine CPU split and for Reflex Markers at Render Start.\n"
-								   "Takes effect after a restart. If the game crashes at startup, create an empty file EngineTimingOff.txt next to\n"
-								   "SettingsUser.json (SKSE\\Plugins\\CommunityShaders) to turn them off without the menu.");
-		ImGui::SameLine();
-		ImGui::TextDisabled("now: %s", Util::EngineTiming::ProbeStatus());
-		// (46o) M2
-		ImGui::Checkbox("Stall Sampler (trace)", &settings.StallSampler);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("While a trace records: when the game's main thread is stuck 8 ms or more in one place, a helper thread pauses it for a few\n"
-								   "microseconds, notes where it is (the stall_stack column) and lets it go at once. Diagnostics only; off by default.");
+		// (46r) The three measurement switches, tucked away: they are for A/B checks of the
+		// measuring itself and are best left at their defaults.
+		if (ImGui::TreeNodeEx("Diagnostics / A-B switches (leave at defaults)", ImGuiTreeNodeFlags_None)) {
+			if (ImGui::SmallButton("Reset these to defaults")) {
+				const Settings d{};
+				settings.DriverWaitTiming = d.DriverWaitTiming;
+				settings.EngineTimingProbes = d.EngineTimingProbes;
+				settings.StallSampler = d.StallSampler;
+			}
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Driver wait timing on, Engine timing probes on, Stall sampler off.");
+			ImGui::Checkbox("Driver wait timing", &settings.DriverWaitTiming);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Times every D3D11 draw, map and copy (two clock reads each) while the overlay is shown or a trace records,\n"
+									   "to show how long the CPU is stuck in the driver. Also needed for the CPU vs GPU and latency lines.\n"
+									   "Off = measured runs can be compared with unmeasured ones.");
+			// (44f)
+			ImGui::Checkbox("Engine timing probes (restart)", &settings.EngineTimingProbes);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("Small hooks on the calls inside the game's main update, for the Engine CPU split and for Reflex Markers at Render Start.\n"
+									   "Takes effect after a restart. If the game crashes at startup, create an empty file EngineTimingOff.txt next to\n"
+									   "SettingsUser.json (SKSE\\Plugins\\CommunityShaders) to turn them off without the menu.");
+			ImGui::SameLine();
+			ImGui::TextDisabled("now: %s", Util::EngineTiming::ProbeStatus());
+			// (46o) M2
+			ImGui::Checkbox("Stall sampler (trace)", &settings.StallSampler);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::TextUnformatted("While a trace records: when the game's main thread is stuck 8 ms or more in one place, a helper thread pauses it for a few\n"
+									   "microseconds, notes where it is (the stall_stack column) and lets it go at once. Diagnostics only.");
+			ImGui::TreePop();
+		}
 		if (const auto f = Util::FrameTrace::LastFile(); !f.empty())
 			ImGui::TextDisabled("Last trace: %s", f.c_str());
 		if (const auto f = Util::Screenshot::LastFile(); !f.empty())
@@ -3806,10 +4435,14 @@ void PerformanceOverlay::DrawViewOptions()
 		const bool frozen = view.frozen;
 		auto frozenState = view.frozenState;
 		const auto frozenStats = view.frozenStats;
+		const auto frozenSeries = view.frozenSeries;
+		const auto frozenSmoothed = view.frozenSmoothed;
 		view = ViewState{};
 		view.frozen = frozen;
 		view.frozenState = frozenState;
 		view.frozenStats = frozenStats;
+		view.frozenSeries = frozenSeries;
+		view.frozenSmoothed = frozenSmoothed;
 	}
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::TextUnformatted("Rows stay in place once they have appeared. This clears them, e.g. after switching an effect off for good.");
@@ -4068,7 +4701,7 @@ void PerformanceOverlay::WriteSnapshotToLog(const PerfView::ViewConfig& a_cfg)
 		}
 	};
 	if (view.denoiser.RowCount() == 0)
-		logger::info("[PerfSnapshot] Denoiser | (not measured: open the \"Denoiser breakdown\" section first)");
+		logger::info("[PerfSnapshot] Denoiser | (not measured: open the \"Details: SSRT denoiser per pass\" section first)");
 	logDenoiser(view.denoiser, cfg);
 	logDenoiser(view.denoiserFooter, fixedCfg);
 
@@ -4160,7 +4793,7 @@ void PerformanceOverlay::DrawShadowInfo()
 	const auto& report = Util::GpuPhaseTimeline::GetSingleton()->Get();
 	const auto& s = report.shadow;
 	if (!report.hasCpuSample) {
-		ImGui::TextDisabled("Open \"Engine passes (GPU)\" once to start measuring.");
+		ImGui::TextDisabled("Not measured: needs \"Measure time per effect\" on (Performance Overlay settings).");
 		return;
 	}
 	if (!s.valid) {
@@ -4558,7 +5191,7 @@ void PerformanceOverlay::SaveFrameJson(const PerfView::ViewConfig& a_cfg)
 void PerformanceOverlay::DrawCpuWaitSection()
 {
 	if (!settings.DriverWaitTiming) {
-		ImGui::TextDisabled("Off (Performance Overlay settings > Driver wait timing).");
+		ImGui::TextDisabled("Off (Overlay options > Screenshot and frame trace > Diagnostics > Driver wait timing).");
 		return;
 	}
 	const auto st = Util::FrameTrace::GetSeriesStats(10.0f);
@@ -4580,7 +5213,7 @@ void PerformanceOverlay::DrawCpuWaitSection()
 		ImGui::PlotLines("##cpuframe", cpu.data(), static_cast<int>(cpu.size()), 0, cpuText.c_str(), 0.0f, top, ImVec2(w, h));
 		ImGui::PopStyleColor();
 		ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.3f, 0.7f, 1.0f, 1.0f));
-		const std::string gpuText = st.gpuFrames ? std::format("GPU frame {:.1f} ms", gpu.back()) : std::string("GPU frame: needs Show Draw Calls");
+		const std::string gpuText = st.gpuFrames ? std::format("GPU frame {:.1f} ms", gpu.back()) : std::string("GPU frame: needs Measure time per effect");
 		ImGui::PlotLines("##gpuframe", gpu.data(), static_cast<int>(gpu.size()), 0, gpuText.c_str(), 0.0f, top, ImVec2(w, h));
 		ImGui::PopStyleColor();
 	}
@@ -4592,7 +5225,7 @@ void PerformanceOverlay::DrawCpuWaitSection()
 	if (ImGui::IsItemHovered()) {
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted("A frame counts as CPU-limited when its CPU frame (which includes time stuck in the driver) is longer than its GPU work.\n"
-								   "Shown for information; the CPU / GPU split label above is unchanged.");
+								   "The summary's CPU vs GPU line uses this same comparison.");
 	}
 
 	const auto s = Util::FrameTrace::GetSmoothed();

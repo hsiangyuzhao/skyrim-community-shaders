@@ -197,6 +197,7 @@ Menu::~Menu()
 	uiIcons.debug.Release();
 	uiIcons.materials.Release();
 	uiIcons.postProcessing.Release();
+	uiIcons.rayTracing.Release();
 
 	ImGui_ImplDX11_Shutdown();
 	ImGui_ImplWin32_Shutdown();
