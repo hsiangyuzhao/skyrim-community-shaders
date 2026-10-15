@@ -1026,6 +1026,8 @@ namespace RayTracingRT
 		void KickSubmits();
 		/// Hands over what is staged and waits until the submit thread executed all of it (mode switch, shutdown).
 		void DrainSubmits();
+		/// A queue Signal the submit thread could not make: the fence value is set from the CPU (a D3D11 wait for it must end).
+		static void SignalFromCpu(const SubmitOp& a_op);
 		void StopSubmitThread();
 		void SubmitThreadMain();
 		/// Applies submitWanted_ when no prepared frame is open (draining first when switching off). False = keep the mode.
@@ -1044,6 +1046,9 @@ namespace RayTracingRT
 		std::deque<SubmitBatch> submitQueue_;
 		bool submitStop_ = false;
 		bool submitBusy_ = false;
+		std::int64_t submitBusyKickQpc_ = 0;  // under submitMutex_: hand-over time of the batch being executed
+		bool submitStallLogged_ = false;      // under submitMutex_
+		bool submitDetached_ = false;         // process exit: the thread was detached (its lock is never taken again)
 		std::thread submitThread_;
 		HRESULT submitError_ = S_OK;  // under submitMutex_
 		std::string submitErrorWhat_;

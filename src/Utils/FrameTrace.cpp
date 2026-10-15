@@ -2221,6 +2221,9 @@ namespace Util::FrameTrace
 			}
 			if ((g_frameCounter++ & 15) == 0)
 				PollLatency();
+			// (46q) The snow column is this frame's ms: not carried from before the recording started.
+			const float snowShapesMsThisFrame = g_q46.snowShapesMs;
+			g_q46.snowShapesMs = 0.0f;
 
 			if (g_recording) {
 				Row r = g_hasPendingRow ? g_pendingRow : Row{};
@@ -2247,7 +2250,7 @@ namespace Util::FrameTrace
 				SampleScreenSpacePasses(r);  // (46e)
 				r.postGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::PostProcessing);  // (46p)
 				r.q46 = g_q46;  // (46q)
-				g_q46.snowShapesMs = 0.0f;
+				r.q46.snowShapesMs = snowShapesMsThisFrame;
 				r.vramByFeature = VramByFeatureColumn();
 				r.cpuTop = Util::CpuPassTimers::GetSingleton()->TopOfCurrentFrame(3);
 				r.world = std::move(world);
@@ -2336,7 +2339,7 @@ namespace Util::FrameTrace
 					r.flags |= r.pacer.reset ? kFlagPacerReset : 0u;
 					r.stallStack = EngineTiming::TakeStallSamples();
 				}
-				g_rows.push_back(r);
+				g_rows.push_back(std::move(r));
 				{
 					auto& row = g_rows.back();
 					std::erase_if(g_pendingPassGpu, [&row](const PendingPassGpu& a_p) {
@@ -2565,7 +2568,7 @@ namespace Util::FrameTrace
 			return;
 		auto* tag = static_cast<VramTag*>(tagUnknown);  // only VramTag is ever stored under kVramTagGuid
 		const FeatureVram* current = tag->Feature();
-		if (current && current->name != kVramNoScope) {
+		if (!current || current->name != kVramNoScope) {  // null = not ours (staging / engine): never re-billed
 			tagUnknown->Release();
 			return;
 		}

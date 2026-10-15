@@ -457,17 +457,21 @@ bool SubsurfaceScattering::EnsureTextures()
 	const UINT width = std::min<UINT>(mainDesc.Width, w), height = std::min<UINT>(mainDesc.Height, h);
 	if (blurHorizontalTemp && diffuseNoAlbedoTex && sssGuide && diffuseNoAlbedoTex->desc.Width == width && diffuseNoAlbedoTex->desc.Height == height)
 		return true;
+	// The previous set is usable only while it still covers the render size (a smaller one would be read past its edge).
+	auto usable = [&]() {
+		return blurHorizontalTemp && diffuseNoAlbedoTex && sssGuide && diffuseNoAlbedoTex->desc.Width >= width && diffuseNoAlbedoTex->desc.Height >= height;
+	};
 	if (retryFrames > 0) {
 		--retryFrames;
-		return blurHorizontalTemp && diffuseNoAlbedoTex && sssGuide;
+		return usable();
 	}
 	try {
 		CreateTextures(width, height);
 	} catch (const std::exception& e) {
-		logger::warn("[SSS] Could not create its textures at {}x{} ({}); keeping the previous ones", width, height, e.what());
+		logger::warn("[SSS] Could not create its textures at {}x{} ({}); keeping the previous ones while they are large enough", width, height, e.what());
 		retryFrames = 300;
 	}
-	return blurHorizontalTemp && diffuseNoAlbedoTex && sssGuide;
+	return usable();
 }
 
 void SubsurfaceScattering::Reset()

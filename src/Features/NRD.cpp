@@ -158,17 +158,23 @@ bool NRD::EnsureGuides()
 		texNRDNormalRoughness = nullptr;
 		texNRDMV = nullptr;
 	}
+	// (46q) After a failure: tried again every 300 frames, not every frame.
+	if (guideRetryFrames > 0) {
+		--guideRetryFrames;
+		return false;
+	}
 
 	logger::debug("Creating NRD guide textures ({}x{})...", mainDesc.Width, mainDesc.Height);
 	try {
 		if (CreateGuides(mainDesc))
 			return true;
 	} catch (const std::exception& e) {
-		logger::warn("[NRD] Could not create the guide textures ({}); the denoisers fall back this frame", e.what());
+		logger::warn("[NRD] Could not create the guide textures ({}); the denoisers fall back (next try in 300 frames)", e.what());
 	}
 	texNRDViewZ = nullptr;
 	texNRDNormalRoughness = nullptr;
 	texNRDMV = nullptr;
+	guideRetryFrames = 300;
 	return false;
 }
 

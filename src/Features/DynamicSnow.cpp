@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <format>
+#include <thread>
 
 #include "Features/Skin.h"
 #include "Menu.h"
@@ -1530,15 +1531,27 @@ void DynamicSnow::PollPrintShapes()
 	}
 	if (!shapeFuture.valid()) {
 		try {
-			shapeFuture = std::async(std::launch::async, []() -> std::unique_ptr<PrintShapeData> {
+			// A detached thread with a packaged_task, not std::async: std::async's future blocks in its destructor, and this feature is
+			// a static destroyed under the loader lock at exit (the thread already killed): a game closed mid-load would hang.
+			// COM on this thread: DirectX::Convert takes the WIC path for sRGB sources (same result as the render-thread load).
+			std::packaged_task<std::unique_ptr<PrintShapeData>()> task([]() -> std::unique_ptr<PrintShapeData> {
+				const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+				std::unique_ptr<PrintShapeData> result;
 				try {
-					return DecodePrintShapes();
+					result = DecodePrintShapes();
 				} catch (...) {
-					return nullptr;
+					result = nullptr;
 				}
+				if (SUCCEEDED(com))
+					CoUninitialize();
+				return result;
 			});
+			auto future = task.get_future();
+			std::thread(std::move(task)).detach();
+			shapeFuture = std::move(future);
 			shapeState = 1;
 		} catch (const std::exception& e) {
+			shapeFuture = {};
 			logger::warn("[{}] Background footprint shape load could not start ({}); loading now", GetName(), e.what());
 			LoadPrintShapes();
 		}

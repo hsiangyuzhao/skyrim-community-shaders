@@ -2716,7 +2716,9 @@ void Upscaling::UpdateRenderAllocSize()
 std::pair<uint32_t, uint32_t> Upscaling::GetRenderAllocSize(bool a_ssrtSet) const
 {
 	const auto screen = globals::state->screenSize;
-	const auto sw = static_cast<uint32_t>(std::max(screen.x, 1.0f)), sh = static_cast<uint32_t>(std::max(screen.y, 1.0f));
+	if (screen.x < 1.0f || screen.y < 1.0f)
+		return { UINT32_MAX, UINT32_MAX };  // (46q) no screen size yet: no limit (every caller takes the min with its own output size)
+	const auto sw = static_cast<uint32_t>(screen.x), sh = static_cast<uint32_t>(screen.y);
 	const bool on = a_ssrtSet ? settings.renderResSsrt : settings.renderResBuffers;
 	if (!on || renderAllocW == 0 || renderAllocH == 0 || globals::game::isVR)
 		return { sw, sh };

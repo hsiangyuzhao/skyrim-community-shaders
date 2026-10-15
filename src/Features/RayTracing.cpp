@@ -5323,6 +5323,11 @@ std::string RayTracing::DescribeForProfile() const
 	// (46p)
 	text += std::format(", parallel BLAS builds {}, high-priority queue {} (in effect {}), residency priority {}", settings.ParallelBlasBuilds ? "on" : "off",
 		settings.HighPriorityQueue ? "asked" : "off", backend.QueuePriorityHigh() ? "high" : "normal", backend.ResidencyHigh() ? "high" : "normal");
+	// (46q)
+	text += std::format(", submit on a worker thread {} (in effect {}), budget builds by GPU time {} ({:.2f} ms, {} character builds, keep {:.0f} ms), "
+						"carrier casts shadows {} (clearance {:.0f})",
+		settings.SubmitWorker ? "on" : "off", backend.SubmitWorkerInEffect() ? "on" : "off", settings.BuildGpuBudget ? "on" : "off", settings.BuildGpuBudgetMs,
+		settings.GroupBuildsPerFrame, settings.GroupGraceMs, settings.CarrierShadows ? "on" : "off", settings.CarrierClearance);
 	return text;
 }
 

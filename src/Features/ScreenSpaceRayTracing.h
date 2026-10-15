@@ -1378,6 +1378,8 @@ struct ScreenSpaceRayTracing : Feature
     void ReleaseCoreResources();
     UINT coreAllocW = 0, coreAllocH = 0;
     int coreRetryFrames = 0;
+    int nrdRetryFrames = 0;   // (46q) frames until REBLUR's resources are tried again after a failure
+    int svgfRetryFrames = 0;  // (46q) likewise SVGF's (its allocation threw)
     void CreateNRDResources(const D3D11_TEXTURE2D_DESC& a_mainDesc);  // (46q) may throw; EnsureNRDResources catches
 
     /// @brief (batch C1) One flag per REBLUR instance rather than one shared, because

@@ -1069,6 +1069,17 @@ void ScreenSpaceRayTracing::CreateCoreResources(UINT a_width, UINT a_height)
 
         texDesc.MipLevels = maxMips;
         srvDesc.Texture2D.MipLevels = texDesc.MipLevels;
+        {
+            // (46q) The Hi-Z traversal reads mip k up to ceil(render / 2^k) - 1, but a mip of the allocation has floor(alloc / 2^k)
+            // texels: at render size the last coarse tile would be missing (a Load past the edge reads 0 = the near plane, so
+            // rays along the right / bottom edge could not skip). Padded to a whole coarsest tile, never past the output size
+            // (off / full size: the output size, as 46p).
+            D3D11_TEXTURE2D_DESC mainDesc{};
+            mainTex.texture->GetDesc(&mainDesc);
+            constexpr UINT align = 1u << (maxMips - 1);
+            texDesc.Width = std::min<UINT>(mainDesc.Width, (a_width + align - 1) & ~(align - 1));
+            texDesc.Height = std::min<UINT>(mainDesc.Height, (a_height + align - 1) & ~(align - 1));
+        }
         texDepth = eastl::make_unique<Texture2D>(texDesc);
         texDepth->CreateSRV(srvDesc);
         texDepth->CreateUAV(uavDesc);
@@ -1659,28 +1670,46 @@ void ScreenSpaceRayTracing::EnsureNRDResources()
         mainDesc.Width = std::min<UINT>(mainDesc.Width, w);
         mainDesc.Height = std::min<UINT>(mainDesc.Height, h);
     }
-    if (texNRDPackInput && texNRDPackOutput && nrdReblurDiffuse.IsValid() && nrdReblurSpecular.IsValid()) {
-        if (texNRDPackInput->desc.Width == mainDesc.Width && texNRDPackInput->desc.Height == mainDesc.Height &&
-            nrdReblurDiffuse.GetWidth() == mainDesc.Width && nrdReblurDiffuse.GetHeight() == mainDesc.Height &&
-            nrdReblurSpecular.GetWidth() == mainDesc.Width && nrdReblurSpecular.GetHeight() == mainDesc.Height)
-            return;
-        // Re-made together at the new size (D3D11 keeps what a submitted pass still reads alive).
+    auto sizedRight = [&](const eastl::unique_ptr<Texture2D>& a_tex) {
+        return a_tex && a_tex->desc.Width == mainDesc.Width && a_tex->desc.Height == mainDesc.Height;
+    };
+    auto instanceSized = [&](NRDReblurIntegration& a_instance) {
+        return a_instance.IsValid() && a_instance.GetWidth() == mainDesc.Width && a_instance.GetHeight() == mainDesc.Height;
+    };
+    if (sizedRight(texNRDPackInput) && sizedRight(texNRDPackOutput) && instanceSized(nrdReblurDiffuse) && instanceSized(nrdReblurSpecular))
+        return;
+    // (46q) After a failure: retried every 300 frames, not every frame (each try re-makes the pack and every NRD pipeline).
+    if (nrdRetryFrames > 0) {
+        --nrdRetryFrames;
+        return;
+    }
+    // Anything at another size (or half made) goes, and everything is made again together at this size (D3D11 keeps what a
+    // submitted pass still reads alive; the specular composite view pointing into the pack is dropped with it).
+    if ((texNRDPackInput && !sizedRight(texNRDPackInput)) || (texNRDPackOutput && !sizedRight(texNRDPackOutput)) ||
+        (nrdReblurDiffuse.IsValid() && !instanceSized(nrdReblurDiffuse)) || (nrdReblurSpecular.IsValid() && !instanceSized(nrdReblurSpecular))) {
         texNRDPackInput = nullptr;
         texNRDPackOutput = nullptr;
         nrdReblurDiffuse.Shutdown();
         nrdReblurSpecular.Shutdown();
+        specularCompositeSRV = nullptr;
+        specularCompositePacked = false;
     }
 
     logger::debug("Creating SSRT NRD resources ({}x{})...", mainDesc.Width, mainDesc.Height);
     try {
         CreateNRDResources(mainDesc);
+        if (!nrdReblurDiffuse.IsValid() || !nrdReblurSpecular.IsValid())
+            nrdRetryFrames = 300;  // Init failed without throwing: the fallback denoiser for now
     } catch (const std::exception& e) {
         // Out of video memory (Texture2D / NRD pools throw): REBLUR is not ready, the chains keep their fallback denoiser.
-        logger::warn("SSRT: could not create the REBLUR resources ({}); falling back for now", e.what());
+        logger::warn("SSRT: could not create the REBLUR resources ({}); falling back for now (next try in 300 frames)", e.what());
         texNRDPackInput = nullptr;
         texNRDPackOutput = nullptr;
         nrdReblurDiffuse.Shutdown();
         nrdReblurSpecular.Shutdown();
+        specularCompositeSRV = nullptr;
+        specularCompositePacked = false;
+        nrdRetryFrames = 300;
     }
 }
 
@@ -1832,9 +1861,28 @@ void ScreenSpaceRayTracing::ResolveDenoisers()
     // allocation -- and nothing but a resolution change ever released them again, so the memory
     // stayed committed for the rest of the session with the tree closed and the menu shut. See
     // SvgfHistoryNeeded for why the debug view it was protecting was not actually being served.
-    if (SVGFSelected() ||
-        (ReblurSelected() && (!ReblurResourcesReady(false) || !ReblurResourcesReady(true))))
-        EnsureSvgfResources();
+    if (svgfRetryFrames > 0)
+        --svgfRetryFrames;
+    else if (SVGFSelected() ||
+             (ReblurSelected() && (!ReblurResourcesReady(false) || !ReblurResourcesReady(true)))) {
+        // (46q) Out of video memory must not throw out of the render hook: no SVGF (the chain resolves to Off), next try in 300 frames.
+        try {
+            EnsureSvgfResources();
+        } catch (const std::exception& e) {
+            logger::warn("SSRT: could not create the SVGF resources ({}); denoiser off for now (next try in 300 frames)", e.what());
+            texHistoryDiffuse = nullptr;
+            texHistory = nullptr;
+            texTemporal = nullptr;
+            texVariance = nullptr;
+            texMoments = nullptr;
+            texHistoryMoments = nullptr;
+            texHistoryMomentsDiffuse = nullptr;
+            texHistoryNormals = nullptr;
+            texHistoryDepth = nullptr;
+            texDebugHistory = nullptr;
+            svgfRetryFrames = 300;
+        }
+    }
 
     const bool svgfDiffuse = SvgfChainReady(false);
     const bool svgfSpecular = SvgfChainReady(true);

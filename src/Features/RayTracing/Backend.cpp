@@ -89,8 +89,10 @@ namespace RayTracingRT
 			releaseThread_.detach();
 		if (poolThread_.joinable())
 			poolThread_.detach();  // (46g) likewise
-		if (submitThread_.joinable())
-			submitThread_.detach();  // (46q) likewise
+		if (submitThread_.joinable()) {
+			submitThread_.detach();  // (46q) likewise (and its lock is not taken again: Shutdown checks submitDetached_)
+			submitDetached_ = true;
+		}
 		submitStaged_.clear();
 		submitOn_ = false;
 		Shutdown(false);
@@ -980,7 +982,8 @@ namespace RayTracingRT
 			submitStaged_.clear();
 			submitOn_ = false;
 		}
-		{
+		if (!submitDetached_) {
+			// (46q) Not at process exit: the submit thread was detached there and may have died holding the lock.
 			std::scoped_lock lock(submitMutex_);
 			submitError_ = S_OK;
 			submitErrorWhat_.clear();
@@ -2979,6 +2982,8 @@ namespace RayTracingRT
 					}
 				case SubmitOp::Kind::Signal:
 					hr = queue_->Signal(op.fence, op.value);
+					if (FAILED(hr))
+						SignalFromCpu(op);
 					break;
 				case SubmitOp::Kind::Wait:
 					hr = queue_->Wait(op.fence, op.value);
@@ -3011,7 +3016,20 @@ namespace RayTracingRT
 		if (!submitThread_.joinable())
 			return;
 		std::unique_lock lock(submitMutex_);
-		submitIdleCv_.wait(lock, [this] { return submitQueue_.empty() && !submitBusy_; });
+		// The order of our queue's calls must hold, so this waits; a stuck D3D12 call is logged (every 2 s) instead of passing silently.
+		while (!submitIdleCv_.wait_for(lock, std::chrono::seconds(2), [this] { return submitQueue_.empty() && !submitBusy_; }))
+			logger::warn("[RayTracing] Submit on a Worker Thread: still waiting for the submit thread ({} batches queued, busy {})", submitQueue_.size(), submitBusy_);
+	}
+
+	void Backend::SignalFromCpu(const SubmitOp& a_op)
+	{
+		// (46q) Last resort for a queue Signal that failed on the submit thread (device removed / out of memory): the D3D11 queue may
+		// already wait (GPU-side) for this value, issued before the hand-over. The value is set from the CPU so that wait ends; the
+		// feature then turns itself off (CheckSubmitError at the next recording step). A frame may show stale shadows; no GPU hang.
+		if (!a_op.fence || a_op.fence->GetCompletedValue() >= a_op.value)
+			return;
+		const HRESULT hr = a_op.fence->Signal(a_op.value);
+		logger::error("[RayTracing] Submit thread: {} failed; fence value {} set from the CPU ({})", a_op.what, a_op.value, SUCCEEDED(hr) ? "ok" : HrString(hr));
 	}
 
 	void Backend::StopSubmitThread()
@@ -3051,6 +3069,7 @@ namespace RayTracingRT
 			SubmitBatch batch = std::move(submitQueue_.front());
 			submitQueue_.pop_front();
 			submitBusy_ = true;
+			submitBusyKickQpc_ = batch.kickQpc;
 			ID3D12CommandQueue* queue = queue_.Get();  // released only after this thread is joined (Shutdown)
 			lock.unlock();
 			const std::int64_t start = QpcNow();
@@ -3071,6 +3090,8 @@ namespace RayTracingRT
 					}
 				case SubmitOp::Kind::Signal:
 					hr = queue->Signal(op.fence, op.value);
+					if (FAILED(hr))
+						SignalFromCpu(op);  // the D3D11 queue may already wait for this value (GPU-side): never leave it waiting
 					break;
 				case SubmitOp::Kind::Wait:
 					hr = queue->Wait(op.fence, op.value);
@@ -3134,6 +3155,16 @@ namespace RayTracingRT
 		std::string what;
 		{
 			std::scoped_lock lock(submitMutex_);
+			// (46q) Watchdog: a batch handed over more than 1 s ago and not finished (a D3D12 call stuck): logged once per stall.
+			const std::int64_t oldest = !submitQueue_.empty() ? submitQueue_.front().kickQpc : (submitBusy_ ? submitBusyKickQpc_ : 0);
+			if (oldest != 0 && QpcToMs(QpcNow() - oldest) > 1000.0) {
+				if (!submitStallLogged_) {
+					submitStallLogged_ = true;
+					logger::warn("[RayTracing] Submit on a Worker Thread: a batch handed over {:.0f} ms ago has not gone out yet ({} queued)",
+						QpcToMs(QpcNow() - oldest), submitQueue_.size());
+				}
+			} else
+				submitStallLogged_ = false;
 			if (SUCCEEDED(submitError_))
 				return false;
 			hr = submitError_;
@@ -3192,8 +3223,8 @@ namespace RayTracingRT
 
 	void Backend::LearnBuildCost(float a_prepMs, const Util::FrameTrace::RtPrepWork& a_work)
 	{
-		if (!a_work.valid || a_prepMs < 0.0f)
-			return;
+		if (!a_work.valid || !std::isfinite(a_prepMs) || a_prepMs < 0.0f || a_prepMs > 1000.0f)
+			return;  // (46q) a wrapped / garbage timestamp pair does not feed the model
 		const std::uint64_t triangles = a_work.buildTriangles + a_work.groupTriangles;
 		if (triangles == 0 && a_work.compactions == 0) {
 			prepBaseEma_ = prepBaseEma_ < 0.0 ? a_prepMs : prepBaseEma_ * 0.9 + a_prepMs * 0.1;
