@@ -233,6 +233,9 @@ namespace RayTracingPointLights
 			double pos[3]{};
 			double weight = 0.0;
 			float radius = 0.0f;
+			// (46t) The reach of the source (coverage + the trace's ranking range): the radius, extended to cover every member's
+			// sphere around the group centre (snapped lights; merged ones with Merge Hysteresis). The clearance keeps radius.
+			float reach = 0.0f;
 			float intensity = 0.0f;
 			float score = 0.0f;
 			const Candidate* strongest = nullptr;
@@ -724,6 +727,24 @@ namespace RayTracingPointLights
 			memberGroup[i] = g;
 			++stats_.snapped;
 		}
+		// (46t) Reach, once the centres are final: a snapped light (up to the snap distance away, its own radius) lit pixels
+		// outside its fixture's sphere, which then got no traced shadow -- the shadow ended in a hard line at the fixture's
+		// radius. Each snapped member, and with Merge Hysteresis each merged member (the centre moves off the seed), widens
+		// the source's reach to cover its sphere. All 46s switches off: reach = radius (46r).
+		for (auto& group : groups)
+			group.reach = group.radius;
+		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
+			const std::uint32_t g = memberGroup[i];
+			if (g == UINT32_MAX)
+				continue;
+			const auto& c = candidates[i];
+			auto& group = groups[g];
+			if (group.spot || !(c.anchor != UINT32_MAX || a_config.mergeHysteresis))
+				continue;
+			const float cover = static_cast<float>(std::sqrt(DistSq(group.pos, c.pos))) + c.read.radius;
+			if (std::isfinite(cover))
+				group.reach = std::max(group.reach, cover);
+		}
 		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
 			const auto& c = candidates[i];
 			if (c.meshless && c.anchor == UINT32_MAX)
@@ -826,8 +847,10 @@ namespace RayTracingPointLights
 			out.posRadius[0] = static_cast<float>(group.pos[0] - a_camera[0]);
 			out.posRadius[1] = static_cast<float>(group.pos[1] - a_camera[1]);
 			out.posRadius[2] = static_cast<float>(group.pos[2] - a_camera[2]);
-			out.posRadius[3] = group.radius;
-			out.atten[0] = 1.0f / std::max(group.radius, 1.0f);
+			// (46t) The reach: the trace's per-pixel source test and its ranking range (the shading of the engine's lights is
+			// their own; the trace only picks which sources to shadow-test at a pixel and returns a visibility mask).
+			out.posRadius[3] = group.reach;
+			out.atten[0] = 1.0f / std::max(group.reach, 1.0f);
 			out.atten[1] = s.read.fadeZone;
 			out.atten[2] = s.read.sizeBias;
 			out.atten[3] = group.intensity;
@@ -907,7 +930,7 @@ namespace RayTracingPointLights
 				if (group.slot == UINT32_MAX || !group.strongest)
 					continue;
 				const double d = std::sqrt(DistSq(group.pos, p));
-				if (!(d <= group.radius))
+				if (!(d <= group.reach))  // (46t) the reach (radius before)
 					continue;
 				const auto& s = *group.strongest;
 				Reach e;
@@ -918,7 +941,7 @@ namespace RayTracingPointLights
 				e.spot = group.spot;
 				e.steady = s.steady;
 				e.distance = static_cast<float>(d);
-				e.radius = group.radius;
+				e.radius = group.reach;  // (46t)
 				e.intensity = group.intensity;
 				std::memcpy(e.label, s.traits.label, sizeof(e.label));
 				e.label[sizeof(e.label) - 1] = '\0';
