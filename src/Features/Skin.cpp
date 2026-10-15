@@ -9,6 +9,7 @@
 #include "State.h"
 #include "Features/DynamicSnow.h"
 #include "Features/WetSkin.h"
+#include "Utils/WorldTiming.h"
 
 #include "DynamicWetness_PublicAPI.h"
 
@@ -436,7 +437,11 @@ Skin::WaterSample Skin::SampleWater(RE::Actor* a_actor)
 			const bool moved = std::abs(position.x - entry.x) > kWaterCacheMove || std::abs(position.y - entry.y) > kWaterCacheMove ||
 			                   std::abs(position.z - entry.z) > kWaterCacheMove;
 			if (entry.qpc == 0 || moved || static_cast<double>(now - entry.qpc) * SkinQpcMs() > kWaterCacheMaxAgeMs) {
+				const bool timed = Util::WorldTiming::On();  // (46l) measurement only
+				const uint64_t searchStart = timed ? Util::WorldTiming::Stamp() : 0;
 				entry.height = GetWaterObjectHeight(position, maxDepth);
+				if (timed)
+					Util::WorldTiming::AddWaterSearch(searchStart);
 				entry.x = position.x;
 				entry.y = position.y;
 				entry.z = position.z;
@@ -488,7 +493,12 @@ bool Skin::IsSheltered(RE::Actor* a_actor, ActorSnow& a_snow, double a_intervalM
 	const RE::NiPoint3 from{ position.x, position.y, top };
 	const RE::NiPoint3 to{ position.x, position.y, top + 3000.0f };
 	bool hit = false;
-	if (PickUpSafe(world, &from, &to, &hit))
+	const bool timed = Util::WorldTiming::On();  // (46l) measurement only
+	const uint64_t pickStart = timed ? Util::WorldTiming::Stamp() : 0;
+	const bool picked = PickUpSafe(world, &from, &to, &hit);
+	if (timed)
+		Util::WorldTiming::AddShelterPick(pickStart);
+	if (picked)
 		a_snow.sheltered = hit;
 	else
 		a_snow.shelterQpc = 0;  // not tested (physics busy, or a fault): the last answer, asked again next frame
@@ -638,6 +648,17 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 		o_wetChar = it->second.wetChar;
 		return it->second.skin;
 	}
+	// (46l) World-render split: one character's wetness / snow computed this frame (measurement only).
+	struct ActorTimer
+	{
+		bool on = Util::WorldTiming::On();
+		uint64_t start = on ? Util::WorldTiming::Stamp() : 0;
+		~ActorTimer()
+		{
+			if (on)
+				Util::WorldTiming::AddSkinActor(start);
+		}
+	} actorTimer;
 	if (it == actorWetStates.end()) {
 		if (actorWetStates.size() >= kMaxActorWetStates)
 			PruneActorWetStates(frame);

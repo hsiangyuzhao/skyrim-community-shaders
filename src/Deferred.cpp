@@ -27,6 +27,7 @@
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/OcclusionDryRun.h"
+#include "Utils/WorldTiming.h"
 
 // CPU-side timing of our own work. Purely observational: every one of these is a
 // QueryPerformanceCounter bracket around an existing call, and each is a no-op unless the
@@ -952,6 +953,8 @@ void Deferred::Hooks::Main_RenderWorld::thunk(bool a1)
 void Deferred::Hooks::Main_RenderWorld_Start::thunk(RE::BSBatchRenderer* This, uint32_t StartRange, uint32_t EndRanges, uint32_t RenderFlags, int GeometryGroup)
 {
 	if (globals::shaderCache->IsEnabled() && globals::state->inWorld) {
+		// (46l) World-render split: our work inside the world render (measurement only).
+		Util::WorldTiming::Scope worldTiming(Util::WorldTiming::Kind::OursOther);
 		// Here is where the first opaque objects start rendering
 		globals::deferred->StartDeferred();
 	}
@@ -964,6 +967,7 @@ void Deferred::Hooks::Main_RenderWorld_BlendedDecals::thunk(RE::BSShaderAccumula
 	auto deferred = globals::deferred;
 
 	if (globals::shaderCache->IsEnabled() && globals::state->inWorld) {
+		Util::WorldTiming::Scope worldTiming(Util::WorldTiming::Kind::OursOther);  // (46l)
 		auto& terrainBlending = globals::features::terrainBlending;
 		// Defer terrain rendering until after everything else
 		if (terrainBlending.loaded)
@@ -974,6 +978,7 @@ void Deferred::Hooks::Main_RenderWorld_BlendedDecals::thunk(RE::BSShaderAccumula
 
 	func(This, RenderFlags);
 
+	Util::WorldTiming::Scope worldTiming(Util::WorldTiming::Kind::OursOther);  // (46l) the end of the deferred pass and the depth copy
 	deferred->EndDeferred();
 
 	// Copy depth from before water

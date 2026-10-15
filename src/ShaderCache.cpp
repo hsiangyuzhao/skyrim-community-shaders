@@ -7,6 +7,7 @@
 #include "State.h"
 #include "Utils/CompileDedupe.h"
 #include "Utils/FrameTrace.h"
+#include "Utils/WorldTiming.h"
 #include "Utils/ShaderContentStore.h"
 
 #include "Features/DynamicCubemaps.h"
@@ -2064,8 +2065,13 @@ namespace SIE
 			}
 		}
 
+		// (46l) World-render split: the lookup's lock wait and the miss hand-off (measurement only).
+		const bool worldTimed = Util::WorldTiming::On();
+		const uint64_t lookupStart = worldTimed ? Util::WorldTiming::Stamp() : 0;
 		{
 			std::lock_guard lockGuard(vertexShadersMutex);
+			if (worldTimed)
+				Util::WorldTiming::AddLookup(lookupStart);
 			auto& typeCache = vertexShaders[static_cast<size_t>(shader.shaderType.underlying())];
 			auto it = typeCache.find(descriptor);
 			if (it != typeCache.end()) {
@@ -2074,10 +2080,16 @@ namespace SIE
 		}
 
 		Util::FrameTrace::OnShaderMiss(IsAsync());
+		const uint64_t missStart = worldTimed ? Util::WorldTiming::Stamp() : 0;
 		if (IsAsync()) {
 			compilationSet.Add({ ShaderClass::Vertex, shader, descriptor });
+			if (worldTimed)
+				Util::WorldTiming::AddMiss(missStart);
 		} else {
-			return MakeAndAddVertexShader(shader, descriptor);
+			auto* made = MakeAndAddVertexShader(shader, descriptor);
+			if (worldTimed)
+				Util::WorldTiming::AddMiss(missStart);
+			return made;
 		}
 
 		return nullptr;
@@ -2113,8 +2125,13 @@ namespace SIE
 			}
 		}
 
+		// (46l) World-render split: the lookup's lock wait and the miss hand-off (measurement only).
+		const bool worldTimed = Util::WorldTiming::On();
+		const uint64_t lookupStart = worldTimed ? Util::WorldTiming::Stamp() : 0;
 		{
 			std::lock_guard lockGuard(pixelShadersMutex);
+			if (worldTimed)
+				Util::WorldTiming::AddLookup(lookupStart);
 			auto& typeCache = pixelShaders[static_cast<size_t>(shader.shaderType.underlying())];
 			auto it = typeCache.find(descriptor);
 			if (it != typeCache.end()) {
@@ -2123,10 +2140,16 @@ namespace SIE
 		}
 
 		Util::FrameTrace::OnShaderMiss(IsAsync());
+		const uint64_t missStart = worldTimed ? Util::WorldTiming::Stamp() : 0;
 		if (IsAsync()) {
 			compilationSet.Add({ ShaderClass::Pixel, shader, descriptor });
+			if (worldTimed)
+				Util::WorldTiming::AddMiss(missStart);
 		} else {
-			return MakeAndAddPixelShader(shader, descriptor);
+			auto* made = MakeAndAddPixelShader(shader, descriptor);
+			if (worldTimed)
+				Util::WorldTiming::AddMiss(missStart);
+			return made;
 		}
 
 		return nullptr;

@@ -11,6 +11,7 @@
 #include "Utils/EngineTiming.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/LatencyPacer.h"
+#include "Utils/WorldTiming.h"
 
 #include <intrin.h>
 #include <thread>
@@ -53,10 +54,14 @@ namespace Util::FrameTrace
 			double mapWorstMs = 0.0;
 			const void* mapWorstCaller = nullptr;
 			char mapWorstResource[96]{};
+			double driverMisc = 0.0;  // (46l) GetData, Clear*, GenerateMips, ResolveSubresource
+			uint32_t driverMiscCalls = 0;
 		};
 		FrameAcc g_frame;
 		int64_t g_simStart = 0;
 		std::atomic<uint32_t> g_shaderAsync{ 0 }, g_shaderSync{ 0 }, g_cellAttach{ 0 }, g_cellDetach{ 0 };
+		std::atomic<int64_t> g_mapOtherTicks{ 0 };  // (46l) Map on other contexts
+		std::atomic<uint32_t> g_mapOtherCalls{ 0 };
 		std::unordered_set<const void*> g_seenGeometry;
 		bool g_cellSinkRegistered = false;
 		float g_lastYaw = 0.0f, g_lastPitch = 0.0f;
@@ -144,6 +149,12 @@ namespace Util::FrameTrace
 			// (46e) Screen-space GI / reflections per pass (last GPU samples, -1 = the pass is off): SSRT REBLUR,
 			// SSRT diffuse trace, SSRT specular trace, SSGI, SSGI contact AO.
 			float ssPassMs[5]{ -1.0f, -1.0f, -1.0f, -1.0f, -1.0f };
+			// (46l) World-render split, other blocking D3D11 calls, Map on other contexts.
+			WorldTiming::Frame world;
+			float driverMiscMs = 0.0f;
+			uint32_t driverMiscCalls = 0;
+			float mapOtherMs = 0.0f;
+			uint32_t mapOtherCalls = 0;
 		};
 
 		struct ReflexTimes
@@ -153,6 +164,7 @@ namespace Util::FrameTrace
 		};
 
 		bool g_recording = false;
+		uint32_t g_worldSpikeLogs = 0;  // (46l) world-spike log lines this recording (capped)
 		// (45j) Taken when a recording starts (the CSV is written on another thread).
 		std::string g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency;
 		std::string g_headerRendering;  // (46e) upscaler, resolutions, SSRT / SSGI
@@ -364,6 +376,22 @@ namespace Util::FrameTrace
 				out << "#   1 darker of both), -1 = not traced. Indoors with RTAO only (no light traced) rt_sync_gpu_ms is 0: the AO wait covers the trace.\n";
 				out << "# (46k) rt_pump = 1 on a loading-screen frame (no world render) whose RT work came from the loading pump (rt_phase 1); rt_pump_ms = its CPU\n";
 				out << "#   (-1 = not run). rt_black is now only the first frames after the loading screen (Black Screen Window), not the whole fade-in.\n";
+				out << "# (46l) wt_* = the world segment (eng_world_ms) split while recording (wt_valid 1; wt_total_ms should match eng_world_ms).\n";
+				out << "#   By kind, exclusive (they add up to wt_total): engine = engine code outside the per-pass calls (traversal, sorting, groups);\n";
+				out << "#   pass = per-pass glue in RenderPassImmediately (technique / material switch, SetDirtyStates incl. our State::Draw, the draw);\n";
+				out << "#   technique = BeginTechnique with our shader lookup; material_ours / _engine = SetupMaterial (Lighting) ours / the engine's;\n";
+				out << "#   setup_ours / _engine = SetupGeometry ours (Advanced Skin, LLF, SSS, ...) / the engine's (bones, constants, lights);\n";
+				out << "#   restore = RestoreGeometry; ours_other = our start / end of the deferred pass and terrain blending.\n";
+				out << "#   Of which (inside the kinds above): wt_driver_ms = D3D11 calls, wt_own_draw_ms = State::Draw, wt_lookup_ms = shader-cache lock\n";
+				out << "#   wait (wt_lookups lookups), wt_miss_ms / wt_misses = cache misses handed off, wt_skin_* = Advanced Skin characters computed\n";
+				out << "#   (wetness / snow), wt_shelter_* = Havok shelter picks, wt_water_* = water-object searches, wt_create_* / wt_tex_creates\n";
+				out << "#   (buffers and textures) / wt_view_creates = device Create* calls. Counts: render passes, technique switches, material set-ups,\n";
+				out << "#   geometry set-ups, pass groups; wt_stamps = TSC reads (the split's own cost is about wt_stamps x 10 ns).\n";
+				out << "#   wt_top3 / wt_places_over_1ms = by place: RW/FA/RD/FP+offset>callee = the call site in Main::RenderWorld /\n";
+				out << "#   FinishAccumulating_Standard / Main::RenderDepth / Main::RenderFirstPersonView and the Address Library ID it calls;\n";
+				out << "#   <D|W|F>grp<group>:<first>-<last> = BSShaderAccumulator::RenderBatches of that pass group (D depth, W world, F first person);\n";
+				out << "#   XX:start = before the first probe. driver_misc_* = GetData / Clear* / GenerateMips / ResolveSubresource (not in driver_total);\n";
+				out << "#   map_other_* = Map on contexts other than the immediate one (any thread).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -391,6 +419,11 @@ namespace Util::FrameTrace
 				       "rt_e_close_ms,rt_e_execute_ms,rt_x_timestamps_ms,rt_x_ensure_ms,rt_x_publish_ms,rt_x_ao_ms,rt_pool_ms,rt_pool_sync_blocks,rt_pool_mb,rt_pool_waits,"
 				       "rt_pool_worker_ms,rt_pl_slot_changes,rt_pl_merged,rt_pl_rej_radius,rt_pl_rej_intensity,rt_pl_kept,rt_pl_churn,rt_pl_beams_excluded,"
 				       "rtao_indoors,rtao_mode,rt_pump,rt_pump_ms,"
+				       "wt_valid,wt_total_ms,wt_engine_ms,wt_pass_ms,wt_technique_ms,wt_material_ours_ms,wt_material_engine_ms,wt_setup_ours_ms,"
+				       "wt_setup_engine_ms,wt_restore_ms,wt_ours_other_ms,wt_driver_ms,wt_own_draw_ms,wt_lookup_ms,wt_lookups,"
+				       "wt_miss_ms,wt_misses,wt_skin_actors,wt_skin_ms,wt_shelter_picks,wt_shelter_ms,wt_water_searches,wt_water_ms,wt_creates,"
+				       "wt_create_ms,wt_tex_creates,wt_view_creates,wt_passes,wt_techniques,wt_materials,wt_setups,wt_groups,wt_stamps,wt_top3,"
+				       "wt_places_over_1ms,driver_misc_ms,driver_misc_calls,map_other_ms,map_other_calls,"
 				       "cpu_top_features\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
@@ -431,6 +464,20 @@ namespace Util::FrameTrace
 					s += std::format(",{},{},{},{},{},{},{}", t.plSlotChanges, t.plMerged, t.plRejRadius, t.plRejIntensity, t.plKept, t.plChurn, t.plBeamsExcluded);
 					s += std::format(",{},{}", t.rtaoIndoors, t.rtaoMode);  // (46h)
 					s += std::format(",{},{:.3f}", t.pump, t.pumpMs);         // (46k)
+					{
+						// (46l) World-render split.
+						const auto& w = a_row.world;
+						using K = WorldTiming::Kind;
+						const auto k = [&](K a_kind) { return w.kindMs[static_cast<int>(a_kind)]; };
+						s += std::format(",{},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}", w.valid ? 1 : 0, w.totalMs, k(K::Engine),
+							k(K::Pass), k(K::Technique), k(K::MaterialOurs), k(K::MaterialEngine), k(K::SetupOurs), k(K::SetupEngine), k(K::Restore),
+							k(K::OursOther));
+						s += std::format(",{:.3f},{:.3f},{:.3f},{},{:.3f},{},{},{:.3f},{},{:.3f},{},{:.3f},{},{:.3f},{},{},{},{},{},{},{},{}", w.driverMs, w.ownDrawMs,
+							w.lookupMs, w.lookups, w.missMs, w.misses, w.skinActors, w.skinMs, w.shelterPicks, w.shelterMs, w.waterSearches, w.waterMs, w.creates,
+							w.createMs, w.textureCreates, w.viewCreates, w.passes, w.techniques, w.materials, w.setups, w.groups, w.stamps);
+						s += std::format(",{},{},{:.3f},{},{:.3f},{}", w.top3, w.placesOver1ms, a_row.driverMiscMs, a_row.driverMiscCalls, a_row.mapOtherMs,
+							a_row.mapOtherCalls);
+					}
 					s += "," + a_row.cpuTop + "\n";
 					return s;
 				};
@@ -500,8 +547,95 @@ namespace Util::FrameTrace
 					const double ms = Ms(Now() - start);
 					g_frame.driver[static_cast<int>(C)] += ms;
 					g_frame.driverTotal += ms;
+					if (WorldTiming::On())  // (46l) inside the world render
+						WorldTiming::AddDriverMs(ms);
 				}
 			}
+		};
+
+		/// (46l) Other immediate-context calls that can block (query read-back, clears, resolves, mips):
+		/// timed on their own (driver_misc_*), not part of driver_total.
+		struct TimedMisc
+		{
+			int64_t start = 0;
+			explicit TimedMisc(ID3D11DeviceContext* a_ctx)
+			{
+				if (g_active && a_ctx == globals::d3d::context)
+					start = Now();
+			}
+			~TimedMisc()
+			{
+				if (start) {
+					const double ms = Ms(Now() - start);
+					g_frame.driverMisc += ms;
+					++g_frame.driverMiscCalls;
+					if (WorldTiming::On())
+						WorldTiming::AddDriverMs(ms);
+				}
+			}
+		};
+		struct GetData
+		{
+			static HRESULT thunk(ID3D11DeviceContext* This, ID3D11Asynchronous* a, void* d, UINT s, UINT f)
+			{
+				TimedMisc t(This);
+				return func(This, a, d, s, f);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+		struct ClearRenderTargetView
+		{
+			static void thunk(ID3D11DeviceContext* This, ID3D11RenderTargetView* v, const FLOAT* c)
+			{
+				TimedMisc t(This);
+				func(This, v, c);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+		struct ClearUnorderedAccessViewUint
+		{
+			static void thunk(ID3D11DeviceContext* This, ID3D11UnorderedAccessView* v, const UINT* c)
+			{
+				TimedMisc t(This);
+				func(This, v, c);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+		struct ClearUnorderedAccessViewFloat
+		{
+			static void thunk(ID3D11DeviceContext* This, ID3D11UnorderedAccessView* v, const FLOAT* c)
+			{
+				TimedMisc t(This);
+				func(This, v, c);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+		struct ClearDepthStencilView
+		{
+			static void thunk(ID3D11DeviceContext* This, ID3D11DepthStencilView* v, UINT f, FLOAT d, UINT8 s)
+			{
+				TimedMisc t(This);
+				func(This, v, f, d, s);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+		struct GenerateMips
+		{
+			static void thunk(ID3D11DeviceContext* This, ID3D11ShaderResourceView* v)
+			{
+				TimedMisc t(This);
+				func(This, v);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+		struct ResolveSubresource
+		{
+			static void thunk(ID3D11DeviceContext* This, ID3D11Resource* d, UINT ds, ID3D11Resource* s, UINT ss, DXGI_FORMAT f)
+			{
+				TimedMisc t(This);
+				func(This, d, ds, s, ss, f);
+			}
+			static inline REL::Relocation<decltype(thunk)> func;
 		};
 
 		struct DrawIndexed
@@ -572,8 +706,16 @@ namespace Util::FrameTrace
 		{
 			static HRESULT thunk(ID3D11DeviceContext* This, ID3D11Resource* r, UINT s, D3D11_MAP m, UINT f, D3D11_MAPPED_SUBRESOURCE* o)
 			{
-				if (!g_active || This != globals::d3d::context)
+				if (!g_active)
 					return func(This, r, s, m, f, o);
+				if (This != globals::d3d::context) {
+					// (46l) Map on another context (deferred contexts, other threads): counted and timed apart.
+					const int64_t otherStart = Now();
+					const HRESULT otherHr = func(This, r, s, m, f, o);
+					g_mapOtherTicks.fetch_add(Now() - otherStart, std::memory_order_relaxed);
+					g_mapOtherCalls.fetch_add(1, std::memory_order_relaxed);
+					return otherHr;
+				}
 				const int64_t start = Now();
 				HRESULT hr;
 				{
@@ -714,6 +856,14 @@ namespace Util::FrameTrace
 		stl::detour_vfunc<47, CopyResource>(a_context);
 		stl::detour_vfunc<48, UpdateSubresource>(a_context);
 		stl::detour_vfunc<111, Flush>(a_context);
+		// (46l) Other calls that can block, timed apart (driver_misc_*).
+		stl::detour_vfunc<29, GetData>(a_context);
+		stl::detour_vfunc<50, ClearRenderTargetView>(a_context);
+		stl::detour_vfunc<51, ClearUnorderedAccessViewUint>(a_context);
+		stl::detour_vfunc<52, ClearUnorderedAccessViewFloat>(a_context);
+		stl::detour_vfunc<53, ClearDepthStencilView>(a_context);
+		stl::detour_vfunc<54, GenerateMips>(a_context);
+		stl::detour_vfunc<57, ResolveSubresource>(a_context);
 		logger::info("[FrameTrace] D3D11 call timing hooks installed");
 	}
 
@@ -728,6 +878,8 @@ namespace Util::FrameTrace
 			return;
 		const double ms = Ms(Now() - a_start) - (g_frame.driverTotal - a_driverAtStart);
 		g_frame.ownDrawHook += std::max(ms, 0.0);
+		if (WorldTiming::On())  // (46l)
+			WorldTiming::AddOwnDrawMs(std::max(ms, 0.0));
 		++g_frame.draws;
 		if (a_type == static_cast<int>(RE::BSShader::Type::Lighting))
 			++g_frame.lightingDraws;
@@ -963,6 +1115,8 @@ namespace Util::FrameTrace
 
 		// (44f) Close the engine CPU split for this frame (also resets it while inactive).
 		const auto engine = EngineTiming::TakeFrame(wasActive && g_recording);
+		// (46l) Close the world-render split too (also resets it while not recording).
+		auto world = WorldTiming::TakeFrame(g_recording);
 
 		if (wasActive && g_lastPresentEnd) {
 			const float frameMs = static_cast<float>(Ms(now - g_lastPresentEnd));
@@ -1011,6 +1165,8 @@ namespace Util::FrameTrace
 			const uint32_t shaderSync = g_shaderSync.exchange(0, std::memory_order_relaxed);
 			const uint32_t cellAttach = g_cellAttach.exchange(0, std::memory_order_relaxed);
 			const uint32_t cellDetach = g_cellDetach.exchange(0, std::memory_order_relaxed);
+			const int64_t mapOtherTicks = g_mapOtherTicks.exchange(0, std::memory_order_relaxed);  // (46l)
+			const uint32_t mapOtherCalls = g_mapOtherCalls.exchange(0, std::memory_order_relaxed);
 
 			if (g_recording) {
 				Row r;
@@ -1094,6 +1250,11 @@ namespace Util::FrameTrace
 				r.lights = g_frame.lights;
 				SampleScreenSpacePasses(r);  // (46e)
 				r.cpuTop = Util::CpuPassTimers::GetSingleton()->TopOfCurrentFrame(3);
+				r.world = std::move(world);
+				r.driverMiscMs = static_cast<float>(g_frame.driverMisc);
+				r.driverMiscCalls = g_frame.driverMiscCalls;
+				r.mapOtherMs = static_cast<float>(Ms(mapOtherTicks));
+				r.mapOtherCalls = mapOtherCalls;
 				r.mapCalls = g_frame.mapCalls;
 				r.mapSlow = g_frame.mapSlow;
 				r.mapWorstMs = static_cast<float>(g_frame.mapWorstMs);
@@ -1137,6 +1298,17 @@ namespace Util::FrameTrace
 							r.mapWorstCaller, engine.valid ? engine.ms[static_cast<int>(EngineTiming::Seg::OurPasses)] : -1.0f, engine.createOtherMs);
 					}
 				}
+				// (46l) A slow world render names its three costliest places and the split by kind.
+				if (engine.valid && engine.ms[static_cast<int>(EngineTiming::Seg::World)] > 10.0f && r.world.valid && g_worldSpikeLogs < 400) {
+					++g_worldSpikeLogs;
+					const auto& w = r.world;
+					logger::info("[FrameTrace] World spike {:.1f} ms (split {:.1f}): top places [{}] kinds [{}] of which D3D11 {:.2f}, State::Draw {:.2f}, "
+								 "lookup wait {:.2f} ({}), misses {:.2f} ({}), skin {:.2f} ({} chars), shelter {:.2f} ({}), water {:.2f} ({}), creates {:.2f} ({}); "
+								 "passes {} techniques {} draws {}",
+						engine.ms[static_cast<int>(EngineTiming::Seg::World)], w.totalMs, w.top3, w.kindsText, w.driverMs, w.ownDrawMs, w.lookupMs, w.lookups,
+						w.missMs, w.misses, w.skinMs, w.skinActors, w.shelterMs, w.shelterPicks, w.waterMs, w.waterSearches, w.createMs, w.creates, w.passes,
+						w.techniques, r.draws);
+				}
 				g_rows.push_back(r);
 				if ((++g_reflexPoll & 15) == 0)
 					PollReflex();
@@ -1157,6 +1329,7 @@ namespace Util::FrameTrace
 		if (g_recording || g_frequency == 0)
 			return;
 		g_rows.clear();
+		g_worldSpikeLogs = 0;
 		// (44f) "First seen" geometry counts from the start of every recording.
 		g_seenGeometry.clear();
 		g_rows.reserve(static_cast<size_t>(std::clamp(a_seconds, 1.0f, 600.0f) * 250.0f));

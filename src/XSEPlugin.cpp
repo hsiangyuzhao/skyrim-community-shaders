@@ -10,6 +10,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "TruePBR.h"
+#include "Utils/WorldTiming.h"
 
 #include "ENB/ENBSeriesAPI.h"
 
@@ -81,6 +82,8 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 	case SKSE::MessagingInterface::kPostPostLoad:
 		{
 			if (errors.empty()) {
+				// (46l) World-render split: the innermost shader-vtable wrappers go in before every other hook.
+				Util::WorldTiming::InstallInner();
 				Deferred::Hooks::Install();
 				globals::truePBR->PostPostLoad();
 				Hooks::Install();

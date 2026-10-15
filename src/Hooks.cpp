@@ -21,6 +21,7 @@
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/OcclusionDryRun.h"
+#include "Utils/WorldTiming.h"
 
 #include "Features/GrassOptimizations.h"
 #include "Features/InteriorSun.h"
@@ -132,6 +133,8 @@ struct BSShader_LoadShaders
 
 bool Hooks::BSShader_BeginTechnique::thunk(RE::BSShader* shader, uint32_t vertexDescriptor, uint32_t pixelDescriptor, bool skipPixelShader)
 {
+	// (46l) World-render split: BeginTechnique with our shader lookups (measurement only).
+	Util::WorldTiming::Scope worldTiming(Util::WorldTiming::Kind::Technique);
 	auto state = globals::state;
 	auto shaderCache = globals::shaderCache;
 
@@ -640,6 +643,8 @@ namespace Hooks
 			globals::InstallD3DHooks(globals::d3d::context);
 			Util::FrameTrace::InstallContextHooks(globals::d3d::context);
 			Batch39Engine::InstallContextHooks(globals::d3d::context);
+			// (46l) World-render split: outermost wrappers and probes, after every other hook (measurement only).
+			Util::WorldTiming::InstallOuter();
 
 			globals::menu->Init();
 		}

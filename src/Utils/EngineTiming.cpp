@@ -11,6 +11,7 @@
 #include "Utils/FileSystem.h"
 #include "Utils/FrameTrace.h"
 #include "Utils/GpuPhaseTimeline.h"
+#include "Utils/WorldTiming.h"
 
 namespace Util::EngineTiming
 {
@@ -91,6 +92,10 @@ namespace Util::EngineTiming
 
 		void SwitchTo(int a_seg, int a_call)
 		{
+			// (46l) The world-render split runs exactly while the main thread is in the world segment.
+			constexpr int kWorld = static_cast<int>(Seg::World);
+			if ((g_seg == kWorld) != (a_seg == kWorld))
+				WorldTiming::OnWorldSegment(a_seg == kWorld);
 			if (FrameTrace::Active()) {
 				const int64_t now = FrameTrace::Now();
 				if (g_last) {
@@ -186,52 +191,9 @@ namespace Util::EngineTiming
 			SwitchTo(static_cast<int>(kSites[a_index].offset < kRenderOffset ? Seg::Logic : Seg::Tail), a_index);
 		}
 
-		// Probe stub: notes the call, then jumps to the original target as if called directly.
-		// Saves the flags and every volatile register (rax, rcx, rdx, r8-r11, xmm0-xmm5), so the
-		// callee sees exactly the registers and the stack the engine set up; the C++ callback
-		// preserves the non-volatile ones itself. On entry rsp is 8 mod 16 (the engine's call
-		// pushed the return address); 8 pushes + 0x88 keep the callback's call 16-byte aligned.
 		void EmitStub(Xbyak::CodeGenerator& a_gen, int a_index, uintptr_t a_target)
 		{
-			using namespace Xbyak::util;
-			Xbyak::Label callback, target;
-			a_gen.pushfq();
-			a_gen.push(rax);
-			a_gen.push(rcx);
-			a_gen.push(rdx);
-			a_gen.push(r8);
-			a_gen.push(r9);
-			a_gen.push(r10);
-			a_gen.push(r11);
-			a_gen.sub(rsp, 0x88);
-			a_gen.movdqu(ptr[rsp + 0x20], xmm0);
-			a_gen.movdqu(ptr[rsp + 0x30], xmm1);
-			a_gen.movdqu(ptr[rsp + 0x40], xmm2);
-			a_gen.movdqu(ptr[rsp + 0x50], xmm3);
-			a_gen.movdqu(ptr[rsp + 0x60], xmm4);
-			a_gen.movdqu(ptr[rsp + 0x70], xmm5);
-			a_gen.mov(ecx, a_index);
-			a_gen.call(ptr[rip + callback]);
-			a_gen.movdqu(xmm0, ptr[rsp + 0x20]);
-			a_gen.movdqu(xmm1, ptr[rsp + 0x30]);
-			a_gen.movdqu(xmm2, ptr[rsp + 0x40]);
-			a_gen.movdqu(xmm3, ptr[rsp + 0x50]);
-			a_gen.movdqu(xmm4, ptr[rsp + 0x60]);
-			a_gen.movdqu(xmm5, ptr[rsp + 0x70]);
-			a_gen.add(rsp, 0x88);
-			a_gen.pop(r11);
-			a_gen.pop(r10);
-			a_gen.pop(r9);
-			a_gen.pop(r8);
-			a_gen.pop(rdx);
-			a_gen.pop(rcx);
-			a_gen.pop(rax);
-			a_gen.popfq();
-			a_gen.jmp(ptr[rip + target]);
-			a_gen.L(callback);
-			a_gen.dq(reinterpret_cast<uint64_t>(&OnProbe));
-			a_gen.L(target);
-			a_gen.dq(static_cast<uint64_t>(a_target));
+			EmitProbeStub(a_gen, a_index, a_target, &OnProbe);
 		}
 
 		// ---- device Create* timing ----
@@ -239,7 +201,9 @@ namespace Util::EngineTiming
 		{
 			int64_t start = 0;
 			bool main = false;
-			CreateTimer()
+			int index = 0;
+			explicit CreateTimer(int a_index) :
+				index(a_index)
 			{
 				if (FrameTrace::Active()) {
 					main = OnMainThread();
@@ -254,6 +218,8 @@ namespace Util::EngineTiming
 				if (main) {
 					g_createTicks += d;
 					++g_creates;
+					if (WorldTiming::On())  // (46l) made inside the world render
+						WorldTiming::AddCreate(index, static_cast<double>(d) * g_toMs);
 				} else {
 					g_createOtherTicks.fetch_add(d, std::memory_order_relaxed);
 					g_createsOther.fetch_add(1, std::memory_order_relaxed);
@@ -269,7 +235,7 @@ namespace Util::EngineTiming
 		{
 			static HRESULT STDMETHODCALLTYPE thunk(ID3D11Device* This, Args... a_args)
 			{
-				CreateTimer timer;
+				CreateTimer timer(static_cast<int>(Index));
 				return func(This, a_args...);
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
@@ -293,6 +259,67 @@ namespace Util::EngineTiming
 
 	bool ProbesInstalled() { return g_probes; }
 	const char* ProbeStatus() { return g_probeStatus; }
+
+	// Probe stub: notes the call, then jumps to the original target as if called directly.
+	// Saves the flags and every volatile register (rax, rcx, rdx, r8-r11, xmm0-xmm5), so the
+	// callee sees exactly the registers and the stack the engine set up; the C++ callback
+	// preserves the non-volatile ones itself. On entry rsp is 8 mod 16 (the engine's call
+	// pushed the return address); 8 pushes + 0x88 keep the callback's call 16-byte aligned.
+	void EmitProbeStub(Xbyak::CodeGenerator& a_gen, int a_index, uintptr_t a_target, void (*a_callback)(int))
+	{
+		using namespace Xbyak::util;
+		Xbyak::Label callback, target;
+		a_gen.pushfq();
+		a_gen.push(rax);
+		a_gen.push(rcx);
+		a_gen.push(rdx);
+		a_gen.push(r8);
+		a_gen.push(r9);
+		a_gen.push(r10);
+		a_gen.push(r11);
+		a_gen.sub(rsp, 0x88);
+		a_gen.movdqu(ptr[rsp + 0x20], xmm0);
+		a_gen.movdqu(ptr[rsp + 0x30], xmm1);
+		a_gen.movdqu(ptr[rsp + 0x40], xmm2);
+		a_gen.movdqu(ptr[rsp + 0x50], xmm3);
+		a_gen.movdqu(ptr[rsp + 0x60], xmm4);
+		a_gen.movdqu(ptr[rsp + 0x70], xmm5);
+		a_gen.mov(ecx, a_index);
+		a_gen.call(ptr[rip + callback]);
+		a_gen.movdqu(xmm0, ptr[rsp + 0x20]);
+		a_gen.movdqu(xmm1, ptr[rsp + 0x30]);
+		a_gen.movdqu(xmm2, ptr[rsp + 0x40]);
+		a_gen.movdqu(xmm3, ptr[rsp + 0x50]);
+		a_gen.movdqu(xmm4, ptr[rsp + 0x60]);
+		a_gen.movdqu(xmm5, ptr[rsp + 0x70]);
+		a_gen.add(rsp, 0x88);
+		a_gen.pop(r11);
+		a_gen.pop(r10);
+		a_gen.pop(r9);
+		a_gen.pop(r8);
+		a_gen.pop(rdx);
+		a_gen.pop(rcx);
+		a_gen.pop(rax);
+		a_gen.popfq();
+		a_gen.jmp(ptr[rip + target]);
+		a_gen.L(callback);
+		a_gen.dq(reinterpret_cast<uint64_t>(a_callback));
+		a_gen.L(target);
+		a_gen.dq(static_cast<uint64_t>(a_target));
+	}
+
+	const char* ProbeBlocker()
+	{
+		if (!REL::Module::IsSE())
+			return "SE 1.5.97 only";
+		std::error_code ec;
+		const auto killFile = Util::PathHelpers::GetSettingsUserPath().parent_path() / kKillSwitchFile;
+		if (std::filesystem::exists(killFile, ec))
+			return "EngineTimingOff.txt exists";
+		if (!globals::features::performanceOverlay.settings.EngineTimingProbes)
+			return "Performance Overlay > Engine Timing Probes is off";
+		return nullptr;
+	}
 
 	void InstallUpdateProbes()
 	{
@@ -413,6 +440,7 @@ namespace Util::EngineTiming
 	void OnUpdateBegin(bool a_frameToken)
 	{
 		g_mainThread = GetCurrentThreadId();
+		WorldTiming::OnFrameStart();
 		g_frameToken = a_frameToken;
 		g_renderMarked = false;
 		g_depth = 0;
@@ -448,6 +476,7 @@ namespace Util::EngineTiming
 		if (!g_probes || !OnMainThread())
 			return;
 		Push(a_gpuScope, SegOfScope(static_cast<GpuScope>(a_gpuScope)));
+		WorldTiming::OnScopePush(a_gpuScope);  // (46l) names the world-render place
 	}
 
 	void OnPhasePop(int a_gpuScope)

@@ -65,6 +65,11 @@ namespace Util::EngineTiming
 	const char* ProbeStatus();
 	/// Name of the kill-switch file, looked for next to SettingsUser.json.
 	inline constexpr const char* kKillSwitchFile = "EngineTimingOff.txt";
+	/// (46l) Why engine probes must not be installed (SE only, kill switch, setting), or nullptr.
+	const char* ProbeBlocker();
+	/// (46l) Writes a probe stub: calls a_callback(a_index) with every register preserved, then jumps
+	/// to a_target as if it had been called directly (shared with Util::WorldTiming).
+	void EmitProbeStub(Xbyak::CodeGenerator& a_gen, int a_index, uintptr_t a_target, void (*a_callback)(int));
 
 	// ---- frame structure (Hooks.cpp) ----
 	/// Top of the Main_Update hook, after the Reflex sleep. a_frameToken: Streamline frame timing started this frame.
