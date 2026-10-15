@@ -96,6 +96,43 @@ namespace
 		if (a_legacy)
 			ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Sky Model is Legacy (36f): options added after 36f are not used right now.");
 	}
+
+	/// (46z) A settings value read without throwing: missing key, wrong type or a non-finite number all
+	/// give the default.
+	template <class T>
+	T ReadSetting(const json& a_json, const char* a_key, T a_default)
+	{
+		if (!a_json.is_object())
+			return a_default;
+		const auto it = a_json.find(a_key);
+		if (it == a_json.end())
+			return a_default;
+		try {
+			if constexpr (std::is_same_v<T, bool>) {
+				return it->is_boolean() ? it->get<bool>() : a_default;
+			} else {
+				if (!it->is_number())
+					return a_default;
+				const T value = it->get<T>();
+				if constexpr (std::is_floating_point_v<T>) {
+					if (!std::isfinite(value))
+						return a_default;
+				}
+				return value;
+			}
+		} catch (...) {
+			return a_default;
+		}
+	}
+
+	/// (46z, C2/C3) Earth values (Hillaire 2020, "A Scalable and Production Ready Sky and Atmosphere
+	/// Rendering Technique", and Bruneton 2017), in the Atmosphere tab's units (Mm^-1, km).
+	constexpr float kEarthAerosolScatter = 3.996f;
+	constexpr float kEarthAerosolAbsorption = 0.444f;  // extinction 4.44 - scattering 3.996
+	constexpr float kEarthOzoneAbsorption[3] = { 0.650f, 1.881f, 0.085f };
+	// Common.hlsli's ozone density is a tent: 1 at ozoneAltitude, 0 at +-ozoneThickness/2. Earth: 10-40 km.
+	constexpr float kEarthOzoneAltitude = 25.f;
+	constexpr float kEarthOzoneThickness = 30.f;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -129,6 +166,24 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.moonCloudStrength = o_json.value("moonCloudStrength", defaults.moonCloudStrength);
 		settings.moonCloudHalo = o_json.value("moonCloudHalo", defaults.moonCloudHalo);
 	}
+	{
+		// (46z) Physical Sky fixes.
+		const Settings defaults{};
+		settings.sunHalo = ReadSetting(o_json, "sunHalo", defaults.sunHalo);
+		settings.skyDither = ReadSetting(o_json, "skyDither", defaults.skyDither);
+		settings.accurateLutIntegration = ReadSetting(o_json, "accurateLutIntegration", defaults.accurateLutIntegration);
+		settings.vanillaMixFollowsSun = ReadSetting(o_json, "vanillaMixFollowsSun", defaults.vanillaMixFollowsSun);
+		settings.aerosolPreset = ReadSetting(o_json, "aerosolPreset", defaults.aerosolPreset);
+		settings.ozonePreset = ReadSetting(o_json, "ozonePreset", defaults.ozonePreset);
+		settings.starsFadeWithSky = ReadSetting(o_json, "starsFadeWithSky", defaults.starsFadeWithSky);
+		settings.starsFadeStrength = ReadSetting(o_json, "starsFadeStrength", defaults.starsFadeStrength);
+		settings.highResAerialPerspective = ReadSetting(o_json, "highResAerialPerspective", defaults.highResAerialPerspective);
+	}
+	settings.sunHalo = std::clamp(settings.sunHalo, 0, kSunHaloCount - 1);
+	settings.skyDither = std::clamp(settings.skyDither, 0, kSkyDitherCount - 1);
+	settings.aerosolPreset = std::clamp(settings.aerosolPreset, 0, kAtmospherePresetCount - 1);
+	settings.ozonePreset = std::clamp(settings.ozonePreset, 0, kAtmospherePresetCount - 1);
+	settings.starsFadeStrength = std::clamp(settings.starsFadeStrength, 10.f, 10000.f);
 	settings.skyModel = std::clamp(settings.skyModel, 0, kSkyModelCount - 1);
 	settings.nightBaseLight = std::clamp(settings.nightBaseLight, 0.f, 1.f);
 	settings.twilightLength = std::clamp(settings.twilightLength, 1.f, 3.f);
@@ -281,6 +336,16 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["moonCloudLight"] = settings.moonCloudLight;
 	o_json["moonCloudStrength"] = settings.moonCloudStrength;
 	o_json["moonCloudHalo"] = settings.moonCloudHalo;
+	// (46z) See LoadSettings.
+	o_json["sunHalo"] = settings.sunHalo;
+	o_json["skyDither"] = settings.skyDither;
+	o_json["accurateLutIntegration"] = settings.accurateLutIntegration;
+	o_json["vanillaMixFollowsSun"] = settings.vanillaMixFollowsSun;
+	o_json["aerosolPreset"] = settings.aerosolPreset;
+	o_json["ozonePreset"] = settings.ozonePreset;
+	o_json["starsFadeWithSky"] = settings.starsFadeWithSky;
+	o_json["starsFadeStrength"] = settings.starsFadeStrength;
+	o_json["highResAerialPerspective"] = settings.highResAerialPerspective;
 }
 
 void PhysicalSky::DrawSettings()
@@ -403,6 +468,29 @@ void PhysicalSky::SettingsGeneral()
 		ImGui::SliderFloat("Vanilla Mix", &settings.vanillaMix, 0.f, 1.f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Blend in vanilla sky color.");
+		// (46z, C1)
+		ImGui::Checkbox("Vanilla Mix Follows Sun Height", &settings.vanillaMixFollowsSun);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Vanilla Mix only at night: in full while the sun is more than 6 degrees below the horizon,\n"
+				"fading out until sunrise, none by day (and back in after sunset).\n"
+				"By day the physical sky is far darker than the vanilla sky colours, so even a small Vanilla Mix\n"
+				"decides the colour of the zenith (grey with many weathers) and tints the dawn horizon purple.\n"
+				"Off = Vanilla Mix at all times (as before).");
+		if (settings.vanillaMixFollowsSun)
+			ImGui::TextDisabled("Vanilla Mix now: %.2f", cbData.vanillaMix);
+
+		// (46z, A2)
+		static constexpr const char* skyDitherNames[kSkyDitherCount] = { "Off", "Fine (R11G11B10)", "Vanilla strength" };
+		ImGui::Combo("Sky Dither", &settings.skyDither, skyDitherNames, kSkyDitherCount);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"A little noise on the physical sky so smooth colour gradients do not show steps (bands).\n"
+				"The game's main picture keeps only about 2 significant digits per colour (R11G11B10), and the vanilla\n"
+				"sky's own noise is mostly gone under the physical sky.\n"
+				"Fine (default): changes every pixel and frame by less than half a step; DLSS smooths it away.\n"
+				"Vanilla strength: the vanilla sky's noise pattern in full (coarser, visible grain).\n"
+				"Off: as before.");
 	}
 }
 
@@ -546,6 +634,20 @@ void PhysicalSky::SettingsCelestials()
 		ImGui::SameLine();
 		ImGui::TextDisabled("(%.2f deg across)", settings.sunDiskRadiusDeg * 2.f);
 
+		// (46z, A1)
+		static constexpr const char* sunHaloNames[kSunHaloCount] = { "Off (disc only)", "Smooth", "Keep (as before)" };
+		ImGui::Combo("Vanilla Sun Halo (with Physical Sky)", &settings.sunHalo, sunHaloNames, kSunHaloCount);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"The big halo painted into the game's sun picture (and its sun glare picture). Its see-through\n"
+				"edge is stored in coarse steps; over the dark physical sky at dawn they show as rings and a\n"
+				"hard-edged red disc, even while the sun is still below the horizon.\n"
+				"Smooth (default): the steps are blurred out, and the halo fades in only as the physical sun rises\n"
+				"(from 1 degree below the horizon to 2 above) and by how much light gets through the air.\n"
+				"Off: only the solid sun disc, no halo, no glare.\n"
+				"Keep: as before.\n"
+				"Applies to the game's sun picture (Sun Look \"Vanilla sun\"; with the procedural sun, to the glare).");
+
 		// (44h) The procedural-sun options are hidden (not just disabled) while Procedural Sun is
 		// off; their values are still saved and loaded.
 		if (settings.proceduralSun) {
@@ -613,6 +715,20 @@ void PhysicalSky::SettingsCelestials()
 			"Stretches dawn and dusk in the sky only: with 2, a sun 12 degrees below the horizon lights the sky\n"
 			"like one 6 degrees below, so the sky starts to brighten earlier and stays lit longer after sunset.\n"
 			"Does not change the sun or moon light on the ground. 1 = real twilight (default).");
+	// (46z, D1)
+	ImGui::Checkbox("Stars Fade With Sky Brightness", &settings.starsFadeWithSky);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Stars (and the Milky Way painted with them) disappear as the physical sky behind them brightens,\n"
+			"first near the bright horizon, as real stars are lost against the dawn sky. Nothing changes in full\n"
+			"night (sun more than 18 degrees below the horizon).\n"
+			"Off = the weather alone decides the stars' brightness (as before), which keeps them bright while the\n"
+			"physical sky already shows dawn.");
+	if (settings.starsFadeWithSky) {
+		ImGui::SliderFloat("Stars Fade Strength", &settings.starsFadeStrength, 10.f, 10000.f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text("Higher = stars vanish earlier in the dawn (and later at dusk). Default 1000.");
+	}
 
 	ImGui::SeparatorText("Masser");
 	{
@@ -672,6 +788,22 @@ void PhysicalSky::SettingsAtmosphere()
 
 	ImGui::SliderFloat2("Cloud Shadow Remap", &settings.cloudShadowRemapRange.x, 0.f, 1.f, "%.2f");
 
+	// (46z, E1)
+	ImGui::Checkbox("High-Resolution Aerial Perspective", &settings.highResAerialPerspective);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"The haze laid over distant land is looked up in a table of directions. On: 64 x 64 directions\n"
+			"instead of 32 x 32 (about 6 degrees apart instead of 11), so the bright haze towards the sun stays a\n"
+			"narrow glow instead of being smeared over a wide part of the view. About +0.02 ms. Off = as before.");
+	// (46z, C4 + C5)
+	ImGui::Checkbox("Accurate LUT Integration", &settings.accurateLutIntegration);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"How the sky tables are summed up along each line of sight. On: each step is sampled in its middle\n"
+			"instead of at its far end (twilight horizons were up to 2.5x too bright and purple, the sky near a low\n"
+			"sun too dark), and the light bounced off the ground is no longer about 3x too strong (it greyed the\n"
+			"whole sky a little). Off = as before.");
+
 	ImGui::SeparatorText("Air Molecules (Rayleigh)");
 	{
 		ImGui::PushID("Rayleigh");
@@ -692,10 +824,24 @@ void PhysicalSky::SettingsAtmosphere()
 			"They contributes to the aureole around bright celestial bodies.");
 
 		ImGui::SliderFloat("Anisotropy", &settings.aerosolPhaseG, -1, 1);
+		// (46z, C2)
+		static constexpr const char* aerosolPresetNames[kAtmospherePresetCount] = { "Current (values below)", "Earth Clear" };
+		ImGui::Combo("Aerosol Preset", &settings.aerosolPreset, aerosolPresetNames, kAtmospherePresetCount);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"How much dust and haze is in the air.\n"
+				"Earth Clear: a clear day on Earth (scatter 3.996, absorption 0.444), a tenth of the default values\n"
+				"below. Less white haze over distant land, a smaller bright patch around the sun, a bluer zenith and\n"
+				"less dark-red horizons at dawn. Your values below are kept and come back with Current.");
+		const bool aerosolPreset = settings.aerosolPreset != kAtmospherePresetCurrent;
+		ImGui::BeginDisabled(aerosolPreset);
 		ImGui::ColorEdit3("Scatter", &settings.aerosolScatter.x, ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 		ImGui::ColorEdit3("Absorption", &settings.aerosolAbsorption.x, ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Usually 1/9 of scatter coefficient. Dust/pollution is lower, fog is higher.");
+		ImGui::EndDisabled();
+		if (aerosolPreset)
+			ImGui::TextDisabled("In use: scatter %.3f, absorption %.3f (Earth Clear).", kEarthAerosolScatter, kEarthAerosolAbsorption);
 		ImGui::SliderFloat("Falloff", &settings.aerosolFalloff, 0.f, 2.f, "%.2f km^-1");
 		ImGui::PopID();
 	}
@@ -707,9 +853,24 @@ void PhysicalSky::SettingsAtmosphere()
 			"The ozone layer high up in the sky that mainly absorbs light of certain wavelength. "
 			"It keeps the zenith sky blue, especially at sunrise or sunset.");
 
+		// (46z, C3)
+		static constexpr const char* ozonePresetNames[kAtmospherePresetCount] = { "Current (values below)", "Earth" };
+		ImGui::Combo("Ozone Preset", &settings.ozonePreset, ozonePresetNames, kAtmospherePresetCount);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Earth: real ozone, which takes out mostly green and some red (absorption 0.650, 1.881, 0.085)\n"
+				"in a layer from 10 to 40 km up. It gives the deep blue-violet zenith of the blue hour. The default\n"
+				"values below take out mostly red, higher up (22-58 km). Your values below are kept and come back\n"
+				"with Current.");
+		const bool ozonePreset = settings.ozonePreset != kAtmospherePresetCurrent;
+		ImGui::BeginDisabled(ozonePreset);
 		ImGui::ColorEdit3("Absorption", &settings.ozoneAbsorption.x, ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 		ImGui::DragFloat("Mean Altitude", &settings.ozoneAltitude, .1f, 0.f, 100.f, "%.3f km");
 		ImGui::DragFloat("Layer Thickness", &settings.ozoneThickness, .1f, 0.f, 50.f, "%.3f km");
+		ImGui::EndDisabled();
+		if (ozonePreset)
+			ImGui::TextDisabled("In use: absorption %.3f, %.3f, %.3f, altitude %.0f km, thickness %.0f km (Earth).",
+				kEarthOzoneAbsorption[0], kEarthOzoneAbsorption[1], kEarthOzoneAbsorption[2], kEarthOzoneAltitude, kEarthOzoneThickness);
 		ImGui::PopID();
 	}
 
@@ -879,25 +1040,10 @@ void PhysicalSky::SetupResources()
 		texSvLut->CreateSRV(srvDesc);
 		texSvLut->CreateUAV(uavDesc);
 
-		D3D11_TEXTURE3D_DESC tex3dDesc{
-			.Width = kApLutW,
-			.Height = kApLutH,
-			.Depth = kApLutD,
-			.MipLevels = 1,
-			.Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
-			.Usage = D3D11_USAGE_DEFAULT,
-			.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET,
-			.CPUAccessFlags = 0,
-			.MiscFlags = 0
-		};
-		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
-		srvDesc.Texture3D = { .MostDetailedMip = 0, .MipLevels = 1 };
-		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D,
-		uavDesc.Texture3D = { .MipSlice = 0, .FirstWSlice = 0, .WSize = kApLutD };
-
-		texApLut = eastl::make_unique<Texture3D>(tex3dDesc);
-		texApLut->CreateSRV(srvDesc);
-		texApLut->CreateUAV(uavDesc);
+		// (46z, E1) Created at the size the setting asks for; UpdateApLutSize() follows later changes.
+		const bool hiRes = loaded && Effective().highResAerialPerspective;
+		if (!CreateApLut(hiRes ? kApLutHiResW : kApLutW, hiRes ? kApLutHiResH : kApLutH) && !CreateApLut(kApLutW, kApLutH))
+			DX::ThrowIfFailed(E_FAIL);  // as before: no aerial perspective LUT is a setup failure
 	}
 	{
 		D3D11_TEXTURE2D_DESC texDesc;
@@ -928,6 +1074,61 @@ void PhysicalSky::SetupResources()
 	}
 
 	CompileShaders();
+}
+
+bool PhysicalSky::CreateApLut(uint16_t a_w, uint16_t a_h)
+{
+	D3D11_TEXTURE3D_DESC tex3dDesc{
+		.Width = a_w,
+		.Height = a_h,
+		.Depth = kApLutD,
+		.MipLevels = 1,
+		.Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
+		.Usage = D3D11_USAGE_DEFAULT,
+		.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET,
+		.CPUAccessFlags = 0,
+		.MiscFlags = 0
+	};
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+		.Format = tex3dDesc.Format,
+		.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D,
+		.Texture3D = { .MostDetailedMip = 0, .MipLevels = 1 }
+	};
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+		.Format = tex3dDesc.Format,
+		.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D,
+		.Texture3D = { .MipSlice = 0, .FirstWSlice = 0, .WSize = kApLutD }
+	};
+
+	try {
+		auto texture = eastl::make_unique<Texture3D>(tex3dDesc);
+		texture->CreateSRV(srvDesc);
+		texture->CreateUAV(uavDesc);
+		// The old texture may still be bound from the last frame (t63, the deferred composite): D3D11
+		// keeps its own reference to bound views, so releasing ours here is safe. Everything binds
+		// texApLut afresh each frame after the LUTs are generated.
+		texApLut = std::move(texture);
+		apLutW = a_w;
+		apLutH = a_h;
+		return true;
+	} catch (const std::exception& e) {
+		logger::warn("[Physical Sky] Could not create the {}x{}x{} aerial perspective LUT: {}", a_w, a_h, kApLutD, e.what());
+		return false;
+	}
+}
+
+void PhysicalSky::UpdateApLutSize()
+{
+	const bool hiRes = Effective().highResAerialPerspective;
+	const uint16_t w = hiRes ? kApLutHiResW : kApLutW;
+	const uint16_t h = hiRes ? kApLutHiResH : kApLutH;
+	if (texApLut && w == apLutW && h == apLutH)
+		return;
+	static bool failedOnce = false;  // do not retry a failing size every frame
+	if (failedOnce && texApLut)
+		return;
+	if (!CreateApLut(w, h))
+		failedOnce = true;
 }
 
 void PhysicalSky::ClearShaderCache()
@@ -993,6 +1194,19 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtMultiScatterFix;
 	if (s.moonPhysicalRadiance)
 		flags |= kExtMoonPhysicalRadiance;
+	// (46z)
+	if (s.sunHalo == kSunHaloSmooth)
+		flags |= kExtSunHaloSmooth;
+	else if (s.sunHalo == kSunHaloOff)
+		flags |= kExtSunHaloOff;
+	if (s.skyDither == kSkyDitherFine)
+		flags |= kExtSkyDitherFine;
+	else if (s.skyDither == kSkyDitherVanilla)
+		flags |= kExtSkyDitherVanilla;
+	if (s.accurateLutIntegration)
+		flags |= kExtAccurateLut;
+	if (s.starsFadeWithSky)
+		flags |= kExtStarsFade;
 	extCbData.flags = flags;
 	extCbData.sunRadianceCap = std::clamp(s.sunRadianceCap, 1.f, 62250.f);
 	extCbData.sunGlowIntensity = s.proceduralSun ? std::clamp(s.sunGlowIntensity, 0.f, 30.f) : 0.f;
@@ -1252,6 +1466,15 @@ void PhysicalSky::UpdateEffective()
 	e.moonsFadeInDaylight = false;
 	// 44h
 	e.moonCloudLight = false;
+	// 46z
+	e.sunHalo = kSunHaloKeep;
+	e.skyDither = kSkyDitherOff;
+	e.accurateLutIntegration = false;
+	e.vanillaMixFollowsSun = false;
+	e.aerosolPreset = kAtmospherePresetCurrent;
+	e.ozonePreset = kAtmospherePresetCurrent;
+	e.starsFadeWithSky = false;
+	e.highResAerialPerspective = false;
 }
 
 void PhysicalSky::ApplySunLook(int a_look)
@@ -1384,6 +1607,32 @@ void PhysicalSky::Reset()
 	UpdateMoonData(exposure, masserGlow, secundaGlow);
 	UpdateCloudData(exposure, std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f)));
 
+	// (46z, D1) Stars Fade With Sky Brightness (Sky.hlsl reads it with the ExtFlags bit).
+	nightCbData.starsFadeStrength = s.starsFadeWithSky ? std::clamp(s.starsFadeStrength, 10.f, 10000.f) : 0.f;
+
+	// (46z, C1) Vanilla Mix by the sun height the sky itself uses: full below -6 degrees, 0 from 0 up.
+	float vanillaMix = std::clamp(settings.vanillaMix, 0.f, 1.f);
+	if (s.vanillaMixFollowsSun) {
+		const float lutSunElevationDeg = DirectX::XMConvertToDegrees(std::asin(std::clamp(lutSunDir.z, -1.f, 1.f)));
+		vanillaMix *= 1.f - SkySync::SmoothStep(-6.f, 0.f, lutSunElevationDeg);
+	}
+
+	// (46z, C2/C3) Presets replace the user's values only here, at upload; the settings keep theirs.
+	float3 aerosolScatter = settings.aerosolScatter;
+	float3 aerosolAbsorption = settings.aerosolAbsorption;
+	if (s.aerosolPreset == kAtmospherePresetEarth) {
+		aerosolScatter = float3(kEarthAerosolScatter, kEarthAerosolScatter, kEarthAerosolScatter);
+		aerosolAbsorption = float3(kEarthAerosolAbsorption, kEarthAerosolAbsorption, kEarthAerosolAbsorption);
+	}
+	float3 ozoneAbsorption = settings.ozoneAbsorption;
+	float ozoneAltitude = settings.ozoneAltitude;
+	float ozoneThickness = settings.ozoneThickness;
+	if (s.ozonePreset == kAtmospherePresetEarth) {
+		ozoneAbsorption = float3(kEarthOzoneAbsorption[0], kEarthOzoneAbsorption[1], kEarthOzoneAbsorption[2]);
+		ozoneAltitude = kEarthOzoneAltitude;
+		ozoneThickness = kEarthOzoneThickness;
+	}
+
 	cbData = {
 		.texDim = res,
 		.rcpTexDim = float2(1.0f) / res,
@@ -1401,7 +1650,7 @@ void PhysicalSky::Reset()
 		.secundaColor = secundaGlow,
 		.enabled = allGood,
 		.tonemapper = linearLighting.settings.enableLinearLighting ? 0 : settings.tonemapper,
-		.vanillaMix = settings.vanillaMix,
+		.vanillaMix = vanillaMix,
 		.zBottom = worldspaceInfo.zBottom,
 		.rPlanet = settings.planetRadius / Util::Units::GAME_UNIT_TO_KM,
 		.rAtmosphere = settings.atmosphereRadius / Util::Units::GAME_UNIT_TO_KM,
@@ -1409,13 +1658,13 @@ void PhysicalSky::Reset()
 		.cloudShadowRemapRange = settings.cloudShadowRemapRange,
 		.aerosolFalloff = settings.aerosolFalloff * Util::Units::GAME_UNIT_TO_KM,
 		.aerosolPhaseG = settings.aerosolPhaseG,
-		.aerosolScatter = settings.aerosolScatter * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
-		.aerosolAbsorption = settings.aerosolAbsorption * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
+		.aerosolScatter = aerosolScatter * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
+		.aerosolAbsorption = aerosolAbsorption * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
 		.rayleighFalloff = settings.rayleighFalloff * Util::Units::GAME_UNIT_TO_KM,
 		.rayleighScatter = settings.rayleighScatter * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
-		.ozoneAltitude = settings.ozoneAltitude / Util::Units::GAME_UNIT_TO_KM,
-		.ozoneThickness = settings.ozoneThickness / Util::Units::GAME_UNIT_TO_KM,
-		.ozoneAbsorption = settings.ozoneAbsorption * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
+		.ozoneAltitude = ozoneAltitude / Util::Units::GAME_UNIT_TO_KM,
+		.ozoneThickness = ozoneThickness / Util::Units::GAME_UNIT_TO_KM,
+		.ozoneAbsorption = ozoneAbsorption * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
 		.cloudRelightMix = settings.cloudRelightMix,
 		.cloudOriginalMix = settings.cloudOriginalMix,
 		.silverLiningMix = settings.silverLiningMix,
@@ -1445,6 +1694,7 @@ void PhysicalSky::Reset()
 void PhysicalSky::EarlyPrepass()
 {
 	if (cbData.enabled) {
+		UpdateApLutSize();  // (46z, E1)
 		GenerateLuts();
 	}
 }
@@ -1512,7 +1762,7 @@ void PhysicalSky::GenerateLuts()
 		uav = texApLut->uav.get();
 		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 		context->CSSetShader(csApLutGen.get(), nullptr, 0);
-		context->Dispatch((kApLutW + 7) >> 3, (kApLutH + 7) >> 3, 1);
+		context->Dispatch((apLutW + 7) >> 3, (apLutH + 7) >> 3, 1);
 
 		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::PhysicalSkyLuts);
 
