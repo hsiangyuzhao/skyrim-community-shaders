@@ -235,6 +235,21 @@ namespace RayTracingScene
 		std::uint32_t windowMasks = 0;             // Window Shadows Ultimate mask shapes traced with their cut-out (total)
 		float interiorGatherMs = 0.0f;             // CPU of its capture in total
 		float interiorBounds[6]{};                 // world min xyz, max xyz of what was captured
+		// (46k) Cells of the grid (or the interior) not in the scene yet (held back by the loading-screen gate, the place being
+		// left, or just appeared), and grid cells that exist but are not attached yet. The hand-off waits for both to be 0.
+		std::uint32_t cellsUntracked = 0;
+		std::uint32_t cellsNotAttached = 0;
+	};
+
+	/// (46k) The loading-screen gate (cells captured behind the loading screen): counters since the loading screen opened.
+	struct LoadGateStats
+	{
+		std::uint32_t noted = 0;          // TESCellFullyLoadedEvent cells handed to the scene
+		std::uint32_t captured = 0;       // cells whose capture started behind the loading screen
+		std::uint32_t byEvent = 0;        // ... of which because their fully-loaded event came
+		std::uint32_t waiting = 0;        // this frame: cells held back (no event yet, the player not moved yet)
+		std::uint32_t unsettled = 0;      // this frame: cells held back because their references' 3D was not in place yet
+		std::uint32_t unsettledTotal = 0; // checks that found a cell's 3D not in place (since the loading screen opened)
 	};
 
 	class Scene
@@ -312,6 +327,35 @@ namespace RayTracingScene
 			}
 		}
 		[[nodiscard]] std::uint32_t DepartingSkipped() const { return departingSkipped_; }
+		/// (46k) A flush was asked for and the next Update has not done it yet (the stats are still the old place's).
+		[[nodiscard]] bool FlushPending() const { return flushRequested_.load(); }
+
+		/// (46k) Loading-screen gate. While a transition is on (SetTransition) and a_gate: a new cell is captured only once its
+		/// TESCellFullyLoadedEvent came (NoteFullyLoaded), or once the player has arrived (a_arrived: the teleport finished /
+		/// the game loaded) and the cell has been attached for a moment -- and in both cases only when its references' 3D sits
+		/// where the references stand (sampled). Everything else waits for the loading screen to close (as before 46k).
+		void SetLoadGate(bool a_gate, bool a_arrived)
+		{
+			loadGate_ = a_gate;
+			arrived_ = a_arrived;
+		}
+		void NoteFullyLoaded(const RE::TESObjectCELL* a_cell)
+		{
+			if (a_cell && std::find(fullyLoaded_.begin(), fullyLoaded_.end(), a_cell) == fullyLoaded_.end()) {
+				fullyLoaded_.push_back(a_cell);
+				++gateStats_.noted;
+			}
+		}
+		/// A new transition: no cell is known as fully loaded, the counters start from zero.
+		void ClearLoadGate()
+		{
+			fullyLoaded_.clear();
+			gateSeen_.clear();
+			gateStats_ = {};
+		}
+		[[nodiscard]] const LoadGateStats& GetLoadGateStats() const { return gateStats_; }
+		/// (46k) The point (world xy) lies inside a captured cell's square (exteriors) / the captured interior's box.
+		[[nodiscard]] bool Covers(float a_x, float a_y) const;
 
 		/// (46c) Interiors: whether the player's interior cell may be captured (Ray Tracing's point lights indoors).
 		/// Off: Update drops an interior capture (and never starts one), as before 46c.
@@ -594,6 +638,14 @@ namespace RayTracingScene
 		bool departingPending_ = false;  // the next Update takes the attached cells as departing (after a flush)
 		std::vector<const RE::TESObjectCELL*> departing_;
 		std::uint32_t departingSkipped_ = 0;
+		// (46k) Loading-screen gate.
+		bool loadGate_ = false;
+		bool arrived_ = false;
+		std::vector<const RE::TESObjectCELL*> fullyLoaded_;
+		std::vector<std::pair<const RE::TESObjectCELL*, std::uint32_t>> gateSeen_;  // cell, frame it was first seen attached
+		LoadGateStats gateStats_{};
+		/// (46k) Sampled static references of the cell: is their 3D where they stand (world translate = position)?
+		static bool TransformsSettled(RE::TESObjectCELL* a_cell);
 		std::size_t validationCursor_ = 0;
 		std::uint32_t cellsReady_ = 0;
 		Stats stats_{};

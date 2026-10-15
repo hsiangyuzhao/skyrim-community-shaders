@@ -362,6 +362,8 @@ namespace Util::FrameTrace
 				out << "# (46h) RTAO indoors too: the rtao_* columns are filled indoors as outdoors; rt_interior 2 = indoors traced (point lights and / or RTAO).\n";
 				out << "#   rtao_indoors = this frame's RTAO traced indoors (1) / outdoors (0), -1 = not traced; rtao_mode = its mode (0 RTAO + SSGI contact AO,\n";
 				out << "#   1 darker of both), -1 = not traced. Indoors with RTAO only (no light traced) rt_sync_gpu_ms is 0: the AO wait covers the trace.\n";
+				out << "# (46k) rt_pump = 1 on a loading-screen frame (no world render) whose RT work came from the loading pump (rt_phase 1); rt_pump_ms = its CPU\n";
+				out << "#   (-1 = not run). rt_black is now only the first frames after the loading screen (Black Screen Window), not the whole fade-in.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -388,7 +390,7 @@ namespace Util::FrameTrace
 				       "rt_black,rt_since_close_ms,rt_handoff,rt_held_ready,rt_held_pending,rt_e_collect_ms,rt_e_timestamps_ms,rt_e_reset_ms,rt_e_build_ms,rt_e_skin_ms,"
 				       "rt_e_close_ms,rt_e_execute_ms,rt_x_timestamps_ms,rt_x_ensure_ms,rt_x_publish_ms,rt_x_ao_ms,rt_pool_ms,rt_pool_sync_blocks,rt_pool_mb,rt_pool_waits,"
 				       "rt_pool_worker_ms,rt_pl_slot_changes,rt_pl_merged,rt_pl_rej_radius,rt_pl_rej_intensity,rt_pl_kept,rt_pl_churn,rt_pl_beams_excluded,"
-				       "rtao_indoors,rtao_mode,"
+				       "rtao_indoors,rtao_mode,rt_pump,rt_pump_ms,"
 				       "cpu_top_features\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
@@ -428,6 +430,7 @@ namespace Util::FrameTrace
 						t.poolMb, t.poolAllocFails, t.poolWorkerMs);
 					s += std::format(",{},{},{},{},{},{},{}", t.plSlotChanges, t.plMerged, t.plRejRadius, t.plRejIntensity, t.plKept, t.plChurn, t.plBeamsExcluded);
 					s += std::format(",{},{}", t.rtaoIndoors, t.rtaoMode);  // (46h)
+					s += std::format(",{},{:.3f}", t.pump, t.pumpMs);         // (46k)
 					s += "," + a_row.cpuTop + "\n";
 					return s;
 				};

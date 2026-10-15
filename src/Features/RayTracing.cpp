@@ -66,7 +66,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	AOTemporal,
 	AODistance,
 	AOInteriors,
-	AOModeInterior)
+	AOModeInterior,
+	LoadingPump,
+	LoadingPumpMs,
+	BlackWindowMs)
 
 namespace
 {
@@ -152,6 +155,41 @@ namespace
 		}
 	};
 	LoadingMenuSink g_loadingSink;
+
+	// (46k) The engine's own transition events: cells fully loaded (behind the loading screen), the teleport's stages, the end
+	// of a fast travel, a loaded game. The handlers only record (Ray Tracing acts on them on the render thread).
+	struct TransitionEventSink :
+		RE::BSTEventSink<RE::TESCellFullyLoadedEvent>,
+		RE::BSTEventSink<RE::TESFastTravelEndEvent>,
+		RE::BSTEventSink<RE::TESLoadGameEvent>,
+		RE::BSTEventSink<RE::PositionPlayerEvent>
+	{
+		RE::BSEventNotifyControl ProcessEvent(const RE::TESCellFullyLoadedEvent* a_event, RE::BSTEventSource<RE::TESCellFullyLoadedEvent>*) override
+		{
+			if (a_event && a_event->cell)
+				globals::features::rayTracing.OnCellFullyLoaded(a_event->cell);
+			return RE::BSEventNotifyControl::kContinue;
+		}
+		RE::BSEventNotifyControl ProcessEvent(const RE::TESFastTravelEndEvent*, RE::BSTEventSource<RE::TESFastTravelEndEvent>*) override
+		{
+			globals::features::rayTracing.OnFastTravelEnd();
+			return RE::BSEventNotifyControl::kContinue;
+		}
+		RE::BSEventNotifyControl ProcessEvent(const RE::TESLoadGameEvent*, RE::BSTEventSource<RE::TESLoadGameEvent>*) override
+		{
+			globals::features::rayTracing.OnLoadGame();
+			return RE::BSEventNotifyControl::kContinue;
+		}
+		RE::BSEventNotifyControl ProcessEvent(const RE::PositionPlayerEvent* a_event, RE::BSTEventSource<RE::PositionPlayerEvent>*) override
+		{
+			if (a_event)
+				globals::features::rayTracing.OnPositionPlayer(static_cast<int>(a_event->type.get()));
+			return RE::BSEventNotifyControl::kContinue;
+		}
+	};
+	TransitionEventSink g_transitionSink;
+	constexpr double kEventsLogAfterCloseMs = 6000.0;  // (46k) the events line at the latest this long after the loading screen closed
+	constexpr std::size_t kMaxQueuedCellEvents = 4096;
 
 	std::string Megabytes(std::uint64_t a_bytes) { return std::format("{:.1f} MB", static_cast<double>(a_bytes) / (1024.0 * 1024.0)); }
 
@@ -255,6 +293,20 @@ namespace
 
 void RayTracing::OnLoadingScreen(bool a_open)
 {
+	{
+		// (46k) The transition's event record (a previous one not logged yet is logged now, marked as cut short).
+		std::scoped_lock lock(eventsMutex);
+		const std::int64_t now = Qpc();
+		if (a_open) {
+			if (events.pending)
+				logger::info("[RayTracing] Transition events (cut short by the next loading screen): {}", DescribeTransitionEvents(events));
+			events = {};
+			events.loadingOpen = now;
+			events.pending = true;
+		} else if (events.pending) {
+			events.loadingClose = now;
+		}
+	}
 	if (a_open) {
 		scene.RequestFlush();
 		characters.RequestFlush();  // (45i)
@@ -263,6 +315,134 @@ void RayTracing::OnLoadingScreen(bool a_open)
 		loadingOpen.store(false);
 		loadingClosed.store(true);
 	}
+}
+
+void RayTracing::OnFader(bool a_open)
+{
+	(a_open ? faderOpenQpc : faderCloseQpc).store(Qpc());
+	faderOpen.store(a_open);
+}
+
+void RayTracing::OnCellFullyLoaded(const RE::TESObjectCELL* a_cell)
+{
+	std::scoped_lock lock(eventsMutex);
+	const std::int64_t now = Qpc();
+	if (events.pending && events.loadingOpen != 0) {
+		++events.cells;
+		if (events.firstCell == 0)
+			events.firstCell = now;
+		events.lastCell = now;
+	}
+	if (cellEvents.size() < kMaxQueuedCellEvents)
+		cellEvents.emplace_back(a_cell, now);
+}
+
+void RayTracing::OnPositionPlayer(int a_stage)
+{
+	std::scoped_lock lock(eventsMutex);
+	const std::int64_t now = Qpc();
+	if (a_stage == static_cast<int>(RE::PositionPlayerEvent::EVENT_TYPE::kPre))
+		events.teleportPre = now;
+	else if (a_stage == static_cast<int>(RE::PositionPlayerEvent::EVENT_TYPE::kFinish))
+		events.teleportFinish = now;
+}
+
+void RayTracing::OnFastTravelEnd()
+{
+	std::scoped_lock lock(eventsMutex);
+	events.fastTravelEnd = Qpc();
+}
+
+void RayTracing::OnLoadGame()
+{
+	std::scoped_lock lock(eventsMutex);
+	events.loadGame = Qpc();
+}
+
+bool RayTracing::Arrived() const
+{
+	std::scoped_lock lock(eventsMutex);
+	if (events.loadingOpen == 0)
+		return false;
+	return (events.teleportFinish >= events.loadingOpen && events.teleportFinish >= events.teleportPre) || events.loadGame >= events.loadingOpen;
+}
+
+void RayTracing::RegisterEventSinks()
+{
+	if (!eventSinksRegistered) {
+		if (auto* holder = RE::ScriptEventSourceHolder::GetSingleton()) {
+			holder->AddEventSink<RE::TESCellFullyLoadedEvent>(&g_transitionSink);
+			holder->AddEventSink<RE::TESFastTravelEndEvent>(&g_transitionSink);
+			holder->AddEventSink<RE::TESLoadGameEvent>(&g_transitionSink);
+			eventSinksRegistered = true;
+		}
+	}
+	if (!playerSinkRegistered) {
+		if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+			player->AsPositionPlayerEventSource()->AddEventSink(&g_transitionSink);
+			playerSinkRegistered = true;
+		}
+	}
+}
+
+void RayTracing::DrainTransitionEvents()
+{
+	// (46k) Render thread. Only cells that finished loading after this transition's loading screen opened count.
+	std::vector<std::pair<const RE::TESObjectCELL*, std::int64_t>> queued;
+	std::int64_t openQpc = 0;
+	{
+		std::scoped_lock lock(eventsMutex);
+		queued.swap(cellEvents);
+		openQpc = events.loadingOpen;
+	}
+	if (!inTransition || openQpc == 0)
+		return;
+	for (const auto& [cell, qpc] : queued)
+		if (qpc >= openQpc)
+			scene.NoteFullyLoaded(cell);
+}
+
+std::string RayTracing::DescribeTransitionEvents(const TransitionEvents& a_events) const
+{
+	// Ms after the loading screen opened ("-" = not seen).
+	const std::int64_t base = a_events.loadingOpen;
+	auto at = [&](std::int64_t a_qpc) -> std::string {
+		if (a_qpc == 0 || base == 0)
+			return "-";
+		return std::format("{:+.0f}", static_cast<double>(a_qpc - base) * QpcMs());
+	};
+	const std::int64_t faderOpened = faderOpenQpc.load(), faderClosed = faderCloseQpc.load();
+	std::string line = std::format("ms after the loading screen opened: teleport start {} / finish {}; fast travel end {}; game loaded {}; "
+								   "cells fully loaded {} (first {}, last {}); loading screen closed {}",
+		at(a_events.teleportPre), at(a_events.teleportFinish), at(a_events.fastTravelEnd), at(a_events.loadGame), a_events.cells, at(a_events.firstCell),
+		at(a_events.lastCell), at(a_events.loadingClose));
+	// The Fader Menu's last open / close around this loading screen (it may open before the loading screen, for a door).
+	const bool faderRecent = faderOpened != 0 && base != 0 && static_cast<double>(base - faderOpened) * QpcMs() < 10000.0;
+	line += std::format("; fader opened {}, closed {}", faderRecent ? at(faderOpened) : std::string("-"),
+		faderClosed > faderOpened && faderRecent ? at(faderClosed) : std::string("-"));
+	if (a_events.loadingClose != 0 && faderRecent && faderClosed > a_events.loadingClose)
+		line += std::format(" (the fade-in ended {:.0f} ms after the loading screen closed)", static_cast<double>(faderClosed - a_events.loadingClose) * QpcMs());
+	return line;
+}
+
+void RayTracing::MaybeLogTransitionEvents()
+{
+	// (46k) Once the transition is over (the Fader Menu closed after the loading screen, or 6 s after it closed): one line,
+	// also with Ray Tracing off (the control run for the loading screen's length).
+	std::string line;
+	{
+		std::scoped_lock lock(eventsMutex);
+		if (!events.pending || events.loadingClose == 0)
+			return;
+		const std::int64_t now = Qpc();
+		const bool faded = faderCloseQpc.load() > events.loadingClose && !faderOpen.load();
+		if (!faded && static_cast<double>(now - events.loadingClose) * QpcMs() < kEventsLogAfterCloseMs)
+			return;
+		events.pending = false;
+		line = DescribeTransitionEvents(events);
+	}
+	lastEventsSummary = line;
+	logger::info("[RayTracing] Transition events (Ray Tracing {}): {}", settings.Enabled ? "on" : "off", line);
 }
 
 void RayTracing::UpdatePhase()
@@ -288,6 +468,8 @@ void RayTracing::UpdatePhase()
 			entry = {};
 		transitionLogSlot = -1;
 		handOffSummary.clear();
+		// (46k)
+		scene.ClearLoadGate();
 	};
 	if (open && phase != Phase::Loading) {
 		if (transitionLogSlot >= 0)
@@ -309,16 +491,18 @@ void RayTracing::UpdatePhase()
 		fade = 0.0f;
 	}
 	const double sinceClose = static_cast<double>(now - warmUpStart) * QpcMs();
-	if (phase == Phase::Black && (!faderOpen.load() || sinceClose > kBlackMaxMs))
+	// (46k) The Fader Menu stays open through the whole fade-in and cannot tell when the fade starts: only the first
+	// BlackWindowMs after the loading screen closed count as black (large budgets); 46i counted up to 4 s (pump off).
+	const double blackLimit = settings.LoadingPump ? std::clamp(static_cast<double>(settings.BlackWindowMs), 0.0, kBlackMaxMs) : kBlackMaxMs;
+	if (phase == Phase::Black && (!faderOpen.load() || sinceClose > blackLimit))
 		phase = Phase::WarmUp;
-	blackScreen = inTransition && !open && phase != Phase::Loading && faderOpen.load() && sinceClose <= kBlackMaxMs;
+	blackScreen = inTransition && !open && phase != Phase::Loading && faderOpen.load() && sinceClose <= blackLimit;
+	scene.SetLoadGate(settings.LoadingPump, Arrived());  // (46k)
 
 	if ((phase == Phase::Black || phase == Phase::WarmUp) && !handedOff) {
-		// (46d) Indoors the scene must be the interior's: behind a door's loading screen the old exterior is still
-		// captured (the interior cell is only known once it closes).
-		const bool sceneMatches = !(Util::IsInterior() && InteriorWanted() && RE::TES::GetSingleton() && RE::TES::GetSingleton()->interiorCell) || sc.interior;
-		const bool ready = sceneMatches && sc.cellsTracked > 0 && sc.cellsGathering == 0 && backend.QueuedBuilds() == 0 &&
-		                   backend.PendingSkinUploads() == 0 && backend.IsReady();
+		// (46k) Only once the destination itself is captured and built (46h handed off the place left: its stats were
+		// still the old ones on the first frame after the loading screen), or at the time-out.
+		const bool ready = DestinationReady(sinceClose);
 		if (ready || sinceClose > kWarmUpTimeoutMs) {
 			const bool inBlack = phase == Phase::Black;
 			HandOffNow(ready ? (inBlack ? "in the black screen" : "visible") : (inBlack ? "in the black screen, timed out" : "visible, timed out"));
@@ -350,6 +534,32 @@ void RayTracing::UpdatePhase()
 	fade = handedOff ? static_cast<float>(std::clamp(static_cast<double>(now - handOffQpc) * QpcMs() / kFadeInMs, 0.0, 1.0)) : 0.0f;
 }
 
+bool RayTracing::DestinationReady(double a_sinceCloseMs) const
+{
+	if (!backend.IsReady() || scene.FlushPending())
+		return false;  // the scene's numbers are still the place left
+	if (Util::IsInterior() && !InteriorWanted())
+		return true;  // indoors with nothing of Ray Tracing wanted there: nothing to prepare
+	const auto& sc = scene.GetStats();
+	// (46d) Indoors the scene must be the interior's: behind a door's loading screen the old exterior is still
+	// captured (the interior cell is only known once it closes).
+	const bool sceneMatches = !(Util::IsInterior() && InteriorWanted() && RE::TES::GetSingleton() && RE::TES::GetSingleton()->interiorCell) || sc.interior;
+	if (!sceneMatches || sc.cellsTracked == 0 || sc.cellsGathering > 0 || sc.cellsUntracked > 0)
+		return false;
+	// Grid cells still attaching (the engine names no state for that: a grid cell that never attaches -- the edge of a
+	// small worldspace -- would hold the hand-off for ever, so they count only for the first 1.5 s after the loading screen).
+	if (sc.cellsNotAttached > 0 && a_sinceCloseMs < 1500.0)
+		return false;
+	if (backend.QueuedBuilds() > 0 || backend.PendingSkinUploads() > 0)
+		return false;
+	// (46k) The player stands in what was captured (not in the place left, nor beside it).
+	auto* player = RE::PlayerCharacter::GetSingleton();
+	if (!player)
+		return false;
+	const auto position = player->GetPosition();
+	return std::isfinite(position.x) && std::isfinite(position.y) && scene.Covers(position.x, position.y);
+}
+
 void RayTracing::HandOffNow(const char* a_when)
 {
 	const auto& sc = scene.GetStats();
@@ -376,8 +586,29 @@ void RayTracing::TransitionFrame()
 	const std::int64_t start = Qpc();
 	backend.WaitForTrace();
 	backend.WaitForAO();  // (46f)
-	const bool visible = phase == Phase::WarmUp;
-	const float capture = phase == Phase::Loading ? kLoadingCaptureBudgetMs : (visible ? kWarmUpCaptureBudgetMs : kBlackCaptureBudgetMs);
+	const bool loading = phase == Phase::Loading;
+	const bool visible = phase == Phase::WarmUp && !blackScreen;
+	// (46k) Budgets. The loading pump (behind the loading screen): its own CPU per frame (LoadingPumpMs), split between the
+	// capture, the characters, the pools and the builds. Visible frames: what playing uses (never bulk work on a visible
+	// frame); 46i's moderate ones with the pump off.
+	const bool pump = settings.LoadingPump;
+	const float pumpMs = std::clamp(settings.LoadingPumpMs, 2.0f, 32.0f);
+	float capture = kBlackCaptureBudgetMs, charactersMs = kBlackCaptureBudgetMs, prewarmMs = 4.0f, buildMs = kBlackBuildCpuMs;
+	std::uint32_t charactersMax = 64u, buildTriangles = kLoadingBuildTriangles, buildCount = kLoadingMaxBuilds;
+	if (loading) {
+		capture = pump ? pumpMs * 0.4f : kLoadingCaptureBudgetMs;
+		charactersMs = pump ? pumpMs * 0.15f : kLoadingCaptureBudgetMs;
+		prewarmMs = pump ? std::min(2.0f, pumpMs * 0.15f) : 4.0f;
+		buildMs = kLoadingBuildCpuMs;  // pump: what is left of its budget (below)
+	} else if (visible) {
+		capture = pump ? kCaptureBudgetMs : kWarmUpCaptureBudgetMs;
+		charactersMs = pump ? 1.0f : 2.0f;
+		charactersMax = pump ? 6u : 12u;
+		prewarmMs = 0.0f;
+		buildMs = pump ? 2.0f : kWarmUpBuildCpuMs;
+		buildTriangles = pump ? kBuildBudget : kBuildBudget * 2;
+		buildCount = 64u;
+	}
 	{
 		const auto& stats = backend.GetStats();
 		overVramBudget = stats.blasBytes + stats.scratchBytes > kAccelerationBudgetBytes;
@@ -386,14 +617,21 @@ void RayTracing::TransitionFrame()
 	const std::int64_t charactersStart = Qpc();
 	if (settings.Characters && backend.SkinAvailable()) {
 		float world[4];
-		if (scene.GetLoadedRect(world, true))
-			characters.Update(backend, world, visible ? 2.0 : static_cast<double>(capture), visible ? 12u : 64u);
+		if (scene.GetLoadedRect(world, true)) {
+			// (46k) Behind the loading screen the camera is still at the place left: actors are chosen around the player.
+			RE::NiPoint3 eye{};
+			auto* player = loading ? RE::PlayerCharacter::GetSingleton() : nullptr;
+			if (player)
+				eye = player->GetPosition();
+			characters.Update(backend, world, static_cast<double>(charactersMs), charactersMax, player ? &eye : nullptr);
+		}
 	}
 	cpuLast.characters = static_cast<float>(static_cast<double>(Qpc() - charactersStart) * QpcMs());
-	if (!visible)
-		backend.Prewarm(4.0f, settings.Characters);
-	backend.BuildOnly(visible ? kBuildBudget * 2 : kLoadingBuildTriangles, visible ? 64u : kLoadingMaxBuilds,
-		phase == Phase::Loading ? kLoadingBuildCpuMs : (visible ? kWarmUpBuildCpuMs : kBlackBuildCpuMs));
+	if (prewarmMs > 0.0f)
+		backend.Prewarm(prewarmMs, settings.Characters);
+	if (loading && pump)
+		buildMs = std::max(pumpMs - static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs()), 1.0f);
+	backend.BuildOnly(buildTriangles, buildCount, buildMs);
 	backend.Tick();
 	cpuLast.scene = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
 }
@@ -403,14 +641,16 @@ void RayTracing::TransitionLogFrame(float a_rtCpuMs)
 	// (46g) Per-phase work of a transition, logged in one line once the first 3 s after the hand-off are over.
 	const std::int64_t now = Qpc();
 	int slot = -1;
-	if (inTransition || (handedOff && static_cast<double>(now - handOffQpc) * QpcMs() < 3000.0 && transitionLogSlot >= 0)) {
+	const double sinceHandOff = handedOff ? static_cast<double>(now - handOffQpc) * QpcMs() : -1.0;
+	if (inTransition || (handedOff && sinceHandOff < 3000.0 && transitionLogSlot >= 0)) {
+		// (46k) Black = the black window only (also after a hand-off in it); everything else after the loading screen is visible.
 		if (phase == Phase::Loading)
 			slot = 0;
-		else if (phase == Phase::Black)
+		else if (phase == Phase::Black || blackScreen)
 			slot = 1;
-		else if (phase == Phase::WarmUp)
+		else if (!handedOff)
 			slot = 2;
-		else if (handedOff && static_cast<double>(now - handOffQpc) * QpcMs() < 3000.0)
+		else if (sinceHandOff < 3000.0)
 			slot = 3;
 	}
 	if (slot < 0) {
@@ -439,7 +679,7 @@ void RayTracing::TransitionLogFrame(float a_rtCpuMs)
 
 void RayTracing::TransitionLogFlush()
 {
-	static constexpr const char* kNames[4] = { "loading screen", "black screen", "visible before the hand-off", "first 3 s after the hand-off" };
+	static constexpr const char* kNames[4] = { "loading screen", "black screen", "visible before the hand-off", "visible, first 3 s after the hand-off" };
 	const auto& stats = backend.GetStats();
 	std::string line;
 	for (int i = 0; i < 4; ++i) {
@@ -455,6 +695,14 @@ void RayTracing::TransitionLogFlush()
 	logger::info("[RayTracing] Transition work: {}; pools {:.0f} MB reserved ({} blocks made behind loading / black screens, {} on the pool thread); {}",
 		line, static_cast<double>(stats.pools.reservedBytes) / (1024.0 * 1024.0), stats.pools.syncBlocksTotal, stats.pools.asyncBlocksTotal,
 		handOffSummary.empty() ? std::string("no hand-off") : handOffSummary);
+	// (46k) The loading pump and the loading-screen gate of this transition.
+	const auto& gate = scene.GetLoadGateStats();
+	logger::info("[RayTracing] Loading pump ({}, black window {:.0f} ms): {} frames, RT CPU {:.0f} ms ({} frames on another thread, {} in the middle of the teleport: "
+				 "skipped); {} fully-loaded cells reported, {} cells captured behind the loading screen ({} after their event, the rest once the player "
+				 "had arrived), {} checks found a cell's 3D not in place yet",
+		settings.LoadingPump ? std::format("on, {:.0f} ms per frame", settings.LoadingPumpMs) : std::string("off"),
+		settings.LoadingPump ? static_cast<double>(settings.BlackWindowMs) : kBlackMaxMs, pumpFrames, pumpCpuTotalMs, pumpForeignFrames, pumpMidTeleport,
+		gate.noted, gate.captured, gate.byEvent, gate.unsettledTotal);
 	for (auto& entry : transitionLog)
 		entry = {};
 	transitionLogSlot = -1;
@@ -727,6 +975,9 @@ void RayTracing::LoadSettings(json& o_json)
 	settings.AOStrength = std::isfinite(settings.AOStrength) ? std::clamp(settings.AOStrength, 0.0f, 2.0f) : 1.0f;
 	settings.AODistance = std::isfinite(settings.AODistance) ? std::clamp(settings.AODistance, 1000.0f, 8192.0f) : 4000.0f;
 	settings.AOModeInterior = std::clamp(settings.AOModeInterior, 0, static_cast<int>(AOModeKind::Count) - 1);  // (46h)
+	// (46k)
+	settings.LoadingPumpMs = std::isfinite(settings.LoadingPumpMs) ? std::clamp(settings.LoadingPumpMs, 2.0f, 32.0f) : 8.0f;
+	settings.BlackWindowMs = std::isfinite(settings.BlackWindowMs) ? std::clamp(settings.BlackWindowMs, 0.0f, 2000.0f) : 200.0f;
 }
 
 void RayTracing::SaveSettings(json& o_json)
@@ -749,6 +1000,11 @@ void RayTracing::DataLoaded()
 			loadingFlushRegistered = true;
 		}
 	}
+	// (46k) The engine's transition events; the main thread (SKSE's data-loaded message) until a Prepass names the render
+	// thread (the same one in SE).
+	RegisterEventSinks();
+	if (renderThreadId.load() == 0)
+		renderThreadId.store(static_cast<std::uint32_t>(GetCurrentThreadId()));
 }
 
 void RayTracing::PostPostLoad()
@@ -1372,10 +1628,47 @@ void RayTracing::Prepass()
 		}
 	} skippedMapsEnd{ this };
 
+	// (46k) The world is rendered this frame (the loading pump stays idle), on this thread.
+	lastPrepassFrame = globals::state->frameCount;
+	pumpThisFrame = false;
+	if (const auto thread = static_cast<std::uint32_t>(GetCurrentThreadId()); thread != renderThreadId.load()) {
+		if (renderThreadId.load() != 0)
+			logger::info("[RayTracing] The world is rendered on thread {} (was {})", thread, renderThreadId.load());
+		renderThreadId.store(thread);
+	}
+
 	if (!settings.Enabled) {
 		if (sssClaimed)
 			globals::features::screenSpaceShadows.DrawDeferred(nullptr, 0.0f, 0.0f, 0.0f);
 		sssClaimed = false;
+		SwitchedOffFrame();
+		return;
+	}
+	if (status == Status::Unavailable || status == Status::Failed) {
+		scene.Housekeeping();
+		if (sssClaimed)
+			globals::features::screenSpaceShadows.DrawDeferred(nullptr, 0.0f, 0.0f, 0.0f);
+		sssClaimed = false;
+		return;
+	}
+
+	if (backend.IsReady() && beginFrameIndex != globals::state->frameCount) {
+		beginFrameIndex = globals::state->frameCount;  // (46g) no Early Prep call this frame (loading screens)
+		backend.BeginFrame();
+	}
+	cpuLast = {};
+	UpdatePhase();
+	DrainTransitionEvents();  // (46k)
+	// (46g) Pools grow on the render thread only while nothing is visible.
+	if (backend.IsReady())
+		backend.SetTransition(phase == Phase::Loading || phase == Phase::Black || blackScreen);
+	scene.SetInteriorEnabled(InteriorWanted());  // (46c) also behind loading screens: an interior is captured there
+	PrepassFrame();
+}
+
+void RayTracing::SwitchedOffFrame()
+{
+	{
 		phase = Phase::Play;
 		fade = 1.0f;
 		// (46g) No transition hold while off (the scene is released anyway).
@@ -1430,26 +1723,16 @@ void RayTracing::Prepass()
 				backend.ReleaseSkinResources();  // (45i)
 		}
 		traceSample = {};
-		return;
+		activeNoBlasSince = 0;
+		activeNoBlasLogged = false;
+		// (46k) Queued fully-loaded cells are of no use while off.
+		std::scoped_lock lock(eventsMutex);
+		cellEvents.clear();
 	}
-	if (status == Status::Unavailable || status == Status::Failed) {
-		scene.Housekeeping();
-		if (sssClaimed)
-			globals::features::screenSpaceShadows.DrawDeferred(nullptr, 0.0f, 0.0f, 0.0f);
-		sssClaimed = false;
-		return;
-	}
+}
 
-	if (backend.IsReady() && beginFrameIndex != globals::state->frameCount) {
-		beginFrameIndex = globals::state->frameCount;  // (46g) no Early Prep call this frame (loading screens)
-		backend.BeginFrame();
-	}
-	cpuLast = {};
-	UpdatePhase();
-	// (46g) Pools grow on the render thread only while nothing is visible.
-	if (backend.IsReady())
-		backend.SetTransition(phase == Phase::Loading || phase == Phase::Black || blackScreen);
-	scene.SetInteriorEnabled(InteriorWanted());  // (46c) also behind loading screens: an interior is captured there
+void RayTracing::PrepassFrame()
+{
 	try {
 		if ((phase == Phase::Loading || phase == Phase::Black || (phase == Phase::WarmUp && !handedOff)) && backend.IsReady()) {
 			// (45k) Behind the loading screen: capture and build with a large budget, trace nothing. (46g) Also the black
@@ -1479,6 +1762,106 @@ void RayTracing::Prepass()
 		globals::features::screenSpaceShadows.DrawDeferred(nullptr, 0.0f, 0.0f, 0.0f);
 	sssClaimed = false;
 	lastCpuMs = static_cast<float>(static_cast<double>(Qpc() - frameStart) * QpcMs());
+	ReportFrame();
+}
+
+void RayTracing::Reset()
+{
+	// (46k) Present hook, once per presented frame, before the real Present (State::Reset; frameCount is still this frame's).
+	RegisterEventSinks();
+	MaybeLogTransitionEvents();
+	{
+		std::int64_t openQpc = 0;
+		{
+			std::scoped_lock lock(eventsMutex);
+			openQpc = events.loadingOpen;
+		}
+		if (openQpc != pumpOpenSeen) {
+			// A new loading screen: the pump's counters are this transition's.
+			pumpOpenSeen = openQpc;
+			pumpFrames = pumpForeignFrames = pumpMidTeleport = 0;
+			pumpCpuTotalMs = 0.0;
+		}
+	}
+	if (lastPrepassFrame == globals::state->frameCount || !loadingOpen.load())
+		return;  // the world was rendered this frame (Prepass did its work), or no loading screen is up
+	// A presented frame without a world render behind a loading screen. Scene-graph access only on the thread that renders
+	// the world (the main thread in SE), never in the middle of the teleport.
+	const auto thread = static_cast<std::uint32_t>(GetCurrentThreadId());
+	if (renderThreadId.load() == 0 || thread != renderThreadId.load()) {
+		++pumpForeignFrames;
+		if (!pumpForeignLogged) {
+			pumpForeignLogged = true;
+			logger::warn("[RayTracing] The loading screen is presented on thread {}, the world on thread {}: the loading pump does not run there", thread,
+				renderThreadId.load());
+		}
+		return;
+	}
+	if (!settings.Enabled) {
+		if (status != Status::Off && settings.LoadingPump)
+			SwitchedOffFrame();  // (46k) switched off behind the loading screen: the same clean reset as on a world frame
+		return;
+	}
+	if (!settings.LoadingPump || status == Status::Unavailable || status == Status::Failed)
+		return;
+	{
+		std::scoped_lock lock(eventsMutex);
+		if (events.teleportPre != 0 && events.teleportPre > events.teleportFinish) {
+			++pumpMidTeleport;
+			return;
+		}
+	}
+	LoadingPump();
+}
+
+void RayTracing::LoadingPump()
+{
+	// (46k) Behind the loading screen: the destination's cells (as they finish loading), their BLASes, its characters and the
+	// pools / scratch / TLAS, within LoadingPumpMs of CPU per frame. D3D12 only: no D3D11 pass, nothing traced, nothing waits.
+	const std::int64_t start = Qpc();
+	activeThisFrame = false;
+	combinedThisFrame = false;
+	pending.active = false;
+	earlyThisFrame = false;
+	charactersUpdatedEarly = false;
+	earlyCpuMs = 0.0f;
+	earlyCharactersMs = 0.0f;
+	if (!EnsureBackend())
+		return;
+	if (status != Status::Waiting) {
+		status = Status::Waiting;
+		statusReason = "preparing behind the loading screen";
+	}
+	if (beginFrameIndex != globals::state->frameCount) {
+		beginFrameIndex = globals::state->frameCount;
+		backend.BeginFrame();
+	}
+	if (backend.HasPrepared())
+		backend.AbandonPrepared();
+	cpuLast = {};
+	try {
+		// The per-kind choices first (as RunFrame): a scene captured here with another configuration would be captured again.
+		UpdateAlphaCasters();
+		UpdateCharacters();
+		UpdatePointLights();
+		UpdateAO();
+		UpdatePhase();
+		DrainTransitionEvents();
+		backend.SetTransition(true);
+		scene.SetInteriorEnabled(InteriorWanted());
+		TransitionFrame();
+		const std::int64_t endStart = Qpc();
+		scene.EndFrame(backend);
+		characters.EndFrame(backend);
+		cpuLast.endFrame = static_cast<float>(static_cast<double>(Qpc() - endStart) * QpcMs());
+	} catch (const std::exception& e) {
+		Disable(Status::Failed, std::format("exception: {}", e.what()));
+	}
+	pumpThisFrame = true;
+	pumpCpuMs = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+	++pumpFrames;
+	pumpCpuTotalMs += pumpCpuMs;
+	lastCpuMs = pumpCpuMs;
 	ReportFrame();
 }
 
@@ -1514,6 +1897,26 @@ void RayTracing::ReportFrame()
 		loggedStatus = status;
 	}
 	LogStuckWaiting();  // (46i)
+	{
+		// (46k) "Active" while not a single BLAS exists (46h arrived in Solitude that way: cells without geometry counted as
+		// covered while the pools never built the rest): one warning with what the scene and the pools hold.
+		const auto& sc = scene.GetStats();
+		if (settings.Enabled && status == Status::Active && stats.blasCount == 0 && sc.triangles > 0) {
+			const std::int64_t now = Qpc();
+			if (activeNoBlasSince == 0)
+				activeNoBlasSince = now;
+			if (!activeNoBlasLogged && static_cast<double>(now - activeNoBlasSince) * QpcMs() > 2000.0) {
+				activeNoBlasLogged = true;
+				logger::warn("[RayTracing] Active for 2 s without a single BLAS: cells {} tracked, {} complete, {} gathering, {:.2f} M triangles captured; {} BLAS "
+							 "queued, {} built so far; hold {}, handed off {}, phase {}; pools: {}",
+					sc.cellsTracked, sc.cellsComplete, sc.cellsGathering, static_cast<double>(sc.triangles) / 1e6, backend.QueuedBuilds(), stats.buildsTotal,
+					scene.Held(), handedOff, static_cast<int>(phase), backend.IsReady() ? backend.PoolSummary() : std::string("-"));
+			}
+		} else {
+			activeNoBlasSince = 0;
+			activeNoBlasLogged = false;
+		}
+	}
 	lastCpuMs += earlyCpuMs;  // (45n) the frame-start part (Early Prep) belongs to this frame too
 	TransitionLogFrame(lastCpuMs);  // (46g)
 	traceSample.cpuMs = lastCpuMs;
@@ -1671,6 +2074,8 @@ void RayTracing::PublishCpuSplit()
 		detail.rtaoMode = aoTraced && aoThisFrame ? aoModeThisFrame : -1;
 		// (46g) Transitions, Early Prep split, pools.
 		detail.black = blackScreen ? 1 : 0;
+		detail.pump = pumpThisFrame ? 1 : 0;  // (46k)
+		detail.pumpMs = pumpThisFrame ? pumpCpuMs : -1.0f;
 		detail.handOff = handOffThisFrame ? 1 : 0;
 		detail.sinceCloseMs = inTransition || fade < 1.0f ? static_cast<float>(static_cast<double>(Qpc() - warmUpStart) * QpcMs()) : -1.0f;
 		if (scene.Held()) {
@@ -4065,6 +4470,25 @@ void RayTracing::DrawDiagnostics()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Left half of the screen: ray-traced point-light shadows; right half: Screen Space Point Light Shadows / shadow maps as before.");
 
+		// (46k) Transitions (loading screens, doors, fast travel).
+		ImGui::Checkbox("Prepare Behind Loading Screens", &settings.LoadingPump);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: while a loading screen is up, the place you arrive at is captured and built for ray tracing as its cells finish loading,");
+			ImGui::Text("  so the first frames you see do not have to do it. Off: as 46i (everything starts when the world is drawn again).");
+		}
+		if (settings.LoadingPump) {
+			ImGui::SliderFloat("Loading Screen Work (ms per frame)", &settings.LoadingPumpMs, 2.0f, 32.0f, "%.0f ms");
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("CPU time Ray Tracing may use per loading-screen frame. More: ready sooner, but the game's own loading gets less time.");
+			ImGui::SliderFloat("Black Screen Window (ms)", &settings.BlackWindowMs, 0.0f, 2000.0f, "%.0f ms");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("How long after the loading screen the picture still counts as black (large budgets, the switch to RT happens here).");
+				ImGui::Text("After it only the small per-frame budgets of normal play are used. 46i used up to 4 s, into the visible fade-in.");
+			}
+		}
+		if (!lastEventsSummary.empty())
+			ImGui::TextWrapped("Last transition: %s", lastEventsSummary.c_str());
+
 		const auto& rt = backend.GetStats();
 		const auto& sc = scene.GetStats();
 		const auto& skip = sc.skipped;
@@ -4308,6 +4732,10 @@ std::string RayTracing::DescribeForProfile() const
 	static constexpr const char* kAOModesInterior[] = { "RTAO + SSGI contact AO", "darker of both" };
 	text += std::format(", RTAO indoors {} (mode {}, no distance fade: the interior's box{})", settings.AO && settings.AOInteriors ? "on" : "off",
 		kAOModesInterior[std::clamp(settings.AOModeInterior, 0, 1)], AOInteriorWanted() ? "" : (settings.AO && settings.AOInteriors ? ", not available now" : ""));
+	// (46k)
+	text += settings.LoadingPump ? std::format(", prepare behind loading screens on ({:.0f} ms per frame, black window {:.0f} ms)", settings.LoadingPumpMs,
+									   settings.BlackWindowMs) :
+	                               std::string(", prepare behind loading screens off (46i)");
 	return text;
 }
 

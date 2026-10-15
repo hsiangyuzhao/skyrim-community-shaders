@@ -882,7 +882,7 @@ namespace RayTracingCharacters
 		return shape;
 	}
 
-	void Characters::Update(RayTracingRT::Backend& a_backend, const float a_rect[4], double a_budgetMs, std::uint32_t a_maxCaptures)
+	void Characters::Update(RayTracingRT::Backend& a_backend, const float a_rect[4], double a_budgetMs, std::uint32_t a_maxCaptures, const RE::NiPoint3* a_eye)
 	{
 		const std::int64_t start = Qpc();
 		if (flushRequested_.exchange(false))
@@ -904,7 +904,9 @@ namespace RayTracingCharacters
 
 		// 1. The actors to trace: in the traced area, nearest first, at most kMaxActors.
 		RE::NiPoint3 eye{};
-		if (auto* camera = RE::Main::WorldRootCamera())
+		if (a_eye)
+			eye = *a_eye;
+		else if (auto* camera = RE::Main::WorldRootCamera())
 			eye = camera->world.translate;
 		std::vector<std::pair<float, RE::Actor*>> candidates;
 		auto consider = [&](RE::Actor* a_actor) {

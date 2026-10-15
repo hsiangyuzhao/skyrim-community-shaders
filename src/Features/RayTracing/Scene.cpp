@@ -13,6 +13,9 @@ namespace RayTracingScene
 		constexpr std::size_t kValidatePerFrame = 384;
 		constexpr std::uint32_t kSettleFrames = 30;     // a new cell waits this long before its capture starts
 		constexpr std::uint32_t kRecaptureFrames = 90;  // a changed cell is captured again at most this often
+		// (46k) Behind the loading screen, once the player has arrived: a cell without a fully-loaded event is captured after it
+		// has been attached for this many frames (a cell kept loaded from before fires no event).
+		constexpr std::uint32_t kGateArrivedFrames = 20;
 
 		std::int64_t Qpc()
 		{
@@ -351,6 +354,63 @@ namespace RayTracingScene
 		if (!a_cell.cell || a_cell.cell->GetFormID() != a_cell.formID)
 			return false;
 		return a_cell.interior ? InteriorLoaded(a_cell.cell) : a_cell.cell->IsAttached();
+	}
+
+	bool Scene::TransformsSettled(RE::TESObjectCELL* a_cell)
+	{
+		// (46k) Behind the loading screen nothing of the new place has been drawn yet. A cell is captured there only when the
+		// 3D of a sample of its static references sits where the references stand (the root's world translate is the
+		// reference's position for a static placed in a cell); otherwise it waits (at the latest for the loading screen to close).
+		std::vector<RE::NiPointer<RE::TESObjectREFR>> refs;
+		{
+			auto& data = a_cell->GetRuntimeData();
+			RE::BSSpinLockGuard lock(data.spinLock);
+			refs.reserve(std::min<std::size_t>(data.references.size(), 96));
+			for (const auto& ref : data.references) {
+				if (ref)
+					refs.push_back(ref);
+				if (refs.size() >= 96)
+					break;
+			}
+		}
+		std::uint32_t sampled = 0, off = 0;
+		for (const auto& ref : refs) {
+			if (sampled >= 16)
+				break;
+			auto* base = ref->GetBaseObject();
+			if (!base || !base->Is(RE::FormType::Static) || ref->IsDisabled() || ref->IsDeleted())
+				continue;
+			auto* root = ref->Get3D();
+			if (!root)
+				continue;
+			++sampled;
+			const auto position = ref->GetPosition();
+			const auto& at = root->world.translate;
+			const float dx = at.x - position.x, dy = at.y - position.y, dz = at.z - position.z;
+			const float d2 = dx * dx + dy * dy + dz * dz;
+			if (!std::isfinite(d2) || d2 > 16.0f * 16.0f)
+				++off;
+		}
+		return off * 4 <= sampled;  // at most a quarter off (nothing sampled: nothing static to capture yet either way)
+	}
+
+	bool Scene::Covers(float a_x, float a_y) const
+	{
+		for (const auto& cell : cells_) {
+			if (cell->interior) {
+				if (!cell->hasBounds)
+					return true;
+				constexpr double kMargin = 1024.0;
+				if (a_x >= cell->boundsMin[0] - kMargin && a_x <= cell->boundsMax[0] + kMargin && a_y >= cell->boundsMin[1] - kMargin &&
+					a_y <= cell->boundsMax[1] + kMargin)
+					return true;
+				continue;
+			}
+			const float x0 = static_cast<float>(cell->x) * kCellUnits, y0 = static_cast<float>(cell->y) * kCellUnits;
+			if (a_x >= x0 && a_x < x0 + kCellUnits && a_y >= y0 && a_y < y0 + kCellUnits)
+				return true;
+		}
+		return false;
 	}
 
 	bool Scene::InteriorLoaded(const RE::TESObjectCELL* a_cell)
@@ -1484,17 +1544,24 @@ namespace RayTracingScene
 
 		// 1. Grid diff: cells that left the grid (or are no longer the same attached cell) go now.
 		std::vector<RE::TESObjectCELL*> attached;
+		std::uint32_t notAttached = 0;  // (46k)
 		if (interiorWanted) {
 			if (interior->IsInteriorCell() && InteriorLoaded(interior))
 				attached.push_back(interior);
+			else if (interior->IsInteriorCell())
+				++notAttached;
 		} else {
 			auto* grid = tes->gridCells;
 			attached.reserve(static_cast<std::size_t>(grid->length) * grid->length);
 			for (std::uint32_t gx = 0; gx < grid->length; ++gx) {
 				for (std::uint32_t gy = 0; gy < grid->length; ++gy) {
 					auto* cell = grid->GetCell(gx, gy);
-					if (cell && cell->IsAttached() && cell->IsExteriorCell() && cell->GetCoordinates())
-						attached.push_back(cell);
+					if (cell && cell->IsExteriorCell() && cell->GetCoordinates()) {
+						if (cell->IsAttached())
+							attached.push_back(cell);
+						else
+							++notAttached;
+					}
 				}
 			}
 		}
@@ -1564,14 +1631,42 @@ namespace RayTracingScene
 		}
 
 		// 3. New cells (captured once they have been in the grid for kSettleFrames).
+		gateStats_.waiting = gateStats_.unsettled = 0;
+		std::uint32_t untracked = 0;
 		for (auto* cell : attached) {
-			if (transition_ && std::find(departing_.begin(), departing_.end(), cell) != departing_.end()) {
-				++departingSkipped_;
-				continue;
-			}
 			const bool known = std::any_of(cells_.begin(), cells_.end(), [&](const std::unique_ptr<Cell>& a_cell) { return a_cell->cell == cell; });
 			if (known)
 				continue;
+			bool gateOpened = false;
+			if (transition_ && loadGate_) {
+				// (46k) Behind the loading screen (the loading pump): only cells that finished loading, and only once their 3D is
+				// in place; the place being left never fires the event (it does not load again), so it is not captured again.
+				const bool loaded = std::find(fullyLoaded_.begin(), fullyLoaded_.end(), cell) != fullyLoaded_.end();
+				auto seen = std::find_if(gateSeen_.begin(), gateSeen_.end(), [&](const auto& a_entry) { return a_entry.first == cell; });
+				if (seen == gateSeen_.end()) {
+					gateSeen_.emplace_back(cell, a_frame);
+					seen = std::prev(gateSeen_.end());
+				}
+				if (!loaded && !(arrived_ && a_frame - seen->second >= kGateArrivedFrames)) {
+					++gateStats_.waiting;
+					++untracked;
+					continue;
+				}
+				if (!TransformsSettled(cell)) {
+					++gateStats_.unsettled;
+					++gateStats_.unsettledTotal;
+					++untracked;
+					continue;
+				}
+				++gateStats_.captured;
+				if (loaded)
+					++gateStats_.byEvent;
+				gateOpened = true;
+			} else if (transition_ && std::find(departing_.begin(), departing_.end(), cell) != departing_.end()) {
+				++departingSkipped_;
+				++untracked;
+				continue;
+			}
 			auto entry = std::make_unique<Cell>();
 			entry->cell = cell;
 			entry->formID = cell->GetFormID();
@@ -1591,14 +1686,21 @@ namespace RayTracingScene
 				entry->y = cell->GetCoordinates()->cellY;
 				entry->seenFrame = a_frame;
 			}
+			if (gateOpened)
+				entry->seenFrame = a_frame - kSettleFrames;  // (46k) loaded and in place: captured right away
 			cells_.push_back(std::move(entry));
 		}
+		stats_.cellsUntracked = untracked;
+		stats_.cellsNotAttached = notAttached;
 
 		const std::int64_t gatherStart = Qpc();
 		times_.gridDiff = static_cast<float>(static_cast<double>(gatherStart - frameStart) * QpcMs());
 		// 4. Capture, nearest cells first, within the budget.
 		RE::NiPoint3 eye{};
-		if (auto* camera = RE::Main::WorldRootCamera())
+		auto* eyePlayer = transition_ ? RE::PlayerCharacter::GetSingleton() : nullptr;
+		if (eyePlayer)
+			eye = eyePlayer->GetPosition();  // (46k) behind the loading screen the camera is still at the place left
+		else if (auto* camera = RE::Main::WorldRootCamera())
 			eye = camera->world.translate;
 		const double qpcPerMs = 1.0 / QpcMs();
 		const std::int64_t deadline = frameStart + static_cast<std::int64_t>(static_cast<double>(a_budgetMs) * qpcPerMs);

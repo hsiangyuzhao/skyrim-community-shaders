@@ -166,6 +166,12 @@ public:
 		// the RT weight is 1 everywhere inside the interior's box.
 		bool AOInteriors = true;
 		int AOModeInterior = 0;        // AOModeKind (indoors)
+		// (46k) Transitions (Ray Tracing > Diagnostics): the loading pump prepares the destination behind the loading screen
+		// (off = 46i: nothing happens until the world renders again); its CPU per loading-screen frame; the frames after the
+		// loading screen still counted as black (the Fader Menu cannot tell when its fade-in starts).
+		bool LoadingPump = true;
+		float LoadingPumpMs = 8.0f;
+		float BlackWindowMs = 200.0f;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -224,7 +230,15 @@ public:
 	/// (45k) a_open false: it closed (the warm-up starts).
 	void OnLoadingScreen(bool a_open);
 	/// (46g) Fader Menu open / closed (the black screen after a loading screen), from the UI thread.
-	void OnFader(bool a_open) { faderOpen.store(a_open); }
+	void OnFader(bool a_open);
+	/// (46k) Engine events of a transition (any thread; they only record / queue, the render thread acts on them).
+	void OnCellFullyLoaded(const RE::TESObjectCELL* a_cell);
+	void OnPositionPlayer(int a_stage);
+	void OnFastTravelEnd();
+	void OnLoadGame();
+	/// (46k) Present hook, every presented frame (State::Reset): the loading pump. On a frame without a world render while a
+	/// loading screen is up it captures / builds the destination (D3D12 only, nothing traced); otherwise nothing.
+	virtual void Reset() override;
 	/// (45k) Screen Space Shadows Prepass: true = Ray Tracing draws them this frame (non-RT casters only,
 	/// after its trace, with its caster mask); it then always calls ScreenSpaceShadows::DrawDeferred once.
 	bool ClaimScreenSpaceShadows();
@@ -445,6 +459,47 @@ private:
 	void TransitionLogFlush();
 	std::uint32_t beginFrameIndex = UINT32_MAX;  // (46g) frame of the last Backend::BeginFrame
 	bool handOffThisFrame = false;               // (46g) F7 rt_handoff
+	/// (46k) The destination (not the place left) is captured and built: no flush pending, every attached cell of the grid in the
+	/// scene and complete, none still attaching, the player inside a captured cell, the build / upload queues empty.
+	[[nodiscard]] bool DestinationReady(double a_sinceCloseMs) const;
+	// (46k) Transition events (recorded by the event sinks on any thread, guarded by eventsMutex) and the loading pump.
+	struct TransitionEvents
+	{
+		std::int64_t loadingOpen = 0, loadingClose = 0, teleportPre = 0, teleportFinish = 0, fastTravelEnd = 0, loadGame = 0;
+		std::int64_t firstCell = 0, lastCell = 0;
+		std::uint32_t cells = 0;
+		bool pending = false;  // its events line is not logged yet
+	};
+	mutable std::mutex eventsMutex;
+	TransitionEvents events;                                                      // guarded by eventsMutex
+	std::vector<std::pair<const RE::TESObjectCELL*, std::int64_t>> cellEvents;  // guarded by eventsMutex
+	std::atomic<std::int64_t> faderOpenQpc{ 0 }, faderCloseQpc{ 0 };
+	std::atomic<std::uint32_t> renderThreadId{ 0 };  // the thread that renders the world (Prepass), the main thread in SE
+	std::uint32_t lastPrepassFrame = UINT32_MAX;     // State::frameCount of the last Prepass (a world frame)
+	bool pumpThisFrame = false;                      // F7 rt_pump
+	float pumpCpuMs = 0.0f;
+	std::uint32_t pumpFrames = 0, pumpForeignFrames = 0, pumpMidTeleport = 0;  // this transition
+	double pumpCpuTotalMs = 0.0;
+	bool pumpForeignLogged = false;
+	std::int64_t pumpOpenSeen = 0;  // the loading screen the pump counters belong to (TransitionEvents::loadingOpen)
+	bool eventSinksRegistered = false, playerSinkRegistered = false;
+	std::string lastEventsSummary;  // the last transition's events line (page)
+	std::int64_t activeNoBlasSince = 0;  // (46k) status active while no BLAS exists (should never last)
+	bool activeNoBlasLogged = false;
+	void RegisterEventSinks();
+	/// The player has arrived during this transition (the teleport finished, or the game loaded).
+	[[nodiscard]] bool Arrived() const;
+	/// Fully-loaded cells queued by the event sink go to the scene (only during a transition, only those after it began).
+	void DrainTransitionEvents();
+	/// Behind a loading screen, from Reset(): capture / build / prepare characters, no trace.
+	void LoadingPump();
+	/// Ray Tracing switched off (Prepass, or the pump during a loading screen): the scene, the pools and the states go.
+	void SwitchedOffFrame();
+	/// Prepass after the phase update: the transition frame or the traced frame, then the end of the frame.
+	void PrepassFrame();
+	/// The events line once the transition is over (also with Ray Tracing off: the control run).
+	void MaybeLogTransitionEvents();
+	std::string DescribeTransitionEvents(const TransitionEvents& a_events) const;
 	// (46g) Window beam guard: a beam whose sampled cone pixels are almost all blocked for 30 read-backs is implausible (the room's
 	// shell in the way): it gets no source for 600 frames, the engine's shadow map stays for it; then it is tried again.
 	struct BeamGuard

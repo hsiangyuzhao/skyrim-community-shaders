@@ -123,6 +123,9 @@ namespace Util::FrameTrace
 		// pixels whose top-K source set changed (GPU, a few frames late; -1 = not known), window beams found implausible.
 		uint32_t plSlotChanges = 0, plMerged = 0, plRejRadius = 0, plRejIntensity = 0, plKept = 0, plBeamsExcluded = 0;
 		int64_t plChurn = -1;
+		// (46k) This frame's RT work came from the loading pump (a loading-screen frame, no world render), its CPU ms (-1 = not run).
+		int pump = 0;
+		float pumpMs = -1.0f;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 
