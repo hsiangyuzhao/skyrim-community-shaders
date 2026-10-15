@@ -420,6 +420,21 @@ void WetnessEffects::DrawSettings()
 		ImGui::Checkbox("Enable Ripples", (bool*)&settings.EnableRipples);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Enables circular ripples on puddles, and to a less extent other wet surfaces");
+		// (46y)
+		ImGui::Checkbox("Raindrops: Fast Path", &RaindropFastPath);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): the same splashes and ripples for less GPU time. Splashes are computed only where they can still");
+			ImGui::Text("  make the surface wetter (in steady rain most surfaces are already wetter than a splash), ripples only on");
+			ImGui::Text("  near-flat ground where they have strength, and only the neighbouring raindrop cells a drop could reach.");
+			ImGui::Text("Off: every pixel facing up computes all of it (46x).");
+		}
+		ImGui::BeginDisabled(!RaindropFastPath);
+		ImGui::Checkbox("Raindrops: Skip Sub-Pixel Drops", &RaindropSubPixelSkip);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default, with Fast Path): far away, where one raindrop cell is smaller than a pixel, the drops fade out and");
+			ImGui::Text("  are not computed (there they are only shimmering noise). Off: drops at every distance.");
+		}
+		ImGui::EndDisabled();
 
 		ImGui::BeginDisabled(splashesOfStormsLoaded);
 		std::string checkboxLabel = splashesOfStormsLoaded ?
@@ -868,6 +883,9 @@ WetnessEffects::PerFrame WetnessEffects::GetCommonBufferData() const
 	data.settings.RaindropGridSize = 1.0f / settings.RaindropGridSize;
 	data.settings.RaindropInterval = 1.0f / settings.RaindropInterval;
 	data.settings.RippleLifetime = settings.RaindropInterval / settings.RippleLifetime;
+	// (46y) Raindrops: Fast Path bits (WetnessEffects.hlsli kRaindropFastPath / kRaindropSubPixelSkip); bit 0 stays the switch.
+	data.settings.EnableVanillaRipples = (settings.EnableVanillaRipples ? 1u : 0u) | (RaindropFastPath ? 2u : 0u) |
+	                                     ((RaindropFastPath && RaindropSubPixelSkip) ? 4u : 0u);
 
 	// (42c) Keep hand-edited JSON inside the ranges the shader assumes (the 0.05 floor is
 	// the same one the always-on numeric fix uses).
@@ -913,6 +931,13 @@ void WetnessEffects::LoadSettings(json& o_json)
 	if (o_json.contains("DebugSettings")) {
 		debugSettings = o_json["DebugSettings"].get<DebugSettings>();
 	}
+	// (46y)
+	const auto readBool = [&o_json](const char* a_key, bool a_default) {
+		const auto it = o_json.find(a_key);
+		return (it != o_json.end() && it->is_boolean()) ? it->get<bool>() : a_default;
+	};
+	RaindropFastPath = readBool("RaindropFastPath", true);
+	RaindropSubPixelSkip = readBool("RaindropSubPixelSkip", true);
 }
 
 void WetnessEffects::SaveSettings(json& o_json)
@@ -920,6 +945,8 @@ void WetnessEffects::SaveSettings(json& o_json)
 	o_json = settings;
 
 	o_json["DebugSettings"] = debugSettings;
+	o_json["RaindropFastPath"] = RaindropFastPath;          // (46y)
+	o_json["RaindropSubPixelSkip"] = RaindropSubPixelSkip;  // (46y)
 }
 
 

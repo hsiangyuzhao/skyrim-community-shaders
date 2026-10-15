@@ -141,6 +141,117 @@ namespace WetnessEffects
 		return float4(rippleNormal, wetness * SharedData::wetnessEffectsSettings.SplashesStrength);
 	}
 
+	// (46y) Raindrops: Fast Path flags, packed into EnableVanillaRipples (bit 0 is the vanilla switch, which no shader reads;
+	// the FeatureData layout stays as it is).
+	static const uint kRaindropFastPath = 2u;      // GetRainDropsFast with the caller's skips (Lighting.hlsl)
+	static const uint kRaindropSubPixelSkip = 4u;  // also fade out / skip where a raindrop cell is smaller than a pixel
+
+	// (46y) Raindrops: Fast Path. GetRainDrops with only the work whose result can show:
+	//   a_splashes  the caller needs the splash term (its rain wetness is below the strongest splash: max() hides it otherwise);
+	//   a_ripples   the caller needs the ripple term (with strength 0 every ripple is the identity rotation);
+	//   a neighbour cell is skipped when its nearest point is farther from this pixel than any splash / ripple of the needed
+	//   terms can reach (a drop's centre lies inside its cell, so nothing of that cell touches the pixel).
+	// The cells that are kept run in the same order with the same math, so the result is GetRainDrops' exactly.
+	float4 GetRainDropsFast(float3 worldPos, float t, float3 normal, float rippleStrengthModifier, bool a_splashes, bool a_ripples)
+	{
+		float uintToFloat = rcp(4294967295.0);
+		float rippleBreadthRcp = rcp(SharedData::wetnessEffectsSettings.RippleBreadth);
+		float intervalRcp = SharedData::wetnessEffectsSettings.RaindropIntervalRcp;
+		float lifetimeRcp = SharedData::wetnessEffectsSettings.RippleLifetimeRcp;
+
+		float2 gridUV = worldPos.xy * SharedData::wetnessEffectsSettings.RaindropGridSizeRcp + normal.xy;
+		int2 grid = floor(gridUV);
+		gridUV -= grid;
+
+		float3 rippleNormal = float3(0, 0, 1);
+		float wetness = 0.0;
+
+		const bool doSplashes = a_splashes && SharedData::wetnessEffectsSettings.EnableSplashes;
+		const bool doRipples = a_ripples && SharedData::wetnessEffectsSettings.EnableRipples;
+
+		// Reach in cells. Splash: its radius (either end of the range). Ripple: the band's outer edge, rippleR < 1.3 x Ripple
+		// Radius (rippleT < 1, size up to x1.3); a negative breadth puts the band outside rippleR by |breadth|.
+		const float splashReach = doSplashes ? max(abs(SharedData::wetnessEffectsSettings.SplashesMinRadius), abs(SharedData::wetnessEffectsSettings.SplashesMaxRadius)) : 0.0;
+		const float breadth = SharedData::wetnessEffectsSettings.RippleBreadth;
+		const float rippleReach = doRipples ? max(SharedData::wetnessEffectsSettings.RippleRadius, 0.0) * 1.3 + max(-breadth, 0.0) : 0.0;
+		const float reach = max(splashReach, rippleReach) * 1.001 + 1e-4;
+		const float reachSq = reach * reach;
+
+		[branch] if (doSplashes || doRipples)
+		{
+			for (int i = -1; i <= 1; i++) {
+				for (int j = -1; j <= 1; j++) {
+					// Nearest point of cell (i, j) to the pixel (gridUV in the centre cell [0, 1)).
+					const float2 boxDelta = max(max(float2(i, j) - gridUV, gridUV - float2(i + 1, j + 1)), 0.0);
+					[branch] if (dot(boxDelta, boxDelta) < reachSq)
+					{
+						int2 gridCurr = grid + int2(i, j);
+						float tOffset = float(Random::iqint3(gridCurr)) * uintToFloat;
+
+						if (doSplashes) {
+							float residual = t * intervalRcp / SharedData::wetnessEffectsSettings.SplashesLifetime + tOffset + worldPos.z * 0.001;
+							uint timestep = uint(residual);
+							residual -= timestep;
+
+							uint3 hash = Random::pcg3d(uint3(asuint(gridCurr), timestep));
+							float3 floatHash = float3(hash) * uintToFloat;
+
+							if (floatHash.z < SharedData::wetnessEffectsSettings.RaindropChance) {
+								float2 vec2Centre = int2(i, j) + floatHash.xy - gridUV;
+								float distSqr = dot(vec2Centre, vec2Centre);
+								float dropRadius = lerp(SharedData::wetnessEffectsSettings.SplashesMinRadius,
+									SharedData::wetnessEffectsSettings.SplashesMaxRadius,
+									float(Random::iqint3(hash.yz)) * uintToFloat);
+								if (distSqr < dropRadius * dropRadius) {
+									wetness = max(wetness, RainFade(residual));
+								}
+							}
+						}
+
+						if (doRipples) {
+							float residual = t * intervalRcp + tOffset + worldPos.z * 0.001;
+							uint timestep = uint(residual);
+							residual -= timestep;
+
+							uint3 hash = Random::pcg3d(uint3(asuint(gridCurr), timestep));
+							float3 floatHash = float3(hash) * uintToFloat;
+
+							if (floatHash.z < SharedData::wetnessEffectsSettings.RaindropChance) {
+								float2 vec2Centre = int2(i, j) + floatHash.xy - gridUV;
+								float distSqr = dot(vec2Centre, vec2Centre);
+								float rippleT = residual * lifetimeRcp;
+
+								if (rippleT < 1.0) {
+									uint sizeHash = Random::iqint3(hash.xy);
+									float sizeVariation = lerp(0.7, 1.3, float(sizeHash) * uintToFloat);
+
+									float rippleRadius = SharedData::wetnessEffectsSettings.RippleRadius * sizeVariation;
+									float rippleR = lerp(0.0, rippleRadius, rippleT);
+									float rippleInnerRadius = rippleR - SharedData::wetnessEffectsSettings.RippleBreadth;
+
+									float bandLerp = (sqrt(distSqr) - rippleInnerRadius) * rippleBreadthRcp;
+									if (bandLerp > 0.0 && bandLerp < 1.0) {
+										float rippleStrength = SharedData::wetnessEffectsSettings.RippleStrength * rippleStrengthModifier;
+										float deriv = (bandLerp < 0.5 ? SmoothstepDeriv(bandLerp * 2.0) : -SmoothstepDeriv(2.0 - bandLerp * 2.0)) *
+										              lerp(rippleStrength, 0.0, rippleT * rippleT);
+
+										float3 grad = float3(normalize(vec2Centre), -deriv);
+										float3 bitangent = float3(-grad.y, grad.x, 0.0);
+										float3 rnormal = normalize(cross(grad, bitangent));
+
+										rippleNormal = ReorientNormal(rnormal, rippleNormal);
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		return float4(rippleNormal, wetness * SharedData::wetnessEffectsSettings.SplashesStrength);
+	}
+
 	float3 GetWetnessSpecular(float3 N, float3 L, float3 V, float3 lightColor, float roughness)
 	{
 		return LightingFuncGGX_OPT3(N, V, L, roughness, 0.02) * lightColor;

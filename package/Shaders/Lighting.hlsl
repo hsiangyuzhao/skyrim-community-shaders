@@ -3223,6 +3223,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	                                (SharedData::wetnessEffectsSettings.EnableRaindropFx) &&
 	                                (wetnessOcclusion > 0.5);
 
+	// (46y) Raindrops: Fast Path (Wetness Effects > Raindrops). Raindrop cells smaller than a pixel: the world size of one
+	// pixel here (the smaller of the two screen axes, so grazing ground is not cut early) against the grid; full effect up
+	// to half a cell per pixel, none from one cell per pixel on (the drops are sub-pixel noise there). Top level: derivatives.
+	const uint raindropFlags = SharedData::wetnessEffectsSettings.EnableVanillaRipples;
+	const float3 raindropDdx = ddx(input.WorldPosition.xyz), raindropDdy = ddy(input.WorldPosition.xyz);
+	const float raindropCellsPerPixel = sqrt(min(dot(raindropDdx, raindropDdx), dot(raindropDdy, raindropDdy))) * SharedData::wetnessEffectsSettings.RaindropGridSizeRcp;
+	const float raindropFade = (raindropFlags & WetnessEffects::kRaindropSubPixelSkip) ? saturate(2.0 - 2.0 * raindropCellsPerPixel) : 1.0;
+
 	if (shouldCalculateRaindrops) {
 #		if defined(SKINNED)
 		float3 ripplePosition = input.ModelPosition.xyz;
@@ -3231,7 +3239,29 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		else
 		float3 ripplePosition = !FrameBuffer::FrameParams.y ? input.ModelPosition.xyz : input.WorldPosition.xyz + FrameBuffer::CameraPosAdjust[eyeIndex].xyz;
 #		endif
-		raindropInfo = WetnessEffects::GetRainDrops(ripplePosition, SharedData::wetnessEffectsSettings.Time, worldNormal, flatnessAmount);
+		[branch] if (raindropFlags & WetnessEffects::kRaindropFastPath)
+		{
+			// Splashes only matter where they can raise the rain wetness below (max(rainWetness, splash), splash <= Strength);
+			// skin and hair replace their rain wetness right after, so they never show. Ripples only with a strength above 0
+			// (flatnessAmount is their strength: below Puddle Max Angle a ripple is the identity rotation).
+#		if defined(SKIN) || defined(HAIR)
+			const bool raindropSplashes = false;
+#		else
+			const float rainWetnessBefore = SharedData::wetnessEffectsSettings.Wetness * minWetnessAngle * SharedData::wetnessEffectsSettings.MaxRainWetness;
+			const bool raindropSplashes = rainWetnessBefore < SharedData::wetnessEffectsSettings.SplashesStrength * raindropFade;
+#		endif
+			const float rippleModifier = flatnessAmount * raindropFade;
+			const bool raindropRipples = rippleModifier > 0.0 && SharedData::wetnessEffectsSettings.RippleStrength != 0.0;
+			[branch] if (raindropSplashes || raindropRipples)
+			{
+				raindropInfo = WetnessEffects::GetRainDropsFast(ripplePosition, SharedData::wetnessEffectsSettings.Time, worldNormal, rippleModifier, raindropSplashes, raindropRipples);
+				raindropInfo.w *= raindropFade;
+			}
+		}
+		else
+		{
+			raindropInfo = WetnessEffects::GetRainDrops(ripplePosition, SharedData::wetnessEffectsSettings.Time, worldNormal, flatnessAmount);
+		}
 	}
 
 	// Calculate different wetness types

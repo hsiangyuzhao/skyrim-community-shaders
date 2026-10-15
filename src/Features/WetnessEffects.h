@@ -97,6 +97,14 @@ public:
 		float2 RainOverride = float2(0.0f, 0.0f);
 	} debugSettings;
 
+	// (46y) Raindrops: Fast Path (Raindrop Effects page). Outside Settings: Settings is copied into the FeatureData cbuffer
+	// as is, so these travel as bits 1 / 2 of the GPU copy of EnableVanillaRipples (no shader reads its bit 0).
+	// RaindropFastPath: the Lighting shader computes splashes only where they can raise the wetness and ripples only where
+	// they have strength, and skips neighbour cells out of reach (identical result). RaindropSubPixelSkip: also fades the
+	// drops out where a raindrop cell is smaller than a pixel. Both off = 46x.
+	bool RaindropFastPath = true;
+	bool RaindropSubPixelSkip = true;
+
 	Settings settings;
 	// Climate preset system
 	enum class ClimatePreset : uint32_t
