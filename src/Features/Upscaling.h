@@ -243,7 +243,6 @@ public:
 		bool saveVramSsgi = true;            // SSGI's indirect-light textures only while GI / specular GI is on (A1)
 		bool saveVramFreeRtWhenOff = true;   // Ray Tracing switched off / a denoiser not in use: its textures and buffers go (A8)
 		bool saveVramFreeFgWhenOff = false;  // frame generation switched off in this menu: DLSS-G's resources go (A9; off by default: experiment)
-		bool saveVramLazyPost = true;        // post-processing textures only when the effect runs (A4)
 		bool saveVramUpscalerMasks = true;   // the D3D11 reactive / transparency masks only for FSR (A7)
 		bool saveVramNrdShared = true;       // NRD instances share their transient (scratch) pool textures (A5; from the next pool creation)
 		bool copyRenderedAreaOnly = true;    // per-frame interop copies only of the render rect (item 7)

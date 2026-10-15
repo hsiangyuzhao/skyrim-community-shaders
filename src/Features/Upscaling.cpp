@@ -80,7 +80,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	saveVramSsgi,
 	saveVramFreeRtWhenOff,
 	saveVramFreeFgWhenOff,
-	saveVramLazyPost,
 	saveVramUpscalerMasks,
 	saveVramNrdShared,
 	copyRenderedAreaOnly,
@@ -680,9 +679,6 @@ void Upscaling::DrawAdvancedSettings()
 			ImGui::TextUnformatted("Experiment, off by default: frame generation switched off in this menu gives back DLSS-G's memory (about 700 MB");
 			ImGui::TextUnformatted("at 4K); switching it on again makes it anew (a short hitch). Pause menus and the map are not affected.");
 		}
-		ImGui::Checkbox("Post-Processing Textures Only When Used", &settings.saveVramLazyPost);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted("Post-processing work textures of effects that are off are not kept (made when an effect is switched on).");
 		ImGui::Checkbox("Upscaler Masks Only For FSR", &settings.saveVramUpscalerMasks);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted("Two 4K mask textures only FSR reads are not kept with DLSS (DLSS has its own copies).");
