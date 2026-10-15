@@ -36,10 +36,26 @@ namespace Util::LatencyPacer
 		int inFlightAfter = -1;    ///< (45n) frames not finished by the GPU when the frame's CPU work starts (after the sleep / bound)
 		float stallMs = 0.0f;      ///< (46n) the previous frame's CPU time blocked inside D3D11 waiting for the GPU (calls of 0.5 ms or more)
 		float correctionMs = 0.0f; ///< (46n) learned extra sleep that moves such waits to the frame start (stall feedback)
+		float hiddenWaitMs = -1.0f; ///< (46o) the previous frame's main-thread wait in the render segments up to the submit (-1 = not measured)
+		float waitUsedMs = 0.0f;   ///< (46o) the previous frame's wait left out of its lead sample (46n stall, or the larger hidden wait)
+		float backstopMs = 0.0f;   ///< (46o) lead taken off by the unlock backstop this frame
+		float hiddenBaseMs = 0.0f; ///< (46o) the hidden wait frames have anyway (p25 while sleeping); only the part above it counts
+		bool reset = false;        ///< (46o) the lead samples and learned sleep were cleared at this frame (after a pause / loading / map)
 	};
 
-	/// Main thread, in Main::Update before the Reflex sleep. Sleeps only when a_enabled.
-	void PaceFrameStart(bool a_enabled, float a_marginMs, bool a_stallFeedback = true);
+	/// (46o) The pacer's switches for one frame.
+	struct Options
+	{
+		bool enabled = false;        ///< sleep (else measure only)
+		float marginMs = 1.0f;
+		bool stallFeedback = true;   ///< (46n) "Move GPU Waits to Frame Start": waits grow the learned frame-start sleep
+		bool hiddenWaits = false;    ///< (46o) F1a "Count Hidden GPU Waits": the render segments' wall - thread CPU time is a wait too
+		bool backstop = false;       ///< (46o) F1b "Unlock Backstop"
+		bool paused = false;         ///< (46o) game paused / loading screen / map open: the samples are cleared when it ends
+	};
+
+	/// Main thread, in Main::Update before the Reflex sleep. Sleeps only when a_options.enabled.
+	void PaceFrameStart(const Options& a_options);
 
 	/// (46n) Main thread, any D3D11 call on the immediate context that can wait for the GPU (Map, Flush, GetData): its duration
 	/// in TSC ticks (__rdtsc) or ms. Only calls of 0.5 ms or more count. Not counted in the CPU time the pacer reserves.

@@ -224,4 +224,41 @@ namespace Util::FrameTrace
 
 	/// The split as JSON for the F12 snapshot.
 	nlohmann::json ToJson();
+
+	// ---- (46o) sub-timers of the Present and of the upscaling pass (recording / overlay only) -----
+
+	enum class Split : int
+	{
+		PresentFg,        ///< DX12SwapChain::Present: DLSS-G presentation state + options
+		PresentHdr,       ///< HDR composite + screenshot hook
+		PresentSignal11,  ///< the pacer's submit point + D3D11 Signal
+		PresentCopy,      ///< D3D12 queue Wait, allocator / list Reset, the copy to the swap chain, tags, Close, ExecuteCommandLists
+		PresentSl,        ///< the Streamline / DXGI Present (DLSS-G's wait for the GPU is in here)
+		PresentPost,      ///< after it: DLSS-G state, D3D12 Signal, D3D11 Wait, UI clear, HDR upkeep, the spin limiter (no Reflex)
+		UpsCopyIn,        ///< Upscaling: the input color copy to the shared texture
+		UpsSignal11,      ///< D3D11 Signal before the upscaler
+		UpsWait12,        ///< D3D12 queue Wait
+		UpsReset,         ///< allocator / list Reset
+		SlSetOpts,        ///< Streamline: frame constants + DLSS / RR options
+		SlEvaluate,       ///< Streamline: tags + slEvaluateFeature
+		UpsEcl,           ///< Close + ExecuteCommandLists
+		UpsSignal12,      ///< D3D12 Signal after it
+		UpsWait11,        ///< D3D11 Wait
+		UpsRcas,          ///< RCAS sharpening or the copy back
+		Count
+	};
+	/// Adds a_ticks (QPC) to this frame's part (only while Active()).
+	void AddSplit(Split a_part, int64_t a_ticks);
+	/// Lap timer: Mark bills the time since the last Mark (or the start) to a part; Skip drops it. Nothing while not Active().
+	struct Lap
+	{
+		Lap();
+		void Mark(Split a_part);
+		void Skip();
+
+	private:
+		int64_t t = 0;
+	};
+	/// (46o) M3: a Streamline evaluate returned eWarnOutOfVRAM (any thread).
+	void OnOutOfVram();
 }

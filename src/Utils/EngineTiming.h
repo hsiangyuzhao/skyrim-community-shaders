@@ -170,12 +170,45 @@ namespace Util::EngineTiming
 		bool untimed = false;   ///< "untimed.<scope>": cs_passes time with no pass open
 	};
 
+	// ---- (46o) M1: main-thread waits per segment ----
+	//
+	// At every segment change (not at the game-update call switches inside Logic) the main thread's CPU time is read
+	// (QueryThreadCycleTime: one syscall, calibrated against QPC once on a background thread at startup). Per segment,
+	// wait = wall time - thread CPU time: time the thread was blocked (inside D3D11 waiting for the GPU, on a lock, an event)
+	// or not scheduled. Runs while a trace records, and while the pacer counts hidden GPU waits (F1a); a branch otherwise.
+
+	/// Main thread, every frame before the pacer: the pacer wants the render segments' wait (F1a).
+	void SetPacerWaitTracking(bool a_on);
+	/// Main thread: the main thread's wait so far this frame in the render segments (render_other .. present, i.e. from the
+	/// engine's render call on; not logic / tail / the frame-start sleeps), closing the open interval now. -1 when not
+	/// measured (tracking off, not calibrated, probes not installed, not the main thread).
+	double RenderWaitMsSoFar();
+	/// Thread cycles per ms (0 until calibrated) and the measured cost of one QueryThreadCycleTime call (ns, -1 = not yet).
+	double CyclesPerMs();
+	double CycleReadCostNs();
+
+	// ---- (46o) M2: stall sampler (trace only) ----
+	//
+	// While a trace records with Performance Overlay > Stall Sampler (trace) on, a watchdog thread looks at the main thread
+	// every ~1 ms. When it has been in the same segment / game-update call for 8 ms (then every 4 ms more, at most 3 samples per
+	// frame) it suspends the main thread, reads its instruction pointer and 64 qwords of its stack from RSP into a preallocated
+	// buffer (GetThreadContext + ReadProcessMemory: no allocation, no lock, no logging while suspended), resumes it at once,
+	// and only then turns the stack words that point into a loaded module right after a call instruction into module+offset.
+
+	/// Per frame (FrameTrace::OnPresentEnd): on = recording with the switch on.
+	void SetStallSampler(bool a_on);
+	/// The samples taken since the last call ("seg@ms:mod+off>ret>...|..."), empty if none.
+	std::string TakeStallSamples();
+
 	// ---- per-frame result (FrameTrace::OnPresentEnd) ----
 	struct Frame
 	{
 		uint64_t id = 0;             ///< (46n) FrameId() of this frame
 		bool valid = false;
 		float ms[static_cast<int>(Seg::Count)]{};
+		/// (46o) M1: per segment wall - thread CPU time (-1 = not measured this frame), the thread's CPU time of the frame.
+		float waitMs[static_cast<int>(Seg::Count)]{ -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+		float mainCpuMs = -1.0f;
 		float inputMs = 0.0f;        ///< the input poll call (BSInputDeviceManager, ID 67315), part of Logic
 		uint32_t topCallId = 0;      ///< Address Library ID of the slowest game-update call (0 = none)
 		uint32_t topCallOffset = 0;  ///< its call site, offset in Main::Update

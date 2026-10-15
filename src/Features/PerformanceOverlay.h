@@ -549,6 +549,8 @@ struct PerformanceOverlay : OverlayFeature
 		// (44f) Probes on the calls in Main::Update (engine CPU split, Reflex markers at render start).
 		// Read once at startup (restart to apply). EngineTimingOff.txt next to SettingsUser.json also turns them off.
 		bool EngineTimingProbes = true;
+		// (46o) M2: while a trace records, a watchdog samples where the main thread is stuck (8 ms+ in one segment).
+		bool StallSampler = false;
 		uint32_t ScreenshotKey = VK_F8;      // screenshot of the presented frame (incl. menu and overlay)
 		bool ScreenshotOnSave = true;        // F12 / Save frame also takes a screenshot with the same time stamp
 		bool ScreenshotSaveHDR = true;       // HDR frames: also save the untouched PQ image (16-bit PNG)

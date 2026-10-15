@@ -5,6 +5,10 @@
 #include <cstring>
 #include <format>
 #include <memory>
+#include <mutex>
+#include <thread>
+
+#include <psapi.h>
 
 #include "Features/PerformanceOverlay.h"
 #include "Features/Upscaling.h"
@@ -89,6 +93,247 @@ namespace Util::EngineTiming
 		std::atomic<uint32_t> g_createsOther{ 0 };
 
 		bool OnMainThread() { return g_mainThread != 0 && GetCurrentThreadId() == g_mainThread; }
+
+		// ---- (46o) M1: main-thread waits per segment (wall - thread CPU time) ----
+		bool g_waitPacer = false;                        // the pacer counts hidden GPU waits (F1a)
+		std::atomic<double> g_cyclesPerMs{ 0.0 };        // thread cycles per ms (calibrated on a background thread)
+		std::atomic<double> g_cycleCostNs{ -1.0 };       // one QueryThreadCycleTime call
+		bool g_calibrationStarted = false;
+		uint64_t g_cycLast = 0;                          // thread cycles at the last sample
+		int64_t g_waitQpcLast = 0;                       // QPC at the last sample (0 = no open interval)
+		std::array<uint64_t, kSegCount> g_cycAcc{};      // thread cycles per segment this frame
+		std::array<int64_t, kSegCount> g_waitWallAcc{};  // QPC ticks per segment this frame (same intervals as g_cycAcc)
+		bool g_waitTouched = false;                      // something was sampled this frame
+
+		bool WaitTrackingOn() { return g_probes && g_cyclesPerMs.load(std::memory_order_relaxed) > 0.0 && (g_waitPacer || FrameTrace::IsRecording()); }
+
+		uint64_t ThreadCycles()
+		{
+			ULONG64 cycles = 0;
+			QueryThreadCycleTime(GetCurrentThread(), &cycles);
+			return cycles;
+		}
+
+		/// Bills the main thread's wall and CPU time since the last sample to a_seg.
+		void SampleWait(int a_seg)
+		{
+			const uint64_t cyc = ThreadCycles();
+			LARGE_INTEGER t;
+			QueryPerformanceCounter(&t);
+			if (g_waitQpcLast && cyc >= g_cycLast && t.QuadPart >= g_waitQpcLast) {
+				g_cycAcc[a_seg] += cyc - g_cycLast;
+				g_waitWallAcc[a_seg] += t.QuadPart - g_waitQpcLast;
+				g_waitTouched = true;
+			}
+			g_cycLast = cyc;
+			g_waitQpcLast = t.QuadPart;
+		}
+
+		/// Once, on a background thread: thread cycles per ms (spins 3 x 25 ms, the largest ratio: preemption only lowers it),
+		/// and the cost of one QueryThreadCycleTime call.
+		void CalibrateCycles()
+		{
+			LARGE_INTEGER f;
+			QueryPerformanceFrequency(&f);
+			const double qpcPerMs = static_cast<double>(f.QuadPart) / 1000.0;
+			double best = 0.0;
+			for (int i = 0; i < 3; ++i) {
+				LARGE_INTEGER t0, t1;
+				QueryPerformanceCounter(&t0);
+				const uint64_t c0 = ThreadCycles();
+				do {
+					QueryPerformanceCounter(&t1);
+				} while (static_cast<double>(t1.QuadPart - t0.QuadPart) < 25.0 * qpcPerMs);
+				const uint64_t c1 = ThreadCycles();
+				QueryPerformanceCounter(&t1);
+				const double ms = static_cast<double>(t1.QuadPart - t0.QuadPart) / qpcPerMs;
+				if (ms > 0.0 && c1 > c0)
+					best = std::max(best, static_cast<double>(c1 - c0) / ms);
+			}
+			constexpr int kCalls = 20000;
+			LARGE_INTEGER a, b;
+			QueryPerformanceCounter(&a);
+			uint64_t sink = 0;
+			for (int i = 0; i < kCalls; ++i)
+				sink += ThreadCycles();
+			QueryPerformanceCounter(&b);
+			const double costNs = static_cast<double>(b.QuadPart - a.QuadPart) / qpcPerMs * 1e6 / kCalls;
+			// The TSC rate, for the log: QueryThreadCycleTime counts TSC ticks on current CPUs.
+			const uint64_t r0 = __rdtsc();
+			LARGE_INTEGER q0, q1;
+			QueryPerformanceCounter(&q0);
+			do {
+				QueryPerformanceCounter(&q1);
+			} while (static_cast<double>(q1.QuadPart - q0.QuadPart) < 10.0 * qpcPerMs);
+			const double tscPerMs = static_cast<double>(__rdtsc() - r0) / (static_cast<double>(q1.QuadPart - q0.QuadPart) / qpcPerMs);
+			g_cycleCostNs.store(costNs, std::memory_order_relaxed);
+			if (best > 1000.0)
+				g_cyclesPerMs.store(best, std::memory_order_relaxed);
+			logger::info("[EngineTiming] (46o) Thread CPU time: {:.0f} thread cycles per ms (TSC {:.0f} per ms), one QueryThreadCycleTime {:.0f} ns{}{}",
+				best, tscPerMs, costNs, best > 1000.0 ? "" : "; calibration FAILED, segment waits off", sink == 0 ? " (no cycles)" : "");
+		}
+
+		// ---- (46o) M2: stall sampler ----
+		constexpr int kStackWords = 64;
+		constexpr int kMaxModules = 512;
+		constexpr int kSamplesPerFrame = 3;
+		constexpr double kStallFirstMs = 8.0;
+		constexpr double kStallNextMs = 4.0;
+		std::atomic<bool> g_samplerOn{ false };
+		std::atomic<bool> g_samplerThread{ false };
+		std::atomic<int64_t> g_segSince{ 0 };   // QPC of the last segment / call change (main thread, while the sampler is on)
+		std::atomic<int> g_segNow{ 0 };         // the segment then
+		std::atomic<uint64_t> g_frameNow{ 0 };  // the frame then
+		HANDLE g_mainHandle = nullptr;
+		uintptr_t g_mainStackBase = 0;
+		struct ModuleRange
+		{
+			uintptr_t base, end;
+			char name[48];
+		};
+		ModuleRange g_modules[kMaxModules]{};
+		std::atomic<int> g_moduleCount{ 0 };
+		std::mutex g_sampleMutex;  // never taken while the main thread is suspended
+		std::string g_samples;     // taken by the main thread every frame
+
+		/// Main thread, while the sampler is off (the sampler thread reads the table only while it is on).
+		void RefreshModules()
+		{
+			static HMODULE handles[kMaxModules];
+			DWORD needed = 0;
+			if (!K32EnumProcessModules(GetCurrentProcess(), handles, sizeof(handles), &needed))
+				return;
+			const int n = std::min(static_cast<int>(needed / sizeof(HMODULE)), kMaxModules);
+			int count = 0;
+			for (int i = 0; i < n; ++i) {
+				MODULEINFO info{};
+				if (!K32GetModuleInformation(GetCurrentProcess(), handles[i], &info, sizeof(info)))
+					continue;
+				auto& m = g_modules[count++];
+				m.base = reinterpret_cast<uintptr_t>(info.lpBaseOfDll);
+				m.end = m.base + info.SizeOfImage;
+				char path[MAX_PATH]{};
+				K32GetModuleBaseNameA(GetCurrentProcess(), handles[i], path, MAX_PATH);
+				strncpy_s(m.name, path, _TRUNCATE);
+				for (char& c : m.name)
+					if (c == ',' || c == '|' || c == '>' || c == ';' || c == '@' || c == ':')
+						c = '_';
+			}
+			g_moduleCount.store(count, std::memory_order_release);
+		}
+
+		const ModuleRange* FindModule(uintptr_t a_address)
+		{
+			const int n = g_moduleCount.load(std::memory_order_acquire);
+			for (int i = 0; i < n; ++i)
+				if (a_address >= g_modules[i].base && a_address < g_modules[i].end)
+					return &g_modules[i];
+			return nullptr;
+		}
+
+		/// A stack word that is a return address: inside a module, right after a call (E8 rel32, FF 15 [rip], FF /2 reg or [reg]).
+		/// Read with ReadProcessMemory: a bad guess fails instead of faulting.
+		bool LooksLikeReturn(uintptr_t a_address)
+		{
+			if (a_address < 8 || !FindModule(a_address))
+				return false;
+			uint8_t b[8]{};
+			SIZE_T got = 0;
+			if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(a_address - 8), b, sizeof(b), &got) || got != sizeof(b))
+				return false;
+			if (b[3] == 0xE8)  // call rel32
+				return true;
+			if (b[2] == 0xFF && (b[3] & 0x38) == 0x10 && ((b[3] & 0xC7) == 0x05 || (b[3] & 0xC0) == 0x80))  // call [rip+d32] / [reg+d32]
+				return true;
+			if (b[5] == 0xFF && (b[6] & 0x38) == 0x10 && (b[6] & 0xC0) == 0x40)  // call [reg+d8]
+				return true;
+			if (b[6] == 0xFF && (b[7] & 0x38) == 0x10 && ((b[7] & 0xC0) == 0xC0 || (b[7] & 0xC0) == 0x00))  // call reg / [reg]
+				return true;
+			return false;
+		}
+
+		std::string DescribeCode(uintptr_t a_address)
+		{
+			if (const auto* m = FindModule(a_address))
+				return std::format("{}+{:X}", m->name, a_address - m->base);
+			return std::format("{:X}", a_address);
+		}
+
+		void SamplerThread()
+		{
+			// Highest priority: the time between SuspendThread and ResumeThread must not include a preemption of this thread.
+			SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+			HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+			LARGE_INTEGER f;
+			QueryPerformanceFrequency(&f);
+			const double qpcPerMs = static_cast<double>(f.QuadPart) / 1000.0;
+			alignas(16) static CONTEXT ctx;
+			static uint64_t stack[kStackWords];
+			uint64_t frame = UINT64_MAX;
+			int samplesThisFrame = 0;
+			int64_t sampledSince = 0;
+			int samplesThisInterval = 0;
+			for (;;) {
+				if (!g_samplerOn.load(std::memory_order_acquire) || !g_mainHandle) {
+					Sleep(50);
+					continue;
+				}
+				LARGE_INTEGER due;
+				due.QuadPart = -10000;  // 1 ms
+				if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+					WaitForSingleObject(timer, 5);
+				else
+					Sleep(1);
+				const int64_t since = g_segSince.load(std::memory_order_acquire);
+				const uint64_t frameNow = g_frameNow.load(std::memory_order_relaxed);
+				if (!since || !g_samplerOn.load(std::memory_order_acquire))
+					continue;
+				if (frameNow != frame) {
+					frame = frameNow;
+					samplesThisFrame = 0;
+				}
+				if (since != sampledSince) {
+					sampledSince = since;
+					samplesThisInterval = 0;
+				}
+				LARGE_INTEGER now;
+				QueryPerformanceCounter(&now);
+				const double inSeg = static_cast<double>(now.QuadPart - since) / qpcPerMs;
+				if (samplesThisFrame >= kSamplesPerFrame || inSeg < kStallFirstMs + kStallNextMs * samplesThisInterval || inSeg > 2000.0)
+					continue;
+				const int seg = g_segNow.load(std::memory_order_relaxed);
+
+				// ---- suspended window: syscalls only (no allocation, no lock, no logging); ResumeThread on every path ----
+				ctx.ContextFlags = CONTEXT_CONTROL;
+				SIZE_T got = 0;
+				bool ok = false;
+				if (SuspendThread(g_mainHandle) != static_cast<DWORD>(-1)) {
+					ok = GetThreadContext(g_mainHandle, &ctx) != FALSE;  // also waits until the thread is really suspended
+					if (ok && ctx.Rsp && g_mainStackBase > ctx.Rsp) {
+						const SIZE_T bytes = std::min<SIZE_T>(sizeof(stack), static_cast<SIZE_T>(g_mainStackBase - ctx.Rsp)) & ~static_cast<SIZE_T>(7);
+						if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(ctx.Rsp), stack, bytes, &got))
+							got = 0;
+					}
+					ResumeThread(g_mainHandle);
+				}
+				// ---- resumed ----
+				if (!ok)
+					continue;
+				++samplesThisFrame;
+				++samplesThisInterval;
+				std::string text = std::format("{}@{:.0f}:{}", SegName(static_cast<Seg>(seg)), inSeg, DescribeCode(static_cast<uintptr_t>(ctx.Rip)));
+				int found = 0;
+				for (SIZE_T i = 0; i < got / 8 && found < 6; ++i) {
+					if (LooksLikeReturn(static_cast<uintptr_t>(stack[i]))) {
+						text += ">" + DescribeCode(static_cast<uintptr_t>(stack[i]));
+						++found;
+					}
+				}
+				std::scoped_lock lk(g_sampleMutex);
+				if (g_samples.size() < 4096)
+					g_samples += (g_samples.empty() ? "" : "|") + text;
+			}
+		}
 
 		// ---- (46n) cs_passes split per pass ----
 		constexpr int kOurPasses = static_cast<int>(Seg::OurPasses);
@@ -202,6 +447,20 @@ namespace Util::EngineTiming
 			constexpr int kWorld = static_cast<int>(Seg::World);
 			if ((g_seg == kWorld) != (a_seg == kWorld))
 				WorldTiming::OnWorldSegment(a_seg == kWorld);
+			// (46o) M1: the thread's CPU time at segment changes only (not at the call switches inside logic).
+			if (a_seg != g_seg) {
+				if (WaitTrackingOn())
+					SampleWait(g_seg);
+				else
+					g_waitQpcLast = 0;
+			}
+			// (46o) M2: where the main thread is now, for the stall sampler.
+			if ((a_seg != g_seg || a_call != g_call) && g_samplerOn.load(std::memory_order_relaxed)) {
+				LARGE_INTEGER t;
+				QueryPerformanceCounter(&t);
+				g_segNow.store(a_seg, std::memory_order_relaxed);
+				g_segSince.store(t.QuadPart, std::memory_order_release);
+			}
 			if (FrameTrace::Active()) {
 				const int64_t now = FrameTrace::Now();
 				if (g_last) {
@@ -570,6 +829,10 @@ namespace Util::EngineTiming
 		}
 		g_probes = true;
 		g_probeStatus = "installed";
+		if (!g_calibrationStarted) {  // (46o) M1
+			g_calibrationStarted = true;
+			std::thread(CalibrateCycles).detach();
+		}
 		logger::info("[EngineTiming] Main::Update probes INSTALLED: {} call sites ({} already redirected by other plugins). To turn them off: Performance Overlay > Engine Timing Probes, or create {} next to SettingsUser.json", kSiteCount, mismatched, kKillSwitchFile);
 	}
 
@@ -722,6 +985,23 @@ namespace Util::EngineTiming
 		Frame f;
 		SwitchTo(g_seg, g_call);  // close the open interval at "now"
 		f.id = g_frameId++;
+		// (46o) M1: wall - thread CPU per segment.
+		if (WaitTrackingOn() && OnMainThread())
+			SampleWait(g_seg);
+		if (g_waitTouched) {
+			const double cpm = g_cyclesPerMs.load(std::memory_order_relaxed);
+			double cpu = 0.0;
+			for (int i = 0; i < kSegCount; ++i) {
+				const double c = static_cast<double>(g_cycAcc[i]) / cpm;
+				cpu += c;
+				f.waitMs[i] = static_cast<float>(std::max(static_cast<double>(g_waitWallAcc[i]) * g_toMs - c, 0.0));
+			}
+			f.mainCpuMs = static_cast<float>(cpu);
+		}
+		g_cycAcc.fill(0);
+		g_waitWallAcc.fill(0);
+		g_waitTouched = false;
+		g_frameNow.store(g_frameId, std::memory_order_relaxed);  // (46o) M2
 
 		if (g_probes) {
 			f.valid = true;
@@ -798,5 +1078,61 @@ namespace Util::EngineTiming
 		}
 		g_passTouchedCount = 0;
 		return f;
+	}
+
+	// ---- (46o) M1 ----
+
+	void SetPacerWaitTracking(bool a_on) { g_waitPacer = a_on; }
+
+	double RenderWaitMsSoFar()
+	{
+		if (!WaitTrackingOn() || !OnMainThread())
+			return -1.0;
+		SampleWait(g_seg);
+		const double cpm = g_cyclesPerMs.load(std::memory_order_relaxed);
+		double wall = 0.0, cpu = 0.0;
+		for (int i = static_cast<int>(Seg::RenderOther); i <= static_cast<int>(Seg::Present); ++i) {
+			wall += static_cast<double>(g_waitWallAcc[i]) * g_toMs;
+			cpu += static_cast<double>(g_cycAcc[i]) / cpm;
+		}
+		return std::max(wall - cpu, 0.0);
+	}
+
+	double CyclesPerMs() { return g_cyclesPerMs.load(std::memory_order_relaxed); }
+	double CycleReadCostNs() { return g_cycleCostNs.load(std::memory_order_relaxed); }
+
+	// ---- (46o) M2 ----
+
+	void SetStallSampler(bool a_on)
+	{
+		a_on = a_on && g_probes && OnMainThread();
+		if (a_on == g_samplerOn.load(std::memory_order_relaxed))
+			return;
+		if (a_on) {
+			if (!g_mainHandle) {
+				g_mainHandle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, g_mainThread);
+				if (!g_mainHandle) {
+					logger::warn("[EngineTiming] (46o) Stall sampler: OpenThread failed ({}); off", GetLastError());
+					return;
+				}
+				// The main thread's stack base (this is the main thread).
+				g_mainStackBase = reinterpret_cast<uintptr_t>(reinterpret_cast<const NT_TIB*>(NtCurrentTeb())->StackBase);
+			}
+			RefreshModules();
+			g_segSince.store(0, std::memory_order_relaxed);
+			if (!g_samplerThread.exchange(true)) {
+				std::thread(SamplerThread).detach();
+				logger::info("[EngineTiming] (46o) Stall sampler started ({} modules)", g_moduleCount.load());
+			}
+		}
+		g_samplerOn.store(a_on, std::memory_order_release);
+	}
+
+	std::string TakeStallSamples()
+	{
+		std::scoped_lock lk(g_sampleMutex);
+		std::string out;
+		out.swap(g_samples);
+		return out;
 	}
 }

@@ -228,6 +228,10 @@ public:
 		// (46n) Time the frame spent blocked inside D3D11 waiting for the GPU (Map / Flush / GetData) moves to the frame-start
 		// sleep (learned over a few frames), and is not counted as CPU work the pacer must keep in hand.
 		bool reflexPacerStallFeedback = true;
+		// (46o) F1a: the main thread's wait in the render segments (wall - thread CPU time) counts as a wait for the GPU too.
+		bool reflexPacerHiddenWaits = true;
+		// (46o) F1b: when the pacer stays locked out (no sleep for 30 frames while the GPU is behind), its reserved lead shrinks.
+		bool reflexPacerBackstop = true;
 
 		NeuralRenderingSettings neuralRendering;
 	};

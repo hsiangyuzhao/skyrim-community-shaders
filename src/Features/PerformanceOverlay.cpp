@@ -202,6 +202,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	SectionCpuWait,
 	DriverWaitTiming,
 	EngineTimingProbes,
+	StallSampler,
 	ScreenshotKey,
 	ScreenshotOnSave,
 	ScreenshotSaveHDR,
@@ -3772,6 +3773,11 @@ void PerformanceOverlay::DrawViewOptions()
 								   "SettingsUser.json (SKSE\\Plugins\\CommunityShaders) to turn them off without the menu.");
 		ImGui::SameLine();
 		ImGui::TextDisabled("now: %s", Util::EngineTiming::ProbeStatus());
+		// (46o) M2
+		ImGui::Checkbox("Stall Sampler (trace)", &settings.StallSampler);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("While a trace records: when the game's main thread is stuck 8 ms or more in one place, a helper thread pauses it for a few\n"
+								   "microseconds, notes where it is (the stall_stack column) and lets it go at once. Diagnostics only; off by default.");
 		if (const auto f = Util::FrameTrace::LastFile(); !f.empty())
 			ImGui::TextDisabled("Last trace: %s", f.c_str());
 		if (const auto f = Util::Screenshot::LastFile(); !f.empty())

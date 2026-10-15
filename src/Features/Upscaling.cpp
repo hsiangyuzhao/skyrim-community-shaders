@@ -20,6 +20,7 @@
 #include "Features/ScreenSpaceRayTracing.h"
 #include "Features/SubsurfaceScattering.h"
 #include "Utils/EngineTiming.h"
+#include "Utils/FrameTrace.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/LatencyPacer.h"
@@ -70,6 +71,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexFrameLimit,
 	reflexPacerMarginMs,
 	reflexPacerStallFeedback,
+	reflexPacerHiddenWaits,
+	reflexPacerBackstop,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -607,11 +610,23 @@ void Upscaling::DrawAdvancedSettings()
 			ImGui::TextUnformatted("When the game stops in the middle of a frame to wait for the graphics card (seen as one slow 'Map' every frame),");
 			ImGui::TextUnformatted("the pacer learns that wait and takes it at the start of the frame instead, before input is read. Off: as 46m.");
 		}
+		ImGui::Checkbox("Pacer: Count Hidden GPU Waits", &settings.reflexPacerHiddenWaits);  // (46o) F1a
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("The game often waits for the graphics card inside ordinary drawing calls in the middle of the frame, not only in 'Map'.");
+			ImGui::TextUnformatted("On: that waiting (measured as wall time minus the main thread's real CPU time) is not counted as CPU work, and is");
+			ImGui::TextUnformatted("moved to the frame start like the 'Map' waits. Fixes the pacer locking out (uneven long/short frames). Off: as 46n.");
+		}
+		ImGui::Checkbox("Pacer: Unlock Backstop", &settings.reflexPacerBackstop);  // (46o) F1b
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Safety net: if the pacer has not slept for 30 frames while the graphics card is behind, it trims its CPU reserve");
+			ImGui::TextUnformatted("0.5 ms per frame until it sleeps again, and hands it back at once if frames get slower. Off: as 46n.");
+		}
 		const auto& pacer = Util::LatencyPacer::Last();
 		if (pacer.tracking)
-			ImGui::TextDisabled("Pacer: %d frame(s) on the GPU at frame start (%d after the wait), GPU period %.1f ms, CPU reserve %.1f ms, slept %.1f ms (+%.1f ms bound), "
-								"waited inside D3D11 %.1f ms (learned %.1f ms)",
-				pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.sleepMs, pacer.capWaitMs, pacer.stallMs, pacer.correctionMs);
+			ImGui::TextDisabled("Pacer: %d frame(s) on the GPU at frame start (%d after the wait), GPU period %.1f ms, CPU reserve %.1f ms (backstop -%.1f), slept %.1f ms "
+								"(+%.1f ms bound), waited inside D3D11 %.1f ms, hidden wait %.1f ms (learned %.1f ms)",
+				pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.backstopMs, pacer.sleepMs, pacer.capWaitMs, pacer.stallMs,
+				pacer.hiddenWaitMs, pacer.correctionMs);
 		else
 			ImGui::TextDisabled("Pacer: waiting for the D3D12 swap chain");
 		if (!Util::EngineTiming::ProbesInstalled())
@@ -1670,12 +1685,14 @@ std::string Upscaling::DescribeLatencyForTrace()
 	auto modeName = [](uint m) { return m < 3 ? kModes[m] : "not applied"; };
 	return std::format(
 		"Reflex available {}, functions ready {}, PCL ready {}; mode set {} / applied {}; frame limit set {} / effective {} / applied {} fps (presented); "
-		"pacer {} (margin {:.1f} ms, GPU waits moved to frame start {}), markers at render start {} (probes {}); lowLatencyAvailable {}, latencyReportAvailable {}; "
+		"pacer {} (margin {:.1f} ms, GPU waits moved to frame start {}, (46o) count hidden GPU waits {}, unlock backstop {}), markers at render start {} (probes {}); "
+		"lowLatencyAvailable {}, latencyReportAvailable {}; "
 		"frame generation requested {} at {}x; spin limiter {} (fallback without Reflex, syncInterval 0 path); refresh {:.0f} Hz",
 		streamline.featureReflex ? "yes" : "no", streamline.reflexFunctionsReady ? "yes" : "no", streamline.pclFunctionsReady ? "yes" : "no",
 		modeName(std::min(settings.reflexMode, 2u)), modeName(modeApplied), settings.reflexFrameLimit, GetEffectiveReflexFrameLimit(),
 		reflexFrameLimitApplied == UINT_MAX ? -1 : static_cast<int>(reflexFrameLimitApplied),
-		IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs, settings.reflexPacerStallFeedback ? "on" : "off", WantsReflexMarkersAtRenderStart() ? "on" : "off",
+		IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs, settings.reflexPacerStallFeedback ? "on" : "off",
+		settings.reflexPacerHiddenWaits ? "on" : "off", settings.reflexPacerBackstop ? "on" : "off", WantsReflexMarkersAtRenderStart() ? "on" : "off",
 		Util::EngineTiming::ProbesInstalled() ? "installed" : Util::EngineTiming::ProbeStatus(),
 		stateOk ? (state.lowLatencyAvailable ? "yes" : "no") : "?", stateOk ? (state.latencyReportAvailable ? "yes" : "no") : "?",
 		IsFrameGenerationRequestedNow() ? "yes" : "no", GetFrameGenerationAppliedMultiplier(), streamline.reflexFunctionsReady ? "off" : "on",
@@ -2165,23 +2182,28 @@ void Upscaling::Upscale()
 			}
 			auto renderSize = Util::ConvertToDynamic(globals::state->screenSize);
 
+			Util::FrameTrace::Lap lap;  // (46o) ups_* sub-timers (the 500 ms post-load stalls)
 			// Copy input color texture to shared D3D12 resource
 			context->CopyResource(dx12SwapChain.inputColorBufferShared12->resource11, main.texture);
+			lap.Mark(Util::FrameTrace::Split::UpsCopyIn);
 
 			// Wait for D3D11 to finish
 			DX::ThrowIfFailed(context->QueryInterface(IID_PPV_ARGS(dx12SwapChain.d3d11Context.put())));
 			auto fence = dx12SwapChain.fenceValue;
 			logger::trace("Signaling shared fence {} before upscaling", fence);
 			DX::ThrowIfFailed(dx12SwapChain.d3d11Context->Signal(dx12SwapChain.d3d11Fence.get(), fence));
+			lap.Mark(Util::FrameTrace::Split::UpsSignal11);
 			logger::trace("Waiting for shared fence {} before upscaling", fence);
 			DX::ThrowIfFailed(dx12SwapChain.commandQueue->Wait(dx12SwapChain.d3d12Fence.get(), fence));
 			dx12SwapChain.fenceValue++;
+			lap.Mark(Util::FrameTrace::Split::UpsWait12);
 
 			auto frameIndex = dx12SwapChain.frameIndex;
 
 			// Reset command allocator and list
 			DX::ThrowIfFailed(dx12SwapChain.dlssCommandAllocator[frameIndex]->Reset());
 			DX::ThrowIfFailed(dx12SwapChain.dlssCommandList[frameIndex]->Reset(dx12SwapChain.dlssCommandAllocator[frameIndex].get(), nullptr));
+			lap.Mark(Util::FrameTrace::Split::UpsReset);
 
 			std::optional<Util::EngineTiming::PassScope> streamlinePass;  // (46n) the Streamline evaluate, apart from the copies around it
 			streamlinePass.emplace("Upscaling.Streamline");
@@ -2212,20 +2234,24 @@ void Upscaling::Upscale()
 				);
 			}
 
+			lap.Skip();  // the Streamline call itself is split inside it (sl_setopts / sl_evaluate)
 			// Close and execute command list
 			DX::ThrowIfFailed(dx12SwapChain.dlssCommandList[frameIndex]->Close());
 
 			ID3D12CommandList* commandLists[] = { dx12SwapChain.dlssCommandList[frameIndex].get() };
 			dx12SwapChain.commandQueue->ExecuteCommandLists(1, commandLists);
+			lap.Mark(Util::FrameTrace::Split::UpsEcl);
 			streamlinePass.reset();
 
 			// Wait for D3D12 to finish
 			fence = dx12SwapChain.fenceValue;
 			logger::trace("Signaling shared fence {} after upscaling", fence);
 			DX::ThrowIfFailed(dx12SwapChain.commandQueue->Signal(dx12SwapChain.d3d12Fence.get(), fence));
+			lap.Mark(Util::FrameTrace::Split::UpsSignal12);
 			logger::trace("Waiting for shared fence {} after upscaling", fence);
 			DX::ThrowIfFailed(dx12SwapChain.d3d11Context->Wait(dx12SwapChain.d3d11Fence.get(), fence));
 			dx12SwapChain.fenceValue++;
+			lap.Mark(Util::FrameTrace::Split::UpsWait11);
 
 			// Back to the main buffer: (45a) through RCAS when Sharpening is above 0 (the linear scene,
 			// before post-processing and Neural Rendering after upscaling, so SDR and HDR share it), a
@@ -2244,6 +2270,7 @@ void Upscaling::Upscale()
 			}
 			if (!sharpened)
 				context->CopyResource(main.texture, dx12SwapChain.outputColorBufferShared12->resource11);
+			lap.Mark(Util::FrameTrace::Split::UpsRcas);
 		} else if (upscaleMethod == UpscaleMethod::kFSR) {
 			fidelityFX.Upscale(main.texture, reactiveMaskTexture->resource.get(), transparencyCompositionMaskTexture->resource.get(), motionVector.texture, settings.sharpnessFSR);
 		}

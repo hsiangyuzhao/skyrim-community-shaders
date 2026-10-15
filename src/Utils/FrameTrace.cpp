@@ -56,8 +56,89 @@ namespace Util::FrameTrace
 			char mapWorstResource[96]{};
 			double driverMisc = 0.0;  // (46l) GetData, Clear*, GenerateMips, ResolveSubresource
 			uint32_t driverMiscCalls = 0;
+			// (46o) Present / upscaling sub-timers (-1 = not run this frame).
+			float split[static_cast<int>(Split::Count)]{ -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 		};
+		static_assert(static_cast<int>(Split::Count) == 16);
 		FrameAcc g_frame;
+		std::atomic<uint32_t> g_vramWarn{ 0 };  // (46o) M3: Streamline eWarnOutOfVRAM since the last row
+
+		// (46o) M3: video memory of the D3D11 adapter (and of the D3D12 device's, if it is another one), MB.
+		struct Vram
+		{
+			float budget = -1.0f, usage = -1.0f, nonLocal = -1.0f, usage12 = -1.0f;
+		};
+		Vram g_vram;
+		uint32_t g_vramFrame = 0;
+		winrt::com_ptr<IDXGIAdapter3> g_adapter11, g_adapter12;
+		bool g_adaptersLooked = false;
+		bool g_adapter12Same = true;
+		uint64_t g_adapterTotalMb = 0;
+
+		void LookUpAdapters()
+		{
+			if (g_adaptersLooked)
+				return;
+			g_adaptersLooked = true;
+			try {
+				winrt::com_ptr<IDXGIDevice> dxgiDevice;
+				if (!globals::d3d::device || FAILED(globals::d3d::device->QueryInterface(IID_PPV_ARGS(dxgiDevice.put()))))
+					return;
+				winrt::com_ptr<IDXGIAdapter> adapter;
+				if (FAILED(dxgiDevice->GetAdapter(adapter.put())))
+					return;
+				adapter->QueryInterface(IID_PPV_ARGS(g_adapter11.put()));
+				DXGI_ADAPTER_DESC desc{};
+				if (FAILED(adapter->GetDesc(&desc)))
+					return;
+				g_adapterTotalMb = desc.DedicatedVideoMemory / (1024ull * 1024ull);
+				auto* device12 = Upscaling::dx12SwapChain.d3d12Device.get();
+				if (!device12)
+					return;
+				const LUID luid12 = device12->GetAdapterLuid();
+				if (luid12.LowPart == desc.AdapterLuid.LowPart && luid12.HighPart == desc.AdapterLuid.HighPart)
+					return;
+				g_adapter12Same = false;
+				winrt::com_ptr<IDXGIFactory4> factory;
+				if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put()))))
+					factory->EnumAdapterByLuid(luid12, IID_PPV_ARGS(g_adapter12.put()));
+			} catch (...) {
+				g_adapter11 = nullptr;
+				g_adapter12 = nullptr;
+			}
+		}
+
+		Vram QueryVram()
+		{
+			Vram v;
+			LookUpAdapters();
+			constexpr float kMb = 1.0f / (1024.0f * 1024.0f);
+			DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+			if (g_adapter11 && SUCCEEDED(g_adapter11->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+				v.budget = static_cast<float>(info.Budget) * kMb;
+				v.usage = static_cast<float>(info.CurrentUsage) * kMb;
+			}
+			if (g_adapter11 && SUCCEEDED(g_adapter11->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info)))
+				v.nonLocal = static_cast<float>(info.CurrentUsage) * kMb;
+			if (g_adapter12 && SUCCEEDED(g_adapter12->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+				v.usage12 = static_cast<float>(info.CurrentUsage) * kMb;
+			return v;
+		}
+
+		/// (46o) M6: minutes since the game process started.
+		double SessionMinutes()
+		{
+			FILETIME created{}, exited{}, kernel{}, user{};
+			if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+				return -1.0;
+			FILETIME now{};
+			GetSystemTimeAsFileTime(&now);
+			const auto toU64 = [](const FILETIME& a_t) { return (static_cast<uint64_t>(a_t.dwHighDateTime) << 32) | a_t.dwLowDateTime; };
+			return static_cast<double>(toU64(now) - toU64(created)) / 1e7 / 60.0;
+		}
+
+		// (46o) M6 frame_flags bits.
+		constexpr uint32_t kFlagLoading = 1u, kFlagMap = 2u, kFlagPaused = 4u, kFlagMenu = 8u, kFlagFader = 16u, kFlagPacerReset = 32u;
 		int64_t g_simStart = 0;
 		std::atomic<uint32_t> g_shaderAsync{ 0 }, g_shaderSync{ 0 }, g_cellAttach{ 0 }, g_cellDetach{ 0 };
 		std::atomic<int64_t> g_mapOtherTicks{ 0 };  // (46l) Map on other contexts
@@ -158,6 +239,12 @@ namespace Util::FrameTrace
 			// (46n) Frames since the loading screen closed (0 = first frame after it; -1 = outside the post-load window).
 			int passSinceLoad = -1;
 			bool passLogPending = false;
+			// (46o) Present / upscaling sub-timers, video memory, Streamline out-of-VRAM warnings, frame flags, stall samples.
+			float split[static_cast<int>(Split::Count)]{};
+			Vram vram;
+			uint32_t vramWarn = 0;
+			uint32_t flags = 0;
+			std::string stallStack;
 		};
 
 		struct ReflexTimes
@@ -186,6 +273,7 @@ namespace Util::FrameTrace
 		// (45j) Taken when a recording starts (the CSV is written on another thread).
 		std::string g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency;
 		std::string g_headerRendering;  // (46e) upscaler, resolutions, SSRT / SSGI
+		std::string g_header46o;        // (46o) session uptime, video memory, thread CPU time calibration, stall sampler
 		int64_t g_recordStart = 0;
 		int64_t g_recordEnd = 0;
 		std::vector<Row> g_rows;
@@ -431,7 +519,7 @@ namespace Util::FrameTrace
 		}
 
 		void WriteCsv(std::vector<Row> a_rows, std::unordered_map<uint64_t, ReflexTimes> a_reflex, std::string a_location, std::string a_rayTracing, std::string a_tag,
-			std::string a_latency, std::string a_rendering)
+			std::string a_latency, std::string a_rendering, std::string a_header46o)
 		{
 			try {
 				auto dir = logger::log_directory();
@@ -551,6 +639,27 @@ namespace Util::FrameTrace
 				out << "#   s CompileShader (disk cache or compile; its own Create is also in c).\n";
 				out << "# (46n) pacer_d3d11_wait_ms = the previous frame's main-thread time inside D3D11 calls of 0.5 ms or more (Map / Flush / GetData:\n";
 				out << "#   waits for the GPU), left out of pacer_lead_ms; pacer_learned_ms = the frame-start sleep learned from them (in pacer_sleep_ms).\n";
+				out << "# (46o) " << a_header46o << "\n";
+				out << "# (46o) eng_<seg>_wait_ms (M1) = the main thread's wall time minus its own CPU time (QueryThreadCycleTime at every segment change)\n";
+				out << "#   in that segment: blocked (waiting for the GPU inside D3D11, on a lock or event) or not scheduled; main_cpu_ms = the thread's CPU\n";
+				out << "#   time over the whole frame (-1 = not measured: probes off or not calibrated).\n";
+				out << "#   pacer_hidden_wait_ms = the previous frame's main-thread wait in the render segments (render_other..present) up to the submit\n";
+				out << "#   (measured while recording or with Count Hidden GPU Waits on; -1 = not measured); pacer_hidden_base_ms = the hidden wait frames\n";
+				out << "#   have anyway (p25 over frames that slept 1 ms+: job joins, preemption); pacer_wait_used_ms = what was left out of its lead sample\n";
+				out << "#   (the 46n D3D11 wait, or with Count Hidden GPU Waits the larger of it and hidden - base when >= 0.5 ms and the GPU was behind at\n";
+				out << "#   that frame's start; the learned sleep takes the median of the last 3); pacer_backstop_ms = lead taken off by the Unlock Backstop.\n";
+				out << "#   stall_stack (M2, Stall Sampler on) = up to 3 samples of a main thread stuck 8 ms+ in one segment / call: seg@ms_in_it:RIP>return\n";
+				out << "#   addresses found on the stack (module+offset, nearest first; candidates, not a verified unwind), samples separated by '|'.\n";
+				out << "#   vram_* (M3, every 4th frame) = this process's video memory on the D3D11 adapter (MB): local budget, local usage, non-local\n";
+				out << "#   (system memory) usage; vram12_local_usage_mb = the D3D12 device's adapter if it is another one (-1 = same adapter);\n";
+				out << "#   vram_warn = Streamline evaluations this frame that returned eWarnOutOfVRAM (budget used up).\n";
+				out << "#   present_* (M5) = DX12SwapChain::Present split: fg (DLSS-G state / options), hdr (HDR composite + screenshot), signal11 (D3D11\n";
+				out << "#   Signal), copy (D3D12 Wait, Reset, copy, tags, ExecuteCommandLists), sl (the Streamline / DXGI Present: DLSS-G waits for the GPU\n";
+				out << "#   here), post (D3D12 Signal, D3D11 Wait, clears, HDR upkeep, the spin limiter); -1 = not run.\n";
+				out << "#   ups_* / sl_* = the DLSS pass of Upscaling: input copy, D3D11 Signal, D3D12 Wait, Reset, Streamline options + constants,\n";
+				out << "#   tags + slEvaluateFeature, Close + ExecuteCommandLists, D3D12 Signal, D3D11 Wait, RCAS or copy back (-1 = not run).\n";
+				out << "#   frame_flags (M6) = bits: 1 loading screen, 2 map, 4 game paused, 8 a menu open (application / item / modal), 16 Fader Menu,\n";
+				out << "#   32 the pacer cleared its samples this frame (after a pause / loading screen / the map).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -586,7 +695,13 @@ namespace Util::FrameTrace
 				       "wt_miss_ms,wt_misses,wt_skin_actors,wt_skin_ms,wt_shelter_picks,wt_shelter_ms,wt_water_searches,wt_water_ms,wt_creates,"
 				       "wt_create_ms,wt_tex_creates,wt_view_creates,wt_passes,wt_techniques,wt_materials,wt_setups,wt_groups,wt_stamps,wt_top3,"
 				       "wt_places_over_1ms,driver_misc_ms,driver_misc_calls,map_other_ms,map_other_calls,"
-				       "cpu_top_features,pass_since_load,pass_sum_ms,pass_untimed_ms,pass_split,pass_block,pacer_d3d11_wait_ms,pacer_learned_ms\n";
+				       "cpu_top_features,pass_since_load,pass_sum_ms,pass_untimed_ms,pass_split,pass_block,pacer_d3d11_wait_ms,pacer_learned_ms,"
+				       "eng_world_wait_ms,eng_shadows_wait_ms,eng_cs_passes_wait_ms,eng_logic_wait_ms,eng_present_wait_ms,eng_tail_wait_ms,"
+				       "eng_render_other_wait_ms,main_cpu_ms,pacer_hidden_wait_ms,pacer_hidden_base_ms,pacer_wait_used_ms,pacer_backstop_ms,stall_stack,"
+				       "vram_local_budget_mb,vram_local_usage_mb,vram_nonlocal_usage_mb,vram12_local_usage_mb,vram_warn,"
+				       "present_fg_ms,present_hdr_ms,present_signal11_ms,present_copy_ms,present_sl_ms,present_post_ms,"
+				       "ups_copyin_ms,ups_signal11_ms,ups_wait12_ms,ups_reset_ms,sl_setopts_ms,sl_evaluate_ms,ups_ecl_ms,ups_signal12_ms,ups_wait11_ms,ups_rcas_ms,"
+				       "frame_flags\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -650,7 +765,22 @@ namespace Util::FrameTrace
 					s += std::format(",{},{:.3f},{:.3f},{},{}", a_row.passSinceLoad, a_row.engine.passSumMs, a_row.engine.passUntimedMs, FormatPassSplit(a_row),
 						FormatPassBlock(a_row));
 					// (46n) The pacer: the previous frame's wait inside D3D11, the learned frame-start sleep.
-					s += std::format(",{:.3f},{:.3f}\n", a_row.pacer.stallMs, a_row.pacer.correctionMs);
+					s += std::format(",{:.3f},{:.3f}", a_row.pacer.stallMs, a_row.pacer.correctionMs);
+					{
+						// (46o) M1 waits, the pacer's 46o state, M2 samples, M3 video memory, M5 / upscaling splits, M6 flags.
+						using Seg = EngineTiming::Seg;
+						const auto& e = a_row.engine;
+						const auto w = [&e](Seg a_seg) { return e.waitMs[static_cast<int>(a_seg)]; };
+						s += std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}", w(Seg::World), w(Seg::Shadows), w(Seg::OurPasses), w(Seg::Logic),
+							w(Seg::Present), w(Seg::Tail), w(Seg::RenderOther), e.mainCpuMs);
+						s += std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{}", a_row.pacer.hiddenWaitMs, a_row.pacer.hiddenBaseMs, a_row.pacer.waitUsedMs,
+							a_row.pacer.backstopMs, a_row.stallStack);
+						const auto& v = a_row.vram;
+						s += std::format(",{:.0f},{:.0f},{:.0f},{:.0f},{}", v.budget, v.usage, v.nonLocal, v.usage12, a_row.vramWarn);
+						for (const float ms : a_row.split)
+							s += std::format(",{:.3f}", ms);
+						s += std::format(",{}\n", a_row.flags);
+					}
 					return s;
 				};
 				auto engineColumns = [](const Row& a_row) {
@@ -1543,6 +1673,23 @@ namespace Util::FrameTrace
 				r.passSinceLoad = passWindow ? g_passSinceLoad : -1;
 				r.passLogPending = engine.valid && engine.ms[static_cast<int>(EngineTiming::Seg::OurPasses)] > EngineTiming::kPassSpikeMs &&
 				                   !engine.passes.empty() && g_passLogs < kMaxPassLogs;
+				{
+					// (46o) Sub-timers, video memory (every 4th frame), out-of-VRAM warnings, flags, stall samples.
+					std::copy_n(g_frame.split, static_cast<int>(Split::Count), r.split);
+					if ((g_vramFrame++ & 3u) == 0u)
+						g_vram = QueryVram();
+					r.vram = g_vram;
+					r.vramWarn = g_vramWarn.exchange(0, std::memory_order_relaxed);
+					if (auto* ui = globals::game::ui) {
+						r.flags |= ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) ? kFlagLoading : 0u;
+						r.flags |= ui->IsMenuOpen(RE::MapMenu::MENU_NAME) ? kFlagMap : 0u;
+						r.flags |= ui->GameIsPaused() ? kFlagPaused : 0u;
+						r.flags |= (ui->IsApplicationMenuOpen() || ui->IsItemMenuOpen() || ui->IsModalMenuOpen()) ? kFlagMenu : 0u;
+						r.flags |= ui->IsMenuOpen(RE::FaderMenu::MENU_NAME) ? kFlagFader : 0u;
+					}
+					r.flags |= r.pacer.reset ? kFlagPacerReset : 0u;
+					r.stallStack = EngineTiming::TakeStallSamples();
+				}
 				g_rows.push_back(r);
 				{
 					auto& row = g_rows.back();
@@ -1567,6 +1714,10 @@ namespace Util::FrameTrace
 		g_frame = {};
 		g_lastPresentEnd = now;
 		g_active = WantedThisFrame() && g_frequency != 0;
+		// (46o) M2: the stall sampler runs only while recording with its switch on.
+		EngineTiming::SetStallSampler(g_recording && globals::features::performanceOverlay.loaded && globals::features::performanceOverlay.settings.StallSampler);
+		if (!g_recording)
+			g_vramWarn.store(0, std::memory_order_relaxed);
 		if (!g_active)
 			g_lastPresentEnd = 0;
 	}
@@ -1598,6 +1749,17 @@ namespace Util::FrameTrace
 			g_headerRayTracing = std::format("{}; build {}", globals::features::rayTracing.DescribeForProfile(), BuildLabel::kBuild);
 			g_headerLatency = globals::features::upscaling.DescribeLatencyForTrace();
 			g_headerRendering = DescribeRendering();  // (46e)
+			{
+				// (46o) M6 session uptime, M3 video memory at the start, M1 calibration, M2 switch.
+				const Vram v = QueryVram();
+				g_header46o = std::format("session uptime at start {:.1f} min; VRAM {} MB dedicated (D3D12 device on {}), at start: budget {:.0f} MB, usage {:.0f} MB, "
+										  "non-local {:.0f} MB; thread CPU time {:.0f} cycles/ms, one read {:.0f} ns; stall sampler {}",
+					SessionMinutes(), g_adapterTotalMb, g_adapter12Same ? "the same adapter" : "another adapter", v.budget, v.usage, v.nonLocal,
+					EngineTiming::CyclesPerMs(), EngineTiming::CycleReadCostNs(),
+					globals::features::performanceOverlay.settings.StallSampler ? "on" : "off");
+				g_vram = v;
+				g_vramFrame = 1;
+			}
 		}
 		logger::info("[FrameTrace] Recording {:.0f} s", a_seconds);
 	}
@@ -1610,7 +1772,8 @@ namespace Util::FrameTrace
 		DrainPassLogs(true);  // (46n) before the rows go to the writer thread
 		g_pendingPassGpu.clear();
 		PollReflex();
-		std::thread(WriteCsv, std::move(g_rows), std::move(g_reflex), g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency, g_headerRendering).detach();
+		std::thread(WriteCsv, std::move(g_rows), std::move(g_reflex), g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency, g_headerRendering, g_header46o)
+			.detach();
 		g_rows = {};
 		g_reflex = {};
 	}
@@ -1629,6 +1792,43 @@ namespace Util::FrameTrace
 	}
 
 	Smoothed GetSmoothed() { return g_smoothed; }
+
+	// ---- (46o) sub-timers, out-of-VRAM warnings ----
+
+	void AddSplit(Split a_part, int64_t a_ticks)
+	{
+		if (!g_active)
+			return;
+		float& v = g_frame.split[static_cast<int>(a_part)];
+		v = std::max(v, 0.0f) + static_cast<float>(Ms(a_ticks));
+	}
+
+	Lap::Lap()
+	{
+		if (g_active)
+			t = Now();
+	}
+
+	void Lap::Mark(Split a_part)
+	{
+		if (!t)
+			return;
+		const int64_t n = Now();
+		AddSplit(a_part, n - t);
+		t = n;
+	}
+
+	void Lap::Skip()
+	{
+		if (t)
+			t = Now();
+	}
+
+	void OnOutOfVram()
+	{
+		if (g_recording)
+			g_vramWarn.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	nlohmann::json ToJson()
 	{

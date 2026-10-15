@@ -929,7 +929,15 @@ namespace Hooks
 				const bool timed = Util::FrameTrace::Active();
 				const int64_t t0 = timed ? Util::FrameTrace::Now() : 0;
 				Util::EngineTiming::ScopedSeg sleepSeg(Util::EngineTiming::Seg::Sleep);
-				Util::LatencyPacer::PaceFrameStart(upscaling.IsLatencyPacerEnabled(), upscaling.settings.reflexPacerMarginMs, upscaling.settings.reflexPacerStallFeedback);
+				Util::LatencyPacer::Options pacer;
+				pacer.enabled = upscaling.IsLatencyPacerEnabled();
+				pacer.marginMs = upscaling.settings.reflexPacerMarginMs;
+				pacer.stallFeedback = upscaling.settings.reflexPacerStallFeedback;
+				pacer.hiddenWaits = upscaling.settings.reflexPacerHiddenWaits;  // (46o) F1a
+				pacer.backstop = upscaling.settings.reflexPacerBackstop;        // (46o) F1b
+				if (auto* ui = globals::game::ui)  // (46o) the pacer starts over when these end
+					pacer.paused = ui->GameIsPaused() || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
+				Util::LatencyPacer::PaceFrameStart(pacer);
 				if (timed)
 					Util::FrameTrace::OnPacerSleep(t0);
 			}

@@ -10,6 +10,8 @@
 
 #include <d3d12.h>
 
+#include "Utils/EngineTiming.h"
+
 namespace Util::LatencyPacer
 {
 	namespace
@@ -71,6 +73,75 @@ namespace Util::LatencyPacer
 		uint32_t g_windowFrames = 0, g_windowBehind = 0;
 		double g_windowSleepMs = 0.0, g_windowStallMs = 0.0, g_windowPredMs = 0.0, g_windowLeadMs = 0.0;
 		int64_t g_lastWarn = 0;
+
+		// (46o) F1a "Count Hidden GPU Waits": 46n saw only Map / Flush / GetData. When the pacer stopped sleeping, the CPU's wait
+		// for the GPU moved into untimed D3D11 state calls in the middle of the frame (the world and shadow passes), was counted as
+		// CPU work in the lead, so it slept even less: locked (zig-zag frames, 172633 frames 740-886). The main thread's wait
+		// (wall - thread CPU time, EngineTiming M1) in the render segments up to the submit is a wait too, when the frame started
+		// with the GPU behind. The lead leaves out the larger of it and the 46n stall (not the sum: a blocking Map is in both).
+		// The learned sleep is fed the median of the last 3 frames' waits, so one GPU spike (its wait lands in the next frame's
+		// world pass) teaches nothing.
+		constexpr double kHiddenMinMs = 0.5;  // less is noise (preemption, page faults)
+		bool g_hiddenOn = false;
+		bool g_frameBehind = false;         // this frame started with the GPU behind (in_flight >= 1)
+		float g_lastHiddenMs = -1.0f;       // the last frame's render-segment wait (-1 = not measured)
+		float g_lastWaitMs = 0.0f;          // the last frame's wait left out of its lead
+		std::array<float, 3> g_waitHist{};  // the last three frames' waits
+		size_t g_waitHistHead = 0;
+		// The hidden wait the frame has anyway (job joins, preemption, our RT lanes): p25 of the hidden waits of frames that slept
+		// 1 ms or more at their start (no GPU lock then). Only what is above it counts, so a constant non-GPU wait never grows the
+		// learned sleep.
+		std::array<float, kRing> g_hiddenBase{};
+		size_t g_hiddenBaseCount = 0, g_hiddenBaseHead = 0;
+		float g_hiddenBaseMs = 0.0f;
+		constexpr float kBaseSleepMs = 1.0f;
+
+		// (46o) F1b "Unlock Backstop": 30 frames in a row of no sleep while the GPU is behind and the frame period matches the GPU
+		// period: the reserved lead shrinks 0.5 ms per frame (floor: the lead's p25, at least 2 ms) until the pacer sleeps again.
+		// Then it is handed back slowly (0.1 ms per frame) as the clean lead samples come in; if frames get slower than the GPU
+		// period at the start by over 3 %, it is handed back fast (1 ms per frame) and needs 30 more locked frames to start again.
+		constexpr int kLockFrames = 30;
+		constexpr float kLockSleepMs = 0.5f;
+		constexpr float kPeriodTolerance = 0.03f;
+		constexpr float kBackstopStepMs = 0.5f;
+		constexpr float kBackstopReturnMs = 0.1f;
+		constexpr float kBackstopFastReturnMs = 1.0f;
+		constexpr float kBackstopMaxMs = 15.0f;
+		constexpr float kBackstopFloorMs = 2.0f;
+		int g_lockRun = 0;
+		float g_backstopMs = 0.0f;
+		float g_backstopRef = 0.0f;  // the GPU period when it engaged
+		int64_t g_prevStart = 0;
+		// Frame period (frame start to frame start), the mean of the last 16: zig-zag frames (34 / 24 / 15 ms) average out over whole
+		// cycles, so a locked run is seen as "at the GPU period" and does not trip the "slower" test.
+		constexpr size_t kPeriodRing = 16;
+		std::array<float, kPeriodRing> g_periods{};
+		size_t g_periodCount = 0, g_periodHead = 0;
+		float g_periodMean = -1.0f;
+		bool g_wasPaused = false;
+
+		float Median3(const std::array<float, 3>& a_v)
+		{
+			return std::max(std::min(a_v[0], a_v[1]), std::min(std::max(a_v[0], a_v[1]), a_v[2]));
+		}
+
+		/// (46o) After a pause, a loading screen or the map: the lead samples and everything learned start over.
+		void ResetLearning()
+		{
+			g_leadCount = 0;
+			g_leadHead = 0;
+			g_correctionMs = 0.0f;
+			g_stallFresh = false;
+			g_lastStallMs = 0.0f;
+			g_lastWaitMs = 0.0f;
+			g_waitHist.fill(0.0f);
+			g_backstopMs = 0.0f;
+			g_lockRun = 0;
+			g_periodCount = 0;
+			g_periodMean = -1.0f;
+			g_hiddenBaseCount = 0;
+			g_hiddenBaseMs = 0.0f;
+		}
 
 		void CalibrateTsc(int64_t a_now)
 		{
@@ -205,24 +276,56 @@ namespace Util::LatencyPacer
 		}
 	}
 
-	void PaceFrameStart(bool a_enabled, float a_marginMs, bool a_stallFeedback)
+	void PaceFrameStart(const Options& a_options)
 	{
 		if (!g_qpf) {
 			LARGE_INTEGER f;
 			QueryPerformanceFrequency(&f);
 			g_qpf = f.QuadPart;
 		}
+		const bool a_enabled = a_options.enabled;
+		const float a_marginMs = a_options.marginMs;
+		const bool a_stallFeedback = a_options.stallFeedback;
 		g_mainThread = GetCurrentThreadId();
 		FrameInfo info{};
 		info.enabled = a_enabled;
+		g_hiddenOn = a_options.hiddenWaits;
+		EngineTiming::SetPacerWaitTracking(a_options.hiddenWaits && a_enabled);
 
 		const int64_t start = Now();
 		CalibrateTsc(start);
+		// (46o) After a pause / loading screen / the map, with either 46o switch on (off / off = 46n exactly).
+		if (a_options.hiddenWaits || a_options.backstop) {
+			if (a_options.paused) {
+				g_wasPaused = true;
+			} else if (g_wasPaused) {
+				g_wasPaused = false;
+				ResetLearning();
+				info.reset = true;
+			}
+			if (g_prevStart) {
+				const float p = static_cast<float>(ToMs(start - g_prevStart));
+				if (p > 0.0f && p < 250.0f && !a_options.paused) {
+					g_periods[g_periodHead] = p;
+					g_periodHead = (g_periodHead + 1) % kPeriodRing;
+					g_periodCount = std::min(g_periodCount + 1, kPeriodRing);
+				} else {
+					g_periodCount = 0;
+				}
+				float sum = 0.0f;
+				for (size_t i = 0; i < g_periodCount; ++i)
+					sum += g_periods[i];
+				g_periodMean = g_periodCount >= 8 ? sum / static_cast<float>(g_periodCount) : -1.0f;
+			}
+		}
+		g_prevStart = start;
 		// (46n) Stall feedback: the last frame's wait inside D3D11 grows the learned frame-start sleep, a frame without one shrinks it.
 		if (g_stallFresh) {
 			g_stallFresh = false;
-			if (a_stallFeedback && g_lastStallMs >= kStallThresholdMs)
-				g_correctionMs = std::min(g_correctionMs + kStallGain * g_lastStallMs, kMaxCorrectionMs);
+			// (46o) F1a: the median of the last three frames' waits (46n stall or hidden wait, the larger).
+			const float wait = a_options.hiddenWaits ? Median3(g_waitHist) : g_lastStallMs;
+			if (a_stallFeedback && wait >= kStallThresholdMs)
+				g_correctionMs = std::min(g_correctionMs + kStallGain * wait, kMaxCorrectionMs);
 			else
 				g_correctionMs = std::max(g_correctionMs - kStallDecayMs, 0.0f);
 		}
@@ -230,6 +333,9 @@ namespace Util::LatencyPacer
 			g_correctionMs = 0.0f;
 		info.stallMs = g_lastStallMs;
 		info.correctionMs = g_correctionMs;
+		info.hiddenWaitMs = g_lastHiddenMs;
+		info.waitUsedMs = g_lastWaitMs;
+		info.hiddenBaseMs = g_hiddenBaseMs;
 		int pending = 0;
 		uint64_t secondNewest = 0;
 		int64_t lastDone = 0;
@@ -247,21 +353,48 @@ namespace Util::LatencyPacer
 			fence = g_fence;
 		}
 		if (!info.tracking) {
+			g_frameBehind = false;
 			g_last = info;
 			UpdateGuard(info, start);
 			return;
 		}
 		info.inFlight = pending;
 		info.gpuPeriodMs = period;
+		g_frameBehind = pending >= 1;  // (46o) F1a counts this frame's hidden wait only then
 		const float lead = g_leadCount >= kMinSamples ? Quantile(g_leads, g_leadCount, 0.75f) : -1.0f;
 		info.leadMs = lead;
+		// (46o) F1b: the unlock backstop (decided on the last frame's sleep and GPU state).
+		float leadUsed = lead;
+		if (a_options.backstop && a_enabled && lead >= 0.0f && !a_options.paused) {
+			const bool locked = g_last.tracking && g_last.sleepMs < kLockSleepMs && g_last.inFlight >= 1 && period > 0.0f && g_periodMean > 0.0f &&
+			                    std::abs(g_periodMean - period) <= kPeriodTolerance * period;
+			g_lockRun = locked ? g_lockRun + 1 : 0;
+			if (g_lockRun == kLockFrames)
+				g_backstopRef = period;
+			const bool slower = g_backstopMs > 0.0f && g_backstopRef > 0.0f && g_periodMean > g_backstopRef * (1.0f + kPeriodTolerance);
+			if (slower) {
+				g_lockRun = 0;
+				g_backstopMs = std::max(g_backstopMs - kBackstopFastReturnMs, 0.0f);
+			} else if (g_lockRun >= kLockFrames) {
+				g_backstopMs = std::min(g_backstopMs + kBackstopStepMs, kBackstopMaxMs);
+			} else {
+				g_backstopMs = std::max(g_backstopMs - kBackstopReturnMs, 0.0f);
+			}
+			const float floor = std::max(Quantile(g_leads, g_leadCount, 0.25f), kBackstopFloorMs);
+			g_backstopMs = std::min(g_backstopMs, std::max(lead - floor, 0.0f));
+			leadUsed = lead - g_backstopMs;
+		} else {
+			g_backstopMs = 0.0f;
+			g_lockRun = 0;
+		}
+		info.backstopMs = g_backstopMs;
 
 		if (pending > 0 && lastDone != 0 && period > 0.0f) {
 			// The previous frame finishes about `pending` GPU periods after the last completion.
 			const int64_t predicted = lastDone + static_cast<int64_t>(static_cast<double>(period) * pending * static_cast<double>(g_qpf) / 1000.0);
 			info.predictedMs = static_cast<float>(std::max(0.0, ToMs(predicted - start)));
 			if (a_enabled && lead >= 0.0f) {
-				const double reserveMs = static_cast<double>(lead) + static_cast<double>(a_marginMs);
+				const double reserveMs = static_cast<double>(leadUsed) + static_cast<double>(a_marginMs);
 				// (46n) Plus the learned wait (only while the GPU is behind: pending > 0 here).
 				const double sleepMs = std::min(std::max(ToMs(predicted - start) - reserveMs, 0.0) + static_cast<double>(g_correctionMs), kMaxSleepMs);
 				if (sleepMs > 0.2) {
@@ -331,10 +464,26 @@ namespace Util::LatencyPacer
 			return;
 		// (46n) The waits inside D3D11 are not CPU work the pacer has to keep in hand.
 		const float stall = static_cast<float>(g_stallMs);
+		// (46o) F1a: the render segments' wait so far (measured whenever it is tracked: the F7 trace shows it with F1a off too).
+		const double hidden = EngineTiming::RenderWaitMsSoFar();
+		float wait = stall;
+		if (hidden >= 0.0 && g_last.sleepMs >= kBaseSleepMs) {
+			g_hiddenBase[g_hiddenBaseHead] = static_cast<float>(hidden);
+			g_hiddenBaseHead = (g_hiddenBaseHead + 1) % kRing;
+			g_hiddenBaseCount = std::min(g_hiddenBaseCount + 1, kRing);
+			g_hiddenBaseMs = g_hiddenBaseCount >= kMinSamples ? Quantile(g_hiddenBase, g_hiddenBaseCount, 0.25f) : 0.0f;
+		}
+		const double extra = hidden - static_cast<double>(g_hiddenBaseMs);
+		if (g_hiddenOn && hidden >= 0.0 && extra >= kHiddenMinMs && g_frameBehind)
+			wait = std::max(wait, static_cast<float>(extra));
+		g_lastHiddenMs = static_cast<float>(hidden);
+		g_lastWaitMs = wait;
+		g_waitHist[g_waitHistHead] = wait;
+		g_waitHistHead = (g_waitHistHead + 1) % g_waitHist.size();
 		g_lastStallMs = stall;
 		g_stallFresh = true;
 		g_stallMs = 0.0;
-		const float ms = static_cast<float>(ToMs(Now() - g_simStart)) - stall;
+		const float ms = static_cast<float>(ToMs(Now() - g_simStart)) - wait;
 		g_simStart = 0;
 		if (ms <= 0.0f || ms > 250.0f)
 			return;

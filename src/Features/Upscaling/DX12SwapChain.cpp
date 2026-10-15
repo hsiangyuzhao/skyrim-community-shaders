@@ -237,6 +237,7 @@ HRESULT DX12SwapChain::GetBuffer(void** ppSurface)
 
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
+	Util::FrameTrace::Lap lap;  // (46o) M5: the Present split (recording / overlay only)
 	auto& upscaling = globals::features::upscaling;
 	auto* ui = globals::game::ui;
 	const bool mapMenuOpen = ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
@@ -262,6 +263,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		frameIndex = swapChain->GetCurrentBackBufferIndex();
 	}
 
+	lap.Mark(Util::FrameTrace::Split::PresentFg);
 	// (batch 43) Native HDR: the last D3D11 work of the frame, after every Present hook has drawn.
 	// Returns the HDR10 image to show instead of the back buffer, or nullptr.
 	ID3D12Resource* hdrSource = HDROutput::CompositeForPresent();
@@ -269,10 +271,12 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (auto* finalImage = hdrSource ? (hdrOutputWrapped ? hdrOutputWrapped->resource11 : nullptr) : (swapChainBufferWrapped ? swapChainBufferWrapped->resource11 : nullptr))
 		Util::Screenshot::OnFinalImage(finalImage, hdrSource != nullptr);
 
+	lap.Mark(Util::FrameTrace::Split::PresentHdr);
 	// Wait for D3D11 to finish
 	// (45m) The frame's D3D11 work is all handed over here: the end of the CPU span the pacer reserves.
 	Util::LatencyPacer::OnD3D11Submitted();
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
+	lap.Mark(Util::FrameTrace::Split::PresentSignal11);
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
 	fenceValue++;
 
@@ -351,6 +355,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 	if (markLatency)
 		upscaling.streamline.SetPCLMarker(sl::PCLMarker::eRenderSubmitEnd);
+	lap.Mark(Util::FrameTrace::Split::PresentCopy);
 
 	// Present the frame
 	if (markLatency)
@@ -376,7 +381,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			WndProcPseudoHandleFix::ProbePresentHooks(native, "D3D12 native (below Streamline)");
 	}
 
+	lap.Skip();
 	const auto presentResult = swapChain->Present(SyncInterval, Flags);
+	lap.Mark(Util::FrameTrace::Split::PresentSl);
 	if (markLatency)
 		upscaling.streamline.SetPCLMarker(sl::PCLMarker::ePresentEnd);
 	if (upscaling.IsDLSSGBackend()) {
@@ -442,6 +449,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// If VSync is disabled, use frame limiter to prevent tearing and optimise pacing
 	if (SyncInterval == 0)
 		upscaling.FrameLimiter();
+	lap.Mark(Util::FrameTrace::Split::PresentPost);
 
 	return S_OK;
 }

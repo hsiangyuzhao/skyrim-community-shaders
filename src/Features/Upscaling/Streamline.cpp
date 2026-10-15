@@ -7,6 +7,7 @@
 #include "../../Hooks.h"
 #include "../../State.h"
 #include "../../Util.h"
+#include "Utils/FrameTrace.h"
 #include "../RenderDoc.h"
 #include "../Upscaling.h"
 #include "DX12SwapChain.h"
@@ -1179,8 +1180,10 @@ void Streamline::Upscale(ID3D12Resource* a_inputColorTexture,
 	ID3D12Resource* a_outputTexture,
 	ID3D12GraphicsCommandList* a_commandList)
 {
+	Util::FrameTrace::Lap lap;  // (46o) sl_setopts / sl_evaluate
 	CheckFrameConstants();
 	SetDLSSOptions();
+	lap.Mark(Util::FrameTrace::Split::SlSetOpts);
 	if (!frameConstantsValid || frameToken == nullptr) {
 		logger::error("[Streamline] Cannot evaluate DLSS SR without constants and a frame token");
 		return;
@@ -1220,6 +1223,9 @@ void Streamline::Upscale(ID3D12Resource* a_inputColorTexture,
 			&transparencyCompositionMaskTag
 		};
 		const auto result = slEvaluateFeature(sl::kFeatureDLSS, *frameToken, inputs, _countof(inputs), a_commandList);
+		lap.Mark(Util::FrameTrace::Split::SlEvaluate);
+		if (result == sl::Result::eWarnOutOfVRAM)  // (46o) M3: the evaluation ran; the VRAM budget is used up
+			Util::FrameTrace::OnOutOfVram();
 		if (result != sl::Result::eOk) {
 			logger::error("[Streamline] DLSS SR local-tag evaluation failed ({})", magic_enum::enum_name(result));
 			return;
@@ -1242,8 +1248,12 @@ void Streamline::Upscale(ID3D12Resource* a_inputColorTexture,
 		return;
 	}
 	const sl::BaseStructure* inputs[] = { &view };
-	if (SL_FAILED(result, slEvaluateFeature(sl::kFeatureDLSS, *frameToken, inputs, _countof(inputs), a_commandList)))
-		logger::error("[Streamline] DLSS SR evaluation failed ({})", magic_enum::enum_name(result));
+	const auto evalResult = slEvaluateFeature(sl::kFeatureDLSS, *frameToken, inputs, _countof(inputs), a_commandList);
+	lap.Mark(Util::FrameTrace::Split::SlEvaluate);
+	if (evalResult == sl::Result::eWarnOutOfVRAM)  // (46o) M3
+		Util::FrameTrace::OnOutOfVram();
+	if (evalResult != sl::Result::eOk)
+		logger::error("[Streamline] DLSS SR evaluation failed ({})", magic_enum::enum_name(evalResult));
 }
 
 void Streamline::SetDLSSRROptions()
@@ -1333,6 +1343,7 @@ void Streamline::RayReconstruction(ID3D12Resource* a_inputColorTexture,
 
 	logger::debug("[DLSS RR] Starting Ray Reconstruction");
 
+	Util::FrameTrace::Lap lap;  // (46o) sl_setopts / sl_evaluate
 	CheckFrameConstants();
 	logger::debug("[DLSS RR] Frame constants set");
 	if (!frameConstantsValid || frameToken == nullptr) {
@@ -1341,6 +1352,7 @@ void Streamline::RayReconstruction(ID3D12Resource* a_inputColorTexture,
 	}
 	SetDLSSRROptions();
 	logger::debug("[DLSS RR] DLSS RR options set");
+	lap.Mark(Util::FrameTrace::Split::SlSetOpts);
 
 	auto state = globals::state;
 
@@ -1388,6 +1400,9 @@ void Streamline::RayReconstruction(ID3D12Resource* a_inputColorTexture,
 			&sssGuideTag
 		};
 		const auto result = slEvaluateFeature(sl::kFeatureDLSS_RR, *frameToken, inputs, _countof(inputs), a_commandList);
+		lap.Mark(Util::FrameTrace::Split::SlEvaluate);
+		if (result == sl::Result::eWarnOutOfVRAM)  // (46o) M3
+			Util::FrameTrace::OnOutOfVram();
 		if (result != sl::Result::eOk) {
 			logger::error("[DLSS RR] Local-tag evaluation failed ({})", magic_enum::enum_name(result));
 			return;
@@ -1410,8 +1425,12 @@ void Streamline::RayReconstruction(ID3D12Resource* a_inputColorTexture,
 		return;
 	}
 	const sl::BaseStructure* inputs[] = { &view };
-	if (SL_FAILED(result, slEvaluateFeature(sl::kFeatureDLSS_RR, *frameToken, inputs, _countof(inputs), a_commandList))) {
-		logger::error("[DLSS RR] Failed to evaluate DLSS RR feature, error code: {}", (int)result);
+	const auto evalResult = slEvaluateFeature(sl::kFeatureDLSS_RR, *frameToken, inputs, _countof(inputs), a_commandList);
+	lap.Mark(Util::FrameTrace::Split::SlEvaluate);
+	if (evalResult == sl::Result::eWarnOutOfVRAM)  // (46o) M3
+		Util::FrameTrace::OnOutOfVram();
+	if (evalResult != sl::Result::eOk) {
+		logger::error("[DLSS RR] Failed to evaluate DLSS RR feature, error code: {}", (int)evalResult);
 		return;
 	}
 	logger::debug("[DLSS RR] slEvaluateFeature executed successfully, output texture updated");
