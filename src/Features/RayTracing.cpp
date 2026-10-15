@@ -625,6 +625,7 @@ void RayTracing::UpdatePhase()
 		fade = 0.0f;
 		beamGuards.clear();  // light pointers of the place left behind
 		excludedBeams.clear();
+		pointSelector.ForgetHistory();  // (46s) per-light positions / groups of the place left behind
 		scene.SetHold(true);
 		for (auto& entry : transitionLog)
 			entry = {};
@@ -1186,6 +1187,9 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.GroupGraceMs = std::clamp(read("GroupGraceMs", defaults.GroupGraceMs), 0.0f, 10000.0f);
 		settings.CarrierShadows = read("CarrierShadows", defaults.CarrierShadows);
 		settings.CarrierClearance = std::clamp(read("CarrierClearance", defaults.CarrierClearance), 0.0f, 64.0f);
+		settings.PointLightsSteady = read("PointLightsSteady", defaults.PointLightsSteady);  // (46s)
+		settings.PointLightsMergeHysteresis = read("PointLightsMergeHysteresis", defaults.PointLightsMergeHysteresis);
+		settings.PointLightsMeshless = std::clamp(read("PointLightsMeshless", defaults.PointLightsMeshless), 0, 2);
 	}
 	// (46o) Window Beam Guard: off once for settings saved before 46o (its rule misfired on beams that mostly hit walls).
 	if (loadedVersion < 6 && settings.PointLightsBeamGuard) {
@@ -1249,6 +1253,9 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["GroupGraceMs"] = settings.GroupGraceMs;
 	o_json["CarrierShadows"] = settings.CarrierShadows;
 	o_json["CarrierClearance"] = settings.CarrierClearance;
+	o_json["PointLightsSteady"] = settings.PointLightsSteady;  // (46s)
+	o_json["PointLightsMergeHysteresis"] = settings.PointLightsMergeHysteresis;
+	o_json["PointLightsMeshless"] = settings.PointLightsMeshless;
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -3432,6 +3439,20 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	config.player = settings.PointLightsPlayer;
 	config.effects = settings.PointLightsEffects;
 	config.stable = settings.PointLightsStable;  // (46g)
+	// (46s)
+	config.steady = settings.PointLightsSteady;
+	config.mergeHysteresis = settings.PointLightsMergeHysteresis;
+	config.meshless = static_cast<std::uint32_t>(std::clamp(settings.PointLightsMeshless, 0, 2));
+	double reachPoint[3]{};
+	if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+		const auto p = player->GetPosition();
+		if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
+			reachPoint[0] = p.x;
+			reachPoint[1] = p.y;
+			reachPoint[2] = p.z + 64.0;  // about the chest
+			config.reachPoint = reachPoint;
+		}
+	}
 	UpdateBeamGuard();
 	config.excludedBeams = settings.PointLightsBeamGuard && !excludedBeams.empty() ? &excludedBeams : nullptr;
 	config.forced = a_interior && !skippedLights.empty() ? &skippedLights : nullptr;
@@ -4688,6 +4709,31 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("On (default): flickering candles and lights whose range changes do not make an area jump between the ray-traced");
 				ImGui::Text("  shadow and the old one. Off: the lights are picked again every frame.");
 			}
+			// (46s)
+			ImGui::Checkbox("Steady Flickering Lights", &settings.PointLightsSteady);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the game wobbles flickering torches and fires around their spot (up to about half a metre). Their ray-traced");
+				ImGui::Text("  shadows now come from the light's resting spot, so shadows stop swaying (the lighting itself still flickers as before).");
+				ImGui::Text("  Only for lights fixed in the world; carried torches, your own lights and spells follow their light as before.");
+				ImGui::Text("Off: shadows follow the wobbling light (46r).");
+			}
+			ImGui::Checkbox("Merge Hysteresis", &settings.PointLightsMergeHysteresis);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): two lights close together that share one shadow keep sharing it until they are clearly apart,");
+				ImGui::Text("  so the shadow does not jump between one and two sources. Off: decided again every frame (46r).");
+			}
+			{
+				const char* kMeshless[3] = { "Own", "Snap", "Skip" };
+				settings.PointLightsMeshless = std::clamp(settings.PointLightsMeshless, 0, 2);
+				ImGui::Combo("Meshless Lights Near Fires", &settings.PointLightsMeshless, kMeshless, 3);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Some of the game's \"torch\" lights have no torch: an invisible light placed near braziers and fires.");
+					ImGui::Text("  Own (46r): it casts its own shadow, from a point where nothing burns (an extra shadow between two braziers).");
+					ImGui::Text("  Snap (default): its shadow comes from the nearest visible fire or lamp within about 4.5 m; none in range, or a torch");
+				ImGui::Text("    holder / candle right next to it (then it is that fixture's light): its own.");
+					ImGui::Text("  Skip: it casts no ray-traced shadow (the old screen-space shadow, if any).");
+				}
+			}
 			ImGui::Checkbox("Keep Screen-Space Contact Shadows", &settings.PointLightsKeepSSPLS);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
 				ImGui::Text("Off (default): Screen Space Point Light Shadows are skipped for ray-traced lights.");
@@ -4810,6 +4856,26 @@ void RayTracing::DrawPointLightPage()
 					ImGui::Text("Left out this frame: %s", reasons.empty() ? "none" : reasons.c_str());
 					ImGui::Text("Not classified yet (asked again next frame): %u; classifier cache %u lights, %llu read so far; new slots this frame %u",
 						ps.pending, Util::LightCensus::ClassifierCacheSize(), static_cast<unsigned long long>(Util::LightCensus::ClassifierReads()), ps.slotChanges);
+				}
+				// (46s)
+				ImGui::Text("Steady positions: %u at the rest point, %u averaged; merge kept %u; meshless lights: %u snapped, %u own, %u skipped",
+					ps.steadyParent, ps.steadyAverage, ps.mergeKept, ps.snapped, ps.meshlessOwn, ps.meshlessSkipped);
+				const auto& reach = pointSelector.Reaching();
+				if (!pointThisFrame || reach.empty()) {
+					ImGui::Text("Lights reaching the player: none traced");
+				} else {
+					ImGui::Text("Lights reaching the player (%u):", static_cast<unsigned>(reach.size()));
+					for (const auto& e : reach) {
+						static constexpr const char* kKinds[3] = { "world", "player's", "spell / effect" };
+						ImGui::Text("  #%u %s %s \"%s\": %.0f of %.0f units away%s%s%s", e.slot, kKinds[std::min<std::uint32_t>(e.kind, 2u)],
+							Util::LightCensus::CategoryName(static_cast<Util::LightCensus::Category>(e.category)), e.label[0] ? e.label : "?", e.distance, e.radius,
+							e.members > 1 ? std::format(", {} lights{}", e.members, e.snapped ? std::format(" ({} snapped)", e.snapped) : std::string()).c_str() : "",
+							e.native ? ", game shadow light" : "", e.steady ? ", steady" : "");
+					}
+				}
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Ray-traced shadow sources whose light range covers you this frame (#slot, kind, census category, name of its brightest light).");
+					ImGui::Text("A shadow on you comes from one of these, or from a light that is not ray traced. An F6 census records the same list.");
 				}
 			} else {
 				ImGui::TextDisabled("Not tracing point lights right now.");
@@ -5374,7 +5440,26 @@ std::string RayTracing::DescribeForProfile() const
 						"carrier casts shadows {} (clearance {:.0f})",
 		settings.SubmitWorker ? "on" : "off", backend.SubmitWorkerInEffect() ? "on" : "off", settings.BuildGpuBudget ? "on" : "off", settings.BuildGpuBudgetMs,
 		settings.GroupBuildsPerFrame, settings.GroupGraceMs, settings.CarrierShadows ? "on" : "off", settings.CarrierClearance);
+	// (46s)
+	static constexpr const char* kMeshless[3] = { "own", "snap", "skip" };
+	text += std::format(", steady flickering lights {}, merge hysteresis {}, meshless lights near fires {}", settings.PointLightsSteady ? "on" : "off",
+		settings.PointLightsMergeHysteresis ? "on" : "off", kMeshless[std::clamp(settings.PointLightsMeshless, 0, 2)]);
 	return text;
+}
+
+nlohmann::json RayTracing::PointSourcesReachingPlayerJson() const
+{
+	auto j = nlohmann::json::array();
+	if (!pointThisFrame)
+		return j;
+	static constexpr const char* kKinds[3] = { "world", "player", "effect" };
+	for (const auto& e : pointSelector.Reaching()) {
+		j.push_back({ { "slot", e.slot }, { "kind", kKinds[std::min<std::uint32_t>(e.kind, 2u)] },
+			{ "category", Util::LightCensus::CategoryName(static_cast<Util::LightCensus::Category>(e.category)) }, { "name", std::string(e.label) },
+			{ "distance", std::round(e.distance) }, { "radius", std::round(e.radius) }, { "intensity", e.intensity }, { "lights", e.members },
+			{ "snapped", e.snapped }, { "native", e.native }, { "spot", e.spot }, { "steady", e.steady } });
+	}
+	return j;
 }
 
 nlohmann::json RayTracing::DescribeJson() const

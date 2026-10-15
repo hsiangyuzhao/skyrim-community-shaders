@@ -206,6 +206,13 @@ public:
 		float GroupGraceMs = 2000.0f;
 		bool CarrierShadows = true;
 		float CarrierClearance = 28.0f;
+		// (46s) Outside the settings macro too. Steady Flickering Lights: static world lights' shadows come from their rest point
+		// instead of the engine's flicker-jittered position (off = 46r). Merge Hysteresis: a light merged into another's source stays
+		// there up to 1.5 x the merge distance (off = 46r). Meshless Lights Near Fires: placed lights without a mesh named like a
+		// fixture (vanilla "torch" lights at no visible fire) -- 0 Own (46r), 1 Snap to the nearest visible fixture's source, 2 Skip.
+		bool PointLightsSteady = true;
+		bool PointLightsMergeHysteresis = true;
+		int PointLightsMeshless = 1;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -289,6 +296,8 @@ public:
 	/// (46b) Light Limit Fix, for each light it uploads: the ray-traced shadow tag (LightData::rtShadow), 0 unless
 	/// this frame's trace has a shadow source for the light.
 	[[nodiscard]] std::uint32_t PointLightTag(const RE::BSLight* a_light) const { return pointSelector.TagFor(a_light); }
+	/// (46s) Light Census: this frame's point-light shadow sources whose range covers the player (render thread).
+	nlohmann::json PointSourcesReachingPlayerJson() const;
 
 	/// True when this frame's shadow mask is (being) ray traced.
 	[[nodiscard]] bool IsActiveThisFrame() const { return activeThisFrame; }

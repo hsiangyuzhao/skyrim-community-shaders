@@ -46,6 +46,10 @@ namespace RayTracingPointLights
 			bool spotFromCamera = false;
 			float dir[3]{}, right[3]{}, up[3]{};
 			float semiWidth = 0.0f, semiHeight = 0.0f, falloff = 1.0f;
+			// (46s) Steady position: the light's local offset (the engine's flicker moves it) and its parent node's world position.
+			float local[3]{};
+			float parentPos[3]{};
+			bool hasParent = false;
 		};
 
 		bool Normalize3(float (&v)[3])
@@ -128,6 +132,18 @@ namespace RayTracingPointLights
 			o.pos[0] = p.x;
 			o.pos[1] = p.y;
 			o.pos[2] = p.z;
+			// (46s) Flicker moves the light's local translate around its rest point (a placed light's root node, a Light Placer node).
+			const auto& l = niLight->local.translate;
+			o.local[0] = l.x;
+			o.local[1] = l.y;
+			o.local[2] = l.z;
+			if (const auto* parent = niLight->parent) {
+				const auto& pp = parent->world.translate;
+				o.parentPos[0] = pp.x;
+				o.parentPos[1] = pp.y;
+				o.parentPos[2] = pp.z;
+				o.hasParent = std::isfinite(pp.x) && std::isfinite(pp.y) && std::isfinite(pp.z) && std::isfinite(l.x) && std::isfinite(l.y) && std::isfinite(l.z);
+			}
 			// Light Limit Fix's own test (UpdateLights): an active shadow slot, some colour, some radius.
 			o.used = o.shadowIndex != 255 && (o.color[0] + o.color[1] + o.color[2]) * o.fade > 1e-4f && o.radius > 1e-4f;
 		}
@@ -190,7 +206,27 @@ namespace RayTracingPointLights
 			bool beam;   // (46c) a window beam
 			std::uint8_t kind;  // (46d) 0 world light, 1 the player's, 2 spell / effect
 			std::uint32_t owner;  // (46e) key of the traced character carrying it (0 = none)
+			// (46s)
+			Util::LightCensus::Category category;
+			Util::LightCensus::Traits traits;
+			void* hist;            // Selector::History of the light (null = none)
+			bool steady;           // pos is the steady position
+			bool meshless;         // a meshless placed light named like a fixture (Config::meshless applies)
+			std::uint32_t anchor;  // Snap: index (sorted order) of the visible fixture it is tagged to (UINT32_MAX = none)
 		};
+
+		/// (46s) Categories of static world lights (Steady Flickering Lights): the rest move with someone or are not traced.
+		bool SteadyCategory(Util::LightCensus::Category a_category)
+		{
+			using C = Util::LightCensus::Category;
+			return a_category == C::Fixture || a_category == C::Standalone || a_category == C::MeshAttached || a_category == C::FixtureShadow;
+		}
+
+		double DistSq(const double a[3], const double b[3])
+		{
+			const double x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+			return x * x + y * y + z * z;
+		}
 
 		struct Group
 		{
@@ -248,6 +284,7 @@ namespace RayTracingPointLights
 		tags_.clear();
 		maskEntries_.clear();
 		history_.clear();  // (46g)
+		reach_.clear();    // (46s)
 		published_ = false;
 	}
 
@@ -266,8 +303,33 @@ namespace RayTracingPointLights
 		published_ = false;
 		tags_.clear();
 		maskEntries_.clear();
+		reach_.clear();  // (46s)
 		stats_ = {};
 		std::fill_n(o_sources, kMaxSources, GpuSource{});
+
+		// (46s) Steady Flickering Lights: the light's rest point (its parent node) when its local offset is within the LIGH's flicker
+		// movement (2 x amplitude + 1); else an average of its position (EMA 0.05 per frame, snapping on a jump over 128 units).
+		const auto updateSteady = [a_frame](History& h, const LightRead& r, const Util::LightCensus::Traits& t) {
+			const double limit = 2.0 * static_cast<double>(t.moveAmplitude) + 1.0;
+			const double local2 = static_cast<double>(r.local[0]) * r.local[0] + static_cast<double>(r.local[1]) * r.local[1] +
+			                      static_cast<double>(r.local[2]) * r.local[2];
+			if (r.hasParent && local2 <= limit * limit) {
+				for (int k = 0; k < 3; ++k)
+					h.steady[k] = r.parentPos[k];
+				h.steadyParent = true;
+			} else {
+				const double raw[3] = { r.pos[0], r.pos[1], r.pos[2] };
+				if (!h.steadyValid || DistSq(raw, h.steady) > 128.0 * 128.0) {
+					std::copy_n(raw, 3, h.steady);
+				} else {
+					for (int k = 0; k < 3; ++k)
+						h.steady[k] += (raw[k] - h.steady[k]) * 0.05;
+				}
+				h.steadyParent = false;
+			}
+			h.steadyValid = true;
+			h.steadyFrame = a_frame;
+		};
 
 		auto* smState = globals::game::smState;
 		auto* node = smState ? smState->shadowSceneNode[0] : nullptr;
@@ -367,8 +429,18 @@ namespace RayTracingPointLights
 			const float rawIntensity = std::max({ r.color[0], r.color[1], r.color[2] }) * r.fade;
 			float smoothIntensity = rawIntensity;
 			bool wasTagged = false;
-			if (a_config.stable && !beam) {
-				auto& h = history_[light];
+			// (46s) The per-light history serves the stable selection, the steady position, the merge hysteresis and the snap.
+			History* hist = nullptr;
+			if (!beam && (a_config.stable || a_config.steady || a_config.mergeHysteresis || a_config.meshless == kMeshlessSnap)) {
+				hist = &history_[light];
+				if (hist->niLight != r.niLight) {
+					*hist = History{};  // a new light at the address of an old one
+					hist->niLight = r.niLight;
+				}
+				hist->seen = a_frame;
+			}
+			if (a_config.stable && hist) {
+				auto& h = *hist;
 				if (h.frame == 0 || a_frame - h.frame > 30u) {
 					h.intensity = rawIntensity;
 					h.radius = r.radius;
@@ -384,6 +456,10 @@ namespace RayTracingPointLights
 				r.radius = h.radius;
 				r.invRadius = 1.0f / std::max(r.radius, 1.0f);
 			}
+			// (46s) The position the rules test: last frame's steady position while there is one (this frame's comes with the category).
+			double pos[3] = { r.pos[0], r.pos[1], r.pos[2] };
+			if (a_config.steady && hist && hist->steadyValid && a_frame - hist->steadyFrame <= 2u)
+				std::copy_n(hist->steady, 3, pos);
 			const float cutScale = wasTagged ? 0.8f : 1.0f;
 			const bool limits = !forced && !beam;
 			if (limits && r.lodDimmer < a_config.minLodDimmer) {
@@ -400,13 +476,13 @@ namespace RayTracingPointLights
 				++stats_.byReason[kRejectIntensity];
 				continue;
 			}
-			const double dx = r.pos[0] - a_camera[0], dy = r.pos[1] - a_camera[1], dz = r.pos[2] - a_camera[2];
+			const double dx = pos[0] - a_camera[0], dy = pos[1] - a_camera[1], dz = pos[2] - a_camera[2];
 			const double distSq = dx * dx + dy * dy + dz * dz;
 			if (limits && distSq > maxDistSq) {
 				++stats_.byReason[kRejectDistance];
 				continue;
 			}
-			if (limits && (r.pos[0] < a_rect[0] || r.pos[1] < a_rect[1] || r.pos[0] > a_rect[2] || r.pos[1] > a_rect[3])) {
+			if (limits && (pos[0] < a_rect[0] || pos[1] < a_rect[1] || pos[0] > a_rect[2] || pos[1] > a_rect[3])) {
 				++stats_.byReason[kRejectOutside];
 				continue;
 			}
@@ -429,7 +505,8 @@ namespace RayTracingPointLights
 			// the filters above leave only lit fixtures near the camera).
 			const bool native = r.shadow;
 			bool include = false;
-			if (!classified && !Util::LightCensus::ClassifyCached(light, r.radius, a_frame, classifyBudget, category)) {
+			Util::LightCensus::Traits traits;
+			if (!classified && !Util::LightCensus::ClassifyCached(light, r.radius, a_frame, classifyBudget, category, &traits)) {
 				if (!forced) {
 					++stats_.pending;
 					continue;
@@ -453,21 +530,18 @@ namespace RayTracingPointLights
 			}
 			Candidate c;
 			c.light = light;
-			c.pos[0] = r.pos[0];
-			c.pos[1] = r.pos[1];
-			c.pos[2] = r.pos[2];
 			c.read = r;
 			c.intensity = intensity;
-			// Screen influence: brightness x the light sphere's share of the view (capped where it fills it).
-			const float dist = static_cast<float>(std::sqrt(distSq));
-			const float cover = r.radius / std::max(dist, 1.0f);
-			c.score = intensity * std::min(cover * cover, 4.0f);
-			if (forced)
-				c.score = FLT_MAX;  // never capped
 			c.native = native;
 			c.spot = spot;
 			c.beam = beam;
 			c.kind = (forced || beam) ? 0 : (category == C::Player ? 1 : (category == C::Effect ? 2 : 0));
+			c.category = category;
+			c.traits = traits;
+			c.hist = hist;
+			c.steady = false;
+			c.meshless = false;
+			c.anchor = UINT32_MAX;
 			// (46e) Carried by a traced character (an NPC's torch): its rays do not test that character (the player's own
 			// lights skip the player's body through kSourceNoPlayer already).
 			c.owner = 0;
@@ -485,6 +559,30 @@ namespace RayTracingPointLights
 				if (player && it != a_config.owners->end() && it->first == player)
 					c.owner = it->second;
 			}
+			// (46s) Meshless placed lights named like a fixture (a vanilla "torch" light that is at no visible fire).
+			c.meshless = traits.meshlessNamedFixture && !native && !forced && !spot && category == C::Fixture && c.kind == 0 && c.owner == 0;
+			if (c.meshless && a_config.meshless == kMeshlessSkip) {
+				++stats_.meshlessSkipped;
+				++stats_.byReason[kRejectCategory];
+				continue;
+			}
+			// (46s) Steady Flickering Lights: static world lights take their steady position.
+			if (a_config.steady && hist && !spot && !beam && c.kind == 0 && c.owner == 0 && SteadyCategory(category)) {
+				updateSteady(*hist, r, traits);
+				std::copy_n(hist->steady, 3, pos);
+				c.steady = true;
+				stats_.steadyParent += hist->steadyParent ? 1 : 0;
+				stats_.steadyAverage += hist->steadyParent ? 0 : 1;
+			} else if (hist) {
+				hist->steadyValid = false;
+			}
+			std::copy_n(pos, 3, c.pos);
+			// Screen influence: brightness x the light sphere's share of the view (capped where it fills it).
+			const float dist = static_cast<float>(std::sqrt(DistSq(pos, a_camera)));
+			const float cover = r.radius / std::max(dist, 1.0f);
+			c.score = intensity * std::min(cover * cover, 4.0f);
+			if (forced)
+				c.score = FLT_MAX;  // never capped
 			if (wasTagged && (r.radius < a_config.minRadius || intensityBeforeFade < a_config.minIntensity))
 				++stats_.kept;
 			candidates.push_back(c);
@@ -500,11 +598,82 @@ namespace RayTracingPointLights
 		});
 		const double mergeSq = static_cast<double>(a_config.mergeDistance) * a_config.mergeDistance;
 		memberGroup.assign(candidates.size(), UINT32_MAX);
+
+		// (46s) Snap: a meshless light named like a fixture takes the source of the nearest visible fixture (Light Placer, a light in a
+		// fixture's model, a LIGH with a mesh) within the snap distance; last frame's choice is kept while it stays within 1.25 x.
+		if (a_config.meshless == kMeshlessSnap) {
+			const double snapSq = static_cast<double>(a_config.snapDistance) * a_config.snapDistance;
+			const double keepSq = snapSq * 1.5625;
+			const auto anchorable = [](const Candidate& a) {
+				return a.traits.visibleFixture && !a.meshless && a.kind == 0 && a.owner == 0 && !a.spot && !a.beam;
+			};
+			for (std::uint32_t i = 0; i < candidates.size(); ++i) {
+				auto& c = candidates[i];
+				if (!c.meshless)
+					continue;
+				// A fixture mesh (a sconce, a candle) clearly nearer than any lit fixture: the light is that mesh's own, it keeps its
+				// source. The snap only reaches as far as the nearest fixture mesh + 64 units (the flame sits above the mesh's origin).
+				double limitSq = snapSq, keepLimitSq = keepSq;
+				if (c.traits.nearMeshDistance >= 0.0f) {
+					const double reach = static_cast<double>(c.traits.nearMeshDistance) + 64.0;
+					limitSq = std::min(limitSq, reach * reach);
+					keepLimitSq = std::min(keepLimitSq, reach * reach * 1.5625);
+				}
+				auto* h = static_cast<History*>(c.hist);
+				std::uint32_t best = UINT32_MAX;
+				if (h && h->anchor && a_frame - h->anchorFrame <= 30u) {
+					for (std::uint32_t j = 0; j < candidates.size(); ++j) {
+						if (candidates[j].light != h->anchor)
+							continue;
+						if (anchorable(candidates[j]) && DistSq(candidates[j].pos, c.pos) <= keepLimitSq)
+							best = j;
+						break;
+					}
+				}
+				if (best == UINT32_MAX) {
+					double bestSq = limitSq;
+					for (std::uint32_t j = 0; j < candidates.size(); ++j) {
+						if (j == i || !anchorable(candidates[j]))
+							continue;
+						const double d = DistSq(candidates[j].pos, c.pos);
+						if (d < bestSq || (d == bestSq && best != UINT32_MAX && candidates[j].light < candidates[best].light)) {
+							bestSq = d;
+							best = j;
+						}
+					}
+				}
+				c.anchor = best;
+				if (h) {
+					h->anchor = best != UINT32_MAX ? candidates[best].light : nullptr;
+					h->anchorFrame = a_frame;
+				}
+			}
+		}
+
+		const double keepMergeSq = mergeSq * 2.25;  // (46s) merge hysteresis: 1.5 x the merge distance
 		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
 			const auto& c = candidates[i];
+			if (c.anchor != UINT32_MAX)
+				continue;  // (46s) snapped: after the groups exist
 			std::uint32_t found = UINT32_MAX;
+			// (46s) Merge hysteresis: last frame's group (the same seed light) while within 1.5 x the merge distance.
+			if (a_config.mergeHysteresis && !c.spot) {
+				const auto* h = static_cast<const History*>(c.hist);
+				if (h && h->seed && a_frame - h->seedFrame <= 2u) {
+					for (std::uint32_t g = 0; g < groups.size(); ++g) {
+						const auto& group = groups[g];
+						if (!group.strongest || group.strongest->light != h->seed)
+							continue;
+						if (!group.spot && group.kind == c.kind && group.owner == c.owner && DistSq(group.pos, c.pos) <= keepMergeSq) {
+							found = g;
+							stats_.mergeKept += DistSq(group.pos, c.pos) > mergeSq ? 1 : 0;
+						}
+						break;
+					}
+				}
+			}
 			// (46c) Spot lights keep a source of their own (their cone and direction are theirs).
-			for (std::uint32_t g = 0; g < groups.size() && !c.spot; ++g) {
+			for (std::uint32_t g = 0; g < groups.size() && !c.spot && found == UINT32_MAX; ++g) {
 				const auto& group = groups[g];
 				if (group.spot || group.kind != c.kind || group.owner != c.owner)
 					continue;
@@ -540,6 +709,31 @@ namespace RayTracingPointLights
 				group.native = group.native || c.native;
 				memberGroup[i] = found;
 				++stats_.merged;
+			}
+		}
+		// (46s) Snapped lights join their fixture's group: their intensity counts, the centre stays the fixture's.
+		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
+			const auto& c = candidates[i];
+			if (c.anchor == UINT32_MAX)
+				continue;
+			const std::uint32_t g = memberGroup[c.anchor];
+			if (g == UINT32_MAX)
+				continue;  // cannot happen (an anchor is never snapped itself)
+			groups[g].intensity += c.intensity;
+			groups[g].score += c.score;
+			memberGroup[i] = g;
+			++stats_.snapped;
+		}
+		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
+			const auto& c = candidates[i];
+			if (c.meshless && c.anchor == UINT32_MAX)
+				++stats_.meshlessOwn;
+			// (46s) Merge hysteresis: the seed of the group each light joined (none for seeds and snapped lights).
+			if (auto* h = static_cast<History*>(c.hist)) {
+				const std::uint32_t g = memberGroup[i];
+				const bool joined = g != UINT32_MAX && c.anchor == UINT32_MAX && groups[g].strongest && groups[g].strongest != &c;
+				h->seed = joined ? groups[g].strongest->light : nullptr;
+				h->seedFrame = a_frame;
 			}
 		}
 
@@ -705,9 +899,44 @@ namespace RayTracingPointLights
 			}
 		}
 		std::sort(tags_.begin(), tags_.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-		// (46g) Lights not seen for a while leave the history.
+		// (46s) Diagnostics: the sources whose range covers the player.
+		if (a_config.reachPoint) {
+			const double* p = a_config.reachPoint;
+			for (const std::uint32_t g : order) {
+				const auto& group = groups[g];
+				if (group.slot == UINT32_MAX || !group.strongest)
+					continue;
+				const double d = std::sqrt(DistSq(group.pos, p));
+				if (!(d <= group.radius))
+					continue;
+				const auto& s = *group.strongest;
+				Reach e;
+				e.slot = group.slot;
+				e.kind = group.kind;
+				e.category = static_cast<std::uint8_t>(s.category);
+				e.native = group.native;
+				e.spot = group.spot;
+				e.steady = s.steady;
+				e.distance = static_cast<float>(d);
+				e.radius = group.radius;
+				e.intensity = group.intensity;
+				std::memcpy(e.label, s.traits.label, sizeof(e.label));
+				e.label[sizeof(e.label) - 1] = '\0';
+				for (std::uint32_t i = 0; i < candidates.size(); ++i) {
+					if (memberGroup[i] != g)
+						continue;
+					++e.members;
+					e.snapped += candidates[i].anchor != UINT32_MAX ? 1 : 0;
+				}
+				reach_.push_back(e);
+			}
+			std::sort(reach_.begin(), reach_.end(), [](const Reach& a, const Reach& b) { return a.distance < b.distance || (a.distance == b.distance && a.slot < b.slot); });
+			if (reach_.size() > 8)
+				reach_.resize(8);
+		}
+		// (46g) Lights not seen for a while leave the history. (46s) By the last frame any rule looked at them.
 		if (a_frame % 300u == 0u)
-			std::erase_if(history_, [&](const auto& a_entry) { return a_frame - a_entry.second.frame > 600u; });
+			std::erase_if(history_, [&](const auto& a_entry) { return a_frame - a_entry.second.seen > 600u; });
 		if (a_config.forced) {
 			for (const auto* light : *a_config.forced)
 				if (std::none_of(maskEntries_.begin(), maskEntries_.end(), [&](const MaskEntry& a_entry) { return a_entry.light == light; }))

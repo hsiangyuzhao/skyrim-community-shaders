@@ -112,6 +112,37 @@ namespace RayTracingPointLights
 		// (46g) Window beams found implausible (almost every traced pixel of their cone blocked): no source, the engine's shadow
 		// map stays for them (sorted by pointer; null = none).
 		const std::vector<const RE::BSLight*>* excludedBeams = nullptr;
+		// (46s) Steady Flickering Lights: static world lights (fixtures, standalone, mesh-attached; not carried, not the player's, not
+		// spells / effects, not spots) take a steady position instead of the engine's flicker-jittered one: their parent node's when
+		// the light's local offset is within 2 x its LIGH's movement amplitude + 1, else a per-light average (EMA 0.05 per frame,
+		// snaps on a jump over 128 units). Used for the rules, the merge, the slots (and so the denoiser's motion), the GPU source.
+		bool steady = true;
+		// (46s) Merge hysteresis: a light merged into a group last frame stays in the group of the same seed light up to 1.5 x the
+		// merge distance.
+		bool mergeHysteresis = true;
+		// (46s) Meshless lights near fires (placed LIGH without a mesh, classified a fixture by its name only, not shadow-casting):
+		// MeshlessOwn = a source of its own (46r), MeshlessSnap = its tag goes to the nearest visible fixture's source within
+		// snapDistance (its intensity added, no weight in the centre; none in range: own), MeshlessSkip = no RT source.
+		std::uint32_t meshless = 1;
+		float snapDistance = 320.0f;
+		// (46s) Diagnostics: the sources whose range covers this point (world; the player's chest). Not used when null.
+		const double* reachPoint = nullptr;
+	};
+	inline constexpr std::uint32_t kMeshlessOwn = 0, kMeshlessSnap = 1, kMeshlessSkip = 2;
+
+	/// (46s) A source whose range covers the player this frame (diagnostics).
+	struct Reach
+	{
+		std::uint32_t slot = 0;
+		std::uint8_t kind = 0;      // 0 world light, 1 the player's, 2 spell / effect
+		std::uint8_t category = 0;  // Util::LightCensus::Category of its strongest light
+		bool native = false;
+		bool spot = false;
+		bool steady = false;        // its strongest light has a steady position
+		std::uint16_t members = 0;  // lights sharing it (merged + snapped)
+		std::uint16_t snapped = 0;  // of which meshless lights snapped to it
+		float distance = 0.0f, radius = 0.0f, intensity = 0.0f;
+		char label[40]{};           // strongest light's LIGH / base editor ID
 	};
 
 	struct Stats
@@ -136,6 +167,12 @@ namespace RayTracingPointLights
 		std::uint32_t effects = 0;       // (46d) spell / effect lights among the sources
 		std::uint32_t carried = 0;       // (46e) sources carried by a traced character (its own body is not tested)
 		std::uint32_t kept = 0;          // (46g) lights kept by the hysteresis (below the cut, tagged last frame)
+		std::uint32_t steadyParent = 0;  // (46s) candidates at their parent node's position
+		std::uint32_t steadyAverage = 0; // (46s) candidates at their averaged position
+		std::uint32_t mergeKept = 0;     // (46s) lights kept in last frame's group by the merge hysteresis
+		std::uint32_t snapped = 0;       // (46s) meshless lights tagged to a visible fixture's source
+		std::uint32_t meshlessOwn = 0;   // (46s) meshless lights with a source of their own (Own, or Snap with no fixture in range)
+		std::uint32_t meshlessSkipped = 0;  // (46s) meshless lights left without a source (Skip)
 		float cpuMs = 0.0f;
 	};
 	inline constexpr const char* kRejectNames[8] = { "faded (lodDimmer)", "radius", "intensity", "distance", "outside traced area", "category",
@@ -165,6 +202,14 @@ namespace RayTracingPointLights
 		[[nodiscard]] const std::array<std::uint8_t, kMaxSources>& SlotMotion() const { return motion_; }
 		/// (46g) Per slot: the window beam light it holds this frame (null = none / not a beam).
 		[[nodiscard]] const std::array<const RE::BSLight*, kMaxSources>& SlotBeams() const { return slotBeams_; }
+		/// (46s) This frame's sources whose range covers Config::reachPoint (nearest first, at most 8).
+		[[nodiscard]] const std::vector<Reach>& Reaching() const { return reach_; }
+		/// (46s) A transition (loading screen): the per-light history belongs to the place left behind.
+		void ForgetHistory()
+		{
+			history_.clear();
+			reach_.clear();
+		}
 
 	private:
 		std::vector<MaskEntry> maskEntries_;
@@ -182,12 +227,26 @@ namespace RayTracingPointLights
 		// (46g) Per light: smoothed intensity / radius, the last frame it was seen and whether it was tagged then.
 		struct History
 		{
+			const void* niLight = nullptr;  // (46s) the same BSLight address with another NiLight is another light
+			std::uint32_t seen = 0;         // (46s) last frame it was looked at (the clean-up)
 			float intensity = 0.0f;
 			float radius = 0.0f;
-			std::uint32_t frame = 0;
+			std::uint32_t frame = 0;        // (46g) last frame of the smoothed intensity / radius (0 = none)
 			bool tagged = false;
+			// (46s) Steady position.
+			bool steadyValid = false;
+			bool steadyParent = false;
+			std::uint32_t steadyFrame = 0;
+			double steady[3]{};
+			// (46s) Merge hysteresis: the seed light of the group it joined (null = it seeded one / none).
+			const RE::BSLight* seed = nullptr;
+			std::uint32_t seedFrame = 0;
+			// (46s) Snap: the visible fixture its tag went to last time (kept while in range).
+			const RE::BSLight* anchor = nullptr;
+			std::uint32_t anchorFrame = 0;
 		};
 		std::unordered_map<const RE::BSLight*, History> history_;
+		std::vector<Reach> reach_;  // (46s)
 		bool published_ = false;
 		Stats stats_{};
 	};

@@ -76,6 +76,7 @@ namespace Util::LightCensus
 			uint32_t lighId = 0, lighFlags = 0;
 			std::string lighEdid, lighPlugin, lighModel;
 			float lighRadius = 0, lighFade = 0, lighFov = 0;
+			float lighMoveAmplitude = 0;  ///< (46s) flicker movement amplitude (0 when the LIGH does not flicker / pulse)
 
 			bool emissiveNearby = false;
 			std::string emissiveShape;
@@ -92,6 +93,8 @@ namespace Util::LightCensus
 
 			uint32_t clusters = 0;
 			uint64_t pixelHits = 0;
+
+			uint32_t rtTag = 0;  ///< (46s) Ray Tracing's point-light shadow tag this frame (source slot + 1 in the low bits; 0 = none)
 		};
 
 		struct FixtureRef
@@ -415,6 +418,8 @@ namespace Util::LightCensus
 				r.lighRadius = static_cast<float>(ligh->data.radius);
 				r.lighFade = ligh->fade;
 				r.lighFov = ligh->data.fov;
+				const float amplitude = ligh->data.flickerMovementAmplitude;
+				r.lighMoveAmplitude = (!ligh->GetNoFlicker() && std::isfinite(amplitude)) ? std::clamp(amplitude, 0.0f, 1024.0f) : 0.0f;
 			}
 
 			// Glowing shapes next to a light that lives inside a mesh (not for placed lights: their node is a marker).
@@ -460,6 +465,47 @@ namespace Util::LightCensus
 				}
 				return RE::BSContainer::ForEachResult::kContinue;
 			});
+		}
+
+		/// (46s) Distance from a placed light's reference to the nearest fixture mesh (candle, torch, brazier, fire ...) within
+		/// a_radius (-1 = none): a meshless "torch" light right at a sconce belongs to it, one far from any is at no visible fire.
+		__declspec(noinline) void NearestFixtureMeshUnsafe(RE::TESObjectREFR* a_origin, float a_radius, float& o_distance)
+		{
+			auto* tes = RE::TES::GetSingleton();
+			if (!tes || !a_origin)
+				return;
+			const RE::NiPoint3 origin = a_origin->GetPosition();
+			int visited = 0;
+			tes->ForEachReferenceInRange(a_origin, a_radius, [&](RE::TESObjectREFR* a_ref) {
+				if (++visited > 4096)
+					return RE::BSContainer::ForEachResult::kStop;
+				if (!a_ref || a_ref == a_origin || a_ref->IsDisabled() || !a_ref->Get3D())
+					return RE::BSContainer::ForEachResult::kContinue;
+				auto* base = a_ref->GetBaseObject();
+				if (!base || base->GetFormType() == RE::FormType::Light)
+					return RE::BSContainer::ForEachResult::kContinue;
+				auto* model = base->As<RE::TESModel>();
+				const char* path = model ? model->GetModel() : nullptr;
+				if (!path || !*path)
+					return RE::BSContainer::ForEachResult::kContinue;
+				const auto lower = Lower(path);
+				if (lower.find("marker") != std::string::npos || FindWord(lower, kFixtureWords).empty())
+					return RE::BSContainer::ForEachResult::kContinue;
+				const float d = a_ref->GetPosition().GetDistance(origin);
+				if (d <= a_radius && (o_distance < 0.0f || d < o_distance))
+					o_distance = d;
+				return RE::BSContainer::ForEachResult::kContinue;
+			});
+		}
+
+		bool NearestFixtureMeshSafe(RE::TESObjectREFR* a_origin, float a_radius, float* o_distance)
+		{
+			__try {
+				NearestFixtureMeshUnsafe(a_origin, a_radius, *o_distance);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
 		}
 
 		bool CollectFixturesSafe(std::vector<FixtureRef>* o_refs, RE::TESObjectREFR* a_player)
@@ -620,6 +666,24 @@ namespace Util::LightCensus
 
 			if (r.baseIsLight) {
 				// A placed light (LIGH reference): vanilla, True Light, Window Shadows ...
+				// (46s) The nearest fixture mesh is measured first, so a capture shows it for every placed light (also the ones
+				// the rules below decide by name: is a vanilla "torch" light really at a fire?). The decision is unchanged.
+				float best = -1;
+				const FixtureRef* nearest = nullptr;
+				{
+					const RE::NiPoint3 p{ r.pos[0], r.pos[1], r.pos[2] };
+					for (const auto& f : a_fixtures) {
+						const float d = f.pos.GetDistance(p);
+						if (best < 0 || d < best) {
+							best = d;
+							nearest = &f;
+						}
+					}
+					if (nearest) {
+						r.nearFixture = nearest->label;
+						r.nearFixtureDistance = best;
+					}
+				}
 				// (46a) No mesh and named like a fill light (LIGH editor ID omni / ambient / fill, or an "ambient"
 				// plugin): fill, before the nearby-fixture test (True Light's DwarvenOmniLight went either way by it).
 				// Shadow-casting ones stand in for a fixture's shadow.
@@ -649,20 +713,6 @@ namespace Util::LightCensus
 					r.category = "fixture";
 					because("the light object has its own mesh: " + r.lighModel);
 					return;
-				}
-				float best = -1;
-				const FixtureRef* nearest = nullptr;
-				const RE::NiPoint3 p{ r.pos[0], r.pos[1], r.pos[2] };
-				for (const auto& f : a_fixtures) {
-					const float d = f.pos.GetDistance(p);
-					if (best < 0 || d < best) {
-						best = d;
-						nearest = &f;
-					}
-				}
-				if (nearest) {
-					r.nearFixture = nearest->label;
-					r.nearFixtureDistance = best;
 				}
 				if (nearest && best <= kFixtureNearDistance) {
 					r.category = "fixture";
@@ -722,6 +772,7 @@ namespace Util::LightCensus
 			bool window = false;                 ///< a window light: re-split by the radius on every call
 			bool spot = false;
 			std::uint32_t lastFrame = 0;
+			Traits traits;                       ///< (46s)
 		};
 		std::unordered_map<const RE::BSLight*, ClassEntry> g_classCache;
 		std::uint64_t g_classReads = 0;
@@ -918,6 +969,9 @@ namespace Util::LightCensus
 					{ "maxDistance", sspls.settings.MaxDistance }, { "softShadows", sspls.settings.EnableSoftShadows != 0 } };
 				auto& rt = globals::features::rayTracing;
 				cs["rayTracing"] = { { "loaded", rt.loaded }, { "enabled", rt.settings.Enabled }, { "profile", rt.loaded ? rt.DescribeForProfile() : std::string() } };
+				// (46s) The ray-traced point-light shadow sources whose range covers the player this frame.
+				if (rt.loaded)
+					cs["rayTracing"]["pointSourcesReachingPlayer"] = rt.PointSourcesReachingPlayerJson();
 			}
 			return j;
 		}
@@ -1012,7 +1066,11 @@ namespace Util::LightCensus
 			}
 			if (r.lighId)
 				j["ligh"] = { { "id", std::format("{:08X}", r.lighId) }, { "edid", r.lighEdid }, { "plugin", r.lighPlugin }, { "model", r.lighModel },
-					{ "flags", std::format("{:04X}", r.lighFlags) }, { "radius", r.lighRadius }, { "fade", r.lighFade }, { "fov", r.lighFov } };
+					{ "flags", std::format("{:04X}", r.lighFlags) }, { "radius", r.lighRadius }, { "fade", r.lighFade }, { "fov", r.lighFov },
+					{ "moveAmplitude", r.lighMoveAmplitude } };  // (46s)
+			// (46s) The ray-traced shadow source this light uses (its slot; lights sharing a slot share one shadow).
+			if (r.rtTag & RayTracingPointLights::kTagSourceMask)
+				j["rtSource"] = static_cast<int>((r.rtTag & RayTracingPointLights::kTagSourceMask) - 1);
 			if (r.emissiveNearby)
 				j["glowingShape"] = r.emissiveShape;
 			if (!r.nearFixture.empty())
@@ -1421,9 +1479,11 @@ namespace Util::LightCensus
 		return i < std::size(kNames) ? kNames[i] : "unknown";
 	}
 
-	bool ClassifyCached(RE::BSLight* a_light, float a_radius, std::uint32_t a_frame, std::uint32_t& a_budget, Category& o_category)
+	bool ClassifyCached(RE::BSLight* a_light, float a_radius, std::uint32_t a_frame, std::uint32_t& a_budget, Category& o_category, Traits* o_traits)
 	{
 		o_category = Category::Unknown;
+		if (o_traits)
+			*o_traits = {};
 		RE::NiLight* niLight = nullptr;
 		RE::TESObjectREFR* owner = nullptr;
 		if (!a_light || !ReadIdentity(a_light, &niLight, &owner))
@@ -1432,6 +1492,8 @@ namespace Util::LightCensus
 			auto& e = it->second;
 			e.lastFrame = a_frame;
 			o_category = e.window ? SplitWindow(e.spot, a_radius) : e.category;
+			if (o_traits)
+				*o_traits = e.traits;
 			return true;
 		}
 		if (a_budget == 0)
@@ -1460,8 +1522,30 @@ namespace Util::LightCensus
 		e.window = e.category == Category::WindowBeam || e.category == Category::WindowGlow || e.category == Category::WindowFill;
 		e.spot = r.kind == "spot" || r.kind == "shadow-spot";
 		e.lastFrame = a_frame;
+		// (46s) What the shadow selection needs beyond the category.
+		{
+			auto& t = e.traits;
+			t.lighResolved = r.lighId != 0;
+			t.moveAmplitude = r.lighMoveAmplitude;
+			t.lightPlacer = r.lightPlacer;
+			const bool lighNoMesh = r.lighModel.empty() || Lower(r.lighModel).find("marker") != std::string::npos;
+			t.meshlessNamedFixture = !r.readError && r.baseIsLight && lighNoMesh && !r.shadow && e.category == Category::Fixture;
+			if (t.meshlessNamedFixture) {
+				float d = -1.0f;
+				if (NearestFixtureMeshSafe(owner, kMeshScanRadius, &d))
+					t.nearMeshDistance = d;
+			}
+			t.visibleFixture = !r.readError && ((!r.baseIsLight && (e.category == Category::Fixture || e.category == Category::MeshAttached)) ||
+			                                       (r.baseIsLight && !lighNoMesh && e.category == Category::Fixture));
+			const std::string& name = !r.lighEdid.empty() ? r.lighEdid : r.baseEdid;
+			const std::size_t n = std::min(name.size(), sizeof(t.label) - 1);
+			std::memcpy(t.label, name.data(), n);
+			t.label[n] = '\0';
+		}
 		g_classCache[a_light] = e;
 		o_category = e.window ? SplitWindow(e.spot, a_radius) : e.category;
+		if (o_traits)
+			*o_traits = e.traits;
 		return true;
 	}
 
@@ -1556,6 +1640,8 @@ namespace Util::LightCensus
 			}
 			Classify(r, fixtures);
 			r.stableId = StableId(r);
+			if (a_light && globals::features::rayTracing.loaded)
+				r.rtTag = globals::features::rayTracing.PointLightTag(a_light);  // (46s)
 			c.lights.push_back(std::move(r));
 		};
 		for (std::size_t i = 0; i < a_used.size(); ++i) {

@@ -104,6 +104,28 @@ namespace Util::LightCensus
 	};
 	const char* CategoryName(Category a_category);
 
+	/// (46s) Radius of the fixture-mesh scan around a meshless "torch" light (Traits::nearMeshDistance).
+	inline constexpr float kMeshScanRadius = 400.0f;
+
+	/// (46s) More of the classifier's cached read, for the shadow selection (RT point-light shadows).
+	struct Traits
+	{
+		/// The LIGH's flicker movement amplitude (units; 0 when the LIGH does not flicker / pulse or could not be resolved). Resolved
+		/// as the census does: the placed reference's base, else Inverse Square Lighting's LIGH form ID (Light Placer, NIF lights).
+		float moveAmplitude = 0.0f;
+		bool lighResolved = false;
+		/// A placed LIGH reference without a mesh (model "" or a marker), classified a fixture by its editor ID only (a vanilla
+		/// "...Torch..." light that is not at any visible fire), not shadow-casting.
+		bool meshlessNamedFixture = false;
+		/// For a meshlessNamedFixture: distance from its reference to the nearest fixture mesh (candle, torch, brazier, fire ...)
+		/// within kMeshScanRadius; -1 = none (or not scanned).
+		float nearMeshDistance = -1.0f;
+		/// A light of a visible fixture: Light Placer, a light inside a fixture's model, or a LIGH with a mesh of its own.
+		bool visibleFixture = false;
+		bool lightPlacer = false;
+		char label[40]{};  ///< LIGH (else base) editor ID, for the diagnostics
+	};
+
 	/**
 	 * (46b) The census classifier for every frame (RT point-light shadows): one census-style read of the
 	 * light's engine data (owner, LIGH, node chain, glowing neighbours; SEH-protected) the first time a light
@@ -115,7 +137,8 @@ namespace Util::LightCensus
 	 * Render thread only. a_budget: new lights that may be read this call (decremented); a light that is not
 	 * cached and finds no budget returns false (asked again next frame).
 	 */
-	bool ClassifyCached(RE::BSLight* a_light, float a_radius, std::uint32_t a_frame, std::uint32_t& a_budget, Category& o_category);
+	bool ClassifyCached(RE::BSLight* a_light, float a_radius, std::uint32_t a_frame, std::uint32_t& a_budget, Category& o_category,
+		Traits* o_traits = nullptr);
 	/// Drops cache entries not asked for since a_maxAge frames (call once per frame; cheap when nothing is old).
 	void TrimClassifierCache(std::uint32_t a_frame, std::uint32_t a_maxAge);
 	/// Lights in the cache, and lights read so far (for the page).
