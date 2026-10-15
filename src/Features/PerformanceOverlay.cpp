@@ -3883,15 +3883,22 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 								"The multiplier is the one the backend accepted, which can differ from the menu setting.");
 		if (st.isFrameGenerationActive) {
 			const char* backend = st.frameGenerationIsDLSSG ? "DLSS FG" : "FSR FG";
-			if (st.postFGIsMeasured)
-				ImGui::Text("%s %ux (measured %.2f)", backend, st.appliedFGMultiplier, st.postFGMultiplier);
-			else
+			// (46v) The multiplier shown is the measured one (frames DLSS-G reports it shows per rendered frame, rounded);
+			// until DLSS-G reports, the accepted multiplier is shown greyed out.
+			if (st.postFGIsMeasured) {
+				const long measured = std::lround(st.postFGMultiplier);
+				ImGui::Text("%s %ux", backend, measured >= 2 ? static_cast<unsigned>(measured) : st.appliedFGMultiplier);
+			} else if (st.frameGenerationIsDLSSG) {
+				ImGui::TextDisabled("%s %ux (waiting for DLSS-G)", backend, st.appliedFGMultiplier);
+			} else {
 				ImGui::Text("%s %ux", backend, st.appliedFGMultiplier);
+			}
 			if (ImGui::IsItemHovered()) {
 				if (auto _tt = Util::HoverTooltipWrapper()) {
 					if (st.postFGIsMeasured)
-						ImGui::TextUnformatted("Measured = frames actually shown per rendered frame; a little below the multiplier when DLSS-G\n"
-											   "skips a generated frame to keep the pacing even.");
+						ImGui::Text("Measured: %.2f frames shown per rendered frame (a little below the multiplier when DLSS-G\n"
+									"skips a generated frame to keep the pacing even).",
+							st.postFGMultiplier);
 					else if (st.frameGenerationIsDLSSG)
 						ImGui::TextUnformatted("DLSS-G has not reported what it shows yet (first frames after a switch).");
 					else
@@ -3935,7 +3942,7 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 					  "1% low = the frame rate that 99% of frames beat (the slowest 1% of frames are at least this slow).\n"
 					  "Far below the average = noticeable stutter.");
 		if (stats.valid) {
-			ImGui::Text("%.0f FPS (p99 %.1f ms)  |  average %.0f FPS", Util::CalcFPS(stats.percentile99Ms), stats.percentile99Ms, Util::CalcFPS(stats.averageMs));
+			ImGui::Text("%.1f FPS (p99 %.1f ms)  |  average %.1f FPS", Util::CalcFPS(stats.percentile99Ms), stats.percentile99Ms, Util::CalcFPS(stats.averageMs));
 			if (ImGui::IsItemHovered()) {
 				if (auto _tt = Util::HoverTooltipWrapper())
 					ImGui::Text("Over the last %.1f s (%d rendered frames). Frames over %.0f ms (loading screens, alt-tab) are left out.",
