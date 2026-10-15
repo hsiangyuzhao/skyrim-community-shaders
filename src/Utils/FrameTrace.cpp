@@ -392,6 +392,14 @@ namespace Util::FrameTrace
 				out << "#   <D|W|F>grp<group>:<first>-<last> = BSShaderAccumulator::RenderBatches of that pass group (D depth, W world, F first person);\n";
 				out << "#   XX:start = before the first probe. driver_misc_* = GetData / Clear* / GenerateMips / ResolveSubresource (not in driver_total);\n";
 				out << "#   map_other_* = Map on contexts other than the immediate one (any thread).\n";
+				out << "# (46m) rt_ch_* = Ray Tracing characters' CPU (ms, -1 = not run): cand = actors chosen; reads = per-actor reads (3D scan or check of the\n";
+				out << "#   known shapes + bone matrices) on rt_ch_lanes lanes (1 = render thread alone); capture = new shapes captured, changed ones retired;\n";
+				out << "#   commit = still-pose check; filter = caster filter; collect = draw list (CollectDraws). rt_chars_ms is all of it. rt_ch_bones = bone\n";
+				out << "#   matrices read, rt_ch_rescans = actors whose 3D was walked in full, rt_ch_actors / rt_ch_shapes = traced. rt_skin_groups = merged\n";
+				out << "#   character BLASes in the TLAS (Merge Character Parts), rt_skin_group_builds / _refits = of them built / refit, rt_skin_instances =\n";
+				out << "#   character TLAS instances, rt_skin_dispatches = skinning dispatches. rt_sync_split = 1 when the sun had its own fence (Split Trace\n";
+				out << "#   Sync), 0 not, -1 not traced; rt_sync_sun_gpu_ms / rt_sync_pl_gpu_ms = the game queue's wait for the sun / for the point lights after\n";
+				out << "#   the shadow mask passes (rt_sync_gpu_ms = their sum; not split: rt_sync_sun_gpu_ms = the whole wait, rt_sync_pl_gpu_ms 0).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -419,6 +427,9 @@ namespace Util::FrameTrace
 				       "rt_e_close_ms,rt_e_execute_ms,rt_x_timestamps_ms,rt_x_ensure_ms,rt_x_publish_ms,rt_x_ao_ms,rt_pool_ms,rt_pool_sync_blocks,rt_pool_mb,rt_pool_waits,"
 				       "rt_pool_worker_ms,rt_pl_slot_changes,rt_pl_merged,rt_pl_rej_radius,rt_pl_rej_intensity,rt_pl_kept,rt_pl_churn,rt_pl_beams_excluded,"
 				       "rtao_indoors,rtao_mode,rt_pump,rt_pump_ms,"
+				       "rt_ch_cand_ms,rt_ch_reads_ms,rt_ch_capture_ms,rt_ch_commit_ms,rt_ch_filter_ms,rt_ch_collect_ms,rt_ch_bones,rt_ch_rescans,rt_ch_lanes,"
+				       "rt_ch_actors,rt_ch_shapes,rt_skin_groups,rt_skin_group_builds,rt_skin_group_refits,rt_skin_instances,rt_skin_dispatches,"
+				       "rt_sync_split,rt_sync_sun_gpu_ms,rt_sync_pl_gpu_ms,"
 				       "wt_valid,wt_total_ms,wt_engine_ms,wt_pass_ms,wt_technique_ms,wt_material_ours_ms,wt_material_engine_ms,wt_setup_ours_ms,"
 				       "wt_setup_engine_ms,wt_restore_ms,wt_ours_other_ms,wt_driver_ms,wt_own_draw_ms,wt_lookup_ms,wt_lookups,"
 				       "wt_miss_ms,wt_misses,wt_skin_actors,wt_skin_ms,wt_shelter_picks,wt_shelter_ms,wt_water_searches,wt_water_ms,wt_creates,"
@@ -464,6 +475,11 @@ namespace Util::FrameTrace
 					s += std::format(",{},{},{},{},{},{},{}", t.plSlotChanges, t.plMerged, t.plRejRadius, t.plRejIntensity, t.plKept, t.plChurn, t.plBeamsExcluded);
 					s += std::format(",{},{}", t.rtaoIndoors, t.rtaoMode);  // (46h)
 					s += std::format(",{},{:.3f}", t.pump, t.pumpMs);         // (46k)
+					// (46m)
+					s += std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{}", t.chCandidates, t.chReads, t.chCapture, t.chCommit, t.chFilter,
+						t.chCollect, t.chBones, t.chRescans, t.chLanes, t.chActors, t.chShapes);
+					s += std::format(",{},{},{},{},{},{},{:.3f},{:.3f}", t.skinGroups, t.skinGroupBuilds, t.skinGroupRefits, t.skinInstances, t.skinDispatches,
+						t.syncSplit, t.syncSunGpuMs, t.syncPlGpuMs);
 					{
 						// (46l) World-render split.
 						const auto& w = a_row.world;

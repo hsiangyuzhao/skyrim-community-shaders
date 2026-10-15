@@ -126,6 +126,15 @@ namespace Util::FrameTrace
 		// (46k) This frame's RT work came from the loading pump (a loading-screen frame, no world render), its CPU ms (-1 = not run).
 		int pump = 0;
 		float pumpMs = -1.0f;
+		// (46m) Characters' CPU step by step (ms, -1 = not run): actors chosen, per-actor reads (scan / check + bone matrices, on the
+		// read lanes), captures / retires, still-pose commit, caster filter, CollectDraws; bone matrices read, actors scanned in full,
+		// lanes, actors, shapes. Skinning: merged BLASes in the TLAS, built / refit, character TLAS instances, skinning dispatches.
+		float chCandidates = -1, chReads = -1, chCapture = -1, chCommit = -1, chFilter = -1, chCollect = -1;
+		uint32_t chBones = 0, chRescans = 0, chLanes = 0, chActors = 0, chShapes = 0;
+		uint32_t skinGroups = 0, skinGroupBuilds = 0, skinGroupRefits = 0, skinInstances = 0, skinDispatches = 0;
+		// (46m) Split Trace Sync this frame (1 split, 0 not, -1 not traced); the game queue's wait for the sun / for the point lights (GPU ms).
+		int syncSplit = -1;
+		float syncSunGpuMs = -1, syncPlGpuMs = -1;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

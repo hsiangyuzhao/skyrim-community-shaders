@@ -121,38 +121,43 @@ namespace RayTracingRT
 		}
 		if (!opaque && (geometry.alphaUV.size() != static_cast<std::size_t>(triangles) * 3 * 2 || !SkinAlphaAvailable()))
 			return refuse();
-
-		// Sizes up front (the budget is checked before anything is created).
-		D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc{};
-		geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-		geometryDesc.Flags = opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
-		geometryDesc.Triangles.VertexBuffer.StrideInBytes = kSkinOutputStride;
-		geometryDesc.Triangles.VertexCount = vertices;
-		geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-		geometryDesc.Triangles.IndexCount = triangles * 3;
-		geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
-		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
-		inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-		inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-		inputs.NumDescs = 1;
-		inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-		inputs.pGeometryDescs = &geometryDesc;
-		D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
-		device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
-		if (info.ResultDataMaxSizeInBytes == 0 || info.ScratchDataSizeInBytes == 0)
-			return refuse();
+		// (46m) Merge Character Parts: an opaque shape traced inside its character's merged BLAS has none of its own.
+		const bool grouped = geometry.grouped && opaque;
 
 		SkinShape shape;
 		shape.live = true;
+		shape.grouped = grouped;
+		shape.serial = ++skinSerial_;
 		shape.vertices = vertices;
 		shape.triangles = triangles;
 		shape.boneCount = geometry.boneCount;
 		shape.restBytes = AlignUp(static_cast<std::uint64_t>(vertices) * kSkinVertexBytes, 256);
 		shape.indexBytes = AlignUp(static_cast<std::uint64_t>(triangles) * 3 * sizeof(std::uint32_t), 256);
 		shape.outputBytes = AlignUp(static_cast<std::uint64_t>(vertices) * kSkinOutputStride, 256);
-		shape.blasBytes = AlignUp(info.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
-		shape.buildScratch = AlignUp(info.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
-		shape.updateScratch = AlignUp(std::max<std::uint64_t>(info.UpdateScratchDataSizeInBytes, 256), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+		if (!grouped) {
+			// Sizes up front (the budget is checked before anything is created).
+			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc{};
+			geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+			geometryDesc.Flags = opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+			geometryDesc.Triangles.VertexBuffer.StrideInBytes = kSkinOutputStride;
+			geometryDesc.Triangles.VertexCount = vertices;
+			geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+			geometryDesc.Triangles.IndexCount = triangles * 3;
+			geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+			inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+			inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+			inputs.NumDescs = 1;
+			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+			inputs.pGeometryDescs = &geometryDesc;
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+			device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+			if (info.ResultDataMaxSizeInBytes == 0 || info.ScratchDataSizeInBytes == 0)
+				return refuse();
+			shape.blasBytes = AlignUp(info.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+			shape.buildScratch = AlignUp(info.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+			shape.updateScratch = AlignUp(std::max<std::uint64_t>(info.UpdateScratchDataSizeInBytes, 256), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+		}
 		if (skinStats_.bytes + shape.Bytes() > kSkinBudgetBytes) {
 			++skinStats_.overBudget;
 			return kInvalidSkin;
@@ -224,6 +229,7 @@ namespace RayTracingRT
 	{
 		if (!SkinIdle())
 			return;
+		ReleaseSkinGroups();  // (46m)
 		bool any = false;
 		if (skinScratch_) {
 			Retire(skinScratch_, skinScratchBytes_, &skinStats_.scratchBytes);
@@ -291,8 +297,9 @@ namespace RayTracingRT
 				uploadBytes = entry.uvOffset + geometry.alphaUV.size() * sizeof(std::uint32_t);
 			}
 			ArenaAlloc rest, index, output, blas;
+			// (46m) A merged shape has no BLAS of its own (its character's merged BLAS holds it).
 			const bool ok = skinStaticPool_.Allocate(shape.restBytes, rest) && skinStaticPool_.Allocate(shape.indexBytes, index) &&
-			                skinOutputPool_.Allocate(shape.outputBytes, output) && asPool_.Allocate(shape.blasBytes, blas) &&
+			                skinOutputPool_.Allocate(shape.outputBytes, output) && (shape.grouped || asPool_.Allocate(shape.blasBytes, blas)) &&
 			                uploadPool_.Allocate(uploadBytes, entry.upload);
 			if (!ok) {
 				// Nothing recorded with them: back at once.
@@ -372,37 +379,64 @@ namespace RayTracingRT
 		}
 	}
 
+	void Backend::ReleaseSkinGroup(SkinGroup& a_group)
+	{
+		// (46m) The merged BLAS may still be read by a submission in flight: back to the pool behind the fence.
+		if (a_group.blas.Valid()) {
+			asPool_.Free(a_group.blas, RetireValue());
+			skinStats_.bytes -= std::min(skinStats_.bytes, a_group.blasBytes);
+		}
+		a_group.blas = {};
+		a_group.blasBytes = 0;
+		a_group.serials.clear();
+		a_group.built = false;
+		a_group.refits = 0;
+	}
+
+	void Backend::ReleaseSkinGroups()
+	{
+		for (auto& group : skinGroups_)
+			ReleaseSkinGroup(group);
+		skinGroups_.clear();
+		skinGroupFrame_.clear();
+	}
+
 	void Backend::RecordSkinning(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, const FrameInput& a_input,
 		std::vector<std::uint8_t>& o_ready)
 	{
 		skinStats_.refitsLastFrame = skinStats_.buildsLastFrame = skinStats_.notReadyLastFrame = skinStats_.reusedLastFrame = 0;
 		skinStats_.verticesLastFrame = 0;
+		skinStats_.groupsLastFrame = skinStats_.groupBuildsLastFrame = skinStats_.groupRefitsLastFrame = skinStats_.groupKeptLastFrame = 0;
+		skinStats_.groupShapesLastFrame = skinStats_.dispatchesLastFrame = 0;
+		skinGroupFrame_.clear();
 		UploadSkinShapes(a_list, a_input.skinUploadCpuMs > 0.0f ? a_input.skinUploadCpuMs : kPlaySkinUploadCpuMs);
-		if (!skinFault_.empty() || failed_ || !a_input.skinDraws || a_input.skinDraws->empty())
+		if (!skinFault_.empty() || failed_ || !a_input.skinDraws || a_input.skinDraws->empty()) {
+			if (!skinGroups_.empty())
+				ReleaseSkinGroups();  // (46m) no character drawn: no merged BLAS kept
 			return;
+		}
 		const auto& draws = *a_input.skinDraws;
 		// (45l) Draws that reuse last frame's skinned BLAS (other actors on their off frame, Characters
-		// "reduced"): nothing to record, traced as built.
+		// "reduced"): nothing to record, traced as built. (46m) A merged shape's still pose: its skinned vertices
+		// are kept (its merged BLAS is ready once the group is, below).
 		std::size_t reused = 0;
 		for (std::size_t d = 0; d < draws.size(); ++d) {
 			const auto& draw = draws[d];
 			if (!draw.reuse)
 				continue;
-			if (draw.shape < skins_.size() && skins_[draw.shape].live && skins_[draw.shape].uploaded && skins_[draw.shape].built) {
-				o_ready[d] = 1;
+			const bool valid = draw.shape < skins_.size() && skins_[draw.shape].live && skins_[draw.shape].uploaded;
+			const bool usable = valid && (skins_[draw.shape].grouped ? (draw.group != 0 && skins_[draw.shape].skinned) : skins_[draw.shape].built);
+			if (usable) {
+				if (!skins_[draw.shape].grouped)
+					o_ready[d] = 1;
 				++reused;
 			} else {
 				++skinStats_.notReadyLastFrame;
 			}
 		}
 		skinStats_.reusedLastFrame = static_cast<std::uint32_t>(reused);
-		if (reused == draws.size())
-			return;
 		const std::uint64_t boneFloats = a_input.skinBones ? a_input.skinBones->size() : 0;
-		if (boneFloats == 0 || boneFloats > kSkinMaxBoneFloats || boneFloats % 12 != 0) {
-			skinStats_.notReadyLastFrame = static_cast<std::uint32_t>(draws.size() - reused);
-			return;
-		}
+		const bool bonesOk = boneFloats != 0 && boneFloats <= kSkinMaxBoneFloats && boneFloats % 12 == 0;
 		const std::uint64_t submission = fenceValue_ + 1;  // this frame's done value: unique per recorded frame
 
 		struct Op
@@ -411,15 +445,17 @@ namespace RayTracingRT
 			bool build;
 			std::uint64_t scratchOffset;
 		};
-		std::vector<Op> ops;
+		std::vector<Op> ops;                    // shapes with a BLAS of their own: skinned, then built / refit
+		std::vector<std::size_t> groupSkins;    // (46m) merged shapes skinned this frame (their group's BLAS is built / refit below)
 		ops.reserve(draws.size());
+		groupSkins.reserve(draws.size());
 		std::uint32_t builds = 0, rebuilds = 0;
 		std::uint64_t scratchTotal = 0;
 		for (std::size_t d = 0; d < draws.size(); ++d) {
 			const auto& draw = draws[d];
 			if (draw.reuse)
 				continue;
-			if (draw.shape >= skins_.size() || !skins_[draw.shape].live || !skins_[draw.shape].uploaded) {
+			if (!bonesOk || draw.shape >= skins_.size() || !skins_[draw.shape].live || !skins_[draw.shape].uploaded) {
 				++skinStats_.notReadyLastFrame;
 				continue;
 			}
@@ -428,6 +464,16 @@ namespace RayTracingRT
 				continue;  // the same shape twice: skinned once
 			if ((static_cast<std::uint64_t>(draw.boneOffset) + shape.boneCount) * 12 > boneFloats) {
 				++skinStats_.notReadyLastFrame;
+				continue;
+			}
+			if (shape.grouped) {
+				// (46m) Only traced inside its character's merged BLAS.
+				if (draw.group == 0) {
+					++skinStats_.notReadyLastFrame;
+					continue;
+				}
+				groupSkins.push_back(d);
+				shape.lastSubmission = submission;
 				continue;
 			}
 			bool build = !shape.built;
@@ -445,38 +491,193 @@ namespace RayTracingRT
 			scratchTotal += AlignUp(build ? shape.buildScratch : shape.updateScratch, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
 			shape.lastSubmission = submission;
 		}
-		if (ops.empty())
-			return;
 
-		// This frame's bone matrices into the context's own upload buffer (the context is free).
-		const std::uint64_t boneBytes = boneFloats * sizeof(float);
-		if (!a_context.boneBuffer || a_context.boneCapacity < boneBytes) {
-			if (a_context.boneBuffer) {
-				if (a_context.boneMapped)
-					a_context.boneBuffer->Unmap(0, nullptr);
-				skinStats_.boneBytes -= std::min(skinStats_.boneBytes, a_context.boneCapacity);
-				a_context.boneBuffer.Reset();
-				a_context.boneMapped = nullptr;
-				a_context.boneCapacity = 0;
+		// (46m) Merged BLASes. Members: the group's uploaded shapes skinned now, or before with a still pose (their skinned
+		// vertices are this frame's). Built when the member list changed (by shape serial: handles are reused), refit in place
+		// when a member was skinned now, kept as it is otherwise. A member list of another origin than the group's first
+		// member (cannot happen: Characters rebases) is left out.
+		struct GroupOp
+		{
+			std::size_t group;
+			bool build, update;
+			std::uint64_t scratchOffset;
+			std::size_t firstMember, memberCount;
+		};
+		std::vector<GroupOp> groupOps;
+		for (auto& group : skinGroups_)
+			group.seen = false;
+		skinGroupDraws_.clear();
+		skinGroupMembers_.clear();
+		for (std::size_t d = 0; d < draws.size(); ++d)
+			if (draws[d].group != 0)
+				skinGroupDraws_.emplace_back(draws[d].group, static_cast<std::uint32_t>(d));
+		std::sort(skinGroupDraws_.begin(), skinGroupDraws_.end());
+		auto groupGeometry = [&](const SkinShape& a_shape) {
+			D3D12_RAYTRACING_GEOMETRY_DESC desc{};
+			desc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+			desc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+			desc.Triangles.VertexBuffer.StartAddress = skinOutputPool_.Address(a_shape.output);
+			desc.Triangles.VertexBuffer.StrideInBytes = kSkinOutputStride;
+			desc.Triangles.VertexCount = a_shape.vertices;
+			desc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+			desc.Triangles.IndexBuffer = skinStaticPool_.Address(a_shape.index);
+			desc.Triangles.IndexCount = a_shape.triangles * 3;
+			desc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+			return desc;
+		};
+		for (std::size_t i = 0; i < skinGroupDraws_.size();) {
+			const std::uint32_t key = skinGroupDraws_[i].first;
+			std::size_t end = i;
+			while (end < skinGroupDraws_.size() && skinGroupDraws_[end].first == key)
+				++end;
+			std::size_t g = 0;
+			while (g < skinGroups_.size() && skinGroups_[g].key != key)
+				++g;
+			if (g == skinGroups_.size()) {
+				skinGroups_.emplace_back();
+				skinGroups_.back().key = key;
 			}
-			const std::uint64_t capacity = std::bit_ceil(std::max<std::uint64_t>(boneBytes, 64 * 1024));
-			a_context.boneBuffer = CreateBuffer(capacity, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
-			if (!a_context.boneBuffer || FAILED(a_context.boneBuffer->Map(0, nullptr, &a_context.boneMapped)) || !a_context.boneMapped) {
-				a_context.boneBuffer.Reset();
-				a_context.boneMapped = nullptr;
-				for (const auto& op : ops)
-					skins_[draws[op.draw].shape].lastSubmission = 0;
-				SetSkinFault("could not create the bone matrix buffer");
-				return;
+			skinGroups_[g].seen = true;
+			const std::size_t first = skinGroupMembers_.size();
+			const SkinDraw* lead = nullptr;
+			bool anySkinned = false;
+			for (std::size_t k = i; k < end; ++k) {
+				const std::uint32_t d = skinGroupDraws_[k].second;
+				const auto& draw = draws[d];
+				if (draw.shape >= skins_.size())
+					continue;
+				const auto& shape = skins_[draw.shape];
+				if (!shape.live || !shape.uploaded || !shape.grouped)
+					continue;
+				const bool skinnedNow = !draw.reuse && shape.lastSubmission == submission;
+				if (!skinnedNow && !(draw.reuse && shape.skinned))
+					continue;  // counted above (not ready)
+				if (std::find_if(skinGroupMembers_.begin() + first, skinGroupMembers_.end(), [&](std::uint32_t a_member) { return draws[a_member].shape == draw.shape; }) !=
+					skinGroupMembers_.end())
+					continue;  // the same shape twice: one geometry
+				if (lead && (draw.x != lead->x || draw.y != lead->y || draw.z != lead->z)) {
+					++skinStats_.notReadyLastFrame;
+					continue;
+				}
+				if (!lead)
+					lead = &draw;
+				anySkinned = anySkinned || skinnedNow;
+				skinGroupMembers_.push_back(d);
 			}
-			a_context.boneBuffer->SetName(L"CS RayTracing character bones");
-			a_context.boneCapacity = capacity;
-			skinStats_.boneBytes += capacity;
+			i = end;
+			const std::size_t count = skinGroupMembers_.size() - first;
+			if (count == 0)
+				continue;
+			// By serial: a member that only moved in the character's list (equip changes the order) keeps the BLAS.
+			std::sort(skinGroupMembers_.begin() + static_cast<std::ptrdiff_t>(first), skinGroupMembers_.end(),
+				[&](std::uint32_t a_lhs, std::uint32_t a_rhs) { return skins_[draws[a_lhs].shape].serial < skins_[draws[a_rhs].shape].serial; });
+			auto& group = skinGroups_[g];
+			bool same = group.built && group.serials.size() == count;
+			for (std::size_t m = 0; same && m < count; ++m)
+				same = skins_[draws[skinGroupMembers_[first + m]].shape].serial == group.serials[m];
+			bool build = !same;
+			if (!build && anySkinned && group.refits >= kSkinRebuildFrames && rebuilds < kSkinRebuildsPerFrame) {
+				build = true;  // periodic rebuild (a refit loosens the BVH as the pose drifts)
+				++rebuilds;
+			}
+			const bool update = !build && anySkinned;
+			if (build) {
+				skinGroupDescs_.clear();
+				for (std::size_t m = 0; m < count; ++m)
+					skinGroupDescs_.push_back(groupGeometry(skins_[draws[skinGroupMembers_[first + m]].shape]));
+				D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+				inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+				inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+				inputs.NumDescs = static_cast<UINT>(count);
+				inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+				inputs.pGeometryDescs = skinGroupDescs_.data();
+				D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+				device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+				const std::uint64_t need = AlignUp(info.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+				if (need == 0 || info.ScratchDataSizeInBytes == 0) {
+					skinStats_.notReadyLastFrame += static_cast<std::uint32_t>(count);
+					skinGroupMembers_.resize(first);
+					continue;
+				}
+				if (!group.blas.Valid() || group.blasBytes < need) {
+					const std::uint64_t bytes = AlignUp(static_cast<std::uint64_t>(static_cast<double>(need) * kSkinGroupSlack),
+						D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+					ArenaAlloc fresh;
+					if (!asPool_.Allocate(bytes, fresh)) {
+						// The pool grows on its thread: tried again next frame (the old BLAS, if any, stays allocated).
+						++stats_.pools.allocFailsLastFrame;
+						skinStats_.notReadyLastFrame += static_cast<std::uint32_t>(count);
+						skinGroupMembers_.resize(first);
+						continue;
+					}
+					if (group.blas.Valid()) {
+						asPool_.Free(group.blas, RetireValue());
+						skinStats_.bytes -= std::min(skinStats_.bytes, group.blasBytes);
+					}
+					group.blas = fresh;
+					group.blasBytes = bytes;
+					group.built = false;
+					skinStats_.bytes += bytes;
+				}
+				group.buildScratch = AlignUp(info.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+				group.updateScratch =
+					AlignUp(std::max<std::uint64_t>(info.UpdateScratchDataSizeInBytes, 256), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+			}
+			groupOps.push_back(GroupOp{ g, build, update, scratchTotal, first, count });
+			if (build || update)
+				scratchTotal += AlignUp(build ? group.buildScratch : group.updateScratch, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
 		}
-		std::memcpy(a_context.boneMapped, a_input.skinBones->data(), boneBytes);
 
-		// Scratch: a region per build / refit, so they need no barriers between them.
-		if (!skinScratch_ || skinScratchBytes_ < scratchTotal) {
+		auto finishGroups = [&]() {
+			// Groups no character drew this frame: their BLAS goes (behind the fence).
+			for (std::size_t g = 0; g < skinGroups_.size();) {
+				if (skinGroups_[g].seen) {
+					++g;
+					continue;
+				}
+				ReleaseSkinGroup(skinGroups_[g]);
+				skinGroups_[g] = std::move(skinGroups_.back());
+				skinGroups_.pop_back();
+			}
+		};
+		auto dropRecorded = [&]() {
+			for (const auto& op : ops)
+				skins_[draws[op.draw].shape].lastSubmission = 0;
+			for (const auto d : groupSkins)
+				skins_[draws[d].shape].lastSubmission = 0;
+		};
+
+		const bool skinning = !ops.empty() || !groupSkins.empty();
+		if (skinning) {
+			// This frame's bone matrices into the context's own upload buffer (the context is free).
+			const std::uint64_t boneBytes = boneFloats * sizeof(float);
+			if (!a_context.boneBuffer || a_context.boneCapacity < boneBytes) {
+				if (a_context.boneBuffer) {
+					if (a_context.boneMapped)
+						a_context.boneBuffer->Unmap(0, nullptr);
+					skinStats_.boneBytes -= std::min(skinStats_.boneBytes, a_context.boneCapacity);
+					a_context.boneBuffer.Reset();
+					a_context.boneMapped = nullptr;
+					a_context.boneCapacity = 0;
+				}
+				const std::uint64_t capacity = std::bit_ceil(std::max<std::uint64_t>(boneBytes, 64 * 1024));
+				a_context.boneBuffer = CreateBuffer(capacity, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+				if (!a_context.boneBuffer || FAILED(a_context.boneBuffer->Map(0, nullptr, &a_context.boneMapped)) || !a_context.boneMapped) {
+					a_context.boneBuffer.Reset();
+					a_context.boneMapped = nullptr;
+					dropRecorded();
+					SetSkinFault("could not create the bone matrix buffer");
+					return;
+				}
+				a_context.boneBuffer->SetName(L"CS RayTracing character bones");
+				a_context.boneCapacity = capacity;
+				skinStats_.boneBytes += capacity;
+			}
+			std::memcpy(a_context.boneMapped, a_input.skinBones->data(), boneBytes);
+		}
+
+		if (scratchTotal > 0 && (!skinScratch_ || skinScratchBytes_ < scratchTotal)) {
+			// Scratch: a region per build / refit, so they need no barriers between them.
 			if (skinScratch_)
 				Retire(skinScratch_, skinScratchBytes_, &skinStats_.scratchBytes);
 			skinScratch_.Reset();
@@ -484,8 +685,7 @@ namespace RayTracingRT
 			const std::uint64_t bytes = AlignUp(std::max<std::uint64_t>(scratchTotal + scratchTotal / 4, 4ull << 20), 64 * 1024);
 			skinScratch_ = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
 			if (!skinScratch_) {
-				for (const auto& op : ops)
-					skins_[draws[op.draw].shape].lastSubmission = 0;
+				dropRecorded();
 				SetSkinFault(std::format("could not create a {:.1f} MB scratch buffer", static_cast<double>(bytes) / (1024.0 * 1024.0)));
 				return;
 			}
@@ -494,33 +694,44 @@ namespace RayTracingRT
 			skinStats_.scratchBytes += bytes;
 		}
 
-		skinRecorded_ = true;
-		// Skinning. (46g) The skinned-vertex pool blocks these shapes live in go to UAV as a whole (the other shapes in
-		// them are not read meanwhile: a BLAS holds its own copy of the vertices).
-		std::vector<std::uint32_t> outputBlocks;
-		outputBlocks.reserve(ops.size());
-		for (const auto& op : ops)
-			outputBlocks.push_back(skins_[draws[op.draw].shape].output.block);
-		std::sort(outputBlocks.begin(), outputBlocks.end());
-		outputBlocks.erase(std::unique(outputBlocks.begin(), outputBlocks.end()), outputBlocks.end());
-		TransitionBlocks(a_list, skinOutputPool_, outputBlocks, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-		a_list->SetComputeRootSignature(skinRootSignature_.Get());
-		a_list->SetPipelineState(skinPipeline_.Get());
-		const D3D12_GPU_VIRTUAL_ADDRESS bones = a_context.boneBuffer->GetGPUVirtualAddress();
-		for (const auto& op : ops) {
-			const auto& draw = draws[op.draw];
-			const auto& shape = skins_[draw.shape];
-			const std::uint32_t constants[4] = { shape.vertices, draw.boneOffset, shape.boneCount, 0 };
-			a_list->SetComputeRoot32BitConstants(0, 4, constants, 0);
-			a_list->SetComputeRootShaderResourceView(1, skinStaticPool_.Address(shape.rest));
-			a_list->SetComputeRootShaderResourceView(2, bones);
-			a_list->SetComputeRootUnorderedAccessView(3, skinOutputPool_.Address(shape.output));
-			a_list->Dispatch((shape.vertices + kSkinGroupSize - 1) / kSkinGroupSize, 1, 1);
+		if (skinning) {
+			skinRecorded_ = true;
+			// Skinning. (46g) The skinned-vertex pool blocks these shapes live in go to UAV as a whole (the other shapes in
+			// them are not read meanwhile: a BLAS holds its own copy of the vertices; the builds / refits below, merged ones
+			// too, read the skinned vertices only after the blocks went back).
+			std::vector<std::uint32_t> outputBlocks;
+			outputBlocks.reserve(ops.size() + groupSkins.size());
+			for (const auto& op : ops)
+				outputBlocks.push_back(skins_[draws[op.draw].shape].output.block);
+			for (const auto d : groupSkins)
+				outputBlocks.push_back(skins_[draws[d].shape].output.block);
+			std::sort(outputBlocks.begin(), outputBlocks.end());
+			outputBlocks.erase(std::unique(outputBlocks.begin(), outputBlocks.end()), outputBlocks.end());
+			TransitionBlocks(a_list, skinOutputPool_, outputBlocks, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+			a_list->SetComputeRootSignature(skinRootSignature_.Get());
+			a_list->SetPipelineState(skinPipeline_.Get());
+			a_list->SetComputeRootShaderResourceView(2, a_context.boneBuffer->GetGPUVirtualAddress());  // (46m) once: the same for every shape
+			auto dispatch = [&](std::size_t a_draw) {
+				const auto& draw = draws[a_draw];
+				auto& shape = skins_[draw.shape];
+				const std::uint32_t constants[4] = { shape.vertices, draw.boneOffset, shape.boneCount, 0 };
+				a_list->SetComputeRoot32BitConstants(0, 4, constants, 0);
+				a_list->SetComputeRootShaderResourceView(1, skinStaticPool_.Address(shape.rest));
+				a_list->SetComputeRootUnorderedAccessView(3, skinOutputPool_.Address(shape.output));
+				a_list->Dispatch((shape.vertices + kSkinGroupSize - 1) / kSkinGroupSize, 1, 1);
+				shape.skinned = true;
+				skinStats_.verticesLastFrame += shape.vertices;
+				++skinStats_.dispatchesLastFrame;
+			};
+			for (const auto& op : ops)
+				dispatch(op.draw);
+			for (const auto d : groupSkins)
+				dispatch(d);
+			TransitionBlocks(a_list, skinOutputPool_, outputBlocks, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		}
-		TransitionBlocks(a_list, skinOutputPool_, outputBlocks, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-		// BLAS builds and in-place refits.
-		const D3D12_GPU_VIRTUAL_ADDRESS scratch = skinScratch_->GetGPUVirtualAddress();
+		// BLAS builds and in-place refits (shapes with a BLAS of their own).
+		const D3D12_GPU_VIRTUAL_ADDRESS scratch = skinScratch_ ? skinScratch_->GetGPUVirtualAddress() : 0;
 		for (const auto& op : ops) {
 			auto& shape = skins_[draws[op.draw].shape];
 			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc{};
@@ -555,8 +766,63 @@ namespace RayTracingRT
 				++shape.refits;
 				++skinStats_.refitsLastFrame;
 			}
-			skinStats_.verticesLastFrame += shape.vertices;
 			o_ready[op.draw] = 1;
 		}
+
+		// (46m) Merged BLASes: built / refit in place (one call per character), then this frame's instances.
+		for (const auto& op : groupOps) {
+			auto& group = skinGroups_[op.group];
+			if (op.build || op.update) {
+				skinRecorded_ = true;
+				skinGroupDescs_.clear();
+				for (std::size_t m = 0; m < op.memberCount; ++m)
+					skinGroupDescs_.push_back(groupGeometry(skins_[draws[skinGroupMembers_[op.firstMember + m]].shape]));
+				D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc{};
+				buildDesc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+				buildDesc.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+				buildDesc.Inputs.NumDescs = static_cast<UINT>(op.memberCount);
+				buildDesc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+				buildDesc.Inputs.pGeometryDescs = skinGroupDescs_.data();
+				buildDesc.DestAccelerationStructureData = asPool_.Address(group.blas);
+				buildDesc.ScratchAccelerationStructureData = scratch + op.scratchOffset;
+				if (op.update) {
+					buildDesc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+					buildDesc.SourceAccelerationStructureData = buildDesc.DestAccelerationStructureData;  // in place
+				}
+				a_list->BuildRaytracingAccelerationStructure(&buildDesc, 0, nullptr);
+				if (op.build) {
+					group.built = true;
+					group.refits = 0;
+					group.serials.clear();
+					for (std::size_t m = 0; m < op.memberCount; ++m) {
+						auto& shape = skins_[draws[skinGroupMembers_[op.firstMember + m]].shape];
+						group.serials.push_back(shape.serial);
+						shape.built = true;  // traced from now on (the caster filter may take it out of the shadow map)
+					}
+					++skinStats_.groupBuildsLastFrame;
+					++skinStats_.buildsTotal;
+				} else {
+					++group.refits;
+					++skinStats_.groupRefitsLastFrame;
+				}
+			} else {
+				++skinStats_.groupKeptLastFrame;
+			}
+			for (std::size_t m = 0; m < op.memberCount; ++m)
+				o_ready[skinGroupMembers_[op.firstMember + m]] = 1;
+			const auto& lead = draws[skinGroupMembers_[op.firstMember]];
+			SkinGroupInstance instance;
+			instance.blas = asPool_.Address(group.blas);
+			instance.x = lead.x;
+			instance.y = lead.y;
+			instance.z = lead.z;
+			instance.npc = lead.npc;
+			instance.owner = lead.owner;
+			instance.members = static_cast<std::uint32_t>(op.memberCount);
+			skinGroupFrame_.push_back(instance);
+			++skinStats_.groupsLastFrame;
+			skinStats_.groupShapesLastFrame += instance.members;
+		}
+		finishGroups();
 	}
 }

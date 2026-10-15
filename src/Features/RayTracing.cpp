@@ -69,7 +69,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	AOModeInterior,
 	LoadingPump,
 	LoadingPumpMs,
-	BlackWindowMs)
+	BlackWindowMs,
+	CharactersParallel,
+	CharactersScanCache,
+	CharactersMerge,
+	SplitTraceSync)
 
 namespace
 {
@@ -188,6 +192,18 @@ namespace
 		}
 	};
 	TransitionEventSink g_transitionSink;
+
+	// (46m) Equip / unequip: that actor's 3D is walked in full for the next frames (Character Scan Cache). Records only.
+	struct EquipEventSink : RE::BSTEventSink<RE::TESEquipEvent>
+	{
+		RE::BSEventNotifyControl ProcessEvent(const RE::TESEquipEvent* a_event, RE::BSTEventSource<RE::TESEquipEvent>*) override
+		{
+			if (a_event && a_event->actor)
+				RayTracingCharacters::Characters::NoteEquip(a_event->actor.get());
+			return RE::BSEventNotifyControl::kContinue;
+		}
+	};
+	EquipEventSink g_equipSink;
 	constexpr double kEventsLogAfterCloseMs = 6000.0;  // (46k) the events line at the latest this long after the loading screen closed
 	constexpr std::size_t kMaxQueuedCellEvents = 4096;
 
@@ -374,6 +390,7 @@ void RayTracing::RegisterEventSinks()
 			holder->AddEventSink<RE::TESCellFullyLoadedEvent>(&g_transitionSink);
 			holder->AddEventSink<RE::TESFastTravelEndEvent>(&g_transitionSink);
 			holder->AddEventSink<RE::TESLoadGameEvent>(&g_transitionSink);
+			holder->AddEventSink<RE::TESEquipEvent>(&g_equipSink);  // (46m)
 			eventSinksRegistered = true;
 		}
 	}
@@ -835,7 +852,9 @@ void RayTracing::UpdateCharacters()
 	}
 	// (45j) Alpha-tested parts (fur trims, cut-out cloth; hair when Hair is ray traced) whenever the
 	// alpha pipeline exists; a change of the first three re-captures the characters.
-	characters.Configure(settings.PhysicsParts, settings.Hair, backend.SkinAlphaAvailable(), settings.FirstPersonPlayer);
+	// (46m) Read lanes, scan cache, merged BLASes (a change of the last captures the characters again).
+	characters.Configure(settings.PhysicsParts, settings.Hair, backend.SkinAlphaAvailable(), settings.FirstPersonPlayer, settings.CharactersParallel,
+		settings.CharactersScanCache, settings.CharactersMerge);
 }
 
 
@@ -2109,6 +2128,35 @@ void RayTracing::PublishCpuSplit()
 		detail.plKept = ps.kept;
 		detail.plChurn = pointThisFrame ? stats.pointChurnPerFrame : -1;
 		detail.plBeamsExcluded = static_cast<std::uint32_t>(excludedBeams.size());
+		// (46m) Characters step by step (this frame's Update / CollectDraws), merged BLASes, the split sync.
+		if (activeThisFrame && settings.Characters && cpuLast.characters >= 0.0f) {
+			const auto& ch = characters.GetStats();
+			detail.chCandidates = ch.candidatesMs;
+			detail.chReads = ch.readsMs;
+			detail.chCapture = ch.captureMs;
+			detail.chCommit = ch.commitMs;
+			detail.chFilter = ch.filterMs;
+			detail.chCollect = characters.LastCollectMs();
+			detail.chBones = ch.bonesRead;
+			detail.chRescans = ch.rescans;
+			detail.chLanes = ch.lanes;
+			detail.chActors = ch.actors;
+			detail.chShapes = ch.shapes;
+			const auto& sk = backend.GetSkinStats();
+			detail.skinGroups = sk.groupsLastFrame;
+			detail.skinGroupBuilds = sk.groupBuildsLastFrame;
+			detail.skinGroupRefits = sk.groupRefitsLastFrame;
+			detail.skinInstances = sk.instancesLastFrame;
+			detail.skinDispatches = sk.dispatchesLastFrame;
+		}
+		if (combined && pending.traceSync) {
+			const float sun = passMs(true, Util::GpuBucket::RayTracingSync);
+			const float points = pending.splitSun ? passMs(true, Util::GpuBucket::RayTracingSyncPoint) : 0.0f;
+			detail.syncSplit = pending.splitSun ? 1 : 0;
+			detail.syncSunGpuMs = sun;
+			detail.syncPlGpuMs = points;
+			detail.syncGpuMs = std::max(sun, 0.0f) + std::max(points, 0.0f);  // rt_sync_gpu_ms: the whole wait, as before
+		}
 	}
 	detail.sssGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::ScreenSpaceShadows);
 	// (45k) A slow D3D12 record + submit names its slowest call in the log (at most every 2 s).
@@ -2364,6 +2412,7 @@ void RayTracing::RunFrame()
 	input.skinUploadCpuMs = blackScreen ? kBlackSkinUploadCpuMs : 0.0f;
 	input.skinBones = &skinBones;
 	input.deferWait = true;  // (45l) FinishFrame waits (after the other features' prepasses)
+	input.splitSun = settings.SplitTraceSync;  // (46m) used only with point lights traced too
 	// (46b) Point-light shadows: this frame's sources, traced right after the sun in the same submission.
 	{
 		const std::int64_t pointStart = Qpc();
@@ -2556,6 +2605,7 @@ void RayTracing::RunFrame()
 	pending.active = true;
 	pending.interior = false;
 	pending.traceSync = true;
+	pending.splitSun = backend.GetStats().sunSplitLastFrame && backend.SunWaitPending();  // (46m)
 	std::memcpy(pending.cbBytes.data(), &cb, sizeof(cb));
 	pending.combineFlags = combineFlags;
 	pending.width = width;
@@ -2642,11 +2692,16 @@ void RayTracing::FinishFrame()
 	// 1. The D3D11 queue waits for the trace (on the GPU). Timed: the GPU stall it causes.
 	// (46h) Not on an interior frame that traced RTAO only: nothing here reads the trace then, and the AO list behind it on
 	// the same queue signals the second fence after it, so DrawAmbientOcclusion's wait covers it (rt_sync is not extended).
+	// (46m) Split Trace Sync: here the sun alone; the point lights' part right before their denoiser (step 5).
 	if (pending.traceSync) {
 		timers->Begin(Util::GpuBucket::RayTracingSync);
-		backend.WaitForTrace();
+		if (pending.splitSun)
+			backend.WaitForSun();
+		else
+			backend.WaitForTrace();
 		timers->End(Util::GpuBucket::RayTracingSync);
 	}
+	// Every return before step 5 still leaves no point-light wait behind: the next trace (RunFrame) takes it first.
 	if (backend.HasFailed() || !mask.texture || !mask.SRV || !maskTemp) {
 		if (backend.HasFailed())
 			Disable(Status::Failed, backend.LastError());
@@ -2814,7 +2869,17 @@ void RayTracing::FinishFrame()
 		context->CopySubresourceRegion(mask.texture, 0, 0, 0, 0, maskTemp.get(), 0, &box);
 	}
 	timers->End(Util::GpuBucket::RayTracingCombine);
-	// 5. (46b) Point-light shadows: denoise, then bind them for the pixel shaders.
+	// 5. (46m) Split Trace Sync: the rest of the trace (the point lights) before anything reads it.
+	if (pending.splitSun) {
+		timers->Begin(Util::GpuBucket::RayTracingSyncPoint);
+		backend.WaitForTrace();
+		timers->End(Util::GpuBucket::RayTracingSyncPoint);
+		if (backend.HasFailed()) {
+			Disable(Status::Failed, backend.LastError());
+			return;
+		}
+	}
+	// (46b) Point-light shadows: denoise, then bind them for the pixel shaders.
 	if (pointThisFrame) {
 		try {
 			FinishPointLights();
@@ -3703,6 +3768,7 @@ void RayTracing::RunInteriorFrame()
 	pending.active = true;
 	pending.interior = true;
 	pending.traceSync = pointThisFrame;  // (46h) RTAO only: no rt_sync (DrawAmbientOcclusion's wait covers the trace)
+	pending.splitSun = false;  // (46m) no sun trace indoors
 	std::memcpy(pending.cbBytes.data(), &cb, sizeof(cb));
 	pending.combineFlags = 0;
 	pending.width = width;
@@ -4489,6 +4555,30 @@ void RayTracing::DrawDiagnostics()
 		if (!lastEventsSummary.empty())
 			ImGui::TextWrapped("Last transition: %s", lastEventsSummary.c_str());
 
+		// (46m) Cost switches, each for an A/B (on = 46m, off = as 46l). Same picture either way.
+		ImGui::Checkbox("Parallel Character Reads", &settings.CharactersParallel);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: the characters' bone positions and parts are read on a few helper threads at the same moment of the frame as before");
+			ImGui::Text("  (the frame waits for them right there). Off: all on the render thread, as 46l. F7: rt_ch_reads_ms, rt_ch_lanes.");
+		}
+		ImGui::Checkbox("Character Scan Cache", &settings.CharactersScanCache);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: a character's whole 3D is searched for parts only when it may have changed (equipping, a new character) and every 8 frames;");
+			ImGui::Text("  in between only its known parts are checked (still attached, not hidden). Off: searched every frame, as 46l. F7: rt_ch_rescans.");
+		}
+		ImGui::Checkbox("Merge Character Parts", &settings.CharactersMerge);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: each character's solid parts (body, clothes, armour, weapons) are one ray-tracing object: one update per character per");
+			ImGui::Text("  frame instead of one per part (less GPU and CPU in crowds). Hair and cut-out parts stay separate. Off: one object per part, as 46l.");
+			ImGui::Text("  Changing it rebuilds the characters (a moment). F7: rt_skin_groups, rt_prep_gpu_ms, rt_e_skin_ms.");
+		}
+		ImGui::Checkbox("Split Trace Sync", &settings.SplitTraceSync);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (with point-light shadows traced): the game's GPU queue waits only for the sun's shadow before merging it, and for the point");
+			ImGui::Text("  lights only right before their clean-up, so that work overlaps them. Off: one wait for both, as 46l.");
+			ImGui::Text("  F7: rt_sync_sun_gpu_ms, rt_sync_pl_gpu_ms (rt_sync_gpu_ms = both).");
+		}
+
 		const auto& rt = backend.GetStats();
 		const auto& sc = scene.GetStats();
 		const auto& skip = sc.skipped;
@@ -4606,6 +4696,11 @@ void RayTracing::DrawDiagnostics()
 					static_cast<unsigned long long>(sk.buildsTotal), sk.notReadyLastFrame, sk.pending);
 				ImGui::Text("  VRAM: %s (of %s budget), scratch %s, bones %s; CPU %.2f ms (worst %.2f ms)", Megabytes(sk.bytes).c_str(),
 					Megabytes(RayTracingRT::Backend::kSkinBudgetBytes).c_str(), Megabytes(sk.scratchBytes).c_str(), Megabytes(sk.boneBytes).c_str(), ch.lastMs, ch.maxMs);
+				// (46m)
+				ImGui::Text("  CPU ms: actors %.2f, reads %.2f (%u lanes, %u bones, %u full scans), captures %.2f, still check %.2f, filter %.2f, draw list %.2f",
+					ch.candidatesMs, ch.readsMs, ch.lanes, ch.bonesRead, ch.rescans, ch.captureMs, ch.commitMs, ch.filterMs, characters.LastCollectMs());
+				ImGui::Text("  Merged: %u characters (%u parts), %u built, %u refit, %u kept; %u TLAS instances, %u skinning dispatches", sk.groupsLastFrame,
+					sk.groupShapesLastFrame, sk.groupBuildsLastFrame, sk.groupRefitsLastFrame, sk.groupKeptLastFrame, sk.instancesLastFrame, sk.dispatchesLastFrame);
 				ImGui::Text("  Left to the shadow map: physics off %u, alpha off %u, alpha failed %u, shader %u, type %u, no CPU data %u, bad data %u,",
 					ch.skipPhysicsOff, ch.skipAlphaOff, ch.skipAlphaFailed, ch.skipShader, ch.skipGeometryType, ch.skipNoCpuData, ch.skipBadData);
 				ImGui::Text("    placement %u, budget/size %u (VRAM %llu), shape cap %u; bone indices: palette %u, global %u; faces (morphs at capture) %u",
@@ -4736,6 +4831,10 @@ std::string RayTracing::DescribeForProfile() const
 	text += settings.LoadingPump ? std::format(", prepare behind loading screens on ({:.0f} ms per frame, black window {:.0f} ms)", settings.LoadingPumpMs,
 									   settings.BlackWindowMs) :
 	                               std::string(", prepare behind loading screens off (46i)");
+	// (46m)
+	text += std::format(", parallel character reads {}, character scan cache {}, merge character parts {}, split trace sync {}",
+		settings.CharactersParallel ? "on" : "off", settings.CharactersScanCache ? "on" : "off", settings.CharactersMerge ? "on" : "off",
+		settings.SplitTraceSync ? "on" : "off");
 	return text;
 }
 

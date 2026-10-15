@@ -38,7 +38,13 @@
  * its texture is ready) unless "Keep Characters in the Shadow Map" is on; a shape that could not
  * be captured keeps its shadow-map shadow.
  *
- * Main / render thread only.
+ * (46m) CPU: the per-actor reads (scene graph, bone matrices) run on up to kReadLanes lanes (this thread
+ * and a few workers that only read the engine's nodes; joined before anything uses them, at the same point
+ * of the frame as before); with the scan cache an actor's 3D is walked in full only when it may have
+ * changed, its known shapes are checked every frame. Merged: an actor's opaque shapes are one BLAS
+ * (SkinDraw::group = Actor::serial); a shape whose matrices are of another origin is rebased.
+ *
+ * Main / render thread only (NoteEquip: any thread).
  */
 namespace RayTracingCharacters
 {
@@ -46,6 +52,11 @@ namespace RayTracingCharacters
 	inline constexpr float kEnterDistance = 2840.0f;  // 40 m
 	inline constexpr float kLeaveDistance = 3200.0f;
 	inline constexpr std::uint32_t kMaxShapesPerActor = 64;
+	// (46m) Character Scan Cache: every other actor's 3D is scanned in full every kRescanFrames frames (staggered; the
+	// player every frame), and for kEquipScanFrames frames after it equipped / unequipped something.
+	inline constexpr std::uint32_t kRescanFrames = 8;
+	inline constexpr std::uint32_t kEquipScanFrames = 30;
+	inline constexpr std::uint32_t kReadLanes = 4;  // (46m) per-actor reads: this thread + 3 workers
 
 	struct Stats
 	{
@@ -79,6 +90,18 @@ namespace RayTracingCharacters
 		std::uint32_t dynamicShapes = 0;   // BSDynamicTriShape positions taken at capture
 		float lastMs = 0.0f;               // CPU this frame
 		float maxMs = 0.0f;
+		// (46m) This frame's CPU, step by step (ms; F7 rt_ch_*): the actors to trace; the per-actor reads (scene graph
+		// scan or check of the known shapes, bone matrices; on the read lanes); new shapes captured / changed ones retired;
+		// still-pose check; caster filter (CollectDraws: LastCollectMs). Counts: bone matrices read, actors whose 3D was scanned in full,
+		// lanes the reads ran on (1 = this thread alone).
+		float candidatesMs = 0.0f;
+		float readsMs = 0.0f;
+		float captureMs = 0.0f;
+		float commitMs = 0.0f;
+		float filterMs = 0.0f;
+		std::uint32_t bonesRead = 0;
+		std::uint32_t rescans = 0;
+		std::uint32_t lanes = 0;
 	};
 
 	class Characters
@@ -94,9 +117,16 @@ namespace RayTracingCharacters
 		/// parts; a_alpha: alpha-tested parts with their cut-out (the alpha pipeline exists);
 		/// a_firstPersonPlayer (45j): the player is traced in first person too (off: in first person it stays
 		/// in the shadow map). A change of the first three drops everything (next Update).
-		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer);
+		/// (46m) a_parallel: the per-actor reads run on a few read lanes (joined before anything uses them);
+		/// a_scanCache: an actor's 3D is scanned in full only when it may have changed (equip, a new actor) and
+		/// every kRescanFrames frames, the known shapes are checked every frame; a_merge: an actor's opaque
+		/// shapes are one merged BLAS (a change drops everything).
+		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer, bool a_parallel = true, bool a_scanCache = true,
+			bool a_merge = true);
 		/// Drops everything on the next Update (loading screens, from any thread).
 		void RequestFlush() { flushRequested_.store(true); }
+		/// (46m) An actor equipped / unequipped something (any thread): its 3D is scanned in full for the next frames.
+		static void NoteEquip(const void* a_reference);
 		/// a_rect: world xy min / max of the traced area (actors outside are not taken).
 		/// (46g) a_budgetMs / a_maxCaptures: new shapes read this frame (larger behind loading / black screens).
 		/// (46k) a_eye: the point actors are sorted by / chosen within (default the camera; behind a loading screen the camera is
@@ -116,6 +146,8 @@ namespace RayTracingCharacters
 		/// the player, and one sphere around every other actor. For the trace's character-ray culling.
 		void GetBounds(const double a_camera[3], float o_player[4], float o_others[4]) const;
 		void ResetPeaks() { stats_.maxMs = 0.0f; }
+		/// (46m) CPU ms of the last CollectDraws.
+		[[nodiscard]] float LastCollectMs() const { return collectMs_; }
 		/// (45n) Still poses: a shape whose bone matrices are bit-identical to the ones it was last skinned
 		/// with keeps its skinned BLAS (no upload, skinning or refit). Count of last frame:
 		[[nodiscard]] std::uint32_t StillReusedLastFrame() const { return stillReused_; }
@@ -144,6 +176,15 @@ namespace RayTracingCharacters
 			std::uint32_t vertices = 0;
 			std::vector<float> matrices;    // last bone matrices (12 floats each), relative to origin
 			double origin[3]{};
+			// (46m) This frame's read (per-actor reads, possibly on a read lane): the matrices, whether they could be read.
+			std::vector<float> fresh;
+			bool freshOk = false;
+			bool grouped = false;  // (46m) in its actor's merged BLAS (opaque, Merge Character Parts when captured)
+		};
+		struct Found
+		{
+			RE::BSGeometry* geometry;
+			std::uint64_t signature;
 		};
 		struct Actor
 		{
@@ -153,16 +194,23 @@ namespace RayTracingCharacters
 			std::vector<std::unique_ptr<Shape>> shapes;
 			std::vector<std::unique_ptr<Shape>> retiringShapes;  // traced this frame, released in EndFrame
 			ankerl::unordered_dense::set<std::uint64_t> refused;  // signatures of shapes judged not capturable (counted once)
-		};
-		struct Found
-		{
-			RE::BSGeometry* geometry;
-			std::uint64_t signature;
+			// (46m) Its merged BLAS's key (unique per Actor entry: a new 3D is a new entry), the origin of this frame's bone
+			// matrices, full scans until this frame (equip, new), this frame's shapes found (scan or check) and bones read.
+			std::uint32_t serial = 0;
+			double origin[3]{};
+			std::uint64_t scanUntil = 0;
+			std::vector<Found> found;
+			std::uint32_t bonesRead = 0;
+			bool scanned = false;
+			bool readOk = false;  // this frame's reads completed (otherwise its shapes stay as they were)
 		};
 
 		void ReleaseShape(RayTracingRT::Backend& a_backend, Shape& a_shape);
 		void ReleaseActor(RayTracingRT::Backend& a_backend, Actor& a_actor);
-		void Enumerate(Actor& a_actor, std::vector<Found>& o_found);
+		static void Enumerate(Actor& a_actor, std::vector<Found>& o_found);
+		/// (46m) One actor's reads (any read lane; touches nothing but this actor's entry): its shapes (a full scan, or a
+		/// check of the known ones: still attached under the root, not hidden, signature), its known shapes' bone matrices.
+		static void ReadActor(Actor& a_actor, bool a_scan);
 		/// Reads, checks and hands a shape to the backend; nullptr when it is not taken (counted).
 		std::unique_ptr<Shape> Capture(RayTracingRT::Backend& a_backend, Actor& a_actor, RE::BSGeometry* a_geometry, std::uint64_t a_signature);
 		/// This frame's bone matrices; false when a bone could not be read (the last ones are kept).
@@ -171,12 +219,20 @@ namespace RayTracingCharacters
 		std::vector<std::unique_ptr<Actor>> actors_;
 		std::vector<std::unique_ptr<Actor>> retiring_;  // traced this frame, released in EndFrame
 		mutable std::vector<std::pair<const void*, std::uint32_t>> owners_;  // (46e) CollectDraws
+		mutable float collectMs_ = 0.0f;  // (46m)
 		std::atomic<bool> flushRequested_{ false };
 		bool physics_ = false;
 		bool hair_ = false;               // (45j)
 		bool firstPersonPlayer_ = false;  // (45j)
 		bool alpha_ = false;
 		std::uint32_t stillReused_ = 0;  // (45n)
+		// (46m)
+		bool parallel_ = true;
+		bool scanCache_ = true;
+		bool merge_ = true;
+		std::uint64_t frame_ = 0;
+		std::uint32_t actorSerial_ = 0;
+		std::vector<std::pair<float, RE::Actor*>> candidates_;  // scratch
 		std::uint32_t filterEpoch_ = 0;
 		std::uint32_t loggedPlacement_ = 0;
 		std::uint32_t loggedOther_ = 0;

@@ -89,6 +89,8 @@ namespace Util
 		// (46f) RTAO: the D3D11 filter (1/4-resolution bilateral + clamped history) and composite; the wait for its second fence.
 		RayTracingAO,
 		RayTracingAOSync,
+		// (46m) Split Trace Sync: the wait for the point lights (the sun's part stays in RayTracingSync).
+		RayTracingSyncPoint,
 		Count
 	};
 

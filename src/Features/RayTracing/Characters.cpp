@@ -4,6 +4,9 @@
 
 #include <DirectXPackedVector.h>
 #include <bit>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 namespace RayTracingCharacters
 {
@@ -225,33 +228,183 @@ namespace RayTracingCharacters
 			}
 		}
 
-		/// Rotation * scale and translation (relative to a_origin) of a bone matrix: 12 floats.
-		bool StoreMatrix(const RE::NiTransform& a_m, const double a_origin[3], float* o_out)
-		{
-			for (int r = 0; r < 3; ++r) {
-				for (int c = 0; c < 3; ++c)
-					o_out[r * 4 + c] = a_m.rotate.entry[r][c] * a_m.scale;
-			}
-			o_out[3] = static_cast<float>(static_cast<double>(a_m.translate.x) - a_origin[0]);
-			o_out[7] = static_cast<float>(static_cast<double>(a_m.translate.y) - a_origin[1]);
-			o_out[11] = static_cast<float>(static_cast<double>(a_m.translate.z) - a_origin[2]);
-			for (int i = 0; i < 12; ++i)
-				if (!std::isfinite(o_out[i]) || std::abs(o_out[i]) > 1.0e6f)
-					return false;
-			return true;
-		}
-
-		/// Bone world * skin-to-bone for every bone; SEH: false on a bad read.
-		bool ReadBoneWorlds(RE::NiAVObject* const* a_nodes, const RE::NiTransform* a_skinToBone, std::size_t a_count, RE::NiTransform* o_out)
+		/// (46m) Bone world * skin-to-bone for every bone (NiTransform::operator*, inlined: rotate = W.R * S.R, scale = W.s * S.s,
+		/// translate = W.t + (W.R * S.t) * W.s), stored as 12 floats (rotation * scale, translation relative to a_origin).
+		/// One pass, no copies; SEH: false on a bad read, a missing bone, or a non-finite / huge value.
+		template <class B>
+		bool ReadBoneMatrices(const B* a_bones, std::size_t a_count, const double a_origin[3], float* o_out)
 		{
 			__try {
-				for (std::size_t i = 0; i < a_count; ++i)
-					o_out[i] = a_nodes[i]->world * a_skinToBone[i];
+				for (std::size_t i = 0; i < a_count; ++i) {
+					const RE::NiAVObject* node = a_bones[i].node.get();
+					if (!node)
+						return false;
+					const RE::NiTransform& w = node->world;
+					const RE::NiTransform& s = a_bones[i].skinToBone;
+					const float scale = w.scale * s.scale;
+					const float wt[3] = { w.translate.x, w.translate.y, w.translate.z };
+					float* out = o_out + i * 12;
+					for (int r = 0; r < 3; ++r) {
+						const float w0 = w.rotate.entry[r][0], w1 = w.rotate.entry[r][1], w2 = w.rotate.entry[r][2];
+						for (int c = 0; c < 3; ++c)
+							out[r * 4 + c] = (w0 * s.rotate.entry[0][c] + w1 * s.rotate.entry[1][c] + w2 * s.rotate.entry[2][c]) * scale;
+						const float t = wt[r] + (w0 * s.translate.x + w1 * s.translate.y + w2 * s.translate.z) * w.scale;
+						out[r * 4 + 3] = static_cast<float>(static_cast<double>(t) - a_origin[r]);
+					}
+					for (int k = 0; k < 12; ++k)
+						if (!(std::fabs(out[k]) <= 1.0e6f))  // also NaN
+							return false;
+				}
 				return true;
 			} __except (EXCEPTION_EXECUTE_HANDLER) {
 				return false;
 			}
 		}
+
+		/// (46m) A known shape is still drawn under its actor's root: attached all the way up to it, nothing hidden on the way
+		/// (the player's third-person root may be hidden: Enumerate's rule). SEH: a detached part's former parents may be gone.
+		bool Attached(RE::NiAVObject* a_geometry, RE::NiAVObject* a_root, bool a_player)
+		{
+			__try {
+				int depth = 0;
+				for (RE::NiAVObject* node = a_geometry; node && depth < 64; node = node->parent, ++depth) {
+					if (node->GetFlags().any(RE::NiAVObject::Flag::kHidden) && !(a_player && node == a_root))
+						return false;
+					if (node == a_root)
+						return true;
+				}
+				return false;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		/// (46m) Equip / unequip events (any thread): the references, read (never dereferenced) by the next Update.
+		std::mutex g_equipMutex;
+		std::vector<const void*> g_equipQueue;
+		constexpr std::size_t kEquipQueueMax = 256;
+
+		/// (46m) The read lanes: this thread plus kReadLanes - 1 workers that run per-actor reads (engine nodes, read only)
+		/// while this thread waits for them at the same point of the frame. A worker that wakes after every item was
+		/// taken does nothing; the join waits only for items a worker is working on. Never destroyed (its threads live
+		/// until the process ends).
+		class ReadPool
+		{
+		public:
+			using Job = void (*)(void*, std::uint32_t);
+			static ReadPool& Get()
+			{
+				static ReadPool* pool = new ReadPool();
+				return *pool;
+			}
+			/// a_job(a_context, i) for every i < a_count; returns once all are done: the lanes that took part.
+			std::uint32_t Run(std::uint32_t a_count, Job a_job, void* a_context)
+			{
+				if (a_count <= 1 || !Start()) {
+					for (std::uint32_t i = 0; i < a_count; ++i)
+						a_job(a_context, i);
+					return 1;
+				}
+				std::uint32_t generation = 0;
+				{
+					std::scoped_lock lock(mutex_);
+					generation = ++generation_;
+					job_ = a_job;
+					context_ = a_context;
+					count_ = a_count;
+					done_.store(0, std::memory_order_relaxed);
+					helpers_.store(0, std::memory_order_relaxed);
+					next_.store(static_cast<std::uint64_t>(generation) << 32, std::memory_order_release);
+				}
+				cv_.notify_all();
+				std::uint32_t index = 0;
+				while (Take(generation, a_count, index)) {
+					a_job(a_context, index);
+					done_.fetch_add(1, std::memory_order_acq_rel);
+				}
+				for (std::uint32_t spin = 0; done_.load(std::memory_order_acquire) < a_count; ++spin) {
+					if (spin < 4096)
+						YieldProcessor();
+					else
+						SwitchToThread();
+				}
+				return 1 + helpers_.load(std::memory_order_relaxed);
+			}
+
+		private:
+			bool Take(std::uint32_t a_generation, std::uint32_t a_count, std::uint32_t& o_index)
+			{
+				std::uint64_t value = next_.load(std::memory_order_acquire);
+				for (;;) {
+					if (static_cast<std::uint32_t>(value >> 32) != a_generation || static_cast<std::uint32_t>(value) >= a_count)
+						return false;
+					if (next_.compare_exchange_weak(value, value + 1, std::memory_order_acq_rel)) {
+						o_index = static_cast<std::uint32_t>(value);
+						return true;
+					}
+				}
+			}
+			bool Start()
+			{
+				if (started_)
+					return workers_ > 0;
+				started_ = true;
+				for (std::uint32_t i = 0; i + 1 < kReadLanes; ++i) {
+					try {
+						std::thread worker([this] { Worker(); });
+						SetThreadPriority(worker.native_handle(), THREAD_PRIORITY_HIGHEST);  // short bursts the render thread waits for
+						SetThreadDescription(worker.native_handle(), L"CS RayTracing character reads");
+						worker.detach();
+						++workers_;
+					} catch (const std::exception& e) {
+						logger::warn("[RayTracing] Characters: a read lane could not be started ({}); {} running", e.what(), workers_);
+						break;
+					}
+				}
+				if (workers_ == 0)
+					logger::warn("[RayTracing] Characters: no read lane could be started; the reads stay on the render thread");
+				return workers_ > 0;
+			}
+			void Worker()
+			{
+				std::uint32_t seen = 0;
+				for (;;) {
+					std::uint32_t generation = 0, count = 0;
+					Job job = nullptr;
+					void* context = nullptr;
+					{
+						std::unique_lock lock(mutex_);
+						cv_.wait(lock, [&] { return generation_ != seen; });
+						seen = generation = generation_;
+						job = job_;
+						context = context_;
+						count = count_;
+					}
+					bool took = false;
+					std::uint32_t index = 0;
+					while (Take(generation, count, index)) {
+						if (!took) {
+							took = true;
+							helpers_.fetch_add(1, std::memory_order_relaxed);
+						}
+						job(context, index);
+						done_.fetch_add(1, std::memory_order_acq_rel);
+					}
+				}
+			}
+
+			std::mutex mutex_;
+			std::condition_variable cv_;
+			std::uint32_t generation_ = 0;
+			Job job_ = nullptr;
+			void* context_ = nullptr;
+			std::uint32_t count_ = 0;
+			std::atomic<std::uint64_t> next_{ 0 };  // generation << 32 | next item
+			std::atomic<std::uint32_t> done_{ 0 };
+			std::atomic<std::uint32_t> helpers_{ 0 };
+			bool started_ = false;
+			std::uint32_t workers_ = 0;
+		};
 
 		RE::NiPoint3 Apply(const float* a_m, const float a_p[3])
 		{
@@ -275,14 +428,28 @@ namespace RayTracingCharacters
 		new std::vector<std::unique_ptr<Actor>>(std::move(retiring_));
 	}
 
-	void Characters::Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer)
+	void Characters::Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer, bool a_parallel, bool a_scanCache, bool a_merge)
 	{
-		if (a_physics != physics_ || a_hair != hair_ || a_alpha != alpha_)
+		// (46m) Merging is decided per shape when it is captured: a change captures everything again.
+		if (a_physics != physics_ || a_hair != hair_ || a_alpha != alpha_ || a_merge != merge_)
 			RequestFlush();
 		physics_ = a_physics;
 		hair_ = a_hair;
 		alpha_ = a_alpha;
 		firstPersonPlayer_ = a_firstPersonPlayer;
+		parallel_ = a_parallel;
+		scanCache_ = a_scanCache;
+		merge_ = a_merge;
+	}
+
+	void Characters::NoteEquip(const void* a_reference)
+	{
+		if (!a_reference)
+			return;
+		std::scoped_lock lock(g_equipMutex);
+		if (g_equipQueue.size() >= kEquipQueueMax)
+			g_equipQueue.erase(g_equipQueue.begin(), g_equipQueue.begin() + static_cast<std::ptrdiff_t>(kEquipQueueMax / 2));
+		g_equipQueue.push_back(a_reference);
 	}
 
 	void Characters::ReleaseShape(RayTracingRT::Backend& a_backend, Shape& a_shape)
@@ -337,7 +504,8 @@ namespace RayTracingCharacters
 	void Characters::Enumerate(Actor& a_actor, std::vector<Found>& o_found)
 	{
 		o_found.clear();
-		std::vector<std::pair<RE::NiAVObject*, int>> stack;
+		static thread_local std::vector<std::pair<RE::NiAVObject*, int>> stack;  // (46m) per read lane, no allocation per call
+		stack.clear();
 		stack.emplace_back(a_actor.root.get(), 0);
 		std::uint32_t visited = 0;
 		while (!stack.empty() && visited < kMaxNodesPerActor) {
@@ -370,25 +538,42 @@ namespace RayTracingCharacters
 
 	bool Characters::ReadBones(const Shape& a_shape, const double a_origin[3], std::vector<float>& o_matrices)
 	{
+		// (46m) One pass straight into the matrices (no copies of the nodes / transforms first).
 		const std::size_t count = a_shape.bones.size();
-		static thread_local std::vector<RE::NiAVObject*> nodes;
-		static thread_local std::vector<RE::NiTransform> skinToBone, worlds;
-		nodes.resize(count);
-		skinToBone.resize(count);
-		worlds.resize(count);
-		for (std::size_t i = 0; i < count; ++i) {
-			nodes[i] = a_shape.bones[i].node.get();
-			skinToBone[i] = a_shape.bones[i].skinToBone;
-			if (!nodes[i])
-				return false;
-		}
-		if (!ReadBoneWorlds(nodes.data(), skinToBone.data(), count, worlds.data()))
+		if (count == 0)
 			return false;
 		o_matrices.resize(count * 12);
-		for (std::size_t i = 0; i < count; ++i)
-			if (!StoreMatrix(worlds[i], a_origin, o_matrices.data() + i * 12))
-				return false;
-		return true;
+		return ReadBoneMatrices(a_shape.bones.data(), count, a_origin, o_matrices.data());
+	}
+
+	void Characters::ReadActor(Actor& a_actor, bool a_scan)
+	{
+		a_actor.readOk = false;
+		a_actor.scanned = a_scan;
+		a_actor.bonesRead = 0;
+		RE::NiAVObject* root = a_actor.root.get();
+		const auto translate = root->world.translate;
+		a_actor.origin[0] = translate.x;
+		a_actor.origin[1] = translate.y;
+		a_actor.origin[2] = translate.z;
+		if (a_scan) {
+			Enumerate(a_actor, a_actor.found);
+		} else {
+			// The known shapes only: still attached under the root and not hidden, their signature (a changed one is
+			// captured again by Update, a gone one retires). New shapes are found by the next full scan.
+			a_actor.found.clear();
+			for (const auto& shape : a_actor.shapes) {
+				RE::BSGeometry* geometry = shape->geometry.get();
+				if (geometry && Attached(geometry, root, a_actor.player))
+					a_actor.found.push_back(Found{ geometry, Signature(geometry) });
+			}
+		}
+		for (auto& shape : a_actor.shapes) {
+			shape->freshOk = ReadBones(*shape, a_actor.origin, shape->fresh);
+			if (shape->freshOk)
+				a_actor.bonesRead += static_cast<std::uint32_t>(shape->bones.size());
+		}
+		a_actor.readOk = true;
 	}
 
 	std::unique_ptr<Characters::Shape> Characters::Capture(RayTracingRT::Backend& a_backend, Actor& a_actor, RE::BSGeometry* a_geometry,
@@ -861,6 +1046,9 @@ namespace RayTracingCharacters
 		}
 
 		shape->vertices = vertexCount;
+		// (46m) Merge Character Parts: an opaque shape goes into its actor's merged BLAS.
+		shape->grouped = merge_ && !alphaTested;
+		geometry->grouped = shape->grouped;
 		shape->handle = a_backend.CreateSkinShape(std::move(geometry));
 		if (shape->handle == RayTracingRT::kInvalidSkin) {
 			++stats_.skipBackend;
@@ -885,6 +1073,9 @@ namespace RayTracingCharacters
 	void Characters::Update(RayTracingRT::Backend& a_backend, const float a_rect[4], double a_budgetMs, std::uint32_t a_maxCaptures, const RE::NiPoint3* a_eye)
 	{
 		const std::int64_t start = Qpc();
+		auto msSince = [](std::int64_t a_from) { return static_cast<float>(static_cast<double>(Qpc() - a_from) * QpcMs()); };
+		stats_.candidatesMs = stats_.readsMs = stats_.captureMs = stats_.commitMs = stats_.filterMs = 0.0f;
+		stats_.bonesRead = stats_.rescans = stats_.lanes = 0;
 		if (flushRequested_.exchange(false))
 			ReleaseAll(a_backend);
 		// The scene dropped the caster filter (its own flush): registrations are made again.
@@ -901,6 +1092,7 @@ namespace RayTracingCharacters
 				ReleaseAll(a_backend);
 			return;
 		}
+		++frame_;
 
 		// 1. The actors to trace: in the traced area, nearest first, at most kMaxActors.
 		RE::NiPoint3 eye{};
@@ -908,7 +1100,8 @@ namespace RayTracingCharacters
 			eye = *a_eye;
 		else if (auto* camera = RE::Main::WorldRootCamera())
 			eye = camera->world.translate;
-		std::vector<std::pair<float, RE::Actor*>> candidates;
+		auto& candidates = candidates_;
+		candidates.clear();
 		auto consider = [&](RE::Actor* a_actor) {
 			if (!a_actor || !a_actor->Is3DLoaded() || a_actor->IsDisabled() || a_actor->IsDeleted() || !a_actor->Get3D(false))
 				return;
@@ -938,16 +1131,20 @@ namespace RayTracingCharacters
 
 		// 2. Actors that left (or got new 3D) retire: traced this frame with their last matrices.
 		{
-			std::vector<std::unique_ptr<Actor>> keep;
-			for (auto& actor : actors_) {
+			std::size_t keep = 0;
+			for (std::size_t a = 0; a < actors_.size(); ++a) {
+				auto& actor = actors_[a];
 				auto* ref = actor->ref.get();
 				const bool wanted = std::any_of(candidates.begin(), candidates.end(), [&](const auto& a_candidate) { return a_candidate.second == ref; });
-				if (wanted && ref->Get3D(false) == actor->root.get())
-					keep.push_back(std::move(actor));
-				else
+				if (wanted && ref->Get3D(false) == actor->root.get()) {
+					if (keep != a)
+						actors_[keep] = std::move(actor);
+					++keep;
+				} else {
 					retiring_.push_back(std::move(actor));
+				}
 			}
-			actors_ = std::move(keep);
+			actors_.resize(keep);
 		}
 		for (const auto& [d2, actorPtr] : candidates) {
 			if (std::any_of(actors_.begin(), actors_.end(), [&](const std::unique_ptr<Actor>& a_entry) { return a_entry->ref.get() == actorPtr; }))
@@ -956,28 +1153,87 @@ namespace RayTracingCharacters
 			entry->ref = RE::NiPointer<RE::TESObjectREFR>(actorPtr);
 			entry->root = RE::NiPointer<RE::NiAVObject>(actorPtr->Get3D(false));
 			entry->player = actorPtr == player;
+			if (++actorSerial_ == 0)
+				++actorSerial_;  // (46m) never 0 (0 = no merged BLAS)
+			entry->serial = actorSerial_;
+			entry->scanUntil = frame_;  // a new entry: scanned in full now
 			actors_.push_back(std::move(entry));
 		}
+		// (46m) Equip / unequip since the last frame: those actors' 3D is scanned in full for the next frames.
+		{
+			std::vector<const void*> equipped;
+			{
+				std::scoped_lock lock(g_equipMutex);
+				equipped.swap(g_equipQueue);
+			}
+			for (const void* reference : equipped)
+				for (auto& actor : actors_)
+					if (actor->ref.get() == reference)
+						actor->scanUntil = frame_ + kEquipScanFrames;
+		}
+		stats_.candidatesMs = msSince(start);
 
-		// 3. Shapes: new ones captured (within the budget), changed / gone ones retire.
+		// 3a. (46m) The per-actor reads (shapes, bone matrices) on the read lanes, joined here: the engine's nodes are only
+		// read (as before, at the same point of the frame), each lane writes only the entry of the actor it took.
+		{
+			const std::int64_t readsStart = Qpc();
+			static thread_local std::vector<std::uint8_t> scan;
+			scan.assign(actors_.size(), 0);
+			for (std::size_t a = 0; a < actors_.size(); ++a) {
+				const auto& actor = *actors_[a];
+				scan[a] = (!scanCache_ || actor.player || frame_ <= actor.scanUntil || (frame_ + actor.serial) % kRescanFrames == 0) ? 1 : 0;
+			}
+			struct ReadJob
+			{
+				std::vector<std::unique_ptr<Actor>>* actors;
+				const std::uint8_t* scan;
+			} job{ &actors_, scan.data() };
+			auto run = [](void* a_context, std::uint32_t a_index) {
+				auto& readJob = *static_cast<ReadJob*>(a_context);
+				auto& actor = *(*readJob.actors)[a_index];
+				try {
+					ReadActor(actor, readJob.scan[a_index] != 0);
+				} catch (...) {
+					actor.readOk = false;  // (allocation failure) this actor stays as it was this frame
+				}
+			};
+			const auto count = static_cast<std::uint32_t>(actors_.size());
+			stats_.lanes = parallel_ ? ReadPool::Get().Run(count, run, &job) : 1;
+			if (!parallel_) {
+				for (std::uint32_t a = 0; a < count; ++a)
+					run(&job, a);
+			}
+			for (const auto& actor : actors_) {
+				stats_.bonesRead += actor->bonesRead;
+				stats_.rescans += actor->scanned ? 1 : 0;
+			}
+			stats_.readsMs = msSince(readsStart);
+		}
+
+		// 3b. Shapes: new ones captured (within the budget), changed / gone ones retire.
+		const std::int64_t captureStart = Qpc();
 		const std::int64_t deadline = start + static_cast<std::int64_t>(a_budgetMs / std::max(QpcMs(), 1e-9));
 		std::uint32_t captures = 0;
-		static thread_local std::vector<Found> found;
 		for (auto& actor : actors_) {
-			Enumerate(*actor, found);
-			// Gone or changed shapes.
+			if (!actor->readOk)
+				continue;  // its reads failed this frame: its shapes stay as they were
+			const auto& found = actor->found;
+			// Gone or changed shapes (in place: no allocation per frame).
 			{
-				std::vector<std::unique_ptr<Shape>> keep;
-				for (auto& shape : actor->shapes) {
+				std::size_t keep = 0;
+				for (std::size_t s = 0; s < actor->shapes.size(); ++s) {
+					auto& shape = actor->shapes[s];
 					const auto it = std::find_if(found.begin(), found.end(), [&](const Found& a_found) { return a_found.geometry == shape->geometry.get(); });
 					if (it != found.end() && it->signature == shape->signature) {
-						keep.push_back(std::move(shape));
+						if (keep != s)
+							actor->shapes[keep] = std::move(shape);
+						++keep;
 					} else {
 						++stats_.retiredShapes;
 						actor->retiringShapes.push_back(std::move(shape));
 					}
 				}
-				actor->shapes = std::move(keep);
+				actor->shapes.resize(keep);
 			}
 			// New shapes.
 			for (const auto& entry : found) {
@@ -990,12 +1246,14 @@ namespace RayTracingCharacters
 					actor->refused.insert(entry.signature);
 					continue;
 				}
-				if (captures >= a_maxCaptures || (captures > 0 && Qpc() >= deadline))
+				if (captures >= a_maxCaptures || (captures > 0 && Qpc() >= deadline)) {
+					actor->scanUntil = std::max(actor->scanUntil, frame_ + 1);  // (46m) shapes left to capture: scanned again next frame
 					break;
+				}
 				++captures;
 				auto shape = Capture(a_backend, *actor, entry.geometry, entry.signature);
 				if (shape)
-					actor->shapes.push_back(std::move(shape));
+					actor->shapes.push_back(std::move(shape));  // its matrices are this frame's (read at capture)
 				else
 					actor->refused.insert(entry.signature);  // judged once (a changed shape has a new signature)
 			}
@@ -1003,33 +1261,35 @@ namespace RayTracingCharacters
 			if (actor->refused.size() > 1024)
 				actor->refused.clear();
 		}
+		stats_.captureMs = msSince(captureStart);
 
-		// 4. This frame's bone matrices; a bone that cannot be read keeps the last ones.
+		// 4. This frame's bone matrices (read in 3a); a bone that could not be read keeps the last ones.
+		const std::int64_t commitStart = Qpc();
 		stillReused_ = 0;
 		for (auto& actor : actors_) {
-			const auto translate = actor->root->world.translate;
-			const double origin[3] = { translate.x, translate.y, translate.z };
 			for (auto& shape : actor->shapes) {
 				shape->reuse = false;
-				static thread_local std::vector<float> fresh;
-				if (ReadBones(*shape, origin, fresh)) {
-					// (45n) Still pose: bit-identical to the matrices of last frame's draw (drawable then, so
-					// skinned with them or itself reused from identical ones): last frame's skinned BLAS is
-					// exact. The matrices are relative to the origin, which still moves the instance.
-					const bool still = shape->drawable && !shape->matrices.empty() && fresh.size() == shape->matrices.size() &&
-					                   std::memcmp(fresh.data(), shape->matrices.data(), fresh.size() * sizeof(float)) == 0 &&
-					                   a_backend.IsSkinShapeReady(shape->handle);
-					shape->matrices.swap(fresh);
-					std::copy_n(origin, 3, shape->origin);
-					if (still) {
-						shape->reuse = true;
-						++stillReused_;
-					}
+				if (!shape->freshOk)
+					continue;  // not read (captured this frame: read at capture; or a bad read: the last ones)
+				shape->freshOk = false;
+				// (45n) Still pose: bit-identical to the matrices of last frame's draw (drawable then, so
+				// skinned with them or itself reused from identical ones): last frame's skinned BLAS is
+				// exact. The matrices are relative to the origin, which still moves the instance.
+				const bool still = shape->drawable && !shape->matrices.empty() && shape->fresh.size() == shape->matrices.size() &&
+				                   std::memcmp(shape->fresh.data(), shape->matrices.data(), shape->fresh.size() * sizeof(float)) == 0 &&
+				                   a_backend.IsSkinShapeReady(shape->handle);
+				shape->matrices.swap(shape->fresh);
+				std::copy_n(actor->origin, 3, shape->origin);
+				if (still) {
+					shape->reuse = true;
+					++stillReused_;
 				}
 			}
 		}
+		stats_.commitMs = msSince(commitStart);
 
 		// 5. Caster filter: a shape leaves the sun cascades once it is traced.
+		const std::int64_t filterStart = Qpc();
 		stats_.actors = static_cast<std::uint32_t>(actors_.size());
 		stats_.shapes = stats_.registered = stats_.skinnedShapes = stats_.rigidShapes = stats_.physicsShapes = stats_.alphaShapes = 0;
 		stats_.vertices = 0;
@@ -1071,32 +1331,51 @@ namespace RayTracingCharacters
 				stats_.vertices += shape->vertices;
 			}
 		}
-		stats_.lastMs = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
+		stats_.filterMs = msSince(filterStart);
+		stats_.lastMs = msSince(start);
 		stats_.maxMs = std::max(stats_.maxMs, stats_.lastMs);
 	}
 
 	void Characters::CollectDraws(std::vector<RayTracingRT::SkinDraw>& o_draws, std::vector<float>& o_bones) const
 	{
+		const std::int64_t start = Qpc();
 		o_draws.clear();
 		o_bones.clear();
 		owners_.clear();
-		auto add = [&](const Shape& a_shape, bool a_npc, std::uint32_t a_owner) {
+		auto add = [&](const Shape& a_shape, const Actor& a_actor, bool a_npc, std::uint32_t a_owner) {
 			if (a_shape.handle == RayTracingRT::kInvalidSkin || a_shape.matrices.empty() || a_shape.matrices.size() != a_shape.bones.size() * 12)
 				return;
 			if (!a_shape.drawable || (a_shape.alpha && a_shape.info == RayTracingRT::kInvalidAlphaInfo))
 				return;
 			RayTracingRT::SkinDraw draw;
 			draw.shape = a_shape.handle;
-			draw.x = a_shape.origin[0];
-			draw.y = a_shape.origin[1];
-			draw.z = a_shape.origin[2];
+			// (46m) Merged: every draw of the actor's merged BLAS has the actor's origin. A shape whose matrices are relative to
+			// another one (a bone it could not read this frame, a retiring shape of a moving actor) is rebased (and skinned).
+			const bool grouped = a_shape.grouped && a_actor.serial != 0;
+			const bool rebase = grouped && (a_shape.origin[0] != a_actor.origin[0] || a_shape.origin[1] != a_actor.origin[1] || a_shape.origin[2] != a_actor.origin[2]);
+			const double* origin = rebase ? a_actor.origin : a_shape.origin;
+			draw.x = origin[0];
+			draw.y = origin[1];
+			draw.z = origin[2];
+			draw.group = grouped ? a_actor.serial : 0u;
 			draw.boneOffset = static_cast<std::uint32_t>(o_bones.size() / 12);
 			draw.alphaInfo = a_shape.alpha ? a_shape.info : RayTracingRT::kInvalidAlphaInfo;
 			draw.npc = a_npc;
 			draw.owner = a_owner;
-			draw.reuse = a_shape.reuse;  // (45l) last frame's BLAS: no bones uploaded
-			if (!draw.reuse)
+			draw.reuse = a_shape.reuse && !rebase;  // (45l) last frame's BLAS: no bones uploaded
+			if (!draw.reuse) {
+				const std::size_t at = o_bones.size();
 				o_bones.insert(o_bones.end(), a_shape.matrices.begin(), a_shape.matrices.end());
+				if (rebase) {
+					const float delta[3] = { static_cast<float>(a_shape.origin[0] - a_actor.origin[0]), static_cast<float>(a_shape.origin[1] - a_actor.origin[1]),
+						static_cast<float>(a_shape.origin[2] - a_actor.origin[2]) };
+					for (std::size_t b = at; b < o_bones.size(); b += 12) {
+						o_bones[b + 3] += delta[0];
+						o_bones[b + 7] += delta[1];
+						o_bones[b + 11] += delta[2];
+					}
+				}
+			}
 			o_draws.push_back(draw);
 		};
 		for (const auto* list : { &actors_, &retiring_ }) {
@@ -1115,10 +1394,11 @@ namespace RayTracingCharacters
 				}
 				for (const auto* shapes : { &actor->shapes, &actor->retiringShapes })
 					for (const auto& shape : *shapes)
-						add(*shape, !actor->player, owner);
+						add(*shape, *actor, !actor->player, owner);
 			}
 		}
 		std::sort(owners_.begin(), owners_.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+		collectMs_ = static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs());
 	}
 }
 

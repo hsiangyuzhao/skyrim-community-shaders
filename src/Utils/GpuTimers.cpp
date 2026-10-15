@@ -137,7 +137,7 @@ namespace Util
 				"GPU time of merging the ray-traced shadow into the game's shadow mask, including the history blend of Penumbra." },
 			{ "RT Wait for Trace",
 				"How long the game's GPU queue stood still waiting for the ray-traced shadows (on the GPU; the CPU does not wait). "
-				"Ideally about 0: the other features' work runs while the trace runs." },
+				"Ideally about 0: the other features' work runs while the trace runs. With Split Trace Sync: the wait for the sun alone." },
 			{ "RT Point Lights: Denoiser",
 				"GPU time of cleaning up the ray-traced point-light shadows (per light: blur along soft edges, history). The point-light "
 				"trace itself runs on the ray tracer's own queue (Ray Tracing page, F7 column rt_pl_gpu_ms)." },
@@ -147,6 +147,9 @@ namespace Util
 			{ "RT Ambient Occlusion: Wait",
 				"How long the game's GPU queue stood still waiting for the ray-traced ambient occlusion, right before it is used "
 				"(on the GPU; the CPU does not wait). Ideally about 0." },
+			{ "RT Wait for Point Lights",
+				"With Split Trace Sync: how long the game's GPU queue stood still waiting for the ray-traced point-light shadows, after the "
+				"sun's shadow was already merged (RT Wait for Trace is then the wait for the sun alone). Ideally about 0." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

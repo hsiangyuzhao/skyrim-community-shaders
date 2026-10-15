@@ -186,6 +186,14 @@ namespace RayTracingRT
 			if (FAILED(aoList.As(&context.aoList)))
 				return fail("ID3D12GraphicsCommandList4 not available");
 			context.aoList->Close();
+			// (46m) Split Trace Sync: the point lights' own list (same allocator, recorded after the sun list is closed).
+			// Optional: without it the trace is never split.
+			ComPtr<ID3D12GraphicsCommandList> pointList;
+			if (SUCCEEDED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, context.allocator.Get(), nullptr, IID_PPV_ARGS(&pointList))) &&
+				SUCCEEDED(pointList.As(&context.pointList)))
+				context.pointList->Close();
+			else
+				context.pointList.Reset();
 		}
 
 		if (FAILED(hr = device_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence_))))
@@ -1077,6 +1085,14 @@ namespace RayTracingRT
 		skinFault_.clear();
 		skinStats_ = {};
 		skinReady_.clear();
+		// (46m) Merged BLASes (their pool is gone with the pools above) and the sun fence.
+		skinGroups_.clear();
+		skinGroupFrame_.clear();
+		sunFence11_.Reset();
+		sunFence_.Reset();
+		sunFenceValue_ = 0;
+		pendingSunWait_ = 0;
+		sunFenceFailed_ = false;
 		charAlphaPipeline_.Reset();
 		charPipeline_.Reset();
 		skinPipeline_.Reset();
@@ -1460,7 +1476,8 @@ namespace RayTracingRT
 		const double toMs = 1000.0 / static_cast<double>(timestampFrequency_);
 		stats_.lastPrepGpuMs = static_cast<float>(static_cast<double>(prepEnd - prepBegin) * toMs);
 		// (46b) The trace interval holds the point-light dispatch: the sun's part alone, the point lights on their own.
-		stats_.lastTraceGpuMs = std::max(static_cast<float>(static_cast<double>(end - begin) * toMs) - pointMs, 0.0f);
+		// (46m) Split Trace Sync: the interval ended with the sun already.
+		stats_.lastTraceGpuMs = std::max(static_cast<float>(static_cast<double>(end - begin) * toMs) - (context.splitTrace ? 0.0f : pointMs), 0.0f);
 		stats_.lastGpuMs = stats_.lastPrepGpuMs + stats_.lastTraceGpuMs + pointMs;
 		// (45n) Our queue idle between the builds / skinning and the trace (waiting for the game's depth copy).
 		stats_.lastQueueGapMs = begin >= prepEnd ? static_cast<float>(static_cast<double>(begin - prepEnd) * toMs) : 0.0f;
@@ -2031,8 +2048,11 @@ namespace RayTracingRT
 
 			skinReady_.assign(skinDraws.size(), 0);
 			skinRecorded_ = false;
+			skinGroupFrame_.clear();  // (46m)
 			if (!skinDraws.empty() || !skinUploadQueue_.empty())
 				RecordSkinning(list, context, a_input, skinReady_);
+			else if (!skinGroups_.empty())
+				ReleaseSkinGroups();  // (46m) no character drawn
 			const std::int64_t skinEnd = QpcNow();
 			stats_.cpuBuildMs = static_cast<float>(QpcToMs(buildEnd - buildStart));
 			stats_.cpuSkinMs = static_cast<float>(QpcToMs(skinEnd - buildEnd));
@@ -2106,12 +2126,15 @@ namespace RayTracingRT
 		std::uint32_t characterInstances = 0;
 		// A frame with alpha-tested scene instances needs the character + alpha variant.
 		const bool charactersTraceable = charPipeline_ && (alphaInstances == 0 || charAlphaPipeline_);
+		std::uint32_t charactersTraced = 0;  // (46m) shapes (a merged BLAS counts its members)
 		for (std::size_t d = 0; d < skinDraws.size(); ++d) {
 			if (!skinReady_[d] || !charactersTraceable) {
 				++check_.notBuilt[kCategoryCharacter];
 				continue;
 			}
 			const auto& draw = skinDraws[d];
+			if (draw.group != 0)
+				continue;  // (46m) in its character's merged BLAS (below)
 			// (45n) With Early Prep a shape may have been released since it was skinned (switch change).
 			if (draw.shape >= skins_.size() || !skins_[draw.shape].live || !skins_[draw.shape].blas.Valid()) {
 				++check_.notBuilt[kCategoryCharacter];
@@ -2141,8 +2164,30 @@ namespace RayTracingRT
 			++check_.written[kCategoryCharacter];
 			descs[instanceCount++] = desc;
 			++characterInstances;
+			++charactersTraced;
 		}
-		skinStats_.drawsLastFrame = characterInstances;
+		// (46m) Merged BLASes: one opaque instance per character (its opaque shapes), same mask / key / origin rules.
+		for (const auto& group : skinGroupFrame_) {
+			if (!charactersTraceable || group.blas == 0) {
+				check_.notBuilt[kCategoryCharacter] += group.members;
+				continue;
+			}
+			D3D12_RAYTRACING_INSTANCE_DESC desc{};
+			desc.Transform[0][0] = desc.Transform[1][1] = desc.Transform[2][2] = 1.0f;
+			desc.Transform[0][3] = static_cast<float>(group.x - a_input.cameraX);
+			desc.Transform[1][3] = static_cast<float>(group.y - a_input.cameraY);
+			desc.Transform[2][3] = static_cast<float>(group.z - a_input.cameraZ);
+			desc.InstanceMask = group.npc ? kNpcMask : kCharacterMask;
+			desc.InstanceContributionToHitGroupIndex = group.owner & 0xFFFFFFu;
+			desc.Flags = kInstanceFlags;
+			desc.AccelerationStructure = group.blas;
+			check_.written[kCategoryCharacter] += group.members;
+			descs[instanceCount++] = desc;
+			++characterInstances;
+			charactersTraced += group.members;
+		}
+		skinStats_.drawsLastFrame = charactersTraced;
+		skinStats_.instancesLastFrame = characterInstances;
 
 		stats_.instancesLastFrame = instanceCount;
 		lap(split.tlas);
@@ -2205,6 +2250,12 @@ namespace RayTracingRT
 		if (pointFrame)
 			std::memcpy(context.pointMapped, a_input.pointLights->sources, a_input.pointLights->sourceBytes);
 		stats_.pointTracedLastFrame = pointFrame;
+		// (46m) Split Trace Sync: the sun alone in this list (the sun fence is signalled behind it), the point lights in
+		// their own list after it; the D3D11 queue can start on the sun's result while the point lights still run.
+		const bool splitSun = a_input.splitSun && a_input.sun && pointFrame && context.pointList && EnsureSunFence();
+		context.splitTrace = splitSun;
+		stats_.sunSplitLastFrame = splitSun;
+		const bool pointsInTraceList = pointFrame && !splitSun;
 
 		D3D12_RESOURCE_BARRIER pre[4] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
@@ -2212,7 +2263,7 @@ namespace RayTracingRT
 			Transition(pointVis_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
 			Transition(pointIdx_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
 		};
-		traceList->ResourceBarrier(pointFrame ? 4 : 2, pre);
+		traceList->ResourceBarrier(pointsInTraceList ? 4 : 2, pre);
 
 		lap(split.record);
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
@@ -2241,26 +2292,27 @@ namespace RayTracingRT
 			}
 			traceList->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
 		}
-		if (pointFrame) {
+		if (pointsInTraceList) {
 			// (46b) The point lights read the sun's result (sunlit pixels skip weak point lights).
 			// (46c) Without a sun trace (interiors) the texture is only transitioned; the shader does not read it (no sun gate).
 			D3D12_RESOURCE_BARRIER toRead = Transition(visibility_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 			traceList->ResourceBarrier(1, &toRead);
 			RecordPointTrace(traceList, context, index, a_input, alphaFrame, Offset(block, kDynPoint, descriptorSize_));
-		} else {
+		} else if (!pointFrame) {
 			pointAlphaLastFrame_ = false;
 		}
 
 		D3D12_RESOURCE_BARRIER post[4] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-			Transition(visibility_.resource12.Get(), pointFrame ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			Transition(visibility_.resource12.Get(), pointsInTraceList ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 				D3D12_RESOURCE_STATE_COMMON),
 			Transition(pointVis_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
 			Transition(pointIdx_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
 		};
-		traceList->ResourceBarrier(pointFrame ? 4 : 2, post);
+		traceList->ResourceBarrier(pointsInTraceList ? 4 : 2, post);
 
 		if (timestampHeap_ && timestampReadback_) {
+			// (46m) Split: this interval ends with the sun (the point lights keep their own pair).
 			traceList->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 3);
 			traceList->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase, 4, timestampReadback_.Get(),
 				sizeof(std::uint64_t) * 4 * index);
@@ -2268,6 +2320,30 @@ namespace RayTracingRT
 		}
 		if (FAILED(hr = traceList->Close()))
 			return Fail("command list Close", hr);
+		if (splitSun) {
+			// (46m) The point lights' list: the sun's result (the sun gate) and the depth are read-only on both queues now.
+			auto* pointList = context.pointList.Get();
+			if (FAILED(hr = pointList->Reset(context.allocator.Get(), nullptr)))
+				return Fail("point-light command list Reset", hr);
+			pointList->SetDescriptorHeaps(1, heaps);
+			D3D12_RESOURCE_BARRIER pointPre[4] = {
+				Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+				Transition(visibility_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+				Transition(pointVis_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+				Transition(pointIdx_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+			};
+			pointList->ResourceBarrier(4, pointPre);
+			RecordPointTrace(pointList, context, index, a_input, alphaFrame, Offset(block, kDynPoint, descriptorSize_));
+			D3D12_RESOURCE_BARRIER pointPost[4] = {
+				Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+				Transition(visibility_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+				Transition(pointVis_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+				Transition(pointIdx_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+			};
+			pointList->ResourceBarrier(4, pointPost);
+			if (FAILED(hr = pointList->Close()))
+				return Fail("point-light command list Close", hr);
+		}
 		lap(split.record);
 		// (46f) RTAO: its own list on this context (recorded now, submitted right behind the trace).
 		const bool aoFrame = a_input.ao && RecordAOTrace(context, index, a_input, alphaFrame, Offset(block, kDynAO, descriptorSize_));
@@ -2307,6 +2383,16 @@ namespace RayTracingRT
 		lap(split.wait12);
 		ID3D12CommandList* lists[] = { traceList };
 		queue_->ExecuteCommandLists(1, lists);
+		pendingSunWait_ = 0;
+		if (splitSun) {
+			// (46m) The sun fence between the sun and the point lights (only our queue signals it, in increasing order).
+			const std::uint64_t sunValue = ++sunFenceValue_;
+			if (FAILED(hr = queue_->Signal(sunFence_.Get(), sunValue)))
+				return Fail("D3D12 queue Signal (sun)", hr);
+			ID3D12CommandList* pointLists[] = { context.pointList.Get() };
+			queue_->ExecuteCommandLists(1, pointLists);
+			pendingSunWait_ = sunValue;
+		}
 		lap(split.execute);
 		const std::uint64_t doneValue = ++fenceValue_;
 		if (FAILED(hr = queue_->Signal(fence_.Get(), doneValue)))
@@ -2335,6 +2421,7 @@ namespace RayTracingRT
 			pendingWait_ = doneValue;
 		} else {
 			pendingWait_ = 0;
+			pendingSunWait_ = 0;
 			if (FAILED(hr = context11_->Wait(fence11_.Get(), doneValue)))
 				return Fail("D3D11 Wait", hr);
 		}
@@ -2420,8 +2507,11 @@ namespace RayTracingRT
 		const std::vector<SkinDraw>& skinDraws = a_input.skinDraws && SkinAvailable() ? *a_input.skinDraws : kNoSkinDraws;
 		skinReady_.assign(skinDraws.size(), 0);
 		skinRecorded_ = false;
+		skinGroupFrame_.clear();  // (46m)
 		if (!skinDraws.empty() || !skinUploadQueue_.empty())
 			RecordSkinning(list, context, a_input, skinReady_);
+		else if (!skinGroups_.empty())
+			ReleaseSkinGroups();  // (46m) no character drawn
 		const std::int64_t skinEnd = QpcNow();
 		split.skin = static_cast<float>(QpcToMs(skinEnd - buildEnd));
 		mark = skinEnd;
@@ -2475,6 +2565,8 @@ namespace RayTracingRT
 	float Backend::WaitForTrace()
 	{
 		// (45l) The deferred D3D11 wait (GPU-side): right before the first D3D11 pass that reads the trace.
+		// (46m) The done value follows the sun fence's value on our queue: a sun wait not taken is covered.
+		pendingSunWait_ = 0;
 		if (pendingWait_ == 0 || !context11_ || !fence11_)
 			return 0.0f;
 		const std::int64_t start = QpcNow();
@@ -2485,6 +2577,58 @@ namespace RayTracingRT
 		const float ms = static_cast<float>(QpcToMs(QpcNow() - start));
 		stats_.split.wait11 += ms;
 		return ms;
+	}
+
+	float Backend::WaitForSun()
+	{
+		// (46m) Split Trace Sync: the D3D11 queue waits (GPU-side) for the sun list alone; the point lights may still run.
+		if (pendingSunWait_ == 0 || !context11_ || !sunFence11_)
+			return 0.0f;
+		const std::int64_t start = QpcNow();
+		const std::uint64_t value = pendingSunWait_;
+		pendingSunWait_ = 0;
+		if (FAILED(context11_->Wait(sunFence11_.Get(), value)))
+			Fail("D3D11 Wait (sun)", E_FAIL);
+		const float ms = static_cast<float>(QpcToMs(QpcNow() - start));
+		stats_.split.wait11 += ms;
+		return ms;
+	}
+
+	bool Backend::EnsureSunFence()
+	{
+		// (46m) Shared like the others: the D3D12 queue signals it after the sun list, the D3D11 queue waits for it on the GPU.
+		if (sunFence_ && sunFence11_)
+			return true;
+		if (sunFenceFailed_ || !device_ || !device11_)
+			return false;
+		sunFence_.Reset();
+		sunFence11_.Reset();
+		HRESULT hr;
+		if (FAILED(hr = device_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&sunFence_)))) {
+			sunFence_.Reset();
+			sunFenceFailed_ = true;
+			logger::warn("[RayTracing] Split Trace Sync unavailable: could not create the sun fence ({})", HrString(hr));
+			return false;
+		}
+		HANDLE shared = nullptr;
+		if (FAILED(hr = device_->CreateSharedHandle(sunFence_.Get(), nullptr, GENERIC_ALL, nullptr, &shared))) {
+			sunFence_.Reset();
+			sunFenceFailed_ = true;
+			logger::warn("[RayTracing] Split Trace Sync unavailable: could not share the sun fence ({})", HrString(hr));
+			return false;
+		}
+		hr = device11_->OpenSharedFence(shared, IID_PPV_ARGS(&sunFence11_));
+		CloseHandle(shared);
+		if (FAILED(hr)) {
+			sunFence_.Reset();
+			sunFence11_.Reset();
+			sunFenceFailed_ = true;
+			logger::warn("[RayTracing] Split Trace Sync unavailable: D3D11 could not open the sun fence ({})", HrString(hr));
+			return false;
+		}
+		sunFenceValue_ = 0;
+		pendingSunWait_ = 0;
+		return true;
 	}
 
 	bool Backend::BuildOnly(std::uint32_t a_triangleBudget, std::uint32_t a_maxBuilds, float a_cpuMs)

@@ -172,6 +172,11 @@ public:
 		bool LoadingPump = true;
 		float LoadingPumpMs = 8.0f;
 		float BlackWindowMs = 200.0f;
+		// (46m) Cost switches (Ray Tracing > Diagnostics > Performance), each for an A/B; on = the 46m way, off = 46l's.
+		bool CharactersParallel = true;   // characters' per-actor reads on a few read lanes (joined at the same point of the frame)
+		bool CharactersScanCache = true;  // an actor's 3D is walked in full only when it may have changed (equip, new) and every 8 frames
+		bool CharactersMerge = true;      // an actor's opaque parts are one BLAS: one refit per character instead of one per part
+		bool SplitTraceSync = true;       // the game queue waits for the sun alone before the shadow mask passes, the point lights later
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -388,6 +393,7 @@ private:
 		bool writeSSS = false, debug = false, penumbra = false, spatial = false, half = false, sigma = false, sssNonRT = false;
 		bool interior = false;  // (46c) point lights only: no sun combine
 		bool traceSync = true;  // (46h) FinishFrame waits for the trace (false: an interior frame with RTAO only; the AO wait covers it)
+		bool splitSun = false;  // (46m) Split Trace Sync: the sun fence first (shadow mask passes), the rest before the point lights' denoiser
 		float biasConstant = 0.0f, biasPerUnit = 0.0f;
 		float toSun[3]{};
 		double camera[3]{};

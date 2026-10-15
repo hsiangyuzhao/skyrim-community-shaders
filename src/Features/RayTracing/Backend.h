@@ -99,6 +99,9 @@ namespace RayTracingRT
 		std::vector<std::uint32_t> indices;
 		std::vector<std::uint32_t> alphaUV;  // as ChunkGeometry::alphaUV (alpha-tested parts: hair)
 		std::uint32_t boneCount = 0;
+		// (46m) Merge Character Parts: an opaque shape traced only inside its character's merged BLAS (SkinDraw::group);
+		// it gets no BLAS of its own.
+		bool grouped = false;
 		[[nodiscard]] std::uint32_t Triangles() const { return static_cast<std::uint32_t>(indices.size() / 3); }
 		[[nodiscard]] std::uint32_t Vertices() const { return static_cast<std::uint32_t>(vertices.size()); }
 		[[nodiscard]] bool Opaque() const { return alphaUV.empty(); }
@@ -118,6 +121,9 @@ namespace RayTracingRT
 		bool npc = false;    // (45l) not the player: instance mask kNpcMask
 		std::uint32_t owner = 0;  // (46e) the character's key (InstanceContributionToHitGroupIndex, 24 bits): point lights it carries skip it
 		bool reuse = false;  // (45l) not skinned / refit this frame: last frame's BLAS (x / y / z = the origin it was skinned at)
+		// (46m) Merge Character Parts: the character's key (0 = a BLAS of its own). Every draw of one group has the same
+		// x / y / z, npc and owner; the group's opaque shapes are one BLAS (one geometry each), one TLAS instance.
+		std::uint32_t group = 0;
 	};
 
 	struct SkinStats
@@ -132,6 +138,15 @@ namespace RayTracingRT
 		std::uint32_t buildsLastFrame = 0;    // first builds and periodic rebuilds
 		std::uint32_t notReadyLastFrame = 0;  // draws not traced (not uploaded / built yet, build cap)
 		std::uint32_t reusedLastFrame = 0;    // (45l) draws traced with last frame's skinning (other actors, reduced quality)
+		// (46m) Merge Character Parts: merged BLASes in the TLAS last frame, of them built / refit / kept as they were,
+		// shapes inside them, character instances in the TLAS (merged + own BLAS), skinning dispatches.
+		std::uint32_t groupsLastFrame = 0;
+		std::uint32_t groupBuildsLastFrame = 0;
+		std::uint32_t groupRefitsLastFrame = 0;
+		std::uint32_t groupKeptLastFrame = 0;
+		std::uint32_t groupShapesLastFrame = 0;
+		std::uint32_t instancesLastFrame = 0;
+		std::uint32_t dispatchesLastFrame = 0;
 		std::uint64_t buildsTotal = 0;
 		std::uint64_t bytes = 0;              // rest, index and vertex buffers + BLASes (live shapes)
 		std::uint64_t scratchBytes = 0;
@@ -295,6 +310,10 @@ namespace RayTracingRT
 		bool sun = true;
 		// (46f) RTAO: recorded in its own list, submitted after the trace list, signalling the second fence (null = none).
 		const AOInput* ao = nullptr;
+		// (46m) Split Trace Sync: with the sun and the point lights traced, the sun goes in its own list and signals the sun
+		// fence before the point lights run; the D3D11 queue may then wait for the sun alone (WaitForSun) before the shadow
+		// mask passes and for the rest (WaitForTrace) only before the point lights' denoiser.
+		bool splitSun = false;
 	};
 
 	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
@@ -389,6 +408,8 @@ namespace RayTracingRT
 		std::int64_t aoRaysPerFrame = -1;
 		bool aoTracedLastFrame = false;
 		bool aoAlphaLastFrame = false;
+		// (46m) Split Trace Sync: the last ExecuteFrame signalled the sun fence between the sun and the point lights.
+		bool sunSplitLastFrame = false;
 	};
 
 	/// (46g) GPU memory carved out of a few large committed buffers ("blocks"), so a BLAS or a character shape
@@ -506,6 +527,10 @@ namespace RayTracingRT
 		/// No-op when nothing is pending. Returns the CPU ms of the call.
 		float WaitForTrace();
 		[[nodiscard]] bool TraceWaitPending() const { return pendingWait_ != 0; }
+		/// (46m) Split Trace Sync: the D3D11 queue waits (on the GPU) for the sun trace alone (the sun fence). No-op when
+		/// the last trace was not split (or the wait was taken). WaitForTrace() covers it too (the sun list runs first).
+		float WaitForSun();
+		[[nodiscard]] bool SunWaitPending() const { return pendingSunWait_ != 0; }
 		/// (45k) Loading screens: BLAS builds and compactions only (no trace, no D3D11 interop), with a
 		/// larger cap. Never waits; false when no command context is free or nothing is queued.
 		/// (46g) a_cpuMs: render-thread budget for the builds / compactions / character uploads of this submission.
@@ -722,6 +747,10 @@ namespace RayTracingRT
 			std::uint64_t aoFenceValue = 0;
 			bool aoPending = false;
 			std::uint64_t aoFrame = 0;
+			// (46m) Split Trace Sync: the point lights' own list (same allocator, recorded after the sun list); the
+			// trace timestamps of this submission then end with the sun (the point lights have their own pair).
+			ComPtr<ID3D12GraphicsCommandList4> pointList;
+			bool splitTrace = false;
 		};
 		/// (46f) A context may be reused once its submission (and its RTAO list, behind the second fence) completed.
 		static bool ContextFree(const CommandContext& a_context, std::uint64_t a_completed, std::uint64_t a_aoCompleted)
@@ -828,11 +857,45 @@ namespace RayTracingRT
 			std::uint32_t uvOffset = UINT32_MAX, uvCount = 0;  // alpha texcoords (hair)
 			std::uint32_t refits = 0;                          // since the last build
 			std::uint64_t lastSubmission = 0;                  // a shape is skinned once per frame
+			// (46m) Merge Character Parts: no BLAS of its own (built = inside a built merged BLAS); skinned = its skinned
+			// vertices were written at least once (a merged BLAS may be refit from them on a still frame); serial = unique
+			// per shape ever made (handles are reused), what a merged BLAS's member list compares.
+			bool grouped = false;
+			bool skinned = false;
+			std::uint64_t serial = 0;
 			[[nodiscard]] std::uint64_t Bytes() const { return restBytes + indexBytes + outputBytes + blasBytes; }
 		};
 
+		// (46m) Merge Character Parts: one BLAS per character (SkinDraw::group) holding its opaque shapes as geometries,
+		// built when the member list changes (equip, a new or released shape) and refit in place on every frame a member
+		// was skinned (one refit instead of one per shape: the per-build cost was most of the skinning's GPU time).
+		struct SkinGroup
+		{
+			std::uint32_t key = 0;
+			ArenaAlloc blas;
+			std::uint64_t blasBytes = 0;  // allocated (a little above the member list's need: small additions fit in place)
+			std::uint64_t buildScratch = 0, updateScratch = 0;
+			std::vector<std::uint64_t> serials;  // the built BLAS's members, in geometry order
+			bool built = false;
+			bool seen = false;  // drawn this frame (unseen groups are released)
+			std::uint32_t refits = 0;
+		};
+		struct SkinGroupInstance
+		{
+			D3D12_GPU_VIRTUAL_ADDRESS blas = 0;
+			double x = 0.0, y = 0.0, z = 0.0;
+			bool npc = false;
+			std::uint32_t owner = 0;
+			std::uint32_t members = 0;
+		};
+		static constexpr float kSkinGroupSlack = 1.25f;  // a merged BLAS is allocated this much above its need
+
 		bool CreateSkinPipelines();
 		void SetSkinFault(std::string a_reason);
+		/// (46m) Gives a merged BLAS's memory back (behind the fence) and forgets it.
+		void ReleaseSkinGroup(SkinGroup& a_group);
+		/// (46m) Every merged BLAS (characters released, switched off).
+		void ReleaseSkinGroups();
 		void UploadSkinShapes(ID3D12GraphicsCommandList4* a_list, float a_cpuMs);
 		/// Skins this frame's draws, builds / refits their BLASes; o_ready[i] = draw i can be traced.
 		void RecordSkinning(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, const FrameInput& a_input,
@@ -993,7 +1056,22 @@ namespace RayTracingRT
 		SkinStats skinStats_{};
 		std::vector<std::uint8_t> skinReady_;  // per draw, this frame
 		bool skinRecorded_ = false;            // uploads or builds recorded in this frame's list
+		// (46m) Merge Character Parts.
+		std::vector<SkinGroup> skinGroups_;
+		std::vector<SkinGroupInstance> skinGroupFrame_;  // this frame's merged BLASes for the TLAS (RecordSkinning)
+		std::uint64_t skinSerial_ = 0;
+		std::vector<std::pair<std::uint32_t, std::uint32_t>> skinGroupDraws_;  // scratch: (group key, draw)
+		std::vector<std::uint32_t> skinGroupMembers_;                         // scratch: member draws of every merged BLAS
+		std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> skinGroupDescs_;          // scratch: one merged BLAS's geometries
 		std::uint64_t pendingWait_ = 0;        // (45l) done value the D3D11 queue still has to wait for (deferred wait)
+		// (46m) Split Trace Sync: the sun fence (shared; only the D3D12 queue signals it, between the sun and the point
+		// lights), its last value and the value the D3D11 queue may still wait for (0 = none).
+		ComPtr<ID3D12Fence> sunFence_;
+		ComPtr<ID3D11Fence> sunFence11_;
+		std::uint64_t sunFenceValue_ = 0;
+		std::uint64_t pendingSunWait_ = 0;
+		bool sunFenceFailed_ = false;
+		bool EnsureSunFence();
 		// (45n) Early Prep: the context PrepareFrame recorded on (reserved: fenceValue UINT64_MAX until the trace
 		// or AbandonPrepared gives it its real done value).
 		bool prepared_ = false;
