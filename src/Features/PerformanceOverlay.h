@@ -197,6 +197,8 @@ struct PerformanceOverlay : OverlayFeature
 	virtual bool IsCore() const override { return true; }
 	virtual bool IsInMenu() const override { return true; }
 	bool IsOverlayVisible() const override { return settings.ShowInOverlay; }
+	/// (46u) The SSRT denoiser per-pass section is open and on screen (inside the open "Advanced" node): only then are its timers run.
+	bool IsDenoiserSectionOpen() const { return settings.SectionAdvanced && settings.SectionDenoiser; }
 	virtual std::pair<std::string, std::vector<std::string>> GetFeatureSummary() override;
 	virtual void DrawSettings() override;
 	virtual void DataLoaded() override;
@@ -552,6 +554,9 @@ struct PerformanceOverlay : OverlayFeature
 		bool SectionView = false;
 		bool SectionOcclusion = false;  // (batch 37a) "Occlusion (dry run)"
 		bool SectionShadows = false;    // (batch 37a) "Shadow maps"
+		// (46u) Every "Details: ..." section sits inside "Advanced"; the summary's GPU top list is collapsible too. Both collapsed by default.
+		bool SectionAdvanced = false;
+		bool SectionTopGpu = false;
 
 		// (46r) UI layout only. A saved file without this key (or below the current value) gets every
 		// Section* flag collapsed once on load; see LoadSettings.

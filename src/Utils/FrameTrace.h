@@ -270,8 +270,32 @@ namespace Util::FrameTrace
 		float createMs = 0.0f;
 		// (44f, A) Reflex: newest reported latency (simulation start to GPU end), smoothed.
 		float reflexLatencyMs = -1.0f;
+		// (46u) Reflex's input sample to simulation start, smoothed (-1 = not reported: no input-sample marker).
+		float reflexInputMs = -1.0f;
 	};
 	Smoothed GetSmoothed();
+
+	/// (46u) Estimate of NVIDIA's "PC Latency" (PCL): the input reaching the PC to the frame starting to be
+	/// sent to the display (mouse and panel not included). Only the game + render part (Reflex: simulation
+	/// start to GPU end) and, when reported, the input sample are measured; the rest is modelled from the real
+	/// frame time, the frame-generation multiplier and the display refresh rate. Shared by the overlay and F7.
+	struct LatencyEstimate
+	{
+		bool valid = false;          ///< false without a game + render latency (the one measured part)
+		bool inputMeasured = false;  ///< input wait from Reflex's input sample, else half a real frame
+		float inputMs = 0.0f;        ///< input reaching the PC to the game reading it (average wait)
+		float renderMs = 0.0f;       ///< Reflex: simulation start to GPU end
+		float fgMult = 1.0f;         ///< shown frames per real frame (1 = no frame generation)
+		float fgHoldMs = 0.0f;       ///< real frame held while the generated frames before it are shown
+		float refreshHz = 0.0f;      ///< display refresh used for the queue term (0 = unknown)
+		float queueMs = 0.0f;        ///< present to the start of scan-out (VRR assumed: 0 below the refresh rate)
+		float totalMs = 0.0f;        ///< the sum: the PCL estimate
+	};
+	/// a_realFrameMs: real (rendered) frame period; a_inputMs: measured input-sample wait or < 0; a_renderMs:
+	/// Reflex game + render latency or <= 0 (estimate invalid); a_fgMult: shown per real frame (<= 1 = off); a_refreshHz: display Hz or <= 0.
+	LatencyEstimate EstimatePcLatency(float a_realFrameMs, float a_inputMs, float a_renderMs, float a_fgMult, float a_refreshHz);
+	/// (46u) The model's frame-generation multiplier right now (measured DLSS-G cadence, else the applied multiplier; 1 = off).
+	float CurrentFgMultiplier();
 
 	/// Real-frame CPU vs GPU series for the overlay (last a_seconds). CPU frame = simulation start to
 	/// Present start (all CPU submission work, driver blocking included); GPU frame = GPU work span.

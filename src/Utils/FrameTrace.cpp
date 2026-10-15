@@ -494,12 +494,16 @@ namespace Util::FrameTrace
 			float postGpuMs = -1.0f;  // (46p) our post-processing chain, last GPU sample (GpuPassTimers PostProcessing)
 			Q46 q46{};             // (46q)
 			std::string vramByFeature;  // (46q) "name=MB;..." alive per feature of ours (1 MB or more)
+			// (46u) PC latency estimate inputs taken on the frame (the Reflex report arrives later).
+			float pclFgMult = 1.0f;
+			float pclRefreshHz = 0.0f;
 		};
 
 		struct ReflexTimes
 		{
 			uint64_t simStart, simEnd, submitStart, submitEnd, presentStart, presentEnd, driverStart, driverEnd, queueStart, queueEnd, gpuStart, gpuEnd;
 			uint32_t gpuActiveUs, gpuFrameUs;  // (45m) what the driver counts as GPU work for the frame
+			uint64_t inputSample;              // (46u) 0 = not reported
 		};
 
 		bool g_recording = false;
@@ -681,8 +685,16 @@ namespace Util::FrameTrace
 					continue;
 				g_reflex[r.frameID] = { r.simStartTime, r.simEndTime, r.renderSubmitStartTime, r.renderSubmitEndTime, r.presentStartTime, r.presentEndTime,
 					r.driverStartTime, r.driverEndTime, r.osRenderQueueStartTime, r.osRenderQueueEndTime, r.gpuRenderStartTime, r.gpuRenderEndTime,
-					r.gpuActiveRenderTimeUs, r.gpuFrameTimeUs };
+					r.gpuActiveRenderTimeUs, r.gpuFrameTimeUs, r.inputSampleTime };
 			}
+		}
+
+		/// (46u) Reflex input sample to simulation start in ms, or -1 when not reported (0, after the start, or implausibly early).
+		float InputSampleMs(uint64_t a_inputSample, uint64_t a_simStart)
+		{
+			if (a_inputSample == 0 || a_inputSample > a_simStart || a_simStart - a_inputSample > 200000)
+				return -1.0f;
+			return static_cast<float>(static_cast<double>(a_simStart - a_inputSample) / 1000.0);
 		}
 
 		/// (44f, A) Newest complete Reflex report: simulation start to GPU end, for the overlay line.
@@ -703,6 +715,13 @@ namespace Util::FrameTrace
 			const float ms = static_cast<float>(static_cast<double>(newest->gpuRenderEndTime - newest->simStartTime) / 1000.0);
 			auto& s = g_smoothed.reflexLatencyMs;
 			s = s < 0.0f ? ms : s * 0.8f + ms * 0.2f;
+			// (46u) Input sample to simulation start, only when Reflex reports one (we set no input-sample marker,
+			// so normally 0 = none; the estimate then assumes half a real frame).
+			const float inMs = InputSampleMs(newest->inputSampleTime, newest->simStartTime);
+			if (inMs >= 0.0f) {
+				auto& in = g_smoothed.reflexInputMs;
+				in = in < 0.0f ? inMs : in * 0.8f + inMs * 0.2f;
+			}
 		}
 
 		/// (46e) The upscaler, render / output size and the screen-space GI / reflection setup, for the trace header.
@@ -954,6 +973,14 @@ namespace Util::FrameTrace
 				out << "#   (0 = Fine Detail off); rtao_detail_len = the near / far split (units); rtao_normal_guided 1 / 0; rtao_alpha_budget = an AO\n";
 				out << "#   ray past 8 alpha candidates counts as 0 blocked (46s), 1 half open, 2 open. rtao_gpu_ms holds the near rays too (same\n";
 				out << "#   dispatch), rtao_filter_gpu_ms the detail filter and its history; rtao_rays counts every segment traced.\n";
+				out << "# (46u) pcl_est_* = the overlay's \"PC latency (est.)\": input reaching the PC to the frame starting to be sent to the display\n";
+				out << "#   (mouse and panel not included), an ESTIMATE. input = Reflex input sample to simulation start when reported (input_measured 1;\n";
+				out << "#   no input-sample marker is set, so normally 0 and input = half of frame_ms, the average wait for the next input read);\n";
+				out << "#   render = reflex_latency_ms (measured: simulation start to GPU end); fg_mult = shown frames per real frame (DLSS-G measured\n";
+				out << "#   cadence, else the applied multiplier; 1 = off); fg_hold = frame_ms x (fg_mult - 1) / fg_mult (the real frame waits while the\n";
+				out << "#   generated ones before it are shown; frame generation's own GPU work not included); refresh_hz = display refresh; queue =\n";
+				out << "#   present to scan-out start, VRR assumed: 0 while the shown rate is below the refresh, else half a refresh; pcl_est = the sum.\n";
+				out << "#   -1 = no Reflex report for the row.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -1008,7 +1035,8 @@ namespace Util::FrameTrace
 					   "rt_pw_skin_verts,rt_pw_tlas_instances,rt_pw_pool_blocks,rt_pw_pool_released,rt_pw_sample_age,post_gpu_ms,"
 					   "rt_sub_on,rt_sub_batches,rt_sub_max_batch_ms,rt_sub_max_lag_ms,rt_sub_max_call_ms,rt_bud_on,rt_bud_ms_per_mtri,rt_bud_tris,"
 					   "rt_bud_static_queued,rt_bud_groups_deferred,rt_bud_groups_kept,snow_shapes_ms,snow_shapes_state,rr_b,rr_c,rr_width,rr_height,"
-					   "vram_by_feature,rtao_filter,rtao_detail_rays,rtao_detail_len,rtao_normal_guided,rtao_alpha_budget\n";
+					   "vram_by_feature,rtao_filter,rtao_detail_rays,rtao_detail_len,rtao_normal_guided,rtao_alpha_budget,"
+					   "pcl_est_input_ms,pcl_est_input_measured,pcl_est_render_ms,pcl_est_fg_mult,pcl_est_fg_hold_ms,pcl_est_refresh_hz,pcl_est_queue_ms,pcl_est_ms\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1154,8 +1182,22 @@ namespace Util::FrameTrace
 						r.firstSeen, r.shaderAsync, r.shaderSync, r.cellAttach, r.cellDetach, r.yawRate, r.pitchRate, r.playerSpeed,
 						r.gpuWorkMs, r.gpuElapsedMs, r.fgPresented, r.grassApplyMs, r.rtGpuMs, r.rtCpuMs, r.rtBuilds);
 					auto it = r.reflexFrame != UINT32_MAX ? a_reflex.find(r.reflexFrame) : a_reflex.end();
+					// (46u) PC latency estimate columns, appended after rtao_alpha_budget (the old last column).
+					auto pclColumns = [&r](const ReflexTimes* a_x) {
+						const float renderMs = a_x && a_x->gpuEnd > a_x->simStart ? static_cast<float>(static_cast<double>(a_x->gpuEnd - a_x->simStart) / 1000.0) : -1.0f;
+						const float inputMs = a_x ? InputSampleMs(a_x->inputSample, a_x->simStart) : -1.0f;
+						const auto e = EstimatePcLatency(r.frameMs, inputMs, renderMs, r.pclFgMult, r.pclRefreshHz);
+						if (!e.valid)
+							return std::format(",-1,-1,-1,{:.2f},-1,{:.0f},-1,-1\n", r.pclFgMult, r.pclRefreshHz);
+						return std::format(",{:.3f},{},{:.3f},{:.2f},{:.3f},{:.0f},{:.3f},{:.3f}\n", e.inputMs, e.inputMeasured ? 1 : 0, e.renderMs, e.fgMult, e.fgHoldMs,
+							e.refreshHz, e.queueMs, e.totalMs);
+					};
+					std::string extra = extraColumns(r);
+					if (!extra.empty() && extra.back() == '\n')
+						extra.pop_back();
+					extra += pclColumns(it == a_reflex.end() ? nullptr : &it->second);
 					if (it == a_reflex.end()) {
-						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extraColumns(r);
+						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;
 					}
 					const auto& x = it->second;
@@ -1163,7 +1205,7 @@ namespace Util::FrameTrace
 					out << std::format("{},{},{},{},{},{},{},{},{},{},{},{},{:.3f},{:.3f},{:.3f}", r.reflexFrame, rel(x.simEnd), rel(x.submitStart), rel(x.submitEnd), rel(x.presentStart),
 						rel(x.presentEnd), rel(x.driverStart), rel(x.driverEnd), rel(x.queueStart), rel(x.queueEnd), rel(x.gpuStart), rel(x.gpuEnd),
 						x.gpuEnd > x.simStart ? static_cast<double>(x.gpuEnd - x.simStart) / 1000.0 : -1.0, x.gpuActiveUs / 1000.0, x.gpuFrameUs / 1000.0)
-						<< engineColumns(r) << extraColumns(r);
+						<< engineColumns(r) << extra;
 				}
 				out.close();
 				{
@@ -2260,6 +2302,8 @@ namespace Util::FrameTrace
 				r.q46 = g_q46;  // (46q)
 				r.q46.snowShapesMs = snowShapesMsThisFrame;
 				r.vramByFeature = VramByFeatureColumn();
+				r.pclFgMult = CurrentFgMultiplier();  // (46u)
+				r.pclRefreshHz = static_cast<float>(globals::features::upscaling.refreshRate);
 				r.cpuTop = Util::CpuPassTimers::GetSingleton()->TopOfCurrentFrame(3);
 				r.world = std::move(world);
 				r.driverMiscMs = static_cast<float>(g_frame.driverMisc);
@@ -2481,6 +2525,44 @@ namespace Util::FrameTrace
 	}
 
 	Smoothed GetSmoothed() { return g_smoothed; }
+
+	LatencyEstimate EstimatePcLatency(float a_realFrameMs, float a_inputMs, float a_renderMs, float a_fgMult, float a_refreshHz)
+	{
+		LatencyEstimate e;
+		if (a_renderMs <= 0.0f || a_realFrameMs <= 0.0f)
+			return e;
+		e.valid = true;
+		// Input reaching the PC to the game reading it: the measured sample when Reflex reports one, else
+		// the average wait for the next read (input arrives at a random moment of a real frame).
+		e.inputMeasured = a_inputMs >= 0.0f;
+		e.inputMs = e.inputMeasured ? a_inputMs : 0.5f * a_realFrameMs;
+		e.renderMs = a_renderMs;
+		// Frame generation interpolates: the generated frames between the previous real frame and this one are
+		// shown first, spread over one real frame, so this one waits (N - 1) / N of it (its own GPU work not included).
+		e.fgMult = std::max(1.0f, a_fgMult);
+		e.fgHoldMs = e.fgMult > 1.01f ? a_realFrameMs * (e.fgMult - 1.0f) / e.fgMult : 0.0f;
+		// VRR: a frame flips as soon as it is presented while the shown rate stays below the refresh rate; at
+		// the refresh rate (V-Sync at the top of the range) it waits half a refresh on average.
+		e.refreshHz = std::max(0.0f, a_refreshHz);
+		if (e.refreshHz > 0.0f) {
+			const float refreshMs = 1000.0f / e.refreshHz;
+			const float shownMs = a_realFrameMs / e.fgMult;
+			e.queueMs = shownMs <= refreshMs * 1.03f ? 0.5f * refreshMs : 0.0f;
+		}
+		e.totalMs = e.inputMs + e.renderMs + e.fgHoldMs + e.queueMs;
+		return e;
+	}
+
+	float CurrentFgMultiplier()
+	{
+		auto& up = globals::features::upscaling;
+		if (!up.loaded || !up.IsFrameGenerationActive())
+			return 1.0f;
+		float m = up.GetFrameGenerationPresentMultiplier();  // DLSS-G's measured cadence, 0 = none
+		if (m <= 1.01f)
+			m = static_cast<float>(up.GetFrameGenerationAppliedMultiplier());
+		return std::max(1.0f, m);
+	}
 
 	// ---- (46o) sub-timers, out-of-VRAM warnings ----
 

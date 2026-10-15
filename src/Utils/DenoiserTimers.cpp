@@ -19,7 +19,7 @@ namespace Util
 		auto& overlay = globals::features::performanceOverlay;
 		return globals::d3d::device && globals::d3d::context && globals::state && globals::menu &&
 		       globals::menu->overlayVisible && overlay.loaded && overlay.IsOverlayVisible() &&
-		       overlay.settings.ShowDrawCalls && overlay.settings.SectionDenoiser;
+		       overlay.settings.ShowDrawCalls && overlay.IsDenoiserSectionOpen();
 	}
 
 	bool DenoiserTimers::EnsureDisjoint(FrameSlot& a_slot) const
