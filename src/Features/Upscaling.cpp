@@ -84,6 +84,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	saveVramNrdShared,
 	copyRenderedAreaOnly,
 	precompileLazyShaders,
+	renderResBuffers,
+	renderResSsrt,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -690,6 +692,20 @@ void Upscaling::DrawAdvancedSettings()
 			ImGui::TextUnformatted("The per-frame hand-over copies to DLSS (colour, motion, depth, RR inputs) copy only the part of the picture that is");
 			ImGui::TextUnformatted("rendered (a quarter of 4K with DLSS Performance) instead of the whole 4K texture. Depth buffers cannot be copied");
 			ImGui::TextUnformatted("in part (a D3D11 rule) and stay whole.");
+		}
+		ImGui::Checkbox("Size Buffers to Render Resolution", &settings.renderResBuffers);  // (46q)
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Ray tracing's shadow work textures and its denoisers, and Subsurface Scattering's textures, are made at the size the");
+			ImGui::TextUnformatted("game really renders (1920x1080 with DLSS Performance at 4K) instead of 4K. Same picture. Changing the DLSS quality");
+			ImGui::TextUnformatted("mode or this box re-makes them on the spot (their history restarts once). Off: 4K, as 46p.");
+		}
+		ImGui::Checkbox("SSRT/SSGI Buffers at Render Resolution", &settings.renderResSsrt);  // (46q)
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Screen Space Ray Tracing's textures, its REBLUR denoisers and NRD's guides at the render size, and SSRT's textures");
+			ImGui::TextUnformatted("only while SSRT is on. Same picture; a quality-mode change restarts their history once (a few frames of noise).");
+			ImGui::TextUnformatted("Off: 4K and always allocated, as 46p. (SSGI's own textures stay 4K for now.)");
+			const auto [w, h] = GetRenderAllocSize(true);
+			ImGui::Text("Now allocated at %ux%u.", w, h);
 		}
 		ImGui::Checkbox("Precompile Lazy Shaders", &settings.precompileLazyShaders);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -1425,6 +1441,7 @@ void Upscaling::ConfigureUpscaling(RE::BSGraphics::State* a_viewport)
 
 	dynamicResolutionWidthRatio = resolutionScale.x;
 	dynamicResolutionHeightRatio = resolutionScale.y;
+	UpdateRenderAllocSize();  // (46q)
 
 	// Disable dynamic resolution unless the game explicitly enables it
 	if (!globals::game::isVR)
@@ -1597,14 +1614,30 @@ void Upscaling::CopySharedD3D12Resources()
 		auto& ssrt = globals::features::screenSpaceRayTracing;
 		if (ssrt.loaded && ssrt.settings.EnableSpecular) {
 			if (ssrt.texHitDistance && dx12SwapChain.specHitDistanceShared12) {
-				context->CopyResource(dx12SwapChain.specHitDistanceShared12->resource11, ssrt.texHitDistance->resource.get());
+				// (46q) The SSRT texture may be render-sized (SSRT/SSGI Buffers at Render Resolution): its whole extent, top-left.
+				D3D11_TEXTURE2D_DESC sharedDesc{};
+				dx12SwapChain.specHitDistanceShared12->resource11->GetDesc(&sharedDesc);
+				if (ssrt.texHitDistance->desc.Width == sharedDesc.Width && ssrt.texHitDistance->desc.Height == sharedDesc.Height) {
+					context->CopyResource(dx12SwapChain.specHitDistanceShared12->resource11, ssrt.texHitDistance->resource.get());
+				} else {
+					const D3D11_BOX box{ 0, 0, 0, std::min(ssrt.texHitDistance->desc.Width, sharedDesc.Width), std::min(ssrt.texHitDistance->desc.Height, sharedDesc.Height), 1 };
+					context->CopySubresourceRegion(dx12SwapChain.specHitDistanceShared12->resource11, 0, 0, 0, 0, ssrt.texHitDistance->resource.get(), 0, &box);
+				}
 			}
 		}
 
 		auto& sss = globals::features::subsurfaceScattering;
 		if (sss.loaded) {
 			if (sss.sssGuide && dx12SwapChain.sssGuide) {
-				context->CopyResource(dx12SwapChain.sssGuide->resource11, sss.sssGuide->resource.get());
+				// (46q) Render-sized with Size Buffers to Render Resolution: its extent, top-left.
+				D3D11_TEXTURE2D_DESC sharedDesc{};
+				dx12SwapChain.sssGuide->resource11->GetDesc(&sharedDesc);
+				if (sss.sssGuide->desc.Width == sharedDesc.Width && sss.sssGuide->desc.Height == sharedDesc.Height) {
+					context->CopyResource(dx12SwapChain.sssGuide->resource11, sss.sssGuide->resource.get());
+				} else {
+					const D3D11_BOX box{ 0, 0, 0, std::min(sss.sssGuide->desc.Width, sharedDesc.Width), std::min(sss.sssGuide->desc.Height, sharedDesc.Height), 1 };
+					context->CopySubresourceRegion(dx12SwapChain.sssGuide->resource11, 0, 0, 0, 0, sss.sssGuide->resource.get(), 0, &box);
+				}
 			}
 		}
 	}
@@ -2640,4 +2673,52 @@ void Upscaling::BSFaceGenManager_UpdatePendingCustomizationTextures::thunk()
 	runtimeData.dynamicResolutionLock = 1;
 	func();
 	runtimeData.dynamicResolutionLock = 0;
+}
+
+// ---- (46q) Render-resolution sizing -----------------------------------------------------------------------------------
+
+void Upscaling::UpdateRenderAllocSize()
+{
+	const auto screen = globals::state->screenSize;
+	if (screen.x < 1.0f || screen.y < 1.0f)
+		return;
+	const auto sw = static_cast<uint32_t>(screen.x), sh = static_cast<uint32_t>(screen.y);
+	uint32_t w = sw, h = sh;
+	if (resolutionScale.x < 1.0f || resolutionScale.y < 1.0f) {
+		// Every consumer rounds the render size its own way (truncation, lround, ceil + 1): two texels of margin.
+		w = std::min(sw, static_cast<uint32_t>(std::ceil(screen.x * resolutionScale.x)) + 2u);
+		h = std::min(sh, static_cast<uint32_t>(std::ceil(screen.y * resolutionScale.y)) + 2u);
+	}
+	if (renderAllocW == 0 || w > renderAllocW || h > renderAllocH) {
+		// Larger (or the first frame): at once, so nothing renders past a buffer's edge.
+		renderAllocW = renderAllocW == 0 ? w : std::max(renderAllocW, w);
+		renderAllocH = renderAllocH == 0 ? h : std::max(renderAllocH, h);
+		renderAllocPendingFrames = 0;
+	} else if (w != renderAllocW || h != renderAllocH) {
+		// Smaller: only once it held for 60 frames (a menu or loading frame at another scale does not re-create everything).
+		if (w == renderAllocPendingW && h == renderAllocPendingH) {
+			if (++renderAllocPendingFrames >= 60) {
+				renderAllocW = w;
+				renderAllocH = h;
+				renderAllocPendingFrames = 0;
+			}
+		} else {
+			renderAllocPendingW = w;
+			renderAllocPendingH = h;
+			renderAllocPendingFrames = 1;
+		}
+	} else {
+		renderAllocPendingFrames = 0;
+	}
+	Util::FrameTrace::On46qRenderRes(settings.renderResBuffers ? 1 : 0, settings.renderResSsrt ? 1 : 0, renderAllocW, renderAllocH);
+}
+
+std::pair<uint32_t, uint32_t> Upscaling::GetRenderAllocSize(bool a_ssrtSet) const
+{
+	const auto screen = globals::state->screenSize;
+	const auto sw = static_cast<uint32_t>(std::max(screen.x, 1.0f)), sh = static_cast<uint32_t>(std::max(screen.y, 1.0f));
+	const bool on = a_ssrtSet ? settings.renderResSsrt : settings.renderResBuffers;
+	if (!on || renderAllocW == 0 || renderAllocH == 0 || globals::game::isVR)
+		return { sw, sh };
+	return { std::min(renderAllocW, sw), std::min(renderAllocH, sh) };
 }

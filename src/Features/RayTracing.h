@@ -351,6 +351,8 @@ private:
 
 	bool EnsureBackend();
 	bool EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc);
+	/// (46q) The debug texture only while a debug view is on (Size Buffers to Render Resolution); false = not available.
+	bool EnsureDebugColor();
 	void ReleaseD3D11Resources();
 	void Disable(Status a_status, std::string a_reason);
 	void RunFrame();

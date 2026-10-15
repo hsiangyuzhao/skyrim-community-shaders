@@ -221,11 +221,13 @@ groupshared half DepthData[READ_COUNT * WAVE_SIZE];
 // the ray tracer's start offset leaves); farther along the light ray only the ray tracer shadows.
 groupshared uint RtCasterData[READ_COUNT * WAVE_SIZE];
 
-bool IsRtCaster(half2 uv)
+// (46q) uv is over the full-size depth (output pixel = uv / (InvDepthTextureSize * DynamicRes)); the mask may be render-sized
+// (Size Buffers to Render Resolution) with the same top-left origin, so its texel is that output pixel, not uv x its own size.
+bool IsRtCaster(half2 uv, float2 uvToPixel)
 {
 	uint w, h;
 	RTCasterMask.GetDimensions(w, h);
-	const int2 texel = int2(floor(float2(uv) * float2(w, h)));
+	const int2 texel = int2(floor(float2(uv) * uvToPixel));
 	if (any(texel < 0) || texel.x >= int(w) || texel.y >= int(h))
 		return false;
 	return (uint(RTCasterMask.Load(int3(texel, 0)).w * 255.0 + 0.5) & 4u) != 0u;
@@ -350,7 +352,8 @@ void WriteScreenSpaceShadow(DispatchParameters inParameters, int3 inGroupID, int
 		shadowing_depth[i] = use_point_filter ? edge_depth : shadow_depth;
 #	if defined(RT_CASTER_MASK)
 		// Both taps of the sample: a traced caster's silhouette pixel the mask missed still counts.
-		rt_caster[i] = IsRtCaster(coord) || IsRtCaster(coord_with_offset);
+		const float2 uvToPixel = rcp(max(float2(inParameters.InvDepthTextureSize) * inParameters.DynamicRes, 1e-6));
+		rt_caster[i] = IsRtCaster(coord, uvToPixel) || IsRtCaster(coord_with_offset, uvToPixel);
 #	endif
 
 		// Store for later

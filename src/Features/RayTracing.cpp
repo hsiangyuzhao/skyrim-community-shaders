@@ -1694,10 +1694,25 @@ bool RayTracing::RunSigma(const float a_toSun[3])
 	return ok;
 }
 
+namespace
+{
+	/// (46q) Size Buffers to Render Resolution: the work textures (MaskTemp, DebugColor, the shared DepthMask / Visibility, the
+	/// denoisers sized from MaskTemp) at the upscaler's render size instead of the shadow mask's. Every pass is pixel-indexed over
+	/// min(render size, this size); the combine copies that box into the full-size mask.
+	void ShrinkToRenderAlloc(D3D11_TEXTURE2D_DESC& a_desc)
+	{
+		const auto [w, h] = globals::features::upscaling.GetRenderAllocSize(false);
+		a_desc.Width = std::min<UINT>(a_desc.Width, w);
+		a_desc.Height = std::min<UINT>(a_desc.Height, h);
+	}
+}
+
 bool RayTracing::EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc)
 {
-	if (maskTemp && a_maskDesc.Width == maskDesc.Width && a_maskDesc.Height == maskDesc.Height && a_maskDesc.Format == maskDesc.Format)
+	if (maskTemp && a_maskDesc.Width == maskDesc.Width && a_maskDesc.Height == maskDesc.Height && a_maskDesc.Format == maskDesc.Format) {
+		EnsureDebugColor();  // (46q)
 		return true;
+	}
 	ReleaseD3D11Resources();
 
 	DXGI_FORMAT uavFormat = a_maskDesc.Format;
@@ -1728,19 +1743,49 @@ bool RayTracing::EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc)
 	}
 	Util::SetResourceName(maskTemp.get(), "RayTracing MaskTemp");
 
-	D3D11_TEXTURE2D_DESC debugDesc = desc;
-	debugDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	debugDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-	if (FAILED(device->CreateTexture2D(&debugDesc, nullptr, debugColor.put())) ||
-		FAILED(device->CreateUnorderedAccessView(debugColor.get(), nullptr, debugColorUAV.put())) ||
-		FAILED(device->CreateShaderResourceView(debugColor.get(), nullptr, debugColorSRV.put()))) {
+	maskDesc = a_maskDesc;
+	d3d11Bytes = static_cast<std::uint64_t>(desc.Width) * desc.Height * 4;
+	// (46q) The debug texture: only while a debug view is on (Size Buffers to Render Resolution; off: always, as 46p).
+	if (!EnsureDebugColor() && !globals::features::upscaling.settings.renderResBuffers) {
 		Disable(Status::Unavailable, "could not create the debug texture");
 		return false;
 	}
-	Util::SetResourceName(debugColor.get(), "RayTracing DebugColor");
+	return true;
+}
 
-	maskDesc = a_maskDesc;
-	d3d11Bytes = static_cast<std::uint64_t>(desc.Width) * desc.Height * (4 + 4);
+bool RayTracing::EnsureDebugColor()
+{
+	const bool wanted = !globals::features::upscaling.settings.renderResBuffers || debugView != DebugView::Off || aoDebugView != AODebugView::Off;
+	if (!wanted) {
+		if (debugColor) {
+			d3d11Bytes -= std::min<std::uint64_t>(d3d11Bytes, static_cast<std::uint64_t>(maskDesc.Width) * maskDesc.Height * 4);
+			debugColor = nullptr;
+			debugColorUAV = nullptr;
+			debugColorSRV = nullptr;
+		}
+		return true;
+	}
+	if (debugColor || !maskTemp)
+		return debugColor != nullptr;
+	D3D11_TEXTURE2D_DESC debugDesc{};
+	maskTemp->GetDesc(&debugDesc);
+	debugDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	debugDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+	// Into locals first: a failure leaves no half-made texture behind (the debug views then draw nothing).
+	winrt::com_ptr<ID3D11Texture2D> texture;
+	winrt::com_ptr<ID3D11UnorderedAccessView> uav;
+	winrt::com_ptr<ID3D11ShaderResourceView> srv;
+	auto* device = globals::d3d::device;
+	if (!device || FAILED(device->CreateTexture2D(&debugDesc, nullptr, texture.put())) || FAILED(device->CreateUnorderedAccessView(texture.get(), nullptr, uav.put())) ||
+		FAILED(device->CreateShaderResourceView(texture.get(), nullptr, srv.put()))) {
+		logger::warn("[RayTracing] Could not create the debug texture; debug views draw nothing");
+		return false;
+	}
+	Util::SetResourceName(texture.get(), "RayTracing DebugColor");
+	debugColor = texture;
+	debugColorUAV = uav;
+	debugColorSRV = srv;
+	d3d11Bytes += static_cast<std::uint64_t>(debugDesc.Width) * debugDesc.Height * 4;
 	return true;
 }
 
@@ -2547,6 +2592,7 @@ void RayTracing::RunFrame()
 	}
 	D3D11_TEXTURE2D_DESC desc{};
 	mask.texture->GetDesc(&desc);
+	ShrinkToRenderAlloc(desc);  // (46q) Size Buffers to Render Resolution
 	if (!EnsureD3D11Resources(desc))
 		return;
 	std::string reason;
@@ -3910,6 +3956,7 @@ void RayTracing::RunInteriorFrame()
 	}
 	D3D11_TEXTURE2D_DESC desc{};
 	mask.texture->GetDesc(&desc);
+	ShrinkToRenderAlloc(desc);  // (46q) Size Buffers to Render Resolution
 	if (!EnsureD3D11Resources(desc))
 		return;
 	std::string reason;
@@ -4199,6 +4246,7 @@ void RayTracing::WritePointMask(bool a_traced)
 		return;
 	D3D11_TEXTURE2D_DESC desc{};
 	mask.texture->GetDesc(&desc);
+	ShrinkToRenderAlloc(desc);  // (46q) Size Buffers to Render Resolution
 	if (!maskTemp || desc.Width != maskDesc.Width || desc.Height != maskDesc.Height || desc.Format != maskDesc.Format) {
 		if (!EnsureD3D11Resources(desc))
 			return;

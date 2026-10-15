@@ -2,6 +2,7 @@
 
 #include "Deferred.h"
 #include "Features/TerrainBlending.h"
+#include "Features/Upscaling.h"
 #include "ShaderCache.h"
 #include "State.h"
 #include "Utils/GpuTimers.h"
@@ -219,6 +220,10 @@ void SubsurfaceScattering::DrawSSS()
 {
 	if (!validMaterials)
 		return;
+	if (!EnsureTextures()) {  // (46q)
+		validMaterials = false;
+		return;
+	}
 
 	ZoneScoped;
 	TracyD3D11Zone(globals::state->tracyCtx, "Subsurface Scattering");
@@ -388,37 +393,81 @@ void SubsurfaceScattering::SetupResources()
 		blurCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<BlurCB>());
 	}
 
+	// (46q) Size Buffers to Render Resolution: the three work textures at the upscaler's render size (re-made by EnsureTextures
+	// when it changes); off: the output size, as 46p.
+	blurHorizontalTemp = nullptr;
+	diffuseNoAlbedoTex = nullptr;
+	sssGuide = nullptr;
 	auto renderer = globals::game::renderer;
+	auto main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+	D3D11_TEXTURE2D_DESC mainDesc{};
+	main.texture->GetDesc(&mainDesc);
+	CreateTextures(mainDesc.Width, mainDesc.Height);
+}
 
-	{
-		auto main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+void SubsurfaceScattering::CreateTextures(UINT a_width, UINT a_height)
+{
+	auto renderer = globals::game::renderer;
+	auto main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 
-		D3D11_TEXTURE2D_DESC texDesc{};
-		main.texture->GetDesc(&texDesc);
+	D3D11_TEXTURE2D_DESC texDesc{};
+	main.texture->GetDesc(&texDesc);
+	texDesc.Width = a_width;
+	texDesc.Height = a_height;
 
-		texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 
-		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-		main.SRV->GetDesc(&srvDesc);
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	main.SRV->GetDesc(&srvDesc);
 
-		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
-		main.UAV->GetDesc(&uavDesc);
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+	main.UAV->GetDesc(&uavDesc);
 
-		blurHorizontalTemp = std::make_unique<Texture2D>(texDesc);
-		blurHorizontalTemp->CreateSRV(srvDesc);
-		blurHorizontalTemp->CreateUAV(uavDesc);
+	// Into locals first: a failure (video memory) leaves the previous set in place.
+	auto blur = std::make_unique<Texture2D>(texDesc);
+	blur->CreateSRV(srvDesc);
+	blur->CreateUAV(uavDesc);
 
-		diffuseNoAlbedoTex = std::make_unique<Texture2D>(texDesc);
-		diffuseNoAlbedoTex->CreateSRV(srvDesc);
-		diffuseNoAlbedoTex->CreateUAV(uavDesc);
+	auto diffuse = std::make_unique<Texture2D>(texDesc);
+	diffuse->CreateSRV(srvDesc);
+	diffuse->CreateUAV(uavDesc);
 
-		texDesc.Format = DXGI_FORMAT_R16_FLOAT;
-		srvDesc.Format = DXGI_FORMAT_R16_FLOAT;
-		uavDesc.Format = DXGI_FORMAT_R16_FLOAT;
-		sssGuide = std::make_unique<Texture2D>(texDesc);
-		sssGuide->CreateSRV(srvDesc);
-		sssGuide->CreateUAV(uavDesc);
+	texDesc.Format = DXGI_FORMAT_R16_FLOAT;
+	srvDesc.Format = DXGI_FORMAT_R16_FLOAT;
+	uavDesc.Format = DXGI_FORMAT_R16_FLOAT;
+	auto guide = std::make_unique<Texture2D>(texDesc);
+	guide->CreateSRV(srvDesc);
+	guide->CreateUAV(uavDesc);
+
+	blurHorizontalTemp = std::move(blur);
+	diffuseNoAlbedoTex = std::move(diffuse);
+	sssGuide = std::move(guide);
+}
+
+bool SubsurfaceScattering::EnsureTextures()
+{
+	// (46q) Size Buffers to Render Resolution: re-made when the render size (quality mode) or the switch changes.
+	auto renderer = globals::game::renderer;
+	auto main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+	if (!main.texture)
+		return false;
+	D3D11_TEXTURE2D_DESC mainDesc{};
+	main.texture->GetDesc(&mainDesc);
+	const auto [w, h] = globals::features::upscaling.GetRenderAllocSize(false);
+	const UINT width = std::min<UINT>(mainDesc.Width, w), height = std::min<UINT>(mainDesc.Height, h);
+	if (blurHorizontalTemp && diffuseNoAlbedoTex && sssGuide && diffuseNoAlbedoTex->desc.Width == width && diffuseNoAlbedoTex->desc.Height == height)
+		return true;
+	if (retryFrames > 0) {
+		--retryFrames;
+		return blurHorizontalTemp && diffuseNoAlbedoTex && sssGuide;
 	}
+	try {
+		CreateTextures(width, height);
+	} catch (const std::exception& e) {
+		logger::warn("[SSS] Could not create its textures at {}x{} ({}); keeping the previous ones", width, height, e.what());
+		retryFrames = 300;
+	}
+	return blurHorizontalTemp && diffuseNoAlbedoTex && sssGuide;
 }
 
 void SubsurfaceScattering::Reset()

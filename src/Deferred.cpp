@@ -638,7 +638,7 @@ void Deferred::DeferredPasses()
 			// on ssrtSettings.DiffuseMult > 0 and AmbientReinjection != 0, both of which
 			// GetCommonBufferData clears when EnableDiffuse is off, so a null binding here can
 			// never be read.
-			(ssrt.loaded && ssrt.settings.EnableDiffuse) ? ssrt.texSSRTDiffuseConfidenceSmooth->srv.get() : nullptr,
+			(ssrt.loaded && ssrt.settings.EnableDiffuse && ssrt.texSSRTDiffuseConfidenceSmooth) ? ssrt.texSSRTDiffuseConfidenceSmooth->srv.get() : nullptr,  // (46q) may be absent
 			// t20 (batch 36f) kPOST_ZPREPASS_COPY, the depth SSRT and NRD classify the distance limit by.
 			ssrt.loaded ? renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY].depthSRV : nullptr,
 		};

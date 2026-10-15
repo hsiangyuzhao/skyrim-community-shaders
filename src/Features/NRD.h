@@ -60,6 +60,7 @@ struct NRD : Feature
 	// false if the set is not complete afterwards, which PrepareGuides treats as a failure like
 	// any other. Idempotent; the early-out makes the steady-state call free.
 	bool EnsureGuides();
+	bool CreateGuides(const D3D11_TEXTURE2D_DESC& a_mainDesc);  // (46q) may throw (Texture2D); EnsureGuides catches
 
 	// True when PrepareGuides has run successfully for this frame. Consumers
 	// should skip their dispatches if guides aren't ready (e.g. world not

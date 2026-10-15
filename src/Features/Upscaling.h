@@ -247,6 +247,12 @@ public:
 		bool saveVramNrdShared = true;       // NRD instances share their transient (scratch) pool textures (A5; from the next pool creation)
 		bool copyRenderedAreaOnly = true;    // per-frame interop copies only of the render rect (item 7)
 		bool precompileLazyShaders = true;   // first-use shaders compiled behind the first loading screen (item 9)
+		// (46q) Render-resolution sizing (Save GPU Memory): our buffers that only ever hold the rendered area are allocated at the
+		// render size of the current upscaling mode (+2 texels) instead of the output size; a mode / quality change re-creates them
+		// (one history reset). B = the small set (RT shadow work + denoiser, Screen Space Shadows, LLF clusters, upscaler inputs),
+		// C = SSRT / NRD / SSGI. Off = 46p (output size).
+		bool renderResBuffers = true;
+		bool renderResSsrt = true;
 
 		NeuralRenderingSettings neuralRendering;
 	};
@@ -292,6 +298,12 @@ public:
 	// Timing and scaling
 	double refreshRate = 0.0f;
 	float2 resolutionScale = { 1.0f, 1.0f };
+	/// (46q) The size render-resolution buffers are allocated at: a_ssrtSet = category C (SSRT / NRD / SSGI) else B. The output
+	/// size when that switch is off or nothing upscales (or before the first frame). Grows at once, shrinks after 60 steady frames.
+	[[nodiscard]] std::pair<uint32_t, uint32_t> GetRenderAllocSize(bool a_ssrtSet) const;
+	uint32_t renderAllocW = 0, renderAllocH = 0;
+	uint32_t renderAllocPendingW = 0, renderAllocPendingH = 0, renderAllocPendingFrames = 0;
+	void UpdateRenderAllocSize();
 	LARGE_INTEGER qpf;
 
 	// FG FPS Measurement for Overlay

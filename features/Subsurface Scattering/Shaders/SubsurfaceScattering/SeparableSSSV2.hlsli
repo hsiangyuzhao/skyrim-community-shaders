@@ -57,7 +57,12 @@ float4 SSSSBlurCSV2(
 	float2 texcoordNonDR = texcoord * FrameBuffer::DynamicResolutionParams2.xy;
 
 	// Input is already linear and albedo-free from the pre-pass.
-	float4 colorM = ColorTexture.SampleLevel(PointSampler, texcoord, 0);
+	// (46q) The colour textures may be render-sized (Size Buffers to Render Resolution): UVs over the output size rescaled to
+	// their own extent (x 1 exactly when output-sized). The depth (t1) stays output-sized and keeps the plain UV.
+	uint colorWidth, colorHeight;
+	ColorTexture.GetDimensions(colorWidth, colorHeight);
+	const float2 colorScale = SharedData::BufferDim.xy / float2(max(colorWidth, 1u), max(colorHeight, 1u));
+	float4 colorM = ColorTexture.SampleLevel(PointSampler, texcoord * colorScale, 0);
 
 	if (sssAmount == 0)
 		return colorM;
@@ -103,7 +108,7 @@ float4 SSSSBlurCSV2(
 		// Clamp to the DR-rendered region (per eye in VR) to avoid sampling outside it.
 		sampleCoord = SSSClampToRenderedRegion(sampleCoord, texcoordNonDR);
 
-		float3 color = ColorTexture.SampleLevel(PointSampler, sampleCoord, 0).rgb;
+		float3 color = ColorTexture.SampleLevel(PointSampler, sampleCoord * colorScale, 0).rgb;
 
 		float depth = DepthTexture.SampleLevel(PointSampler, sampleCoord, 0).r;
 		depth = SharedData::GetScreenDepth(depth);

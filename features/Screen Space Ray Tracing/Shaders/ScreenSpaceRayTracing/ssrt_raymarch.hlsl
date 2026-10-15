@@ -1272,7 +1272,12 @@ float SSRT_CubemapNormalizationRatio(float ambientLuminance, float envLuminance)
             // float2 projUV;
             // ReprojectHit(MotionVectorTexture, hit, eyeIndex, projUV);
 
-            sampleColor = ScreenColorTextureMips.SampleLevel(LinearSampler, hit.xy * FrameBuffer::DynamicResolutionParams1.xy, 0).xyz;
+            // (46q) The colour source may be render-sized (SSRT/SSGI Buffers at Render Resolution: the specular pass's texColor):
+            // the UV over the output size, rescaled to its own extent (x 1 exactly when it is output-sized: kMAIN, or the switch off).
+            uint colorWidth, colorHeight;
+            ScreenColorTextureMips.GetDimensions(colorWidth, colorHeight);
+            const float2 colorScale = SharedData::BufferDim.xy / float2(max(colorWidth, 1u), max(colorHeight, 1u));
+            sampleColor = ScreenColorTextureMips.SampleLevel(LinearSampler, hit.xy * FrameBuffer::DynamicResolutionParams1.xy * colorScale, 0).xyz;
             sampleColor = Color::IrradianceToLinear(sampleColor);
             // (guard G1) The radiance source is kMAIN, i.e. the accumulated output of every
             // other feature in the deferred chain. SSRT has no control over what lands

@@ -11,6 +11,7 @@
 #include "DynamicCubemaps.h"
 #include "ScreenSpaceGI.h"
 #include "Skylighting.h"
+#include "Upscaling.h"
 
 #include "Utils/DenoiserTimers.h"
 #include "Utils/GpuTimers.h"
@@ -858,11 +859,51 @@ void ScreenSpaceRayTracing::SetupResources()
         // on row 3 of SSRTCB, which the ray march already binds.
     }
 
-    logger::debug("Creating textures...");
+    // (46q) The always-on set (texColor, texSSRColor, texSSRTDiffuseColor, the confidence pair, the hit distances, the depth
+    // pyramid): with SSRT/SSGI Buffers at Render Resolution made by EnsureCoreResources in Prepass, at the upscaler's render size
+    // and only while diffuse or specular is on; off = here at the output size, as 46p.
+    ReleaseCoreResources();
+    if (!globals::features::upscaling.settings.renderResSsrt) {
+        auto mainTexDesc = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+        D3D11_TEXTURE2D_DESC mainDesc{};
+        mainTexDesc.texture->GetDesc(&mainDesc);
+        CreateCoreResources(mainDesc.Width, mainDesc.Height);
+    }
+
+    logger::debug("Creating samplers...");
+	{
+		D3D11_SAMPLER_DESC samplerDesc = {
+			.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+			.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP,
+			.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP,
+			.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP,
+			.MaxAnisotropy = 1,
+			.MinLOD = 0,
+			.MaxLOD = D3D11_FLOAT32_MAX
+		};
+		DX::ThrowIfFailed(device->CreateSamplerState(&samplerDesc, linearSampler.put()));
+	}
+
+    logger::debug("Loading noise texture...");
+    {
+        DirectX::CreateDDSTextureFromFile(device, globals::d3d::context, L"Data\\Shaders\\ScreenSpaceRayTracing\\noise.dds",
+            nullptr, noiseSRV.put());
+    }
+
+	CompileComputeShaders();
+}
+
+void ScreenSpaceRayTracing::CreateCoreResources(UINT a_width, UINT a_height)
+{
+    auto renderer = globals::game::renderer;
+    auto device = globals::d3d::device;
+    logger::debug("Creating SSRT core textures ({}x{})...", a_width, a_height);
     {
         auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
         D3D11_TEXTURE2D_DESC texDesc = {};
         mainTex.texture->GetDesc(&texDesc);
+        texDesc.Width = a_width;  // (46q)
+        texDesc.Height = a_height;
         // (audit P9) None of these textures is ever bound as a render target or passed
         // to GenerateMips -- the only GenerateMips call in this feature is commented out
         // in Prepass, and no RTV is ever created. D3D11_RESOURCE_MISC_GENERATE_MIPS also
@@ -1049,27 +1090,85 @@ void ScreenSpaceRayTracing::SetupResources()
 		}
     }
 
-    logger::debug("Creating samplers...");
-	{
-		D3D11_SAMPLER_DESC samplerDesc = {
-			.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-			.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP,
-			.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP,
-			.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP,
-			.MaxAnisotropy = 1,
-			.MinLOD = 0,
-			.MaxLOD = D3D11_FLOAT32_MAX
-		};
-		DX::ThrowIfFailed(device->CreateSamplerState(&samplerDesc, linearSampler.put()));
-	}
+    coreAllocW = a_width;
+    coreAllocH = a_height;
+}
 
-    logger::debug("Loading noise texture...");
-    {
-        DirectX::CreateDDSTextureFromFile(device, globals::d3d::context, L"Data\\Shaders\\ScreenSpaceRayTracing\\noise.dds",
-            nullptr, noiseSRV.put());
+void ScreenSpaceRayTracing::ReleaseCoreResources()
+{
+    // (46q) D3D11 keeps whatever a submitted pass still reads alive; the views go with their textures.
+    texColor = nullptr;
+    texSSRColor = nullptr;
+    texSSRTDiffuseColor = nullptr;
+    texSSRTDiffuseConfidence = nullptr;
+    texSSRTDiffuseConfidenceSmooth = nullptr;
+    texSSRTDiffuseHitDistance = nullptr;
+    texHitDistance = nullptr;
+    texDepth = nullptr;
+    for (auto& v : depthSRVs)
+        v = nullptr;
+    for (auto& v : depthUAVs)
+        v = nullptr;
+    coreAllocW = coreAllocH = 0;
+    specularCompositeSRV = nullptr;
+}
+
+void ScreenSpaceRayTracing::EnsureCoreResources()
+{
+    // (46q) SSRT/SSGI Buffers at Render Resolution: the always-on set at the upscaler's render size, made on the first frame
+    // diffuse or specular is on and released while both are off. Every pass over it is pixel-indexed over the render rect
+    // (the specular ray march's colour fetch scales its UV by output / allocation size). A size change (quality mode, the
+    // switch) makes the set and what is sized from it again: the depth pyramid is cleared and the histories restart.
+    // Off: the set SetupResources made at the output size; re-made here only when it has another size (switched off live).
+    auto renderer = globals::game::renderer;
+    if (!renderer)
+        return;
+    auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+    if (!mainTex.texture)
+        return;
+    D3D11_TEXTURE2D_DESC mainDesc{};
+    mainTex.texture->GetDesc(&mainDesc);
+    const bool renderRes = globals::features::upscaling.settings.renderResSsrt;
+    const bool wanted = settings.EnableDiffuse || settings.EnableSpecular;
+    UINT width = mainDesc.Width, height = mainDesc.Height;
+    if (renderRes) {
+        const auto [w, h] = globals::features::upscaling.GetRenderAllocSize(true);
+        width = std::min<UINT>(width, w);
+        height = std::min<UINT>(height, h);
     }
-
-	CompileComputeShaders();
+    if (!wanted) {
+        if (renderRes && texColor)
+            ReleaseCoreResources();
+        return;
+    }
+    if (texColor && coreAllocW == width && coreAllocH == height)
+        return;
+    if (coreRetryFrames > 0) {
+        --coreRetryFrames;  // a failed creation (video memory full) is tried again only every few seconds
+        return;
+    }
+    ReleaseCoreResources();
+    try {
+        CreateCoreResources(width, height);
+    } catch (const std::exception& e) {
+        logger::warn("SSRT: could not create its textures at {}x{} ({}); SSRT draws nothing until they can be made", width, height, e.what());
+        ReleaseCoreResources();
+        coreRetryFrames = 300;
+        return;
+    }
+    // What is sized from the set, or holds history at its old size, starts over.
+    texSSRTConfidenceLo.reset();
+    texSSRTConfidenceLoBlur.reset();
+    texSSRTConfidenceLoDepth.reset();
+    texSSRTConfidenceLoNormal.reset();
+    texSparseColor.reset();
+    texSparseConfidence.reset();
+    texSparseHitDistance.reset();
+    lastDepthExtentX = lastDepthExtentY = 0;
+    historyClearPending = true;
+    resetReblurDiffuse = true;
+    resetReblurSpecular = true;
+    logger::info("SSRT: textures at {}x{}{}", width, height, renderRes ? " (render resolution)" : "");
 }
 
 #ifdef ENABLE_SHARC
@@ -1323,6 +1422,12 @@ bool ScreenSpaceRayTracing::EnsureConfidenceFilterResources()
 
     D3D11_TEXTURE2D_DESC texDesc{};
     mainTex.texture->GetDesc(&texDesc);
+    if (coreAllocW != 0) {
+        // (46q) Sized from the always-on set (the render size with SSRT/SSGI Buffers at Render Resolution: the confidence filter
+        // stays a quarter of the render area, hard constraint 3); EnsureCoreResources drops this set when that size changes.
+        texDesc.Width = coreAllocW;
+        texDesc.Height = coreAllocH;
+    }
     // Same reasoning as every other surface in this feature: no RTV is created for any of these
     // and none is passed to GenerateMips, so the render-target bind flag and its compression
     // metadata are pure cost. MiscFlags set rather than OR-ed, because an inherited GENERATE_MIPS
@@ -1395,6 +1500,12 @@ bool ScreenSpaceRayTracing::EnsureSparseResources()
 
     D3D11_TEXTURE2D_DESC texDesc{};
     mainTex.texture->GetDesc(&texDesc);
+    if (coreAllocW != 0) {
+        // (46q) Sized from the always-on set (the render size with SSRT/SSGI Buffers at Render Resolution: the confidence filter
+        // stays a quarter of the render area, hard constraint 3); EnsureCoreResources drops this set when that size changes.
+        texDesc.Width = coreAllocW;
+        texDesc.Height = coreAllocH;
+    }
     // Same reasoning as every other surface in this feature (audit P9): no RTV is created for any
     // of these and none is passed to GenerateMips, so the render-target bind flag and its
     // compression metadata are pure cost. MiscFlags set rather than OR-ed, because an inherited
@@ -1536,15 +1647,45 @@ uint ScreenSpaceRayTracing::ResolveSamplingMode()
 // *are* the per-signal history and are not scratch.
 void ScreenSpaceRayTracing::EnsureNRDResources()
 {
-    if (texNRDPackInput && texNRDPackOutput && nrdReblurDiffuse.IsValid() && nrdReblurSpecular.IsValid())
-        return;
-
-    logger::debug("Creating SSRT NRD resources...");
-
     auto renderer = globals::game::renderer;
     auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
     D3D11_TEXTURE2D_DESC mainDesc;
     mainTex.texture->GetDesc(&mainDesc);
+    {
+        // (46q) SSRT/SSGI Buffers at Render Resolution: the pack pair and both REBLUR instances at the upscaler's render size,
+        // the same size NRD::EnsureGuides gives the guides (NRD's resourceSize). Hard constraints unchanged: two instances,
+        // full-RENDER-resolution input, frameIndex as before; a size change = one history reset (both instances re-made).
+        const auto [w, h] = globals::features::upscaling.GetRenderAllocSize(true);
+        mainDesc.Width = std::min<UINT>(mainDesc.Width, w);
+        mainDesc.Height = std::min<UINT>(mainDesc.Height, h);
+    }
+    if (texNRDPackInput && texNRDPackOutput && nrdReblurDiffuse.IsValid() && nrdReblurSpecular.IsValid()) {
+        if (texNRDPackInput->desc.Width == mainDesc.Width && texNRDPackInput->desc.Height == mainDesc.Height &&
+            nrdReblurDiffuse.GetWidth() == mainDesc.Width && nrdReblurDiffuse.GetHeight() == mainDesc.Height &&
+            nrdReblurSpecular.GetWidth() == mainDesc.Width && nrdReblurSpecular.GetHeight() == mainDesc.Height)
+            return;
+        // Re-made together at the new size (D3D11 keeps what a submitted pass still reads alive).
+        texNRDPackInput = nullptr;
+        texNRDPackOutput = nullptr;
+        nrdReblurDiffuse.Shutdown();
+        nrdReblurSpecular.Shutdown();
+    }
+
+    logger::debug("Creating SSRT NRD resources ({}x{})...", mainDesc.Width, mainDesc.Height);
+    try {
+        CreateNRDResources(mainDesc);
+    } catch (const std::exception& e) {
+        // Out of video memory (Texture2D / NRD pools throw): REBLUR is not ready, the chains keep their fallback denoiser.
+        logger::warn("SSRT: could not create the REBLUR resources ({}); falling back for now", e.what());
+        texNRDPackInput = nullptr;
+        texNRDPackOutput = nullptr;
+        nrdReblurDiffuse.Shutdown();
+        nrdReblurSpecular.Shutdown();
+    }
+}
+
+void ScreenSpaceRayTracing::CreateNRDResources(const D3D11_TEXTURE2D_DESC& mainDesc)
+{
 
     D3D11_TEXTURE2D_DESC texDesc{
         .Width = mainDesc.Width,
@@ -2113,6 +2254,7 @@ void ScreenSpaceRayTracing::Prepass()
     // enable gate below, because a frame in which neither pass renders must still record
     // where the state machine got to. This is also where the REBLUR path is brought up, so
     // no dispatch gate is ever the first thing to ask whether its resources exist.
+    EnsureCoreResources();  // (46q)
     ResolveDenoisers();
 
     // (guard G8) Before the enable gate below, so a transition is never missed just because
@@ -2125,6 +2267,8 @@ void ScreenSpaceRayTracing::Prepass()
     // raymarch passes, so with both switched off it was 1 copy + 8 downsample
     // dispatches of pure waste every frame.
     if (!settings.EnableDiffuse && !settings.EnableSpecular)
+        return;
+    if (!texDepth || !texColor)  // (46q) the always-on set could not be made (video memory): nothing to build
         return;
 
     // (audit P9) inInterior is cached once per frame by UpdateHistoryValidity above, which
@@ -2757,8 +2901,19 @@ void ScreenSpaceRayTracing::CopyDynamicRegion(ID3D11Resource* a_dst, ID3D11Resou
     // One texel of margin against a float-rounding disagreement with the shader's own
     // `BufferDim.xy * DynamicResolutionParams1.xy`, then clamped to the allocation. A dynamic
     // ratio of 1.0 therefore degenerates to the whole surface, i.e. to what CopyResource did.
-    const UINT w = std::min((UINT)std::max(full.x, 1.0f), (UINT)std::max(size.x, 1.0f) + 1u);
-    const UINT h = std::min((UINT)std::max(full.y, 1.0f), (UINT)std::max(size.y, 1.0f) + 1u);
+    UINT w = std::min((UINT)std::max(full.x, 1.0f), (UINT)std::max(size.x, 1.0f) + 1u);
+    UINT h = std::min((UINT)std::max(full.y, 1.0f), (UINT)std::max(size.y, 1.0f) + 1u);
+    // (46q) Clamped to both textures too: with SSRT/SSGI Buffers at Render Resolution one side may be render-sized (a box
+    // past either edge would make D3D11 drop the copy).
+    for (auto* resource : { a_dst, a_src }) {
+        winrt::com_ptr<ID3D11Texture2D> texture;
+        if (resource && SUCCEEDED(resource->QueryInterface(IID_PPV_ARGS(texture.put())))) {
+            D3D11_TEXTURE2D_DESC desc{};
+            texture->GetDesc(&desc);
+            w = std::min(w, desc.Width);
+            h = std::min(h, desc.Height);
+        }
+    }
 
     const D3D11_BOX box{ 0, 0, 0, w, h, 1 };
     context->CopySubresourceRegion(a_dst, 0, 0, 0, 0, a_src, 0, &box);
@@ -2784,7 +2939,7 @@ void ScreenSpaceRayTracing::CopyHistoryGeometry()
     // purpose lies. The region outside it now keeps the far plane ClearDenoiserHistory wrote
     // instead of inheriting texDepth's own untouched content -- the same value, arrived at more
     // directly, and the one audit #8's convention asks for there.
-    if (texHistoryDepth)
+    if (texHistoryDepth && texDepth)
         CopyDynamicRegion(texHistoryDepth->resource.get(), texDepth->resource.get());
 }
 

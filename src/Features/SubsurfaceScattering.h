@@ -111,6 +111,10 @@ public:
 	bool HasShaderDefine(RE::BSShader::Type) override { return true; };
 
 	virtual void SetupResources() override;
+	/// (46q) Size Buffers to Render Resolution: the work textures at a size (may throw) / re-made when the render size changes.
+	void CreateTextures(UINT a_width, UINT a_height);
+	bool EnsureTextures();
+	int retryFrames = 0;
 	virtual void Reset() override;
 	virtual void RestoreDefaultSettings() override;
 

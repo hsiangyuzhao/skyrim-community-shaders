@@ -140,15 +140,40 @@ void NRD::SetupResources()
 // falls back to its own denoiser, which is a path that already exists and is already tested.
 bool NRD::EnsureGuides()
 {
-	if (texNRDViewZ && texNRDNormalRoughness && texNRDMV)
-		return true;
-
-	logger::debug("Creating NRD guide textures...");
-
 	auto renderer = globals::game::renderer;
 	auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 	D3D11_TEXTURE2D_DESC mainDesc;
 	mainTex.texture->GetDesc(&mainDesc);
+	{
+		// (46q) SSRT/SSGI Buffers at Render Resolution: the guides at the upscaler's render size (NRD's resourceSize follows them;
+		// its rect is the render rect either way). A size change makes all three again (one history reset: resourceSize changed).
+		const auto [w, h] = globals::features::upscaling.GetRenderAllocSize(true);
+		mainDesc.Width = std::min<UINT>(mainDesc.Width, w);
+		mainDesc.Height = std::min<UINT>(mainDesc.Height, h);
+	}
+	if (texNRDViewZ && texNRDNormalRoughness && texNRDMV) {
+		if (texNRDViewZ->desc.Width == mainDesc.Width && texNRDViewZ->desc.Height == mainDesc.Height)
+			return true;
+		texNRDViewZ = nullptr;
+		texNRDNormalRoughness = nullptr;
+		texNRDMV = nullptr;
+	}
+
+	logger::debug("Creating NRD guide textures ({}x{})...", mainDesc.Width, mainDesc.Height);
+	try {
+		if (CreateGuides(mainDesc))
+			return true;
+	} catch (const std::exception& e) {
+		logger::warn("[NRD] Could not create the guide textures ({}); the denoisers fall back this frame", e.what());
+	}
+	texNRDViewZ = nullptr;
+	texNRDNormalRoughness = nullptr;
+	texNRDMV = nullptr;
+	return false;
+}
+
+bool NRD::CreateGuides(const D3D11_TEXTURE2D_DESC& mainDesc)
+{
 
 	D3D11_TEXTURE2D_DESC texDesc{
 		.Width = mainDesc.Width,
@@ -324,7 +349,8 @@ const nrd::CommonSettings& NRD::GetCommonSettings()
 
 	commonSettings = nrd::CommonSettings{};
 	const uint16_t resourceSize[2] = { (uint16_t)fullW, (uint16_t)fullH };
-	const uint16_t rectSize[2] = { (uint16_t)dynres.x, (uint16_t)dynres.y };
+	// (46q) Never past the resources (render-sized with SSRT/SSGI Buffers at Render Resolution).
+	const uint16_t rectSize[2] = { (uint16_t)std::min<uint32_t>((uint32_t)dynres.x, fullW), (uint16_t)std::min<uint32_t>((uint32_t)dynres.y, fullH) };
 	const bool resourceSizeChanged = hasCommonFrameHistory &&
 	                                 (resourceSize[0] != prevResourceSize[0] || resourceSize[1] != prevResourceSize[1]);
 

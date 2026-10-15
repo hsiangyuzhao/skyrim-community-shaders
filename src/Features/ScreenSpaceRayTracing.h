@@ -1372,6 +1372,13 @@ struct ScreenSpaceRayTracing : Feature
     /// two REBLUR instances on first use, exactly like EnsureSharcResources: a user
     /// who stays on SVGF never pays for REBLUR's permanent/transient pools.
     void EnsureNRDResources();
+    /// (46q) The always-on set: made (CreateCoreResources, may throw) at the render or output size, released while SSRT is off.
+    void CreateCoreResources(UINT a_width, UINT a_height);
+    void EnsureCoreResources();
+    void ReleaseCoreResources();
+    UINT coreAllocW = 0, coreAllocH = 0;
+    int coreRetryFrames = 0;
+    void CreateNRDResources(const D3D11_TEXTURE2D_DESC& a_mainDesc);  // (46q) may throw; EnsureNRDResources catches
 
     /// @brief (batch C1) One flag per REBLUR instance rather than one shared, because
     /// diffuse dispatches earlier in the frame than specular and each instance must
