@@ -1113,7 +1113,8 @@ namespace RayTracingRT
 		check_ = {};
 	}
 
-	ComPtr<ID3D12Resource> Backend::CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav)
+	ComPtr<ID3D12Resource> Backend::CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav,
+		Util::FrameTrace::VramOwner a_owner)
 	{
 		D3D12_HEAP_PROPERTIES heap{};
 		heap.Type = a_heap;
@@ -1129,6 +1130,11 @@ namespace RayTracingRT
 		ComPtr<ID3D12Resource> resource;
 		if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, a_state, nullptr, IID_PPV_ARGS(&resource))))
 			return nullptr;
+		// (46p) Counted per owner (upload / read-back heaps are system memory: their own owners).
+		const auto owner = a_heap == D3D12_HEAP_TYPE_UPLOAD ? Util::FrameTrace::VramOwner::RtUpload :
+		                   a_heap == D3D12_HEAP_TYPE_READBACK ? Util::FrameTrace::VramOwner::RtReadback :
+		                                                         a_owner;
+		Util::FrameTrace::TagVram(resource.Get(), owner, (desc.Width + 0xFFFFull) & ~0xFFFFull);
 		return resource;
 	}
 
@@ -1475,6 +1481,7 @@ namespace RayTracingRT
 			return;
 		const double toMs = 1000.0 / static_cast<double>(timestampFrequency_);
 		stats_.lastPrepGpuMs = static_cast<float>(static_cast<double>(prepEnd - prepBegin) * toMs);
+		stats_.lastPrepWork = context.work;  // (46p)
 		// (46b) The trace interval holds the point-light dispatch: the sun's part alone, the point lights on their own.
 		// (46m) Split Trace Sync: the interval ended with the sun already.
 		stats_.lastTraceGpuMs = std::max(static_cast<float>(static_cast<double>(end - begin) * toMs) - (context.splitTrace ? 0.0f : pointMs), 0.0f);
@@ -1574,7 +1581,7 @@ namespace RayTracingRT
 		if (scratch_)
 			Retire(scratch_, scratchBytes_, &stats_.scratchBytes);
 		const std::uint64_t bytes = Align(std::max<std::uint64_t>(a_bytes, 8ull << 20), 64 * 1024);
-		scratch_ = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+		scratch_ = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true, Util::FrameTrace::VramOwner::RtScratch);
 		if (!scratch_) {
 			scratchBytes_ = 0;
 			return Fail("scratch buffer", E_OUTOFMEMORY);
@@ -1600,7 +1607,7 @@ namespace RayTracingRT
 		if (tlas_)
 			Retire(tlas_, tlasBytes_, &stats_.tlasBytes);
 		const std::uint64_t bytes = Align(info.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
-		tlas_ = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
+		tlas_ = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true, Util::FrameTrace::VramOwner::RtTlas);
 		if (!tlas_ || !EnsureScratch(info.ScratchDataSizeInBytes)) {
 			tlasBytes_ = 0;
 			tlasCapacity_ = 0;
@@ -1676,6 +1683,8 @@ namespace RayTracingRT
 			stats_.blasBytes += bytes;
 			blas.state = BlasState::Ready;
 			++stats_.compactionsLastFrame;
+			++recWork_.compactions;  // (46p)
+			recWork_.compactBytes += bytes;
 		}
 	}
 
@@ -1847,6 +1856,11 @@ namespace RayTracingRT
 			a_list->BuildRaytracingAccelerationStructure(&buildDesc, 1, &postbuild);
 
 			const std::uint64_t bytes = entry.result.size;
+			// (46p) This submission's prep work.
+			++recWork_.builds;
+			recWork_.buildsAlpha += geometry.Opaque() ? 0u : 1u;
+			recWork_.buildTriangles += blas.triangles;
+			recWork_.buildBytes += bytes;
 			blas.geometry.reset();
 			blas.alloc = entry.result;
 			blas.bytes = bytes;
@@ -2041,6 +2055,7 @@ namespace RayTracingRT
 			const std::int64_t buildStart = QpcNow();
 			const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
 			const std::int64_t buildDeadline = buildStart + MsToQpc(a_input.buildCpuMs > 0.0f ? a_input.buildCpuMs : kPlayBuildCpuMs);  // (46g)
+			recWork_ = {};  // (46p)
 			ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame, buildDeadline);
 			const std::uint32_t builtNow = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds, buildDeadline);
 			stats_.buildsLastFrame = builtNow;
@@ -2049,9 +2064,11 @@ namespace RayTracingRT
 			skinReady_.assign(skinDraws.size(), 0);
 			skinRecorded_ = false;
 			skinGroupFrame_.clear();  // (46m)
-			if (!skinDraws.empty() || !skinUploadQueue_.empty())
+			if (!skinDraws.empty() || !skinUploadQueue_.empty()) {
+				const std::uint64_t uploadsBefore = skinUploadsTotal_;
 				RecordSkinning(list, context, a_input, skinReady_);
-			else if (!skinGroups_.empty())
+				NoteSkinWork(uploadsBefore);  // (46p)
+			} else if (!skinGroups_.empty())
 				ReleaseSkinGroups();  // (46m) no character drawn
 			const std::int64_t skinEnd = QpcNow();
 			stats_.cpuBuildMs = static_cast<float>(QpcToMs(buildEnd - buildStart));
@@ -2190,6 +2207,7 @@ namespace RayTracingRT
 		skinStats_.instancesLastFrame = characterInstances;
 
 		stats_.instancesLastFrame = instanceCount;
+		recWork_.tlasInstances = instanceCount;  // (46p)
 		lap(split.tlas);
 		// (45h) The alpha pipeline only on frames that hold alpha-tested instances (and their records
 		// are in this context's copy); every other frame runs exactly the opaque pipeline.
@@ -2317,6 +2335,15 @@ namespace RayTracingRT
 			traceList->ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase, 4, timestampReadback_.Get(),
 				sizeof(std::uint64_t) * 4 * index);
 			context.timestampsPending = true;
+			// (46p) The prep work these timestamps measure, with the pool blocks adopted / released since the last one.
+			const std::uint64_t blocks = stats_.pools.asyncBlocksTotal + stats_.pools.syncBlocksTotal;
+			recWork_.poolBlocks = static_cast<std::uint32_t>(blocks - std::min(blocks, workBlocksSeen_));
+			recWork_.poolReleased = static_cast<std::uint32_t>(stats_.pools.blocksReleased - std::min(stats_.pools.blocksReleased, workReleasedSeen_));
+			workBlocksSeen_ = blocks;
+			workReleasedSeen_ = stats_.pools.blocksReleased;
+			recWork_.early = early ? 1 : 0;
+			recWork_.valid = 1;
+			context.work = recWork_;
 		}
 		if (FAILED(hr = traceList->Close()))
 			return Fail("command list Close", hr);
@@ -2498,6 +2525,7 @@ namespace RayTracingRT
 		const std::int64_t buildStart = QpcNow();
 		const std::uint32_t maxBuilds = a_input.maxBuilds ? a_input.maxBuilds : static_cast<std::uint32_t>(kMaxBuildsPerFrame);
 		const std::int64_t buildDeadline = buildStart + MsToQpc(a_input.buildCpuMs > 0.0f ? a_input.buildCpuMs : kPlayBuildCpuMs);
+		recWork_ = {};  // (46p)
 		ProcessCompaction(list, completed, a_input.maxBuilds ? a_input.maxBuilds : kMaxCompactionsPerFrame, buildDeadline);
 		stats_.buildsLastFrame = BuildQueued(list, a_input.buildTriangleBudget, maxBuilds, buildDeadline);
 		const std::int64_t buildEnd = QpcNow();
@@ -2508,9 +2536,11 @@ namespace RayTracingRT
 		skinReady_.assign(skinDraws.size(), 0);
 		skinRecorded_ = false;
 		skinGroupFrame_.clear();  // (46m)
-		if (!skinDraws.empty() || !skinUploadQueue_.empty())
+		if (!skinDraws.empty() || !skinUploadQueue_.empty()) {
+			const std::uint64_t uploadsBefore = skinUploadsTotal_;
 			RecordSkinning(list, context, a_input, skinReady_);
-		else if (!skinGroups_.empty())
+			NoteSkinWork(uploadsBefore);  // (46p)
+		} else if (!skinGroups_.empty())
 			ReleaseSkinGroups();  // (46m) no character drawn
 		const std::int64_t skinEnd = QpcNow();
 		split.skin = static_cast<float>(QpcToMs(skinEnd - buildEnd));

@@ -401,6 +401,18 @@ namespace RayTracingRT
 		skinGroupFrame_.clear();
 	}
 
+	void Backend::NoteSkinWork(std::uint64_t a_uploadsBefore)
+	{
+		// (46p) RecordSkinning just ran: its per-frame counts are this submission's.
+		recWork_.skinUploads += static_cast<std::uint32_t>(skinUploadsTotal_ - std::min(skinUploadsTotal_, a_uploadsBefore));
+		recWork_.skinBuilds += skinStats_.buildsLastFrame;
+		recWork_.skinRefits += skinStats_.refitsLastFrame;
+		recWork_.groupBuilds += skinStats_.groupBuildsLastFrame;
+		recWork_.groupRefits += skinStats_.groupRefitsLastFrame;
+		recWork_.skinDispatches += skinStats_.dispatchesLastFrame;
+		recWork_.skinVertices += skinStats_.verticesLastFrame;
+	}
+
 	void Backend::RecordSkinning(ID3D12GraphicsCommandList4* a_list, CommandContext& a_context, const FrameInput& a_input,
 		std::vector<std::uint8_t>& o_ready)
 	{
@@ -683,7 +695,7 @@ namespace RayTracingRT
 			skinScratch_.Reset();
 			skinScratchBytes_ = 0;
 			const std::uint64_t bytes = AlignUp(std::max<std::uint64_t>(scratchTotal + scratchTotal / 4, 4ull << 20), 64 * 1024);
-			skinScratch_ = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+			skinScratch_ = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true, Util::FrameTrace::VramOwner::RtScratch);
 			if (!skinScratch_) {
 				dropRecorded();
 				SetSkinFault(std::format("could not create a {:.1f} MB scratch buffer", static_cast<double>(bytes) / (1024.0 * 1024.0)));
@@ -798,6 +810,7 @@ namespace RayTracingRT
 						auto& shape = skins_[draws[skinGroupMembers_[op.firstMember + m]].shape];
 						group.serials.push_back(shape.serial);
 						shape.built = true;  // traced from now on (the caster filter may take it out of the shadow map)
+						recWork_.groupTriangles += shape.triangles;  // (46p)
 					}
 					++skinStats_.groupBuildsLastFrame;
 					++skinStats_.buildsTotal;

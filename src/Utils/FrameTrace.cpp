@@ -13,7 +13,9 @@
 #include "Utils/LatencyPacer.h"
 #include "Utils/WorldTiming.h"
 
+#include <d3d12.h>  // (46p) TagVram on D3D12 objects
 #include <intrin.h>
+#include <new>
 #include <thread>
 
 namespace Util::FrameTrace
@@ -124,6 +126,158 @@ namespace Util::FrameTrace
 				v.usage12 = static_cast<float>(info.CurrentUsage) * kMb;
 			return v;
 		}
+
+		// ---- (46p) video memory by owner (cumulative bytes since the hooks went in; read per row while recording) ----
+		constexpr int kVramOwners = static_cast<int>(VramOwner::Count);
+		std::array<std::atomic<uint64_t>, kVramOwners> g_vramNew{};
+		std::array<std::atomic<uint64_t>, kVramOwners> g_vramFreed{};
+		// {6E3D0F2A-91B4-4C7D-8E25-3A9F1C64B70D}: our private-data slot on tagged resources.
+		constexpr GUID kVramTagGuid = { 0x6e3d0f2a, 0x91b4, 0x4c7d, { 0x8e, 0x25, 0x3a, 0x9f, 0x1c, 0x64, 0xb7, 0x0d } };
+
+		/// Held by the resource as private data: the runtime releases it when the resource is destroyed.
+		class VramTag final : public IUnknown
+		{
+		public:
+			VramTag(int a_owner, uint64_t a_bytes) :
+				owner(a_owner), bytes(a_bytes) {}
+
+			HRESULT STDMETHODCALLTYPE QueryInterface(REFIID a_riid, void** a_out) override
+			{
+				if (!a_out)
+					return E_POINTER;
+				if (IsEqualIID(a_riid, __uuidof(IUnknown))) {
+					*a_out = static_cast<IUnknown*>(this);
+					AddRef();
+					return S_OK;
+				}
+				*a_out = nullptr;
+				return E_NOINTERFACE;
+			}
+			ULONG STDMETHODCALLTYPE AddRef() override { return refs.fetch_add(1, std::memory_order_relaxed) + 1; }
+			ULONG STDMETHODCALLTYPE Release() override
+			{
+				const ULONG left = refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
+				if (left == 0) {
+					if (counted)
+						g_vramFreed[owner].fetch_add(bytes, std::memory_order_relaxed);
+					delete this;
+				}
+				return left;
+			}
+
+			bool counted = false;
+
+		private:
+			std::atomic<ULONG> refs{ 1 };
+			int owner;
+			uint64_t bytes;
+		};
+
+		template <class T>
+		void TagObject(T* a_object, VramOwner a_owner, uint64_t a_bytes)
+		{
+			const int owner = static_cast<int>(a_owner);
+			if (!a_object || a_bytes == 0 || owner < 0 || owner >= kVramOwners)
+				return;
+			auto* tag = new (std::nothrow) VramTag(owner, a_bytes);
+			if (!tag)
+				return;
+			if (SUCCEEDED(a_object->SetPrivateDataInterface(kVramTagGuid, tag))) {
+				tag->counted = true;
+				g_vramNew[owner].fetch_add(a_bytes, std::memory_order_relaxed);
+			}
+			tag->Release();  // the resource holds it now (or nobody: then it goes uncounted)
+		}
+
+		struct ModuleRange
+		{
+			uintptr_t base = 0, end = 0;
+			[[nodiscard]] bool Holds(const void* a_address) const
+			{
+				const auto a = reinterpret_cast<uintptr_t>(a_address);
+				return a >= base && a < end;
+			}
+		};
+
+		ModuleRange RangeOf(HMODULE a_module)
+		{
+			if (!a_module)
+				return {};
+			const auto base = reinterpret_cast<uintptr_t>(a_module);
+			const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+			if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+				return {};
+			const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + static_cast<uintptr_t>(dos->e_lfanew));
+			return { base, base + nt->OptionalHeader.SizeOfImage };
+		}
+
+		VramOwner OwnerOfCaller(const void* a_caller, bool a_shared)
+		{
+			static const ModuleRange ours = [] {
+				HMODULE module = nullptr;
+				GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&g_vramNew), &module);
+				return RangeOf(module);
+			}();
+			static const ModuleRange exe = RangeOf(GetModuleHandleW(nullptr));
+			if (ours.Holds(a_caller))
+				return a_shared ? VramOwner::D3D11Shared : VramOwner::D3D11Ours;
+			if (exe.Holds(a_caller))
+				return VramOwner::D3D11Engine;
+			return VramOwner::D3D11Other;
+		}
+
+		/// Owner groups for the columns: ours in video memory, the engine, other modules, system memory (upload / read-back / staging).
+		enum class VramGroup : int
+		{
+			Ours,
+			Engine,
+			Other,
+			SysMem,
+			Count
+		};
+		constexpr int kVramGroups = static_cast<int>(VramGroup::Count);
+		VramGroup GroupOf(int a_owner)
+		{
+			switch (static_cast<VramOwner>(a_owner)) {
+			case VramOwner::D3D11Engine:
+				return VramGroup::Engine;
+			case VramOwner::D3D11Other:
+				return VramGroup::Other;
+			case VramOwner::RtUpload:
+			case VramOwner::RtReadback:
+			case VramOwner::D3D11Staging:
+				return VramGroup::SysMem;
+			default:
+				return VramGroup::Ours;
+			}
+		}
+
+		/// A snapshot of the cumulative counters (and what goes with it) per recorded row, for the deltas and the jump log.
+		struct VramSnap
+		{
+			std::array<uint64_t, kVramOwners> created{}, freed{};
+			float usage = -1.0f, budget = -1.0f, nonLocal = -1.0f;
+			uint32_t createsOther = 0;  // the engine's device Create* calls on other threads that frame (EngineTiming)
+			float createOtherMs = 0.0f;
+			size_t row = 0;
+		};
+		VramSnap TakeVramSnap()
+		{
+			VramSnap s;
+			for (int i = 0; i < kVramOwners; ++i) {
+				s.created[i] = g_vramNew[i].load(std::memory_order_relaxed);
+				s.freed[i] = g_vramFreed[i].load(std::memory_order_relaxed);
+			}
+			return s;
+		}
+		constexpr size_t kVramWindow = 5;          // the row and the 4 before it
+		constexpr float kVramJumpMb = 500.0f;      // a usage change this large within 4 frames is logged
+		std::array<VramSnap, kVramWindow> g_vramWin{};
+		size_t g_vramWinCount = 0, g_vramWinHead = 0;
+		int g_vramJumpCooldown = 0;
+		uint32_t g_vramJumpLogs = 0;
+		VramSnap g_vramPrev{};
+		bool g_vramPrevValid = false;
 
 		/// (46o) M6: minutes since the game process started.
 		double SessionMinutes()
@@ -245,6 +399,16 @@ namespace Util::FrameTrace
 			uint32_t vramWarn = 0;
 			uint32_t flags = 0;
 			std::string stallStack;
+			// (46p) The VRAM query's cost, the usage change since the last row, bytes created / destroyed this frame per owner (MB),
+			// alive per group (MB, tagged since the hooks went in); GPU ms per engine segment (-1 = none), the rest, total, stamps.
+			float vramQueryUs = -1.0f;
+			float vramDeltaMb = 0.0f;
+			std::array<float, kVramOwners> vramNewMb{}, vramFreedMb{};
+			std::array<float, kVramGroups> vramLiveMb{};
+			float gpuSegMs[static_cast<int>(EngineTiming::Seg::Count)]{ -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+			float gpuSegOtherMs = -1.0f;
+			float gpuSegTotalMs = -1.0f;
+			int gpuSegStamps = -1;
 		};
 
 		struct ReflexTimes
@@ -650,7 +814,7 @@ namespace Util::FrameTrace
 				out << "#   that frame's start; the learned sleep takes the median of the last 3); pacer_backstop_ms = lead taken off by the Unlock Backstop.\n";
 				out << "#   stall_stack (M2, Stall Sampler on) = up to 3 samples of a main thread stuck 8 ms+ in one segment / call: seg@ms_in_it:RIP>return\n";
 				out << "#   addresses found on the stack (module+offset, nearest first; candidates, not a verified unwind), samples separated by '|'.\n";
-				out << "#   vram_* (M3, every 4th frame) = this process's video memory on the D3D11 adapter (MB): local budget, local usage, non-local\n";
+				out << "#   vram_* (M3, every 4th frame; 46p: every frame) = this process's video memory on the D3D11 adapter (MB): local budget, local usage, non-local\n";
 				out << "#   (system memory) usage; vram12_local_usage_mb = the D3D12 device's adapter if it is another one (-1 = same adapter);\n";
 				out << "#   vram_warn = Streamline evaluations this frame that returned eWarnOutOfVRAM (budget used up).\n";
 				out << "#   present_* (M5) = DX12SwapChain::Present split: fg (DLSS-G state / options), hdr (HDR composite + screenshot), signal11 (D3D11\n";
@@ -660,6 +824,29 @@ namespace Util::FrameTrace
 				out << "#   tags + slEvaluateFeature, Close + ExecuteCommandLists, D3D12 Signal, D3D11 Wait, RCAS or copy back (-1 = not run).\n";
 				out << "#   frame_flags (M6) = bits: 1 loading screen, 2 map, 4 game paused, 8 a menu open (application / item / modal), 16 Fader Menu,\n";
 				out << "#   32 the pacer cleared its samples this frame (after a pause / loading screen / the map).\n";
+				out << "# (46p) vram_* are now sampled every frame (vram_query_us = the cost of that query).\n";
+				out << "#   pacer_oversleep_cut_ms = planned sleep not taken because the previous frame finished on the GPU first (Never Over-Sleep: the\n";
+				out << "#   sleep ends at that completion + max(0.5, min(2, 0.1 x GPU period)) ms); pacer_decay_ms = learned sleep taken off fast this\n";
+				out << "#   frame (cut sleep: down to the part that was of use, at least -2 ms; frames slower than the GPU period by 5 %: -max(2, half));\n";
+				out << "#   pacer_spike_skip = 1 when the previous frame's wait was not learned (a GPU frame over 1.5 periods finished since the submit\n";
+				out << "#   before it or was running then: that frame and the next); pacer_done_interval_ms = the last GPU completion interval the\n";
+				out << "#   waiter saw (per frame); pacer_phase_shift_ms = smoothed minus raw predicted completion (median phase of the last 6\n";
+				out << "#   completions; used for pacer_pred_ms only with Smooth GPU Phase on, shown always).\n";
+				out << "#   vram_<group>_new_mb / _freed_mb = bytes created / destroyed this frame (estimates from the descriptions) by: ours (RT D3D12\n";
+				out << "#   BLAS / TLAS / scratch / character pools / other, our D3D11 textures and buffers, our shared interop textures), engine (D3D11\n";
+				out << "#   created by SkyrimSE.exe), other (other modules: plugins, Streamline, drivers), sysmem (upload / read-back heaps, staging);\n";
+				out << "#   vram_<group>_live_mb = alive of what was tagged since start-up (resources made before the hooks are not in it);\n";
+				out << "#   vram_owners = per owner name:+new/-freed MB this frame (only those that moved); vram_delta_mb = usage change since the last row.\n";
+				out << "#   Releases are counted when the runtime destroys the resource (D3D11 destroys late: a Release shows a frame or so after).\n";
+				out << "#   gpu_seg_<seg>_ms = GPU wall time between D3D11 timestamps at the main thread's segment changes from the render start to\n";
+				out << "#   the Present end (read back a few frames late; -1 = none): GPU idle inside a segment included, the D3D11 queue's waits for\n";
+				out << "#   our D3D12 work (RT, upscaling, the present path) land in the segment where the wait was queued. gpu_seg_other_ms = between\n";
+				out << "#   stamps in non-render segments; gpu_seg_total_ms = first to last stamp; gpu_seg_stamps = stamps (17 = capped: the last\n";
+				out << "#   segment ran on to the close).\n";
+				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
+				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
+				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
+				out << "#   refits, skinning dispatches (vertices), TLAS instances, pool blocks adopted / released since the previous submission.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -701,7 +888,17 @@ namespace Util::FrameTrace
 				       "vram_local_budget_mb,vram_local_usage_mb,vram_nonlocal_usage_mb,vram12_local_usage_mb,vram_warn,"
 				       "present_fg_ms,present_hdr_ms,present_signal11_ms,present_copy_ms,present_sl_ms,present_post_ms,"
 				       "ups_copyin_ms,ups_signal11_ms,ups_wait12_ms,ups_reset_ms,sl_setopts_ms,sl_evaluate_ms,ups_ecl_ms,ups_signal12_ms,ups_wait11_ms,ups_rcas_ms,"
-				       "frame_flags\n";
+				       "frame_flags";
+				// (46p)
+				out << ",pacer_oversleep_cut_ms,pacer_decay_ms,pacer_spike_skip,pacer_done_interval_ms,pacer_phase_shift_ms"
+					   ",vram_query_us,vram_delta_mb,vram_ours_new_mb,vram_ours_freed_mb,vram_engine_new_mb,vram_engine_freed_mb,vram_other_new_mb,"
+					   "vram_other_freed_mb,vram_sysmem_new_mb,vram_sysmem_freed_mb,vram_ours_live_mb,vram_engine_live_mb,vram_other_live_mb,vram_owners";
+				for (int s = static_cast<int>(EngineTiming::Seg::RenderOther); s <= static_cast<int>(EngineTiming::Seg::Present); ++s)
+					out << ",gpu_seg_" << EngineTiming::SegName(static_cast<EngineTiming::Seg>(s)) << "_ms";
+				out << ",gpu_seg_other_ms,gpu_seg_total_ms,gpu_seg_stamps"
+					   ",rt_pw_valid,rt_pw_early,rt_pw_builds,rt_pw_builds_alpha,rt_pw_build_tris,rt_pw_build_mb,rt_pw_compactions,rt_pw_compact_mb,"
+					   "rt_pw_skin_uploads,rt_pw_skin_builds,rt_pw_skin_refits,rt_pw_group_builds,rt_pw_group_tris,rt_pw_group_refits,rt_pw_skin_dispatches,"
+					   "rt_pw_skin_verts,rt_pw_tlas_instances,rt_pw_pool_blocks,rt_pw_pool_released\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -779,7 +976,35 @@ namespace Util::FrameTrace
 						s += std::format(",{:.0f},{:.0f},{:.0f},{:.0f},{}", v.budget, v.usage, v.nonLocal, v.usage12, a_row.vramWarn);
 						for (const float ms : a_row.split)
 							s += std::format(",{:.3f}", ms);
-						s += std::format(",{}\n", a_row.flags);
+						s += std::format(",{}", a_row.flags);
+					}
+					{
+						// (46p) Pacer guard, video memory by owner, GPU per engine segment, RT prep work.
+						const auto& p = a_row.pacer;
+						s += std::format(",{:.3f},{:.3f},{},{:.3f},{:.3f}", p.overSleepCutMs, p.decayMs, p.spikeSkip, p.doneIntervalMs, p.phaseShiftMs);
+						float groupNew[kVramGroups]{}, groupFreed[kVramGroups]{};
+						std::string owners;
+						for (int i = 0; i < kVramOwners; ++i) {
+							groupNew[static_cast<int>(GroupOf(i))] += a_row.vramNewMb[i];
+							groupFreed[static_cast<int>(GroupOf(i))] += a_row.vramFreedMb[i];
+							if (a_row.vramNewMb[i] >= 0.05f || a_row.vramFreedMb[i] >= 0.05f)
+								owners += std::format("{}{}:+{:.1f}/-{:.1f}", owners.empty() ? "" : ";", VramOwnerName(static_cast<VramOwner>(i)), a_row.vramNewMb[i],
+									a_row.vramFreedMb[i]);
+						}
+						using G = VramGroup;
+						const auto gi = [](G a_g) { return static_cast<int>(a_g); };
+						s += std::format(",{:.1f},{:.0f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.1f},{:.0f},{:.0f},{:.0f},{}", a_row.vramQueryUs, a_row.vramDeltaMb,
+							groupNew[gi(G::Ours)], groupFreed[gi(G::Ours)], groupNew[gi(G::Engine)], groupFreed[gi(G::Engine)], groupNew[gi(G::Other)],
+							groupFreed[gi(G::Other)], groupNew[gi(G::SysMem)], groupFreed[gi(G::SysMem)], a_row.vramLiveMb[gi(G::Ours)],
+							a_row.vramLiveMb[gi(G::Engine)], a_row.vramLiveMb[gi(G::Other)], owners);
+						for (int seg = static_cast<int>(EngineTiming::Seg::RenderOther); seg <= static_cast<int>(EngineTiming::Seg::Present); ++seg)
+							s += std::format(",{:.3f}", a_row.gpuSegMs[seg]);
+						s += std::format(",{:.3f},{:.3f},{}", a_row.gpuSegOtherMs, a_row.gpuSegTotalMs, a_row.gpuSegStamps);
+						const auto& w = a_row.rt.prepWork;
+						constexpr double kMb = 1.0 / (1024.0 * 1024.0);
+						s += std::format(",{},{},{},{},{},{:.2f},{},{:.2f},{},{},{},{},{},{},{},{},{},{},{}\n", w.valid, w.early, w.builds, w.buildsAlpha, w.buildTriangles,
+							static_cast<double>(w.buildBytes) * kMb, w.compactions, static_cast<double>(w.compactBytes) * kMb, w.skinUploads, w.skinBuilds, w.skinRefits,
+							w.groupBuilds, w.groupTriangles, w.groupRefits, w.skinDispatches, w.skinVertices, w.tlasInstances, w.poolBlocks, w.poolReleased);
 					}
 					return s;
 				};
@@ -1152,6 +1377,278 @@ namespace Util::FrameTrace
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
 		};
+	}
+
+	namespace
+	{
+		// ---- (46p) coarse GPU time per engine segment (recording only) ----
+		//
+		// A D3D11 timestamp (End only) on the immediate context at every segment change from the render start to the
+		// Present end, one degenerate disjoint query per frame (frequency; never nested in a GpuPassTimers interval), read
+		// back without waiting (DONOTFLUSH) a few frames later and put on that frame's row. GPU time between two stamps goes
+		// to the segment that was open (GPU idle inside the interval included: it is GPU wall time, not GPU work).
+		constexpr int kSegSlots = 8;
+		constexpr int kSegStamps = 17;  // 16 intervals, then the close
+		constexpr int kSegs = static_cast<int>(EngineTiming::Seg::Count);
+		struct SegSlot
+		{
+			winrt::com_ptr<ID3D11Query> disjoint;
+			std::array<winrt::com_ptr<ID3D11Query>, kSegStamps> stamps;
+			std::array<int8_t, kSegStamps> seg{};  // the segment that starts at stamp i (-1 = not a render segment / the close)
+			int count = 0;
+			uint64_t frameId = 0;
+			bool open = false;
+			bool pending = false;
+		};
+		std::array<SegSlot, kSegSlots> g_segSlots;
+		int g_segWrite = 0;
+		bool g_segBroken = false;  // a query could not be made: off for the session
+		ID3D11Device* g_segDevice = nullptr;
+
+		bool IsRenderSeg(int a_seg)
+		{
+			return a_seg >= static_cast<int>(EngineTiming::Seg::RenderOther) && a_seg <= static_cast<int>(EngineTiming::Seg::Present);
+		}
+
+		bool EnsureSegQueries(SegSlot& a_slot)
+		{
+			auto* device = globals::d3d::device;
+			if (!device)
+				return false;
+			if (g_segDevice != device) {
+				for (auto& slot : g_segSlots)
+					slot = SegSlot{};
+				g_segDevice = device;
+			}
+			D3D11_QUERY_DESC disjointDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+			D3D11_QUERY_DESC stampDesc{ D3D11_QUERY_TIMESTAMP, 0 };
+			if (!a_slot.disjoint && FAILED(device->CreateQuery(&disjointDesc, a_slot.disjoint.put()))) {
+				g_segBroken = true;
+				return false;
+			}
+			for (auto& stamp : a_slot.stamps) {
+				if (!stamp && FAILED(device->CreateQuery(&stampDesc, stamp.put()))) {
+					g_segBroken = true;
+					return false;
+				}
+			}
+			return true;
+		}
+
+		/// GetData without waiting, past our own GetData timer (not a wait of the frame).
+		template <class T>
+		HRESULT ReadQuery(ID3D11DeviceContext* a_context, ID3D11Query* a_query, T& o_data)
+		{
+			if (GetData::func.address())
+				return GetData::func(a_context, a_query, &o_data, static_cast<UINT>(sizeof(T)), static_cast<UINT>(D3D11_ASYNC_GETDATA_DONOTFLUSH));
+			return a_context->GetData(a_query, &o_data, static_cast<UINT>(sizeof(T)), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+		}
+
+		void ResetSegSlots()
+		{
+			for (auto& slot : g_segSlots) {
+				slot.open = false;
+				slot.pending = false;
+				slot.count = 0;
+			}
+			g_segWrite = 0;
+		}
+
+		/// Present end: the frame's last stamp; the slot is read back from now on.
+		void CloseSegFrame()
+		{
+			auto& slot = g_segSlots[g_segWrite];
+			if (!slot.open)
+				return;
+			slot.open = false;
+			if (auto* context = globals::d3d::context) {
+				context->End(slot.stamps[slot.count].get());
+				slot.seg[slot.count] = -1;
+				++slot.count;
+				slot.pending = true;
+			}
+			g_segWrite = (g_segWrite + 1) % kSegSlots;
+		}
+
+		/// (46p) This row's video memory by owner (created / destroyed since the last row, alive per group), the usage change,
+		/// and a log line when the usage moved by more than 500 MB within 4 frames.
+		void SampleVramOwners(Row& a_row, const EngineTiming::Frame& a_engine)
+		{
+			constexpr double kMb = 1.0 / (1024.0 * 1024.0);
+			VramSnap now = TakeVramSnap();
+			now.usage = a_row.vram.usage;
+			now.budget = a_row.vram.budget;
+			now.nonLocal = a_row.vram.nonLocal;
+			now.createsOther = a_engine.createsOther;
+			now.createOtherMs = a_engine.createOtherMs;
+			now.row = g_rows.size();
+			std::array<double, kVramGroups> live{};
+			for (int i = 0; i < kVramOwners; ++i) {
+				if (g_vramPrevValid) {
+					a_row.vramNewMb[i] = static_cast<float>(static_cast<double>(now.created[i] - g_vramPrev.created[i]) * kMb);
+					a_row.vramFreedMb[i] = static_cast<float>(static_cast<double>(now.freed[i] - g_vramPrev.freed[i]) * kMb);
+				}
+				live[static_cast<int>(GroupOf(i))] += (static_cast<double>(now.created[i]) - static_cast<double>(now.freed[i])) * kMb;
+			}
+			for (int g = 0; g < kVramGroups; ++g)
+				a_row.vramLiveMb[g] = static_cast<float>(live[g]);
+			a_row.vramDeltaMb = g_vramPrevValid && g_vramPrev.usage >= 0.0f && now.usage >= 0.0f ? now.usage - g_vramPrev.usage : 0.0f;
+			g_vramPrev = now;
+			g_vramPrevValid = true;
+
+			g_vramWin[g_vramWinHead] = now;
+			g_vramWinHead = (g_vramWinHead + 1) % kVramWindow;
+			g_vramWinCount = std::min(g_vramWinCount + 1, kVramWindow);
+			if (g_vramJumpCooldown > 0) {
+				--g_vramJumpCooldown;
+				return;
+			}
+			if (now.usage < 0.0f || g_vramJumpLogs >= 300)
+				return;
+			// The largest move from any of the 4 rows before this one.
+			const VramSnap* from = nullptr;
+			for (size_t k = 1; k < g_vramWinCount; ++k) {
+				const auto& s = g_vramWin[(g_vramWinHead + kVramWindow - 1 - k) % kVramWindow];
+				if (s.usage < 0.0f)
+					continue;
+				if (std::abs(now.usage - s.usage) > kVramJumpMb && (!from || std::abs(now.usage - s.usage) > std::abs(now.usage - from->usage)))
+					from = &s;
+			}
+			if (!from)
+				return;
+			++g_vramJumpLogs;
+			g_vramJumpCooldown = static_cast<int>(kVramWindow) - 1;
+			double groupNew[kVramGroups]{}, groupFreed[kVramGroups]{};
+			std::string owners;
+			for (int i = 0; i < kVramOwners; ++i) {
+				const double c = static_cast<double>(now.created[i] - from->created[i]) * kMb;
+				const double f = static_cast<double>(now.freed[i] - from->freed[i]) * kMb;
+				groupNew[static_cast<int>(GroupOf(i))] += c;
+				groupFreed[static_cast<int>(GroupOf(i))] += f;
+				if (c >= 0.05 || f >= 0.05)
+					owners += std::format("{}{} +{:.1f}/-{:.1f}", owners.empty() ? "" : ", ", VramOwnerName(static_cast<VramOwner>(i)), c, f);
+			}
+			// The engine's Create* calls on other threads in the window (the rows after `from`, and this one).
+			uint32_t creates = now.createsOther;
+			float createMs = now.createOtherMs;
+			for (size_t k = from->row + 1; k < g_rows.size(); ++k) {
+				creates += g_rows[k].engine.createsOther;
+				createMs += g_rows[k].engine.createOtherMs;
+			}
+			using G = VramGroup;
+			const auto gi = [](G a_g) { return static_cast<int>(a_g); };
+			logger::info("[FrameTrace] VRAM jump {:+.0f} MB in {} frames (trace frame {}): local usage {:.0f} -> {:.0f} MB, budget {:.0f} -> {:.0f} MB, "
+						 "non-local {:.0f} -> {:.0f} MB; created / destroyed in the window: ours +{:.0f}/-{:.0f} MB, engine D3D11 +{:.0f}/-{:.0f} MB, "
+						 "other modules +{:.0f}/-{:.0f} MB, system memory (upload / read-back / staging) +{:.0f}/-{:.0f} MB [{}]; engine Create* on other threads "
+						 "{} ({:.1f} ms); alive (tagged): ours {:.0f} MB, engine {:.0f} MB, other modules {:.0f} MB",
+				now.usage - from->usage, now.row - from->row, now.row, from->usage, now.usage, from->budget, now.budget, from->nonLocal, now.nonLocal,
+				groupNew[gi(G::Ours)], groupFreed[gi(G::Ours)], groupNew[gi(G::Engine)], groupFreed[gi(G::Engine)], groupNew[gi(G::Other)], groupFreed[gi(G::Other)],
+				groupNew[gi(G::SysMem)], groupFreed[gi(G::SysMem)], owners.empty() ? std::string("nothing tagged") : owners, creates, createMs,
+				live[gi(G::Ours)], live[gi(G::Engine)], live[gi(G::Other)]);
+		}
+
+		// (46p) RT prep spikes: rt_prep_gpu_ms over twice its median (last 64 new samples) and 1 ms above it names the work of
+		// that submission in the log (at most 200 lines a recording).
+		constexpr size_t kPrepRing = 64;
+		std::array<float, kPrepRing> g_prepRing{};
+		size_t g_prepCount = 0, g_prepHead = 0;
+		uint32_t g_prepLogs = 0;
+		float g_prepLast = -2.0f;  // the last sample seen (the same read-back is on several rows)
+		uint32_t g_prepLastTlas = 0;
+
+		void NotePrepSpike(const Row& a_row, size_t a_index)
+		{
+			const float ms = a_row.rt.prepGpuMs;
+			const auto& w = a_row.rt.prepWork;
+			if (ms < 0.0f || !w.valid)
+				return;
+			if (ms == g_prepLast && w.tlasInstances == g_prepLastTlas)
+				return;  // no new read-back since the last row
+			g_prepLast = ms;
+			g_prepLastTlas = w.tlasInstances;
+			float median = -1.0f;
+			if (g_prepCount >= 16) {
+				std::array<float, kPrepRing> v{};
+				std::copy_n(g_prepRing.begin(), g_prepCount, v.begin());
+				const auto mid = v.begin() + static_cast<std::ptrdiff_t>(g_prepCount / 2);
+				std::nth_element(v.begin(), mid, v.begin() + static_cast<std::ptrdiff_t>(g_prepCount));
+				median = *mid;
+			}
+			g_prepRing[g_prepHead] = ms;
+			g_prepHead = (g_prepHead + 1) % kPrepRing;
+			g_prepCount = std::min(g_prepCount + 1, kPrepRing);
+			if (median < 0.0f || ms <= 2.0f * median || ms < median + 1.0f || g_prepLogs >= 200)
+				return;
+			++g_prepLogs;
+			logger::info("[FrameTrace] RT prep spike {:.2f} ms (median {:.2f}) on trace frame {} ({}): static BLAS builds {} (alpha {}, {} triangles, {:.1f} MB), "
+						 "compactions {} ({:.1f} MB); characters: new shapes {}, own-BLAS builds {} / refits {}, merged builds {} ({} triangles) / refits {}, "
+						 "skinning dispatches {} ({} vertices); TLAS instances {}; pool blocks adopted {} / released {} since the last submission",
+				ms, median, a_index, w.early ? "early prep" : "with the trace", w.builds, w.buildsAlpha, w.buildTriangles,
+				static_cast<double>(w.buildBytes) / (1024.0 * 1024.0), w.compactions, static_cast<double>(w.compactBytes) / (1024.0 * 1024.0), w.skinUploads,
+				w.skinBuilds, w.skinRefits, w.groupBuilds, w.groupTriangles, w.groupRefits, w.skinDispatches, w.skinVertices, w.tlasInstances, w.poolBlocks,
+				w.poolReleased);
+		}
+
+		/// The closed frames whose stamps are in, oldest first, onto their rows (never waits).
+		void CollectSegFrames()
+		{
+			auto* context = globals::d3d::context;
+			if (!context)
+				return;
+			for (int age = 0; age < kSegSlots; ++age) {
+				auto& slot = g_segSlots[(g_segWrite + age) % kSegSlots];
+				if (!slot.pending || slot.open)
+					continue;
+				D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+				HRESULT hr = ReadQuery(context, slot.disjoint.get(), disjoint);
+				if (hr == S_FALSE)
+					continue;
+				std::array<UINT64, kSegStamps> ticks{};
+				bool ready = SUCCEEDED(hr);
+				bool waiting = false;
+				for (int i = 0; ready && i < slot.count; ++i) {
+					hr = ReadQuery(context, slot.stamps[i].get(), ticks[i]);
+					if (hr == S_FALSE)
+						waiting = true;
+					if (hr != S_OK)
+						ready = false;
+				}
+				if (waiting)
+					continue;  // asked again next frame
+				slot.pending = false;
+				if (!ready || disjoint.Disjoint || disjoint.Frequency == 0 || slot.count < 2)
+					continue;
+				const double toMs = 1000.0 / static_cast<double>(disjoint.Frequency);
+				float ms[kSegs];
+				std::fill(std::begin(ms), std::end(ms), -1.0f);
+				float other = 0.0f;
+				bool ordered = true;
+				for (int i = 0; i + 1 < slot.count; ++i) {
+					if (ticks[i + 1] < ticks[i]) {
+						ordered = false;
+						break;
+					}
+					const float d = static_cast<float>(static_cast<double>(ticks[i + 1] - ticks[i]) * toMs);
+					const int seg = slot.seg[i];
+					if (seg >= 0 && seg < kSegs)
+						ms[seg] = std::max(ms[seg], 0.0f) + d;
+					else
+						other += d;
+				}
+				if (!ordered)
+					continue;
+				int looked = 0;
+				for (auto it = g_rows.rbegin(); it != g_rows.rend() && looked < 32; ++it, ++looked) {
+					if (it->engine.id != slot.frameId)
+						continue;
+					std::copy(std::begin(ms), std::end(ms), it->gpuSegMs);
+					it->gpuSegOtherMs = other;
+					it->gpuSegTotalMs = static_cast<float>(static_cast<double>(ticks[slot.count - 1] - ticks[0]) * toMs);
+					it->gpuSegStamps = slot.count;
+					break;
+				}
+			}
+		}
 	}
 
 	int64_t Now()
@@ -1676,9 +2173,15 @@ namespace Util::FrameTrace
 				{
 					// (46o) Sub-timers, video memory (every 4th frame), out-of-VRAM warnings, flags, stall samples.
 					std::copy_n(g_frame.split, static_cast<int>(Split::Count), r.split);
-					if ((g_vramFrame++ & 3u) == 0u)
+					{
+						// (46p) Every frame (was every 4th), with its cost.
+						const int64_t q0 = Now();
 						g_vram = QueryVram();
+						r.vramQueryUs = static_cast<float>(Ms(Now() - q0) * 1000.0);
+						++g_vramFrame;
+					}
 					r.vram = g_vram;
+					SampleVramOwners(r, engine);
 					r.vramWarn = g_vramWarn.exchange(0, std::memory_order_relaxed);
 					if (auto* ui = globals::game::ui) {
 						r.flags |= ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) ? kFlagLoading : 0u;
@@ -1703,12 +2206,19 @@ namespace Util::FrameTrace
 						g_passLogQueue.push_back(g_rows.size() - 1);
 					}
 					DrainPassLogs(false);
+					NotePrepSpike(row, g_rows.size() - 1);  // (46p)
 				}
 				if ((++g_reflexPoll & 15) == 0)
 					PollReflex();
 				if (now >= g_recordEnd)
 					StopRecording();
 			}
+		}
+
+		// (46p) This frame's GPU segment stamps are closed; earlier frames' are read back onto their rows.
+		if (g_recording) {
+			CloseSegFrame();
+			CollectSegFrames();
 		}
 
 		g_frame = {};
@@ -1728,6 +2238,15 @@ namespace Util::FrameTrace
 			return;
 		g_rows.clear();
 		g_worldSpikeLogs = 0;
+		// (46p) GPU segment stamps, VRAM window, RT prep spikes start over.
+		ResetSegSlots();
+		g_vramWinCount = g_vramWinHead = 0;
+		g_vramJumpCooldown = 0;
+		g_vramJumpLogs = 0;
+		g_vramPrevValid = false;
+		g_prepCount = g_prepHead = 0;
+		g_prepLogs = 0;
+		g_prepLast = -2.0f;
 		g_passLogs = 0;  // (46n)
 		g_passLogQueue.clear();
 		g_pendingPassGpu.clear();
@@ -1759,6 +2278,13 @@ namespace Util::FrameTrace
 					globals::features::performanceOverlay.settings.StallSampler ? "on" : "off");
 				g_vram = v;
 				g_vramFrame = 1;
+				// (46p) Alive per owner at the start (bytes tagged since the hooks went in).
+				const VramSnap snap = TakeVramSnap();
+				std::string owners;
+				for (int i = 0; i < kVramOwners; ++i)
+					owners += std::format("{}{} {:.0f}", owners.empty() ? "" : ", ", VramOwnerName(static_cast<VramOwner>(i)),
+						(static_cast<double>(snap.created[i]) - static_cast<double>(snap.freed[i])) / (1024.0 * 1024.0));
+				g_header46o += std::format("; (46p) alive by owner at start (MB, tagged since start-up): {}", owners);
 			}
 		}
 		logger::info("[FrameTrace] Recording {:.0f} s", a_seconds);
@@ -1828,6 +2354,60 @@ namespace Util::FrameTrace
 	{
 		if (g_recording)
 			g_vramWarn.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	// ---- (46p) video memory by owner ----
+
+	const char* VramOwnerName(VramOwner a_owner)
+	{
+		static constexpr const char* kNames[] = { "rt_blas", "rt_tlas", "rt_scratch", "rt_skin", "rt_upload", "rt_readback", "rt_other", "d3d11_ours",
+			"d3d11_shared", "engine", "other_modules", "staging" };
+		static_assert(std::size(kNames) == static_cast<size_t>(VramOwner::Count));
+		const int i = static_cast<int>(a_owner);
+		return i >= 0 && i < kVramOwners ? kNames[i] : "?";
+	}
+
+	void TagVram(ID3D11DeviceChild* a_object, VramOwner a_owner, uint64_t a_bytes) { TagObject(a_object, a_owner, a_bytes); }
+	void TagVram(ID3D12Object* a_object, VramOwner a_owner, uint64_t a_bytes) { TagObject(a_object, a_owner, a_bytes); }
+
+	void OnD3D11Created(ID3D11DeviceChild* a_resource, uint64_t a_bytes, bool a_shared, bool a_staging, const void* a_caller)
+	{
+		TagObject(a_resource, a_staging ? VramOwner::D3D11Staging : OwnerOfCaller(a_caller, a_shared), a_bytes);
+	}
+
+	// ---- (46p) coarse GPU time per engine segment ----
+
+	void OnEngineSegment(int a_seg)
+	{
+		if (!g_recording || g_segBroken)
+			return;
+		auto* context = globals::d3d::context;
+		if (!context)
+			return;
+		auto& slot = g_segSlots[g_segWrite];
+		if (!slot.open) {
+			// Opens at the frame's first render segment.
+			if (!IsRenderSeg(a_seg))
+				return;
+			if (Util::GpuPassTimers::GetSingleton()->HasOpenInterval())
+				return;  // its disjoint query is open: ours would nest (this frame goes untimed)
+			slot.pending = false;  // a sample never read back is dropped
+			if (!EnsureSegQueries(slot))
+				return;
+			context->Begin(slot.disjoint.get());
+			context->End(slot.stamps[0].get());
+			context->End(slot.disjoint.get());
+			slot.seg[0] = static_cast<int8_t>(a_seg);
+			slot.count = 1;
+			slot.frameId = EngineTiming::FrameId();
+			slot.open = true;
+			return;
+		}
+		if (slot.count >= kSegStamps - 1)
+			return;  // full: the last interval runs on to the close (gpu_seg_stamps = 17)
+		context->End(slot.stamps[slot.count].get());
+		slot.seg[slot.count] = static_cast<int8_t>(IsRenderSeg(a_seg) ? a_seg : -1);
+		++slot.count;
 	}
 
 	nlohmann::json ToJson()

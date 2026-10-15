@@ -935,6 +935,8 @@ namespace Hooks
 				pacer.stallFeedback = upscaling.settings.reflexPacerStallFeedback;
 				pacer.hiddenWaits = upscaling.settings.reflexPacerHiddenWaits;  // (46o) F1a
 				pacer.backstop = upscaling.settings.reflexPacerBackstop;        // (46o) F1b
+				pacer.noOverSleep = upscaling.settings.reflexPacerNoOverSleep;  // (46p)
+				pacer.smoothPhase = upscaling.settings.reflexPacerSmoothPhase;  // (46p)
 				if (auto* ui = globals::game::ui)  // (46o) the pacer starts over when these end
 					pacer.paused = ui->GameIsPaused() || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
 				Util::LatencyPacer::PaceFrameStart(pacer);

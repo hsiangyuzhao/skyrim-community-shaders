@@ -120,6 +120,43 @@ namespace Util::LatencyPacer
 		float g_periodMean = -1.0f;
 		bool g_wasPaused = false;
 
+		// (46p) "Never Over-Sleep". 46o traces in Solitude (203926 frames 50-150): the learned sleep sat at 13-20 ms on top of a
+		// predicted 7-10 ms, the pacer slept ~20 ms, frames took 41-45 ms with the GPU working 22-29 ms (idle the rest). Every 2-3
+		// frames a GPU spike's after-wait (10-15 ms, in the next frame's world pass) pumped it back up; it decays 0.2 ms a frame.
+		// The prediction cannot bound it: the GPU period it uses is the completion interval, which an over-sleeping pacer
+		// stretches to its own frame period (36-40 ms there). So the sleep waits on the interop fence itself: it ends at the
+		// previous frame's actual completion + a small slack (nothing queued for the GPU after that: any later start only
+		// idles it). A sleep cut short that way, or frames slower than the GPU period, cut the learned sleep fast; a frame
+		// right after a GPU spike does not feed it. Off: 46o exactly.
+		constexpr float kSlackShare = 0.1f;      // slack after the completion: this share of the GPU period ...
+		constexpr float kSlackMinMs = 0.5f;      // ... within these bounds
+		constexpr float kSlackMaxMs = 2.0f;
+		constexpr float kCutMinMs = 0.5f;        // a shorter cut is timer noise
+		constexpr float kFastDecayMs = 2.0f;     // learned sleep taken off per frame at least, when cut / when frames are slow
+		constexpr float kSlowShare = 0.05f;      // frames slower than the GPU period by this share: fast decay
+		constexpr float kSpikeShare = 1.5f;      // a GPU frame this many periods long is a spike
+		constexpr int kSpikeSkipFrames = 2;      // frames whose wait is not learned after one (that frame and the next)
+		HANDLE g_doneEvent = nullptr;
+		bool g_guardOn = false;                  // the last PaceFrameStart's switch (for OnD3D11Submitted)
+		int g_spikeSkip = 0;                     // frames still to skip
+		bool g_skipFeed = false;                 // the last submitted frame's wait is not learned
+		// Waiter results (under g_mutex): the longest single-frame completion gap since the main thread last looked (ms per
+		// frame when several finished together), the last one, and the recent completions (QPC, index of the frame).
+		float g_maxGapMs = -1.0f;
+		float g_lastGapMs = -1.0f;
+		constexpr size_t kDoneRing = 6;
+		std::array<int64_t, kDoneRing> g_doneTimes{};
+		std::array<uint64_t, kDoneRing> g_doneIndex{};
+		size_t g_doneCount = 0, g_doneHead = 0;
+		uint64_t g_completedFrames = 0;  // frames the waiter has seen finish (index of the newest)
+
+		// (46p) "Smooth GPU Phase": 46o RT-off Solitude (204223 frames 400-430) had the predicted completion (t + pacer_pred_ms)
+		// stepping by 22.5 +- 5.6 ms (sd) frame to frame while the GPU's own frame times (gpu_elapsed) varied by about 1 ms: the
+		// single last completion time is a noisy phase (the wake-up of the waiter thread, the DLSS-G present path behind the
+		// signalled value). The median of the last completions' offsets from a steady period gives the phase instead.
+		constexpr double kPhaseClampShare = 0.5;  // the median offset is kept within half a period of the raw phase
+		constexpr size_t kPhaseMinSamples = 4;
+
 		float Median3(const std::array<float, 3>& a_v)
 		{
 			return std::max(std::min(a_v[0], a_v[1]), std::min(std::max(a_v[0], a_v[1]), a_v[2]));
@@ -141,6 +178,8 @@ namespace Util::LatencyPacer
 			g_periodMean = -1.0f;
 			g_hiddenBaseCount = 0;
 			g_hiddenBaseMs = 0.0f;
+			g_spikeSkip = 0;  // (46p)
+			g_skipFeed = false;
 		}
 
 		void CalibrateTsc(int64_t a_now)
@@ -251,6 +290,17 @@ namespace Util::LatencyPacer
 						g_intervalCount = std::min(g_intervalCount + 1, kRing);
 					}
 				}
+				// (46p) Spike detection (per frame when several finished together) and the recent completions for the phase.
+				if (prevDone != 0) {
+					const float gap = static_cast<float>(ToMs(now - prevDone)) / static_cast<float>(popped);
+					g_lastGapMs = gap;
+					g_maxGapMs = std::max(g_maxGapMs, gap);
+				}
+				g_completedFrames += popped;
+				g_doneTimes[g_doneHead] = now;
+				g_doneIndex[g_doneHead] = g_completedFrames;
+				g_doneHead = (g_doneHead + 1) % kDoneRing;
+				g_doneCount = std::min(g_doneCount + 1, kDoneRing);
 				prevDone = now;
 				g_lastDoneTime = now;
 			}
@@ -274,6 +324,72 @@ namespace Util::LatencyPacer
 			}
 			::Sleep(static_cast<DWORD>(ms));
 		}
+
+		/// (46p) Sleeps until a_target, or until a_value completes on a_fence plus a_slackTicks, whichever is first.
+		/// Returns the QPC at which the value was seen complete (0 = it was not before a_target, or no fence wait was possible).
+		int64_t SleepUntilOrDone(int64_t a_target, ID3D12Fence* a_fence, uint64_t a_value, int64_t a_slackTicks)
+		{
+			if (a_fence->GetCompletedValue() >= a_value) {
+				const int64_t done = Now();
+				SleepUntil(std::min(a_target, done + a_slackTicks));
+				return done;
+			}
+			if (!g_doneEvent)
+				g_doneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			if (!g_timer)
+				g_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+			if (!g_doneEvent || !g_timer || FAILED(a_fence->SetEventOnCompletion(a_value, g_doneEvent))) {
+				SleepUntil(a_target);
+				return 0;
+			}
+			for (;;) {
+				const double ms = ToMs(a_target - Now());
+				if (ms <= 0.0)
+					return 0;
+				LARGE_INTEGER due;
+				due.QuadPart = -static_cast<LONGLONG>(ms * 10000.0);  // relative, 100 ns units
+				if (!SetWaitableTimer(g_timer, &due, 0, nullptr, nullptr, FALSE)) {
+					SleepUntil(a_target);
+					return 0;
+				}
+				const HANDLE handles[2] = { g_doneEvent, g_timer };
+				const DWORD r = WaitForMultipleObjects(2, handles, FALSE, static_cast<DWORD>(ms) + 5);
+				if (r != WAIT_OBJECT_0)
+					return 0;  // the timer (or the timeout): the planned end
+				// The event is shared by every frame's registration: an older value may have set it. Ours is still armed then.
+				if (a_fence->GetCompletedValue() < a_value)
+					continue;
+				const int64_t done = Now();
+				CancelWaitableTimer(g_timer);
+				SleepUntil(std::min(a_target, done + a_slackTicks));
+				return done;
+			}
+		}
+
+		/// (46p) Predicted completion of frame a_targetIndex from the median phase of the recent completions (a_times / a_index:
+		/// oldest first, the last one is the newest), with a_periodTicks per frame. a_raw when there are too few.
+		int64_t SmoothedCompletion(const int64_t* a_times, const uint64_t* a_index, size_t a_count, uint64_t a_targetIndex, double a_periodTicks, int64_t a_raw)
+		{
+			if (a_count < kPhaseMinSamples || a_periodTicks <= 0.0)
+				return a_raw;
+			const int64_t lastTime = a_times[a_count - 1];
+			const uint64_t lastIndex = a_index[a_count - 1];
+			std::array<double, kDoneRing> offsets{};
+			size_t n = 0;
+			for (size_t i = 0; i < a_count; ++i) {
+				if (a_index[i] > lastIndex || lastIndex - a_index[i] > 2 * kDoneRing)
+					continue;  // not from this run of completions
+				offsets[n++] = static_cast<double>(a_times[i] - lastTime) + static_cast<double>(lastIndex - a_index[i]) * a_periodTicks;
+			}
+			if (n < kPhaseMinSamples)
+				return a_raw;
+			std::sort(offsets.begin(), offsets.begin() + static_cast<std::ptrdiff_t>(n));
+			const double median = (n & 1) ? offsets[n / 2] : 0.5 * (offsets[n / 2 - 1] + offsets[n / 2]);
+			const double clamp = kPhaseClampShare * a_periodTicks;
+			const double shift = std::clamp(median, -clamp, clamp);
+			const double frames = a_targetIndex >= lastIndex ? static_cast<double>(a_targetIndex - lastIndex) : 0.0;
+			return lastTime + static_cast<int64_t>(shift + frames * a_periodTicks);
+		}
 	}
 
 	void PaceFrameStart(const Options& a_options)
@@ -286,16 +402,19 @@ namespace Util::LatencyPacer
 		const bool a_enabled = a_options.enabled;
 		const float a_marginMs = a_options.marginMs;
 		const bool a_stallFeedback = a_options.stallFeedback;
+		const bool guard = a_options.noOverSleep;  // (46p)
 		g_mainThread = GetCurrentThreadId();
 		FrameInfo info{};
 		info.enabled = a_enabled;
 		g_hiddenOn = a_options.hiddenWaits;
+		g_guardOn = guard;
 		EngineTiming::SetPacerWaitTracking(a_options.hiddenWaits && a_enabled);
 
 		const int64_t start = Now();
 		CalibrateTsc(start);
-		// (46o) After a pause / loading screen / the map, with either 46o switch on (off / off = 46n exactly).
-		if (a_options.hiddenWaits || a_options.backstop) {
+		// (46o) After a pause / loading screen / the map, with either 46o switch on (off / off = 46n exactly). (46p) Or Never Over-Sleep
+		// (its fast decay reads the frame period).
+		if (a_options.hiddenWaits || a_options.backstop || guard) {
 			if (a_options.paused) {
 				g_wasPaused = true;
 			} else if (g_wasPaused) {
@@ -324,11 +443,15 @@ namespace Util::LatencyPacer
 			g_stallFresh = false;
 			// (46o) F1a: the median of the last three frames' waits (46n stall or hidden wait, the larger).
 			const float wait = a_options.hiddenWaits ? Median3(g_waitHist) : g_lastStallMs;
-			if (a_stallFeedback && wait >= kStallThresholdMs)
+			// (46p) Right after a GPU spike the wait is the spike's, not a steady one: not learned (the learned sleep decays).
+			const bool skip = guard && g_skipFeed;
+			info.spikeSkip = skip ? 1 : 0;
+			if (a_stallFeedback && !skip && wait >= kStallThresholdMs)
 				g_correctionMs = std::min(g_correctionMs + kStallGain * wait, kMaxCorrectionMs);
 			else
 				g_correctionMs = std::max(g_correctionMs - kStallDecayMs, 0.0f);
 		}
+		g_skipFeed = false;
 		if (!a_stallFeedback)
 			g_correctionMs = 0.0f;
 		info.stallMs = g_lastStallMs;
@@ -338,19 +461,42 @@ namespace Util::LatencyPacer
 		info.hiddenBaseMs = g_hiddenBaseMs;
 		int pending = 0;
 		uint64_t secondNewest = 0;
+		uint64_t newest = 0;  // (46p) the previous frame's value
 		int64_t lastDone = 0;
 		float period = -1.0f;
 		winrt::com_ptr<ID3D12Fence> fence;
+		// (46p) The recent completions, oldest first, and the index of the newest pending frame.
+		std::array<int64_t, kDoneRing> doneTimes{};
+		std::array<uint64_t, kDoneRing> doneIndex{};
+		size_t doneCount = 0;
+		uint64_t newestIndex = 0;
 		{
 			std::scoped_lock lk(g_mutex);
 			info.tracking = g_fence != nullptr;
 			pending = static_cast<int>(g_pending.size());
 			if (pending >= 2)
 				secondNewest = g_pending[g_pending.size() - 2];
+			if (pending >= 1)
+				newest = g_pending.back();
 			lastDone = g_lastDoneTime;
 			if (g_intervalCount >= kMinSamples)
 				period = Quantile(g_intervals, g_intervalCount, 0.5f);
 			fence = g_fence;
+			info.doneIntervalMs = g_lastGapMs;
+			doneCount = g_doneCount;
+			for (size_t i = 0; i < doneCount; ++i) {
+				const size_t slot = (g_doneHead + kDoneRing - doneCount + i) % kDoneRing;
+				doneTimes[i] = g_doneTimes[slot];
+				doneIndex[i] = g_doneIndex[slot];
+			}
+			newestIndex = g_completedFrames + static_cast<uint64_t>(pending);
+		}
+		// (46p) Fast decay: frames slower than the GPU period (16-frame mean) while sleep is learned.
+		if (guard && g_correctionMs > 0.0f && period > 0.0f && g_periodMean > period * (1.0f + kSlowShare)) {
+			const float cut = std::min(g_correctionMs, std::max(kFastDecayMs, 0.5f * g_correctionMs));
+			g_correctionMs -= cut;
+			info.decayMs += cut;
+			info.correctionMs = g_correctionMs;
 		}
 		if (!info.tracking) {
 			g_frameBehind = false;
@@ -391,15 +537,42 @@ namespace Util::LatencyPacer
 
 		if (pending > 0 && lastDone != 0 && period > 0.0f) {
 			// The previous frame finishes about `pending` GPU periods after the last completion.
-			const int64_t predicted = lastDone + static_cast<int64_t>(static_cast<double>(period) * pending * static_cast<double>(g_qpf) / 1000.0);
+			const double periodTicks = static_cast<double>(period) * static_cast<double>(g_qpf) / 1000.0;
+			const int64_t raw = lastDone + static_cast<int64_t>(periodTicks * pending);
+			// (46p) The same from the median phase of the recent completions (shown always; used with Smooth GPU Phase).
+			const int64_t smoothed = doneCount > 0 && doneTimes[doneCount - 1] == lastDone ?
+			                             SmoothedCompletion(doneTimes.data(), doneIndex.data(), doneCount, newestIndex, periodTicks, raw) :
+			                             raw;
+			info.phaseShiftMs = static_cast<float>(ToMs(smoothed - raw));
+			const int64_t predicted = a_options.smoothPhase ? smoothed : raw;
 			info.predictedMs = static_cast<float>(std::max(0.0, ToMs(predicted - start)));
 			if (a_enabled && lead >= 0.0f) {
 				const double reserveMs = static_cast<double>(leadUsed) + static_cast<double>(a_marginMs);
 				// (46n) Plus the learned wait (only while the GPU is behind: pending > 0 here).
-				const double sleepMs = std::min(std::max(ToMs(predicted - start) - reserveMs, 0.0) + static_cast<double>(g_correctionMs), kMaxSleepMs);
+				const double baseMs = std::max(ToMs(predicted - start) - reserveMs, 0.0);
+				const double sleepMs = std::min(baseMs + static_cast<double>(g_correctionMs), kMaxSleepMs);
 				if (sleepMs > 0.2) {
-					SleepUntil(start + static_cast<int64_t>(sleepMs * static_cast<double>(g_qpf) / 1000.0));
-					info.sleepMs = static_cast<float>(ToMs(Now() - start));
+					const int64_t target = start + static_cast<int64_t>(sleepMs * static_cast<double>(g_qpf) / 1000.0);
+					if (guard && fence && newest != 0) {
+						// (46p) Never past the previous frame's completion (+ slack): the frame after it only idles the GPU.
+						const double slackMs = std::clamp(static_cast<double>(period) * kSlackShare, static_cast<double>(kSlackMinMs), static_cast<double>(kSlackMaxMs));
+						const int64_t done = SleepUntilOrDone(target, fence.get(), newest, static_cast<int64_t>(slackMs * static_cast<double>(g_qpf) / 1000.0));
+						info.sleepMs = static_cast<float>(ToMs(Now() - start));
+						const double cut = sleepMs - static_cast<double>(info.sleepMs);
+						if (done != 0 && cut >= kCutMinMs) {
+							info.overSleepCutMs = static_cast<float>(cut);
+							// The learned part that was of use; the rest goes fast.
+							if (g_correctionMs > 0.0f) {
+								const float used = static_cast<float>(std::max(static_cast<double>(info.sleepMs) - baseMs, 0.0));
+								const float next = std::max(std::min(std::max(used, 0.5f * g_correctionMs), g_correctionMs - kFastDecayMs), 0.0f);
+								info.decayMs += g_correctionMs - next;
+								g_correctionMs = next;
+							}
+						}
+					} else {
+						SleepUntil(target);
+						info.sleepMs = static_cast<float>(ToMs(Now() - start));
+					}
 				}
 			}
 		} else if (pending == 0) {
@@ -478,8 +651,37 @@ namespace Util::LatencyPacer
 			wait = std::max(wait, static_cast<float>(extra));
 		g_lastHiddenMs = static_cast<float>(hidden);
 		g_lastWaitMs = wait;
-		g_waitHist[g_waitHistHead] = wait;
-		g_waitHistHead = (g_waitHistHead + 1) % g_waitHist.size();
+		// (46p) Never Over-Sleep: a GPU frame of over 1.5 periods finished since the last submit, or the GPU is in one right now
+		// (the last completion that long ago with frames still pending): this frame's wait and the next one's are not learned.
+		bool skipFeed = false;
+		if (g_guardOn) {
+			const float period = g_last.gpuPeriodMs;
+			float maxGap = -1.0f;
+			int64_t lastDone = 0;
+			size_t pendingNow = 0;
+			{
+				std::scoped_lock lk(g_mutex);
+				maxGap = g_maxGapMs;
+				g_maxGapMs = -1.0f;
+				lastDone = g_lastDoneTime;
+				pendingNow = g_pending.size();
+			}
+			if (period > 0.0f) {
+				const bool spikeDone = maxGap > kSpikeShare * period;
+				const bool spikeNow = pendingNow > 0 && lastDone != 0 && ToMs(Now() - lastDone) > static_cast<double>(kSpikeShare * period);
+				if (spikeDone || spikeNow)
+					g_spikeSkip = kSpikeSkipFrames;
+			}
+			if (g_spikeSkip > 0) {
+				--g_spikeSkip;
+				skipFeed = true;
+			}
+		}
+		g_skipFeed = skipFeed;
+		if (!skipFeed) {
+			g_waitHist[g_waitHistHead] = wait;
+			g_waitHistHead = (g_waitHistHead + 1) % g_waitHist.size();
+		}
 		g_lastStallMs = stall;
 		g_stallFresh = true;
 		g_stallMs = 0.0;
@@ -503,6 +705,8 @@ namespace Util::LatencyPacer
 				g_pending.clear();
 				g_intervalCount = 0;
 				g_lastDoneTime = 0;
+				g_doneCount = 0;  // (46p)
+				g_maxGapMs = g_lastGapMs = -1.0f;
 			}
 			// Bounded: if the waiter ever stalls, old entries are dropped rather than piling up.
 			if (g_pending.size() >= 16)

@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <string>
 
+struct ID3D11DeviceChild;  // (46p)
+struct ID3D12Object;
+
 /**
  * @brief (44e, D2) Per-frame CPU wait split and the frame-time trace recorder.
  *
@@ -69,6 +72,30 @@ namespace Util::FrameTrace
 	void OnGrassApply(float a_ms);
 	/// (45) Ray Tracing this frame: D3D12 GPU ms of the last completed submission, CPU ms, BLAS builds (-1 = off).
 	void OnRayTracing(float a_gpuMs, float a_cpuMs, uint32_t a_builds);
+	// ---- (46p) what the RT D3D12 prep submission did (the one whose GPU time is rt_prep_gpu_ms) ---------------------
+	struct RtPrepWork
+	{
+		int valid = 0;                 ///< 1 = filled from the submission
+		int early = 0;                 ///< recorded at the frame start (Early Prep)
+		uint32_t builds = 0;           ///< static BLAS builds (cell chunks, objects, trees, alpha-tested)
+		uint32_t buildsAlpha = 0;      ///< of which alpha-tested
+		uint64_t buildTriangles = 0;
+		uint64_t buildBytes = 0;       ///< BLAS results (before compaction)
+		uint32_t compactions = 0;
+		uint64_t compactBytes = 0;     ///< compacted copies written
+		uint32_t skinUploads = 0;      ///< new character shapes uploaded
+		uint32_t skinBuilds = 0;       ///< character shapes with their own BLAS: first builds + periodic rebuilds
+		uint32_t skinRefits = 0;
+		uint32_t groupBuilds = 0;      ///< merged character BLASes built (member list changed / periodic)
+		uint64_t groupTriangles = 0;   ///< triangles in them
+		uint32_t groupRefits = 0;
+		uint32_t skinDispatches = 0;
+		uint64_t skinVertices = 0;     ///< vertices skinned
+		uint32_t tlasInstances = 0;
+		uint32_t poolBlocks = 0;       ///< pool blocks adopted since the previous submission (growth)
+		uint32_t poolReleased = 0;     ///< pool blocks released since the previous submission
+	};
+
 	/// (45j) Ray Tracing's CPU split this frame (ms; -1 = not run) and its counters.
 	struct RayTracingDetail
 	{
@@ -135,6 +162,8 @@ namespace Util::FrameTrace
 		// (46m) Split Trace Sync this frame (1 split, 0 not, -1 not traced); the game queue's wait for the sun / for the point lights (GPU ms).
 		int syncSplit = -1;
 		float syncSunGpuMs = -1, syncPlGpuMs = -1;
+		// (46p) The work of the prep submission prepGpuMs was measured on (same read-back).
+		RtPrepWork prepWork{};
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 
@@ -261,4 +290,41 @@ namespace Util::FrameTrace
 	};
 	/// (46o) M3: a Streamline evaluate returned eWarnOutOfVRAM (any thread).
 	void OnOutOfVram();
+
+	// ---- (46p) video memory by owner (always counted; shown while recording) --------------------------------------
+	//
+	// Every resource we create (and every D3D11 texture / buffer anyone creates through the game's device) gets a small
+	// private-data object; the runtime releases it when the resource is destroyed, which counts the release. So bytes
+	// created and destroyed per owner are known per frame, and the bytes alive (since the hooks went in) per owner.
+	// D3D11 owners come from the caller's module (our DLL, SkyrimSE.exe, any other module); staging resources (system
+	// memory) on their own. Sizes are estimates from the description (mips, array, samples; 64 KB granularity for D3D12).
+
+	enum class VramOwner : int
+	{
+		RtBlas,       ///< RT BLAS pool blocks (static BLASes, compacted copies, character BLASes)
+		RtTlas,       ///< RT TLAS buffer
+		RtScratch,    ///< RT build / skinning scratch
+		RtSkin,       ///< RT character vertex / skinned-vertex pools
+		RtUpload,     ///< RT upload heaps (geometry, instances, bones, alpha records): system memory
+		RtReadback,   ///< RT read-back heaps: system memory
+		RtOther,      ///< RT other D3D12 buffers (texcoords, counters, post-build sizes)
+		D3D11Ours,    ///< D3D11 textures / buffers our DLL created (features, RT's D3D11 side)
+		D3D11Shared,  ///< D3D11 shared textures our DLL created (D3D11 <-> D3D12 interop: RT, upscaling)
+		D3D11Engine,  ///< D3D11 textures / buffers SkyrimSE.exe created
+		D3D11Other,   ///< D3D11 textures / buffers other modules created (other plugins, Streamline, drivers)
+		D3D11Staging, ///< D3D11 staging resources (any caller): system memory
+		Count
+	};
+	const char* VramOwnerName(VramOwner a_owner);
+	/// Counts a_bytes as created for a_owner now, and as released when a_object is destroyed.
+	void TagVram(ID3D11DeviceChild* a_object, VramOwner a_owner, uint64_t a_bytes);
+	void TagVram(ID3D12Object* a_object, VramOwner a_owner, uint64_t a_bytes);
+	/// A D3D11 texture / buffer created through the game's device (EngineTiming's Create* hooks): owner from a_caller.
+	void OnD3D11Created(ID3D11DeviceChild* a_resource, uint64_t a_bytes, bool a_shared, bool a_staging, const void* a_caller);
+
+	// ---- (46p) coarse GPU time per engine segment (recording only) --------------------------------------------------
+	/// EngineTiming: the main thread entered segment a_seg (EngineTiming::Seg as int). A D3D11 timestamp at every change
+	/// between render segments (at most 16 per frame), read back a few frames later without waiting.
+	void OnEngineSegment(int a_seg);
+
 }

@@ -10,6 +10,10 @@
 
 #include <psapi.h>
 
+#include <DirectXTex.h>  // (46p) BitsPerPixel / IsCompressed
+#include <intrin.h>      // (46p) _ReturnAddress
+#include <tuple>
+
 #include "Features/PerformanceOverlay.h"
 #include "Features/Upscaling.h"
 #include "Utils/FileSystem.h"
@@ -453,6 +457,9 @@ namespace Util::EngineTiming
 					SampleWait(g_seg);
 				else
 					g_waitQpcLast = 0;
+				// (46p) A GPU timestamp at the change (recording only).
+				if (FrameTrace::IsRecording())
+					FrameTrace::OnEngineSegment(a_seg);
 			}
 			// (46o) M2: where the main thread is now, for the stall sampler.
 			if ((a_seg != g_seg || a_call != g_call) && g_samplerOn.load(std::memory_order_relaxed)) {
@@ -649,13 +656,71 @@ namespace Util::EngineTiming
 		template <std::size_t Index, class Sig>
 		struct DeviceCreate;
 
+		// ---- (46p) video memory of D3D11 textures / buffers (FrameTrace::OnD3D11Created) ----
+		constexpr UINT kSharedMisc = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+		/// Bytes of one 2D surface of a_format (block-compressed formats by 4x4 blocks).
+		uint64_t SurfaceBytes(DXGI_FORMAT a_format, uint64_t a_width, uint64_t a_height)
+		{
+			const uint64_t bits = DirectX::BitsPerPixel(a_format);
+			if (DirectX::IsCompressed(a_format))
+				return ((a_width + 3) / 4) * ((a_height + 3) / 4) * bits * 2;  // 4 bpp = 8 bytes a block, 8 bpp = 16
+			return (a_width * a_height * (bits ? bits : 32) + 7) / 8;
+		}
+
+		uint64_t MipChainBytes(DXGI_FORMAT a_format, uint64_t a_width, uint64_t a_height, uint64_t a_depth, UINT a_mips)
+		{
+			uint64_t total = 0;
+			const UINT mips = a_mips ? a_mips : 1;  // 0 = a full chain asked for: at least the top level counted
+			for (UINT m = 0; m < mips && m < 16; ++m)
+				total += SurfaceBytes(a_format, std::max<uint64_t>(a_width >> m, 1), std::max<uint64_t>(a_height >> m, 1)) * std::max<uint64_t>(a_depth >> m, 1);
+			return total;
+		}
+
+		void NoteCreated(const D3D11_BUFFER_DESC* a_desc, ID3D11Buffer** a_out, const void* a_caller)
+		{
+			if (a_desc && a_out && *a_out)
+				FrameTrace::OnD3D11Created(*a_out, a_desc->ByteWidth, (a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING, a_caller);
+		}
+		void NoteCreated(const D3D11_TEXTURE1D_DESC* a_desc, ID3D11Texture1D** a_out, const void* a_caller)
+		{
+			if (a_desc && a_out && *a_out)
+				FrameTrace::OnD3D11Created(*a_out, MipChainBytes(a_desc->Format, a_desc->Width, 1, 1, a_desc->MipLevels) * std::max<UINT>(a_desc->ArraySize, 1),
+					(a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING, a_caller);
+		}
+		void NoteCreated(const D3D11_TEXTURE2D_DESC* a_desc, ID3D11Texture2D** a_out, const void* a_caller)
+		{
+			if (a_desc && a_out && *a_out)
+				FrameTrace::OnD3D11Created(*a_out,
+					MipChainBytes(a_desc->Format, a_desc->Width, a_desc->Height, 1, a_desc->MipLevels) * std::max<UINT>(a_desc->ArraySize, 1) *
+						std::max<UINT>(a_desc->SampleDesc.Count, 1),
+					(a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING, a_caller);
+		}
+		void NoteCreated(const D3D11_TEXTURE3D_DESC* a_desc, ID3D11Texture3D** a_out, const void* a_caller)
+		{
+			if (a_desc && a_out && *a_out)
+				FrameTrace::OnD3D11Created(*a_out, MipChainBytes(a_desc->Format, a_desc->Width, a_desc->Height, a_desc->Depth, a_desc->MipLevels),
+					(a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING, a_caller);
+		}
+
 		template <std::size_t Index, class... Args>
 		struct DeviceCreate<Index, HRESULT(Args...)>
 		{
 			static HRESULT STDMETHODCALLTYPE thunk(ID3D11Device* This, Args... a_args)
 			{
-				CreateTimer timer(static_cast<int>(Index));
-				return func(This, a_args...);
+				HRESULT hr;
+				{
+					CreateTimer timer(static_cast<int>(Index));
+					hr = func(This, a_args...);
+				}
+				// (46p) Textures and buffers: counted per owner (the caller's module) while they live.
+				if constexpr (Index >= 3 && Index <= 6) {
+					if (SUCCEEDED(hr)) {
+						auto args = std::forward_as_tuple(a_args...);
+						NoteCreated(std::get<0>(args), std::get<2>(args), _ReturnAddress());
+					}
+				}
+				return hr;
 			}
 			static inline REL::Relocation<decltype(thunk)> func;
 		};

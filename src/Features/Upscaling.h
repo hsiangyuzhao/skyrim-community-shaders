@@ -232,6 +232,11 @@ public:
 		bool reflexPacerHiddenWaits = true;
 		// (46o) F1b: when the pacer stays locked out (no sleep for 30 frames while the GPU is behind), its reserved lead shrinks.
 		bool reflexPacerBackstop = true;
+		// (46p) The frame-start sleep ends once the previous frame is done on the GPU (+ slack); learned sleep that was cut, or frames
+		// slower than the GPU period, decay it fast; a frame right after a GPU spike does not feed it. Off = 46o.
+		bool reflexPacerNoOverSleep = true;
+		// (46p) The predicted completion from the median phase of the last GPU completions instead of the last one alone. Off = 46o.
+		bool reflexPacerSmoothPhase = false;
 
 		NeuralRenderingSettings neuralRendering;
 	};

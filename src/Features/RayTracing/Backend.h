@@ -17,6 +17,8 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include "Utils/FrameTrace.h"  // (46p) VramOwner, RtPrepWork
+
 /**
  * @brief (45, RT prototype) The ray tracer's own D3D12 side: device, queue, BLAS/TLAS, trace pass.
  *
@@ -410,6 +412,8 @@ namespace RayTracingRT
 		bool aoAlphaLastFrame = false;
 		// (46m) Split Trace Sync: the last ExecuteFrame signalled the sun fence between the sun and the point lights.
 		bool sunSplitLastFrame = false;
+		// (46p) What the submission behind lastPrepGpuMs recorded (set with it).
+		Util::FrameTrace::RtPrepWork lastPrepWork{};
 	};
 
 	/// (46g) GPU memory carved out of a few large committed buffers ("blocks"), so a BLAS or a character shape
@@ -751,6 +755,7 @@ namespace RayTracingRT
 			// trace timestamps of this submission then end with the sun (the point lights have their own pair).
 			ComPtr<ID3D12GraphicsCommandList4> pointList;
 			bool splitTrace = false;
+			Util::FrameTrace::RtPrepWork work{};  // (46p) what this submission's prep recorded (read with its timestamps)
 		};
 		/// (46f) A context may be reused once its submission (and its RTAO list, behind the second fence) completed.
 		static bool ContextFree(const CommandContext& a_context, std::uint64_t a_completed, std::uint64_t a_aoCompleted)
@@ -921,7 +926,15 @@ namespace RayTracingRT
 		void ReleaseThreadMain();
 		void CollectRetired();
 		void CollectTimestamps(std::size_t a_index);
-		ComPtr<ID3D12Resource> CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav);
+		/// (46p) a_owner: the video-memory owner it is counted under (F7 vram_*).
+		ComPtr<ID3D12Resource> CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav,
+			Util::FrameTrace::VramOwner a_owner = Util::FrameTrace::VramOwner::RtOther);
+		// (46p) The prep work being recorded (stored into the context with its timestamps); pool block totals at the last store.
+		Util::FrameTrace::RtPrepWork recWork_{};
+		std::uint64_t workBlocksSeen_ = 0;
+		std::uint64_t workReleasedSeen_ = 0;
+		/// (46p) Copies the skinning counts of the RecordSkinning just run (and uploads since a_uploadsBefore) into recWork_.
+		void NoteSkinWork(std::uint64_t a_uploadsBefore);
 		bool CheckSharedFormat(DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store, const char* a_name, bool a_fatal = true);
 		bool CreateSharedTexture(std::uint32_t a_width, std::uint32_t a_height, DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store,
 			SharedTexture& o_texture, const char* a_name, bool a_fatal = true);

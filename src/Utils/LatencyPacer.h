@@ -41,6 +41,13 @@ namespace Util::LatencyPacer
 		float backstopMs = 0.0f;   ///< (46o) lead taken off by the unlock backstop this frame
 		float hiddenBaseMs = 0.0f; ///< (46o) the hidden wait frames have anyway (p25 while sleeping); only the part above it counts
 		bool reset = false;        ///< (46o) the lead samples and learned sleep were cleared at this frame (after a pause / loading / map)
+		// (46p) "Never Over-Sleep": planned sleep not taken because the previous frame had finished on the GPU (+ slack), learned
+		// sleep taken off by the fast decay this frame, the previous frame's wait not learned (right after a GPU spike).
+		float overSleepCutMs = 0.0f;
+		float decayMs = 0.0f;
+		int spikeSkip = 0;
+		float doneIntervalMs = -1.0f; ///< (46p) the last single-frame GPU completion interval the waiter saw (-1 = none yet)
+		float phaseShiftMs = 0.0f;    ///< (46p) smoothed minus raw predicted completion (computed always; used with Smooth GPU Phase)
 	};
 
 	/// (46o) The pacer's switches for one frame.
@@ -52,6 +59,8 @@ namespace Util::LatencyPacer
 		bool hiddenWaits = false;    ///< (46o) F1a "Count Hidden GPU Waits": the render segments' wall - thread CPU time is a wait too
 		bool backstop = false;       ///< (46o) F1b "Unlock Backstop"
 		bool paused = false;         ///< (46o) game paused / loading screen / map open: the samples are cleared when it ends
+		bool noOverSleep = false;    ///< (46p) "Never Over-Sleep": the sleep ends once the previous frame is done on the GPU (+ slack), fast decay, spike skip
+		bool smoothPhase = false;    ///< (46p) "Smooth GPU Phase": the predicted completion from the median phase of the last completions
 	};
 
 	/// Main thread, in Main::Update before the Reflex sleep. Sleeps only when a_options.enabled.

@@ -73,6 +73,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexPacerStallFeedback,
 	reflexPacerHiddenWaits,
 	reflexPacerBackstop,
+	reflexPacerNoOverSleep,
+	reflexPacerSmoothPhase,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -621,12 +623,23 @@ void Upscaling::DrawAdvancedSettings()
 			ImGui::TextUnformatted("Safety net: if the pacer has not slept for 30 frames while the graphics card is behind, it trims its CPU reserve");
 			ImGui::TextUnformatted("0.5 ms per frame until it sleeps again, and hands it back at once if frames get slower. Off: as 46n.");
 		}
+		ImGui::Checkbox("Pacer: Never Over-Sleep", &settings.reflexPacerNoOverSleep);  // (46p)
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("The pacer's learned extra sleep may move a wait to the frame start, but never past the moment the graphics card");
+			ImGui::TextUnformatted("finishes the previous frame (that would only leave the card idle). Learned sleep that got cut, or frames slower than");
+			ImGui::TextUnformatted("the card, make it shrink fast; a frame right after one very slow GPU frame teaches it nothing. Off: as 46o.");
+		}
+		ImGui::Checkbox("Pacer: Smooth GPU Phase", &settings.reflexPacerSmoothPhase);  // (46p)
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Predicts when the graphics card finishes a frame from the last several finishes instead of only the last one,");
+			ImGui::TextUnformatted("so the pacer's sleep jitters less from frame to frame. Off: as 46o.");
+		}
 		const auto& pacer = Util::LatencyPacer::Last();
 		if (pacer.tracking)
 			ImGui::TextDisabled("Pacer: %d frame(s) on the GPU at frame start (%d after the wait), GPU period %.1f ms, CPU reserve %.1f ms (backstop -%.1f), slept %.1f ms "
-								"(+%.1f ms bound), waited inside D3D11 %.1f ms, hidden wait %.1f ms (learned %.1f ms)",
-				pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.backstopMs, pacer.sleepMs, pacer.capWaitMs, pacer.stallMs,
-				pacer.hiddenWaitMs, pacer.correctionMs);
+								"(+%.1f ms bound, cut %.1f ms), waited inside D3D11 %.1f ms, hidden wait %.1f ms (learned %.1f ms, fast decay %.1f)",
+				pacer.inFlight, pacer.inFlightAfter, pacer.gpuPeriodMs, pacer.leadMs, pacer.backstopMs, pacer.sleepMs, pacer.capWaitMs, pacer.overSleepCutMs,
+				pacer.stallMs, pacer.hiddenWaitMs, pacer.correctionMs, pacer.decayMs);
 		else
 			ImGui::TextDisabled("Pacer: waiting for the D3D12 swap chain");
 		if (!Util::EngineTiming::ProbesInstalled())
@@ -1685,14 +1698,16 @@ std::string Upscaling::DescribeLatencyForTrace()
 	auto modeName = [](uint m) { return m < 3 ? kModes[m] : "not applied"; };
 	return std::format(
 		"Reflex available {}, functions ready {}, PCL ready {}; mode set {} / applied {}; frame limit set {} / effective {} / applied {} fps (presented); "
-		"pacer {} (margin {:.1f} ms, GPU waits moved to frame start {}, (46o) count hidden GPU waits {}, unlock backstop {}), markers at render start {} (probes {}); "
+		"pacer {} (margin {:.1f} ms, GPU waits moved to frame start {}, (46o) count hidden GPU waits {}, unlock backstop {}, (46p) never over-sleep {}, "
+		"smooth GPU phase {}), markers at render start {} (probes {}); "
 		"lowLatencyAvailable {}, latencyReportAvailable {}; "
 		"frame generation requested {} at {}x; spin limiter {} (fallback without Reflex, syncInterval 0 path); refresh {:.0f} Hz",
 		streamline.featureReflex ? "yes" : "no", streamline.reflexFunctionsReady ? "yes" : "no", streamline.pclFunctionsReady ? "yes" : "no",
 		modeName(std::min(settings.reflexMode, 2u)), modeName(modeApplied), settings.reflexFrameLimit, GetEffectiveReflexFrameLimit(),
 		reflexFrameLimitApplied == UINT_MAX ? -1 : static_cast<int>(reflexFrameLimitApplied),
 		IsLatencyPacerEnabled() ? "on" : "off", settings.reflexPacerMarginMs, settings.reflexPacerStallFeedback ? "on" : "off",
-		settings.reflexPacerHiddenWaits ? "on" : "off", settings.reflexPacerBackstop ? "on" : "off", WantsReflexMarkersAtRenderStart() ? "on" : "off",
+		settings.reflexPacerHiddenWaits ? "on" : "off", settings.reflexPacerBackstop ? "on" : "off", settings.reflexPacerNoOverSleep ? "on" : "off",
+		settings.reflexPacerSmoothPhase ? "on" : "off", WantsReflexMarkersAtRenderStart() ? "on" : "off",
 		Util::EngineTiming::ProbesInstalled() ? "installed" : Util::EngineTiming::ProbeStatus(),
 		stateOk ? (state.lowLatencyAvailable ? "yes" : "no") : "?", stateOk ? (state.latencyReportAvailable ? "yes" : "no") : "?",
 		IsFrameGenerationRequestedNow() ? "yes" : "no", GetFrameGenerationAppliedMultiplier(), streamline.reflexFunctionsReady ? "off" : "on",

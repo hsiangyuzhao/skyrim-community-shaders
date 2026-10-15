@@ -2283,6 +2283,7 @@ void RayTracing::PublishCpuSplit()
 		detail.denoiseGpuMs = denoise;
 		if (activeThisFrame) {
 			detail.prepGpuMs = stats.lastPrepGpuMs;
+			detail.prepWork = stats.lastPrepWork;  // (46p) the same submission's work
 			detail.traceGpuMs = stats.lastTraceGpuMs;
 		}
 		detail.quality = settings.QualityLevel;

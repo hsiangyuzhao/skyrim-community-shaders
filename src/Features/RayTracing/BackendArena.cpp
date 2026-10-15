@@ -199,6 +199,12 @@ namespace RayTracingRT
 		if (FAILED(hr) || !resource)
 			return nullptr;
 		resource->SetName(a_pool.name);
+		// (46p) Counted per owner while it lives (F7 vram_*).
+		{
+			using Owner = Util::FrameTrace::VramOwner;
+			const Owner owner = a_pool.heap == D3D12_HEAP_TYPE_UPLOAD ? Owner::RtUpload : (&a_pool == &asPool_ ? Owner::RtBlas : Owner::RtSkin);
+			Util::FrameTrace::TagVram(resource.Get(), owner, (a_bytes + 0xFFFFull) & ~0xFFFFull);
+		}
 		if (a_pool.heap == D3D12_HEAP_TYPE_UPLOAD) {
 			void* mapped = nullptr;
 			if (FAILED(resource->Map(0, nullptr, &mapped)) || !mapped)
@@ -474,7 +480,7 @@ namespace RayTracingRT
 		if (inBudget() && tlasCapacity_ < 8192 && !EnsureTlas(8192))
 			return;
 		if (a_characters && SkinAvailable() && inBudget() && skinScratchBytes_ < (16ull << 20)) {
-			auto scratch = CreateBuffer(16ull << 20, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+			auto scratch = CreateBuffer(16ull << 20, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true, Util::FrameTrace::VramOwner::RtScratch);
 			if (scratch) {
 				if (skinScratch_)
 					Retire(skinScratch_, skinScratchBytes_, &skinStats_.scratchBytes);
