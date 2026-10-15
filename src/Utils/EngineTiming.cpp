@@ -90,6 +90,112 @@ namespace Util::EngineTiming
 
 		bool OnMainThread() { return g_mainThread != 0 && GetCurrentThreadId() == g_mainThread; }
 
+		// ---- (46n) cs_passes split per pass ----
+		constexpr int kOurPasses = static_cast<int>(Seg::OurPasses);
+		constexpr int kPassBlocks = static_cast<int>(PassBlock::Count);
+		constexpr int kMaxPassKeys = 192;
+		constexpr int kMaxPassDepth = 32;
+		constexpr int kMaxGpuBuckets = 128;
+		constexpr int kMaxScopes = 64;
+
+		struct PassKey
+		{
+			std::string name;            // assigned once, never changed: name.data() stays valid
+			const char* lastPtr = nullptr;  // fast path: the caller's key pointer seen last
+			size_t lastLen = 0;
+			int gpuBucket = -1;
+			bool untimed = false;
+			// this frame
+			int64_t ticks = 0;
+			uint32_t calls = 0;
+			double blockMs[kPassBlocks]{};
+			uint32_t blockCalls[kPassBlocks]{};
+			bool touched = false;
+		};
+		std::array<PassKey, kMaxPassKeys> g_passKeys{};
+		int g_passKeyCount = 0;
+		std::array<int, kMaxPassKeys> g_passTouched{};
+		int g_passTouchedCount = 0;
+		std::array<int, kMaxGpuBuckets> g_gpuPassKey = [] {
+			std::array<int, kMaxGpuBuckets> a{};
+			a.fill(-1);
+			return a;
+		}();
+		std::array<int, kMaxScopes + 1> g_untimedKey = [] {
+			std::array<int, kMaxScopes + 1> a{};
+			a.fill(-1);
+			return a;
+		}();
+
+		struct PassEntry
+		{
+			int key;
+			int engineDepth;  // g_depth when opened: a pop of the engine scope below it closes it
+		};
+		std::array<PassEntry, kMaxPassDepth> g_passStack{};
+		int g_passDepth = 0;
+		uint64_t g_frameId = 0;
+
+		int AddPassKey(std::string a_name, int a_gpuBucket, bool a_untimed)
+		{
+			if (g_passKeyCount >= kMaxPassKeys)
+				return -1;
+			auto& k = g_passKeys[g_passKeyCount];
+			k.name = std::move(a_name);
+			k.gpuBucket = a_gpuBucket;
+			k.untimed = a_untimed;
+			return g_passKeyCount++;
+		}
+
+		int InternPassKey(std::string_view a_key)
+		{
+			for (int i = 0; i < g_passKeyCount; ++i) {
+				auto& k = g_passKeys[i];
+				if (k.lastPtr == a_key.data() && k.lastLen == a_key.size() && k.gpuBucket < 0 && !k.untimed)
+					return i;
+			}
+			for (int i = 0; i < g_passKeyCount; ++i) {
+				auto& k = g_passKeys[i];
+				if (k.gpuBucket < 0 && !k.untimed && k.name == a_key) {
+					k.lastPtr = a_key.data();
+					k.lastLen = a_key.size();
+					return i;
+				}
+			}
+			const int i = AddPassKey(std::string(a_key), -1, false);
+			if (i >= 0) {
+				g_passKeys[i].lastPtr = a_key.data();
+				g_passKeys[i].lastLen = a_key.size();
+			}
+			return i;
+		}
+
+		const char* ScopeName(int a_scope)
+		{
+			switch (static_cast<GpuScope>(a_scope)) {
+			case GpuScope::CsPasses:
+				return "untimed.cs_passes";
+			case GpuScope::CsOther:
+				return "untimed.cs_other";
+			case GpuScope::CsUpscaling:
+				return "untimed.cs_upscaling";
+			default:
+				return nullptr;
+			}
+		}
+
+		/// The pass billed right now: the innermost open pass, else "untimed.<innermost engine scope>".
+		int CurrentPassKey();
+
+		void MarkTouched(int a_key)
+		{
+			auto& k = g_passKeys[a_key];
+			if (!k.touched) {
+				k.touched = true;
+				g_passTouched[g_passTouchedCount++] = a_key;
+			}
+		}
+
 		void SwitchTo(int a_seg, int a_call)
 		{
 			// (46l) The world-render split runs exactly while the main thread is in the world segment.
@@ -103,6 +209,14 @@ namespace Util::EngineTiming
 					g_acc[g_seg] += d;
 					if (g_call >= 0)
 						g_callAcc[g_call] += d;
+					// (46n) cs_passes time goes to the pass open now.
+					if (g_seg == kOurPasses) {
+						const int key = CurrentPassKey();
+						if (key >= 0) {
+							g_passKeys[key].ticks += d;
+							MarkTouched(key);
+						}
+					}
 				}
 				g_last = now;
 			} else {
@@ -110,6 +224,48 @@ namespace Util::EngineTiming
 			}
 			g_seg = a_seg;
 			g_call = a_call;
+		}
+
+		int CurrentPassKey()
+		{
+			if (g_passDepth > 0)
+				return g_passStack[g_passDepth - 1].key;
+			int scope = -1;
+			for (int i = g_depth - 1; i >= 0; --i) {
+				if (g_stack[i].scope >= 0) {
+					scope = g_stack[i].scope;
+					break;
+				}
+			}
+			const int slot = scope >= 0 && scope < kMaxScopes ? scope : kMaxScopes;
+			if (g_untimedKey[slot] < 0) {
+				const char* name = scope >= 0 ? ScopeName(scope) : nullptr;
+				g_untimedKey[slot] = AddPassKey(name ? std::string(name) : std::format("untimed.scope{}", scope), -1, true);
+			}
+			return g_untimedKey[slot];
+		}
+
+		void PushPass(int a_key)
+		{
+			if (a_key < 0 || g_passDepth >= kMaxPassDepth)
+				return;
+			SwitchTo(g_seg, g_call);  // bill the time so far to the pass that was open
+			g_passStack[g_passDepth++] = { a_key, g_depth };
+			++g_passKeys[a_key].calls;
+			MarkTouched(a_key);
+		}
+
+		/// Closes the innermost open pass a_match accepts (and anything opened inside it).
+		template <class Match>
+		void PopPass(Match a_match)
+		{
+			for (int i = g_passDepth - 1; i >= 0; --i) {
+				if (a_match(g_passKeys[g_passStack[i].key])) {
+					SwitchTo(g_seg, g_call);
+					g_passDepth = i;
+					return;
+				}
+			}
 		}
 
 		void Push(int a_scope, Seg a_seg)
@@ -131,8 +287,11 @@ namespace Util::EngineTiming
 			for (int i = g_depth - 1; i >= 0; --i) {
 				if (g_stack[i].scope == a_scope) {
 					const StackEntry e = g_stack[i];
+					SwitchTo(e.seg, e.call);  // (46n) bills the interval before the passes inside are closed
 					g_depth = i;
-					SwitchTo(e.seg, e.call);
+					// (46n) Passes opened inside the popped scope cannot outlive it.
+					while (g_passDepth > 0 && g_passStack[g_passDepth - 1].engineDepth > g_depth)
+						--g_passDepth;
 					return;
 				}
 			}
@@ -218,6 +377,7 @@ namespace Util::EngineTiming
 				if (main) {
 					g_createTicks += d;
 					++g_creates;
+					AddPassBlock(PassBlock::Create, static_cast<double>(d) * g_toMs);  // (46n)
 					if (WorldTiming::On())  // (46l) made inside the world render
 						WorldTiming::AddCreate(index, static_cast<double>(d) * g_toMs);
 				} else {
@@ -445,6 +605,7 @@ namespace Util::EngineTiming
 		g_renderMarked = false;
 		g_depth = 0;
 		g_overflow = 0;
+		g_passDepth = 0;
 		SwitchTo(static_cast<int>(Seg::Logic), -1);
 	}
 
@@ -454,7 +615,75 @@ namespace Util::EngineTiming
 			return;
 		g_depth = 0;
 		g_overflow = 0;
+		g_passDepth = 0;
 		SwitchTo(static_cast<int>(Seg::Outer), -1);
+	}
+
+	// ---- (46n) cs_passes split per pass ----
+
+	void PassBegin(std::string_view a_key)
+	{
+		if (!g_probes || !FrameTrace::Active() || !OnMainThread())
+			return;
+		PushPass(InternPassKey(a_key));
+	}
+
+	void PassEnd(std::string_view a_key)
+	{
+		if (g_passDepth == 0 || !OnMainThread())
+			return;
+		PopPass([a_key](const PassKey& a_k) { return a_k.gpuBucket < 0 && !a_k.untimed && a_k.name == a_key; });
+	}
+
+	void PassBeginGpu(int a_bucket, std::string_view a_name)
+	{
+		if (!g_probes || !FrameTrace::Active() || a_bucket < 0 || a_bucket >= kMaxGpuBuckets || !OnMainThread())
+			return;
+		int& key = g_gpuPassKey[a_bucket];
+		if (key < 0)
+			key = AddPassKey(std::format("g.{}", a_name), a_bucket, false);
+		PushPass(key);
+	}
+
+	void PassEndGpu(int a_bucket)
+	{
+		if (g_passDepth == 0 || !OnMainThread())
+			return;
+		PopPass([a_bucket](const PassKey& a_k) { return a_k.gpuBucket == a_bucket; });
+	}
+
+	void AddPassBlock(PassBlock a_kind, double a_ms)
+	{
+		if (!g_probes || !OnMainThread() || g_seg != kOurPasses)
+			return;
+		const int key = CurrentPassKey();
+		if (key < 0)
+			return;
+		auto& k = g_passKeys[key];
+		k.blockMs[static_cast<int>(a_kind)] += a_ms;
+		++k.blockCalls[static_cast<int>(a_kind)];
+		MarkTouched(key);
+	}
+
+	uint64_t FrameId() { return g_frameId; }
+
+	std::string_view GpuPassName(int a_bucket)
+	{
+		if (a_bucket < 0 || a_bucket >= kMaxGpuBuckets || g_gpuPassKey[a_bucket] < 0)
+			return {};
+		return g_passKeys[g_gpuPassKey[a_bucket]].name;
+	}
+
+	CompileTimer::CompileTimer()
+	{
+		if (g_probes && FrameTrace::Active() && OnMainThread())
+			start = FrameTrace::Now();
+	}
+
+	CompileTimer::~CompileTimer()
+	{
+		if (start)
+			AddPassBlock(PassBlock::Compile, static_cast<double>(FrameTrace::Now() - start) * g_toMs);
 	}
 
 	ScopedSeg::ScopedSeg(Seg a_seg)
@@ -488,15 +717,44 @@ namespace Util::EngineTiming
 
 	bool RenderStartMarked() { return g_renderMarked; }
 
-	Frame TakeFrame(bool a_detail)
+	Frame TakeFrame(bool a_detail, bool a_passWindow)
 	{
 		Frame f;
 		SwitchTo(g_seg, g_call);  // close the open interval at "now"
+		f.id = g_frameId++;
 
 		if (g_probes) {
 			f.valid = true;
 			for (int i = 0; i < kSegCount; ++i)
 				f.ms[i] = static_cast<float>(static_cast<double>(g_acc[i]) * g_toMs);
+			// (46n) cs_passes split: the sum and the untimed part always, the passes when asked for.
+			{
+				double sum = 0.0, untimed = 0.0;
+				const bool list = a_detail && (a_passWindow || f.ms[kOurPasses] > kPassSpikeMs);
+				for (int t = 0; t < g_passTouchedCount; ++t) {
+					const auto& k = g_passKeys[g_passTouched[t]];
+					const double ms = static_cast<double>(k.ticks) * g_toMs;
+					sum += ms;
+					if (k.untimed)
+						untimed += ms;
+					if (list) {
+						PassItem item;
+						item.name = k.name;
+						item.gpuBucket = k.gpuBucket;
+						item.cpuMs = static_cast<float>(ms);
+						item.calls = k.calls;
+						item.untimed = k.untimed;
+						for (int b = 0; b < kPassBlocks; ++b) {
+							item.blockMs[b] = static_cast<float>(k.blockMs[b]);
+							item.blockCalls[b] = k.blockCalls[b];
+						}
+						f.passes.push_back(item);
+					}
+				}
+				f.passSumMs = static_cast<float>(sum);
+				f.passUntimedMs = static_cast<float>(untimed);
+				std::sort(f.passes.begin(), f.passes.end(), [](const PassItem& a_l, const PassItem& a_r) { return a_l.cpuMs > a_r.cpuMs; });
+			}
 			if (g_inputIndex >= 0)
 				f.inputMs = static_cast<float>(static_cast<double>(g_callAcc[g_inputIndex]) * g_toMs);
 			int top = -1;
@@ -530,6 +788,15 @@ namespace Util::EngineTiming
 		g_callAcc.fill(0);
 		g_createTicks = 0;
 		g_creates = 0;
+		for (int t = 0; t < g_passTouchedCount; ++t) {  // (46n)
+			auto& k = g_passKeys[g_passTouched[t]];
+			k.ticks = 0;
+			k.calls = 0;
+			std::fill(std::begin(k.blockMs), std::end(k.blockMs), 0.0);
+			std::fill(std::begin(k.blockCalls), std::end(k.blockCalls), 0u);
+			k.touched = false;
+		}
+		g_passTouchedCount = 0;
 		return f;
 	}
 }

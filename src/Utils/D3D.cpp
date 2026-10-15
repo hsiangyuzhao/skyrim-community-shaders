@@ -3,6 +3,7 @@
 #include "ShaderCache.h"
 #include "State.h"
 #include "Utils/ContentHash.h"
+#include "Utils/EngineTiming.h"
 #include "Utils/Format.h"
 
 #include <d3dcompiler.h>
@@ -229,6 +230,7 @@ namespace Util
 
 	ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const std::vector<std::pair<const char*, const char*>>& Defines, const char* ProgramType, const char* Program)
 	{
+		EngineTiming::CompileTimer compileTimer;  // (46n) billed to the pass that asked for it (F7 trace pass_block "s")
 		auto device = globals::d3d::device;
 
 		CustomInclude include;

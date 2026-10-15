@@ -165,6 +165,8 @@ namespace Util::FrameTrace
 	std::string LocationTag(const Location& a_location);
 	/// A raw GPU frame sample (GpuFrameTimer), for the row of that frame.
 	void OnGpuSample(uint64_t a_gpuFrameIndex, float a_workMs, float a_elapsedMs);
+	/// (46n) One GpuPassTimers interval's GPU ms, for the cs_passes split of the row of frame a_frameId (EngineTiming::FrameId()).
+	void OnPassGpuSample(uint64_t a_frameId, int a_bucket, float a_ms);
 
 	// ---- recorder ------------------------------------------------------------------------------
 

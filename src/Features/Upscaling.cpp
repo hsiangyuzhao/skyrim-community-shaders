@@ -2176,6 +2176,8 @@ void Upscaling::Upscale()
 			DX::ThrowIfFailed(dx12SwapChain.dlssCommandAllocator[frameIndex]->Reset());
 			DX::ThrowIfFailed(dx12SwapChain.dlssCommandList[frameIndex]->Reset(dx12SwapChain.dlssCommandAllocator[frameIndex].get(), nullptr));
 
+			std::optional<Util::EngineTiming::PassScope> streamlinePass;  // (46n) the Streamline evaluate, apart from the copies around it
+			streamlinePass.emplace("Upscaling.Streamline");
 			if (!settings.enableDLSSRR) {
 				streamline.Upscale(
 					dx12SwapChain.inputColorBufferShared12->resource.get(),
@@ -2208,6 +2210,7 @@ void Upscaling::Upscale()
 
 			ID3D12CommandList* commandLists[] = { dx12SwapChain.dlssCommandList[frameIndex].get() };
 			dx12SwapChain.commandQueue->ExecuteCommandLists(1, commandLists);
+			streamlinePass.reset();
 
 			// Wait for D3D12 to finish
 			fence = dx12SwapChain.fenceValue;
@@ -2244,8 +2247,8 @@ void Upscaling::Upscale()
 
 void Upscaling::PerformUpscaling()
 {
-	Upscale();
-	UpscaleDepth();
+	{ Util::EngineTiming::PassScope pass("Upscaling.Upscale"); Upscale(); }  // (46n)
+	{ Util::EngineTiming::PassScope pass("Upscaling.Depth"); UpscaleDepth(); }
 
 	auto& runtimeData = globals::game::graphicsState->GetRuntimeData();
 
@@ -2253,7 +2256,7 @@ void Upscaling::PerformUpscaling()
 	runtimeData.dynamicResolutionLock = 1;
 
 	// Updates the PerFrame constant buffer so that dynamic resolution settings are disabled
-	UpdateCameraData();
+	{ Util::EngineTiming::PassScope pass("Upscaling.CameraData"); UpdateCameraData(); }
 }
 
 void Upscaling::UpscaleDepth()
@@ -2391,6 +2394,7 @@ void Upscaling::MenuManagerDrawInterfaceStartHook::thunk(int64_t a1)
 {
 	{
 		Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsUpscaling);  // (batch 36) timeline row
+		Util::EngineTiming::PassScope pass("Upscaling.PostDisplay");  // (46n)
 		globals::features::upscaling.PostDisplay();
 	}
 	func(a1);
@@ -2406,6 +2410,7 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 
 	auto& postProcessing = globals::features::postProcessing;
 	if (postProcessing.loaded) {
+		Util::EngineTiming::PassScope pass("PostProcessing.BeforeUpscaling");  // (46n)
 		postProcessing.DrawBeforeUpscaling();
 	}
 
@@ -2413,7 +2418,7 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 	auto upscaleMethod = upscaling.GetUpscaleMethod();
 
 	if (upscaling.d3d12SwapChainActive && (upscaling.IsFrameGenerationEnabled() || upscaleMethod == UpscaleMethod::kDLSS))
-		upscaling.CopySharedD3D12Resources();
+		{ Util::EngineTiming::PassScope pass("Upscaling.CopyShared"); upscaling.CopySharedD3D12Resources(); }  // (46n)
 
 	if (upscaling.d3d12SwapChainActive) {
 		dx12SwapChain.upscalingFenceValue++;
@@ -2426,10 +2431,10 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 	// (and releases or rebuilds it), and with "Run before upscaling" on runs it here, on the HDR
 	// scene DLSS is about to read. Inert while Advanced > Batch 38 is off.
 	if (!globals::game::isVR)
-		NeuralRendering::BeforeUpscaling();
+		{ Util::EngineTiming::PassScope pass("NeuralRendering.Before"); NeuralRendering::BeforeUpscaling(); }  // (46n)
 
 	if (upscaleMethod != UpscaleMethod::kNONE && upscaleMethod != UpscaleMethod::kTAA)
-		upscaling.PerformUpscaling();
+		{ Util::EngineTiming::PassScope pass("Upscaling.Perform"); upscaling.PerformUpscaling(); }  // (46n)
 
 	auto imageSpaceManager = RE::ImageSpaceManager::GetSingleton();
 	GET_INSTANCE_MEMBER(BSImagespaceShaderISTemporalAA, imageSpaceManager);
@@ -2437,7 +2442,7 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 	BSImagespaceShaderISTemporalAA->taaEnabled = upscaleMethod == UpscaleMethod::kTAA;
 
 	// (batch 43) Native HDR: the image-space chain draws into an fp16 frame-buffer target.
-	HDROutput::BeginPostProcessing();
+	{ Util::EngineTiming::PassScope pass("HDROutput.Begin"); HDROutput::BeginPostProcessing(); }  // (46n)
 	gpuTimeline->Pop(Util::GpuScope::CsUpscaling);
 	func(a_this, a3, a_target, a_4, a_5);
 	HDROutput::EndPostProcessing(static_cast<int>(a_target));
@@ -2453,7 +2458,7 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
 	// (batch 26b) Neural Rendering takes the scene from the currently bound render target.
 	// (45o) DLSS sharpening (RCAS) runs at the DLSS copy-back, before this.
 	if (!globals::game::isVR)
-		NeuralRendering::ApplyLdr();
+		{ Util::EngineTiming::PassScope pass("NeuralRendering.ApplyLdr"); NeuralRendering::ApplyLdr(); }  // (46n)
 
 	if (upscaling.d3d12SwapChainActive) {
 		dx12SwapChain.upscalingFenceValue++;

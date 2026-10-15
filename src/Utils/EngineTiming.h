@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
+#include <vector>
 
 struct ID3D11Device;
 
@@ -98,9 +100,80 @@ namespace Util::EngineTiming
 	/// start of the frame render (the "Reflex Markers at Render Start" switch, with the probe in place).
 	bool RenderStartMarked();
 
+	// ---- (46n) eng_cs_passes split per pass ----
+	//
+	// Every main-thread millisecond of the cs_passes segment is billed to the innermost open pass:
+	// a CpuPassScope key (feature name), a GpuPassTimers bucket ("g.<bucket>") or a PassScope below.
+	// Time inside the segment with no pass open goes to "untimed.<scope>". The split is exclusive, so
+	// the passes add up to eng_cs_passes. Blocking D3D11 calls, device Create* calls and CompileShader
+	// on the main thread inside the segment are billed to the same pass. Only while FrameTrace::Active()
+	// (overlay on screen or a trace recording); one branch otherwise.
+
+	/// What a pass spent blocked in (all on the main thread, inside cs_passes).
+	enum class PassBlock : int
+	{
+		Map,      ///< Map / Unmap
+		Upload,   ///< CopyResource / CopySubresourceRegion / UpdateSubresource
+		Flush,    ///< Flush
+		Misc,     ///< GetData, Clear*, GenerateMips, ResolveSubresource
+		Submit,   ///< Draw* / Dispatch*
+		Create,   ///< device Create* calls
+		Compile,  ///< Util::CompileShader (disk cache read or compile; includes the Create of the shader)
+		Count
+	};
+
+	void PassBegin(std::string_view a_key);
+	void PassEnd(std::string_view a_key);
+	/// GpuPassTimers buckets (a_bucket = GpuBucket as int, a_name = its enum name).
+	void PassBeginGpu(int a_bucket, std::string_view a_name);
+	void PassEndGpu(int a_bucket);
+	void AddPassBlock(PassBlock a_kind, double a_ms);
+	/// Index of the frame in progress (TakeFrame closes it), for matching late GPU samples to rows.
+	uint64_t FrameId();
+	/// Interned pass name of a GPU bucket ("g.<bucket>"), or empty while it has not run.
+	std::string_view GpuPassName(int a_bucket);
+
+	/// RAII pass for our work that has no CpuPassScope (attribution only, no overlay row). The key must outlive the scope.
+	struct PassScope
+	{
+		explicit PassScope(std::string_view a_key) :
+			key(a_key) { PassBegin(key); }
+		~PassScope() { PassEnd(key); }
+		PassScope(const PassScope&) = delete;
+		PassScope& operator=(const PassScope&) = delete;
+
+	private:
+		std::string_view key;
+	};
+
+	/// Times Util::CompileShader (main thread, while active).
+	struct CompileTimer
+	{
+		CompileTimer();
+		~CompileTimer();
+		CompileTimer(const CompileTimer&) = delete;
+		CompileTimer& operator=(const CompileTimer&) = delete;
+
+	private:
+		int64_t start = 0;
+	};
+
+	struct PassItem
+	{
+		std::string_view name;  ///< interned (lives as long as the process)
+		int gpuBucket = -1;     ///< GpuBucket as int, -1 for CPU-only passes
+		float cpuMs = 0.0f;     ///< exclusive main-thread ms inside cs_passes
+		float gpuMs = -1.0f;    ///< GPU ms of the bucket's intervals this frame (filled in a few frames later; -1 = none)
+		uint32_t calls = 0;     ///< times the pass was opened
+		float blockMs[static_cast<int>(PassBlock::Count)]{};
+		uint32_t blockCalls[static_cast<int>(PassBlock::Count)]{};
+		bool untimed = false;   ///< "untimed.<scope>": cs_passes time with no pass open
+	};
+
 	// ---- per-frame result (FrameTrace::OnPresentEnd) ----
 	struct Frame
 	{
+		uint64_t id = 0;             ///< (46n) FrameId() of this frame
 		bool valid = false;
 		float ms[static_cast<int>(Seg::Count)]{};
 		float inputMs = 0.0f;        ///< the input poll call (BSInputDeviceManager, ID 67315), part of Logic
@@ -114,7 +187,14 @@ namespace Util::EngineTiming
 		uint32_t creates = 0;
 		float createOtherMs = 0.0f;  ///< other threads inside device Create* calls
 		uint32_t createsOther = 0;
+		// (46n) cs_passes split: sum over passes (equals ms[OurPasses]), the untimed part; -1 = not measured.
+		float passSumMs = -1.0f;
+		float passUntimedMs = -1.0f;
+		std::vector<PassItem> passes;  ///< filled only when asked for (see TakeFrame), costliest CPU first
 	};
 	/// Closes the frame (since the previous call) and resets. a_detail: also build callsOver1ms.
-	Frame TakeFrame(bool a_detail);
+	/// (46n) a_passWindow: also list the passes (with a_detail; they are listed too whenever cs_passes > 10 ms).
+	Frame TakeFrame(bool a_detail, bool a_passWindow = false);
+	/// (46n) cs_passes above this lists the passes in the trace and logs the frame.
+	inline constexpr float kPassSpikeMs = 10.0f;
 }

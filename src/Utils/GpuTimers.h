@@ -202,6 +202,7 @@ namespace Util
 			winrt::com_ptr<ID3D11Query> disjoint;
 			winrt::com_ptr<ID3D11Query> start;
 			winrt::com_ptr<ID3D11Query> end;
+			uint64_t traceFrame = 0;  // (46n) EngineTiming::FrameId() at Begin: the trace row the GPU time belongs to
 		};
 
 		struct FrameSlot
@@ -237,7 +238,8 @@ namespace Util
 
 		bool OverlayWantsTimings() const;
 		void AdvanceFrameIfNew();
-		SlotStatus TryCollectSlot(FrameSlot& a_slot, float& a_outMs) const;
+		/// a_outIntervalMs (optional, kMaxIntervalsPerFrame entries): each interval's ms (46n, for the trace).
+		SlotStatus TryCollectSlot(FrameSlot& a_slot, float& a_outMs, float* a_outIntervalMs = nullptr) const;
 		bool EnsureQueries(Interval& a_interval) const;
 
 		Bucket buckets[static_cast<int>(GpuBucket::Count)];

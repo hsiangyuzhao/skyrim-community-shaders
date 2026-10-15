@@ -172,6 +172,12 @@ public:
 		bool LoadingPump = true;
 		float LoadingPumpMs = 8.0f;
 		float BlackWindowMs = 200.0f;
+		// (46n) The destination prepared on the main thread as each cell finishes loading (TESCellFullyLoadedEvent), CellEventMs
+		// per event: the loading screen is presented from another thread, so the per-frame pump never runs behind it. The fade-in
+		// after the loading screen (Fader Menu open, the picture still mostly dark) gets budgets that start large and shrink.
+		bool PrepareOnCellEvents = true;
+		float CellEventMs = 12.0f;
+		bool FadeInBudgets = true;
 		// (46m) Cost switches (Ray Tracing > Diagnostics > Performance), each for an A/B; on = the 46m way, off = 46l's.
 		bool CharactersParallel = true;   // characters' per-actor reads on a few read lanes (joined at the same point of the frame)
 		bool CharactersScanCache = true;  // an actor's 3D is walked in full only when it may have changed (equip, new) and every 8 frames
@@ -456,8 +462,8 @@ private:
 		std::uint32_t shapesAtEnd = 0;
 		bool seen = false;
 	};
-	// [0] loading screen, [1] black screen, [2] visible before the hand-off, [3] the first 3 s after the hand-off.
-	std::array<TransitionPhaseLog, 4> transitionLog{};
+	// [0] loading screen, [1] black screen, [2] (46n) fading in before the hand-off, [3] visible before the hand-off, [4] the first 3 s after it.
+	std::array<TransitionPhaseLog, 5> transitionLog{};
 	int transitionLogSlot = -1;
 	std::int64_t transitionLogEndQpc = 0;
 	std::string handOffSummary;
@@ -488,6 +494,35 @@ private:
 	double pumpCpuTotalMs = 0.0;
 	bool pumpForeignLogged = false;
 	std::int64_t pumpOpenSeen = 0;  // the loading screen the pump counters belong to (TransitionEvents::loadingOpen)
+	// (46n) Preparation on the main thread from TESCellFullyLoadedEvent (behind the loading screen). Counters of this transition.
+	struct CellEventLog
+	{
+		std::uint32_t events = 0;       // events while a loading screen was up and the path was on
+		std::uint32_t steps = 0;        // steps run
+		std::uint32_t skipped = 0;      // steps not run (backend not ready, a D3D11 wait pending, ...)
+		std::uint32_t midTeleport = 0;  // steps run between the teleport's start and finish
+		std::uint32_t cellsCaptured = 0;  // cells the scene took in during the steps (gate: captured)
+		std::uint32_t shapes = 0;       // shapes captured during the steps
+		std::uint64_t builds = 0;       // BLAS built during the steps
+		double cpuMs = 0.0, maxMs = 0.0;
+		std::string lastSkip;
+	};
+	CellEventLog cellEventLog;
+	std::int64_t cellEventOpenSeen = 0;
+	bool cellEventActive = false;     // re-entrancy guard
+	bool cellEventBroken = false;     // a fault in a step: the path stays off for the session
+	std::atomic<std::uint32_t> cellEventForeign{ 0 };  // events on another thread than the world's (nothing done there)
+	std::atomic<bool> cellEventForeignLogged{ false };
+	std::string cellEventFault;       // set by a faulting step (main thread), acted on by the next Prepass
+	/// From OnCellFullyLoaded: one budgeted step on the world's thread while a loading screen is up.
+	void PrepareOnCellEvent();
+	/// The step itself (capture, pools, BLAS builds; D3D12 only, nothing D3D11). Called through an SEH guard.
+	void CellEventStep(float a_budgetMs);
+	static void CellEventStepThunk(void* a_self);
+	float cellEventBudgetMs = 0.0f;
+	/// (46n) The fade-in after the loading screen: 1 for the first second while the Fader Menu is open, then down to 0 at 3 s.
+	[[nodiscard]] float FadeInFactor(double a_sinceCloseMs) const;
+	float lastFadeFactor = 0.0f;
 	bool eventSinksRegistered = false, playerSinkRegistered = false;
 	std::string lastEventsSummary;  // the last transition's events line (page)
 	std::int64_t activeNoBlasSince = 0;  // (46k) status active while no BLAS exists (should never last)

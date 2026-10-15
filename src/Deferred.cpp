@@ -24,6 +24,7 @@
 #include "Hooks.h"
 #include "Utils/Batch37b.h"
 #include "Utils/Batch39Engine.h"
+#include "Utils/EngineTiming.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/OcclusionDryRun.h"
@@ -344,6 +345,7 @@ void Deferred::ReflectionsPrepasses()
 
 	auto state = globals::state;
 
+	Util::EngineTiming::PassScope passScope("Deferred.ReflectionsPrepasses");  // (46n) cs_passes split
 	state->activeReflections = true;
 	{
 		Util::CpuPassScope timer("Shared Data");
@@ -373,6 +375,7 @@ void Deferred::EarlyPrepasses()
 	if (!shaderCache->IsEnabled())
 		return;
 
+	Util::EngineTiming::PassScope passScope("Deferred.EarlyPrepasses");  // (46n) cs_passes split
 	{
 		Util::CpuPassScope timer("Shared Data");
 		globals::state->UpdateSharedData(false, true);
@@ -429,6 +432,7 @@ void Deferred::StartDeferred()
 {
 	// (batch 36) Our setup and prepasses before the opaque pass; the passes among them that
 	// have a GPU Passes row take their own time out of this.
+	Util::EngineTiming::PassScope passScope("Deferred.Start");  // (46n) cs_passes split
 	Util::GpuPhaseTimeline::GetSingleton()->Push(Util::GpuScope::CsOther);
 
 	{
@@ -502,6 +506,7 @@ void Deferred::StartDeferred()
 
 void Deferred::DeferredPasses()
 {
+	Util::EngineTiming::PassScope passScope("Deferred.Passes");  // (46n) cs_passes split
 	{
 		Util::CpuPassScope timer("Upscaling");
 		globals::features::upscaling.CheckFrameConstants();
@@ -730,20 +735,29 @@ void Deferred::EndDeferred()
 
 	{
 		Util::GpuPhaseScope gpuPhase(Util::GpuScope::CsOther);
+		Util::EngineTiming::PassScope passScope("Deferred.End");  // (46n) cs_passes split
 
 		// (batch 37a) Occlusion dry run: max-reduce the finished opaque depth into its own Hi-Z
 		// and queue a readback. Writes only its own textures; a no-op unless the test is running.
-		Util::OcclusionDryRun::OnEndDeferred();
+		{
+			Util::EngineTiming::PassScope pass("Deferred.OcclusionDryRun");
+			Util::OcclusionDryRun::OnEndDeferred();
+		}
 
 		DeferredPasses();  // Perform deferred passes and composite forward buffers
 
 		// (45) Ray Tracing debug views over the lit opaque scene (no-op unless one is selected).
-		if (globals::features::rayTracing.loaded)
+		if (globals::features::rayTracing.loaded) {
+			Util::EngineTiming::PassScope pass("RayTracing.DebugOverlay");
 			globals::features::rayTracing.DrawDebugOverlay();
+		}
 
 		// Measures the lit opaque scene for next frame's shading rates. Our work, so it stays
 		// in the CsOther scope; its dispatches are billed to "our timed passes" by GpuPassTimers.
-		globals::features::variableRateShading.AnalyzeFrame();
+		{
+			Util::EngineTiming::PassScope pass("VariableRateShading.Analyze");
+			globals::features::variableRateShading.AnalyzeFrame();
+		}
 	}
 
 	stateUpdateFlags.set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);  // Run OMSetRenderTargets again

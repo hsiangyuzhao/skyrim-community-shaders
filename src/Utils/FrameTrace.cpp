@@ -155,6 +155,9 @@ namespace Util::FrameTrace
 			uint32_t driverMiscCalls = 0;
 			float mapOtherMs = 0.0f;
 			uint32_t mapOtherCalls = 0;
+			// (46n) Frames since the loading screen closed (0 = first frame after it; -1 = outside the post-load window).
+			int passSinceLoad = -1;
+			bool passLogPending = false;
 		};
 
 		struct ReflexTimes
@@ -165,6 +168,21 @@ namespace Util::FrameTrace
 
 		bool g_recording = false;
 		uint32_t g_worldSpikeLogs = 0;  // (46l) world-spike log lines this recording (capped)
+		// (46n) cs_passes split: the post-load window, GPU samples that arrived before their row, rows waiting to be logged.
+		constexpr int kPassWindowFrames = 120;
+		constexpr size_t kPassLogDelayRows = 8;  // GPU samples come back 1-5 frames late
+		constexpr uint32_t kMaxPassLogs = 300;
+		bool g_loadingWasOpen = false;
+		int g_passSinceLoad = -1;
+		uint32_t g_passLogs = 0;
+		struct PendingPassGpu
+		{
+			uint64_t frame;
+			int bucket;
+			float ms;
+		};
+		std::vector<PendingPassGpu> g_pendingPassGpu;
+		std::vector<size_t> g_passLogQueue;
 		// (45j) Taken when a recording starts (the CSV is written on another thread).
 		std::string g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency;
 		std::string g_headerRendering;  // (46e) upscaler, resolutions, SSRT / SSGI
@@ -179,6 +197,129 @@ namespace Util::FrameTrace
 		std::string g_lastFile;
 
 		double Ms(int64_t a_ticks) { return static_cast<double>(a_ticks) * g_toMs; }
+
+		// ---- (46n) cs_passes split per pass ----
+		constexpr int kPassBlocks = static_cast<int>(EngineTiming::PassBlock::Count);
+		constexpr char kPassBlockLetters[kPassBlocks] = { 'm', 'u', 'f', 'q', 'd', 'c', 's' };
+		static_assert(kPassBlocks == 7);
+
+		std::string PassName(const EngineTiming::PassItem& a_item)
+		{
+			if (!a_item.name.empty())
+				return std::string(a_item.name);
+			return a_item.gpuBucket >= 0 ? std::format("g.bucket{}", a_item.gpuBucket) : std::string("?");
+		}
+
+		void ApplyPassGpu(Row& a_row, int a_bucket, float a_ms)
+		{
+			auto& passes = a_row.engine.passes;
+			if (passes.empty())
+				return;  // the passes of this frame are not listed
+			for (auto& p : passes) {
+				if (p.gpuBucket == a_bucket) {
+					p.gpuMs = (p.gpuMs < 0.0f ? 0.0f : p.gpuMs) + a_ms;
+					return;
+				}
+			}
+			EngineTiming::PassItem item;
+			item.name = EngineTiming::GpuPassName(a_bucket);
+			item.gpuBucket = a_bucket;
+			item.gpuMs = a_ms;
+			passes.push_back(item);
+		}
+
+		/// Blocked ms of a pass (a CompileShader's own shader Create is counted in both c and s; ignored here).
+		float PassBlockTotal(const EngineTiming::PassItem& a_item)
+		{
+			float total = 0.0f;
+			for (int b = 0; b < kPassBlocks; ++b)
+				total += a_item.blockMs[b];
+			return total;
+		}
+
+		/// "name=cpu/gpu;..." costliest CPU first (gpu "-" for passes without GPU timing).
+		std::string FormatPassSplit(const Row& a_row)
+		{
+			std::string out;
+			for (const auto& p : a_row.engine.passes) {
+				if (p.cpuMs < 0.05f && p.gpuMs < 0.05f && PassBlockTotal(p) < 0.05f)
+					continue;
+				out += std::format("{}{}={:.2f}/", out.empty() ? "" : ";", PassName(p), p.cpuMs);
+				out += p.gpuMs < 0.0f ? std::string("-") : std::format("{:.2f}", p.gpuMs);
+			}
+			return out;
+		}
+
+		/// "name:m<ms>x<calls> ...;..." for passes that blocked (m Map, u copies, f Flush, q GetData/Clear, d Draw/Dispatch,
+		/// c Create, s CompileShader).
+		std::string FormatPassBlock(const Row& a_row)
+		{
+			std::string out;
+			for (const auto& p : a_row.engine.passes) {
+				if (PassBlockTotal(p) < 0.02f)
+					continue;
+				std::string parts;
+				for (int b = 0; b < kPassBlocks; ++b) {
+					if (p.blockCalls[b] == 0 || p.blockMs[b] < 0.005f)
+						continue;
+					parts += std::format("{}{}{:.2f}x{}", parts.empty() ? "" : " ", kPassBlockLetters[b], p.blockMs[b], p.blockCalls[b]);
+				}
+				if (!parts.empty())
+					out += std::format("{}{}:{}", out.empty() ? "" : ";", PassName(p), parts);
+			}
+			return out;
+		}
+
+		void LogPassRow(const Row& a_row, size_t a_index)
+		{
+			const auto& e = a_row.engine;
+			std::vector<const EngineTiming::PassItem*> sorted;
+			float block[kPassBlocks]{};
+			uint32_t blockCalls[kPassBlocks]{};
+			const EngineTiming::PassItem* worstBlock = nullptr;
+			for (const auto& p : e.passes) {
+				sorted.push_back(&p);
+				for (int b = 0; b < kPassBlocks; ++b) {
+					block[b] += p.blockMs[b];
+					blockCalls[b] += p.blockCalls[b];
+				}
+				if (!worstBlock || PassBlockTotal(p) > PassBlockTotal(*worstBlock))
+					worstBlock = &p;
+			}
+			std::sort(sorted.begin(), sorted.end(), [](const auto* a_l, const auto* a_r) { return a_l->cpuMs > a_r->cpuMs; });
+			std::string top;
+			for (size_t i = 0; i < sorted.size() && i < 3; ++i) {
+				const auto& p = *sorted[i];
+				top += std::format("{}{} {:.2f}/", top.empty() ? "" : ", ", PassName(p), p.cpuMs);
+				top += p.gpuMs < 0.0f ? std::string("-") : std::format("{:.2f}", p.gpuMs);
+			}
+			using B = EngineTiming::PassBlock;
+			const auto bi = [](B a_b) { return static_cast<int>(a_b); };
+			const std::string where = a_row.passSinceLoad >= 0 ? std::format("{} frames after the loading screen", a_row.passSinceLoad) :
+			                                                     std::string("not right after a loading screen");
+			logger::info("[FrameTrace] Post-load pass spike: top 3 passes (cpu/gpu ms) [{}]; trace frame {} ({}), frame {:.1f} ms, cs_passes {:.1f} ms "
+						 "(passes add up to {:.1f}, untimed {:.2f}); blocking in cs_passes: Map {:.2f} ({}), copies {:.2f} ({}), Flush {:.2f} ({}), "
+						 "GetData/Clear {:.2f} ({}), Draw/Dispatch {:.2f} ({}), Create {:.2f} ({}), CompileShader {:.2f} ({}); most blocked pass {} {:.2f} ms",
+				top, a_index, where, a_row.frameMs, e.ms[static_cast<int>(EngineTiming::Seg::OurPasses)], e.passSumMs, e.passUntimedMs, block[bi(B::Map)],
+				blockCalls[bi(B::Map)], block[bi(B::Upload)], blockCalls[bi(B::Upload)], block[bi(B::Flush)], blockCalls[bi(B::Flush)], block[bi(B::Misc)],
+				blockCalls[bi(B::Misc)], block[bi(B::Submit)], blockCalls[bi(B::Submit)], block[bi(B::Create)], blockCalls[bi(B::Create)],
+				block[bi(B::Compile)], blockCalls[bi(B::Compile)], worstBlock ? PassName(*worstBlock) : std::string("-"),
+				worstBlock ? PassBlockTotal(*worstBlock) : 0.0f);
+		}
+
+		/// Logs the queued spike rows whose GPU samples are in (a_all: every queued row, at the end of a recording).
+		void DrainPassLogs(bool a_all)
+		{
+			size_t done = 0;
+			for (; done < g_passLogQueue.size(); ++done) {
+				const size_t index = g_passLogQueue[done];
+				if (!a_all && index + kPassLogDelayRows >= g_rows.size())
+					break;
+				if (index < g_rows.size())
+					LogPassRow(g_rows[index], index);
+			}
+			g_passLogQueue.erase(g_passLogQueue.begin(), g_passLogQueue.begin() + static_cast<std::ptrdiff_t>(done));
+		}
 
 		bool WantedThisFrame()
 		{
@@ -400,6 +541,14 @@ namespace Util::FrameTrace
 				out << "#   character TLAS instances, rt_skin_dispatches = skinning dispatches. rt_sync_split = 1 when the sun had its own fence (Split Trace\n";
 				out << "#   Sync), 0 not, -1 not traced; rt_sync_sun_gpu_ms / rt_sync_pl_gpu_ms = the game queue's wait for the sun / for the point lights after\n";
 				out << "#   the shadow mask passes (rt_sync_gpu_ms = their sum; not split: rt_sync_sun_gpu_ms = the whole wait, rt_sync_pl_gpu_ms 0).\n";
+				out << "# (46n) pass_* = eng_cs_passes split by our pass (exclusive: the innermost open pass takes the time, so they add up).\n";
+				out << "#   Passes: feature names (the CPU table's keys), g.<bucket> = a GPU Passes bucket (its CPU from Begin to End), Upscaling.* /\n";
+				out << "#   Deferred.* = our hook code, untimed.<scope> = cs_passes time with no pass open. pass_sum_ms = their sum (= eng_cs_passes_ms),\n";
+				out << "#   pass_untimed_ms = the untimed part. pass_since_load = frames since the loading screen closed (0-119, -1 outside).\n";
+				out << "#   pass_split = name=cpu_ms/gpu_ms;... costliest CPU first, listed in that window and on frames with cs_passes > 10 ms (gpu = that\n";
+				out << "#   frame's GPU time of the bucket, '-' = no GPU timer). pass_block = name:<kind><ms>x<calls> for blocking calls on the main thread\n";
+				out << "#   inside the pass: m Map/Unmap, u Copy*/UpdateSubresource, f Flush, q GetData/Clear*/mips/resolve, d Draw/Dispatch, c device Create*,\n";
+				out << "#   s CompileShader (disk cache or compile; its own Create is also in c).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -435,7 +584,7 @@ namespace Util::FrameTrace
 				       "wt_miss_ms,wt_misses,wt_skin_actors,wt_skin_ms,wt_shelter_picks,wt_shelter_ms,wt_water_searches,wt_water_ms,wt_creates,"
 				       "wt_create_ms,wt_tex_creates,wt_view_creates,wt_passes,wt_techniques,wt_materials,wt_setups,wt_groups,wt_stamps,wt_top3,"
 				       "wt_places_over_1ms,driver_misc_ms,driver_misc_calls,map_other_ms,map_other_calls,"
-				       "cpu_top_features\n";
+				       "cpu_top_features,pass_since_load,pass_sum_ms,pass_untimed_ms,pass_split,pass_block\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -494,7 +643,10 @@ namespace Util::FrameTrace
 						s += std::format(",{},{},{:.3f},{},{:.3f},{}", w.top3, w.placesOver1ms, a_row.driverMiscMs, a_row.driverMiscCalls, a_row.mapOtherMs,
 							a_row.mapOtherCalls);
 					}
-					s += "," + a_row.cpuTop + "\n";
+					s += "," + a_row.cpuTop;
+					// (46n) cs_passes split.
+					s += std::format(",{},{:.3f},{:.3f},{},{}\n", a_row.passSinceLoad, a_row.engine.passSumMs, a_row.engine.passUntimedMs, FormatPassSplit(a_row),
+						FormatPassBlock(a_row));
 					return s;
 				};
 				auto engineColumns = [](const Row& a_row) {
@@ -565,6 +717,12 @@ namespace Util::FrameTrace
 					g_frame.driverTotal += ms;
 					if (WorldTiming::On())  // (46l) inside the world render
 						WorldTiming::AddDriverMs(ms);
+					// (46n) Billed to the pass running now (inside cs_passes only).
+					using B = EngineTiming::PassBlock;
+					constexpr B kBlock = C == DriverCall::Map ? B::Map : C == DriverCall::Upload ? B::Upload :
+					                     C == DriverCall::Flush                                  ? B::Flush :
+					                                                                               B::Submit;
+					EngineTiming::AddPassBlock(kBlock, ms);
 				}
 			}
 		};
@@ -587,6 +745,7 @@ namespace Util::FrameTrace
 					++g_frame.driverMiscCalls;
 					if (WorldTiming::On())
 						WorldTiming::AddDriverMs(ms);
+					EngineTiming::AddPassBlock(EngineTiming::PassBlock::Misc, ms);  // (46n)
 				}
 			}
 		};
@@ -1117,6 +1276,24 @@ namespace Util::FrameTrace
 		}
 	}
 
+	void OnPassGpuSample(uint64_t a_frameId, int a_bucket, float a_ms)
+	{
+		if (!g_recording)
+			return;
+		int looked = 0;
+		for (auto it = g_rows.rbegin(); it != g_rows.rend() && looked < 32; ++it, ++looked) {
+			if (it->engine.id == a_frameId) {
+				ApplyPassGpu(*it, a_bucket, a_ms);
+				return;
+			}
+			if (it->engine.id < a_frameId)
+				break;
+		}
+		// The frame's row is not written yet (its own later passes collected it): kept until it is.
+		if ((g_rows.empty() || a_frameId > g_rows.back().engine.id) && g_pendingPassGpu.size() < 4096)
+			g_pendingPassGpu.push_back({ a_frameId, a_bucket, a_ms });
+	}
+
 	void OnPresentEnd(int64_t a_presentStart, uint64_t a_gpuFrameIndex)
 	{
 		const int64_t now = Now();
@@ -1129,8 +1306,24 @@ namespace Util::FrameTrace
 			}
 		}
 
+		// (46n) The post-load window: the first kPassWindowFrames frames after the loading screen closes list
+		// every pass of cs_passes in the trace (frames with cs_passes over kPassSpikeMs always do).
+		bool passWindow = false;
+		if (g_recording) {
+			auto* ui = globals::game::ui;
+			const bool loadingOpen = ui && ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME);
+			if (loadingOpen)
+				g_passSinceLoad = -1;
+			else if (g_loadingWasOpen)
+				g_passSinceLoad = 0;
+			else if (g_passSinceLoad >= 0 && ++g_passSinceLoad >= kPassWindowFrames)
+				g_passSinceLoad = -1;
+			g_loadingWasOpen = loadingOpen;
+			passWindow = g_passSinceLoad >= 0;
+		}
+
 		// (44f) Close the engine CPU split for this frame (also resets it while inactive).
-		const auto engine = EngineTiming::TakeFrame(wasActive && g_recording);
+		const auto engine = EngineTiming::TakeFrame(wasActive && g_recording, passWindow);
 		// (46l) Close the world-render split too (also resets it while not recording).
 		auto world = WorldTiming::TakeFrame(g_recording);
 
@@ -1325,7 +1518,24 @@ namespace Util::FrameTrace
 						w.missMs, w.misses, w.skinMs, w.skinActors, w.shelterMs, w.shelterPicks, w.waterMs, w.waterSearches, w.createMs, w.creates, w.passes,
 						w.techniques, r.draws);
 				}
+				// (46n) cs_passes split: the window, GPU samples that came in early, the spike log (once its GPU samples are in).
+				r.passSinceLoad = passWindow ? g_passSinceLoad : -1;
+				r.passLogPending = engine.valid && engine.ms[static_cast<int>(EngineTiming::Seg::OurPasses)] > EngineTiming::kPassSpikeMs &&
+				                   !engine.passes.empty() && g_passLogs < kMaxPassLogs;
 				g_rows.push_back(r);
+				{
+					auto& row = g_rows.back();
+					std::erase_if(g_pendingPassGpu, [&row](const PendingPassGpu& a_p) {
+						if (a_p.frame == row.engine.id)
+							ApplyPassGpu(row, a_p.bucket, a_p.ms);
+						return a_p.frame <= row.engine.id;
+					});
+					if (row.passLogPending) {
+						++g_passLogs;
+						g_passLogQueue.push_back(g_rows.size() - 1);
+					}
+					DrainPassLogs(false);
+				}
 				if ((++g_reflexPoll & 15) == 0)
 					PollReflex();
 				if (now >= g_recordEnd)
@@ -1346,6 +1556,11 @@ namespace Util::FrameTrace
 			return;
 		g_rows.clear();
 		g_worldSpikeLogs = 0;
+		g_passLogs = 0;  // (46n)
+		g_passLogQueue.clear();
+		g_pendingPassGpu.clear();
+		g_passSinceLoad = -1;
+		g_loadingWasOpen = false;
 		// (44f) "First seen" geometry counts from the start of every recording.
 		g_seenGeometry.clear();
 		g_rows.reserve(static_cast<size_t>(std::clamp(a_seconds, 1.0f, 600.0f) * 250.0f));
@@ -1371,6 +1586,8 @@ namespace Util::FrameTrace
 		if (!g_recording)
 			return;
 		g_recording = false;
+		DrainPassLogs(true);  // (46n) before the rows go to the writer thread
+		g_pendingPassGpu.clear();
 		PollReflex();
 		std::thread(WriteCsv, std::move(g_rows), std::move(g_reflex), g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency, g_headerRendering).detach();
 		g_rows = {};

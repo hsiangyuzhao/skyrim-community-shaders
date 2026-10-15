@@ -4,6 +4,7 @@
 #include "Globals.h"
 #include "Menu.h"
 #include "State.h"
+#include "Utils/EngineTiming.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/FrameTrace.h"
 
@@ -205,7 +206,7 @@ namespace Util
 		return true;
 	}
 
-	GpuPassTimers::SlotStatus GpuPassTimers::TryCollectSlot(FrameSlot& a_slot, float& a_outMs) const
+	GpuPassTimers::SlotStatus GpuPassTimers::TryCollectSlot(FrameSlot& a_slot, float& a_outMs, float* a_outIntervalMs) const
 	{
 		auto context = globals::d3d::context;
 		if (!context)
@@ -251,8 +252,10 @@ namespace Util
 			if (disjointData.Disjoint || disjointData.Frequency == 0)
 				return SlotStatus::Invalid;
 
-			if (t1 > t0)
-				totalMs += static_cast<float>(static_cast<double>(t1 - t0) * 1000.0 / static_cast<double>(disjointData.Frequency));
+			const float intervalMs = t1 > t0 ? static_cast<float>(static_cast<double>(t1 - t0) * 1000.0 / static_cast<double>(disjointData.Frequency)) : 0.0f;
+			totalMs += intervalMs;
+			if (a_outIntervalMs)
+				a_outIntervalMs[i] = intervalMs;
 		}
 
 		a_outMs = totalMs;
@@ -268,7 +271,9 @@ namespace Util
 		const int finishedSlot = writeSlot;
 		writeSlot = (writeSlot + 1) % kFramesInFlight;
 
-		for (auto& bucket : buckets) {
+		const bool tracing = Util::FrameTrace::IsRecording();  // (46n) GPU time per interval to its trace row
+		for (int bucketIndex = 0; bucketIndex < static_cast<int>(GpuBucket::Count); ++bucketIndex) {
+			auto& bucket = buckets[bucketIndex];
 			// Defensive: a Begin whose End never ran must not leak an open D3D11 query pair
 			// into the next frame. This cannot happen through the public API (End always
 			// closes when an interval is open), but a complete pairing per frame is a hard
@@ -298,8 +303,13 @@ namespace Util
 				if (!slot.pending)
 					continue;
 				float sampleMs = 0.0f;
-				switch (TryCollectSlot(slot, sampleMs)) {
+				float intervalMs[kMaxIntervalsPerFrame]{};
+				switch (TryCollectSlot(slot, sampleMs, tracing ? intervalMs : nullptr)) {
 				case SlotStatus::Ready:
+					if (tracing) {
+						for (int i = 0; i < slot.used; ++i)
+							Util::FrameTrace::OnPassGpuSample(slot.intervals[i].traceFrame, bucketIndex, intervalMs[i]);
+					}
 					bucket.smoothedMs = bucket.smoothedMs * kSmoothingOld + sampleMs * kSmoothingNew;
 					bucket.lastSampleIntervals = slot.used;
 					bucket.lastSampleMs = sampleMs;
@@ -354,6 +364,10 @@ namespace Util
 		if (!OverlayWantsTimings())
 			return;
 
+		// (46n) The CPU time from here to End is billed to this bucket in the cs_passes split, whether or not
+		// a query interval can be opened below.
+		EngineTiming::PassBeginGpu(static_cast<int>(a_bucket), magic_enum::enum_name(a_bucket));
+
 		// A query belongs to the device that created it. After a device rebuild the old
 		// queries must never be handed to the new context, so drop everything - including
 		// the smoothed values, which describe a GPU that no longer exists.
@@ -388,6 +402,7 @@ namespace Util
 		context->Begin(interval.disjoint.get());
 		context->End(interval.start.get());  // timestamp queries are issued with End() only
 
+		interval.traceFrame = EngineTiming::FrameId();  // (46n)
 		bucket.openInterval = slot.used;
 		openBucket = static_cast<int>(a_bucket);
 		bucket.lastActiveFrame = frameIndex;
@@ -399,8 +414,10 @@ namespace Util
 	void GpuPassTimers::End(GpuBucket a_bucket)
 	{
 		auto& bucket = buckets[static_cast<int>(a_bucket)];
-		if (bucket.openInterval < 0)
+		if (bucket.openInterval < 0) {
+			EngineTiming::PassEndGpu(static_cast<int>(a_bucket));  // (46n) Begin may have opened the pass without an interval
 			return;  // matching Begin was suppressed (overlay hidden); nothing to close
+		}
 
 		auto& interval = bucket.slots[writeSlot].intervals[bucket.openInterval];
 		if (auto context = globals::d3d::context) {
@@ -412,6 +429,7 @@ namespace Util
 			openBucket = -1;
 
 		GpuPhaseTimeline::GetSingleton()->Pop(GpuScope::CsPasses);
+		EngineTiming::PassEndGpu(static_cast<int>(a_bucket));  // (46n) after the scope, so its tail is billed to the bucket
 	}
 
 	void GpuPassTimers::ForEachActiveBucket(const std::function<void(const BucketReport&)>& a_callback)
@@ -887,6 +905,7 @@ namespace Util
 
 	void CpuPassTimers::Begin(std::string_view a_key)
 	{
+		EngineTiming::PassBegin(a_key);  // (46n) its own gate
 		if (!WantsTimings())
 			return;
 
@@ -912,6 +931,7 @@ namespace Util
 
 	void CpuPassTimers::End(std::string_view a_key)
 	{
+		EngineTiming::PassEnd(a_key);  // (46n)
 		if (openBucket < 0)
 			return;
 
