@@ -496,6 +496,10 @@ private:
 	std::uint32_t latchedWithoutTrace = 0;  // (45e) frames whose shadow map left casters out but that could not trace (should stay 0)
 	bool overVramBudget = false;
 	Status loggedStatus = Status::Off;
+	// (46i) "Loading the scene" for long while playing: one diagnostic line (scene, build queue, pools, phase).
+	std::int64_t waitingSinceQpc = 0;
+	bool waitingLogged = false;
+	void LogStuckWaiting();
 	std::int64_t lastTlasLog = 0;  // (45f) QPC of the last TLAS summary in the log (0 = log on the next active frame)
 	// (45h) Alpha-tested casters (45j: Foliage / Cut-outs): as last seen (a change by the user clears an
 	// old fault) and why they were switched off automatically (shown on the page).

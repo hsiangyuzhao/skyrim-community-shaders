@@ -43,11 +43,15 @@ namespace RayTracingRT
 		constexpr std::uint64_t kMB = 1024ull * 1024ull;
 		constexpr std::uint64_t kBlockGranularity = 64 * 1024;
 		constexpr double kSyncCreateBudgetMs = 8.0;  // render-thread block creation per frame behind loading / black screens
+		constexpr double kIdleReleaseMs = 20000.0;   // (46i) no allocation asked for this long: the pool's empty blocks go
+		constexpr double kMinBlockAgeMs = 3000.0;    // (46i) a new block stays at least this long
+		constexpr double kWaitLogMs = 5000.0;        // (46i) a waiting allocation is logged past this
 	}
 
 	bool GpuArena::Allocate(std::uint64_t a_bytes, ArenaAlloc& o_alloc)
 	{
 		const std::uint64_t size = AlignArena(std::max<std::uint64_t>(a_bytes, alignment), alignment);
+		lastAskQpc = ArenaQpc();  // (46i) in use: empty blocks stay
 		for (std::uint32_t b = 0; b < blocks.size(); ++b) {
 			auto& block = blocks[b];
 			if (!block.live || block.size - block.used < size)
@@ -68,6 +72,8 @@ namespace RayTracingRT
 		}
 		// Does not fit: the next block must hold it (made on the pool thread, or behind a loading screen).
 		wantBytes = std::max(wantBytes, size);
+		if (waitSinceQpc == 0)
+			waitSinceQpc = lastAskQpc;
 		o_alloc = {};
 		return false;
 	}
@@ -123,6 +129,7 @@ namespace RayTracingRT
 		block.size = a_size;
 		block.state = createState;
 		block.free.emplace(0, a_size);
+		block.adoptedQpc = ArenaQpc();
 		block.live = true;
 		reserved += a_size;
 		for (auto& slot : blocks) {
@@ -280,15 +287,44 @@ namespace RayTracingRT
 			}
 		}
 
-		// Empty blocks past twice the headroom go (one per frame, never behind loading screens: the destination is
-		// about to fill them). A pool nothing uses (Ray Tracing off, characters off) gives everything back.
+		// (46i) A waiting allocation in the log (once per wait): the diagnostic for "loading the scene" for ever.
+		const std::int64_t now = ArenaQpc();
+		for (auto* pool : pools) {
+			if (pool->wantBytes == 0) {
+				pool->waitSinceQpc = 0;
+				pool->waitLogged = false;
+				continue;
+			}
+			if (pool->waitSinceQpc == 0)
+				pool->waitSinceQpc = now;
+			const double waitedMs = ArenaQpcToMs(now - pool->waitSinceQpc);
+			if (!pool->waitLogged && waitedMs > kWaitLogMs) {
+				pool->waitLogged = true;
+				logger::warn("[RayTracing] Pool '{}': an allocation of {:.1f} MB has waited {:.0f} ms for a block ({:.0f} MB reserved, {:.0f} MB in use, request in flight {}, "
+							 "failed {}, transition {}, {} blocks released so far)",
+					pool->label, static_cast<double>(pool->wantBytes) / kMB, waitedMs, static_cast<double>(pool->reserved) / kMB,
+					static_cast<double>(pool->used) / kMB, pool->requestInFlight, pool->failed, transition_, ps.blocksReleased);
+			}
+		}
+
+		// Empty blocks past twice the headroom go (one per upkeep, never behind loading screens: the destination is
+		// about to fill them). A pool nothing has used for a while (Ray Tracing off, characters off) gives everything back.
+		// (46i) Never a block adopted moments ago, never while the pool waits for growth: 46g released a pool's only
+		// block in the upkeep that adopted it whenever the pool held no allocation yet (after a switch off / on, or the
+		// upload pool once its last uploads retired) -- the allocation failed again, a new block came, went again: the
+		// build queue waited for ever ("loading the scene").
 		if (!transition_) {
 			for (auto* pool : pools) {
+				if (pool->wantBytes > 0 || pool->requestInFlight)
+					continue;
 				bool released = false;
+				const bool unused = pool->lastAskQpc == 0 || ArenaQpcToMs(now - pool->lastAskQpc) > kIdleReleaseMs;
 				for (auto& block : pool->blocks) {
 					if (!block.live || block.used != 0)
 						continue;
-					const bool idle = pool->used == 0 && pool->wantBytes == 0;
+					if (ArenaQpcToMs(now - block.adoptedQpc) < kMinBlockAgeMs)
+						continue;
+					const bool idle = pool->used == 0 && unused;
 					if (!idle && pool->FreeBytes() < block.size + 2 * pool->headroom)
 						continue;
 					pool->reserved -= std::min(pool->reserved, block.size);
@@ -358,6 +394,47 @@ namespace RayTracingRT
 			std::scoped_lock lock(poolMutex_);
 			poolResults_.push_back(PoolResult{ request.pool, request.bytes, std::move(resource), mapped });
 		}
+	}
+
+	void Backend::OnSwitchedOff()
+	{
+		transition_ = false;
+		for (auto* pool : Pools()) {
+			pool->wantBytes = 0;     // growth for the released scene is not wanted any more (a block in flight is adopted, then goes)
+			pool->lastAskQpc = 0;    // unused from now on: empty blocks go once their ranges are retired
+			pool->waitSinceQpc = 0;
+			pool->waitLogged = false;
+			pool->failed = false;    // switching on again is a fresh attempt
+		}
+	}
+
+	std::string Backend::PoolSummary() const
+	{
+		std::string line;
+		const std::int64_t now = ArenaQpc();
+		for (const auto* pool : Pools()) {
+			std::uint32_t blocks = 0;
+			for (const auto& block : pool->blocks)
+				blocks += block.live ? 1 : 0;
+			line += std::format("{}{} {:.0f}/{:.0f} MB in {} blocks", line.empty() ? "" : ", ", pool->label, static_cast<double>(pool->used) / kMB,
+				static_cast<double>(pool->reserved) / kMB, blocks);
+			if (pool->wantBytes > 0)
+				line += std::format(" (waiting {:.0f} ms for {:.1f} MB{})", pool->waitSinceQpc ? ArenaQpcToMs(now - pool->waitSinceQpc) : 0.0,
+					static_cast<double>(pool->wantBytes) / kMB, pool->requestInFlight ? ", block in the making" : "");
+			if (pool->failed)
+				line += " (failed)";
+		}
+		return line;
+	}
+
+	double Backend::PoolWaitMs() const
+	{
+		const std::int64_t now = ArenaQpc();
+		double waited = 0.0;
+		for (const auto* pool : Pools())
+			if (pool->wantBytes > 0 && pool->waitSinceQpc != 0)
+				waited = std::max(waited, ArenaQpcToMs(now - pool->waitSinceQpc));
+		return waited;
 	}
 
 	void Backend::StopPoolThread()

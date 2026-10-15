@@ -407,6 +407,7 @@ namespace RayTracingRT
 			std::uint64_t used = 0;        // allocated, deferred frees included
 			D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;  // whole-buffer state (pools that transition)
 			std::map<std::uint64_t, std::uint64_t> free;  // offset -> size
+			std::int64_t adoptedQpc = 0;   // (46i) a new block is never given back before it could be used
 			bool live = false;
 		};
 		struct Deferred
@@ -435,6 +436,12 @@ namespace RayTracingRT
 		std::uint64_t wantBytes = 0;         // an allocation that did not fit: the next block must hold it
 		bool requestInFlight = false;
 		bool failed = false;                 // a block could not be created (the owner decides what goes off)
+		// (46i) Idle release: a pool gives its empty blocks back only after no allocation was asked of it for a while
+		// (0 = idle since forever: Ray Tracing switched off). 46g released a block in the same upkeep that adopted it
+		// whenever the pool was empty (nothing allocated yet) -- after a switch off / on the queue waited for ever.
+		std::int64_t lastAskQpc = 0;
+		std::int64_t waitSinceQpc = 0;       // an allocation has been waiting for a block since then (0 = none)
+		bool waitLogged = false;
 
 		bool Allocate(std::uint64_t a_bytes, ArenaAlloc& o_alloc);
 		void Free(const ArenaAlloc& a_alloc, std::uint64_t a_fence, std::uint64_t* a_counter = nullptr, std::uint64_t a_bytes = 0);
@@ -450,6 +457,8 @@ namespace RayTracingRT
 			deferred.clear();
 			reserved = used = wantBytes = 0;
 			requestInFlight = failed = false;
+			lastAskQpc = waitSinceQpc = 0;
+			waitLogged = false;
 		}
 	};
 
@@ -507,6 +516,13 @@ namespace RayTracingRT
 		/// (46g) Behind a loading screen or the black screen after it: the pools grow to their larger headroom on the
 		/// render thread (nothing is visible), scratch / TLAS / per-context buffers are sized ahead (Prewarm).
 		void SetTransition(bool a_transition) { transition_ = a_transition; }
+		/// (46i) Ray Tracing switched off: no transition, the pools forget growth they wanted and give their empty
+		/// blocks back as soon as the released scene's ranges are retired (switching on again starts from clean pools).
+		void OnSwitchedOff();
+		/// (46i) The pools for the log: per pool reserved / used MB, blocks, a waiting allocation, a request in flight.
+		[[nodiscard]] std::string PoolSummary() const;
+		/// (46i) Ms the oldest waiting pool allocation has waited for a block (0 = none waits).
+		[[nodiscard]] double PoolWaitMs() const;
 		/// (46g) Start of a frame: the per-frame pool counters start from zero.
 		void BeginFrame()
 		{
@@ -863,6 +879,7 @@ namespace RayTracingRT
 		std::uint64_t skinUploadsTotal_ = 0;
 		std::vector<std::uint64_t> postbuildOwner_;  // per slot: (handle + 1) of the BLAS that owns it, 0 = none
 		std::array<GpuArena*, 4> Pools() { return { &asPool_, &uploadPool_, &skinStaticPool_, &skinOutputPool_ }; }
+		std::array<const GpuArena*, 4> Pools() const { return { &asPool_, &uploadPool_, &skinStaticPool_, &skinOutputPool_ }; }
 		void InitPools();
 		/// Deferred frees, finished pool-thread blocks, growth requests (sync behind loading / black screens), empty
 		/// blocks released. Every frame from CollectRetired.

@@ -306,8 +306,10 @@ namespace RayTracingScene
 		void SetTransition(bool a_on)
 		{
 			transition_ = a_on;
-			if (!a_on)
+			if (!a_on) {
 				departing_.clear();
+				departingPending_ = false;  // (46i) nor taken on a later flush (a switch-off inside a transition)
+			}
 		}
 		[[nodiscard]] std::uint32_t DepartingSkipped() const { return departingSkipped_; }
 

@@ -1401,8 +1401,19 @@ void RayTracing::Prepass()
 			}
 			RayTracingCasterFilter::Clear();
 			characters.ReleaseAll(backend);  // (45i)
-			if (backend.IsReady())
+			if (backend.IsReady()) {
 				scene.ReleaseAll(backend);
+				backend.OnSwitchedOff();  // (46i) clean pools for the next switch-on (see GpuArena::lastAskQpc)
+			}
+			// (46i) Switching on again starts like a fresh entry: the interior's entry time, the beam guards of
+			// this place, the stuck-state diagnostic.
+			interiorCell = nullptr;
+			interiorReadyPending = false;
+			interiorSceneLogPending = false;
+			beamGuards.clear();
+			excludedBeams.clear();
+			waitingSinceQpc = 0;
+			waitingLogged = false;
 			status = Status::Off;
 			statusReason.clear();
 			lastTlasLog = 0;
@@ -1502,6 +1513,7 @@ void RayTracing::ReportFrame()
 			static_cast<double>(stats.blasBytes + stats.scratchBytes + stats.tlasBytes) / (1024.0 * 1024.0));
 		loggedStatus = status;
 	}
+	LogStuckWaiting();  // (46i)
 	lastCpuMs += earlyCpuMs;  // (45n) the frame-start part (Early Prep) belongs to this frame too
 	TransitionLogFrame(lastCpuMs);  // (46g)
 	traceSample.cpuMs = lastCpuMs;
@@ -1510,6 +1522,32 @@ void RayTracing::ReportFrame()
 	traceSample.instances = activeThisFrame ? stats.instancesLastFrame : 0;
 	Util::FrameTrace::OnRayTracing(traceSample.gpuMs, traceSample.cpuMs, traceSample.builds);
 	PublishCpuSplit();
+}
+
+void RayTracing::LogStuckWaiting()
+{
+	// (46i) On, playing (no loading screen involved), and still nothing traced after 10 s: one line that says what
+	// the scene waits for (cells, the build queue, the GPU pools, the hand-off). Logged once per wait.
+	if (!settings.Enabled || status != Status::Waiting || inTransition || phase != Phase::Play) {
+		waitingSinceQpc = 0;
+		waitingLogged = false;
+		return;
+	}
+	const std::int64_t now = Qpc();
+	if (waitingSinceQpc == 0) {
+		waitingSinceQpc = now;
+		return;
+	}
+	const double waitedMs = static_cast<double>(now - waitingSinceQpc) * QpcMs();
+	if (waitingLogged || waitedMs < 10000.0)
+		return;
+	waitingLogged = true;
+	const auto& sc = scene.GetStats();
+	const auto& st = backend.GetStats();
+	logger::warn("[RayTracing] Still loading the scene after {:.0f} s ({}): cells {} tracked, {} gathering, {} complete, {} shapes; {} BLAS built, {} queued, "
+				 "{} character shapes waiting; hold {}, handed off {}, interior {}; pools: {}",
+		waitedMs / 1000.0, statusReason, sc.cellsTracked, sc.cellsGathering, sc.cellsComplete, sc.shapes, st.blasCount, backend.QueuedBuilds(),
+		backend.PendingSkinUploads(), scene.Held(), handedOff, Util::IsInterior(), backend.IsReady() ? backend.PoolSummary() : std::string("-"));
 }
 
 void RayTracing::PublishCpuSplit()
@@ -3312,10 +3350,10 @@ void RayTracing::LogInteriorProgress(bool a_covered)
 	auto* tes = RE::TES::GetSingleton();
 	const auto* cell = tes ? tes->interiorCell : nullptr;
 	logger::info("[RayTracing] Interior capture: {:.0f} ms after entering; cell {} ({}), scene interior {}, cells {} ({} gathering, {} complete), {} shapes, "
-				 "{} BLAS built, {} queued, phase {}",
+				 "{} BLAS built, {} queued, phase {}; pools: {}",
 		static_cast<double>(now - interiorEntryQpc) * QpcMs(), cell ? std::format("{:08X}", cell->GetFormID()) : std::string("none"),
 		cell ? (cell->IsAttached() ? "attached" : "not attached") : "-", scene.InteriorEnabled() ? "on" : "off", sc.cellsTracked, sc.cellsGathering,
-		sc.cellsComplete, sc.interiorShapes, st.blasCount, st.blasQueued, static_cast<int>(phase));
+		sc.cellsComplete, sc.interiorShapes, st.blasCount, st.blasQueued, static_cast<int>(phase), backend.PoolSummary());
 }
 
 void RayTracing::WritePointMask(bool a_traced)
