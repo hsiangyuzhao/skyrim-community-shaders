@@ -2,6 +2,8 @@
 
 #include <d3dcompiler.h>
 #include <fstream>
+#include <map>
+#include <set>
 
 #include "Deferred.h"
 #include "State.h"
@@ -1312,15 +1314,21 @@ namespace SIE
 			mapBufferConsts("PerGeometry", bufferSizes[2]);
 		}
 
-		std::wstring GetDiskPath(const std::string_view& name, uint32_t descriptor, ShaderClass shaderClass)
+		/**
+		 * @brief (46j) Disk-cache file of one shader: `<descriptor>-<inputs hash>`, where the hash covers every define,
+		 * the flags and the compiler (see DiskInputsHash). A shader whose defines changed (a C++ mapping change, a
+		 * setting-driven define, VR, Developer Mode) therefore never reuses an old file.
+		 */
+		static std::wstring GetDiskPath(const std::string_view& name, uint32_t descriptor, ShaderClass shaderClass, uint64_t inputsHash)
 		{
+			const std::wstring directory(name.begin(), name.end());
 			switch (shaderClass) {
 			case ShaderClass::Pixel:
-				return std::format(L"Data/ShaderCache/{}/{:X}.pso", std::wstring(name.begin(), name.end()), descriptor);
+				return std::format(L"Data/ShaderCache/{}/{:X}-{:016X}.pso", directory, descriptor, inputsHash);
 			case ShaderClass::Vertex:
-				return std::format(L"Data/ShaderCache/{}/{:X}.vso", std::wstring(name.begin(), name.end()), descriptor);
+				return std::format(L"Data/ShaderCache/{}/{:X}-{:016X}.vso", directory, descriptor, inputsHash);
 			case ShaderClass::Compute:
-				return std::format(L"Data/ShaderCache/{}/{:X}.cso", std::wstring(name.begin(), name.end()), descriptor);
+				return std::format(L"Data/ShaderCache/{}/{:X}-{:016X}.cso", directory, descriptor, inputsHash);
 			}
 			return {};
 		}
@@ -1446,6 +1454,482 @@ namespace SIE
 			return Util::ContentHash::CombineHashes(a_key, Util::ContentHash::HashString(context));
 		}
 
+		/** @brief The full define list a shader compiles with: class, Developer Mode, VR, user defines, then the descriptor's own. */
+		static void BuildCompileDefines(ShaderClass a_class, const RE::BSShader& a_shader, uint32_t a_descriptor, std::array<D3D_SHADER_MACRO, 64>& a_defines)
+		{
+			size_t lastIndex = 0;
+			if (a_class == ShaderClass::Vertex) {
+				a_defines[lastIndex++] = { "VSHADER", nullptr };
+			} else if (a_class == ShaderClass::Pixel) {
+				a_defines[lastIndex++] = { "PSHADER", nullptr };
+			} else if (a_class == ShaderClass::Compute) {
+				a_defines[lastIndex++] = { "CSHADER", nullptr };
+			}
+			if (globals::state->IsDeveloperMode()) {
+				a_defines[lastIndex++] = { "D3DCOMPILE_SKIP_OPTIMIZATION", nullptr };
+				a_defines[lastIndex++] = { "D3DCOMPILE_DEBUG", nullptr };
+			}
+			if (REL::Module::IsVR())
+				a_defines[lastIndex++] = { "VR", nullptr };
+			auto shaderDefines = globals::state->GetDefines();
+			for (const auto& [name, definition] : *shaderDefines)
+				a_defines[lastIndex++] = { name.c_str(), definition.c_str() };
+			a_defines[lastIndex] = { nullptr, nullptr };  // do final entry
+			GetShaderDefines(a_shader, a_descriptor, std::span{ a_defines }.subspan(lastIndex));
+		}
+
+		/** @brief Compile flags; release disk-cache compiles skip fxc's validation pass on its own output (44j, upstream). */
+		static uint32_t GetCompileFlags(bool a_useDiskCache)
+		{
+			uint32_t flags = !globals::state->IsDeveloperMode() ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : D3DCOMPILE_DEBUG;
+			if (a_useDiskCache && !globals::state->IsDeveloperMode())
+				flags |= D3DCOMPILE_SKIP_VALIDATION;
+			return flags;
+		}
+
+		/**
+		 * @brief (46j) Hash of everything besides the source that decides a blob: every define (name and value, in
+		 * order), the profile, the flags and the compiler. Zero when hashing failed; the caller then skips the disk cache.
+		 */
+		static uint64_t DiskInputsHash(ShaderClass a_class, const D3D_SHADER_MACRO* a_defines, uint32_t a_flags)
+		{
+			Util::ContentHash::Sha256 sha;
+			sha.UpdateField("cs-fork-disk-v1");
+			sha.UpdateField(GetShaderProfile(a_class));
+			sha.UpdateField(std::format("{:X}", a_flags));
+			sha.UpdateField(GetCompilerIdentity());
+			for (const auto* define = a_defines; define && define->Name; ++define) {
+				sha.UpdateField(define->Name);
+				sha.UpdateField(define->Definition ? "=" : "-");
+				sha.UpdateField(define->Definition ? define->Definition : "");
+			}
+			const auto hash = sha.Finish128();
+			return hash.high ^ hash.low;
+		}
+
+		/** @brief Disk-cache file for these compile inputs, or empty when they cannot be hashed. */
+		static std::wstring GetDiskPathForInputs(const std::string_view& a_name, uint32_t a_descriptor, ShaderClass a_class, const D3D_SHADER_MACRO* a_defines, uint32_t a_flags)
+		{
+			const auto inputsHash = DiskInputsHash(a_class, a_defines, a_flags);
+			return inputsHash ? GetDiskPath(a_name, a_descriptor, a_class, inputsHash) : std::wstring{};
+		}
+
+		std::wstring GetDiskCachePath(ShaderClass shaderClass, const RE::BSShader& shader, uint32_t descriptor)
+		{
+			if (!ResolveImageSpaceDescriptor(shader, descriptor))
+				return {};
+			std::array<D3D_SHADER_MACRO, 64> defines{};
+			BuildCompileDefines(shaderClass, shader, descriptor, defines);
+			return GetDiskPathForInputs(shader.fxpFilename, descriptor, shaderClass, defines.data(), GetCompileFlags(true));
+		}
+
+		static uint64_t ElapsedNs(std::chrono::steady_clock::time_point a_start)
+		{
+			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - a_start).count());
+		}
+
+		/**
+		 * @brief (46j) Per-type invalidation of the disk cache.
+		 *
+		 * Every type directory (Data/ShaderCache/<fxpFilename>) holds a stamp listing the source files its blobs were
+		 * built from, each with the fingerprint of its include closure. At startup a directory is kept only when every
+		 * listed source still has the same fingerprint; anything else (no stamp, unreadable source, changed closure)
+		 * deletes the directory. The closure comes from a textual scan of #include lines that ignores #if, and resolves
+		 * each include at every place the include handlers may look, so it can only be larger than what a compile
+		 * reads. An include found nowhere is hashed as missing, so the file appearing later also counts as a change.
+		 *
+		 * Fingerprints are computed once per session and kept (a startup snapshot): a stamp written later in the
+		 * session still describes the sources as they were at startup, so a mid-session edit can only cause an extra
+		 * invalidation on the next launch, never a stale hit.
+		 */
+		namespace SourceStamps
+		{
+			constexpr std::string_view kStampHeader = "cs-source-stamp-v1";
+			constexpr std::wstring_view kStampName = L"Sources.stamp";
+			constexpr std::wstring_view kCompileShaderDir = L"CompileShader";
+			/** CompileShader entries are keyed by their preprocessed source, so they stay valid; this only bounds the folder. */
+			constexpr uintmax_t kCompileShaderMaxBytes = 32ull << 20;
+
+			static const std::filesystem::path& ShaderRoot()
+			{
+				static const std::filesystem::path root(L"Data/Shaders");
+				return root;
+			}
+
+			static const std::filesystem::path& CacheRoot()
+			{
+				static const std::filesystem::path root(L"Data/ShaderCache");
+				return root;
+			}
+
+			/** @brief Normalised, lower-case, forward-slash UTF-8 path: one key per file however it was spelled. */
+			static std::string PathKey(const std::filesystem::path& a_path)
+			{
+				auto key = Util::WStringToString(a_path.lexically_normal().generic_wstring());
+				std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+				return key;
+			}
+
+			struct FileInfo
+			{
+				bool readable = false;
+				std::array<uint8_t, 32> digest{};
+				std::vector<std::string> includes;  ///< An empty name marks an include the scan cannot resolve (e.g. a macro).
+			};
+
+			static std::mutex fingerprintMutex;                                // guards the three maps below
+			static std::unordered_map<std::string, FileInfo> fileInfos;        // file key -> contents digest and includes
+			static std::unordered_map<std::string, bool> fileExists;           // file key -> is a regular file
+			static std::unordered_map<std::string, std::string> fingerprints;  // source key -> closure fingerprint ("" = unavailable)
+
+			static std::mutex stampMutex;                                                            // guards stampedDirs
+			static std::unordered_map<std::string, std::map<std::string, std::string>> stampedDirs;  // dir key -> source key -> fingerprint, as on disk
+
+			/** @brief Names of every `#include "..."` / `#include <...>` line; conditionals are ignored on purpose. */
+			static std::vector<std::string> ParseIncludes(std::string_view a_text)
+			{
+				std::vector<std::string> result;
+				size_t pos = 0;
+				while (pos < a_text.size()) {
+					size_t end = a_text.find('\n', pos);
+					if (end == std::string_view::npos)
+						end = a_text.size();
+					const auto line = a_text.substr(pos, end - pos);
+					pos = end + 1;
+					size_t i = 0;
+					const auto skipSpace = [&] {
+						while (i < line.size() && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r'))
+							++i;
+					};
+					skipSpace();
+					if (i >= line.size() || line[i] != '#')
+						continue;
+					++i;
+					skipSpace();
+					if (line.substr(i, 7) != "include")
+						continue;
+					i += 7;
+					if (i < line.size() && (std::isalnum(static_cast<unsigned char>(line[i])) || line[i] == '_'))
+						continue;  // another directive that starts with "include"
+					skipSpace();
+					const char open = i < line.size() ? line[i] : '\0';
+					const char close = open == '"' ? '"' : (open == '<' ? '>' : '\0');
+					const auto stop = close ? line.find(close, i + 1) : std::string_view::npos;
+					if (stop == std::string_view::npos || stop == i + 1)
+						result.emplace_back();  // not a plain file name: the closure cannot be known
+					else
+						result.emplace_back(line.substr(i + 1, stop - i - 1));
+				}
+				return result;
+			}
+
+			/** @brief Reads and digests one file once per session. Caller holds fingerprintMutex. */
+			static const FileInfo& LoadFileInfo(const std::filesystem::path& a_path, const std::string& a_key)
+			{
+				auto [it, inserted] = fileInfos.try_emplace(a_key);
+				if (inserted) {
+					std::ifstream ifs(a_path, std::ios::binary);
+					if (ifs) {
+						const std::string contents((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+						if (!ifs.bad()) {
+							Util::ContentHash::Sha256 sha;
+							sha.Update(contents);
+							if (sha.Finish(it->second.digest)) {
+								it->second.readable = true;
+								it->second.includes = ParseIncludes(contents);
+							}
+						}
+					}
+				}
+				return it->second;
+			}
+
+			/** @brief Caller holds fingerprintMutex. */
+			static bool IsFile(const std::filesystem::path& a_path, const std::string& a_key)
+			{
+				auto [it, inserted] = fileExists.try_emplace(a_key, false);
+				if (inserted) {
+					std::error_code ec;
+					it->second = std::filesystem::is_regular_file(a_path, ec);
+				}
+				return it->second;
+			}
+
+			/** @brief "<file count>:<sha256>" over the include closure of a source, or empty when it cannot be determined. Caller holds fingerprintMutex. */
+			static std::string ComputeClosureFingerprint(const std::filesystem::path& a_source)
+			{
+				try {
+					if (!IsFile(a_source, PathKey(a_source)))
+						return {};
+					std::map<std::string, const FileInfo*> files;  // sorted, so the hash does not depend on traversal order
+					std::set<std::string> missing;
+					std::vector<std::filesystem::path> pending{ a_source };
+					while (!pending.empty()) {
+						const auto path = std::move(pending.back());
+						pending.pop_back();
+						const auto key = PathKey(path);
+						if (files.contains(key))
+							continue;
+						const auto& info = LoadFileInfo(path, key);
+						if (!info.readable)
+							return {};
+						files.emplace(key, &info);
+						const auto parentDir = path.parent_path();
+						for (const auto& name : info.includes) {
+							if (name.empty())
+								return {};
+							const std::filesystem::path includePath(name);
+							std::vector<std::filesystem::path> candidates;
+							if (includePath.is_absolute()) {
+								candidates.push_back(includePath);
+							} else {
+								// Every place ShaderIncludeHandler or D3D_COMPILE_STANDARD_FILE_INCLUDE may look.
+								candidates.push_back(ShaderRoot() / includePath);
+								candidates.push_back(parentDir / includePath);
+								candidates.push_back(includePath);
+							}
+							bool found = false;
+							for (auto& candidate : candidates) {
+								const auto candidateKey = PathKey(candidate);
+								if (!IsFile(candidate, candidateKey))
+									continue;
+								found = true;
+								if (!files.contains(candidateKey))
+									pending.push_back(std::move(candidate));
+							}
+							if (!found)
+								missing.insert(PathKey(parentDir) + "|" + PathKey(includePath));
+						}
+					}
+					Util::ContentHash::Sha256 sha;
+					sha.UpdateField("cs-source-closure-v1");
+					for (const auto& [key, info] : files) {
+						sha.UpdateField(key);
+						sha.Update(info->digest.data(), info->digest.size());
+					}
+					for (const auto& entry : missing) {
+						sha.UpdateField("missing");
+						sha.UpdateField(entry);
+					}
+					std::array<uint8_t, 32> digest{};
+					if (!sha.Finish(digest))
+						return {};
+					std::string hex;
+					hex.reserve(digest.size() * 2);
+					for (const auto byte : digest)
+						hex += std::format("{:02x}", byte);
+					return std::format("{}:{}", files.size(), hex);
+				} catch (...) {
+					return {};
+				}
+			}
+
+			/** @brief The session's fingerprint of a source's include closure (computed on first use, then kept). */
+			static std::string GetSourceFingerprint(const std::filesystem::path& a_source)
+			{
+				std::scoped_lock lock(fingerprintMutex);
+				const auto key = PathKey(a_source);
+				if (const auto it = fingerprints.find(key); it != fingerprints.end())
+					return it->second;
+				auto fingerprint = ComputeClosureFingerprint(a_source);
+				fingerprints.emplace(key, fingerprint);
+				return fingerprint;
+			}
+
+			/** @brief Fingerprints every top-level shader source now, so later stamps describe the files as they were at startup. */
+			static size_t SnapshotSources()
+			{
+				std::vector<std::filesystem::path> sources;
+				std::error_code ec;
+				for (std::filesystem::directory_iterator it(ShaderRoot(), ec), end; !ec && it != end; it.increment(ec)) {
+					auto extension = it->path().extension().wstring();
+					std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
+					if (extension == L".hlsl" && it->is_regular_file(ec))
+						sources.push_back(ShaderRoot() / it->path().filename());
+				}
+				for (const auto& source : sources)
+					GetSourceFingerprint(source);
+				std::scoped_lock lock(fingerprintMutex);
+				return fileInfos.size();
+			}
+
+			static bool ReadStamp(const std::filesystem::path& a_dir, std::map<std::string, std::string>& a_sources)
+			{
+				std::ifstream ifs(a_dir / kStampName, std::ios::binary);
+				if (!ifs)
+					return false;
+				const auto trim = [](std::string& line) {
+					while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+						line.pop_back();
+				};
+				std::string line;
+				if (!std::getline(ifs, line))
+					return false;
+				trim(line);
+				if (line != kStampHeader)
+					return false;
+				while (std::getline(ifs, line)) {
+					trim(line);
+					if (line.empty())
+						continue;
+					const auto tab = line.find('\t');
+					if (tab == std::string::npos || tab == 0 || tab + 1 >= line.size())
+						return false;
+					a_sources[line.substr(tab + 1)] = line.substr(0, tab);
+				}
+				return !a_sources.empty();
+			}
+
+			static bool WriteStamp(const std::filesystem::path& a_dir, const std::map<std::string, std::string>& a_sources)
+			{
+				std::string text(kStampHeader);
+				text += '\n';
+				for (const auto& [source, fingerprint] : a_sources)
+					text += std::format("{}\t{}\n", fingerprint, source);
+				const auto stampPath = a_dir / kStampName;
+				const auto tempPath = a_dir / std::format(L"{}.{}-{}.tmp", kStampName, GetCurrentProcessId(), GetCurrentThreadId());
+				std::error_code ec;
+				{
+					std::ofstream ofs(tempPath, std::ios::binary | std::ios::trunc);
+					if (!ofs || !ofs.write(text.data(), static_cast<std::streamsize>(text.size()))) {
+						ofs.close();
+						std::filesystem::remove(tempPath, ec);
+						return false;
+					}
+				}
+				std::filesystem::rename(tempPath, stampPath, ec);
+				if (ec) {
+					std::filesystem::remove(tempPath, ec);
+					return false;
+				}
+				return true;
+			}
+
+			/**
+			 * @brief Makes sure the type directory's stamp lists this source before a blob built from it is written.
+			 * @return false when the source cannot be fingerprinted or the stamp cannot be written: the blob must not be cached.
+			 */
+			static bool EnsureStamp(const std::string_view& a_dirName, const std::filesystem::path& a_source)
+			{
+				std::scoped_lock lock(stampMutex);
+				const auto dir = CacheRoot() / std::wstring(a_dirName.begin(), a_dirName.end());
+				auto& sources = stampedDirs[PathKey(dir)];
+				const auto sourceKey = PathKey(a_source);
+				if (sources.contains(sourceKey))
+					return true;
+				const auto fingerprint = GetSourceFingerprint(a_source);
+				if (fingerprint.empty())
+					return false;
+				std::error_code ec;
+				std::filesystem::create_directories(dir, ec);
+				auto updated = sources;
+				updated[sourceKey] = fingerprint;
+				if (!WriteStamp(dir, updated))
+					return false;
+				sources = std::move(updated);
+				return true;
+			}
+
+			/** @brief Forgets which directories carry a stamp; call after deleting type directories. */
+			static void ForgetStamps()
+			{
+				std::scoped_lock lock(stampMutex);
+				stampedDirs.clear();
+			}
+
+			/** @brief Counts blobs in a type directory and removes temp files a crash left behind. */
+			static size_t CountBlobs(const std::filesystem::path& a_dir, uintmax_t* a_bytes = nullptr)
+			{
+				size_t blobs = 0;
+				std::error_code ec;
+				for (std::filesystem::directory_iterator it(a_dir, ec), end; !ec && it != end; it.increment(ec)) {
+					std::error_code fileError;
+					if (!it->is_regular_file(fileError))
+						continue;
+					auto extension = it->path().extension().wstring();
+					std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
+					if (extension == L".tmp") {
+						std::filesystem::remove(it->path(), fileError);
+						continue;
+					}
+					if (a_bytes) {
+						const auto size = it->file_size(fileError);
+						if (!fileError)
+							*a_bytes += size;
+					}
+					if (extension == L".pso" || extension == L".vso" || extension == L".cso")
+						++blobs;
+				}
+				return blobs;
+			}
+
+			/** @brief Keeps or drops every type directory on its own; logs one line per directory. */
+			static void ValidateTypeDirectories()
+			{
+				std::error_code ec;
+				std::vector<std::filesystem::path> dirs;
+				for (std::filesystem::directory_iterator it(CacheRoot(), ec), end; !ec && it != end; it.increment(ec)) {
+					std::error_code dirError;
+					if (it->is_directory(dirError))
+						dirs.push_back(CacheRoot() / it->path().filename());
+				}
+				size_t keptDirs = 0, keptBlobs = 0, droppedDirs = 0, droppedBlobs = 0;
+				for (const auto& dir : dirs) {
+					const auto dirName = dir.filename().wstring();
+					const auto displayName = Util::WStringToString(dirName);
+					if (dirName == Util::ShaderContentStore::kDirName)
+						continue;
+					if (dirName == kCompileShaderDir) {
+						uintmax_t bytes = 0;
+						const auto blobs = CountBlobs(dir, &bytes);
+						if (bytes > kCompileShaderMaxBytes) {
+							std::filesystem::remove_all(dir, ec);
+							logger::info("Disk cache [{}]: dropped {} shaders ({} MB over the {} MB limit)", displayName, blobs, bytes >> 20, kCompileShaderMaxBytes >> 20);
+						} else {
+							logger::info("Disk cache [{}]: kept {} shaders (keyed by their own preprocessed source)", displayName, blobs);
+						}
+						continue;
+					}
+					const auto blobs = CountBlobs(dir);
+					std::map<std::string, std::string> recorded;
+					std::string reason;
+					if (!ReadStamp(dir, recorded)) {
+						reason = "no source record";
+					} else {
+						for (const auto& [source, fingerprint] : recorded) {
+							const auto current = GetSourceFingerprint(std::filesystem::path(source));
+							if (current.empty()) {
+								reason = std::format("cannot fingerprint {}", source);
+								break;
+							}
+							if (current != fingerprint) {
+								reason = std::format("{} or its includes changed", source);
+								break;
+							}
+						}
+					}
+					if (reason.empty()) {
+						{
+							std::scoped_lock lock(stampMutex);
+							stampedDirs[PathKey(dir)] = std::move(recorded);
+						}
+						++keptDirs;
+						keptBlobs += blobs;
+						logger::info("Disk cache [{}]: kept {} shaders", displayName, blobs);
+					} else {
+						std::error_code removeError;
+						std::filesystem::remove_all(dir, removeError);
+						if (removeError)
+							logger::warn("Disk cache [{}]: failed to delete: {}", displayName, removeError.message());
+						++droppedDirs;
+						droppedBlobs += blobs;
+						logger::info("Disk cache [{}]: invalidated {} shaders ({})", displayName, blobs, reason);
+					}
+				}
+				logger::info("Disk cache: kept {} shaders in {} type folders, invalidated {} shaders in {} type folders", keptBlobs, keptDirs, droppedBlobs, droppedDirs);
+			}
+		}
+
 		/** @brief Absolute store path as UTF-8, for logs and the menu; `path::string()` throws on characters outside the ANSI code page. */
 		static std::string ContentStoreDisplayPath()
 		{
@@ -1505,6 +1989,9 @@ namespace SIE
 			std::string source;                                 ///< The preprocessed code the key was built from; empty if preprocessing failed.
 			bool compileFailed = false;                         ///< An identical compile already failed; skip compiling.
 			bool fromStore = false;                             ///< `blob` came from the persistent content store.
+			uint64_t preprocessNs = 0;                          ///< (46j, B0) source read, preprocess and key hashing
+			uint64_t waitNs = 0;                                ///< (46j, B0) joining an identical compile from this session
+			uint64_t storeNs = 0;                               ///< (46j, B0) content-store lookup
 		};
 
 		/**
@@ -1516,6 +2003,7 @@ namespace SIE
 			const D3D_SHADER_MACRO* a_defines, uint32_t a_flags)
 		{
 			SharedCompile result;
+			const auto preprocessStart = std::chrono::steady_clock::now();
 			std::string source;
 			{
 				std::ifstream sourceFile(a_path, std::ios::binary);
@@ -1538,17 +2026,23 @@ namespace SIE
 			// Developer Mode keeps #line in the key: stripping it would share debug info with another variant's source lines.
 			const auto keyText = globals::state->IsDeveloperMode() ? result.source : Util::CompileDedupe::StripLineDirectives(result.source);
 			const auto key = Util::CompileDedupe::MakeKey({ keyText, "main", GetShaderProfile(a_class), a_flags });
+			result.preprocessNs = ElapsedNs(preprocessStart);
 			if (key == Util::ContentHash::Hash128{})
 				return result;  // hashing failed: compile from the snapshot, but share and store nothing
 			result.key = key;
+			const auto waitStart = std::chrono::steady_clock::now();
 			auto acquired = GetCompileDedupe().Acquire(key);
+			result.waitNs = ElapsedNs(waitStart);
 			result.compileFailed = acquired.compileFailed;
 			if (acquired.compileFailed)
 				return result;
 			if (!acquired.blob) {
 				// This task owns the compile; a stored blob from an earlier session saves it, and reaches identical tasks waiting on the ticket.
 				if (const auto* store = GetContentStore()) {
-					if (auto stored = ReadStoredBlob(*store, key)) {
+					const auto storeStart = std::chrono::steady_clock::now();
+					auto stored = ReadStoredBlob(*store, key);
+					result.storeNs = ElapsedNs(storeStart);
+					if (stored) {
 						acquired.ticket->Publish(stored->GetBufferPointer(), stored->GetBufferSize());
 						result.blob = stored.detach();
 						result.fromStore = true;
@@ -1580,11 +2074,20 @@ namespace SIE
 				return shaderBlob;
 			}
 			const auto type = shader.shaderType.get();
+			auto& stats = cache.GetTypeStats(type);
+			stats.tasks++;
+
+			// prepare preprocessor defines (before the disk lookup: the disk-cache file name hashes them)
+			std::array<D3D_SHADER_MACRO, 64> defines{};
+			BuildCompileDefines(shaderClass, shader, descriptor, defines);
+			// (44j, upstream) Release disk-cache compiles skip fxc's validation pass on its own output; bytecode is unchanged.
+			const uint32_t flags = GetCompileFlags(useDiskCache);
 
 			// check diskcache
-			auto diskPath = GetDiskPath(shader.fxpFilename, descriptor, shaderClass);
+			const auto diskStart = std::chrono::steady_clock::now();
+			const std::wstring diskPath = useDiskCache ? GetDiskPathForInputs(shader.fxpFilename, descriptor, shaderClass, defines.data(), flags) : std::wstring{};
 
-			if (useDiskCache && std::filesystem::exists(diskPath)) {
+			if (!diskPath.empty() && std::filesystem::exists(diskPath)) {
 				// check build time of cache
 				auto diskCacheTime = cache.UseFileWatcher() ? std::chrono::clock_cast<std::chrono::system_clock>(std::filesystem::last_write_time(diskPath)) : system_clock::now();
 				if (cache.ShaderModifiedSince(shader.fxpFilename, diskCacheTime)) {
@@ -1595,34 +2098,13 @@ namespace SIE
 					shaderBlob = intactBlob.detach();
 					logger::debug("Loaded shader from {}", Util::WStringToString(diskPath));
 					cache.IncDiskHitTasks();
-					cache.AddCompletedShader(shaderClass, shader, descriptor, shaderBlob);
+					stats.diskHits++;
+					stats.diskNs += ElapsedNs(diskStart);
+					cache.AddCompletedShader(shaderClass, shader, descriptor, shaderBlob, diskPath);
 					return shaderBlob;
 				}
 			}
-
-			// prepare preprocessor defines
-			std::array<D3D_SHADER_MACRO, 64> defines{};
-			auto lastIndex = 0;
-			if (shaderClass == ShaderClass::Vertex) {
-				defines[lastIndex++] = { "VSHADER", nullptr };
-			} else if (shaderClass == ShaderClass::Pixel) {
-				defines[lastIndex++] = { "PSHADER", nullptr };
-			} else if (shaderClass == ShaderClass::Compute) {
-				defines[lastIndex++] = { "CSHADER", nullptr };
-			}
-			if (globals::state->IsDeveloperMode()) {
-				defines[lastIndex++] = { "D3DCOMPILE_SKIP_OPTIMIZATION", nullptr };
-				defines[lastIndex++] = { "D3DCOMPILE_DEBUG", nullptr };
-			}
-			if (REL::Module::IsVR())
-				defines[lastIndex++] = { "VR", nullptr };
-			auto shaderDefines = globals::state->GetDefines();
-			if (!shaderDefines->empty()) {
-				for (unsigned int i = 0; i < shaderDefines->size(); i++)
-					defines[lastIndex++] = { shaderDefines->at(i).first.c_str(), shaderDefines->at(i).second.c_str() };
-			}
-			defines[lastIndex] = { nullptr, nullptr };  // do final entry
-			GetShaderDefines(shader, descriptor, std::span{ defines }.subspan(lastIndex));
+			stats.diskNs += ElapsedNs(diskStart);
 
 			const std::wstring path = GetShaderPath(
 				shader.shaderType == RE::BSShader::Type::ImageSpace ?
@@ -1637,32 +2119,39 @@ namespace SIE
 
 			// compile shaders
 			ID3DBlob* errorBlob = nullptr;
-			uint32_t flags = !globals::state->IsDeveloperMode() ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : D3DCOMPILE_DEBUG;
-			// (44j, upstream) Release disk-cache compiles skip fxc's validation pass on its own output; bytecode is unchanged.
-			if (useDiskCache && !globals::state->IsDeveloperMode())
-				flags |= D3DCOMPILE_SKIP_VALIDATION;
 
 			// (44j) Preprocess once with the real defines: identical code shares one compile (#2836) and a blob
 			// stored by an earlier session is restored instead of compiled (#2840).
 			auto shared = AcquireSharedCompile(shaderClass, path, pathString, defines.data(), flags);
+			stats.preprocessNs += shared.preprocessNs;
+			stats.waitNs += shared.waitNs;
+			stats.storeNs += shared.storeNs;
 			shaderBlob = shared.blob;
 			auto& dedupeTicket = shared.ticket;
 			const bool dedupeHit = shaderBlob != nullptr;
-			if (shared.fromStore)
+			if (shared.fromStore) {
 				cache.IncContentStoreHitTasks();
-			else if (dedupeHit)
+				stats.storeHits++;
+			} else if (dedupeHit) {
 				cache.IncContentDedupeTasks();
+				stats.shared++;
+			}
 
 			// Compiling the preprocessed snapshot keeps the published bytecode matched to the key if the files change meanwhile.
 			const bool fromSnapshot = !shared.source.empty();
-			if (!dedupeHit && !shared.compileFailed)
+			if (!dedupeHit && !shared.compileFailed) {
 				cache.IncCompiledTasks();
+				stats.compiled++;
+			}
+			const auto compileStart = std::chrono::steady_clock::now();
 			const HRESULT compileResult = shared.compileFailed ? E_FAIL :
 			                              dedupeHit            ? S_OK :
 			                              fromSnapshot         ? D3DCompile(shared.source.data(), shared.source.size(), pathString.c_str(), nullptr, nullptr, "main",
 																	 GetShaderProfile(shaderClass), flags, 0, &shaderBlob, &errorBlob) :
 			                                                     D3DCompileFromFile(path.c_str(), defines.data(), D3D_COMPILE_STANDARD_FILE_INCLUDE, "main",
 																	 GetShaderProfile(shaderClass), flags, 0, &shaderBlob, &errorBlob);
+			if (!dedupeHit)
+				stats.compileNs += ElapsedNs(compileStart);
 
 			if (FAILED(compileResult) || !shaderBlob) {
 				if (dedupeTicket)
@@ -1692,6 +2181,7 @@ namespace SIE
 
 			// strip debug info (a shared or stored blob was stripped when it was first compiled)
 			if (!globals::state->IsDeveloperMode() && !dedupeHit) {
+				const auto stripStart = std::chrono::steady_clock::now();
 				ID3DBlob* strippedShaderBlob = nullptr;
 
 				const uint32_t stripFlags = D3DCOMPILER_STRIP_DEBUG_INFO |
@@ -1702,6 +2192,7 @@ namespace SIE
 					std::swap(shaderBlob, strippedShaderBlob);
 					strippedShaderBlob->Release();
 				}
+				stats.compileNs += ElapsedNs(stripStart);
 			}
 
 			if (dedupeTicket)
@@ -1709,12 +2200,17 @@ namespace SIE
 
 			// Only a blob compiled from the keyed snapshot matches its key; a reused blob is already stored or shared.
 			if (!dedupeHit && fromSnapshot && shared.key) {
-				if (const auto* store = GetContentStore())
+				if (const auto* store = GetContentStore()) {
+					const auto storeStart = std::chrono::steady_clock::now();
 					store->Put(StoreKey(*shared.key), shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize());
+					stats.storeNs += ElapsedNs(storeStart);
+				}
 			}
 
 			// save shader to disk
-			if (useDiskCache) {
+			bool savedToDisk = false;
+			if (!diskPath.empty()) {
+				const auto writeStart = std::chrono::steady_clock::now();
 				auto directoryPath = std::format("Data/ShaderCache/{}", shader.fxpFilename);
 				if (!std::filesystem::is_directory(directoryPath)) {
 					try {
@@ -1724,13 +2220,19 @@ namespace SIE
 					}
 				}
 
-				if (!WriteBlobAtomic(diskPath, shaderBlob)) {
+				// (46j) The type folder's stamp must name this source (with its startup fingerprint) before the blob
+				// lands, or the next launch could keep the folder after this source changed.
+				if (!SourceStamps::EnsureStamp(shader.fxpFilename, std::filesystem::path(path))) {
+					logger::debug("Not saving {}: the source record for {} could not be written", Util::WStringToString(diskPath), pathString);
+				} else if (!WriteBlobAtomic(diskPath, shaderBlob)) {
 					logger::error("Failed to save shader to {}", Util::WStringToString(diskPath));
 				} else {
+					savedToDisk = true;
 					logger::debug("Saved shader to {}", Util::WStringToString(diskPath));
 				}
+				stats.diskNs += ElapsedNs(writeStart);
 			}
-			cache.AddCompletedShader(shaderClass, shader, descriptor, shaderBlob);
+			cache.AddCompletedShader(shaderClass, shader, descriptor, shaderBlob, savedToDisk ? diskPath : std::wstring{});
 			return shaderBlob;
 		}
 
@@ -2325,7 +2827,7 @@ namespace SIE
 			// Delete the associated file
 			const auto& filePath = entry.diskPath;
 			const auto& filePathString = Util::WStringToString(filePath);
-			{
+			if (!filePath.empty()) {  // (46j) empty when the shader was never written to the disk cache
 				std::scoped_lock lockD{ compilationSet.compilationMutex };
 				std::error_code ec;  // Use the error_code overload to avoid exceptions for non-critical errors like the file not existing.
 				if (const bool removed = std::filesystem::remove(filePath, ec); ec) {
@@ -2374,7 +2876,7 @@ namespace SIE
 		compilationSet.Clear();
 	}
 
-	bool ShaderCache::AddCompletedShader(ShaderClass shaderClass, const RE::BSShader& shader, uint32_t descriptor, ID3DBlob* a_blob)
+	bool ShaderCache::AddCompletedShader(ShaderClass shaderClass, const RE::BSShader& shader, uint32_t descriptor, ID3DBlob* a_blob, const std::wstring& a_diskPath)
 	{
 		auto key = SIE::SShaderCache::GetShaderString(shaderClass, shader, descriptor, true);
 		auto keyWithDescriptor = SIE::SShaderCache::GetShaderString(shaderClass, shader, descriptor, false);
@@ -2394,7 +2896,7 @@ namespace SIE
 			{
 				std::unique_lock lockH{ hlslMapMutex };
 				auto it = hlslToShaderMap.find(lowerFilePath);
-				hlslRecord newRecord{ key, shader.shaderType.get(), descriptor, shaderClass, SIE::SShaderCache::GetDiskPath(shader.fxpFilename, descriptor, shaderClass) };
+				hlslRecord newRecord{ key, shader.shaderType.get(), descriptor, shaderClass, a_diskPath };
 
 				if (it != hlslToShaderMap.end()) {
 					auto& entries = it->second;
@@ -2543,59 +3045,17 @@ namespace SIE
 		} catch (std::filesystem::filesystem_error const& ex) {
 			logger::error("Failed to delete disk cache: {}", ex.what());
 		}
-	}
-
-	std::string ShaderCache::ComputeShaderSourceFingerprint()
-	{
-		// Sorted relative paths + contents of every shader source, so any edit (or an added/removed include)
-		// changes the fingerprint. ~200 files / ~2 MB in this fork: a few tens of milliseconds even under MO2.
-		const std::filesystem::path root(L"Data/Shaders");
-		std::vector<std::filesystem::path> files;
-		std::error_code ec;
-		for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
-			if (!it->is_regular_file(ec))
-				continue;
-			auto extension = it->path().extension().wstring();
-			std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
-			if (extension == L".hlsl" || extension == L".hlsli")
-				files.push_back(it->path());
-		}
-		if (ec || files.empty())
-			return {};
-		std::vector<std::pair<std::string, std::filesystem::path>> sorted;
-		sorted.reserve(files.size());
-		for (const auto& file : files) {
-			auto relative = Util::WStringToString(file.lexically_relative(root).generic_wstring());
-			std::transform(relative.begin(), relative.end(), relative.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-			sorted.emplace_back(std::move(relative), file);
-		}
-		std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-
-		Util::ContentHash::Sha256 sha;
-		std::string contents;
-		for (const auto& [relative, file] : sorted) {
-			std::ifstream ifs(file, std::ios::binary);
-			if (!ifs)
-				return {};
-			contents.assign((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-			sha.UpdateField(relative);
-			sha.UpdateField(contents);
-		}
-		std::array<uint8_t, 32> digest{};
-		if (!sha.Finish(digest))
-			return {};
-		std::string hex;
-		hex.reserve(digest.size() * 2);
-		for (const auto byte : digest)
-			hex += std::format("{:02x}", byte);
-		return std::format("{}:{}", sorted.size(), hex);
+		// (46j) The type folders and their stamps are gone; the next blob written to a folder stamps it afresh.
+		SShaderCache::SourceStamps::ForgetStamps();
 	}
 
 	void ShaderCache::ValidateDiskCache()
 	{
 		const auto start = std::chrono::steady_clock::now();
-		sourceFingerprint = ComputeShaderSourceFingerprint();
-		logger::info("Shader source fingerprint {} ({} ms)", sourceFingerprint.empty() ? "unavailable" : sourceFingerprint,
+		// (46j) Fingerprint every shader source's include closure first: the per-type check below and every stamp
+		// written later in this session use these startup values.
+		const auto filesRead = SShaderCache::SourceStamps::SnapshotSources();
+		logger::info("Shader source fingerprints: {} files read ({} ms)", filesRead,
 			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
 
 		CSimpleIniA ini;
@@ -2603,27 +3063,30 @@ namespace SIE
 		ini.LoadFile(L"Data\\ShaderCache\\Info.ini");
 		bool valid = true;
 
+		// Whole-cache checks: the cache format (SHADER_CACHE_VERSION, also bumped when C++ changes how descriptors map
+		// to defines) and the set of installed features. A feature's ini Version alone no longer drops anything (46j):
+		// shader content is covered by the per-type source fingerprints and every define by the blob file names.
 		if (auto version = ini.GetValue("Cache", "Version")) {
-			if (strcmp(SHADER_CACHE_VERSION.string().c_str(), version) != 0 || !(globals::state->ValidateCache(ini))) {
-				logger::info("Disk cache outdated or invalid");
+			if (strcmp(SHADER_CACHE_VERSION.string().c_str(), version) != 0) {
+				logger::info("Disk cache version {} differs from {}: dropping every shader type", version, SHADER_CACHE_VERSION.string());
 				valid = false;
-			} else if (const auto* cachedFingerprint = ini.GetValue("Cache", "SourceFingerprint", "");
-					   sourceFingerprint.empty() || sourceFingerprint != cachedFingerprint) {
-				// (44j) Shader sources changed since the cache was built (or cannot be fingerprinted).
-				logger::info("Disk cache built from different shader sources");
+			} else if (!globals::state->ValidateCache(ini)) {
+				logger::info("Installed features changed since the disk cache was built: dropping every shader type");
 				valid = false;
 			}
 		} else {
-			logger::info("Disk cache outdated or invalid");
+			logger::info("Disk cache has no version record: dropping every shader type");
 			valid = false;
 		}
 
 		if (valid) {
-			logger::info("Using disk cache");
+			SShaderCache::SourceStamps::ValidateTypeDirectories();
 		} else {
 			// Stored blobs are keyed by their own inputs, so they stay valid across plugin, feature and source changes.
 			DeleteDiskCache(true);
 		}
+		logger::info("Disk cache validated in {} ms",
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
 
 		// (44j) Record the decision right away: before 44j Info.ini was only written after the startup compile,
 		// so quitting mid-compile wiped the partial cache again on the next launch. Every blob written from here
@@ -2637,8 +3100,6 @@ namespace SIE
 		CSimpleIniA ini;
 		ini.SetUnicode();
 		ini.SetValue("Cache", "Version", SHADER_CACHE_VERSION.string().c_str());
-		if (!sourceFingerprint.empty())
-			ini.SetValue("Cache", "SourceFingerprint", sourceFingerprint.c_str());
 		globals::state->WriteDiskCacheInfo(ini);
 		std::error_code ec;
 		std::filesystem::create_directories(L"Data/ShaderCache", ec);
@@ -2890,6 +3351,18 @@ namespace SIE
 		compilationSet.compiledTasks++;
 	}
 
+	CompilationSet::TypeStats& ShaderCache::GetTypeStats(RE::BSShader::Type a_type)
+	{
+		const auto index = std::min(static_cast<size_t>(a_type), compilationSet.typeStats.size() - 1);
+		return compilationSet.typeStats[index];
+	}
+
+	void CompilationSet::TypeStats::Reset()
+	{
+		for (auto* counter : { &tasks, &diskHits, &storeHits, &shared, &compiled, &diskNs, &preprocessNs, &waitNs, &storeNs, &compileNs })
+			counter->store(0, std::memory_order_relaxed);
+	}
+
 	void ShaderCache::ClearContentStore()
 	{
 		std::error_code ec;
@@ -3041,11 +3514,7 @@ namespace SIE
 			info.descriptor = descriptor;
 
 			// Construct disk path
-			info.diskPath = SIE::SShaderCache::GetDiskPath(
-				shader.shaderType == RE::BSShader::Type::ImageSpace ?
-					static_cast<const RE::BSImagespaceShader&>(shader).originalShaderName :
-					shader.fxpFilename,
-				descriptor, shaderClass);
+			info.diskPath = SIE::SShaderCache::GetDiskCachePath(shaderClass, shader, descriptor);
 		}
 
 		info.isActive = true;
@@ -3244,7 +3713,18 @@ namespace SIE
 				compiledTasks.load(), contentStoreHitTasks.load(), contentDedupeTasks.load(), diskHitTasks.load(), failedTasks.load(),
 				!globals::shaderCache->backgroundCompilation ? globals::shaderCache->compilationThreadCount : globals::shaderCache->backgroundCompilationThreadCount,
 				globals::shaderCache->backgroundCompilation ? " (background)" : "");
-			logger::debug("Compile dedupe: {} MiB retained, {} blobs over the retention cap", compileDedupe.RetainedBytes() >> 20, compileDedupe.DroppedBlobs());
+			// (46j, B0) Per shader type: where the time went. Thread time summed over the workers, so it can exceed the wall time.
+			for (size_t index = 0; index < typeStats.size(); ++index) {
+				const auto& stats = typeStats[index];
+				if (stats.tasks.load() == 0)
+					continue;
+				const auto seconds = [](const std::atomic<uint64_t>& a_ns) { return static_cast<double>(a_ns.load()) / 1e9; };
+				logger::info("Shader compile summary [{}]: {} tasks: {} disk cache, {} content store, {} shared, {} compiled; thread time: disk {:.1f} s, preprocess {:.1f} s, store {:.1f} s, wait for shared {:.1f} s, compile {:.1f} s",
+					magic_enum::enum_name(static_cast<RE::BSShader::Type>(index)), stats.tasks.load(),
+					stats.diskHits.load(), stats.storeHits.load(), stats.shared.load(), stats.compiled.load(),
+					seconds(stats.diskNs), seconds(stats.preprocessNs), seconds(stats.storeNs), seconds(stats.waitNs), seconds(stats.compileNs));
+			}
+			logger::debug("Compile dedupe:{} MiB retained, {} blobs over the retention cap", compileDedupe.RetainedBytes() >> 20, compileDedupe.DroppedBlobs());
 			compileDedupe.Clear();
 		}
 
@@ -3265,6 +3745,8 @@ namespace SIE
 		compiledTasks = 0;
 		contentStoreHitTasks = 0;
 		contentDedupeTasks = 0;
+		for (auto& stats : typeStats)
+			stats.Reset();
 		SShaderCache::GetCompileDedupe().Clear();
 		QueryPerformanceCounter(&lastReset);
 		QueryPerformanceCounter(&lastCalculation);

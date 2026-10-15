@@ -135,8 +135,8 @@ namespace Util
 		 * @brief Returns the cache entry path for one compile: a SHA-256 of the preprocessed source (includes and
 		 *        defines expanded), the entry point, the target, the flags and D3D_COMPILER_VERSION.
 		 *
-		 * Entries are named by content and never replaced; they are dropped with the rest of the per-descriptor
-		 * disk cache whenever it is invalidated (Clear Shader Cache, version/feature/source change).
+		 * Entries are named by content and never replaced; they are dropped by Clear Shader Cache, a cache-version or
+		 * installed-feature change, or (46j) when the folder outgrows its size limit. Source edits do not drop them.
 		 * @return The path, or nullopt when the source cannot be read, preprocessed or hashed.
 		 */
 		std::optional<std::wstring> GetCompileShaderDiskPath(const wchar_t* filePath, const D3D_SHADER_MACRO* macros, ID3DInclude* include, const char* program, const char* programType, uint32_t flags)

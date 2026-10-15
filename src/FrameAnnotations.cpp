@@ -34,7 +34,8 @@ namespace FrameAnnotations
 				if (globals::game::currentPixelShader && *globals::game::currentPixelShader) {
 					descriptor = (*globals::game::currentPixelShader)->id;
 				}
-				std::string diskPath = std::format("Data/ShaderCache/{}/{:X}.pso", shader->fxpFilename, descriptor);
+				// (46j) Disk-cache files are named <descriptor>-<compile inputs hash>.pso.
+				std::string diskPath = std::format("Data/ShaderCache/{}/{:X}-*.pso", shader->fxpFilename, descriptor);
 				const std::string passName = std::format("[{}:{:X}] ({:X}) <{}> {} -> {}", magic_enum::enum_name(ShaderType), descriptor, pass->passEnum,
 					pass->accumulationHint, pass->geometry->name.c_str(), diskPath);
 				globals::state->BeginPerfEvent(passName);

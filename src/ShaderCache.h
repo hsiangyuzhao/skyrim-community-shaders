@@ -7,10 +7,11 @@
 #include <winrt/base.h>
 
 // (44j) 74: cache format change (content store, SKIP_VALIDATION, source fingerprint in Info.ini).
-// Shader source edits no longer need a bump: Info.ini carries a fingerprint of Data/Shaders, and a
-// mismatch drops the per-descriptor cache while the content store restores unchanged shaders.
-// Still bump this when C++ changes how a descriptor maps to defines (GetShaderDefines etc.).
-static constexpr REL::Version SHADER_CACHE_VERSION = { 0, 0, 0, 76 };
+// (46j) 77: per-directory source stamps (include closure of each shader source) replace the single
+// Data/Shaders fingerprint, and blob file names carry a hash of their compile inputs (defines, flags,
+// compiler), so a changed source drops only its own shader type and changed defines are never reused.
+// A bump still drops every shader type at once (the content store is kept).
+static constexpr REL::Version SHADER_CACHE_VERSION = { 0, 0, 0, 77 };
 
 using namespace std::chrono;
 
@@ -280,6 +281,23 @@ namespace SIE
 		std::atomic<uint64_t> contentDedupeTasks = 0;    // (44j) shared an identical compile from this session
 		std::mutex compilationMutex;
 
+		/** @brief (46j, B0) Where one shader type's compile-run time went; times are thread time summed over workers. */
+		struct TypeStats
+		{
+			std::atomic<uint64_t> tasks = 0;
+			std::atomic<uint64_t> diskHits = 0;
+			std::atomic<uint64_t> storeHits = 0;
+			std::atomic<uint64_t> shared = 0;
+			std::atomic<uint64_t> compiled = 0;
+			std::atomic<uint64_t> diskNs = 0;        ///< disk-cache lookup, read and write
+			std::atomic<uint64_t> preprocessNs = 0;  ///< source read, D3DPreprocess and key hashing
+			std::atomic<uint64_t> waitNs = 0;        ///< waiting on an identical compile from this session
+			std::atomic<uint64_t> storeNs = 0;       ///< content-store lookup and write
+			std::atomic<uint64_t> compileNs = 0;     ///< D3DCompile and stripping
+			void Reset();
+		};
+		std::array<TypeStats, static_cast<size_t>(RE::BSShader::Type::Total)> typeStats;
+
 	private:
 		std::unordered_set<ShaderCompilationTask> availableTasks;
 		std::unordered_set<ShaderCompilationTask> tasksInProgress;
@@ -301,6 +319,9 @@ namespace SIE
 
 		/** @brief Writes through a unique sibling temp file and a rename, so a crash mid-write cannot leave a torn blob at diskPath. */
 		bool WriteBlobAtomic(const std::wstring& diskPath, ID3DBlob* blob);
+
+		/** @brief (46j) The disk-cache file of one shader: its descriptor plus a hash of its compile inputs (defines, flags, compiler). */
+		std::wstring GetDiskCachePath(ShaderClass shaderClass, const RE::BSShader& shader, uint32_t descriptor);
 	}
 
 	class UpdateListener;
@@ -361,7 +382,11 @@ namespace SIE
 		 * @param a_keepContentStore Keep the persistent content store, whose blobs stay valid because they are keyed by their own inputs.
 		 */
 		void DeleteDiskCache(bool a_keepContentStore = false);
-		/** @brief Validates the disk cache (version, features, shader source fingerprint) and writes Info.ini at once, so an interrupted first compile keeps its progress. */
+		/**
+		 * @brief Validates the disk cache and writes Info.ini at once, so an interrupted first compile keeps its progress.
+		 * (46j) A cache-version or installed-feature change drops every shader type; otherwise each type directory is
+		 * kept or dropped on its own by comparing the include closures of the sources it was built from.
+		 */
 		void ValidateDiskCache();
 		void WriteDiskCacheInfo();
 
@@ -384,6 +409,8 @@ namespace SIE
 		void IncContentDedupeTasks();
 		void IncDiskHitTasks();
 		void IncCompiledTasks();
+		/** @brief (46j, B0) Per-shader-type counters and timings of the current compile run. */
+		CompilationSet::TypeStats& GetTypeStats(RE::BSShader::Type a_type);
 
 		/** @brief (44j) Default compile threads: all logical cores minus 2 (minus 1 on <= 8 threads). */
 		static int32_t GetDefaultCompilationThreadCount()
@@ -451,7 +478,8 @@ namespace SIE
 		*/
 		bool Clear(const std::string& a_path);
 
-		bool AddCompletedShader(ShaderClass shaderClass, const RE::BSShader& shader, uint32_t descriptor, ID3DBlob* a_blob);
+		/** @param a_diskPath (46j) The shader's disk-cache file, recorded so a source edit can delete it; empty when not disk cached. */
+		bool AddCompletedShader(ShaderClass shaderClass, const RE::BSShader& shader, uint32_t descriptor, ID3DBlob* a_blob, const std::wstring& a_diskPath = {});
 		ID3DBlob* GetCompletedShader(const std::string& a_key);
 		ID3DBlob* GetCompletedShader(const SIE::ShaderCompilationTask& a_task);
 		ID3DBlob* GetCompletedShader(ShaderClass shaderClass, const RE::BSShader& shader, uint32_t descriptor);
@@ -764,10 +792,6 @@ namespace SIE
 		bool isDump = false;
 		bool hideError = false;
 		bool useFileWatcher = false;
-
-		/** @brief (44j) SHA-256 of every .hlsl/.hlsli under Data/Shaders (path + contents); computed once by ValidateDiskCache. */
-		std::string sourceFingerprint;
-		static std::string ComputeShaderSourceFingerprint();
 
 		std::stop_source ssource;
 		std::mutex vertexShadersMutex;

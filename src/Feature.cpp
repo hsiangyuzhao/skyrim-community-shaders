@@ -201,13 +201,13 @@ bool Feature::ValidateCache(CSimpleIniA& a_ini)
 	}
 
 	if (loaded) {
-		auto versionInCache = a_ini.GetValue(ini_name.c_str(), "Version");
-		if (strcmp(versionInCache, version.c_str()) != 0) {
-			logger::info("Change in version detected. Installed {} but {} in Disk Cache", version, versionInCache);
-			return false;
-		} else {
+		// (46j) A version change alone no longer drops the cache: the per-type source fingerprints cover the
+		// feature's shader files and the blob file names cover every define it adds.
+		const auto* versionInCache = a_ini.GetValue(ini_name.c_str(), "Version", "");
+		if (strcmp(versionInCache, version.c_str()) != 0)
+			logger::info("Version changed: installed {}, {} in Disk Cache (shader types are checked by source)", version, versionInCache);
+		else
 			logger::info("Installed version and cached version match.");
-		}
 	}
 
 	logger::info("Cached feature is valid");
