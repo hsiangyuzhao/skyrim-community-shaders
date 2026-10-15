@@ -527,6 +527,7 @@ namespace Util::FrameTrace
 		std::string g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency;
 		std::string g_headerRendering;  // (46e) upscaler, resolutions, SSRT / SSGI
 		std::string g_header46o;        // (46o) session uptime, video memory, thread CPU time calibration, stall sampler
+		std::string g_headerFG;         // (46w) frame-generation DLL and MFG Unlocker preset
 		int64_t g_recordStart = 0;
 		int64_t g_recordEnd = 0;
 		std::vector<Row> g_rows;
@@ -789,7 +790,7 @@ namespace Util::FrameTrace
 		}
 
 		void WriteCsv(std::vector<Row> a_rows, std::unordered_map<uint64_t, ReflexTimes> a_reflex, std::string a_location, std::string a_rayTracing, std::string a_tag,
-			std::string a_latency, std::string a_rendering, std::string a_header46o)
+			std::string a_latency, std::string a_rendering, std::string a_header46o, std::string a_headerFG)
 		{
 			try {
 				auto dir = logger::log_directory();
@@ -827,6 +828,7 @@ namespace Util::FrameTrace
 				out << "# (45j) location at start: " << a_location << "\n";
 				out << "# (45j) ray tracing at start: " << a_rayTracing << "\n";
 				out << "# (46e) rendering at start: " << a_rendering << "\n";
+				out << "# (46w) frame generation at start: " << a_headerFG << "\n";
 				out << "# (45j) rt_* = Ray Tracing CPU split (ms, -1 = not run): scene update (grid diff, cell capture, filter registration, objects of which new\n";
 				out << "#   captures), TLAS instances, missed-caster check, characters, D3D12 record+submit (of which BLAS creation, skinning), D3D11 passes,\n";
 				out << "#   end of frame, engine references dropped; counts: recaptures, objects captured, misses examined, references waiting, TLAS instances,\n";
@@ -2465,7 +2467,8 @@ namespace Util::FrameTrace
 			g_headerTag = LocationTag(location);
 			g_headerRayTracing = std::format("{}; build {}", globals::features::rayTracing.DescribeForProfile(), BuildLabel::kBuild);
 			g_headerLatency = globals::features::upscaling.DescribeLatencyForTrace();
-			g_headerRendering = DescribeRendering();  // (46e)
+			g_headerRendering = DescribeRendering();        // (46e)
+			g_headerFG = Streamline::DescribeFGForTrace();  // (46w)
 			{
 				// (46o) M6 session uptime, M3 video memory at the start, M1 calibration, M2 switch.
 				const Vram v = QueryVram();
@@ -2505,7 +2508,7 @@ namespace Util::FrameTrace
 		DrainPassLogs(true);  // (46n) before the rows go to the writer thread
 		g_pendingPassGpu.clear();
 		PollReflex();
-		std::thread(WriteCsv, std::move(g_rows), std::move(g_reflex), g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency, g_headerRendering, g_header46o)
+		std::thread(WriteCsv, std::move(g_rows), std::move(g_reflex), g_headerLocation, g_headerRayTracing, g_headerTag, g_headerLatency, g_headerRendering, g_header46o, g_headerFG)
 			.detach();
 		g_rows = {};
 		g_reflex = {};

@@ -3780,6 +3780,41 @@ void PerformanceOverlay::UpdateViews(double a_now, const DrawCallRowSets& a_rowS
 	}
 }
 
+/// (46w) Tooltip part of the "Frame generation" row: which DLL runs, and the MFG Unlocker's preset fields.
+static void DrawFGDiagnosticsTooltip(const Streamline::FGDllInfo& a_dll, const Streamline::FGUnlockerInfo& a_unlocker, const ImVec4& a_warning)
+{
+	ImGui::Separator();
+	if (a_dll.found) {
+		ImGui::Text("Frame generation DLL: %s, %s", a_dll.versionText.c_str(), a_dll.SourceName());
+		ImGui::TextDisabled("%s", a_dll.path.c_str());
+		if (!a_dll.otherPath.empty())
+			ImGui::TextDisabled("Also loaded: %s", a_dll.otherPath.c_str());
+	} else {
+		ImGui::TextUnformatted("Frame generation DLL: not loaded yet (it loads once frame generation first runs).");
+	}
+
+	if (!a_unlocker.fileFound) {
+		ImGui::TextUnformatted("Preset: game/driver default (no MFG Unlocker status file next to the game).");
+	} else if (!a_unlocker.parsed) {
+		ImGui::TextUnformatted("Preset: MFG Unlocker status file found but not readable yet.");
+	} else {
+		if (a_unlocker.stale)
+			ImGui::TextUnformatted("MFG Unlocker status file is from another game session, so the preset is the game/driver default.");
+		ImGui::Text("MFG Unlocker preset: requested %s, latched %s, observed %s%s",
+			Streamline::FGPresetName(a_unlocker.presetRequested), Streamline::FGPresetName(a_unlocker.presetLatched),
+			Streamline::FGPresetName(a_unlocker.presetObserved), a_unlocker.presetObservedValid == 0 ? " (not seen yet)" : "");
+		if (a_unlocker.NeedsRestart())
+			ImGui::TextColored(a_warning, "Restart the game for the requested preset to take effect.");
+		ImGui::TextDisabled("Unlocker reports DLL %s%s%s", a_unlocker.hasProviderVersion ? a_unlocker.providerVersionText.c_str() : "-",
+			a_unlocker.unlockerBuild.empty() ? "" : ", unlocker build ", a_unlocker.unlockerBuild.c_str());
+		if (a_unlocker.lastReadFailed)
+			ImGui::TextDisabled("(last read of the status file failed; showing the one before)");
+	}
+	if (Streamline::FGPresetCNeedsNewerDll(a_dll, a_unlocker))
+		ImGui::TextColored(a_warning, "Preset C is requested, but this DLL is older than 310.9.16 and cannot run it.\n"
+									  "Enable the CS-DLSSG-310.9.16 mod in MO2 (below Community Shaders).");
+}
+
 void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 {
 	auto* menu = Menu::GetSingleton();
@@ -3883,13 +3918,26 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 								"The multiplier is the one the backend accepted, which can differ from the menu setting.");
 		if (st.isFrameGenerationActive) {
 			const char* backend = st.frameGenerationIsDLSSG ? "DLSS FG" : "FSR FG";
+			// (46w) Which frame-generation DLL runs and the preset the MFG Unlocker reports (read-only; re-read
+			// at most every few seconds, and only while this overlay is drawn).
+			Streamline::FGDllInfo fgDll{};
+			Streamline::FGUnlockerInfo fgUnlocker{};
+			std::string fgSuffix;
+			if (st.frameGenerationIsDLSSG) {
+				fgDll = Streamline::GetFGDll(false);
+				fgUnlocker = Streamline::GetFGUnlocker(false);
+				static constexpr const char* kSep = " \xC2\xB7 ";  // U+00B7 middle dot
+				fgSuffix = std::format("{}preset {}", kSep, fgUnlocker.Active() ? Streamline::FGPresetName(fgUnlocker.EffectivePreset()) : "default");
+				if (fgDll.found)
+					fgSuffix += std::format("{}{}", kSep, fgDll.versionText);
+			}
 			// (46v) The multiplier shown is the measured one (frames DLSS-G reports it shows per rendered frame, rounded);
 			// until DLSS-G reports, the accepted multiplier is shown greyed out.
 			if (st.postFGIsMeasured) {
 				const long measured = std::lround(st.postFGMultiplier);
-				ImGui::Text("%s %ux", backend, measured >= 2 ? static_cast<unsigned>(measured) : st.appliedFGMultiplier);
+				ImGui::Text("%s %ux%s", backend, measured >= 2 ? static_cast<unsigned>(measured) : st.appliedFGMultiplier, fgSuffix.c_str());
 			} else if (st.frameGenerationIsDLSSG) {
-				ImGui::TextDisabled("%s %ux (waiting for DLSS-G)", backend, st.appliedFGMultiplier);
+				ImGui::TextDisabled("%s %ux%s (waiting for DLSS-G)", backend, st.appliedFGMultiplier, fgSuffix.c_str());
 			} else {
 				ImGui::Text("%s %ux", backend, st.appliedFGMultiplier);
 			}
@@ -3903,6 +3951,8 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 						ImGui::TextUnformatted("DLSS-G has not reported what it shows yet (first frames after a switch).");
 					else
 						ImGui::TextUnformatted("FSR 3.1 frame generation only supports 2x and does not report what it shows.");
+					if (st.frameGenerationIsDLSSG)
+						DrawFGDiagnosticsTooltip(fgDll, fgUnlocker, theme.StatusPalette.Warning);
 				}
 			}
 			if (st.rejectedFGMultiplier > 0) {
@@ -4770,6 +4820,7 @@ void PerformanceOverlay::WriteSnapshotToLog(const PerfView::ViewConfig& a_cfg)
 		std::max(0.0f, cpuFrame), std::max(0.0f, wait), std::max(0.0f, summary(kSummaryGpuOurs)),
 		std::max(0.0f, summary(kSummaryGpuUntracked)), std::max(0.0f, summary(kSummaryGpuGap)));
 	logger::info("[PerfSnapshot] Resolution | render {}x{} | output {}x{}", view.renderWidth, view.renderHeight, view.outputWidth, view.outputHeight);
+	logger::info("[PerfSnapshot] Frame generation | {}", Streamline::DescribeFGForTrace());  // (46w)
 
 	const auto logTable = [&](const char* a_name, const PerfView::StableTable<DrawCallRow>& a_table, const PerfView::ViewConfig& a_order) {
 		for (int id : a_table.DisplayOrder(a_order)) {
@@ -5009,6 +5060,8 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 			{ "multiplier_measured", st.postFGIsMeasured },
 			{ "multiplier_rejected", st.rejectedFGMultiplier },
 		};
+		// (46w) The frame-generation DLL in use and the MFG Unlocker's preset fields (live, not frozen).
+		m["frame_generation"]["diagnostics"] = Streamline::DescribeFGJson();
 		m["effects_enabled"] = globals::shaderCache ? globals::shaderCache->IsEnabled() : false;
 
 		// Every feature's load state, and the full settings of the ones whose numbers this

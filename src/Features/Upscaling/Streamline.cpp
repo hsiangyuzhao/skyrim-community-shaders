@@ -12,7 +12,13 @@
 #include "../Upscaling.h"
 #include "DX12SwapChain.h"
 
+#include <Psapi.h>
+#include <chrono>
+#include <cwctype>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <mutex>
 #include <vector>
 
 namespace
@@ -185,6 +191,422 @@ void LoggingCallback(sl::LogType type, const char* msg)
 }
 
 std::vector<std::pair<std::string, std::string>> Streamline::dllVersions = {};
+
+// ---- (46w) Read-only frame-generation diagnostics ----
+namespace
+{
+constexpr double kFGDiagIntervalSeconds = 3.0;
+constexpr const wchar_t* kNvidiaDlssgVersionsDir = L"\\ngx\\models\\dlssg\\versions\\";
+constexpr const wchar_t* kLocalStreamlineDir = L"\\shaders\\upscaling\\streamline\\";
+constexpr const wchar_t* kUnlockerStatusFile = L"RTXMFG-Universal.status.json";
+
+std::mutex g_fgDiagMutex;
+Streamline::FGDllInfo g_fgDll;
+Streamline::FGUnlockerInfo g_fgUnlocker;
+double g_fgDllLastProbe = -1.0e9;
+double g_fgUnlockerLastRead = -1.0e9;
+std::string g_fgDllLoggedPath;
+bool g_fgUnlockerLogged = false;
+bool g_fgPresetCWarned = false;
+
+double FGDiagNowSeconds()
+{
+	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::string FGWideToUtf8(const std::wstring& a_text)
+{
+	if (a_text.empty())
+		return {};
+	const int size = WideCharToMultiByte(CP_UTF8, 0, a_text.data(), static_cast<int>(a_text.size()), nullptr, 0, nullptr, nullptr);
+	if (size <= 0)
+		return {};
+	std::string result(static_cast<size_t>(size), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, a_text.data(), static_cast<int>(a_text.size()), result.data(), size, nullptr, nullptr);
+	return result;
+}
+
+std::wstring FGLower(std::wstring a_text)
+{
+	for (auto& c : a_text)
+		c = static_cast<wchar_t>(std::towlower(c));
+	return a_text;
+}
+
+std::wstring FGModulePath(HMODULE a_module)
+{
+	std::wstring path(1024, L'\0');
+	const DWORD length = GetModuleFileNameW(a_module, path.data(), static_cast<DWORD>(path.size()));
+	if (length == 0 || length >= path.size())
+		return {};
+	path.resize(length);
+	return path;
+}
+
+/// The driver's download sits in ...\versions\<encoded version>\files\<name>.bin, the folder name
+/// being (major << 16) | (minor << 8) | build (20318480 = 310.9.16). Used when the file carries no version resource.
+std::optional<REL::Version> FGVersionFromDownloadFolder(const std::wstring& a_lowerPath)
+{
+	const auto start = a_lowerPath.find(kNvidiaDlssgVersionsDir);
+	if (start == std::wstring::npos)
+		return std::nullopt;
+	const size_t begin = start + std::wcslen(kNvidiaDlssgVersionsDir);
+	const size_t end = a_lowerPath.find(L'\\', begin);
+	if (end == std::wstring::npos || end == begin || end - begin > 10)
+		return std::nullopt;
+	uint64_t value = 0;
+	for (size_t i = begin; i < end; ++i) {
+		if (a_lowerPath[i] < L'0' || a_lowerPath[i] > L'9')
+			return std::nullopt;
+		value = value * 10 + static_cast<uint64_t>(a_lowerPath[i] - L'0');
+	}
+	if (value == 0 || value > 0xFFFFFFFFull)
+		return std::nullopt;
+	return REL::Version(static_cast<std::uint16_t>((value >> 16) & 0xFFFF), static_cast<std::uint16_t>((value >> 8) & 0xFF),
+		static_cast<std::uint16_t>(value & 0xFF), 0);
+}
+
+Streamline::FGDllInfo::Source FGClassify(const std::wstring& a_lowerPath)
+{
+	using Source = Streamline::FGDllInfo::Source;
+	if (a_lowerPath.find(kNvidiaDlssgVersionsDir) != std::wstring::npos)
+		return Source::kNvidiaDownload;
+	if (a_lowerPath.find(kLocalStreamlineDir) != std::wstring::npos)
+		return Source::kLocal;
+	return Source::kOther;
+}
+
+/// Caller holds g_fgDiagMutex.
+void FGProbeDllLocked()
+{
+	// Every frame-generation candidate loaded in the process: the local nvngx_dlssg.dll (by name) and
+	// the driver's download (by folder; NVIDIA loads it as e.g. 160_E658700.bin). When both are loaded,
+	// the download is the one NGX chose (it only loads it to use it).
+	std::wstring localPath;
+	if (HMODULE local = GetModuleHandleW(L"nvngx_dlssg.dll"))
+		localPath = FGModulePath(local);
+
+	std::wstring downloadPath;
+	std::wstring otherByName;
+	{
+		std::vector<HMODULE> modules(1024);
+		DWORD needed = 0;
+		if (K32EnumProcessModules(GetCurrentProcess(), modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed)) {
+			const size_t count = std::min<size_t>(modules.size(), needed / sizeof(HMODULE));
+			for (size_t i = 0; i < count; ++i) {
+				const std::wstring path = FGModulePath(modules[i]);
+				if (path.empty())
+					continue;
+				const std::wstring lower = FGLower(path);
+				if (lower.find(kNvidiaDlssgVersionsDir) != std::wstring::npos) {
+					if (downloadPath.empty())
+						downloadPath = path;
+				} else if (localPath.empty() && lower.ends_with(L"\\nvngx_dlssg.dll")) {
+					otherByName = path;
+				}
+			}
+		}
+	}
+	if (localPath.empty())
+		localPath = otherByName;
+
+	const std::wstring& chosen = !downloadPath.empty() ? downloadPath : localPath;
+	const std::wstring& second = !downloadPath.empty() ? localPath : downloadPath;
+
+	Streamline::FGDllInfo info{};
+	if (!chosen.empty()) {
+		const std::wstring lower = FGLower(chosen);
+		info.found = true;
+		info.path = FGWideToUtf8(chosen);
+		info.otherPath = FGWideToUtf8(second);
+		info.source = FGClassify(lower);
+		auto version = Util::GetDllVersion(chosen);
+		if (!version && info.source == Streamline::FGDllInfo::Source::kNvidiaDownload)
+			version = FGVersionFromDownloadFolder(lower);
+		if (version) {
+			info.hasVersion = true;
+			info.version = *version;
+			info.versionText = Util::GetFormattedVersion(*version);
+		}
+	}
+	// Final once seen while DLSS-G runs and reports what it shows: NGX has created and evaluated the
+	// feature by then, so the module in use will not change for the session.
+	const auto& upscaling = globals::features::upscaling;
+	info.settled = info.found && upscaling.streamline.IsDLSSGActive() && upscaling.GetFrameGenerationPresentMultiplier() > 1.01f;
+	g_fgDll = std::move(info);
+
+	if (g_fgDll.found && g_fgDll.path != g_fgDllLoggedPath) {
+		g_fgDllLoggedPath = g_fgDll.path;
+		logger::info("[Streamline] (46w) Frame generation DLL in use: {} version {} ({}){}", g_fgDll.path, g_fgDll.versionText, g_fgDll.SourceName(),
+			g_fgDll.otherPath.empty() ? std::string() : std::format("; also loaded: {}", g_fgDll.otherPath));
+	}
+}
+
+int FGJsonInt(const json& a_json, const char* a_key, int a_default)
+{
+	const auto it = a_json.find(a_key);
+	if (it == a_json.end())
+		return a_default;
+	if (it->is_boolean())
+		return it->get<bool>() ? 1 : 0;
+	if (it->is_number_integer() || it->is_number_unsigned()) {
+		const auto value = it->get<int64_t>();
+		return static_cast<int>(std::clamp<int64_t>(value, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()));
+	}
+	if (it->is_number_float())
+		return static_cast<int>(it->get<double>());
+	return a_default;
+}
+
+std::string FGJsonString(const json& a_json, const char* a_key)
+{
+	const auto it = a_json.find(a_key);
+	if (it == a_json.end())
+		return {};
+	if (it->is_string())
+		return it->get<std::string>();
+	if (it->is_number())
+		return it->dump();
+	return {};
+}
+
+/// Caller holds g_fgDiagMutex.
+void FGReadUnlockerLocked()
+{
+	std::filesystem::path statusPath;
+	{
+		const std::wstring exe = FGModulePath(nullptr);
+		if (exe.empty())
+			return;
+		statusPath = std::filesystem::path(exe).parent_path() / kUnlockerStatusFile;
+	}
+
+	std::error_code ec;
+	if (!std::filesystem::exists(statusPath, ec)) {
+		// Keep nothing from an earlier read: without the file the game / driver default applies.
+		g_fgUnlocker = {};
+		return;
+	}
+	g_fgUnlocker.fileFound = true;
+
+	std::string text;
+	{
+		std::ifstream file(statusPath, std::ios::binary);
+		if (!file) {
+			g_fgUnlocker.lastReadFailed = true;
+			return;
+		}
+		text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+	}
+	// The unlocker rewrites the file while the game runs; a half-written read is simply skipped.
+	const json status = json::parse(text, nullptr, false);
+	if (status.is_discarded() || !status.is_object()) {
+		g_fgUnlocker.lastReadFailed = true;
+		return;
+	}
+
+	Streamline::FGUnlockerInfo info{};
+	info.fileFound = true;
+	info.parsed = true;
+	info.statusFormat = FGJsonInt(status, "version", -1);
+	const int pid = FGJsonInt(status, "pid", -1);
+	info.stale = pid > 0 && static_cast<DWORD>(pid) != GetCurrentProcessId();
+	info.presetRequested = FGJsonInt(status, "dlssgPresetRequested", -1);
+	info.presetLatched = FGJsonInt(status, "dlssgPresetLatched", -1);
+	info.presetObserved = FGJsonInt(status, "dlssgPresetObserved", -1);
+	info.presetObservedValid = FGJsonInt(status, "dlssgPresetObservedValid", -1);
+	info.restartRequired = FGJsonInt(status, "dlssgPresetRestartRequired", 0) != 0;
+	const int major = FGJsonInt(status, "activeProviderVersionMajor", -1);
+	if (major > 0) {
+		const auto part = [&](const char* a_key) { return static_cast<std::uint16_t>(std::clamp(FGJsonInt(status, a_key, 0), 0, 0xFFFF)); };
+		info.hasProviderVersion = true;
+		info.providerVersion = REL::Version(static_cast<std::uint16_t>(std::min(major, 0xFFFF)), part("activeProviderVersionMinor"),
+			part("activeProviderVersionBuild"), part("activeProviderVersionPrivate"));
+		info.providerVersionText = Util::GetFormattedVersion(info.providerVersion);
+	}
+	info.providerPath = FGJsonString(status, "activeProviderPath");
+	for (const char* key : { "unlockerVersion", "unlockerBuild", "productVersion", "buildVersion", "build" }) {
+		info.unlockerBuild = FGJsonString(status, key);
+		if (!info.unlockerBuild.empty())
+			break;
+	}
+	g_fgUnlocker = std::move(info);
+
+	if (!g_fgUnlockerLogged) {
+		g_fgUnlockerLogged = true;
+		logger::info("[Streamline] (46w) MFG Unlocker status: {}preset requested {}, latched {}, observed {}{}, restart required {}, provider {}",
+			g_fgUnlocker.stale ? "(from another game session) " : "", Streamline::FGPresetName(g_fgUnlocker.presetRequested),
+			Streamline::FGPresetName(g_fgUnlocker.presetLatched), Streamline::FGPresetName(g_fgUnlocker.presetObserved),
+			g_fgUnlocker.presetObservedValid == 0 ? " (not seen yet)" : "", g_fgUnlocker.NeedsRestart() ? "yes" : "no",
+			g_fgUnlocker.hasProviderVersion ? g_fgUnlocker.providerVersionText : std::string("-"));
+	}
+}
+
+/// Caller holds g_fgDiagMutex.
+void FGCheckWarningsLocked()
+{
+	if (!g_fgPresetCWarned && Streamline::FGPresetCNeedsNewerDll(g_fgDll, g_fgUnlocker)) {
+		g_fgPresetCWarned = true;
+		logger::warn("[Streamline] (46w) MFG Unlocker asks for frame generation Preset C, but the frame generation DLL in use is {} (Preset C needs 310.9.16 or newer)",
+			g_fgDll.hasVersion ? g_fgDll.versionText : g_fgUnlocker.providerVersionText);
+	}
+}
+}  // namespace
+
+const char* Streamline::FGDllInfo::SourceName() const
+{
+	switch (source) {
+	case Source::kLocal:
+		return "local copy (Shaders\\Upscaling\\Streamline, AIO or MO2 override)";
+	case Source::kNvidiaDownload:
+		return "NVIDIA download";
+	case Source::kOther:
+		return "other location";
+	default:
+		return "not loaded";
+	}
+}
+
+int Streamline::FGUnlockerInfo::EffectivePreset() const
+{
+	if (presetObserved >= 0 && presetObservedValid != 0)
+		return presetObserved;
+	if (presetLatched >= 0)
+		return presetLatched;
+	return presetRequested;
+}
+
+bool Streamline::FGUnlockerInfo::NeedsRestart() const
+{
+	return restartRequired || (presetRequested >= 0 && presetLatched >= 0 && presetRequested != presetLatched);
+}
+
+const char* Streamline::FGPresetName(int a_preset)
+{
+	switch (a_preset) {
+	case 0:
+		return "default";
+	case 1:
+		return "A";
+	case 2:
+		return "B";
+	case 3:
+		return "C";
+	case -1:
+		return "-";
+	default:
+		return "?";
+	}
+}
+
+Streamline::FGDllInfo Streamline::GetFGDll(bool a_force)
+{
+	std::lock_guard lock(g_fgDiagMutex);
+	try {
+		const double now = FGDiagNowSeconds();
+		// Nothing to look for when DLSS-G is not the startup backend; once final, the module does not change.
+		if (globals::features::upscaling.streamline.IsDLSSGBackendSelectedAtBoot() && !g_fgDll.settled &&
+			(a_force || now - g_fgDllLastProbe >= kFGDiagIntervalSeconds)) {
+			g_fgDllLastProbe = now;
+			FGProbeDllLocked();
+			FGCheckWarningsLocked();
+		}
+	} catch (const std::exception& e) {
+		logger::warn("[Streamline] (46w) Frame generation DLL probe failed: {}", e.what());
+	}
+	return g_fgDll;
+}
+
+Streamline::FGUnlockerInfo Streamline::GetFGUnlocker(bool a_force)
+{
+	std::lock_guard lock(g_fgDiagMutex);
+	try {
+		const double now = FGDiagNowSeconds();
+		if (a_force || now - g_fgUnlockerLastRead >= kFGDiagIntervalSeconds) {
+			g_fgUnlockerLastRead = now;
+			FGReadUnlockerLocked();
+			FGCheckWarningsLocked();
+		}
+	} catch (const std::exception& e) {
+		g_fgUnlocker.lastReadFailed = true;
+		logger::warn("[Streamline] (46w) Could not read the MFG Unlocker status: {}", e.what());
+	}
+	return g_fgUnlocker;
+}
+
+bool Streamline::FGPresetCNeedsNewerDll(const FGDllInfo& a_dll, const FGUnlockerInfo& a_unlocker)
+{
+	if (!a_unlocker.Active() || a_unlocker.presetRequested != 3)
+		return false;
+	static const REL::Version kPresetCMinimum(310, 9, 16, 0);
+	if (a_dll.hasVersion)
+		return a_dll.version < kPresetCMinimum;
+	if (a_unlocker.hasProviderVersion)
+		return a_unlocker.providerVersion < kPresetCMinimum;
+	return false;
+}
+
+std::string Streamline::DescribeFGForTrace()
+{
+	const FGDllInfo dll = GetFGDll(true);
+	const FGUnlockerInfo unlocker = GetFGUnlocker(true);
+	std::string text;
+	if (!globals::features::upscaling.streamline.IsDLSSGBackendSelectedAtBoot())
+		text = "DLSS-G not the startup backend (no FG DLL expected)";
+	else if (dll.found)
+		text = std::format("DLL {} ({}: {}){}", dll.versionText, dll.SourceName(), dll.path,
+			dll.otherPath.empty() ? std::string() : std::format(", also loaded {}", dll.otherPath));
+	else
+		text = "DLL not loaded yet";
+	if (!unlocker.fileFound) {
+		text += "; MFG Unlocker: no status file (game/driver default preset)";
+	} else if (!unlocker.parsed) {
+		text += "; MFG Unlocker: status file unreadable";
+	} else {
+		text += std::format("; MFG Unlocker{}: preset requested {}, latched {}, observed {}{}, restart required {}, provider {} ({}), build {}, status format {}",
+			unlocker.stale ? " (status from another game session, not in effect)" : "", FGPresetName(unlocker.presetRequested),
+			FGPresetName(unlocker.presetLatched), FGPresetName(unlocker.presetObserved), unlocker.presetObservedValid == 0 ? " (not seen yet)" : "",
+			unlocker.NeedsRestart() ? "yes" : "no", unlocker.hasProviderVersion ? unlocker.providerVersionText : std::string("-"),
+			unlocker.providerPath.empty() ? std::string("-") : unlocker.providerPath, unlocker.unlockerBuild.empty() ? std::string("-") : unlocker.unlockerBuild,
+			unlocker.statusFormat);
+	}
+	if (FGPresetCNeedsNewerDll(dll, unlocker))
+		text += "; WARNING: Preset C requested but the DLL is older than 310.9.16";
+	return text;
+}
+
+json Streamline::DescribeFGJson()
+{
+	const FGDllInfo dll = GetFGDll(true);
+	const FGUnlockerInfo unlocker = GetFGUnlocker(true);
+	json result;
+	result["dll"] = {
+		{ "found", dll.found },
+		{ "version", dll.versionText },
+		{ "path", dll.path },
+		{ "source", dll.SourceName() },
+		{ "also_loaded", dll.otherPath },
+		{ "settled", dll.settled },
+	};
+	result["unlocker"] = {
+		{ "status_file", unlocker.fileFound },
+		{ "parsed", unlocker.parsed },
+		{ "stale", unlocker.stale },
+		{ "last_read_failed", unlocker.lastReadFailed },
+		{ "preset_requested", FGPresetName(unlocker.presetRequested) },
+		{ "preset_latched", FGPresetName(unlocker.presetLatched) },
+		{ "preset_observed", FGPresetName(unlocker.presetObserved) },
+		{ "preset_observed_valid", unlocker.presetObservedValid },
+		{ "preset_effective", unlocker.Active() ? FGPresetName(unlocker.EffectivePreset()) : "game/driver default" },
+		{ "restart_required", unlocker.NeedsRestart() },
+		{ "provider_version", unlocker.providerVersionText },
+		{ "provider_path", unlocker.providerPath },
+		{ "unlocker_build", unlocker.unlockerBuild },
+		{ "status_format", unlocker.statusFormat },
+	};
+	result["preset_c_needs_newer_dll"] = FGPresetCNeedsNewerDll(dll, unlocker);
+	return result;
+}
 
 void Streamline::SelectDLSSGBackendAtBoot(bool a_selected)
 {

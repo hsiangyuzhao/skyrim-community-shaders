@@ -170,6 +170,67 @@ public:
 	// Cached DLL version info for Streamline plugin directory
 	static std::vector<std::pair<std::string, std::string>> dllVersions;
 
+	// ---- (46w) Read-only frame-generation diagnostics (nothing here changes behaviour) ----
+
+	/// @brief The frame-generation DLL (nvngx_dlssg) actually loaded in the process.
+	struct FGDllInfo
+	{
+		enum class Source
+		{
+			kNone,            // not loaded (yet)
+			kLocal,           // our Shaders\Upscaling\Streamline folder (the AIO copy or an MO2 override of it)
+			kNvidiaDownload,  // the driver's download under NGX\models\dlssg\versions
+			kOther            // somewhere else
+		};
+		bool found = false;
+		bool hasVersion = false;
+		REL::Version version{};
+		std::string versionText = "unknown";
+		std::string path;       // UTF-8
+		std::string otherPath;  // a second candidate that is also loaded, or empty
+		Source source = Source::kNone;
+		bool settled = false;  // probed while DLSS-G was running, so no longer re-checked
+		const char* SourceName() const;
+	};
+
+	/// @brief What the community MFG Unlocker reports in <game dir>\RTXMFG-Universal.status.json.
+	/// Presets: 0 default, 1 A, 2 B, 3 C; -1 = not in the file.
+	struct FGUnlockerInfo
+	{
+		bool fileFound = false;
+		bool parsed = false;          // at least one read was parsed
+		bool lastReadFailed = false;  // the latest read could not be parsed; the values are from the one before
+		bool stale = false;           // written by another process (its pid is not ours)
+		int presetRequested = -1;
+		int presetLatched = -1;
+		int presetObserved = -1;
+		int presetObservedValid = -1;  // -1 = not in the file
+		bool restartRequired = false;
+		bool hasProviderVersion = false;
+		REL::Version providerVersion{};
+		std::string providerVersionText;
+		std::string providerPath;
+		std::string unlockerBuild;  // empty when the file carries none
+		int statusFormat = -1;      // the file's "version" field
+		bool Active() const { return parsed && !stale; }
+		/// @brief Observed (when valid) > latched > requested; -1 when none.
+		int EffectivePreset() const;
+		/// @brief Requested differs from latched, or the unlocker says a restart is needed.
+		bool NeedsRestart() const;
+	};
+
+	static const char* FGPresetName(int a_preset);
+	/// @brief Probes (at most every few seconds unless forced, never again once settled) and returns the cached result.
+	static FGDllInfo GetFGDll(bool a_force);
+	/// @brief Re-reads the status file at most every few seconds unless forced and returns the cached result.
+	static FGUnlockerInfo GetFGUnlocker(bool a_force);
+	/// @brief Preset C asked for while the frame-generation DLL in use is older than 310.9.16.
+	static bool FGPresetCNeedsNewerDll(const FGDllInfo& a_dll, const FGUnlockerInfo& a_unlocker);
+	/// @brief One line for the F7 trace header (forces a fresh probe and read).
+	static std::string DescribeFGForTrace();
+	/// @brief The same fields for the F12 snapshot (forces a fresh probe and read).
+	static json DescribeFGJson();
+
 	void LoadInterposer();
 
 	/**
