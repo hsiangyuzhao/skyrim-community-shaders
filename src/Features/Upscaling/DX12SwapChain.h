@@ -184,7 +184,7 @@ public:
 	/// transparency, specular hit distance, SSS guide, albedo, reflectance; about 250 MB at 4K) exist only while wanted.
 	/// Created at once when wanted again; released behind the interop fence (the GPU may still read them) when not.
 	void SetRRResourcesWanted(bool a_wanted);
-	[[nodiscard]] bool RRResourcesPresent() const { return albedoShared12 != nullptr; }
+	[[nodiscard]] bool RRResourcesPresent() const;  // all six
 	/// (46p) Releases retired interop textures the GPU is done with (Present, after the frame's signal).
 	void CollectRetiredWrapped();
 
@@ -199,8 +199,9 @@ private:
 	};
 
 	// (46p) RR-only interop textures.
-	void CreateRRResources();
+	bool CreateRRResources();  // all six or none (logs a failure once)
 	bool rrResourcesWanted = true;
+	bool rrCreateFailed = false;  // not tried again until RR is switched
 	D3D11_TEXTURE2D_DESC sharedMainDesc{};  // kMAIN at the last CreateSharedResources (Width 0 = not yet)
 	struct RetiredWrapped
 	{

@@ -1686,6 +1686,24 @@ namespace RayTracingRT
 		return true;
 	}
 
+	bool Backend::TryGrowScratch(std::uint64_t a_bytes)
+	{
+		// (46p) Parallel BLAS Builds: the new scratch first; the old one is retired only once it exists. No Fail() on refusal.
+		if (scratch_ && scratchBytes_ >= a_bytes)
+			return true;
+		const std::uint64_t bytes = Align(std::max<std::uint64_t>(a_bytes, 8ull << 20), 64 * 1024);
+		auto fresh = CreateBuffer(bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true, Util::FrameTrace::VramOwner::RtScratch);
+		if (!fresh)
+			return false;
+		if (scratch_)
+			Retire(scratch_, scratchBytes_, &stats_.scratchBytes);
+		scratch_ = std::move(fresh);
+		scratch_->SetName(L"CS RayTracing Scratch");
+		scratchBytes_ = bytes;
+		stats_.scratchBytes += bytes;
+		return true;
+	}
+
 	bool Backend::EnsureTlas(std::uint32_t a_instances)
 	{
 		if (tlas_ && tlasCapacity_ >= a_instances)
@@ -1877,7 +1895,11 @@ namespace RayTracingRT
 			uploadPool_.Free(entry.upload, RetireValue());
 		// (46p) Parallel BLAS Builds: each build its own scratch slice, no barrier between them (one at the batch end, below),
 		// while the slices fit kParallelScratchBytes; else one shared scratch and a barrier before each build (46o).
-		const bool parallel = parallelBuilds_ && batch.size() > 1 && scratchSum <= kParallelScratchBytes;
+		bool parallel = parallelBuilds_ && batch.size() > 1 && scratchSum <= kParallelScratchBytes;
+		// The larger scratch is made before the old one goes; if it cannot be made (video memory full) this batch is built one by
+		// one in the scratch there is, as before -- never a reason to switch ray tracing off.
+		if (parallel && !TryGrowScratch(scratchSum))
+			parallel = false;
 		stats_.parallelBuildsLastFrame = parallel;
 		if (!EnsureScratch(parallel ? scratchSum : scratchNeed)) {
 			for (auto it = batch.rbegin(); it != batch.rend(); ++it) {

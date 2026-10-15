@@ -900,7 +900,14 @@ void DX12SwapChain::CreateSharedResources()
 	transparencyCompositionMaskShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
 	// (46p) The Ray Reconstruction-only six: here as before when wanted (DLSS RR on, or Save GPU Memory off), else none.
+	packedNormalShared12.reset();  // (46p) the old size's go first; a failed creation leaves none (logged once)
+	colorBeforeTransparencySnapshot.reset();
+	specHitDistanceShared12.reset();
+	sssGuide.reset();
+	albedoShared12.reset();
+	reflectanceShared12.reset();
 	if (rrResourcesWanted) {
+		rrCreateFailed = false;
 		CreateRRResources();
 	} else {
 		packedNormalShared12.reset();
@@ -928,36 +935,57 @@ void DX12SwapChain::CreateSharedResources()
 	}
 }
 
-void DX12SwapChain::CreateRRResources()
+bool DX12SwapChain::CreateRRResources()
 {
-	// (46p) Same descriptions as before 46p (kMAIN's, then the formats below).
-	D3D11_TEXTURE2D_DESC texDesc = sharedMainDesc;
-	packedNormalShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-	colorBeforeTransparencySnapshot = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-	texDesc.Format = DXGI_FORMAT_R32_FLOAT;
-	specHitDistanceShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-	texDesc.Format = DXGI_FORMAT_R16_FLOAT;
-	sssGuide = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-	texDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-	albedoShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	reflectanceShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	// (46p) Same descriptions as before 46p (kMAIN's, then the formats below). All six or none: built into locals, assigned
+	// only when every one succeeded (RRResourcesPresent checks all six).
+	std::unique_ptr<WrappedResource> packedNormal, snapshot, specHit, guide, albedo, reflectance;
+	try {
+		D3D11_TEXTURE2D_DESC texDesc = sharedMainDesc;
+		packedNormal = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+		snapshot = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+		texDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		specHit = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+		texDesc.Format = DXGI_FORMAT_R16_FLOAT;
+		guide = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+		texDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+		albedo = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+		texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		reflectance = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	} catch (const std::exception& e) {
+		if (!rrCreateFailed)
+			logger::error("[Upscaling] (46p) Ray Reconstruction interop textures could not be created ({}); tried again when RR is switched", e.what());
+		rrCreateFailed = true;
+		return false;
+	}
+	packedNormalShared12 = std::move(packedNormal);
+	colorBeforeTransparencySnapshot = std::move(snapshot);
+	specHitDistanceShared12 = std::move(specHit);
+	sssGuide = std::move(guide);
+	albedoShared12 = std::move(albedo);
+	reflectanceShared12 = std::move(reflectance);
+	rrCreateFailed = false;
+	return true;
+}
+
+bool DX12SwapChain::RRResourcesPresent() const
+{
+	return packedNormalShared12 && colorBeforeTransparencySnapshot && specHitDistanceShared12 && sssGuide && albedoShared12 && reflectanceShared12;
 }
 
 void DX12SwapChain::SetRRResourcesWanted(bool a_wanted)
 {
 	const bool changed = a_wanted != rrResourcesWanted;
 	rrResourcesWanted = a_wanted;
+	if (changed)
+		rrCreateFailed = false;  // a failed creation is tried again only after RR is switched
 	if (sharedMainDesc.Width == 0 || !d3d11Device || !d3d12Device)
 		return;  // CreateSharedResources follows the wish
-	if (a_wanted && !albedoShared12) {
-		try {
-			CreateRRResources();
+	const bool any = packedNormalShared12 || colorBeforeTransparencySnapshot || specHitDistanceShared12 || sssGuide || albedoShared12 || reflectanceShared12;
+	if (a_wanted && !RRResourcesPresent() && !rrCreateFailed) {
+		if (CreateRRResources())
 			logger::info("[Upscaling] (46p) Ray Reconstruction interop textures created");
-		} catch (const std::exception& e) {
-			logger::error("[Upscaling] (46p) Ray Reconstruction interop textures could not be created: {}", e.what());
-		}
-	} else if (!a_wanted && albedoShared12) {
+	} else if (!a_wanted && any) {
 		// Earlier frames' RR evaluations may still read them on the D3D12 queue: kept until the interop fence passes a value
 		// signalled after this frame's work (the next frame's first signal at the latest).
 		const UINT64 fence = fenceValue + 4;

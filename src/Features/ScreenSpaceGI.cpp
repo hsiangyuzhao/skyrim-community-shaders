@@ -500,8 +500,15 @@ void ScreenSpaceGI::SetupResources()
 
 		// (46p) Radiance (+ its prefilter copy), IL Y / CoCg and specular GI: made here unless Save GPU Memory leaves them out
 		// (GI and specular GI off); CompileComputeShaders makes or drops them as the settings change.
-		if (!IlTexturesOmitted())
-			CreateIlTextures();
+		if (!IlTexturesOmitted()) {
+			try {
+				CreateIlTextures();
+			} catch (const std::exception& e) {
+				ReleaseIlTextures();
+				ilCreateFailed = true;
+				logger::error("[SSGI] (46p) Indirect-light textures could not be created ({}); indirect lighting stays off this session", e.what());
+			}
+		}
 
 		texDesc.BindFlags &= ~D3D11_BIND_RENDER_TARGET;
 		texDesc.MiscFlags &= ~D3D11_RESOURCE_MISC_GENERATE_MIPS;
@@ -617,7 +624,7 @@ bool ScreenSpaceGI::IlTexturesOmitted() const
 {
 	// (46p) Save GPU Memory: with Indirect Lighting and specular GI off nothing reads these (radiance only under GI, the
 	// IL / specular histories only feed GI outputs; the AO path checks them for finiteness only, and a null SRV reads 0).
-	return globals::features::upscaling.settings.saveVramSsgi && !settings.EnableGI && !settings.EnableExperimentalSpecularGI;
+	return ilCreateFailed || (globals::features::upscaling.settings.saveVramSsgi && !settings.EnableGI && !settings.EnableExperimentalSpecularGI);
 }
 
 void ScreenSpaceGI::CreateIlTextures()
@@ -712,8 +719,23 @@ void ScreenSpaceGI::CompileComputeShaders()
 			logger::info("[SSGI] (46p) Indirect lighting and specular GI off: their textures released");
 		}
 	} else if (!texRadiance && ilMainDesc.Width != 0) {
-		CreateIlTextures();
-		logger::info("[SSGI] (46p) Indirect-light textures created");
+		// Mid-frame (DrawSSGI -> recompile): a failure must not leave the render hook; GI then stays off for the session.
+		try {
+			CreateIlTextures();
+			if (auto* context = globals::d3d::context) {
+				// A fresh temporal history starts from zero, never from whatever the new memory held.
+				const FLOAT zero[4] = { 0.f, 0.f, 0.f, 0.f };
+				for (auto* uav : { UavOf(texRadiance), UavOf(texIlY[0]), UavOf(texIlY[1]), UavOf(texIlCoCg[0]), UavOf(texIlCoCg[1]), UavOf(texGiSpecular[0]),
+						 UavOf(texGiSpecular[1]) })
+					if (uav)
+						context->ClearUnorderedAccessViewFloat(uav, zero);
+			}
+			logger::info("[SSGI] (46p) Indirect-light textures created");
+		} catch (const std::exception& e) {
+			ReleaseIlTextures();
+			ilCreateFailed = true;
+			logger::error("[SSGI] (46p) Indirect-light textures could not be created ({}); indirect lighting stays off this session", e.what());
+		}
 	}
 
 	struct ShaderCompileInfo
@@ -932,7 +954,8 @@ void ScreenSpaceGI::DrawSSGI()
 	uint inputGITexIdx = lastFrameGITexIdx;
 
 	// (batch 37b, C-2) IL off: the radiance copy + prefilter and the IL blur serve nothing.
-	const bool skipIlPasses = !compiledWithGI;
+	// (46p) Or the indirect-light textures are absent (could not be made): nothing to prefilter or blur.
+	const bool skipIlPasses = !compiledWithGI || !texRadiance;
 	ilPassesSkipped = skipIlPasses;
 
 	//////////////////////////////////////////////////////

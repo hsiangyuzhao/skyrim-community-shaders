@@ -2540,8 +2540,18 @@ void RayTracing::RunFrame()
 	lastQuality = quality;
 	const DenoiserMode denoiser = EffectiveDenoiser();
 	lastEffectiveDenoiser = denoiser;
-	// (46p) Save GPU Memory: the denoiser not in effect gives its textures back (made again on first use).
-	if (globals::features::upscaling.settings.saveVramFreeRtWhenOff) {
+	// (46p) Save GPU Memory: the denoiser not in effect gives its textures back (made again on first use) -- only once the
+	// effective one has held for 120 frames of play (RR can flip it on map / menu warm-up frames: no free / remake churn).
+	if (denoiser == denoiserStableMode) {
+		denoiserStableFrames = std::min(denoiserStableFrames + 1, 1000000);
+	} else {
+		denoiserStableMode = denoiser;
+		denoiserStableFrames = 0;
+	}
+	auto* denoiserUi = globals::game::ui;
+	const bool denoiserCalm = denoiserStableFrames >= 120 && phase == Phase::Play && !loadingOpen.load() && denoiserUi && !denoiserUi->GameIsPaused() &&
+	                          !denoiserUi->IsMenuOpen(RE::MapMenu::MENU_NAME);
+	if (globals::features::upscaling.settings.saveVramFreeRtWhenOff && denoiserCalm) {
 		if (denoiser != DenoiserMode::Penumbra && (denoiseTiles.texture || history4[0].texture))
 			ReleaseDenoiser();
 		if (denoiser != DenoiserMode::Sigma && (sigma || sigmaOut.texture))

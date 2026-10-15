@@ -968,6 +968,9 @@ namespace RayTracingRT
 		bool CreatePipeline(std::string& o_reason);
 		void WriteDescriptors();
 		bool EnsureScratch(std::uint64_t a_bytes);
+		/// (46p) Grows the shared scratch to a_bytes, making the new buffer before retiring the old; false (nothing changed, no Fail)
+		/// when it cannot be made.
+		bool TryGrowScratch(std::uint64_t a_bytes);
 		bool EnsureTlas(std::uint32_t a_instances);
 		bool EnsureInstanceBuffer(CommandContext& a_context, std::uint32_t a_instances);
 		void ProcessCompaction(ID3D12GraphicsCommandList4* a_list, std::uint64_t a_completed, std::uint32_t a_max, std::int64_t a_deadline);

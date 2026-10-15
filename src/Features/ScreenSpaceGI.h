@@ -201,6 +201,7 @@ public:
 	eastl::unique_ptr<Texture2D> texGiSpecular[2] = { nullptr };
 	// (46p) Save GPU Memory: radiance, its prefilter copy, IL Y / CoCg and specular GI exist only while GI or specular GI is on.
 	D3D11_TEXTURE2D_DESC ilMainDesc{};  // kMAIN at SetupResources (Width 0 = not yet)
+	bool ilCreateFailed = false;         // they could not be made: treated as omitted for the session
 	[[nodiscard]] bool IlTexturesOmitted() const;
 	void CreateIlTextures();
 	void ReleaseIlTextures();

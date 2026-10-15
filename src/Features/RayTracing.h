@@ -430,6 +430,8 @@ private:
 	float prepassCpuMs = 0.0f;
 	QualityParams lastQuality{};
 	DenoiserMode lastEffectiveDenoiser = DenoiserMode::Off;
+	DenoiserMode denoiserStableMode = DenoiserMode::Off;  // (46p) the effective denoiser and for how many frames it has held
+	int denoiserStableFrames = 0;
 	// (45k) Screen Space Shadows drawn by us this frame (non-RT casters only).
 	bool sssClaimed = false;
 	// (45k) Loading screens and the warm-up after them.
