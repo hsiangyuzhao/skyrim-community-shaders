@@ -570,6 +570,8 @@ namespace RayTracingRT
 
 		/// (46p) Parallel BLAS Builds: the static builds of one batch get a scratch slice each and no barrier between them.
 		void SetParallelBuilds(bool a_on) { parallelBuilds_ = a_on; }
+		/// (46p) Trace submissions recorded so far (the newest RtPrepWork::submission).
+		[[nodiscard]] std::uint64_t SubmissionsTotal() const { return submissions_; }
 		/// (46p) Keep Our GPU Memory Resident: our video-memory resources (pools, TLAS, scratch, shared textures) get
 		/// D3D12_RESIDENCY_PRIORITY_HIGH (else NORMAL). Applied to what exists when it changes, and to every later creation.
 		void SetResidencyHigh(bool a_high);
@@ -957,6 +959,7 @@ namespace RayTracingRT
 		Util::FrameTrace::RtPrepWork recWork_{};
 		std::uint64_t workBlocksSeen_ = 0;
 		std::uint64_t workReleasedSeen_ = 0;
+		std::uint64_t submissions_ = 0;  // (46p) trace submissions recorded (RtPrepWork::submission)
 		/// (46p) Copies the skinning counts of the RecordSkinning just run (and uploads since a_uploadsBefore) into recWork_.
 		void NoteSkinWork(std::uint64_t a_uploadsBefore);
 		bool CheckSharedFormat(DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store, const char* a_name, bool a_fatal = true);

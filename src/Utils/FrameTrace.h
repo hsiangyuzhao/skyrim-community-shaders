@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 struct ID3D11DeviceChild;  // (46p)
 struct ID3D12Object;
@@ -94,6 +95,8 @@ namespace Util::FrameTrace
 		uint32_t tlasInstances = 0;
 		uint32_t poolBlocks = 0;       ///< pool blocks adopted since the previous submission (growth)
 		uint32_t poolReleased = 0;     ///< pool blocks released since the previous submission
+		uint64_t submission = 0;       ///< the backend's trace submission number
+		uint32_t sampleAge = 0;        ///< submissions between this one and the frame's own (the RT GPU columns on a row are this many frames old)
 	};
 
 	/// (45j) Ray Tracing's CPU split this frame (ms; -1 = not run) and its counters.
@@ -326,6 +329,11 @@ namespace Util::FrameTrace
 	void SetKeepResident(bool a_on);
 	/// (46p) Bytes of D3D11 resources our DLL created and that are alive (tagged), for the overlay / trace.
 	uint64_t OurD3D11LiveBytes();
+	/// (46p) Our creations on this thread are billed to feature a_name until cleared (empty). Without a scope: the pass open on
+	/// the main thread (while the overlay / a trace runs), else "other".
+	void SetVramScope(std::string_view a_name);
+	/// (46p) "name MB, ..." alive per feature of ours (largest first), for the trace header.
+	std::string DescribeOurVramByFeature();
 
 	// ---- (46p) coarse GPU time per engine segment (recording only) --------------------------------------------------
 	/// EngineTiming: the main thread entered segment a_seg (EngineTiming::Seg as int). A D3D11 timestamp at every change

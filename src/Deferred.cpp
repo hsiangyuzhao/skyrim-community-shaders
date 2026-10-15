@@ -904,6 +904,17 @@ ID3D11ComputeShader* Deferred::GetComputeMainComposite()
 	return mainCompositeCS;
 }
 
+void Deferred::PrecompileLazyShaders()
+{
+	// (46p) Same rule as the composite pass: the AO-spares-direct state first (a flip rebuilds both variants), then both.
+	if (const bool aoSparesDirect = Batch37b::SsgiAoSparesDirectActive(); aoSparesDirect != compositeAoSparesDirect) {
+		ClearShaderCache();
+		compositeAoSparesDirect = aoSparesDirect;
+	}
+	GetComputeMainComposite();
+	GetComputeMainCompositeInterior();
+}
+
 ID3D11ComputeShader* Deferred::GetComputeMainCompositeInterior()
 {
 	if (!mainCompositeInteriorCS) {

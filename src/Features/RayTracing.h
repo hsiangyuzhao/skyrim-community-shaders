@@ -234,6 +234,8 @@ public:
 	virtual void RestoreDefaultSettings() override;
 	virtual void SetupResources() override;
 	virtual void ClearShaderCache() override;
+	/// (46p) Precompile Lazy Shaders: the D3D11 passes the current settings will use (main thread, outside the frame's passes).
+	void PrecompileShaders();
 	virtual void DataLoaded() override;
 	virtual void PostPostLoad() override;
 	virtual void Prepass() override;

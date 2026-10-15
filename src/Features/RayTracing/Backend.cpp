@@ -2445,6 +2445,7 @@ namespace RayTracingRT
 			workReleasedSeen_ = stats_.pools.blocksReleased;
 			recWork_.early = early ? 1 : 0;
 			recWork_.valid = 1;
+			recWork_.submission = ++submissions_;
 			context.work = recWork_;
 		}
 		if (FAILED(hr = traceList->Close()))

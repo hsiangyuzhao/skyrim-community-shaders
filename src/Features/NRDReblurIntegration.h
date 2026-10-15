@@ -4,6 +4,8 @@
 #include <EASTL/vector.h>
 #include <NRD.h>
 #include <d3d11.h>
+#include <memory>
+#include <vector>
 #include <winrt/base.h>
 #include <wrl/client.h>
 
@@ -85,6 +87,16 @@ private:
 	eastl::vector<PoolTexture> m_permanentPool;
 	eastl::vector<PoolTexture> m_transientPool;
 	PoolTexture m_validation;
+	// (46p) Save GPU Memory: transient pool textures shared between NRD instances (they only live inside one Denoise call; the
+	// instances denoise one after another on the immediate context). This instance's hold on the shared entries.
+	struct SharedTransient
+	{
+		PoolTexture texture;
+		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+		uint32_t width = 0, height = 0;
+	};
+	std::vector<std::shared_ptr<SharedTransient>> m_sharedTransient;
+	static inline std::vector<std::weak_ptr<SharedTransient>> s_sharedTransient;  // every instance's (render thread only)
 
 	// Per-pipeline DX11 compute shaders (indexed by PipelineDesc order)
 	eastl::vector<winrt::com_ptr<ID3D11ComputeShader>> m_pipelines;

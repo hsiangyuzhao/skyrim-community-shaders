@@ -32,6 +32,9 @@
 #include "Features/Upscaling.h"
 #include "Features/VR.h"
 #include "Features/VolumetricLighting.h"
+#include "Deferred.h"                       // (46p) Precompile Lazy Shaders
+#include "Features/RayTracing.h"
+#include "Features/ScreenSpaceShadows.h"
 
 #include "ShaderTools/BSShaderHooks.h"
 
@@ -938,6 +941,30 @@ namespace Hooks
 				pacer.noOverSleep = upscaling.settings.reflexPacerNoOverSleep;  // (46p)
 				pacer.smoothPhase = upscaling.settings.reflexPacerSmoothPhase;  // (46p)
 				Util::FrameTrace::SetKeepResident(upscaling.settings.keepGpuMemoryResident);  // (46p) for resources made from now on
+				// (46p) Precompile Lazy Shaders: once, on the first main-menu or loading-screen frame (the main thread, before this
+				// frame renders): the deferred composite variants, screen-space shadows' edge pass, ray tracing's D3D11 passes.
+				static bool precompiled = false;
+				if (!precompiled && upscaling.settings.precompileLazyShaders) {
+					auto* ui = globals::game::ui;
+					if (ui && (ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME))) {
+						precompiled = true;
+						LARGE_INTEGER q0, q1, qf;
+						QueryPerformanceCounter(&q0);
+						try {
+							if (globals::deferred)
+								globals::deferred->PrecompileLazyShaders();
+							if (globals::features::screenSpaceShadows.loaded)
+								globals::features::screenSpaceShadows.GetComputeEdgeSmooth();
+							if (globals::features::rayTracing.loaded)
+								globals::features::rayTracing.PrecompileShaders();
+						} catch (const std::exception& e) {
+							logger::warn("[Precompile] {}", e.what());
+						}
+						QueryPerformanceCounter(&q1);
+						QueryPerformanceFrequency(&qf);
+						logger::info("[Precompile] (46p) Lazy shaders prepared in {:.1f} ms", static_cast<double>(q1.QuadPart - q0.QuadPart) * 1000.0 / static_cast<double>(qf.QuadPart));
+					}
+				}
 				if (auto* ui = globals::game::ui)  // (46o) the pacer starts over when these end
 					pacer.paused = ui->GameIsPaused() || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) || ui->IsMenuOpen(RE::MapMenu::MENU_NAME);
 				Util::LatencyPacer::PaceFrameStart(pacer);

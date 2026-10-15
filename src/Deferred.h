@@ -34,6 +34,8 @@ public:
 
 	ID3D11ComputeShader* GetComputeMainComposite();
 	ID3D11ComputeShader* GetComputeMainCompositeInterior();
+	/// (46p) Precompile Lazy Shaders: both composite variants now (main thread, outside the frame's passes).
+	void PrecompileLazyShaders();
 
 	ID3D11BlendState* deferredBlendStates[7][2][13][2];
 	ID3D11BlendState* forwardBlendStates[7][2][13][2];

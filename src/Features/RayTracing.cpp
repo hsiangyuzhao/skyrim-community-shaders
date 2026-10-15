@@ -1331,6 +1331,26 @@ void RayTracing::ClearShaderCache()
 	aoCompositeCS = nullptr;
 }
 
+void RayTracing::PrecompileShaders()
+{
+	// (46p) What the first traced frame would compile on the spot (26.6 ms in 46o's post-load log): the same getters, now.
+	if (!loaded || !settings.Enabled)
+		return;
+	GetShader(prepareCS, L"Data\\Shaders\\RayTracing\\PrepareCS.hlsl", "PrepareCS");
+	GetShader(combineCS, L"Data\\Shaders\\RayTracing\\CombineCS.hlsl", "CombineCS");
+	if (ValidDenoiser(settings.Denoiser) == static_cast<int>(DenoiserMode::Penumbra)) {
+		GetShader(denoiseTileCS, L"Data\\Shaders\\RayTracing\\DenoiseTileCS.hlsl", "DenoiseTileCS");
+		GetShaderDefined(denoiseHalfHCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS (half)", "DENOISE_HALF");
+		GetShaderDefined(denoiseHCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS", nullptr);
+		GetShaderDefined(denoiseHalfVCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS (half, vertical)", "DENOISE_HALF,DENOISE_VERTICAL");
+		GetShaderDefined(denoiseVCS, L"Data\\Shaders\\RayTracing\\DenoiseSpatialCS.hlsl", "DenoiseSpatialCS (vertical)", "DENOISE_VERTICAL");
+	}
+	if (settings.PointLights) {
+		GetShader(pointDenoiseCS, L"Data\\Shaders\\RayTracing\\PointDenoiseCS.hlsl", "PointDenoiseCS");
+		GetShader(pointMaskCS, L"Data\\Shaders\\RayTracing\\PointMaskCS.hlsl", "PointMaskCS");
+	}
+}
+
 ID3D11ComputeShader* RayTracing::GetShader(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name)
 {
 	if (!a_shader) {
@@ -2306,6 +2326,8 @@ void RayTracing::PublishCpuSplit()
 		if (activeThisFrame) {
 			detail.prepGpuMs = stats.lastPrepGpuMs;
 			detail.prepWork = stats.lastPrepWork;  // (46p) the same submission's work
+		if (detail.prepWork.valid && backend.SubmissionsTotal() >= detail.prepWork.submission)
+			detail.prepWork.sampleAge = static_cast<std::uint32_t>(backend.SubmissionsTotal() - detail.prepWork.submission);
 			detail.traceGpuMs = stats.lastTraceGpuMs;
 		}
 		detail.quality = settings.QualityLevel;

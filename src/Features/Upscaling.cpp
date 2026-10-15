@@ -82,6 +82,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	saveVramFreeFgWhenOff,
 	saveVramLazyPost,
 	saveVramUpscalerMasks,
+	saveVramNrdShared,
 	copyRenderedAreaOnly,
 	precompileLazyShaders,
 	neuralRendering);
@@ -685,6 +686,9 @@ void Upscaling::DrawAdvancedSettings()
 		ImGui::Checkbox("Upscaler Masks Only For FSR", &settings.saveVramUpscalerMasks);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted("Two 4K mask textures only FSR reads are not kept with DLSS (DLSS has its own copies).");
+		ImGui::Checkbox("NRD Denoisers Share Scratch Textures", &settings.saveVramNrdShared);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("The NRD denoisers (SSRT REBLUR diffuse / specular, RT SIGMA) share their scratch textures (about 90 MB). Takes effect when they are next made (restart).");
 		ImGui::Checkbox("Copy Only the Rendered Area", &settings.copyRenderedAreaOnly);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::TextUnformatted("The per-frame hand-over copies to DLSS (colour, motion, depth, RR inputs) copy only the part of the picture that is");
@@ -2461,7 +2465,8 @@ void Upscaling::UpscaleDepth()
 			// Set depth stencil state to write 0x00
 			context->OMSetDepthStencilState(upscaleDepthStencilState.get(), 0x00);
 
-			context->CopyResource(refractionNormals.textureCopy, refractionNormals.texture);
+			// (46p) Copy Only the Rendered Area: DepthRefractionUpscalePS clamps its UVs to the render rect (bilinear: +1 texel).
+			CopyRenderedArea(context, refractionNormals.textureCopy, refractionNormals.texture);
 
 			ID3D11ShaderResourceView* srvs[] = { refractionNormals.SRVCopy, depthCopy.depthSRV, depthCopy.stencilSRV };
 			context->PSSetShaderResources(0, ARRAYSIZE(srvs), srvs);

@@ -14,8 +14,12 @@
 #include "Utils/WorldTiming.h"
 
 #include <d3d12.h>  // (46p) TagVram on D3D12 objects
+#include <algorithm>
+#include <deque>
 #include <intrin.h>
+#include <mutex>
 #include <new>
+#include <set>
 #include <thread>
 
 namespace Util::FrameTrace
@@ -134,12 +138,36 @@ namespace Util::FrameTrace
 		// {6E3D0F2A-91B4-4C7D-8E25-3A9F1C64B70D}: our private-data slot on tagged resources.
 		constexpr GUID kVramTagGuid = { 0x6e3d0f2a, 0x91b4, 0x4c7d, { 0x8e, 0x25, 0x3a, 0x9f, 0x1c, 0x64, 0xb7, 0x0d } };
 
+		/// Bytes alive per feature of ours (entries never go away: a deque keeps their addresses).
+		struct FeatureVram
+		{
+			std::string name;
+			std::atomic<int64_t> live{ 0 };
+			explicit FeatureVram(std::string_view a_name) :
+				name(a_name) {}
+		};
+		// Never destroyed (heap, leaked on purpose): resources may be released after our statics at process exit, and their
+		// tags still reach these.
+		std::mutex& g_featureMutex = *new std::mutex();
+		std::deque<FeatureVram>& g_featureVram = *new std::deque<FeatureVram>();
+		std::set<std::string, std::less<>>& g_scopeNames = *new std::set<std::string, std::less<>>();
+		thread_local std::string_view t_vramScope;
+
+		FeatureVram* FeatureEntry(std::string_view a_name)
+		{
+			std::scoped_lock lock(g_featureMutex);
+			for (auto& entry : g_featureVram)
+				if (entry.name == a_name)
+					return &entry;
+			return &g_featureVram.emplace_back(a_name);
+		}
+
 		/// Held by the resource as private data: the runtime releases it when the resource is destroyed.
 		class VramTag final : public IUnknown
 		{
 		public:
-			VramTag(int a_owner, uint64_t a_bytes) :
-				owner(a_owner), bytes(a_bytes) {}
+			VramTag(int a_owner, uint64_t a_bytes, FeatureVram* a_feature) :
+				owner(a_owner), bytes(a_bytes), feature(a_feature) {}
 
 			HRESULT STDMETHODCALLTYPE QueryInterface(REFIID a_riid, void** a_out) override
 			{
@@ -158,8 +186,11 @@ namespace Util::FrameTrace
 			{
 				const ULONG left = refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
 				if (left == 0) {
-					if (counted)
+					if (counted) {
 						g_vramFreed[owner].fetch_add(bytes, std::memory_order_relaxed);
+						if (feature)
+							feature->live.fetch_sub(static_cast<int64_t>(bytes), std::memory_order_relaxed);
+					}
 					delete this;
 				}
 				return left;
@@ -171,20 +202,23 @@ namespace Util::FrameTrace
 			std::atomic<ULONG> refs{ 1 };
 			int owner;
 			uint64_t bytes;
+			FeatureVram* feature;
 		};
 
 		template <class T>
-		void TagObject(T* a_object, VramOwner a_owner, uint64_t a_bytes)
+		void TagObject(T* a_object, VramOwner a_owner, uint64_t a_bytes, FeatureVram* a_feature = nullptr)
 		{
 			const int owner = static_cast<int>(a_owner);
 			if (!a_object || a_bytes == 0 || owner < 0 || owner >= kVramOwners)
 				return;
-			auto* tag = new (std::nothrow) VramTag(owner, a_bytes);
+			auto* tag = new (std::nothrow) VramTag(owner, a_bytes, a_feature);
 			if (!tag)
 				return;
 			if (SUCCEEDED(a_object->SetPrivateDataInterface(kVramTagGuid, tag))) {
 				tag->counted = true;
 				g_vramNew[owner].fetch_add(a_bytes, std::memory_order_relaxed);
+				if (a_feature)
+					a_feature->live.fetch_add(static_cast<int64_t>(a_bytes), std::memory_order_relaxed);
 			}
 			tag->Release();  // the resource holds it now (or nobody: then it goes uncounted)
 		}
@@ -409,6 +443,7 @@ namespace Util::FrameTrace
 			float gpuSegOtherMs = -1.0f;
 			float gpuSegTotalMs = -1.0f;
 			int gpuSegStamps = -1;
+			float postGpuMs = -1.0f;  // (46p) our post-processing chain, last GPU sample (GpuPassTimers PostProcessing)
 		};
 
 		struct ReflexTimes
@@ -638,7 +673,9 @@ namespace Util::FrameTrace
 			}
 			if (globals::state) {
 				const float2 output = globals::state->screenSize;
-				const float2 render = Util::ConvertToDynamic(output, true);
+				// (46p) The upscaler's render size (ConvertToDynamic here, outside the frame's dynamic-resolution window, gave the output size).
+				const float2 render = up.loaded ? float2{ std::floor(output.x * up.resolutionScale.x), std::floor(output.y * up.resolutionScale.y) } :
+				                                  Util::ConvertToDynamic(output, true);
 				text += std::format("; render {}x{}, output {}x{}", static_cast<int>(std::floor(render.x)), static_cast<int>(std::floor(render.y)),
 					static_cast<int>(output.x), static_cast<int>(output.y));
 			}
@@ -847,6 +884,9 @@ namespace Util::FrameTrace
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
 				out << "#   refits, skinning dispatches (vertices), TLAS instances, pool blocks adopted / released since the previous submission.\n";
+				out << "#   rt_pw_sample_age = trace submissions between that one and this frame's: rt_prep_gpu_ms, rt_trace_gpu_ms, rt_queue_gap_gpu_ms,\n";
+				out << "#   rt_pl_gpu_ms and rtao_gpu_ms on this row belong to the frame that many rows up (rt_sync_* / rt_denoise_* are D3D11 samples, 1-4 frames).\n";
+				out << "#   post_gpu_ms = our post-processing chain (last GPU sample, a few frames old). The F7 header's render size is now the upscaler's.\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -898,7 +938,7 @@ namespace Util::FrameTrace
 				out << ",gpu_seg_other_ms,gpu_seg_total_ms,gpu_seg_stamps"
 					   ",rt_pw_valid,rt_pw_early,rt_pw_builds,rt_pw_builds_alpha,rt_pw_build_tris,rt_pw_build_mb,rt_pw_compactions,rt_pw_compact_mb,"
 					   "rt_pw_skin_uploads,rt_pw_skin_builds,rt_pw_skin_refits,rt_pw_group_builds,rt_pw_group_tris,rt_pw_group_refits,rt_pw_skin_dispatches,"
-					   "rt_pw_skin_verts,rt_pw_tlas_instances,rt_pw_pool_blocks,rt_pw_pool_released\n";
+					   "rt_pw_skin_verts,rt_pw_tlas_instances,rt_pw_pool_blocks,rt_pw_pool_released,rt_pw_sample_age,post_gpu_ms\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1005,6 +1045,8 @@ namespace Util::FrameTrace
 						s += std::format(",{},{},{},{},{},{:.2f},{},{:.2f},{},{},{},{},{},{},{},{},{},{},{}\n", w.valid, w.early, w.builds, w.buildsAlpha, w.buildTriangles,
 							static_cast<double>(w.buildBytes) * kMb, w.compactions, static_cast<double>(w.compactBytes) * kMb, w.skinUploads, w.skinBuilds, w.skinRefits,
 							w.groupBuilds, w.groupTriangles, w.groupRefits, w.skinDispatches, w.skinVertices, w.tlasInstances, w.poolBlocks, w.poolReleased);
+						s.pop_back();  // the line end, after the two below
+						s += std::format(",{},{:.3f}\n", w.sampleAge, a_row.postGpuMs);
 					}
 					return s;
 				};
@@ -2106,6 +2148,7 @@ namespace Util::FrameTrace
 				r.rt = g_frame.rt;
 				r.lights = g_frame.lights;
 				SampleScreenSpacePasses(r);  // (46e)
+				r.postGpuMs = Util::GpuPassTimers::GetSingleton()->LastSampleMs(Util::GpuBucket::PostProcessing);  // (46p)
 				r.cpuTop = Util::CpuPassTimers::GetSingleton()->TopOfCurrentFrame(3);
 				r.world = std::move(world);
 				r.driverMiscMs = static_cast<float>(g_frame.driverMisc);
@@ -2285,6 +2328,15 @@ namespace Util::FrameTrace
 					owners += std::format("{}{} {:.0f}", owners.empty() ? "" : ", ", VramOwnerName(static_cast<VramOwner>(i)),
 						(static_cast<double>(snap.created[i]) - static_cast<double>(snap.freed[i])) / (1024.0 * 1024.0));
 				g_header46o += std::format("; (46p) alive by owner at start (MB, tagged since start-up): {}", owners);
+				// (46p) The main render target's format (bUse64bitsHDRRenderTarget: RGBA16F = 8 bytes a pixel) and ours per feature.
+				D3D11_TEXTURE2D_DESC mainDesc{};
+				if (auto* renderer = globals::game::renderer) {
+					auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+					if (main.texture)
+						main.texture->GetDesc(&mainDesc);
+				}
+				g_header46o += std::format("; kMAIN {}x{} format {} ({}); our video memory per feature at start (MB, tagged D3D11 + RT D3D12): {}",
+					mainDesc.Width, mainDesc.Height, static_cast<int>(mainDesc.Format), magic_enum::enum_name(mainDesc.Format), DescribeOurVramByFeature());
 			}
 		}
 		logger::info("[FrameTrace] Recording {:.0f} s", a_seconds);
@@ -2368,7 +2420,44 @@ namespace Util::FrameTrace
 	}
 
 	void TagVram(ID3D11DeviceChild* a_object, VramOwner a_owner, uint64_t a_bytes) { TagObject(a_object, a_owner, a_bytes); }
-	void TagVram(ID3D12Object* a_object, VramOwner a_owner, uint64_t a_bytes) { TagObject(a_object, a_owner, a_bytes); }
+	void TagVram(ID3D12Object* a_object, VramOwner a_owner, uint64_t a_bytes)
+	{
+		// (46p) Every D3D12 resource of ours is ray tracing's (system-memory heaps not billed to it).
+		static FeatureVram* const rt = FeatureEntry("RayTracing (D3D12)");
+		const bool sysmem = a_owner == VramOwner::RtUpload || a_owner == VramOwner::RtReadback;
+		TagObject(a_object, a_owner, a_bytes, sysmem ? nullptr : rt);
+	}
+
+	void SetVramScope(std::string_view a_name)
+	{
+		if (a_name.empty()) {
+			t_vramScope = {};
+			return;
+		}
+		std::scoped_lock lock(g_featureMutex);
+		auto it = g_scopeNames.find(a_name);
+		if (it == g_scopeNames.end())
+			it = g_scopeNames.emplace(a_name).first;
+		t_vramScope = *it;
+	}
+
+	std::string DescribeOurVramByFeature()
+	{
+		std::vector<std::pair<int64_t, std::string>> rows;
+		{
+			std::scoped_lock lock(g_featureMutex);
+			for (const auto& entry : g_featureVram) {
+				const int64_t live = entry.live.load(std::memory_order_relaxed);
+				if (live >= (512ll << 10))
+					rows.emplace_back(live, entry.name);
+			}
+		}
+		std::sort(rows.begin(), rows.end(), [](const auto& a_l, const auto& a_r) { return a_l.first > a_r.first; });
+		std::string text;
+		for (const auto& [live, name] : rows)
+			text += std::format("{}{} {:.0f}", text.empty() ? "" : ", ", name, static_cast<double>(live) / (1024.0 * 1024.0));
+		return text.empty() ? std::string("nothing tagged") : text;
+	}
 
 	namespace
 	{
@@ -2391,7 +2480,15 @@ namespace Util::FrameTrace
 	void OnD3D11Created(ID3D11DeviceChild* a_resource, uint64_t a_bytes, bool a_shared, bool a_staging, bool a_target, const void* a_caller)
 	{
 		const VramOwner owner = a_staging ? VramOwner::D3D11Staging : OwnerOfCaller(a_caller, a_shared);
-		TagObject(a_resource, owner, a_bytes);
+		// (46p) Ours: billed to the feature setting up (scope), else the pass open on the main thread, else "other".
+		FeatureVram* feature = nullptr;
+		if (owner == VramOwner::D3D11Ours || owner == VramOwner::D3D11Shared) {
+			std::string_view name = t_vramScope;
+			if (name.empty())
+				name = EngineTiming::CurrentPassName();
+			feature = FeatureEntry(name.empty() ? std::string_view("other (lazy, no pass open)") : name);
+		}
+		TagObject(a_resource, owner, a_bytes, feature);
 		// (46p) Keep Our GPU Memory Resident: our render targets / UAVs (histories, interop, work textures) are evicted last.
 		if (a_target && a_resource && (owner == VramOwner::D3D11Ours || owner == VramOwner::D3D11Shared) && g_keepResident.load(std::memory_order_relaxed)) {
 			winrt::com_ptr<IDXGIResource> dxgi;

@@ -130,6 +130,8 @@ namespace Util::EngineTiming
 	void AddPassBlock(PassBlock a_kind, double a_ms);
 	/// Index of the frame in progress (TakeFrame closes it), for matching late GPU samples to rows.
 	uint64_t FrameId();
+	/// (46p) The pass open right now on the main thread (innermost; empty when none, off the main thread, or not tracking).
+	std::string_view CurrentPassName();
 	/// Interned pass name of a GPU bucket ("g.<bucket>"), or empty while it has not run.
 	std::string_view GpuPassName(int a_bucket);
 

@@ -3,6 +3,10 @@
 #include "Globals.h"
 #include "Utils/D3D.h"
 #include "Utils/DenoiserTimers.h"
+#include "Features/Upscaling.h"  // (46p) Save GPU Memory switches
+
+#include <algorithm>
+#include <memory>
 
 #include <d3d11shader.h>
 #include <d3dcompiler.h>
@@ -391,6 +395,25 @@ void NRDReblurIntegration::CreatePoolTextures(uint32_t w, uint32_t h)
 		d3dDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 
 		PoolTexture& pt = isPermanent ? m_permanentPool[poolIdx] : m_transientPool[poolIdx];
+		// (46p) Save GPU Memory: a transient texture of the same format and size another instance (or nobody in this one) holds
+		// is shared (transient contents never outlive a Denoise call).
+		if (!isPermanent && globals::features::upscaling.settings.saveVramNrdShared) {
+			std::shared_ptr<SharedTransient> found;
+			for (auto& weak : s_sharedTransient) {
+				auto entry = weak.lock();
+				if (!entry || entry->format != fmt || entry->width != tw || entry->height != th)
+					continue;
+				if (std::find(m_sharedTransient.begin(), m_sharedTransient.end(), entry) != m_sharedTransient.end())
+					continue;  // already one of this instance's slots
+				found = std::move(entry);
+				break;
+			}
+			if (found) {
+				pt = found->texture;
+				m_sharedTransient.push_back(std::move(found));
+				continue;
+			}
+		}
 		DX::ThrowIfFailed(device->CreateTexture2D(&d3dDesc, nullptr, pt.texture.put()));
 
 		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
@@ -403,6 +426,15 @@ void NRDReblurIntegration::CreatePoolTextures(uint32_t w, uint32_t h)
 		uavDesc.Format = fmt;
 		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
 		DX::ThrowIfFailed(device->CreateUnorderedAccessView(pt.texture.get(), &uavDesc, pt.uav.put()));
+		if (!isPermanent && globals::features::upscaling.settings.saveVramNrdShared) {
+			auto entry = std::make_shared<SharedTransient>();
+			entry->texture = pt;
+			entry->format = fmt;
+			entry->width = tw;
+			entry->height = th;
+			s_sharedTransient.push_back(entry);
+			m_sharedTransient.push_back(std::move(entry));
+		}
 	}
 }
 
@@ -410,6 +442,8 @@ void NRDReblurIntegration::DestroyPoolTextures()
 {
 	m_permanentPool.clear();
 	m_transientPool.clear();
+	m_sharedTransient.clear();  // (46p)
+	std::erase_if(s_sharedTransient, [](const std::weak_ptr<SharedTransient>& a_entry) { return a_entry.expired(); });
 }
 
 void NRDReblurIntegration::CreateValidationTexture()

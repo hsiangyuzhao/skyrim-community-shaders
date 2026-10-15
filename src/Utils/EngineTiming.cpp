@@ -1001,6 +1001,14 @@ namespace Util::EngineTiming
 
 	uint64_t FrameId() { return g_frameId; }
 
+	std::string_view CurrentPassName()
+	{
+		if (!OnMainThread() || g_passDepth <= 0)
+			return {};
+		const int key = g_passStack[g_passDepth - 1].key;
+		return key >= 0 && key < g_passKeyCount ? std::string_view(g_passKeys[key].name) : std::string_view{};
+	}
+
 	std::string_view GpuPassName(int a_bucket)
 	{
 		if (a_bucket < 0 || a_bucket >= kMaxGpuBuckets || g_gpuPassKey[a_bucket] < 0)

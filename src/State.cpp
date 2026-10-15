@@ -217,12 +217,20 @@ void State::Reset()
 
 void State::Setup()
 {
+	// (46p) Each one's D3D11 creations are billed to it (F7 header: our video memory per feature).
+	Util::FrameTrace::SetVramScope("TruePBR");
 	globals::truePBR->SetupResources();
+	Util::FrameTrace::SetVramScope("State");
 	SetupResources();
-	for (auto* feature : Feature::GetFeatureList())
-		if (feature->loaded)
+	for (auto* feature : Feature::GetFeatureList()) {
+		if (feature->loaded) {
+			Util::FrameTrace::SetVramScope(feature->GetShortName());
 			feature->SetupResources();
+		}
+	}
+	Util::FrameTrace::SetVramScope("Deferred");
 	globals::deferred->SetupResources();
+	Util::FrameTrace::SetVramScope({});
 }
 
 static std::string GetConfigPath(State::ConfigMode a_configMode)
