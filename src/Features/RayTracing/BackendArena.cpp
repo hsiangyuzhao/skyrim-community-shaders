@@ -204,6 +204,8 @@ namespace RayTracingRT
 			using Owner = Util::FrameTrace::VramOwner;
 			const Owner owner = a_pool.heap == D3D12_HEAP_TYPE_UPLOAD ? Owner::RtUpload : (&a_pool == &asPool_ ? Owner::RtBlas : Owner::RtSkin);
 			Util::FrameTrace::TagVram(resource.Get(), owner, (a_bytes + 0xFFFFull) & ~0xFFFFull);
+			if (owner != Owner::RtUpload && ResidencyHigh())
+				ApplyResidency(resource.Get());  // Keep Our GPU Memory Resident
 		}
 		if (a_pool.heap == D3D12_HEAP_TYPE_UPLOAD) {
 			void* mapped = nullptr;

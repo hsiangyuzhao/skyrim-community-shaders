@@ -180,6 +180,14 @@ public:
 	// D3D12 interop resource management
 	void CreateSharedResources();
 
+	/// (46p) Save GPU Memory: the six DLSS Ray Reconstruction-only interop textures (packed normals, the snapshot before
+	/// transparency, specular hit distance, SSS guide, albedo, reflectance; about 250 MB at 4K) exist only while wanted.
+	/// Created at once when wanted again; released behind the interop fence (the GPU may still read them) when not.
+	void SetRRResourcesWanted(bool a_wanted);
+	[[nodiscard]] bool RRResourcesPresent() const { return albedoShared12 != nullptr; }
+	/// (46p) Releases retired interop textures the GPU is done with (Present, after the frame's signal).
+	void CollectRetiredWrapped();
+
 private:
 	enum class DLSSGPresentationState
 	{
@@ -189,6 +197,17 @@ private:
 		kMapSuspended,
 		kResumePending
 	};
+
+	// (46p) RR-only interop textures.
+	void CreateRRResources();
+	bool rrResourcesWanted = true;
+	D3D11_TEXTURE2D_DESC sharedMainDesc{};  // kMAIN at the last CreateSharedResources (Width 0 = not yet)
+	struct RetiredWrapped
+	{
+		std::unique_ptr<WrappedResource> resource;
+		UINT64 fence = 0;  // released once the interop fence has completed this value
+	};
+	std::vector<RetiredWrapped> retiredWrapped;
 
 	bool UpdateDLSSGPresentationState(bool a_frameGenerationRequested, bool a_mapMenuOpen, bool a_mapRenderingContext);
 	bool DLSSGResourcesReadyForFrame(uint32_t a_frameIndex) const;

@@ -75,6 +75,15 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	reflexPacerBackstop,
 	reflexPacerNoOverSleep,
 	reflexPacerSmoothPhase,
+	keepGpuMemoryResident,
+	saveVramRROnly,
+	saveVramSsgi,
+	saveVramFreeRtWhenOff,
+	saveVramFreeFgWhenOff,
+	saveVramLazyPost,
+	saveVramUpscalerMasks,
+	copyRenderedAreaOnly,
+	precompileLazyShaders,
 	neuralRendering);
 
 decltype(&D3D11CreateDeviceAndSwapChain) ptrD3D11CreateDeviceAndSwapChainUpscaling;
@@ -647,6 +656,49 @@ void Upscaling::DrawAdvancedSettings()
 		ImGui::Separator();
 	}
 
+	// (46p) GPU memory and copies. Each switch off = 46o.
+	if (ImGui::TreeNodeEx("Save GPU Memory", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::Checkbox("Keep Our GPU Memory Resident", &settings.keepGpuMemoryResident);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("When video memory runs full, Windows moves memory out to system RAM; whatever the card then needs from there is");
+			ImGui::TextUnformatted("read slowly (8-10x slower ray-tracing prep and denoising seen in Solitude). On: our ray-tracing memory and our");
+			ImGui::TextUnformatted("work / history textures are the last to be moved (game textures go first). Ray tracing: at once; the rest: for");
+			ImGui::TextUnformatted("textures made after switching (restart for all of them).");
+		}
+		ImGui::Checkbox("Ray Reconstruction Textures Only With RR", &settings.saveVramRROnly);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Six 4K hand-over textures only DLSS Ray Reconstruction reads (about 250 MB) exist only while RR is on, and are not copied every frame.");
+		ImGui::Checkbox("SSGI Light Textures Only With GI", &settings.saveVramSsgi);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("With SSGI's Indirect Lighting and specular GI both off, their textures (about 390 MB at 4K) are not kept. AO is unchanged.");
+		ImGui::Checkbox("Free Ray Tracing Memory When Off", &settings.saveVramFreeRtWhenOff);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Ray tracing switched off gives back its textures and buffers; the shadow denoiser not in use gives back its own.");
+		ImGui::Checkbox("Free Frame Generation Memory When Off", &settings.saveVramFreeFgWhenOff);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("Experiment, off by default: frame generation switched off in this menu gives back DLSS-G's memory (about 700 MB");
+			ImGui::TextUnformatted("at 4K); switching it on again makes it anew (a short hitch). Pause menus and the map are not affected.");
+		}
+		ImGui::Checkbox("Post-Processing Textures Only When Used", &settings.saveVramLazyPost);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Post-processing work textures of effects that are off are not kept (made when an effect is switched on).");
+		ImGui::Checkbox("Upscaler Masks Only For FSR", &settings.saveVramUpscalerMasks);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Two 4K mask textures only FSR reads are not kept with DLSS (DLSS has its own copies).");
+		ImGui::Checkbox("Copy Only the Rendered Area", &settings.copyRenderedAreaOnly);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::TextUnformatted("The per-frame hand-over copies to DLSS (colour, motion, depth, RR inputs) copy only the part of the picture that is");
+			ImGui::TextUnformatted("rendered (a quarter of 4K with DLSS Performance) instead of the whole 4K texture. Depth buffers cannot be copied");
+			ImGui::TextUnformatted("in part (a D3D11 rule) and stay whole.");
+		}
+		ImGui::Checkbox("Precompile Lazy Shaders", &settings.precompileLazyShaders);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::TextUnformatted("Shaders first needed right after a loading screen (deferred composite, screen-space shadows) are prepared during the first loading screen.");
+		ImGui::TextDisabled("Our D3D11 textures / buffers alive: %.0f MB", static_cast<double>(Util::FrameTrace::OurD3D11LiveBytes()) / (1024.0 * 1024.0));
+		ImGui::TreePop();
+	}
+	ImGui::Separator();
+
 	// Streamline log level selection
 	const char* logLevels[] = { "Off", "Default", "Verbose" };
 	int logLevelIdx = static_cast<int>(std::min(settings.streamlineLogLevel, 2u));
@@ -884,6 +936,7 @@ void Upscaling::LoadSettings(json& o_json)
 	HDROutput::StashLegacyUpscalingJson(o_json);
 	settings = o_json;
 	PinNeuralRenderingOptions(settings.neuralRendering);
+	Util::FrameTrace::SetKeepResident(settings.keepGpuMemoryResident);  // (46p) before the first resources are made
 
 	// (45o) Sharpening is one RCAS strength (0 = off). Once, from a profile that still has the old method
 	// (45a-45n: 0 Off, 1 RCAS, 2 NIS) or only the NIS strength (before 45a: 0 = off, else NIS): Off -> 0,
@@ -1038,7 +1091,10 @@ void Upscaling::CreateUpscalingTextureResources(UpscaleMethod a_upscalemethod, b
 
 	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 
-	if (a_upscalemethod == UpscaleMethod::kDLSS || a_upscalemethod == UpscaleMethod::kFSR) {
+	// (46p) Save GPU Memory: DLSS writes its masks into the D3D12 interop pair (reactiveMaskShared12 / transparencyCompositionMaskShared12);
+	// these two D3D11 ones are read only by FSR.
+	const bool masksWanted = a_upscalemethod == UpscaleMethod::kFSR || (a_upscalemethod == UpscaleMethod::kDLSS && !settings.saveVramUpscalerMasks);
+	if (masksWanted) {
 		texDesc.Format = DXGI_FORMAT_R8_UNORM;
 		srvDesc.Format = texDesc.Format;
 		uavDesc.Format = texDesc.Format;
@@ -1085,7 +1141,8 @@ void Upscaling::DestroyUpscalingTextureResources(UpscaleMethod a_upscalemethod)
 	// correctly, but by hand: null the three views, then `delete`. As unique_ptrs a single
 	// reset() does the same thing, and the members can no longer be leaked by a future edit
 	// that forgets the delete.
-	if (a_upscalemethod != UpscaleMethod::kDLSS && a_upscalemethod != UpscaleMethod::kFSR) {
+	if ((a_upscalemethod != UpscaleMethod::kDLSS && a_upscalemethod != UpscaleMethod::kFSR) ||
+		(a_upscalemethod == UpscaleMethod::kDLSS && settings.saveVramUpscalerMasks)) {  // (46p) not read with DLSS
 		reactiveMaskTexture.reset();
 		transparencyCompositionMaskTexture.reset();
 	}
@@ -1096,8 +1153,28 @@ void Upscaling::DestroyUpscalingTextureResources(UpscaleMethod a_upscalemethod)
 	}
 }
 
+void Upscaling::CopyRenderedArea(ID3D11DeviceContext* a_context, ID3D11Resource* a_dst, ID3D11Resource* a_src) const
+{
+	if (!a_context || !a_dst || !a_src)
+		return;
+	const auto screenSize = globals::state->screenSize;
+	if (!settings.copyRenderedAreaOnly || (resolutionScale.x >= 1.0f && resolutionScale.y >= 1.0f) || screenSize.x < 1.0f || screenSize.y < 1.0f) {
+		a_context->CopyResource(a_dst, a_src);
+		return;
+	}
+	D3D11_BOX box{};
+	box.right = static_cast<UINT>(std::min(screenSize.x, std::ceil(screenSize.x * resolutionScale.x) + 1.0f));
+	box.bottom = static_cast<UINT>(std::min(screenSize.y, std::ceil(screenSize.y * resolutionScale.y) + 1.0f));
+	box.back = 1;
+	a_context->CopySubresourceRegion(a_dst, 0, 0, 0, 0, a_src, 0, &box);
+}
+
 void Upscaling::CheckResources(UpscaleMethod a_upscalemethod)
 {
+	// (46p) Save GPU Memory: the RR-only interop textures follow Ray Reconstruction (created at once when it goes on).
+	if (d3d12SwapChainActive)
+		dx12SwapChain.SetRRResourcesWanted(settings.enableDLSSRR || !settings.saveVramRROnly);
+
 	static auto previousUpscaleMode = UpscaleMethod::kTAA;
 	static bool previousFrameGenMode = false;
 	static bool previousRR = false;
@@ -1501,28 +1578,32 @@ void Upscaling::CopySharedD3D12Resources()
 	}
 
 	auto& motionVector = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
-	context->CopyResource(dx12SwapChain.motionVectorBufferShared12->resource11, motionVector.texture);
+	// (46p) Copy Only the Rendered Area: DLSS / DLSS-G / RR read these only inside the render rect (their input extent).
+	CopyRenderedArea(context, dx12SwapChain.motionVectorBufferShared12->resource11, motionVector.texture);
 	if (dx12SwapChain.motionVectorFrameGenerationShared12) {
 		// Preserve the engine's original MV field for DLSS-G before the DLSS SR
 		// encode pass overwrites its own interop buffer with depth-aware dilation.
-		context->CopyResource(dx12SwapChain.motionVectorFrameGenerationShared12->resource11, motionVector.texture);
+		CopyRenderedArea(context, dx12SwapChain.motionVectorFrameGenerationShared12->resource11, motionVector.texture);
 	}
-	auto& albedo = renderer->GetRuntimeData().renderTargets[ALBEDO];
-	context->CopyResource(dx12SwapChain.albedoShared12->resource11, albedo.texture);
-	auto& reflectance = renderer->GetRuntimeData().renderTargets[REFLECTANCE];
-	context->CopyResource(dx12SwapChain.reflectanceShared12->resource11, reflectance.texture);
+	// (46p) Ray Reconstruction's inputs: only while they exist (with Save GPU Memory, only with RR on).
+	if (dx12SwapChain.albedoShared12 && dx12SwapChain.reflectanceShared12) {
+		auto& albedo = renderer->GetRuntimeData().renderTargets[ALBEDO];
+		CopyRenderedArea(context, dx12SwapChain.albedoShared12->resource11, albedo.texture);
+		auto& reflectance = renderer->GetRuntimeData().renderTargets[REFLECTANCE];
+		CopyRenderedArea(context, dx12SwapChain.reflectanceShared12->resource11, reflectance.texture);
+	}
 
 	if (settings.enableDLSSRR) {
 		auto& ssrt = globals::features::screenSpaceRayTracing;
 		if (ssrt.loaded && ssrt.settings.EnableSpecular) {
-			if (ssrt.texHitDistance) {
+			if (ssrt.texHitDistance && dx12SwapChain.specHitDistanceShared12) {
 				context->CopyResource(dx12SwapChain.specHitDistanceShared12->resource11, ssrt.texHitDistance->resource.get());
 			}
 		}
 
 		auto& sss = globals::features::subsurfaceScattering;
 		if (sss.loaded) {
-			if (sss.sssGuide) {
+			if (sss.sssGuide && dx12SwapChain.sssGuide) {
 				context->CopyResource(dx12SwapChain.sssGuide->resource11, sss.sssGuide->resource.get());
 			}
 		}
@@ -1539,6 +1620,11 @@ void Upscaling::CopySharedD3D12Resources()
 		viewport.TopLeftY = 0.0f;
 		viewport.Width = screenSize.x;
 		viewport.Height = screenSize.y;
+		if (settings.copyRenderedAreaOnly) {
+			// (46p) The render rect (+1 texel): DLSS / DLSS-G read the shared depth only inside it.
+			viewport.Width = std::min(screenSize.x, std::ceil(screenSize.x * resolutionScale.x) + 1.0f);
+			viewport.Height = std::min(screenSize.y, std::ceil(screenSize.y * resolutionScale.y) + 1.0f);
+		}
 		viewport.MinDepth = 0.0f;
 		viewport.MaxDepth = 1.0f;
 		context->RSSetViewports(1, &viewport);
@@ -2159,7 +2245,7 @@ void Upscaling::Upscale()
 			ID3D11UnorderedAccessView* reactiveMaskUAV = isDLSS ? dx12SwapChain.reactiveMaskShared12->uav : reactiveMaskTexture->uav.get();
 			ID3D11UnorderedAccessView* transparencyUAV = isDLSS ? dx12SwapChain.transparencyCompositionMaskShared12->uav : transparencyCompositionMaskTexture->uav.get();
 			ID3D11UnorderedAccessView* motionVectorUAV = isDLSS ? dx12SwapChain.motionVectorBufferShared12->uav : nullptr;
-			ID3D11UnorderedAccessView* packedNormalUAV = isDLSS ? dx12SwapChain.packedNormalShared12->uav : nullptr;
+			ID3D11UnorderedAccessView* packedNormalUAV = isDLSS && dx12SwapChain.packedNormalShared12 ? dx12SwapChain.packedNormalShared12->uav : nullptr;  // (46p) RR only
 
 			ID3D11UnorderedAccessView* uavs[4] = { reactiveMaskUAV, transparencyUAV, motionVectorUAV, packedNormalUAV };
 			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
@@ -2199,7 +2285,7 @@ void Upscaling::Upscale()
 
 			Util::FrameTrace::Lap lap;  // (46o) ups_* sub-timers (the 500 ms post-load stalls)
 			// Copy input color texture to shared D3D12 resource
-			context->CopyResource(dx12SwapChain.inputColorBufferShared12->resource11, main.texture);
+			CopyRenderedArea(context, dx12SwapChain.inputColorBufferShared12->resource11, main.texture);  // (46p) DLSS reads its input extent only
 			lap.Mark(Util::FrameTrace::Split::UpsCopyIn);
 
 			// Wait for D3D11 to finish
@@ -2232,7 +2318,7 @@ void Upscaling::Upscale()
 					dx12SwapChain.outputColorBufferShared12->resource.get(),
 					dx12SwapChain.dlssCommandList[frameIndex].get()
 				);
-			} else {
+			} else if (dx12SwapChain.RRResourcesPresent()) {  // (46p) created with RR (Save GPU Memory)
 				logger::debug("Call DLSS RR");
 				streamline.RayReconstruction(
 					dx12SwapChain.inputColorBufferShared12->resource.get(),
@@ -2429,7 +2515,8 @@ void Upscaling::SnapshotBeforeTransparency()
 	auto renderer = globals::game::renderer;
 	auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 
-	context->CopyResource(dx12SwapChain.colorBeforeTransparencySnapshot->resource11, main.texture);
+	if (dx12SwapChain.colorBeforeTransparencySnapshot)  // (46p) only while RR's textures exist
+		CopyRenderedArea(context, dx12SwapChain.colorBeforeTransparencySnapshot->resource11, main.texture);
 }
 
 void Upscaling::Main_UpdateJitter::thunk(RE::BSGraphics::State* a_state)

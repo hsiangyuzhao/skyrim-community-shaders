@@ -237,6 +237,16 @@ public:
 		bool reflexPacerNoOverSleep = true;
 		// (46p) The predicted completion from the median phase of the last GPU completions instead of the last one alone. Off = 46o.
 		bool reflexPacerSmoothPhase = false;
+		// (46p) GPU memory and copies (Advanced / Diagnostics > Save GPU Memory); each off = 46o.
+		bool keepGpuMemoryResident = true;   // our RT D3D12 resources HIGH residency priority, our D3D11 render targets / UAVs HIGH eviction priority
+		bool saveVramRROnly = true;          // DLSS RR-only interop textures only while RR is on (A2)
+		bool saveVramSsgi = true;            // SSGI's indirect-light textures only while GI / specular GI is on (A1)
+		bool saveVramFreeRtWhenOff = true;   // Ray Tracing switched off / a denoiser not in use: its textures and buffers go (A8)
+		bool saveVramFreeFgWhenOff = false;  // frame generation switched off in this menu: DLSS-G's resources go (A9; off by default: experiment)
+		bool saveVramLazyPost = true;        // post-processing textures only when the effect runs (A4)
+		bool saveVramUpscalerMasks = true;   // the D3D11 reactive / transparency masks only for FSR (A7)
+		bool copyRenderedAreaOnly = true;    // per-frame interop copies only of the render rect (item 7)
+		bool precompileLazyShaders = true;   // first-use shaders compiled behind the first loading screen (item 9)
 
 		NeuralRenderingSettings neuralRendering;
 	};
@@ -366,6 +376,9 @@ public:
 	bool previousUpscalingWasActive = false;
 
 	void CopySharedD3D12Resources();
+	/// (46p) Copy Only the Rendered Area: copies the render rect (+1 texel, clamped to the output size) of a_src into a_dst
+	/// (output-sized colour textures, no depth-stencil / MSAA); a full CopyResource with the switch off.
+	void CopyRenderedArea(ID3D11DeviceContext* a_context, ID3D11Resource* a_dst, ID3D11Resource* a_src) const;
 	void PostDisplay();
 	void PerformUpscaling();
 	void UpscaleDepth();

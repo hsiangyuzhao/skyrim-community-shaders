@@ -199,6 +199,11 @@ public:
 	eastl::unique_ptr<Texture2D> texIlY[2] = { nullptr };
 	eastl::unique_ptr<Texture2D> texIlCoCg[2] = { nullptr };
 	eastl::unique_ptr<Texture2D> texGiSpecular[2] = { nullptr };
+	// (46p) Save GPU Memory: radiance, its prefilter copy, IL Y / CoCg and specular GI exist only while GI or specular GI is on.
+	D3D11_TEXTURE2D_DESC ilMainDesc{};  // kMAIN at SetupResources (Width 0 = not yet)
+	[[nodiscard]] bool IlTexturesOmitted() const;
+	void CreateIlTextures();
+	void ReleaseIlTextures();
 	// (contact AO) Full-resolution ping-pong for the accumulated contact visibility. R8_UNORM, so
 	// the signal is format-bounded to [0, 1] and nothing downstream needs a finiteness test.
 	eastl::unique_ptr<Texture2D> texContactAo[2] = { nullptr };
@@ -220,9 +225,9 @@ public:
 		return (loaded && settings.Enabled) ?
 		           std::make_tuple(
 					   aoOverride ? aoOverride : texAo[outputAoIdx]->srv.get(),
-					   texIlY[outputIlIdx]->srv.get(),
-					   texIlCoCg[outputIlIdx]->srv.get(),
-					   texGiSpecular[outputSpecularIdx]->srv.get()) :
+					   texIlY[outputIlIdx] ? texIlY[outputIlIdx]->srv.get() : nullptr,  // (46p) absent: Save GPU Memory, GI off
+					   texIlCoCg[outputIlIdx] ? texIlCoCg[outputIlIdx]->srv.get() : nullptr,
+					   texGiSpecular[outputSpecularIdx] ? texGiSpecular[outputSpecularIdx]->srv.get() : nullptr) :
 		           std::make_tuple(nullptr, nullptr, nullptr, nullptr);
 	}
 

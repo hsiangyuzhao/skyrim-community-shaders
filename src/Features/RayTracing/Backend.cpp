@@ -159,8 +159,18 @@ namespace RayTracingRT
 
 		D3D12_COMMAND_QUEUE_DESC queueDesc{};
 		queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-		if (FAILED(hr = device_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_))))
+		// (46p) RT Queue High Priority (an experiment; read at start-up only).
+		queueDesc.Priority = queuePriorityHigh_ ? D3D12_COMMAND_QUEUE_PRIORITY_HIGH : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+		hr = device_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_));
+		if (FAILED(hr) && queuePriorityHigh_) {
+			logger::warn("[RayTracing] A high-priority queue was refused ({}); normal priority", HrString(hr));
+			queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+			hr = device_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_));
+		}
+		if (FAILED(hr))
 			return fail(std::format("CreateCommandQueue failed ({})", HrString(hr)));
+		queueCreatedHigh_ = queueDesc.Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+		logger::info("[RayTracing] Queue priority {}", queueCreatedHigh_ ? "high (46p experiment)" : "normal");
 		queue_->SetName(L"CS RayTracing Queue");
 
 		for (auto& context : contexts_) {
@@ -1135,7 +1145,89 @@ namespace RayTracingRT
 		                   a_heap == D3D12_HEAP_TYPE_READBACK ? Util::FrameTrace::VramOwner::RtReadback :
 		                                                         a_owner;
 		Util::FrameTrace::TagVram(resource.Get(), owner, (desc.Width + 0xFFFFull) & ~0xFFFFull);
+		if (a_heap == D3D12_HEAP_TYPE_DEFAULT && ResidencyHigh())
+			ApplyResidency(resource.Get());  // (46p)
 		return resource;
+	}
+
+	void Backend::ApplyResidency(ID3D12Pageable* const* a_objects, std::size_t a_count)
+	{
+		// (46p) Keep Our GPU Memory Resident. The device is free-threaded (the pool thread calls this too).
+		ComPtr<ID3D12Device1> device1;
+		if (!device_ || FAILED(device_.As(&device1)))
+			return;
+		std::vector<ID3D12Pageable*> objects;
+		objects.reserve(a_count);
+		for (std::size_t i = 0; i < a_count; ++i)
+			if (a_objects[i])
+				objects.push_back(a_objects[i]);
+		if (objects.empty())
+			return;
+		const D3D12_RESIDENCY_PRIORITY priority = ResidencyHigh() ? D3D12_RESIDENCY_PRIORITY_HIGH : D3D12_RESIDENCY_PRIORITY_NORMAL;
+		const std::vector<D3D12_RESIDENCY_PRIORITY> priorities(objects.size(), priority);
+		const HRESULT hr = device1->SetResidencyPriority(static_cast<UINT>(objects.size()), objects.data(), priorities.data());
+		static bool logged = false;
+		if (FAILED(hr) && !logged) {
+			logged = true;
+			logger::warn("[RayTracing] SetResidencyPriority failed ({})", HrString(hr));
+		}
+	}
+
+	void Backend::SetResidencyHigh(bool a_high)
+	{
+		if (residencyHigh_.load(std::memory_order_relaxed) == a_high)
+			return;
+		residencyHigh_.store(a_high, std::memory_order_relaxed);
+		if (!ready_)
+			return;
+		// What exists now (upload / read-back heaps are system memory: not listed).
+		std::vector<ID3D12Pageable*> objects;
+		for (auto* pool : Pools()) {
+			if (pool->heap == D3D12_HEAP_TYPE_UPLOAD)
+				continue;
+			for (const auto& block : pool->blocks)
+				if (block.live && block.resource)
+					objects.push_back(block.resource.Get());
+		}
+		for (auto* resource : { tlas_.Get(), scratch_.Get(), skinScratch_.Get(), alphaUv_.Get(), alphaLayers12_.Get(), postbuild_.Get(), pointCounter_.Get(),
+				 aoCounter_.Get(), depthMask_.resource12.Get(), visibility_.resource12.Get(), pointVis_.resource12.Get(), pointIdx_.resource12.Get(),
+				 aoRaw_.resource12.Get() })
+			if (resource)
+				objects.push_back(resource);
+		ApplyResidency(objects.data(), objects.size());
+		logger::info("[RayTracing] Residency priority {} for {} resources", a_high ? "high" : "normal", objects.size());
+	}
+
+	void Backend::ReleaseIdleResources()
+	{
+		// (46p) Free When Off. Retire keeps each D3D12 object until the GPU is done with it.
+		if (!ready_)
+			return;
+		if (scratch_) {
+			Retire(scratch_, scratchBytes_, &stats_.scratchBytes);
+			scratch_.Reset();
+			scratchBytes_ = 0;
+		}
+		if (tlas_) {
+			Retire(tlas_, tlasBytes_, &stats_.tlasBytes);
+			tlas_.Reset();
+			tlasBytes_ = 0;
+			tlasCapacity_ = 0;
+		}
+		if (skinScratch_) {
+			Retire(skinScratch_, skinScratchBytes_, &skinStats_.scratchBytes);
+			skinScratch_.Reset();
+			skinScratchBytes_ = 0;
+		}
+		if (depthMask_.resource12)
+			Retire(depthMask_.resource12, 0, nullptr);
+		if (visibility_.resource12)
+			Retire(visibility_.resource12, 0, nullptr);
+		depthMask_ = {};
+		visibility_ = {};
+		textureWidth_ = textureHeight_ = 0;
+		stats_.sharedTextureBytes = 0;
+		logger::info("[RayTracing] Switched off: shared textures, scratch and TLAS released (46p Free When Off)");
 	}
 
 	bool Backend::CheckSharedFormat(DXGI_FORMAT a_format, bool a_d3d11Store, bool a_d3d12Store, const char* a_name, bool a_fatal)
@@ -1230,6 +1322,8 @@ namespace RayTracingRT
 		CloseHandle(handle);
 		if (FAILED(hr))
 			return fail(std::format("OpenSharedHandle {}", what), hr);
+		if (ResidencyHigh())
+			ApplyResidency(texture.resource12.Get());  // (46p) the D3D11 side: FrameTrace's create hook (eviction priority)
 		o_texture = std::move(texture);
 		return true;
 	}
@@ -1715,6 +1809,7 @@ namespace RayTracingRT
 		std::vector<Pending> batch;
 		std::uint32_t batchTriangles = 0;
 		std::uint64_t scratchNeed = 0;
+		std::uint64_t scratchSum = 0;  // (46p) every build its own slice
 		while (!buildQueue_.empty() && batch.size() < a_maxBuilds && (batch.empty() || (batchTriangles < a_budget && QpcNow() < a_deadline))) {
 			const BlasHandle handle = buildQueue_.front();
 			auto& blas = blas_[handle];
@@ -1770,6 +1865,7 @@ namespace RayTracingRT
 			if (!geometry.Opaque())
 				std::memcpy(mapped + entry.uvOffset, geometry.alphaUV.data(), geometry.alphaUV.size() * sizeof(std::uint32_t));
 			scratchNeed = std::max(scratchNeed, info.ScratchDataSizeInBytes);
+			scratchSum += Align(info.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);  // (46p)
 			batchTriangles += geometry.Triangles();
 			buildQueue_.pop_front();
 			batch.push_back(entry);
@@ -1779,7 +1875,11 @@ namespace RayTracingRT
 		// Freed once this submission completes.
 		for (const auto& entry : batch)
 			uploadPool_.Free(entry.upload, RetireValue());
-		if (!EnsureScratch(scratchNeed)) {
+		// (46p) Parallel BLAS Builds: each build its own scratch slice, no barrier between them (one at the batch end, below),
+		// while the slices fit kParallelScratchBytes; else one shared scratch and a barrier before each build (46o).
+		const bool parallel = parallelBuilds_ && batch.size() > 1 && scratchSum <= kParallelScratchBytes;
+		stats_.parallelBuildsLastFrame = parallel;
+		if (!EnsureScratch(parallel ? scratchSum : scratchNeed)) {
 			for (auto it = batch.rbegin(); it != batch.rend(); ++it) {
 				asPool_.Free(it->result, 0);
 				buildQueue_.push_front(it->handle);
@@ -1807,6 +1907,7 @@ namespace RayTracingRT
 			}
 		}
 
+		std::uint64_t scratchOffset = 0;  // (46p) Parallel BLAS Builds: this build's slice
 		for (const auto& entry : batch) {
 			auto& blas = blas_[entry.handle];
 			const ChunkGeometry& geometry = *blas.geometry;
@@ -1831,7 +1932,7 @@ namespace RayTracingRT
 			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
 			inputs.pGeometryDescs = &geometryDesc;
 
-			if (built > 0) {
+			if (built > 0 && !parallel) {
 				// The builds share one scratch buffer.
 				auto barrier = UavBarrier(scratch_.Get());
 				a_list->ResourceBarrier(1, &barrier);
@@ -1852,7 +1953,8 @@ namespace RayTracingRT
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc{};
 			buildDesc.Inputs = inputs;
 			buildDesc.DestAccelerationStructureData = asPool_.Address(entry.result);
-			buildDesc.ScratchAccelerationStructureData = scratch_->GetGPUVirtualAddress();
+			buildDesc.ScratchAccelerationStructureData = scratch_->GetGPUVirtualAddress() + (parallel ? scratchOffset : 0);
+			scratchOffset += Align(entry.info.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
 			a_list->BuildRaytracingAccelerationStructure(&buildDesc, 1, &postbuild);
 
 			const std::uint64_t bytes = entry.result.size;

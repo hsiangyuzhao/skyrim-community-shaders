@@ -414,6 +414,7 @@ namespace RayTracingRT
 		bool sunSplitLastFrame = false;
 		// (46p) What the submission behind lastPrepGpuMs recorded (set with it).
 		Util::FrameTrace::RtPrepWork lastPrepWork{};
+		bool parallelBuildsLastFrame = false;  // (46p) the last static batch was built in parallel
 	};
 
 	/// (46g) GPU memory carved out of a few large committed buffers ("blocks"), so a BLAS or a character shape
@@ -566,6 +567,19 @@ namespace RayTracingRT
 		void Prewarm(float a_cpuMs, bool a_characters);
 		/// (46g) Character uploads made since start (for the per-phase transition log).
 		[[nodiscard]] std::uint64_t SkinUploadsTotal() const { return skinUploadsTotal_; }
+
+		/// (46p) Parallel BLAS Builds: the static builds of one batch get a scratch slice each and no barrier between them.
+		void SetParallelBuilds(bool a_on) { parallelBuilds_ = a_on; }
+		/// (46p) Keep Our GPU Memory Resident: our video-memory resources (pools, TLAS, scratch, shared textures) get
+		/// D3D12_RESIDENCY_PRIORITY_HIGH (else NORMAL). Applied to what exists when it changes, and to every later creation.
+		void SetResidencyHigh(bool a_high);
+		[[nodiscard]] bool ResidencyHigh() const { return residencyHigh_.load(std::memory_order_relaxed); }
+		/// (46p) RT queue at D3D12_COMMAND_QUEUE_PRIORITY_HIGH; read by Initialize only (takes effect at the next start-up).
+		void SetQueuePriorityHigh(bool a_high) { queuePriorityHigh_ = a_high; }
+		[[nodiscard]] bool QueuePriorityHigh() const { return queueCreatedHigh_; }
+		/// (46p) Ray Tracing switched off: the shared textures, scratch buffers and the TLAS go (behind the fence, Retire);
+		/// recreated on the next switch-on. The pools already give their empty blocks back (OnSwitchedOff).
+		void ReleaseIdleResources();
 
 		/// (45e) True when ExecuteFrame will find a free command context. Only the GPU completing
 		/// work can change the answer from false to true, never back, so a yes at the start of the
@@ -929,6 +943,16 @@ namespace RayTracingRT
 		/// (46p) a_owner: the video-memory owner it is counted under (F7 vram_*).
 		ComPtr<ID3D12Resource> CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav,
 			Util::FrameTrace::VramOwner a_owner = Util::FrameTrace::VramOwner::RtOther);
+		// (46p) Parallel BLAS Builds (a batch's scratch slices fit this, else the shared scratch and a barrier each), residency
+		// priority, queue priority.
+		static constexpr std::uint64_t kParallelScratchBytes = 64ull << 20;
+		bool parallelBuilds_ = false;
+		std::atomic<bool> residencyHigh_{ false };  // read on the pool thread too
+		bool queuePriorityHigh_ = false;
+		bool queueCreatedHigh_ = false;
+		/// (46p) Sets a_objects' residency priority to the current one (HIGH / NORMAL); null entries are skipped.
+		void ApplyResidency(ID3D12Pageable* const* a_objects, std::size_t a_count);
+		void ApplyResidency(ID3D12Pageable* a_object) { ApplyResidency(&a_object, 1); }
 		// (46p) The prep work being recorded (stored into the context with its timestamps); pool block totals at the last store.
 		Util::FrameTrace::RtPrepWork recWork_{};
 		std::uint64_t workBlocksSeen_ = 0;

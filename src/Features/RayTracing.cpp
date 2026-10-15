@@ -1177,6 +1177,8 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.CellEventMs = read("CellEventMs", defaults.CellEventMs);
 		settings.FadeInBudgets = read("FadeInBudgets", defaults.FadeInBudgets);
 		settings.PointLightsBeamSoftness = read("PointLightsBeamSoftness", defaults.PointLightsBeamSoftness);  // (46o)
+		settings.ParallelBlasBuilds = read("ParallelBlasBuilds", defaults.ParallelBlasBuilds);  // (46p)
+		settings.HighPriorityQueue = read("HighPriorityQueue", defaults.HighPriorityQueue);
 	}
 	// (46o) Window Beam Guard: off once for settings saved before 46o (its rule misfired on beams that mostly hit walls).
 	if (loadedVersion < 6 && settings.PointLightsBeamGuard) {
@@ -1231,6 +1233,8 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["CellEventMs"] = settings.CellEventMs;
 	o_json["FadeInBudgets"] = settings.FadeInBudgets;
 	o_json["PointLightsBeamSoftness"] = settings.PointLightsBeamSoftness;  // (46o)
+	o_json["ParallelBlasBuilds"] = settings.ParallelBlasBuilds;  // (46p)
+	o_json["HighPriorityQueue"] = settings.HighPriorityQueue;
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -1383,6 +1387,7 @@ bool RayTracing::EnsureBackend()
 	}
 	backendTried = true;
 	std::string reason;
+	backend.SetQueuePriorityHigh(settings.HighPriorityQueue);  // (46p) read at start-up only
 	try {
 		if (!backend.Initialize(globals::d3d::device, globals::d3d::context, reason)) {
 			status = Status::Unavailable;
@@ -1749,6 +1754,11 @@ void RayTracing::RunEarlyPrep()
 	// game's update is finished; rendering does not move bones), so nothing becomes stale; only the TLAS and
 	// the trace are left for Prepass. Nothing waits. Whenever a condition fails (loading screens, the warm-up after
 	// them, no exterior sky) Prepass does all of it later in the frame (the fallback).
+	// (46p) Per-frame backend switches: Parallel BLAS Builds, Keep Our GPU Memory Resident (Upscaling > Save GPU Memory).
+	if (backend.IsReady()) {
+		backend.SetParallelBuilds(settings.ParallelBlasBuilds);
+		backend.SetResidencyHigh(globals::features::upscaling.settings.keepGpuMemoryResident);
+	}
 	earlyThisFrame = false;
 	charactersUpdatedEarly = false;
 	earlyCpuMs = 0.0f;
@@ -1949,6 +1959,13 @@ void RayTracing::SwitchedOffFrame()
 				scene.ReleaseAll(backend);
 				backend.OnSwitchedOff();  // (46i) clean pools for the next switch-on (see GpuArena::lastAskQpc)
 			}
+			// (46p) Save GPU Memory: the shadow-mask work textures, the denoisers, the shared textures, scratch and the TLAS go
+			// too (made again on the next switch-on; D3D12 ones behind the fence).
+			if (globals::features::upscaling.settings.saveVramFreeRtWhenOff) {
+				ReleaseD3D11Resources();
+				if (backend.IsReady())
+					backend.ReleaseIdleResources();
+			}
 			// (46i) Switching on again starts like a fresh entry: the interior's entry time, the beam guards of
 			// this place, the stuck-state diagnostic.
 			interiorCell = nullptr;
@@ -2073,6 +2090,11 @@ void RayTracing::LoadingPump()
 	activeThisFrame = false;
 	combinedThisFrame = false;
 	pending.active = false;
+	// (46p) Per-frame backend switches: Parallel BLAS Builds, Keep Our GPU Memory Resident (Upscaling > Save GPU Memory).
+	if (backend.IsReady()) {
+		backend.SetParallelBuilds(settings.ParallelBlasBuilds);
+		backend.SetResidencyHigh(globals::features::upscaling.settings.keepGpuMemoryResident);
+	}
 	earlyThisFrame = false;
 	charactersUpdatedEarly = false;
 	earlyCpuMs = 0.0f;
@@ -2496,6 +2518,13 @@ void RayTracing::RunFrame()
 	lastQuality = quality;
 	const DenoiserMode denoiser = EffectiveDenoiser();
 	lastEffectiveDenoiser = denoiser;
+	// (46p) Save GPU Memory: the denoiser not in effect gives its textures back (made again on first use).
+	if (globals::features::upscaling.settings.saveVramFreeRtWhenOff) {
+		if (denoiser != DenoiserMode::Penumbra && (denoiseTiles.texture || history4[0].texture))
+			ReleaseDenoiser();
+		if (denoiser != DenoiserMode::Sigma && (sigma || sigmaOut.texture))
+			ReleaseSigma();
+	}
 	const bool penumbra = denoiser == DenoiserMode::Penumbra;
 	const bool rrMode = denoiser == DenoiserMode::DLSSRR;
 	bool sigmaMode = denoiser == DenoiserMode::Sigma;
@@ -4865,6 +4894,17 @@ void RayTracing::DrawDiagnostics()
 			ImGui::Text("  lights only right before their clean-up, so that work overlaps them. Off: one wait for both, as 46l.");
 			ImGui::Text("  F7: rt_sync_sun_gpu_ms, rt_sync_pl_gpu_ms (rt_sync_gpu_ms = both).");
 		}
+		ImGui::Checkbox("Parallel BLAS Builds", &settings.ParallelBlasBuilds);  // (46p)
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On: the scenery shapes that enter in one frame are built side by side on the graphics card (each its own scratch");
+			ImGui::Text("  memory, at most 64 MB together) instead of one after the other. Shorter hitches when new cells or objects arrive.");
+			ImGui::Text("  Off: one by one, as 46o. F7: rt_prep_gpu_ms with rt_pw_builds.");
+		}
+		ImGui::Checkbox("RT Queue High Priority (restart)", &settings.HighPriorityQueue);  // (46p)
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("Experiment, off by default: ray tracing's own GPU queue asks for high priority, which may shorten the long waits for it");
+			ImGui::Text("  when the card is busy. Takes effect after restarting the game. In effect now: %s.", backend.QueuePriorityHigh() ? "high" : "normal");
+		}
 
 		const auto& rt = backend.GetStats();
 		const auto& sc = scene.GetStats();
@@ -5125,6 +5165,9 @@ std::string RayTracing::DescribeForProfile() const
 	text += std::format(", parallel character reads {}, character scan cache {}, merge character parts {}, split trace sync {}",
 		settings.CharactersParallel ? "on" : "off", settings.CharactersScanCache ? "on" : "off", settings.CharactersMerge ? "on" : "off",
 		settings.SplitTraceSync ? "on" : "off");
+	// (46p)
+	text += std::format(", parallel BLAS builds {}, high-priority queue {} (in effect {}), residency priority {}", settings.ParallelBlasBuilds ? "on" : "off",
+		settings.HighPriorityQueue ? "asked" : "off", backend.QueuePriorityHigh() ? "high" : "normal", backend.ResidencyHigh() ? "high" : "normal");
 	return text;
 }
 

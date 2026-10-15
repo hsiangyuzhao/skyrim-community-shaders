@@ -320,7 +320,12 @@ namespace Util::FrameTrace
 	void TagVram(ID3D11DeviceChild* a_object, VramOwner a_owner, uint64_t a_bytes);
 	void TagVram(ID3D12Object* a_object, VramOwner a_owner, uint64_t a_bytes);
 	/// A D3D11 texture / buffer created through the game's device (EngineTiming's Create* hooks): owner from a_caller.
-	void OnD3D11Created(ID3D11DeviceChild* a_resource, uint64_t a_bytes, bool a_shared, bool a_staging, const void* a_caller);
+	/// a_target: default usage, bound as render target / UAV / depth (kept resident with Keep Our GPU Memory Resident when ours).
+	void OnD3D11Created(ID3D11DeviceChild* a_resource, uint64_t a_bytes, bool a_shared, bool a_staging, bool a_target, const void* a_caller);
+	/// (46p) Keep Our GPU Memory Resident: our D3D11 render targets / UAVs made from now on get DXGI_RESOURCE_PRIORITY_HIGH.
+	void SetKeepResident(bool a_on);
+	/// (46p) Bytes of D3D11 resources our DLL created and that are alive (tagged), for the overlay / trace.
+	uint64_t OurD3D11LiveBytes();
 
 	// ---- (46p) coarse GPU time per engine segment (recording only) --------------------------------------------------
 	/// EngineTiming: the main thread entered segment a_seg (EngineTiming::Seg as int). A D3D11 timestamp at every change

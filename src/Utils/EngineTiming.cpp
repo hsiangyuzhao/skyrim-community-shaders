@@ -677,16 +677,22 @@ namespace Util::EngineTiming
 			return total;
 		}
 
+		bool IsTarget(D3D11_USAGE a_usage, UINT a_bind)
+		{
+			return a_usage == D3D11_USAGE_DEFAULT && (a_bind & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_DEPTH_STENCIL)) != 0;
+		}
+
 		void NoteCreated(const D3D11_BUFFER_DESC* a_desc, ID3D11Buffer** a_out, const void* a_caller)
 		{
 			if (a_desc && a_out && *a_out)
-				FrameTrace::OnD3D11Created(*a_out, a_desc->ByteWidth, (a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING, a_caller);
+				FrameTrace::OnD3D11Created(*a_out, a_desc->ByteWidth, (a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING,
+					a_desc->Usage == D3D11_USAGE_DEFAULT && (a_desc->BindFlags & D3D11_BIND_UNORDERED_ACCESS) != 0, a_caller);
 		}
 		void NoteCreated(const D3D11_TEXTURE1D_DESC* a_desc, ID3D11Texture1D** a_out, const void* a_caller)
 		{
 			if (a_desc && a_out && *a_out)
 				FrameTrace::OnD3D11Created(*a_out, MipChainBytes(a_desc->Format, a_desc->Width, 1, 1, a_desc->MipLevels) * std::max<UINT>(a_desc->ArraySize, 1),
-					(a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING, a_caller);
+					(a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING, IsTarget(a_desc->Usage, a_desc->BindFlags), a_caller);
 		}
 		void NoteCreated(const D3D11_TEXTURE2D_DESC* a_desc, ID3D11Texture2D** a_out, const void* a_caller)
 		{
@@ -694,13 +700,13 @@ namespace Util::EngineTiming
 				FrameTrace::OnD3D11Created(*a_out,
 					MipChainBytes(a_desc->Format, a_desc->Width, a_desc->Height, 1, a_desc->MipLevels) * std::max<UINT>(a_desc->ArraySize, 1) *
 						std::max<UINT>(a_desc->SampleDesc.Count, 1),
-					(a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING, a_caller);
+					(a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING, IsTarget(a_desc->Usage, a_desc->BindFlags), a_caller);
 		}
 		void NoteCreated(const D3D11_TEXTURE3D_DESC* a_desc, ID3D11Texture3D** a_out, const void* a_caller)
 		{
 			if (a_desc && a_out && *a_out)
 				FrameTrace::OnD3D11Created(*a_out, MipChainBytes(a_desc->Format, a_desc->Width, a_desc->Height, a_desc->Depth, a_desc->MipLevels),
-					(a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING, a_caller);
+					(a_desc->MiscFlags & kSharedMisc) != 0, a_desc->Usage == D3D11_USAGE_STAGING, IsTarget(a_desc->Usage, a_desc->BindFlags), a_caller);
 		}
 
 		template <std::size_t Index, class... Args>

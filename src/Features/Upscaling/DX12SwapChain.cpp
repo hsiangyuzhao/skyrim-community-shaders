@@ -255,7 +255,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		useFrameGeneration = UpdateDLSSGPresentationState(frameGenerationRequested, mapMenuOpen, mapRenderingContext);
 		// SR inputs are evaluate-local now, so a short FG suspension can retain
 		// resources without exposing DLSS-G to SR's depth/MV tags.
-		upscaling.PresentFrameGeneration(useFrameGeneration, true);
+		// (46p) Save GPU Memory > Free Frame Generation Memory When Off: switched off in the menu (not a pause / menu
+		// suspension), DLSS-G is told not to retain its resources, so eOff frees them; eOn makes them again.
+		const bool userTurnedFgOff = upscaling.settings.frameGenerationMode == 0;
+		upscaling.PresentFrameGeneration(useFrameGeneration, !(upscaling.settings.saveVramFreeFgWhenOff && userTurnedFgOff));
 
 		// The interposer can advance the native swap-chain index when its mode
 		// changes. Re-query it after SetOptions instead of carrying the index from
@@ -436,6 +439,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// (45m) The next frame's D3D11 work cannot start on the GPU before this value: the pacer follows it.
 	Util::LatencyPacer::OnFrameEndSignaled(d3d12Fence.get(), fenceValue);
 	fenceValue++;
+	CollectRetiredWrapped();  // (46p)
 
 	// Update the frame index
 	frameIndex = swapChain->GetCurrentBackBufferIndex();
@@ -884,27 +888,28 @@ void DX12SwapChain::CreateSharedResources()
 	auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 	D3D11_TEXTURE2D_DESC texDesc{};
 	main.texture->GetDesc(&texDesc);
+	sharedMainDesc = texDesc;  // (46p)
 	inputColorBufferShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 	outputColorBufferShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-	packedNormalShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-	colorBeforeTransparencySnapshot = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
 	texDesc.Format = DXGI_FORMAT_R32_FLOAT;
 	depthBufferShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-	specHitDistanceShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-
-	texDesc.Format = DXGI_FORMAT_R16_FLOAT;
-	sssGuide = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
 	texDesc.Format = DXGI_FORMAT_R8_UNORM;
 	reactiveMaskShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 	transparencyCompositionMaskShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
 
-	texDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-	albedoShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
-
-	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	reflectanceShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	// (46p) The Ray Reconstruction-only six: here as before when wanted (DLSS RR on, or Save GPU Memory off), else none.
+	if (rrResourcesWanted) {
+		CreateRRResources();
+	} else {
+		packedNormalShared12.reset();
+		colorBeforeTransparencySnapshot.reset();
+		specHitDistanceShared12.reset();
+		sssGuide.reset();
+		albedoShared12.reset();
+		reflectanceShared12.reset();
+	}
 
 	// Create motion vector buffer
 	auto& motionVector = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMOTION_VECTOR];
@@ -921,4 +926,54 @@ void DX12SwapChain::CreateSharedResources()
 		// and so is freed by its own reassignment.
 		motionVectorFrameGenerationShared12.reset();
 	}
+}
+
+void DX12SwapChain::CreateRRResources()
+{
+	// (46p) Same descriptions as before 46p (kMAIN's, then the formats below).
+	D3D11_TEXTURE2D_DESC texDesc = sharedMainDesc;
+	packedNormalShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	colorBeforeTransparencySnapshot = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	texDesc.Format = DXGI_FORMAT_R32_FLOAT;
+	specHitDistanceShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	texDesc.Format = DXGI_FORMAT_R16_FLOAT;
+	sssGuide = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	texDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+	albedoShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	reflectanceShared12 = std::make_unique<WrappedResource>(texDesc, d3d11Device.get(), d3d12Device.get());
+}
+
+void DX12SwapChain::SetRRResourcesWanted(bool a_wanted)
+{
+	const bool changed = a_wanted != rrResourcesWanted;
+	rrResourcesWanted = a_wanted;
+	if (sharedMainDesc.Width == 0 || !d3d11Device || !d3d12Device)
+		return;  // CreateSharedResources follows the wish
+	if (a_wanted && !albedoShared12) {
+		try {
+			CreateRRResources();
+			logger::info("[Upscaling] (46p) Ray Reconstruction interop textures created");
+		} catch (const std::exception& e) {
+			logger::error("[Upscaling] (46p) Ray Reconstruction interop textures could not be created: {}", e.what());
+		}
+	} else if (!a_wanted && albedoShared12) {
+		// Earlier frames' RR evaluations may still read them on the D3D12 queue: kept until the interop fence passes a value
+		// signalled after this frame's work (the next frame's first signal at the latest).
+		const UINT64 fence = fenceValue + 4;
+		for (auto* member : { &packedNormalShared12, &colorBeforeTransparencySnapshot, &specHitDistanceShared12, &sssGuide, &albedoShared12, &reflectanceShared12 })
+			if (*member)
+				retiredWrapped.push_back(RetiredWrapped{ std::move(*member), fence });
+		logger::info("[Upscaling] (46p) Ray Reconstruction off: its interop textures go once the GPU is done with them");
+	} else if (changed) {
+		logger::debug("[Upscaling] (46p) RR interop textures wanted: {}", a_wanted);
+	}
+}
+
+void DX12SwapChain::CollectRetiredWrapped()
+{
+	if (retiredWrapped.empty() || !d3d12Fence)
+		return;
+	const UINT64 completed = d3d12Fence->GetCompletedValue();
+	std::erase_if(retiredWrapped, [completed](const RetiredWrapped& a_entry) { return completed != UINT64_MAX && a_entry.fence <= completed; });
 }

@@ -2370,9 +2370,34 @@ namespace Util::FrameTrace
 	void TagVram(ID3D11DeviceChild* a_object, VramOwner a_owner, uint64_t a_bytes) { TagObject(a_object, a_owner, a_bytes); }
 	void TagVram(ID3D12Object* a_object, VramOwner a_owner, uint64_t a_bytes) { TagObject(a_object, a_owner, a_bytes); }
 
-	void OnD3D11Created(ID3D11DeviceChild* a_resource, uint64_t a_bytes, bool a_shared, bool a_staging, const void* a_caller)
+	namespace
 	{
-		TagObject(a_resource, a_staging ? VramOwner::D3D11Staging : OwnerOfCaller(a_caller, a_shared), a_bytes);
+		std::atomic<bool> g_keepResident{ true };
+	}
+
+	void SetKeepResident(bool a_on) { g_keepResident.store(a_on, std::memory_order_relaxed); }
+
+	uint64_t OurD3D11LiveBytes()
+	{
+		uint64_t live = 0;
+		for (const auto owner : { VramOwner::D3D11Ours, VramOwner::D3D11Shared }) {
+			const int i = static_cast<int>(owner);
+			const uint64_t created = g_vramNew[i].load(std::memory_order_relaxed), freed = g_vramFreed[i].load(std::memory_order_relaxed);
+			live += created > freed ? created - freed : 0;
+		}
+		return live;
+	}
+
+	void OnD3D11Created(ID3D11DeviceChild* a_resource, uint64_t a_bytes, bool a_shared, bool a_staging, bool a_target, const void* a_caller)
+	{
+		const VramOwner owner = a_staging ? VramOwner::D3D11Staging : OwnerOfCaller(a_caller, a_shared);
+		TagObject(a_resource, owner, a_bytes);
+		// (46p) Keep Our GPU Memory Resident: our render targets / UAVs (histories, interop, work textures) are evicted last.
+		if (a_target && a_resource && (owner == VramOwner::D3D11Ours || owner == VramOwner::D3D11Shared) && g_keepResident.load(std::memory_order_relaxed)) {
+			winrt::com_ptr<IDXGIResource> dxgi;
+			if (SUCCEEDED(a_resource->QueryInterface(IID_PPV_ARGS(dxgi.put()))))
+				dxgi->SetEvictionPriority(DXGI_RESOURCE_PRIORITY_HIGH);
+		}
 	}
 
 	// ---- (46p) coarse GPU time per engine segment ----

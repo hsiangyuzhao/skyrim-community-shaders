@@ -7,6 +7,22 @@
 #include "Util.h"
 #include "Utils/Batch37b.h"
 #include "Utils/GpuTimers.h"
+#include "Features/Upscaling.h"  // (46p) Save GPU Memory switches
+
+namespace
+{
+	// (46p) The indirect-light textures may be absent (Save GPU Memory, GI off): a null view reads 0 / discards writes.
+	template <class T>
+	ID3D11ShaderResourceView* SrvOf(const T& a_texture)
+	{
+		return a_texture ? a_texture->srv.get() : nullptr;
+	}
+	template <class T>
+	ID3D11UnorderedAccessView* UavOf(const T& a_texture)
+	{
+		return a_texture ? a_texture->uav.get() : nullptr;
+	}
+}
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	ScreenSpaceGI::Settings,
@@ -477,41 +493,15 @@ void ScreenSpaceGI::SetupResources()
 
 		auto mainTex = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
 		mainTex.texture->GetDesc(&texDesc);
+		ilMainDesc = texDesc;  // (46p) the indirect-light textures are (re)made from it (CreateIlTextures)
 		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
 		texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 		texDesc.MipLevels = srvDesc.Texture2D.MipLevels = 5;
 
-		{
-			texRadiance = eastl::make_unique<Texture2D>(texDesc);
-			texRadiance->CreateSRV(srvDesc);
-			texRadiance->CreateUAV(uavDesc);  // Create default UAV for mip 0
-
-			// Create individual UAVs for each mip level for prefiltering
-			for (uint i = 0; i < 5; ++i) {
-				D3D11_UNORDERED_ACCESS_VIEW_DESC mipUavDesc = {
-					.Format = DXGI_FORMAT_R11G11B10_FLOAT,
-					.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
-					.Texture2D = { .MipSlice = i }
-				};
-				DX::ThrowIfFailed(device->CreateUnorderedAccessView(texRadiance->resource.get(), &mipUavDesc, uavRadiance[i].put()));
-			}
-
-			// Create temporary texture for prefiltering (single mip level, used as SRV input)
-			D3D11_TEXTURE2D_DESC tempTexDesc = texDesc;
-			tempTexDesc.MipLevels = 1;
-			tempTexDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-
-			D3D11_SHADER_RESOURCE_VIEW_DESC tempSrvDesc = {
-				.Format = DXGI_FORMAT_R11G11B10_FLOAT,
-				.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
-				.Texture2D = {
-					.MostDetailedMip = 0,
-					.MipLevels = 1 }
-			};
-
-			texRadianceTemp = eastl::make_unique<Texture2D>(tempTexDesc);
-			texRadianceTemp->CreateSRV(tempSrvDesc);
-		}
+		// (46p) Radiance (+ its prefilter copy), IL Y / CoCg and specular GI: made here unless Save GPU Memory leaves them out
+		// (GI and specular GI off); CompileComputeShaders makes or drops them as the settings change.
+		if (!IlTexturesOmitted())
+			CreateIlTextures();
 
 		texDesc.BindFlags &= ~D3D11_BIND_RENDER_TARGET;
 		texDesc.MiscFlags &= ~D3D11_RESOURCE_MISC_GENERATE_MIPS;
@@ -528,34 +518,6 @@ void ScreenSpaceGI::SetupResources()
 
 		uavDesc.Texture2D.MipSlice = 0;
 		texDesc.MipLevels = srvDesc.Texture2D.MipLevels = 1;
-		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-		{
-			texIlY[0] = eastl::make_unique<Texture2D>(texDesc);
-			texIlY[0]->CreateSRV(srvDesc);
-			texIlY[0]->CreateUAV(uavDesc);
-
-			texIlY[1] = eastl::make_unique<Texture2D>(texDesc);
-			texIlY[1]->CreateSRV(srvDesc);
-			texIlY[1]->CreateUAV(uavDesc);
-
-			texGiSpecular[0] = eastl::make_unique<Texture2D>(texDesc);
-			texGiSpecular[0]->CreateSRV(srvDesc);
-			texGiSpecular[0]->CreateUAV(uavDesc);
-
-			texGiSpecular[1] = eastl::make_unique<Texture2D>(texDesc);
-			texGiSpecular[1]->CreateSRV(srvDesc);
-			texGiSpecular[1]->CreateUAV(uavDesc);
-		}
-		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
-		{
-			texIlCoCg[0] = eastl::make_unique<Texture2D>(texDesc);
-			texIlCoCg[0]->CreateSRV(srvDesc);
-			texIlCoCg[0]->CreateUAV(uavDesc);
-
-			texIlCoCg[1] = eastl::make_unique<Texture2D>(texDesc);
-			texIlCoCg[1]->CreateSRV(srvDesc);
-			texIlCoCg[1]->CreateUAV(uavDesc);
-		}
 
 		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R8_UNORM;
 		{
@@ -651,6 +613,81 @@ void ScreenSpaceGI::SetupResources()
 	CompileComputeShaders();
 }
 
+bool ScreenSpaceGI::IlTexturesOmitted() const
+{
+	// (46p) Save GPU Memory: with Indirect Lighting and specular GI off nothing reads these (radiance only under GI, the
+	// IL / specular histories only feed GI outputs; the AO path checks them for finiteness only, and a null SRV reads 0).
+	return globals::features::upscaling.settings.saveVramSsgi && !settings.EnableGI && !settings.EnableExperimentalSpecularGI;
+}
+
+void ScreenSpaceGI::CreateIlTextures()
+{
+	auto device = globals::d3d::device;
+	if (!device || ilMainDesc.Width == 0)
+		return;
+	D3D11_TEXTURE2D_DESC texDesc = ilMainDesc;
+	texDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	texDesc.MipLevels = 5;
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = { .Format = texDesc.Format, .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D, .Texture2D = { .MostDetailedMip = 0, .MipLevels = 5 } };
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = { .Format = texDesc.Format, .ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D, .Texture2D = { .MipSlice = 0 } };
+
+	texRadiance = eastl::make_unique<Texture2D>(texDesc);
+	texRadiance->CreateSRV(srvDesc);
+	texRadiance->CreateUAV(uavDesc);  // Create default UAV for mip 0
+
+	// Create individual UAVs for each mip level for prefiltering
+	for (uint i = 0; i < 5; ++i) {
+		D3D11_UNORDERED_ACCESS_VIEW_DESC mipUavDesc = {
+			.Format = DXGI_FORMAT_R11G11B10_FLOAT,
+			.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
+			.Texture2D = { .MipSlice = i }
+		};
+		DX::ThrowIfFailed(device->CreateUnorderedAccessView(texRadiance->resource.get(), &mipUavDesc, uavRadiance[i].put()));
+	}
+
+	// Create temporary texture for prefiltering (single mip level, used as SRV input)
+	D3D11_TEXTURE2D_DESC tempTexDesc = texDesc;
+	tempTexDesc.MipLevels = 1;
+	tempTexDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	D3D11_SHADER_RESOURCE_VIEW_DESC tempSrvDesc = { .Format = DXGI_FORMAT_R11G11B10_FLOAT, .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D, .Texture2D = { .MostDetailedMip = 0, .MipLevels = 1 } };
+	texRadianceTemp = eastl::make_unique<Texture2D>(tempTexDesc);
+	texRadianceTemp->CreateSRV(tempSrvDesc);
+
+	// As SetupResources made them before 46p: one mip, no render target, no mip generation.
+	texDesc.BindFlags &= ~D3D11_BIND_RENDER_TARGET;
+	texDesc.MiscFlags &= ~D3D11_RESOURCE_MISC_GENERATE_MIPS;
+	texDesc.MipLevels = srvDesc.Texture2D.MipLevels = 1;
+	srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	for (int i = 0; i < 2; ++i) {
+		texIlY[i] = eastl::make_unique<Texture2D>(texDesc);
+		texIlY[i]->CreateSRV(srvDesc);
+		texIlY[i]->CreateUAV(uavDesc);
+		texGiSpecular[i] = eastl::make_unique<Texture2D>(texDesc);
+		texGiSpecular[i]->CreateSRV(srvDesc);
+		texGiSpecular[i]->CreateUAV(uavDesc);
+	}
+	srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+	for (int i = 0; i < 2; ++i) {
+		texIlCoCg[i] = eastl::make_unique<Texture2D>(texDesc);
+		texIlCoCg[i]->CreateSRV(srvDesc);
+		texIlCoCg[i]->CreateUAV(uavDesc);
+	}
+}
+
+void ScreenSpaceGI::ReleaseIlTextures()
+{
+	texRadiance = nullptr;
+	texRadianceTemp = nullptr;
+	for (auto& uav : uavRadiance)
+		uav = nullptr;
+	for (int i = 0; i < 2; ++i) {
+		texIlY[i] = nullptr;
+		texIlCoCg[i] = nullptr;
+		texGiSpecular[i] = nullptr;
+	}
+}
+
 void ScreenSpaceGI::ClearShaderCache()
 {
 	static const std::vector<winrt::com_ptr<ID3D11ComputeShader>*> shaderPtrs = {
@@ -668,6 +705,16 @@ void ScreenSpaceGI::CompileComputeShaders()
 	// (batch 37b, C-2) What this round compiles GI for. DrawSSGI decides the IL-only skips from
 	// this, not from the live setting, so the two can never disagree for a frame.
 	compiledWithGI = settings.EnableGI;
+	// (46p) Save GPU Memory: the indirect-light textures follow the settings this round compiles for.
+	if (IlTexturesOmitted()) {
+		if (texRadiance) {
+			ReleaseIlTextures();
+			logger::info("[SSGI] (46p) Indirect lighting and specular GI off: their textures released");
+		}
+	} else if (!texRadiance && ilMainDesc.Width != 0) {
+		CreateIlTextures();
+		logger::info("[SSGI] (46p) Indirect-light textures created");
+	}
 
 	struct ShaderCompileInfo
 	{
@@ -761,7 +808,8 @@ bool ScreenSpaceGI::ShadersOK()
 
 void ScreenSpaceGI::UpdateSB()
 {
-	float2 res = { (float)texRadiance->desc.Width, (float)texRadiance->desc.Height };
+	// (46p) texWorkingDepth: the same size as texRadiance, and always there (texRadiance is not with Save GPU Memory, GI off).
+	float2 res = { (float)texWorkingDepth->desc.Width, (float)texWorkingDepth->desc.Height };
 	float2 dynres = Util::ConvertToDynamic(res);
 	dynres = { floor(dynres.x), floor(dynres.y) };
 
@@ -852,6 +900,9 @@ void ScreenSpaceGI::DrawSSGI()
 	// global shader-cache button. Nothing about the flag's meaning depends on the feature being
 	// enabled or on the current shaders being good, so it is honoured unconditionally; the flag is
 	// cleared inside the recompile, so a genuine compile failure cannot spin here.
+	// (46p) Save GPU Memory switched: the indirect-light textures follow on the recompile.
+	if (ilMainDesc.Width != 0 && IlTexturesOmitted() == (texRadiance != nullptr))
+		recompileFlag = true;
 	if (recompileFlag)
 		ClearShaderCache();
 
@@ -864,8 +915,10 @@ void ScreenSpaceGI::DrawSSGI()
 		ilPassesSkipped = false;
 		FLOAT clr[4] = { 0.f, 0.f, 0.f, 0.f };
 		context->ClearUnorderedAccessViewFloat(texAo[outputAoIdx]->uav.get(), clr);
-		context->ClearUnorderedAccessViewFloat(texIlY[outputIlIdx]->uav.get(), clr);
-		context->ClearUnorderedAccessViewFloat(texIlCoCg[outputIlIdx]->uav.get(), clr);
+		if (texIlY[outputIlIdx] && texIlCoCg[outputIlIdx]) {  // (46p) absent with Save GPU Memory (GI off)
+			context->ClearUnorderedAccessViewFloat(UavOf(texIlY[outputIlIdx]), clr);
+			context->ClearUnorderedAccessViewFloat(UavOf(texIlCoCg[outputIlIdx]), clr);
+		}
 		return;
 	}
 
@@ -945,17 +998,17 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(4) = rts[RE::RENDER_TARGET::kMOTION_VECTOR].SRV;
 		srvs.at(5) = texAccumFrames[lastFrameAccumTexIdx]->srv.get();
 		srvs.at(6) = texAo[inputAoTexIdx]->srv.get();
-		srvs.at(7) = texIlY[inputGITexIdx]->srv.get();
-		srvs.at(8) = texIlCoCg[inputGITexIdx]->srv.get();
-		srvs.at(9) = texGiSpecular[inputAoTexIdx]->srv.get();
+		srvs.at(7) = SrvOf(texIlY[inputGITexIdx]);
+		srvs.at(8) = SrvOf(texIlCoCg[inputGITexIdx]);
+		srvs.at(9) = SrvOf(texGiSpecular[inputAoTexIdx]);
 		srvs.at(10) = nullptr;
 
-		uavs.at(0) = texRadiance->uav.get();
+		uavs.at(0) = UavOf(texRadiance);
 		uavs.at(1) = texAccumFrames[!lastFrameAccumTexIdx]->uav.get();
 		uavs.at(2) = texAo[!inputAoTexIdx]->uav.get();
-		uavs.at(3) = texIlY[!inputGITexIdx]->uav.get();
-		uavs.at(4) = texIlCoCg[!inputGITexIdx]->uav.get();
-		uavs.at(5) = texGiSpecular[!inputAoTexIdx]->uav.get();
+		uavs.at(3) = UavOf(texIlY[!inputGITexIdx]);
+		uavs.at(4) = UavOf(texIlCoCg[!inputGITexIdx]);
+		uavs.at(5) = UavOf(texGiSpecular[!inputAoTexIdx]);
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
@@ -976,7 +1029,7 @@ void ScreenSpaceGI::DrawSSGI()
 				texRadiance->resource.get(), 0, nullptr);
 
 			resetViews();
-			srvs.at(0) = texRadianceTemp->srv.get();  // Use temporary texture as input
+			srvs.at(0) = SrvOf(texRadianceTemp);  // Use temporary texture as input
 			uavs.at(0) = uavRadiance[0].get();        // Mip 0
 			uavs.at(1) = uavRadiance[1].get();        // Mip 1
 			uavs.at(2) = uavRadiance[2].get();        // Mip 2
@@ -1001,18 +1054,18 @@ void ScreenSpaceGI::DrawSSGI()
 		resetViews();
 		srvs.at(0) = texWorkingDepth->srv.get();
 		srvs.at(1) = rts[NORMALROUGHNESS].SRV;
-		srvs.at(2) = texRadiance->srv.get();
+		srvs.at(2) = SrvOf(texRadiance);
 		srvs.at(3) = texNoise->srv.get();
 		srvs.at(4) = texAccumFrames[lastFrameAccumTexIdx]->srv.get();
 		srvs.at(5) = texAo[inputAoTexIdx]->srv.get();
-		srvs.at(6) = texIlY[inputGITexIdx]->srv.get();
-		srvs.at(7) = texIlCoCg[inputGITexIdx]->srv.get();
-		srvs.at(8) = texGiSpecular[inputAoTexIdx]->srv.get();
+		srvs.at(6) = SrvOf(texIlY[inputGITexIdx]);
+		srvs.at(7) = SrvOf(texIlCoCg[inputGITexIdx]);
+		srvs.at(8) = SrvOf(texGiSpecular[inputAoTexIdx]);
 
 		uavs.at(0) = texAo[!inputAoTexIdx]->uav.get();
-		uavs.at(1) = texIlY[!inputGITexIdx]->uav.get();
-		uavs.at(2) = texIlCoCg[!inputGITexIdx]->uav.get();
-		uavs.at(3) = texGiSpecular[!inputAoTexIdx]->uav.get();
+		uavs.at(1) = UavOf(texIlY[!inputGITexIdx]);
+		uavs.at(2) = UavOf(texIlCoCg[!inputGITexIdx]);
+		uavs.at(3) = UavOf(texGiSpecular[!inputAoTexIdx]);
 		uavs.at(4) = texPrevGeo->uav.get();
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
@@ -1044,12 +1097,12 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(0) = texWorkingDepth->srv.get();
 		srvs.at(1) = rts[NORMALROUGHNESS].SRV;
 		srvs.at(2) = texAccumFrames[lastFrameAccumTexIdx]->srv.get();
-		srvs.at(3) = texIlY[inputGITexIdx]->srv.get();
-		srvs.at(4) = texIlCoCg[inputGITexIdx]->srv.get();
+		srvs.at(3) = SrvOf(texIlY[inputGITexIdx]);
+		srvs.at(4) = SrvOf(texIlCoCg[inputGITexIdx]);
 
 		uavs.at(0) = texAccumFrames[!lastFrameAccumTexIdx]->uav.get();
-		uavs.at(1) = texIlY[!inputGITexIdx]->uav.get();
-		uavs.at(2) = texIlCoCg[!inputGITexIdx]->uav.get();
+		uavs.at(1) = UavOf(texIlY[!inputGITexIdx]);
+		uavs.at(2) = UavOf(texIlCoCg[!inputGITexIdx]);
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);
@@ -1118,16 +1171,16 @@ void ScreenSpaceGI::DrawSSGI()
 		resetViews();
 		srvs.at(0) = texWorkingDepth->srv.get();
 		srvs.at(1) = texAo[inputAoTexIdx]->srv.get();
-		srvs.at(2) = texIlY[inputGITexIdx]->srv.get();
-		srvs.at(3) = texIlCoCg[inputGITexIdx]->srv.get();
-		srvs.at(4) = texGiSpecular[inputAoTexIdx]->srv.get();
+		srvs.at(2) = SrvOf(texIlY[inputGITexIdx]);
+		srvs.at(3) = SrvOf(texIlCoCg[inputGITexIdx]);
+		srvs.at(4) = SrvOf(texGiSpecular[inputAoTexIdx]);
 		if (contactAoActive)
 			srvs.at(5) = texContactAo[contactIdx]->srv.get();
 
 		uavs.at(0) = texAo[!inputAoTexIdx]->uav.get();
-		uavs.at(1) = texIlY[!inputGITexIdx]->uav.get();
-		uavs.at(2) = texIlCoCg[!inputGITexIdx]->uav.get();
-		uavs.at(3) = texGiSpecular[!inputAoTexIdx]->uav.get();
+		uavs.at(1) = UavOf(texIlY[!inputGITexIdx]);
+		uavs.at(2) = UavOf(texIlCoCg[!inputGITexIdx]);
+		uavs.at(3) = UavOf(texGiSpecular[!inputAoTexIdx]);
 
 		context->CSSetShaderResources(0, (uint)srvs.size(), srvs.data());
 		context->CSSetUnorderedAccessViews(0, (uint)uavs.size(), uavs.data(), nullptr);

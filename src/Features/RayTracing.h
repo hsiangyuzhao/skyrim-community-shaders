@@ -189,6 +189,10 @@ public:
 		bool CharactersScanCache = true;  // an actor's 3D is walked in full only when it may have changed (equip, new) and every 8 frames
 		bool CharactersMerge = true;      // an actor's opaque parts are one BLAS: one refit per character instead of one per part
 		bool SplitTraceSync = true;       // the game queue waits for the sun alone before the shadow mask passes, the point lights later
+		// (46p) Outside the settings macro (read / written in Load / SaveSettings): a static BLAS batch built side by side (a scratch
+		// slice each, one barrier at the end); the RT queue at high priority (an experiment, from the next start-up).
+		bool ParallelBlasBuilds = true;
+		bool HighPriorityQueue = false;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
