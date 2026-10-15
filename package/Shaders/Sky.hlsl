@@ -306,7 +306,9 @@ float SmoothedSunHaloAlpha(float2 uv, float texAlpha, float bodyWeight, float2 p
 	[branch] if (fade > 0.0)
 	{
 		const float3 sunTransmittance = PhysSky::SampleTr(lutSunDir, PhysSky::SampTr);
-		fade *= saturate(max(sunTransmittance.r, max(sunTransmittance.g, sunTransmittance.b)));
+		// Low sun only: from 5 to 15 deg up the halo returns to its full vanilla strength, so the daytime look is unchanged.
+		const float sunTr = saturate(max(sunTransmittance.r, max(sunTransmittance.g, sunTransmittance.b)));
+		fade *= lerp(sunTr, 1.0, smoothstep(0.0871557, 0.258819, lutSunDir.z));  // sin(5 deg), sin(15 deg)
 	}
 	alpha *= lerp(fade, 1.0, bodyWeight);
 
