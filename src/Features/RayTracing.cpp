@@ -235,6 +235,7 @@ namespace
 	constexpr int kAODetailRaysMax = 4;
 	constexpr float kAONormalPower = 8.0f;  // Normal-Guided: tap weight dot(N, N_tap)^8 (0.6 at 20 degrees, 0.06 at the 45 degree gate)
 	constexpr std::uint32_t kAOTraceDetail = 4u, kAOTraceAlphaHalf = 8u, kAOTraceAlphaOpen = 16u;  // TraceAOCS
+	constexpr std::uint32_t kAOTraceSingleRay = 32u, kAOTraceHalfFar = 64u;  // (46y) TraceAOCS (two scales only)
 
 	// (46c) BSShadowFrustumLight / BSShadowParabolicLight::RenderShadowmaps (vfunc 0x0A): Ray Tracing may skip the shadow
 	// maps of lights it fully handles this frame (Point Lights > Stop Engine Shadow Maps, interiors only).
@@ -3919,6 +3920,11 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 		shape.detailRays = std::clamp(settings.AODetailRays, 1, kAODetailRaysMax);
 		shape.detailLength = std::min(std::clamp(settings.AODetailLength, kAODetailLengthMin, kAODetailLengthMax), rayLength * 0.5f);
 		flags |= kAOTraceDetail;
+		// (46y) Single Long Ray / Half-Resolution Broad Term (the far part on a checkerboard; the filter's far weight .b = 0 elsewhere).
+		if (settings.AOSingleRay)
+			flags |= kAOTraceSingleRay;
+		if (settings.AOHalfResFar)
+			flags |= kAOTraceHalfFar;
 	}
 	flags |= shape.alphaBudget == 1 ? kAOTraceAlphaHalf : (shape.alphaBudget == 2 ? kAOTraceAlphaOpen : 0u);
 	aoShapeThisFrame = shape;
@@ -5339,6 +5345,8 @@ void RayTracing::DrawAOPage()
 					settings.AONormalGuided = d.AONormalGuided;
 					settings.AOFullResFilter = d.AOFullResFilter;
 					settings.AOAlphaBudget = d.AOAlphaBudget;
+					settings.AOSingleRay = d.AOSingleRay;  // (46y)
+					settings.AOHalfResFar = d.AOHalfResFar;
 				}
 				ImGui::BeginDisabled(!settings.AO);
 				ImGui::Checkbox("Fine Detail (two scales)", &settings.AODetail);
@@ -5368,6 +5376,21 @@ void RayTracing::DrawAOPage()
 						ImGui::Text("  Half Open: half darkened. Open: not darkened (dense foliage may come out too light).");
 					}
 				}
+				// (46y)
+				ImGui::BeginDisabled(!settings.AODetail);
+				ImGui::Checkbox("RTAO: Single Long Ray", &settings.AOSingleRay);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On (default): the long ray is traced once and sorted into near / far by where it hits (the same result as");
+					ImGui::Text("  two pieces; the character ray too). Fewer rays. Off: the near and far pieces are traced separately (46x).");
+					ImGui::Text("  Needs Fine Detail (without it there is only one ray anyway).");
+				}
+				ImGui::Checkbox("RTAO: Half-Resolution Broad Term", &settings.AOHalfResFar);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On: the broad (far) part is traced on every other pixel (a checkerboard that swaps every frame); the blur fills");
+					ImGui::Text("  the rest from neighbours on the same surface. The fine detail stays full resolution. Cheaper; the broad AO may");
+					ImGui::Text("  be a little noisier on thin objects. Off (default): every pixel (46x). Needs Fine Detail.");
+				}
+				ImGui::EndDisabled();
 				ImGui::EndDisabled();
 				if (!aoExtrasFault.empty())
 					RtErrorLine("Fine Detail / Full-Resolution Filter were switched off automatically", aoExtrasFault);

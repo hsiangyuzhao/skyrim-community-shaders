@@ -29,6 +29,9 @@
 //   than D along that direction, by the far term otherwise. (A single long ray with TMin = D would count a direction
 //   blocked near AND far twice -- in crevices and next to walls the long ray passes through the near wall and hits the
 //   same mesh's other side -- darkening exactly the places the detail term is for.)
+//   (46y) kFlagSingleRay: the long direction is one closest-hit ray over [0, L], classified by its hit distance (the same
+//   near / far values with one ray instead of two; past the alpha budget the two segments are traced instead). kFlagHalfFar: the
+//   far part only on a checkerboard that swaps every frame; elsewhere .b = 0 (no far sample), filled by the filter's weighted mean.
 //
 // Rays: the scene (instance mask 0x01) and, when characters are in the TLAS, a second ray against them (0x06, TMin =
 // Extra.x against their own coarse polygons) where the segment passes a character's bounds. Without RT_ALPHA the
@@ -58,6 +61,8 @@ static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near th
 static const uint kFlagDetail = 4u;       // (46t) two scales (see the top)
 static const uint kFlagAlphaHalf = 8u;    // (46t) past the alpha candidate budget: half open
 static const uint kFlagAlphaOpen = 16u;   // (46t) past the alpha candidate budget: open
+static const uint kFlagSingleRay = 32u;   // (46y) two scales: the long direction as one closest-hit ray (see ClosestBlocker)
+static const uint kFlagHalfFar = 64u;     // (46y) two scales: the far part only on a checkerboard that swaps every frame
 static const uint kMaxDetailRays = 4u;
 static const uint kSceneMask = 0x01u;
 static const uint kCharacterMasks = 0x06u;
@@ -193,6 +198,49 @@ float Visibility(float3 origin, float3 dir, float tMin, float tMax, uint mask, f
 #endif
 }
 
+// (46y, kFlagSingleRay) The nearest blocker on [tMin, tMax] (closest hit; cut-outs tested against their alpha as in Visibility):
+// o_hit / o_tHit. Returns false when the ray went past the alpha candidate budget (twice Visibility's: it covers both segments);
+// the caller then traces the two segments instead, so the near / far result is always the one the segments define.
+bool ClosestBlocker(float3 origin, float3 dir, float tMin, float tMax, uint mask, float footprint, out bool o_hit, out float o_tHit)
+{
+	o_hit = false;
+	o_tHit = tMax;
+	if (!(tMin < tMax))
+		return true;
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = dir;
+	ray.TMin = tMin;
+	ray.TMax = tMax;
+	bool complete = true;
+#if defined(RT_ALPHA)
+	RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
+	uint budget = kAlphaCandidateBudget * 2u;
+	while (q.Proceed()) {
+		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+			continue;
+		if (budget == 0u) {
+			complete = false;
+			q.Abort();
+		} else if (AlphaBlocks(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
+			q.CommitNonOpaqueTriangleHit();
+		} else {
+			budget -= 1u;
+		}
+	}
+#else
+	RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_CULL_NON_OPAQUE> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, mask, ray);
+	q.Proceed();
+#endif
+	if (complete && q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+		o_hit = true;
+		o_tHit = q.CommittedRayT();
+	}
+	return complete;
+}
+
 // Does the segment origin -> origin + dir * tMax pass the sphere?
 bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 {
@@ -282,13 +330,46 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 			{
 				// (46t) Two scales: the long direction's near and (where that is open) far segment, more near-only directions.
 				const float shortLength = clamp(C.Extra.y, 1.0, rayLength);
-				float tNear;
-				const float near0 = Segment(origin, dir, 0.0, shortLength, footprint, flags, characters, rays, tNear);
+				// (46y, kFlagHalfFar) The far part on half the pixels (checkerboard, swapped every frame); the others write far weight 0
+				// (.b), which the filter's weighted mean already reads as "no far sample here" (as where the near part was blocked).
+				const bool farHere = !(flags & kFlagHalfFar) || (((uint(p.x) + uint(p.y) + frame) & 1u) == 0u);
+				float near0 = 1.0;
 				float far = 1.0;
-				[branch] if (near0 > 0.0 && shortLength < rayLength)
+				bool traced = false;
+				// (46y, kFlagSingleRay) One closest-hit ray over [0, L]: blocked before D = near blocked (no far sample), between D and L
+				// = near open and far blocked, nothing = both open: the two segments' result with one ray. The character ray likewise,
+				// over [Extra.x, D] when the scene already blocks the far part, else over [Extra.x, L].
+				[branch] if ((flags & kFlagSingleRay) && farHere && shortLength < rayLength)
 				{
-					float tFar;
-					far = Segment(origin, dir, shortLength, rayLength, footprint, flags, characters, rays, tFar);
+					bool sceneHit, charHit = false;
+					float tScene, tChar = rayLength;
+					bool complete = ClosestBlocker(origin, dir, 0.0, rayLength, kSceneMask, footprint, sceneHit, tScene);
+					rays += 1u;
+					const bool nearBlockedByScene = sceneHit && tScene < shortLength;
+					const float charEnd = sceneHit ? shortLength : rayLength;
+					[branch] if (complete && !nearBlockedByScene && characters && (SphereOnSegment(origin, dir, charEnd, C.Spheres[0]) || SphereOnSegment(origin, dir, charEnd, C.Spheres[1])))
+					{
+						complete = ClosestBlocker(origin, dir, max(0.0, C.Extra.x), charEnd, kCharacterMasks, footprint, charHit, tChar);
+						rays += 1u;
+					}
+					[branch] if (complete)
+					{
+						const bool nearBlocked = nearBlockedByScene || (charHit && tChar < shortLength);
+						near0 = nearBlocked ? 0.0 : 1.0;
+						far = (!nearBlocked && (sceneHit || charHit)) ? 0.0 : 1.0;
+						traced = true;
+					}
+				}
+				[branch] if (!traced)
+				{
+					float tNear;
+					near0 = Segment(origin, dir, 0.0, shortLength, footprint, flags, characters, rays, tNear);
+					far = 1.0;
+					[branch] if (near0 > 0.0 && shortLength < rayLength && farHere)
+					{
+						float tFar;
+						far = Segment(origin, dir, shortLength, rayLength, footprint, flags, characters, rays, tFar);
+					}
 				}
 				float nearSum = near0;
 				const uint extra = min(uint(C.Extra.z), kMaxDetailRays);
@@ -299,7 +380,7 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 					float tExtra;
 					nearSum += Segment(origin, CosineDirection(u, T, B, N), 0.0, shortLength, footprint, flags, characters, rays, tExtra);
 				}
-				result = float4(far, weight, near0, nearSum / float(extra + 1u));
+				result = float4(far, weight, farHere ? near0 : 0.0, nearSum / float(extra + 1u));
 			}
 			else
 			{
