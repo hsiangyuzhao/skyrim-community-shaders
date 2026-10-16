@@ -69,9 +69,6 @@ struct PhysicalSky final : public Feature
 	constexpr static uint16_t kApLutW = 32;
 	constexpr static uint16_t kApLutH = 32;
 	constexpr static uint16_t kApLutD = 32;
-	/// (46z, E1) "High-Resolution Aerial Perspective": directions of the AP LUT when on (depth stays kApLutD).
-	constexpr static uint16_t kApLutHiResW = 64;
-	constexpr static uint16_t kApLutHiResH = 64;
 
 	struct WorldspaceInfo
 	{
@@ -127,31 +124,6 @@ struct PhysicalSky final : public Feature
 		kSkyModelCurrent = 0,
 		kSkyModelLegacy36f,
 		kSkyModelCount
-	};
-	/// (46z, A1) "Vanilla Sun Halo (with Physical Sky)": the large halo baked into the game's sun picture
-	/// (and the sun glare picture). Their 8-bit alpha steps show as rings over the dark physical sky.
-	enum SunHalo : int
-	{
-		kSunHaloOff = 0,  // only the opaque disc body of the sun picture; no glare
-		kSunHaloSmooth,   // halo smoothed (steps blurred along the radius, dithered), faded with the LUT sun
-		kSunHaloKeep,     // 46y and earlier: drawn as the picture has it
-		kSunHaloCount
-	};
-	/// (46z, A2) "Sky Dither": noise on the physical sky dome against colour steps.
-	enum SkyDither : int
-	{
-		kSkyDitherOff = 0,  // 46y and earlier
-		kSkyDitherFine,     // per pixel and frame, about half a step of the R11G11B10 main target
-		kSkyDitherVanilla,  // the vanilla sky's own noise texture at full strength (zero mean)
-		kSkyDitherCount
-	};
-	/// (46z, C2) "Aerosol Preset" / (46z, C3) "Ozone Preset": applied when the constants are uploaded;
-	/// the saved Atmosphere values are never written.
-	enum AtmospherePreset : int
-	{
-		kAtmospherePresetCurrent = 0,  // the Atmosphere tab's values
-		kAtmospherePresetEarth,        // Hillaire 2020 / Bruneton 2017 Earth values
-		kAtmospherePresetCount
 	};
 
 	struct Settings
@@ -301,30 +273,6 @@ struct PhysicalSky final : public Feature
 		float cloudOriginalMix = 0.5f;
 		float silverLiningMix = 1.f;
 		float silverLiningSpread = 0.f;
-
-		// (46z) Physical Sky fixes. Outside the NLOHMANN macro (64-field limit): read and written in
-		// Load/SaveSettings, tolerant of missing or mistyped keys. The two banding fixes default on,
-		// everything else defaults to the 46y look.
-		/// A1 SunHalo.
-		int sunHalo = kSunHaloSmooth;
-		/// A2 SkyDither.
-		int skyDither = kSkyDitherFine;
-		/// C4 + C5 "Accurate LUT Integration": the LUT ray marches sample the middle of each step (not its
-		/// far end), and the multiple-scattering LUT's ground bounce gets its cos/pi and is lit by the sun
-		/// at the ground point.
-		bool accurateLutIntegration = false;
-		/// C1 "Vanilla Mix Follows Sun Height": Vanilla Mix in full only at night (sun below -6 degrees),
-		/// gone by sunrise (0 degrees).
-		bool vanillaMixFollowsSun = false;
-		/// C2 AtmospherePreset for the aerosol scatter / absorption.
-		int aerosolPreset = kAtmospherePresetCurrent;
-		/// C3 AtmospherePreset for the ozone absorption and layer.
-		int ozonePreset = kAtmospherePresetCurrent;
-		/// D1 "Stars Fade With Sky Brightness": star alpha x 1 / (1 + strength x sky / star), from twilight on.
-		bool starsFadeWithSky = false;
-		float starsFadeStrength = 1000.f;
-		/// E1 "High-Resolution Aerial Perspective": the AP LUT at 64 x 64 directions instead of 32 x 32.
-		bool highResAerialPerspective = false;
 	} settings;
 
 	/// (41b, F5) The settings as used this frame. In "Legacy (36f)" mode every option added after
@@ -409,14 +357,6 @@ struct PhysicalSky final : public Feature
 		kExtReflectionSkyFix = 1u << 7,
 		kExtMultiScatterFix = 1u << 8,
 		kExtMoonPhysicalRadiance = 1u << 9,  // (40d)
-		// (46z) Defined again as local constants in Sky.hlsl / LutGen.cs.hlsl (SharedData.hlsli is not
-		// touched, so Lighting.hlsl and its includes stay byte-identical).
-		kExtSunHaloSmooth = 1u << 10,   // A1 Smooth (neither A1 bit = Keep)
-		kExtSunHaloOff = 1u << 11,      // A1 Off
-		kExtSkyDitherFine = 1u << 12,   // A2 R11G11B10-matched
-		kExtSkyDitherVanilla = 1u << 13,  // A2 vanilla strength
-		kExtAccurateLut = 1u << 14,     // C4 + C5 (LutGen.cs.hlsl)
-		kExtStarsFade = 1u << 15,       // D1 (strength in NightCbData::starsFadeStrength)
 	};
 	struct ExtCbData
 	{
@@ -452,15 +392,13 @@ struct PhysicalSky final : public Feature
 		float3 lutSunDir = { 0.f, 0.f, 1.f };  // F4a/F4b: sun direction the LUTs use
 		uint flags = 0;
 		float3 baseUpper = {};    // F1: linear, x strength x fade (zenith)
-		float starsFadeStrength = 0.f;  // (46z, D1) read by Sky.hlsl as PhysSkyNightData.pad0
-
+		float pad0 = 0.f;
 		float3 baseHorizon = {};  // horizon; also the aerial perspective's even glow
 		float pad1 = 0.f;
 		float3 baseLower = {};    // below the horizon
 		float pad2 = 0.f;
 	} nightCbData;
 	static_assert(sizeof(NightCbData) == 64);
-	static_assert(offsetof(NightCbData, starsFadeStrength) == 28);  // HLSL PhysSkyNightData.pad0
 	/// (41b, F1) Fills nightCbData's base light from the current weather; a_sunElevation in radians.
 	void UpdateNightBaseLight(float a_sunElevation);
 	/// (41b, F2) Glow visibility of a moon by its true elevation; 0 when the weather hides it.
@@ -507,14 +445,6 @@ struct PhysicalSky final : public Feature
 	eastl::unique_ptr<Texture2D> texSvLut = nullptr;  // sky view
 	eastl::unique_ptr<Texture3D> texApLut = nullptr;  // aerial perspective
 	eastl::unique_ptr<Texture2D> texApShadow = nullptr;
-	/// (46z, E1) Directions of texApLut as created (kApLutW x kApLutH, or the hi-res size).
-	uint16_t apLutW = kApLutW;
-	uint16_t apLutH = kApLutH;
-	/// (46z, E1) Creates texApLut at a_w x a_h x kApLutD. On failure the old texture (if any) is kept.
-	bool CreateApLut(uint16_t a_w, uint16_t a_h);
-	/// (46z, E1) Recreates texApLut when "High-Resolution Aerial Perspective" was toggled. Called before
-	/// the LUTs are generated, the first use of the frame.
-	void UpdateApLutSize();
 
 	winrt::com_ptr<ID3D11SamplerState> sampTr = nullptr;
 	winrt::com_ptr<ID3D11SamplerState> sampSv = nullptr;

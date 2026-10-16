@@ -16,10 +16,6 @@ RWTexture3D<float4> RWTexOutput : register(u0);
 RWTexture2D<float4> RWTexOutput : register(u0);
 #endif
 
-// (46z) PhysicalSky::kExtAccurateLut ("Accurate LUT Integration", C4 + C5). Defined here, not in
-// SharedData.hlsli, so the Lighting shaders' includes stay unchanged.
-static const uint kExtAccurateLut = (1 << 14);
-
 void rayMarch(
 	float3 pos, float3 rayDir, 
 #if LUTGEN == 0
@@ -40,7 +36,6 @@ void rayMarch(
 )
 {
 	const SharedData::PhysSkyData data = SharedData::physSkyData;
-	const bool accurateLut = (SharedData::physSkyExtData.Flags & kExtAccurateLut) != 0;
 
 #if LUTGEN == 0
 	const uint nsteps = 40;
@@ -110,10 +105,7 @@ void rayMarch(
 #	endif
 #endif
 
-	// (46z, C4) "Accurate LUT Integration": sample each step in its middle. The original samples its far
-	// end (curr_pos is advanced first), which against a 400-step reference made twilight horizons 1.9x
-	// (red) to 2.5x (blue) too bright and the sky near a 10-degree sun 0.5-0.65x too dark.
-	float3 curr_pos = accurateLut ? pos - 0.5 * stride : pos;
+	float3 curr_pos = pos;
 	[loop] for (uint i = 0; i < nsteps; ++i)
 	{
 		curr_pos += stride;
@@ -182,17 +174,7 @@ void rayMarch(
 #if LUTGEN == 1  // multiscatter
 	if (tGround > 0) {
 		float3 hit_pos = pos + tGround * rayDir;
-		[branch] if (accurateLut) {
-			// (46z, C5) A Lambertian ground under the sun sends back albedo x cos(sun zenith at the ground
-			// point) / pi per unit of sunlight (Hillaire 2020); the original left out cos/pi (about 3x too
-			// bright) and tested the sun against the ray's start instead of the ground point.
-			const float3 groundUp = normalize(hit_pos);
-			const float groundCosSun = dot(groundUp, sunDir);
-			if (groundCosSun > 0) {
-				float2 lutUv = TrLutUvPlanet(groundUp * data.rPlanet, sunDir);
-				lum += tr * data.groundAlbedo * TexTrLut.SampleLevel(SampTr, lutUv, 0).rgb * (groundCosSun * RCP_PI);
-			}
-		} else if (dot(pos, sunDir) > 0) {
+		if (dot(pos, sunDir) > 0) {
 			hit_pos = normalize(hit_pos) * data.rPlanet;
 			float2 lutUv = TrLutUvPlanet(hit_pos, sunDir);
 			lum += tr * data.groundAlbedo * TexTrLut.SampleLevel(SampTr, lutUv, 0).rgb;

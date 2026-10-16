@@ -250,80 +250,6 @@ float3 GetProceduralSunGlow(float3 viewDir)
 	const float3 sunTransmittance = PhysSky::SampleTr(sunDir, PhysSky::SampTr);
 	return SharedData::physSkyData.sunlightColor * sunTransmittance * (intensity * falloff / Math::PI);
 }
-
-// (46z) PhysicalSky::ExtFlags bits added in 46z. Defined here (and in LutGen.cs.hlsl) instead of
-// SharedData.hlsli, which every Lighting shader includes.
-namespace PhysSkyExt46z
-{
-	static const uint SunHaloSmooth = (1 << 10);     // A1 "Vanilla Sun Halo": Smooth
-	static const uint SunHaloOff = (1 << 11);        // A1: Off (disc body only)
-	static const uint SkyDitherFine = (1 << 12);     // A2 "Sky Dither": R11G11B10-matched
-	static const uint SkyDitherVanilla = (1 << 13);  // A2: vanilla noise at full strength
-	static const uint StarsFade = (1 << 15);         // D1 "Stars Fade With Sky Brightness"
-}
-
-// (46z) Four uniform numbers in [0, 1) for this pixel and frame (a different set for each a_salt).
-float4 PixelFrameRandom(float2 pxCoord, uint a_salt)
-{
-	const uint3 h0 = Random::pcg3d(uint3(uint2(pxCoord), SharedData::FrameCount ^ (a_salt * 0x9E3779B9u)));
-	const uint3 h1 = Random::pcg3d(h0 ^ 0x68E31DA4u);
-	return float4(float3(h0 >> 8), float(h1.x >> 8)) * (1.0 / 16777216.0);
-}
-
-#		if defined(TEX)
-// (46z, A1) Alpha of the game's sun / sun glare picture under "Vanilla Sun Halo". NAT's sun.dds keeps
-// its whole halo in the alpha channel, stored as 8-bit steps (12/255 ... 1/255 then 0) tens to a
-// hundred texels wide: over the dark physical sky at dawn each step is a visible ring. Smooth blurs the
-// halo along the radius (the picture is radially symmetric; 8 taps, a per-pixel per-frame offset so the
-// taps fill the gaps over a few frames) and fades it in with the LUT sun (-1 -> +2 degrees) x the light
-// left after the air towards the sun, then dithers it by +-0.5/255. The opaque disc body (alpha > 0.5)
-// is left alone; it shows or hides as the game (or Sky Sync's "Vanilla Sun Visibility") decides.
-// Off keeps the body only.
-float SmoothedSunHaloAlpha(float2 uv, float texAlpha, float bodyWeight, float2 pxCoord)
-{
-	const float4 rnd = PixelFrameRandom(pxCoord, 1);
-	float alpha = texAlpha;
-	const float2 fromCentre = uv - 0.5;
-	const float r = length(fromCentre);
-	[branch] if (bodyWeight < 1.0 && r > 1e-4)
-	{
-		const float2 radial = fromCentre / r;
-		// The steps get wider away from the centre: about 35 texels of a 2048 picture at the inner halo,
-		// 90 at the outer edge.
-		const float halfWidth = 0.1 * r + 0.004;
-		float sum = 0.0;
-		[unroll] for (int k = 0; k < 8; ++k)
-		{
-			const float t = ((k + rnd.x) * 0.125) * 2.0 - 1.0;
-			// Capped so taps that reach into the disc do not light a ring around it.
-			sum += min(TexBaseSampler.SampleLevel(SampBaseSampler, uv + radial * (t * halfWidth), 0).w, 0.3);
-		}
-		alpha = lerp(sum * 0.125, texAlpha, bodyWeight);
-	}
-
-	const float3 lutSunDir = normalize(SharedData::physSkyNightData.LutSunDir);
-	float fade = smoothstep(-0.0174524, 0.0348995, lutSunDir.z);  // sin(-1 deg), sin(2 deg)
-	[branch] if (fade > 0.0)
-	{
-		const float3 sunTransmittance = PhysSky::SampleTr(lutSunDir, PhysSky::SampTr);
-		fade *= saturate(max(sunTransmittance.r, max(sunTransmittance.g, sunTransmittance.b)));
-	}
-	alpha *= lerp(fade, 1.0, bodyWeight);
-
-	// Triangular dither, +-0.5/255, shrinking to nothing where the halo ends (no speckles around it).
-	const float dither = (rnd.y + rnd.z - 1.0) * (0.5 / 255.0);
-	return max(alpha + dither * saturate(alpha * 510.0), 0.0);
-}
-
-float VanillaSunHaloAlpha(float2 uv, float texAlpha, float vertexAlpha, bool hasBody, bool smooth, float2 pxCoord)
-{
-	const float bodyWeight = hasBody ? smoothstep(0.3, 0.6, texAlpha) : 0.0;
-	float alpha = texAlpha * bodyWeight;  // Off
-	[branch] if (smooth)
-		alpha = SmoothedSunHaloAlpha(uv, texAlpha, bodyWeight, pxCoord);
-	return vertexAlpha * alpha;
-}
-#		endif
 #	endif
 
 PS_OUTPUT main(PS_INPUT input)
@@ -434,25 +360,6 @@ PS_OUTPUT main(PS_INPUT input)
 		else
 			psout.Color.xyz = lerp(skyColor, psout.Color.xyz, SharedData::physSkyData.vanillaMix);
 
-		// (46z, A2) "Sky Dither". Only the Vanilla Mix share of the vanilla sky's noise was left, and the
-		// main target (R11G11B10_FLOAT: 6 significant bits in red and green, 5 in blue) shows smooth dark
-		// gradients as steps. Fine: per pixel and frame, triangular, about half a step (2^-7 relative in
-		// red/green, 2^-6 in blue); DLSS averages it out. Vanilla: the dome's own noise texture in full,
-		// made zero-mean so it does not lift the sky. Not in reflections (cubemaps keep their noise).
-		const uint skyDitherFlags = SharedData::physSkyExtData.Flags & (PhysSkyExt46z::SkyDitherFine | PhysSkyExt46z::SkyDitherVanilla);
-		[branch] if (skyDitherFlags && !(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection))
-		{
-			[branch] if (skyDitherFlags & PhysSkyExt46z::SkyDitherFine)
-			{
-				const float4 rndA = PixelFrameRandom(input.Position.xy, 2);
-				const float4 rndB = PixelFrameRandom(input.Position.xy, 3);
-				const float3 tpdf = rndA.xyz + rndB.xyz - 1.0;
-				psout.Color.xyz = max(psout.Color.xyz * (1.0 + tpdf * float3(1.0 / 128.0, 1.0 / 128.0, 1.0 / 64.0)), 0.0);
-			}
-			else
-				psout.Color.xyz = max(psout.Color.xyz + (noiseGrad - 0.0078125) * (1.0 - SharedData::physSkyData.vanillaMix), 0.0);
-		}
-
 #		elif defined(PS_CLOUDS)
 		float4 apColor;
 		[branch] if (UseReflectionSkyShadow())
@@ -460,25 +367,6 @@ PS_OUTPUT main(PS_INPUT input)
 		else
 			apColor = PhysSky::SampleAp(viewDir, input.Position.xy, psCloudDist, PhysSky::SampSv);
 		psout.Color.xyz = psout.Color.xyz * apColor.a + apColor.rgb;
-#		elif defined(HORIZFADE)
-		// (46z, D1) "Stars Fade With Sky Brightness". The star layer (stars and any Milky Way painted into
-		// the same picture) comes in the weather's colour by the clock; the vanilla dawn sky was bright
-		// enough to drown it, the physical sky is not. Like the moons by day (42b): alpha x 1 / (1 +
-		// strength x sky / star), with the sky luminance of the sky-view LUT behind each star pixel, so
-		// stars near the bright horizon go first and bright stars last. Enabled from astronomical twilight
-		// (LUT sun -18 -> -9 degrees): full nights are unchanged (no fading next to a moonlit glow).
-		[branch] if (SharedData::physSkyExtData.Flags & PhysSkyExt46z::StarsFade)
-		{
-			const float twilight = smoothstep(-0.309017, -0.156434, normalize(SharedData::physSkyNightData.LutSunDir).z);  // sin(-18), sin(-9)
-			[branch] if (twilight > 0.0)
-			{
-				const float3 starViewDir = normalize(input.WorldPosition.xyz);
-				const float skyLuminance = Color::RGBToLuminance(PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(starViewDir), 0).rgb);
-				const float starLuminance = Color::RGBToLuminance(psout.Color.xyz);
-				const float strength = twilight * SharedData::physSkyNightData.pad0;
-				psout.Color.w *= rcp(1.0 + strength * max(skyLuminance, 0.0) / max(starLuminance, 1e-4));
-			}
-		}
 #		elif defined(DEFERRED) && defined(TEX) && !defined(MOONMASK)
 		// (batch 37c) Not the moon/star mask: it is TEX too, but a sun disk has no business on it.
 		const uint extFlags = SharedData::physSkyExtData.Flags;
@@ -567,19 +455,6 @@ PS_OUTPUT main(PS_INPUT input)
 		} else if (replaceSun && isSunQuad) {
 			// Upstream 735ec68e4: the rest of the vanilla sun quad is cleared.
 			psout.Color = 0.0;
-		}
-#		endif
-
-#		if defined(TEX) && !defined(MOONMASK) && !defined(CLOUDS) && !defined(OCCLUSION)
-		// (46z, A1) "Vanilla Sun Halo (with Physical Sky)": the game's sun picture while the procedural
-		// sun is off (with it on, the disc code above owns that quad), and the sun glare picture.
-		{
-			const uint sunHaloFlags = SharedData::physSkyExtData.Flags & (PhysSkyExt46z::SunHaloSmooth | PhysSkyExt46z::SunHaloOff);
-			const bool vanillaSunQuad = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSun) && SharedData::physSkyData.sunDiskCos <= 0.0;
-			const bool sunGlareQuad = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSunGlare) != 0;
-			[branch] if (sunHaloFlags && (vanillaSunQuad || sunGlareQuad))
-				psout.Color.w = VanillaSunHaloAlpha(input.TexCoord0.xy, baseColor.w, input.Color.w, vanillaSunQuad,
-					(sunHaloFlags & PhysSkyExt46z::SunHaloSmooth) != 0, input.Position.xy);
 		}
 #		endif
 
