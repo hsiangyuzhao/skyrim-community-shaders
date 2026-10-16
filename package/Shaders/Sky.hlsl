@@ -250,6 +250,140 @@ float3 GetProceduralSunGlow(float3 viewDir)
 	const float3 sunTransmittance = PhysSky::SampleTr(sunDir, PhysSky::SampTr);
 	return SharedData::physSkyData.sunlightColor * sunTransmittance * (intensity * falloff / Math::PI);
 }
+
+// (47a) "Sky Fixes": PhysicalSky::NightFlags bit 3 and the NightCbData fields it fills, named here so
+// that SharedData.hlsli (which every Lighting shader includes) stays byte-identical.
+namespace SkyFixes
+{
+	static const uint Flag = (1 << 3);
+	// Relative sky brightening that does not count yet: the night base is drawn into the LUT (fp16,
+	// bilinear) but recomputed here exactly, so a moonless night must not fade anything.
+	static const float StarDeadZone = 0.05;
+
+	bool On() { return (SharedData::physSkyNightData.Flags & Flag) != 0; }
+	float StarFadeStrength() { return SharedData::physSkyNightData.pad1; }
+	float NightBaseUnfade() { return SharedData::physSkyNightData.pad2; }
+
+	// Four uniform numbers in [0, 1) for this pixel and frame (a different set for each a_salt).
+	float4 PixelFrameRandom(float2 a_pxCoord, uint a_salt)
+	{
+		const uint3 h0 = Random::pcg3d(uint3(uint2(a_pxCoord), SharedData::FrameCount ^ (a_salt * 0x9E3779B9u)));
+		const uint3 h1 = Random::pcg3d(h0 ^ 0x68E31DA4u);
+		return float4(float3(h0 >> 8), float(h1.x >> 8)) * (1.0 / 16777216.0);
+	}
+
+	// LutGen.cs.hlsl's NightSkyBase: the weather's night gradient (x strength x fade).
+	float3 NightSkyBase(float3 a_dir)
+	{
+		const SharedData::PhysSkyNightData night = SharedData::physSkyNightData;
+		[flatten] if (a_dir.z >= 0.0)
+			return lerp(night.BaseHorizon, night.BaseUpper, smoothstep(0.0, 0.5, a_dir.z));
+		return lerp(night.BaseHorizon, night.BaseLower, smoothstep(0.0, 0.3, -a_dir.z));
+	}
+
+	// Stars and the Milky Way against the sky behind them. k = the physical sky's brightness in this
+	// direction / the night base light at full strength there: 1 on a moonless night, more under a moon or
+	// at dawn. The extra brightness (k - 1) drowns a texel in proportion to how faint it is itself (c0 =
+	// its own brightness x alpha, before the weather tint and the clock fade), so the Milky Way's glow and
+	// the faint stars go first and the brightest stars last. Moonless night: exactly 1.
+	float StarVisibility(float3 a_dir, float a_texelBrightness)
+	{
+		const float unfade = NightBaseUnfade();
+		float visibility = 0.0;  // the night base light has faded out: daylight
+		[branch] if (unfade > 0.0)
+		{
+			visibility = 1.0;
+			const float base = Color::RGBToLuminance(NightSkyBase(a_dir)) * unfade;
+			[branch] if (base > 0.0)
+			{
+				const float sky = Color::RGBToLuminance(PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(a_dir), 0).rgb);
+				const float excess = max(sky / base - 1.0 - StarDeadZone, 0.0);
+				visibility = saturate(1.0 - StarFadeStrength() * excess / max(a_texelBrightness, 1e-6));
+			}
+		}
+		return visibility;
+	}
+
+#		if defined(TEX) && !defined(MOONMASK) && !defined(CLOUDS) && !defined(OCCLUSION)
+	// The game's sun / sun glare picture. NAT's sun.dds keeps its halo in the alpha channel as 8-bit steps
+	// tens to a hundred texels wide, each a visible ring over a dark sky; a dither on the output cannot hide
+	// a step that is already in the texture, so the halo is blurred along the radius first (the picture is
+	// radially symmetric; 8 taps with a per-pixel per-frame offset, so the taps fill the gaps over a few
+	// frames), then dithered by +-0.5/255. The opaque disc body (alpha > 0.5) of the sun picture is kept.
+	// Not multiplied by any transmittance: its brightness stays the game's.
+	float SunHaloAlpha(float2 a_uv, float a_texAlpha, float a_vertexAlpha, bool a_hasBody, float2 a_pxCoord)
+	{
+		const float bodyWeight = a_hasBody ? smoothstep(0.3, 0.6, a_texAlpha) : 0.0;
+		const float4 rnd = PixelFrameRandom(a_pxCoord, 1);
+		float alpha = a_texAlpha;
+		const float2 fromCentre = a_uv - 0.5;
+		const float r = length(fromCentre);
+		[branch] if (bodyWeight < 1.0 && r > 1e-4)
+		{
+			const float2 radial = fromCentre / r;
+			// The steps get wider away from the centre: about 35 texels of a 2048 picture at the inner halo,
+			// 90 at the outer edge.
+			const float halfWidth = 0.1 * r + 0.004;
+			float sum = 0.0;
+			[unroll] for (int k = 0; k < 8; ++k)
+			{
+				const float t = ((k + rnd.x) * 0.125) * 2.0 - 1.0;
+				// Capped so taps that reach into the disc do not light a ring around it.
+				sum += min(TexBaseSampler.SampleLevel(SampBaseSampler, a_uv + radial * (t * halfWidth), 0).w, 0.3);
+			}
+			alpha = lerp(sum * 0.125, a_texAlpha, bodyWeight);
+		}
+		// Triangular dither, +-0.5/255, shrinking to nothing where the halo ends (no speckles around it).
+		const float dither = (rnd.y + rnd.z - 1.0) * (0.5 / 255.0);
+		alpha = max(alpha + dither * saturate(alpha * 510.0), 0.0);
+		return a_vertexAlpha * alpha;
+	}
+
+	// Upstream 6491de101: the share of the sun's neighbourhood that shows open sky (16 depth taps in a 0.02
+	// screen-UV disc around the glare's centre), so ridges between the sun and the camera hide the glare.
+	// The centre comes from the quad itself: world position and texture coordinate are affine on the quad,
+	// so their screen derivatives give the world point at uv (0.5, 0.5).
+	Texture2D<float> TexGlareDepth : register(t65);  // bound only for the glare draw (PhysicalSky::BindGlareDepth)
+
+	float GlareRidgeVisibility(float2 a_uv, float3 a_worldPos, float2 a_uvDx, float2 a_uvDy, float3 a_posDx, float3 a_posDy, uint a_eyeIndex)
+	{
+#			if defined(VR)
+		return 1.0;
+#			else
+		if (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection)
+			return 1.0;
+		const float det = a_uvDx.x * a_uvDy.y - a_uvDx.y * a_uvDy.x;
+		[branch] if (!(abs(det) > 1e-14))
+			return 1.0;
+		const float2 toCentre = 0.5 - a_uv;
+		const float a = (toCentre.x * a_uvDy.y - toCentre.y * a_uvDy.x) / det;
+		const float b = (a_uvDx.x * toCentre.y - a_uvDx.y * toCentre.x) / det;
+		const float3 centre = a_worldPos + a * a_posDx + b * a_posDy;
+		const float4 centreCS = mul(FrameBuffer::CameraViewProj[a_eyeIndex], float4(centre, 1.0));
+		[branch] if (centreCS.w <= 0.0)
+			return 1.0;
+		const float2 sunUV = centreCS.xy / centreCS.w * float2(0.5, -0.5) + 0.5;
+		uint visible = 0, loaded = 0, empty = 0;
+		[unroll] for (uint i = 0; i < 16; i++)
+		{
+			const float2 sampleUV = sunUV + Random::PoissonSampleOffsets16[i] * 0.02;
+			[branch] if (FrameBuffer::IsOutsideFrame(sampleUV))
+			{
+				visible++;
+				continue;
+			}
+			const float depth = TexGlareDepth.Load(SharedData::ConvertUVToSampleCoord(sampleUV, a_eyeIndex)).x;
+			loaded++;
+			visible += depth >= 1.0 ? 1 : 0;
+			empty += depth <= 0.0 ? 1 : 0;
+		}
+		[branch] if (loaded > 0 && empty == loaded)
+			return 1.0;  // nothing bound (or no usable depth): leave the glare as the game draws it
+		return smoothstep(0.0, 1.0, visible / 16.0);
+#			endif
+	}
+#		endif
+}
 #	endif
 
 PS_OUTPUT main(PS_INPUT input)
@@ -344,6 +478,13 @@ PS_OUTPUT main(PS_INPUT input)
 #	endif  // OCCLUSION
 
 #if defined(PHYSICAL_SKY)
+#	if defined(TEX) && !defined(MOONMASK) && !defined(CLOUDS) && !defined(OCCLUSION)
+	// (47a) Screen derivatives for the glare's ridge test, taken here in uniform control flow.
+	const float2 glareUvDx = ddx(input.TexCoord0.xy);
+	const float2 glareUvDy = ddy(input.TexCoord0.xy);
+	const float3 glarePosDx = ddx(input.WorldPosition.xyz);
+	const float3 glarePosDy = ddy(input.WorldPosition.xyz);
+#	endif
 	if (SharedData::physSkyData.enabled)
 	{
 # 		if defined(DITHER) && !defined(TEX)
@@ -360,6 +501,17 @@ PS_OUTPUT main(PS_INPUT input)
 		else
 			psout.Color.xyz = lerp(skyColor, psout.Color.xyz, SharedData::physSkyData.vanillaMix);
 
+		// (47a) Sky Fixes: the main target (R11G11B10_FLOAT: 6 significant bits in red and green, 5 in blue)
+		// shows smooth dark gradients as steps. Per pixel and frame, triangular, about half a step (2^-7
+		// relative in red/green, 2^-6 in blue); the upscaler averages it out. Not in reflections.
+		[branch] if (SkyFixes::On() && !(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection))
+		{
+			const float4 rndA = SkyFixes::PixelFrameRandom(input.Position.xy, 2);
+			const float4 rndB = SkyFixes::PixelFrameRandom(input.Position.xy, 3);
+			const float3 tpdf = rndA.xyz + rndB.xyz - 1.0;
+			psout.Color.xyz = max(psout.Color.xyz * (1.0 + tpdf * float3(1.0 / 128.0, 1.0 / 128.0, 1.0 / 64.0)), 0.0);
+		}
+
 #		elif defined(PS_CLOUDS)
 		float4 apColor;
 		[branch] if (UseReflectionSkyShadow())
@@ -367,6 +519,11 @@ PS_OUTPUT main(PS_INPUT input)
 		else
 			apColor = PhysSky::SampleAp(viewDir, input.Position.xy, psCloudDist, PhysSky::SampSv);
 		psout.Color.xyz = psout.Color.xyz * apColor.a + apColor.rgb;
+#		elif defined(HORIZFADE)
+		// (47a) Sky Fixes: the star layer (stars and the Milky Way) fades as the physical sky behind it gets
+		// brighter than the moonless night base (moonlight, dawn); the game's clock fade stays multiplied in.
+		[branch] if (SkyFixes::On() && SkyFixes::StarFadeStrength() > 0.0)
+			psout.Color.w *= SkyFixes::StarVisibility(normalize(input.WorldPosition.xyz), Color::RGBToLuminance(baseColor.xyz) * baseColor.w);
 #		elif defined(DEFERRED) && defined(TEX) && !defined(MOONMASK)
 		// (batch 37c) Not the moon/star mask: it is TEX too, but a sun disk has no business on it.
 		const uint extFlags = SharedData::physSkyExtData.Flags;
@@ -455,6 +612,22 @@ PS_OUTPUT main(PS_INPUT input)
 		} else if (replaceSun && isSunQuad) {
 			// Upstream 735ec68e4: the rest of the vanilla sun quad is cleared.
 			psout.Color = 0.0;
+		}
+#		endif
+
+#		if defined(TEX) && !defined(MOONMASK) && !defined(CLOUDS) && !defined(OCCLUSION)
+		// (47a) Sky Fixes: the game's sun picture (while the procedural sun is off; with it on the disc code
+		// above owns that quad) and its glare: halo smoothed and dithered; the glare also hides behind ridges.
+		[branch] if (SkyFixes::On())
+		{
+			const bool vanillaSunQuad = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSun) && SharedData::physSkyData.sunDiskCos <= 0.0;
+			const bool sunGlareQuad = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::IsSunGlare) != 0;
+			[branch] if (vanillaSunQuad || sunGlareQuad)
+			{
+				psout.Color.w = SkyFixes::SunHaloAlpha(input.TexCoord0.xy, baseColor.w, input.Color.w, vanillaSunQuad, input.Position.xy);
+				[branch] if (sunGlareQuad)
+					psout.Color.w *= SkyFixes::GlareRidgeVisibility(input.TexCoord0.xy, input.WorldPosition.xyz, glareUvDx, glareUvDy, glarePosDx, glarePosDy, eyeIndex);
+			}
 		}
 #		endif
 

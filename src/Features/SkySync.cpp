@@ -1,5 +1,7 @@
 ﻿#include "SkySync.h"
 
+#include <numbers>
+
 #include "PhysicalSky.h"
 #include "VolumetricLighting.h"
 
@@ -162,7 +164,7 @@ void SkySync::Update(const RE::Sky* sky)
 	const auto worldSpace = player->GetWorldspace();
 	const float altitude = worldSpace ? player->GetPositionZ() - worldSpace->GetDefaultWaterHeight() : 0.0f;
 
-	ProcessSun(sun, time, altitude, isDayTime);
+	ProcessSun(sky, sun, time, altitude, isDayTime);
 	ProcessMoon(sky->masser, time, Caster::Masser, altitude, isDayTime);
 	ProcessMoon(sky->secunda, time, Caster::Secunda, altitude, isDayTime);
 
@@ -182,7 +184,180 @@ void SkySync::Update(const RE::Sky* sky)
 
 float SkySync::MoonDayFade(const float sunElevationDeg)
 {
+	// (47a) Sky Fixes: upstream's moonlight retreat. Its moonlight cap before sunrise is
+	// (effective horizon - sun height) / 7 degrees with the effective horizon at -1 degree: full
+	// at -8, gone at -1 (by then the real sky is already far brighter than any full moon).
+	if (SkyFixesActive())
+		return std::clamp((-1.0f - sunElevationDeg) / 7.0f, 0.0f, 1.0f);
 	return 1.0f - SmoothStep(MoonDayFadeStart, MoonDayFadeEnd, sunElevationDeg);
+}
+
+bool SkySync::SkyFixesActive()
+{
+	return globals::features::physicalSky.SkyFixesActive();
+}
+
+float SkySync::GetDaytimeColorExtension()
+{
+	if (!gDaytimeColorExtension) {
+		if (const auto collection = RE::GameSettingCollection::GetSingleton())
+			gDaytimeColorExtension = collection->GetSetting("fDaytimeColorExtension");
+	}
+	const float value = gDaytimeColorExtension ? gDaytimeColorExtension->GetFloat() : 0.5f;
+	return std::isfinite(value) ? std::clamp(value, 0.0f, 3.0f) : 0.5f;
+}
+
+void SkySync::SunWarp::Build(const RE::TESClimate::Timing& a_timing, const float a_colorExtension, const float a_sunAngleDeg)
+{
+	const uint8_t newKey[4] = { a_timing.sunrise.begin, a_timing.sunrise.end, a_timing.sunset.begin, a_timing.sunset.end };
+	if (built && std::equal(std::begin(newKey), std::end(newKey), std::begin(key)) && keyExtension == a_colorExtension && keySunAngle == a_sunAngleDeg)
+		return;
+	built = true;
+	std::copy(std::begin(newKey), std::end(newKey), std::begin(key));
+	keyExtension = a_colorExtension;
+	keySunAngle = a_sunAngleDeg;
+	++generation;
+	valid = false;
+
+	// All zero: no timing at all (the 46y formula, as the game's own colours then never change either).
+	if (newKey[0] == 0 && newKey[1] == 0 && newKey[2] == 0 && newKey[3] == 0)
+		return;
+
+	// TNAM is in 10-minute units. Windows shorter than half an hour are widened about their middle.
+	double srb = newKey[0] / 6.0, sre = newKey[1] / 6.0, ssb = newKey[2] / 6.0, sse = newKey[3] / 6.0;
+	auto widen = [](double& a_begin, double& a_end) {
+		if (a_end - a_begin < 0.5) {
+			const double centre = (a_begin + a_end) * 0.5;
+			a_begin = centre - 0.25;
+			a_end = centre + 0.25;
+		}
+	};
+	widen(srb, sre);
+	widen(ssb, sse);
+
+	// The engine's colour keys: night until sunrise begin - fDaytimeColorExtension (clamped at 0), sunrise
+	// colours peak half way to sunrise end, day from sunrise end to sunset begin, sunset colours peak half
+	// way to sunset end + extension (clamped at 23.99), night after that.
+	const double ext = a_colorExtension;
+	const double csb = std::max(0.0, srb - ext);
+	const double cse = std::min(23.99, sse + ext);
+	const double midR = csb + (sre - csb) * 0.5;
+	const double midS = ssb + (cse - ssb) * 0.5;
+	const double noon = (midR + midS) * 0.5;
+
+	// Overlapping, inverted or crowded windows (polar days and nights, broken records): no warp.
+	constexpr double gap = 0.25;
+	if (!(csb + gap <= midR && midR + gap <= sre && sre + gap <= noon && noon + gap <= ssb && ssb + gap <= midS && midS + gap <= cse && cse + gap <= csb + 24.0))
+		return;
+
+	// Elevation -> phase on the tilted path: sin(elevation) = sin(phase) sin(tilt). Targets are kept within
+	// 0.8 of the path's own maximum, so a low path still rises and sets smoothly.
+	const double sinTilt = std::abs(std::sin(a_sunAngleDeg * (std::numbers::pi / 180.0)));
+	if (sinTilt < std::sin(10.0 * std::numbers::pi / 180.0))
+		return;
+	const double maxElevationDeg = std::asin(std::min(sinTilt, 1.0)) * (180.0 / std::numbers::pi);
+	auto phaseFor = [&](double a_elevationDeg) {
+		const double el = std::clamp(a_elevationDeg, -0.8 * maxElevationDeg, 0.8 * maxElevationDeg);
+		return std::asin(std::clamp(std::sin(el * (std::numbers::pi / 180.0)) / sinTilt, -1.0, 1.0));
+	};
+	const double pn = phaseFor(NightElevation);
+	const double pd = phaseFor(DayElevation);
+	constexpr double pi = std::numbers::pi;
+
+	const double xs[KnotCount] = { cse - 24.0, csb, midR, sre, noon, ssb, midS, cse, csb + 24.0, midR + 24.0 };
+	const double ys[KnotCount] = { pi - pn - 2.0 * pi, pn, 0.0, pd, pi * 0.5, pi - pd, pi, pi - pn, 2.0 * pi + pn, 2.0 * pi };
+	std::copy(std::begin(xs), std::end(xs), std::begin(x));
+	std::copy(std::begin(ys), std::end(ys), std::begin(y));
+
+	// Monotone piecewise cubic Hermite (Fritsch-Butland weighted harmonic mean of the secants).
+	double delta[KnotCount - 1];
+	for (int i = 0; i < KnotCount - 1; ++i)
+		delta[i] = (y[i + 1] - y[i]) / (x[i + 1] - x[i]);
+	m[0] = delta[0];
+	m[KnotCount - 1] = delta[KnotCount - 2];
+	for (int i = 1; i < KnotCount - 1; ++i) {
+		if (delta[i - 1] * delta[i] <= 0.0) {
+			m[i] = 0.0;
+		} else {
+			const double w1 = 2.0 * (x[i + 1] - x[i]) + (x[i] - x[i - 1]);
+			const double w2 = (x[i + 1] - x[i]) + 2.0 * (x[i] - x[i - 1]);
+			m[i] = (w1 + w2) / (w1 / delta[i - 1] + w2 / delta[i]);
+		}
+	}
+	valid = true;
+}
+
+double SkySync::SunWarp::Phase(double a_hour) const
+{
+	if (!std::isfinite(a_hour))
+		a_hour = 12.0;
+	// Into [csb, csb + 24): the knots cover that day once, plus a knot either side.
+	double h = std::fmod(a_hour - x[1], 24.0);
+	if (h < 0.0)
+		h += 24.0;
+	h += x[1];
+	int k = 0;
+	while (k < KnotCount - 2 && h > x[k + 1])
+		++k;
+	const double span = x[k + 1] - x[k];
+	const double t = span > 0.0 ? (h - x[k]) / span : 0.0;
+	const double t2 = t * t, t3 = t2 * t;
+	const double h00 = 2.0 * t3 - 3.0 * t2 + 1.0, h10 = t3 - 2.0 * t2 + t, h01 = -2.0 * t3 + 3.0 * t2, h11 = t3 - t2;
+	return h00 * y[k] + h10 * span * m[k] + h01 * y[k + 1] + h11 * span * m[k + 1];
+}
+
+void SkySync::GetSunDirectionAtHour(const RE::Sky* sky, const float hour, RE::NiPoint3& outDir, float& outDist)
+{
+	double phase;
+	if (sky && sky->currentClimate) {
+		sunWarp.Build(sky->currentClimate->timing, GetDaytimeColorExtension(), sunAngle);
+	}
+	if (sky && sky->currentClimate && sunWarp.valid) {
+		phase = sunWarp.Phase(hour);
+	} else {
+		// The 46y formula, guarded against a window that would divide by ~0.
+		float sunrise = timings.sunrise, sunset = timings.sunset;
+		if (!(sunset - sunrise > 0.1f) || !std::isfinite(sunrise) || !std::isfinite(sunset)) {
+			sunrise = 6.0f;
+			sunset = 18.0f;
+		}
+		phase = std::numbers::pi * ((hour - sunrise) / (sunset - sunrise));
+	}
+	const double tilt = sunAngle * (std::numbers::pi / 180.0);
+	const double sinPhi = std::sin(phase), cosPhi = std::cos(phase);
+	outDir = { static_cast<float>(cosPhi), static_cast<float>(-sinPhi * std::cos(tilt)), static_cast<float>(sinPhi * std::sin(tilt)) };
+	if (outDir.Unitize() < FLT_EPSILON)
+		outDir = { 0.0f, 0.0f, 1.0f };
+	outDist = std::lerp(SunHorizonDistance, SunPeakDistance, std::max(static_cast<float>(sinPhi), 0.0f));
+}
+
+void SkySync::FadeSunAtHorizon(const RE::Sky* sky, const float sunElevationDeg)
+{
+	if (!sky || !sky->sun)
+		return;
+	const float el = std::isfinite(sunElevationDeg) ? sunElevationDeg : -90.0f;
+	const float discFade = std::clamp((el + 3.0f) / 2.0f, 0.0f, 1.0f);
+	const float glareFade = std::clamp(el / 1.0f, 0.0f, 1.0f);
+
+	// The weathers' own glare, blended as Sun::Update blends it (its alpha also carries the clock fade,
+	// which is exactly what this replaces).
+	const float pct = std::isfinite(sky->currentWeatherPct) ? std::clamp(sky->currentWeatherPct, 0.0f, 1.0f) : 1.0f;
+	float glare = 0.0f;
+	if (sky->currentWeather) {
+		const float current = sky->currentWeather->data.sunGlare * (1.0f / 255.0f);
+		if (sky->lastWeather && sky->lastWeather != sky->currentWeather && pct < 1.0f)
+			glare = std::lerp(sky->lastWeather->data.sunGlare * (1.0f / 255.0f), current, pct);
+		else
+			glare = current;
+	}
+
+	const std::pair<RE::BSTriShape*, float> alphas[] = { { sky->sun->sunBase.get(), discFade }, { sky->sun->sunGlare.get(), glare * glareFade } };
+	for (const auto& [geometry, alpha] : alphas) {
+		if (!geometry)
+			continue;
+		if (const auto property = skyrim_cast<RE::BSSkyShaderProperty*>(geometry->GetGeometryRuntimeData().properties[1].get()))
+			property->kBlendColor.alpha = alpha;
+	}
 }
 
 void SkySync::UpdateCombined(const RE::Sky* sky)
@@ -476,13 +651,19 @@ void SkySync::SetSkyRotation(const RE::Sky* sky, RE::TESObjectCELL* cell)
 	sky->root->Update(updateData);
 }
 
-void SkySync::ProcessSun(const RE::Sun* sun, const float time, const float altitude, const bool isDayTime)
+void SkySync::ProcessSun(const RE::Sky* sky, const RE::Sun* sun, const float time, const float altitude, const bool isDayTime)
 {
 	RE::NiPoint3 dir;
 	float dist;
 
+	// (47a) Sky Fixes: the alternate path's timing follows the climate's colour keys (SunWarp). Without
+	// the alternate path the game's own sun position is kept (no warp), as in 46y.
+	const bool skyFixes = SkyFixesActive();
 	if (settings.UseAlternateSunPath) {
-		CalculateAlternateSunDirectionAndDistance(dir, dist, time, timings.sunrise, timings.sunset, sunAngle);
+		if (skyFixes)
+			GetSunDirectionAtHour(sky, time, dir, dist);
+		else
+			CalculateAlternateSunDirectionAndDistance(dir, dist, time, timings.sunrise, timings.sunset, sunAngle);
 	} else
 		CalculateSunDirectionAndDistance(sun, dir, dist);
 
@@ -493,7 +674,12 @@ void SkySync::ProcessSun(const RE::Sun* sun, const float time, const float altit
 
 	directions[static_cast<int>(Caster::Sun)] = apparentDir;
 
-	SetSunBaseVisibility(sun, isDayTime ? 1.0f : 0.0f);
+	// (47a) Sky Fixes: disc and glare by the sun's true elevation instead of on/off by the clock
+	// (06:30-19:30 with NAT's climate, which showed a red disc 15 degrees below the horizon).
+	if (skyFixes)
+		FadeSunAtHorizon(sky, DirectX::XMConvertToDegrees(std::asin(std::clamp(dir.z, -1.0f, 1.0f))));
+	else
+		SetSunBaseVisibility(sun, isDayTime ? 1.0f : 0.0f);
 
 	intensities[static_cast<int>(Caster::Sun)] = isDayTime ? CalculateVisibility(dir, dist, *gSunGlareSize * SunScaleFactor) : 0.0f;
 }

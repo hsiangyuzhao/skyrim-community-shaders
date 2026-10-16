@@ -1,5 +1,7 @@
 #pragma once
 
+#include "PhysicalSkyModel.h"
+
 struct PhysicalSky final : public Feature
 {
 	////////////////////////////////////////////////// Boilerplate
@@ -129,6 +131,12 @@ struct PhysicalSky final : public Feature
 	struct Settings
 	{
 		bool enabled = true;
+		/// (47a) "Sky Fixes": one switch for the batch 47a sky (timing from the climate, sky brightness
+		/// following the ground, ozone 10-40 km, midpoint LUTs, ground bounce fix, 64x64 aerial
+		/// perspective, stars fading with the sky, the vanilla sun by its true height, glare hidden by
+		/// ridges, dither, earlier moonlight retreat). Off = 46y exactly. Saved outside the NLOHMANN
+		/// macro (see LoadSettings).
+		bool skyFixes = true;
 		bool overrideDirLight = false;
 		int tonemapper = 2;
 		float vanillaMix = 0;
@@ -282,6 +290,10 @@ struct PhysicalSky final : public Feature
 	const Settings& Effective() const { return effective; }
 	/// (41b, F5) Legacy (36f) mode is active.
 	bool IsLegacy() const { return loaded && settings.skyModel == kSkyModelLegacy36f; }
+	/// (47a) "Sky Fixes" is in effect: on, Physical Sky loaded and enabled, not Legacy (36f). Sky
+	/// Sync's timing, sun fade and moonlight retreat follow this too (also where the physical sky
+	/// itself is not drawn, e.g. interiors, so the sun does not jump at a worldspace border).
+	bool SkyFixesActive() const { return loaded && settings.enabled && settings.skyFixes && !IsLegacy(); }
 	/// (41b, F5) 36f code paths for what the old Batch 37b master switched: hard-coded worldspace
 	/// list, 37a sun disc size, no 37b/37c shader flags.
 	bool UseLegacyPaths() const;
@@ -386,21 +398,69 @@ struct PhysicalSky final : public Feature
 	enum NightFlags : uint32_t
 	{
 		kNightBaseLight = 1u << 0,  // F1: add the Base* colours below
+		// (47a) Sky Fixes. Read by LutGen.cs.hlsl / Sky.hlsl through local constants (SharedData.hlsli,
+		// which every Lighting shader includes, is untouched).
+		kNightMidpoint = 1u << 1,   // LUT ray-march samples in the middle of each step (all four passes)
+		kNightGroundFix = 1u << 2,  // multiscatter ground bounce x cos / pi, sun tested at the ground point
+		kNightSkyFixes = 1u << 3,   // Sky.hlsl: dither, sun halo smoothing, glare ridge test, star fade
 	};
 	struct NightCbData
 	{
 		float3 lutSunDir = { 0.f, 0.f, 1.f };  // F4a/F4b: sun direction the LUTs use
 		uint flags = 0;
 		float3 baseUpper = {};    // F1: linear, x strength x fade (zenith)
-		float pad0 = 0.f;
+		float skyScale = 1.f;     // (47a, HLSL pad0) sky brightness factor on the sun/moon in-scatter (1 = none)
 		float3 baseHorizon = {};  // horizon; also the aerial perspective's even glow
-		float pad1 = 0.f;
+		float starFadeStrength = 0.f;  // (47a, HLSL pad1) star fade T (0 = off)
 		float3 baseLower = {};    // below the horizon
-		float pad2 = 0.f;
+		float nightBaseUnfade = 0.f;   // (47a, HLSL pad2) 1 / the night base fade (0 = faded out or off)
 	} nightCbData;
 	static_assert(sizeof(NightCbData) == 64);
 	/// (41b, F1) Fills nightCbData's base light from the current weather; a_sunElevation in radians.
 	void UpdateNightBaseLight(float a_sunElevation);
+	/// (47a) The night base light at full strength (fade 1) and its fade this frame, for Sky Fixes.
+	float3 nightBaseUnfadedUpper = {};
+	float3 nightBaseUnfadedHorizon = {};
+	float nightBaseFade = 0.f;
+
+	/// (47a) Sky Fixes constants.
+	static constexpr float kSkyFixesDayElevationDeg = 12.f;  // = SkySync::SunWarp::DayElevation
+	static constexpr float kSkyFixesScaleCap = 8.f;
+	static constexpr float kSkyFixesRingElevationDeg = 85.f;
+	static constexpr float kSkyFixesSmoothingSeconds = 1.5f;
+	static constexpr float kSkyFixesStarFade = 0.0035f;
+	static constexpr float kOzoneFixAltitude = 25.f;   // km: layer 10-40 km
+	static constexpr float kOzoneFixThickness = 30.f;  // km
+	/// (47a) Sky brightness follows the ground: sets nightCbData.skyScale (smoothed) and the Sky Fixes
+	/// flags and star values. a_lutSunDir is the LUTs' sun (world frame).
+	void UpdateSkyFixes(bool a_fixes, const RE::NiPoint3& a_lutSunDir);
+	/// (47a) g: the weather's blended ground ambient (DALC) between its night and day keys, 0-1; false
+	/// when there is no usable difference (|day - night| < 10%) or no weather.
+	static bool GetAmbientProgress(float& a_g);
+	PhysicalSkyModel::Model skyModelCpu;
+	float skyScaleSmoothed = -1.f;  // < 0: snap next time
+	float skyScaleLastHours = -1.f;
+	uint32_t skyScaleLastWarp = 0;
+	struct SkyFixesDebug
+	{
+		bool valid = false;
+		float g = 0.f, zScatter = 0.f, zBase = 0.f, zNight = 0.f, zDay = 0.f, target = 1.f;
+	} skyFixesDebug;
+
+	/// (47a) Aerial perspective LUT direction size: 32x32, or 64x64 with Sky Fixes (depth stays 32).
+	static constexpr uint16_t kApLutFixW = 64;
+	static constexpr uint16_t kApLutFixH = 64;
+	uint16_t apLutW = kApLutW;
+	uint16_t apLutH = kApLutH;
+	bool CreateApLut(uint16_t a_w, uint16_t a_h);
+	void UpdateApLutSize();
+
+	/// (47a) Sky Fixes: scene depth bound for the vanilla sun glare draw (PS t65), for its ridge test.
+	static constexpr UINT kGlareDepthSlot = 65;
+	ID3D11ShaderResourceView* glarePreviousSrv = nullptr;
+	bool glareDepthBound = false;
+	void BindGlareDepth(const RE::BSRenderPass* a_pass);
+	void UnbindGlareDepth();
 	/// (41b, F2) Glow visibility of a moon by its true elevation; 0 when the weather hides it.
 	static float MoonHorizonVisibility(const RE::Moon* a_moon, const RE::Sky* a_sky, float a_sinElevation);
 

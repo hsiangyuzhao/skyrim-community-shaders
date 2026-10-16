@@ -303,7 +303,7 @@ private:
 
 	void SetSkyRotation(const RE::Sky* sky, RE::TESObjectCELL* cell);
 
-	void ProcessSun(const RE::Sun* sun, float time, float altitude, bool isDayTime);
+	void ProcessSun(const RE::Sky* sky, const RE::Sun* sun, float time, float altitude, bool isDayTime);
 
 	void ProcessMoon(const RE::Moon* moon, float time, Caster type, float altitude, bool isDayTime);
 
@@ -340,5 +340,51 @@ public:
 	/// (42b) How much of the moons' light is left with the sun at this true elevation (degrees):
 	/// 1 below MoonDayFadeStart, 0 above MoonDayFadeEnd. Used by the Combined light model and by
 	/// Physical Sky's cloud lighting.
+	/// (47a) With Physical Sky's "Sky Fixes" on: 1 below -8 degrees, falling linearly to 0 at -1
+	/// (upstream's timing: 7 degrees below its -1 degree effective horizon).
 	static float MoonDayFade(float sunElevationDeg);
+
+	/// (47a) Physical Sky's "Sky Fixes" is on (Physical Sky loaded and enabled, not Legacy (36f)).
+	static bool SkyFixesActive();
+
+	/// (47a) Sky Fixes timing. The phase of the alternate sun path is warped through the climate's
+	/// colour keys (monotone C1 PCHIP), so the physical sun sits at -12 degrees when the weather starts
+	/// to leave its night colours, at 0 where its sunrise colours peak, at +12 where it is full day,
+	/// at the top of the path at noon, and mirrored in the evening. Pure function of the hour and the
+	/// climate timing; invalid (= the 46y formula) for all-zero, overlapping, inverted or crowded
+	/// windows and for paths flatter than 10 degrees.
+	struct SunWarp
+	{
+		static constexpr int KnotCount = 10;
+		static constexpr double NightElevation = -12.0;  // degrees, at the start of the colour change
+		static constexpr double DayElevation = 12.0;     // degrees, where the day colours are full
+		bool valid = false;
+		double x[KnotCount] = {};  // hours (the first and the last two wrap round the day)
+		double y[KnotCount] = {};  // path phase, radians
+		double m[KnotCount] = {};  // PCHIP slopes
+		// What the knots were built from; Build() is a no-op while these match.
+		bool built = false;
+		uint8_t key[4] = {};
+		float keyExtension = 0.f;
+		float keySunAngle = 0.f;
+		uint32_t generation = 0;  // bumped whenever the knots change (climate, sun path)
+
+		void Build(const RE::TESClimate::Timing& a_timing, float a_colorExtension, float a_sunAngleDeg);
+		double Phase(double a_hour) const;
+	};
+	SunWarp sunWarp;
+	/// (47a) Bumped when the warp's knots change, so Physical Sky can snap its smoothing.
+	uint32_t GetSunWarpGeneration() const { return sunWarp.generation; }
+	/// (47a) GMST fDaytimeColorExtension (0.5 if missing).
+	static float GetDaytimeColorExtension();
+
+private:
+	inline static RE::Setting* gDaytimeColorExtension = nullptr;
+	/// (47a) Sky Fixes: alternate-path sun direction (sky-local) and quad distance at an hour, through
+	/// the warp when it is valid, else the 46y formula. The one source of the sun's position.
+	void GetSunDirectionAtHour(const RE::Sky* sky, float hour, RE::NiPoint3& outDir, float& outDist);
+	/// (47a) Sky Fixes: the vanilla sun disc and glare follow the sun's true elevation instead of the
+	/// clock: disc 0 at -3 degrees -> 1 at -1 (upstream), glare = the weathers' own glare (DATA sun
+	/// glare / 255, blended like the game) x 0 at the horizon -> 1 at +1 degree.
+	static void FadeSunAtHorizon(const RE::Sky* sky, float sunElevationDeg);
 };

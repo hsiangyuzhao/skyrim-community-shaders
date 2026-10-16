@@ -16,6 +16,13 @@ RWTexture3D<float4> RWTexOutput : register(u0);
 RWTexture2D<float4> RWTexOutput : register(u0);
 #endif
 
+// (47a) PhysicalSky::NightFlags bits and the NightCbData fields used by "Sky Fixes". Named here, not in
+// SharedData.hlsli (which every Lighting shader includes), so that file stays byte-identical.
+static const uint kNightMidpoint = (1 << 1);   // ray-march samples in the middle of each step
+static const uint kNightGroundFix = (1 << 2);  // multiscatter ground bounce x cos / pi, sun tested at the ground point
+static const uint kNightSkyFixes = (1 << 3);   // Sky Fixes on: the sky brightness factor below applies
+#define SKY_FIXES_SCALE SharedData::physSkyNightData.pad0  // sky brightness factor on the sun/moon in-scatter
+
 void rayMarch(
 	float3 pos, float3 rayDir, 
 #if LUTGEN == 0
@@ -36,6 +43,7 @@ void rayMarch(
 )
 {
 	const SharedData::PhysSkyData data = SharedData::physSkyData;
+	const uint fixFlags = SharedData::physSkyNightData.Flags;  // (47a)
 
 #if LUTGEN == 0
 	const uint nsteps = 40;
@@ -106,6 +114,10 @@ void rayMarch(
 #endif
 
 	float3 curr_pos = pos;
+	// (47a) Sky Fixes: sample each step in its middle (the loop advances first, so the original samples
+	// the far end of each step: twilight horizons came out too bright, a low sun's sky too dark).
+	[branch] if (fixFlags & kNightMidpoint)
+		curr_pos -= 0.5 * stride;
 	[loop] for (uint i = 0; i < nsteps; ++i)
 	{
 		curr_pos += stride;
@@ -165,8 +177,10 @@ void rayMarch(
 
 #if LUTGEN == 3
 		float3 lumOut = lum;
+		[branch] if (fixFlags & kNightSkyFixes)  // (47a) Sky Fixes: the sky brightness factor, not on the night glow
+			lumOut *= SKY_FIXES_SCALE;
 		[branch] if (nightBaseLight)
-			lumOut = lum + lumNight;
+			lumOut += lumNight;
 		RWTexOutput[uint3(tid.xy, i + 1)] = float4(lumOut, dot(tr, float3(0.2126, 0.7152, 0.0722)));
 #endif
 	}
@@ -174,7 +188,17 @@ void rayMarch(
 #if LUTGEN == 1  // multiscatter
 	if (tGround > 0) {
 		float3 hit_pos = pos + tGround * rayDir;
-		if (dot(pos, sunDir) > 0) {
+		[branch] if (fixFlags & kNightGroundFix) {
+			// (47a) Sky Fixes: a Lambertian ground sends back albedo x cos(sun zenith at the ground point) / pi
+			// per unit of sunlight; the original left out cos / pi (about 3x too bright) and tested the sun
+			// against the ray's start instead of the ground point.
+			const float3 groundUp = normalize(hit_pos);
+			const float groundCosSun = dot(groundUp, sunDir);
+			if (groundCosSun > 0) {
+				float2 lutUv = TrLutUvPlanet(groundUp * data.rPlanet, sunDir);
+				lum += tr * data.groundAlbedo * TexTrLut.SampleLevel(SampTr, lutUv, 0).rgb * (groundCosSun * RCP_PI);
+			}
+		} else if (dot(pos, sunDir) > 0) {
 			hit_pos = normalize(hit_pos) * data.rPlanet;
 			float2 lutUv = TrLutUvPlanet(hit_pos, sunDir);
 			lum += tr * data.groundAlbedo * TexTrLut.SampleLevel(SampTr, lutUv, 0).rgb;
@@ -259,6 +283,8 @@ float3 NightSkyBase(float3 rayDir)
 #elif LUTGEN == 2
 	float3 lum = 0;
 	rayMarch(pos, rayDir, tr, lum);
+	[branch] if (SharedData::physSkyNightData.Flags & kNightSkyFixes)  // (47a) Sky Fixes: the sky brightness factor, not on the night base
+		lum *= SKY_FIXES_SCALE;
 	[branch] if (SharedData::physSkyNightData.Flags & SharedData::PhysSkyNightFlags::BaseLight)
 		lum += NightSkyBase(rayDir);
 	RWTexOutput[tid.xy] = float4(lum, 1.0);

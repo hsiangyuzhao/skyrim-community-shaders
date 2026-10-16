@@ -128,6 +128,7 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.moonCloudLight = o_json.value("moonCloudLight", defaults.moonCloudLight);
 		settings.moonCloudStrength = o_json.value("moonCloudStrength", defaults.moonCloudStrength);
 		settings.moonCloudHalo = o_json.value("moonCloudHalo", defaults.moonCloudHalo);
+		settings.skyFixes = o_json.value("skyFixes", defaults.skyFixes);  // (47a)
 	}
 	settings.skyModel = std::clamp(settings.skyModel, 0, kSkyModelCount - 1);
 	settings.nightBaseLight = std::clamp(settings.nightBaseLight, 0.f, 1.f);
@@ -281,10 +282,33 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["moonCloudLight"] = settings.moonCloudLight;
 	o_json["moonCloudStrength"] = settings.moonCloudStrength;
 	o_json["moonCloudHalo"] = settings.moonCloudHalo;
+	o_json["skyFixes"] = settings.skyFixes;  // (47a)
 }
 
 void PhysicalSky::DrawSettings()
 {
+	// (47a) The one switch of batch 47a, above everything else.
+	ImGui::Checkbox("Sky Fixes", &settings.skyFixes);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Dawn and dusk that follow the game's own weather timing, a sky as bright as the ground around it,\n"
+			"and a set of physics and look fixes:\n"
+			"- the sun rises when the weather turns to sunrise colours (-12 deg as night colours start to fade,\n"
+			"  0 deg at the peak of the sunrise colours, +12 deg when the day colours are full; noon unchanged);\n"
+			"- at dawn and dusk the sky's scattered sun and moon light is raised (up to 8x) to keep the day's\n"
+			"  sky-to-ground brightness ratio; full day and full night are unchanged;\n"
+			"- ozone layer at 10-40 km (same colour and amount), more accurate sky tables, ground bounce fixed,\n"
+			"  finer distant-haze table;\n"
+			"- stars and the Milky Way fade as the sky behind them brightens (moonlight, dawn), faint parts first;\n"
+			"- the game's sun and its glare follow the sun's real height, the glare hides behind ridges, no\n"
+			"  banding in the glare and the sky;\n"
+			"- moonlight on the ground fades out from 8 deg before sunrise.\n"
+			"Day/Night Exposure, the adaptation angles and Twilight Length are not used while this is on.\n"
+			"Off = exactly as before.");
+	if (settings.skyFixes && IsLegacy())
+		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Sky Model is Legacy (36f): Sky Fixes is not used right now.");
+	ImGui::Separator();
+
 	if (ImGui::BeginTabBar("##PHYSSKY")) {
 		if (ImGui::BeginTabItem("General")) {
 			SettingsGeneral();
@@ -372,6 +396,11 @@ void PhysicalSky::SettingsGeneral()
 
 	ImGui::SeparatorText("Post Processing");
 	{
+		// (47a) Taken over by Sky Fixes (treated as 1 / off); greyed, the saved values are kept.
+		const bool takenOver = SkyFixesActive();
+		if (takenOver)
+			ImGui::TextDisabled("Taken over by Sky Fixes; set night brightness with the moon light.");
+		ImGui::BeginDisabled(takenOver);
 		ImGui::InputFloat("Day Exposure", &settings.dayExposure);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Brightness of the sky and sun/moon light by day. Higher = brighter.");
@@ -386,6 +415,7 @@ void PhysicalSky::SettingsGeneral()
 		ImGui::SliderAngle("Adaptation End", &settings.adaptationEnd, -90.f, 0.f);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Sun angle below the horizon where Night Exposure is fully reached.");
+		ImGui::EndDisabled();
 
 		if (ImGui::BeginTable("tonemap", 4, ImGuiTableFlags_SizingStretchSame, { -1, 0 })) {
 			ImGui::TableNextColumn();
@@ -607,12 +637,20 @@ void PhysicalSky::SettingsCelestials()
 			"Fades out as the sun climbs from 6 degrees below the horizon to 4 above.\n"
 			"0 = off (exactly as before). Default 0.2.");
 	// (44h) removed "Sky Uses True Sun Height": now fixed on (UpdateEffective()).
-	ImGui::SliderFloat("Twilight Length", &settings.twilightLength, 1.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Stretches dawn and dusk in the sky only: with 2, a sun 12 degrees below the horizon lights the sky\n"
-			"like one 6 degrees below, so the sky starts to brighten earlier and stays lit longer after sunset.\n"
-			"Does not change the sun or moon light on the ground. 1 = real twilight (default).");
+	// (47a) Taken over by Sky Fixes (treated as 1).
+	{
+		const bool takenOver = SkyFixesActive();
+		if (takenOver)
+			ImGui::TextDisabled("Taken over by Sky Fixes; set night brightness with the moon light.");
+		ImGui::BeginDisabled(takenOver);
+		ImGui::SliderFloat("Twilight Length", &settings.twilightLength, 1.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Stretches dawn and dusk in the sky only: with 2, a sun 12 degrees below the horizon lights the sky\n"
+				"like one 6 degrees below, so the sky starts to brighten earlier and stays lit longer after sunset.\n"
+				"Does not change the sun or moon light on the ground. 1 = real twilight (default).");
+		ImGui::EndDisabled();
+	}
 
 	ImGui::SeparatorText("Masser");
 	{
@@ -795,6 +833,14 @@ void PhysicalSky::SettingsDebug()
 		ImGui::InputFloat3("Sun Direction", &cbData.sunDir.x, "%.3f", ImGuiInputTextFlags_ReadOnly);
 		ImGui::InputFloat3("Masser Direction", &cbData.masserDir.x, "%.3f", ImGuiInputTextFlags_ReadOnly);
 		ImGui::InputFloat3("Secunda Direction", &cbData.secundaDir.x, "%.3f", ImGuiInputTextFlags_ReadOnly);
+		// (47a) Sky Fixes state, read only.
+		if (SkyFixesActive()) {
+			const auto& d = skyFixesDebug;
+			ImGui::Text("Sky Fixes: sun %.1f deg, sky x%.2f (target x%.2f)%s", DirectX::XMConvertToDegrees(std::asin(std::clamp(nightCbData.lutSunDir.z, -1.f, 1.f))),
+				nightCbData.skyScale, d.target, d.valid ? "" : " - no usable weather ambient, x1");
+			ImGui::Text("  ground progress %.2f, zenith scatter %.2e, night base %.2e, night ref %.2e, day ref %.2e", d.g, d.zScatter, d.zBase, d.zNight, d.zDay);
+			ImGui::Text("  aerial perspective LUT %ux%u, timing warp %s", apLutW, apLutH, globals::features::skySync.sunWarp.valid ? "on" : "off (46y timing)");
+		}
 	}
 
 	ImGui::SeparatorText("Textures");
@@ -879,25 +925,9 @@ void PhysicalSky::SetupResources()
 		texSvLut->CreateSRV(srvDesc);
 		texSvLut->CreateUAV(uavDesc);
 
-		D3D11_TEXTURE3D_DESC tex3dDesc{
-			.Width = kApLutW,
-			.Height = kApLutH,
-			.Depth = kApLutD,
-			.MipLevels = 1,
-			.Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
-			.Usage = D3D11_USAGE_DEFAULT,
-			.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET,
-			.CPUAccessFlags = 0,
-			.MiscFlags = 0
-		};
-		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
-		srvDesc.Texture3D = { .MostDetailedMip = 0, .MipLevels = 1 };
-		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D,
-		uavDesc.Texture3D = { .MipSlice = 0, .FirstWSlice = 0, .WSize = kApLutD };
-
-		texApLut = eastl::make_unique<Texture3D>(tex3dDesc);
-		texApLut->CreateSRV(srvDesc);
-		texApLut->CreateUAV(uavDesc);
+		// (47a) 32x32 directions as before; UpdateApLutSize() switches to 64x64 while Sky Fixes is on.
+		if (!CreateApLut(kApLutW, kApLutH))
+			DX::ThrowIfFailed(E_FAIL);  // as before: no aerial perspective LUT is a setup failure
 	}
 	{
 		D3D11_TEXTURE2D_DESC texDesc;
@@ -928,6 +958,62 @@ void PhysicalSky::SetupResources()
 	}
 
 	CompileShaders();
+}
+
+bool PhysicalSky::CreateApLut(uint16_t a_w, uint16_t a_h)
+{
+	D3D11_TEXTURE3D_DESC tex3dDesc{
+		.Width = a_w,
+		.Height = a_h,
+		.Depth = kApLutD,
+		.MipLevels = 1,
+		.Format = DXGI_FORMAT_R16G16B16A16_FLOAT,
+		.Usage = D3D11_USAGE_DEFAULT,
+		.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET,
+		.CPUAccessFlags = 0,
+		.MiscFlags = 0
+	};
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+		.Format = tex3dDesc.Format,
+		.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D,
+		.Texture3D = { .MostDetailedMip = 0, .MipLevels = 1 }
+	};
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+		.Format = tex3dDesc.Format,
+		.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D,
+		.Texture3D = { .MipSlice = 0, .FirstWSlice = 0, .WSize = kApLutD }
+	};
+
+	try {
+		auto texture = eastl::make_unique<Texture3D>(tex3dDesc);
+		texture->CreateSRV(srvDesc);
+		texture->CreateUAV(uavDesc);
+		// The old texture may still be bound from the last frame (t63 and the deferred passes): D3D11 keeps
+		// its own reference to bound views, so dropping ours here is safe. Every user binds texApLut afresh
+		// each frame after GenerateLuts().
+		texApLut = std::move(texture);
+		apLutW = a_w;
+		apLutH = a_h;
+		return true;
+	} catch (const std::exception& e) {
+		logger::warn("[Physical Sky] Could not create the {}x{}x{} aerial perspective LUT: {}", a_w, a_h, kApLutD, e.what());
+		return false;
+	}
+}
+
+void PhysicalSky::UpdateApLutSize()
+{
+	// (47a) Sky Fixes: 64x64 directions (each texel ~6 degrees instead of ~11); depth unchanged.
+	const bool fine = SkyFixesActive();
+	const uint16_t w = fine ? kApLutFixW : kApLutW;
+	const uint16_t h = fine ? kApLutFixH : kApLutH;
+	if (texApLut && w == apLutW && h == apLutH)
+		return;
+	static bool failedFine = false;  // do not retry a failing size every frame
+	if (fine && failedFine && texApLut)
+		return;
+	if (!CreateApLut(w, h) && fine)
+		failedFine = true;
 }
 
 void PhysicalSky::ClearShaderCache()
@@ -1085,13 +1171,18 @@ void PhysicalSky::UpdateNightBaseLight(float a_sunElevation)
 	nightCbData.baseUpper = {};
 	nightCbData.baseHorizon = {};
 	nightCbData.baseLower = {};
+	nightBaseUnfadedUpper = {};
+	nightBaseUnfadedHorizon = {};
+	nightBaseFade = 0.f;
 
 	const float strength = std::clamp(effective.nightBaseLight, 0.f, 1.f);
 	if (!(strength > 0.f))
 		return;  // 0: no flag, the LUTs run exactly the 41a code
 	// Gone once the sun's own twilight has taken over: full at -6 degrees, 0 at +4.
 	const float fade = 1.f - SkySync::SmoothStep(-6.f, 4.f, DirectX::XMConvertToDegrees(a_sunElevation));
-	if (!(fade > 0.f))
+	// (47a) Sky Fixes measures the night base at full strength even after it has faded out.
+	const bool keepUnfaded = SkyFixesActive();
+	if (!(fade > 0.f) && !keepUnfaded)
 		return;
 
 	// The weather's night keyframes (sRGB 0-255), blended like the game blends weathers.
@@ -1126,10 +1217,205 @@ void PhysicalSky::UpdateNightBaseLight(float a_sunElevation)
 		}
 		return c * (strength * fade);
 	};
+	if (keepUnfaded) {
+		// (47a) The same colours at fade 1. Only Sky Fixes reads these.
+		auto toLinearUnfaded = [&](float3 c) {
+			c = float3(std::max(c.x, airglow.x), std::max(c.y, airglow.y), std::max(c.z, airglow.z));
+			const auto& ll = globals::features::linearLighting.settings;
+			if (ll.enableLinearLighting) {
+				const float g = ll.skyGamma;
+				c = float3(std::pow(c.x, g), std::pow(c.y, g), std::pow(c.z, g));
+			}
+			return c * strength;
+		};
+		nightBaseUnfadedUpper = toLinearUnfaded(upper);
+		nightBaseUnfadedHorizon = toLinearUnfaded(horizon);
+		nightBaseFade = std::max(fade, 0.f);
+		if (!(fade > 0.f))
+			return;  // faded out: no flag, as without Sky Fixes
+	}
 	nightCbData.baseUpper = toLinear(upper);
 	nightCbData.baseHorizon = toLinear(horizon);
 	nightCbData.baseLower = toLinear(lower);
 	nightCbData.flags = kNightBaseLight;
+}
+
+bool PhysicalSky::GetAmbientProgress(float& a_g)
+{
+	a_g = 0.f;
+	const auto* sky = globals::game::sky;
+	if (!sky || !sky->currentWeather)
+		return false;
+
+	// The same linearisation the ambient gets in the shaders (Linear Lighting's ambient gamma).
+	const auto& ll = globals::features::linearLighting.settings;
+	const float gamma = ll.enableLinearLighting && std::isfinite(ll.ambientGamma) ? std::clamp(ll.ambientGamma, 0.1f, 5.f) : 1.f;
+	auto luminance = [&](float r, float g, float b) {
+		auto lin = [&](float v) { return std::pow(std::isfinite(v) ? std::max(v, 0.f) : 0.f, gamma); };
+		return 0.2126f * lin(r) + 0.7152f * lin(g) + 0.0722f * lin(b);
+	};
+
+	// Now: the engine's own blend (time of day x weather transition) of the six directional ambient colours.
+	float now = 0.f;
+	for (int axis = 0; axis < 3; ++axis)
+		for (int side = 0; side < 2; ++side) {
+			const auto& c = sky->directionalAmbientColors[axis][side];
+			now += luminance(c.red, c.green, c.blue);
+		}
+	now /= 6.f;
+
+	// The night and day keys of the same weathers, blended with the same weather transition.
+	const float pct = std::isfinite(sky->currentWeatherPct) ? std::clamp(sky->currentWeatherPct, 0.f, 1.f) : 1.f;
+	const RE::TESWeather* last = (sky->lastWeather && sky->lastWeather != sky->currentWeather && pct < 1.f) ? sky->lastWeather : nullptr;
+	auto keyLuminance = [&](RE::TESWeather::ColorTime a_time) {
+		auto channel = [](const RE::Color& c, int i) { return (i == 0 ? c.red : i == 1 ? c.green : c.blue) * (1.f / 255.f); };
+		float sum = 0.f;
+		for (int axis = 0; axis < 3; ++axis)
+			for (int side = 0; side < 2; ++side) {
+				auto colorOf = [&](const RE::TESWeather* w) -> const RE::Color& {
+					const auto& d = w->directionalAmbientLightingColors[a_time].directional;
+					const auto& mm = axis == 0 ? d.x : axis == 1 ? d.y : d.z;
+					return side == 0 ? mm.max : mm.min;
+				};
+				const RE::Color& cur = colorOf(sky->currentWeather);
+				float rgb[3];
+				for (int i = 0; i < 3; ++i)
+					rgb[i] = last ? std::lerp(channel(colorOf(last), i), channel(cur, i), pct) : channel(cur, i);
+				sum += luminance(rgb[0], rgb[1], rgb[2]);
+			}
+		return sum / 6.f;
+	};
+	const float night = keyLuminance(RE::TESWeather::ColorTime::kNight);
+	const float day = keyLuminance(RE::TESWeather::ColorTime::kDay);
+	// Storms and odd weathers whose day ambient is not clearly above their night: no matching.
+	if (!(day - night > 0.1f * std::max(day, night)) || !std::isfinite(now))
+		return false;
+	a_g = std::clamp((now - night) / (day - night), 0.f, 1.f);
+	return true;
+}
+
+void PhysicalSky::UpdateSkyFixes(const bool a_fixes, const RE::NiPoint3& a_lutSunDir)
+{
+	nightCbData.skyScale = 1.f;
+	nightCbData.starFadeStrength = 0.f;
+	nightCbData.nightBaseUnfade = 0.f;
+	skyFixesDebug = {};
+	if (!a_fixes) {
+		skyScaleSmoothed = -1.f;
+		return;
+	}
+
+	nightCbData.flags |= kNightMidpoint | kNightGroundFix | kNightSkyFixes;
+
+	// Stars: their fade compares the sky with the night base light at full strength (needs the base light).
+	if (std::clamp(effective.nightBaseLight, 0.f, 1.f) > 0.f) {
+		nightCbData.starFadeStrength = kSkyFixesStarFade;
+		nightCbData.nightBaseUnfade = nightBaseFade > 1e-6f ? 1.f / nightBaseFade : 0.f;
+	}
+
+	// ---- Sky brightness follows the ground ----
+	// T = Zn + g (Zd - Zn): the zenith brightness that keeps the day's sky-to-ground ratio, where g is how far
+	// the weather's ground ambient has gone from its night to its day key, Zn the night base light's zenith
+	// and Zd the zenith with the sun at +12 degrees (where the day colours are full). The factor scales only
+	// the sun/moon in-scatter Zs, so it is the one that brings the zenith to T with the night base Zb held:
+	// f = (T - Zb) / Zs, never below 1, at most 8.
+	float target = 1.f;
+	auto& dbg = skyFixesDebug;
+	float g = 0.f;
+	if (GetAmbientProgress(g)) {
+		const auto& s = settings;
+		PhysicalSkyModel::Atmosphere atmosphere;
+		atmosphere.rPlanet = s.planetRadius;
+		atmosphere.rAtmosphere = s.atmosphereRadius;
+		atmosphere.rayleighScatter = { s.rayleighScatter.x * 1e-3, s.rayleighScatter.y * 1e-3, s.rayleighScatter.z * 1e-3 };
+		atmosphere.rayleighFalloff = s.rayleighFalloff;
+		atmosphere.aerosolScatter = { s.aerosolScatter.x * 1e-3, s.aerosolScatter.y * 1e-3, s.aerosolScatter.z * 1e-3 };
+		atmosphere.aerosolAbsorption = { s.aerosolAbsorption.x * 1e-3, s.aerosolAbsorption.y * 1e-3, s.aerosolAbsorption.z * 1e-3 };
+		atmosphere.aerosolFalloff = s.aerosolFalloff;
+		atmosphere.aerosolPhaseG = s.aerosolPhaseG;
+		// As uploaded (Reset): the moved ozone layer.
+		const double ozoneScale = std::isfinite(s.ozoneThickness) ? std::max(s.ozoneThickness, 0.f) / kOzoneFixThickness : 0.0;
+		atmosphere.ozoneAltitude = kOzoneFixAltitude;
+		atmosphere.ozoneThickness = kOzoneFixThickness;
+		atmosphere.ozoneAbsorption = { s.ozoneAbsorption.x * 1e-3 * ozoneScale, s.ozoneAbsorption.y * 1e-3 * ozoneScale, s.ozoneAbsorption.z * 1e-3 * ozoneScale };
+		atmosphere.groundAlbedo = { s.groundAlbedo.x, s.groundAlbedo.y, s.groundAlbedo.z };
+		atmosphere.midpoint = true;
+		atmosphere.groundFix = true;
+		atmosphere.multiScatterFix = effective.fixMultiScatter;
+		atmosphere.trLutEdgeFix = effective.fixTrLutEdge;
+
+		if (skyModelCpu.Update(atmosphere)) {
+			auto unit = [](float x, float y, float z) {
+				const double l = std::sqrt(double(x) * x + double(y) * y + double(z) * z);
+				return l > 1e-9 ? PhysicalSkyModel::Vec3{ x / l, y / l, z / l } : PhysicalSkyModel::Vec3{ 0.0, 0.0, 1.0 };
+			};
+			auto vec = [](const float3& c) { return PhysicalSkyModel::Vec3{ c.x, c.y, c.z }; };
+			const double cameraRadius = static_cast<double>(cbData.zCameraPlanet) * Util::Units::GAME_UNIT_TO_KM;
+			const PhysicalSkyModel::Light lights[3] = {
+				{ unit(a_lutSunDir.x, a_lutSunDir.y, a_lutSunDir.z), vec(cbData.sunlightColor) },
+				{ unit(cbData.masserDir.x, cbData.masserDir.y, cbData.masserDir.z), vec(cbData.masserColor) },
+				{ unit(cbData.secundaDir.x, cbData.secundaDir.y, cbData.secundaDir.z), vec(cbData.secundaColor) },
+			};
+			const double zScatter = skyModelCpu.RingLuminance(cameraRadius, kSkyFixesRingElevationDeg, lights, 3);
+
+			// The day reference: the same sun at +12 degrees (same azimuth), no moons, no night base.
+			const double horizontal = std::sqrt(double(a_lutSunDir.x) * a_lutSunDir.x + double(a_lutSunDir.y) * a_lutSunDir.y);
+			const double dayEl = DirectX::XMConvertToRadians(kSkyFixesDayElevationDeg);
+			PhysicalSkyModel::Light day = lights[0];
+			day.dir = horizontal > 1e-6 ? PhysicalSkyModel::Vec3{ a_lutSunDir.x / horizontal * std::cos(dayEl), a_lutSunDir.y / horizontal * std::cos(dayEl), std::sin(dayEl) } :
+			                              PhysicalSkyModel::Vec3{ std::cos(dayEl), 0.0, std::sin(dayEl) };
+			const double zDay = skyModelCpu.RingLuminance(cameraRadius, kSkyFixesRingElevationDeg, &day, 1);
+
+			// The night base on the ring (LutGen's NightSkyBase gradient), as drawn now and at full strength.
+			const float ringMix = SkySync::SmoothStep(0.f, 0.5f, std::sin(DirectX::XMConvertToRadians(kSkyFixesRingElevationDeg)));
+			auto ringLuminance = [&](const float3& a_upper, const float3& a_horizon) {
+				const float3 c = a_horizon + (a_upper - a_horizon) * ringMix;
+				return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+			};
+			const bool baseOn = (nightCbData.flags & kNightBaseLight) != 0;
+			const double zBase = baseOn ? ringLuminance(nightCbData.baseUpper, nightCbData.baseHorizon) : 0.0;
+			const double zNight = ringLuminance(nightBaseUnfadedUpper, nightBaseUnfadedHorizon);
+
+			const double t = zNight + g * (zDay - zNight);
+			const double need = t - zBase;
+			if (std::isfinite(need) && std::isfinite(zScatter)) {
+				if (!(need > 0.0))
+					target = 1.f;
+				else if (!(zScatter * kSkyFixesScaleCap > need))
+					target = kSkyFixesScaleCap;
+				else
+					target = static_cast<float>(std::clamp(need / zScatter, 1.0, static_cast<double>(kSkyFixesScaleCap)));
+				dbg.valid = true;
+			}
+			dbg.g = g;
+			dbg.zScatter = static_cast<float>(zScatter);
+			dbg.zBase = static_cast<float>(zBase);
+			dbg.zNight = static_cast<float>(zNight);
+			dbg.zDay = static_cast<float>(zDay);
+		}
+	}
+	if (!std::isfinite(target))
+		target = 1.f;
+	dbg.target = target;
+
+	// About 1.5 s of smoothing against weather changes and lightning; a jump on time skips, loads, a stopped
+	// clock, a new climate or sun path, and whenever the sky (re)appears.
+	const auto calendar = RE::Calendar::GetSingleton();
+	const float hours = calendar ? calendar->GetHoursPassed() : 0.f;
+	const float timeScale = calendar ? calendar->GetTimescale() : 0.f;
+	const uint32_t warp = globals::features::skySync.GetSunWarpGeneration();
+	const bool snap = skyScaleSmoothed < 0.f || !(timeScale > 0.f) || !(std::abs(hours - skyScaleLastHours) < 0.01f) || warp != skyScaleLastWarp;
+	skyScaleLastHours = hours;
+	skyScaleLastWarp = warp;
+	if (snap) {
+		skyScaleSmoothed = target;
+	} else {
+		const float dt = globals::game::deltaTime ? std::clamp(*globals::game::deltaTime, 0.f, 1.f) : 0.f;
+		skyScaleSmoothed += (target - skyScaleSmoothed) * (1.f - std::exp(-dt / kSkyFixesSmoothingSeconds));
+	}
+	if (!std::isfinite(skyScaleSmoothed))
+		skyScaleSmoothed = 1.f;
+	nightCbData.skyScale = std::clamp(skyScaleSmoothed, 1.f, kSkyFixesScaleCap);
 }
 
 void PhysicalSky::UpdateCloudData(float a_exposure, float a_sunElevation)
@@ -1215,6 +1501,10 @@ void PhysicalSky::UpdateEffective()
 	effective.moonPhysicalRadiance = true;
 	effective.moonsFadeInDaylight = true;
 	effective.hideNewMoonDisc = true;
+	// (47a) Sky Fixes takes over Twilight Length (and Day/Night Exposure with the adaptation angles,
+	// see SkyExposure()): treated as 1 / off. The saved values are kept.
+	if (SkyFixesActive())
+		effective.twilightLength = 1.f;
 	if (!IsLegacy())
 		return;
 
@@ -1312,6 +1602,7 @@ void PhysicalSky::Reset()
 	if (!allGood) {
 		if (skySync.loaded && skySync.settings.Enabled)
 			skySync.lightColors = std::nullopt;
+		skyScaleSmoothed = -1.f;  // (47a) snap when the sky comes back
 		cbData.enabled = allGood;
 		cloudCbData = {};
 		linearLighting.isDirLightLinear = false;
@@ -1379,10 +1670,27 @@ void PhysicalSky::Reset()
 	float adaptAmount = (sunAngle - settings.adaptationStart) / (settings.adaptationEnd - settings.adaptationStart);
 	adaptAmount = std::min(1.f, std::max(0.f, adaptAmount));
 	float exposure = settings.dayExposure * exp(log(settings.nightExposure / settings.dayExposure) * adaptAmount);
+	// (47a) Sky Fixes: no Day/Night Exposure and no adaptation (the brightness of dawn and dusk comes
+	// from the sky brightness factor instead).
+	const bool skyFixes = SkyFixesActive();
+	if (skyFixes)
+		exposure = 1.f;
 
 	float3 masserGlow, secundaGlow;
 	UpdateMoonData(exposure, masserGlow, secundaGlow);
 	UpdateCloudData(exposure, std::asin(std::clamp(skySync.rawDirections[static_cast<int>(SkySync::Caster::Sun)].z, -1.f, 1.f)));
+
+	// (47a) Sky Fixes: the ozone layer moved to 10-40 km, keeping the user's absorption colour and the
+	// column (peak x thickness / 2). Only the upload changes; the saved settings keep their values.
+	float3 ozoneAbsorption = settings.ozoneAbsorption;
+	float ozoneAltitude = settings.ozoneAltitude;
+	float ozoneThickness = settings.ozoneThickness;
+	if (skyFixes) {
+		const float thickness = std::isfinite(settings.ozoneThickness) ? std::max(settings.ozoneThickness, 0.f) : 0.f;
+		ozoneAbsorption = settings.ozoneAbsorption * (thickness / kOzoneFixThickness);
+		ozoneAltitude = kOzoneFixAltitude;
+		ozoneThickness = kOzoneFixThickness;
+	}
 
 	cbData = {
 		.texDim = res,
@@ -1413,9 +1721,9 @@ void PhysicalSky::Reset()
 		.aerosolAbsorption = settings.aerosolAbsorption * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
 		.rayleighFalloff = settings.rayleighFalloff * Util::Units::GAME_UNIT_TO_KM,
 		.rayleighScatter = settings.rayleighScatter * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
-		.ozoneAltitude = settings.ozoneAltitude / Util::Units::GAME_UNIT_TO_KM,
-		.ozoneThickness = settings.ozoneThickness / Util::Units::GAME_UNIT_TO_KM,
-		.ozoneAbsorption = settings.ozoneAbsorption * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
+		.ozoneAltitude = ozoneAltitude / Util::Units::GAME_UNIT_TO_KM,
+		.ozoneThickness = ozoneThickness / Util::Units::GAME_UNIT_TO_KM,
+		.ozoneAbsorption = ozoneAbsorption * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
 		.cloudRelightMix = settings.cloudRelightMix,
 		.cloudOriginalMix = settings.cloudOriginalMix,
 		.silverLiningMix = settings.silverLiningMix,
@@ -1440,11 +1748,15 @@ void PhysicalSky::Reset()
 		posCam = cam->cameraRoot->world.translate;
 		cbData.zCameraPlanet = posCam.z - cbData.zBottom + cbData.rPlanet;
 	}
+
+	// (47a) Sky brightness factor, LUT flags and star values (all neutral when off).
+	UpdateSkyFixes(skyFixes, lutSunDir);
 }
 
 void PhysicalSky::EarlyPrepass()
 {
 	if (cbData.enabled) {
+		UpdateApLutSize();  // (47a) before anything binds texApLut this frame
 		GenerateLuts();
 	}
 }
@@ -1512,7 +1824,7 @@ void PhysicalSky::GenerateLuts()
 		uav = texApLut->uav.get();
 		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
 		context->CSSetShader(csApLutGen.get(), nullptr, 0);
-		context->Dispatch((kApLutW + 7) >> 3, (kApLutH + 7) >> 3, 1);
+		context->Dispatch((apLutW + 7) >> 3, (apLutH + 7) >> 3, 1);  // (47a) 32x32 or 64x64
 
 		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::PhysicalSkyLuts);
 
@@ -1684,12 +1996,75 @@ void PhysicalSky::Hooks::BSSkyShader_SetupGeometry::thunk(RE::BSShader* This, RE
 {
 	globals::features::physicalSky.ModifySky();
 	SetSunDrawFlags(Pass);
+	globals::features::physicalSky.BindGlareDepth(Pass);  // (47a)
 	func(This, Pass, RenderFlags);
 }
 
 void PhysicalSky::Hooks::BSSkyShader_RestoreGeometry::thunk(RE::BSShader* This, RE::BSRenderPass* Pass, uint32_t RenderFlags)
 {
 	globals::features::physicalSky.RestoreSamplers();
+	globals::features::physicalSky.UnbindGlareDepth();  // (47a)
 	ClearSunDrawFlags();
 	func(This, Pass, RenderFlags);
+}
+
+void PhysicalSky::BindGlareDepth(const RE::BSRenderPass* a_pass)
+{
+	// (47a) Sky Fixes: the vanilla sun glare fades with how much of the sun's neighbourhood is open sky
+	// (upstream 6491de101's 16-tap ridge test; the game's own occlusion query sees gaps between distant
+	// ridges). Main view only; a depth texture that is not the bound depth target goes to PS t65 for this
+	// one draw, and whatever was there is put back in RestoreGeometry.
+	if (glareDepthBound)
+		UnbindGlareDepth();
+	if (!cbData.enabled || !SkyFixesActive() || !a_pass || !a_pass->shaderProperty)
+		return;
+	const auto* skyProperty = static_cast<const RE::BSSkyShaderProperty*>(a_pass->shaderProperty);
+	if (skyProperty->uiSkyObjectType != RE::BSSkyShaderProperty::SkyObject::SO_SUN_GLARE)
+		return;
+	if (!(globals::state->permutationData.ExtraShaderDescriptor & static_cast<uint32_t>(State::ExtraShaderDescriptors::InWorld)) ||
+		(globals::state->permutationData.ExtraShaderDescriptor & static_cast<uint32_t>(State::ExtraShaderDescriptors::IsReflections)))
+		return;
+	auto* renderer = globals::game::renderer;
+	auto* context = globals::d3d::context;
+	if (!renderer || !context)
+		return;
+
+	const auto& depthStencils = renderer->GetDepthStencilData().depthStencils;
+	const auto& main = depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
+	const auto& copy = depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kPOST_ZPREPASS_COPY];
+	ID3D11ShaderResourceView* srv = main.depthSRV;
+	{
+		// Never the texture the draw itself depth-tests against (D3D11 would null the view).
+		ID3D11DepthStencilView* dsv = nullptr;
+		context->OMGetRenderTargets(0, nullptr, &dsv);
+		if (dsv) {
+			ID3D11Resource* bound = nullptr;
+			dsv->GetResource(&bound);
+			if (bound && bound == static_cast<ID3D11Resource*>(main.texture))
+				srv = copy.texture != main.texture ? copy.depthSRV : nullptr;
+			if (bound)
+				bound->Release();
+			dsv->Release();
+		}
+	}
+	if (!srv)
+		return;
+
+	glarePreviousSrv = nullptr;
+	context->PSGetShaderResources(kGlareDepthSlot, 1, &glarePreviousSrv);  // AddRef'd; released in Unbind
+	context->PSSetShaderResources(kGlareDepthSlot, 1, &srv);
+	glareDepthBound = true;
+}
+
+void PhysicalSky::UnbindGlareDepth()
+{
+	if (!glareDepthBound)
+		return;
+	glareDepthBound = false;
+	if (auto* context = globals::d3d::context)
+		context->PSSetShaderResources(kGlareDepthSlot, 1, &glarePreviousSrv);
+	if (glarePreviousSrv) {
+		glarePreviousSrv->Release();
+		glarePreviousSrv = nullptr;
+	}
 }
