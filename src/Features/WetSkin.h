@@ -184,6 +184,8 @@ struct WetSkin : Feature
 
 private:
 	void DrawPresets();
+	/// (47b) Overwrite / Delete / Rename / Save as New, in the "Manage Presets" node under "Presets".
+	void DrawManagePresets(bool a_selected);
 	std::vector<std::string> presetNames;
 	int presetIndex = -1;
 	bool presetsListed = false;

@@ -641,7 +641,22 @@ void WetSkin::DrawPresets()
 		presetStatus = LoadPreset(name) ? std::format("Loaded \"{}\".", name) : std::format("Could not load \"{}\".", name);
 	}
 	Tooltip({ "Replace the settings on this page with the chosen preset." });
-	ImGui::SameLine();
+	ImGui::EndDisabled();
+
+	// (47b) Everything that changes the preset files sits in a nested node, closed by default.
+	if (ImGui::TreeNode("Manage Presets")) {
+		DrawManagePresets(selected);
+		ImGui::TreePop();
+	}
+	if (!presetStatus.empty())
+		ImGui::TextDisabled("%s", presetStatus.c_str());
+	ImGui::TreePop();
+}
+
+void WetSkin::DrawManagePresets(bool a_selected)
+{
+	const bool selected = a_selected && presetIndex >= 0 && presetIndex < static_cast<int>(presetNames.size());
+	ImGui::BeginDisabled(!selected);
 	if (ImGui::Button("Overwrite")) {
 		const std::string name = presetNames[presetIndex];
 		presetStatus = SavePreset(name) ? std::format("Saved the current settings into \"{}\".", name) : std::format("Could not save \"{}\".", name);
@@ -703,7 +718,4 @@ void WetSkin::DrawPresets()
 		}
 	}
 	Tooltip({ "Save every setting on this page as a new preset under the name typed on the left." });
-	if (!presetStatus.empty())
-		ImGui::TextDisabled("%s", presetStatus.c_str());
-	ImGui::TreePop();
 }
