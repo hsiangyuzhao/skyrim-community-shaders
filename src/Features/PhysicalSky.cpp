@@ -295,7 +295,7 @@ void PhysicalSky::DrawSettings()
 			"and a set of physics and look fixes:\n"
 			"- the sun rises when the weather turns to sunrise colours (-12 deg as night colours start to fade,\n"
 			"  0 deg at the peak of the sunrise colours, +12 deg when the day colours are full; noon unchanged);\n"
-			"- at dawn and dusk the sky's scattered sun and moon light is raised (up to 8x) to keep the day's\n"
+			"- at dawn and dusk the sky's scattered sun and moon light is raised (up to 32x) to keep the day's\n"
 			"  sky-to-ground brightness ratio; full day and full night are unchanged;\n"
 			"- ozone layer at 10-40 km (same colour and amount), more accurate sky tables, ground bounce fixed,\n"
 			"  finer distant-haze table;\n"
@@ -1318,7 +1318,8 @@ void PhysicalSky::UpdateSkyFixes(const bool a_fixes, const RE::NiPoint3& a_lutSu
 	// the weather's ground ambient has gone from its night to its day key, Zn the night base light's zenith
 	// and Zd the zenith with the sun at +12 degrees (where the day colours are full). The factor scales only
 	// the sun/moon in-scatter Zs, so it is the one that brings the zenith to T with the night base Zb held:
-	// f = (T - Zb) / Zs, never below 1, at most 8.
+	// f = (T - Zb) / Zs, never below 1, at most kSkyFixesScaleCap (32: larger caps light a horizon band at
+	// deep twilight that is brighter than later in the dawn; reaching T there would need x10000).
 	float target = 1.f;
 	auto& dbg = skyFixesDebug;
 	float g = 0.f;

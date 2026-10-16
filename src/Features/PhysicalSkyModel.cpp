@@ -28,6 +28,23 @@ namespace PhysicalSkyModel
 			return discr > b * b ? (-b + std::sqrt(discr)) : (-b - std::sqrt(discr));
 		}
 
+		// The LUTs are R16G16B16A16_FLOAT on the GPU: stored values are rounded to binary16 (round to nearest
+		// even, denormals kept), which matters for the tiny transmittances of a sun far below the horizon.
+		double ToHalf(double a_x)
+		{
+			if (std::isnan(a_x) || a_x == 0.0)
+				return a_x;
+			if (a_x < 0.0)
+				return -ToHalf(-a_x);
+			if (a_x >= 65504.0)
+				return 65504.0;
+			int exponent = 0;
+			std::frexp(a_x, &exponent);  // a_x = m 2^exponent, m in [0.5, 1)
+			const double ulp = std::ldexp(1.0, std::max(exponent - 11, -24));
+			return std::nearbyint(a_x / ulp) * ulp;
+		}
+		Vec3 ToHalf(const Vec3& a) { return { ToHalf(a[0]), ToHalf(a[1]), ToHalf(a[2]) }; }
+
 		double PhaseRayleigh(double a_cos) { return 0.1875 / kPi * (1.0 + a_cos * a_cos); }
 		double PhaseCornetteShanks(double a_cos, double a_g)
 		{
@@ -140,7 +157,7 @@ namespace PhysicalSkyModel
 					Densities(std::max(0.0, Length(p) - atmo.rPlanet), dr, da, dO);
 					depth = Add(depth, Scale(Extinction(dr, da, dO), dt));
 				}
-				tr[y * TrW + x] = { std::exp(-depth[0]), std::exp(-depth[1]), std::exp(-depth[2]) };
+				tr[y * TrW + x] = ToHalf(Vec3{ std::exp(-depth[0]), std::exp(-depth[1]), std::exp(-depth[2]) });
 			}
 		}
 	}
@@ -220,7 +237,7 @@ namespace PhysicalSkyModel
 					const double denom = 1.0 - fMs[c] * rcpSamples;
 					out[c] = denom > 1e-6 ? lumTotal[c] * rcpSamples / denom : 0.0;
 				}
-				ms[y * MsW + x] = out;
+				ms[y * MsW + x] = ToHalf(out);
 			}
 		}
 	}

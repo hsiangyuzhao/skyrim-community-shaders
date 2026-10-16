@@ -425,7 +425,7 @@ struct PhysicalSky final : public Feature
 
 	/// (47a) Sky Fixes constants.
 	static constexpr float kSkyFixesDayElevationDeg = 12.f;  // = SkySync::SunWarp::DayElevation
-	static constexpr float kSkyFixesScaleCap = 8.f;
+	static constexpr float kSkyFixesScaleCap = 32.f;  // largest cap whose sun-side horizon still brightens monotonically through NAT's dawn (v5 cap study)
 	static constexpr float kSkyFixesRingElevationDeg = 85.f;
 	static constexpr float kSkyFixesSmoothingSeconds = 1.5f;
 	static constexpr float kSkyFixesStarFade = 0.0035f;
