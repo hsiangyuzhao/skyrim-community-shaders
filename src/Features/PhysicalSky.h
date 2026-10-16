@@ -120,6 +120,15 @@ struct PhysicalSky final : public Feature
 		kCloudLightingAll,         // the sun, both moons and the sky, each on its own
 		kCloudLightingCount
 	};
+	/// (47b) "Aerosol".
+	enum AerosolPreset : int
+	{
+		kAerosolCurrent = 0,  // the saved Aerosol (Mie) values
+		kAerosolContinental,  // upstream 846c97ede: OPAC continental clean, 50% humidity, reference loading
+		kAerosolPresetCount
+	};
+	/// (47b) The aerosol optics as uploaded (Mm^-1): the saved values, or the preset's.
+	void GetUploadedAerosol(float3& a_scatter, float3& a_absorption, float& a_phaseG) const;
 	/// (41b, F5) "Sky Model".
 	enum SkyModel : int
 	{
@@ -137,6 +146,12 @@ struct PhysicalSky final : public Feature
 		/// ridges, dither, earlier moonlight retreat). Off = 46y exactly. Saved outside the NLOHMANN
 		/// macro (see LoadSettings).
 		bool skyFixes = true;
+		/// (47b) "Sky Precision": upstream's LUT precision work (Bruneton transmittance LUT with analytic planet
+		/// occlusion, nonuniform midpoint quadrature, sky-view rows around the true horizon, quadratic aerial
+		/// perspective slices). Off = 47a2 exactly. Saved outside the NLOHMANN macro.
+		bool skyPrecision = true;
+		/// (47b) "Aerosol": AerosolPreset. Applied at upload; the saved aerosol values are never changed.
+		int aerosolPreset = 0;
 		bool overrideDirLight = false;
 		int tonemapper = 2;
 		float vanillaMix = 0;
@@ -369,6 +384,7 @@ struct PhysicalSky final : public Feature
 		kExtReflectionSkyFix = 1u << 7,
 		kExtMultiScatterFix = 1u << 8,
 		kExtMoonPhysicalRadiance = 1u << 9,  // (40d)
+		kExtSkyPrecision = 1u << 10,         // (47b) "Sky Precision" (Common.hlsli kPhysSkyPrecisionFlag)
 	};
 	struct ExtCbData
 	{
@@ -403,6 +419,9 @@ struct PhysicalSky final : public Feature
 		kNightMidpoint = 1u << 1,   // LUT ray-march samples in the middle of each step (all four passes)
 		kNightGroundFix = 1u << 2,  // multiscatter ground bounce x cos / pi, sun tested at the ground point
 		kNightSkyFixes = 1u << 3,   // Sky.hlsl: dither, sun halo smoothing, glare ridge test, star fade
+		// (47b) Sky Fixes additions.
+		kNightDistantSea = 1u << 4,  // LutGen.cs.hlsl: below the planet horizon the sky view sees a calm sea (no dark band)
+		kNightWaterAp = 1u << 5,     // Water.hlsl: the water surface gets the aerial perspective
 	};
 	struct NightCbData
 	{

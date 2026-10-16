@@ -129,7 +129,10 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.moonCloudStrength = o_json.value("moonCloudStrength", defaults.moonCloudStrength);
 		settings.moonCloudHalo = o_json.value("moonCloudHalo", defaults.moonCloudHalo);
 		settings.skyFixes = o_json.value("skyFixes", defaults.skyFixes);  // (47a)
+		settings.skyPrecision = o_json.value("skyPrecision", defaults.skyPrecision);  // (47b)
+		settings.aerosolPreset = o_json.value("aerosolPreset", defaults.aerosolPreset);  // (47b)
 	}
+	settings.aerosolPreset = std::clamp(settings.aerosolPreset, 0, kAerosolPresetCount - 1);
 	settings.skyModel = std::clamp(settings.skyModel, 0, kSkyModelCount - 1);
 	settings.nightBaseLight = std::clamp(settings.nightBaseLight, 0.f, 1.f);
 	settings.twilightLength = std::clamp(settings.twilightLength, 1.f, 3.f);
@@ -283,6 +286,36 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["moonCloudStrength"] = settings.moonCloudStrength;
 	o_json["moonCloudHalo"] = settings.moonCloudHalo;
 	o_json["skyFixes"] = settings.skyFixes;  // (47a)
+	o_json["skyPrecision"] = settings.skyPrecision;  // (47b)
+	o_json["aerosolPreset"] = settings.aerosolPreset;  // (47b)
+}
+
+void PhysicalSky::GetUploadedAerosol(float3& a_scatter, float3& a_absorption, float& a_phaseG) const
+{
+	a_scatter = settings.aerosolScatter;
+	a_absorption = settings.aerosolAbsorption;
+	a_phaseG = settings.aerosolPhaseG;
+	if (effective.aerosolPreset != kAerosolContinental)
+		return;
+	// (47b) Upstream 846c97ede, AerosolData.inl: OPAC 4.0 continental clean at 50% relative humidity, reference
+	// loading (1x). Scatter / absorption in Mm^-1 for R/G/B; the phase g is the Cornette-Shanks g whose mean cosine
+	// equals the OPAC asymmetry (scatter moment / green scatter), found by bisection as upstream's PhaseG().
+	static const float continentalG = [] {
+		constexpr float meanCosine = 11.6354217f / 17.0945f;
+		float lower = -0.999f, upper = 0.999f;
+		for (int i = 0; i < 24; ++i) {
+			const float g = (lower + upper) * 0.5f;
+			const float g2 = g * g;
+			if (3.f * g * (4.f + g2) / (5.f * (2.f + g2)) < meanCosine)
+				lower = g;
+			else
+				upper = g;
+		}
+		return (lower + upper) * 0.5f;
+	}();
+	a_scatter = { 12.61057f, 17.0945f, 22.87603f };
+	a_absorption = { 0.663498f, 0.7328f, 0.802034f };
+	a_phaseG = continentalG;
 }
 
 void PhysicalSky::DrawSettings()
@@ -307,6 +340,17 @@ void PhysicalSky::DrawSettings()
 			"Off = exactly as before.");
 	if (settings.skyFixes && IsLegacy())
 		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Sky Model is Legacy (36f): Sky Fixes is not used right now.");
+	// (47b)
+	ImGui::Checkbox("Sky Precision", &settings.skyPrecision);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"More accurate sky tables (upstream's precision work): the sunlight-through-air table spends its detail\n"
+			"near the ground and the horizon, the planet hides the sun smoothly over the sun's own width, the sky\n"
+			"table puts its rows around the true horizon (sharper from high places) and the distant-haze table\n"
+			"is finer close to you. Mostly visible at sunrise and sunset: a sun on the horizon and the haze in\n"
+			"front of it are a little darker and redder. Off = exactly as before.");
+	if (settings.skyPrecision && IsLegacy())
+		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Sky Model is Legacy (36f): Sky Precision is not used right now.");
 	ImGui::Separator();
 
 	if (ImGui::BeginTabBar("##PHYSSKY")) {
@@ -729,11 +773,25 @@ void PhysicalSky::SettingsAtmosphere()
 			"Solid and liquid particles greater than 1/10 of the light wavelength but not too much, like dust. Strongly anisotropic (Mie Scattering). "
 			"They contributes to the aureole around bright celestial bodies.");
 
+		// (47b)
+		static constexpr const char* aerosolNames[kAerosolPresetCount] = { "Current", "Continental" };
+		ImGui::Combo("Aerosol", &settings.aerosolPreset, aerosolNames, kAerosolPresetCount);
+		if (auto _tt = Util::HoverTooltipWrapper())
+			ImGui::Text(
+				"Current: the values below.\n"
+				"Continental: measured clean continental air (OPAC, 50%% humidity; upstream's preset): less and bluer\n"
+				"haze, a smaller and softer glow around the sun, much less absorption. Replaces the values below\n"
+				"while picked (they are kept, not changed).");
+		const bool aerosolPresetOn = settings.aerosolPreset != kAerosolCurrent;
+		if (aerosolPresetOn && IsLegacy())
+			ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Sky Model is Legacy (36f): the preset is not used right now.");
+		ImGui::BeginDisabled(aerosolPresetOn);
 		ImGui::SliderFloat("Anisotropy", &settings.aerosolPhaseG, -1, 1);
 		ImGui::ColorEdit3("Scatter", &settings.aerosolScatter.x, ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 		ImGui::ColorEdit3("Absorption", &settings.aerosolAbsorption.x, ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Usually 1/9 of scatter coefficient. Dust/pollution is lower, fog is higher.");
+		ImGui::EndDisabled();
 		ImGui::SliderFloat("Falloff", &settings.aerosolFalloff, 0.f, 2.f, "%.2f km^-1");
 		ImGui::PopID();
 	}
@@ -840,6 +898,14 @@ void PhysicalSky::SettingsDebug()
 				nightCbData.skyScale, d.target, d.valid ? "" : " - no usable weather ambient, x1");
 			ImGui::Text("  ground progress %.2f, sun scatter %.2e, moon glow %.2e, night base %.2e, night ref %.2e, day ref %.2e", d.g, d.zScatter, d.zMoon, d.zBase, d.zNight, d.zDay);
 			ImGui::Text("  aerial perspective LUT %ux%u, timing warp %s", apLutW, apLutH, globals::features::skySync.sunWarp.valid ? "on" : "off (46y timing)");
+		}
+		// (47b)
+		{
+			float3 scatter, absorption;
+			float g = 0.f;
+			GetUploadedAerosol(scatter, absorption, g);
+			ImGui::Text("Sky Precision %s; aerosol uploaded: scatter %.2f/%.2f/%.2f, absorption %.2f/%.2f/%.2f, g %.3f", (extCbData.flags & kExtSkyPrecision) ? "on" : "off",
+				scatter.x, scatter.y, scatter.z, absorption.x, absorption.y, absorption.z, g);
 		}
 	}
 
@@ -1079,6 +1145,8 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtMultiScatterFix;
 	if (s.moonPhysicalRadiance)
 		flags |= kExtMoonPhysicalRadiance;
+	if (s.skyPrecision)
+		flags |= kExtSkyPrecision;  // (47b)
 	extCbData.flags = flags;
 	extCbData.sunRadianceCap = std::clamp(s.sunRadianceCap, 1.f, 62250.f);
 	extCbData.sunGlowIntensity = s.proceduralSun ? std::clamp(s.sunGlowIntensity, 0.f, 30.f) : 0.f;
@@ -1305,7 +1373,7 @@ void PhysicalSky::UpdateSkyFixes(const bool a_fixes, const RE::NiPoint3& a_lutSu
 		return;
 	}
 
-	nightCbData.flags |= kNightMidpoint | kNightGroundFix | kNightSkyFixes;
+	nightCbData.flags |= kNightMidpoint | kNightGroundFix | kNightSkyFixes | kNightDistantSea | kNightWaterAp;  // (47b) + distant sea, water haze
 
 	// Stars: their fade compares the sky with the night base light at full strength (needs the base light).
 	if (std::clamp(effective.nightBaseLight, 0.f, 1.f) > 0.f) {
@@ -1330,10 +1398,14 @@ void PhysicalSky::UpdateSkyFixes(const bool a_fixes, const RE::NiPoint3& a_lutSu
 		atmosphere.rAtmosphere = s.atmosphereRadius;
 		atmosphere.rayleighScatter = { s.rayleighScatter.x * 1e-3, s.rayleighScatter.y * 1e-3, s.rayleighScatter.z * 1e-3 };
 		atmosphere.rayleighFalloff = s.rayleighFalloff;
-		atmosphere.aerosolScatter = { s.aerosolScatter.x * 1e-3, s.aerosolScatter.y * 1e-3, s.aerosolScatter.z * 1e-3 };
-		atmosphere.aerosolAbsorption = { s.aerosolAbsorption.x * 1e-3, s.aerosolAbsorption.y * 1e-3, s.aerosolAbsorption.z * 1e-3 };
+		// (47b) As uploaded: the Aerosol preset's values when one is picked.
+		float3 aerosolScatter, aerosolAbsorption;
+		float aerosolPhaseG = 0.f;
+		GetUploadedAerosol(aerosolScatter, aerosolAbsorption, aerosolPhaseG);
+		atmosphere.aerosolScatter = { aerosolScatter.x * 1e-3, aerosolScatter.y * 1e-3, aerosolScatter.z * 1e-3 };
+		atmosphere.aerosolAbsorption = { aerosolAbsorption.x * 1e-3, aerosolAbsorption.y * 1e-3, aerosolAbsorption.z * 1e-3 };
 		atmosphere.aerosolFalloff = s.aerosolFalloff;
-		atmosphere.aerosolPhaseG = s.aerosolPhaseG;
+		atmosphere.aerosolPhaseG = aerosolPhaseG;
 		// As uploaded (Reset): the moved ozone layer.
 		const double ozoneScale = std::isfinite(s.ozoneThickness) ? std::max(s.ozoneThickness, 0.f) / kOzoneFixThickness : 0.0;
 		atmosphere.ozoneAltitude = kOzoneFixAltitude;
@@ -1344,6 +1416,7 @@ void PhysicalSky::UpdateSkyFixes(const bool a_fixes, const RE::NiPoint3& a_lutSu
 		atmosphere.groundFix = true;
 		atmosphere.multiScatterFix = effective.fixMultiScatter;
 		atmosphere.trLutEdgeFix = effective.fixTrLutEdge;
+		atmosphere.precision = (extCbData.flags & kExtSkyPrecision) != 0;  // (47b) the transmittance LUT as the GPU builds it
 
 		if (skyModelCpu.Update(atmosphere)) {
 			auto unit = [](float x, float y, float z) {
@@ -1546,6 +1619,9 @@ void PhysicalSky::UpdateEffective()
 	e.moonsFadeInDaylight = false;
 	// 44h
 	e.moonCloudLight = false;
+	// 47b
+	e.skyPrecision = false;
+	e.aerosolPreset = kAerosolCurrent;
 }
 
 void PhysicalSky::ApplySunLook(int a_look)
@@ -1696,6 +1772,11 @@ void PhysicalSky::Reset()
 		ozoneThickness = kOzoneFixThickness;
 	}
 
+	// (47b) "Aerosol": a preset replaces the aerosol optics in the upload only; the saved values are kept.
+	float3 aerosolScatter, aerosolAbsorption;
+	float aerosolPhaseG = settings.aerosolPhaseG;
+	GetUploadedAerosol(aerosolScatter, aerosolAbsorption, aerosolPhaseG);
+
 	cbData = {
 		.texDim = res,
 		.rcpTexDim = float2(1.0f) / res,
@@ -1720,9 +1801,9 @@ void PhysicalSky::Reset()
 		.groundAlbedo = settings.groundAlbedo,
 		.cloudShadowRemapRange = settings.cloudShadowRemapRange,
 		.aerosolFalloff = settings.aerosolFalloff * Util::Units::GAME_UNIT_TO_KM,
-		.aerosolPhaseG = settings.aerosolPhaseG,
-		.aerosolScatter = settings.aerosolScatter * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
-		.aerosolAbsorption = settings.aerosolAbsorption * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
+		.aerosolPhaseG = aerosolPhaseG,
+		.aerosolScatter = aerosolScatter * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
+		.aerosolAbsorption = aerosolAbsorption * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
 		.rayleighFalloff = settings.rayleighFalloff * Util::Units::GAME_UNIT_TO_KM,
 		.rayleighScatter = settings.rayleighScatter * 1e-3 * Util::Units::GAME_UNIT_TO_KM,
 		.ozoneAltitude = ozoneAltitude / Util::Units::GAME_UNIT_TO_KM,

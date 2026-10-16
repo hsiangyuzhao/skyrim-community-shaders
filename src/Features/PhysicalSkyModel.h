@@ -28,6 +28,7 @@ namespace PhysicalSkyModel
 		bool groundFix = false;        // multiscatter ground bounce x cos / pi, sun tested at the ground point
 		bool multiScatterFix = true;   // isotropic multiscatter phase over the full sphere
 		bool trLutEdgeFix = true;      // transmittance/multiscatter lookups clamped to texel centres
+		bool precision = false;        // (47b) "Sky Precision": Bruneton transmittance LUT + analytic planet occlusion, nonuniform midpoint quadrature
 
 		bool operator==(const Atmosphere&) const = default;
 	};
@@ -65,6 +66,8 @@ namespace PhysicalSkyModel
 		void Densities(double a_altitude, double& a_rayleigh, double& a_aerosol, double& a_ozone) const;
 		Vec3 Extinction(double a_rayleigh, double a_aerosol, double a_ozone) const;
 		void TrLutUv(double a_r, double a_cosZenith, double& a_u, double& a_v) const;
+		void TrLutUvBruneton(double a_r, double a_cosZenith, double& a_u, double& a_v) const;  // (47b)
+		void TrLutParametersBruneton(double a_u, double a_v, double& a_r, double& a_cosZenith) const;  // (47b)
 		Vec3 Sample(const std::vector<Vec3>& a_lut, int a_w, int a_h, double a_u, double a_v) const;
 		Vec3 TrAt(const Vec3& a_pos, const Vec3& a_dir) const;
 		Vec3 MsAt(const Vec3& a_pos, const Vec3& a_dir) const;

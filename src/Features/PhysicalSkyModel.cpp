@@ -100,6 +100,35 @@ namespace PhysicalSkyModel
 		}
 	}
 
+	// (47b) Common.hlsli TrLutUvBruneton / TrLutParametersBruneton (Sky Precision).
+	void Model::TrLutUvBruneton(double a_r, double a_cosZenith, double& a_u, double& a_v) const
+	{
+		const double r = std::clamp(a_r, atmo.rPlanet, atmo.rAtmosphere);
+		const double atmosphereHorizon = std::sqrt((atmo.rAtmosphere - atmo.rPlanet) * (atmo.rAtmosphere + atmo.rPlanet));
+		const double localHorizon = std::sqrt(std::max(0.0, (r - atmo.rPlanet) * (r + atmo.rPlanet)));
+		const double mu = std::max(a_cosZenith, -localHorizon / r);
+		const double rMu = r * mu;
+		const double distance = std::max(0.0, std::sqrt(std::max(0.0, rMu * rMu + (atmo.rAtmosphere - r) * (atmo.rAtmosphere + r))) - rMu);
+		const double nearest = atmo.rAtmosphere - r;
+		const double farthest = localHorizon + atmosphereHorizon;
+		const double unitU = std::clamp((distance - nearest) / std::max(farthest - nearest, 1.428e-5), 0.0, 1.0);  // 1 game unit
+		const double unitV = std::clamp(localHorizon / atmosphereHorizon, 0.0, 1.0);
+		a_u = 0.5 / TrW + unitU * (1.0 - 1.0 / TrW);
+		a_v = 0.5 / TrH + unitV * (1.0 - 1.0 / TrH);
+	}
+
+	void Model::TrLutParametersBruneton(double a_u, double a_v, double& a_r, double& a_cosZenith) const
+	{
+		const double unitU = std::clamp((a_u - 0.5 / TrW) / (1.0 - 1.0 / TrW), 0.0, 1.0);
+		const double unitV = std::clamp((a_v - 0.5 / TrH) / (1.0 - 1.0 / TrH), 0.0, 1.0);
+		const double horizonSquared = (atmo.rAtmosphere - atmo.rPlanet) * (atmo.rAtmosphere + atmo.rPlanet);
+		const double localHorizon = std::sqrt(horizonSquared) * unitV;
+		a_r = std::clamp(std::sqrt(atmo.rPlanet * atmo.rPlanet + localHorizon * localHorizon), atmo.rPlanet, atmo.rAtmosphere);
+		const double distance = std::lerp(atmo.rAtmosphere - a_r, localHorizon + std::sqrt(horizonSquared), unitU);
+		const double mu = distance > 0.0 ? (horizonSquared - localHorizon * localHorizon - distance * distance) / (2.0 * a_r * distance) : 1.0;
+		a_cosZenith = std::clamp(mu, -localHorizon / a_r, 1.0);
+	}
+
 	// Bilinear, clamp addressing (Physical Sky's SampTr).
 	Vec3 Model::Sample(const std::vector<Vec3>& a_lut, int a_w, int a_h, double a_u, double a_v) const
 	{
@@ -122,6 +151,20 @@ namespace PhysicalSkyModel
 	{
 		const double r = Length(a_pos);
 		double u, v;
+		if (atmo.precision) {
+			// (47b) Common.hlsli SampleLightTr: the unoccluded LUT x the visible part of a sun-sized light.
+			const double mu = r > 0.0 ? Dot(a_pos, a_dir) / r : 1.0;
+			const double rClamped = std::max(r, atmo.rPlanet);
+			const double sinHorizon = std::clamp(atmo.rPlanet / rClamped, 0.0, 1.0);
+			const double cosHorizon = -std::sqrt(std::max(0.0, 1.0 - sinHorizon * sinHorizon));
+			const double width = std::max(0.00465 * sinHorizon, 1e-6);
+			const double t = std::clamp((mu - cosHorizon + width) / (2.0 * width), 0.0, 1.0);
+			const double visibility = t * t * (3.0 - 2.0 * t);
+			if (!(visibility > 0.0))
+				return { 0.0, 0.0, 0.0 };
+			TrLutUvBruneton(rClamped, mu, u, v);
+			return Scale(Sample(tr, TrW, TrH, u, v), visibility);
+		}
 		TrLutUv(r, r > 0.0 ? Dot(a_pos, a_dir) / r : 1.0, u, v);
 		return Sample(tr, TrW, TrH, u, v);
 	}
@@ -139,6 +182,42 @@ namespace PhysicalSkyModel
 	{
 		tr.assign(static_cast<size_t>(TrW) * TrH, Vec3{ 0.0, 0.0, 0.0 });
 		constexpr int steps = 40;
+		if (atmo.precision) {
+			// (47b) LutGen.cs.hlsl TransmittanceBruneton: unoccluded paths to the top of the atmosphere, steps concentrated
+			// around the lowest point (TransmittanceRayDistance), each at its midpoint.
+			auto rayDistance = [](double a_t, double a_distance, double a_closest) {
+				if (a_closest <= 0.0)
+					return a_distance * a_t * a_t;
+				if (a_t < 0.5) {
+					const double s = 1.0 - 2.0 * a_t;
+					return a_closest * (1.0 - s * s);
+				}
+				const double s = 2.0 * a_t - 1.0;
+				return a_closest + (a_distance - a_closest) * s * s;
+			};
+			for (int y = 0; y < TrH; ++y) {
+				for (int x = 0; x < TrW; ++x) {
+					double r, mu;
+					TrLutParametersBruneton((x + 0.5) / TrW, (y + 0.5) / TrH, r, mu);
+					const Vec3 pos = { 0.0, 0.0, r };
+					const Vec3 dir = { 0.0, std::sqrt(std::max(0.0, 1.0 - mu * mu)), mu };
+					const double projected = r * mu;
+					const double tMax = std::max(0.0, -projected + std::sqrt(std::max(0.0, projected * projected + (atmo.rAtmosphere - r) * (atmo.rAtmosphere + r))));
+					const double tClosest = std::clamp(-projected, 0.0, tMax);
+					Vec3 depth = { 0.0, 0.0, 0.0 };
+					for (int i = 0; i < steps; ++i) {
+						const double tNear = rayDistance(double(i) / steps, tMax, tClosest);
+						const double tFar = rayDistance(double(i + 1) / steps, tMax, tClosest);
+						const Vec3 p = Add(pos, Scale(dir, 0.5 * (tNear + tFar)));
+						double dr, da, dO;
+						Densities(std::max(0.0, Length(p) - atmo.rPlanet), dr, da, dO);
+						depth = Add(depth, Scale(Extinction(dr, da, dO), tFar - tNear));
+					}
+					tr[y * TrW + x] = ToHalf(Vec3{ std::exp(-depth[0]), std::exp(-depth[1]), std::exp(-depth[2]) });
+				}
+			}
+			return;
+		}
 		for (int y = 0; y < TrH; ++y) {
 			const double v = (y + 0.5) / TrH;
 			const Vec3 pos = { 0.0, 0.0, std::lerp(atmo.rPlanet, atmo.rAtmosphere, v) };

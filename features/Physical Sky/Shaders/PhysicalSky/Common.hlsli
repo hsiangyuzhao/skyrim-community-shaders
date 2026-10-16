@@ -50,6 +50,36 @@ static const float3 CLOUD_RANGE_M = float3(4.f, 4.f, .5f) * 1e3;
 #	define ISNAN(x) (!(x < 0.f || x > 0.f || x == 0.f))
 #endif
 
+// (47b) "Sky Precision": PhysicalSky::ExtFlags bit 10, named here so that SharedData.hlsli stays untouched.
+// Off = the 47a2 LUT mappings exactly. On = upstream 35c759765 (Bruneton transmittance LUT, analytic planet
+// occlusion, nonuniform midpoint quadrature, separate multiscatter coordinates), dcd3593d1 (sky-view rows
+// around the true horizon) and 183ec20b3 (quadratic aerial perspective slices).
+static const uint kPhysSkyPrecisionFlag = (1 << 10);
+static const float SV_LUT_HEIGHT = 150.0;  // PhysicalSky::kSvLutH
+
+bool SkyPrecision()
+{
+	return (SharedData::physSkyExtData.Flags & kPhysSkyPrecisionFlag) != 0;
+}
+
+// (47b, Sky Precision) Aerial perspective slices concentrated near the camera: slice k at AP_MAX_DIST (k / (n - 1))^2.
+float ApSliceDistance(float slice, float sliceCount)
+{
+	const float t = slice / (sliceCount - 1.0);
+	return AP_MAX_DIST * t * t;
+}
+
+float ApDepthUv(float dist, uint sliceCount)
+{
+	const float clampedDist = clamp(dist, 0.0, AP_MAX_DIST);
+	const float slice = min(floor(sqrt(clampedDist / AP_MAX_DIST) * (sliceCount - 1.0)), sliceCount - 2.0);
+	const float nearDist = ApSliceDistance(slice, sliceCount);
+	const float farDist = ApSliceDistance(slice + 1.0, sliceCount);
+	// Interpolate in physical distance, not sqrt(distance).
+	const float weight = saturate((clampedDist - nearDist) / max(farDist - nearDist, 1e-3));
+	return (slice + weight + 0.5) / sliceCount;
+}
+
 float Remap(float x, float in_a, float in_b, float out_a, float out_b)
 {
 	if (in_a == in_b)
@@ -113,15 +143,134 @@ float2 TrLutUvPlanet(float3 pos, float3 sunDir)
 	return TrLutUv(r, dot(sunDir, up));
 }
 
-// cylinder map
+// (47b, Sky Precision) Multiple scattering keeps the affine (sun zenith, height) map and the 47a2 edge clamp
+// (upstream MsLutUv; the CPU copy in PhysicalSkyModel reads it the same way).
+float2 MsLutUv(float r, float cosSunZenith)
+{
+	const SharedData::PhysSkyData data = SharedData::physSkyData;
+	const float cosHorZenith = -0.414;
+	float2 uv = float2(
+		saturate((cosSunZenith - cosHorZenith) / (1 - cosHorZenith)),
+		saturate((r - data.rPlanet) / (data.rAtmosphere - data.rPlanet)));
+	return clamp(uv, float2(0.5 / 256.0, 0.5 / 64.0), float2(1.0 - 0.5 / 256.0, 1.0 - 0.5 / 64.0));
+}
+
+float2 MsLutUvPlanet(float3 pos, float3 lightDir)
+{
+	const float r = length(pos);
+	return MsLutUv(r, dot(lightDir, pos / max(r, 1.0)));
+}
+
+// (47b, Sky Precision) Bruneton's transmittance parameterisation (upstream 35c759765): low altitudes and long grazing
+// paths get most of the 256x64 texels. The LUT holds unoccluded paths to the top of the atmosphere; the planet is
+// tested analytically (PlanetVisibility).
+// https://ebruneton.github.io/precomputed_atmospheric_scattering/atmosphere/functions.glsl.html
+float2 TrLutUvBruneton(float r, float cosSunZenith)
+{
+	const SharedData::PhysSkyData data = SharedData::physSkyData;
+	r = clamp(r, data.rPlanet, data.rAtmosphere);
+	const float atmosphereHorizon = sqrt((data.rAtmosphere - data.rPlanet) * (data.rAtmosphere + data.rPlanet));
+	const float localHorizon = sqrt(max(0.0, (r - data.rPlanet) * (r + data.rPlanet)));
+	const float mu = max(cosSunZenith, -localHorizon / r);
+	const float rMu = r * mu;
+	const float distance = max(0.0, sqrt(max(0.0, rMu * rMu + (data.rAtmosphere - r) * (data.rAtmosphere + r))) - rMu);
+	const float nearest = data.rAtmosphere - r;
+	const float farthest = localHorizon + atmosphereHorizon;
+	const float2 unitUv = saturate(float2((distance - nearest) / max(farthest - nearest, 1.0), localHorizon / atmosphereHorizon));
+	const float2 texel = 1.0 / float2(256, 64);
+	return 0.5 * texel + unitUv * (1.0 - texel);
+}
+
+void TrLutParametersBruneton(float2 uv, out float r, out float mu)
+{
+	const SharedData::PhysSkyData data = SharedData::physSkyData;
+	const float2 texel = 1.0 / float2(256, 64);
+	const float2 unitUv = saturate((uv - 0.5 * texel) / (1.0 - texel));
+	const float horizonSquared = (data.rAtmosphere - data.rPlanet) * (data.rAtmosphere + data.rPlanet);
+	const float localHorizon = sqrt(horizonSquared) * unitUv.y;
+	r = sqrt(data.rPlanet * data.rPlanet + localHorizon * localHorizon);
+	r = clamp(r, data.rPlanet, data.rAtmosphere);
+	const float distance = lerp(data.rAtmosphere - r, localHorizon + sqrt(horizonSquared), unitUv.x);
+	mu = distance > 0.0 ? (horizonSquared - localHorizon * localHorizon - distance * distance) / (2.0 * r * distance) : 1.0;
+	mu = clamp(mu, -localHorizon / r, 1.0);
+}
+
+// (47b, Sky Precision) Visible fraction of a light the size of the sun (0.266 degree radius) at radius r, cos zenith mu.
+float PlanetVisibility(float r, float mu)
+{
+	const float sinHorizon = saturate(SharedData::physSkyData.rPlanet / max(r, 1.0));
+	const float cosHorizon = -sqrt(max(0.0, 1.0 - sinHorizon * sinHorizon));
+	const float discWidth = max(0.00465 * sinHorizon, 1e-6);
+	return smoothstep(-discWidth, discWidth, mu - cosHorizon);
+}
+
+// Transmittance from a point (planet-centred) towards a light, through the LUT. With Sky Precision: the Bruneton
+// lookup x the analytic planet occlusion (a point below the ground counts as on it, so a camera under the
+// physical ground keeps its light); without: the 47a2 lookup (occlusion baked into the LUT).
+float3 SampleLightTr(Texture2D<float4> a_lut, SamplerState a_samp, float3 a_pos, float3 a_lightDir)
+{
+	float3 tr = 0.0;
+	[branch] if (SkyPrecision())
+	{
+		const float r = length(a_pos);
+		const float mu = dot(a_pos, a_lightDir) / max(r, 1.0);
+		const float rClamped = max(r, SharedData::physSkyData.rPlanet);
+		const float visibility = PlanetVisibility(rClamped, mu);
+		[branch] if (visibility > 0.0)
+			tr = a_lut.SampleLevel(a_samp, TrLutUvBruneton(rClamped, mu), 0).rgb * visibility;
+	}
+	else
+		tr = a_lut.SampleLevel(a_samp, TrLutUvPlanet(a_pos, a_lightDir), 0).rgb;
+	return tr;
+}
+
+// The same without the planet's shadow (Sky Precision); for callers that apply their own (CloudBodyLight).
+float3 SampleLightTrUnoccluded(Texture2D<float4> a_lut, SamplerState a_samp, float3 a_pos, float3 a_lightDir)
+{
+	const float r = length(a_pos);
+	const float2 uv = SkyPrecision() ? TrLutUvBruneton(max(r, SharedData::physSkyData.rPlanet), dot(a_pos, a_lightDir) / max(r, 1.0)) : TrLutUvPlanet(a_pos, a_lightDir);
+	return a_lut.SampleLevel(a_samp, uv, 0).rgb;
+}
+
+// (47b, Sky Precision) Zenith angle of the planet's horizon seen from the camera (upstream dcd3593d1).
+float SkyViewHorizonZenith()
+{
+	const float radius = SharedData::physSkyData.rPlanet;
+	const float viewRadius = max(SharedData::physSkyData.zCameraPlanet, radius);
+	const float horizonDistance = sqrt(max(0.0, (viewRadius - radius) * (viewRadius + radius)));
+	return acos(clamp(-horizonDistance / viewRadius, -1.0, 0.0));
+}
+
+// cylinder map. a_lutHeight: rows of the LUT (Sky Precision maps onto texel centres, with the true horizon on the
+// middle row; without it the 47a2 mapping, which ignores the height).
+float2 SkyViewLutUvH(float3 rayDir, float a_lutHeight)
+{
+	float2 uv;
+	[branch] if (SkyPrecision())
+	{
+		const float u = atan2(rayDir.y, rayDir.x) * 0.5 * RCP_PI;
+		const float zenith = acos(clamp(rayDir.z, -1.0, 1.0));
+		const float horizon = SkyViewHorizonZenith();
+		const float v = zenith <= horizon ?
+		                    0.5 * (1.0 - sqrt(saturate(1.0 - zenith / horizon))) :
+		                    0.5 + 0.5 * sqrt(saturate((zenith - horizon) / (Math::PI - horizon)));
+		uv = float2(frac(u), (0.5 + v * (a_lutHeight - 1.0)) / a_lutHeight);
+	}
+	else
+	{
+		float azimuth = atan2(rayDir.y, rayDir.x);
+		float u = azimuth * .5 * RCP_PI;  // sampler wraps around so ok
+		float zenith = asin(rayDir.z);
+		float v = 0.5 - 0.5 * sign(zenith) * sqrt(abs(zenith) * 2 * RCP_PI);
+		v = max(v, 0.01);
+		uv = frac(float2(u, v));
+	}
+	return uv;
+}
+
 float2 SkyViewLutUv(float3 rayDir)
 {
-	float azimuth = atan2(rayDir.y, rayDir.x);
-	float u = azimuth * .5 * RCP_PI;  // sampler wraps around so ok
-	float zenith = asin(rayDir.z);
-	float v = 0.5 - 0.5 * sign(zenith) * sqrt(abs(zenith) * 2 * RCP_PI);
-	v = max(v, 0.01);
-	return frac(float2(u, v));
+	return SkyViewLutUvH(rayDir, SV_LUT_HEIGHT);
 }
 
 // url: http://www.physics.hmc.edu/faculty/esin/a101/limbdarkening.pdf
@@ -152,6 +301,24 @@ float3 InvSkyViewLutUv(float2 uv)
 	float vm = 1 - 2 * uv.y;
 	float zenith = Math::PI * .5 * (1 - sign(vm) * vm * vm);
 	return SphericalDir(azimuth, zenith);
+}
+
+// (47b) The inverse of SkyViewLutUvH.
+float3 InvSkyViewLutUvH(float2 uv, float a_lutHeight)
+{
+	float3 dir;
+	[branch] if (SkyPrecision())
+	{
+		const float azimuth = uv.x * 2.0 * Math::PI;
+		const float v = saturate((uv.y * a_lutHeight - 0.5) / (a_lutHeight - 1.0));
+		const float horizon = SkyViewHorizonZenith();
+		const float vm = 1.0 - 2.0 * v;
+		const float zenith = v <= 0.5 ? horizon * (1.0 - vm * vm) : horizon + (Math::PI - horizon) * vm * vm;
+		dir = SphericalDir(azimuth, zenith);
+	}
+	else
+		dir = InvSkyViewLutUv(uv);
+	return dir;
 }
 
 void SampleAtmosphere(
@@ -312,8 +479,11 @@ float3 SampleTr(float3 sunDir, SamplerState sampSv)
 	if (data.trMix < 1e-8)
 		return 1;
 
-	const float2 lutUv = TrLutUv(data.zCameraPlanet, sunDir.z);
-	float3 tr = TexTrLut.SampleLevel(sampSv, lutUv, 0).rgb;
+	float3 tr;
+	[branch] if (SkyPrecision())  // (47b)
+		tr = SampleLightTr(TexTrLut, sampSv, float3(0, 0, data.zCameraPlanet), sunDir);
+	else
+		tr = TexTrLut.SampleLevel(sampSv, TrLutUv(data.zCameraPlanet, sunDir.z), 0).rgb;
 	tr = lerp(1, tr, data.trMix);
 
 	return tr;
@@ -329,12 +499,11 @@ float3 RelightCloud(float4 baseColor, float3 viewDir, float3 cloudPosWS, Sampler
 
 	// TODO: use proper light Dir
 	float3 dirLightDir = SharedData::DirLightDirection.xyz;
-	float3 dirLightColor = SharedData::DirLightColor;
+	float3 dirLightColor = SharedData::DirLightColor.xyz;  // (47b) .xyz: no truncation warning (Water includes this file now)
 
 	// TODO: planet shadowing
 
-	float2 lutUv = TrLutUvPlanet(cloudPosWS + float3(0, 0, data.zCameraPlanet), dirLightDir);
-	float3 trAtmos = TexTrLut.SampleLevel(sampTr, lutUv, 0).rgb;
+	float3 trAtmos = SampleLightTr(TexTrLut, sampTr, cloudPosWS + float3(0, 0, data.zCameraPlanet), dirLightDir);  // (47b) the 47a2 lookup without Sky Precision
 	trAtmos = lerp(1, trAtmos, data.trMix);
 	dirLightColor *= trAtmos;
 	
@@ -447,7 +616,7 @@ float3 CloudBodyLight(float4 baseColor, float3 viewDir, float3 posPlanet, float3
 	const float planetShadow = PlanetShadow(posPlanet, lightDir);
 	[branch] if (any(lightColor > 0.0) && planetShadow > 0.0)
 	{
-		float3 trAtmos = TexTrLut.SampleLevel(sampTr, TrLutUvPlanet(posPlanet, lightDir), 0).rgb;
+		float3 trAtmos = SampleLightTrUnoccluded(TexTrLut, sampTr, posPlanet, lightDir);  // (47b) planetShadow is the occlusion
 		trAtmos = lerp(1, trAtmos, SharedData::physSkyData.trMix);
 		result = lightColor * trAtmos * planetShadow * CloudPhase(baseColor.w, viewDir, lightDir) * (1.0 - CloudSelfShadow(viewDir, lightDir, sampCube));
 	}
@@ -483,7 +652,8 @@ float3 RelightCloudMulti(float4 baseColor, float3 viewDir, float3 cloudPosWS, Sa
 	[branch] if (cloud.SkyAmbient > 0.0)
 	{
 		const float c15 = 0.9659258, s15 = 0.2588190;
-		float3 sky = 0.3 * TexSvLut.SampleLevel(sampSv, float2(0.0, 0.01), 0).rgb;  // the zenith (SkyViewLutUv's v floor)
+		// the zenith: SkyViewLutUv's v floor, or (47b, Sky Precision) the first row's centre
+		float3 sky = 0.3 * TexSvLut.SampleLevel(sampSv, SkyPrecision() ? float2(0.0, 0.5 / SV_LUT_HEIGHT) : float2(0.0, 0.01), 0).rgb;
 		sky += 0.175 * TexSvLut.SampleLevel(sampSv, SkyViewLutUv(float3(c15, 0, s15)), 0).rgb;
 		sky += 0.175 * TexSvLut.SampleLevel(sampSv, SkyViewLutUv(float3(-c15, 0, s15)), 0).rgb;
 		sky += 0.175 * TexSvLut.SampleLevel(sampSv, SkyViewLutUv(float3(0, c15, s15)), 0).rgb;
@@ -531,11 +701,10 @@ float4 SampleAp(float3 viewDir, uint2 pxCoord, float dist, SamplerState sampSv)
 {
 	SharedData::PhysSkyData data = SharedData::physSkyData;
 
-	const float2 skyLutUv = SkyViewLutUv(viewDir);
-
 	uint3 apDims;
 	TexApLut.GetDimensions(apDims.x, apDims.y, apDims.z);
-	const float depth_slice = lerp(.5 / apDims.z, 1 - .5 / apDims.z, saturate(dist / AP_MAX_DIST));
+	const float2 skyLutUv = SkyViewLutUvH(viewDir, apDims.y);  // (47b) the AP LUT's own rows with Sky Precision
+	const float depth_slice = SkyPrecision() ? ApDepthUv(dist, apDims.z) : lerp(.5 / apDims.z, 1 - .5 / apDims.z, saturate(dist / AP_MAX_DIST));
 	float4 apColor = TexApLut.SampleLevel(sampSv, float3(skyLutUv, depth_slice), 0);
 
 	float shadow = TexApShadow[pxCoord / 2];
@@ -557,11 +726,10 @@ float4 SampleApShadow(float3 viewDir, float dist, float shadow, SamplerState sam
 {
 	SharedData::PhysSkyData data = SharedData::physSkyData;
 
-	const float2 skyLutUv = SkyViewLutUv(viewDir);
-
 	uint3 apDims;
 	TexApLut.GetDimensions(apDims.x, apDims.y, apDims.z);
-	const float depth_slice = lerp(.5 / apDims.z, 1 - .5 / apDims.z, saturate(dist / AP_MAX_DIST));
+	const float2 skyLutUv = SkyViewLutUvH(viewDir, apDims.y);  // (47b)
+	const float depth_slice = SkyPrecision() ? ApDepthUv(dist, apDims.z) : lerp(.5 / apDims.z, 1 - .5 / apDims.z, saturate(dist / AP_MAX_DIST));
 	float4 apColor = TexApLut.SampleLevel(sampSv, float3(skyLutUv, depth_slice), 0);
 	apColor.rgb *= 1 - shadow;
 

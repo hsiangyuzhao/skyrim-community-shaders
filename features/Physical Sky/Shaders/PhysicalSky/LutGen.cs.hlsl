@@ -21,7 +21,22 @@ RWTexture2D<float4> RWTexOutput : register(u0);
 static const uint kNightMidpoint = (1 << 1);   // ray-march samples in the middle of each step
 static const uint kNightGroundFix = (1 << 2);  // multiscatter ground bounce x cos / pi, sun tested at the ground point
 static const uint kNightSkyFixes = (1 << 3);   // Sky Fixes on: the sky brightness factor below applies
+static const uint kNightDistantSea = (1 << 4); // (47b) Sky Fixes: sky-view rays below the planet horizon also see the sky reflected at grazing incidence
 #define SKY_FIXES_SCALE SharedData::physSkyNightData.pad0  // sky brightness factor on the SUN's in-scatter (47a2: not the moons')
+
+// (47b, Sky Precision) Upstream 35c759765: transmittance quadrature concentrated around the ray's lowest point,
+// where the density changes fastest; a grazing ray gets samples on both sides of it.
+float TransmittanceRayDistance(float u, float distance, float closest)
+{
+	if (closest <= 0.0)
+		return distance * u * u;
+	if (u < 0.5) {
+		const float v = 1.0 - 2.0 * u;
+		return closest * (1.0 - v * v);
+	}
+	const float v = 2.0 * u - 1.0;
+	return closest + (distance - closest) * v * v;
+}
 
 void rayMarch(
 	float3 pos, float3 rayDir, 
@@ -45,6 +60,7 @@ void rayMarch(
 {
 	const SharedData::PhysSkyData data = SharedData::physSkyData;
 	const uint fixFlags = SharedData::physSkyNightData.Flags;  // (47a)
+	const bool precision = SkyPrecision();                      // (47b)
 
 #if LUTGEN == 0
 	const uint nsteps = 40;
@@ -120,11 +136,28 @@ void rayMarch(
 	float3 curr_pos = pos;
 	// (47a) Sky Fixes: sample each step in its middle (the loop advances first, so the original samples
 	// the far end of each step: twilight horizons came out too bright, a low sun's sky too dark).
+	// (47b) Sky Precision samples the sky-view rays in the middle of each step too (upstream dcd3593d1).
+#if LUTGEN == 2
+	[branch] if ((fixFlags & kNightMidpoint) || precision)
+#else
 	[branch] if (fixFlags & kNightMidpoint)
+#endif
 		curr_pos -= 0.5 * stride;
 	[loop] for (uint i = 0; i < nsteps; ++i)
 	{
 		curr_pos += stride;
+		float stepDt = dt;
+#if LUTGEN == 3
+		// (47b, Sky Precision) Upstream 183ec20b3: slices concentrated near the camera (quadratic in distance), each
+		// interval integrated at its midpoint and stored at its far end.
+		[branch] if (precision)
+		{
+			const float tNear = ApSliceDistance(i, depth);
+			const float tFar = ApSliceDistance(i + 1, depth);
+			stepDt = tFar - tNear;
+			curr_pos = pos + (0.5 * (tNear + tFar)) * rayDir;
+		}
+#endif
 
 		float rouRayleigh, rouAerosol, rouOzone;
 		SampleAtmosphere(
@@ -136,7 +169,7 @@ void rayMarch(
 		                    rouAerosol * data.aerosolAbsorption +
 		                    rouOzone * data.ozoneAbsorption;
 
-		float3 trSample = exp(-dt * extinction);
+		float3 trSample = exp(-stepDt * extinction);
 
 #if LUTGEN != 0
 		float3 scatterFactor = (1 - trSample) / extinction;
@@ -147,15 +180,16 @@ void rayMarch(
 		lumFactor += tr * fScatter;
 #	endif
 
-		float2 lutUvSun = TrLutUvPlanet(curr_pos, sunDir);
-		float3 trSun = TexTrLut.SampleLevel(SampTr, lutUvSun, 0).rgb;
+		// (47b) SampleLightTr / the multiscatter coordinates are the 47a2 lookups without Sky Precision.
+		float3 trSun = SampleLightTr(TexTrLut, SampTr, curr_pos, sunDir);
 #	if LUTGEN != 1
-		float2 lutUvMasser = TrLutUvPlanet(curr_pos, data.masserDir);
-		float3 trMasser = TexTrLut.SampleLevel(SampTr, lutUvMasser, 0).rgb;
+		float3 trMasser = SampleLightTr(TexTrLut, SampTr, curr_pos, data.masserDir);
+		float3 trSecunda = SampleLightTr(TexTrLut, SampTr, curr_pos, data.secundaDir);
 
-		float2 lutUvSecunda = TrLutUvPlanet(curr_pos, data.secundaDir);
-		float3 trSecunda = TexTrLut.SampleLevel(SampTr, lutUvSecunda, 0).rgb;
-		
+		const float2 lutUvSun = precision ? MsLutUvPlanet(curr_pos, sunDir) : TrLutUvPlanet(curr_pos, sunDir);
+		const float2 lutUvMasser = precision ? MsLutUvPlanet(curr_pos, data.masserDir) : TrLutUvPlanet(curr_pos, data.masserDir);
+		const float2 lutUvSecunda = precision ? MsLutUvPlanet(curr_pos, data.secundaDir) : TrLutUvPlanet(curr_pos, data.secundaDir);
+
 		const float3 psiMsSun = TexMsLut.SampleLevel(SampTr, lutUvSun, 0).rgb * data.sunlightColor;
 		float3 psiMs = psiMsSun;
 		psiMs += TexMsLut.SampleLevel(SampTr, lutUvMasser, 0).rgb * data.masserColor;
@@ -206,17 +240,44 @@ void rayMarch(
 			const float3 groundUp = normalize(hit_pos);
 			const float groundCosSun = dot(groundUp, sunDir);
 			if (groundCosSun > 0) {
-				float2 lutUv = TrLutUvPlanet(groundUp * data.rPlanet, sunDir);
-				lum += tr * data.groundAlbedo * TexTrLut.SampleLevel(SampTr, lutUv, 0).rgb * (groundCosSun * RCP_PI);
+				lum += tr * data.groundAlbedo * SampleLightTr(TexTrLut, SampTr, groundUp * data.rPlanet, sunDir) * (groundCosSun * RCP_PI);
 			}
 		} else if (dot(pos, sunDir) > 0) {
 			hit_pos = normalize(hit_pos) * data.rPlanet;
-			float2 lutUv = TrLutUvPlanet(hit_pos, sunDir);
-			lum += tr * data.groundAlbedo * TexTrLut.SampleLevel(SampTr, lutUv, 0).rgb;
+			lum += tr * data.groundAlbedo * SampleLightTr(TexTrLut, SampTr, hit_pos, sunDir);
 		}
 	}
 #endif
 }
+
+#if LUTGEN == 0
+// (47b, Sky Precision) Upstream 35c759765: a transmittance texel (Bruneton parameters) is the unoccluded path to the
+// top of the atmosphere (the planet is tested when the LUT is read), 40 nonuniform steps, each at its midpoint.
+float3 TransmittanceBruneton(float2 uv)
+{
+	const SharedData::PhysSkyData data = SharedData::physSkyData;
+	float r, mu;
+	TrLutParametersBruneton(uv, r, mu);
+	const float3 pos = float3(0, 0, r);
+	const float3 dir = float3(0, sqrt(max(0.0, 1.0 - mu * mu)), mu);
+	const float projected = r * mu;
+	const float tMax = max(0.0, -projected + sqrt(max(0.0, projected * projected + (data.rAtmosphere - r) * (data.rAtmosphere + r))));
+	const float tClosest = clamp(-projected, 0.0, tMax);
+	const uint nsteps = 40;
+	float3 opticalDepth = 0;
+	[loop] for (uint i = 0; i < nsteps; ++i)
+	{
+		const float tNear = TransmittanceRayDistance(float(i) / nsteps, tMax, tClosest);
+		const float tFar = TransmittanceRayDistance(float(i + 1) / nsteps, tMax, tClosest);
+		const float3 p = pos + (0.5 * (tNear + tFar)) * dir;
+		float rouRayleigh, rouAerosol, rouOzone;
+		SampleAtmosphere(max(0.f, length(p) - data.rPlanet), rouRayleigh, rouAerosol, rouOzone);
+		const float3 extinction = rouRayleigh * data.rayleighScatter + rouAerosol * (data.aerosolScatter + data.aerosolAbsorption) + rouOzone * data.ozoneAbsorption;
+		opticalDepth += (tFar - tNear) * extinction;
+	}
+	return exp(-opticalDepth);
+}
+#endif
 
 #if LUTGEN == 2
 // (41b, F1) Night sky base light on the sky dome: the weather's own night gradient (horizon colour
@@ -257,13 +318,17 @@ float3 NightSkyBase(float3 rayDir)
 	float zenithCos = lerp(horZenithCos, 1, uv.x);
 	float3 sunDir = float3(0, sqrt(1 - zenithCos * zenithCos), zenithCos);
 #else
-	float3 rayDir = InvSkyViewLutUv(uv);
-	float3 pos = float3(0, 0, data.zCameraPlanet);
+	// (47b) Sky Precision: rows around the true horizon (InvSkyViewLutUvH), a camera under the ground taken as on it.
+	float3 rayDir = InvSkyViewLutUvH(uv, outDims.y);
+	float3 pos = float3(0, 0, SkyPrecision() ? max(data.zCameraPlanet, data.rPlanet) : data.zCameraPlanet);
 #endif
 
 	float3 tr = 1.0;
 #if LUTGEN == 0
-	rayMarch(pos, sunDir, sunDir, tr);
+	[branch] if (SkyPrecision())
+		tr = TransmittanceBruneton(uv);  // (47b)
+	else
+		rayMarch(pos, sunDir, sunDir, tr);
 	RWTexOutput[tid.xy] = float4(tr, 1.0);
 
 #elif LUTGEN == 1
@@ -295,6 +360,30 @@ float3 NightSkyBase(float3 rayDir)
 	float3 lum = 0;
 	float3 lumSun = 0;
 	rayMarch(pos, rayDir, tr, lum, lumSun);
+	// (47b) Sky Fixes "distant sea": below the planet's horizon the sky dome showed only the short stretch of air down to
+	// the physical ground, a dark band under the horizon wherever the game world ends (seen from high places). Here that
+	// ground is a calm sea: the sky reflected at the ground point (Fresnel, Schlick with water's F0 = 0.02, which goes to
+	// 1 at grazing so the band joins the horizon haze) x the air in between, on top of that air's own glow.
+	[branch] if (SharedData::physSkyNightData.Flags & kNightDistantSea)
+	{
+		const float tGround = RayIntersectSphere(pos, rayDir, 0, data.rPlanet);
+		[branch] if (tGround > 0.0)
+		{
+			const float3 groundUp = normalize(pos + tGround * rayDir);
+			const float3 reflected = reflect(rayDir, groundUp);
+			// Started about 14 m above the ground so the reflected ray cannot find the ground again (fp32 at the
+			// planet's radius in game units).
+			const float3 start = groundUp * (data.rPlanet + 1000.0);
+			const float cosIncidence = saturate(-dot(rayDir, groundUp));
+			const float fresnel = 0.02 + 0.98 * pow(1.0 - cosIncidence, 5.0);
+			float3 trReflected = 1.0;
+			float3 lumReflected = 0;
+			float3 lumSunReflected = 0;
+			rayMarch(start, reflected, trReflected, lumReflected, lumSunReflected);
+			lum += tr * fresnel * lumReflected;
+			lumSun += tr * fresnel * lumSunReflected;
+		}
+	}
 	[branch] if (SharedData::physSkyNightData.Flags & kNightSkyFixes)  // (47a) Sky Fixes: the sky brightness factor, sun only (47a2), not the night base
 		lum += lumSun * (SKY_FIXES_SCALE - 1.0);
 	[branch] if (SharedData::physSkyNightData.Flags & SharedData::PhysSkyNightFlags::BaseLight)
