@@ -67,20 +67,6 @@ public:
 		/// (42b) Combined: both moons add their light (Secunda at 0.67, by phase). Off: only the moon
 		/// picked by "Moon light source" (Brightest = a smooth blend that is as bright as the brighter).
 		bool BothMoonsLight = false;
-
-		// (46z) Outside the NLOHMANN macro: read in LoadSettings, tolerant of missing or mistyped keys.
-		/// B1 "Physical Sunrise Alignment", 0-0.5 (alternate sun path only): where in the climate's sunrise
-		/// window the sun crosses the horizon. 0 = the start of the window (when the weather's dawn colours
-		/// begin), 0.5 = the middle minus 15 minutes (as before). Sunset mirrors it (0 = end of the sunset
-		/// window, 0.5 = middle plus 15 minutes).
-		float SunriseAlignment = 0.5f;
-		/// B2 "Vanilla Sun Visibility Follows Physical Sun": the game's sun picture fades in as the sun
-		/// rises from -1 to +2 degrees (true elevation) instead of switching on by the clock an hour after
-		/// the sunrise window starts.
-		bool SunVisibilityFollowsSun = false;
-		/// B4 "Sunrise Light Ramp Width", 3-8 degrees (Combined light model): sun light from 10% at the
-		/// horizon to full at this elevation.
-		float SunriseRampWidth = 3.0f;
 	};
 
 	Settings settings;
@@ -250,7 +236,7 @@ private:
 	};
 
 	// (42b) Combined model constants (degrees of true elevation).
-	static constexpr float SunFullElevation = 3.0f;         // sun at full strength from here up (default of Settings::SunriseRampWidth, 46z B4)
+	static constexpr float SunFullElevation = 3.0f;         // sun at full strength from here up
 	static constexpr float SunResidual = 0.1f;              // sun strength left at the horizon...
 	static constexpr float SunResidualEndElevation = -4.0f;  // ...fading to 0 here (x Physical Sky's Twilight Length)
 	static constexpr float MoonStartElevation = -1.0f;      // moon light 0 here...
@@ -324,10 +310,6 @@ private:
 	static void CalculateSunDirectionAndDistance(const RE::Sun* sun, RE::NiPoint3& outDir, float& outDistance);
 
 	static void CalculateAlternateSunDirectionAndDistance(RE::NiPoint3& outDir, float& outDist, float time, float sunrise, float sunset, float sunAngle);
-
-	/// (46z, B1) Sunrise / sunset hours of the alternate sun path for the current climate and
-	/// "Physical Sunrise Alignment"; 0.5 gives timings.sunrise / timings.sunset exactly.
-	void GetAlignedSunTimes(float& outSunrise, float& outSunset) const;
 
 	static RE::NiPoint3 GetApparentDirection(const RE::NiPoint3& dir, float altitude);
 

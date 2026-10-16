@@ -37,47 +37,6 @@ void SkySync::DrawSettings()
 		}
 	}
 
-	// (46z, B1, B2, B4)
-	ImGui::SeparatorText("Sunrise and Sunset");
-	{
-		auto hhmm = [](float a_hour) {
-			if (!std::isfinite(a_hour))
-				return std::string("--:--");
-			a_hour = std::fmod(a_hour + 48.0f, 24.0f);
-			int minutes = static_cast<int>(std::lround(a_hour * 60.0f)) % (24 * 60);
-			return fmt::format("{:02}:{:02}", minutes / 60, minutes % 60);
-		};
-		ImGui::Text("Climate sunrise window %s - %s, sunset window %s - %s",
-			hhmm(timings.sunriseBegin).c_str(), hhmm(timings.sunriseEnd).c_str(), hhmm(timings.sunsetBegin).c_str(), hhmm(timings.sunsetEnd).c_str());
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("The current climate's times. The weather's dawn colours start with the sunrise window.");
-		ImGui::SliderFloat("Physical Sunrise Alignment", &settings.SunriseAlignment, 0.0f, 0.5f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"When the sun crosses the horizon, within the climate's sunrise window (and the same for sunset).\n"
-				"0 = at the start of the window, when the weather's sky, fog and clouds start to brighten.\n"
-				"0.5 = the middle of the window minus 15 minutes (as before), often an hour or more after the\n"
-				"weather's dawn colours, so the physical sky stayed night while the land already looked like day.\n"
-				"Moves the sun (and with it shadows and the sun light) earlier in the morning and later in the\n"
-				"evening. Only with the alternate sun path.");
-		if (settings.UseAlternateSunPath) {
-			float sunrise = 0.0f, sunset = 0.0f;
-			GetAlignedSunTimes(sunrise, sunset);
-			ImGui::TextDisabled("The sun rises at %s and sets at %s.", hhmm(sunrise).c_str(), hhmm(sunset).c_str());
-		}
-		ImGui::Checkbox("Vanilla Sun Visibility Follows Physical Sun", &settings.SunVisibilityFollowsSun);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"The game's sun picture fades in as the sun rises from 1 degree below the horizon to 2 above (and\n"
-				"out the same way at sunset). Off: it appears all at once by the clock, an hour after the sunrise\n"
-				"window starts, wherever the sun is then (as before).");
-		ImGui::SliderFloat("Sunrise Light Ramp Width", &settings.SunriseRampWidth, 3.0f, 8.0f, "%.1f deg", ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text(
-				"How high the sun climbs before its light on the land is at full strength (it starts at 10%% at\n"
-				"the horizon). 3 = as before (about 16 game minutes); 8 = a slower, gentler dawn.");
-	}
-
 	ImGui::SliderInt("Moon light source", &settings.MoonLightSource, 0, static_cast<uint8_t>(MoonLightSource::Count) - 1, MoonLightSourceNames[settings.MoonLightSource], ImGuiSliderFlags_AlwaysClamp);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text("Which moon casts the shadows at night (both moons still add their light). If the chosen moon is not up, the other one takes over.");
@@ -104,10 +63,6 @@ SkySync::Settings SkySync::Effective() const
 		s.MoonOrbit = static_cast<int32_t>(MoonOrbit::Vanilla);
 		s.KeepMoonPosition = false;
 		s.LightSourceModel = static_cast<int32_t>(LightSourceModel::Clock);  // (42b)
-		// (46z)
-		s.SunriseAlignment = 0.5f;
-		s.SunVisibilityFollowsSun = false;
-		s.SunriseRampWidth = SunFullElevation;
 	}
 	return s;
 }
@@ -115,26 +70,6 @@ SkySync::Settings SkySync::Effective() const
 void SkySync::LoadSettings(json& o_json)
 {
 	settings = o_json;
-	// (46z) Outside the macro; a missing, mistyped or non-finite value keeps the default.
-	{
-		const Settings defaults{};
-		auto readFloat = [&](const char* a_key, float a_default) {
-			if (!o_json.is_object())
-				return a_default;
-			const auto it = o_json.find(a_key);
-			if (it == o_json.end() || !it->is_number())
-				return a_default;
-			const float value = it->get<float>();
-			return std::isfinite(value) ? value : a_default;
-		};
-		settings.SunriseAlignment = std::clamp(readFloat("SunriseAlignment", defaults.SunriseAlignment), 0.0f, 0.5f);
-		settings.SunriseRampWidth = std::clamp(readFloat("SunriseRampWidth", defaults.SunriseRampWidth), 3.0f, 8.0f);
-		settings.SunVisibilityFollowsSun = defaults.SunVisibilityFollowsSun;
-		if (o_json.is_object()) {
-			if (const auto it = o_json.find("SunVisibilityFollowsSun"); it != o_json.end() && it->is_boolean())
-				settings.SunVisibilityFollowsSun = it->get<bool>();
-		}
-	}
 	settings.MoonLightSource = std::clamp(settings.MoonLightSource, static_cast<int32_t>(MoonLightSource::Brightest), static_cast<int32_t>(MoonLightSource::Secunda));
 	settings.SunPath = std::clamp(settings.SunPath, static_cast<int32_t>(SunPath::Southern), static_cast<int32_t>(SunPath::Custom));
 	settings.MoonOrbit = std::clamp(settings.MoonOrbit, static_cast<int32_t>(MoonOrbit::Vanilla), static_cast<int32_t>(MoonOrbit::NightSky));
@@ -148,10 +83,6 @@ void SkySync::LoadSettings(json& o_json)
 void SkySync::SaveSettings(json& o_json)
 {
 	o_json = settings;
-	// (46z) See LoadSettings.
-	o_json["SunriseAlignment"] = settings.SunriseAlignment;
-	o_json["SunVisibilityFollowsSun"] = settings.SunVisibilityFollowsSun;
-	o_json["SunriseRampWidth"] = settings.SunriseRampWidth;
 }
 
 void SkySync::RestoreDefaultSettings()
@@ -269,10 +200,8 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 	if (const auto& physicalSky = globals::features::physicalSky; physicalSky.loaded)
 		twilight = std::clamp(physicalSky.Effective().twilightLength, 1.0f, 3.0f);
 	float strength[3] = {};
-	// (46z, B4) Sunrise Light Ramp Width (3 = SunFullElevation, as before).
-	const float sunFullElevation = std::clamp(Effective().SunriseRampWidth, 3.0f, 8.0f);
 	strength[sunIdx] = SunResidual * SmoothStep(SunResidualEndElevation * twilight, 0.0f, sunElevation) +
-	                   (1.0f - SunResidual) * SmoothStep(0.0f, sunFullElevation, sunElevation);
+	                   (1.0f - SunResidual) * SmoothStep(0.0f, SunFullElevation, sunElevation);
 
 	// The moons: phase, height, and gone by day. The weather does not switch them off (as in the
 	// Clock model: overcast nights keep their moonlight).
@@ -552,12 +481,8 @@ void SkySync::ProcessSun(const RE::Sun* sun, const float time, const float altit
 	RE::NiPoint3 dir;
 	float dist;
 
-	const auto effective = Effective();
 	if (settings.UseAlternateSunPath) {
-		// (46z, B1) Physical Sunrise Alignment.
-		float sunrise, sunset;
-		GetAlignedSunTimes(sunrise, sunset);
-		CalculateAlternateSunDirectionAndDistance(dir, dist, time, sunrise, sunset, sunAngle);
+		CalculateAlternateSunDirectionAndDistance(dir, dist, time, timings.sunrise, timings.sunset, sunAngle);
 	} else
 		CalculateSunDirectionAndDistance(sun, dir, dist);
 
@@ -568,12 +493,7 @@ void SkySync::ProcessSun(const RE::Sun* sun, const float time, const float altit
 
 	directions[static_cast<int>(Caster::Sun)] = apparentDir;
 
-	// (46z, B2) By the sun's true elevation instead of the clock.
-	if (effective.SunVisibilityFollowsSun) {
-		const float elevationDeg = DirectX::XMConvertToDegrees(std::asin(std::clamp(dir.z, -1.0f, 1.0f)));
-		SetSunBaseVisibility(sun, SmoothStep(-1.0f, 2.0f, elevationDeg));
-	} else
-		SetSunBaseVisibility(sun, isDayTime ? 1.0f : 0.0f);
+	SetSunBaseVisibility(sun, isDayTime ? 1.0f : 0.0f);
 
 	intensities[static_cast<int>(Caster::Sun)] = isDayTime ? CalculateVisibility(dir, dist, *gSunGlareSize * SunScaleFactor) : 0.0f;
 }
@@ -654,22 +574,6 @@ inline void SkySync::CalculateAlternateSunDirectionAndDistance(RE::NiPoint3& out
 
 	const float elevationRatio = std::max(sinPhi, 0.0f);
 	outDist = std::lerp(SunHorizonDistance, SunPeakDistance, elevationRatio);
-}
-
-void SkySync::GetAlignedSunTimes(float& outSunrise, float& outSunset) const
-{
-	outSunrise = timings.sunrise;
-	outSunset = timings.sunset;
-	const float alignment = std::clamp(Effective().SunriseAlignment, 0.0f, 0.5f);
-	if (alignment >= 0.5f || !std::isfinite(alignment))
-		return;  // exactly the 46y times
-	// Linear from the window's start (0) to its middle minus 15 minutes (0.5); sunset mirrored.
-	const float sunrise = timings.sunriseBegin + alignment * (timings.sunriseEnd - timings.sunriseBegin) - 0.5f * alignment;
-	const float sunset = timings.sunsetEnd - alignment * (timings.sunsetEnd - timings.sunsetBegin) + 0.5f * alignment;
-	if (std::isfinite(sunrise) && std::isfinite(sunset) && sunset - sunrise > 1.0f) {
-		outSunrise = sunrise;
-		outSunset = sunset;
-	}
 }
 
 RE::NiPoint3 SkySync::GetApparentDirection(const RE::NiPoint3& dir, const float altitude)
