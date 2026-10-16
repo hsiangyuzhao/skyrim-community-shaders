@@ -60,6 +60,16 @@ struct WetSkin : Feature
 	{
 		uint32_t Model = 0;  // 0 = New, 1 = Original (pre-42c)
 
+		// (47c) Performance, both on by default; both off = 47b exactly. Not part of presets.
+		// SkipInvisibleWork: leave out work whose result is multiplied by 0 (same picture): faded
+		// noise octaves, rivulets narrower than half a pixel, rain droplets / rivulets on skin under
+		// a roof when rain is its only water, dry hair's clump noise, the see-through-clothes depth
+		// copy while nobody is in water, the GPU values once per frame.
+		// FasterNoiseLOD: a cheaper wet-patch noise (same parameters and statistics, patches in
+		// other places) and no droplets / rivulets on characters far away (about 13 m+ at 1440p).
+		bool SkipInvisibleWork = true;
+		bool FasterNoiseLOD = true;
+
 		// Wetness input
 		float ExtraWetness = 0.0f;  // manual; Original reads it as before (0..2), New uses 0..1
 		float SwimWeight = 1.0f;

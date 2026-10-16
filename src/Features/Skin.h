@@ -210,6 +210,13 @@ struct Skin : Feature
 	std::unordered_map<RE::FormID, ActorWetState> actorWetStates;
 	double wetClock = 0.0;          // game seconds, advanced once per frame
 	uint32_t wetClockFrame = UINT32_MAX;
+	// (47c) Skip Invisible Work: WetSkin::GetGPUParams() once per frame (was once per Lighting draw).
+	std::array<float4, 6> wetSkinParamsCache{};
+	std::array<float4, 12> wetCharParamsCache{};
+	uint32_t wetParamsCacheFrame = UINT32_MAX;
+	// (47c) Last frame a character's wetness state found it in water (TranslucentUnderWater's depth
+	// copy is only needed then).
+	uint32_t actorInWaterFrame = UINT32_MAX;
 	void PruneActorWetStates(uint32_t a_frame);
 	std::array<float, sizeof(PerGeometryData) / sizeof(float)> currentPerGeometry{};  // last uploaded (raw, avoids padding Skin)
 	bool perGeometryValid = false;

@@ -2242,12 +2242,22 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	const float3 wetdPdy = ddy(input.WorldPosition.xyz);
 	const float2 wetdUVdx = ddx(wetUV);
 	const float2 wetdUVdy = ddy(wetUV);
+	// (47c) The world size of one pixel at this distance (from the view ray, so not foreshortened on
+	// slanted skin), for the droplet / rivulet distance LOD.
+	const float3 wetViewRay = normalize(input.WorldPosition.xyz);
+	const float wetPixelWorld = length(input.WorldPosition.xyz) * max(length(ddx(wetViewRay)), length(ddy(wetViewRay)));
+	// (47c) Droplets and rivulets: set up in the block below, evaluated after the sky occlusion
+	// (WETNESS_EFFECTS) or right there (without it).
+	Skin::SkinWetDetailSetup skinWetDetail = (Skin::SkinWetDetailSetup)0;
+	bool skinWetDetailPending = false;
+	bool skinWetNoOtherWet = false;  // (47c) no swimming, manual or sweat wetness: only rain
 	[branch] if (skinWetNew)
 	{
 		const float worldZ = input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z;
 		// (44b) The same per-character function hair and gear use.
 		float wSwim, wManual, wSweat;
 		const float wDry = Skin::CharDryWetness(worldZ, dynamicWet.x, wSwim, wManual, wSweat);
+		skinWetNoOtherWet = max(max(wSwim, wManual), wSweat) <= 0.0;
 		const float wRain = saturate(skinRainStrength * Skin::wetSkinParams[0].w);
 		const float wAll = 1.0 - (1.0 - wDry) * (1.0 - wRain);
 		skinRainShare = wAll > 0.0 ? saturate((wAll - wDry) / wAll) : 0.0;
@@ -2314,25 +2324,36 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			const float faceRivulets = 1.0;
 			const float rivuletColumnsPerUV = 25.0;  // (44b) about 3 cm per rivulet column on the body
 #		endif
-			const float2 cellUV = wetUV * cellsPerUV;
+			// (47c) Distance LOD (Faster Noise & Distance LOD; 1 when off): droplets and rivulets fade
+			// out on characters far away, the wet sheen and darkening stay.
+			const float detailLOD = Skin::WetDetailLOD(wetPixelWorld);
 			const float footprint = max(max(length(dUVdx), length(dUVdy)) * cellsPerUV, 1e-6);
 			// Beads are about 0.3 cell in radius: fade them out below ~1.5 pixels (no DLSS sparkle).
-			const float dropVisibility = smoothstep(1.0, 2.5, 0.3 / footprint);
+			const float dropVisibility = smoothstep(1.0, 2.5, 0.3 / footprint) * detailLOD;
 			// More beads where water rests (shoulders, chest), fewer on undersides.
 			const float restFactor = lerp(0.7, 1.2, saturate(baseN.z * 0.5 + 0.5));
-			const float presence = saturate(Skin::wetSkinParams[2].w) * saturate(Skin::wetSkinParams[2].z) * skinWetDropDriver * restFactor * faceDroplets * (dropVisibility > 0.0 ? 1.0 : 0.0);
-			const Skin::WetSkinDetail detail = Skin::WetSkinDroplets(cellUV, footprint, gravityUV, alignment, presence, skinWetStreakDriver);
-			skinWetDropMask = detail.dropMask * dropVisibility;
-			skinWetDropRim = detail.dropRim * skinWetDropMask;
-			// (44b) Rivulets on their own scale (they used the droplet cells, about 1/800 uv wide, and
-			// faded out below a pixel at any normal viewing distance).
-			const float rivulets = Skin::WetSkinRivulets(wetUV, rivuletColumnsPerUV, max(length(dUVdx), length(dUVdy)), gravityUV, alignment, skinWetStreakDriver * faceRivulets);
-			skinWetStreak = saturate(max(rivulets, detail.trail * 0.8 * dropVisibility));
-
-			const float3 tu = dot(dPdu, dPdu) > 1e-20 ? normalize(dPdu) : float3(1.0, 0.0, 0.0);
-			const float3 tv = dot(dPdv, dPdv) > 1e-20 ? normalize(dPdv) : float3(0.0, 1.0, 0.0);
-			const float domeStrength = clamp(Skin::wetSkinParams[5].z, 0.0, 2.0);
-			wetWorldNormal = normalize(baseN + (detail.dropSlope.x * tu + detail.dropSlope.y * tv) * domeStrength * skinWetDropMask);
+			skinWetDetail.wetUV = wetUV;
+			skinWetDetail.cellUV = wetUV * cellsPerUV;
+			skinWetDetail.footprint = footprint;
+			skinWetDetail.uvFootprint = max(length(dUVdx), length(dUVdy));
+			skinWetDetail.gravityUV = gravityUV;
+			skinWetDetail.alignment = alignment;
+			skinWetDetail.presence = saturate(Skin::wetSkinParams[2].w) * saturate(Skin::wetSkinParams[2].z) * skinWetDropDriver * restFactor * faceDroplets * (dropVisibility > 0.0 ? 1.0 : 0.0);
+			skinWetDetail.dropVisibility = dropVisibility;
+			skinWetDetail.streakDriver = skinWetStreakDriver;
+			skinWetDetail.rivuletColumnsPerUV = rivuletColumnsPerUV;
+			skinWetDetail.rivuletDriver = skinWetStreakDriver * faceRivulets;
+			skinWetDetail.lod = detailLOD;
+			skinWetDetail.baseN = baseN;
+			skinWetDetail.tu = dot(dPdu, dPdu) > 1e-20 ? normalize(dPdu) : float3(1.0, 0.0, 0.0);
+			skinWetDetail.tv = dot(dPdv, dPdv) > 1e-20 ? normalize(dPdv) : float3(0.0, 1.0, 0.0);
+			skinWetDetail.domeStrength = clamp(Skin::wetSkinParams[5].z, 0.0, 2.0);
+			skinWetDetailPending = true;
+#		if !defined(WETNESS_EFFECTS)
+			// No sky occlusion without Wetness Effects: the droplets and rivulets right here.
+			Skin::SkinWetDetail(skinWetDetail, skinWetDropMask, skinWetDropRim, skinWetStreak, wetWorldNormal);
+			skinWetDetailPending = false;
+#		endif
 		} else if (skinWetness > 0.0f) {
 			float3 wetNormal = Skin::CalculateNormalFromHeight(skinWetness, SharedData::skinData.wetParams.w * 0.0005, uv);
 			if (hasSkinWetness) {
@@ -2679,6 +2700,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float hairClumpR = 0.0;     // -0.5..0.5, the clump's random highlight offset
 	float hairClumpFade = 0.0;  // 0 where a clump is narrower than ~2.5 px, 1 above ~5 px
 	float hairWetSpecAA = 0.0;  // squared widening of the highlight lobes
+	float hairClumpL = 0.0;     // (47c) clump coordinates, for Skip Invisible Work (clumps only where wet)
+	float hairClumpS = 0.0;
 #		if defined(CS_SKIN) && defined(WETNESS_EFFECTS)
 	[branch] if (skinEnabled && SharedData::hairSpecularSettings.Enabled && Skin::WetSkinNewModel() && Skin::wetCharParams[1].x > 0.5)
 	{
@@ -2697,12 +2720,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		tUV = dot(tUV, tUV) > 1e-20 ? normalize(tUV) : float2(0.0, 1.0);
 		const float2 aUV = float2(-tUV.y, tUV.x);
 		const float clumpCount = clamp(Skin::wetCharParams[2].w, 16.0, 128.0);
-		const float l = dot(uv, tUV);
-		float s = dot(uv, aUV) * clumpCount;
-		s += 0.7 * (Skin::WetValueNoise(float2(l * 3.0, s * 0.1)) - 0.5);
-		const float id = floor(s);
-		hairClumpX = s - id;
-		hairClumpR = Skin::WetHash12(float2(id, 7.31)) - 0.5;
+		hairClumpL = dot(uv, tUV);
+		hairClumpS = dot(uv, aUV) * clumpCount;
+		// (47c) Skip Invisible Work: computed below, only where the hair is wet (hairWetK > 0).
+		[branch] if (!Skin::WetSkipInvisible())
+			Skin::WetHairClump(hairClumpL, hairClumpS, hairClumpX, hairClumpR);
 		const float sPerPixel = max(abs(dot(dUVdx, aUV)), abs(dot(dUVdy, aUV))) * clumpCount;
 		hairClumpFade = smoothstep(2.5, 5.0, 1.0 / max(sPerPixel, 1e-6));
 	}
@@ -3288,6 +3310,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float3 geardPdx = 0.0, geardPdy = 0.0;
 	float2 gearUVdx = 0.0, gearUVdy = 0.0;
 	float gearNormalVariance = 0.0;
+	float gearPixelWorld = 0.0;  // (47c) world size of a pixel here, for the droplet / rivulet distance LOD
 #		if defined(CS_SKIN) && !defined(SKIN)
 	if (skinEnabled) {
 		const float charWorldZ = input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z;
@@ -3367,6 +3390,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				const float3 dNdx = ddx(worldNormal.xyz);
 				const float3 dNdy = ddy(worldNormal.xyz);
 				gearNormalVariance = 0.5 * (dot(dNdx, dNdx) + dot(dNdy, dNdy));
+				const float3 viewRay = normalize(input.WorldPosition.xyz);
+				gearPixelWorld = length(input.WorldPosition.xyz) * max(length(ddx(viewRay)), length(ddy(viewRay)));
 			} else if (wetCharacter) {
 				rainWetness = 0.0;  // Wet Gear off: no character wetness (world surfaces untouched)
 			}
@@ -3483,6 +3508,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			Hair::WetTRT = lerp(1.0, 1.0 - saturate(Skin::wetCharParams[2].x), hairWetK);
 			Hair::WetScatter = 1.0 - saturate(Skin::wetCharParams[2].y) * hairWetK;
 			Hair::WetSpecAA = hairWetSpecAA;
+			// (47c) Skip Invisible Work: the clump noise left out above for dry hair, here instead.
+			[branch] if (Skin::WetSkipInvisible())
+				Skin::WetHairClump(hairClumpL, hairClumpS, hairClumpX, hairClumpR);
 			// Clumps: strength from the wetness, faded out where a clump is narrower than ~3 px.
 			const float clump = saturate(Skin::wetCharParams[2].z) * smoothstep(0.3, 0.9, hairWetW) * hairClumpFade;
 			const float x = hairClumpX;
@@ -3518,7 +3546,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			float3 tu = float3(1.0, 0.0, 0.0), tv = float3(0.0, 1.0, 0.0);
 			const float dropDensity = saturate(Skin::wetSkinParams[2].w) * (gearClass.z * saturate(Skin::wetCharParams[6].x) + gearClass.y * saturate(Skin::wetCharParams[5].z)) * (1.0 - gearClass.w);
 			const float rivAmount = (gearClass.z * saturate(Skin::wetCharParams[6].y) + gearClass.y * saturate(Skin::wetCharParams[5].w)) * (1.0 - gearClass.w);
-			[branch] if ((dropDensity > 0.0 || rivAmount > 0.0) && wChar > 0.0)
+			// (47c) Distance LOD (Faster Noise & Distance LOD; 1 when off): no droplets or rivulets on gear far away.
+			const float gearDetailLOD = Skin::WetDetailLOD(gearPixelWorld);
+			[branch] if ((dropDensity > 0.0 || rivAmount > 0.0) && wChar > 0.0 && gearDetailLOD > 0.0)
 			{
 				const float3 baseN = worldNormal.xyz;
 				const float uvDet = gearUVdx.x * gearUVdy.y - gearUVdx.y * gearUVdy.x;
@@ -3541,7 +3571,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				const float cellsPerUV = 230.0 / clamp(Skin::wetSkinParams[3].x, 0.25, 4.0);
 				const float footprint = max(uvFootprint * cellsPerUV, 1e-6);
 				// Beads are about 0.3 cell in radius: fade them out below ~1.5 pixels (no DLSS sparkle).
-				const float dropVisibility = smoothstep(1.0, 2.5, 0.3 / footprint);
+				const float dropVisibility = smoothstep(1.0, 2.5, 0.3 / footprint) * gearDetailLOD;
 				const float restFactor = lerp(0.7, 1.2, saturate(baseN.z * 0.5 + 0.5));
 				const float streakDriver = max(smoothstep(0.2, 0.85, dropOthers), charRainPart);
 				const float presence = dropDensity * dropDriver * restFactor * (dropVisibility > 0.0 ? 1.0 : 0.0);
@@ -3549,7 +3579,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				dropMask = detail.dropMask * dropVisibility;
 				dropRim = detail.dropRim * dropMask;
 				dropSlope = detail.dropSlope;
-				const float rivulets = rivAmount > 0.0 ? Skin::WetSkinRivulets(uv, 25.0, uvFootprint, gravityUV, alignment, streakDriver * rivAmount) : 0.0;
+				const float rivulets = rivAmount > 0.0 ? Skin::WetSkinRivulets(uv, 25.0, uvFootprint, gravityUV, alignment, streakDriver * rivAmount, gearDetailLOD) : 0.0;
 				streak = saturate(max(rivulets, detail.trail * 0.8 * dropVisibility * hardW));
 			}
 
@@ -3590,6 +3620,19 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	// (42c) Character wetness: 4.3 occlusion for the rain-fed skin film, 4.2 darkening, 4.1 film.
 #		if defined(SKIN) && defined(CS_SKIN)
+	// (47c) The skin's droplets and rivulets (set up with the coverage above). Skip Invisible Work:
+	// left out where the sky is fully occluded (factor 0) and rain is the only water on this
+	// character: the occlusion below multiplies the rain droplets by exactly 0 (drop-only-from-rain
+	// = 1) and the rivulets by 1 - rainShare, which is 0 up to one division rounding (rainShare =
+	// wAll / wAll); the film then has no energy, so the bead domes in wetWorldNormal are unused.
+	[branch] if (skinWetDetailPending)
+	{
+		const bool rainDetailHidden = Skin::WetSkipInvisible() && skinWetNoOtherWet && saturate(wetnessOcclusion * nearFactor) <= 0.0;
+		[branch] if (!rainDetailHidden)
+			Skin::SkinWetDetail(skinWetDetail, skinWetDropMask, skinWetDropRim, skinWetStreak, wetWorldNormal);
+		else
+			wetWorldNormal = normalize(skinWetDetail.baseN);
+	}
 	// 4.3: the rain share of the Advanced Skin film follows the same sky occlusion as the rest
 	// of Wetness Effects (a character under a roof is not rained on).
 	skinSurfaceProperties.Wetness *= lerp(1.0, saturate(wetnessOcclusion * nearFactor), skinRainShare);

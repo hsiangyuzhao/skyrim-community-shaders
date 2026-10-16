@@ -60,6 +60,32 @@ namespace Skin
 		return wetSkinParams[0].x > 0.5;
 	}
 
+	// (47c) "Wetness: Skip Invisible Work" (wetCharParams[11].x): leave out work whose result is
+	// multiplied by 0 (faded noise octaves, sub-pixel rivulets, rain detail under a roof, dry hair's
+	// clumps). The picture stays the same.
+	bool WetSkipInvisible()
+	{
+		return wetCharParams[11].x > 0.5;
+	}
+
+	// (47c) "Wetness: Faster Noise & Distance LOD" (wetCharParams[11].y): the cheaper patch noise and
+	// no droplets / rivulets on characters far away.
+	bool WetFastNoiseLOD()
+	{
+		return wetCharParams[11].y > 0.5;
+	}
+
+	/// (47c) Distance LOD for droplets and rivulets: 1 up close, fading to 0 while one pixel grows
+	/// from 0.8 to 1.2 game units (about 1.1 to 1.7 cm) on the character. pixelWorld: the world
+	/// size of a pixel at this distance (view-ray derivatives, not foreshortened). Around 13 m and
+	/// farther at 1440p; a third-person player (up to about 8.5 m) never reaches it. Off: 1.
+	float WetDetailLOD(float pixelWorld)
+	{
+		[branch] if (!WetFastNoiseLOD())
+			return 1.0;
+		return 1.0 - smoothstep(0.8, 1.2, pixelWorld);
+	}
+
 	/// (44c) Twomey wet albedo, d = 0..2: d <= 1 moves toward one soaking step A / (1.77 - 0.77 A),
 	/// above 1 a second step on top (the same formula again), so a "darker than soaked" slider
 	/// stays a plausible colour.
@@ -496,6 +522,10 @@ namespace Skin
 	// derivatives are defined.
 	float FBMFootprint(float2 uv, float uv_pixel_footprint, float base_scale, int octaves, float lacunarity, float persistence, float z_offset_multiplier)
 	{
+		// (47c) Skip Invisible Work: an octave faded out completely (octave_filter == 0) adds
+		// lerp(0.5, n, 0) = 0.5 exactly, so its noise is not evaluated. With Lacunarity < 1 the
+		// first octave is the finest, so the skipped ones are not at the end of the loop.
+		const bool skipFaded = WetSkipInvisible();
 		float total = 0.0;
 		float frequency = base_scale;
 		float amplitude = 1.0;
@@ -509,9 +539,91 @@ namespace Skin
 			// instead of a temporally unstable point sample. Scale, lacunarity and
 			// persistence still control the same frequency/amplitude progression.
 			const float octave_filter = 1.0f - smoothstep(0.25f, 0.5f, pixel_footprint);
-			const float octave_noise = (Random::perlinNoise(float3(octave_uv, (float)i * z_offset_multiplier)) + 1.0f) * 0.5f;
-			total += amplitude * lerp(0.5f, octave_noise, octave_filter);
-			
+			float octave_value = 0.5f;
+			[branch] if (!skipFaded || octave_filter > 0.0f)
+			{
+				const float octave_noise = (Random::perlinNoise(float3(octave_uv, (float)i * z_offset_multiplier)) + 1.0f) * 0.5f;
+				octave_value = lerp(0.5f, octave_noise, octave_filter);
+			}
+			total += amplitude * octave_value;
+
+			max_amplitude += amplitude;
+			amplitude *= persistence;
+			frequency *= lacunarity;
+		}
+		if (max_amplitude > 0.0) {
+			return total / max_amplitude;
+		}
+		return 0.0;
+	}
+
+	// ---- (47c) Faster Noise: a 2D gradient noise on a cheap integer hash -------------------------
+	//
+	// Replaces the 5-octave 3D murmur3 Perlin of the wet patches (New model, skin and gear) when
+	// "Wetness: Faster Noise & Distance LOD" is on. Same uv (mesh uv: stays put on a moving
+	// character), same Scale / Lacunarity / Persistence / footprint fade; each octave has its own
+	// seed (the old one had its own z slice). Per-octave gain: the old octave's spread (std of the
+	// 0..1 value, 0.124-0.134, measured over 400k samples) over this noise's (0.086), so the patch
+	// statistics match: the wet fraction at a given wetness is within about 0.01 of the old one
+	// (user's 256 / 0.6 / 2, and the defaults). The patches are in other places.
+	// Cost (fxc /O3, all 5 octaves resolved): 221 instruction slots, about 400 scalar ops, instead of
+	// 657 slots, about 1010 scalar ops (8 murmur3 hashes, 8 gradient lookups, a trilinear blend per octave).
+
+	/// One xorshift-multiply-xorshift round (the first half of Wellons' lowbias32): enough for
+	/// gradients (neighbour and seed correlation of the gradient below 0.005 over 200k cells).
+	uint WetHashMix(uint h)
+	{
+		h ^= h >> 16;
+		h *= 0x7feb352du;
+		h ^= h >> 15;
+		return h;
+	}
+
+	/// The corner's gradient (two signed 16-bit halves of the hash, -1..1 each) dotted with d.
+	float WetGrad2(uint h, float2 d)
+	{
+		const float2 g = float2(float(int(h << 16) >> 16) * (1.0 / 32768.0), float(int(h)) * (1.0 / 2147483648.0));
+		return dot(g, d);
+	}
+
+	/// 2D gradient noise, about -0.7..0.7 (std 0.17), lattice of 1.
+	float WetGradientNoise2(float2 p, uint seed)
+	{
+		const float2 cell = floor(p);
+		const float2 f = p - cell;
+		const uint2 i = asuint(int2(cell));
+		const uint hx0 = i.x * 0x8da6b343u;
+		const uint hx1 = hx0 + 0x8da6b343u;
+		const uint hy0 = i.y * 0xd8163841u + seed * 0xcb1ab31fu;
+		const uint hy1 = hy0 + 0xd8163841u;
+		const float v00 = WetGrad2(WetHashMix(hx0 + hy0), f);
+		const float v10 = WetGrad2(WetHashMix(hx1 + hy0), f - float2(1.0, 0.0));
+		const float v01 = WetGrad2(WetHashMix(hx0 + hy1), f - float2(0.0, 1.0));
+		const float v11 = WetGrad2(WetHashMix(hx1 + hy1), f - float2(1.0, 1.0));
+		const float2 u = f * f * (3.0 - 2.0 * f);
+		return lerp(lerp(v00, v10, u.x), lerp(v01, v11, u.x), u.y);
+	}
+
+	/// FBMFootprint with WetGradientNoise2 (5 octaves, the wet patches' z offset is not needed).
+	float FBMFootprintFast(float2 uv, float uv_pixel_footprint, float base_scale, float lacunarity, float persistence)
+	{
+		static const float kOctaveGain[5] = { 1.427, 1.514, 1.465, 1.431, 1.544 };
+		const bool skipFaded = WetSkipInvisible();
+		float total = 0.0;
+		float frequency = base_scale;
+		float amplitude = 1.0;
+		float max_amplitude = 0.0;
+		[unroll] for (int i = 0; i < 5; i++)
+		{
+			const float pixel_footprint = uv_pixel_footprint * abs(frequency);
+			const float octave_filter = 1.0f - smoothstep(0.25f, 0.5f, pixel_footprint);
+			float octave_value = 0.5f;
+			[branch] if (!skipFaded || octave_filter > 0.0f)
+			{
+				const float octave_noise = saturate(0.5f + 0.5f * kOctaveGain[i] * WetGradientNoise2(uv * frequency, (uint)i));
+				octave_value = lerp(0.5f, octave_noise, octave_filter);
+			}
+			total += amplitude * octave_value;
 			max_amplitude += amplitude;
 			amplitude *= persistence;
 			frequency *= lacunarity;
@@ -602,6 +714,17 @@ namespace Skin
 		return lerp(lerp(WetHash12(i), WetHash12(i + float2(1, 0)), u.x), lerp(WetHash12(i + float2(0, 1)), WetHash12(i + float2(1, 1)), u.x), u.y);
 	}
 
+	/// (44c) Wet hair clumps: l along the strands, s across them in clumps (both from uv). x: 0..1
+	/// across the clump; r: the clump's random highlight offset, -0.5..0.5. (47c) A function so Skip
+	/// Invisible Work can run it only where the hair is wet.
+	void WetHairClump(float l, float s, out float x, out float r)
+	{
+		s += 0.7 * (WetValueNoise(float2(l * 3.0, s * 0.1)) - 0.5);
+		const float id = floor(s);
+		x = s - id;
+		r = WetHash12(float2(id, 7.31)) - 0.5;
+	}
+
 	/// Soft wet patches: the Perlin noise (Scale / Lacunarity / Persistence) against a threshold that
 	/// falls as the wetness rises, through a wide smoothstep. Patches grow and merge; at full wetness
 	/// the coverage is 1 everywhere. Contrast blends between an even film (0) and the patches (1).
@@ -613,7 +736,13 @@ namespace Skin
 			return 0.0;
 		if (contrast <= 0.0 || wetness >= 1.0)
 			return wetness;
-		const float noise = saturate((FBMFootprint(uv, uvFootprint, scale, 5, lacunarity, persistence, 7.375f) - 0.5) * 3.0 + 0.5);
+		// (47c) Faster Noise: the 2D gradient FBM (same parameters, matched statistics).
+		float fbm;
+		[branch] if (WetFastNoiseLOD())
+			fbm = FBMFootprintFast(uv, uvFootprint, scale, lacunarity, persistence);
+		else
+			fbm = FBMFootprint(uv, uvFootprint, scale, 5, lacunarity, persistence, 7.375f);
+		const float noise = saturate((fbm - 0.5) * 3.0 + 0.5);
 		const float threshold = lerp(1.0 + softness, -softness, wetness);
 		const float patches = smoothstep(threshold - softness, threshold + softness, noise);
 		return wetness * lerp(1.0, patches, contrast);
@@ -722,7 +851,8 @@ namespace Skin
 	/// rivulet-making water there is. Two families (along u, along v) are blended by how gravity runs
 	/// in uv, so the pattern stays put on the mesh and still runs downhill. They fade only when a
 	/// rivulet would be narrower than about a pixel.
-	float WetSkinRivulets(float2 uv, float columnsPerUV, float uvFootprint, float2 gravityUV, float alignment, float driver)
+	/// (47c) lod: the distance LOD (WetDetailLOD, 1 when off), multiplied into the result.
+	float WetSkinRivulets(float2 uv, float columnsPerUV, float uvFootprint, float2 gravityUV, float alignment, float driver, float lod)
 	{
 		const float amount = saturate(wetSkinParams[4].y) * driver * alignment;
 		float streak = 0.0;
@@ -732,28 +862,70 @@ namespace Skin
 			const float width = clamp(wetSkinParams[4].w, 0.1, 3.0);
 			const float2 p = uv * (columnsPerUV / width);
 			const float aFoot = max(uvFootprint * columnsPerUV / width, 1e-6);
-			// (44e) Contrast (RivuletContrast2): higher = more of each trail runs unbroken, so the trails
-			// read more clearly against the skin. 44b-44d raised the segment threshold with Contrast
-			// (fewer, broken trails), which is why a high value looked weaker. Same range, reversed:
-			// new = 1 - old gives exactly the old threshold. The film between the trails is a
-			// separate setting now (WetSkinFilm, Between-Trail Dulling).
-			const float threshold = lerp(0.68, 0.48, saturate(wetSkinParams[5].x));
-			const float2 g2 = gravityUV * gravityUV;
-			const float wU = g2.x / max(g2.x + g2.y, 1e-4);
-			float lines = 0.0;
-			[branch] if (wU < 0.999)
-				lines += (1.0 - wU) * WetRivuletField(p.x, p.y, aFoot, lengthScale, threshold, 31.7);
-			[branch] if (wU > 0.001)
-				lines += wU * WetRivuletField(p.y, p.x, aFoot, lengthScale, threshold, 7.3);
 			// A rivulet is about 0.26 column wide: fade below about a pixel.
 			const float linePixels = 0.26 / aFoot;
-			streak = saturate(lines) * amount * smoothstep(0.5, 1.2, linePixels);
+			const float lineFade = smoothstep(0.5, 1.2, linePixels);
+			// (47c) Skip Invisible Work: narrower than half a pixel (lineFade == 0) or past the
+			// distance LOD, the product below is exactly 0 (the fields are finite): not evaluated.
+			[branch] if (!WetSkipInvisible() || (lineFade > 0.0 && lod > 0.0))
+			{
+				// (44e) Contrast (RivuletContrast2): higher = more of each trail runs unbroken, so the trails
+				// read more clearly against the skin. 44b-44d raised the segment threshold with Contrast
+				// (fewer, broken trails), which is why a high value looked weaker. Same range, reversed:
+				// new = 1 - old gives exactly the old threshold. The film between the trails is a
+				// separate setting now (WetSkinFilm, Between-Trail Dulling).
+				const float threshold = lerp(0.68, 0.48, saturate(wetSkinParams[5].x));
+				const float2 g2 = gravityUV * gravityUV;
+				const float wU = g2.x / max(g2.x + g2.y, 1e-4);
+				float lines = 0.0;
+				[branch] if (wU < 0.999)
+					lines += (1.0 - wU) * WetRivuletField(p.x, p.y, aFoot, lengthScale, threshold, 31.7);
+				[branch] if (wU > 0.001)
+					lines += wU * WetRivuletField(p.y, p.x, aFoot, lengthScale, threshold, 7.3);
+				streak = saturate(lines) * amount * lineFade * lod;
+			}
 		}
 		return streak;
 	}
 
 #endif  // PSHADER (44c: the wet helpers are shared by skin, hair and gear)
 #if defined(SKIN)
+	/// (47c) Everything the skin's droplets and rivulets need, gathered where the screen derivatives
+	/// are known, so the work itself can run later: after the sky occlusion (Lighting.hlsl), where
+	/// a skin under a roof with only rain on it can leave it out.
+	struct SkinWetDetailSetup
+	{
+		float2 wetUV;
+		float2 cellUV;
+		float footprint;      // droplet cells per pixel
+		float uvFootprint;    // wet uv per pixel
+		float2 gravityUV;
+		float alignment;
+		float presence;
+		float dropVisibility;
+		float streakDriver;   // droplet trails
+		float rivuletColumnsPerUV;
+		float rivuletDriver;  // streak driver x Rivulets on the Face
+		float lod;            // distance LOD (1 when off)
+		float3 baseN;
+		float3 tu;
+		float3 tv;
+		float domeStrength;
+	};
+
+	/// (47c) The 44a-44e skin droplets and rivulets, unchanged, from a SkinWetDetailSetup.
+	void SkinWetDetail(SkinWetDetailSetup s, out float dropMask, out float dropRim, out float streak, out float3 wetN)
+	{
+		const WetSkinDetail detail = WetSkinDroplets(s.cellUV, s.footprint, s.gravityUV, s.alignment, s.presence, s.streakDriver);
+		dropMask = detail.dropMask * s.dropVisibility;
+		dropRim = detail.dropRim * dropMask;
+		// (44b) Rivulets on their own scale (they used the droplet cells, about 1/800 uv wide, and
+		// faded out below a pixel at any normal viewing distance).
+		const float rivulets = WetSkinRivulets(s.wetUV, s.rivuletColumnsPerUV, s.uvFootprint, s.gravityUV, s.alignment, s.rivuletDriver, s.lod);
+		streak = saturate(max(rivulets, detail.trail * 0.8 * s.dropVisibility));
+		wetN = normalize(s.baseN + (detail.dropSlope.x * s.tu + detail.dropSlope.y * s.tv) * s.domeStrength * dropMask);
+	}
+
 	/// How far the skin darkens toward its soaked colour (0..1): follows the soft coverage, plus
 	/// (44b) clearly along rivulets (more water standing in the skin's micro-relief) and at the
 	/// droplets' edges (their refractive rim).

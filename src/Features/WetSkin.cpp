@@ -69,6 +69,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	MetalDroplets,
 	MetalRivulets,
 	TranslucentUnderWater,
+	SkipInvisibleWork,
+	FasterNoiseLOD,
 	UnderWaterTint)
 
 namespace
@@ -160,7 +162,8 @@ WetSkin::GPUParams WetSkin::GetGPUParams() const
 	g.c[8] = classParams(s.GearLeather);
 	g.c[9] = classParams(s.GearMetal);
 	g.c[10] = classParams(s.GearFur);
-	g.c[11] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	// (47c) x: Skip Invisible Work, y: Faster Noise & Distance LOD (Skin.hlsli WetSkipInvisible / WetFastNoiseLOD).
+	g.c[11] = float4(s.SkipInvisibleWork ? 1.0f : 0.0f, s.FasterNoiseLOD ? 1.0f : 0.0f, 0.0f, 0.0f);
 	return g;
 }
 
@@ -194,6 +197,16 @@ void WetSkin::DrawSettings()
 		"that gets strong when soaked (never a mirror), droplets, rivulets, darkening per material.",
 		"Legacy (pre-42c): every character exactly as before the wetness work (41b): skin, hair and gear.",
 		"Only safety limits are kept." });
+
+	// (47c) Performance switches (not saved in presets).
+	ImGui::Checkbox("Wetness: Skip Invisible Work", &s.SkipInvisibleWork);
+	Tooltip({ "Same picture, less GPU work: skips noise layers too fine to see, rivulets thinner than half a pixel,",
+		"rain droplets and rivulets on skin under a roof (when rain is the only water), dry hair's clump pattern,",
+		"the see-through-clothes depth copy while nobody is in water. Off = as in 47b." });
+	ImGui::Checkbox("Wetness: Faster Noise & Distance LOD", &s.FasterNoiseLOD);
+	Tooltip({ "Advanced model. A much cheaper noise for the wet patches (skin and gear): same sliders, same look on average,",
+		"the patches sit in other places. Droplets and rivulets fade out on characters far away (about 13 m and farther);",
+		"their wet sheen and darkening stay. Off = as in 47b." });
 
 	// (46a) User presets (the built-in Natural / Drenched looks were removed).
 	DrawPresets();
@@ -529,6 +542,9 @@ bool WetSkin::SavePreset(const std::string& a_name)
 	json j;
 	j["preset_name"] = name;
 	j["settings"] = settings;
+	// (47c) The performance switches are not part of a look.
+	j["settings"].erase("SkipInvisibleWork");
+	j["settings"].erase("FasterNoiseLOD");
 	try {
 		std::ofstream o{ PresetFile(name) };
 		if (!o)
@@ -561,6 +577,8 @@ bool WetSkin::LoadPreset(const std::string& a_name)
 	try {
 		json merged = settings;
 		merged.update(values);
+		merged["SkipInvisibleWork"] = settings.SkipInvisibleWork;  // (47c) not part of a look
+		merged["FasterNoiseLOD"] = settings.FasterNoiseLOD;
 		settings = merged.get<Settings>();
 	} catch (const std::exception& e) {
 		logger::warn("[Character Wetness] Preset \"{}\" is not valid: {}", a_name, e.what());

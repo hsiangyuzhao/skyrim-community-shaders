@@ -674,6 +674,8 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 	// (46d) The local water surface (never the cell's default water plane), shared with the snow.
 	const WaterSample water = SampleWater(actor);
 	const bool inWater = water.inWater;
+	if (inWater)
+		actorInWaterFrame = frame;  // (47c) the see-through-clothes depth copy is needed
 	const float positionZ = water.feetZ;
 	const float depth = water.depth;
 
@@ -1117,11 +1119,21 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 		// (44a) Wet Skin settings ride along (they change rarely; the buffer is only rewritten
 		// when something in it changed).
 		const auto& wetSkin = globals::features::wetSkin;
-		const auto params = wetSkin.GetGPUParams();
+		// (47c) Skip Invisible Work: the settings are turned into GPU values once per frame (a change
+		// in the menu shows from the next frame on); off: on every draw, as before.
+		const uint32_t paramsFrame = globals::state->frameCount;
+		if (!wetSkin.settings.SkipInvisibleWork || wetParamsCacheFrame != paramsFrame) {
+			const auto params = wetSkin.GetGPUParams();
+			for (int i = 0; i < 6; ++i)
+				wetSkinParamsCache[i] = params.p[i];
+			for (int i = 0; i < 12; ++i)
+				wetCharParamsCache[i] = params.c[i];
+			wetParamsCacheFrame = wetSkin.settings.SkipInvisibleWork ? paramsFrame : UINT32_MAX;
+		}
 		for (int i = 0; i < 6; ++i)
-			perGeometryData.wetSkinParams[i] = params.p[i];
+			perGeometryData.wetSkinParams[i] = wetSkinParamsCache[i];
 		for (int i = 0; i < 12; ++i)
-			perGeometryData.wetCharParams[i] = params.c[i];
+			perGeometryData.wetCharParams[i] = wetCharParamsCache[i];
 		// (44f) Item class prior from the keywords of the worn item this geometry belongs to.
 		if (lastWetState && !wetSkin.IsOriginal() && wetSkin.settings.GearEnabled && wetSkin.settings.GearModel == 0 && wetSkin.settings.GearKeywords) {
 			auto userData = geometry->GetUserData();
@@ -1281,7 +1293,11 @@ void Skin::OnDrawStatesApplied(ID3D11DeviceContext* a_context)
 
 	if (shader->shaderType.get() == RE::BSShader::Type::Water) {
 		// The first water draw after this frame's opaque pass: keep the depth from before it.
-		if (preWaterDepthFrame != frame && endDeferredFrame == frame) {
+		// (47c) Skip Invisible Work: only when a character was in water this frame or the last one
+		// (the last frame covers one whose draws all come after the water); nobody in water = no
+		// draw is ever swapped (GetWaterDepthParams), so the full-screen copy was unused.
+		const bool someoneInWater = actorInWaterFrame != UINT32_MAX && frame - actorInWaterFrame <= 1;
+		if (preWaterDepthFrame != frame && endDeferredFrame == frame && (someoneInWater || !globals::features::wetSkin.settings.SkipInvisibleWork)) {
 			ID3D11DepthStencilView* dsv = nullptr;
 			a_context->OMGetRenderTargets(0, nullptr, &dsv);
 			CopyPreWaterDepth(a_context, dsv);
