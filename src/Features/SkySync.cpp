@@ -937,6 +937,12 @@ inline void SkySync::CalculateAlternateSunDirectionAndDistance(RE::NiPoint3& out
 
 RE::NiPoint3 SkySync::GetApparentDirection(const RE::NiPoint3& dir, const float altitude)
 {
+	// (47a2) Sky Fixes: no altitude dip (upstream removed it in 54962ef3b). The sun disc, the light and the
+	// moons' light use the true direction, which is what Physical Sky's planet model already assumes; the LUTs
+	// used the true height since 41b, so the procedural disc (sunAlignToVanilla) and its glow still sit on
+	// the vanilla quad.
+	if (SkyFixesActive())
+		return dir;
 	const float dipAngle = -std::atan(altitude / RenderDistance);
 	float sinPhi, cosPhi;
 	DirectX::XMScalarSinCosEst(&sinPhi, &cosPhi, dipAngle);
