@@ -1,6 +1,7 @@
 #include "Deferred.h"
 #include "EngineFixes/WndProcPseudoHandleFix.h"
 #include "Features/Skin.h"
+#include "Features/SkySync.h"
 #include "Features/Upscaling.h"
 #include "FrameAnnotations.h"
 #include "Globals.h"
@@ -114,6 +115,9 @@ void MessageHandler(SKSE::MessagingInterface::Message* message)
 			// (46d) Per-character snow (Advanced Skin) starts afresh with the loaded game.
 			if (errors.empty() && globals::features::skin.loaded)
 				globals::features::skin.OnGameLoaded();
+			// (47a2) Sky Sync's cell / sky rotation caches start afresh with the loaded game.
+			if (errors.empty() && globals::features::skySync.loaded)
+				globals::features::skySync.OnGameLoaded();
 			break;
 		}
 	case SKSE::MessagingInterface::kDataLoaded:

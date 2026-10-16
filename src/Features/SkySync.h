@@ -67,6 +67,9 @@ public:
 		/// (42b) Combined: both moons add their light (Secunda at 0.67, by phase). Off: only the moon
 		/// picked by "Moon light source" (Brightest = a smooth blend that is as bright as the brighter).
 		bool BothMoonsLight = false;
+		/// (47a2, upstream) Worldspaces where Sky Sync leaves the light to the game (editor IDs, any case).
+		/// Editable in the JSON only. Realms whose weathers keep the same light round the clock.
+		std::vector<std::string> DisabledWorldspaces = { "Blackreach", "AlftandWorld", "Sovngarde", "DLC01SoulCairn", "DLC01Boneyard", "DLC2ApocryphaWorld" };
 	};
 
 	Settings settings;
@@ -86,6 +89,8 @@ public:
 
 	virtual void PostPostLoad() override;
 	virtual void DataLoaded() override;
+	/// (47a2) Called on kPostLoadGame / kNewGame: drops the cached cell and sky rotation.
+	void OnGameLoaded();
 
 	struct Sky_Update
 	{
@@ -273,6 +278,21 @@ private:
 
 	bool moonAndStarsLoaded = false;
 	RE::TESObjectCELL* currentCell = nullptr;
+	// (47a2) What the cached cell was, so the old (maybe unloaded) cell is never dereferenced.
+	bool currentCellValid = false;
+	bool currentCellInterior = false;
+	const RE::TESWorldSpace* currentCellWorldspace = nullptr;
+	// (47a2) Sky Sync is leaving the light to the game (light fade and the volumetric factor restored once).
+	bool lightReleased = false;
+	const RE::TESWorldSpace* disabledCacheWorldspace = nullptr;
+	bool disabledCacheResult = false;
+	bool disabledCacheValid = false;
+	/// (47a2) Why this frame is left to the game: no cell, an interior without sunlight shadows, a disabled
+	/// worldspace. False = Sky Sync runs.
+	bool SkipReason(const RE::PlayerCharacter* a_player);
+	// (47a2) Menu "Status": strengths of the Combined model this frame (sun, Masser, Secunda) and its body.
+	float lastStrength[3] = {};
+	int lastDominant = 3;
 	float sunAngle = 90.0f;
 	float currentSkyRotation = D3D11_FLOAT32_MAX;
 	float masserPhaseIntensityFactor = 0.0f;
@@ -321,6 +341,11 @@ private:
 
 	static void SetSunBaseVisibility(const RE::Sun* sun, float visibility);
 
+	/// (47a2, upstream CalculateVanillaSunDirection) The game's own sun arc with the alternate path off, but
+	/// with its night half below the horizon (the engine mirrors it above, so a sun was seen at night).
+	static void PutVanillaNightBelowHorizon(RE::NiPoint3& dir, float hour, const RE::TESClimate::Timing& timing);
+	inline static RE::Setting* gSunAlphaTransTime = nullptr;
+
 	/// (40d, 40e) Writes the orbit angle (Moon+0xCC) for the Stable or Night Sky orbit and sets
 	/// the last hour (+0xD0) to the current hour, so the engine's own update adds nothing.
 	/// SE 1.5.97 only.
@@ -347,21 +372,23 @@ public:
 	/// (47a) Physical Sky's "Sky Fixes" is on (Physical Sky loaded and enabled, not Legacy (36f)).
 	static bool SkyFixesActive();
 
-	/// (47a) Sky Fixes timing. The phase of the alternate sun path is warped through the climate's
-	/// colour keys (monotone C1 PCHIP), so the physical sun sits at -12 degrees when the weather starts
-	/// to leave its night colours, at 0 where its sunrise colours peak, at +12 where it is full day,
-	/// at the top of the path at noon, and mirrored in the evening. Pure function of the hour and the
-	/// climate timing; invalid (= the 46y formula) for all-zero, overlapping, inverted or crowded
-	/// windows and for paths flatter than 10 degrees.
+	/// (47a) Sky Fixes timing, (47a2) warped only below the horizon. The sun sits at -12 degrees when
+	/// the weather starts to leave its night colours (csb) and at 0 where its sunrise colours peak (midR,
+	/// which is also where the 46y uniform path rises); between midR and midS it moves uniformly along
+	/// its path exactly as in 46y (fastest climb at the horizon, none at noon). The pieces below the
+	/// horizon are monotone curves that meet the uniform motion at the same rate (C1); the night joins
+	/// them smoothly round midnight. Pure function of the hour and the climate timing; invalid (= the 46y
+	/// formula) for all-zero, overlapping, inverted or crowded windows and for paths flatter than 10 deg.
 	struct SunWarp
 	{
-		static constexpr int KnotCount = 10;
 		static constexpr double NightElevation = -12.0;  // degrees, at the start of the colour change
-		static constexpr double DayElevation = 12.0;     // degrees, where the day colours are full
 		bool valid = false;
-		double x[KnotCount] = {};  // hours (the first and the last two wrap round the day)
-		double y[KnotCount] = {};  // path phase, radians
-		double m[KnotCount] = {};  // PCHIP slopes
+		double csb = 0.0, midR = 0.0, midS = 0.0, cse = 0.0;  // key hours (csb in [0, 24))
+		double pn = 0.0;    // path phase at NightElevation (negative), radians
+		double rate = 0.0;  // uniform phase rate between midR and midS, radians per hour
+		double riseBeta = 0.0, setBeta = 0.0;      // horizon rate / mean rate of the piece below the horizon
+		bool risePower = false, setPower = false;  // ratio above 4: t^beta (a pause at -12 deg), else a cubic
+		double nightM0 = 0.0, nightM1 = 0.0;       // night piece slopes at cse and at csb + 24, radians per hour
 		// What the knots were built from; Build() is a no-op while these match.
 		bool built = false;
 		uint8_t key[4] = {};

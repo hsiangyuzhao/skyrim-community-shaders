@@ -11,7 +11,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	UseAlternateSunPath,
 	MoonLightSource,
 	SunPath,
-	CustomAngle)
+	CustomAngle,
+	DisabledWorldspaces)  // (47a2)
 // (44h) removed MoonOrbit, MasserNightPosition, SecundaNightPosition, NightArc, KeepMoonPosition,
 // LightSourceModel, BothMoonsLight: pinned in Effective() (Stable orbit, discs kept, Combined, both
 // moons); the Night Sky sliders only applied to the Night Sky orbit. Old keys are ignored on load.
@@ -30,6 +31,12 @@ void SkySync::DrawSettings()
 			SetSunAngle();
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Southern/Northern Sky: the sun path tilts 35 degrees to that side for longer, more angled shadows. Vanilla: Skyrim's near-overhead path.");
+		// (47a2) Read-only: the latitude whose equinox sun follows this path (noon height = 90 - |latitude|).
+		{
+			const float latitude = 90.0f - sunAngle;
+			ImGui::SameLine();
+			ImGui::TextDisabled("~ latitude %.0f deg %s (equinox)", std::abs(latitude), latitude >= 0.0f ? "N" : "S");
+		}
 
 		if (settings.SunPath == static_cast<int32_t>(SunPath::Custom)) {
 			if (ImGui::SliderFloat("Custom angle", &settings.CustomAngle, -90.0f, 90.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp))
@@ -48,6 +55,31 @@ void SkySync::DrawSettings()
 	// possible rollback (specs/physsky-rollback-candidates.md).
 	if (globals::features::physicalSky.IsLegacy())
 		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Physical Sky's Sky Model is Legacy (36f): moons and moonlight work as in 36f right now.");
+
+	// (47a2) Read-only status.
+	if (ImGui::TreeNode("Status")) {
+		auto clock = [](double a_hour) {
+			double h = std::fmod(a_hour, 24.0);
+			if (h < 0.0)
+				h += 24.0;
+			const int minutes = static_cast<int>(std::lround(h * 60.0)) % (24 * 60);
+			return fmt::format("{:02}:{:02}", minutes / 60, minutes % 60);
+		};
+		const auto& sunDir = rawDirections[static_cast<int>(Caster::Sun)];
+		ImGui::Text("Sun true elevation: %.1f deg", DirectX::XMConvertToDegrees(std::asin(std::clamp(sunDir.z, -1.0f, 1.0f))));
+		if (!SkyFixesActive() || !settings.UseAlternateSunPath)
+			ImGui::Text("Timing: 46y (Sky Fixes off or alternate path off)");
+		else if (!sunWarp.valid)
+			ImGui::Text("Timing: 46y (this climate's windows cannot be warped)");
+		else
+			ImGui::Text("Timing: -12 deg %s, 0 deg %s, noon %s, 0 deg %s, -12 deg %s", clock(sunWarp.csb).c_str(), clock(sunWarp.midR).c_str(),
+				clock((sunWarp.midR + sunWarp.midS) * 0.5).c_str(), clock(sunWarp.midS).c_str(), clock(sunWarp.cse).c_str());
+		static constexpr const char* bodyNames[4] = { "Sun", "Masser", "Secunda", "None" };
+		ImGui::Text("Light: %s (sun %.2f, Masser %.2f, Secunda %.2f)", bodyNames[std::clamp(lastDominant, 0, 3)], lastStrength[0], lastStrength[1], lastStrength[2]);
+		if (const auto* sky = RE::Sky::GetSingleton())
+			ImGui::Text("Moon phase brightness: Masser %.2f, Secunda %.2f", PhaseFactorFromTexture(sky->masser), PhaseFactorFromTexture(sky->secunda));
+		ImGui::TreePop();
+	}
 }
 
 SkySync::Settings SkySync::Effective() const
@@ -79,6 +111,11 @@ void SkySync::LoadSettings(json& o_json)
 	settings.SecundaNightPosition = std::clamp(settings.SecundaNightPosition, -60.0f, 60.0f);
 	settings.NightArc = std::clamp(settings.NightArc, 0.0f, 140.0f);
 	settings.LightSourceModel = std::clamp(settings.LightSourceModel, 0, static_cast<int32_t>(LightSourceModel::Count) - 1);
+	// (47a2) A broken or out-of-range angle from the JSON: back to the default / into range.
+	if (!std::isfinite(settings.CustomAngle))
+		settings.CustomAngle = Settings{}.CustomAngle;
+	settings.CustomAngle = std::clamp(settings.CustomAngle, -90.0f, 90.0f);
+	disabledCacheValid = false;
 	SetSunAngle();
 }
 
@@ -90,6 +127,7 @@ void SkySync::SaveSettings(json& o_json)
 void SkySync::RestoreDefaultSettings()
 {
 	settings = {};
+	disabledCacheValid = false;
 	SetSunAngle();
 }
 
@@ -122,6 +160,42 @@ void SkySync::DataLoaded()
 	const auto data = RE::TESDataHandler::GetSingleton();
 	if (data && (data->LookupLoadedModByName("DVLaSS.esp"sv) || data->LookupLoadedLightModByName("DVLaSS.esp"sv)))
 		DisableOnConflict("DVLaSS");
+
+	// (47a2) For the vanilla arc's night half (alternate path off).
+	if (const auto collection = RE::GameSettingCollection::GetSingleton())
+		gSunAlphaTransTime = collection->GetSetting("fSunAlphaTransTime");
+}
+
+void SkySync::OnGameLoaded()
+{
+	// (47a2) The cell pointers of the last game may be gone: start the cell and sky rotation caches afresh.
+	currentCell = nullptr;
+	currentCellValid = false;
+	currentCellInterior = false;
+	currentCellWorldspace = nullptr;
+	currentSkyRotation = D3D11_FLOAT32_MAX;
+	disabledCacheValid = false;
+	shadowFader.Reset();
+	combinedHandover.Reset();
+}
+
+bool SkySync::SkipReason(const RE::PlayerCharacter* a_player)
+{
+	const auto* cell = a_player ? a_player->GetParentCell() : nullptr;
+	if (!cell)
+		return true;
+	if (cell->IsInteriorCell())
+		return !cell->cellFlags.all(static_cast<RE::TESObjectCELL::Flag>(1u << 15));  // "sunlight shadows", as Interior Sun
+	const RE::TESWorldSpace* worldspace = cell->GetRuntimeData().worldSpace;
+	if (!worldspace)
+		return false;
+	if (!disabledCacheValid || worldspace != disabledCacheWorldspace) {
+		disabledCacheValid = true;
+		disabledCacheWorldspace = worldspace;
+		const char* editorID = worldspace->GetFormEditorID();
+		disabledCacheResult = editorID && *editorID && std::ranges::any_of(settings.DisabledWorldspaces, [editorID](const std::string& a_listed) { return _stricmp(a_listed.c_str(), editorID) == 0; });
+	}
+	return disabledCacheResult;
 }
 
 void SkySync::DisableOnConflict(std::string_view conflictName)
@@ -150,13 +224,36 @@ void SkySync::Update(const RE::Sky* sky)
 		return;
 
 	if (const auto cell = player->GetParentCell(); cell != currentCell) {
-		SetSkyRotation(sky, cell);
-		if (currentCell && (cell->IsInteriorCell() != currentCell->IsInteriorCell() || cell->GetRuntimeData().worldSpace != currentCell->GetRuntimeData().worldSpace))
-			{
+		// (47a2, upstream a59c212f7) Never dereference a null cell or the previous (possibly unloaded) one:
+		// the cell's kind and worldspace are cached instead.
+		const bool hadCell = currentCellValid;
+		const bool wasInterior = currentCellInterior;
+		const auto* oldWorldspace = currentCellWorldspace;
+		if (cell) {
+			SetSkyRotation(sky, cell);
+			if (hadCell && (cell->IsInteriorCell() != wasInterior || cell->GetRuntimeData().worldSpace != oldWorldspace)) {
 				shadowFader.Reset();
 				combinedHandover.Reset();
 			}
+		} else {
+			currentCell = nullptr;
+			currentCellValid = false;
+		}
 	}
+
+	// (47a2, upstream a59c212f7 + DisabledWorldspaces) Leave the light to the game when there is no cell,
+	// in an interior without the sunlight-shadows flag, or in a worldspace listed as disabled.
+	if (const auto skip = SkipReason(player); skip) {
+		if (!lightReleased) {
+			if (sun->light)
+				sun->light->GetLightRuntimeData().fade = 1.0f;
+			volumetricLightingIntensityFactor = 1.0f;
+			volumetricLightingIsMoon = false;
+			lightReleased = true;
+		}
+		return;
+	}
+	lightReleased = false;
 
 	const float time = sky->currentGameHour;
 	const bool isDayTime = time > timings.sunriseFadeOutMoonEnd && time < timings.sunsetFadeInMoonStart;
@@ -237,73 +334,120 @@ void SkySync::SunWarp::Build(const RE::TESClimate::Timing& a_timing, const float
 
 	// The engine's colour keys: night until sunrise begin - fDaytimeColorExtension (clamped at 0), sunrise
 	// colours peak half way to sunrise end, day from sunrise end to sunset begin, sunset colours peak half
-	// way to sunset end + extension (clamped at 23.99), night after that.
+	// way to sunset end + extension (clamped at 23.99), night after that. Unclamped, midR and midS are the
+	// 46y path's own horizon crossings ((begin + end) / 2 -+ a quarter hour).
 	const double ext = a_colorExtension;
-	const double csb = std::max(0.0, srb - ext);
-	const double cse = std::min(23.99, sse + ext);
-	const double midR = csb + (sre - csb) * 0.5;
-	const double midS = ssb + (cse - ssb) * 0.5;
-	const double noon = (midR + midS) * 0.5;
+	const double keyCsb = std::max(0.0, srb - ext);
+	const double keyCse = std::min(23.99, sse + ext);
+	const double keyMidR = keyCsb + (sre - keyCsb) * 0.5;
+	const double keyMidS = ssb + (keyCse - ssb) * 0.5;
 
 	// Overlapping, inverted or crowded windows (polar days and nights, broken records): no warp.
 	constexpr double gap = 0.25;
-	if (!(csb + gap <= midR && midR + gap <= sre && sre + gap <= noon && noon + gap <= ssb && ssb + gap <= midS && midS + gap <= cse && cse + gap <= csb + 24.0))
+	if (!(keyCsb + gap <= keyMidR && keyMidR + gap <= sre && sre <= ssb && ssb + gap <= keyMidS && keyMidS + gap <= keyCse && keyCse + gap <= keyCsb + 24.0))
 		return;
 
-	// Elevation -> phase on the tilted path: sin(elevation) = sin(phase) sin(tilt). Targets are kept within
-	// 0.8 of the path's own maximum, so a low path still rises and sets smoothly.
+	// Elevation -> phase on the tilted path: sin(elevation) = sin(phase) sin(tilt). The night target is kept
+	// within 0.8 of the path's own maximum, so a low path still sets smoothly.
 	const double sinTilt = std::abs(std::sin(a_sunAngleDeg * (std::numbers::pi / 180.0)));
 	if (sinTilt < std::sin(10.0 * std::numbers::pi / 180.0))
 		return;
 	const double maxElevationDeg = std::asin(std::min(sinTilt, 1.0)) * (180.0 / std::numbers::pi);
-	auto phaseFor = [&](double a_elevationDeg) {
-		const double el = std::clamp(a_elevationDeg, -0.8 * maxElevationDeg, 0.8 * maxElevationDeg);
-		return std::asin(std::clamp(std::sin(el * (std::numbers::pi / 180.0)) / sinTilt, -1.0, 1.0));
-	};
-	const double pn = phaseFor(NightElevation);
-	const double pd = phaseFor(DayElevation);
-	constexpr double pi = std::numbers::pi;
+	const double el = std::clamp(NightElevation, -0.8 * maxElevationDeg, 0.8 * maxElevationDeg);
+	const double phaseNight = std::asin(std::clamp(std::sin(el * (std::numbers::pi / 180.0)) / sinTilt, -1.0, 1.0));
+	if (!(phaseNight < 0.0) || !(std::numbers::pi + 2.0 * phaseNight > 0.0))
+		return;
 
-	const double xs[KnotCount] = { cse - 24.0, csb, midR, sre, noon, ssb, midS, cse, csb + 24.0, midR + 24.0 };
-	const double ys[KnotCount] = { pi - pn - 2.0 * pi, pn, 0.0, pd, pi * 0.5, pi - pd, pi, pi - pn, 2.0 * pi + pn, 2.0 * pi };
-	std::copy(std::begin(xs), std::end(xs), std::begin(x));
-	std::copy(std::begin(ys), std::end(ys), std::begin(y));
+	// Uniform motion above the horizon (the path's natural rate), and the pieces below it: each ends at the
+	// horizon with that rate. Their shape: a cubic with unit relative slope at -12 deg while the horizon
+	// rate is at most 4x the piece's mean rate (monotone there by Fritsch-Carlson), else t^ratio.
+	const double rateUniform = std::numbers::pi / (keyMidS - keyMidR);
+	const double riseMean = -phaseNight / (keyMidR - keyCsb);
+	const double setMean = -phaseNight / (keyCse - keyMidS);
+	const double betaRise = rateUniform / riseMean;
+	const double betaSet = rateUniform / setMean;
+	const bool powerRise = betaRise > 4.0;
+	const bool powerSet = betaSet > 4.0;
+	// Phase rate at -12 deg (radians per hour) = relative slope there x the mean rate.
+	const double m1 = powerRise ? 0.0 : riseMean;
+	const double m0 = powerSet ? 0.0 : setMean;
 
-	// Monotone piecewise cubic Hermite (Fritsch-Butland weighted harmonic mean of the secants).
-	double delta[KnotCount - 1];
-	for (int i = 0; i < KnotCount - 1; ++i)
-		delta[i] = (y[i + 1] - y[i]) / (x[i + 1] - x[i]);
-	m[0] = delta[0];
-	m[KnotCount - 1] = delta[KnotCount - 2];
-	for (int i = 1; i < KnotCount - 1; ++i) {
-		if (delta[i - 1] * delta[i] <= 0.0) {
-			m[i] = 0.0;
-		} else {
-			const double w1 = 2.0 * (x[i + 1] - x[i]) + (x[i] - x[i - 1]);
-			const double w2 = (x[i + 1] - x[i]) + 2.0 * (x[i] - x[i - 1]);
-			m[i] = (w1 + w2) / (w1 / delta[i - 1] + w2 / delta[i]);
-		}
-	}
+	// The night piece (cse -> csb + 24): a cubic from pi - pn to 2 pi + pn with those end rates, monotone.
+	const double nightMean = (std::numbers::pi + 2.0 * phaseNight) / (keyCsb + 24.0 - keyCse);
+	const double a = m0 / nightMean, b = m1 / nightMean;
+	const bool monotone = (a + b - 2.0 <= 0.0) || (2.0 * a + b - 3.0 <= 0.0) || (a + 2.0 * b - 3.0 <= 0.0) ||
+	                      (a - (2.0 * a + b - 3.0) * (2.0 * a + b - 3.0) / (3.0 * (a + b - 2.0)) >= 0.0);
+	if (!monotone || !std::isfinite(rateUniform) || !std::isfinite(betaRise) || !std::isfinite(betaSet))
+		return;
+
+	csb = keyCsb;
+	midR = keyMidR;
+	midS = keyMidS;
+	cse = keyCse;
+	pn = phaseNight;
+	rate = rateUniform;
+	riseBeta = betaRise;
+	setBeta = betaSet;
+	risePower = powerRise;
+	setPower = powerSet;
+	nightM0 = m0;
+	nightM1 = m1;
 	valid = true;
+}
+
+namespace
+{
+	// Normalised monotone piece on [0, 1]: s(0) = 0, s(1) = 1, s'(1) = a_beta; s'(0) = 1 (cubic) or 0 (power).
+	double WarpPiece(double a_t, double a_beta, bool a_power)
+	{
+		const double t = std::clamp(a_t, 0.0, 1.0);
+		if (a_power)
+			return std::pow(t, a_beta);
+		const double t2 = t * t, t3 = t2 * t;
+		return (t3 - 2.0 * t2 + t) + (-2.0 * t3 + 3.0 * t2) + (t3 - t2) * a_beta;
+	}
 }
 
 double SkySync::SunWarp::Phase(double a_hour) const
 {
 	if (!std::isfinite(a_hour))
 		a_hour = 12.0;
-	// Into [csb, csb + 24): the knots cover that day once, plus a knot either side.
-	double h = std::fmod(a_hour - x[1], 24.0);
+	// Into [csb, csb + 24).
+	double h = std::fmod(a_hour - csb, 24.0);
 	if (h < 0.0)
 		h += 24.0;
-	h += x[1];
-	int k = 0;
-	while (k < KnotCount - 2 && h > x[k + 1])
-		++k;
-	const double span = x[k + 1] - x[k];
-	const double t = span > 0.0 ? (h - x[k]) / span : 0.0;
+	h += csb;
+	constexpr double pi = std::numbers::pi;
+	if (h <= midR)  // -12 deg -> horizon
+		return pn * (1.0 - WarpPiece((h - csb) / (midR - csb), riseBeta, risePower));
+	if (h <= midS)  // the 46y uniform path
+		return rate * (h - midR);
+	if (h <= cse)  // horizon -> -12 deg
+		return pi - pn + pn * WarpPiece((cse - h) / (cse - midS), setBeta, setPower);
+	// Night: Hermite from (cse, pi - pn, nightM0) to (csb + 24, 2 pi + pn, nightM1).
+	const double span = csb + 24.0 - cse;
+	const double t = std::clamp((h - cse) / span, 0.0, 1.0);
 	const double t2 = t * t, t3 = t2 * t;
-	const double h00 = 2.0 * t3 - 3.0 * t2 + 1.0, h10 = t3 - 2.0 * t2 + t, h01 = -2.0 * t3 + 3.0 * t2, h11 = t3 - t2;
-	return h00 * y[k] + h10 * span * m[k] + h01 * y[k + 1] + h11 * span * m[k + 1];
+	return (2.0 * t3 - 3.0 * t2 + 1.0) * (pi - pn) + (t3 - 2.0 * t2 + t) * span * nightM0 + (-2.0 * t3 + 3.0 * t2) * (2.0 * pi + pn) + (t3 - t2) * span * nightM1;
+}
+
+void SkySync::PutVanillaNightBelowHorizon(RE::NiPoint3& dir, const float hour, const RE::TESClimate::Timing& timing)
+{
+	// Upstream CalculateVanillaSunDirection: the game's sun touches the horizon where its alpha fade ends, the
+	// middle of each interval -+ half fSunAlphaTransTime; between those hours the arc is the day half, outside
+	// them the night half, whose height the engine writes mirrored (above the horizon).
+	constexpr float hoursPerUnit = 1.0f / 6.0f;
+	auto middle = [](const RE::TESClimate::Timing::Interval& a_interval) { return (a_interval.end * hoursPerUnit + a_interval.begin * hoursPerUnit) * 0.5f; };
+	const float transition = gSunAlphaTransTime ? gSunAlphaTransTime->GetFloat() : 2.0f;
+	const float half = std::isfinite(transition) ? std::clamp(transition, 0.0f, 6.0f) * 0.5f : 1.0f;
+	const float sunrise = middle(timing.sunrise) - half;
+	const float sunset = middle(timing.sunset) + half;
+	const float dayLength = sunset - sunrise;
+	if (!(dayLength > 0.1f && dayLength < 23.9f) || !std::isfinite(hour))
+		return;
+	const float sinceSunrise = hour >= sunrise ? hour - sunrise : hour + 24.0f - sunrise;
+	if (sinceSunrise >= dayLength)
+		dir.z = -std::abs(dir.z);
 }
 
 void SkySync::GetSunDirectionAtHour(const RE::Sky* sky, const float hour, RE::NiPoint3& outDir, float& outDist)
@@ -482,6 +626,10 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 	if (hasColors)
 		color = handover * sum;
 
+	// (47a2) For the menu'"'"'s Status block.
+	for (int i = 0; i < 3; ++i)
+		lastStrength[i] = strength[i];
+	lastDominant = static_cast<int>(dominant);
 	const float dominantStrength = dominant == Caster::None ? 0.0f : strength[static_cast<int>(dominant)];
 	volumetricLightingIsMoon = dominant == Caster::Masser || dominant == Caster::Secunda;
 	SetLightingCombined(sky->sun, dir, color, std::min(total, 1.0f) * handover, std::min(dominantStrength, 1.0f) * handover);
@@ -641,6 +789,10 @@ void SkySync::SetSkyRotation(const RE::Sky* sky, RE::TESObjectCELL* cell)
 		return;
 
 	currentCell = cell;
+	// (47a2) What it was, for later frames (the pointer itself is never dereferenced again).
+	currentCellValid = true;
+	currentCellInterior = cell->IsInteriorCell();
+	currentCellWorldspace = cell->GetRuntimeData().worldSpace;
 	const float rotation = cell->GetNorthRotation();
 	if (rotation == currentSkyRotation)
 		return;
@@ -664,8 +816,12 @@ void SkySync::ProcessSun(const RE::Sky* sky, const RE::Sun* sun, const float tim
 			GetSunDirectionAtHour(sky, time, dir, dist);
 		else
 			CalculateAlternateSunDirectionAndDistance(dir, dist, time, timings.sunrise, timings.sunset, sunAngle);
-	} else
+	} else {
 		CalculateSunDirectionAndDistance(sun, dir, dist);
+		// (47a2, upstream) The game mirrors its night arc above the horizon: put it below.
+		if (sky && sky->currentClimate)
+			PutVanillaNightBelowHorizon(dir, time, sky->currentClimate->timing);
+	}
 
 	rawDirections[static_cast<int>(Caster::Sun)] = dir;
 
