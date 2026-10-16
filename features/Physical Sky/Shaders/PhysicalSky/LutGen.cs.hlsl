@@ -21,7 +21,7 @@ RWTexture2D<float4> RWTexOutput : register(u0);
 static const uint kNightMidpoint = (1 << 1);   // ray-march samples in the middle of each step
 static const uint kNightGroundFix = (1 << 2);  // multiscatter ground bounce x cos / pi, sun tested at the ground point
 static const uint kNightSkyFixes = (1 << 3);   // Sky Fixes on: the sky brightness factor below applies
-#define SKY_FIXES_SCALE SharedData::physSkyNightData.pad0  // sky brightness factor on the sun/moon in-scatter
+#define SKY_FIXES_SCALE SharedData::physSkyNightData.pad0  // sky brightness factor on the SUN's in-scatter (47a2: not the moons')
 
 void rayMarch(
 	float3 pos, float3 rayDir, 
@@ -34,7 +34,8 @@ void rayMarch(
 	inout float3 lum, inout float3 lumFactor
 #elif LUTGEN == 2
 	inout float3 tr,
-	inout float3 lum
+	inout float3 lum,
+	inout float3 lumSun  // (47a2) the sun's share of lum (Sky Fixes only)
 #elif LUTGEN == 3
 	uint2 tid, uint depth,
 	inout float3 tr,
@@ -68,6 +69,9 @@ void rayMarch(
 	const bool nightBaseLight = (SharedData::physSkyNightData.Flags & SharedData::PhysSkyNightFlags::BaseLight) != 0;
 	const float3 nightGlow = SharedData::physSkyNightData.BaseHorizon;
 	float3 lumNight = 0;
+#endif
+#if LUTGEN == 3
+	float3 lumSun = 0;  // (47a2) the sun's share of lum (Sky Fixes only)
 #endif
 
 	float tGround = RayIntersectSphere(pos, rayDir, 0, data.rPlanet);
@@ -152,7 +156,8 @@ void rayMarch(
 		float2 lutUvSecunda = TrLutUvPlanet(curr_pos, data.secundaDir);
 		float3 trSecunda = TexTrLut.SampleLevel(SampTr, lutUvSecunda, 0).rgb;
 		
-		float3 psiMs = TexMsLut.SampleLevel(SampTr, lutUvSun, 0).rgb * data.sunlightColor;
+		const float3 psiMsSun = TexMsLut.SampleLevel(SampTr, lutUvSun, 0).rgb * data.sunlightColor;
+		float3 psiMs = psiMsSun;
 		psiMs += TexMsLut.SampleLevel(SampTr, lutUvMasser, 0).rgb * data.masserColor;
 		psiMs += TexMsLut.SampleLevel(SampTr, lutUvSecunda, 0).rgb * data.secundaColor;
 #	endif
@@ -168,6 +173,12 @@ void rayMarch(
 		float3 scatterIntegeral = inscatter * scatterFactor;
 
 		lum += scatterIntegeral * tr;
+#	if LUTGEN != 1
+		// (47a2) Sky Fixes scales only the sun's light (its single scatter and its share of the multiple
+		// scattering); the moons' glow keeps its 46y brightness.
+		[branch] if (fixFlags & kNightSkyFixes)
+			lumSun += ((muSRayleigh * phaseRayleighSun + muSAerosol * phaseAerosolSun) * trSun * data.sunlightColor + scatterNoPhase * psiMsSun) * scatterFactor * tr;
+#	endif
 #endif
 #if LUTGEN == 3
 		[branch] if (nightBaseLight)
@@ -177,8 +188,8 @@ void rayMarch(
 
 #if LUTGEN == 3
 		float3 lumOut = lum;
-		[branch] if (fixFlags & kNightSkyFixes)  // (47a) Sky Fixes: the sky brightness factor, not on the night glow
-			lumOut *= SKY_FIXES_SCALE;
+		[branch] if (fixFlags & kNightSkyFixes)  // (47a) Sky Fixes: the sky brightness factor, sun only (47a2)
+			lumOut += lumSun * (SKY_FIXES_SCALE - 1.0);
 		[branch] if (nightBaseLight)
 			lumOut += lumNight;
 		RWTexOutput[uint3(tid.xy, i + 1)] = float4(lumOut, dot(tr, float3(0.2126, 0.7152, 0.0722)));
@@ -282,9 +293,10 @@ float3 NightSkyBase(float3 rayDir)
 
 #elif LUTGEN == 2
 	float3 lum = 0;
-	rayMarch(pos, rayDir, tr, lum);
-	[branch] if (SharedData::physSkyNightData.Flags & kNightSkyFixes)  // (47a) Sky Fixes: the sky brightness factor, not on the night base
-		lum *= SKY_FIXES_SCALE;
+	float3 lumSun = 0;
+	rayMarch(pos, rayDir, tr, lum, lumSun);
+	[branch] if (SharedData::physSkyNightData.Flags & kNightSkyFixes)  // (47a) Sky Fixes: the sky brightness factor, sun only (47a2), not the night base
+		lum += lumSun * (SKY_FIXES_SCALE - 1.0);
 	[branch] if (SharedData::physSkyNightData.Flags & SharedData::PhysSkyNightFlags::BaseLight)
 		lum += NightSkyBase(rayDir);
 	RWTexOutput[tid.xy] = float4(lum, 1.0);

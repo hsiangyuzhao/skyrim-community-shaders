@@ -838,7 +838,7 @@ void PhysicalSky::SettingsDebug()
 			const auto& d = skyFixesDebug;
 			ImGui::Text("Sky Fixes: sun %.1f deg, sky x%.2f (target x%.2f)%s", DirectX::XMConvertToDegrees(std::asin(std::clamp(nightCbData.lutSunDir.z, -1.f, 1.f))),
 				nightCbData.skyScale, d.target, d.valid ? "" : " - no usable weather ambient, x1");
-			ImGui::Text("  ground progress %.2f, zenith scatter %.2e, night base %.2e, night ref %.2e, day ref %.2e", d.g, d.zScatter, d.zBase, d.zNight, d.zDay);
+			ImGui::Text("  ground progress %.2f, sun scatter %.2e, moon glow %.2e, night base %.2e, night ref %.2e, day ref %.2e", d.g, d.zScatter, d.zMoon, d.zBase, d.zNight, d.zDay);
 			ImGui::Text("  aerial perspective LUT %ux%u, timing warp %s", apLutW, apLutH, globals::features::skySync.sunWarp.valid ? "on" : "off (46y timing)");
 		}
 	}
@@ -1317,8 +1317,8 @@ void PhysicalSky::UpdateSkyFixes(const bool a_fixes, const RE::NiPoint3& a_lutSu
 	// T = Zn + g (Zd - Zn): the zenith brightness that keeps the day's sky-to-ground ratio, where g is how far
 	// the weather's ground ambient has gone from its night to its day key, Zn the night base light's zenith
 	// and Zd the zenith with the sun at +12 degrees (where the day colours are full). The factor scales only
-	// the sun/moon in-scatter Zs, so it is the one that brings the zenith to T with the night base Zb held:
-	// f = (T - Zb) / Zs, never below 1, at most kSkyFixesScaleCap (32: larger caps light a horizon band at
+	// the sun's in-scatter Zs (47a2: not the moons' Zm), so it is the one that brings the zenith to T with the
+	// night base Zb and the moon glow held: f = (T - Zb - Zm) / Zs, never below 1, at most kSkyFixesScaleCap (32: larger caps light a horizon band at
 	// deep twilight that is brighter than later in the dawn; reaching T there would need x10000).
 	float target = 1.f;
 	auto& dbg = skyFixesDebug;
@@ -1357,7 +1357,9 @@ void PhysicalSky::UpdateSkyFixes(const bool a_fixes, const RE::NiPoint3& a_lutSu
 				{ unit(cbData.masserDir.x, cbData.masserDir.y, cbData.masserDir.z), vec(cbData.masserColor) },
 				{ unit(cbData.secundaDir.x, cbData.secundaDir.y, cbData.secundaDir.z), vec(cbData.secundaColor) },
 			};
-			const double zScatter = skyModelCpu.RingLuminance(cameraRadius, kSkyFixesRingElevationDeg, lights, 3);
+			// (47a2) The sun and the moons apart: only the sun's share is scaled.
+			const double zScatter = skyModelCpu.RingLuminance(cameraRadius, kSkyFixesRingElevationDeg, lights, 1);
+			const double zMoon = skyModelCpu.RingLuminance(cameraRadius, kSkyFixesRingElevationDeg, lights + 1, 2);
 
 			// The day reference: the same sun at +12 degrees (same azimuth), no moons, no night base.
 			const double horizontal = std::sqrt(double(a_lutSunDir.x) * a_lutSunDir.x + double(a_lutSunDir.y) * a_lutSunDir.y);
@@ -1378,7 +1380,7 @@ void PhysicalSky::UpdateSkyFixes(const bool a_fixes, const RE::NiPoint3& a_lutSu
 			const double zNight = ringLuminance(nightBaseUnfadedUpper, nightBaseUnfadedHorizon);
 
 			const double t = zNight + g * (zDay - zNight);
-			const double need = t - zBase;
+			const double need = t - zBase - zMoon;
 			if (std::isfinite(need) && std::isfinite(zScatter)) {
 				if (!(need > 0.0))
 					target = 1.f;
@@ -1390,6 +1392,7 @@ void PhysicalSky::UpdateSkyFixes(const bool a_fixes, const RE::NiPoint3& a_lutSu
 			}
 			dbg.g = g;
 			dbg.zScatter = static_cast<float>(zScatter);
+			dbg.zMoon = static_cast<float>(zMoon);
 			dbg.zBase = static_cast<float>(zBase);
 			dbg.zNight = static_cast<float>(zNight);
 			dbg.zDay = static_cast<float>(zDay);

@@ -444,7 +444,7 @@ struct PhysicalSky final : public Feature
 	struct SkyFixesDebug
 	{
 		bool valid = false;
-		float g = 0.f, zScatter = 0.f, zBase = 0.f, zNight = 0.f, zDay = 0.f, target = 1.f;
+		float g = 0.f, zScatter = 0.f, zMoon = 0.f, zBase = 0.f, zNight = 0.f, zDay = 0.f, target = 1.f;
 	} skyFixesDebug;
 
 	/// (47a) Aerial perspective LUT direction size: 32x32, or 64x64 with Sky Fixes (depth stays 32).
