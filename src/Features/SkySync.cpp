@@ -359,8 +359,9 @@ void SkySync::SunWarp::Build(const RE::TESClimate::Timing& a_timing, const float
 		return;
 
 	// Uniform motion above the horizon (the path's natural rate), and the pieces below it: each ends at the
-	// horizon with that rate. Their shape: a cubic with unit relative slope at -12 deg while the horizon
-	// rate is at most 4x the piece's mean rate (monotone there by Fritsch-Carlson), else t^ratio.
+	// horizon with that rate (beta x its own mean rate). Their shape: a cubic whose relative slope at -12 deg
+	// (alpha) is the largest monotone one up to 3 (Fritsch-Carlson), so the sun leaves -12 deg briskly and
+	// spends the twilight nearer the horizon; t^beta when beta > 4 (no monotone cubic exists).
 	const double rateUniform = std::numbers::pi / (keyMidS - keyMidR);
 	const double riseMean = -phaseNight / (keyMidR - keyCsb);
 	const double setMean = -phaseNight / (keyCse - keyMidS);
@@ -369,8 +370,22 @@ void SkySync::SunWarp::Build(const RE::TESClimate::Timing& a_timing, const float
 	const bool powerRise = betaRise > 4.0;
 	const bool powerSet = betaSet > 4.0;
 	// Phase rate at -12 deg (radians per hour) = relative slope there x the mean rate.
-	const double m1 = powerRise ? 0.0 : riseMean;
-	const double m0 = powerSet ? 0.0 : setMean;
+	auto monotoneCubic = [](double a_alpha, double a_beta) {
+		return (a_alpha + a_beta - 2.0 <= 0.0) || (2.0 * a_alpha + a_beta - 3.0 <= 0.0) || (a_alpha + 2.0 * a_beta - 3.0 <= 0.0) ||
+		       (a_alpha - (2.0 * a_alpha + a_beta - 3.0) * (2.0 * a_alpha + a_beta - 3.0) / (3.0 * (a_alpha + a_beta - 2.0)) >= 0.0);
+	};
+	auto pickAlpha = [&](double a_beta) {
+		for (int i = 60; i >= 1; --i) {
+			const double alpha = i * 0.05;  // 3.00, 2.95, ... 0.05
+			if (monotoneCubic(alpha, a_beta))
+				return alpha;
+		}
+		return 0.05;
+	};
+	const double alphaRise = powerRise ? 0.0 : pickAlpha(betaRise);
+	const double alphaSet = powerSet ? 0.0 : pickAlpha(betaSet);
+	const double m1 = alphaRise * riseMean;
+	const double m0 = alphaSet * setMean;
 
 	// The night piece (cse -> csb + 24): a cubic from pi - pn to 2 pi + pn with those end rates, monotone.
 	const double nightMean = (std::numbers::pi + 2.0 * phaseNight) / (keyCsb + 24.0 - keyCse);
@@ -387,6 +402,8 @@ void SkySync::SunWarp::Build(const RE::TESClimate::Timing& a_timing, const float
 	pn = phaseNight;
 	rate = rateUniform;
 	riseBeta = betaRise;
+	riseAlpha = alphaRise;
+	setAlpha = alphaSet;
 	setBeta = betaSet;
 	risePower = powerRise;
 	setPower = powerSet;
@@ -397,14 +414,14 @@ void SkySync::SunWarp::Build(const RE::TESClimate::Timing& a_timing, const float
 
 namespace
 {
-	// Normalised monotone piece on [0, 1]: s(0) = 0, s(1) = 1, s'(1) = a_beta; s'(0) = 1 (cubic) or 0 (power).
-	double WarpPiece(double a_t, double a_beta, bool a_power)
+	// Normalised monotone piece on [0, 1]: s(0) = 0, s(1) = 1, s'(1) = a_beta; s'(0) = a_alpha (cubic) or 0 (power).
+	double WarpPiece(double a_t, double a_alpha, double a_beta, bool a_power)
 	{
 		const double t = std::clamp(a_t, 0.0, 1.0);
 		if (a_power)
 			return std::pow(t, a_beta);
 		const double t2 = t * t, t3 = t2 * t;
-		return (t3 - 2.0 * t2 + t) + (-2.0 * t3 + 3.0 * t2) + (t3 - t2) * a_beta;
+		return (t3 - 2.0 * t2 + t) * a_alpha + (-2.0 * t3 + 3.0 * t2) + (t3 - t2) * a_beta;
 	}
 }
 
@@ -419,11 +436,11 @@ double SkySync::SunWarp::Phase(double a_hour) const
 	h += csb;
 	constexpr double pi = std::numbers::pi;
 	if (h <= midR)  // -12 deg -> horizon
-		return pn * (1.0 - WarpPiece((h - csb) / (midR - csb), riseBeta, risePower));
+		return pn * (1.0 - WarpPiece((h - csb) / (midR - csb), riseAlpha, riseBeta, risePower));
 	if (h <= midS)  // the 46y uniform path
 		return rate * (h - midR);
 	if (h <= cse)  // horizon -> -12 deg
-		return pi - pn + pn * WarpPiece((cse - h) / (cse - midS), setBeta, setPower);
+		return pi - pn + pn * WarpPiece((cse - h) / (cse - midS), setAlpha, setBeta, setPower);
 	// Night: Hermite from (cse, pi - pn, nightM0) to (csb + 24, 2 pi + pn, nightM1).
 	const double span = csb + 24.0 - cse;
 	const double t = std::clamp((h - cse) / span, 0.0, 1.0);

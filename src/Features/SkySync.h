@@ -387,6 +387,7 @@ public:
 		double pn = 0.0;    // path phase at NightElevation (negative), radians
 		double rate = 0.0;  // uniform phase rate between midR and midS, radians per hour
 		double riseBeta = 0.0, setBeta = 0.0;      // horizon rate / mean rate of the piece below the horizon
+		double riseAlpha = 1.0, setAlpha = 1.0;     // relative slope at -12 deg (largest monotone value up to 3)
 		bool risePower = false, setPower = false;  // ratio above 4: t^beta (a pause at -12 deg), else a cubic
 		double nightM0 = 0.0, nightM1 = 0.0;       // night piece slopes at cse and at csb + 24, radians per hour
 		// What the knots were built from; Build() is a no-op while these match.
