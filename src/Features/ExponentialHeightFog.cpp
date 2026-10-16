@@ -74,12 +74,21 @@ namespace
     }
 
     constexpr const char* kVolumetricKey = "Volumetric Fog";
+    constexpr const char* kVanillaFogKey = "Vanilla Fog";  // (47b)
 }
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+    ExponentialHeightFog::VanillaFogSettings,
+    FollowWeather,
+    RestoreRoomFog,
+    ClearFogFar,
+    FullFogFar)
 
 void ExponentialHeightFog::RestoreDefaultSettings()
 {
     settings = {};
     volumetric = {};
+    vanillaFog = {};
 }
 
 void ExponentialHeightFog::LoadSettings(json& o_json)
@@ -87,12 +96,66 @@ void ExponentialHeightFog::LoadSettings(json& o_json)
     settings = o_json;
     if (o_json.contains(kVolumetricKey) && o_json[kVolumetricKey].is_object())
         volumetric = o_json[kVolumetricKey];
+    vanillaFog = {};
+    if (o_json.contains(kVanillaFogKey) && o_json[kVanillaFogKey].is_object())
+        vanillaFog = o_json[kVanillaFogKey];
 }
 
 void ExponentialHeightFog::SaveSettings(json& o_json)
 {
     o_json = settings;
     o_json[kVolumetricKey] = volumetric;
+    o_json[kVanillaFogKey] = vanillaFog;
+}
+
+ExponentialHeightFog::VanillaFogState ExponentialHeightFog::GetVanillaFogState() const
+{
+    // (47b) Design C (reviews/analysis-ehf-weather-fog-2026-10.md): how much of the game's own fog comes back under
+    // the height fog. Outdoors from the weather's fog distance as the engine has blended it this frame (time of day,
+    // weather transitions), so clear and cloudy skies (fog far 150000+) get 0 and fog, storms and blizzards (5000-15000)
+    // get 1; indoors the cell's own fog in full. Generic: only RE::Sky's blended values are read.
+    VanillaFogState state;
+    if (!loaded || !settings.enabled) {
+        state.reason = "height fog off";
+        return state;
+    }
+    if (globals::game::ui && globals::game::ui->IsMenuOpen(RE::MapMenu::MENU_NAME)) {
+        state.reason = "map open";
+        return state;
+    }
+    state.interior = Util::IsInterior();
+    if (state.interior) {
+        if (vanillaFog.RestoreRoomFog)
+            state.weight = 1.0f;
+        else
+            state.reason = "EHF Restores Room Fog off";
+        return state;
+    }
+    if (!vanillaFog.FollowWeather) {
+        state.reason = "EHF Follows Weather off";
+        return state;
+    }
+    const auto* sky = globals::game::sky;
+    if (!sky || sky->mode.get() != RE::Sky::Mode::kFull || !sky->currentWeather) {
+        state.reason = "no weather";
+        return state;
+    }
+    state.hasWeather = true;
+    state.fogNear = sky->fogNear;
+    state.fogFar = sky->fogFar;
+    state.fogPower = sky->fogPower;
+    state.fogClamp = sky->fogClamp;
+    const float clear = vanillaFog.ClearFogFar;
+    const float full = vanillaFog.FullFogFar;
+    if (!std::isfinite(state.fogFar) || !(state.fogFar > 0.0f) || !std::isfinite(clear) || !std::isfinite(full) || !(full > 0.0f) || !(clear > full)) {
+        state.reason = "no usable fog distance";
+        return state;
+    }
+    const float weight = std::log(clear / state.fogFar) / std::log(clear / full);
+    state.weight = std::isfinite(weight) ? std::clamp(weight, 0.0f, 1.0f) : 0.0f;
+    if (!(state.weight > 0.0f))
+        state.reason = "clear weather";
+    return state;
 }
 
 ExponentialHeightFog::Settings ExponentialHeightFog::GetCommonBufferData() const
@@ -155,6 +218,10 @@ ExponentialHeightFog::GridParams ExponentialHeightFog::ComputeGridParams(uint32_
 ExponentialHeightFog::VolumetricFogPSData ExponentialHeightFog::GetVolumetricPSData() const
 {
     VolumetricFogPSData data{};
+    // (47b) The game's fog under the height fog: written before any early return (the shaders read it whether or not
+    // the volumes are built). Both 0 with the two switches off = the 47a2 fog exactly.
+    data.pad0[0] = GetVanillaFogState().weight;
+    data.pad0[1] = std::bit_cast<float>((loaded && settings.enabled && vanillaFog.FollowWeather) ? kFogFlagOpacityFix : 0u);
     if (!VolumetricFogActive())
         return data;
 
@@ -715,6 +782,36 @@ void ExponentialHeightFog::DrawSettings()
             ImGui::Text(
                 "A second fog layer stacked on the first, with its own height, thinning and thickness.\n"
                 "Use it for high haze above ground fog, or a separate low ground fog. 0 = off (default).");
+        ImGui::TreePop();
+    }
+
+    // (47b) The game's own fog under the height fog.
+    ImGui::SeparatorText("Game Fog");
+    ImGui::Checkbox("EHF Follows Weather", &vanillaFog.FollowWeather);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Outdoors. On: foggy weather keeps its fog. The weather's own fog comes back under the height fog,\n"
+            "by how foggy the weather is: none in clear or cloudy weather, some in overcast and rain, all of it\n"
+            "in fog, storms and blizzards. The distant physical-sky haze steps back behind that fog. Also fixes the\n"
+            "height fog's colour being dimmed twice, so clear-weather distance looks a little brighter.\n"
+            "Off = as before (the height fog replaces the weather's fog).");
+    ImGui::Checkbox("EHF Restores Room Fog", &vanillaFog.RestoreRoomFog);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text("Indoors. On: caves, dungeons and houses keep their own fog, with the height fog on top.\nOff = as before (the height fog replaces it).");
+    {
+        const auto state = GetVanillaFogState();
+        if (state.hasWeather)
+            ImGui::Text("Weather fog: near %.0f, far %.0f, power %.2f, max %.2f -> weight %.2f", state.fogNear, state.fogFar, state.fogPower, state.fogClamp, state.weight);
+        else
+            ImGui::Text("Game fog weight %.2f%s%s", state.weight, *state.reason ? " - " : "", state.reason);
+    }
+    if (ImGui::TreeNode("Advanced##GameFog")) {
+        ImGui::SliderFloat("Clear Fog Distance", &vanillaFog.ClearFogFar, 20000.0f, 400000.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text("Weather fog distance (far) at and above which none of the weather's fog comes back. Default 120000.");
+        ImGui::SliderFloat("Full Fog Distance", &vanillaFog.FullFogFar, 1000.0f, 100000.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text("Weather fog distance at and below which all of it comes back. Default 15000.");
         ImGui::TreePop();
     }
 

@@ -945,6 +945,7 @@ PS_OUTPUT main(PS_INPUT input)
 	}
 #	endif
 
+	float weatherFogAmount = 0.0;  // (47b) share of the view the game's fog covers under the height fog
 #	if !defined(MOTIONVECTORS_NORMALS)
 	float fogFactor = Color::FogAlpha(input.FogParam.w);
 	float3 fogColor = Color::Fog(input.FogParam.xyz);
@@ -961,6 +962,8 @@ PS_OUTPUT main(PS_INPUT input)
 			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, eyeIndex, input.Position.xy);
 		else
 			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
+		// (47b) the game's own fog (weather / room, with the game's fog fade) under the height fog; no-op while off
+		exponentialHeightFog = ExponentialHeightFog::ComposeVanillaFog(exponentialHeightFog, fogColor, fogFactor, fogMul.x, weatherFogAmount);
 		fogColor = exponentialHeightFog.xyz;
 		fogFactor = exponentialHeightFog.w;
 		fogMul = 1;
@@ -1045,7 +1048,11 @@ PS_OUTPUT main(PS_INPUT input)
 #	if !defined(DEFERRED)
 #		if defined(PHYSICAL_SKY)
 	if (SharedData::physSkyData.enabled && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld)) {
-		const float4 apSample = PhysSky::SampleAp(normalize(input.WorldPosition.xyz), input.Position.xy, length(input.WorldPosition.xyz), SampBaseSampler);
+		float4 apSample = PhysSky::SampleAp(normalize(input.WorldPosition.xyz), input.Position.xy, length(input.WorldPosition.xyz), SampBaseSampler);
+#			if defined(EXP_HEIGHT_FOG)
+		[branch] if (weatherFogAmount > 0.0)  // (47b) what the game's fog covers loses its haze
+			apSample = ExponentialHeightFog::ScaleAerialPerspective(apSample, weatherFogAmount);
+#			endif
 		psout.Diffuse.xyz = psout.Diffuse.xyz * apSample.w + apSample.xyz;
 	}
 #		endif

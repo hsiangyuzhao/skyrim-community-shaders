@@ -4857,6 +4857,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	color.xyz = Color::IrradianceToGamma(Color::IrradianceToLinear(color.xyz) + specularColor);
 	float3 fogColor = Color::Fog(input.FogParam.xyz);
 	float fogFactor = Color::FogAlpha(input.FogParam.w);
+	float weatherFogAmount = 0.0;  // (47b) share of the view the game's fog covers under the height fog
 #		if defined(IBL)
 	if (SharedData::iblSettings.EnableDiffuseIBL && !SharedData::InInterior) {
 		fogColor = ImageBasedLighting::GetFogIBLColor(fogColor);
@@ -4870,16 +4871,25 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, eyeIndex, input.Position.xy);
 		else
 			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
+		// (47b) the game's own fog (weather / room) under the height fog; no-op while off
+		exponentialHeightFog = ExponentialHeightFog::ComposeVanillaFog(exponentialHeightFog, fogColor, fogFactor, 1.0, weatherFogAmount);
 		fogColor = exponentialHeightFog.xyz;
 		fogFactor = exponentialHeightFog.w;
 	}
 #		endif
 	if (FrameBuffer::FrameParams.y && FrameBuffer::FrameParams.z)
 		color.xyz = lerp(color.xyz, fogColor, fogFactor);
+	else
+		weatherFogAmount = 0.0;
 
 #		if defined(PHYSICAL_SKY)
 	if (SharedData::physSkyData.enabled) {
-		const float4 apSample = PhysSky::SampleAp(normalize(input.WorldPosition.xyz), input.Position.xy, length(input.WorldPosition.xyz), SampColorSampler);
+		float4 apSample = PhysSky::SampleAp(normalize(input.WorldPosition.xyz), input.Position.xy, length(input.WorldPosition.xyz), SampColorSampler);
+#			if defined(EXP_HEIGHT_FOG)
+		// (47b) the game's fog sits in front of the haze here (forward objects are fogged first): what it covers loses its haze
+		[branch] if (weatherFogAmount > 0.0)
+			apSample = ExponentialHeightFog::ScaleAerialPerspective(apSample, weatherFogAmount);
+#			endif
 		color.xyz = color.xyz * apSample.w + apSample.xyz;
 	}
 #		endif

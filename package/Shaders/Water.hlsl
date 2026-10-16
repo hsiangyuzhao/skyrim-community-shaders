@@ -420,6 +420,28 @@ float CalculateDepthMultFromUV(float2 uv, float depth, uint eyeIndex = 0)
 #			include "ExponentialHeightFog/ExponentialHeightFog.hlsli"
 #		endif
 
+#		if defined(PHYSICAL_SKY) && (defined(SIMPLE) || defined(LOD) || defined(SPECULAR)) && !defined(UNDERWATER)
+#			include "PhysicalSky/Common.hlsli"
+// (47b) Sky Fixes: PhysicalSky::NightFlags bit 5, named here (SharedData.hlsli untouched). The water surface gets the
+// physical sky's aerial perspective (distant haze) the way forward Lighting does, right after its fog.
+static const uint kWaterAerialPerspectiveFlag = (1 << 5);
+
+float3 ApplyWaterAerialPerspective(float3 a_color, float3 a_positionWS, float2 a_pxCoord, float a_weatherFogAmount)
+{
+	[branch] if (SharedData::physSkyData.enabled && (SharedData::physSkyNightData.Flags & kWaterAerialPerspectiveFlag) &&
+				 (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld))
+	{
+		float4 apSample = PhysSky::SampleAp(normalize(a_positionWS), a_pxCoord, length(a_positionWS), SampColorSampler);
+#			if defined(EXP_HEIGHT_FOG)
+		[branch] if (a_weatherFogAmount > 0.0)  // what the game's fog covers loses its haze, as in Lighting
+			apSample = ExponentialHeightFog::ScaleAerialPerspective(apSample, a_weatherFogAmount);
+#			endif
+		a_color = a_color * apSample.w + apSample.xyz;
+	}
+	return a_color;
+}
+#		endif
+
 #		include "Common/ShadowSampling.hlsli"
 
 #		if defined(SIMPLE) || defined(UNDERWATER) || defined(LOD) || defined(SPECULAR)
@@ -1182,6 +1204,7 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 finalColorPreFog = lerp(diffuseColor, specularColor, specularFraction) + sunColor * depthControl.w;
 	float3 fogColor = Color::Fog(input.FogParam.xyz);
 	float fogFactor = Color::FogAlpha(input.FogParam.w);
+	float weatherFogAmount = 0.0;  // (47b)
 #						if defined(IBL)
 	if (SharedData::iblSettings.EnableDiffuseIBL && !SharedData::InInterior) {
 		fogColor = ImageBasedLighting::GetFogIBLColor(fogColor);
@@ -1196,6 +1219,8 @@ PS_OUTPUT main(PS_INPUT input)
 			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, eyeIndex, input.HPosition.xy);
 		else
 			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
+		// (47b) the game's own fog (weather / room, with the water's fog fade) under the height fog; no-op while off
+		exponentialHeightFog = ExponentialHeightFog::ComposeVanillaFog(exponentialHeightFog, fogColor, fogFactor, PosAdjust[eyeIndex].w, weatherFogAmount);
 		fogColor = exponentialHeightFog.xyz;
 		fogFactor = exponentialHeightFog.w;
 	}
@@ -1204,6 +1229,9 @@ PS_OUTPUT main(PS_INPUT input)
 	fogColor *= PosAdjust[eyeIndex].w;
 
 	float3 finalColor = lerp(finalColorPreFog, fogColor, fogFactor);
+#						if defined(PHYSICAL_SKY)
+	finalColor = ApplyWaterAerialPerspective(finalColor, input.WPosition.xyz, input.HPosition.xy, weatherFogAmount);  // (47b) Sky Fixes
+#						endif
 #						if defined(WETNESS_EFFECTS) && defined(DEBUG_WETNESS_EFFECTS)
 	// DEBUG MODE: Override water color with debug visualization
 	float3 debugColor = WetnessEffects::GetDebugWetnessColorStandard(waterData.rippleInfo, 2.0, 3.0);
@@ -1217,6 +1245,7 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 finalColorPreFog = lerp(diffuseOutput.refractionDiffuseColor, specularColor, specularFraction) + sunColor * depthControl.w;
 	float3 preFogColor = Color::Fog(input.FogParam.xyz);
 	float preFogFactor = Color::FogAlpha(input.FogParam.w);
+	float weatherFogAmount = 0.0;  // (47b)
 #						if defined(IBL)
 	if (SharedData::iblSettings.EnableDiffuseIBL && !SharedData::InInterior) {
 		preFogColor = ImageBasedLighting::GetFogIBLColor(preFogColor);
@@ -1231,6 +1260,8 @@ PS_OUTPUT main(PS_INPUT input)
 			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, preFogColor, eyeIndex, input.HPosition.xy);
 		else
 			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, preFogColor);
+		// (47b) the game's own fog (weather / room, with the water's fog fade) under the height fog; no-op while off
+		exponentialHeightFog = ExponentialHeightFog::ComposeVanillaFog(exponentialHeightFog, preFogColor, preFogFactor, PosAdjust[eyeIndex].w, weatherFogAmount);
 		preFogColor = exponentialHeightFog.xyz;
 		preFogFactor = exponentialHeightFog.w;
 	}
@@ -1239,6 +1270,11 @@ PS_OUTPUT main(PS_INPUT input)
 	preFogColor *= PosAdjust[eyeIndex].w;
 
 	finalColorPreFog = lerp(finalColorPreFog, preFogColor, preFogFactor);
+#						if defined(PHYSICAL_SKY)
+	// (47b) Sky Fixes: the surface's haze, on what the fog covers (the refraction behind is the composited scene,
+	// which has its own).
+	finalColorPreFog = ApplyWaterAerialPerspective(finalColorPreFog, input.WPosition.xyz, input.HPosition.xy, weatherFogAmount);
+#						endif
 
 	float3 refractionColor = diffuseOutput.refractionColor;
 

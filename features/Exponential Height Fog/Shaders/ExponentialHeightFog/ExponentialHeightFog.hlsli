@@ -23,6 +23,50 @@ Texture3D<float4> ExponentialHeightFogIntegratedLightScatteringFar : register(t2
 
 namespace ExponentialHeightFog
 {
+    // (47b) "EHF Follows Weather" / "EHF Restores Room Fog". ExponentialHeightFog::GetVolumetricPSData() fills
+    // VolumetricFogSettings.pad0 (SharedData.hlsli is untouched): x = w, how much of the game's own fog comes back
+    // under the height fog (outdoors from the weather's fog distance, 1 indoors with "Restores Room Fog", 0 = off);
+    // y (bits) = flags. Both 0 = the 47a2 fog exactly.
+    static const uint kFogFlagOpacityFix = 1u;  // "EHF Follows Weather" on: the fog colour is no longer weighted by its opacity twice
+
+    float VanillaFogWeight()
+    {
+        return saturate(SharedData::volumetricFogSettings.pad0.x);
+    }
+
+    bool FogOpacityFix()
+    {
+        return (asuint(SharedData::volumetricFogSettings.pad0.y) & kFogFlagOpacityFix) != 0;
+    }
+
+    /// The game's fog (amount a_vanillaAmount after Color::FogAlpha, colour a_vanillaColor x the game's fog fade
+    /// a_fade) x VanillaFogWeight() under the height fog a_heightFog (rgb colour, a opacity): one layer of opacity
+    /// 1 - (1 - aw)(1 - ae). a_weatherAmount = aw, the share of the view the game's fog covers (for the physical sky's
+    /// aerial perspective). With no weight: a_heightFog untouched, a_weatherAmount 0.
+    float4 ComposeVanillaFog(float4 a_heightFog, float3 a_vanillaColor, float a_vanillaAmount, float a_fade, out float a_weatherAmount)
+    {
+        a_weatherAmount = 0.0f;
+        float4 result = a_heightFog;
+        const float w = VanillaFogWeight();
+        [branch] if (w > 0.0f)
+        {
+            const float aw = w * saturate(a_vanillaAmount);
+            const float ae = saturate(a_heightFog.w);
+            const float opacity = 1.0f - (1.0f - aw) * (1.0f - ae);
+            const float3 premultiplied = aw * (1.0f - ae) * a_vanillaColor * a_fade + ae * a_heightFog.rgb;
+            a_weatherAmount = aw;
+            result = float4(opacity > 1e-5f ? premultiplied / opacity : a_heightFog.rgb, opacity);
+        }
+        return result;
+    }
+
+    /// The physical sky's aerial perspective behind the game's fog: what the fog covers loses its share of the haze.
+    float4 ScaleAerialPerspective(float4 a_ap, float a_weatherAmount)
+    {
+        const float keep = 1.0f - saturate(a_weatherAmount);
+        return float4(a_ap.rgb * keep, lerp(1.0f, a_ap.a, keep));
+    }
+
     /// The analytical height fog. excludeDistance replaces Start Distance as the length of the
     /// ray that gets no fog; with volumetric fog off it is Start Distance, i.e. the 37c fog.
     float4 GetAnalyticalHeightFog(float3 positionWS, float3 cameraWS, float3 fogColor, float excludeDistance)
@@ -78,7 +122,9 @@ namespace ExponentialHeightFog
         {
             float3 tintColor = lerp(fogColor, SharedData::exponentialHeightFogSettings.inscatteringTint.xyz, SharedData::exponentialHeightFogSettings.inscatteringTint.w);
             float3 cubemapColor = DynamicCubemaps::EnvReflectionsTexture.SampleLevel(SampColorSampler, normalize(positionWS), SharedData::exponentialHeightFogSettings.cubemapMipLevel).xyz;
-            fogColor = tintColor * cubemapColor * (1.0f - expFogFactor);
+            // (47b) With "EHF Follows Weather" the colour is not pre-weighted by the opacity the callers blend with
+            // (upstream 22ac9859c, #2776); off = 47a2.
+            fogColor = tintColor * cubemapColor * (FogOpacityFix() ? 1.0f : (1.0f - expFogFactor));
         }
 #   endif
 
@@ -97,7 +143,7 @@ namespace ExponentialHeightFog
             float3 directionalLightInscattering = dirLightColor * pow(saturate((dot(normalize(positionWS), SharedData::DirLightDirection.xyz) + 1) / 2), SharedData::exponentialHeightFogSettings.directionalInscatteringExponent) / Math::TAU;
             float dirExponentialHeightLineIntegral = exponentialHeightLineIntegralCalc * max(rayLength - SharedData::exponentialHeightFogSettings.startDistance, 0);
             float dirExpFogFactor = saturate(exp2(-dirExponentialHeightLineIntegral));
-            directionalInscattering = directionalLightInscattering * (1 - dirExpFogFactor) * SharedData::exponentialHeightFogSettings.directionalInscatteringMultiplier;
+            directionalInscattering = directionalLightInscattering * (FogOpacityFix() ? 1.0f : (1 - dirExpFogFactor)) * SharedData::exponentialHeightFogSettings.directionalInscatteringMultiplier;  // (47b) as above
         }
 
         fogColor += directionalInscattering;

@@ -194,6 +194,11 @@ PS_OUTPUT main(PS_INPUT input)
 	if (SharedData::exponentialHeightFogSettings.enabled) {
 		// (batch 38, A1) + volumetric fog in front of the height fog (no-op while it is off)
 		float4 exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(positionWS.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, eyeIndex, input.TexCoord.xy * SharedData::BufferDim.xy);
+		// (47b) The game's own fog (weather / room) under the height fog; outdoor sky pixels get its far amount, indoor
+		// empty pixels none (the game never fogs them). No-op while off.
+		float weatherFogAmount;
+		const float vanillaFogAmount = (depth < 0.999999 || !SharedData::InInterior) ? fogFactor : 0.0;
+		exponentialHeightFog = ExponentialHeightFog::ComposeVanillaFog(exponentialHeightFog, fogColor, vanillaFogAmount, FogNearColor.w, weatherFogAmount);
 		fogColor = exponentialHeightFog.xyz;
 		fogFactor = exponentialHeightFog.w;
 	}

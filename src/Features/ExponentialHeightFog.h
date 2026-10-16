@@ -91,6 +91,35 @@ struct ExponentialHeightFog : Feature
 		float3 NoiseVelocity = { 0.0f, 0.0f, 0.0f };
 	} volumetric;
 
+	/// (47b) The game's own fog under the height fog. CPU side only; reaches the shaders through
+	/// VolumetricFogPSData::pad0 (see GetVolumetricPSData). Saved under "Vanilla Fog".
+	struct VanillaFogSettings
+	{
+		/// "EHF Follows Weather" (exteriors): the weather's fog comes back under the height fog, weighted by how
+		/// foggy the weather is (from its engine-blended fog distance); also fixes the fog colour being weighted
+		/// by its opacity twice (upstream 22ac9859c). Off = 47a2.
+		bool FollowWeather = true;
+		/// "EHF Restores Room Fog" (interiors): the cell's own fog comes back in full under the height fog. Off = 47a2.
+		bool RestoreRoomFog = true;
+		/// Weather fog distance (game units) at and above which the weight is 0 (clear) ...
+		float ClearFogFar = 120000.0f;
+		/// ... and at and below which it is 1 (fog, storm); log-linear in between.
+		float FullFogFar = 15000.0f;
+	} vanillaFog;
+
+	/// (47b) The current weight and what it was computed from (also the menu readout).
+	struct VanillaFogState
+	{
+		float weight = 0.0f;
+		bool interior = false;
+		bool hasWeather = false;  // exterior with a full sky and a weather
+		float fogNear = 0.0f, fogFar = 0.0f, fogPower = 0.0f, fogClamp = 0.0f;
+		const char* reason = "";  // why the weight is 0, for the readout
+	};
+	[[nodiscard]] VanillaFogState GetVanillaFogState() const;
+	/// Flag bits in VolumetricFogPSData::pad0[1] (as uint); mirrored by ExponentialHeightFog.hlsli.
+	static constexpr uint32_t kFogFlagOpacityFix = 1u;
+
 	/// Mirrors SharedData::VolumetricFogSettings (HLSL), appended to FeatureData.
 	struct alignas(16) VolumetricFogPSData
 	{
@@ -102,7 +131,7 @@ struct ExponentialHeightFog : Feature
 		float4 FarGridZParams;
 		float NearGridEndDistance;
 		float UpsampleJitter;
-		float pad0[2];
+		float pad0[2];  // (47b) [0] = the game's fog weight, [1] = kFogFlag* bits (as uint)
 	};
 	STATIC_ASSERT_ALIGNAS_16(VolumetricFogPSData);
 
