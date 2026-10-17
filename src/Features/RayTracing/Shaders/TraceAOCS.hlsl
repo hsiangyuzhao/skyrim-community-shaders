@@ -45,9 +45,11 @@
 // inside its own traced mesh and leave it through the inside of the surface (a dark band along the sides of the legs, strongest
 // with the short detail rays). At a pixel that is a character (CharacterAt: a short probe from the camera side finds that
 // character's traced mesh; it gives the owner key and which side of its triangles faces outward), the character rays skip that
-// character's opaque triangles seen from their inner side -- a ray can only meet those from inside the same mesh -- and the ray
-// start moves out by up to kSelfGrazeOffset more along the normal, the more the ray grazes the surface. A real contact (an arm
-// against the torso, the other leg) is met on its outer side and still counts; static geometry and every other pixel are unchanged.
+// character's opaque triangles met from their inner side when the ray did not enter that character first (before the TMin): such a
+// ray started inside its own traced mesh. The ray start also moves out by up to kSelfGrazeOffset more along the normal, the more the
+// ray grazes the surface. A real contact (an arm against the torso, the other leg, also within the TMin) still counts, as in 47g;
+// static geometry and every other pixel are unchanged. (Hits on the same character closer than 1.5-2 units are
+// already ignored by the 6-unit character TMin; the band came from rays leaving their own mesh beyond it.)
 
 struct AOConstants
 {
@@ -317,21 +319,28 @@ bool PointInSphere(float3 P, float4 sphere)
 	return sphere.w > 0.0 && dot(d, d) <= sphere.w * sphere.w;
 }
 
-// (47h) Visibility() against the characters, without the pixel's own character seen from inside (SelfInfo). Every candidate comes
-// back (forced non-opaque): the opaque instances (ID 0) block unless they are the pixel's character's inner side; the alpha-tested
-// ones as in Visibility (their cut-out and budget with RT_ALPHA, culled without it).
-float CharacterVisibilitySelf(float3 origin, float3 dir, float tMin, float tMax, float footprint, uint flags, SelfInfo self, out float tHit)
+// (47h) Visibility() / ClosestBlocker() against the characters for a pixel that is a character (SelfInfo), over [tStart, tMax] as
+// the 47g ray (tStart >= Extra.x, the character TMin). The query starts at 0 so the ray's entries before the TMin are seen too;
+// every candidate comes back (forced non-opaque). Rules, as 47g except one: an opaque hit (ID 0) in [tStart, tMax] blocks -- unless it
+// is the pixel's own character seen from its inner side and the ray did not enter that character before the TMin (Extra.x): then the
+// ray started inside its own traced mesh (the traced copy sits a little off the drawn one) and is leaving it, a false hit. With an
+// entry before the TMin it is the far side of a nearby part of the same body (the other leg, an arm), real contact, as in 47g. The
+// candidates come in no order, so such inner-side hits wait for the end. Alpha-tested instances as in Visibility / ClosestBlocker.
+float CharacterVisibilitySelf(float3 origin, float3 dir, float tStart, float tMax, float footprint, uint flags, SelfInfo self, out float tHit)
 {
 	tHit = tMax;
-	if (!(tMin < tMax))
+	if (!(tStart < tMax))
 		return 1.0;
 	RayDesc ray;
 	ray.Origin = origin;
 	ray.Direction = dir;
-	ray.TMin = tMin;
+	ray.TMin = 0.0;
 	ray.TMax = tMax;
 	RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
 	q.TraceRayInline(Scene, RAY_FLAG_NONE, kCharacterMasks, ray);
+	const float charTMin = C.Extra.x;
+	bool enteredSelf = false;  // an outer-side hit on the own character before the TMin
+	float innerT = tMax + 1.0; // the nearest own inner-side hit in [tStart, tMax]
 #if defined(RT_ALPHA)
 	uint budget = kAlphaCandidateBudget;
 	bool exceeded = false;
@@ -339,14 +348,25 @@ float CharacterVisibilitySelf(float3 origin, float3 dir, float tMin, float tMax,
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
 			continue;
+		const float t = q.CandidateTriangleRayT();
 		const uint id = q.CandidateInstanceID();
 		if (id == 0u) {
-			if (q.CandidateInstanceContributionToHitGroupIndex() == self.owner && q.CandidateTriangleFrontFace() != self.outerFront)
+			const bool own = q.CandidateInstanceContributionToHitGroupIndex() == self.owner;
+			const bool front = q.CandidateTriangleFrontFace();
+			if (own && front == self.outerFront && t < charTMin)
+				enteredSelf = true;
+			if (t < tStart)
 				continue;
+			if (own && front != self.outerFront) {
+				innerT = min(innerT, t);
+				continue;
+			}
 			q.CommitNonOpaqueTriangleHit();
 			q.Abort();
 			continue;
 		}
+		if (t < tStart)
+			continue;  // the 47g ray started at tStart: not a candidate there, no budget used
 #if defined(RT_ALPHA)
 		if (budget == 0u) {
 			if (flags & (kFlagAlphaHalf | kFlagAlphaOpen)) {
@@ -367,6 +387,10 @@ float CharacterVisibilitySelf(float3 origin, float3 dir, float tMin, float tMax,
 		tHit = q.CommittedRayT();
 		return 0.0;
 	}
+	if (enteredSelf && innerT <= tMax) {
+		tHit = innerT;
+		return 0.0;
+	}
 #if defined(RT_ALPHA)
 	return exceeded ? ((flags & kFlagAlphaOpen) ? 1.0 : 0.5) : 1.0;
 #else
@@ -374,33 +398,46 @@ float CharacterVisibilitySelf(float3 origin, float3 dir, float tMin, float tMax,
 #endif
 }
 
-// (47h) ClosestBlocker() against the characters, without the pixel's own character seen from inside (as CharacterVisibilitySelf).
-bool CharacterClosestSelf(float3 origin, float3 dir, float tMin, float tMax, float footprint, SelfInfo self, out bool o_hit, out float o_tHit)
+bool CharacterClosestSelf(float3 origin, float3 dir, float tStart, float tMax, float footprint, SelfInfo self, out bool o_hit, out float o_tHit)
 {
 	o_hit = false;
 	o_tHit = tMax;
-	if (!(tMin < tMax))
+	if (!(tStart < tMax))
 		return true;
 	RayDesc ray;
 	ray.Origin = origin;
 	ray.Direction = dir;
-	ray.TMin = tMin;
+	ray.TMin = 0.0;
 	ray.TMax = tMax;
 	bool complete = true;
 	RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
 	q.TraceRayInline(Scene, RAY_FLAG_NONE, kCharacterMasks, ray);
+	const float charTMin = C.Extra.x;
+	bool enteredSelf = false;
+	float innerT = tMax + 1.0;
 #if defined(RT_ALPHA)
 	uint budget = kAlphaCandidateBudget * 2u;
 #endif
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
 			continue;
+		const float t = q.CandidateTriangleRayT();
 		const uint id = q.CandidateInstanceID();
 		if (id == 0u) {
-			if (!(q.CandidateInstanceContributionToHitGroupIndex() == self.owner && q.CandidateTriangleFrontFace() != self.outerFront))
-				q.CommitNonOpaqueTriangleHit();
+			const bool own = q.CandidateInstanceContributionToHitGroupIndex() == self.owner;
+			const bool front = q.CandidateTriangleFrontFace();
+			if (own && front == self.outerFront && t < charTMin)
+				enteredSelf = true;
+			if (t < tStart)
+				continue;
+			if (own && front != self.outerFront)
+				innerT = min(innerT, t);
+			else
+				q.CommitNonOpaqueTriangleHit();  // the search goes on with a shorter ray (closest hit)
 			continue;
 		}
+		if (t < tStart)
+			continue;
 #if defined(RT_ALPHA)
 		if (budget == 0u) {
 			complete = false;
@@ -412,11 +449,18 @@ bool CharacterClosestSelf(float3 origin, float3 dir, float tMin, float tMax, flo
 		}
 #endif
 	}
-	if (complete && q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+	if (!complete)
+		return false;
+	float best = tMax + 1.0;
+	if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+		best = q.CommittedRayT();
+	if (enteredSelf)
+		best = min(best, innerT);
+	if (best <= tMax) {
 		o_hit = true;
-		o_tHit = q.CommittedRayT();
+		o_tHit = best;
 	}
-	return complete;
+	return true;
 }
 
 
