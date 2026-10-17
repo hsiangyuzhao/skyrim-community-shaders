@@ -112,6 +112,7 @@ namespace ScreenSpacePointLightShadows
 		static const uint FixedMath = (1 << 1);
 		static const uint StableNoise = (1 << 2);
 		static const uint CoverageView = (1 << 3);  // (46y) Ray Tracing debug view SSPLS Coverage, drawn by Lighting.hlsl
+		static const uint SkipTranslucent = (1 << 4);  // (47h) not in forward (non-DEFERRED) Lighting draws: they read the depth behind them
 	}
 
 	/// Legacy (pre-45) ray march setup. noiseOffset / noiseRotation are both the caller's noise when

@@ -4157,6 +4157,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// non-RT casters, z not ray traced: screen-space and / or shadow map, w no shadow), weighted by each light's brightness here.
 	const bool ssplsCoverageView = (SharedData::ssplsSettings.Enable & ScreenSpacePointLightShadows::SettingFlags::CoverageView) != 0;
 	float4 ssplsCoverage = 0.0;
+	// (47h) "Skip Screen-Space Light Shadows on Translucent Surfaces": a forward (blended) fragment that is not the surface in the
+	// depth buffer (the tolerance of RTPointShadows::Get) gets no screen-space light shadows: the search would read the surfaces
+	// behind it. Forward surfaces that are in the depth buffer keep them.
+#				if defined(DEFERRED)
+	const bool ssplsHere = true;
+#				else
+	bool ssplsHere = true;
+	[branch] if (SharedData::ssplsSettings.Enable & ScreenSpacePointLightShadows::SettingFlags::SkipTranslucent)
+		ssplsHere = abs(SharedData::GetScreenDepth(screenUV, eyeIndex) - viewPosition.z) <= viewPosition.z * 0.02 + 4.0;
+#				endif
 #			endif
 	uint numClusteredLights = 0;
 	uint totalLightCount = LightLimitFix::NumStrictLights;
@@ -4234,7 +4244,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		const bool ssplsNonRT = false;
 		const bool ssplsBesideRT = false;
 #				endif
-		const bool ssplsRun = SharedData::ssplsSettings.Enable && inWorld &&
+		const bool ssplsRun = SharedData::ssplsSettings.Enable && inWorld && ssplsHere &&
 		                      !(light.lightFlags & LightLimitFix::LightFlags::Simple) &&
 		                      shadowComponent != 0.0 &&
 		                      lightAngle > 0.0 &&

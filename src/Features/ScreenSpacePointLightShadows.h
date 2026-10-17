@@ -36,6 +36,7 @@ struct ScreenSpacePointLightShadows : Feature
 		float MaxDistance = 2048.0f;
 		uint EnableSoftShadows = true;
 		float SoftShadowScale = 2.5f;
+		bool SkipTranslucent = true;  // (47h) "Skip Screen-Space Light Shadows on Translucent Surfaces" (Enable bit 4)
 	} settings;
 
 	/// Mirrors SharedData::SSPLSSettings (package/Shaders/Common/SharedData.hlsli). Its size is pinned
