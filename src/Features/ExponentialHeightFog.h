@@ -93,18 +93,30 @@ struct ExponentialHeightFog : Feature
 
 	/// (47b) The game's own fog under the height fog. CPU side only; reaches the shaders through
 	/// VolumetricFogPSData::pad0 (see GetVolumetricPSData). Saved under "Vanilla Fog".
+	/// (47d) "EHF Follows Weather" (exteriors), formerly a bool (true -> CSFogTakesOver, false -> Off).
+	enum WeatherMode : uint32_t
+	{
+		kWeatherOff = 0,             ///< the height fog replaces the weather's fog (47a2)
+		kWeatherBlendVanillaFog = 1, ///< the weather's own fog under the height fog, weighted (47b)
+		kWeatherCSFogTakesOver = 2,  ///< the weather's fog as a layer of the height fog (47d)
+		kWeatherModeCount
+	};
+
 	struct VanillaFogSettings
 	{
-		/// "EHF Follows Weather" (exteriors): the weather's fog comes back under the height fog, weighted by how
-		/// foggy the weather is (from its engine-blended fog distance); also fixes the fog colour being weighted
-		/// by its opacity twice (upstream 22ac9859c). Off = 47a2.
-		bool FollowWeather = true;
-		/// "EHF Restores Room Fog" (interiors): the cell's own fog comes back in full under the height fog. Off = 47a2.
+		/// "EHF Follows Weather" (exteriors), a WeatherMode. Every mode but Off also fixes the fog colour being weighted
+		/// by its opacity twice (upstream 22ac9859c), and weights the weather's fog by how foggy the weather is (from
+		/// its engine-blended fog distance).
+		uint32_t WeatherMode = kWeatherCSFogTakesOver;
+		/// "EHF Restores Room Fog" (interiors, every mode): the cell's own fog comes back in full under the height
+		/// fog. Off = 47a2.
 		bool RestoreRoomFog = true;
 		/// Weather fog distance (game units) at and above which the weight is 0 (clear) ...
 		float ClearFogFar = 120000.0f;
 		/// ... and at and below which it is 1 (fog, storm); log-linear in between.
 		float FullFogFar = 15000.0f;
+		/// (47d) "CS Fog Takes Over": above the camera the weather's fog thins by e every this many game units (~300 m).
+		float TakeoverScaleHeight = 21000.0f;
 	} vanillaFog;
 
 	/// (47b) The current weight and what it was computed from (also the menu readout).
@@ -115,10 +127,28 @@ struct ExponentialHeightFog : Feature
 		bool hasWeather = false;  // exterior with a full sky and a weather
 		float fogNear = 0.0f, fogFar = 0.0f, fogPower = 0.0f, fogClamp = 0.0f;
 		const char* reason = "";  // why the weight is 0, for the readout
+		// (47d) "CS Fog Takes Over" layer (takeover = it applies this frame)
+		bool takeover = false;
+		float gamma = 1.0f;          // Linear Lighting's fog transparency gamma (1 without Linear Lighting)
+		float screenCap = 0.0f;      // the weather's on-screen max opacity, clamp^gamma
+		float halfDistance = 0.0f;   // on-screen half-cover distance (game units from the camera)
+		float sigma = 0.0f;          // extinction per game unit at and below the camera's height
 	};
 	[[nodiscard]] VanillaFogState GetVanillaFogState() const;
-	/// Flag bits in VolumetricFogPSData::pad0[1] (as uint); mirrored by ExponentialHeightFog.hlsli.
+	/// Flag bits in VolumetricFogPSData::pad0[1] (as uint); mirrored by ExponentialHeightFog.hlsli / WeatherFog.hlsli.
 	static constexpr uint32_t kFogFlagOpacityFix = 1u;
+	static constexpr uint32_t kFogFlagTakeover = 2u;  // (47d)
+
+	/// (47d) Mirrors SharedData::WeatherFogData (HLSL), appended at the very end of FeatureData.
+	struct alignas(16) WeatherFogData
+	{
+		float Sigma = 0.0f;
+		float Cap = 0.0f;  // weight x the on-screen max opacity
+		float NearDistance = 0.0f;
+		float ScaleHeight = 21000.0f;
+	};
+	STATIC_ASSERT_ALIGNAS_16(WeatherFogData);
+	[[nodiscard]] WeatherFogData GetWeatherFogData() const;
 
 	/// Mirrors SharedData::VolumetricFogSettings (HLSL), appended to FeatureData.
 	struct alignas(16) VolumetricFogPSData
@@ -220,4 +250,8 @@ private:
 	bool hasLightScatteringFarHistory = false;
 	bool hasConservativeDepthFarHistory = false;
 	uint32_t lastPrepassFrame = UINT32_MAX;
+	/// (47d) The weather layer the volumes were last built with: a jump (forced weather, mode switch) drops the
+	/// temporal history so the old fog does not ghost.
+	WeatherFogData lastVolumeWeather{};
+	[[nodiscard]] static bool WeatherLayerJumped(const WeatherFogData& a_previous, const WeatherFogData& a_current);
 };

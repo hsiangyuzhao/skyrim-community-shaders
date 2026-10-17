@@ -17,6 +17,7 @@
 // ShadowSampling's SharedShadowData).
 #include "Common/Random.hlsli"
 #include "ExponentialHeightFog/VolumetricFogCommon.hlsli"
+#include "ExponentialHeightFog/WeatherFog.hlsli"  // (47d)
 
 Texture3D<float4> ExponentialHeightFogIntegratedLightScattering : register(t21);
 Texture3D<float4> ExponentialHeightFogIntegratedLightScatteringFar : register(t22);
@@ -26,7 +27,8 @@ namespace ExponentialHeightFog
     // (47b) "EHF Follows Weather" / "EHF Restores Room Fog". ExponentialHeightFog::GetVolumetricPSData() fills
     // VolumetricFogSettings.pad0 (SharedData.hlsli is untouched): x = w, how much of the game's own fog comes back
     // under the height fog (outdoors from the weather's fog distance, 1 indoors with "Restores Room Fog", 0 = off);
-    // y (bits) = flags. Both 0 = the 47a2 fog exactly.
+    // y (bits) = flags. Both 0 = the 47a2 fog exactly. (47d) Bit 1 = WeatherFog::kFlagTakeover ("CS Fog Takes Over"
+    // applies: GetFog() replaces ComposeVanillaFog with the weather's fog layer).
     static const uint kFogFlagOpacityFix = 1u;  // "EHF Follows Weather" on: the fog colour is no longer weighted by its opacity twice
 
     float VanillaFogWeight()
@@ -264,6 +266,100 @@ namespace ExponentialHeightFog
             float combinedOpacity = saturate(1.0f - combinedTransmittance);
             float3 combinedPremultiplied = volumetricFog.rgb + volumetricFog.a * analyticalFog.rgb * analyticalFog.w;
             result = float4(combinedOpacity > 1e-4f ? combinedPremultiplied / combinedOpacity : float3(0.0f, 0.0f, 0.0f), combinedOpacity);
+        }
+        return result;
+    }
+
+    /// (47d) The height fog's colour path at this pixel, as GetAnalyticalHeightFog builds it with FogOpacityFix() on
+    /// (no opacity weighting): the fog colour (or the tinted cubemap), and in a_directional the sun / moon glow.
+    float3 GetInscatteringColor(float3 positionWS, float3 fogColor, out float3 a_directional)
+    {
+#   if defined(DYNAMIC_CUBEMAPS)
+        if (SharedData::exponentialHeightFogSettings.useDynamicCubemaps > 0)
+        {
+            float3 tintColor = lerp(fogColor, SharedData::exponentialHeightFogSettings.inscatteringTint.xyz, SharedData::exponentialHeightFogSettings.inscatteringTint.w);
+            fogColor = tintColor * DynamicCubemaps::EnvReflectionsTexture.SampleLevel(SampColorSampler, normalize(positionWS), SharedData::exponentialHeightFogSettings.cubemapMipLevel).xyz;
+        }
+#   endif
+        a_directional = 0.0f;
+        if (SharedData::exponentialHeightFogSettings.directionalInscatteringMultiplier > 0)
+        {
+            float3 dirLightColor = SharedData::DirLightColor.xyz;
+#   if defined(PHYSICAL_SKY) && defined(COMMON_PHYS_SKY_HLSLI)
+            if (SharedData::physSkyData.enabled)
+                dirLightColor *= saturate(PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampColorSampler));
+#   endif
+            a_directional = dirLightColor * pow(saturate((dot(normalize(positionWS), SharedData::DirLightDirection.xyz) + 1) / 2), SharedData::exponentialHeightFogSettings.directionalInscatteringExponent) / Math::TAU *
+                            SharedData::exponentialHeightFogSettings.directionalInscatteringMultiplier;
+        }
+        return fogColor;
+    }
+
+    /// (47d) "CS Fog Takes Over": the height fog and the weather's fog layer (WeatherFog.hlsli) as one fog, the
+    /// volumetric fog (which carries the layer inside its range) in front. The layer takes the height fog's colour
+    /// path; its sun glow is dimmed by the layer's own transmittance toward the sun; a_fade is the game's fog fade
+    /// (black for additive effects). a_weatherAmount = the layer's opacity over the whole ray.
+    float4 GetTakeoverFog(float3 positionWS, float3 cameraWS, float3 fogColor, float a_fade, bool a_useVolume, uint eyeIndex, float2 pixelPosition, out float a_weatherAmount)
+    {
+        float excludeDistance = SharedData::exponentialHeightFogSettings.startDistance;
+        float weatherStart = 0.0f;
+        float4 volumetricFog = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        bool applied = false;
+        [branch] if (a_useVolume && ShouldApplyVolumetricFog())
+        {
+            float sceneDepth;
+            volumetricFog = SampleVolumetricFog(positionWS, eyeIndex, pixelPosition, sceneDepth, applied);
+            float rayDistance = length(positionWS);
+            float cosAngle = sceneDepth / max(rayDistance, 1e-4f);
+            if (applied && cosAngle > 0.001f)
+            {
+                const float volumeEnd = min(SharedData::volumetricFogSettings.EndDistance / cosAngle, rayDistance);
+                excludeDistance = min(max(excludeDistance, volumeEnd), rayDistance);
+                weatherStart = volumeEnd;
+            }
+        }
+
+        const float4 heightFog = GetAnalyticalHeightFog(positionWS, cameraWS, fogColor, excludeDistance);
+        const float weatherOpacity = WeatherFog::Opacity(positionWS, weatherStart, a_weatherAmount);
+
+        float3 directional;
+        const float3 baseColor = GetInscatteringColor(positionWS, fogColor, directional);
+        const float3 weatherColor = (baseColor + directional * WeatherFog::SunTransmittance(0.0f)) * a_fade;
+
+        // One fog: opacities combine as 1 - (1 - aw)(1 - ae), colours by each layer's share.
+        const float ae = saturate(heightFog.w);
+        const float opacity = 1.0f - (1.0f - weatherOpacity) * (1.0f - ae);
+        const float share = weatherOpacity + ae;
+        float4 result = float4(share > 1e-5f ? (weatherOpacity * weatherColor + ae * heightFog.rgb) / share : heightFog.rgb, opacity);
+
+        [branch] if (applied)
+        {
+            float combinedOpacity = saturate(1.0f - volumetricFog.a * (1.0f - result.w));
+            float3 combinedPremultiplied = volumetricFog.rgb + volumetricFog.a * result.rgb * result.w;
+            result = float4(combinedOpacity > 1e-4f ? combinedPremultiplied / combinedOpacity : float3(0.0f, 0.0f, 0.0f), combinedOpacity);
+        }
+        return result;
+    }
+
+    /// (47d) Every fog of a pixel, for the five fog sites (ISSAOComposite, forward Lighting, Effect, Water x2): the
+    /// height fog (with the volumetric fog in front when a_useVolume) and the game's own fog (amount a_vanillaAmount
+    /// after Color::FogAlpha, colour fogColor, fade a_fade). Without the weather layer (Off, Blend Vanilla Fog,
+    /// interiors, clear weather) exactly 47b: GetExponentialHeightFog + ComposeVanillaFog.
+    float4 GetFog(float3 positionWS, float3 cameraWS, float3 fogColor, float a_vanillaAmount, float a_fade, bool a_useVolume, uint eyeIndex, float2 pixelPosition, out float a_weatherAmount)
+    {
+        float4 result;
+        [branch] if (WeatherFog::Active())
+        {
+            result = GetTakeoverFog(positionWS, cameraWS, fogColor, a_fade, a_useVolume, eyeIndex, pixelPosition, a_weatherAmount);
+        }
+        else
+        {
+            float4 heightFog;
+            [branch] if (a_useVolume)
+                heightFog = GetExponentialHeightFog(positionWS, cameraWS, fogColor, eyeIndex, pixelPosition);
+            else
+                heightFog = GetExponentialHeightFog(positionWS, cameraWS, fogColor);
+            result = ComposeVanillaFog(heightFog, fogColor, a_vanillaAmount, a_fade, a_weatherAmount);
         }
         return result;
     }

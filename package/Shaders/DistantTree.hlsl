@@ -207,6 +207,10 @@ const static float DepthOffsets[16] = {
 #		include "DynamicSnow/DynamicSnow.hlsli"
 #	endif
 
+#	if defined(EXP_HEIGHT_FOG)
+#		include "ExponentialHeightFog/WeatherFog.hlsli"  // (47d) sunlight in the weather's fog
+#	endif
+
 #	define LinearSampler SampDiffuse
 
 #	include "Common/ShadowSampling.hlsli"
@@ -278,6 +282,9 @@ PS_OUTPUT main(PS_INPUT input)
 
 	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
 	float3 diffuseColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * dirShadow * 0.5 * llDirLightMult * Color::VanillaDiffuseMult();
+#			if defined(EXP_HEIGHT_FOG)
+	diffuseColor *= WeatherFog::SunlightAttenuation(input.WorldPosition.z);  // (47d) 1 unless "CS Fog Takes Over" applies
+#			endif
 
 #			if defined(PHYSICAL_SKY)
 	if (SharedData::physSkyData.enabled)
@@ -368,6 +375,9 @@ PS_OUTPUT main(PS_INPUT input)
 
 	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
 	float3 diffuseColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * dirShadow * 0.5 * llDirLightMult * Color::VanillaDiffuseMult();
+#			if defined(EXP_HEIGHT_FOG)
+	diffuseColor *= WeatherFog::SunlightAttenuation(input.WorldPosition.z);  // (47d) 1 unless "CS Fog Takes Over" applies
+#			endif
 
 #			if defined(PHYSICAL_SKY)
 	if (SharedData::physSkyData.enabled)

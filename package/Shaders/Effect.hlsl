@@ -550,7 +550,7 @@ float ComputeShadowVariance(float shadow)
     return (v < epsilon) ? 1.0 : 0.0;
 }
 
-#	if defined(LIGHTING) && defined(VOLUMETRIC_SHADOWS)
+#	if defined(LIGHTING) && (defined(VOLUMETRIC_SHADOWS) || defined(EXP_HEIGHT_FOG))  // (47d) + the sunlight in the weather's fog
 // (batch 38, A2) Port of upstream ShadowSampling::ExtractLighting (0f79d567a): split the
 // engine's combined effect light colour into sun and ambient by the luminance ratio of the
 // sun colour and the ambient (DALC, with IBL where it replaces part of it). Returns the sun
@@ -601,6 +601,9 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 #		if defined(PHYSICAL_SKY)
 		if (SharedData::physSkyData.enabled)
 			dirLightColor *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampDepthSampler);
+#		endif
+#		if defined(EXP_HEIGHT_FOG)
+		dirLightColor *= WeatherFog::SunlightAttenuation(worldPosition.z);  // (47d) 1 unless "CS Fog Takes Over" applies
 #		endif
 
 		float3 ambientColor = max(0, mul(SharedData::DirectionalAmbient, float4(0, 0, 1, 1)));
@@ -689,6 +692,11 @@ float3 GetLightingColor(float3 msPosition, float3 worldPosition, float4 screenPo
 			color -= EstimateEffectDirectionalPart(color) * (1.0 - shadow);
 			shadowVariance = ComputeShadowVariance(shadow);
 		}
+#		endif
+#		if defined(EXP_HEIGHT_FOG)
+		// (47d) "CS Fog Takes Over": the sun's share of the engine's colour, dimmed by the weather's fog toward the sun.
+		[branch] if (WeatherFog::Active() && (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld))
+			color -= EstimateEffectDirectionalPart(color) * (1.0 - WeatherFog::SunTransmittance(worldPosition.z));
 #		endif
 #		if defined(SKYLIGHTING)
 #			if defined(VR)
@@ -957,13 +965,10 @@ PS_OUTPUT main(PS_INPUT input)
 #		if defined(EXP_HEIGHT_FOG)
 	if (SharedData::exponentialHeightFogSettings.enabled) {
 		// (batch 38, A1) + volumetric fog for effects drawn by the main camera
-		float4 exponentialHeightFog;
-		[branch] if ((Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld) && !(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection))
-			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, eyeIndex, input.Position.xy);
-		else
-			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
 		// (47b) the game's own fog (weather / room, with the game's fog fade) under the height fog; no-op while off
-		exponentialHeightFog = ExponentialHeightFog::ComposeVanillaFog(exponentialHeightFog, fogColor, fogFactor, fogMul.x, weatherFogAmount);
+		// (47d) or, with "CS Fog Takes Over", the weather's fog as a layer of the height fog
+		const bool useVolumetricFog = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld) && !(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection);
+		float4 exponentialHeightFog = ExponentialHeightFog::GetFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, fogFactor, fogMul.x, useVolumetricFog, eyeIndex, input.Position.xy, weatherFogAmount);
 		fogColor = exponentialHeightFog.xyz;
 		fogFactor = exponentialHeightFog.w;
 		fogMul = 1;

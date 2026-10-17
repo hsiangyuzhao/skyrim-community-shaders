@@ -3747,6 +3747,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		dirLightColorMultiplier *= PhysSky::SampleTr(normalize(DirLightDirection.xyz), SampShadowMaskSampler);
 #	endif
 
+#	if defined(EXP_HEIGHT_FOG)
+	// (47d) "CS Fog Takes Over": the weather's fog between the surface and the sun dims the sunlight (1 otherwise).
+	// The light's strength, once: shadows (RT, cascades, screen space) stay visibility terms.
+	[branch] if (inWorld || inReflection)
+		dirLightColorMultiplier *= WeatherFog::SunlightAttenuation(input.WorldPosition.z);
+#	endif
+
 #	if defined(WATER_EFFECTS)
 	dirLightColorMultiplier *= WaterEffects::ComputeCaustics(waterData, input.WorldPosition.xyz, eyeIndex);
 #	endif
@@ -4909,13 +4916,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(EXP_HEIGHT_FOG)
 	if (SharedData::exponentialHeightFogSettings.enabled) {
 		// (batch 38, A1) the froxel volumes belong to the main camera: not in reflections
-		float4 exponentialHeightFog;
-		[branch] if (inWorld && !inReflection)
-			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, eyeIndex, input.Position.xy);
-		else
-			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
 		// (47b) the game's own fog (weather / room) under the height fog; no-op while off
-		exponentialHeightFog = ExponentialHeightFog::ComposeVanillaFog(exponentialHeightFog, fogColor, fogFactor, 1.0, weatherFogAmount);
+		// (47d) or, with "CS Fog Takes Over", the weather's fog as a layer of the height fog
+		float4 exponentialHeightFog = ExponentialHeightFog::GetFog(input.WorldPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, fogFactor, 1.0, inWorld && !inReflection, eyeIndex, input.Position.xy, weatherFogAmount);
 		fogColor = exponentialHeightFog.xyz;
 		fogFactor = exponentialHeightFog.w;
 	}

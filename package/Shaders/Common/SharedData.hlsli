@@ -525,7 +525,7 @@ namespace SharedData
 		float4 FarGridZParams;      // same for the far volume
 		float NearGridEndDistance;  // view depth where the near volume hands over to the far one
 		float UpsampleJitter;       // screen-space jitter of the lookup, in froxels
-		float2 pad0;
+		float2 pad0;               // (47b/47d) x = the game's fog weight, y = flag bits (ExponentialHeightFog.hlsli, WeatherFog.hlsli)
 	};
 
 	// (batch 38, A2) Mirrors VolumetricShadows::CommonBufferData, after VolumetricFogSettings
@@ -638,6 +638,17 @@ namespace SharedData
 		float SnowLineEnd;        // (44i) ... and where everything is cold
 	};
 
+	// (47d) Mirrors ExponentialHeightFog::WeatherFogData, appended at the very end of FeatureData (offset 1904).
+	// "CS Fog Takes Over": the weather's fog as a layer of the height fog (ExponentialHeightFog/WeatherFog.hlsli).
+	// Only read while VolumetricFogSettings.pad0.y carries the takeover flag (outdoors, weather fog weight > 0).
+	struct WeatherFogData
+	{
+		float Sigma;         // extinction per game unit at and below the camera's height
+		float Cap;           // weight x the weather's on-screen max opacity
+		float NearDistance;  // no weather fog closer than this (the weather's fog near)
+		float ScaleHeight;   // above the camera the density falls by e every this many game units
+	};
+
 	namespace PhysSkyCloudFlags
 	{
 		static const uint MultiLight = (1 << 0);        // clouds: sun + both moons + sky (0 = the 42a single-light code)
@@ -691,6 +702,7 @@ namespace SharedData
 		PhysSkyNightData physSkyNightData;
 		PhysSkyCloudData physSkyCloudData;
 		DynamicSnowMapData dynamicSnowMapData;
+		WeatherFogData weatherFogData;  // (47d)
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);

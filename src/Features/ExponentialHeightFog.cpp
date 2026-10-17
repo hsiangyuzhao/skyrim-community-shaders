@@ -5,6 +5,7 @@
 #include "Features/IBL.h"
 #include "Features/InverseSquareLighting.h"
 #include "Features/LightLimitFix.h"
+#include "Features/LinearLighting.h"
 #include "Features/Skylighting.h"
 #include "Features/TerrainBlending.h"
 #include "Features/TerrainShadows.h"
@@ -75,14 +76,17 @@ namespace
 
     constexpr const char* kVolumetricKey = "Volumetric Fog";
     constexpr const char* kVanillaFogKey = "Vanilla Fog";  // (47b)
+    constexpr float kMinTakeoverScaleHeight = 3500.0f;     // (47d) ~50 m
+    constexpr float kMaxTakeoverScaleHeight = 140000.0f;   // (47d) ~2 km
 }
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ExponentialHeightFog::VanillaFogSettings,
-    FollowWeather,
+    WeatherMode,
     RestoreRoomFog,
     ClearFogFar,
-    FullFogFar)
+    FullFogFar,
+    TakeoverScaleHeight)
 
 void ExponentialHeightFog::RestoreDefaultSettings()
 {
@@ -97,8 +101,18 @@ void ExponentialHeightFog::LoadSettings(json& o_json)
     if (o_json.contains(kVolumetricKey) && o_json[kVolumetricKey].is_object())
         volumetric = o_json[kVolumetricKey];
     vanillaFog = {};
-    if (o_json.contains(kVanillaFogKey) && o_json[kVanillaFogKey].is_object())
-        vanillaFog = o_json[kVanillaFogKey];
+    if (o_json.contains(kVanillaFogKey) && o_json[kVanillaFogKey].is_object()) {
+        const auto& vanillaFogJson = o_json[kVanillaFogKey];
+        vanillaFog = vanillaFogJson;
+        // (47d) The 47b bool "FollowWeather": on -> "CS Fog Takes Over" (the new default), off -> Off.
+        if (!vanillaFogJson.contains("WeatherMode") && vanillaFogJson.contains("FollowWeather") && vanillaFogJson["FollowWeather"].is_boolean())
+            vanillaFog.WeatherMode = vanillaFogJson["FollowWeather"].get<bool>() ? kWeatherCSFogTakesOver : kWeatherOff;
+    }
+    if (vanillaFog.WeatherMode >= kWeatherModeCount)
+        vanillaFog.WeatherMode = kWeatherCSFogTakesOver;
+    if (!std::isfinite(vanillaFog.TakeoverScaleHeight))
+        vanillaFog.TakeoverScaleHeight = VanillaFogSettings{}.TakeoverScaleHeight;
+    vanillaFog.TakeoverScaleHeight = std::clamp(vanillaFog.TakeoverScaleHeight, kMinTakeoverScaleHeight, kMaxTakeoverScaleHeight);
 }
 
 void ExponentialHeightFog::SaveSettings(json& o_json)
@@ -131,7 +145,7 @@ ExponentialHeightFog::VanillaFogState ExponentialHeightFog::GetVanillaFogState()
             state.reason = "EHF Restores Room Fog off";
         return state;
     }
-    if (!vanillaFog.FollowWeather) {
+    if (vanillaFog.WeatherMode == kWeatherOff) {
         state.reason = "EHF Follows Weather off";
         return state;
     }
@@ -153,9 +167,73 @@ ExponentialHeightFog::VanillaFogState ExponentialHeightFog::GetVanillaFogState()
     }
     const float weight = std::log(clear / state.fogFar) / std::log(clear / full);
     state.weight = std::isfinite(weight) ? std::clamp(weight, 0.0f, 1.0f) : 0.0f;
-    if (!(state.weight > 0.0f))
+    if (!(state.weight > 0.0f)) {
         state.reason = "clear weather";
+        return state;
+    }
+    if (vanillaFog.WeatherMode != kWeatherCSFogTakesOver)
+        return state;
+
+    // (47d) "CS Fog Takes Over": the weather's fog as an exponential layer (WeatherFog.hlsli) fitted to what the game
+    // shows. On screen the game's fog covers min(clamp, x^power)^gamma at x = (d - near) / (far - near) (gamma = Linear
+    // Lighting's fog transparency gamma, Color::FogAlpha); the layer takes the same cap, clamp^gamma, and the same
+    // half-cover distance d50 = near + (far - near) (clamp 2^(-1/gamma))^(1/power): sigma = ln 2 / (d50 - near).
+    const auto& linearLighting = globals::features::linearLighting.settings;
+    float gamma = linearLighting.enableLinearLighting ? linearLighting.fogAlphaGamma : 1.0f;
+    if (!std::isfinite(gamma) || !(gamma > 0.0f))
+        gamma = 1.0f;
+    const double clampValue = std::isfinite(state.fogClamp) ? std::clamp(static_cast<double>(state.fogClamp), 0.0, 1.0) : 0.0;
+    const double nearDistance = std::isfinite(state.fogNear) ? std::max(static_cast<double>(state.fogNear), 0.0) : 0.0;
+    const double farDistance = state.fogFar;
+    // Power 0 (or almost) is a wall at the near distance (NAT's night snow): held at 0.05, a few dozen units deep.
+    const double power = std::isfinite(state.fogPower) ? std::max(static_cast<double>(state.fogPower), 0.05) : 1.0;
+    if (!(clampValue > 0.0) || !(farDistance > nearDistance + 1.0)) {
+        // Nothing the layer could match (no fog on screen, or far not beyond near): the height fog alone.
+        state.weight = 0.0f;
+        state.reason = "weather fog has no visible amount";
+        return state;
+    }
+    const double halfRatio = std::pow(std::clamp(clampValue * std::exp2(-1.0 / gamma), 1e-6, 1.0), 1.0 / power);
+    const double halfDistance = std::max(nearDistance + (farDistance - nearDistance) * halfRatio, nearDistance + 64.0);
+    state.gamma = gamma;
+    state.screenCap = static_cast<float>(std::pow(clampValue, static_cast<double>(gamma)));
+    state.halfDistance = static_cast<float>(halfDistance);
+    state.sigma = static_cast<float>(std::numbers::ln2 / (halfDistance - nearDistance));
+    state.takeover = std::isfinite(state.sigma) && state.sigma > 0.0f && state.screenCap > 0.0f;
+    if (!state.takeover) {
+        state.weight = 0.0f;
+        state.reason = "weather fog has no visible amount";
+    }
     return state;
+}
+
+ExponentialHeightFog::WeatherFogData ExponentialHeightFog::GetWeatherFogData() const
+{
+    WeatherFogData data{};
+    data.ScaleHeight = std::clamp(vanillaFog.TakeoverScaleHeight, kMinTakeoverScaleHeight, kMaxTakeoverScaleHeight);
+    const auto state = GetVanillaFogState();
+    if (state.takeover) {
+        data.Sigma = state.sigma;
+        data.Cap = std::clamp(state.weight * state.screenCap, 0.0f, 1.0f);
+        data.NearDistance = std::max(state.fogNear, 0.0f);
+    }
+    return data;
+}
+
+bool ExponentialHeightFog::WeatherLayerJumped(const WeatherFogData& a_previous, const WeatherFogData& a_current)
+{
+    // Engine weather transitions move these a little per frame; a forced weather or a mode switch moves them at once.
+    if ((a_previous.Cap > 0.0f) != (a_current.Cap > 0.0f))
+        return true;
+    if (!(a_current.Cap > 0.0f))
+        return false;
+    if (std::abs(a_current.Cap - a_previous.Cap) > 0.05f)
+        return true;
+    if (!(a_previous.Sigma > 0.0f) || std::abs(std::log(a_current.Sigma / a_previous.Sigma)) > 0.1f)
+        return true;
+    if (std::abs(a_current.ScaleHeight - a_previous.ScaleHeight) > 0.05f * a_previous.ScaleHeight)
+        return true;
+    return std::abs(a_current.NearDistance - a_previous.NearDistance) > 500.0f;
 }
 
 ExponentialHeightFog::Settings ExponentialHeightFog::GetCommonBufferData() const
@@ -173,7 +251,7 @@ bool ExponentialHeightFog::VolumetricFogActive() const
     if (!VolumetricFogRequested())
         return false;
     const float density2 = GetCommonBufferData().fogDensity2;
-    if (settings.fogDensity <= 0.0f && density2 <= 0.0f)
+    if (settings.fogDensity <= 0.0f && density2 <= 0.0f && !GetVanillaFogState().takeover)  // (47d) or the weather's fog layer
         return false;
     if (volumetric.ExtinctionScale <= 0.0f)
         return false;
@@ -186,7 +264,7 @@ std::string ExponentialHeightFog::VolumetricFogIdleReason() const
 {
     if (!VolumetricFogRequested() || VolumetricFogActive())
         return {};
-    if (settings.fogDensity <= 0.0f && GetCommonBufferData().fogDensity2 <= 0.0f)
+    if (settings.fogDensity <= 0.0f && GetCommonBufferData().fogDensity2 <= 0.0f && !GetVanillaFogState().takeover)
         return "height fog density is 0";
     if (volumetric.ExtinctionScale <= 0.0f)
         return "Volumetric Extinction Scale is 0";
@@ -220,8 +298,14 @@ ExponentialHeightFog::VolumetricFogPSData ExponentialHeightFog::GetVolumetricPSD
     VolumetricFogPSData data{};
     // (47b) The game's fog under the height fog: written before any early return (the shaders read it whether or not
     // the volumes are built). Both 0 with the two switches off = the 47a2 fog exactly.
-    data.pad0[0] = GetVanillaFogState().weight;
-    data.pad0[1] = std::bit_cast<float>((loaded && settings.enabled && vanillaFog.FollowWeather) ? kFogFlagOpacityFix : 0u);
+    // (47d) Blend Vanilla Fog = 47b exactly. CS Fog Takes Over also flags the weather's fog layer (SharedData::weatherFogData)
+    // while it applies (outdoors, w > 0); the shaders then take the layer instead of the weight in pad0[0].
+    const auto vanillaFogState = GetVanillaFogState();
+    data.pad0[0] = vanillaFogState.weight;
+    uint32_t fogFlags = (loaded && settings.enabled && vanillaFog.WeatherMode != kWeatherOff) ? kFogFlagOpacityFix : 0u;
+    if (vanillaFogState.takeover)
+        fogFlags |= kFogFlagTakeover;
+    data.pad0[1] = std::bit_cast<float>(fogFlags);
     if (!VolumetricFogActive())
         return data;
 
@@ -494,8 +578,12 @@ void ExponentialHeightFog::Prepass()
 
     const bool temporalReprojection = Util::GetTemporal();
     const bool frameContinuous = lastPrepassFrame != UINT32_MAX && globals::state->frameCount == lastPrepassFrame + 1u;
-    const bool temporalHistoryValid = temporalReprojection && hasLightScatteringHistory && frameContinuous;
-    const bool temporalHistoryValidFar = temporalReprojection && hasLightScatteringFarHistory && frameContinuous;
+    // (47d) A sudden change of the weather's fog layer (forced weather, mode switch): start the history over.
+    const auto weatherFog = GetWeatherFogData();
+    const bool weatherJumped = WeatherLayerJumped(lastVolumeWeather, weatherFog);
+    lastVolumeWeather = weatherFog;
+    const bool temporalHistoryValid = temporalReprojection && hasLightScatteringHistory && frameContinuous && !weatherJumped;
+    const bool temporalHistoryValidFar = temporalReprojection && hasLightScatteringFarHistory && frameContinuous && !weatherJumped;
 
     const auto p = ComputeGridParams(currentGridSize.z, currentFarGridSize.z);
 
@@ -787,14 +875,24 @@ void ExponentialHeightFog::DrawSettings()
 
     // (47b) The game's own fog under the height fog.
     ImGui::SeparatorText("Game Fog");
-    ImGui::Checkbox("EHF Follows Weather", &vanillaFog.FollowWeather);
+    {
+        // (47d) Off = 47a2, Blend Vanilla Fog = 47b, CS Fog Takes Over = the weather's fog as a layer of the height fog.
+        static constexpr const char* kWeatherModeNames[kWeatherModeCount] = { "Off", "Blend Vanilla Fog", "CS Fog Takes Over" };
+        int weatherMode = static_cast<int>(std::min<uint32_t>(vanillaFog.WeatherMode, kWeatherModeCount - 1));
+        if (ImGui::Combo("EHF Follows Weather", &weatherMode, kWeatherModeNames, static_cast<int>(kWeatherModeCount)))
+            vanillaFog.WeatherMode = static_cast<uint32_t>(weatherMode);
+    }
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
-            "Outdoors. On: foggy weather keeps its fog. The weather's own fog comes back under the height fog,\n"
-            "by how foggy the weather is: none in clear or cloudy weather, some in overcast and rain, all of it\n"
-            "in fog, storms and blizzards. The distant physical-sky haze steps back behind that fog. Also fixes the\n"
-            "height fog's colour being dimmed twice, so clear-weather distance looks a little brighter.\n"
-            "Off = as before (the height fog replaces the weather's fog).");
+            "Outdoors: how foggy weather keeps its fog. None of it comes back in clear or cloudy weather, some in\n"
+            "overcast and rain, all of it in fog, storms and blizzards.\n"
+            "  Off: as before 47b (the height fog replaces the weather's fog).\n"
+            "  Blend Vanilla Fog: the game's own flat fog comes back under the height fog (47b).\n"
+            "  CS Fog Takes Over (default): the weather's fog becomes part of the height fog, as thick as the game's\n"
+            "  on screen but thinning above your height (mountains rise out of it), the sky fades with height, the sun\n"
+            "  glow and the sunlight on the ground dim in it, and Volumetric Fog (if you turned it on) carries it too.\n"
+            "Every mode but Off also fixes the height fog's colour being dimmed twice. The distant physical-sky haze\n"
+            "steps back behind the weather's fog.");
     ImGui::Checkbox("EHF Restores Room Fog", &vanillaFog.RestoreRoomFog);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Indoors. On: caves, dungeons and houses keep their own fog, with the height fog on top.\nOff = as before (the height fog replaces it).");
@@ -804,6 +902,11 @@ void ExponentialHeightFog::DrawSettings()
             ImGui::Text("Weather fog: near %.0f, far %.0f, power %.2f, max %.2f -> weight %.2f", state.fogNear, state.fogFar, state.fogPower, state.fogClamp, state.weight);
         else
             ImGui::Text("Game fog weight %.2f%s%s", state.weight, *state.reason ? " - " : "", state.reason);
+        if (state.takeover)  // (47d) the layer as the shaders get it; 70 game units ~ 1 m
+            ImGui::Text("Takeover layer: sigma %.2e / unit, cap %.2f (x weight %.2f), half cover at %.0f m", state.sigma, state.screenCap,
+                state.weight * state.screenCap, state.halfDistance / 70.0f);
+        else if (state.hasWeather && vanillaFog.WeatherMode == kWeatherCSFogTakesOver && *state.reason)
+            ImGui::Text("Takeover layer: none - %s", state.reason);
     }
     if (ImGui::TreeNode("Advanced##GameFog")) {
         ImGui::SliderFloat("Clear Fog Distance", &vanillaFog.ClearFogFar, 20000.0f, 400000.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
@@ -812,6 +915,12 @@ void ExponentialHeightFog::DrawSettings()
         ImGui::SliderFloat("Full Fog Distance", &vanillaFog.FullFogFar, 1000.0f, 100000.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text("Weather fog distance at and below which all of it comes back. Default 15000.");
+        ImGui::SliderFloat("Takeover Thinning Height", &vanillaFog.TakeoverScaleHeight, kMinTakeoverScaleHeight, kMaxTakeoverScaleHeight, "%.0f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "CS Fog Takes Over: above your own height the weather's fog thins out by about two thirds every this\n"
+                "many game units (70 units ~ 1 m). Lower = mountains and the sky come out of the fog sooner.\n"
+                "Default 21000 (~300 m).");
         ImGui::TreePop();
     }
 

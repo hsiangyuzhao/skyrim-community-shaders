@@ -1197,6 +1197,9 @@ PS_OUTPUT main(PS_INPUT input)
 
 	if (!(Permutation::PixelShaderDescriptor & Permutation::WaterFlags::Interior) && any(sunColor > 0.0)) {
 		sunColor *= ShadowSampling::GetWaterShadow(screenNoise, input.WPosition.xyz, eyeIndex);
+#					if defined(EXP_HEIGHT_FOG)
+		sunColor *= WeatherFog::SunlightAttenuation(input.WPosition.z);  // (47d) 1 unless "CS Fog Takes Over" applies
+#					endif
 	}
 
 #					if defined(VC)
@@ -1214,13 +1217,10 @@ PS_OUTPUT main(PS_INPUT input)
 	if (SharedData::exponentialHeightFogSettings.enabled)
 	{
 		// (batch 38, A1) + volumetric fog when drawn by the main camera
-		float4 exponentialHeightFog;
-		[branch] if (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld)
-			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, eyeIndex, input.HPosition.xy);
-		else
-			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor);
 		// (47b) the game's own fog (weather / room, with the water's fog fade) under the height fog; no-op while off
-		exponentialHeightFog = ExponentialHeightFog::ComposeVanillaFog(exponentialHeightFog, fogColor, fogFactor, PosAdjust[eyeIndex].w, weatherFogAmount);
+		// (47d) or, with "CS Fog Takes Over", the weather's fog as a layer of the height fog
+		const bool useVolumetricFog = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld) != 0;
+		float4 exponentialHeightFog = ExponentialHeightFog::GetFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, fogFactor, PosAdjust[eyeIndex].w, useVolumetricFog, eyeIndex, input.HPosition.xy, weatherFogAmount);
 		fogColor = exponentialHeightFog.xyz;
 		fogFactor = exponentialHeightFog.w;
 	}
@@ -1255,13 +1255,10 @@ PS_OUTPUT main(PS_INPUT input)
 	if (SharedData::exponentialHeightFogSettings.enabled)
 	{
 		// (batch 38, A1) + volumetric fog when drawn by the main camera
-		float4 exponentialHeightFog;
-		[branch] if (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld)
-			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, preFogColor, eyeIndex, input.HPosition.xy);
-		else
-			exponentialHeightFog = ExponentialHeightFog::GetExponentialHeightFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, preFogColor);
 		// (47b) the game's own fog (weather / room, with the water's fog fade) under the height fog; no-op while off
-		exponentialHeightFog = ExponentialHeightFog::ComposeVanillaFog(exponentialHeightFog, preFogColor, preFogFactor, PosAdjust[eyeIndex].w, weatherFogAmount);
+		// (47d) or, with "CS Fog Takes Over", the weather's fog as a layer of the height fog
+		const bool useVolumetricFog = (Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InWorld) != 0;
+		float4 exponentialHeightFog = ExponentialHeightFog::GetFog(input.WPosition.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, preFogColor, preFogFactor, PosAdjust[eyeIndex].w, useVolumetricFog, eyeIndex, input.HPosition.xy, weatherFogAmount);
 		preFogColor = exponentialHeightFog.xyz;
 		preFogFactor = exponentialHeightFog.w;
 	}

@@ -559,6 +559,10 @@ cbuffer AlphaTestRefCB : register(b11)
 #		include "PhysicalSky/Common.hlsli"
 #	endif
 
+#	if defined(EXP_HEIGHT_FOG)
+#		include "ExponentialHeightFog/WeatherFog.hlsli"  // (47d) sunlight in the weather's fog
+#	endif
+
 #	define LinearSampler SampBaseSampler
 
 #	include "Common/ShadowSampling.hlsli"
@@ -759,6 +763,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #			if defined(PHYSICAL_SKY)
 	if (SharedData::physSkyData.enabled)
 		dirLightColorMultiplier *= PhysSky::SampleTr(normalize(SharedData::DirLightDirection.xyz), SampShadowMaskSampler);
+#			endif
+
+#			if defined(EXP_HEIGHT_FOG)
+	dirLightColorMultiplier *= WeatherFog::SunlightAttenuation(input.WorldPosition.z);  // (47d) 1 unless "CS Fog Takes Over" applies
 #			endif
 
 	float dirLightAngle = dot(normal, SharedData::DirLightDirection.xyz);
@@ -1118,6 +1126,9 @@ PS_OUTPUT main(PS_INPUT input)
 
 	float llDirLightMult = (SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear) ? SharedData::linearLightingSettings.dirLightMult : 1.0f;
 	float3 diffuseColor = Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * dirShadow * dirDetailShadow * 0.5 * llDirLightMult;
+#			if defined(EXP_HEIGHT_FOG)
+	diffuseColor *= WeatherFog::SunlightAttenuation(input.WorldPosition.z);  // (47d) 1 unless "CS Fog Takes Over" applies
+#			endif
 
 #			if defined(LIGHT_LIMIT_FIX)
 	uint clusterIndex = 0;

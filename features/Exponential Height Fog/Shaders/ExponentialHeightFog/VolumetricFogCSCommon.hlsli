@@ -60,6 +60,7 @@ cbuffer VolumetricFogCB : register(b0)
 #define VolumetricFogStateFrameIndexMod8 ((uint)(VolumetricFogJitterParameters.y + 0.5f))
 
 #include "ExponentialHeightFog/VolumetricFogCommon.hlsli"
+#include "ExponentialHeightFog/WeatherFog.hlsli"  // (47d) "CS Fog Takes Over": the weather's fog layer joins the medium
 
 namespace ExponentialHeightFog
 {

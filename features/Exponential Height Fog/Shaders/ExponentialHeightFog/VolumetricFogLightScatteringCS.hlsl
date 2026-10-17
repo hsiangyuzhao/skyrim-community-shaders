@@ -311,8 +311,10 @@ float4 ComputeLightScattering(uint3 coord, float3 cellOffset)
 	float3 viewDirection = normalize(positionWS);
 	float phase = ExponentialHeightFog::HenyeyGreenstein(dot(normalize(SharedData::DirLightDirection.xyz), viewDirection), VolumetricFogLighting.w);
 
+	// (47d) x the weather's fog toward the sun ("CS Fog Takes Over"; 1 otherwise), as on surfaces.
 	float directionalShadow = SampleDirectionalShadow(positionWS, eyeIndex) *
-	                          ShadowSampling::GetWorldShadow(positionWS, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, eyeIndex);
+	                          ShadowSampling::GetWorldShadow(positionWS, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, eyeIndex) *
+	                          WeatherFog::SunlightAttenuation(positionWS.z);
 	float3 directionalScattering =
 		GetDirectionalLightColor() *
 		VolumetricFogLighting.x *

@@ -13,6 +13,9 @@ RWTexture3D<float4> VBufferA : register(u0);
 	float3 positionWS = ExponentialHeightFog::ComputeCellWorldPosition(dispatchID, 0.5f.xxx, eyeIndex, viewDepth);
 
 	float extinction = ExponentialHeightFog::EvaluateHeightFogExtinction(positionWS, FrameBuffer::CameraPosAdjust[eyeIndex].xyz);
+	// (47d) "CS Fog Takes Over": the weather's fog layer inside the volume's range (the analytical layer covers the rest
+	// of the ray), shaped so a camera ray ends with the layer's capped transmittance. 0 otherwise.
+	extinction += WeatherFog::VolumetricExtinction(positionWS);
 	float3 albedo = saturate(VolumetricFogAlbedo.rgb);
 	float3 scattering = extinction * albedo * VolumetricFogAlbedo.a;
 
