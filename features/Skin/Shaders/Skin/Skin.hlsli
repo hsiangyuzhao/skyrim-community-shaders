@@ -192,12 +192,12 @@ namespace Skin
 		return saturate(max(swimTrail, max(wetPhysParams[2].z * rainRegion * (1.0 / 1.3), wetPhysParams[2].w * sweatRegion * (1.0 / 1.25))));
 	}
 
-	/// One fade for all of a character's beads by their drawn radius in render pixels (1 -> 2.5 px; no per-bead popping),
+	/// One fade for all of a character's beads by their drawn diameter in render pixels (1 -> 2.5 px; no per-bead popping),
 	/// x the distance LOD. cmPerUV: cm of surface per uv unit; uvFootprint: uv per render pixel.
 	float WetPhysBeadFade(float cmPerUV, float uvFootprint, float lod)
 	{
-		const float rPx = wetPhysParams[2].x / max(cmPerUV * uvFootprint, 1e-8);
-		return smoothstep(1.0, 2.5, rPx) * lod;
+		const float dPx = 2.0 * wetPhysParams[2].x / max(cmPerUV * uvFootprint, 1e-8);  // drawn diameter in render pixels
+		return smoothstep(1.0, 2.5, dPx) * lod;
 	}
 
 	/// Droplet cells per uv unit for the drawn bead radius (a bead is 0.42 cell in radius).
