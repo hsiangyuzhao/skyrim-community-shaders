@@ -3526,6 +3526,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	config.native = settings.PointLightsNative;
 	config.keepSSPLS = settings.PointLightsKeepSSPLS;
 	config.ssplsNonRT = settings.PointLightsSSPLSNonRT;  // (46y)
+	config.waterBed = settings.PointShadowsOnWater;  // (47h)
 	config.ssplsContact = settings.PointLightsSSPLSContact;
 	config.split = pointSplit;
 	config.maxSources = static_cast<std::uint32_t>(std::clamp(settings.PointLightsMaxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources)));
@@ -5084,6 +5085,13 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("On (default): at night leaves, bushes and cut-out shapes (fences, nets) cast shadows from torches and campfires,");
 				ImGui::Text("  for the kinds traced with their cut-out (Foliage / Cut-outs under Sun Shadows > Advanced). A little slower.");
 				ImGui::Text("Off: outdoors only solid shapes block point lights.");
+			}
+			// (47h)
+			ImGui::Checkbox("Point Light Shadows on Water", &settings.PointShadowsOnWater);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): a ray-traced light that a wall hides from shallow water (a forge behind a stone foundation) no longer");
+				ImGui::Text("  shines on the water: the water takes the traced shadow of the river bed right under it. Deep water and lights not");
+				ImGui::Text("  traced there keep the screen-space shadows as before. Off: as in 47g.");
 			}
 			ImGui::BeginDisabled(!settings.PointLightsInteriors);
 			{

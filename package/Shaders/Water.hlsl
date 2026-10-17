@@ -1141,7 +1141,14 @@ PS_OUTPUT main(PS_INPUT input)
 			// (46b) Ray-traced visibility: only where this fragment is the traced surface (water itself is drawn
 			// after the depth prepass, so in practice its point lights keep the old path below).
 			float rtVisibility = 1.0;
-			const bool rtShadow = !FrameBuffer::FrameParams.z && RTPointShadows::Get(light.rtShadow, input.HPosition.xy, screenUV, viewPosition.z, eyeIndex, rtVisibility);
+			bool rtShadow = false;
+			[branch] if (!FrameBuffer::FrameParams.z)
+			{
+				rtShadow = RTPointShadows::Get(light.rtShadow, input.HPosition.xy, screenUV, viewPosition.z, eyeIndex, rtVisibility);
+				// (47h) Point Light Shadows on Water: else the traced visibility of the shallow bed under this water (GetWater).
+				[branch] if (!rtShadow)
+					rtShadow = RTPointShadows::GetWater(light.rtShadow, input.HPosition.xy, screenUV, viewPosition.xyz, lightDist, eyeIndex, rtVisibility);
+			}
 			if (rtShadow)
 				lightColor *= rtVisibility;
 #					else

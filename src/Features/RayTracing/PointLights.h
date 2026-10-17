@@ -48,6 +48,8 @@ namespace RayTracingPointLights
 	// = that length in eighths of the ray tracer's start offset (RT Caster Contact Length x 8).
 	inline constexpr std::uint32_t kTagSSPLSNonRT = 1u << 11;
 	inline constexpr std::uint32_t kTagContactShift = 16u;
+	// (47h) "Point Light Shadows on Water": the water above a shallow bed takes the bed's traced visibility (PointLightShadows.hlsli GetWater).
+	inline constexpr std::uint32_t kTagWaterBed = 1u << 12;
 
 	// GpuSource::info[0] bits (TracePointLightsCS).
 	inline constexpr std::uint32_t kSourceISL = 1u;     // inverse-square attenuation (InverseSquareLighting)
@@ -113,6 +115,7 @@ namespace RayTracingPointLights
 		bool native = true;         // include the engine's shadow-map lights (RT replaces their shadow map in Lighting)
 		bool keepSSPLS = false;     // tag: keep SSPLS as contact shadows for RT lights
 		bool ssplsNonRT = false;    // (46y) tag: SSPLS beside RT for occluders the ray tracer does not see (wins over keepSSPLS)
+		bool waterBed = false;      // (47h) tag: Point Light Shadows on Water
 		float ssplsContact = 8.0f;  // (46y) their contact length for traced occluders, x the ray start offset (0 - 31.875)
 		bool split = false;         // tag: debug split screen
 		std::uint32_t maxSources = 64;
