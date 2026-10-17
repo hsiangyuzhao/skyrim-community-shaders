@@ -354,8 +354,12 @@ void PhysicalSky::DrawSettings()
 			"- the game's clouds reach down to the real horizon (their dome is squeezed so that where they used to fade out\n"
 			"  is now the horizon; the far, flattened clouds fade into the haze);\n"
 			"- the distant sea below the horizon reflects the clouds above it (needs Cloud Shadows);\n"
-			"- the fog runs on to the curved sea's real distance below the horizon, the weather fog keeps thickening below\n"
-			"  you down to sea level, and the fog's colour is no longer taken from the ground (no dark blotches).\n"
+			"- (47g) the fog on the sky follows each view ray's real, curved path: just below level the ray passes above the\n"
+			"  sea and leaves the air (no band at the level line), below the sea horizon it ends on the sea, whose reflection\n"
+			"  carries the fog of the reflected sky (no seam at the horizon);\n"
+			"- (47g) the weather fog sits on the ground, not on you: from high places only the low part near the valley floor\n"
+			"  is thick (below about 300 m above the Fog Height you see the same as before);\n"
+			"- the fog's colour is no longer taken from the ground (no dark blotches).\n"
 			"Needs Sky Fixes. Off = exactly as 47e.");
 	if (settings.horizonFix && settings.skyFixes && cloudFadeMeasured > 0)
 		ImGui::TextDisabled("Cloud layers measured: %u (%s)", cloudFadeMeasured, cloudFadeNote.c_str());
@@ -1415,33 +1419,7 @@ void PhysicalSky::UpdateSkyFixes(const bool a_fixes, const RE::NiPoint3& a_lutSu
 	auto& dbg = skyFixesDebug;
 	float g = 0.f;
 	if (GetAmbientProgress(g)) {
-		const auto& s = settings;
-		PhysicalSkyModel::Atmosphere atmosphere;
-		atmosphere.rPlanet = s.planetRadius;
-		atmosphere.rAtmosphere = s.atmosphereRadius;
-		atmosphere.rayleighScatter = { s.rayleighScatter.x * 1e-3, s.rayleighScatter.y * 1e-3, s.rayleighScatter.z * 1e-3 };
-		atmosphere.rayleighFalloff = s.rayleighFalloff;
-		// (47b) As uploaded: the Aerosol preset's values when one is picked.
-		float3 aerosolScatter, aerosolAbsorption;
-		float aerosolPhaseG = 0.f;
-		GetUploadedAerosol(aerosolScatter, aerosolAbsorption, aerosolPhaseG);
-		atmosphere.aerosolScatter = { aerosolScatter.x * 1e-3, aerosolScatter.y * 1e-3, aerosolScatter.z * 1e-3 };
-		atmosphere.aerosolAbsorption = { aerosolAbsorption.x * 1e-3, aerosolAbsorption.y * 1e-3, aerosolAbsorption.z * 1e-3 };
-		atmosphere.aerosolFalloff = s.aerosolFalloff;
-		atmosphere.aerosolPhaseG = aerosolPhaseG;
-		// As uploaded (Reset): the moved ozone layer.
-		const double ozoneScale = std::isfinite(s.ozoneThickness) ? std::max(s.ozoneThickness, 0.f) / kOzoneFixThickness : 0.0;
-		atmosphere.ozoneAltitude = kOzoneFixAltitude;
-		atmosphere.ozoneThickness = kOzoneFixThickness;
-		atmosphere.ozoneAbsorption = { s.ozoneAbsorption.x * 1e-3 * ozoneScale, s.ozoneAbsorption.y * 1e-3 * ozoneScale, s.ozoneAbsorption.z * 1e-3 * ozoneScale };
-		atmosphere.groundAlbedo = { s.groundAlbedo.x, s.groundAlbedo.y, s.groundAlbedo.z };
-		atmosphere.midpoint = true;
-		atmosphere.groundFix = true;
-		atmosphere.multiScatterFix = effective.fixMultiScatter;
-		atmosphere.trLutEdgeFix = effective.fixTrLutEdge;
-		atmosphere.precision = (extCbData.flags & kExtSkyPrecision) != 0;  // (47b) the transmittance LUT as the GPU builds it
-
-		if (skyModelCpu.Update(atmosphere)) {
+		if (UpdateCpuSkyModel()) {
 			auto unit = [](float x, float y, float z) {
 				const double l = std::sqrt(double(x) * x + double(y) * y + double(z) * z);
 				return l > 1e-9 ? PhysicalSkyModel::Vec3{ x / l, y / l, z / l } : PhysicalSkyModel::Vec3{ 0.0, 0.0, 1.0 };
@@ -1861,18 +1839,27 @@ void PhysicalSky::Reset()
 	// (47a) Sky brightness factor, LUT flags and star values (all neutral when off).
 	UpdateSkyFixes(skyFixes, lutSunDir);
 
-	// (47f) Horizon Fix: the camera's height over sea level (the ground sphere is 500 units below the worldspace's water,
-	// FallbackZBottom) and over the ground sphere.
+	// (47f) Horizon Fix: the camera's height over the ground sphere (500 units below the worldspace's water,
+	// FallbackZBottom). (47g) The weather fog layer's base is anchored to world height: the camera's height up to the
+	// reference max(EHF Fog Height, sea level) + the layer's thinning height, that reference above it; anchorOffset is how
+	// far the camera is above the base (WeatherFog.hlsli). No more thickening below the camera (47f).
 	horizonFixCbData = {};
+	auto& heightFog = globals::features::exponentialHeightFog;
 	if (HorizonFixActive()) {
 		horizonFixCbData.flags = 1u;
 		horizonFixCbData.altitude = std::max(posCam.z - cbData.zBottom, 0.f);
-		horizonFixCbData.anchorDepth = std::max(posCam.z - (cbData.zBottom + 500.f), 0.f);
-		const float scaleHeight = std::max(globals::features::exponentialHeightFog.GetWeatherFogData().ScaleHeight, 1.f);
-		horizonFixCbData.floorDensity = std::min(std::exp(horizonFixCbData.anchorDepth / scaleHeight), 1e6f);
-		if (!std::isfinite(horizonFixCbData.altitude) || !std::isfinite(horizonFixCbData.anchorDepth) || !std::isfinite(horizonFixCbData.floorDensity))
+		const float scaleHeight = std::max(heightFog.GetWeatherFogData().ScaleHeight, 1.f);
+		const float seaLevel = cbData.zBottom + 500.f;
+		const float reference = std::max(heightFog.GetCommonBufferData().fogHeight, seaLevel) + scaleHeight;
+		horizonFixCbData.anchorOffset = std::max(posCam.z - reference, 0.f);
+		if (!std::isfinite(horizonFixCbData.altitude) || !std::isfinite(horizonFixCbData.anchorOffset))
 			horizonFixCbData = {};
 	}
+	// (47g) EHF "Physical Fog Brightness": the clear sky's light on the fog (0 = off; independent of the Horizon Fix).
+	if (heightFog.loaded && heightFog.vanillaFog.PhysicalFogBrightness)
+		horizonFixCbData.fogSkyLight = ComputeFogSkyLight(lutSunDir);
+	else
+		fogSkyLightFrame = UINT32_MAX;
 }
 
 void PhysicalSky::EarlyPrepass()
@@ -2402,4 +2389,78 @@ void PhysicalSky::UnbindHorizonWarp()
 		horizonWarpPrevious->Release();
 		horizonWarpPrevious = nullptr;
 	}
+}
+
+/// (47a, 47g) The CPU copy of the scattering model with the atmosphere as uploaded (Sky Fixes, Sky Precision, Aerosol).
+bool PhysicalSky::UpdateCpuSkyModel()
+{
+	const auto& s = settings;
+	PhysicalSkyModel::Atmosphere atmosphere;
+	atmosphere.rPlanet = s.planetRadius;
+	atmosphere.rAtmosphere = s.atmosphereRadius;
+	atmosphere.rayleighScatter = { s.rayleighScatter.x * 1e-3, s.rayleighScatter.y * 1e-3, s.rayleighScatter.z * 1e-3 };
+	atmosphere.rayleighFalloff = s.rayleighFalloff;
+	// (47b) As uploaded: the Aerosol preset's values when one is picked.
+	float3 aerosolScatter, aerosolAbsorption;
+	float aerosolPhaseG = 0.f;
+	GetUploadedAerosol(aerosolScatter, aerosolAbsorption, aerosolPhaseG);
+	atmosphere.aerosolScatter = { aerosolScatter.x * 1e-3, aerosolScatter.y * 1e-3, aerosolScatter.z * 1e-3 };
+	atmosphere.aerosolAbsorption = { aerosolAbsorption.x * 1e-3, aerosolAbsorption.y * 1e-3, aerosolAbsorption.z * 1e-3 };
+	atmosphere.aerosolFalloff = s.aerosolFalloff;
+	atmosphere.aerosolPhaseG = aerosolPhaseG;
+	// As uploaded (Reset): the moved ozone layer.
+	const double ozoneScale = std::isfinite(s.ozoneThickness) ? std::max(s.ozoneThickness, 0.f) / kOzoneFixThickness : 0.0;
+	atmosphere.ozoneAltitude = kOzoneFixAltitude;
+	atmosphere.ozoneThickness = kOzoneFixThickness;
+	atmosphere.ozoneAbsorption = { s.ozoneAbsorption.x * 1e-3 * ozoneScale, s.ozoneAbsorption.y * 1e-3 * ozoneScale, s.ozoneAbsorption.z * 1e-3 * ozoneScale };
+	atmosphere.groundAlbedo = { s.groundAlbedo.x, s.groundAlbedo.y, s.groundAlbedo.z };
+	atmosphere.midpoint = true;
+	atmosphere.groundFix = true;
+	atmosphere.multiScatterFix = effective.fixMultiScatter;
+	atmosphere.trLutEdgeFix = effective.fixTrLutEdge;
+	atmosphere.precision = (extCbData.flags & kExtSkyPrecision) != 0;  // (47b) the transmittance LUT as the GPU builds it
+	return skyModelCpu.Update(atmosphere);
+}
+
+float PhysicalSky::ComputeFogSkyLight(const RE::NiPoint3& a_lutSunDir)
+{
+	// Every 4th frame (the sky changes slowly), and on the first one.
+	const uint32_t frame = globals::state->frameCount;
+	if (fogSkyLightFrame != UINT32_MAX && frame - fogSkyLightFrame < 4u)
+		return fogSkyLightCached;
+	fogSkyLightFrame = frame;
+	fogSkyLightCached = 0.f;
+	if (!UpdateCpuSkyModel())
+		return 0.f;
+	auto unit = [](float x, float y, float z) {
+		const double l = std::sqrt(double(x) * x + double(y) * y + double(z) * z);
+		return l > 1e-9 ? PhysicalSkyModel::Vec3{ x / l, y / l, z / l } : PhysicalSkyModel::Vec3{ 0.0, 0.0, 1.0 };
+	};
+	auto vec = [](const float3& c) { return PhysicalSkyModel::Vec3{ c.x, c.y, c.z }; };
+	const double cameraRadius = static_cast<double>(cbData.zCameraPlanet) * Util::Units::GAME_UNIT_TO_KM;
+	const PhysicalSkyModel::Light lights[3] = {
+		{ unit(a_lutSunDir.x, a_lutSunDir.y, a_lutSunDir.z), vec(cbData.sunlightColor) },
+		{ unit(cbData.masserDir.x, cbData.masserDir.y, cbData.masserDir.z), vec(cbData.masserColor) },
+		{ unit(cbData.secundaDir.x, cbData.secundaDir.y, cbData.secundaDir.z), vec(cbData.secundaColor) },
+	};
+	// Cosine-weighted mean over the upper hemisphere: bands 0-30, 30-60, 60-90 degrees (weights sin^2 differences
+	// 0.25 / 0.5 / 0.25), each at its middle ring. The sun's in-scatter x Sky Fixes' brightness factor, as drawn.
+	constexpr double kElevations[3] = { 15.0, 45.0, 75.0 };
+	constexpr double kWeights[3] = { 0.25, 0.5, 0.25 };
+	const bool baseOn = (nightCbData.flags & kNightBaseLight) != 0;
+	double light = 0.0;
+	for (int i = 0; i < 3; ++i) {
+		const double sun = skyModelCpu.RingLuminance(cameraRadius, kElevations[i], lights, 1);
+		const double moons = skyModelCpu.RingLuminance(cameraRadius, kElevations[i], lights + 1, 2);
+		double base = 0.0;
+		if (baseOn) {
+			const float mix = SkySync::SmoothStep(0.f, 0.5f, static_cast<float>(std::sin(DirectX::XMConvertToRadians(static_cast<float>(kElevations[i])))));
+			const float3 c = nightCbData.baseHorizon + (nightCbData.baseUpper - nightCbData.baseHorizon) * mix;
+			base = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+		}
+		light += kWeights[i] * (sun * std::clamp(nightCbData.skyScale, 1.f, kSkyFixesScaleCap) + moons + base);
+	}
+	if (std::isfinite(light) && light > 0.0)
+		fogSkyLightCached = static_cast<float>(std::clamp(light, 1e-6, 100.0));
+	return fogSkyLightCached;
 }

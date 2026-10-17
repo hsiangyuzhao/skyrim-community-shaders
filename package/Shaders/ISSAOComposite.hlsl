@@ -198,14 +198,11 @@ PS_OUTPUT main(PS_INPUT input)
 		// (47d) "CS Fog Takes Over": the weather's fog as a layer of the height fog instead (sky pixels along the view ray).
 		float weatherFogAmount;
 		const float vanillaFogAmount = (depth < 0.999999 || !SharedData::InInterior) ? fogFactor : 0.0;
-		// (47f) Horizon Fix: sky pixels are fogged out to the curved sea below the planet horizon (where the physical sky
-		// shows the distant sea) and to at least the horizon's distance above it, so the haze meets the horizon without a line.
-		[branch] if (depth >= 0.999999 && HorizonFix::Active())
-		{
-			const float skyRay = length(positionWS.xyz);
-			positionWS.xyz *= HorizonFix::SkyDistance(positionWS.xyz / max(skyRay, 1e-4), skyRay) / max(skyRay, 1e-4);
-		}
-		float4 exponentialHeightFog = ExponentialHeightFog::GetFog(positionWS.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, vanillaFogAmount, FogNearColor.w, true, eyeIndex, input.TexCoord.xy * SharedData::BufferDim.xy, weatherFogAmount);
+		// (47g) Horizon Fix: a sky pixel's fog follows its ray's curved path: out of the air above the planet horizon (rays
+		// down to it pass above the sea), to the distant sea and its reflection below it, through each layer's own height
+		// profile (HorizonFix::SkyLayerIntegral). Continuous across 0 degrees and the planet horizon.
+		const bool curvedSky = depth >= 0.999999 && HorizonFix::Active();
+		float4 exponentialHeightFog = ExponentialHeightFog::GetFog(positionWS.xyz, FrameBuffer::CameraPosAdjust[eyeIndex].xyz, fogColor, vanillaFogAmount, FogNearColor.w, true, eyeIndex, input.TexCoord.xy * SharedData::BufferDim.xy, weatherFogAmount, curvedSky);
 		fogColor = exponentialHeightFog.xyz;
 		fogFactor = exponentialHeightFog.w;
 	}

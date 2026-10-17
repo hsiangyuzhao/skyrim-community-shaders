@@ -650,13 +650,13 @@ namespace SharedData
 	};
 
 	// (47f) Mirrors PhysicalSky::HorizonFixCbData, appended after WeatherFogData (offset 1920). Physical Sky > Sky Fixes >
-	// "Horizon Fix" (ExponentialHeightFog/WeatherFog.hlsli namespace HorizonFix, Sky.hlsl). All 0 while it is off.
+	// "Horizon Fix" (Common/HorizonFix.hlsli, WeatherFog.hlsli, Sky.hlsl). All but FogSkyLight 0 while it is off.
 	struct HorizonFixData
 	{
-		float AnchorDepth;  // camera height over sea level (game units): the weather fog layer keeps thickening down to it
+		float AnchorOffset; // (47g) how far the camera is above the weather fog layer's base (game units; 0 = the base is the camera)
 		float Altitude;     // camera height over the physical sky's ground sphere (game units)
 		uint Flags;         // bit 0: Horizon Fix in effect (Physical Sky drawn, Sky Fixes and Horizon Fix on)
-		float FloorDensity; // exp(AnchorDepth / the weather layer's ScaleHeight): its density at sea level (1 = off)
+		float FogSkyLight;  // (47g) EHF "Physical Fog Brightness": the clear physical sky's light on a white surface facing up (0 = off)
 	};
 
 	namespace PhysSkyCloudFlags

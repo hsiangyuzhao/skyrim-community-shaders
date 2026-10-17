@@ -69,9 +69,32 @@ namespace ExponentialHeightFog
         return float4(a_ap.rgb * keep, lerp(1.0f, a_ap.a, keep));
     }
 
+    /// (47g) The exp2 argument of one analytical layer along the first a_length units of a camera ray (flat, as below
+    /// without an excluded part): origin density x the line integral x the length.
+    float FlatLayerX(float a_density, float a_falloff, float a_height, float a_cameraZ, float a_directionZ, float a_length)
+    {
+        const float origin = a_density * exp2(-a_falloff * max(a_cameraZ - a_height, 0));
+        const float falloff = a_falloff * a_directionZ * a_length;
+        const float lineIntegral = abs(falloff) > 0.01f ? (1.0f - exp2(-falloff)) / falloff : 0.69314718056f - 0.24022650695f * falloff;
+        return origin * lineIntegral * a_length;
+    }
+
+    /// (47g) Horizon Fix, sky pixels: the exp2 argument of one analytical layer along the ray's curved path (out of the air,
+    /// or to the sea and its reflection), minus its first a_skip units (flat; the volumetric fog's part or Start Distance).
+    /// Density d x exp2(-f max(z - height, 0)) has scale height 1 / (f ln 2); the flat form's exp2 argument is ln 2 x the
+    /// density integral, so this one is too.
+    float CurvedLayerX(HorizonFix::SkyRay a_ray, float a_density, float a_falloff, float a_height, float a_cameraZ, float a_directionZ, float a_skip)
+    {
+        const float scale = 1.0f / max(a_falloff * 0.69314718056f, 1e-7f);
+        const float base = HorizonFix::Altitude() - (a_cameraZ - a_height);
+        const float total = 0.69314718056f * a_density * HorizonFix::SkyLayerIntegral(a_ray, base, scale);
+        return max(total - (a_skip > 0.0f ? FlatLayerX(a_density, a_falloff, a_height, a_cameraZ, a_directionZ, a_skip) : 0.0f), 0.0f);
+    }
+
     /// The analytical height fog. excludeDistance replaces Start Distance as the length of the
     /// ray that gets no fog; with volumetric fog off it is Start Distance, i.e. the 37c fog.
-    float4 GetAnalyticalHeightFog(float3 positionWS, float3 cameraWS, float3 fogColor, float excludeDistance)
+    /// (47g) a_curvedSky: a sky pixel under Horizon Fix (the ray's curved path, CurvedLayerX).
+    float4 GetAnalyticalHeightFog(float3 positionWS, float3 cameraWS, float3 fogColor, float excludeDistance, bool a_curvedSky = false)
     {
         float fogHeightFalloff = SharedData::exponentialHeightFogSettings.fogHeightFalloff * 0.001f;
         float fogDensity = SharedData::exponentialHeightFogSettings.fogDensity * 0.001f;
@@ -116,9 +139,27 @@ namespace ExponentialHeightFog
             exponentialHeightLineIntegralCalc += rayOriginTerms2 * (abs(falloff2) > 0.01f ? lineIntegral2 : lineIntegralTaylor2);
         }
         float exponentialHeightLineIntegral = exponentialHeightLineIntegralCalc * rayLength;
+        float dirExponentialHeightLineIntegral = exponentialHeightLineIntegralCalc * max(rayLength - SharedData::exponentialHeightFogSettings.startDistance, 0);
+
+        // (47g) Horizon Fix, sky pixels: along the ray's curved path, both layers, past the excluded part (resp. Start
+        // Distance for the directional glow's own opacity).
+        [branch] if (a_curvedSky)
+        {
+            const float3 direction = viewToPos * viewToPosLengthInv;
+            const HorizonFix::SkyRay ray = HorizonFix::MakeSkyRay(direction.z);
+            const float startDistance = SharedData::exponentialHeightFogSettings.startDistance;
+            exponentialHeightLineIntegral = CurvedLayerX(ray, fogDensity, fogHeightFalloff, SharedData::exponentialHeightFogSettings.fogHeight, cameraWS.z, direction.z, excludeDistance);
+            dirExponentialHeightLineIntegral = CurvedLayerX(ray, fogDensity, fogHeightFalloff, SharedData::exponentialHeightFogSettings.fogHeight, cameraWS.z, direction.z, startDistance);
+            [branch] if (fogDensity2 > 0.0f)
+            {
+                exponentialHeightLineIntegral += CurvedLayerX(ray, fogDensity2, fogHeightFalloff2, SharedData::exponentialHeightFogSettings.fogHeight2, cameraWS.z, direction.z, excludeDistance);
+                dirExponentialHeightLineIntegral += CurvedLayerX(ray, fogDensity2, fogHeightFalloff2, SharedData::exponentialHeightFogSettings.fogHeight2, cameraWS.z, direction.z, startDistance);
+            }
+        }
 
         float expFogFactor = saturate(exp2(-exponentialHeightLineIntegral));
 
+        bool cubemapColored = false;
 #   if defined(DYNAMIC_CUBEMAPS)
         if (SharedData::exponentialHeightFogSettings.useDynamicCubemaps > 0)
         {
@@ -127,8 +168,13 @@ namespace ExponentialHeightFog
             // (47b) With "EHF Follows Weather" the colour is not pre-weighted by the opacity the callers blend with
             // (upstream 22ac9859c, #2776); off = 47a2.
             fogColor = tintColor * cubemapColor * (FogOpacityFix() ? 1.0f : (1.0f - expFogFactor));
+            cubemapColored = true;
         }
 #   endif
+        // (47g) "Physical Fog Brightness": without the cubemap colour, the fog colour's hue at the brightness of the light
+        // that reaches the fog (WeatherFog::PhysicalFogColor; unchanged while off, indoors or without the physical sky).
+        [branch] if (!cubemapColored)
+            fogColor = WeatherFog::PhysicalFogColor(fogColor, 0.0f);
 
         float3 directionalInscattering = 0;
 
@@ -143,7 +189,6 @@ namespace ExponentialHeightFog
             }
 #   endif
             float3 directionalLightInscattering = dirLightColor * pow(saturate((dot(normalize(positionWS), SharedData::DirLightDirection.xyz) + 1) / 2), SharedData::exponentialHeightFogSettings.directionalInscatteringExponent) / Math::TAU;
-            float dirExponentialHeightLineIntegral = exponentialHeightLineIntegralCalc * max(rayLength - SharedData::exponentialHeightFogSettings.startDistance, 0);
             float dirExpFogFactor = saturate(exp2(-dirExponentialHeightLineIntegral));
             directionalInscattering = directionalLightInscattering * (FogOpacityFix() ? 1.0f : (1 - dirExpFogFactor)) * SharedData::exponentialHeightFogSettings.directionalInscatteringMultiplier;  // (47b) as above
         }
@@ -239,7 +284,7 @@ namespace ExponentialHeightFog
     /// Height fog with the volumetric fog in front of it. The analytical fog only covers the
     /// part of the ray beyond the volumetric fog's range, and the two are composited front
     /// (volume) to back (analytical). Exactly the 37c fog whenever the volumes are off.
-    float4 GetExponentialHeightFog(float3 positionWS, float3 cameraWS, float3 fogColor, uint eyeIndex, float2 pixelPosition)
+    float4 GetExponentialHeightFog(float3 positionWS, float3 cameraWS, float3 fogColor, uint eyeIndex, float2 pixelPosition, bool a_curvedSky = false)
     {
         float excludeDistance = SharedData::exponentialHeightFogSettings.startDistance;
         float4 volumetricFog = float4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -256,7 +301,7 @@ namespace ExponentialHeightFog
                 excludeDistance = min(max(excludeDistance, SharedData::volumetricFogSettings.EndDistance / cosAngle), rayDistance);
         }
 
-        float4 analyticalFog = GetAnalyticalHeightFog(positionWS, cameraWS, fogColor, excludeDistance);
+        float4 analyticalFog = GetAnalyticalHeightFog(positionWS, cameraWS, fogColor, excludeDistance, a_curvedSky);
 
         float4 result = analyticalFog;
         [branch] if (applied)
@@ -274,13 +319,17 @@ namespace ExponentialHeightFog
     /// (no opacity weighting): the fog colour (or the tinted cubemap), and in a_directional the sun / moon glow.
     float3 GetInscatteringColor(float3 positionWS, float3 fogColor, out float3 a_directional)
     {
+        bool cubemapColored = false;
 #   if defined(DYNAMIC_CUBEMAPS)
         if (SharedData::exponentialHeightFogSettings.useDynamicCubemaps > 0)
         {
             float3 tintColor = lerp(fogColor, SharedData::exponentialHeightFogSettings.inscatteringTint.xyz, SharedData::exponentialHeightFogSettings.inscatteringTint.w);
             fogColor = tintColor * DynamicCubemaps::EnvReflectionsTexture.SampleLevel(SampColorSampler, HorizonFix::ClampToHorizon(normalize(positionWS)) /* (47f) */, SharedData::exponentialHeightFogSettings.cubemapMipLevel).xyz;
+            cubemapColored = true;
         }
 #   endif
+        [branch] if (!cubemapColored)
+            fogColor = WeatherFog::PhysicalFogColor(fogColor, 0.0f);  // (47g) as GetAnalyticalHeightFog
         a_directional = 0.0f;
         if (SharedData::exponentialHeightFogSettings.directionalInscatteringMultiplier > 0)
         {
@@ -299,7 +348,7 @@ namespace ExponentialHeightFog
     /// volumetric fog (which carries the layer inside its range) in front. The layer takes the height fog's colour
     /// path; its sun glow is dimmed by the layer's own transmittance toward the sun; a_fade is the game's fog fade
     /// (black for additive effects). a_weatherAmount = the layer's opacity over the whole ray.
-    float4 GetTakeoverFog(float3 positionWS, float3 cameraWS, float3 fogColor, float a_fade, bool a_useVolume, uint eyeIndex, float2 pixelPosition, out float a_weatherAmount)
+    float4 GetTakeoverFog(float3 positionWS, float3 cameraWS, float3 fogColor, float a_fade, bool a_useVolume, uint eyeIndex, float2 pixelPosition, out float a_weatherAmount, bool a_curvedSky = false)
     {
         float excludeDistance = SharedData::exponentialHeightFogSettings.startDistance;
         float weatherStart = 0.0f;
@@ -319,8 +368,8 @@ namespace ExponentialHeightFog
             }
         }
 
-        const float4 heightFog = GetAnalyticalHeightFog(positionWS, cameraWS, fogColor, excludeDistance);
-        const float weatherOpacity = WeatherFog::Opacity(positionWS, weatherStart, a_weatherAmount);
+        const float4 heightFog = GetAnalyticalHeightFog(positionWS, cameraWS, fogColor, excludeDistance, a_curvedSky);
+        const float weatherOpacity = WeatherFog::Opacity(positionWS, weatherStart, a_weatherAmount, a_curvedSky);
 
         float3 directional;
         const float3 baseColor = GetInscatteringColor(positionWS, fogColor, directional);
@@ -345,20 +394,20 @@ namespace ExponentialHeightFog
     /// height fog (with the volumetric fog in front when a_useVolume) and the game's own fog (amount a_vanillaAmount
     /// after Color::FogAlpha, colour fogColor, fade a_fade). Without the weather layer (Off, Blend Vanilla Fog,
     /// interiors, clear weather) exactly 47b: GetExponentialHeightFog + ComposeVanillaFog.
-    float4 GetFog(float3 positionWS, float3 cameraWS, float3 fogColor, float a_vanillaAmount, float a_fade, bool a_useVolume, uint eyeIndex, float2 pixelPosition, out float a_weatherAmount)
+    float4 GetFog(float3 positionWS, float3 cameraWS, float3 fogColor, float a_vanillaAmount, float a_fade, bool a_useVolume, uint eyeIndex, float2 pixelPosition, out float a_weatherAmount, bool a_curvedSky = false)
     {
         float4 result;
         [branch] if (WeatherFog::Active())
         {
-            result = GetTakeoverFog(positionWS, cameraWS, fogColor, a_fade, a_useVolume, eyeIndex, pixelPosition, a_weatherAmount);
+            result = GetTakeoverFog(positionWS, cameraWS, fogColor, a_fade, a_useVolume, eyeIndex, pixelPosition, a_weatherAmount, a_curvedSky);
         }
         else
         {
             float4 heightFog;
             [branch] if (a_useVolume)
-                heightFog = GetExponentialHeightFog(positionWS, cameraWS, fogColor, eyeIndex, pixelPosition);
+                heightFog = GetExponentialHeightFog(positionWS, cameraWS, fogColor, eyeIndex, pixelPosition, a_curvedSky);
             else
-                heightFog = GetExponentialHeightFog(positionWS, cameraWS, fogColor);
+                heightFog = GetAnalyticalHeightFog(positionWS, cameraWS, fogColor, SharedData::exponentialHeightFogSettings.startDistance, a_curvedSky);
             result = ComposeVanillaFog(heightFog, fogColor, a_vanillaAmount, a_fade, a_weatherAmount);
         }
         return result;

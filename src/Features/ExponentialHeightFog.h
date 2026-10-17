@@ -124,6 +124,10 @@ struct ExponentialHeightFog : Feature
 		float FullFogFar = 15000.0f;
 		/// (47d) "CS Fog Takes Over": above the camera the weather's fog thins by e every this many game units (~300 m).
 		float TakeoverScaleHeight = 21000.0f;
+		/// (47g) "Physical Fog Brightness": the fog's brightness from what lights it (the clear physical sky and the sun through
+		/// the weather layer), the fog colour giving only its hue. Where the fog takes the fog colour (not Dynamic Cubemaps)
+		/// and in Match Weather Fog Brightness; needs Physical Sky outdoors. Off = 47f.
+		bool PhysicalFogBrightness = true;
 	} vanillaFog;
 
 	/// (47b) The current weight and what it was computed from (also the menu readout).

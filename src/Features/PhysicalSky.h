@@ -460,6 +460,7 @@ struct PhysicalSky final : public Feature
 	/// (47a) Sky brightness follows the ground: sets nightCbData.skyScale (smoothed) and the Sky Fixes
 	/// flags and star values. a_lutSunDir is the LUTs' sun (world frame).
 	void UpdateSkyFixes(bool a_fixes, const RE::NiPoint3& a_lutSunDir);
+	bool UpdateCpuSkyModel();  // (47g) skyModelCpu with the atmosphere as uploaded
 	/// (47a) g: the weather's blended ground ambient (DALC) between its night and day keys, 0-1; false
 	/// when there is no usable difference (|day - night| < 10%) or no weather.
 	static bool GetAmbientProgress(float& a_g);
@@ -518,11 +519,16 @@ struct PhysicalSky final : public Feature
 	/// (47f) Mirrors SharedData::HorizonFixData (HLSL), appended after WeatherFogData at the very end of FeatureData.
 	struct HorizonFixCbData
 	{
-		float anchorDepth = 0.f;  // camera height over sea level (zBottom + 500), game units
-		float altitude = 0.f;     // camera height over the ground sphere (zBottom), game units
-		uint flags = 0;           // bit 0: Horizon Fix in effect
-		float floorDensity = 1.f; // exp(anchorDepth / the weather fog layer's ScaleHeight), capped (WeatherFog.hlsli)
+		float anchorOffset = 0.f;  // (47g) camera height over the weather fog layer's base (0 = the base is the camera), game units
+		float altitude = 0.f;      // camera height over the ground sphere (zBottom), game units
+		uint flags = 0;            // bit 0: Horizon Fix in effect
+		float fogSkyLight = 0.f;   // (47g) EHF Physical Fog Brightness: the clear sky's light on a white surface facing up (0 = off)
 	} horizonFixCbData;
+	/// (47g) The clear physical sky's light on a white surface facing up (its cosine-weighted mean radiance, as drawn:
+	/// Sky Fixes' brightness factor, the moons' glow, the night base light), from the CPU model; 0 when it cannot be had.
+	float ComputeFogSkyLight(const RE::NiPoint3& a_lutSunDir);
+	uint32_t fogSkyLightFrame = UINT32_MAX;
+	float fogSkyLightCached = 0.f;
 	static_assert(sizeof(HorizonFixCbData) == 16);
 
 	/// (47f) Horizon Fix (a): the cloud dome warp. Per cloud draw the vertex shader gets (VS b11, Sky.hlsl HorizonFixVS)

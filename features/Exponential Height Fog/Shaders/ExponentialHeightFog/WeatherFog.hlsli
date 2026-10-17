@@ -9,7 +9,8 @@
 //  - opacity along a camera ray: Cap (1 - exp(-tau)), with Cap = w x the weather's on-screen max opacity and
 //    tau = Sigma x the integral of the density from the weather's fog near distance on. Sigma is fitted so that the
 //    on-screen half-cover distance equals the game's;
-//  - density: 1 at and below the camera's height, exp(-h / ScaleHeight) above it (h = height over the camera);
+//  - density: 1 at and below the layer's base, exp(-h / ScaleHeight) above it. The base is the camera's height (47d), or
+//    (47g, Horizon Fix) a world height the camera can rise above (HorizonFix::AnchorOffset());
 //  - light toward the sun through the layer has the same form, so sunlight never gets darker than the farthest
 //    mountain shows through the fog (1 - Cap).
 // Only SharedData is needed: Lighting, Effect, Water, RunGrass, DistantTree and the volumetric fog passes include it.
@@ -32,26 +33,26 @@ namespace WeatherFog
 		return max(SharedData::weatherFogData.ScaleHeight, 1.0f);
 	}
 
-	/// (47f) Horizon Fix: below the camera the layer keeps thickening, exp(-h / H), down to sea level (HorizonFix::AnchorDepth()
-	/// under the camera), and is even below that. 0 while the fix is off: even below the camera, the 47e layer exactly.
-	float Floor()
+	/// (47g) How far the camera is above the layer's base (Horizon Fix: the base is anchored to world height); 0 = the base
+	/// is the camera's height, the 47e layer exactly.
+	float Offset()
 	{
-		return -HorizonFix::AnchorDepth();
+		return HorizonFix::AnchorOffset();
 	}
 
-	/// Relative density at a height over the camera (1 at the camera).
+	/// Relative density at a height over the camera (1 at and below the base).
 	float Density(float a_height)
 	{
-		return exp(-max(a_height, Floor()) / ScaleHeight());
+		return exp(-max(a_height + Offset(), 0.0f) / ScaleHeight());
 	}
 
-	/// Integral of the relative density over the heights [a_low, a_high] (a_low <= a_high).
+	/// Integral of the relative density over the heights [a_low, a_high] (a_low <= a_high, over the camera).
 	float DensityIntegral(float a_low, float a_high)
 	{
 		const float H = ScaleHeight();
-		const float f = Floor();  // (47f) 0 = the 47e form exactly
-		const float below = (min(a_high, f) - min(a_low, f)) * HorizonFix::FloorDensity();
-		const float above = H * (exp(-max(a_low, f) / H) - exp(-max(a_high, f) / H));
+		const float o = Offset();  // (47g) 0 = the 47e form exactly
+		const float below = min(a_high, -o) - min(a_low, -o);
+		const float above = H * (exp(-max(a_low + o, 0.0f) / H) - exp(-max(a_high + o, 0.0f) / H));
 		return below + above;
 	}
 
@@ -68,21 +69,30 @@ namespace WeatherFog
 	}
 
 	/// Transmittance of the layer along a camera ray up to distance a_distance: 1 - Cap (1 - exp(-tau)); 1 within the
-	/// weather's fog near distance.
-	float Transmittance(float3 a_direction, float a_distance)
+	/// weather's fog near distance. (47g) a_curvedSky (Horizon Fix, sky pixels): along the ray's curved path out of the air,
+	/// or to the sea and its reflection (HorizonFix::SkyLayerIntegral); a_distance is then not used.
+	float Transmittance(float3 a_direction, float a_distance, bool a_curvedSky = false)
 	{
 		const float nearDistance = max(SharedData::weatherFogData.NearDistance, 0.0f);
-		const float tau = SharedData::weatherFogData.Sigma * RayDensityIntegral(a_direction, nearDistance, max(a_distance, nearDistance));
+		float tau;
+		[branch] if (a_curvedSky)
+		{
+			const HorizonFix::SkyRay ray = HorizonFix::MakeSkyRay(a_direction.z);
+			const float base = HorizonFix::Altitude() - Offset();
+			tau = SharedData::weatherFogData.Sigma * max(HorizonFix::SkyLayerIntegral(ray, base, ScaleHeight()) - RayDensityIntegral(a_direction, 0.0f, nearDistance), 0.0f);
+		}
+		else
+			tau = SharedData::weatherFogData.Sigma * RayDensityIntegral(a_direction, nearDistance, max(a_distance, nearDistance));
 		return 1.0f - saturate(SharedData::weatherFogData.Cap) * (1.0f - exp(-tau));
 	}
 
 	/// Opacity of the layer over the part of a camera ray (camera-relative a_positionWS) beyond a_startDistance (what lies
 	/// in front of it is the volumetric fog's). a_fullOpacity = the layer's opacity over the whole ray.
-	float Opacity(float3 a_positionWS, float a_startDistance, out float a_fullOpacity)
+	float Opacity(float3 a_positionWS, float a_startDistance, out float a_fullOpacity, bool a_curvedSky = false)
 	{
 		const float distance = length(a_positionWS);
 		const float3 direction = a_positionWS / max(distance, 1e-4f);
-		const float endTransmittance = Transmittance(direction, distance);
+		const float endTransmittance = Transmittance(direction, distance, a_curvedSky);
 		a_fullOpacity = saturate(1.0f - endTransmittance);
 		float startTransmittance = 1.0f;
 		[branch] if (a_startDistance > 0.0f)
@@ -90,15 +100,20 @@ namespace WeatherFog
 		return saturate(1.0f - endTransmittance / max(startTransmittance, 1e-4f));
 	}
 
+	/// Optical depth of the layer above a point a_height over the camera, straight up (Sigma x the density integral).
+	float VerticalDepth(float a_height)
+	{
+		const float H = ScaleHeight();
+		const float z = a_height + Offset();  // over the base
+		return SharedData::weatherFogData.Sigma * (max(-z, 0.0f) + H * exp(-max(z, 0.0f) / H));
+	}
+
 	/// Transmittance of the layer from a point a_height over the camera toward the sun (to the top of the layer).
 	float SunTransmittance(float a_height)
 	{
 		// Sun near the horizon: the path is held at ~3 degrees; it is long enough there to reach the cap anyway.
 		const float mu = max(SharedData::DirLightDirection.z, 0.05f);
-		const float H = ScaleHeight();
-		const float f = Floor();  // (47f) 0 = the 47e form exactly
-		const float depth = (max(f - a_height, 0.0f) * HorizonFix::FloorDensity() + H * exp(-max(a_height, f) / H)) / mu;
-		return 1.0f - saturate(SharedData::weatherFogData.Cap) * (1.0f - exp(-SharedData::weatherFogData.Sigma * depth));
+		return 1.0f - saturate(SharedData::weatherFogData.Cap) * (1.0f - exp(-VerticalDepth(a_height) / mu));
 	}
 
 	/// Direct sunlight on a surface a_height over the camera: dimmed by the layer between it and the sun.
@@ -128,6 +143,59 @@ namespace WeatherFog
 			extinction = max(cap * sigma * Density(a_positionWS.z) * remaining / max(transmittance, 1e-4f), 0.0f);
 		}
 		return extinction;
+	}
+
+	// ---- (47g) "Physical Fog Brightness" (Exponential Height Fog) ---------------------------------------------------
+	//
+	// The fog's brightness from what lights it, with the weather's fog colour giving only the hue: a deep fog of droplets
+	// (single-scattering albedo about 1) shows the mean of the light coming down to it and the light coming back up from
+	// below, (1 + ground albedo) / 2 x the downwelling light, in the units a white surface facing up would show (the game's
+	// sun x cos, the sky as ambient). The downwelling light: the sun, and the physical sky's own light (unfogged, from
+	// Physical Sky's model on the CPU: HorizonFixData.FogSkyLight, 0 = off / no physical sky), each through the weather layer
+	// above the point with its scattered light kept (two-stream, conservative scattering, g = 0.85): 1 / (1 + 0.75 (1 - g)
+	// tau / mu). Off (FogSkyLight 0): the weather's colour as before.
+
+	float PhysicalSkyLight()
+	{
+		return SharedData::horizonFixData.FogSkyLight;
+	}
+
+	/// The directional light as surfaces receive it (linear; Linear Lighting's conversion, as the volumetric fog's
+	/// GetDirectionalLightColor, without the TRUE_PBR compensation so every permutation agrees).
+	float3 SunLightLinear()
+	{
+		const bool convert = SharedData::linearLightingSettings.enableLinearLighting && !SharedData::linearLightingSettings.isDirLightLinear;
+		const float mult = convert ? max(SharedData::linearLightingSettings.dirLightMult, 1e-5f) : 1.0f;
+		float3 color = SharedData::DirLightColor.xyz / mult;
+		[flatten] if (convert)
+			color = pow(abs(color), SharedData::linearLightingSettings.lightGamma) * SharedData::linearLightingSettings.lightMult * SharedData::linearLightingSettings.directionalLightMult;
+		return color * mult;
+	}
+
+	/// The fog's luminance at a point a_height over the camera.
+	float PhysicalLuminance(float a_height)
+	{
+		const float k = 0.75f * (1.0f - 0.85f);
+		const float tau = Active() ? VerticalDepth(a_height) : 0.0f;
+		const float mu = saturate(SharedData::DirLightDirection.z);
+		const float sun = dot(SunLightLinear(), float3(0.2126f, 0.7152f, 0.0722f)) * mu / (1.0f + k * tau / max(mu, 0.1f));
+		const float sky = PhysicalSkyLight() / (1.0f + 2.0f * k * tau);  // diffuse light: mean cosine 0.5
+		const float groundAlbedo = dot(SharedData::physSkyData.groundAlbedo, float3(0.2126f, 0.7152f, 0.0722f));
+		return (sun + sky) * 0.5f * (1.0f + saturate(groundAlbedo));
+	}
+
+	/// The fog colour: the weather's hue (a_weatherColor with its luminance normalised) at the physical brightness; the
+	/// colour unchanged while Physical Fog Brightness is off.
+	float3 PhysicalFogColor(float3 a_weatherColor, float a_height)
+	{
+		float3 color = a_weatherColor;
+		[branch] if (PhysicalSkyLight() > 0.0f)
+		{
+			const float y = dot(max(a_weatherColor, 0.0f), float3(0.2126f, 0.7152f, 0.0722f));
+			const float3 hue = y > 1e-4f ? max(a_weatherColor, 0.0f) / y : float3(1.0f, 1.0f, 1.0f);
+			color = hue * PhysicalLuminance(a_height);
+		}
+		return color;
 	}
 }
 

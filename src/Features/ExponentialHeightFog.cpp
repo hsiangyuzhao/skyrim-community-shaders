@@ -6,6 +6,7 @@
 #include "Features/InverseSquareLighting.h"
 #include "Features/LightLimitFix.h"
 #include "Features/LinearLighting.h"
+#include "Features/PhysicalSky.h"
 #include "Features/Skylighting.h"
 #include "Features/TerrainBlending.h"
 #include "Features/TerrainShadows.h"
@@ -87,7 +88,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     RestoreRoomFog,
     ClearFogFar,
     FullFogFar,
-    TakeoverScaleHeight)
+    TakeoverScaleHeight,
+    PhysicalFogBrightness)
 
 void ExponentialHeightFog::RestoreDefaultSettings()
 {
@@ -984,6 +986,17 @@ void ExponentialHeightFog::DrawSettings()
     ImGui::Checkbox("EHF Restores Room Fog", &vanillaFog.RestoreRoomFog);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text("Indoors. On: caves, dungeons and houses keep their own fog, with the height fog on top.\nOff = as before (the height fog replaces it).");
+    // (47g)
+    ImGui::Checkbox("Physical Fog Brightness", &vanillaFog.PhysicalFogBrightness);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "Outdoors with Physical Sky. On (default): the fog is as bright as the light that reaches it - the clear\n"
+            "sky's light and the sun through the fog above - and the weather's fog colour only gives its tint.\n"
+            "Applies where the fog takes the fog colour (Use Dynamic Cubemaps for Inscattering off) and to the\n"
+            "3D fog's Match Weather Fog Brightness, so Volumetric Fog on and off match. With dynamic cubemaps on\n"
+            "the height fog keeps the cubemap's colour. Off: the fog colour's own brightness, as in 47f.");
+    if (const float skyLight = globals::features::physicalSky.horizonFixCbData.fogSkyLight; skyLight > 0.0f)
+        ImGui::Text("Clear sky light on the fog: %.3f", skyLight);
     {
         const auto state = GetVanillaFogState();
         if (state.hasWeather)

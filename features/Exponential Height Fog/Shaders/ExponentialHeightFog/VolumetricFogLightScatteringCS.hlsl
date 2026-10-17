@@ -280,7 +280,9 @@ float3 ComputeWeatherMultipleScattering(uint3 coord, bool a_readout)
 	{
 		const float3 skyLight = ComputeSkyLight(positionWS, normalize(positionWS), eyeIndex);
 		const float3 albedo = saturate(VolumetricFogAlbedo.rgb) * VolumetricFogAlbedo.a;
-		const float3 weatherColor = GetWeatherFogColor(viewDepth);
+		// (47g) "Physical Fog Brightness": the weather colour's hue at the brightness of the light reaching this froxel, as the
+		// height fog without cubemaps (WeatherFog::PhysicalFogColor; the weather colour itself while off).
+		const float3 weatherColor = WeatherFog::PhysicalFogColor(GetWeatherFogColor(viewDepth), positionWS.z);
 		const float3 sun = GetDirectionalLightColor() * (WeatherFog::SunTransmittance(positionWS.z) / (4.0f * Math::PI));
 		// The bracket is never negative, so the source never exceeds Wfog; the min keeps it there whatever comes in.
 		const float3 missing = min(max(weatherColor - (sun + skyLight), 0.0f.xxx), weatherColor);
