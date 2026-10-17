@@ -80,11 +80,13 @@ cbuffer PerGeometry : register(b2)
 // (47f) Physical Sky > Sky Fixes > "Horizon Fix" (a), set per cloud draw by PhysicalSky::BindHorizonWarp: x = 1 to warp,
 // y = the layer's fade elevation E1 (measured from its vertex alpha), z = the planet horizon eH = -dip, w = 4242 (key).
 // The dome's elevation e goes to eH + (e - E1) (90 deg - eH) / (90 deg - E1): where the clouds used to fade out is the
-// real horizon now, the zenith stays. Texture coordinates are the mesh's, so the cloud picture is squeezed with it. HorizonFixVS : register(b11)
+// real horizon now, the zenith stays. Texture coordinates are the mesh's, so the cloud picture is squeezed with it.
+cbuffer HorizonFixVS : register(b11)
 {
 	float4 HorizonWarp;
 };
- HorizonInverse3x3(float3x3 m, out bool a_ok)
+
+float3x3 HorizonInverse3x3(float3x3 m, out bool a_ok)
 {
 	const float3 c0 = cross(m[1], m[2]);
 	const float3 c1 = cross(m[2], m[0]);
@@ -94,7 +96,8 @@ cbuffer PerGeometry : register(b2)
 	return transpose(float3x3(c0, c1, c2)) / (a_ok ? det : 1.0);
 }
 #	endif
- main(VS_INPUT input)
+
+VS_OUTPUT main(VS_INPUT input)
 {
 	VS_OUTPUT vsout;
 	uint eyeIndex = Stereo::GetEyeIndexVS(
@@ -305,7 +308,8 @@ float3 GetProceduralSunGlow(float3 viewDir)
 // reflects the clear sky). Here the clouds go into that reflection: the Cloud Shadows cube (the cloud layers' opacity as
 // drawn, warped ones included) at the mirrored direction, a cloud lit like RelightCloudMulti's (sun through the air, the
 // sky's own light; no self-shadow), weighted by the air in between x Fresnel x opacity, in place of the clear sky the
-// LUT already reflected there. Main view only. Then the same AP shadow and tonemap as PhysSky::SampleSky. HorizonSeaSky(float3 a_dir, uint2 a_pxCoord)
+// LUT already reflected there. Main view only. Then the same AP shadow and tonemap as PhysSky::SampleSky.
+float3 HorizonSeaSky(float3 a_dir, uint2 a_pxCoord)
 {
 	const SharedData::PhysSkyData data = SharedData::physSkyData;
 	float3 lum = PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(a_dir), 0).rgb;
@@ -329,7 +333,7 @@ float3 GetProceduralSunGlow(float3 viewDir)
 			const float3 tr = saturate(trSea / max(trEye, 1e-6));
 			const float3 sunDir = normalize(SharedData::physSkyNightData.LutSunDir);
 			const float3 sun = data.sunlightColor * PhysSky::SampleTr(sunDir, PhysSky::SampTr) * smoothstep(-0.02, 0.02, sunDir.z) * 0.5;
-			const float3 sky = PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(float3(0.0, 0.0, 1.0)), 0).rgb * (Math::PI * 0.5 * SharedData::physSkyCloudData.SkyAmbient);
+			const float3 sky = PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyPrecision() ? float2(0.0, 0.5 / PhysSky::SV_LUT_HEIGHT) : float2(0.0, 0.01), 0).rgb  /* the zenith, as RelightCloudMulti */ * (Math::PI * 0.5 * SharedData::physSkyCloudData.SkyAmbient);
 			const float3 cloud = 0.8 * (sun + sky) * data.cloudRelightMix;
 			const float3 clear = PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(mirrored), 0).rgb;
 			lum = max(lum + tr * fresnel * opacity * (cloud - clear), 0.0);

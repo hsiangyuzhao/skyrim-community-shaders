@@ -66,7 +66,14 @@ namespace HorizonFix
 	/// over sea level (game units). 0 while inactive (the 47e layer: even below the camera).
 	float AnchorDepth()
 	{
-		return max(SharedData::horizonFixData.AnchorDepth, 0.0f);
+		return SharedData::horizonFixData.AnchorDepth;  // >= 0, 0 while inactive (no max(): register pressure)
+	}
+
+	/// exp(AnchorDepth() / the weather layer's ScaleHeight), from the CPU (saves the volumetric fog's registers); exactly 1 while
+	/// inactive.
+	float FloorDensity()
+	{
+		return SharedData::horizonFixData.FloorDensity;  // >= 1, 1 while inactive (PhysicalSky::HorizonFixCbData): no max(), 64 registers in the fog light pass
 	}
 
 	/// Distance to the game's cloud deck (a_deckHeight above the camera, on a sphere around the planet's centre, the

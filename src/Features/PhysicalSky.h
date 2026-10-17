@@ -521,7 +521,7 @@ struct PhysicalSky final : public Feature
 		float anchorDepth = 0.f;  // camera height over sea level (zBottom + 500), game units
 		float altitude = 0.f;     // camera height over the ground sphere (zBottom), game units
 		uint flags = 0;           // bit 0: Horizon Fix in effect
-		float pad0 = 0.f;
+		float floorDensity = 1.f; // exp(anchorDepth / the weather fog layer's ScaleHeight), capped (WeatherFog.hlsli)
 	} horizonFixCbData;
 	static_assert(sizeof(HorizonFixCbData) == 16);
 

@@ -656,7 +656,7 @@ namespace SharedData
 		float AnchorDepth;  // camera height over sea level (game units): the weather fog layer keeps thickening down to it
 		float Altitude;     // camera height over the physical sky's ground sphere (game units)
 		uint Flags;         // bit 0: Horizon Fix in effect (Physical Sky drawn, Sky Fixes and Horizon Fix on)
-		float pad0;
+		float FloorDensity; // exp(AnchorDepth / the weather layer's ScaleHeight): its density at sea level (1 = off)
 	};
 
 	namespace PhysSkyCloudFlags

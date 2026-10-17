@@ -5,6 +5,7 @@
 #include <imgui_stdlib.h>
 
 #include "CloudShadows.h"
+#include "ExponentialHeightFog.h"
 #include "Deferred.h"
 #include "LinearLighting.h"
 #include "SkySync.h"
@@ -1867,7 +1868,9 @@ void PhysicalSky::Reset()
 		horizonFixCbData.flags = 1u;
 		horizonFixCbData.altitude = std::max(posCam.z - cbData.zBottom, 0.f);
 		horizonFixCbData.anchorDepth = std::max(posCam.z - (cbData.zBottom + 500.f), 0.f);
-		if (!std::isfinite(horizonFixCbData.altitude) || !std::isfinite(horizonFixCbData.anchorDepth))
+		const float scaleHeight = std::max(globals::features::exponentialHeightFog.GetWeatherFogData().ScaleHeight, 1.f);
+		horizonFixCbData.floorDensity = std::min(std::exp(horizonFixCbData.anchorDepth / scaleHeight), 1e6f);
+		if (!std::isfinite(horizonFixCbData.altitude) || !std::isfinite(horizonFixCbData.anchorDepth) || !std::isfinite(horizonFixCbData.floorDensity))
 			horizonFixCbData = {};
 	}
 }

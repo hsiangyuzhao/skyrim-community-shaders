@@ -50,7 +50,7 @@ namespace WeatherFog
 	{
 		const float H = ScaleHeight();
 		const float f = Floor();  // (47f) 0 = the 47e form exactly
-		const float below = (min(a_high, f) - min(a_low, f)) * exp(-f / H);
+		const float below = (min(a_high, f) - min(a_low, f)) * HorizonFix::FloorDensity();
 		const float above = H * (exp(-max(a_low, f) / H) - exp(-max(a_high, f) / H));
 		return below + above;
 	}
@@ -97,7 +97,7 @@ namespace WeatherFog
 		const float mu = max(SharedData::DirLightDirection.z, 0.05f);
 		const float H = ScaleHeight();
 		const float f = Floor();  // (47f) 0 = the 47e form exactly
-		const float depth = (max(f - a_height, 0.0f) * exp(-f / H) + H * exp(-max(a_height, f) / H)) / mu;
+		const float depth = (max(f - a_height, 0.0f) * HorizonFix::FloorDensity() + H * exp(-max(a_height, f) / H)) / mu;
 		return 1.0f - saturate(SharedData::weatherFogData.Cap) * (1.0f - exp(-SharedData::weatherFogData.Sigma * depth));
 	}
 
