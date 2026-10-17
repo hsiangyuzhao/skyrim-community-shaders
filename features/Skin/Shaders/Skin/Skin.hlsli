@@ -565,7 +565,7 @@ namespace Skin
 		float frequency = base_scale;
 		float amplitude = 1.0;
 		float max_amplitude = 0.0;
-		for (int i = 0; i < octaves; i++)
+		[loop] for (int i = 0; i < octaves; i++)  // (47g) compile time: not unrolled (same result)
 		{
 			const float2 octave_uv = uv * frequency;
 			const float pixel_footprint = uv_pixel_footprint * abs(frequency);
@@ -648,7 +648,7 @@ namespace Skin
 		float frequency = base_scale;
 		float amplitude = 1.0;
 		float max_amplitude = 0.0;
-		[unroll] for (int i = 0; i < 5; i++)
+		[loop] for (int i = 0; i < 5; i++)  // (47g) compile time: not unrolled (same result)
 		{
 			const float pixel_footprint = uv_pixel_footprint * abs(frequency);
 			const float octave_filter = 1.0f - smoothstep(0.25f, 0.5f, pixel_footprint);
@@ -820,9 +820,9 @@ namespace Skin
 			const float2 cell = floor(p);
 			const float2 f = p - cell;
 			float best = 0.0;
-			[unroll] for (int j = -1; j <= 1; ++j)
+			[loop] for (int j = -1; j <= 1; ++j)  // (47g) compile time: not unrolled (same result)
 			{
-				[unroll] for (int i = -1; i <= 1; ++i)
+				[loop] for (int i = -1; i <= 1; ++i)
 				{
 					const float2 c = cell + float2(i, j);
 					if (WetHash12(c) > presence)

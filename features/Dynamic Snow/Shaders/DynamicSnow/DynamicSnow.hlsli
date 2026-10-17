@@ -423,14 +423,24 @@ namespace DynamicSnow
 
 	TrailSample SampleTrail(float3 positionWS, float3 viewDirectionWS)
 	{
+		// (47g) Compile time: the two lookups (the point, then the parallax-shifted point) are one [loop] of two
+		// iterations around a single SampleTrailAt, so the bicubic (16 loads, unrolled) is inlined once, not twice.
+		// Same lookups, same result.
 		const SharedData::DynamicSnowSettings s = SharedData::dynamicSnowSettings;
-		TrailSample o = SampleTrailAt(positionWS.xy, positionWS.z);
-		[branch] if (o.any && abs(o.pressed) > 1e-3)
+		TrailSample o = (TrailSample)0;
+		float2 position = positionWS.xy;
+		[loop] for (int lookup = 0; lookup < 2; ++lookup)
 		{
-			float h = o.pressed * s.TrailDepth;
-			float2 offset = -viewDirectionWS.xy * (h / max(viewDirectionWS.z, 0.3));
-			TrailSample p = SampleTrailAt(positionWS.xy + offset, positionWS.z);
-			if (p.any)
+			TrailSample p = SampleTrailAt(position, positionWS.z);
+			[branch] if (lookup == 0)
+			{
+				o = p;
+				if (!(o.any && abs(o.pressed) > 1e-3))
+					break;
+				float h = o.pressed * s.TrailDepth;
+				position += -viewDirectionWS.xy * (h / max(viewDirectionWS.z, 0.3));
+			}
+			else if (p.any)
 				o = p;
 		}
 		return o;
