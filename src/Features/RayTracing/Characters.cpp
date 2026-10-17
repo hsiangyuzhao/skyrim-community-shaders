@@ -166,6 +166,20 @@ namespace RayTracingCharacters
 			return false;
 		}
 
+		/// (47g) True when the NIF material alpha (not the fade / property alpha, so actors fading in are unaffected) is
+		/// <= 1/255: an invisible helper such as an HDT-SMP collision shape (VirtualGroundBDO, colHeadBDO, colWig*BDO).
+		bool InvisibleHelper(RE::BSLightingShaderProperty* a_lighting)
+		{
+			if (!a_lighting)
+				return false;
+			__try {
+				auto* material = static_cast<RE::BSLightingShaderMaterialBase*>(a_lighting->material);
+				return material && material->materialAlpha <= 1.0f / 255.0f;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
 		/// (45j) How a shape was recognised as hair: 0 = not hair, 1 = its material is the hair tint
 		/// material (what the game's and Community Shaders' hair shading key on), 2 = "hair" in its name
 		/// or in its diffuse texture path (wigs, hair added as armour without the hair tint material).
@@ -181,7 +195,8 @@ namespace RayTracingCharacters
 			}
 			if (ContainsHair(a_geometry->name.c_str()))
 				return 2;
-			if (a_lighting) {
+			// (47g) The texture-path match is ignored for an invisible helper (material alpha 0).
+			if (a_lighting && !InvisibleHelper(a_lighting)) {
 				char path[512]{};
 				__try {
 					auto* material = static_cast<RE::BSLightingShaderMaterialBase*>(a_lighting->material);
@@ -592,6 +607,12 @@ namespace RayTracingCharacters
 		using F = RE::BSShaderProperty::EShaderPropertyFlag;
 		if (!lighting || lighting->flags.any(F::kDecal, F::kDynamicDecal, F::kRefraction, F::kLODObjects) || lighting->flags.none(F::kCastShadows)) {
 			++stats_.skipShader;
+			return nullptr;
+		}
+		// (47g) Invisible helper meshes (material alpha 0) are not traced as solid geometry.
+		if (InvisibleHelper(lighting)) {
+			++stats_.skipShader;
+			logOther("shader: material alpha 0 (invisible helper)");
 			return nullptr;
 		}
 		auto* alphaProperty = netimmerse_cast<RE::NiAlphaProperty*>(runtime.properties[RE::BSGeometry::States::kProperty].get());

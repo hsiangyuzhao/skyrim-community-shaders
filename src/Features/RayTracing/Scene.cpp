@@ -160,6 +160,17 @@ namespace RayTracingScene
 				return false;
 			}
 		}
+
+		/// (47g) NIF material alpha <= 1/255 (not the fade alpha): an invisible helper mesh. SEH-guarded.
+		bool MaterialAlphaZero(RE::BSLightingShaderProperty* a_lighting)
+		{
+			__try {
+				auto* material = static_cast<RE::BSLightingShaderMaterialBase*>(a_lighting->material);
+				return material && material->materialAlpha <= 1.0f / 255.0f;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
 	}
 
 	bool Scene::IsWindowMask(RE::BSGeometry* a_geometry)
@@ -802,6 +813,11 @@ namespace RayTracingScene
 			++skipped.decals;
 			reason = MissReason::Decal;
 			return "decal";
+		}
+		// (47g) Invisible helper meshes (material alpha 0) are not traced as solid geometry.
+		if (MaterialAlphaZero(lighting)) {
+			++skipped.otherGeometry;
+			return "material alpha 0 (invisible helper)";
 		}
 		// (45h) Alpha-tested casters: a large enough alpha-tested shape whose cut-out can be traced
 		// (diffuse texture, texcoords, a "greater" test) goes in as a non-opaque shape. Tree-animated
