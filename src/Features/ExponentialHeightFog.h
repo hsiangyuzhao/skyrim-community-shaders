@@ -2,6 +2,10 @@
 
 #include "Buffer.h"
 
+// (47e) The 16-byte aligned members (Settings, WeatherFogData) pad the class once anything else changes size.
+#pragma warning(push)
+#pragma warning(disable: 4324)
+
 struct ExponentialHeightFog : Feature
 {
 	virtual bool SupportsVR() override { return true; };
@@ -89,6 +93,9 @@ struct ExponentialHeightFog : Feature
 		float NoiseScale = 0.0f;  // 0 = no noise
 		float NoiseThreshold = 0.5f;
 		float3 NoiseVelocity = { 0.0f, 0.0f, 0.0f };
+		/// (47e) CS Fog Takes Over: the weather's part of the volume also gets the light scattered many times that the
+		/// weather's fog colour already holds, so it is as bright as the game's fog (VolumetricFogLightScatteringCS).
+		bool MatchWeatherFogBrightness = true;
 	} volumetric;
 
 	/// (47b) The game's own fog under the height fog. CPU side only; reaches the shaders through
@@ -214,8 +221,29 @@ private:
 		float4 lighting = {};
 		float4 misc = {};
 		float4 noiseVelocity = {};
+		// (47e) mirrored by VolumetricFogCSCommon.hlsli
+		float4 weatherNearColor = {};  // rgb, w = 1: "Match Weather Fog Brightness" on
+		float4 weatherFarColor = {};   // rgb, w = fog power
+		float4 weatherFogParams = {};  // near / (far - near), 1 / (far - near), clamp, debug readout slice
 	};
 	STATIC_ASSERT_ALIGNAS_16(VolumetricFogCB);
+	static_assert(sizeof(VolumetricFogCB) == 656, "VolumetricFogCB must match VolumetricFogCSCommon.hlsli");
+	static_assert(offsetof(VolumetricFogCB, noiseVelocity) == 592 && offsetof(VolumetricFogCB, weatherFogParams) == 640, "VolumetricFogCB layout");
+
+	/// (47e) EHF panel readout of the "Match Weather Fog Brightness" terms at one froxel (screen centre, ~100 m), read
+	/// back from the GPU a few frames late.
+	struct VolumetricDebugState
+	{
+		float weather[4]{};  // Wfog, sigma_w
+		float sun[4]{};      // E Ts / 4 pi, view depth
+		float sky[4]{};      // S, the extra source's share of Wfog
+		bool valid = false;
+		uint32_t frame = 0;
+		winrt::com_ptr<ID3D11Buffer> buffer;
+		winrt::com_ptr<ID3D11UnorderedAccessView> uav;
+		winrt::com_ptr<ID3D11Buffer> staging[3];
+	};
+	void ReadVolumetricDebug();
 
 	void EnsureVolumetricResources();
 	void ReleaseVolumetricResources();
@@ -254,4 +282,6 @@ private:
 	/// temporal history so the old fog does not ghost.
 	WeatherFogData lastVolumeWeather{};
 	[[nodiscard]] static bool WeatherLayerJumped(const WeatherFogData& a_previous, const WeatherFogData& a_current);
+	std::unique_ptr<VolumetricDebugState> volumetricDebug;  // (47e)
 };
+#pragma warning(pop)

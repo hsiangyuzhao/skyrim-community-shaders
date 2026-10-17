@@ -210,7 +210,8 @@ float3 GetDirectionalLightColor()
 	return Color::DirectionalLight(SharedData::DirLightColor.xyz / max(llDirLightMult, 1e-5), SharedData::linearLightingSettings.isDirLightLinear) * llDirLightMult;
 }
 
-float3 ComputeSkyLightScattering(float3 positionWS, float3 viewDirection, uint eyeIndex)
+/// Sky light reaching a froxel at intensity 1 (x VolumetricFogLighting.y for the scattering).
+float3 ComputeSkyLight(float3 positionWS, float3 viewDirection, uint eyeIndex)
 {
 	float phaseG = VolumetricFogLighting.w;
 	float3 skyDirection = abs(phaseG) > 0.001f ? normalize(-viewDirection * phaseG) : float3(0.0f, 0.0f, 1.0f);
@@ -229,7 +230,75 @@ float3 ComputeSkyLightScattering(float3 positionWS, float3 viewDirection, uint e
 	else
 		skyLighting = Color::Ambient(max(0, mul(SharedData::DirectionalAmbient, float4(skyDirection, 1.0f))));
 
-	return skyLighting * skyVisibility * VolumetricFogLighting.y;
+	return skyLighting * skyVisibility;
+}
+
+// (47e) "Match Weather Fog Brightness" (CS Fog Takes Over with volumetric fog on). The weather's fog colour is what the
+// game shows for fog that is lit from every side by fog: it already holds the light scattered many times. The froxels
+// only scatter once (the sun, which the layer above has mostly taken out, and the sky), so the weather's part of the
+// medium gets the rest as a source: sigma_w x albedo x max(0, Wfog - [E Ts / 4 pi + S]) with the single scatter at
+// intensity 1 and no shadow. Lit air then totals Wfog plus the forward-scatter glow; shadowed air loses the sun's share.
+static const float kMaxWeatherFogIBLScale = 2.0f;  // IBL fog colour at most this x the weather's own (IBL feedback)
+
+bool MatchWeatherFogBrightness()
+{
+	return VolumetricFogWeatherNearColor.w > 0.5f;
+}
+
+/// The weather's fog colour at a view depth, as the analytical fog builds it (ISSAOComposite): Color::Fog of the
+/// near / far blend at min(clamp, x^power), then the IBL fog colour where it applies.
+float3 GetWeatherFogColor(float viewDepth)
+{
+	const float x = saturate(viewDepth * VolumetricFogWeatherFogParams.y - VolumetricFogWeatherFogParams.x);
+	const float fogFactor = min(VolumetricFogWeatherFogParams.z, pow(x, VolumetricFogWeatherFarColor.w));
+	float3 color = Color::Fog(lerp(VolumetricFogWeatherNearColor.rgb, VolumetricFogWeatherFarColor.rgb, fogFactor));
+	[branch] if (VolumetricFogHasIBL && !SharedData::InInterior)
+		color = min(ImageBasedLighting::GetFogIBLColor(color), color * kMaxWeatherFogIBLScale);
+	return max(color, 0.0f.xxx);
+}
+
+#if !defined(VOLUMETRIC_FOG_FAR_GRID)
+// EHF panel readout: one froxel at the centre of the screen (slice VolumetricFogWeatherFogParams.w), read back by
+// ExponentialHeightFog::ReadVolumetricDebug. [0] = Wfog, sigma_w (0 = no extra source here); [1] = E Ts / 4 pi, view
+// depth; [2] = S, the extra source's share of Wfog (luminance). Writes to an unbound UAV are dropped.
+RWStructuredBuffer<float4> VolumetricFogDebug : register(u1);
+#endif
+
+/// The extra source of the weather layer (sigma_w x albedo x the missing light) at a froxel's centre, exactly 0 while the
+/// layer or the switch is off. a_readout: this froxel feeds the EHF panel readout.
+float3 ComputeWeatherMultipleScattering(uint3 coord, bool a_readout)
+{
+	// The cell centre (main's copy is not passed in: fewer registers stay live).
+	uint eyeIndex;
+	float viewDepth;
+	const float3 positionWS = ExponentialHeightFog::ComputeCellWorldPosition(coord, 0.5f.xxx, eyeIndex, viewDepth);
+	float3 result = 0.0f.xxx;
+	float weatherExtinction = 0.0f;
+	[branch] if (MatchWeatherFogBrightness())
+		weatherExtinction = WeatherFog::VolumetricExtinction(positionWS);
+	[branch] if (weatherExtinction > 0.0f)
+	{
+		const float3 skyLight = ComputeSkyLight(positionWS, normalize(positionWS), eyeIndex);
+		const float3 albedo = saturate(VolumetricFogAlbedo.rgb) * VolumetricFogAlbedo.a;
+		const float3 weatherColor = GetWeatherFogColor(viewDepth);
+		const float3 sun = GetDirectionalLightColor() * (WeatherFog::SunTransmittance(positionWS.z) / (4.0f * Math::PI));
+		// The bracket is never negative, so the source never exceeds Wfog; the min keeps it there whatever comes in.
+		const float3 missing = min(max(weatherColor - (sun + skyLight), 0.0f.xxx), weatherColor);
+		result = weatherExtinction * albedo * missing;
+#if !defined(VOLUMETRIC_FOG_FAR_GRID)
+		[branch] if (a_readout)
+		{
+			VolumetricFogDebug[0] = float4(weatherColor, weatherExtinction);
+			VolumetricFogDebug[1] = float4(sun, viewDepth);
+			VolumetricFogDebug[2] = float4(skyLight, Color::RGBToLuminance(missing) / max(Color::RGBToLuminance(weatherColor), 1e-6f));
+		}
+#endif
+	}
+#if !defined(VOLUMETRIC_FOG_FAR_GRID)
+	else if (a_readout)
+		VolumetricFogDebug[0] = 0.0f.xxxx;
+#endif
+	return result;
 }
 
 #if defined(LIGHT_LIMIT_FIX)
@@ -322,7 +391,8 @@ float4 ComputeLightScattering(uint3 coord, float3 cellOffset)
 		phase *
 		materialScatteringAndExtinction.rgb;
 
-	float3 skyScattering = ComputeSkyLightScattering(positionWS, viewDirection, eyeIndex) * materialScatteringAndExtinction.rgb;
+	const float3 skyLight = ComputeSkyLight(positionWS, viewDirection, eyeIndex);
+	float3 skyScattering = skyLight * VolumetricFogLighting.y * materialScatteringAndExtinction.rgb;
 
 #if defined(LIGHT_LIMIT_FIX) && !defined(VOLUMETRIC_FOG_FAR_GRID)
 	float3 localScattering = AccumulateLocalLightScattering(coord, cellOffset, positionWS, viewDirection, eyeIndex, materialScatteringAndExtinction.rgb);
@@ -346,6 +416,12 @@ float4 ComputeLightScattering(uint3 coord, float3 cellOffset)
 		LightScattering[dispatchID] = 0.0f.xxxx;
 		return;
 	}
+
+	// (47e) "Match Weather Fog Brightness": the weather layer's extra source, once per froxel at its centre (it is smooth and
+	// has no jitter). It starts the sample sum below (x the sample count the average divides by), so nothing more stays
+	// live across the sample loop (register pressure). Exactly 0 otherwise: the result is unchanged bit for bit.
+	const float3 weatherMultipleScattering = ComputeWeatherMultipleScattering(dispatchID,
+		all(dispatchID == uint3(VolumetricFogGridSize.xy / 2u, (uint)VolumetricFogWeatherFogParams.w)));
 
 	bool validHistory;
 	float previousCenterDepth;
@@ -371,7 +447,7 @@ float4 ComputeLightScattering(uint3 coord, float3 cellOffset)
 	}
 
 	uint sampleCount = historyAlpha < 0.001f ? VolumetricFogHistoryMissSampleCount : 1u;
-	float4 scatteringAndExtinction = 0.0f.xxxx;
+	float4 scatteringAndExtinction = float4(weatherMultipleScattering * float(sampleCount), 0.0f);
 	[loop] for (uint sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++)
 	{
 		// Per-voxel random offset (UE LightScatteringCS): decorrelates the Halton jitter across

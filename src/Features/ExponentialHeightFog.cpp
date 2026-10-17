@@ -57,7 +57,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     DepthDistributionScale,
     NoiseScale,
     NoiseThreshold,
-    NoiseVelocity)
+    NoiseVelocity,
+    MatchWeatherFogBrightness)
 
 namespace
 {
@@ -343,6 +344,54 @@ void ExponentialHeightFog::SetupResources()
     DX::ThrowIfFailed(globals::d3d::device->CreateSamplerState(&samplerDesc, shadowSampler.put()));
 
     volumetricFogCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<VolumetricFogCB>());
+
+    // (47e) Readout of the "Match Weather Fog Brightness" terms (3 x float4) and its staging ring.
+    auto debugState = std::make_unique<VolumetricDebugState>();
+    D3D11_BUFFER_DESC debugDesc{};
+    debugDesc.ByteWidth = sizeof(float) * 12;
+    debugDesc.Usage = D3D11_USAGE_DEFAULT;
+    debugDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    debugDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    debugDesc.StructureByteStride = sizeof(float) * 4;
+    DX::ThrowIfFailed(globals::d3d::device->CreateBuffer(&debugDesc, nullptr, debugState->buffer.put()));
+    D3D11_UNORDERED_ACCESS_VIEW_DESC debugUavDesc{};
+    debugUavDesc.Format = DXGI_FORMAT_UNKNOWN;
+    debugUavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    debugUavDesc.Buffer.NumElements = 3;
+    DX::ThrowIfFailed(globals::d3d::device->CreateUnorderedAccessView(debugState->buffer.get(), &debugUavDesc, debugState->uav.put()));
+    D3D11_BUFFER_DESC stagingDesc = debugDesc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.MiscFlags = 0;
+    stagingDesc.StructureByteStride = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    for (auto& staging : debugState->staging)
+        DX::ThrowIfFailed(globals::d3d::device->CreateBuffer(&stagingDesc, nullptr, staging.put()));
+    volumetricDebug = std::move(debugState);
+}
+
+void ExponentialHeightFog::ReadVolumetricDebug()
+{
+    // (47e) Copy this frame's readout into the ring and read the oldest copy without waiting for the GPU.
+    if (!volumetricDebug)
+        return;
+    auto& debug = *volumetricDebug;
+    auto context = globals::d3d::context;
+    const uint32_t count = static_cast<uint32_t>(std::size(debug.staging));
+    context->CopyResource(debug.staging[debug.frame % count].get(), debug.buffer.get());
+    debug.frame++;
+    if (debug.frame < count)
+        return;
+    auto* oldest = debug.staging[debug.frame % count].get();
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (SUCCEEDED(context->Map(oldest, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)) && mapped.pData) {
+        const auto* values = static_cast<const float*>(mapped.pData);
+        std::copy_n(values, 4, debug.weather);
+        std::copy_n(values + 4, 4, debug.sun);
+        std::copy_n(values + 8, 4, debug.sky);
+        debug.valid = true;
+        context->Unmap(oldest, 0);
+    }
 }
 
 void ExponentialHeightFog::ClearShaderCache()
@@ -596,7 +645,10 @@ void ExponentialHeightFog::Prepass()
     VolumetricFogCB cb{};
     cb.gridSizeAndFlags = { currentGridSize.x, currentGridSize.y, currentGridSize.z,
         commonFlags | (depthSrv && temporalHistoryValid && hasConservativeDepthHistory ? 16u : 0u) | (hasLocalLights ? 32u : 0u) };
-    const float nearFadeInv = volumetric.NearFadeInDistance > 0.0f ? 1.0f / volumetric.NearFadeInDistance : 100000000.0f;
+    // (47e) While the weather's fog layer is in the volume the near fade-in stays off: it would thin the layer in front of
+    // the camera, which the game's fog (and the analytical layer) never does.
+    const bool nearFadeIn = volumetric.NearFadeInDistance > 0.0f && !(weatherFog.Cap > 0.0f);
+    const float nearFadeInv = nearFadeIn ? 1.0f / volumetric.NearFadeInDistance : 100000000.0f;
     cb.invGridSizeAndNearFade = { 1.0f / static_cast<float>(currentGridSize.x), 1.0f / static_cast<float>(currentGridSize.y), 1.0f / static_cast<float>(currentGridSize.z), nearFadeInv };
     cb.gridZParams = { p.nearZ.x, p.nearZ.y, p.nearZ.z, 0.0f };
 
@@ -626,6 +678,31 @@ void ExponentialHeightFog::Prepass()
     cb.lighting = { volumetric.DirectionalIntensity, volumetric.SkyLightingIntensity, volumetric.LocalLightIntensity, std::clamp(volumetric.ScatteringDistribution, -0.95f, 0.95f) };
     cb.misc = { volumetric.ShadowBias, volumetric.ExtinctionScale, std::max(volumetric.NoiseScale, 0.0f), volumetric.NoiseThreshold };
     cb.noiseVelocity = { volumetric.NoiseVelocity.x, volumetric.NoiseVelocity.y, volumetric.NoiseVelocity.z, 0.0f };
+    {
+        // (47e) "Match Weather Fog Brightness": the weather's fog colours and distances as ISSAOComposite gets them
+        // (FogNearColor / FogFarColor / FogParam). Only used while the layer is in the volume (sigma_w > 0).
+        const auto* sky = globals::game::sky;
+        const auto vanillaFogState = GetVanillaFogState();
+        const bool matchBrightness = volumetric.MatchWeatherFogBrightness && vanillaFogState.takeover && sky && weatherFog.Cap > 0.0f;
+        if (matchBrightness) {
+            const auto& nearColor = sky->skyColor[RE::TESWeather::ColorTypes::kFogNear];
+            const auto& farColor = sky->skyColor[RE::TESWeather::ColorTypes::kFogFar];
+            const float fogNear = std::max(vanillaFogState.fogNear, 0.0f);
+            const float invRange = 1.0f / std::max(vanillaFogState.fogFar - fogNear, 1.0f);
+            cb.weatherNearColor = { nearColor.red, nearColor.green, nearColor.blue, 1.0f };
+            cb.weatherFarColor = { farColor.red, farColor.green, farColor.blue, std::max(vanillaFogState.fogPower, 0.05f) };
+            cb.weatherFogParams = { fogNear * invRange, invRange, std::clamp(vanillaFogState.fogClamp, 0.0f, 1.0f), 0.0f };
+            for (auto* value : { &cb.weatherNearColor.x, &cb.weatherNearColor.y, &cb.weatherNearColor.z, &cb.weatherFarColor.x, &cb.weatherFarColor.y,
+                     &cb.weatherFarColor.z, &cb.weatherFarColor.w, &cb.weatherFogParams.x, &cb.weatherFogParams.y, &cb.weatherFogParams.z }) {
+                if (!std::isfinite(*value))
+                    *value = 0.0f;
+            }
+        }
+        // Readout froxel: the near-grid slice at ~100 m (7000 units), screen centre.
+        const double readoutDepth = std::min(7000.0, p.nearEnd);
+        const double readoutSlice = std::log2(std::max(readoutDepth * p.nearZ.x + p.nearZ.y, 1e-6)) * p.nearZ.z;
+        cb.weatherFogParams.w = static_cast<float>(std::clamp(std::floor(readoutSlice), 0.0, static_cast<double>(currentGridSize.z - 1)));
+    }
     volumetricFogCB->Update(cb);
 
     auto context = globals::d3d::context;
@@ -686,6 +763,7 @@ void ExponentialHeightFog::Prepass()
         ID3D11ComputeShader* lightScatteringCS;
         ID3D11ComputeShader* integrationCS;
         Util::GpuBucket bucket;
+        bool debugReadout;  // (47e)
     };
 
     auto timers = Util::GpuPassTimers::GetSingleton();
@@ -723,12 +801,14 @@ void ExponentialHeightFog::Prepass()
                 a_pass.conservativeDepth->srv.get(),
                 a_pass.conservativeDepthHistory ? a_pass.conservativeDepthHistory->srv.get() : nullptr
             };
-            ID3D11UnorderedAccessView* uav = a_pass.scattering->uav.get();
+            // u1: (47e) the readout froxel (near grid only; the far shader has no u1).
+            ID3D11UnorderedAccessView* uavs[2]{ a_pass.scattering->uav.get(), a_pass.debugReadout && volumetricDebug ? volumetricDebug->uav.get() : nullptr };
+            ID3D11UnorderedAccessView* nullUavs[2]{};
             context->CSSetShaderResources(0, 5, srvs);
-            context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+            context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
             context->CSSetShader(a_pass.lightScatteringCS, nullptr, 0);
             context->Dispatch(groupX, groupY, groupZ);
-            context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+            context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
         }
 
         {
@@ -755,7 +835,7 @@ void ExponentialHeightFog::Prepass()
         temporalHistoryValid ? lightScatteringHistory.get() : nullptr,
         integratedLightScattering.get(),
         materialCS, depthCS, scatteringCS, integrateCS,
-        Util::GpuBucket::VolumetricFogNear });
+        Util::GpuBucket::VolumetricFogNear, true });
 
     if (p.farEnabled) {
         const bool farDepthHistory = depthSrv && temporalHistoryValidFar && hasConservativeDepthFarHistory;
@@ -767,7 +847,7 @@ void ExponentialHeightFog::Prepass()
             temporalHistoryValidFar ? lightScatteringFarHistory.get() : nullptr,
             integratedLightScatteringFar.get(),
             farMaterialCS, farDepthCS, farScatteringCS, farIntegrateCS,
-            Util::GpuBucket::VolumetricFogFar });
+            Util::GpuBucket::VolumetricFogFar, false });
     } else {
         const float clearValue[4]{ 0.0f, 0.0f, 0.0f, 1.0f };
         context->ClearUnorderedAccessViewFloat(integratedLightScatteringFar->uav.get(), clearValue);
@@ -823,6 +903,7 @@ void ExponentialHeightFog::Prepass()
     lastBuildFrame = globals::state->frameCount;
     lastBuildHadShadows = hasShadowMap;
     lastBuildHadLocalLights = hasLocalLights;
+    ReadVolumetricDebug();
     BindIntegratedLightScattering(true);
 }
 
@@ -954,7 +1035,7 @@ void ExponentialHeightFog::DrawSettings()
         ImGui::SliderFloat("Volumetric Start Distance", &volumetric.StartDistance, 0.0f, 20000.0f, "%.0f");
         ImGui::SliderFloat("Near Fade In Distance", &volumetric.NearFadeInDistance, 0.0f, 20000.0f, "%.0f");
         if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text("The 3D fog fades in over this distance in front of the camera.");
+            ImGui::Text("The 3D fog fades in over this distance in front of the camera.\nNot while CS Fog Takes Over has the weather's fog in it (the game's fog does not fade in).");
         ImGui::SliderFloat("Near Grid Distance", &volumetric.NearGridDistance, 256.0f, 50000.0f, "%.0f");
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text(
@@ -971,6 +1052,27 @@ void ExponentialHeightFog::DrawSettings()
         ImGui::SliderFloat("Local Light Scattering Intensity", &volumetric.LocalLightIntensity, 0.0f, 10.0f, "%.2f");
         if (auto _tt = Util::HoverTooltipWrapper())
             ImGui::Text("Glow of torches, lanterns and other lights in the fog (needs Light Limit Fix).");
+        // (47e)
+        ImGui::Checkbox("Match Weather Fog Brightness", &volumetric.MatchWeatherFogBrightness);
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Only with \"EHF Follows Weather\" = CS Fog Takes Over, outdoors in foggy weather.\n"
+                "On (default): the weather's fog inside the 3D fog is as bright as the game's own fog. The weather's\n"
+                "fog colour already holds the light bounced around inside the fog; the 3D fog only lit it once, with\n"
+                "the sun mostly taken out by the fog above, so it came out about half as bright (looked thinner).\n"
+                "Lit fog now matches Volumetric Fog off, plus the glow toward the sun; fog in shadow keeps the sun's\n"
+                "share out, so shafts stay. With this on the Scattering Intensities can go back to about 1.\n"
+                "Off: as in 47d.");
+        {
+            const bool built = lastBuildFrame != UINT32_MAX && globals::state->frameCount - lastBuildFrame <= 1u;
+            if (built && volumetricDebug && volumetricDebug->valid && volumetricDebug->weather[3] > 0.0f) {
+                const auto& d = *volumetricDebug;
+                ImGui::Text("At screen centre, %.0f m: weather fog %.3f %.3f %.3f | sun E*Ts/4pi %.3f %.3f %.3f | sky S %.3f %.3f %.3f | added %.0f%% of fog",
+                    d.sun[3] / 70.0f, d.weather[0], d.weather[1], d.weather[2], d.sun[0], d.sun[1], d.sun[2], d.sky[0], d.sky[1], d.sky[2], d.sky[3] * 100.0f);
+            } else if (built && volumetricDebug && volumetricDebug->valid) {
+                ImGui::TextDisabled("Readout: no extra source at screen centre (switch off, clear weather, other mode, indoors, or something closer than 100 m).");
+            }
+        }
         ImGui::ColorEdit4("Volumetric Albedo", (float*)&volumetric.Albedo);
         ImGui::ColorEdit4("Volumetric Emissive", (float*)&volumetric.Emissive);
         if (ImGui::TreeNode("Volumetric Noise")) {

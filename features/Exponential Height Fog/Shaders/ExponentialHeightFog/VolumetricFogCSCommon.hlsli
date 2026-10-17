@@ -28,6 +28,12 @@ cbuffer VolumetricFogCB : register(b0)
 	float4 VolumetricFogLighting;           // x = sun, y = sky, z = local lights intensity, w = phase g
 	float4 VolumetricFogMisc;               // x = shadow bias, y = extinction scale, z = noise scale, w = noise threshold
 	float4 VolumetricFogNoiseVelocity;      // xyz, noise cells per second
+	// (47e) "Match Weather Fog Brightness" (only the light scattering pass reads these): the weather's fog colours and
+	// distances as the engine blended them this frame (Sky::skyColor[kFogNear / kFogFar], fogNear / fogFar / fogPower /
+	// fogClamp). Mirrored by ExponentialHeightFog::VolumetricFogCB.
+	float4 VolumetricFogWeatherNearColor;   // rgb = fog near colour (game, 0-1), w = 1: "Match Weather Fog Brightness" on
+	float4 VolumetricFogWeatherFarColor;    // rgb = fog far colour, w = fog power
+	float4 VolumetricFogWeatherFogParams;   // x = near / (far - near), y = 1 / (far - near), z = fog clamp, w = debug slice
 };
 
 #if defined(VOLUMETRIC_FOG_FAR_GRID)
