@@ -112,11 +112,13 @@ public:
 		uint NumStrictLights;
 		int RoomIndex;
 		uint ShadowBitMask;
-		uint pad0;
+		uint Flags;  // (47h) was pad0. kStrictFlagSunDepthCheck: RayTracing::SunMaskDepthCheckActive() (Lighting.hlsl, forward draws)
 		LightData StrictLights[15];
 	};
 	STATIC_ASSERT_ALIGNAS_16(StrictLightDataCB);
 
+	static constexpr uint kStrictFlagSunDepthCheck = 1u;  // (47h) LightLimitFix.hlsli kStrictFlagSunDepthCheck
+	uint previousStrictFlags = 0;
 	StrictLightDataCB strictLightDataTemp;
 
 	std::unique_ptr<ConstantBuffer> strictLightDataCB;

@@ -2001,6 +2001,7 @@ void RayTracing::Prepass()
 {
 	activeThisFrame = false;
 	combinedThisFrame = false;
+	sunMaskWrittenThisFrame = false;  // (47h)
 	pending.active = false;
 	frameStart = Qpc();
 	// (46n) A step of the cell-event preparation faulted behind the loading screen: off here, on the world's frame.
@@ -2257,6 +2258,7 @@ void RayTracing::LoadingPump()
 	const std::int64_t start = Qpc();
 	activeThisFrame = false;
 	combinedThisFrame = false;
+	sunMaskWrittenThisFrame = false;  // (47h)
 	pending.active = false;
 	// (46p) Per-frame backend switches: Parallel BLAS Builds, Keep Our GPU Memory Resident (Upscaling > Save GPU Memory).
 	if (backend.IsReady()) {
@@ -3345,6 +3347,8 @@ void RayTracing::FinishFrame()
 		// Only the render area was written; the rest of the work texture is never read.
 		D3D11_BOX box{ 0, 0, 0, width, height, 1 };
 		context->CopySubresourceRegion(mask.texture, 0, 0, 0, 0, maskTemp.get(), 0, &box);
+		sunMaskWrittenThisFrame = true;  // (47h) forward Lighting surfaces may check their depth against it (SunMaskDepthCheckActive)
+		sunMaskFrame = globals::state->frameCount;
 	}
 	timers->End(Util::GpuBucket::RayTracingCombine);
 	// 5. (46m) Split Trace Sync: the rest of the trace (the point lights) before anything reads it.
@@ -4871,7 +4875,7 @@ void RayTracing::DrawSunPage()
 				}
 			}
 			row("Cut-outs", settings.Cutouts, "Fences, grilles, banners and other non-plant cut-outs (default: Shadow map).",
-				"Ray traced: traced with their cut-out (the holes stay lit).");
+				"Ray traced: traced with their cut-out (the holes stay lit). (47h) Blended-only shapes with a fully opaque material (an arch, a trellis) are traced as cut-outs at half alpha.");
 			row("Characters", settings.Characters, "The player and nearby NPCs and creatures: body, clothes, armour, weapons (default: Ray traced).",
 				"Up to 16 characters within 40 m inside the ray-traced area, posed every frame.");
 			{
@@ -4893,6 +4897,13 @@ void RayTracing::DrawSunPage()
 				ImGui::Text("How far (along the sun ray) a ray-traced object may still cast a small screen-space contact shadow at its base,");
 				ImGui::Text("  where the ray tracer cannot resolve it. Default 8 = about 16 units near the camera. 0 = none.");
 				ImGui::Text("  Larger = softer bases, but thin posts get fatter. Everything the ray tracer does not see keeps its contact shadows.");
+			}
+			// (47h)
+			ImGui::Checkbox("Sun Shadow: Depth Check for Translucent Surfaces", &settings.SunDepthCheckTranslucent);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): a see-through or blended surface drawn after the solid pass (glass, a blended arch or banner) takes the");
+				ImGui::Text("  sun shadow at its own position (the shadow cascades) where it is not the surface the ray tracer saw; before, it took");
+				ImGui::Text("  the ray-traced shadow of whatever lies behind it and could lose its sunlight. Off: as in 47g.");
 			}
 			ImGui::TreePop();
 		}
@@ -5641,6 +5652,9 @@ void RayTracing::DrawDiagnostics()
 			ImGui::Text("  mixed by how bright each light is there: green = ray traced only, cyan = ray traced + screen-space for the non-RT casters,");
 			ImGui::Text("  orange = screen-space only (the light is not traced here: not a source, more lights than traced per pixel, outside the");
 			ImGui::Text("  traced area), red = no shadow at all. Dark grey = no point light.");
+			// (47h)
+			ImGui::Text("Note: see-through surfaces drawn after the solid pass (glass, blended arches and banners, water, particles) are drawn");
+			ImGui::Text("  over these views: the colours there describe what lies behind them, not the see-through surface itself.");
 		}
 		if (!lastEventsSummary.empty())
 			ImGui::TextWrapped("Last transition: %s", lastEventsSummary.c_str());
@@ -5821,6 +5835,7 @@ void RayTracing::DrawDiagnostics()
 				ImGui::Text("Statics with a Havok-driven part (hinged signs) traced as moving objects: %u", skip.physicsParts);
 				ImGui::Text("Alpha-tested traced with their cut-out %u, alpha-tested that could not be (small, no texture / texcoords, test) %u",
 					skip.alphaAnyHit, skip.alphaUnusable);
+				ImGui::Text("Alpha-blended traced as cut-outs (fully opaque material, Cut-outs on) %u", skip.alphaBlendedTraced);  // (47h)
 				ImGui::Text("Placement check: %u shapes checked, %u fixed (other vertex format), %u left out (wrong place), %u without bound",
 					sc.placementChecked, sc.placementFixed, sc.placementRejected, sc.placementUnchecked);
 				if (auto _tt = Util::HoverTooltipWrapper())
@@ -6023,4 +6038,10 @@ int RayTracing::EffectiveBeamCull() const
 {
 	// (46n) The other modes block Window Shadows Ultimate's beams on its one-sided glass pane by design: debug only.
 	return globals::state && globals::state->IsDeveloperMode() ? std::clamp(settings.PointLightsBeamCull, 0, 2) : 1;
+}
+
+bool RayTracing::SunMaskDepthCheckActive() const
+{
+	// (47h) Only within the frame the mask was written (a stale flag after Ray Tracing stopped running never applies).
+	return settings.Enabled && settings.SunDepthCheckTranslucent && sunMaskWrittenThisFrame && globals::state && sunMaskFrame == globals::state->frameCount;
 }

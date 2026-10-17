@@ -725,21 +725,63 @@ namespace RayTracingScene
 				return false;
 			}
 		}
+
+		// (47h) Blend-only shapes traced as cut-outs (Cut-outs setting): a material at least this opaque, and this alpha threshold.
+		constexpr float kBlendCutoutMinMaterialAlpha = 254.0f / 255.0f;
+		constexpr float kBlendCutoutThreshold = 0.5f;
+
+		/// (47h) The diffuse texture keeps an alpha channel (a blend-only shape's shape is in it). BC1 counts as none.
+		bool TextureHasAlpha(ID3D11Texture2D* a_texture)
+		{
+			__try {
+				D3D11_TEXTURE2D_DESC desc{};
+				a_texture->GetDesc(&desc);
+				switch (desc.Format) {
+				case DXGI_FORMAT_BC2_TYPELESS:
+				case DXGI_FORMAT_BC2_UNORM:
+				case DXGI_FORMAT_BC2_UNORM_SRGB:
+				case DXGI_FORMAT_BC3_TYPELESS:
+				case DXGI_FORMAT_BC3_UNORM:
+				case DXGI_FORMAT_BC3_UNORM_SRGB:
+				case DXGI_FORMAT_BC7_TYPELESS:
+				case DXGI_FORMAT_BC7_UNORM:
+				case DXGI_FORMAT_BC7_UNORM_SRGB:
+				case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+				case DXGI_FORMAT_R8G8B8A8_UNORM:
+				case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+				case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+				case DXGI_FORMAT_B8G8R8A8_UNORM:
+				case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+					return true;
+				default:
+					return false;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
 	}
 
-	bool Scene::GetAlphaSource(RE::BSGeometry* a_geometry, AlphaSource& o_source)
+	bool Scene::GetAlphaSource(RE::BSGeometry* a_geometry, AlphaSource& o_source, bool a_allowBlend)
 	{
 		if (!a_geometry)
 			return false;
 		const auto& runtime = a_geometry->GetGeometryRuntimeData();
 		auto* lighting = netimmerse_cast<RE::BSLightingShaderProperty*>(runtime.properties[RE::BSGeometry::States::kEffect].get());
 		auto* alpha = netimmerse_cast<RE::NiAlphaProperty*>(runtime.properties[RE::BSGeometry::States::kProperty].get());
-		if (!lighting || !alpha || !alpha->GetAlphaTesting())
+		if (!lighting || !alpha)
 			return false;
-		// The Lighting shader keeps a pixel when alpha >= its threshold: only the "greater" tests map to that.
-		const auto test = static_cast<RE::NiAlphaProperty::TestFunction>((alpha->alphaFlags >> 10) & 7);
-		if (test != RE::NiAlphaProperty::TestFunction::kGreater && test != RE::NiAlphaProperty::TestFunction::kGreaterEqual)
+		// (47h) a_allowBlend: a blend-only shape (no alpha test) whose material is fully opaque and whose diffuse texture has an alpha
+		// channel: that alpha is its shape (a trellis, a carved arch), traced as a cut-out at half alpha.
+		const bool blendOnly = a_allowBlend && !alpha->GetAlphaTesting() && alpha->GetAlphaBlending();
+		if (!alpha->GetAlphaTesting() && !blendOnly)
 			return false;
+		if (!blendOnly) {
+			// The Lighting shader keeps a pixel when alpha >= its threshold: only the "greater" tests map to that.
+			const auto test = static_cast<RE::NiAlphaProperty::TestFunction>((alpha->alphaFlags >> 10) & 7);
+			if (test != RE::NiAlphaProperty::TestFunction::kGreater && test != RE::NiAlphaProperty::TestFunction::kGreaterEqual)
+				return false;
+		}
 		auto* rendererData = runtime.rendererData;
 		if (!rendererData)
 			return false;
@@ -749,10 +791,12 @@ namespace RayTracingScene
 		RawAlphaSource raw{};
 		if (!ReadAlphaSource(lighting, raw))
 			return false;
+		if (blendOnly && (!(raw.materialAlpha >= kBlendCutoutMinMaterialAlpha) || !TextureHasAlpha(raw.texture)))
+			return false;
 		using F = RE::BSShaderProperty::EShaderPropertyFlag;
 		o_source.texture = raw.texture;
 		o_source.view = raw.view;
-		o_source.material.threshold = static_cast<float>(alpha->alphaThreshold) / 255.0f;
+		o_source.material.threshold = blendOnly ? kBlendCutoutThreshold : static_cast<float>(alpha->alphaThreshold) / 255.0f;
 		o_source.material.alphaScale = raw.materialAlpha;
 		std::copy_n(raw.uv, 4, o_source.material.uvTransform);
 		// Lighting.hlsl: alpha *= vertex colour alpha, except for tree-animated and LOD shapes.
@@ -826,7 +870,15 @@ namespace RayTracingScene
 		// banners) the Cut-outs setting; vegetation is never taken as an opaque occluder.
 		bool anyHit = false;
 		bool vegetation = false;
+		bool blendTraced = false;  // (47h)
 		auto* alphaTestProperty = netimmerse_cast<RE::NiAlphaProperty*>(runtime.properties[RE::BSGeometry::States::kProperty].get());
+		if (alphaTestProperty && !alphaTestProperty->GetAlphaTesting() && alphaTestProperty->GetAlphaBlending() && (a_alphaKinds & kAlphaCutouts) &&
+			!IsVegetation(geometry)) {
+			// (47h) Blend-only with a fully opaque material and an alpha channel (a trellis arch): traced as a cut-out (Cut-outs).
+			AlphaSource source;
+			blendTraced = std::isfinite(geometry->worldBound.radius) && geometry->worldBound.radius >= kAlphaMinRadius && GetAlphaSource(geometry, source, true);
+			anyHit = blendTraced;
+		}
 		if (alphaTestProperty && alphaTestProperty->GetAlphaTesting()) {
 			vegetation = IsVegetation(geometry);
 			if (o_foliage)
@@ -897,6 +949,10 @@ namespace RayTracingScene
 					       !(geometry->worldBound.radius >= kCutoutMinRadius) ? "alpha-tested (small)" :
 					                                                          "alpha-tested (threshold / test function)";
 				}
+			} else if (alpha->GetAlphaBlending() && blendTraced) {
+				++skipped.alphaBlendedTraced;  // (47h) traced as a cut-out, not a skip
+				if (o_alpha)
+					*o_alpha = true;
 			} else if (alpha->GetAlphaBlending()) {
 				++skipped.alphaBlended;
 				return "alpha-blended";
@@ -1038,7 +1094,8 @@ namespace RayTracingScene
 	{
 		auto& alphaStats = stats_.alpha;
 		AlphaSource source;
-		if (!GetAlphaSource(a_shape, source)) {
+		// (47h) true: a blend-only shape reaches here only through ShapeRejectReason under the Cut-outs setting.
+		if (!GetAlphaSource(a_shape, source, true)) {
 			++alphaStats.failedTexture;
 			return false;
 		}

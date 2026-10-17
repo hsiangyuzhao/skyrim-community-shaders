@@ -9,9 +9,12 @@ namespace LightLimitFix
 		uint NumStrictLights;
 		int RoomIndex;
 		uint ShadowBitMask;
-		uint pad0;
+		uint StrictFlags;  // (47h) was pad0 (LightLimitFix::StrictLightDataCB::Flags)
 		Light StrictLights[15];
 	};
+
+	// (47h) Ray Tracing wrote this frame's sun shadow mask and "Sun Shadow: Depth Check for Translucent Surfaces" is on.
+	static const uint kStrictFlagSunDepthCheck = 1u;
 
 	StructuredBuffer<Light> lights : register(t35);
 	StructuredBuffer<uint> lightList : register(t36);       //MAX_CLUSTER_LIGHTS * 16^3

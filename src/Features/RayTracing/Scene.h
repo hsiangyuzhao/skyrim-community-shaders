@@ -95,6 +95,7 @@ namespace RayTracingScene
 		std::uint32_t physicsParts = 0;    // (45g) statics with a Havok-driven part (swinging signs): own instances
 		std::uint32_t alphaAnyHit = 0;     // (45h) alpha-tested shapes traced with their cut-out, not a skip
 		std::uint32_t alphaUnusable = 0;   // (45h) alpha-tested, but no texture / texcoords / usable test: 45g rules
+		std::uint32_t alphaBlendedTraced = 0;  // (47h) blend-only shapes traced as cut-outs (Cut-outs setting), not a skip
 	};
 
 	/// (45h) Alpha-tested casters traced with their cut-out (Alpha-tested casters switch).
@@ -590,7 +591,8 @@ namespace RayTracingScene
 			RayTracingRT::AlphaMaterial material{};
 			bool vertexAlpha = false;  // the Lighting shader multiplies the vertex colour's alpha in
 		};
-		static bool GetAlphaSource(RE::BSGeometry* a_geometry, AlphaSource& o_source);
+		/// (47h) a_allowBlend: also a blend-only shape with a fully opaque material and an alpha channel (threshold 0.5).
+		static bool GetAlphaSource(RE::BSGeometry* a_geometry, AlphaSource& o_source, bool a_allowBlend = false);
 		/// (45h) An alpha-tested shape as an object shape (shared non-opaque mesh BLAS, texture,
 		/// record); false = not possible (counted), the caller then applies the 45g rules.
 		bool CaptureAlphaShape(RayTracingRT::Backend& a_backend, RE::BSTriShape* a_shape, bool a_allowNewMeshes, ObjectShape& o_shape);

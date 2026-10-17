@@ -212,6 +212,8 @@ void LightLimitFix::BSLightingShader_SetupGeometry_Before(RE::BSRenderPass* a_pa
 
 	strictLightDataTemp.NumStrictLights = 0;
 	strictLightDataTemp.ShadowBitMask = 0;
+	// (47h) Ray Tracing wrote this frame's sun shadow mask and "Sun Shadow: Depth Check for Translucent Surfaces" is on.
+	strictLightDataTemp.Flags = globals::features::rayTracing.loaded && globals::features::rayTracing.SunMaskDepthCheckActive() ? kStrictFlagSunDepthCheck : 0u;
 
 	strictLightDataTemp.RoomIndex = -1;
 	if (!roomNodes.empty()) {
@@ -290,13 +292,16 @@ void LightLimitFix::BSLightingShader_SetupGeometry_After(RE::BSRenderPass*)
 	const bool isWorld = accumulator->GetRuntimeData().activeShadowSceneNode == shadowSceneNode;
 	const auto roomIndex = strictLightDataTemp.RoomIndex;
 	const auto shadowBitMask = strictLightDataTemp.ShadowBitMask;
+	const auto strictFlags = strictLightDataTemp.Flags;  // (47h)
 
-	if (!isEmpty || (isEmpty && !wasEmpty) || isWorld != wasWorld || previousRoomIndex != roomIndex || shadowBitMask != previousShadowBitMask) {
+	if (!isEmpty || (isEmpty && !wasEmpty) || isWorld != wasWorld || previousRoomIndex != roomIndex || shadowBitMask != previousShadowBitMask ||
+		strictFlags != previousStrictFlags) {
 		strictLightDataCB->Update(strictLightDataTemp);
 		wasEmpty = isEmpty;
 		wasWorld = isWorld;
 		previousRoomIndex = roomIndex;
 		previousShadowBitMask = shadowBitMask;
+		previousStrictFlags = strictFlags;
 	}
 
 	if (frameChecker.IsNewFrame()) {

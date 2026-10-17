@@ -353,6 +353,9 @@ public:
 
 	/// True when this frame's shadow mask is (being) ray traced.
 	[[nodiscard]] bool IsActiveThisFrame() const { return activeThisFrame; }
+	/// (47h) This frame's sun shadow mask was written by the trace (outdoors) and "Sun Shadow: Depth Check for Translucent Surfaces" is
+	/// on: forward Lighting surfaces that are not the depth buffer's take the cascades at their own position (LightLimitFix strict flags).
+	[[nodiscard]] bool SunMaskDepthCheckActive() const;
 	[[nodiscard]] Status GetStatus() const { return status; }
 
 	/// For the F7 frame trace: D3D12 GPU ms (last completed), CPU ms this frame, BLAS builds this frame.
@@ -682,6 +685,8 @@ private:
 	std::string lastFailureReason;  // shown again if the start-up is not retried (45d)
 	bool backendTried = false;
 	bool activeThisFrame = false;
+	bool sunMaskWrittenThisFrame = false;  // (47h) FinishFrame merged the trace into the engine's sun shadow mask this frame
+	std::uint32_t sunMaskFrame = UINT32_MAX;  // (47h) State::frameCount of that frame
 	bool combinedThisFrame = false;
 	bool filterLatched = false;
 	bool loadingFlushRegistered = false;

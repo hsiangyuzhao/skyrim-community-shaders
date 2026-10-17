@@ -3816,6 +3816,29 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 	float dirLightAngle = dot(worldNormal.xyz, DirLightDirection.xyz);
 
+#	if !defined(DEFERRED) && defined(LIGHT_LIMIT_FIX)
+	// (47h) "Sun Shadow: Depth Check for Translucent Surfaces": with Ray Tracing's sun shadow in this frame's screen mask, a forward
+	// (blended) surface that is not the one in the depth buffer (glass, a blend-only arch) would read the shadow of what lies behind
+	// it. There it takes the cascades at its own position instead (the same test and tolerance as RTPointShadows::Get).
+	[branch] if ((Permutation::PixelShaderDescriptor & Permutation::LightingFlags::DefShadow) && (Permutation::PixelShaderDescriptor & Permutation::LightingFlags::ShadowDir) &&
+				 (LightLimitFix::StrictFlags & LightLimitFix::kStrictFlagSunDepthCheck) && inWorld && !inReflection && !SharedData::InInterior)
+	{
+		const float sceneDepth = SharedData::GetScreenDepth(screenUV, eyeIndex);
+		[branch] if (abs(sceneDepth - viewPosition.z) > viewPosition.z * 0.02 + 4.0)
+		{
+#		if defined(VOLUMETRIC_SHADOWS)
+			float vsmSunShadow;
+			[branch] if (VolumetricShadows::ForwardSoftShadowsEnabled())
+			{
+				VolumetricShadows::GetVSMShadow2D(input.WorldPosition.xyz, eyeIndex, vsmSunShadow);
+				shadowColor.x = vsmSunShadow;
+			}
+			else
+#		endif
+				shadowColor.x = ShadowSampling::GetLightingShadow(screenNoise, input.WorldPosition.xyz, eyeIndex);
+		}
+	}
+#	endif
 	if ((Permutation::PixelShaderDescriptor & Permutation::LightingFlags::DefShadow) && (Permutation::PixelShaderDescriptor & Permutation::LightingFlags::ShadowDir)) {
 		dirLightColorMultiplier *= shadowColor.x;
 	}
