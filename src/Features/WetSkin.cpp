@@ -81,13 +81,18 @@ namespace
 	void PhysicalToJson(json& o_json, const WetSkin::Settings& a_s)
 	{
 		o_json["SweatBuildup"] = a_s.SweatBuildup;
-		o_json["SweatDrying"] = a_s.SweatDrying;
 		o_json["RainWetting"] = a_s.RainWetting;
-		o_json["RainDrying"] = a_s.RainDrying;
-		o_json["SwimDrying"] = a_s.SwimDrying;
 		o_json["MaxRainWetness"] = a_s.MaxRainWetness;
 		o_json["ManualLookType"] = a_s.ManualLookType;
 		o_json["OilRepelsWater"] = a_s.OilRepelsWater;
+		// (47i)
+		o_json["Beading"] = a_s.Beading;
+		o_json["PhysDryTime"] = a_s.PhysDryTime;
+		o_json["PhysDropletSize"] = a_s.PhysDropletSize;
+		o_json["StartSweat"] = a_s.StartSweat;
+		o_json["FullSweat"] = a_s.FullSweat;
+		o_json["UseDynamicWetness"] = a_s.UseDynamicWetness;
+		o_json["Physical47i"] = true;
 	}
 
 	void PhysicalFromJson(const json& a_json, WetSkin::Settings& o_s)
@@ -102,15 +107,57 @@ namespace
 			}
 		};
 		number("SweatBuildup", o_s.SweatBuildup, 0.1f, 5.0f);
-		number("SweatDrying", o_s.SweatDrying, 0.1f, 5.0f);
 		number("RainWetting", o_s.RainWetting, 0.1f, 5.0f);
-		number("RainDrying", o_s.RainDrying, 0.1f, 5.0f);
-		number("SwimDrying", o_s.SwimDrying, 0.1f, 5.0f);
 		number("MaxRainWetness", o_s.MaxRainWetness, 0.0f, 1.0f);
 		if (auto it = a_json.find("ManualLookType"); it != a_json.end() && it->is_number_integer())
 			o_s.ManualLookType = std::min(it->get<uint32_t>(), static_cast<uint32_t>(WetSkin::ManualLook::Oil));
 		if (auto it = a_json.find("OilRepelsWater"); it != a_json.end() && it->is_boolean())
 			o_s.OilRepelsWater = it->get<bool>();
+		// (47i)
+		number("Beading", o_s.Beading, 0.0f, 1.0f);
+		number("PhysDryTime", o_s.PhysDryTime, 10.0f, 1800.0f);
+		number("PhysDropletSize", o_s.PhysDropletSize, 0.5f, 3.0f);
+		number("StartSweat", o_s.StartSweat, 0.0f, 1.0f);
+		number("FullSweat", o_s.FullSweat, 0.0f, 1.0f);
+		if (auto it = a_json.find("UseDynamicWetness"); it != a_json.end() && it->is_boolean())
+			o_s.UseDynamicWetness = it->get<bool>();
+	}
+
+	/// (47i) A settings JSON (or preset) from before 47i: the Physical options take the user's old values, once. Beading from
+	/// Droplet Amount x Density and Droplets from Rain, Dry Time from Hold + Dry-off Time / Swim Drying, the coalescence scale
+	/// from Droplet Size (its old meaning was the drawn size itself); the sweat thresholds from Advanced Skin (a_skin, may be
+	/// empty: the defaults stay).
+	void MigratePhysical47i(const json& a_json, const json& a_skin, WetSkin::Settings& o_s)
+	{
+		if (!a_json.is_object() || a_json.contains("Physical47i"))
+			return;
+		const auto value = [](const json& a_j, const char* a_key, float a_default) {
+			if (a_j.is_object()) {
+				if (auto it = a_j.find(a_key); it != a_j.end() && it->is_number()) {
+					const float v = it->get<float>();
+					if (std::isfinite(v))
+						return v;
+				}
+			}
+			return a_default;
+		};
+		const float amount = std::clamp(value(a_json, "DropletAmount", 1.0f), 0.0f, 1.0f);
+		const float density = std::clamp(value(a_json, "DropletDensity", 0.45f), 0.0f, 1.0f);
+		const float rainDroplets = std::clamp(value(a_json, "RainDroplets", 0.4f), 0.0f, 1.0f);
+		o_s.Beading = std::clamp(0.75f * std::sqrt(amount * density) * (0.8f + 0.5f * rainDroplets), 0.05f, 1.0f);
+		const float hold = std::clamp(value(a_json, "HoldTime", 20.0f), 0.0f, 600.0f);
+		const float dry = std::clamp(value(a_json, "DryTime", 150.0f), 1.0f, 1200.0f);
+		const float swimDrying = std::clamp(value(a_json, "SwimDrying", 1.0f), 0.1f, 5.0f);
+		o_s.PhysDryTime = std::clamp((hold + dry) / swimDrying, 10.0f, 1800.0f);
+		o_s.PhysDropletSize = std::clamp(std::cbrt(std::clamp(value(a_json, "DropletSize", 1.0f), 0.25f, 4.0f)), 0.5f, 3.0f);
+		if (a_skin.is_object()) {
+			o_s.StartSweat = std::clamp(value(a_skin, "StartSweat", o_s.StartSweat), 0.0f, 1.0f);
+			o_s.FullSweat = std::clamp(value(a_skin, "FullSweat", o_s.FullSweat), 0.0f, 1.0f);
+			if (auto it = a_skin.find("UseDynamicWetness"); it != a_skin.end() && it->is_boolean())
+				o_s.UseDynamicWetness = it->get<bool>();
+		}
+		logger::info("[Character Wetness] 47i Physical settings taken from the old ones: Beading {:.2f}, Dry Time {:.0f} s, Droplet Size {:.2f}, sweat {:.2f} / {:.2f}{}",
+			o_s.Beading, o_s.PhysDryTime, o_s.PhysDropletSize, o_s.StartSweat, o_s.FullSweat, o_s.UseDynamicWetness ? ", Dynamic Wetness" : "");
 	}
 
 	float Smooth(float a_edge0, float a_edge1, float a_x)
@@ -119,119 +166,88 @@ namespace
 		return t * t * (3.0f - 2.0f * t);
 	}
 
-	/// (47f) One source's look at level a_level (what the shader sees of it, 0..1).
-	struct SourceLook
+	/// (47i) One source's beads at its bead water (um): base radius r (cm, at most the runoff size), coverage, the visible
+	/// share (sub-visible beads are sheen only) and how far past the runoff size the water would make them (trails).
+	struct BeadSet
 	{
-		float level = 0.0f;
-		float beads = 0.0f;       // droplet driver
-		float streak = 0.0f;      // rivulet driver
-		float film = 1.0f;        // x sheen strength
-		float density = 1.0f;     // x droplet density
-		float size = 1.0f;        // x droplet size
-		float sizeRandom = 1.0f;  // x size variation
-		float trails = 1.0f;      // x droplet trails
+		float water = 0.0f;
+		float r = 0.0f;
+		float coverage = 0.0f;
+		float visible = 0.0f;
+		float runoff = 0.0f;
 	};
 
-	/// (47g) The droplet driver for a visible bead count per skin area a_count at bead size a_size (both x the user's
-	/// values): the shader's droplet cells shrink with the bead size (cells per uv = 320 / size), so the share of cells
-	/// holding a bead is count x size^2.
-	/// (47h) Stronger Low-Wetness Look: droplet density x the user's value (the shader clamps the product to 1).
-	constexpr float kStrongDensity = 2.2f;
+	using Phys = WetSkin::Phys;
+	constexpr float kPi = 3.14159265f;
 
-	float BeadDriver(float a_count, float a_size)
+	BeadSet FinishBeads(BeadSet a_b, float a_runoffR)
 	{
-		return std::clamp(a_count * a_size * a_size, 0.0f, 1.0f);
+		if (a_b.r > a_runoffR) {
+			a_b.runoff = std::clamp((a_b.r - a_runoffR) / a_runoffR, 0.0f, 1.0f);
+			// Larger beads run off: the water left stays in beads of the runoff size (more of them).
+			const float v = a_b.water * 1e-4f;
+			a_b.r = a_runoffR;
+			a_b.coverage = v * kPi / (Phys::kBeadKappa * a_b.r);
+		}
+		a_b.coverage = std::clamp(a_b.coverage, 0.0f, Phys::kMaxCoverage);
+		a_b.visible = Smooth(Phys::kVisibleR0, Phys::kVisibleR1, a_b.r);
+		return a_b;
 	}
 
-	/// Sweat: a few tiny beads at the onset, more and larger toward mid wetness, then they merge into trails and a thin
-	/// film. (47g) The count rises gradually and peaks around mid wetness (it saturated at 0.15-0.2 before, with 1.8x
-	/// density at low wetness); the size grows with the wetness. Fully wet unchanged (driver 0.6 at size 0.9).
-	/// (47h) a_strong "Physical: Stronger Low-Wetness Look": beads are the visible signal from the onset (presence share, no
-	/// size^2), 2.2x density, size from a bead that resolves at 1.5 m; trails, streaks and the film come in earlier (reviews/wetness-render).
-	SourceLook SweatLook(float a_level, bool a_strong)
+	/// Sweat: pores fill (kSweatPores per cm2), then the beads merge once they cover kSweatCoalesce / S.
+	BeadSet SweatBeads(float a_water, float a_size)
 	{
-		SourceLook o;
-		const float l = std::clamp(a_level, 0.0f, 1.0f);
-		o.level = l;
-		if (a_strong) {
-			o.size = std::lerp(0.55f, 0.95f, Smooth(0.0f, 0.7f, l));
-			const float count = 0.30f + 0.70f * Smooth(0.02f, 0.30f, l) - 0.25f * Smooth(0.6f, 1.0f, l);
-			o.beads = std::clamp(count * Smooth(0.0f, 0.04f, l), 0.0f, 1.0f);
-			o.density = kStrongDensity;
-			o.sizeRandom = 0.5f;
-			o.trails = Smooth(0.15f, 0.5f, l);
-			o.streak = 0.7f * Smooth(0.3f, 0.75f, l);
-			o.film = std::lerp(0.6f, 1.0f, Smooth(0.3f, 0.9f, l));
-			return o;
+		BeadSet b;
+		b.water = std::max(a_water, 0.0f);
+		if (b.water <= 1e-4f)
+			return b;
+		const float v = b.water * 1e-4f;
+		b.r = std::cbrt(v / (Phys::kSweatPores * Phys::kBeadKappa));
+		b.coverage = Phys::kSweatPores * kPi * b.r * b.r;
+		const float merge = Phys::kSweatCoalesce / a_size;
+		if (b.coverage > merge) {
+			b.coverage = merge;
+			b.r = v * kPi / (merge * Phys::kBeadKappa);
 		}
-		o.size = std::lerp(0.3f, 0.9f, Smooth(0.0f, 0.8f, l));
-		const float count = (0.6f / 0.81f) * (1.4f * Smooth(0.02f, 0.5f, l) - 0.4f * Smooth(0.55f, 1.0f, l));
-		o.beads = BeadDriver(count, o.size);
-		o.density = 1.0f;
-		o.sizeRandom = 0.5f;
-		o.trails = Smooth(0.4f, 0.8f, l);
-		o.streak = 0.7f * Smooth(0.55f, 0.95f, l);
-		o.film = std::lerp(0.2f, 1.0f, Smooth(0.5f, 1.0f, l));
-		return o;
+		return FinishBeads(b, Phys::kRunoffRadius * a_size);
 	}
 
-	/// Rain: sparse beads of mixed sizes (the shader puts more on up-facing surfaces), runoff trails, a film in heavy rain.
-	/// (47g) The count grows with the water received (it was at its maximum from level 0.15); fully wet unchanged.
-	SourceLook RainLook(float a_level, bool a_strong)
+	/// Rain: each impact one bead of kRainRadius; they merge once they cover kRainCoalesce / S.
+	BeadSet RainBeads(float a_water, float a_size)
 	{
-		SourceLook o;
-		const float l = std::clamp(a_level, 0.0f, 1.0f);
-		o.level = l;
-		if (a_strong) {  // (47h)
-			o.size = std::lerp(0.75f, 1.1f, Smooth(0.05f, 0.7f, l));
-			o.beads = std::clamp(0.35f + 0.55f * Smooth(0.02f, 0.5f, l), 0.0f, 1.0f) * Smooth(0.0f, 0.04f, l);
-			o.density = kStrongDensity;
-			o.sizeRandom = 1.5f;
-			o.trails = Smooth(0.1f, 0.45f, l);
-			o.streak = Smooth(0.15f, 0.55f, l);
-			o.film = std::lerp(0.6f, 1.0f, Smooth(0.25f, 0.8f, l));
-			return o;
+		BeadSet b;
+		b.water = std::max(a_water, 0.0f);
+		if (b.water <= 1e-4f)
+			return b;
+		const float v = b.water * 1e-4f;
+		b.r = Phys::kRainRadius;
+		b.coverage = v * kPi / (Phys::kBeadKappa * b.r);
+		const float merge = Phys::kRainCoalesce / a_size;
+		if (b.coverage > merge) {
+			b.coverage = merge;
+			b.r = v * kPi / (merge * Phys::kBeadKappa);
 		}
-		o.size = std::lerp(0.6f, 1.1f, Smooth(0.1f, 0.8f, l));
-		o.beads = BeadDriver((0.6f / 1.21f) * Smooth(0.02f, 0.8f, l), o.size);
-		o.density = 1.0f;
-		o.sizeRandom = 1.5f;
-		o.trails = Smooth(0.2f, 0.6f, l);
-		o.streak = Smooth(0.25f, 0.7f, l);
-		o.film = std::lerp(0.3f, 1.0f, Smooth(0.45f, 0.9f, l));
-		return o;
+		return FinishBeads(b, Phys::kRunoffRadius * a_size);
 	}
 
-	/// Swimming: a thick film with runoff trails; drying, the film breaks into beads, which then shrink and go.
-	/// a_phase: 0 just out of the water .. 1 dry (evaporation clock / evaporation time); a_runoff: the runoff left (1 .. 0).
-	/// (47g) Late in the drying both the count and the size fall (the small beads evaporate first); the count rose 20x
-	/// before (density up while the size shrank). Just out of the water unchanged.
-	SourceLook SwimLook(float a_level, float a_phase, float a_runoff, bool a_strong)
+	/// Swim: the film breaks into kSwimBeads / S^2 beads per cm2, which then shrink in place.
+	BeadSet SwimBeads(float a_water, float a_size)
 	{
-		SourceLook o;
-		const float l = std::clamp(a_level, 0.0f, 1.0f);
-		const float p = std::clamp(a_phase, 0.0f, 1.0f);
-		o.level = l;
-		if (a_strong) {  // (47h)
-			o.film = std::lerp(1.0f, 0.55f, Smooth(0.1f, 0.6f, p));
-			o.size = std::lerp(1.1f, 0.6f, Smooth(0.3f, 0.95f, p));
-			const float count = std::lerp(0.55f, 0.9f, Smooth(0.05f, 0.3f, p)) * (1.0f - 0.85f * Smooth(0.6f, 1.0f, p));
-			o.beads = std::clamp(count, 0.0f, 1.0f) * Smooth(0.0f, 0.05f, l);
-			o.density = kStrongDensity;
-			o.sizeRandom = 0.7f;
-			o.trails = std::lerp(1.0f, 0.5f, Smooth(0.1f, 0.6f, p));
-			o.streak = std::max(std::clamp(a_runoff, 0.0f, 1.0f), 0.5f * (1.0f - p)) * Smooth(0.0f, 0.06f, l);
-			return o;
-		}
-		o.film = std::lerp(1.0f, 0.3f, Smooth(0.1f, 0.55f, p));
-		o.size = std::lerp(1.1f, 0.45f, Smooth(0.3f, 0.95f, p));
-		const float count = (0.5f / 1.21f) * std::lerp(1.0f, 1.6f, Smooth(0.05f, 0.3f, p)) * (1.0f - Smooth(0.5f, 1.0f, p));
-		o.beads = BeadDriver(count, o.size) * Smooth(0.0f, 0.12f, l);
-		o.density = 1.0f;
-		o.sizeRandom = 0.7f;
-		o.trails = std::lerp(1.0f, 0.3f, Smooth(0.1f, 0.5f, p));
-		o.streak = std::max(std::clamp(a_runoff, 0.0f, 1.0f), 0.25f * (1.0f - p)) * Smooth(0.0f, 0.1f, l);
-		return o;
+		BeadSet b;
+		b.water = std::max(a_water, 0.0f);
+		if (b.water <= 1e-4f)
+			return b;
+		const float v = b.water * 1e-4f;
+		const float n = Phys::kSwimBeads / (a_size * a_size);
+		b.r = std::cbrt(v / (n * Phys::kBeadKappa));
+		b.coverage = n * kPi * b.r * b.r;
+		return FinishBeads(b, Phys::kRunoffRadius * a_size);
+	}
+
+	/// The swim water above which no beads form (a closed film), as Skin.hlsli WetPhysSwimBeadShare.
+	float SwimBeadGate(float a_water)
+	{
+		return 1.0f - Smooth(120.0f, 160.0f, a_water);
 	}
 
 	json g_legacySkin;
@@ -295,9 +311,7 @@ WetSkin::GPUParams WetSkin::GetGPUParams() const
 	GPUParams g{};
 	const bool isNew = !IsOriginal();
 	// (47f) x: 0 Legacy, 1 Simple, 2 Physical (Skin.hlsli WetSkinNewModel() is x > 0.5, WetPhysical() x > 1.5).
-	// (47h) Physical: + 0.25 Stronger Low-Wetness Look, + 0.5 Smaller Visible Bead Size (Skin.hlsli WetStrongLowLook / WetSmallBeads).
-	const float physicalBits = IsPhysical() ? (s.PhysicalStrongLowLook ? 0.25f : 0.0f) + (s.PhysicalSmallBeads ? 0.5f : 0.0f) : 0.0f;
-	g.p[0] = float4(isNew ? (IsPhysical() ? 2.0f + physicalBits : 1.0f) : 0.0f, std::clamp(s.ExtraWetness, 0.0f, 1.0f), std::clamp(s.SwimWeight, 0.0f, 1.0f), std::clamp(s.RainWeight, 0.0f, 1.0f));
+	g.p[0] = float4(isNew ? (IsPhysical() ? 2.0f : 1.0f) : 0.0f, std::clamp(s.ExtraWetness, 0.0f, 1.0f), std::clamp(s.SwimWeight, 0.0f, 1.0f), std::clamp(s.RainWeight, 0.0f, 1.0f));
 	// Sheen: roughness never below 0.2 (anti-mirror), strength at most 2.5.
 	g.p[1] = float4(std::clamp(s.SweatWeight, 0.0f, 1.0f), std::clamp(s.RoughnessLow, 0.2f, 0.6f), std::clamp(s.RoughnessFull, 0.2f, 0.6f), std::clamp(s.FullWetnessStrength, 0.0f, 2.5f));
 	g.p[2] = float4(std::clamp(s.PatchSoftness, 0.05f, 0.6f), std::clamp(s.PatchContrast, 0.0f, 1.0f), std::clamp(s.DropletAmount, 0.0f, 1.0f), std::clamp(s.DropletDensity, 0.0f, 1.0f));
@@ -346,24 +360,9 @@ float WetSkin::MaxDryMultiplier() const
 // (47f) Physical model
 // ---------------------------------------------------------------------------------------------
 
-float WetSkin::PhysicalRunoffTime() const
+float WetSkin::PhysBandWater(float a_p, float a_x)
 {
-	// Simple holds a character fully wet for Hold Time after leaving the water: the runoff takes about that long.
-	return std::clamp(settings.HoldTime * 0.5f, 3.0f, 60.0f);
-}
-
-float WetSkin::PhysicalEvaporationTime() const
-{
-	// Simple is dry after Hold + Dry-off Time: a soaked skin's evaporation takes that long here.
-	return std::clamp(settings.HoldTime + settings.DryTime, 10.0f, 1800.0f);
-}
-
-float WetSkin::PhysicalSwimLevel(float a_run, float a_runoffTime, float a_evapTime, float a_dryMult)
-{
-	const float t = std::max(a_run, 0.0f) / std::max(a_dryMult, 0.25f);
-	const float runoff = std::exp(-t / std::max(a_runoffTime, 0.1f));
-	const float evaporation = std::clamp(1.0f - t / std::max(a_evapTime, 1.0f), 0.0f, 1.0f);
-	return kRunoffShare * runoff + (1.0f - kRunoffShare) * evaporation;
+	return Phys::kHold * std::clamp(1.0f - a_p, 0.0f, 1.0f) + (Phys::kSoak - Phys::kHold) * std::clamp(a_x, 0.0f, 1.0f);
 }
 
 const WetSkin::PhysicalFrame& WetSkin::GetPhysicalFrame()
@@ -375,89 +374,138 @@ const WetSkin::PhysicalFrame& WetSkin::GetPhysicalFrame()
 	const auto& wetness = globals::features::wetnessEffects;
 	physicalFrame.rainIntensity = wetness.loaded ? wetness.GetCharacterRainIntensity() : 0.0f;
 	float snowing = 0.0f;
+	float fogHumidity = 0.0f;
 	if (const auto* sky = globals::game::sky; sky && sky->mode.get() == RE::Sky::Mode::kFull) {
 		const auto isSnow = [](const RE::TESWeather* a_weather) {
 			return a_weather && a_weather->data.flags.any(RE::TESWeather::WeatherDataFlag::kSnow) ? 1.0f : 0.0f;
 		};
-		snowing = isSnow(sky->currentWeather) * sky->currentWeatherPct + isSnow(sky->lastWeather) * (1.0f - sky->currentWeatherPct);
+		// (47i) Fog humidity, generic: the weather's own fog distance (day and night alike), short in fog and mist.
+		const auto fogHumid = [](const RE::TESWeather* a_weather) {
+			if (!a_weather)
+				return 0.0f;
+			const float fogFar = std::min(a_weather->fogData.dayFar, a_weather->fogData.nightFar);
+			return std::isfinite(fogFar) && fogFar > 0.0f ? 1.0f - Smooth(8000.0f, 30000.0f, fogFar) : 0.0f;
+		};
+		const float pct = std::clamp(sky->currentWeatherPct, 0.0f, 1.0f);
+		snowing = isSnow(sky->currentWeather) * pct + isSnow(sky->lastWeather) * (1.0f - pct);
+		fogHumidity = fogHumid(sky->currentWeather) * pct + fogHumid(sky->lastWeather) * (1.0f - pct);
 	}
 	physicalFrame.snowing = std::clamp(snowing, 0.0f, 1.0f);
+	physicalFrame.fogHumidity = std::clamp(fogHumidity, 0.0f, 1.0f);
 	return physicalFrame;
 }
 
 void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) const
 {
 	const auto& s = settings;
-	const float dt = std::clamp(std::isfinite(a_in.dt) ? a_in.dt : 0.0f, 0.0f, 3600.0f);
-	const float evapTime = PhysicalEvaporationTime();
-	const float cold = std::clamp(a_in.cold, 0.0f, 1.0f);
-	const float exposure = std::clamp(a_in.exposure, 0.0f, 1.0f);
+	const float dtAll = std::clamp(std::isfinite(a_in.dt) ? a_in.dt : 0.0f, 0.0f, 3600.0f);
+	const float cold = a_in.outdoors ? std::clamp(a_in.cold, 0.0f, 1.0f) : 0.0f;
+	const float exposure = a_in.outdoors ? std::clamp(a_in.exposure, 0.0f, 1.0f) : 0.0f;
 	const float intensity = std::clamp(physicalFrame.rainIntensity, 0.0f, 1.0f);
-	// Evaporation environment (generic only): humid while it rains, slower in the cold (dry, windy air is the 1).
-	const float evaporation = (1.0f - 0.5f * intensity) * (1.0f - 0.3f * cold);
-	const float exertion = std::clamp(a_in.exertion, 0.0f, 1.0f);
+	// Evaporation environment (generic only): humid air (rain, even light rain; snow weather; fog) and cold dry slower; interiors neutral.
+	const float rainHumid = (0.6f + 0.4f * intensity) * Smooth(0.0f, 0.05f, intensity);
+	const float humid = a_in.outdoors ? std::max({ rainHumid, 0.7f * physicalFrame.snowing, physicalFrame.fogHumidity }) : 0.0f;
+	const float evaporation = (1.0f - 0.7f * humid) * (1.0f - 0.4f * cold);
+	const float exertion = std::clamp(std::isfinite(a_in.exertion) ? a_in.exertion : 0.0f, 0.0f, 1.0f);
 	const float buildup = std::clamp(s.SweatBuildup, 0.1f, 5.0f);
-	const float sweatDrying = std::clamp(s.SweatDrying, 0.1f, 5.0f);
-	const float maxRain = std::clamp(s.MaxRainWetness, 0.0f, 1.0f);
-	const float rainTarget = maxRain * intensity * exposure;
-
-	// Sweat: production follows the exertion through two lags (onset after about a minute, still sweating for a
-	// while after stopping); the skin's sweat moves to production / evaporation (above the production when humid).
-	const float kEvap = sweatDrying * evaporation / (0.6f * evapTime);
-	const float kProd = buildup / (0.6f * evapTime);
-	const auto production = [&](float a_heat) { return Smooth(0.3f, 0.9f, a_heat) * (1.0f - 0.6f * cold); };
+	const float sweatTarget = Phys::kSweatMax * std::clamp(s.SweatWeight, 0.0f, 1.0f) * (1.0f - 0.6f * cold);
+	const float rainCap = std::clamp(s.MaxRainWetness, 0.0f, 1.0f) * Phys::kHold;
+	const float rainRate = Phys::kRainRate * intensity * exposure * std::clamp(s.RainWetting, 0.1f, 5.0f);
+	const float flux = Phys::kHold / std::clamp(s.PhysDryTime, 10.0f, 1800.0f) * evaporation;  // um/s
+	const float depth = std::max(std::isfinite(a_in.depth) ? a_in.depth : 0.0f, 0.0f);
+	const float bandHeight = std::max(std::isfinite(a_in.height) ? a_in.height : 128.0f, 32.0f) / static_cast<float>(Phys::kBands);
+	const auto submerged = [&](uint32_t a_band) { return depth > (static_cast<float>(a_band) + 0.5f) * bandHeight; };
 
 	if (!a_state.valid) {
+		// First seen: as if it had been like this for a while (a character met in the rain is wet already; nobody is
+		// wet from a swim they were not seen taking).
 		a_state = {};
 		a_state.valid = true;
-		a_state.heat1 = a_state.heat2 = exertion;
-		a_state.sweat = std::min(kProd * production(exertion) / std::max(kEvap, 1e-6f), 1.0f);
-		a_state.rain = rainTarget;  // a character met in the rain is wet already
-	} else if (dt > 0.0f) {
-		const auto lag = [dt](float& a_value, float a_target, float a_up, float a_down) {
-			const float tau = a_target > a_value ? a_up : a_down;
-			a_value += (a_target - a_value) * (1.0f - std::exp(-dt / tau));
-		};
-		lag(a_state.heat1, exertion, 45.0f / buildup, 150.0f);
-		lag(a_state.heat2, a_state.heat1, 45.0f / buildup, 150.0f);
-		// Unclamped: humid air raises it above 1, so the sweat climbs as fast as anywhere and stays at the top (clamped below).
-		const float equilibrium = kProd * production(a_state.heat2) / std::max(kEvap, 1e-6f);
-		a_state.sweat = equilibrium + (a_state.sweat - equilibrium) * std::exp(-kEvap * dt);
+		a_state.heat = exertion;
+		a_state.sweat = sweatTarget * exertion * 0.8f;
+		a_state.rain = rainRate > 0.0f ? std::min(rainCap, rainRate * 60.0f) : 0.0f;
+		for (uint32_t b = 0; b < Phys::kBands; ++b) {
+			a_state.bandP[b] = submerged(b) ? 0.0f : Phys::kMaxProgress;
+			a_state.bandX[b] = submerged(b) ? 1.0f : 0.0f;
+		}
+	} else if (dtAll > 0.0f) {
+		// Sub-steps of at most 2 s (the shared evaporation couples the sources), at most 64 (a character back after a long
+		// absence just catches up coarser).
+		const uint32_t steps = std::clamp(static_cast<uint32_t>(std::ceil(dtAll / 2.0f)), 1u, 64u);
+		const float dt = dtAll / static_cast<float>(steps);
+		for (uint32_t step = 0; step < steps; ++step) {
+			// Sweat: body heat follows the exertion; production fills the skin toward the target (one way: a lower target
+			// leaves the water to evaporate).
+			const float tau = exertion > a_state.heat ? Phys::kHeatUp : Phys::kHeatDown;
+			a_state.heat += (exertion - a_state.heat) * (1.0f - std::exp(-dt / tau));
+			const float target = sweatTarget * a_state.heat;
+			if (a_state.sweat < target)
+				a_state.sweat = target + (a_state.sweat - target) * std::exp(-dt * buildup / Phys::kSweatTau);
 
-		// Rain: toward intensity x exposure x Max Rain Wetness. Drying: what is above the skin's damp hold (or above
-		// what the rain still brings) runs off within seconds, the damp rest evaporates.
-		const float rainWetting = std::clamp(s.RainWetting, 0.1f, 5.0f);
-		const float rainDrying = std::clamp(s.RainDrying, 0.1f, 5.0f);
-		if (rainTarget > a_state.rain) {
-			const float tau = 40.0f / (rainWetting * std::max(intensity, 0.15f));
-			a_state.rain += (rainTarget - a_state.rain) * (1.0f - std::exp(-dt / tau));
-		} else {
-			const float damp = std::min(a_state.rain, 0.35f * maxRain);
-			const float floor = std::max(rainTarget, damp);
-			if (a_state.rain > floor)
-				a_state.rain = floor + (a_state.rain - floor) * std::exp(-dt * rainDrying / 12.0f);
-			const float rate = 0.35f * maxRain * rainDrying * evaporation / (0.6f * evapTime);
-			a_state.rain = std::max(rainTarget, a_state.rain - rate * dt);
+			// Rain: what the sky reaches, up to the cap; while it rains the impacts shed water (kRainDrain), so lighter rain settles
+			// lower (equilibrium rate x kRainDrain); the water over the cap runs off. Both make trails.
+			if (a_state.rain >= rainCap) {
+				a_state.rain = rainCap + (a_state.rain - rainCap) * std::exp(-dt / Phys::kRunoffTau);  // over the cap (lowered): runs off
+			} else if (rainRate > 0.0f) {
+				const float settle = rainRate * Phys::kRainDrain;
+				a_state.rain = std::min(settle + (a_state.rain - settle) * std::exp(-dt / Phys::kRainDrain), rainCap);
+			}
+			const bool runningOff = rainRate > 0.0f && a_state.rain >= rainCap - 0.5f;
+			const float drainTrail = rainRate > 0.0f ? Smooth(0.6f, 1.6f, a_state.rain / Phys::kRainDrain) : 0.0f;  // um/s shed
+			const float runoffTarget = std::max(runningOff ? std::clamp(rainRate / 1.0f, 0.0f, 1.0f) : 0.0f, drainTrail);
+			a_state.rainRunoff += (runoffTarget - a_state.rainRunoff) * (1.0f - std::exp(-dt / (runoffTarget > a_state.rainRunoff ? 6.0f : 15.0f)));
+
+			// Swim: bands under the surface are soaked; above it the water over the hold capacity runs off.
+			float swimSum = 0.0f;
+			for (uint32_t b = 0; b < Phys::kBands; ++b) {
+				if (submerged(b)) {
+					a_state.bandP[b] = 0.0f;
+					a_state.bandX[b] = 1.0f;
+				} else {
+					a_state.bandX[b] *= std::exp(-dt / Phys::kRunoffTau);
+				}
+				swimSum += PhysBandWater(a_state.bandP[b], a_state.bandX[b]);
+			}
+			const float swimMean = swimSum / static_cast<float>(Phys::kBands);
+
+			// One evaporation flux, shared by the water there in proportion (more water: longer).
+			const float loss = flux * dt;
+			const float total = a_state.sweat + a_state.rain + swimMean;
+			if (total > 1e-4f) {
+				a_state.sweat = std::max(a_state.sweat - loss * a_state.sweat / total, 0.0f);
+				a_state.rain = std::max(a_state.rain - loss * a_state.rain / total, 0.0f);
+			}
+			for (uint32_t b = 0; b < Phys::kBands; ++b) {
+				if (submerged(b))
+					continue;
+				const float held = Phys::kHold * std::clamp(1.0f - a_state.bandP[b], 0.0f, 1.0f);
+				// Dry skin (p >= 1): the slower classes (hair, cloth ...) go on drying at the full flux.
+				const float share = a_state.bandP[b] < 1.0f ? held / std::max(held + a_state.sweat + a_state.rain, 1e-3f) : 1.0f;
+				a_state.bandP[b] = std::min(a_state.bandP[b] + loss * share / Phys::kHold, Phys::kMaxProgress);
+			}
 		}
 	}
-
-	// Swimming: both clocks start when the character leaves the water.
-	const float swimDrying = std::clamp(s.SwimDrying, 0.1f, 5.0f);
-	if (a_in.inWater) {
-		a_state.swimRun = 0.0f;
-		a_state.swimEvap = 0.0f;
+	a_state.bandHeight = bandHeight;
+	a_state.depth = depth;
+	if (depth > 0.0f)
 		a_state.wasInWater = true;
-	} else if (dt > 0.0f) {
-		a_state.swimRun = std::min(a_state.swimRun + dt * swimDrying, 1e6f);
-		a_state.swimEvap = std::min(a_state.swimEvap + dt * swimDrying * evaporation, 1e6f);
-	}
-
 	a_state.exposure = exposure;
 	a_state.evaporation = evaporation;
-	for (float* v : { &a_state.heat1, &a_state.heat2, &a_state.sweat, &a_state.rain }) {
+	for (float* v : { &a_state.heat, &a_state.rainRunoff }) {
 		if (!std::isfinite(*v))
 			*v = 0.0f;
 		*v = std::clamp(*v, 0.0f, 1.0f);
+	}
+	for (float* v : { &a_state.sweat, &a_state.rain }) {
+		if (!std::isfinite(*v))
+			*v = 0.0f;
+		*v = std::clamp(*v, 0.0f, Phys::kSoak);
+	}
+	for (uint32_t b = 0; b < Phys::kBands; ++b) {
+		if (!std::isfinite(a_state.bandP[b]))
+			a_state.bandP[b] = Phys::kMaxProgress;
+		if (!std::isfinite(a_state.bandX[b]))
+			a_state.bandX[b] = 0.0f;
 	}
 }
 
@@ -465,91 +513,82 @@ WetSkin::PhysicalLook WetSkin::GetPhysicalLook(const PhysicalState& a_state) con
 {
 	const auto& s = settings;
 	PhysicalLook look;
-	const float runoffTime = PhysicalRunoffTime();
-	const float evapTime = PhysicalEvaporationTime();
-	look.runoffTime = runoffTime;
-	look.swimClock = std::min(a_state.swimRun, 1e6f);
-	// The evaporation clock ran slower or faster than the runoff clock (environment): the shader only gets the runoff
-	// clock, so the evaporation time is stretched to match (exact for every dry multiplier).
-	look.evapTime = a_state.swimEvap > 1e-3f ? std::clamp(evapTime * a_state.swimRun / a_state.swimEvap, 1.0f, 1e6f) : evapTime;
-	look.swim = a_state.wasInWater ? PhysicalSwimLevel(a_state.swimRun, runoffTime, look.evapTime, 1.0f) : 0.0f;
-	look.sweat = a_state.sweat;
-	look.rain = a_state.rain;
+	const float size = std::clamp(s.PhysDropletSize, 0.5f, 3.0f);
+	float beading = std::clamp(s.Beading, 0.0f, 1.0f);
 
+	// Manual: a fixed amount of water with the chosen source's look; Oil is its own film (never dries).
 	const float manual = std::clamp(s.ExtraWetness, 0.0f, 1.0f);
 	const auto manualLook = static_cast<ManualLook>(std::min(s.ManualLookType, static_cast<uint32_t>(ManualLook::Oil)));
+	const float manualWater = manualLook == ManualLook::Oil ? 0.0f : manual * Phys::kSoak;
 	look.oil = manualLook == ManualLook::Oil ? manual : 0.0f;
-	look.manualWater = manualLook == ManualLook::Oil ? 0.0f : manual;
+	const float sweat = a_state.sweat + (manualLook == ManualLook::Sweat ? manualWater : 0.0f);
+	const float rain = a_state.rain + (manualLook == ManualLook::Rain ? manualWater : 0.0f);
+	const float manualSwim = manualLook == ManualLook::Swim ? manualWater : 0.0f;
+	const float swimWeight = std::clamp(s.SwimWeight, 0.0f, 1.0f);
 
-	// Each source at the level the shader will see (x its weight), then the stronger effect wins; the droplet
-	// shape parameters are blended by how much each source's beads count.
-	std::array<SourceLook, 4> sources{};
-	const bool strong = s.PhysicalStrongLowLook;  // (47h)
-	sources[0] = SweatLook(a_state.sweat * std::clamp(s.SweatWeight, 0.0f, 1.0f), strong);
-	sources[1] = RainLook(a_state.rain, strong);
-	{
-		const float phase = std::clamp(a_state.swimEvap / evapTime, 0.0f, 1.0f);
-		const float runoff = std::exp(-a_state.swimRun / runoffTime);
-		sources[2] = SwimLook(look.swim * std::clamp(s.SwimWeight, 0.0f, 1.0f), phase, runoff, strong);
-	}
-	switch (manualLook) {
-	case ManualLook::Sweat:
-		sources[3] = SweatLook(look.manualWater, strong);
-		break;
-	case ManualLook::Rain:
-		sources[3] = RainLook(look.manualWater, strong);
-		break;
-	case ManualLook::Swim:
-		sources[3] = SwimLook(look.manualWater, 1.0f - look.manualWater, Smooth(0.8f, 1.0f, look.manualWater), strong);
-		break;
-	default:
-		break;  // Oil: no water
-	}
-	float levelSum = 0.0f, filmSum = 0.0f, beadSum = 0.0f;
-	float density = 0.0f, size = 0.0f, sizeRandom = 0.0f, trails = 0.0f;
-	for (const auto& src : sources) {
-		look.peak = std::max(look.peak, src.level);
-		look.beads = std::max(look.beads, src.beads);
-		look.trails = std::max(look.trails, src.streak);
-		levelSum += src.level;
-		filmSum += src.film * src.level;
-		const float w = src.beads * src.level;
-		beadSum += w;
-		density += src.density * w;
-		size += src.size * w;
-		sizeRandom += src.sizeRandom * w;
-		trails += src.trails * w;
-	}
-	// (47g) Gear and hair: beads and trails only from rain, swimming and a manual look other than Sweat.
-	look.manualSweat = manualLook == ManualLook::Sweat;
-	for (std::size_t i = 1; i < sources.size(); ++i) {
-		if (i == 3 && look.manualSweat)
-			continue;
-		look.gearBeads = std::max(look.gearBeads, sources[i].beads);
-		look.gearTrails = std::max(look.gearTrails, sources[i].streak);
-	}
-	look.film = levelSum > 1e-5f ? filmSum / levelSum : 1.0f;
-	if (beadSum > 1e-6f) {
-		look.density = density / beadSum;
-		look.size = size / beadSum;
-		look.sizeRandom = sizeRandom / beadSum;
-		look.beadTrails = trails / beadSum;
-	}
-
-	// Oil Repels Water: on oiled skin the water stays in round, distinct beads and forms no film (CPU parameters only).
+	// Oil Repels Water: on oiled skin the water stays in round, distinct beads and forms almost no film.
+	look.filmMult = 1.0f;
+	look.dome = 1.0f;
 	if (s.OilRepelsWater && look.oil > 0.0f) {
-		const float k = look.oil;
-		look.film *= 1.0f - 0.9f * k;
-		look.beads = std::lerp(look.beads, std::max(look.beads, Smooth(0.02f, 0.12f, look.peak)), k);
-		look.density *= 1.0f + 0.4f * k;
-		look.size *= std::lerp(1.0f, 1.15f, k);
-		look.sizeRandom *= 1.0f - 0.6f * k;
-		look.beadTrails *= 1.0f - 0.8f * k;
-		look.trails *= 1.0f - 0.7f * k;
-		look.dome *= 1.0f + 0.6f * k;
+		beading = std::lerp(beading, 0.9f, look.oil);
+		look.filmMult = 1.0f - 0.8f * look.oil;
+		look.dome = 1.0f + 0.6f * look.oil;
 	}
+
+	// The beads of each source at the character's water (the shader scales the count with each pixel's own water).
+	const BeadSet sweatBeads = SweatBeads(sweat * beading, size);
+	const BeadSet rainBeads = RainBeads(rain * beading, size);
+	float swimBeadWater = 0.0f, swimBeadWeight = 0.0f, swimMax = 0.0f, swimTrail = 0.0f;
+	for (uint32_t b = 0; b < Phys::kBands; ++b) {
+		const float v = PhysBandWater(a_state.bandP[b], a_state.bandX[b]) * swimWeight;
+		swimMax = std::max(swimMax, v);
+		swimTrail = std::max(swimTrail, swimWeight > 0.0f ? std::pow(std::clamp(a_state.bandX[b], 0.0f, 1.0f), 0.25f) : 0.0f);
+		const float bead = v * beading * SwimBeadGate(v);
+		swimBeadWater += bead * bead;  // weighted by itself: the bands that bead most set the size
+		swimBeadWeight += bead;
+	}
+	{
+		const float bead = manualSwim * beading * SwimBeadGate(manualSwim);
+		swimBeadWater += bead * bead;
+		swimBeadWeight += bead;
+	}
+	const BeadSet swimBeads = SwimBeads(swimBeadWeight > 1e-4f ? swimBeadWater / swimBeadWeight : 0.0f, size);
+
+	// One parameter set, weighted by bead water; coverage adds up.
+	float water = 0.0f, radius = 0.0f, visible = 0.0f, coverage = 0.0f;
+	for (const BeadSet* b : { &sweatBeads, &rainBeads, &swimBeads }) {
+		water += b->water;
+		radius += b->r * b->water;
+		visible += b->visible * b->water;
+		coverage += b->coverage;
+	}
+	if (water > 1e-4f) {
+		radius /= water;
+		visible /= water;
+	}
+	coverage = std::min(coverage, Phys::kMaxCoverage);
+	const float drawRadius = std::max(radius, Phys::kDrawRadius);
+	// presence = pixel bead water x this (the visible share in it): presence 1 = the grid's full coverage.
+	const float presencePerWater = water > 1e-4f ? coverage / (Phys::kMaxCoverage * water) * visible : 0.0f;
+
+	look.beadRadius = radius;
+	look.coverage = coverage;
+	look.visible = visible;
+	look.swimMax = swimMax;
+	look.sweatRunoff = sweatBeads.runoff;
+	// Droplet tails only where water runs off.
+	look.beadTrails = std::clamp(std::max({ a_state.rainRunoff, sweatBeads.runoff, swimTrail }), 0.0f, 1.0f);
+	look.sweatLevel = std::clamp(a_state.sweat / Phys::kSweatMax, 0.0f, 1.0f);
+
+	look.params[0] = float4(sweat, rain, manualSwim, a_state.bandHeight);
+	look.params[1] = float4(beading, beading, beading, swimWeight);
+	look.params[2] = float4(drawRadius, presencePerWater, a_state.rainRunoff, sweatBeads.runoff);
+	look.params[3] = float4(visible, a_state.depth, 0.0f, 0.0f);
+	for (uint32_t b = 0; b < Phys::kBands; ++b)
+		look.bands[b] = float4(a_state.bandP[b], a_state.bandX[b], 0.0f, 0.0f);
 	return look;
 }
+
 
 void WetSkin::DrawSettings()
 {
@@ -564,17 +603,15 @@ void WetSkin::DrawSettings()
 
 	// 2. Model. (47f) Saved values: 1 = Legacy, 0 = Simple (the 44a-47e "Advanced" model, unchanged), 2 = Physical.
 	{
-		const char* models[] = { "Legacy", "Simple", "Physical" };
+		const char* models[] = { "Legacy", "Simple (old, for comparison)", "Physical" };
 		constexpr uint32_t kSaved[] = { 1u, 0u, 2u };
 		int shown = IsOriginal() ? 0 : (IsPhysical() ? 2 : 1);
 		if (ImGui::Combo("Wetness Model", &shown, models, IM_ARRAYSIZE(models)))
 			s.Model = kSaved[std::clamp(shown, 0, 2)];
 		Tooltip({ "Legacy (pre-42c): every character exactly as before the wetness work (41b): skin, hair and gear. Only safety limits are kept.",
-			"Simple: skin, hair and gear get wet together and dry at their own pace (cloth slowest). Soft sheen that gets strong",
-			"when soaked (never a mirror), droplets, rivulets, darkening per material. (Called Advanced before 47f; unchanged.)",
-			"Physical: as Simple, but sweat, rain and swimming each build up and dry like real water, and each has its own look:",
-			"sweat starts as small beads after a minute or two of exertion, rain wets only what the sky reaches and runs off",
-			"under a roof, a swimmer's film breaks into beads while drying. Costs about the same as Simple on the GPU." });
+			"Simple (old): the 44a-47e model, kept only to compare against; it will be removed once Physical is confirmed.",
+			"Physical: every character carries real amounts of water from sweat, rain and swimming. Water arrives, runs off when",
+			"there is too much, and dries at one pace; how it looks (sheen, beads, trails) follows how much water is where." });
 	}
 
 	// 3. (47c) Performance switches (not saved in presets).
@@ -588,6 +625,22 @@ void WetSkin::DrawSettings()
 		"the patches sit in other places. Droplets and rivulets fade out on characters far away (about 13 m and farther);",
 		"their wet sheen and darkening stay. Off = as in 47b." });
 
+	// (47i) Sweat from stamina (or Dynamic Wetness), for every model (moved here from Advanced Skin).
+	const auto drawSweatSource = [&]() {
+		auto& skin = globals::features::skin;
+		if (skin.isDynamicWetnessAvailable) {
+			ImGui::Checkbox("Use Dynamic Wetness", &s.UseDynamicWetness);
+			Tooltip({ "Dynamic Wetness (a mod) is installed: let it decide how exerted a character is, instead of the stamina thresholds below." });
+		}
+		const bool dynamic = s.UseDynamicWetness && skin.isDynamicWetnessAvailable;
+		ImGui::BeginDisabled(dynamic);
+		ImGui::SliderFloat("Stamina Threshold for Sweat", &s.StartSweat, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		Tooltip({ "A character starts to exert itself (and to sweat) when its stamina drops below this share (0.75 = 75 %)." });
+		ImGui::SliderFloat("Full Sweat Threshold", &s.FullSweat, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+		Tooltip({ "Stamina share at which the exertion is full." });
+		ImGui::EndDisabled();
+	};
+
 	if (IsOriginal()) {
 		// 5. Legacy's own look, 6. the manual slider (0-2, as before).
 		ImGui::SeparatorText("Legacy (pre-42c)");
@@ -597,59 +650,76 @@ void WetSkin::DrawSettings()
 		ImGui::SliderFloat("Wetness Perlin Noise Lacunarity", &s.WetParams.y, 0.0f, 2.0f, "%.1f");
 		ImGui::SliderFloat("Wetness Perlin Noise Persistence", &s.WetParams.z, 0.0f, 20.0f, "%.2f");
 		ImGui::SliderFloat("Wetness Normal Scale", &s.WetParams.w, 0.0f, 20.0f, "%.1f");
-		ImGui::TextDisabled("Sweat thresholds, Dynamic Wetness and the fade-out time are on the Advanced Skin page.");
+		// (47i) Moved here from Advanced Skin.
+		ImGui::SliderFloat("Wetness Fade Out Time", &globals::features::skin.settings.WetFadeTime, 0.0f, 50.0f, "%.2f");
+		Tooltip({ "Legacy only: time for the wetness to go from 1 to 0 after leaving the water (and for sweat to fade)." });
+		drawSweatSource();
 		ImGui::SeparatorText("Manual");
 		ImGui::SliderFloat("Extra Wetness (manual)", &s.ExtraWetness, 0.0f, 2.0f, "%.2f");
 		Tooltip({ "Makes skin and hair this wet (0-2, as before)." });
 		return;
 	}
 
-	// 4. (47f) Physical: how fast each source wets and dries.
 	if (IsPhysical()) {
-		ImGui::SeparatorText("Physical");
+		// (47i) Physical: grouped by what the water does.
+		ImGui::SeparatorText("Sweat");
+		drawSweatSource();
+		ImGui::SliderFloat("Sweat", &s.SweatWeight, 0.0f, 1.0f, "%.2f");
+		Tooltip({ "How much a fully exerted character sweats (1 = heavily). Most on the forehead, neck, chest and back, least on the legs.",
+			"Hair and gear take their own share (Hair / Gear sections); sweat never makes beads on hair or gear." });
 		ImGui::SliderFloat("Sweat Build-up", &s.SweatBuildup, 0.1f, 5.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
-		Tooltip({ "How soon and how much a character sweats when exerted (low stamina, or Dynamic Wetness). 1: the first sweat",
-			"shows after about a minute or two, then it slowly builds up to where it dries as fast as it comes." });
-		ImGui::SliderFloat("Sweat Drying", &s.SweatDrying, 0.1f, 5.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
-		Tooltip({ "How fast sweat dries. It keeps coming for a while after stopping, then fades slowly; slower in humid or rainy air", "(and it builds up higher there), drier in the cold." });
-		ImGui::SliderFloat("Rain Wetting", &s.RainWetting, 0.1f, 5.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
-		Tooltip({ "How fast rain wets a character under the open sky. Heavier rain wets faster and wetter." });
-		ImGui::SliderFloat("Rain Drying", &s.RainDrying, 0.1f, 5.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
-		Tooltip({ "Under a roof or when the rain stops: the water first runs off within seconds, the damp rest then dries slowly." });
-		ImGui::SliderFloat("Swim Drying", &s.SwimDrying, 0.1f, 5.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
-		Tooltip({ "Out of the water: most of the water runs off in the first seconds, the rest dries slowly.",
-			"Hair and gear dry slower by their own Dry Time x (Hair and Gear sections)." });
-		ImGui::SliderFloat("Max Rain Wetness", &s.MaxRainWetness, 0.0f, 1.0f, "%.2f");
-		Tooltip({ "How wet the heaviest rain makes an exposed character. Lighter rain settles lower: wetness follows",
-			"rain intensity x how open the sky is above the character." });
-		// (47h) Not saved in presets.
-		ImGui::Checkbox("Physical: Stronger Low-Wetness Look", &s.PhysicalStrongLowLook);
-		Tooltip({ "On (default): a slightly wet character (below about half wet) already shows it: more and larger visible beads from",
-			"the first sweat or rain drops, trails and a thin sheen earlier. Fully wet looks the same. Off: as in 47g." });
-		ImGui::Checkbox("Physical: Smaller Visible Bead Size", &s.PhysicalSmallBeads);
-		Tooltip({ "On (default): beads and thin rivulets show from 1-2 screen pixels across (before: hidden below 2 px, full at 3.5 px),",
-			"so small beads stay visible a little farther away. Off: as in 47g." });
-	}
+		Tooltip({ "How fast sweat comes. 1: body heat follows the exertion over about 20 s, and a fully exerted character reaches",
+			"most of its sweat in about a minute. A short sprint gives a slight sheen, a long fight a few beads on the forehead.",
+			"Cold air makes less sweat. After stopping, the sweat stays and dries like any water (Drying)." });
 
-	// 5. Look: how wet each source makes a character at most (shared by Simple and Physical).
-	ImGui::SeparatorText("Look (fully wet)");
-	ImGui::SliderFloat("Swimming", &s.SwimWeight, 0.0f, 1.0f, "%.2f");
-	Tooltip({ "How wet everything under the water line gets. 1 = soaked." });
-	ImGui::SliderFloat("Stay Wet After Leaving Water (s)", &s.HoldTime, 0.0f, 120.0f, "%.0f s");
-	ImGui::SliderFloat("Dry-off Time (s)", &s.DryTime, 5.0f, 600.0f, "%.0f s", ImGuiSliderFlags_Logarithmic);
-	if (IsPhysical())
-		Tooltip({ "Physical: the base times. The runoff after leaving the water takes about half of Stay Wet, a soaked skin dries",
-			"in Stay Wet + Dry-off; sweat and rain dry on the same scale. The Physical multipliers above scale them." });
-	else
+		ImGui::SeparatorText("Rain");
+		ImGui::SliderFloat("Rain Wetting", &s.RainWetting, 0.1f, 5.0f, "%.2fx", ImGuiSliderFlags_Logarithmic);
+		Tooltip({ "How fast rain wets a character standing under the open sky. Light rain settles at a little water (a sheen, a few beads);",
+			"heavy rain soaks up to Max Rain Wetness and runs off in trails. Under a roof or indoors no rain arrives." });
+		ImGui::SliderFloat("Max Rain Wetness", &s.MaxRainWetness, 0.0f, 1.0f, "%.2f");
+		Tooltip({ "How much rain water skin can hold at most (1 = what soaked skin holds). More rain runs off and leaves trails." });
+
+		ImGui::SeparatorText("Swim");
+		ImGui::SliderFloat("Swimming", &s.SwimWeight, 0.0f, 1.0f, "%.2f");
+		Tooltip({ "How wet the water makes everything below its surface (1 = soaked). Each height of the body keeps its own water:",
+			"standing with only the feet in the water, the rest of the body dries normally. Out of the water, what skin cannot hold",
+			"runs off within seconds (trails), the rest dries (Drying)." });
+
+		ImGui::SeparatorText("Drying");
+		ImGui::SliderFloat("Dry Time (s)", &s.PhysDryTime, 10.0f, 1800.0f, "%.0f s", ImGuiSliderFlags_Logarithmic);
+		Tooltip({ "How long soaked skin takes to dry completely in neutral air. Water dries at a steady pace, so a little water dries",
+			"quickly and a lot takes longer; sweat, rain and swim water share the same pace. Rain, snow and fog (humid air) and",
+			"cold air dry slower; indoors is neutral. Hair and gear multiply it by their own Dry Time x." });
+
+		ImGui::SeparatorText("Beads");
+		ImGui::SliderFloat("Beading", &s.Beading, 0.0f, 1.0f, "%.2f");
+		Tooltip({ "How much of the water gathers into beads; the rest spreads as a thin film (a sheen). 0 = film only.",
+			"Beads only show once they are big enough to see (about 1.2 mm), so a little water is only a sheen, never tiny dots." });
+		ImGui::SliderFloat("Droplet Size", &s.PhysDropletSize, 0.5f, 3.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+		Tooltip({ "How big beads grow before they merge and run off. Larger = fewer, bigger beads for the same water." });
+		ImGui::SliderFloat("Droplet Size Variation", &s.DropletSizeRandom, 0.0f, 1.0f, "%.2f");
+		Tooltip({ "How different the beads are in size (kept narrow)." });
+		ImGui::SliderFloat("Droplets on the Face", &s.FaceDroplets, 0.0f, 1.0f, "%.2f");
+		ImGui::SliderFloat("Droplet Normal Strength", &s.DropletNormal, 0.0f, 2.0f, "%.2f");
+		Tooltip({ "How round the beads look (their own little dome, inside the bead only). 0 = flat spots of shine." });
+		ImGui::SliderFloat("Droplet Edge", &s.DropletRim, 0.0f, 1.0f, "%.2f");
+		ImGui::SliderFloat("Droplet Trails", &s.DropletTrails, 0.0f, 1.0f, "%.2f");
+		Tooltip({ "A short wet trail below each bead, only while water is running off." });
+	} else {
+		// 5. Look: how wet each source makes a character at most (Simple).
+		ImGui::SeparatorText("Look (fully wet)");
+		ImGui::SliderFloat("Swimming", &s.SwimWeight, 0.0f, 1.0f, "%.2f");
+		Tooltip({ "How wet everything under the water line gets. 1 = soaked." });
+		ImGui::SliderFloat("Stay Wet After Leaving Water (s)", &s.HoldTime, 0.0f, 120.0f, "%.0f s");
+		ImGui::SliderFloat("Dry-off Time (s)", &s.DryTime, 5.0f, 600.0f, "%.0f s", ImGuiSliderFlags_Logarithmic);
 		Tooltip({ "For skin. Hair and each kind of gear multiply both times by their own Dry Time x (cloth 2.5x: stays wet longest)." });
-	if (!IsPhysical()) {
 		ImGui::SliderFloat("Rain", &s.RainWeight, 0.0f, 1.0f, "%.2f");
 		Tooltip({ "How wet rain makes skin and hair (only where the sky reaches them: under a roof they stay dry).",
 			"Gear follows the rain wetness of Wetness Effects." });
+		ImGui::SliderFloat("Sweat", &s.SweatWeight, 0.0f, 1.0f, "%.2f");
+		Tooltip({ "How wet sweat (low stamina, or Dynamic Wetness) makes skin. Hair and gear take their own share of it." });
+		drawSweatSource();
 	}
-	ImGui::SliderFloat("Sweat", &s.SweatWeight, 0.0f, 1.0f, "%.2f");
-	Tooltip({ "How wet sweat (low stamina, or Dynamic Wetness) makes skin. Hair and gear take their own share of it.",
-		"Thresholds are on the Advanced Skin page." });
 
 	// 6. Manual.
 	ImGui::SeparatorText("Manual");
@@ -665,16 +735,16 @@ void WetSkin::DrawSettings()
 		int look = static_cast<int>(std::min(s.ManualLookType, 3u));
 		if (ImGui::Combo("Manual Look", &look, looks, IM_ARRAYSIZE(looks)))
 			s.ManualLookType = static_cast<uint32_t>(std::clamp(look, 0, 3));
-		Tooltip({ "What the manual wetness looks like: Sweat (beads, then a thin film), Rain (sparse beads, trails, a film),",
-			"Swim (a film breaking into beads), or Oil: an even oily film on the skin only (no beads, no trails), a little",
-			"shinier than water with crisp highlights, the skin a little deeper in colour. Oil never dries." });
+		Tooltip({ "Where the manual water sits and how it looks: Sweat (forehead, chest, back), Rain (shoulders, head, up-facing",
+			"skin), Swim (everywhere, a film that breaks into beads below full), or Oil: an even oily film on the skin only (no beads,",
+			"no trails), a little shinier than water with crisp highlights, the skin a little deeper in colour. Oil never dries." });
 		ImGui::BeginDisabled(s.ManualLookType != static_cast<uint32_t>(ManualLook::Oil));
 		ImGui::Checkbox("Oil Repels Water", &s.OilRepelsWater);
-		Tooltip({ "On oiled skin, sweat, rain and swimming water gather in rounder, separate beads and form no film." });
+		Tooltip({ "On oiled skin, sweat, rain and swimming water gather in rounder, separate beads and form almost no film." });
 		ImGui::EndDisabled();
 	}
 
-	if (ImGui::CollapsingHeader("Skin")) {
+	if (ImGui::CollapsingHeader(IsPhysical() ? "Skin look###Skin" : "Skin")) {
 		ImGui::SeparatorText("Sheen");
 		ImGui::SliderFloat("Wet Look Strength at Full Wetness", &s.FullWetnessStrength, 0.0f, 2.5f, "%.2f");
 		Tooltip({ "How strong the water sheen is on soaked skin (gear uses it too). It grows faster than the wetness: barely there when damp,",
@@ -696,22 +766,24 @@ void WetSkin::DrawSettings()
 		ImGui::SliderFloat("Patch Persistence", &s.WetParams.z, 0.0f, 20.0f, "%.2f");
 		Tooltip({ "The Perlin noise the patches come from (shared with the Legacy model and gear). Lacunarity 2 / Persistence 0.5 gives finer patches." });
 
-		ImGui::SeparatorText("Droplets");
-		ImGui::SliderFloat("Droplet Amount", &s.DropletAmount, 0.0f, 1.0f, "%.2f");
-		Tooltip({ "Water beads on the skin: a tiny bright point each, with a slightly darker edge. Mostly when coming out of the water",
-			"and when soaked; they disappear one by one as the skin dries. Seen up close only (they fade out when smaller than a pixel)." });
-		ImGui::SliderFloat("Droplet Density", &s.DropletDensity, 0.0f, 1.0f, "%.2f");
-		Tooltip({ "Also scales the beads on metal and leather gear." });
-		ImGui::SliderFloat("Droplet Size", &s.DropletSize, 0.25f, 4.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-		ImGui::SliderFloat("Droplet Size Variation", &s.DropletSizeRandom, 0.0f, 1.0f, "%.2f");
-		ImGui::SliderFloat("Droplets on the Face", &s.FaceDroplets, 0.0f, 1.0f, "%.2f");
-		ImGui::SliderFloat("Droplet Normal Strength", &s.DropletNormal, 0.0f, 2.0f, "%.2f");
-		Tooltip({ "How round the beads look (their own little dome, inside the bead only). 0 = flat spots of shine." });
-		ImGui::SliderFloat("Droplet Edge", &s.DropletRim, 0.0f, 1.0f, "%.2f");
-		ImGui::SliderFloat("Droplet Trails", &s.DropletTrails, 0.0f, 1.0f, "%.2f");
-		Tooltip({ "A short wet trail running down from each bead." });
-		ImGui::SliderFloat("Droplets from Rain", &s.RainDroplets, 0.0f, 1.0f, "%.2f");
-		Tooltip({ "Rain makes fewer beads than coming out of the water." });
+		if (!IsPhysical()) {  // (47i) Physical: the Beads section above
+			ImGui::SeparatorText("Droplets");
+			ImGui::SliderFloat("Droplet Amount", &s.DropletAmount, 0.0f, 1.0f, "%.2f");
+			Tooltip({ "Water beads on the skin: a tiny bright point each, with a slightly darker edge. Mostly when coming out of the water",
+				"and when soaked; they disappear one by one as the skin dries. Seen up close only (they fade out when smaller than a pixel)." });
+			ImGui::SliderFloat("Droplet Density", &s.DropletDensity, 0.0f, 1.0f, "%.2f");
+			Tooltip({ "Also scales the beads on metal and leather gear." });
+			ImGui::SliderFloat("Droplet Size", &s.DropletSize, 0.25f, 4.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+			ImGui::SliderFloat("Droplet Size Variation", &s.DropletSizeRandom, 0.0f, 1.0f, "%.2f");
+			ImGui::SliderFloat("Droplets on the Face", &s.FaceDroplets, 0.0f, 1.0f, "%.2f");
+			ImGui::SliderFloat("Droplet Normal Strength", &s.DropletNormal, 0.0f, 2.0f, "%.2f");
+			Tooltip({ "How round the beads look (their own little dome, inside the bead only). 0 = flat spots of shine." });
+			ImGui::SliderFloat("Droplet Edge", &s.DropletRim, 0.0f, 1.0f, "%.2f");
+			ImGui::SliderFloat("Droplet Trails", &s.DropletTrails, 0.0f, 1.0f, "%.2f");
+			Tooltip({ "A short wet trail running down from each bead." });
+			ImGui::SliderFloat("Droplets from Rain", &s.RainDroplets, 0.0f, 1.0f, "%.2f");
+			Tooltip({ "Rain makes fewer beads than coming out of the water." });
+		}
 
 		ImGui::SeparatorText("Rivulets");
 		ImGui::SliderFloat("Rivulet Amount", &s.StreakAmount, 0.0f, 1.0f, "%.2f");
@@ -843,17 +915,22 @@ void WetSkin::DrawStatus()
 			state = &it->second;
 	}
 	if (!IsPhysical()) {
-		ImGui::TextDisabled("The levels below are kept by the Physical model only.");
+		ImGui::TextDisabled("The water amounts below are kept by the Physical model only.");
 	} else if (!state) {
 		ImGui::TextDisabled("The player has not been drawn yet.");
 	} else {
+		// (47i) Water amounts in micrometres of water film (soaked skin holds 120).
 		const auto& phys = state->phys;
 		const auto& look = state->look;
-		ImGui::Text("Player sweat: %.2f   (exertion lag %.2f)", phys.sweat, phys.heat2);
-		ImGui::Text("Player rain: %.2f   (rain %.0f%%, open sky %.0f%%)", phys.rain, physicalFrame.rainIntensity * 100.0f, phys.exposure * 100.0f);
-		ImGui::Text("Player swim: %.2f   (%s)", look.swim, state->wetChar.z > 0.5f ? "in the water" : (phys.wasInWater ? std::format("out {:.0f} s", phys.swimRun / std::clamp(settings.SwimDrying, 0.1f, 5.0f)).c_str() : "dry"));
+		ImGui::Text("Player sweat: %.0f um   (body heat %.2f)", phys.sweat, phys.heat);
+		ImGui::Text("Player rain: %.0f um   (rain %.0f%%, open sky %.0f%%%s)", phys.rain, physicalFrame.rainIntensity * 100.0f, phys.exposure * 100.0f,
+			phys.rainRunoff > 0.05f ? ", running off" : "");
+		std::string bands;
+		for (uint32_t b = 0; b < Phys::kBands; ++b)
+			bands += std::format("{}{:.0f}", b ? " " : "", PhysBandWater(phys.bandP[b], phys.bandX[b]));
+		ImGui::Text("Player swim, feet to head: %s um%s", bands.c_str(), phys.depth > 0.0f ? std::format("   (in the water, {:.0f} units deep)", phys.depth).c_str() : "");
 		ImGui::Text("Oil: %.2f   Drying speed (air): %.2fx", look.oil, phys.evaporation);
-		ImGui::TextDisabled("Look: beads %.2f, trails %.2f, film x%.2f, bead size x%.2f", look.beads, look.trails, look.film, look.size);
+		ImGui::TextDisabled("Beads: radius %.2f mm, cover %.1f%%, visible %.0f%%; trails %.2f", look.beadRadius * 10.0f, look.coverage * 100.0f, look.visible * 100.0f, look.beadTrails);
 	}
 	ImGui::TreePop();
 }
@@ -862,12 +939,10 @@ void WetSkin::LoadSettings(json& o_json)
 {
 	settings = o_json;
 	PhysicalFromJson(o_json, settings);  // (47f)
-	// (47h) Not in the macro (its 64-argument limit) and not part of presets.
-	if (o_json.is_object()) {
-		if (auto it = o_json.find("PhysicalStrongLowLook"); it != o_json.end() && it->is_boolean())
-			settings.PhysicalStrongLowLook = it->get<bool>();
-		if (auto it = o_json.find("PhysicalSmallBeads"); it != o_json.end() && it->is_boolean())
-			settings.PhysicalSmallBeads = it->get<bool>();
+	// (47i) Saved before 47i: the new Physical options from the old ones, and the sweat thresholds from Advanced Skin, once.
+	try {
+		MigratePhysical47i(o_json, g_legacySkin, settings);
+	} catch (...) {
 	}
 	if (settings.Model > static_cast<uint32_t>(Model::Physical))
 		settings.Model = static_cast<uint32_t>(Model::New);
@@ -900,8 +975,6 @@ void WetSkin::SaveSettings(json& o_json)
 {
 	o_json = settings;
 	PhysicalToJson(o_json, settings);  // (47f)
-	o_json["PhysicalStrongLowLook"] = settings.PhysicalStrongLowLook;  // (47h)
-	o_json["PhysicalSmallBeads"] = settings.PhysicalSmallBeads;
 }
 
 void WetSkin::RestoreDefaultSettings()
@@ -923,6 +996,15 @@ void WetSkin::RestoreDefaultSettings()
 		if (j.contains("SkinWetnessCoverage"))
 			settings.Model = j.value("SkinWetnessCoverage", 1u) == 0 ? static_cast<uint32_t>(Model::Original) : static_cast<uint32_t>(Model::New);
 		logger::info("[Wet Skin] Settings migrated from Advanced Skin (model {})", IsOriginal() ? "Original" : "New");
+	}
+	// (47i) The sweat thresholds and Dynamic Wetness moved here from Advanced Skin.
+	if (g_legacySkin.is_object()) {
+		try {
+			settings.StartSweat = std::clamp(g_legacySkin.value("StartSweat", settings.StartSweat), 0.0f, 1.0f);
+			settings.FullSweat = std::clamp(g_legacySkin.value("FullSweat", settings.FullSweat), 0.0f, 1.0f);
+			settings.UseDynamicWetness = g_legacySkin.value("UseDynamicWetness", settings.UseDynamicWetness);
+		} catch (...) {
+		}
 	}
 	if (g_legacyWetnessPending) {
 		g_legacyWetnessPending = false;
@@ -1060,16 +1142,19 @@ bool WetSkin::LoadPreset(const std::string& a_name)
 		Settings fromPreset = merged.get<Settings>();
 		// (47f) Not in the macro: kept unless the preset has them.
 		fromPreset.SweatBuildup = settings.SweatBuildup;
-		fromPreset.SweatDrying = settings.SweatDrying;
 		fromPreset.RainWetting = settings.RainWetting;
-		fromPreset.RainDrying = settings.RainDrying;
-		fromPreset.SwimDrying = settings.SwimDrying;
 		fromPreset.MaxRainWetness = settings.MaxRainWetness;
 		fromPreset.ManualLookType = settings.ManualLookType;
 		fromPreset.OilRepelsWater = settings.OilRepelsWater;
-		fromPreset.PhysicalStrongLowLook = settings.PhysicalStrongLowLook;  // (47h) not part of a look preset
-		fromPreset.PhysicalSmallBeads = settings.PhysicalSmallBeads;
+		// (47i)
+		fromPreset.Beading = settings.Beading;
+		fromPreset.PhysDryTime = settings.PhysDryTime;
+		fromPreset.PhysDropletSize = settings.PhysDropletSize;
+		fromPreset.StartSweat = settings.StartSweat;
+		fromPreset.FullSweat = settings.FullSweat;
+		fromPreset.UseDynamicWetness = settings.UseDynamicWetness;
 		PhysicalFromJson(values, fromPreset);
+		MigratePhysical47i(values, json(), fromPreset);  // a preset saved before 47i: from its own droplet / drying values
 		if (fromPreset.Model > static_cast<uint32_t>(Model::Physical))
 			fromPreset.Model = static_cast<uint32_t>(Model::New);
 		settings = fromPreset;

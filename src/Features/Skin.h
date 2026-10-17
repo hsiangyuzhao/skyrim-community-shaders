@@ -105,6 +105,10 @@ struct Skin : Feature
 		// (46a) See-through clothes in water: x water surface world Z, y 1 = this draw tests against the
 		// pre-water depth (tint below x), z tint strength, w 0.
 		float4 waterPerGeometry;
+		// (47i) Character Wetness Physical, per character (WetSkin::PhysicalLook; zero in the other models): water amounts,
+		// bead parameters and the per-height swim profile (Skin.hlsli wetPhysParams / wetPhysBands).
+		float4 wetPhysParams[4];
+		float4 wetPhysBands[WetSkin::Phys::kBands];
 	};
 
 	/// (46a) See-through (alpha-blended) clothes of characters in water (Character Wetness > See-through

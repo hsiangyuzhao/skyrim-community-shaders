@@ -39,6 +39,15 @@ namespace Skin
 		// (46a) See-through clothes in water: x = water surface world Z, y = 1 when this draw is tested
 		// against the depth from before the water (its part below x is tinted), z = tint strength.
 		float4 waterPerGeometry;
+		// (47i) Character Wetness Physical, per character (WetSkin::PhysicalLook, zero in the other models), water in um:
+		//   [0] x sweat, y rain, z manual swim water, w height of one swim band (units; 0 = no profile)
+		//   [1] x / y / z beading share of sweat / rain / swim, w Swimming weight
+		//   [2] x drawn bead radius (cm), y bead presence per um of bead water, z rain runoff, w sweat runoff (0..1)
+		//   [3] x visible share of the bead water, y current water depth above the feet (0 = not in the water)
+		float4 wetPhysParams[4];
+		// (47i) Swim water per height band, feet up: x drying progress (0 soaked, 1 dry skin, up to 4), y share of the water
+		// above the hold capacity still on (1 in the water).
+		float4 wetPhysBands[8];
 	};
 
 	/// (46a) This character's snow amount at a world height (absolute Z), or a_global when the
@@ -70,28 +79,10 @@ namespace Skin
 		return wetSkinParams[0].x > 1.5;
 	}
 
-	/// (47f) Physical: how much of the character's droplet / rivulet driver this pixel gets: its own wetness against
-	/// the character's strongest source (below a water line, a sweatier forehead ...).
-	float WetPhysicalGate(float pixelWetness)
-	{
-		return saturate(pixelWetness / max(wetCharParams[11].z, 0.02));
-	}
-
 	/// (47f) Physical, Manual Look "Oil": the oil on the skin, 0..1 (0 in every other model).
 	float WetOil()
 	{
 		return WetPhysical() ? saturate(wetCharParams[11].w) : 0.0;
-	}
-
-	/// (47g) Physical: gear and hair get no beads or trails from sweat (or the manual Sweat look), only wicking darkening
-	/// and a gloss change. x = droplet driver, y = rivulet driver of the other sources (rain, swimming, other manual
-	/// looks), z = 1 while the manual look is Sweat. Packed by the CPU in the unused wetCharParams[3].w (Skin.cpp); 0 outside
-	/// Physical.
-	float3 WetGearDrivers()
-	{
-		const float v = wetCharParams[3].w;
-		const float a = max(abs(v) - 1.0, 0.0);
-		return float3(floor(a) * (1.0 / 1023.0), saturate(frac(a) * (1.0 / 0.998)), v < 0.0 ? 1.0 : 0.0);
 	}
 
 	/// (47g) Physical: the share of the sweat a gear class takes up (wicking): cloth 1, leather 0.3, metal 0, fur 0.6.
@@ -100,50 +91,18 @@ namespace Skin
 		return lerp(w.x + 0.3 * w.y, 0.6, w.w);
 	}
 
-	/// (47g) Droplet visibility for a droplet cell size (footprint: droplet cells per render pixel; the screen derivatives
-	/// are in render pixels, the internal resolution under DLSS). Physical: only a coarse early-out (0 when no bead of
-	/// this cell size, radius up to 0.42 cell, reaches 2 px); each bead then fades by its own size (WetSkinDroplets).
-	/// Otherwise the 44a fade by cell size.
-	/// (47h) Physical, "Physical: Stronger Low-Wetness Look" / "Physical: Smaller Visible Bead Size": the CPU adds 0.25 / 0.5 to
-	/// the model value 2 (WetSkin::GetGPUParams); both 0 outside Physical.
-	bool WetStrongLowLook()
-	{
-		const float bits = wetSkinParams[0].x - 2.0;
-		return WetPhysical() && (bits > 0.125 && bits < 0.375 || bits > 0.625);
-	}
-
-	bool WetSmallBeads()
-	{
-		return WetPhysical() && wetSkinParams[0].x - 2.0 > 0.375;
-	}
-
-	/// (47h) The bead / rivulet pixel size below which the Physical early-outs drop them: 2 px (47g), 1 px (Smaller Visible Bead Size).
-	float WetMinPixels()
-	{
-		return WetSmallBeads() ? 1.0 : 2.0;
-	}
-
-	/// (47h) The skin film's response to its wetness: W^1.3 (Simple, 47g), W^0.85 with Physical: Stronger Low-Wetness Look (a damp
-	/// skin already shows a sheen).
+	/// The skin film's response to its wetness: W^1.3 (Simple). (47i) Physical: W is the film water / 80 um, response W^0.7
+	/// (a thin film already shows a sheen).
 	float WetFilmResponse(float a_wetness)
 	{
-		return pow(saturate(a_wetness), WetStrongLowLook() ? 0.85 : 1.3);
+		return pow(saturate(a_wetness), WetPhysical() ? 0.7 : 1.3);
 	}
 
+	/// The 44a droplet fade by cell size (footprint: droplet cells per render pixel). (47i) Not used by Physical, which fades
+	/// all of a character's beads at once by their drawn size (WetPhysBeadFade).
 	float WetDropVisibility(float footprint)
 	{
-		[branch] if (WetPhysical())
-			return 0.84 / footprint > WetMinPixels() ? 1.0 : 0.0;
 		return smoothstep(1.0, 2.5, 0.3 / footprint);
-	}
-
-	/// (47g) Physical: a bead or rivulet of a_pixels render pixels across is hidden below 2 px and fades in up to 3.5 px
-	/// (sub-pixel water sparkles under DLSS); 1 in the other models. (47h) Smaller Visible Bead Size: hidden below 1 px, full at 2 px.
-	float WetMinSizeFade(float a_pixels)
-	{
-		[branch] if (!WetPhysical())
-			return 1.0;
-		return WetSmallBeads() ? smoothstep(1.0, 2.0, a_pixels) : smoothstep(2.0, 3.5, a_pixels);
 	}
 
 	// (47c) "Wetness: Skip Invisible Work" (wetCharParams[11].x): leave out work whose result is
@@ -172,6 +131,81 @@ namespace Skin
 		return 1.0 - smoothstep(0.8, 1.2, pixelWorld);
 	}
 
+	// ---- (47i) Physical: water amounts (um of water film; WetSkin::Phys) -------------------------------
+	static const float kPhysSoak = 200.0;     // in the water
+	static const float kPhysHold = 120.0;     // what skin holds after the runoff
+	static const float kPhysFilmFull = 80.0;  // film water at full sheen
+
+	/// The swim height profile at h units above the feet: x drying progress, y share of the above-capacity water still on,
+	/// z = 1 below the current water surface (the old 2.5-unit soft line).
+	float3 WetPhysBand(float h)
+	{
+		float3 o = float3(4.0, 0.0, 0.0);
+		const float bandH = wetPhysParams[0].w;
+		[branch] if (bandH > 0.0)
+		{
+			const float t = clamp(h / bandH - 0.5, 0.0, 7.0);
+			const uint i = min(uint(t), 6u);
+			const float f = smoothstep(0.35, 0.65, t - float(i));
+			o.xy = lerp(wetPhysBands[i].xy, wetPhysBands[i + 1].xy, f);
+			const float depth = wetPhysParams[3].y;
+			o.z = depth > 0.0 ? 1.0 - smoothstep(depth - 2.5, depth + 2.5, h) : 0.0;
+		}
+		return o;
+	}
+
+	/// Swim water (um, x Swimming; at least the manual Swim water) of a class with dry multiplier m (skin 1: progress / m,
+	/// runoff share ^ (1 / m)). trail: water still running off (0..1, ~12 s for skin).
+	float WetPhysSwimWater(float3 band, float m, out float trail)
+	{
+		const float invM = 1.0 / max(m, 0.25);
+		const float x = saturate(band.y);
+		const float excess = x > 0.0 ? pow(x, invM) : 0.0;
+		trail = x > 0.0 ? pow(x, 0.25 * invM) : 0.0;
+		const float v = lerp(kPhysHold * saturate(1.0 - band.x * invM) + (kPhysSoak - kPhysHold) * excess, kPhysSoak, band.z);
+		const float w = saturate(wetPhysParams[1].w);
+		trail = w > 0.0 ? max(trail, band.z) : 0.0;
+		return max(v * w, wetPhysParams[0].z);
+	}
+
+	/// Where sweat gathers (forehead, neck, chest, back more than the legs) and where rain lands (up-facing skin, shoulders,
+	/// head), from the height above the feet h and the normal's z.
+	float WetPhysSweatRegion(float h)
+	{
+		return lerp(0.55, 1.25, smoothstep(55.0, 100.0, h));
+	}
+
+	float WetPhysRainRegion(float h, float nz)
+	{
+		return lerp(0.6, 1.3, saturate(nz * 0.5 + 0.5)) + 0.15 * smoothstep(95.0, 115.0, h);
+	}
+
+	/// The beading share of swim water a_v (um): a closed film above 160 um makes no beads.
+	float WetPhysSwimBeadShare(float a_v)
+	{
+		return saturate(wetPhysParams[1].z) * (1.0 - smoothstep(120.0, 160.0, a_v));
+	}
+
+	/// Trails and rivulets only where water runs off: swim (local), rain and sweat (per character, by region).
+	float WetPhysTrail(float swimTrail, float sweatRegion, float rainRegion)
+	{
+		return saturate(max(swimTrail, max(wetPhysParams[2].z * rainRegion * (1.0 / 1.3), wetPhysParams[2].w * sweatRegion * (1.0 / 1.25))));
+	}
+
+	/// One fade for all of a character's beads by their drawn radius in render pixels (1 -> 2.5 px; no per-bead popping),
+	/// x the distance LOD. cmPerUV: cm of surface per uv unit; uvFootprint: uv per render pixel.
+	float WetPhysBeadFade(float cmPerUV, float uvFootprint, float lod)
+	{
+		const float rPx = wetPhysParams[2].x / max(cmPerUV * uvFootprint, 1e-8);
+		return smoothstep(1.0, 2.5, rPx) * lod;
+	}
+
+	/// Droplet cells per uv unit for the drawn bead radius (a bead is 0.42 cell in radius).
+	float WetPhysCellsPerUV(float cmPerUV)
+	{
+		return 0.42 * cmPerUV / max(wetPhysParams[2].x, 0.01);
+	}
+
 	/// (44c) Twomey wet albedo, d = 0..2: d <= 1 moves toward one soaking step A / (1.77 - 0.77 A),
 	/// above 1 a second step on top (the same formula again), so a "darker than soaked" slider
 	/// stays a plausible colour.
@@ -193,15 +227,7 @@ namespace Skin
 		progress = 0.0;
 		if (wetCharPerGeometry.z > 0.5)
 			return 1.0;
-		// (47f) Physical: the runoff (45 % of a soaked skin's water, within seconds) and the evaporation of the rest, both
-		// slower by this class's dry multiplier (WetSkin::PhysicalSwimLevel).
-		[branch] if (WetPhysical())
-		{
-			const float tp = max(wetCharPerGeometry.x, 0.0) / max(dryMult, 0.25);
-			const float evaporated = saturate(tp / max(wetCharParams[0].y, 1.0));
-			progress = evaporated;
-			return 0.45 * exp(-tp / max(wetCharParams[0].x, 0.1)) + 0.55 * (1.0 - evaporated);
-		}
+		// (47i) Not used by Physical (its swim water is the height profile, WetPhysSwimWater).
 		const float hold = max(wetCharParams[0].x, 0.0) * dryMult;
 		const float dry = max(wetCharParams[0].y * dryMult, 1.0);
 		const float t = saturate((wetCharPerGeometry.x - hold) / dry);
@@ -897,9 +923,7 @@ namespace Skin
 					const float r = length(d) / radius;
 					// Anti-aliased edge: one pixel wide in bead radii.
 					const float aa = max(footprint / radius, 0.05);
-					// (47g) Physical: each bead by its own projected diameter (render pixels), so the larger beads of
-					// the same cells stay while the tiny ones are hidden.
-					const float m = (1.0 - smoothstep(1.0 - aa, 1.0 + aa, r)) * WetMinSizeFade(2.0 * radius / footprint);
+					const float m = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
 					if (m > best) {
 						best = m;
 						o.dropSlope = d / radius;
@@ -914,7 +938,7 @@ namespace Skin
 							const float t = along / length_;
 							const float width = radius * 0.45 * (1.0 - t) + footprint;
 							const float side = abs(dot(d, across));
-							o.trail = max(o.trail, (1.0 - smoothstep(width * 0.5, width, side)) * (1.0 - t) * alignment * WetMinSizeFade(0.9 * radius / footprint));  // (47g) by the trail's width
+							o.trail = max(o.trail, (1.0 - smoothstep(width * 0.5, width, side)) * (1.0 - t) * alignment);
 						}
 					}
 				}
@@ -940,8 +964,7 @@ namespace Skin
 		const float center = (h.x - 0.5) * 0.4;
 		const float halfWidth = 0.13 * lerp(0.7, 1.3, h.y);
 		const float w = max(halfWidth, 0.6 * aFoot);
-		// (47g) Physical: each rivulet by its own width in render pixels (WetMinSizeFade; 1 otherwise).
-		const float profile = (1.0 - smoothstep(0.35 * w, w, abs(x - center))) * (halfWidth / w) * WetMinSizeFade(2.0 * halfWidth / aFoot);
+		const float profile = (1.0 - smoothstep(0.35 * w, w, abs(x - center))) * (halfWidth / w);
 		const float segment = WetValueNoise(float2(l * 0.25 / lengthScale + h.y * 13.0, id * 1.37 + seed));
 		return profile * smoothstep(threshold, threshold + 0.12, segment) * lerp(0.6, 1.0, h.x);
 	}
@@ -965,9 +988,7 @@ namespace Skin
 			const float aFoot = max(uvFootprint * columnsPerUV / width, 1e-6);
 			// A rivulet is about 0.26 column wide: fade below about a pixel.
 			const float linePixels = 0.26 / aFoot;
-			// (47g) Physical: each rivulet fades by its own width (WetRivuletField); here only a coarse early-out, 0 when
-			// even the widest (0.34 column) is under 2 px. Where it is 1 the old fade was 1 too.
-			const float lineFade = WetPhysical() ? (0.34 / aFoot > WetMinPixels() ? 1.0 : 0.0) : smoothstep(0.5, 1.2, linePixels);  // (47h) 1 px with Smaller Visible Bead Size
+			const float lineFade = smoothstep(0.5, 1.2, linePixels);
 			// (47c) Skip Invisible Work: narrower than half a pixel (lineFade == 0) or past the
 			// distance LOD, the product below is exactly 0 (the fields are finite): not evaluated.
 			[branch] if (!WetSkipInvisible() || (lineFade > 0.0 && lod > 0.0))
@@ -1067,7 +1088,7 @@ namespace Skin
 	void WetSkinFilm(inout SkinSurfaceProperties skin, float streak, float streakDriver, float dropMask)
 	{
 		const float wetness = saturate(skin.Wetness);
-		const float response = WetFilmResponse(wetness);  // (47h) W^0.85 with Physical: Stronger Low-Wetness Look
+		const float response = WetFilmResponse(wetness);  // (47i) Physical: W^0.7 of the film water
 		const float roughness = max(lerp(wetSkinParams[1].y, wetSkinParams[1].z, response) - 0.04 * streak, 0.2);
 		// (44e) Between-Trail Dulling (wetCharParams[6].w): how much less wet the film between the
 		// trails looks. Was the old Contrast value itself; migrated 1:1.

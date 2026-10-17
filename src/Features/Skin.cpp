@@ -116,34 +116,8 @@ void Skin::DrawSettings()
 
 	ImGui::Spacing();
 
-	// (44a) Skin wetness has its own page.
-	ImGui::TextDisabled("Skin wetness (model, extra wetness, sheen, droplets, rivulets): see the Character Wetness page (Characters).");
-
-	ImGui::SliderFloat("Wetness Fade Out Time", &settings.WetFadeTime, 0.0f, 50.0f, "%.2f");
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("Time it takes for the wetness to reduce from 1.0 to 0.0 after leaving water");
-	}
-
-	if (isDynamicWetnessAvailable) {
-		ImGui::Text("Dynamic Wetness detected.");
-		ImGui::Checkbox("Use Dynamic Wetness", &settings.UseDynamicWetness);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Let the Dynamic Wetness mod decide how wet skin is, instead of the stamina-based sweat below.");
-	} else {
-		settings.UseDynamicWetness = false;
-	}
-
-	if (!settings.UseDynamicWetness)
-	{
-		ImGui::SliderFloat("Stamina Threshold for Sweat", &settings.StartSweat, 0.0f, 1.0f, "%.2f", 
-			ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Characters start to look sweaty when stamina drops below this fraction (0.75 = 75 percent).");
-		ImGui::SliderFloat("Full Sweat Threshold", &settings.FullSweat, 0.0f, 1.0f, "%.2f",
-			ImGuiSliderFlags_AlwaysClamp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Stamina fraction at which sweat reaches full strength.");
-	}
+	// (44a) Skin wetness has its own page. (47i) So do the sweat thresholds, Dynamic Wetness and the Legacy fade-out time.
+	ImGui::TextDisabled("Skin wetness (model, sweat thresholds, Dynamic Wetness, sheen, droplets, rivulets): see the Character Wetness page (Characters).");
 
 
 	ImGui::Spacing();
@@ -715,9 +689,11 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 		state.wetChar = float4(inWater ? 0.0f : std::min(state.timeOut, allDry + 1.0f), 0.0f, inWater ? 1.0f : 0.0f, 0.0f);
 	}
 
-	// Sweat and the Original model's swim wetness (Advanced Skin's WetFadeTime fade).
+	// Sweat and the Original model's swim wetness (Advanced Skin's WetFadeTime fade). (47i) The sweat thresholds and Dynamic
+	// Wetness live on the Character Wetness page now (same meaning, every model).
 	float4 wetness = float4(0.0f, 0.0f, positionZ, 0.0f);
-	if (settings.UseDynamicWetness && isDynamicWetnessAvailable) {
+	const auto& sweatSettings = globals::features::wetSkin.settings;
+	if (sweatSettings.UseDynamicWetness && isDynamicWetnessAvailable) {
 		wetness.x = SWE::API::GetFinalWetness(actor);
 	} else {
 		const float stamina = actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kStamina);
@@ -725,9 +701,9 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 		const float temporaryStamina = actor->GetActorValueModifier(RE::ACTOR_VALUE_MODIFIER::kTemporary, RE::ActorValue::kStamina);
 		const float maxStamina = permanentStamina + temporaryStamina;
 		const float staminaPercentage = actor->IsDead() ? 1.0f : (maxStamina > 0.0f ? stamina / maxStamina : 1.0f);
-		wetness.x = (staminaPercentage >= settings.StartSweat) ? 0.0f :
-		            (staminaPercentage <= settings.FullSweat)  ? 1.0f :
-		                                                         (settings.StartSweat - staminaPercentage) / (settings.StartSweat - settings.FullSweat);
+		wetness.x = (staminaPercentage >= sweatSettings.StartSweat) ? 0.0f :
+		            (staminaPercentage <= sweatSettings.FullSweat)  ? 1.0f :
+		                                                              (sweatSettings.StartSweat - staminaPercentage) / (sweatSettings.StartSweat - sweatSettings.FullSweat);
 	}
 	const float exertion = std::isfinite(wetness.x) ? std::clamp(wetness.x, 0.0f, 1.0f) : 0.0f;  // (47f) Physical: the sweat source
 	wetness.y = inWater ? 2.0f : 0.0f;
@@ -780,7 +756,10 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 		WetSkin::PhysicalInput in;
 		in.dt = dt;
 		in.exertion = exertion;
-		in.inWater = inWater;
+		// (47i) The local surface's depth above the feet (each height band of the body keeps its own swim water).
+		in.depth = inWater ? std::max(water.depth, 0.0f) : 0.0f;
+		in.height = std::max(actor->GetHeight(), 32.0f);
+		in.outdoors = outdoors;
 		// Open sky: a Havok ray up from the head (player every 0.25 s, others every 1 s), only while it rains.
 		in.exposure = (outdoors && env.rainIntensity > 0.0f && !IsSheltered(actor, state.shelter, actor->IsPlayerRef() ? 250.0 : 1000.0)) ? 1.0f : 0.0f;
 		float cold = outdoors ? env.snowing : 0.0f;
@@ -793,12 +772,10 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 		in.cold = cold;
 		wetSkin.UpdatePhysical(state.phys, in);
 		state.look = wetSkin.GetPhysicalLook(state.phys);
-		const float allDry = (state.look.evapTime + 6.0f * state.look.runoffTime) * wetSkin.MaxDryMultiplier();
-		if (!inWater && state.look.swimClock >= allDry)
-			state.maxDepth = 0.0f;
-		state.skin.x = state.look.sweat;
-		state.wetSkin = float4(state.look.swim, state.maxDepth, inWater ? 1.0f : 0.0f, state.look.beads);
-		state.wetChar = float4(inWater ? 0.0f : std::min(state.look.swimClock, allDry + 1.0f), 0.0f, inWater ? 1.0f : 0.0f, state.look.trails);
+		state.maxDepth = 0.0f;  // (47i) the swim water is in the height bands
+		state.skin.x = state.look.sweatLevel;
+		state.wetSkin = float4(0.0f, 0.0f, inWater ? 1.0f : 0.0f, 0.0f);
+		state.wetChar = float4(1e6f, 0.0f, inWater ? 1.0f : 0.0f, 0.0f);
 	} else {
 		state.phys.valid = false;  // a later switch to Physical starts afresh
 	}
@@ -1167,27 +1144,23 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 			perGeometryData.wetSkinParams[i] = wetSkinParamsCache[i];
 		for (int i = 0; i < 12; ++i)
 			perGeometryData.wetCharParams[i] = wetCharParamsCache[i];
-		// (47f) Physical: this character's levels and look ride in the same parameters (no extra GPU data).
+		// (47f) Physical: this character's look. (47i) Its water amounts, bead parameters and swim height profile in
+		// wetPhysParams / wetPhysBands; a few look values ride in the frame's parameters (Skin.hlsli).
 		if (lastWetState && wetSkin.IsPhysical() && lastWetState->phys.valid) {
 			const auto& look = lastWetState->look;
 			auto& p = perGeometryData.wetSkinParams;
 			auto& c = perGeometryData.wetCharParams;
-			p[0].y = std::clamp(look.manualWater, 0.0f, 1.0f);
-			p[0].w = std::clamp(look.rain, 0.0f, 1.0f);
-			p[1].w = std::clamp(p[1].w * look.film, 0.0f, 2.5f);
-			p[2].w = std::clamp(p[2].w * look.density, 0.0f, 1.0f);
-			p[3].x = std::clamp(p[3].x * look.size, 0.25f, 4.0f);
-			p[3].y = std::clamp(p[3].y * look.sizeRandom, 0.0f, 1.0f);
+			p[0].y = 0.0f;  // manual water is in wetPhysParams
+			p[0].w = 0.0f;
+			p[1].w = std::clamp(p[1].w * look.filmMult, 0.0f, 2.5f);
+			p[3].y = std::clamp(p[3].y * 0.35f, 0.0f, 1.0f);  // narrow size spread
 			p[4].x = std::clamp(p[4].x * look.beadTrails, 0.0f, 1.0f);
 			p[5].z = std::clamp(p[5].z * look.dome, 0.0f, 2.0f);
-			c[0].x = std::clamp(look.runoffTime, 0.1f, 600.0f);
-			c[0].y = std::clamp(look.evapTime, 1.0f, 1e6f);
-			c[11].z = std::clamp(look.peak, 0.0f, 1.0f);
 			c[11].w = std::clamp(look.oil, 0.0f, 1.0f);
-			// (47g) Gear and hair: the droplet / rivulet drivers without sweat, packed in the unused c[3].w (Skin.hlsli
-			// WetGearDrivers): |v| = 1 + round(beads x 1023) + 0.998 x trails, negative while the manual look is Sweat.
-			const float packed = 1.0f + std::round(std::clamp(look.gearBeads, 0.0f, 1.0f) * 1023.0f) + 0.998f * std::clamp(look.gearTrails, 0.0f, 1.0f);
-			c[3].w = look.manualSweat ? -packed : packed;
+			for (size_t i = 0; i < look.params.size(); ++i)
+				perGeometryData.wetPhysParams[i] = look.params[i];
+			for (size_t i = 0; i < look.bands.size(); ++i)
+				perGeometryData.wetPhysBands[i] = look.bands[i];
 		}
 		// (44f) Item class prior from the keywords of the worn item this geometry belongs to.
 		if (lastWetState && !wetSkin.IsOriginal() && wetSkin.settings.GearEnabled && wetSkin.settings.GearModel == 0 && wetSkin.settings.GearKeywords) {
