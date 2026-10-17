@@ -251,8 +251,8 @@ public:
 		// (47h) Outside the settings macro too. AOCharacterSelfFix "RTAO: Character Self-Occlusion Fix" (TraceAOCS kFlagSelfFix).
 		// SunDepthCheckTranslucent "Sun Shadow: Depth Check for Translucent Surfaces": a forward (blended) Lighting surface that is not
 		// the one in the depth buffer takes the cascades at its own position instead of the ray-traced screen mask (Lighting.hlsl).
-		// PointShadowsOnWater "Point Light Shadows on Water": a ray-traced light gives the water above a shallow bed that bed's
-		// traced visibility (Water.hlsl, PointLightShadows.hlsli GetWater). All three off = 47g.
+		// PointShadowsOnWater "Point Light Shadows on Water": (47i) the point trace also traces from last frame's water surface; the
+		// Water shader uses that where its fragment matches (TracePointLightsCS kFlagWater, PointLightShadows.hlsli GetWater). All three off = 47g.
 		bool AOCharacterSelfFix = true;
 		bool SunDepthCheckTranslucent = true;
 		bool PointShadowsOnWater = true;
@@ -758,6 +758,32 @@ private:
 	void FinishPointLights();
 	/// Pixel shader slots t40 / t41 back to null (before any pass writes those textures, and when nothing was traced).
 	void UnbindPointLights();
+
+	// (47i) Point Light Shadows on Water: after this frame's water draws the depth (with the water) is copied and turned into the
+	// water's distance from the camera per pixel (WaterPrepCS, into the backend's shared texture); next frame's point trace traces
+	// the pixel's sources from there (TracePointLightsCS kFlagWater) and the Water shader reads the result (t42 / t43).
+public:
+	/// State::Draw, every draw: notes water draws after the opaque pass; the first other draw after them runs the water prep.
+	void OnDrawStatesApplied(ID3D11DeviceContext* a_context);
+	/// Deferred::EndDeferred: the opaque pass is over (water draws from here on count).
+	void OnEndDeferred();
+
+private:
+	void PrepWaterDistance(ID3D11DeviceContext* a_context);
+	bool WaterTracking() const;
+	uint32_t waterEndDeferredFrame = UINT32_MAX;
+	uint32_t waterSeenFrame = UINT32_MAX;     // a water draw after the opaque pass this frame
+	bool waterPrepPending = false;            // water drawn since the last prep
+	uint32_t waterPrepFrame = UINT32_MAX;     // frame of the last prep (its distances are next frame's trace input)
+	bool waterDistValid = false;              // the distance texture holds a prep (cleared when none ran last frame)
+	bool waterTraced = false;                 // this frame's point trace traced from the water (t42 / t43 bound)
+	float waterInvViewProj[16]{};             // this frame's (the trace's) inverse view-projection
+	uint32_t waterRenderWidth = 0, waterRenderHeight = 0;
+	winrt::com_ptr<ID3D11Texture2D> waterDepthCopy;
+	winrt::com_ptr<ID3D11ShaderResourceView> waterDepthCopySRV;
+	D3D11_TEXTURE2D_DESC waterDepthCopyDesc{};
+	winrt::com_ptr<ID3D11ComputeShader> waterPrepCS;
+	std::unique_ptr<ConstantBuffer> waterPrepCB;
 
 	// (46c) Interiors: the interior cell's capture, its point lights and window beams, and the engine's shadow maps.
 	struct alignas(16) PointMaskCB

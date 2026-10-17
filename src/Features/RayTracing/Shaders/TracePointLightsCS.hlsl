@@ -66,6 +66,13 @@ StructuredBuffer<PLSource> Sources : register(t3);
 RWTexture2D<unorm float4> PLVis : register(u0);
 RWTexture2D<unorm float4> PLIdx : register(u1);
 RWByteAddressBuffer RayCounter : register(u2);  // rays traced (monotonic, read back for the F7 trace)
+// (47i) "Point Light Shadows on Water" (kFlagWater): last frame's water, as the distance from the camera of the water surface
+// seen at each pixel (0 = no water in front of the opaque surface there; RayTracing/WaterPrepCS.hlsl after the water draws).
+// The water point is rebuilt along this frame's view ray at that distance, and the pixel's own traced sources (PLIdx, same
+// slots) are traced again from it into PLWaterVis; the Water shader uses it only where its fragment lies at that distance
+// (RTPointShadows::GetWater), so the point traced is the fragment itself.
+Texture2D<float> WaterDist : register(t7);
+RWTexture2D<unorm float4> PLWaterVis : register(u3);
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
@@ -74,6 +81,7 @@ static const uint kFlagSticky = 8u;          // (46g) last frame's sources of th
 static const uint kFlagBeamCullFront = 16u;  // (46g) window beam rays cull triangles facing the ray start (the room shell from inside)
 static const uint kFlagBeamCullBack = 32u;   // (46g) ... or the ones facing away
 static const uint kFlagRtSurface = 64u;      // (46y) probe whether the visible surface is a traced caster (PLIdx.w bit 7)
+static const uint kFlagWater = 128u;         // (47i) trace the pixel's sources from last frame's water surface too (PLWaterVis)
 static const float kStickyBonus = 1.5;
 static const uint kChurnWord = 1u;           // (46g) RayCounter words: [1] pixels whose source set changed
 static const uint kBeamWordBase = 64u;       // ... from 64: per slot, sampled beam cone pixels traced / blocked
@@ -325,6 +333,73 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 	return dot(closest, closest) <= sphere.w * sphere.w;
 }
 
+// (47i) Point Light Shadows on Water: the pixel's traced sources (idx, same slots and jitter as its own rays) traced again from
+// the water surface at waterDist along this frame's view ray (normal up). 1 = lit, 0 = blocked (no denoiser: one ray each).
+float4 TraceFromWater(int2 p, uint4 idx, float waterDist, uint flags, float n0, float n1, inout uint rays)
+{
+	float4 vis = 1.0;
+	const float3 W = normalize(PositionAt(p, 0.5)) * waterDist;
+	const float3 N = float3(0.0, 0.0, 1.0);
+	const float3 origin = W + N * (C.Bias.x + C.Bias.y * waterDist);
+	const bool characters = (flags & kFlagCharacters) && !((flags & kFlagFirstPerson) && waterDist < kFirstPersonNear);
+	const uint beamCull = (flags & kFlagBeamCullFront) ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : ((flags & kFlagBeamCullBack) ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : RAY_FLAG_NONE);
+	const float footprint = waterDist * 2.0 * C.RenderSize.w;
+	[unroll] for (uint k = 0u; k < 4u; ++k)
+	{
+		const uint id = idx[k] & 0x7Fu;
+		if (id == 0u)
+			continue;
+		const PLSource src = Sources[id - 1u];
+		const bool isAim = (src.Info.x & kSourceAim) != 0u;
+		const bool beamLike = (src.Info.x & kSourceBeam) != 0u || isAim;
+		const bool softBeam = beamLike && C.Bounds.w > 0.0;
+		const float3 rayTarget = isAim ? src.Spot.xyz : src.PosRadius.xyz;
+		if (dot(N, rayTarget - W) <= 0.0)
+			continue;  // the light is below the water surface: no shadow from here (lit)
+		const float3 L0 = rayTarget - origin;
+		const float len0 = length(L0);
+		const float3 Ln = L0 / max(len0, 1e-3);
+		const float3 helper = abs(Ln.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+		const float3 T = normalize(cross(helper, Ln));
+		const float3 B = cross(Ln, T);
+		const float u1 = frac(n0 + float(k) * 0.7548776662);
+		const float u2 = frac(n1 + float(k) * 0.5698402910);
+		float sn, cs;
+		sincos(6.2831853 * u2, sn, cs);
+		const float emitter = softBeam ? len0 * C.Bounds.w : (((src.Info.x & kSourceEmitter) && !isAim) ? src.Spot.w : C.Bias.w);
+		const float3 target = rayTarget + (T * cs + B * sn) * (sqrt(u1) * emitter);
+		const float3 L = target - origin;
+		const float len = length(L);
+		const float3 dir = L / max(len, 1e-3);
+		float tMax = len - asfloat(src.Info.y);
+		if (beamLike)
+			tMax = min(tMax, ExitDistance(origin, dir));
+		if (tMax <= 1.0)
+			continue;
+		float tHit;
+		bool blocked = Blocked(origin, dir, tMax, kSceneMask, 0.0, footprint, beamLike ? beamCull : RAY_FLAG_NONE, tHit);
+		rays += 1u;
+		if (!blocked && characters) {
+			const bool ownLight = (src.Info.x & kSourceNoPlayer) != 0u;
+			bool test = true;
+			if (flags & kFlagCharCull)
+				test = (!ownLight && SphereOnSegment(origin, dir, tMax, C.Spheres[0])) || SphereOnSegment(origin, dir, tMax, C.Spheres[1]);
+			if (test) {
+				const uint owner = src.Info.w & 0xFFFFFFu;
+				const float ownerTMax = C.Extra.w >= 0.0 ? max(len - C.Extra.w, 0.0) : -1.0;
+				if (owner != 0u)
+					blocked = BlockedExcept(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, owner, ownerTMax, tHit);
+				else
+					blocked = Blocked(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, RAY_FLAG_NONE, tHit);
+				rays += 1u;
+			}
+		}
+		if (blocked)
+			vis[k] = 0.0;
+	}
+	return vis;
+}
+
 groupshared float3 gsMin[64];
 groupshared float3 gsMax[64];
 groupshared uint gsMask[2];
@@ -569,6 +644,13 @@ groupshared uint gsMask[2];
 		idx[3] |= 0x80u;
 	PLVis[p] = vis;
 	PLIdx[p] = float4(idx) / 255.0;
+	// (47i) Point Light Shadows on Water: a water surface in front of this pixel's opaque surface last frame.
+	[branch] if (flags & kFlagWater)
+	{
+		const float waterDist = WaterDist[p];
+		if (waterDist > 1.0 && waterDist < dist - max(2.0, 0.01 * dist) && any((idx & 0x7Fu) != 0u))
+			PLWaterVis[p] = TraceFromWater(p, idx, waterDist, flags, n0, n1, rays);
+	}
 	// One atomic per wave (the lanes that returned early traced nothing).
 	const uint waveRays = WaveActiveSum(rays);
 	if (WaveIsFirstLane() && waveRays > 0u) {

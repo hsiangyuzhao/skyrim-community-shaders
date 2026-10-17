@@ -767,6 +767,8 @@ void Deferred::EndDeferred()
 	// (46a) The opaque pass is over: the next water draw marks the depth "before the water".
 	if (globals::features::skin.loaded)
 		globals::features::skin.OnEndDeferred();
+	if (globals::features::rayTracing.loaded)
+		globals::features::rayTracing.OnEndDeferred();  // (47i) Point Light Shadows on Water
 
 	ResetBlendStates();
 }

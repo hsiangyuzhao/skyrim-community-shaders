@@ -9,6 +9,7 @@
 #include "FeatureIssues.h"
 #include "Features/CloudShadows.h"
 #include "Features/PerformanceOverlay.h"
+#include "Features/RayTracing.h"
 #include "Features/Skin.h"
 #include "Features/TerrainBlending.h"
 #include "Features/TerrainHelper.h"
@@ -57,6 +58,9 @@ void State::Draw()
 			// (46a) See-through clothes in water: depth copy before the water, depth swap for flagged draws.
 			skin.OnDrawStatesApplied(context);
 		}
+		// (47i) Point Light Shadows on Water: the water distance after the water draws.
+		if (globals::features::rayTracing.loaded)
+			globals::features::rayTracing.OnDrawStatesApplied(context);
 
 		truePBR->SetShaderResouces(context);
 

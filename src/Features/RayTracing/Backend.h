@@ -714,6 +714,16 @@ namespace RayTracingRT
 		[[nodiscard]] const std::string& PointFault() const { return pointFault_; }
 		void ClearPointFault() { pointFault_.clear(); }
 		[[nodiscard]] std::uint64_t PointBytes() const { return pointBytes_; }
+		/// (47i) Point Light Shadows on Water: last frame's water distance (R32F; D3D11 writes it after the water draws, the trace
+		/// reads it) and the visibility traced from the water (RGBA8, same slots as PLVis). Created on use, sized like the point
+		/// textures; false = not available.
+		bool EnsurePointWaterTextures();
+		void ReleasePointWaterTextures();
+		[[nodiscard]] bool PointWaterReady() const { return pointWaterDist_.resource12 && pointWaterVis_.resource12; }
+		[[nodiscard]] ID3D11UnorderedAccessView* PointWaterDistUAV() const { return pointWaterDist_.uav11.Get(); }
+		[[nodiscard]] ID3D11ShaderResourceView* PointWaterDistSRV() const { return pointWaterDist_.srv11.Get(); }
+		[[nodiscard]] ID3D11ShaderResourceView* PointWaterVisSRV() const { return pointWaterVis_.srv11.Get(); }
+		[[nodiscard]] std::uint64_t PointWaterBytes() const { return pointWaterBytes_; }
 
 		// (46f) RTAO. Its pipeline is created with the others; its texture, ray counter and second fence on first use only.
 		[[nodiscard]] bool AOAvailable() const { return ready_ && !failed_ && aoPipeline_ && aoFault_.empty(); }
@@ -1258,6 +1268,9 @@ namespace RayTracingRT
 		ComPtr<ID3D12PipelineState> pointAlphaPipeline_;  // (46c) TracePointLightsCS with RT_ALPHA
 		bool pointAlphaLastFrame_ = false;
 		SharedTexture pointVis_, pointIdx_;
+		SharedTexture pointWaterDist_, pointWaterVis_;  // (47i) Point Light Shadows on Water
+		std::uint64_t pointWaterBytes_ = 0;
+		static constexpr DXGI_FORMAT kPointWaterDistFormat = DXGI_FORMAT_R32_FLOAT;
 		std::uint32_t pointWidth_ = 0, pointHeight_ = 0;
 		ComPtr<ID3D12Resource> pointCounter_;          // default heap, UAV: rays traced (monotonic, wraps)
 		ComPtr<ID3D12Resource> pointCounterReadback_;  // per context one uint32 copy of it
@@ -1284,7 +1297,8 @@ namespace RayTracingRT
 		// descriptor a submission still in flight reads (each block is only reused once its context completed).
 		// Block layout: sun table (depth SRV, visibility UAV), point table (depth SRV, sun visibility SRV, PLVis UAV,
 		// PLIdx UAV), RTAO table (depth SRV, AO UAV).
-		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynamicDescriptors = 8;
+		// (47i) + the point table's water views (water distance SRV, water visibility UAV) after the RTAO table (offsets 6, 7 of the point table).
+		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynamicDescriptors = 10;
 		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
 		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
 		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;

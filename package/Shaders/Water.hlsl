@@ -1069,7 +1069,14 @@ PS_OUTPUT main(PS_INPUT input)
 #			if defined(SPECULAR) && (NUM_SPECULAR_LIGHTS != 0)
 	float3 finalColor = 0.0.xxx;
 
-	for (int lightIndex = 0; lightIndex < NUM_SPECULAR_LIGHTS; ++lightIndex) {
+	// (47i) "Skip Engine Water Point-Light Highlights" (Light Limit Fix): these engine passes add nothing; the clustered water loop
+	// lights the water with every light (with ray-traced shadows where available).
+#				if defined(LIGHT_LIMIT_FIX)
+	const int specularLights = (LightLimitFix::StrictFlags & LightLimitFix::kStrictFlagSkipWaterSpecular) ? 0 : NUM_SPECULAR_LIGHTS;
+#				else
+	const int specularLights = NUM_SPECULAR_LIGHTS;
+#				endif
+	for (int lightIndex = 0; lightIndex < specularLights; ++lightIndex) {
 		float3 lightVector = LightPos[lightIndex].xyz - (PosAdjust[eyeIndex].xyz + input.WPosition.xyz);
 		float3 lightDirection = normalize(normalize(lightVector) - viewDirection);
 		float lightFade = saturate(length(lightVector) / LightPos[lightIndex].w);
@@ -1115,7 +1122,9 @@ PS_OUTPUT main(PS_INPUT input)
 		{
 			uint clusteredLightIndex = LightLimitFix::lightList[lightOffset + i];
 			LightLimitFix::Light light = LightLimitFix::lights[clusteredLightIndex];
-			if (LightLimitFix::IsLightIgnored(light) || light.lightFlags & LightLimitFix::LightFlags::Shadow) {
+			// (47i) Skip Engine Water Point-Light Highlights: the engine's shadow-casting lights too (their own passes add nothing then).
+			const bool skipShadowLights = !(LightLimitFix::StrictFlags & LightLimitFix::kStrictFlagSkipWaterSpecular);
+			if (LightLimitFix::IsLightIgnored(light) || (skipShadowLights && (light.lightFlags & LightLimitFix::LightFlags::Shadow))) {
 				continue;
 			}
 

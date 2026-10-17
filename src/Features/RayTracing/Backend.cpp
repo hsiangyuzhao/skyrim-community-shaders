@@ -384,6 +384,11 @@ namespace RayTracingRT
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAO));
 			nullUav.Format = aoFormat_;
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynAO + 1));
+			// (47i) Point Light Shadows on Water.
+			nullSrv.Format = kPointWaterDistFormat;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynWater));
+			nullUav.Format = kPointFormat;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynWater + 1));
 		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
@@ -446,7 +451,8 @@ namespace RayTracingRT
 		// Its own root signature: constants b0, TLAS t0, table (depth t1, sun visibility t2, PLVis u0, PLIdx u1), sources t3, ray counter u2;
 		// (46c) the alpha-tested variant also: records t4, texcoords t5, table (copy layers t6, bindless game textures t0 space1), s0.
 		// 52 + 2 + 1 + 2 + 2 + 2 + 2 + 1 = 64 DWORDs (the limit).
-		D3D12_DESCRIPTOR_RANGE ranges[2]{};
+		// (47i) + the water views in the same table (water distance t7, water visibility u3; past the RTAO table in the block).
+		D3D12_DESCRIPTOR_RANGE ranges[4]{};
 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		ranges[0].NumDescriptors = 2;
 		ranges[0].BaseShaderRegister = 1;
@@ -455,6 +461,14 @@ namespace RayTracingRT
 		ranges[1].NumDescriptors = 2;
 		ranges[1].BaseShaderRegister = 0;
 		ranges[1].OffsetInDescriptorsFromTableStart = 2;
+		ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[2].NumDescriptors = 1;
+		ranges[2].BaseShaderRegister = 7;
+		ranges[2].OffsetInDescriptorsFromTableStart = kDynWater - kDynPoint;
+		ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		ranges[3].NumDescriptors = 1;
+		ranges[3].BaseShaderRegister = 3;
+		ranges[3].OffsetInDescriptorsFromTableStart = kDynWater + 1 - kDynPoint;
 		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
 		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		alphaRanges[0].NumDescriptors = 1;
@@ -474,7 +488,7 @@ namespace RayTracingRT
 		params[1].Descriptor.ShaderRegister = 0;
 		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[2].DescriptorTable.NumDescriptorRanges = 2;
+		params[2].DescriptorTable.NumDescriptorRanges = 4;
 		params[2].DescriptorTable.pDescriptorRanges = ranges;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -575,8 +589,73 @@ namespace RayTracingRT
 		return true;
 	}
 
+	bool Backend::EnsurePointWaterTextures()
+	{
+		if (!PointAvailable() || !pointVis_.resource12 || pointWidth_ == 0 || pointHeight_ == 0)
+			return false;
+		if (PointWaterReady()) {
+			D3D11_TEXTURE2D_DESC d{};
+			pointWaterDist_.resource11->GetDesc(&d);
+			if (d.Width == pointWidth_ && d.Height == pointHeight_)
+				return true;
+		}
+		ReleasePointWaterTextures();
+		if (!CreateSharedTexture(pointWidth_, pointHeight_, kPointWaterDistFormat, true, false, pointWaterDist_, "RayTracing PointWaterDistance", false) ||
+			!CreateSharedTexture(pointWidth_, pointHeight_, kPointFormat, false, true, pointWaterVis_, "RayTracing PointWaterVisibility", false)) {
+			pointWaterDist_ = {};
+			pointWaterVis_ = {};
+			logger::warn("[RayTracing] Point Light Shadows on Water: could not create its textures; the water keeps the old path");
+			return false;
+		}
+		// No water known yet: distance 0 everywhere (the Water shader never matches it).
+		const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+		if (device11_) {
+			ComPtr<ID3D11DeviceContext> context11;
+			device11_->GetImmediateContext(&context11);
+			if (context11)
+				context11->ClearUnorderedAccessViewFloat(pointWaterDist_.uav11.Get(), zero);
+		}
+		pointWaterBytes_ = static_cast<std::uint64_t>(pointWidth_) * pointHeight_ * 8;
+		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = kPointWaterDistFormat;
+		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srvDesc.Texture2D.MipLevels = 1;
+		device_->CreateShaderResourceView(pointWaterDist_.resource12.Get(), &srvDesc, StagingCpu(kDynWater));
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		uavDesc.Format = kPointFormat;
+		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		device_->CreateUnorderedAccessView(pointWaterVis_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynWater + 1));
+		logger::info("[RayTracing] Point Light Shadows on Water: textures {}x{}", pointWidth_, pointHeight_);
+		return true;
+	}
+
+	void Backend::ReleasePointWaterTextures()
+	{
+		if (pointWaterDist_.resource12)
+			Retire(pointWaterDist_.resource12, 0, nullptr);
+		if (pointWaterVis_.resource12)
+			Retire(pointWaterVis_.resource12, 0, nullptr);
+		pointWaterDist_ = {};
+		pointWaterVis_ = {};
+		pointWaterBytes_ = 0;
+		if (stagingHeap_ && device_) {
+			D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
+			nullSrv.Format = kPointWaterDistFormat;
+			nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			nullSrv.Texture2D.MipLevels = 1;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynWater));
+			D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
+			nullUav.Format = kPointFormat;
+			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynWater + 1));
+		}
+	}
+
 	void Backend::ReleasePointResources()
 	{
+		ReleasePointWaterTextures();  // (47i) sized like them
 		// A submission in flight may still use them: D3D12 keeps them until it is done.
 		if (pointVis_.resource12)
 			Retire(pointVis_.resource12, 0, nullptr);
@@ -678,7 +757,23 @@ namespace RayTracingRT
 			alphaTable.ptr += static_cast<UINT64>(descriptorSize_) * (kAlphaDescriptorBase - 1);
 			a_list->SetComputeRootDescriptorTable(7, alphaTable);
 		}
+		// (47i) Point Light Shadows on Water: last frame's water distance (D3D11 wrote it) read, the water visibility written.
+		const bool water = PointWaterReady();
+		if (water) {
+			D3D12_RESOURCE_BARRIER waterPre[2] = {
+				Transition(pointWaterDist_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+				Transition(pointWaterVis_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+			};
+			a_list->ResourceBarrier(2, waterPre);
+		}
 		a_list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
+		if (water) {
+			D3D12_RESOURCE_BARRIER waterPost[2] = {
+				Transition(pointWaterDist_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+				Transition(pointWaterVis_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+			};
+			a_list->ResourceBarrier(2, waterPost);
+		}
 		if (timestampHeap_)
 			a_list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
 		// The ray counter's value after this frame, into this context's read-back slot.

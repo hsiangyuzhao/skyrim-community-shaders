@@ -210,6 +210,13 @@ namespace
 
 	std::string Megabytes(std::uint64_t a_bytes) { return std::format("{:.1f} MB", static_cast<double>(a_bytes) / (1024.0 * 1024.0)); }
 
+	// (47i) WaterPrepCS (Point Light Shadows on Water).
+	struct alignas(16) WaterPrepConstants
+	{
+		float InvViewProj[16];  // row-major, as the trace's
+		float RenderSize[4];    // xy size, zw 1 / size
+	};
+
 	// (46b) Point-light shadows.
 	int ValidPointK(int a_value) { return a_value >= 4 ? 4 : (a_value >= 2 ? 2 : 1); }
 	constexpr float kPointMinShare = 0.02f;          // a light under 2 % of the pixel's point light is not traced
@@ -220,6 +227,7 @@ namespace
 	constexpr std::uint32_t kPointFlagCharacters = 1u, kPointFlagFirstPerson = 2u, kPointFlagCharCull = 4u;  // TracePointLightsCS
 	constexpr std::uint32_t kPointFlagSticky = 8u, kPointFlagBeamCullFront = 16u, kPointFlagBeamCullBack = 32u;  // (46g) TracePointLightsCS
 	constexpr std::uint32_t kPointFlagRtSurface = 64u;  // (46y) TracePointLightsCS: mark traced-caster surfaces for SSPLS
+	constexpr std::uint32_t kPointFlagWater = 128u;     // (47i) TracePointLightsCS: trace the sources from last frame's water too
 	constexpr std::uint32_t kPointDenoiseHistory = 1u, kPointDenoiseDebug = 2u;                             // PointDenoiseCS
 	constexpr float kBeamRayMargin = 64.0f;  // (46c) a window beam's ray goes this far past the interior's box
 	// (46f) RTAO.
@@ -2012,6 +2020,7 @@ void RayTracing::Prepass()
 	pointSelector.Publish(false);
 	pointThisFrame = false;
 	pointK = 0;
+	waterTraced = false;  // (47i)
 	pointCpuMs = 0.0f;
 	pointHistoryValid = pointHistoryValid && pointDenoised;
 	pointDenoised = false;
@@ -3463,9 +3472,117 @@ void RayTracing::UnbindPointLights()
 {
 	if (!pointBound)
 		return;
-	ID3D11ShaderResourceView* nulls[2]{};
-	globals::d3d::context->PSSetShaderResources(40, 2, nulls);
+	ID3D11ShaderResourceView* nulls[4]{};
+	globals::d3d::context->PSSetShaderResources(40, 4, nulls);  // (47i) + the water's t42 / t43
 	pointBound = false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// (47i) Point Light Shadows on Water: the water's distance after the water draws (next frame's trace input)
+// ---------------------------------------------------------------------------------------------
+
+void RayTracing::OnEndDeferred()
+{
+	waterEndDeferredFrame = globals::state ? globals::state->frameCount : 0u;
+}
+
+bool RayTracing::WaterTracking() const
+{
+	return settings.PointShadowsOnWater && PointLightsOn() && backend.PointWaterReady();
+}
+
+void RayTracing::OnDrawStatesApplied(ID3D11DeviceContext* a_context)
+{
+	if (!WaterTracking())
+		return;
+	const uint32_t frame = globals::state->frameCount;
+	const auto* shader = globals::state->currentShader;
+	if (shader && shader->shaderType.get() == RE::BSShader::Type::Water) {
+		if (waterEndDeferredFrame == frame) {
+			waterSeenFrame = frame;
+			waterPrepPending = true;
+		}
+		return;
+	}
+	if (waterPrepPending && waterSeenFrame == frame) {
+		waterPrepPending = false;
+		PrepWaterDistance(a_context);
+	}
+}
+
+void RayTracing::PrepWaterDistance(ID3D11DeviceContext* a_context)
+{
+	auto& main = globals::game::renderer->GetDepthStencilData().depthStencils[RE::RENDER_TARGETS_DEPTHSTENCIL::kMAIN];
+	if (!main.texture || !main.depthSRV || !backend.PointWaterDistUAV() || !backend.DepthMaskSRV() || waterRenderWidth == 0 || waterRenderHeight == 0)
+		return;
+	D3D11_TEXTURE2D_DESC desc{};
+	main.texture->GetDesc(&desc);
+	if (desc.SampleDesc.Count != 1)
+		return;
+	if (!waterDepthCopy || desc.Width != waterDepthCopyDesc.Width || desc.Height != waterDepthCopyDesc.Height || desc.Format != waterDepthCopyDesc.Format) {
+		waterDepthCopy = nullptr;
+		waterDepthCopySRV = nullptr;
+		D3D11_TEXTURE2D_DESC copyDesc = desc;
+		copyDesc.Usage = D3D11_USAGE_DEFAULT;
+		copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		copyDesc.CPUAccessFlags = 0;
+		copyDesc.MiscFlags = 0;
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		main.depthSRV->GetDesc(&srvDesc);
+		auto* device = globals::d3d::device;
+		if (FAILED(device->CreateTexture2D(&copyDesc, nullptr, waterDepthCopy.put())) ||
+			FAILED(device->CreateShaderResourceView(waterDepthCopy.get(), &srvDesc, waterDepthCopySRV.put()))) {
+			waterDepthCopy = nullptr;
+			waterDepthCopySRV = nullptr;
+			logger::warn("[RayTracing] Point Light Shadows on Water: could not create the depth copy ({}x{}, format {})", desc.Width, desc.Height, static_cast<int>(desc.Format));
+			settings.PointShadowsOnWater = false;
+			return;
+		}
+		waterDepthCopyDesc = desc;
+	}
+	if (!waterPrepCS) {
+		waterPrepCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\RayTracing\\WaterPrepCS.hlsl", {}, "cs_5_0")));
+		if (!waterPrepCS) {
+			logger::warn("[RayTracing] Point Light Shadows on Water: WaterPrepCS did not compile; switched off");
+			settings.PointShadowsOnWater = false;
+			return;
+		}
+	}
+	if (!waterPrepCB)
+		waterPrepCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<WaterPrepConstants>());
+	WaterPrepConstants cb{};
+	std::memcpy(cb.InvViewProj, waterInvViewProj, sizeof(cb.InvViewProj));
+	cb.RenderSize[0] = static_cast<float>(waterRenderWidth);
+	cb.RenderSize[1] = static_cast<float>(waterRenderHeight);
+	cb.RenderSize[2] = 1.0f / static_cast<float>(waterRenderWidth);
+	cb.RenderSize[3] = 1.0f / static_cast<float>(waterRenderHeight);
+	waterPrepCB->Update(cb);
+
+	// The depth as it is after the water (GPU copy in command order), then the water's distance where it lies in front of the
+	// opaque depth (the trace's DepthMask).
+	a_context->CopyResource(waterDepthCopy.get(), main.texture);
+	ID3D11Buffer* cbs[1] = { waterPrepCB->CB() };
+	ID3D11ShaderResourceView* srvs[2] = { waterDepthCopySRV.get(), backend.DepthMaskSRV() };
+	ID3D11UnorderedAccessView* uavs[1] = { backend.PointWaterDistUAV() };
+	a_context->CSSetConstantBuffers(0, 1, cbs);
+	a_context->CSSetShaderResources(0, 2, srvs);
+	a_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+	a_context->CSSetShader(waterPrepCS.get(), nullptr, 0);
+	a_context->Dispatch((waterRenderWidth + 7) / 8, (waterRenderHeight + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullSrvs[2]{};
+	ID3D11UnorderedAccessView* nullUavs[1]{};
+	ID3D11Buffer* nullCbs[1]{};
+	a_context->CSSetShaderResources(0, 2, nullSrvs);
+	a_context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+	a_context->CSSetConstantBuffers(0, 1, nullCbs);
+	a_context->CSSetShader(nullptr, nullptr, 0);
+	// Binding the UAV unbound the pixel shaders' view of it: back for any later water draw this frame.
+	if (pointBound && waterTraced) {
+		ID3D11ShaderResourceView* views[2] = { backend.PointWaterVisSRV(), backend.PointWaterDistSRV() };
+		a_context->PSSetShaderResources(42, 2, views);
+	}
+	waterPrepFrame = globals::state->frameCount;
+	waterDistValid = true;
 }
 
 void RayTracing::ReleasePointDenoiser()
@@ -3509,6 +3626,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	bool a_interior)
 {
 	pointK = 0;
+	waterTraced = false;  // (47i)
 	if (!PointLightsOn() || !backend.PointAvailable() || !maskTemp)
 		return false;
 	// (46c) Sized to the render area (2560x1440 behind DLSS Quality at 4K), not to the shadow mask (the output size): the
@@ -3607,6 +3725,27 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		flags |= kPointFlagBeamCullFront;
 	else if (beamCull == 2)
 		flags |= kPointFlagBeamCullBack;
+	// (47i) Point Light Shadows on Water: the water distance of last frame (its prep ran after last frame's water draws) is traced
+	// from; with no prep last frame (no water drawn) the distance is cleared, so the Water shader never matches a stale one.
+	std::memcpy(waterInvViewProj, a_input.constants.invViewProj, sizeof(waterInvViewProj));
+	waterRenderWidth = width;
+	waterRenderHeight = height;
+	if (settings.PointShadowsOnWater) {
+		if (backend.EnsurePointWaterTextures()) {
+			const uint32_t frame = globals::state->frameCount;
+			if (waterPrepFrame != UINT32_MAX && frame - waterPrepFrame == 1u && waterDistValid) {
+				flags |= kPointFlagWater;
+				waterTraced = true;
+			} else if (waterDistValid) {
+				const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+				globals::d3d::context->ClearUnorderedAccessViewFloat(backend.PointWaterDistUAV(), zero);
+				waterDistValid = false;
+			}
+		}
+	} else if (backend.PointWaterReady()) {
+		backend.ReleasePointWaterTextures();
+		waterDistValid = false;
+	}
 	c.params[0] = static_cast<float>(scan);
 	c.params[1] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[2], &flags, sizeof(float));
@@ -3713,8 +3852,11 @@ void RayTracing::FinishPointLights()
 	timers->End(Util::GpuBucket::RayTracingPointDenoise);
 
 	// For the pixel shaders of this frame (RayTracing/PointLightShadows.hlsli).
-	ID3D11ShaderResourceView* views[2] = { pointVis[write].srv.get(), pointIdx[write].srv.get() };
-	context->PSSetShaderResources(40, 2, views);
+	// (47i) t42 / t43: the visibility traced from last frame's water and that water's distance (null: GetWater falls back).
+	const bool water = waterTraced && backend.PointWaterReady();
+	ID3D11ShaderResourceView* views[4] = { pointVis[write].srv.get(), pointIdx[write].srv.get(), water ? backend.PointWaterVisSRV() : nullptr,
+		water ? backend.PointWaterDistSRV() : nullptr };
+	context->PSSetShaderResources(40, 4, views);
 	pointBound = true;
 	pointWrite ^= 1u;
 	pointHistoryValid = true;
@@ -5089,9 +5231,9 @@ void RayTracing::DrawPointLightPage()
 			// (47h)
 			ImGui::Checkbox("Point Light Shadows on Water", &settings.PointShadowsOnWater);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): a ray-traced light that a wall hides from shallow water (a forge behind a stone foundation) no longer");
-				ImGui::Text("  shines on the water: the water takes the traced shadow of the river bed right under it. Deep water and lights not");
-				ImGui::Text("  traced there keep the screen-space shadows as before. Off: as in 47g.");
+				ImGui::Text("On (default): a ray-traced light that a wall hides from the water (a forge behind a stone foundation) no longer shines");
+				ImGui::Text("  on it: the trace also shoots rays from the water surface itself (last frame's water, extra rays only on water pixels).");
+				ImGui::Text("  Lights not traced at that pixel keep the old path. Off: as in 47g.");
 			}
 			ImGui::BeginDisabled(!settings.PointLightsInteriors);
 			{

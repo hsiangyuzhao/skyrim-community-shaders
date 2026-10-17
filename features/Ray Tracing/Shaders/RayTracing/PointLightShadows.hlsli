@@ -59,37 +59,33 @@ namespace RTPointShadows
 	}
 
 	// (47h) "Point Light Shadows on Water" (kWaterBed in the tag). Water is drawn after the depth prepass, so Get() never matches it
-	// and a traced light shone on the water through walls (the Riverwood forge on the river behind its stone foundation). The trace
-	// did run for the surface under the water at this pixel (the river bed); its visibility stands in for the water's where the two
-	// points see the light alike: the bed lies behind the water along the view ray, and closer to the water fragment than
-	// kWaterBedReach of the distance to the light (at least kWaterBedMinReach units) -- a small step against the distance to the light,
-	// so a wall that hides the light from the one hides it from the other. Deep water, steep grazing views over deep water and lights
-	// the bed did not trace keep the old path (Screen Space Point Light Shadows). No settings to tune: both bounds are geometric.
+	// and a traced light shone on the water through walls (the Riverwood forge on the river behind its stone foundation).
+	// (47i) The trace traces the pixel's sources from the water surface itself (TracePointLightsCS kFlagWater): last frame's water
+	// distance at this pixel (WaterDistance, 0 = none) along this frame's view ray, the visibility per slot in WaterVisibility (same
+	// slots as Sources). Used where this water fragment lies at that distance (2 % + 4 units, as Get()): then the traced point is
+	// this fragment. Else the old path (47h's river-bed borrowing is gone: it failed at normal view angles).
 	static const uint kWaterBed = 1u << 12;
-	static const float kWaterBedReach = 0.15;
-	static const float kWaterBedMinReach = 24.0;
+	Texture2D<unorm float4> WaterVisibility : register(t42);
+	Texture2D<float> WaterDistance : register(t43);
 
-	/// a_viewPosition: the water fragment's view-space position; a_lightDistance: from the fragment to the light (units).
+	/// a_viewPosition: the water fragment's view-space position; a_lightDistance: from the fragment to the light (units, unused).
 	bool GetWater(uint a_tag, float2 a_position, float2 a_screenUV, float3 a_viewPosition, float a_lightDistance, uint a_eyeIndex, out float o_visibility)
 	{
 		o_visibility = 1.0;
 		bool found = false;
 		const uint source = a_tag & kSourceMask;
-		[branch] if (source != 0u && (a_tag & kWaterBed) && !((a_tag & kSplit) && a_screenUV.x >= 0.5) && a_viewPosition.z > 1.0)
+		[branch] if (source != 0u && (a_tag & kWaterBed) && !((a_tag & kSplit) && a_screenUV.x >= 0.5))
 		{
 			const int3 pixel = int3(int2(a_position), 0);
 			const uint4 ids = uint4(Sources.Load(pixel) * 255.0 + 0.5) & kSourceMask;
 			const bool4 match = ids == source.xxxx;
 			[branch] if (any(match))
 			{
-				const float sceneDepth = SharedData::GetScreenDepth(a_screenUV, a_eyeIndex);
-				// Positions relative to the camera scale along the view ray: the bed is (sceneDepth / viewDepth - 1) x the fragment's
-				// distance behind it.
-				const float behind = sceneDepth / a_viewPosition.z - 1.0;
-				const float offset = length(a_viewPosition) * behind;
-				[branch] if (behind > -0.02 && offset <= max(kWaterBedMinReach, kWaterBedReach * a_lightDistance))
+				const float traced = WaterDistance.Load(pixel);
+				const float distance = length(a_viewPosition);
+				[branch] if (traced > 0.0 && abs(traced - distance) <= distance * 0.02 + 4.0)
 				{
-					const float4 visibility = Visibility.Load(pixel);
+					const float4 visibility = WaterVisibility.Load(pixel);
 					o_visibility = match.x ? visibility.x : (match.y ? visibility.y : (match.z ? visibility.z : visibility.w));
 					found = true;
 				}
