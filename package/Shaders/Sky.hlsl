@@ -44,6 +44,9 @@ struct VS_OUTPUT
 
 	float4 WorldPosition : POSITION1;
 	float4 PreviousWorldPosition : POSITION2;
+#if defined(CLOUDS)
+	float HorizonClip : TEXCOORD4;  // (47f) Horizon Fix: 1 = this layer is warped, cut below the planet horizon
+#endif
 #if defined(VR)
 	float ClipDistance : SV_ClipDistance0;  // o11
 	float CullDistance : SV_CullDistance0;  // p11
@@ -73,7 +76,25 @@ cbuffer PerGeometry : register(b2)
 #	endif  // !VR
 };
 
-VS_OUTPUT main(VS_INPUT input)
+#	if defined(CLOUDS)
+// (47f) Physical Sky > Sky Fixes > "Horizon Fix" (a), set per cloud draw by PhysicalSky::BindHorizonWarp: x = 1 to warp,
+// y = the layer's fade elevation E1 (measured from its vertex alpha), z = the planet horizon eH = -dip, w = 4242 (key).
+// The dome's elevation e goes to eH + (e - E1) (90 deg - eH) / (90 deg - E1): where the clouds used to fade out is the
+// real horizon now, the zenith stays. Texture coordinates are the mesh's, so the cloud picture is squeezed with it. HorizonFixVS : register(b11)
+{
+	float4 HorizonWarp;
+};
+ HorizonInverse3x3(float3x3 m, out bool a_ok)
+{
+	const float3 c0 = cross(m[1], m[2]);
+	const float3 c1 = cross(m[2], m[0]);
+	const float3 c2 = cross(m[0], m[1]);
+	const float det = dot(m[0], c0);
+	a_ok = abs(det) > 1e-20;
+	return transpose(float3x3(c0, c1, c2)) / (a_ok ? det : 1.0);
+}
+#	endif
+ main(VS_INPUT input)
 {
 	VS_OUTPUT vsout;
 	uint eyeIndex = Stereo::GetEyeIndexVS(
@@ -83,6 +104,33 @@ VS_OUTPUT main(VS_INPUT input)
 	);
 
 	float4 inputPosition = float4(input.Position.xyz, 1.0);
+
+#	if defined(CLOUDS)
+	vsout.HorizonClip = 0.0;
+	[branch] if (HorizonWarp.x > 0.5 && abs(HorizonWarp.w - 4242.0) < 0.5)
+	{
+		const float3x3 m = (float3x3)World[eyeIndex];
+		const float3 translation = float3(World[eyeIndex][0].w, World[eyeIndex][1].w, World[eyeIndex][2].w);
+		const float3 rel = mul(m, inputPosition.xyz) + translation - EyePosition[eyeIndex];
+		const float r = length(rel);
+		const float horizontal = length(rel.xy);
+		bool invertible;
+		const float3x3 inverse = HorizonInverse3x3(m, invertible);
+		[branch] if (r > 1e-3 && invertible)
+		{
+			const float halfPi = 1.57079633;
+			const float e = atan2(rel.z, horizontal);
+			const float e1 = clamp(HorizonWarp.y, 0.0, 1.4);
+			const float eH = clamp(HorizonWarp.z, -0.5, 0.0);
+			const float warped = clamp(eH + (e - e1) * (halfPi - eH) / (halfPi - e1), -1.5, halfPi);
+			float s, c;
+			sincos(warped, s, c);
+			const float2 heading = horizontal > 1e-6 * r ? rel.xy / horizontal : float2(1.0, 0.0);
+			inputPosition.xyz += mul(inverse, r * float3(heading * c, s) - rel);
+			vsout.HorizonClip = 1.0;
+		}
+	}
+#	endif
 
 #	if defined(OCCLUSION)
 
@@ -183,6 +231,7 @@ cbuffer AlphaTestRefCB : register(b11)
 }
 #	endif
 
+#	include "Common/HorizonFix.hlsli"  // (47f)
 #	include "Common/MotionBlur.hlsli"
 #	include "Common/Permutation.hlsli"
 #	include "Common/SharedData.hlsli"
@@ -250,6 +299,50 @@ float3 GetProceduralSunGlow(float3 viewDir)
 	const float3 sunTransmittance = PhysSky::SampleTr(sunDir, PhysSky::SampTr);
 	return SharedData::physSkyData.sunlightColor * sunTransmittance * (intensity * falloff / Math::PI);
 }
+
+#		if defined(CLOUD_SHADOWS)
+// (47f) Horizon Fix (b): the sky dome below the planet horizon is the distant sea (LutGen.cs.hlsl's "distant sea", which
+// reflects the clear sky). Here the clouds go into that reflection: the Cloud Shadows cube (the cloud layers' opacity as
+// drawn, warped ones included) at the mirrored direction, a cloud lit like RelightCloudMulti's (sun through the air, the
+// sky's own light; no self-shadow), weighted by the air in between x Fresnel x opacity, in place of the clear sky the
+// LUT already reflected there. Main view only. Then the same AP shadow and tonemap as PhysSky::SampleSky. HorizonSeaSky(float3 a_dir, uint2 a_pxCoord)
+{
+	const SharedData::PhysSkyData data = SharedData::physSkyData;
+	float3 lum = PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(a_dir), 0).rgb;
+	const float R = max(data.rPlanet, 1.0);
+	const float h = HorizonFix::Altitude();
+	const float3 eye = float3(0.0, 0.0, R + h);
+	const float b = (R + h) * a_dir.z;
+	const float disc = b * b - h * (2.0 * R + h);
+	[branch] if (a_dir.z < 0.0 && disc >= 0.0)
+	{
+		const float3 sea = eye + (-b - sqrt(disc)) * a_dir;
+		const float3 up = normalize(sea);
+		const float3 mirrored = reflect(a_dir, up);
+		const float opacity = saturate(CloudShadows::CloudShadowsTexture.SampleLevel(SampBaseSampler, mirrored, 0).x);
+		[branch] if (opacity > 0.0)
+		{
+			const float fresnel = 0.02 + 0.98 * pow(1.0 - saturate(-dot(a_dir, up)), 5.0);
+			// Air between the camera and the sea point: T(sea -> top of the air, along -dir) / T(camera -> top, along -dir).
+			const float3 trSea = PhysSky::SampleLightTrUnoccluded(PhysSky::TexTrLut, PhysSky::SampTr, sea, -a_dir);
+			const float3 trEye = PhysSky::SampleLightTrUnoccluded(PhysSky::TexTrLut, PhysSky::SampTr, eye, -a_dir);
+			const float3 tr = saturate(trSea / max(trEye, 1e-6));
+			const float3 sunDir = normalize(SharedData::physSkyNightData.LutSunDir);
+			const float3 sun = data.sunlightColor * PhysSky::SampleTr(sunDir, PhysSky::SampTr) * smoothstep(-0.02, 0.02, sunDir.z) * 0.5;
+			const float3 sky = PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(float3(0.0, 0.0, 1.0)), 0).rgb * (Math::PI * 0.5 * SharedData::physSkyCloudData.SkyAmbient);
+			const float3 cloud = 0.8 * (sun + sky) * data.cloudRelightMix;
+			const float3 clear = PhysSky::TexSvLut.SampleLevel(PhysSky::SampSv, PhysSky::SkyViewLutUv(mirrored), 0).rgb;
+			lum = max(lum + tr * fresnel * opacity * (cloud - clear), 0.0);
+		}
+	}
+	lum *= 1.0 - PhysSky::TexApShadow[a_pxCoord / 2];
+	if (data.tonemapper == 1)
+		lum = Color::LinearToGamma(lum);
+	else if (data.tonemapper == 2)
+		lum = lum / (1.0 + lum);
+	return lum;
+}
+#		endif
 
 // (47a) "Sky Fixes": PhysicalSky::NightFlags bit 3 and the NightCbData fields it fills, named here so
 // that SharedData.hlsli (which every Lighting shader includes) stays byte-identical.
@@ -410,8 +503,24 @@ PS_OUTPUT main(PS_INPUT input)
 	float3 viewDir = normalize(input.WorldPosition.xyz);
 #		if defined(CLOUD_SHADOWS) 
 	if (SharedData::physSkyData.enabled)
-		psCloudDist = CloudShadows::IntersectCloudDist(float3(0, 0, 0), viewDir);
+	{
+		// (47f) Horizon Fix: a warped layer's distance with the camera at its real altitude (the deck 500 m above it, round
+		// the planet's centre): the squeezed clouds down at the real horizon are far away and fade into the haze.
+		[branch] if (input.HorizonClip > 0.5 && HorizonFix::Active())
+			psCloudDist = HorizonFix::CloudDistance(viewDir, CloudShadows::CloudHeight);
+		else
+			psCloudDist = CloudShadows::IntersectCloudDist(float3(0, 0, 0), viewDir);
+	}
 #		endif
+#	endif
+
+#	if defined(CLOUDS)
+	// (47f) Horizon Fix: a warped cloud layer ends at the planet horizon (below it lies the distant sea).
+	[branch] if (input.HorizonClip > 0.5 && HorizonFix::Active())
+	{
+		if (normalize(input.WorldPosition.xyz).z < HorizonFix::HorizonZ())
+			discard;
+	}
 #	endif
 
 #	ifndef OCCLUSION
@@ -492,6 +601,10 @@ PS_OUTPUT main(PS_INPUT input)
 		float3 skyColor;
 		[branch] if (UseReflectionSkyShadow())
 			skyColor = PhysSky::SampleSkyShadow(normalize(input.WorldPosition.xyz), GetReflectionSkyShadow(normalize(input.WorldPosition.xyz)), PhysSky::SampSv);
+#			if defined(CLOUD_SHADOWS)
+		else if (HorizonFix::Active() && !(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection) && normalize(input.WorldPosition.xyz).z < HorizonFix::HorizonZ())
+			skyColor = HorizonSeaSky(normalize(input.WorldPosition.xyz), uint2(input.Position.xy));  // (47f)
+#			endif
 		else
 			skyColor = PhysSky::SampleSky(normalize(input.WorldPosition.xyz), input.Position.xy, PhysSky::SampSv);
 		if (!(Permutation::ExtraShaderDescriptor & Permutation::ExtraFlags::InReflection))

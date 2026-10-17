@@ -1,5 +1,6 @@
 #include "PhysicalSky.h"
 
+#include <DirectXPackedVector.h>
 #include <cfloat>
 #include <imgui_stdlib.h>
 
@@ -130,6 +131,7 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.moonCloudHalo = o_json.value("moonCloudHalo", defaults.moonCloudHalo);
 		settings.skyFixes = o_json.value("skyFixes", defaults.skyFixes);  // (47a)
 		settings.skyPrecision = o_json.value("skyPrecision", defaults.skyPrecision);  // (47b)
+	settings.horizonFix = o_json.value("horizonFix", defaults.horizonFix);  // (47f)
 		settings.aerosolPreset = o_json.value("aerosolPreset", defaults.aerosolPreset);  // (47b)
 	}
 	settings.aerosolPreset = std::clamp(settings.aerosolPreset, 0, kAerosolPresetCount - 1);
@@ -287,6 +289,7 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["moonCloudHalo"] = settings.moonCloudHalo;
 	o_json["skyFixes"] = settings.skyFixes;  // (47a)
 	o_json["skyPrecision"] = settings.skyPrecision;  // (47b)
+	o_json["horizonFix"] = settings.horizonFix;  // (47f)
 	o_json["aerosolPreset"] = settings.aerosolPreset;  // (47b)
 }
 
@@ -340,6 +343,23 @@ void PhysicalSky::DrawSettings()
 			"Off = exactly as before.");
 	if (settings.skyFixes && IsLegacy())
 		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Sky Model is Legacy (36f): Sky Fixes is not used right now.");
+	// (47f) Part of Sky Fixes.
+	ImGui::Indent();
+	ImGui::BeginDisabled(!settings.skyFixes);
+	ImGui::Checkbox("Horizon Fix", &settings.horizonFix);
+	if (auto _tt = Util::HoverTooltipWrapper())
+		ImGui::Text(
+			"Seen from high places, the sky meets the land and sea without a gap or a line:\n"
+			"- the game's clouds reach down to the real horizon (their dome is squeezed so that where they used to fade out\n"
+			"  is now the horizon; the far, flattened clouds fade into the haze);\n"
+			"- the distant sea below the horizon reflects the clouds above it (needs Cloud Shadows);\n"
+			"- the fog runs on to the curved sea's real distance below the horizon, the weather fog keeps thickening below\n"
+			"  you down to sea level, and the fog's colour is no longer taken from the ground (no dark blotches).\n"
+			"Needs Sky Fixes. Off = exactly as 47e.");
+	if (settings.horizonFix && settings.skyFixes && cloudFadeMeasured > 0)
+		ImGui::TextDisabled("Cloud layers measured: %u (%s)", cloudFadeMeasured, cloudFadeNote.c_str());
+	ImGui::EndDisabled();
+	ImGui::Unindent();
 	// (47b)
 	ImGui::Checkbox("Sky Precision", &settings.skyPrecision);
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -924,6 +944,8 @@ void PhysicalSky::SettingsDebug()
 void PhysicalSky::SetupResources()
 {
 	auto device = globals::d3d::device;
+
+	horizonWarpCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<float4>());  // (47f)
 
 	logger::debug("Creating samplers...");
 	{
@@ -1684,6 +1706,7 @@ void PhysicalSky::Reset()
 			skySync.lightColors = std::nullopt;
 		skyScaleSmoothed = -1.f;  // (47a) snap when the sky comes back
 		cbData.enabled = allGood;
+		horizonFixCbData = {};  // (47f)
 		cloudCbData = {};
 		linearLighting.isDirLightLinear = false;
 		return;
@@ -1836,6 +1859,17 @@ void PhysicalSky::Reset()
 
 	// (47a) Sky brightness factor, LUT flags and star values (all neutral when off).
 	UpdateSkyFixes(skyFixes, lutSunDir);
+
+	// (47f) Horizon Fix: the camera's height over sea level (the ground sphere is 500 units below the worldspace's water,
+	// FallbackZBottom) and over the ground sphere.
+	horizonFixCbData = {};
+	if (HorizonFixActive()) {
+		horizonFixCbData.flags = 1u;
+		horizonFixCbData.altitude = std::max(posCam.z - cbData.zBottom, 0.f);
+		horizonFixCbData.anchorDepth = std::max(posCam.z - (cbData.zBottom + 500.f), 0.f);
+		if (!std::isfinite(horizonFixCbData.altitude) || !std::isfinite(horizonFixCbData.anchorDepth))
+			horizonFixCbData = {};
+	}
 }
 
 void PhysicalSky::EarlyPrepass()
@@ -2082,6 +2116,7 @@ void PhysicalSky::Hooks::BSSkyShader_SetupGeometry::thunk(RE::BSShader* This, RE
 	globals::features::physicalSky.ModifySky();
 	SetSunDrawFlags(Pass);
 	globals::features::physicalSky.BindGlareDepth(Pass);  // (47a)
+	globals::features::physicalSky.BindHorizonWarp(Pass);  // (47f)
 	func(This, Pass, RenderFlags);
 }
 
@@ -2089,6 +2124,7 @@ void PhysicalSky::Hooks::BSSkyShader_RestoreGeometry::thunk(RE::BSShader* This, 
 {
 	globals::features::physicalSky.RestoreSamplers();
 	globals::features::physicalSky.UnbindGlareDepth();  // (47a)
+	globals::features::physicalSky.UnbindHorizonWarp();  // (47f)
 	ClearSunDrawFlags();
 	func(This, Pass, RenderFlags);
 }
@@ -2151,5 +2187,216 @@ void PhysicalSky::UnbindGlareDepth()
 	if (glarePreviousSrv) {
 		glarePreviousSrv->Release();
 		glarePreviousSrv = nullptr;
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// (47f) Horizon Fix (a): the cloud dome warp
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+	bool HorizonSafeCopy(void* a_destination, const void* a_source, std::size_t a_bytes)
+	{
+		__try {
+			std::memcpy(a_destination, a_source, a_bytes);
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+}
+
+float PhysicalSky::MeasureCloudFade(const uint8_t* a_vertices, uint32_t a_count, uint32_t a_stride, uint32_t a_positionOffset, uint32_t a_colorOffset,
+	bool a_fullPrecision, const RE::NiTransform& a_world, const RE::NiPoint3& a_eye)
+{
+	// Vertex alpha by elevation (camera-centred, world frame), in 0.25-degree rings from the horizon up to 60 degrees.
+	constexpr float kBinDeg = 0.25f;
+	constexpr int kBins = 240;
+	std::array<double, kBins> alphaSum{}, elevationSum{};
+	std::array<uint32_t, kBins> counts{};
+	for (uint32_t i = 0; i < a_count; ++i) {
+		const uint8_t* v = a_vertices + static_cast<size_t>(i) * a_stride;
+		RE::NiPoint3 p;
+		if (a_fullPrecision) {
+			float f[3];
+			std::memcpy(f, v + a_positionOffset, sizeof(f));
+			p = { f[0], f[1], f[2] };
+		} else {
+			uint16_t h[3];
+			std::memcpy(h, v + a_positionOffset, sizeof(h));
+			p = { DirectX::PackedVector::XMConvertHalfToFloat(h[0]), DirectX::PackedVector::XMConvertHalfToFloat(h[1]), DirectX::PackedVector::XMConvertHalfToFloat(h[2]) };
+		}
+		const RE::NiPoint3 w = a_world.rotate * (p * a_world.scale) + a_world.translate - a_eye;
+		const float horizontal = std::sqrt(w.x * w.x + w.y * w.y);
+		if (!std::isfinite(horizontal) || !std::isfinite(w.z) || (horizontal < 1e-3f && std::abs(w.z) < 1e-3f))
+			continue;
+		const float elevation = DirectX::XMConvertToDegrees(std::atan2(w.z, horizontal));
+		if (elevation < -0.5f || elevation >= 60.0f)
+			continue;
+		const int bin = std::clamp(static_cast<int>(std::floor(std::max(elevation, 0.0f) / kBinDeg)), 0, kBins - 1);
+		alphaSum[bin] += v[a_colorOffset + 3] / 255.0;
+		elevationSum[bin] += std::max(elevation, 0.0f);
+		++counts[bin];
+	}
+	std::vector<std::pair<float, float>> rings;  // (elevation, mean alpha), rising
+	float maxAlpha = 0.0f;
+	for (int b = 0; b < kBins; ++b) {
+		if (!counts[b])
+			continue;
+		const float alpha = static_cast<float>(alphaSum[b] / counts[b]);
+		rings.emplace_back(static_cast<float>(elevationSum[b] / counts[b]), alpha);
+		maxAlpha = std::max(maxAlpha, alpha);
+	}
+	if (rings.empty() || maxAlpha < 0.05f)
+		return -1.0f;
+	const float threshold = kCloudFadeAlphaShare * maxAlpha;
+	float e1 = rings.front().first;
+	if (rings.front().second < threshold) {
+		for (size_t i = 1; i < rings.size(); ++i) {
+			if (rings[i].second >= threshold) {
+				const auto& [e0, a0] = rings[i - 1];
+				const auto& [eA, aA] = rings[i];
+				e1 = e0 + (threshold - a0) / std::max(aA - a0, 1e-4f) * (eA - e0);
+				break;
+			}
+		}
+	}
+	return DirectX::XMConvertToRadians(std::clamp(e1, 0.0f, 45.0f));
+}
+
+float PhysicalSky::GetCloudFadeElevation(const RE::BSGeometry* a_geometry)
+{
+	auto* geometry = const_cast<RE::BSGeometry*>(a_geometry);
+	auto* rendererData = geometry ? geometry->GetGeometryRuntimeData().rendererData : nullptr;
+	auto* shape = geometry ? geometry->AsTriShape() : nullptr;
+	if (!rendererData || !rendererData->vertexBuffer || !shape)
+		return -1.0f;
+	const uint32_t frame = globals::state->frameCount;
+	if (auto it = cloudFades.find(a_geometry); it != cloudFades.end() && it->second.vertexBuffer == rendererData->vertexBuffer) {
+		auto& fade = it->second;
+		if (!std::isnan(fade.e1))
+			return fade.e1;
+		// GPU read-back in flight: never waits (a frame or two late at most).
+		if (fade.staging && frame - fade.copyFrame >= 2) {
+			auto* context = globals::d3d::context;
+			D3D11_MAPPED_SUBRESOURCE mapped{};
+			const HRESULT hr = context->Map(fade.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+			if (SUCCEEDED(hr)) {
+				D3D11_BUFFER_DESC desc{};
+				fade.staging->GetDesc(&desc);
+				const bool fits = static_cast<uint64_t>(fade.vertexCount) * fade.stride <= desc.ByteWidth;
+				fade.e1 = fits ? MeasureCloudFade(static_cast<const uint8_t*>(mapped.pData), fade.vertexCount, fade.stride, fade.positionOffset, fade.colorOffset,
+									 fade.fullPrecision, fade.world, fade.eye) :
+				                 -1.0f;
+				context->Unmap(fade.staging.get(), 0);
+				fade.staging = nullptr;
+				++cloudFadeMeasured;
+				cloudFadeNote = fade.e1 >= 0.0f ? std::format("last: fades in at {:.1f} deg", DirectX::XMConvertToDegrees(fade.e1)) : "last: no fade found";
+			} else if (hr != DXGI_ERROR_WAS_STILL_DRAWING || frame - fade.copyFrame > 120) {
+				fade.staging = nullptr;
+				fade.e1 = -1.0f;
+			}
+		}
+		return fade.e1;
+	}
+	if (cloudFades.size() > 64)
+		cloudFades.clear();
+
+	CloudFade fade;
+	fade.vertexBuffer = rendererData->vertexBuffer;
+	fade.e1 = -1.0f;
+	uint64_t descBits = 0;
+	std::memcpy(&descBits, &rendererData->vertexDesc, sizeof(descBits));
+	const uint32_t stride = static_cast<uint32_t>(descBits & 0xF) * 4;
+	const auto flags = rendererData->vertexDesc.GetFlags();
+	fade.vertexCount = shape->GetTrishapeRuntimeData().vertexCount;
+	if ((flags & RE::BSGraphics::Vertex::VF_VERTEX) && (flags & RE::BSGraphics::Vertex::VF_COLORS) && stride > 0 && fade.vertexCount > 0) {
+		const uint32_t positionOffset = rendererData->vertexDesc.GetAttributeOffset(RE::BSGraphics::Vertex::VA_POSITION);
+		uint32_t next = stride;
+		for (uint32_t attribute = 1; attribute < RE::BSGraphics::Vertex::VA_COUNT; ++attribute) {
+			if (!(flags & (1u << attribute)))
+				continue;
+			const uint32_t offset = rendererData->vertexDesc.GetAttributeOffset(static_cast<RE::BSGraphics::Vertex::Attribute>(attribute));
+			if (offset > positionOffset && offset < next)
+				next = offset;
+		}
+		fade.fullPrecision = next - positionOffset >= 12;
+		fade.stride = stride;
+		fade.positionOffset = positionOffset;
+		fade.colorOffset = rendererData->vertexDesc.GetAttributeOffset(RE::BSGraphics::Vertex::VA_COLOR);
+		fade.world = geometry->world;
+		fade.eye = (globals::game::sky && globals::game::sky->root) ? globals::game::sky->root->world.translate : geometry->world.translate;
+		const bool layoutOk = positionOffset + (fade.fullPrecision ? 12u : 6u) <= stride && fade.colorOffset + 4 <= stride;
+		if (layoutOk) {
+			if (rendererData->rawVertexData) {
+				// The engine's CPU copy (copied out first: bad pointers from mods are skipped).
+				std::vector<uint8_t> bytes(static_cast<size_t>(fade.vertexCount) * stride);
+				if (HorizonSafeCopy(bytes.data(), rendererData->rawVertexData, bytes.size())) {
+					fade.e1 = MeasureCloudFade(bytes.data(), fade.vertexCount, stride, positionOffset, fade.colorOffset, fade.fullPrecision, fade.world, fade.eye);
+					++cloudFadeMeasured;
+					cloudFadeNote = fade.e1 >= 0.0f ? std::format("last: fades in at {:.1f} deg", DirectX::XMConvertToDegrees(fade.e1)) : "last: no fade found";
+				}
+			} else if (auto* device = globals::d3d::device) {
+				// No CPU copy: one GPU read-back of the vertex buffer.
+				D3D11_BUFFER_DESC desc{};
+				auto* vertexBuffer = reinterpret_cast<::ID3D11Buffer*>(rendererData->vertexBuffer);
+				vertexBuffer->GetDesc(&desc);
+				D3D11_BUFFER_DESC stagingDesc{ desc.ByteWidth, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
+				if (desc.ByteWidth > 0 && SUCCEEDED(device->CreateBuffer(&stagingDesc, nullptr, fade.staging.put()))) {
+					globals::d3d::context->CopyResource(fade.staging.get(), vertexBuffer);
+					fade.copyFrame = frame;
+					fade.e1 = std::numeric_limits<float>::quiet_NaN();
+				}
+			}
+		}
+	}
+	const float result = fade.e1;
+	cloudFades[a_geometry] = std::move(fade);
+	return result;
+}
+
+void PhysicalSky::BindHorizonWarp(const RE::BSRenderPass* a_pass)
+{
+	if (horizonWarpBound)
+		UnbindHorizonWarp();
+	if (!a_pass || !a_pass->shaderProperty || !horizonWarpCB)
+		return;
+	const auto* skyProperty = static_cast<const RE::BSSkyShaderProperty*>(a_pass->shaderProperty);
+	if (skyProperty->uiSkyObjectType != RE::BSSkyShaderProperty::SkyObject::SO_CLOUDS)
+		return;
+	auto* context = globals::d3d::context;
+	if (!context)
+		return;
+	// Every cloud draw gets the constants (zeros when the fix is off), so Sky.hlsl's VS never reads someone else's b11.
+	// w = 4242: the shader warps only with this key in place.
+	float4 warp{ 0.f, 0.f, 0.f, 0.f };
+	if (HorizonFixActive() && a_pass->geometry) {
+		const float e1 = GetCloudFadeElevation(a_pass->geometry);
+		if (std::isfinite(e1) && e1 >= 0.f) {
+			const double R = static_cast<double>(cbData.rPlanet);
+			const double h = static_cast<double>(horizonFixCbData.altitude);
+			const double dip = R > 0.0 ? std::atan(std::sqrt(h * (2.0 * R + h)) / R) : 0.0;
+			warp = { 1.f, e1, static_cast<float>(-dip), 4242.f };
+		}
+	}
+	horizonWarpCB->Update(warp);
+	horizonWarpPrevious = nullptr;
+	context->VSGetConstantBuffers(kHorizonWarpSlot, 1, &horizonWarpPrevious);  // AddRef'd; released in Unbind
+	ID3D11Buffer* buffer = horizonWarpCB->CB();
+	context->VSSetConstantBuffers(kHorizonWarpSlot, 1, &buffer);
+	horizonWarpBound = true;
+}
+
+void PhysicalSky::UnbindHorizonWarp()
+{
+	if (!horizonWarpBound)
+		return;
+	horizonWarpBound = false;
+	if (auto* context = globals::d3d::context)
+		context->VSSetConstantBuffers(kHorizonWarpSlot, 1, &horizonWarpPrevious);
+	if (horizonWarpPrevious) {
+		horizonWarpPrevious->Release();
+		horizonWarpPrevious = nullptr;
 	}
 }

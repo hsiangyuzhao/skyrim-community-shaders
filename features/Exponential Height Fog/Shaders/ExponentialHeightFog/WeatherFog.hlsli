@@ -14,6 +14,7 @@
 //    mountain shows through the fog (1 - Cap).
 // Only SharedData is needed: Lighting, Effect, Water, RunGrass, DistantTree and the volumetric fog passes include it.
 
+#include "Common/HorizonFix.hlsli"  // (47f)
 #include "Common/SharedData.hlsli"
 
 namespace WeatherFog
@@ -31,18 +32,26 @@ namespace WeatherFog
 		return max(SharedData::weatherFogData.ScaleHeight, 1.0f);
 	}
 
-	/// Relative density at a height over the camera.
+	/// (47f) Horizon Fix: below the camera the layer keeps thickening, exp(-h / H), down to sea level (HorizonFix::AnchorDepth()
+	/// under the camera), and is even below that. 0 while the fix is off: even below the camera, the 47e layer exactly.
+	float Floor()
+	{
+		return -HorizonFix::AnchorDepth();
+	}
+
+	/// Relative density at a height over the camera (1 at the camera).
 	float Density(float a_height)
 	{
-		return exp(-max(a_height, 0.0f) / ScaleHeight());
+		return exp(-max(a_height, Floor()) / ScaleHeight());
 	}
 
 	/// Integral of the relative density over the heights [a_low, a_high] (a_low <= a_high).
 	float DensityIntegral(float a_low, float a_high)
 	{
 		const float H = ScaleHeight();
-		const float below = min(a_high, 0.0f) - min(a_low, 0.0f);
-		const float above = H * (exp(-max(a_low, 0.0f) / H) - exp(-max(a_high, 0.0f) / H));
+		const float f = Floor();  // (47f) 0 = the 47e form exactly
+		const float below = (min(a_high, f) - min(a_low, f)) * exp(-f / H);
+		const float above = H * (exp(-max(a_low, f) / H) - exp(-max(a_high, f) / H));
 		return below + above;
 	}
 
@@ -87,7 +96,8 @@ namespace WeatherFog
 		// Sun near the horizon: the path is held at ~3 degrees; it is long enough there to reach the cap anyway.
 		const float mu = max(SharedData::DirLightDirection.z, 0.05f);
 		const float H = ScaleHeight();
-		const float depth = (max(-a_height, 0.0f) + H * exp(-max(a_height, 0.0f) / H)) / mu;
+		const float f = Floor();  // (47f) 0 = the 47e form exactly
+		const float depth = (max(f - a_height, 0.0f) * exp(-f / H) + H * exp(-max(a_height, f) / H)) / mu;
 		return 1.0f - saturate(SharedData::weatherFogData.Cap) * (1.0f - exp(-SharedData::weatherFogData.Sigma * depth));
 	}
 

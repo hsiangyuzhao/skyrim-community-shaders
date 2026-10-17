@@ -123,7 +123,7 @@ namespace ExponentialHeightFog
         if (SharedData::exponentialHeightFogSettings.useDynamicCubemaps > 0)
         {
             float3 tintColor = lerp(fogColor, SharedData::exponentialHeightFogSettings.inscatteringTint.xyz, SharedData::exponentialHeightFogSettings.inscatteringTint.w);
-            float3 cubemapColor = DynamicCubemaps::EnvReflectionsTexture.SampleLevel(SampColorSampler, normalize(positionWS), SharedData::exponentialHeightFogSettings.cubemapMipLevel).xyz;
+            float3 cubemapColor = DynamicCubemaps::EnvReflectionsTexture.SampleLevel(SampColorSampler, HorizonFix::ClampToHorizon(normalize(positionWS)) /* (47f) */, SharedData::exponentialHeightFogSettings.cubemapMipLevel).xyz;
             // (47b) With "EHF Follows Weather" the colour is not pre-weighted by the opacity the callers blend with
             // (upstream 22ac9859c, #2776); off = 47a2.
             fogColor = tintColor * cubemapColor * (FogOpacityFix() ? 1.0f : (1.0f - expFogFactor));
@@ -278,7 +278,7 @@ namespace ExponentialHeightFog
         if (SharedData::exponentialHeightFogSettings.useDynamicCubemaps > 0)
         {
             float3 tintColor = lerp(fogColor, SharedData::exponentialHeightFogSettings.inscatteringTint.xyz, SharedData::exponentialHeightFogSettings.inscatteringTint.w);
-            fogColor = tintColor * DynamicCubemaps::EnvReflectionsTexture.SampleLevel(SampColorSampler, normalize(positionWS), SharedData::exponentialHeightFogSettings.cubemapMipLevel).xyz;
+            fogColor = tintColor * DynamicCubemaps::EnvReflectionsTexture.SampleLevel(SampColorSampler, HorizonFix::ClampToHorizon(normalize(positionWS)) /* (47f) */, SharedData::exponentialHeightFogSettings.cubemapMipLevel).xyz;
         }
 #   endif
         a_directional = 0.0f;

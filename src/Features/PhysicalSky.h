@@ -150,6 +150,11 @@ struct PhysicalSky final : public Feature
 		/// occlusion, nonuniform midpoint quadrature, sky-view rows around the true horizon, quadratic aerial
 		/// perspective slices). Off = 47a2 exactly. Saved outside the NLOHMANN macro.
 		bool skyPrecision = true;
+		/// (47f) "Horizon Fix" (under Sky Fixes): the game's cloud dome reaches the real horizon (vertex-shader elevation warp,
+		/// fade start measured from the loaded cloud meshes), the distant sea reflects the clouds, and the fog meets the horizon
+		/// without a line (sky pixels fogged out to the curved sea, the weather fog layer thickening down to sea level, the
+		/// fog colour's cubemap read no lower than the horizon). Off = 47e exactly. Saved outside the NLOHMANN macro.
+		bool horizonFix = true;
 		/// (47b) "Aerosol": AerosolPreset. Applied at upload; the saved aerosol values are never changed.
 		int aerosolPreset = 0;
 		bool overrideDirLight = false;
@@ -309,6 +314,8 @@ struct PhysicalSky final : public Feature
 	/// Sync's timing, sun fade and moonlight retreat follow this too (also where the physical sky
 	/// itself is not drawn, e.g. interiors, so the sun does not jump at a worldspace border).
 	bool SkyFixesActive() const { return loaded && settings.enabled && settings.skyFixes && !IsLegacy(); }
+	/// (47f) "Horizon Fix" is in effect this frame (Sky Fixes on, Horizon Fix on, the physical sky drawn here).
+	bool HorizonFixActive() const { return SkyFixesActive() && settings.horizonFix && cbData.enabled; }
 	/// (41b, F5) 36f code paths for what the old Batch 37b master switched: hard-coded worldspace
 	/// list, 37a sun disc size, no 37b/37c shader flags.
 	bool UseLegacyPaths() const;
@@ -507,6 +514,47 @@ struct PhysicalSky final : public Feature
 	static_assert(sizeof(CloudCbData) == 64);
 	/// (42b) Fills cloudCbData. a_exposure as for the LUTs, a_sunElevation (radians) of the LUTs' sun.
 	void UpdateCloudData(float a_exposure, float a_sunElevation);
+
+	/// (47f) Mirrors SharedData::HorizonFixData (HLSL), appended after WeatherFogData at the very end of FeatureData.
+	struct HorizonFixCbData
+	{
+		float anchorDepth = 0.f;  // camera height over sea level (zBottom + 500), game units
+		float altitude = 0.f;     // camera height over the ground sphere (zBottom), game units
+		uint flags = 0;           // bit 0: Horizon Fix in effect
+		float pad0 = 0.f;
+	} horizonFixCbData;
+	static_assert(sizeof(HorizonFixCbData) == 16);
+
+	/// (47f) Horizon Fix (a): the cloud dome warp. Per cloud draw the vertex shader gets (VS b11, Sky.hlsl HorizonFixVS)
+	/// x = 1 to warp, y = the layer's fade elevation E1 (rad), z = the planet horizon eH = -dip (rad): elevation e goes to
+	/// eH + (e - E1) (90 deg - eH) / (90 deg - E1). E1 is measured once per cloud mesh from its vertex alpha (the elevation
+	/// where it reaches 40 % of the layer's own maximum, rising from the horizon; the engine's CPU copy, else a GPU read-back).
+	static constexpr UINT kHorizonWarpSlot = 11;
+	static constexpr float kCloudFadeAlphaShare = 0.4f;
+	static constexpr float kCloudFadeFallbackDeg = 8.f;
+	struct CloudFade
+	{
+		const void* vertexBuffer = nullptr;  // identity check (the geometry pointer could be reused)
+		float e1 = -1.f;                     // radians; < 0 = no fade found (no warp), NaN = pending
+		winrt::com_ptr<ID3D11Buffer> staging;  // GPU read-back in flight
+		uint32_t copyFrame = 0;
+		uint32_t vertexCount = 0, stride = 0, positionOffset = 0, colorOffset = 0;
+		bool fullPrecision = true;
+		RE::NiTransform world;  // the geometry's transform when the copy was taken
+		RE::NiPoint3 eye;
+	};
+	std::unordered_map<const RE::BSGeometry*, CloudFade> cloudFades;
+	/// Fade elevation of a cloud layer (radians), NaN while it is being measured, < 0 when it has none.
+	float GetCloudFadeElevation(const RE::BSGeometry* a_geometry);
+	static float MeasureCloudFade(const uint8_t* a_vertices, uint32_t a_count, uint32_t a_stride, uint32_t a_positionOffset, uint32_t a_colorOffset,
+		bool a_fullPrecision, const RE::NiTransform& a_world, const RE::NiPoint3& a_eye);
+	std::unique_ptr<ConstantBuffer> horizonWarpCB;
+	ID3D11Buffer* horizonWarpPrevious = nullptr;  // VS b11 before a cloud draw (AddRef'd), put back after it
+	bool horizonWarpBound = false;
+	void BindHorizonWarp(const RE::BSRenderPass* a_pass);
+	void UnbindHorizonWarp();
+	uint32_t cloudFadeMeasured = 0;  // layers measured (menu line)
+	std::string cloudFadeNote;
 
 	/// (batch 37c) "Sun Look" presets.
 	enum SunLook : int

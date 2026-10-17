@@ -649,6 +649,16 @@ namespace SharedData
 		float ScaleHeight;   // above the camera the density falls by e every this many game units
 	};
 
+	// (47f) Mirrors PhysicalSky::HorizonFixCbData, appended after WeatherFogData (offset 1920). Physical Sky > Sky Fixes >
+	// "Horizon Fix" (ExponentialHeightFog/WeatherFog.hlsli namespace HorizonFix, Sky.hlsl). All 0 while it is off.
+	struct HorizonFixData
+	{
+		float AnchorDepth;  // camera height over sea level (game units): the weather fog layer keeps thickening down to it
+		float Altitude;     // camera height over the physical sky's ground sphere (game units)
+		uint Flags;         // bit 0: Horizon Fix in effect (Physical Sky drawn, Sky Fixes and Horizon Fix on)
+		float pad0;
+	};
+
 	namespace PhysSkyCloudFlags
 	{
 		static const uint MultiLight = (1 << 0);        // clouds: sun + both moons + sky (0 = the 42a single-light code)
@@ -703,6 +713,7 @@ namespace SharedData
 		PhysSkyCloudData physSkyCloudData;
 		DynamicSnowMapData dynamicSnowMapData;
 		WeatherFogData weatherFogData;  // (47d)
+		HorizonFixData horizonFixData;  // (47f)
 	};
 
 	Texture2D<float4> DepthTexture : register(t17);
