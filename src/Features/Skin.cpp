@@ -1184,6 +1184,10 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 			c[0].y = std::clamp(look.evapTime, 1.0f, 1e6f);
 			c[11].z = std::clamp(look.peak, 0.0f, 1.0f);
 			c[11].w = std::clamp(look.oil, 0.0f, 1.0f);
+			// (47g) Gear and hair: the droplet / rivulet drivers without sweat, packed in the unused c[3].w (Skin.hlsli
+			// WetGearDrivers): |v| = 1 + round(beads x 1023) + 0.998 x trails, negative while the manual look is Sweat.
+			const float packed = 1.0f + std::round(std::clamp(look.gearBeads, 0.0f, 1.0f) * 1023.0f) + 0.998f * std::clamp(look.gearTrails, 0.0f, 1.0f);
+			c[3].w = look.manualSweat ? -packed : packed;
 		}
 		// (44f) Item class prior from the keywords of the worn item this geometry belongs to.
 		if (lastWetState && !wetSkin.IsOriginal() && wetSkin.settings.GearEnabled && wetSkin.settings.GearModel == 0 && wetSkin.settings.GearKeywords) {

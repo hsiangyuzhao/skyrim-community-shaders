@@ -132,15 +132,26 @@ namespace
 		float trails = 1.0f;      // x droplet trails
 	};
 
-	/// Sweat: small dense beads first, then they grow and merge, trails, and a thin film at the end.
+	/// (47g) The droplet driver for a visible bead count per skin area a_count at bead size a_size (both x the user's
+	/// values): the shader's droplet cells shrink with the bead size (cells per uv = 320 / size), so the share of cells
+	/// holding a bead is count x size^2.
+	float BeadDriver(float a_count, float a_size)
+	{
+		return std::clamp(a_count * a_size * a_size, 0.0f, 1.0f);
+	}
+
+	/// Sweat: a few tiny beads at the onset, more and larger toward mid wetness, then they merge into trails and a thin
+	/// film. (47g) The count rises gradually and peaks around mid wetness (it saturated at 0.15-0.2 before, with 1.8x
+	/// density at low wetness); the size grows with the wetness. Fully wet unchanged (driver 0.6 at size 0.9).
 	SourceLook SweatLook(float a_level)
 	{
 		SourceLook o;
 		const float l = std::clamp(a_level, 0.0f, 1.0f);
 		o.level = l;
-		o.beads = Smooth(0.02f, 0.2f, l) * std::lerp(1.0f, 0.6f, Smooth(0.75f, 1.0f, l));
-		o.density = std::lerp(1.8f, 1.0f, Smooth(0.25f, 0.7f, l));
-		o.size = std::lerp(0.35f, 0.9f, Smooth(0.1f, 0.75f, l));
+		o.size = std::lerp(0.3f, 0.9f, Smooth(0.0f, 0.8f, l));
+		const float count = (0.6f / 0.81f) * (1.4f * Smooth(0.02f, 0.5f, l) - 0.4f * Smooth(0.55f, 1.0f, l));
+		o.beads = BeadDriver(count, o.size);
+		o.density = 1.0f;
 		o.sizeRandom = 0.5f;
 		o.trails = Smooth(0.4f, 0.8f, l);
 		o.streak = 0.7f * Smooth(0.55f, 0.95f, l);
@@ -149,14 +160,15 @@ namespace
 	}
 
 	/// Rain: sparse beads of mixed sizes (the shader puts more on up-facing surfaces), runoff trails, a film in heavy rain.
+	/// (47g) The count grows with the water received (it was at its maximum from level 0.15); fully wet unchanged.
 	SourceLook RainLook(float a_level)
 	{
 		SourceLook o;
 		const float l = std::clamp(a_level, 0.0f, 1.0f);
 		o.level = l;
-		o.beads = Smooth(0.02f, 0.15f, l);
-		o.density = 0.6f;
 		o.size = std::lerp(0.6f, 1.1f, Smooth(0.1f, 0.8f, l));
+		o.beads = BeadDriver((0.6f / 1.21f) * Smooth(0.02f, 0.8f, l), o.size);
+		o.density = 1.0f;
 		o.sizeRandom = 1.5f;
 		o.trails = Smooth(0.2f, 0.6f, l);
 		o.streak = Smooth(0.25f, 0.7f, l);
@@ -166,6 +178,8 @@ namespace
 
 	/// Swimming: a thick film with runoff trails; drying, the film breaks into beads, which then shrink and go.
 	/// a_phase: 0 just out of the water .. 1 dry (evaporation clock / evaporation time); a_runoff: the runoff left (1 .. 0).
+	/// (47g) Late in the drying both the count and the size fall (the small beads evaporate first); the count rose 20x
+	/// before (density up while the size shrank). Just out of the water unchanged.
 	SourceLook SwimLook(float a_level, float a_phase, float a_runoff)
 	{
 		SourceLook o;
@@ -173,9 +187,10 @@ namespace
 		const float p = std::clamp(a_phase, 0.0f, 1.0f);
 		o.level = l;
 		o.film = std::lerp(1.0f, 0.3f, Smooth(0.1f, 0.55f, p));
-		o.beads = std::lerp(0.5f, 1.0f, Smooth(0.05f, 0.3f, p)) * Smooth(0.0f, 0.12f, l);
-		o.density = std::lerp(1.0f, 1.3f, Smooth(0.1f, 0.4f, p));
-		o.size = std::lerp(1.1f, 0.4f, Smooth(0.25f, 0.9f, p));
+		o.size = std::lerp(1.1f, 0.45f, Smooth(0.3f, 0.95f, p));
+		const float count = (0.5f / 1.21f) * std::lerp(1.0f, 1.6f, Smooth(0.05f, 0.3f, p)) * (1.0f - Smooth(0.5f, 1.0f, p));
+		o.beads = BeadDriver(count, o.size) * Smooth(0.0f, 0.12f, l);
+		o.density = 1.0f;
 		o.sizeRandom = 0.7f;
 		o.trails = std::lerp(1.0f, 0.3f, Smooth(0.1f, 0.5f, p));
 		o.streak = std::max(std::clamp(a_runoff, 0.0f, 1.0f), 0.25f * (1.0f - p)) * Smooth(0.0f, 0.1f, l);
@@ -464,6 +479,14 @@ WetSkin::PhysicalLook WetSkin::GetPhysicalLook(const PhysicalState& a_state) con
 		size += src.size * w;
 		sizeRandom += src.sizeRandom * w;
 		trails += src.trails * w;
+	}
+	// (47g) Gear and hair: beads and trails only from rain, swimming and a manual look other than Sweat.
+	look.manualSweat = manualLook == ManualLook::Sweat;
+	for (std::size_t i = 1; i < sources.size(); ++i) {
+		if (i == 3 && look.manualSweat)
+			continue;
+		look.gearBeads = std::max(look.gearBeads, sources[i].beads);
+		look.gearTrails = std::max(look.gearTrails, sources[i].streak);
 	}
 	look.film = levelSum > 1e-5f ? filmSum / levelSum : 1.0f;
 	if (beadSum > 1e-6f) {

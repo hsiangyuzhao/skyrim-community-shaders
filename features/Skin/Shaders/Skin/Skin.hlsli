@@ -83,6 +83,41 @@ namespace Skin
 		return WetPhysical() ? saturate(wetCharParams[11].w) : 0.0;
 	}
 
+	/// (47g) Physical: gear and hair get no beads or trails from sweat (or the manual Sweat look), only wicking darkening
+	/// and a gloss change. x = droplet driver, y = rivulet driver of the other sources (rain, swimming, other manual
+	/// looks), z = 1 while the manual look is Sweat. Packed by the CPU in the unused wetCharParams[3].w (Skin.cpp); 0 outside
+	/// Physical.
+	float3 WetGearDrivers()
+	{
+		const float v = wetCharParams[3].w;
+		const float a = max(abs(v) - 1.0, 0.0);
+		return float3(floor(a) * (1.0 / 1023.0), saturate(frac(a) * (1.0 / 0.998)), v < 0.0 ? 1.0 : 0.0);
+	}
+
+	/// (47g) Physical: the share of the sweat a gear class takes up (wicking): cloth 1, leather 0.3, metal 0, fur 0.6.
+	float WetGearSweatClass(float4 w)
+	{
+		return lerp(w.x + 0.3 * w.y, 0.6, w.w);
+	}
+
+	/// (47g) Droplet visibility for a droplet cell size (footprint: droplet cells per render pixel; the screen derivatives
+	/// are in render pixels, the internal resolution under DLSS). Physical: only a coarse early-out (0 when no bead of
+	/// this cell size, radius up to 0.42 cell, reaches 2 px); each bead then fades by its own size (WetSkinDroplets).
+	/// Otherwise the 44a fade by cell size.
+	float WetDropVisibility(float footprint)
+	{
+		[branch] if (WetPhysical())
+			return 0.84 / footprint > 2.0 ? 1.0 : 0.0;
+		return smoothstep(1.0, 2.5, 0.3 / footprint);
+	}
+
+	/// (47g) Physical: a bead or rivulet of a_pixels render pixels across is hidden below 2 px and fades in up to 3.5 px
+	/// (sub-pixel water sparkles under DLSS); 1 in the other models.
+	float WetMinSizeFade(float a_pixels)
+	{
+		return WetPhysical() ? smoothstep(2.0, 3.5, a_pixels) : 1.0;
+	}
+
 	// (47c) "Wetness: Skip Invisible Work" (wetCharParams[11].x): leave out work whose result is
 	// multiplied by 0 (faded noise octaves, sub-pixel rivulets, rain detail under a roof, dry hair's
 	// clumps). The picture stays the same.
@@ -834,7 +869,9 @@ namespace Skin
 					const float r = length(d) / radius;
 					// Anti-aliased edge: one pixel wide in bead radii.
 					const float aa = max(footprint / radius, 0.05);
-					const float m = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
+					// (47g) Physical: each bead by its own projected diameter (render pixels), so the larger beads of
+					// the same cells stay while the tiny ones are hidden.
+					const float m = (1.0 - smoothstep(1.0 - aa, 1.0 + aa, r)) * WetMinSizeFade(2.0 * radius / footprint);
 					if (m > best) {
 						best = m;
 						o.dropSlope = d / radius;
@@ -849,7 +886,7 @@ namespace Skin
 							const float t = along / length_;
 							const float width = radius * 0.45 * (1.0 - t) + footprint;
 							const float side = abs(dot(d, across));
-							o.trail = max(o.trail, (1.0 - smoothstep(width * 0.5, width, side)) * (1.0 - t) * alignment);
+							o.trail = max(o.trail, (1.0 - smoothstep(width * 0.5, width, side)) * (1.0 - t) * alignment * WetMinSizeFade(0.9 * radius / footprint));  // (47g) by the trail's width
 						}
 					}
 				}
@@ -875,7 +912,8 @@ namespace Skin
 		const float center = (h.x - 0.5) * 0.4;
 		const float halfWidth = 0.13 * lerp(0.7, 1.3, h.y);
 		const float w = max(halfWidth, 0.6 * aFoot);
-		const float profile = (1.0 - smoothstep(0.35 * w, w, abs(x - center))) * (halfWidth / w);
+		// (47g) Physical: each rivulet by its own width in render pixels (WetMinSizeFade; 1 otherwise).
+		const float profile = (1.0 - smoothstep(0.35 * w, w, abs(x - center))) * (halfWidth / w) * WetMinSizeFade(2.0 * halfWidth / aFoot);
 		const float segment = WetValueNoise(float2(l * 0.25 / lengthScale + h.y * 13.0, id * 1.37 + seed));
 		return profile * smoothstep(threshold, threshold + 0.12, segment) * lerp(0.6, 1.0, h.x);
 	}
@@ -899,7 +937,9 @@ namespace Skin
 			const float aFoot = max(uvFootprint * columnsPerUV / width, 1e-6);
 			// A rivulet is about 0.26 column wide: fade below about a pixel.
 			const float linePixels = 0.26 / aFoot;
-			const float lineFade = smoothstep(0.5, 1.2, linePixels);
+			// (47g) Physical: each rivulet fades by its own width (WetRivuletField); here only a coarse early-out, 0 when
+			// even the widest (0.34 column) is under 2 px. Where it is 1 the old fade was 1 too.
+			const float lineFade = WetPhysical() ? (0.34 / aFoot > 2.0 ? 1.0 : 0.0) : smoothstep(0.5, 1.2, linePixels);
 			// (47c) Skip Invisible Work: narrower than half a pixel (lineFade == 0) or past the
 			// distance LOD, the product below is exactly 0 (the fields are finite): not evaluated.
 			[branch] if (!WetSkipInvisible() || (lineFade > 0.0 && lod > 0.0))

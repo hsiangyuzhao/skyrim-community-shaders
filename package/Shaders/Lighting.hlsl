@@ -2347,7 +2347,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			const float detailLOD = Skin::WetDetailLOD(wetPixelWorld);
 			const float footprint = max(max(length(dUVdx), length(dUVdy)) * cellsPerUV, 1e-6);
 			// Beads are about 0.3 cell in radius: fade them out below ~1.5 pixels (no DLSS sparkle).
-			const float dropVisibility = smoothstep(1.0, 2.5, 0.3 / footprint) * detailLOD;
+			const float dropVisibility = Skin::WetDropVisibility(footprint) * detailLOD;  // (47g) Physical: a coarse early-out, each bead fades by its own size
 			// More beads where water rests (shoulders, chest), fewer on undersides.
 			const float restFactor = lerp(0.7, 1.2, saturate(baseN.z * 0.5 + 0.5));
 			skinWetDetail.wetUV = wetUV;
@@ -3351,6 +3351,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				rainWetness *= saturate(Skin::wetSkinParams[0].w);
 				[branch] if (Skin::WetPhysical())
 				{
+					// (47g) Sweat (and the manual Sweat look) on hair: a damp hairline with the crown drier, slight clumping
+					// and darkening at most (no beads on hair in any model).
+					const float hairline = lerp(1.0, 0.45, smoothstep(118.0, 126.0, charWorldZ - Skin::skinPerGeometry.z));
+					wSweat = min(wSweat * hairline, 0.6);
+					[branch] if (Skin::WetGearDrivers().z > 0.5)
+						wManual = min(wManual * saturate(Skin::wetCharParams[0].w) * hairline, 0.6);
+					charDryWetness = 1.0 - (1.0 - wSwim) * (1.0 - wManual) * (1.0 - wSweat);
 					// (47f) The character's own rain level (shelter and drying on the CPU), not sky-occluded again.
 					charDryWetness = 1.0 - (1.0 - charDryWetness) * (1.0 - saturate(Skin::wetSkinParams[0].w));
 					rainWetness = 0.0;
@@ -3404,9 +3411,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				const float wick = max(Skin::wetCharParams[4].w, 0.0) * clothW;
 				const float tide = (Skin::WetValueNoise(uv * 40.0) - 0.5) * 4.0 * clothW;
 				const float recede = 0.6 * Skin::wetSkinPerGeometry.y * gearSwimProgress;
-				charDryWetness = Skin::CharDryWetnessClass(charWorldZ, dynamicWetness.x, swimGear, wick + tide - recede, saturate(Skin::wetCharParams[5].x), wSwim, wManual, wSweat);
-				[branch] if (Skin::WetPhysical())
+				// (47g) Physical: sweat makes gear wet by wicking only, cloth most, leather a little, metal not at all.
+				const bool gearPhysical = Skin::WetPhysical();
+				const float gearSweatShare = saturate(Skin::wetCharParams[5].x) * (gearPhysical ? Skin::WetGearSweatClass(gearClass) : 1.0);
+				charDryWetness = Skin::CharDryWetnessClass(charWorldZ, dynamicWetness.x, swimGear, wick + tide - recede, gearSweatShare, wSwim, wManual, wSweat);
+				[branch] if (gearPhysical)
 				{
+					// (47g) The manual Sweat look is sweat on gear too.
+					[branch] if (Skin::WetGearDrivers().z > 0.5)
+					{
+						wManual *= gearSweatShare;
+						charDryWetness = 1.0 - (1.0 - wSwim) * (1.0 - wManual) * (1.0 - wSweat);
+					}
 					// (47f) The character's own rain level, a little less on surfaces that face down; not sky-occluded again.
 					const float gearRain = saturate(Skin::wetSkinParams[0].w) * lerp(0.8, 1.0, saturate(worldNormal.z * 0.5 + 0.5));
 					charDryWetness = 1.0 - (1.0 - charDryWetness) * (1.0 - gearRain);
@@ -3602,15 +3618,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				const float cellsPerUV = 230.0 / clamp(Skin::wetSkinParams[3].x, 0.25, 4.0);
 				const float footprint = max(uvFootprint * cellsPerUV, 1e-6);
 				// Beads are about 0.3 cell in radius: fade them out below ~1.5 pixels (no DLSS sparkle).
-				const float dropVisibility = smoothstep(1.0, 2.5, 0.3 / footprint) * gearDetailLOD;
+				const float dropVisibility = Skin::WetDropVisibility(footprint) * gearDetailLOD;  // (47g) Physical: a coarse early-out, each bead fades by its own size
 				const float restFactor = lerp(0.7, 1.2, saturate(baseN.z * 0.5 + 0.5));
 				float streakDriver = max(smoothstep(0.2, 0.85, dropOthers), charRainPart);
 				[branch] if (Skin::WetPhysical())
 				{
 					// (47f) The character's droplet / rivulet drivers from the CPU, gated by this pixel's own wetness.
+					// (47g) Gear: without sweat's (no sweat beads or trails on cloth, leather or metal).
 					const float gate = Skin::WetPhysicalGate(wChar);
-					dropDriver = saturate(Skin::wetSkinPerGeometry.w) * gate;
-					streakDriver = saturate(Skin::wetCharPerGeometry.w) * gate;
+					const float2 gearDrivers = Skin::WetGearDrivers().xy;
+					dropDriver = gearDrivers.x * gate;
+					streakDriver = gearDrivers.y * gate;
 				}
 				const float presence = dropDensity * dropDriver * restFactor * (dropVisibility > 0.0 ? 1.0 : 0.0);
 				const Skin::WetSkinDetail detail = Skin::WetSkinDroplets(uv * cellsPerUV, footprint, gravityUV, alignment, presence, streakDriver);

@@ -230,6 +230,11 @@ struct WetSkin : Feature
 		float sizeRandom = 1.0f;  // x Size Variation (wetSkinParams[3].y)
 		float beadTrails = 1.0f;  // x Droplet Trails (wetSkinParams[4].x)
 		float dome = 1.0f;        // x Droplet Normal Strength (wetSkinParams[5].z)
+		// (47g) Gear and hair: sweat (and the manual Sweat look) makes no beads or trails there, only wicking darkening and
+		// a gloss change. The drivers of the other sources, and the flag, packed into wetCharParams[3].w (PackGearDrivers).
+		float gearBeads = 0.0f;
+		float gearTrails = 0.0f;
+		bool manualSweat = false;
 	};
 	/// Per frame, shared by every character.
 	struct PhysicalFrame
