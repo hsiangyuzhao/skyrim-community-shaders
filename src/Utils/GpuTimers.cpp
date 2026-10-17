@@ -84,11 +84,11 @@ namespace Util
 				"older copy and composite passes." },
 			{ "Local Exposure",
 				"GPU time for Post Processing > Local Exposure, all of its passes. Not counted in the Post Processing row." },
-			{ "Volumetric Fog (near)",
-				"GPU time for the detailed near grid of Volumetric Fog: finding where the scene is, the fog medium, "
-				"lighting every fog cell by the sun, sky and nearby lights, and adding it up along each view ray." },
-			{ "Volumetric Fog (far)",
-				"GPU time for the coarse far grid of Volumetric Fog, the same four passes. No local lights out here." },
+			{ "Volumetric Fog: Lighting (near)",
+				"GPU time for lighting every fog cell of the detailed near grid by the sun, sky and nearby lights (the light "
+				"scattering pass). The other Volumetric Fog passes have their own rows." },
+			{ "Volumetric Fog: Lighting (far)",
+				"GPU time for lighting every fog cell of the coarse far grid (no local lights out here)." },
 			{ "Volumetric Shadows",
 				"GPU time for the small blurred sun shadow map that lets smoke and other effects darken in shadow." },
 			{ "Snow Footprints",
@@ -151,6 +151,14 @@ namespace Util
 			{ "RT Wait for Point Lights",
 				"With Split Trace Sync: how long the game's GPU queue stood still waiting for the ray-traced point-light shadows, after the "
 				"sun's shadow was already merged (RT Wait for Trace is then the wait for the sun alone). Ideally about 0." },
+			{ "Volumetric Fog: Depth",
+				"GPU time for finding where the scene is in each fog column (conservative depth), near and far grids together." },
+			{ "Volumetric Fog: Medium",
+				"GPU time for filling every fog cell with its density (height fog, weather fog layer, noise), near and far grids together." },
+			{ "Volumetric Fog: Integration",
+				"GPU time for adding the lit fog up along each view ray, near and far grids together." },
+			{ "Volumetric Fog: History",
+				"GPU time for keeping this frame's fog for the next one (temporal reprojection copies)." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

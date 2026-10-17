@@ -53,8 +53,8 @@ namespace Util
 		// (batch 38, part B) Split out of their parent rows so the new passes show their own cost.
 		SubsurfaceScatteringPrepass,  // SSS upgrade: albedo-removal pre-pass
 		LocalExposure,                // Post Processing > Local Exposure (taken out of the Post Processing row)
-		VolumetricFogNear,       // (batch 38) volumetric fog near grid: conservative depth + medium + light scattering + integration
-		VolumetricFogFar,        // (batch 38) volumetric fog far grid, same four passes
+		VolumetricFogNear,       // (batch 38) volumetric fog near grid; (47f) its light scattering pass only
+		VolumetricFogFar,        // (batch 38) volumetric fog far grid; (47f) its light scattering pass only
 		VolumetricShadows,       // (batch 38) sun VSM for smoke and effects: downsample + 11x11 blur
 		SnowTrails,              // (batch 39) Dynamic Snow footprint map: scroll clear + refill + prints
 		// (batch 42a) Neural Rendering split three ways on the D3D11 timeline (the Batch 38 path):
@@ -92,6 +92,12 @@ namespace Util
 		RayTracingAOSync,
 		// (46m) Split Trace Sync: the wait for the point lights (the sun's part stays in RayTracingSync).
 		RayTracingSyncPoint,
+		// (47f) Volumetric fog split per pass (for 47g). VolumetricFogNear / VolumetricFogFar above are now the light
+		// scattering pass of each grid only; these take the rest (near + far intervals in one bucket each).
+		VolumetricFogDepth,      // conservative depth (both grids)
+		VolumetricFogMaterial,   // medium set-up (both grids)
+		VolumetricFogIntegrate,  // integration along the view rays (both grids)
+		VolumetricFogHistory,    // the temporal history copies (light scattering + conservative depth)
 		Count
 	};
 

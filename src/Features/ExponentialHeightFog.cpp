@@ -775,22 +775,25 @@ void ExponentialHeightFog::Prepass()
         const uint32_t groupZ = (a_pass.gridSize.z + 3) / 4;
         ID3D11UnorderedAccessView* nullUav = nullptr;
 
-        timers->Begin(a_pass.bucket);
-
+        // (47f) One GPU interval per pass (F7 vf_* columns), so 47g can see where the time goes.
         if (depthSrv) {
+            timers->Begin(Util::GpuBucket::VolumetricFogDepth);
             ID3D11UnorderedAccessView* uav = a_pass.conservativeDepth->uav.get();
             context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
             context->CSSetShader(a_pass.conservativeDepthCS, nullptr, 0);
             context->Dispatch(groupX, groupY, 1);
             context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+            timers->End(Util::GpuBucket::VolumetricFogDepth);
         }
 
         {
+            timers->Begin(Util::GpuBucket::VolumetricFogMaterial);
             ID3D11UnorderedAccessView* uav = a_pass.vBuffer->uav.get();
             context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
             context->CSSetShader(a_pass.materialSetupCS, nullptr, 0);
             context->Dispatch(groupX, groupY, groupZ);
             context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+            timers->End(Util::GpuBucket::VolumetricFogMaterial);
         }
 
         {
@@ -804,16 +807,19 @@ void ExponentialHeightFog::Prepass()
             // u1: (47e) the readout froxel (near grid only; the far shader has no u1).
             ID3D11UnorderedAccessView* uavs[2]{ a_pass.scattering->uav.get(), a_pass.debugReadout && volumetricDebug ? volumetricDebug->uav.get() : nullptr };
             ID3D11UnorderedAccessView* nullUavs[2]{};
+            timers->Begin(a_pass.bucket);  // (47f) the light scattering pass of this grid
             context->CSSetShaderResources(0, 5, srvs);
             context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
             context->CSSetShader(a_pass.lightScatteringCS, nullptr, 0);
             context->Dispatch(groupX, groupY, groupZ);
             context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+            timers->End(a_pass.bucket);
         }
 
         {
             ID3D11ShaderResourceView* srvs[5]{ a_pass.scattering->srv.get(), nullptr, nullptr, nullptr, nullptr };
             ID3D11UnorderedAccessView* uav = a_pass.integrated->uav.get();
+            timers->Begin(Util::GpuBucket::VolumetricFogIntegrate);
             context->CSSetShaderResources(0, 5, srvs);
             context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
             context->CSSetShader(a_pass.integrationCS, nullptr, 0);
@@ -821,9 +827,8 @@ void ExponentialHeightFog::Prepass()
             context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
             srvs[0] = nullptr;
             context->CSSetShaderResources(0, 1, srvs);
+            timers->End(Util::GpuBucket::VolumetricFogIntegrate);
         }
-
-        timers->End(a_pass.bucket);
     };
 
     const bool nearDepthHistory = depthSrv && temporalHistoryValid && hasConservativeDepthHistory;
@@ -871,6 +876,7 @@ void ExponentialHeightFog::Prepass()
     context->CSSetShader(nullptr, nullptr, 0);
 
     if (temporalReprojection) {
+        timers->Begin(Util::GpuBucket::VolumetricFogHistory);  // (47f)
         context->CopyResource(lightScatteringHistory->resource.get(), lightScattering->resource.get());
         hasLightScatteringHistory = true;
         if (depthSrv) {
@@ -892,6 +898,7 @@ void ExponentialHeightFog::Prepass()
             hasLightScatteringFarHistory = false;
             hasConservativeDepthFarHistory = false;
         }
+        timers->End(Util::GpuBucket::VolumetricFogHistory);
     } else {
         hasLightScatteringHistory = false;
         hasConservativeDepthHistory = false;

@@ -1,5 +1,6 @@
 #include "Utils/FrameTrace.h"
 
+#include "Features/ExponentialHeightFog.h"
 #include "Features/PerformanceOverlay.h"
 #include "Features/RayTracing.h"
 #include "Features/ScreenSpaceGI.h"
@@ -466,6 +467,9 @@ namespace Util::FrameTrace
 			// (46e) Screen-space GI / reflections per pass (last GPU samples, -1 = the pass is off): SSRT REBLUR,
 			// SSRT diffuse trace, SSRT specular trace, SSGI, SSGI contact AO.
 			float ssPassMs[5]{ -1.0f, -1.0f, -1.0f, -1.0f, -1.0f };
+			// (47f) Volumetric fog per pass: depth, medium, lighting near, lighting far, integration, history (-1 = not built).
+			float vfPassMs[6]{ -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f };
+			uint32_t vfGrid[4]{};  // near x, y, z, far z (0 = far grid off)
 			// (46l) World-render split, other blocking D3D11 calls, Map on other contexts.
 			WorldTiming::Frame world;
 			float driverMiscMs = 0.0f;
@@ -787,6 +791,22 @@ namespace Util::FrameTrace
 			a_row.ssPassMs[2] = sample(specular, Util::GpuBucket::SSRTTraceSpecular);
 			a_row.ssPassMs[3] = sample(ssgi.loaded && ssgi.settings.Enabled, Util::GpuBucket::SSGI);
 			a_row.ssPassMs[4] = sample(ssgi.loaded && ssgi.settings.Enabled && ssgi.settings.EnableContactAo && ssgi.contactAoActive, Util::GpuBucket::SSGIContactAO);
+			// (47f) Volumetric fog passes: built within the last few frames (LastSampleMs is -1 once a bucket has gone quiet).
+			const auto& ehf = globals::features::exponentialHeightFog;
+			const bool vf = ehf.loaded && ehf.lastBuildFrame != UINT32_MAX && globals::state && globals::state->frameCount - ehf.lastBuildFrame < 8;
+			const bool vfFar = vf && ehf.currentFarGridSize.z > 0 && timers->LastSampleMs(Util::GpuBucket::VolumetricFogFar) >= 0.0f;
+			a_row.vfPassMs[0] = sample(vf, Util::GpuBucket::VolumetricFogDepth);
+			a_row.vfPassMs[1] = sample(vf, Util::GpuBucket::VolumetricFogMaterial);
+			a_row.vfPassMs[2] = sample(vf, Util::GpuBucket::VolumetricFogNear);
+			a_row.vfPassMs[3] = sample(vfFar, Util::GpuBucket::VolumetricFogFar);
+			a_row.vfPassMs[4] = sample(vf, Util::GpuBucket::VolumetricFogIntegrate);
+			a_row.vfPassMs[5] = sample(vf, Util::GpuBucket::VolumetricFogHistory);
+			if (vf) {
+				a_row.vfGrid[0] = ehf.currentGridSize.x;
+				a_row.vfGrid[1] = ehf.currentGridSize.y;
+				a_row.vfGrid[2] = ehf.currentGridSize.z;
+				a_row.vfGrid[3] = vfFar ? ehf.currentFarGridSize.z : 0u;
+			}
 		}
 
 		void WriteCsv(std::vector<Row> a_rows, std::unordered_map<uint64_t, ReflexTimes> a_reflex, std::string a_location, std::string a_rayTracing, std::string a_tag,
@@ -985,6 +1005,10 @@ namespace Util::FrameTrace
 				out << "#   -1 = no Reflex report for the row.\n";
 				out << "# (46x) rt_pl_fill_direct / fill_ambient = fill lights traced as direct light / left untraced; rt_pl_portal_away / dropped /\n";
 				out << "#   boxed = room-bound lights behind a portal / of which not traced / ranked only inside their rooms' box (-1 = no point-light trace).\n";
+				out << "# (47f) vf_*_gpu_ms = Volumetric Fog per pass, last GPU sample (a few frames old; -1 = not built): depth = conservative depth,\n";
+				out << "#   material = the medium (height fog, weather layer, noise), scatter_near / scatter_far = lighting the cells of each grid (sun with\n";
+				out << "#   shadows, sky, local lights near only), integrate = adding up along the view rays, history = the temporal copies. depth, material\n";
+				out << "#   and integrate hold both grids. vf_grid_* = near grid x, y, slices and far grid slices (0 = far grid off).\n";
 				out << "frame,t_ms,frame_ms,cpu_frame_ms,cpu_busy_ms,present_wait_ms,reflex_sleep_ms,"
 					   "driver_draw_ms,driver_map_ms,driver_upload_ms,driver_dispatch_ms,driver_flush_ms,driver_total_ms,"
 					   "own_draw_hook_ms,own_setup_geometry_ms,perm_cb_upload_ms,draws,lighting_draws,utility_draws,own_per_draw_us,"
@@ -1041,7 +1065,9 @@ namespace Util::FrameTrace
 					   "rt_bud_static_queued,rt_bud_groups_deferred,rt_bud_groups_kept,snow_shapes_ms,snow_shapes_state,rr_b,rr_c,rr_width,rr_height,"
 					   "vram_by_feature,rtao_filter,rtao_detail_rays,rtao_detail_len,rtao_normal_guided,rtao_alpha_budget,"
 					   "pcl_est_input_ms,pcl_est_input_measured,pcl_est_render_ms,pcl_est_fg_mult,pcl_est_fg_hold_ms,pcl_est_refresh_hz,pcl_est_queue_ms,pcl_est_ms,"
-					   "rt_pl_fill_direct,rt_pl_fill_ambient,rt_pl_portal_away,rt_pl_portal_dropped,rt_pl_portal_boxed\n";
+					   "rt_pl_fill_direct,rt_pl_fill_ambient,rt_pl_portal_away,rt_pl_portal_dropped,rt_pl_portal_boxed,"
+					   "vf_depth_gpu_ms,vf_material_gpu_ms,vf_scatter_near_gpu_ms,vf_scatter_far_gpu_ms,vf_integrate_gpu_ms,vf_history_gpu_ms,"
+					   "vf_grid_x,vf_grid_y,vf_grid_z,vf_grid_far_z\n";
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1205,6 +1231,10 @@ namespace Util::FrameTrace
 					if (!extra.empty() && extra.back() == '\n')
 						extra.pop_back();
 					extra += std::format(",{},{},{},{},{}\n", r.rt.plFillDirect, r.rt.plFillAmbient, r.rt.plPortalAway, r.rt.plPortalDropped, r.rt.plPortalBoxed);
+					// (47f) Volumetric fog per pass, after rt_pl_portal_boxed (the old last column).
+					extra.pop_back();
+					extra += std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{}\n", r.vfPassMs[0], r.vfPassMs[1], r.vfPassMs[2], r.vfPassMs[3], r.vfPassMs[4],
+						r.vfPassMs[5], r.vfGrid[0], r.vfGrid[1], r.vfGrid[2], r.vfGrid[3]);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;

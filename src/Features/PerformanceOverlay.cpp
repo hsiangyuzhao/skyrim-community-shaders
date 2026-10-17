@@ -295,9 +295,17 @@ namespace
 		case B::LocalExposure:
 			return "Local exposure";
 		case B::VolumetricFogNear:
-			return "Volumetric fog (near)";
+			return "Volumetric fog: lighting (near)";
 		case B::VolumetricFogFar:
-			return "Volumetric fog (far)";
+			return "Volumetric fog: lighting (far)";
+		case B::VolumetricFogDepth:
+			return "Volumetric fog: depth";
+		case B::VolumetricFogMaterial:
+			return "Volumetric fog: medium";
+		case B::VolumetricFogIntegrate:
+			return "Volumetric fog: integration";
+		case B::VolumetricFogHistory:
+			return "Volumetric fog: history copies";
 		case B::VolumetricShadows:
 			return "Shadows for smoke and effects";
 		case B::SnowTrails:
