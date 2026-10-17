@@ -161,6 +161,12 @@ public:
 	bool DoesCurrentSettingsMatchPreset(ClimatePreset preset) const;
 	void DetectCurrentPreset();
 
+	/// (47f) Rain falling on characters this frame for Character Wetness (Physical), 0..1: the precipitation's
+	/// intensity (particle density / MAX_RAIN_PARTICLE_DENSITY, blended across a weather change) x how far the rain
+	/// has faded in (the same fade the world's wetness follows). Honours the debug overrides; 0 without the full sky,
+	/// with Wetness Effects off, or when nothing rains. Has no side effects (GetCommonBufferData advances the rain clock).
+	float GetCharacterRainIntensity() const;
+
 private:
 	void DrawWeatherAnalysis() const;
 

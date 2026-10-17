@@ -705,8 +705,8 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 			state.timeOut = std::min(state.timeOut + dt, 1e6f);
 			const float t = std::clamp((state.timeOut - hold) / dry, 0.0f, 1.0f);
 			swim = 1.0f - t * t * (3.0f - 2.0f * t);
-			// (44c) The water line is kept until the slowest class (hair, cloth ...) is dry too.
-			if (state.timeOut >= allDry)
+			// (44c) The water line is kept until the slowest class (hair, cloth ...) is dry too. (47f) Physical: below.
+			if (state.timeOut >= allDry && !globals::features::wetSkin.IsPhysical())
 				state.maxDepth = 0.0f;
 		}
 		state.wetSkin = float4(swim, state.maxDepth, inWater ? 1.0f : 0.0f, 0.0f);
@@ -729,6 +729,7 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 		            (staminaPercentage <= settings.FullSweat)  ? 1.0f :
 		                                                         (settings.StartSweat - staminaPercentage) / (settings.StartSweat - settings.FullSweat);
 	}
+	const float exertion = std::isfinite(wetness.x) ? std::clamp(wetness.x, 0.0f, 1.0f) : 0.0f;  // (47f) Physical: the sweat source
 	wetness.y = inWater ? 2.0f : 0.0f;
 	wetness.w = depth;
 
@@ -769,6 +770,38 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 	}
 	state.skin = wetness;
 	state.valid = true;
+
+	// (47f) Character Wetness Physical: sweat, rain and swim water advanced here, once per character per frame, and
+	// turned into the per-source look the shader gets (BSLightingShader_SetupGeometry).
+	if (auto& wetSkin = globals::features::wetSkin; wetSkin.IsPhysical()) {
+		const auto& env = wetSkin.GetPhysicalFrame();
+		const auto* cell = actor->GetParentCell();
+		const bool outdoors = cell && !cell->IsInteriorCell();
+		WetSkin::PhysicalInput in;
+		in.dt = dt;
+		in.exertion = exertion;
+		in.inWater = inWater;
+		// Open sky: a Havok ray up from the head (player every 0.25 s, others every 1 s), only while it rains.
+		in.exposure = (outdoors && env.rainIntensity > 0.0f && !IsSheltered(actor, state.shelter, actor->IsPlayerRef() ? 250.0 : 1000.0)) ? 1.0f : 0.0f;
+		float cold = outdoors ? env.snowing : 0.0f;
+		if (outdoors && globals::features::dynamicSnow.loaded) {
+			const auto pos = actor->GetPosition();
+			const float mapCold = globals::features::dynamicSnow.ColdnessAt(pos.x, pos.y, pos.z);
+			if (mapCold >= 0.0f)
+				cold = std::max(cold, mapCold);
+		}
+		in.cold = cold;
+		wetSkin.UpdatePhysical(state.phys, in);
+		state.look = wetSkin.GetPhysicalLook(state.phys);
+		const float allDry = (state.look.evapTime + 6.0f * state.look.runoffTime) * wetSkin.MaxDryMultiplier();
+		if (!inWater && state.look.swimClock >= allDry)
+			state.maxDepth = 0.0f;
+		state.skin.x = state.look.sweat;
+		state.wetSkin = float4(state.look.swim, state.maxDepth, inWater ? 1.0f : 0.0f, state.look.beads);
+		state.wetChar = float4(inWater ? 0.0f : std::min(state.look.swimClock, allDry + 1.0f), 0.0f, inWater ? 1.0f : 0.0f, state.look.trails);
+	} else {
+		state.phys.valid = false;  // a later switch to Physical starts afresh
+	}
 
 	lastWetState = &state;
 	o_wetSkin = state.wetSkin;
@@ -1134,6 +1167,24 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 			perGeometryData.wetSkinParams[i] = wetSkinParamsCache[i];
 		for (int i = 0; i < 12; ++i)
 			perGeometryData.wetCharParams[i] = wetCharParamsCache[i];
+		// (47f) Physical: this character's levels and look ride in the same parameters (no extra GPU data).
+		if (lastWetState && wetSkin.IsPhysical() && lastWetState->phys.valid) {
+			const auto& look = lastWetState->look;
+			auto& p = perGeometryData.wetSkinParams;
+			auto& c = perGeometryData.wetCharParams;
+			p[0].y = std::clamp(look.manualWater, 0.0f, 1.0f);
+			p[0].w = std::clamp(look.rain, 0.0f, 1.0f);
+			p[1].w = std::clamp(p[1].w * look.film, 0.0f, 2.5f);
+			p[2].w = std::clamp(p[2].w * look.density, 0.0f, 1.0f);
+			p[3].x = std::clamp(p[3].x * look.size, 0.25f, 4.0f);
+			p[3].y = std::clamp(p[3].y * look.sizeRandom, 0.0f, 1.0f);
+			p[4].x = std::clamp(p[4].x * look.beadTrails, 0.0f, 1.0f);
+			p[5].z = std::clamp(p[5].z * look.dome, 0.0f, 2.0f);
+			c[0].x = std::clamp(look.runoffTime, 0.1f, 600.0f);
+			c[0].y = std::clamp(look.evapTime, 1.0f, 1e6f);
+			c[11].z = std::clamp(look.peak, 0.0f, 1.0f);
+			c[11].w = std::clamp(look.oil, 0.0f, 1.0f);
+		}
 		// (44f) Item class prior from the keywords of the worn item this geometry belongs to.
 		if (lastWetState && !wetSkin.IsOriginal() && wetSkin.settings.GearEnabled && wetSkin.settings.GearModel == 0 && wetSkin.settings.GearKeywords) {
 			auto userData = geometry->GetUserData();

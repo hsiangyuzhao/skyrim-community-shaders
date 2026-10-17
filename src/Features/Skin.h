@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Features/WetSkin.h"  // (47f) WetSkin::PhysicalState / PhysicalLook in ActorWetState
+
 struct Skin : Feature
 {
 	static Skin* GetSingleton()
@@ -199,6 +201,11 @@ struct Skin : Feature
 		uint32_t itemClassFrame = 0;
 		bool itemClassValid = false;
 		bool animal = false;
+		// (47f) Character Wetness Physical: this character's water and its look this frame; the shelter test for the rain
+		// (its own throttle, apart from the snow's).
+		WetSkin::PhysicalState phys;
+		WetSkin::PhysicalLook look;
+		ActorSnow shelter;
 	};
 	/// (44f) Item class prior (0 unknown, 1 cloth, 2 leather, 3 metal, 4 fur) of one geometry of a
 	/// character, from the keywords of the worn item it belongs to (rebuilt on a miss, at most

@@ -649,6 +649,19 @@ void DynamicSnow::BuildColdMask()
 	}
 }
 
+float DynamicSnow::ColdnessAt(float a_x, float a_y, float a_z) const
+{
+	if (!loaded || coldMaskCPU.empty() || coldMapW == 0 || coldMapH == 0)
+		return -1.0f;
+	float cold = std::clamp(SampleColdMaskCPU(a_x, a_y), 0.0f, 1.0f);
+	if (settings.SnowLineHeight > 0.0f) {
+		const float start = settings.SnowLineHeight - std::max(settings.SnowLineFade, 1.0f);
+		const float t = std::clamp((a_z - start) / std::max(settings.SnowLineHeight - start, 1.0f), 0.0f, 1.0f);
+		cold = std::max(cold, t * t * (3.0f - 2.0f * t));
+	}
+	return cold;
+}
+
 float DynamicSnow::SampleColdMaskCPU(float a_x, float a_y) const
 {
 	if (coldMaskCPU.empty() || coldMapW == 0 || coldMapH == 0)

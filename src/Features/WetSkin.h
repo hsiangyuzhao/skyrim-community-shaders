@@ -50,15 +50,38 @@ struct WetSkin : Feature
 		};
 	}
 
+	/// Saved values. (47f) Shown as Legacy (1) / Simple (0, the 44a-47e "Advanced" model, unchanged) / Physical (2).
 	enum class Model : uint32_t
 	{
 		New = 0,
 		Original = 1,
+		Physical = 2,
+	};
+
+	/// (47f) Physical: "Manual Look", what the manual slider puts on the skin.
+	enum class ManualLook : uint32_t
+	{
+		Sweat = 0,
+		Rain = 1,
+		Swim = 2,
+		Oil = 3,
 	};
 
 	struct Settings
 	{
-		uint32_t Model = 0;  // 0 = New, 1 = Original (pre-42c)
+		uint32_t Model = 0;  // 0 = New (Simple), 1 = Original (Legacy, pre-42c), 2 = Physical (47f)
+
+		// (47f) Physical model: per-character sweat / rain / swim levels with their own wetting and drying on the CPU
+		// (WetSkin::UpdatePhysical), each source with its own look (beads, trails, film). Multipliers, 1 = the base
+		// rates derived from Hold / Dry-off Time.
+		float SweatBuildup = 1.0f;
+		float SweatDrying = 1.0f;
+		float RainWetting = 1.0f;
+		float RainDrying = 1.0f;
+		float SwimDrying = 1.0f;
+		float MaxRainWetness = 0.8f;  // wetness that only the heaviest rain reaches on an exposed character
+		uint32_t ManualLookType = 0;  // ManualLook
+		bool OilRepelsWater = true;
 
 		// (47c) Performance, both on by default; both off = 47b exactly. Not part of presets.
 		// SkipInvisibleWork: leave out work whose result is multiplied by 0 (same picture): faded
@@ -169,6 +192,72 @@ struct WetSkin : Feature
 	GPUParams GetGPUParams() const;
 
 	bool IsOriginal() const { return settings.Model == static_cast<uint32_t>(Model::Original); }
+	/// (47f) The Physical model (a superset of Simple: every "!IsOriginal()" path applies to it too).
+	bool IsPhysical() const { return settings.Model == static_cast<uint32_t>(Model::Physical); }
+
+	// ---- (47f) Physical model -----------------------------------------------------------------------
+	/// One character's water, advanced on the CPU once per frame (Skin::GetWetness).
+	struct PhysicalState
+	{
+		bool valid = false;
+		float heat1 = 0.0f;     // exertion through two first-order lags: the onset of sweating and its after-run
+		float heat2 = 0.0f;
+		float sweat = 0.0f;     // 0..1 sweat on the skin (production = evaporation at equilibrium)
+		float rain = 0.0f;      // 0..Max Rain Wetness, rain water on the character
+		float swimRun = 1e6f;   // s since leaving the water, x Swim Drying (runoff clock; 0 in the water)
+		float swimEvap = 1e6f;  // the same, x the evaporation environment (evaporation clock)
+		bool wasInWater = false;
+		float exposure = 0.0f;  // last rain exposure (0 sheltered / indoors, 1 open sky), for the status line
+		float evaporation = 1.0f;  // last evaporation environment factor (1 = neutral)
+	};
+	/// What a Physical character hands the shader on top of the frame's GPUParams (Skin::BSLightingShader_SetupGeometry).
+	struct PhysicalLook
+	{
+		float swim = 0.0f;        // skin swim level (wetSkinPerGeometry.x)
+		float swimClock = 1e6f;   // runoff clock (wetCharPerGeometry.x; hair and gear divide it by their dry multiplier)
+		float runoffTime = 10.0f; // wetCharParams[0].x
+		float evapTime = 170.0f;  // wetCharParams[0].y: the evaporation time on the runoff clock
+		float sweat = 0.0f;       // skinPerGeometry.x
+		float rain = 0.0f;        // wetSkinParams[0].w: the rain level itself
+		float manualWater = 0.0f; // wetSkinParams[0].y (0 when the manual look is Oil)
+		float oil = 0.0f;         // wetCharParams[11].w
+		float peak = 0.0f;        // wetCharParams[11].z: the character's strongest source (droplet gate)
+		float beads = 0.0f;       // wetSkinPerGeometry.w: droplet driver
+		float trails = 0.0f;      // wetCharPerGeometry.w: rivulet driver
+		float film = 1.0f;        // x Wet Look Strength (wetSkinParams[1].w)
+		float density = 1.0f;     // x Droplet Density (wetSkinParams[2].w)
+		float size = 1.0f;        // x Droplet Size (wetSkinParams[3].x)
+		float sizeRandom = 1.0f;  // x Size Variation (wetSkinParams[3].y)
+		float beadTrails = 1.0f;  // x Droplet Trails (wetSkinParams[4].x)
+		float dome = 1.0f;        // x Droplet Normal Strength (wetSkinParams[5].z)
+	};
+	/// Per frame, shared by every character.
+	struct PhysicalFrame
+	{
+		uint32_t frame = UINT32_MAX;
+		float rainIntensity = 0.0f;  // 0..1 (Wetness Effects)
+		float snowing = 0.0f;        // 0..1 snow weather share
+	};
+	/// Inputs of one character this frame.
+	struct PhysicalInput
+	{
+		float dt = 0.0f;        // game seconds since the last update
+		float exertion = 0.0f;  // the sweat source (stamina or Dynamic Wetness), 0..1
+		bool inWater = false;
+		float exposure = 0.0f;  // 0 sheltered / indoors .. 1 under the open sky
+		float cold = 0.0f;      // 0..1 (cold-region map / snow line / snow weather)
+	};
+	const PhysicalFrame& GetPhysicalFrame();
+	/// Advances a character's sweat, rain and swim water (exact exponential steps, any dt).
+	void UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) const;
+	/// Turns the levels into the per-source look (CPU, once per character per frame).
+	PhysicalLook GetPhysicalLook(const PhysicalState& a_state) const;
+	/// The base times the multipliers scale: runoff (s), evaporation of a soaked skin (s, = Hold + Dry-off Time).
+	float PhysicalRunoffTime() const;
+	float PhysicalEvaporationTime() const;
+	/// Swim level of a class with a_dryMult at runoff clock a_run (the shader's CharSwimClass, Physical branch).
+	static float PhysicalSwimLevel(float a_run, float a_runoffTime, float a_evapTime, float a_dryMult);
+	static constexpr float kRunoffShare = 0.45f;  // share of a soaked skin's water that runs off rather than evaporates
 
 	virtual void DrawSettings() override;
 	virtual void LoadSettings(json& o_json) override;
@@ -193,6 +282,8 @@ struct WetSkin : Feature
 	static std::string SanitizePresetName(const std::string& a_name);
 
 private:
+	PhysicalFrame physicalFrame;
+	void DrawStatus();
 	void DrawPresets();
 	/// (47b) Overwrite / Delete / Rename / Save as New, in the "Manage Presets" node under "Presets".
 	void DrawManagePresets(bool a_selected);

@@ -277,6 +277,9 @@ public:
 	/// (46a) Per-character snow is in use this frame: accumulation and Snow on Characters on, the
 	/// build-up switch on, and Advanced Skin loaded and enabled (it owns the per-character state and b7).
 	[[nodiscard]] bool CharacterSnowStateActive() const;
+	/// (47f) How cold it is at a world position for Character Wetness (Physical): the cold-region mask (blurred, 0..1)
+	/// and the snow line, the larger. -1 when there is no cold map (not loaded, no worldspace map built yet).
+	[[nodiscard]] float ColdnessAt(float a_x, float a_y, float a_z) const;
 	/// (46a) The amount drawn this frame (the accumulated amount, or the debug override): the cap of
 	/// every character's own snow.
 	[[nodiscard]] float DrawnAmount() const { return settings.OverrideAmount ? std::clamp(settings.AmountOverride, 0.0f, 1.0f) : amount; }

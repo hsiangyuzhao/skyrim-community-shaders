@@ -798,6 +798,27 @@ void WetnessEffects::ApplyClimatePreset(ClimatePreset preset)
 	// Removed clamping for all settings to allow full preset range
 }
 
+float WetnessEffects::GetCharacterRainIntensity() const
+{
+	if (!loaded || !settings.EnableWetnessEffects)
+		return 0.0f;
+	auto sky = globals::game::sky;
+	if (!sky || sky->mode.get() != RE::Sky::Mode::kFull)
+		return 0.0f;
+	float raining = 0.0f;
+	if (auto precip = sky->precip) {
+		const float current = (precip->currentPrecip && sky->currentWeather) ? GetRainIntensity(precip->currentPrecip, sky->currentWeather) : 0.0f;
+		const float last = (precip->lastPrecip && sky->lastWeather) ? GetRainIntensity(precip->lastPrecip, sky->lastWeather) : 0.0f;
+		raining = current * sky->currentWeatherPct + last * (1.0f - sky->currentWeatherPct);
+	}
+	const float fade = std::min(1.0f, CalculateWeatherWetness(sky->currentWeather, sky->currentWeatherPct, true).wetness +
+										  CalculateWeatherWetness(sky->lastWeather, sky->currentWeatherPct, false).wetness);
+	if (debugSettings.EnableRainOverride)
+		raining = debugSettings.RainOverride.y;
+	const float intensity = std::clamp(raining, 0.0f, 1.0f) * (debugSettings.EnableWetnessOverride ? std::clamp(debugSettings.WetnessOverride.y, 0.0f, 1.0f) : fade);
+	return std::isfinite(intensity) ? intensity : 0.0f;
+}
+
 WetnessEffects::PerFrame WetnessEffects::GetCommonBufferData() const
 {
 	PerFrame data{};

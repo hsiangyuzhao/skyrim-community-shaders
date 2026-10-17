@@ -54,10 +54,33 @@ namespace Skin
 		return s.x;
 	}
 
-	// (44a) Wet Skin model: New (1) or Original (0).
+	// (44a) Wet Skin model: New (1) or Original (0). (47f) Physical (2) is a New model too.
 	bool WetSkinNewModel()
 	{
 		return wetSkinParams[0].x > 0.5;
+	}
+
+	// (47f) Character Wetness "Physical": the CPU keeps each character's sweat, rain and swim water and hands over its
+	// look in the same parameters (WetSkin::PhysicalLook, Skin::BSLightingShader_SetupGeometry):
+	//   wetSkinParams[0].w = the rain level itself (not a weight), wetSkinParams[0].y = manual water (0 for oil),
+	//   wetSkinPerGeometry.w = droplet driver, wetCharPerGeometry.w = rivulet driver, wetCharParams[0].xy = runoff /
+	//   evaporation time, wetCharParams[11].z = the character's strongest source (droplet gate), [11].w = oil.
+	bool WetPhysical()
+	{
+		return wetSkinParams[0].x > 1.5;
+	}
+
+	/// (47f) Physical: how much of the character's droplet / rivulet driver this pixel gets: its own wetness against
+	/// the character's strongest source (below a water line, a sweatier forehead ...).
+	float WetPhysicalGate(float pixelWetness)
+	{
+		return saturate(pixelWetness / max(wetCharParams[11].z, 0.02));
+	}
+
+	/// (47f) Physical, Manual Look "Oil": the oil on the skin, 0..1 (0 in every other model).
+	float WetOil()
+	{
+		return WetPhysical() ? saturate(wetCharParams[11].w) : 0.0;
 	}
 
 	// (47c) "Wetness: Skip Invisible Work" (wetCharParams[11].x): leave out work whose result is
@@ -107,6 +130,15 @@ namespace Skin
 		progress = 0.0;
 		if (wetCharPerGeometry.z > 0.5)
 			return 1.0;
+		// (47f) Physical: the runoff (45 % of a soaked skin's water, within seconds) and the evaporation of the rest, both
+		// slower by this class's dry multiplier (WetSkin::PhysicalSwimLevel).
+		[branch] if (WetPhysical())
+		{
+			const float tp = max(wetCharPerGeometry.x, 0.0) / max(dryMult, 0.25);
+			const float evaporated = saturate(tp / max(wetCharParams[0].y, 1.0));
+			progress = evaporated;
+			return 0.45 * exp(-tp / max(wetCharParams[0].x, 0.1)) + 0.55 * (1.0 - evaporated);
+		}
 		const float hold = max(wetCharParams[0].x, 0.0) * dryMult;
 		const float dry = max(wetCharParams[0].y * dryMult, 1.0);
 		const float t = saturate((wetCharPerGeometry.x - hold) / dry);
@@ -222,6 +254,8 @@ namespace Skin
 		float WetDropletRoughness;
 		float WetIndirectRoughness;
 		float WetIndirectEnergy;
+		// (47f) The film's F0 (water 0.02; a Physical oil film a little more), direct lobe and the New indirect lobe.
+		float WetF0;
 	};
 
 	SkinSurfaceProperties InitSkinSurfaceProperties()
@@ -247,6 +281,7 @@ namespace Skin
 		skin.WetDropletRoughness = 0.1;
 		skin.WetIndirectRoughness = 0.2;
 		skin.WetIndirectEnergy = -1.0;
+		skin.WetF0 = WATER_F0;
 		return skin;
 	}
 
@@ -388,9 +423,9 @@ namespace Skin
 			float WNdotV = saturate(abs(dot(WN, V)) + 1e-5);
 			float WNdotH = saturate(dot(WN, H));
 
-			float3 wetSpecular = PBR::GetSpecularDirectLightMultiplierMicrofacet(wetRoughness, WATER_F0, WNdotL, WNdotV, WNdotH, oVdotH, wetnessF) * light.LightColor * WNdotL;
+			float3 wetSpecular = PBR::GetSpecularDirectLightMultiplierMicrofacet(wetRoughness, skin.WetF0, WNdotL, WNdotV, WNdotH, oVdotH, wetnessF) * light.LightColor * WNdotL;
 			float2 wetSpecularBRDF = BRDF::EnvBRDFApproxLazarov(wetRoughness, WNdotV);
-			wetSpecular *= 1 + WATER_F0 * (1 / (wetSpecularBRDF.x + wetSpecularBRDF.y) - 1);
+			wetSpecular *= 1 + skin.WetF0 * (1 / (wetSpecularBRDF.x + wetSpecularBRDF.y) - 1);
 			const float waterTransmission = lerp(1.0, 1.0 - wetnessF.x, saturate(wetnessEnergy));
 			specular *= waterTransmission;
 			specular += wetSpecular * wetnessEnergy;
@@ -425,10 +460,10 @@ namespace Skin
 				const float wetRoughness = max(skin.WetIndirectRoughness, 0.2);
 				float WNdotV = saturate(dot(WN, V));
 				float2 wetSpecularBRDF = BRDF::EnvBRDF(wetRoughness, WNdotV);
-				wetSpecular += WATER_F0 * wetSpecularBRDF.x + wetSpecularBRDF.y;
-				wetSpecular *= 1 + WATER_F0 * (1 / (wetSpecularBRDF.x + wetSpecularBRDF.y) - 1);
+				wetSpecular += skin.WetF0 * wetSpecularBRDF.x + wetSpecularBRDF.y;
+				wetSpecular *= 1 + skin.WetF0 * (1 / (wetSpecularBRDF.x + wetSpecularBRDF.y) - 1);
 				wetSpecular *= wetnessEnergy;
-				waterTransmission = lerp(1.0, 1.0 - (WATER_F0 * wetSpecularBRDF.x + wetSpecularBRDF.y), wetnessEnergy);
+				waterTransmission = lerp(1.0, 1.0 - (skin.WetF0 * wetSpecularBRDF.x + wetSpecularBRDF.y), wetnessEnergy);
 			}
 		} else if (skin.Wetness > 0.0) {
 			const float wetnessAmount = GetWetnessOpticalResponse(skin.Wetness);
@@ -932,7 +967,28 @@ namespace Skin
 	float WetSkinDarkening(float wetness, float streak, float rim)
 	{
 		const float darkening = clamp(wetSkinParams[5].y, 0.0, 2.0);
+		// (47f) Oil fills the skin's fine relief: a deeper, more saturated colour (0 outside Physical: unchanged).
+		wetness = max(saturate(wetness), 0.55 * WetOil());
 		return saturate(darkening * pow(saturate(wetness), 0.8) + 0.8 * streak * saturate(wetness) + saturate(wetSkinParams[3].w) * rim);
+	}
+
+	/// (47f) Physical, Manual Look "Oil": an even oily film over the skin (with whatever water there is): no beads or
+	/// trails of its own, no noise, F0 0.02 -> 0.035, a crisp highlight (the beads' low roughness over the whole film) and
+	/// a little more sheen than water; the reflections see it at roughness 0.2 (anti-mirror). oil = 0: unchanged.
+	void WetSkinOil(inout SkinSurfaceProperties skin, float oil)
+	{
+		[branch] if (oil > 0.0)
+		{
+			const float k = saturate(oil);
+			skin.WetFilmEnergy = max(max(skin.WetFilmEnergy, 0.0), 1.2 * k);
+			skin.WetFilmRoughness = lerp(skin.WetFilmRoughness, 0.2, k);
+			if (skin.WetDropletMask < 0.85 * k)
+				skin.WetDropletRoughness = 0.12;
+			skin.WetDropletMask = max(skin.WetDropletMask, 0.85 * k);
+			skin.WetF0 = lerp(WATER_F0, 0.035, k);
+			skin.WetIndirectEnergy = max(max(skin.WetIndirectEnergy, 0.0), 0.75 * k);
+			skin.WetIndirectRoughness = lerp(skin.WetIndirectRoughness, 0.2, k);
+		}
 	}
 
 	/// Fills the film fields of SkinSurfaceProperties for the New model: a broad sheen whose
@@ -960,6 +1016,7 @@ namespace Skin
 		skin.WetDropletRoughness = dropMask >= trailMask ? 0.1 : 0.15;
 		skin.WetIndirectRoughness = roughness;
 		skin.WetIndirectEnergy = saturate(response * strength * 0.6 * between + 0.5 * streak * response);
+		WetSkinOil(skin, WetOil());
 	}
 #endif
 

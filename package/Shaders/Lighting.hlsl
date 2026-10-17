@@ -2256,11 +2256,21 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		const float worldZ = input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z;
 		// (44b) The same per-character function hair and gear use.
 		float wSwim, wManual, wSweat;
-		const float wDry = Skin::CharDryWetness(worldZ, dynamicWet.x, wSwim, wManual, wSweat);
+		// (47f) Physical: sweat gathers on the upper body (forehead, neck, chest, back) more than on the legs, from the
+		// height above the feet (skinPerGeometry.z); about 3 ALU, Physical only.
+		const bool skinWetPhysical = Skin::WetPhysical();
+		const float sweatRegion = skinWetPhysical ? lerp(0.55, 1.25, smoothstep(55.0, 100.0, worldZ - Skin::skinPerGeometry.z)) : 1.0;
+		const float wDry = Skin::CharDryWetness(worldZ, dynamicWet.x * sweatRegion, wSwim, wManual, wSweat);
 		skinWetNoOtherWet = max(max(wSwim, wManual), wSweat) <= 0.0;
-		const float wRain = saturate(skinRainStrength * Skin::wetSkinParams[0].w);
+		float wRain = saturate(skinRainStrength * Skin::wetSkinParams[0].w);
+		[branch] if (skinWetPhysical)
+		{
+			// The CPU's rain level for this character: shelter and drying are in it, no sky occlusion on top.
+			wRain = saturate(Skin::wetSkinParams[0].w);
+			skinWetNoOtherWet = false;
+		}
 		const float wAll = 1.0 - (1.0 - wDry) * (1.0 - wRain);
-		skinRainShare = wAll > 0.0 ? saturate((wAll - wDry) / wAll) : 0.0;
+		skinRainShare = (wAll > 0.0 && !skinWetPhysical) ? saturate((wAll - wDry) / wAll) : 0.0;
 		skinWetness = Skin::WetCoverage(wetUV, wAll, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z);
 		skinWetMask = 1.0;
 		const float dropOthers = max(max(wSwim, wManual), wSweat * 0.5);
@@ -2268,6 +2278,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		skinWetDropDriver = smoothstep(0.35, 0.9, max(dropOthers, dropRain));
 		skinWetDropRainOnly = dropRain > dropOthers ? 1.0 : 0.0;
 		skinWetStreakDriver = max(smoothstep(0.2, 0.85, max(wSwim, wManual)), wRain);  // (44b) still running while drying off
+		[branch] if (skinWetPhysical)
+		{
+			// (47f) Each source's look comes from the CPU (beads early for sweat, a film breaking into beads after a swim ...).
+			const float gate = Skin::WetPhysicalGate(wAll);
+			skinWetDropDriver = saturate(Skin::wetSkinPerGeometry.w) * gate;
+			skinWetDropRainOnly = 0.0;
+			skinWetStreakDriver = saturate(Skin::wetCharPerGeometry.w) * gate;
+		}
 	} else {
 		skinRainShare = skinRainStrength / max(skinFilmStrength + skinRainStrength, 1e-4);
 		skinWetness = Skin::PerlinNoise(wetUV, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z, min(skinFilmStrength + skinRainStrength, 2.f));
@@ -3179,7 +3197,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// reflections (SSRT / IBL) see on skin never exceeds 0.8, i.e. roughness >= 0.2 (anti-mirror).
 	[branch] if (skinWetNew)
 	{
-		const float skinWetResponse = pow(saturate(skinSurfaceProperties.Wetness), 1.3);
+		const float skinWetResponse = pow(max(saturate(skinSurfaceProperties.Wetness), 0.9 * Skin::WetOil()), 1.3);  // (47f) + oil (0 outside Physical)
 		const float skinWetFilmRoughness = max(lerp(Skin::wetSkinParams[1].y, Skin::wetSkinParams[1].z, skinWetResponse), 0.2);
 		pbrGlossiness = lerp(1 - averageRoughness, 1 - skinWetFilmRoughness, saturate(skinWetResponse * Skin::wetSkinParams[1].w));
 	}
@@ -3331,6 +3349,12 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				const float swimHair = Skin::CharSwimClass(clamp(Skin::wetCharParams[0].z, 0.25, 4.0), progress);
 				charDryWetness = Skin::CharDryWetnessClass(charWorldZ, dynamicWetness.x, swimHair, 0.0, saturate(Skin::wetCharParams[0].w), wSwim, wManual, wSweat);
 				rainWetness *= saturate(Skin::wetSkinParams[0].w);
+				[branch] if (Skin::WetPhysical())
+				{
+					// (47f) The character's own rain level (shelter and drying on the CPU), not sky-occluded again.
+					charDryWetness = 1.0 - (1.0 - charDryWetness) * (1.0 - saturate(Skin::wetSkinParams[0].w));
+					rainWetness = 0.0;
+				}
 			}
 			else
 				rainWetness = 0.0;  // Wet Hair off: not wet at all
@@ -3381,6 +3405,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				const float tide = (Skin::WetValueNoise(uv * 40.0) - 0.5) * 4.0 * clothW;
 				const float recede = 0.6 * Skin::wetSkinPerGeometry.y * gearSwimProgress;
 				charDryWetness = Skin::CharDryWetnessClass(charWorldZ, dynamicWetness.x, swimGear, wick + tide - recede, saturate(Skin::wetCharParams[5].x), wSwim, wManual, wSweat);
+				[branch] if (Skin::WetPhysical())
+				{
+					// (47f) The character's own rain level, a little less on surfaces that face down; not sky-occluded again.
+					const float gearRain = saturate(Skin::wetSkinParams[0].w) * lerp(0.8, 1.0, saturate(worldNormal.z * 0.5 + 0.5));
+					charDryWetness = 1.0 - (1.0 - charDryWetness) * (1.0 - gearRain);
+					rainWetness = 0.0;
+				}
 				// Screen derivatives for droplets, rivulets and the specular AA, here in uniform
 				// control flow (everything above is per draw).
 				geardPdx = ddx(input.WorldPosition.xyz);
@@ -3567,13 +3598,20 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 				const float dropOthers = max(charWetSwim, charWetManual);
 				const float dropRain = charRainPart * saturate(Skin::wetSkinParams[5].w);
-				const float dropDriver = smoothstep(0.35, 0.9, max(dropOthers, dropRain));
+				float dropDriver = smoothstep(0.35, 0.9, max(dropOthers, dropRain));
 				const float cellsPerUV = 230.0 / clamp(Skin::wetSkinParams[3].x, 0.25, 4.0);
 				const float footprint = max(uvFootprint * cellsPerUV, 1e-6);
 				// Beads are about 0.3 cell in radius: fade them out below ~1.5 pixels (no DLSS sparkle).
 				const float dropVisibility = smoothstep(1.0, 2.5, 0.3 / footprint) * gearDetailLOD;
 				const float restFactor = lerp(0.7, 1.2, saturate(baseN.z * 0.5 + 0.5));
-				const float streakDriver = max(smoothstep(0.2, 0.85, dropOthers), charRainPart);
+				float streakDriver = max(smoothstep(0.2, 0.85, dropOthers), charRainPart);
+				[branch] if (Skin::WetPhysical())
+				{
+					// (47f) The character's droplet / rivulet drivers from the CPU, gated by this pixel's own wetness.
+					const float gate = Skin::WetPhysicalGate(wChar);
+					dropDriver = saturate(Skin::wetSkinPerGeometry.w) * gate;
+					streakDriver = saturate(Skin::wetCharPerGeometry.w) * gate;
+				}
 				const float presence = dropDensity * dropDriver * restFactor * (dropVisibility > 0.0 ? 1.0 : 0.0);
 				const Skin::WetSkinDetail detail = Skin::WetSkinDroplets(uv * cellsPerUV, footprint, gravityUV, alignment, presence, streakDriver);
 				dropMask = detail.dropMask * dropVisibility;
