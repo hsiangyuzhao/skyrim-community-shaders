@@ -86,6 +86,8 @@ namespace Util::LatencyPacer
 		bool g_frameBehind = false;         // this frame started with the GPU behind (in_flight >= 1)
 		float g_lastHiddenMs = -1.0f;       // the last frame's render-segment wait (-1 = not measured)
 		float g_lastWaitMs = 0.0f;          // the last frame's wait left out of its lead
+		float g_frameGpuWaitMs = 0.0f;      // (47h) the last submitted frame's wait for the GPU (FrameGpuWaitMs), whether used or not
+		float g_prevFrameGpuWaitMs = 0.0f;  // (47h) the frame before's (PreviousFrameGpuWaitMs: read before this frame's submit)
 		std::array<float, 3> g_waitHist{};  // the last three frames' waits
 		size_t g_waitHistHead = 0;
 		// The hidden wait the frame has anyway (job joins, preemption, our RT lanes): p25 of the hidden waits of frames that slept
@@ -625,10 +627,22 @@ namespace Util::LatencyPacer
 		g_stallMs += a_ms;
 	}
 
+	float FrameGpuWaitMs()
+	{
+		return g_frameGpuWaitMs;
+	}
+
+	float PreviousFrameGpuWaitMs()
+	{
+		return g_prevFrameGpuWaitMs;
+	}
+
 	void OnSimulationStart()
 	{
 		g_simStart = Now();
 		g_stallMs = 0.0;  // (46n)
+		g_prevFrameGpuWaitMs = g_frameGpuWaitMs;  // (47h) this frame's is set at its submit
+		g_frameGpuWaitMs = 0.0f;
 	}
 
 	void OnD3D11Submitted()
@@ -651,6 +665,13 @@ namespace Util::LatencyPacer
 			wait = std::max(wait, static_cast<float>(extra));
 		g_lastHiddenMs = static_cast<float>(hidden);
 		g_lastWaitMs = wait;
+		// (47h) The same wait for the overlay's bottleneck reading, measured whether or not F1a "Count Hidden GPU Waits" is on.
+		{
+			float gpuWait = stall;
+			if (hidden >= 0.0 && extra >= kHiddenMinMs && g_frameBehind)
+				gpuWait = std::max(gpuWait, static_cast<float>(extra));
+			g_frameGpuWaitMs = std::isfinite(gpuWait) ? std::max(gpuWait, 0.0f) : 0.0f;
+		}
 		// (46p) Never Over-Sleep: a GPU frame of over 1.5 periods finished since the last submit, or the GPU is in one right now
 		// (the last completion that long ago with frames still pending): this frame's wait and the next one's are not learned.
 		bool skipFeed = false;

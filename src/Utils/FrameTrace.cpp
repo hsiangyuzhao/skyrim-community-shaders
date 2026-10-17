@@ -393,6 +393,7 @@ namespace Util::FrameTrace
 			float cpuMs = 0.0f;
 			float gpuMs = -1.0f;
 			uint64_t gpuIndex = 0;
+			float gpuWaitMs = 0.0f;  // (47h) of cpuMs, time the CPU spent waiting for the GPU (LatencyPacer::FrameGpuWaitMs)
 		};
 		constexpr size_t kHist = 4096;
 		std::array<HistEntry, kHist> g_hist{};
@@ -1941,20 +1942,26 @@ namespace Util::FrameTrace
 		cpu.reserve(g_histCount);
 		gpu.reserve(g_histCount);
 		int cpuLimited = 0, both = 0;
+		double waitSum = 0.0;
 		for (size_t i = 0; i < g_histCount; ++i) {
 			const auto& e = g_hist[(g_histHead + kHist - 1 - i) % kHist];
 			if (e.t < cutoff)
 				break;
-			if (e.cpuMs > 0.0f)
+			if (e.cpuMs > 0.0f) {
 				cpu.push_back(e.cpuMs);
+				waitSum += e.gpuWaitMs;
+			}
 			if (e.gpuMs > 0.0f)
 				gpu.push_back(e.gpuMs);
 			if (e.cpuMs > 0.0f && e.gpuMs > 0.0f) {
 				++both;
-				if (e.cpuMs > e.gpuMs)
+				// (47h) The CPU's own work: its time waiting for the GPU inside the frame is the GPU's (GPU-bound with DLSS-G, the
+				// render thread blocks in D3D11 calls and read the CPU as the limit before).
+				if (e.cpuMs - e.gpuWaitMs > e.gpuMs)
 					++cpuLimited;
 			}
 		}
+		s.cpuGpuWaitAvg = cpu.empty() ? 0.0f : static_cast<float>(waitSum / static_cast<double>(cpu.size()));
 		auto stats = [](std::vector<float>& v, float& avg, float& low1, float& mx) {
 			if (v.empty())
 				return;
@@ -2242,6 +2249,9 @@ namespace Util::FrameTrace
 				e.t = now;
 				e.cpuMs = cpuFrameMs;
 				e.gpuIndex = a_gpuFrameIndex;
+				// (47h) Blocking D3D11 calls and the render segments' hidden wait (when the frame started with the GPU behind): GPU
+				// time as far as the bottleneck reading goes. Never more than the CPU frame itself.
+				e.gpuWaitMs = std::clamp(LatencyPacer::FrameGpuWaitMs(), 0.0f, cpuFrameMs);
 				g_histHead = (g_histHead + 1) % kHist;
 				g_histCount = std::min(g_histCount + 1, kHist);
 			}

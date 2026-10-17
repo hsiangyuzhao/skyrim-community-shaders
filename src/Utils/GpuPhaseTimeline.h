@@ -82,6 +82,14 @@ namespace Util
 		CsUpscaling,  // DLSS / FSR / NIS and the copies around them
 		CsOverlay,    // ImGui: this overlay and the CS menu
 
+		// (47h) Diagnostic "Split Transparent Pass by Shader" (default off, not saved): the Transparent row's draws by shader /
+		// Lighting technique, a timestamp at every change. At the end so the older values keep their numbers.
+		TransparentLighting,
+		TransparentHair,
+		TransparentEye,
+		TransparentEffect,
+		TransparentOther,
+
 		Count
 	};
 

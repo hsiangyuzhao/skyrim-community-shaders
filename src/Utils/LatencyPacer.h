@@ -71,6 +71,13 @@ namespace Util::LatencyPacer
 	void AddD3D11WaitTsc(uint64_t a_ticks);
 	void AddD3D11WaitMs(double a_ms);
 
+	/// (47h) The last submitted frame's time waiting for the GPU inside its CPU work (the 46n blocking D3D11 calls, or the larger
+	/// hidden render-segment wait when the frame started with the GPU behind -- measured whether or not the pacer uses them); 0 from
+	/// the next frame's start until its submit. For the overlay's bottleneck reading (FrameTrace::GetSeriesStats, the summary).
+	float FrameGpuWaitMs();
+	/// (47h) The same for the previous frame (for readers before this frame's submit: the overlay, drawn before Present).
+	float PreviousFrameGpuWaitMs();
+
 	/// Main thread, right after PaceFrameStart and the Reflex sleep: the frame's CPU work starts now.
 	void OnSimulationStart();
 

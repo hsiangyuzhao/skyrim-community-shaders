@@ -308,7 +308,8 @@ namespace Util::FrameTrace
 		float cpuAvg = 0, cpuLow1 = 0, cpuMax = 0;  ///< low1 = the 99th-percentile frame time (1% low)
 		int gpuFrames = 0;
 		float gpuAvg = 0, gpuLow1 = 0, gpuMax = 0;
-		float cpuLimitedPct = 0;  ///< frames where CPU frame > GPU frame
+		float cpuLimitedPct = 0;  ///< frames where CPU frame > GPU frame; (47h) the CPU frame without its waits for the GPU (cpuGpuWaitAvg)
+		float cpuGpuWaitAvg = 0;  ///< (47h) of cpuAvg, time the CPU spent waiting for the GPU inside the frame (blocking D3D11 calls, hidden waits)
 	};
 	SeriesStats GetSeriesStats(float a_seconds);
 	/// Copies the last up-to-a_count CPU and GPU samples (oldest first; GPU -1 = none) for plotting.

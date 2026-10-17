@@ -578,6 +578,9 @@ struct PerformanceOverlay : OverlayFeature
 		float TraceSeconds = 20.0f;
 	};
 	Settings settings;
+	/// (47h) Diagnostic "Split Transparent Pass by Shader" (not saved, default off): GpuPhaseTimeline splits the Transparent row by
+	/// shader / Lighting technique (a timestamp at every change). Off: one row, no extra timestamps.
+	bool splitTransparentDiag = false;
 
 	/// (batch 36e) Display state of every table. Not saved.
 	struct ViewState

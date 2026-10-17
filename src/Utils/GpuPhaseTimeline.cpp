@@ -224,7 +224,31 @@ namespace Util
 		/// World draws outside the opaque pass. Lighting / Effect / Particle draws here are the
 		/// alpha-blended pass; they are deliberately not split further, because they are sorted
 		/// back to front and would switch type on almost every draw.
-		GpuPhase ClassifyWorld(RE::BSShader* a_shader)
+		/// (47h) Diagnostic "Split Transparent Pass by Shader": the alpha-blended pass's draw by shader type, the Lighting ones by
+		/// technique (hair, eyes, the rest). Water keeps its own row.
+		GpuPhase ClassifyTransparent(RE::BSShader* a_shader, uint32_t a_pixelDescriptor)
+		{
+			switch (a_shader->shaderType.get()) {
+			case RE::BSShader::Type::Lighting:
+				{
+					using Tech = SIE::ShaderCache::LightingShaderTechniques;
+					switch (static_cast<Tech>(0x3F & (a_pixelDescriptor >> 24))) {
+					case Tech::Hair:
+						return GpuPhase::TransparentHair;
+					case Tech::Eye:
+						return GpuPhase::TransparentEye;
+					default:
+						return GpuPhase::TransparentLighting;
+					}
+				}
+			case RE::BSShader::Type::Effect:
+				return GpuPhase::TransparentEffect;
+			default:
+				return GpuPhase::TransparentOther;
+			}
+		}
+
+		GpuPhase ClassifyWorld(RE::BSShader* a_shader, uint32_t a_pixelDescriptor)
 		{
 			switch (a_shader->shaderType.get()) {
 			case RE::BSShader::Type::Sky:
@@ -234,7 +258,7 @@ namespace Util
 			case RE::BSShader::Type::ImageSpace:
 				return GpuPhase::Imagespace;
 			default:
-				return GpuPhase::Transparent;
+				return globals::features::performanceOverlay.splitTransparentDiag ? ClassifyTransparent(a_shader, a_pixelDescriptor) : GpuPhase::Transparent;
 			}
 		}
 
@@ -643,7 +667,7 @@ namespace Util
 				top.phase = ClassifyOpaque(a_shader, a_vertexDescriptor, a_pixelDescriptor);
 				break;
 			case GpuScope::World:
-				top.phase = ClassifyWorld(a_shader);
+				top.phase = ClassifyWorld(a_shader, a_pixelDescriptor);
 				break;
 			case GpuScope::DepthPrepass:
 				top.phase = ClassifyDepth(a_shader, a_vertexDescriptor, a_pixelDescriptor);

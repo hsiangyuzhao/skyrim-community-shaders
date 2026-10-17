@@ -42,6 +42,7 @@
 #include "Utils/GpuTimers.h"
 #include "Utils/EngineTiming.h"
 #include "Utils/FrameTrace.h"
+#include "Utils/LatencyPacer.h"
 #include "Utils/Screenshot.h"
 #include "Utils/OcclusionDryRun.h"
 #include "Utils/UI.h"
@@ -2002,6 +2003,12 @@ namespace
 					{ P::Transparent, "Transparent & effects",
 						"See-through things drawn after the solid pass:\n"
 						"glass, particles, spell effects, fire, smoke, rain." },
+					// (47h) Diagnostic Split Transparent Pass by Shader (only with it on).
+					{ P::TransparentLighting, "Transparent: objects (Lighting)", "Blended objects drawn with the Lighting shader (glass, blended meshes), not hair or eyes." },
+					{ P::TransparentHair, "Transparent: hair", "Blended hair (the Lighting shader's hair technique)." },
+					{ P::TransparentEye, "Transparent: eyes", "Blended eyes (the Lighting shader's eye technique)." },
+					{ P::TransparentEffect, "Transparent: effects", "Effect-shader meshes: spell effects, fire, smoke, glows, fog cards." },
+					{ P::TransparentOther, "Transparent: other", "Particles and anything else in the blended pass." },
 					{ P::WorldOther, "Other world work", "Main scene work that could not be assigned to any row here." },
 					{ P::FirstPerson, "First person", "Your hands and weapon in first person." },
 				} },
@@ -2145,6 +2152,16 @@ namespace
 			return "water";
 		case P::Transparent:
 			return "transparent";
+		case P::TransparentLighting:  // (47h)
+			return "transparent_lighting";
+		case P::TransparentHair:
+			return "transparent_hair";
+		case P::TransparentEye:
+			return "transparent_eye";
+		case P::TransparentEffect:
+			return "transparent_effect";
+		case P::TransparentOther:
+			return "transparent_other";
 		case P::WorldOther:
 			return "world_other";
 		case P::FirstPerson:
@@ -2197,7 +2214,10 @@ namespace
 		// (46r) Display only (not in the log snapshot or the F12 JSON): Ray Tracing's GPU time on the
 		// game's queue (sum of its GPU passes rows) and its own D3D12 queue (last trace sample).
 		kSummaryRtMain,
-		kSummaryRtAsync
+		kSummaryRtAsync,
+		// (47h) Waits inside the frame that are the GPU's, not the CPU's: the frame-start pacer's sleep (and its hard bound) and the
+		// time the render thread blocked in D3D11 for the GPU (LatencyPacer::PreviousFrameGpuWaitMs). Counted with the Present wait.
+		kSummaryGpuWaitInFrame
 	};
 
 	/// CPU-bound / GPU-bound verdict from the share of the frame the CPU spends in Present.
@@ -2239,6 +2259,14 @@ void PerformanceOverlay::DrawEngineGpuTable()
 	float totalMs = 0.0f;
 	table.DisplayValue(kEngineTotalRowId, cfg, totalMs);
 
+	// (47h) Diagnostic, not saved.
+	ImGui::Checkbox("Split Transparent Pass by Shader (diagnostic)", &splitTransparentDiag);
+	if (auto _tt = Util::HoverTooltipWrapper()) {
+		ImGui::TextUnformatted(
+			"Off (default): one \"Transparent & effects\" row. On: split into objects / hair / eyes / effects / other, with a GPU\n"
+			"timestamp at every change of shader during that pass (also in the F12 snapshot). The blended pass is sorted back to\n"
+			"front, so this adds many timestamps: frames that run out of them are dropped from the table. Not saved.");
+	}
 	ImGui::TextDisabled("(hover for how to read this)");
 	if (ImGui::IsItemHovered()) {
 		if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -2429,6 +2457,12 @@ void PerformanceOverlay::DrawBottleneckSummary()
 	value(kSummaryCpuFrame, frameMs);
 	value(kSummaryPresentWait, waitMs);
 	value(kSummaryGpuOurs, gpuMeasuredMs);
+	{
+		// (47h) The pacer's sleep and the CPU's waits for the GPU inside the frame are GPU time too (else "CPU-bound" while GPU-bound).
+		float inFrameWaitMs = 0.0f;
+		if (value(kSummaryGpuWaitInFrame, inFrameWaitMs))
+			waitMs = std::min(waitMs + inFrameWaitMs, frameMs);
+	}
 	const float busyMs = std::max(0.0f, frameMs - waitMs);
 	const float waitShare = (frameMs > 0.0f) ? (waitMs / frameMs) : 0.0f;
 	const auto verdict = BottleneckVerdict(theme, frameMs, waitMs);
@@ -3762,6 +3796,12 @@ void PerformanceOverlay::UpdateViews(double a_now, const DrawCallRowSets& a_rowS
 		if (cpuFrameMs > 0.0f)
 			in.push_back(SIn{ kSummaryCpuFrame, 0, cpuFrameMs, 0 });
 		in.push_back(SIn{ kSummaryPresentWait, 0, Util::CpuPassTimers::GetSingleton()->GetPresentWaitMs(), 0 });
+		{
+			// (47h) This frame's pacer sleep and hard-bound wait, the previous frame's waits for the GPU inside its CPU work.
+			const auto& pacer = Util::LatencyPacer::Last();
+			const float inFrameWait = std::max(0.0f, pacer.sleepMs) + std::max(0.0f, pacer.capWaitMs) + std::max(0.0f, Util::LatencyPacer::PreviousFrameGpuWaitMs());
+			in.push_back(SIn{ kSummaryGpuWaitInFrame, 0, std::isfinite(inFrameWait) ? inFrameWait : 0.0f, 0 });
+		}
 		in.push_back(SIn{ kSummaryGpuOurs, 0, bucketSum, 0 });
 		if (frameGpu.hasSample) {
 			in.push_back(SIn{ kSummaryGpuUntracked, 0, std::max(0.0f, frameGpu.workSpanMs - bucketSum), 0 });
@@ -4017,7 +4057,8 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 						  "Whichever is slower more often limits the frame rate. With a frame-rate cap both have spare time;\n"
 						  "the label then says which one is closer to the limit.");
 		{
-			float cpuShownMs = series.frames > 0 ? series.cpuAvg : -1.0f;
+			// (47h) The CPU's own work: its waits for the GPU inside the frame are left out (they are the GPU's).
+			float cpuShownMs = series.frames > 0 ? std::max(0.0f, series.cpuAvg - series.cpuGpuWaitAvg) : -1.0f;
 			float gpuShownMs = series.gpuFrames > 0 ? series.gpuAvg : -1.0f;
 			ImVec4 verdictColor = theme.StatusPalette.Disable;
 			const char* verdictText = "measuring...";
@@ -4041,6 +4082,9 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 				value(kSummaryPresentWait, waitMs);
 				if (traceSmoothed.valid)
 					waitMs += traceSmoothed.reflexSleepMs;
+				float inFrameWaitMs = 0.0f;  // (47h) the pacer's sleep, the waits for the GPU inside the frame
+				if (value(kSummaryGpuWaitInFrame, inFrameWaitMs))
+					waitMs += inFrameWaitMs;
 				const auto verdict = BottleneckVerdict(theme, cpuFrameMs, waitMs);
 				const std::string_view v = verdict.first;
 				verdictText = v.starts_with("GPU") ? "GPU-limited (or capped)" : v.starts_with("CPU") ? "CPU-limited" : v == "balanced" ? "CPU and GPU about even" : "measuring...";
@@ -4066,8 +4110,11 @@ void PerformanceOverlay::DrawCompactSummary(const PerfView::ViewConfig& a_cfg)
 			ImGui::EndGroup();
 			if (ImGui::IsItemHovered()) {
 				if (auto _tt = Util::HoverTooltipWrapper()) {
-					if (series.frames > 0 && series.gpuFrames > 0)
+					if (series.frames > 0 && series.gpuFrames > 0) {
 						ImGui::Text("Over the last 10 s the CPU took longer than the GPU in %.0f%% of the frames.", series.cpuLimitedPct);
+						// (47h)
+						ImGui::Text("CPU = its own work: %.1f ms per frame it spent waiting for the GPU (blocked in the driver) count as GPU time.", series.cpuGpuWaitAvg);
+					}
 					else if (!settings.DriverWaitTiming)
 						ImGui::TextUnformatted("Rough reading only (from how long the CPU waits each frame). The per-frame CPU and GPU times need\n"
 											   "Driver wait timing on (Overlay options > Screenshot and frame trace > Diagnostics).");
@@ -4307,6 +4354,16 @@ namespace
 			return "Water (game)";
 		case P::Transparent:
 			return "Transparent & effects (game)";
+		case P::TransparentLighting:  // (47h)
+			return "Transparent: objects (game)";
+		case P::TransparentHair:
+			return "Transparent: hair (game)";
+		case P::TransparentEye:
+			return "Transparent: eyes (game)";
+		case P::TransparentEffect:
+			return "Transparent: effects (game)";
+		case P::TransparentOther:
+			return "Transparent: particles & other (game)";
 		case P::WorldOther:
 			return "Other world drawing (game)";
 		case P::FirstPerson:
@@ -5104,7 +5161,9 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 		view.summary.DisplayValue(kSummaryCpuFrame, cfg, cpuFrame);
 		view.summary.DisplayValue(kSummaryPresentWait, cfg, wait);
 		const bool hasPostFg = view.summary.DisplayValue(kSummaryPostFgFrame, cfg, postFg);
-		const auto verdict = BottleneckVerdict(Menu::GetSingleton()->GetTheme(), cpuFrame, wait);
+		float inFrameWait = 0.0f;  // (47h) the pacer's sleep, the waits for the GPU inside the frame
+		const bool hasInFrameWait = view.summary.DisplayValue(kSummaryGpuWaitInFrame, cfg, inFrameWait);
+		const auto verdict = BottleneckVerdict(Menu::GetSingleton()->GetTheme(), cpuFrame, hasInFrameWait ? std::min(wait + inFrameWait, cpuFrame) : wait);
 		const FrameStats stats = view.frozen ? view.frozenStats : ComputeFrameStats();
 		j["summary"] = {
 			{ "fps", frameMs > 0.0f ? 1000.0f / frameMs : 0.0f },
@@ -5112,6 +5171,7 @@ nlohmann::json PerformanceOverlay::BuildFrameJson(const PerfView::ViewConfig& a_
 			{ "post_fg_fps", hasPostFg && postFg > 0.0f ? json(1000.0f / postFg) : json(nullptr) },
 			{ "cpu_frame_ms", summary(kSummaryCpuFrame) },
 			{ "present_wait_ms", summary(kSummaryPresentWait) },
+			{ "gpu_wait_in_frame_ms", summary(kSummaryGpuWaitInFrame) },  // (47h)
 			{ "gpu_ours_ms", summary(kSummaryGpuOurs) },
 			{ "gpu_untracked_ms", summary(kSummaryGpuUntracked) },
 			{ "gpu_gap_ms", summary(kSummaryGpuGap) },
