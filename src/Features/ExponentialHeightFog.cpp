@@ -781,7 +781,7 @@ void ExponentialHeightFog::Prepass()
             ID3D11UnorderedAccessView* uav = a_pass.conservativeDepth->uav.get();
             context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
             context->CSSetShader(a_pass.conservativeDepthCS, nullptr, 0);
-            context->Dispatch(groupX, groupY, 1);
+            context->Dispatch(a_pass.gridSize.x, a_pass.gridSize.y, 1);  // (47g) one 8x8 group per froxel column (parallel reduction)
             context->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
             timers->End(Util::GpuBucket::VolumetricFogDepth);
         }
