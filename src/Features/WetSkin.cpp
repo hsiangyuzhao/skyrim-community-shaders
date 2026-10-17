@@ -135,6 +135,9 @@ namespace
 	/// (47g) The droplet driver for a visible bead count per skin area a_count at bead size a_size (both x the user's
 	/// values): the shader's droplet cells shrink with the bead size (cells per uv = 320 / size), so the share of cells
 	/// holding a bead is count x size^2.
+	/// (47h) Stronger Low-Wetness Look: droplet density x the user's value (the shader clamps the product to 1).
+	constexpr float kStrongDensity = 2.2f;
+
 	float BeadDriver(float a_count, float a_size)
 	{
 		return std::clamp(a_count * a_size * a_size, 0.0f, 1.0f);
@@ -143,11 +146,24 @@ namespace
 	/// Sweat: a few tiny beads at the onset, more and larger toward mid wetness, then they merge into trails and a thin
 	/// film. (47g) The count rises gradually and peaks around mid wetness (it saturated at 0.15-0.2 before, with 1.8x
 	/// density at low wetness); the size grows with the wetness. Fully wet unchanged (driver 0.6 at size 0.9).
-	SourceLook SweatLook(float a_level)
+	/// (47h) a_strong "Physical: Stronger Low-Wetness Look": beads are the visible signal from the onset (presence share, no
+	/// size^2), 2.2x density, size from a bead that resolves at 1.5 m; trails, streaks and the film come in earlier (reviews/wetness-render).
+	SourceLook SweatLook(float a_level, bool a_strong)
 	{
 		SourceLook o;
 		const float l = std::clamp(a_level, 0.0f, 1.0f);
 		o.level = l;
+		if (a_strong) {
+			o.size = std::lerp(0.55f, 0.95f, Smooth(0.0f, 0.7f, l));
+			const float count = 0.30f + 0.70f * Smooth(0.02f, 0.30f, l) - 0.25f * Smooth(0.6f, 1.0f, l);
+			o.beads = std::clamp(count * Smooth(0.0f, 0.04f, l), 0.0f, 1.0f);
+			o.density = kStrongDensity;
+			o.sizeRandom = 0.5f;
+			o.trails = Smooth(0.15f, 0.5f, l);
+			o.streak = 0.7f * Smooth(0.3f, 0.75f, l);
+			o.film = std::lerp(0.6f, 1.0f, Smooth(0.3f, 0.9f, l));
+			return o;
+		}
 		o.size = std::lerp(0.3f, 0.9f, Smooth(0.0f, 0.8f, l));
 		const float count = (0.6f / 0.81f) * (1.4f * Smooth(0.02f, 0.5f, l) - 0.4f * Smooth(0.55f, 1.0f, l));
 		o.beads = BeadDriver(count, o.size);
@@ -161,11 +177,21 @@ namespace
 
 	/// Rain: sparse beads of mixed sizes (the shader puts more on up-facing surfaces), runoff trails, a film in heavy rain.
 	/// (47g) The count grows with the water received (it was at its maximum from level 0.15); fully wet unchanged.
-	SourceLook RainLook(float a_level)
+	SourceLook RainLook(float a_level, bool a_strong)
 	{
 		SourceLook o;
 		const float l = std::clamp(a_level, 0.0f, 1.0f);
 		o.level = l;
+		if (a_strong) {  // (47h)
+			o.size = std::lerp(0.75f, 1.1f, Smooth(0.05f, 0.7f, l));
+			o.beads = std::clamp(0.35f + 0.55f * Smooth(0.02f, 0.5f, l), 0.0f, 1.0f) * Smooth(0.0f, 0.04f, l);
+			o.density = kStrongDensity;
+			o.sizeRandom = 1.5f;
+			o.trails = Smooth(0.1f, 0.45f, l);
+			o.streak = Smooth(0.15f, 0.55f, l);
+			o.film = std::lerp(0.6f, 1.0f, Smooth(0.25f, 0.8f, l));
+			return o;
+		}
 		o.size = std::lerp(0.6f, 1.1f, Smooth(0.1f, 0.8f, l));
 		o.beads = BeadDriver((0.6f / 1.21f) * Smooth(0.02f, 0.8f, l), o.size);
 		o.density = 1.0f;
@@ -180,12 +206,23 @@ namespace
 	/// a_phase: 0 just out of the water .. 1 dry (evaporation clock / evaporation time); a_runoff: the runoff left (1 .. 0).
 	/// (47g) Late in the drying both the count and the size fall (the small beads evaporate first); the count rose 20x
 	/// before (density up while the size shrank). Just out of the water unchanged.
-	SourceLook SwimLook(float a_level, float a_phase, float a_runoff)
+	SourceLook SwimLook(float a_level, float a_phase, float a_runoff, bool a_strong)
 	{
 		SourceLook o;
 		const float l = std::clamp(a_level, 0.0f, 1.0f);
 		const float p = std::clamp(a_phase, 0.0f, 1.0f);
 		o.level = l;
+		if (a_strong) {  // (47h)
+			o.film = std::lerp(1.0f, 0.55f, Smooth(0.1f, 0.6f, p));
+			o.size = std::lerp(1.1f, 0.6f, Smooth(0.3f, 0.95f, p));
+			const float count = std::lerp(0.55f, 0.9f, Smooth(0.05f, 0.3f, p)) * (1.0f - 0.85f * Smooth(0.6f, 1.0f, p));
+			o.beads = std::clamp(count, 0.0f, 1.0f) * Smooth(0.0f, 0.05f, l);
+			o.density = kStrongDensity;
+			o.sizeRandom = 0.7f;
+			o.trails = std::lerp(1.0f, 0.5f, Smooth(0.1f, 0.6f, p));
+			o.streak = std::max(std::clamp(a_runoff, 0.0f, 1.0f), 0.5f * (1.0f - p)) * Smooth(0.0f, 0.06f, l);
+			return o;
+		}
 		o.film = std::lerp(1.0f, 0.3f, Smooth(0.1f, 0.55f, p));
 		o.size = std::lerp(1.1f, 0.45f, Smooth(0.3f, 0.95f, p));
 		const float count = (0.5f / 1.21f) * std::lerp(1.0f, 1.6f, Smooth(0.05f, 0.3f, p)) * (1.0f - Smooth(0.5f, 1.0f, p));
@@ -258,7 +295,9 @@ WetSkin::GPUParams WetSkin::GetGPUParams() const
 	GPUParams g{};
 	const bool isNew = !IsOriginal();
 	// (47f) x: 0 Legacy, 1 Simple, 2 Physical (Skin.hlsli WetSkinNewModel() is x > 0.5, WetPhysical() x > 1.5).
-	g.p[0] = float4(isNew ? (IsPhysical() ? 2.0f : 1.0f) : 0.0f, std::clamp(s.ExtraWetness, 0.0f, 1.0f), std::clamp(s.SwimWeight, 0.0f, 1.0f), std::clamp(s.RainWeight, 0.0f, 1.0f));
+	// (47h) Physical: + 0.25 Stronger Low-Wetness Look, + 0.5 Smaller Visible Bead Size (Skin.hlsli WetStrongLowLook / WetSmallBeads).
+	const float physicalBits = IsPhysical() ? (s.PhysicalStrongLowLook ? 0.25f : 0.0f) + (s.PhysicalSmallBeads ? 0.5f : 0.0f) : 0.0f;
+	g.p[0] = float4(isNew ? (IsPhysical() ? 2.0f + physicalBits : 1.0f) : 0.0f, std::clamp(s.ExtraWetness, 0.0f, 1.0f), std::clamp(s.SwimWeight, 0.0f, 1.0f), std::clamp(s.RainWeight, 0.0f, 1.0f));
 	// Sheen: roughness never below 0.2 (anti-mirror), strength at most 2.5.
 	g.p[1] = float4(std::clamp(s.SweatWeight, 0.0f, 1.0f), std::clamp(s.RoughnessLow, 0.2f, 0.6f), std::clamp(s.RoughnessFull, 0.2f, 0.6f), std::clamp(s.FullWetnessStrength, 0.0f, 2.5f));
 	g.p[2] = float4(std::clamp(s.PatchSoftness, 0.05f, 0.6f), std::clamp(s.PatchContrast, 0.0f, 1.0f), std::clamp(s.DropletAmount, 0.0f, 1.0f), std::clamp(s.DropletDensity, 0.0f, 1.0f));
@@ -445,22 +484,23 @@ WetSkin::PhysicalLook WetSkin::GetPhysicalLook(const PhysicalState& a_state) con
 	// Each source at the level the shader will see (x its weight), then the stronger effect wins; the droplet
 	// shape parameters are blended by how much each source's beads count.
 	std::array<SourceLook, 4> sources{};
-	sources[0] = SweatLook(a_state.sweat * std::clamp(s.SweatWeight, 0.0f, 1.0f));
-	sources[1] = RainLook(a_state.rain);
+	const bool strong = s.PhysicalStrongLowLook;  // (47h)
+	sources[0] = SweatLook(a_state.sweat * std::clamp(s.SweatWeight, 0.0f, 1.0f), strong);
+	sources[1] = RainLook(a_state.rain, strong);
 	{
 		const float phase = std::clamp(a_state.swimEvap / evapTime, 0.0f, 1.0f);
 		const float runoff = std::exp(-a_state.swimRun / runoffTime);
-		sources[2] = SwimLook(look.swim * std::clamp(s.SwimWeight, 0.0f, 1.0f), phase, runoff);
+		sources[2] = SwimLook(look.swim * std::clamp(s.SwimWeight, 0.0f, 1.0f), phase, runoff, strong);
 	}
 	switch (manualLook) {
 	case ManualLook::Sweat:
-		sources[3] = SweatLook(look.manualWater);
+		sources[3] = SweatLook(look.manualWater, strong);
 		break;
 	case ManualLook::Rain:
-		sources[3] = RainLook(look.manualWater);
+		sources[3] = RainLook(look.manualWater, strong);
 		break;
 	case ManualLook::Swim:
-		sources[3] = SwimLook(look.manualWater, 1.0f - look.manualWater, Smooth(0.8f, 1.0f, look.manualWater));
+		sources[3] = SwimLook(look.manualWater, 1.0f - look.manualWater, Smooth(0.8f, 1.0f, look.manualWater), strong);
 		break;
 	default:
 		break;  // Oil: no water
@@ -582,6 +622,13 @@ void WetSkin::DrawSettings()
 		ImGui::SliderFloat("Max Rain Wetness", &s.MaxRainWetness, 0.0f, 1.0f, "%.2f");
 		Tooltip({ "How wet the heaviest rain makes an exposed character. Lighter rain settles lower: wetness follows",
 			"rain intensity x how open the sky is above the character." });
+		// (47h) Not saved in presets.
+		ImGui::Checkbox("Physical: Stronger Low-Wetness Look", &s.PhysicalStrongLowLook);
+		Tooltip({ "On (default): a slightly wet character (below about half wet) already shows it: more and larger visible beads from",
+			"the first sweat or rain drops, trails and a thin sheen earlier. Fully wet looks the same. Off: as in 47g." });
+		ImGui::Checkbox("Physical: Smaller Visible Bead Size", &s.PhysicalSmallBeads);
+		Tooltip({ "On (default): beads and thin rivulets show from 1-2 screen pixels across (before: hidden below 2 px, full at 3.5 px),",
+			"so small beads stay visible a little farther away. Off: as in 47g." });
 	}
 
 	// 5. Look: how wet each source makes a character at most (shared by Simple and Physical).
@@ -815,6 +862,13 @@ void WetSkin::LoadSettings(json& o_json)
 {
 	settings = o_json;
 	PhysicalFromJson(o_json, settings);  // (47f)
+	// (47h) Not in the macro (its 64-argument limit) and not part of presets.
+	if (o_json.is_object()) {
+		if (auto it = o_json.find("PhysicalStrongLowLook"); it != o_json.end() && it->is_boolean())
+			settings.PhysicalStrongLowLook = it->get<bool>();
+		if (auto it = o_json.find("PhysicalSmallBeads"); it != o_json.end() && it->is_boolean())
+			settings.PhysicalSmallBeads = it->get<bool>();
+	}
 	if (settings.Model > static_cast<uint32_t>(Model::Physical))
 		settings.Model = static_cast<uint32_t>(Model::New);
 	// (44e) Rivulet Contrast reversed. Old key StreakContrast c (0..1): trail threshold lerp(0.48, 0.68, c)
@@ -846,6 +900,8 @@ void WetSkin::SaveSettings(json& o_json)
 {
 	o_json = settings;
 	PhysicalToJson(o_json, settings);  // (47f)
+	o_json["PhysicalStrongLowLook"] = settings.PhysicalStrongLowLook;  // (47h)
+	o_json["PhysicalSmallBeads"] = settings.PhysicalSmallBeads;
 }
 
 void WetSkin::RestoreDefaultSettings()
@@ -1011,6 +1067,8 @@ bool WetSkin::LoadPreset(const std::string& a_name)
 		fromPreset.MaxRainWetness = settings.MaxRainWetness;
 		fromPreset.ManualLookType = settings.ManualLookType;
 		fromPreset.OilRepelsWater = settings.OilRepelsWater;
+		fromPreset.PhysicalStrongLowLook = settings.PhysicalStrongLowLook;  // (47h) not part of a look preset
+		fromPreset.PhysicalSmallBeads = settings.PhysicalSmallBeads;
 		PhysicalFromJson(values, fromPreset);
 		if (fromPreset.Model > static_cast<uint32_t>(Model::Physical))
 			fromPreset.Model = static_cast<uint32_t>(Model::New);

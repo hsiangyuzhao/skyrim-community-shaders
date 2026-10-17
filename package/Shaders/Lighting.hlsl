@@ -3197,7 +3197,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// reflections (SSRT / IBL) see on skin never exceeds 0.8, i.e. roughness >= 0.2 (anti-mirror).
 	[branch] if (skinWetNew)
 	{
-		const float skinWetResponse = pow(max(saturate(skinSurfaceProperties.Wetness), 0.9 * Skin::WetOil()), 1.3);  // (47f) + oil (0 outside Physical)
+		// (47f) + oil (0 outside Physical). (47h) Physical: Stronger Low-Wetness Look: the water film's response W^0.85 (oil as before).
+		const float skinWetResponse = Skin::WetStrongLowLook() ? max(Skin::WetFilmResponse(skinSurfaceProperties.Wetness), pow(0.9 * Skin::WetOil(), 1.3)) :
+		                                                         pow(max(saturate(skinSurfaceProperties.Wetness), 0.9 * Skin::WetOil()), 1.3);
 		const float skinWetFilmRoughness = max(lerp(Skin::wetSkinParams[1].y, Skin::wetSkinParams[1].z, skinWetResponse), 0.2);
 		pbrGlossiness = lerp(1 - averageRoughness, 1 - skinWetFilmRoughness, saturate(skinWetResponse * Skin::wetSkinParams[1].w));
 	}

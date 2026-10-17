@@ -92,6 +92,12 @@ struct WetSkin : Feature
 		// other places) and no droplets / rivulets on characters far away (about 13 m+ at 1440p).
 		bool SkipInvisibleWork = true;
 		bool FasterNoiseLOD = true;
+		// (47h) Physical only, both on by default; both off = 47g. Not part of presets. PhysicalStrongLowLook "Physical: Stronger
+		// Low-Wetness Look": the bead count / size / trail / streak / film curves of reviews/wetness-render (beads visible from
+		// the onset, 2.2x density) and the film response W^0.85 (Simple keeps W^1.3). PhysicalSmallBeads "Physical: Smaller
+		// Visible Bead Size": beads and rivulets fade in over 1-2 render pixels (was 2-3.5), their early-outs at 1 px (was 2).
+		bool PhysicalStrongLowLook = true;
+		bool PhysicalSmallBeads = true;
 
 		// Wetness input
 		float ExtraWetness = 0.0f;  // manual; Original reads it as before (0..2), New uses 0..1

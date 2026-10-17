@@ -104,18 +104,46 @@ namespace Skin
 	/// are in render pixels, the internal resolution under DLSS). Physical: only a coarse early-out (0 when no bead of
 	/// this cell size, radius up to 0.42 cell, reaches 2 px); each bead then fades by its own size (WetSkinDroplets).
 	/// Otherwise the 44a fade by cell size.
+	/// (47h) Physical, "Physical: Stronger Low-Wetness Look" / "Physical: Smaller Visible Bead Size": the CPU adds 0.25 / 0.5 to
+	/// the model value 2 (WetSkin::GetGPUParams); both 0 outside Physical.
+	bool WetStrongLowLook()
+	{
+		const float bits = wetSkinParams[0].x - 2.0;
+		return WetPhysical() && (bits > 0.125 && bits < 0.375 || bits > 0.625);
+	}
+
+	bool WetSmallBeads()
+	{
+		return WetPhysical() && wetSkinParams[0].x - 2.0 > 0.375;
+	}
+
+	/// (47h) The bead / rivulet pixel size below which the Physical early-outs drop them: 2 px (47g), 1 px (Smaller Visible Bead Size).
+	float WetMinPixels()
+	{
+		return WetSmallBeads() ? 1.0 : 2.0;
+	}
+
+	/// (47h) The skin film's response to its wetness: W^1.3 (Simple, 47g), W^0.85 with Physical: Stronger Low-Wetness Look (a damp
+	/// skin already shows a sheen).
+	float WetFilmResponse(float a_wetness)
+	{
+		return pow(saturate(a_wetness), WetStrongLowLook() ? 0.85 : 1.3);
+	}
+
 	float WetDropVisibility(float footprint)
 	{
 		[branch] if (WetPhysical())
-			return 0.84 / footprint > 2.0 ? 1.0 : 0.0;
+			return 0.84 / footprint > WetMinPixels() ? 1.0 : 0.0;
 		return smoothstep(1.0, 2.5, 0.3 / footprint);
 	}
 
 	/// (47g) Physical: a bead or rivulet of a_pixels render pixels across is hidden below 2 px and fades in up to 3.5 px
-	/// (sub-pixel water sparkles under DLSS); 1 in the other models.
+	/// (sub-pixel water sparkles under DLSS); 1 in the other models. (47h) Smaller Visible Bead Size: hidden below 1 px, full at 2 px.
 	float WetMinSizeFade(float a_pixels)
 	{
-		return WetPhysical() ? smoothstep(2.0, 3.5, a_pixels) : 1.0;
+		[branch] if (!WetPhysical())
+			return 1.0;
+		return WetSmallBeads() ? smoothstep(1.0, 2.0, a_pixels) : smoothstep(2.0, 3.5, a_pixels);
 	}
 
 	// (47c) "Wetness: Skip Invisible Work" (wetCharParams[11].x): leave out work whose result is
@@ -939,7 +967,7 @@ namespace Skin
 			const float linePixels = 0.26 / aFoot;
 			// (47g) Physical: each rivulet fades by its own width (WetRivuletField); here only a coarse early-out, 0 when
 			// even the widest (0.34 column) is under 2 px. Where it is 1 the old fade was 1 too.
-			const float lineFade = WetPhysical() ? (0.34 / aFoot > 2.0 ? 1.0 : 0.0) : smoothstep(0.5, 1.2, linePixels);
+			const float lineFade = WetPhysical() ? (0.34 / aFoot > WetMinPixels() ? 1.0 : 0.0) : smoothstep(0.5, 1.2, linePixels);  // (47h) 1 px with Smaller Visible Bead Size
 			// (47c) Skip Invisible Work: narrower than half a pixel (lineFade == 0) or past the
 			// distance LOD, the product below is exactly 0 (the fields are finite): not evaluated.
 			[branch] if (!WetSkipInvisible() || (lineFade > 0.0 && lod > 0.0))
@@ -1039,7 +1067,7 @@ namespace Skin
 	void WetSkinFilm(inout SkinSurfaceProperties skin, float streak, float streakDriver, float dropMask)
 	{
 		const float wetness = saturate(skin.Wetness);
-		const float response = pow(wetness, 1.3);
+		const float response = WetFilmResponse(wetness);  // (47h) W^0.85 with Physical: Stronger Low-Wetness Look
 		const float roughness = max(lerp(wetSkinParams[1].y, wetSkinParams[1].z, response) - 0.04 * streak, 0.2);
 		// (44e) Between-Trail Dulling (wetCharParams[6].w): how much less wet the film between the
 		// trails looks. Was the old Contrast value itself; migrated 1:1.
