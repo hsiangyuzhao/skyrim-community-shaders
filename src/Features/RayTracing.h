@@ -248,6 +248,14 @@ public:
 		float PointLightsSSPLSContact = 8.0f;
 		bool AOSingleRay = true;
 		bool AOHalfResFar = false;
+		// (47h) Outside the settings macro too. AOCharacterSelfFix "RTAO: Character Self-Occlusion Fix" (TraceAOCS kFlagSelfFix).
+		// SunDepthCheckTranslucent "Sun Shadow: Depth Check for Translucent Surfaces": a forward (blended) Lighting surface that is not
+		// the one in the depth buffer takes the cascades at its own position instead of the ray-traced screen mask (Lighting.hlsl).
+		// PointShadowsOnWater "Point Light Shadows on Water": a ray-traced light gives the water above a shallow bed that bed's
+		// traced visibility (Water.hlsl, PointLightShadows.hlsli GetWater). All three off = 47g.
+		bool AOCharacterSelfFix = true;
+		bool SunDepthCheckTranslucent = true;
+		bool PointShadowsOnWater = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int

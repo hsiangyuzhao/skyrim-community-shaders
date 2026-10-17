@@ -382,7 +382,7 @@ namespace RayTracingRT
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynPoint + 3));
 			nullSrv.Format = kDepthMaskFormat;
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAO));
-			nullUav.Format = kAOFormat;
+			nullUav.Format = aoFormat_;
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynAO + 1));
 		}
 
@@ -826,10 +826,16 @@ namespace RayTracingRT
 		if (a_width == aoWidth_ && a_height == aoHeight_ && aoRaw_.resource12 && aoCounter_ && aoCounterMapped_)
 			return true;
 		ReleaseAOResources();
-		if (!CreateSharedTexture(a_width, a_height, kAOFormat, false, true, aoRaw_, "RayTracing RTAO", false)) {
+		// (47h) 16-bit float first (no 8-bit steps in the weight's distance fade); RGBA8 (dithered weight) where it cannot be shared.
+		aoFormat_ = kAOFormat16;
+		if (!CreateSharedTexture(a_width, a_height, kAOFormat16, false, true, aoRaw_, "RayTracing RTAO", false)) {
 			aoRaw_ = {};
-			SetAOFault("could not create its shared texture (see the log)");
-			return false;
+			aoFormat_ = kAOFormat8;
+			if (!CreateSharedTexture(a_width, a_height, kAOFormat8, false, true, aoRaw_, "RayTracing RTAO", false)) {
+				aoRaw_ = {};
+				SetAOFault("could not create its shared texture (see the log)");
+				return false;
+			}
 		}
 		aoCounter_ = CreateBuffer(256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
 		aoCounterReadback_ = CreateBuffer(sizeof(std::uint32_t) * kContexts, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
@@ -845,9 +851,9 @@ namespace RayTracingRT
 		aoCounterValid_ = false;
 		aoWidth_ = a_width;
 		aoHeight_ = a_height;
-		aoBytes_ = static_cast<std::uint64_t>(a_width) * a_height * 4;
+		aoBytes_ = static_cast<std::uint64_t>(a_width) * a_height * (AOIs8Bit() ? 4 : 8);
 		WriteAODescriptors();
-		logger::info("[RayTracing] RTAO texture {}x{}", a_width, a_height);
+		logger::info("[RayTracing] RTAO texture {}x{} ({})", a_width, a_height, AOIs8Bit() ? "RGBA8, dithered weight" : "RGBA16F");
 		return true;
 	}
 
@@ -876,7 +882,7 @@ namespace RayTracingRT
 		stats_.aoTracedLastFrame = false;
 		if (stagingHeap_ && device_) {
 			D3D12_UNORDERED_ACCESS_VIEW_DESC nullUav{};
-			nullUav.Format = kAOFormat;
+			nullUav.Format = aoFormat_;
 			nullUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynAO + 1));
 		}
@@ -893,7 +899,7 @@ namespace RayTracingRT
 		srvDesc.Texture2D.MipLevels = 1;
 		device_->CreateShaderResourceView(depthMask_.resource12.Get(), &srvDesc, StagingCpu(kDynAO));
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-		uavDesc.Format = kAOFormat;
+		uavDesc.Format = aoFormat_;
 		uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 		device_->CreateUnorderedAccessView(aoRaw_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynAO + 1));
 	}

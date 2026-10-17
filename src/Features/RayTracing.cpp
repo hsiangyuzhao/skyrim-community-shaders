@@ -236,6 +236,7 @@ namespace
 	constexpr float kAONormalPower = 8.0f;  // Normal-Guided: tap weight dot(N, N_tap)^8 (0.6 at 20 degrees, 0.06 at the 45 degree gate)
 	constexpr std::uint32_t kAOTraceDetail = 4u, kAOTraceAlphaHalf = 8u, kAOTraceAlphaOpen = 16u;  // TraceAOCS
 	constexpr std::uint32_t kAOTraceSingleRay = 32u, kAOTraceHalfFar = 64u;  // (46y) TraceAOCS (two scales only)
+	constexpr std::uint32_t kAOTraceDither8 = 128u, kAOTraceSelfFix = 256u;  // (47h) TraceAOCS: RGBA8 output dither, Character Self-Occlusion Fix
 
 	// (46c) BSShadowFrustumLight / BSShadowParabolicLight::RenderShadowmaps (vfunc 0x0A): Ray Tracing may skip the shadow
 	// maps of lights it fully handles this frame (Point Lights > Stop Engine Shadow Maps, interiors only).
@@ -1216,6 +1217,10 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.PointLightsSSPLSContact = read("PointLightsSSPLSContact", defaults.PointLightsSSPLSContact);
 		settings.AOSingleRay = read("AOSingleRay", defaults.AOSingleRay);
 		settings.AOHalfResFar = read("AOHalfResFar", defaults.AOHalfResFar);
+		// (47h)
+		settings.AOCharacterSelfFix = read("AOCharacterSelfFix", defaults.AOCharacterSelfFix);
+		settings.SunDepthCheckTranslucent = read("SunDepthCheckTranslucent", defaults.SunDepthCheckTranslucent);
+		settings.PointShadowsOnWater = read("PointShadowsOnWater", defaults.PointShadowsOnWater);
 	}
 	// (46o) Window Beam Guard: off once for settings saved before 46o (its rule misfired on beams that mostly hit walls).
 	if (loadedVersion < 6 && settings.PointLightsBeamGuard) {
@@ -1305,6 +1310,9 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["PointLightsSSPLSContact"] = settings.PointLightsSSPLSContact;
 	o_json["AOSingleRay"] = settings.AOSingleRay;
 	o_json["AOHalfResFar"] = settings.AOHalfResFar;
+	o_json["AOCharacterSelfFix"] = settings.AOCharacterSelfFix;  // (47h)
+	o_json["SunDepthCheckTranslucent"] = settings.SunDepthCheckTranslucent;
+	o_json["PointShadowsOnWater"] = settings.PointShadowsOnWater;
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -3800,8 +3808,8 @@ bool RayTracing::EnsureAOExtras(bool a_quarter, bool a_full, bool a_detail)
 	};
 	if (a_quarter && !aoLoW.texture) {
 		DenoiseTexture lo, loBlur;
-		create(lo, lw, lh, DXGI_FORMAT_R8G8_UNORM, 2, "RayTracing RTAO LoW");
-		create(loBlur, lw, lh, DXGI_FORMAT_R8G8_UNORM, 2, "RayTracing RTAO LoWBlur");
+		create(lo, lw, lh, DXGI_FORMAT_R16G16_UNORM, 4, "RayTracing RTAO LoW");
+		create(loBlur, lw, lh, DXGI_FORMAT_R16G16_UNORM, 4, "RayTracing RTAO LoWBlur");
 		if (ok) {
 			aoLoW = std::move(lo);
 			aoLoWBlur = std::move(loBlur);
@@ -3809,15 +3817,15 @@ bool RayTracing::EnsureAOExtras(bool a_quarter, bool a_full, bool a_detail)
 	}
 	if (ok && a_full && !aoFullTemp.texture) {
 		DenoiseTexture temp;
-		create(temp, width, height, DXGI_FORMAT_R8G8_UNORM, 2, "RayTracing RTAO FullTemp");
+		create(temp, width, height, DXGI_FORMAT_R16G16_UNORM, 4, "RayTracing RTAO FullTemp");
 		if (ok)
 			aoFullTemp = std::move(temp);
 	}
 	if (ok && a_detail && !aoDetailFiltered.texture) {
 		DenoiseTexture filtered, history0, history1;
-		create(filtered, width, height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Detail");
-		create(history0, width, height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Detail History");
-		create(history1, width, height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Detail History");
+		create(filtered, width, height, DXGI_FORMAT_R16_UNORM, 2, "RayTracing RTAO Detail");
+		create(history0, width, height, DXGI_FORMAT_R16_UNORM, 2, "RayTracing RTAO Detail History");
+		create(history1, width, height, DXGI_FORMAT_R16_UNORM, 2, "RayTracing RTAO Detail History");
 		if (ok) {
 			aoDetailFiltered = std::move(filtered);
 			aoDetailHistory[0] = std::move(history0);
@@ -3851,13 +3859,13 @@ bool RayTracing::EnsureAOFilter(std::uint32_t a_width, std::uint32_t a_height)
 		bytes += static_cast<std::uint64_t>(a_w) * a_h * a_bytesPerPixel;
 		return true;
 	};
-	const bool ok = create(aoLo, lw, lh, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Lo") && create(aoLoBlur, lw, lh, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO LoBlur") &&
+	const bool ok = create(aoLo, lw, lh, DXGI_FORMAT_R16_UNORM, 2, "RayTracing RTAO Lo") && create(aoLoBlur, lw, lh, DXGI_FORMAT_R16_UNORM, 2, "RayTracing RTAO LoBlur") &&
 	                create(aoLoDepth, lw, lh, DXGI_FORMAT_R32_FLOAT, 4, "RayTracing RTAO LoDepth") &&
 	                create(aoLoNormal, lw, lh, DXGI_FORMAT_R8G8B8A8_SNORM, 4, "RayTracing RTAO LoNormal") &&
-	                create(aoFiltered, a_width, a_height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Filtered") &&
-	                create(aoHistory[0], a_width, a_height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO History") &&
-	                create(aoHistory[1], a_width, a_height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO History") &&
-	                create(aoOut, a_width, a_height, DXGI_FORMAT_R8_UNORM, 1, "RayTracing RTAO Out");
+	                create(aoFiltered, a_width, a_height, DXGI_FORMAT_R16_UNORM, 2, "RayTracing RTAO Filtered") &&
+	                create(aoHistory[0], a_width, a_height, DXGI_FORMAT_R16_UNORM, 2, "RayTracing RTAO History") &&
+	                create(aoHistory[1], a_width, a_height, DXGI_FORMAT_R16_UNORM, 2, "RayTracing RTAO History") &&
+	                create(aoOut, a_width, a_height, DXGI_FORMAT_R16_UNORM, 2, "RayTracing RTAO Out");
 	if (!ok) {
 		ReleaseAOFilter();
 		SwitchOffAO("could not create its filter textures");
@@ -3927,6 +3935,11 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 			flags |= kAOTraceHalfFar;
 	}
 	flags |= shape.alphaBudget == 1 ? kAOTraceAlphaHalf : (shape.alphaBudget == 2 ? kAOTraceAlphaOpen : 0u);
+	// (47h) The trace output fell back to RGBA8: dither its weight. Character Self-Occlusion Fix (only with characters in the TLAS).
+	if (backend.AOIs8Bit())
+		flags |= kAOTraceDither8;
+	if (settings.AOCharacterSelfFix && (flags & kAOTraceCharacters))
+		flags |= kAOTraceSelfFix;
 	aoShapeThisFrame = shape;
 	c.params[0] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[1], &flags, sizeof(float));
@@ -5347,6 +5360,7 @@ void RayTracing::DrawAOPage()
 					settings.AOAlphaBudget = d.AOAlphaBudget;
 					settings.AOSingleRay = d.AOSingleRay;  // (46y)
 					settings.AOHalfResFar = d.AOHalfResFar;
+					settings.AOCharacterSelfFix = d.AOCharacterSelfFix;  // (47h)
 				}
 				ImGui::BeginDisabled(!settings.AO);
 				ImGui::Checkbox("Fine Detail (two scales)", &settings.AODetail);
@@ -5391,6 +5405,14 @@ void RayTracing::DrawAOPage()
 					ImGui::Text("  be a little noisier on thin objects. Off (default): every pixel (46x). Needs Fine Detail.");
 				}
 				ImGui::EndDisabled();
+				// (47h)
+				ImGui::Checkbox("RTAO: Character Self-Occlusion Fix", &settings.AOCharacterSelfFix);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On (default): a character's own ray-traced body no longer darkens itself where the traced mesh sits a little");
+					ImGui::Text("  off the drawn one (the dark band along the sides of the legs, clearest with Fine Detail). Rays from a body");
+					ImGui::Text("  pixel ignore that same character's surfaces seen from the inside and start a bit further out when they");
+					ImGui::Text("  skim the skin. Real contact (an arm against the body, between the legs) still darkens. Off: as in 47g.");
+				}
 				ImGui::EndDisabled();
 				if (!aoExtrasFault.empty())
 					RtErrorLine("Fine Detail / Full-Resolution Filter were switched off automatically", aoExtrasFault);

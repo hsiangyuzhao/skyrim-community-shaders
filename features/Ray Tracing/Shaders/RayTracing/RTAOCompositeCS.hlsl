@@ -16,7 +16,7 @@
 #include "RayTracing/RTAOCommon.hlsli"
 
 Texture2D<unorm float> RTAO : register(t0);    // filtered (and history-blended) visibility (two scales: the far term)
-Texture2D<unorm float4> Raw : register(t1);    // TraceAOCS: r this frame's ray, g RT weight, (46t) b far weight, a near visibility
+Texture2D<float4> Raw : register(t1);          // (47h float: RGBA16F or RGBA8) TraceAOCS: r this frame's ray, g RT weight, (46t) b far weight, a near visibility
 Texture2D<unorm float> SsgiAo : register(t2);  // SSGI's own AO this frame (occlusion; contact AO folded in)
 Texture2D<unorm float> Contact : register(t3); // SSGI's contact AO visibility (kFlagContact)
 Texture2D<unorm float> DetailAO : register(t4); // (46t) filtered (and history-blended) detail visibility (kFlagDetail)

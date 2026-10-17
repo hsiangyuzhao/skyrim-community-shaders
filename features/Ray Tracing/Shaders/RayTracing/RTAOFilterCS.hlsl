@@ -23,7 +23,7 @@
 #include "Common/GBuffer.hlsli"
 #include "RayTracing/RTAOCommon.hlsli"
 
-Texture2D<unorm float4> Raw : register(t0);  // TraceAOCS
+Texture2D<float4> Raw : register(t0);  // TraceAOCS (47h: RGBA16F, or RGBA8 where the GPU cannot share it)
 Texture2D<float> DepthTexture : register(t1);
 Texture2D<float4> NormalRoughness : register(t2);
 Texture2D<float> LoDepth : register(t3);

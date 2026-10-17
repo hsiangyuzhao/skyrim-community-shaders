@@ -11,7 +11,8 @@
 // the D3D11 side averages the rays spatially (1/4-resolution bilateral filter) and then, optionally, with a clamped
 // history. Nothing of NRD.
 //
-// Output (R8G8B8A8_UNORM, shared with D3D11):
+// Output (shared with D3D11; (47h) R16G16B16A16_FLOAT, or R8G8B8A8_UNORM where the GPU cannot share that -- kFlagDither8: the
+// weight .g, the only value with many levels, then gets a +-0.5 LSB triangular dither so its distance fade has no 8-bit steps):
 //   r = this frame's ray: 1 = open, 0 = blocked (1 where not traced)
 //   g = weight of the ray-traced result (1 inside the traced area and nearer than Fade.x, to 0 at Fade.y; 0 = not traced)
 //   b = the hit distance / ray length where blocked (1 = open; debug)
@@ -38,6 +39,15 @@
 // alpha-tested instances (traced leaves / cut-outs) are culled; with it they are tested against their cut-out, at
 // most kAlphaCandidateBudget candidates per ray (past it the ray counts as blocked: bounded cost). (46t) AO Alpha
 // Budget: past the budget the ray may instead count as half open (kFlagAlphaHalf) or open (kFlagAlphaOpen).
+//
+// (47h) kFlagSelfFix "RTAO: Character Self-Occlusion Fix": the character ray already starts Extra.x (6 units) along, yet near a
+// character's silhouette the ray-traced (GPU-skinned) mesh is a little off the drawn one, so a ray from a body pixel can start just
+// inside its own traced mesh and leave it through the inside of the surface (a dark band along the sides of the legs, strongest
+// with the short detail rays). At a pixel that is a character (CharacterAt: a short probe from the camera side finds that
+// character's traced mesh; it gives the owner key and which side of its triangles faces outward), the character rays skip that
+// character's opaque triangles seen from their inner side -- a ray can only meet those from inside the same mesh -- and the ray
+// start moves out by up to kSelfGrazeOffset more along the normal, the more the ray grazes the surface. A real contact (an arm
+// against the torso, the other leg) is met on its outer side and still counts; static geometry and every other pixel are unchanged.
 
 struct AOConstants
 {
@@ -53,7 +63,7 @@ struct AOConstants
 ConstantBuffer<AOConstants> C : register(b0);
 RaytracingAccelerationStructure Scene : register(t0);
 Texture2D<float> DepthMask : register(t1);
-RWTexture2D<unorm float4> AOOut : register(u0);
+RWTexture2D<float4> AOOut : register(u0);  // (47h) float: RGBA16F, or RGBA8 (kFlagDither8)
 RWByteAddressBuffer RayCounter : register(u1);  // rays traced (monotonic, read back for the F7 trace)
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
@@ -63,7 +73,11 @@ static const uint kFlagAlphaHalf = 8u;    // (46t) past the alpha candidate budg
 static const uint kFlagAlphaOpen = 16u;   // (46t) past the alpha candidate budget: open
 static const uint kFlagSingleRay = 32u;   // (46y) two scales: the long direction as one closest-hit ray (see ClosestBlocker)
 static const uint kFlagHalfFar = 64u;     // (46y) two scales: the far part only on a checkerboard that swaps every frame
+static const uint kFlagDither8 = 128u;    // (47h) the output is RGBA8: dither the weight (.g)
+static const uint kFlagSelfFix = 256u;    // (47h) RTAO: Character Self-Occlusion Fix (see the top)
 static const uint kMaxDetailRays = 4u;
+static const float kSelfProbe = 4.0;          // (47h) CharacterAt: the probe reaches this far to either side of the pixel (units)
+static const float kSelfGrazeOffset = 1.5;    // (47h) extra ray start offset at a character pixel for a ray along the surface (units)
 static const uint kSceneMask = 0x01u;
 static const uint kCharacterMasks = 0x06u;
 static const float kFirstPersonNear = 96.0;
@@ -252,17 +266,171 @@ bool SphereOnSegment(float3 origin, float3 dir, float tMax, float4 sphere)
 	return dot(closest, closest) <= sphere.w * sphere.w;
 }
 
+// (47h) The character this pixel shows, for the self-occlusion fix (kFlagSelfFix): valid = the pixel is on a traced character,
+// owner = its key (the instances' InstanceContributionToHitGroupIndex, Backend), outerFront = CandidateTriangleFrontFace() of its
+// triangles seen from outside (the side the probe met first). Only the opaque instances (ID 0) count: hair cards are two-sided.
+struct SelfInfo
+{
+	bool valid;
+	uint owner;
+	bool outerFront;
+};
+
+bool ProbeCharacter(float3 origin, float3 dir, out uint o_owner, out bool o_front)
+{
+	o_owner = 0u;
+	o_front = true;
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = dir;
+	ray.TMin = 0.0;
+	ray.TMax = 2.0 * kSelfProbe;
+	RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, kCharacterMasks, ray);
+	while (q.Proceed()) {
+		if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && q.CandidateInstanceID() == 0u)
+			q.CommitNonOpaqueTriangleHit();  // the nearest from the probe's start (the search goes on with a shorter ray)
+	}
+	if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+		return false;
+	o_owner = q.CommittedInstanceContributionToHitGroupIndex();
+	o_front = q.CommittedTriangleFrontFace();
+	return true;
+}
+
+SelfInfo CharacterAt(float3 P, float3 V, float3 N)
+{
+	SelfInfo s;
+	s.valid = false;
+	s.owner = 0u;
+	s.outerFront = true;
+	// Along the view ray from the camera side first (the surface the camera sees), else along the normal (silhouettes, where the
+	// traced mesh is off the drawn one sideways).
+	if (ProbeCharacter(P + V * kSelfProbe, -V, s.owner, s.outerFront) || ProbeCharacter(P + N * kSelfProbe, -N, s.owner, s.outerFront))
+		s.valid = true;
+	return s;
+}
+
+bool PointInSphere(float3 P, float4 sphere)
+{
+	const float3 d = P - sphere.xyz;
+	return sphere.w > 0.0 && dot(d, d) <= sphere.w * sphere.w;
+}
+
+// (47h) Visibility() against the characters, without the pixel's own character seen from inside (SelfInfo). Every candidate comes
+// back (forced non-opaque): the opaque instances (ID 0) block unless they are the pixel's character's inner side; the alpha-tested
+// ones as in Visibility (their cut-out and budget with RT_ALPHA, culled without it).
+float CharacterVisibilitySelf(float3 origin, float3 dir, float tMin, float tMax, float footprint, uint flags, SelfInfo self, out float tHit)
+{
+	tHit = tMax;
+	if (!(tMin < tMax))
+		return 1.0;
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = dir;
+	ray.TMin = tMin;
+	ray.TMax = tMax;
+	RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, kCharacterMasks, ray);
+#if defined(RT_ALPHA)
+	uint budget = kAlphaCandidateBudget;
+	bool exceeded = false;
+#endif
+	while (q.Proceed()) {
+		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+			continue;
+		const uint id = q.CandidateInstanceID();
+		if (id == 0u) {
+			if (q.CandidateInstanceContributionToHitGroupIndex() == self.owner && q.CandidateTriangleFrontFace() != self.outerFront)
+				continue;
+			q.CommitNonOpaqueTriangleHit();
+			q.Abort();
+			continue;
+		}
+#if defined(RT_ALPHA)
+		if (budget == 0u) {
+			if (flags & (kFlagAlphaHalf | kFlagAlphaOpen)) {
+				exceeded = true;
+			} else {
+				q.CommitNonOpaqueTriangleHit();
+			}
+			q.Abort();
+		} else if (AlphaBlocks(id, q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
+			q.CommitNonOpaqueTriangleHit();
+			q.Abort();
+		} else {
+			budget -= 1u;
+		}
+#endif
+	}
+	if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+		tHit = q.CommittedRayT();
+		return 0.0;
+	}
+#if defined(RT_ALPHA)
+	return exceeded ? ((flags & kFlagAlphaOpen) ? 1.0 : 0.5) : 1.0;
+#else
+	return 1.0;
+#endif
+}
+
+// (47h) ClosestBlocker() against the characters, without the pixel's own character seen from inside (as CharacterVisibilitySelf).
+bool CharacterClosestSelf(float3 origin, float3 dir, float tMin, float tMax, float footprint, SelfInfo self, out bool o_hit, out float o_tHit)
+{
+	o_hit = false;
+	o_tHit = tMax;
+	if (!(tMin < tMax))
+		return true;
+	RayDesc ray;
+	ray.Origin = origin;
+	ray.Direction = dir;
+	ray.TMin = tMin;
+	ray.TMax = tMax;
+	bool complete = true;
+	RayQuery<RAY_FLAG_FORCE_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+	q.TraceRayInline(Scene, RAY_FLAG_NONE, kCharacterMasks, ray);
+#if defined(RT_ALPHA)
+	uint budget = kAlphaCandidateBudget * 2u;
+#endif
+	while (q.Proceed()) {
+		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+			continue;
+		const uint id = q.CandidateInstanceID();
+		if (id == 0u) {
+			if (!(q.CandidateInstanceContributionToHitGroupIndex() == self.owner && q.CandidateTriangleFrontFace() != self.outerFront))
+				q.CommitNonOpaqueTriangleHit();
+			continue;
+		}
+#if defined(RT_ALPHA)
+		if (budget == 0u) {
+			complete = false;
+			q.Abort();
+		} else if (AlphaBlocks(id, q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), footprint)) {
+			q.CommitNonOpaqueTriangleHit();
+		} else {
+			budget -= 1u;
+		}
+#endif
+	}
+	if (complete && q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+		o_hit = true;
+		o_tHit = q.CommittedRayT();
+	}
+	return complete;
+}
+
 
 // One segment [tMin, tMax] of a direction: the scene, then (still open and passing a character's bounds) the characters
 // (their ray starts at least Extra.x along). The darker of the two; tHit = where it was blocked. Counts its rays.
-float Segment(float3 origin, float3 dir, float tMin, float tMax, float footprint, uint flags, bool characters, inout uint rays, out float tHit)
+float Segment(float3 origin, float3 dir, float tMin, float tMax, float footprint, uint flags, bool characters, SelfInfo self, inout uint rays, out float tHit)
 {
 	float v = Visibility(origin, dir, tMin, tMax, kSceneMask, footprint, flags, tHit);
 	rays += 1u;
 	[branch] if (v > 0.0 && characters && (SphereOnSegment(origin, dir, tMax, C.Spheres[0]) || SphereOnSegment(origin, dir, tMax, C.Spheres[1])))
 	{
 		float tCharacter;
-		const float vc = Visibility(origin, dir, max(tMin, C.Extra.x), tMax, kCharacterMasks, footprint, flags, tCharacter);
+		const float vc = self.valid ? CharacterVisibilitySelf(origin, dir, max(tMin, C.Extra.x), tMax, footprint, flags, self, tCharacter) :
+		                              Visibility(origin, dir, max(tMin, C.Extra.x), tMax, kCharacterMasks, footprint, flags, tCharacter);
 		rays += 1u;
 		if (vc < v) {
 			v = vc;
@@ -323,9 +491,21 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 
 			const float rayLength = C.Params.z;
 			const float bias = C.Fade.z + C.Fade.w * dist;
-			const float3 origin = P + N * bias;
 			const float footprint = dist * 2.0 * C.RenderSize.w;  // about a pixel's size there (alpha mip choice)
 			const bool characters = (flags & kFlagCharacters) && !((flags & kFlagFirstPerson) && dist < kFirstPersonNear);
+			// (47h) kFlagSelfFix: is this pixel a character (only inside the character bounds)? Off / not one: every ray as in 47g.
+			SelfInfo self;
+			self.valid = false;
+			self.owner = 0u;
+			self.outerFront = true;
+			[branch] if ((flags & kFlagSelfFix) && characters && (PointInSphere(P, C.Spheres[0]) || PointInSphere(P, C.Spheres[1])))
+			{
+				self = CharacterAt(P, V, N);
+				rays += 1u;
+			}
+			// The ray start: the 47g offset along the normal; (47h) at a character pixel up to kSelfGrazeOffset more for a grazing ray.
+			const float3 origin = P + N * bias;
+			const float3 origin0 = self.valid ? P + N * (bias + kSelfGrazeOffset * (1.0 - abs(dot(N, dir)))) : origin;
 			[branch] if (flags & kFlagDetail)
 			{
 				// (46t) Two scales: the long direction's near and (where that is open) far segment, more near-only directions.
@@ -343,13 +523,14 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 				{
 					bool sceneHit, charHit = false;
 					float tScene, tChar = rayLength;
-					bool complete = ClosestBlocker(origin, dir, 0.0, rayLength, kSceneMask, footprint, sceneHit, tScene);
+					bool complete = ClosestBlocker(origin0, dir, 0.0, rayLength, kSceneMask, footprint, sceneHit, tScene);
 					rays += 1u;
 					const bool nearBlockedByScene = sceneHit && tScene < shortLength;
 					const float charEnd = sceneHit ? shortLength : rayLength;
-					[branch] if (complete && !nearBlockedByScene && characters && (SphereOnSegment(origin, dir, charEnd, C.Spheres[0]) || SphereOnSegment(origin, dir, charEnd, C.Spheres[1])))
+					[branch] if (complete && !nearBlockedByScene && characters && (SphereOnSegment(origin0, dir, charEnd, C.Spheres[0]) || SphereOnSegment(origin0, dir, charEnd, C.Spheres[1])))
 					{
-						complete = ClosestBlocker(origin, dir, max(0.0, C.Extra.x), charEnd, kCharacterMasks, footprint, charHit, tChar);
+						complete = self.valid ? CharacterClosestSelf(origin0, dir, max(0.0, C.Extra.x), charEnd, footprint, self, charHit, tChar) :
+						                        ClosestBlocker(origin0, dir, max(0.0, C.Extra.x), charEnd, kCharacterMasks, footprint, charHit, tChar);
 						rays += 1u;
 					}
 					[branch] if (complete)
@@ -363,12 +544,12 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 				[branch] if (!traced)
 				{
 					float tNear;
-					near0 = Segment(origin, dir, 0.0, shortLength, footprint, flags, characters, rays, tNear);
+					near0 = Segment(origin0, dir, 0.0, shortLength, footprint, flags, characters, self, rays, tNear);
 					far = 1.0;
 					[branch] if (near0 > 0.0 && shortLength < rayLength && farHere)
 					{
 						float tFar;
-						far = Segment(origin, dir, shortLength, rayLength, footprint, flags, characters, rays, tFar);
+						far = Segment(origin0, dir, shortLength, rayLength, footprint, flags, characters, self, rays, tFar);
 					}
 				}
 				float nearSum = near0;
@@ -377,16 +558,26 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 				{
 					// Offsets of the R2 sequence: the extra directions stay well spread around the first one.
 					const float2 u = frac(float2(u1, u2) + float(i) * float2(0.7548776662, 0.5698402910));
+					const float3 dirExtra = CosineDirection(u, T, B, N);
+					const float3 originExtra = self.valid ? P + N * (bias + kSelfGrazeOffset * (1.0 - abs(dot(N, dirExtra)))) : origin;
 					float tExtra;
-					nearSum += Segment(origin, CosineDirection(u, T, B, N), 0.0, shortLength, footprint, flags, characters, rays, tExtra);
+					nearSum += Segment(originExtra, dirExtra, 0.0, shortLength, footprint, flags, characters, self, rays, tExtra);
 				}
 				result = float4(far, weight, farHere ? near0 : 0.0, nearSum / float(extra + 1u));
 			}
 			else
 			{
 				float tHit;
-				const float v = Segment(origin, dir, 0.0, rayLength, footprint, flags, characters, rays, tHit);
+				const float v = Segment(origin0, dir, 0.0, rayLength, footprint, flags, characters, self, rays, tHit);
 				result = float4(v, weight, v < 1.0 ? saturate(tHit / max(rayLength, 1.0)) : 1.0, 1.0);
+			}
+			// (47h) RGBA8 output: the weight's distance fade gets a +-0.5 LSB triangular dither (two uniform numbers), only inside
+			// the fade (exactly 0 and 1 stay exact).
+			[branch] if ((flags & kFlagDither8) && result.g > 0.0 && result.g < 1.0)
+			{
+				const float d0 = InterleavedGradientNoise(float2(p) + float2(47.0, 17.0), frame);
+				const float d1 = InterleavedGradientNoise(float2(p.yx) + float2(5.0, 91.0), frame * 3u + 1u);
+				result.g = saturate(result.g + (d0 + d1 - 1.0) * (0.5 / 255.0));
 			}
 		}
 	}

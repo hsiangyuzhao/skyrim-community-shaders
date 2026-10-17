@@ -727,6 +727,8 @@ namespace RayTracingRT
 		[[nodiscard]] const std::string& AOFault() const { return aoFault_; }
 		void ClearAOFault() { aoFault_.clear(); }
 		[[nodiscard]] std::uint64_t AOBytes() const { return aoBytes_; }
+		/// (47h) The RTAO trace output fell back to RGBA8 (TraceAOCS dithers its 8-bit weight then).
+		[[nodiscard]] bool AOIs8Bit() const { return aoFormat_ == kAOFormat8; }
 		/// The D3D11 queue waits (on the GPU) for the last RTAO trace (its second fence). No-op when nothing is pending.
 		/// Right before the first D3D11 pass that reads it; never before the opaque pass. Returns the CPU ms of the call.
 		float WaitForAO();
@@ -1295,7 +1297,11 @@ namespace RayTracingRT
 		}
 
 		// (46f) RTAO.
-		static constexpr DXGI_FORMAT kAOFormat = DXGI_FORMAT_R8G8B8A8_UNORM;  // TraceAOCS AOOut
+		// TraceAOCS AOOut. (47h) 16-bit float when the GPU shares it (the weight's distance fade had 8-bit steps), else RGBA8
+		// (TraceAOCS then dithers the weight: AOIs8Bit).
+		static constexpr DXGI_FORMAT kAOFormat16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
+		static constexpr DXGI_FORMAT kAOFormat8 = DXGI_FORMAT_R8G8B8A8_UNORM;
+		DXGI_FORMAT aoFormat_ = kAOFormat16;
 		ComPtr<ID3D12RootSignature> aoRootSignature_;
 		ComPtr<ID3D12PipelineState> aoPipeline_;
 		ComPtr<ID3D12PipelineState> aoAlphaPipeline_;
