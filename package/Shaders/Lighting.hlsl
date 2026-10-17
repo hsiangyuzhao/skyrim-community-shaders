@@ -3821,12 +3821,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #	if !defined(DEFERRED) && defined(LIGHT_LIMIT_FIX)
 	// (47h) "Sun Shadow: Depth Check for Translucent Surfaces": with Ray Tracing's sun shadow in this frame's screen mask, a forward
 	// (blended) surface that is not the one in the depth buffer (glass, a blend-only arch) would read the shadow of what lies behind
-	// it. There it takes the cascades at its own position instead (the same test and tolerance as RTPointShadows::Get).
+	// it. There it takes the cascades at its own position instead (the tolerance of RTPointShadows::Get). Only where the surface
+	// behind is well behind it (at least 32 units): the cascades leave out the casters the ray tracer covers, so glass just in front
+	// of a backing wall keeps the screen mask, which holds those shadows (as in 47g).
 	[branch] if ((Permutation::PixelShaderDescriptor & Permutation::LightingFlags::DefShadow) && (Permutation::PixelShaderDescriptor & Permutation::LightingFlags::ShadowDir) &&
 				 (LightLimitFix::StrictFlags & LightLimitFix::kStrictFlagSunDepthCheck) && inWorld && !inReflection && !SharedData::InInterior)
 	{
 		const float sceneDepth = SharedData::GetScreenDepth(screenUV, eyeIndex);
-		[branch] if (abs(sceneDepth - viewPosition.z) > viewPosition.z * 0.02 + 4.0)
+		[branch] if (sceneDepth - viewPosition.z > max(viewPosition.z * 0.02 + 4.0, 32.0))
 		{
 #		if defined(VOLUMETRIC_SHADOWS)
 			float vsmSunShadow;
