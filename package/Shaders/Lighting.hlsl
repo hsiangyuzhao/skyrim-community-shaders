@@ -2256,6 +2256,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float skinPhysPresence = 0.0;
 	float skinPhysBeadFade = 0.0;
 	float skinPhysCellsPerUV = 1.0;
+	float skinPhysGrowth = 1.0;  // (47j) Beads Fade In: how far the beads here have grown in (1 = all, or off)
+	float skinPhysShrink = 0.0;  // (47j) Beads Shrink and Fade Out on (Physical)
 	[branch] if (skinWetNew && !skinWetPhysical)
 	{
 		const float worldZ = input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z;
@@ -2288,7 +2290,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		const float wn = saturate(vAll / Skin::kPhysHold);
 		const float cov = Skin::WetCoverage(wetUV, wn, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z);
 		const float patch = wn > 0.0 ? cov / wn : 0.0;
-		const float vBead = (vSweat * saturate(Skin::wetPhysParams[1].x) + vRain * saturate(Skin::wetPhysParams[1].y) + vSwim * Skin::WetPhysSwimBeadShare(vSwim)) * patch;
+		// (47j) Beads Fade In From the Film: the swim film breaks up between 200 and 120 um, first where the patch noise is
+		// low; the noise only while breaking up (then the swim water is over 120 um: the coverage above skipped it).
+		float breakNoise = 0.5;
+		[branch] if (Skin::WetPhysFlag(Skin::kPhysFlagFadeIn) && vSwim > Skin::kPhysBreakLo && vSwim < Skin::kPhysBreakHi && Skin::wetPhysParams[1].z > 0.0)
+			breakNoise = Skin::WetPatchNoise(wetUV, max(length(wetdUVdx), length(wetdUVdy)), SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z);
+		const float swimBeadShare = Skin::WetPhysSwimBeadShareEx(vSwim, breakNoise);
+		const float vBead = (vSweat * saturate(Skin::wetPhysParams[1].x) + vRain * saturate(Skin::wetPhysParams[1].y) + vSwim * swimBeadShare) * patch;
+		const float vBeadSwim = vSwim * swimBeadShare * patch;
 		const float vFilm = vAll * patch - vBead;
 		// One fade for all beads of the character by their drawn size in render pixels (x the distance LOD); the water of
 		// the beads not drawn (too small to see, or too far) shows as film sheen instead.
@@ -2300,7 +2309,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		skinPhysBeadFade = Skin::WetPhysBeadFade(physCmPerUV, max(length(wetdUVdx), length(wetdUVdy)), Skin::WetDetailLOD(wetPixelWorld));
 		skinPhysPresence = skinPhysBeadFade > 0.0 ? saturate(vBead * Skin::wetPhysParams[2].y) : 0.0;
 		skinPhysCellsPerUV = Skin::WetPhysCellsPerUV(physCmPerUV);
-		skinWetness = saturate((vFilm + vBead * (1.0 - saturate(Skin::wetPhysParams[3].x) * skinPhysBeadFade)) / Skin::kPhysFilmFull);
+		// (47j) The beads still growing in (Fade In: the swim beads, by the break-up) or shrinking out (Shrink) draw less than
+		// their water: that share shows as film sheen, like the beads hidden by the distance fade.
+		float beadDrawn = 1.0;
+		[branch] if (Skin::WetPhysFlag(Skin::kPhysFlagFadeIn) && vBeadSwim > 0.0)
+		{
+			skinPhysGrowth = 1.0 - (vBeadSwim / max(vBead, 1e-4)) * (1.0 - Skin::WetPhysBreakup(vSwim, breakNoise));
+			beadDrawn = Skin::WetPhysGrowthShare(skinPhysGrowth);
+		}
+		skinPhysShrink = Skin::WetPhysFlag(Skin::kPhysFlagShrink) ? 1.0 : 0.0;
+		[branch] if (skinPhysShrink > 0.0)
+			beadDrawn *= Skin::WetPhysShrinkShare(skinPhysPresence);
+		skinWetness = saturate((vFilm + vBead * (1.0 - saturate(Skin::wetPhysParams[3].x) * skinPhysBeadFade * beadDrawn)) / Skin::kPhysFilmFull);
 		skinWetMask = 1.0;
 		skinWetDropDriver = skinPhysPresence > 0.0 ? 1.0 : 0.0;
 		skinWetDropRainOnly = 0.0;
@@ -2388,6 +2408,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			skinWetDetail.tu = dot(dPdu, dPdu) > 1e-20 ? normalize(dPdu) : float3(1.0, 0.0, 0.0);
 			skinWetDetail.tv = dot(dPdv, dPdv) > 1e-20 ? normalize(dPdv) : float3(0.0, 1.0, 0.0);
 			skinWetDetail.domeStrength = clamp(Skin::wetSkinParams[5].z, 0.0, 2.0);
+			skinWetDetail.growth = skinWetPhysical ? skinPhysGrowth : 1.0;  // (47j)
+			skinWetDetail.shrink = skinWetPhysical ? skinPhysShrink : 0.0;
 			skinWetDetailPending = true;
 #		if !defined(WETNESS_EFFECTS)
 			// No sky occlusion without Wetness Effects: the droplets and rivulets right here.
@@ -3355,6 +3377,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float gearPixelWorld = 0.0;  // (47c) world size of a pixel here, for the droplet / rivulet distance LOD
 	float gearPhysBead = 0.0;    // (47i) Physical gear: bead water here (um, rain and swim only)
 	float gearPhysTrail = 0.0;   // (47i) Physical gear: runoff trails here
+	float gearPhysGrowth = 1.0;  // (47j) Physical gear: Beads Fade In growth (1 = all grown, or off)
 #		if defined(CS_SKIN) && !defined(SKIN)
 	if (skinEnabled) {
 		const float charWorldZ = input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z;
@@ -3475,7 +3498,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 					wManual = 0.0;
 					wSweat = saturate(vSweat / Skin::kPhysHold);
 					charDryWetness = saturate((vSwim + vRain + vSweat) / Skin::kPhysHold);
-					gearPhysBead = vRain * saturate(Skin::wetPhysParams[1].y) + vSwim * Skin::WetPhysSwimBeadShare(vSwim);
+					// (47j) Beads Fade In: the swim film breaks up gradually (no patch noise on gear: its middle value), the swim beads
+					// grow in by the break-up.
+					const float gearSwimBead = vSwim * Skin::WetPhysSwimBeadShareEx(vSwim, 0.5);
+					gearPhysBead = vRain * saturate(Skin::wetPhysParams[1].y) + gearSwimBead;
+					gearPhysGrowth = Skin::WetPhysFlag(Skin::kPhysFlagFadeIn) && gearSwimBead > 0.0 ? 1.0 - (gearSwimBead / max(gearPhysBead, 1e-4)) * (1.0 - Skin::WetPhysBreakup(vSwim, 0.5)) : 1.0;
 					gearPhysTrail = saturate(max(swimTrail, Skin::wetPhysParams[2].z * rainRegion)) * saturate(charDryWetness * 4.0);
 					rainWetness = 0.0;
 				}
@@ -3685,7 +3712,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 				}
 				else
 					presence = dropDensity * dropDriver * restFactor * (dropVisibility > 0.0 ? 1.0 : 0.0);
-				const Skin::WetSkinDetail detail = Skin::WetSkinDroplets(uv * cellsPerUV, footprint, gravityUV, alignment, presence, streakDriver);
+				const Skin::WetSkinDetail detail = Skin::WetSkinDroplets(uv * cellsPerUV, footprint, gravityUV, alignment, presence, streakDriver, gearDropPhysical ? gearPhysGrowth : 1.0, gearDropPhysical && Skin::WetPhysFlag(Skin::kPhysFlagShrink) ? 1.0 : 0.0);
 				dropMask = detail.dropMask * dropVisibility;
 				dropRim = detail.dropRim * dropMask;
 				dropSlope = detail.dropSlope;

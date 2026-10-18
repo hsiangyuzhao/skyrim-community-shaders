@@ -82,6 +82,10 @@ struct WetSkin : Feature
 		float Beading = 0.5f;          // (47i) share of the water that gathers in beads (the rest is film)
 		float PhysDryTime = 170.0f;    // (47i) s for soaked skin to dry fully at a neutral environment
 		float PhysDropletSize = 1.0f;  // (47i) coalescence / runoff size scale (bigger: fewer, bigger beads)
+		// (47j) A/B switches, all on by default; off = 47i exactly. Not part of presets.
+		bool PhysWaterLine = true;     // "Physical: Water Line Like Legacy": one water line (deepest since dry) + the current surface
+		bool PhysBeadsFadeIn = true;   // "Physical: Beads Fade In From the Film": the swim film breaks up gradually, beads grow in
+		bool PhysBeadsShrink = true;   // "Physical: Beads Shrink and Fade Out": beads shrink to 0.6x, then fade, staggered
 		// (47i) Moved from Advanced Skin (used by every model): sweat from stamina, or from Dynamic Wetness.
 		float StartSweat = 0.75f;
 		float FullSweat = 0.15f;
@@ -227,6 +231,14 @@ struct WetSkin : Feature
 		static constexpr float kDrawRadius = 0.2f;      // drawn at least this large (at the same coverage): 2 mm, visible up close
 		static constexpr float kMaxCoverage = 0.554f;   // the cell grid at presence 1 (pi 0.42^2)
 		static constexpr float kMaxProgress = 4.0f;     // drying progress kept (the slowest class multiplier)
+		// (47j) Beads Fade In: the swim film breaks into beads between these amounts (Skin.hlsli kPhysBreak*).
+		static constexpr float kBreakHi = 200.0f;
+		static constexpr float kBreakLo = 120.0f;
+		static constexpr float kLineSplit = 3.0f;  // (47j) units the water must come back up inside the lower zone to re-soak it
+		// (47j) Flags in wetPhysParams[3].w (Skin.hlsli WetPhysFlag).
+		static constexpr uint32_t kFlagWaterLine = 1u;
+		static constexpr uint32_t kFlagFadeIn = 2u;
+		static constexpr uint32_t kFlagShrink = 4u;
 	};
 	/// One character's water, advanced on the CPU once per frame (Skin::GetWetness).
 	struct PhysicalState
@@ -239,6 +251,17 @@ struct WetSkin : Feature
 		std::array<float, Phys::kBands> bandP{};  // drying progress per height band (0 soaked .. 1 dry skin .. kMaxProgress)
 		std::array<float, Phys::kBands> bandX{};  // share of the above-capacity water still on (1 in the water)
 		float bandHeight = 0.0f;   // units per band (actor height / kBands)
+		// (47j) Water Line Like Legacy: the deepest water line above the feet since last fully dry (lineHeight, 0 = none). Below the
+		// current surface: soaked. Above it at most two zones, each drying evenly as one: the lower one (surface .. midHeight, state
+		// mid*) emerged last; the upper one (midHeight .. lineHeight, state line*) earlier. Usually only one is there.
+		float lineHeight = 0.0f;
+		float lineP = Phys::kMaxProgress;
+		float lineX = 0.0f;
+		float midHeight = 0.0f;
+		float midP = Phys::kMaxProgress;
+		float midX = 0.0f;
+		float dipMin = 0.0f;      // the lowest surface since the lower zone was last soaked
+		bool lineMode = false;     // the state above was advanced by the water-line model (a switch starts afresh)
 		float depth = 0.0f;        // current water depth above the feet (0 = not in the water)
 		bool wasInWater = false;
 		float exposure = 0.0f;     // last rain exposure (status)
@@ -287,6 +310,8 @@ struct WetSkin : Feature
 	PhysicalLook GetPhysicalLook(const PhysicalState& a_state) const;
 	/// (47i) Skin swim water of a band (um, before the Swimming weight).
 	static float PhysBandWater(float a_p, float a_x);
+	/// (47j) The character's swim bead gate (share of the swim water that beads, before Beading) at swim water a_v (um).
+	float PhysSwimBeadGate(float a_v) const;
 
 	virtual void DrawSettings() override;
 	virtual void LoadSettings(json& o_json) override;

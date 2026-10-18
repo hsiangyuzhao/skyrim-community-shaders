@@ -136,13 +136,36 @@ namespace Skin
 	static const float kPhysHold = 120.0;     // what skin holds after the runoff
 	static const float kPhysFilmFull = 80.0;  // film water at full sheen
 
+	// (47j) Switches in wetPhysParams[3].w (WetSkin::Phys::kFlag*); all 0 = 47i.
+	static const uint kPhysFlagWaterLine = 1u;
+	static const uint kPhysFlagFadeIn = 2u;
+	static const uint kPhysFlagShrink = 4u;
+	bool WetPhysFlag(uint a_flag)
+	{
+		return (uint(max(wetPhysParams[3].w, 0.0) + 0.5) & a_flag) != 0u;
+	}
+
 	/// The swim height profile at h units above the feet: x drying progress, y share of the above-capacity water still on,
 	/// z = 1 below the current water surface (the old 2.5-unit soft line).
+	/// (47j) Water Line Like Legacy: below the water line (wetPhysParams[0].w, units above the feet, 0 = none; the Legacy 2.5-unit
+	/// soft line) at most two evenly drying zones: wetPhysBands[0] up to the line, wetPhysBands[1] up to wetPhysBands[0].z (the part
+	/// that left the water last); under the current surface soaked as before.
 	float3 WetPhysBand(float h)
 	{
 		float3 o = float3(4.0, 0.0, 0.0);
 		const float bandH = wetPhysParams[0].w;
-		[branch] if (bandH > 0.0)
+		[branch] if (WetPhysFlag(kPhysFlagWaterLine))
+		{
+			[branch] if (bandH > 0.0)
+			{
+				o.xy = lerp(float2(4.0, 0.0), wetPhysBands[0].xy, 1.0 - smoothstep(bandH - 2.5, bandH + 2.5, h));
+				const float mid = wetPhysBands[0].z;
+				o.xy = lerp(o.xy, wetPhysBands[1].xy, mid > 0.0 ? 1.0 - smoothstep(mid - 2.5, mid + 2.5, h) : 0.0);
+			}
+			const float depth = wetPhysParams[3].y;
+			o.z = depth > 0.0 ? 1.0 - smoothstep(depth - 2.5, depth + 2.5, h) : 0.0;
+		}
+		else if (bandH > 0.0)
 		{
 			const float t = clamp(h / bandH - 0.5, 0.0, 7.0);
 			const uint i = min(uint(t), 6u);
@@ -184,6 +207,69 @@ namespace Skin
 	float WetPhysSwimBeadShare(float a_v)
 	{
 		return saturate(wetPhysParams[1].z) * (1.0 - smoothstep(120.0, 160.0, a_v));
+	}
+
+	// ---- (47j) Beads Fade In From the Film / Beads Shrink and Fade Out ------------------------------------
+	static const float kPhysBreakHi = 200.0;  // the swim film starts to break up below this (um)
+	static const float kPhysBreakLo = 120.0;  // and is all beads (x Beading) by this
+	static const float kPhysBeadFloor = 0.6;  // a bead shrinks to this share of its drawn size before it fades
+	static const float kPhysBeadRamp = 0.3;   // Shrink: the top 30 % of the present beads (by their hash) are shrinking / fading
+	static const float kPhysBeadInflate = 1.2121;  // Shrink: 1 / (0.7 + 0.3 G(1)): the same drawn bead area as 47i
+
+	/// Whether the swim film is breaking up here (0..1 within kPhysBreakHi -> kPhysBreakLo): where the patch noise n is low
+	/// (the film is thinnest) it starts first, where it is high last; all beads by kPhysBreakLo.
+	float WetPhysBreakup(float a_v, float a_n)
+	{
+		// Even in time: the swim water above the hold capacity runs off exponentially, so the break-up follows its log (0 at 200 um,
+		// 1 at 122.5 um, about 10 s after leaving the water).
+		const float s = saturate(0.2 * log2((kPhysBreakHi - kPhysBreakLo) / max(a_v - kPhysBreakLo, 1e-3)));
+		const float t0 = 0.55 * saturate(a_n);
+		return smoothstep(t0, t0 + 0.45, s);
+	}
+
+	/// The beading share of swim water a_v with the break-up (Fade In on) or the 47i gate (off). a_n: patch noise 0..1.
+	float WetPhysSwimBeadShareEx(float a_v, float a_n)
+	{
+		[branch] if (WetPhysFlag(kPhysFlagFadeIn))
+			return saturate(wetPhysParams[1].z) * WetPhysBreakup(a_v, a_n);
+		return WetPhysSwimBeadShare(a_v);
+	}
+
+	/// A bead's drawn size share and opacity at its life L (0 gone .. 1 full): it grows from kPhysBeadFloor to full over
+	/// L 0.5..1 and fades in over L 0..0.5 at the floor size (never smaller than 0.6x: no pixel-sized flicker).
+	float2 WetPhysBeadLife(float L)
+	{
+		return float2(kPhysBeadFloor + (1.0 - kPhysBeadFloor) * saturate(2.0 * L - 1.0), saturate(2.0 * L));
+	}
+
+	/// Integral of opacity x size^2 over life 0..L (the drawn area of beads spread evenly over their lives).
+	float WetPhysLifeArea(float L)
+	{
+		const float f = kPhysBeadFloor;
+		L = saturate(L);
+		[branch] if (L < 0.5)
+			return f * f * L * L;
+		const float s = f + 2.0 * (1.0 - f) * (L - 0.5);
+		return 0.25 * f * f + (s * s * s - f * f * f) / (6.0 * (1.0 - f));
+	}
+
+	/// Fade In: the drawn share of the beads at growth g (each bead's life saturate((g - 0.6 hash) / 0.4)).
+	float WetPhysGrowthShare(float g)
+	{
+		const float full = saturate((g - 0.4) / 0.6);
+		return full + (2.0 / 3.0) * (WetPhysLifeArea(saturate(g / 0.4)) - WetPhysLifeArea(saturate((g - 0.6) / 0.4)));
+	}
+
+	/// Shrink: the drawn share of the bead water at presence p (<= 1, the 47i presence: 1 up to p 0.825, less where the grid
+	/// is full: pe <= 1.21 keeps the full-size part (hash < 0.7 pe) inside the cells).
+	float WetPhysShrinkShare(float p)
+	{
+		const float pe = p * kPhysBeadInflate;
+		[branch] if (pe <= 1.0)
+			return 1.0;
+		const float lMin = (pe - 1.0) / (kPhysBeadRamp * pe);
+		const float drawn = (1.0 - kPhysBeadRamp) * pe + kPhysBeadRamp * pe * (WetPhysLifeArea(1.0) - WetPhysLifeArea(lMin));
+		return drawn / max(p, 1e-4);
 	}
 
 	/// Trails and rivulets only where water runs off: swim (local), rain and sweat (per character, by region).
@@ -849,6 +935,18 @@ namespace Skin
 		r = WetHash12(float2(id, 7.31)) - 0.5;
 	}
 
+	/// (47j) The wet-patch noise itself (0..1; high = wet first, dry last), as WetCoverageEx uses it.
+	float WetPatchNoise(float2 uv, float uvFootprint, float scale, float lacunarity, float persistence)
+	{
+		// (47c) Faster Noise: the 2D gradient FBM (same parameters, matched statistics).
+		float fbm;
+		[branch] if (WetFastNoiseLOD())
+			fbm = FBMFootprintFast(uv, uvFootprint, scale, lacunarity, persistence);
+		else
+			fbm = FBMFootprint(uv, uvFootprint, scale, 5, lacunarity, persistence, 7.375f);
+		return saturate((fbm - 0.5) * 3.0 + 0.5);
+	}
+
 	/// Soft wet patches: the Perlin noise (Scale / Lacunarity / Persistence) against a threshold that
 	/// falls as the wetness rises, through a wide smoothstep. Patches grow and merge; at full wetness
 	/// the coverage is 1 everywhere. Contrast blends between an even film (0) and the patches (1).
@@ -891,7 +989,11 @@ namespace Skin
 	/// gravityUV: unit direction of "down" in uv (the tangent plane), alignment: how much the
 	/// surface is not facing straight up / down (0..1). Beads come from a jittered cell grid,
 	/// 3x3 neighbourhood; each cell holds at most one bead, so they never overlap into blobs.
-	WetSkinDetail WetSkinDroplets(float2 p, float footprint, float2 gravityUV, float alignment, float presence, float streakDriver)
+	/// (47j) growth: Beads Fade In (1 = off / fully grown): each bead's life saturate((growth - 0.6 hash) / 0.4); shrink: Beads
+	/// Shrink and Fade Out (0 = off): the top kPhysBeadRamp of the present beads (by their presence hash, with the presence
+	/// raised by kPhysBeadInflate: the same drawn area) shrink to kPhysBeadFloor, then fade (WetPhysBeadLife); one bead after
+	/// another as the presence falls (and grow in the same way as it rises). Both off: 47i exactly.
+	WetSkinDetail WetSkinDroplets(float2 p, float footprint, float2 gravityUV, float alignment, float presence, float streakDriver, float growth, float shrink)
 	{
 		WetSkinDetail o;
 		o.dropMask = 0.0;
@@ -903,6 +1005,8 @@ namespace Skin
 		const float sizeRandom = saturate(wetSkinParams[3].y);
 		const float trails = saturate(wetSkinParams[4].x);
 		const float2 across = float2(-gravityUV.y, gravityUV.x);
+		const float presenceDrawn = shrink > 0.0 ? presence * kPhysBeadInflate : presence;
+		const float invRamp = 1.0 / max(kPhysBeadRamp * presenceDrawn, 1e-4);
 
 		[branch] if (presence > 0.0)
 		{
@@ -914,16 +1018,22 @@ namespace Skin
 				[loop] for (int i = -1; i <= 1; ++i)
 				{
 					const float2 c = cell + float2(i, j);
-					if (WetHash12(c) > presence)
+					const float hp = WetHash12(c);
+					if (hp > presenceDrawn)
 						continue;
 					const float2 rnd = WetHash22(c + 17.0);
-					const float radius = 0.42 * lerp(1.0, 0.35, rnd.x * sizeRandom);
-					const float2 center = float2(i, j) + 0.5 + (rnd.yx - 0.5) * (1.0 - 2.0 * radius);
+					const float radiusFull = 0.42 * lerp(1.0, 0.35, rnd.x * sizeRandom);
+					const float2 center = float2(i, j) + 0.5 + (rnd.yx - 0.5) * (1.0 - 2.0 * radiusFull);
+					// (47j) This bead's life: growing in from the film, shrinking out as it dries (1 = full, as 47i).
+					const float lifeIn = saturate((growth - 0.6 * frac((hp + rnd.x + rnd.y) * 7.13)) * 2.5);
+					const float lifeOut = shrink > 0.0 ? saturate((presenceDrawn - hp) * invRamp) : 1.0;
+					const float2 life = WetPhysBeadLife(min(lifeIn, lifeOut));
+					const float radius = radiusFull * life.x;
 					const float2 d = f - center;
 					const float r = length(d) / radius;
 					// Anti-aliased edge: one pixel wide in bead radii.
 					const float aa = max(footprint / radius, 0.05);
-					const float m = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
+					const float m = (1.0 - smoothstep(1.0 - aa, 1.0 + aa, r)) * life.y;
 					if (m > best) {
 						best = m;
 						o.dropSlope = d / radius;
@@ -938,7 +1048,7 @@ namespace Skin
 							const float t = along / length_;
 							const float width = radius * 0.45 * (1.0 - t) + footprint;
 							const float side = abs(dot(d, across));
-							o.trail = max(o.trail, (1.0 - smoothstep(width * 0.5, width, side)) * (1.0 - t) * alignment);
+							o.trail = max(o.trail, (1.0 - smoothstep(width * 0.5, width, side)) * (1.0 - t) * alignment * life.y);
 						}
 					}
 				}
@@ -1035,12 +1145,14 @@ namespace Skin
 		float3 tu;
 		float3 tv;
 		float domeStrength;
+		float growth;  // (47j) Beads Fade In (1 = fully grown / off)
+		float shrink;  // (47j) Beads Shrink and Fade Out (0 = off)
 	};
 
 	/// (47c) The 44a-44e skin droplets and rivulets, unchanged, from a SkinWetDetailSetup.
 	void SkinWetDetail(SkinWetDetailSetup s, out float dropMask, out float dropRim, out float streak, out float3 wetN)
 	{
-		const WetSkinDetail detail = WetSkinDroplets(s.cellUV, s.footprint, s.gravityUV, s.alignment, s.presence, s.streakDriver);
+		const WetSkinDetail detail = WetSkinDroplets(s.cellUV, s.footprint, s.gravityUV, s.alignment, s.presence, s.streakDriver, s.growth, s.shrink);
 		dropMask = detail.dropMask * s.dropVisibility;
 		dropRim = detail.dropRim * dropMask;
 		// (44b) Rivulets on their own scale (they used the droplet cells, about 1/800 uv wide, and
