@@ -113,6 +113,65 @@ namespace ScreenSpacePointLightShadows
 		static const uint StableNoise = (1 << 2);
 		static const uint CoverageView = (1 << 3);  // (46y) Ray Tracing debug view SSPLS Coverage, drawn by Lighting.hlsl
 		static const uint SkipTranslucent = (1 << 4);  // (47h) not in forward (non-DEFERRED) Lighting draws: they read the depth behind them
+		static const uint SkipWeakLights = (1 << 5);   // (47k) no march for a light far weaker than the pixel's strongest
+		static const uint SmarterSteps = (1 << 6);     // (47k) GetShadowFixed: start past the receiver, >= 2 px steps, contact rays 2-3 steps
+		static const uint SkipOnWater = (1 << 7);      // (47k) Water.hlsl: no screen-space light shadows
+		static const uint MaxLightsShift = 8;          // (47k) bits 8-11: Max Shadowed Lights per Pixel (0 = unlimited)
+	}
+
+	/// (47k) Max Shadowed Lights per Pixel (1..7; 0 = unlimited, 47j).
+	uint MaxShadowedLights()
+	{
+		return (SharedData::ssplsSettings.Enable >> SettingFlags::MaxLightsShift) & 0xFu;
+	}
+
+	/// (47k) How much one light matters at this pixel for the light budget: its colour's luminance (with falloff and fade) x N.L.
+	/// No texture reads (the same value in the scoring pre-pass and the lighting loop).
+	float LightScore(float3 a_lightColor, float a_lightAngle)
+	{
+		return dot(max(a_lightColor, 0.0), float3(0.2126, 0.7152, 0.0722)) * saturate(a_lightAngle);
+	}
+
+	/// (47k) Keeps the eight largest scores, descending, in a (first four) and b (next four).
+	void InsertScore(inout float4 a, inout float4 b, float x)
+	{
+		float t;
+		[unroll] for (uint i = 0; i < 4; ++i)
+		{
+			t = max(a[i], x);
+			x = min(a[i], x);
+			a[i] = t;
+		}
+		[unroll] for (uint j = 0; j < 4; ++j)
+		{
+			t = max(b[j], x);
+			x = min(b[j], x);
+			b[j] = t;
+		}
+	}
+
+	/// (47k) The i-th largest score (0-based, i < 8).
+	float ScoreAt(float4 a, float4 b, uint i)
+	{
+		const uint k = i & 3u;
+		const float4 sel = float4(k == 0u, k == 1u, k == 2u, k == 3u);
+		return dot(i < 4u ? a : b, sel);
+	}
+
+	/// (47k) The share of SSPLS strength a light gets from the light budget: 0 = not marched (lit unshadowed by SSPLS), 1 = full.
+	/// a_k: the budget (0 = unlimited), a_top / a_next: the budget's last score and the first one past it, a_strongest: the pixel's
+	/// strongest; a_skipWeak: Skip Weak Lights.
+	float BudgetWeight(float a_score, uint a_k, float a_last, float a_next, float a_strongest, bool a_skipWeak)
+	{
+		float w = 1.0;
+		[branch] if (a_k > 0u)
+		{
+			// In the top K; the ones close to the first light out fade with it (no seam when the set changes).
+			w = a_score >= a_last * 0.999 && a_score > 0.0 ? (a_next > 0.0 ? smoothstep(1.0, 1.5, a_score / a_next) : 1.0) : 0.0;
+		}
+		[branch] if (a_skipWeak)
+			w *= smoothstep(0.035, 0.07, a_score / max(a_strongest, 1e-8)) * smoothstep(0.001, 0.002, a_score);
+		return w;
 	}
 
 	/// Legacy (pre-45) ray march setup. noiseOffset / noiseRotation are both the caller's noise when
@@ -191,7 +250,24 @@ namespace ScreenSpacePointLightShadows
 		const float3 start = viewPosition + (lightDir * 1.5 + toCamera) * footprint;
 		const float2 receiverUV = FrameBuffer::ViewToUV(viewPosition, true, a_eyeIndex);
 
-		const float stepLength = rayLength / steps;
+		// (47k) Smarter Steps: the part of the ray still on the receiver's own 2 pixels is skipped (its samples were skipped anyway),
+		// the steps are at least 2 px apart on screen, the contact rays of shadow-map lights take 2-3 steps. Off: 47j.
+		float tStart = 0.0;
+		uint stepCount = steps;
+		[branch] if (SharedData::ssplsSettings.Enable & SettingFlags::SmarterSteps)
+		{
+			const float3 rayEnd = start + lightDir * rayLength;
+			[branch] if (rayEnd.z > 1.0)
+			{
+				const float screenPixels = length((FrameBuffer::ViewToUV(rayEnd, true, a_eyeIndex) - receiverUV) * renderSize);
+				if (screenPixels <= 2.0)
+					return 1.0;  // the whole ray is on the receiver's own pixels (47j: every sample skipped)
+				tStart = rayLength * (2.0 / screenPixels);
+				const uint bySize = max(uint(ceil((screenPixels - 2.0) * 0.5)), 1u);
+				stepCount = min(steps, isShadowCaster ? min(bySize, screenPixels > 8.0 ? 3u : 2u) : bySize);
+			}
+		}
+		const float stepLength = (rayLength - tStart) / stepCount;
 		const float jitter = 0.5 + (noiseOffset - 0.5) * offsetAmplitude;
 		const float thicknessScale = 0.5 * SharedData::ssplsSettings.CompareToleranceScale;
 		const float stepDepth = abs(lightDir.z) * stepLength;
@@ -205,9 +281,9 @@ namespace ScreenSpacePointLightShadows
 
 		float occlusion = 0.0;
 
-		[loop] for (uint i = 0; i < steps; i++)
+		[loop] for (uint i = 0; i < stepCount; i++)
 		{
-			const float t = (i + jitter) * stepLength;
+			const float t = tStart + (i + jitter) * stepLength;
 			const float3 rayPosition = start + lightDir * t;
 			if (rayPosition.z <= 1.0)
 				break;
@@ -258,7 +334,7 @@ namespace ScreenSpacePointLightShadows
 				}
 			}
 
-			const float endFade = 1.0 - smoothstep(0.5, 1.0, (i + jitter) / steps);
+			const float endFade = 1.0 - smoothstep(0.5, 1.0, t / rayLength);  // (47k) the same as (i + jitter) / steps without Smarter Steps
 			occlusion = max(occlusion, hit * endFade);
 			if (occlusion > 0.95)
 				break;

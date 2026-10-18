@@ -86,6 +86,10 @@ struct WetSkin : Feature
 		bool PhysWaterLine = true;     // "Physical: Water Line Like Legacy": one water line (deepest since dry) + the current surface
 		bool PhysBeadsFadeIn = true;   // "Physical: Beads Fade In From the Film": the swim film breaks up gradually, beads grow in
 		bool PhysBeadsShrink = true;   // "Physical: Beads Shrink and Fade Out": beads shrink to 0.6x, then fade, staggered
+		// (47k) A/B switches, all on by default; off = 47j exactly. Not part of presets.
+		bool PhysBodyLine = true;      // "Physical: Water Line Follows the Body": the stored line by the bind-pose height (Skin::CharBodyHeight)
+		bool PhysBeadCap = true;       // "Physical: Bead Coalescence Cap": coverage <= 0.40 Beading^1.5, runoff keeps the coverage
+		bool PhysLessGrid = true;      // "Physical: Less Grid-like Bead Placement": bead radius 0.36 cell (was 0.42), more jitter
 		// (47i) Moved from Advanced Skin (used by every model): sweat from stamina, or from Dynamic Wetness.
 		float StartSweat = 0.75f;
 		float FullSweat = 0.15f;
@@ -239,6 +243,14 @@ struct WetSkin : Feature
 		static constexpr uint32_t kFlagWaterLine = 1u;
 		static constexpr uint32_t kFlagFadeIn = 2u;
 		static constexpr uint32_t kFlagShrink = 4u;
+		// (47k) Bead Coalescence Cap (per-pixel presence clamp in wetPhysParams[3].z, halo normal clamp) / Less Grid-like Bead
+		// Placement (bead radius kLessGridRadius per cell). Skin.hlsli kPhysFlag*.
+		static constexpr uint32_t kFlagBeadCap = 8u;
+		static constexpr uint32_t kFlagLessGrid = 16u;
+		static constexpr float kCapScale = 0.40f;             // c_cap(B) = kCapScale B^1.5
+		static constexpr float kLessGridRadius = 0.36f;       // bead radius per cell (47j: 0.42)
+		static constexpr float kLessGridCoverage = 0.4072f;   // pi 0.36^2: the cell grid at presence 1
+		static constexpr float kPresenceMax = 0.75f;          // per-pixel presence never above this (Bead Coalescence Cap)
 	};
 	/// One character's water, advanced on the CPU once per frame (Skin::GetWetness).
 	struct PhysicalState

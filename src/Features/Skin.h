@@ -109,7 +109,52 @@ struct Skin : Feature
 		// bead parameters and the per-height swim profile (Skin.hlsli wetPhysParams / wetPhysBands).
 		float4 wetPhysParams[4];
 		float4 wetPhysBands[WetSkin::Phys::kBands];
+		// (47k) "Physical: Water Line Follows the Body" (Skin.hlsli bodyPerGeometry / CharBodyHeight): x the pelvis's bone-matrix
+		// scale (0 = the world height), y NPC Root's world Z - the actor's, zw the bind-pose shoulder (|x|, z; z 0 = unknown).
+		float4 bodyPerGeometry;
+		float4 bodyPerGeometry2;  // x the actor's height (sanity range of the body height)
 	};
+
+	/// (47k) Water Line Follows the Body: per geometry of a character, what maps its bind-pose (pre-skinning) positions to a height on
+	/// the body. Built once per geometry / skin instance (bone names and bind data under SEH), validated every draw.
+	struct BodyGeometry
+	{
+		const void* skin = nullptr;  // the skin instance it was read from (another one rebuilds it)
+		bool usable = false;         // skinned, third person, a central bone in its list
+		int32_t refBone = -1;        // index in the skin's bone list of its central bone (pelvis / spine / thigh / calf / head)
+		int32_t refRank = 0;         // its place in the preference list (from the neck on: the pelvis's world scale is used)
+		float refBindZ = 0.0f;       // that bone's bind-pose joint height (model space)
+		float stbScale = 1.0f;       // its skin-to-bone scale
+		bool shoulderKnown = false;  // "NPC L UpperArm [LUar]" in its list
+		float shoulderX = 0.0f;      // its bind-pose joint, |x| and z (model space)
+		float shoulderZ = 0.0f;
+		uint32_t usedFrame = 0;
+	};
+	/// (47k) Per character: NPC Root (high heels lift), whether the skeleton is a humanoid's, the shoulder from any of its geometries.
+	struct BodyActor
+	{
+		const void* root = nullptr;  // the 3D (third person) the lookups were made in (compare only)
+		uint32_t lookupFrame = UINT32_MAX;
+		RE::NiPointer<RE::NiAVObject> npcRoot;
+		RE::NiPointer<RE::NiAVObject> pelvis;
+		bool humanoid = false;
+		float pelvisScale = 0.0f;  // its world scale this frame (0 = unreadable)
+		uint32_t frame = UINT32_MAX;  // rootOffset / feetZ / height of this frame
+		float rootOffset = 0.0f;
+		float feetZ = 0.0f;
+		float height = 128.0f;
+		bool shoulderKnown = false;
+		float shoulderX = 0.0f;
+		float shoulderZ = 0.0f;
+	};
+	/// (47k) Status: geometries drawn with the body height / the world height last frame (Physical, switch on).
+	struct BodyLineStats
+	{
+		uint32_t body = 0;
+		uint32_t world = 0;
+	};
+	BodyLineStats bodyLineStats, bodyLineCounting;
+	uint32_t bodyLineStatsFrame = UINT32_MAX;
 
 	/// (46a) See-through (alpha-blended) clothes of characters in water (Character Wetness > See-through
 	/// clothes in water). Their draws come after the water, whose depth hid everything below the surface.
@@ -210,11 +255,16 @@ struct Skin : Feature
 		WetSkin::PhysicalState phys;
 		WetSkin::PhysicalLook look;
 		ActorSnow shelter;
+		// (47k) Water Line Follows the Body.
+		BodyActor body;
+		std::unordered_map<const RE::BSGeometry*, BodyGeometry> bodyGeometry;
 	};
 	/// (44f) Item class prior (0 unknown, 1 cloth, 2 leather, 3 metal, 4 fur) of one geometry of a
 	/// character, from the keywords of the worn item it belongs to (rebuilt on a miss, at most
 	/// every 15 frames; animals are fur).
 	uint8_t GetItemClassPrior(RE::Actor* a_actor, ActorWetState& a_state, const RE::BSGeometry* a_geometry, uint32_t a_frame);
+	/// (47k) bodyPerGeometry / bodyPerGeometry2 for one geometry of a Physical character (x = 0: the world height).
+	void GetBodyFrame(RE::BSGeometry* a_geometry, RE::Actor* a_actor, ActorWetState& a_state, float4& o_body, float4& o_body2);
 	ActorWetState* lastWetState = nullptr;  // (44c) the state GetWetness last returned (this draw)
 	static constexpr size_t kMaxActorWetStates = 1024;
 	static constexpr uint32_t kActorWetStaleFrames = 600;

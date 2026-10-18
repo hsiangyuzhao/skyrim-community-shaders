@@ -1171,6 +1171,7 @@ PS_OUTPUT main(PS_INPUT input)
 			[branch] if (
 				!FrameBuffer::FrameParams.z &&
 				SharedData::ssplsSettings.Enable &&
+				!(SharedData::ssplsSettings.Enable & ScreenSpacePointLightShadows::SettingFlags::SkipOnWater) &&  // (47k) Skip SSPLS on Water
 				!(light.lightFlags & LightLimitFix::LightFlags::Simple) &&
 				lightAngle > 0.0
 #						if defined(RT_POINT_SHADOWS)

@@ -48,7 +48,37 @@ namespace Skin
 		// (47i) Swim water per height band, feet up: x drying progress (0 soaked, 1 dry skin, up to 4), y share of the water
 		// above the hold capacity still on (1 in the water).
 		float4 wetPhysBands[8];
+		// (47k) "Physical: Water Line Follows the Body", per geometry (Skin::GetBodyFrame): x = s, the bone-matrix scale of the
+		// pelvis (node world scale x skin-to-bone scale; NPC / race scale included; 0 = use the world height: off, rigid gear, first
+		// person, creatures), y = NPC Root's world Z minus the actor's (high heels), zw = the bind-pose shoulder joint ("NPC L
+		// UpperArm [LUar]": |x|, z in model space; z <= 0 = unknown, no arm remap).
+		float4 bodyPerGeometry;
+		// (47k) x = the actor's height (units; the body height is trusted only within -20 .. x + 40), yzw unused.
+		float4 bodyPerGeometry2;
 	};
+
+	/// (47k) Height above the feet that stays on the same point of the body while the limbs move: the pre-skinning (bind-pose)
+	/// position's z, the arms (A / T bind pose) remapped as if hanging from the shoulder, times the skeleton's scale plus the
+	/// root's lift. The world height (worldZ - feet) where bodyPerGeometry.x is 0 or the result is implausible.
+	float CharBodyHeight(float3 modelPos, float worldZ)
+	{
+		const float hWorld = worldZ - skinPerGeometry.z;
+		const float4 b = bodyPerGeometry;
+		float h = hWorld;
+		[branch] if (b.x > 0.0)
+		{
+			float hModel = modelPos.z;
+			[branch] if (b.w > 0.0)
+			{
+				const float ax = abs(modelPos.x);
+				const float hArm = b.w - length(float2(max(ax - b.z, 0.0), modelPos.z - b.w));
+				hModel = lerp(hModel, hArm, smoothstep(b.z, b.z + 4.0, ax));
+			}
+			const float hBody = b.x * hModel + b.y;
+			h = (hBody >= -20.0 && hBody <= bodyPerGeometry2.x + 40.0) ? hBody : hWorld;
+		}
+		return h;
+	}
 
 	/// (46a) This character's snow amount at a world height (absolute Z), or a_global when the
 	/// character has none kept. The washed part (below the water line) has its own amount, with a
@@ -140,6 +170,11 @@ namespace Skin
 	static const uint kPhysFlagWaterLine = 1u;
 	static const uint kPhysFlagFadeIn = 2u;
 	static const uint kPhysFlagShrink = 4u;
+	// (47k) Bead Coalescence Cap (per-pixel presence at most wetPhysParams[3].z, no halo at the bead edge) / Less Grid-like Bead
+	// Placement (a bead is kPhysLessGridRadius of its cell; 47j 0.42). WetSkin::Phys::kFlag*.
+	static const uint kPhysFlagBeadCap = 8u;
+	static const uint kPhysFlagLessGrid = 16u;
+	static const float kPhysLessGridRadius = 0.36;
 	bool WetPhysFlag(uint a_flag)
 	{
 		return (uint(max(wetPhysParams[3].w, 0.0) + 0.5) & a_flag) != 0u;
@@ -150,7 +185,9 @@ namespace Skin
 	/// (47j) Water Line Like Legacy: below the water line (wetPhysParams[0].w, units above the feet, 0 = none; the Legacy 2.5-unit
 	/// soft line) at most two evenly drying zones: wetPhysBands[0] up to the line, wetPhysBands[1] up to wetPhysBands[0].z (the part
 	/// that left the water last); under the current surface soaked as before.
-	float3 WetPhysBand(float h)
+	/// (47k) hBody: the body-fixed height (CharBodyHeight) for the stored line / zones / bands; hWorld: the world height for the
+	/// current water surface (the same value when Water Line Follows the Body is off).
+	float3 WetPhysBand(float h, float hWorld)
 	{
 		float3 o = float3(4.0, 0.0, 0.0);
 		const float bandH = wetPhysParams[0].w;
@@ -163,7 +200,7 @@ namespace Skin
 				o.xy = lerp(o.xy, wetPhysBands[1].xy, mid > 0.0 ? 1.0 - smoothstep(mid - 2.5, mid + 2.5, h) : 0.0);
 			}
 			const float depth = wetPhysParams[3].y;
-			o.z = depth > 0.0 ? 1.0 - smoothstep(depth - 2.5, depth + 2.5, h) : 0.0;
+			o.z = depth > 0.0 ? 1.0 - smoothstep(depth - 2.5, depth + 2.5, hWorld) : 0.0;
 		}
 		else if (bandH > 0.0)
 		{
@@ -172,7 +209,7 @@ namespace Skin
 			const float f = smoothstep(0.35, 0.65, t - float(i));
 			o.xy = lerp(wetPhysBands[i].xy, wetPhysBands[i + 1].xy, f);
 			const float depth = wetPhysParams[3].y;
-			o.z = depth > 0.0 ? 1.0 - smoothstep(depth - 2.5, depth + 2.5, h) : 0.0;
+			o.z = depth > 0.0 ? 1.0 - smoothstep(depth - 2.5, depth + 2.5, hWorld) : 0.0;
 		}
 		return o;
 	}
@@ -286,10 +323,17 @@ namespace Skin
 		return smoothstep(1.0, 2.5, dPx) * lod;
 	}
 
-	/// Droplet cells per uv unit for the drawn bead radius (a bead is 0.42 cell in radius).
+	/// Droplet cells per uv unit for the drawn bead radius (a bead is 0.42 cell in radius; (47k) Less Grid-like: 0.36).
 	float WetPhysCellsPerUV(float cmPerUV)
 	{
-		return 0.42 * cmPerUV / max(wetPhysParams[2].x, 0.01);
+		return (WetPhysFlag(kPhysFlagLessGrid) ? kPhysLessGridRadius : 0.42) * cmPerUV / max(wetPhysParams[2].x, 0.01);
+	}
+
+	/// (47k) Bead Coalescence Cap: the pixel's bead presence at most wetPhysParams[3].z (c_cap / the grid's coverage, <= 0.75);
+	/// off: unchanged.
+	float WetPhysPresenceCap(float a_presence)
+	{
+		return WetPhysFlag(kPhysFlagBeadCap) ? min(a_presence, max(wetPhysParams[3].z, 0.0)) : a_presence;
 	}
 
 	/// (44c) Twomey wet albedo, d = 0..2: d <= 1 moves toward one soaking step A / (1.77 - 0.77 A),
@@ -1007,6 +1051,9 @@ namespace Skin
 		const float2 across = float2(-gravityUV.y, gravityUV.x);
 		const float presenceDrawn = shrink > 0.0 ? presence * kPhysBeadInflate : presence;
 		const float invRamp = 1.0 / max(kPhysBeadRamp * presenceDrawn, 1e-4);
+		// (47k) Physical only (the flags are 0 in the other models): a smaller bead per cell, no halo slope past the bead's edge.
+		const float cellRadius = WetPhysFlag(kPhysFlagLessGrid) ? kPhysLessGridRadius : 0.42;
+		const bool slopeClamp = WetPhysFlag(kPhysFlagBeadCap);
 
 		[branch] if (presence > 0.0)
 		{
@@ -1022,7 +1069,7 @@ namespace Skin
 					if (hp > presenceDrawn)
 						continue;
 					const float2 rnd = WetHash22(c + 17.0);
-					const float radiusFull = 0.42 * lerp(1.0, 0.35, rnd.x * sizeRandom);
+					const float radiusFull = cellRadius * lerp(1.0, 0.35, rnd.x * sizeRandom);
 					const float2 center = float2(i, j) + 0.5 + (rnd.yx - 0.5) * (1.0 - 2.0 * radiusFull);
 					// (47j) This bead's life: growing in from the film, shrinking out as it dries (1 = full, as 47i).
 					const float lifeIn = saturate((growth - 0.6 * frac((hp + rnd.x + rnd.y) * 7.13)) * 2.5);
@@ -1036,7 +1083,7 @@ namespace Skin
 					const float m = (1.0 - smoothstep(1.0 - aa, 1.0 + aa, r)) * life.y;
 					if (m > best) {
 						best = m;
-						o.dropSlope = d / radius;
+						o.dropSlope = slopeClamp ? d / max(length(d), radius) : d / radius;
 						o.dropRim = saturate(1.0 - abs(r - 0.85) / max(0.2, aa));
 					}
 					// A short trail below the bead, along gravity, tapering away.

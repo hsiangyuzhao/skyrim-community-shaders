@@ -4,6 +4,7 @@
 #include "Features/PerformanceOverlay.h"
 #include "Features/RayTracing.h"
 #include "Features/ScreenSpaceGI.h"
+#include "Features/ScreenSpacePointLightShadows.h"
 #include "Features/ScreenSpaceRayTracing.h"
 #include "Features/Upscaling.h"
 #include "Menu.h"
@@ -775,6 +776,7 @@ namespace Util::FrameTrace
 			} else {
 				text += "; SSGI not loaded";
 			}
+			text += "; " + globals::features::screenSpacePointLightShadows.DescribeForTrace();  // (47k)
 			return text;
 		}
 

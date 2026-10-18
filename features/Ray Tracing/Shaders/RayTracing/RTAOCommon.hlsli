@@ -16,6 +16,7 @@ static const uint kFlagSplit = 8u;           // debug split
 static const uint kFlagDetail = 16u;         // (46t) the detail term is multiplied in (TraceAOCS .a, RTAOFilterCS RTAO_DETAIL)
 static const uint kFlagValidity = 32u;       // (46t) TraceAOCS .b is the far sample's weight (two scales), not the hit distance
 static const uint kFlagDetailHistory = 64u;  // (46t) the detail history holds last frame
+static const uint kFlagNormalDebug = 128u;   // (47k) t5 of RTAOCompositeCS holds this frame's Smooth Normals debug view (AONormalPrepCS)
 
 // Debug views (RayTracing::AODebugView)
 static const uint kViewRaw = 1u;
@@ -24,3 +25,6 @@ static const uint kViewSplit = 3u;
 static const uint kViewRawDetail = 4u;       // (46t)
 static const uint kViewFilteredDetail = 5u;  // (46t)
 static const uint kViewFinal = 6u;           // (46t)
+static const uint kViewNormalConfidence = 7u;  // (47k) Smooth Normals: confidence
+static const uint kViewNormalNs = 8u;          // (47k) Smooth Normals: the hemisphere normal
+static const uint kViewNormalNg = 9u;          // (47k) Smooth Normals: the depth normal

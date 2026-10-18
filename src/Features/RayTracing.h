@@ -261,6 +261,11 @@ public:
 		// (47j) AOSmoothNormals "RTAO: Smooth Normals": the AO hemisphere around last frame's G-buffer normal reprojected to this frame
 		// (AONormalPrepCS, confidence-blended toward the depth normal), not the per-facet depth normal. Off = 47i.
 		bool AOSmoothNormals = true;
+		// (47k) AOSmoothNormals2 "RTAO: Smooth Normals v2" (needs Smooth Normals): the ray start offset along the smooth normal, a
+		// direction below the depth normal's plane projected onto it (not mirrored); AONormalPrepCS: the best match in a 3x3 of last
+		// frame, tolerances by the pixel footprint / max(N.V, 0.2), and the low-confidence fallback a depth-only smoothed normal (a
+		// sparse ring of depth normals weighted by plane agreement) instead of the raw facet. Off = 47j.
+		bool AOSmoothNormals2 = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -278,6 +283,9 @@ public:
 		RawDetail,       // (46t) this frame's near rays (open share)
 		FilteredDetail,  // (46t) the detail term after its filter (and history)
 		Final,           // (46t) 1 - the final AO the lighting gets
+		NormalConfidence,  // (47k) Smooth Normals: green = used (by its confidence), red = fell back, blue = no data
+		NormalNs,          // (47k) the normal the AO hemisphere is built around (RGB = xyz * 0.5 + 0.5)
+		NormalNg,          // (47k) the depth (facet) normal
 		Count
 	};
 	Settings settings;
@@ -802,6 +810,11 @@ private:
 		double camera[3]{};
 	} aoNormalPrev;
 	bool aoNormalsThisFrame = false;
+	// (47k) RTAO debug views "Smooth Normals: Confidence" / "Ns" / "Ng": AONormalPrepCS writes the chosen view here (only while one of
+	// them is on); RTAOCompositeCS copies it into the overlay.
+	DenoiseTexture aoNormalDebug;
+	uint32_t aoNormalDebugWidth = 0, aoNormalDebugHeight = 0;
+	uint32_t aoNormalDebugFrame = UINT32_MAX;  // frame it was written in
 	/// Before PrepareCS: the smooth normals for this frame's RTAO trace (sets its flag); false = the trace keeps the depth normal.
 	bool RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height);
 	/// After PrepareCS: this frame's camera, for next frame's reprojection.

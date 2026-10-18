@@ -79,6 +79,7 @@ static const uint kFlagHalfFar = 64u;     // (46y) two scales: the far part only
 static const uint kFlagDither8 = 128u;    // (47h) the output is RGBA8: dither the weight (.g)
 static const uint kFlagSelfFix = 256u;    // (47h) RTAO: Character Self-Occlusion Fix (see the top)
 static const uint kFlagSmoothNormals = 512u;  // (47j) RTAO: Smooth Normals (see main)
+static const uint kFlagSmoothNormals2 = 1024u;  // (47k) RTAO: Smooth Normals v2 (with kFlagSmoothNormals): offsets along Ns, projection
 static const uint kMaxDetailRays = 4u;
 static const float kSelfProbe = 4.0;          // (47h) CharacterAt: the probe reaches this far to either side of the pixel (units)
 static const float kSelfGrazeOffset = 1.5;    // (47h) extra ray start offset at a character pixel for a ray along the surface (units)
@@ -488,9 +489,13 @@ float Segment(float3 origin, float3 dir, float tMin, float tMax, float footprint
 
 // (47j) A direction below the depth normal's plane mirrored above it (Smooth Normals: the hemisphere is around Ns; with Ns = Ng
 // nothing changes: every cosine direction is above it).
-float3 AboveNg(float3 d, float3 Ng, bool a_on)
+// (47k) a_project (Smooth Normals v2): instead laid onto the plane (lifted to 0.02 above it): the mirror flipped the directions next
+// to the plane between the two sides of a facet edge and left a step there.
+float3 AboveNg(float3 d, float3 Ng, bool a_on, bool a_project)
 {
 	const float k = dot(d, Ng);
+	[branch] if (a_project)
+		return (a_on && k < 0.02) ? normalize(d - Ng * (k - 0.02)) : d;
 	return (a_on && k < 0.0) ? d - 2.0 * k * Ng : d;
 }
 
@@ -566,7 +571,9 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 			const float3 helper = abs(Ns.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
 			const float3 T = normalize(cross(helper, Ns));
 			const float3 B = cross(Ns, T);
-			const float3 dir = AboveNg(CosineDirection(float2(u1, u2), T, B, Ns), N, (flags & kFlagSmoothNormals) != 0u);
+			const bool smoothOn = (flags & kFlagSmoothNormals) != 0u;
+			const bool smooth2 = smoothOn && (flags & kFlagSmoothNormals2) != 0u;
+			const float3 dir = AboveNg(CosineDirection(float2(u1, u2), T, B, Ns), N, smoothOn, smooth2);
 
 			const float rayLength = C.Params.z;
 			const float bias = C.Fade.z + C.Fade.w * dist;
@@ -583,8 +590,10 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 				rays += 1u;
 			}
 			// The ray start: the 47g offset along the normal; (47h) at a character pixel up to kSelfGrazeOffset more for a grazing ray.
-			const float3 origin = P + N * bias;
-			const float3 origin0 = self.valid ? P + N * (bias + kSelfGrazeOffset * (1.0 - abs(dot(N, dir)))) : origin;
+			// (47k) Smooth Normals v2: the offsets along the smooth normal (the facet's jumped at every facet edge). Ns = N without data.
+			const float3 Noff = smooth2 ? Ns : N;
+			const float3 origin = P + Noff * bias;
+			const float3 origin0 = self.valid ? P + Noff * (bias + kSelfGrazeOffset * (1.0 - abs(dot(Noff, dir)))) : origin;
 			[branch] if (flags & kFlagDetail)
 			{
 				// (46t) Two scales: the long direction's near and (where that is open) far segment, more near-only directions.
@@ -637,8 +646,8 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 				{
 					// Offsets of the R2 sequence: the extra directions stay well spread around the first one.
 					const float2 u = frac(float2(u1, u2) + float(i) * float2(0.7548776662, 0.5698402910));
-					const float3 dirExtra = AboveNg(CosineDirection(u, T, B, Ns), N, (flags & kFlagSmoothNormals) != 0u);
-					const float3 originExtra = self.valid ? P + N * (bias + kSelfGrazeOffset * (1.0 - abs(dot(N, dirExtra)))) : origin;
+					const float3 dirExtra = AboveNg(CosineDirection(u, T, B, Ns), N, smoothOn, smooth2);
+					const float3 originExtra = self.valid ? P + Noff * (bias + kSelfGrazeOffset * (1.0 - abs(dot(Noff, dirExtra)))) : origin;
 					float tExtra;
 					nearSum += Segment(originExtra, dirExtra, 0.0, shortLength, footprint, flags, characters, self, rays, tExtra);
 				}

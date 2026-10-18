@@ -856,6 +856,271 @@ namespace
 	}
 }
 
+// ---------------------------------------------------------------------------------------------
+// (47k) "Physical: Water Line Follows the Body"
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+	/// The skin instance's bone list and bind data (SEH: a mod can leave them dangling; the RayTracing Characters.cpp pattern).
+	struct BodySkinRefs
+	{
+		RE::NiAVObject** bones = nullptr;
+		RE::NiSkinData::BoneData* boneData = nullptr;
+		std::uint32_t boneCount = 0;
+	};
+
+	bool ReadBodySkinRefs(RE::NiSkinInstance* a_skin, BodySkinRefs& o_refs)
+	{
+		__try {
+			RE::NiSkinData* data = a_skin->skinData.get();
+			o_refs.bones = a_skin->bones;
+			if (!data || !o_refs.bones)
+				return false;
+			o_refs.boneCount = data->bones;
+			o_refs.boneData = data->boneData;
+			return o_refs.boneData != nullptr && o_refs.boneCount > 0 && o_refs.boneCount <= 1024;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	/// Index of the bone called a_name in the skin's list (-1 = none, also on a bad read).
+	int32_t FindBodyBone(const BodySkinRefs& a_refs, const char* a_name)
+	{
+		__try {
+			for (std::uint32_t i = 0; i < a_refs.boneCount; ++i) {
+				const RE::NiAVObject* node = a_refs.bones[i];
+				if (!node)
+					continue;
+				const char* name = node->name.c_str();
+				if (name && std::strcmp(name, a_name) == 0)
+					return static_cast<int32_t>(i);
+			}
+			return -1;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return -1;
+		}
+	}
+
+	/// A bone's bind-pose joint in the skin's (model) space: the origin of its bone space through skin-to-bone inverted
+	/// (x = -R^T t / s), and that scale.
+	bool ReadBindJoint(const BodySkinRefs& a_refs, int32_t a_index, float o_joint[3], float& o_scale)
+	{
+		if (a_index < 0 || static_cast<std::uint32_t>(a_index) >= a_refs.boneCount)
+			return false;
+		__try {
+			const RE::NiTransform& s = a_refs.boneData[a_index].skinToBone;
+			if (!(s.scale > 1e-4f) || !(s.scale < 1e4f))
+				return false;
+			const float t[3] = { s.translate.x, s.translate.y, s.translate.z };
+			for (int c = 0; c < 3; ++c)
+				o_joint[c] = -(s.rotate.entry[0][c] * t[0] + s.rotate.entry[1][c] * t[1] + s.rotate.entry[2][c] * t[2]) / s.scale;
+			o_scale = s.scale;
+			for (int c = 0; c < 3; ++c)
+				if (!(std::fabs(o_joint[c]) < 1e5f))
+					return false;
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	/// A bone's world scale and Z this frame.
+	bool ReadBoneWorld(const BodySkinRefs& a_refs, int32_t a_index, float& o_scale, float& o_z)
+	{
+		if (a_index < 0 || static_cast<std::uint32_t>(a_index) >= a_refs.boneCount)
+			return false;
+		__try {
+			const RE::NiAVObject* node = a_refs.bones[a_index];
+			if (!node)
+				return false;
+			o_scale = node->world.scale;
+			o_z = node->world.translate.z;
+			return std::isfinite(o_scale) && std::isfinite(o_z) && o_scale > 1e-4f && o_scale < 1e4f;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	/// Whether a_object hangs below a_root (SEH: parents of a detached part may be gone).
+	bool BodyIsUnder(const RE::NiAVObject* a_object, const RE::NiAVObject* a_root)
+	{
+		if (!a_object || !a_root)
+			return false;
+		__try {
+			int depth = 0;
+			for (const RE::NiAVObject* node = a_object; node && depth < 96; node = node->parent, ++depth)
+				if (node == a_root)
+					return true;
+			return false;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	bool ReadNodeWorldZ(const RE::NiAVObject* a_node, float& o_z)
+	{
+		if (!a_node)
+			return false;
+		__try {
+			o_z = a_node->world.translate.z;
+			return std::isfinite(o_z);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// The central bones, in order of preference (an individually scaled head late).
+	constexpr const char* kBodyCentralBones[] = { "NPC Pelvis [Pelv]", "NPC Spine [Spn0]", "NPC Spine1 [Spn1]", "NPC Spine2 [Spn2]",
+		"NPC L Thigh [LThg]", "NPC R Thigh [RThg]", "NPC L Calf [LClf]", "NPC R Calf [RClf]", "NPC Neck [Neck]", "NPC Head [Head]",
+		"NPC L UpperArm [LUar]", "NPC R UpperArm [RUar]", "NPC L Forearm [LLar]", "NPC R Forearm [RLar]", "NPC L Foot [Lft ]",
+		"NPC R Foot [Rft ]" };
+	constexpr const char* kBodyShoulder = "NPC L UpperArm [LUar]";
+	constexpr int32_t kBodyOwnScaleRanks = 8;  // pelvis, spines, thighs, calves: their own world scale; the rest: the pelvis's
+
+	bool ReadNodeWorldScale(const RE::NiAVObject* a_node, float& o_scale)
+	{
+		if (!a_node)
+			return false;
+		__try {
+			o_scale = a_node->world.scale;
+			return std::isfinite(o_scale) && o_scale > 1e-4f && o_scale < 1e4f;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+	constexpr std::size_t kMaxBodyGeometries = 256;
+}
+
+void Skin::GetBodyFrame(RE::BSGeometry* a_geometry, RE::Actor* a_actor, ActorWetState& a_state, float4& o_body, float4& o_body2)
+{
+	o_body = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	o_body2 = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	const uint32_t frame = globals::state->frameCount;
+	if (frame != bodyLineStatsFrame) {
+		bodyLineStats = bodyLineCounting;
+		bodyLineCounting = {};
+		bodyLineStatsFrame = frame;
+	}
+	struct Count
+	{
+		Skin* self;
+		const float4& body;
+		~Count()
+		{
+			if (body.x > 0.0f)
+				++self->bodyLineCounting.body;
+			else
+				++self->bodyLineCounting.world;
+		}
+	} count{ this, o_body };
+	if (!a_geometry || !a_actor)
+		return;
+	// Rigid gear (helmets, shields, weapons): its model space is not the body's.
+	RE::NiSkinInstance* skin = a_geometry->GetGeometryRuntimeData().skinInstance.get();
+	if (!skin)
+		return;
+
+	// Per character, once per frame: NPC Root (high heels), the humanoid check (pelvis, calf, foot; re-checked when its 3D changes
+	// and every 300 frames), the feet and the height.
+	auto& body = a_state.body;
+	RE::NiAVObject* root = a_actor->Get3D(false);
+	if (!root)
+		return;
+	if (body.root != root || body.lookupFrame == UINT32_MAX || frame - body.lookupFrame > 300u) {
+		static const RE::BSFixedString kRoot("NPC Root [Root]");
+		static const RE::BSFixedString kPelvis("NPC Pelvis [Pelv]");
+		static const RE::BSFixedString kCalf("NPC L Calf [LClf]");
+		static const RE::BSFixedString kFoot("NPC L Foot [Lft ]");
+		if (body.root != root) {
+			body.shoulderKnown = false;
+			a_state.bodyGeometry.clear();
+		}
+		body.root = root;
+		body.lookupFrame = frame;
+		body.npcRoot.reset(root->GetObjectByName(kRoot));
+		body.pelvis.reset(root->GetObjectByName(kPelvis));
+		body.humanoid = body.npcRoot && body.pelvis && root->GetObjectByName(kCalf) && root->GetObjectByName(kFoot);
+	}
+	if (!body.humanoid)
+		return;
+	if (body.frame != frame) {
+		body.frame = frame;
+		body.feetZ = a_actor->GetPositionZ();
+		body.height = std::max(a_actor->GetHeight(), 32.0f);
+		float rootZ = body.feetZ;
+		body.rootOffset = ReadNodeWorldZ(body.npcRoot.get(), rootZ) ? std::clamp(rootZ - body.feetZ, -64.0f, 64.0f) : 0.0f;
+		body.pelvisScale = ReadNodeWorldScale(body.pelvis.get(), body.pelvisScale) ? body.pelvisScale : 0.0f;
+	}
+
+	// Per geometry: its central bone, its bind height and skin-to-bone scale, the shoulder (rebuilt for another skin instance).
+	if (a_state.bodyGeometry.size() >= kMaxBodyGeometries)
+		a_state.bodyGeometry.clear();
+	auto& geo = a_state.bodyGeometry[a_geometry];
+	geo.usedFrame = frame;
+	BodySkinRefs refs;
+	if (!ReadBodySkinRefs(skin, refs)) {
+		geo = {};
+		return;
+	}
+	if (geo.skin != skin) {
+		geo = {};
+		geo.skin = skin;
+		geo.usedFrame = frame;
+		// First person (the player's first-person 3D): its arms are not where the third-person body's line is.
+		const bool firstPerson = a_actor->IsPlayerRef() && BodyIsUnder(a_geometry, a_actor->Get3D(true));
+		if (!firstPerson) {
+			for (int32_t rank = 0; rank < static_cast<int32_t>(std::size(kBodyCentralBones)); ++rank) {
+				const int32_t index = FindBodyBone(refs, kBodyCentralBones[rank]);
+				float joint[3], scale;
+				if (index >= 0 && ReadBindJoint(refs, index, joint, scale) && joint[2] > 5.0f) {
+					geo.refBone = index;
+					geo.refRank = rank;
+					geo.refBindZ = joint[2];
+					geo.stbScale = scale;
+					geo.usable = true;
+					break;
+				}
+			}
+			const int32_t shoulder = FindBodyBone(refs, kBodyShoulder);
+			float joint[3], scale;
+			if (shoulder >= 0 && ReadBindJoint(refs, shoulder, joint, scale) && joint[2] > 10.0f && std::fabs(joint[0]) > 1.0f) {
+				geo.shoulderKnown = true;
+				geo.shoulderX = std::fabs(joint[0]);
+				geo.shoulderZ = joint[2];
+				body.shoulderKnown = true;  // the geometries without that bone (gloves, bracers) use the body's
+				body.shoulderX = geo.shoulderX;
+				body.shoulderZ = geo.shoulderZ;
+			}
+		}
+	}
+	if (!geo.usable)
+		return;
+
+	// s = the central bone's bone-matrix scale (its world scale x skin-to-bone scale: NPC / race scale included).
+	float worldScale = 1.0f, boneZ = 0.0f;
+	if (!ReadBoneWorld(refs, geo.refBone, worldScale, boneZ))
+		return;
+	// A geometry with only the neck / head / arms / feet (hair, head parts, gloves, boots) takes the pelvis's world scale: a head or
+	// limb bone can be scaled on its own (RaceMenu), the body is not.
+	if (geo.refRank >= kBodyOwnScaleRanks && body.pelvisScale > 0.0f)
+		worldScale = body.pelvisScale;
+	const float s = worldScale * geo.stbScale;
+	if (!(s > 0.05f && s < 20.0f))
+		return;
+	// The model space must be the body's: the central bone's bind height there (as a body height) roughly where the bone is now
+	// (crouching, sitting, swimming still pass; another space, e.g. one around the head, does not).
+	const float predicted = s * geo.refBindZ + body.rootOffset;
+	const float actual = boneZ - body.feetZ;
+	if (!(std::fabs(predicted - actual) < 0.5f * body.height + 20.0f))
+		return;
+	const bool own = geo.shoulderKnown;
+	const bool shoulderKnown = own || body.shoulderKnown;
+	o_body = float4(s, body.rootOffset, shoulderKnown ? (own ? geo.shoulderX : body.shoulderX) : 0.0f, shoulderKnown ? (own ? geo.shoulderZ : body.shoulderZ) : 0.0f);
+	o_body2 = float4(body.height, 0.0f, 0.0f, 0.0f);
+}
+
 uint8_t Skin::GetItemClassPrior(RE::Actor* a_actor, ActorWetState& a_state, const RE::BSGeometry* a_geometry, uint32_t a_frame)
 {
 	if (a_state.itemClassValid && a_frame - a_state.itemClassFrame > 600)
@@ -1161,6 +1426,12 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 				perGeometryData.wetPhysParams[i] = look.params[i];
 			for (size_t i = 0; i < look.bands.size(); ++i)
 				perGeometryData.wetPhysBands[i] = look.bands[i];
+			// (47k) Water Line Follows the Body: the bind-pose height of this geometry (zero: the world height, as 47j).
+			if (wetSkin.settings.PhysBodyLine) {
+				auto userData = geometry->GetUserData();
+				if (auto actor = userData ? userData->As<RE::Character>() : nullptr)
+					GetBodyFrame(geometry, actor, *lastWetState, perGeometryData.bodyPerGeometry, perGeometryData.bodyPerGeometry2);
+			}
 		}
 		// (44f) Item class prior from the keywords of the worn item this geometry belongs to.
 		if (lastWetState && !wetSkin.IsOriginal() && wetSkin.settings.GearEnabled && wetSkin.settings.GearModel == 0 && wetSkin.settings.GearKeywords) {

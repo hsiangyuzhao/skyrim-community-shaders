@@ -20,6 +20,7 @@ Texture2D<float4> Raw : register(t1);          // (47h float: RGBA16F or RGBA8) 
 Texture2D<unorm float> SsgiAo : register(t2);  // SSGI's own AO this frame (occlusion; contact AO folded in)
 Texture2D<unorm float> Contact : register(t3); // SSGI's contact AO visibility (kFlagContact)
 Texture2D<unorm float> DetailAO : register(t4); // (46t) filtered (and history-blended) detail visibility (kFlagDetail)
+Texture2D<unorm float4> NormalDebug : register(t5);  // (47k) AONormalPrepCS's Smooth Normals debug view (kFlagNormalDebug)
 RWTexture2D<unorm float> Output : register(u0);
 RWTexture2D<unorm float4> Debug : register(u1);
 
@@ -78,6 +79,9 @@ RWTexture2D<unorm float4> Debug : register(u1);
 		} else if (Size.w == kViewFinal) {
 			// (46t) What the lighting gets: 1 - the final occlusion (RTAO mixed with SSGI's AO), everywhere.
 			debug = float4((1.0 - occlusion).xxx, 1.0);
+		} else if (Size.w >= kViewNormalConfidence && Size.w <= kViewNormalNg) {
+			// (47k) Smooth Normals: written by AONormalPrepCS this frame (blue tint: it did not run, e.g. Smooth Normals off).
+			debug = (Size.z & kFlagNormalDebug) ? NormalDebug[p] : notTraced;
 		}
 		Debug[p] = debug;
 	}

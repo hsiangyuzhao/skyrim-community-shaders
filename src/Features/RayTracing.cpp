@@ -246,6 +246,8 @@ namespace
 	constexpr std::uint32_t kAOTraceSingleRay = 32u, kAOTraceHalfFar = 64u;  // (46y) TraceAOCS (two scales only)
 	constexpr std::uint32_t kAOTraceDither8 = 128u, kAOTraceSelfFix = 256u;  // (47h) TraceAOCS: RGBA8 output dither, Character Self-Occlusion Fix
 	constexpr std::uint32_t kAOTraceSmoothNormals = 512u;  // (47j) TraceAOCS: RTAO: Smooth Normals (AONormalPrepCS)
+	constexpr std::uint32_t kAOTraceSmoothNormals2 = 1024u;  // (47k) TraceAOCS: RTAO: Smooth Normals v2 (offset along Ns, projection)
+	constexpr std::uint32_t kAOFlagNormalDebug = 128u;       // (47k) RTAOCompositeCS: t5 holds this frame's Smooth Normals debug view
 	// (47j) AONormalPrepCS.
 	struct alignas(16) AONormalConstants
 	{
@@ -255,6 +257,8 @@ namespace
 		float PrevViewInverse[16];
 		float CameraDelta[4];
 		float RenderSize[4];
+		// (47k) x: 1 = Smooth Normals v2; y: debug view written to u1 (0 none, 1 confidence, 2 Ns, 3 Ng); zw unused.
+		std::uint32_t Flags[4];
 	};
 
 	// (46c) BSShadowFrustumLight / BSShadowParabolicLight::RenderShadowmaps (vfunc 0x0A): Ray Tracing may skip the shadow
@@ -1242,6 +1246,7 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.SunDepthCheckTranslucent = read("SunDepthCheckTranslucent", defaults.SunDepthCheckTranslucent);
 		settings.PointShadowsOnWater = read("PointShadowsOnWater", defaults.PointShadowsOnWater);
 		settings.AOSmoothNormals = read("AOSmoothNormals", defaults.AOSmoothNormals);  // (47j)
+		settings.AOSmoothNormals2 = read("AOSmoothNormals2", defaults.AOSmoothNormals2);  // (47k)
 	}
 	// (46o) Window Beam Guard: off once for settings saved before 46o (its rule misfired on beams that mostly hit walls).
 	if (loadedVersion < 6 && settings.PointLightsBeamGuard) {
@@ -1334,6 +1339,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AOHalfResFar"] = settings.AOHalfResFar;
 	o_json["AOCharacterSelfFix"] = settings.AOCharacterSelfFix;  // (47h)
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
+	o_json["AOSmoothNormals2"] = settings.AOSmoothNormals2;  // (47k)
 	o_json["SunDepthCheckTranslucent"] = settings.SunDepthCheckTranslucent;
 	o_json["PointShadowsOnWater"] = settings.PointShadowsOnWater;
 }
@@ -3619,6 +3625,12 @@ void RayTracing::PrepWaterDistance(ID3D11DeviceContext* a_context)
 bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height)
 {
 	aoNormalsThisFrame = false;
+	// (47k) The Smooth Normals debug views: their texture only while one of them is on.
+	const int normalView = aoDebugView == AODebugView::NormalConfidence ? 1 : (aoDebugView == AODebugView::NormalNs ? 2 : (aoDebugView == AODebugView::NormalNg ? 3 : 0));
+	if ((!normalView || !settings.AOSmoothNormals) && aoNormalDebug.texture) {
+		aoNormalDebug = {};
+		aoNormalDebugWidth = aoNormalDebugHeight = 0;
+	}
 	if (!settings.AOSmoothNormals) {
 		if (backend.HasAONormalTexture())
 			backend.ReleaseAONormalTexture();  // only while it is wanted
@@ -3662,26 +3674,41 @@ bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderRes
 	cb.RenderSize[1] = static_cast<float>(a_height);
 	cb.RenderSize[2] = 1.0f / static_cast<float>(a_width);
 	cb.RenderSize[3] = 1.0f / static_cast<float>(a_height);
+	// (47k) v2 and the debug view (its RGBA8 texture created on demand; a failure only drops the view).
+	if (normalView && (!aoNormalDebug.texture || aoNormalDebugWidth != a_width || aoNormalDebugHeight != a_height)) {
+		aoNormalDebug = {};
+		if (CreateDenoiseTexture(this, aoNormalDebug.texture, aoNormalDebug.srv, aoNormalDebug.uav, a_width, a_height, DXGI_FORMAT_R8G8B8A8_UNORM, "RayTracing RTAO NormalDebug")) {
+			aoNormalDebugWidth = a_width;
+			aoNormalDebugHeight = a_height;
+		} else {
+			aoNormalDebug = {};
+		}
+	}
+	const bool writeDebug = normalView && aoNormalDebug.uav;
+	cb.Flags[0] = settings.AOSmoothNormals2 ? 1u : 0u;
+	cb.Flags[1] = writeDebug ? static_cast<std::uint32_t>(normalView) : 0u;
 	aoNormalCB->Update(cb);
 	ID3D11Buffer* cbs[1] = { aoNormalCB->CB() };
 	ID3D11ShaderResourceView* srvs[4] = { a_depth, backend.DepthMaskSRV(), normal.SRV, motion.SRV };
-	ID3D11UnorderedAccessView* uavs[1] = { backend.AONormalUAV() };
+	ID3D11UnorderedAccessView* uavs[2] = { backend.AONormalUAV(), writeDebug ? aoNormalDebug.uav.get() : nullptr };
 	a_context->CSSetConstantBuffers(0, 1, cbs);
 	a_context->CSSetShaderResources(0, 4, srvs);
-	a_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+	a_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
 	a_context->CSSetShader(aoNormalCS.get(), nullptr, 0);
 	a_context->Dispatch((a_width + 7) / 8, (a_height + 7) / 8, 1);
 	ID3D11ShaderResourceView* nullSrvs[4]{};
-	ID3D11UnorderedAccessView* nullUavs[1]{};
+	ID3D11UnorderedAccessView* nullUavs[2]{};
 	ID3D11Buffer* nullCbs[1]{};
 	a_context->CSSetShaderResources(0, 4, nullSrvs);
-	a_context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+	a_context->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+	if (writeDebug)
+		aoNormalDebugFrame = frame;
 	a_context->CSSetConstantBuffers(0, 1, nullCbs);
 	a_context->CSSetShader(nullptr, nullptr, 0);
 	// The trace reads it.
 	std::uint32_t flags;
 	std::memcpy(&flags, &aoInput.constants.params[1], sizeof(flags));
-	flags |= kAOTraceSmoothNormals;
+	flags |= kAOTraceSmoothNormals | (settings.AOSmoothNormals2 ? kAOTraceSmoothNormals2 : 0u);
 	std::memcpy(&aoInput.constants.params[1], &flags, sizeof(flags));
 	aoNormalsThisFrame = true;
 	return true;
@@ -4352,6 +4379,11 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	cb.Size[2] = (contact ? kAOFlagContact : 0u) | (aoModeThisFrame == static_cast<int>(AOModeKind::Darker) ? kAOFlagDarker : 0u) |
 	             (historyValid ? kAOFlagHistory : 0u) | (aoDebugView == AODebugView::Split ? kAOFlagSplit : 0u) |
 	             (detail ? (kAOFlagDetail | kAOFlagValidity) : 0u) | (detailHistoryValid ? kAOFlagDetailHistory : 0u);
+	// (47k) The Smooth Normals debug view of this frame (AONormalPrepCS), when it was written at this size.
+	const bool normalDebug = debugOverlay && aoNormalDebug.srv && aoNormalDebugFrame == globals::state->frameCount && aoNormalDebugWidth == width &&
+	                         aoNormalDebugHeight == height;
+	if (normalDebug)
+		cb.Size[2] |= kAOFlagNormalDebug;
 	cb.Size[3] = debugOverlay ? static_cast<std::uint32_t>(aoDebugView) : 0u;
 	cb.Params[0] = std::clamp(settings.AOStrength, 0.0f, 2.0f);
 	cb.Params[1] = kAOHistoryWeight;
@@ -4451,7 +4483,8 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	ID3D11SamplerState* nullSampler = nullptr;
 	context->CSSetSamplers(0, 1, &nullSampler);
 	// 4. The mix with SSGI's AO into the texture its consumers read (DeferredComposite, SSRT) for this frame.
-	dispatch(composite, { blended->srv.get(), backend.AORawSRV(), ssgi.GetOwnAoSRV(), contact, detailBlended ? detailBlended->srv.get() : nullptr },
+	dispatch(composite, { blended->srv.get(), backend.AORawSRV(), ssgi.GetOwnAoSRV(), contact, detailBlended ? detailBlended->srv.get() : nullptr,
+							normalDebug ? aoNormalDebug.srv.get() : nullptr },
 		{ aoOut.uav.get(), debugOverlay ? debugColorUAV.get() : nullptr }, groupsX, groupsY);
 	timers->End(Util::GpuBucket::RayTracingAO);
 	ID3D11Buffer* nullCb[1]{};
@@ -5663,6 +5696,7 @@ void RayTracing::DrawAOPage()
 					settings.AOHalfResFar = d.AOHalfResFar;
 					settings.AOCharacterSelfFix = d.AOCharacterSelfFix;  // (47h)
 					settings.AOSmoothNormals = d.AOSmoothNormals;  // (47j)
+					settings.AOSmoothNormals2 = d.AOSmoothNormals2;  // (47k)
 				}
 				ImGui::BeginDisabled(!settings.AO);
 				ImGui::Checkbox("Fine Detail (two scales)", &settings.AODetail);
@@ -5724,6 +5758,18 @@ void RayTracing::DrawAOPage()
 					ImGui::Text("  normal cannot be trusted (just uncovered, fast motion) it blends back to the facet direction. Fine Detail may");
 					ImGui::Text("  pick up a faint trace of normal-map texture. Off: as in 47i.");
 				}
+				// (47k)
+				ImGui::BeginDisabled(!settings.AOSmoothNormals);
+				ImGui::Checkbox("RTAO: Smooth Normals v2", &settings.AOSmoothNormals2);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Needs RTAO: Smooth Normals. On (default): removes the facet steps that were left: the rays start a little out");
+					ImGui::Text("  along the smooth direction (not the facet's), rays that would dip under the facet are laid flat along it");
+					ImGui::Text("  instead of mirrored, last frame's normal is matched over 3x3 pixels with a tolerance that grows on slanted");
+					ImGui::Text("  surfaces, and where it still cannot be trusted a smoothed depth direction (an average over a ring of nearby");
+					ImGui::Text("  pixels on the same surface; real corners kept) is used instead of the bare facet. Off: as in 47j.");
+					ImGui::Text("  AO Debug View \"Smooth Normals: Confidence\": green = smooth normal used, red = fell back, blue = no data.");
+				}
+				ImGui::EndDisabled();
 				ImGui::EndDisabled();
 				if (!aoExtrasFault.empty())
 					RtErrorLine("Fine Detail / Full-Resolution Filter were switched off automatically", aoExtrasFault);
@@ -5734,7 +5780,9 @@ void RayTracing::DrawAOPage()
 		if (ImGui::TreeNodeEx("Diagnostics")) {
 			ImGui::BeginDisabled(!settings.AO);
 			{
-				const char* views[] = { "Off", "Raw RTAO (broad)", "Filtered RTAO (broad)", "RTAO vs SSGI (split)", "Raw Detail", "Filtered Detail", "Final AO" };
+				const char* views[] = { "Off", "Raw RTAO (broad)", "Filtered RTAO (broad)", "RTAO vs SSGI (split)", "Raw Detail", "Filtered Detail", "Final AO",
+					"Smooth Normals: Confidence", "Smooth Normals: Ns", "Smooth Normals: Ng" };
+				static_assert(IM_ARRAYSIZE(views) == static_cast<int>(AODebugView::Count));
 				int view = static_cast<int>(aoDebugView);
 				if (ImGui::Combo("AO Debug View", &view, views, IM_ARRAYSIZE(views)))
 					aoDebugView = static_cast<AODebugView>(std::clamp(view, 0, static_cast<int>(AODebugView::Count) - 1));
@@ -5745,6 +5793,10 @@ void RayTracing::DrawAOPage()
 					ImGui::Text("With Fine Detail: Raw RTAO shows the long rays' far part (orange = its near part was blocked: the detail term");
 					ImGui::Text("  covers that direction); Raw / Filtered Detail = the short rays (open share) and their filtered result;");
 					ImGui::Text("  Final AO = what the lighting gets (white = no darkening).");
+					ImGui::Text("(47k) Smooth Normals (RTAO: Smooth Normals on): Confidence = green where last frame's smooth normal is used");
+					ImGui::Text("  (brighter = more trusted), red = fell back (to the smoothed depth direction with v2, else the facet), blue =");
+					ImGui::Text("  no data (sky, just uncovered, off screen, first frame); Ns = the direction the AO rays are built around, Ng = the");
+					ImGui::Text("  flat facet direction from the depth (colours: x red, y green, z blue).");
 					ImGui::Text("Not saved.");
 				}
 			}
@@ -6198,10 +6250,10 @@ std::string RayTracing::DescribeForProfile() const
 		kBeamCull[EffectiveBeamCull()], settings.PointLightsBeamGuard ? "on" : "off", settings.PointLightsBeamSoftness);
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
-	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final" };
+	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final", "normal confidence", "normal Ns", "normal Ng" };
 	text += std::format(", RTAO {} (mode {}, ray length {:.0f}, strength {:.2f}, temporal {}, max distance {:.0f}, debug view {}{})", settings.AO ? "on" : "off",
 		kAOModes[std::clamp(settings.AOMode, 0, 1)], settings.AORayLength, settings.AOStrength, settings.AOTemporal ? "on" : "off", settings.AODistance,
-		kAOViews[std::clamp(static_cast<int>(aoDebugView), 0, 6)], aoOffReason.empty() ? "" : ", switched off: " + aoOffReason);
+		kAOViews[std::clamp(static_cast<int>(aoDebugView), 0, 9)], aoOffReason.empty() ? "" : ", switched off: " + aoOffReason);
 	// (46t)
 	static constexpr const char* kAOBudget[] = { "blocked", "half open", "open" };
 	text += std::format(", RTAO fine detail {} (detail strength {:.2f}, detail ray length {:.0f}, detail rays {}), normal-guided filter {}, full-resolution filter {}, "

@@ -96,6 +96,10 @@ namespace
 		o_json["PhysWaterLine"] = a_s.PhysWaterLine;
 		o_json["PhysBeadsFadeIn"] = a_s.PhysBeadsFadeIn;
 		o_json["PhysBeadsShrink"] = a_s.PhysBeadsShrink;
+		// (47k) A/B switches (not part of presets either)
+		o_json["PhysBodyLine"] = a_s.PhysBodyLine;
+		o_json["PhysBeadCap"] = a_s.PhysBeadCap;
+		o_json["PhysLessGrid"] = a_s.PhysLessGrid;
 		o_json["Physical47i"] = true;
 	}
 
@@ -126,7 +130,8 @@ namespace
 		if (auto it = a_json.find("UseDynamicWetness"); it != a_json.end() && it->is_boolean())
 			o_s.UseDynamicWetness = it->get<bool>();
 		// (47j)
-		for (auto [key, value] : { std::pair{ "PhysWaterLine", &o_s.PhysWaterLine }, std::pair{ "PhysBeadsFadeIn", &o_s.PhysBeadsFadeIn }, std::pair{ "PhysBeadsShrink", &o_s.PhysBeadsShrink } }) {
+		for (auto [key, value] : { std::pair{ "PhysWaterLine", &o_s.PhysWaterLine }, std::pair{ "PhysBeadsFadeIn", &o_s.PhysBeadsFadeIn }, std::pair{ "PhysBeadsShrink", &o_s.PhysBeadsShrink },
+				 std::pair{ "PhysBodyLine", &o_s.PhysBodyLine }, std::pair{ "PhysBeadCap", &o_s.PhysBeadCap }, std::pair{ "PhysLessGrid", &o_s.PhysLessGrid } }) {
 			if (auto it = a_json.find(key); it != a_json.end() && it->is_boolean())
 				*value = it->get<bool>();
 		}
@@ -184,45 +189,78 @@ namespace
 		float coverage = 0.0f;
 		float visible = 0.0f;
 		float runoff = 0.0f;
+		float kept = 1.0f;       // (47k) Bead Coalescence Cap: share of the water still held in the beads (the rest runs off / is film)
+		float n0 = 0.0f;         // (47k) nucleation density (per cm2) before coalescence
+		bool coalesced = false;  // (47k)
 	};
 
 	using Phys = WetSkin::Phys;
 	constexpr float kPi = 3.14159265f;
 
-	BeadSet FinishBeads(BeadSet a_b, float a_runoffR)
+	/// (47k) How the beads of every source are formed this frame. The default is 47j exactly.
+	struct BeadLaw
 	{
-		if (a_b.r > a_runoffR) {
+		bool cap = false;                         // Bead Coalescence Cap
+		float cCap = 1.0f;                        // its coverage cap: kCapScale x Beading^1.5
+		float beading = 0.5f;                     // Beading (after Oil Repels Water)
+		float maxCoverage = Phys::kMaxCoverage;   // the cell grid at presence 1 (Less Grid-like Bead Placement: kLessGridCoverage)
+	};
+
+	/// (47k) Merges the beads once they cover a_merge (at the same water: fewer, bigger beads).
+	void Coalesce(BeadSet& a_b, float a_merge)
+	{
+		if (a_b.coverage > a_merge) {
+			const float v = a_b.water * 1e-4f;
+			a_b.coverage = a_merge;
+			a_b.r = v * kPi / (std::max(a_merge, 1e-6f) * Phys::kBeadKappa);
+			a_b.coalesced = true;
+		}
+	}
+
+	BeadSet FinishBeads(BeadSet a_b, float a_runoffR, const BeadLaw& a_law)
+	{
+		if (a_law.cap) {
+			// (47k) Beads past the runoff size run off; what stays is in beads of the runoff size at the coverage they had (an
+			// uncoalesced set: its nucleation count at the runoff size). The excess water drives the trails, nothing is repacked.
+			if (a_b.r > a_runoffR) {
+				if (!a_b.coalesced)
+					a_b.coverage = a_b.n0 * kPi * a_runoffR * a_runoffR;
+				a_b.r = a_runoffR;
+				const float v = a_b.water * 1e-4f;
+				const float held = a_b.coverage * Phys::kBeadKappa * a_runoffR / kPi;
+				a_b.kept = v > 1e-12f ? std::clamp(held / v, 0.0f, 1.0f) : 1.0f;
+				a_b.runoff = held > 1e-12f ? std::clamp((v - held) / held, 0.0f, 1.0f) : 1.0f;
+			}
+		} else if (a_b.r > a_runoffR) {
 			a_b.runoff = std::clamp((a_b.r - a_runoffR) / a_runoffR, 0.0f, 1.0f);
 			// Larger beads run off: the water left stays in beads of the runoff size (more of them).
 			const float v = a_b.water * 1e-4f;
 			a_b.r = a_runoffR;
 			a_b.coverage = v * kPi / (Phys::kBeadKappa * a_b.r);
 		}
-		a_b.coverage = std::clamp(a_b.coverage, 0.0f, Phys::kMaxCoverage);
+		a_b.coverage = std::clamp(a_b.coverage, 0.0f, a_law.maxCoverage);
 		a_b.visible = Smooth(Phys::kVisibleR0, Phys::kVisibleR1, a_b.r);
 		return a_b;
 	}
 
-	/// Sweat: pores fill (kSweatPores per cm2), then the beads merge once they cover kSweatCoalesce / S.
-	BeadSet SweatBeads(float a_water, float a_size)
+	/// Sweat: pores fill (kSweatPores per cm2), then the beads merge once they cover kSweatCoalesce / S ((47k) cap: or c_cap).
+	BeadSet SweatBeads(float a_water, float a_size, const BeadLaw& a_law)
 	{
 		BeadSet b;
 		b.water = std::max(a_water, 0.0f);
 		if (b.water <= 1e-4f)
 			return b;
 		const float v = b.water * 1e-4f;
+		b.n0 = Phys::kSweatPores;
 		b.r = std::cbrt(v / (Phys::kSweatPores * Phys::kBeadKappa));
 		b.coverage = Phys::kSweatPores * kPi * b.r * b.r;
 		const float merge = Phys::kSweatCoalesce / a_size;
-		if (b.coverage > merge) {
-			b.coverage = merge;
-			b.r = v * kPi / (merge * Phys::kBeadKappa);
-		}
-		return FinishBeads(b, Phys::kRunoffRadius * a_size);
+		Coalesce(b, a_law.cap ? std::min(merge, a_law.cCap) : merge);
+		return FinishBeads(b, Phys::kRunoffRadius * a_size, a_law);
 	}
 
-	/// Rain: each impact one bead of kRainRadius; they merge once they cover kRainCoalesce / S.
-	BeadSet RainBeads(float a_water, float a_size)
+	/// Rain: each impact one bead of kRainRadius; they merge once they cover kRainCoalesce / S ((47k) cap: or c_cap).
+	BeadSet RainBeads(float a_water, float a_size, const BeadLaw& a_law)
 	{
 		BeadSet b;
 		b.water = std::max(a_water, 0.0f);
@@ -231,26 +269,28 @@ namespace
 		const float v = b.water * 1e-4f;
 		b.r = Phys::kRainRadius;
 		b.coverage = v * kPi / (Phys::kBeadKappa * b.r);
+		b.n0 = b.coverage / (kPi * b.r * b.r);
 		const float merge = Phys::kRainCoalesce / a_size;
-		if (b.coverage > merge) {
-			b.coverage = merge;
-			b.r = v * kPi / (merge * Phys::kBeadKappa);
-		}
-		return FinishBeads(b, Phys::kRunoffRadius * a_size);
+		Coalesce(b, a_law.cap ? std::min(merge, a_law.cCap) : merge);
+		return FinishBeads(b, Phys::kRunoffRadius * a_size, a_law);
 	}
 
-	/// Swim: the film breaks into kSwimBeads / S^2 beads per cm2, which then shrink in place.
-	BeadSet SwimBeads(float a_water, float a_size)
+	/// Swim: the film breaks into kSwimBeads / S^2 beads per cm2, which then shrink in place. (47k) Cap: n0 = 1.5 / S^2 x
+	/// (0.25 + 3 B^2) (the same 1.5 at Beading 0.5), and they merge at c_cap too.
+	BeadSet SwimBeads(float a_water, float a_size, const BeadLaw& a_law)
 	{
 		BeadSet b;
 		b.water = std::max(a_water, 0.0f);
 		if (b.water <= 1e-4f)
 			return b;
 		const float v = b.water * 1e-4f;
-		const float n = Phys::kSwimBeads / (a_size * a_size);
+		const float n = Phys::kSwimBeads / (a_size * a_size) * (a_law.cap ? 0.25f + 3.0f * a_law.beading * a_law.beading : 1.0f);
+		b.n0 = n;
 		b.r = std::cbrt(v / (n * Phys::kBeadKappa));
 		b.coverage = n * kPi * b.r * b.r;
-		return FinishBeads(b, Phys::kRunoffRadius * a_size);
+		if (a_law.cap)
+			Coalesce(b, a_law.cCap);
+		return FinishBeads(b, Phys::kRunoffRadius * a_size, a_law);
 	}
 
 	/// The swim water above which no beads form (a closed film), as Skin.hlsli WetPhysSwimBeadShare.
@@ -644,8 +684,14 @@ WetSkin::PhysicalLook WetSkin::GetPhysicalLook(const PhysicalState& a_state) con
 	}
 
 	// The beads of each source at the character's water (the shader scales the count with each pixel's own water).
-	const BeadSet sweatBeads = SweatBeads(sweat * beading, size);
-	const BeadSet rainBeads = RainBeads(rain * beading, size);
+	// (47k) Bead Coalescence Cap / Less Grid-like Bead Placement (both off: 47j).
+	BeadLaw law;
+	law.cap = s.PhysBeadCap;
+	law.beading = beading;
+	law.cCap = Phys::kCapScale * beading * std::sqrt(beading);
+	law.maxCoverage = s.PhysLessGrid ? Phys::kLessGridCoverage : Phys::kMaxCoverage;
+	const BeadSet sweatBeads = SweatBeads(sweat * beading, size, law);
+	const BeadSet rainBeads = RainBeads(rain * beading, size, law);
 	float swimBeadWater = 0.0f, swimBeadWeight = 0.0f, swimMax = 0.0f, swimTrail = 0.0f;
 	const auto addSwim = [&](float a_p, float a_x) {
 		const float v = PhysBandWater(a_p, a_x) * swimWeight;
@@ -673,24 +719,36 @@ WetSkin::PhysicalLook WetSkin::GetPhysicalLook(const PhysicalState& a_state) con
 		swimBeadWater += bead * bead;
 		swimBeadWeight += bead;
 	}
-	const BeadSet swimBeads = SwimBeads(swimBeadWeight > 1e-4f ? swimBeadWater / swimBeadWeight : 0.0f, size);
+	const BeadSet swimBeads = SwimBeads(swimBeadWeight > 1e-4f ? swimBeadWater / swimBeadWeight : 0.0f, size, law);
 
 	// One parameter set, weighted by bead water; coverage adds up.
-	float water = 0.0f, radius = 0.0f, visible = 0.0f, coverage = 0.0f;
+	float water = 0.0f, radius = 0.0f, visible = 0.0f, coverage = 0.0f, kept = 0.0f;
 	for (const BeadSet* b : { &sweatBeads, &rainBeads, &swimBeads }) {
 		water += b->water;
 		radius += b->r * b->water;
 		visible += b->visible * b->water;
+		kept += b->kept * b->water;
 		coverage += b->coverage;
 	}
 	if (water > 1e-4f) {
 		radius /= water;
 		visible /= water;
+		kept /= water;
+	} else {
+		kept = 1.0f;
 	}
-	coverage = std::min(coverage, Phys::kMaxCoverage);
+	// (47k) Cap: the summed coverage never above c_cap (47j: the full grid's 0.554).
+	coverage = std::min(coverage, law.cap ? std::min(law.cCap, law.maxCoverage) : law.maxCoverage);
 	const float drawRadius = std::max(radius, Phys::kDrawRadius);
+	// (47k) Cap: beads drawn larger than they are (the 2 mm minimum) are drawn fewer: coverage x sqrt(r / r_draw); the bead water
+	// not drawn (run off, or the fewer drawn beads) goes to the film sheen (the visible share sent to the shader).
+	const float drawFactor = law.cap ? std::sqrt(std::min(1.0f, radius / Phys::kDrawRadius)) : 1.0f;
+	const float drawnShare = law.cap ? visible * kept * drawFactor : visible;
 	// presence = pixel bead water x this (the visible share in it): presence 1 = the grid's full coverage.
-	const float presencePerWater = water > 1e-4f ? coverage / (Phys::kMaxCoverage * water) * visible : 0.0f;
+	const float presencePerWater = water > 1e-4f ? coverage * drawFactor / (law.maxCoverage * water) * visible : 0.0f;
+	// (47k) Cap: no pixel above c_cap's presence (nor 0.75): never a full lattice where a region gathers more water.
+	const float presenceMax = law.cap ? std::min(law.cCap / law.maxCoverage, Phys::kPresenceMax) : 0.0f;
+	const float rainRunoff = law.cap ? std::max(a_state.rainRunoff, rainBeads.runoff) : a_state.rainRunoff;
 
 	look.beadRadius = radius;
 	look.coverage = coverage;
@@ -698,15 +756,17 @@ WetSkin::PhysicalLook WetSkin::GetPhysicalLook(const PhysicalState& a_state) con
 	look.swimMax = swimMax;
 	look.sweatRunoff = sweatBeads.runoff;
 	// Droplet tails only where water runs off.
-	look.beadTrails = std::clamp(std::max({ a_state.rainRunoff, sweatBeads.runoff, swimTrail }), 0.0f, 1.0f);
+	look.beadTrails = std::clamp(std::max({ rainRunoff, sweatBeads.runoff, swimTrail, law.cap ? swimBeads.runoff : 0.0f }), 0.0f, 1.0f);
 	look.sweatLevel = std::clamp(a_state.sweat / Phys::kSweatMax, 0.0f, 1.0f);
 
 	look.params[0] = float4(sweat, rain, manualSwim, a_state.bandHeight);
 	look.params[1] = float4(beading, beading, beading, swimWeight);
-	look.params[2] = float4(drawRadius, presencePerWater, a_state.rainRunoff, sweatBeads.runoff);
-	// (47j) Flags (Skin.hlsli WetPhysFlag): the water line, beads fading in from the film, beads shrinking out.
-	const uint32_t flags = (lineMode ? Phys::kFlagWaterLine : 0u) | (s.PhysBeadsFadeIn ? Phys::kFlagFadeIn : 0u) | (s.PhysBeadsShrink ? Phys::kFlagShrink : 0u);
-	look.params[3] = float4(visible, a_state.depth, 0.0f, static_cast<float>(flags));
+	look.params[2] = float4(drawRadius, presencePerWater, rainRunoff, sweatBeads.runoff);
+	// (47j) Flags (Skin.hlsli WetPhysFlag): the water line, beads fading in from the film, beads shrinking out. (47k) The bead cap
+	// (presenceMax in [3].z) and the smaller bead per cell.
+	const uint32_t flags = (lineMode ? Phys::kFlagWaterLine : 0u) | (s.PhysBeadsFadeIn ? Phys::kFlagFadeIn : 0u) | (s.PhysBeadsShrink ? Phys::kFlagShrink : 0u) |
+	                       (law.cap ? Phys::kFlagBeadCap : 0u) | (s.PhysLessGrid ? Phys::kFlagLessGrid : 0u);
+	look.params[3] = float4(drawnShare, a_state.depth, presenceMax, static_cast<float>(flags));
 	if (lineMode) {
 		// (47j) The water line height (units above the feet, 0 = none) in place of the band height; the two zones in bands 0 and 1.
 		look.params[0].w = a_state.lineHeight;
@@ -819,6 +879,11 @@ void WetSkin::DrawSettings()
 			"Everything below it dries together, evenly. Under the current water surface it stays soaked; standing with the feet in",
 			"the water, the rest below the line dries normally; going deeper than the line raises it and soaks that part again.",
 			"Off: 47i (eight height bands, each drying on its own)." });
+		ImGui::Checkbox("Physical: Water Line Follows the Body", &s.PhysBodyLine);
+		Tooltip({ "On (47k): the remembered water line (and where sweat and rain gather, the hairline) is measured on the body itself",
+			"(its height in the T-pose, arms counted as hanging down), so a wet line stays on the same spot of the skin or clothes while",
+			"arms and legs swing, bend or the character crouches. The current water surface stays a flat line in the world.",
+			"Rigid gear (helmets, shields), first person and creatures keep the world height. Off: 47j (world height)." });
 
 		ImGui::SeparatorText("Drying");
 		ImGui::SliderFloat("Dry Time (s)", &s.PhysDryTime, 10.0f, 1800.0f, "%.0f s", ImGuiSliderFlags_Logarithmic);
@@ -840,6 +905,13 @@ void WetSkin::DrawSettings()
 		ImGui::Checkbox("Physical: Beads Shrink and Fade Out", &s.PhysBeadsShrink);
 		Tooltip({ "On (47j): a bead that dries up first shrinks (to about 60 % of its size, never to a pixel), then fades out; the beads",
 			"do so one after another, and their shine goes to the film. Off: 47i (each bead disappears at once)." });
+		ImGui::Checkbox("Physical: Bead Coalescence Cap", &s.PhysBeadCap);
+		Tooltip({ "On (47k): beads merge before they cover much of the skin (at most 0.40 x Beading^1.5 of it, about 14 % at Beading 0.5),",
+			"bigger ones run off without packing the rest into more beads, and no pixel is ever a full grid of beads; the water not in",
+			"beads shows as film sheen. Also no bright ring around a bead's edge. Off: 47j (up to a full lattice of beads)." });
+		ImGui::Checkbox("Physical: Less Grid-like Bead Placement", &s.PhysLessGrid);
+		Tooltip({ "On (47k): each bead is a little smaller than its cell (0.36 instead of 0.42 of it), so the beads sit more randomly and",
+			"never line up in rows; the same water and coverage. Off: 47j." });
 		ImGui::SliderFloat("Droplets on the Face", &s.FaceDroplets, 0.0f, 1.0f, "%.2f");
 		ImGui::SliderFloat("Droplet Normal Strength", &s.DropletNormal, 0.0f, 2.0f, "%.2f");
 		Tooltip({ "How round the beads look (their own little dome, inside the bead only). 0 = flat spots of shine." });
@@ -1082,6 +1154,12 @@ void WetSkin::DrawStatus()
 		}
 		ImGui::Text("Oil: %.2f   Drying speed (air): %.2fx", look.oil, phys.evaporation);
 		ImGui::TextDisabled("Beads: radius %.2f mm, cover %.1f%%, visible %.0f%%; trails %.2f", look.beadRadius * 10.0f, look.coverage * 100.0f, look.visible * 100.0f, look.beadTrails);
+		// (47k)
+		if (settings.PhysBodyLine) {
+			const auto& stats = globals::features::skin.bodyLineStats;
+			ImGui::TextDisabled("Water line on the body: %u character draws by the body, %u by the world height (rigid gear, first person, creatures)",
+				stats.body, stats.world);
+		}
 	}
 	ImGui::TreePop();
 }
@@ -1259,6 +1337,9 @@ bool WetSkin::SavePreset(const std::string& a_name)
 	j["settings"].erase("PhysWaterLine");  // (47j) A/B switches
 	j["settings"].erase("PhysBeadsFadeIn");
 	j["settings"].erase("PhysBeadsShrink");
+	j["settings"].erase("PhysBodyLine");  // (47k) A/B switches
+	j["settings"].erase("PhysBeadCap");
+	j["settings"].erase("PhysLessGrid");
 	try {
 		std::ofstream o{ PresetFile(name) };
 		if (!o)
@@ -1311,6 +1392,9 @@ bool WetSkin::LoadPreset(const std::string& a_name)
 		fromPreset.PhysWaterLine = settings.PhysWaterLine;  // (47j) not part of a look
 		fromPreset.PhysBeadsFadeIn = settings.PhysBeadsFadeIn;
 		fromPreset.PhysBeadsShrink = settings.PhysBeadsShrink;
+		fromPreset.PhysBodyLine = settings.PhysBodyLine;  // (47k) not part of a look
+		fromPreset.PhysBeadCap = settings.PhysBeadCap;
+		fromPreset.PhysLessGrid = settings.PhysLessGrid;
 		MigratePhysical47i(values, json(), fromPreset);  // a preset saved before 47i: from its own droplet / drying values
 		if (fromPreset.Model > static_cast<uint32_t>(Model::Physical))
 			fromPreset.Model = static_cast<uint32_t>(Model::New);

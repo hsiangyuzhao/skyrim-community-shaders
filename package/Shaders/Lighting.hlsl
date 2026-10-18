@@ -2279,13 +2279,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		// (47i) Physical: this pixel's water (um) from the character's sweat, rain and swim height profile, times where each
 		// gathers and the wet patches; split into bead water and film water by the beading share. The rain amount already
 		// holds the shelter (CPU): no sky occlusion on top.
-		const float h = input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z - Skin::skinPerGeometry.z;
+		// (47k) Water Line Follows the Body: the stored line and the regions by the body-fixed height (the bind pose); the current
+		// water surface by the world height (both the world height when off).
+		const float physWorldZ = input.WorldPosition.z + FrameBuffer::CameraPosAdjust[eyeIndex].z;
+		const float hWorld = physWorldZ - Skin::skinPerGeometry.z;
+		const float h = Skin::CharBodyHeight(input.ModelPosition.xyz, physWorldZ);
 		const float sweatRegion = Skin::WetPhysSweatRegion(h);
 		const float rainRegion = Skin::WetPhysRainRegion(h, worldNormal.z);
 		float swimTrail;
 		const float vSweat = Skin::wetPhysParams[0].x * sweatRegion;
 		const float vRain = Skin::wetPhysParams[0].y * rainRegion;
-		const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBand(h), 1.0, swimTrail);
+		const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBand(h, hWorld), 1.0, swimTrail);
 		const float vAll = vSweat + vRain + vSwim;
 		const float wn = saturate(vAll / Skin::kPhysHold);
 		const float cov = Skin::WetCoverage(wetUV, wn, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z);
@@ -2307,15 +2311,19 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		const float physCmPerUV = 140.0 / max(SharedData::skinData.skinDetailParams.y, 0.1);
 #		endif
 		skinPhysBeadFade = Skin::WetPhysBeadFade(physCmPerUV, max(length(wetdUVdx), length(wetdUVdy)), Skin::WetDetailLOD(wetPixelWorld));
-		skinPhysPresence = skinPhysBeadFade > 0.0 ? saturate(vBead * Skin::wetPhysParams[2].y) : 0.0;
+		const float physPresenceRaw = skinPhysBeadFade > 0.0 ? saturate(vBead * Skin::wetPhysParams[2].y) : 0.0;
+		// (47k) Bead Coalescence Cap: never more than c_cap's presence; the water of the beads not drawn goes to the film sheen.
+		skinPhysPresence = Skin::WetPhysPresenceCap(physPresenceRaw);
 		skinPhysCellsPerUV = Skin::WetPhysCellsPerUV(physCmPerUV);
 		// (47j) The beads still growing in (Fade In: the swim beads, by the break-up) or shrinking out (Shrink) draw less than
 		// their water: that share shows as film sheen, like the beads hidden by the distance fade.
 		float beadDrawn = 1.0;
+		[branch] if (skinPhysPresence < physPresenceRaw)
+			beadDrawn = skinPhysPresence / max(physPresenceRaw, 1e-4);
 		[branch] if (Skin::WetPhysFlag(Skin::kPhysFlagFadeIn) && vBeadSwim > 0.0)
 		{
 			skinPhysGrowth = 1.0 - (vBeadSwim / max(vBead, 1e-4)) * (1.0 - Skin::WetPhysBreakup(vSwim, breakNoise));
-			beadDrawn = Skin::WetPhysGrowthShare(skinPhysGrowth);
+			beadDrawn *= Skin::WetPhysGrowthShare(skinPhysGrowth);
 		}
 		skinPhysShrink = Skin::WetPhysFlag(Skin::kPhysFlagShrink) ? 1.0 : 0.0;
 		[branch] if (skinPhysShrink > 0.0)
@@ -3406,9 +3414,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 					// (47i) Physical: the hair's water (um): swim from the height profile with the hair's dry multiplier, rain
 					// on the head, and its share of the sweat (manual Sweat included) as a damp hairline with the crown drier
 					// (47g: slight clumping and darkening at most; no beads on hair in any model).
-					const float h = charWorldZ - Skin::skinPerGeometry.z;
+					// (47k) Water Line Follows the Body: the stored line and the hairline by the body-fixed height.
+					const float h = Skin::CharBodyHeight(input.ModelPosition.xyz, charWorldZ);
 					float hairTrail;
-					const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBand(h), clamp(Skin::wetCharParams[0].z, 0.25, 4.0), hairTrail);
+					const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBand(h, charWorldZ - Skin::skinPerGeometry.z), clamp(Skin::wetCharParams[0].z, 0.25, 4.0), hairTrail);
 					const float vRain = Skin::wetPhysParams[0].y * 1.15;
 					const float hairline = lerp(1.0, 0.45, smoothstep(118.0, 126.0, h));
 					wSwim = saturate(vSwim / Skin::kPhysHold);
@@ -3482,8 +3491,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 					// wicks the line up by Cloth Wicking with a tide mark), its wicking share of the sweat (manual Sweat
 					// included; 47g: no sweat beads or trails on gear), the rain a little less on down-facing surfaces. Beads
 					// and trails (below) from the rain and swim water only. The rain holds the shelter: not sky-occluded again.
-					const float h = charWorldZ - Skin::skinPerGeometry.z;
-					const float3 band = Skin::WetPhysBand(h - (wick + tide));
+					// (47k) Water Line Follows the Body: the stored line and the sweat region by the body-fixed height (rigid gear: the
+					// world height); the current water surface by the world height.
+					const float h = Skin::CharBodyHeight(input.ModelPosition.xyz, charWorldZ);
+					const float3 band = Skin::WetPhysBand(h - (wick + tide), charWorldZ - Skin::skinPerGeometry.z - (wick + tide));
 					float tC, tL, tM, tF;
 					const float vC = Skin::WetPhysSwimWater(band, Skin::wetCharParams[7].w, tC);
 					const float vL = Skin::WetPhysSwimWater(band, Skin::wetCharParams[8].w, tL);
@@ -3707,7 +3718,8 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 					// (47i) The pixel's bead water (rain and swim; no sweat beads on gear) x the character's presence per um; the
 					// class sliders (Leather / Metal Droplets) scale it.
 					const float classDroplets = (gearClass.z * saturate(Skin::wetCharParams[6].x) + gearClass.y * saturate(Skin::wetCharParams[5].z)) * (1.0 - gearClass.w);
-					presence = dropVisibility > 0.0 ? saturate(gearPhysBead * Skin::wetPhysParams[2].y) * classDroplets : 0.0;
+					// (47k) Bead Coalescence Cap: at most c_cap's presence.
+					presence = dropVisibility > 0.0 ? Skin::WetPhysPresenceCap(saturate(gearPhysBead * Skin::wetPhysParams[2].y)) * classDroplets : 0.0;
 					streakDriver = gearPhysTrail;
 				}
 				else
@@ -4261,6 +4273,49 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		lightOffset = LightLimitFix::lightGrid[clusterIndex].offset;
 	}
 
+#			if defined(SSPLS)
+	// (47k) Max Shadowed Lights per Pixel / Skip Weak Lights: score this pixel's lights first (colour x falloff x N.L, no texture
+	// reads), keep the eight largest; the lighting loop marches SSPLS only for the top K (the K-th fading against the first one out)
+	// and skips lights far weaker than the strongest. Both off (K unlimited): nothing here, 47j exactly.
+	const uint ssplsBudget = ScreenSpacePointLightShadows::MaxShadowedLights();
+	const bool ssplsSkipWeak = (SharedData::ssplsSettings.Enable & ScreenSpacePointLightShadows::SettingFlags::SkipWeakLights) != 0;
+	float4 ssplsTopA = 0.0, ssplsTopB = 0.0;
+	[branch] if (SharedData::ssplsSettings.Enable && inWorld && ssplsHere && (ssplsBudget > 0u || ssplsSkipWeak))
+	{
+		[loop] for (uint scoreIndex = 0; scoreIndex < totalLightCount; scoreIndex++)
+		{
+			LightLimitFix::Light scoreLight;
+			if (scoreIndex < LightLimitFix::NumStrictLights) {
+				scoreLight = LightLimitFix::StrictLights[scoreIndex];
+			} else {
+				scoreLight = LightLimitFix::lights[LightLimitFix::lightList[lightOffset + (scoreIndex - LightLimitFix::NumStrictLights)]];
+				if (LightLimitFix::IsLightIgnored(scoreLight))
+					continue;
+			}
+			if (scoreLight.lightFlags & LightLimitFix::LightFlags::Simple)
+				continue;
+			const float3 scoreDirection = scoreLight.positionWS[eyeIndex].xyz - input.WorldPosition.xyz;
+			const float scoreDist = length(scoreDirection);
+#				if defined(ISL)
+			const float scoreIntensity = InverseSquareLighting::GetAttenuation(scoreDist, scoreLight);
+			if (scoreIntensity < 1e-5)
+				continue;
+#				else
+			const float scoreFactor = saturate(scoreDist / scoreLight.radius);
+			if (scoreFactor == 1)
+				continue;
+			const float scoreIntensity = 1 - scoreFactor * scoreFactor;
+#				endif
+			const float3 scoreColor = Color::PointLight(scoreLight.color.xyz, (scoreLight.lightFlags & LightLimitFix::LightFlags::Linear) != 0) * scoreIntensity * scoreLight.fade;
+			const float scoreAngle = dot(worldNormal.xyz, normalize(scoreDirection));  // as the lighting loop (the same score there)
+			if (scoreAngle > 0.0)
+				ScreenSpacePointLightShadows::InsertScore(ssplsTopA, ssplsTopB, ScreenSpacePointLightShadows::LightScore(scoreColor, scoreAngle));
+		}
+	}
+	const float ssplsBudgetLast = ssplsBudget > 0u ? ScreenSpacePointLightShadows::ScoreAt(ssplsTopA, ssplsTopB, ssplsBudget - 1u) : 0.0;
+	const float ssplsBudgetNext = ssplsBudget > 0u ? ScreenSpacePointLightShadows::ScoreAt(ssplsTopA, ssplsTopB, ssplsBudget) : 0.0;
+#			endif
+
 	[loop] for (uint lightIndex = 0; lightIndex < totalLightCount; lightIndex++)
 	{
 		LightLimitFix::Light light;
@@ -4327,18 +4382,23 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		const bool ssplsNonRT = false;
 		const bool ssplsBesideRT = false;
 #				endif
+		// (47k) The light budget's share of this light (1 with both switches off).
+		float ssplsWeight = 1.0;
+		[branch] if (ssplsBudget > 0u || ssplsSkipWeak)
+			ssplsWeight = ScreenSpacePointLightShadows::BudgetWeight(ScreenSpacePointLightShadows::LightScore(lightColor, lightAngle), ssplsBudget, ssplsBudgetLast, ssplsBudgetNext, ssplsTopA.x, ssplsSkipWeak);
 		const bool ssplsRun = SharedData::ssplsSettings.Enable && inWorld && ssplsHere &&
 		                      !(light.lightFlags & LightLimitFix::LightFlags::Simple) &&
 		                      shadowComponent != 0.0 &&
 		                      lightAngle > 0.0 &&
-		                      (!rtShadow || ssplsBesideRT);
+		                      (!rtShadow || ssplsBesideRT) &&
+		                      ssplsWeight > 0.0;
 		[branch] if (ssplsRun)
 		{
 			float3 lightDirectionVS = FrameBuffer::WorldToView(light.positionWS[eyeIndex].xyz, true, eyeIndex) - viewPosition.xyz;
 			// (46y) Contact length for traced occluders: the tag's eighths x the trace's start offset (RayTracing.cpp kRayBiasConstant
 			// + kRayBiasPerUnit x the distance to the camera). -1: every occluder counts.
 			const float ssplsRtContact = ssplsNonRT ? float((light.rtShadow >> 16) & 0xFFu) * 0.125 * (2.0 + 0.0015 * length(viewPosition.xyz)) : -1.0;
-			float SSPLSShadow = lerp(1.0, ScreenSpacePointLightShadows::GetShadow(LinearSampler, viewPosition, screenNoise, lightDirectionVS, ssplsSteps, light.radius, eyeIndex, light.lightFlags & LightLimitFix::LightFlags::Shadow, ssplsRtContact), SharedData::ssplsSettings.Strength);
+			float SSPLSShadow = lerp(1.0, ScreenSpacePointLightShadows::GetShadow(LinearSampler, viewPosition, screenNoise, lightDirectionVS, ssplsSteps, light.radius, eyeIndex, light.lightFlags & LightLimitFix::LightFlags::Shadow, ssplsRtContact), SharedData::ssplsSettings.Strength * ssplsWeight);
 			// (46b) Kept beside a ray-traced shadow: the darker of both (a shadow both see is not doubled).
 			lightShadow = rtShadow ? min(lightShadow, SSPLSShadow) : lightShadow * SSPLSShadow;
 		}
