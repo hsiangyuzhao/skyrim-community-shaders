@@ -159,6 +159,9 @@ namespace Util
 				"GPU time for adding the lit fog up along each view ray, near and far grids together." },
 			{ "Volumetric Fog: History",
 				"GPU time for keeping this frame's fog for the next one (temporal reprojection copies)." },
+			{ "RT Point Lights: Water Prep",
+				"GPU time of the depth copy after the water and the water-distance pass (Point Light Shadows on Water), right after the "
+				"water draws. F7 column water_prep_gpu_ms." },
 		};
 
 		static_assert(sizeof(kBucketInfo) / sizeof(kBucketInfo[0]) == static_cast<size_t>(GpuBucket::Count),

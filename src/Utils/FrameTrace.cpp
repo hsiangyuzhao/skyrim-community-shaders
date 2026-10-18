@@ -496,6 +496,8 @@ namespace Util::FrameTrace
 			float gpuSegOtherMs = -1.0f;
 			float gpuSegTotalMs = -1.0f;
 			int gpuSegStamps = -1;
+			float gpuWaterMs = -1.0f;      // (47j) GPU wall time of the water draws (stamp pairs; -1 = not read back)
+			float waterPrepGpuMs = -1.0f;  // (47j) WaterPrepCS (GpuPassTimers RayTracingWaterPrep)
 			float postGpuMs = -1.0f;  // (46p) our post-processing chain, last GPU sample (GpuPassTimers PostProcessing)
 			Q46 q46{};             // (46q)
 			std::string vramByFeature;  // (46q) "name=MB;..." alive per feature of ours (1 MB or more)
@@ -802,6 +804,7 @@ namespace Util::FrameTrace
 			a_row.vfPassMs[3] = sample(vfFar, Util::GpuBucket::VolumetricFogFar);
 			a_row.vfPassMs[4] = sample(vf, Util::GpuBucket::VolumetricFogIntegrate);
 			a_row.vfPassMs[5] = sample(vf, Util::GpuBucket::VolumetricFogHistory);
+			a_row.waterPrepGpuMs = timers->LastSampleMs(Util::GpuBucket::RayTracingWaterPrep);  // (47j) -1 once quiet
 			if (vf) {
 				a_row.vfGrid[0] = ehf.currentGridSize.x;
 				a_row.vfGrid[1] = ehf.currentGridSize.y;
@@ -970,8 +973,10 @@ namespace Util::FrameTrace
 				out << "#   gpu_seg_<seg>_ms = GPU wall time between D3D11 timestamps at the main thread's segment changes from the render start to\n";
 				out << "#   the Present end (read back a few frames late; -1 = none): GPU idle inside a segment included, the D3D11 queue's waits for\n";
 				out << "#   our D3D12 work (RT, upscaling, the present path) land in the segment where the wait was queued. gpu_seg_other_ms = between\n";
-				out << "#   stamps in non-render segments; gpu_seg_total_ms = first to last stamp; gpu_seg_stamps = stamps (17 = capped: the last\n";
+				out << "#   stamps in non-render segments; gpu_seg_total_ms = first to last stamp; gpu_seg_stamps = stamps (47j: 65 = capped; repeats of one segment merged; the last\n";
 				out << "#   segment ran on to the close).\n";
+				out << "#   (47j) water_prep_gpu_ms = WaterPrepCS (Point Light Shadows on Water); water_draw_gpu_ms = GPU wall time of the runs of water\n";
+				out << "#   draws (0 = none drawn, -1 = not read back); rt_pl_water_rays = point-light rays traced from the water surface (also in rt_pl_rays).\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1068,7 +1073,8 @@ namespace Util::FrameTrace
 					   "pcl_est_input_ms,pcl_est_input_measured,pcl_est_render_ms,pcl_est_fg_mult,pcl_est_fg_hold_ms,pcl_est_refresh_hz,pcl_est_queue_ms,pcl_est_ms,"
 					   "rt_pl_fill_direct,rt_pl_fill_ambient,rt_pl_portal_away,rt_pl_portal_dropped,rt_pl_portal_boxed,"
 					   "vf_depth_gpu_ms,vf_material_gpu_ms,vf_scatter_near_gpu_ms,vf_scatter_far_gpu_ms,vf_integrate_gpu_ms,vf_history_gpu_ms,"
-					   "vf_grid_x,vf_grid_y,vf_grid_z,vf_grid_far_z\n";
+					   "vf_grid_x,vf_grid_y,vf_grid_z,vf_grid_far_z,"
+					   "water_prep_gpu_ms,water_draw_gpu_ms,rt_pl_water_rays\n";  // (47j) the last three
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1236,6 +1242,9 @@ namespace Util::FrameTrace
 					extra.pop_back();
 					extra += std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{}\n", r.vfPassMs[0], r.vfPassMs[1], r.vfPassMs[2], r.vfPassMs[3], r.vfPassMs[4],
 						r.vfPassMs[5], r.vfGrid[0], r.vfGrid[1], r.vfGrid[2], r.vfGrid[3]);
+					// (47j) Water prep / water draws GPU time and the rays traced from the water, after vf_grid_far_z (the old last column).
+					extra.pop_back();
+					extra += std::format(",{:.3f},{:.3f},{}\n", r.waterPrepGpuMs, r.gpuWaterMs, r.rt.plWaterRays);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;
@@ -1590,13 +1599,17 @@ namespace Util::FrameTrace
 		// back without waiting (DONOTFLUSH) a few frames later and put on that frame's row. GPU time between two stamps goes
 		// to the segment that was open (GPU idle inside the interval included: it is GPU wall time, not GPU work).
 		constexpr int kSegSlots = 8;
-		constexpr int kSegStamps = 17;  // 16 intervals, then the close
+		constexpr int kSegStamps = 65;  // (47j) 64 intervals, then the close (was 17: interiors ran out early and the rest of the frame went to "shadows")
 		constexpr int kSegs = static_cast<int>(EngineTiming::Seg::Count);
 		struct SegSlot
 		{
 			winrt::com_ptr<ID3D11Query> disjoint;
 			std::array<winrt::com_ptr<ID3D11Query>, kSegStamps> stamps;
 			std::array<int8_t, kSegStamps> seg{};  // the segment that starts at stamp i (-1 = not a render segment / the close)
+			// (47j) The water draws: begin / end stamp pairs (each run of Water-shader draws), summed into gpu water ms.
+			std::array<winrt::com_ptr<ID3D11Query>, 16> water;
+			int waterCount = 0;
+			bool waterOpen = false;
 			int count = 0;
 			uint64_t frameId = 0;
 			bool open = false;
@@ -1634,6 +1647,12 @@ namespace Util::FrameTrace
 					return false;
 				}
 			}
+			for (auto& stamp : a_slot.water) {
+				if (!stamp && FAILED(device->CreateQuery(&stampDesc, stamp.put()))) {
+					g_segBroken = true;
+					return false;
+				}
+			}
 			return true;
 		}
 
@@ -1664,6 +1683,11 @@ namespace Util::FrameTrace
 				return;
 			slot.open = false;
 			if (auto* context = globals::d3d::context) {
+				if (slot.waterOpen && slot.waterCount < static_cast<int>(slot.water.size())) {  // (47j) a run of water draws to the end of the frame
+					context->End(slot.water[slot.waterCount].get());
+					++slot.waterCount;
+				}
+				slot.waterOpen = false;
 				context->End(slot.stamps[slot.count].get());
 				slot.seg[slot.count] = -1;
 				++slot.count;
@@ -1815,6 +1839,14 @@ namespace Util::FrameTrace
 					if (hr != S_OK)
 						ready = false;
 				}
+				std::array<UINT64, 16> waterTicks{};  // (47j)
+				for (int i = 0; ready && i < slot.waterCount; ++i) {
+					hr = ReadQuery(context, slot.water[i].get(), waterTicks[i]);
+					if (hr == S_FALSE)
+						waiting = true;
+					if (hr != S_OK)
+						ready = false;
+				}
 				if (waiting)
 					continue;  // asked again next frame
 				slot.pending = false;
@@ -1847,6 +1879,12 @@ namespace Util::FrameTrace
 					it->gpuSegOtherMs = other;
 					it->gpuSegTotalMs = static_cast<float>(static_cast<double>(ticks[slot.count - 1] - ticks[0]) * toMs);
 					it->gpuSegStamps = slot.count;
+					// (47j) The water draws: the stamp pairs summed (0 = no water drawn).
+					double water = 0.0;
+					for (int i = 0; i + 1 < slot.waterCount; i += 2)
+						if (waterTicks[i + 1] >= waterTicks[i])
+							water += static_cast<double>(waterTicks[i + 1] - waterTicks[i]) * toMs;
+					it->gpuWaterMs = static_cast<float>(water);
 					break;
 				}
 			}
@@ -2804,15 +2842,42 @@ namespace Util::FrameTrace
 			context->End(slot.disjoint.get());
 			slot.seg[0] = static_cast<int8_t>(a_seg);
 			slot.count = 1;
+			slot.waterCount = 0;  // (47j)
+			slot.waterOpen = false;
 			slot.frameId = EngineTiming::FrameId();
 			slot.open = true;
 			return;
 		}
+		// (47j) The same segment again (or "not a render segment" again): the open interval goes on, no stamp spent.
+		const int8_t next = static_cast<int8_t>(IsRenderSeg(a_seg) ? a_seg : -1);
+		if (slot.count > 0 && slot.seg[slot.count - 1] == next)
+			return;
 		if (slot.count >= kSegStamps - 1)
-			return;  // full: the last interval runs on to the close (gpu_seg_stamps = 17)
+			return;  // full: the last interval runs on to the close (gpu_seg_stamps = kSegStamps)
 		context->End(slot.stamps[slot.count].get());
-		slot.seg[slot.count] = static_cast<int8_t>(IsRenderSeg(a_seg) ? a_seg : -1);
+		slot.seg[slot.count] = next;
 		++slot.count;
+	}
+
+	// (47j) The water draws on the GPU: a stamp where a run of Water-shader draws begins and where it ends (inside the frame's
+	// segment stamps: the same disjoint query), summed on read-back (water_draw_gpu_ms; GPU wall time, idle included).
+	void OnWaterDrawState(bool a_water)
+	{
+		if (!g_recording || g_segBroken)
+			return;
+		auto* context = globals::d3d::context;
+		if (!context)
+			return;
+		auto& slot = g_segSlots[g_segWrite];
+		if (!slot.open || slot.waterOpen == a_water)
+			return;
+		// A begin needs room for its end too.
+		const int room = static_cast<int>(slot.water.size()) - slot.waterCount;
+		if (a_water ? room < 2 : room < 1)
+			return;
+		context->End(slot.water[slot.waterCount].get());
+		++slot.waterCount;
+		slot.waterOpen = a_water;
 	}
 
 	nlohmann::json ToJson()

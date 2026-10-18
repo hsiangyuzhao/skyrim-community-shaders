@@ -2291,6 +2291,24 @@ namespace RayTracingScene
 		return any;
 	}
 
+	bool Scene::GetInteriorRect(float o_rect[4]) const
+	{
+		for (const auto& cell : cells_) {
+			if (!cell->interior)
+				continue;
+			double lo[3], hi[3];
+			if (!GetInteriorBounds(lo, hi))
+				return false;
+			o_rect[0] = static_cast<float>(lo[0]);
+			o_rect[1] = static_cast<float>(lo[1]);
+			o_rect[2] = static_cast<float>(hi[0]);
+			o_rect[3] = static_cast<float>(hi[1]);
+			return std::isfinite(o_rect[0]) && std::isfinite(o_rect[1]) && std::isfinite(o_rect[2]) && std::isfinite(o_rect[3]) && o_rect[2] > o_rect[0] &&
+			       o_rect[3] > o_rect[1];
+		}
+		return false;
+	}
+
 	bool Scene::GetLoadedRect(float o_rect[4], bool a_includeRetiring) const
 	{
 		// (46c) An interior: the box of what was captured (or, before anything is, a wide square around its origin).

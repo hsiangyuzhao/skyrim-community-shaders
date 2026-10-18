@@ -141,6 +141,16 @@ bool Hooks::BSShader_BeginTechnique::thunk(RE::BSShader* shader, uint32_t vertex
 	auto state = globals::state;
 	auto shaderCache = globals::shaderCache;
 
+	// (47j) "Skip Engine Water Point-Light Highlights" (Light Limit Fix, 47i): the engine's additive water light passes (Water
+	// techniques 1-7: SPECULAR with NUM_SPECULAR_LIGHTS 1-7) are not drawn at all (47i drew them with a 0 light loop, adding 0).
+	// Technique 0 (the main water pass, NUM_SPECULAR_LIGHTS 0) and Underwater / LOD / Stencil / Simple (8-11) are never skipped.
+	// A technique that does not begin is skipped by the engine, as for a missing shader.
+	if (shader->shaderType.get() == RE::BSShader::Type::Water && shaderCache->IsEnabled()) {
+		const uint32_t technique = (pixelDescriptor >> 11) & 0xF;
+		if (technique >= 1 && technique <= 7 && globals::features::lightLimitFix.loaded && globals::features::lightLimitFix.settings.SkipEngineWaterHighlights)
+			return false;
+	}
+
 	state->updateShader = true;
 	state->currentShader = shader;
 

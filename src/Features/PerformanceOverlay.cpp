@@ -345,6 +345,8 @@ namespace
 			return "Ray-traced AO: filter";
 		case B::RayTracingAOSync:
 			return "Ray-traced AO: waiting for the trace";
+		case B::RayTracingWaterPrep:  // (47j)
+			return "Ray-traced lamp shadows: water prep";
 		default:
 			return nullptr;
 		}
@@ -362,6 +364,7 @@ namespace
 		Util::GpuBucket::RayTracingAO,
 		Util::GpuBucket::RayTracingAOSync,
 		Util::GpuBucket::RayTracingSyncPoint,
+		Util::GpuBucket::RayTracingWaterPrep,  // (47j)
 	};
 
 	/// A table label without the ':' the tables append.

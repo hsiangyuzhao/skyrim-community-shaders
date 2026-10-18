@@ -96,6 +96,9 @@ struct ExponentialHeightFog : Feature
 		/// (47e) CS Fog Takes Over: the weather's part of the volume also gets the light scattered many times that the
 		/// weather's fog colour already holds, so it is as bright as the game's fog (VolumetricFogLightScatteringCS).
 		bool MatchWeatherFogBrightness = true;
+		/// (47j) "Volumetric Fog: Off Indoors": no volumetric fog passes in interior cells (and nothing of them applied there); its
+		/// history starts over outside. Exteriors unchanged. Off = 47i (the fog is built indoors too).
+		bool OffIndoors = true;
 	} volumetric;
 
 	/// (47b) The game's own fog under the height fog. CPU side only; reaches the shaders through

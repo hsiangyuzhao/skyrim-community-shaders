@@ -389,6 +389,9 @@ namespace RayTracingRT
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynWater));
 			nullUav.Format = kPointFormat;
 			device_->CreateUnorderedAccessView(nullptr, nullptr, &nullUav, StagingCpu(kDynWater + 1));
+			// (47j) RTAO: Smooth Normals (filled when its texture exists).
+			nullSrv.Format = kDepthMaskFormat;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAONormal));
 		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
@@ -678,6 +681,7 @@ namespace RayTracingRT
 		for (auto& context : contexts_)
 			context.pointPending = false;
 		stats_.pointRaysPerFrame = -1;
+		stats_.pointWaterRaysPerFrame = -1;  // (47j)
 		stats_.lastPointGpuMs = -1.0f;
 		if (stagingHeap_ && device_) {
 			// Back to null views (staging: the blocks of submissions in flight keep what they were recorded with).
@@ -798,7 +802,7 @@ namespace RayTracingRT
 		// Its own root signature: constants b0, TLAS t0, table (depth t1, AO u0), ray counter u1;
 		// the alpha-tested variant also: records t2, texcoords t3, table (copy layers t4, bindless game textures t0 space1), s0.
 		// 44 + 2 + 1 + 2 + 2 + 2 + 1 = 54 DWORDs.
-		D3D12_DESCRIPTOR_RANGE ranges[2]{};
+		D3D12_DESCRIPTOR_RANGE ranges[3]{};
 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		ranges[0].NumDescriptors = 1;
 		ranges[0].BaseShaderRegister = 1;
@@ -807,6 +811,11 @@ namespace RayTracingRT
 		ranges[1].NumDescriptors = 1;
 		ranges[1].BaseShaderRegister = 0;
 		ranges[1].OffsetInDescriptorsFromTableStart = 1;
+		// (47j) RTAO: Smooth Normals (t5), after the water views in the block.
+		ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+		ranges[2].NumDescriptors = 1;
+		ranges[2].BaseShaderRegister = 5;
+		ranges[2].OffsetInDescriptorsFromTableStart = kDynAONormal - kDynAO;
 		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
 		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		alphaRanges[0].NumDescriptors = 1;
@@ -826,7 +835,7 @@ namespace RayTracingRT
 		params[1].Descriptor.ShaderRegister = 0;
 		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[2].DescriptorTable.NumDescriptorRanges = 2;
+		params[2].DescriptorTable.NumDescriptorRanges = 3;  // (47j) + the smooth normals
 		params[2].DescriptorTable.pDescriptorRanges = ranges;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -966,6 +975,7 @@ namespace RayTracingRT
 			Retire(aoCounterReadback_, 0, nullptr);
 		aoCounter_.Reset();
 		aoCounterReadback_.Reset();
+		ReleaseAONormalTexture();  // (47j)
 		aoRaw_ = {};
 		aoWidth_ = aoHeight_ = 0;
 		aoBytes_ = 0;
@@ -999,6 +1009,54 @@ namespace RayTracingRT
 		device_->CreateUnorderedAccessView(aoRaw_.resource12.Get(), nullptr, &uavDesc, StagingCpu(kDynAO + 1));
 	}
 
+	// (47j) RTAO: Smooth Normals.
+	bool Backend::EnsureAONormalTexture(std::uint32_t a_width, std::uint32_t a_height)
+	{
+		if (!AOAvailable() || !stagingHeap_)
+			return false;
+		if (a_width == aoNormalWidth_ && a_height == aoNormalHeight_ && aoNormal_.resource12)
+			return true;
+		ReleaseAONormalTexture();
+		if (!CreateSharedTexture(a_width, a_height, kDepthMaskFormat, true, false, aoNormal_, "RayTracing RTAO Normals", false)) {
+			aoNormal_ = {};
+			return false;
+		}
+		aoNormalWidth_ = a_width;
+		aoNormalHeight_ = a_height;
+		WriteAONormalDescriptor();
+		logger::info("[RayTracing] RTAO smooth normals texture {}x{}", a_width, a_height);
+		return true;
+	}
+
+	void Backend::ReleaseAONormalTexture()
+	{
+		// A submission in flight may still read it: D3D12 keeps it until it is done (Retire).
+		if (aoNormal_.resource12)
+			Retire(aoNormal_.resource12, 0, nullptr);
+		aoNormal_ = {};
+		aoNormalWidth_ = aoNormalHeight_ = 0;
+		if (stagingHeap_ && device_) {
+			D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
+			nullSrv.Format = kDepthMaskFormat;
+			nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			nullSrv.Texture2D.MipLevels = 1;
+			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAONormal));
+		}
+	}
+
+	void Backend::WriteAONormalDescriptor()
+	{
+		if (!stagingHeap_ || !aoNormal_.resource12)
+			return;
+		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+		srvDesc.Format = kDepthMaskFormat;
+		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srvDesc.Texture2D.MipLevels = 1;
+		device_->CreateShaderResourceView(aoNormal_.resource12.Get(), &srvDesc, StagingCpu(kDynAONormal));
+	}
+
 	bool Backend::RecordAOTrace(CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame, D3D12_GPU_DESCRIPTOR_HANDLE a_table)
 	{
 		if (!a_input.ao || !AOAvailable() || !aoRaw_.resource12 || !aoCounter_ || !aoCounterMapped_ || !aoFence_ || !aoFence11_ || !a_context.aoList ||
@@ -1013,11 +1071,14 @@ namespace RayTracingRT
 		}
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
 		list->SetDescriptorHeaps(1, heaps);
-		D3D12_RESOURCE_BARRIER pre[2] = {
+		// (47j) The smooth normals texture (when it exists) is read like the depth.
+		const bool normals = aoNormal_.resource12 != nullptr;
+		D3D12_RESOURCE_BARRIER pre[3] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
 			Transition(aoRaw_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+			normals ? Transition(aoNormal_.resource12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) : D3D12_RESOURCE_BARRIER{},
 		};
-		list->ResourceBarrier(2, pre);
+		list->ResourceBarrier(normals ? 3 : 2, pre);
 		const UINT queryBase = static_cast<UINT>(kContexts * 6 + a_index * 2);
 		if (timestampHeap_)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase);
@@ -1041,11 +1102,12 @@ namespace RayTracingRT
 		list->Dispatch((a_input.renderWidth + 7) / 8, (a_input.renderHeight + 7) / 8, 1);
 		if (timestampHeap_)
 			list->EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryBase + 1);
-		D3D12_RESOURCE_BARRIER post[2] = {
+		D3D12_RESOURCE_BARRIER post[3] = {
 			Transition(depthMask_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
 			Transition(aoRaw_.resource12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+			normals ? Transition(aoNormal_.resource12.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON) : D3D12_RESOURCE_BARRIER{},
 		};
-		list->ResourceBarrier(2, post);
+		list->ResourceBarrier(normals ? 3 : 2, post);
 		// The ray counter's value after this frame, into this context's read-back slot.
 		D3D12_RESOURCE_BARRIER toCopy = Transition(aoCounter_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
 		list->ResourceBarrier(1, &toCopy);
@@ -1164,6 +1226,8 @@ namespace RayTracingRT
 		aoFence_.Reset();
 		aoFenceValue_ = 0;
 		pendingAOWait_ = 0;
+		aoNormal_ = {};  // (47j)
+		aoNormalWidth_ = aoNormalHeight_ = 0;
 		stagingHeap_.Reset();
 		depthMask_ = {};
 		visibility_ = {};
@@ -1312,7 +1376,7 @@ namespace RayTracingRT
 		}
 		for (auto* resource : { tlas_.Get(), scratch_.Get(), skinScratch_.Get(), alphaUv_.Get(), alphaLayers12_.Get(), postbuild_.Get(), pointCounter_.Get(),
 				 aoCounter_.Get(), depthMask_.resource12.Get(), visibility_.resource12.Get(), pointVis_.resource12.Get(), pointIdx_.resource12.Get(),
-				 aoRaw_.resource12.Get() })
+				 aoRaw_.resource12.Get(), aoNormal_.resource12.Get() })
 			if (resource)
 				objects.push_back(resource);
 		ApplyResidency(objects.data(), objects.size());
@@ -1620,6 +1684,7 @@ namespace RayTracingRT
 				stats_.pointRaysPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(value - pointCounterLast_) / frames);
 				// (46g) Top-K churn and the window beams' sampled pixels (traced / blocked), per frame.
 				stats_.pointChurnPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[1] - pointCounterWords_[1]) / frames);
+				stats_.pointWaterRaysPerFrame = static_cast<std::int64_t>(static_cast<std::uint32_t>(words[2] - pointCounterWords_[2]) / frames);  // (47j)
 				for (std::uint32_t slot = 0; slot < kPointBeamSlots; ++slot) {
 					const std::uint32_t w = kPointBeamBase + slot * 2;
 					stats_.beamTraced[slot] = static_cast<std::uint32_t>(words[w] - pointCounterWords_[w]) / frames;

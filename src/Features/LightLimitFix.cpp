@@ -33,7 +33,7 @@ void LightLimitFix::DrawSettings()
 	ImGui::SeparatorText("Water");
 	ImGui::Checkbox("Skip Engine Water Point-Light Highlights", &settings.SkipEngineWaterHighlights);
 	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("On (default): the game's own extra highlight passes for lights on water add nothing. They had no shadows (a forge behind");
+		ImGui::Text("On (default): the game's own extra highlight passes for lights on water are not drawn (47j; 47i drew them adding nothing). They had no shadows (a forge behind");
 		ImGui::Text("  a wall still lit the river) and came on top of this feature's water lighting, which already lights the water with");
 		ImGui::Text("  every nearby light (now including the game's shadow-casting lights, which it used to leave to those passes).");
 		ImGui::Text("Off: as before 47i.");

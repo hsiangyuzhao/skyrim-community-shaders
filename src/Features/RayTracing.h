@@ -194,6 +194,8 @@ public:
 		// slice each, one barrier at the end); the RT queue at high priority (an experiment, from the next start-up).
 		bool ParallelBlasBuilds = true;
 		bool HighPriorityQueue = false;
+		// (47j) "Early RT Prep Indoors": Early Prep (characters, skinning, builds at the frame start) in interiors too (Ray Tracing indoors on).
+		bool EarlyPrepIndoors = true;
 		// (46q) Outside the settings macro too. Submit on a Worker Thread: our D3D12 queue calls (ExecuteCommandLists / Signal /
 		// Wait) go out on a submit thread (off = 46p, on the render thread). Budget Builds by GPU Time: static + merged-character
 		// BLAS builds per frame within BuildGpuBudgetMs of measured GPU time, at most GroupBuildsPerFrame merged builds, and a
@@ -256,6 +258,9 @@ public:
 		bool AOCharacterSelfFix = true;
 		bool SunDepthCheckTranslucent = true;
 		bool PointShadowsOnWater = true;
+		// (47j) AOSmoothNormals "RTAO: Smooth Normals": the AO hemisphere around last frame's G-buffer normal reprojected to this frame
+		// (AONormalPrepCS, confidence-blended toward the depth normal), not the per-facet depth normal. Off = 47i.
+		bool AOSmoothNormals = true;
 	};
 	/// (46f) RTAO modes (Settings::AOMode); with RTAO off the AO is SSGI's, exactly as before.
 	enum class AOModeKind : int
@@ -784,6 +789,23 @@ private:
 	D3D11_TEXTURE2D_DESC waterDepthCopyDesc{};
 	winrt::com_ptr<ID3D11ComputeShader> waterPrepCS;
 	std::unique_ptr<ConstantBuffer> waterPrepCB;
+	// (47j) RTAO: Smooth Normals. Last frame's camera and size (DepthMask still holds its depth until PrepareCS overwrites it).
+	winrt::com_ptr<ID3D11ComputeShader> aoNormalCS;
+	std::unique_ptr<ConstantBuffer> aoNormalCB;
+	struct AONormalPrev
+	{
+		uint32_t frame = UINT32_MAX;
+		uint32_t width = 0, height = 0;
+		float viewProj[16]{};
+		float invViewProj[16]{};
+		float viewInverse[16]{};
+		double camera[3]{};
+	} aoNormalPrev;
+	bool aoNormalsThisFrame = false;
+	/// Before PrepareCS: the smooth normals for this frame's RTAO trace (sets its flag); false = the trace keeps the depth normal.
+	bool RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height);
+	/// After PrepareCS: this frame's camera, for next frame's reprojection.
+	void RememberAONormalFrame(std::uint32_t a_width, std::uint32_t a_height);
 
 	// (46c) Interiors: the interior cell's capture, its point lights and window beams, and the engine's shadow maps.
 	struct alignas(16) PointMaskCB

@@ -59,7 +59,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     NoiseScale,
     NoiseThreshold,
     NoiseVelocity,
-    MatchWeatherFogBrightness)
+    MatchWeatherFogBrightness,
+    OffIndoors)
 
 namespace
 {
@@ -260,6 +261,8 @@ bool ExponentialHeightFog::VolumetricFogActive() const
         return false;
     if (globals::game::ui && globals::game::ui->IsMenuOpen(RE::MapMenu::MENU_NAME))
         return false;
+    if (volumetric.OffIndoors && Util::IsInterior())  // (47j)
+        return false;
     return true;
 }
 
@@ -271,6 +274,8 @@ std::string ExponentialHeightFog::VolumetricFogIdleReason() const
         return "height fog density is 0";
     if (volumetric.ExtinctionScale <= 0.0f)
         return "Volumetric Extinction Scale is 0";
+    if (volumetric.OffIndoors && Util::IsInterior())
+        return "indoors (Volumetric Fog: Off Indoors)";
     return "map open";
 }
 
@@ -1034,6 +1039,12 @@ void ExponentialHeightFog::DrawSettings()
             "leaves beams that tree trunks block. Uses the fog settings above for where the fog is.\n"
             "While it is on, vanilla Volumetric Lighting (light shafts) is paused so the sun's shafts are\n"
             "not drawn twice. Costs roughly 0.5-1.5 ms.");
+    // (47j)
+    ImGui::Checkbox("Volumetric Fog: Off Indoors", &volumetric.OffIndoors);
+    if (auto _tt = Util::HoverTooltipWrapper())
+        ImGui::Text(
+            "On (default): no 3D fog inside buildings and caves (saves about 1 ms there). Outside nothing changes;\n"
+            "stepping out it starts afresh (no old fog from indoors). Off: as in 47i (the 3D fog is built indoors too).");
     if (volumetric.Enabled) {
         if (VolumetricFogRequested() && globals::features::volumetricLighting.loaded)
             ImGui::TextColored(palette.InfoColor, "Vanilla Volumetric Lighting is paused while this is on.");

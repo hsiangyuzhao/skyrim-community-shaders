@@ -127,6 +127,7 @@ namespace Util::FrameTrace
 		int plK = 0;
 		uint32_t plSources = 0, plCandidates = 0;
 		int64_t plRays = -1;
+		int64_t plWaterRays = -1;  // (47j) of plRays, traced from the water surface
 		float plGpuMs = -1, plDenoiseGpuMs = -1, plCpuMs = -1;
 		// (46c) Interiors: 0 outdoors / off, 1 indoors capturing, 2 indoors traced; window beams traced; engine shadow maps
 		// left out this frame; shadow mask channels written by RT; interior shapes captured.
@@ -406,5 +407,7 @@ namespace Util::FrameTrace
 	/// EngineTiming: the main thread entered segment a_seg (EngineTiming::Seg as int). A D3D11 timestamp at every change
 	/// between render segments (at most 16 per frame), read back a few frames later without waiting.
 	void OnEngineSegment(int a_seg);
+	/// (47j) Every draw (State): whether it uses the Water shader; brackets the runs of water draws with GPU stamps while recording.
+	void OnWaterDrawState(bool a_water);
 
 }

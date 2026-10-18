@@ -245,6 +245,17 @@ namespace
 	constexpr std::uint32_t kAOTraceDetail = 4u, kAOTraceAlphaHalf = 8u, kAOTraceAlphaOpen = 16u;  // TraceAOCS
 	constexpr std::uint32_t kAOTraceSingleRay = 32u, kAOTraceHalfFar = 64u;  // (46y) TraceAOCS (two scales only)
 	constexpr std::uint32_t kAOTraceDither8 = 128u, kAOTraceSelfFix = 256u;  // (47h) TraceAOCS: RGBA8 output dither, Character Self-Occlusion Fix
+	constexpr std::uint32_t kAOTraceSmoothNormals = 512u;  // (47j) TraceAOCS: RTAO: Smooth Normals (AONormalPrepCS)
+	// (47j) AONormalPrepCS.
+	struct alignas(16) AONormalConstants
+	{
+		float InvViewProj[16];
+		float PrevViewProj[16];
+		float PrevInvViewProj[16];
+		float PrevViewInverse[16];
+		float CameraDelta[4];
+		float RenderSize[4];
+	};
 
 	// (46c) BSShadowFrustumLight / BSShadowParabolicLight::RenderShadowmaps (vfunc 0x0A): Ray Tracing may skip the shadow
 	// maps of lights it fully handles this frame (Point Lights > Stop Engine Shadow Maps, interiors only).
@@ -1196,6 +1207,7 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.FadeInBudgets = read("FadeInBudgets", defaults.FadeInBudgets);
 		settings.PointLightsBeamSoftness = read("PointLightsBeamSoftness", defaults.PointLightsBeamSoftness);  // (46o)
 		settings.ParallelBlasBuilds = read("ParallelBlasBuilds", defaults.ParallelBlasBuilds);  // (46p)
+		settings.EarlyPrepIndoors = read("EarlyPrepIndoors", defaults.EarlyPrepIndoors);  // (47j)
 		settings.HighPriorityQueue = read("HighPriorityQueue", defaults.HighPriorityQueue);
 		settings.SubmitWorker = read("SubmitWorker", defaults.SubmitWorker);  // (46q)
 		settings.BuildGpuBudget = read("BuildGpuBudget", defaults.BuildGpuBudget);
@@ -1229,6 +1241,7 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AOCharacterSelfFix = read("AOCharacterSelfFix", defaults.AOCharacterSelfFix);
 		settings.SunDepthCheckTranslucent = read("SunDepthCheckTranslucent", defaults.SunDepthCheckTranslucent);
 		settings.PointShadowsOnWater = read("PointShadowsOnWater", defaults.PointShadowsOnWater);
+		settings.AOSmoothNormals = read("AOSmoothNormals", defaults.AOSmoothNormals);  // (47j)
 	}
 	// (46o) Window Beam Guard: off once for settings saved before 46o (its rule misfired on beams that mostly hit walls).
 	if (loadedVersion < 6 && settings.PointLightsBeamGuard) {
@@ -1291,6 +1304,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["FadeInBudgets"] = settings.FadeInBudgets;
 	o_json["PointLightsBeamSoftness"] = settings.PointLightsBeamSoftness;  // (46o)
 	o_json["ParallelBlasBuilds"] = settings.ParallelBlasBuilds;  // (46p)
+	o_json["EarlyPrepIndoors"] = settings.EarlyPrepIndoors;  // (47j)
 	o_json["HighPriorityQueue"] = settings.HighPriorityQueue;
 	o_json["SubmitWorker"] = settings.SubmitWorker;  // (46q)
 	o_json["BuildGpuBudget"] = settings.BuildGpuBudget;
@@ -1319,6 +1333,7 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AOSingleRay"] = settings.AOSingleRay;
 	o_json["AOHalfResFar"] = settings.AOHalfResFar;
 	o_json["AOCharacterSelfFix"] = settings.AOCharacterSelfFix;  // (47h)
+	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["SunDepthCheckTranslucent"] = settings.SunDepthCheckTranslucent;
 	o_json["PointShadowsOnWater"] = settings.PointShadowsOnWater;
 }
@@ -1946,8 +1961,13 @@ void RayTracing::RunEarlyPrep()
 	if (backend.IsReady() && backend.HasPrepared())
 		backend.AbandonPrepared();  // a frame that never reached its Prepass
 	auto* sky = globals::game::sky;
-	if (!settings.Enabled || status != Status::Active || phase != Phase::Play || loadingOpen.load() ||
-		!backend.IsReady() || Util::IsInterior() || !sky || sky->mode.get() != RE::Sky::Mode::kFull || !backend.HasFreeContext())
+	// (47j) Early RT Prep Indoors: in an interior traced by Ray Tracing (its own interior frame), once the interior is in the scene
+	// with its captured box (the characters are taken within that box, as RunInteriorFrame does). Off = 47i (outdoors only).
+	const bool interior = Util::IsInterior();
+	float interiorRect[4]{};
+	const bool earlyIndoors = interior && settings.EarlyPrepIndoors && InteriorWanted() && scene.HasCoverage() && scene.GetInteriorRect(interiorRect);
+	if (!settings.Enabled || status != Status::Active || phase != Phase::Play || loadingOpen.load() || !backend.IsReady() ||
+		(interior ? !earlyIndoors : (!sky || sky->mode.get() != RE::Sky::Mode::kFull)) || !backend.HasFreeContext())
 		return;
 	const std::int64_t start = Qpc();
 	try {
@@ -1955,7 +1975,9 @@ void RayTracing::RunEarlyPrep()
 		skinBones.clear();
 		if (settings.Characters && backend.SkinAvailable()) {
 			float world[4];
-			if (scene.GetLoadedRect(world, false))
+			if (interior)
+				characters.Update(backend, interiorRect, blackScreen ? 6.0 : 1.0, blackScreen ? 32u : 6u);
+			else if (scene.GetLoadedRect(world, false))
 				characters.Update(backend, world, blackScreen ? 6.0 : 1.0, blackScreen ? 32u : 6u);
 			characters.CollectDraws(skinDraws, skinBones);
 			charactersUpdatedEarly = true;
@@ -2511,6 +2533,7 @@ void RayTracing::PublishCpuSplit()
 		detail.plGpuMs = pointThisFrame ? stats.lastPointGpuMs : 0.0f;
 		detail.plDenoiseGpuMs = passMs(pointThisFrame && pointDenoised, Util::GpuBucket::RayTracingPointDenoise);
 		detail.plRays = pointThisFrame ? stats.pointRaysPerFrame : 0u;
+		detail.plWaterRays = pointThisFrame ? stats.pointWaterRaysPerFrame : 0;  // (47j)
 		detail.plCpuMs = PointLightsOn() ? pointCpuMs : -1.0f;
 		// (46c)
 		// (46h) 2 = indoors traced: point lights and / or RTAO.
@@ -3028,6 +3051,9 @@ void RayTracing::RunFrame()
 			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
 	}
 
+	// 0b. (47j) RTAO: Smooth Normals, from last frame's depth still in DepthMask (before step 1 overwrites it).
+	if (input.ao)
+		RunAONormalPrep(context, depth.depthSRV, width, height);
 	// 1. Depth + engine mask -> the tracer's shared texture.
 	{
 		ID3D11ShaderResourceView* srvs[2] = { depth.depthSRV, mask.SRV };
@@ -3043,6 +3069,7 @@ void RayTracing::RunFrame()
 		context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
 		context->CSSetShader(nullptr, nullptr, 0);
 	}
+	RememberAONormalFrame(width, height);  // (47j) DepthMask now holds this frame's depth
 
 	// 2. D3D12: builds, skinning and the TLAS (not waiting for D3D11), then the trace (waiting for the
 	// depth copy above, GPU-side). The D3D11 queue waits for the trace in FinishFrame.
@@ -3558,6 +3585,7 @@ void RayTracing::PrepWaterDistance(ID3D11DeviceContext* a_context)
 	cb.RenderSize[3] = 1.0f / static_cast<float>(waterRenderHeight);
 	waterPrepCB->Update(cb);
 
+	GpuBucketScope waterTimer(Util::GpuBucket::RayTracingWaterPrep);  // (47j) F7 water_prep_gpu_ms
 	// The depth as it is after the water (GPU copy in command order), then the water's distance where it lies in front of the
 	// opaque depth (the trace's DepthMask).
 	a_context->CopyResource(waterDepthCopy.get(), main.texture);
@@ -3583,6 +3611,95 @@ void RayTracing::PrepWaterDistance(ID3D11DeviceContext* a_context)
 	}
 	waterPrepFrame = globals::state->frameCount;
 	waterDistValid = true;
+}
+
+// (47j) RTAO: Smooth Normals. The trace runs after the depth prepass, before this frame's G-buffer: last frame's normals
+// (NORMALROUGHNESS is cleared only in StartDeferred) reprojected by the camera and the motion vectors, checked against last
+// frame's depth (the trace's DepthMask, before PrepareCS overwrites it) and blended toward the depth normal by that confidence.
+bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderResourceView* a_depth, std::uint32_t a_width, std::uint32_t a_height)
+{
+	aoNormalsThisFrame = false;
+	if (!settings.AOSmoothNormals) {
+		if (backend.HasAONormalTexture())
+			backend.ReleaseAONormalTexture();  // only while it is wanted
+		return false;
+	}
+	const uint32_t frame = globals::state->frameCount;
+	// Last frame's depth in DepthMask at the same size, and its camera.
+	const bool prevValid = aoNormalPrev.frame != UINT32_MAX && aoNormalPrev.frame + 1 == frame && aoNormalPrev.width == a_width && aoNormalPrev.height == a_height;
+	auto* renderer = globals::game::renderer;
+	auto& normal = renderer->GetRuntimeData().renderTargets[NORMALROUGHNESS];
+	auto& motion = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR];
+	if (!prevValid || !a_depth || !normal.SRV || !motion.SRV || !backend.DepthMaskSRV())
+		return false;
+	if (!backend.EnsureAONormalTexture(a_width, a_height)) {
+		logger::warn("[RayTracing] RTAO: Smooth Normals: its shared texture could not be created; switched off");
+		settings.AOSmoothNormals = false;
+		return false;
+	}
+	if (!aoNormalCS) {
+		aoNormalCS.attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(L"Data\\Shaders\\RayTracing\\AONormalPrepCS.hlsl", {}, "cs_5_0")));
+		if (!aoNormalCS) {
+			logger::warn("[RayTracing] RTAO: Smooth Normals: AONormalPrepCS did not compile; switched off");
+			settings.AOSmoothNormals = false;
+			backend.ReleaseAONormalTexture();
+			return false;
+		}
+	}
+	if (!aoNormalCB)
+		aoNormalCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<AONormalConstants>());
+	const auto& fb = globals::game::frameBufferCached;
+	const float4 camera = fb.GetCameraPosAdjust(0);
+	AONormalConstants cb{};
+	std::memcpy(cb.InvViewProj, &fb.GetCameraViewProjInverse(0), sizeof(cb.InvViewProj));
+	std::copy_n(aoNormalPrev.viewProj, 16, cb.PrevViewProj);
+	std::copy_n(aoNormalPrev.invViewProj, 16, cb.PrevInvViewProj);
+	std::copy_n(aoNormalPrev.viewInverse, 16, cb.PrevViewInverse);
+	cb.CameraDelta[0] = static_cast<float>(static_cast<double>(camera.x) - aoNormalPrev.camera[0]);
+	cb.CameraDelta[1] = static_cast<float>(static_cast<double>(camera.y) - aoNormalPrev.camera[1]);
+	cb.CameraDelta[2] = static_cast<float>(static_cast<double>(camera.z) - aoNormalPrev.camera[2]);
+	cb.RenderSize[0] = static_cast<float>(a_width);
+	cb.RenderSize[1] = static_cast<float>(a_height);
+	cb.RenderSize[2] = 1.0f / static_cast<float>(a_width);
+	cb.RenderSize[3] = 1.0f / static_cast<float>(a_height);
+	aoNormalCB->Update(cb);
+	ID3D11Buffer* cbs[1] = { aoNormalCB->CB() };
+	ID3D11ShaderResourceView* srvs[4] = { a_depth, backend.DepthMaskSRV(), normal.SRV, motion.SRV };
+	ID3D11UnorderedAccessView* uavs[1] = { backend.AONormalUAV() };
+	a_context->CSSetConstantBuffers(0, 1, cbs);
+	a_context->CSSetShaderResources(0, 4, srvs);
+	a_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+	a_context->CSSetShader(aoNormalCS.get(), nullptr, 0);
+	a_context->Dispatch((a_width + 7) / 8, (a_height + 7) / 8, 1);
+	ID3D11ShaderResourceView* nullSrvs[4]{};
+	ID3D11UnorderedAccessView* nullUavs[1]{};
+	ID3D11Buffer* nullCbs[1]{};
+	a_context->CSSetShaderResources(0, 4, nullSrvs);
+	a_context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+	a_context->CSSetConstantBuffers(0, 1, nullCbs);
+	a_context->CSSetShader(nullptr, nullptr, 0);
+	// The trace reads it.
+	std::uint32_t flags;
+	std::memcpy(&flags, &aoInput.constants.params[1], sizeof(flags));
+	flags |= kAOTraceSmoothNormals;
+	std::memcpy(&aoInput.constants.params[1], &flags, sizeof(flags));
+	aoNormalsThisFrame = true;
+	return true;
+}
+
+void RayTracing::RememberAONormalFrame(std::uint32_t a_width, std::uint32_t a_height)
+{
+	const auto& fb = globals::game::frameBufferCached;
+	const float4 camera = fb.GetCameraPosAdjust(0);
+	aoNormalPrev.frame = globals::state->frameCount;
+	aoNormalPrev.width = a_width;
+	aoNormalPrev.height = a_height;
+	std::memcpy(aoNormalPrev.viewProj, &fb.GetCameraViewProj(0), sizeof(aoNormalPrev.viewProj));
+	std::memcpy(aoNormalPrev.invViewProj, &fb.GetCameraViewProjInverse(0), sizeof(aoNormalPrev.invViewProj));
+	std::memcpy(aoNormalPrev.viewInverse, &fb.GetCameraViewInverse(0), sizeof(aoNormalPrev.viewInverse));
+	aoNormalPrev.camera[0] = camera.x;
+	aoNormalPrev.camera[1] = camera.y;
+	aoNormalPrev.camera[2] = camera.z;
 }
 
 void RayTracing::ReleasePointDenoiser()
@@ -4443,6 +4560,10 @@ void RayTracing::RunInteriorFrame()
 		// queue even before any cell is covered, but indoors nothing is traced until the interior is covered,
 		// so without this its queued builds never ran (46c: "capturing the interior" for ever). Our own queue,
 		// nothing waits on the CPU; a larger cap while warming up after the loading screen.
+		if (backend.HasPrepared()) {  // (47j) an Early Prep context this frame does not trace with
+			backend.AbandonPrepared();
+			earlyThisFrame = false;
+		}
 		backend.BuildOnly(blackScreen ? kLoadingBuildTriangles : kBuildBudget * 2, blackScreen ? kLoadingMaxBuilds : 64u, blackScreen ? kBlackBuildCpuMs : 2.0f);
 		backend.Tick();
 		status = Status::Waiting;
@@ -4458,15 +4579,26 @@ void RayTracing::RunInteriorFrame()
 
 	// Characters (as outdoors, within the interior's box).
 	const std::int64_t charactersStart = Qpc();
-	if (backend.HasPrepared())
-		backend.AbandonPrepared();
-	skinDraws.clear();
-	skinBones.clear();
-	if (settings.Characters && backend.SkinAvailable()) {
-		characters.Update(backend, world, blackScreen ? 6.0 : 1.0, blackScreen ? 32u : 6u);
-		characters.CollectDraws(skinDraws, skinBones);
+	const bool charactersWanted = settings.Characters && backend.SkinAvailable();
+	if (charactersUpdatedEarly && charactersWanted && backend.HasPrepared()) {
+		// (47j) Early RT Prep Indoors: already done at the frame start (skinDraws / skinBones are this frame's); the prepared
+		// context (builds, skinning) is used by ExecuteFrame as outdoors.
+		cpuLast.characters = earlyCharactersMs;
+	} else {
+		if (backend.HasPrepared() && (charactersWanted || charactersUpdatedEarly)) {
+			// Prepared without these draws: the trace must not pair other ready flags (as outdoors).
+			backend.AbandonPrepared();
+			earlyThisFrame = false;
+		}
+		charactersUpdatedEarly = false;
+		skinDraws.clear();
+		skinBones.clear();
+		if (charactersWanted) {
+			characters.Update(backend, world, blackScreen ? 6.0 : 1.0, blackScreen ? 32u : 6u);
+			characters.CollectDraws(skinDraws, skinBones);
+		}
+		cpuLast.characters = static_cast<float>(static_cast<double>(Qpc() - charactersStart) * QpcMs());
 	}
-	cpuLast.characters = static_cast<float>(static_cast<double>(Qpc() - charactersStart) * QpcMs());
 
 	const float2 renderSize = Util::ConvertToDynamic(globals::state->screenSize);
 	const std::uint32_t width = std::min<std::uint32_t>(static_cast<std::uint32_t>(renderSize.x), desc.Width);
@@ -4527,6 +4659,10 @@ void RayTracing::RunInteriorFrame()
 	}
 	if (!input.pointLights && !input.ao) {
 		// Nothing to trace (no shadow-casting light in view, no RTAO): the queued builds go on, nothing waits.
+		if (backend.HasPrepared()) {  // (47j) an Early Prep context this frame does not trace with
+			backend.AbandonPrepared();
+			earlyThisFrame = false;
+		}
 		backend.BuildOnly(kBuildBudget, 64u, blackScreen ? kBlackBuildCpuMs : 2.0f);
 		backend.Tick();
 		status = Status::Active;
@@ -4577,6 +4713,9 @@ void RayTracing::RunInteriorFrame()
 		if (alphaMaskCS)
 			backend.RecordAlphaCopies(alphaMaskCS.get(), kAlphaCopiesPerFrame);
 	}
+	// (47j) RTAO: Smooth Normals, from last frame's depth still in DepthMask (before PrepareCS overwrites it).
+	if (input.ao)
+		RunAONormalPrep(context, depth.depthSRV, width, height);
 	{
 		ID3D11Buffer* cbs[1] = { combineCB->CB() };
 		ID3D11ShaderResourceView* srvs[2] = { depth.depthSRV, mask.SRV };
@@ -4592,6 +4731,7 @@ void RayTracing::RunInteriorFrame()
 		context->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
 		context->CSSetShader(nullptr, nullptr, 0);
 	}
+	RememberAONormalFrame(width, height);  // (47j)
 	const std::int64_t executeStart = Qpc();
 	cpuLast.d3d11 = static_cast<float>(static_cast<double>(executeStart - d3d11Start) * QpcMs());
 	const bool traced = backend.ExecuteFrame(input);
@@ -5522,6 +5662,7 @@ void RayTracing::DrawAOPage()
 					settings.AOSingleRay = d.AOSingleRay;  // (46y)
 					settings.AOHalfResFar = d.AOHalfResFar;
 					settings.AOCharacterSelfFix = d.AOCharacterSelfFix;  // (47h)
+					settings.AOSmoothNormals = d.AOSmoothNormals;  // (47j)
 				}
 				ImGui::BeginDisabled(!settings.AO);
 				ImGui::Checkbox("Fine Detail (two scales)", &settings.AODetail);
@@ -5573,6 +5714,15 @@ void RayTracing::DrawAOPage()
 					ImGui::Text("  off the drawn one (the dark band along the sides of the legs, clearest with Fine Detail). Rays from a body");
 					ImGui::Text("  pixel ignore that same character's surfaces seen from the inside and start a bit further out when they");
 					ImGui::Text("  skim the skin. Real contact (an arm against the body, between the legs) still darkens. Off: as in 47g.");
+				}
+				// (47j)
+				ImGui::Checkbox("RTAO: Smooth Normals", &settings.AOSmoothNormals);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("On (default): the AO rays leave each pixel around the smooth surface direction (last frame's G-buffer normal,");
+					ImGui::Text("  moved to this frame by the camera and the motion vectors) instead of the flat facet seen in the depth. Low-poly");
+					ImGui::Text("  round things (bottles, legs) no longer get one AO value per facet with steps at the facet edges. Where the old");
+					ImGui::Text("  normal cannot be trusted (just uncovered, fast motion) it blends back to the facet direction. Fine Detail may");
+					ImGui::Text("  pick up a faint trace of normal-map texture. Off: as in 47i.");
 				}
 				ImGui::EndDisabled();
 				if (!aoExtrasFault.empty())
@@ -5700,6 +5850,7 @@ void RayTracing::DrawDiagnostics()
 			settings.CharactersMerge = d.CharactersMerge;
 			settings.SplitTraceSync = d.SplitTraceSync;
 			settings.ParallelBlasBuilds = d.ParallelBlasBuilds;
+			settings.EarlyPrepIndoors = d.EarlyPrepIndoors;  // (47j)
 			settings.HighPriorityQueue = d.HighPriorityQueue;
 			settings.SubmitWorker = d.SubmitWorker;
 			settings.BuildGpuBudget = d.BuildGpuBudget;
@@ -5734,6 +5885,12 @@ void RayTracing::DrawDiagnostics()
 			ImGui::Text("On (default): the scenery shapes that enter in one frame are built side by side on the graphics card (at most 64 MB");
 			ImGui::Text("  of scratch memory together). Shorter hitches when new cells or objects arrive. Off: one by one.");
 			ImGui::Text("  F7: rt_prep_gpu_ms with rt_pw_builds.");
+		}
+		ImGui::Checkbox("Early RT Prep Indoors", &settings.EarlyPrepIndoors);  // (47j)
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): indoors too, the characters' ray-tracing shapes and the queued builds go to the graphics card at the start");
+			ImGui::Text("  of the frame (overlapping the game's shadow maps and depth pass), as outdoors, instead of right before the trace.");
+			ImGui::Text("  Same frame, same data: no change in the picture. Off: as in 47i (indoors all of it right before the trace). F7: rt_sync_gpu_ms.");
 		}
 		ImGui::Checkbox("RT Queue High Priority (restart)", &settings.HighPriorityQueue);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -6160,7 +6317,8 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "sspls_non_rt", settings.PointLightsSSPLSNonRT }, { "sspls_contact", settings.PointLightsSSPLSContact },  // (46y)
 			{ "size", settings.PointLightsSize }, { "clearance", settings.PointLightsClearance }, { "traced", pointThisFrame }, { "sources", ps.sources },
 			{ "candidates", ps.candidates }, { "merged", ps.merged }, { "capped", ps.capped }, { "native_lights", ps.native }, { "gpu_ms", stats.lastPointGpuMs },
-			{ "rays_per_frame", stats.pointRaysPerFrame }, { "denoise_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingPointDenoise) },
+			{ "rays_per_frame", stats.pointRaysPerFrame }, { "water_rays_per_frame", stats.pointWaterRaysPerFrame },  // (47j)
+			 { "denoise_gpu_ms", Util::GpuPassTimers::GetSingleton()->SmoothedMs(Util::GpuBucket::RayTracingPointDenoise) },
 			{ "cpu_ms", pointCpuMs }, { "off_reason", pointOffReason }, { "player", settings.PointLightsPlayer }, { "effects", settings.PointLightsEffects },
 			{ "alpha_outdoors", settings.PointLightsAlphaOutdoors }, { "player_sources", ps.player }, { "effect_sources", ps.effects },
 			{ "alpha_last_frame", backend.PointAlphaLastFrame() } };

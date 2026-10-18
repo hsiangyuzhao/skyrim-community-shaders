@@ -298,6 +298,9 @@ namespace RayTracingScene
 		/// World-space xy rect of the captured cells (min x, min y, max x, max y); false when none.
 		/// a_includeRetiring: also the cells still traced this frame but released at its end.
 		bool GetLoadedRect(float o_rect[4], bool a_includeRetiring) const;
+		/// (47j) The captured interior's box (world xy min / max) when an interior cell is in the scene and has captured bounds; false
+		/// otherwise (exterior, an interior not captured yet, the frame of a switch). Early RT Prep Indoors.
+		bool GetInteriorRect(float o_rect[4]) const;
 		/// True once at least one cell is captured with all its BLASes built.
 		[[nodiscard]] bool HasCoverage() const { return cellsReady_ > 0; }
 

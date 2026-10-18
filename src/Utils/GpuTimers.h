@@ -98,6 +98,8 @@ namespace Util
 		VolumetricFogMaterial,   // medium set-up (both grids)
 		VolumetricFogIntegrate,  // integration along the view rays (both grids)
 		VolumetricFogHistory,    // the temporal history copies (light scattering + conservative depth)
+		// (47j) Point Light Shadows on Water: WaterPrepCS (the depth copy after the water and the water distance pass).
+		RayTracingWaterPrep,
 		Count
 	};
 

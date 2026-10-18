@@ -67,6 +67,7 @@ RaytracingAccelerationStructure Scene : register(t0);
 Texture2D<float> DepthMask : register(t1);
 RWTexture2D<float4> AOOut : register(u0);  // (47h) float: RGBA16F, or RGBA8 (kFlagDither8)
 RWByteAddressBuffer RayCounter : register(u1);  // rays traced (monotonic, read back for the F7 trace)
+Texture2D<float> AONormals : register(t5);   // (47j) kFlagSmoothNormals: AONormalPrepCS output (packed octahedral world normal, 0 = none)
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
@@ -77,6 +78,7 @@ static const uint kFlagSingleRay = 32u;   // (46y) two scales: the long directio
 static const uint kFlagHalfFar = 64u;     // (46y) two scales: the far part only on a checkerboard that swaps every frame
 static const uint kFlagDither8 = 128u;    // (47h) the output is RGBA8: dither the weight (.g)
 static const uint kFlagSelfFix = 256u;    // (47h) RTAO: Character Self-Occlusion Fix (see the top)
+static const uint kFlagSmoothNormals = 512u;  // (47j) RTAO: Smooth Normals (see main)
 static const uint kMaxDetailRays = 4u;
 static const float kSelfProbe = 4.0;          // (47h) CharacterAt: the probe reaches this far to either side of the pixel (units)
 static const float kSelfGrazeOffset = 1.5;    // (47h) extra ray start offset at a character pixel for a ray along the surface (units)
@@ -484,6 +486,14 @@ float Segment(float3 origin, float3 dir, float tMin, float tMax, float footprint
 	return v;
 }
 
+// (47j) A direction below the depth normal's plane mirrored above it (Smooth Normals: the hemisphere is around Ns; with Ns = Ng
+// nothing changes: every cosine direction is above it).
+float3 AboveNg(float3 d, float3 Ng, bool a_on)
+{
+	const float k = dot(d, Ng);
+	return (a_on && k < 0.0) ? d - 2.0 * k * Ng : d;
+}
+
 // Cosine-weighted direction in the hemisphere around N (T, B: its tangent frame) from two uniform numbers.
 float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 {
@@ -528,10 +538,35 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 			const uint frame = uint(C.Params.x);
 			const float u1 = InterleavedGradientNoise(float2(p), frame);
 			const float u2 = frac(InterleavedGradientNoise(float2(p.yx) + float2(29.0, 61.0), frame * 7u + 3u) + float(frame % 64u) * 0.6180339887);
-			const float3 helper = abs(N.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
-			const float3 T = normalize(cross(helper, N));
-			const float3 B = cross(N, T);
-			const float3 dir = CosineDirection(float2(u1, u2), T, B, N);
+			// (47j) kFlagSmoothNormals: the hemisphere (every cosine direction, the Fine Detail ones too) is built around the smooth
+			// normal Ns (AONormalPrepCS: last frame's G-buffer normal reprojected, already blended toward Ng by its confidence), bent
+			// smoothly toward the depth normal N (= Ng) where they disagree; a direction below the Ng plane is mirrored above it. The
+			// ray start offsets stay along Ng. Off: Ns = Ng (47i exactly).
+			float3 Ns = N;
+			[branch] if (flags & kFlagSmoothNormals)
+			{
+				const uint packed = asuint(AONormals[p]);
+				[branch] if (packed != 0u)
+				{
+					const float2 e = (f16tof32(uint2(packed >> 16, packed & 0xFFFFu)) - 0.5) * 4.0;
+					float3 s = float3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+					if (s.z < 0.0)
+						s.xy = (1.0 - abs(s.yx)) * float2(s.x >= 0.0 ? 1.0 : -1.0, s.y >= 0.0 ? 1.0 : -1.0);
+					const float sl = length(s);
+					[branch] if (sl > 1e-4)
+					{
+						s /= sl;
+						const float keep = smoothstep(0.1, 0.3, dot(s, N));
+						const float3 b = lerp(N, s, keep);
+						const float bl = length(b);
+						Ns = bl > 1e-4 ? b / bl : N;
+					}
+				}
+			}
+			const float3 helper = abs(Ns.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+			const float3 T = normalize(cross(helper, Ns));
+			const float3 B = cross(Ns, T);
+			const float3 dir = AboveNg(CosineDirection(float2(u1, u2), T, B, Ns), N, (flags & kFlagSmoothNormals) != 0u);
 
 			const float rayLength = C.Params.z;
 			const float bias = C.Fade.z + C.Fade.w * dist;
@@ -602,7 +637,7 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 				{
 					// Offsets of the R2 sequence: the extra directions stay well spread around the first one.
 					const float2 u = frac(float2(u1, u2) + float(i) * float2(0.7548776662, 0.5698402910));
-					const float3 dirExtra = CosineDirection(u, T, B, N);
+					const float3 dirExtra = AboveNg(CosineDirection(u, T, B, Ns), N, (flags & kFlagSmoothNormals) != 0u);
 					const float3 originExtra = self.valid ? P + N * (bias + kSelfGrazeOffset * (1.0 - abs(dot(N, dirExtra)))) : origin;
 					float tExtra;
 					nearSum += Segment(originExtra, dirExtra, 0.0, shortLength, footprint, flags, characters, self, rays, tExtra);

@@ -84,6 +84,7 @@ static const uint kFlagRtSurface = 64u;      // (46y) probe whether the visible 
 static const uint kFlagWater = 128u;         // (47i) trace the pixel's sources from last frame's water surface too (PLWaterVis)
 static const float kStickyBonus = 1.5;
 static const uint kChurnWord = 1u;           // (46g) RayCounter words: [1] pixels whose source set changed
+static const uint kWaterRayWord = 2u;        // (47j) RayCounter word [2]: the rays traced from the water surface (also in [0])
 static const uint kBeamWordBase = 64u;       // ... from 64: per slot, sampled beam cone pixels traced / blocked
 static const uint kSourceISL = 1u;
 static const uint kSourceSpot = 8u;   // (46c) RayTracingPointLights::kSourceSpot
@@ -645,11 +646,18 @@ groupshared uint gsMask[2];
 	PLVis[p] = vis;
 	PLIdx[p] = float4(idx) / 255.0;
 	// (47i) Point Light Shadows on Water: a water surface in front of this pixel's opaque surface last frame.
+	uint waterRays = 0u;  // (47j) counted on their own too (F7 rt_pl_water_rays)
 	[branch] if (flags & kFlagWater)
 	{
 		const float waterDist = WaterDist[p];
 		if (waterDist > 1.0 && waterDist < dist - max(2.0, 0.01 * dist) && any((idx & 0x7Fu) != 0u))
-			PLWaterVis[p] = TraceFromWater(p, idx, waterDist, flags, n0, n1, rays);
+			PLWaterVis[p] = TraceFromWater(p, idx, waterDist, flags, n0, n1, waterRays);
+	}
+	rays += waterRays;
+	const uint waveWaterRays = WaveActiveSum(waterRays);
+	if (WaveIsFirstLane() && waveWaterRays > 0u) {
+		uint previousWater;
+		RayCounter.InterlockedAdd(kWaterRayWord * 4u, waveWaterRays, previousWater);
 	}
 	// One atomic per wave (the lanes that returned early traced nothing).
 	const uint waveRays = WaveActiveSum(rays);

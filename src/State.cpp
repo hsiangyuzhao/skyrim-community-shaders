@@ -61,6 +61,9 @@ void State::Draw()
 		// (47i) Point Light Shadows on Water: the water distance after the water draws.
 		if (globals::features::rayTracing.loaded)
 			globals::features::rayTracing.OnDrawStatesApplied(context);
+		// (47j) F7 water_draw_gpu_ms: GPU stamps around the runs of water draws (only while recording).
+		if (Util::FrameTrace::IsRecording())
+			Util::FrameTrace::OnWaterDrawState(currentShader && currentShader->shaderType.get() == RE::BSShader::Type::Water);
 
 		truePBR->SetShaderResouces(context);
 

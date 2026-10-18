@@ -399,6 +399,7 @@ namespace RayTracingRT
 		// rays traced per frame (counter read back with the timestamps; -1 = not known), last frame traced or not.
 		float lastPointGpuMs = -1.0f;
 		std::int64_t pointRaysPerFrame = -1;
+		std::int64_t pointWaterRaysPerFrame = -1;  // (47j) of those, traced from the water surface (RayCounter word 2)
 		bool pointTracedLastFrame = false;
 		// (46g) Point lights: pixels whose top-K source set changed per frame (-1 = not known); window beams per slot: sampled cone
 		// pixels traced / blocked per frame (1 of 16 pixels), beamSamples counts the read-backs.
@@ -733,6 +734,12 @@ namespace RayTracingRT
 		bool EnsureAOTextures(std::uint32_t a_width, std::uint32_t a_height);
 		/// Retires the RTAO texture and counter (switch off). The second fence stays.
 		void ReleaseAOResources();
+		/// (47j) RTAO: Smooth Normals: the shared R32 texture AONormalPrepCS writes (D3D11) and TraceAOCS reads (t5). Created only while
+		/// RTAO and the switch are on; false = not available (the trace keeps the depth normal).
+		bool EnsureAONormalTexture(std::uint32_t a_width, std::uint32_t a_height);
+		void ReleaseAONormalTexture();
+		[[nodiscard]] ID3D11UnorderedAccessView* AONormalUAV() const { return aoNormal_.uav11.Get(); }
+		[[nodiscard]] bool HasAONormalTexture() const { return aoNormal_.resource12 != nullptr; }
 		[[nodiscard]] ID3D11ShaderResourceView* AORawSRV() const { return aoRaw_.srv11.Get(); }
 		[[nodiscard]] const std::string& AOFault() const { return aoFault_; }
 		void ClearAOFault() { aoFault_.clear(); }
@@ -1298,7 +1305,7 @@ namespace RayTracingRT
 		// Block layout: sun table (depth SRV, visibility UAV), point table (depth SRV, sun visibility SRV, PLVis UAV,
 		// PLIdx UAV), RTAO table (depth SRV, AO UAV).
 		// (47i) + the point table's water views (water distance SRV, water visibility UAV) after the RTAO table (offsets 6, 7 of the point table).
-		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynamicDescriptors = 10;
+		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynamicDescriptors = 11;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4)
 		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
 		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
 		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;
@@ -1320,6 +1327,9 @@ namespace RayTracingRT
 		ComPtr<ID3D12PipelineState> aoPipeline_;
 		ComPtr<ID3D12PipelineState> aoAlphaPipeline_;
 		SharedTexture aoRaw_;
+		SharedTexture aoNormal_;  // (47j) RTAO: Smooth Normals (R32_FLOAT, packed octahedral normal)
+		std::uint32_t aoNormalWidth_ = 0, aoNormalHeight_ = 0;
+		void WriteAONormalDescriptor();
 		std::uint32_t aoWidth_ = 0, aoHeight_ = 0;
 		ComPtr<ID3D12Resource> aoCounter_;          // default heap, UAV: rays traced (monotonic, wraps)
 		ComPtr<ID3D12Resource> aoCounterReadback_;  // per context one uint32 copy of it
