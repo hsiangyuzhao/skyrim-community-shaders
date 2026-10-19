@@ -32,12 +32,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	TrailsOnAccumulated,
 	MudTrails,
 	TrailsFromNPCs,
-	BackgroundShapeLoad,
 	TrailResolution,
 	SnowOnCharacters,
-	CharacterSnowBuildUp,
-	CharacterSnowWaterWash,
-	CharacterSnowRoofs,
 	TrailSize,
 	TrailDepth,
 	TrailRefillSeconds,
@@ -215,7 +211,7 @@ bool DynamicSnow::AccumulationActive() const
 bool DynamicSnow::CharacterSnowStateActive() const
 {
 	const auto& skin = globals::features::skin;
-	return AccumulationActive() && settings.SnowOnCharacters && settings.CharacterSnowBuildUp && skin.loaded && skin.settings.EnableSkin;
+	return AccumulationActive() && settings.SnowOnCharacters && skin.loaded && skin.settings.EnableSkin;
 }
 
 bool DynamicSnow::TrailsActive() const
@@ -1043,9 +1039,8 @@ DynamicSnow::CommonBufferData DynamicSnow::GetCommonBufferData()
 			// (46a) Characters take their own amount from Advanced Skin's b7 (Skin::GetWetness).
 			if (CharacterSnowStateActive()) {
 				data.Flags |= FlagCharacterSnowState;
-				// (46d) Roofs: the per-character state (no build-up under a roof) instead of the per-pixel sky test.
-				if (settings.CharacterSnowRoofs)
-					data.Flags |= FlagCharacterRoofs;
+				// (46d) Roofs: the per-character state (no build-up under a roof) instead of the per-pixel sky test. (47m) Always.
+				data.Flags |= FlagCharacterRoofs;
 			}
 		}
 		// (batch 39c) (44h) FlagCoverageSlope (Even Cover) is never set: NormalThreshold decides coverage.
@@ -1538,10 +1533,6 @@ void DynamicSnow::PollPrintShapes()
 	// (46q) Background Shape Load: the decode runs on its own thread; the render thread only creates the atlas from the result.
 	if (shapesTried)
 		return;
-	if (!settings.BackgroundShapeLoad && !shapeFuture.valid()) {
-		LoadPrintShapes();
-		return;
-	}
 	if (!shapeFuture.valid()) {
 		try {
 			// A detached thread with a packaged_task, not std::async: std::async's future blocks in its destructor, and this feature is
@@ -2198,7 +2189,7 @@ void DynamicSnow::Prepass()
 
 void DynamicSnow::DrawSettings()
 {
-	// (44k) Main view: the everyday switches. The rest is under Advanced, status lines under Debug.
+	// (44k) Main view: the everyday switches. The rest is under Advanced, status lines under Diagnostics.
 	if (ImGui::TreeNodeEx("Snow Accumulation", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Checkbox("Enable Snow Accumulation", &settings.EnableAccumulation);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -2252,49 +2243,12 @@ void DynamicSnow::DrawSettings()
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted(
 				"Off (default): people, creatures and everything they wear or carry stay free of built-up snow.\n"
-				"On: their upward-facing parts (shoulders, hoods) get snow like the ground does.");
-		// (46a) Per-character snow.
-		ImGui::BeginDisabled(!settings.SnowOnCharacters);
-		ImGui::Indent();
-		ImGui::Checkbox("Snow builds up per character (resets indoors)", &settings.CharacterSnowBuildUp);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"On (default): every character keeps their own snow. Indoors it is gone; back outside it starts\n"
-				"from nothing and builds up again while it snows (as fast as the ground, never more than the ground has),\n"
-				"and melts when the snow stops.\n"
-				"Off: every character shows the same snow as the ground, and it comes back at once when you step outside.\n"
-				"Needs Advanced Skin (enabled); without it the Off behaviour is used.");
-		ImGui::BeginDisabled(!settings.CharacterSnowBuildUp);
-		ImGui::Checkbox("Water washes off character snow", &settings.CharacterSnowWaterWash);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"On (default): the part of a character that went under water loses its snow; after leaving the water\n"
-				"it builds up again from nothing.\n"
-				"Off: water does not touch character snow.");
-		// (46d)
-		ImGui::Checkbox("Roofs stop build-up (snow stays)", &settings.CharacterSnowRoofs);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::TextUnformatted(
-				"On (default): under a roof, eaves or an overhang a character's snow stops building up; what is already\n"
-				"on them stays (and melts as usual when it stops snowing). Checked with a ray straight up from the head.\n"
-				"Off: snow fades per pixel under anything that blocks the sky (it vanishes under eaves).");
-		ImGui::EndDisabled();
-		// (46d) Diagnostics: the player's water and snow state. (46r) In a collapsed node.
-		if (settings.CharacterSnowBuildUp && globals::features::skin.loaded && ImGui::TreeNodeEx("Player snow readout (diagnostics)")) {
-			const auto& w = globals::features::skin.playerWater;
-			const auto& ps = globals::features::skin.playerSnow;
-			auto z = [](float a_z) { return a_z > -1e29f ? std::format("{:.0f}", a_z) : std::string("none"); };
-			ImGui::TextDisabled("Player water: local %s (Havok %s, water object %s, cell default %s), feet %.0f, depth %.0f%s%s",
-				z(w.surfaceZ).c_str(), z(w.relevant).c_str(), z(w.multibound).c_str(), z(w.cellDefault).c_str(), w.feetZ, w.depth,
-				w.clamped ? std::format(" (clamped from {:.0f})", w.rawDepth).c_str() : "", w.swimming ? ", swimming" : "");
-			ImGui::TextDisabled("Player snow: %.2f, washed part %.2f below %.0f units, %s", ps.amount, ps.washed, ps.washDepth,
-				ps.sheltered ? "under a roof" : "open sky");
-			ImGui::TreePop();
-		}
-		if (settings.CharacterSnowBuildUp && !(globals::features::skin.loaded && globals::features::skin.settings.EnableSkin))
+				"On: their upward-facing parts (shoulders, hoods) get snow like the ground does. Each character keeps their own:\n"
+				"none indoors, it builds up outdoors while it snows (never more than the ground), stops building up under a roof,\n"
+				"and water washes it off. Needs Advanced Skin (without it, characters show the ground's snow).");
+		// (46a) Per-character snow. (47m) Build-up per character, the water wash and roofs are permanent (their switches removed).
+		if (settings.SnowOnCharacters && !(globals::features::skin.loaded && globals::features::skin.settings.EnableSkin))
 			ImGui::TextDisabled("Advanced Skin is off: characters show the ground's snow.");
-		ImGui::Unindent();
-		ImGui::EndDisabled();
 		ImGui::EndDisabled();
 		ImGui::TreePop();
 	}
@@ -2325,7 +2279,7 @@ void DynamicSnow::DrawSettings()
 			ImGui::TextUnformatted("Off = only the player leaves prints.");
 
 		// Prints are shaped from installed footprint textures (Realistic PBR Footprints, or Footprints
-		// itself); plain ovals when none are installed. (46r) Background Shape Load and the shape status: under Debug.
+		// itself); plain ovals when none are installed. (46r) The shape status: under Diagnostics ((47m) always loaded in the background).
 		// (44h) "Leave Snowy Ground to the Footprints Mod" removed: off, our prints go everywhere set above.
 		ImGui::Checkbox("Trenches from Bodies and Objects", &settings.BodyAndObjectTrails);
 		if (auto _tt = Util::HoverTooltipWrapper())
@@ -2384,7 +2338,7 @@ void DynamicSnow::DrawSettings()
 				ImGui::TextUnformatted(
 					"Above this height everything counts as cold, whatever region it is in: mountain tops such as\n"
 					"High Hrothgar and the Throat of the World get snow even when their region is not a cold one.\n"
-					"0 = off. Your own height is shown under Debug (\"Your height\"); Whiterun is about -3500, Riften about 9800.");
+					"0 = off. Your own height is shown under Diagnostics (\"Your height\"); Whiterun is about -3500, Riften about 9800.");
 			ImGui::BeginDisabled(settings.SnowLineHeight <= 0.0f);
 			const std::string fadeFormat = std::format("%.0f units ({:.0f} m)", settings.SnowLineFade * 0.01428f);
 			ImGui::SliderFloat("Snow Line Fade", &settings.SnowLineFade, 500.0f, 16000.0f, fadeFormat.c_str());
@@ -2448,7 +2402,20 @@ void DynamicSnow::DrawSettings()
 
 	ImGui::Spacing();
 
-	if (ImGui::TreeNodeEx("Debug")) {
+	// (47m) Diagnostics, closed by default: the player snow readout, the test overrides and the status lines.
+	if (ImGui::TreeNodeEx("Diagnostics")) {
+		// (46d) The player's water and snow state (47m: moved here from Snow on Characters).
+		if (settings.SnowOnCharacters && globals::features::skin.loaded && ImGui::TreeNodeEx("Player snow readout")) {
+			const auto& w = globals::features::skin.playerWater;
+			const auto& ps = globals::features::skin.playerSnow;
+			auto z = [](float a_z) { return a_z > -1e29f ? std::format("{:.0f}", a_z) : std::string("none"); };
+			ImGui::TextDisabled("Player water: local %s (Havok %s, water object %s, cell default %s), feet %.0f, depth %.0f%s%s",
+				z(w.surfaceZ).c_str(), z(w.relevant).c_str(), z(w.multibound).c_str(), z(w.cellDefault).c_str(), w.feetZ, w.depth,
+				w.clamped ? std::format(" (clamped from {:.0f})", w.rawDepth).c_str() : "", w.swimming ? ", swimming" : "");
+			ImGui::TextDisabled("Player snow: %.2f, washed part %.2f below %.0f units, %s", ps.amount, ps.washed, ps.washDepth,
+				ps.sheltered ? "under a roof" : "open sky");
+			ImGui::TreePop();
+		}
 		ImGui::Checkbox("Override Accumulated Amount", &settings.OverrideAmount);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::TextUnformatted("Test only: draw this much accumulated snow whatever the weather (outdoors only).");
@@ -2518,19 +2485,7 @@ void DynamicSnow::DrawSettings()
 			ImGui::Text("Actors tracked: %u   Prints this frame: %u (trenches %u)   Map: %u x %u", status.actorsTracked, status.stamps, status.bodyStamps, status.trailMapSize, status.trailMapSize);
 		if (status.exterior && TrailsActive())
 			ImGui::Text("Map upkeep: %s", status.trailUpkeep);
-
-		// (46r) A/B switches (saved; the defaults are the tested ones).
-		bool reset = false;
-		if (Util::BeginABSwitchGroup(nullptr, reset)) {
-			if (reset)
-				settings.BackgroundShapeLoad = Settings{}.BackgroundShapeLoad;
-			ImGui::Checkbox("Load Footprint Shapes in the Background", &settings.BackgroundShapeLoad);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::TextUnformatted(
-					"On (default): the footprint shapes are prepared on a helper thread the first time prints are made (plain ovals\n"
-					"for the fraction of a second until they are ready), instead of one 20-30 ms hitch. Off: loaded at once. F7: snow_shapes_ms.");
-			ImGui::TreePop();
-		}
+		// (47m) "Load Footprint Shapes in the Background" (46r A/B) is permanent: the shapes are always prepared on a helper thread.
 		ImGui::TreePop();
 	}
 }

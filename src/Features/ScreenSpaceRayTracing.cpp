@@ -358,36 +358,7 @@ void ScreenSpaceRayTracing::DrawSettings()
                 "NRD is turned off on its own feature page, so SVGF is running instead of REBLUR.");
         if (REL::Module::IsVR())
             ImGui::TextWrapped("REBLUR is not available in VR; SVGF runs instead.");
-
-        bool reblurChanged = false;
-
-        // (S1.1) The confidence input, off by default and labelled for what it is.
-        if (ImGui::Checkbox("Feed Hit Coverage as History Confidence (experimental)", &settings.ReblurFeedHitCoverageConfidence))
-            reblurChanged = true;
-        if (auto _tt = Util::HoverTooltipWrapper())
-            ImGui::Text(
-                "Experimental, off by default. Makes REBLUR average fewer frames where the rays found little nearby geometry: "
-                "trails behind moving objects may get shorter, but open ground gets noisier and blotchier. Does nothing while the diffuse cubemap fallback is on.");
-        if (ImGui::TreeNode("REBLUR Hit Distance Normalization")) {
-            reblurChanged |= ImGui::SliderFloat("Hit Dist A (game units)", &settings.ReblurHitDistA, 1.0f, 1000.0f, "%.0f");
-            if (auto _tt = Util::HoverTooltipWrapper())
-                ImGui::Text("Advanced. The distance REBLUR treats as 'far' when judging traced light, in game units (NVIDIA's default 210 = 3 m). Works together with B.");
-            reblurChanged |= ImGui::SliderFloat("Hit Dist B (per unit viewZ)", &settings.ReblurHitDistB, 0.0f, 1.0f, "%.3f");
-            reblurChanged |= ImGui::SliderFloat("Hit Dist C (roughness scale)", &settings.ReblurHitDistC, 1.0f, 40.0f, "%.1f");
-            ImGui::TreePop();
-        }
-        if (ImGui::TreeNode("REBLUR Diffuse (advanced)")) {
-            reblurChanged |= nrdSvc.DrawReblurSettings(settings.ReblurDiffuse, true, "ssrt_reblur_diffuse");
-            ImGui::TreePop();
-        }
-        if (ImGui::TreeNode("REBLUR Specular (advanced)")) {
-            reblurChanged |= nrdSvc.DrawReblurSettings(settings.ReblurSpecular, true, "ssrt_reblur_specular");
-            ImGui::TreePop();
-        }
-        if (reblurChanged) {
-            resetReblurDiffuse = true;
-            resetReblurSpecular = true;
-        }
+        // (47m) The confidence input and the REBLUR advanced nodes: under Diagnostics (end of the page).
     }
 
     // (batch 36f, item 2) Any denoiser: it limits the tracing as well as REBLUR.
@@ -486,6 +457,45 @@ void ScreenSpaceRayTracing::DrawSettings()
         ImGui::Text(
             "Turns leftover grain into a fine, even pattern instead of drifting blotches, which the denoiser and upscaler clean up much better. "
             "Free; keep it on.");
+
+    // (47m) Diagnostics, closed by default: the REBLUR experimental / advanced options and the debug section.
+    if (!ImGui::TreeNode("Diagnostics")) {
+        JiayeStatement::GetSingleton()->DrawJSInfo();
+        return;
+    }
+
+    if (ReblurSelected()) {
+        auto& nrdSvc = globals::features::nrd;
+        bool reblurChanged = false;
+
+        // (S1.1) The confidence input, off by default and labelled for what it is.
+        if (ImGui::Checkbox("Feed Hit Coverage as History Confidence (experimental)", &settings.ReblurFeedHitCoverageConfidence))
+            reblurChanged = true;
+        if (auto _tt = Util::HoverTooltipWrapper())
+            ImGui::Text(
+                "Experimental, off by default. Makes REBLUR average fewer frames where the rays found little nearby geometry: "
+                "trails behind moving objects may get shorter, but open ground gets noisier and blotchier. Does nothing while the diffuse cubemap fallback is on.");
+        if (ImGui::TreeNode("REBLUR Hit Distance Normalization")) {
+            reblurChanged |= ImGui::SliderFloat("Hit Dist A (game units)", &settings.ReblurHitDistA, 1.0f, 1000.0f, "%.0f");
+            if (auto _tt = Util::HoverTooltipWrapper())
+                ImGui::Text("Advanced. The distance REBLUR treats as 'far' when judging traced light, in game units (NVIDIA's default 210 = 3 m). Works together with B.");
+            reblurChanged |= ImGui::SliderFloat("Hit Dist B (per unit viewZ)", &settings.ReblurHitDistB, 0.0f, 1.0f, "%.3f");
+            reblurChanged |= ImGui::SliderFloat("Hit Dist C (roughness scale)", &settings.ReblurHitDistC, 1.0f, 40.0f, "%.1f");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("REBLUR Diffuse (advanced)")) {
+            reblurChanged |= nrdSvc.DrawReblurSettings(settings.ReblurDiffuse, true, "ssrt_reblur_diffuse");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("REBLUR Specular (advanced)")) {
+            reblurChanged |= nrdSvc.DrawReblurSettings(settings.ReblurSpecular, true, "ssrt_reblur_specular");
+            ImGui::TreePop();
+        }
+        if (reblurChanged) {
+            resetReblurDiffuse = true;
+            resetReblurSpecular = true;
+        }
+    }
 
     ImGui::SeparatorText("Debug");
 
@@ -743,6 +753,7 @@ void ScreenSpaceRayTracing::DrawSettings()
 		ImGui::TreePop();
 	}
 
+    ImGui::TreePop();  // (47m) Diagnostics
     JiayeStatement::GetSingleton()->DrawJSInfo();
 }
 
@@ -847,7 +858,6 @@ void ScreenSpaceRayTracing::SetupResources()
     // old allocation has to go with it, in one place, before the first of them is rebuilt.
     ResetFrameState();
 
-    auto renderer = globals::game::renderer;
 	auto device = globals::d3d::device;
 
 	logger::debug("Creating buffers...");
@@ -860,15 +870,9 @@ void ScreenSpaceRayTracing::SetupResources()
     }
 
     // (46q) The always-on set (texColor, texSSRColor, texSSRTDiffuseColor, the confidence pair, the hit distances, the depth
-    // pyramid): with SSRT/SSGI Buffers at Render Resolution made by EnsureCoreResources in Prepass, at the upscaler's render size
-    // and only while diffuse or specular is on; off = here at the output size, as 46p.
+    // pyramid): made by EnsureCoreResources in Prepass, at the upscaler's render size and only while diffuse or specular is on
+    // (SSRT/SSGI Buffers at Render Resolution, always since 47m).
     ReleaseCoreResources();
-    if (!globals::features::upscaling.settings.renderResSsrt) {
-        auto mainTexDesc = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
-        D3D11_TEXTURE2D_DESC mainDesc{};
-        mainTexDesc.texture->GetDesc(&mainDesc);
-        CreateCoreResources(mainDesc.Width, mainDesc.Height);
-    }
 
     logger::debug("Creating samplers...");
 	{
@@ -1128,9 +1132,8 @@ void ScreenSpaceRayTracing::EnsureCoreResources()
 {
     // (46q) SSRT/SSGI Buffers at Render Resolution: the always-on set at the upscaler's render size, made on the first frame
     // diffuse or specular is on and released while both are off. Every pass over it is pixel-indexed over the render rect
-    // (the specular ray march's colour fetch scales its UV by output / allocation size). A size change (quality mode, the
-    // switch) makes the set and what is sized from it again: the depth pyramid is cleared and the histories restart.
-    // Off: the set SetupResources made at the output size; re-made here only when it has another size (switched off live).
+    // (the specular ray march's colour fetch scales its UV by output / allocation size). A size change (quality mode) makes
+    // the set and what is sized from it again: the depth pyramid is cleared and the histories restart. (47m) Always on.
     auto renderer = globals::game::renderer;
     if (!renderer)
         return;
@@ -1139,16 +1142,15 @@ void ScreenSpaceRayTracing::EnsureCoreResources()
         return;
     D3D11_TEXTURE2D_DESC mainDesc{};
     mainTex.texture->GetDesc(&mainDesc);
-    const bool renderRes = globals::features::upscaling.settings.renderResSsrt;
     const bool wanted = settings.EnableDiffuse || settings.EnableSpecular;
     UINT width = mainDesc.Width, height = mainDesc.Height;
-    if (renderRes) {
+    {
         const auto [w, h] = globals::features::upscaling.GetRenderAllocSize(true);
         width = std::min<UINT>(width, w);
         height = std::min<UINT>(height, h);
     }
     if (!wanted) {
-        if (renderRes && texColor)
+        if (texColor)
             ReleaseCoreResources();
         return;
     }
@@ -1179,7 +1181,7 @@ void ScreenSpaceRayTracing::EnsureCoreResources()
     historyClearPending = true;
     resetReblurDiffuse = true;
     resetReblurSpecular = true;
-    logger::info("SSRT: textures at {}x{}{}", width, height, renderRes ? " (render resolution)" : "");
+    logger::info("SSRT: textures at {}x{} (render resolution)", width, height);
 }
 
 #ifdef ENABLE_SHARC

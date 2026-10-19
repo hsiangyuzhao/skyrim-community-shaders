@@ -184,9 +184,9 @@ public:
 		bool EnableLightsVisualisation = false;
 		uint LightsVisualisationMode = 0;
 		uint32_t LightCensusKey = VK_F6;  ///< (45o) Diagnostics > Light Census capture key; 0 = none
-		/// (47i) "Skip Engine Water Point-Light Highlights": the engine's own water point-light highlight passes (NUM_SPECULAR_LIGHTS)
-		/// add nothing; the clustered water loop lights the water with every light, the engine's shadow-casting ones too (Water.hlsl).
-		bool SkipEngineWaterHighlights = true;
+		// (47i) (47m) "Skip Engine Water Point-Light Highlights" is permanent: the engine's own water point-light highlight passes
+		// (NUM_SPECULAR_LIGHTS) are not drawn; the clustered water loop lights the water with every light (Water.hlsl). Old key
+		// SkipEngineWaterHighlights is ignored.
 	};
 
 	bool capturingLightCensusKey = false;  ///< (45o) the menu is waiting for the new census key

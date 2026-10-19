@@ -523,7 +523,7 @@ void WetnessEffects::DrawSettings()
 	ImGui::Spacing();
 	ImGui::Spacing();
 
-	if (ImGui::TreeNodeEx("Advanced", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::TreeNodeEx("Advanced")) {  // (47m) closed by default
 		ImGui::SliderFloat("Weather transition speed", &settings.WeatherTransitionSpeed, 0.2f, 8.0f);
 		if (ImGui::IsItemDeactivatedAfterEdit())
 			DetectCurrentPreset();
@@ -585,7 +585,7 @@ void WetnessEffects::DrawSettings()
 		}
 	}
 
-	if (ImGui::TreeNodeEx("Debug", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::TreeNodeEx("Debug")) {  // (47m) closed by default
 		ImGui::Checkbox("Enable Wetness Override", &debugSettings.EnableWetnessOverride);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Debug only. Forces the wetness amount.");
@@ -1006,7 +1006,7 @@ void WetnessEffects::DrawWeatherAnalysis() const
 		weatherMaxParticleDensity = sky->lastWeather->precipitationData->GetSettingValue(RE::BGSShaderParticleGeometryData::DataID::kParticleDensity).f;
 	}
 	// // Consolidated Shader & Weather Analysis
-	static bool rainAnalysisExpanded = true;
+	static bool rainAnalysisExpanded = false;  // (47m) collapsed by default
 	Util::DrawSectionHeader("Rain Analysis", false, true, &rainAnalysisExpanded);
 
 	if (rainAnalysisExpanded) {

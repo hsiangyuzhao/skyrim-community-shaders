@@ -4,9 +4,6 @@
 #include "Features/WetnessEffects.h"
 #include "State.h"
 #include "Util.h"
-#include "imgui_stdlib.h"
-
-#include <fstream>
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	WetSkin::Settings,
@@ -77,7 +74,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 namespace
 {
 	// (47f) The macro above is at nlohmann's 64-argument limit: the Physical model's settings are written and read
-	// here, next to it (settings JSON and presets alike).
+	// here, next to it.
 	void PhysicalToJson(json& o_json, const WetSkin::Settings& a_s)
 	{
 		o_json["SweatBuildup"] = a_s.SweatBuildup;
@@ -92,16 +89,14 @@ namespace
 		o_json["StartSweat"] = a_s.StartSweat;
 		o_json["FullSweat"] = a_s.FullSweat;
 		o_json["UseDynamicWetness"] = a_s.UseDynamicWetness;
-		// (47j) A/B switches (not part of presets: SavePreset leaves them out)
+		// (47j) A/B switches
 		o_json["PhysWaterLine"] = a_s.PhysWaterLine;
 		o_json["PhysBeadsFadeIn"] = a_s.PhysBeadsFadeIn;
 		o_json["PhysBeadsShrink"] = a_s.PhysBeadsShrink;
-		// (47k) A/B switches (not part of presets either)
-		o_json["PhysBodyLine"] = a_s.PhysBodyLine;
+		// (47k) A/B switches ((47m) Water Line Follows the Body: permanent)
 		o_json["PhysBeadCap"] = a_s.PhysBeadCap;
 		o_json["PhysLessGrid"] = a_s.PhysLessGrid;
-		o_json["PhysSweat2"] = a_s.PhysSweat2;  // (47l) A/B switches (not part of presets)
-		o_json["PhysLimbLines"] = a_s.PhysLimbLines;
+		o_json["PhysSweat2"] = a_s.PhysSweat2;  // (47l) A/B switch ((47m) Water Line per Limb: permanent)
 		o_json["Physical47i"] = true;
 	}
 
@@ -133,14 +128,13 @@ namespace
 			o_s.UseDynamicWetness = it->get<bool>();
 		// (47j)
 		for (auto [key, value] : { std::pair{ "PhysWaterLine", &o_s.PhysWaterLine }, std::pair{ "PhysBeadsFadeIn", &o_s.PhysBeadsFadeIn }, std::pair{ "PhysBeadsShrink", &o_s.PhysBeadsShrink },
-				 std::pair{ "PhysBodyLine", &o_s.PhysBodyLine }, std::pair{ "PhysBeadCap", &o_s.PhysBeadCap }, std::pair{ "PhysLessGrid", &o_s.PhysLessGrid },
-				 std::pair{ "PhysSweat2", &o_s.PhysSweat2 }, std::pair{ "PhysLimbLines", &o_s.PhysLimbLines } }) {
+				 std::pair{ "PhysBeadCap", &o_s.PhysBeadCap }, std::pair{ "PhysLessGrid", &o_s.PhysLessGrid }, std::pair{ "PhysSweat2", &o_s.PhysSweat2 } }) {
 			if (auto it = a_json.find(key); it != a_json.end() && it->is_boolean())
 				*value = it->get<bool>();
 		}
 	}
 
-	/// (47i) A settings JSON (or preset) from before 47i: the Physical options take the user's old values, once. Beading from
+	/// (47i) A settings JSON from before 47i: the Physical options take the user's old values, once. Beading from
 	/// Droplet Amount x Density and Droplets from Rain, Dry Time from Hold + Dry-off Time / Swim Drying, the coalescence scale
 	/// from Droplet Size (its old meaning was the drawn size itself); the sweat thresholds from Advanced Skin (a_skin, may be
 	/// empty: the defaults stay).
@@ -338,7 +332,7 @@ namespace
 		}
 	}
 
-	// (46a) The built-in look presets (44k Natural / Drenched) were removed; presets are the user's own files.
+	// (46a) The built-in look presets (44k Natural / Drenched) were removed; (47m) so were the user presets.
 }
 
 void WetSkin::StashLegacySkinJson(const json& a_skin)
@@ -500,7 +494,7 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 	const float actorHeight = bandHeight * static_cast<float>(Phys::kBands);
 	const float lineDry = std::min(MaxDryMultiplier(), Phys::kMaxProgress);  // every class (hair, slowest gear) dry
 	// (47l) Water Line per Limb: a line per limb in body units (a body-mapped character: Skin::UpdateBodyLimbs); else the one line.
-	const bool limbMode = lineMode && s.PhysLimbLines && a_in.limbs;
+	const bool limbMode = lineMode && a_in.limbs;  // (47m) per Limb is permanent
 	std::array<float, Phys::kLimbs> limbDepth{};
 	if (limbMode) {
 		for (uint32_t i = 0; i < Phys::kLimbs; ++i)
@@ -890,7 +884,7 @@ WetSkin::PhysicalLook WetSkin::GetPhysicalLook(const PhysicalState& a_state) con
 		swimBeadWeight += bead;
 	};
 	const bool lineMode = s.PhysWaterLine && a_state.lineMode;
-	const bool limbMode = lineMode && s.PhysLimbLines && a_state.limbMode;  // (47l)
+	const bool limbMode = lineMode && a_state.limbMode;  // (47l); (47m) per Limb is permanent
 	if (limbMode) {
 		// (47l) Water Line per Limb: every limb's two zones; under the surface soaked.
 		for (const auto& l : a_state.limbs) {
@@ -1005,8 +999,7 @@ void WetSkin::DrawSettings()
 	if (!globals::features::wetnessEffects.loaded)
 		ImGui::TextColored({ 1.0f, 0.75f, 0.3f, 1.0f }, "Hair and gear need Wetness Effects enabled (skin works without it).");
 
-	// 1. (46a) User presets (the built-in Natural / Drenched looks were removed). They hold the model too.
-	DrawPresets();
+	// (47m) The user presets (46a) were removed.
 
 	// 2. Model. (47f) Saved values: 1 = Legacy, 0 = Simple (the 44a-47e "Advanced" model, unchanged), 2 = Physical.
 	{
@@ -1021,7 +1014,7 @@ void WetSkin::DrawSettings()
 			"there is too much, and dries at one pace; how it looks (sheen, beads, trails) follows how much water is where." });
 	}
 
-	// 3. (47c) Performance switches (not saved in presets).
+	// 3. (47c) Performance switches.
 	ImGui::SeparatorText("Performance");
 	ImGui::Checkbox("Wetness: Skip Invisible Work", &s.SkipInvisibleWork);
 	Tooltip({ "Same picture, less GPU work: skips noise layers too fine to see, rivulets thinner than half a pixel,",
@@ -1104,19 +1097,9 @@ void WetSkin::DrawSettings()
 		Tooltip({ "On (47j): like Legacy, one water line: the deepest the water reached since the character was last fully dry.",
 			"Everything below it dries together, evenly. Under the current water surface it stays soaked; standing with the feet in",
 			"the water, the rest below the line dries normally; going deeper than the line raises it and soaks that part again.",
+			"Each leg, each arm and the torso keep their own line, measured on the body along their bones, so it stays on the same",
+			"spot of the skin while moving (creatures without a usable skeleton keep one line by the world height).",
 			"Off: 47i (eight height bands, each drying on its own)." });
-		ImGui::Checkbox("Physical: Water Line Follows the Body", &s.PhysBodyLine);
-		Tooltip({ "On (47k): the remembered water line (and where sweat and rain gather, the hairline) is measured on the body itself",
-			"(its height in the T-pose, arms counted as hanging down), so a wet line stays on the same spot of the skin or clothes while",
-			"arms and legs swing, bend or the character crouches. The current water surface stays a flat line in the world.",
-			"Rigid gear (helmets, shields), first person and creatures keep the world height. Off: 47j (world height)." });
-		ImGui::BeginDisabled(!s.PhysWaterLine || !s.PhysBodyLine);
-		ImGui::Checkbox("Physical: Water Line per Limb (bones)", &s.PhysLimbLines);
-		Tooltip({ "On (47l, needs the two switches above): each leg, each arm and the torso keep their own water line, measured along their",
-			"bones on the body itself, so it stays on the same spot of the skin on slopes, stairs and jumps, the leg further up a slope is",
-			"not wet as high as the one further down, and dipping one hand wets only that arm. The current water surface stays a flat",
-			"line in the world. Characters without a usable skeleton (creatures) keep one line by the world height. Off: 47k." });
-		ImGui::EndDisabled();
 
 		ImGui::SeparatorText("Drying");
 		ImGui::SliderFloat("Dry Time (s)", &s.PhysDryTime, 10.0f, 1800.0f, "%.0f s", ImGuiSliderFlags_Logarithmic);
@@ -1299,8 +1282,6 @@ void WetSkin::DrawSettings()
 		ImGui::BeginDisabled(!s.GearKeywords);
 		ImGui::SliderFloat("Item Keyword Trust", &s.GearKeywordTrust, 0.0f, 1.0f, "%.2f");
 		ImGui::EndDisabled();
-		ImGui::Checkbox("Debug: Tint by Material Class", reinterpret_cast<bool*>(&s.DebugClassTint));
-		Tooltip({ "Paints characters by what the wetness thinks they are: red cloth, yellow leather, blue metal, green fur / other, purple hair." });
 		ImGui::SliderFloat("Overall Sheen x", &s.GearSheen, 0.0f, 3.0f, "%.2f");
 		ImGui::SliderFloat("Gear Patch Contrast", &s.GearPatchContrast, 0.0f, 1.0f, "%.2f");
 		Tooltip({ "Lower than skin: cloth soaks in sheets." });
@@ -1350,14 +1331,20 @@ void WetSkin::DrawSettings()
 	}
 	ImGui::EndDisabled();
 
-	// 8. (47f) Status (read-only, closed by default).
-	DrawStatus();
+	// 8. (47f) Status (read-only); (47m) with the material tint debug view, in a "Diagnostics" node closed by default.
+	if (ImGui::TreeNode("Diagnostics")) {
+		ImGui::BeginDisabled(!s.GearEnabled || s.GearModel == 1);
+		ImGui::Checkbox("Debug: Tint by Material Class", reinterpret_cast<bool*>(&s.DebugClassTint));
+		Tooltip({ "Paints characters by what the wetness thinks they are: red cloth, yellow leather, blue metal, green fur / other, purple hair." });
+		ImGui::EndDisabled();
+		DrawStatus();
+		ImGui::TreePop();
+	}
 }
 
 void WetSkin::DrawStatus()
 {
-	if (!ImGui::TreeNode("Status"))
-		return;
+	ImGui::SeparatorText("Status");
 	const auto* player = RE::PlayerCharacter::GetSingleton();
 	const auto& skinFeature = globals::features::skin;
 	const Skin::ActorWetState* state = nullptr;
@@ -1377,7 +1364,7 @@ void WetSkin::DrawStatus()
 		ImGui::Text("Player rain: %.0f um   (rain %.0f%%, open sky %.0f%%%s)", phys.rain, physicalFrame.rainIntensity * 100.0f, phys.exposure * 100.0f,
 			phys.rainRunoff > 0.05f ? ", running off" : "");
 		const std::string inWater = phys.depth > 0.0f ? std::format("   (in the water, {:.0f} units deep)", phys.depth) : std::string();
-		if (settings.PhysWaterLine && settings.PhysLimbLines && phys.limbMode) {
+		if (settings.PhysWaterLine && phys.limbMode) {
 			// (47l) The line of each limb (body units above the soles).
 			static constexpr const char* kLimbNames[Phys::kLimbs] = { "left leg", "right leg", "torso", "left arm", "right arm" };
 			std::string lines;
@@ -1404,13 +1391,10 @@ void WetSkin::DrawStatus()
 		ImGui::Text("Oil: %.2f   Drying speed (air): %.2fx", look.oil, phys.evaporation);
 		ImGui::TextDisabled("Beads: radius %.2f mm, cover %.1f%%, visible %.0f%%; trails %.2f", look.beadRadius * 10.0f, look.coverage * 100.0f, look.visible * 100.0f, look.beadTrails);
 		// (47k)
-		if (settings.PhysBodyLine) {
-			const auto& stats = globals::features::skin.bodyLineStats;
-			ImGui::TextDisabled("Water line on the body: %u character draws by the body, %u by the world height (rigid gear, first person, creatures)",
-				stats.body, stats.world);
-		}
+		const auto& stats = globals::features::skin.bodyLineStats;
+		ImGui::TextDisabled("Water line on the body: %u character draws by the body, %u by the world height (rigid gear, first person, creatures)",
+			stats.body, stats.world);
 	}
-	ImGui::TreePop();
 }
 
 void WetSkin::LoadSettings(json& o_json)
@@ -1498,314 +1482,4 @@ void WetSkin::DataLoaded()
 {
 	g_legacySkinPending = false;
 	g_legacyWetnessPending = false;
-}
-
-// ---------------------------------------------------------------------------------------------
-// (46a) User presets
-// ---------------------------------------------------------------------------------------------
-
-namespace
-{
-	std::filesystem::path Utf8Path(const std::string& a_text)
-	{
-		return std::filesystem::path(std::u8string(a_text.begin(), a_text.end()));
-	}
-
-	std::string PathUtf8(const std::filesystem::path& a_path)
-	{
-		const auto text = a_path.u8string();
-		return std::string(text.begin(), text.end());
-	}
-
-	std::filesystem::path PresetFile(const std::string& a_name)
-	{
-		return Utf8Path(WetSkin::kPresetDirectory) / Utf8Path(a_name + ".json");
-	}
-}
-
-std::string WetSkin::SanitizePresetName(const std::string& a_name)
-{
-	std::string out;
-	for (const char ch : a_name) {
-		const auto c = static_cast<unsigned char>(ch);
-		if (c < 32 || std::string_view("\\/:*?\"<>|").find(ch) != std::string_view::npos)
-			continue;
-		out.push_back(ch);
-	}
-	// No leading / trailing spaces or dots (Windows drops trailing ones), nothing like "..".
-	while (!out.empty() && (out.back() == ' ' || out.back() == '.'))
-		out.pop_back();
-	size_t start = 0;
-	while (start < out.size() && (out[start] == ' ' || out[start] == '.'))
-		++start;
-	out = out.substr(start);
-	if (out.size() > 64) {
-		out.resize(64);
-		// Do not cut a UTF-8 character in half.
-		while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80)
-			out.pop_back();
-		if (!out.empty() && (static_cast<unsigned char>(out.back()) & 0x80))
-			out.pop_back();
-	}
-	return out;
-}
-
-std::vector<std::string> WetSkin::ListPresets() const
-{
-	std::vector<std::string> names;
-	std::error_code ec;
-	const auto dir = Utf8Path(kPresetDirectory);
-	if (!std::filesystem::is_directory(dir, ec))
-		return names;
-	for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-		if (entry.is_regular_file(ec) && entry.path().extension() == ".json")
-			names.push_back(PathUtf8(entry.path().stem()));
-	}
-	std::sort(names.begin(), names.end());
-	return names;
-}
-
-bool WetSkin::SavePreset(const std::string& a_name)
-{
-	const std::string name = SanitizePresetName(a_name);
-	if (name.empty())
-		return false;
-	std::error_code ec;
-	std::filesystem::create_directories(Utf8Path(kPresetDirectory), ec);
-	if (ec) {
-		logger::warn("[Character Wetness] Could not create the preset folder {}: {}", kPresetDirectory, ec.message());
-		return false;
-	}
-	json j;
-	j["preset_name"] = name;
-	j["settings"] = settings;
-	PhysicalToJson(j["settings"], settings);  // (47f) the model is in the macro, its Physical options here
-	// (47c) The performance switches are not part of a look.
-	j["settings"].erase("SkipInvisibleWork");
-	j["settings"].erase("FasterNoiseLOD");
-	j["settings"].erase("PhysWaterLine");  // (47j) A/B switches
-	j["settings"].erase("PhysBeadsFadeIn");
-	j["settings"].erase("PhysBeadsShrink");
-	j["settings"].erase("PhysBodyLine");  // (47k) A/B switches
-	j["settings"].erase("PhysBeadCap");
-	j["settings"].erase("PhysLessGrid");
-	j["settings"].erase("PhysSweat2");  // (47l) A/B switches
-	j["settings"].erase("PhysLimbLines");
-	try {
-		std::ofstream o{ PresetFile(name) };
-		if (!o)
-			return false;
-		o << std::setw(4) << j;
-		logger::info("[Character Wetness] Saved preset \"{}\"", name);
-		return static_cast<bool>(o);
-	} catch (const std::exception& e) {
-		logger::warn("[Character Wetness] Could not save preset \"{}\": {}", name, e.what());
-		return false;
-	}
-}
-
-bool WetSkin::LoadPreset(const std::string& a_name)
-{
-	json j;
-	try {
-		std::ifstream i{ PresetFile(a_name) };
-		if (!i)
-			return false;
-		i >> j;
-	} catch (const std::exception& e) {
-		logger::warn("[Character Wetness] Could not read preset \"{}\": {}", a_name, e.what());
-		return false;
-	}
-	const json& values = (j.is_object() && j.contains("settings")) ? j["settings"] : j;
-	if (!values.is_object())
-		return false;
-	// Laid over the current values: a preset saved by an older build leaves newer options as they are.
-	try {
-		json merged = settings;
-		merged.update(values);
-		merged["SkipInvisibleWork"] = settings.SkipInvisibleWork;  // (47c) not part of a look
-		merged["FasterNoiseLOD"] = settings.FasterNoiseLOD;
-		Settings fromPreset = merged.get<Settings>();
-		// (47f) Not in the macro: kept unless the preset has them.
-		fromPreset.SweatBuildup = settings.SweatBuildup;
-		fromPreset.RainWetting = settings.RainWetting;
-		fromPreset.MaxRainWetness = settings.MaxRainWetness;
-		fromPreset.ManualLookType = settings.ManualLookType;
-		fromPreset.OilRepelsWater = settings.OilRepelsWater;
-		// (47i)
-		fromPreset.Beading = settings.Beading;
-		fromPreset.PhysDryTime = settings.PhysDryTime;
-		fromPreset.PhysDropletSize = settings.PhysDropletSize;
-		fromPreset.StartSweat = settings.StartSweat;
-		fromPreset.FullSweat = settings.FullSweat;
-		fromPreset.UseDynamicWetness = settings.UseDynamicWetness;
-		PhysicalFromJson(values, fromPreset);
-		fromPreset.PhysWaterLine = settings.PhysWaterLine;  // (47j) not part of a look
-		fromPreset.PhysBeadsFadeIn = settings.PhysBeadsFadeIn;
-		fromPreset.PhysBeadsShrink = settings.PhysBeadsShrink;
-		fromPreset.PhysBodyLine = settings.PhysBodyLine;  // (47k) not part of a look
-		fromPreset.PhysBeadCap = settings.PhysBeadCap;
-		fromPreset.PhysLessGrid = settings.PhysLessGrid;
-		fromPreset.PhysSweat2 = settings.PhysSweat2;  // (47l) not part of a look
-		fromPreset.PhysLimbLines = settings.PhysLimbLines;
-		MigratePhysical47i(values, json(), fromPreset);  // a preset saved before 47i: from its own droplet / drying values
-		if (fromPreset.Model > static_cast<uint32_t>(Model::Physical))
-			fromPreset.Model = static_cast<uint32_t>(Model::New);
-		settings = fromPreset;
-	} catch (const std::exception& e) {
-		logger::warn("[Character Wetness] Preset \"{}\" is not valid: {}", a_name, e.what());
-		return false;
-	}
-	logger::info("[Character Wetness] Loaded preset \"{}\"", a_name);
-	return true;
-}
-
-bool WetSkin::RenamePreset(const std::string& a_from, const std::string& a_to)
-{
-	const std::string to = SanitizePresetName(a_to);
-	if (to.empty() || to == a_from)
-		return false;
-	std::error_code ec;
-	if (std::filesystem::exists(PresetFile(to), ec))
-		return false;
-	std::filesystem::rename(PresetFile(a_from), PresetFile(to), ec);
-	if (ec) {
-		logger::warn("[Character Wetness] Could not rename preset \"{}\": {}", a_from, ec.message());
-		return false;
-	}
-	// Keep the name stored inside the file in step.
-	try {
-		json j;
-		{
-			std::ifstream i{ PresetFile(to) };
-			i >> j;
-		}
-		if (j.is_object()) {
-			j["preset_name"] = to;
-			std::ofstream o{ PresetFile(to) };
-			o << std::setw(4) << j;
-		}
-	} catch (...) {
-	}
-	return true;
-}
-
-bool WetSkin::DeletePreset(const std::string& a_name)
-{
-	std::error_code ec;
-	const bool removed = std::filesystem::remove(PresetFile(a_name), ec);
-	if (ec)
-		logger::warn("[Character Wetness] Could not delete preset \"{}\": {}", a_name, ec.message());
-	return removed && !ec;
-}
-
-void WetSkin::DrawPresets()
-{
-	if (!ImGui::TreeNodeEx("Presets", ImGuiTreeNodeFlags_DefaultOpen))
-		return;
-	if (!presetsListed) {
-		presetNames = ListPresets();
-		presetsListed = true;
-	}
-	if (presetIndex >= static_cast<int>(presetNames.size()))
-		presetIndex = -1;
-	const bool selected = presetIndex >= 0;
-	const std::string current = selected ? presetNames[presetIndex] : std::string(presetNames.empty() ? "(no presets saved yet)" : "(choose a preset)");
-
-	if (ImGui::BeginCombo("Preset", current.c_str())) {
-		presetNames = ListPresets();
-		for (int i = 0; i < static_cast<int>(presetNames.size()); ++i) {
-			if (ImGui::Selectable(presetNames[i].c_str(), presetIndex == i)) {
-				presetIndex = i;
-				presetRenameTo = presetNames[i];
-			}
-		}
-		ImGui::EndCombo();
-	}
-	Tooltip({ "Your own saved Character Wetness settings (every option on this page).",
-		"Files are kept in Data\\SKSE\\Plugins\\CommunityShaders\\CharacterWetness." });
-
-	ImGui::BeginDisabled(!selected);
-	if (ImGui::Button("Load")) {
-		const std::string name = presetNames[presetIndex];
-		presetStatus = LoadPreset(name) ? std::format("Loaded \"{}\".", name) : std::format("Could not load \"{}\".", name);
-	}
-	Tooltip({ "Replace the settings on this page with the chosen preset." });
-	ImGui::EndDisabled();
-
-	// (47b) Everything that changes the preset files sits in a nested node, closed by default.
-	if (ImGui::TreeNode("Manage Presets")) {
-		DrawManagePresets(selected);
-		ImGui::TreePop();
-	}
-	if (!presetStatus.empty())
-		ImGui::TextDisabled("%s", presetStatus.c_str());
-	ImGui::TreePop();
-}
-
-void WetSkin::DrawManagePresets(bool a_selected)
-{
-	const bool selected = a_selected && presetIndex >= 0 && presetIndex < static_cast<int>(presetNames.size());
-	ImGui::BeginDisabled(!selected);
-	if (ImGui::Button("Overwrite")) {
-		const std::string name = presetNames[presetIndex];
-		presetStatus = SavePreset(name) ? std::format("Saved the current settings into \"{}\".", name) : std::format("Could not save \"{}\".", name);
-	}
-	Tooltip({ "Save the current settings into the chosen preset (replaces what it held)." });
-	ImGui::SameLine();
-	if (ImGui::Button("Delete"))
-		ImGui::OpenPopup("Delete Character Wetness Preset");
-	Tooltip({ "Delete the chosen preset file (asks first)." });
-	if (ImGui::BeginPopup("Delete Character Wetness Preset")) {
-		ImGui::Text("Delete \"%s\"?", selected ? presetNames[presetIndex].c_str() : "");
-		if (ImGui::Button("Yes, delete") && selected) {
-			const std::string name = presetNames[presetIndex];
-			presetStatus = DeletePreset(name) ? std::format("Deleted \"{}\".", name) : std::format("Could not delete \"{}\".", name);
-			presetNames = ListPresets();
-			presetIndex = -1;
-			ImGui::CloseCurrentPopup();
-		}
-		ImGui::SameLine();
-		if (ImGui::Button("Cancel"))
-			ImGui::CloseCurrentPopup();
-		ImGui::EndPopup();
-	}
-	ImGui::InputText("##RenameTo", &presetRenameTo);
-	ImGui::SameLine();
-	if (ImGui::Button("Rename") && selected) {
-		const std::string from = presetNames[presetIndex];
-		const std::string to = SanitizePresetName(presetRenameTo);
-		if (RenamePreset(from, to)) {
-			presetStatus = std::format("Renamed \"{}\" to \"{}\".", from, to);
-			presetNames = ListPresets();
-			const auto it = std::find(presetNames.begin(), presetNames.end(), to);
-			presetIndex = it != presetNames.end() ? static_cast<int>(it - presetNames.begin()) : -1;
-		} else {
-			presetStatus = to.empty() ? std::string("Enter a new name first.") : std::format("Could not rename to \"{}\" (the name may be in use).", to);
-		}
-	}
-	Tooltip({ "Give the chosen preset the name typed on the left." });
-	ImGui::EndDisabled();
-
-	ImGui::InputText("##NewPresetName", &presetNewName);
-	ImGui::SameLine();
-	if (ImGui::Button("Save as New Preset")) {
-		const std::string name = SanitizePresetName(presetNewName);
-		std::error_code ec;
-		if (name.empty()) {
-			presetStatus = "Enter a name first.";
-		} else if (std::filesystem::exists(PresetFile(name), ec)) {
-			presetStatus = std::format("\"{}\" already exists: choose it and use Overwrite.", name);
-		} else if (SavePreset(name)) {
-			presetStatus = std::format("Saved \"{}\".", name);
-			presetNames = ListPresets();
-			const auto it = std::find(presetNames.begin(), presetNames.end(), name);
-			presetIndex = it != presetNames.end() ? static_cast<int>(it - presetNames.begin()) : -1;
-			presetRenameTo = name;
-			presetNewName.clear();
-		} else {
-			presetStatus = std::format("Could not save \"{}\".", name);
-		}
-	}
-	Tooltip({ "Save every setting on this page as a new preset under the name typed on the left." });
 }

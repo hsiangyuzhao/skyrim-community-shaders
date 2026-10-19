@@ -142,8 +142,12 @@ void Skin::DrawSettings()
 		ImGui::Text("Multiply the tiling for the body to match the face");
 	}
 
-	if (ImGui::Button("Reload Skin Detail Texture")) {
-		ReloadSkinDetail();
+	// (47m) In a "Tools" node, closed by default.
+	if (ImGui::TreeNode("Tools")) {
+		if (ImGui::Button("Reload Skin Detail Texture")) {
+			ReloadSkinDetail();
+		}
+		ImGui::TreePop();
 	}
 
 	BUFFER_VIEWER_NODE(texSkinDetail, 1.0f)
@@ -500,8 +504,8 @@ float4 Skin::UpdateActorSnow(ActorSnow& a_snow, RE::Actor* a_actor, const WaterS
 		return float4(0.0f, 0.0f, 0.0f, feetZ);
 	}
 	const auto& s = snow.settings;
-	// (46d) Under a roof: no build-up (the snow already there stays, melting as usual when it does not snow).
-	const bool sheltered = s.CharacterSnowRoofs && IsSheltered(a_actor, a_snow, a_actor->IsPlayerRef() ? 250.0 : 1000.0 + static_cast<double>(a_actor->GetFormID() % 97));
+	// (46d) Under a roof: no build-up (the snow already there stays, melting as usual when it does not snow). (47m) Always.
+	const bool sheltered = IsSheltered(a_actor, a_snow, a_actor->IsPlayerRef() ? 250.0 : 1000.0 + static_cast<double>(a_actor->GetFormID() % 97));
 	if (a_snow.hours < 0.0) {
 		// First seen outdoors (a load, a character walking into view, the switch turned on): assume they
 		// have been out as long as the ground has (none under a roof).
@@ -530,19 +534,16 @@ float4 Skin::UpdateActorSnow(ActorSnow& a_snow, RE::Actor* a_actor, const WaterS
 
 	// (46d) In the water: the part below the current local surface has no snow (the line follows the surface);
 	// the deepest validated line is kept for after leaving, until the washed part has built up again.
+	// (47m) Water Washes Off Character Snow: always.
 	float washLine = 0.0f;
-	if (s.CharacterSnowWaterWash) {
-		if (a_water.inWater && a_water.depth > 0.0f) {
-			a_snow.washDepth = std::max(a_snow.washDepth, a_water.depth);
-			a_snow.washed = 0.0f;
-			washLine = a_water.depth;
-		} else {
-			if (a_snow.washDepth > 0.0f && a_snow.washed >= a_snow.amount - 1e-3f)
-				a_snow.washDepth = 0.0f;  // built back up to the rest of the body: one amount again
-			washLine = a_snow.washDepth;
-		}
+	if (a_water.inWater && a_water.depth > 0.0f) {
+		a_snow.washDepth = std::max(a_snow.washDepth, a_water.depth);
+		a_snow.washed = 0.0f;
+		washLine = a_water.depth;
 	} else {
-		a_snow.washDepth = 0.0f;
+		if (a_snow.washDepth > 0.0f && a_snow.washed >= a_snow.amount - 1e-3f)
+			a_snow.washDepth = 0.0f;  // built back up to the rest of the body: one amount again
+		washLine = a_snow.washDepth;
 	}
 	if (washLine <= 0.0f && a_snow.washDepth <= 0.0f)
 		a_snow.washed = a_snow.amount;
@@ -771,8 +772,8 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 		}
 		in.cold = cold;
 		// (47l) Water Line per Limb: how far up each limb is under the water, from its bones (a humanoid with usable limb chains; else
-		// the one line by the world height).
-		if (const auto& ws = wetSkin.settings; ws.PhysWaterLine && ws.PhysBodyLine && ws.PhysLimbLines)
+		// the one line by the world height). (47m) Always on with Water Line Like Legacy.
+		if (wetSkin.settings.PhysWaterLine)
 			in.limbs = UpdateBodyLimbs(actor, state, water, in);
 		wetSkin.UpdatePhysical(state.phys, in);
 		state.look = wetSkin.GetPhysicalLook(state.phys);
@@ -1034,7 +1035,7 @@ void Skin::GetBodyFrame(RE::BSGeometry* a_geometry, RE::Actor* a_actor, ActorWet
 	// (47l) Water Line per Limb: a character without usable limb chains keeps the world height everywhere (never mixed); the
 	// body / world decision of a geometry is sticky (BodyGeometry::failCount), and no root offset (the lines are in body units).
 	const auto& wetSettings = globals::features::wetSkin.settings;
-	const bool limbs = wetSettings.PhysWaterLine && wetSettings.PhysLimbLines;
+	const bool limbs = wetSettings.PhysWaterLine;  // (47m) Water Line per Limb is permanent (needs Water Line Like Legacy)
 	if (limbs && !body.limbs.valid)
 		return;
 
@@ -1310,7 +1311,7 @@ bool Skin::RefreshBodyActor(RE::Actor* a_actor, ActorWetState& a_state, uint32_t
 	if (!root)
 		return false;
 	const auto& wetSettings = globals::features::wetSkin.settings;
-	const bool limbsWanted = wetSettings.PhysWaterLine && wetSettings.PhysBodyLine && wetSettings.PhysLimbLines;
+	const bool limbsWanted = wetSettings.PhysWaterLine;  // (47m) Follows the Body and per Limb are permanent
 	bool lookedUp = false;
 	if (body.root != root || body.lookupFrame == UINT32_MAX || a_frame - body.lookupFrame > 300u) {
 		static const RE::BSFixedString kRoot("NPC Root [Root]");
@@ -1757,8 +1758,8 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 				for (size_t i = 0; i < look.limbs.size(); ++i)
 					perGeometryData.wetPhysLimbs[i] = look.limbs[i];
 			}
-			// (47k) Water Line Follows the Body: the bind-pose height of this geometry (zero: the world height, as 47j).
-			if (wetSkin.settings.PhysBodyLine) {
+			// (47k) Water Line Follows the Body: the bind-pose height of this geometry (zero: the world height, as 47j). (47m) Always on.
+			{
 				auto userData = geometry->GetUserData();
 				if (auto actor = userData ? userData->As<RE::Character>() : nullptr)
 					GetBodyFrame(geometry, actor, *lastWetState, perGeometryData.bodyPerGeometry, perGeometryData.bodyPerGeometry2);

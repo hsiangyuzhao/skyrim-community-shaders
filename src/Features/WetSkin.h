@@ -82,23 +82,23 @@ struct WetSkin : Feature
 		float Beading = 0.5f;          // (47i) share of the water that gathers in beads (the rest is film)
 		float PhysDryTime = 170.0f;    // (47i) s for soaked skin to dry fully at a neutral environment
 		float PhysDropletSize = 1.0f;  // (47i) coalescence / runoff size scale (bigger: fewer, bigger beads)
-		// (47j) A/B switches, all on by default; off = 47i exactly. Not part of presets.
+		// (47j) A/B switches, all on by default; off = 47i exactly.
 		bool PhysWaterLine = true;     // "Physical: Water Line Like Legacy": one water line (deepest since dry) + the current surface
 		bool PhysBeadsFadeIn = true;   // "Physical: Beads Fade In From the Film": the swim film breaks up gradually, beads grow in
 		bool PhysBeadsShrink = true;   // "Physical: Beads Shrink and Fade Out": beads shrink to 0.6x, then fade, staggered
-		// (47k) A/B switches, all on by default; off = 47j exactly. Not part of presets.
-		bool PhysBodyLine = true;      // "Physical: Water Line Follows the Body": the stored line by the bind-pose height (Skin::CharBodyHeight)
+		// (47k) A/B switches, all on by default; off = 47j exactly. (47m) "Water Line Follows the Body" (the stored line by the
+		// bind-pose height, Skin::CharBodyHeight) is permanent, its switch PhysBodyLine removed.
 		bool PhysBeadCap = true;       // "Physical: Bead Coalescence Cap": coverage <= 0.40 Beading^1.5, runoff keeps the coverage
 		bool PhysLessGrid = true;      // "Physical: Less Grid-like Bead Placement": bead radius 0.36 cell (was 0.42), more jitter
-		// (47l) A/B switch, on by default; off = 47k exactly. Not part of presets.
+		// (47l) A/B switch, on by default; off = 47k exactly. (47m) "Water Line per Limb" (a water line per limb, in body units
+		// from its bones) is permanent with PhysWaterLine, its switch PhysLimbLines removed.
 		bool PhysSweat2 = true;        // "Physical: Sweat and Drying v2": sweat made in um/s by body heat, one smooth drying law (WetSkin::Phys kLaw*)
-		bool PhysLimbLines = true;     // "Physical: Water Line per Limb (bones)": a water line per limb, recorded in body units from its bones
 		// (47i) Moved from Advanced Skin (used by every model): sweat from stamina, or from Dynamic Wetness.
 		float StartSweat = 0.75f;
 		float FullSweat = 0.15f;
 		bool UseDynamicWetness = false;
 
-		// (47c) Performance, both on by default; both off = 47b exactly. Not part of presets.
+		// (47c) Performance, both on by default; both off = 47b exactly.
 		// SkipInvisibleWork: leave out work whose result is multiplied by 0 (same picture): faded
 		// noise octaves, rivulets narrower than half a pixel, rain droplets / rivulets on skin under
 		// a roof when rain is its only water, dry hair's clump noise, the see-through-clothes depth
@@ -265,7 +265,7 @@ struct WetSkin : Feature
 		static constexpr float kLawVe = 0.3f;           // um
 		static constexpr float kLawLambda = 18.8325f;   // calibration (Dry Time meaning)
 		static constexpr float kLawTauEnd = 1.56747f;   // Dry Time units from held 120 um to 0 (the swim zone's progress 0 .. 1)
-		static constexpr float kSweatRate2 = 2.4f;      // um/s
+		static constexpr float kSweatRate2 = 3.6f;      // um/s (47m: 1.5x the 47l 2.4)
 		static constexpr float kHeatUp2 = 8.0f;         // s
 		static constexpr float kHeatDown2 = 60.0f;      // s
 		static constexpr float kDripLevel = 150.0f;     // um x Sweat
@@ -394,27 +394,7 @@ struct WetSkin : Feature
 	static void StashLegacySkinJson(const json& a_skin);
 	static void StashLegacyWetnessJson(const json& a_wetness);
 
-	/// (46a) User presets: every Character Wetness setting, one JSON file per preset in
-	/// kPresetDirectory (after PostProcessing's SavePresetTo). No presets ship with the plugin.
-	static constexpr const char* kPresetDirectory = "Data\\SKSE\\Plugins\\CommunityShaders\\CharacterWetness";
-	std::vector<std::string> ListPresets() const;
-	bool SavePreset(const std::string& a_name);
-	bool LoadPreset(const std::string& a_name);
-	bool RenamePreset(const std::string& a_from, const std::string& a_to);
-	bool DeletePreset(const std::string& a_name);
-	/// A usable preset name (no path characters, not empty, at most 64 bytes) or empty.
-	static std::string SanitizePresetName(const std::string& a_name);
-
 private:
 	PhysicalFrame physicalFrame;
 	void DrawStatus();
-	void DrawPresets();
-	/// (47b) Overwrite / Delete / Rename / Save as New, in the "Manage Presets" node under "Presets".
-	void DrawManagePresets(bool a_selected);
-	std::vector<std::string> presetNames;
-	int presetIndex = -1;
-	bool presetsListed = false;
-	std::string presetNewName;
-	std::string presetRenameTo;
-	std::string presetStatus;
 };

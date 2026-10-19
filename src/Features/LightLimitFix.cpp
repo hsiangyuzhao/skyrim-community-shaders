@@ -17,28 +17,21 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	LightLimitFix::Settings,
 	EnableContactShadows,
 	LightsVisualisationMode,
-	LightCensusKey,
-	SkipEngineWaterHighlights)
+	LightCensusKey)
 
 void LightLimitFix::DrawSettings()
 {
 	auto shaderCache = globals::shaderCache;
 
-	if (ImGui::TreeNodeEx("Statistics", ImGuiTreeNodeFlags_DefaultOpen)) {
+	// (47m) Statistics closed by default.
+	if (ImGui::TreeNodeEx("Statistics")) {
 		ImGui::Text(std::format("Clustered Light Count : {}", lightCount).c_str());
 
 		ImGui::TreePop();
 	}
 
-	// (47i)
-	ImGui::SeparatorText("Water");
-	ImGui::Checkbox("Skip Engine Water Point-Light Highlights", &settings.SkipEngineWaterHighlights);
-	if (auto _tt = Util::HoverTooltipWrapper()) {
-		ImGui::Text("On (default): the game's own extra highlight passes for lights on water are not drawn (47j; 47i drew them adding nothing). They had no shadows (a forge behind");
-		ImGui::Text("  a wall still lit the river) and came on top of this feature's water lighting, which already lights the water with");
-		ImGui::Text("  every nearby light (now including the game's shadow-casting lights, which it used to leave to those passes).");
-		ImGui::Text("Off: as before 47i.");
-	}
+	// (47i) (47m) "Skip Engine Water Point-Light Highlights" is permanent (its switch removed): Hooks.cpp skips the engine's
+	// water point-light highlight passes, kStrictFlagSkipWaterSpecular is always set.
 
 	///////////////////////////////
 	ImGui::SeparatorText("Debug");
@@ -226,8 +219,7 @@ void LightLimitFix::BSLightingShader_SetupGeometry_Before(RE::BSRenderPass* a_pa
 	strictLightDataTemp.ShadowBitMask = 0;
 	// (47h) Ray Tracing wrote this frame's sun shadow mask and "Sun Shadow: Depth Check for Translucent Surfaces" is on.
 	strictLightDataTemp.Flags = globals::features::rayTracing.loaded && globals::features::rayTracing.SunMaskDepthCheckActive() ? kStrictFlagSunDepthCheck : 0u;
-	if (settings.SkipEngineWaterHighlights)
-		strictLightDataTemp.Flags |= kStrictFlagSkipWaterSpecular;  // (47i)
+	strictLightDataTemp.Flags |= kStrictFlagSkipWaterSpecular;  // (47i) fixed (47m): Skip Engine Water Point-Light Highlights is permanent
 
 	strictLightDataTemp.RoomIndex = -1;
 	if (!roomNodes.empty()) {

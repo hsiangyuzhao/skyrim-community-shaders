@@ -147,7 +147,7 @@ bool Hooks::BSShader_BeginTechnique::thunk(RE::BSShader* shader, uint32_t vertex
 	// A technique that does not begin is skipped by the engine, as for a missing shader.
 	if (shader->shaderType.get() == RE::BSShader::Type::Water && shaderCache->IsEnabled()) {
 		const uint32_t technique = (pixelDescriptor >> 11) & 0xF;
-		if (technique >= 1 && technique <= 7 && globals::features::lightLimitFix.loaded && globals::features::lightLimitFix.settings.SkipEngineWaterHighlights)
+		if (technique >= 1 && technique <= 7 && globals::features::lightLimitFix.loaded)  // (47m) permanent
 			return false;
 	}
 
@@ -945,16 +945,11 @@ namespace Hooks
 				Util::LatencyPacer::Options pacer;
 				pacer.enabled = upscaling.IsLatencyPacerEnabled();
 				pacer.marginMs = upscaling.settings.reflexPacerMarginMs;
-				pacer.stallFeedback = upscaling.settings.reflexPacerStallFeedback;
-				pacer.hiddenWaits = upscaling.settings.reflexPacerHiddenWaits;  // (46o) F1a
-				pacer.backstop = upscaling.settings.reflexPacerBackstop;        // (46o) F1b
-				pacer.noOverSleep = upscaling.settings.reflexPacerNoOverSleep;  // (46p)
 				pacer.smoothPhase = upscaling.settings.reflexPacerSmoothPhase;  // (46p)
-				Util::FrameTrace::SetKeepResident(upscaling.settings.keepGpuMemoryResident);  // (46p) for resources made from now on
-				// (46p) Precompile Lazy Shaders: once, on the first main-menu or loading-screen frame (the main thread, before this
-				// frame renders): the deferred composite variants, screen-space shadows' edge pass, ray tracing's D3D11 passes.
+				// (46p) Precompile Lazy Shaders (always, 47m): once, on the first main-menu or loading-screen frame (the main thread,
+				// before this frame renders): the deferred composite variants, screen-space shadows' edge pass, ray tracing's D3D11 passes.
 				static bool precompiled = false;
-				if (!precompiled && upscaling.settings.precompileLazyShaders) {
+				if (!precompiled) {
 					auto* ui = globals::game::ui;
 					if (ui && (ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME))) {
 						precompiled = true;

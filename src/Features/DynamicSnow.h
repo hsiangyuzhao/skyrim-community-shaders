@@ -105,9 +105,8 @@ public:
 		bool TrailsOnAccumulated = true;  ///< item 5's accumulated snow
 		bool MudTrails = false;           ///< any other terrain, as mud/dirt
 		bool TrailsFromNPCs = true;       ///< nearby actors and creatures, not only the player
-		/// (46q) The footprint shapes (31 textures read, decoded and filtered once per session, 19-29 ms) are prepared on a
-		/// background thread; oval prints until they are ready. Off = 46p (all of it on the render thread on first use).
-		bool BackgroundShapeLoad = true;
+		// (46q) (47m) Permanent: the footprint shapes (31 textures read, decoded and filtered once per session, 19-29 ms) are
+		// prepared on a background thread; oval prints until they are ready. Old key BackgroundShapeLoad is ignored.
 		int TrailResolution = 1;          ///< 0 = 1024 texels (4 units each), 1 = 2048 (2 units each), 2 = 4096 (1 unit each)
 		// (44f) Permanent: bicubic print reconstruction (39b), snowy ground recognised from its land
 		// texture / white directional snow (39b), shaped prints from installed footprint textures
@@ -116,16 +115,10 @@ public:
 		// SmoothTrails / DetectAuthoredSnow / AlbedoSnowGuess / UseModFootprintShapes /
 		// RigidGearWorldUp / FlipPrintShapes are ignored.
 		bool SnowOnCharacters = false;    ///< (39b) accumulated snow on actors and their gear
-		/// (46a) Each character keeps its own snow (Advanced Skin's per-character state): none indoors,
-		/// builds up from nothing outdoors while it snows (never above the global amount), melts otherwise.
-		/// Off = the 45o behaviour (every character shows the global amount).
-		bool CharacterSnowBuildUp = true;
-		/// (46a) The part of a character that was under water loses its snow and builds it up again
-		/// after leaving the water (needs CharacterSnowBuildUp).
-		bool CharacterSnowWaterWash = true;
-		/// (46d) Under a roof (a ray straight up from the head) a character's snow does not build up; what is on
-		/// them stays. The shader then skips its per-pixel sky test for characters (it erased their snow under eaves).
-		bool CharacterSnowRoofs = true;
+		// (46a) (46d) (47m) Permanent with SnowOnCharacters (needs Advanced Skin): each character keeps its own snow (none indoors,
+		// builds up outdoors while it snows, never above the global amount, melts otherwise); the part that was under water loses
+		// its snow and builds it up again; under a roof (a ray up from the head) it does not build up and the shader skips its
+		// per-pixel sky test for characters. Old keys CharacterSnowBuildUp / CharacterSnowWaterWash / CharacterSnowRoofs are ignored.
 		float TrailSize = 1.0f;
 		float TrailDepth = 5.0f;            ///< game units
 		float TrailRefillSeconds = 180.0f;  ///< real seconds for a full print to fill back in

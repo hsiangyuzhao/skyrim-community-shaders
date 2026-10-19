@@ -96,9 +96,10 @@ struct ExponentialHeightFog : Feature
 		/// (47e) CS Fog Takes Over: the weather's part of the volume also gets the light scattered many times that the
 		/// weather's fog colour already holds, so it is as bright as the game's fog (VolumetricFogLightScatteringCS).
 		bool MatchWeatherFogBrightness = true;
-		/// (47j) "Volumetric Fog: Off Indoors": no volumetric fog passes in interior cells (and nothing of them applied there); its
-		/// history starts over outside. Exteriors unchanged. Off = 47i (the fog is built indoors too).
-		bool OffIndoors = true;
+		/// (47j) "Skip Volumetric Fog Indoors" (was "Volumetric Fog: Off Indoors"): no volumetric fog passes in interior cells
+		/// (and nothing of them applied there), saves about 1 ms; its history starts over outside. Exteriors unchanged.
+		/// (47m) Default off (the fog is built indoors too); settings saved before 47m are switched off once (OffIndoors47m).
+		bool OffIndoors = false;
 	} volumetric;
 
 	/// (47b) The game's own fog under the height fog. CPU side only; reaches the shaders through
@@ -118,9 +119,8 @@ struct ExponentialHeightFog : Feature
 		/// by its opacity twice (upstream 22ac9859c), and weights the weather's fog by how foggy the weather is (from
 		/// its engine-blended fog distance).
 		uint32_t WeatherMode = kWeatherCSFogTakesOver;
-		/// "EHF Restores Room Fog" (interiors, every mode): the cell's own fog comes back in full under the height
-		/// fog. Off = 47a2.
-		bool RestoreRoomFog = true;
+		// (47m) "EHF Restores Room Fog" is permanent (interiors, every mode): the cell's own fog comes back in full under the
+		// height fog. Old key RestoreRoomFog is ignored.
 		/// Weather fog distance (game units) at and above which the weight is 0 (clear) ...
 		float ClearFogFar = 120000.0f;
 		/// ... and at and below which it is 1 (fog, storm); log-linear in between.
@@ -129,7 +129,7 @@ struct ExponentialHeightFog : Feature
 		float TakeoverScaleHeight = 21000.0f;
 		/// (47g) "Physical Fog Brightness": the fog's brightness from what lights it (the clear physical sky and the sun through
 		/// the weather layer), the fog colour giving only its hue. Where the fog takes the fog colour (not Dynamic Cubemaps)
-		/// and in Match Weather Fog Brightness; needs Physical Sky outdoors. Off = 47f.
+		/// and in Match Weather Fog Brightness; needs Physical Sky outdoors. Off = 47f. (47m) Kept until the Physical Sky repair.
 		bool PhysicalFogBrightness = true;
 	} vanillaFog;
 

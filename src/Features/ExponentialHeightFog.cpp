@@ -79,6 +79,7 @@ namespace
 
     constexpr const char* kVolumetricKey = "Volumetric Fog";
     constexpr const char* kVanillaFogKey = "Vanilla Fog";  // (47b)
+    constexpr const char* kOffIndoors47mKey = "OffIndoors47m";  // (47m) migration marker in the Volumetric Fog object
     constexpr float kMinTakeoverScaleHeight = 3500.0f;     // (47d) ~50 m
     constexpr float kMaxTakeoverScaleHeight = 140000.0f;   // (47d) ~2 km
 }
@@ -86,7 +87,6 @@ namespace
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     ExponentialHeightFog::VanillaFogSettings,
     WeatherMode,
-    RestoreRoomFog,
     ClearFogFar,
     FullFogFar,
     TakeoverScaleHeight,
@@ -102,8 +102,15 @@ void ExponentialHeightFog::RestoreDefaultSettings()
 void ExponentialHeightFog::LoadSettings(json& o_json)
 {
     settings = o_json;
-    if (o_json.contains(kVolumetricKey) && o_json[kVolumetricKey].is_object())
-        volumetric = o_json[kVolumetricKey];
+    if (o_json.contains(kVolumetricKey) && o_json[kVolumetricKey].is_object()) {
+        const auto& volumetricJson = o_json[kVolumetricKey];
+        volumetric = volumetricJson;
+        // (47m) "Skip Volumetric Fog Indoors" now defaults to off: settings saved before 47m (no marker) get it switched off once.
+        if (!volumetricJson.contains(kOffIndoors47mKey) && volumetric.OffIndoors) {
+            volumetric.OffIndoors = false;
+            logger::info("[{}] 47m: Skip Volumetric Fog Indoors switched off once (volumetric fog now runs indoors)", GetName());
+        }
+    }
     vanillaFog = {};
     if (o_json.contains(kVanillaFogKey) && o_json[kVanillaFogKey].is_object()) {
         const auto& vanillaFogJson = o_json[kVanillaFogKey];
@@ -123,6 +130,7 @@ void ExponentialHeightFog::SaveSettings(json& o_json)
 {
     o_json = settings;
     o_json[kVolumetricKey] = volumetric;
+    o_json[kVolumetricKey][kOffIndoors47mKey] = true;  // (47m) the OffIndoors default change is applied
     o_json[kVanillaFogKey] = vanillaFog;
 }
 
@@ -143,10 +151,7 @@ ExponentialHeightFog::VanillaFogState ExponentialHeightFog::GetVanillaFogState()
     }
     state.interior = Util::IsInterior();
     if (state.interior) {
-        if (vanillaFog.RestoreRoomFog)
-            state.weight = 1.0f;
-        else
-            state.reason = "EHF Restores Room Fog off";
+        state.weight = 1.0f;  // (47m) EHF Restores Room Fog: permanent
         return state;
     }
     if (vanillaFog.WeatherMode == kWeatherOff) {
@@ -275,7 +280,7 @@ std::string ExponentialHeightFog::VolumetricFogIdleReason() const
     if (volumetric.ExtinctionScale <= 0.0f)
         return "Volumetric Extinction Scale is 0";
     if (volumetric.OffIndoors && Util::IsInterior())
-        return "indoors (Volumetric Fog: Off Indoors)";
+        return "indoors (Skip Volumetric Fog Indoors)";
     return "map open";
 }
 
@@ -988,9 +993,7 @@ void ExponentialHeightFog::DrawSettings()
             "  glow and the sunlight on the ground dim in it, and Volumetric Fog (if you turned it on) carries it too.\n"
             "Every mode but Off also fixes the height fog's colour being dimmed twice. The distant physical-sky haze\n"
             "steps back behind the weather's fog.");
-    ImGui::Checkbox("EHF Restores Room Fog", &vanillaFog.RestoreRoomFog);
-    if (auto _tt = Util::HoverTooltipWrapper())
-        ImGui::Text("Indoors. On: caves, dungeons and houses keep their own fog, with the height fog on top.\nOff = as before (the height fog replaces it).");
+    // (47m) "EHF Restores Room Fog" (indoors the cell's own fog stays under the height fog) is permanent.
     // (47g)
     ImGui::Checkbox("Physical Fog Brightness", &vanillaFog.PhysicalFogBrightness);
     if (auto _tt = Util::HoverTooltipWrapper())
@@ -1039,12 +1042,12 @@ void ExponentialHeightFog::DrawSettings()
             "leaves beams that tree trunks block. Uses the fog settings above for where the fog is.\n"
             "While it is on, vanilla Volumetric Lighting (light shafts) is paused so the sun's shafts are\n"
             "not drawn twice. Costs roughly 0.5-1.5 ms.");
-    // (47j)
-    ImGui::Checkbox("Volumetric Fog: Off Indoors", &volumetric.OffIndoors);
+    // (47j) (47m) Relabelled, default off.
+    ImGui::Checkbox("Skip Volumetric Fog Indoors (saves about 1 ms)", &volumetric.OffIndoors);
     if (auto _tt = Util::HoverTooltipWrapper())
         ImGui::Text(
-            "On (default): no 3D fog inside buildings and caves (saves about 1 ms there). Outside nothing changes;\n"
-            "stepping out it starts afresh (no old fog from indoors). Off: as in 47i (the 3D fog is built indoors too).");
+            "On: no 3D fog inside buildings and caves, which saves about 1 ms there. Outside nothing changes.\n"
+            "Off (default): the 3D fog is drawn indoors too.");
     if (volumetric.Enabled) {
         if (VolumetricFogRequested() && globals::features::volumetricLighting.loaded)
             ImGui::TextColored(palette.InfoColor, "Vanilla Volumetric Lighting is paused while this is on.");
