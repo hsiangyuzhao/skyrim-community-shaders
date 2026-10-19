@@ -25,6 +25,8 @@
 //   character or a moving object this frame (TraceAOCS .b, t9), or that was such a pixel last frame (bit 7 of its stored large-scale
 //   length), keeps at most 1 frame of history (n <= 1) and is clamped to mean +- 1 sd of this frame's 3x3 (at least the usual
 //   minimum half width): the dark trail a walking character or a swinging door left behind is gone within a frame or two.
+// (47n) Without Temporal v2 (the 47k history) kFlagDynamicHistory makes a pixel with the flag in its 3x3 take half of this frame and
+//   no clamp slack (t3: the raw trace).
 // (47n) Debug view "Temporal v2: History" (Size.w == kViewHistory, u4): red = no usable history (rejected), green = the clamp moved
 //   the history, blue = history length / 32, whitened = the moving-occluder flag of this frame.
 
@@ -314,6 +316,7 @@ static const uint kHistoryFlag = kFlagHistory;
 Texture2D<unorm float> Current : register(t0);
 Texture2D<unorm float> History : register(t1);
 Texture2D<float2> MotionVectors : register(t2);
+Texture2D<float4> Raw : register(t3);  // (47n) TraceAOCS' output: its moving-occluder flag (kFlagDynamicHistory)
 SamplerState LinearClamp : register(s0);
 RWTexture2D<unorm float> Output : register(u0);
 
@@ -325,13 +328,16 @@ RWTexture2D<unorm float> Output : register(u0);
 	const float current = Current[p];
 	float lo = current;
 	float hi = current;
+	bool dyn = false;  // (47n) a moving occluder in the 3x3 this frame: half of this frame, no clamp slack
 	[unroll] for (int dy = -1; dy <= 1; ++dy)
 	{
 		[unroll] for (int dx = -1; dx <= 1; ++dx)
 		{
-			const float s = Current[clamp(p + int2(dx, dy), int2(0, 0), maxP)];
+			const int2 q = clamp(p + int2(dx, dy), int2(0, 0), maxP);
+			const float s = Current[q];
 			lo = min(lo, s);
 			hi = max(hi, s);
+			dyn = dyn || ((Size.z & kFlagDynamicHistory) != 0u && RawDynamic(Raw[q].b));
 		}
 	}
 	float result = current;
@@ -341,8 +347,9 @@ RWTexture2D<unorm float> Output : register(u0);
 		const float2 prevUv = uv + MotionVectors[p];
 		if (all(prevUv >= 0.0) && all(prevUv <= 1.0)) {
 			const float history = History.SampleLevel(LinearClamp, prevUv, 0);
-			const float clamped = clamp(history, max(lo - Params.z, 0.0), min(hi + Params.z, 1.0));
-			result = lerp(clamped, current, Params.y);
+			const float slack = dyn ? 0.0 : Params.z;
+			const float clamped = clamp(history, max(lo - slack, 0.0), min(hi + slack, 1.0));
+			result = lerp(clamped, current, dyn ? max(Params.y, 0.5) : Params.y);
 		}
 	}
 	Output[p] = result;

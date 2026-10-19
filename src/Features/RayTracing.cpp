@@ -4837,7 +4837,9 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	}
 	// (47l) Temporal v2: its flags and constants (the matrices every frame; without last frame's camera its own matrix, unused then).
 	if (v2)
-		cb.Size[2] |= kAOFlagTemporalV2 | (geometryValid ? kAOFlagGeometryValid : 0u) | (settings.AODynamicFlag ? kAOFlagDynamicHistory : 0u);
+		cb.Size[2] |= kAOFlagTemporalV2 | (geometryValid ? kAOFlagGeometryValid : 0u);
+	if (settings.AODynamicFlag)
+		cb.Size[2] |= kAOFlagDynamicHistory;  // (47n) v2: n <= 1 and a 3x3 clamp; the 47k history: half of this frame, no slack
 	std::memcpy(cb.InvViewProj, &fbAO.GetCameraViewProjInverse(0), sizeof(cb.InvViewProj));
 	if (prevCameraUsable)
 		std::copy_n(aoPrevCamera.viewProj, 16, cb.PrevViewProj);
@@ -4943,7 +4945,7 @@ void RayTracing::DrawAmbientOcclusionImpl()
 		aoV2Frame = frameNow;
 	} else if (settings.AOTemporal) {
 		aoV2Valid = false;  // (47l)
-		dispatch(temporal, { aoFiltered.srv.get(), aoHistory[read].srv.get(), motion.SRV }, { aoHistory[write].uav.get() }, groupsX, groupsY);
+		dispatch(temporal, { aoFiltered.srv.get(), aoHistory[read].srv.get(), motion.SRV, backend.AORawSRV() }, { aoHistory[write].uav.get() }, groupsX, groupsY);
 		blended = &aoHistory[write];
 		aoHistoryIndex = write;
 		aoHistoryValid = true;
@@ -4958,7 +4960,7 @@ void RayTracing::DrawAmbientOcclusionImpl()
 		// (46t) The detail term: this frame's near rays, 5x5 edge-aware at full resolution, then its own clamped history.
 		dispatch(detailCS, { backend.AORawSRV(), depth.depthSRV, normal.SRV }, { aoDetailFiltered.uav.get() }, groupsX, groupsY);
 		if (settings.AOTemporal) {
-			dispatch(detailTemporal, { aoDetailFiltered.srv.get(), aoDetailHistory[detailRead].srv.get(), motion.SRV },
+			dispatch(detailTemporal, { aoDetailFiltered.srv.get(), aoDetailHistory[detailRead].srv.get(), motion.SRV, backend.AORawSRV() },
 				{ aoDetailHistory[detailWrite].uav.get() }, groupsX, groupsY);
 			detailBlended = &aoDetailHistory[detailWrite];
 			aoDetailHistoryIndex = detailWrite;
@@ -6172,8 +6174,8 @@ void RayTracing::DrawAOPage()
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("On (default): where the AO rays of a pixel hit a character or a moving object (this frame or the last), that pixel");
 			ImGui::Text("  keeps almost no history (at most 1 frame) and is held tightly to this frame's neighbours, so walking characters and");
-			ImGui::Text("  swinging doors leave no dark trail on the floor and walls. Elsewhere nothing changes. Needs Temporal v2 (Medium and");
-			ImGui::Text("  above, or Custom with it on). Off: as in 47m.");
+			ImGui::Text("  swinging doors leave no dark trail on the floor and walls. Elsewhere nothing changes. Strongest with Temporal v2");
+			ImGui::Text("  (Medium and above); without it such pixels take half of this frame and no clamp slack. Off: as in 47m.");
 		}
 		ImGui::EndDisabled();
 		{

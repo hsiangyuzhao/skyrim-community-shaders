@@ -1281,6 +1281,9 @@ namespace RayTracingRT
 		// (47l) Wind meshes (their ranges went with the pools above).
 		winds_.clear();
 		freeWinds_.clear();
+		windSources_.clear();  // (47n)
+		freeWindSources_.clear();
+		windSourcesLive_ = 0;
 		windUploadQueue_.clear();
 		windScratch_.Reset();
 		windScratchBytes_ = 0;
