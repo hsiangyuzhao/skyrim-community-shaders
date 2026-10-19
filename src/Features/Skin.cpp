@@ -770,6 +770,10 @@ float4 Skin::GetWetness(RE::BSGeometry* geometry, float4& o_wetSkin, float4& o_w
 				cold = std::max(cold, mapCold);
 		}
 		in.cold = cold;
+		// (47l) Water Line per Limb: how far up each limb is under the water, from its bones (a humanoid with usable limb chains; else
+		// the one line by the world height).
+		if (const auto& ws = wetSkin.settings; ws.PhysWaterLine && ws.PhysBodyLine && ws.PhysLimbLines)
+			in.limbs = UpdateBodyLimbs(actor, state, water, in);
 		wetSkin.UpdatePhysical(state.phys, in);
 		state.look = wetSkin.GetPhysicalLook(state.phys);
 		state.maxDepth = 0.0f;  // (47i) the swim water is in the height bands
@@ -1024,35 +1028,15 @@ void Skin::GetBodyFrame(RE::BSGeometry* a_geometry, RE::Actor* a_actor, ActorWet
 
 	// Per character, once per frame: NPC Root (high heels), the humanoid check (pelvis, calf, foot; re-checked when its 3D changes
 	// and every 300 frames), the feet and the height.
+	if (!RefreshBodyActor(a_actor, a_state, frame))
+		return;
 	auto& body = a_state.body;
-	RE::NiAVObject* root = a_actor->Get3D(false);
-	if (!root)
+	// (47l) Water Line per Limb: a character without usable limb chains keeps the world height everywhere (never mixed); the
+	// body / world decision of a geometry is sticky (BodyGeometry::failCount), and no root offset (the lines are in body units).
+	const auto& wetSettings = globals::features::wetSkin.settings;
+	const bool limbs = wetSettings.PhysWaterLine && wetSettings.PhysLimbLines;
+	if (limbs && !body.limbs.valid)
 		return;
-	if (body.root != root || body.lookupFrame == UINT32_MAX || frame - body.lookupFrame > 300u) {
-		static const RE::BSFixedString kRoot("NPC Root [Root]");
-		static const RE::BSFixedString kPelvis("NPC Pelvis [Pelv]");
-		static const RE::BSFixedString kCalf("NPC L Calf [LClf]");
-		static const RE::BSFixedString kFoot("NPC L Foot [Lft ]");
-		if (body.root != root) {
-			body.shoulderKnown = false;
-			a_state.bodyGeometry.clear();
-		}
-		body.root = root;
-		body.lookupFrame = frame;
-		body.npcRoot.reset(root->GetObjectByName(kRoot));
-		body.pelvis.reset(root->GetObjectByName(kPelvis));
-		body.humanoid = body.npcRoot && body.pelvis && root->GetObjectByName(kCalf) && root->GetObjectByName(kFoot);
-	}
-	if (!body.humanoid)
-		return;
-	if (body.frame != frame) {
-		body.frame = frame;
-		body.feetZ = a_actor->GetPositionZ();
-		body.height = std::max(a_actor->GetHeight(), 32.0f);
-		float rootZ = body.feetZ;
-		body.rootOffset = ReadNodeWorldZ(body.npcRoot.get(), rootZ) ? std::clamp(rootZ - body.feetZ, -64.0f, 64.0f) : 0.0f;
-		body.pelvisScale = ReadNodeWorldScale(body.pelvis.get(), body.pelvisScale) ? body.pelvisScale : 0.0f;
-	}
 
 	// Per geometry: its central bone, its bind height and skin-to-bone scale, the shoulder (rebuilt for another skin instance).
 	if (a_state.bodyGeometry.size() >= kMaxBodyGeometries)
@@ -1095,30 +1079,372 @@ void Skin::GetBodyFrame(RE::BSGeometry* a_geometry, RE::Actor* a_actor, ActorWet
 			}
 		}
 	}
-	if (!geo.usable)
+	if (!geo.usable || geo.stuckWorld)
 		return;
 
 	// s = the central bone's bone-matrix scale (its world scale x skin-to-bone scale: NPC / race scale included).
+	float s = 0.0f;
+	bool ok = false;
 	float worldScale = 1.0f, boneZ = 0.0f;
-	if (!ReadBoneWorld(refs, geo.refBone, worldScale, boneZ))
-		return;
-	// A geometry with only the neck / head / arms / feet (hair, head parts, gloves, boots) takes the pelvis's world scale: a head or
-	// limb bone can be scaled on its own (RaceMenu), the body is not.
-	if (geo.refRank >= kBodyOwnScaleRanks && body.pelvisScale > 0.0f)
-		worldScale = body.pelvisScale;
-	const float s = worldScale * geo.stbScale;
-	if (!(s > 0.05f && s < 20.0f))
-		return;
-	// The model space must be the body's: the central bone's bind height there (as a body height) roughly where the bone is now
-	// (crouching, sitting, swimming still pass; another space, e.g. one around the head, does not).
-	const float predicted = s * geo.refBindZ + body.rootOffset;
-	const float actual = boneZ - body.feetZ;
-	if (!(std::fabs(predicted - actual) < 0.5f * body.height + 20.0f))
-		return;
+	if (ReadBoneWorld(refs, geo.refBone, worldScale, boneZ)) {
+		// A geometry with only the neck / head / arms / feet (hair, head parts, gloves, boots) takes the pelvis's world scale: a head or
+		// limb bone can be scaled on its own (RaceMenu), the body is not.
+		if (geo.refRank >= kBodyOwnScaleRanks && body.pelvisScale > 0.0f)
+			worldScale = body.pelvisScale;
+		s = worldScale * geo.stbScale;
+		// The model space must be the body's: the central bone's bind height there (as a body height) roughly where the bone is now
+		// (crouching, sitting, swimming still pass; another space, e.g. one around the head, does not).
+		const float predicted = s * geo.refBindZ + body.rootOffset;
+		const float actual = boneZ - body.feetZ;
+		ok = s > 0.05f && s < 20.0f && std::fabs(predicted - actual) < 0.5f * body.height + 20.0f;
+	}
+	if (!limbs) {
+		if (!ok)
+			return;
+	} else if (ok) {
+		geo.failCount = 0;
+		geo.lastScale = s;
+	} else {
+		// (47l) A failed check keeps the body height (last good scale) for up to kBodyFailLimit draws in a row; then the world height
+		// until the character's next lookup. A geometry that never passed has no scale: the world height until it does.
+		if (++geo.failCount >= kBodyFailLimit)
+			geo.stuckWorld = true;
+		if (geo.stuckWorld || !(geo.lastScale > 0.0f))
+			return;
+		s = geo.lastScale;
+	}
 	const bool own = geo.shoulderKnown;
 	const bool shoulderKnown = own || body.shoulderKnown;
-	o_body = float4(s, body.rootOffset, shoulderKnown ? (own ? geo.shoulderX : body.shoulderX) : 0.0f, shoulderKnown ? (own ? geo.shoulderZ : body.shoulderZ) : 0.0f);
+	o_body = float4(s, limbs ? 0.0f : body.rootOffset, shoulderKnown ? (own ? geo.shoulderX : body.shoulderX) : 0.0f, shoulderKnown ? (own ? geo.shoulderZ : body.shoulderZ) : 0.0f);
 	o_body2 = float4(body.height, 0.0f, 0.0f, 0.0f);
+	if (limbs) {
+		const auto& l = body.limbs;
+		o_body2 = float4(body.height, l.crotchZ, l.legSign, l.armSign);
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// (47l) "Physical: Water Line per Limb (bones)"
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+	enum LimbJoint : uint32_t
+	{
+		kLFoot,
+		kLCalf,
+		kLThigh,
+		kRFoot,
+		kRCalf,
+		kRThigh,
+		kPelvis,
+		kSpine0,
+		kSpine1,
+		kSpine2,
+		kNeck,
+		kHead,
+		kLUpper,
+		kLFore,
+		kLHand,
+		kRUpper,
+		kRFore,
+		kRHand
+	};
+	constexpr const char* kLimbBones[Skin::BodyLimbs::kJoints] = { "NPC L Foot [Lft ]", "NPC L Calf [LClf]", "NPC L Thigh [LThg]",
+		"NPC R Foot [Rft ]", "NPC R Calf [RClf]", "NPC R Thigh [RThg]", "NPC Pelvis [Pelv]", "NPC Spine [Spn0]", "NPC Spine1 [Spn1]",
+		"NPC Spine2 [Spn2]", "NPC Neck [Neck]", "NPC Head [Head]", "NPC L UpperArm [LUar]", "NPC L Forearm [LLar]", "NPC L Hand [LHnd]",
+		"NPC R UpperArm [RUar]", "NPC R Forearm [RLar]", "NPC R Hand [RHnd]" };
+
+	/// The nodes' world positions (SEH: a node of a 3D being torn down). A null node: false.
+	bool ReadLimbPositions(const std::array<RE::NiPointer<RE::NiAVObject>, Skin::BodyLimbs::kJoints>& a_nodes, bool a_neck, bool a_head,
+		std::array<RE::NiPoint3, Skin::BodyLimbs::kJoints>& o_pos)
+	{
+		__try {
+			for (uint32_t j = 0; j < Skin::BodyLimbs::kJoints; ++j) {
+				if ((j == kNeck && !a_neck) || (j == kHead && !a_head))
+					continue;
+				const RE::NiAVObject* node = a_nodes[j].get();
+				if (!node)
+					return false;
+				o_pos[j] = node->world.translate;
+				if (!std::isfinite(o_pos[j].x) || !std::isfinite(o_pos[j].y) || !std::isfinite(o_pos[j].z))
+					return false;
+			}
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	/// The highest body height under the water surface along a chain of points (world z, body height), feet up: the joints under it
+	/// and where a segment crosses it (0 = none under).
+	float LimbChainDepth(const float* a_z, const float* a_body, uint32_t a_count, float a_surface)
+	{
+		float d = 0.0f;
+		for (uint32_t k = 0; k < a_count; ++k) {
+			if (a_z[k] < a_surface)
+				d = std::max(d, a_body[k]);
+			if (k + 1 < a_count && (a_z[k] < a_surface) != (a_z[k + 1] < a_surface)) {
+				const float dz = a_z[k + 1] - a_z[k];
+				const float t = std::fabs(dz) > 1e-4f ? std::clamp((a_surface - a_z[k]) / dz, 0.0f, 1.0f) : 0.5f;
+				d = std::max(d, a_body[k] + (a_body[k + 1] - a_body[k]) * t);
+			}
+		}
+		return d;
+	}
+
+	RE::NiPoint3 LimbDir(const RE::NiPoint3& a_to, const RE::NiPoint3& a_from)
+	{
+		RE::NiPoint3 d = a_to - a_from;
+		const float len = d.Length();
+		return len > 1e-3f ? d / len : RE::NiPoint3(0.0f, 0.0f, 1.0f);
+	}
+
+	/// The character's limb chains: the bones' bind joints from the skin data of its geometries (the first that has each bone, in the
+	/// body's model space by the 47k check), their nodes, and the plausibility of every chain. Leaves a_limbs.valid false otherwise.
+	void LookupBodyLimbs(RE::Actor* a_actor, RE::NiAVObject* a_root, const Skin::BodyActor& a_body, Skin::BodyLimbs& o_limbs)
+	{
+		o_limbs = {};
+		std::array<std::array<float, 3>, Skin::BodyLimbs::kJoints> bind{};
+		std::array<bool, Skin::BodyLimbs::kJoints> found{};
+		float pelvisStb = 0.0f;
+		uint32_t missing = Skin::BodyLimbs::kJoints;
+		RE::NiAVObject* firstPerson = a_actor->IsPlayerRef() ? a_actor->Get3D(true) : nullptr;
+		RE::BSVisit::TraverseScenegraphGeometries(a_root, [&](RE::BSGeometry* a_geom) {
+			if (!a_geom || (firstPerson && BodyIsUnder(a_geom, firstPerson)))
+				return RE::BSVisit::BSVisitControl::kContinue;
+			RE::NiSkinInstance* skin = a_geom->GetGeometryRuntimeData().skinInstance.get();
+			BodySkinRefs refs;
+			if (!skin || !ReadBodySkinRefs(skin, refs))
+				return RE::BSVisit::BSVisitControl::kContinue;
+			for (uint32_t j = 0; j < Skin::BodyLimbs::kJoints; ++j) {
+				if (found[j])
+					continue;
+				const int32_t index = FindBodyBone(refs, kLimbBones[j]);
+				float joint[3], scale;
+				if (index < 0 || !ReadBindJoint(refs, index, joint, scale))
+					continue;
+				// The model space must be the body's: the bind height (as a body height) roughly where the bone is now (47k check).
+				float worldScale = 0.0f, boneZ = 0.0f;
+				if (!ReadBoneWorld(refs, index, worldScale, boneZ))
+					continue;
+				const float s = (a_body.pelvisScale > 0.0f ? a_body.pelvisScale : worldScale) * scale;
+				if (!(s > 0.05f && s < 20.0f) || !(std::fabs(s * joint[2] + a_body.rootOffset - (boneZ - a_body.feetZ)) < 0.5f * a_body.height + 20.0f))
+					continue;
+				bind[j] = { joint[0], joint[1], joint[2] };
+				found[j] = true;
+				if (j == kPelvis)
+					pelvisStb = scale;
+				--missing;
+			}
+			return missing ? RE::BSVisit::BSVisitControl::kContinue : RE::BSVisit::BSVisitControl::kStop;
+		});
+		for (uint32_t j = 0; j < Skin::BodyLimbs::kJoints; ++j) {
+			if (j != kNeck && j != kHead && !found[j])
+				return;
+		}
+		const auto z = [&](uint32_t j) { return bind[j][2]; };
+		const auto x = [&](uint32_t j) { return bind[j][0]; };
+		// Legs: foot < calf < thigh, the thighs on opposite sides; the torso rising from the pelvis.
+		for (const uint32_t f : { kLFoot, kRFoot }) {
+			if (!(z(f) > 0.0f && z(f + 1) > z(f) + 5.0f && z(f + 2) > z(f + 1) + 5.0f))
+				return;
+		}
+		if (!(x(kLThigh) * x(kRThigh) < 0.0f && std::fabs(x(kLThigh)) > 1.0f && std::fabs(x(kRThigh)) > 1.0f))
+			return;
+		const float thighZ = 0.5f * (z(kLThigh) + z(kRThigh)), calfZ = 0.5f * (z(kLCalf) + z(kRCalf));
+		if (!(z(kPelvis) > thighZ - 10.0f && z(kSpine0) > z(kPelvis) - 2.0f && z(kSpine1) > z(kSpine0) && z(kSpine2) > z(kSpine1)))
+			return;
+		o_limbs.hasNeck = found[kNeck] && z(kNeck) > z(kSpine2);
+		o_limbs.hasHead = found[kHead] && z(kHead) > (o_limbs.hasNeck ? z(kNeck) : z(kSpine2));
+		// Arms: the left shoulder (|x|, z) as the 47k remap; both upper arms there, elbow and wrist lower when hanging.
+		const float shoulderX = std::fabs(x(kLUpper)), shoulderZ = z(kLUpper);
+		if (!(shoulderZ > z(kSpine0) && shoulderX > 1.0f && x(kLUpper) * x(kRUpper) < 0.0f))
+			return;
+		const auto remap = [&](uint32_t j) {
+			const float ax = std::max(std::fabs(x(j)) - shoulderX, 0.0f), dz = z(j) - shoulderZ;
+			return shoulderZ - std::sqrt(ax * ax + dz * dz);
+		};
+		for (const uint32_t u : { kLUpper, kRUpper }) {
+			if (!(remap(u) > remap(u + 1) + 3.0f && remap(u + 1) > remap(u + 2) + 3.0f))
+				return;
+		}
+		if (!(pelvisStb > 1e-4f))
+			return;
+		// The nodes (world positions per frame).
+		for (uint32_t j = 0; j < Skin::BodyLimbs::kJoints; ++j) {
+			if ((j == kNeck && !o_limbs.hasNeck) || (j == kHead && !o_limbs.hasHead))
+				continue;
+			const RE::BSFixedString name(kLimbBones[j]);
+			o_limbs.nodes[j].reset(a_root->GetObjectByName(name));
+			if (!o_limbs.nodes[j]) {
+				if (j == kNeck || j == kHead) {
+					(j == kNeck ? o_limbs.hasNeck : o_limbs.hasHead) = false;
+					continue;
+				}
+				o_limbs = {};
+				return;
+			}
+		}
+		for (uint32_t j = 0; j < Skin::BodyLimbs::kJoints; ++j)
+			o_limbs.bindH[j] = (j >= kLUpper) ? remap(j) : z(j);
+		o_limbs.pelvisStb = pelvisStb;
+		o_limbs.crotchZ = thighZ - 0.25f * (thighZ - calfZ);
+		const auto dist = [&](uint32_t a, uint32_t b) {
+			const float dx = x(a) - x(b), dy = bind[a][1] - bind[b][1], dz = z(a) - z(b);
+			return std::sqrt(dx * dx + dy * dy + dz * dz);
+		};
+		o_limbs.fingerLen = 0.7f * 0.5f * (dist(kLFore, kLHand) + dist(kRFore, kRHand));
+		o_limbs.legSign = x(kLThigh) > 0.0f ? 1.0f : -1.0f;
+		o_limbs.armSign = x(kLUpper) > 0.0f ? 1.0f : -1.0f;
+		o_limbs.shoulderX = shoulderX;
+		o_limbs.shoulderZ = shoulderZ;
+		o_limbs.valid = true;
+	}
+}
+
+bool Skin::RefreshBodyActor(RE::Actor* a_actor, ActorWetState& a_state, uint32_t a_frame)
+{
+	auto& body = a_state.body;
+	RE::NiAVObject* root = a_actor ? a_actor->Get3D(false) : nullptr;
+	if (!root)
+		return false;
+	const auto& wetSettings = globals::features::wetSkin.settings;
+	const bool limbsWanted = wetSettings.PhysWaterLine && wetSettings.PhysBodyLine && wetSettings.PhysLimbLines;
+	bool lookedUp = false;
+	if (body.root != root || body.lookupFrame == UINT32_MAX || a_frame - body.lookupFrame > 300u) {
+		static const RE::BSFixedString kRoot("NPC Root [Root]");
+		static const RE::BSFixedString kPelvis("NPC Pelvis [Pelv]");
+		static const RE::BSFixedString kCalf("NPC L Calf [LClf]");
+		static const RE::BSFixedString kFoot("NPC L Foot [Lft ]");
+		if (body.root != root) {
+			body.shoulderKnown = false;
+			a_state.bodyGeometry.clear();
+		}
+		body.root = root;
+		body.lookupFrame = a_frame;
+		body.npcRoot.reset(root->GetObjectByName(kRoot));
+		body.pelvis.reset(root->GetObjectByName(kPelvis));
+		body.humanoid = body.npcRoot && body.pelvis && root->GetObjectByName(kCalf) && root->GetObjectByName(kFoot);
+		// (47l) Every geometry decides body / world afresh (BodyGeometry::failCount), the limb chains are looked up again.
+		for (auto& [geometry, geo] : a_state.bodyGeometry) {
+			geo.failCount = 0;
+			geo.stuckWorld = false;
+		}
+		body.limbs = {};
+		body.frame = UINT32_MAX;
+		lookedUp = true;
+	}
+	if (!body.humanoid)
+		return false;
+	if (body.frame != a_frame) {
+		body.frame = a_frame;
+		body.feetZ = a_actor->GetPositionZ();
+		body.height = std::max(a_actor->GetHeight(), 32.0f);
+		float rootZ = body.feetZ;
+		body.rootOffset = ReadNodeWorldZ(body.npcRoot.get(), rootZ) ? std::clamp(rootZ - body.feetZ, -64.0f, 64.0f) : 0.0f;
+		body.pelvisScale = ReadNodeWorldScale(body.pelvis.get(), body.pelvisScale) ? body.pelvisScale : 0.0f;
+	}
+	// (47l) The limb chains: at the lookup (or once the switch is turned on).
+	if (limbsWanted && (lookedUp || !body.limbsLooked)) {
+		body.limbsLooked = true;
+		LookupBodyLimbs(a_actor, root, body, body.limbs);
+	} else if (!limbsWanted) {
+		body.limbsLooked = false;
+	}
+	return true;
+}
+
+bool Skin::UpdateBodyLimbs(RE::Actor* a_actor, ActorWetState& a_state, const WaterSample& a_water, WetSkin::PhysicalInput& o_in)
+{
+	const uint32_t frame = globals::state->frameCount;
+	if (!RefreshBodyActor(a_actor, a_state, frame))
+		return false;
+	auto& body = a_state.body;
+	auto& l = body.limbs;
+	if (!l.valid)
+		return false;
+	// s: the pelvis's bone-matrix scale (the body geometry's s in the shader); a frame it cannot be read: the last one.
+	const float sNow = body.pelvisScale * l.pelvisStb;
+	if (sNow > 0.05f && sNow < 20.0f)
+		l.lastScale = sNow;
+	const float s = l.lastScale;
+	if (!(s > 0.0f))
+		return false;
+	using Limb = uint32_t;
+	constexpr Limb kLegL = 0, kLegR = 1, kTorso = 2, kArmL = 3, kArmR = 4;
+	const float topH = std::max(body.height, s * (l.bindH[l.hasHead ? kHead : (l.hasNeck ? kNeck : kSpine2)] + 8.0f));
+	const float tipL = l.bindH[kLHand] - l.fingerLen, tipR = l.bindH[kRHand] - l.fingerLen;
+	o_in.limbLo = { 0.0f, 0.0f, s * l.crotchZ, s * tipL, s * tipR };
+	o_in.limbHi = { s * l.bindH[kLThigh], s * l.bindH[kRThigh], topH, s * l.bindH[kLUpper], s * l.bindH[kRUpper] };
+	o_in.limbDepth = {};
+	// The surface: where the feet are in the water, the one the depth is measured to (clamped as the depth); else a local surface
+	// below the feet (standing on the bank or a jetty) still wets a hand or a knee that reaches into it.
+	float surface = -1e30f;
+	if (a_water.inWater && a_water.depth > 0.0f)
+		surface = a_water.feetZ + a_water.depth;
+	else if (a_water.surfaceZ > -1e29f && a_water.surfaceZ < a_water.feetZ && a_water.surfaceZ > a_water.feetZ - body.height)
+		surface = a_water.surfaceZ;
+	if (surface <= -1e29f)
+		return true;
+	std::array<RE::NiPoint3, BodyLimbs::kJoints> p{};
+	if (!ReadLimbPositions(l.nodes, l.hasNeck, l.hasHead, p)) {
+		// Unreadable this frame: every limb by the world depth.
+		const float depth = a_water.inWater ? std::max(a_water.depth, 0.0f) : 0.0f;
+		for (Limb i = 0; i < WetSkin::Phys::kLimbs; ++i)
+			o_in.limbDepth[i] = depth > o_in.limbLo[i] ? std::min(depth, o_in.limbHi[i]) : 0.0f;
+		return true;
+	}
+	const auto b = [&](uint32_t j) { return s * l.bindH[j]; };
+	// Legs: the sole (straight below the ankle by its bind height), ankle, knee, hip.
+	const auto leg = [&](uint32_t a_foot) {
+		const float zs[4] = { p[a_foot].z - b(a_foot), p[a_foot].z, p[a_foot + 1].z, p[a_foot + 2].z };
+		const float hs[4] = { 0.0f, b(a_foot), b(a_foot + 1), b(a_foot + 2) };
+		return LimbChainDepth(zs, hs, 4, surface);
+	};
+	o_in.limbDepth[kLegL] = leg(kLFoot);
+	o_in.limbDepth[kLegR] = leg(kRFoot);
+	// Torso / head: the crotch (between the thighs at its bind height), pelvis, spine, neck, head, the top of the head.
+	{
+		const auto atCrotch = [&](uint32_t a_thigh) {
+			const float span = l.bindH[a_thigh] - l.bindH[a_thigh - 1];
+			const float t = span > 1e-3f ? std::clamp((l.bindH[a_thigh] - l.crotchZ) / span, 0.0f, 1.0f) : 0.0f;
+			return p[a_thigh] + (p[a_thigh - 1] - p[a_thigh]) * t;
+		};
+		const RE::NiPoint3 crotch = (atCrotch(kLThigh) + atCrotch(kRThigh)) * 0.5f;
+		float zs[8], hs[8];
+		uint32_t n = 0;
+		const auto push = [&](float a_z, float a_h) {
+			zs[n] = a_z;
+			hs[n++] = a_h;
+		};
+		push(crotch.z, s * l.crotchZ);
+		for (const uint32_t j : { kPelvis, kSpine0, kSpine1, kSpine2 })
+			push(p[j].z, b(j));
+		uint32_t lastJoint = kSpine2, prevJoint = kSpine1;
+		for (const uint32_t j : { kNeck, kHead }) {
+			if ((j == kNeck && !l.hasNeck) || (j == kHead && !l.hasHead))
+				continue;
+			push(p[j].z, b(j));
+			prevJoint = lastJoint;
+			lastJoint = j;
+		}
+		const RE::NiPoint3 top = p[lastJoint] + LimbDir(p[lastJoint], p[prevJoint]) * std::max(topH - b(lastJoint), 0.0f);
+		push(top.z, topH);
+		o_in.limbDepth[kTorso] = LimbChainDepth(zs, hs, n, surface);
+	}
+	// Arms: shoulder, elbow, wrist, the fingertips (the hand's length on along the forearm), by their hanging heights.
+	const auto arm = [&](uint32_t a_upper, float a_tip) {
+		const RE::NiPoint3 tip = p[a_upper + 2] + LimbDir(p[a_upper + 2], p[a_upper + 1]) * (s * l.fingerLen);
+		const float zs[4] = { p[a_upper].z, p[a_upper + 1].z, p[a_upper + 2].z, tip.z };
+		const float hs[4] = { b(a_upper), b(a_upper + 1), b(a_upper + 2), s * a_tip };
+		return LimbChainDepth(zs, hs, 4, surface);
+	};
+	o_in.limbDepth[kArmL] = arm(kLUpper, tipL);
+	o_in.limbDepth[kArmR] = arm(kRUpper, tipR);
+	for (Limb i = 0; i < WetSkin::Phys::kLimbs; ++i)
+		o_in.limbDepth[i] = std::isfinite(o_in.limbDepth[i]) ? std::clamp(o_in.limbDepth[i], 0.0f, o_in.limbHi[i]) : 0.0f;
+	return true;
 }
 
 uint8_t Skin::GetItemClassPrior(RE::Actor* a_actor, ActorWetState& a_state, const RE::BSGeometry* a_geometry, uint32_t a_frame)
@@ -1426,6 +1752,11 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 				perGeometryData.wetPhysParams[i] = look.params[i];
 			for (size_t i = 0; i < look.bands.size(); ++i)
 				perGeometryData.wetPhysBands[i] = look.bands[i];
+			// (47l) Water Line per Limb (zero otherwise).
+			if (look.limbMode) {
+				for (size_t i = 0; i < look.limbs.size(); ++i)
+					perGeometryData.wetPhysLimbs[i] = look.limbs[i];
+			}
 			// (47k) Water Line Follows the Body: the bind-pose height of this geometry (zero: the world height, as 47j).
 			if (wetSkin.settings.PhysBodyLine) {
 				auto userData = geometry->GetUserData();

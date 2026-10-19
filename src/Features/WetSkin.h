@@ -92,6 +92,7 @@ struct WetSkin : Feature
 		bool PhysLessGrid = true;      // "Physical: Less Grid-like Bead Placement": bead radius 0.36 cell (was 0.42), more jitter
 		// (47l) A/B switch, on by default; off = 47k exactly. Not part of presets.
 		bool PhysSweat2 = true;        // "Physical: Sweat and Drying v2": sweat made in um/s by body heat, one smooth drying law (WetSkin::Phys kLaw*)
+		bool PhysLimbLines = true;     // "Physical: Water Line per Limb (bones)": a water line per limb, recorded in body units from its bones
 		// (47i) Moved from Advanced Skin (used by every model): sweat from stamina, or from Dynamic Wetness.
 		float StartSweat = 0.75f;
 		float FullSweat = 0.15f;
@@ -269,11 +270,28 @@ struct WetSkin : Feature
 		static constexpr float kHeatDown2 = 60.0f;      // s
 		static constexpr float kDripLevel = 150.0f;     // um x Sweat
 		static constexpr float kDripSoft = 4.0f;        // um (softplus width: no kink)
+		// (47l) Water Line per Limb: left leg, right leg, torso / head, left arm, right arm (Skin.hlsli wetPhysLimbs).
+		static constexpr uint32_t kLimbs = 5;
+		static constexpr uint32_t kFlagLimbs = 64u;  // wetPhysParams[3].w: the lines are per limb (Skin.hlsli kPhysFlagLimbs)
 		static constexpr uint32_t kDryCurveN = 24;
 		/// The held water of a swim zone (share of kHold) at progress p = u^2, u = i / kDryCurveN (Skin.hlsli kPhysDryCurve).
 		static constexpr float kDryCurve[kDryCurveN + 1] = { 1.000000f, 0.986224f, 0.946868f, 0.887163f, 0.813968f, 0.734044f, 0.652900f,
 			0.574383f, 0.500785f, 0.433202f, 0.371927f, 0.316773f, 0.267314f, 0.223037f, 0.183439f, 0.148090f, 0.116668f, 0.088982f,
 			0.064987f, 0.044771f, 0.028500f, 0.016274f, 0.007911f, 0.002796f, 0.000000f };
+	};
+	/// (47l) Water Line per Limb: one limb's water line (body units: the bind-pose height x the skeleton's scale, from its bones) and
+	/// its two evenly drying zones, exactly as the 47j line (PhysicalState line* / mid*).
+	struct LimbLine
+	{
+		float lineHeight = 0.0f;
+		float lineP = Phys::kMaxProgress;
+		float lineX = 0.0f;
+		float midHeight = 0.0f;
+		float midP = Phys::kMaxProgress;
+		float midX = 0.0f;
+		float dipMin = 0.0f;
+		float depth = 0.0f;      // how far up the limb (body units) is under water this frame (0 = none)
+		float lastDepth = 0.0f;  // last frame's: the line rises only as far as two frames agree (a one-frame glitch never raises it)
 	};
 	/// One character's water, advanced on the CPU once per frame (Skin::GetWetness).
 	struct PhysicalState
@@ -299,6 +317,8 @@ struct WetSkin : Feature
 		bool lineMode = false;     // the state above was advanced by the water-line model (a switch starts afresh)
 		bool dryLaw = false;       // (47l) the swim progress above follows kDryCurve (Sweat and Drying v2; a switch starts afresh)
 		float sweatDrip = 0.0f;    // (47l) 0..1, sweat dripping over kDripLevel x Sweat (trails)
+		bool limbMode = false;     // (47l) the swim water is in limbs[] (Water Line per Limb, a body-mapped character; a switch starts afresh)
+		std::array<LimbLine, Phys::kLimbs> limbs{};
 		float depth = 0.0f;        // current water depth above the feet (0 = not in the water)
 		bool wasInWater = false;
 		float exposure = 0.0f;     // last rain exposure (status)
@@ -314,6 +334,9 @@ struct WetSkin : Feature
 		float beadTrails = 0.0f;   // x Droplet Trails (wetSkinParams[4].x): runoff only
 		float dome = 1.0f;         // x Droplet Normal Strength (wetSkinParams[5].z)
 		float sweatLevel = 0.0f;   // skinPerGeometry.x: sweat / max (0..1)
+		// (47l) Water Line per Limb (Skin.hlsli wetPhysLimbs): per limb (line, lineP, lineX, mid), (midP, midX, 0, 0).
+		bool limbMode = false;
+		std::array<float4, 2 * Phys::kLimbs> limbs{};
 		// Status
 		float beadRadius = 0.0f;   // cm, physical (mixed)
 		float coverage = 0.0f;
@@ -339,6 +362,12 @@ struct WetSkin : Feature
 		bool outdoors = false;  // (47i) interiors: neutral air
 		float exposure = 0.0f;  // 0 sheltered / indoors .. 1 under the open sky
 		float cold = 0.0f;      // 0..1 (cold-region map / snow line / snow weather)
+		// (47l) Water Line per Limb: the character is body-mapped (Skin::UpdateBodyLimbs), how far up each limb is under water and each
+		// limb's range of body heights (body units).
+		bool limbs = false;
+		std::array<float, Phys::kLimbs> limbDepth{};
+		std::array<float, Phys::kLimbs> limbLo{};
+		std::array<float, Phys::kLimbs> limbHi{};
 	};
 	const PhysicalFrame& GetPhysicalFrame();
 	/// Advances a character's sweat, rain and swim water.

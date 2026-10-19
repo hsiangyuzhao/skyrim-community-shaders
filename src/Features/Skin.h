@@ -112,7 +112,10 @@ struct Skin : Feature
 		// (47k) "Physical: Water Line Follows the Body" (Skin.hlsli bodyPerGeometry / CharBodyHeight): x the pelvis's bone-matrix
 		// scale (0 = the world height), y NPC Root's world Z - the actor's, zw the bind-pose shoulder (|x|, z; z 0 = unknown).
 		float4 bodyPerGeometry;
-		float4 bodyPerGeometry2;  // x the actor's height (sanity range of the body height)
+		float4 bodyPerGeometry2;  // x the actor's height (sanity range of the body height); (47l) y crotch z (model units, 0 = no limbs), z / w the left leg's / arm's x sign
+		// (47l) "Physical: Water Line per Limb" (WetSkin::PhysicalLook::limbs, Skin.hlsli wetPhysLimbs): per limb (line, lineP, lineX,
+		// mid), (midP, midX, 0, 0) in body units.
+		float4 wetPhysLimbs[2 * WetSkin::Phys::kLimbs];
 	};
 
 	/// (47k) Water Line Follows the Body: per geometry of a character, what maps its bind-pose (pre-skinning) positions to a height on
@@ -129,6 +132,31 @@ struct Skin : Feature
 		float shoulderX = 0.0f;      // its bind-pose joint, |x| and z (model space)
 		float shoulderZ = 0.0f;
 		uint32_t usedFrame = 0;
+		// (47l) Water Line per Limb: the body / world decision is sticky: a geometry found usable keeps the body height (with its last
+		// good scale) until its checks failed kBodyFailLimit draws in a row; then the world height until the character's next lookup.
+		uint32_t failCount = 0;
+		bool stuckWorld = false;
+		float lastScale = 0.0f;
+	};
+	/// (47l) Water Line per Limb: a character's limb chains, decided at its lookup (3D change / every 300 frames): the bone nodes (world
+	/// positions now) and their bind heights from the skin data (model units, the arms remapped as hanging, as Skin.hlsli CharBodyHeight).
+	struct BodyLimbs
+	{
+		// L foot, calf, thigh; R foot, calf, thigh; pelvis, spine 0 / 1 / 2, neck, head; L upper arm, forearm, hand; R upper arm, forearm, hand.
+		static constexpr uint32_t kJoints = 18;
+		bool valid = false;     // every chain found with plausible bind heights (else the whole character keeps the world height)
+		bool hasNeck = false;   // neck / head are optional (the torso then ends at spine 2)
+		bool hasHead = false;
+		std::array<RE::NiPointer<RE::NiAVObject>, kJoints> nodes;
+		std::array<float, kJoints> bindH{};  // model units (arms: remapped as hanging)
+		float pelvisStb = 1.0f;  // the pelvis's skin-to-bone scale (s = its world scale x this)
+		float crotchZ = 0.0f;    // model units: legs below, torso above
+		float fingerLen = 0.0f;  // model units: wrist to fingertips
+		float legSign = 1.0f;    // the left leg's / arm's bind x sign
+		float armSign = 1.0f;
+		float shoulderX = 0.0f;  // the left upper arm's bind joint (|x|, z)
+		float shoulderZ = 0.0f;
+		float lastScale = 0.0f;  // the last readable s (UpdateBodyLimbs)
 	};
 	/// (47k) Per character: NPC Root (high heels lift), whether the skeleton is a humanoid's, the shoulder from any of its geometries.
 	struct BodyActor
@@ -146,7 +174,10 @@ struct Skin : Feature
 		bool shoulderKnown = false;
 		float shoulderX = 0.0f;
 		float shoulderZ = 0.0f;
+		BodyLimbs limbs;           // (47l)
+		bool limbsLooked = false;  // (47l) the limb chains were looked up since the last lookup (or the switch came on)
 	};
+	static constexpr uint32_t kBodyFailLimit = 30;  // (47l) draws in a row a geometry's body checks may fail before it takes the world height
 	/// (47k) Status: geometries drawn with the body height / the world height last frame (Physical, switch on).
 	struct BodyLineStats
 	{
@@ -265,6 +296,12 @@ struct Skin : Feature
 	uint8_t GetItemClassPrior(RE::Actor* a_actor, ActorWetState& a_state, const RE::BSGeometry* a_geometry, uint32_t a_frame);
 	/// (47k) bodyPerGeometry / bodyPerGeometry2 for one geometry of a Physical character (x = 0: the world height).
 	void GetBodyFrame(RE::BSGeometry* a_geometry, RE::Actor* a_actor, ActorWetState& a_state, float4& o_body, float4& o_body2);
+	/// (47l) The per-character lookup (NPC Root, pelvis, the humanoid check, the limb chains) and this frame's root / feet / height
+	/// (shared by GetBodyFrame and UpdateBodyLimbs). False: not a humanoid (the world height).
+	bool RefreshBodyActor(RE::Actor* a_actor, ActorWetState& a_state, uint32_t a_frame);
+	/// (47l) Water Line per Limb: how far up each limb (body units) is under the water this frame, from its bones, and each limb's
+	/// range of body heights (o_in.limb*). False: no usable limb chains (the character keeps the one line by the world height).
+	bool UpdateBodyLimbs(RE::Actor* a_actor, ActorWetState& a_state, const WaterSample& a_water, WetSkin::PhysicalInput& o_in);
 	ActorWetState* lastWetState = nullptr;  // (44c) the state GetWetness last returned (this draw)
 	static constexpr size_t kMaxActorWetStates = 1024;
 	static constexpr uint32_t kActorWetStaleFrames = 600;

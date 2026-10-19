@@ -2289,7 +2289,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		float swimTrail;
 		const float vSweat = Skin::wetPhysParams[0].x * sweatRegion;
 		const float vRain = Skin::wetPhysParams[0].y * rainRegion;
-		const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBand(h, hWorld), 1.0, swimTrail);
+		const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBandBody(input.ModelPosition.xyz, h, hWorld), 1.0, swimTrail);
 		const float vAll = vSweat + vRain + vSwim;
 		const float wn = saturate(vAll / Skin::kPhysHold);
 		const float cov = Skin::WetCoverage(wetUV, wn, SharedData::skinData.wetParams.x, SharedData::skinData.wetParams.y, SharedData::skinData.wetParams.z);
@@ -3417,7 +3417,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 					// (47k) Water Line Follows the Body: the stored line and the hairline by the body-fixed height.
 					const float h = Skin::CharBodyHeight(input.ModelPosition.xyz, charWorldZ);
 					float hairTrail;
-					const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBand(h, charWorldZ - Skin::skinPerGeometry.z), clamp(Skin::wetCharParams[0].z, 0.25, 4.0), hairTrail);
+					const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBandBody(input.ModelPosition.xyz, h, charWorldZ - Skin::skinPerGeometry.z), clamp(Skin::wetCharParams[0].z, 0.25, 4.0), hairTrail);
 					const float vRain = Skin::wetPhysParams[0].y * 1.15;
 					const float hairline = lerp(1.0, 0.45, smoothstep(118.0, 126.0, h));
 					wSwim = saturate(vSwim / Skin::kPhysHold);
@@ -3494,7 +3494,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 					// (47k) Water Line Follows the Body: the stored line and the sweat region by the body-fixed height (rigid gear: the
 					// world height); the current water surface by the world height.
 					const float h = Skin::CharBodyHeight(input.ModelPosition.xyz, charWorldZ);
-					const float3 band = Skin::WetPhysBand(h - (wick + tide), charWorldZ - Skin::skinPerGeometry.z - (wick + tide));
+					const float3 band = Skin::WetPhysBandBody(input.ModelPosition.xyz, h - (wick + tide), charWorldZ - Skin::skinPerGeometry.z - (wick + tide));
 					float tC, tL, tM, tF;
 					const float vC = Skin::WetPhysSwimWater(band, Skin::wetCharParams[7].w, tC);
 					const float vL = Skin::WetPhysSwimWater(band, Skin::wetCharParams[8].w, tL);

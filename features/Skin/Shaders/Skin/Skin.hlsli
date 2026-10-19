@@ -53,8 +53,14 @@ namespace Skin
 		// person, creatures), y = NPC Root's world Z minus the actor's (high heels), zw = the bind-pose shoulder joint ("NPC L
 		// UpperArm [LUar]": |x|, z in model space; z <= 0 = unknown, no arm remap).
 		float4 bodyPerGeometry;
-		// (47k) x = the actor's height (units; the body height is trusted only within -20 .. x + 40), yzw unused.
+		// (47k) x = the actor's height (units; the body height is trusted only within -20 .. x + 40).
+		// (47l) Water Line per Limb (0 = off): y = the crotch's bind z (model units: legs below, the rest above), z / w = the sign of
+		// the left leg's / left arm's bind x. With y > 0 bodyPerGeometry.y is 0 and the body height is never swapped per pixel.
 		float4 bodyPerGeometry2;
+		// (47l) Water Line per Limb (WetSkin::PhysicalLook::limbs; flag kPhysFlagLimbs): left leg, right leg, torso / head, left arm,
+		// right arm; [2i] = (line, upper zone progress, its runoff share, the lower zone's top), [2i + 1] = (lower zone progress, its
+		// runoff share, 0, 0); heights in body units.
+		float4 wetPhysLimbs[10];
 	};
 
 	/// (47k) Height above the feet that stays on the same point of the body while the limbs move: the pre-skinning (bind-pose)
@@ -75,7 +81,11 @@ namespace Skin
 				hModel = lerp(hModel, hArm, smoothstep(b.z, b.z + 4.0, ax));
 			}
 			const float hBody = b.x * hModel + b.y;
-			h = (hBody >= -20.0 && hBody <= bodyPerGeometry2.x + 40.0) ? hBody : hWorld;
+			// (47l) Per limb: the decision is the CPU's (sticky per geometry), never the pixel's.
+			[flatten] if (bodyPerGeometry2.y > 0.0)
+				h = clamp(hBody, -20.0, bodyPerGeometry2.x + 40.0);
+			else
+				h = (hBody >= -20.0 && hBody <= bodyPerGeometry2.x + 40.0) ? hBody : hWorld;
 		}
 		return h;
 	}
@@ -177,6 +187,8 @@ namespace Skin
 	static const float kPhysLessGridRadius = 0.36;
 	// (47l) Sweat and Drying v2 (WetSkin::Phys::kFlagDryLaw): a swim zone's held water follows the drying law's curve.
 	static const uint kPhysFlagDryLaw = 32u;
+	// (47l) Water Line per Limb (WetSkin::Phys::kFlagLimbs): the stored lines per limb in wetPhysLimbs (WetPhysBandBody).
+	static const uint kPhysFlagLimbs = 64u;
 	bool WetPhysFlag(uint a_flag)
 	{
 		return (uint(max(wetPhysParams[3].w, 0.0) + 0.5) & a_flag) != 0u;
@@ -228,6 +240,44 @@ namespace Skin
 			o.z = depth > 0.0 ? 1.0 - smoothstep(depth - 2.5, depth + 2.5, hWorld) : 0.0;
 		}
 		return o;
+	}
+
+	/// (47l) One limb's line and its two zones at body height h (as WetPhysBand's line mode): a = (line, upper p, x, lower zone top),
+	/// b = (lower p, x).
+	float2 WetPhysLimbZones(float h, float4 a, float4 b)
+	{
+		float2 o = float2(4.0, 0.0);
+		[branch] if (a.x > 0.0)
+		{
+			o = lerp(o, a.yz, 1.0 - smoothstep(a.x - 2.5, a.x + 2.5, h));
+			o = lerp(o, b.xy, a.w > 0.0 ? 1.0 - smoothstep(a.w - 2.5, a.w + 2.5, h) : 0.0);
+		}
+		return o;
+	}
+
+	/// (47l) WetPhysBand with "Water Line per Limb": the fragment's limb from its bind-pose (model) position: below the crotch a
+	/// leg (by the sign of x), out past the shoulder (the 47k arm remap's region) an arm, else the torso / head; 3 units of blend
+	/// at the crotch, 1.5 across x = 0, the remap's 4 at the shoulder. Each limb's own line at the body height h; the current water
+	/// surface by the world height as before. Not per limb (switch off, a geometry on the world height): WetPhysBand.
+	float3 WetPhysBandBody(float3 modelPos, float h, float hWorld)
+	{
+		[branch] if (!WetPhysFlag(kPhysFlagLimbs) || bodyPerGeometry.x <= 0.0 || bodyPerGeometry2.y <= 0.0)
+			return WetPhysBand(h, hWorld);
+		const float crotch = bodyPerGeometry2.y;
+		const float above = smoothstep(crotch - 3.0, crotch + 3.0, modelPos.z);
+		const float arm = bodyPerGeometry.w > 0.0 ? smoothstep(bodyPerGeometry.z, bodyPerGeometry.z + 4.0, abs(modelPos.x)) * above : 0.0;
+		const float leg = (1.0 - arm) * (1.0 - above);
+		const float legL = smoothstep(-1.5, 1.5, modelPos.x * bodyPerGeometry2.z);
+		const float armL = smoothstep(-1.5, 1.5, modelPos.x * bodyPerGeometry2.w);
+		const float w[5] = { leg * legL, leg * (1.0 - legL), saturate(1.0 - arm - leg), arm * armL, arm * (1.0 - armL) };
+		float2 o = 0.0;
+		[unroll] for (uint i = 0; i < 5; ++i)
+		{
+			[branch] if (w[i] > 0.0)
+				o += w[i] * WetPhysLimbZones(h, wetPhysLimbs[2 * i], wetPhysLimbs[2 * i + 1]);
+		}
+		const float depth = wetPhysParams[3].y;
+		return float3(o, depth > 0.0 ? 1.0 - smoothstep(depth - 2.5, depth + 2.5, hWorld) : 0.0);
 	}
 
 	/// Swim water (um, x Swimming; at least the manual Swim water) of a class with dry multiplier m (skin 1: progress / m,

@@ -100,7 +100,8 @@ namespace
 		o_json["PhysBodyLine"] = a_s.PhysBodyLine;
 		o_json["PhysBeadCap"] = a_s.PhysBeadCap;
 		o_json["PhysLessGrid"] = a_s.PhysLessGrid;
-		o_json["PhysSweat2"] = a_s.PhysSweat2;  // (47l) A/B switch (not part of presets)
+		o_json["PhysSweat2"] = a_s.PhysSweat2;  // (47l) A/B switches (not part of presets)
+		o_json["PhysLimbLines"] = a_s.PhysLimbLines;
 		o_json["Physical47i"] = true;
 	}
 
@@ -133,7 +134,7 @@ namespace
 		// (47j)
 		for (auto [key, value] : { std::pair{ "PhysWaterLine", &o_s.PhysWaterLine }, std::pair{ "PhysBeadsFadeIn", &o_s.PhysBeadsFadeIn }, std::pair{ "PhysBeadsShrink", &o_s.PhysBeadsShrink },
 				 std::pair{ "PhysBodyLine", &o_s.PhysBodyLine }, std::pair{ "PhysBeadCap", &o_s.PhysBeadCap }, std::pair{ "PhysLessGrid", &o_s.PhysLessGrid },
-				 std::pair{ "PhysSweat2", &o_s.PhysSweat2 } }) {
+				 std::pair{ "PhysSweat2", &o_s.PhysSweat2 }, std::pair{ "PhysLimbLines", &o_s.PhysLimbLines } }) {
 			if (auto it = a_json.find(key); it != a_json.end() && it->is_boolean())
 				*value = it->get<bool>();
 		}
@@ -498,6 +499,13 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 	const bool lineMode = s.PhysWaterLine;
 	const float actorHeight = bandHeight * static_cast<float>(Phys::kBands);
 	const float lineDry = std::min(MaxDryMultiplier(), Phys::kMaxProgress);  // every class (hair, slowest gear) dry
+	// (47l) Water Line per Limb: a line per limb in body units (a body-mapped character: Skin::UpdateBodyLimbs); else the one line.
+	const bool limbMode = lineMode && s.PhysLimbLines && a_in.limbs;
+	std::array<float, Phys::kLimbs> limbDepth{};
+	if (limbMode) {
+		for (uint32_t i = 0; i < Phys::kLimbs; ++i)
+			limbDepth[i] = std::max(std::isfinite(a_in.limbDepth[i]) ? a_in.limbDepth[i] : 0.0f, 0.0f);
+	}
 	const auto resetSwim = [&]() {
 		for (uint32_t b = 0; b < Phys::kBands; ++b) {
 			a_state.bandP[b] = submerged(b) ? 0.0f : Phys::kMaxProgress;
@@ -512,9 +520,18 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 		a_state.dipMin = depth;
 		a_state.lineMode = lineMode;
 		a_state.dryLaw = law;
+		a_state.limbMode = limbMode;
+		for (uint32_t i = 0; i < Phys::kLimbs; ++i) {
+			auto& l = a_state.limbs[i];
+			const float d = limbDepth[i];
+			l = {};
+			l.lineHeight = l.midHeight = l.dipMin = l.depth = l.lastDepth = d;
+			l.lineP = l.midP = d > 0.0f ? 0.0f : Phys::kMaxProgress;
+			l.lineX = l.midX = d > 0.0f ? 1.0f : 0.0f;
+		}
 	};
 
-	if (a_state.valid && (a_state.lineMode != lineMode || a_state.dryLaw != law))
+	if (a_state.valid && (a_state.lineMode != lineMode || a_state.dryLaw != law || a_state.limbMode != limbMode))
 		resetSwim();  // (47j) switched between the line and the bands ((47l) or the drying law): the swim water starts afresh (sweat and rain kept)
 
 	if (!a_state.valid) {
@@ -541,6 +558,16 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 		a_state.rain = rainRate > 0.0f ? std::min(rainCap, rainRate * 60.0f) : 0.0f;
 		resetSwim();
 	} else if (dtAll > 0.0f) {
+		// (47l) Per limb: a line rises only as far as this and last frame agree (a one-frame glitch of the bones or the water never
+		// raises it); dropping is immediate.
+		if (limbMode) {
+			for (uint32_t i = 0; i < Phys::kLimbs; ++i) {
+				auto& l = a_state.limbs[i];
+				const float d = limbDepth[i];
+				limbDepth[i] = std::min(d, std::max(l.lineHeight, l.lastDepth));
+				l.lastDepth = d;
+			}
+		}
 		// Sub-steps of at most 2 s (the shared evaporation couples the sources), at most 64 (a character back after a long
 		// absence just catches up coarser).
 		// (47l) v2: at most 0.5 s (the loss law is steep for thick water; the step itself stays stable at any length).
@@ -588,7 +615,43 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 			float swimMean = 0.0f;
 			float swimHeld = 0.0f;  // (47l) v2: the held part only (the water over it runs off on its own)
 			const auto heldOf = [&](float a_p) { return Phys::kHold * (law ? PhysDryCurve(a_p) : std::clamp(1.0f - a_p, 0.0f, 1.0f)); };
-			if (lineMode) {
+			if (limbMode) {
+				// (47l) Water Line per Limb: each limb's line (the 47j two zones) by how far up that limb is under water (body units, from
+				// its bones); the mean water for the shared loss from each limb's range of body heights, weighted by its share of the skin.
+				constexpr float kLimbShare[Phys::kLimbs] = { 0.18f, 0.18f, 0.46f, 0.09f, 0.09f };
+				for (uint32_t i = 0; i < Phys::kLimbs; ++i) {
+					auto& st = a_state.limbs[i];
+					const float d = limbDepth[i];
+					st.dipMin = std::min(st.dipMin, d);
+					if (d > 0.0f && d >= st.lineHeight) {
+						st.lineHeight = st.midHeight = st.dipMin = d;
+						st.lineP = st.midP = 0.0f;
+						st.lineX = st.midX = 1.0f;
+					} else if (d > st.midHeight) {
+						st.midHeight = st.dipMin = d;
+						st.midP = 0.0f;
+						st.midX = 1.0f;
+					} else if (d > st.dipMin + Phys::kLineSplit) {
+						const float hA = std::max(st.lineHeight - st.midHeight, 0.0f), hB = std::max(st.midHeight - d, 0.0f);
+						if (hA + hB > 0.0f) {
+							st.lineP = (st.lineP * hA + st.midP * hB) / (hA + hB);
+							st.lineX = (st.lineX * hA + st.midX * hB) / (hA + hB);
+						}
+						st.midHeight = st.dipMin = d;
+						st.midP = 0.0f;
+						st.midX = 1.0f;
+					} else {
+						st.midX *= std::exp(-dt / Phys::kRunoffTau);
+					}
+					st.lineX *= st.lineHeight > st.midHeight ? std::exp(-dt / Phys::kRunoffTau) : 1.0f;
+					const float lo = std::isfinite(a_in.limbLo[i]) ? a_in.limbLo[i] : 0.0f;
+					const float hi = std::max(std::isfinite(a_in.limbHi[i]) ? a_in.limbHi[i] : actorHeight, lo + 1.0f);
+					const float cd = std::clamp(d, lo, hi), cm = std::clamp(st.midHeight, lo, hi), cl = std::clamp(st.lineHeight, lo, hi);
+					const float under = cd - lo, zoneB = std::max(cm - cd, 0.0f), zoneA = std::max(cl - std::max(cm, cd), 0.0f);
+					swimMean += kLimbShare[i] * (under * Phys::kSoak + zoneB * PhysBandWater(st.midP, st.midX, law) + zoneA * PhysBandWater(st.lineP, st.lineX, law)) / (hi - lo);
+					swimHeld += kLimbShare[i] * (under * Phys::kHold + zoneB * heldOf(st.midP) + zoneA * heldOf(st.lineP)) / (hi - lo);
+				}
+			} else if (lineMode) {
 				auto& st = a_state;
 				st.dipMin = std::min(st.dipMin, depth);
 				if (depth > 0.0f && depth >= st.lineHeight) {
@@ -674,6 +737,28 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 				const float share = o_p < 1.0f ? held / std::max(held + a_state.sweat + a_state.rain, 1e-3f) : 1.0f;
 				o_p = std::min(o_p + loss * share / Phys::kHold, Phys::kMaxProgress);
 			};
+			if (limbMode) {
+				// (47l) Each limb's zones dry as the 47j line's (removal included, at that limb's own depth).
+				for (uint32_t i = 0; i < Phys::kLimbs; ++i) {
+					auto& st = a_state.limbs[i];
+					const float d = limbDepth[i];
+					if (st.midHeight > d)
+						dryProgress(st.midP);
+					if (st.lineHeight > st.midHeight)
+						dryProgress(st.lineP);
+					if (st.lineHeight > st.midHeight && st.lineP >= lineDry) {
+						st.lineHeight = st.midHeight;
+						st.lineP = st.midP;
+						st.lineX = st.midX;
+					}
+					if (st.lineHeight <= st.midHeight && st.midHeight > d && st.midP >= lineDry) {
+						st.lineHeight = st.midHeight = st.dipMin = d;
+						st.lineP = st.midP;
+						st.lineX = st.midX;
+					}
+				}
+				continue;
+			}
 			if (lineMode) {
 				auto& st = a_state;
 				const auto dryZone = [&](float& o_p) { dryProgress(o_p); };
@@ -735,6 +820,19 @@ void WetSkin::UpdatePhysical(PhysicalState& a_state, const PhysicalInput& a_in) 
 	a_state.midP = std::isfinite(a_state.midP) ? std::clamp(a_state.midP, 0.0f, Phys::kMaxProgress) : Phys::kMaxProgress;
 	a_state.midX = std::isfinite(a_state.midX) ? std::clamp(a_state.midX, 0.0f, 1.0f) : 0.0f;
 	a_state.dipMin = std::isfinite(a_state.dipMin) ? std::clamp(a_state.dipMin, 0.0f, a_state.midHeight) : 0.0f;
+	// (47l)
+	for (uint32_t i = 0; i < Phys::kLimbs; ++i) {
+		auto& l = a_state.limbs[i];
+		l.depth = limbMode ? limbDepth[i] : 0.0f;
+		l.lineHeight = std::isfinite(l.lineHeight) ? std::clamp(l.lineHeight, 0.0f, actorHeight + 64.0f) : 0.0f;
+		l.lineP = std::isfinite(l.lineP) ? std::clamp(l.lineP, 0.0f, Phys::kMaxProgress) : Phys::kMaxProgress;
+		l.lineX = std::isfinite(l.lineX) ? std::clamp(l.lineX, 0.0f, 1.0f) : 0.0f;
+		l.midHeight = std::isfinite(l.midHeight) ? std::clamp(l.midHeight, 0.0f, l.lineHeight) : 0.0f;
+		l.midP = std::isfinite(l.midP) ? std::clamp(l.midP, 0.0f, Phys::kMaxProgress) : Phys::kMaxProgress;
+		l.midX = std::isfinite(l.midX) ? std::clamp(l.midX, 0.0f, 1.0f) : 0.0f;
+		l.dipMin = std::isfinite(l.dipMin) ? std::clamp(l.dipMin, 0.0f, l.midHeight) : 0.0f;
+		l.lastDepth = std::isfinite(l.lastDepth) ? std::max(l.lastDepth, 0.0f) : 0.0f;
+	}
 }
 
 float WetSkin::PhysSwimBeadGate(float a_v) const
@@ -792,7 +890,20 @@ WetSkin::PhysicalLook WetSkin::GetPhysicalLook(const PhysicalState& a_state) con
 		swimBeadWeight += bead;
 	};
 	const bool lineMode = s.PhysWaterLine && a_state.lineMode;
-	if (lineMode) {
+	const bool limbMode = lineMode && s.PhysLimbLines && a_state.limbMode;  // (47l)
+	if (limbMode) {
+		// (47l) Water Line per Limb: every limb's two zones; under the surface soaked.
+		for (const auto& l : a_state.limbs) {
+			if (l.midHeight > l.depth)
+				addSwim(l.midP, l.midX);
+			if (l.lineHeight > std::max(l.midHeight, l.depth))
+				addSwim(l.lineP, l.lineX);
+			if (l.depth > 0.0f)
+				swimMax = std::max(swimMax, Phys::kSoak * swimWeight);
+		}
+		if (a_state.depth > 0.0f)
+			swimMax = std::max(swimMax, Phys::kSoak * swimWeight);
+	} else if (lineMode) {
 		// (47j) Water line: the part between the surface and the line (one state) and the part under the surface (soaked).
 		if (a_state.midHeight > a_state.depth)
 			addSwim(a_state.midP, a_state.midX);
@@ -857,9 +968,23 @@ WetSkin::PhysicalLook WetSkin::GetPhysicalLook(const PhysicalState& a_state) con
 	// (47j) Flags (Skin.hlsli WetPhysFlag): the water line, beads fading in from the film, beads shrinking out. (47k) The bead cap
 	// (presenceMax in [3].z) and the smaller bead per cell.
 	const uint32_t flags = (lineMode ? Phys::kFlagWaterLine : 0u) | (s.PhysBeadsFadeIn ? Phys::kFlagFadeIn : 0u) | (s.PhysBeadsShrink ? Phys::kFlagShrink : 0u) |
-	                       (law.cap ? Phys::kFlagBeadCap : 0u) | (s.PhysLessGrid ? Phys::kFlagLessGrid : 0u) | (dryLaw ? Phys::kFlagDryLaw : 0u);
+	                       (law.cap ? Phys::kFlagBeadCap : 0u) | (s.PhysLessGrid ? Phys::kFlagLessGrid : 0u) | (dryLaw ? Phys::kFlagDryLaw : 0u) |
+	                       (limbMode ? Phys::kFlagLimbs : 0u);
 	look.params[3] = float4(drawnShare, a_state.depth, presenceMax, static_cast<float>(flags));
-	if (lineMode) {
+	if (limbMode) {
+		// (47l) Per limb (line, lineP, lineX, mid), (midP, midX); the one-line slots hold the torso's (geometry not mapped to the body:
+		// rigid gear, by the world height).
+		for (uint32_t i = 0; i < Phys::kLimbs; ++i) {
+			const auto& l = a_state.limbs[i];
+			look.limbs[2 * i] = float4(l.lineHeight, l.lineP, l.lineX, l.midHeight);
+			look.limbs[2 * i + 1] = float4(l.midP, l.midX, 0.0f, 0.0f);
+		}
+		look.limbMode = true;
+		const auto& torso = a_state.limbs[2];
+		look.params[0].w = torso.lineHeight;
+		look.bands[0] = float4(torso.lineP, torso.lineX, torso.midHeight, 0.0f);
+		look.bands[1] = float4(torso.midP, torso.midX, 0.0f, 0.0f);
+	} else if (lineMode) {
 		// (47j) The water line height (units above the feet, 0 = none) in place of the band height; the two zones in bands 0 and 1.
 		look.params[0].w = a_state.lineHeight;
 		look.bands[0] = float4(a_state.lineP, a_state.lineX, a_state.midHeight, 0.0f);  // upper zone; z the lower zone's top
@@ -985,6 +1110,13 @@ void WetSkin::DrawSettings()
 			"(its height in the T-pose, arms counted as hanging down), so a wet line stays on the same spot of the skin or clothes while",
 			"arms and legs swing, bend or the character crouches. The current water surface stays a flat line in the world.",
 			"Rigid gear (helmets, shields), first person and creatures keep the world height. Off: 47j (world height)." });
+		ImGui::BeginDisabled(!s.PhysWaterLine || !s.PhysBodyLine);
+		ImGui::Checkbox("Physical: Water Line per Limb (bones)", &s.PhysLimbLines);
+		Tooltip({ "On (47l, needs the two switches above): each leg, each arm and the torso keep their own water line, measured along their",
+			"bones on the body itself, so it stays on the same spot of the skin on slopes, stairs and jumps, the leg further up a slope is",
+			"not wet as high as the one further down, and dipping one hand wets only that arm. The current water surface stays a flat",
+			"line in the world. Characters without a usable skeleton (creatures) keep one line by the world height. Off: 47k." });
+		ImGui::EndDisabled();
 
 		ImGui::SeparatorText("Drying");
 		ImGui::SliderFloat("Dry Time (s)", &s.PhysDryTime, 10.0f, 1800.0f, "%.0f s", ImGuiSliderFlags_Logarithmic);
@@ -1245,7 +1377,18 @@ void WetSkin::DrawStatus()
 		ImGui::Text("Player rain: %.0f um   (rain %.0f%%, open sky %.0f%%%s)", phys.rain, physicalFrame.rainIntensity * 100.0f, phys.exposure * 100.0f,
 			phys.rainRunoff > 0.05f ? ", running off" : "");
 		const std::string inWater = phys.depth > 0.0f ? std::format("   (in the water, {:.0f} units deep)", phys.depth) : std::string();
-		if (settings.PhysWaterLine && phys.lineMode) {
+		if (settings.PhysWaterLine && settings.PhysLimbLines && phys.limbMode) {
+			// (47l) The line of each limb (body units above the soles).
+			static constexpr const char* kLimbNames[Phys::kLimbs] = { "left leg", "right leg", "torso", "left arm", "right arm" };
+			std::string lines;
+			for (uint32_t i = 0; i < Phys::kLimbs; ++i) {
+				const auto& l = phys.limbs[i];
+				lines += std::format("{}{} {:.0f}", i ? ", " : "", kLimbNames[i], l.lineHeight);
+				if (l.depth > 0.0f)
+					lines += std::format(" (under water up to {:.0f})", l.depth);
+			}
+			ImGui::TextWrapped("Player water lines per limb: %s%s", lines.c_str(), inWater.c_str());
+		} else if (settings.PhysWaterLine && phys.lineMode) {
 			// (47j) The water line and the one state below it.
 			if (phys.lineHeight > phys.depth)
 				ImGui::Text("Player swim: %.0f um up to %.0f units, %.0f um up to the water line at %.0f units%s", PhysBandWater(phys.midP, phys.midX, phys.dryLaw), phys.midHeight,
@@ -1446,7 +1589,8 @@ bool WetSkin::SavePreset(const std::string& a_name)
 	j["settings"].erase("PhysBodyLine");  // (47k) A/B switches
 	j["settings"].erase("PhysBeadCap");
 	j["settings"].erase("PhysLessGrid");
-	j["settings"].erase("PhysSweat2");  // (47l) A/B switch
+	j["settings"].erase("PhysSweat2");  // (47l) A/B switches
+	j["settings"].erase("PhysLimbLines");
 	try {
 		std::ofstream o{ PresetFile(name) };
 		if (!o)
@@ -1503,6 +1647,7 @@ bool WetSkin::LoadPreset(const std::string& a_name)
 		fromPreset.PhysBeadCap = settings.PhysBeadCap;
 		fromPreset.PhysLessGrid = settings.PhysLessGrid;
 		fromPreset.PhysSweat2 = settings.PhysSweat2;  // (47l) not part of a look
+		fromPreset.PhysLimbLines = settings.PhysLimbLines;
 		MigratePhysical47i(values, json(), fromPreset);  // a preset saved before 47i: from its own droplet / drying values
 		if (fromPreset.Model > static_cast<uint32_t>(Model::Physical))
 			fromPreset.Model = static_cast<uint32_t>(Model::New);
