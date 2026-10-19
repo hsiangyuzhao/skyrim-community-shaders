@@ -2,6 +2,7 @@
 
 #include "Features/PerformanceOverlay.h"
 #include "Features/RayTracing/CasterFilter.h"
+#include "Features/VariableRateShading.h"
 #include "Globals.h"
 #include "Menu.h"
 #include "ShaderCache.h"
@@ -285,6 +286,9 @@ namespace Util
 		{
 			static void thunk(uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4)
 			{
+				// (47p) VRS for soft effects: the window ends where the engine's image space starts.
+				if constexpr (Scope == GpuScope::Imagespace)
+					globals::features::variableRateShading.EndEffectsWindow();
 				GpuPhaseScope scope(Scope);
 				func(a1, a2, a3, a4);
 			}

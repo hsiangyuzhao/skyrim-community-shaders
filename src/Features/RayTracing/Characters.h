@@ -85,6 +85,7 @@ namespace RayTracingCharacters
 		std::uint32_t skipPlacement = 0;   // skinned vertices outside the engine's bounds
 		std::uint32_t skipBackend = 0;     // refused by the backend (VRAM budget, size)
 		std::uint32_t skipShapeCap = 0;    // past kMaxShapesPerActor
+		std::uint32_t skipTinyFace = 0;    // (47p) eyes, brows, mouth left out (they cast nothing visible)
 		std::uint32_t paletteMode = 0;     // shapes whose bone indices are partition-local (palette)
 		std::uint32_t globalMode = 0;      // ... global
 		std::uint32_t dynamicShapes = 0;   // BSDynamicTriShape positions taken at capture
@@ -120,7 +121,10 @@ namespace RayTracingCharacters
 		/// (46m, always since 47m) The per-actor reads run on a few read lanes (joined before anything uses them); an
 		/// actor's 3D is scanned in full only when it may have changed (equip, a new actor) and every kRescanFrames
 		/// frames, the known shapes are checked every frame; an actor's opaque shapes are one merged BLAS.
-		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer);
+		/// (47p) a_dropTiny: tiny face parts (eyes, brows, mouth) are not traced (a change drops everything, like the first three).
+		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer, bool a_dropTiny);
+		/// (47p) Bone matrices within float noise of the last skinned ones count as a still pose (no re-skinning).
+		void SetBonesTolerant(bool a_on) { bonesTolerant_ = a_on; }
 		/// Drops everything on the next Update (loading screens, from any thread).
 		void RequestFlush() { flushRequested_.store(true); }
 		/// (46m) An actor equipped / unequipped something (any thread): its 3D is scanned in full for the next frames.
@@ -223,6 +227,8 @@ namespace RayTracingCharacters
 		bool hair_ = false;               // (45j)
 		bool firstPersonPlayer_ = false;  // (45j)
 		bool alpha_ = false;
+		bool dropTiny_ = false;  // (47p)
+		bool bonesTolerant_ = false;  // (47p) "Ray tracing: ignore bone noise"
 		std::uint32_t stillReused_ = 0;  // (45n)
 		std::uint64_t frame_ = 0;
 		std::uint32_t actorSerial_ = 0;

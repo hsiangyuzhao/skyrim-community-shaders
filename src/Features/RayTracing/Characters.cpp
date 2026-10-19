@@ -153,6 +153,48 @@ namespace RayTracingCharacters
 			return false;
 		}
 
+		/// (47p, "Ray tracing: leave out tiny parts that cast nothing") Eyes, brows and the mouth (teeth, tongue): tiny FaceGen
+		/// parts inside or on the head. The head's own shadow covers theirs, and a hit this close to the character's own surface
+		/// is ignored by the trace anyway (kCharacterSelfShadowOffset).
+		bool TinyFacePart(RE::BSGeometry* a_geometry)
+		{
+			const auto& bound = a_geometry->worldBound;
+			if (!(bound.radius > 0.0f) || bound.radius > 8.0f)
+				return false;
+			bool underFace = false;
+			int depth = 0;
+			for (RE::NiAVObject* node = a_geometry->parent; node && depth < 3; node = node->parent, ++depth) {
+				if (netimmerse_cast<RE::BSFaceGenNiNode*>(node)) {
+					underFace = true;
+					break;
+				}
+			}
+			if (!underFace)
+				return false;
+			const char* raw = a_geometry->name.c_str();
+			if (!raw)
+				return false;
+			std::string name(raw);
+			for (auto& c : name)
+				c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+			for (const char* key : { "eyes", "brow", "mouth", "teeth", "tongue" })
+				if (name.find(key) != std::string::npos)
+					return true;
+			return false;
+		}
+
+		/// (47p) Bone matrices (3x4, units relative to the actor's origin) equal within float noise: every value within
+		/// 1e-4 x max(1, |value|) of the other (rotation 1e-4, translation 0.01 units at 100 units: far below a pixel).
+		bool BonesWithinTolerance(const std::vector<float>& a_fresh, const std::vector<float>& a_skinned)
+		{
+			for (std::size_t i = 0; i < a_fresh.size(); ++i) {
+				const float reference = a_skinned[i];
+				if (!(std::abs(a_fresh[i] - reference) <= 1e-4f * std::max(1.0f, std::abs(reference))))
+					return false;
+			}
+			return true;
+		}
+
 		/// HDT-SMP / HDT-PE parts (their 3D carries the HDT extra data).
 		bool IsPhysicsPart(RE::BSGeometry* a_geometry, RE::NiAVObject* a_root)
 		{
@@ -443,10 +485,11 @@ namespace RayTracingCharacters
 		new std::vector<std::unique_ptr<Actor>>(std::move(retiring_));
 	}
 
-	void Characters::Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer)
+	void Characters::Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer, bool a_dropTiny)
 	{
-		if (a_physics != physics_ || a_hair != hair_ || a_alpha != alpha_)
+		if (a_physics != physics_ || a_hair != hair_ || a_alpha != alpha_ || a_dropTiny != dropTiny_)
 			RequestFlush();
+		dropTiny_ = a_dropTiny;  // (47p)
 		physics_ = a_physics;
 		hair_ = a_hair;
 		alpha_ = a_alpha;
@@ -634,6 +677,11 @@ namespace RayTracingCharacters
 			++(hairKind == 1 ? stats_.hairByTint : stats_.hairByName);
 		if (alphaTested && (!alpha_ || !a_backend.SkinAlphaAvailable())) {
 			++stats_.skipAlphaOff;
+			return nullptr;
+		}
+		// (47p) Tiny face parts that cast nothing visible (eyes, brows, mouth): not skinned or built at all.
+		if (dropTiny_ && !hair && TinyFacePart(a_geometry)) {
+			++stats_.skipTinyFace;
 			return nullptr;
 		}
 
@@ -1289,10 +1337,15 @@ namespace RayTracingCharacters
 				// (45n) Still pose: bit-identical to the matrices of last frame's draw (drawable then, so
 				// skinned with them or itself reused from identical ones): last frame's skinned BLAS is
 				// exact. The matrices are relative to the origin, which still moves the instance.
-				const bool still = shape->drawable && !shape->matrices.empty() && shape->fresh.size() == shape->matrices.size() &&
-				                   std::memcmp(shape->fresh.data(), shape->matrices.data(), shape->fresh.size() * sizeof(float)) == 0 &&
-				                   a_backend.IsSkinShapeReady(shape->handle);
-				shape->matrices.swap(shape->fresh);
+				// (47p) "Ray tracing: ignore bone noise": within float noise of them (BonesWithinTolerance) counts as still too; the matrices kept are
+				// then the ones last skinned (never the drifting fresh ones), so noise can not add up to a visible shift.
+				const bool comparable = shape->drawable && !shape->matrices.empty() && shape->fresh.size() == shape->matrices.size() &&
+				                        a_backend.IsSkinShapeReady(shape->handle);
+				const bool still = comparable &&
+				                   (std::memcmp(shape->fresh.data(), shape->matrices.data(), shape->fresh.size() * sizeof(float)) == 0 ||
+									   (bonesTolerant_ && BonesWithinTolerance(shape->fresh, shape->matrices)));
+				if (!still)
+					shape->matrices.swap(shape->fresh);
 				std::copy_n(actor->origin, 3, shape->origin);
 				if (still) {
 					shape->reuse = true;

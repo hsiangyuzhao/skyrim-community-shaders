@@ -34,14 +34,10 @@ namespace PerfOptions
 		bool HairLightSkip = true;      ///< 2c: hair self-shadow / Marschner skipped for lights with no effect; tangent shift read once
 		bool SssTransmitSkip = true;    ///< 2d: skin transmittance skipped where its strength (sssParams.w) is 0
 		bool SsplsDistanceGate = true;  ///< 2e: the SSPLS light pre-pass only within its Max Distance
-		bool RtSkinBatch = true;        ///< 6a: one skinning dispatch per character (all its parts) instead of one per part
 		bool RtDropTinyParts = true;    ///< 6b: eyes, teeth, brows and similar tiny parts that cast nothing stay out of the BLAS
 		bool RtBonesTolerant = true;    ///< 6c: "bones unchanged" ignores float noise far below a visible shift
 		bool RtaoNormalFold = true;     ///< 7: RTAO Smooth Normals prep skipped where its result is not used
-		bool SsgiSkipUnderRtao = true;  ///< 8: SSGI's own AO not traced where RTAO replaces it completely
-		bool SssTileLimit = true;       ///< 9: Screen Space Shadows only in screen tiles that hold a non-RT caster (RT on)
 		bool WaterPrepGate = true;      ///< 10: RT water prep only when a traced point light can reach the water drawn
-		bool PostFuseGrading = true;    ///< 11a: colour grading writes the final image directly (no extra full-screen copy)
 		// ---- A: small visible trade ----
 		bool HairSsplsSkip = false;       ///< 2f: no SSPLS on hair in the forward / blended pass
 		bool SmallCasterCull = false;     ///< 3: far sun cascade: small, far objects cast no shadow (characters always do)

@@ -786,6 +786,13 @@ private:
 	bool waterDistValid = false;              // the distance texture holds a prep (cleared when none ran last frame)
 	bool waterTraced = false;                 // this frame's point trace traced from the water (t42 / t43 bound)
 	bool waterLodSkip = false;                // (47l) distant LOD water draws do not ask for the prep this frame (out of every source's reach)
+	// (47p, "Ray tracing: water prep only when a lamp can reach water") This frame's traced sources (world xyz, reach radius) and the
+	// water drawn (world bounds); the prep runs when one reaches the other (1024 units of margin) on this frame or the last.
+	std::vector<std::array<double, 4>> waterGateLights;
+	std::vector<RE::NiBound> waterGateBounds;
+	uint32_t waterGateBoundsFrame = UINT32_MAX;
+	bool waterGateReachLast = true;
+	uint32_t waterGateSkips = 0;  // preps left out (session)
 	float waterInvViewProj[16]{};             // this frame's (the trace's) inverse view-projection
 	uint32_t waterRenderWidth = 0, waterRenderHeight = 0;
 	winrt::com_ptr<ID3D11Texture2D> waterDepthCopy;

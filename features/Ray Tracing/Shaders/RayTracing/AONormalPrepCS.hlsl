@@ -31,6 +31,8 @@ cbuffer AONormalCB : register(b0)
 	float4 CameraDelta;                  // xyz: this camera minus last frame's camera (world units), w unused
 	float4 RenderSize;                   // xy size, zw 1 / size (the same this frame and last)
 	uint4 Flags;                         // (47k) x 1 = v2; y debug view (0 none, 1 confidence, 2 Ns, 3 Ng)
+	float4 SkipRect;                     // (47p) the trace's rect (camera-relative xy min / max)
+	float4 SkipFade;                     // (47p) x: the trace's fade end (units), y: 1 = skip the pixels the trace never reads
 };
 
 Texture2D<float> Depth : register(t0);         // this frame's depth (after the prepass)
@@ -165,6 +167,15 @@ float3 RingSmoothedNormal(int2 p, float3 P, float3 Ng, float footprint)
 	{
 		const float3 P = PositionAtPixel(p, depth);
 		const float dist = length(P);
+		// (47p) The trace reads this only where its weight is above 0 (inside its rect, nearer than its fade end): elsewhere "no
+		// smooth normal", as for the sky. 64 units / 1 % of margin cover the two passes' float differences.
+		const bool unused = SkipFade.y > 0.0 && debugView == 0u &&
+		                    (dist >= SkipFade.x * 1.01 + 64.0 || P.x < SkipRect.x - 64.0 || P.y < SkipRect.y - 64.0 || P.x > SkipRect.z + 64.0 || P.y > SkipRect.w + 64.0);
+		[branch] if (unused)
+		{
+			Output[p] = 0.0;
+			return;
+		}
 		// This frame's depth normal, exactly as TraceAOCS builds Ng (per axis the neighbour with the smaller depth step).
 		const int2 maxP = int2(RenderSize.xy) - 1;
 		const int2 pl = int2(max(p.x - 1, 0), p.y), pr = int2(min(p.x + 1, maxP.x), p.y);

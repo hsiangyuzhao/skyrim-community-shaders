@@ -34,9 +34,6 @@ namespace PerfOptions
 			{ &Settings::SsplsDistanceGate, "SsplsDistanceGate", "Lamp contact shadows: skip the pre-pass beyond their distance", false,
 				"Screen Space Point Light Shadows: the per-pixel light ranking is skipped beyond SSPLS's Max Distance, where no\n"
 				"contact shadow is drawn anyway. No visible change." },
-			{ &Settings::RtSkinBatch, "RtSkinBatch", "Ray tracing: one skinning batch per character", false,
-				"Ray Tracing: the character parts are skinned for the ray tracer in one GPU batch per character instead of one per\n"
-				"part (fewer, larger GPU jobs). Same result. Only while Ray Tracing is on." },
 			{ &Settings::RtDropTinyParts, "RtDropTinyParts", "Ray tracing: leave out tiny parts that cast nothing", false,
 				"Ray Tracing: eyes, teeth, mouth, eyebrows and similar tiny parts inside the head are not skinned or built for the\n"
 				"ray tracer when they could not cast a visible shadow. Only while Ray Tracing is on." },
@@ -46,18 +43,9 @@ namespace PerfOptions
 			{ &Settings::RtaoNormalFold, "RtaoNormalFold", "RTAO: skip the normal prep where it is not used", false,
 				"RTAO Smooth Normals: the normal-prep pass is skipped for pixels the AO does not trace (sky, beyond the RTAO\n"
 				"distance). Same result. Only while RTAO is on." },
-			{ &Settings::SsgiSkipUnderRtao, "SsgiSkipUnderRtao", "SSGI: skip its AO where RTAO replaces it", false,
-				"RTAO mode \"RTAO (keeps SSGI contact AO)\": SSGI's own AO is not traced where RTAO fully replaces it (every pixel\n"
-				"inside the RTAO distance). Same result. Only while RTAO is on." },
-			{ &Settings::SssTileLimit, "SssTileLimit", "Screen Space Shadows: only where a non-RT caster is", false,
-				"With Ray Tracing on, Screen Space Shadows only fill in for casters the ray tracer does not have. Screen tiles\n"
-				"without such a caster skip the ray march. Same result. Only while Ray Tracing is on." },
 			{ &Settings::WaterPrepGate, "WaterPrepGate", "Ray tracing: water prep only when a lamp can reach water", false,
 				"Point Light Shadows on Water: the water prep pass is skipped on frames where no traced point light reaches any\n"
 				"water drawn. Same result. Only while RT point lights are on." },
-			{ &Settings::PostFuseGrading, "PostFuseGrading", "Post processing: one less full-screen copy", false,
-				"Colour grading writes straight into the final image instead of into a copy that is then copied again.\n"
-				"Same result." },
 			{ &Settings::HairSsplsSkip, "HairSsplsSkip", "Hair: no lamp contact shadows in the hair's blended pass", true,
 				"Screen Space Point Light Shadows are not marched again for hair in the blended (transparent) pass. Hair keeps\n"
 				"its lamp shadows from the shadow maps / ray tracing; only the tiny contact shadows inside the hair go.\n"

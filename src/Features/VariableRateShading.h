@@ -100,10 +100,13 @@ struct VariableRateShading : Feature
 	/// @brief Deferred::EndDeferred, after the deferred composite: per-tile analysis for the next frame.
 	void AnalyzeFrame();
 
+	/// @brief (47p) The engine's image space starts (GpuPhaseTimeline): the soft-effects window ends (VRS off, image unbound).
+	void EndEffectsWindow();
+
 	/// @brief State::Draw, i.e. once per engine draw: selects the rate table for this draw.
 	inline void OnDraw()
 	{
-		if (!opaqueWindow && appliedTable == Table::Off)
+		if (!opaqueWindow && !effectsWindow && appliedTable == Table::Off)
 			return;
 		UpdateDrawState();
 	}
@@ -114,11 +117,13 @@ private:
 		Off,
 		Full,         // opaque draws: the rate image as built
 		AlphaTested,  // cut-out grass: same image, capped at 2x2 so edges do not get 4 px steps
+		Effects,      // (47p) soft blended effects: 2x2 everywhere
 	};
 
 	bool IsActive() const;
 	void UpdateDrawState();
 	Table ClassifyDraw() const;
+	Table ClassifyEffectDraw() const;  // (47p)
 	static bool IsAlphaBlendedDraw();
 	void ApplyTable(Table a_table);
 	void DisableForSession(std::string a_reason);
@@ -171,6 +176,7 @@ private:
 	uint32_t lastAnalysisRenderSize[2] = {};
 
 	bool opaqueWindow = false;  // between BeginOpaquePass and EndOpaquePass with the image bound
+	bool effectsWindow = false;  // (47p) from EndOpaquePass to the engine's image space: soft effects at 2x2
 	bool imageBound = false;
 	Table appliedTable = Table::Off;
 };

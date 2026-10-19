@@ -897,6 +897,17 @@ void PostProcessing::PreProcess()
 	const bool singleCopy = blendReadMatches >= 3 && frame >= singleCopyBlockedUntil;
 	singleCopyUsed = singleCopy;
 	lastWrittenMain = gameTexMain.texture;
+	// (47p) Which write-back the frame took, in the log whenever it changes (the next trace / F12 then tells what PP Final Copy holds).
+	{
+		static std::string lastPath;
+		static int pathLogs = 0;
+		const std::string path = std::format("{}; second buffer {}", directOutputStatus, singleCopy ? "not written (single copy)" : "written");
+		if (path != lastPath && pathLogs < 50) {
+			++pathLogs;
+			lastPath = path;
+			logger::info("[Post Processing] (47p) Final write-back: {}", path);
+		}
+	}
 
 	auto* timers = Util::GpuPassTimers::GetSingleton();
 	timers->End(Util::GpuBucket::PostProcessing);

@@ -6,6 +6,7 @@
 #include "State.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/Nvapi.h"
+#include "Utils/PerfOptions.h"
 
 // NVAPI is only used for its types; every entry point is resolved at runtime through the
 // driver's nvapi_QueryInterface (Utils/Nvapi), so nothing is linked and a machine without an
@@ -90,6 +91,14 @@ namespace
 
 	/// Alpha-tested draws: the same image capped at 2x2. A discard in a coarse pixel removes the
 	/// whole block, so a 4-pixel step on a leaf or grass edge is far more visible than on a wall.
+	// (47p, A) "Variable Rate Shading also for soft effects": every soft effect draw at 2x2, whatever the tile's rate.
+	constexpr NV_PIXEL_SHADING_RATE kEffectsTable[NV_MAX_PIXEL_SHADING_RATES] = {
+		NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS,
+		NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS,
+		NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS,
+		NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS, NV_PIXEL_X1_PER_2X2_RASTER_PIXELS
+	};
+
 	constexpr NV_PIXEL_SHADING_RATE kAlphaTestedTable[NV_MAX_PIXEL_SHADING_RATES] = {
 		NV_PIXEL_X1_PER_RASTER_PIXEL,
 		NV_PIXEL_X1_PER_1X2_RASTER_PIXELS,
@@ -455,10 +464,43 @@ void VariableRateShading::EndOpaquePass()
 	opaqueWindow = false;
 	if (appliedTable != Table::Off)
 		ApplyTable(Table::Off);
+	// (47p, A) The blended pass's soft effects: the rate image stays bound (its values do not matter for kEffectsTable) until
+	// EndEffectsWindow (the engine's image space starts) or Present.
+	if (imageBound && hardwareSupported && PerfOptions::settings.VrsEffects && IsActive()) {
+		effectsWindow = true;
+		return;
+	}
+	EndEffectsWindow();
+}
+
+void VariableRateShading::EndEffectsWindow()
+{
+	effectsWindow = false;
+	if (appliedTable != Table::Off)
+		ApplyTable(Table::Off);
 	if (imageBound) {
 		GetNvapi().setView(globals::d3d::context, nullptr);
 		imageBound = false;
 	}
+}
+
+VariableRateShading::Table VariableRateShading::ClassifyEffectDraw() const
+{
+	// (47p) Soft (depth-faded) blended effects only: smoke, mist, steam, glows. Never cut-outs (alpha test), membranes (shield
+	// / spell outlines), blood or decals, sky objects, deferred effects, reflections; hair is a Lighting draw and never gets here.
+	const auto* state = globals::state;
+	const auto* shader = state->currentShader;
+	if (!shader || shader->shaderType.get() != RE::BSShader::Type::Effect)
+		return Table::Off;
+	if (state->permutationData.ExtraShaderDescriptor & static_cast<uint32_t>(State::ExtraShaderDescriptors::IsReflections))
+		return Table::Off;
+	using F = SIE::ShaderCache::EffectShaderFlags;
+	const uint32_t flags = state->currentPixelDescriptor;
+	constexpr uint32_t excluded = static_cast<uint32_t>(F::AlphaTest) | static_cast<uint32_t>(F::Membrane) | static_cast<uint32_t>(F::Blood) |
+	                              static_cast<uint32_t>(F::MultBlendDecal) | static_cast<uint32_t>(F::SkyObject) | static_cast<uint32_t>(F::Deferred);
+	if (!(flags & static_cast<uint32_t>(F::Soft)) || (flags & excluded) || !IsAlphaBlendedDraw())
+		return Table::Off;
+	return Table::Effects;
 }
 
 VariableRateShading::Table VariableRateShading::ClassifyDraw() const
@@ -532,7 +574,7 @@ bool VariableRateShading::IsAlphaBlendedDraw()
 
 void VariableRateShading::UpdateDrawState()
 {
-	const Table wanted = opaqueWindow ? ClassifyDraw() : Table::Off;
+	const Table wanted = opaqueWindow ? ClassifyDraw() : (effectsWindow ? ClassifyEffectDraw() : Table::Off);
 	if (wanted != appliedTable)
 		ApplyTable(wanted);
 }
@@ -547,7 +589,7 @@ void VariableRateShading::ApplyTable(Table a_table)
 
 	NV_D3D11_VIEWPORT_SHADING_RATE_DESC viewport{};
 	viewport.enableVariablePixelShadingRate = a_table != Table::Off;
-	const auto& table = a_table == Table::AlphaTested ? kAlphaTestedTable : kFullTable;
+	const auto& table = a_table == Table::AlphaTested ? kAlphaTestedTable : (a_table == Table::Effects ? kEffectsTable : kFullTable);
 	std::copy(std::begin(table), std::end(table), std::begin(viewport.shadingRateTable));
 
 	NV_D3D11_VIEWPORTS_SHADING_RATE_DESC desc{};
@@ -579,6 +621,7 @@ void VariableRateShading::DisableForSession(std::string a_reason)
 	appliedTable = Table::Off;
 	imageBound = false;
 	opaqueWindow = false;
+	effectsWindow = false;
 }
 
 void VariableRateShading::AnalyzeFrame()
@@ -664,8 +707,10 @@ void VariableRateShading::Reset()
 {
 	// Present: nothing of the engine frame is left to draw, and the UI is about to be. The
 	// NVAPI rate state survives even ID3D11DeviceContext::ClearState, so never leave it on.
-	if (opaqueWindow || imageBound || appliedTable != Table::Off)
-		EndOpaquePass();
+	if (opaqueWindow || effectsWindow || imageBound || appliedTable != Table::Off) {
+		opaqueWindow = false;
+		EndEffectsWindow();  // (47p) also the effects window: never past Present
+	}
 	ReadBackRateCounts();
 	frameIndex++;
 }

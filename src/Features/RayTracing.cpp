@@ -9,6 +9,8 @@
 #include "Features/Upscaling.h"
 #include "State.h"
 #include "Utils/FrameTrace.h"
+#include "Utils/PerfOptions.h"
+#include "Utils/Batch39Engine.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/LightCensus.h"
 
@@ -294,6 +296,10 @@ namespace
 		float RenderSize[4];
 		// (47k) x: 1 = Smooth Normals v2; y: debug view written to u1 (0 none, 1 confidence, 2 Ns, 3 Ng); zw unused.
 		std::uint32_t Flags[4];
+		// (47p) "RTAO: skip the normal prep where it is not used": the trace's rect (camera-relative xy min / max) and x = the distance
+		// where its weight reaches 0, y = 1 to skip the pixels the trace never reads (outside the rect / beyond x, with a margin).
+		float SkipRect[4];
+		float SkipFade[4];
 	};
 
 	// (46c) BSShadowFrustumLight / BSShadowParabolicLight::RenderShadowmaps (vfunc 0x0A): Ray Tracing may skip the shadow
@@ -1106,7 +1112,8 @@ void RayTracing::UpdateCharacters()
 	// (45j) Alpha-tested parts (fur trims, cut-out cloth; hair when Hair is ray traced) whenever the
 	// alpha pipeline exists; a change of the first three re-captures the characters.
 	// (46m) Read lanes, scan cache and merged BLASes are always on (47m).
-	characters.Configure(settings.PhysicsParts, settings.Hair, backend.SkinAlphaAvailable(), settings.FirstPersonPlayer);
+	characters.Configure(settings.PhysicsParts, settings.Hair, backend.SkinAlphaAvailable(), settings.FirstPersonPlayer, PerfOptions::settings.RtDropTinyParts);
+	characters.SetBonesTolerant(PerfOptions::settings.RtBonesTolerant);  // (47p)
 }
 
 
@@ -3855,11 +3862,50 @@ void RayTracing::OnDrawStatesApplied(ID3D11DeviceContext* a_context)
 		if (waterEndDeferredFrame == frame && !lodOnly) {
 			waterSeenFrame = frame;
 			waterPrepPending = true;
+			// (47p) The water's bound for the prep gate.
+			if (waterGateBoundsFrame != frame) {
+				waterGateBoundsFrame = frame;
+				waterGateBounds.clear();
+			}
+			if (const auto* pass = Batch39Engine::CurrentPass(); pass && pass->geometry && waterGateBounds.size() < 256)
+				waterGateBounds.push_back(pass->geometry->worldBound);
+			else
+				waterGateBounds.push_back(RE::NiBound{ {}, -1.0f });  // unknown: always reachable
 		}
 		return;
 	}
 	if (waterPrepPending && waterSeenFrame == frame) {
 		waterPrepPending = false;
+		// (47p) Skipped while no traced point light reaches any water drawn, this frame or the last (the next frame then traces
+		// nothing from the water: exactly what it would trace when no light reaches it).
+		if (PerfOptions::settings.WaterPrepGate) {
+			bool reach = false;
+			constexpr double kMargin = 1024.0;
+			for (const auto& b : waterGateBounds) {
+				if (!(b.radius >= 0.0f)) {
+					reach = true;
+					break;
+				}
+				for (const auto& l : waterGateLights) {
+					const double dx = l[0] - b.center.x, dy = l[1] - b.center.y, dz = l[2] - b.center.z;
+					const double r = l[3] + static_cast<double>(b.radius) + kMargin;
+					if (dx * dx + dy * dy + dz * dz <= r * r) {
+						reach = true;
+						break;
+					}
+				}
+				if (reach)
+					break;
+			}
+			const bool skip = !reach && !waterGateReachLast;
+			waterGateReachLast = reach;
+			if (skip) {
+				++waterGateSkips;
+				return;
+			}
+		} else {
+			waterGateReachLast = true;
+		}
 		PrepWaterDistance(a_context);
 	}
 }
@@ -4010,6 +4056,12 @@ bool RayTracing::RunAONormalPrep(ID3D11DeviceContext* a_context, ID3D11ShaderRes
 	const bool writeDebug = normalView && aoNormalDebug.uav;
 	cb.Flags[0] = 1u;  // (47n) v2 always
 	cb.Flags[1] = writeDebug ? static_cast<std::uint32_t>(normalView) : 0u;
+	// (47p) Pixels the trace does not read (its weight is 0 there: outside its rect or beyond the fade end) keep "no smooth normal".
+	if (PerfOptions::settings.RtaoNormalFold && !writeDebug) {
+		std::copy_n(aoInput.constants.rect, 4, cb.SkipRect);
+		cb.SkipFade[0] = aoInput.constants.fade[1];
+		cb.SkipFade[1] = 1.0f;
+	}
 	aoNormalCB->Update(cb);
 	// (47l) F7 rtao_normal_prep_gpu_ms: its own GPU bucket. Buckets do not nest and both callers (RunFrame, RunInteriorFrame) are
 	// inside the Ray Tracing bucket's scope: that interval pauses around this one (a bucket may hold several intervals a frame).
@@ -4101,6 +4153,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 {
 	pointK = 0;
 	waterTraced = false;  // (47i)
+	waterGateLights.clear();  // (47p)
 	if (!PointLightsOn() || !backend.PointAvailable())  // (47n) no MaskTemp needed (the sun may be "Off")
 		return false;
 	// (46c) Sized to the render area (2560x1440 behind DLSS Quality at 4K), not to the shadow mask (the output size): the
@@ -4163,6 +4216,12 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	std::memcpy(viewProjF, &viewProj, sizeof(viewProjF));
 	const std::uint32_t scan = pointSelector.Select(config, camera, viewProjF, worldRect, globals::state->frameCount, pointSources.data());
 	lastSlotBeams = pointSelector.SlotBeams();  // (46g) the warm-up report reads the counters of these slots a few frames later
+	// (47p) The water prep gate's sources (world position, reach).
+	waterGateLights.clear();
+	for (std::uint32_t s = 0; s < scan && s < pointSources.size(); ++s) {
+		const auto& p = pointSources[s].posRadius;
+		waterGateLights.push_back({ p[0] + a_camX, p[1] + a_camY, p[2] + a_camZ, static_cast<double>(std::max(p[3], 0.0f)) });
+	}
 	pointEmitterMask = pointSelector.EmitterSlots();  // (46x)
 	pointEmitterRadius = config.directEmitter;
 	if (scan == 0)
