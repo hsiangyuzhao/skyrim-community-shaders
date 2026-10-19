@@ -168,12 +168,11 @@ namespace RayTracingRT
 	};
 	static_assert(sizeof(WindVertex) == 16);
 
+	// (47n) One engine mesh's rest vertices and indices (a wind source, shared by the instances of that mesh).
 	struct WindGeometry
 	{
 		std::vector<WindVertex> vertices;
 		std::vector<std::uint32_t> indices;  // the frozen mesh's, in its order
-		float amplitude = 0.0f;              // TreeParams.z
-		float frequency = 0.0f;              // TreeParams.w (leaf frequency)
 		bool opaque = true;                  // false: an alpha-tested mesh (non-opaque geometry)
 		[[nodiscard]] std::uint32_t Triangles() const { return static_cast<std::uint32_t>(indices.size() / 3); }
 		[[nodiscard]] std::uint32_t Vertices() const { return static_cast<std::uint32_t>(vertices.size()); }
@@ -181,7 +180,9 @@ namespace RayTracingRT
 
 	struct WindStats
 	{
-		std::uint32_t meshes = 0;                 // live wind BLASes
+		std::uint32_t meshes = 0;                 // live wind BLASes ((47n) one per swaying instance)
+		std::uint32_t sources = 0;                // (47n) live wind sources (engine meshes uploaded once, shared by their instances)
+		std::uint64_t sourceBytes = 0;            // (47n) their rest + index buffers (inside bytes)
 		std::uint32_t pending = 0;                // not uploaded or not built yet
 		std::uint64_t vertices = 0;               // of the live meshes
 		std::uint64_t triangles = 0;
@@ -352,11 +353,6 @@ namespace RayTracingRT
 		bool sun = true;
 		// (46f) RTAO: recorded in its own list, submitted after the trace list, signalling the second fence (null = none).
 		const AOInput* ao = nullptr;
-		// (47l) Foliage sway: this frame's wind (BSTreeManager, or the shaders' last values extrapolated). false = no refit this
-		// frame (the wind BLASes keep their last pose); new wind meshes are still built (mean pose).
-		bool windValid = false;
-		float windMagnitude = 0.0f;  // TreeParams.y
-		float windTimer = 0.0f;      // WindTimers.x (Lighting) = TreeParams.x (shadow map)
 	};
 
 	/// (45k) Where the CPU time of the last ExecuteFrame went, call by call (ms). The sum of these
@@ -729,10 +725,19 @@ namespace RayTracingRT
 		// (47l) Foliage sway (BackendWind.cpp). Its pipeline is created with the others; everything else on first use only.
 		/// The posing shader exists and nothing of the wind path failed.
 		[[nodiscard]] bool WindAvailable() const { return ready_ && !failed_ && windPipeline_ && windFault_.empty(); }
-		/// Takes the geometry; a BlasHandle in the Queued state, built (mean pose) over the next frames, then refit every frame the
-		/// wind moves (FrameInput::windValid). ReleaseBlas releases it like any BLAS. kInvalidBlas when refused (counted).
-		BlasHandle CreateWindBlas(std::unique_ptr<WindGeometry> a_geometry);
-		[[nodiscard]] bool WindIdle() const { return windLive_ == 0; }
+		/// (47n) A wind source: one tree-animated engine mesh (rest vertices, indices), uploaded once and shared by its instances.
+		/// Returns its index (the caller holds one reference: ReleaseWindSource), UINT32_MAX when refused (counted).
+		std::uint32_t CreateWindSource(std::unique_ptr<WindGeometry> a_geometry);
+		/// (47n) Drops the caller's reference; the source goes (behind the fence) once no instance uses it either.
+		void ReleaseWindSource(std::uint32_t a_source);
+		/// (47n) One instance's wind BLAS over a source (its own posed vertices and BLAS): a BlasHandle in the Queued state, built at the
+		/// mean pose of a_amplitude over the next frames, then refit whenever its pose (SetWindPose) changes. ReleaseBlas releases it
+		/// like any BLAS. kInvalidBlas when refused (counted).
+		BlasHandle CreateWindBlas(std::uint32_t a_source, float a_amplitude);
+		/// (47n) This frame's pose of a wind BLAS: the vertex shader's TreeParams.y (wind magnitude), .z (amplitude), .w (leaf frequency)
+		/// and WindTimers.x, as the engine's BSLightingShader::SetupGeometry computes them for that instance.
+		void SetWindPose(BlasHandle a_handle, float a_magnitude, float a_amplitude, float a_frequency, float a_timer);
+		[[nodiscard]] bool WindIdle() const { return windLive_ == 0 && windSourcesLive_ == 0; }
 		/// The wind scratch buffer (only when WindIdle()).
 		void ReleaseWindResources();
 		[[nodiscard]] const std::string& WindFault() const { return windFault_; }
@@ -914,32 +919,54 @@ namespace RayTracingRT
 		static constexpr std::uint32_t kWindMaxTriangles = 131072;
 		static constexpr std::uint32_t kWindUploadsPerFrame = 32;          // new meshes uploaded per submission (a CPU budget bounds it too)
 		static constexpr std::uint32_t kWindUploadVerticesPerFrame = 300000;
-		static constexpr std::uint32_t kWindBuildsPerFrame = 8;            // first builds per frame while playing (refits are never capped)
+		static constexpr std::uint32_t kWindBuildsPerFrame = 12;           // first builds per frame while playing (refits are never capped)
 		static constexpr std::uint32_t kWindBuildsLoading = 48;            // ... behind loading screens (BuildOnly)
 		static constexpr float kWindUploadCpuMs = 0.5f;                    // render-thread CPU for new meshes per frame while playing
+		// (47n) A wind source (one engine mesh): rest + index buffers, refs = the scene's reference + one per instance.
+		struct WindSource
+		{
+			bool live = false;
+			bool uploaded = false;
+			std::unique_ptr<WindGeometry> geometry;  // until uploaded
+			ArenaAlloc rest, index;                  // skinStaticPool_
+			std::uint64_t restBytes = 0, indexBytes = 0;
+			std::uint32_t vertices = 0, triangles = 0;
+			bool opaque = true;
+			std::uint32_t refs = 0;
+			float boundsMin[3]{}, boundsMax[3]{};    // rest positions (the instances' self-check box grows by their sway)
+			[[nodiscard]] std::uint64_t Bytes() const { return restBytes + indexBytes; }
+		};
+		// (47n) A wind instance: its posed vertices and BLAS over a source, its pose this frame and the pose it was last refit to.
 		struct WindMesh
 		{
 			bool live = false;
-			bool uploaded = false;  // rest + index copied, ranges allocated
-			bool built = false;     // first build recorded
+			bool allocated = false;  // output + BLAS ranges taken (on its first build)
+			bool built = false;      // first build recorded
 			BlasHandle handle = kInvalidBlas;
-			std::unique_ptr<WindGeometry> geometry;  // until uploaded
-			ArenaAlloc rest, index, output, blas;    // skinStaticPool_ (rest, index), skinOutputPool_ (posed), asPool_ (BLAS)
-			std::uint64_t restBytes = 0, indexBytes = 0, outputBytes = 0, blasBytes = 0;
+			std::uint32_t source = UINT32_MAX;
+			ArenaAlloc output, blas;  // skinOutputPool_ (posed), asPool_ (BLAS)
+			std::uint64_t outputBytes = 0, blasBytes = 0;
 			std::uint64_t buildScratch = 0, updateScratch = 0;
 			std::uint32_t vertices = 0, triangles = 0;
-			float amplitude = 0.0f, frequency = 0.0f;
 			bool opaque = true;
-			bool posed = false;       // refit to a timer pose at least once (else: the mean pose of the first build)
-			double posedPhase = 0.0;  // magnitude x timer of that pose (the skip test of a still wind)
-			[[nodiscard]] std::uint64_t Bytes() const { return restBytes + indexBytes + outputBytes + blasBytes; }
+			float meanAmplitude = 0.0f;  // the first build's pose (0.55 x this x alpha along the normal)
+			bool hasPose = false;        // SetWindPose called
+			float pose[4]{};             // magnitude, amplitude, frequency, timer
+			bool posed = false;          // refit to a pose at least once
+			float posedPose[4]{};        // the pose of the last refit (refit again only when it changes)
+			[[nodiscard]] std::uint64_t Bytes() const { return outputBytes + blasBytes; }
 		};
+		std::vector<WindSource> windSources_;
+		std::vector<std::uint32_t> freeWindSources_;
+		std::uint32_t windSourcesLive_ = 0;
+		void FreeWindSource(std::uint32_t a_source);
 		bool CreateWindPipeline();
 		void SetWindFault(std::string a_reason);
 		/// Frees a wind mesh's ranges (behind the fence) and forgets it (from ReleaseBlas).
 		void ReleaseWindMesh(std::uint32_t a_index);
 		void UploadWindMeshes(ID3D12GraphicsCommandList4* a_list, float a_cpuMs);
-		/// Uploads, first builds (mean pose, up to a_maxBuilds) and this frame's refits (a_input.windValid). Inside the prep interval.
+		/// Uploads, first builds (mean pose, up to a_maxBuilds) and this frame's refits (a_input non-null: every instance whose pose
+		/// changed since its last refit). Inside the prep interval.
 		void RecordWind(ID3D12GraphicsCommandList4* a_list, const FrameInput* a_input, std::uint32_t a_maxBuilds, float a_uploadCpuMs);
 		/// Wind meshes still to upload or to build (BuildOnly has work).
 		[[nodiscard]] bool WindWorkDue() const;
@@ -947,7 +974,7 @@ namespace RayTracingRT
 		ComPtr<ID3D12PipelineState> windPipeline_;  // WindFoliageCS
 		std::vector<WindMesh> winds_;
 		std::vector<std::uint32_t> freeWinds_;
-		std::deque<std::uint32_t> windUploadQueue_;
+		std::deque<std::uint32_t> windUploadQueue_;  // (47n) sources
 		ComPtr<ID3D12Resource> windScratch_;
 		std::uint64_t windScratchBytes_ = 0;
 		std::uint32_t windLive_ = 0;

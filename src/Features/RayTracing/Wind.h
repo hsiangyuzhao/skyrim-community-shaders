@@ -1,91 +1,80 @@
 #pragma once
 
-#include <algorithm>
-#include <cmath>
 #include <cstdint>
-#include <mutex>
 
 namespace RE
 {
 	class BSGeometry;
 	class BSRenderPass;
+	class NiNode;
 }
 
 /**
- * @brief (47l) Foliage sway: the wind inputs of the game's tree animation, for the ray tracer's wind BLASes.
+ * @brief (47l, 47n) Foliage sway: the wind inputs of the game's tree animation, for the ray tracer's wind BLASes.
  *
- * Per shape: its leaf amplitude / frequency (TreeParams.z / .w of the Lighting vertex shader), read from the vertex shader's
- * per-geometry constants right after BSLightingShader::SetupGeometry wrote them (Light Limit Fix's hook calls OnSetupGeometry),
- * once for every shape the scene asked for (Request) and again now and then (spot checks), never on every draw: a tree-animated
- * draw costs a flag test and one hash-map lookup. Per frame: the wind magnitude and the tree timer (TreeParams.y, WindTimers.x)
- * from BSTreeManager at the frame start, as long as the shaders' own values (compared on every sample) agree with it; otherwise
- * the shaders' last values extrapolated by one frame (WindTimers.x + (x - y)).
+ * (47n) Per plant, exactly as BSLightingShader::SetupGeometry (SE 1.5.97 0x1412F4FD0) computes the Lighting vertex shader's
+ * TreeParams / WindTimers for a draw: the node is the shader property's fade node when it is a BSLeafAnimNode / BSTreeNode
+ * (BSFadeNode::AsLeafAnimNode), and
+ *   TreeParams.x = 0
+ *   TreeParams.y = *(float*)(*(void**)ID 513211 + 0x304)                                   (the same for every plant)
+ *   TreeParams.z = the node's amplitude (+0x15C) faded by its distance d = sqrt(+0x158) between ID 513234 / 513235:
+ *                  f = (1 - (d - start) / (end - start)) x amplitude; z = amplitude >= max(f, 0) ? max(f, 0) : amplitude
+ *                  (the engine's one-step reciprocal square root, bit for bit; a negative amplitude is used as it is)
+ *   TreeParams.w = the node's leaf frequency (+0x160)
+ *   WindTimers.x = 6 x the node's timer (+0x164)
+ * and without such a node (0, y, min(1, ...) with distance 0, 1) and timer 0. BSTreeManager::Update advances the node's timer /
+ * amplitude / distance once per frame on the main thread before the frame is drawn, so the values read at Early Prep are the ones
+ * the frame's draws get (one diagnostic line in the log compares them with the vertex shader's constants).
  *
- * Diagnostics (log, once per engine mesh, capped): the sampled constants against BSTreeManager's values and the TREE form's leaf
- * amplitude / frequency, and whether a second copy of the mesh (at another distance) has the same parameters.
- *
- * Render / main thread only (SE draws on the main thread); the hook never blocks (try-lock).
+ * Render / main thread only (SE draws on the main thread); the SetupGeometry hook never blocks (try-lock).
  */
 namespace RayTracingWind
 {
-	/// Amplitude / frequency as a wind mesh key: shapes within 1/4096 of each other share a wind BLAS.
-	[[nodiscard]] inline std::int32_t Quantize(float a_value)
+	/// This frame's values every plant shares (Early Prep).
+	struct Globals
 	{
-		return std::isfinite(a_value) ? static_cast<std::int32_t>(std::lround(std::clamp(a_value, -100000.0f, 100000.0f) * 4096.0f)) : 0;
-	}
-
-	/// One sample of a tree-animated shape's vertex-shader constants.
-	struct Params
-	{
-		float treeParams[4]{};       // x (the shadow map's timer), y wind magnitude, z amplitude, w leaf frequency
-		float windTimers[2]{};       // x this frame's timer, y last frame's
-		std::uint32_t frame = 0;     // when it was sampled
-		std::uint32_t samples = 0;   // 0 = not sampled yet
+		bool valid = false;
+		float magnitude = 0.0f;   // TreeParams.y
+		float fadeStart = 0.0f;   // ID 513234
+		float fadeEnd = 0.0f;     // ID 513235
 	};
-
-	/// This frame's wind for the RT frame input.
-	struct FrameWind
+	/// One plant's pose, as the vertex shader gets it (TreeParams.y / .z / .w, WindTimers.x).
+	struct Pose
 	{
-		bool valid = false;        // false: no refit this frame (the wind BLASes keep their pose)
 		float magnitude = 0.0f;
+		float amplitude = 0.0f;
+		float frequency = 1.0f;
 		float timer = 0.0f;
-		bool fromManager = false;  // BSTreeManager (else the shaders' values extrapolated)
 	};
 
 	struct Stats
 	{
-		std::uint32_t requested = 0;        // shapes waiting for / holding samples
-		std::uint32_t sampled = 0;          // ... of which sampled at least once
-		std::uint64_t samplesTotal = 0;     // constant reads (new shapes, spot checks, the fallback's per-frame sample)
-		std::uint64_t readFailures = 0;     // reads refused (no constants, implausible values, fault)
-		std::uint64_t managerMatches = 0;   // samples whose magnitude / timer equal BSTreeManager's
-		std::uint64_t managerMismatches = 0;
-		std::uint64_t spotChanges = 0;      // spot checks that found other amplitude / frequency than the shape's last sample
-		std::uint64_t copiesSame = 0;       // second copies of a mesh with the same amplitude / frequency as the first
-		std::uint64_t copiesDifferent = 0;
-		bool managerReadable = false;       // BSTreeManager found and read
-		bool usingManager = false;          // this frame's wind from BSTreeManager
-		float magnitude = 0.0f, timer = 0.0f;  // this frame's
+		bool available = false;      // SE, the engine addresses found
+		std::uint64_t nodeReads = 0;     // node reads (per plant per frame)
+		std::uint64_t nodeFaults = 0;    // refused (fault / implausible): the plant keeps its last pose
+		std::uint32_t compared = 0;      // diagnostic samples against the vertex shader's constants
+		std::uint32_t formulaMatches = 0;  // ... equal to the formula evaluated at draw time
+		std::uint32_t earlyMatches = 0;    // ... equal to the values read at Early Prep this frame
+		float magnitude = 0.0f, fadeStart = 0.0f, fadeEnd = 0.0f;  // this frame's
 	};
 
-	/// On while some wind mesh may be wanted (render thread). Off forgets every request and sample (the hook then does nothing).
+	/// The engine's addresses (SE only); false = unavailable (logged once).
+	[[nodiscard]] bool Available();
+	/// This frame's shared values (computed at the first call of a frame, then the same).
+	[[nodiscard]] Globals FrameGlobals(std::uint32_t a_frame);
+	/// The shape's leaf-animation node as the draw uses it (its shader property's fade node when that is a BSLeafAnimNode /
+	/// BSTreeNode), nullptr when none. SEH-guarded.
+	[[nodiscard]] RE::NiNode* LeafNodeOf(RE::BSGeometry* a_geometry);
+	/// The pose of a plant (a_node may be null: the engine's no-node values). False = unreadable now (keep the last pose).
+	[[nodiscard]] bool Evaluate(const RE::NiNode* a_node, const Globals& a_globals, Pose& o_pose);
+	/// (Diagnostics) The pose read at Early Prep this frame for a node (the hook compares the draw's constants with it).
+	void NoteEarly(const RE::NiNode* a_node, const Pose& a_pose, std::uint32_t a_frame);
+	/// On while sway is in use (the hook does nothing otherwise).
 	void SetActive(bool a_active);
 	[[nodiscard]] bool IsActive();
-	/// The shape's constants are sampled on its next draw. a_predicted (optional): leaf amplitude / frequency of its TREE form,
-	/// for the diagnostics.
-	void Request(const RE::BSGeometry* a_geometry, const float* a_predicted);
-	void Forget(const RE::BSGeometry* a_geometry);
-	/// The shape's latest sample; false = none yet (or not requested).
-	[[nodiscard]] bool Get(const RE::BSGeometry* a_geometry, Params& o_params);
-	/// The scene's per-frame pass over every candidate: one lock for all of it (the *Locked calls below need it held).
-	[[nodiscard]] std::unique_lock<std::mutex> LockForBatch();
-	void RequestLocked(const RE::BSGeometry* a_geometry, const float* a_predicted);
-	void ForgetLocked(const RE::BSGeometry* a_geometry);
-	[[nodiscard]] bool GetLocked(const RE::BSGeometry* a_geometry, Params& o_params);
-	/// Light Limit Fix's BSLightingShader::SetupGeometry hook, right after the engine's function.
+	/// Light Limit Fix's BSLightingShader::SetupGeometry hook, right after the engine's function: a few samples of the vertex
+	/// shader's constants for the one diagnostic log line.
 	void OnSetupGeometry(RE::BSRenderPass* a_pass);
-	/// This frame's wind (computed by the first call of a frame, then the same values).
-	FrameWind Compute(std::uint32_t a_frame);
 	/// The game animates trees (BSTreeManager::enableTreeAnims; true when it cannot be read). Off: the game draws them at rest,
 	/// so the ray tracer keeps their frozen BLASes.
 	[[nodiscard]] bool TreeAnimsEnabled();

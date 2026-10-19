@@ -180,6 +180,9 @@ namespace Util::FrameTrace
 		RtPrepWork prepWork{};
 		// (47l) Foliage sway: wind meshes alive (BLASes refit in place), their vertices, refits recorded this frame (-1 = sway off / RT off).
 		int64_t windMeshes = -1, windVertices = -1, windRefits = -1;
+		// (47n) Per-plant sway: plants within the radius, wind sources, first builds, refit vertices this frame, the radius (-1 = off).
+		int64_t windInRadius = -1, windSources = -1, windBuilds = -1, windRefitVertices = -1;
+		float windRadius = -1.0f;
 	};
 	void OnRayTracingDetail(const RayTracingDetail& a_detail);
 

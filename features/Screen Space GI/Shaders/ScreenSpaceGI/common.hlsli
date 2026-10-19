@@ -74,6 +74,10 @@ cbuffer SSGICB : register(b1)
 	// written, not by this frame's; the two differ exactly when the dynamic-resolution ratio
 	// moves. Opens a new row, and the C++ side declares the row's padding explicitly to match.
 	float2 PrevFrameDim;
+	// (47n) contactAo.cs.hlsl: bit 0 = uncovered-area test + 4-frame window, bit 1 = srcPrevContactDepth holds last frame's depth.
+	// Took the row's padding (the C++ side declares the same two fields).
+	uint ContactFlags;
+	float ssgiPad0;
 };
 
 SamplerState samplerPointClamp : register(s0);

@@ -4,75 +4,138 @@
 #include "State.h"
 
 #include <atomic>
+#include <bit>
 #include <mutex>
 
 namespace RayTracingWind
 {
 	namespace
 	{
-		constexpr std::uint32_t kSpotCheckFrames = 900;   // a sampled shape is read again after this many frames (when drawn)
-		constexpr std::uint32_t kRetryFrames = 60;        // a refused read is tried again after this many frames
-		constexpr std::uint32_t kFallbackMaxAge = 120;    // the fallback's last sample is used for at most this many frames
-		constexpr std::uint32_t kLogMeshes = 48;          // diagnostic lines per session: first samples of a mesh
-		constexpr std::uint32_t kLogCopies = 48;          // ... second copies of a mesh
-		constexpr std::size_t kMaxMeshDiag = 8192;        // meshes remembered for the copy comparison
-		constexpr std::uint64_t kDistrustMismatches = 4;  // BSTreeManager is not used once this many samples disagreed (and most did)
+		constexpr std::uint32_t kDiagSamples = 32;          // the one diagnostic line after this many samples
+		constexpr std::uint32_t kDiagMaxFrames = 36000;     // ... or (with fewer) after this many frames of sampling
+		constexpr std::size_t kDiagMaxEarly = 8192;         // nodes remembered from Early Prep for the comparison
+		// SE 1.5.97: what the IDs must resolve to (BSLightingShader::SetupGeometry's tree branch reads exactly these).
+		constexpr std::uintptr_t kRvaMagnitudeOwner = 0x1E0DED0;  // ID 513211: a pointer; TreeParams.y at +0x304
+		constexpr std::uintptr_t kRvaFadeStart = 0x1E0DF70;       // ID 513234
+		constexpr std::uintptr_t kRvaFadeEnd = 0x1E0DF74;         // ID 513235
+		constexpr std::uintptr_t kMagnitudeOffset = 0x304;
+		// BSLeafAnimNode (BSFadeNode 0x158 + ...): the engine's per-plant values (BSTreeManager::Update writes them every frame).
+		constexpr std::uintptr_t kNodeDistanceSq = 0x158;
+		constexpr std::uintptr_t kNodeAmplitude = 0x15C;
+		constexpr std::uintptr_t kNodeFrequency = 0x160;
+		constexpr std::uintptr_t kNodeTimer = 0x164;
+		constexpr float kTimerScale = 6.0f;  // 0x14164DD68
 
-		struct Entry
+		struct Addresses
 		{
-			Params params;
-			float predicted[2]{};
-			bool hasPrediction = false;
-			std::uint32_t failedFrame = UINT32_MAX;
-			std::uint32_t refs = 0;  // captures holding the shape (a recaptured cell's old and new capture both, for a moment)
+			bool resolved = false;
+			bool ok = false;
+			std::uintptr_t magnitudeOwner = 0, fadeStart = 0, fadeEnd = 0;
+			std::uintptr_t leafVtable = 0, treeVtable = 0;
 		};
+		Addresses g_addresses;
+		std::once_flag g_resolveOnce;
 
-		struct MeshDiag
+		void Resolve()
 		{
-			const RE::BSGeometry* first = nullptr;
-			float amplitude = 0.0f, frequency = 0.0f, distance = 0.0f;
-			bool copySeen = false;
-		};
+			std::call_once(g_resolveOnce, [] {
+				g_addresses.resolved = true;
+				if (!REL::Module::IsSE()) {
+					logger::warn("[RayTracing] Foliage sway: per-plant wind needs Skyrim SE 1.5.97 (its engine addresses); unavailable");
+					return;
+				}
+				try {
+					const std::uintptr_t base = REL::Module::get().base();
+					g_addresses.magnitudeOwner = REL::ID(513211).address();
+					g_addresses.fadeStart = REL::ID(513234).address();
+					g_addresses.fadeEnd = REL::ID(513235).address();
+					g_addresses.leafVtable = RE::VTABLE_BSLeafAnimNode[0].address();
+					g_addresses.treeVtable = RE::VTABLE_BSTreeNode[0].address();
+					g_addresses.ok = g_addresses.magnitudeOwner - base == kRvaMagnitudeOwner && g_addresses.fadeStart - base == kRvaFadeStart &&
+					                 g_addresses.fadeEnd - base == kRvaFadeEnd && g_addresses.leafVtable && g_addresses.treeVtable;
+					if (!g_addresses.ok)
+						logger::warn("[RayTracing] Foliage sway: engine addresses not as expected (0x{:X} 0x{:X} 0x{:X}); per-plant wind unavailable",
+							g_addresses.magnitudeOwner - base, g_addresses.fadeStart - base, g_addresses.fadeEnd - base);
+				} catch (const std::exception& e) {
+					logger::warn("[RayTracing] Foliage sway: engine addresses not found ({}); per-plant wind unavailable", e.what());
+					g_addresses.ok = false;
+				}
+			});
+		}
 
-		struct Manager
-		{
-			float magnitude;
-			float timer;
-		};
-
-		std::mutex g_mutex;
-		std::atomic<bool> g_active{ false };
-		ankerl::unordered_dense::map<const RE::BSGeometry*, Entry> g_requests;
-		ankerl::unordered_dense::map<const void*, MeshDiag> g_meshes;
-		Stats g_stats{};
-		std::uint32_t g_loggedMeshes = 0, g_loggedCopies = 0;  // whole session
-		// The fallback: the last per-frame sample of any tree-animated draw (taken only while BSTreeManager is not used).
-		bool g_haveGlobal = false;
-		float g_globalTree[4]{};
-		float g_globalTimers[2]{};
-		std::uint32_t g_globalFrame = 0;
-		std::uint32_t g_globalTriedFrame = UINT32_MAX;
-		std::uint32_t g_computedFrame = UINT32_MAX;
-		FrameWind g_frameWind{};
-
-		/// BSTreeManager's wind magnitude and tree timer (SEH: a missing singleton is not a crash).
-		bool ReadManager(Manager& o_manager)
+		/// The shared values (SEH: a pointer that is not set yet is a refused read, never a crash).
+		bool ReadGlobals(Globals& o_globals)
 		{
 			__try {
-				auto* manager = RE::BSTreeManager::GetSingleton();
-				if (!manager)
+				const auto owner = *reinterpret_cast<const std::uintptr_t*>(g_addresses.magnitudeOwner);
+				if (!owner)
 					return false;
-				o_manager.magnitude = manager->windMagnitude;
-				o_manager.timer = manager->treeUpdateTimer;
-				return std::isfinite(o_manager.magnitude) && std::isfinite(o_manager.timer);
+				o_globals.magnitude = *reinterpret_cast<const float*>(owner + kMagnitudeOffset);
+				o_globals.fadeStart = *reinterpret_cast<const float*>(g_addresses.fadeStart);
+				o_globals.fadeEnd = *reinterpret_cast<const float*>(g_addresses.fadeEnd);
+				return std::isfinite(o_globals.magnitude) && std::isfinite(o_globals.fadeStart) && std::isfinite(o_globals.fadeEnd);
 			} __except (EXCEPTION_EXECUTE_HANDLER) {
 				return false;
 			}
 		}
 
-		/// TreeParams / WindTimers of the current vertex shader's per-geometry constants (the Lighting VS constant table entries 4
-		/// and 5, ShaderCache's lightingVS map), as BSLightingShader::SetupGeometry just wrote them. SEH: the group was unmapped
-		/// by then (its pointer is the dynamic buffer's mapping); a fault is a refused read, never a crash.
+		RE::NiNode* LeafNodeOfProperty(const RE::BSShaderProperty* a_property)
+		{
+			__try {
+				auto* node = a_property ? a_property->fadeNode : nullptr;
+				if (!node)
+					return nullptr;
+				const std::uintptr_t vtable = *reinterpret_cast<const std::uintptr_t*>(node);
+				return (vtable == g_addresses.leafVtable || vtable == g_addresses.treeVtable) ? node : nullptr;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return nullptr;
+			}
+		}
+
+		struct NodeValues
+		{
+			float distanceSq, amplitude, frequency, timer;
+		};
+		bool ReadNode(const RE::NiNode* a_node, NodeValues& o_values)
+		{
+			__try {
+				const auto base = reinterpret_cast<std::uintptr_t>(a_node);
+				o_values.distanceSq = *reinterpret_cast<const float*>(base + kNodeDistanceSq);
+				o_values.amplitude = *reinterpret_cast<const float*>(base + kNodeAmplitude);
+				o_values.frequency = *reinterpret_cast<const float*>(base + kNodeFrequency);
+				o_values.timer = *reinterpret_cast<const float*>(base + kNodeTimer);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		/// The engine's one-step reciprocal square root, times the value: its distance (bit for bit).
+		float EngineSqrt(float a_value)
+		{
+			const float half = a_value * 0.5f;
+			const std::int32_t bits = 0x5F3759DF - (std::bit_cast<std::int32_t>(a_value) >> 1);
+			const float y = std::bit_cast<float>(bits);
+			float t = half * y;
+			t = t * y;
+			float r = 1.5f - t;
+			r = r * y;
+			return r * a_value;
+		}
+
+		/// TreeParams.z: the amplitude faded by the distance (the engine's order of operations and comparisons).
+		float FadedAmplitude(float a_amplitude, float a_distance, const Globals& a_globals)
+		{
+			const float range = a_globals.fadeEnd - a_globals.fadeStart;
+			const float t = (a_distance - a_globals.fadeStart) / range;
+			float faded = (1.0f - t) * a_amplitude;
+			if (!(faded >= 0.0f))
+				faded = 0.0f;
+			return (a_amplitude < faded || std::isnan(a_amplitude)) ? a_amplitude : faded;
+		}
+
+		/// The vertex shader's per-geometry constants (TreeParams, WindTimers) as SetupGeometry just wrote them (ShaderCache's
+		/// Lighting VS constant table entries 4 and 5). SEH: a fault is a refused read.
 		bool ReadConstants(float o_tree[4], float o_timers[2])
 		{
 			__try {
@@ -82,7 +145,6 @@ namespace RayTracingWind
 					return false;
 				const std::int8_t treeOffset = shader->constantTable[4];
 				const std::int8_t timerOffset = shader->constantTable[5];
-				// 0 = not in the shader (offset 0 is World). An int8 offset (< 128 floats) stays inside the per-geometry buffer.
 				if (treeOffset <= 0 || timerOffset <= 0)
 					return false;
 				const auto& group = shader->constantBuffers[2];  // PerGeometry
@@ -99,229 +161,166 @@ namespace RayTracingWind
 			}
 		}
 
-		bool Plausible(const float a_tree[4], const float a_timers[2])
+		bool Same(float a_value, float a_reference) { return std::abs(a_value - a_reference) <= 1.0e-5f * std::max(1.0f, std::abs(a_reference)); }
+
+		struct EarlyEntry
 		{
-			for (int i = 0; i < 4; ++i)
-				if (!std::isfinite(a_tree[i]))
-					return false;
-			if (!std::isfinite(a_timers[0]) || !std::isfinite(a_timers[1]))
+			std::uint32_t frame;
+			Pose pose;
+		};
+
+		std::mutex g_mutex;
+		std::atomic<bool> g_active{ false };
+		Stats g_stats{};
+		std::uint32_t g_globalsFrame = UINT32_MAX;
+		Globals g_globals{};
+		// Diagnostics (one line per session).
+		bool g_diagDone = false;
+		std::uint32_t g_diagStartFrame = UINT32_MAX;
+		std::uint32_t g_earlyChecked = 0;
+		ankerl::unordered_dense::map<const void*, EarlyEntry> g_early;
+		ankerl::unordered_dense::set<const void*> g_sampled;
+		std::string g_firstMismatch;
+
+		void LogDiagnostics()
+		{
+			g_diagDone = true;
+			logger::info("[RayTracing] Foliage sway: per-plant wind vs the vertex shader's constants: {} samples, the formula at draw time matches {}, "
+						 "the Early Prep values of the same frame match {} of {}{}{} (magnitude {:.4f}, fade {:.0f}-{:.0f})",
+				g_stats.compared, g_stats.formulaMatches, g_stats.earlyMatches, g_earlyChecked, g_firstMismatch.empty() ? "" : "; first difference: ", g_firstMismatch,
+				g_globals.magnitude, g_globals.fadeStart, g_globals.fadeEnd);
+			g_early.clear();
+			g_sampled.clear();
+		}
+	}
+
+	bool Available()
+	{
+		Resolve();
+		return g_addresses.ok;
+	}
+
+	Globals FrameGlobals(std::uint32_t a_frame)
+	{
+		std::scoped_lock lock(g_mutex);
+		if (a_frame == g_globalsFrame)
+			return g_globals;
+		g_globalsFrame = a_frame;
+		Globals globals{};
+		if (Available())
+			globals.valid = ReadGlobals(globals);
+		g_globals = globals;
+		g_stats.available = g_addresses.ok;
+		g_stats.magnitude = globals.magnitude;
+		g_stats.fadeStart = globals.fadeStart;
+		g_stats.fadeEnd = globals.fadeEnd;
+		return globals;
+	}
+
+	RE::NiNode* LeafNodeOf(RE::BSGeometry* a_geometry)
+	{
+		if (!a_geometry || !Available())
+			return nullptr;
+		const auto& runtime = a_geometry->GetGeometryRuntimeData();
+		auto* property = netimmerse_cast<RE::BSShaderProperty*>(runtime.properties[RE::BSGeometry::States::kEffect].get());
+		return LeafNodeOfProperty(property);
+	}
+
+	bool Evaluate(const RE::NiNode* a_node, const Globals& a_globals, Pose& o_pose)
+	{
+		++g_stats.nodeReads;
+		if (!a_globals.valid) {
+			++g_stats.nodeFaults;
+			return false;
+		}
+		Pose pose;
+		pose.magnitude = a_globals.magnitude;
+		if (a_node) {
+			NodeValues values{};
+			if (!ReadNode(a_node, values) || !std::isfinite(values.distanceSq) || !std::isfinite(values.amplitude) || !std::isfinite(values.frequency) ||
+				!std::isfinite(values.timer) || std::abs(values.timer) > 1.0e6f) {
+				++g_stats.nodeFaults;
 				return false;
-			// Amplitude >= 0 (0 = this shape does not sway), frequency and magnitude of a sane size, a timer below float's integer range.
-			return a_tree[2] >= 0.0f && a_tree[2] <= 1000.0f && std::abs(a_tree[3]) <= 1000.0f && std::abs(a_tree[1]) <= 1000.0f &&
-			       std::abs(a_timers[0]) < 1.0e7f && std::abs(a_timers[1]) < 1.0e7f;
-		}
-
-		bool Same(float a_value, float a_reference) { return std::abs(a_value - a_reference) <= 1.0e-4f * std::max(1.0f, std::abs(a_reference)); }
-
-		bool Distrusted() { return g_stats.managerMismatches >= kDistrustMismatches && g_stats.managerMismatches > g_stats.managerMatches; }
-
-		void Diagnose(const RE::BSGeometry* a_geometry, const Entry& a_entry, const Manager& a_manager, bool a_managerOk)
-		{
-			const auto& runtime = a_geometry->GetGeometryRuntimeData();
-			const void* mesh = runtime.rendererData;
-			if (!mesh)
-				return;
-			float distance = -1.0f;
-			if (auto* camera = RE::Main::WorldRootCamera()) {
-				const auto d = a_geometry->worldBound.center - camera->world.translate;
-				distance = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
 			}
-			const float* tree = a_entry.params.treeParams;
-			const float* timers = a_entry.params.windTimers;
-			auto found = g_meshes.find(mesh);
-			if (found == g_meshes.end()) {
-				if (g_meshes.size() >= kMaxMeshDiag)
-					return;
-				g_meshes.emplace(mesh, MeshDiag{ a_geometry, tree[2], tree[3], distance, false });
-				if (g_loggedMeshes >= kLogMeshes)
-					return;
-				++g_loggedMeshes;
-				auto* triShape = const_cast<RE::BSGeometry*>(a_geometry)->AsTriShape();
-				const std::uint32_t vertices = triShape ? triShape->GetTrishapeRuntimeData().vertexCount : 0;
-				const std::string manager = a_managerOk ?
-				                                std::format("BSTreeManager magnitude {:.4f} timer {:.4f} ({})", a_manager.magnitude, a_manager.timer,
-													Same(tree[1], a_manager.magnitude) && Same(timers[0], a_manager.timer) ? "match" : "MISMATCH") :
-				                                std::string("BSTreeManager not readable");
-				const std::string predicted = a_entry.hasPrediction ?
-				                                  std::format("TREE leaf amplitude {:.4f} frequency {:.4f} ({})", a_entry.predicted[0], a_entry.predicted[1],
-													  Quantize(a_entry.predicted[0]) == Quantize(tree[2]) && Quantize(a_entry.predicted[1]) == Quantize(tree[3]) ? "match" : "differs") :
-				                                  std::string("no TREE form");
-				logger::info("[RayTracing] Foliage sway: '{}' ({} vertices, {:.0f} units away): TreeParams ({:.4f}, {:.4f}, {:.4f}, {:.4f}) WindTimers ({:.4f}, {:.4f}); {}; {}",
-					a_geometry->name.c_str(), vertices, distance, tree[0], tree[1], tree[2], tree[3], timers[0], timers[1], manager, predicted);
-				return;
-			}
-			auto& diag = found->second;
-			if (diag.first == a_geometry || diag.copySeen)
-				return;
-			// A second copy of the mesh: the same amplitude / frequency? (If not, keying wind meshes by them keeps both right.)
-			diag.copySeen = true;
-			const bool same = Quantize(diag.amplitude) == Quantize(tree[2]) && Quantize(diag.frequency) == Quantize(tree[3]);
-			++(same ? g_stats.copiesSame : g_stats.copiesDifferent);
-			if (g_loggedCopies >= kLogCopies)
-				return;
-			++g_loggedCopies;
-			logger::info("[RayTracing] Foliage sway: second copy of '{}' at {:.0f} units (first at {:.0f}): amplitude / frequency {} ({:.4f} / {:.4f} vs {:.4f} / {:.4f})",
-				a_geometry->name.c_str(), distance, diag.distance, same ? "the same" : "DIFFERENT", tree[2], tree[3], diag.amplitude, diag.frequency);
+			pose.amplitude = FadedAmplitude(values.amplitude, EngineSqrt(values.distanceSq), a_globals);
+			pose.frequency = values.frequency;
+			pose.timer = values.timer * kTimerScale;
+		} else {
+			pose.amplitude = FadedAmplitude(1.0f, 0.0f, a_globals);
+			pose.frequency = 1.0f;
+			pose.timer = 0.0f;
 		}
+		if (!std::isfinite(pose.amplitude) || std::abs(pose.amplitude) > 10000.0f || std::abs(pose.frequency) > 10000.0f) {
+			++g_stats.nodeFaults;
+			return false;
+		}
+		o_pose = pose;
+		return true;
+	}
+
+	void NoteEarly(const RE::NiNode* a_node, const Pose& a_pose, std::uint32_t a_frame)
+	{
+		if (g_diagDone || !a_node)
+			return;
+		std::scoped_lock lock(g_mutex);
+		if (g_early.size() >= kDiagMaxEarly && !g_early.contains(a_node))
+			return;
+		g_early[a_node] = EarlyEntry{ a_frame, a_pose };
 	}
 
 	void SetActive(bool a_active)
 	{
-		if (g_active.load(std::memory_order_relaxed) == a_active)
-			return;
-		std::scoped_lock lock(g_mutex);
 		g_active.store(a_active, std::memory_order_relaxed);
-		if (a_active)
-			return;
-		g_requests.clear();
-		g_meshes.clear();
-		g_haveGlobal = false;
-		g_globalTriedFrame = UINT32_MAX;
-		g_computedFrame = UINT32_MAX;
-		g_frameWind = {};
-		const auto matches = g_stats.managerMatches, mismatches = g_stats.managerMismatches;  // the verdict on BSTreeManager stays
-		g_stats = {};
-		g_stats.managerMatches = matches;
-		g_stats.managerMismatches = mismatches;
 	}
 
 	bool IsActive() { return g_active.load(std::memory_order_relaxed); }
 
-	std::unique_lock<std::mutex> LockForBatch() { return std::unique_lock<std::mutex>(g_mutex); }
-
-	void Request(const RE::BSGeometry* a_geometry, const float* a_predicted)
-	{
-		std::scoped_lock lock(g_mutex);
-		RequestLocked(a_geometry, a_predicted);
-	}
-
-	void Forget(const RE::BSGeometry* a_geometry)
-	{
-		std::scoped_lock lock(g_mutex);
-		ForgetLocked(a_geometry);
-	}
-
-	bool Get(const RE::BSGeometry* a_geometry, Params& o_params)
-	{
-		std::scoped_lock lock(g_mutex);
-		return GetLocked(a_geometry, o_params);
-	}
-
-	void RequestLocked(const RE::BSGeometry* a_geometry, const float* a_predicted)
-	{
-		if (!a_geometry)
-			return;
-		auto [it, inserted] = g_requests.try_emplace(a_geometry);
-		++it->second.refs;
-		if (inserted && a_predicted) {
-			it->second.predicted[0] = a_predicted[0];
-			it->second.predicted[1] = a_predicted[1];
-			it->second.hasPrediction = true;
-		}
-	}
-
-	void ForgetLocked(const RE::BSGeometry* a_geometry)
-	{
-		if (!a_geometry)
-			return;
-		const auto it = g_requests.find(a_geometry);
-		if (it != g_requests.end() && (it->second.refs <= 1 || --it->second.refs == 0))
-			g_requests.erase(it);
-	}
-
-	bool GetLocked(const RE::BSGeometry* a_geometry, Params& o_params)
-	{
-		const auto it = g_requests.find(a_geometry);
-		if (it == g_requests.end() || it->second.params.samples == 0)
-			return false;
-		o_params = it->second.params;
-		return true;
-	}
-
 	void OnSetupGeometry(RE::BSRenderPass* a_pass)
 	{
-		if (!g_active.load(std::memory_order_relaxed) || !a_pass)
+		if (g_diagDone || !g_active.load(std::memory_order_relaxed) || !a_pass)
 			return;
 		auto* property = a_pass->shaderProperty;
-		const auto* geometry = a_pass->geometry;
-		if (!property || !geometry || property->flags.none(RE::BSShaderProperty::EShaderPropertyFlag::kTreeAnim))
+		if (!property || property->flags.none(RE::BSShaderProperty::EShaderPropertyFlag::kTreeAnim))
 			return;
 		std::unique_lock lock(g_mutex, std::try_to_lock);
-		if (!lock.owns_lock())
+		if (!lock.owns_lock() || g_diagDone)
 			return;
 		const std::uint32_t frame = globals::state ? globals::state->frameCount : 0u;
-		auto it = g_requests.find(geometry);
-		bool due = false;
-		if (it != g_requests.end()) {
-			const auto& entry = it->second;
-			const bool retryOk = entry.failedFrame == UINT32_MAX || frame - entry.failedFrame >= kRetryFrames;
-			due = retryOk && (entry.params.samples == 0 || frame - entry.params.frame >= kSpotCheckFrames);
-		}
-		// The fallback's per-frame sample, only while BSTreeManager is not used (one read per frame at most).
-		const bool global = g_globalTriedFrame != frame && (Distrusted() || !g_stats.managerReadable);
-		if (!due && !global)
+		if (g_diagStartFrame == UINT32_MAX)
+			g_diagStartFrame = frame;
+		auto* node = LeafNodeOfProperty(property);
+		const void* key = node ? static_cast<const void*>(node) : static_cast<const void*>(a_pass->geometry);
+		if (g_sampled.contains(key) || frame != g_globalsFrame || !g_globals.valid)
 			return;
-		if (global)
-			g_globalTriedFrame = frame;
 		float tree[4], timers[2];
-		if (!ReadConstants(tree, timers) || !Plausible(tree, timers)) {
-			++g_stats.readFailures;
-			if (due)
-				it->second.failedFrame = frame;
+		if (!ReadConstants(tree, timers))
 			return;
+		g_sampled.insert(key);
+		Pose atDraw;
+		const bool evaluated = Evaluate(node, g_globals, atDraw);
+		++g_stats.compared;
+		const bool formula = evaluated && Same(tree[1], atDraw.magnitude) && Same(tree[2], atDraw.amplitude) && Same(tree[3], atDraw.frequency) && Same(timers[0], atDraw.timer);
+		if (formula)
+			++g_stats.formulaMatches;
+		bool early = false;
+		if (const auto it = g_early.find(node); node && it != g_early.end() && it->second.frame == frame) {
+			++g_earlyChecked;
+			const Pose& p = it->second.pose;
+			early = Same(tree[1], p.magnitude) && Same(tree[2], p.amplitude) && Same(tree[3], p.frequency) && Same(timers[0], p.timer);
+			if (early)
+				++g_stats.earlyMatches;
 		}
-		++g_stats.samplesTotal;
-		Manager manager{};
-		const bool managerOk = ReadManager(manager);
-		if (managerOk)
-			++(Same(tree[1], manager.magnitude) && Same(timers[0], manager.timer) ? g_stats.managerMatches : g_stats.managerMismatches);
-		if (global) {
-			std::copy_n(tree, 4, g_globalTree);
-			std::copy_n(timers, 2, g_globalTimers);
-			g_globalFrame = frame;
-			g_haveGlobal = true;
+		if ((!formula || (node && !early)) && g_firstMismatch.empty()) {
+			const auto it = node ? g_early.find(node) : g_early.end();
+			g_firstMismatch = std::format("'{}': TreeParams ({:.4f}, {:.4f}, {:.4f}, {:.4f}) WindTimers ({:.4f}, {:.4f}); formula at draw ({:.4f}, {:.4f}, {:.4f}, {:.4f}){}",
+				a_pass->geometry ? a_pass->geometry->name.c_str() : "?", tree[0], tree[1], tree[2], tree[3], timers[0], timers[1], atDraw.magnitude, atDraw.amplitude,
+				atDraw.frequency, atDraw.timer,
+				it != g_early.end() ? std::format("; Early Prep (frame {} of {}) ({:.4f}, {:.4f}, {:.4f}, {:.4f})", it->second.frame, frame, it->second.pose.magnitude,
+										  it->second.pose.amplitude, it->second.pose.frequency, it->second.pose.timer) :
+									  std::string(node ? "; no Early Prep value" : "; no leaf node"));
 		}
-		if (!due)
-			return;
-		auto& entry = it->second;
-		if (entry.params.samples > 0 &&
-			(Quantize(entry.params.treeParams[2]) != Quantize(tree[2]) || Quantize(entry.params.treeParams[3]) != Quantize(tree[3])))
-			++g_stats.spotChanges;
-		const bool first = entry.params.samples == 0;
-		std::copy_n(tree, 4, entry.params.treeParams);
-		std::copy_n(timers, 2, entry.params.windTimers);
-		entry.params.frame = frame;
-		++entry.params.samples;
-		entry.failedFrame = UINT32_MAX;
-		if (first)
-			Diagnose(geometry, entry, manager, managerOk);
-	}
-
-	FrameWind Compute(std::uint32_t a_frame)
-	{
-		std::scoped_lock lock(g_mutex);
-		if (a_frame == g_computedFrame)
-			return g_frameWind;
-		g_computedFrame = a_frame;
-		FrameWind wind{};
-		Manager manager{};
-		const bool managerOk = ReadManager(manager);
-		g_stats.managerReadable = managerOk;
-		if (managerOk && !Distrusted()) {
-			wind = FrameWind{ true, manager.magnitude, manager.timer, true };
-		} else if (g_haveGlobal && a_frame - g_globalFrame <= kFallbackMaxAge) {
-			// The shaders' last values (normally last frame's draws), one frame on per frame since: x + (x - y).
-			float step = g_globalTimers[0] - g_globalTimers[1];
-			if (!std::isfinite(step) || std::abs(step) > 10.0f)
-				step = 0.0f;
-			const float timer = g_globalTimers[0] + step * static_cast<float>(a_frame - g_globalFrame);
-			wind = FrameWind{ std::isfinite(timer), g_globalTree[1], timer, false };
-		}
-		g_stats.usingManager = wind.valid && wind.fromManager;
-		g_stats.magnitude = wind.magnitude;
-		g_stats.timer = wind.timer;
-		g_frameWind = wind;
-		return wind;
+		if (g_stats.compared >= kDiagSamples || frame - g_diagStartFrame > kDiagMaxFrames)
+			LogDiagnostics();
 	}
 
 	bool TreeAnimsEnabled()
@@ -337,11 +336,6 @@ namespace RayTracingWind
 	Stats GetStats()
 	{
 		std::scoped_lock lock(g_mutex);
-		Stats stats = g_stats;
-		stats.requested = static_cast<std::uint32_t>(g_requests.size());
-		stats.sampled = 0;
-		for (const auto& [geometry, entry] : g_requests)
-			stats.sampled += entry.params.samples > 0 ? 1u : 0u;
-		return stats;
+		return g_stats;
 	}
 }

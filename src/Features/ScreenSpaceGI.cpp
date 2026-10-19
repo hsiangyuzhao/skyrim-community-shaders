@@ -51,7 +51,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	DistanceNormalisation,
 	EnableContactAo,
 	ContactRadius,
-	ContactStrength)
+	ContactStrength,
+	ContactGhostFix)
 
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -346,6 +347,16 @@ void ScreenSpaceGI::DrawSettings()
 				};
 				Util::DrawMultiLineTooltip(tooltipLines);
 			}
+
+			// (47n) Less ghosting: an uncovered-area (depth) test on the history and 4 frames instead of 8.
+			ImGui::Checkbox("Contact AO: Uncovered-Area Test, 4-Frame History", &settings.ContactGhostFix);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				std::vector<std::string> tooltipLines = {
+					"On (default): the contact AO's history is dropped where the surface was just uncovered (behind a walking character)",
+					"and it averages 4 frames instead of 8: less dark fringe behind moving things, a little more grain. Off: as in 47m."
+				};
+				Util::DrawMultiLineTooltip(tooltipLines);
+			}
 		}
 	}
 
@@ -556,6 +567,19 @@ void ScreenSpaceGI::SetupResources()
 			texContactAo[1] = eastl::make_unique<Texture2D>(texDesc);
 			texContactAo[1]->CreateSRV(srvDesc);
 			texContactAo[1]->CreateUAV(uavDesc);
+		}
+
+		// (47n) Contact AO's own view depth per frame (the uncovered-area test of its history), same extent, R16_FLOAT.
+		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R16_FLOAT;
+		{
+			texContactDepth[0] = eastl::make_unique<Texture2D>(texDesc);
+			texContactDepth[0]->CreateSRV(srvDesc);
+			texContactDepth[0]->CreateUAV(uavDesc);
+
+			texContactDepth[1] = eastl::make_unique<Texture2D>(texDesc);
+			texContactDepth[1]->CreateSRV(srvDesc);
+			texContactDepth[1]->CreateUAV(uavDesc);
+			contactDepthValid = false;
 		}
 
 		srvDesc.Format = uavDesc.Format = texDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
@@ -890,7 +914,9 @@ void ScreenSpaceGI::UpdateSB()
 		// "no usable history extent" and fall back to this frame's, exactly the behaviour they
 		// had before. Every subsequent frame carries the real value.
 		data.PrevFrameDim = (prevFrameDim.x > 0.0f && prevFrameDim.y > 0.0f) ? prevFrameDim : dynres;
-		data.ssgiPad0 = { 0.0f, 0.0f };
+		// (47n) Contact AO: bit 0 the uncovered-area test + 4-frame window, bit 1 last frame's contact depth is there to test against.
+		data.ContactFlags = (settings.ContactGhostFix ? 1u : 0u) | (settings.ContactGhostFix && contactDepthValid ? 2u : 0u);
+		data.ssgiPad0 = 0.0f;
 	}
 
 	ssgiCB->Update(data);
@@ -1168,8 +1194,10 @@ void ScreenSpaceGI::DrawSSGI()
 		srvs.at(1) = rts[NORMALROUGHNESS].SRV;
 		srvs.at(2) = rts[RE::RENDER_TARGET::kMOTION_VECTOR].SRV;
 		srvs.at(3) = texContactAo[contactIdx]->srv.get();
+		srvs.at(5) = SrvOf(texContactDepth[contactIdx]);  // (47n) last frame's contact depth
 
 		uavs.at(0) = texContactAo[!contactIdx]->uav.get();
+		uavs.at(2) = UavOf(texContactDepth[!contactIdx]);  // (47n) this frame's, for the next
 
 		if (settings.ResolutionMode == 0) {
 			srvs.at(4) = texAo[inputAoTexIdx]->srv.get();
@@ -1184,6 +1212,9 @@ void ScreenSpaceGI::DrawSSGI()
 
 		contactIdx = !contactIdx;
 		lastFrameContactIdx = contactIdx;
+		contactDepthValid = texContactDepth[0] && texContactDepth[1];  // (47n) written every dispatch
+	} else {
+		contactDepthValid = false;
 
 		Util::GpuPassTimers::GetSingleton()->End(Util::GpuBucket::SSGIContactAO);
 	}

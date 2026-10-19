@@ -32,6 +32,7 @@
 // replaces read, so the signal is directly comparable to theirs.
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+#include "Common/FrameBuffer.hlsli"
 #include "Common/Game.hlsli"
 #include "Common/GBuffer.hlsli"
 #include "Common/Math.hlsli"
@@ -54,11 +55,14 @@ Texture2D<unorm float> srcPrevContact : register(t3);
 #ifdef CONTACT_COMPOSE
 Texture2D<unorm float> srcAo : register(t4);
 #endif
+// (47n) This pass's own view depth of last frame (R16_FLOAT, TexDim-sized like srcPrevContact): the uncovered-area test.
+Texture2D<float> srcPrevContactDepth : register(t5);
 
 RWTexture2D<unorm float> outContact : register(u0);
 #ifdef CONTACT_COMPOSE
 RWTexture2D<unorm float> outAo : register(u1);
 #endif
+RWTexture2D<float> outContactDepth : register(u2);  // (47n) this frame's view depth, for the next frame's test
 
 ///////////////////////////////////////////////////////////////////////////////
 // Kernel constants. Carried over unchanged from the estimator this replaces, so a saved
@@ -89,6 +93,12 @@ static const float ContactBias = 0.1;
 // number (see below). Longer windows buy little: sqrt improvement against a linear increase in the
 // amount of history the fence has to catch.
 static const float ContactAccumFrames = 8.0;
+// (47n) ContactFlags bit 0 ("Contact AO: Uncovered-Area Test, 4-Frame History"): a shorter window (offline, a character walking
+// past at 1-8 px / frame: the dark fringe behind it about halves; static grain 0.031 -> 0.045) and the history dropped where the
+// surface was just uncovered (the fence cannot see that case: there the neighbourhood itself is new).
+static const float ContactAccumFramesShort = 4.0;
+static const uint kContactFlagGhostFix = 1u;
+static const uint kContactFlagPrevDepth = 2u;
 
 // Slack on the neighbourhood fence, in occlusion units. Two R8_UNORM quanta.
 //
@@ -209,12 +219,14 @@ float EvaluateContact(uint2 a_px, float3 a_posVS, float3 a_normalVS, float a_vie
 	const float ndcDepth = srcNDCDepth[px];
 
 	float curr = 1.0;
+	float viewZ = 0.0;  // (47n) 0 = sky (stored for the next frame's uncovered-area test)
+	float3 posVS = 0.0;
 	// The sky has nothing to self-occlude and every tap there is a far-plane tap, so the kernel
 	// would return 1 after paying for ten loads. Same gate the three estimators this replaces used.
 	[branch] if (ndcDepth < 1.0)
 	{
-		const float viewZ = ScreenToViewDepth(ndcDepth);
-		const float3 posVS = ScreenToViewPosition(screenPos, viewZ, eyeIndex);
+		viewZ = ScreenToViewDepth(ndcDepth);
+		posVS = ScreenToViewPosition(screenPos, viewZ, eyeIndex);
 		const float3 normalVS = GBuffer::DecodeNormal(srcNormalRoughness[px].xy);
 
 		// With an accumulator of its own the spiral can rotate with the frame again, which is what
@@ -308,13 +320,33 @@ float EvaluateContact(uint2 a_px, float3 a_posVS, float3 a_normalVS, float a_vie
 		// common.hlsli (filterNaN / filterInf / isFiniteSafe) is absent here: the only float that
 		// is not format-bounded is `curr`, and it leaves EvaluateContact through saturate().
 		const float hist = srcPrevContact.SampleLevel(samplerLinearClamp, prevTexCoord, 0);
-		accum = lerp(clamp(hist, fenceLo, fenceHi), curr, rcp(ContactAccumFrames));
+		// (47n) Uncovered-area test (ContactFlags): last frame's surface at that spot (its stored view depth, put back into the world
+		// with last frame's camera) must be this pixel's surface; else (just uncovered behind something that moved) no history.
+		bool keep = true;
+		[branch] if ((ContactFlags & kContactFlagPrevDepth) && viewZ > 0.0)
+		{
+			const int2 prevTexel = clamp(int2(prevTexCoord * TexDim), int2(0, 0), int2(TexDim) - 1);
+			const float prevZ = srcPrevContactDepth[prevTexel];
+			if (!(prevZ > 0.0)) {
+				keep = false;
+			} else {
+				const float3 currWS = ViewToWorldPosition(posVS, FrameBuffer::CameraViewInverse[eyeIndex]) + FrameBuffer::CameraPosAdjust[eyeIndex].xyz;
+				const float3 prevVS = ScreenToViewPosition(prevScreenPos, prevZ, eyeIndex);
+				const float3 prevWS = ViewToWorldPosition(prevVS, PrevInvViewMat[eyeIndex]) + FrameBuffer::CameraPreviousPosAdjust[eyeIndex].xyz;
+				const float3 delta = currWS - prevWS;
+				const float tol = 0.02 * viewZ + 4.0;
+				keep = dot(delta, delta) <= tol * tol;
+			}
+		}
+		const float frames = (ContactFlags & kContactFlagGhostFix) ? ContactAccumFramesShort : ContactAccumFrames;
+		accum = keep ? lerp(clamp(hist, fenceLo, fenceHi), curr, rcp(frames)) : curr;
 	}
 #endif
 
 	[branch] if (all(dtid < (uint2)FrameDim))
 	{
 		outContact[dtid] = accum;
+		outContactDepth[dtid] = min(viewZ, 65000.0);  // (47n)
 #ifdef CONTACT_COMPOSE
 		// SSGI's AO channel stores *occlusion*; its consumers read `1 - value` as visibility. So
 		// combining the two visibilities is a single multiply in that space.

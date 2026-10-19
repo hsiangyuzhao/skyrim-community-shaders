@@ -986,6 +986,10 @@ namespace Util::FrameTrace
 				out << "# (47l) rtao_normal_prep_gpu_ms = AONormalPrepCS (RTAO: Smooth Normals, right before the RT depth copy; -1 = not run lately).\n";
 				out << "# (47m) pacer_learned_cap_ms = cap on pacer_learned_ms: 1.5 x the largest of the last 60 learned waits, at most 20 (0 = none yet);\n";
 				out << "#   pacer_learned_cut_ms = learned sleep not taken because the frame start + half the CPU lead would pass the predicted completion.\n";
+				out << "# (47n) Foliage sway per plant (each plant its own wind BLAS within the sway radius): rt_wind_meshes = wind BLASes alive (plants),\n";
+				out << "#   rt_wind_in_radius = swayable plants within the radius, rt_wind_sources = engine meshes uploaded (shared), rt_wind_builds = first\n";
+				out << "#   builds this frame, rt_wind_refits / rt_wind_refit_verts = plants refit this frame and their vertices, rt_wind_radius = the radius\n";
+				out << "#   (the engine's sway fade end + 256, at most 8192). The GPU cost is in rt_prep_gpu_ms. -1 = sway off / Ray Tracing off.\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1086,7 +1090,8 @@ namespace Util::FrameTrace
 					   "water_prep_gpu_ms,water_draw_gpu_ms,rt_pl_water_rays,"  // (47j)
 					   "rt_wind_meshes,rt_wind_verts,rt_wind_refits,"  // (47l)
 					   "rtao_normal_prep_gpu_ms,"  // (47l)
-					   "pacer_learned_cap_ms,pacer_learned_cut_ms\n";  // (47m) the last ones
+					   "pacer_learned_cap_ms,pacer_learned_cut_ms,"  // (47m)
+					   "rt_wind_in_radius,rt_wind_sources,rt_wind_builds,rt_wind_refit_verts,rt_wind_radius\n";  // (47n) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1266,6 +1271,9 @@ namespace Util::FrameTrace
 					// (47m) The pacer's learned-sleep cap and the part of it not taken, after rtao_normal_prep_gpu_ms (the old last column).
 					extra.pop_back();
 					extra += std::format(",{:.3f},{:.3f}\n", r.pacer.learnedCapMs, r.pacer.learnedCutMs);
+					// (47n) Foliage sway per plant, after pacer_learned_cut_ms (the old last column).
+					extra.pop_back();
+					extra += std::format(",{},{},{},{},{:.0f}\n", r.rt.windInRadius, r.rt.windSources, r.rt.windBuilds, r.rt.windRefitVertices, r.rt.windRadius);
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;

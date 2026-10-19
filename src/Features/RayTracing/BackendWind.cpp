@@ -1,13 +1,14 @@
-// (47l) Foliage sway on the ray tracer's D3D12 side.
+// (47l) Foliage sway on the ray tracer's D3D12 side. (47n) Per instance.
 //
-// A wind mesh is a tree-animated mesh (leaves, bushes, swaying branches) with the shapes that share its engine mesh and its
-// leaf amplitude / frequency. It is uploaded once (a few per frame): its rest vertices (position, packed normal and vertex
-// alpha), its indices, a vertex buffer the posing writes and a BLAS range sized for ALLOW_UPDATE builds. Its first build poses
-// it at the mean of the sway (WindFoliageCS mode 0) so every later in-place refit stays within half the sway of the BVH it
-// was built for (no periodic rebuild: the sway never drifts). Every frame the wind pose changes, WindFoliageCS poses it with
-// this frame's wind (the game's own formula) and its BLAS is refit in place (PERFORM_UPDATE). First builds are capped per
-// frame; refits are not. Its ranges come from the character pools (rest + index: skinStaticPool_, posed vertices:
-// skinOutputPool_, BLAS: asPool_) and go back behind the fence (RetireValue) like every other range. The CPU never waits.
+// A wind source is a tree-animated engine mesh (leaves, bushes, swaying branches): its rest vertices (position, packed normal and
+// vertex alpha) and its indices, uploaded once (a few per frame) and shared by every instance of that mesh. A wind instance is one
+// placed shape over a source: its own posed vertex buffer and a BLAS range sized for ALLOW_UPDATE builds. Its first build poses it
+// at the mean of its sway (WindFoliageCS mode 0) so the later in-place refits stay near the BVH it was built for. Every frame the
+// scene hands each instance its pose (SetWindPose: the engine's own per-plant TreeParams / WindTimers, see Wind.h); an instance whose
+// pose changed since its last refit is posed by WindFoliageCS and its BLAS refit in place (PERFORM_UPDATE). A plant whose timer
+// does not move (no leaf data) is posed once. First builds are capped per frame; refits are not. The ranges come from the character
+// pools (rest + index: skinStaticPool_, posed vertices: skinOutputPool_, BLAS: asPool_) and go back behind the fence (RetireValue)
+// like every other range. The CPU never waits.
 
 #include "Backend.h"
 
@@ -15,6 +16,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstring>
 
 // Generated at build time from Shaders/WindFoliageCS.hlsl by the Windows SDK's dxc (CMakeLists.txt).
 #include "RayTracing/WindFoliageCS.dxil.h"
@@ -26,17 +28,6 @@ namespace RayTracingRT
 		std::string WindHr(HRESULT a_hr) { return std::format("0x{:08X}", static_cast<std::uint32_t>(a_hr)); }
 
 		std::uint64_t WindAlign(std::uint64_t a_value, std::uint64_t a_alignment) { return (a_value + a_alignment - 1) & ~(a_alignment - 1); }
-
-		D3D12_RESOURCE_BARRIER WindTransition(ID3D12Resource* a_resource, D3D12_RESOURCE_STATES a_before, D3D12_RESOURCE_STATES a_after)
-		{
-			D3D12_RESOURCE_BARRIER barrier{};
-			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-			barrier.Transition.pResource = a_resource;
-			barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-			barrier.Transition.StateBefore = a_before;
-			barrier.Transition.StateAfter = a_after;
-			return barrier;
-		}
 
 		D3D12_RESOURCE_BARRIER WindUavBarrier()
 		{
@@ -67,9 +58,6 @@ namespace RayTracingRT
 		constexpr std::uint32_t kWindOutputStride = sizeof(float) * 3;
 		constexpr std::uint32_t kWindGroupSize = 64;  // WindFoliageCS numthreads
 		constexpr std::uint32_t kWindConstants = 8;   // WindFoliageCS WindConstants
-		// A wind pose whose phase moved by less than this (in cycles of the faster wave) since the last refit is not refit again:
-		// the vertices would move by less than a ten-thousandth of the sway (a paused game, no wind).
-		constexpr double kWindStillCycles = 1.0e-5;
 
 		D3D12_RAYTRACING_GEOMETRY_DESC WindGeometryDesc(bool a_opaque, std::uint32_t a_vertices, std::uint32_t a_triangles)
 		{
@@ -87,6 +75,8 @@ namespace RayTracingRT
 
 		constexpr D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS kWindBuildFlags =
 			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+
+		bool SamePose(const float a_a[4], const float a_b[4]) { return std::memcmp(a_a, a_b, sizeof(float) * 4) == 0; }
 	}
 
 	bool Backend::CreateWindPipeline()
@@ -133,42 +123,116 @@ namespace RayTracingRT
 		logger::error("[RayTracing] Foliage sway: {} -- switched off", windFault_);
 	}
 
-	BlasHandle Backend::CreateWindBlas(std::unique_ptr<WindGeometry> a_geometry)
+	std::uint32_t Backend::CreateWindSource(std::unique_ptr<WindGeometry> a_geometry)
 	{
 		if (!WindAvailable() || !a_geometry) {
 			++windStats_.refused;
-			return kInvalidBlas;
+			return UINT32_MAX;
 		}
 		const WindGeometry& geometry = *a_geometry;
 		const std::uint32_t vertices = geometry.Vertices();
 		const std::uint32_t triangles = geometry.Triangles();
-		auto refuse = [&]() {
+		if (vertices == 0 || triangles == 0 || vertices > kWindMaxVertices || triangles > kWindMaxTriangles || geometry.indices.size() % 3 != 0) {
+			++windStats_.refused;
+			return UINT32_MAX;
+		}
+		for (const auto index : geometry.indices) {
+			if (index >= vertices) {
+				++windStats_.refused;
+				return UINT32_MAX;
+			}
+		}
+		WindSource source;
+		for (int a = 0; a < 3; ++a) {
+			source.boundsMin[a] = FLT_MAX;
+			source.boundsMax[a] = -FLT_MAX;
+		}
+		for (const auto& vertex : geometry.vertices) {
+			for (int a = 0; a < 3; ++a) {
+				if (!std::isfinite(vertex.position[a])) {
+					++windStats_.refused;
+					return UINT32_MAX;
+				}
+				source.boundsMin[a] = std::min(source.boundsMin[a], vertex.position[a]);
+				source.boundsMax[a] = std::max(source.boundsMax[a], vertex.position[a]);
+			}
+		}
+		source.live = true;
+		source.vertices = vertices;
+		source.triangles = triangles;
+		source.opaque = geometry.opaque;
+		source.restBytes = WindAlign(static_cast<std::uint64_t>(vertices) * kWindVertexBytes, 256);
+		source.indexBytes = WindAlign(static_cast<std::uint64_t>(triangles) * 3 * sizeof(std::uint32_t), 256);
+		if (windStats_.bytes + source.Bytes() > kWindBudgetBytes) {
+			++windStats_.overBudget;
+			return UINT32_MAX;
+		}
+		source.refs = 1;  // the caller's
+		source.geometry = std::move(a_geometry);
+		std::uint32_t index;
+		if (!freeWindSources_.empty()) {
+			index = freeWindSources_.back();
+			freeWindSources_.pop_back();
+		} else {
+			index = static_cast<std::uint32_t>(windSources_.size());
+			windSources_.emplace_back();
+		}
+		windStats_.bytes += source.Bytes();
+		windStats_.sourceBytes += source.Bytes();
+		windSources_[index] = std::move(source);
+		++windSourcesLive_;
+		windStats_.sources = windSourcesLive_;
+		windUploadQueue_.push_back(index);
+		return index;
+	}
+
+	void Backend::FreeWindSource(std::uint32_t a_source)
+	{
+		if (a_source >= windSources_.size() || !windSources_[a_source].live)
+			return;
+		auto& source = windSources_[a_source];
+		if (!source.uploaded)
+			std::erase(windUploadQueue_, a_source);
+		// Back once every submission that may use them completed (an instance refit in flight may still read them).
+		skinStaticPool_.Free(source.rest, RetireValue());
+		skinStaticPool_.Free(source.index, RetireValue());
+		windStats_.bytes -= std::min(windStats_.bytes, source.Bytes());
+		windStats_.sourceBytes -= std::min(windStats_.sourceBytes, source.Bytes());
+		source = {};
+		freeWindSources_.push_back(a_source);
+		windSourcesLive_ -= std::min<std::uint32_t>(windSourcesLive_, 1);
+		windStats_.sources = windSourcesLive_;
+	}
+
+	void Backend::ReleaseWindSource(std::uint32_t a_source)
+	{
+		if (a_source >= windSources_.size() || !windSources_[a_source].live)
+			return;
+		auto& source = windSources_[a_source];
+		if (source.refs <= 1)
+			FreeWindSource(a_source);
+		else
+			--source.refs;
+	}
+
+	BlasHandle Backend::CreateWindBlas(std::uint32_t a_source, float a_amplitude)
+	{
+		if (!WindAvailable() || a_source >= windSources_.size() || !windSources_[a_source].live || !std::isfinite(a_amplitude) ||
+			std::abs(a_amplitude) > 10000.0f) {
 			++windStats_.refused;
 			return kInvalidBlas;
-		};
-		if (vertices == 0 || triangles == 0 || vertices > kWindMaxVertices || triangles > kWindMaxTriangles || geometry.indices.size() % 3 != 0 ||
-			!std::isfinite(geometry.amplitude) || !std::isfinite(geometry.frequency) || geometry.amplitude <= 0.0f || geometry.amplitude > 10000.0f ||
-			std::abs(geometry.frequency) > 10000.0f)
-			return refuse();
-		for (const auto index : geometry.indices)
-			if (index >= vertices)
-				return refuse();
-		for (const auto& vertex : geometry.vertices)
-			if (!std::isfinite(vertex.position[0]) || !std::isfinite(vertex.position[1]) || !std::isfinite(vertex.position[2]))
-				return refuse();
-
+		}
+		auto& source = windSources_[a_source];
 		WindMesh mesh;
 		mesh.live = true;
-		mesh.vertices = vertices;
-		mesh.triangles = triangles;
-		mesh.amplitude = geometry.amplitude;
-		mesh.frequency = geometry.frequency;
-		mesh.opaque = geometry.opaque;
-		mesh.restBytes = WindAlign(static_cast<std::uint64_t>(vertices) * kWindVertexBytes, 256);
-		mesh.indexBytes = WindAlign(static_cast<std::uint64_t>(triangles) * 3 * sizeof(std::uint32_t), 256);
-		mesh.outputBytes = WindAlign(static_cast<std::uint64_t>(vertices) * kWindOutputStride, 256);
+		mesh.source = a_source;
+		mesh.vertices = source.vertices;
+		mesh.triangles = source.triangles;
+		mesh.opaque = source.opaque;
+		mesh.meanAmplitude = a_amplitude;
+		mesh.outputBytes = WindAlign(static_cast<std::uint64_t>(source.vertices) * kWindOutputStride, 256);
 		{
-			const D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc = WindGeometryDesc(mesh.opaque, vertices, triangles);
+			const D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc = WindGeometryDesc(mesh.opaque, mesh.vertices, mesh.triangles);
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
 			inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
 			inputs.Flags = kWindBuildFlags;
@@ -177,8 +241,10 @@ namespace RayTracingRT
 			inputs.pGeometryDescs = &geometryDesc;
 			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
 			device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
-			if (info.ResultDataMaxSizeInBytes == 0 || info.ScratchDataSizeInBytes == 0)
-				return refuse();
+			if (info.ResultDataMaxSizeInBytes == 0 || info.ScratchDataSizeInBytes == 0) {
+				++windStats_.refused;
+				return kInvalidBlas;
+			}
 			mesh.blasBytes = WindAlign(info.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
 			mesh.buildScratch = WindAlign(info.ScratchDataSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
 			mesh.updateScratch = WindAlign(std::max<std::uint64_t>(info.UpdateScratchDataSizeInBytes, 256), D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
@@ -200,34 +266,39 @@ namespace RayTracingRT
 		auto& blas = blas_[handle];
 		blas = {};
 		blas.state = BlasState::Queued;  // never in buildQueue_: RecordWind builds it
-		blas.triangles = triangles;
+		blas.triangles = mesh.triangles;
 		blas.wind = index;
-		// (45f) The TLAS self-check box: every pose of the sway (the offset runs from 0 to 1.1 amplitude x alpha along +normal).
+		// (45f) The TLAS self-check box: the rest box grown by the sway's reach (1.1 x |amplitude| along any normal, vertex alpha <= 1).
+		const float reach = 1.1f * std::abs(a_amplitude);
 		for (int a = 0; a < 3; ++a) {
-			blas.boundsMin[a] = FLT_MAX;
-			blas.boundsMax[a] = -FLT_MAX;
+			blas.boundsMin[a] = source.boundsMin[a] - reach;
+			blas.boundsMax[a] = source.boundsMax[a] + reach;
 		}
-		for (const auto i : geometry.indices) {
-			const auto& vertex = geometry.vertices[i];
-			const float reach = 1.1f * geometry.amplitude * static_cast<float>(vertex.normalAlpha >> 24) / 255.0f;
-			for (int a = 0; a < 3; ++a) {
-				const float n = static_cast<float>((vertex.normalAlpha >> (8 * a)) & 0xFFu) * (2.0f / 255.0f) - 1.0f;
-				const float p = vertex.position[a];
-				const float q = p + n * reach;
-				blas.boundsMin[a] = std::min({ blas.boundsMin[a], p, q });
-				blas.boundsMax[a] = std::max({ blas.boundsMax[a], p, q });
-			}
-		}
+		++source.refs;
 		mesh.handle = handle;
-		mesh.geometry = std::move(a_geometry);
 		windStats_.bytes += mesh.Bytes();
-		windStats_.vertices += vertices;
-		windStats_.triangles += triangles;
+		windStats_.vertices += mesh.vertices;
+		windStats_.triangles += mesh.triangles;
 		winds_[index] = std::move(mesh);
 		++windLive_;
 		windStats_.meshes = windLive_;
-		windUploadQueue_.push_back(index);
 		return handle;
+	}
+
+	void Backend::SetWindPose(BlasHandle a_handle, float a_magnitude, float a_amplitude, float a_frequency, float a_timer)
+	{
+		if (a_handle >= blas_.size() || blas_[a_handle].wind == UINT32_MAX)
+			return;
+		const std::uint32_t index = blas_[a_handle].wind;
+		if (index >= winds_.size() || !winds_[index].live || winds_[index].handle != a_handle)
+			return;
+		auto& mesh = winds_[index];
+		const float pose[4] = { a_magnitude, a_amplitude, a_frequency, a_timer };
+		for (const float v : pose)
+			if (!std::isfinite(v) || std::abs(v) > 1.0e7f)
+				return;  // an implausible read keeps the last pose
+		std::copy_n(pose, 4, mesh.pose);
+		mesh.hasPose = true;
 	}
 
 	void Backend::ReleaseWindMesh(std::uint32_t a_index)
@@ -235,20 +306,20 @@ namespace RayTracingRT
 		if (a_index >= winds_.size() || !winds_[a_index].live)
 			return;
 		auto& mesh = winds_[a_index];
-		if (!mesh.uploaded)
-			std::erase(windUploadQueue_, a_index);
 		// Back once every submission that may use them completed (the BLAS may be in a TLAS still in flight).
-		skinStaticPool_.Free(mesh.rest, RetireValue());
-		skinStaticPool_.Free(mesh.index, RetireValue());
-		skinOutputPool_.Free(mesh.output, RetireValue());
-		asPool_.Free(mesh.blas, RetireValue());
+		if (mesh.allocated) {
+			skinOutputPool_.Free(mesh.output, RetireValue());
+			asPool_.Free(mesh.blas, RetireValue());
+		}
 		windStats_.bytes -= std::min(windStats_.bytes, mesh.Bytes());
 		windStats_.vertices -= std::min<std::uint64_t>(windStats_.vertices, mesh.vertices);
 		windStats_.triangles -= std::min<std::uint64_t>(windStats_.triangles, mesh.triangles);
+		const std::uint32_t source = mesh.source;
 		mesh = {};
 		freeWinds_.push_back(a_index);
 		windLive_ -= std::min<std::uint32_t>(windLive_, 1);
 		windStats_.meshes = windLive_;
+		ReleaseWindSource(source);  // the instance's reference
 	}
 
 	void Backend::ReleaseWindResources()
@@ -267,12 +338,14 @@ namespace RayTracingRT
 
 	bool Backend::WindWorkDue() const
 	{
-		if (windLive_ == 0 || !WindAvailable())
+		if (windLive_ == 0 && windSourcesLive_ == 0)
+			return false;
+		if (!WindAvailable())
 			return false;
 		if (!windUploadQueue_.empty())
 			return true;
 		for (const auto& mesh : winds_)
-			if (mesh.live && mesh.uploaded && !mesh.built)
+			if (mesh.live && !mesh.built)
 				return true;
 		return false;
 	}
@@ -281,7 +354,7 @@ namespace RayTracingRT
 	{
 		if (windUploadQueue_.empty())
 			return;
-		// As the character uploads (BackendSkin.cpp): pool ranges, no resource creation; a mesh whose ranges do not fit waits at
+		// As the character uploads (BackendSkin.cpp): pool ranges, no resource creation; a source whose ranges do not fit waits at
 		// the front of the queue for the pools' next block.
 		const std::int64_t deadline = WindQpc() + WindMsToQpc(a_cpuMs);
 		struct Pending
@@ -294,31 +367,28 @@ namespace RayTracingRT
 		std::uint32_t batchVertices = 0;
 		while (!windUploadQueue_.empty() && batch.size() < kWindUploadsPerFrame && (batch.empty() || (batchVertices < kWindUploadVerticesPerFrame && WindQpc() < deadline))) {
 			const std::uint32_t index = windUploadQueue_.front();
-			if (index >= winds_.size() || !winds_[index].live || winds_[index].uploaded || !winds_[index].geometry) {
+			if (index >= windSources_.size() || !windSources_[index].live || windSources_[index].uploaded || !windSources_[index].geometry) {
 				windUploadQueue_.pop_front();
 				continue;
 			}
-			auto& mesh = winds_[index];
-			const auto& geometry = *mesh.geometry;
+			auto& source = windSources_[index];
+			const auto& geometry = *source.geometry;
 			Pending entry{ index, {}, 0 };
 			entry.indexOffset = WindAlign(geometry.vertices.size() * sizeof(WindVertex), 256);
 			const std::uint64_t uploadBytes = entry.indexOffset + geometry.indices.size() * sizeof(std::uint32_t);
-			ArenaAlloc rest, indexRange, output, blas;
-			const bool ok = skinStaticPool_.Allocate(mesh.restBytes, rest) && skinStaticPool_.Allocate(mesh.indexBytes, indexRange) &&
-			                skinOutputPool_.Allocate(mesh.outputBytes, output) && asPool_.Allocate(mesh.blasBytes, blas) &&
+			ArenaAlloc rest, indexRange;
+			const bool ok = skinStaticPool_.Allocate(source.restBytes, rest) && skinStaticPool_.Allocate(source.indexBytes, indexRange) &&
 			                uploadPool_.Allocate(uploadBytes, entry.upload);
 			if (!ok) {
 				// Nothing recorded with them: back at once.
 				skinStaticPool_.Free(rest, 0);
 				skinStaticPool_.Free(indexRange, 0);
-				skinOutputPool_.Free(output, 0);
-				asPool_.Free(blas, 0);
 				uploadPool_.Free(entry.upload, 0);
 				++stats_.pools.allocFailsLastFrame;
-				for (auto* pool : { &skinStaticPool_, &skinOutputPool_, &asPool_, &uploadPool_ }) {
+				for (auto* pool : { &skinStaticPool_, &uploadPool_ }) {
 					if (pool->failed) {
-						SetWindFault(std::format("could not grow the {} pool for a wind mesh ({} vertices, {} triangles, {:.1f} MB)", pool->label,
-							mesh.vertices, mesh.triangles, static_cast<double>(mesh.Bytes()) / (1024.0 * 1024.0)));
+						SetWindFault(std::format("could not grow the {} pool for a wind mesh ({} vertices, {} triangles)", pool->label, source.vertices,
+							source.triangles));
 						break;
 					}
 				}
@@ -327,10 +397,8 @@ namespace RayTracingRT
 			std::byte* mapped = uploadPool_.Mapped(entry.upload);
 			std::memcpy(mapped, geometry.vertices.data(), geometry.vertices.size() * sizeof(WindVertex));
 			std::memcpy(mapped + entry.indexOffset, geometry.indices.data(), geometry.indices.size() * sizeof(std::uint32_t));
-			mesh.rest = rest;
-			mesh.index = indexRange;
-			mesh.output = output;
-			mesh.blas = blas;
+			source.rest = rest;
+			source.index = indexRange;
 			windUploadQueue_.pop_front();
 			batchVertices += geometry.Vertices();
 			batch.push_back(entry);
@@ -338,31 +406,31 @@ namespace RayTracingRT
 		if (batch.empty())
 			return;
 
-		// The copies: every touched static-pool block to copy dest, the copies, back to shader resource (the builds read them).
+		// The copies: every touched static-pool block to copy dest, the copies, back to shader resource (the poses / builds read them).
 		std::vector<std::uint32_t> blocks;
 		for (const auto& entry : batch) {
-			blocks.push_back(winds_[entry.index].rest.block);
-			blocks.push_back(winds_[entry.index].index.block);
+			blocks.push_back(windSources_[entry.index].rest.block);
+			blocks.push_back(windSources_[entry.index].index.block);
 		}
 		std::sort(blocks.begin(), blocks.end());
 		blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
 		TransitionBlocks(a_list, skinStaticPool_, blocks, D3D12_RESOURCE_STATE_COPY_DEST);
 		for (const auto& entry : batch) {
-			auto& mesh = winds_[entry.index];
-			const auto& geometry = *mesh.geometry;
+			auto& source = windSources_[entry.index];
+			const auto& geometry = *source.geometry;
 			ID3D12Resource* upload = uploadPool_.Resource(entry.upload);
-			a_list->CopyBufferRegion(skinStaticPool_.Resource(mesh.rest), mesh.rest.offset, upload, entry.upload.offset, geometry.vertices.size() * sizeof(WindVertex));
-			a_list->CopyBufferRegion(skinStaticPool_.Resource(mesh.index), mesh.index.offset, upload, entry.upload.offset + entry.indexOffset,
+			a_list->CopyBufferRegion(skinStaticPool_.Resource(source.rest), source.rest.offset, upload, entry.upload.offset, geometry.vertices.size() * sizeof(WindVertex));
+			a_list->CopyBufferRegion(skinStaticPool_.Resource(source.index), source.index.offset, upload, entry.upload.offset + entry.indexOffset,
 				geometry.indices.size() * sizeof(std::uint32_t));
 		}
 		TransitionBlocks(a_list, skinStaticPool_, blocks, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 		windRecorded_ = true;
-		windMustSubmit_ = true;  // the uploads must reach the GPU (the meshes are marked uploaded)
+		windMustSubmit_ = true;  // the uploads must reach the GPU (the sources are marked uploaded)
 		for (const auto& entry : batch) {
-			auto& mesh = winds_[entry.index];
+			auto& source = windSources_[entry.index];
 			uploadPool_.Free(entry.upload, RetireValue());  // read by this submission only
-			mesh.uploaded = true;
-			mesh.geometry.reset();
+			source.uploaded = true;
+			source.geometry.reset();
 		}
 	}
 
@@ -373,7 +441,7 @@ namespace RayTracingRT
 		windStats_.buildsLastFrame = windStats_.refitsLastFrame = windStats_.deferredLastFrame = 0;
 		windStats_.refitVerticesLastFrame = 0;
 		windStats_.stillLastFrame = false;
-		if (windLive_ == 0) {
+		if (windLive_ == 0 && windSourcesLive_ == 0) {
 			windStats_.pending = 0;
 			return;
 		}
@@ -382,12 +450,7 @@ namespace RayTracingRT
 		UploadWindMeshes(a_list, a_uploadCpuMs);
 		if (!windFault_.empty() || failed_)
 			return;
-
-		// This frame's wind pose (none: only first builds, at the mean pose).
-		const bool timerPose = a_input && a_input->windValid && std::isfinite(a_input->windMagnitude) && std::isfinite(a_input->windTimer);
-		const float magnitude = timerPose ? a_input->windMagnitude : 0.0f;
-		const float timer = timerPose ? a_input->windTimer : 0.0f;
-		const double phase = static_cast<double>(magnitude) * static_cast<double>(timer);
+		const bool refitsWanted = a_input != nullptr;  // BuildOnly (no frame): first builds only
 
 		struct Op
 		{
@@ -402,7 +465,8 @@ namespace RayTracingRT
 			auto& mesh = winds_[i];
 			if (!mesh.live)
 				continue;
-			if (!mesh.uploaded) {
+			const bool sourceReady = mesh.source < windSources_.size() && windSources_[mesh.source].live && windSources_[mesh.source].uploaded;
+			if (!sourceReady) {
 				++pending;
 				continue;
 			}
@@ -412,24 +476,43 @@ namespace RayTracingRT
 					++pending;
 					continue;
 				}
+				if (!mesh.allocated) {
+					ArenaAlloc output, blas;
+					if (!skinOutputPool_.Allocate(mesh.outputBytes, output) || !asPool_.Allocate(mesh.blasBytes, blas)) {
+						skinOutputPool_.Free(output, 0);
+						asPool_.Free(blas, 0);
+						++stats_.pools.allocFailsLastFrame;
+						for (auto* pool : { &skinOutputPool_, &asPool_ }) {
+							if (pool->failed) {
+								SetWindFault(std::format("could not grow the {} pool for a wind instance ({} vertices, {} triangles)", pool->label, mesh.vertices,
+									mesh.triangles));
+								return;
+							}
+						}
+						++pending;
+						continue;  // the pools' next block (grown asynchronously)
+					}
+					mesh.output = output;
+					mesh.blas = blas;
+					mesh.allocated = true;
+				}
 				builds.push_back(Op{ i, scratchTotal });
 				scratchTotal += WindAlign(mesh.buildScratch, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
 			} else {
 				anyBuilt = true;
 			}
 		}
-		if (timerPose) {
-			// Every built mesh (and every mesh built just now) whose pose moved since its last refit: in place, from this frame's pose.
-			auto wanted = [&](const WindMesh& a_mesh) {
-				return !a_mesh.posed || std::abs(0.25 * static_cast<double>(a_mesh.frequency) * (phase - a_mesh.posedPhase)) >= kWindStillCycles;
-			};
+		if (refitsWanted) {
+			// Every built instance (and every one built just now) whose pose changed since its last refit: in place, at this frame's pose.
 			for (const auto& op : builds) {
+				if (!winds_[op.mesh].hasPose)
+					continue;
 				refits.push_back(Op{ op.mesh, scratchTotal });
 				scratchTotal += WindAlign(winds_[op.mesh].updateScratch, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
 			}
 			for (std::uint32_t i = 0; i < winds_.size(); ++i) {
 				const auto& mesh = winds_[i];
-				if (!mesh.live || !mesh.uploaded || !mesh.built || !wanted(mesh))
+				if (!mesh.live || !mesh.built || !mesh.hasPose || (mesh.posed && SamePose(mesh.pose, mesh.posedPose)))
 					continue;
 				refits.push_back(Op{ i, scratchTotal });
 				scratchTotal += WindAlign(mesh.updateScratch, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
@@ -460,11 +543,14 @@ namespace RayTracingRT
 
 		a_list->SetComputeRootSignature(windRootSignature_.Get());
 		a_list->SetPipelineState(windPipeline_.Get());
+		// Mode 0: the mean pose of the first build (amplitude only); mode 1: the pose (magnitude, amplitude, frequency, timer).
 		auto pose = [&](const WindMesh& a_mesh, std::uint32_t a_mode) {
-			const std::uint32_t constants[kWindConstants] = { a_mesh.vertices, a_mode, std::bit_cast<std::uint32_t>(a_mesh.amplitude),
-				std::bit_cast<std::uint32_t>(a_mesh.frequency), std::bit_cast<std::uint32_t>(magnitude), std::bit_cast<std::uint32_t>(timer), 0u, 0u };
+			const auto& source = windSources_[a_mesh.source];
+			const float amplitude = a_mode == 0 ? a_mesh.meanAmplitude : a_mesh.pose[1];
+			const std::uint32_t constants[kWindConstants] = { a_mesh.vertices, a_mode, std::bit_cast<std::uint32_t>(amplitude), std::bit_cast<std::uint32_t>(a_mesh.pose[2]),
+				std::bit_cast<std::uint32_t>(a_mesh.pose[0]), std::bit_cast<std::uint32_t>(a_mesh.pose[3]), 0u, 0u };
 			a_list->SetComputeRoot32BitConstants(0, kWindConstants, constants, 0);
-			a_list->SetComputeRootShaderResourceView(1, skinStaticPool_.Address(a_mesh.rest));
+			a_list->SetComputeRootShaderResourceView(1, skinStaticPool_.Address(source.rest));
 			a_list->SetComputeRootUnorderedAccessView(2, skinOutputPool_.Address(a_mesh.output));
 			a_list->Dispatch((a_mesh.vertices + kWindGroupSize - 1) / kWindGroupSize, 1, 1);
 		};
@@ -478,9 +564,10 @@ namespace RayTracingRT
 			return blocks;
 		};
 		auto record = [&](WindMesh& a_mesh, std::uint64_t a_scratchOffset, bool a_update) {
+			const auto& source = windSources_[a_mesh.source];
 			D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc = WindGeometryDesc(a_mesh.opaque, a_mesh.vertices, a_mesh.triangles);
 			geometryDesc.Triangles.VertexBuffer.StartAddress = skinOutputPool_.Address(a_mesh.output);
-			geometryDesc.Triangles.IndexBuffer = skinStaticPool_.Address(a_mesh.index);
+			geometryDesc.Triangles.IndexBuffer = skinStaticPool_.Address(source.index);
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc{};
 			buildDesc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
 			buildDesc.Inputs.Flags = kWindBuildFlags;
@@ -537,7 +624,7 @@ namespace RayTracingRT
 				auto& mesh = winds_[op.mesh];
 				record(mesh, op.scratchOffset, true);
 				mesh.posed = true;
-				mesh.posedPhase = phase;
+				std::copy_n(mesh.pose, 4, mesh.posedPose);
 				++windStats_.refitsLastFrame;
 				windStats_.refitVerticesLastFrame += mesh.vertices;
 				++recWork_.windRefits;

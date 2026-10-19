@@ -117,6 +117,9 @@ public:
 		bool EnableContactAo = true;
 		float ContactRadius = 15.f;  // centimetres
 		float ContactStrength = 1.f;
+		// (47n) contactAo.cs.hlsl: a depth disocclusion test on the history (its own last-frame view depth, texContactDepth) and a
+		// 4-frame window instead of 8 (SSGICB ContactFlags bit 0). Off = 47m.
+		bool ContactGhostFix = true;
 	} settings;
 
 	struct alignas(16) SSGICB
@@ -177,7 +180,9 @@ public:
 		float2 PrevFrameDim;
 		/// @brief Explicit, because a bare float2 tail would leave sizeof at 296 -- and HLSL
 		/// would pad the row anyway, so the padding may as well be visible on both sides.
-		float2 ssgiPad0;
+		/// (47n) contactAo.cs.hlsl: bit 0 = ContactGhostFix, bit 1 = texContactDepth holds last frame's depth.
+		uint ContactFlags;
+		float ssgiPad0;
 	};
 	STATIC_ASSERT_ALIGNAS_16(SSGICB);
 	eastl::unique_ptr<ConstantBuffer> ssgiCB;
@@ -208,6 +213,9 @@ public:
 	// (contact AO) Full-resolution ping-pong for the accumulated contact visibility. R8_UNORM, so
 	// the signal is format-bounded to [0, 1] and nothing downstream needs a finiteness test.
 	eastl::unique_ptr<Texture2D> texContactAo[2] = { nullptr };
+	// (47n) The view depth each contact AO frame was written at (R16_FLOAT, ping-pong with texContactAo): the uncovered-area test.
+	eastl::unique_ptr<Texture2D> texContactDepth[2] = { nullptr };
+	bool contactDepthValid = false;  // the texContactDepth slot the next frame reads holds last frame's depth
 
 	/// @brief (46f) Ray Tracing's RTAO composite for this frame (occlusion, same layout as texAo), or null.
 	///

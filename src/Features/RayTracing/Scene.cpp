@@ -329,10 +329,13 @@ namespace RayTracingScene
 		capturedGeometries_.clear();
 		trackedRefs_.clear();
 		persistent_ = {};
-		for (auto& [key, mesh] : windMeshes_)  // (47l) likewise
-			a_backend.ReleaseBlas(mesh.blas);
-		windMeshes_.clear();
-		RayTracingWind::SetActive(false);  // (47l) no request outlives the scene (the next UpdateWind switches it on again)
+		for (auto& [handle, instance] : windInstances_)  // (47n) every shape released above; anything left is a bookkeeping slip
+			a_backend.ReleaseBlas(handle);
+		windInstances_.clear();
+		for (auto& [key, source] : windSources_)
+			a_backend.ReleaseWindSource(source.source);
+		windSources_.clear();
+		RayTracingWind::SetActive(false);  // (47l) the next UpdateWind switches it on again
 		for (auto& [key, mesh] : meshes_)  // every user released above; anything left is a bookkeeping slip
 			a_backend.ReleaseBlas(mesh.blas);
 		meshes_.clear();
@@ -1196,11 +1199,8 @@ namespace RayTracingScene
 		if (a_shape.registered)
 			RayTracingCasterFilter::Remove(a_shape.geometry.get());
 		a_shape.registered = false;
-		// (47l) Its wind mesh (before the frozen mesh: an alpha wind mesh traces with the frozen mesh's texcoords) and its request.
+		// (47l) Its wind BLAS (before the frozen mesh: an alpha wind BLAS traces with the frozen mesh's texcoords).
 		ReleaseWind(a_backend, a_shape);
-		if (a_shape.windRequested)
-			RayTracingWind::Forget(a_shape.geometry.get());
-		a_shape.windRequested = false;
 		const auto it = meshes_.find(a_shape.key);
 		if (it != meshes_.end() && --it->second.users == 0) {
 			a_backend.ReleaseBlas(it->second.blas);
@@ -2184,7 +2184,7 @@ namespace RayTracingScene
 				verdict = "character (not traced)";
 			} else if (byChoice && !shapeReason) {
 				bucket = MissReason::ByChoice;
-				verdict = "left to the shadow map by Sun Shadows > Advanced";
+				verdict = "left to the shadow map by Objects in Ray Tracing";
 			} else if (shapeReason) {
 				verdict = std::format("shape rejected: {}", shapeReason);
 			} else if (kind == RefKind::Other) {
@@ -2444,13 +2444,12 @@ namespace RayTracingScene
 	}
 
 	// ---------------------------------------------------------------------------------------------
-	// (47l) Foliage sway: tree-animated shapes traced with the game's wind
+	// (47l, 47n) Foliage sway: tree-animated shapes traced with the game's wind, each plant with its own
 	// ---------------------------------------------------------------------------------------------
 
 	void Scene::MarkWindCandidate(ObjectShape& a_shape, RE::BSTriShape* a_triShape)
 	{
 		a_shape.windCandidate = false;
-		a_shape.windPredicted = false;
 		if (!a_triShape)
 			return;
 		const auto& runtime = a_triShape->GetGeometryRuntimeData();
@@ -2462,23 +2461,6 @@ namespace RayTracingScene
 		if (!(flags & RE::BSGraphics::Vertex::VF_COLORS) || !(flags & RE::BSGraphics::Vertex::VF_NORMAL))
 			return;
 		a_shape.windCandidate = true;
-		// Its TREE form's leaf amplitude / frequency: a guess that lets a tree's wind mesh be made before it is drawn (behind a
-		// loading screen); the first sample of the shape's constants confirms it or moves the shape to the right wind mesh.
-		int depth = 0;
-		for (RE::NiAVObject* node = a_triShape; node && depth < 64; node = node->parent, ++depth) {
-			if (auto* owner = NodeOwner(node)) {
-				auto* base = owner->GetBaseObject();
-				if (auto* tree = base ? base->As<RE::TESObjectTREE>() : nullptr) {
-					const float amplitude = tree->data.leafAmplitude, frequency = tree->data.leafFrequency;
-					if (std::isfinite(amplitude) && std::isfinite(frequency) && amplitude > 0.0f && amplitude <= 1000.0f && std::abs(frequency) <= 1000.0f) {
-						a_shape.windPrediction[0] = amplitude;
-						a_shape.windPrediction[1] = frequency;
-						a_shape.windPredicted = true;
-					}
-				}
-				break;
-			}
-		}
 	}
 
 	void Scene::ReleaseWind(RayTracingRT::Backend& a_backend, ObjectShape& a_shape)
@@ -2486,19 +2468,23 @@ namespace RayTracingScene
 		a_shape.windReady = false;
 		if (a_shape.windBlas == RayTracingRT::kInvalidBlas)
 			return;
-		const auto it = windMeshes_.find(a_shape.windKey);
-		if (it != windMeshes_.end() && it->second.blas == a_shape.windBlas && it->second.users > 0 && --it->second.users == 0) {
-			a_backend.ReleaseBlas(it->second.blas);  // its ranges go behind the fence (a TLAS in flight may still name it)
-			windMeshes_.erase(it);
-		}
+		// Its BLAS and posed vertices go behind the fence (a TLAS in flight may still name it); its source when no shape uses it.
+		a_backend.ReleaseBlas(a_shape.windBlas);
+		windInstances_.erase(a_shape.windBlas);
 		a_shape.windBlas = RayTracingRT::kInvalidBlas;
-		a_shape.windKey = {};
+		const auto it = windSources_.find(a_shape.key);
+		if (it != windSources_.end() && (it->second.users <= 1 || --it->second.users == 0)) {
+			a_backend.ReleaseWindSource(it->second.source);
+			windSources_.erase(it);
+		}
 	}
 
-	bool Scene::AcquireWind(RayTracingRT::Backend& a_backend, ObjectShape& a_shape, const WindKey& a_key, float a_amplitude, float a_frequency)
+	bool Scene::AcquireWind(RayTracingRT::Backend& a_backend, ObjectShape& a_shape, bool a_allowNewSource)
 	{
-		auto it = windMeshes_.find(a_key);
-		if (it == windMeshes_.end()) {
+		auto it = windSources_.find(a_shape.key);
+		if (it == windSources_.end()) {
+			if (!a_allowNewSource)
+				return false;
 			const auto frozen = meshes_.find(a_shape.key);
 			if (frozen == meshes_.end())
 				return false;
@@ -2506,7 +2492,7 @@ namespace RayTracingScene
 				a_shape.windNone = true;  // known: no vertex alpha, nothing sways
 				return false;
 			}
-			++windNewThisFrame_;  // attempts (the CPU of the read and copy is what the cap bounds)
+			++windNewSourcesThisFrame_;  // attempts (the CPU of the read and copy is what the cap bounds)
 			auto* shape = a_shape.geometry ? a_shape.geometry->AsTriShape() : nullptr;
 			static thread_local RawMesh mesh;
 			static thread_local std::vector<float> local;
@@ -2539,87 +2525,72 @@ namespace RayTracingScene
 			}
 			frozen->second.windAlpha = 1;
 			geometry->indices = mesh.indices;
-			geometry->amplitude = a_amplitude;
-			geometry->frequency = a_frequency;
 			geometry->opaque = a_shape.key.kind == 0;
-			const auto handle = a_backend.CreateWindBlas(std::move(geometry));
-			if (handle == RayTracingRT::kInvalidBlas) {
+			const std::uint32_t source = a_backend.CreateWindSource(std::move(geometry));
+			if (source == UINT32_MAX) {
 				a_shape.windNone = true;  // refused (size, VRAM budget): stays frozen until it is captured again
 				return false;
 			}
-			it = windMeshes_.emplace(a_key, WindMesh{ handle, 0 }).first;
-			++windStats_.newMeshes;
+			it = windSources_.emplace(a_shape.key, WindSourceRef{ source, 0 }).first;
+			++windStats_.newSources;
+		}
+		// Its own BLAS, first built at the mean of its sway now.
+		const auto globals = RayTracingWind::FrameGlobals(currentFrame_);
+		RE::NiNode* node = RayTracingWind::LeafNodeOf(a_shape.geometry.get());
+		RayTracingWind::Pose pose;
+		const float amplitude = RayTracingWind::Evaluate(node, globals, pose) ? pose.amplitude : 0.0f;
+		const std::uint64_t overBudgetBefore = a_backend.GetWindStats().overBudget;
+		const auto handle = a_backend.CreateWindBlas(it->second.source, amplitude);
+		if (handle == RayTracingRT::kInvalidBlas) {
+			if (it->second.users == 0) {
+				a_backend.ReleaseWindSource(it->second.source);
+				windSources_.erase(it);
+			}
+			if (a_backend.GetWindStats().overBudget != overBudgetBefore)
+				windPauseUntil_ = currentFrame_ + kWindBudgetPauseFrames;  // the VRAM budget: no new wind BLAS for a while (it stays frozen)
+			else
+				a_shape.windNone = true;  // refused for good (bad data): stays frozen until it is captured again
+			return false;
 		}
 		++it->second.users;
-		a_shape.windBlas = it->second.blas;
-		a_shape.windKey = a_key;
+		++windNewInstancesThisFrame_;
+		++windStats_.newInstances;
+		a_shape.windBlas = handle;
+		windInstances_[handle] = WindInstance{ a_shape.geometry, RE::NiPointer<RE::NiNode>(node), UINT32_MAX };
 		return true;
 	}
 
-	void Scene::VisitWind(RayTracingRT::Backend& a_backend, ObjectShape& a_shape, std::int64_t a_deadline, bool a_allowNew)
+	void Scene::VisitWind(RayTracingRT::Backend& a_backend, ObjectShape& a_shape, std::int64_t a_deadline, bool a_allowNew, const double a_camera[3], float a_radius)
 	{
 		if (!a_shape.windCandidate || !a_shape.geometry)
 			return;
 		if (a_shape.windNone) {
-			if (a_shape.windRequested) {
-				RayTracingWind::ForgetLocked(a_shape.geometry.get());  // no more samples of a shape that never sways
-				a_shape.windRequested = false;
-			}
 			++windStats_.still;
 			return;
 		}
 		++windStats_.candidates;
-		const auto* geometry = a_shape.geometry.get();
-		if (!a_shape.windRequested) {
-			RayTracingWind::RequestLocked(geometry, a_shape.windPredicted ? a_shape.windPrediction : nullptr);
-			a_shape.windRequested = true;
-		}
-		RayTracingWind::Params params;
-		float amplitude = 0.0f, frequency = 0.0f;
-		if (RayTracingWind::GetLocked(geometry, params)) {
-			amplitude = params.treeParams[2];
-			frequency = params.treeParams[3];
-			if (!a_shape.windSampled) {
-				a_shape.windSampled = true;
-				if (a_shape.windPredicted) {
-					const bool hit = RayTracingWind::Quantize(a_shape.windPrediction[0]) == RayTracingWind::Quantize(amplitude) &&
-					                 RayTracingWind::Quantize(a_shape.windPrediction[1]) == RayTracingWind::Quantize(frequency);
-					++(hit ? windStats_.predictedHits : windStats_.predictedMisses);
-					if (!windPredictionOff_ && windStats_.predictedMisses >= 8 && windStats_.predictedHits == 0) {
-						windPredictionOff_ = true;
-						logger::info("[RayTracing] Foliage sway: the TREE forms' leaf amplitude / frequency never matched the shaders' ({} samples): "
-									 "wind meshes wait for their first draw from now on",
-							windStats_.predictedMisses);
-					}
-				}
-			}
-			if (!(amplitude > 0.0f)) {
-				// TreeParams.z 0: the shader moves nothing; the frozen BLAS is exact. Not final: a read of the constants can be stale, so
-				// the shape stays sampled (the 900-frame spot check) and sways once a sample has an amplitude.
+		// Distance from the camera to the shape's bound (the engine fades the sway out with its node's distance; beyond the fade end
+		// the plant does not move and the frozen BLAS is exact).
+		const auto& bound = a_shape.geometry->worldBound;
+		const double dx = bound.center.x - a_camera[0], dy = bound.center.y - a_camera[1], dz = bound.center.z - a_camera[2];
+		const double distance = std::sqrt(dx * dx + dy * dy + dz * dz) - static_cast<double>(std::isfinite(bound.radius) ? std::max(bound.radius, 0.0f) : 0.0f);
+		if (a_shape.windBlas != RayTracingRT::kInvalidBlas) {
+			if (distance > static_cast<double>(a_radius) * kWindReleaseScale + kWindRadiusMargin) {
+				// Left the radius: back to the frozen BLAS (it does not move out there).
 				ReleaseWind(a_backend, a_shape);
-				++windStats_.still;
-				--windStats_.candidates;
+				++windStats_.released;
 				return;
 			}
-		} else if (a_shape.windPredicted && !windPredictionOff_) {
-			amplitude = a_shape.windPrediction[0];
-			frequency = a_shape.windPrediction[1];
 		} else {
-			++windStats_.waiting;  // not drawn since captured: no amplitude / frequency yet
-			return;
+			if (distance > a_radius)
+				return;
+			const bool transition = transition_ || hold_;
+			const std::uint32_t sourceCap = transition ? kWindNewSourcesTransition : kWindNewSourcesPerFrame;
+			const std::uint32_t instanceCap = transition ? kWindNewInstancesTransition : kWindNewInstancesPerFrame;
+			if (a_allowNew && windNewInstancesThisFrame_ < instanceCap && static_cast<std::int32_t>(currentFrame_ - windPauseUntil_) >= 0 && Qpc() < a_deadline)
+				AcquireWind(a_backend, a_shape, windNewSourcesThisFrame_ < sourceCap);
 		}
-		const WindKey key{ a_shape.key, RayTracingWind::Quantize(amplitude), RayTracingWind::Quantize(frequency) };
-		if (a_shape.windBlas != RayTracingRT::kInvalidBlas && !(key == a_shape.windKey)) {
-			// A sample differs from the guess (or a spot check from the last sample): the shape moves to the right wind mesh (its
-			// instance takes the frozen BLAS until that one is built: never a hole).
-			ReleaseWind(a_backend, a_shape);
-			++windStats_.rekeyed;
-		}
-		if (a_shape.windBlas == RayTracingRT::kInvalidBlas) {
-			const std::uint32_t cap = (transition_ || hold_) ? kWindNewMeshesTransition : kWindNewMeshesPerFrame;
-			if (windMeshes_.contains(key) || (a_allowNew && windNewThisFrame_ < cap && Qpc() < a_deadline))
-				AcquireWind(a_backend, a_shape, key, amplitude, frequency);
-		}
+		++windStats_.inRadius;
 		a_shape.windReady = a_shape.windBlas != RayTracingRT::kInvalidBlas && a_shape.ready && a_backend.IsBlasBuilt(a_shape.windBlas);
 		if (a_shape.windReady)
 			++windStats_.swaying;
@@ -2629,15 +2600,16 @@ namespace RayTracingScene
 
 	void Scene::UpdateWind(RayTracingRT::Backend& a_backend, std::int64_t a_deadline, bool a_allowNew)
 	{
-		windNewThisFrame_ = 0;
-		windStats_.candidates = windStats_.swaying = windStats_.waiting = windStats_.still = windStats_.newMeshes = 0;
-		const bool on = SwayActive() && a_backend.WindAvailable() && RayTracingWind::TreeAnimsEnabled();
+		windNewSourcesThisFrame_ = windNewInstancesThisFrame_ = 0;
+		windStats_.candidates = windStats_.inRadius = windStats_.swaying = windStats_.waiting = windStats_.still = 0;
+		windStats_.newInstances = windStats_.newSources = windStats_.released = 0;
+		const bool on = SwayActive() && a_backend.WindAvailable() && RayTracingWind::Available() && RayTracingWind::TreeAnimsEnabled();
 		if (!on) {
 			if (windWasOn_) {
 				// Every shape back to its frozen BLAS (released behind the fence; retiring captures too: traced frozen this frame).
 				auto reset = [&](ObjectShape& a_shape) {
 					ReleaseWind(a_backend, a_shape);
-					a_shape.windRequested = a_shape.windNone = a_shape.windSampled = false;
+					a_shape.windNone = false;
 				};
 				for (const auto* list : { &cells_, &retiring_ })
 					for (const auto& cell : *list)
@@ -2647,25 +2619,68 @@ namespace RayTracingScene
 					for (const auto& object : *list)
 						for (auto& shape : object->shapes)
 							reset(shape);
-				for (auto& [key, mesh] : windMeshes_)  // every user released above; anything left is a bookkeeping slip
-					a_backend.ReleaseBlas(mesh.blas);
-				windMeshes_.clear();
+				for (auto& [handle, instance] : windInstances_)  // every user released above; anything left is a bookkeeping slip
+					a_backend.ReleaseBlas(handle);
+				windInstances_.clear();
+				for (auto& [key, source] : windSources_)
+					a_backend.ReleaseWindSource(source.source);
+				windSources_.clear();
 				windWasOn_ = false;
 			}
 			RayTracingWind::SetActive(false);
-			windStats_.meshes = 0;
+			windStats_.sources = windStats_.instances = 0;
+			windStats_.radius = 0.0f;
 			return;
 		}
 		windWasOn_ = true;
 		RayTracingWind::SetActive(true);
-		// One lock for the whole pass (VisitWind uses the *Locked calls; nothing in it may call the locking ones).
-		const auto windLock = RayTracingWind::LockForBatch();
+		// The radius: the engine's own fade end (beyond it every plant stands still: the frozen BLAS is exact), at most kWindMaxRadius.
+		const auto globals = RayTracingWind::FrameGlobals(currentFrame_);
+		float radius = kWindMaxRadius;
+		if (globals.valid && globals.fadeEnd > 0.0f && globals.fadeEnd > globals.fadeStart)
+			radius = std::min(globals.fadeEnd + kWindRadiusMargin, kWindMaxRadius);
+		windStats_.radius = radius;
+		double camera[3]{};
+		if (auto* worldCamera = RE::Main::WorldRootCamera()) {
+			camera[0] = worldCamera->world.translate.x;
+			camera[1] = worldCamera->world.translate.y;
+			camera[2] = worldCamera->world.translate.z;
+		}
 		for (const auto& cell : cells_)
 			for (auto& shape : cell->alphaShapes)
-				VisitWind(a_backend, shape, a_deadline, a_allowNew);
+				VisitWind(a_backend, shape, a_deadline, a_allowNew, camera, radius);
 		for (const auto& object : objects_)
 			for (auto& shape : object->shapes)
-				VisitWind(a_backend, shape, a_deadline, a_allowNew);
-		windStats_.meshes = static_cast<std::uint32_t>(windMeshes_.size());
+				VisitWind(a_backend, shape, a_deadline, a_allowNew, camera, radius);
+		windStats_.sources = static_cast<std::uint32_t>(windSources_.size());
+		windStats_.instances = static_cast<std::uint32_t>(windInstances_.size());
+	}
+
+	void Scene::UpdateWindPoses(RayTracingRT::Backend& a_backend, std::uint32_t a_frame)
+	{
+		if (windInstances_.empty())
+			return;
+		if (a_frame != windPoseStatsFrame_) {
+			windPoseStatsFrame_ = a_frame;
+			windStats_.poses = windStats_.poseFaults = 0;
+		}
+		const auto globals = RayTracingWind::FrameGlobals(a_frame);
+		for (auto& [handle, instance] : windInstances_) {
+			if (instance.poseFrame == a_frame)
+				continue;
+			instance.poseFrame = a_frame;
+			// The node the draw uses this frame (re-read: the shape's fade node may change; the one in use is held).
+			RE::NiNode* node = RayTracingWind::LeafNodeOf(instance.geometry.get());
+			if (node != instance.node.get())
+				instance.node.reset(node);
+			RayTracingWind::Pose pose;
+			if (!RayTracingWind::Evaluate(node, globals, pose)) {
+				++windStats_.poseFaults;
+				continue;  // the last pose stays
+			}
+			a_backend.SetWindPose(handle, pose.magnitude, pose.amplitude, pose.frequency, pose.timer);
+			RayTracingWind::NoteEarly(node, pose, a_frame);
+			++windStats_.poses;
+		}
 	}
 }

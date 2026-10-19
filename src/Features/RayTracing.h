@@ -188,12 +188,11 @@ public:
 		// filters weight taps by the G-buffer normal (not only the 45 degree gate). AOFullResFilter: the large-scale term filtered at
 		// full render resolution instead of 1/4. AOAlphaBudget: an AO ray past the alpha candidate budget counts as 0 blocked (46s),
 		// 1 half open, 2 open. All off / 0: 46s.
-		bool AODetail = true;
+		// (47n) Fine Detail (two scales) and the Normal-Guided Filter are always on (the AODetail / AONormalGuided keys are gone).
 		float AODetailStrength = 1.0f;
 		float AODetailLength = 20.0f;  // units: 8 - 48 (at most half the Ray Length)
-		int AODetailRays = 2;          // near rays per pixel, the long ray's near part included: 1 - 4
-		bool AONormalGuided = true;
-		bool AOFullResFilter = false;
+		int AODetailRays = 2;          // near rays per pixel, the long ray's near part included: 1 - 4 (the RTAO Custom tier's value)
+		bool AOFullResFilter = false;  // the RTAO Custom tier's value
 		int AOAlphaBudget = 0;
 		// (46y) Outside the settings macro too. Screen-Space Shadows for Non-RT Casters (Point Light Shadows): for ray-traced lights
 		// Screen Space Point Light Shadows run as well, but only occluders the ray tracer does not see shadow (grass, terrain, LOD,
@@ -203,29 +202,35 @@ public:
 		// that alternates every frame (the filter fills the other half from the neighbours; off = 46x, default off).
 		bool PointLightsSSPLSNonRT = true;
 		float PointLightsSSPLSContact = 8.0f;
-		bool AOSingleRay = true;
-		bool AOHalfResFar = false;
+		bool AOHalfResFar = false;  // the RTAO Custom tier's value ((47n) Single Long Ray always on: the AOSingleRay key is gone)
 		// (47h) Outside the settings macro too. AOCharacterSelfFix "RTAO: Character Self-Occlusion Fix" (TraceAOCS kFlagSelfFix).
 		// SunDepthCheckTranslucent "Sun Shadow: Depth Check for Translucent Surfaces": a forward (blended) Lighting surface that is not
 		// the one in the depth buffer takes the cascades at its own position instead of the ray-traced screen mask (Lighting.hlsl).
 		// PointShadowsOnWater "Point Light Shadows on Water": (47i) the point trace also traces from last frame's water surface; the
 		// Water shader uses that where its fragment matches (TracePointLightsCS kFlagWater, PointLightShadows.hlsli GetWater). All three off = 47g.
-		bool AOCharacterSelfFix = true;
+		// (47n) The Character Self-Occlusion Fix is always on (the AOCharacterSelfFix key is gone).
 		bool SunDepthCheckTranslucent = true;
 		bool PointShadowsOnWater = true;
 		// (47j) AOSmoothNormals "RTAO: Smooth Normals": the AO hemisphere around last frame's G-buffer normal reprojected to this frame
-		// (AONormalPrepCS, confidence-blended toward the depth normal), not the per-facet depth normal. Off = 47i.
+		// (AONormalPrepCS, confidence-blended toward the depth normal), not the per-facet depth normal. Off = 47i. (47n) The RTAO Custom
+		// tier's value; its v2 refinements (the 47k AOSmoothNormals2) are always on.
 		bool AOSmoothNormals = true;
-		// (47k) AOSmoothNormals2 "RTAO: Smooth Normals v2" (needs Smooth Normals): the ray start offset along the smooth normal, a
-		// direction below the depth normal's plane projected onto it (not mirrored); AONormalPrepCS: the best match in a 3x3 of last
-		// frame, tolerances by the pixel footprint / max(N.V, 0.2), and the low-confidence fallback a depth-only smoothed normal (a
-		// sparse ring of depth normals weighted by plane agreement) instead of the raw facet. Off = 47j.
-		bool AOSmoothNormals2 = true;
 		// (47l) Outside the settings macro too. AOTemporalV2 "RTAO: Temporal v2" (needs Temporal): per-pixel history length,
 		// disocclusion test against our own last-frame depth and normal, depth-weighted history taps, a statistical clamp (both
 		// terms), a history-fix blur while the history is short, and the large-scale blur's radius in world units (RTAOTemporalCS
 		// RTAO_TEMPORAL_V2, RTAOFilterCS). Off = 47k. (47m) The 47l Blue-Noise Rays option is gone (interleaved gradient noise only).
+		// (47n) The RTAO Custom tier's value.
 		bool AOTemporalV2 = true;
+		// (47n) Quality tiers, outside the settings macro. SunShadows false = the sun's "Off" (QualityLevel is kept, so turning the sun
+		// back on returns to its tier). PointQuality / AOQuality: 0 Low, 1 Medium, 2 High, 3 Ultra, 4 Custom; their Custom values are
+		// the older keys (PointLightsPerPixel, -PerPixelInterior, -MaxSources, -Distance, -AlphaOutdoors; AODetailRays, AODistance,
+		// AOHalfResFar, AOFullResFilter, AOTemporalV2, AOSmoothNormals). Their "Off" = PointLights / AO false.
+		bool SunShadows = true;
+		int PointQuality = 2;  // High (the 46b-47m defaults)
+		int AOQuality = 1;     // Medium
+		// (47n) RTAO ghosting: "RTAO: Tight History Near Moving Things" (AODynamicFlag): pixels whose AO rays hit a character or a moving
+		// object (this frame or last) keep at most 1 frame of Temporal v2 history and a tight 3x3 clamp.
+		bool AODynamicFlag = true;
 		// (47l) Outside the settings macro too. FoliageSway "Sway in RT Shadows" (under Foliage): with Foliage ray traced / Both, tree-
 		// animated leaves, bushes and branches are traced with the game's wind (a wind BLAS per mesh, posed and refit every frame).
 		// Off = 47k (frozen at their rest pose). No effect with Foliage = Shadow map.
@@ -250,6 +255,7 @@ public:
 		NormalConfidence,  // (47k) Smooth Normals: green = used (by its confidence), red = fell back, blue = no data
 		NormalNs,          // (47k) the normal the AO hemisphere is built around (RGB = xyz * 0.5 + 0.5)
 		NormalNg,          // (47k) the depth (facet) normal
+		History,           // (47n) Temporal v2: red = history rejected, green = clamp active, blue = history length / 32, white dots = moving-occluder flag
 		Count
 	};
 	Settings settings;
@@ -269,6 +275,8 @@ public:
 	// (46g) The Ray Tracing category: the feature entry (master switch, status, diagnostics) and three more entries.
 	void DrawMasterHeader();
 	void DrawSunPage();
+	/// (47n) Main page: the per-kind rows (sun, point lights and RTAO share them).
+	void DrawObjectRows();
 	void DrawPointLightPage();
 	void DrawAOPage();
 	void DrawDiagnostics();
@@ -385,18 +393,46 @@ private:
 	};
 	QualityParams ResolveQuality() const;
 	void CopyTierToCustom(int a_tier);
+	/// (47n) What a point-light / RTAO tier (or Custom: the older keys) sets.
+	struct PointTierParams
+	{
+		int k = 2, kInterior = 4, maxSources = 64;
+		float distance = 4000.0f;
+		bool alphaOutdoors = true;
+	};
+	struct AOTierParams
+	{
+		int detailRays = 1;
+		float distance = 5000.0f;
+		bool halfResFar = true, fullResFilter = false, temporalV2 = true, smoothNormals = true;
+	};
+	[[nodiscard]] PointTierParams ResolvePointTier() const;
+	[[nodiscard]] AOTierParams ResolveAOTier() const;
+	void CopyPointTierToCustom(int a_tier);
+	void CopyAOTierToCustom(int a_tier);
+	/// (47n) The sun's shadows are traced (Sun Shadows not "Off").
+	[[nodiscard]] bool SunOn() const { return settings.SunShadows; }
+	/// (47n) Ray Tracing has something to do: on, and at least one of sun / point lights / RTAO not "Off" (else: as switched off).
+	[[nodiscard]] bool RtWanted() const { return settings.Enabled && (settings.SunShadows || settings.PointLights || settings.AO); }
+	// (47n) Sun Off outdoors: frames since it was picked (its sun-only textures go after a calm period).
+	std::uint32_t sunOffFrames = 0;
+	bool sunOffReleased = false;
+	void ReleaseSunOnlyResources();
 	/// (45l) Upscaling's Ray Reconstruction is running (DLSS, RR switched on and available).
 	static bool UpscalingRRActive();
 	/// (45l) The denoiser in effect: DLSS RR whenever Upscaling's Ray Reconstruction runs, else the chosen one.
 	[[nodiscard]] DenoiserMode EffectiveDenoiser() const;
 
 	bool EnsureBackend();
-	bool EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc);
+	bool EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc, bool a_maskTemp = true);
 	/// (46q) The debug texture only while a debug view is on (Size Buffers to Render Resolution); false = not available.
 	bool EnsureDebugColor();
 	void ReleaseD3D11Resources();
 	void Disable(Status a_status, std::string a_reason);
 	void RunFrame();
+	/// (47n) RunFrame's outdoor frame with Sun Shadows "Off": point lights and RTAO only (as RunInteriorFrame).
+	void RunNoSunFrame(ID3D11ShaderResourceView* a_depth, ID3D11ShaderResourceView* a_mask, const float a_traceRect[4], double a_camX, double a_camY, double a_camZ,
+		std::uint32_t a_width, std::uint32_t a_height, bool a_validate);
 	bool ComputeRects(float o_traceRect[4], float o_coreRect[4], double a_camX, double a_camY);
 
 	ID3D11ComputeShader* GetShader(winrt::com_ptr<ID3D11ComputeShader>& a_shader, const wchar_t* a_path, const char* a_name);
@@ -466,6 +502,7 @@ private:
 		std::uint32_t width = 0, height = 0;
 		bool writeSSS = false, debug = false, penumbra = false, spatial = false, half = false, sigma = false, sssNonRT = false;
 		bool interior = false;  // (46c) point lights only: no sun combine
+		bool noSun = false;     // (47n) outdoors with the sun "Off": point lights / RTAO only (no combine, no mask channels)
 		bool traceSync = true;  // (46h) FinishFrame waits for the trace (false: an interior frame with RTAO only; the AO wait covers it)
 		bool splitSun = false;  // (46m) Split Trace Sync: the sun fence first (shadow mask passes), the rest before the point lights' denoiser
 		float biasConstant = 0.0f, biasPerUnit = 0.0f;
@@ -644,6 +681,8 @@ private:
 	void PublishCpuSplit();
 	RayTracingScene::SceneConfig SceneConfigFromSettings() const;
 	D3D11_TEXTURE2D_DESC maskDesc{};
+	bool maskDescValid = false;       // (47n) maskDesc holds the current size (MaskTemp itself may be absent: sun Off)
+	std::uint64_t maskTempBytes = 0;  // (47n)
 	std::uint64_t d3d11Bytes = 0;
 	bool typedUavLoadR8 = false;
 
@@ -682,7 +721,7 @@ private:
 	// (47l) Foliage sway: likewise (a wind fault switches FoliageSway off); this frame's wind into an RT frame input.
 	bool windRequested = false;
 	std::string windOffReason;
-	void FillWind(RayTracingRT::FrameInput& a_input) const;
+	void FillWind(RayTracingRT::FrameInput& a_input);
 
 	// (46b) Point-light shadows.
 	struct alignas(16) PointDenoiseCB
@@ -769,6 +808,7 @@ private:
 		double camera[3]{};
 	} aoNormalPrev;
 	bool aoNormalsThisFrame = false;
+	std::string aoSmoothFault;  // (47n) Smooth Normals failed this session (its texture / shader): off until RTAO is switched on again
 	// (47k) RTAO debug views "Smooth Normals: Confidence" / "Ns" / "Ng": AONormalPrepCS writes the chosen view here (only while one of
 	// them is on); RTAOCompositeCS copies it into the overlay.
 	DenoiseTexture aoNormalDebug;
@@ -894,13 +934,13 @@ private:
 	bool aoComposedLastFrame = false;
 	bool aoDebugDrawn = false;     // its debug view wrote debugColor this frame (the overlay draws it)
 	std::uint32_t aoWidth = 0, aoHeight = 0;
-	DenoiseTexture aoLo, aoLoBlur, aoLoDepth, aoLoNormal, aoFiltered, aoHistory[2], aoOut;
+	DenoiseTexture aoLoDepth, aoLoNormal, aoFiltered, aoHistory[2], aoOut;
 	std::uint32_t aoHistoryIndex = 0;
 	bool aoHistoryValid = false;
 	std::uint32_t aoHistoryFrame = 0;  // State::frameCount when the history was written (valid for the next frame only)
 	std::uint64_t aoD3D11Bytes = 0;
 	std::unique_ptr<ConstantBuffer> aoCB;
-	winrt::com_ptr<ID3D11ComputeShader> aoDownCS, aoBlurHCS, aoBlurVCS, aoUpCS, aoTemporalCS, aoCompositeCS;
+	winrt::com_ptr<ID3D11ComputeShader> aoTemporalCS, aoCompositeCS;
 	winrt::com_ptr<ID3D11SamplerState> aoLinearSampler;
 	float aoCpuMs = 0.0f;
 	// (46t) Two scales, normal-guided and full-resolution filtering (RTAOFilterCS). The extra textures are made only when a
