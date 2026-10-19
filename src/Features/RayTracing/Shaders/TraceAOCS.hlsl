@@ -40,7 +40,7 @@
 // most kAlphaCandidateBudget candidates per ray (past it the ray counts as blocked: bounded cost). (46t) AO Alpha
 // Budget: past the budget the ray may instead count as half open (kFlagAlphaHalf) or open (kFlagAlphaOpen).
 //
-// (47l) kFlagBlueNoise "RTAO: Blue-Noise Rays": the two uniform numbers of the cosine map from Skylighting's spatiotemporal blue noise (t6)
+// (47l) kFlagBlueNoise "RTAO: Blue-Noise Rays": the two uniform numbers of the cosine map from our spatiotemporal blue noise (t6)
 // instead of interleaved gradient noise (see main).
 //
 // (47h) kFlagSelfFix "RTAO: Character Self-Occlusion Fix": the character ray already starts Extra.x (6 units) along, yet near a
@@ -71,9 +71,11 @@ Texture2D<float> DepthMask : register(t1);
 RWTexture2D<float4> AOOut : register(u0);  // (47h) float: RGBA16F, or RGBA8 (kFlagDither8)
 RWByteAddressBuffer RayCounter : register(u1);  // rays traced (monotonic, read back for the F7 trace)
 Texture2D<float> AONormals : register(t5);   // (47j) kFlagSmoothNormals: AONormalPrepCS output (packed octahedral world normal, 0 = none)
-// (47l) kFlagBlueNoise: Skylighting's spatiotemporal blue noise (stbn_vec3_2Dx1D_128x128x64, RGBA8: each channel uniform, the vector
-// blue in space and in time), uploaded once by the backend.
-Texture2DArray<float4> AOBlueNoise : register(t6);
+// (47l) kFlagBlueNoise: our spatiotemporal blue noise for these rays (Ray Tracing package AOBlueNoise/rtao_stbn_cosine_2Dx1D_128x128x64,
+// RG8: the two numbers u1, u2 of the cosine map; each slice a stratified set, one value per 2 x 2 cell of the 8-bit grid, i.e. a
+// stratified cosine-weighted direction set; blue in space and in time by the directions' tangent-plane distance), uploaded once
+// by the backend.
+Texture2DArray<float2> AOBlueNoise : register(t6);
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
@@ -554,12 +556,12 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 			float u2 = frac(InterleavedGradientNoise(float2(p.yx) + float2(29.0, 61.0), frame * 7u + 3u) + float(frame % 64u) * 0.6180339887);
 			// (47l) kFlagBlueNoise: the two numbers from the spatiotemporal blue noise instead (pixel wrapped at 128, one slice per
 			// frame): through the cosine map the directions of neighbouring pixels, and of one pixel over the frames, are spread
-			// evenly, so the spatial filter and the history average the noise out faster. Its first two channels (8-bit, each
-			// uniform) mapped to the centres of their 256 steps. The extra Fine Detail directions below keep their R2 offsets from
+			// evenly, so the spatial filter and the history average the noise out faster. Its two channels (8-bit) mapped to the
+			// centres of their 256 steps. The extra Fine Detail directions below keep their R2 offsets from
 			// these (a toroidal shift: each ray's pattern stays blue, a pixel's rays stay spread). Off: interleaved gradient noise (47k).
 			[branch] if (flags & kFlagBlueNoise)
 			{
-				const float2 bn = AOBlueNoise.Load(int4(int2(uint2(p) % kBlueNoiseSize), int(frame % kBlueNoiseSlices), 0)).rg;
+				const float2 bn = AOBlueNoise.Load(int4(int2(uint2(p) % kBlueNoiseSize), int(frame % kBlueNoiseSlices), 0));
 				u1 = (round(bn.x * 255.0) + 0.5) / 256.0;
 				u2 = (round(bn.y * 255.0) + 0.5) / 256.0;
 			}

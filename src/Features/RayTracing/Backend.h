@@ -800,7 +800,8 @@ namespace RayTracingRT
 		void ReleaseAONormalTexture();
 		[[nodiscard]] ID3D11UnorderedAccessView* AONormalUAV() const { return aoNormal_.uav11.Get(); }
 		[[nodiscard]] bool HasAONormalTexture() const { return aoNormal_.resource12 != nullptr; }
-		/// (47l) RTAO: Blue-Noise Rays: Skylighting's spatiotemporal blue noise (128 x 128 x 64, RGBA8) as TraceAOCS t6. Read from disk and
+		/// (47l) RTAO: Blue-Noise Rays: our cosine-direction spatiotemporal blue noise (128 x 128 x 64, RG8; Ray Tracing package
+		/// AOBlueNoise\rtao_stbn_cosine_2Dx1D_128x128x64.dds) as TraceAOCS t6. Read from disk and
 		/// created once (default heap; its upload goes out in the next RTAO list, then it stays a shader resource). False = not available
 		/// (missing / unexpected file, creation failed: logged once, the trace keeps the interleaved gradient noise).
 		bool EnsureAOBlueNoise();
@@ -1447,8 +1448,10 @@ namespace RayTracingRT
 		std::uint32_t aoNormalWidth_ = 0, aoNormalHeight_ = 0;
 		void WriteAONormalDescriptor();
 		// (47l) RTAO: Blue-Noise Rays. The upload buffer lives until the RTAO list after the one that copied it (retired then).
-		ComPtr<ID3D12Resource> aoBlueNoise_;        // default heap, Texture2DArray RGBA8 128 x 128 x 64 (COPY_DEST until copied)
-		ComPtr<ID3D12Resource> aoBlueNoiseUpload_;  // upload heap, the file's texels (row pitch 512)
+		static constexpr DXGI_FORMAT kAOBlueNoiseFormat = DXGI_FORMAT_R8G8_UNORM;  // the asset's format (DDS checked against it)
+		static constexpr std::uint32_t kAOBlueNoiseTexelBytes = 2;
+		ComPtr<ID3D12Resource> aoBlueNoise_;        // default heap, Texture2DArray RG8 128 x 128 x 64 (COPY_DEST until copied)
+		ComPtr<ID3D12Resource> aoBlueNoiseUpload_;  // upload heap, the file's texels (row pitch 256)
 		bool aoBlueNoiseCopyPending_ = false;       // the copy is not recorded yet
 		bool aoBlueNoiseRetirePending_ = false;     // the copy is recorded: retire the upload buffer in the next RTAO list
 		bool aoBlueNoiseFailed_ = false;            // tried and failed (logged once): IGN for this session

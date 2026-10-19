@@ -6072,9 +6072,10 @@ void RayTracing::DrawAOPage()
 				// (47l)
 				ImGui::Checkbox("RTAO: Blue-Noise Rays", &settings.AOBlueNoise);
 				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Off (default): the ray directions use the old noise pattern (47k). On: they come from the blue-noise pattern Skylighting");
-					ImGui::Text("  uses (spread evenly between neighbouring pixels and over frames; a finer, less patterned raw grain). Offline it left");
-					ImGui::Text("  somewhat more noise after the blur than the old pattern, so it is off by default: an A/B to judge by eye.");
+					ImGui::Text("Off (default): the ray directions use the old noise pattern (47k). On: they come from our own blue-noise pattern made");
+					ImGui::Text("  for these rays (the directions of neighbouring pixels, and of one pixel over the frames, are spread evenly; a finer,");
+					ImGui::Text("  less patterned raw grain). Offline it still left somewhat more noise after the blur than the old pattern, so it is off");
+					ImGui::Text("  by default: an A/B to judge by eye.");
 				}
 				ImGui::BeginDisabled(!settings.AOTemporal);
 				ImGui::Checkbox("RTAO: Temporal v2", &settings.AOTemporalV2);

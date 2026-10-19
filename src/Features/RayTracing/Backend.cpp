@@ -1075,7 +1075,7 @@ namespace RayTracingRT
 		if (!stagingHeap_ || !device_)
 			return;
 		D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
-		nullSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		nullSrv.Format = kAOBlueNoiseFormat;
 		nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
 		nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		nullSrv.Texture2DArray.MipLevels = 1;
@@ -1089,10 +1089,11 @@ namespace RayTracingRT
 			return true;
 		if (aoBlueNoiseFailed_ || !AOAvailable() || !stagingHeap_)
 			return false;
-		// Skylighting's asset (DirectX 10 DDS header: RGBA8, 2D, 64 slices of 128 x 128, one mip).
-		static constexpr const wchar_t* kPath = L"Data\\Shaders\\Skylighting\\SpatiotemporalBlueNoise\\stbn_vec3_2Dx1D_128x128x64.dds";
+		// Our own asset (Ray Tracing package; DirectX 10 DDS header: RG8, 2D, 64 slices of 128 x 128, one mip): per texel the two
+		// numbers of the cosine map, a spatiotemporal blue noise optimised on the cosine-weighted directions (see TraceAOCS).
+		static constexpr const wchar_t* kPath = L"Data\\Shaders\\RayTracing\\AOBlueNoise\\rtao_stbn_cosine_2Dx1D_128x128x64.dds";
 		static constexpr std::uint32_t kSize = 128, kSlices = 64, kHeaderBytes = 4 + 124 + 20;
-		static constexpr std::uint64_t kSliceBytes = static_cast<std::uint64_t>(kSize) * kSize * 4;
+		static constexpr std::uint64_t kSliceBytes = static_cast<std::uint64_t>(kSize) * kSize * kAOBlueNoiseTexelBytes;
 		static constexpr std::uint64_t kDataBytes = kSliceBytes * kSlices;
 		auto fail = [&](const std::string& a_why) {
 			aoBlueNoiseFailed_ = true;
@@ -1103,7 +1104,7 @@ namespace RayTracingRT
 		{
 			std::ifstream in(kPath, std::ios::binary);
 			if (!in)
-				return fail("Data\\Shaders\\Skylighting\\SpatiotemporalBlueNoise\\stbn_vec3_2Dx1D_128x128x64.dds not found");
+				return fail("Data\\Shaders\\RayTracing\\AOBlueNoise\\rtao_stbn_cosine_2Dx1D_128x128x64.dds not found");
 			file.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 		}
 		auto u32 = [&](std::size_t a_offset) {
@@ -1112,7 +1113,7 @@ namespace RayTracingRT
 			return v;
 		};
 		if (file.size() < kHeaderBytes + kDataBytes || std::memcmp(file.data(), "DDS ", 4) != 0 || std::memcmp(file.data() + 84, "DX10", 4) != 0 ||
-			u32(12) != kSize || u32(16) != kSize || u32(28) > 1u || u32(128) != static_cast<std::uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM) || u32(132) != 3u || u32(140) != kSlices)
+			u32(12) != kSize || u32(16) != kSize || u32(28) > 1u || u32(128) != static_cast<std::uint32_t>(kAOBlueNoiseFormat) || u32(132) != 3u || u32(140) != kSlices)
 			return fail("unexpected file layout");
 		D3D12_HEAP_PROPERTIES heap{};
 		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1122,7 +1123,7 @@ namespace RayTracingRT
 		desc.Height = kSize;
 		desc.DepthOrArraySize = static_cast<UINT16>(kSlices);
 		desc.MipLevels = 1;
-		desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		desc.Format = kAOBlueNoiseFormat;
 		desc.SampleDesc.Count = 1;
 		desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 		ComPtr<ID3D12Resource> texture;
@@ -1130,7 +1131,7 @@ namespace RayTracingRT
 		if (FAILED(hr))
 			return fail(std::format("CreateCommittedResource ({})", HrString(hr)));
 		texture->SetName(L"CS RayTracing RTAO blue noise");
-		// Rows of 512 bytes (a multiple of D3D12_TEXTURE_DATA_PITCH_ALIGNMENT), slices 64 KiB apart (placement alignment 512): the
+		// Rows of 256 bytes (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT), slices 32 KiB apart (placement alignment 512): the
 		// file's own layout, copied as it is.
 		auto upload = CreateBuffer(kDataBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
 		void* mapped = nullptr;
@@ -1144,7 +1145,7 @@ namespace RayTracingRT
 		aoBlueNoiseCopyPending_ = true;
 		aoBlueNoiseRetirePending_ = false;
 		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-		srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		srvDesc.Format = kAOBlueNoiseFormat;
 		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
 		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srvDesc.Texture2DArray.MipLevels = 1;
@@ -1199,12 +1200,12 @@ namespace RayTracingRT
 				D3D12_TEXTURE_COPY_LOCATION src{};
 				src.pResource = aoBlueNoiseUpload_.Get();
 				src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-				src.PlacedFootprint.Offset = static_cast<UINT64>(slice) * desc.Width * desc.Height * 4;
+				src.PlacedFootprint.Offset = static_cast<UINT64>(slice) * desc.Width * desc.Height * kAOBlueNoiseTexelBytes;
 				src.PlacedFootprint.Footprint.Format = desc.Format;
 				src.PlacedFootprint.Footprint.Width = static_cast<UINT>(desc.Width);
 				src.PlacedFootprint.Footprint.Height = desc.Height;
 				src.PlacedFootprint.Footprint.Depth = 1;
-				src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(desc.Width) * 4;
+				src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(desc.Width) * kAOBlueNoiseTexelBytes;
 				list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 			}
 			D3D12_RESOURCE_BARRIER toSrv = Transition(aoBlueNoise_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

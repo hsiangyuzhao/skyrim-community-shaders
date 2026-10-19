@@ -269,13 +269,14 @@ public:
 		// frame, tolerances by the pixel footprint / max(N.V, 0.2), and the low-confidence fallback a depth-only smoothed normal (a
 		// sparse ring of depth normals weighted by plane agreement) instead of the raw facet. Off = 47j.
 		bool AOSmoothNormals2 = true;
-		// (47l) Outside the settings macro too. AOBlueNoise "RTAO: Blue-Noise Rays": the ray directions from Skylighting's
-		// spatiotemporal blue noise instead of interleaved gradient noise (TraceAOCS kFlagBlueNoise). AOTemporalV2 "RTAO: Temporal v2"
+		// (47l) Outside the settings macro too. AOBlueNoise "RTAO: Blue-Noise Rays": the ray directions from our cosine-direction
+		// spatiotemporal blue noise (Ray Tracing package AOBlueNoise\, RG8) instead of interleaved gradient noise (TraceAOCS kFlagBlueNoise). AOTemporalV2 "RTAO: Temporal v2"
 		// (needs Temporal): per-pixel history length, disocclusion test against our own last-frame depth and normal, depth-weighted
 		// history taps, a statistical clamp (both terms), a history-fix blur while the history is short, and the large-scale
 		// blur's radius in world units (RTAOTemporalCS RTAO_TEMPORAL_V2, RTAOFilterCS). Both off = 47k.
-		// Blue-Noise Rays defaults off: offline (Rtao47l.cs) this asset's (r, g) pair left 1.5x the noise of the 47k IGN pair after the
-		// 5x5 filter and after the history (it is a 3D-vector blue noise; its 2D projection is not as even as IGN in a 5x5).
+		// Blue-Noise Rays defaults off: offline (reviews\rtao-stbn-47l\NoiseEval.cs) our STBN still leaves more detail-term noise than
+		// the 47k IGN pair (5x5, 1 ray 0.046 vs 0.040; Temporal v2 steady 0.0080 vs 0.0064, flicker 0.0041 vs 0.0029; better only on
+		// the broad term's steady error). IGN's per-pixel pair is locally a 2D lattice, very even in any window.
 		bool AOBlueNoise = false;
 		bool AOTemporalV2 = true;
 		// (47l) Outside the settings macro too. FoliageSway "Sway in RT Shadows" (under Foliage): with Foliage ray traced / Both, tree-
