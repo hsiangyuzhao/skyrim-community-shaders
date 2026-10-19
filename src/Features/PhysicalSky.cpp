@@ -1,6 +1,5 @@
 #include "PhysicalSky.h"
 
-#include <DirectXPackedVector.h>
 #include <cfloat>
 #include <imgui_stdlib.h>
 
@@ -37,7 +36,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	masserColor,
 	secundaColor,
 	proceduralSun,
-	sunDiskRad,
+	// (47m) removed sunDiskRad (Legacy (36f) only); the old key is ignored on load.
 	sunAlignToVanilla,
 	sunReplaceVanilla,
 	sunSoftEdge,
@@ -49,17 +48,15 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	sunGlowWidthDeg,
 	sunLook,
 	// (44h) removed hideNewMoonDisc/moonGlowFollowsMoon/moonPhysicalRadiance/moonGlowFade/
-	// skyTrueSunHeight (and moonsFadeInDaylight in Load/SaveSettings): now fixed (see
-	// UpdateEffective()); old keys are ignored on load. Code paths kept for a possible rollback
-	// (specs/physsky-rollback-candidates.md).
+	// skyTrueSunHeight (and moonsFadeInDaylight in Load/SaveSettings): fixed on (47m: in the code);
+	// old keys are ignored on load.
 	moonGlowStrength,
 	moonRadianceCap,
 	nightBaseLight,
 	twilightLength,
-	skyModel,
+	// (47m) removed skyModel ("Sky Model: Legacy (36f)"); the old key is ignored on load.
 	// (44h) removed fixSkyAlpha/fixTrLutEdge/fixApShadowDepth/fixReflectionSky/fixMultiScatter:
-	// now fixed on; old keys are ignored on load. Code paths kept for a possible rollback
-	// (specs/physsky-rollback-candidates.md).
+	// fixed on (47m: in the code); old keys are ignored on load.
 	adaptationStart,
 	adaptationEnd,
 	dayExposure,
@@ -91,13 +88,6 @@ namespace
 			ImGui::EndTable();
 		}
 	}
-
-	/// (41b, F5) Shown where options are overridden by "Sky Model: Legacy (36f)".
-	void LegacyNote(bool a_legacy)
-	{
-		if (a_legacy)
-			ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Sky Model is Legacy (36f): options added after 36f are not used right now.");
-	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -125,18 +115,17 @@ void PhysicalSky::LoadSettings(json& o_json)
 		settings.cloudLighting = o_json.value("cloudLighting", defaults.cloudLighting);
 		settings.cloudSkyAmbient = o_json.value("cloudSkyAmbient", defaults.cloudSkyAmbient);
 		settings.cloudLightHeightKm = o_json.value("cloudLightHeightKm", defaults.cloudLightHeightKm);
-		// (44h) moonsFadeInDaylight no longer loaded: fixed on in UpdateEffective().
+		// (44h) moonsFadeInDaylight no longer loaded: fixed on (47m: in the code).
 		settings.moonDaylightFade = o_json.value("moonDaylightFade", defaults.moonDaylightFade);
 		settings.moonCloudLight = o_json.value("moonCloudLight", defaults.moonCloudLight);
 		settings.moonCloudStrength = o_json.value("moonCloudStrength", defaults.moonCloudStrength);
 		settings.moonCloudHalo = o_json.value("moonCloudHalo", defaults.moonCloudHalo);
 		settings.skyFixes = o_json.value("skyFixes", defaults.skyFixes);  // (47a)
 		settings.skyPrecision = o_json.value("skyPrecision", defaults.skyPrecision);  // (47b)
-	settings.horizonFix = o_json.value("horizonFix", defaults.horizonFix);  // (47f)
+		// (47m) horizonFix (47f) removed; the old key is ignored.
 		settings.aerosolPreset = o_json.value("aerosolPreset", defaults.aerosolPreset);  // (47b)
 	}
 	settings.aerosolPreset = std::clamp(settings.aerosolPreset, 0, kAerosolPresetCount - 1);
-	settings.skyModel = std::clamp(settings.skyModel, 0, kSkyModelCount - 1);
 	settings.nightBaseLight = std::clamp(settings.nightBaseLight, 0.f, 1.f);
 	settings.twilightLength = std::clamp(settings.twilightLength, 1.f, 3.f);
 	settings.cloudLighting = std::clamp(settings.cloudLighting, 0, kCloudLightingCount - 1);
@@ -246,20 +235,6 @@ PhysicalSky::WorldspaceStatus PhysicalSky::GetWorldspaceStatus(float& a_zBottom)
 		if (auto cell = player->GetParentCell(); cell && cell->IsInteriorCell())
 			return WorldspaceStatus::Interior;
 
-	if (UseLegacyPaths()) {
-		// 37a: TES worldspace only, hard-coded list, no exclusions.
-		auto* tes = RE::TES::GetSingleton();
-		auto* worldspace = tes ? tes->GetRuntimeData2().worldSpace : nullptr;
-		if (!worldspace)
-			return WorldspaceStatus::Unknown;
-		const auto& legacy = LegacyWorldspaceWhitelist();
-		if (auto it = legacy.find(worldspace->GetFormEditorID()); it != legacy.end()) {
-			a_zBottom = it->second.zBottom;
-			return WorldspaceStatus::Whitelist;
-		}
-		return WorldspaceStatus::NotListed;
-	}
-
 	auto* worldspace = GetCurrentWorldspace();
 	if (!worldspace)
 		return WorldspaceStatus::Unknown;
@@ -283,14 +258,13 @@ void PhysicalSky::SaveSettings(json& o_json)
 	o_json["cloudLighting"] = settings.cloudLighting;
 	o_json["cloudSkyAmbient"] = settings.cloudSkyAmbient;
 	o_json["cloudLightHeightKm"] = settings.cloudLightHeightKm;
-	// (44h) moonsFadeInDaylight no longer saved: fixed on in UpdateEffective().
+	// (44h) moonsFadeInDaylight no longer saved: fixed on (47m: in the code).
 	o_json["moonDaylightFade"] = settings.moonDaylightFade;
 	o_json["moonCloudLight"] = settings.moonCloudLight;
 	o_json["moonCloudStrength"] = settings.moonCloudStrength;
 	o_json["moonCloudHalo"] = settings.moonCloudHalo;
 	o_json["skyFixes"] = settings.skyFixes;  // (47a)
 	o_json["skyPrecision"] = settings.skyPrecision;  // (47b)
-	o_json["horizonFix"] = settings.horizonFix;  // (47f)
 	o_json["aerosolPreset"] = settings.aerosolPreset;  // (47b)
 }
 
@@ -342,29 +316,7 @@ void PhysicalSky::DrawSettings()
 			"- moonlight on the ground fades out from 8 deg before sunrise.\n"
 			"Day/Night Exposure, the adaptation angles and Twilight Length are not used while this is on.\n"
 			"Off = exactly as before.");
-	if (settings.skyFixes && IsLegacy())
-		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Sky Model is Legacy (36f): Sky Fixes is not used right now.");
-	// (47f) Part of Sky Fixes.
-	ImGui::Indent();
-	ImGui::BeginDisabled(!settings.skyFixes);
-	ImGui::Checkbox("Horizon Fix", &settings.horizonFix);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"Seen from high places, the sky meets the land and sea without a gap or a line:\n"
-			"- the game's clouds reach down to the real horizon (their dome is squeezed so that where they used to fade out\n"
-			"  is now the horizon; the far, flattened clouds fade into the haze);\n"
-			"- the distant sea below the horizon reflects the clouds above it (needs Cloud Shadows);\n"
-			"- (47g) the fog on the sky follows each view ray's real, curved path: just below level the ray passes above the\n"
-			"  sea and leaves the air (no band at the level line), below the sea horizon it ends on the sea, whose reflection\n"
-			"  carries the fog of the reflected sky (no seam at the horizon);\n"
-			"- (47g) the weather fog sits on the ground, not on you: from high places only the low part near the valley floor\n"
-			"  is thick (below about 300 m above the Fog Height you see the same as before);\n"
-			"- the fog's colour is no longer taken from the ground (no dark blotches).\n"
-			"Needs Sky Fixes. Off = exactly as 47e.");
-	if (settings.horizonFix && settings.skyFixes && cloudFadeMeasured > 0)
-		ImGui::TextDisabled("Cloud layers measured: %u (%s)", cloudFadeMeasured, cloudFadeNote.c_str());
-	ImGui::EndDisabled();
-	ImGui::Unindent();
+	// (47m) "Horizon Fix" (47f) removed (fixed off).
 	// (47b)
 	ImGui::Checkbox("Sky Precision", &settings.skyPrecision);
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -374,8 +326,6 @@ void PhysicalSky::DrawSettings()
 			"table puts its rows around the true horizon (sharper from high places) and the distant-haze table\n"
 			"is finer close to you. Mostly visible at sunrise and sunset: a sun on the horizon and the haze in\n"
 			"front of it are a little darker and redder. Off = exactly as before.");
-	if (settings.skyPrecision && IsLegacy())
-		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Sky Model is Legacy (36f): Sky Precision is not used right now.");
 	ImGui::Separator();
 
 	if (ImGui::BeginTabBar("##PHYSSKY")) {
@@ -449,42 +399,32 @@ void PhysicalSky::SettingsGeneral()
 
 	ImGui::Checkbox("Enabled", &settings.enabled);
 
-	static constexpr const char* skyModelNames[kSkyModelCount] = { "Current", "Legacy (36f)" };
-	ImGui::Combo("Sky Model", &settings.skyModel, skyModelNames, kSkyModelCount);
-	if (auto _tt = Util::HoverTooltipWrapper())
-		ImGui::Text(
-			"For comparing only. Legacy (36f): every Physical Sky and Sky Sync option added after 36f is\n"
-			"used at its 36f value while this is selected (sun look and alignment, fixes, moon glow at full\n"
-			"strength without fading, new-moon disc, Vanilla moon orbit, discs lowered by altitude, no night\n"
-			"base light, no twilight changes, the old worldspace list, the 42a cloud lighting and moon discs, the\n"
-			"Clock light source model). Your own values are kept and come back\n"
-			"with Current. Colours, exposures, atmosphere and clouds are always yours.");
-	LegacyNote(IsLegacy());
+	// (47m) "Sky Model" (Current / Legacy (36f)) removed: Current is the only model.
 
 	SettingsWorldspaces();
 
 	ImGui::SeparatorText("Post Processing");
 	{
-		// (47a) Taken over by Sky Fixes (treated as 1 / off); greyed, the saved values are kept.
-		const bool takenOver = SkyFixesActive();
-		if (takenOver)
-			ImGui::TextDisabled("Taken over by Sky Fixes; set night brightness with the moon light.");
-		ImGui::BeginDisabled(takenOver);
-		ImGui::InputFloat("Day Exposure", &settings.dayExposure);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Brightness of the sky and sun/moon light by day. Higher = brighter.");
+		// (47a) Taken over by Sky Fixes (treated as 1 / off); the saved values are kept. (47m) Shown, in a
+		// collapsed node, only while Sky Fixes is off.
+		if (!SkyFixesActive() && ImGui::TreeNode("Exposure (used only with Sky Fixes off)")) {
+			ImGui::InputFloat("Day Exposure", &settings.dayExposure);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Brightness of the sky and sun/moon light by day. Higher = brighter.");
+			ImGui::InputFloat("Night Exposure", &settings.nightExposure);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Same, but at night. Higher = brighter nights.");
+			ImGui::SliderAngle("Adaptation Start", &settings.adaptationStart, -90.f, 0.f);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Sun angle below the horizon where the switch from Day to Night Exposure begins.");
+			ImGui::SliderAngle("Adaptation End", &settings.adaptationEnd, -90.f, 0.f);
+			if (auto _tt = Util::HoverTooltipWrapper())
+				ImGui::Text("Sun angle below the horizon where Night Exposure is fully reached.");
+			ImGui::TreePop();
+		}
+		// As before: kept positive whenever this tab is drawn, open or not.
 		settings.dayExposure = std::max(1e-10f, settings.dayExposure);
-		ImGui::InputFloat("Night Exposure", &settings.nightExposure);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Same, but at night. Higher = brighter nights.");
 		settings.nightExposure = std::max(1e-10f, settings.nightExposure);
-		ImGui::SliderAngle("Adaptation Start", &settings.adaptationStart, -90.f, 0.f);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Sun angle below the horizon where the switch from Day to Night Exposure begins.");
-		ImGui::SliderAngle("Adaptation End", &settings.adaptationEnd, -90.f, 0.f);
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("Sun angle below the horizon where Night Exposure is fully reached.");
-		ImGui::EndDisabled();
 
 		if (ImGui::BeginTable("tonemap", 4, ImGuiTableFlags_SizingStretchSame, { -1, 0 })) {
 			ImGui::TableNextColumn();
@@ -603,7 +543,6 @@ void PhysicalSky::SettingsCelestials()
 	constexpr auto lightColorHint = "This sets the light color BEFORE it goes through the atmosphere i.e. extraterrestrial radiance.";
 
 	InfoBox("The sun and moons, and their lights.");
-	LegacyNote(IsLegacy());
 
 	ImGui::Checkbox("Override Directional Light", &settings.overrideDirLight);
 	if (auto _tt = Util::HoverTooltipWrapper())
@@ -705,20 +644,16 @@ void PhysicalSky::SettingsCelestials()
 			"(before dawn, after dusk). It also tints distant haze, reflections and the sky's ambient light.\n"
 			"Fades out as the sun climbs from 6 degrees below the horizon to 4 above.\n"
 			"0 = off (exactly as before). Default 0.2.");
-	// (44h) removed "Sky Uses True Sun Height": now fixed on (UpdateEffective()).
-	// (47a) Taken over by Sky Fixes (treated as 1).
-	{
-		const bool takenOver = SkyFixesActive();
-		if (takenOver)
-			ImGui::TextDisabled("Taken over by Sky Fixes; set night brightness with the moon light.");
-		ImGui::BeginDisabled(takenOver);
+	// (44h) removed "Sky Uses True Sun Height": fixed on (47m: in the code).
+	// (47a) Taken over by Sky Fixes (treated as 1). (47m) Shown, in a collapsed node, only while Sky Fixes is off.
+	if (!SkyFixesActive() && ImGui::TreeNode("Twilight (used only with Sky Fixes off)")) {
 		ImGui::SliderFloat("Twilight Length", &settings.twilightLength, 1.f, 3.f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text(
 				"Stretches dawn and dusk in the sky only: with 2, a sun 12 degrees below the horizon lights the sky\n"
 				"like one 6 degrees below, so the sky starts to brighten earlier and stays lit longer after sunset.\n"
 				"Does not change the sun or moon light on the ground. 1 = real twilight (default).");
-		ImGui::EndDisabled();
+		ImGui::TreePop();
 	}
 
 	ImGui::SeparatorText("Masser");
@@ -748,8 +683,8 @@ void PhysicalSky::SettingsCelestials()
 			"1 = the moon light colour in full: with bright moonlight the glow is as bright as the discs,\n"
 			"which then look washed out. Default 0.2: the discs stand clearly out of their glow.");
 	// (44h) removed "Moon Glow Follows Phase and Visibility" (fixed on), "Moon Glow Fades" (fixed
-	// At Horizon), "Moon Physical Brightness" and "Moons Fade in Daylight" (fixed on): see
-	// UpdateEffective(). Their sliders below are now always shown.
+	// At Horizon), "Moon Physical Brightness" and "Moons Fade in Daylight" (fixed on): fixed in the
+	// code (47m). Their sliders below are now always shown.
 	ImGui::SliderFloat("Moon Brightness Cap", &settings.moonRadianceCap, 1.f, 50.f, "%.1f", ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
 	if (auto _tt = Util::HoverTooltipWrapper())
 		ImGui::Text(
@@ -763,7 +698,7 @@ void PhysicalSky::SettingsCelestials()
 			"Higher = paler moons by day. Default 20: at noon a moon keeps roughly 40%% of its contrast,\n"
 			"in the early morning about 60%%, in twilight almost all of it. No change at night.");
 
-	// (44h) removed the "New Moon" section ("Hide New Moon Disc"): now fixed on (UpdateEffective()).
+	// (44h) removed the "New Moon" section ("Hide New Moon Disc"): fixed on (47m: in the code).
 }
 
 void PhysicalSky::SettingsAtmosphere()
@@ -808,8 +743,6 @@ void PhysicalSky::SettingsAtmosphere()
 				"haze, a smaller and softer glow around the sun, much less absorption. Replaces the values below\n"
 				"while picked (they are kept, not changed).");
 		const bool aerosolPresetOn = settings.aerosolPreset != kAerosolCurrent;
-		if (aerosolPresetOn && IsLegacy())
-			ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Sky Model is Legacy (36f): the preset is not used right now.");
 		ImGui::BeginDisabled(aerosolPresetOn);
 		ImGui::SliderFloat("Anisotropy", &settings.aerosolPhaseG, -1, 1);
 		ImGui::ColorEdit3("Scatter", &settings.aerosolScatter.x, ImGuiColorEditFlags_DisplayHSV | ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
@@ -846,14 +779,12 @@ void PhysicalSky::SettingsAtmosphere()
 	}
 
 	// (44h) removed the "Fixes" section (Opaque Sky, Transmittance Edge Fix, Atmosphere Shadow
-	// Depth Fix, Reflected Sky Fix, Multiple Scattering Fix): now fixed on; code paths kept for a
-	// possible rollback (specs/physsky-rollback-candidates.md).
+	// Depth Fix, Reflected Sky Fix, Multiple Scattering Fix): fixed on (47m: in the code).
 }
 
 void PhysicalSky::SettingsClouds()
 {
 	InfoBox("Clouds.");
-	LegacyNote(IsLegacy());
 
 	static constexpr const char* cloudLightingNames[kCloudLightingCount] = { "Single light (old)", "Sun + Moons + Sky" };
 	ImGui::Combo("Cloud Lighting", &settings.cloudLighting, cloudLightingNames, kCloudLightingCount);
@@ -1147,7 +1078,7 @@ bool PhysicalSky::ShadersOK()
 void PhysicalSky::UpdateExtCbData()
 {
 	extCbData = {};
-	if (!loaded || UseLegacyPaths())
+	if (!loaded)
 		return;
 
 	const auto& s = effective;
@@ -1160,18 +1091,9 @@ void PhysicalSky::UpdateExtCbData()
 		flags |= kExtSunPhysicalRadiance;
 	if (s.sunHideVanillaGlare)
 		flags |= kExtHideSunGlare;
-	if (s.fixSkyAlpha)
-		flags |= kExtSkyAlphaOpaque;
-	if (s.fixTrLutEdge)
-		flags |= kExtTrLutEdgeFix;
-	if (s.fixApShadowDepth)
-		flags |= kExtApShadowDepthFix;
-	if (s.fixReflectionSky)
-		flags |= kExtReflectionSkyFix;
-	if (s.fixMultiScatter)
-		flags |= kExtMultiScatterFix;
-	if (s.moonPhysicalRadiance)
-		flags |= kExtMoonPhysicalRadiance;
+	// fixed (47m): the five 37b fixes and Moon Physical Brightness (pinned on since 44h).
+	flags |= kExtSkyAlphaOpaque | kExtTrLutEdgeFix | kExtApShadowDepthFix | kExtReflectionSkyFix | kExtMultiScatterFix;
+	flags |= kExtMoonPhysicalRadiance;
 	if (s.skyPrecision)
 		flags |= kExtSkyPrecision;  // (47b)
 	extCbData.flags = flags;
@@ -1194,24 +1116,20 @@ void PhysicalSky::UpdateMoonData(float a_exposure, float3& a_masserGlow, float3&
 	if (!sky)
 		return;
 
-	if (s.moonGlowFollowsMoon) {
+	// fixed (47m, pinned since 44h): "Moon Glow Follows Phase and Visibility" on, "Moon Glow Fades" At Horizon.
+	{
 		// A new moon (or a moon the game has hidden or faded out) no longer lights the sky.
-		float masserVisibility, secundaVisibility;
-		if (s.moonGlowFade == kMoonGlowFadeAtHorizon) {
-			// (41b, F2) The vanilla disc is faded out 16-28 degrees above the horizon (orbit angle
-			// 145-160), long before the moon sets; the glow now follows the moon down to it.
-			const auto& skySync = globals::features::skySync;
-			masserVisibility = MoonHorizonVisibility(sky->masser, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)].z);
-			secundaVisibility = MoonHorizonVisibility(sky->secunda, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)].z);
-		} else {
-			masserVisibility = SkySync::VanillaVisibility(sky->masser);
-			secundaVisibility = SkySync::VanillaVisibility(sky->secunda);
-		}
+		// (41b, F2) The vanilla disc is faded out 16-28 degrees above the horizon (orbit angle
+		// 145-160), long before the moon sets; the glow follows the moon down to it.
+		const auto& skySync = globals::features::skySync;
+		const float masserVisibility = MoonHorizonVisibility(sky->masser, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Masser)].z);
+		const float secundaVisibility = MoonHorizonVisibility(sky->secunda, sky, skySync.rawDirections[static_cast<int>(SkySync::Caster::Secunda)].z);
 		a_masserGlow = a_masserGlow * (SkySync::PhaseFactorFromTexture(sky->masser) * masserVisibility);
 		a_secundaGlow = a_secundaGlow * (SkySync::PhaseFactorFromTexture(sky->secunda) * secundaVisibility);
 	}
 
-	if (s.moonPhysicalRadiance) {
+	// fixed (47m, pinned since 44h): "Moon Physical Brightness" on.
+	{
 		// Like the sun's Physical Brightness: the moonlight colour is an irradiance, the disc shows
 		// radiance = irradiance / disc solid angle. The vanilla disc (phase picture, about 1 at
 		// its brightest) is multiplied by that, never darkened, capped at moonRadianceCap.
@@ -1501,10 +1419,9 @@ void PhysicalSky::UpdateCloudData(float a_exposure, float a_sunElevation)
 	cloudCbData = {};
 	const auto& s = effective;
 
-	if (s.moonsFadeInDaylight) {
-		cloudCbData.flags |= kCloudMoonDaylightFade;
-		cloudCbData.moonDaylightFade = std::clamp(s.moonDaylightFade, 0.f, 100.f);
-	}
+	// fixed (47m, pinned since 44h): "Moons Fade in Daylight" on.
+	cloudCbData.flags |= kCloudMoonDaylightFade;
+	cloudCbData.moonDaylightFade = std::clamp(s.moonDaylightFade, 0.f, 100.f);
 
 	if (s.cloudLighting != kCloudLightingAll)
 		return;  // no flag: Sky.hlsl runs the 42a RelightCloud exactly
@@ -1553,76 +1470,15 @@ void PhysicalSky::UpdateCloudData(float a_exposure, float a_sunElevation)
 	cloudCbData.heightOffset = (std::clamp(s.cloudLightHeightKm, 0.5f, 12.f) - 0.5f) / Util::Units::GAME_UNIT_TO_KM;
 }
 
-bool PhysicalSky::UseLegacyPaths() const
-{
-	return IsLegacy();
-}
-
 void PhysicalSky::UpdateEffective()
 {
 	effective = settings;
-	// (44h) The five atmosphere fixes are no longer user settings: pinned on here so nothing that
-	// copies or loads `settings` can turn them off. Legacy (36f) below still sets them off (and
-	// UseLegacyPaths() skips the ext flags anyway). Code paths kept for a possible rollback
-	// (specs/physsky-rollback-candidates.md).
-	effective.fixSkyAlpha = true;
-	effective.fixTrLutEdge = true;
-	effective.fixApShadowDepth = true;
-	effective.fixReflectionSky = true;
-	effective.fixMultiScatter = true;
-	// (44h) Celestials options removed from the menu and the JSON, pinned at the user's values the
-	// same way. Legacy (36f) below still sets them to their 36f values. Code paths kept for a
-	// possible rollback (specs/physsky-rollback-candidates.md).
-	effective.skyTrueSunHeight = true;
-	effective.moonGlowFollowsMoon = true;
-	effective.moonGlowFade = kMoonGlowFadeAtHorizon;
-	effective.moonPhysicalRadiance = true;
-	effective.moonsFadeInDaylight = true;
-	effective.hideNewMoonDisc = true;
+	// (47m) The 44h pins (five atmosphere fixes, six celestial options) are no longer fields: the code always
+	// takes their "on" side. "Sky Model: Legacy (36f)" is gone.
 	// (47a) Sky Fixes takes over Twilight Length (and Day/Night Exposure with the adaptation angles,
-	// see SkyExposure()): treated as 1 / off. The saved values are kept.
+	// see Reset()): treated as 1 / off. The saved values are kept.
 	if (SkyFixesActive())
 		effective.twilightLength = 1.f;
-	if (!IsLegacy())
-		return;
-
-	// (41b, F5) Legacy (36f): every Physical Sky option added after 36f at its 36f value. The
-	// worldspace list and the 37a sun disc size come from UseLegacyPaths(). Kept as the user set
-	// them: enabled, colours, exposures, tonemapper, mixes, procedural sun on/off, atmosphere,
-	// clouds.
-	auto& e = effective;
-	// 37b
-	e.enableAllExteriorWorldspaces = false;
-	e.sunAlignToVanilla = false;
-	e.sunReplaceVanilla = false;
-	e.sunSoftEdge = false;
-	e.sunPhysicalRadiance = false;
-	e.sunHideVanillaGlare = false;
-	e.fixSkyAlpha = false;
-	e.fixTrLutEdge = false;
-	e.fixApShadowDepth = false;
-	e.fixReflectionSky = false;
-	e.fixMultiScatter = false;
-	// 37c
-	e.sunGlowIntensity = 0.f;
-	e.hideNewMoonDisc = false;
-	// 40d
-	e.moonGlowStrength = 1.f;
-	e.moonGlowFollowsMoon = false;
-	e.moonPhysicalRadiance = false;
-	// 41b
-	e.moonGlowFade = kMoonGlowFadeWithDisc;
-	e.nightBaseLight = 0.f;
-	e.skyTrueSunHeight = false;
-	e.twilightLength = 1.f;
-	// 42b
-	e.cloudLighting = kCloudLightingSingle;
-	e.moonsFadeInDaylight = false;
-	// 44h
-	e.moonCloudLight = false;
-	// 47b
-	e.skyPrecision = false;
-	e.aerosolPreset = kAerosolCurrent;
 }
 
 void PhysicalSky::ApplySunLook(int a_look)
@@ -1674,7 +1530,6 @@ void PhysicalSky::Reset()
 	bool inMainLoadingMenu = globals::game::ui && (globals::game::ui->IsMenuOpen(RE::MainMenu::MENU_NAME) || globals::game::ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
 
 	// (batch 37b) Whitelist (saved, editable, DLC exteriors added) / all exteriors / exclusions.
-	// With the 37b master off this is the 37a hard-coded list.
 	WorldspaceInfo worldspaceInfo = {};
 	const auto worldspaceStatus = GetWorldspaceStatus(worldspaceInfo.zBottom);
 	const bool worldspaceEnabled = worldspaceStatus == WorldspaceStatus::Whitelist || worldspaceStatus == WorldspaceStatus::AllExteriors;
@@ -1717,7 +1572,8 @@ void PhysicalSky::Reset()
 		// the camera, so a higher camera sees the sun lower). Fed to the LUTs it made the whole sky
 		// think the sun was 1.5-6 degrees lower: dawn 7-25 minutes late, dusk as early. The LUTs
 		// now get the true height in the same (world) frame; the disc and its glow keep the dip.
-		if (s.skyTrueSunHeight && trueDir.Unitize() > FLT_EPSILON)
+		// fixed (47m, pinned since 44h): "Sky Uses True Sun Height" on.
+		if (trueDir.Unitize() > FLT_EPSILON)
 			lutSunDir = trueDir;
 	}
 	// (41b, F4b) Longer twilight, LUTs only: a sun below the horizon is taken as elevation / L.
@@ -1737,8 +1593,8 @@ void PhysicalSky::Reset()
 	// (40d) With the discs left where the game puts them, the glow follows each disc's on-screen
 	// direction (world frame, like the aligned sun above; upstream b2d671ba8's idea). The raw
 	// direction is in the sky root's local frame, so it missed the disc by the north rotation and
-	// the altitude dip.
-	if (skySync.Effective().KeepMoonPosition) {
+	// the altitude dip. fixed (47m, pinned since 44h): Sky Sync's "Keep Moons Where the Game Puts Them" on.
+	{
 		if (auto* sky = globals::game::sky) {
 			RE::NiPoint3 onScreen;
 			if (SkySync::OnScreenDirection(sky->masser, sky, onScreen))
@@ -1792,7 +1648,7 @@ void PhysicalSky::Reset()
 		.masserColor = masserGlow,
 		.apTrMix = settings.apTrMix,
 		.secundaDir = { secundaDir.x, secundaDir.y, secundaDir.z },
-		.sunDiskCos = cos(!UseLegacyPaths() ? DirectX::XMConvertToRadians(std::clamp(s.sunDiskRadiusDeg, 0.05f, 10.f)) : settings.sunDiskRad) * (settings.proceduralSun ? 1.f : 0.f),
+		.sunDiskCos = cos(DirectX::XMConvertToRadians(std::clamp(s.sunDiskRadiusDeg, 0.05f, 10.f))) * (settings.proceduralSun ? 1.f : 0.f),
 		.secundaColor = secundaGlow,
 		.enabled = allGood,
 		.tonemapper = linearLighting.settings.enableLinearLighting ? 0 : settings.tonemapper,
@@ -1839,22 +1695,9 @@ void PhysicalSky::Reset()
 	// (47a) Sky brightness factor, LUT flags and star values (all neutral when off).
 	UpdateSkyFixes(skyFixes, lutSunDir);
 
-	// (47f) Horizon Fix: the camera's height over the ground sphere (500 units below the worldspace's water,
-	// FallbackZBottom). (47g) The weather fog layer's base is anchored to world height: the camera's height up to the
-	// reference max(EHF Fog Height, sea level) + the layer's thinning height, that reference above it; anchorOffset is how
-	// far the camera is above the base (WeatherFog.hlsli). No more thickening below the camera (47f).
+	// fixed (47m): Horizon Fix removed; anchorOffset, altitude and flags stay 0 (as with Horizon Fix off).
 	horizonFixCbData = {};
 	auto& heightFog = globals::features::exponentialHeightFog;
-	if (HorizonFixActive()) {
-		horizonFixCbData.flags = 1u;
-		horizonFixCbData.altitude = std::max(posCam.z - cbData.zBottom, 0.f);
-		const float scaleHeight = std::max(heightFog.GetWeatherFogData().ScaleHeight, 1.f);
-		const float seaLevel = cbData.zBottom + 500.f;
-		const float reference = std::max(heightFog.GetCommonBufferData().fogHeight, seaLevel) + scaleHeight;
-		horizonFixCbData.anchorOffset = std::max(posCam.z - reference, 0.f);
-		if (!std::isfinite(horizonFixCbData.altitude) || !std::isfinite(horizonFixCbData.anchorOffset))
-			horizonFixCbData = {};
-	}
 	// (47g) EHF "Physical Fog Brightness": the clear sky's light on the fog (0 = off; independent of the Horizon Fix).
 	if (heightFog.loaded && heightFog.vanillaFog.PhysicalFogBrightness)
 		horizonFixCbData.fogSkyLight = ComputeFogSkyLight(lutSunDir);
@@ -2047,13 +1890,12 @@ void PhysicalSky::SetSunDrawFlags(const RE::BSRenderPass* a_pass)
 		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsSunGlare);
 	else if ((skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON ||
 				 skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON_SHADOW) &&
-			 globals::features::physicalSky.Effective().hideNewMoonDisc && IsNewMoonDraw(a_pass))
+			 IsNewMoonDraw(a_pass))  // fixed (47m, pinned since 44h): "Hide New Moon Disc" on
 		descriptor |= static_cast<uint32_t>(State::ExtraShaderDescriptors::IsNewMoon);
 
 	// (40d) The moon disc itself (not its star mask, SO_MOON_SHADOW), for "Moon Physical Brightness"
-	// and (42b) "Moons Fade in Daylight". Sky.hlsl checks each option's own flag.
-	if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON &&
-		(globals::features::physicalSky.Effective().moonPhysicalRadiance || globals::features::physicalSky.Effective().moonsFadeInDaylight)) {
+	// and (42b) "Moons Fade in Daylight" (both fixed on, 47m). Sky.hlsl checks each option's own flag.
+	if (skyProperty->uiSkyObjectType == RE::BSSkyShaderProperty::SkyObject::SO_MOON) {
 		if (const auto sky = RE::Sky::GetSingleton(); sky && a_pass->geometry) {
 			const auto* geometry = static_cast<const void*>(a_pass->geometry);
 			if (sky->masser && geometry == sky->masser->moonMesh.get())
@@ -2181,170 +2023,9 @@ void PhysicalSky::UnbindGlareDepth()
 }
 
 // ---------------------------------------------------------------------------------------------
-// (47f) Horizon Fix (a): the cloud dome warp
+// (47f) VS b11 for cloud draws. (47m) Horizon Fix's cloud dome warp is removed; the zero constants stay
+// (what every cloud draw got with Horizon Fix off) until the Lighting package drops b11 from Sky.hlsl.
 // ---------------------------------------------------------------------------------------------
-
-namespace
-{
-	bool HorizonSafeCopy(void* a_destination, const void* a_source, std::size_t a_bytes)
-	{
-		__try {
-			std::memcpy(a_destination, a_source, a_bytes);
-			return true;
-		} __except (EXCEPTION_EXECUTE_HANDLER) {
-			return false;
-		}
-	}
-}
-
-float PhysicalSky::MeasureCloudFade(const uint8_t* a_vertices, uint32_t a_count, uint32_t a_stride, uint32_t a_positionOffset, uint32_t a_colorOffset,
-	bool a_fullPrecision, const RE::NiTransform& a_world, const RE::NiPoint3& a_eye)
-{
-	// Vertex alpha by elevation (camera-centred, world frame), in 0.25-degree rings from the horizon up to 60 degrees.
-	constexpr float kBinDeg = 0.25f;
-	constexpr int kBins = 240;
-	std::array<double, kBins> alphaSum{}, elevationSum{};
-	std::array<uint32_t, kBins> counts{};
-	for (uint32_t i = 0; i < a_count; ++i) {
-		const uint8_t* v = a_vertices + static_cast<size_t>(i) * a_stride;
-		RE::NiPoint3 p;
-		if (a_fullPrecision) {
-			float f[3];
-			std::memcpy(f, v + a_positionOffset, sizeof(f));
-			p = { f[0], f[1], f[2] };
-		} else {
-			uint16_t h[3];
-			std::memcpy(h, v + a_positionOffset, sizeof(h));
-			p = { DirectX::PackedVector::XMConvertHalfToFloat(h[0]), DirectX::PackedVector::XMConvertHalfToFloat(h[1]), DirectX::PackedVector::XMConvertHalfToFloat(h[2]) };
-		}
-		const RE::NiPoint3 w = a_world.rotate * (p * a_world.scale) + a_world.translate - a_eye;
-		const float horizontal = std::sqrt(w.x * w.x + w.y * w.y);
-		if (!std::isfinite(horizontal) || !std::isfinite(w.z) || (horizontal < 1e-3f && std::abs(w.z) < 1e-3f))
-			continue;
-		const float elevation = DirectX::XMConvertToDegrees(std::atan2(w.z, horizontal));
-		if (elevation < -0.5f || elevation >= 60.0f)
-			continue;
-		const int bin = std::clamp(static_cast<int>(std::floor(std::max(elevation, 0.0f) / kBinDeg)), 0, kBins - 1);
-		alphaSum[bin] += v[a_colorOffset + 3] / 255.0;
-		elevationSum[bin] += std::max(elevation, 0.0f);
-		++counts[bin];
-	}
-	std::vector<std::pair<float, float>> rings;  // (elevation, mean alpha), rising
-	float maxAlpha = 0.0f;
-	for (int b = 0; b < kBins; ++b) {
-		if (!counts[b])
-			continue;
-		const float alpha = static_cast<float>(alphaSum[b] / counts[b]);
-		rings.emplace_back(static_cast<float>(elevationSum[b] / counts[b]), alpha);
-		maxAlpha = std::max(maxAlpha, alpha);
-	}
-	if (rings.empty() || maxAlpha < 0.05f)
-		return -1.0f;
-	const float threshold = kCloudFadeAlphaShare * maxAlpha;
-	float e1 = rings.front().first;
-	if (rings.front().second < threshold) {
-		for (size_t i = 1; i < rings.size(); ++i) {
-			if (rings[i].second >= threshold) {
-				const auto& [e0, a0] = rings[i - 1];
-				const auto& [eA, aA] = rings[i];
-				e1 = e0 + (threshold - a0) / std::max(aA - a0, 1e-4f) * (eA - e0);
-				break;
-			}
-		}
-	}
-	return DirectX::XMConvertToRadians(std::clamp(e1, 0.0f, 45.0f));
-}
-
-float PhysicalSky::GetCloudFadeElevation(const RE::BSGeometry* a_geometry)
-{
-	auto* geometry = const_cast<RE::BSGeometry*>(a_geometry);
-	auto* rendererData = geometry ? geometry->GetGeometryRuntimeData().rendererData : nullptr;
-	auto* shape = geometry ? geometry->AsTriShape() : nullptr;
-	if (!rendererData || !rendererData->vertexBuffer || !shape)
-		return -1.0f;
-	const uint32_t frame = globals::state->frameCount;
-	if (auto it = cloudFades.find(a_geometry); it != cloudFades.end() && it->second.vertexBuffer == rendererData->vertexBuffer) {
-		auto& fade = it->second;
-		if (!std::isnan(fade.e1))
-			return fade.e1;
-		// GPU read-back in flight: never waits (a frame or two late at most).
-		if (fade.staging && frame - fade.copyFrame >= 2) {
-			auto* context = globals::d3d::context;
-			D3D11_MAPPED_SUBRESOURCE mapped{};
-			const HRESULT hr = context->Map(fade.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-			if (SUCCEEDED(hr)) {
-				D3D11_BUFFER_DESC desc{};
-				fade.staging->GetDesc(&desc);
-				const bool fits = static_cast<uint64_t>(fade.vertexCount) * fade.stride <= desc.ByteWidth;
-				fade.e1 = fits ? MeasureCloudFade(static_cast<const uint8_t*>(mapped.pData), fade.vertexCount, fade.stride, fade.positionOffset, fade.colorOffset,
-									 fade.fullPrecision, fade.world, fade.eye) :
-				                 -1.0f;
-				context->Unmap(fade.staging.get(), 0);
-				fade.staging = nullptr;
-				++cloudFadeMeasured;
-				cloudFadeNote = fade.e1 >= 0.0f ? std::format("last: fades in at {:.1f} deg", DirectX::XMConvertToDegrees(fade.e1)) : "last: no fade found";
-			} else if (hr != DXGI_ERROR_WAS_STILL_DRAWING || frame - fade.copyFrame > 120) {
-				fade.staging = nullptr;
-				fade.e1 = -1.0f;
-			}
-		}
-		return fade.e1;
-	}
-	if (cloudFades.size() > 64)
-		cloudFades.clear();
-
-	CloudFade fade;
-	fade.vertexBuffer = rendererData->vertexBuffer;
-	fade.e1 = -1.0f;
-	uint64_t descBits = 0;
-	std::memcpy(&descBits, &rendererData->vertexDesc, sizeof(descBits));
-	const uint32_t stride = static_cast<uint32_t>(descBits & 0xF) * 4;
-	const auto flags = rendererData->vertexDesc.GetFlags();
-	fade.vertexCount = shape->GetTrishapeRuntimeData().vertexCount;
-	if ((flags & RE::BSGraphics::Vertex::VF_VERTEX) && (flags & RE::BSGraphics::Vertex::VF_COLORS) && stride > 0 && fade.vertexCount > 0) {
-		const uint32_t positionOffset = rendererData->vertexDesc.GetAttributeOffset(RE::BSGraphics::Vertex::VA_POSITION);
-		uint32_t next = stride;
-		for (uint32_t attribute = 1; attribute < RE::BSGraphics::Vertex::VA_COUNT; ++attribute) {
-			if (!(flags & (1u << attribute)))
-				continue;
-			const uint32_t offset = rendererData->vertexDesc.GetAttributeOffset(static_cast<RE::BSGraphics::Vertex::Attribute>(attribute));
-			if (offset > positionOffset && offset < next)
-				next = offset;
-		}
-		fade.fullPrecision = next - positionOffset >= 12;
-		fade.stride = stride;
-		fade.positionOffset = positionOffset;
-		fade.colorOffset = rendererData->vertexDesc.GetAttributeOffset(RE::BSGraphics::Vertex::VA_COLOR);
-		fade.world = geometry->world;
-		fade.eye = (globals::game::sky && globals::game::sky->root) ? globals::game::sky->root->world.translate : geometry->world.translate;
-		const bool layoutOk = positionOffset + (fade.fullPrecision ? 12u : 6u) <= stride && fade.colorOffset + 4 <= stride;
-		if (layoutOk) {
-			if (rendererData->rawVertexData) {
-				// The engine's CPU copy (copied out first: bad pointers from mods are skipped).
-				std::vector<uint8_t> bytes(static_cast<size_t>(fade.vertexCount) * stride);
-				if (HorizonSafeCopy(bytes.data(), rendererData->rawVertexData, bytes.size())) {
-					fade.e1 = MeasureCloudFade(bytes.data(), fade.vertexCount, stride, positionOffset, fade.colorOffset, fade.fullPrecision, fade.world, fade.eye);
-					++cloudFadeMeasured;
-					cloudFadeNote = fade.e1 >= 0.0f ? std::format("last: fades in at {:.1f} deg", DirectX::XMConvertToDegrees(fade.e1)) : "last: no fade found";
-				}
-			} else if (auto* device = globals::d3d::device) {
-				// No CPU copy: one GPU read-back of the vertex buffer.
-				D3D11_BUFFER_DESC desc{};
-				auto* vertexBuffer = reinterpret_cast<::ID3D11Buffer*>(rendererData->vertexBuffer);
-				vertexBuffer->GetDesc(&desc);
-				D3D11_BUFFER_DESC stagingDesc{ desc.ByteWidth, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
-				if (desc.ByteWidth > 0 && SUCCEEDED(device->CreateBuffer(&stagingDesc, nullptr, fade.staging.put()))) {
-					globals::d3d::context->CopyResource(fade.staging.get(), vertexBuffer);
-					fade.copyFrame = frame;
-					fade.e1 = std::numeric_limits<float>::quiet_NaN();
-				}
-			}
-		}
-	}
-	const float result = fade.e1;
-	cloudFades[a_geometry] = std::move(fade);
-	return result;
-}
 
 void PhysicalSky::BindHorizonWarp(const RE::BSRenderPass* a_pass)
 {
@@ -2358,18 +2039,9 @@ void PhysicalSky::BindHorizonWarp(const RE::BSRenderPass* a_pass)
 	auto* context = globals::d3d::context;
 	if (!context)
 		return;
-	// Every cloud draw gets the constants (zeros when the fix is off), so Sky.hlsl's VS never reads someone else's b11.
-	// w = 4242: the shader warps only with this key in place.
-	float4 warp{ 0.f, 0.f, 0.f, 0.f };
-	if (HorizonFixActive() && a_pass->geometry) {
-		const float e1 = GetCloudFadeElevation(a_pass->geometry);
-		if (std::isfinite(e1) && e1 >= 0.f) {
-			const double R = static_cast<double>(cbData.rPlanet);
-			const double h = static_cast<double>(horizonFixCbData.altitude);
-			const double dip = R > 0.0 ? std::atan(std::sqrt(h * (2.0 * R + h)) / R) : 0.0;
-			warp = { 1.f, e1, static_cast<float>(-dip), 4242.f };
-		}
-	}
+	// Every cloud draw gets the constants, so Sky.hlsl's VS never reads someone else's b11. fixed (47m): always zeros
+	// (x = 0: no warp; w = 0, not the 4242 key), exactly as with Horizon Fix off.
+	const float4 warp{ 0.f, 0.f, 0.f, 0.f };
 	horizonWarpCB->Update(warp);
 	horizonWarpPrevious = nullptr;
 	context->VSGetConstantBuffers(kHorizonWarpSlot, 1, &horizonWarpPrevious);  // AddRef'd; released in Unbind
@@ -2416,8 +2088,8 @@ bool PhysicalSky::UpdateCpuSkyModel()
 	atmosphere.groundAlbedo = { s.groundAlbedo.x, s.groundAlbedo.y, s.groundAlbedo.z };
 	atmosphere.midpoint = true;
 	atmosphere.groundFix = true;
-	atmosphere.multiScatterFix = effective.fixMultiScatter;
-	atmosphere.trLutEdgeFix = effective.fixTrLutEdge;
+	atmosphere.multiScatterFix = true;  // fixed (47m, pinned since 44h)
+	atmosphere.trLutEdgeFix = true;     // fixed (47m, pinned since 44h)
 	atmosphere.precision = (extCbData.flags & kExtSkyPrecision) != 0;  // (47b) the transmittance LUT as the GPU builds it
 	return skyModelCpu.Update(atmosphere);
 }

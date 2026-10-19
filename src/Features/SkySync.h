@@ -35,49 +35,21 @@ public:
 		int32_t MoonLightSource = 0;
 		int32_t SunPath = 0;
 		float CustomAngle = -35.0f;
-		// (44h) The fields below are no longer in the menu or the JSON: Effective() pins MoonOrbit =
-		// Stable, KeepMoonPosition = on, LightSourceModel = Combined, BothMoonsLight = on (Legacy (36f)
-		// still overrides). Kept for a possible rollback (specs/physsky-rollback-candidates.md).
-		/// (40e) Where the moons are placed (MoonOrbit values):
-		/// 0 Vanilla: the engine steps each orbit angle forward every frame (a backwards time change
-		///   counts as +24 h; Secunda, 20% faster than Masser, lands somewhere new on every skip).
-		/// 1 Stable (40d fix C): the angle follows whole days + the clock at each moon's own speed.
-		///   Masser is overhead at midnight; Secunda drifts 72 degrees a day (a 5-day cycle in
-		///   which it is up at night on about two nights).
-		/// 2 Night Sky (default): both moons are tied to the clock and stay up all night: they are
-		///   up at dusk, cross the sky slowly and set after dawn, Secunda a little ahead of Masser, a
-		///   fixed distance apart. Each day both pass below the horizon, so phases still change.
-		int32_t MoonOrbit = 2;
-		/// (40e) Night Sky: each moon's place on its orbit at the middle of the night, in degrees
-		/// from its highest point (negative = earlier, towards the side it rises on).
-		float MasserNightPosition = -15.0f;
-		float SecundaNightPosition = 15.0f;
-		/// (40e) Night Sky: degrees each moon moves along its orbit from dusk to dawn.
-		float NightArc = 80.0f;
-		/// (40d) Leave the moons where the game puts them: no altitude dip written into their
-		/// rotation (upstream 54962ef3b). Physical Sky then reads each moon's on-screen
-		/// direction (upstream b2d671ba8's idea), so its glow sits on the disc.
-		bool KeepMoonPosition = true;
-		/// (42b) LightSourceModel: what the one directional (shadow-casting) light is.
-		/// 0 Clock (42a and earlier): the sun from 6:30 to 19:30 by the climate's clock, a moon outside
-		///   it with clock fades, so there was a stretch at dawn and dusk with no light at all.
-		/// 1 Combined (default): sun + moons added, each by its true height above the horizon; the
-		///   direction follows the brightest body and hands over smoothly (spec-skysync D1-D6).
-		int32_t LightSourceModel = 1;
-		/// (42b) Combined: both moons add their light (Secunda at 0.67, by phase). Off: only the moon
-		/// picked by "Moon light source" (Brightest = a smooth blend that is as bright as the brighter).
-		bool BothMoonsLight = false;
+		// (47m) The 44h pins are no longer fields; the code always takes these sides (only Physical Sky's removed
+		// "Legacy (36f)" model ever used the others):
+		// - MoonOrbit = Stable (40d fix C): the orbit angle follows whole days + the clock at each moon's own speed
+		//   (SetMoonAngle); the Night Sky orbit and its MasserNightPosition / SecundaNightPosition / NightArc are gone.
+		// - KeepMoonPosition = on (40d): no altitude dip written into the moons' rotation (upstream 54962ef3b); Physical
+		//   Sky reads each moon's on-screen direction, so its glow sits on the disc.
+		// - LightSourceModel = Combined (42b): sun + moons added by true height, smooth hand-over (UpdateCombined); the
+		//   Clock model (ShadowFader) is gone.
+		// - BothMoonsLight = on (42b): both moons add their light (Secunda at 0.67, by phase).
 		/// (47a2, upstream) Worldspaces where Sky Sync leaves the light to the game (editor IDs, any case).
 		/// Editable in the JSON only. Realms whose weathers keep the same light round the clock.
 		std::vector<std::string> DisabledWorldspaces = { "Blackreach", "AlftandWorld", "Sovngarde", "DLC01SoulCairn", "DLC01Boneyard", "DLC2ApocryphaWorld" };
 	};
 
 	Settings settings;
-
-	/// (41b, F5) Settings as used this frame: in Physical Sky's "Legacy (36f)" mode the moon options
-	/// added after 36f are at their 36f values (Vanilla orbit, discs lowered by altitude). The saved
-	/// settings are never changed.
-	Settings Effective() const;
 
 	virtual void DrawSettings() override;
 
@@ -138,21 +110,6 @@ private:
 		None
 	};
 
-	enum class MoonOrbit : int32_t
-	{
-		Vanilla,
-		Stable,
-		NightSky,
-		Count
-	};
-
-	enum class LightSourceModel : int32_t
-	{
-		Clock,
-		Combined,
-		Count
-	};
-
 	enum class SunPath : uint8_t
 	{
 		Southern,
@@ -164,8 +121,6 @@ private:
 
 	const char* MoonLightSourceNames[static_cast<uint8_t>(MoonLightSource::Count)] = { "Brightest", "Masser", "Secunda" };
 	const char* SunPathNames[static_cast<uint8_t>(SunPath::Count)] = { "Southern Sky", "Northern Sky", "Vanilla", "Custom" };
-	const char* MoonOrbitNames[static_cast<int32_t>(MoonOrbit::Count)] = { "Vanilla", "Stable", "Night Sky" };
-	const char* LightSourceModelNames[static_cast<int32_t>(LightSourceModel::Count)] = { "Clock (old)", "Combined" };
 
 	struct ClimateTimings
 	{
@@ -183,28 +138,8 @@ private:
 		void Update(const RE::TESClimate* climate);
 	};
 
-	struct ShadowFader
-	{
-		enum class Phase : uint8_t
-		{
-			None,
-			FadeOut,
-			FadeIn
-		};
-
-		static constexpr float FadeTime = 100.0f;  // 5 seconds at timescale 20
-
-		Phase fadePhase = Phase::None;
-		Caster current = Caster::None;
-		Caster target = Caster::None;
-		float fadeTimer = 0.0f;
-		float previousHoursPassed = 0.0f;
-
-		void Update(const RE::Sun* sun, RE::NiPoint3 dirs[], float intensities[], std::optional<std::array<RE::NiColor, 3>> colors, bool isDayTime);
-		static void SetLighting(const RE::Sun* sun, RE::NiPoint3 dir, float intensity, std::optional<RE::NiColor> color);
-		static void ClampDirection(RE::NiPoint3& dir);
-		void Reset();
-	};
+	/// Keeps the light at least MinElevation above the horizon (the old ShadowFader::ClampDirection).
+	static void ClampLightDirection(RE::NiPoint3& dir);
 
 	/// (42b) Direction hand-over of the Combined light model (spec-skysync D2): the light's direction
 	/// follows `dominant`. A new dominant body close in the sky (TurnMaxAngle) is turned to over
@@ -221,7 +156,7 @@ private:
 			FadeIn
 		};
 
-		static constexpr float FadeTime = 100.0f;      // game seconds: 5 real seconds at timescale 20, as ShadowFader
+		static constexpr float FadeTime = 100.0f;      // game seconds: 5 real seconds at timescale 20
 		static constexpr float TurnMaxAngle = 25.0f;   // degrees: closer than this, turn instead of fading
 		static constexpr float Hysteresis = 1.25f;     // a new body must be this much brighter to take over
 
@@ -255,7 +190,6 @@ private:
 	static constexpr float RenderDistance = 325000.0f;
 	static constexpr float SunHorizonDistance = 280.0f;
 	static constexpr float SunPeakDistance = 400.0f;
-	static constexpr float SunScaleFactor = 48.0f / 2048.0f;
 	static constexpr float MinElevation = 0.25f;
 
 	static constexpr float SouthernSunAngle = 90.0f - 35.0f;
@@ -268,9 +202,6 @@ private:
 	static constexpr float FullMoonIntensityFactor = 1.0f;
 
 	inline static RE::NiPoint3* gSunPosition = nullptr;
-	inline static float* gSunGlareSize = nullptr;
-	inline static uint32_t* gMasserSize = nullptr;
-	inline static uint32_t* gSecundaSize = nullptr;
 
 	inline static float volumetricLightingIntensityFactor = 1.0f;
 	/// (batch 37b, A3) The shadow fader's current light source is Masser or Secunda.
@@ -295,18 +226,13 @@ private:
 	int lastDominant = 3;
 	float sunAngle = 90.0f;
 	float currentSkyRotation = D3D11_FLOAT32_MAX;
-	float masserPhaseIntensityFactor = 0.0f;
-	float secundaPhaseIntensityFactor = 0.0f;
 
 	ClimateTimings timings = {};
 
 	RE::NiPoint3 rawDirections[3];
 	RE::NiPoint3 directions[3];
-	float intensities[3] = {};
 	std::optional<std::array<RE::NiColor, 3>> lightColors = {};  // assigned externally by Physical Sky
-	ShadowFader shadowFader;
 	CombinedHandover combinedHandover;
-	int32_t lastLightSourceModel = -1;
 
 	void DisableOnConflict(std::string_view conflictName);
 
@@ -325,7 +251,7 @@ private:
 
 	void ProcessSun(const RE::Sky* sky, const RE::Sun* sun, float time, float altitude, bool isDayTime);
 
-	void ProcessMoon(const RE::Moon* moon, float time, Caster type, float altitude, bool isDayTime);
+	void ProcessMoon(const RE::Moon* moon, Caster type, float altitude);
 
 	static void CalculateSunDirectionAndDistance(const RE::Sun* sun, RE::NiPoint3& outDir, float& outDistance);
 
@@ -335,10 +261,6 @@ private:
 
 	static void SetSunPosition(const RE::Sun* sun, const RE::NiPoint3& dir, float distance);
 
-	static void SetMoonDirection(const RE::Moon* moon, const RE::NiPoint3& dir);
-
-	static float CalculateVisibility(const RE::NiPoint3& dir, float dist, float radius);
-
 	static void SetSunBaseVisibility(const RE::Sun* sun, float visibility);
 
 	/// (47a2, upstream CalculateVanillaSunDirection) The game's own sun arc with the alternate path off, but
@@ -346,17 +268,14 @@ private:
 	static void PutVanillaNightBelowHorizon(RE::NiPoint3& dir, float hour, const RE::TESClimate::Timing& timing);
 	inline static RE::Setting* gSunAlphaTransTime = nullptr;
 
-	/// (40d, 40e) Writes the orbit angle (Moon+0xCC) for the Stable or Night Sky orbit and sets
-	/// the last hour (+0xD0) to the current hour, so the engine's own update adds nothing.
-	/// SE 1.5.97 only.
+	/// (40d) Writes the orbit angle (Moon+0xCC) for the Stable orbit and sets the last hour (+0xD0)
+	/// to the current hour, so the engine's own update adds nothing. SE 1.5.97 only.
 	static void SetMoonAngle(RE::Moon* moon, const RE::Sky* sky);
 
 public:
 	/// (40d) Brightness factor of the moon's current phase picture (new 0.05 .. full 1), read
 	/// from the texture on its disc, as the phase factor above.
 	static float PhaseFactorFromTexture(const RE::Moon* moon);
-	/// (40d) The moon's vanilla visibility: 0 when hidden, else its disc's fade alpha.
-	static float VanillaVisibility(const RE::Moon* moon);
 	/// (40d) World-space direction from the sky's centre to the moon's disc; false if unknown.
 	static bool OnScreenDirection(const RE::Moon* moon, const RE::Sky* sky, RE::NiPoint3& outDir);
 
@@ -369,7 +288,7 @@ public:
 	/// (upstream's timing: 7 degrees below its -1 degree effective horizon).
 	static float MoonDayFade(float sunElevationDeg);
 
-	/// (47a) Physical Sky's "Sky Fixes" is on (Physical Sky loaded and enabled, not Legacy (36f)).
+	/// (47a) Physical Sky's "Sky Fixes" is on (Physical Sky loaded and enabled).
 	static bool SkyFixesActive();
 
 	/// (47a) Sky Fixes timing, (47a2) warped only below the horizon. The sun sits at -12 degrees when

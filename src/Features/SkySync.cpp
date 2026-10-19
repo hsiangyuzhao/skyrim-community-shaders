@@ -14,9 +14,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	CustomAngle,
 	DisabledWorldspaces)  // (47a2)
 // (44h) removed MoonOrbit, MasserNightPosition, SecundaNightPosition, NightArc, KeepMoonPosition,
-// LightSourceModel, BothMoonsLight: pinned in Effective() (Stable orbit, discs kept, Combined, both
-// moons); the Night Sky sliders only applied to the Night Sky orbit. Old keys are ignored on load.
-// Code paths kept for a possible rollback (specs/physsky-rollback-candidates.md).
+// LightSourceModel, BothMoonsLight from the JSON (old keys are ignored on load). (47m) Fixed in the
+// code: Stable orbit, discs kept, Combined light model, both moons (see Settings).
 
 void SkySync::DrawSettings()
 {
@@ -51,13 +50,10 @@ void SkySync::DrawSettings()
 		ImGui::Text("Which moon casts the shadows at night (both moons still add their light). If the chosen moon is not up, the other one takes over.");
 
 	// (44h) removed "Light Source Model", "Both Moons Light the Scene", "Moon Orbit" (with the Night Sky
-	// sliders) and "Keep Moons Where the Game Puts Them": pinned in Effective(). Code paths kept for a
-	// possible rollback (specs/physsky-rollback-candidates.md).
-	if (globals::features::physicalSky.IsLegacy())
-		ImGui::TextColored({ 1.f, 0.8f, 0.3f, 1.f }, "Physical Sky's Sky Model is Legacy (36f): moons and moonlight work as in 36f right now.");
+	// sliders) and "Keep Moons Where the Game Puts Them": fixed in the code (47m).
 
-	// (47a2) Read-only status.
-	if (ImGui::TreeNode("Status")) {
+	// (47a2) Read-only status. (47m) In a collapsed "Diagnostics" node.
+	if (ImGui::TreeNode("Diagnostics")) {
 		auto clock = [](double a_hour) {
 			double h = std::fmod(a_hour, 24.0);
 			if (h < 0.0)
@@ -82,35 +78,11 @@ void SkySync::DrawSettings()
 	}
 }
 
-SkySync::Settings SkySync::Effective() const
-{
-	Settings s = settings;
-	// (44h) No longer user settings: pinned here so every reader gets them (Combined light model, both
-	// moons in the sum, Stable orbit, discs left where the game puts them). Legacy (36f) below still
-	// sets its 36f values.
-	s.LightSourceModel = static_cast<int32_t>(LightSourceModel::Combined);
-	s.BothMoonsLight = true;
-	s.MoonOrbit = static_cast<int32_t>(MoonOrbit::Stable);
-	s.KeepMoonPosition = true;
-	if (globals::features::physicalSky.IsLegacy()) {
-		// 36f: the engine's own moon stepping, discs lowered by altitude (40d/40e options off).
-		s.MoonOrbit = static_cast<int32_t>(MoonOrbit::Vanilla);
-		s.KeepMoonPosition = false;
-		s.LightSourceModel = static_cast<int32_t>(LightSourceModel::Clock);  // (42b)
-	}
-	return s;
-}
-
 void SkySync::LoadSettings(json& o_json)
 {
 	settings = o_json;
 	settings.MoonLightSource = std::clamp(settings.MoonLightSource, static_cast<int32_t>(MoonLightSource::Brightest), static_cast<int32_t>(MoonLightSource::Secunda));
 	settings.SunPath = std::clamp(settings.SunPath, static_cast<int32_t>(SunPath::Southern), static_cast<int32_t>(SunPath::Custom));
-	settings.MoonOrbit = std::clamp(settings.MoonOrbit, static_cast<int32_t>(MoonOrbit::Vanilla), static_cast<int32_t>(MoonOrbit::NightSky));
-	settings.MasserNightPosition = std::clamp(settings.MasserNightPosition, -60.0f, 60.0f);
-	settings.SecundaNightPosition = std::clamp(settings.SecundaNightPosition, -60.0f, 60.0f);
-	settings.NightArc = std::clamp(settings.NightArc, 0.0f, 140.0f);
-	settings.LightSourceModel = std::clamp(settings.LightSourceModel, 0, static_cast<int32_t>(LightSourceModel::Count) - 1);
 	// (47a2) A broken or out-of-range angle from the JSON: back to the default / into range.
 	if (!std::isfinite(settings.CustomAngle))
 		settings.CustomAngle = Settings{}.CustomAngle;
@@ -148,9 +120,6 @@ void SkySync::PostPostLoad()
 	stl::write_thunk_call<ApplyVolumetricLighting_VolumetricLightingDescriptor_Get>(REL::RelocationID(100475, 107193).address() + 0x354);
 
 	gSunPosition = reinterpret_cast<RE::NiPoint3*>(REL::RelocationID(527924, 414871).address());
-	gSunGlareSize = reinterpret_cast<float*>(REL::RelocationID(502611, 370235).address());
-	gMasserSize = reinterpret_cast<uint32_t*>(REL::RelocationID(502558, 370155).address());
-	gSecundaSize = reinterpret_cast<uint32_t*>(REL::RelocationID(502570, 370173).address());
 
 	logger::info("[Sky Sync] Installed hooks");
 }
@@ -175,7 +144,6 @@ void SkySync::OnGameLoaded()
 	currentCellWorldspace = nullptr;
 	currentSkyRotation = D3D11_FLOAT32_MAX;
 	disabledCacheValid = false;
-	shadowFader.Reset();
 	combinedHandover.Reset();
 }
 
@@ -231,10 +199,8 @@ void SkySync::Update(const RE::Sky* sky)
 		const auto* oldWorldspace = currentCellWorldspace;
 		if (cell) {
 			SetSkyRotation(sky, cell);
-			if (hadCell && (cell->IsInteriorCell() != wasInterior || cell->GetRuntimeData().worldSpace != oldWorldspace)) {
-				shadowFader.Reset();
+			if (hadCell && (cell->IsInteriorCell() != wasInterior || cell->GetRuntimeData().worldSpace != oldWorldspace))
 				combinedHandover.Reset();
-			}
 		} else {
 			currentCell = nullptr;
 			currentCellValid = false;
@@ -262,21 +228,11 @@ void SkySync::Update(const RE::Sky* sky)
 	const float altitude = worldSpace ? player->GetPositionZ() - worldSpace->GetDefaultWaterHeight() : 0.0f;
 
 	ProcessSun(sky, sun, time, altitude, isDayTime);
-	ProcessMoon(sky->masser, time, Caster::Masser, altitude, isDayTime);
-	ProcessMoon(sky->secunda, time, Caster::Secunda, altitude, isDayTime);
+	ProcessMoon(sky->masser, Caster::Masser, altitude);
+	ProcessMoon(sky->secunda, Caster::Secunda, altitude);
 
-	// (42b) A model change (menu, A/B Compare) starts the new model from scratch.
-	const int32_t model = Effective().LightSourceModel;
-	if (model != lastLightSourceModel) {
-		shadowFader.Reset();
-		combinedHandover.Reset();
-		lastLightSourceModel = model;
-	}
-
-	if (model == static_cast<int32_t>(LightSourceModel::Combined))
-		UpdateCombined(sky);
-	else
-		shadowFader.Update(sun, directions, intensities, lightColors, isDayTime);
+	// fixed (47m, pinned since 44h): the Combined light model (the Clock model went with Legacy (36f)).
+	UpdateCombined(sky);
 }
 
 float SkySync::MoonDayFade(const float sunElevationDeg)
@@ -560,22 +516,9 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 	for (int i = 0; i < 3; ++i)
 		weight[i] = strength[i] * (hasColors ? std::max(luminance((*lightColors)[i]), 0.0f) : 1.0f);
 
-	// Which moons are in the sum.
+	// Which moons are in the sum. fixed (47m, pinned since 44h): "Both Moons Light the Scene" on.
 	const auto src = static_cast<MoonLightSource>(settings.MoonLightSource);
-	float share[3] = { 1.0f, 0.0f, 0.0f };
-	if (Effective().BothMoonsLight) {
-		share[masserIdx] = 1.0f;
-		share[secundaIdx] = 1.0f;
-	} else if (src == MoonLightSource::Masser) {
-		share[masserIdx] = 1.0f;
-	} else if (src == MoonLightSource::Secunda) {
-		share[secundaIdx] = 1.0f;
-	} else if (const float moonSum = weight[masserIdx] + weight[secundaIdx]; moonSum > 0.0f) {
-		// Brightest, without a jump when the two cross: each by its share of the moonlight. As bright as
-		// the brighter moon when one dominates, and at the crossing.
-		share[masserIdx] = weight[masserIdx] / moonSum;
-		share[secundaIdx] = weight[secundaIdx] / moonSum;
-	}
+	const float share[3] = { 1.0f, 1.0f, 1.0f };
 
 	// Direction: the brightest body, among the moons only those "Moon light source" allows.
 	// (44h) With Masser or Secunda picked, the other moon may cast the shadows while the picked one has
@@ -654,7 +597,7 @@ void SkySync::UpdateCombined(const RE::Sky* sky)
 
 void SkySync::SetLightingCombined(const RE::Sun* sun, RE::NiPoint3 dir, std::optional<RE::NiColor> color, const float vanillaFade, const float vlFactor)
 {
-	ShadowFader::ClampDirection(dir);
+	ClampLightDirection(dir);
 
 	RE::NiMatrix3& m = sun->light->local.rotate;
 	m.entry[0][0] = -dir.x;
@@ -669,7 +612,7 @@ void SkySync::SetLightingCombined(const RE::Sun* sun, RE::NiPoint3 dir, std::opt
 		light.fade = 1.0f;
 	} else {
 		// No Physical Sky colours: the colour is the weather's, written by the game, so fade stays the
-		// dimmer here (as in the Clock model).
+		// dimmer here (as in the old Clock model).
 		light.fade = std::clamp(vanillaFade, 0.0f, 1.0f);
 	}
 
@@ -853,13 +796,11 @@ void SkySync::ProcessSun(const RE::Sky* sky, const RE::Sun* sun, const float tim
 		FadeSunAtHorizon(sky, DirectX::XMConvertToDegrees(std::asin(std::clamp(dir.z, -1.0f, 1.0f))));
 	else
 		SetSunBaseVisibility(sun, isDayTime ? 1.0f : 0.0f);
-
-	intensities[static_cast<int>(Caster::Sun)] = isDayTime ? CalculateVisibility(dir, dist, *gSunGlareSize * SunScaleFactor) : 0.0f;
+	// (47m) The Clock model's sun intensity (CalculateVisibility) went with that model.
 }
 
-void SkySync::ProcessMoon(const RE::Moon* moon, const float time, const Caster type, const float altitude, const bool isDayTime)
+void SkySync::ProcessMoon(const RE::Moon* moon, const Caster type, const float altitude)
 {
-	intensities[static_cast<int>(type)] = 0.0f;
 	directions[static_cast<int>(type)] = { 0.0f, 0.0f, 1.0f };
 	rawDirections[static_cast<int>(type)] = { 0.0f, 0.0f, -1.0f };
 
@@ -870,11 +811,9 @@ void SkySync::ProcessMoon(const RE::Moon* moon, const float time, const Caster t
 
 	rawDirections[static_cast<int>(type)] = dir;
 
+	// (40d) fixed (47m, pinned since 44h): "Keep Moons Where the Game Puts Them" on. The disc stays where the game
+	// put it (no altitude dip written into its rotation); only the light uses the dip.
 	auto apparentDir = GetApparentDirection(dir, altitude);
-	// (40d) Off = the old behaviour: the altitude dip is written into the moon's rotation, which
-	// moves the disc. On: the disc stays where the game put it; only the light uses the dip.
-	if (!Effective().KeepMoonPosition)
-		SetMoonDirection(moon, apparentDir);
 
 	// Moon and Stars adjusts some intermediary rotation matrices for the moon
 	// Directly changing the directions here avoids 3 matrix multiplications and a vector rotation
@@ -882,29 +821,7 @@ void SkySync::ProcessMoon(const RE::Moon* moon, const float time, const Caster t
 		apparentDir = { apparentDir.y, -apparentDir.x, apparentDir.z };
 
 	directions[static_cast<int>(type)] = apparentDir;
-
-	if (isDayTime)
-		return;
-
-	const auto src = static_cast<MoonLightSource>(settings.MoonLightSource);
-	const bool isValidSource = src == MoonLightSource::Brightest || (src == MoonLightSource::Masser && type == Caster::Masser) || (src == MoonLightSource::Secunda && type == Caster::Secunda);
-	if (!isValidSource)
-		return;
-
-	const float moonRadius = type == Caster::Masser ? static_cast<float>(*gMasserSize) : static_cast<float>(*gSecundaSize);
-	float intensity = CalculateVisibility(dir, moon->moonMesh->local.translate.y, moonRadius);
-
-	if (type == Caster::Masser)
-		intensity *= masserPhaseIntensityFactor;
-	else if (type == Caster::Secunda)
-		intensity *= secundaPhaseIntensityFactor * SecundaIntensityFactor;
-
-	if (time >= timings.sunriseFadeOutMoonStart && time <= timings.sunriseFadeOutMoonEnd)
-		intensity *= SmoothStep(timings.sunriseFadeOutMoonEnd, timings.sunriseFadeOutMoonStart, time);
-	else if (time >= timings.sunsetFadeInMoonStart && time <= timings.sunsetFadeInMoonEnd)
-		intensity *= SmoothStep(timings.sunsetFadeInMoonStart, timings.sunsetFadeInMoonEnd, time);
-
-	intensities[static_cast<int>(type)] = intensity;
+	// (47m) The Clock model's moon intensities (visibility x phase x clock fades) went with that model.
 }
 
 inline void SkySync::CalculateSunDirectionAndDistance(const RE::Sun* sun, RE::NiPoint3& outDir, float& outDistance)
@@ -969,129 +886,13 @@ inline void SkySync::SetSunPosition(const RE::Sun* sun, const RE::NiPoint3& dir,
 	*gSunPosition = position;
 }
 
-inline void SkySync::SetMoonDirection(const RE::Moon* moon, const RE::NiPoint3& dir)
-{
-	auto& m = moon->root->local.rotate;
-	m.entry[0][1] = dir.x;
-	m.entry[1][1] = dir.y;
-	m.entry[2][1] = dir.z;
-}
-
-inline float SkySync::CalculateVisibility(const RE::NiPoint3& dir, const float dist, const float radius)
-{
-	const float height = dir.Dot({ 0.0f, 0.0f, 1.0f }) * dist;
-	return SmoothStep(-radius, radius, height);
-}
-
 inline void SkySync::SetSunBaseVisibility(const RE::Sun* sun, const float visibility)
 {
 	if (const auto property = skyrim_cast<RE::BSSkyShaderProperty*>(sun->sunBase->GetGeometryRuntimeData().properties[1].get()))
 		property->kBlendColor.alpha = visibility;
 }
 
-void SkySync::ShadowFader::Reset()
-{
-	fadePhase = Phase::None;
-	current = Caster::None;
-	target = Caster::None;
-	fadeTimer = 0.0f;
-}
-
-void SkySync::ShadowFader::Update(const RE::Sun* sun, RE::NiPoint3 dirs[3], float intensities[3], std::optional<std::array<RE::NiColor, 3>> colors, const bool isDayTime)
-{
-	const float masserIntensity = intensities[static_cast<int>(Caster::Masser)];
-	const float secundaIntensity = intensities[static_cast<int>(Caster::Secunda)];
-
-	auto desired = Caster::None;
-	if (isDayTime)
-		desired = Caster::Sun;
-	else if (masserIntensity > 0.0f && masserIntensity >= secundaIntensity)
-		desired = Caster::Masser;
-	else if (secundaIntensity > 0.0f)
-		desired = Caster::Secunda;
-
-	if (desired != target) {
-		target = desired;
-		fadeTimer = 0.0f;
-
-		if (current == Caster::None) {
-			fadePhase = Phase::FadeIn;
-			current = target;
-		} else
-			fadePhase = Phase::FadeOut;
-	}
-
-	const auto calendar = RE::Calendar::GetSingleton();
-	const float currentHoursPassed = calendar->GetHoursPassed();
-	const float timeScale = calendar->GetTimescale();
-	const float hoursPassedDiff = abs(currentHoursPassed - previousHoursPassed);
-	previousHoursPassed = currentHoursPassed;
-	if (timeScale <= 0.0f || hoursPassedDiff >= 0.01f) {
-		fadePhase = Phase::None;
-		current = target;
-	}
-
-	std::optional<RE::NiColor> color = std::nullopt;
-	if (colors.has_value())
-		color = { 0.f, 0.f, 0.f };
-
-	volumetricLightingIsMoon = current == Caster::Masser || current == Caster::Secunda;
-
-	if (current == Caster::None) {
-		fadePhase = Phase::None;
-		SetLighting(sun, { 0.0f, 0.0f, 1.0f }, 0.0f, color);
-		return;
-	}
-
-	const auto& dir = dirs[static_cast<int>(current)];
-	const auto intensity = intensities[static_cast<int>(current)];
-	if (colors.has_value())
-		color = (*colors)[static_cast<int>(current)];
-
-	if (fadePhase == Phase::None) {
-		SetLighting(sun, dir, intensity, color);
-		return;
-	}
-
-	fadeTimer = std::min(fadeTimer + *globals::game::deltaTime * timeScale, FadeTime);
-
-	const float t = fadeTimer / FadeTime;
-	const float fade = fadePhase == Phase::FadeIn ? t : 1.0f - t;
-	SetLighting(sun, dir, intensity * fade, color);
-
-	if (fadePhase == Phase::FadeOut) {
-		if (t >= 1.0f || intensity <= 0.0f) {
-			current = target;
-			fadePhase = Phase::FadeIn;
-			fadeTimer = 0.0f;
-		}
-	} else if (fadePhase == Phase::FadeIn) {
-		if (t >= 1.0f)
-			fadePhase = Phase::None;
-	}
-}
-
-void SkySync::ShadowFader::SetLighting(const RE::Sun* sun, RE::NiPoint3 dir, float intensity, std::optional<RE::NiColor> color)
-{
-	ShadowFader::ClampDirection(dir);
-
-	RE::NiMatrix3& m = sun->light->local.rotate;
-	m.entry[0][0] = -dir.x;
-	m.entry[1][0] = -dir.y;
-	m.entry[2][0] = -dir.z;
-
-	if (color.has_value())
-		sun->light->GetLightRuntimeData().diffuse = *color;
-
-	RE::NiUpdateData updateData;
-	sun->light->Update(updateData);
-
-	intensity = std::clamp(intensity, 0.0f, 1.0f);
-	sun->light->GetLightRuntimeData().fade = intensity;
-	volumetricLightingIntensityFactor = intensity;
-}
-
-inline void SkySync::ShadowFader::ClampDirection(RE::NiPoint3& dir)
+void SkySync::ClampLightDirection(RE::NiPoint3& dir)
 {
 	constexpr float minElev = DirectX::XMConvertToRadians(MinElevation);
 	const float elev = DirectX::XMScalarASinEst(dir.z);
@@ -1143,53 +944,13 @@ void SkySync::Sky_OnNewClimate::thunk(RE::Sky* sky)
 
 void SkySync::Moon_Update::thunk(RE::Moon* moon, RE::Sky* sky)
 {
-	const auto updateMoonTexture = moon->updateMoonTexture;
-
-	if (const auto& singleton = globals::features::skySync; singleton.settings.Enabled && singleton.Effective().MoonOrbit != static_cast<int32_t>(MoonOrbit::Vanilla))
+	// fixed (47m, pinned since 44h): the Stable orbit.
+	if (globals::features::skySync.settings.Enabled)
 		SetMoonAngle(moon, sky);
 
 	func(moon, sky);
-
-	if (auto& singleton = globals::features::skySync; singleton.settings.Enabled && updateMoonTexture != moon->updateMoonTexture) {
-		// Gets the texture name of the current moon phase when it changes rather than reading direct global variables
-		// Allows for compatability with other mods that don't directly update the in-game phase values
-		const auto moonShaderProperty = skyrim_cast<RE::BSSkyShaderProperty*>(moon->moonMesh->GetGeometryRuntimeData().properties[1].get());
-
-		const auto name = moonShaderProperty->GetBaseTexture()->name.c_str();
-		const size_t len = std::strlen(name);
-		std::string lower;
-		lower.reserve(len);
-		for (size_t i = 0; i < len; ++i) {
-			lower.push_back(static_cast<char>(std::tolower(name[i])));
-		}
-
-		static constexpr std::array<std::pair<std::string_view, RE::Moon::Phases::Phase>, 8> Lookup{
-			{ { "full", RE::Moon::Phases::Phase::kFull },
-				{ "three_wan", RE::Moon::Phases::Phase::kWaningGibbous },
-				{ "half_wan", RE::Moon::Phases::Phase::kWaningQuarter },
-				{ "one_wan", RE::Moon::Phases::Phase::kWaningCrescent },
-				{ "new", RE::Moon::Phases::Phase::kNewMoon },
-				{ "one_wax", RE::Moon::Phases::Phase::kWaxingCrescent },
-				{ "half_wax", RE::Moon::Phases::Phase::kWaxingQuarter },
-				{ "three_wax", RE::Moon::Phases::Phase::kWaxingGibbous } }
-		};
-
-		RE::Moon::Phases::Phase phase = RE::Moon::Phases::Phase::kFull;
-		for (auto& [suffix, id] : Lookup) {
-			if (lower.find(suffix) != std::string::npos) {
-				phase = id;
-				break;
-			}
-		}
-
-		float* intensityFactor = moon == sky->masser ? &singleton.masserPhaseIntensityFactor : &singleton.secundaPhaseIntensityFactor;
-		if (phase == RE::Moon::Phases::Phase::kNewMoon) {
-			*intensityFactor = NewMoonIntensityFactor;
-		} else {
-			const float t = (abs(static_cast<float>(phase) - static_cast<float>(RE::Moon::Phases::Phase::kNewMoon)) - 1.0f) / 3.0f;
-			*intensityFactor = std::lerp(CrescentMoonIntensityFactor, FullMoonIntensityFactor, t);
-		}
-	}
+	// (47m) The phase tracking that fed the Clock model's moon intensities went with that model; the Combined model
+	// reads the phase with PhaseFactorFromTexture().
 }
 
 inline float SkySync::SmoothStep(const float start, const float end, const float x)
@@ -1231,45 +992,18 @@ void SkySync::SetMoonAngle(RE::Moon* moon, const RE::Sky* sky)
 	if (!std::isfinite(hour) || hour < 0.0 || hour > 24.0)
 		return;
 
-	double angle;
-	const auto effective = singleton.Effective();
-	if (effective.MoonOrbit == static_cast<int32_t>(MoonOrbit::Stable)) {
-		const auto calendar = RE::Calendar::GetSingleton();
-		if (!calendar)
-			return;
-		const double hours = static_cast<double>(calendar->GetHoursPassed());
-		const double speed = static_cast<double>(moon->speed);
-		if (!std::isfinite(hours) || hours < 0.0 || !std::isfinite(speed))
-			return;
-		// Whole days from the calendar, the time of day from the clock: Masser (15 degrees an hour,
-		// exactly a turn a day) is overhead at midnight whatever offset the save has between them.
-		const double days = std::floor((hours - hour) / 24.0 + 0.5);
-		angle = 90.0 + speed * 60.0 * (days * 24.0 + hour);
-	} else if (effective.MoonOrbit == static_cast<int32_t>(MoonOrbit::NightSky)) {
-		// Night = from an hour before the end of sunset to an hour after the start of sunrise, the
-		// span in which Sky Sync lets the moons light the scene (NAT's Skyrim climate: 19:30-06:30).
-		// Through the night the angle moves evenly from centre - arc/2 to centre + arc/2; over the day
-		// it carries on round the rest of the circle (below the horizon) to the next dusk.
-		double dusk = 19.5;
-		double night = 11.0;
-		if (const auto climate = sky->currentClimate) {
-			const double d = climate->timing.sunset.end / 6.0 - 1.0;
-			const double n = std::fmod(climate->timing.sunrise.begin / 6.0 + 1.0 - d + 48.0, 24.0);
-			if (n >= 4.0 && n <= 20.0) {
-				dusk = d;
-				night = n;
-			}
-		}
-		const auto& s = effective;
-		const double arc = std::clamp(static_cast<double>(s.NightArc), 0.0, 140.0);
-		const double centre = 90.0 + std::clamp(static_cast<double>(moon == sky->masser ? s.MasserNightPosition : s.SecundaNightPosition), -60.0, 60.0);
-		const double t = std::fmod(hour - dusk + 48.0, 24.0);
-		if (t < night)
-			angle = centre + arc * (t / night - 0.5);
-		else
-			angle = centre + arc * 0.5 + (360.0 - arc) * ((t - night) / (24.0 - night));
-	} else
+	// The Stable orbit (the only one since 47m; the Night Sky orbit is gone).
+	const auto calendar = RE::Calendar::GetSingleton();
+	if (!calendar)
 		return;
+	const double hours = static_cast<double>(calendar->GetHoursPassed());
+	const double speed = static_cast<double>(moon->speed);
+	if (!std::isfinite(hours) || hours < 0.0 || !std::isfinite(speed))
+		return;
+	// Whole days from the calendar, the time of day from the clock: Masser (15 degrees an hour,
+	// exactly a turn a day) is overhead at midnight whatever offset the save has between them.
+	const double days = std::floor((hours - hour) / 24.0 + 0.5);
+	double angle = 90.0 + speed * 60.0 * (days * 24.0 + hour);
 
 	angle = std::fmod(angle, 360.0);
 	if (angle < 0.0)
@@ -1291,7 +1025,7 @@ float SkySync::PhaseFactorFromTexture(const RE::Moon* moon)
 	for (auto& c : lower)
 		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
-	// Same table and factors as Moon_Update's phase tracking above.
+	// Phase from the texture name; brightness factors new 0.05, crescent 0.25 .. full 1.
 	static constexpr std::array<std::pair<std::string_view, RE::Moon::Phases::Phase>, 8> Lookup{
 		{ { "full", RE::Moon::Phases::Phase::kFull },
 			{ "three_wan", RE::Moon::Phases::Phase::kWaningGibbous },
@@ -1313,18 +1047,6 @@ float SkySync::PhaseFactorFromTexture(const RE::Moon* moon)
 		return NewMoonIntensityFactor;
 	const float t = (abs(static_cast<float>(phase) - static_cast<float>(RE::Moon::Phases::Phase::kNewMoon)) - 1.0f) / 3.0f;
 	return std::lerp(CrescentMoonIntensityFactor, FullMoonIntensityFactor, t);
-}
-
-float SkySync::VanillaVisibility(const RE::Moon* moon)
-{
-	if (!moon || !moon->root || !moon->moonMesh)
-		return 0.0f;
-	if (moon->root->GetFlags().any(RE::NiAVObject::Flag::kHidden) ||
-		(moon->moonNode && moon->moonNode->GetFlags().any(RE::NiAVObject::Flag::kHidden)) ||
-		moon->moonMesh->GetFlags().any(RE::NiAVObject::Flag::kHidden))
-		return 0.0f;
-	const auto property = skyrim_cast<RE::BSSkyShaderProperty*>(moon->moonMesh->GetGeometryRuntimeData().properties[1].get());
-	return property ? std::clamp(property->kBlendColor.alpha, 0.0f, 1.0f) : 1.0f;
 }
 
 bool SkySync::OnScreenDirection(const RE::Moon* moon, const RE::Sky* sky, RE::NiPoint3& outDir)

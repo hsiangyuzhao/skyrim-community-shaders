@@ -77,7 +77,7 @@ struct PhysicalSky final : public Feature
 		float zBottom = -14500.f;
 	};
 
-	/// The 9 hard-coded worldspaces of 37a and earlier. Used as-is while the 37b master is off.
+	/// The 9 hard-coded worldspaces of 37a and earlier (the base of DefaultWorldspaceWhitelist()).
 	static const std::map<std::string, WorldspaceInfo>& LegacyWorldspaceWhitelist();
 	/// (batch 37b) Legacy list + the Dawnguard exteriors that are earthly skies:
 	/// DLC1HunterHQWorld (Fort Dawnguard), DLC1VampireCastleCourtyard (Castle Volkihar
@@ -106,13 +106,6 @@ struct PhysicalSky final : public Feature
 	/// What Reset() decides for the current worldspace, also used by the menu.
 	WorldspaceStatus GetWorldspaceStatus(float& a_zBottom) const;
 
-	/// (41b, F2) "Moon Glow Fades".
-	enum MoonGlowFade : int
-	{
-		kMoonGlowFadeWithDisc = 0,  // 40d: the vanilla disc's fade alpha (gone 16 degrees up)
-		kMoonGlowFadeAtHorizon,     // the moon's true elevation, -2 -> +3 degrees
-		kMoonGlowFadeCount
-	};
 	/// (42b) "Cloud Lighting".
 	enum CloudLighting : int
 	{
@@ -129,13 +122,8 @@ struct PhysicalSky final : public Feature
 	};
 	/// (47b) The aerosol optics as uploaded (Mm^-1): the saved values, or the preset's.
 	void GetUploadedAerosol(float3& a_scatter, float3& a_absorption, float& a_phaseG) const;
-	/// (41b, F5) "Sky Model".
-	enum SkyModel : int
-	{
-		kSkyModelCurrent = 0,
-		kSkyModelLegacy36f,
-		kSkyModelCount
-	};
+	// (47m) "Sky Model: Legacy (36f)" removed: the Current model is the only one (the old skyModel key is ignored on
+	// load). The 44h fixes and celestial options it switched off are fixed on in the code.
 
 	struct Settings
 	{
@@ -150,11 +138,7 @@ struct PhysicalSky final : public Feature
 		/// occlusion, nonuniform midpoint quadrature, sky-view rows around the true horizon, quadratic aerial
 		/// perspective slices). Off = 47a2 exactly. Saved outside the NLOHMANN macro.
 		bool skyPrecision = true;
-		/// (47f) "Horizon Fix" (under Sky Fixes): the game's cloud dome reaches the real horizon (vertex-shader elevation warp,
-		/// fade start measured from the loaded cloud meshes), the distant sea reflects the clouds, and the fog meets the horizon
-		/// without a line (sky pixels fogged out to the curved sea, the weather fog layer thickening down to sea level, the
-		/// fog colour's cubemap read no lower than the horizon). Off = 47e exactly. Saved outside the NLOHMANN macro.
-		bool horizonFix = true;
+		// (47m) "Horizon Fix" (47f) removed: fixed off (the old horizonFix key is ignored on load).
 		/// (47b) "Aerosol": AerosolPreset. Applied at upload; the saved aerosol values are never changed.
 		int aerosolPreset = 0;
 		bool overrideDirLight = false;
@@ -171,7 +155,7 @@ struct PhysicalSky final : public Feature
 		float3 secundaColor = float3{ 0.8f, 1.0f, 1.0f } * 5e-3f;
 
 		bool proceduralSun = true;
-		float sunDiskRad = DirectX::XMConvertToRadians(0.53f);  // 37a size (really a diameter)
+		// (47m) sunDiskRad (the 37a disc size, read only by Legacy (36f)) removed; the old key is ignored on load.
 
 		// (batch 37b) Procedural sun v2. Each follows its own setting (the old master switch is gone).
 		/// Disk centred where the vanilla sun is drawn (Sky Sync's apparent direction, dipped
@@ -199,42 +183,26 @@ struct PhysicalSky final : public Feature
 		float sunGlowWidthDeg = 0.8f;
 		/// (batch 37c) Last "Sun Look" preset picked (SunLook); Custom once a slider is moved.
 		int sunLook = 1;
-		/// (batch 37c) Hide the solid black disc the game draws for a new moon (both moons share
-		/// the vanilla phase cycle, so both go black on the same nights).
-		bool hideNewMoonDisc = true;
 		/// (40d) Scales only the glow each moon puts into the physical sky (the scattering LUTs),
 		/// not the moonlight used for lighting and shadows. At 1 the glow next to the disc is about
 		/// as bright as the vanilla disc itself with strong moonlight, so the discs look washed out;
 		/// 0.2 keeps the disc about 5x brighter than its glow while the night sky keeps a moonlit
 		/// tint.
 		float moonGlowStrength = 0.2f;
-		/// (40d) Each moon's glow follows its phase (new moon ~0) and its vanilla visibility
-		/// (hidden or faded out = no glow).
-		bool moonGlowFollowsMoon = true;
-		/// (40d) Moon disc brightness = moonlight / disc solid angle (like the sun's Physical
-		/// Brightness), capped at moonRadianceCap; the phase picture keeps its shading.
-		/// (44h) skyTrueSunHeight, hideNewMoonDisc, moonGlowFollowsMoon, moonGlowFade,
-		/// moonPhysicalRadiance and moonsFadeInDaylight are no longer in the menu or the JSON:
-		/// UpdateEffective() pins them at these defaults outside Legacy (36f). Code paths kept for a
-		/// possible rollback (specs/physsky-rollback-candidates.md).
-		bool moonPhysicalRadiance = true;  // (44h) default false -> true (pinned)
+		// (47m) The 44h pins skyTrueSunHeight, hideNewMoonDisc, moonGlowFollowsMoon, moonGlowFade (At Horizon),
+		// moonPhysicalRadiance and moonsFadeInDaylight (all on) are no longer fields: the code always takes that side.
+		/// (40d) Moon disc brightness = moonlight / disc solid angle (like the sun's Physical Brightness),
+		/// capped at this; the phase picture keeps its shading.
 		float moonRadianceCap = 2.f;  // (44h) default 8 -> 2 (user's tuned value)
-		/// (41b, F2) What fades each moon's sky glow (with moonGlowFollowsMoon): MoonGlowFade.
-		int moonGlowFade = kMoonGlowFadeAtHorizon;
 
 		/// (41b, F1) Night sky base light: the current weather's night sky colours (SkyUpper,
 		/// Horizon, SkyLower) x this, with a faint airglow floor, faded out as the sun rises from
 		/// -6 to +4 degrees. Added to the sky-view LUT as a gradient and to the aerial
 		/// perspective LUT as an even glow of the air. 0 = the 41a image exactly.
 		float nightBaseLight = 0.2f;
-		/// (41b, F4a) The scattering LUTs use the sun's true height. The vanilla altitude dip
-		/// stays on the disc and its glow (sunAlignToVanilla).
-		bool skyTrueSunHeight = true;
 		/// (41b, F4b) In the LUTs only, a sun below the horizon is taken as elevation / this:
 		/// 1 = real twilight, 2 = twilight twice as long. Never the directional light.
 		float twilightLength = 1.f;
-		/// (41b, F5) SkyModel: Current, or Legacy (36f) for comparison (see Effective()).
-		int skyModel = kSkyModelCurrent;
 
 		/// (42b) CloudLighting. Single: clouds are lit only by the directional light (whichever body
 		/// Sky Sync made it), so they went black whenever it was off (dawn, dusk) and never caught the
@@ -246,9 +214,7 @@ struct PhysicalSky final : public Feature
 		/// (42b) Height of the clouds above you used for their sunlight only, km. Higher = they keep
 		/// the sun (pink/orange) longer after sunset. The drawn cloud layer is unchanged.
 		float cloudLightHeightKm = 2.f;
-		/// (42b) Moon discs lose contrast against a bright sky, as a real daytime moon does.
-		bool moonsFadeInDaylight = true;
-		/// (42b) How strongly: disc alpha x 1 / (1 + this x sky luminance / disc luminance).
+		/// (42b) Moon discs lose contrast against a bright sky, as a real daytime moon does. How strongly: disc alpha x 1 / (1 + this x sky luminance / disc luminance).
 		float moonDaylightFade = 20.f;
 		/// (44h) "Moonlight on Clouds": the moons light the clouds after the weather's cloud colour
 		/// (near black at night) instead of through it. Off = the 42b picture exactly. Needs
@@ -259,15 +225,8 @@ struct PhysicalSky final : public Feature
 		/// (44h) "Moon Halo": forward-scatter glow on thin cloud near the moon, 0-4.
 		float moonCloudHalo = 1.f;
 
-		// (batch 37b) Upstream correctness fixes (the old master switch is gone).
-		// (44h) removed from the menu and the JSON; now fixed on (UpdateEffective() forces them on
-		// outside Legacy (36f)). Code paths kept for a possible rollback
-		// (specs/physsky-rollback-candidates.md).
-		bool fixSkyAlpha = true;  // 5846ad833: sky dome written opaque
-		bool fixApShadowDepth = true;  // 224312a11 (depth read only): AP shadow under dynamic resolution
-		bool fixReflectionSky = true;  // 23156dc5f: reflected sky takes cloud-cube shadow, not TexApShadow
-		bool fixMultiScatter = true;  // c14664115 (LutGen part): full-sphere, isotropic MS LUT. Changes sky colour
-		bool fixTrLutEdge = true;  // 9fbd052ad: transmittance LUT read on texel centres, clamp sampler
+		// (47m) The 37b upstream fixes fixSkyAlpha, fixApShadowDepth, fixReflectionSky, fixMultiScatter and fixTrLutEdge
+		// (pinned on since 44h) are no longer fields: UpdateExtCbData() always writes their bits.
 
 		float adaptationStart = DirectX::XMConvertToRadians(-2);
 		float adaptationEnd = DirectX::XMConvertToRadians(-15);
@@ -303,22 +262,14 @@ struct PhysicalSky final : public Feature
 		float silverLiningSpread = 0.f;
 	} settings;
 
-	/// (41b, F5) The settings as used this frame. In "Legacy (36f)" mode every option added after
-	/// 36f is temporarily at its 36f value (and the 41b options at their "off" values); the saved
-	/// settings above are never written. Colours, exposures, atmosphere and clouds are the user's.
+	/// (41b, F5) The settings as used this frame: the saved settings with what Sky Fixes takes over
+	/// (Twilight Length) replaced; the saved settings above are never written.
 	/// Rebuilt by UpdateEffective() (every Reset and after a load).
 	const Settings& Effective() const { return effective; }
-	/// (41b, F5) Legacy (36f) mode is active.
-	bool IsLegacy() const { return loaded && settings.skyModel == kSkyModelLegacy36f; }
-	/// (47a) "Sky Fixes" is in effect: on, Physical Sky loaded and enabled, not Legacy (36f). Sky
-	/// Sync's timing, sun fade and moonlight retreat follow this too (also where the physical sky
-	/// itself is not drawn, e.g. interiors, so the sun does not jump at a worldspace border).
-	bool SkyFixesActive() const { return loaded && settings.enabled && settings.skyFixes && !IsLegacy(); }
-	/// (47f) "Horizon Fix" is in effect this frame (Sky Fixes on, Horizon Fix on, the physical sky drawn here).
-	bool HorizonFixActive() const { return SkyFixesActive() && settings.horizonFix && cbData.enabled; }
-	/// (41b, F5) 36f code paths for what the old Batch 37b master switched: hard-coded worldspace
-	/// list, 37a sun disc size, no 37b/37c shader flags.
-	bool UseLegacyPaths() const;
+	/// (47a) "Sky Fixes" is in effect: on, Physical Sky loaded and enabled. Sky Sync's timing, sun
+	/// fade and moonlight retreat follow this too (also where the physical sky itself is not drawn,
+	/// e.g. interiors, so the sun does not jump at a worldspace border).
+	bool SkyFixesActive() const { return loaded && settings.enabled && settings.skyFixes; }
 	void UpdateEffective();
 	Settings effective;
 
@@ -496,7 +447,7 @@ struct PhysicalSky final : public Feature
 	enum CloudFlags : uint32_t
 	{
 		kCloudMultiLight = 1u << 0,        // "Cloud Lighting: Sun + Moons + Sky"
-		kCloudMoonDaylightFade = 1u << 1,  // "Moons Fade in Daylight"
+		kCloudMoonDaylightFade = 1u << 1,  // "Moons Fade in Daylight" (fixed on since 44h)
 		kCloudMoonDirect = 1u << 2,        // (44h) "Moonlight on Clouds": moons added after the weather cloud colour
 	};
 	struct CloudCbData
@@ -517,11 +468,13 @@ struct PhysicalSky final : public Feature
 	void UpdateCloudData(float a_exposure, float a_sunElevation);
 
 	/// (47f) Mirrors SharedData::HorizonFixData (HLSL), appended after WeatherFogData at the very end of FeatureData.
+	/// (47m) Horizon Fix is removed: anchorOffset, altitude and flags are always 0 (padding until the Lighting package
+	/// drops the shader side); only fogSkyLight is live. The layout must not change (SharedData).
 	struct HorizonFixCbData
 	{
-		float anchorOffset = 0.f;  // (47g) camera height over the weather fog layer's base (0 = the base is the camera), game units
-		float altitude = 0.f;      // camera height over the ground sphere (zBottom), game units
-		uint flags = 0;            // bit 0: Horizon Fix in effect
+		float anchorOffset = 0.f;  // (47m) always 0 (was: camera height over the weather fog layer's base)
+		float altitude = 0.f;      // (47m) always 0 (was: camera height over the ground sphere)
+		uint flags = 0;            // (47m) always 0 (was: bit 0 Horizon Fix in effect)
 		float fogSkyLight = 0.f;   // (47g) EHF Physical Fog Brightness: the clear sky's light on a white surface facing up (0 = off)
 	} horizonFixCbData;
 	/// (47g) The clear physical sky's light on a white surface facing up (its cosine-weighted mean radiance, as drawn:
@@ -531,36 +484,15 @@ struct PhysicalSky final : public Feature
 	float fogSkyLightCached = 0.f;
 	static_assert(sizeof(HorizonFixCbData) == 16);
 
-	/// (47f) Horizon Fix (a): the cloud dome warp. Per cloud draw the vertex shader gets (VS b11, Sky.hlsl HorizonFixVS)
-	/// x = 1 to warp, y = the layer's fade elevation E1 (rad), z = the planet horizon eH = -dip (rad): elevation e goes to
-	/// eH + (e - E1) (90 deg - eH) / (90 deg - E1). E1 is measured once per cloud mesh from its vertex alpha (the elevation
-	/// where it reaches 40 % of the layer's own maximum, rising from the horizon; the engine's CPU copy, else a GPU read-back).
+	/// (47f) Sky.hlsl's cloud vertex shader still declares VS b11 (HorizonFixVS, the removed Horizon Fix's cloud dome warp).
+	/// (47m) Every cloud draw keeps getting a buffer of zeros there (exactly what it got with Horizon Fix off), so the
+	/// shader never reads someone else's b11; the previous b11 is put back after the draw. Goes with the Lighting package.
 	static constexpr UINT kHorizonWarpSlot = 11;
-	static constexpr float kCloudFadeAlphaShare = 0.4f;
-	static constexpr float kCloudFadeFallbackDeg = 8.f;
-	struct CloudFade
-	{
-		const void* vertexBuffer = nullptr;  // identity check (the geometry pointer could be reused)
-		float e1 = -1.f;                     // radians; < 0 = no fade found (no warp), NaN = pending
-		winrt::com_ptr<ID3D11Buffer> staging;  // GPU read-back in flight
-		uint32_t copyFrame = 0;
-		uint32_t vertexCount = 0, stride = 0, positionOffset = 0, colorOffset = 0;
-		bool fullPrecision = true;
-		RE::NiTransform world;  // the geometry's transform when the copy was taken
-		RE::NiPoint3 eye;
-	};
-	std::unordered_map<const RE::BSGeometry*, CloudFade> cloudFades;
-	/// Fade elevation of a cloud layer (radians), NaN while it is being measured, < 0 when it has none.
-	float GetCloudFadeElevation(const RE::BSGeometry* a_geometry);
-	static float MeasureCloudFade(const uint8_t* a_vertices, uint32_t a_count, uint32_t a_stride, uint32_t a_positionOffset, uint32_t a_colorOffset,
-		bool a_fullPrecision, const RE::NiTransform& a_world, const RE::NiPoint3& a_eye);
 	std::unique_ptr<ConstantBuffer> horizonWarpCB;
 	ID3D11Buffer* horizonWarpPrevious = nullptr;  // VS b11 before a cloud draw (AddRef'd), put back after it
 	bool horizonWarpBound = false;
 	void BindHorizonWarp(const RE::BSRenderPass* a_pass);
 	void UnbindHorizonWarp();
-	uint32_t cloudFadeMeasured = 0;  // layers measured (menu line)
-	std::string cloudFadeNote;
 
 	/// (batch 37c) "Sun Look" presets.
 	enum SunLook : int
