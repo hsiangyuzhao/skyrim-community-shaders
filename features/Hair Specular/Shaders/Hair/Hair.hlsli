@@ -58,6 +58,25 @@ namespace Hair
 		return F0.xxx;
 	}
 
+
+	// (47p) The tangent shift read once per pixel (Lighting.hlsl, "Hair: skip lighting work for lights that add nothing"): the same
+	// texel every caller reads, so the value is identical; any other uv reads the texture as before.
+	static float TangentShiftValue = 0.0;
+	static float2 TangentShiftUV = -1.0;
+	static bool TangentShiftReady = false;
+	float TangentShiftAt(float2 uv)
+	{
+		[branch] if (TangentShiftReady && all(uv == TangentShiftUV))
+			return TangentShiftValue;
+		return TexTangentShift.SampleLevel(SampColorSampler, uv, 0).x - 0.5;
+	}
+	void CacheTangentShift(float2 uv)
+	{
+		TangentShiftValue = TexTangentShift.SampleLevel(SampColorSampler, uv, 0).x - 0.5;
+		TangentShiftUV = uv;
+		TangentShiftReady = true;
+	}
+
 	float3 ShiftTangent(float3 T, float3 N, float shift)
 	{
 		return normalize(T + N * shift);
@@ -72,7 +91,7 @@ namespace Hair
 
 	float3 ShiftWorldNormal(float3 T, float3 N, float n, float2 uv)
 	{
-		const float shift = TexTangentShift.SampleLevel(SampColorSampler, uv, 0).x - 0.5;
+		const float shift = TangentShiftAt(uv);
 		float3 T_shifted = ShiftTangent(T, N, shift + n);
 		float3 N_shifted = normalize(cross(T_shifted, cross(N, T_shifted)));
 		return N_shifted;
@@ -105,7 +124,7 @@ namespace Hair
 		// (44c) Wet: the secondary shift moves toward the primary (0.4 k), both get the clump shift.
 		const float secondaryShift = lerp(SharedData::hairSpecularSettings.SecondaryTangentShift, SharedData::hairSpecularSettings.PrimaryTangentShift, 0.4 * WetK);
 		if (SharedData::hairSpecularSettings.EnableTangentShift) {
-			const float shift = TexTangentShift.SampleLevel(SampColorSampler, uv, 0).x - 0.5;
+			const float shift = TangentShiftAt(uv);
 			TshiftPrimary = ShiftTangent(T, N, shift + SharedData::hairSpecularSettings.PrimaryTangentShift + WetShift);
 			TshiftSecondary = ShiftTangent(T, N, shift + secondaryShift + WetShift);
 		} else if (WetShift != 0.0) {
@@ -256,7 +275,7 @@ namespace Hair
 		const float roughness = 1 - saturate(shininess * 0.01);
 
 		if (SharedData::hairSpecularSettings.EnableTangentShift) {
-			const float shift = TexTangentShift.SampleLevel(SampColorSampler, uv, 0).x - 0.5;
+			const float shift = TangentShiftAt(uv);
 			T = ShiftTangent(T, N, shift);
 		}
 		if (WetShift != 0.0)
@@ -293,7 +312,7 @@ namespace Hair
 			specularLobeWeightSecondary = 0;
 
 			if (SharedData::hairSpecularSettings.EnableTangentShift) {
-				const float shift = TexTangentShift.SampleLevel(SampColorSampler, uv, 0).x - 0.5;
+				const float shift = TangentShiftAt(uv);
 				T = ShiftTangent(T, N, shift);
 			}
 			float3 L = normalize(V - T * dot(V, T));
@@ -306,7 +325,7 @@ namespace Hair
 			float NdotVshifted2 = NdotV;
 
 			if (SharedData::hairSpecularSettings.EnableTangentShift) {
-				const float shift = TexTangentShift.SampleLevel(SampColorSampler, uv, 0).x - 0.5;
+				const float shift = TangentShiftAt(uv);
 				NdotVshifted = saturate(dot(ShiftNormal(T, N, shift + SharedData::hairSpecularSettings.PrimaryTangentShift), V));
 				NdotVshifted2 = saturate(dot(ShiftNormal(T, N, shift + SharedData::hairSpecularSettings.SecondaryTangentShift), V));
 			}
@@ -397,7 +416,7 @@ namespace Hair
 		const float roughnessSecondary = pow(abs(2.0 / (glossiness * 0.5 + 2.0)), 0.25);
 
 		if (SharedData::hairSpecularSettings.EnableTangentShift) {
-			const float shift = TexTangentShift.SampleLevel(SampColorSampler, uv, 0).x - 0.5;
+			const float shift = TangentShiftAt(uv);
 			N1 = ShiftNormal(T, N, shift + (SharedData::hairSpecularSettings.HairMode == 1 ? 0.0 : SharedData::hairSpecularSettings.PrimaryTangentShift));
 			N2 = ShiftNormal(T, N, shift + SharedData::hairSpecularSettings.SecondaryTangentShift);
 		}

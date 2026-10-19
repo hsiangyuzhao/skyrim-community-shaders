@@ -1075,6 +1075,26 @@ float3 GetWetFilmSpecular(float3 N, float3 V, float3 L, float3 lightColor, float
 #		include "Skin/Skin.hlsli"
 #	endif
 
+// (47p) The performance package's switches (Utils/PerfOptions; Skin.cpp writes them to wetCharParams[11].x). Without Advanced
+// Skin (no Skin constant buffer bound) they read 0: every old path. Each one only skips work whose result is provably unused or
+// multiplied by 0 (kHairSspls, an Aggressive-only switch, excepted).
+namespace Perf47p
+{
+	static const uint kWetCube = 2u;     // no wetness cubemap reflection where the wet film weight is exactly 0 (forward)
+	static const uint kHairLight = 4u;   // hair: no self-shadow / highlight for a black or fully shadowed light; tangent shift read once
+	static const uint kSssTrans = 8u;    // skin: no transmittance profile while its strength (sssParams.w) is 0
+	static const uint kSsplsDist = 16u;  // SSPLS: no light ranking beyond Max Distance (no steps are marched there)
+	static const uint kHairSspls = 32u;  // (A) no SSPLS for hair in its forward / blended pass
+	bool On(uint a_flag)
+	{
+#	if defined(CS_SKIN)
+		return (uint(max(Skin::wetCharParams[11].x, 0.0) + 0.5) & a_flag) != 0u;
+#	else
+		return false;
+#	endif
+	}
+}
+
 // (46y) The point-light trace first: SSPLS.hlsli reads its traced-caster mark (Screen-Space Shadows for Non-RT Casters).
 #	if defined(RT_POINT_SHADOWS) && defined(LIGHT_LIMIT_FIX)
 #		include "RayTracing/PointLightShadows.hlsli"
@@ -2250,7 +2270,11 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	float skinPhysBeadFade = 0.0;
 	float skinPhysCellsPerUV = 1.0;
 	float skinPhysGrowth = 1.0;  // (47j) Beads Fade In: how far the beads here have grown in (1 = all)
-	[branch] if (skinWetNew) {
+	// (47p) "Dry characters skip the wetness math": no sweat, rain or swim water on this character (the CPU's flag): exactly the
+	// Physical branch below with no water (film, beads and trails 0).
+	[branch] if (skinWetNew && Skin::WetPhysFlag(Skin::kPhysFlagDry)) {
+		skinWetMask = 1.0;
+	} else [branch] if (skinWetNew) {
 		// (47i) Physical: this pixel's water (um) from the character's sweat, rain and swim height profile, times where each
 		// gathers and the wet patches; split into bead water and film water by the beading share. The rain amount already
 		// holds the shelter (CPU): no sky occlusion on top.
@@ -2321,8 +2345,13 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		else
 		const float3 tangentNormal = normal.xyz;
 #		endif  // MODELSPACENORMALS
-		float3 detailNormal = float3(Skin::TexSkinDetailNormal.SampleBias(SampNormalSampler, detailUV, SharedData::MipBias).xy, 0.5f);
-		skinAO *= Skin::TexSkinDetailNormal.SampleBias(SampNormalSampler, detailUV, SharedData::MaterialMipBias()).w;
+		// (47p) One read of t72 when both reads use the same mip bias (always since 44f made the material mip bias permanent).
+		const float4 skinDetailSample = Skin::TexSkinDetailNormal.SampleBias(SampNormalSampler, detailUV, SharedData::MipBias);
+		float3 detailNormal = float3(skinDetailSample.xy, 0.5f);
+		[branch] if (Perf47p::On(Perf47p::kSssTrans) && SharedData::MaterialMipBias() == SharedData::MipBias)
+			skinAO *= skinDetailSample.w;
+		else
+			skinAO *= Skin::TexSkinDetailNormal.SampleBias(SampNormalSampler, detailUV, SharedData::MaterialMipBias()).w;
 		detailNormal = (detailNormal * 2.0 - 1.0) * SharedData::skinData.skinDetailParams.z;
 		float3 combinedTangentNormal = normalize(float3(Skin::ReorientNormal(detailNormal, tangentNormal).xy, tangentNormal.z));
 		float3 combinedNormal = normalize(mul(tbn, combinedTangentNormal));
@@ -2725,6 +2754,9 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	hairT = Bitangent;
 #		endif
 	hairT = Hair::ReorientTangent(hairT, worldNormal);
+	// (47p) The tangent shift texture is read once here instead of by every light and the indirect lobes (same uv, same value).
+	[branch] if (Perf47p::On(Perf47p::kHairLight) && SharedData::hairSpecularSettings.Enabled && SharedData::hairSpecularSettings.EnableTangentShift)
+		Hair::CacheTangentShift(uv);
 
 	// (44c) Wet hair clumps and specular AA, from screen derivatives taken here (uniform control
 	// flow; the per-pixel wetness comes later). Strand space: the hair tangent projected into uv
@@ -3354,20 +3386,32 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			[branch] if (wetCharacter && Skin::wetCharParams[1].x > 0.5)
 			{
 				hairWetActive = true;
-				// (47i) Physical: the hair's water (um): swim from the height profile with the hair's dry multiplier, rain
-				// on the head, and its share of the sweat (manual Sweat included) as a damp hairline with the crown drier
-				// (47g: slight clumping and darkening at most; no beads on hair in any model).
-				// (47k) Water Line Follows the Body: the stored line and the hairline by the body-fixed height.
-				const float h = Skin::CharBodyHeight(input.ModelPosition.xyz, charWorldZ);
-				float hairTrail;
-				const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBandBody(input.ModelPosition.xyz, h, charWorldZ - Skin::skinPerGeometry.z), clamp(Skin::wetCharParams[0].z, 0.25, 4.0), hairTrail);
-				const float vRain = Skin::wetPhysParams[0].y * 1.15;
-				const float hairline = lerp(1.0, 0.45, smoothstep(118.0, 126.0, h));
-				wSwim = saturate(vSwim / Skin::kPhysHold);
-				wManual = 0.0;
-				wSweat = min(Skin::wetPhysParams[0].x * saturate(Skin::wetCharParams[0].w) * hairline / Skin::kPhysHold, 0.6);
-				charDryWetness = 1.0 - (1.0 - saturate((vSwim + vRain) / Skin::kPhysHold)) * (1.0 - wSweat);
-				rainWetness = 0.0;
+				[branch] if (Skin::WetPhysFlag(Skin::kPhysFlagDry))
+				{
+					// (47p) Dry: no swim, rain or sweat water (the values the lines below give with none).
+					wSwim = 0.0;
+					wManual = 0.0;
+					wSweat = 0.0;
+					charDryWetness = 0.0;
+					rainWetness = 0.0;
+				}
+				else
+				{
+					// (47i) Physical: the hair's water (um): swim from the height profile with the hair's dry multiplier, rain
+					// on the head, and its share of the sweat (manual Sweat included) as a damp hairline with the crown drier
+					// (47g: slight clumping and darkening at most; no beads on hair in any model).
+					// (47k) Water Line Follows the Body: the stored line and the hairline by the body-fixed height.
+					const float h = Skin::CharBodyHeight(input.ModelPosition.xyz, charWorldZ);
+					float hairTrail;
+					const float vSwim = Skin::WetPhysSwimWater(Skin::WetPhysBandBody(input.ModelPosition.xyz, h, charWorldZ - Skin::skinPerGeometry.z), clamp(Skin::wetCharParams[0].z, 0.25, 4.0), hairTrail);
+					const float vRain = Skin::wetPhysParams[0].y * 1.15;
+					const float hairline = lerp(1.0, 0.45, smoothstep(118.0, 126.0, h));
+					wSwim = saturate(vSwim / Skin::kPhysHold);
+					wManual = 0.0;
+					wSweat = min(Skin::wetPhysParams[0].x * saturate(Skin::wetCharParams[0].w) * hairline / Skin::kPhysHold, 0.6);
+					charDryWetness = 1.0 - (1.0 - saturate((vSwim + vRain) / Skin::kPhysHold)) * (1.0 - wSweat);
+					rainWetness = 0.0;
+				}
 			}
 			else
 				rainWetness = 0.0;  // Wet Hair off: not wet at all
@@ -3401,13 +3445,26 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #				endif
 				gearClass = Skin::GearClassWeights(m0, g0, l0, gearFur);
 				gearParams = Skin::GearClassParams(gearClass);
-				// Cloth wicks water a few units above the water line (irregular tide mark).
-				const float clothW = gearClass.x * (1.0 - gearClass.w);
-				const float wick = max(Skin::wetCharParams[4].w, 0.0) * clothW;
-				const float tide = (Skin::WetValueNoise(uv * 40.0) - 0.5) * 4.0 * clothW;
 				// (47g) Physical: sweat makes gear wet by wicking only, cloth most, leather a little, metal not at all.
 				const float gearSweatShare = saturate(Skin::wetCharParams[5].x) * Skin::WetGearSweatClass(gearClass);
+				[branch] if (Skin::WetPhysFlag(Skin::kPhysFlagDry))
 				{
+					// (47p) Dry: no swim, rain or sweat water (the values the block below gives with none).
+					wSwim = 0.0;
+					wManual = 0.0;
+					wSweat = 0.0;
+					charDryWetness = 0.0;
+					gearPhysBead = 0.0;
+					gearPhysGrowth = 1.0;
+					gearPhysTrail = 0.0;
+					rainWetness = 0.0;
+				}
+				else
+				{
+					// Cloth wicks water a few units above the water line (irregular tide mark).
+					const float clothW = gearClass.x * (1.0 - gearClass.w);
+					const float wick = max(Skin::wetCharParams[4].w, 0.0) * clothW;
+					const float tide = (Skin::WetValueNoise(uv * 40.0) - 0.5) * 4.0 * clothW;
 					// (47i) Physical: the gear's water (um): swim from the height profile per class (its dry multiplier; cloth
 					// wicks the line up by Cloth Wicking with a tide mark), its wicking share of the sweat (manual Sweat
 					// included; 47g: no sweat beads or trails on gear), the rain a little less on down-facing surfaces. Beads
@@ -3940,7 +3997,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		Skin::SkinDirectLightInput(dirDiffuseColor, dirTransmissionColor, dirSpecularColor, lightProperties, skinSurfaceProperties, originalWorldNormal, viewDirection, DirLightDirection, wetWorldNormal);
 		lightsDiffuseColor += dirDiffuseColor;
 		transmissionColor += dirTransmissionColor;
-		float3 sssTransmittance = Skin::SSSSTransmittance(
+		float3 sssTransmittance = 0.0;
+		// (47p) Its strength is 0: the profile x 0 is 0.
+		[branch] if (!(Perf47p::On(Perf47p::kSssTrans) && SharedData::skinData.sssParams.w == 0.0))
+			sssTransmittance = Skin::SSSSTransmittance(
 									  SharedData::skinData.sssParams.x,
 									  SharedData::skinData.sssParams.y,
 									  originalWorldNormal,
@@ -3998,8 +4058,17 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		if defined(HAIR) && defined(CS_HAIR)
 		if (SharedData::hairSpecularSettings.Enabled) {
 			float3 dirTransmissionColor = 0.0;
-			float hairShadow = Hair::HairSelfShadow(input.WorldPosition.xyz, DirLightDirection, screenNoise, eyeIndex);
-			Hair::GetHairDirectLight(dirDiffuseColor, lightsSpecularColor, dirTransmissionColor, hairT, DirLightDirection, viewDirection, worldNormal.xyz, vertexNormal.xyz, dirLightColor.xyz * dirDetailShadow, SharedData::hairSpecularSettings.HairGlossiness, hairShadow, uv, baseColor.xyz);
+			// (47p) A black or fully shadowed sun: exactly the outputs of the call below (all 0), without the self-shadow march.
+			[branch] if (Perf47p::On(Perf47p::kHairLight) && all(dirLightColor.xyz * dirDetailShadow == 0.0))
+			{
+				dirDiffuseColor = 0.0;
+				lightsSpecularColor = 0.0;
+			}
+			else
+			{
+				float hairShadow = Hair::HairSelfShadow(input.WorldPosition.xyz, DirLightDirection, screenNoise, eyeIndex);
+				Hair::GetHairDirectLight(dirDiffuseColor, lightsSpecularColor, dirTransmissionColor, hairT, DirLightDirection, viewDirection, worldNormal.xyz, vertexNormal.xyz, dirLightColor.xyz * dirDetailShadow, SharedData::hairSpecularSettings.HairGlossiness, hairShadow, uv, baseColor.xyz);
+			}
 			transmissionColor += dirTransmissionColor;
 		}
 		else {
@@ -4068,7 +4137,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			Skin::SkinDirectLightInput(pointDiffuseColor, pointTransmissionColor, pointSpecularColor, lightProperties, skinSurfaceProperties, originalWorldNormal, viewDirection, normalizedLightDirection, wetWorldNormal);
 			lightsDiffuseColor += pointDiffuseColor;
 			transmissionColor += pointTransmissionColor;
-			float3 sssTransmittance = Skin::SSSSTransmittance(
+			float3 sssTransmittance = 0.0;
+			// (47p) Its strength is 0: the profile x 0 is 0.
+			[branch] if (!(Perf47p::On(Perf47p::kSssTrans) && SharedData::skinData.sssParams.w == 0.0))
+				sssTransmittance = Skin::SSSSTransmittance(
 										  SharedData::skinData.sssParams.x,
 										  SharedData::skinData.sssParams.y,
 										  originalWorldNormal,
@@ -4108,8 +4180,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 		if (SharedData::hairSpecularSettings.Enabled) {
 			float3 lightSpecularColor = 0;
 			float3 lightTransmissionColor = 0;
-			float hairShadow = Hair::HairSelfShadow(input.WorldPosition.xyz, normalizedLightDirection, screenNoise, eyeIndex);
-			Hair::GetHairDirectLight(lightDiffuseColor, lightSpecularColor, lightTransmissionColor, hairT, normalizedLightDirection, viewDirection, worldNormal.xyz, vertexNormal.xyz, lightColor, SharedData::hairSpecularSettings.HairGlossiness, hairShadow, uv, baseColor.xyz);
+			// (47p) A black or fully shadowed light: exactly the call's outputs (all 0), without the self-shadow march.
+			[branch] if (Perf47p::On(Perf47p::kHairLight) && all(lightColor == 0.0))
+				lightDiffuseColor = 0.0;
+			else
+			{
+				float hairShadow = Hair::HairSelfShadow(input.WorldPosition.xyz, normalizedLightDirection, screenNoise, eyeIndex);
+				Hair::GetHairDirectLight(lightDiffuseColor, lightSpecularColor, lightTransmissionColor, hairT, normalizedLightDirection, viewDirection, worldNormal.xyz, vertexNormal.xyz, lightColor, SharedData::hairSpecularSettings.HairGlossiness, hairShadow, uv, baseColor.xyz);
+			}
 			lightsSpecularColor += lightSpecularColor;
 			transmissionColor += lightTransmissionColor;
 		} else {
@@ -4157,7 +4235,14 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 	// and skips lights far weaker than the strongest ((47o) Skip Weak Lights permanent).
 	const uint ssplsBudget = ScreenSpacePointLightShadows::MaxShadowedLights();
 	float4 ssplsTopA = 0.0, ssplsTopB = 0.0;
-	[branch] if (SharedData::ssplsSettings.Enable && inWorld && ssplsHere)
+	// (47p) Beyond Max Distance no step is marched (ssplsSteps 0: GetShadow returns 1), so the ranking is skipped there.
+#				if defined(HAIR) && !defined(DEFERRED)
+	const bool ssplsHairOff = Perf47p::On(Perf47p::kHairSspls);  // (47p, A) no SSPLS for hair in its blended pass
+#				else
+	const bool ssplsHairOff = false;
+#				endif
+	const bool ssplsBeyond = Perf47p::On(Perf47p::kSsplsDist) && !ssplsCoverageView && viewPosition.z >= SharedData::ssplsSettings.MaxDistance;
+	[branch] if (SharedData::ssplsSettings.Enable && inWorld && ssplsHere && !ssplsBeyond && !ssplsHairOff)
 	{
 		[loop] for (uint scoreIndex = 0; scoreIndex < totalLightCount; scoreIndex++)
 		{
@@ -4260,7 +4345,7 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #				endif
 		// (47k) The light budget's share of this light.
 		const float ssplsWeight = ScreenSpacePointLightShadows::BudgetWeight(ScreenSpacePointLightShadows::LightScore(lightColor, lightAngle), ssplsBudget, ssplsBudgetLast, ssplsBudgetNext, ssplsTopA.x);
-		const bool ssplsRun = SharedData::ssplsSettings.Enable && inWorld && ssplsHere &&
+		const bool ssplsRun = SharedData::ssplsSettings.Enable && inWorld && ssplsHere && !ssplsHairOff &&
 		                      !(light.lightFlags & LightLimitFix::LightFlags::Simple) &&
 		                      shadowComponent != 0.0 &&
 		                      lightAngle > 0.0 &&
@@ -4353,7 +4438,10 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 			Skin::SkinDirectLightInput(pointDiffuseColor, pointTransmissionColor, pointSpecularColor, lightProperties, skinSurfaceProperties, originalWorldNormal, viewDirection, normalizedLightDirection, wetWorldNormal);
 			lightsDiffuseColor += pointDiffuseColor;
 			transmissionColor += pointTransmissionColor;
-			float3 sssTransmittance = Skin::SSSSTransmittance(
+			float3 sssTransmittance = 0.0;
+			// (47p) Its strength is 0: the profile x 0 is 0.
+			[branch] if (!(Perf47p::On(Perf47p::kSssTrans) && SharedData::skinData.sssParams.w == 0.0))
+				sssTransmittance = Skin::SSSSTransmittance(
 										  SharedData::skinData.sssParams.x,
 										  SharedData::skinData.sssParams.y,
 										  originalWorldNormal,
@@ -4397,10 +4485,16 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 
 #				if defined(HAIR) && defined(CS_HAIR) && (defined(SKINNED) || !defined(MODELSPACENORMALS))
 		if (SharedData::hairSpecularSettings.Enabled) {
-			float hairShadow = Hair::HairSelfShadow(input.WorldPosition.xyz, normalizedLightDirection, screenNoise, eyeIndex);
 			float3 lightSpecularColor = 0;
 			float3 lightTransmissionColor = 0;
-			Hair::GetHairDirectLight(lightDiffuseColor, lightSpecularColor, lightTransmissionColor, hairT, normalizedLightDirection, viewDirection, worldNormal.xyz, vertexNormal.xyz, lightColor, SharedData::hairSpecularSettings.HairGlossiness, hairShadow, uv, baseColor.xyz);
+			// (47p) A black or fully shadowed light: exactly the call's outputs (all 0), without the self-shadow march.
+			[branch] if (Perf47p::On(Perf47p::kHairLight) && all(lightColor == 0.0))
+				lightDiffuseColor = 0.0;
+			else
+			{
+				float hairShadow = Hair::HairSelfShadow(input.WorldPosition.xyz, normalizedLightDirection, screenNoise, eyeIndex);
+				Hair::GetHairDirectLight(lightDiffuseColor, lightSpecularColor, lightTransmissionColor, hairT, normalizedLightDirection, viewDirection, worldNormal.xyz, vertexNormal.xyz, lightColor, SharedData::hairSpecularSettings.HairGlossiness, hairShadow, uv, baseColor.xyz);
+			}
 			lightsSpecularColor += lightSpecularColor;
 			transmissionColor += lightTransmissionColor;
 		} else {
@@ -4662,11 +4756,18 @@ PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFrontFace)
 #		endif
 
 #		if defined(DYNAMIC_CUBEMAPS)
-#			if defined(SKYLIGHTING)
-	float3 wetnessReflectance = DynamicCubemaps::GetDynamicCubemap(wetnessNormal, vertexNormal, viewDirection, wetIndirectRoughness, 0.02 * wetnessGlossinessSpecular, skylightingSH);
-#			else
-	float3 wetnessReflectance = DynamicCubemaps::GetDynamicCubemap(wetnessNormal, vertexNormal, viewDirection, wetIndirectRoughness, 0.02 * wetnessGlossinessSpecular);
+	float3 wetnessReflectance = 0.0;
+	// (47p) Forward: used only x wetnessGlossinessSpecular (below); where that is exactly 0 the cubemap reads add nothing.
+#			if !defined(DEFERRED)
+	[branch] if (!(Perf47p::On(Perf47p::kWetCube) && wetnessGlossinessSpecular == 0.0))
 #			endif
+	{
+#			if defined(SKYLIGHTING)
+		wetnessReflectance = DynamicCubemaps::GetDynamicCubemap(wetnessNormal, vertexNormal, viewDirection, wetIndirectRoughness, 0.02 * wetnessGlossinessSpecular, skylightingSH);
+#			else
+		wetnessReflectance = DynamicCubemaps::GetDynamicCubemap(wetnessNormal, vertexNormal, viewDirection, wetIndirectRoughness, 0.02 * wetnessGlossinessSpecular);
+#			endif
+	}
 #		else
 	float3 wetnessReflectance = 0.0;
 #		endif

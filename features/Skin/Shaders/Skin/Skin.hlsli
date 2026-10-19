@@ -152,6 +152,8 @@ namespace Skin
 	// (47l) Water Line per Limb (WetSkin::Phys::kFlagLimbs): the stored lines per limb in wetPhysLimbs (WetPhysBandBody); set per
 	// character (body-mapped ones), so still a flag.
 	static const uint kPhysFlagLimbs = 64u;
+	// (47p) "Dry characters skip the wetness math": set while the character has no sweat, rain or swim water at all.
+	static const uint kPhysFlagDry = 128u;
 	bool WetPhysFlag(uint a_flag)
 	{
 		return (uint(max(wetPhysParams[3].w, 0.0) + 0.5) & a_flag) != 0u;

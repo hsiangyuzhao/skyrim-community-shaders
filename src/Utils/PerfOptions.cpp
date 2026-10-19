@@ -21,7 +21,7 @@ namespace PerfOptions
 		constexpr Item kItems[] = {
 			{ &Settings::DryCharacterSkip, "DryCharacterSkip", "Dry characters skip the wetness math", false,
 				"Character Wetness (Physical): a character with no sweat, rain or swim water on it skips the wet-skin, wet-hair and\n"
-				"wet-gear shading. Every value it would add is 0 then. No visible change." },
+				"wet-gear shading. Every value it would add is 0 then. No visible change. Needs Advanced Skin on." },
 			{ &Settings::WetCubemapSkip, "WetCubemapSkip", "Skip the wet reflection where nothing is wet", false,
 				"The extra reflection read for wet surfaces is not made where the surface's wetness is 0 (always the case for hair).\n"
 				"No visible change." },
@@ -29,20 +29,21 @@ namespace PerfOptions
 				"Hair self-shadow and the hair highlight are not computed for a light whose colour is black or that is fully\n"
 				"shadowed; the hair's tangent texture is read once instead of per light. No visible change." },
 			{ &Settings::SssTransmitSkip, "SssTransmitSkip", "Skin: skip light-through-skin where it is off", false,
-				"Advanced Skin's transmittance (light shining through ears and fingers) is not computed when its strength is 0.\n"
-				"No visible change." },
+				"Advanced Skin's transmittance (light shining through ears and fingers) is not computed when its strength is 0, and\n"
+				"its detail-normal texture is read once instead of twice. No visible change." },
 			{ &Settings::SsplsDistanceGate, "SsplsDistanceGate", "Lamp contact shadows: skip the pre-pass beyond their distance", false,
 				"Screen Space Point Light Shadows: the per-pixel light ranking is skipped beyond SSPLS's Max Distance, where no\n"
 				"contact shadow is drawn anyway. No visible change." },
 			{ &Settings::RtDropTinyParts, "RtDropTinyParts", "Ray tracing: leave out tiny parts that cast nothing", false,
 				"Ray Tracing: eyes, teeth, mouth, eyebrows and similar tiny parts inside the head are not skinned or built for the\n"
-				"ray tracer when they could not cast a visible shadow. Only while Ray Tracing is on." },
+				"ray tracer (the head's own shadow covers theirs). Only while Ray Tracing is on; switching it rebuilds the\n"
+				"characters for the ray tracer once." },
 			{ &Settings::RtBonesTolerant, "RtBonesTolerant", "Ray tracing: ignore bone noise when checking for movement", false,
-				"Ray Tracing: a character whose bones moved by less than a thousandth of a unit counts as unchanged, so its last\n"
-				"skinning is reused. The update rate is unchanged. Only while Ray Tracing is on." },
+				"Ray Tracing: a character whose bones moved by no more than float noise (at most about a hundredth of a unit)\n"
+				"counts as unchanged, so its last skinning is reused. The update rate is unchanged. Only while Ray Tracing is on." },
 			{ &Settings::RtaoNormalFold, "RtaoNormalFold", "RTAO: skip the normal prep where it is not used", false,
-				"RTAO Smooth Normals: the normal-prep pass is skipped for pixels the AO does not trace (sky, beyond the RTAO\n"
-				"distance). Same result. Only while RTAO is on." },
+				"RTAO Smooth Normals: the normal-prep pass is skipped for pixels the AO does not trace (outside the traced\n"
+				"area, beyond the RTAO distance). Same result. Only while RTAO is on." },
 			{ &Settings::WaterPrepGate, "WaterPrepGate", "Ray tracing: water prep only when a lamp can reach water", false,
 				"Point Light Shadows on Water: the water prep pass is skipped on frames where no traced point light reaches any\n"
 				"water drawn. Same result. Only while RT point lights are on." },
@@ -124,7 +125,8 @@ namespace PerfOptions
 	{
 		ImGui::TextWrapped(
 			"Performance package (47p). Conservative turns on only changes that look exactly the same. "
-			"Aggressive adds a few that trade a little picture for speed. Every switch works on its own and takes effect at once.");
+			"Aggressive adds a few that trade a little picture for speed. Every switch works on its own and takes effect at once. "
+			"The shading switches (wetness, hair, skin, lamp contact shadows) need Advanced Skin on.");
 		ImGui::Spacing();
 		ImGui::TextUnformatted("Performance:");
 		ImGui::SameLine();

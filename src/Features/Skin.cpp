@@ -10,6 +10,7 @@
 #include "Features/DynamicSnow.h"
 #include "Features/WetSkin.h"
 #include "Utils/FrameTrace.h"
+#include "Utils/PerfOptions.h"
 #include "Utils/WorldTiming.h"
 
 #include "DynamicWetness_PublicAPI.h"
@@ -1670,6 +1671,65 @@ void Skin::BSLightingShader_SetupMaterial(RE::BSLightingShaderMaterialBase const
 	}
 }
 
+namespace
+{
+	// (47p) Skin.hlsli kPhysFlagDry.
+	constexpr std::uint32_t kPhysFlagDry = 128u;
+
+	/// (47p) Lighting.hlsl Perf47p bits from the performance switches.
+	std::uint32_t PerfShaderFlags()
+	{
+		const auto& s = PerfOptions::settings;
+		std::uint32_t f = 0;
+		f |= s.WetCubemapSkip ? 2u : 0u;
+		f |= s.HairLightSkip ? 4u : 0u;
+		f |= s.SssTransmitSkip ? 8u : 0u;
+		f |= s.SsplsDistanceGate ? 16u : 0u;
+		f |= s.HairSsplsSkip ? 32u : 0u;
+		return f;
+	}
+
+	/// (47p) True when the shader's Physical math gives no water anywhere on this character (skin, hair and every gear class):
+	/// no sweat, rain or manual swim water, not in the water, and every stored swim zone fully dry for the slowest class (its
+	/// progress / multiplier >= 1, nothing above the hold capacity) -- or no swim water at all (Swimming weight 0).
+	bool PhysicalLookDry(const WetSkin::PhysicalLook& a_look, const float4 (&a_c)[12])
+	{
+		const auto& p = a_look.params;
+		if (!(p[0].x <= 0.0f && p[0].y <= 0.0f && p[0].z <= 0.0f && p[3].y <= 0.0f))
+			return false;
+		if (p[1].w <= 0.0f)
+			return true;  // WetPhysSwimWater: x Swimming 0
+		// The slowest drying class: hair (clamped to 4 in the shader) and the four gear classes (unclamped there).
+		float slowest = 1.0f;
+		slowest = std::max(slowest, std::clamp(a_c[0].z, 0.25f, 4.0f));
+		for (int i = 7; i <= 10; ++i)
+			slowest = std::max(slowest, std::max(a_c[i].w, 0.25f));
+		if (!(slowest <= 4.0f))
+			return false;  // no line still counts as progress 4: such a class is never dry
+		auto zoneDry = [&](float a_p, float a_x) { return a_p >= slowest && a_x <= 0.0f; };
+		// One line (or the torso's in limb mode) and its two zones.
+		if (p[0].w > 0.0f) {
+			if (!zoneDry(a_look.bands[0].x, a_look.bands[0].y))
+				return false;
+			if (a_look.bands[0].z > 0.0f && !zoneDry(a_look.bands[1].x, a_look.bands[1].y))
+				return false;
+		}
+		if (a_look.limbMode) {
+			for (std::size_t i = 0; i + 1 < a_look.limbs.size(); i += 2) {
+				const auto& a = a_look.limbs[i];
+				const auto& b = a_look.limbs[i + 1];
+				if (a.x <= 0.0f)
+					continue;
+				if (!zoneDry(a.y, a.z))
+					return false;
+				if (a.w > 0.0f && !zoneDry(b.x, b.y))
+					return false;
+			}
+		}
+		return true;
+	}
+}
+
 void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 {
 	// auto deferred = globals::deferred;
@@ -1697,6 +1757,8 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 			perGeometryData.wetSkinParams[i] = wetSkinParamsCache[i];
 		for (int i = 0; i < 12; ++i)
 			perGeometryData.wetCharParams[i] = wetCharParamsCache[i];
+		// (47p) The performance switches the Lighting shader reads (Lighting.hlsl Perf47p; a slot the 47o cleanup left unused).
+		perGeometryData.wetCharParams[11].x = static_cast<float>(PerfShaderFlags());
 		// (47f) Physical: this character's look. (47i) Its water amounts, bead parameters and swim height profile in
 		// wetPhysParams / wetPhysBands; a few look values ride in the frame's parameters (Skin.hlsli).
 		if (lastWetState && wetSkin.IsPhysical() && lastWetState->phys.valid) {
@@ -1712,6 +1774,9 @@ void Skin::BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass)
 			c[11].w = std::clamp(look.oil, 0.0f, 1.0f);
 			for (size_t i = 0; i < look.params.size(); ++i)
 				perGeometryData.wetPhysParams[i] = look.params[i];
+			// (47p) "Dry characters skip the wetness math": no water from any source here (Lighting.hlsl then skips the Physical math).
+			if (PerfOptions::settings.DryCharacterSkip && PhysicalLookDry(look, perGeometryData.wetCharParams))
+				perGeometryData.wetPhysParams[3].w = static_cast<float>(static_cast<std::uint32_t>(perGeometryData.wetPhysParams[3].w + 0.5f) | kPhysFlagDry);
 			for (size_t i = 0; i < look.bands.size(); ++i)
 				perGeometryData.wetPhysBands[i] = look.bands[i];
 			// (47l) Water Line per Limb (zero otherwise).
