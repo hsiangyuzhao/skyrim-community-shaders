@@ -808,6 +808,22 @@ namespace RayTracingRT
 		[[nodiscard]] bool HasFailed() const { return failed_; }
 		[[nodiscard]] const std::string& LastError() const { return lastError_; }
 		[[nodiscard]] const Stats& GetStats() const { return stats_; }
+		/// (47p) RT switched off: the GPU readings shown on the page and in F12 start over (no stale averages while off).
+		void ResetGpuReadings()
+		{
+			stats_.lastGpuMs = 0.0f;
+			stats_.smoothedGpuMs = 0.0f;
+			stats_.lastPrepGpuMs = -1.0f;
+			stats_.lastTraceGpuMs = -1.0f;
+			stats_.lastQueueGapMs = -1.0f;
+			stats_.lastPointGpuMs = -1.0f;
+			stats_.lastAOGpuMs = -1.0f;
+			stats_.pointRaysPerFrame = -1;
+			stats_.pointWaterRaysPerFrame = -1;
+			stats_.aoRaysPerFrame = -1;
+			stats_.pointTracedLastFrame = false;
+			stats_.aoTracedLastFrame = false;
+		}
 		[[nodiscard]] const TlasCheck& GetTlasCheck() const { return check_; }
 		void ResetTlasCheck() { check_ = {}; }
 		/// D3D12 instance mask of every scene (non-character) instance, and the flags of opaque ones.

@@ -2878,6 +2878,7 @@ namespace SIE
 
 	bool ShaderCache::AddCompletedShader(ShaderClass shaderClass, const RE::BSShader& shader, uint32_t descriptor, ID3DBlob* a_blob, const std::wstring& a_diskPath)
 	{
+		Util::FrameTrace::NoteJob(Util::FrameTrace::Job::ShaderCompiled);  // (47p)
 		auto key = SIE::SShaderCache::GetShaderString(shaderClass, shader, descriptor, true);
 		auto keyWithDescriptor = SIE::SShaderCache::GetShaderString(shaderClass, shader, descriptor, false);
 		auto status = a_blob ? ShaderCompilationTask::Status::Completed : ShaderCompilationTask::Status::Failed;

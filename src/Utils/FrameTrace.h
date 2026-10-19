@@ -416,4 +416,24 @@ namespace Util::FrameTrace
 	/// (47j) Every draw (State): whether it uses the Water shader; brackets the runs of water draws with GPU stamps while recording.
 	void OnWaterDrawState(bool a_water);
 
+	// ---- (47p) periodic-job stamps and the periodic GPU spike watch ---------------------------------------------------
+	/// Our jobs that run every few seconds (or rarely). Each call site stamps the frame it ran in (any thread); the F7 trace
+	/// writes them per frame (jobs column) and the always-on GPU spike watch names the ones of a spike frame and the frame
+	/// before it in the log.
+	enum class Job : uint32_t
+	{
+		FgStatus,        ///< Streamline: frame generation DLL probe / MFG Unlocker status file read (3 s)
+		HdrQuery,        ///< DisplayHDRInfo: display re-query (at most every 2 s, on a display change)
+		PresentProbe,    ///< DX12SwapChain: present-hook module probe (every 1200 frames)
+		SettingsSave,    ///< State::Save (SettingsUser.json written)
+		OverlayUpdate,   ///< Performance Overlay: statistics refresh (Update Interval)
+		SkinWater,       ///< Advanced Skin: water-height cache refresh / prune
+		RtPersistent,    ///< Ray Tracing: persistent-cell reference list rebuilt (object scan)
+		RtPoolRelease,   ///< Ray Tracing: idle GPU pool blocks released
+		LightCensus,     ///< Light census read-back
+		ShaderCompiled,  ///< a shader permutation finished compiling (any thread)
+		Count
+	};
+	void NoteJob(Job a_job);
+
 }

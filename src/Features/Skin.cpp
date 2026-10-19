@@ -9,6 +9,7 @@
 #include "State.h"
 #include "Features/DynamicSnow.h"
 #include "Features/WetSkin.h"
+#include "Utils/FrameTrace.h"
 #include "Utils/WorldTiming.h"
 
 #include "DynamicWetness_PublicAPI.h"
@@ -414,6 +415,7 @@ Skin::WaterSample Skin::SampleWater(RE::Actor* a_actor)
 			if (entry.qpc == 0 || moved || static_cast<double>(now - entry.qpc) * SkinQpcMs() > kWaterCacheMaxAgeMs) {
 				const bool timed = Util::WorldTiming::On();  // (46l) measurement only
 				const uint64_t searchStart = timed ? Util::WorldTiming::Stamp() : 0;
+				Util::FrameTrace::NoteJob(Util::FrameTrace::Job::SkinWater);  // (47p)
 				entry.height = GetWaterObjectHeight(position, maxDepth);
 				if (timed)
 					Util::WorldTiming::AddWaterSearch(searchStart);

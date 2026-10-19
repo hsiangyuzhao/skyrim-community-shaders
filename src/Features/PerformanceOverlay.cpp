@@ -3458,6 +3458,7 @@ void PerformanceOverlay::UpdateGraphValues()
 	// Update smooth values with user-specified interval
 	state.updateTimer += deltaTime;
 	if (state.updateTimer >= settings.UpdateInterval) {
+		Util::FrameTrace::NoteJob(Util::FrameTrace::Job::OverlayUpdate);  // (47p)
 		state.smoothFps = state.fps;  // Sampling white noise won't give you smoothed noise. This is useless.
 		state.smoothFrameTimeMs = state.frameTimeMs;
 		state.updateTimer = 0.0f;

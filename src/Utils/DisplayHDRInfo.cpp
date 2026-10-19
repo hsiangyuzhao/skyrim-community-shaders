@@ -6,6 +6,7 @@
 #include "Features/Upscaling.h"
 #include "Features/Upscaling/HDROutput.h"
 #include "Utils/UI.h"
+#include "Utils/FrameTrace.h"
 
 namespace DisplayHDRInfo
 {
@@ -351,6 +352,7 @@ namespace DisplayHDRInfo
 		if (!g_requested && std::chrono::duration<double>(now - g_lastCheck).count() < kCheckIntervalSeconds)
 			return;
 		g_lastCheck = now;
+		Util::FrameTrace::NoteJob(Util::FrameTrace::Job::HdrQuery);  // (47p)
 
 		std::string reason;
 		if (g_requested) {

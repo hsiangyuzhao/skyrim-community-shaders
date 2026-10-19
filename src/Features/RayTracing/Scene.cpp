@@ -2,6 +2,7 @@
 
 #include "CasterFilter.h"
 #include "Wind.h"
+#include "Utils/FrameTrace.h"
 
 #include <DirectXPackedVector.h>
 #include <bit>
@@ -2015,6 +2016,7 @@ namespace RayTracingScene
 			return;
 		if (persistent_.sky == sky && !a_force && currentFrame_ - persistent_.builtFrame < 240)
 			return;
+		Util::FrameTrace::NoteJob(Util::FrameTrace::Job::RtPersistent);  // (47p)
 		persistent_.sky = sky;
 		persistent_.references = count;
 		persistent_.builtFrame = currentFrame_;

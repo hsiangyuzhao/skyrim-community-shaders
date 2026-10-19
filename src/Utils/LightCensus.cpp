@@ -1829,6 +1829,7 @@ namespace Util::LightCensus
 
 		// Poll the copies; after a few frames wait for them.
 		++c.framesWaited;
+		Util::FrameTrace::NoteJob(Util::FrameTrace::Job::LightCensus);  // (47p)
 		const UINT flags = c.framesWaited >= kBlockingAfterFrames ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT;
 		D3D11_MAPPED_SUBRESOURCE grid{}, indices{}, counter{}, depth{};
 		bool mappedGrid = false, mappedIndices = false, mappedCounter = false, mappedDepth = false;

@@ -370,9 +370,17 @@ namespace Util
 				// (45) Ray Tracing keeps the casters it covers out of the sun cascades only (CasterFilter.h).
 				struct SunCascadeBracket
 				{
-					SunCascadeBracket() { RayTracingCasterFilter::SetInSunCascade(Kind == SliceKind::Sun); }
-					~SunCascadeBracket() { RayTracingCasterFilter::SetInSunCascade(false); }
-				} sunCascade;
+					explicit SunCascadeBracket(int a_index)
+					{
+						RayTracingCasterFilter::SetInSunCascade(Kind == SliceKind::Sun);
+						Batch39Engine::SetSunCascade(Kind == SliceKind::Sun ? a_index : -1);  // (47p)
+					}
+					~SunCascadeBracket()
+					{
+						RayTracingCasterFilter::SetInSunCascade(false);
+						Batch39Engine::SetSunCascade(-1);
+					}
+				} sunCascade{ a_desc ? static_cast<int>(a_desc->shadowmapIndex) : -1 };
 				auto* timeline = GpuPhaseTimeline::GetSingleton();
 				if (!timeline->IsRecording() || !a_desc) {
 					func(a_light, a_desc, a3, a4);

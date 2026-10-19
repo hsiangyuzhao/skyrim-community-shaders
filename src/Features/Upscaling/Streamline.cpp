@@ -508,6 +508,7 @@ Streamline::FGDllInfo Streamline::GetFGDll(bool a_force)
 		if (globals::features::upscaling.streamline.IsDLSSGBackendSelectedAtBoot() && !g_fgDll.settled &&
 			(a_force || now - g_fgDllLastProbe >= kFGDiagIntervalSeconds)) {
 			g_fgDllLastProbe = now;
+			Util::FrameTrace::NoteJob(Util::FrameTrace::Job::FgStatus);  // (47p)
 			FGProbeDllLocked();
 			FGCheckWarningsLocked();
 		}
@@ -524,6 +525,7 @@ Streamline::FGUnlockerInfo Streamline::GetFGUnlocker(bool a_force)
 		const double now = FGDiagNowSeconds();
 		if (a_force || now - g_fgUnlockerLastRead >= kFGDiagIntervalSeconds) {
 			g_fgUnlockerLastRead = now;
+			Util::FrameTrace::NoteJob(Util::FrameTrace::Job::FgStatus);  // (47p)
 			FGReadUnlockerLocked();
 			FGCheckWarningsLocked();
 		}

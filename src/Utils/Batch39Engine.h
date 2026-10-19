@@ -94,6 +94,14 @@ namespace Batch39Engine
 	/// @brief True inside Main_RenderDepth (the engine's depth prepass).
 	bool InDepthPrepass();
 
+	/// @brief (47p, A) "Sun shadows: small far objects cast none". GpuPhaseTimeline's RenderShadowmap bracket: the sun cascade
+	/// being drawn (its shadowmapIndex, 0 nearest), -1 outside the sun cascades. In cascade 1 and beyond, RenderPassImmediately
+	/// leaves out a pass whose geometry's bound radius < kSmallCasterSlope x its distance to the camera (characters always cast).
+	void SetSunCascade(int a_index);
+	inline constexpr float kSmallCasterSlope = 0.03f;
+	/// Passes left out by that rule during the last completed frame.
+	uint32_t SmallCastersCulledLastFrame();
+
 	// ---- 1. reflection cubemap -------------------------------------------------------------
 	/// @brief Decides which faces this RenderCubemap call draws. Returns the face mask to pass on.
 	int FilterCubemapFaces(RE::NiAVObject* a_camera, int a_faceMask, bool a_clearScenesAfter);

@@ -2291,6 +2291,13 @@ void RayTracing::SwitchedOffFrame()
 			status = Status::Off;
 			statusReason.clear();
 			lastTlasLog = 0;
+			// (47p) No stale averages on the page, the overlay or in F12 while off (they were the last ones before the switch-off).
+			cpuLast = {};
+			cpuSmoothed = {};
+			cpuWorst = {};
+			lastCpuMs = 0.0f;
+			if (backend.IsReady())
+				backend.ResetGpuReadings();
 			logger::info("[RayTracing] Switched off");
 		}
 		scene.Housekeeping();  // (45j) engine objects of the released scene, a bounded number per frame

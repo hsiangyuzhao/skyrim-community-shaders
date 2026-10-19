@@ -16,6 +16,7 @@
 #include "ShaderCache.h"
 #include "ThemeManager.h"
 #include "Util.h"
+#include "Utils/PerfOptions.h"
 
 using json = nlohmann::json;
 
@@ -61,6 +62,7 @@ void SettingsTabRenderer::RenderGeneralSettings(
 	const std::function<const char*(uint32_t)>& keyIdToString)
 {
 	if (ImGui::BeginTabBar("##GeneralTabBar", ImGuiTabBarFlags_None)) {
+		RenderPerformanceTab();  // (47p)
 		RenderShadersTab();
 		RenderKeybindingsTab(state, keyIdToString);
 		RenderInterfaceTab();
@@ -182,6 +184,14 @@ void SettingsTabRenderer::RenderKeybindingsTab(
 			}
 		}
 
+		ImGui::EndTabItem();
+	}
+}
+
+void SettingsTabRenderer::RenderPerformanceTab()
+{
+	if (BeginTabItemWithFont("Performance", Menu::FontRole::Heading)) {
+		PerfOptions::DrawMenu();
 		ImGui::EndTabItem();
 	}
 }

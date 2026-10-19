@@ -20,6 +20,7 @@
 #include "ShaderCache.h"
 #include "TruePBR.h"
 #include "Utils/Batch39Engine.h"
+#include "Utils/PerfOptions.h"
 #include "Utils/FileSystem.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
@@ -380,6 +381,8 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 				frameAnnotations = advanced["Frame Annotations"];
 			if (advanced.contains("Engine"))
 				Batch39Engine::Load(advanced["Engine"]);
+			if (advanced.contains("Performance"))
+				PerfOptions::Load(advanced["Performance"]);  // (47p)
 			if (advanced.contains("Window Compatibility"))
 				WndProcPseudoHandleFix::Load(advanced["Window Compatibility"]);
 		}
@@ -495,6 +498,7 @@ void State::Load(ConfigMode a_configMode, bool a_allowReload)
 
 void State::Save(ConfigMode a_configMode)
 {
+	Util::FrameTrace::NoteJob(Util::FrameTrace::Job::SettingsSave);  // (47p)
 	const auto shaderCache = globals::shaderCache;
 	std::string configPath = GetConfigPath(a_configMode);
 	std::ofstream o{ configPath };
@@ -528,6 +532,7 @@ void State::Save(ConfigMode a_configMode)
 	advanced["Use FileWatcher"] = shaderCache->UseFileWatcher();
 	advanced["Frame Annotations"] = frameAnnotations;
 	advanced["Engine"] = Batch39Engine::Save();
+	advanced["Performance"] = PerfOptions::Save();  // (47p)
 	advanced["Window Compatibility"] = WndProcPseudoHandleFix::Save();
 	settings["Advanced"] = advanced;
 

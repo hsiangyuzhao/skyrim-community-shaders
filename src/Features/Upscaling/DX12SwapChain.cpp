@@ -376,6 +376,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// first Present and whenever it changes, checked about every ten seconds.
 	static uint32_t presentProbeCounter = 0;
 	if (presentProbeCounter++ % 1200 == 0) {
+		Util::FrameTrace::NoteJob(Util::FrameTrace::Job::PresentProbe);  // (47p)
 		IDXGISwapChain4* native = GetNativeSwapChain();
 		WndProcPseudoHandleFix::ProbePresentHooks(swapChain, native && native != swapChain ? "D3D12 Streamline proxy" : "D3D12");
 		if (native && native != swapChain)

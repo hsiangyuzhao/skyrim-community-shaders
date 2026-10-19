@@ -14,6 +14,7 @@
 #include "Backend.h"
 
 #include "Utils/D3D.h"
+#include "Utils/FrameTrace.h"
 
 #include <algorithm>
 
@@ -340,6 +341,7 @@ namespace RayTracingRT
 					block = {};
 					++ps.blocksReleased;
 					released = true;
+					Util::FrameTrace::NoteJob(Util::FrameTrace::Job::RtPoolRelease);  // (47p)
 					break;
 				}
 				if (released)

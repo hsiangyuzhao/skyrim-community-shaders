@@ -13,6 +13,7 @@
 #include "Utils/EngineTiming.h"
 #include "Utils/GpuTimers.h"
 #include "Utils/LatencyPacer.h"
+#include "Utils/PerfOptions.h"
 #include "Utils/WorldTiming.h"
 
 #include <d3d12.h>  // (46p) TagVram on D3D12 objects
@@ -401,6 +402,55 @@ namespace Util::FrameTrace
 		size_t g_histHead = 0;  // next write
 		size_t g_histCount = 0;
 
+		// ---- (47p) periodic-job stamps and the GPU spike watch ----
+		std::atomic<uint32_t> g_jobsThisFrame{ 0 };
+		struct JobFrame
+		{
+			uint64_t gpuIndex = UINT64_MAX;
+			uint32_t jobs = 0;
+		};
+		constexpr size_t kJobRing = 64;
+		std::array<JobFrame, kJobRing> g_jobRing{};  // written every frame (OnPresentEnd), render thread
+		size_t g_jobRingHead = 0;
+
+		constexpr const char* kJobNames[] = { "fg_status", "hdr_query", "present_probe", "settings_save", "overlay_update", "skin_water",
+			"rt_persistent", "rt_pool_release", "light_census", "shader_compiled" };
+		static_assert(std::size(kJobNames) == static_cast<size_t>(Job::Count));
+
+		std::string JobNames(uint32_t a_jobs)
+		{
+			std::string s;
+			for (uint32_t i = 0; i < static_cast<uint32_t>(Job::Count); ++i) {
+				if (!(a_jobs & (1u << i)))
+					continue;
+				if (!s.empty())
+					s += '|';
+				s += kJobNames[i];
+			}
+			return s;
+		}
+
+		uint32_t JobsOfGpuFrame(uint64_t a_gpuIndex)
+		{
+			for (const auto& f : g_jobRing)
+				if (f.gpuIndex == a_gpuIndex)
+					return f.jobs;
+			return 0;
+		}
+
+		// The watch learns the usual GPU work on frames without a spike; a spike is 12 ms+ and 1.4x over it.
+		struct SpikeWatch
+		{
+			float usualMs = 0.0f;
+			int learned = 0;
+			int64_t lastSpikeQpc = 0;
+			std::array<float, 4> intervals{};  // seconds between the last spikes, newest first
+			int intervalCount = 0;
+			int logs = 0;
+			bool periodicLogged = false;
+		} g_spike;
+		constexpr int kSpikeLogLimit = 60;
+
 		struct CellSink : RE::BSTEventSink<RE::TESCellAttachDetachEvent>
 		{
 			RE::BSEventNotifyControl ProcessEvent(const RE::TESCellAttachDetachEvent* a_event, RE::BSTEventSource<RE::TESCellAttachDetachEvent>*) override
@@ -501,6 +551,8 @@ namespace Util::FrameTrace
 			float waterPrepGpuMs = -1.0f;  // (47j) WaterPrepCS (GpuPassTimers RayTracingWaterPrep)
 			float aoNormalPrepGpuMs = -1.0f;  // (47l) AONormalPrepCS (GpuPassTimers RayTracingAONormalPrep)
 			float postGpuMs = -1.0f;  // (46p) our post-processing chain, last GPU sample (GpuPassTimers PostProcessing)
+			float gpuSpikeMs = 0.0f;  // (47p) GPU work over the usual (spike watch), 0 = none
+			uint32_t jobs = 0;        // (47p) our periodic jobs that ran in this frame (bit per FrameTrace::Job)
 			Q46 q46{};             // (46q)
 			std::string vramByFeature;  // (46q) "name=MB;..." alive per feature of ours (1 MB or more)
 			// (46u) PC latency estimate inputs taken on the frame (the Reflex report arrives later).
@@ -857,6 +909,7 @@ namespace Util::FrameTrace
 				out << "# (45j) ray tracing at start: " << a_rayTracing << "\n";
 				out << "# (46e) rendering at start: " << a_rendering << "\n";
 				out << "# (46w) frame generation at start: " << a_headerFG << "\n";
+				out << "# (47p) performance switches when written: " << PerfOptions::Describe() << "\n";
 				out << "# (45j) rt_* = Ray Tracing CPU split (ms, -1 = not run): scene update (grid diff, cell capture, filter registration, objects of which new\n";
 				out << "#   captures), TLAS instances, missed-caster check, characters, D3D12 record+submit (of which BLAS creation, skinning), D3D11 passes,\n";
 				out << "#   end of frame, engine references dropped; counts: recaptures, objects captured, misses examined, references waiting, TLAS instances,\n";
@@ -990,6 +1043,9 @@ namespace Util::FrameTrace
 				out << "#   rt_wind_in_radius = swayable plants within the radius, rt_wind_sources = engine meshes uploaded (shared), rt_wind_builds = first\n";
 				out << "#   builds this frame, rt_wind_refits / rt_wind_refit_verts = plants refit this frame and their vertices, rt_wind_radius = the radius\n";
 				out << "#   (the engine's sway fade end + 256, at most 8192). The GPU cost is in rt_prep_gpu_ms. -1 = sway off / Ray Tracing off.\n";
+				out << "# (47p) gpu_spike_ms = GPU work of this frame over the usual (learned on frames without a spike), 0 = no spike (12 ms+ and 1.4x);\n";
+				out << "#   jobs = our periodic jobs that ran in this frame (| separated). A spike that lands in a different gpu_seg_* each time while no\n";
+				out << "#   job of ours ran is another GPU user taking the GPU (another queue or process), not our work.\n";
 				out << "#   rt_pw_* = the work of the RT D3D12 prep submission whose GPU time is rt_prep_gpu_ms on the same row (1 = valid; early =\n";
 				out << "#   recorded at the frame start): static BLAS builds (of which alpha-tested, triangles, MB before compaction), compactions (MB\n";
 				out << "#   written), new character shapes uploaded, own-BLAS character builds / refits, merged character BLAS builds (triangles) /\n";
@@ -1091,7 +1147,8 @@ namespace Util::FrameTrace
 					   "rt_wind_meshes,rt_wind_verts,rt_wind_refits,"  // (47l)
 					   "rtao_normal_prep_gpu_ms,"  // (47l)
 					   "pacer_learned_cap_ms,pacer_learned_cut_ms,"  // (47m)
-					   "rt_wind_in_radius,rt_wind_sources,rt_wind_builds,rt_wind_refit_verts,rt_wind_radius\n";  // (47n) the last ones
+					   "rt_wind_in_radius,rt_wind_sources,rt_wind_builds,rt_wind_refit_verts,rt_wind_radius,"  // (47n)
+					   "gpu_spike_ms,jobs\n";  // (47p) the last ones
 				auto extraColumns = [](const Row& a_row) {
 					const auto& t = a_row.rt;
 					std::string s = std::format(",{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{},{},{},{},{},{}", t.scene,
@@ -1274,6 +1331,9 @@ namespace Util::FrameTrace
 					// (47n) Foliage sway per plant, after pacer_learned_cut_ms (the old last column).
 					extra.pop_back();
 					extra += std::format(",{},{},{},{},{:.0f}\n", r.rt.windInRadius, r.rt.windSources, r.rt.windBuilds, r.rt.windRefitVertices, r.rt.windRadius);
+					// (47p) GPU spike and our periodic jobs, after rt_wind_radius (the old last column).
+					extra.pop_back();
+					extra += std::format(",{:.3f},{}\n", r.gpuSpikeMs, JobNames(r.jobs));
 					if (it == a_reflex.end()) {
 						out << (r.reflexFrame == UINT32_MAX ? std::string("-1") : std::to_string(r.reflexFrame)) << ",-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1" << engineColumns(r) << extra;
 						continue;
@@ -2206,6 +2266,67 @@ namespace Util::FrameTrace
 		return tag;
 	}
 
+	void NoteJob(Job a_job)
+	{
+		const auto bit = static_cast<uint32_t>(a_job);
+		if (bit < static_cast<uint32_t>(Job::Count))
+			g_jobsThisFrame.fetch_or(1u << bit, std::memory_order_relaxed);
+	}
+
+	namespace
+	{
+		/// (47p) The GPU spike watch (runs while the GPU frame timer does: overlay shown or F7 recording). Returns the excess
+		/// over the usual GPU work (0 = no spike) and logs spikes with the time since the previous one and our jobs of that
+		/// frame and the one before; three intervals in a row within 10 % of each other are reported as a periodic interruption.
+		float WatchGpuSpike(uint64_t a_gpuFrameIndex, float a_workMs)
+		{
+			auto& w = g_spike;
+			if (!(a_workMs > 0.0f) || a_workMs > 1000.0f)
+				return 0.0f;
+			if (w.learned < 30) {
+				w.usualMs = w.learned == 0 ? a_workMs : w.usualMs * 0.9f + a_workMs * 0.1f;
+				++w.learned;
+				return 0.0f;
+			}
+			const float excess = a_workMs - w.usualMs;
+			if (!(excess >= 12.0f && a_workMs >= 1.4f * w.usualMs)) {
+				w.usualMs = w.usualMs * 0.97f + a_workMs * 0.03f;
+				return 0.0f;
+			}
+			const int64_t now = Now();
+			float sinceS = -1.0f;
+			if (w.lastSpikeQpc != 0 && g_frequency != 0)
+				sinceS = static_cast<float>(static_cast<double>(now - w.lastSpikeQpc) / static_cast<double>(g_frequency));
+			w.lastSpikeQpc = now;
+			if (sinceS > 0.0f) {
+				for (size_t i = w.intervals.size() - 1; i > 0; --i)
+					w.intervals[i] = w.intervals[i - 1];
+				w.intervals[0] = sinceS;
+				w.intervalCount = std::min(w.intervalCount + 1, static_cast<int>(w.intervals.size()));
+			}
+			const uint32_t jobs = JobsOfGpuFrame(a_gpuFrameIndex) | JobsOfGpuFrame(a_gpuFrameIndex - 1);
+			if (w.logs < kSpikeLogLimit) {
+				++w.logs;
+				logger::info("[FrameTrace] (47p) GPU spike: +{:.1f} ms over the usual {:.1f} ms (GPU frame {}), {}; our periodic jobs in it and the frame before: {}",
+					excess, w.usualMs, a_gpuFrameIndex, sinceS > 0.0f ? std::format("{:.2f} s after the previous spike", sinceS) : std::string("the first one seen"),
+					jobs ? JobNames(jobs) : std::string("none"));
+			}
+			if (w.intervalCount >= 3) {
+				const float mean = (w.intervals[0] + w.intervals[1] + w.intervals[2]) / 3.0f;
+				bool periodic = mean >= 1.0f;
+				for (int i = 0; i < 3 && periodic; ++i)
+					periodic = std::abs(w.intervals[i] - mean) <= 0.1f * mean;
+				if (periodic && !w.periodicLogged) {
+					w.periodicLogged = true;
+					logger::warn("[FrameTrace] (47p) Periodic GPU interruption: about every {:.2f} s (+{:.0f} ms each). {}", mean, excess,
+						jobs ? std::format("Our job(s) {} ran with it.", JobNames(jobs)) :
+							   std::string("None of our periodic jobs ran with it: another GPU user (another queue, overlay, monitoring tool) is the likely cause."));
+				}
+			}
+			return excess;
+		}
+	}
+
 	void OnGpuSample(uint64_t a_gpuFrameIndex, float a_workMs, float a_elapsedMs)
 	{
 		for (size_t i = 0; i < std::min<size_t>(g_histCount, 16); ++i) {
@@ -2215,12 +2336,14 @@ namespace Util::FrameTrace
 				break;
 			}
 		}
+		const float spike = WatchGpuSpike(a_gpuFrameIndex, a_workMs);  // (47p)
 		if (!g_recording)
 			return;
 		for (auto it = g_rows.rbegin(); it != g_rows.rend() && it - g_rows.rbegin() < 16; ++it) {
 			if (it->gpuFrameIndex == a_gpuFrameIndex) {
 				it->gpuWorkMs = a_workMs;
 				it->gpuElapsedMs = a_elapsedMs;
+				it->gpuSpikeMs = spike;
 				return;
 			}
 		}
@@ -2248,6 +2371,10 @@ namespace Util::FrameTrace
 	{
 		const int64_t now = Now();
 		const bool wasActive = g_active;
+		// (47p) Our periodic jobs of this frame, by GPU frame index (the spike watch looks them up when the GPU sample arrives).
+		const uint32_t frameJobs = g_jobsThisFrame.exchange(0, std::memory_order_relaxed);
+		g_jobRing[g_jobRingHead] = { a_gpuFrameIndex, frameJobs };
+		g_jobRingHead = (g_jobRingHead + 1) % kJobRing;
 
 		if (!g_cellSinkRegistered) {
 			if (auto* holder = RE::ScriptEventSourceHolder::GetSingleton()) {
@@ -2337,6 +2464,7 @@ namespace Util::FrameTrace
 				r.firstSeen = g_frame.firstSeen;
 				r.shaderAsync = shaderAsync;
 				r.shaderSync = shaderSync;
+				r.jobs = frameJobs;  // (47p)
 				r.cellAttach = cellAttach;
 				r.cellDetach = cellDetach;
 				r.yawRate = yawRate;

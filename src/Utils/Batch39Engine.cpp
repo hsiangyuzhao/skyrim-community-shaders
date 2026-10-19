@@ -24,6 +24,7 @@
 #include "Util.h"
 #include "Utils/GpuPhaseTimeline.h"
 #include "Utils/GpuTimers.h"
+#include "Utils/PerfOptions.h"
 #include "Utils/UI.h"
 
 namespace Batch39Engine
@@ -104,6 +105,39 @@ namespace Batch39Engine
 		bool g_depthHookInstalled = false;
 		bool g_samplerHookInstalled = false;
 
+		// (47p, A) Small far casters in the sun's far cascade(s).
+		int g_sunCascade = -1;
+		bool g_smallCullOn = false;  // latched at the cascade bracket
+		RE::NiPoint3 g_cullEye{};
+		uint32_t g_smallCulled = 0, g_smallCulledLast = 0;
+
+		/// A character's part (skinned, or anything under an actor's 3D: weapons, hair, worn items) always casts.
+		bool IsCharacterPart(const RE::BSGeometry* a_geometry)
+		{
+			if (a_geometry->GetGeometryRuntimeData().skinInstance)
+				return true;
+			const RE::NiAVObject* node = a_geometry;
+			for (int depth = 0; node && depth < 12; ++depth, node = node->parent) {
+				if (auto* ref = node->GetUserData())
+					return ref->Is(RE::FormType::ActorCharacter);
+			}
+			return false;
+		}
+
+		bool CullSmallCaster(const RE::BSRenderPass* a_pass)
+		{
+			if (!g_smallCullOn || !a_pass || !a_pass->geometry)
+				return false;
+			const auto& b = a_pass->geometry->worldBound;
+			if (!(b.radius > 0.0f))
+				return false;
+			const float distance = b.center.GetDistance(g_cullEye);
+			if (!(b.radius < kSmallCasterSlope * distance) || IsCharacterPart(a_pass->geometry))
+				return false;
+			++g_smallCulled;
+			return true;
+		}
+
 		struct BSBatchRenderer_RenderPassImmediately
 		{
 			static void thunk(RE::BSRenderPass* a_pass, uint32_t a_technique, bool a_alphaTest, uint32_t a_renderFlags)
@@ -111,6 +145,9 @@ namespace Batch39Engine
 				// (45) Ray Tracing: a caster the ray tracer covers is not drawn into the sun cascades.
 				// One branch unless Ray Tracing latched this frame (CasterFilter.h).
 				if (RayTracingCasterFilter::ShouldSkip(a_pass))
+					return;
+				// (47p, A) Small far objects cast no sun shadow in the far cascade (one branch while off).
+				if (g_smallCullOn && CullSmallCaster(a_pass))
 					return;
 				RE::BSRenderPass* previous = g_currentPass;
 				g_currentPass = a_pass;
@@ -330,6 +367,20 @@ namespace Batch39Engine
 	RE::BSRenderPass* CurrentPass() { return g_currentPass; }
 	bool InDepthPrepass() { return g_inDepthPrepass; }
 
+	void SetSunCascade(int a_index)
+	{
+		g_sunCascade = a_index;
+		g_smallCullOn = a_index >= 1 && PerfOptions::settings.SmallCasterCull;
+		if (g_smallCullOn) {
+			if (auto* camera = RE::Main::WorldRootCamera())
+				g_cullEye = camera->world.translate;
+			else
+				g_smallCullOn = false;
+		}
+	}
+
+	uint32_t SmallCastersCulledLastFrame() { return g_smallCulledLast; }
+
 	// =====================================================================================
 	// Hooks
 	// =====================================================================================
@@ -423,9 +474,11 @@ namespace Batch39Engine
 		// LOD trees never go into the reflection (39b default, permanent since 44f). (39b) While
 		// handed off to Dynamic Cubemaps, the game's cubemap holds the sky alone.
 		const bool skyOnly = ReflHandOffActive();
+		// (47p, A) "Water reflection: leave out LOD objects and terrain": the cubemap keeps only the sky (no hand-off).
+		const bool perfSkip = PerfOptions::settings.ReflSkipLodTerrain;
 		g_reflectLODTrees.Apply(true, false);
-		g_reflectLODObjects.Apply(ReflSkipLODObjectsActive() || skyOnly, false);
-		g_reflectLODLand.Apply(skyOnly, false);
+		g_reflectLODObjects.Apply(ReflSkipLODObjectsActive() || skyOnly || perfSkip, false);
+		g_reflectLODLand.Apply(skyOnly || perfSkip, false);
 
 		// 16x AF (permanent since 44f): swap what is bound right now once the hook exists.
 		const bool aniso = g_samplerHookInstalled;
@@ -433,6 +486,10 @@ namespace Batch39Engine
 			g_anisoApplied = aniso;
 			RebindPixelSamplers(aniso);
 		}
+
+		// (47p) Small-caster cull count roll-over.
+		g_smallCulledLast = g_smallCulled;
+		g_smallCulled = 0;
 
 		// Reflection cubemap statistics.
 		constexpr float kOld = 0.95f, kNew = 0.05f;
@@ -555,6 +612,7 @@ namespace Batch39Engine
 			{ "shader_flags", ShaderFlags() },
 		};
 		j["hooks"] = { { "render_pass", g_passHookInstalled }, { "depth_prepass", g_depthHookInstalled }, { "ps_samplers", g_samplerHookInstalled } };
+		j["small_caster_cull"] = { { "on", PerfOptions::settings.SmallCasterCull }, { "culled_last_frame", g_smallCulledLast }, { "slope", kSmallCasterSlope } };  // (47p)
 
 		j["engine_ini"] = {
 			{ "fCubeMapRefreshRate:Water_seconds", ReadEngineFloat("fCubeMapRefreshRate:Water", -1.0f) },
