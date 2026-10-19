@@ -117,12 +117,10 @@ namespace RayTracingCharacters
 		/// parts; a_alpha: alpha-tested parts with their cut-out (the alpha pipeline exists);
 		/// a_firstPersonPlayer (45j): the player is traced in first person too (off: in first person it stays
 		/// in the shadow map). A change of the first three drops everything (next Update).
-		/// (46m) a_parallel: the per-actor reads run on a few read lanes (joined before anything uses them);
-		/// a_scanCache: an actor's 3D is scanned in full only when it may have changed (equip, a new actor) and
-		/// every kRescanFrames frames, the known shapes are checked every frame; a_merge: an actor's opaque
-		/// shapes are one merged BLAS (a change drops everything).
-		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer, bool a_parallel = true, bool a_scanCache = true,
-			bool a_merge = true);
+		/// (46m, always since 47m) The per-actor reads run on a few read lanes (joined before anything uses them); an
+		/// actor's 3D is scanned in full only when it may have changed (equip, a new actor) and every kRescanFrames
+		/// frames, the known shapes are checked every frame; an actor's opaque shapes are one merged BLAS.
+		void Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer);
 		/// Drops everything on the next Update (loading screens, from any thread).
 		void RequestFlush() { flushRequested_.store(true); }
 		/// (46m) An actor equipped / unequipped something (any thread): its 3D is scanned in full for the next frames.
@@ -226,10 +224,6 @@ namespace RayTracingCharacters
 		bool firstPersonPlayer_ = false;  // (45j)
 		bool alpha_ = false;
 		std::uint32_t stillReused_ = 0;  // (45n)
-		// (46m)
-		bool parallel_ = true;
-		bool scanCache_ = true;
-		bool merge_ = true;
 		std::uint64_t frame_ = 0;
 		std::uint32_t actorSerial_ = 0;
 		std::vector<std::pair<float, RE::Actor*>> candidates_;  // scratch

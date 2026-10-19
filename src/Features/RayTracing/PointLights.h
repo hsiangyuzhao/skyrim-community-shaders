@@ -112,7 +112,7 @@ namespace RayTracingPointLights
 
 	struct Config
 	{
-		bool native = true;         // include the engine's shadow-map lights (RT replaces their shadow map in Lighting)
+		// (47m) The engine's shadow-map lights are always included (RT replaces their shadow map in Lighting).
 		bool keepSSPLS = false;     // tag: keep SSPLS as contact shadows for RT lights
 		bool ssplsNonRT = false;    // (46y) tag: SSPLS beside RT for occluders the ray tracer does not see (wins over keepSSPLS)
 		bool waterBed = false;      // (47h) tag: Point Light Shadows on Water
@@ -142,20 +142,14 @@ namespace RayTracingPointLights
 		// (46q) Carrier Casts Shadows from Its Own Light, third person: the player's own lights take the player's key as their carrier
 		// (the body blocks except near the light, TracePointLightsCS) instead of skipping the player (kSourceNoPlayer).
 		bool playerCarrier = false;
-		// (46g) Stable selection: per light a smoothed intensity (EMA 0.1 per frame) and radius (rises at once, shrinks 2 % per
-		// frame) drive the rules, the merge and the GPU source; a light tagged last frame stays while it is above 80 % of the cuts.
-		bool stable = true;
-		// (46g) Window beams found implausible (almost every traced pixel of their cone blocked): no source, the engine's shadow
-		// map stays for them (sorted by pointer; null = none).
-		const std::vector<const RE::BSLight*>* excludedBeams = nullptr;
-		// (46s) Steady Flickering Lights: static world lights (fixtures, standalone, mesh-attached; not carried, not the player's, not
-		// spells / effects, not spots) take a steady position instead of the engine's flicker-jittered one: their parent node's when
-		// the light's local offset is within 2 x its LIGH's movement amplitude + 1, else a per-light average (EMA 0.05 per frame,
-		// snaps on a jump over 128 units). Used for the rules, the merge, the slots (and so the denoiser's motion), the GPU source.
-		bool steady = true;
-		// (46s) Merge hysteresis: a light merged into a group last frame stays in the group of the same seed light up to 1.5 x the
-		// merge distance.
-		bool mergeHysteresis = true;
+		// (47m) Always on: (46g) Stable selection: per light a smoothed intensity (EMA 0.1 per frame) and radius (rises at once,
+		// shrinks 2 % per frame) drive the rules, the merge and the GPU source; a light tagged last frame stays while it is above 80 %
+		// of the cuts. (46s) Steady Flickering Lights: static world lights (fixtures, standalone, mesh-attached; not carried, not the
+		// player's, not spells / effects, not spots) take a steady position instead of the engine's flicker-jittered one: their parent
+		// node's when the light's local offset is within 2 x its LIGH's movement amplitude + 1, else a per-light average (EMA 0.05 per
+		// frame, snaps on a jump over 128 units). Used for the rules, the merge, the slots (and so the denoiser's motion), the GPU
+		// source. (46s) Merge hysteresis: a light merged into a group last frame stays in the group of the same seed light up to
+		// 1.5 x the merge distance.
 		// (46s) Meshless lights near fires (placed LIGH without a mesh, classified a fixture by its name only, not shadow-casting):
 		// MeshlessOwn = a source of its own (46r), MeshlessSnap = its tag goes to the nearest visible fixture's source within
 		// snapDistance (its intensity added, no weight in the centre; none in range: own), MeshlessSkip = no RT source.
@@ -163,22 +157,17 @@ namespace RayTracingPointLights
 		float snapDistance = 320.0f;
 		// (46s) Diagnostics: the sources whose range covers this point (world; the player's chest). Not used when null.
 		const double* reachPoint = nullptr;
-		// (46x) Fill lights (placed, no mesh, named / from a plugin like fill lights; 46w: never traced). Trace Direct Fill Lights: a fill
+		// (46x, always since 47m) Fill lights (placed, no mesh, named / from a plugin like fill lights; 46w: never traced). Trace Direct Fill Lights: a fill
 		// named like direct light (sun / shaft / beam / ray) or lying on the axis of a window spot shadow light (within 128 units
 		// horizontally, the spot above it), at least 1.0 before the fade and near-neutral (max / min channel <= 1.3), is traced: aimed
 		// at that spot (kSourceAim), or without one as a soft point light of emitter radius directEmitter. Plugin-only fills (an
 		// "ambient" plugin made them fills) named like a fire / candle / torch, or within 128 units of a fixture light, are fixtures
 		// (the meshless rules: Snap / Own / Skip).
-		bool directFills = true;
 		float directEmitter = 24.0f;
-		bool pluginFillFixtures = true;
-		// (46x) The window-beam radius in effect (LightCensus::WindowBeamRadius(): 4096 with Wider Window Beam Detection, else 10000).
-		float beamRadius = 10000.0f;
-		// (46x) Skip Lights Behind Portals (interiors with room bounds): a portal-strict light none of whose rooms (or portals) holds the
-		// camera takes no source when roomBoxes is off, or when its rooms' box is off screen; with roomBoxes every portal-strict light with
+		// (46x, always since 47m) The window-beam radius is Util::LightCensus::kWindowBeamRadiusWide (Wider Window Beam Detection).
+		// Skip Lights Behind Portals (interiors with room bounds) with the per-pixel room box: a portal-strict light none of whose
+		// rooms (or portals) holds the camera takes no source when its rooms' box is off screen; every portal-strict light with
 		// readable rooms is ranked only at pixels inside its rooms' box (kSourceRoomBox). The camera in no known room: nothing changes.
-		bool portals = true;
-		bool roomBoxes = true;
 	};
 	inline constexpr std::uint32_t kMeshlessOwn = 0, kMeshlessSnap = 1, kMeshlessSkip = 2;
 

@@ -40,9 +40,7 @@ namespace Util::LightCensus
 		// (46x) A fill light named like direct light: a sun patch / shaft on the floor (True Light's FarmInteriorSunLight01).
 		constexpr std::string_view kDirectFillWords[] = { "sun", "shaft", "beam", "godray", "lightray" };
 
-		/// (46x) Wider Window Beam Detection (Ray Tracing's switch, set every frame).
-		std::atomic<bool> g_widerBeams{ false };
-
+		/// (46x) a_wider: Wider Window Beam Detection (always in effect since 47m; false only for the cached 46w decision).
 		float BeamRadiusFor(bool a_wider)
 		{
 			return a_wider ? kWindowBeamRadiusWide : kWindowBeamRadius;
@@ -831,7 +829,7 @@ namespace Util::LightCensus
 
 		Category SplitWindow(bool a_spot, float a_radius)
 		{
-			if (a_spot && a_radius > BeamRadiusFor(g_widerBeams.load(std::memory_order_relaxed)))
+			if (a_spot && a_radius > kWindowBeamRadiusWide)  // (46x) the wider rule (always, 47m)
 				return Category::WindowBeam;
 			if (a_radius < kWindowGlowRadius)
 				return Category::WindowGlow;
@@ -1385,9 +1383,8 @@ namespace Util::LightCensus
 					{ "fill", "placed light without a mesh whose LIGH editor ID says omni / ambient / fill / bounce or that comes from an 'ambient' plugin "
 							  "(never by radius): lights the room, no visible source" },
 					{ "fixture-shadow", "like fill, but shadow-casting: stands in for a fixture's shadow (True Light - Shadows and Ambient)" },
-					{ "window-beam", WiderWindowBeams() ?
-										 "window light (name says window / sunbeam / shaft, or a Window Shadows Ultimate spot shadow light), spot with radius > 4096 (46x Wider Window Beam Detection): the sun beam through a window" :
-										 "window light (name says window / sunbeam / shaft), spot with radius > 10000: the sun beam through a window (Window Shadows Ultimate)" },
+					{ "window-beam",
+						"window light (name says window / sunbeam / shaft, or a Window Shadows Ultimate spot shadow light), spot with radius > 4096 (46x Wider Window Beam Detection): the sun beam through a window" },
 					{ "window-glow", "window light with radius < 128: the glow of a lit pane seen from outside" },
 					{ "window-fill", "other window lights: the light a window spreads into a room" },
 					{ "standalone", "placed light without a mesh nearby and not named like a fill light" },
@@ -1548,11 +1545,11 @@ namespace Util::LightCensus
 		if (!a_light || !ReadIdentity(a_light, &niLight, &owner))
 			return false;
 		// (46x) Window lights re-split by the radius (and the beam rule in effect); Window Shadows Ultimate's other spot shadow lights
-		// are beams over 4096 units with the wider rule. The cached decision is the one without it (46w), so switching it off is exact.
+		// are beams over 4096 units with the wider rule (always, 47m). The cached decision is the one without it (46w).
 		const auto categoryOf = [a_radius](const ClassEntry& a_entry) {
 			if (a_entry.window)
 				return SplitWindow(a_entry.spot, a_radius);
-			if (a_entry.wsuSpot && g_widerBeams.load(std::memory_order_relaxed) && a_radius > kWindowBeamRadiusWide)
+			if (a_entry.wsuSpot && a_radius > kWindowBeamRadiusWide)
 				return Category::WindowBeam;
 			return a_entry.category;
 		};
@@ -1641,9 +1638,6 @@ namespace Util::LightCensus
 	std::uint32_t ClassifierCacheSize() { return static_cast<std::uint32_t>(g_classCache.size()); }
 	std::uint64_t ClassifierReads() { return g_classReads; }
 
-	void SetWiderWindowBeams(bool a_on) { g_widerBeams.store(a_on, std::memory_order_relaxed); }
-	bool WiderWindowBeams() { return g_widerBeams.load(std::memory_order_relaxed); }
-	float WindowBeamRadius() { return BeamRadiusFor(WiderWindowBeams()); }
 
 	bool WantsSources()
 	{
@@ -1722,7 +1716,7 @@ namespace Util::LightCensus
 				r.intensityBeforeFade = std::max({ r.color[0], r.color[1], r.color[2] }) * r.fade;
 				r.intensityAfterFade = r.intensityBeforeFade * r.lodDimmer;
 			}
-			Classify(r, fixtures, WiderWindowBeams());
+			Classify(r, fixtures, true);  // (46x) Wider Window Beam Detection (always, 47m)
 			r.stableId = StableId(r);
 			if (a_light && globals::features::rayTracing.loaded) {
 				r.rtTag = globals::features::rayTracing.PointLightTag(a_light);            // (46s)

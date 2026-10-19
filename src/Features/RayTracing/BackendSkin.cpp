@@ -534,10 +534,10 @@ namespace RayTracingRT
 			std::size_t firstMember, memberCount;
 		};
 		std::vector<GroupOp> groupOps;
-		// (46q) Budget Builds by GPU Time: merged builds this frame and the triangles the whole budget allows.
+		// (46q) Builds budgeted by GPU time: merged builds this frame and the triangles the whole budget allows.
 		std::uint32_t groupBuildsNow = 0;
 		const double groupPerTri = msPerTriEma_ > 0.0 ? msPerTriEma_ : 8.0e-6;
-		const std::uint64_t groupTriBudget = static_cast<std::uint64_t>(std::max(16384.0, static_cast<double>(std::max(budgetGpuMs_, 0.1f)) / groupPerTri));
+		const std::uint64_t groupTriBudget = static_cast<std::uint64_t>(std::max(16384.0, static_cast<double>(kBudgetGpuMs) / groupPerTri));
 		for (auto& group : skinGroups_)
 			group.seen = false;
 		skinGroupDraws_.clear();
@@ -614,14 +614,14 @@ namespace RayTracingRT
 				build = true;  // periodic rebuild (a refit loosens the BVH as the pose drifts)
 				++rebuilds;
 			}
-			if (build && budgetOn_) {
-				// (46q) Budget Builds by GPU Time: at most groupBuildCap_ merged builds a frame, within the GPU-time budget left after the
+			if (build) {
+				// (46q) Builds budgeted by GPU time: at most kGroupBuildCap merged builds a frame, within the GPU-time budget left after the
 				// static builds (the first one always goes). A periodic rebuild put off is a refit; a changed member list waits (its
 				// character is not traced this frame, as a shape over kSkinBuildsPerFrame).
 				std::uint64_t triangles = 0;
 				for (std::size_t m = 0; m < count; ++m)
 					triangles += skins_[draws[skinGroupMembers_[first + m]].shape].triangles;
-				const bool fits = groupBuildsNow == 0 || (groupBuildsNow < groupBuildCap_ && frameTrisUsed_ + triangles <= groupTriBudget);
+				const bool fits = groupBuildsNow == 0 || (groupBuildsNow < kGroupBuildCap && frameTrisUsed_ + triangles <= groupTriBudget);
 				if (fits) {
 					++groupBuildsNow;
 					frameTrisUsed_ += triangles;
@@ -684,17 +684,17 @@ namespace RayTracingRT
 		}
 
 		auto finishGroups = [&]() {
-			// Groups no character drew this frame: their BLAS goes (behind the fence). (46q) With Budget Builds by GPU Time only
-			// once it was not drawn for the grace period (a character out of view for a moment keeps it: no rebuild when seen again).
+			// Groups no character drew this frame: their BLAS goes (behind the fence). (46q) Only once it was not drawn for the
+			// grace period (a character out of view for a moment keeps it: no rebuild when seen again).
 			const std::int64_t now = Util::FrameTrace::Now();
-			const std::int64_t grace = static_cast<std::int64_t>(static_cast<double>(std::max(groupGraceMs_, 0.0f)) * QpcPerMs());
+			const std::int64_t grace = static_cast<std::int64_t>(static_cast<double>(kGroupGraceMs) * QpcPerMs());
 			for (std::size_t g = 0; g < skinGroups_.size();) {
 				if (skinGroups_[g].seen) {
 					skinGroups_[g].lastSeenQpc = now;
 					++g;
 					continue;
 				}
-				if (budgetOn_ && skinGroups_[g].lastSeenQpc != 0 && now - skinGroups_[g].lastSeenQpc < grace) {
+				if (skinGroups_[g].lastSeenQpc != 0 && now - skinGroups_[g].lastSeenQpc < grace) {
 					++budget_.groupsKept;
 					++g;
 					continue;

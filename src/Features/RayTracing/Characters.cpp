@@ -443,18 +443,14 @@ namespace RayTracingCharacters
 		new std::vector<std::unique_ptr<Actor>>(std::move(retiring_));
 	}
 
-	void Characters::Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer, bool a_parallel, bool a_scanCache, bool a_merge)
+	void Characters::Configure(bool a_physics, bool a_hair, bool a_alpha, bool a_firstPersonPlayer)
 	{
-		// (46m) Merging is decided per shape when it is captured: a change captures everything again.
-		if (a_physics != physics_ || a_hair != hair_ || a_alpha != alpha_ || a_merge != merge_)
+		if (a_physics != physics_ || a_hair != hair_ || a_alpha != alpha_)
 			RequestFlush();
 		physics_ = a_physics;
 		hair_ = a_hair;
 		alpha_ = a_alpha;
 		firstPersonPlayer_ = a_firstPersonPlayer;
-		parallel_ = a_parallel;
-		scanCache_ = a_scanCache;
-		merge_ = a_merge;
 	}
 
 	void Characters::NoteEquip(const void* a_reference)
@@ -1067,8 +1063,9 @@ namespace RayTracingCharacters
 		}
 
 		shape->vertices = vertexCount;
-		// (46m) Merge Character Parts: an opaque shape goes into its actor's merged BLAS.
-		shape->grouped = merge_ && !alphaTested;
+		// (46m) Merge Character Parts (always, 47m): an opaque shape goes into its actor's merged BLAS; an alpha-tested one keeps
+		// its own BLAS.
+		shape->grouped = !alphaTested;
 		geometry->grouped = shape->grouped;
 		shape->handle = a_backend.CreateSkinShape(std::move(geometry));
 		if (shape->handle == RayTracingRT::kInvalidSkin) {
@@ -1202,7 +1199,7 @@ namespace RayTracingCharacters
 			scan.assign(actors_.size(), 0);
 			for (std::size_t a = 0; a < actors_.size(); ++a) {
 				const auto& actor = *actors_[a];
-				scan[a] = (!scanCache_ || actor.player || frame_ <= actor.scanUntil || (frame_ + actor.serial) % kRescanFrames == 0) ? 1 : 0;
+				scan[a] = (actor.player || frame_ <= actor.scanUntil || (frame_ + actor.serial) % kRescanFrames == 0) ? 1 : 0;
 			}
 			struct ReadJob
 			{
@@ -1219,11 +1216,7 @@ namespace RayTracingCharacters
 				}
 			};
 			const auto count = static_cast<std::uint32_t>(actors_.size());
-			stats_.lanes = parallel_ ? ReadPool::Get().Run(count, run, &job) : 1;
-			if (!parallel_) {
-				for (std::uint32_t a = 0; a < count; ++a)
-					run(&job, a);
-			}
+			stats_.lanes = ReadPool::Get().Run(count, run, &job);  // (47m) always parallel (Run itself falls back to this thread)
 			for (const auto& actor : actors_) {
 				stats_.bonesRead += actor->bonesRead;
 				stats_.rescans += actor->scanned ? 1 : 0;

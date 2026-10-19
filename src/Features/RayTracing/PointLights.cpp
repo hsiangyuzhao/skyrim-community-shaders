@@ -713,7 +713,7 @@ namespace RayTracingPointLights
 				return nullptr;
 			}
 			// (46s) Steady Flickering Lights: static world lights take their steady position.
-			if (a_config.steady && hist && !spot && !beam && c.kind == 0 && c.owner == 0 && SteadyCategory(category)) {
+			if (hist && !spot && !beam && c.kind == 0 && c.owner == 0 && SteadyCategory(category)) {
 				updateSteady(*hist, r, traits);
 				std::copy_n(hist->steady, 3, pos);
 				c.steady = true;
@@ -767,7 +767,7 @@ namespace RayTracingPointLights
 			// (46c) Spot shadow lights: only indoors and only with a readable cone (outdoors they keep the engine's).
 			const bool spot = r.shadow && r.spot;
 			if (spot && a_config.interior)
-				LogSpot(light, r, r.radius > a_config.beamRadius);
+				LogSpot(light, r, r.radius > Util::LightCensus::kWindowBeamRadiusWide);
 			if (spot && (!a_config.interior || !r.spotValid)) {
 				stats_.spotsInvalid += a_config.interior ? 1 : 0;
 				++stats_.byReason[kRejectCategory];
@@ -779,7 +779,7 @@ namespace RayTracingPointLights
 			Util::LightCensus::Traits traits;
 			bool classified = false;
 			bool beam = false;
-			if (spot && r.radius > std::min(a_config.maxRadius, a_config.beamRadius)) {
+			if (spot && r.radius > std::min(a_config.maxRadius, Util::LightCensus::kWindowBeamRadiusWide)) {
 				if (!Util::LightCensus::ClassifyCached(light, r.radius, a_frame, classifyBudget, category, &traits)) {
 					++stats_.pending;
 					continue;
@@ -787,14 +787,10 @@ namespace RayTracingPointLights
 				classified = true;
 				beam = category == C::WindowBeam;
 				// (46x) A window spot shadow light: the aim of the direct fill under it.
-				if (a_config.directFills && (beam || category == C::WindowFill || category == C::WindowGlow || traits.wsu))
+				if (beam || category == C::WindowFill || category == C::WindowGlow || traits.wsu)
 					addWindowSpot(r);
 				if (!beam || !a_config.beams) {
 					++stats_.byReason[kRejectCategory];
-					continue;
-				}
-				if (a_config.excludedBeams && std::binary_search(a_config.excludedBeams->begin(), a_config.excludedBeams->end(), static_cast<const RE::BSLight*>(light))) {
-					++stats_.byReason[kRejectCategory];  // (46g) implausible: the engine's shadow map stays
 					continue;
 				}
 				// (46x) A beam only by the wider rule (46w: radius over 10000 only).
@@ -802,7 +798,7 @@ namespace RayTracingPointLights
 					++stats_.beamsWider;
 					decide(light, Decision::WiderBeam, 0);
 				}
-			} else if (spot && a_config.directFills) {
+			} else if (spot) {
 				// (46x) The other spot shadow lights indoors: the window ones are aims of direct fills (classified now; cached).
 				if (Util::LightCensus::ClassifyCached(light, r.radius, a_frame, classifyBudget, category, &traits)) {
 					classified = true;
@@ -817,7 +813,7 @@ namespace RayTracingPointLights
 			bool wasTagged = false;
 			// (46s) The per-light history serves the stable selection, the steady position, the merge hysteresis and the snap.
 			History* hist = nullptr;
-			if (!beam && (a_config.stable || a_config.steady || a_config.mergeHysteresis || a_config.meshless == kMeshlessSnap || a_config.directFills)) {
+			if (!beam) {
 				hist = &history_[light];
 				if (hist->niLight != r.niLight) {
 					*hist = History{};  // a new light at the address of an old one
@@ -825,7 +821,7 @@ namespace RayTracingPointLights
 				}
 				hist->seen = a_frame;
 			}
-			if (a_config.stable && hist) {
+			if (hist) {
 				auto& h = *hist;
 				if (h.frame == 0 || a_frame - h.frame > 30u) {
 					h.intensity = rawIntensity;
@@ -844,7 +840,7 @@ namespace RayTracingPointLights
 			}
 			// (46s) The position the rules test: last frame's steady position while there is one (this frame's comes with the category).
 			double pos[3] = { r.pos[0], r.pos[1], r.pos[2] };
-			if (a_config.steady && hist && hist->steadyValid && a_frame - hist->steadyFrame <= 2u)
+			if (hist && hist->steadyValid && a_frame - hist->steadyFrame <= 2u)
 				std::copy_n(hist->steady, 3, pos);
 			const float cutScale = wasTagged ? 0.8f : 1.0f;
 			const bool limits = !forced && !beam;
@@ -912,18 +908,14 @@ namespace RayTracingPointLights
 			if (forced || beam)
 				include = true;
 			else if (native)
-				include = a_config.native && !window && (!own || ownWanted);  // omni / hemi / spot shadow lights
+				include = !window && (!own || ownWanted);  // omni / hemi / spot shadow lights
 			else
 				include = own ? ownWanted : IncludedCategory(category);
 			if (!include) {
 				// (46x) Fill lights: decided after the loop (direct light, a fixture's light, or left as they are).
 				if (category == C::Fill && !native && !forced) {
-					if (a_config.directFills || (a_config.pluginFillFixtures && traits.fillPluginOnly)) {
-						fills.push_back({ light, r, { pos[0], pos[1], pos[2] }, hist, traits, intensity, intensityBeforeFade, wasTagged });
-						continue;
-					}
-					++stats_.fillAmbient;
-					decide(light, Decision::FillAmbient, 3);
+					fills.push_back({ light, r, { pos[0], pos[1], pos[2] }, hist, traits, intensity, intensityBeforeFade, wasTagged });
+					continue;
 				}
 				++stats_.byReason[kRejectCategory];
 				continue;
@@ -937,7 +929,7 @@ namespace RayTracingPointLights
 		// one); (d) every other fill stays untraced.
 		for (auto& f : fills) {
 			auto traits = f.traits;
-			if (a_config.pluginFillFixtures && traits.fillPluginOnly) {
+			if (traits.fillPluginOnly) {
 				bool fixture = traits.fillFixtureWord;
 				std::uint8_t why = 0;
 				if (!fixture) {
@@ -960,53 +952,52 @@ namespace RayTracingPointLights
 					continue;
 				}
 			}
-			std::uint8_t ambientWhy = a_config.directFills ? 0 : 3;
-			if (a_config.directFills) {
-				// The window spot above it: within 128 units horizontally, at least 64 units higher (the nearest horizontally).
-				const WindowSpot* spot = nullptr;
-				double bestSq = 128.0 * 128.0;
-				for (const auto& s : windowSpots) {
-					const double ex = s.pos[0] - f.pos[0], ey = s.pos[1] - f.pos[1];
-					const double h2 = ex * ex + ey * ey;
-					if (s.pos[2] > f.pos[2] + 64.0 && h2 <= bestSq) {
-						bestSq = h2;
-						spot = &s;
-					}
+			std::uint8_t ambientWhy = 0;
+			// (46x) Trace Direct Fill Lights (always, 47m). The window spot above it: within 128 units horizontally, at least 64 units
+			// higher (the nearest horizontally).
+			const WindowSpot* spot = nullptr;
+			double bestSq = 128.0 * 128.0;
+			for (const auto& s : windowSpots) {
+				const double ex = s.pos[0] - f.pos[0], ey = s.pos[1] - f.pos[1];
+				const double h2 = ex * ex + ey * ey;
+				if (s.pos[2] > f.pos[2] + 64.0 && h2 <= bestSq) {
+					bestSq = h2;
+					spot = &s;
 				}
-				double aim[3]{};
-				bool paired = false;
-				if (spot) {
-					std::copy_n(spot->pos, 3, aim);
-					paired = true;
-					if (f.hist) {
-						std::copy_n(spot->pos, 3, f.hist->aim);
-						f.hist->aimFrame = a_frame;
-					}
-				} else if (f.hist && f.hist->aimFrame && a_frame - f.hist->aimFrame <= 120u) {
-					std::copy_n(f.hist->aim, 3, aim);  // its spot is not in this frame's lights: the last one seen
-					paired = true;
+			}
+			double aim[3]{};
+			bool paired = false;
+			if (spot) {
+				std::copy_n(spot->pos, 3, aim);
+				paired = true;
+				if (f.hist) {
+					std::copy_n(spot->pos, 3, f.hist->aim);
+					f.hist->aimFrame = a_frame;
 				}
-				if (traits.fillDirectName || paired) {
-					const float mx = std::max({ f.read.color[0], f.read.color[1], f.read.color[2] });
-					const float mn = std::min({ f.read.color[0], f.read.color[1], f.read.color[2] });
-					if (f.intensityBeforeFade < 1.0f) {
-						ambientWhy = 1;
-					} else if (!(mn > 1e-4f) || mx > mn * 1.3f) {
-						ambientWhy = 2;
-					} else if (auto* c = addCandidate(f.light, f.read, f.pos, f.hist, C::Fill, traits, f.intensity, f.intensityBeforeFade, f.wasTagged, false, false, false,
-								   false)) {
-						c->direct = true;
-						c->aimed = paired;
-						std::copy_n(aim, 3, c->aim);
-						if (paired) {
-							++stats_.fillDirectAimed;
-							decide(f.light, Decision::FillDirectAimed, traits.fillDirectName ? 2 : 1);
-						} else {
-							++stats_.fillDirectPoint;
-							decide(f.light, Decision::FillDirectPoint, 0);
-						}
-						continue;
+			} else if (f.hist && f.hist->aimFrame && a_frame - f.hist->aimFrame <= 120u) {
+				std::copy_n(f.hist->aim, 3, aim);  // its spot is not in this frame's lights: the last one seen
+				paired = true;
+			}
+			if (traits.fillDirectName || paired) {
+				const float mx = std::max({ f.read.color[0], f.read.color[1], f.read.color[2] });
+				const float mn = std::min({ f.read.color[0], f.read.color[1], f.read.color[2] });
+				if (f.intensityBeforeFade < 1.0f) {
+					ambientWhy = 1;
+				} else if (!(mn > 1e-4f) || mx > mn * 1.3f) {
+					ambientWhy = 2;
+				} else if (auto* c = addCandidate(f.light, f.read, f.pos, f.hist, C::Fill, traits, f.intensity, f.intensityBeforeFade, f.wasTagged, false, false, false,
+							   false)) {
+					c->direct = true;
+					c->aimed = paired;
+					std::copy_n(aim, 3, c->aim);
+					if (paired) {
+						++stats_.fillDirectAimed;
+						decide(f.light, Decision::FillDirectAimed, traits.fillDirectName ? 2 : 1);
+					} else {
+						++stats_.fillDirectPoint;
+						decide(f.light, Decision::FillDirectPoint, 0);
 					}
+					continue;
 				}
 			}
 			++stats_.fillAmbient;
@@ -1017,7 +1008,7 @@ namespace RayTracingPointLights
 		// (46x) Skip Lights Behind Portals: Light Limit Fix lights a portal-strict light's pixels only on the geometry of its rooms (and
 		// portals). Each such light's rooms' box (world, conservative); a light whose rooms do not hold the camera is behind a portal.
 		// Only when its rooms read well (every room box valid, the light inside them) and the camera is in some known room.
-		if (a_config.portals && a_config.interior && !candidates.empty()) {
+		if (a_config.interior && !candidates.empty()) {
 			static thread_local std::vector<RoomBox> roomBoxes;
 			roomBoxes.clear();
 			const auto boxOf = [](RE::NiNode* a_node) -> RoomBox {
@@ -1089,30 +1080,27 @@ namespace RayTracingPointLights
 					++stats_.portalStrict;
 					if (!s.reaches) {
 						++stats_.portalAway;
-						bool drop = !a_config.roomBoxes;
-						std::uint8_t why = 1;
-						if (!drop) {
-							// Behind a portal and its rooms' box wholly outside the view: no source.
-							for (const auto& p : planes) {
-								double d = p[3];
-								for (int a = 0; a < 3; ++a)
-									d += static_cast<double>(p[a]) * ((p[a] >= 0.0f ? s.hi[a] : s.lo[a]) - a_camera[a]);
-								if (d < 0.0) {
-									drop = true;
-									why = 0;
-									break;
-								}
+						// Behind a portal and its rooms' box wholly outside the view: no source. (47m) Per-Pixel Room Box always on (the
+						// drop-all-behind-portal path is gone).
+						bool drop = false;
+						for (const auto& p : planes) {
+							double d = p[3];
+							for (int a = 0; a < 3; ++a)
+								d += static_cast<double>(p[a]) * ((p[a] >= 0.0f ? s.hi[a] : s.lo[a]) - a_camera[a]);
+							if (d < 0.0) {
+								drop = true;
+								break;
 							}
 						}
 						if (drop) {
 							c.dropped = true;
 							++stats_.portalDropped;
 							stats_.native -= c.native ? 1 : 0;
-							decide(c.light, Decision::PortalDropped, why);
+							decide(c.light, Decision::PortalDropped, 0);
 							continue;
 						}
 					}
-					if (a_config.roomBoxes && !c.direct) {
+					if (!c.direct) {
 						c.boxed = true;
 						std::copy_n(s.lo, 3, c.boxLo);
 						std::copy_n(s.hi, 3, c.boxHi);
@@ -1192,7 +1180,7 @@ namespace RayTracingPointLights
 				continue;  // (46s) snapped: after the groups exist
 			std::uint32_t found = UINT32_MAX;
 			// (46s) Merge hysteresis: last frame's group (the same seed light) while within 1.5 x the merge distance.
-			if (a_config.mergeHysteresis && !c.spot && !c.direct) {
+			if (!c.spot && !c.direct) {
 				const auto* h = static_cast<const History*>(c.hist);
 				if (h && h->seed && a_frame - h->seedFrame <= 2u) {
 					for (std::uint32_t g = 0; g < groups.size(); ++g) {
@@ -1269,8 +1257,8 @@ namespace RayTracingPointLights
 		}
 		// (46t) Reach, once the centres are final: a snapped light (up to the snap distance away, its own radius) lit pixels
 		// outside its fixture's sphere, which then got no traced shadow -- the shadow ended in a hard line at the fixture's
-		// radius. Each snapped member, and with Merge Hysteresis each merged member (the centre moves off the seed), widens
-		// the source's reach to cover its sphere. All 46s switches off: reach = radius (46r).
+		// radius. Each snapped or merged member (Merge Hysteresis, always since 47m: the centre moves off the seed) widens
+		// the source's reach to cover its sphere.
 		for (auto& group : groups)
 			group.reach = group.radius;
 		for (std::uint32_t i = 0; i < candidates.size(); ++i) {
@@ -1279,7 +1267,7 @@ namespace RayTracingPointLights
 				continue;
 			const auto& c = candidates[i];
 			auto& group = groups[g];
-			if (group.spot || !(c.anchor != UINT32_MAX || a_config.mergeHysteresis))
+			if (group.spot)
 				continue;
 			const float cover = static_cast<float>(std::sqrt(DistSq(group.pos, c.pos))) + c.read.radius;
 			if (std::isfinite(cover))
@@ -1457,10 +1445,8 @@ namespace RayTracingPointLights
 			const std::uint32_t g = memberGroup[i];
 			if (g == UINT32_MAX || groups[g].slot == UINT32_MAX)
 				continue;
-			if (a_config.stable) {
-				if (const auto it = history_.find(candidates[i].light); it != history_.end())
-					it->second.tagged = true;  // (46g) hysteresis next frame
-			}
+			if (const auto it = history_.find(candidates[i].light); it != history_.end())
+				it->second.tagged = true;  // (46g) hysteresis next frame
 			const auto& c = candidates[i];
 			// (46c) Spot lights are not tagged: Lighting reads their shadow mask channel, which Ray Tracing writes (with the cone).
 			if (!c.spot) {

@@ -47,7 +47,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PointLightsPerPixel,
 	PointLightsMaxSources,
 	PointLightsDistance,
-	PointLightsNative,
 	PointLightsKeepSSPLS,
 	PointLightsSize,
 	PointLightsClearance,
@@ -58,9 +57,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	PointLightsPlayer,
 	PointLightsEffects,
 	PointLightsAlphaOutdoors,
-	PointLightsStable,
-	PointLightsBeamCull,
-	PointLightsBeamGuard,
 	AO,
 	AOMode,
 	AORayLength,
@@ -69,13 +65,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 	AODistance,
 	AOInteriors,
 	AOModeInterior,
-	LoadingPump,
 	LoadingPumpMs,
-	BlackWindowMs,
-	CharactersParallel,
-	CharactersScanCache,
-	CharactersMerge,
-	SplitTraceSync)
+	BlackWindowMs)
 
 namespace
 {
@@ -130,13 +121,12 @@ namespace
 	constexpr std::uint32_t kPatternNpcReduced = 16u;                                                  // TraceShadowsCS Extra.w
 	constexpr std::uint32_t kFlagSpatial = 512u, kFlagDenoiseHalf = 1024u, kFlagSigma = 2048u, kFlagFalloffDenoise = 4096u;  // Common.hlsli
 	constexpr float kBlockerRange = 4096.0f;    // TraceShadowsCS kBlockerRange
-	// (45k) Loading screens: capture / build budgets (frame time does not matter there), warm-up after them.
-	constexpr float kLoadingCaptureBudgetMs = 8.0f;
+	// (45k) Loading screens: build budgets (frame time does not matter there), warm-up after them.
 	constexpr std::uint32_t kLoadingBuildTriangles = 1u << 20;  // per submission (TDR-safe: about 8 frames' worth of normal builds)
 	constexpr std::uint32_t kLoadingMaxBuilds = 128;  // (46g) 64 -> 128 (a CPU budget per frame now; 8 contexts x 128 stay within the postbuild slots)
 	// (46g) Transition budgets: render-thread ms per frame. Loading / black screen: nothing visible; WarmUp: visible, not handed off.
-	constexpr float kLoadingBuildCpuMs = 12.0f, kBlackBuildCpuMs = 10.0f, kWarmUpBuildCpuMs = 3.0f;
-	constexpr float kBlackCaptureBudgetMs = 8.0f, kWarmUpCaptureBudgetMs = 3.0f;
+	constexpr float kLoadingBuildCpuMs = 12.0f, kBlackBuildCpuMs = 10.0f;
+	constexpr float kBlackCaptureBudgetMs = 8.0f;
 	constexpr float kBlackSkinUploadCpuMs = 6.0f;
 	constexpr double kBlackMaxMs = 4000.0;  // a Fader Menu open longer than this after a loading screen is not the black screen
 	constexpr double kLateHoldMs = 4000.0;  // items not ready at the hand-off wait at most this long for the late batch
@@ -226,7 +216,7 @@ namespace
 	constexpr float kPointMaxFilterRadius = 12.0f;   // px
 	constexpr float kPointSunShare = 0.05f;          // at a sunlit pixel a point light under 5 % of the sun's light there is not traced
 	constexpr std::uint32_t kPointFlagCharacters = 1u, kPointFlagFirstPerson = 2u, kPointFlagCharCull = 4u;  // TracePointLightsCS
-	constexpr std::uint32_t kPointFlagSticky = 8u, kPointFlagBeamCullFront = 16u, kPointFlagBeamCullBack = 32u;  // (46g) TracePointLightsCS
+	constexpr std::uint32_t kPointFlagSticky = 8u, kPointFlagBeamCullFront = 16u;  // (46g) TracePointLightsCS (32 = cull back: unused since 47m)
 	constexpr std::uint32_t kPointFlagRtSurface = 64u;  // (46y) TracePointLightsCS: mark traced-caster surfaces for SSPLS
 	constexpr std::uint32_t kPointFlagWater = 128u;     // (47i) TracePointLightsCS: trace the sources from last frame's water too
 	constexpr std::uint32_t kPointDenoiseHistory = 1u, kPointDenoiseDebug = 2u;                             // PointDenoiseCS
@@ -249,8 +239,7 @@ namespace
 	constexpr std::uint32_t kAOTraceSmoothNormals = 512u;  // (47j) TraceAOCS: RTAO: Smooth Normals (AONormalPrepCS)
 	constexpr std::uint32_t kAOTraceSmoothNormals2 = 1024u;  // (47k) TraceAOCS: RTAO: Smooth Normals v2 (offset along Ns, projection)
 	constexpr std::uint32_t kAOFlagNormalDebug = 128u;       // (47k) RTAOCompositeCS: t5 holds this frame's Smooth Normals debug view
-	// (47l) RTAO: Blue-Noise Rays / Temporal v2.
-	constexpr std::uint32_t kAOTraceBlueNoise = 2048u;       // TraceAOCS: the directions from the blue noise (t6)
+	// (47l) RTAO: Temporal v2. (TraceAOCS 2048 = the removed Blue-Noise Rays: never set since 47m.)
 	constexpr std::uint32_t kAOFlagTemporalV2 = 256u;        // RTAOCommon.hlsli: Temporal v2 (RTAOTemporalCS RTAO_TEMPORAL_V2, the filters' world sigma)
 	constexpr std::uint32_t kAOFlagGeometryValid = 512u;     // RTAOCommon.hlsli: last frame's geometry / history lengths valid
 	constexpr float kAOMinHistoryWeight = 0.1f;   // this frame's weight never below 1 / 10 (a = max(1 / (n + 1), 0.1))
@@ -446,7 +435,7 @@ void RayTracing::PrepareOnCellEvent()
 			cellEventLog = {};
 		}
 	}
-	if (!settings.Enabled || !settings.LoadingPump || !settings.PrepareOnCellEvents || cellEventBroken)
+	if (!settings.Enabled || cellEventBroken)  // (47m) loading pump and prepare on cell load: always on
 		return;
 	++cellEventLog.events;
 	const char* skip = nullptr;
@@ -479,7 +468,7 @@ void RayTracing::PrepareOnCellEvent()
 	if (!ok) {
 		// The scene may be half-updated: Ray Tracing goes off at the next world frame (Disable binds D3D11 state: not from here).
 		cellEventBroken = true;
-		cellEventFault = std::format("fault 0x{:08X} while preparing a cell behind the loading screen (Prepare On Cell Load turned off for this session)", code);
+		cellEventFault = std::format("fault 0x{:08X} while preparing a cell behind the loading screen (preparing on cell load stopped for this session)", code);
 		logger::error("[RayTracing] {}", cellEventFault);
 	}
 }
@@ -537,7 +526,7 @@ void RayTracing::CellEventStep(float a_budgetMs)
 
 float RayTracing::FadeInFactor(double a_sinceCloseMs) const
 {
-	if (!settings.FadeInBudgets || !faderOpen.load() || a_sinceCloseMs < 0.0 || a_sinceCloseMs > kBlackMaxMs)
+	if (!faderOpen.load() || a_sinceCloseMs < 0.0 || a_sinceCloseMs > kBlackMaxMs)
 		return 0.0f;
 	if (a_sinceCloseMs <= kFadeFullMs)
 		return 1.0f;
@@ -669,8 +658,6 @@ void RayTracing::UpdatePhase()
 		lateHold = false;
 		inTransition = true;
 		fade = 0.0f;
-		beamGuards.clear();  // light pointers of the place left behind
-		excludedBeams.clear();
 		pointSelector.ForgetHistory();  // (46s) per-light positions / groups of the place left behind
 		scene.SetHold(true);
 		for (auto& entry : transitionLog)
@@ -701,12 +688,12 @@ void RayTracing::UpdatePhase()
 	}
 	const double sinceClose = static_cast<double>(now - warmUpStart) * QpcMs();
 	// (46k) The Fader Menu stays open through the whole fade-in and cannot tell when the fade starts: only the first
-	// BlackWindowMs after the loading screen closed count as black (large budgets); 46i counted up to 4 s (pump off).
-	const double blackLimit = settings.LoadingPump ? std::clamp(static_cast<double>(settings.BlackWindowMs), 0.0, kBlackMaxMs) : kBlackMaxMs;
+	// BlackWindowMs after the loading screen closed count as black (large budgets).
+	const double blackLimit = std::clamp(static_cast<double>(settings.BlackWindowMs), 0.0, kBlackMaxMs);
 	if (phase == Phase::Black && (!faderOpen.load() || sinceClose > blackLimit))
 		phase = Phase::WarmUp;
 	blackScreen = inTransition && !open && phase != Phase::Loading && faderOpen.load() && sinceClose <= blackLimit;
-	scene.SetLoadGate(settings.LoadingPump, Arrived());  // (46k)
+	scene.SetLoadGate(true, Arrived());  // (46k) the loading pump: always on (47m)
 
 	if ((phase == Phase::Black || phase == Phase::WarmUp) && !handedOff) {
 		// (46k) Only once the destination itself is captured and built (46h handed off the place left: its stats were
@@ -800,23 +787,22 @@ void RayTracing::TransitionFrame()
 	const bool visible = phase == Phase::WarmUp && !blackScreen;
 	// (46k) Budgets. The loading pump (behind the loading screen): its own CPU per frame (LoadingPumpMs), split between the
 	// capture, the characters, the pools and the builds. Visible frames: what playing uses (never bulk work on a visible
-	// frame); 46i's moderate ones with the pump off.
-	const bool pump = settings.LoadingPump;
+	// frame). (47m) The pump is always on (46i's moderate budgets without it are gone).
 	const float pumpMs = std::clamp(settings.LoadingPumpMs, 2.0f, 32.0f);
 	float capture = kBlackCaptureBudgetMs, charactersMs = kBlackCaptureBudgetMs, prewarmMs = 4.0f, buildMs = kBlackBuildCpuMs;
 	std::uint32_t charactersMax = 64u, buildTriangles = kLoadingBuildTriangles, buildCount = kLoadingMaxBuilds;
 	if (loading) {
-		capture = pump ? pumpMs * 0.4f : kLoadingCaptureBudgetMs;
-		charactersMs = pump ? pumpMs * 0.15f : kLoadingCaptureBudgetMs;
-		prewarmMs = pump ? std::min(2.0f, pumpMs * 0.15f) : 4.0f;
-		buildMs = kLoadingBuildCpuMs;  // pump: what is left of its budget (below)
+		capture = pumpMs * 0.4f;
+		charactersMs = pumpMs * 0.15f;
+		prewarmMs = std::min(2.0f, pumpMs * 0.15f);
+		buildMs = kLoadingBuildCpuMs;  // what is left of the pump's budget (below)
 	} else if (visible) {
-		capture = pump ? kCaptureBudgetMs : kWarmUpCaptureBudgetMs;
-		charactersMs = pump ? 1.0f : 2.0f;
-		charactersMax = pump ? 6u : 12u;
+		capture = kCaptureBudgetMs;
+		charactersMs = 1.0f;
+		charactersMax = 6u;
 		prewarmMs = 0.0f;
-		buildMs = pump ? 2.0f : kWarmUpBuildCpuMs;
-		buildTriangles = pump ? kBuildBudget : kBuildBudget * 2;
+		buildMs = 2.0f;
+		buildTriangles = kBuildBudget;
 		buildCount = 64u;
 		// (46n) The fade-in (the Fader Menu still open): the picture is almost black for its first second and dim until about 3 s.
 		// The budgets start at the black screen's and shrink to the visible ones over that time.
@@ -853,7 +839,7 @@ void RayTracing::TransitionFrame()
 	cpuLast.characters = static_cast<float>(static_cast<double>(Qpc() - charactersStart) * QpcMs());
 	if (prewarmMs > 0.0f)
 		backend.Prewarm(prewarmMs, settings.Characters);
-	if (loading && pump)
+	if (loading)
 		buildMs = std::max(pumpMs - static_cast<float>(static_cast<double>(Qpc() - start) * QpcMs()), 1.0f);
 	backend.BuildOnly(buildTriangles, buildCount, buildMs);
 	backend.Tick();
@@ -923,19 +909,17 @@ void RayTracing::TransitionLogFlush()
 		handOffSummary.empty() ? std::string("no hand-off") : handOffSummary);
 	// (46k) The loading pump and the loading-screen gate of this transition.
 	const auto& gate = scene.GetLoadGateStats();
-	logger::info("[RayTracing] Loading pump ({}, black window {:.0f} ms): {} frames, RT CPU {:.0f} ms ({} frames on another thread, {} in the middle of the teleport: "
-				 "skipped); {} fully-loaded cells reported, {} cells captured behind the loading screen ({} after their event, the rest once the player "
-				 "had arrived), {} checks found a cell's 3D not in place yet",
-		settings.LoadingPump ? std::format("on, {:.0f} ms per frame", settings.LoadingPumpMs) : std::string("off"),
-		settings.LoadingPump ? static_cast<double>(settings.BlackWindowMs) : kBlackMaxMs, pumpFrames, pumpCpuTotalMs, pumpForeignFrames, pumpMidTeleport,
-		gate.noted, gate.captured, gate.byEvent, gate.unsettledTotal);
+	logger::info("[RayTracing] Loading pump ({:.0f} ms per frame, black window {:.0f} ms): {} frames, RT CPU {:.0f} ms ({} frames on another thread, {} in the middle "
+				 "of the teleport: skipped); {} fully-loaded cells reported, {} cells captured behind the loading screen ({} after their event, the rest once the "
+				 "player had arrived), {} checks found a cell's 3D not in place yet",
+		settings.LoadingPumpMs, static_cast<double>(settings.BlackWindowMs), pumpFrames, pumpCpuTotalMs, pumpForeignFrames, pumpMidTeleport, gate.noted, gate.captured,
+		gate.byEvent, gate.unsettledTotal);
 	// (46n) The preparation from the cell events (main thread, behind the loading screen) and the fade-in budgets.
 	{
 		const auto& c = cellEventLog;
-		logger::info("[RayTracing] Cell-event preparation ({}, {:.0f} ms per event; fade-in budgets {}): {} events, {} steps run ({:.0f} ms CPU, longest {:.1f} ms, "
+		logger::info("[RayTracing] Cell-event preparation ({}, {:.0f} ms per event): {} events, {} steps run ({:.0f} ms CPU, longest {:.1f} ms, "
 					 "{} in the middle of the teleport), {} events on another thread, {} skipped{}; {} cells captured, {} shapes, {} BLAS built in the steps",
-			!settings.PrepareOnCellEvents ? "off" : (cellEventBroken ? "off after a fault" : "on"), settings.CellEventMs, settings.FadeInBudgets ? "on" : "off",
-			c.events, c.steps, c.cpuMs, c.maxMs, c.midTeleport, cellEventForeign.exchange(0, std::memory_order_relaxed), c.skipped,
+			cellEventBroken ? "off after a fault" : "on", settings.CellEventMs, c.events, c.steps, c.cpuMs, c.maxMs, c.midTeleport, cellEventForeign.exchange(0, std::memory_order_relaxed), c.skipped,
 			c.lastSkip.empty() ? std::string() : std::format(" (last: {})", c.lastSkip), c.cellsCaptured, c.shapes, c.builds);
 		cellEventLog = {};
 	}
@@ -944,57 +928,25 @@ void RayTracing::TransitionLogFlush()
 	transitionLogSlot = -1;
 }
 
-void RayTracing::UpdateBeamGuard()
+void RayTracing::UpdateBeamShares()
 {
-	// (46g) Window beams whose traced cone is (almost) fully blocked are not believed: with the room's own shell in the way
-	// the beam's patch would vanish. 30 read-backs over 97 % (with enough sampled pixels) -> no source for 600 frames (the
-	// engine's shadow map stays for that beam), then it is tried again.
+	// (46n) The window beams' sampled-cone counters (read back a few frames later) feed the warm-up report. (47m) The 46g
+	// Window Beam Guard that also read them is gone (it was off by default since 46o).
 	const auto& stats = backend.GetStats();
 	const std::uint32_t frame = globals::state->frameCount;
 	if (stats.beamSamples != beamSamplesSeen) {
 		beamSamplesSeen = stats.beamSamples;
-		for (std::uint32_t slot = 0; slot < lastSlotBeams.size(); ++slot) {
-			const auto* light = lastSlotBeams[slot];
-			if (!light)
-				continue;
-			const std::uint32_t traced = stats.beamTraced[slot], blocked = stats.beamBlocked[slot];
-			if (beamSharePending && frame - beamShareFrom < 0x80000000u) {  // (46n) the warm-up report
+		if (beamSharePending && frame - beamShareFrom < 0x80000000u) {  // (46n) the warm-up report
+			for (std::uint32_t slot = 0; slot < lastSlotBeams.size(); ++slot) {
+				const auto* light = lastSlotBeams[slot];
+				if (!light)
+					continue;
 				auto& share = beamShares[light];
-				share.traced += traced;
-				share.blocked += blocked;
-			}
-			if (traced < 64)
-				continue;  // too little of the cone on screen to judge
-			auto& guard = beamGuards[light];
-			if (guard.implausible)
-				continue;
-			guard.over = static_cast<double>(blocked) > 0.97 * static_cast<double>(traced) ? guard.over + 1 : 0;
-			if (guard.over >= 30) {
-				guard.implausible = true;
-				guard.until = frame + 600;
-				++beamsImplausible;
-				logger::info("[RayTracing] Window beam {} looks implausible ({} of {} sampled cone pixels blocked): the engine's shadow map is kept for it "
-							 "for 600 frames (Point Light Shadows > Window Beam Guard)",
-					static_cast<const void*>(light), blocked, traced);
+				share.traced += stats.beamTraced[slot];
+				share.blocked += stats.beamBlocked[slot];
 			}
 		}
 	}
-	excludedBeams.clear();
-	for (auto it = beamGuards.begin(); it != beamGuards.end();) {
-		auto& guard = it->second;
-		if (guard.implausible && frame - guard.until < 0x80000000u) {
-			// Retry: believed again until the counters say otherwise.
-			guard.implausible = false;
-			guard.over = 0;
-		}
-		if (guard.implausible)
-			excludedBeams.push_back(it->first);
-		if (!guard.implausible && guard.over == 0 && beamGuards.size() > 256)
-			it = beamGuards.erase(it);
-		else
-			++it;
-	}
-	std::sort(excludedBeams.begin(), excludedBeams.end());
 	// (46n) After the warm-up of an interior: the blocked share of every beam that was sampled, once.
 	if (beamSharePending && frame - beamShareUntil < 0x80000000u) {
 		beamSharePending = false;
@@ -1122,9 +1074,8 @@ void RayTracing::UpdateCharacters()
 	}
 	// (45j) Alpha-tested parts (fur trims, cut-out cloth; hair when Hair is ray traced) whenever the
 	// alpha pipeline exists; a change of the first three re-captures the characters.
-	// (46m) Read lanes, scan cache, merged BLASes (a change of the last captures the characters again).
-	characters.Configure(settings.PhysicsParts, settings.Hair, backend.SkinAlphaAvailable(), settings.FirstPersonPlayer, settings.CharactersParallel,
-		settings.CharactersScanCache, settings.CharactersMerge);
+	// (46m) Read lanes, scan cache and merged BLASes are always on (47m).
+	characters.Configure(settings.PhysicsParts, settings.Hair, backend.SkinAlphaAvailable(), settings.FirstPersonPlayer);
 }
 
 
@@ -1247,28 +1198,10 @@ void RayTracing::LoadSettings(json& o_json)
 				return a_default;
 			}
 		};
-		settings.PrepareOnCellEvents = read("PrepareOnCellEvents", defaults.PrepareOnCellEvents);
 		settings.CellEventMs = read("CellEventMs", defaults.CellEventMs);
-		settings.FadeInBudgets = read("FadeInBudgets", defaults.FadeInBudgets);
 		settings.PointLightsBeamSoftness = read("PointLightsBeamSoftness", defaults.PointLightsBeamSoftness);  // (46o)
-		settings.ParallelBlasBuilds = read("ParallelBlasBuilds", defaults.ParallelBlasBuilds);  // (46p)
-		settings.EarlyPrepIndoors = read("EarlyPrepIndoors", defaults.EarlyPrepIndoors);  // (47j)
-		settings.HighPriorityQueue = read("HighPriorityQueue", defaults.HighPriorityQueue);
-		settings.SubmitWorker = read("SubmitWorker", defaults.SubmitWorker);  // (46q)
-		settings.BuildGpuBudget = read("BuildGpuBudget", defaults.BuildGpuBudget);
-		settings.BuildGpuBudgetMs = std::clamp(read("BuildGpuBudgetMs", defaults.BuildGpuBudgetMs), 0.25f, 4.0f);
-		settings.GroupBuildsPerFrame = std::clamp(read("GroupBuildsPerFrame", defaults.GroupBuildsPerFrame), 1, 16);
-		settings.GroupGraceMs = std::clamp(read("GroupGraceMs", defaults.GroupGraceMs), 0.0f, 10000.0f);
-		settings.CarrierShadows = read("CarrierShadows", defaults.CarrierShadows);
 		settings.CarrierClearance = std::clamp(read("CarrierClearance", defaults.CarrierClearance), 0.0f, 64.0f);
-		settings.PointLightsSteady = read("PointLightsSteady", defaults.PointLightsSteady);  // (46s)
-		settings.PointLightsMergeHysteresis = read("PointLightsMergeHysteresis", defaults.PointLightsMergeHysteresis);
 		settings.PointLightsMeshless = std::clamp(read("PointLightsMeshless", defaults.PointLightsMeshless), 0, 2);
-		settings.PointLightsDirectFills = read("PointLightsDirectFills", defaults.PointLightsDirectFills);  // (46x)
-		settings.PointLightsWiderBeams = read("PointLightsWiderBeams", defaults.PointLightsWiderBeams);
-		settings.PointLightsPortals = read("PointLightsPortals", defaults.PointLightsPortals);
-		settings.PointLightsRoomBoxes = read("PointLightsRoomBoxes", defaults.PointLightsRoomBoxes);
-		settings.PointLightsPluginFillFixtures = read("PointLightsPluginFillFixtures", defaults.PointLightsPluginFillFixtures);
 		// (46t) RTAO
 		settings.AODetail = read("AODetail", defaults.AODetail);
 		settings.AODetailStrength = read("AODetailStrength", defaults.AODetailStrength);
@@ -1286,23 +1219,21 @@ void RayTracing::LoadSettings(json& o_json)
 		settings.AOCharacterSelfFix = read("AOCharacterSelfFix", defaults.AOCharacterSelfFix);
 		settings.SunDepthCheckTranslucent = read("SunDepthCheckTranslucent", defaults.SunDepthCheckTranslucent);
 		settings.PointShadowsOnWater = read("PointShadowsOnWater", defaults.PointShadowsOnWater);
-		settings.PointShadowsWaterLodSkip = read("PointShadowsWaterLodSkip", defaults.PointShadowsWaterLodSkip);  // (47l)
 		settings.AOSmoothNormals = read("AOSmoothNormals", defaults.AOSmoothNormals);  // (47j)
 		settings.AOSmoothNormals2 = read("AOSmoothNormals2", defaults.AOSmoothNormals2);  // (47k)
-		settings.AOBlueNoise = read("AOBlueNoise", defaults.AOBlueNoise);  // (47l)
 		settings.AOTemporalV2 = read("AOTemporalV2", defaults.AOTemporalV2);  // (47l)
 		settings.FoliageSway = read("FoliageSway", defaults.FoliageSway);  // (47l)
 	}
-	// (46o) Window Beam Guard: off once for settings saved before 46o (its rule misfired on beams that mostly hit walls).
-	if (loadedVersion < 6 && settings.PointLightsBeamGuard) {
-		settings.PointLightsBeamGuard = false;
-		logger::info("[RayTracing] Window Beam Guard switched off (46o default; tick it again in Point Light Shadows if wanted)");
+	// (47m) Skip the Game's Shadow Maps for RT-Shadowed Lights: on once for settings saved before 47m (its new default).
+	if (loadedVersion < 7) {
+		if (!settings.PointLightsSkipShadowMaps)
+			logger::info("[RayTracing] Skip the Game's Shadow Maps for RT-Shadowed Lights switched on (47m default; untick it in Point Light Shadows > Advanced if wanted)");
+		settings.PointLightsSkipShadowMaps = true;
 	}
 	if (settings.Denoiser == 1)
 		logger::info("[RayTracing] Denoiser Temporal was removed: Penumbra");
 	settings.Denoiser = ValidDenoiser(settings.Denoiser);
 	settings.SettingsVersion = Settings{}.SettingsVersion;
-	Util::LightCensus::SetWiderWindowBeams(settings.PointLightsWiderBeams);  // (46x) captures follow it from the start
 	settings.QualityLevel = std::clamp(settings.QualityLevel, 0, static_cast<int>(Quality::Count) - 1);
 	settings.CustomBaseRays = std::clamp(settings.CustomBaseRays, 1, 4);
 	settings.CustomExtraRays = std::clamp(settings.CustomExtraRays, 0, 8);
@@ -1349,28 +1280,10 @@ void RayTracing::SaveSettings(json& o_json)
 {
 	o_json = settings;
 	// (46n) Outside the macro (it takes at most 64 members).
-	o_json["PrepareOnCellEvents"] = settings.PrepareOnCellEvents;
 	o_json["CellEventMs"] = settings.CellEventMs;
-	o_json["FadeInBudgets"] = settings.FadeInBudgets;
 	o_json["PointLightsBeamSoftness"] = settings.PointLightsBeamSoftness;  // (46o)
-	o_json["ParallelBlasBuilds"] = settings.ParallelBlasBuilds;  // (46p)
-	o_json["EarlyPrepIndoors"] = settings.EarlyPrepIndoors;  // (47j)
-	o_json["HighPriorityQueue"] = settings.HighPriorityQueue;
-	o_json["SubmitWorker"] = settings.SubmitWorker;  // (46q)
-	o_json["BuildGpuBudget"] = settings.BuildGpuBudget;
-	o_json["BuildGpuBudgetMs"] = settings.BuildGpuBudgetMs;
-	o_json["GroupBuildsPerFrame"] = settings.GroupBuildsPerFrame;
-	o_json["GroupGraceMs"] = settings.GroupGraceMs;
-	o_json["CarrierShadows"] = settings.CarrierShadows;
 	o_json["CarrierClearance"] = settings.CarrierClearance;
-	o_json["PointLightsSteady"] = settings.PointLightsSteady;  // (46s)
-	o_json["PointLightsMergeHysteresis"] = settings.PointLightsMergeHysteresis;
 	o_json["PointLightsMeshless"] = settings.PointLightsMeshless;
-	o_json["PointLightsDirectFills"] = settings.PointLightsDirectFills;  // (46x)
-	o_json["PointLightsWiderBeams"] = settings.PointLightsWiderBeams;
-	o_json["PointLightsPortals"] = settings.PointLightsPortals;
-	o_json["PointLightsRoomBoxes"] = settings.PointLightsRoomBoxes;
-	o_json["PointLightsPluginFillFixtures"] = settings.PointLightsPluginFillFixtures;
 	o_json["AODetail"] = settings.AODetail;  // (46t)
 	o_json["AODetailStrength"] = settings.AODetailStrength;
 	o_json["AODetailLength"] = settings.AODetailLength;
@@ -1385,12 +1298,10 @@ void RayTracing::SaveSettings(json& o_json)
 	o_json["AOCharacterSelfFix"] = settings.AOCharacterSelfFix;  // (47h)
 	o_json["AOSmoothNormals"] = settings.AOSmoothNormals;  // (47j)
 	o_json["AOSmoothNormals2"] = settings.AOSmoothNormals2;  // (47k)
-	o_json["AOBlueNoise"] = settings.AOBlueNoise;  // (47l)
 	o_json["AOTemporalV2"] = settings.AOTemporalV2;  // (47l)
 	o_json["FoliageSway"] = settings.FoliageSway;  // (47l)
 	o_json["SunDepthCheckTranslucent"] = settings.SunDepthCheckTranslucent;
 	o_json["PointShadowsOnWater"] = settings.PointShadowsOnWater;
-	o_json["PointShadowsWaterLodSkip"] = settings.PointShadowsWaterLodSkip;  // (47l)
 }
 
 void RayTracing::RestoreDefaultSettings()
@@ -1590,7 +1501,6 @@ bool RayTracing::EnsureBackend()
 	}
 	backendTried = true;
 	std::string reason;
-	backend.SetQueuePriorityHigh(settings.HighPriorityQueue);  // (46p) read at start-up only
 	try {
 		if (!backend.Initialize(globals::d3d::device, globals::d3d::context, reason)) {
 			status = Status::Unavailable;
@@ -1914,17 +1824,15 @@ bool RayTracing::EnsureD3D11Resources(const D3D11_TEXTURE2D_DESC& a_maskDesc)
 
 	maskDesc = a_maskDesc;
 	d3d11Bytes = static_cast<std::uint64_t>(desc.Width) * desc.Height * 4;
-	// (46q) The debug texture: only while a debug view is on (Size Buffers to Render Resolution; off: always, as 46p).
-	if (!EnsureDebugColor() && !globals::features::upscaling.settings.renderResBuffers) {
-		Disable(Status::Unavailable, "could not create the debug texture");
-		return false;
-	}
+	// (46q) The debug texture: only while a debug view is on (Size Buffers to Render Resolution, always since 47m); a failure
+	// to make it is not fatal (the debug view then shows nothing).
+	EnsureDebugColor();
 	return true;
 }
 
 bool RayTracing::EnsureDebugColor()
 {
-	const bool wanted = !globals::features::upscaling.settings.renderResBuffers || debugView != DebugView::Off || aoDebugView != AODebugView::Off;
+	const bool wanted = debugView != DebugView::Off || aoDebugView != AODebugView::Off;
 	if (!wanted) {
 		if (debugColor) {
 			d3d11Bytes -= std::min<std::uint64_t>(d3d11Bytes, static_cast<std::uint64_t>(maskDesc.Width) * maskDesc.Height * 4);
@@ -1980,7 +1888,7 @@ void RayTracing::LatchFrame()
 	// after the trace (or with the fallback, should it not run after all).
 	skippedMaps.clear();
 	skippedLights.clear();
-	skipLatched = settings.Enabled && PointLightsOn() && InteriorsOn() && settings.PointLightsNative &&
+	skipLatched = settings.Enabled && PointLightsOn() && InteriorsOn() &&
 	              settings.PointLightsSkipShadowMaps && hooksInstalled && status == Status::Active && phase == Phase::Play && !loadingOpen.load() &&
 	              interiorTracedLastFrame && Util::IsInterior() && backend.HasFreeContext() && scene.HasCoverage() && !skipCandidates.empty();
 	auto* sky = globals::game::sky;
@@ -2002,12 +1910,9 @@ void RayTracing::RunEarlyPrep()
 	// game's update is finished; rendering does not move bones), so nothing becomes stale; only the TLAS and
 	// the trace are left for Prepass. Nothing waits. Whenever a condition fails (loading screens, the warm-up after
 	// them, no exterior sky) Prepass does all of it later in the frame (the fallback).
-	// (46p) Per-frame backend switches: Parallel BLAS Builds, Keep Our GPU Memory Resident (Upscaling > Save GPU Memory).
+	// (46p) Per-frame backend switches: Keep Our GPU Memory Resident (Upscaling > Save GPU Memory).
 	if (backend.IsReady()) {
-		backend.SetParallelBuilds(settings.ParallelBlasBuilds);
-		backend.SetSubmitWorker(settings.SubmitWorker);  // (46q)
-		backend.SetBuildBudget(settings.BuildGpuBudget, settings.BuildGpuBudgetMs, static_cast<std::uint32_t>(settings.GroupBuildsPerFrame), settings.GroupGraceMs);
-		backend.SetResidencyHigh(globals::features::upscaling.settings.keepGpuMemoryResident);
+		backend.SetResidencyHigh(true);  // fixed (47m): Keep Our GPU Memory Resident
 	}
 	earlyThisFrame = false;
 	charactersUpdatedEarly = false;
@@ -2021,10 +1926,10 @@ void RayTracing::RunEarlyPrep()
 		backend.AbandonPrepared();  // a frame that never reached its Prepass
 	auto* sky = globals::game::sky;
 	// (47j) Early RT Prep Indoors: in an interior traced by Ray Tracing (its own interior frame), once the interior is in the scene
-	// with its captured box (the characters are taken within that box, as RunInteriorFrame does). Off = 47i (outdoors only).
+	// with its captured box (the characters are taken within that box, as RunInteriorFrame does). Always since 47m.
 	const bool interior = Util::IsInterior();
 	float interiorRect[4]{};
-	const bool earlyIndoors = interior && settings.EarlyPrepIndoors && InteriorWanted() && scene.HasCoverage() && scene.GetInteriorRect(interiorRect);
+	const bool earlyIndoors = interior && InteriorWanted() && scene.HasCoverage() && scene.GetInteriorRect(interiorRect);
 	if (!settings.Enabled || status != Status::Active || phase != Phase::Play || loadingOpen.load() || !backend.IsReady() ||
 		(interior ? !earlyIndoors : (!sky || sky->mode.get() != RE::Sky::Mode::kFull)) || !backend.HasFreeContext())
 		return;
@@ -2220,20 +2125,15 @@ void RayTracing::SwitchedOffFrame()
 				scene.ReleaseAll(backend);
 				backend.OnSwitchedOff();  // (46i) clean pools for the next switch-on (see GpuArena::lastAskQpc)
 			}
-			// (46p) Save GPU Memory: the shadow-mask work textures, the denoisers, the shared textures, scratch and the TLAS go
-			// too (made again on the next switch-on; D3D12 ones behind the fence).
-			if (globals::features::upscaling.settings.saveVramFreeRtWhenOff) {
-				ReleaseD3D11Resources();
-				if (backend.IsReady())
-					backend.ReleaseIdleResources();
-			}
-			// (46i) Switching on again starts like a fresh entry: the interior's entry time, the beam guards of
-			// this place, the stuck-state diagnostic.
+			// (46p) Save GPU Memory (always, 47m): the shadow-mask work textures, the denoisers, the shared textures, scratch and
+			// the TLAS go too (made again on the next switch-on; D3D12 ones behind the fence).
+			ReleaseD3D11Resources();
+			if (backend.IsReady())
+				backend.ReleaseIdleResources();
+			// (46i) Switching on again starts like a fresh entry: the interior's entry time, the stuck-state diagnostic.
 			interiorCell = nullptr;
 			interiorReadyPending = false;
 			interiorSceneLogPending = false;
-			beamGuards.clear();
-			excludedBeams.clear();
 			waitingSinceQpc = 0;
 			waitingLogged = false;
 			status = Status::Off;
@@ -2327,11 +2227,11 @@ void RayTracing::Reset()
 		return;
 	}
 	if (!settings.Enabled) {
-		if (status != Status::Off && settings.LoadingPump)
+		if (status != Status::Off)
 			SwitchedOffFrame();  // (46k) switched off behind the loading screen: the same clean reset as on a world frame
 		return;
 	}
-	if (!settings.LoadingPump || status == Status::Unavailable || status == Status::Failed)
+	if (status == Status::Unavailable || status == Status::Failed)
 		return;
 	{
 		std::scoped_lock lock(eventsMutex);
@@ -2352,12 +2252,9 @@ void RayTracing::LoadingPump()
 	combinedThisFrame = false;
 	sunMaskWrittenThisFrame = false;  // (47h)
 	pending.active = false;
-	// (46p) Per-frame backend switches: Parallel BLAS Builds, Keep Our GPU Memory Resident (Upscaling > Save GPU Memory).
+	// (46p) Per-frame backend switches: Keep Our GPU Memory Resident (Upscaling > Save GPU Memory).
 	if (backend.IsReady()) {
-		backend.SetParallelBuilds(settings.ParallelBlasBuilds);
-		backend.SetSubmitWorker(settings.SubmitWorker);  // (46q)
-		backend.SetBuildBudget(settings.BuildGpuBudget, settings.BuildGpuBudgetMs, static_cast<std::uint32_t>(settings.GroupBuildsPerFrame), settings.GroupGraceMs);
-		backend.SetResidencyHigh(globals::features::upscaling.settings.keepGpuMemoryResident);
+		backend.SetResidencyHigh(true);  // fixed (47m): Keep Our GPU Memory Resident
 	}
 	earlyThisFrame = false;
 	charactersUpdatedEarly = false;
@@ -2662,7 +2559,7 @@ void RayTracing::PublishCpuSplit()
 		detail.plRejIntensity = ps.byReason[2];
 		detail.plKept = ps.kept;
 		detail.plChurn = pointThisFrame ? stats.pointChurnPerFrame : -1;
-		detail.plBeamsExcluded = static_cast<std::uint32_t>(excludedBeams.size());
+		detail.plBeamsExcluded = 0;  // fixed (47m): the Window Beam Guard is gone
 		if (pointThisFrame) {  // (46x)
 			detail.plFillDirect = static_cast<int>(ps.fillDirectAimed + ps.fillDirectPoint);
 			detail.plFillAmbient = static_cast<int>(ps.fillAmbient);
@@ -2735,7 +2632,7 @@ void RayTracing::PublishCpuSplit()
 			q.subMaxLagMs = sub.maxLagMs;
 			q.subMaxCallMs = sub.maxCallMs;
 			const auto& bud = backend.GetBudgetSample();
-			q.budOn = settings.BuildGpuBudget ? 1 : 0;
+			q.budOn = 1;  // fixed (47m): builds always budgeted by GPU time
 			q.budMsPerMtri = bud.msPerMillionTris;
 			q.budTris = bud.triBudget;
 			q.budStaticQueued = bud.staticDeferred;
@@ -2837,7 +2734,7 @@ void RayTracing::RunFrame()
 	auto* denoiserUi = globals::game::ui;
 	const bool denoiserCalm = denoiserStableFrames >= 120 && phase == Phase::Play && !loadingOpen.load() && denoiserUi && !denoiserUi->GameIsPaused() &&
 	                          !denoiserUi->IsMenuOpen(RE::MapMenu::MENU_NAME);
-	if (globals::features::upscaling.settings.saveVramFreeRtWhenOff && denoiserCalm) {
+	if (denoiserCalm) {  // (47m) always (was Save GPU Memory > Free Ray Tracing Memory When Off)
 		if (denoiser != DenoiserMode::Penumbra && (denoiseTiles.texture || history4[0].texture))
 			ReleaseDenoiser();
 		if (denoiser != DenoiserMode::Sigma && (sigma || sigmaOut.texture))
@@ -2993,7 +2890,6 @@ void RayTracing::RunFrame()
 	FillWind(input);  // (47l)
 	input.skinBones = &skinBones;
 	input.deferWait = true;  // (45l) FinishFrame waits (after the other features' prepasses)
-	input.splitSun = settings.SplitTraceSync;  // (46m) used only with point lights traced too
 	// (46b) Point-light shadows: this frame's sources, traced right after the sun in the same submission.
 	{
 		const std::int64_t pointStart = Qpc();
@@ -3860,7 +3756,6 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		return false;
 
 	RayTracingPointLights::Config config;
-	config.native = settings.PointLightsNative;
 	config.keepSSPLS = settings.PointLightsKeepSSPLS;
 	config.ssplsNonRT = settings.PointLightsSSPLSNonRT;  // (46y)
 	config.waterBed = settings.PointShadowsOnWater;  // (47h)
@@ -3875,19 +3770,11 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	// (46d) The player's lights (never shadowed by the player's own body) and ownerless spell / effect lights.
 	config.player = settings.PointLightsPlayer;
 	config.effects = settings.PointLightsEffects;
-	config.stable = settings.PointLightsStable;  // (46g)
 	// (46s)
-	config.steady = settings.PointLightsSteady;
-	config.mergeHysteresis = settings.PointLightsMergeHysteresis;
 	config.meshless = static_cast<std::uint32_t>(std::clamp(settings.PointLightsMeshless, 0, 2));
-	// (46x) Fill classes, the window-beam rule, portals.
-	config.directFills = settings.PointLightsDirectFills;
+	// (46x) Direct fills' emitter. (47m) Native shadow lights, stable selection, steady flickering lights, merge hysteresis, direct
+	// fills, plugin-only fill fixtures, wider window beams, portals and room boxes are always on.
 	config.directEmitter = std::min(std::max(settings.PointLightsSize, 0.0f) * 4.0f, 64.0f);
-	config.pluginFillFixtures = settings.PointLightsPluginFillFixtures;
-	Util::LightCensus::SetWiderWindowBeams(settings.PointLightsWiderBeams);
-	config.beamRadius = Util::LightCensus::WindowBeamRadius();
-	config.portals = settings.PointLightsPortals;
-	config.roomBoxes = settings.PointLightsRoomBoxes;
 	double reachPoint[3]{};
 	if (auto* player = RE::PlayerCharacter::GetSingleton()) {
 		const auto p = player->GetPosition();
@@ -3898,16 +3785,15 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 			config.reachPoint = reachPoint;
 		}
 	}
-	UpdateBeamGuard();
-	config.excludedBeams = settings.PointLightsBeamGuard && !excludedBeams.empty() ? &excludedBeams : nullptr;
+	UpdateBeamShares();
 	config.forced = a_interior && !skippedLights.empty() ? &skippedLights : nullptr;
 	// (46e) The characters in this frame's TLAS: a light one of them carries skips that character's body.
 	config.owners = (a_input.skinDraws && !a_input.skinDraws->empty()) ? &characters.Owners() : nullptr;
-	// (46q) Carrier Casts Shadows: the player in third person is its own lights' carrier too (first person: as 46p, the player's
-	// body is never tested against its own lights; the first-person arm would cover most of the view).
+	// (46q) Carrier Casts Shadows (always, 47m): the player in third person is its own lights' carrier too (first person: as 46p,
+	// the player's body is never tested against its own lights; the first-person arm would cover most of the view).
 	{
 		auto* playerCamera = RE::PlayerCamera::GetSingleton();
-		config.playerCarrier = settings.CarrierShadows && playerCamera && !playerCamera->IsInFirstPerson();
+		config.playerCarrier = playerCamera && !playerCamera->IsInFirstPerson();
 	}
 	const double camera[3] = { a_camX, a_camY, a_camZ };
 	const float worldRect[4] = { static_cast<float>(a_traceRect[0] + a_camX), static_cast<float>(a_traceRect[1] + a_camY),
@@ -3917,7 +3803,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	float viewProjF[16];
 	std::memcpy(viewProjF, &viewProj, sizeof(viewProjF));
 	const std::uint32_t scan = pointSelector.Select(config, camera, viewProjF, worldRect, globals::state->frameCount, pointSources.data());
-	lastSlotBeams = pointSelector.SlotBeams();  // (46g) the beam guard reads the counters of these slots a few frames later
+	lastSlotBeams = pointSelector.SlotBeams();  // (46g) the warm-up report reads the counters of these slots a few frames later
 	pointEmitterMask = pointSelector.EmitterSlots();  // (46x)
 	pointEmitterRadius = config.directEmitter;
 	if (scan == 0)
@@ -3934,16 +3820,11 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 		if (auto* playerCamera = RE::PlayerCamera::GetSingleton(); playerCamera && playerCamera->IsInFirstPerson())
 			flags |= kPointFlagFirstPerson;
 	}
-	if (settings.PointLightsStable)
-		flags |= kPointFlagSticky;  // (46g)
+	flags |= kPointFlagSticky;  // (46g) Stable Light Selection: fixed (47m)
 	// (46y) Screen-Space Shadows for Non-RT Casters: the trace marks the pixels whose surface is a traced caster (PLIdx.w bit 7).
 	if (settings.PointLightsSSPLSNonRT && globals::features::screenSpacePointLightShadows.loaded && globals::features::screenSpacePointLightShadows.settings.Enable)
 		flags |= kPointFlagRtSurface;
-	const int beamCull = EffectiveBeamCull();  // (46n)
-	if (beamCull == 1)
-		flags |= kPointFlagBeamCullFront;
-	else if (beamCull == 2)
-		flags |= kPointFlagBeamCullBack;
+	flags |= kPointFlagBeamCullFront;  // (46n) Window Beam Culling: fixed (47m) at "Faces Toward the Room"
 	// (47i) Point Light Shadows on Water: the water distance of last frame (its prep ran after last frame's water draws) is traced
 	// from; with no prep last frame (no water drawn) the distance is cleared, so the Water shader never matches a stale one.
 	std::memcpy(waterInvViewProj, a_input.constants.invViewProj, sizeof(waterInvViewProj));
@@ -3952,7 +3833,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	// (47l) Distant LOD water may be left out of the prep this frame only when the loaded cells' edge lies farther from the camera than
 	// any point-light source reaches (sources within PointLightsDistance of the camera, radius at most 4096; 512 units of margin).
 	waterLodSkip = false;
-	if (!a_interior && settings.PointShadowsWaterLodSkip) {  // (47l) switch
+	if (!a_interior) {  // (47l) Skip Distant LOD Water: always (47m)
 		float core[4];
 		if (scene.GetLoadedRect(core, false)) {
 			const double edge = std::min({ a_camX - core[0], a_camY - core[1], core[2] - a_camX, core[3] - a_camY });
@@ -3986,7 +3867,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	c.extra[0] = kPointMinShare;
 	c.extra[1] = kPointMinContribution;
 	c.extra[2] = kPointSunShare;
-	c.extra[3] = settings.CarrierShadows ? std::clamp(settings.CarrierClearance, 0.0f, 64.0f) : -1.0f;  // (46q) < 0: as 46p
+	c.extra[3] = std::clamp(settings.CarrierClearance, 0.0f, 64.0f);  // (46q) Carrier Casts Shadows: fixed (47m); the shader's < 0 path is unused
 	std::copy_n(a_input.constants.spheres, 8, c.spheres);
 	std::copy_n(a_input.constants.toSun, 3, c.sun);
 	c.sun[3] = a_sunStrength;
@@ -4138,8 +4019,6 @@ void RayTracing::UpdateAO()
 			ReleaseAOFilter();
 		if (backend.IsReady() && backend.AOBytes())
 			backend.ReleaseAOResources();
-		if (backend.IsReady() && backend.HasAOBlueNoise())  // (47l)
-			backend.ReleaseAOBlueNoise();
 	}
 }
 
@@ -4366,14 +4245,7 @@ bool RayTracing::PrepareAO(RayTracingRT::FrameInput& a_input, const float a_trac
 		flags |= kAOTraceDither8;
 	if (settings.AOCharacterSelfFix && (flags & kAOTraceCharacters))
 		flags |= kAOTraceSelfFix;
-	// (47l) RTAO: Blue-Noise Rays: the texture is made (and its upload queued into the next RTAO list) once; unavailable = IGN (the
-	// backend logged why once). Off: the texture goes (only while wanted).
-	if (settings.AOBlueNoise) {
-		if (backend.EnsureAOBlueNoise())
-			flags |= kAOTraceBlueNoise;
-	} else if (backend.HasAOBlueNoise()) {
-		backend.ReleaseAOBlueNoise();
-	}
+	// (47m) TraceAOCS's blue-noise flag (2048) is never set: the 47l Blue-Noise Rays option is gone (t6 stays a null view).
 	aoShapeThisFrame = shape;
 	c.params[0] = static_cast<float>(frameIndex % 1024);
 	std::memcpy(&c.params[1], &flags, sizeof(float));
@@ -5249,8 +5121,8 @@ namespace
 
 void RayTracing::DrawSettings()
 {
-	// (46r) The "Ray Tracing" entry: the master switch and status, a one-line summary, Advanced (loading screens), the A/B
-	// switches and the diagnostics. Sun Shadows, Point Light Shadows and Ambient Occlusion have their own entries in the
+	// (46r) The "Ray Tracing" entry: the master switch and status, a one-line summary, Advanced (loading screens) and the
+	// diagnostics (both collapsed). Sun Shadows, Point Light Shadows and Ambient Occlusion have their own entries in the
 	// Ray Tracing category (each shows the switch and the status on top).
 	ImGui::PushID("rtMainPage");  // tree-node open states of its own (other pages also have Advanced / Diagnostics)
 	DrawMasterHeader();
@@ -5333,41 +5205,7 @@ void RayTracing::DrawSunPage()
 			if (settings.QualityLevel < static_cast<int>(Quality::Custom))
 				ImGui::Text("%s", kTiers[settings.QualityLevel].tooltip);
 			else
-				ImGui::Text("Custom: the values under Custom Quality below (started from the tier you had picked).");
-		}
-		if (settings.QualityLevel == static_cast<int>(Quality::Custom) && ImGui::TreeNodeEx("Custom Quality", ImGuiTreeNodeFlags_DefaultOpen)) {
-			ImGui::SliderFloat("Sun Softness", &settings.CustomSunCone, 0.1f, 2.0f, "%.2f deg");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("How big the sun looks to the shadows: 0.27 = the real sun (sharp edges), larger = softer, wider shadow edges.");
-			ImGui::SliderInt("Rays per Pixel", &settings.CustomBaseRays, 1, 4);
-			ImGui::SliderInt("Extra Rays at Shadow Edges", &settings.CustomExtraRays, 0, 8);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Extra rays only where a shadow edge is (cleaner soft edges). 0 = none.");
-			ImGui::Combo("Trace Resolution", &settings.CustomTraceResolution, kPatternNames, 3);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Full: every pixel traced every frame. Checkerboard: half of them, alternating each frame. Half: one pixel of each 2x2, rotating.");
-				ImGui::Text("  The others are filled from their traced neighbours (and the denoiser's history averages the frames).");
-			}
-			ImGui::SliderFloat("Fall-off Start", &settings.CustomFalloffStart, 0.0f, 16384.0f, "%.0f units");
-			ImGui::SliderFloat("Fall-off End", &settings.CustomFalloffEnd, 0.0f, 32768.0f, "%.0f units");
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("From the start to the end distance the extra rays fade out and the denoiser blur shrinks to Far Blur Scale;");
-				ImGui::Text("  beyond the end: 1 ray per pixel and the Far Quality pattern. 70 units = 1 m. End at or below the start = no fall-off.");
-			}
-			ImGui::Combo("Far Quality", &settings.CustomFarQuality, kPatternNames, 3);
-			ImGui::SliderFloat("Far Blur Scale", &settings.CustomFarDenoiseScale, 0.0f, 1.0f, "%.2f");
-			const char* npcModes[] = { "Full", "Reduced" };
-			ImGui::Combo("Other Characters", &settings.CustomNpcQuality, npcModes, 2);
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("The player always gets full quality. Reduced: other characters get no extra edge rays.");
-			ImGui::SliderFloat("Denoiser Radius", &settings.CustomDenoiseRadius, 2.0f, 32.0f, "%.0f px");
-			ImGui::SliderInt("Denoiser Taps per Side", &settings.CustomDenoiseTaps, 1, 8);
-			ImGui::Checkbox("Denoiser at Half Resolution", &settings.CustomDenoiseHalf);
-			ImGui::SliderInt("History Length", &settings.CustomHistory, 1, 32, "%d frames");
-			ImGui::SliderFloat("History Clamp", &settings.CustomDenoiseClamp, 0.5f, 4.0f, "%.2f sigma");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("How far the history may differ from this frame's neighbourhood: smaller = less ghosting, more grain.");
-			ImGui::TreePop();
+				ImGui::Text("Custom: the values under Advanced > Custom Quality (started from the tier you had picked).");
 		}
 
 		// Denoiser: Off / Penumbra / DLSS RR / NRD SIGMA (stored values 0 / 2 / 3 / 4).
@@ -5426,8 +5264,42 @@ void RayTracing::DrawSunPage()
 		if (!charactersOffReason.empty())
 			RtErrorLine("Characters was switched off automatically", charactersOffReason);
 
-		// Advanced: per kind of object, ray traced or the shadow map + screen-space shadows.
+		// Advanced (collapsed): the Custom quality's values, then per kind of object, ray traced or the shadow map + screen-space shadows.
 		if (ImGui::TreeNodeEx("Advanced")) {
+			if (settings.QualityLevel == static_cast<int>(Quality::Custom) && ImGui::TreeNodeEx("Custom Quality", ImGuiTreeNodeFlags_DefaultOpen)) {
+				ImGui::SliderFloat("Sun Softness", &settings.CustomSunCone, 0.1f, 2.0f, "%.2f deg");
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("How big the sun looks to the shadows: 0.27 = the real sun (sharp edges), larger = softer, wider shadow edges.");
+				ImGui::SliderInt("Rays per Pixel", &settings.CustomBaseRays, 1, 4);
+				ImGui::SliderInt("Extra Rays at Shadow Edges", &settings.CustomExtraRays, 0, 8);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("Extra rays only where a shadow edge is (cleaner soft edges). 0 = none.");
+				ImGui::Combo("Trace Resolution", &settings.CustomTraceResolution, kPatternNames, 3);
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("Full: every pixel traced every frame. Checkerboard: half of them, alternating each frame. Half: one pixel of each 2x2, rotating.");
+					ImGui::Text("  The others are filled from their traced neighbours (and the denoiser's history averages the frames).");
+				}
+				ImGui::SliderFloat("Fall-off Start", &settings.CustomFalloffStart, 0.0f, 16384.0f, "%.0f units");
+				ImGui::SliderFloat("Fall-off End", &settings.CustomFalloffEnd, 0.0f, 32768.0f, "%.0f units");
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("From the start to the end distance the extra rays fade out and the denoiser blur shrinks to Far Blur Scale;");
+					ImGui::Text("  beyond the end: 1 ray per pixel and the Far Quality pattern. 70 units = 1 m. End at or below the start = no fall-off.");
+				}
+				ImGui::Combo("Far Quality", &settings.CustomFarQuality, kPatternNames, 3);
+				ImGui::SliderFloat("Far Blur Scale", &settings.CustomFarDenoiseScale, 0.0f, 1.0f, "%.2f");
+				const char* npcModes[] = { "Full", "Reduced" };
+				ImGui::Combo("Other Characters", &settings.CustomNpcQuality, npcModes, 2);
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("The player always gets full quality. Reduced: other characters get no extra edge rays.");
+				ImGui::SliderFloat("Denoiser Radius", &settings.CustomDenoiseRadius, 2.0f, 32.0f, "%.0f px");
+				ImGui::SliderInt("Denoiser Taps per Side", &settings.CustomDenoiseTaps, 1, 8);
+				ImGui::Checkbox("Denoiser at Half Resolution", &settings.CustomDenoiseHalf);
+				ImGui::SliderInt("History Length", &settings.CustomHistory, 1, 32, "%d frames");
+				ImGui::SliderFloat("History Clamp", &settings.CustomDenoiseClamp, 0.5f, 4.0f, "%.2f sigma");
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("How far the history may differ from this frame's neighbourhood: smaller = less ghosting, more grain.");
+				ImGui::TreePop();
+			}
 			ImGui::TextWrapped("What the ray tracer takes over, per kind of object. \"Shadow map\" = the game's own shadows and Screen Space "
 							   "Shadows, exactly as with Ray Tracing off. Changing a row re-captures the scene over the next frames.");
 			const char* twoModes[] = { "Shadow map", "Ray traced" };
@@ -5530,17 +5402,6 @@ void RayTracing::DrawPointLightPage()
 		ImGui::SliderFloat("Light Size", &settings.PointLightsSize, 0.0f, 32.0f, "%.1f units");
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("Radius of the flame the rays aim at: larger = softer shadow edges (a little grainier before the clean-up). 0 = hard edges.");
-		ImGui::Checkbox("Player Lights Cast RT Shadows", &settings.PointLightsPlayer);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): the torch in your hand, Quick Light's light and light spells on you cast ray-traced shadows.");
-			ImGui::Text("  Off: they keep the old shadows.");
-		}
-		ImGui::Checkbox("Carrier Casts Shadows from Its Own Light", &settings.CarrierShadows);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): someone holding a torch (an NPC, or you in third person) casts a body shadow from it on the ground and");
-			ImGui::Text("  walls behind them; only the hand and forearm near the flame are ignored (Advanced > Carrier Clearance).");
-			ImGui::Text("  In first person your body never blocks your own light. Off: the carrier never blocks its own light.");
-		}
 
 		ImGui::SeparatorText("Indoors");
 		ImGui::Checkbox("Indoors Too", &settings.PointLightsInteriors);
@@ -5567,6 +5428,30 @@ void RayTracing::DrawPointLightPage()
 			if (interiorAutoOff && ImGui::SmallButton("Retry Indoors"))
 				interiorRequested = false;
 		}
+
+		ImGui::SeparatorText("Which Lights");
+		ImGui::Checkbox("Player Lights Cast RT Shadows", &settings.PointLightsPlayer);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): the torch in your hand, Quick Light's light and light spells on you cast ray-traced shadows.");
+			ImGui::Text("  Off: they keep the old shadows.");
+		}
+		ImGui::Checkbox("Spell / Effect Lights Cast RT Shadows", &settings.PointLightsEffects);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("On (default): lights of spells and effects that belong to nobody (Magelight on a wall, fire bolts in flight)");
+			ImGui::Text("  cast ray-traced shadows. Off: they keep the old shadows.");
+		}
+		{
+			const char* kMeshless[3] = { "Own", "Snap", "Skip" };
+			settings.PointLightsMeshless = std::clamp(settings.PointLightsMeshless, 0, 2);
+			ImGui::Combo("Meshless Lights Near Fires", &settings.PointLightsMeshless, kMeshless, 3);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Some of the game's \"torch\" lights have no torch: an invisible light placed near braziers and fires.");
+				ImGui::Text("  Own (46r): it casts its own shadow, from a point where nothing burns (an extra shadow between two braziers).");
+				ImGui::Text("  Snap (default): its shadow comes from the nearest visible fire or lamp within about 4.5 m; none in range, or a torch");
+				ImGui::Text("    holder / candle right next to it (then it is that fixture's light): its own.");
+				ImGui::Text("  Skip: it casts no ray-traced shadow (the old screen-space shadow, if any).");
+			}
+		}
 		ImGui::EndDisabled();
 		if (!pointOffReason.empty()) {
 			RtErrorLine("Point-light shadows were switched off automatically", pointOffReason);
@@ -5588,64 +5473,41 @@ void RayTracing::DrawPointLightPage()
 					ImGui::Text("  Weaker lights at that pixel keep their old shadows. More = slower.");
 				}
 			}
+			ImGui::BeginDisabled(!settings.PointLightsInteriors);
+			{
+				static constexpr int kKs[3] = { 1, 2, 4 };
+				const char* kNames[3] = { "1", "2", "4" };
+				int index = settings.PointLightsPerPixelInterior >= 4 ? 2 : (settings.PointLightsPerPixelInterior >= 2 ? 1 : 0);
+				if (ImGui::Combo("Lights per Pixel Indoors", &index, kNames, 3))
+					settings.PointLightsPerPixelInterior = kKs[std::clamp(index, 0, 2)];
+				if (auto _tt = Util::HoverTooltipWrapper())
+					ImGui::Text("Indoors many lights overlap; 4 (default) catches nearly all of the light. 2 or 1 = cheaper.");
+			}
+			ImGui::EndDisabled();
 			ImGui::SliderInt("Max Lights", &settings.PointLightsMaxSources, 8, static_cast<int>(RayTracingPointLights::kMaxSources));
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("Shadow-casting lights per frame at most (the ones that matter most on screen). Lights within 64 units count as one.");
 			ImGui::SliderFloat("Max Distance", &settings.PointLightsDistance, 512.0f, 8192.0f, "%.0f units");
 			if (auto _tt = Util::HoverTooltipWrapper())
 				ImGui::Text("Lights farther from the camera keep their old shadows. 70 units = 1 m. Default 4000 (about 57 m).");
-			ImGui::Checkbox("Native Shadow Lights Use RT Shadows", &settings.PointLightsNative);
+			ImGui::Checkbox("Plants and Cut-Outs Block Point Lights Outdoors", &settings.PointLightsAlphaOutdoors);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("The game's own shadow-casting lights (fireplaces, some campfires): their ray-traced shadow replaces the game's");
-				ImGui::Text("  shadow map in the lighting (default on). Off: they keep the game's shadow map.");
-				ImGui::Text("  Outdoors spot lights keep the game's shadow map; indoors their cone is taken from the game.");
+				ImGui::Text("On (default): at night leaves, bushes and cut-out shapes (fences, nets) cast shadows from torches and campfires,");
+				ImGui::Text("  for the kinds traced with their cut-out (Foliage / Cut-outs under Sun Shadows > Advanced). A little slower.");
+				ImGui::Text("Off: outdoors only solid shapes block point lights.");
 			}
-			ImGui::Checkbox("Stable Light Selection", &settings.PointLightsStable);
+			ImGui::SliderFloat("Fixture Clearance", &settings.PointLightsClearance, 0.0f, 128.0f, "%.0f units");
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): flickering candles and lights whose range changes do not make an area jump between the ray-traced");
-				ImGui::Text("  shadow and the old one. Off: the lights are picked again every frame.");
+				ImGui::Text("Rays stop this far before the light, so the lamp, brazier bowl or torch holding it does not shadow its own light.");
+				ImGui::Text("  Too small: a dark ring or a black patch around a lamp. Too large: objects right next to a light cast nothing.");
 			}
-			// (46s)
-			ImGui::Checkbox("Steady Flickering Lights", &settings.PointLightsSteady);
+			ImGui::SliderFloat("Carrier Clearance (units)", &settings.CarrierClearance, 0.0f, 64.0f, "%.0f");
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): the game wobbles flickering torches and fires around their spot (up to about half a metre). Their ray-traced");
-				ImGui::Text("  shadows now come from the light's resting spot, so shadows stop swaying (the lighting itself still flickers as before).");
-				ImGui::Text("  Only for lights fixed in the world; carried torches, your own lights and spells follow their light as before.");
-				ImGui::Text("Off: shadows follow the wobbling light (46r).");
+				ImGui::Text("Someone holding a torch (an NPC, or you in third person) casts a body shadow from it; body parts closer than this to");
+				ImGui::Text("  the flame (the hand and forearm) do not block it (70 units = 1 m). NPC lights also stop %.0f units before the flame.",
+					settings.PointLightsClearance);
+				ImGui::Text("  In first person your body never blocks your own light.");
 			}
-			ImGui::Checkbox("Merge Hysteresis", &settings.PointLightsMergeHysteresis);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): two lights close together that share one shadow keep sharing it until they are clearly apart,");
-				ImGui::Text("  so the shadow does not jump between one and two sources. Off: decided again every frame (46r).");
-			}
-			{
-				const char* kMeshless[3] = { "Own", "Snap", "Skip" };
-				settings.PointLightsMeshless = std::clamp(settings.PointLightsMeshless, 0, 2);
-				ImGui::Combo("Meshless Lights Near Fires", &settings.PointLightsMeshless, kMeshless, 3);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Some of the game's \"torch\" lights have no torch: an invisible light placed near braziers and fires.");
-					ImGui::Text("  Own (46r): it casts its own shadow, from a point where nothing burns (an extra shadow between two braziers).");
-					ImGui::Text("  Snap (default): its shadow comes from the nearest visible fire or lamp within about 4.5 m; none in range, or a torch");
-				ImGui::Text("    holder / candle right next to it (then it is that fixture's light): its own.");
-					ImGui::Text("  Skip: it casts no ray-traced shadow (the old screen-space shadow, if any).");
-				}
-			}
-			// (46x)
-			ImGui::Checkbox("Trace Direct Fill Lights (sun shafts)", &settings.PointLightsDirectFills);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): some invisible \"fill\" lights are really the bright patch of a light shaft on the floor (a sun spot under");
-				ImGui::Text("  a roof opening, e.g. Fort Dawnguard). Those (named sun / shaft / beam / ray, or right under a window spot light; bright");
-				ImGui::Text("  and white) cast ray-traced shadows, aimed at the window light above them like the sun. The tinted ambient / bounce");
-				ImGui::Text("  fills that only brighten a room (Dwemer ruins' teal lights) stay as they are.");
-				ImGui::Text("Off: no fill light casts ray-traced shadows (46w).");
-			}
-			ImGui::Checkbox("Wider Window Beam Detection", &settings.PointLightsWiderBeams);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): Window Shadows Ultimate's window light spots with a range over 4096 units count as window beams (ray traced");
-				ImGui::Text("  with Window Light Beams), not only the ones over 10000; its spots from its own plugins count even when not named \"window\".");
-				ImGui::Text("Off: 46w (e.g. Fort Dawnguard's roof light kept the game's shadow map).");
-			}
-			Util::LightCensus::SetWiderWindowBeams(settings.PointLightsWiderBeams);
 			// (46y)
 			ImGui::Checkbox("Screen-Space Shadows for Non-RT Casters", &settings.PointLightsSSPLSNonRT);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -5666,28 +5528,6 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("  On: they stay on as well; the darker of both counts (small contact shadows of grass and leaves the ray tracer does not see).");
 			}
 			ImGui::EndDisabled();
-			ImGui::SliderFloat("Fixture Clearance", &settings.PointLightsClearance, 0.0f, 128.0f, "%.0f units");
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Rays stop this far before the light, so the lamp, brazier bowl or torch holding it does not shadow its own light.");
-				ImGui::Text("  Too small: a dark ring or a black patch around a lamp. Too large: objects right next to a light cast nothing.");
-			}
-			ImGui::BeginDisabled(!settings.CarrierShadows);
-			ImGui::SliderFloat("Carrier Clearance (units)", &settings.CarrierClearance, 0.0f, 64.0f, "%.0f");
-			if (auto _tt = Util::HoverTooltipWrapper())
-				ImGui::Text("Body parts closer than this to a carried light do not block it (70 units = 1 m). NPC lights also stop %.0f units before the flame.",
-					settings.PointLightsClearance);
-			ImGui::EndDisabled();
-			ImGui::Checkbox("Spell / Effect Lights Cast RT Shadows", &settings.PointLightsEffects);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): lights of spells and effects that belong to nobody (Magelight on a wall, fire bolts in flight)");
-				ImGui::Text("  cast ray-traced shadows. Off: they keep the old shadows.");
-			}
-			ImGui::Checkbox("Plants and Cut-Outs Block Point Lights Outdoors", &settings.PointLightsAlphaOutdoors);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): at night leaves, bushes and cut-out shapes (fences, nets) cast shadows from torches and campfires,");
-				ImGui::Text("  for the kinds traced with their cut-out (Foliage / Cut-outs under Sun Shadows > Advanced). A little slower.");
-				ImGui::Text("Off: outdoors only solid shapes block point lights.");
-			}
 			// (47h)
 			ImGui::Checkbox("Point Light Shadows on Water", &settings.PointShadowsOnWater);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
@@ -5695,88 +5535,17 @@ void RayTracing::DrawPointLightPage()
 				ImGui::Text("  on it: the trace also shoots rays from the water surface itself (last frame's water, extra rays only on water pixels).");
 				ImGui::Text("  Lights not traced at that pixel keep the old path. Off: as in 47g.");
 			}
-			// (47l)
-			ImGui::BeginDisabled(!settings.PointShadowsOnWater);
-			ImGui::Indent();
-			ImGui::Checkbox("Skip Distant LOD Water", &settings.PointShadowsWaterLodSkip);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default, 47l): frames whose only water is the distant (LOD) water, farther than any point light reaches, skip");
-				ImGui::Text("  the water preparation pass (a small GPU saving; nothing visible changes). Off: as in 47k.");
-			}
-			ImGui::Unindent();
-			ImGui::EndDisabled();
+			// (46c, 47m: default on)
 			ImGui::BeginDisabled(!settings.PointLightsInteriors);
-			{
-				static constexpr int kKs[3] = { 1, 2, 4 };
-				const char* kNames[3] = { "1", "2", "4" };
-				int index = settings.PointLightsPerPixelInterior >= 4 ? 2 : (settings.PointLightsPerPixelInterior >= 2 ? 1 : 0);
-				if (ImGui::Combo("Lights per Pixel Indoors", &index, kNames, 3))
-					settings.PointLightsPerPixelInterior = kKs[std::clamp(index, 0, 2)];
-				if (auto _tt = Util::HoverTooltipWrapper())
-					ImGui::Text("Indoors many lights overlap; 4 (default) catches nearly all of the light. 2 or 1 = cheaper.");
-			}
-			// (46x)
-			ImGui::Checkbox("Skip Lights Behind Portals", &settings.PointLightsPortals);
+			ImGui::Checkbox("Skip the Game's Shadow Maps for RT-Shadowed Lights", &settings.PointLightsSkipShadowMaps);
 			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): in interiors split into rooms (Dragonsreach, Dwemer ruins; not small houses or inns without room bounds)");
-				ImGui::Text("  a light that only lights its own rooms no longer takes one of a pixel's traced lights outside those rooms, and one");
-				ImGui::Text("  in another room that is entirely off screen is not traced at all. More of the lights you see get ray-traced shadows.");
-				ImGui::Text("Off: 46w.");
+				ImGui::Text("On (default): indoors, the game no longer draws its own shadow maps for the lights whose shadows ray tracing already");
+				ImGui::Text("  draws (saves about 0.7-1.2 ms). Only on frames where the ray-traced result is sure to come.");
+				ImGui::Text("  If it still goes missing for a frame, those lights shine without a shadow for that frame (inside their cone for");
+				ImGui::Text("  spot lights); the Diagnostics line \"with the fallback only\" counts such frames.");
+				ImGui::Text("Off: the game keeps drawing those shadow maps too (wasted work).");
 			}
 			ImGui::EndDisabled();
-			ImGui::EndDisabled();
-			ImGui::TreePop();
-		}
-
-		// A/B switches (saved settings; the defaults are the tested ones).
-		bool reset = false;
-		if (Util::BeginABSwitchGroup(nullptr, reset)) {
-			if (reset) {
-				const Settings d{};
-				settings.PointLightsBeamGuard = d.PointLightsBeamGuard;
-				settings.PointLightsSkipShadowMaps = d.PointLightsSkipShadowMaps;
-				settings.PointLightsBeamCull = d.PointLightsBeamCull;
-				settings.PointLightsRoomBoxes = d.PointLightsRoomBoxes;  // (46x)
-				settings.PointLightsPluginFillFixtures = d.PointLightsPluginFillFixtures;
-			}
-			// (46x)
-			ImGui::BeginDisabled(!settings.PointLights);
-			ImGui::Checkbox("Plugin-Only Fills Near Fires Are Fixtures", &settings.PointLightsPluginFillFixtures);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): a light counted as \"fill\" only because True Light's ambient plugin edited it, but named like a fire / candle /");
-				ImGui::Text("  torch or within 128 units of a fire, is that fire's light (Meshless Lights Near Fires decides its shadow). Off: 46w.");
-			}
-			ImGui::BeginDisabled(!settings.PointLightsInteriors || !settings.PointLightsPortals);
-			ImGui::Checkbox("Per-Pixel Room Box", &settings.PointLightsRoomBoxes);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("With Skip Lights Behind Portals. On (default): a room-bound light is ranked only at pixels inside its rooms' box; one behind");
-				ImGui::Text("  a portal still casts shadows where its rooms are on screen. Off: every light behind a portal is simply not traced.");
-			}
-			ImGui::EndDisabled();
-			ImGui::EndDisabled();
-			ImGui::BeginDisabled(!settings.PointLights || !settings.PointLightsInteriors);
-			ImGui::Checkbox("Window Beam Guard", &settings.PointLightsBeamGuard);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Off (default). On: a window beam whose whole cone comes out blocked keeps the game's shadow map for a while,");
-				ImGui::Text("  then it is tried again. It also catches normal beams whose cone mostly hits walls, which flickers.");
-				ImGui::Text("  %u beams caught so far.", beamsImplausible);
-			}
-			ImGui::Checkbox("Stop Engine Shadow Maps for RT Lights", &settings.PointLightsSkipShadowMaps);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Off (default): the game still draws its shadow maps for the lights ray tracing handles (wasted work, but a safe fallback).");
-				ImGui::Text("On: indoors the game skips them (saves about 0.7-1.2 ms); ray tracing fills in their shadows. Whenever the ray-traced");
-				ImGui::Text("  result might be missing in a frame, the game draws them as usual.");
-			}
-			// The other two modes block Window Shadows Ultimate's beams on its one-sided glass pane by design: developer mode only.
-			if (globals::state->IsDeveloperMode()) {
-				const char* cullModes[] = { "None (debug: blocks the beams)", "Faces Toward the Room", "Faces Away (debug: blocks the beams)" };
-				settings.PointLightsBeamCull = std::clamp(settings.PointLightsBeamCull, 0, 2);
-				ImGui::Combo("Window Beam Culling (debug)", &settings.PointLightsBeamCull, cullModes, 3);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Which wall faces a window beam's rays ignore. \"Faces Toward the Room\" (default) lets the beam pass the room's shell");
-					ImGui::Text("  and Window Shadows Ultimate's one-sided glass pane, as the game's beam shadow maps do. The other two block the beam.");
-				}
-			}
 			ImGui::EndDisabled();
 			ImGui::TreePop();
 		}
@@ -5834,9 +5603,7 @@ void RayTracing::DrawPointLightPage()
 							"negative lights %u; beams by the wider rule %u",
 					ps.fillDirectAimed + ps.fillDirectPoint, ps.fillDirectAimed, ps.fillDirectPoint, ps.fillFixture, ps.fillAmbient, ps.negative, ps.beamsWider);
 				if (Util::IsInterior()) {
-					if (!settings.PointLightsPortals)
-						ImGui::Text("Portals: off");
-					else if (!ps.cameraInRoom)
+					if (!ps.cameraInRoom)
 						ImGui::Text("Portals: no room bounds around the camera (nothing changed this frame)");
 					else
 						ImGui::Text("Portals: %u room-bound lights, %u behind portals (%u not traced), %u limited to their rooms' box; %u rooms unreadable (left as 46w)",
@@ -5890,7 +5657,7 @@ void RayTracing::DrawAOPage()
 		ImGui::SliderFloat("Strength", &settings.AOStrength, 0.0f, 2.0f, "%.2f");
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("1 = as traced. Lower = lighter, higher = darker.");
-			ImGui::Text("With Fine Detail on (Advanced > A-B switches, default on): the broad darkening only (under roofs, along walls, around");
+			ImGui::Text("With Fine Detail on (Advanced, default on): the broad darkening only (under roofs, along walls, around");
 			ImGui::Text("  large objects); the small creases have their own Detail Strength.");
 		}
 		ImGui::BeginDisabled(!settings.AODetail);
@@ -5903,13 +5670,6 @@ void RayTracing::DrawAOPage()
 		ImGui::SliderFloat("Ray Length", &settings.AORayLength, kAORayLengthMin, kAORayLengthMax, "%.0f units");
 		if (auto _tt = Util::HoverTooltipWrapper())
 			ImGui::Text("How far an object may be and still darken a surface. 70 units = 1 m. Default 100 (about 1.4 m). Longer = wider, darker AO.");
-		ImGui::BeginDisabled(!settings.AODetail);
-		ImGui::SliderFloat("Detail Ray Length", &settings.AODetailLength, kAODetailLengthMin, kAODetailLengthMax, "%.0f units");
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("How close an object has to be to count as fine detail (Detail Strength); farther ones count for Strength.");
-			ImGui::Text("  Default 20 (about 28 cm). At most half the Ray Length.");
-		}
-		ImGui::EndDisabled();
 		ImGui::Checkbox("Indoors Too##AO", &settings.AOInteriors);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("On (default): inside houses, inns, castles and dungeons the room itself (walls, furniture, clutter, people) is captured");
@@ -5946,23 +5706,6 @@ void RayTracing::DrawAOPage()
 					ImGui::Text("Darker of RTAO and SSGI AO: per pixel the darker of the two (fullest darkening; SSGI's AO is never lost).");
 				}
 			}
-			ImGui::Checkbox("Temporal", &settings.AOTemporal);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("On (default): after the edge-aware blur the last frames are blended in (held close to this frame's own values,");
-				ImGui::Text("  so moving objects leave no dark trail). Off: this frame's blurred rays only (a little grainier).");
-			}
-			ImGui::BeginDisabled(!settings.AODetail);
-			ImGui::SliderInt("Detail Rays", &settings.AODetailRays, 1, kAODetailRaysMax);
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Short rays per pixel for the fine detail (the long ray's first part is one of them). Default 2.");
-				ImGui::Text("  More = smoother creases, costs more GPU time (about +20 %% of the RTAO rays' time per ray).");
-			}
-			ImGui::EndDisabled();
-			ImGui::SliderFloat("Max Distance", &settings.AODistance, 1000.0f, 8192.0f, "%.0f units");
-			if (auto _tt = Util::HoverTooltipWrapper()) {
-				ImGui::Text("Outdoors: RTAO fades back to Screen Space GI's AO over the last quarter of this distance. Default 4000 (about 57 m).");
-				ImGui::Text("  Shorter = cheaper. Indoors there is no fade: the whole interior is traced.");
-			}
 			ImGui::BeginDisabled(!settings.AOInteriors);
 			{
 				const char* modes[] = { "RTAO + SSGI contact AO", "Darker of both" };
@@ -5975,126 +5718,119 @@ void RayTracing::DrawAOPage()
 				}
 			}
 			ImGui::EndDisabled();
+			ImGui::Checkbox("Temporal", &settings.AOTemporal);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): after the edge-aware blur the last frames are blended in (held close to this frame's own values,");
+				ImGui::Text("  so moving objects leave no dark trail). Off: this frame's blurred rays only (a little grainier).");
+			}
+			ImGui::BeginDisabled(!settings.AOTemporal);
+			ImGui::Checkbox("RTAO: Temporal v2", &settings.AOTemporalV2);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Needs Temporal. On (default): a smarter history. Each pixel remembers how many frames it has been seen and averages");
+				ImGui::Text("  more of them the longer it stays (up to 10), so still scenes get much calmer. A spot that was just uncovered (behind");
+				ImGui::Text("  a walking character, at a screen edge) is recognised by its depth and direction and starts fresh from a wider blur");
+				ImGui::Text("  of this frame instead of smearing old AO across it. Both AO parts are held close to this frame's own values (no");
+				ImGui::Text("  ghosting), and the broad AO's blur has a fixed size in the world (not in pixels): far surfaces are no longer");
+				ImGui::Text("  smeared, near ones no longer grainy. Resets at camera cuts. Off: as in 47k.");
+			}
+			ImGui::EndDisabled();
+			if (!aoV2Fault.empty())
+				RtErrorLine("RTAO: Temporal v2 was switched off automatically", aoV2Fault);
+			ImGui::BeginDisabled(!settings.AODetail);
+			ImGui::SliderFloat("Detail Ray Length", &settings.AODetailLength, kAODetailLengthMin, kAODetailLengthMax, "%.0f units");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("How close an object has to be to count as fine detail (Detail Strength); farther ones count for Strength.");
+				ImGui::Text("  Default 20 (about 28 cm). At most half the Ray Length.");
+			}
+			ImGui::SliderInt("Detail Rays", &settings.AODetailRays, 1, kAODetailRaysMax);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Short rays per pixel for the fine detail (the long ray's first part is one of them). Default 2.");
+				ImGui::Text("  More = smoother creases, costs more GPU time (about +20 %% of the RTAO rays' time per ray).");
+			}
+			ImGui::EndDisabled();
+			ImGui::SliderFloat("Max Distance", &settings.AODistance, 1000.0f, 8192.0f, "%.0f units");
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Outdoors: RTAO fades back to Screen Space GI's AO over the last quarter of this distance. Default 4000 (about 57 m).");
+				ImGui::Text("  Shorter = cheaper. Indoors there is no fade: the whole interior is traced.");
+			}
+			ImGui::BeginDisabled(!settings.AODetail);
+			ImGui::Checkbox("RTAO: Half-Resolution Broad Term", &settings.AOHalfResFar);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On: the broad (far) part is traced on every other pixel (a checkerboard that swaps every frame); the blur fills");
+				ImGui::Text("  the rest from neighbours on the same surface. The fine detail stays full resolution. Cheaper; the broad AO may");
+				ImGui::Text("  be a little noisier on thin objects. Off (default): every pixel (46x). Needs Fine Detail.");
+			}
+			ImGui::EndDisabled();
+			ImGui::Checkbox("Full-Resolution Filter", &settings.AOFullResFilter);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Off (default): the broad AO is blurred at quarter resolution (wide, smooth, cheap).");
+				ImGui::Text("On: blurred at full render resolution with a smaller reach (sharper edges, a little grainier, a bit more GPU time).");
+			}
+			{
+				const char* kBudget[] = { "Blocked (as before)", "Half Open", "Open" };
+				settings.AOAlphaBudget = std::clamp(settings.AOAlphaBudget, 0, 2);
+				ImGui::Combo("Dense Leaves (alpha budget)", &settings.AOAlphaBudget, kBudget, IM_ARRAYSIZE(kBudget));
+				if (auto _tt = Util::HoverTooltipWrapper()) {
+					ImGui::Text("An AO ray stops checking leaf / cut-out textures after 8 see-through spots (bounded cost). Then it counts as:");
+					ImGui::Text("  Blocked (default, as before): dense ivy / bushes may come out too dark.");
+					ImGui::Text("  Half Open: half darkened. Open: not darkened (dense foliage may come out too light).");
+				}
+			}
+			ImGui::Separator();
+			ImGui::Checkbox("Fine Detail (two scales)", &settings.AODetail);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): short extra rays find the small creases (stone joints, door frame and wall, ivy layers) and keep");
+				ImGui::Text("  them sharp (lightly blurred at full resolution); the long ray only adds the broad darkening beyond them, so");
+				ImGui::Text("  nothing is darkened twice. Strength and Detail Strength set the two separately.");
+				ImGui::Text("Off: one long ray per pixel, blurred at quarter resolution (as before: small creases mostly blur away).");
+			}
+			ImGui::Checkbox("Normal-Guided Filter", &settings.AONormalGuided);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the blur follows the surface direction too (the detailed normal of the material), so the two");
+				ImGui::Text("  sides of a crease or a frame and its wall are not averaged together. Off: only a coarse 45 degree test (as before).");
+			}
+			// (46y)
+			ImGui::BeginDisabled(!settings.AODetail);
+			ImGui::Checkbox("RTAO: Single Long Ray", &settings.AOSingleRay);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the long ray is traced once and sorted into near / far by where it hits (the same result as");
+				ImGui::Text("  two pieces; the character ray too). Fewer rays. Off: the near and far pieces are traced separately (46x).");
+				ImGui::Text("  Needs Fine Detail (without it there is only one ray anyway).");
+			}
+			ImGui::EndDisabled();
+			// (47h)
+			ImGui::Checkbox("RTAO: Character Self-Occlusion Fix", &settings.AOCharacterSelfFix);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): a character's own ray-traced body no longer darkens itself where the traced mesh sits a little");
+				ImGui::Text("  off the drawn one (the dark band along the sides of the legs, clearest with Fine Detail). Rays from a body");
+				ImGui::Text("  pixel ignore that same character's surfaces seen from the inside and start a bit further out when they");
+				ImGui::Text("  skim the skin. Real contact (an arm against the body, between the legs) still darkens. Off: as in 47g.");
+			}
+			// (47j)
+			ImGui::Checkbox("RTAO: Smooth Normals", &settings.AOSmoothNormals);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("On (default): the AO rays leave each pixel around the smooth surface direction (last frame's G-buffer normal,");
+				ImGui::Text("  moved to this frame by the camera and the motion vectors) instead of the flat facet seen in the depth. Low-poly");
+				ImGui::Text("  round things (bottles, legs) no longer get one AO value per facet with steps at the facet edges. Where the old");
+				ImGui::Text("  normal cannot be trusted (just uncovered, fast motion) it blends back to the facet direction. Fine Detail may");
+				ImGui::Text("  pick up a faint trace of normal-map texture. Off: as in 47i.");
+			}
+			// (47k)
+			ImGui::BeginDisabled(!settings.AOSmoothNormals);
+			ImGui::Checkbox("RTAO: Smooth Normals v2", &settings.AOSmoothNormals2);
+			if (auto _tt = Util::HoverTooltipWrapper()) {
+				ImGui::Text("Needs RTAO: Smooth Normals. On (default): removes the facet steps that were left: the rays start a little out");
+				ImGui::Text("  along the smooth direction (not the facet's), rays that would dip under the facet are laid flat along it");
+				ImGui::Text("  instead of mirrored, last frame's normal is matched over 3x3 pixels with a tolerance that grows on slanted");
+				ImGui::Text("  surfaces, and where it still cannot be trusted a smoothed depth direction (an average over a ring of nearby");
+				ImGui::Text("  pixels on the same surface; real corners kept) is used instead of the bare facet. Off: as in 47j.");
+				ImGui::Text("  AO Debug View \"Smooth Normals: Confidence\": green = smooth normal used, red = fell back, blue = no data.");
+			}
+			ImGui::EndDisabled();
+			if (!aoExtrasFault.empty())
+				RtErrorLine("Fine Detail / Full-Resolution Filter were switched off automatically", aoExtrasFault);
 			ImGui::EndDisabled();
 			ImGui::TreePop();
-		}
-
-		// (46t) A/B switches (saved settings; the defaults are the tested ones). All off / Blocked = 46s.
-		{
-			bool reset = false;
-			if (Util::BeginABSwitchGroup(nullptr, reset)) {
-				if (reset) {
-					const Settings d{};
-					settings.AODetail = d.AODetail;
-					settings.AONormalGuided = d.AONormalGuided;
-					settings.AOFullResFilter = d.AOFullResFilter;
-					settings.AOAlphaBudget = d.AOAlphaBudget;
-					settings.AOSingleRay = d.AOSingleRay;  // (46y)
-					settings.AOHalfResFar = d.AOHalfResFar;
-					settings.AOCharacterSelfFix = d.AOCharacterSelfFix;  // (47h)
-					settings.AOSmoothNormals = d.AOSmoothNormals;  // (47j)
-					settings.AOSmoothNormals2 = d.AOSmoothNormals2;  // (47k)
-					settings.AOBlueNoise = d.AOBlueNoise;  // (47l)
-					settings.AOTemporalV2 = d.AOTemporalV2;
-				}
-				ImGui::BeginDisabled(!settings.AO);
-				ImGui::Checkbox("Fine Detail (two scales)", &settings.AODetail);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("On (default): short extra rays find the small creases (stone joints, door frame and wall, ivy layers) and keep");
-					ImGui::Text("  them sharp (lightly blurred at full resolution); the long ray only adds the broad darkening beyond them, so");
-					ImGui::Text("  nothing is darkened twice. Strength and Detail Strength set the two separately.");
-					ImGui::Text("Off: one long ray per pixel, blurred at quarter resolution (as before: small creases mostly blur away).");
-				}
-				ImGui::Checkbox("Normal-Guided Filter", &settings.AONormalGuided);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("On (default): the blur follows the surface direction too (the detailed normal of the material), so the two");
-					ImGui::Text("  sides of a crease or a frame and its wall are not averaged together. Off: only a coarse 45 degree test (as before).");
-				}
-				ImGui::Checkbox("Full-Resolution Filter", &settings.AOFullResFilter);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Off (default): the broad AO is blurred at quarter resolution (wide, smooth, cheap).");
-					ImGui::Text("On: blurred at full render resolution with a smaller reach (sharper edges, a little grainier, a bit more GPU time).");
-				}
-				{
-					const char* kBudget[] = { "Blocked (as before)", "Half Open", "Open" };
-					settings.AOAlphaBudget = std::clamp(settings.AOAlphaBudget, 0, 2);
-					ImGui::Combo("Dense Leaves (alpha budget)", &settings.AOAlphaBudget, kBudget, IM_ARRAYSIZE(kBudget));
-					if (auto _tt = Util::HoverTooltipWrapper()) {
-						ImGui::Text("An AO ray stops checking leaf / cut-out textures after 8 see-through spots (bounded cost). Then it counts as:");
-						ImGui::Text("  Blocked (default, as before): dense ivy / bushes may come out too dark.");
-						ImGui::Text("  Half Open: half darkened. Open: not darkened (dense foliage may come out too light).");
-					}
-				}
-				// (46y)
-				ImGui::BeginDisabled(!settings.AODetail);
-				ImGui::Checkbox("RTAO: Single Long Ray", &settings.AOSingleRay);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("On (default): the long ray is traced once and sorted into near / far by where it hits (the same result as");
-					ImGui::Text("  two pieces; the character ray too). Fewer rays. Off: the near and far pieces are traced separately (46x).");
-					ImGui::Text("  Needs Fine Detail (without it there is only one ray anyway).");
-				}
-				ImGui::Checkbox("RTAO: Half-Resolution Broad Term", &settings.AOHalfResFar);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("On: the broad (far) part is traced on every other pixel (a checkerboard that swaps every frame); the blur fills");
-					ImGui::Text("  the rest from neighbours on the same surface. The fine detail stays full resolution. Cheaper; the broad AO may");
-					ImGui::Text("  be a little noisier on thin objects. Off (default): every pixel (46x). Needs Fine Detail.");
-				}
-				ImGui::EndDisabled();
-				// (47h)
-				ImGui::Checkbox("RTAO: Character Self-Occlusion Fix", &settings.AOCharacterSelfFix);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("On (default): a character's own ray-traced body no longer darkens itself where the traced mesh sits a little");
-					ImGui::Text("  off the drawn one (the dark band along the sides of the legs, clearest with Fine Detail). Rays from a body");
-					ImGui::Text("  pixel ignore that same character's surfaces seen from the inside and start a bit further out when they");
-					ImGui::Text("  skim the skin. Real contact (an arm against the body, between the legs) still darkens. Off: as in 47g.");
-				}
-				// (47j)
-				ImGui::Checkbox("RTAO: Smooth Normals", &settings.AOSmoothNormals);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("On (default): the AO rays leave each pixel around the smooth surface direction (last frame's G-buffer normal,");
-					ImGui::Text("  moved to this frame by the camera and the motion vectors) instead of the flat facet seen in the depth. Low-poly");
-					ImGui::Text("  round things (bottles, legs) no longer get one AO value per facet with steps at the facet edges. Where the old");
-					ImGui::Text("  normal cannot be trusted (just uncovered, fast motion) it blends back to the facet direction. Fine Detail may");
-					ImGui::Text("  pick up a faint trace of normal-map texture. Off: as in 47i.");
-				}
-				// (47k)
-				ImGui::BeginDisabled(!settings.AOSmoothNormals);
-				ImGui::Checkbox("RTAO: Smooth Normals v2", &settings.AOSmoothNormals2);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Needs RTAO: Smooth Normals. On (default): removes the facet steps that were left: the rays start a little out");
-					ImGui::Text("  along the smooth direction (not the facet's), rays that would dip under the facet are laid flat along it");
-					ImGui::Text("  instead of mirrored, last frame's normal is matched over 3x3 pixels with a tolerance that grows on slanted");
-					ImGui::Text("  surfaces, and where it still cannot be trusted a smoothed depth direction (an average over a ring of nearby");
-					ImGui::Text("  pixels on the same surface; real corners kept) is used instead of the bare facet. Off: as in 47j.");
-					ImGui::Text("  AO Debug View \"Smooth Normals: Confidence\": green = smooth normal used, red = fell back, blue = no data.");
-				}
-				ImGui::EndDisabled();
-				// (47l)
-				ImGui::Checkbox("RTAO: Blue-Noise Rays", &settings.AOBlueNoise);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Off (default): the ray directions use the old noise pattern (47k). On: they come from our own blue-noise pattern made");
-					ImGui::Text("  for these rays (the directions of neighbouring pixels, and of one pixel over the frames, are spread evenly; a finer,");
-					ImGui::Text("  less patterned raw grain). Offline it still left somewhat more noise after the blur than the old pattern, so it is off");
-					ImGui::Text("  by default: an A/B to judge by eye.");
-				}
-				ImGui::BeginDisabled(!settings.AOTemporal);
-				ImGui::Checkbox("RTAO: Temporal v2", &settings.AOTemporalV2);
-				if (auto _tt = Util::HoverTooltipWrapper()) {
-					ImGui::Text("Needs Temporal. On (default): a smarter history. Each pixel remembers how many frames it has been seen and averages");
-					ImGui::Text("  more of them the longer it stays (up to 10), so still scenes get much calmer. A spot that was just uncovered (behind");
-					ImGui::Text("  a walking character, at a screen edge) is recognised by its depth and direction and starts fresh from a wider blur");
-					ImGui::Text("  of this frame instead of smearing old AO across it. Both AO parts are held close to this frame's own values (no");
-					ImGui::Text("  ghosting), and the broad AO's blur has a fixed size in the world (not in pixels): far surfaces are no longer");
-					ImGui::Text("  smeared, near ones no longer grainy. Resets at camera cuts. Off: as in 47k.");
-				}
-				ImGui::EndDisabled();
-				if (!aoV2Fault.empty())
-					RtErrorLine("RTAO: Temporal v2 was switched off automatically", aoV2Fault);
-				ImGui::EndDisabled();
-				if (!aoExtrasFault.empty())
-					RtErrorLine("Fine Detail / Full-Resolution Filter were switched off automatically", aoExtrasFault);
-				ImGui::TreePop();
-			}
 		}
 
 		if (ImGui::TreeNodeEx("Diagnostics")) {
@@ -6176,119 +5912,25 @@ void RayTracing::DrawDiagnostics()
 			ImGui::TextColored({ 1.0f, 0.85f, 0.3f, 1.0f }, "Over the 1.2 GB scene budget: no further cells are captured.");
 	}
 
-	// Advanced: the loading-screen preparation.
+	// Advanced (collapsed): the loading-screen preparation's budgets (the preparation itself is always on since 47m).
 	if (ImGui::TreeNodeEx("Advanced")) {
 		ImGui::SeparatorText("Loading screens");
-		ImGui::Checkbox("Prepare Behind Loading Screens", &settings.LoadingPump);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): while a loading screen is up, the place you arrive at is captured and built for ray tracing as its cells");
-			ImGui::Text("  finish loading, so the first frames you see do not have to do it. Off: everything starts when the world is drawn again.");
-		}
-		ImGui::BeginDisabled(!settings.LoadingPump);
 		ImGui::SliderFloat("Loading Screen Work (ms per frame)", &settings.LoadingPumpMs, 2.0f, 32.0f, "%.0f ms");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("CPU time Ray Tracing may use per loading-screen frame. More: ready sooner, but the game's own loading gets less time.");
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("While a loading screen is up, the place you arrive at is captured and built for ray tracing, so the first frames you");
+			ImGui::Text("  see do not have to do it. This is the CPU time Ray Tracing may use per loading-screen frame. More: ready sooner, but");
+			ImGui::Text("  the game's own loading gets less time.");
+		}
 		ImGui::SliderFloat("Black Screen Window (ms)", &settings.BlackWindowMs, 0.0f, 2000.0f, "%.0f ms");
 		if (auto _tt = Util::HoverTooltipWrapper()) {
 			ImGui::Text("How long after the loading screen the picture still counts as black (large budgets; the switch to RT happens here).");
-			ImGui::Text("After it only the small per-frame budgets of normal play are used.");
+			ImGui::Text("After it the budgets shrink over the fade-in to the small per-frame budgets of normal play.");
 		}
-		ImGui::Checkbox("Prepare On Cell Load", &settings.PrepareOnCellEvents);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): each cell of the place you arrive at is captured and built for ray tracing the moment it finishes loading,");
-			ImGui::Text("  behind the loading screen. Off: only the per-frame work above.");
-		}
-		ImGui::BeginDisabled(!settings.PrepareOnCellEvents);
 		ImGui::SliderFloat("Work per Loaded Cell (ms)", &settings.CellEventMs, 2.0f, 50.0f, "%.0f ms");
-		if (auto _tt = Util::HoverTooltipWrapper())
-			ImGui::Text("CPU time per loaded cell. The loading screen gets longer by about this much per cell (about 25 cells per fast travel).");
-		ImGui::EndDisabled();
-		ImGui::Checkbox("Use the Fade-In", &settings.FadeInBudgets);
 		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): while the picture fades in after a loading screen (about 3 s), the first second still works as hard as the");
-			ImGui::Text("  black screen, then less and less. Off: small budgets as soon as the black window is over.");
-		}
-		ImGui::EndDisabled();
-		ImGui::TreePop();
-	}
-
-	// A/B switches (saved settings; the defaults are the tested ones). Same picture either way.
-	bool reset = false;
-	if (Util::BeginABSwitchGroup(nullptr, reset)) {
-		if (reset) {
-			const Settings d{};
-			settings.CharactersParallel = d.CharactersParallel;
-			settings.CharactersScanCache = d.CharactersScanCache;
-			settings.CharactersMerge = d.CharactersMerge;
-			settings.SplitTraceSync = d.SplitTraceSync;
-			settings.ParallelBlasBuilds = d.ParallelBlasBuilds;
-			settings.EarlyPrepIndoors = d.EarlyPrepIndoors;  // (47j)
-			settings.HighPriorityQueue = d.HighPriorityQueue;
-			settings.SubmitWorker = d.SubmitWorker;
-			settings.BuildGpuBudget = d.BuildGpuBudget;
-			settings.BuildGpuBudgetMs = d.BuildGpuBudgetMs;
-			settings.GroupBuildsPerFrame = d.GroupBuildsPerFrame;
-			settings.GroupGraceMs = d.GroupGraceMs;
-		}
-		ImGui::Checkbox("Parallel Character Reads", &settings.CharactersParallel);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): the characters' bone positions and parts are read on a few helper threads (the frame waits for them");
-			ImGui::Text("  at the same point). Off: all on the render thread. F7: rt_ch_reads_ms, rt_ch_lanes.");
-		}
-		ImGui::Checkbox("Character Scan Cache", &settings.CharactersScanCache);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): a character's whole 3D is searched for parts only when it may have changed (equipping, a new character)");
-			ImGui::Text("  and every 8 frames; in between only its known parts are checked. Off: searched every frame. F7: rt_ch_rescans.");
-		}
-		ImGui::Checkbox("Merge Character Parts", &settings.CharactersMerge);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): each character's solid parts (body, clothes, armour, weapons) are one ray-tracing object: one update per");
-			ImGui::Text("  character per frame instead of one per part. Hair and cut-out parts stay separate. Off: one object per part.");
-			ImGui::Text("  Changing it rebuilds the characters (a moment). F7: rt_skin_groups, rt_prep_gpu_ms, rt_e_skin_ms.");
-		}
-		ImGui::Checkbox("Split Trace Sync", &settings.SplitTraceSync);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default, with point-light shadows traced): the game's GPU queue waits only for the sun's shadow before merging it,");
-			ImGui::Text("  and for the point lights only right before their clean-up. Off: one wait for both.");
-			ImGui::Text("  F7: rt_sync_sun_gpu_ms, rt_sync_pl_gpu_ms (rt_sync_gpu_ms = both).");
-		}
-		ImGui::Checkbox("Parallel BLAS Builds", &settings.ParallelBlasBuilds);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): the scenery shapes that enter in one frame are built side by side on the graphics card (at most 64 MB");
-			ImGui::Text("  of scratch memory together). Shorter hitches when new cells or objects arrive. Off: one by one.");
-			ImGui::Text("  F7: rt_prep_gpu_ms with rt_pw_builds.");
-		}
-		ImGui::Checkbox("Early RT Prep Indoors", &settings.EarlyPrepIndoors);  // (47j)
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): indoors too, the characters' ray-tracing shapes and the queued builds go to the graphics card at the start");
-			ImGui::Text("  of the frame (overlapping the game's shadow maps and depth pass), as outdoors, instead of right before the trace.");
-			ImGui::Text("  Same frame, same data: no change in the picture. Off: as in 47i (indoors all of it right before the trace). F7: rt_sync_gpu_ms.");
-		}
-		ImGui::Checkbox("RT Queue High Priority (restart)", &settings.HighPriorityQueue);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("Experiment, off by default: ray tracing's own GPU queue asks for high priority, which may shorten the long waits for it");
-			ImGui::Text("  when the card is busy. Takes effect after restarting the game. In effect now: %s.", backend.QueuePriorityHigh() ? "high" : "normal");
-		}
-		ImGui::Checkbox("RT: Submit on a Worker Thread", &settings.SubmitWorker);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): handing ray tracing's work to the graphics card is done by a helper thread, so the game's main thread");
-			ImGui::Text("  does not stall there when Windows is busy moving video memory. Same order, same picture. Off: on the main thread.");
-			ImGui::Text("  In effect now: %s. F7: rt_sub_* columns.", backend.SubmitWorkerInEffect() ? "on" : "off");
-		}
-		ImGui::Checkbox("RT: Budget Builds by GPU Time", &settings.BuildGpuBudget);
-		if (auto _tt = Util::HoverTooltipWrapper()) {
-			ImGui::Text("On (default): new ray-tracing shapes (scenery and whole characters) are built a few per frame within a graphics-card");
-			ImGui::Text("  time budget, and a character that leaves view for a moment keeps its shape for a short while (no rebuild when it");
-			ImGui::Text("  comes back). Off: built as they come. F7: rt_bud_* columns.");
-		}
-		if (settings.BuildGpuBudget) {
-			ImGui::Indent();
-			ImGui::SliderFloat("Build Budget (GPU ms per frame)", &settings.BuildGpuBudgetMs, 0.25f, 4.0f, "%.2f");
-			ImGui::SliderInt("Character Builds per Frame", &settings.GroupBuildsPerFrame, 1, 16);
-			ImGui::SliderFloat("Character Keep Time (ms)", &settings.GroupGraceMs, 0.0f, 10000.0f, "%.0f");
-			const auto& bud = backend.GetBudgetSample();
-			ImGui::TextDisabled("Measured: %.1f GPU ms per million triangles, prep base %.2f ms, budget %u triangles", bud.msPerMillionTris, bud.prepBaseMs, bud.triBudget);
-			ImGui::Unindent();
+			ImGui::Text("Each cell of the place you arrive at is captured and built for ray tracing the moment it finishes loading, behind the");
+			ImGui::Text("  loading screen. CPU time per loaded cell: the loading screen gets longer by about this much per cell (about 25 cells");
+			ImGui::Text("  per fast travel).");
 		}
 		ImGui::TreePop();
 	}
@@ -6337,6 +5979,12 @@ void RayTracing::DrawDiagnostics()
 		}
 		if (!lastEventsSummary.empty())
 			ImGui::TextWrapped("Last transition: %s", lastEventsSummary.c_str());
+		{
+			// (46q) Builds budgeted by GPU time (always, 47m; F7 rt_bud_* columns).
+			const auto& bud = backend.GetBudgetSample();
+			ImGui::TextDisabled("Build budget: %.1f GPU ms per million triangles, prep base %.2f ms, budget %u triangles", bud.msPerMillionTris, bud.prepBaseMs,
+				bud.triBudget);
+		}
 
 		const auto& sc = scene.GetStats();
 		const auto& skip = sc.skipped;
@@ -6553,21 +6201,19 @@ std::string RayTracing::DescribeForProfile() const
 		kPatternNames[std::min(q.tracePattern, 2u)], kPatternNames[std::min(q.farPattern, 2u)], q.falloffStart, q.falloffEnd, q.npcReduced ? "reduced" : "full",
 		q.denoiseRadius, q.denoiseTaps, q.denoiseHalf ? "half res" : "full res", q.farDenoiseScale, q.history, q.clampSigma, settings.SigmaStabilizedFrames);
 	// (46b)
-	text += std::format(", point lights {} (K {}, max {}, distance {:.0f}, native shadow lights {}, keep SSPLS {}, size {:.1f}, clearance {:.0f}{}{})",
+	text += std::format(", point lights {} (K {}, max {}, distance {:.0f}, keep SSPLS {}, size {:.1f}, clearance {:.0f}{}{})",
 		settings.PointLights ? "on" : "off", ValidPointK(settings.PointLightsPerPixel), settings.PointLightsMaxSources, settings.PointLightsDistance,
-		settings.PointLightsNative ? "RT" : "shadow map", settings.PointLightsKeepSSPLS ? "yes" : "no", settings.PointLightsSize, settings.PointLightsClearance,
+		settings.PointLightsKeepSSPLS ? "yes" : "no", settings.PointLightsSize, settings.PointLightsClearance,
 		pointSplit ? ", split screen" : "", pointOffReason.empty() ? "" : ", switched off: " + pointOffReason);
 	// (46c)
-	text += std::format(", indoors {} (K {}, window beams {}, stop engine shadow maps {}{})", settings.PointLightsInteriors ? "on" : "off",
+	text += std::format(", indoors {} (K {}, window beams {}, skip game shadow maps {}{})", settings.PointLightsInteriors ? "on" : "off",
 		ValidPointK(settings.PointLightsPerPixelInterior), settings.PointLightsWindowBeams ? "on" : "off", settings.PointLightsSkipShadowMaps ? "on" : "off",
 		interiorOffReason.empty() ? "" : ", switched off: " + interiorOffReason);
 	// (46d)
 	text += std::format(", player lights {}, spell / effect lights {}, plants block point lights outdoors {}", settings.PointLightsPlayer ? "on" : "off",
 		settings.PointLightsEffects ? "on" : "off", settings.PointLightsAlphaOutdoors ? "on" : "off");
-	// (46g)
-	static constexpr const char* kBeamCull[] = { "none", "faces toward the room", "faces away" };
-	text += std::format(", stable light selection {}, window beam culling {}, beam guard {}, (46o) window beam softness {:.2f} deg", settings.PointLightsStable ? "on" : "off",
-		kBeamCull[EffectiveBeamCull()], settings.PointLightsBeamGuard ? "on" : "off", settings.PointLightsBeamSoftness);
+	// (46o)
+	text += std::format(", window beam softness {:.2f} deg", settings.PointLightsBeamSoftness);
 	// (46f)
 	static constexpr const char* kAOModes[] = { "RTAO (keeps SSGI contact AO)", "darker of RTAO and SSGI AO" };
 	static constexpr const char* kAOViews[] = { "off", "raw", "filtered", "split", "raw detail", "filtered detail", "final", "normal confidence", "normal Ns", "normal Ng" };
@@ -6585,45 +6231,25 @@ std::string RayTracing::DescribeForProfile() const
 	text += std::format(", RTAO single long ray {}, half-resolution broad term {}, point lights: screen-space shadows for non-RT casters {} (contact {:.1f})",
 		settings.AOSingleRay ? "on" : "off", settings.AOHalfResFar ? "on" : "off", settings.PointLightsSSPLSNonRT ? "on" : "off", settings.PointLightsSSPLSContact);
 	// (47l)
-	text += std::format(", RTAO smooth normals {} (v2 {}), blue-noise rays {}{}, temporal v2 {}{}", settings.AOSmoothNormals ? "on" : "off",
-		settings.AOSmoothNormals2 ? "on" : "off", settings.AOBlueNoise ? "on" : "off", settings.AOBlueNoise && !backend.HasAOBlueNoise() ? " (texture not loaded)" : "",
+	text += std::format(", RTAO smooth normals {} (v2 {}), temporal v2 {}{}", settings.AOSmoothNormals ? "on" : "off", settings.AOSmoothNormals2 ? "on" : "off",
 		settings.AOTemporalV2 ? "on" : "off", aoV2Fault.empty() ? "" : " (switched off: " + aoV2Fault + ")");
 	// (46h)
 	static constexpr const char* kAOModesInterior[] = { "RTAO + SSGI contact AO", "darker of both" };
 	text += std::format(", RTAO indoors {} (mode {}, no distance fade: the interior's box{})", settings.AO && settings.AOInteriors ? "on" : "off",
 		kAOModesInterior[std::clamp(settings.AOModeInterior, 0, 1)], AOInteriorWanted() ? "" : (settings.AO && settings.AOInteriors ? ", not available now" : ""));
-	// (46k)
-	text += settings.LoadingPump ? std::format(", prepare behind loading screens on ({:.0f} ms per frame, black window {:.0f} ms)", settings.LoadingPumpMs,
-									   settings.BlackWindowMs) :
-	                               std::string(", prepare behind loading screens off (46i)");
-	// (46n)
-	text += std::format(", prepare on cell load {} ({:.0f} ms per cell), fade-in budgets {}", settings.PrepareOnCellEvents ? "on" : "off", settings.CellEventMs,
-		settings.FadeInBudgets ? "on" : "off");
-	// (46m)
-	text += std::format(", parallel character reads {}, character scan cache {}, merge character parts {}, split trace sync {}",
-		settings.CharactersParallel ? "on" : "off", settings.CharactersScanCache ? "on" : "off", settings.CharactersMerge ? "on" : "off",
-		settings.SplitTraceSync ? "on" : "off");
-	// (46p)
-	text += std::format(", parallel BLAS builds {}, high-priority queue {} (in effect {}), residency priority {}", settings.ParallelBlasBuilds ? "on" : "off",
-		settings.HighPriorityQueue ? "asked" : "off", backend.QueuePriorityHigh() ? "high" : "normal", backend.ResidencyHigh() ? "high" : "normal");
-	// (46q)
-	text += std::format(", submit on a worker thread {} (in effect {}), budget builds by GPU time {} ({:.2f} ms, {} character builds, keep {:.0f} ms), "
-						"carrier casts shadows {} (clearance {:.0f})",
-		settings.SubmitWorker ? "on" : "off", backend.SubmitWorkerInEffect() ? "on" : "off", settings.BuildGpuBudget ? "on" : "off", settings.BuildGpuBudgetMs,
-		settings.GroupBuildsPerFrame, settings.GroupGraceMs, settings.CarrierShadows ? "on" : "off", settings.CarrierClearance);
+	// (46k, 46n) Loading-screen preparation (always on since 47m): its budgets.
+	text += std::format(", loading screens {:.0f} ms per frame, black window {:.0f} ms, {:.0f} ms per loaded cell", settings.LoadingPumpMs, settings.BlackWindowMs,
+		settings.CellEventMs);
+	// (46p, 46q)
+	text += std::format(", residency priority {}, submit worker in effect {}, carrier clearance {:.0f}", backend.ResidencyHigh() ? "high" : "normal",
+		backend.SubmitWorkerInEffect() ? "yes" : "no", settings.CarrierClearance);
 	// (46s)
 	static constexpr const char* kMeshless[3] = { "own", "snap", "skip" };
-	text += std::format(", steady flickering lights {}, merge hysteresis {}, meshless lights near fires {}", settings.PointLightsSteady ? "on" : "off",
-		settings.PointLightsMergeHysteresis ? "on" : "off", kMeshless[std::clamp(settings.PointLightsMeshless, 0, 2)]);
-	// (46x)
-	text += std::format(", direct fill lights {}, wider window beams {}, skip lights behind portals {} (room box {}), plugin-only fills near fires {}",
-		settings.PointLightsDirectFills ? "on" : "off", settings.PointLightsWiderBeams ? "on" : "off", settings.PointLightsPortals ? "on" : "off",
-		settings.PointLightsRoomBoxes ? "on" : "off", settings.PointLightsPluginFillFixtures ? "fixtures" : "fills");
+	text += std::format(", meshless lights near fires {}", kMeshless[std::clamp(settings.PointLightsMeshless, 0, 2)]);
 	// (47l)
 	text += std::format(", sway in RT shadows {}{}", settings.FoliageSway ? "on" : "off",
 		settings.FoliageSway && !scene.SwayActive() ? " (not in effect: Foliage is shadow map or the wind shader is unavailable)" : "");
-	text += std::format(", point shadows on water {}, skip distant LOD water {}", settings.PointShadowsOnWater ? "on" : "off",
-		settings.PointShadowsWaterLodSkip ? "on" : "off");
+	text += std::format(", point shadows on water {}", settings.PointShadowsOnWater ? "on" : "off");
 	return text;
 }
 
@@ -6694,7 +6320,7 @@ nlohmann::json RayTracing::DescribeJson() const
 	{
 		const auto& ps = pointSelector.GetStats();
 		j["point_lights"] = { { "enabled", settings.PointLights }, { "k", ValidPointK(settings.PointLightsPerPixel) }, { "max_sources", settings.PointLightsMaxSources },
-			{ "distance", settings.PointLightsDistance }, { "native", settings.PointLightsNative }, { "keep_sspls", settings.PointLightsKeepSSPLS },
+			{ "distance", settings.PointLightsDistance }, { "keep_sspls", settings.PointLightsKeepSSPLS },
 			{ "sspls_non_rt", settings.PointLightsSSPLSNonRT }, { "sspls_contact", settings.PointLightsSSPLSContact },  // (46y)
 			{ "size", settings.PointLightsSize }, { "clearance", settings.PointLightsClearance }, { "traced", pointThisFrame }, { "sources", ps.sources },
 			{ "candidates", ps.candidates }, { "merged", ps.merged }, { "capped", ps.capped }, { "native_lights", ps.native }, { "gpu_ms", stats.lastPointGpuMs },
@@ -6739,12 +6365,6 @@ nlohmann::json RayTracing::DescribeJson() const
 			{ "off_reason", windOffReason } };
 	}
 	return j;
-}
-
-int RayTracing::EffectiveBeamCull() const
-{
-	// (46n) The other modes block Window Shadows Ultimate's beams on its one-sided glass pane by design: debug only.
-	return globals::state && globals::state->IsDeveloperMode() ? std::clamp(settings.PointLightsBeamCull, 0, 2) : 1;
 }
 
 bool RayTracing::SunMaskDepthCheckActive() const

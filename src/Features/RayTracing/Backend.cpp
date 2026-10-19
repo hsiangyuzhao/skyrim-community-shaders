@@ -7,7 +7,6 @@
 #include <cstring>
 
 #include <dxgi1_4.h>
-#include <fstream>   // (47l) the RTAO blue noise file
 #include <iterator>
 
 // Generated at build time from Shaders/TraceShadowsCS.hlsl by the Windows SDK's dxc (CMakeLists.txt).
@@ -167,18 +166,11 @@ namespace RayTracingRT
 
 		D3D12_COMMAND_QUEUE_DESC queueDesc{};
 		queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-		// (46p) RT Queue High Priority (an experiment; read at start-up only).
-		queueDesc.Priority = queuePriorityHigh_ ? D3D12_COMMAND_QUEUE_PRIORITY_HIGH : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+		// (47m) Normal priority (the 46p high-priority experiment is gone).
+		queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
 		hr = device_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_));
-		if (FAILED(hr) && queuePriorityHigh_) {
-			logger::warn("[RayTracing] A high-priority queue was refused ({}); normal priority", HrString(hr));
-			queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-			hr = device_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_));
-		}
 		if (FAILED(hr))
 			return fail(std::format("CreateCommandQueue failed ({})", HrString(hr)));
-		queueCreatedHigh_ = queueDesc.Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
-		logger::info("[RayTracing] Queue priority {}", queueCreatedHigh_ ? "high (46p experiment)" : "normal");
 		queue_->SetName(L"CS RayTracing Queue");
 
 		for (auto& context : contexts_) {
@@ -394,7 +386,7 @@ namespace RayTracingRT
 			// (47j) RTAO: Smooth Normals (filled when its texture exists).
 			nullSrv.Format = kDepthMaskFormat;
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAONormal));
-			// (47l) RTAO: Blue-Noise Rays (filled when its texture exists).
+			// (47l) TraceAOCS t6 kept until the RT shader package (47m): always a null view (the 47l blue noise is gone).
 			WriteNullAOBlueNoiseDescriptor();
 		}
 
@@ -1069,7 +1061,8 @@ namespace RayTracingRT
 		device_->CreateShaderResourceView(aoNormal_.resource12.Get(), &srvDesc, StagingCpu(kDynAONormal));
 	}
 
-	// (47l) RTAO: Blue-Noise Rays.
+	// (47l) TraceAOCS t6 kept until the RT shader package (47m): a null Texture2DArray RG8 view (the blue noise is gone; kFlagBlueNoise
+	// is never set, so the shader never reads it).
 	void Backend::WriteNullAOBlueNoiseDescriptor()
 	{
 		if (!stagingHeap_ || !device_)
@@ -1081,91 +1074,6 @@ namespace RayTracingRT
 		nullSrv.Texture2DArray.MipLevels = 1;
 		nullSrv.Texture2DArray.ArraySize = 1;
 		device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAOBlueNoise));
-	}
-
-	bool Backend::EnsureAOBlueNoise()
-	{
-		if (aoBlueNoise_)
-			return true;
-		if (aoBlueNoiseFailed_ || !AOAvailable() || !stagingHeap_)
-			return false;
-		// Our own asset (Ray Tracing package; DirectX 10 DDS header: RG8, 2D, 64 slices of 128 x 128, one mip): per texel the two
-		// numbers of the cosine map, a spatiotemporal blue noise optimised on the cosine-weighted directions (see TraceAOCS).
-		static constexpr const wchar_t* kPath = L"Data\\Shaders\\RayTracing\\AOBlueNoise\\rtao_stbn_cosine_2Dx1D_128x128x64.dds";
-		static constexpr std::uint32_t kSize = 128, kSlices = 64, kHeaderBytes = 4 + 124 + 20;
-		static constexpr std::uint64_t kSliceBytes = static_cast<std::uint64_t>(kSize) * kSize * kAOBlueNoiseTexelBytes;
-		static constexpr std::uint64_t kDataBytes = kSliceBytes * kSlices;
-		auto fail = [&](const std::string& a_why) {
-			aoBlueNoiseFailed_ = true;
-			logger::warn("[RayTracing] RTAO: Blue-Noise Rays unavailable ({}); the rays keep the interleaved gradient noise", a_why);
-			return false;
-		};
-		std::vector<std::uint8_t> file;
-		{
-			std::ifstream in(kPath, std::ios::binary);
-			if (!in)
-				return fail("Data\\Shaders\\RayTracing\\AOBlueNoise\\rtao_stbn_cosine_2Dx1D_128x128x64.dds not found");
-			file.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-		}
-		auto u32 = [&](std::size_t a_offset) {
-			std::uint32_t v = 0;
-			std::memcpy(&v, file.data() + a_offset, sizeof(v));
-			return v;
-		};
-		if (file.size() < kHeaderBytes + kDataBytes || std::memcmp(file.data(), "DDS ", 4) != 0 || std::memcmp(file.data() + 84, "DX10", 4) != 0 ||
-			u32(12) != kSize || u32(16) != kSize || u32(28) > 1u || u32(128) != static_cast<std::uint32_t>(kAOBlueNoiseFormat) || u32(132) != 3u || u32(140) != kSlices)
-			return fail("unexpected file layout");
-		D3D12_HEAP_PROPERTIES heap{};
-		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-		D3D12_RESOURCE_DESC desc{};
-		desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-		desc.Width = kSize;
-		desc.Height = kSize;
-		desc.DepthOrArraySize = static_cast<UINT16>(kSlices);
-		desc.MipLevels = 1;
-		desc.Format = kAOBlueNoiseFormat;
-		desc.SampleDesc.Count = 1;
-		desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-		ComPtr<ID3D12Resource> texture;
-		HRESULT hr = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture));
-		if (FAILED(hr))
-			return fail(std::format("CreateCommittedResource ({})", HrString(hr)));
-		texture->SetName(L"CS RayTracing RTAO blue noise");
-		// Rows of 256 bytes (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT), slices 32 KiB apart (placement alignment 512): the
-		// file's own layout, copied as it is.
-		auto upload = CreateBuffer(kDataBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
-		void* mapped = nullptr;
-		if (!upload || FAILED(upload->Map(0, nullptr, &mapped)) || !mapped)
-			return fail("its upload buffer could not be created");
-		std::memcpy(mapped, file.data() + kHeaderBytes, kDataBytes);
-		upload->Unmap(0, nullptr);
-		Util::FrameTrace::TagVram(texture.Get(), Util::FrameTrace::VramOwner::RtOther, kDataBytes);
-		aoBlueNoise_ = std::move(texture);
-		aoBlueNoiseUpload_ = std::move(upload);
-		aoBlueNoiseCopyPending_ = true;
-		aoBlueNoiseRetirePending_ = false;
-		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-		srvDesc.Format = kAOBlueNoiseFormat;
-		srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-		srvDesc.Texture2DArray.MipLevels = 1;
-		srvDesc.Texture2DArray.ArraySize = kSlices;
-		device_->CreateShaderResourceView(aoBlueNoise_.Get(), &srvDesc, StagingCpu(kDynAOBlueNoise));
-		logger::info("[RayTracing] RTAO blue noise {}x{}x{} loaded", kSize, kSize, kSlices);
-		return true;
-	}
-
-	void Backend::ReleaseAOBlueNoise()
-	{
-		// A submission in flight may still read it (or copy into it): D3D12 keeps both until it is done (Retire).
-		if (aoBlueNoise_)
-			Retire(aoBlueNoise_, 0, nullptr);
-		if (aoBlueNoiseUpload_)
-			Retire(aoBlueNoiseUpload_, 0, nullptr);
-		aoBlueNoise_.Reset();
-		aoBlueNoiseUpload_.Reset();
-		aoBlueNoiseCopyPending_ = aoBlueNoiseRetirePending_ = false;
-		WriteNullAOBlueNoiseDescriptor();
 	}
 
 	bool Backend::RecordAOTrace(CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame, D3D12_GPU_DESCRIPTOR_HANDLE a_table)
@@ -1182,37 +1090,6 @@ namespace RayTracingRT
 		}
 		ID3D12DescriptorHeap* heaps[] = { descriptorHeap_.Get() };
 		list->SetDescriptorHeaps(1, heaps);
-		// (47l) RTAO: Blue-Noise Rays. The upload buffer of the copy recorded in an earlier list goes now (this list's fence value
-		// orders after that list on our queue); a pending copy goes out first in this list, then the texture stays a shader resource.
-		if (aoBlueNoiseRetirePending_) {
-			if (aoBlueNoiseUpload_)
-				Retire(aoBlueNoiseUpload_, 0, nullptr);
-			aoBlueNoiseUpload_.Reset();
-			aoBlueNoiseRetirePending_ = false;
-		}
-		if (aoBlueNoiseCopyPending_ && aoBlueNoise_ && aoBlueNoiseUpload_) {
-			const D3D12_RESOURCE_DESC desc = aoBlueNoise_->GetDesc();
-			for (UINT slice = 0; slice < desc.DepthOrArraySize; ++slice) {
-				D3D12_TEXTURE_COPY_LOCATION dst{};
-				dst.pResource = aoBlueNoise_.Get();
-				dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-				dst.SubresourceIndex = slice;
-				D3D12_TEXTURE_COPY_LOCATION src{};
-				src.pResource = aoBlueNoiseUpload_.Get();
-				src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-				src.PlacedFootprint.Offset = static_cast<UINT64>(slice) * desc.Width * desc.Height * kAOBlueNoiseTexelBytes;
-				src.PlacedFootprint.Footprint.Format = desc.Format;
-				src.PlacedFootprint.Footprint.Width = static_cast<UINT>(desc.Width);
-				src.PlacedFootprint.Footprint.Height = desc.Height;
-				src.PlacedFootprint.Footprint.Depth = 1;
-				src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(desc.Width) * kAOBlueNoiseTexelBytes;
-				list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-			}
-			D3D12_RESOURCE_BARRIER toSrv = Transition(aoBlueNoise_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-			list->ResourceBarrier(1, &toSrv);
-			aoBlueNoiseCopyPending_ = false;
-			aoBlueNoiseRetirePending_ = true;
-		}
 		// (47j) The smooth normals texture (when it exists) is read like the depth.
 		const bool normals = aoNormal_.resource12 != nullptr;
 		D3D12_RESOURCE_BARRIER pre[3] = {
@@ -1370,9 +1247,6 @@ namespace RayTracingRT
 		pendingAOWait_ = 0;
 		aoNormal_ = {};  // (47j)
 		aoNormalWidth_ = aoNormalHeight_ = 0;
-		aoBlueNoise_.Reset();  // (47l)
-		aoBlueNoiseUpload_.Reset();
-		aoBlueNoiseCopyPending_ = aoBlueNoiseRetirePending_ = false;
 		stagingHeap_.Reset();
 		depthMask_ = {};
 		visibility_ = {};
@@ -2252,7 +2126,7 @@ namespace RayTracingRT
 			uploadPool_.Free(entry.upload, RetireValue());
 		// (46p) Parallel BLAS Builds: each build its own scratch slice, no barrier between them (one at the batch end, below),
 		// while the slices fit kParallelScratchBytes; else one shared scratch and a barrier before each build (46o).
-		bool parallel = parallelBuilds_ && batch.size() > 1 && scratchSum <= kParallelScratchBytes;
+		bool parallel = batch.size() > 1 && scratchSum <= kParallelScratchBytes;  // (47m) always on
 		// The larger scratch is made before the old one goes; if it cannot be made (video memory full) this batch is built one by
 		// one in the scratch there is, as before -- never a reason to switch ray tracing off.
 		if (parallel && !TryGrowScratch(scratchSum))
@@ -2771,8 +2645,9 @@ namespace RayTracingRT
 			std::memcpy(context.pointMapped, a_input.pointLights->sources, a_input.pointLights->sourceBytes);
 		stats_.pointTracedLastFrame = pointFrame;
 		// (46m) Split Trace Sync: the sun alone in this list (the sun fence is signalled behind it), the point lights in
-		// their own list after it; the D3D11 queue can start on the sun's result while the point lights still run.
-		const bool splitSun = a_input.splitSun && a_input.sun && pointFrame && context.pointList && EnsureSunFence();
+		// their own list after it; the D3D11 queue can start on the sun's result while the point lights still run. (47m) Always
+		// when the sun and the point lights are both traced (the single-wait list stays for the other frames).
+		const bool splitSun = a_input.sun && pointFrame && context.pointList && EnsureSunFence();
 		context.splitTrace = splitSun;
 		stats_.sunSplitLastFrame = splitSun;
 		const bool pointsInTraceList = pointFrame && !splitSun;
@@ -3362,17 +3237,6 @@ namespace RayTracingRT
 		submitCv_.notify_one();
 	}
 
-	void Backend::DrainSubmits()
-	{
-		KickSubmits();
-		if (!submitThread_.joinable())
-			return;
-		std::unique_lock lock(submitMutex_);
-		// The order of our queue's calls must hold, so this waits; a stuck D3D12 call is logged (every 2 s) instead of passing silently.
-		while (!submitIdleCv_.wait_for(lock, std::chrono::seconds(2), [this] { return submitQueue_.empty() && !submitBusy_; }))
-			logger::warn("[RayTracing] Submit on a Worker Thread: still waiting for the submit thread ({} batches queued, busy {})", submitQueue_.size(), submitBusy_);
-	}
-
 	void Backend::SignalFromCpu(const SubmitOp& a_op)
 	{
 		// (46q) Last resort for a queue Signal that failed on the submit thread (device removed / out of memory): the D3D11 queue may
@@ -3470,22 +3334,14 @@ namespace RayTracingRT
 				submitError_ = error;
 				submitErrorWhat_ = errorWhat;
 			}
-			if (submitQueue_.empty())
-				submitIdleCv_.notify_all();
 		}
-		submitIdleCv_.notify_all();
 	}
 
 	void Backend::ApplySubmitMode()
 	{
-		if (prepared_ || submitWanted_ == submitOn_)
+		// (47m) Always wanted (the setting is gone); the render-thread mode stays only as the fallback when the thread cannot start.
+		if (prepared_ || submitOn_)
 			return;
-		if (!submitWanted_) {
-			DrainSubmits();  // everything handed over goes out before calls are made right away again
-			submitOn_ = false;
-			logger::info("[RayTracing] Submit on a Worker Thread: off");
-			return;
-		}
 		if (submitThreadFailed_ || !queue_)
 			return;
 		if (!submitThread_.joinable()) {
@@ -3556,19 +3412,15 @@ namespace RayTracingRT
 		return s;
 	}
 
-	// ---- (46q) RT: Budget Builds by GPU Time ------------------------------------------------------------------------
+	// ---- (46q) Builds budgeted by GPU time (always, 47m) ----------------------------------------------------------------
 
 	std::uint32_t Backend::StaticTriangleBudget(std::uint32_t a_default)
 	{
-		if (!budgetOn_) {
-			budget_.triBudget = 0;
-			return a_default;
-		}
 		constexpr double kDefaultMsPerTri = 8.0e-6;  // 8 ms per million: about 1 ms for the 46p default batch
 		constexpr double kMinTriangles = 16384.0;     // always some progress
 		const double perTri = msPerTriEma_ > 0.0 ? msPerTriEma_ : kDefaultMsPerTri;
 		const double upper = std::max(static_cast<double>(a_default), kMinTriangles);
-		const double triangles = std::clamp(static_cast<double>(std::max(budgetGpuMs_, 0.1f)) / perTri, kMinTriangles, upper);
+		const double triangles = std::clamp(static_cast<double>(kBudgetGpuMs) / perTri, kMinTriangles, upper);
 		budget_.triBudget = static_cast<std::uint32_t>(triangles);
 		return budget_.triBudget;
 	}
@@ -3596,13 +3448,9 @@ namespace RayTracingRT
 
 	void Backend::ReleaseUnseenSkinGroups()
 	{
-		if (!budgetOn_) {
-			ReleaseSkinGroups();
-			return;
-		}
 		skinGroupFrame_.clear();
 		const std::int64_t now = QpcNow();
-		const std::int64_t grace = MsToQpc(std::max(groupGraceMs_, 0.0f));
+		const std::int64_t grace = MsToQpc(kGroupGraceMs);
 		std::uint32_t kept = 0;
 		for (std::size_t g = 0; g < skinGroups_.size();) {
 			auto& group = skinGroups_[g];

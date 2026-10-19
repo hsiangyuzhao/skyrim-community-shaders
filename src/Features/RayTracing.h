@@ -104,7 +104,9 @@ public:
 		// Per kind of object: ray traced (true) or the shadow map + screen-space shadows.
 		bool Characters = true;
 		bool PhysicsParts = true;  // HDT-SMP / HDT-PE parts other than hair (capes, skirts)
-		int SettingsVersion = 6;   // 5 = 45o (debug switches hard-wired; no migrations before it); 6 = 46o (Window Beam Guard off once)
+		// 5 = 45o (debug switches hard-wired; no migrations before it); 6 = 46o (Window Beam Guard off once; the guard is gone since
+		// 47m); 7 = 47m (Skip the Game's Shadow Maps for RT-Shadowed Lights on once)
+		int SettingsVersion = 7;
 		bool Buildings = true;
 		bool Objects = true;
 		bool Trees = false;
@@ -136,7 +138,6 @@ public:
 		int PointLightsPerPixel = 2;         // K: 1, 2 or 4 lights traced per pixel
 		int PointLightsMaxSources = 64;
 		float PointLightsDistance = 4000.0f;  // light centre to camera (units)
-		bool PointLightsNative = true;       // the engine's shadow-map lights use RT shadows (instead of their shadow map)
 		bool PointLightsKeepSSPLS = false;   // Screen Space Point Light Shadows stay on as contact shadows for RT lights
 		float PointLightsSize = 6.0f;        // emitter radius (soft edges)
 		float PointLightsClearance = 32.0f;  // the ray stops this far before the light (its own fixture casts nothing)
@@ -144,19 +145,11 @@ public:
 		bool PointLightsInteriors = true;
 		int PointLightsPerPixelInterior = 4;    // K indoors: 1, 2 or 4
 		bool PointLightsWindowBeams = true;     // Window Shadows Ultimate's window beams traced (their shadow mask channel written)
-		bool PointLightsSkipShadowMaps = false; // the engine does not draw shadow maps for lights fully handled by RT (interiors)
+		bool PointLightsSkipShadowMaps = true;  // the engine does not draw shadow maps for lights fully handled by RT (interiors); (47m) default on
 		// (46d)
 		bool PointLightsPlayer = true;          // the player's own lights (torch in hand, Quick Light, light spells) cast RT shadows (not of the player)
 		bool PointLightsEffects = true;         // spell / effect lights without an owner (Magelight, projectiles) cast RT shadows
 		bool PointLightsAlphaOutdoors = true;   // outdoors too, leaves / bushes / cut-outs (as the per-kind menu traces them) block point lights
-		// (46g) Stable light selection: smoothed intensity / radius, hysteresis at the cuts, stable merging, per-pixel stickiness.
-		bool PointLightsStable = true;
-		// (46g) Window beam rays: 0 cull nothing (46f), 1 cull triangles facing the ray start (the room shell seen from inside, as the
-		// engine's shadow map culls it from the light), 2 cull the ones facing away.
-		int PointLightsBeamCull = 1;
-		// (46g) a beam that is almost fully blocked keeps the engine's shadow map. (46o) Off by default (and switched off once for saved
-		// settings older than 6): its 97 % rule misfired on beams whose cone mostly hits walls (one normally ~94 %) and flickered.
-		bool PointLightsBeamGuard = false;
 		// (46o) Window beams' angular size (degrees, half angle, like the sun's cone): their rays are jittered inside it and the point-light
 		// denoiser filters their shadow edges by blocker distance x tan(angle). 0 = 46n (the emitter sphere, nearly hard and unfiltered).
 		// Outside the settings macro (it takes at most 64 members): read / written in Load / SaveSettings.
@@ -173,60 +166,22 @@ public:
 		// the RT weight is 1 everywhere inside the interior's box.
 		bool AOInteriors = true;
 		int AOModeInterior = 0;        // AOModeKind (indoors)
-		// (46k) Transitions (Ray Tracing > Diagnostics): the loading pump prepares the destination behind the loading screen
-		// (off = 46i: nothing happens until the world renders again); its CPU per loading-screen frame; the frames after the
-		// loading screen still counted as black (the Fader Menu cannot tell when its fade-in starts).
-		bool LoadingPump = true;
+		// (46k) Transitions (Ray Tracing > Advanced): the loading pump (always on since 47m) prepares the destination behind the
+		// loading screen; its CPU per loading-screen frame; the frames after the loading screen still counted as black (the Fader
+		// Menu cannot tell when its fade-in starts).
 		float LoadingPumpMs = 8.0f;
 		float BlackWindowMs = 200.0f;
 		// (46n) The destination prepared on the main thread as each cell finishes loading (TESCellFullyLoadedEvent), CellEventMs
-		// per event: the loading screen is presented from another thread, so the per-frame pump never runs behind it. The fade-in
-		// after the loading screen (Fader Menu open, the picture still mostly dark) gets budgets that start large and shrink.
-		bool PrepareOnCellEvents = true;
+		// per event (always on since 47m): the loading screen is presented from another thread, so the per-frame pump never runs
+		// behind it. The fade-in after the loading screen (Fader Menu open, the picture still mostly dark) gets budgets that start
+		// large and shrink. Outside the settings macro (it takes at most 64 members): read / written in Load / SaveSettings.
 		float CellEventMs = 12.0f;
-		bool FadeInBudgets = true;
-		// (46m) Cost switches (Ray Tracing > Diagnostics > Performance), each for an A/B; on = the 46m way, off = 46l's.
-		bool CharactersParallel = true;   // characters' per-actor reads on a few read lanes (joined at the same point of the frame)
-		bool CharactersScanCache = true;  // an actor's 3D is walked in full only when it may have changed (equip, new) and every 8 frames
-		bool CharactersMerge = true;      // an actor's opaque parts are one BLAS: one refit per character instead of one per part
-		bool SplitTraceSync = true;       // the game queue waits for the sun alone before the shadow mask passes, the point lights later
-		// (46p) Outside the settings macro (read / written in Load / SaveSettings): a static BLAS batch built side by side (a scratch
-		// slice each, one barrier at the end); the RT queue at high priority (an experiment, from the next start-up).
-		bool ParallelBlasBuilds = true;
-		bool HighPriorityQueue = false;
-		// (47j) "Early RT Prep Indoors": Early Prep (characters, skinning, builds at the frame start) in interiors too (Ray Tracing indoors on).
-		bool EarlyPrepIndoors = true;
-		// (46q) Outside the settings macro too. Submit on a Worker Thread: our D3D12 queue calls (ExecuteCommandLists / Signal /
-		// Wait) go out on a submit thread (off = 46p, on the render thread). Budget Builds by GPU Time: static + merged-character
-		// BLAS builds per frame within BuildGpuBudgetMs of measured GPU time, at most GroupBuildsPerFrame merged builds, and a
-		// merged character BLAS not drawn kept GroupGraceMs (off = 46p). Carrier Casts Shadows: a light carried by a traced
-		// character is blocked by the carrier's own body except within CarrierClearance units of the light (off = 46p: the
-		// carrier never blocks its own light).
-		bool SubmitWorker = true;
-		bool BuildGpuBudget = true;
-		float BuildGpuBudgetMs = 1.0f;
-		int GroupBuildsPerFrame = 3;
-		float GroupGraceMs = 2000.0f;
-		bool CarrierShadows = true;
+		// (46q) Outside the settings macro too. Carrier Casts Shadows (always on since 47m): a light carried by a traced character is
+		// blocked by the carrier's own body except within CarrierClearance units of the light.
 		float CarrierClearance = 28.0f;
-		// (46s) Outside the settings macro too. Steady Flickering Lights: static world lights' shadows come from their rest point
-		// instead of the engine's flicker-jittered position (off = 46r). Merge Hysteresis: a light merged into another's source stays
-		// there up to 1.5 x the merge distance (off = 46r). Meshless Lights Near Fires: placed lights without a mesh named like a
-		// fixture (vanilla "torch" lights at no visible fire) -- 0 Own (46r), 1 Snap to the nearest visible fixture's source, 2 Skip.
-		bool PointLightsSteady = true;
-		bool PointLightsMergeHysteresis = true;
+		// (46s) Outside the settings macro too. Meshless Lights Near Fires: placed lights without a mesh named like a fixture
+		// (vanilla "torch" lights at no visible fire) -- 0 Own (46r), 1 Snap to the nearest visible fixture's source, 2 Skip.
 		int PointLightsMeshless = 1;
-		// (46x) Outside the settings macro too; all off = 46w. Trace Direct Fill Lights: a fill light that is direct light (named sun /
-		// shaft / beam / ray, or under a window spot shadow light; bright, near-neutral) is traced, aimed at the window spot above it.
-		// Wider Window Beam Detection: window spots over 4096 units (and Window Shadows Ultimate's spots by their plugin) are beams.
-		// Skip Lights Behind Portals: indoors with room bounds, a portal-strict light is ranked only inside its rooms' box, and one
-		// behind a portal whose rooms are off screen takes no source. A/B: Per-Pixel Room Box (off: every light behind a portal is
-		// dropped), Plugin-Only Fills Near Fires Are Fixtures.
-		bool PointLightsDirectFills = true;
-		bool PointLightsWiderBeams = true;
-		bool PointLightsPortals = true;
-		bool PointLightsRoomBoxes = true;
-		bool PointLightsPluginFillFixtures = true;
 		// (46t) RTAO, outside the settings macro too. Two scales (AODetail): the long ray split at AODetailLength (its far part
 		// counted only where the near part is open) plus near-only rays (AODetailRays near rays per pixel in all, the long ray's near part included), the near visibility filtered at full
 		// resolution and multiplied in with AODetailStrength (AOStrength is then the far / large-scale term's). AONormalGuided: the
@@ -258,9 +213,6 @@ public:
 		bool AOCharacterSelfFix = true;
 		bool SunDepthCheckTranslucent = true;
 		bool PointShadowsOnWater = true;
-		// (47l) "Point Light Shadows on Water: Skip Distant LOD Water": a frame whose only water is the distant LOD water (beyond every
-		// point-light source's reach) runs no WaterPrepCS. Off = 47k.
-		bool PointShadowsWaterLodSkip = true;
 		// (47j) AOSmoothNormals "RTAO: Smooth Normals": the AO hemisphere around last frame's G-buffer normal reprojected to this frame
 		// (AONormalPrepCS, confidence-blended toward the depth normal), not the per-facet depth normal. Off = 47i.
 		bool AOSmoothNormals = true;
@@ -269,15 +221,10 @@ public:
 		// frame, tolerances by the pixel footprint / max(N.V, 0.2), and the low-confidence fallback a depth-only smoothed normal (a
 		// sparse ring of depth normals weighted by plane agreement) instead of the raw facet. Off = 47j.
 		bool AOSmoothNormals2 = true;
-		// (47l) Outside the settings macro too. AOBlueNoise "RTAO: Blue-Noise Rays": the ray directions from our cosine-direction
-		// spatiotemporal blue noise (Ray Tracing package AOBlueNoise\, RG8) instead of interleaved gradient noise (TraceAOCS kFlagBlueNoise). AOTemporalV2 "RTAO: Temporal v2"
-		// (needs Temporal): per-pixel history length, disocclusion test against our own last-frame depth and normal, depth-weighted
-		// history taps, a statistical clamp (both terms), a history-fix blur while the history is short, and the large-scale
-		// blur's radius in world units (RTAOTemporalCS RTAO_TEMPORAL_V2, RTAOFilterCS). Both off = 47k.
-		// Blue-Noise Rays defaults off: offline (reviews\rtao-stbn-47l\NoiseEval.cs) our STBN still leaves more detail-term noise than
-		// the 47k IGN pair (5x5, 1 ray 0.046 vs 0.040; Temporal v2 steady 0.0080 vs 0.0064, flicker 0.0041 vs 0.0029; better only on
-		// the broad term's steady error). IGN's per-pixel pair is locally a 2D lattice, very even in any window.
-		bool AOBlueNoise = false;
+		// (47l) Outside the settings macro too. AOTemporalV2 "RTAO: Temporal v2" (needs Temporal): per-pixel history length,
+		// disocclusion test against our own last-frame depth and normal, depth-weighted history taps, a statistical clamp (both
+		// terms), a history-fix blur while the history is short, and the large-scale blur's radius in world units (RTAOTemporalCS
+		// RTAO_TEMPORAL_V2, RTAOFilterCS). Off = 47k. (47m) The 47l Blue-Noise Rays option is gone (interleaved gradient noise only).
 		bool AOTemporalV2 = true;
 		// (47l) Outside the settings macro too. FoliageSway "Sway in RT Shadows" (under Foliage): with Foliage ray traced / Both, tree-
 		// animated leaves, bushes and branches are traced with the game's wind (a wind BLAS per mesh, posed and refit every frame).
@@ -664,19 +611,9 @@ private:
 	/// The events line once the transition is over (also with Ray Tracing off: the control run).
 	void MaybeLogTransitionEvents();
 	std::string DescribeTransitionEvents(const TransitionEvents& a_events) const;
-	// (46g) Window beam guard: a beam whose sampled cone pixels are almost all blocked for 30 read-backs is implausible (the room's
-	// shell in the way): it gets no source for 600 frames, the engine's shadow map stays for it; then it is tried again.
-	struct BeamGuard
-	{
-		std::uint32_t over = 0;
-		bool implausible = false;
-		std::uint32_t until = 0;
-	};
-	std::unordered_map<const RE::BSLight*, BeamGuard> beamGuards;
-	std::vector<const RE::BSLight*> excludedBeams;
+	// (46g) The window beams of last frame's slots (their sampled-cone counters are read back a few frames later).
 	std::uint64_t beamSamplesSeen = 0;
 	std::array<const RE::BSLight*, 64> lastSlotBeams{};
-	std::uint32_t beamsImplausible = 0;
 	// (46n) One line per interior after its warm-up: how much of each window beam's sampled cone was blocked (with the 46n chunk split
 	// expected well below 100 %). Collected from read-back 60 to 300 frames after "Interior ready".
 	struct BeamShare
@@ -686,9 +623,9 @@ private:
 	std::unordered_map<const RE::BSLight*, BeamShare> beamShares;
 	std::uint32_t beamShareFrom = 0, beamShareUntil = 0;
 	bool beamSharePending = false;
-	void UpdateBeamGuard();
-	/// (46n) Window Beam Culling in effect: "Faces Toward the Room" (1) unless developer mode picks another (debug: they block).
-	[[nodiscard]] int EffectiveBeamCull() const;
+	void UpdateBeamShares();
+	/// (46n) Window Beam Culling in effect: fixed (47m) at "Faces Toward the Room" (1).
+	[[nodiscard]] static constexpr int EffectiveBeamCull() { return 1; }
 	/// Off, Penumbra, DLSS RR or SIGMA; anything else (the removed Temporal = 1) reads as Penumbra.
 	[[nodiscard]] static int ValidDenoiser(int a_value)
 	{

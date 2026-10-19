@@ -352,10 +352,6 @@ namespace RayTracingRT
 		bool sun = true;
 		// (46f) RTAO: recorded in its own list, submitted after the trace list, signalling the second fence (null = none).
 		const AOInput* ao = nullptr;
-		// (46m) Split Trace Sync: with the sun and the point lights traced, the sun goes in its own list and signals the sun
-		// fence before the point lights run; the D3D11 queue may then wait for the sun alone (WaitForSun) before the shadow
-		// mask passes and for the rest (WaitForTrace) only before the point lights' denoiser.
-		bool splitSun = false;
 		// (47l) Foliage sway: this frame's wind (BSTreeManager, or the shaders' last values extrapolated). false = no refit this
 		// frame (the wind BLASes keep their last pose); new wind meshes are still built (mean pose).
 		bool windValid = false;
@@ -614,25 +610,19 @@ namespace RayTracingRT
 		/// (46g) Character uploads made since start (for the per-phase transition log).
 		[[nodiscard]] std::uint64_t SkinUploadsTotal() const { return skinUploadsTotal_; }
 
-		/// (46p) Parallel BLAS Builds: the static builds of one batch get a scratch slice each and no barrier between them.
-		void SetParallelBuilds(bool a_on) { parallelBuilds_ = a_on; }
 		/// (46p) Trace submissions recorded so far (the newest RtPrepWork::submission).
 		[[nodiscard]] std::uint64_t SubmissionsTotal() const { return submissions_; }
 		/// (46p) Keep Our GPU Memory Resident: our video-memory resources (pools, TLAS, scratch, shared textures) get
 		/// D3D12_RESIDENCY_PRIORITY_HIGH (else NORMAL). Applied to what exists when it changes, and to every later creation.
 		void SetResidencyHigh(bool a_high);
 		[[nodiscard]] bool ResidencyHigh() const { return residencyHigh_.load(std::memory_order_relaxed); }
-		/// (46p) RT queue at D3D12_COMMAND_QUEUE_PRIORITY_HIGH; read by Initialize only (takes effect at the next start-up).
-		void SetQueuePriorityHigh(bool a_high) { queuePriorityHigh_ = a_high; }
-		[[nodiscard]] bool QueuePriorityHigh() const { return queueCreatedHigh_; }
 		/// (46p) Ray Tracing switched off: the shared textures, scratch buffers and the TLAS go (behind the fence, Retire);
 		/// recreated on the next switch-on. The pools already give their empty blocks back (OnSwitchedOff).
 		void ReleaseIdleResources();
 
-		/// (46q) RT: Submit on a Worker Thread. On: every call on our D3D12 queue (ExecuteCommandLists, Signal, Wait) is handed,
-		/// in order, to a submit thread at the end of each recording step; the render thread only records and does the D3D11
-		/// side (Signal / Wait). Off: called right away (46p). Takes effect at the next recording step that has no prepared frame.
-		void SetSubmitWorker(bool a_on) { submitWanted_ = a_on; }
+		/// (46q) Submit on a Worker Thread (always, 47m): every call on our D3D12 queue (ExecuteCommandLists, Signal, Wait) is
+		/// handed, in order, to a submit thread at the end of each recording step; the render thread only records and does the
+		/// D3D11 side (Signal / Wait). Internal fallback: should the thread not start, the calls are made right away (46p).
 		[[nodiscard]] bool SubmitWorkerInEffect() const { return submitOn_; }
 		/// (46q) The submit thread since the last call: batches handed over, longest batch (ms in D3D12 calls), the latest
 		/// batch's wait to start (ms from hand-over), the longest single call (ms); -1 = none.
@@ -645,16 +635,9 @@ namespace RayTracingRT
 			float maxCallMs = -1.0f;
 		};
 		SubmitSample TakeSubmitSample();
-		/// (46q) RT: Budget Builds by GPU Time. On: the static BLAS builds and merged-character builds of a frame are bounded by
-		/// a GPU-time budget (ms, from the measured GPU ms per triangle), merged-character builds by a count too, and a merged
-		/// character BLAS not drawn on a frame is kept for a grace period before it goes. Off: 46p (triangles / CPU / count only).
-		void SetBuildBudget(bool a_on, float a_gpuMs, std::uint32_t a_groupBuildsPerFrame, float a_graceMs)
-		{
-			budgetOn_ = a_on;
-			budgetGpuMs_ = a_gpuMs;
-			groupBuildCap_ = a_groupBuildsPerFrame;
-			groupGraceMs_ = a_graceMs;
-		}
+		/// (46q) Builds budgeted by GPU time (always, 47m): the static BLAS builds and merged-character builds of a frame are
+		/// bounded by a GPU-time budget (kBudgetGpuMs, from the measured GPU ms per triangle), merged-character builds by a count
+		/// too (kGroupBuildCap), and a merged character BLAS not drawn on a frame is kept kGroupGraceMs before it goes.
 		struct BudgetSample
 		{
 			float msPerMillionTris = -1.0f;   // EMA of the measured GPU ms per million triangles built (-1 = no sample yet)
@@ -800,13 +783,6 @@ namespace RayTracingRT
 		void ReleaseAONormalTexture();
 		[[nodiscard]] ID3D11UnorderedAccessView* AONormalUAV() const { return aoNormal_.uav11.Get(); }
 		[[nodiscard]] bool HasAONormalTexture() const { return aoNormal_.resource12 != nullptr; }
-		/// (47l) RTAO: Blue-Noise Rays: our cosine-direction spatiotemporal blue noise (128 x 128 x 64, RG8; Ray Tracing package
-		/// AOBlueNoise\rtao_stbn_cosine_2Dx1D_128x128x64.dds) as TraceAOCS t6. Read from disk and
-		/// created once (default heap; its upload goes out in the next RTAO list, then it stays a shader resource). False = not available
-		/// (missing / unexpected file, creation failed: logged once, the trace keeps the interleaved gradient noise).
-		bool EnsureAOBlueNoise();
-		void ReleaseAOBlueNoise();
-		[[nodiscard]] bool HasAOBlueNoise() const { return aoBlueNoise_ != nullptr; }
 		[[nodiscard]] ID3D11ShaderResourceView* AORawSRV() const { return aoRaw_.srv11.Get(); }
 		[[nodiscard]] const std::string& AOFault() const { return aoFault_; }
 		void ClearAOFault() { aoFault_.clear(); }
@@ -1123,13 +1099,10 @@ namespace RayTracingRT
 		/// (46p) a_owner: the video-memory owner it is counted under (F7 vram_*).
 		ComPtr<ID3D12Resource> CreateBuffer(std::uint64_t a_bytes, D3D12_HEAP_TYPE a_heap, D3D12_RESOURCE_STATES a_state, bool a_uav,
 			Util::FrameTrace::VramOwner a_owner = Util::FrameTrace::VramOwner::RtOther);
-		// (46p) Parallel BLAS Builds (a batch's scratch slices fit this, else the shared scratch and a barrier each), residency
-		// priority, queue priority.
+		// (46p) Parallel BLAS Builds (always, 47m: a batch's scratch slices fit this, else the shared scratch and a barrier each),
+		// residency priority.
 		static constexpr std::uint64_t kParallelScratchBytes = 64ull << 20;
-		bool parallelBuilds_ = false;
 		std::atomic<bool> residencyHigh_{ false };  // read on the pool thread too
-		bool queuePriorityHigh_ = false;
-		bool queueCreatedHigh_ = false;
 		/// (46p) Sets a_objects' residency priority to the current one (HIGH / NORMAL); null entries are skipped.
 		void ApplyResidency(ID3D12Pageable* const* a_objects, std::size_t a_count);
 		void ApplyResidency(ID3D12Pageable* a_object) { ApplyResidency(&a_object, 1); }
@@ -1159,25 +1132,21 @@ namespace RayTracingRT
 		HRESULT QueueSignal(ID3D12Fence* a_fence, std::uint64_t a_value, const char* a_what);
 		HRESULT QueueWait(ID3D12Fence* a_fence, std::uint64_t a_value, const char* a_what);
 		void KickSubmits();
-		/// Hands over what is staged and waits until the submit thread executed all of it (mode switch, shutdown).
-		void DrainSubmits();
 		/// A queue Signal the submit thread could not make: the fence value is set from the CPU (a D3D11 wait for it must end).
 		static void SignalFromCpu(const SubmitOp& a_op);
 		void StopSubmitThread();
 		void SubmitThreadMain();
-		/// Applies submitWanted_ when no prepared frame is open (draining first when switching off). False = keep the mode.
+		/// Starts the submit thread when no prepared frame is open (it stays off after a failed start: the internal fallback).
 		void ApplySubmitMode();
 		/// A D3D12 call the submit thread made failed: Fail() with it (render thread). True = failed.
 		bool CheckSubmitError();
 		/// The prep allocator / TLAS list of a context (Submit on a Worker Thread); false = could not be created.
 		bool EnsureWorkerLists(CommandContext& a_context);
-		bool submitWanted_ = false;
 		bool submitOn_ = false;
 		bool submitThreadFailed_ = false;
 		std::vector<SubmitOp> submitStaged_;
 		std::mutex submitMutex_;
 		std::condition_variable submitCv_;
-		std::condition_variable submitIdleCv_;
 		std::deque<SubmitBatch> submitQueue_;
 		bool submitStop_ = false;
 		bool submitBusy_ = false;
@@ -1193,20 +1162,19 @@ namespace RayTracingRT
 		// D3D11 queue first waits for the former before its next ready signal, so the fence never goes backwards.
 		std::uint64_t d3d12OnlySignal_ = 0;
 		std::uint64_t d3d11WaitedFor_ = 0;
-		// (46q) RT: Budget Builds by GPU Time.
-		bool budgetOn_ = false;
-		float budgetGpuMs_ = 1.0f;
-		std::uint32_t groupBuildCap_ = 3;
-		float groupGraceMs_ = 2000.0f;
+		// (46q) Builds budgeted by GPU time; fixed (47m) at the former settings' defaults.
+		static constexpr float kBudgetGpuMs = 1.0f;
+		static constexpr std::uint32_t kGroupBuildCap = 3;
+		static constexpr float kGroupGraceMs = 2000.0f;
 		BudgetSample budget_{};
 		double msPerTriEma_ = -1.0;  // GPU ms per triangle built (static + merged-character builds)
 		double prepBaseEma_ = -1.0;  // prep GPU ms on submissions without builds
 		std::uint64_t frameTrisUsed_ = 0;  // triangles built in the submission being recorded (static then merged)
-		/// The static triangle budget of this frame (budget on) or a_default.
+		/// The static triangle budget of this frame (at most a_default).
 		std::uint32_t StaticTriangleBudget(std::uint32_t a_default);
 		/// Feeds the cost model with a completed submission's prep GPU ms and its work.
 		void LearnBuildCost(float a_prepMs, const Util::FrameTrace::RtPrepWork& a_work);
-		/// Releases merged-character BLASes not drawn for longer than the grace period (all of them with the budget off).
+		/// Releases merged-character BLASes not drawn for longer than the grace period.
 		void ReleaseUnseenSkinGroups();
 		// (46p) The prep work being recorded (stored into the context with its timestamps); pool block totals at the last store.
 		Util::FrameTrace::RtPrepWork recWork_{};
@@ -1447,14 +1415,9 @@ namespace RayTracingRT
 		SharedTexture aoNormal_;  // (47j) RTAO: Smooth Normals (R32_FLOAT, packed octahedral normal)
 		std::uint32_t aoNormalWidth_ = 0, aoNormalHeight_ = 0;
 		void WriteAONormalDescriptor();
-		// (47l) RTAO: Blue-Noise Rays. The upload buffer lives until the RTAO list after the one that copied it (retired then).
-		static constexpr DXGI_FORMAT kAOBlueNoiseFormat = DXGI_FORMAT_R8G8_UNORM;  // the asset's format (DDS checked against it)
-		static constexpr std::uint32_t kAOBlueNoiseTexelBytes = 2;
-		ComPtr<ID3D12Resource> aoBlueNoise_;        // default heap, Texture2DArray RG8 128 x 128 x 64 (COPY_DEST until copied)
-		ComPtr<ID3D12Resource> aoBlueNoiseUpload_;  // upload heap, the file's texels (row pitch 256)
-		bool aoBlueNoiseCopyPending_ = false;       // the copy is not recorded yet
-		bool aoBlueNoiseRetirePending_ = false;     // the copy is recorded: retire the upload buffer in the next RTAO list
-		bool aoBlueNoiseFailed_ = false;            // tried and failed (logged once): IGN for this session
+		// (47l) TraceAOCS t6 (kDynAOBlueNoise) kept until the RT shader package (47m): always a null view of this format (the 47l
+		// blue-noise texture is gone).
+		static constexpr DXGI_FORMAT kAOBlueNoiseFormat = DXGI_FORMAT_R8G8_UNORM;
 		void WriteNullAOBlueNoiseDescriptor();
 		std::uint32_t aoWidth_ = 0, aoHeight_ = 0;
 		ComPtr<ID3D12Resource> aoCounter_;          // default heap, UAV: rays traced (monotonic, wraps)

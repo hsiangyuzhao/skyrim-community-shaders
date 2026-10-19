@@ -132,14 +132,10 @@ namespace Util::LightCensus
 		bool wsu = false;              ///< the reference or its LIGH comes from Window Shadows Ultimate (or its Supplement)
 	};
 
-	/// (46x) Wider Window Beam Detection: a window spot shadow light over kWindowBeamRadiusWide units is a window beam (46w:
-	/// over 10000), and a spot shadow light from Window Shadows Ultimate / its Supplement counts as a window light by its plugin
-	/// for that rule too. Set by Ray Tracing every frame (its Point Light Shadows switch); captures follow it.
+	/// (46x) Wider Window Beam Detection (always, 47m): a window spot shadow light over kWindowBeamRadiusWide units is a window
+	/// beam (46w: over 10000), and a spot shadow light from Window Shadows Ultimate / its Supplement counts as a window light by
+	/// its plugin for that rule too.
 	inline constexpr float kWindowBeamRadiusWide = 4096.0f;
-	void SetWiderWindowBeams(bool a_on);
-	[[nodiscard]] bool WiderWindowBeams();
-	/// The window-beam radius threshold in effect (10000, or kWindowBeamRadiusWide with the wider rule).
-	[[nodiscard]] float WindowBeamRadius();
 
 	/**
 	 * (46b) The census classifier for every frame (RT point-light shadows): one census-style read of the
