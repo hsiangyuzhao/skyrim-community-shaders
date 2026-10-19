@@ -60,7 +60,7 @@ RWTexture2D<unorm float4> Debug : register(u1);
 			// (46t) Two scales: the far segment; orange = no far sample (the near segment of that direction was blocked).
 			if (weight <= 0.0)
 				debug = notTraced;
-			else if ((Size.z & kFlagValidity) && raw.b <= 0.0)
+			else if ((Size.z & kFlagValidity) && RawFarWeight(raw.b) <= 0.0)
 				debug = float4(1.0, 0.5, 0.1, 1.0);
 			else
 				debug = float4(raw.rrr, 1.0);
@@ -82,6 +82,11 @@ RWTexture2D<unorm float4> Debug : register(u1);
 		} else if (Size.w >= kViewNormalConfidence && Size.w <= kViewNormalNg) {
 			// (47k) Smooth Normals: written by AONormalPrepCS this frame (blue tint: it did not run, e.g. Smooth Normals off).
 			debug = (Size.z & kFlagNormalDebug) ? NormalDebug[p] : notTraced;
+		} else if (Size.w == kViewHistory) {
+			// (47n) Written by RTAOTemporalCS (Temporal v2) this frame; without v2 a blue tint.
+			if (Size.z & kFlagTemporalV2)
+				return;
+			debug = notTraced;
 		}
 		Debug[p] = debug;
 	}

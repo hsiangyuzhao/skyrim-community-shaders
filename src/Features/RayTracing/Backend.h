@@ -327,7 +327,12 @@ namespace RayTracingRT
 		// beam rays (which may cull, Point Light Shadows > Window Beam Culling) pass the room's own shell from inside;
 		// the sun, point-light and RTAO rays cull nothing (their results do not change).
 		bool twoSided = true;
+		// (47n) Moved since last frame (its world transform differs from the engine's previous one): its instance carries
+		// kMovingInstanceKey in InstanceContributionToHitGroupIndex (TraceAOCS: RTAO's tight history near moving things).
+		bool moving = false;
 	};
+	/// (47n) InstanceContributionToHitGroupIndex of a moving scene instance (character instances carry their small owner keys).
+	inline constexpr std::uint32_t kMovingInstanceKey = 0x800000u;
 
 	struct FrameInput
 	{
@@ -1416,8 +1421,8 @@ namespace RayTracingRT
 		// Block layout: sun table (depth SRV, visibility UAV), point table (depth SRV, sun visibility SRV, PLVis UAV,
 		// PLIdx UAV), RTAO table (depth SRV, AO UAV).
 		// (47i) + the point table's water views (water distance SRV, water visibility UAV) after the RTAO table (offsets 6, 7 of the point table).
-		// (47l) + the RTAO blue noise SRV (RTAO table offset 5).
-		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynAOBlueNoise = 11, kDynamicDescriptors = 12;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4)
+		// (47n) The 47l RTAO blue noise SRV (slot 11) is gone.
+		static constexpr std::uint32_t kDynSun = 0, kDynPoint = 2, kDynAO = 6, kDynWater = 8, kDynAONormal = 10, kDynamicDescriptors = 11;  // (47j) + the RTAO smooth normals SRV (RTAO table offset 4)
 		static constexpr std::uint32_t kDynamicBase = kPointDescriptorBase + kPointDescriptors;  // after the (unused) 46b point slots
 		ComPtr<ID3D12DescriptorHeap> stagingHeap_;
 		[[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE StagingCpu(std::uint32_t a_slot) const;
@@ -1442,10 +1447,6 @@ namespace RayTracingRT
 		SharedTexture aoNormal_;  // (47j) RTAO: Smooth Normals (R32_FLOAT, packed octahedral normal)
 		std::uint32_t aoNormalWidth_ = 0, aoNormalHeight_ = 0;
 		void WriteAONormalDescriptor();
-		// (47l) TraceAOCS t6 (kDynAOBlueNoise) kept until the RT shader package (47m): always a null view of this format (the 47l
-		// blue-noise texture is gone).
-		static constexpr DXGI_FORMAT kAOBlueNoiseFormat = DXGI_FORMAT_R8G8_UNORM;
-		void WriteNullAOBlueNoiseDescriptor();
 		std::uint32_t aoWidth_ = 0, aoHeight_ = 0;
 		ComPtr<ID3D12Resource> aoCounter_;          // default heap, UAV: rays traced (monotonic, wraps)
 		ComPtr<ID3D12Resource> aoCounterReadback_;  // per context one uint32 copy of it

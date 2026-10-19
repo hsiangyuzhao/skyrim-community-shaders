@@ -40,8 +40,11 @@
 // most kAlphaCandidateBudget candidates per ray (past it the ray counts as blocked: bounded cost). (46t) AO Alpha
 // Budget: past the budget the ray may instead count as half open (kFlagAlphaHalf) or open (kFlagAlphaOpen).
 //
-// (47l) kFlagBlueNoise "RTAO: Blue-Noise Rays": the two uniform numbers of the cosine map from our spatiotemporal blue noise (t6)
-// instead of interleaved gradient noise (see main).
+// (47n) Fine Detail (kFlagDetail), Single Long Ray, the Character Self-Occlusion Fix and Smooth Normals v2 are always on (their
+// off paths are gone; the flags stay as they were set). The 47l blue-noise rays (t6) are gone.
+// (47n) kFlagDynamic "RTAO: Tight History Near Moving Things": .b carries whether any of the pixel's rays was blocked by a
+// character (the character rays) or a moving scene instance (InstanceContributionToHitGroupIndex == kMovingKey): the far weight
+// w (0, 0.5 or 1) is stored as 0.4 w, plus 0.6 for such a pixel (exact in 8 bits too; RTAOCommon.hlsli RawFarWeight / RawDynamic).
 //
 // (47h) kFlagSelfFix "RTAO: Character Self-Occlusion Fix": the character ray already starts Extra.x (6 units) along, yet near a
 // character's silhouette the ray-traced (GPU-skinned) mesh is a little off the drawn one, so a ray from a body pixel can start just
@@ -71,11 +74,6 @@ Texture2D<float> DepthMask : register(t1);
 RWTexture2D<float4> AOOut : register(u0);  // (47h) float: RGBA16F, or RGBA8 (kFlagDither8)
 RWByteAddressBuffer RayCounter : register(u1);  // rays traced (monotonic, read back for the F7 trace)
 Texture2D<float> AONormals : register(t5);   // (47j) kFlagSmoothNormals: AONormalPrepCS output (packed octahedral world normal, 0 = none)
-// (47l) kFlagBlueNoise: our spatiotemporal blue noise for these rays (Ray Tracing package AOBlueNoise/rtao_stbn_cosine_2Dx1D_128x128x64,
-// RG8: the two numbers u1, u2 of the cosine map; each slice a stratified set, one value per 2 x 2 cell of the 8-bit grid, i.e. a
-// stratified cosine-weighted direction set; blue in space and in time by the directions' tangent-plane distance), uploaded once
-// by the backend.
-Texture2DArray<float2> AOBlueNoise : register(t6);
 
 static const uint kFlagCharacters = 1u;   // characters are in the TLAS: the character ray
 static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near the camera
@@ -88,9 +86,8 @@ static const uint kFlagDither8 = 128u;    // (47h) the output is RGBA8: dither t
 static const uint kFlagSelfFix = 256u;    // (47h) RTAO: Character Self-Occlusion Fix (see the top)
 static const uint kFlagSmoothNormals = 512u;  // (47j) RTAO: Smooth Normals (see main)
 static const uint kFlagSmoothNormals2 = 1024u;  // (47k) RTAO: Smooth Normals v2 (with kFlagSmoothNormals): offsets along Ns, projection
-static const uint kFlagBlueNoise = 2048u;       // (47l) RTAO: Blue-Noise Rays (AOBlueNoise t6)
-static const uint kBlueNoiseSize = 128u;        // the texture's width / height (wrapped by the pixel)
-static const uint kBlueNoiseSlices = 64u;       // its slices (one per frame, wrapped)
+static const uint kFlagDynamic = 2048u;         // (47n) RTAO: Tight History Near Moving Things (see the top)
+static const uint kMovingKey = 0x800000u;       // (47n) Backend kMovingInstanceKey: a scene instance that moved since last frame
 static const uint kMaxDetailRays = 4u;
 static const float kSelfProbe = 4.0;          // (47h) CharacterAt: the probe reaches this far to either side of the pixel (units)
 static const float kSelfGrazeOffset = 1.5;    // (47h) extra ray start offset at a character pixel for a ray along the surface (units)
@@ -179,7 +176,7 @@ float InterleavedGradientNoise(float2 p, uint frame)
 
 // One ray against the scene (or the characters: a_mask), any hit ends it. 1 = open, 0 = blocked; (46t) past the alpha
 // candidate budget 0 (46s), 0.5 (kFlagAlphaHalf) or 1 (kFlagAlphaOpen). tHit = where it was blocked (else TMax).
-float Visibility(float3 origin, float3 dir, float tMin, float tMax, uint mask, float footprint, uint flags, out float tHit)
+float Visibility(float3 origin, float3 dir, float tMin, float tMax, uint mask, float footprint, uint flags, out float tHit, inout bool dyn)
 {
 	tHit = tMax;
 	if (!(tMin < tMax))
@@ -213,6 +210,7 @@ float Visibility(float3 origin, float3 dir, float tMin, float tMax, uint mask, f
 	}
 	if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
 		tHit = q.CommittedRayT();
+		dyn = dyn || (mask & kCharacterMasks) != 0u || q.CommittedInstanceContributionToHitGroupIndex() == kMovingKey;  // (47n)
 		return 0.0;
 	}
 	return exceeded ? ((flags & kFlagAlphaOpen) ? 1.0 : 0.5) : 1.0;
@@ -222,6 +220,7 @@ float Visibility(float3 origin, float3 dir, float tMin, float tMax, uint mask, f
 	q.Proceed();
 	if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
 		tHit = q.CommittedRayT();
+		dyn = dyn || (mask & kCharacterMasks) != 0u || q.CommittedInstanceContributionToHitGroupIndex() == kMovingKey;  // (47n)
 		return 0.0;
 	}
 	return 1.0;
@@ -231,7 +230,7 @@ float Visibility(float3 origin, float3 dir, float tMin, float tMax, uint mask, f
 // (46y, kFlagSingleRay) The nearest blocker on [tMin, tMax] (closest hit; cut-outs tested against their alpha as in Visibility):
 // o_hit / o_tHit. Returns false when the ray went past the alpha candidate budget (twice Visibility's: it covers both segments);
 // the caller then traces the two segments instead, so the near / far result is always the one the segments define.
-bool ClosestBlocker(float3 origin, float3 dir, float tMin, float tMax, uint mask, float footprint, out bool o_hit, out float o_tHit)
+bool ClosestBlocker(float3 origin, float3 dir, float tMin, float tMax, uint mask, float footprint, out bool o_hit, out float o_tHit, inout bool dyn)
 {
 	o_hit = false;
 	o_tHit = tMax;
@@ -267,6 +266,7 @@ bool ClosestBlocker(float3 origin, float3 dir, float tMin, float tMax, uint mask
 	if (complete && q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
 		o_hit = true;
 		o_tHit = q.CommittedRayT();
+		dyn = dyn || (mask & kCharacterMasks) != 0u || q.CommittedInstanceContributionToHitGroupIndex() == kMovingKey;  // (47n)
 	}
 	return complete;
 }
@@ -480,34 +480,34 @@ bool CharacterClosestSelf(float3 origin, float3 dir, float tStart, float tMax, f
 
 // One segment [tMin, tMax] of a direction: the scene, then (still open and passing a character's bounds) the characters
 // (their ray starts at least Extra.x along). The darker of the two; tHit = where it was blocked. Counts its rays.
-float Segment(float3 origin, float3 dir, float tMin, float tMax, float footprint, uint flags, bool characters, SelfInfo self, inout uint rays, out float tHit)
+float Segment(float3 origin, float3 dir, float tMin, float tMax, float footprint, uint flags, bool characters, SelfInfo self, inout uint rays, out float tHit,
+	inout bool dyn)
 {
-	float v = Visibility(origin, dir, tMin, tMax, kSceneMask, footprint, flags, tHit);
+	float v = Visibility(origin, dir, tMin, tMax, kSceneMask, footprint, flags, tHit, dyn);
 	rays += 1u;
 	[branch] if (v > 0.0 && characters && (SphereOnSegment(origin, dir, tMax, C.Spheres[0]) || SphereOnSegment(origin, dir, tMax, C.Spheres[1])))
 	{
 		float tCharacter;
+		bool unused = false;
 		const float vc = self.valid ? CharacterVisibilitySelf(origin, dir, max(tMin, C.Extra.x), tMax, footprint, flags, self, tCharacter) :
-		                              Visibility(origin, dir, max(tMin, C.Extra.x), tMax, kCharacterMasks, footprint, flags, tCharacter);
+		                              Visibility(origin, dir, max(tMin, C.Extra.x), tMax, kCharacterMasks, footprint, flags, tCharacter, unused);
 		rays += 1u;
 		if (vc < v) {
 			v = vc;
 			tHit = tCharacter;
 		}
+		dyn = dyn || vc < 1.0;  // (47n) a character blocked it
+
 	}
 	return v;
 }
 
-// (47j) A direction below the depth normal's plane mirrored above it (Smooth Normals: the hemisphere is around Ns; with Ns = Ng
-// nothing changes: every cosine direction is above it).
-// (47k) a_project (Smooth Normals v2): instead laid onto the plane (lifted to 0.02 above it): the mirror flipped the directions next
-// to the plane between the two sides of a facet edge and left a step there.
-float3 AboveNg(float3 d, float3 Ng, bool a_on, bool a_project)
+// (47j, 47k) Smooth Normals: a direction below the depth normal's plane laid onto it (lifted to 0.02 above it; the 47j mirror is gone
+// since 47n: it flipped the directions next to the plane between the two sides of a facet edge). With Ns = Ng nothing changes.
+float3 AboveNg(float3 d, float3 Ng, bool a_on)
 {
 	const float k = dot(d, Ng);
-	[branch] if (a_project)
-		return (a_on && k < 0.02) ? normalize(d - Ng * (k - 0.02)) : d;
-	return (a_on && k < 0.0) ? d - 2.0 * k * Ng : d;
+	return (a_on && k < 0.02) ? normalize(d - Ng * (k - 0.02)) : d;
 }
 
 // Cosine-weighted direction in the hemisphere around N (T, B: its tangent frame) from two uniform numbers.
@@ -527,7 +527,7 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 	const uint flags = asuint(C.Params.y);
 	const float depth = abs(DepthMask[p]);
 	uint rays = 0u;
-	float4 result = float4(1.0, 0.0, 1.0, 1.0);
+	float4 result = float4(1.0, 0.0, 0.4, 1.0);  // (47n) .b: far weight 1 (x 0.4), not traced
 	[branch] if (depth < 0.999999 && depth > 0.0)
 	{
 		const float3 P = PositionAt(p, depth);
@@ -552,25 +552,15 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 
 			// Cosine-weighted direction (noise changes every frame; the D3D11 filter averages it).
 			const uint frame = uint(C.Params.x);
-			float u1 = InterleavedGradientNoise(float2(p), frame);
-			float u2 = frac(InterleavedGradientNoise(float2(p.yx) + float2(29.0, 61.0), frame * 7u + 3u) + float(frame % 64u) * 0.6180339887);
-			// (47l) kFlagBlueNoise: the two numbers from the spatiotemporal blue noise instead (pixel wrapped at 128, one slice per
-			// frame): through the cosine map the directions of neighbouring pixels, and of one pixel over the frames, are spread
-			// evenly, so the spatial filter and the history average the noise out faster. Its two channels (8-bit) mapped to the
-			// centres of their 256 steps. The extra Fine Detail directions below keep their R2 offsets from
-			// these (a toroidal shift: each ray's pattern stays blue, a pixel's rays stay spread). Off: interleaved gradient noise (47k).
-			[branch] if (flags & kFlagBlueNoise)
-			{
-				const float2 bn = AOBlueNoise.Load(int4(int2(uint2(p) % kBlueNoiseSize), int(frame % kBlueNoiseSlices), 0));
-				u1 = (round(bn.x * 255.0) + 0.5) / 256.0;
-				u2 = (round(bn.y * 255.0) + 0.5) / 256.0;
-			}
+			const float u1 = InterleavedGradientNoise(float2(p), frame);
+			const float u2 = frac(InterleavedGradientNoise(float2(p.yx) + float2(29.0, 61.0), frame * 7u + 3u) + float(frame % 64u) * 0.6180339887);
 			// (47j) kFlagSmoothNormals: the hemisphere (every cosine direction, the Fine Detail ones too) is built around the smooth
 			// normal Ns (AONormalPrepCS: last frame's G-buffer normal reprojected, already blended toward Ng by its confidence), bent
-			// smoothly toward the depth normal N (= Ng) where they disagree; a direction below the Ng plane is mirrored above it. The
-			// ray start offsets stay along Ng. Off: Ns = Ng (47i exactly).
+			// smoothly toward the depth normal N (= Ng) where they disagree; (47k, always since 47n) a direction below the Ng plane is
+			// laid onto it and the ray start offsets follow Ns. Off: Ns = Ng (47i exactly).
 			float3 Ns = N;
-			[branch] if (flags & kFlagSmoothNormals)
+			const bool smoothOn = (flags & kFlagSmoothNormals) != 0u;
+			[branch] if (smoothOn)
 			{
 				const uint packed = asuint(AONormals[p]);
 				[branch] if (packed != 0u)
@@ -593,95 +583,89 @@ float3 CosineDirection(float2 u, float3 T, float3 B, float3 N)
 			const float3 helper = abs(Ns.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
 			const float3 T = normalize(cross(helper, Ns));
 			const float3 B = cross(Ns, T);
-			const bool smoothOn = (flags & kFlagSmoothNormals) != 0u;
-			const bool smooth2 = smoothOn && (flags & kFlagSmoothNormals2) != 0u;
-			const float3 dir = AboveNg(CosineDirection(float2(u1, u2), T, B, Ns), N, smoothOn, smooth2);
+			const float3 dir = AboveNg(CosineDirection(float2(u1, u2), T, B, Ns), N, smoothOn);
 
 			const float rayLength = C.Params.z;
 			const float bias = C.Fade.z + C.Fade.w * dist;
 			const float footprint = dist * 2.0 * C.RenderSize.w;  // about a pixel's size there (alpha mip choice)
 			const bool characters = (flags & kFlagCharacters) && !((flags & kFlagFirstPerson) && dist < kFirstPersonNear);
-			// (47h) kFlagSelfFix: is this pixel a character (only inside the character bounds)? Off / not one: every ray as in 47g.
+			// (47h) Character Self-Occlusion Fix (always, 47n): is this pixel a character (only inside the character bounds)?
 			SelfInfo self;
 			self.valid = false;
 			self.owner = 0u;
 			self.outerFront = true;
-			[branch] if ((flags & kFlagSelfFix) && characters && (PointInSphere(P, C.Spheres[0]) || PointInSphere(P, C.Spheres[1])))
+			[branch] if (characters && (PointInSphere(P, C.Spheres[0]) || PointInSphere(P, C.Spheres[1])))
 			{
 				self = CharacterAt(P, V, N);
 				rays += 1u;
 			}
-			// The ray start: the 47g offset along the normal; (47h) at a character pixel up to kSelfGrazeOffset more for a grazing ray.
-			// (47k) Smooth Normals v2: the offsets along the smooth normal (the facet's jumped at every facet edge). Ns = N without data.
-			const float3 Noff = smooth2 ? Ns : N;
+			// The ray start: the 47g offset along the normal ((47k) the smooth one; Ns = N without data); (47h) at a character pixel up
+			// to kSelfGrazeOffset more for a grazing ray.
+			const float3 Noff = Ns;
 			const float3 origin = P + Noff * bias;
 			const float3 origin0 = self.valid ? P + Noff * (bias + kSelfGrazeOffset * (1.0 - abs(dot(Noff, dir)))) : origin;
-			[branch] if (flags & kFlagDetail)
+			// (46t) Two scales (always, 47n): the long direction's near and (where that is open) far segment, more near-only directions.
+			const float shortLength = clamp(C.Extra.y, 1.0, rayLength);
+			// (46y, kFlagHalfFar) The far part on half the pixels (checkerboard, swapped every frame); the others write far weight 0
+			// (.b), which the filter's weighted mean already reads as "no far sample here" (as where the near part was blocked).
+			const bool farHere = !(flags & kFlagHalfFar) || (((uint(p.x) + uint(p.y) + frame) & 1u) == 0u);
+			float near0 = 1.0;
+			float far = 1.0;
+			bool traced = false;
+			bool dyn = false;  // (47n) a ray of this pixel was blocked by a character or a moving object
+			// (46y, Single Long Ray: always, 47n) One closest-hit ray over [0, L]: blocked before D = near blocked (no far sample),
+			// between D and L = near open and far blocked, nothing = both open: the two segments' result with one ray. The character ray
+			// likewise, over [Extra.x, D] when the scene already blocks the far part, else over [Extra.x, L].
+			[branch] if (farHere && shortLength < rayLength)
 			{
-				// (46t) Two scales: the long direction's near and (where that is open) far segment, more near-only directions.
-				const float shortLength = clamp(C.Extra.y, 1.0, rayLength);
-				// (46y, kFlagHalfFar) The far part on half the pixels (checkerboard, swapped every frame); the others write far weight 0
-				// (.b), which the filter's weighted mean already reads as "no far sample here" (as where the near part was blocked).
-				const bool farHere = !(flags & kFlagHalfFar) || (((uint(p.x) + uint(p.y) + frame) & 1u) == 0u);
-				float near0 = 1.0;
-				float far = 1.0;
-				bool traced = false;
-				// (46y, kFlagSingleRay) One closest-hit ray over [0, L]: blocked before D = near blocked (no far sample), between D and L
-				// = near open and far blocked, nothing = both open: the two segments' result with one ray. The character ray likewise,
-				// over [Extra.x, D] when the scene already blocks the far part, else over [Extra.x, L].
-				[branch] if ((flags & kFlagSingleRay) && farHere && shortLength < rayLength)
+				bool sceneHit, charHit = false;
+				float tScene, tChar = rayLength;
+				bool sceneDyn = false;
+				bool complete = ClosestBlocker(origin0, dir, 0.0, rayLength, kSceneMask, footprint, sceneHit, tScene, sceneDyn);
+				rays += 1u;
+				const bool nearBlockedByScene = sceneHit && tScene < shortLength;
+				const float charEnd = sceneHit ? shortLength : rayLength;
+				[branch] if (complete && !nearBlockedByScene && characters && (SphereOnSegment(origin0, dir, charEnd, C.Spheres[0]) || SphereOnSegment(origin0, dir, charEnd, C.Spheres[1])))
 				{
-					bool sceneHit, charHit = false;
-					float tScene, tChar = rayLength;
-					bool complete = ClosestBlocker(origin0, dir, 0.0, rayLength, kSceneMask, footprint, sceneHit, tScene);
+					bool unused = false;
+					complete = self.valid ? CharacterClosestSelf(origin0, dir, max(0.0, C.Extra.x), charEnd, footprint, self, charHit, tChar) :
+					                        ClosestBlocker(origin0, dir, max(0.0, C.Extra.x), charEnd, kCharacterMasks, footprint, charHit, tChar, unused);
 					rays += 1u;
-					const bool nearBlockedByScene = sceneHit && tScene < shortLength;
-					const float charEnd = sceneHit ? shortLength : rayLength;
-					[branch] if (complete && !nearBlockedByScene && characters && (SphereOnSegment(origin0, dir, charEnd, C.Spheres[0]) || SphereOnSegment(origin0, dir, charEnd, C.Spheres[1])))
-					{
-						complete = self.valid ? CharacterClosestSelf(origin0, dir, max(0.0, C.Extra.x), charEnd, footprint, self, charHit, tChar) :
-						                        ClosestBlocker(origin0, dir, max(0.0, C.Extra.x), charEnd, kCharacterMasks, footprint, charHit, tChar);
-						rays += 1u;
-					}
-					[branch] if (complete)
-					{
-						const bool nearBlocked = nearBlockedByScene || (charHit && tChar < shortLength);
-						near0 = nearBlocked ? 0.0 : 1.0;
-						far = (!nearBlocked && (sceneHit || charHit)) ? 0.0 : 1.0;
-						traced = true;
-					}
 				}
-				[branch] if (!traced)
+				[branch] if (complete)
 				{
-					float tNear;
-					near0 = Segment(origin0, dir, 0.0, shortLength, footprint, flags, characters, self, rays, tNear);
-					far = 1.0;
-					[branch] if (near0 > 0.0 && shortLength < rayLength && farHere)
-					{
-						float tFar;
-						far = Segment(origin0, dir, shortLength, rayLength, footprint, flags, characters, self, rays, tFar);
-					}
+					const bool nearBlocked = nearBlockedByScene || (charHit && tChar < shortLength);
+					near0 = nearBlocked ? 0.0 : 1.0;
+					far = (!nearBlocked && (sceneHit || charHit)) ? 0.0 : 1.0;
+					dyn = sceneDyn || charHit;
+					traced = true;
 				}
-				float nearSum = near0;
-				const uint extra = min(uint(C.Extra.z), kMaxDetailRays);
-				[loop] for (uint i = 1u; i <= extra; ++i)
-				{
-					// Offsets of the R2 sequence: the extra directions stay well spread around the first one.
-					const float2 u = frac(float2(u1, u2) + float(i) * float2(0.7548776662, 0.5698402910));
-					const float3 dirExtra = AboveNg(CosineDirection(u, T, B, Ns), N, smoothOn, smooth2);
-					const float3 originExtra = self.valid ? P + Noff * (bias + kSelfGrazeOffset * (1.0 - abs(dot(Noff, dirExtra)))) : origin;
-					float tExtra;
-					nearSum += Segment(originExtra, dirExtra, 0.0, shortLength, footprint, flags, characters, self, rays, tExtra);
-				}
-				result = float4(far, weight, farHere ? near0 : 0.0, nearSum / float(extra + 1u));
 			}
-			else
+			[branch] if (!traced)
 			{
-				float tHit;
-				const float v = Segment(origin0, dir, 0.0, rayLength, footprint, flags, characters, self, rays, tHit);
-				result = float4(v, weight, v < 1.0 ? saturate(tHit / max(rayLength, 1.0)) : 1.0, 1.0);
+				float tNear;
+				near0 = Segment(origin0, dir, 0.0, shortLength, footprint, flags, characters, self, rays, tNear, dyn);
+				far = 1.0;
+				[branch] if (near0 > 0.0 && shortLength < rayLength && farHere)
+				{
+					float tFar;
+					far = Segment(origin0, dir, shortLength, rayLength, footprint, flags, characters, self, rays, tFar, dyn);
+				}
 			}
-			// (47h) RGBA8 output: the weight's distance fade gets a +-0.5 LSB triangular dither (two uniform numbers), only inside
+			float nearSum = near0;
+			const uint extra = min(uint(C.Extra.z), kMaxDetailRays);
+			[loop] for (uint i = 1u; i <= extra; ++i)
+			{
+				// Offsets of the R2 sequence: the extra directions stay well spread around the first one.
+				const float2 u = frac(float2(u1, u2) + float(i) * float2(0.7548776662, 0.5698402910));
+				const float3 dirExtra = AboveNg(CosineDirection(u, T, B, Ns), N, smoothOn);
+				const float3 originExtra = self.valid ? P + Noff * (bias + kSelfGrazeOffset * (1.0 - abs(dot(Noff, dirExtra)))) : origin;
+				float tExtra;
+				nearSum += Segment(originExtra, dirExtra, 0.0, shortLength, footprint, flags, characters, self, rays, tExtra, dyn);
+			}
+			// .b: the far weight x 0.4, + 0.6 for a pixel with a moving occluder (kFlagDynamic; see the top).
+			const bool dynamicHere = dyn && (flags & kFlagDynamic) != 0u;
+			result = float4(far, weight, (farHere ? near0 : 0.0) * 0.4 + (dynamicHere ? 0.6 : 0.0), nearSum / float(extra + 1u));			// (47h) RGBA8 output: the weight's distance fade gets a +-0.5 LSB triangular dither (two uniform numbers), only inside
 			// the fade (exactly 0 and 1 stay exact).
 			[branch] if ((flags & kFlagDither8) && result.g > 0.0 && result.g < 1.0)
 			{

@@ -43,7 +43,7 @@ struct PLConstants
 	float4 Bias;                     // x constant ray offset, y per unit of distance, z character ray TMin, w emitter radius
 	float4 Extra;                    // x least share of the pixel's point light that is traced, y least absolute contribution,
 	                                 // z least share of the sun's light at a sunlit pixel (the sun gate), (46q) w carrier clearance
-	                                 // (units; < 0 = 46p: a carried light never tests its carrier)
+	                                 // (units; (47n) always >= 0: the 46p "never tests its carrier" path is gone)
 	float4 Spheres[2];               // character bounds (camera-relative xyz, radius; 0 = none): [0] the player, [1] the others
 	float4 Sun;                      // xyz to the sun (world axes), w its strength (brightest channel; 0 = no sun gate)
 	float4 Bounds;                   // (46c) x / y camera-relative z min / max of the interior, z ray margin past it,
@@ -79,7 +79,7 @@ static const uint kFlagFirstPerson = 2u;  // no character ray for pixels near th
 static const uint kFlagCharCull = 4u;     // the character ray only where the segment passes a character's bounds
 static const uint kFlagSticky = 8u;          // (46g) last frame's sources of the pixel rank x kStickyBonus and pass at half the share cut
 static const uint kFlagBeamCullFront = 16u;  // (46g) window beam rays cull triangles facing the ray start (the room shell from inside)
-static const uint kFlagBeamCullBack = 32u;   // (46g) ... or the ones facing away
+                                             // ((47n) the cull-back flag 32 is gone: Window Beam Culling is fixed at this one)
 static const uint kFlagRtSurface = 64u;      // (46y) probe whether the visible surface is a traced caster (PLIdx.w bit 7)
 static const uint kFlagWater = 128u;         // (47i) trace the pixel's sources from last frame's water surface too (PLWaterVis)
 static const float kStickyBonus = 1.5;
@@ -263,7 +263,7 @@ bool Blocked(float3 origin, float3 dir, float tMax, uint mask, float tMin, float
 // InstanceContributionToHitGroupIndex = its key, Backend) are not tested. Every candidate comes back (forced
 // non-opaque); the opaque instances (ID 0) block as usual, the alpha-tested ones are tested against their cut-out
 // (RT_ALPHA) or ignored (without it they are culled in Blocked() too).
-// (46q) ownerTMax >= 0 (Carrier Casts Shadows from Its Own Light): the carrier's own instances do block, but only where the ray
+// (46q) Carrier Casts Shadows from Its Own Light (always, 47n): the carrier's own instances do block, but only where the ray
 // meets them before ownerTMax (farther than the carrier clearance from the light): the hand and arm holding the torch do not.
 bool BlockedExcept(float3 origin, float3 dir, float tMax, uint mask, float tMin, float footprint, uint owner, float ownerTMax, out float tHit)
 {
@@ -280,7 +280,7 @@ bool BlockedExcept(float3 origin, float3 dir, float tMax, uint mask, float tMin,
 	while (q.Proceed()) {
 		if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
 			continue;
-		if (q.CandidateInstanceContributionToHitGroupIndex() == owner && (ownerTMax < 0.0 || q.CandidateTriangleRayT() >= ownerTMax))
+		if (q.CandidateInstanceContributionToHitGroupIndex() == owner && q.CandidateTriangleRayT() >= ownerTMax)
 			continue;
 		const uint id = q.CandidateInstanceID();
 		bool blocks = id == 0u;
@@ -343,7 +343,7 @@ float4 TraceFromWater(int2 p, uint4 idx, float waterDist, uint flags, float n0, 
 	const float3 N = float3(0.0, 0.0, 1.0);
 	const float3 origin = W + N * (C.Bias.x + C.Bias.y * waterDist);
 	const bool characters = (flags & kFlagCharacters) && !((flags & kFlagFirstPerson) && waterDist < kFirstPersonNear);
-	const uint beamCull = (flags & kFlagBeamCullFront) ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : ((flags & kFlagBeamCullBack) ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : RAY_FLAG_NONE);
+	const uint beamCull = (flags & kFlagBeamCullFront) ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : RAY_FLAG_NONE;
 	const float footprint = waterDist * 2.0 * C.RenderSize.w;
 	[unroll] for (uint k = 0u; k < 4u; ++k)
 	{
@@ -387,7 +387,7 @@ float4 TraceFromWater(int2 p, uint4 idx, float waterDist, uint flags, float n0, 
 				test = (!ownLight && SphereOnSegment(origin, dir, tMax, C.Spheres[0])) || SphereOnSegment(origin, dir, tMax, C.Spheres[1]);
 			if (test) {
 				const uint owner = src.Info.w & 0xFFFFFFu;
-				const float ownerTMax = C.Extra.w >= 0.0 ? max(len - C.Extra.w, 0.0) : -1.0;
+				const float ownerTMax = max(len - max(C.Extra.w, 0.0), 0.0);
 				if (owner != 0u)
 					blocked = BlockedExcept(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, owner, ownerTMax, tHit);
 				else
@@ -554,7 +554,7 @@ groupshared uint gsMask[2];
 		threshold = max(threshold, sunTerm * C.Extra.z);
 		stickyThreshold = max(stickyThreshold, sunTerm * C.Extra.z);
 	}
-	const uint beamCull = (flags & kFlagBeamCullFront) ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : ((flags & kFlagBeamCullBack) ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : RAY_FLAG_NONE);
+	const uint beamCull = (flags & kFlagBeamCullFront) ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : RAY_FLAG_NONE;
 	const bool beamSample = ((p.x & 3) | (p.y & 3)) == 0;  // (46g) 1 of 16 pixels feeds the beam counters
 	float4 vis = 1.0;
 	uint rays = (flags & kFlagRtSurface) ? 1u : 0u;  // (46y) the surface probe above
@@ -609,7 +609,7 @@ groupshared uint gsMask[2];
 				// (46e) A light carried by a traced character (Info.w = its key): that character's body is not tested.
 				const uint owner = src.Info.w & 0xFFFFFFu;
 				// (46q) Carrier Casts Shadows (Extra.w >= 0): its body blocks except within the carrier clearance of the light.
-				const float ownerTMax = C.Extra.w >= 0.0 ? max(len - C.Extra.w, 0.0) : -1.0;
+				const float ownerTMax = max(len - max(C.Extra.w, 0.0), 0.0);
 				if (owner != 0u)
 					blocked = BlockedExcept(origin, dir, tMax, ownLight ? kNpcMask : kCharacterMasks, C.Bias.z, footprint, owner, ownerTMax, tHit);
 				else

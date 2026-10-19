@@ -21,6 +21,12 @@
 //   - history fix: while n < Temporal.z the current value is replaced (fading out as n grows) by a wider edge-aware blur of this
 //     frame's filtered result (5x5 taps, 3 / 2 pixels apart): a fresh pixel starts from a smooth value, never from older frames.
 //   Nothing is blurred after this blend (the composite reads it as it is).
+// (47n) kFlagDynamicHistory "RTAO: Tight History Near Moving Things": a pixel whose own rays or a 3x3 neighbour's were blocked by a
+//   character or a moving object this frame (TraceAOCS .b, t9), or that was such a pixel last frame (bit 7 of its stored large-scale
+//   length), keeps at most 1 frame of history (n <= 1) and is clamped to mean +- 1 sd of this frame's 3x3 (at least the usual
+//   minimum half width): the dark trail a walking character or a swinging door left behind is gone within a frame or two.
+// (47n) Debug view "Temporal v2: History" (Size.w == kViewHistory, u4): red = no usable history (rejected), green = the clamp moved
+//   the history, blue = history length / 32, whitened = the moving-occluder flag of this frame.
 
 #include "RayTracing/RTAOCommon.hlsli"
 
@@ -41,6 +47,8 @@ RWTexture2D<unorm float> Output : register(u0);
 RWTexture2D<unorm float> OutputDetail : register(u1);
 RWTexture2D<unorm float2> LengthOut : register(u2);
 RWTexture2D<uint> GeometryOut : register(u3);
+Texture2D<float4> Raw : register(t9);                 // (47n) TraceAOCS' output: .b carries the moving-occluder flag (RawDynamic)
+RWTexture2D<unorm float4> HistoryDebug : register(u4); // (47n) the debug view (only bound while it is on)
 
 static const int kTileRadius = 6;  // the history fix reaches 2 x 3 pixels
 static const int kTile = 8 + 2 * kTileRadius;
@@ -53,6 +61,7 @@ groupshared float g_large[kTileCount];
 groupshared float g_detail[kTileCount];
 groupshared float g_z[kTileCount];
 groupshared float3 g_n[kTileCount];
+groupshared uint g_dyn[kTileCount];  // (47n) this frame's moving-occluder flag per tile pixel
 
 float LinearDepth(float a_depth)
 {
@@ -123,6 +132,7 @@ float FixBlur(bool a_detail, int a_centre, float a_z, float a_slope, float3 a_n,
 			const float d = DepthTexture[q];
 			g_z[slot] = (d > 0.0 && d < 1.0) ? LinearDepth(d) : 0.0;
 			g_n[slot] = float3(GBuffer::DecodeNormal(NormalRoughness[q].xy));
+			g_dyn[slot] = ((Size.z & kFlagDynamicHistory) != 0u && RawDynamic(Raw[q].b)) ? 1u : 0u;
 		}
 	}
 	GroupMemoryBarrierWithGroupSync();
@@ -157,15 +167,29 @@ float FixBlur(bool a_detail, int a_centre, float a_z, float a_slope, float3 a_n,
 	}
 	m1 /= 25.0;
 	d1 /= 25.0;
-	const float halfWidth = max(Clamp.x * sqrt(max(m2 / 25.0 - m1 * m1, 0.0)), Clamp.z);
-	const float lo = min(m1 - halfWidth, current), hi = max(m1 + halfWidth, current);
-	const float halfWidthDetail = max(Clamp.x * sqrt(max(d2 / 25.0 - d1 * d1, 0.0)), Clamp.y);
-	const float dLo = min(d1 - halfWidthDetail, currentDetail), dHi = max(d1 + halfWidthDetail, currentDetail);
+	float halfWidth = max(Clamp.x * sqrt(max(m2 / 25.0 - m1 * m1, 0.0)), Clamp.z);
+	float halfWidthDetail = max(Clamp.x * sqrt(max(d2 / 25.0 - d1 * d1, 0.0)), Clamp.y);
+	// (47n) The moving-occluder flag of this frame in the 3x3 around the pixel, and the 3x3 statistics for its tight clamp.
+	bool dynNow = false;
+	float s1 = 0.0, s2 = 0.0, t1 = 0.0, t2 = 0.0;
+	[unroll] for (int fy = -1; fy <= 1; ++fy)
+	{
+		[unroll] for (int fx = -1; fx <= 1; ++fx)
+		{
+			const int slot = c + fy * kTile + fx;
+			dynNow = dynNow || g_dyn[slot] != 0u;
+			s1 += g_large[slot];
+			s2 += g_large[slot] * g_large[slot];
+			t1 += g_detail[slot];
+			t2 += g_detail[slot] * g_detail[slot];
+		}
+	}
 
 	// Last frame: the 2x2 bilinear taps around where the motion vectors put this pixel, each weighted by how well its stored
 	// geometry matches this surface (depth where the camera says it must have been, normal).
 	float histLarge = current, histDetail = currentDetail;
 	float nLarge = 0.0, nDetail = 0.0;
+	bool dynPrev = false;  // (47n) last frame's flag at an agreeing history tap
 	// This point (camera-relative) and its view depth by the matrices (1 / w of the inverse: the same measure as last frame's
 	// clip.w below, so no near / far convention can bias the comparison). Stored for next frame.
 	const float2 uv = (float2(p) + 0.5) / float2(Size.xy);
@@ -197,7 +221,11 @@ float FixBlur(bool a_detail, int a_centre, float a_z, float a_slope, float3 a_n,
 				const float bilinear = (o.x != 0 ? f.x : 1.0 - f.x) * (o.y != 0 ? f.y : 1.0 - f.y);
 				const float agree = (1.0 - smoothstep(tol, 2.0 * tol, abs(zPrev - zExpected))) * smoothstep(0.6, 0.85, dot(nPrev, n));
 				const float w = bilinear * agree;
-				const float2 len = HistoryLength[q] * 255.0;
+				float2 len = HistoryLength[q] * 255.0;
+				// (47n) Bit 7 of the large-scale length: that pixel had a moving occluder last frame.
+				const bool tapDyn = len.x >= 127.5;
+				len.x = tapDyn ? len.x - 128.0 : len.x;
+				dynPrev = dynPrev || (tapDyn && w > 0.0);
 				sumW += w;
 				sumL += w * History[q];
 				sumNL += w * len.x;
@@ -217,6 +245,30 @@ float FixBlur(bool a_detail, int a_centre, float a_z, float a_slope, float3 a_n,
 			nDetail = (detail && (Size.z & kFlagDetailHistory)) ? sumND / sumW * confidence : 0.0;
 		}
 	}
+
+	// (47n) Tight history near moving things: at most 1 frame of history and mean +- 1 sd of the 3x3 (at least the minimum widths).
+	const bool dynamicPixel = (Size.z & kFlagDynamicHistory) != 0u && (dynNow || dynPrev);
+	float lo, hi, dLo, dHi;
+	[branch] if (dynamicPixel)
+	{
+		nLarge = min(nLarge, 1.0);
+		nDetail = min(nDetail, 1.0);
+		const float mean = s1 / 9.0, meanD = t1 / 9.0;
+		halfWidth = max(sqrt(max(s2 / 9.0 - mean * mean, 0.0)), Clamp.z);
+		halfWidthDetail = max(sqrt(max(t2 / 9.0 - meanD * meanD, 0.0)), Clamp.y);
+		lo = min(mean - halfWidth, current);
+		hi = max(mean + halfWidth, current);
+		dLo = min(meanD - halfWidthDetail, currentDetail);
+		dHi = max(meanD + halfWidthDetail, currentDetail);
+	}
+	else
+	{
+		lo = min(m1 - halfWidth, current);
+		hi = max(m1 + halfWidth, current);
+		dLo = min(d1 - halfWidthDetail, currentDetail);
+		dHi = max(d1 + halfWidthDetail, currentDetail);
+	}
+	const bool rejected = nLarge <= 0.0;
 
 	// History fix: a short history starts from a wider blur of this frame (fading out by Temporal.z frames).
 	const float fixLarge = saturate(1.0 - nLarge / Temporal.z);
@@ -238,7 +290,16 @@ float FixBlur(bool a_detail, int a_centre, float a_z, float a_slope, float3 a_n,
 		OutputDetail[p] = lerp(clamp(histDetail, dLo, dHi), useDetail, aDetail);
 		nDetailNew = min(nDetail + 1.0, Temporal.w);
 	}
-	LengthOut[p] = float2(min(nLarge + 1.0, Temporal.w), nDetailNew) / 255.0;
+	// (47n) Bit 7 of the large-scale length: this pixel's moving-occluder flag (n stays <= Temporal.w = 32).
+	LengthOut[p] = float2(min(nLarge + 1.0, Temporal.w) + (dynNow ? 128.0 : 0.0), nDetailNew) / 255.0;
+	[branch] if (Size.w == kViewHistory)
+	{
+		const bool clampActive = abs(histLarge - clampedLarge) > 0.002;
+		float3 colour = float3(rejected ? 1.0 : 0.0, clampActive ? 1.0 : 0.0, saturate(nLarge / 32.0));
+		if (dynNow)
+			colour = lerp(colour, 1.0, 0.6);
+		HistoryDebug[p] = float4(colour, 1.0);
+	}
 	GeometryOut[p] = zView > 0.0 ? PackGeometry(zView, n) : 0u;
 }
 

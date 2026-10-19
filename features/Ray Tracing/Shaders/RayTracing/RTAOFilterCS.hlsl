@@ -69,10 +69,11 @@ bool DepthNear(float a_centre, float a_tap, float a_tol)
 	return abs(a_tap - a_centre) / max(a_centre, kMinDepth) < a_tol;
 }
 
-// The large-scale sample of a pixel: (value, weight). Two scales: the far sample and its weight (TraceAOCS .b).
+// The large-scale sample of a pixel: (value, weight). Two scales: the far sample and its weight (TraceAOCS .b; (47n) decoded: it
+// also carries the moving-occluder flag).
 float2 LargeSample(float4 a_raw)
 {
-	return (Size.z & kFlagValidity) ? float2(a_raw.r, a_raw.b) : float2(a_raw.r, 1.0);
+	return (Size.z & kFlagValidity) ? float2(a_raw.r, RawFarWeight(a_raw.b)) : float2(a_raw.r, 1.0);
 }
 
 // Central difference of 1/z from the two neighbours along an axis (zero where either belongs to another surface): on a

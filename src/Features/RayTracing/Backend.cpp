@@ -386,8 +386,6 @@ namespace RayTracingRT
 			// (47j) RTAO: Smooth Normals (filled when its texture exists).
 			nullSrv.Format = kDepthMaskFormat;
 			device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAONormal));
-			// (47l) TraceAOCS t6 kept until the RT shader package (47m): always a null view (the 47l blue noise is gone).
-			WriteNullAOBlueNoiseDescriptor();
 		}
 
 		// (45h) Null views in every alpha slot (the copy layers and the bindless table are filled on use).
@@ -801,7 +799,7 @@ namespace RayTracingRT
 		// Its own root signature: constants b0, TLAS t0, table (depth t1, AO u0), ray counter u1;
 		// the alpha-tested variant also: records t2, texcoords t3, table (copy layers t4, bindless game textures t0 space1), s0.
 		// 44 + 2 + 1 + 2 + 2 + 2 + 1 = 54 DWORDs.
-		D3D12_DESCRIPTOR_RANGE ranges[4]{};
+		D3D12_DESCRIPTOR_RANGE ranges[3]{};
 		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		ranges[0].NumDescriptors = 1;
 		ranges[0].BaseShaderRegister = 1;
@@ -815,11 +813,7 @@ namespace RayTracingRT
 		ranges[2].NumDescriptors = 1;
 		ranges[2].BaseShaderRegister = 5;
 		ranges[2].OffsetInDescriptorsFromTableStart = kDynAONormal - kDynAO;
-		// (47l) RTAO: Blue-Noise Rays (t6).
-		ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-		ranges[3].NumDescriptors = 1;
-		ranges[3].BaseShaderRegister = 6;
-		ranges[3].OffsetInDescriptorsFromTableStart = kDynAOBlueNoise - kDynAO;
+		// (47n) The 47l blue-noise view (t6) is gone.
 		D3D12_DESCRIPTOR_RANGE alphaRanges[2]{};
 		alphaRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 		alphaRanges[0].NumDescriptors = 1;
@@ -839,7 +833,7 @@ namespace RayTracingRT
 		params[1].Descriptor.ShaderRegister = 0;
 		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		params[2].DescriptorTable.NumDescriptorRanges = 4;  // (47j) + the smooth normals, (47l) + the blue noise
+		params[2].DescriptorTable.NumDescriptorRanges = 3;  // (47j) + the smooth normals ((47n) the 47l blue noise is gone)
 		params[2].DescriptorTable.pDescriptorRanges = ranges;
 		params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -1059,21 +1053,6 @@ namespace RayTracingRT
 		srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srvDesc.Texture2D.MipLevels = 1;
 		device_->CreateShaderResourceView(aoNormal_.resource12.Get(), &srvDesc, StagingCpu(kDynAONormal));
-	}
-
-	// (47l) TraceAOCS t6 kept until the RT shader package (47m): a null Texture2DArray RG8 view (the blue noise is gone; kFlagBlueNoise
-	// is never set, so the shader never reads it).
-	void Backend::WriteNullAOBlueNoiseDescriptor()
-	{
-		if (!stagingHeap_ || !device_)
-			return;
-		D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
-		nullSrv.Format = kAOBlueNoiseFormat;
-		nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-		nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-		nullSrv.Texture2DArray.MipLevels = 1;
-		nullSrv.Texture2DArray.ArraySize = 1;
-		device_->CreateShaderResourceView(nullptr, &nullSrv, StagingCpu(kDynAOBlueNoise));
 	}
 
 	bool Backend::RecordAOTrace(CommandContext& a_context, std::size_t a_index, const FrameInput& a_input, bool a_alphaFrame, D3D12_GPU_DESCRIPTOR_HANDLE a_table)
@@ -2499,6 +2478,7 @@ namespace RayTracingRT
 			desc.Transform[1][3] = static_cast<float>(instance.y - a_input.cameraY);
 			desc.Transform[2][3] = static_cast<float>(instance.z - a_input.cameraZ);
 			desc.InstanceMask = kInstanceMask;
+			desc.InstanceContributionToHitGroupIndex = instance.moving ? kMovingInstanceKey : 0u;  // (47n) TraceAOCS dynamic-occluder flag
 			desc.Flags = instance.twoSided ? kInstanceFlags : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;  // (46g)
 			if (alpha) {
 				// The shader finds the record through the instance ID (0 = opaque); no force-opaque flag.

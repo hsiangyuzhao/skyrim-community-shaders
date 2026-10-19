@@ -10,7 +10,10 @@
 // Mode 0 (a first build) poses every vertex at the offset's mean over time, 0.55 amplitude alpha (E[s] = 0.5): the BVH is
 // built in the middle of the sway and every later in-place refit stays within half its range of it.
 //
-// One dispatch per mesh, 64 vertices per group. Root bindings (Backend::CreateWindPipeline):
+// (47n) Per plant: TreeParams / WindTimers are the plant's own (Wind.h: its BSLeafAnimNode's timer, faded amplitude and leaf
+// frequency, the shared magnitude), the rest vertices its mesh's (a wind source shared by the plant's copies). The amplitude may be
+// negative (the engine passes it as it is); the first build's mean pose is 0.55 x the amplitude at creation.
+// One dispatch per plant, 64 vertices per group. Root bindings (Backend::CreateWindPipeline):
 //   b0 constants: x vertex count, y mode (0 mean pose, 1 the timer's pose), z amplitude, w leaf frequency (float bits),
 //                 then wind magnitude, timer (float bits), 2 unused
 //   t0 Rest (raw): per vertex 16 bytes = float3 position (the mesh's own space, as the frozen BLAS), uint normal xyz (UNORM8,

@@ -247,7 +247,7 @@ namespace
 	constexpr float kPointMaxFilterRadius = 12.0f;   // px
 	constexpr float kPointSunShare = 0.05f;          // at a sunlit pixel a point light under 5 % of the sun's light there is not traced
 	constexpr std::uint32_t kPointFlagCharacters = 1u, kPointFlagFirstPerson = 2u, kPointFlagCharCull = 4u;  // TracePointLightsCS
-	constexpr std::uint32_t kPointFlagSticky = 8u, kPointFlagBeamCullFront = 16u;  // (46g) TracePointLightsCS (32 = cull back: unused since 47m)
+	constexpr std::uint32_t kPointFlagSticky = 8u, kPointFlagBeamCullFront = 16u;  // (46g) TracePointLightsCS (32 = cull back: gone since 47n)
 	constexpr std::uint32_t kPointFlagRtSurface = 64u;  // (46y) TracePointLightsCS: mark traced-caster surfaces for SSPLS
 	constexpr std::uint32_t kPointFlagWater = 128u;     // (47i) TracePointLightsCS: trace the sources from last frame's water too
 	constexpr std::uint32_t kPointDenoiseHistory = 1u, kPointDenoiseDebug = 2u;                             // PointDenoiseCS
@@ -274,6 +274,7 @@ namespace
 	// (47l) RTAO: Temporal v2. (TraceAOCS 2048 = the removed Blue-Noise Rays: never set since 47m.)
 	constexpr std::uint32_t kAOFlagTemporalV2 = 256u;        // RTAOCommon.hlsli: Temporal v2 (RTAOTemporalCS RTAO_TEMPORAL_V2, the filters' world sigma)
 	constexpr std::uint32_t kAOFlagGeometryValid = 512u;     // RTAOCommon.hlsli: last frame's geometry / history lengths valid
+	constexpr std::uint32_t kAOFlagDynamicHistory = 1024u;   // (47n) RTAOCommon.hlsli: RTAO: Tight History Near Moving Things
 	constexpr float kAOMinHistoryWeight = 0.1f;   // this frame's weight never below 1 / 10 (a = max(1 / (n + 1), 0.1))
 	constexpr float kAOHistoryFixFrames = 4.0f;   // the history fix fades out over the first 4 frames of a pixel's history
 	constexpr float kAOMaxHistoryLength = 32.0f;  // n is stored up to this (only n < 9 changes the weight)
@@ -4225,7 +4226,7 @@ bool RayTracing::PreparePointLights(RayTracingRT::FrameInput& a_input, const flo
 	c.extra[0] = kPointMinShare;
 	c.extra[1] = kPointMinContribution;
 	c.extra[2] = kPointSunShare;
-	c.extra[3] = std::clamp(settings.CarrierClearance, 0.0f, 64.0f);  // (46q) Carrier Casts Shadows: fixed (47m); the shader's < 0 path is unused
+	c.extra[3] = std::clamp(settings.CarrierClearance, 0.0f, 64.0f);  // (46q) Carrier Casts Shadows: fixed (47m); (47n) the shader's < 0 path is gone
 	std::copy_n(a_input.constants.spheres, 8, c.spheres);
 	std::copy_n(a_input.constants.toSun, 3, c.sun);
 	c.sun[3] = a_sunStrength;
@@ -4836,7 +4837,7 @@ void RayTracing::DrawAmbientOcclusionImpl()
 	}
 	// (47l) Temporal v2: its flags and constants (the matrices every frame; without last frame's camera its own matrix, unused then).
 	if (v2)
-		cb.Size[2] |= kAOFlagTemporalV2 | (geometryValid ? kAOFlagGeometryValid : 0u);
+		cb.Size[2] |= kAOFlagTemporalV2 | (geometryValid ? kAOFlagGeometryValid : 0u) | (settings.AODynamicFlag ? kAOFlagDynamicHistory : 0u);
 	std::memcpy(cb.InvViewProj, &fbAO.GetCameraViewProjInverse(0), sizeof(cb.InvViewProj));
 	if (prevCameraUsable)
 		std::copy_n(aoPrevCamera.viewProj, 16, cb.PrevViewProj);
@@ -4910,18 +4911,21 @@ void RayTracing::DrawAmbientOcclusionImpl()
 		if (detail)
 			dispatch(detailCS, { backend.AORawSRV(), depth.depthSRV, normal.SRV }, { aoDetailFiltered.uav.get() }, groupsX, groupsY);
 		const std::uint32_t v2Read = aoV2Index, v2Write = aoV2Index ^ 1u;
-		ID3D11ShaderResourceView* srvs[9] = { aoFiltered.srv.get(), aoHistory[read].srv.get(), motion.SRV, detail ? aoDetailFiltered.srv.get() : nullptr,
-			detail ? aoDetailHistory[detailRead].srv.get() : nullptr, aoV2Length[v2Read].srv.get(), aoV2Geometry[v2Read].srv.get(), depth.depthSRV, normal.SRV };
-		ID3D11UnorderedAccessView* uavs[4] = { aoHistory[write].uav.get(), detail ? aoDetailHistory[detailWrite].uav.get() : nullptr,
-			aoV2Length[v2Write].uav.get(), aoV2Geometry[v2Write].uav.get() };
-		context->CSSetShaderResources(0, 9, srvs);
-		context->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+		// (47n) t9: the raw trace (its moving-occluder flag); u4: the "Temporal v2: History" debug view.
+		const bool historyView = debugOverlay && aoDebugView == AODebugView::History;
+		ID3D11ShaderResourceView* srvs[10] = { aoFiltered.srv.get(), aoHistory[read].srv.get(), motion.SRV, detail ? aoDetailFiltered.srv.get() : nullptr,
+			detail ? aoDetailHistory[detailRead].srv.get() : nullptr, aoV2Length[v2Read].srv.get(), aoV2Geometry[v2Read].srv.get(), depth.depthSRV, normal.SRV,
+			backend.AORawSRV() };
+		ID3D11UnorderedAccessView* uavs[5] = { aoHistory[write].uav.get(), detail ? aoDetailHistory[detailWrite].uav.get() : nullptr,
+			aoV2Length[v2Write].uav.get(), aoV2Geometry[v2Write].uav.get(), historyView ? debugColorUAV.get() : nullptr };
+		context->CSSetShaderResources(0, 10, srvs);
+		context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);
 		context->CSSetShader(temporalV2, nullptr, 0);
 		context->Dispatch(groupsX, groupsY, 1);
-		ID3D11ShaderResourceView* nullSrvs9[9]{};
-		ID3D11UnorderedAccessView* nullUavs4[4]{};
-		context->CSSetShaderResources(0, 9, nullSrvs9);
-		context->CSSetUnorderedAccessViews(0, 4, nullUavs4, nullptr);
+		ID3D11ShaderResourceView* nullSrvs10[10]{};
+		ID3D11UnorderedAccessView* nullUavs5[5]{};
+		context->CSSetShaderResources(0, 10, nullSrvs10);
+		context->CSSetUnorderedAccessViews(0, 5, nullUavs5, nullptr);
 		blended = &aoHistory[write];
 		aoHistoryIndex = write;
 		aoHistoryValid = true;

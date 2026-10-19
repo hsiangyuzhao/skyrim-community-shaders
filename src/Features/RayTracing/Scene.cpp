@@ -1241,6 +1241,20 @@ namespace RayTracingScene
 				instance.m[r][c] = world.rotate.entry[r][c] * world.scale;
 		instance.category = a_shape.alpha ? RayTracingRT::kCategoryAlpha : a_category;
 		instance.twoSided = a_shape.alpha || a_shape.twoSided;  // (46g)
+		{
+			// (47n) Moved since the last frame it was traced (a door swinging, an item falling): RTAO keeps a tight history where its
+			// rays hit it. Compared with our own copy of its last transform (the engine's previousWorld is not refreshed for idle objects).
+			const float now[12] = { world.translate.x, world.translate.y, world.translate.z, world.scale, world.rotate.entry[0][0], world.rotate.entry[0][1],
+				world.rotate.entry[0][2], world.rotate.entry[1][0], world.rotate.entry[1][1], world.rotate.entry[1][2], world.rotate.entry[2][0], world.rotate.entry[2][2] };
+			bool moved = false;
+			if (a_shape.lastWorldValid) {
+				for (int i = 0; i < 12 && !moved; ++i)
+					moved = std::abs(now[i] - a_shape.lastWorld[i]) > (i < 3 ? 0.01f : 1e-4f);
+			}
+			std::copy_n(now, 12, a_shape.lastWorld);
+			a_shape.lastWorldValid = true;
+			instance.moving = moved;
+		}
 		if (a_shape.alpha)
 			instance.alphaInfo = a_shape.info;
 		if (a_expected) {

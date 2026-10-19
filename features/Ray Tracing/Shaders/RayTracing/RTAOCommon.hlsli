@@ -37,3 +37,17 @@ static const uint kViewFinal = 6u;           // (46t)
 static const uint kViewNormalConfidence = 7u;  // (47k) Smooth Normals: confidence
 static const uint kViewNormalNs = 8u;          // (47k) Smooth Normals: the hemisphere normal
 static const uint kViewNormalNg = 9u;          // (47k) Smooth Normals: the depth normal
+static const uint kViewHistory = 10u;          // (47n) Temporal v2: history rejected / clamp active / length / moving-occluder flag (RTAOTemporalCS writes it)
+
+static const uint kFlagDynamicHistory = 1024u; // (47n) RTAO: Tight History Near Moving Things (RTAOTemporalCS RTAO_TEMPORAL_V2)
+
+// (47n) TraceAOCS .b: the far sample's weight w (0, 0.5, 1) stored as 0.4 w, plus 0.6 where one of the pixel's rays was blocked by a
+// character or a moving object (exact in 8 bits too).
+float RawFarWeight(float a_b)
+{
+	return saturate((a_b > 0.5 ? a_b - 0.6 : a_b) * 2.5);
+}
+bool RawDynamic(float a_b)
+{
+	return a_b > 0.5;
+}

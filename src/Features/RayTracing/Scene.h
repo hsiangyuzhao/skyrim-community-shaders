@@ -491,6 +491,9 @@ namespace RayTracingScene
 			bool windNone = false;       // never sways (no vertex alpha, no wind BLAS possible)
 			bool windReady = false;
 			RayTracingRT::BlasHandle windBlas = RayTracingRT::kInvalidBlas;
+			// (47n) Its transform the last time its instance was written (moving instances: RTAO's dynamic-occluder flag).
+			mutable float lastWorld[12]{};
+			mutable bool lastWorldValid = false;
 		};
 
 		struct TrackedRef
